@@ -23,7 +23,10 @@ func (s *Store) WriteResult(jobID string, raw []byte, inlineCap int) (ResultInfo
 	if inlineCap <= 0 {
 		inlineCap = DefaultInlineResultCap
 	}
-	path := filepath.Join(s.layout.Results, jobID+".txt")
+	path, err := s.resultPath(jobID)
+	if err != nil {
+		return ResultInfo{}, err
+	}
 	sum := sha256.Sum256(raw)
 	if err := atomicWriteFile(path, raw, 0o600); err != nil {
 		return ResultInfo{}, err
@@ -62,6 +65,10 @@ func NewCappedLogWriter(path string, capBytes int64) (*CappedLogWriter, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
 	return &CappedLogWriter{file: f, cap: capBytes}, nil
 }
 
@@ -78,7 +85,12 @@ func (w *CappedLogWriter) Write(p []byte) (int, error) {
 	if w.truncated {
 		return len(p), nil
 	}
-	remaining := w.cap - w.written
+	marker := truncationMarker()
+	payloadCap := w.cap - int64(len(marker))
+	if payloadCap < 0 {
+		payloadCap = 0
+	}
+	remaining := payloadCap - w.written
 	if remaining <= 0 {
 		if err := w.markTruncated(); err != nil {
 			return 0, err
@@ -114,8 +126,15 @@ func (w *CappedLogWriter) markTruncated() error {
 	if w.truncated {
 		return nil
 	}
-	const marker = "\n[agentbus: log truncated]\n"
+	marker := truncationMarker()
+	if int64(len(marker)) > w.cap {
+		marker = marker[:int(w.cap)]
+	}
 	_, err := w.file.WriteString(marker)
 	w.truncated = true
 	return err
+}
+
+func truncationMarker() string {
+	return "\n[agentbus: log truncated]\n"
 }

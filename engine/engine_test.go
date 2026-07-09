@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -88,6 +89,29 @@ func TestStateLayoutAndPermissions(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("record mode = %o, want 600", got)
+	}
+}
+
+func TestJobIDPathsStayInNamespace(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, now, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	for _, id := range []string{"../../escape", "job_../escape", "job_bad/name", "job_bad\\name", "turn_123", "job_"} {
+		id := id
+		t.Run(id, func(t *testing.T) {
+			if err := store.Save(&JobRecord{JobID: id, State: StateQueued}); err == nil {
+				t.Fatalf("Save(%q) succeeded", id)
+			}
+			if _, err := store.Load(id); err == nil {
+				t.Fatalf("Load(%q) succeeded", id)
+			}
+			if _, err := store.WriteResult(id, []byte("x"), 1); err == nil {
+				t.Fatalf("WriteResult(%q) succeeded", id)
+			}
+		})
+	}
+	if _, err := os.Stat(filepath.Join(store.Layout().Root, "escape.json")); !os.IsNotExist(err) {
+		t.Fatalf("escape path exists or unexpected error: %v", err)
 	}
 }
 
@@ -193,7 +217,7 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 			if err := store.Save(&job); err != nil {
 				t.Fatal(err)
 			}
-			loaded, err := store.Load(job.JobID)
+			loaded, err := store.loadPath(job.StatePath)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -203,7 +227,7 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 			if err := store.Reap(); err != nil {
 				t.Fatal(err)
 			}
-			got, err := store.Load(job.JobID)
+			got, err := store.loadPath(job.StatePath)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -211,6 +235,90 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 				t.Fatalf("state = %s, want %s", got.State, tt.want)
 			}
 		})
+	}
+}
+
+func TestLoadAndListRunReaperAndQuarantine(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	expired := &JobRecord{
+		JobID:     "job_status_reap",
+		State:     StateRunning,
+		UpdatedAt: base,
+		Lease:     Lease{ExpiresAt: base.Add(-time.Second)},
+	}
+	if err := store.Save(expired); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(expired.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.State != StateOrphaned {
+		t.Fatalf("Load state = %s, want orphaned", loaded.State)
+	}
+
+	badPath := filepath.Join(store.Layout().Jobs, "job_list_bad.json")
+	if err := os.WriteFile(badPath, []byte("{bad json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.List(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(badPath); !os.IsNotExist(err) {
+		t.Fatalf("corrupt record still exists after List: %v", err)
+	}
+	entries, err := os.ReadDir(store.Layout().Quarantine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("List did not quarantine corrupt record")
+	}
+}
+
+func TestReaperDoesNotClobberRefreshedHeartbeat(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	var store *Store
+	refreshed := false
+	pt := processTableFunc(func(pid int) (ProcessInfo, bool, error) {
+		if !refreshed {
+			refreshed = true
+			fresh := &JobRecord{
+				JobID:     "job_live_refresh",
+				State:     StateRunning,
+				UpdatedAt: base.Add(time.Second),
+				Lease:     Lease{ExpiresAt: base.Add(time.Hour)},
+				Worker:    ProcessRef{PID: pid, StartTime: "fresh"},
+			}
+			if err := store.Save(fresh); err != nil {
+				t.Fatal(err)
+			}
+			return ProcessInfo{}, false, nil
+		}
+		return ProcessInfo{PID: pid, StartTime: "fresh"}, true, nil
+	})
+	store = newTestStore(t, base, pt)
+	stale := &JobRecord{
+		JobID:     "job_live_refresh",
+		State:     StateRunning,
+		UpdatedAt: base,
+		Lease:     Lease{ExpiresAt: base.Add(time.Hour)},
+		Worker:    ProcessRef{PID: 200, StartTime: "old"},
+	}
+	if err := store.Save(stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.loadPath(stale.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateRunning || got.Worker.StartTime != "fresh" {
+		t.Fatalf("reaper clobbered refreshed record: %+v", got)
 	}
 }
 
@@ -250,27 +358,51 @@ func TestQuarantineCorruptRecord(t *testing.T) {
 	}
 }
 
-func TestAtomicRecordWriteIgnoresMidWriteTemp(t *testing.T) {
-	t.Parallel()
+func TestAtomicRecordWriteSurvivesCrashMidWrite(t *testing.T) {
+	if os.Getenv("AGENTBUS_ATOMIC_CRASH_CHILD") == "1" {
+		atomicWriteFileCrashHook = func(stage, _ string) {
+			if stage == "after-temp-sync" {
+				os.Exit(23)
+			}
+		}
+		if err := atomicWriteFile(os.Getenv("AGENTBUS_ATOMIC_TARGET"), []byte(os.Getenv("AGENTBUS_ATOMIC_NEW_DATA")), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	store := newTestStore(t, now, fakeProcessTable{entries: map[int]ProcessInfo{}})
 	record := &JobRecord{JobID: "job_atomic", State: StateQueued}
 	if err := store.Save(record); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(store.Layout().Jobs, "job_atomic.json.tmp-dead"), []byte("partial"), 0o600); err != nil {
+	before, err := os.ReadFile(record.StatePath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	record.State = StateStarting
-	if err := store.Save(record); err != nil {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAtomicRecordWriteSurvivesCrashMidWrite$")
+	cmd.Env = append(os.Environ(),
+		"AGENTBUS_ATOMIC_CRASH_CHILD=1",
+		"AGENTBUS_ATOMIC_TARGET="+record.StatePath,
+		"AGENTBUS_ATOMIC_NEW_DATA={\"jobId\":\"job_atomic\",\"state\":\"starting\"}\n",
+	)
+	err = cmd.Run()
+	if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 23 {
+		t.Fatalf("crash child err = %v, want exit 23", err)
+	}
+	after, err := os.ReadFile(record.StatePath)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("target changed across pre-rename crash:\nbefore=%s\nafter=%s", before, after)
 	}
 	loaded, err := store.Load(record.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.State != StateStarting {
-		t.Fatalf("state = %s, want starting", loaded.State)
+	if loaded.State != StateQueued {
+		t.Fatalf("state = %s, want queued", loaded.State)
 	}
 	jobs, err := store.List()
 	if err != nil {
@@ -321,6 +453,35 @@ func TestGCRetention(t *testing.T) {
 	}
 }
 
+func TestGCKeepsResultReferencedByRetainedJob(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	resultPath := filepath.Join(store.Layout().Results, "job_keep_result.txt")
+	if err := os.WriteFile(resultPath, []byte("authoritative"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := base.Add(-2 * time.Hour)
+	if err := os.Chtimes(resultPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	record := &JobRecord{
+		JobID:     "job_keep_result",
+		State:     StateCompleted,
+		UpdatedAt: base,
+		Result:    &ResultInfo{ResultPath: resultPath},
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(resultPath); err != nil {
+		t.Fatalf("referenced result was removed: %v", err)
+	}
+}
+
 func TestResultSpillAndEventTruncation(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
@@ -357,7 +518,14 @@ func TestResultSpillAndEventTruncation(t *testing.T) {
 func TestCappedLogWriter(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "log.txt")
-	w, err := NewCappedLogWriter(path, 5)
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	capBytes := int64(len(truncationMarker()) + 5)
+	w, err := NewCappedLogWriter(path, capBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,6 +539,9 @@ func TestCappedLogWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if int64(len(b)) > capBytes {
+		t.Fatalf("log size = %d, want <= %d", len(b), capBytes)
+	}
 	if got := string(b); !strings.HasPrefix(got, "abcde") || !strings.Contains(got, "[agentbus: log truncated]") {
 		t.Fatalf("log contents = %q", got)
 	}
@@ -381,4 +552,22 @@ func TestCappedLogWriter(t *testing.T) {
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("log mode = %o, want 600", got)
 	}
+}
+
+func TestLinuxProcStatStartTimeWithSpacesInComm(t *testing.T) {
+	t.Parallel()
+	stat := "123 (name with spaces) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654 20"
+	got, ok := linuxProcStatStartTime(stat)
+	if !ok {
+		t.Fatal("linuxProcStatStartTime returned !ok")
+	}
+	if got != "987654" {
+		t.Fatalf("start time = %q, want 987654", got)
+	}
+}
+
+type processTableFunc func(pid int) (ProcessInfo, bool, error)
+
+func (f processTableFunc) Lookup(pid int) (ProcessInfo, bool, error) {
+	return f(pid)
 }

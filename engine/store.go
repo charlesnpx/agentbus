@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -109,8 +110,9 @@ func (s *Store) Save(record *JobRecord) error {
 	if record == nil {
 		return errors.New("nil job record")
 	}
-	if record.JobID == "" {
-		return errors.New("job id is required")
+	path, err := s.jobPath(record.JobID)
+	if err != nil {
+		return err
 	}
 	now := s.clock.Now().UTC()
 	if record.CreatedAt.IsZero() {
@@ -119,7 +121,7 @@ func (s *Store) Save(record *JobRecord) error {
 	if record.UpdatedAt.IsZero() {
 		record.UpdatedAt = now
 	}
-	record.StatePath = s.jobPath(record.JobID)
+	record.StatePath = path
 	b, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return err
@@ -130,24 +132,24 @@ func (s *Store) Save(record *JobRecord) error {
 
 // Load reads a job record and computes status-only lease fields.
 func (s *Store) Load(jobID string) (*JobRecord, error) {
-	path := s.jobPath(jobID)
-	b, err := os.ReadFile(path)
+	if err := validateJobID(jobID); err != nil {
+		return nil, err
+	}
+	if err := s.Reap(); err != nil {
+		return nil, err
+	}
+	path, err := s.jobPath(jobID)
 	if err != nil {
 		return nil, err
 	}
-	var record JobRecord
-	if err := json.Unmarshal(b, &record); err != nil {
-		return nil, err
-	}
-	if record.JobID == "" || record.State == "" {
-		return nil, errors.New("invalid job record: missing jobId or state")
-	}
-	status := record.StatusRecord(s.clock.Now().UTC())
-	return &status, nil
+	return s.loadPath(path)
 }
 
-// List loads all non-corrupt job records. Corrupt records are left for Reap.
+// List runs the reaper and loads all non-corrupt job records.
 func (s *Store) List() ([]JobRecord, error) {
+	if err := s.Reap(); err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(s.layout.Jobs)
 	if err != nil {
 		return nil, err
@@ -157,8 +159,12 @@ func (s *Store) List() ([]JobRecord, error) {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		record, err := s.Load(strings.TrimSuffix(entry.Name(), ".json"))
+		path := filepath.Join(s.layout.Jobs, entry.Name())
+		record, err := s.loadPath(path)
 		if err != nil {
+			if qerr := s.quarantine(path, err); qerr != nil {
+				return nil, qerr
+			}
 			continue
 		}
 		out = append(out, *record)
@@ -179,7 +185,7 @@ func (s *Store) Reap() error {
 			continue
 		}
 		path := filepath.Join(s.layout.Jobs, entry.Name())
-		record, err := s.loadPath(path)
+		record, original, err := s.loadPathWithBytes(path)
 		if err != nil {
 			if qerr := s.quarantine(path, err); qerr != nil {
 				return qerr
@@ -191,7 +197,7 @@ func (s *Store) Reap() error {
 			return err
 		}
 		if changed {
-			if err := s.Save(record); err != nil {
+			if err := s.saveIfUnchanged(record, path, original); err != nil {
 				return err
 			}
 		}
@@ -265,17 +271,33 @@ func (s *Store) gc(now time.Time) error {
 	if err != nil {
 		return err
 	}
+	protectedResults := make(map[string]struct{})
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
 		record, err := s.loadPath(filepath.Join(s.layout.Jobs, entry.Name()))
-		if err != nil || !IsTerminal(record.State) || now.Sub(record.UpdatedAt) < s.retention.TerminalJobTTL {
+		if err != nil {
 			continue
+		}
+		if record.Result != nil && record.Result.ResultPath != "" {
+			protectedResults[filepath.Clean(record.Result.ResultPath)] = struct{}{}
+		}
+		if !IsTerminal(record.State) || now.Sub(record.UpdatedAt) < s.retention.TerminalJobTTL {
+			continue
+		}
+		if record.Result != nil && record.Result.ResultPath != "" {
+			resultPath := filepath.Clean(record.Result.ResultPath)
+			delete(protectedResults, resultPath)
+			if pathWithinDir(s.layout.Results, resultPath) {
+				_ = removeIfExists(resultPath)
+			}
 		}
 		_ = removeIfExists(record.LogPaths.Stdout)
 		_ = removeIfExists(record.LogPaths.Stderr)
-		_ = removeIfExists(filepath.Join(s.layout.Inputs, record.JobID+".json"))
+		if inputPath, err := safePathForID(s.layout.Inputs, record.JobID, ".json"); err == nil {
+			_ = removeIfExists(inputPath)
+		}
 		_ = removeIfExists(record.StatePath)
 	}
 	for _, dir := range []string{s.layout.Results} {
@@ -291,8 +313,12 @@ func (s *Store) gc(now time.Time) error {
 			if err != nil {
 				return err
 			}
+			path := filepath.Join(dir, entry.Name())
+			if _, ok := protectedResults[filepath.Clean(path)]; ok {
+				continue
+			}
 			if now.Sub(info.ModTime()) >= s.retention.ResultTTL {
-				_ = os.Remove(filepath.Join(dir, entry.Name()))
+				_ = os.Remove(path)
 			}
 		}
 	}
@@ -300,24 +326,96 @@ func (s *Store) gc(now time.Time) error {
 }
 
 func (s *Store) loadPath(path string) (*JobRecord, error) {
+	record, _, err := s.loadPathWithBytes(path)
+	return record, err
+}
+
+func (s *Store) loadPathWithBytes(path string) (*JobRecord, []byte, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var record JobRecord
 	if err := json.Unmarshal(b, &record); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if record.JobID == "" || record.State == "" {
-		return nil, errors.New("invalid job record: missing jobId or state")
+		return nil, nil, errors.New("invalid job record: missing jobId or state")
+	}
+	if err := validateJobID(record.JobID); err != nil {
+		return nil, nil, err
+	}
+	expected := strings.TrimSuffix(filepath.Base(path), ".json")
+	if record.JobID != expected {
+		return nil, nil, fmt.Errorf("invalid job record: jobId %q does not match path %q", record.JobID, filepath.Base(path))
 	}
 	record.StatePath = path
 	status := record.StatusRecord(s.clock.Now().UTC())
-	return &status, nil
+	return &status, b, nil
 }
 
-func (s *Store) jobPath(jobID string) string {
-	return filepath.Join(s.layout.Jobs, jobID+".json")
+func (s *Store) saveIfUnchanged(record *JobRecord, path string, original []byte) error {
+	current, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(current, original) {
+		return nil
+	}
+	record.StatePath = path
+	b, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	return atomicWriteFile(path, b, 0o600)
+}
+
+func (s *Store) jobPath(jobID string) (string, error) {
+	return safePathForID(s.layout.Jobs, jobID, ".json")
+}
+
+func (s *Store) resultPath(jobID string) (string, error) {
+	return safePathForID(s.layout.Results, jobID, ".txt")
+}
+
+func safePathForID(dir, id, ext string) (string, error) {
+	if err := validateJobID(id); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, id+ext)
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("job id %q escapes state namespace", id)
+	}
+	return path, nil
+}
+
+func validateJobID(jobID string) error {
+	if !strings.HasPrefix(jobID, "job_") || len(jobID) <= len("job_") || len(jobID) > 128 {
+		return fmt.Errorf("invalid job id %q", jobID)
+	}
+	for _, r := range jobID {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+			continue
+		}
+		return fmt.Errorf("invalid job id %q", jobID)
+	}
+	return nil
+}
+
+func pathWithinDir(dir, path string) bool {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
 }
 
 func removeIfExists(path string) error {
@@ -353,17 +451,21 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		_ = tmp.Close()
 		return err
 	}
+	atomicWriteFileCrashHook("after-temp-sync", tmpName)
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
+	atomicWriteFileCrashHook("after-rename", path)
 	if err := os.Chmod(path, perm); err != nil {
 		return err
 	}
 	return fsyncDir(dir)
 }
+
+var atomicWriteFileCrashHook = func(string, string) {}
 
 func fsyncDir(dir string) error {
 	f, err := os.Open(dir)

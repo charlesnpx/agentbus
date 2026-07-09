@@ -40,11 +40,11 @@ func (NativeProcessTable) Lookup(pid int) (ProcessInfo, bool, error) {
 		if err != nil {
 			return ProcessInfo{}, false, err
 		}
-		fields := strings.Fields(string(b))
-		if len(fields) < 22 {
+		startTime, ok := linuxProcStatStartTime(string(b))
+		if !ok {
 			return ProcessInfo{}, false, nil
 		}
-		return ProcessInfo{PID: pid, StartTime: fields[21]}, true, nil
+		return ProcessInfo{PID: pid, StartTime: startTime}, true, nil
 	case "darwin":
 		out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
 		if err != nil {
@@ -58,4 +58,16 @@ func (NativeProcessTable) Lookup(pid int) (ProcessInfo, bool, error) {
 
 func errorsIsProcessMissing(err error) bool {
 	return err == syscall.ESRCH
+}
+
+func linuxProcStatStartTime(stat string) (string, bool) {
+	endComm := strings.LastIndex(stat, ") ")
+	if endComm < 0 {
+		return "", false
+	}
+	fieldsAfterComm := strings.Fields(stat[endComm+2:])
+	if len(fieldsAfterComm) < 20 {
+		return "", false
+	}
+	return fieldsAfterComm[19], true
 }
