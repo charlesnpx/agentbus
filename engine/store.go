@@ -156,6 +156,7 @@ func (s *Store) List() ([]JobRecord, error) {
 	if err := s.Reap(); err != nil {
 		return nil, err
 	}
+	listAfterReapHook()
 	entries, err := os.ReadDir(s.layout.Jobs)
 	if err != nil {
 		return nil, err
@@ -166,11 +167,29 @@ func (s *Store) List() ([]JobRecord, error) {
 			continue
 		}
 		path := filepath.Join(s.layout.Jobs, entry.Name())
-		record, err := s.loadPath(path)
-		if err != nil {
+		jobID := strings.TrimSuffix(entry.Name(), ".json")
+		if err := validateJobID(jobID); err != nil {
 			if qerr := s.quarantine(path, err); qerr != nil {
 				return nil, qerr
 			}
+			continue
+		}
+		var record *JobRecord
+		if err := s.withJobLock(jobID, func() error {
+			loaded, err := s.loadPath(path)
+			if err != nil {
+				listLoadErrorHook(path, err)
+				if qerr := s.quarantine(path, err); qerr != nil {
+					return qerr
+				}
+				return nil
+			}
+			record = loaded
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		if record == nil {
 			continue
 		}
 		out = append(out, *record)
@@ -536,6 +555,10 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 }
 
 var atomicWriteFileCrashHook = func(string, string) {}
+
+var listAfterReapHook = func() {}
+
+var listLoadErrorHook = func(string, error) {}
 
 func fsyncDir(dir string) error {
 	f, err := os.Open(dir)

@@ -340,6 +340,66 @@ func TestReaperDoesNotClobberRefreshedHeartbeat(t *testing.T) {
 	}
 }
 
+func TestListDoesNotQuarantineConcurrentFreshSave(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	jobID := "job_list_fresh_save"
+	path := filepath.Join(store.Layout().Jobs, jobID+".json")
+
+	oldAfterReapHook := listAfterReapHook
+	oldHook := listLoadErrorHook
+	defer func() {
+		listAfterReapHook = oldAfterReapHook
+		listLoadErrorHook = oldHook
+	}()
+	saveDone := make(chan error, 1)
+	var once sync.Once
+	saveCompletedBeforeQuarantine := false
+	listAfterReapHook = func() {
+		if err := os.WriteFile(path, []byte("{bad json"), 0o600); err != nil {
+			t.Fatalf("write corrupt record after Reap: %v", err)
+		}
+	}
+	listLoadErrorHook = func(hookPath string, _ error) {
+		if hookPath != path {
+			return
+		}
+		once.Do(func() {
+			go func() {
+				saveDone <- store.Save(&JobRecord{
+					JobID:     jobID,
+					State:     StateQueued,
+					UpdatedAt: base.Add(time.Second),
+				})
+			}()
+			select {
+			case err := <-saveDone:
+				saveCompletedBeforeQuarantine = true
+				saveDone <- err
+			case <-time.After(50 * time.Millisecond):
+			}
+		})
+	}
+
+	if _, err := store.List(); err != nil {
+		t.Fatal(err)
+	}
+	saveErr := <-saveDone
+	if saveErr != nil {
+		t.Fatal(saveErr)
+	}
+	if saveCompletedBeforeQuarantine {
+		t.Fatal("Save completed while List was between corrupt read and quarantine")
+	}
+	loaded, err := store.loadPath(path)
+	if err != nil {
+		t.Fatalf("fresh save was quarantined or left unreadable: %v", err)
+	}
+	if loaded.JobID != jobID || loaded.State != StateQueued {
+		t.Fatalf("loaded record = %+v, want fresh queued record", loaded)
+	}
+}
+
 func TestGCIgnoresLogPathsOutsideLayout(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
