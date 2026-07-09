@@ -113,6 +113,9 @@ func TestShapeEvidenceHeuristic(t *testing.T) {
 		{name: "priority label finding without evidence", text: "Findings:\nP1: missing validation", valid: false},
 		{name: "fenced command adjacent exit evidence before", text: "Findings:\nIt failed\nexit code 1\n```sh\ngo test ./...\n```", valid: true},
 		{name: "fenced command adjacent exit evidence after", text: "Findings:\nIt failed\n```sh\ngo test ./...\n```\nexit 1", valid: true},
+		{name: "fenced command evidence inside backtick fence not closed by tilde run", text: "Findings:\nIt failed\n```md\nexit code 1\n~~~sh\ngo test ./...\n~~~\n```", valid: false},
+		{name: "fenced command evidence inside longer backtick fence not closed by shorter run", text: "Findings:\nIt failed\n````md\nexit code 1\n```sh\ngo test ./...\n```\n````", valid: false},
+		{name: "properly closed fence followed by command exit evidence", text: "Findings:\nIt failed\n```md\nexample transcript\n```\nexit code 1\n```sh\ngo test ./...\n```", valid: true},
 		{name: "fenced path line excluded", text: "Findings:\nIt failed\n```\nengine/run.go:42\n```", valid: false},
 		{name: "claimed finding without evidence", text: "Findings:\nThere is a real issue", valid: false},
 	}
