@@ -71,6 +71,9 @@ type JobRecord struct {
 	StatePath        string            `json:"statePath,omitempty"`
 	LogPaths         LogPaths          `json:"logPaths,omitempty"`
 	Result           *ResultInfo       `json:"result,omitempty"`
+	Policy           *TurnPolicy       `json:"policy,omitempty"`
+	ResolvedContract *ContractSpec     `json:"resolvedContract,omitempty"`
+	Contract         *ContractStamp    `json:"contract,omitempty"`
 	RetryCount       int               `json:"retryCount,omitempty"`
 	QuarantineReason string            `json:"quarantineReason,omitempty"`
 }
