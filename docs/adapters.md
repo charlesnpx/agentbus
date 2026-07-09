@@ -95,10 +95,17 @@ Write turns run under the user's normal Claude configuration.
 Base argv:
 
 ```text
-claude --print --output-format stream-json --strict-mcp-config --tools Read,Grep,Glob,Bash
+claude --print --output-format stream-json --bare --strict-mcp-config --mcp-config {} --permission-mode dontAsk --allowedTools <allow-list> --disallowedTools <deny-list>
 ```
 
 The read-only profile MUST NOT include `--dangerously-skip-permissions`.
+The installed Claude CLI exposes tool allow/deny controls as
+`--allowedTools`/`--allowed-tools` and
+`--disallowedTools`/`--disallowed-tools`; agentbus uses the camelCase spellings
+shown above. It also exposes `--permission-mode dontAsk`, which agentbus uses
+as the print-mode fail-closed permission mode, and `--bare`, which minimizes
+hooks, plugin sync, auto-memory, background prefetches, and similar
+customization sources.
 
 The read-only profile MUST allow only these first-party tools:
 
@@ -224,8 +231,52 @@ backend version changed since setup; re-run agentbus setup
 ```
 
 Each adapter MUST declare a minimum known-good version. The exact values are
-pinned by adapter tests in merge unit A5 after the installed CLI surfaces are
-verified.
+pinned by adapter tests:
+
+| Backend | Minimum known-good version |
+| --- | --- |
+| codex | `0.143.0` |
+| claude | `2.1.205` |
+
+The setup probe cache consumed by `Preflight` is internal agentbus state and has
+this shape:
+
+```json
+{
+  "backends": [
+    {
+      "backend": "codex",
+      "binaryPath": "/Users/me/.local/bin/codex",
+      "version": "0.143.0",
+      "streamSchema": "codex-json-v1",
+      "configMode": {
+        "write": "user",
+        "readOnly": "hermetic"
+      },
+      "sandboxModes": ["workspace-write", "read-only"],
+      "jsonEventsProbed": true
+    }
+  ]
+}
+```
+
+## A5 flag verification amendments
+
+The installed CLIs verified for A5 reported:
+
+| Backend | Documented flag/profile item | Installed CLI result | Amendment |
+| --- | --- | --- | --- |
+| codex | `exec --json` | present in `codex exec --help` | none |
+| codex | `--sandbox read-only|workspace-write` | present in `codex exec --help` | none |
+| codex | `--ignore-user-config` | present in `codex exec --help` and `codex exec resume --help` | none |
+| codex | `exec resume <session-id>` | present as `codex exec resume [SESSION_ID] [PROMPT]` | none |
+| claude | `--print` | present in `claude --help` | none |
+| claude | `--output-format stream-json` | present in `claude --help` | none |
+| claude | `--dangerously-skip-permissions` | present in `claude --help` | none |
+| claude | `--resume <session-id>` | present in `claude --help` | none |
+| claude | read-only tool allow/deny flags | real flags are `--allowedTools`/`--allowed-tools` and `--disallowedTools`/`--disallowed-tools` | use `--allowedTools` and `--disallowedTools` |
+| claude | fail-closed print-mode permission behavior | real flag is `--permission-mode dontAsk` | add `--permission-mode dontAsk` |
+| claude | hermetic customization minimization | real flag `--bare` exists; `--strict-mcp-config` exists | add `--bare --mcp-config {}` alongside `--strict-mcp-config` |
 
 ## Native structured output capability
 

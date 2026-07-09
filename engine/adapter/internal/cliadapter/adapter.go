@@ -1,0 +1,407 @@
+package cliadapter
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/charlesnpx/agentbus/engine"
+)
+
+const DriftError = "backend version changed since setup; re-run agentbus setup"
+
+type Backend struct {
+	NameValue        string
+	Binary           string
+	MinimumVersion   string
+	CachePath        string
+	StreamSchema     string
+	AllowedModels    map[string]struct{}
+	AllowedEfforts   map[string]struct{}
+	BuildArgs        func(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error)
+	Parse            func(map[string]any) ([]engine.Event, string, error)
+	VersionTransform func(string) string
+}
+
+func (b *Backend) Name() string { return b.NameValue }
+
+func (b *Backend) Preflight(ctx context.Context) (engine.Health, error) {
+	binary, err := exec.LookPath(b.binary())
+	if err != nil {
+		return engine.Health{}, fmt.Errorf("backend_unavailable: %s binary not found: %w", b.NameValue, err)
+	}
+	version, err := commandOutput(ctx, binary, "--version")
+	if err != nil {
+		return engine.Health{}, fmt.Errorf("backend_unavailable: %s version check failed: %w", b.NameValue, err)
+	}
+	version = b.normalizeVersion(version)
+	if compareVersion(version, b.MinimumVersion) < 0 {
+		return engine.Health{}, fmt.Errorf("backend_unavailable: %s version %s is below minimum known-good %s", b.NameValue, version, b.MinimumVersion)
+	}
+	probe, err := b.cachedProbe()
+	if err != nil {
+		return engine.Health{}, err
+	}
+	if probe.Version != version || probe.BinaryPath != binary {
+		return engine.Health{}, errors.New(DriftError)
+	}
+	if probe.StreamSchema == "" || probe.StreamSchema != b.StreamSchema {
+		return engine.Health{}, fmt.Errorf("backend_unavailable: setup cache for %s lacks stream schema %q", b.NameValue, b.StreamSchema)
+	}
+	return engine.Health{
+		Backend:      b.NameValue,
+		BinaryPath:   binary,
+		Version:      version,
+		StreamSchema: probe.StreamSchema,
+		Minimum:      b.MinimumVersion,
+	}, nil
+}
+
+func (b *Backend) Start(ctx context.Context, opts engine.SessionOpts) (engine.Session, error) {
+	if err := b.validateOptions(opts); err != nil {
+		return nil, err
+	}
+	return &Session{backend: b, opts: opts}, nil
+}
+
+func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts) (engine.Session, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, errors.New("resume session id is required")
+	}
+	if err := b.validateOptions(opts); err != nil {
+		return nil, err
+	}
+	return &Session{backend: b, id: id, opts: opts}, nil
+}
+
+func (b *Backend) binary() string {
+	if b.Binary != "" {
+		return b.Binary
+	}
+	return b.NameValue
+}
+
+func (b *Backend) normalizeVersion(s string) string {
+	s = strings.TrimSpace(s)
+	if b.VersionTransform != nil {
+		s = b.VersionTransform(s)
+	}
+	fields := strings.Fields(s)
+	for _, f := range fields {
+		if isVersionToken(f) {
+			return strings.TrimPrefix(f, "v")
+		}
+	}
+	return strings.TrimPrefix(s, "v")
+}
+
+func (b *Backend) validateOptions(opts engine.SessionOpts) error {
+	if opts.Model != "" && len(b.AllowedModels) > 0 {
+		if _, ok := b.AllowedModels[opts.Model]; !ok {
+			return fmt.Errorf("unsupported model %q for %s", opts.Model, b.NameValue)
+		}
+	}
+	if opts.Effort != "" && len(b.AllowedEfforts) > 0 {
+		if _, ok := b.AllowedEfforts[opts.Effort]; !ok {
+			return fmt.Errorf("unsupported effort %q for %s", opts.Effort, b.NameValue)
+		}
+	}
+	return nil
+}
+
+func (b *Backend) cachedProbe() (engine.BackendSetupProbe, error) {
+	path := b.CachePath
+	if path == "" {
+		root, err := engine.ResolveStateRoot()
+		if err != nil {
+			return engine.BackendSetupProbe{}, err
+		}
+		path = filepath.Join(root, "setup-probes.json")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache missing for %s; re-run agentbus setup: %w", b.NameValue, err)
+	}
+	var cache engine.SetupProbeCache
+	if err := json.Unmarshal(raw, &cache); err != nil {
+		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: invalid setup cache: %w", err)
+	}
+	for _, p := range cache.Backends {
+		if p.Backend == b.NameValue {
+			return p, nil
+		}
+	}
+	return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache missing backend %s; re-run agentbus setup", b.NameValue)
+}
+
+type Session struct {
+	backend *Backend
+	id      string
+	opts    engine.SessionOpts
+	mu      sync.Mutex
+	active  *exec.Cmd
+}
+
+func (s *Session) ID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.id
+}
+
+func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+	if err := s.backend.validateOptions(s.opts); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if s.active != nil {
+		s.mu.Unlock()
+		return nil, errors.New("session_busy")
+	}
+	timeout := input.Timeout
+	if timeout == 0 {
+		timeout = s.opts.Timeout
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer func() {
+			if ctx.Err() != nil {
+				cancel()
+			}
+		}()
+	}
+	resumeID := s.id
+	args, err := s.backend.BuildArgs(resumeID, s.opts, input)
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, s.backend.binary(), args...)
+	cmd.Cancel = func() error { return terminateProcessGroup(cmd, 500*time.Millisecond) }
+	cmd.WaitDelay = 200 * time.Millisecond
+	if s.opts.CWD != "" {
+		cmd.Dir = s.opts.CWD
+	}
+	setProcessGroup(cmd)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	s.active = cmd
+	s.mu.Unlock()
+
+	events := make(chan engine.Event, 16)
+	go func() {
+		defer close(events)
+		go func() {
+			_, _ = io.WriteString(stdin, input.Prompt)
+			_ = stdin.Close()
+		}()
+		parseErr := s.scan(stdout, events)
+		waitErr := cmd.Wait()
+		s.mu.Lock()
+		if s.active == cmd {
+			s.active = nil
+		}
+		s.mu.Unlock()
+		if ctx.Err() == context.DeadlineExceeded {
+			events <- warning("backend turn timed out")
+			return
+		}
+		if parseErr != nil {
+			events <- warning(parseErr.Error())
+		}
+		if waitErr != nil {
+			msg := strings.TrimSpace(stderr.String())
+			if msg == "" {
+				msg = waitErr.Error()
+			}
+			events <- warning(msg)
+		}
+	}()
+	return events, nil
+}
+
+func (s *Session) Interrupt(ctx context.Context) error {
+	s.mu.Lock()
+	cmd := s.active
+	s.mu.Unlock()
+	if cmd == nil {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- terminateProcessGroup(cmd, 500*time.Millisecond) }()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		return err
+	}
+}
+
+func (s *Session) scan(r io.Reader, out chan<- engine.Event) error {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var obj map[string]any
+		if err := json.Unmarshal(line, &obj); err != nil {
+			return fmt.Errorf("malformed backend stream: %w", err)
+		}
+		events, id, err := s.backend.Parse(obj)
+		if err != nil {
+			return err
+		}
+		if id != "" {
+			s.mu.Lock()
+			if s.id == "" {
+				s.id = id
+			}
+			s.mu.Unlock()
+		}
+		for _, ev := range events {
+			out <- capEvent(ev)
+		}
+	}
+	return scanner.Err()
+}
+
+func capEvent(ev engine.Event) engine.Event {
+	text := engine.TruncateEventText([]byte(ev.Text), engine.DefaultEventTextCap)
+	ev.Text = text.Text
+	ev.Truncated = ev.Truncated || text.Truncated
+	return ev
+}
+
+func warning(text string) engine.Event {
+	return engine.Event{Type: engine.EventWarning, Text: text}
+}
+
+func setProcessGroup(cmd *exec.Cmd) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}
+
+func terminateProcessGroup(cmd *exec.Cmd, grace time.Duration) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	pid := cmd.Process.Pid
+	if runtime.GOOS == "windows" {
+		_ = cmd.Process.Kill()
+		return nil
+	}
+	pgid, err := syscall.Getpgid(pid)
+	if err != nil {
+		pgid = pid
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	time.Sleep(grace)
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	return nil
+}
+
+func commandOutput(ctx context.Context, binary string, arg ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, binary, arg...)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func compareVersion(a, b string) int {
+	ap := versionParts(a)
+	bp := versionParts(b)
+	for i := 0; i < len(ap) || i < len(bp); i++ {
+		av, bv := 0, 0
+		if i < len(ap) {
+			av = ap[i]
+		}
+		if i < len(bp) {
+			bv = bp[i]
+		}
+		if av < bv {
+			return -1
+		}
+		if av > bv {
+			return 1
+		}
+	}
+	return 0
+}
+
+func versionParts(s string) []int {
+	var out []int
+	for _, p := range strings.Split(strings.TrimPrefix(s, "v"), ".") {
+		n, _ := strconv.Atoi(leadingDigits(p))
+		out = append(out, n)
+	}
+	return out
+}
+
+func leadingDigits(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			break
+		}
+		b.WriteRune(r)
+	}
+	if b.Len() == 0 {
+		return "0"
+	}
+	return b.String()
+}
+
+func isVersionToken(s string) bool {
+	s = strings.TrimPrefix(s, "v")
+	parts := strings.Split(s, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, p := range parts {
+		if leadingDigits(p) == "0" && !strings.HasPrefix(p, "0") {
+			return false
+		}
+	}
+	return true
+}
+
+func StringSet(values ...string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, v := range values {
+		out[v] = struct{}{}
+	}
+	return out
+}
