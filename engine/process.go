@@ -20,8 +20,29 @@ type ProcessTable interface {
 	Lookup(pid int) (ProcessInfo, bool, error)
 }
 
+// ProcessGroupSignaler abstracts process-group signals for tests.
+type ProcessGroupSignaler interface {
+	SignalProcessGroup(pgid int, signal syscall.Signal) error
+}
+
 // NativeProcessTable reads process information from the host OS.
 type NativeProcessTable struct{}
+
+// NativeProcessGroupSignaler sends signals to host OS process groups.
+type NativeProcessGroupSignaler struct{}
+
+// SignalProcessGroup sends signal to pgid. Missing process groups are already
+// dead for cancellation purposes and are treated as success.
+func (NativeProcessGroupSignaler) SignalProcessGroup(pgid int, signal syscall.Signal) error {
+	if pgid <= 0 || runtime.GOOS == "windows" {
+		return nil
+	}
+	err := syscall.Kill(-pgid, signal)
+	if errorsIsProcessMissing(err) {
+		return nil
+	}
+	return err
+}
 
 // Lookup returns process liveness and a platform start-time token.
 func (NativeProcessTable) Lookup(pid int) (ProcessInfo, bool, error) {

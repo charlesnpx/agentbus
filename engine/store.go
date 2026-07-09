@@ -24,6 +24,20 @@ type ClockFunc func() time.Time
 // Now returns f().
 func (f ClockFunc) Now() time.Time { return f() }
 
+// Waiter provides deterministic waits in tests.
+type Waiter interface {
+	Wait(time.Duration)
+}
+
+// WaiterFunc adapts a function to Waiter.
+type WaiterFunc func(time.Duration)
+
+// Wait calls f().
+func (f WaiterFunc) Wait(d time.Duration) { f(d) }
+
+// DefaultCancelGrace is the protocol default grace period before SIGKILL.
+const DefaultCancelGrace = 10 * time.Second
+
 // RetentionConfig controls reaper garbage collection.
 type RetentionConfig struct {
 	TerminalJobTTL time.Duration
@@ -42,19 +56,25 @@ func DefaultRetention() RetentionConfig {
 
 // StoreConfig configures a workspace job store.
 type StoreConfig struct {
-	Root      string
-	CWD       string
-	Clock     Clock
-	Processes ProcessTable
-	Retention RetentionConfig
+	Root          string
+	CWD           string
+	Clock         Clock
+	Processes     ProcessTable
+	ProcessGroups ProcessGroupSignaler
+	CancelGrace   time.Duration
+	CancelWaiter  Waiter
+	Retention     RetentionConfig
 }
 
 // Store persists job records for one workspace namespace.
 type Store struct {
-	layout    WorkspaceLayout
-	clock     Clock
-	processes ProcessTable
-	retention RetentionConfig
+	layout        WorkspaceLayout
+	clock         Clock
+	processes     ProcessTable
+	processGroups ProcessGroupSignaler
+	cancelGrace   time.Duration
+	cancelWaiter  Waiter
+	retention     RetentionConfig
 }
 
 // NewStore creates a state store and ensures protocol directories exist.
@@ -89,6 +109,21 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 	if processes == nil {
 		processes = NativeProcessTable{}
 	}
+	processGroups := cfg.ProcessGroups
+	if processGroups == nil {
+		processGroups = NativeProcessGroupSignaler{}
+	}
+	cancelGrace := cfg.CancelGrace
+	if cancelGrace < 0 {
+		return nil, errors.New("cancel grace cannot be negative")
+	}
+	if cancelGrace == 0 {
+		cancelGrace = DefaultCancelGrace
+	}
+	cancelWaiter := cfg.CancelWaiter
+	if cancelWaiter == nil {
+		cancelWaiter = WaiterFunc(time.Sleep)
+	}
 	retention := cfg.Retention
 	defaults := DefaultRetention()
 	if retention.TerminalJobTTL == 0 {
@@ -100,7 +135,15 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 	if retention.StaleJobAfter == 0 {
 		retention.StaleJobAfter = defaults.StaleJobAfter
 	}
-	return &Store{layout: layout, clock: clock, processes: processes, retention: retention}, nil
+	return &Store{
+		layout:        layout,
+		clock:         clock,
+		processes:     processes,
+		processGroups: processGroups,
+		cancelGrace:   cancelGrace,
+		cancelWaiter:  cancelWaiter,
+		retention:     retention,
+	}, nil
 }
 
 // Layout returns the workspace layout used by the store.
@@ -196,6 +239,116 @@ func (s *Store) List() ([]JobRecord, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].JobID < out[j].JobID })
 	return out, nil
+}
+
+// Cancel transitions a queued or active job record to canceled.
+func (s *Store) Cancel(jobID string) (*JobRecord, error) {
+	if err := validateJobID(jobID); err != nil {
+		return nil, err
+	}
+	path, err := s.jobPath(jobID)
+	if err != nil {
+		return nil, err
+	}
+	now := s.clock.Now().UTC()
+	var out *JobRecord
+	if err := s.withJobLock(jobID, func() error {
+		record, original, err := s.loadPathWithBytes(path)
+		if err != nil {
+			return err
+		}
+		if IsTerminal(record.State) {
+			status := record.StatusRecord(now)
+			out = &status
+			return nil
+		}
+		if err := s.cancelLiveProcessGroup(record); err != nil {
+			return err
+		}
+		if err := record.Transition(StateCanceled, now); err != nil {
+			return err
+		}
+		if err := s.saveIfUnchanged(record, path, original); err != nil {
+			return err
+		}
+		status := record.StatusRecord(now)
+		out = &status
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+type cancelProcessGroupTarget struct {
+	pgid            int
+	worker          ProcessRef
+	backendChildPID int
+}
+
+func (s *Store) cancelLiveProcessGroup(record *JobRecord) error {
+	switch record.State {
+	case StateStarting, StateRunning, StateRetrying:
+	default:
+		return nil
+	}
+	target, ok, err := s.liveCancelProcessGroup(record)
+	if err != nil || !ok {
+		return err
+	}
+	if err := s.processGroups.SignalProcessGroup(target.pgid, syscall.SIGTERM); err != nil {
+		return err
+	}
+	s.cancelWaiter.Wait(s.cancelGrace)
+	alive, err := s.cancelProcessGroupStillAlive(target)
+	if err != nil || !alive {
+		return err
+	}
+	return s.processGroups.SignalProcessGroup(target.pgid, syscall.SIGKILL)
+}
+
+func (s *Store) liveCancelProcessGroup(record *JobRecord) (cancelProcessGroupTarget, bool, error) {
+	if record.Worker.PGID <= 0 {
+		return cancelProcessGroupTarget{}, false, nil
+	}
+	alive, err := s.processRefAlive(record.Worker)
+	if err != nil || !alive {
+		return cancelProcessGroupTarget{}, false, err
+	}
+	return cancelProcessGroupTarget{
+		pgid:            record.Worker.PGID,
+		worker:          record.Worker,
+		backendChildPID: record.BackendChildPID,
+	}, true, nil
+}
+
+func (s *Store) cancelProcessGroupStillAlive(target cancelProcessGroupTarget) (bool, error) {
+	alive, err := s.processRefAlive(target.worker)
+	if err != nil || alive {
+		return alive, err
+	}
+	if target.backendChildPID <= 0 {
+		return false, nil
+	}
+	_, childAlive, err := s.processes.Lookup(target.backendChildPID)
+	return childAlive, err
+}
+
+func (s *Store) processRefAlive(ref ProcessRef) (bool, error) {
+	if ref.PID <= 0 {
+		return false, nil
+	}
+	info, alive, err := s.processes.Lookup(ref.PID)
+	if err != nil || !alive {
+		return false, err
+	}
+	if ref.StartTime != "" {
+		if info.StartTime == "" {
+			return false, fmt.Errorf("cannot verify process %d start time", ref.PID)
+		}
+		return ref.StartTime == info.StartTime, nil
+	}
+	return true, nil
 }
 
 // Reap scans records, quarantines corrupt files, finalizes orphaned work, and runs GC.

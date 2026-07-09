@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -30,13 +31,26 @@ func (p fakeProcessTable) Lookup(pid int) (ProcessInfo, bool, error) {
 	return info, ok, nil
 }
 
+type testStoreOptions struct {
+	processGroups ProcessGroupSignaler
+	cancelWaiter  Waiter
+	cancelGrace   time.Duration
+}
+
 func newTestStore(t *testing.T, now time.Time, pt ProcessTable) *Store {
+	return newTestStoreWithOptions(t, now, pt, testStoreOptions{})
+}
+
+func newTestStoreWithOptions(t *testing.T, now time.Time, pt ProcessTable, opts testStoreOptions) *Store {
 	t.Helper()
 	store, err := NewStore(StoreConfig{
-		Root:      filepath.Join(t.TempDir(), "state"),
-		CWD:       t.TempDir(),
-		Clock:     &fakeClock{now: now},
-		Processes: pt,
+		Root:          filepath.Join(t.TempDir(), "state"),
+		CWD:           t.TempDir(),
+		Clock:         &fakeClock{now: now},
+		Processes:     pt,
+		ProcessGroups: opts.processGroups,
+		CancelWaiter:  opts.cancelWaiter,
+		CancelGrace:   opts.cancelGrace,
 		Retention: RetentionConfig{
 			TerminalJobTTL: time.Hour,
 			ResultTTL:      time.Hour,
@@ -47,6 +61,56 @@ func newTestStore(t *testing.T, now time.Time, pt ProcessTable) *Store {
 		t.Fatal(err)
 	}
 	return store
+}
+
+type processGroupSignal struct {
+	pgid   int
+	signal syscall.Signal
+}
+
+type recordingProcessGroupSignaler struct {
+	signals  []processGroupSignal
+	onSignal func(pgid int, signal syscall.Signal)
+}
+
+func (s *recordingProcessGroupSignaler) SignalProcessGroup(pgid int, signal syscall.Signal) error {
+	s.signals = append(s.signals, processGroupSignal{pgid: pgid, signal: signal})
+	if s.onSignal != nil {
+		s.onSignal(pgid, signal)
+	}
+	return nil
+}
+
+type recordingWaiter struct {
+	waits []time.Duration
+}
+
+func (w *recordingWaiter) Wait(d time.Duration) {
+	w.waits = append(w.waits, d)
+}
+
+func assertProcessGroupSignals(t *testing.T, got, want []processGroupSignal) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("signals = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("signals = %+v, want %+v", got, want)
+		}
+	}
+}
+
+func assertWaits(t *testing.T, got, want []time.Duration) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("waits = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("waits = %v, want %v", got, want)
+		}
+	}
 }
 
 func TestStateLayoutAndPermissions(t *testing.T) {
@@ -236,6 +300,137 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 				t.Fatalf("state = %s, want %s", got.State, tt.want)
 			}
 		})
+	}
+}
+
+func TestCancelRunningLiveProcessSignalsTermThenKillBeforeCanceled(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	entries := map[int]ProcessInfo{201: {PID: 201, StartTime: "worker-start"}}
+	signaler := &recordingProcessGroupSignaler{}
+	waiter := &recordingWaiter{}
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: entries}, testStoreOptions{
+		processGroups: signaler,
+		cancelWaiter:  waiter,
+		cancelGrace:   250 * time.Millisecond,
+	})
+	record := &JobRecord{
+		JobID:     "job_cancel_live",
+		State:     StateRunning,
+		UpdatedAt: base,
+		Lease:     Lease{ExpiresAt: base.Add(time.Minute)},
+		Worker:    ProcessRef{PID: 201, PGID: 301, StartTime: "worker-start"},
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	signaler.onSignal = func(pgid int, signal syscall.Signal) {
+		if pgid != 301 {
+			t.Fatalf("signaled pgid = %d, want 301", pgid)
+		}
+		loaded, err := store.loadPath(record.StatePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.State != StateRunning {
+			t.Fatalf("state during %s = %s, want running", signal, loaded.State)
+		}
+	}
+
+	canceled, err := store.Cancel(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceled.State != StateCanceled {
+		t.Fatalf("cancel state = %s, want canceled", canceled.State)
+	}
+	assertProcessGroupSignals(t, signaler.signals, []processGroupSignal{
+		{pgid: 301, signal: syscall.SIGTERM},
+		{pgid: 301, signal: syscall.SIGKILL},
+	})
+	assertWaits(t, waiter.waits, []time.Duration{250 * time.Millisecond})
+	persisted, err := store.loadPath(record.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.State != StateCanceled {
+		t.Fatalf("persisted state = %s, want canceled", persisted.State)
+	}
+}
+
+func TestCancelRunningProcessDyingOnTermSkipsKill(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	entries := map[int]ProcessInfo{202: {PID: 202, StartTime: "worker-start"}}
+	signaler := &recordingProcessGroupSignaler{}
+	waiter := &recordingWaiter{}
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: entries}, testStoreOptions{
+		processGroups: signaler,
+		cancelWaiter:  waiter,
+		cancelGrace:   time.Second,
+	})
+	record := &JobRecord{
+		JobID:     "job_cancel_term",
+		State:     StateRunning,
+		UpdatedAt: base,
+		Lease:     Lease{ExpiresAt: base.Add(time.Minute)},
+		Worker:    ProcessRef{PID: 202, PGID: 302, StartTime: "worker-start"},
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	signaler.onSignal = func(_ int, signal syscall.Signal) {
+		if signal == syscall.SIGTERM {
+			delete(entries, 202)
+		}
+	}
+
+	canceled, err := store.Cancel(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceled.State != StateCanceled {
+		t.Fatalf("cancel state = %s, want canceled", canceled.State)
+	}
+	assertProcessGroupSignals(t, signaler.signals, []processGroupSignal{
+		{pgid: 302, signal: syscall.SIGTERM},
+	})
+	assertWaits(t, waiter.waits, []time.Duration{time.Second})
+}
+
+func TestCancelRunningDeadProcessPersistsCanceledWithoutSignals(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	signaler := &recordingProcessGroupSignaler{}
+	waiter := &recordingWaiter{}
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		processGroups: signaler,
+		cancelWaiter:  waiter,
+		cancelGrace:   time.Second,
+	})
+	record := &JobRecord{
+		JobID:     "job_cancel_dead",
+		State:     StateRunning,
+		UpdatedAt: base,
+		Lease:     Lease{ExpiresAt: base.Add(time.Minute)},
+		Worker:    ProcessRef{PID: 203, PGID: 303, StartTime: "worker-start"},
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	canceled, err := store.Cancel(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceled.State != StateCanceled {
+		t.Fatalf("cancel state = %s, want canceled", canceled.State)
+	}
+	assertProcessGroupSignals(t, signaler.signals, nil)
+	assertWaits(t, waiter.waits, nil)
+	persisted, err := store.loadPath(record.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.State != StateCanceled {
+		t.Fatalf("persisted state = %s, want canceled", persisted.State)
 	}
 }
 
