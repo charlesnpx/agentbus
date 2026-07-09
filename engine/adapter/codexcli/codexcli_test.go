@@ -59,6 +59,9 @@ func TestCodexPreflightAndFailures(t *testing.T) {
 	if _, err := backend.Preflight(context.Background()); err == nil || !strings.Contains(err.Error(), "backend version changed since setup") {
 		t.Fatalf("drift err = %v", err)
 	}
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: "xhigh"}); err != nil {
+		t.Fatalf("xhigh effort err = %v", err)
+	}
 	if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: "extreme"}); err == nil || !strings.Contains(err.Error(), "unsupported effort") {
 		t.Fatalf("unsupported effort err = %v", err)
 	}

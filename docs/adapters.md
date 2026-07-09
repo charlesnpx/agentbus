@@ -76,6 +76,17 @@ Corrective resume is always read-only. It is used for policy repair after an
 invalid final result and MUST NOT inherit writable permissions from the original
 turn.
 
+### codex effort values
+
+When `SessionOpts.Effort` is provided, the codex adapter passes it as:
+
+```text
+--config model_reasoning_effort="<effort>"
+```
+
+The default codex effort allow-list is `none`, `minimal`, `low`, `medium`,
+`high`, and `xhigh`.
+
 ### claude write
 
 ```text

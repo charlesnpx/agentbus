@@ -23,7 +23,7 @@ type Options struct {
 func New(opts Options) engine.Backend {
 	efforts := opts.SupportedEfforts
 	if len(efforts) == 0 {
-		efforts = []string{"low", "medium", "high"}
+		efforts = []string{"none", "minimal", "low", "medium", "high", "xhigh"}
 	}
 	return &cliadapter.Backend{
 		NameValue:      "codex",
