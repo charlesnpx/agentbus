@@ -459,7 +459,15 @@ func splitLines(s string) []string {
 }
 
 func isFenceLine(line string) bool {
-	return strings.HasPrefix(line, "```")
+	spaces := 0
+	for spaces < len(line) && line[spaces] == ' ' {
+		spaces++
+	}
+	if spaces > 3 {
+		return false
+	}
+	line = line[spaces:]
+	return strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~")
 }
 
 type sectionMarker struct {
@@ -621,7 +629,9 @@ func canonicalJSON(v any) ([]byte, error) {
 		return nil, err
 	}
 	var decoded any
-	if err := json.Unmarshal(b, &decoded); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.UseNumber()
+	if err := decodeJSONDocument(decoder, &decoded); err != nil {
 		return nil, err
 	}
 	var out bytes.Buffer
@@ -641,6 +651,8 @@ func writeCanonical(out *bytes.Buffer, v any) {
 		}
 	case float64:
 		out.WriteString(strconv.FormatFloat(x, 'f', -1, 64))
+	case json.Number:
+		out.WriteString(x.String())
 	case string:
 		b, _ := json.Marshal(x)
 		out.Write(b)

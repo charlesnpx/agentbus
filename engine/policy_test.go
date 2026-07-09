@@ -56,6 +56,11 @@ func TestShapeContracts(t *testing.T) {
 			wantMissing: "section:Findings",
 		},
 		{
+			name:        "indented tilde fenced sections and attestations excluded",
+			text:        "PASS\n   ~~~md\n## Findings\n## Tests\nI inspected the diff.\n   ~~~\n",
+			wantMissing: "section:Findings",
+		},
+		{
 			name: "duplicates allowed first wins empty section satisfies",
 			text: "PASS\nFindings:\nfindings: later\nTests:\nI inspected the diff.",
 		},
@@ -123,6 +128,24 @@ func TestShapeEvidenceFencedFindingsDoNotTrigger(t *testing.T) {
 	}
 }
 
+func TestShapeIndentedFencesExcludeSectionsAttestationsAndEvidence(t *testing.T) {
+	t.Parallel()
+	contract := ContractSpec{Shape: &ShapeSpec{
+		RequiredSections:     []string{"Findings"},
+		RequiredAttestations: []string{"I inspected the diff."},
+		EvidenceHeuristic:    true,
+	}}
+	got, err := ValidateContract("   ```md\n## Findings\nI inspected the diff.\nengine/policy.go:461\n   ```\nFindings:\nThere is a real issue", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"attestation:I inspected the diff.", "evidence"} {
+		if !contains(got.Missing, want) {
+			t.Fatalf("missing = %v, want %q", got.Missing, want)
+		}
+	}
+}
+
 func TestJSONSchemaContracts(t *testing.T) {
 	t.Parallel()
 	contract := ContractSpec{JSONSchema: json.RawMessage(`{
@@ -161,6 +184,23 @@ func TestJSONSchemaContracts(t *testing.T) {
 				t.Fatalf("contract hash = %q", got.ContractSHA256)
 			}
 		})
+	}
+}
+
+func TestContractSHA256PreservesLargeJSONNumbers(t *testing.T) {
+	t.Parallel()
+	a := ContractSpec{JSONSchema: json.RawMessage(`{"const":9007199254740992}`)}
+	b := ContractSpec{JSONSchema: json.RawMessage(`{"const":9007199254740993}`)}
+	hashA, err := ContractSHA256(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hashB, err := ContractSHA256(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hashA == hashB {
+		t.Fatalf("hashes matched for distinct large numeric literals: %s", hashA)
 	}
 }
 
