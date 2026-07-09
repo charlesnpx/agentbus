@@ -44,8 +44,9 @@ Example response frame:
 
 `protocol.hello` MUST be the first request sent on a connection. A server MUST
 reject all other methods before a successful hello. A protocol major-version
-mismatch MUST return a structured JSON-RPC error with `code:
-"version_mismatch"`.
+mismatch MUST return a structured JSON-RPC error whose stable identifier is
+`error.data.code: "version_mismatch"`. The JSON-RPC `error.code` field MUST
+remain numeric and is implementation-defined.
 
 ## Trust model
 
@@ -57,9 +58,65 @@ State files contain sensitive data: prompts, diffs, tool output, backend logs,
 and final model output. Clients MUST treat paths returned by agentbus as private
 same-user state.
 
-The daemon MAY require a token file with mode `0600` and check that token during
-`protocol.hello`. That token is accident-prevention only. It is explicitly NOT a
-security boundary because same-user code can read it.
+The daemon MUST maintain a token file with mode `0600` and check the supplied
+token during `protocol.hello`. That token is accident-prevention only. It is
+explicitly NOT a security boundary because same-user code can read it.
+
+## Daemon, jobs, and state
+
+Implementations MUST provide `agentbus serve [--foreground]`. Client packages
+MUST autostart the daemon when a connection is requested and no live daemon is
+available.
+
+The daemon MUST support idle shutdown. The default idle shutdown threshold is
+30 minutes, and the daemon MUST shut down only when there are no client
+connections and no active or queued jobs or turns. A running background job
+always counts as activity. The daemon MUST support concurrent multi-job
+execution; the one-active-turn rule is per session, not per daemon.
+
+State storage requirements:
+
+| Item | Requirement |
+| --- | --- |
+| State root | `$XDG_STATE_HOME/agentbus`, falling back to `~/.local/state/agentbus` when `XDG_STATE_HOME` is unset. |
+| Directory modes | State directories MUST be created with mode `0700`. |
+| File and log modes | State files and logs MUST be created with mode `0600`. |
+| Workspace namespace | Per-workspace state MUST be keyed by the full 64-hex SHA-256 of the canonicalized absolute `cwd`. The digest MUST NOT be truncated. |
+
+Every foreground turn and background job MUST have a job record. A job record
+MUST include, when applicable:
+
+- supervisor PID, PGID, and process start time
+- worker PID, PGID, and process start time
+- heartbeat lease
+- backend session id
+- backend child PID
+
+`job.status`, `job.result`, `job.cancel`, and equivalent CLI status operations
+MUST detect expired heartbeat leases, stale queued jobs, foreground crashes,
+orphaned records, and PID reuse. PID reuse detection MUST compare the observed
+process start time with the start time recorded for that PID. Corrupted job
+records MUST be moved to a quarantine directory with diagnostics describing the
+record path and validation or parse failure. The daemon MUST run an independent
+reaper pass on daemon start and before every status call.
+
+Job-record writes MUST be atomic: write a temporary file in the same directory,
+fsync that file, rename it over the target, then fsync the containing
+directory. Each backend invocation MUST run in a new process group. Canceling a
+running job or interrupting a foreground turn MUST send `SIGTERM` to the
+process group, wait a grace period whose default is 10 seconds, then send
+`SIGKILL` to remaining processes in that group.
+
+Implementations MUST read process start time portably. On Linux this can use
+`/proc/<pid>/stat` field 22; on macOS this can use `ps -o lstart=` or `sysctl`.
+Backend stdout and stderr MUST be captured to state log files from process
+start. Log files MUST be size-capped, with a default cap of 10 MB, and capped
+logs MUST include a truncation marker.
+
+Terminal job records and logs MUST be retained for a default of 14 days.
+Spilled result files MUST be retained for a default of 14 days. Orphaned
+job-input files MUST be swept when their job is terminal. Garbage collection
+MUST piggyback on the reaper pass, and retention settings MUST be configurable.
 
 ## Identity model
 
@@ -140,8 +197,9 @@ Example terminal notification:
 
 ## Error-code namespace
 
-JSON-RPC numeric error codes are implementation-defined. The stable v1 error
-identifier is `error.data.code`, using this namespace:
+JSON-RPC numeric error codes are implementation-defined and MUST remain
+numeric. Structured errors MUST put the stable v1 error identifier in
+`error.data.code`, using this namespace:
 
 | Code | Meaning |
 | --- | --- |
@@ -187,9 +245,13 @@ Request params:
 ```json
 {
   "clientProtocolVersion": 1,
-  "token": "optional-accident-prevention-token"
+  "token": "accident-prevention-token"
 }
 ```
+
+`token` is REQUIRED. The server MUST check it against the daemon token file
+before advertising capabilities. The token check is accident-prevention only;
+it is not a security boundary.
 
 Result:
 
@@ -204,6 +266,23 @@ Result:
     "policy.retry": true,
     "nativeStructuredOutput.codex": false,
     "nativeStructuredOutput.claude": false
+  }
+}
+```
+
+Version mismatch error example:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "error": {
+    "code": -32000,
+    "message": "protocol major version mismatch",
+    "data": {
+      "code": "version_mismatch",
+      "serverProtocolVersion": 1
+    }
   }
 }
 ```
@@ -325,7 +404,8 @@ Request params:
       "max": 1,
       "template": "Your response missed: {{missing}}. Emit the corrected report only; make no further changes."
     }
-  }
+  },
+  "timeoutMs": 1800000
 }
 ```
 
@@ -341,6 +421,9 @@ Result:
 
 `write` is optional and defaults to the session default. A server MUST allow a
 turn to downgrade a write-enabled session to `write:false`.
+
+`timeoutMs` is optional and uses the same timeout semantics as
+`taskSpec.timeoutMs`.
 
 There is exactly one active turn per session. If `turn.start` is called while
 the session has an active turn, the server MUST return `session_busy`. The
@@ -675,12 +758,19 @@ Allowed fields:
 | `prompt` | yes | string | User prompt. |
 | `policy` | no | TurnPolicy | Generic structural policy. |
 | `tags` | no | object | Client-supplied string tags for discovery. |
-| `timeoutMs` | yes | integer | Timeout in milliseconds. |
+| `timeoutMs` | no | integer | Timeout in milliseconds. See timeout rules below. |
 
 No other fields are permitted in v1. An implementation MUST reject unknown
 fields with `invalid_task_spec`. A future protocol version MAY add a `kind`
 discriminator. v1 intentionally does not include open-ended extensibility:
 workflow composition belongs to clients, not agentbus.
+
+When `timeoutMs` is omitted, the timeout defaults to 1800000 milliseconds
+(30 minutes). Non-zero timeout values MUST NOT exceed 14400000 milliseconds
+(4 hours). The explicit value `0` means unbounded. Unbounded timeout is allowed
+only when `timeoutMs` is explicitly set to `0`; implementations MUST NOT infer
+an unbounded timeout from an omitted field. These rules apply to foreground
+turns and background jobs alike.
 
 ## State machine
 
@@ -737,7 +827,7 @@ codes as follows:
 | `reaped` | 8 |
 | `quarantined` | 9 |
 
-Non-terminal states returned by polling commands SHOULD use exit code `2` when
+Non-terminal states returned by polling commands MUST use exit code `2` when
 the command cannot return a terminal result yet.
 
 ## Result-size semantics
