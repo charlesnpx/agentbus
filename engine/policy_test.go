@@ -161,6 +161,126 @@ func TestJSONSchemaContracts(t *testing.T) {
 	}
 }
 
+func TestJSONSchemaDraft202012Features(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		schema string
+		text   string
+		valid  bool
+	}{
+		{
+			name: "allOf applies every subschema",
+			schema: `{
+				"$schema":"https://json-schema.org/draft/2020-12/schema",
+				"allOf":[
+					{"type":"object","required":["status"]},
+					{"properties":{"status":{"const":"ok"}}}
+				]
+			}`,
+			text:  `{"status":"bad"}`,
+			valid: false,
+		},
+		{
+			name: "anyOf accepts one matching branch",
+			schema: `{
+				"$schema":"https://json-schema.org/draft/2020-12/schema",
+				"anyOf":[
+					{"required":["alpha"]},
+					{"required":["beta"]}
+				]
+			}`,
+			text:  `{"beta":true}`,
+			valid: true,
+		},
+		{
+			name: "oneOf rejects multiple matching branches",
+			schema: `{
+				"$schema":"https://json-schema.org/draft/2020-12/schema",
+				"oneOf":[
+					{"required":["alpha"]},
+					{"required":["beta"]}
+				]
+			}`,
+			text:  `{"alpha":true,"beta":true}`,
+			valid: false,
+		},
+		{
+			name: "not rejects forbidden shape",
+			schema: `{
+				"$schema":"https://json-schema.org/draft/2020-12/schema",
+				"not":{"required":["debug"]}
+			}`,
+			text:  `{"debug":true}`,
+			valid: false,
+		},
+		{
+			name: "local ref resolves definitions",
+			schema: `{
+				"$schema":"https://json-schema.org/draft/2020-12/schema",
+				"$defs":{"nonEmptyString":{"type":"string","minLength":1}},
+				"type":"object",
+				"properties":{"name":{"$ref":"#/$defs/nonEmptyString"}},
+				"required":["name"]
+			}`,
+			text:  `{"name":""}`,
+			valid: false,
+		},
+		{
+			name: "format remains annotation by default",
+			schema: `{
+				"$schema":"https://json-schema.org/draft/2020-12/schema",
+				"type":"object",
+				"properties":{"email":{"type":"string","format":"email"}},
+				"required":["email"]
+			}`,
+			text:  `{"email":"not an email address"}`,
+			valid: true,
+		},
+		{
+			name: "nested conditionals apply selected branch",
+			schema: `{
+				"$schema":"https://json-schema.org/draft/2020-12/schema",
+				"type":"object",
+				"required":["kind","payload"],
+				"properties":{
+					"kind":{"enum":["metric","message"]},
+					"payload":{"type":"object"}
+				},
+				"if":{"properties":{"kind":{"const":"metric"}}},
+				"then":{
+					"properties":{
+						"payload":{
+							"required":["unit","value"],
+							"if":{"properties":{"unit":{"const":"count"}}},
+							"then":{"properties":{"value":{"type":"integer"}}},
+							"else":{"properties":{"value":{"type":"number","exclusiveMinimum":0}}}
+						}
+					}
+				},
+				"else":{
+					"properties":{"payload":{"required":["text"],"properties":{"text":{"type":"string","minLength":1}}}}
+				}
+			}`,
+			text:  `{"kind":"metric","payload":{"unit":"count","value":1.5}}`,
+			valid: false,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ValidateContract(tt.text, ContractSpec{JSONSchema: json.RawMessage(tt.schema)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Valid != tt.valid {
+				t.Fatalf("valid = %v, missing = %v, want %v", got.Valid, got.Missing, tt.valid)
+			}
+		})
+	}
+}
+
 func TestPolicyRegistry(t *testing.T) {
 	t.Parallel()
 	registry := NewPolicyRegistry()

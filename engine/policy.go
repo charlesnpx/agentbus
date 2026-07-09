@@ -7,12 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // TurnPolicy describes optional structural validation for a backend turn.
@@ -290,6 +293,9 @@ func validateConcreteContract(contract ContractSpec) error {
 		count++
 		if !json.Valid(contract.JSONSchema) {
 			return errors.New("jsonSchema must be valid JSON")
+		}
+		if _, err := compileJSONSchema(contract.JSONSchema); err != nil {
+			return fmt.Errorf("jsonSchema must be valid Draft 2020-12 schema: %w", err)
 		}
 	}
 	if contract.Shape != nil {
@@ -602,143 +608,47 @@ func writeCanonical(out *bytes.Buffer, v any) {
 
 func validateJSONSchema(text string, schemaRaw json.RawMessage) []string {
 	var value any
-	if err := json.Unmarshal([]byte(text), &value); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(text))
+	decoder.UseNumber()
+	if err := decodeJSONDocument(decoder, &value); err != nil {
 		return []string{"json"}
 	}
-	var schema any
-	if err := json.Unmarshal(schemaRaw, &schema); err != nil {
+	schema, err := compileJSONSchema(schemaRaw)
+	if err != nil {
 		return []string{"jsonSchema"}
 	}
-	var missing []string
-	validateSchemaValue(value, schema, "$", &missing)
-	return missing
+	if err := schema.Validate(value); err != nil {
+		return []string{"jsonSchema"}
+	}
+	return nil
 }
 
-func validateSchemaValue(value any, schema any, path string, missing *[]string) {
-	sm, ok := schema.(map[string]any)
-	if !ok {
-		return
+func compileJSONSchema(schemaRaw json.RawMessage) (*jsonschema.Schema, error) {
+	var schemaDoc any
+	decoder := json.NewDecoder(bytes.NewReader(schemaRaw))
+	decoder.UseNumber()
+	if err := decodeJSONDocument(decoder, &schemaDoc); err != nil {
+		return nil, err
 	}
-	if types, ok := sm["type"]; ok && !matchesJSONType(value, types) {
-		*missing = append(*missing, "jsonSchema:"+path+":type")
-		return
+	compiler := jsonschema.NewCompiler()
+	compiler.DefaultDraft(jsonschema.Draft2020)
+	const schemaURL = "agentbus://policy.schema.json"
+	if err := compiler.AddResource(schemaURL, schemaDoc); err != nil {
+		return nil, err
 	}
-	if enum, ok := sm["enum"].([]any); ok {
-		matched := false
-		for _, candidate := range enum {
-			if jsonEqual(value, candidate) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			*missing = append(*missing, "jsonSchema:"+path+":enum")
-		}
-	}
-	obj, isObj := value.(map[string]any)
-	if required, ok := sm["required"].([]any); ok {
-		for _, item := range required {
-			name, ok := item.(string)
-			if !ok {
-				continue
-			}
-			if !isObj {
-				*missing = append(*missing, "jsonSchema:"+path+":required:"+name)
-				continue
-			}
-			if _, exists := obj[name]; !exists {
-				*missing = append(*missing, "jsonSchema:"+path+":required:"+name)
-			}
-		}
-	}
-	if isObj {
-		if props, ok := sm["properties"].(map[string]any); ok {
-			for name, propSchema := range props {
-				if child, exists := obj[name]; exists {
-					validateSchemaValue(child, propSchema, path+"."+name, missing)
-				}
-			}
-		}
-		if additional, ok := sm["additionalProperties"].(bool); ok && !additional {
-			if props, _ := sm["properties"].(map[string]any); props != nil {
-				for name := range obj {
-					if _, allowed := props[name]; !allowed {
-						*missing = append(*missing, "jsonSchema:"+path+":additionalProperties:"+name)
-					}
-				}
-			}
-		}
-	}
-	if arr, ok := value.([]any); ok {
-		if min, ok := numberKeyword(sm["minItems"]); ok && len(arr) < int(min) {
-			*missing = append(*missing, "jsonSchema:"+path+":minItems")
-		}
-		if itemSchema, ok := sm["items"]; ok {
-			for i, item := range arr {
-				validateSchemaValue(item, itemSchema, fmt.Sprintf("%s[%d]", path, i), missing)
-			}
-		}
-	}
-	if s, ok := value.(string); ok {
-		if min, ok := numberKeyword(sm["minLength"]); ok && len(s) < int(min) {
-			*missing = append(*missing, "jsonSchema:"+path+":minLength")
-		}
-		if pattern, ok := sm["pattern"].(string); ok {
-			re, err := regexp.Compile(pattern)
-			if err != nil || !re.MatchString(s) {
-				*missing = append(*missing, "jsonSchema:"+path+":pattern")
-			}
-		}
-	}
+	return compiler.Compile(schemaURL)
 }
 
-func matchesJSONType(value any, types any) bool {
-	if list, ok := types.([]any); ok {
-		for _, item := range list {
-			if name, ok := item.(string); ok && matchesJSONTypeName(value, name) {
-				return true
-			}
+func decodeJSONDocument(decoder *json.Decoder, dst *any) error {
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values")
 		}
-		return false
+		return err
 	}
-	name, ok := types.(string)
-	return ok && matchesJSONTypeName(value, name)
-}
-
-func matchesJSONTypeName(value any, name string) bool {
-	switch name {
-	case "null":
-		return value == nil
-	case "boolean":
-		_, ok := value.(bool)
-		return ok
-	case "object":
-		_, ok := value.(map[string]any)
-		return ok
-	case "array":
-		_, ok := value.([]any)
-		return ok
-	case "number":
-		_, ok := value.(float64)
-		return ok
-	case "integer":
-		n, ok := value.(float64)
-		return ok && n == float64(int64(n))
-	case "string":
-		_, ok := value.(string)
-		return ok
-	default:
-		return true
-	}
-}
-
-func jsonEqual(a, b any) bool {
-	ab, _ := canonicalJSON(a)
-	bb, _ := canonicalJSON(b)
-	return bytes.Equal(ab, bb)
-}
-
-func numberKeyword(v any) (float64, bool) {
-	n, ok := v.(float64)
-	return n, ok
+	return nil
 }
