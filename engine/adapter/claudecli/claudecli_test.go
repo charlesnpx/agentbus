@@ -32,6 +32,17 @@ func TestClaudeProfilesAndParsing(t *testing.T) {
 	}
 	assertLog(t, fake.argv, "--print\n--output-format\nstream-json\n--model\nsonnet\n--effort\nmax\n--dangerously-skip-permissions\n")
 
+	session, err = backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err = session.Turn(context.Background(), engine.TurnInput{Prompt: "inspect", Write: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collect(events)
+	assertLog(t, fake.argv, expectedClaudeReadOnlyArgv(""))
+
 	session, err = backend.Resume(context.Background(), "claude-session", engine.SessionOpts{Write: true})
 	if err != nil {
 		t.Fatal(err)
@@ -41,20 +52,30 @@ func TestClaudeProfilesAndParsing(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = collect(events)
-	args := readLog(t, fake.argv)
-	wantPrefix := "--print\n--output-format\nstream-json\n--bare\n--strict-mcp-config\n--mcp-config\n{}\n--permission-mode\ndontAsk\n--allowedTools\n"
-	if !strings.HasPrefix(args, wantPrefix) {
-		t.Fatalf("read-only argv prefix = %q", args)
-	}
-	for _, want := range []string{"Read", "Grep", "Glob", "Bash(git diff*)", "--disallowedTools", "Edit", "Write", "NotebookEdit", "mcp__*", "Bash(git push*)", "--resume\nclaude-session\n"} {
-		if !strings.Contains(args, want) {
-			t.Fatalf("read-only argv missing %q in %q", want, args)
-		}
-	}
-	if strings.Contains(args, "--dangerously-skip-permissions") {
-		t.Fatalf("read-only argv included bypass flag: %q", args)
-	}
+	assertLog(t, fake.argv, expectedClaudeReadOnlyArgv("claude-session"))
 	assertLog(t, fake.stdin, "repair")
+}
+
+func expectedClaudeReadOnlyArgv(resumeID string) string {
+	args := []string{
+		"--print",
+		"--output-format",
+		"stream-json",
+		"--bare",
+		"--strict-mcp-config",
+		"--mcp-config",
+		"{}",
+		"--permission-mode",
+		"dontAsk",
+		"--allowedTools",
+		"Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(git status*),Bash(cat*),Bash(rg*),Bash(grep*),Bash(ls*),Bash(head*),Bash(tail*),Bash(wc*)",
+		"--disallowedTools",
+		"Edit,Write,NotebookEdit,mcp__*,Bash(*>*),Bash(*>>*),Bash(*| tee*),Bash(*|tee*),Bash(sed -i*),Bash(tee*),Bash(find*),Bash(rm*),Bash(mv*),Bash(cp*),Bash(git commit*),Bash(git push*),Bash(git checkout*),Bash(chmod*),Bash(curl*),Bash(wget*)",
+	}
+	if resumeID != "" {
+		args = append(args, "--resume", resumeID)
+	}
+	return strings.Join(args, "\n") + "\n"
 }
 
 func TestClaudePreflightAndFailures(t *testing.T) {

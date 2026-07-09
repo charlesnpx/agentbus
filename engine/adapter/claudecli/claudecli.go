@@ -29,7 +29,6 @@ var readOnlyAllowedTools = []string{
 	"Bash(head*)",
 	"Bash(tail*)",
 	"Bash(wc*)",
-	"Bash(find*)",
 }
 
 var readOnlyDeniedTools = []string{
@@ -37,10 +36,13 @@ var readOnlyDeniedTools = []string{
 	"Write",
 	"NotebookEdit",
 	"mcp__*",
-	"Bash(>*)",
-	"Bash(>>*)",
+	"Bash(*>*)",
+	"Bash(*>>*)",
+	"Bash(*| tee*)",
+	"Bash(*|tee*)",
 	"Bash(sed -i*)",
 	"Bash(tee*)",
+	"Bash(find*)",
 	"Bash(rm*)",
 	"Bash(mv*)",
 	"Bash(cp*)",
