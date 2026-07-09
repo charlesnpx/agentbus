@@ -61,6 +61,21 @@ func TestShapeContracts(t *testing.T) {
 			wantMissing: "section:Findings",
 		},
 		{
+			name:        "backtick fence not closed by tilde fence",
+			text:        "PASS\n```md\n~~~\n## Findings\n## Tests\nI inspected the diff.\n```\n",
+			wantMissing: "section:Findings",
+		},
+		{
+			name:        "long backtick fence not closed by shorter run",
+			text:        "PASS\n````md\n```\n## Findings\n## Tests\nI inspected the diff.\n````\n",
+			wantMissing: "section:Findings",
+		},
+		{
+			name:        "tilde fence not closed by backtick fence",
+			text:        "PASS\n~~~md\n```\n## Findings\n## Tests\nI inspected the diff.\n~~~\n",
+			wantMissing: "section:Findings",
+		},
+		{
 			name: "duplicates allowed first wins empty section satisfies",
 			text: "PASS\nFindings:\nfindings: later\nTests:\nI inspected the diff.",
 		},

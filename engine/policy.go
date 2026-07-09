@@ -437,13 +437,16 @@ func firstLine(s string) string {
 func outsideFences(raw string) string {
 	lines := splitLines(raw)
 	var b strings.Builder
-	inFence := false
+	var fence *fenceMarker
 	for _, line := range lines {
-		if isFenceLine(line) {
-			inFence = !inFence
+		if fence != nil {
+			if isClosingFence(line, *fence) {
+				fence = nil
+			}
 			continue
 		}
-		if inFence {
+		if marker, ok := openingFence(line); ok {
+			fence = &marker
 			continue
 		}
 		b.WriteString(line)
@@ -458,7 +461,31 @@ func splitLines(s string) []string {
 	return strings.Split(s, "\n")
 }
 
-func isFenceLine(line string) bool {
+type fenceMarker struct {
+	char byte
+	run  int
+}
+
+func openingFence(line string) (fenceMarker, bool) {
+	spaces := 0
+	for spaces < len(line) && line[spaces] == ' ' {
+		spaces++
+	}
+	if spaces > 3 {
+		return fenceMarker{}, false
+	}
+	line = line[spaces:]
+	if len(line) < 3 || (line[0] != '`' && line[0] != '~') {
+		return fenceMarker{}, false
+	}
+	run := fenceRun(line, line[0])
+	if run < 3 {
+		return fenceMarker{}, false
+	}
+	return fenceMarker{char: line[0], run: run}, true
+}
+
+func isClosingFence(line string, opener fenceMarker) bool {
 	spaces := 0
 	for spaces < len(line) && line[spaces] == ' ' {
 		spaces++
@@ -467,7 +494,19 @@ func isFenceLine(line string) bool {
 		return false
 	}
 	line = line[spaces:]
-	return strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~")
+	run := fenceRun(line, opener.char)
+	if run < opener.run {
+		return false
+	}
+	return strings.TrimSpace(line[run:]) == ""
+}
+
+func fenceRun(line string, char byte) int {
+	run := 0
+	for run < len(line) && line[run] == char {
+		run++
+	}
+	return run
 }
 
 type sectionMarker struct {
@@ -597,12 +636,13 @@ func hasEvidence(raw, outside string) bool {
 	}
 	lines := splitLines(raw)
 	for i := 0; i < len(lines); i++ {
-		if !isFenceLine(lines[i]) {
+		marker, ok := openingFence(lines[i])
+		if !ok {
 			continue
 		}
 		start := i
 		i++
-		for i < len(lines) && !isFenceLine(lines[i]) {
+		for i < len(lines) && !isClosingFence(lines[i], marker) {
 			i++
 		}
 		if i >= len(lines) {
