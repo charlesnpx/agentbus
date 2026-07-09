@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -110,24 +111,29 @@ func (s *Store) Save(record *JobRecord) error {
 	if record == nil {
 		return errors.New("nil job record")
 	}
-	path, err := s.jobPath(record.JobID)
-	if err != nil {
+	if err := validateJobID(record.JobID); err != nil {
 		return err
 	}
-	now := s.clock.Now().UTC()
-	if record.CreatedAt.IsZero() {
-		record.CreatedAt = now
-	}
-	if record.UpdatedAt.IsZero() {
-		record.UpdatedAt = now
-	}
-	record.StatePath = path
-	b, err := json.MarshalIndent(record, "", "  ")
-	if err != nil {
-		return err
-	}
-	b = append(b, '\n')
-	return atomicWriteFile(record.StatePath, b, 0o600)
+	return s.withJobLock(record.JobID, func() error {
+		path, err := s.jobPath(record.JobID)
+		if err != nil {
+			return err
+		}
+		now := s.clock.Now().UTC()
+		if record.CreatedAt.IsZero() {
+			record.CreatedAt = now
+		}
+		if record.UpdatedAt.IsZero() {
+			record.UpdatedAt = now
+		}
+		record.StatePath = path
+		b, err := json.MarshalIndent(record, "", "  ")
+		if err != nil {
+			return err
+		}
+		b = append(b, '\n')
+		return atomicWriteFile(record.StatePath, b, 0o600)
+	})
 }
 
 // Load reads a job record and computes status-only lease fields.
@@ -185,21 +191,33 @@ func (s *Store) Reap() error {
 			continue
 		}
 		path := filepath.Join(s.layout.Jobs, entry.Name())
-		record, original, err := s.loadPathWithBytes(path)
-		if err != nil {
+		jobID := strings.TrimSuffix(entry.Name(), ".json")
+		if err := validateJobID(jobID); err != nil {
 			if qerr := s.quarantine(path, err); qerr != nil {
 				return qerr
 			}
 			continue
 		}
-		changed, err := s.reapRecord(record, now)
-		if err != nil {
-			return err
-		}
-		if changed {
-			if err := s.saveIfUnchanged(record, path, original); err != nil {
+		if err := s.withJobLock(jobID, func() error {
+			record, original, err := s.loadPathWithBytes(path)
+			if err != nil {
+				if qerr := s.quarantine(path, err); qerr != nil {
+					return qerr
+				}
+				return nil
+			}
+			changed, err := s.reapRecord(record, now)
+			if err != nil {
 				return err
 			}
+			if changed {
+				if err := s.saveIfUnchanged(record, path, original); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 	return s.gc(now)
@@ -276,29 +294,53 @@ func (s *Store) gc(now time.Time) error {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		record, err := s.loadPath(filepath.Join(s.layout.Jobs, entry.Name()))
+		path := filepath.Join(s.layout.Jobs, entry.Name())
+		jobID := strings.TrimSuffix(entry.Name(), ".json")
+		if err := validateJobID(jobID); err != nil {
+			continue
+		}
+		record, err := s.loadPath(path)
 		if err != nil {
 			continue
 		}
 		if record.Result != nil && record.Result.ResultPath != "" {
 			protectedResults[filepath.Clean(record.Result.ResultPath)] = struct{}{}
 		}
-		if !IsTerminal(record.State) || now.Sub(record.UpdatedAt) < s.retention.TerminalJobTTL {
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		if record.Result != nil && record.Result.ResultPath != "" {
-			resultPath := filepath.Clean(record.Result.ResultPath)
-			delete(protectedResults, resultPath)
-			if pathWithinDir(s.layout.Results, resultPath) {
-				_ = removeIfExists(resultPath)
+		path := filepath.Join(s.layout.Jobs, entry.Name())
+		jobID := strings.TrimSuffix(entry.Name(), ".json")
+		if err := validateJobID(jobID); err != nil {
+			continue
+		}
+		if err := s.withJobLock(jobID, func() error {
+			record, err := s.loadPath(path)
+			if err != nil {
+				return nil
 			}
+			if !IsTerminal(record.State) || now.Sub(record.UpdatedAt) < s.retention.TerminalJobTTL {
+				return nil
+			}
+			if record.Result != nil && record.Result.ResultPath != "" {
+				resultPath := filepath.Clean(record.Result.ResultPath)
+				delete(protectedResults, resultPath)
+				if pathWithinDir(s.layout.Results, resultPath) {
+					_ = removeIfExists(resultPath)
+				}
+			}
+			_ = removeContainedIfExists(s.layout.Logs, record.LogPaths.Stdout)
+			_ = removeContainedIfExists(s.layout.Logs, record.LogPaths.Stderr)
+			if inputPath, err := safePathForID(s.layout.Inputs, record.JobID, ".json"); err == nil {
+				_ = removeIfExists(inputPath)
+			}
+			_ = removeIfExists(record.StatePath)
+			return nil
+		}); err != nil {
+			return err
 		}
-		_ = removeIfExists(record.LogPaths.Stdout)
-		_ = removeIfExists(record.LogPaths.Stderr)
-		if inputPath, err := safePathForID(s.layout.Inputs, record.JobID, ".json"); err == nil {
-			_ = removeIfExists(inputPath)
-		}
-		_ = removeIfExists(record.StatePath)
 	}
 	for _, dir := range []string{s.layout.Results} {
 		entries, err := os.ReadDir(dir)
@@ -374,6 +416,23 @@ func (s *Store) saveIfUnchanged(record *JobRecord, path string, original []byte)
 	return atomicWriteFile(path, b, 0o600)
 }
 
+func (s *Store) withJobLock(jobID string, fn func() error) error {
+	lockPath, err := safePathForID(s.layout.Jobs, jobID, ".lock")
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+	return fn()
+}
+
 func (s *Store) jobPath(jobID string) (string, error) {
 	return safePathForID(s.layout.Jobs, jobID, ".json")
 }
@@ -426,6 +485,17 @@ func removeIfExists(path string) error {
 		return err
 	}
 	return nil
+}
+
+func removeContainedIfExists(dir, path string) error {
+	if path == "" {
+		return nil
+	}
+	clean := filepath.Clean(path)
+	if !pathWithinDir(dir, clean) {
+		return nil
+	}
+	return removeIfExists(clean)
 }
 
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {

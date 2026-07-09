@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -280,26 +281,7 @@ func TestLoadAndListRunReaperAndQuarantine(t *testing.T) {
 
 func TestReaperDoesNotClobberRefreshedHeartbeat(t *testing.T) {
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
-	var store *Store
-	refreshed := false
-	pt := processTableFunc(func(pid int) (ProcessInfo, bool, error) {
-		if !refreshed {
-			refreshed = true
-			fresh := &JobRecord{
-				JobID:     "job_live_refresh",
-				State:     StateRunning,
-				UpdatedAt: base.Add(time.Second),
-				Lease:     Lease{ExpiresAt: base.Add(time.Hour)},
-				Worker:    ProcessRef{PID: pid, StartTime: "fresh"},
-			}
-			if err := store.Save(fresh); err != nil {
-				t.Fatal(err)
-			}
-			return ProcessInfo{}, false, nil
-		}
-		return ProcessInfo{PID: pid, StartTime: "fresh"}, true, nil
-	})
-	store = newTestStore(t, base, pt)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
 	stale := &JobRecord{
 		JobID:     "job_live_refresh",
 		State:     StateRunning,
@@ -310,8 +292,44 @@ func TestReaperDoesNotClobberRefreshedHeartbeat(t *testing.T) {
 	if err := store.Save(stale); err != nil {
 		t.Fatal(err)
 	}
+
+	oldHook := atomicWriteFileCrashHook
+	defer func() { atomicWriteFileCrashHook = oldHook }()
+	saveDone := make(chan error, 1)
+	var once sync.Once
+	saveCompletedInHook := false
+	var saveErr error
+	atomicWriteFileCrashHook = func(stage, path string) {
+		if stage != "after-temp-sync" || !strings.HasPrefix(filepath.Base(path), "job_live_refresh.json.tmp-") {
+			return
+		}
+		once.Do(func() {
+			go func() {
+				fresh := &JobRecord{
+					JobID:     "job_live_refresh",
+					State:     StateRunning,
+					UpdatedAt: base.Add(time.Second),
+					Lease:     Lease{ExpiresAt: base.Add(time.Hour)},
+					Worker:    ProcessRef{PID: 200, StartTime: "fresh"},
+				}
+				saveDone <- store.Save(fresh)
+			}()
+			select {
+			case saveErr = <-saveDone:
+				saveCompletedInHook = true
+			case <-time.After(50 * time.Millisecond):
+			}
+		})
+	}
+
 	if err := store.Reap(); err != nil {
 		t.Fatal(err)
+	}
+	if !saveCompletedInHook {
+		saveErr = <-saveDone
+	}
+	if saveErr != nil {
+		t.Fatal(saveErr)
 	}
 	got, err := store.loadPath(stale.StatePath)
 	if err != nil {
@@ -319,6 +337,39 @@ func TestReaperDoesNotClobberRefreshedHeartbeat(t *testing.T) {
 	}
 	if got.State != StateRunning || got.Worker.StartTime != "fresh" {
 		t.Fatalf("reaper clobbered refreshed record: %+v", got)
+	}
+}
+
+func TestGCIgnoresLogPathsOutsideLayout(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	outside := filepath.Join(t.TempDir(), "must-not-delete.log")
+	if err := os.WriteFile(outside, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := base.Add(-2 * time.Hour)
+	record := &JobRecord{
+		JobID:     "job_malicious_logs",
+		State:     StateCompleted,
+		UpdatedAt: old,
+		LogPaths:  LogPaths{Stdout: outside, Stderr: filepath.Join("..", "escape.log")},
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	record.UpdatedAt = old
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("outside log path was removed or became inaccessible: %v", err)
+	}
+	if _, err := os.Stat(record.StatePath); !os.IsNotExist(err) {
+		t.Fatalf("expired record still exists or unexpected err: %v", err)
 	}
 }
 
