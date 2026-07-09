@@ -198,6 +198,45 @@ func (s *Store) List() ([]JobRecord, error) {
 	return out, nil
 }
 
+// Cancel transitions a queued or active job record to canceled after a reaper pass.
+func (s *Store) Cancel(jobID string) (*JobRecord, error) {
+	if err := validateJobID(jobID); err != nil {
+		return nil, err
+	}
+	if err := s.Reap(); err != nil {
+		return nil, err
+	}
+	path, err := s.jobPath(jobID)
+	if err != nil {
+		return nil, err
+	}
+	now := s.clock.Now().UTC()
+	var out *JobRecord
+	if err := s.withJobLock(jobID, func() error {
+		record, original, err := s.loadPathWithBytes(path)
+		if err != nil {
+			return err
+		}
+		if IsTerminal(record.State) {
+			status := record.StatusRecord(now)
+			out = &status
+			return nil
+		}
+		if err := record.Transition(StateCanceled, now); err != nil {
+			return err
+		}
+		if err := s.saveIfUnchanged(record, path, original); err != nil {
+			return err
+		}
+		status := record.StatusRecord(now)
+		out = &status
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Reap scans records, quarantines corrupt files, finalizes orphaned work, and runs GC.
 func (s *Store) Reap() error {
 	now := s.clock.Now().UTC()

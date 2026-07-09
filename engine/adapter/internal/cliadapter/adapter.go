@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -70,6 +69,75 @@ func (b *Backend) Preflight(ctx context.Context) (engine.Health, error) {
 	}, nil
 }
 
+// SetupProbe runs the live setup-time stream probe and returns the cache entry
+// later consumed by Preflight.
+func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, error) {
+	binary, err := exec.LookPath(b.binary())
+	if err != nil {
+		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s binary not found: %w", b.NameValue, err)
+	}
+	version, err := commandOutput(ctx, binary, "--version")
+	if err != nil {
+		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s version check failed: %w", b.NameValue, err)
+	}
+	version = b.normalizeVersion(version)
+	if compareVersion(version, b.MinimumVersion) < 0 {
+		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s version %s is below minimum known-good %s", b.NameValue, version, b.MinimumVersion)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return engine.BackendSetupProbe{}, err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	session, err := b.Start(probeCtx, engine.SessionOpts{
+		CWD:     cwd,
+		Write:   false,
+		Timeout: 2 * time.Minute,
+	})
+	if err != nil {
+		return engine.BackendSetupProbe{}, err
+	}
+	events, err := session.Turn(probeCtx, engine.TurnInput{
+		Prompt:  "Reply with exactly: OK\n",
+		Write:   false,
+		Timeout: 2 * time.Minute,
+	})
+	if err != nil {
+		return engine.BackendSetupProbe{}, err
+	}
+	var sawEvent bool
+	var warnings []string
+	for event := range events {
+		if event.Type == engine.EventWarning {
+			warnings = append(warnings, event.Text)
+			continue
+		}
+		sawEvent = true
+	}
+	if probeCtx.Err() != nil {
+		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s setup stream probe failed: %w", b.NameValue, probeCtx.Err())
+	}
+	if len(warnings) > 0 {
+		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s setup stream probe warning: %s", b.NameValue, strings.Join(warnings, "; "))
+	}
+	if !sawEvent {
+		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s setup stream probe produced no JSON events", b.NameValue)
+	}
+	return engine.BackendSetupProbe{
+		Backend:      b.NameValue,
+		BinaryPath:   binary,
+		Version:      version,
+		StreamSchema: b.StreamSchema,
+		ConfigMode: engine.ModeInfo{
+			Write:    "user",
+			ReadOnly: "hermetic",
+		},
+		SandboxModes:     []string{"workspace-write", "read-only"},
+		JSONEventsProbed: true,
+	}, nil
+}
+
 func (b *Backend) Start(ctx context.Context, opts engine.SessionOpts) (engine.Session, error) {
 	if err := b.validateOptions(opts); err != nil {
 		return nil, err
@@ -125,11 +193,11 @@ func (b *Backend) validateOptions(opts engine.SessionOpts) error {
 func (b *Backend) cachedProbe() (engine.BackendSetupProbe, error) {
 	path := b.CachePath
 	if path == "" {
-		root, err := engine.ResolveStateRoot()
+		var err error
+		path, err = engine.SetupProbeCachePath("")
 		if err != nil {
 			return engine.BackendSetupProbe{}, err
 		}
-		path = filepath.Join(root, "setup-probes.json")
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {

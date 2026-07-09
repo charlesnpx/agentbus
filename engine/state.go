@@ -3,6 +3,7 @@ package engine
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -22,6 +23,55 @@ func ResolveStateRoot() (string, error) {
 		return "", errors.New("home directory is empty")
 	}
 	return filepath.Join(home, ".local", "state", "agentbus"), nil
+}
+
+// SetupProbeCachePath returns the protocol state path for setup probe cache.
+func SetupProbeCachePath(root string) (string, error) {
+	if root == "" {
+		var err error
+		root, err = ResolveStateRoot()
+		if err != nil {
+			return "", err
+		}
+	}
+	return filepath.Join(root, "setup-probes.json"), nil
+}
+
+// WriteSetupProbeCache writes the setup probe cache with protocol state permissions.
+func WriteSetupProbeCache(path string, cache SetupProbeCache) error {
+	if path == "" {
+		var err error
+		path, err = SetupProbeCachePath("")
+		if err != nil {
+			return err
+		}
+	}
+	b, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	return atomicWriteFile(path, b, 0o600)
+}
+
+// ReadSetupProbeCache reads the setup probe cache.
+func ReadSetupProbeCache(path string) (SetupProbeCache, error) {
+	if path == "" {
+		var err error
+		path, err = SetupProbeCachePath("")
+		if err != nil {
+			return SetupProbeCache{}, err
+		}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return SetupProbeCache{}, err
+	}
+	var cache SetupProbeCache
+	if err := json.Unmarshal(raw, &cache); err != nil {
+		return SetupProbeCache{}, err
+	}
+	return cache, nil
 }
 
 // CanonicalWorkspace returns an absolute workspace path with symlinks resolved.
