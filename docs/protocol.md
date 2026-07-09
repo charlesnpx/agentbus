@@ -203,6 +203,7 @@ numeric. Structured errors MUST put the stable v1 error identifier in
 
 | Code | Meaning |
 | --- | --- |
+| `unauthorized` | The required `protocol.hello` token was missing or invalid. |
 | `session_busy` | A session already has an active turn. |
 | `name_conflict` | A policy name was re-registered with a different spec. |
 | `version_mismatch` | The client and server protocol major versions differ. |
@@ -251,7 +252,8 @@ Request params:
 
 `token` is REQUIRED. The server MUST check it against the daemon token file
 before advertising capabilities. The token check is accident-prevention only;
-it is not a security boundary.
+it is not a security boundary. If the token is missing or invalid, the server
+MUST fail `protocol.hello` with `error.data.code` set to `unauthorized`.
 
 Result:
 
@@ -266,6 +268,22 @@ Result:
     "policy.retry": true,
     "nativeStructuredOutput.codex": false,
     "nativeStructuredOutput.claude": false
+  }
+}
+```
+
+Unauthorized error example:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "error": {
+    "code": -32000,
+    "message": "missing or invalid hello token",
+    "data": {
+      "code": "unauthorized"
+    }
   }
 }
 ```
@@ -485,7 +503,7 @@ Terminal foreground notification:
     "missing": [],
     "reason": "",
     "contractName": "delegate/delegate-report@1",
-    "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3",
+    "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3aabbccddeeff001122334455",
     "attempts": 1,
     "retryUsed": false,
     "validatedAt": "2026-07-09T12:00:00Z"
@@ -561,6 +579,14 @@ Result:
 
 Fetches one job status or all job statuses.
 
+Each job entry MUST include `heartbeatAt`, `lease`, `workerPid`,
+`backendChildPid`, `statePath`, and `logPaths` when those fields are known for
+the current record. `lease.expired` MUST be computed at status-read time from
+`lease.expiresAt`. A running job whose heartbeat lease has expired MUST still
+report its recorded `state` as `running` until the reaper transitions it, and
+MUST report `lease.expired: true`; the reaper may subsequently move the record
+to `orphaned` according to the daemon supervision rules.
+
 Request params for one job:
 
 ```json
@@ -592,7 +618,19 @@ Result:
         "kind": "task"
       },
       "startedAt": "2026-07-09T12:00:00Z",
-      "updatedAt": "2026-07-09T12:01:00Z"
+      "updatedAt": "2026-07-09T12:01:00Z",
+      "heartbeatAt": "2026-07-09T12:01:00Z",
+      "lease": {
+        "expiresAt": "2026-07-09T12:02:00Z",
+        "expired": true
+      },
+      "workerPid": 12345,
+      "backendChildPid": 12346,
+      "statePath": "/home/me/.local/state/agentbus/jobs/job_01J00000000000000000000002.json",
+      "logPaths": {
+        "stdout": "/home/me/.local/state/agentbus/logs/job_01J00000000000000000000002.stdout.log",
+        "stderr": "/home/me/.local/state/agentbus/logs/job_01J00000000000000000000002.stderr.log"
+      }
     }
   ]
 }
@@ -627,7 +665,7 @@ Result:
     "status": "noncompliant",
     "missing": ["section: Tests"],
     "reason": "missing required section",
-    "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3",
+    "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3aabbccddeeff001122334455",
     "attempts": 1,
     "retryUsed": false,
     "validatedAt": "2026-07-09T12:00:00Z"
@@ -682,7 +720,7 @@ Result:
 {
   "valid": true,
   "missing": [],
-  "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3"
+  "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3aabbccddeeff001122334455"
 }
 ```
 
@@ -711,7 +749,7 @@ Result:
 ```json
 {
   "name": "delegate/delegate-report@1",
-  "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3",
+  "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3aabbccddeeff001122334455",
   "registered": true
 }
 ```
@@ -1038,7 +1076,7 @@ task completion, repository cleanliness, or instruction-following.
   "missing": [],
   "reason": "initial response missed required section; retry satisfied contract",
   "contractName": "delegate/delegate-report@1",
-  "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3",
+  "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3aabbccddeeff001122334455",
   "attempts": 2,
   "retryUsed": true,
   "validatedAt": "2026-07-09T12:00:00Z"
