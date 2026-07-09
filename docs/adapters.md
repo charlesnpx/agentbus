@@ -47,7 +47,7 @@ invent additional permission modes under protocol v1.
 | codex | read-only | `codex exec --json --sandbox read-only --ignore-user-config` |
 | codex | corrective-resume | `codex exec resume <session-id> --json --sandbox read-only --ignore-user-config` |
 | claude | write | `claude --print --output-format stream-json --dangerously-skip-permissions` plus `--resume <session-id>` when resuming |
-| claude | read-only | `claude --print --output-format stream-json --strict-mcp-config --tools Read,Grep,Glob,Bash` plus first-party write-tool denies and scoped Bash allow/deny rules |
+| claude | read-only | `claude --print --output-format stream-json --bare --strict-mcp-config --mcp-config {} --permission-mode dontAsk --allowedTools Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(git status*),Bash(cat*),Bash(rg*),Bash(grep*),Bash(ls*),Bash(head*),Bash(tail*),Bash(wc*) --disallowedTools Edit,Write,NotebookEdit,mcp__*,Bash(*>*),Bash(*>>*),Bash(*\| tee*),Bash(*\|tee*),Bash(sed -i*),Bash(tee*),Bash(find*),Bash(rm*),Bash(mv*),Bash(cp*),Bash(git commit*),Bash(git push*),Bash(git checkout*),Bash(chmod*),Bash(curl*),Bash(wget*)` |
 | claude | corrective-resume | claude read-only profile plus `--resume <session-id>` |
 
 ### codex write
@@ -76,6 +76,17 @@ Corrective resume is always read-only. It is used for policy repair after an
 invalid final result and MUST NOT inherit writable permissions from the original
 turn.
 
+### codex effort values
+
+When `SessionOpts.Effort` is provided, the codex adapter passes it as:
+
+```text
+--config model_reasoning_effort="<effort>"
+```
+
+The default codex effort allow-list is `none`, `minimal`, `low`, `medium`,
+`high`, and `xhigh`.
+
 ### claude write
 
 ```text
@@ -95,10 +106,17 @@ Write turns run under the user's normal Claude configuration.
 Base argv:
 
 ```text
-claude --print --output-format stream-json --strict-mcp-config --tools Read,Grep,Glob,Bash
+claude --print --output-format stream-json --bare --strict-mcp-config --mcp-config {} --permission-mode dontAsk --allowedTools <allow-list> --disallowedTools <deny-list>
 ```
 
 The read-only profile MUST NOT include `--dangerously-skip-permissions`.
+The installed Claude CLI exposes tool allow/deny controls as
+`--allowedTools`/`--allowed-tools` and
+`--disallowedTools`/`--disallowed-tools`; agentbus uses the camelCase spellings
+shown above. It also exposes `--permission-mode dontAsk`, which agentbus uses
+as the print-mode fail-closed permission mode, and `--bare`, which minimizes
+hooks, plugin sync, auto-memory, background prefetches, and similar
+customization sources.
 
 The read-only profile MUST allow only these first-party tools:
 
@@ -133,15 +151,20 @@ Scoped Bash allow patterns:
 | `head*` |
 | `tail*` |
 | `wc*` |
-| `find*` |
+
+`find*` is intentionally not allowed. `find` can mutate the workspace with
+flags such as `-delete` and `-exec`, while `rg`, `ls`, `Glob`, and `Grep`
+cover read-only discovery.
 
 Scoped Bash deny patterns:
 
 | Pattern |
 | --- |
-| output redirects: `>` and `>>` |
+| output redirects anywhere in the command: `*>*` and `*>>*` |
+| pipes to `tee`: `*\| tee*` and `*\|tee*` |
 | `sed -i*` |
 | `tee*` |
+| `find*` |
 | `rm*` |
 | `mv*` |
 | `cp*` |
@@ -151,6 +174,12 @@ Scoped Bash deny patterns:
 | `chmod*` |
 | `curl*` |
 | `wget*` |
+
+Claude help documents allow/deny entries using the `Bash(...)` command pattern
+form with wildcard examples such as `Bash(git *)`, but does not formally define
+anchoring. agentbus therefore uses leading and trailing wildcards for redirect
+and pipe-to-tee denies so the deny pattern is expressed as a contains-style
+match in the same CLI pattern language.
 
 Default permission mode in `-p` / `--print` mode MUST fail closed. A command
 that is not allowed MUST be denied rather than prompting interactively.
@@ -224,8 +253,52 @@ backend version changed since setup; re-run agentbus setup
 ```
 
 Each adapter MUST declare a minimum known-good version. The exact values are
-pinned by adapter tests in merge unit A5 after the installed CLI surfaces are
-verified.
+pinned by adapter tests:
+
+| Backend | Minimum known-good version |
+| --- | --- |
+| codex | `0.143.0` |
+| claude | `2.1.205` |
+
+The setup probe cache consumed by `Preflight` is internal agentbus state and has
+this shape:
+
+```json
+{
+  "backends": [
+    {
+      "backend": "codex",
+      "binaryPath": "/Users/me/.local/bin/codex",
+      "version": "0.143.0",
+      "streamSchema": "codex-json-v1",
+      "configMode": {
+        "write": "user",
+        "readOnly": "hermetic"
+      },
+      "sandboxModes": ["workspace-write", "read-only"],
+      "jsonEventsProbed": true
+    }
+  ]
+}
+```
+
+## A5 flag verification amendments
+
+The installed CLIs verified for A5 reported:
+
+| Backend | Documented flag/profile item | Installed CLI result | Amendment |
+| --- | --- | --- | --- |
+| codex | `exec --json` | present in `codex exec --help` | none |
+| codex | `--sandbox read-only|workspace-write` | present in `codex exec --help` | none |
+| codex | `--ignore-user-config` | present in `codex exec --help` and `codex exec resume --help` | none |
+| codex | `exec resume <session-id>` | present as `codex exec resume [SESSION_ID] [PROMPT]` | none |
+| claude | `--print` | present in `claude --help` | none |
+| claude | `--output-format stream-json` | present in `claude --help` | none |
+| claude | `--dangerously-skip-permissions` | present in `claude --help` | none |
+| claude | `--resume <session-id>` | present in `claude --help` | none |
+| claude | read-only tool allow/deny flags | real flags are `--allowedTools`/`--allowed-tools` and `--disallowedTools`/`--disallowed-tools` | use `--allowedTools` and `--disallowedTools` |
+| claude | fail-closed print-mode permission behavior | real flag is `--permission-mode dontAsk` | add `--permission-mode dontAsk` |
+| claude | hermetic customization minimization | real flag `--bare` exists; `--strict-mcp-config` exists | add `--bare --mcp-config {}` alongside `--strict-mcp-config` |
 
 ## Native structured output capability
 
