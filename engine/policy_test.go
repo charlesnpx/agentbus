@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const correctiveRetryTemplate = "Your response missed: {{missing}}. Emit the corrected report only; make no further changes."
+
 func TestShapeContracts(t *testing.T) {
 	t.Parallel()
 	contract := ContractSpec{Shape: &ShapeSpec{
@@ -88,6 +90,7 @@ func TestShapeEvidenceHeuristic(t *testing.T) {
 		{name: "not applicable does not require evidence", text: "## Findings\nnot applicable", valid: true},
 		{name: "path line evidence", text: "Findings:\nBug in engine/run.go:42", valid: true},
 		{name: "diff hunk evidence", text: "Findings:\nRegression observed\n@@ -1,2 +1,2 @@", valid: true},
+		{name: "priority label finding without evidence", text: "Findings:\nP1: missing validation", valid: false},
 		{name: "fenced command adjacent exit evidence before", text: "Findings:\nIt failed\nexit code 1\n```sh\ngo test ./...\n```", valid: true},
 		{name: "fenced command adjacent exit evidence after", text: "Findings:\nIt failed\n```sh\ngo test ./...\n```\nexit 1", valid: true},
 		{name: "fenced path line excluded", text: "Findings:\nIt failed\n```\nengine/run.go:42\n```", valid: false},
@@ -308,13 +311,44 @@ func TestPolicyRegistry(t *testing.T) {
 	if name != "delegate/delegate-report@1" || resolvedHash != hash || resolved.Shape == nil {
 		t.Fatalf("resolved = %#v name=%q hash=%q", resolved, name, resolvedHash)
 	}
-	inline := ContractSpec{Shape: &ShapeSpec{RequiredSections: []string{"Inline"}}}
-	resolved, name, _, err = ResolveContract(ContractSpec{Shape: inline.Shape, Named: "delegate/delegate-report@1"}, registry)
+}
+
+func TestPolicyRegistryDefensiveCopies(t *testing.T) {
+	t.Parallel()
+	registry := NewPolicyRegistry()
+	spec := ContractSpec{Shape: &ShapeSpec{RequiredSections: []string{"Findings"}}}
+	hash, err := registry.Register("delegate/delegate-report@1", spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if name != "" || resolved.Shape.RequiredSections[0] != "Inline" {
-		t.Fatalf("inline-first resolution = %#v name=%q", resolved, name)
+	spec.Shape.RequiredSections[0] = "MutatedAfterRegister"
+	resolved, resolvedHash, err := registry.Resolve("delegate/delegate-report@1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolvedHash != hash || resolved.Shape.RequiredSections[0] != "Findings" {
+		t.Fatalf("resolved = %#v hash=%q, want immutable Findings hash=%q", resolved, resolvedHash, hash)
+	}
+	resolved.Shape.RequiredSections[0] = "MutatedAfterResolve"
+	resolvedAgain, resolvedAgainHash, err := registry.Resolve("delegate/delegate-report@1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolvedAgainHash != hash || resolvedAgain.Shape.RequiredSections[0] != "Findings" {
+		t.Fatalf("resolved again = %#v hash=%q, want immutable Findings hash=%q", resolvedAgain, resolvedAgainHash, hash)
+	}
+}
+
+func TestResolveContractRejectsMultipleVariants(t *testing.T) {
+	t.Parallel()
+	registry := NewPolicyRegistry()
+	spec := ContractSpec{Shape: &ShapeSpec{RequiredSections: []string{"Findings"}}}
+	if _, err := registry.Register("delegate/delegate-report@1", spec); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err := ResolveContract(ContractSpec{Shape: spec.Shape, Named: "delegate/delegate-report@1"}, registry)
+	if err == nil || !strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("mixed shape/named err = %v, want exactly one", err)
 	}
 }
 
@@ -331,7 +365,7 @@ func TestPolicyPersistenceFieldsAndStamps(t *testing.T) {
 	job := &JobRecord{
 		JobID:            "job_policy",
 		State:            StateCompleted,
-		Policy:           &TurnPolicy{Contract: &ContractSpec{Named: "delegate/delegate-report@1"}, Retry: &RetryPolicy{Max: 1, Template: "Missing {{missing}}"}},
+		Policy:           &TurnPolicy{Contract: &ContractSpec{Named: "delegate/delegate-report@1"}, Retry: &RetryPolicy{Max: 1, Template: correctiveRetryTemplate}},
 		ResolvedContract: &spec,
 		Contract:         &stamp,
 	}
@@ -363,7 +397,7 @@ func TestValidatePolicyTextHelper(t *testing.T) {
 	}
 	got, err := ValidatePolicyText("## Findings\nNone", &TurnPolicy{
 		Contract: &ContractSpec{Named: "delegate/delegate-report@1"},
-		Retry:    &RetryPolicy{Max: 1, Template: "Missing {{missing}}"},
+		Retry:    &RetryPolicy{Max: 1, Template: correctiveRetryTemplate},
 	}, registry, now)
 	if err != nil {
 		t.Fatal(err)
@@ -388,6 +422,13 @@ func TestValidatePolicyTextHelper(t *testing.T) {
 	if err == nil {
 		t.Fatal("invalid retry template succeeded")
 	}
+	_, err = ValidatePolicyText("## Findings\nNone", &TurnPolicy{
+		Contract: &spec,
+		Retry:    &RetryPolicy{Max: 1, Template: "Missing {{missing}}"},
+	}, registry, now)
+	if err == nil {
+		t.Fatal("retry template without corrective-only instruction succeeded")
+	}
 }
 
 func TestRetryTemplateAndSkippedDisabledStamps(t *testing.T) {
@@ -395,7 +436,7 @@ func TestRetryTemplateAndSkippedDisabledStamps(t *testing.T) {
 	if got := RenderRetryTemplate("missing: {{missing}}", []string{"section:Findings", "evidence"}); got != "missing: section:Findings, evidence" {
 		t.Fatalf("rendered = %q", got)
 	}
-	retry := RetryPolicy{Max: 1, Template: "missing {{missing}}"}
+	retry := RetryPolicy{Max: 1, Template: correctiveRetryTemplate}
 	if retry.Max != 1 || !strings.Contains(retry.Template, "{{missing}}") {
 		t.Fatalf("retry policy invalid in test")
 	}

@@ -142,7 +142,7 @@ func (r *PolicyRegistry) Register(name string, spec ContractSpec) (string, error
 		}
 		return hash, nil
 	}
-	r.specs[name] = registeredSpec{spec: spec, hash: hash}
+	r.specs[name] = registeredSpec{spec: cloneContractSpec(spec), hash: hash}
 	return hash, nil
 }
 
@@ -157,14 +157,17 @@ func (r *PolicyRegistry) Resolve(name string) (ContractSpec, string, error) {
 	if !ok {
 		return ContractSpec{}, "", fmt.Errorf("policy name not registered: %s", name)
 	}
-	return spec.spec, spec.hash, nil
+	return cloneContractSpec(spec.spec), spec.hash, nil
 }
 
 // ResolveContract resolves named contracts and returns the concrete spec to persist.
-// Inline contracts win over named references when both are present.
+// Contract variants are exclusive.
 func ResolveContract(contract ContractSpec, registry *PolicyRegistry) (ContractSpec, string, string, error) {
+	if err := validateContractVariant(contract); err != nil {
+		return ContractSpec{}, "", "", err
+	}
 	if contract.JSONSchema != nil {
-		concrete := ContractSpec{JSONSchema: contract.JSONSchema}
+		concrete := ContractSpec{JSONSchema: append(json.RawMessage(nil), contract.JSONSchema...)}
 		if err := validateConcreteContract(concrete); err != nil {
 			return ContractSpec{}, "", "", err
 		}
@@ -172,7 +175,7 @@ func ResolveContract(contract ContractSpec, registry *PolicyRegistry) (ContractS
 		return concrete, "", hash, err
 	}
 	if contract.Shape != nil {
-		concrete := ContractSpec{Shape: contract.Shape}
+		concrete := ContractSpec{Shape: cloneShapeSpec(contract.Shape)}
 		if err := validateConcreteContract(concrete); err != nil {
 			return ContractSpec{}, "", "", err
 		}
@@ -288,15 +291,27 @@ func ContractSHA256(contract ContractSpec) (string, error) {
 }
 
 func validateConcreteContract(contract ContractSpec) error {
-	count := 0
+	if err := validateContractVariant(contract); err != nil {
+		return err
+	}
 	if contract.JSONSchema != nil {
-		count++
 		if !json.Valid(contract.JSONSchema) {
 			return errors.New("jsonSchema must be valid JSON")
 		}
 		if _, err := compileJSONSchema(contract.JSONSchema); err != nil {
 			return fmt.Errorf("jsonSchema must be valid Draft 2020-12 schema: %w", err)
 		}
+	}
+	if contract.Named != "" {
+		return errors.New("named contract must be resolved before validation")
+	}
+	return nil
+}
+
+func validateContractVariant(contract ContractSpec) error {
+	count := 0
+	if contract.JSONSchema != nil {
+		count++
 	}
 	if contract.Shape != nil {
 		count++
@@ -306,9 +321,6 @@ func validateConcreteContract(contract ContractSpec) error {
 	}
 	if count != 1 {
 		return errors.New("contract must include exactly one of jsonSchema, shape, or named")
-	}
-	if contract.Named != "" {
-		return errors.New("named contract must be resolved before validation")
 	}
 	return nil
 }
@@ -320,10 +332,38 @@ func validateRetryPolicy(retry *RetryPolicy) error {
 	if retry.Max != 0 && retry.Max != 1 {
 		return errors.New("retry.max must be 0 or 1")
 	}
-	if retry.Max == 1 && !strings.Contains(retry.Template, "{{missing}}") {
-		return errors.New("retry.template must include {{missing}} when retry.max is 1")
+	if retry.Max == 1 {
+		if !strings.Contains(retry.Template, "{{missing}}") {
+			return errors.New("retry.template must include {{missing}} when retry.max is 1")
+		}
+		normalized := strings.ToLower(retry.Template)
+		if !strings.Contains(normalized, "emit the corrected report only") ||
+			!strings.Contains(normalized, "make no further changes") {
+			return errors.New("retry.template must instruct the backend to emit the corrected report only and make no further changes when retry.max is 1")
+		}
 	}
 	return nil
+}
+
+func cloneContractSpec(spec ContractSpec) ContractSpec {
+	clone := ContractSpec{Named: spec.Named}
+	if spec.JSONSchema != nil {
+		clone.JSONSchema = append(json.RawMessage(nil), spec.JSONSchema...)
+	}
+	clone.Shape = cloneShapeSpec(spec.Shape)
+	return clone
+}
+
+func cloneShapeSpec(spec *ShapeSpec) *ShapeSpec {
+	if spec == nil {
+		return nil
+	}
+	return &ShapeSpec{
+		FirstLineEnum:        append([]string(nil), spec.FirstLineEnum...),
+		RequiredSections:     append([]string(nil), spec.RequiredSections...),
+		RequiredAttestations: append([]string(nil), spec.RequiredAttestations...),
+		EvidenceHeuristic:    spec.EvidenceHeuristic,
+	}
 }
 
 func validatePolicyName(name string) error {
@@ -346,6 +386,7 @@ func validatePolicyName(name string) error {
 }
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+var findingItemLabelRE = regexp.MustCompile(`(?i)^p[0-9]+$`)
 
 func stripANSI(s string) string {
 	return ansiRE.ReplaceAllString(s, "")
@@ -491,10 +532,7 @@ func claimsFindings(outside string) bool {
 		if marker.rest != "" {
 			body = append(body, marker.rest)
 		}
-		end := len(lines)
-		if mi+1 < len(markers) {
-			end = markers[mi+1].index
-		}
+		end := findingsBodyEnd(lines, markers, mi)
 		if marker.index+1 < end {
 			body = append(body, lines[marker.index+1:end]...)
 		}
@@ -508,6 +546,35 @@ func claimsFindings(outside string) bool {
 		return false
 	}
 	return false
+}
+
+func findingsBodyEnd(lines []string, markers []sectionMarker, markerIndex int) int {
+	for i := markerIndex + 1; i < len(markers); i++ {
+		marker := markers[i]
+		if _, ok := headingName(lines[marker.index]); ok {
+			return marker.index
+		}
+		if marker.rest == "" && !isFindingItemLabel(marker.name) {
+			return marker.index
+		}
+	}
+	return len(lines)
+}
+
+func isFindingItemLabel(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	if normalized == "" {
+		return false
+	}
+	if findingItemLabelRE.MatchString(normalized) {
+		return true
+	}
+	switch normalized {
+	case "critical", "high", "medium", "low", "info", "informational":
+		return true
+	default:
+		return false
+	}
 }
 
 var (
