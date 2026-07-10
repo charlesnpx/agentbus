@@ -74,13 +74,15 @@ func TestSetupCachesProbeAndReportsJSON(t *testing.T) {
 	t.Parallel()
 	a := testApp(t)
 	probe := engine.BackendSetupProbe{
-		Backend:          "codex",
-		BinaryPath:       "/tmp/bin/codex",
-		Version:          "0.143.0",
-		StreamSchema:     "codex-json-v1",
-		ConfigMode:       engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
-		SandboxModes:     []string{"workspace-write", "read-only"},
-		JSONEventsProbed: true,
+		Backend:           "codex",
+		BinaryPath:        "/tmp/bin/codex",
+		Version:           "0.143.0",
+		StreamSchema:      "codex-json-v1",
+		ConfigMode:        engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
+		SandboxModes:      []string{"workspace-write", "read-only"},
+		JSONEventsProbed:  true,
+		DiscoveredModels:  []string{"gpt-5.4"},
+		DiscoveredEfforts: []string{"high"},
 	}
 	a.backends = []backendSpec{{
 		name: "codex",
@@ -109,6 +111,9 @@ func TestSetupCachesProbeAndReportsJSON(t *testing.T) {
 	if got.Backend != "codex" || got.BinaryPath != probe.BinaryPath || got.Version != probe.Version || !got.JSONEventsProbe.Ran || got.JSONEventsProbe.StreamSchema != probe.StreamSchema {
 		t.Fatalf("setup backend = %+v", got)
 	}
+	if strings.Join(got.DiscoveredModels, ",") != "gpt-5.4" || strings.Join(got.DiscoveredEfforts, ",") != "high" {
+		t.Fatalf("discovery report=%+v", got)
+	}
 	cachePath, err := engine.SetupProbeCachePath(a.stateRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -117,8 +122,24 @@ func TestSetupCachesProbeAndReportsJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cache.Backends) != 1 || cache.Backends[0].Version != probe.Version || cache.Backends[0].StreamSchema != probe.StreamSchema {
+	if cache.Version != engine.SetupProbeCacheVersion || len(cache.Backends) != 1 || cache.Backends[0].Version != probe.Version || cache.Backends[0].StreamSchema != probe.StreamSchema || len(cache.Backends[0].DiscoveredModels) != 1 {
 		t.Fatalf("cache = %+v", cache)
+	}
+}
+
+func TestSetupReportsDiscoveryWarnings(t *testing.T) {
+	t.Parallel()
+	a := testApp(t)
+	probe := engine.BackendSetupProbe{Backend: "claude", BinaryPath: "/tmp/bin/claude", Version: "2.1.205", StreamSchema: "claude-stream-json-v1", JSONEventsProbed: true, DiscoveryWarnings: []string{"claude model discovery failed: claude --help model discovery parser found no model or effort listings"}}
+	a.backends = []backendSpec{{name: "claude", backend: fakeBackend{name: "claude", health: engine.Health{Backend: "claude", BinaryPath: probe.BinaryPath, Version: probe.Version, StreamSchema: probe.StreamSchema}}, probe: fakeProbe{probe: probe}}}
+	code, stdout, stderr := runTestCLI(t, a, []string{"setup", "--json"}, "")
+	if code != 0 {
+		t.Fatalf("setup exit=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	var output setupOutput
+	decodeJSON(t, stdout, &output)
+	if len(output.Backends) != 1 || len(output.Backends[0].Warnings) != 1 || !strings.Contains(output.Backends[0].Warnings[0], "claude --help") {
+		t.Fatalf("output=%+v", output)
 	}
 }
 

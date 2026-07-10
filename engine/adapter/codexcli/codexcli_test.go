@@ -3,6 +3,7 @@ package codexcli
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,6 +73,88 @@ func TestCodexPreflightAndFailures(t *testing.T) {
 	restricted := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"gpt-5"}})
 	if _, err := restricted.Start(context.Background(), engine.SessionOpts{Model: "not-a-model"}); err == nil || !strings.Contains(err.Error(), "unsupported model") {
 		t.Fatalf("unsupported model err = %v", err)
+	}
+}
+
+func TestCodexDiscoveryParsesFakeHelp(t *testing.T) {
+	fake := fakeCodex(t)
+	script := "#!/bin/sh\nif [ \"$1\" = --help ]; then echo 'Models available: [gpt-5.4, gpt-5.5]'; echo 'Reasoning effort possible values: [low, high, xhigh]'; exit 0; fi\nexec /bin/false\n"
+	if err := os.WriteFile(fake.bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(engine.ModelDiscoverer).DiscoverModels(context.Background())
+	if err != nil || discovery == nil || strings.Join(discovery.Models, ",") != "gpt-5.4,gpt-5.5" || strings.Join(discovery.Efforts, ",") != "high,low,xhigh" {
+		t.Fatalf("discovery=%+v err=%v", discovery, err)
+	}
+}
+
+func TestCodexDiscoveryReportsParserMiss(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho generic help\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := discoverModels(context.Background(), path); err == nil || !strings.Contains(err.Error(), "parser found no model or effort") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestCodexDiscoveredCacheWinsAndLegacyFallsBack(t *testing.T) {
+	fake := fakeCodex(t)
+	cache := engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{Backend: "codex", BinaryPath: fake.bin, Version: MinimumKnownGoodVersion, StreamSchema: StreamSchema, DiscoveredModels: []string{"discovered"}, DiscoveredEfforts: []string{"turbo"}}}}
+	if err := engine.WriteSetupProbeCache(fake.cache, cache); err != nil {
+		t.Fatal(err)
+	}
+	backend := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"static"}, SupportedEfforts: []string{"low"}})
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "discovered", Effort: "turbo"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "static"}); err == nil {
+		t.Fatal("static model unexpectedly beat discovered cache")
+	}
+	v1 := fmt.Sprintf(`{"version":1,"backends":[{"backend":"codex","binaryPath":%q,"version":%q,"streamSchema":%q,"jsonEventsProbed":true}]}`, fake.bin, MinimumKnownGoodVersion, StreamSchema)
+	if err := os.WriteFile(fake.cache, []byte(v1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "static", Effort: "low"}); err != nil {
+		t.Fatalf("legacy fallback: %v", err)
+	}
+	health, err := backend.Preflight(context.Background())
+	if err != nil || !strings.Contains(health.Warning, "stale") {
+		t.Fatalf("health=%+v err=%v", health, err)
+	}
+	legacy, err := engine.ReadSetupProbeCache(fake.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.WriteSetupProbeCache(fake.cache, legacy); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := engine.ReadSetupProbeCache(fake.cache)
+	if err != nil || migrated.Version != engine.SetupProbeCacheVersion {
+		t.Fatalf("migrated=%+v err=%v", migrated, err)
+	}
+}
+
+func TestCodexUpgradedVersionFallsBackAndWarnsOnTurn(t *testing.T) {
+	fake := fakeCodex(t)
+	cache := engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{Backend: "codex", BinaryPath: fake.bin, Version: "0.142.0", StreamSchema: StreamSchema, DiscoveredModels: []string{"old-discovered"}}}}
+	if err := engine.WriteSetupProbeCache(fake.cache, cache); err != nil {
+		t.Fatal(err)
+	}
+	backend := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"static"}})
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "old-discovered"}); err == nil {
+		t.Fatal("stale discovered model unexpectedly accepted")
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{Model: "static"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := collect(events); !containsWarning(got, "stale") {
+		t.Fatalf("events=%#v, want stale discovery warning", got)
 	}
 }
 
@@ -200,7 +283,7 @@ esac
 
 func writeCache(t *testing.T, path, backend, bin, version, schema string) {
 	t.Helper()
-	raw, err := json.Marshal(engine.SetupProbeCache{Backends: []engine.BackendSetupProbe{{
+	raw, err := json.Marshal(engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{
 		Backend:          backend,
 		BinaryPath:       bin,
 		Version:          version,

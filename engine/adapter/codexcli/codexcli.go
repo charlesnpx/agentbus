@@ -1,7 +1,11 @@
 package codexcli
 
 import (
+	"context"
 	"fmt"
+	"os/exec"
+	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/charlesnpx/agentbus/engine"
@@ -35,7 +39,38 @@ func New(opts Options) engine.Backend {
 		AllowedEfforts: cliadapter.StringSet(efforts...),
 		BuildArgs:      buildArgs,
 		Parse:          parseEvent,
+		Discover:       discoverModels,
 	}
+}
+
+func discoverModels(ctx context.Context, binary string) (*engine.ModelDiscovery, error) {
+	out, err := exec.CommandContext(ctx, binary, "--help").CombinedOutput()
+	if err != nil {
+		return nil, err
+	}
+	models := helpValues(string(out), `(?i)models?\s*(?:available|possible values|choices)?\s*[:=]\s*\[?([^\]\n]+)`)
+	efforts := helpValues(string(out), `(?i)(?:effort|reasoning effort)\s*(?:available|possible values|choices)?\s*[:=]\s*\[?([^\]\n]+)`)
+	if len(models) == 0 && len(efforts) == 0 {
+		return nil, fmt.Errorf("codex --help model discovery parser found no model or effort listings")
+	}
+	return &engine.ModelDiscovery{Models: models, Efforts: efforts, Source: "codex --help (listing syntax when exposed)"}, nil
+}
+
+func helpValues(text, pattern string) []string {
+	match := regexp.MustCompile(pattern).FindStringSubmatch(text)
+	if len(match) < 2 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	for _, value := range regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9._-]*`).FindAllString(match[1], -1) {
+		seen[value] = struct{}{}
+	}
+	values := make([]string, 0, len(seen))
+	for value := range seen {
+		values = append(values, value)
+	}
+	sort.Strings(values)
+	return values
 }
 
 func buildArgs(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error) {

@@ -115,6 +115,7 @@ func DefaultCapabilities() map[string]bool {
 		"policy.retry":                  true,
 		"nativeStructuredOutput.codex":  false,
 		"nativeStructuredOutput.claude": false,
+		"models.discovery":              true,
 	}
 }
 
@@ -126,7 +127,14 @@ type HelloParams struct {
 type HelloResult struct {
 	ProtocolVersion int             `json:"protocolVersion"`
 	Backends        []string        `json:"backends"`
+	BackendMetadata []BackendInfo   `json:"backendMetadata,omitempty"`
 	Capabilities    map[string]bool `json:"capabilities"`
+}
+
+type BackendInfo struct {
+	Backend string   `json:"backend"`
+	Models  []string `json:"models"`
+	Efforts []string `json:"efforts"`
 }
 
 type SessionStartParams struct {

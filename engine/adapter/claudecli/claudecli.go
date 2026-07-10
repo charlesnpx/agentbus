@@ -1,8 +1,12 @@
 package claudecli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
+	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/charlesnpx/agentbus/engine"
@@ -93,7 +97,41 @@ func New(opts Options) engine.Backend {
 		AllowedEfforts: cliadapter.StringSet(efforts...),
 		BuildArgs:      buildArgs,
 		Parse:          parseEvent,
+		Discover:       discoverModels,
 	}
+}
+
+func discoverModels(ctx context.Context, binary string) (*engine.ModelDiscovery, error) {
+	out, err := exec.CommandContext(ctx, binary, "--help").CombinedOutput()
+	if err != nil {
+		return nil, err
+	}
+	text := string(out)
+	efforts := valuesFromGroup(text, `(?m)--effort[^\n]*\n?[^\n]*\(([^)]+)\)`)
+	models := valuesFromGroup(text, `(?m)--model[^\n]*\n(?:[^\n]*\n){0,4}?[^\n]*\((?:e\.g\.\s*)?([^)]+)\)`)
+	if len(models) == 0 && len(efforts) == 0 {
+		return nil, fmt.Errorf("claude --help model discovery parser found no model or effort listings")
+	}
+	return &engine.ModelDiscovery{Models: models, Efforts: efforts, Source: "claude --help"}, nil
+}
+
+func valuesFromGroup(text, pattern string) []string {
+	match := regexp.MustCompile(pattern).FindStringSubmatch(text)
+	if len(match) < 2 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	for _, value := range regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9._-]*`).FindAllString(match[1], -1) {
+		if value != "e.g" && value != "or" {
+			seen[value] = struct{}{}
+		}
+	}
+	values := make([]string, 0, len(seen))
+	for value := range seen {
+		values = append(values, value)
+	}
+	sort.Strings(values)
+	return values
 }
 
 func buildArgs(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error) {

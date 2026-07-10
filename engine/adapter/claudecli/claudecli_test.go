@@ -56,6 +56,27 @@ func TestClaudeProfilesAndParsing(t *testing.T) {
 	assertLog(t, fake.stdin, "repair")
 }
 
+func TestClaudeDiscoveryReportsHelpFailures(t *testing.T) {
+	t.Run("command error", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "claude")
+		if err := os.WriteFile(path, []byte("#!/bin/sh\necho help exploded >&2\nexit 7\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := discoverModels(context.Background(), path); err == nil || !strings.Contains(err.Error(), "exit status 7") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("parser miss", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "claude")
+		if err := os.WriteFile(path, []byte("#!/bin/sh\necho generic help\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := discoverModels(context.Background(), path); err == nil || !strings.Contains(err.Error(), "parser found no model or effort") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+}
+
 func expectedClaudeReadOnlyArgv(resumeID string) string {
 	args := []string{
 		"--print",
@@ -101,6 +122,18 @@ func TestClaudePreflightAndFailures(t *testing.T) {
 	restricted := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"sonnet"}})
 	if _, err := restricted.Start(context.Background(), engine.SessionOpts{Model: "not-a-model"}); err == nil || !strings.Contains(err.Error(), "unsupported model") {
 		t.Fatalf("unsupported model err = %v", err)
+	}
+}
+
+func TestClaudeDiscoveryParsesFakeHelp(t *testing.T) {
+	fake := fakeClaude(t)
+	script := "#!/bin/sh\nif [ \"$1\" = --help ]; then printf '%s\\n' '  --effort <level> Effort level' '    (low, medium, high, xhigh, max)' '  --model <model> Model' \"    (e.g. 'fable', 'opus', or 'sonnet')\"; exit 0; fi\nexec /bin/false\n"
+	if err := os.WriteFile(fake.bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(engine.ModelDiscoverer).DiscoverModels(context.Background())
+	if err != nil || discovery == nil || strings.Join(discovery.Models, ",") != "fable,opus,sonnet" || strings.Join(discovery.Efforts, ",") != "high,low,max,medium,xhigh" {
+		t.Fatalf("discovery=%+v err=%v", discovery, err)
 	}
 }
 
@@ -200,7 +233,7 @@ esac
 
 func writeCache(t *testing.T, path, backend, bin, version, schema string) {
 	t.Helper()
-	raw, err := json.Marshal(engine.SetupProbeCache{Backends: []engine.BackendSetupProbe{{
+	raw, err := json.Marshal(engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{
 		Backend:          backend,
 		BinaryPath:       bin,
 		Version:          version,

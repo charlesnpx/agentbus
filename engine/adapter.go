@@ -27,6 +27,7 @@ type Health struct {
 	Version      string
 	StreamSchema string
 	Minimum      string
+	Warning      string
 }
 
 // SessionOpts configures a backend session default.
@@ -68,18 +69,45 @@ const (
 // SetupProbeCache is written by setup after a live stream probe and read by
 // adapter Preflight without running another backend turn.
 type SetupProbeCache struct {
+	Version  int                 `json:"version"`
 	Backends []BackendSetupProbe `json:"backends"`
 }
 
+const SetupProbeCacheVersion = 2
+
 // BackendSetupProbe records the setup-time facts required by Preflight.
 type BackendSetupProbe struct {
-	Backend          string   `json:"backend"`
-	BinaryPath       string   `json:"binaryPath"`
-	Version          string   `json:"version"`
-	StreamSchema     string   `json:"streamSchema"`
-	ConfigMode       ModeInfo `json:"configMode"`
-	SandboxModes     []string `json:"sandboxModes"`
-	JSONEventsProbed bool     `json:"jsonEventsProbed"`
+	Backend           string   `json:"backend"`
+	BinaryPath        string   `json:"binaryPath"`
+	Version           string   `json:"version"`
+	StreamSchema      string   `json:"streamSchema"`
+	ConfigMode        ModeInfo `json:"configMode"`
+	SandboxModes      []string `json:"sandboxModes"`
+	JSONEventsProbed  bool     `json:"jsonEventsProbed"`
+	DiscoveredModels  []string `json:"discoveredModels,omitempty"`
+	DiscoveredEfforts []string `json:"discoveredEfforts,omitempty"`
+	DiscoverySource   string   `json:"discoverySource,omitempty"`
+	DiscoveryWarnings []string `json:"discoveryWarnings,omitempty"`
+}
+
+type ModelDiscovery struct {
+	Models  []string
+	Efforts []string
+	Source  string
+}
+
+type ModelDiscoverer interface {
+	DiscoverModels(context.Context) (*ModelDiscovery, error)
+}
+
+type BackendMetadataProvider interface {
+	BackendMetadata(context.Context) BackendMetadata
+}
+
+type BackendMetadata struct {
+	Name    string
+	Models  []string
+	Efforts []string
 }
 
 // ModeInfo describes write/read-only configuration loading.
