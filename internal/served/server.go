@@ -112,9 +112,10 @@ func (j *activeJob) requestedTerminal() engine.JobState {
 }
 
 type requestOutcome struct {
-	result any
-	err    *protocol.ErrorObject
-	after  func()
+	result       any
+	err          *protocol.ErrorObject
+	after        func()
+	onAckFailure func(error)
 }
 
 type resolvedPolicy struct {
@@ -379,7 +380,12 @@ func (c *connection) serve(ctx context.Context) {
 		out := c.server.handle(ctx, c, req)
 		if len(req.ID) != 0 {
 			resp := protocol.Response{JSONRPC: "2.0", ID: req.ID, Result: out.result, Error: out.err}
-			_ = c.writeResponse(resp)
+			if err := c.writeResponse(resp); err != nil {
+				if out.onAckFailure != nil && out.err == nil {
+					out.onAckFailure(err)
+				}
+				continue
+			}
 			if out.after != nil && out.err == nil {
 				out.after()
 			}
@@ -638,8 +644,9 @@ func (s *Server) handleTurnStart(ctx context.Context, c *connection, raw json.Ra
 		},
 	}
 	return requestOutcome{
-		result: protocol.TurnStartResult{TurnID: jobID, JobID: jobID, SessionID: session.id},
-		after:  func() { go s.runJob(runCtx, run) },
+		result:       protocol.TurnStartResult{TurnID: jobID, JobID: jobID, SessionID: session.id},
+		after:        func() { go s.runJob(runCtx, run) },
+		onAckFailure: func(error) { s.abortUndeliveredRun(run, engine.StateInterrupted) },
 	}
 }
 
@@ -744,8 +751,9 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 		active:       active,
 	}
 	return requestOutcome{
-		result: protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
-		after:  func() { go s.runJob(runCtx, run) },
+		result:       protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
+		after:        func() { go s.runJob(runCtx, run) },
+		onAckFailure: func(error) { s.abortUndeliveredRun(run, engine.StateCanceled) },
 	}
 }
 
@@ -996,7 +1004,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 	for {
 		select {
 		case <-attemptCtx.Done():
-			_ = run.session.Interrupt(context.Background())
+			if shouldInterruptSessionOnAttemptCancel(run, attemptCtx.Err()) {
+				_ = run.session.Interrupt(context.Background())
+			}
 			return final.String(), stateForContext(attemptCtx.Err()), attemptCtx.Err()
 		case event, ok := <-events:
 			if !ok {
@@ -1022,6 +1032,13 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			}
 		}
 	}
+}
+
+func shouldInterruptSessionOnAttemptCancel(run jobRun, err error) bool {
+	if errors.Is(err, context.Canceled) && !run.foreground && run.active != nil && run.active.requestedTerminal() == engine.StateCanceled {
+		return false
+	}
+	return true
 }
 
 func (s *Server) validateAttempt(text string, run jobRun, attempts int, retryUsed bool) (engine.PolicyValidation, string, engine.JobState, error) {
@@ -1105,39 +1122,35 @@ func (s *Server) finalizeRequestedTerminal(run jobRun) {
 }
 
 func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {
-	record, err := run.store.Load(run.jobID)
+	record, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
+		if engine.IsTerminal(record.State) {
+			return false, nil
+		}
+		var result *engine.ResultInfo
+		if state == engine.StateCompleted || state == engine.StateCompletedNoncompliant {
+			if text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
+				stamp = skippedStampForRun(run, s.registry, engine.SkipNoFinalMessage)
+			}
+			info, err := run.store.WriteResult(run.jobID, []byte(text), s.inlineResultCap)
+			if err != nil {
+				return false, err
+			}
+			result = &info
+		}
+		if err := transitionOrSet(record, state, s.clock.Now().UTC()); err != nil {
+			return false, err
+		}
+		record.Result = result
+		if stamp != nil {
+			record.Contract = stamp
+		}
+		if run.contract != nil {
+			resolved := *run.contract
+			record.ResolvedContract = &resolved
+		}
+		return true, nil
+	})
 	if err != nil {
-		return err
-	}
-	if engine.IsTerminal(record.State) {
-		if run.foreground && run.conn != nil {
-			_ = run.conn.notify(protocol.NotificationTurnResult, turnResultFromRecord(*record))
-		}
-		return nil
-	}
-	var result *engine.ResultInfo
-	if state == engine.StateCompleted || state == engine.StateCompletedNoncompliant {
-		if text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
-			stamp = skippedStampForRun(run, s.registry, engine.SkipNoFinalMessage)
-		}
-		info, err := run.store.WriteResult(run.jobID, []byte(text), s.inlineResultCap)
-		if err != nil {
-			return err
-		}
-		result = &info
-	}
-	if err := transitionOrSet(record, state, s.clock.Now().UTC()); err != nil {
-		return err
-	}
-	record.Result = result
-	if stamp != nil {
-		record.Contract = stamp
-	}
-	if run.contract != nil {
-		resolved := *run.contract
-		record.ResolvedContract = &resolved
-	}
-	if err := run.store.Save(record); err != nil {
 		return err
 	}
 	if run.foreground && run.conn != nil {
@@ -1154,31 +1167,59 @@ func (s *Server) heartbeat(store *engine.Store, jobID string, done <-chan struct
 		case <-done:
 			return
 		case <-ticker.C:
-			record, err := store.Load(jobID)
-			if err != nil || engine.IsTerminal(record.State) {
+			active, err := s.refreshHeartbeat(store, jobID)
+			if err != nil || !active {
 				return
 			}
-			now := s.clock.Now().UTC()
-			record.HeartbeatAt = now
-			record.Lease = engine.Lease{ExpiresAt: now.Add(defaultLeaseDuration)}
-			_ = store.Save(record)
 		}
 	}
 }
 
+func (s *Server) refreshHeartbeat(store *engine.Store, jobID string) (bool, error) {
+	active := false
+	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
+		if engine.IsTerminal(record.State) {
+			return false, nil
+		}
+		now := s.clock.Now().UTC()
+		record.HeartbeatAt = now
+		record.Lease = engine.Lease{ExpiresAt: now.Add(defaultLeaseDuration)}
+		active = true
+		return true, nil
+	})
+	return active, err
+}
+
+func (s *Server) abortUndeliveredRun(run jobRun, state engine.JobState) {
+	if run.active != nil && run.active.cancel != nil {
+		run.active.cancel()
+	}
+	switch state {
+	case engine.StateInterrupted:
+		_, _ = run.store.Interrupt(run.jobID)
+	case engine.StateCanceled:
+		_, _ = run.store.Cancel(run.jobID)
+	default:
+		_ = s.finalizeTerminal(run, state, "", nil)
+	}
+	s.removeActiveJob(run.jobID)
+	if run.onDone != nil {
+		run.onDone()
+	}
+}
+
 func (s *Server) updateBackendProcess(store *engine.Store, jobID string, ref engine.ProcessRef, backendChildPID int) error {
-	record, err := store.Load(jobID)
-	if err != nil {
-		return err
-	}
-	if engine.IsTerminal(record.State) {
-		return nil
-	}
-	record.BackendChildPID = backendChildPID
-	if ref.PID > 0 || ref.PGID > 0 || ref.StartTime != "" {
-		record.Worker = ref
-	}
-	return store.Save(record)
+	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
+		if engine.IsTerminal(record.State) {
+			return false, nil
+		}
+		record.BackendChildPID = backendChildPID
+		if ref.PID > 0 || ref.PGID > 0 || ref.StartTime != "" {
+			record.Worker = ref
+		}
+		return true, nil
+	})
+	return err
 }
 
 func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backend string, tags map[string]string, policy *engine.TurnPolicy, resolved *engine.ContractSpec, foreground bool) error {
@@ -1213,20 +1254,19 @@ func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backe
 }
 
 func (s *Server) transitionRecord(store *engine.Store, jobID string, state engine.JobState) error {
-	record, err := store.Load(jobID)
-	if err != nil {
-		return err
-	}
-	if engine.IsTerminal(record.State) {
-		return nil
-	}
-	if err := transitionOrSet(record, state, s.clock.Now().UTC()); err != nil {
-		return err
-	}
-	now := s.clock.Now().UTC()
-	record.HeartbeatAt = now
-	record.Lease = engine.Lease{ExpiresAt: now.Add(defaultLeaseDuration)}
-	return store.Save(record)
+	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
+		if engine.IsTerminal(record.State) {
+			return false, nil
+		}
+		if err := transitionOrSet(record, state, s.clock.Now().UTC()); err != nil {
+			return false, err
+		}
+		now := s.clock.Now().UTC()
+		record.HeartbeatAt = now
+		record.Lease = engine.Lease{ExpiresAt: now.Add(defaultLeaseDuration)}
+		return true, nil
+	})
+	return err
 }
 
 func transitionOrSet(record *engine.JobRecord, state engine.JobState, now time.Time) error {

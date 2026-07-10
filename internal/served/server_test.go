@@ -2,9 +2,11 @@ package served
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -108,6 +110,27 @@ func (s *fakeSession) Turn(ctx context.Context, input engine.TurnInput) (<-chan 
 
 func (s *fakeSession) Interrupt(context.Context) error {
 	s.backend.interrupts.Add(1)
+	return nil
+}
+
+type controlledSession struct {
+	id         string
+	events     chan engine.Event
+	started    chan struct{}
+	interrupts atomic.Int64
+}
+
+func (s *controlledSession) ID() string { return s.id }
+
+func (s *controlledSession) Turn(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+	if s.started != nil {
+		s.started <- struct{}{}
+	}
+	return s.events, nil
+}
+
+func (s *controlledSession) Interrupt(context.Context) error {
+	s.interrupts.Add(1)
 	return nil
 }
 
@@ -373,28 +396,236 @@ func TestJobCancelUsesStoreGraceAndDoesNotInterruptSession(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for job to start")
 	}
-	var canceled protocol.JobCancelResult
-	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: job.JobID}), &canceled)
-	if canceled.State != engine.StateCanceled {
-		t.Fatalf("cancel result = %+v", canceled)
-	}
+	defer waiter.Release()
+	cancelResp := make(chan protocol.Response, 1)
+	go func() {
+		cancelResp <- rpc(t, conn, r, "3", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: job.JobID})
+	}()
 	select {
 	case got := <-waiter.durations:
 		if got != engine.DefaultCancelGrace {
 			t.Fatalf("cancel grace = %s, want %s", got, engine.DefaultCancelGrace)
 		}
-	default:
-		t.Fatal("store cancellation did not wait the protocol grace")
+	case <-time.After(time.Second):
+		t.Fatal("store cancellation did not enter the protocol grace wait")
 	}
 	signals := groups.snapshot()
-	if len(signals) != 2 || signals[0].Signal != syscall.SIGTERM || signals[1].Signal != syscall.SIGKILL || signals[0].PGID != 5250 || signals[1].PGID != 5250 {
-		t.Fatalf("signals = %+v", signals)
+	if len(signals) != 1 || signals[0].Signal != syscall.SIGTERM || signals[0].PGID != 5250 {
+		t.Fatalf("signals before grace release = %+v", signals)
+	}
+	waiter.Release()
+	var canceled protocol.JobCancelResult
+	select {
+	case resp := <-cancelResp:
+		decodeResult(t, resp, &canceled)
+	case <-time.After(time.Second):
+		t.Fatal("cancel RPC did not return after grace release")
+	}
+	if canceled.State != engine.StateCanceled {
+		t.Fatalf("cancel result = %+v", canceled)
+	}
+	signals = groups.snapshot()
+	if len(signals) != 2 || signals[1].Signal != syscall.SIGKILL || signals[1].PGID != 5250 {
+		t.Fatalf("signals after grace release = %+v", signals)
 	}
 	if got := backend.interrupts.Load(); got != 0 {
 		t.Fatalf("session interrupts = %d, want 0", got)
 	}
 	close(release)
 	waitJobState(t, conn, r, job.JobID, engine.StateCanceled)
+}
+
+func TestBackgroundJobCancelDoesNotInterruptSessionAttemptInterleavings(t *testing.T) {
+	t.Parallel()
+	t.Run("attempt context cancellation wins", func(t *testing.T) {
+		t.Parallel()
+		server, run, sess, ctx, cancel := newControlledBackgroundRun(t)
+		defer cancel()
+		done := make(chan attemptResult, 1)
+		go func() {
+			text, state, err := server.runAttempt(ctx, run, "hold", false)
+			done <- attemptResult{text: text, state: state, err: err}
+		}()
+		waitControlledSessionStarted(t, sess)
+
+		run.active.requestTerminal(engine.StateCanceled)
+		cancel()
+		result := waitAttemptResult(t, done)
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("runAttempt err = %v, want context.Canceled", result.err)
+		}
+		if got := sess.interrupts.Load(); got != 0 {
+			t.Fatalf("session interrupts = %d, want 0", got)
+		}
+	})
+	t.Run("backend event stream closes before context cancellation", func(t *testing.T) {
+		t.Parallel()
+		server, run, sess, ctx, cancel := newControlledBackgroundRun(t)
+		defer cancel()
+		done := make(chan attemptResult, 1)
+		go func() {
+			text, state, err := server.runAttempt(ctx, run, "hold", false)
+			done <- attemptResult{text: text, state: state, err: err}
+		}()
+		waitControlledSessionStarted(t, sess)
+
+		run.active.requestTerminal(engine.StateCanceled)
+		close(sess.events)
+		result := waitAttemptResult(t, done)
+		if result.err != nil || result.state != engine.StateCompleted {
+			t.Fatalf("runAttempt result = %+v, want completed without error", result)
+		}
+		cancel()
+		if got := sess.interrupts.Load(); got != 0 {
+			t.Fatalf("session interrupts = %d, want 0", got)
+		}
+	})
+}
+
+func TestDeferredLaunchRunsOnlyAfterSuccessfulAck(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	backend := newFakeBackend("fake")
+	backend.block = release
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	if got := conn.writesString(); !strings.Contains(got, `"result"`) {
+		t.Fatalf("response was not written before launch: %s", got)
+	}
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatal("job did not launch after successful ack")
+	}
+	close(release)
+	waitKnownRecordState(t, server, engine.StateCompleted)
+}
+
+func TestDeferredLaunchAbortsWhenAckWriteFails(t *testing.T) {
+	t.Parallel()
+	errAck := errors.New("ack write failed")
+	tests := []struct {
+		name      string
+		method    string
+		params    func(cwd string) any
+		sessionID string
+		want      engine.JobState
+	}{
+		{
+			name:   "job submit",
+			method: protocol.MethodJobSubmit,
+			params: func(cwd string) any {
+				return protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"}}
+			},
+			want: engine.StateCanceled,
+		},
+		{
+			name:      "turn start",
+			method:    protocol.MethodTurnStart,
+			sessionID: "ses_ack_failure",
+			params: func(string) any {
+				return protocol.TurnStartParams{SessionID: "ses_ack_failure", Prompt: "hold"}
+			},
+			want: engine.StateInterrupted,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := newFakeBackend("fake")
+			backend.started = make(chan struct{}, 1)
+			server, _, cwd := newUnstartedTestServer(t, backend)
+			if tt.sessionID != "" {
+				addScriptedSession(t, server, backend, cwd, tt.sessionID)
+			}
+
+			serveScriptedRequest(t, server, tt.method, tt.params(cwd), errAck)
+			select {
+			case <-backend.started:
+				t.Fatal("backend launched after failed ack")
+			default:
+			}
+			select {
+			case turn := <-backend.turns:
+				t.Fatalf("backend received turn after failed ack: %+v", turn)
+			default:
+			}
+			record := singleKnownRecord(t, server)
+			if record.State != tt.want {
+				t.Fatalf("record state = %s, want %s", record.State, tt.want)
+			}
+			if server.activeWork() {
+				t.Fatal("failed ack left active work registered")
+			}
+			if tt.sessionID != "" {
+				server.mu.Lock()
+				active := server.sessions[tt.sessionID].activeTurnID
+				server.mu.Unlock()
+				if active != "" {
+					t.Fatalf("failed ack left active turn %q", active)
+				}
+			}
+		})
+	}
+}
+
+func TestHeartbeatRacingCompletionDoesNotResurrectTerminalRecord(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := server.nextID("job")
+	contract := &engine.ContractSpec{Shape: &engine.ShapeSpec{FirstLineEnum: []string{"PASS"}}}
+	if err := server.createQueuedRecord(store, jobID, "ses_race", "fake", nil, &engine.TurnPolicy{Contract: contract}, contract, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.transitionRecord(store, jobID, engine.StateStarting); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.transitionRecord(store, jobID, engine.StateRunning); err != nil {
+		t.Fatal(err)
+	}
+
+	stamp := &engine.ContractStamp{Status: engine.ContractCompliant, Attempts: 1, ValidatedAt: time.Now().UTC()}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	go func() {
+		<-start
+		errs <- server.finalizeTerminal(jobRun{jobID: jobID, store: store, contract: contract}, engine.StateCompleted, "PASS\n", stamp)
+	}()
+	go func() {
+		<-start
+		_, err := server.refreshHeartbeat(store, jobID)
+		errs <- err
+	}()
+	close(start)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	active, err := server.refreshHeartbeat(store, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active {
+		t.Fatal("heartbeat treated terminal job as active")
+	}
+	record, err := store.Load(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != engine.StateCompleted || record.Result == nil || record.Contract == nil || record.ResolvedContract == nil {
+		t.Fatalf("terminal record was not preserved: %+v", record)
+	}
 }
 
 func TestTurnInterruptRejectsBackgroundJob(t *testing.T) {
@@ -631,14 +862,21 @@ func (g *recordingProcessGroups) snapshot() []processSignal {
 
 type recordingWaiter struct {
 	durations chan time.Duration
+	release   chan struct{}
+	once      sync.Once
 }
 
 func newRecordingWaiter() *recordingWaiter {
-	return &recordingWaiter{durations: make(chan time.Duration, 4)}
+	return &recordingWaiter{durations: make(chan time.Duration, 4), release: make(chan struct{})}
 }
 
 func (w *recordingWaiter) Wait(d time.Duration) {
 	w.durations <- d
+	<-w.release
+}
+
+func (w *recordingWaiter) Release() {
+	w.once.Do(func() { close(w.release) })
 }
 
 type testServer struct {
@@ -713,6 +951,194 @@ func dialRaw(t *testing.T, socketPath string) net.Conn {
 		t.Fatal(err)
 	}
 	return conn
+}
+
+func newUnstartedTestServer(t *testing.T, backend engine.Backend) (*Server, string, string) {
+	t.Helper()
+	root := shortTempDir(t)
+	cwd := shortTempDir(t)
+	server, err := New(Config{
+		StateRoot:    root,
+		CWD:          cwd,
+		Token:        "test-token",
+		Backends:     []engine.Backend{backend},
+		ProcessTable: mapProcessTable{entries: map[int]engine.ProcessInfo{os.Getpid(): {PID: os.Getpid()}}},
+		IdleTimeout:  -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server, root, cwd
+}
+
+func addScriptedSession(t *testing.T, server *Server, backend *fakeBackend, cwd, sessionID string) {
+	t.Helper()
+	session, err := backend.Start(context.Background(), engine.SessionOpts{CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	server.sessions[sessionID] = &sessionState{id: sessionID, backend: backend.Name(), cwd: cwd, session: session}
+	server.mu.Unlock()
+}
+
+type attemptResult struct {
+	text  string
+	state engine.JobState
+	err   error
+}
+
+func newControlledBackgroundRun(t *testing.T) (*Server, jobRun, *controlledSession, context.Context, context.CancelFunc) {
+	t.Helper()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := server.nextID("job")
+	if err := server.createQueuedRecord(store, jobID, "ses_controlled", "fake", nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.transitionRecord(store, jobID, engine.StateStarting); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.transitionRecord(store, jobID, engine.StateRunning); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &controlledSession{id: "controlled-session", events: make(chan engine.Event), started: make(chan struct{}, 1)}
+	active := &activeJob{jobID: jobID, sessionID: "ses_controlled", session: session, cancel: cancel}
+	run := jobRun{
+		jobID:     jobID,
+		sessionID: "ses_controlled",
+		backend:   "fake",
+		store:     store,
+		session:   session,
+		active:    active,
+	}
+	return server, run, session, ctx, cancel
+}
+
+func serveScriptedRequest(t *testing.T, server *Server, method string, params any, writeErr error) *scriptedConn {
+	t.Helper()
+	req := protocol.Request{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage(strconvQuote("1")),
+		Method:  method,
+		Params:  mustMarshal(t, params),
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &scriptedConn{read: bytes.NewReader(append(raw, '\n')), writeErr: writeErr}
+	c := &connection{server: server, conn: conn, hello: true}
+	c.serve(context.Background())
+	return conn
+}
+
+func waitControlledSessionStarted(t *testing.T, session *controlledSession) {
+	t.Helper()
+	select {
+	case <-session.started:
+	case <-time.After(time.Second):
+		t.Fatal("controlled session did not start")
+	}
+}
+
+func waitAttemptResult(t *testing.T, done <-chan attemptResult) attemptResult {
+	t.Helper()
+	select {
+	case result := <-done:
+		return result
+	case <-time.After(time.Second):
+		t.Fatal("runAttempt did not return")
+		return attemptResult{}
+	}
+}
+
+type scriptedConn struct {
+	mu       sync.Mutex
+	read     *bytes.Reader
+	writes   bytes.Buffer
+	writeErr error
+	closed   bool
+}
+
+func (c *scriptedConn) Read(p []byte) (int, error) {
+	return c.read.Read(p)
+}
+
+func (c *scriptedConn) Write(p []byte) (int, error) {
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return 0, io.ErrClosedPipe
+	}
+	return c.writes.Write(p)
+}
+
+func (c *scriptedConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *scriptedConn) LocalAddr() net.Addr {
+	return &net.UnixAddr{Name: "scripted-local", Net: "unix"}
+}
+
+func (c *scriptedConn) RemoteAddr() net.Addr {
+	return &net.UnixAddr{Name: "scripted-remote", Net: "unix"}
+}
+
+func (c *scriptedConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (c *scriptedConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *scriptedConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func (c *scriptedConn) writesString() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writes.String()
+}
+
+func singleKnownRecord(t *testing.T, server *Server) engine.JobRecord {
+	t.Helper()
+	records := server.listKnownRecords()
+	if len(records) != 1 {
+		t.Fatalf("known records = %+v, want exactly one", records)
+	}
+	return records[0]
+}
+
+func waitKnownRecordState(t *testing.T, server *Server, want engine.JobState) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	var last engine.JobRecord
+	for time.Now().Before(deadline) {
+		record := singleKnownRecord(t, server)
+		last = record
+		if record.State == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("known record did not reach %s; last = %+v", want, last)
 }
 
 type rawNotification struct {

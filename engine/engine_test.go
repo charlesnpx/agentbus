@@ -227,6 +227,30 @@ func TestStateMachineAndExitCodes(t *testing.T) {
 	}
 }
 
+func TestStoreUpdateRejectsIllegalTerminalTransition(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, now, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	record := &JobRecord{JobID: "job_guarded_update", State: StateCompleted, UpdatedAt: now}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(record.JobID, func(record *JobRecord) (bool, error) {
+		record.State = StateRunning
+		record.UpdatedAt = now.Add(time.Second)
+		return true, nil
+	}); err == nil {
+		t.Fatal("Update allowed completed -> running")
+	}
+	persisted, err := store.Load(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.State != StateCompleted || !persisted.UpdatedAt.Equal(now) {
+		t.Fatalf("illegal update changed record: %+v", persisted)
+	}
+}
+
 func TestStoreLeaseStatusAndReaper(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)

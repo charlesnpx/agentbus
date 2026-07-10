@@ -162,21 +162,48 @@ func (s *Store) Save(record *JobRecord) error {
 		if err != nil {
 			return err
 		}
-		now := s.clock.Now().UTC()
-		if record.CreatedAt.IsZero() {
-			record.CreatedAt = now
-		}
-		if record.UpdatedAt.IsZero() {
-			record.UpdatedAt = now
-		}
-		record.StatePath = path
-		b, err := json.MarshalIndent(record, "", "  ")
+		return s.saveRecordLocked(record, path)
+	})
+}
+
+// Update loads, mutates, and saves a job record while holding the per-job lock.
+func (s *Store) Update(jobID string, mutate func(*JobRecord) (bool, error)) (*JobRecord, error) {
+	if mutate == nil {
+		return nil, errors.New("nil job update")
+	}
+	if err := validateJobID(jobID); err != nil {
+		return nil, err
+	}
+	path, err := s.jobPath(jobID)
+	if err != nil {
+		return nil, err
+	}
+	var out *JobRecord
+	if err := s.withJobLock(jobID, func() error {
+		record, err := s.loadPath(path)
 		if err != nil {
 			return err
 		}
-		b = append(b, '\n')
-		return atomicWriteFile(record.StatePath, b, 0o600)
-	})
+		before := *record
+		changed, err := mutate(record)
+		if err != nil {
+			return err
+		}
+		if err := validateGuardedStateChange(before, *record); err != nil {
+			return err
+		}
+		if changed {
+			if err := s.saveRecordLocked(record, path); err != nil {
+				return err
+			}
+		}
+		status := record.StatusRecord(s.clock.Now().UTC())
+		out = &status
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Load reads a job record and computes status-only lease fields.
@@ -598,6 +625,33 @@ func (s *Store) saveIfUnchanged(record *JobRecord, path string, original []byte)
 	}
 	b = append(b, '\n')
 	return atomicWriteFile(path, b, 0o600)
+}
+
+func (s *Store) saveRecordLocked(record *JobRecord, path string) error {
+	now := s.clock.Now().UTC()
+	if record.CreatedAt.IsZero() {
+		record.CreatedAt = now
+	}
+	if record.UpdatedAt.IsZero() {
+		record.UpdatedAt = now
+	}
+	record.StatePath = path
+	b, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	return atomicWriteFile(path, b, 0o600)
+}
+
+func validateGuardedStateChange(before, after JobRecord) error {
+	if before.State == after.State {
+		return nil
+	}
+	if !LegalTransition(before.State, after.State, before.RetryCount) {
+		return fmt.Errorf("illegal job state transition %q -> %q", before.State, after.State)
+	}
+	return nil
 }
 
 func (s *Store) withJobLock(jobID string, fn func() error) error {
