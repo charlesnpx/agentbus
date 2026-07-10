@@ -293,6 +293,7 @@ type Session struct {
 	suppressValidationWarning bool
 	mu                        sync.Mutex
 	active                    *exec.Cmd
+	lastAgentMessage          string
 }
 
 func (s *Session) ID() string {
@@ -317,6 +318,7 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		s.mu.Unlock()
 		return nil, errors.New("session_busy")
 	}
+	s.lastAgentMessage = ""
 	timeout := input.Timeout
 	if timeout == 0 {
 		timeout = s.opts.Timeout
@@ -480,6 +482,16 @@ func (s *Session) scan(r io.Reader, out chan<- engine.Event) error {
 			s.mu.Unlock()
 		}
 		for _, ev := range events {
+			if ev.Type == engine.EventAgentText && ev.Text != "" {
+				s.mu.Lock()
+				s.lastAgentMessage = ev.Text
+				s.mu.Unlock()
+			}
+			if ev.Type == engine.EventResultMessage && ev.Text == "" {
+				s.mu.Lock()
+				ev.Text = s.lastAgentMessage
+				s.mu.Unlock()
+			}
 			out <- capEvent(ev)
 		}
 	}

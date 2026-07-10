@@ -135,7 +135,7 @@ func valuesFromGroup(text, pattern string) []string {
 }
 
 func buildArgs(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error) {
-	args := []string{"--print", "--output-format", "stream-json"}
+	args := []string{"--print", "--output-format", "stream-json", "--verbose"}
 	if opts.Model != "" {
 		args = append(args, "--model", opts.Model)
 	}
