@@ -40,9 +40,11 @@ type SessionOpts struct {
 
 // TurnInput is the effective input for one backend turn.
 type TurnInput struct {
-	Prompt  string
-	Write   bool
-	Timeout time.Duration
+	Prompt         string
+	Write          bool
+	Timeout        time.Duration
+	LogPaths       LogPaths
+	OnProcessStart func(ProcessRef, int)
 }
 
 // Event is an agentbus streaming event emitted by an adapter.
@@ -52,6 +54,7 @@ type Event struct {
 	Text      string         `json:"text"`
 	Truncated bool           `json:"truncated"`
 	Metadata  map[string]any `json:"metadata,omitempty"`
+	RawText   string         `json:"-"`
 }
 
 const (

@@ -102,6 +102,8 @@ type WorkspaceLayout struct {
 	Quarantine string
 }
 
+const workspaceManifestFile = "workspace.json"
+
 // LayoutForWorkspace resolves and describes the state layout for cwd.
 func LayoutForWorkspace(root, cwd string) (WorkspaceLayout, error) {
 	canon, err := CanonicalWorkspace(cwd)
@@ -109,10 +111,17 @@ func LayoutForWorkspace(root, cwd string) (WorkspaceLayout, error) {
 		return WorkspaceLayout{}, err
 	}
 	key := WorkspaceKey(canon)
+	return layoutForWorkspaceKey(root, key, canon)
+}
+
+func layoutForWorkspaceKey(root, key, workspace string) (WorkspaceLayout, error) {
+	if err := validateWorkspaceKey(key); err != nil {
+		return WorkspaceLayout{}, err
+	}
 	ns := filepath.Join(root, "workspaces", key)
 	return WorkspaceLayout{
 		Root:       root,
-		Workspace:  canon,
+		Workspace:  workspace,
 		Key:        key,
 		Namespace:  ns,
 		Jobs:       filepath.Join(ns, "jobs"),
@@ -121,6 +130,19 @@ func LayoutForWorkspace(root, cwd string) (WorkspaceLayout, error) {
 		Inputs:     filepath.Join(ns, "inputs"),
 		Quarantine: filepath.Join(ns, "quarantine"),
 	}, nil
+}
+
+func validateWorkspaceKey(key string) error {
+	if len(key) != sha256.Size*2 {
+		return errors.New("invalid workspace key")
+	}
+	for _, r := range key {
+		if r >= '0' && r <= '9' || r >= 'a' && r <= 'f' {
+			continue
+		}
+		return errors.New("invalid workspace key")
+	}
+	return nil
 }
 
 func ensureLayout(layout WorkspaceLayout) error {

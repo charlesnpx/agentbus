@@ -258,7 +258,7 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, s.backend.binary(), args...)
-	cmd.Cancel = func() error { return terminateProcessGroup(cmd, 500*time.Millisecond) }
+	cmd.Cancel = func() error { return terminateProcessGroup(cmd, engine.DefaultCancelGrace) }
 	cmd.WaitDelay = 200 * time.Millisecond
 	if s.opts.CWD != "" {
 		cmd.Dir = s.opts.CWD
@@ -275,10 +275,40 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		return nil, err
 	}
 	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	var stderrLog *engine.CappedLogWriter
+	stderrWriter := io.Writer(&stderr)
+	if input.LogPaths.Stderr != "" {
+		stderrLog, err = engine.NewCappedLogWriter(input.LogPaths.Stderr, 0)
+		if err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+		stderrWriter = io.MultiWriter(&stderr, stderrLog)
+	}
+	cmd.Stderr = stderrWriter
+	var stdoutLog *engine.CappedLogWriter
+	if input.LogPaths.Stdout != "" {
+		stdoutLog, err = engine.NewCappedLogWriter(input.LogPaths.Stdout, 0)
+		if err != nil {
+			if stderrLog != nil {
+				_ = stderrLog.Close()
+			}
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
 	if err := cmd.Start(); err != nil {
+		if stdoutLog != nil {
+			_ = stdoutLog.Close()
+		}
+		if stderrLog != nil {
+			_ = stderrLog.Close()
+		}
 		s.mu.Unlock()
 		return nil, err
+	}
+	if input.OnProcessStart != nil {
+		input.OnProcessStart(processRefForCmd(cmd), cmd.Process.Pid)
 	}
 	s.active = cmd
 	s.mu.Unlock()
@@ -286,11 +316,23 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 	events := make(chan engine.Event, 16)
 	go func() {
 		defer close(events)
+		defer func() {
+			if stdoutLog != nil {
+				_ = stdoutLog.Close()
+			}
+			if stderrLog != nil {
+				_ = stderrLog.Close()
+			}
+		}()
 		go func() {
 			_, _ = io.WriteString(stdin, input.Prompt)
 			_ = stdin.Close()
 		}()
-		parseErr := s.scan(stdout, events)
+		var stdoutReader io.Reader = stdout
+		if stdoutLog != nil {
+			stdoutReader = io.TeeReader(stdout, stdoutLog)
+		}
+		parseErr := s.scan(stdoutReader, events)
 		waitErr := cmd.Wait()
 		s.mu.Lock()
 		if s.active == cmd {
@@ -323,7 +365,7 @@ func (s *Session) Interrupt(ctx context.Context) error {
 		return nil
 	}
 	done := make(chan error, 1)
-	go func() { done <- terminateProcessGroup(cmd, 500*time.Millisecond) }()
+	go func() { done <- terminateProcessGroup(cmd, engine.DefaultCancelGrace) }()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -362,10 +404,29 @@ func (s *Session) scan(r io.Reader, out chan<- engine.Event) error {
 	return scanner.Err()
 }
 
+func processRefForCmd(cmd *exec.Cmd) engine.ProcessRef {
+	ref := engine.ProcessRef{}
+	if cmd == nil || cmd.Process == nil {
+		return ref
+	}
+	ref.PID = cmd.Process.Pid
+	if runtime.GOOS != "windows" {
+		if pgid, err := syscall.Getpgid(ref.PID); err == nil {
+			ref.PGID = pgid
+		}
+	}
+	if info, alive, err := (engine.NativeProcessTable{}).Lookup(ref.PID); err == nil && alive {
+		ref.StartTime = info.StartTime
+	}
+	return ref
+}
+
 func capEvent(ev engine.Event) engine.Event {
+	ev.RawText = ev.Text
 	text := engine.TruncateEventText([]byte(ev.Text), engine.DefaultEventTextCap)
 	ev.Text = text.Text
 	ev.Truncated = ev.Truncated || text.Truncated
+	ev.Metadata = engine.SanitizeEventMetadata(ev.Metadata)
 	return ev
 }
 
@@ -380,7 +441,9 @@ func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func terminateProcessGroup(cmd *exec.Cmd, grace time.Duration) error {
+var terminateProcessGroup = terminateProcessGroupImpl
+
+func terminateProcessGroupImpl(cmd *exec.Cmd, grace time.Duration) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
@@ -394,9 +457,24 @@ func terminateProcessGroup(cmd *exec.Cmd, grace time.Duration) error {
 		pgid = pid
 	}
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
-	time.Sleep(grace)
+	waitForProcessGroupExit(pgid, grace)
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
 	return nil
+}
+
+func waitForProcessGroupExit(pgid int, grace time.Duration) {
+	if grace <= 0 {
+		return
+	}
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(-pgid, 0); err != nil {
+			if err == syscall.ESRCH {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func commandOutput(ctx context.Context, binary string, arg ...string) (string, error) {

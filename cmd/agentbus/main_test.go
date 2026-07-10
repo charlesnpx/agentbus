@@ -64,12 +64,9 @@ func TestVersionAndServeCommands(t *testing.T) {
 		t.Fatalf("version output = %+v", version)
 	}
 
-	code, _, stderr = runTestCLI(t, a, []string{"serve", "--foreground"}, "")
-	if code != 1 {
-		t.Fatalf("serve exit = %d, want 1", code)
-	}
-	if !strings.Contains(stderr, serveStubError) {
-		t.Fatalf("serve stderr = %q", stderr)
+	code, _, stderr = runTestCLI(t, a, []string{"serve", "--help"}, "")
+	if code != 0 {
+		t.Fatalf("serve help exit = %d stderr=%s", code, stderr)
 	}
 }
 

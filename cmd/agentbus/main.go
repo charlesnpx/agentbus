@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -14,13 +16,13 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/claudecli"
 	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
+	"github.com/charlesnpx/agentbus/internal/served"
 )
 
 const (
-	version        = "dev"
-	protocolMajor  = 1
-	cliJSONSchema  = 1
-	serveStubError = "daemon lands in v0.0.7"
+	version       = "dev"
+	protocolMajor = 1
+	cliJSONSchema = 1
 )
 
 type setupProber interface {
@@ -50,8 +52,9 @@ func main() {
 
 func newDefaultApp() *app {
 	a := &app{
-		version:  version,
-		registry: engine.NewPolicyRegistry(),
+		version:   version,
+		stateRoot: os.Getenv("AGENTBUS_STATE_ROOT"),
+		registry:  engine.NewPolicyRegistry(),
 	}
 	cachePath, err := a.cachePath()
 	if err != nil {
@@ -87,7 +90,7 @@ func (a *app) run(ctx context.Context, args []string, in io.Reader, out, errOut 
 	case "setup":
 		return a.runSetup(ctx, args[1:], out, errOut)
 	case "serve":
-		return a.runServe(args[1:], errOut)
+		return a.runServe(ctx, args[1:], errOut)
 	case "sessions":
 		return a.runSessions(args[1:], out, errOut)
 	case "status":
@@ -155,17 +158,108 @@ func (a *app) runSetup(ctx context.Context, args []string, out, errOut io.Writer
 	return 0
 }
 
-func (a *app) runServe(args []string, errOut io.Writer) int {
+func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int {
 	fs := newCommandFlagSet("serve", errOut)
-	fs.Bool("foreground", false, "run daemon in foreground once daemon support lands")
+	foreground := fs.Bool("foreground", false, "run daemon in foreground")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
 	if fs.NArg() != 0 {
 		return usageError(errOut, "serve does not accept positional arguments")
 	}
-	fmt.Fprintln(errOut, serveStubError)
-	return 1
+	if !*foreground {
+		if err := a.startBackgroundDaemon(ctx); err != nil {
+			return commandError(errOut, err)
+		}
+		return 0
+	}
+	backends := make([]engine.Backend, 0, len(a.backends))
+	for _, spec := range a.backends {
+		if spec.backend != nil {
+			backends = append(backends, spec.backend)
+		}
+	}
+	server, err := served.New(served.Config{
+		StateRoot:    a.stateRoot,
+		CWD:          a.cwd,
+		Backends:     backends,
+		Registry:     a.registryOrDefault(),
+		Clock:        a.clock,
+		ProcessTable: a.processes,
+	})
+	if err != nil {
+		return commandError(errOut, err)
+	}
+	if err := server.Serve(ctx); err != nil {
+		return commandError(errOut, err)
+	}
+	return 0
+}
+
+func (a *app) startBackgroundDaemon(ctx context.Context) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, exe, "serve", "--foreground")
+	cmd.Env = os.Environ()
+	if a.stateRoot != "" {
+		cmd.Env = append(cmd.Env, "AGENTBUS_STATE_ROOT="+a.stateRoot)
+	}
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer devNull.Close()
+	cmd.Stdin = devNull
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	root := a.stateRoot
+	if root == "" {
+		root, err = engine.ResolveStateRoot()
+		if err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return err
+	}
+	pidPath := filepath.Join(root, "agentbus.pid")
+	return atomicWriteFile(pidPath, []byte(fmt.Sprintf("%d\n", cmd.Process.Pid)), 0o600)
+}
+
+func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	return os.Chmod(path, mode)
 }
 
 func (a *app) runSessions(args []string, out, errOut io.Writer) int {

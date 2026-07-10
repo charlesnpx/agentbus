@@ -66,6 +66,12 @@ type StoreConfig struct {
 	Retention     RetentionConfig
 }
 
+type workspaceManifest struct {
+	Version int    `json:"version"`
+	CWD     string `json:"cwd"`
+	Key     string `json:"key"`
+}
+
 // Store persists job records for one workspace namespace.
 type Store struct {
 	layout        WorkspaceLayout
@@ -98,6 +104,58 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	store, err := newStoreWithLayout(cfg, layout)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeWorkspaceManifest(layout); err != nil {
+		return nil, err
+	}
+	return store, nil
+}
+
+// OpenWorkspaceStores opens every persisted workspace namespace under cfg.Root.
+func OpenWorkspaceStores(cfg StoreConfig) ([]*Store, error) {
+	root := cfg.Root
+	var err error
+	if root == "" {
+		root, err = ResolveStateRoot()
+		if err != nil {
+			return nil, err
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "workspaces"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	stores := make([]*Store, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		key := entry.Name()
+		if err := validateWorkspaceKey(key); err != nil {
+			continue
+		}
+		workspace := readWorkspaceManifestCWD(filepath.Join(root, "workspaces", key), key)
+		layout, err := layoutForWorkspaceKey(root, key, workspace)
+		if err != nil {
+			return nil, err
+		}
+		store, err := newStoreWithLayout(cfg, layout)
+		if err != nil {
+			return nil, err
+		}
+		stores = append(stores, store)
+	}
+	sort.Slice(stores, func(i, j int) bool { return stores[i].layout.Key < stores[j].layout.Key })
+	return stores, nil
+}
+
+func newStoreWithLayout(cfg StoreConfig, layout WorkspaceLayout) (*Store, error) {
 	if err := ensureLayout(layout); err != nil {
 		return nil, err
 	}
@@ -149,6 +207,48 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 // Layout returns the workspace layout used by the store.
 func (s *Store) Layout() WorkspaceLayout { return s.layout }
 
+func writeWorkspaceManifest(layout WorkspaceLayout) error {
+	if layout.Workspace == "" {
+		return nil
+	}
+	manifest := workspaceManifest{
+		Version: 1,
+		CWD:     layout.Workspace,
+		Key:     layout.Key,
+	}
+	raw, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	return atomicWriteFile(filepath.Join(layout.Namespace, workspaceManifestFile), raw, 0o600)
+}
+
+func readWorkspaceManifestCWD(namespace, key string) string {
+	raw, err := os.ReadFile(filepath.Join(namespace, workspaceManifestFile))
+	if err != nil {
+		return ""
+	}
+	var manifest workspaceManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return ""
+	}
+	if manifest.Key != "" && manifest.Key != key {
+		return ""
+	}
+	if manifest.CWD == "" {
+		return ""
+	}
+	cwd, err := CanonicalWorkspace(manifest.CWD)
+	if err != nil {
+		return ""
+	}
+	if WorkspaceKey(cwd) != key {
+		return ""
+	}
+	return cwd
+}
+
 // Save writes a job record atomically.
 func (s *Store) Save(record *JobRecord) error {
 	if record == nil {
@@ -162,21 +262,66 @@ func (s *Store) Save(record *JobRecord) error {
 		if err != nil {
 			return err
 		}
-		now := s.clock.Now().UTC()
-		if record.CreatedAt.IsZero() {
-			record.CreatedAt = now
-		}
-		if record.UpdatedAt.IsZero() {
-			record.UpdatedAt = now
-		}
-		record.StatePath = path
-		b, err := json.MarshalIndent(record, "", "  ")
+		return s.saveRecordLocked(record, path)
+	})
+}
+
+// Update loads, mutates, and saves a job record while holding the per-job lock.
+func (s *Store) Update(jobID string, mutate func(*JobRecord) (bool, error)) (*JobRecord, error) {
+	if mutate == nil {
+		return nil, errors.New("nil job update")
+	}
+	if err := validateJobID(jobID); err != nil {
+		return nil, err
+	}
+	path, err := s.jobPath(jobID)
+	if err != nil {
+		return nil, err
+	}
+	var out *JobRecord
+	if err := s.withJobLock(jobID, func() error {
+		record, err := s.loadPath(path)
 		if err != nil {
 			return err
 		}
-		b = append(b, '\n')
-		return atomicWriteFile(record.StatePath, b, 0o600)
-	})
+		before := *record
+		changed, err := mutate(record)
+		if err != nil {
+			return err
+		}
+		if err := validateGuardedStateChange(before, *record); err != nil {
+			return err
+		}
+		if changed {
+			if err := s.saveRecordLocked(record, path); err != nil {
+				return err
+			}
+		}
+		status := record.StatusRecord(s.clock.Now().UTC())
+		out = &status
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// HasJob reports whether a persisted job record exists in this workspace store.
+func (s *Store) HasJob(jobID string) (bool, error) {
+	if err := validateJobID(jobID); err != nil {
+		return false, err
+	}
+	path, err := s.jobPath(jobID)
+	if err != nil {
+		return false, err
+	}
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // Load reads a job record and computes status-only lease fields.
@@ -241,10 +386,22 @@ func (s *Store) List() ([]JobRecord, error) {
 	return out, nil
 }
 
-// Cancel transitions a queued or active job record to canceled.
+// Interrupt transitions a queued or active foreground turn record to interrupted.
+func (s *Store) Interrupt(jobID string) (*JobRecord, error) {
+	return s.terminate(jobID, StateInterrupted)
+}
+
+// Cancel transitions a queued or active background job record to canceled.
 func (s *Store) Cancel(jobID string) (*JobRecord, error) {
+	return s.terminate(jobID, StateCanceled)
+}
+
+func (s *Store) terminate(jobID string, state JobState) (*JobRecord, error) {
 	if err := validateJobID(jobID); err != nil {
 		return nil, err
+	}
+	if state != StateInterrupted && state != StateCanceled {
+		return nil, fmt.Errorf("unsupported terminal state %q", state)
 	}
 	path, err := s.jobPath(jobID)
 	if err != nil {
@@ -265,7 +422,7 @@ func (s *Store) Cancel(jobID string) (*JobRecord, error) {
 		if err := s.cancelLiveProcessGroup(record); err != nil {
 			return err
 		}
-		if err := record.Transition(StateCanceled, now); err != nil {
+		if err := record.Transition(state, now); err != nil {
 			return err
 		}
 		if err := s.saveIfUnchanged(record, path, original); err != nil {
@@ -586,6 +743,33 @@ func (s *Store) saveIfUnchanged(record *JobRecord, path string, original []byte)
 	}
 	b = append(b, '\n')
 	return atomicWriteFile(path, b, 0o600)
+}
+
+func (s *Store) saveRecordLocked(record *JobRecord, path string) error {
+	now := s.clock.Now().UTC()
+	if record.CreatedAt.IsZero() {
+		record.CreatedAt = now
+	}
+	if record.UpdatedAt.IsZero() {
+		record.UpdatedAt = now
+	}
+	record.StatePath = path
+	b, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	return atomicWriteFile(path, b, 0o600)
+}
+
+func validateGuardedStateChange(before, after JobRecord) error {
+	if before.State == after.State {
+		return nil
+	}
+	if !LegalTransition(before.State, after.State, before.RetryCount) {
+		return fmt.Errorf("illegal job state transition %q -> %q", before.State, after.State)
+	}
+	return nil
 }
 
 func (s *Store) withJobLock(jobID string, fn func() error) error {
