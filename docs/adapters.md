@@ -171,6 +171,7 @@ Scoped Bash deny patterns:
 | Pattern |
 | --- |
 | `Bash(*&&*)` |
+| `Bash(*&*)` |
 | `Bash(*;*)` |
 | `Bash(*\|*)` |
 | `Bash(*$(*)` |
@@ -184,6 +185,18 @@ Scoped Bash deny patterns:
 | `Bash(rm*)` |
 | `Bash(mv*)` |
 | `Bash(cp*)` |
+| `Bash(git -c*)` |
+| `Bash(git --config-env*)` |
+| `Bash(git --paginate*)` |
+| `Bash(git -p*)` |
+| `Bash(git *--help*)` |
+| `Bash(*--output*)` |
+| `Bash(*--ext-diff*)` |
+| `Bash(*--textconv*)` |
+| `Bash(*--pre*)` |
+| `Bash(*--hostname-bin*)` |
+| `Bash(*--search-zip*)` |
+| `Bash(* -z*)` |
 | `Bash(git commit*)` |
 | `Bash(git push*)` |
 | `Bash(git checkout*)` |
@@ -196,7 +209,25 @@ form with wildcard examples such as `Bash(git *)`, but does not formally define
 anchoring. agentbus therefore uses leading and trailing wildcards for redirect
 and shell composition denies so the deny pattern is expressed as a
 contains-style match in the same CLI pattern language. The `Bash(*\|*)` deny
-subsumes the older pipe-to-`tee` special cases.
+subsumes the older pipe-to-`tee` special cases. `Bash(*&*)` closes the matching
+single-ampersand command terminator/backgrounding case.
+
+The Git deny patterns intentionally over-block options that can write output
+files or execute configured helpers even when attached to otherwise read-only
+commands. `--output` writes files for `git diff`, `git show`, and `git log`;
+`--ext-diff` and `--textconv` can execute external diff or conversion helpers;
+`git -c` and `git --config-env` can inject values such as `diff.external` or
+`core.pager`; and `git --paginate`, `git -p`, and `git *--help*` can execute a
+pager or help viewer. These are denied as contains-style Bash patterns rather
+than parsed per subcommand so later allow-list edits do not reopen the same
+class of hole.
+
+The ripgrep deny patterns block options that execute helper commands:
+`--pre`, `--hostname-bin`, and compressed-search helpers via `--search-zip` or
+its short `-z` form. Standard `cat`, `grep`, `ls`, `head`, `tail`, and `wc`
+options do not expose comparable write-or-exec switches in the audited command
+families; they remain covered by the shell composition, redirect, and mutating
+command denies above.
 
 Default permission mode in `-p` / `--print` mode MUST fail closed. A command
 that is not allowed MUST be denied rather than prompting interactively.

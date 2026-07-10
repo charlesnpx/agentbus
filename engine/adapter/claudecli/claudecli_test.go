@@ -70,7 +70,7 @@ func expectedClaudeReadOnlyArgv(resumeID string) string {
 		"--allowedTools",
 		"Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(git status*),Bash(cat*),Bash(rg*),Bash(grep*),Bash(ls*),Bash(head*),Bash(tail*),Bash(wc*)",
 		"--disallowedTools",
-		"Edit,Write,NotebookEdit,mcp__*,Bash(*&&*),Bash(*;*),Bash(*|*),Bash(*$(*),Bash(*`*),Bash(*<(*),Bash(*>*),Bash(*>>*),Bash(sed -i*),Bash(tee*),Bash(find*),Bash(rm*),Bash(mv*),Bash(cp*),Bash(git commit*),Bash(git push*),Bash(git checkout*),Bash(chmod*),Bash(curl*),Bash(wget*)",
+		"Edit,Write,NotebookEdit,mcp__*,Bash(*&&*),Bash(*&*),Bash(*;*),Bash(*|*),Bash(*$(*),Bash(*`*),Bash(*<(*),Bash(*>*),Bash(*>>*),Bash(sed -i*),Bash(tee*),Bash(find*),Bash(rm*),Bash(mv*),Bash(cp*),Bash(git -c*),Bash(git --config-env*),Bash(git --paginate*),Bash(git -p*),Bash(git *--help*),Bash(*--output*),Bash(*--ext-diff*),Bash(*--textconv*),Bash(*--pre*),Bash(*--hostname-bin*),Bash(*--search-zip*),Bash(* -z*),Bash(git commit*),Bash(git push*),Bash(git checkout*),Bash(chmod*),Bash(curl*),Bash(wget*)",
 	}
 	if resumeID != "" {
 		args = append(args, "--resume", resumeID)
