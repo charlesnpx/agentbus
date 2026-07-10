@@ -392,6 +392,143 @@ The codex adapter maps:
 Older aliases such as `message`, `assistant_message`, `tool_use`, and `result`
 remain accepted for compatibility.
 
+## Adding a backend
+
+This is the normative recipe for adding a backend adapter. A backend profile
+MUST ship only when its argv and stream behavior have been verified against an
+installed binary. Documentation, remembered flags, or another project's
+integration are not sufficient evidence. If no candidate CLI is installed,
+document the recipe or discovery surface instead of shipping a speculative
+profile.
+
+### 1. Implement the engine surfaces
+
+Implement `Backend` and `Session` as described in [Go interfaces](#go-interfaces).
+The implementation MUST keep responsibilities at the existing boundary:
+
+- `Backend.Name` returns the stable protocol name. `Preflight` performs only
+  local availability and drift checks. `Start` and `Resume` validate options
+  and create sessions; `Resume` MUST reject an empty backend session id.
+- `Session.ID` returns the backend id extracted from the stream. `Turn` launches
+  exactly one CLI turn and emits normalized events. `Interrupt` terminates the
+  active process group and is a no-op after the process has exited.
+- argv construction MUST use the effective `TurnInput.Write`, not only the
+  `SessionOpts.Write` default. A corrective resume MUST therefore downgrade to
+  the complete read-only profile even when the original session was writable.
+- The adapter MUST NOT take over job state, policy validation or retry
+  decisions, result spilling, or workflow semantics owned by the engine.
+
+Implement the B1 discovery hooks in addition to `Backend`: expose
+`ModelDiscoverer.DiscoverModels(context.Context)` and
+`BackendMetadataProvider.BackendMetadata(context.Context)`. Discovery MUST run
+only during `agentbus setup`, use local CLI surfaces such as verified help or
+config listings, and return `ModelDiscovery` with models, efforts, and an
+evidence-bearing source string. Cache non-empty results in `BackendSetupProbe`.
+Missing, failed, legacy, or stale discovery MUST fall back to static
+known-good validation lists with a warning; it MUST NOT make the backend
+unavailable. Metadata advertised by `protocol.hello` comes from the cache and
+MUST NOT launch discovery or a network turn.
+
+### 2. Verify and pin argv profiles
+
+Record the installed binary version and preserve receipts from its `--help`,
+subcommand help, offline strings, and hermetic fake runs. Pin golden argv tests
+for write, read-only, fresh, and resume forms. Verify option placement for every
+subcommand rather than assuming top-level flags remain valid after a resume
+verb.
+
+Every read-only profile MUST be fail-closed and MUST satisfy this hardening
+checklist:
+
+- default-deny unknown commands or tools; a denied action MUST NOT fall back to
+  an interactive prompt
+- allow only audited read-only tool families and command prefixes, while
+  explicitly denying first-party write tools and untrusted extension/MCP tools
+- express shell separators and substitution as contains-style denies, including
+  `&&`, `;`, `|`, `$()`, backticks, and `<()`; also deny backgrounding and input
+  or output redirection where the CLI's pattern language can express them
+- deny commands and options that can write or execute helpers even when their
+  base command appears read-only; examples include `find -delete`/`-exec`,
+  output-file flags, external diff or text-conversion hooks, injected config,
+  pagers/help viewers, preprocessors, and compressed-search helpers
+- test deny-pattern matching against the installed CLI's actual pattern
+  semantics, using leading and trailing wildcards when anchoring is not
+  specified
+- include an honesty note stating that the profile blocks known tools and
+  patterns but is not an OS sandbox, and that shell bypasses or same-user OS
+  access may remain
+
+These requirements are minimums, not a reusable Claude-specific allow-list.
+Each vendor's tool and option surface MUST be audited independently.
+
+### 3. Make read-only configuration hermetic
+
+Read-only and corrective turns MUST exclude user configuration, hooks, plugins,
+MCP servers, auto-memory, and other customization sources to the strongest
+extent supported by verified vendor flags. Supply an empty explicit config when
+the CLI otherwise discovers user services. If the CLI cannot provide a
+credible hermetic mode, do not advertise the profile as read-only; document the
+limitation and stop the adapter from shipping. Writable turns MAY use normal
+user configuration when their profile explicitly permits it.
+
+### 4. Normalize the stream and terminal result
+
+The adapter MUST parse the CLI's real streaming format incrementally, reject
+malformed records, and map backend events to `AgentText`, `ToolUse`, `Warning`,
+`ResultMessage`, and `TerminalError`. It MUST extract a stable backend session
+id from any documented start or event envelope, retain the first valid id, and
+use it for resume. It MUST distinguish progress text from the authoritative
+terminal result and map the latter to exactly the `ResultMessage` consumed by
+engine result selection. Parse errors, unsupported terminal shapes, and
+non-zero process exits MUST surface as terminal errors rather than successful
+empty results.
+
+Do not infer schemas from an old adapter or generic JSON mode. The
+[Codex 0.144.1 JSON event mapping](#codex-01441-json-event-mapping) is the drift
+lesson: the installed event names and authoritative `last_agent_message` field
+differed from the earlier assumed schema, and valid resume options had to move
+before the subcommand. Capture representative installed-binary events without
+API spend where possible, parse defensively only around verified shapes, and
+pin those fixtures in tests.
+
+### 5. Wire setup, versions, and drift guards
+
+Declare and test a minimum known-good CLI version and a version normalizer.
+Wire the backend into `agentbus setup` so its live trivial-turn probe records
+the resolved binary path, normalized version, stream schema, configuration
+modes, sandbox modes, JSON-event success, and discovery result or warning.
+Setup is the only place a live probe may spend API quota.
+
+Routine `Preflight` MUST remain local: resolve the executable, reject versions
+below the minimum, and compare binary path, version, and exact stream-schema
+identifier with the versioned setup cache. Missing cache data or any drift MUST
+fail with an actionable instruction to rerun setup. Register the adapter in the
+CLI/daemon backend list only after setup reporting, cache migration behavior,
+and `protocol.hello` metadata are wired and tested.
+
+### 6. Build a hermetic fake-backend test suite
+
+Use a temporary executable and isolated setup cache; tests MUST NOT require the
+real vendor CLI, user configuration, network, or API quota. At minimum, cover:
+
+- golden argv and stdin for write, read-only, resume, and corrective-resume;
+  assert that corrective resume downgrades a writable session to the complete
+  read-only and hermetic profile
+- representative stream fixtures, session-id extraction, authoritative
+  terminal-result mapping, malformed JSON, unsupported terminal shapes, and
+  non-zero exits
+- timeout behavior and explicit interrupt, including termination of the whole
+  process group (PGID) rather than only the direct child
+- event and log truncation with the truncation marker and flag preserved
+- unsupported model and effort rejection, discovered-cache validation, missing
+  discovery fallback, and stale-cache warnings
+- minimum-version rejection, binary/version/schema drift, setup-probe output,
+  and discovery parsing from captured fake help/config output
+
+Run `go test -race ./...` and `go vet ./...` after registration. A backend is
+not complete until the tests can falsify its permission profile, process
+supervision, parser, resume behavior, and drift guard.
+
 ## Native structured output capability
 
 Adapters MAY detect backend-native structured output support:
