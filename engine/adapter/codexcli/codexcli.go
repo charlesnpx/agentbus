@@ -91,6 +91,8 @@ func buildArgs(resumeID string, opts engine.SessionOpts, input engine.TurnInput)
 	}
 	if resumeID != "" {
 		args = append(args, "resume", resumeID, "-")
+	} else {
+		args = append(args, "-")
 	}
 	return args, nil
 }

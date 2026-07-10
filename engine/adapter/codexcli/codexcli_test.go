@@ -34,7 +34,7 @@ func TestCodexProfilesAndParsing(t *testing.T) {
 	if got[2].Text != "final answer" {
 		t.Fatalf("terminal result = %q", got[2].Text)
 	}
-	assertLog(t, fake.argv, "exec\n--json\n--model\ngpt-5\n--sandbox\nworkspace-write\n--config\nmodel_reasoning_effort=\"high\"\n")
+	assertLog(t, fake.argv, "exec\n--json\n--model\ngpt-5\n--sandbox\nworkspace-write\n--config\nmodel_reasoning_effort=\"high\"\n-\n")
 	assertLog(t, fake.stdin, "hello")
 
 	session, err = backend.Resume(context.Background(), "codex-session", engine.SessionOpts{Write: true})
@@ -48,6 +48,26 @@ func TestCodexProfilesAndParsing(t *testing.T) {
 	_ = collect(events)
 	assertLog(t, fake.argv, "exec\n--json\n--sandbox\nread-only\n--ignore-user-config\nresume\ncodex-session\n-\n")
 	assertLog(t, fake.stdin, "repair")
+}
+
+func TestCodexSetupProbeUsesStdinPromptArg(t *testing.T) {
+	fake := fakeCodex(t)
+	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
+	probeBackend, ok := backend.(interface {
+		SetupProbe(context.Context) (engine.BackendSetupProbe, error)
+	})
+	if !ok {
+		t.Fatal("backend does not implement SetupProbe")
+	}
+	probe, err := probeBackend.SetupProbe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !probe.JSONEventsProbed {
+		t.Fatalf("probe = %#v", probe)
+	}
+	assertLog(t, fake.argv, "exec\n--json\n--sandbox\nread-only\n--ignore-user-config\n-\n")
+	assertLog(t, fake.stdin, "Reply with exactly: OK")
 }
 
 func TestCodexPreflightAndFailures(t *testing.T) {
@@ -260,11 +280,15 @@ func fakeCodex(t *testing.T) fakeCLI {
 	}
 	script := `#!/bin/sh
 if [ "$1" = "--version" ]; then echo "codex-cli 0.143.0"; exit 0; fi
+if [ "$1" = "--help" ]; then echo "codex help"; exit 0; fi
 trap 'echo TERM >> "$AGENTBUS_TERM_LOG"; exit 0' TERM
 : > "$AGENTBUS_ARGV_LOG"
 for arg in "$@"; do printf '%s\n' "$arg" >> "$AGENTBUS_ARGV_LOG"; done
 input=$(cat)
 printf '%s' "$input" > "$AGENTBUS_STDIN_LOG"
+last=
+for arg in "$@"; do last=$arg; done
+if [ "$1" = "exec" ] && [ "$last" != "-" ]; then exit 0; fi
 case "$input" in
   *sleep*) while :; do :; done ;;
   *huge*) printf '{"type":"agent_message","session_id":"codex-session","message":"'; i=0; while [ $i -lt 70000 ]; do printf a; i=$((i+1)); done; printf '"}\n' ;;

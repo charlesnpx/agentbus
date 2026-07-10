@@ -85,7 +85,7 @@ func expectedClaudeReadOnlyArgv(resumeID string) string {
 		"--bare",
 		"--strict-mcp-config",
 		"--mcp-config",
-		"{}",
+		`{"mcpServers":{}}`,
 		"--permission-mode",
 		"dontAsk",
 		"--allowedTools",
@@ -97,6 +97,26 @@ func expectedClaudeReadOnlyArgv(resumeID string) string {
 		args = append(args, "--resume", resumeID)
 	}
 	return strings.Join(args, "\n") + "\n"
+}
+
+func TestClaudeSetupProbeUsesHermeticArgv(t *testing.T) {
+	fake := fakeClaude(t)
+	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
+	probeBackend, ok := backend.(interface {
+		SetupProbe(context.Context) (engine.BackendSetupProbe, error)
+	})
+	if !ok {
+		t.Fatal("backend does not implement SetupProbe")
+	}
+	probe, err := probeBackend.SetupProbe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !probe.JSONEventsProbed {
+		t.Fatalf("probe = %#v", probe)
+	}
+	assertLog(t, fake.argv, expectedClaudeReadOnlyArgv(""))
+	assertLog(t, fake.stdin, "Reply with exactly: OK")
 }
 
 func TestClaudePreflightAndFailures(t *testing.T) {
@@ -210,6 +230,7 @@ func fakeClaude(t *testing.T) fakeCLI {
 	}
 	script := `#!/bin/sh
 if [ "$1" = "--version" ]; then echo "2.1.205 (Claude Code)"; exit 0; fi
+if [ "$1" = "--help" ]; then echo "claude help"; exit 0; fi
 trap 'echo TERM >> "$AGENTBUS_TERM_LOG"; exit 0' TERM
 : > "$AGENTBUS_ARGV_LOG"
 for arg in "$@"; do printf '%s\n' "$arg" >> "$AGENTBUS_ARGV_LOG"; done
