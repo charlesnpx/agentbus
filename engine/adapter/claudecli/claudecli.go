@@ -148,7 +148,7 @@ func buildArgs(resumeID string, opts engine.SessionOpts, input engine.TurnInput)
 		args = append(args,
 			"--bare",
 			"--strict-mcp-config",
-			"--mcp-config", "{}",
+			"--mcp-config", `{"mcpServers":{}}`,
 			"--permission-mode", "dontAsk",
 			"--allowedTools", strings.Join(readOnlyAllowedTools, ","),
 			"--disallowedTools", strings.Join(readOnlyDeniedTools, ","),

@@ -43,17 +43,17 @@ invent additional permission modes under protocol v1.
 
 | Backend | Profile | Argv shape |
 | --- | --- | --- |
-| codex | write | `codex exec --json --sandbox workspace-write` |
-| codex | read-only | `codex exec --json --sandbox read-only --ignore-user-config` |
+| codex | write | `codex exec --json --sandbox workspace-write -` |
+| codex | read-only | `codex exec --json --sandbox read-only --ignore-user-config -` |
 | codex | corrective-resume | `codex exec --json --sandbox read-only --ignore-user-config resume <session-id> -` |
 | claude | write | `claude --print --output-format stream-json --dangerously-skip-permissions` plus `--resume <session-id>` when resuming |
-| claude | read-only | `claude --print --output-format stream-json --bare --strict-mcp-config --mcp-config {} --permission-mode dontAsk --allowedTools <claude-read-only-allow-list> --disallowedTools <claude-read-only-deny-list>` |
+| claude | read-only | `claude --print --output-format stream-json --bare --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <claude-read-only-allow-list> --disallowedTools <claude-read-only-deny-list>` |
 | claude | corrective-resume | claude read-only profile plus `--resume <session-id>` |
 
 ### codex write
 
 ```text
-codex exec --json --sandbox workspace-write
+codex exec --json --sandbox workspace-write -
 ```
 
 Write turns run under the user's normal Codex configuration.
@@ -61,10 +61,13 @@ Write turns run under the user's normal Codex configuration.
 ### codex read-only
 
 ```text
-codex exec --json --sandbox read-only --ignore-user-config
+codex exec --json --sandbox read-only --ignore-user-config -
 ```
 
 Read-only turns MUST be hermetic and MUST ignore user configuration.
+The trailing `-` explicitly selects stdin for the initial prompt, matching the
+resume invocation shape and avoiding CLI-version-dependent implicit stdin
+detection during setup probes.
 
 ### codex corrective-resume
 
@@ -117,7 +120,7 @@ The default claude effort allow-list is `low`, `medium`, `high`, and `max`.
 Base argv:
 
 ```text
-claude --print --output-format stream-json --bare --strict-mcp-config --mcp-config {} --permission-mode dontAsk --allowedTools <allow-list> --disallowedTools <deny-list>
+claude --print --output-format stream-json --bare --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <allow-list> --disallowedTools <deny-list>
 ```
 
 The read-only profile MUST NOT include `--dangerously-skip-permissions`.
@@ -128,6 +131,9 @@ shown above. It also exposes `--permission-mode dontAsk`, which agentbus uses
 as the print-mode fail-closed permission mode, and `--bare`, which minimizes
 hooks, plugin sync, auto-memory, background prefetches, and similar
 customization sources.
+Claude accepts MCP configuration as JSON strings, and the installed CLI's
+schema requires the top-level `mcpServers` record even when no servers are
+configured.
 
 The read-only profile MUST allow only these first-party tools:
 
@@ -360,7 +366,7 @@ The installed CLIs verified for A5 reported:
 
 | Backend | Documented flag/profile item | Installed CLI result | Amendment |
 | --- | --- | --- | --- |
-| codex | `exec --json` | present in `codex exec --help` | none |
+| codex | `exec --json` | present in `codex exec --help`; omitted `PROMPT` or `-` reads stdin | pass explicit `-` for fresh turns |
 | codex | `--sandbox read-only|workspace-write` | present in `codex exec --help` | none |
 | codex | `--ignore-user-config` | present in `codex exec --help` and `codex exec resume --help` | none |
 | codex | `exec resume <session-id>` | present as `codex exec resume [SESSION_ID] [PROMPT]`; `PROMPT` may be `-` to read stdin | pass `-` after `<session-id>` |
@@ -371,7 +377,7 @@ The installed CLIs verified for A5 reported:
 | claude | `--resume <session-id>` | present in `claude --help` | none |
 | claude | read-only tool allow/deny flags | real flags are `--allowedTools`/`--allowed-tools` and `--disallowedTools`/`--disallowed-tools` | use `--allowedTools` and `--disallowedTools` |
 | claude | fail-closed print-mode permission behavior | real flag is `--permission-mode dontAsk` | add `--permission-mode dontAsk` |
-| claude | hermetic customization minimization | real flag `--bare` exists; `--strict-mcp-config` exists | add `--bare --mcp-config {}` alongside `--strict-mcp-config` |
+| claude | hermetic customization minimization | real flag `--bare` exists; `--strict-mcp-config` exists; `--mcp-config` accepts JSON strings | add `--bare --mcp-config '{"mcpServers":{}}'` alongside `--strict-mcp-config` |
 
 ## Codex 0.144.1 JSON event mapping
 
