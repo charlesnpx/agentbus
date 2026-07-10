@@ -45,7 +45,7 @@ invent additional permission modes under protocol v1.
 | --- | --- | --- |
 | codex | write | `codex exec --json --sandbox workspace-write` |
 | codex | read-only | `codex exec --json --sandbox read-only --ignore-user-config` |
-| codex | corrective-resume | `codex exec resume <session-id> --json --sandbox read-only --ignore-user-config` |
+| codex | corrective-resume | `codex exec --json --sandbox read-only --ignore-user-config resume <session-id> -` |
 | claude | write | `claude --print --output-format stream-json --dangerously-skip-permissions` plus `--resume <session-id>` when resuming |
 | claude | read-only | `claude --print --output-format stream-json --bare --strict-mcp-config --mcp-config {} --permission-mode dontAsk --allowedTools <claude-read-only-allow-list> --disallowedTools <claude-read-only-deny-list>` |
 | claude | corrective-resume | claude read-only profile plus `--resume <session-id>` |
@@ -69,12 +69,13 @@ Read-only turns MUST be hermetic and MUST ignore user configuration.
 ### codex corrective-resume
 
 ```text
-codex exec resume <session-id> --json --sandbox read-only --ignore-user-config
+codex exec --json --sandbox read-only --ignore-user-config resume <session-id> -
 ```
 
 Corrective resume is always read-only. It is used for policy repair after an
 invalid final result and MUST NOT inherit writable permissions from the original
-turn.
+turn. The trailing `-` is the resume subcommand's prompt argument and makes the
+CLI read the corrective prompt from stdin.
 
 ### codex effort values
 
@@ -339,7 +340,8 @@ The installed CLIs verified for A5 reported:
 | codex | `exec --json` | present in `codex exec --help` | none |
 | codex | `--sandbox read-only|workspace-write` | present in `codex exec --help` | none |
 | codex | `--ignore-user-config` | present in `codex exec --help` and `codex exec resume --help` | none |
-| codex | `exec resume <session-id>` | present as `codex exec resume [SESSION_ID] [PROMPT]` | none |
+| codex | `exec resume <session-id>` | present as `codex exec resume [SESSION_ID] [PROMPT]`; `PROMPT` may be `-` to read stdin | pass `-` after `<session-id>` |
+| codex | resume sandbox profile | `--sandbox` is present in `codex exec --help` but absent from `codex exec resume --help` | pass exec options before `resume` |
 | claude | `--print` | present in `claude --help` | none |
 | claude | `--output-format stream-json` | present in `claude --help` | none |
 | claude | `--dangerously-skip-permissions` | present in `claude --help` | none |
@@ -347,6 +349,25 @@ The installed CLIs verified for A5 reported:
 | claude | read-only tool allow/deny flags | real flags are `--allowedTools`/`--allowed-tools` and `--disallowedTools`/`--disallowed-tools` | use `--allowedTools` and `--disallowedTools` |
 | claude | fail-closed print-mode permission behavior | real flag is `--permission-mode dontAsk` | add `--permission-mode dontAsk` |
 | claude | hermetic customization minimization | real flag `--bare` exists; `--strict-mcp-config` exists | add `--bare --mcp-config {}` alongside `--strict-mcp-config` |
+
+## Codex 0.144.1 JSON event mapping
+
+For Codex 0.144.1, `codex --help`, `codex exec --help`, and
+`codex exec resume --help` verify only the JSONL mode and argv shape. The
+installed package's offline binary strings additionally expose the current event
+names `agent_message`, `item_completed`, and `task_complete`, and show
+`task_complete` / `TurnCompleteEvent` carrying `last_agent_message`.
+
+The codex adapter maps:
+
+| Codex event | agentbus event | Basis |
+| --- | --- | --- |
+| `agent_message` | `AgentText` | verified event name; text field names are parsed defensively |
+| `item_completed` with a tool-call item | `ToolUse` | verified event name; nested item payload shape is defensive |
+| `task_complete.last_agent_message` | `ResultMessage` | verified event name and `last_agent_message` field |
+
+Older aliases such as `message`, `assistant_message`, `tool_use`, and `result`
+remain accepted for compatibility.
 
 ## Native structured output capability
 

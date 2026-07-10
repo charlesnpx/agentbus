@@ -27,8 +27,11 @@ func TestCodexProfilesAndParsing(t *testing.T) {
 	if session.ID() != "codex-session" {
 		t.Fatalf("session id = %q", session.ID())
 	}
-	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[1].Type != engine.EventToolUse {
+	if len(got) != 3 || got[0].Type != engine.EventAgentText || got[1].Type != engine.EventToolUse || got[2].Type != engine.EventResultMessage {
 		t.Fatalf("events = %#v", got)
+	}
+	if got[2].Text != "final answer" {
+		t.Fatalf("terminal result = %q", got[2].Text)
 	}
 	assertLog(t, fake.argv, "exec\n--json\n--model\ngpt-5\n--sandbox\nworkspace-write\n--config\nmodel_reasoning_effort=\"high\"\n")
 	assertLog(t, fake.stdin, "hello")
@@ -42,7 +45,8 @@ func TestCodexProfilesAndParsing(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = collect(events)
-	assertLog(t, fake.argv, "exec\nresume\ncodex-session\n--json\n--sandbox\nread-only\n--ignore-user-config\n")
+	assertLog(t, fake.argv, "exec\n--json\n--sandbox\nread-only\n--ignore-user-config\nresume\ncodex-session\n-\n")
+	assertLog(t, fake.stdin, "repair")
 }
 
 func TestCodexPreflightAndFailures(t *testing.T) {
@@ -68,6 +72,49 @@ func TestCodexPreflightAndFailures(t *testing.T) {
 	restricted := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"gpt-5"}})
 	if _, err := restricted.Start(context.Background(), engine.SessionOpts{Model: "not-a-model"}); err == nil || !strings.Contains(err.Error(), "unsupported model") {
 		t.Fatalf("unsupported model err = %v", err)
+	}
+}
+
+func TestCodexTaskCompleteIsAuthoritativeResultMessage(t *testing.T) {
+	events, id, err := parseEvent(map[string]any{
+		"type":               "task_complete",
+		"session_id":         "codex-session",
+		"last_agent_message": "final answer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "codex-session" || len(events) != 1 || events[0].Type != engine.EventResultMessage || events[0].Text != "final answer" {
+		t.Fatalf("parse task_complete = events:%#v id:%q", events, id)
+	}
+}
+
+func TestCodexCurrentEventNames(t *testing.T) {
+	events, id, err := parseEvent(map[string]any{
+		"type":       "agent_message",
+		"session_id": "codex-session",
+		"message":    "stream text",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "codex-session" || len(events) != 1 || events[0].Type != engine.EventAgentText || events[0].Text != "stream text" {
+		t.Fatalf("parse agent_message = events:%#v id:%q", events, id)
+	}
+
+	events, id, err = parseEvent(map[string]any{
+		"type":       "item_completed",
+		"session_id": "codex-session",
+		"item": map[string]any{
+			"type":    "local_shell_call",
+			"command": "git status",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "codex-session" || len(events) != 1 || events[0].Type != engine.EventToolUse || events[0].Text != "git status" {
+		t.Fatalf("parse item_completed = events:%#v id:%q", events, id)
 	}
 }
 
@@ -137,8 +184,8 @@ input=$(cat)
 printf '%s' "$input" > "$AGENTBUS_STDIN_LOG"
 case "$input" in
   *sleep*) while :; do :; done ;;
-  *huge*) printf '{"type":"message","session_id":"codex-session","text":"'; i=0; while [ $i -lt 70000 ]; do printf a; i=$((i+1)); done; printf '"}\n' ;;
-  *) printf '{"type":"message","session_id":"codex-session","text":"hello text"}\n{"type":"tool_use","name":"shell","text":"git status"}\n' ;;
+  *huge*) printf '{"type":"agent_message","session_id":"codex-session","message":"'; i=0; while [ $i -lt 70000 ]; do printf a; i=$((i+1)); done; printf '"}\n' ;;
+  *) printf '{"type":"task_started","session_id":"codex-session"}\n{"type":"agent_message","session_id":"codex-session","message":"hello text"}\n{"type":"item_completed","session_id":"codex-session","item":{"type":"local_shell_call","command":"git status"}}\n{"type":"task_complete","session_id":"codex-session","last_agent_message":"final answer"}\n' ;;
 esac
 `
 	if err := os.WriteFile(f.bin, []byte(script), 0o755); err != nil {
