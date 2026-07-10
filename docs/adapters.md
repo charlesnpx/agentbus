@@ -47,7 +47,7 @@ invent additional permission modes under protocol v1.
 | codex | read-only | `codex exec --json --sandbox read-only --ignore-user-config -` |
 | codex | corrective-resume | `codex exec --json --sandbox read-only --ignore-user-config resume <session-id> -` |
 | claude | write | `claude --print --output-format stream-json --verbose --dangerously-skip-permissions` plus `--resume <session-id>` when resuming |
-| claude | read-only | `claude --print --output-format stream-json --verbose --bare --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <claude-read-only-allow-list> --disallowedTools <claude-read-only-deny-list>` |
+| claude | read-only | `claude --print --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <claude-read-only-allow-list> --disallowedTools <claude-read-only-deny-list>` |
 | claude | corrective-resume | claude read-only profile plus `--resume <session-id>` |
 
 ### codex write
@@ -120,7 +120,7 @@ The default claude effort allow-list is `low`, `medium`, `high`, and `max`.
 Base argv:
 
 ```text
-claude --print --output-format stream-json --verbose --bare --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <allow-list> --disallowedTools <deny-list>
+claude --print --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <allow-list> --disallowedTools <deny-list>
 ```
 
 The read-only profile MUST NOT include `--dangerously-skip-permissions`.
@@ -128,9 +128,9 @@ The installed Claude CLI exposes tool allow/deny controls as
 `--allowedTools`/`--allowed-tools` and
 `--disallowedTools`/`--disallowed-tools`; agentbus uses the camelCase spellings
 shown above. It also exposes `--permission-mode dontAsk`, which agentbus uses
-as the print-mode fail-closed permission mode, and `--bare`, which minimizes
-hooks, plugin sync, auto-memory, background prefetches, and similar
-customization sources.
+as the print-mode fail-closed permission mode. Claude 2.1.x `--bare` is not
+used because live verification showed that it strips API authentication and
+ends the turn with `terminal_reason=api_error` and exit status 1.
 Claude accepts MCP configuration as JSON strings, and the installed CLI's
 schema requires the top-level `mcpServers` record even when no servers are
 configured.
@@ -263,7 +263,7 @@ Read-only turns MUST be hermetic:
 | Backend | Required read-only config behavior |
 | --- | --- |
 | codex | Pass `--ignore-user-config`. |
-| claude | Pass `--strict-mcp-config` and exclude user hooks/plugins to the extent vendor flags allow. |
+| claude | Pass `--strict-mcp-config` with an empty `mcpServers` record. MCP servers are excluded, but full settings isolation is unavailable because Claude 2.1.x `--bare` strips API authentication; user settings and hooks may still load on read-only turns. |
 
 Write turns run under user configuration because real work may legitimately
 need the user's MCP servers, hooks, plugins, credentials, and skills.
@@ -377,7 +377,7 @@ The installed CLIs verified for A5 reported:
 | claude | `--resume <session-id>` | present in `claude --help` | none |
 | claude | read-only tool allow/deny flags | real flags are `--allowedTools`/`--allowed-tools` and `--disallowedTools`/`--disallowed-tools` | use `--allowedTools` and `--disallowedTools` |
 | claude | fail-closed print-mode permission behavior | real flag is `--permission-mode dontAsk` | add `--permission-mode dontAsk` |
-| claude | hermetic customization minimization | real flag `--bare` exists; `--strict-mcp-config` exists; `--mcp-config` accepts JSON strings | add `--bare --mcp-config '{"mcpServers":{}}'` alongside `--strict-mcp-config` |
+| claude | hermetic customization minimization | `--strict-mcp-config` exists; `--mcp-config` accepts JSON strings; live Claude 2.1.x runs with `--bare` fail authentication, while the same profile without it succeeds | exclude MCP servers with `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`; do not use `--bare`, and document that user settings/hooks can still load |
 
 ## Codex 0.144.1 JSON event mapping
 
