@@ -492,8 +492,24 @@ func (s *Server) handleHello(c *connection, raw json.RawMessage) requestOutcome 
 	return requestOutcome{result: protocol.HelloResult{
 		ProtocolVersion: protocol.Version,
 		Backends:        s.backendNames(),
+		BackendMetadata: s.backendMetadata(),
 		Capabilities:    protocol.DefaultCapabilities(),
 	}}
+}
+
+func (s *Server) backendMetadata() []protocol.BackendInfo {
+	names := s.backendNames()
+	result := make([]protocol.BackendInfo, 0, len(names))
+	for _, name := range names {
+		info := protocol.BackendInfo{Backend: name, Models: []string{}, Efforts: []string{}}
+		if provider, ok := s.backends[name].(engine.BackendMetadataProvider); ok {
+			metadata := provider.BackendMetadata(context.Background())
+			info.Models = append([]string(nil), metadata.Models...)
+			info.Efforts = append([]string(nil), metadata.Efforts...)
+		}
+		result = append(result, info)
+	}
+	return result
 }
 
 func (s *Server) handleSessionStart(ctx context.Context, raw json.RawMessage) requestOutcome {

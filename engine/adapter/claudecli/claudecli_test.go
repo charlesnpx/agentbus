@@ -104,6 +104,18 @@ func TestClaudePreflightAndFailures(t *testing.T) {
 	}
 }
 
+func TestClaudeDiscoveryParsesFakeHelp(t *testing.T) {
+	fake := fakeClaude(t)
+	script := "#!/bin/sh\nif [ \"$1\" = --help ]; then printf '%s\\n' '  --effort <level> Effort level' '    (low, medium, high, xhigh, max)' '  --model <model> Model' \"    (e.g. 'fable', 'opus', or 'sonnet')\"; exit 0; fi\nexec /bin/false\n"
+	if err := os.WriteFile(fake.bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(engine.ModelDiscoverer).DiscoverModels(context.Background())
+	if err != nil || discovery == nil || strings.Join(discovery.Models, ",") != "fable,opus,sonnet" || strings.Join(discovery.Efforts, ",") != "high,low,max,medium,xhigh" {
+		t.Fatalf("discovery=%+v err=%v", discovery, err)
+	}
+}
+
 func TestClaudeResultEventIsAuthoritativeResultMessage(t *testing.T) {
 	events, id, err := parseEvent(map[string]any{
 		"type":       "result",

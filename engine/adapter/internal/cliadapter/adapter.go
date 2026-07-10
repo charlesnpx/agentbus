@@ -33,6 +33,7 @@ type Backend struct {
 	BuildArgs        func(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error)
 	Parse            func(map[string]any) ([]engine.Event, string, error)
 	VersionTransform func(string) string
+	Discover         func(context.Context, string) (*engine.ModelDiscovery, error)
 }
 
 func (b *Backend) Name() string { return b.NameValue }
@@ -66,7 +67,26 @@ func (b *Backend) Preflight(ctx context.Context) (engine.Health, error) {
 		Version:      version,
 		StreamSchema: probe.StreamSchema,
 		Minimum:      b.MinimumVersion,
+		Warning:      b.discoveryWarning(probe, version),
 	}, nil
+}
+
+func (b *Backend) DiscoverModels(ctx context.Context) (*engine.ModelDiscovery, error) {
+	binary, err := exec.LookPath(b.binary())
+	if err != nil || b.Discover == nil {
+		return nil, err
+	}
+	return b.Discover(ctx, binary)
+}
+
+func (b *Backend) BackendMetadata(context.Context) engine.BackendMetadata {
+	meta := engine.BackendMetadata{Name: b.NameValue}
+	probe, err := b.cachedProbe()
+	if err == nil && probe.Version != "" {
+		meta.Models = append([]string(nil), probe.DiscoveredModels...)
+		meta.Efforts = append([]string(nil), probe.DiscoveredEfforts...)
+	}
+	return meta
 }
 
 // SetupProbe runs the live setup-time stream probe and returns the cache entry
@@ -124,7 +144,7 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 	if !sawEvent {
 		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s setup stream probe produced no JSON events", b.NameValue)
 	}
-	return engine.BackendSetupProbe{
+	probe := engine.BackendSetupProbe{
 		Backend:      b.NameValue,
 		BinaryPath:   binary,
 		Version:      version,
@@ -135,7 +155,13 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 		},
 		SandboxModes:     []string{"workspace-write", "read-only"},
 		JSONEventsProbed: true,
-	}, nil
+	}
+	if discovered, discoverErr := b.DiscoverModels(ctx); discoverErr == nil && discovered != nil {
+		probe.DiscoveredModels = discovered.Models
+		probe.DiscoveredEfforts = discovered.Efforts
+		probe.DiscoverySource = discovered.Source
+	}
+	return probe, nil
 }
 
 func (b *Backend) Start(ctx context.Context, opts engine.SessionOpts) (engine.Session, error) {
@@ -177,35 +203,66 @@ func (b *Backend) normalizeVersion(s string) string {
 }
 
 func (b *Backend) validateOptions(opts engine.SessionOpts) error {
-	if opts.Model != "" && len(b.AllowedModels) > 0 {
-		if _, ok := b.AllowedModels[opts.Model]; !ok {
+	models, efforts := b.validationSets()
+	if opts.Model != "" && len(models) > 0 {
+		if _, ok := models[opts.Model]; !ok {
 			return fmt.Errorf("unsupported model %q for %s", opts.Model, b.NameValue)
 		}
 	}
-	if opts.Effort != "" && len(b.AllowedEfforts) > 0 {
-		if _, ok := b.AllowedEfforts[opts.Effort]; !ok {
+	if opts.Effort != "" && len(efforts) > 0 {
+		if _, ok := efforts[opts.Effort]; !ok {
 			return fmt.Errorf("unsupported effort %q for %s", opts.Effort, b.NameValue)
 		}
 	}
 	return nil
 }
 
-func (b *Backend) cachedProbe() (engine.BackendSetupProbe, error) {
+func (b *Backend) validationSets() (map[string]struct{}, map[string]struct{}) {
+	cache, cacheErr := b.readCache()
+	probe, err := b.cachedProbe()
+	if cacheErr == nil && cache.Version == engine.SetupProbeCacheVersion && err == nil {
+		models := b.AllowedModels
+		efforts := b.AllowedEfforts
+		if len(probe.DiscoveredModels) > 0 {
+			models = StringSet(probe.DiscoveredModels...)
+		}
+		if len(probe.DiscoveredEfforts) > 0 {
+			efforts = StringSet(probe.DiscoveredEfforts...)
+		}
+		return models, efforts
+	}
+	return b.AllowedModels, b.AllowedEfforts
+}
+
+func (b *Backend) discoveryWarning(probe engine.BackendSetupProbe, version string) string {
+	if cache, err := b.readCache(); err == nil && cache.Version != engine.SetupProbeCacheVersion {
+		return "model discovery cache is stale; using static known-good validation lists"
+	}
+	if len(probe.DiscoveredModels) == 0 && len(probe.DiscoveredEfforts) == 0 {
+		return "model discovery unavailable; using static known-good validation lists"
+	}
+	if probe.Version != version {
+		return "model discovery cache is stale; using static known-good validation lists"
+	}
+	return ""
+}
+
+func (b *Backend) readCache() (engine.SetupProbeCache, error) {
 	path := b.CachePath
 	if path == "" {
 		var err error
 		path, err = engine.SetupProbeCachePath("")
 		if err != nil {
-			return engine.BackendSetupProbe{}, err
+			return engine.SetupProbeCache{}, err
 		}
 	}
-	raw, err := os.ReadFile(path)
+	return engine.ReadSetupProbeCache(path)
+}
+
+func (b *Backend) cachedProbe() (engine.BackendSetupProbe, error) {
+	cache, err := b.readCache()
 	if err != nil {
 		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache missing for %s; re-run agentbus setup: %w", b.NameValue, err)
-	}
-	var cache engine.SetupProbeCache
-	if err := json.Unmarshal(raw, &cache); err != nil {
-		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: invalid setup cache: %w", err)
 	}
 	for _, p := range cache.Backends {
 		if p.Backend == b.NameValue {

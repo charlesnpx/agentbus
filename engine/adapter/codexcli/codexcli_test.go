@@ -75,6 +75,41 @@ func TestCodexPreflightAndFailures(t *testing.T) {
 	}
 }
 
+func TestCodexDiscoveryParsesFakeHelp(t *testing.T) {
+	fake := fakeCodex(t)
+	script := "#!/bin/sh\nif [ \"$1\" = --help ]; then echo 'Models available: [gpt-5.4, gpt-5.5]'; echo 'Reasoning effort possible values: [low, high, xhigh]'; exit 0; fi\nexec /bin/false\n"
+	if err := os.WriteFile(fake.bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(engine.ModelDiscoverer).DiscoverModels(context.Background())
+	if err != nil || discovery == nil || strings.Join(discovery.Models, ",") != "gpt-5.4,gpt-5.5" || strings.Join(discovery.Efforts, ",") != "high,low,xhigh" {
+		t.Fatalf("discovery=%+v err=%v", discovery, err)
+	}
+}
+
+func TestCodexDiscoveredCacheWinsAndLegacyFallsBack(t *testing.T) {
+	fake := fakeCodex(t)
+	cache := engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{Backend: "codex", BinaryPath: fake.bin, Version: MinimumKnownGoodVersion, StreamSchema: StreamSchema, DiscoveredModels: []string{"discovered"}, DiscoveredEfforts: []string{"turbo"}}}}
+	if err := engine.WriteSetupProbeCache(fake.cache, cache); err != nil {
+		t.Fatal(err)
+	}
+	backend := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"static"}, SupportedEfforts: []string{"low"}})
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "discovered", Effort: "turbo"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "static"}); err == nil {
+		t.Fatal("static model unexpectedly beat discovered cache")
+	}
+	writeCache(t, fake.cache, "codex", fake.bin, MinimumKnownGoodVersion, StreamSchema)
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "static", Effort: "low"}); err != nil {
+		t.Fatalf("legacy fallback: %v", err)
+	}
+	health, err := backend.Preflight(context.Background())
+	if err != nil || !strings.Contains(health.Warning, "stale") {
+		t.Fatalf("health=%+v err=%v", health, err)
+	}
+}
+
 func TestCodexTaskCompleteIsAuthoritativeResultMessage(t *testing.T) {
 	events, id, err := parseEvent(map[string]any{
 		"type":               "task_complete",

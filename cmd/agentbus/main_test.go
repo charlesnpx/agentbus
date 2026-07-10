@@ -74,13 +74,15 @@ func TestSetupCachesProbeAndReportsJSON(t *testing.T) {
 	t.Parallel()
 	a := testApp(t)
 	probe := engine.BackendSetupProbe{
-		Backend:          "codex",
-		BinaryPath:       "/tmp/bin/codex",
-		Version:          "0.143.0",
-		StreamSchema:     "codex-json-v1",
-		ConfigMode:       engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
-		SandboxModes:     []string{"workspace-write", "read-only"},
-		JSONEventsProbed: true,
+		Backend:           "codex",
+		BinaryPath:        "/tmp/bin/codex",
+		Version:           "0.143.0",
+		StreamSchema:      "codex-json-v1",
+		ConfigMode:        engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
+		SandboxModes:      []string{"workspace-write", "read-only"},
+		JSONEventsProbed:  true,
+		DiscoveredModels:  []string{"gpt-5.4"},
+		DiscoveredEfforts: []string{"high"},
 	}
 	a.backends = []backendSpec{{
 		name: "codex",
@@ -109,6 +111,9 @@ func TestSetupCachesProbeAndReportsJSON(t *testing.T) {
 	if got.Backend != "codex" || got.BinaryPath != probe.BinaryPath || got.Version != probe.Version || !got.JSONEventsProbe.Ran || got.JSONEventsProbe.StreamSchema != probe.StreamSchema {
 		t.Fatalf("setup backend = %+v", got)
 	}
+	if strings.Join(got.DiscoveredModels, ",") != "gpt-5.4" || strings.Join(got.DiscoveredEfforts, ",") != "high" {
+		t.Fatalf("discovery report=%+v", got)
+	}
 	cachePath, err := engine.SetupProbeCachePath(a.stateRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +122,7 @@ func TestSetupCachesProbeAndReportsJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cache.Backends) != 1 || cache.Backends[0].Version != probe.Version || cache.Backends[0].StreamSchema != probe.StreamSchema {
+	if cache.Version != engine.SetupProbeCacheVersion || len(cache.Backends) != 1 || cache.Backends[0].Version != probe.Version || cache.Backends[0].StreamSchema != probe.StreamSchema || len(cache.Backends[0].DiscoveredModels) != 1 {
 		t.Fatalf("cache = %+v", cache)
 	}
 }

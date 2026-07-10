@@ -46,6 +46,7 @@ func WriteSetupProbeCache(path string, cache SetupProbeCache) error {
 			return err
 		}
 	}
+	cache.Version = SetupProbeCacheVersion
 	b, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
 		return err

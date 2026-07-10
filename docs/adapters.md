@@ -314,6 +314,7 @@ this shape:
 
 ```json
 {
+  "version": 2,
   "backends": [
     {
       "backend": "codex",
@@ -325,11 +326,33 @@ this shape:
         "readOnly": "hermetic"
       },
       "sandboxModes": ["workspace-write", "read-only"],
-      "jsonEventsProbed": true
+      "jsonEventsProbed": true,
+      "discoveredModels": ["gpt-5.4"],
+      "discoveredEfforts": ["low", "medium", "high", "xhigh"],
+      "discoverySource": "codex --help (listing syntax when exposed)"
     }
   ]
 }
 ```
+
+Model and effort discovery runs only inside `agentbus setup`, alongside the
+live stream probe. Routine `Preflight` reads the versioned cache and never runs
+a discovery command or network turn. A current non-empty discovery list wins
+for adapter option validation. Missing or legacy discovery data falls back to
+the adapter's static known-good list and emits a loud warning in setup output
+and `Health.Warning`; discovery data alone never causes a hard failure.
+
+Verified discovery surfaces for the installed CLIs:
+
+| Backend | Verified source | Discovery status |
+| --- | --- | --- |
+| codex | `codex --help`; user config contains selected model and effort but help exposes no available-model or effort listing | Parser accepts future help listing syntax; current installed CLI returns no discovery, so static fallback is used. |
+| claude | `claude --help` lists effort choices and documents model aliases/examples | Efforts and documented model aliases/examples are cached. These are help-advertised values, not an account-entitlement query. |
+| gemini | `gemini --help` exposes `--model` but no model or effort listing | B1-ready discovery interface returns no listing; static fallback applies when the B2 adapter is added. |
+
+`agentbus setup --json` exposes `discoveredModels`, `discoveredEfforts`, and
+`warnings` per backend. `protocol.hello.backendMetadata` exposes the cached
+arrays with capability `models.discovery`; the protocol major remains 1.
 
 ## A5 flag verification amendments
 

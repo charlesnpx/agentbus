@@ -149,6 +149,9 @@ func (a *app) runSetup(ctx context.Context, args []string, out, errOut io.Writer
 			continue
 		}
 		fmt.Fprintf(out, "%s: %s %s schema=%s probe=%t\n", backend.Backend, backend.BinaryPath, backend.Version, backend.JSONEventsProbe.StreamSchema, backend.JSONEventsProbe.Ran)
+		for _, warning := range backend.Warnings {
+			fmt.Fprintf(errOut, "%s: warning: %s\n", backend.Backend, warning)
+		}
 	}
 	if result.Error != "" {
 		fmt.Fprintln(errOut, result.Error)
@@ -455,7 +458,7 @@ func (a *app) setup(ctx context.Context) (setupOutput, bool) {
 		result.Error = "no backends configured"
 		return result, false
 	}
-	cache := engine.SetupProbeCache{Backends: make([]engine.BackendSetupProbe, 0, len(a.backends))}
+	cache := engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: make([]engine.BackendSetupProbe, 0, len(a.backends))}
 	ok := true
 	for _, spec := range a.backends {
 		name := spec.name
@@ -515,6 +518,9 @@ func (a *app) setup(ctx context.Context) (setupOutput, bool) {
 		if health.StreamSchema != "" {
 			result.Backends[i].JSONEventsProbe.StreamSchema = health.StreamSchema
 		}
+		if health.Warning != "" {
+			result.Backends[i].Warnings = append(result.Backends[i].Warnings, health.Warning)
+		}
 	}
 	if !ok {
 		result.Error = "setup preflight failed"
@@ -540,11 +546,13 @@ func normalizeProbe(probe engine.BackendSetupProbe, name string) engine.BackendS
 
 func setupReportFromProbe(probe engine.BackendSetupProbe) setupBackendReport {
 	return setupBackendReport{
-		Backend:      probe.Backend,
-		BinaryPath:   probe.BinaryPath,
-		Version:      probe.Version,
-		ConfigMode:   probe.ConfigMode,
-		SandboxModes: append([]string(nil), probe.SandboxModes...),
+		Backend:           probe.Backend,
+		BinaryPath:        probe.BinaryPath,
+		Version:           probe.Version,
+		ConfigMode:        probe.ConfigMode,
+		SandboxModes:      append([]string(nil), probe.SandboxModes...),
+		DiscoveredModels:  append([]string(nil), probe.DiscoveredModels...),
+		DiscoveredEfforts: append([]string(nil), probe.DiscoveredEfforts...),
 		JSONEventsProbe: setupJSONEventsProbe{
 			Ran:          probe.JSONEventsProbed,
 			Version:      probe.Version,
@@ -886,13 +894,16 @@ type setupOutput struct {
 }
 
 type setupBackendReport struct {
-	Backend         string               `json:"backend"`
-	BinaryPath      string               `json:"binaryPath,omitempty"`
-	Version         string               `json:"version,omitempty"`
-	ConfigMode      engine.ModeInfo      `json:"configMode"`
-	SandboxModes    []string             `json:"sandboxModes,omitempty"`
-	JSONEventsProbe setupJSONEventsProbe `json:"jsonEventsProbe"`
-	Error           string               `json:"error,omitempty"`
+	Backend           string               `json:"backend"`
+	BinaryPath        string               `json:"binaryPath,omitempty"`
+	Version           string               `json:"version,omitempty"`
+	ConfigMode        engine.ModeInfo      `json:"configMode"`
+	SandboxModes      []string             `json:"sandboxModes,omitempty"`
+	JSONEventsProbe   setupJSONEventsProbe `json:"jsonEventsProbe"`
+	DiscoveredModels  []string             `json:"discoveredModels"`
+	DiscoveredEfforts []string             `json:"discoveredEfforts"`
+	Warnings          []string             `json:"warnings,omitempty"`
+	Error             string               `json:"error,omitempty"`
 }
 
 type setupJSONEventsProbe struct {

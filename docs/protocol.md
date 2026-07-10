@@ -39,7 +39,7 @@ Example request frame:
 Example response frame:
 
 ```json
-{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":1,"backends":["codex","claude"],"capabilities":{"policy.shape":true,"policy.jsonSchema":true}}}
+{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":1,"backends":["codex","claude"],"backendMetadata":[{"backend":"codex","models":["gpt-5.4"],"efforts":["low","medium","high","xhigh"]},{"backend":"claude","models":["sonnet","opus"],"efforts":["low","medium","high","xhigh","max"]}],"capabilities":{"policy.shape":true,"policy.jsonSchema":true,"models.discovery":true}}}
 ```
 
 `protocol.hello` MUST be the first request sent on a connection. A server MUST
@@ -261,16 +261,26 @@ Result:
 {
   "protocolVersion": 1,
   "backends": ["codex", "claude"],
+  "backendMetadata": [
+    {"backend": "codex", "models": ["gpt-5.4"], "efforts": ["low", "medium", "high", "xhigh"]},
+    {"backend": "claude", "models": ["sonnet", "opus"], "efforts": ["low", "medium", "high", "xhigh", "max"]}
+  ],
   "capabilities": {
     "policy.shape": true,
     "policy.jsonSchema": true,
     "policy.named": true,
     "policy.retry": true,
     "nativeStructuredOutput.codex": false,
-    "nativeStructuredOutput.claude": false
+    "nativeStructuredOutput.claude": false,
+    "models.discovery": true
   }
 }
 ```
+
+`backendMetadata` and `models.discovery` are additive protocol-v1 fields. Older
+clients may ignore them and continue using the stable `backends` string array.
+Empty `models` or `efforts` arrays mean no runtime listing was discoverable and
+the adapter uses its static known-good validation list.
 
 Unauthorized error example:
 
