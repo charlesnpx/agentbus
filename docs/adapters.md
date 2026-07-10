@@ -46,8 +46,8 @@ invent additional permission modes under protocol v1.
 | codex | write | `codex exec --json --sandbox workspace-write -` |
 | codex | read-only | `codex exec --json --sandbox read-only --ignore-user-config -` |
 | codex | corrective-resume | `codex exec --json --sandbox read-only --ignore-user-config resume <session-id> -` |
-| claude | write | `claude --print --output-format stream-json --dangerously-skip-permissions` plus `--resume <session-id>` when resuming |
-| claude | read-only | `claude --print --output-format stream-json --bare --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <claude-read-only-allow-list> --disallowedTools <claude-read-only-deny-list>` |
+| claude | write | `claude --print --output-format stream-json --verbose --dangerously-skip-permissions` plus `--resume <session-id>` when resuming |
+| claude | read-only | `claude --print --output-format stream-json --verbose --bare --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <claude-read-only-allow-list> --disallowedTools <claude-read-only-deny-list>` |
 | claude | corrective-resume | claude read-only profile plus `--resume <session-id>` |
 
 ### codex write
@@ -94,13 +94,13 @@ The default codex effort allow-list is `none`, `minimal`, `low`, `medium`,
 ### claude write
 
 ```text
-claude --print --output-format stream-json --dangerously-skip-permissions
+claude --print --output-format stream-json --verbose --dangerously-skip-permissions
 ```
 
 When resuming:
 
 ```text
-claude --print --output-format stream-json --dangerously-skip-permissions --resume <session-id>
+claude --print --output-format stream-json --verbose --dangerously-skip-permissions --resume <session-id>
 ```
 
 Write turns run under the user's normal Claude configuration.
@@ -120,7 +120,7 @@ The default claude effort allow-list is `low`, `medium`, `high`, and `max`.
 Base argv:
 
 ```text
-claude --print --output-format stream-json --bare --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <allow-list> --disallowedTools <deny-list>
+claude --print --output-format stream-json --verbose --bare --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <allow-list> --disallowedTools <deny-list>
 ```
 
 The read-only profile MUST NOT include `--dangerously-skip-permissions`.
@@ -372,7 +372,7 @@ The installed CLIs verified for A5 reported:
 | codex | `exec resume <session-id>` | present as `codex exec resume [SESSION_ID] [PROMPT]`; `PROMPT` may be `-` to read stdin | pass `-` after `<session-id>` |
 | codex | resume sandbox profile | `--sandbox` is present in `codex exec --help` but absent from `codex exec resume --help` | pass exec options before `resume` |
 | claude | `--print` | present in `claude --help` | none |
-| claude | `--output-format stream-json` | present in `claude --help` | none |
+| claude | `--output-format stream-json` | present in `claude --help`; with `--print`, the installed CLI requires `--verbose` | add `--verbose` |
 | claude | `--dangerously-skip-permissions` | present in `claude --help` | none |
 | claude | `--resume <session-id>` | present in `claude --help` | none |
 | claude | read-only tool allow/deny flags | real flags are `--allowedTools`/`--allowed-tools` and `--disallowedTools`/`--disallowed-tools` | use `--allowedTools` and `--disallowedTools` |
@@ -383,19 +383,19 @@ The installed CLIs verified for A5 reported:
 
 For Codex 0.144.1, `codex --help`, `codex exec --help`, and
 `codex exec resume --help` verify only the JSONL mode and argv shape. The
-installed package's offline binary strings additionally expose the current event
-names `agent_message`, `item_completed`, and `task_complete`, and show
-`task_complete` / `TurnCompleteEvent` carrying `last_agent_message`.
+live orchestrator captures expose the dotted event names `thread.started`,
+`turn.started`, `item.completed`, `item.updated`, and `turn.completed`.
 
 The codex adapter maps:
 
 | Codex event | agentbus event | Basis |
 | --- | --- | --- |
-| `agent_message` | `AgentText` | verified event name; text field names are parsed defensively |
-| `item_completed` with a tool-call item | `ToolUse` | verified event name; nested item payload shape is defensive |
-| `task_complete.last_agent_message` | `ResultMessage` | verified event name and `last_agent_message` field |
+| `thread.started.thread_id` | session ID | live-verified resume identifier |
+| `item.completed` with `item.type=agent_message` | `AgentText` | live-verified nested message shape |
+| `item.completed` with another item type | `ToolUse` | covers command execution, todo lists, and future item types |
+| `turn.completed` | `ResultMessage` | uses its own result text when present, otherwise the last agent message |
 
-Older aliases such as `message`, `assistant_message`, `tool_use`, and `result`
+Older underscore aliases such as `item_completed`, `task_complete`, and `result`
 remain accepted for compatibility.
 
 ## Adding a backend

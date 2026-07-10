@@ -30,7 +30,7 @@ func TestClaudeProfilesAndParsing(t *testing.T) {
 	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[1].Type != engine.EventToolUse {
 		t.Fatalf("events = %#v", got)
 	}
-	assertLog(t, fake.argv, "--print\n--output-format\nstream-json\n--model\nsonnet\n--effort\nmax\n--dangerously-skip-permissions\n")
+	assertLog(t, fake.argv, "--print\n--output-format\nstream-json\n--verbose\n--model\nsonnet\n--effort\nmax\n--dangerously-skip-permissions\n")
 
 	session, err = backend.Start(context.Background(), engine.SessionOpts{})
 	if err != nil {
@@ -82,6 +82,7 @@ func expectedClaudeReadOnlyArgv(resumeID string) string {
 		"--print",
 		"--output-format",
 		"stream-json",
+		"--verbose",
 		"--bare",
 		"--strict-mcp-config",
 		"--mcp-config",

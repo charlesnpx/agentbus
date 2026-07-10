@@ -28,11 +28,11 @@ func TestCodexProfilesAndParsing(t *testing.T) {
 	if session.ID() != "codex-session" {
 		t.Fatalf("session id = %q", session.ID())
 	}
-	if len(got) != 3 || got[0].Type != engine.EventAgentText || got[1].Type != engine.EventToolUse || got[2].Type != engine.EventResultMessage {
+	if len(got) != 4 || got[0].Type != engine.EventAgentText || got[1].Type != engine.EventToolUse || got[2].Type != engine.EventAgentText || got[3].Type != engine.EventResultMessage {
 		t.Fatalf("events = %#v", got)
 	}
-	if got[2].Text != "final answer" {
-		t.Fatalf("terminal result = %q", got[2].Text)
+	if got[3].Text != "final answer" {
+		t.Fatalf("terminal result = %q", got[3].Text)
 	}
 	assertLog(t, fake.argv, "exec\n--json\n--model\ngpt-5\n--sandbox\nworkspace-write\n--config\nmodel_reasoning_effort=\"high\"\n-\n")
 	assertLog(t, fake.stdin, "hello")
@@ -178,7 +178,7 @@ func TestCodexUpgradedVersionFallsBackAndWarnsOnTurn(t *testing.T) {
 	}
 }
 
-func TestCodexTaskCompleteIsAuthoritativeResultMessage(t *testing.T) {
+func TestCodexLegacyAliasResultMessage(t *testing.T) {
 	events, id, err := parseEvent(map[string]any{
 		"type":               "task_complete",
 		"session_id":         "codex-session",
@@ -192,32 +192,44 @@ func TestCodexTaskCompleteIsAuthoritativeResultMessage(t *testing.T) {
 	}
 }
 
-func TestCodexCurrentEventNames(t *testing.T) {
+func TestCodexDottedEventSchema(t *testing.T) {
 	events, id, err := parseEvent(map[string]any{
-		"type":       "agent_message",
-		"session_id": "codex-session",
-		"message":    "stream text",
+		"type":      "thread.started",
+		"thread_id": "codex-session",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id != "codex-session" || len(events) != 1 || events[0].Type != engine.EventAgentText || events[0].Text != "stream text" {
-		t.Fatalf("parse agent_message = events:%#v id:%q", events, id)
+	if id != "codex-session" || len(events) != 0 {
+		t.Fatalf("parse thread.started = events:%#v id:%q", events, id)
 	}
 
 	events, id, err = parseEvent(map[string]any{
-		"type":       "item_completed",
-		"session_id": "codex-session",
+		"type": "item.completed",
 		"item": map[string]any{
-			"type":    "local_shell_call",
+			"type": "agent_message",
+			"text": "stream text",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Type != engine.EventAgentText || events[0].Text != "stream text" {
+		t.Fatalf("parse agent item.completed = events:%#v id:%q", events, id)
+	}
+
+	events, _, err = parseEvent(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{
+			"type":    "command_execution",
 			"command": "git status",
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id != "codex-session" || len(events) != 1 || events[0].Type != engine.EventToolUse || events[0].Text != "git status" {
-		t.Fatalf("parse item_completed = events:%#v id:%q", events, id)
+	if len(events) != 1 || events[0].Type != engine.EventToolUse || events[0].Text != "git status" {
+		t.Fatalf("parse tool item.completed = %#v", events)
 	}
 }
 
@@ -291,8 +303,8 @@ for arg in "$@"; do last=$arg; done
 if [ "$1" = "exec" ] && [ "$last" != "-" ]; then exit 0; fi
 case "$input" in
   *sleep*) while :; do :; done ;;
-  *huge*) printf '{"type":"agent_message","session_id":"codex-session","message":"'; i=0; while [ $i -lt 70000 ]; do printf a; i=$((i+1)); done; printf '"}\n' ;;
-  *) printf '{"type":"task_started","session_id":"codex-session"}\n{"type":"agent_message","session_id":"codex-session","message":"hello text"}\n{"type":"item_completed","session_id":"codex-session","item":{"type":"local_shell_call","command":"git status"}}\n{"type":"task_complete","session_id":"codex-session","last_agent_message":"final answer"}\n' ;;
+  *huge*) printf '{"type":"thread.started","thread_id":"codex-session"}\n{"type":"item.completed","item":{"type":"agent_message","text":"'; i=0; while [ $i -lt 70000 ]; do printf a; i=$((i+1)); done; printf '"}}\n{"type":"turn.completed"}\n' ;;
+  *) printf '{"type":"thread.started","thread_id":"codex-session"}\n{"type":"turn.started"}\n{"type":"item.completed","item":{"type":"agent_message","text":"hello text"}}\n{"type":"item.completed","item":{"type":"command_execution","command":"git status"}}\n{"type":"item.updated","item":{"type":"todo_list"}}\n{"type":"item.completed","item":{"type":"agent_message","text":"final answer"}}\n{"type":"turn.completed","usage":{"input_tokens":15110}}\n' ;;
 esac
 `
 	if err := os.WriteFile(f.bin, []byte(script), 0o755); err != nil {

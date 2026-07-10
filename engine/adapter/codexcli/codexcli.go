@@ -98,11 +98,16 @@ func buildArgs(resumeID string, opts engine.SessionOpts, input engine.TurnInput)
 }
 
 func parseEvent(obj map[string]any) ([]engine.Event, string, error) {
-	id := firstString(obj, "session_id", "sessionId", "conversation_id", "conversationId", "id")
+	id := firstString(obj, "thread_id", "session_id", "sessionId", "conversation_id", "conversationId", "id")
 	typ := strings.ToLower(firstString(obj, "type", "event"))
 	switch typ {
-	case "task_started", "turn_started", "session_configured", "token_count":
+	case "thread.started", "task_started", "turn.started", "turn_started", "item.updated", "session_configured", "token_count":
 		return nil, id, nil
+	case "item.completed":
+		return parseItemCompleted(obj, id)
+	case "turn.completed":
+		text := firstString(obj, "last_agent_message", "lastAgentMessage", "result", "message", "text", "content", "output")
+		return []engine.Event{{Type: engine.EventResultMessage, Text: text, Metadata: obj}}, id, nil
 	case "agent_message", "agent_message_content_delta", "agentmessage", "agenttext", "agent_text", "assistant_text", "message", "assistant_message":
 		return agentTextEvent(obj, id)
 	case "task_complete", "turn_complete", "taskcomplete", "result":
@@ -133,10 +138,8 @@ func parseItemCompleted(obj map[string]any, id string) ([]engine.Event, string, 
 	switch itemType {
 	case "agent_message", "agentmessage", "assistant_message", "message":
 		return agentTextEvent(item, id)
-	case "local_shell_call", "exec_command", "tool_call", "function_call", "custom_tool_call", "mcp_tool_call":
-		return toolUseEvent(item, id)
 	default:
-		return nil, id, nil
+		return toolUseEvent(item, id)
 	}
 }
 
