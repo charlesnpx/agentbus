@@ -73,7 +73,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --target)
-      [[ $# -ge 2 ]] || die "--target requires claude, codex, tools, or all"
+      [[ $# -ge 2 ]] || die "--target requires tools or all"
       TARGET=$2
       shift 2
       ;;
@@ -86,7 +86,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -h|--help)
-      printf 'Usage: %s [--plan|--install|--uninstall] --target claude|codex|tools|all [--json] [--install-root <abs>]\n' "$0" >&2
+      printf 'Usage: %s [--plan|--install|--uninstall] --target tools|all [--json] [--install-root <abs>]\n' "$0" >&2
       exit 0
       ;;
     *)
@@ -100,8 +100,9 @@ if [[ -z "$OPERATION" ]]; then
 fi
 
 case "$TARGET" in
-  claude|codex|tools|all) ;;
-  *) die "--target must be claude, codex, tools, or all" ;;
+  tools|all) ;;
+  claude|codex) die "--target $TARGET has no skills in v1; use --target tools" ;;
+  *) die "--target must be tools or all" ;;
 esac
 
 if [[ -n "$INSTALL_ROOT_ARG" && "$INSTALL_ROOT_ARG" != /* ]]; then
@@ -248,7 +249,7 @@ print_targets() {
   local first=1
   local name
   case "$TARGET" in
-    all) names=(claude codex tools) ;;
+    all) names=(tools) ;;
     *) names=("$TARGET") ;;
   esac
   printf '{'

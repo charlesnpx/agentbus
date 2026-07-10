@@ -27,12 +27,13 @@ agentbus is a delegated `mise-en-place` entry. In the registry it is expected to
 start under `experimental:` as a private optional delegated repo:
 
 ```yaml
-agentbus:
-  repo: github.com/charlesnpx/agentbus
-  channel: latest-release
-  fallback_ref: main
-  visibility: private
-  optional: true
+experimental:
+  agentbus:
+    repo: github.com/charlesnpx/agentbus
+    channel: latest-release
+    fallback_ref: main
+    visibility: private
+    optional: true
 ```
 
 Install the tools target through mise-en-place:

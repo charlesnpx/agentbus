@@ -64,10 +64,17 @@ func TestInstallerPlanJSONWithoutGoOnPath(t *testing.T) {
 	if len(result.Setup) != 1 || result.Setup[0].Kind != "executable" || result.Setup[0].Executable != "go" {
 		t.Fatalf("setup = %+v", result.Setup)
 	}
-	for _, target := range []string{"claude", "codex", "tools"} {
-		if _, ok := result.Targets[target]; !ok {
-			t.Fatalf("target %q missing from %+v", target, result.Targets)
-		}
+	if len(result.Targets) != 1 {
+		t.Fatalf("targets = %+v, want only tools", result.Targets)
+	}
+	if _, ok := result.Targets["claude"]; ok {
+		t.Fatalf("claude target reported for --target all: %+v", result.Targets)
+	}
+	if _, ok := result.Targets["codex"]; ok {
+		t.Fatalf("codex target reported for --target all: %+v", result.Targets)
+	}
+	if _, ok := result.Targets["tools"]; !ok {
+		t.Fatalf("tools target missing from %+v", result.Targets)
 	}
 	toolFiles := result.Targets["tools"].Files
 	if len(toolFiles) != 1 || !filepath.IsAbs(toolFiles[0].Path) || toolFiles[0].SHA256 != "" {
@@ -139,14 +146,40 @@ func TestInstallerInstallAndUninstallStagedTools(t *testing.T) {
 
 func TestInstallerRejectsMalformedFlags(t *testing.T) {
 	root := repoRoot(t)
-	tests := [][]string{
-		{"--plan", "--install", "--target", "tools", "--json"},
-		{"--plan", "--target", "bogus", "--json"},
-		{"--install", "--target", "tools", "--json", "--install-root", "relative"},
+	tests := []struct {
+		name           string
+		args           []string
+		stderrContains string
+	}{
+		{
+			name:           "multiple operations",
+			args:           []string{"--plan", "--install", "--target", "tools", "--json"},
+			stderrContains: "agentbus installer:",
+		},
+		{
+			name:           "unknown target",
+			args:           []string{"--plan", "--target", "bogus", "--json"},
+			stderrContains: "agentbus installer:",
+		},
+		{
+			name:           "relative install root",
+			args:           []string{"--install", "--target", "tools", "--json", "--install-root", "relative"},
+			stderrContains: "agentbus installer:",
+		},
+		{
+			name:           "claude target unavailable",
+			args:           []string{"--plan", "--target", "claude", "--json"},
+			stderrContains: "no skills in v1",
+		},
+		{
+			name:           "codex target unavailable",
+			args:           []string{"--plan", "--target", "codex", "--json"},
+			stderrContains: "no skills in v1",
+		},
 	}
-	for _, args := range tests {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			cmd := installerCommand(t, root, args...)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cmd := installerCommand(t, root, test.args...)
 			cmd.Env = commandEnv(t, nil)
 			stdout, stderr, err := runCommand(cmd)
 			if err == nil {
@@ -155,10 +188,48 @@ func TestInstallerRejectsMalformedFlags(t *testing.T) {
 			if strings.TrimSpace(stdout) != "" {
 				t.Fatalf("malformed command wrote stdout: %q", stdout)
 			}
-			if !strings.Contains(stderr, "agentbus installer:") {
-				t.Fatalf("stderr does not contain installer prefix: %q", stderr)
+			if !strings.Contains(stderr, test.stderrContains) {
+				t.Fatalf("stderr does not contain %q: %q", test.stderrContains, stderr)
 			}
 		})
+	}
+}
+
+func TestReleaseCheckValidatesInstallerJSONAndExactTag(t *testing.T) {
+	root := repoRoot(t)
+	version := readVersion(t, root)
+	tag := "v" + version
+	gitBin := fakeGitBin(t)
+
+	cmd := releaseCheckCommand(t, root, tag)
+	cmd.Env = releaseCheckEnv(t, gitBin, tag)
+	stdout, stderr, err := runCommand(cmd)
+	if err != nil {
+		t.Fatalf("release-check failed: %v stderr=%s stdout=%s", err, stderr, stdout)
+	}
+	want := fmt.Sprintf("release-check: ok tag=%s version=%s", tag, version)
+	if strings.TrimSpace(stdout) != want {
+		t.Fatalf("release-check stdout = %q, want %q", strings.TrimSpace(stdout), want)
+	}
+	if strings.TrimSpace(stderr) != "" {
+		t.Fatalf("release-check wrote stderr: %q", stderr)
+	}
+
+	wrongTag := "v0.0.0"
+	if wrongTag == tag {
+		wrongTag = "v9.9.9"
+	}
+	mismatch := releaseCheckCommand(t, root, tag)
+	mismatch.Env = releaseCheckEnv(t, gitBin, wrongTag)
+	mismatchOut, mismatchErr, err := runCommand(mismatch)
+	if err == nil {
+		t.Fatalf("release-check succeeded with mismatched HEAD tag: stdout=%s stderr=%s", mismatchOut, mismatchErr)
+	}
+	if strings.TrimSpace(mismatchOut) != "" {
+		t.Fatalf("tag mismatch wrote stdout: %q", mismatchOut)
+	}
+	if !strings.Contains(mismatchErr, "not requested tag") {
+		t.Fatalf("tag mismatch stderr = %q", mismatchErr)
 	}
 }
 
@@ -166,6 +237,14 @@ func installerCommand(t *testing.T, root string, args ...string) *exec.Cmd {
 	t.Helper()
 	script := filepath.Join(root, "install-skill.sh")
 	cmd := exec.Command("/bin/bash", append([]string{script}, args...)...)
+	cmd.Dir = root
+	return cmd
+}
+
+func releaseCheckCommand(t *testing.T, root string, tag string) *exec.Cmd {
+	t.Helper()
+	script := filepath.Join(root, "scripts", "release-check.sh")
+	cmd := exec.Command("/bin/bash", script, tag)
 	cmd.Dir = root
 	return cmd
 }
@@ -219,6 +298,20 @@ func offlineGoEnv(t *testing.T) []string {
 	})
 }
 
+func releaseCheckEnv(t *testing.T, gitBin string, headTag string) []string {
+	t.Helper()
+	env := map[string]string{
+		"FAKE_GIT_TAG": headTag,
+		"GOCACHE":      privateTmpDir(t, "agentbus-gocache-*"),
+		"GOMODCACHE":   privateTmpDir(t, "agentbus-gomodcache-*"),
+		"GOFLAGS":      "-buildvcs=false",
+		"GOPROXY":      "off",
+		"GOSUMDB":      "off",
+		"PATH":         gitBin + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+	return commandEnv(t, env)
+}
+
 func commandEnv(t *testing.T, overrides map[string]string) []string {
 	t.Helper()
 	env := os.Environ()
@@ -248,6 +341,30 @@ func privateTmpDir(t *testing.T, pattern string) string {
 	t.Cleanup(func() {
 		_ = os.RemoveAll(dir)
 	})
+	return dir
+}
+
+func fakeGitBin(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "git")
+	body := `#!/bin/sh
+if [ "$1" = "-C" ]; then
+  shift 2
+fi
+if [ "$1" = "describe" ] && [ "$2" = "--tags" ] && [ "$3" = "--exact-match" ]; then
+  if [ -n "${FAKE_GIT_TAG:-}" ]; then
+    printf '%s\n' "$FAKE_GIT_TAG"
+    exit 0
+  fi
+  exit 1
+fi
+printf 'unexpected git invocation: %s\n' "$*" >&2
+exit 99
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	return dir
 }
 
