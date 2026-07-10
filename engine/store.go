@@ -65,6 +65,9 @@ type StoreConfig struct {
 	CancelGrace   time.Duration
 	CancelWaiter  Waiter
 	Retention     RetentionConfig
+	LeaseDuration time.Duration
+	OrphanGrace   time.Duration
+	BeforeUpdate  func(string)
 }
 
 type workspaceManifest struct {
@@ -82,7 +85,14 @@ type Store struct {
 	cancelGrace   time.Duration
 	cancelWaiter  Waiter
 	retention     RetentionConfig
+	leaseDuration time.Duration
+	orphanGrace   time.Duration
+	beforeUpdate  func(string)
 }
+
+const staleHeartbeatWarning = "stale-heartbeat: lease expired while process identity remained alive; lease renewed"
+
+const DefaultLeaseDuration = 5 * time.Minute
 
 // NewStore creates a state store and ensures protocol directories exist.
 func NewStore(cfg StoreConfig) (*Store, error) {
@@ -194,6 +204,17 @@ func newStoreWithLayout(cfg StoreConfig, layout WorkspaceLayout) (*Store, error)
 	if retention.StaleJobAfter == 0 {
 		retention.StaleJobAfter = defaults.StaleJobAfter
 	}
+	leaseDuration := cfg.LeaseDuration
+	if leaseDuration <= 0 {
+		leaseDuration = DefaultLeaseDuration
+	}
+	orphanGrace := cfg.OrphanGrace
+	if orphanGrace <= 0 {
+		orphanGrace = leaseDuration
+	}
+	if orphanGrace < leaseDuration {
+		return nil, errors.New("orphan grace cannot be shorter than lease duration")
+	}
 	return &Store{
 		layout:        layout,
 		clock:         clock,
@@ -202,6 +223,9 @@ func newStoreWithLayout(cfg StoreConfig, layout WorkspaceLayout) (*Store, error)
 		cancelGrace:   cancelGrace,
 		cancelWaiter:  cancelWaiter,
 		retention:     retention,
+		leaseDuration: leaseDuration,
+		orphanGrace:   orphanGrace,
+		beforeUpdate:  cfg.BeforeUpdate,
 	}, nil
 }
 
@@ -286,6 +310,9 @@ func (s *Store) Update(jobID string, mutate func(*JobRecord) (bool, error)) (*Jo
 			return err
 		}
 		before := *record
+		if s.beforeUpdate != nil {
+			s.beforeUpdate(jobID)
+		}
 		changed, err := mutate(record)
 		if err != nil {
 			return err
@@ -298,7 +325,7 @@ func (s *Store) Update(jobID string, mutate func(*JobRecord) (bool, error)) (*Jo
 				return err
 			}
 			if IsTerminal(record.State) {
-				s.sweepTerminalJobInput(record.JobID)
+				s.sweepTerminalJobArtifacts(record.JobID)
 			}
 		}
 		status := record.StatusRecord(s.clock.Now().UTC())
@@ -308,6 +335,30 @@ func (s *Store) Update(jobID string, mutate func(*JobRecord) (bool, error)) (*Jo
 		return nil, err
 	}
 	return out, nil
+}
+
+// TouchHeartbeat records a heartbeat without waiting for the contended per-job lock.
+func (s *Store) TouchHeartbeat(jobID string, now time.Time, leaseDuration time.Duration) (bool, error) {
+	if err := validateJobID(jobID); err != nil {
+		return false, err
+	}
+	jobPath, err := s.jobPath(jobID)
+	if err != nil {
+		return false, err
+	}
+	record, err := s.loadPath(jobPath)
+	if err != nil {
+		return false, err
+	}
+	if IsTerminal(record.State) {
+		return false, nil
+	}
+	path, err := safePathForID(s.layout.Jobs, jobID, ".heartbeat")
+	if err != nil {
+		return false, err
+	}
+	payload := []byte(now.UTC().Format(time.RFC3339Nano) + "\n" + now.UTC().Add(leaseDuration).Format(time.RFC3339Nano) + "\n")
+	return true, atomicWriteFile(path, payload, 0o600)
 }
 
 // HasJob reports whether a persisted job record exists in this workspace store.
@@ -433,7 +484,7 @@ func (s *Store) terminate(jobID string, state JobState) (*JobRecord, error) {
 			return err
 		}
 		if IsTerminal(record.State) {
-			s.sweepTerminalJobInput(record.JobID)
+			s.sweepTerminalJobArtifacts(record.JobID)
 		}
 		status := record.StatusRecord(now)
 		out = &status
@@ -575,20 +626,23 @@ func (s *Store) Reap() error {
 }
 
 func (s *Store) reapRecord(record *JobRecord, now time.Time) (bool, error) {
+	changed := false
+	if heartbeatAt, expiresAt, ok := s.readHeartbeat(record.JobID); ok && heartbeatAt.After(record.HeartbeatAt) {
+		record.HeartbeatAt = heartbeatAt
+		record.Lease = Lease{ExpiresAt: expiresAt}
+		changed = true
+	}
 	switch record.State {
 	case StateOrphaned:
+		if record.UpdatedAt.IsZero() || now.Sub(record.UpdatedAt) < s.orphanGrace {
+			return changed, nil
+		}
 		return true, record.Transition(StateReaped, now)
 	case StateQueued, StateStarting:
 		if !record.UpdatedAt.IsZero() && now.Sub(record.UpdatedAt) >= s.retention.StaleJobAfter {
-			if err := record.Transition(StateOrphaned, now); err != nil {
-				return false, err
-			}
-			return true, record.Transition(StateReaped, now)
-		}
-	case StateRunning, StateRetrying:
-		if !record.Lease.ExpiresAt.IsZero() && !now.Before(record.Lease.ExpiresAt) {
 			return true, record.Transition(StateOrphaned, now)
 		}
+	case StateRunning, StateRetrying:
 		if s.processGoneOrReused(record.Worker) {
 			return true, record.Transition(StateOrphaned, now)
 		}
@@ -598,8 +652,63 @@ func (s *Store) reapRecord(record *JobRecord, now time.Time) (bool, error) {
 		if s.processMissing(record.BackendChildPID) {
 			return true, record.Transition(StateOrphaned, now)
 		}
+		if !record.Lease.ExpiresAt.IsZero() && !now.Before(record.Lease.ExpiresAt) {
+			if s.processIdentityConfirmed(record) {
+				record.HeartbeatAt = now
+				record.Lease = Lease{ExpiresAt: now.Add(s.leaseDuration)}
+				record.Warnings = appendWarning(record.Warnings, staleHeartbeatWarning)
+				return true, nil
+			}
+			return true, record.Transition(StateOrphaned, now)
+		}
 	}
-	return false, nil
+	return changed, nil
+}
+
+func (s *Store) processIdentityConfirmed(record *JobRecord) bool {
+	refs := []ProcessRef{record.Worker, record.Supervisor}
+	if record.BackendChildPID > 0 {
+		refs = append(refs, ProcessRef{PID: record.BackendChildPID, StartTime: record.BackendChildStartTime})
+	}
+	confirmed := false
+	for _, ref := range refs {
+		if ref.PID <= 0 || ref.StartTime == "" {
+			continue
+		}
+		confirmed = true
+		info, alive, err := s.processes.Lookup(ref.PID)
+		if err != nil || !alive || info.StartTime == "" || info.StartTime != ref.StartTime {
+			return false
+		}
+	}
+	return confirmed
+}
+
+func (s *Store) readHeartbeat(jobID string) (time.Time, time.Time, bool) {
+	path, err := safePathForID(s.layout.Jobs, jobID, ".heartbeat")
+	if err != nil {
+		return time.Time{}, time.Time{}, false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}, time.Time{}, false
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 2 {
+		return time.Time{}, time.Time{}, false
+	}
+	heartbeatAt, err1 := time.Parse(time.RFC3339Nano, lines[0])
+	expiresAt, err2 := time.Parse(time.RFC3339Nano, lines[1])
+	return heartbeatAt, expiresAt, err1 == nil && err2 == nil
+}
+
+func appendWarning(warnings []string, warning string) []string {
+	for _, existing := range warnings {
+		if existing == warning {
+			return warnings
+		}
+	}
+	return append(warnings, warning)
 }
 
 func (s *Store) processGoneOrReused(ref ProcessRef) bool {
@@ -627,6 +736,10 @@ func (s *Store) quarantine(path string, cause error) error {
 	target := filepath.Join(s.layout.Quarantine, stamp+"-"+base)
 	if err := os.Rename(path, target); err != nil {
 		return err
+	}
+	jobID := strings.TrimSuffix(base, ".json")
+	if validateJobID(jobID) == nil {
+		s.sweepHeartbeat(jobID)
 	}
 	diag := []byte(fmt.Sprintf("recordPath: %s\nfailure: %v\n", path, cause))
 	if err := atomicWriteFile(target+".diagnostic.txt", diag, 0o600); err != nil {
@@ -683,7 +796,7 @@ func (s *Store) gc(now time.Time) error {
 			if !IsTerminal(record.State) {
 				return nil
 			}
-			s.sweepTerminalJobInput(record.JobID)
+			s.sweepTerminalJobArtifacts(record.JobID)
 			if now.Sub(record.UpdatedAt) < s.retention.TerminalJobTTL {
 				return nil
 			}
@@ -873,7 +986,7 @@ func logRemoveIfExists(path string) {
 	}
 }
 
-func (s *Store) sweepTerminalJobInput(jobID string) {
+func (s *Store) sweepTerminalJobArtifacts(jobID string) {
 	inputPath, err := safePathForID(s.layout.Inputs, jobID, ".json")
 	if err != nil {
 		log.Printf("agentbus gc: invalid terminal input path for %s: %v", jobID, err)
@@ -881,6 +994,18 @@ func (s *Store) sweepTerminalJobInput(jobID string) {
 	}
 	if err := removeIfExists(inputPath); err != nil {
 		log.Printf("agentbus gc: failed to remove terminal input %s: %v", inputPath, err)
+	}
+	s.sweepHeartbeat(jobID)
+}
+
+func (s *Store) sweepHeartbeat(jobID string) {
+	heartbeatPath, err := safePathForID(s.layout.Jobs, jobID, ".heartbeat")
+	if err != nil {
+		log.Printf("agentbus gc: invalid heartbeat path for %s: %v", jobID, err)
+		return
+	}
+	if err := removeIfExists(heartbeatPath); err != nil {
+		log.Printf("agentbus gc: failed to remove heartbeat %s: %v", heartbeatPath, err)
 	}
 }
 

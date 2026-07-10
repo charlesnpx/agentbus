@@ -37,6 +37,9 @@ type testStoreOptions struct {
 	cancelWaiter  Waiter
 	cancelGrace   time.Duration
 	retention     RetentionConfig
+	leaseDuration time.Duration
+	orphanGrace   time.Duration
+	beforeUpdate  func(string)
 }
 
 func newTestStore(t *testing.T, now time.Time, pt ProcessTable) *Store {
@@ -64,6 +67,9 @@ func newTestStoreWithOptions(t *testing.T, now time.Time, pt ProcessTable, opts 
 		CancelWaiter:  opts.cancelWaiter,
 		CancelGrace:   opts.cancelGrace,
 		Retention:     retention,
+		LeaseDuration: opts.leaseDuration,
+		OrphanGrace:   opts.orphanGrace,
+		BeforeUpdate:  opts.beforeUpdate,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -306,16 +312,16 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 		want JobState
 	}{
 		{
-			name: "expired lease becomes orphaned",
+			name: "expired lease with alive worker is renewed",
 			job:  JobRecord{JobID: "job_lease", State: StateRunning, UpdatedAt: base, Lease: Lease{ExpiresAt: base.Add(-time.Second)}, Worker: ProcessRef{PID: 101, StartTime: "a"}},
 			pt:   fakeProcessTable{entries: map[int]ProcessInfo{101: {PID: 101, StartTime: "a"}}},
-			want: StateOrphaned,
+			want: StateRunning,
 		},
 		{
-			name: "stale queued reaped",
+			name: "stale queued orphaned",
 			job:  JobRecord{JobID: "job_stale", State: StateQueued, UpdatedAt: base.Add(-2 * time.Minute)},
 			pt:   fakeProcessTable{entries: map[int]ProcessInfo{}},
-			want: StateReaped,
+			want: StateOrphaned,
 		},
 		{
 			name: "worker crash orphaned",
@@ -337,7 +343,7 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 		},
 		{
 			name: "orphaned reaped",
-			job:  JobRecord{JobID: "job_orphan", State: StateOrphaned, UpdatedAt: base},
+			job:  JobRecord{JobID: "job_orphan", State: StateOrphaned, UpdatedAt: base.Add(-DefaultLeaseDuration)},
 			pt:   fakeProcessTable{entries: map[int]ProcessInfo{}},
 			want: StateReaped,
 		},
@@ -368,7 +374,123 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 			if got.State != tt.want {
 				t.Fatalf("state = %s, want %s", got.State, tt.want)
 			}
+			if tt.name == "expired lease with alive worker is renewed" {
+				if !got.Lease.ExpiresAt.Equal(base.Add(DefaultLeaseDuration)) || len(got.Warnings) != 1 || !strings.Contains(got.Warnings[0], "stale-heartbeat") {
+					t.Fatalf("renewed record = %+v", got)
+				}
+			}
 		})
+	}
+}
+
+func TestReaperUsesConfiguredLeaseAndOrphanGrace(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	clock := &fakeClock{now: base}
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{101: {PID: 101, StartTime: "a"}}}, testStoreOptions{leaseDuration: 20 * time.Second, orphanGrace: 30 * time.Second})
+	store.clock = clock
+	record := &JobRecord{JobID: "job_configured_lease", State: StateRunning, UpdatedAt: base, Lease: Lease{ExpiresAt: base.Add(-time.Second)}, Worker: ProcessRef{PID: 101, StartTime: "a"}}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.loadPath(record.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Lease.ExpiresAt.Equal(base.Add(20 * time.Second)) {
+		t.Fatalf("lease = %s", got.Lease.ExpiresAt)
+	}
+	got.State = StateOrphaned
+	got.UpdatedAt = base
+	if err := store.Save(got); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = base.Add(29 * time.Second)
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = store.loadPath(record.StatePath)
+	if got.State != StateOrphaned {
+		t.Fatalf("state before grace = %s", got.State)
+	}
+	clock.now = base.Add(30 * time.Second)
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = store.loadPath(record.StatePath)
+	if got.State != StateReaped {
+		t.Fatalf("state after grace = %s", got.State)
+	}
+}
+
+func TestLeaseRenewalRequiresAllPersistedProcessIdentities(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		jobID     string
+		processes map[int]ProcessInfo
+	}{
+		{
+			name:      "backend child mismatch",
+			jobID:     "job_backend_identity",
+			processes: map[int]ProcessInfo{101: {PID: 101, StartTime: "worker"}, 202: {PID: 202, StartTime: "reused"}, 303: {PID: 303, StartTime: "supervisor"}},
+		},
+		{
+			name:      "supervisor identity unavailable",
+			jobID:     "job_supervisor_identity",
+			processes: map[int]ProcessInfo{101: {PID: 101, StartTime: "worker"}, 202: {PID: 202, StartTime: "backend"}, 303: {PID: 303}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestStore(t, base, fakeProcessTable{entries: tt.processes})
+			record := &JobRecord{JobID: tt.jobID, State: StateRunning, UpdatedAt: base, Lease: Lease{ExpiresAt: base.Add(-time.Second)}, Worker: ProcessRef{PID: 101, StartTime: "worker"}, Supervisor: ProcessRef{PID: 303, StartTime: "supervisor"}, BackendChildPID: 202, BackendChildStartTime: "backend"}
+			if err := store.Save(record); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Reap(); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := store.loadPath(record.StatePath)
+			if got.State != StateOrphaned {
+				t.Fatalf("state = %s", got.State)
+			}
+		})
+	}
+}
+
+func TestTerminalAndQuarantineRemoveHeartbeatSidecar(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	record := &JobRecord{JobID: "job_heartbeat_cleanup", State: StateRunning, UpdatedAt: base}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TouchHeartbeat(record.JobID, base, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(record.JobID, func(r *JobRecord) (bool, error) { return true, r.Transition(StateFailed, base) }); err != nil {
+		t.Fatal(err)
+	}
+	heartbeat := filepath.Join(store.Layout().Jobs, record.JobID+".heartbeat")
+	if _, err := os.Stat(heartbeat); !os.IsNotExist(err) {
+		t.Fatalf("terminal heartbeat remains: %v", err)
+	}
+	badID := "job_bad_heartbeat"
+	badPath := filepath.Join(store.Layout().Jobs, badID+".json")
+	if err := os.WriteFile(badPath, []byte("bad"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.Layout().Jobs, badID+".heartbeat"), []byte("bad"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.List(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(store.Layout().Jobs, badID+".heartbeat")); !os.IsNotExist(err) {
+		t.Fatalf("quarantine heartbeat remains: %v", err)
 	}
 }
 

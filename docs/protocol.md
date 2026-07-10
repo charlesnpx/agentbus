@@ -597,9 +597,20 @@ start-time tokens. Clients MUST compare them only for exact equality when
 verifying that a PID has not been reused. `lease.expired` MUST be computed at
 status-read time from `lease.expiresAt`. A running job whose heartbeat lease
 has expired MUST still report its recorded `state` as `running` until the
-reaper transitions it, and MUST report `lease.expired: true`; the reaper may
-subsequently move the record to `orphaned` according to the daemon supervision
-rules.
+reaper transitions it, and MUST report `lease.expired: true`. The daemon's
+default lease duration is five minutes and its default heartbeat interval is
+30 seconds. On an expired lease, the reaper MAY renew the lease and append a
+stale-heartbeat warning only when every persisted process identity with both a
+PID and start-time token still matches the observed process. If any required
+identity is missing, dead, or reused, the reaper MUST move the record to
+`orphaned`.
+
+An orphaned record MUST remain non-terminal for an orphan grace period measured
+from the transition to `orphaned`. The default orphan grace is the configured
+lease duration and MUST NOT be shorter than that duration. After the grace
+expires, the reaper MAY transition the record to `reaped`. This reconciliation
+window permits an in-process backend completion already held by the supervising
+daemon to persist its authoritative result.
 
 Request params for one job:
 
@@ -842,9 +853,17 @@ queued -> starting -> running -> [retrying ->] completed
 Supervision states:
 
 ```text
-orphaned -> reaped
+orphaned -> completed | completed_noncompliant | reaped
+reaped --authoritative in-process completion--> completed | completed_noncompliant
 quarantined
 ```
+
+The `reaped` completion amendments are intentionally narrow: only the daemon
+instance that already holds the authoritative backend completion may salvage a
+`reaped` record. Status clients, restarted daemons, and unauthenticated or
+out-of-process writers MUST treat `reaped` as terminal and MUST NOT synthesize a
+result. This exception closes the `running -> orphaned -> reaped -> finalize`
+race without reopening arbitrary terminal records.
 
 `retrying` is entered only from `running` when policy validation fails and
 `retry.max == 1`. It may be entered at most once for a job.
@@ -863,8 +882,8 @@ Terminal states:
 | `timed_out` | yes | Timeout expired. |
 | `interrupted` | yes | Foreground turn was interrupted. |
 | `canceled` | yes | Background job was canceled. |
-| `orphaned` | no | Reaper found an active record with missing or stale supervision. |
-| `reaped` | yes | Reaper finalized an orphaned record. |
+| `orphaned` | no | Reaper found missing, stale, or identity-mismatched supervision; the orphan grace is still reconciling possible in-process completion. |
+| `reaped` | yes | Reaper finalized an orphan after its grace elapsed; only an authoritative in-process completion already held by the daemon may amend it to a completed state. |
 | `quarantined` | yes | Corrupt record was moved aside with diagnostics. |
 
 CLI commands that surface a single job result MUST map terminal states to exit
