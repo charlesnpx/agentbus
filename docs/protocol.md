@@ -580,12 +580,16 @@ Result:
 Fetches one job status or all job statuses.
 
 Each job entry MUST include `heartbeatAt`, `lease`, `workerPid`,
-`backendChildPid`, `statePath`, and `logPaths` when those fields are known for
-the current record. `lease.expired` MUST be computed at status-read time from
-`lease.expiresAt`. A running job whose heartbeat lease has expired MUST still
-report its recorded `state` as `running` until the reaper transitions it, and
-MUST report `lease.expired: true`; the reaper may subsequently move the record
-to `orphaned` according to the daemon supervision rules.
+`workerStartTime`, `backendChildPid`, `backendChildStartTime`, `statePath`, and
+`logPaths` when those fields are known for the current record.
+`workerStartTime` and `backendChildStartTime` are opaque platform process
+start-time tokens. Clients MUST compare them only for exact equality when
+verifying that a PID has not been reused. `lease.expired` MUST be computed at
+status-read time from `lease.expiresAt`. A running job whose heartbeat lease
+has expired MUST still report its recorded `state` as `running` until the
+reaper transitions it, and MUST report `lease.expired: true`; the reaper may
+subsequently move the record to `orphaned` according to the daemon supervision
+rules.
 
 Request params for one job:
 
@@ -625,7 +629,9 @@ Result:
         "expired": true
       },
       "workerPid": 12345,
+      "workerStartTime": "2026-07-09 12:00:00",
       "backendChildPid": 12346,
+      "backendChildStartTime": "2026-07-09 12:00:00",
       "statePath": "/home/me/.local/state/agentbus/jobs/job_01J00000000000000000000002.json",
       "logPaths": {
         "stdout": "/home/me/.local/state/agentbus/logs/job_01J00000000000000000000002.stdout.log",

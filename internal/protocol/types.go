@@ -236,19 +236,21 @@ type JobStatusResult struct {
 }
 
 type JobStatus struct {
-	JobID           string            `json:"jobId"`
-	SessionID       string            `json:"sessionId,omitempty"`
-	Backend         string            `json:"backend,omitempty"`
-	State           engine.JobState   `json:"state"`
-	Tags            map[string]string `json:"tags,omitempty"`
-	StartedAt       *time.Time        `json:"startedAt,omitempty"`
-	UpdatedAt       *time.Time        `json:"updatedAt,omitempty"`
-	HeartbeatAt     *time.Time        `json:"heartbeatAt,omitempty"`
-	Lease           *engine.Lease     `json:"lease,omitempty"`
-	WorkerPID       int               `json:"workerPid,omitempty"`
-	BackendChildPID int               `json:"backendChildPid,omitempty"`
-	StatePath       string            `json:"statePath,omitempty"`
-	LogPaths        engine.LogPaths   `json:"logPaths,omitempty"`
+	JobID                 string            `json:"jobId"`
+	SessionID             string            `json:"sessionId,omitempty"`
+	Backend               string            `json:"backend,omitempty"`
+	State                 engine.JobState   `json:"state"`
+	Tags                  map[string]string `json:"tags,omitempty"`
+	StartedAt             *time.Time        `json:"startedAt,omitempty"`
+	UpdatedAt             *time.Time        `json:"updatedAt,omitempty"`
+	HeartbeatAt           *time.Time        `json:"heartbeatAt,omitempty"`
+	Lease                 *engine.Lease     `json:"lease,omitempty"`
+	WorkerPID             int               `json:"workerPid,omitempty"`
+	WorkerStartTime       string            `json:"workerStartTime,omitempty"`
+	BackendChildPID       int               `json:"backendChildPid,omitempty"`
+	BackendChildStartTime string            `json:"backendChildStartTime,omitempty"`
+	StatePath             string            `json:"statePath,omitempty"`
+	LogPaths              engine.LogPaths   `json:"logPaths,omitempty"`
 }
 
 type JobResultParams struct {

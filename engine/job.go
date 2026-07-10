@@ -54,29 +54,30 @@ type ResultInfo struct {
 
 // JobRecord is the durable job state record stored as JSON.
 type JobRecord struct {
-	JobID            string            `json:"jobId"`
-	SessionID        string            `json:"sessionId,omitempty"`
-	Backend          string            `json:"backend,omitempty"`
-	Foreground       bool              `json:"foreground,omitempty"`
-	State            JobState          `json:"state"`
-	Tags             map[string]string `json:"tags,omitempty"`
-	CreatedAt        time.Time         `json:"createdAt"`
-	StartedAt        time.Time         `json:"startedAt,omitempty"`
-	UpdatedAt        time.Time         `json:"updatedAt"`
-	HeartbeatAt      time.Time         `json:"heartbeatAt,omitempty"`
-	Lease            Lease             `json:"lease,omitempty"`
-	Supervisor       ProcessRef        `json:"supervisor,omitempty"`
-	Worker           ProcessRef        `json:"worker,omitempty"`
-	BackendSessionID string            `json:"backendSessionId,omitempty"`
-	BackendChildPID  int               `json:"backendChildPid,omitempty"`
-	StatePath        string            `json:"statePath,omitempty"`
-	LogPaths         LogPaths          `json:"logPaths,omitempty"`
-	Result           *ResultInfo       `json:"result,omitempty"`
-	Policy           *TurnPolicy       `json:"policy,omitempty"`
-	ResolvedContract *ContractSpec     `json:"resolvedContract,omitempty"`
-	Contract         *ContractStamp    `json:"contract,omitempty"`
-	RetryCount       int               `json:"retryCount,omitempty"`
-	QuarantineReason string            `json:"quarantineReason,omitempty"`
+	JobID                 string            `json:"jobId"`
+	SessionID             string            `json:"sessionId,omitempty"`
+	Backend               string            `json:"backend,omitempty"`
+	Foreground            bool              `json:"foreground,omitempty"`
+	State                 JobState          `json:"state"`
+	Tags                  map[string]string `json:"tags,omitempty"`
+	CreatedAt             time.Time         `json:"createdAt"`
+	StartedAt             time.Time         `json:"startedAt,omitempty"`
+	UpdatedAt             time.Time         `json:"updatedAt"`
+	HeartbeatAt           time.Time         `json:"heartbeatAt,omitempty"`
+	Lease                 Lease             `json:"lease,omitempty"`
+	Supervisor            ProcessRef        `json:"supervisor,omitempty"`
+	Worker                ProcessRef        `json:"worker,omitempty"`
+	BackendSessionID      string            `json:"backendSessionId,omitempty"`
+	BackendChildPID       int               `json:"backendChildPid,omitempty"`
+	BackendChildStartTime string            `json:"backendChildStartTime,omitempty"`
+	StatePath             string            `json:"statePath,omitempty"`
+	LogPaths              LogPaths          `json:"logPaths,omitempty"`
+	Result                *ResultInfo       `json:"result,omitempty"`
+	Policy                *TurnPolicy       `json:"policy,omitempty"`
+	ResolvedContract      *ContractSpec     `json:"resolvedContract,omitempty"`
+	Contract              *ContractStamp    `json:"contract,omitempty"`
+	RetryCount            int               `json:"retryCount,omitempty"`
+	QuarantineReason      string            `json:"quarantineReason,omitempty"`
 }
 
 // IsTerminal reports whether state is terminal under protocol v1.
