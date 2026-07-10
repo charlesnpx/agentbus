@@ -3,6 +3,7 @@ package engine
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -154,6 +155,43 @@ func TestStateLayoutAndPermissions(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("record mode = %o, want 600", got)
+	}
+}
+
+func TestOpenWorkspaceStoresIgnoresManifestWithMismatchedCWD(t *testing.T) {
+	t.Parallel()
+	root := filepath.Join(t.TempDir(), "root")
+	workspace := t.TempDir()
+	alias := t.TempDir()
+	store, err := NewStore(StoreConfig{Root: root, CWD: workspace, Clock: ClockFunc(time.Now), Processes: fakeProcessTable{entries: map[int]ProcessInfo{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.MarshalIndent(workspaceManifest{
+		Version: 1,
+		CWD:     alias,
+		Key:     store.Layout().Key,
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append(raw, '\n')
+	if err := os.WriteFile(filepath.Join(store.Layout().Namespace, workspaceManifestFile), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stores, err := OpenWorkspaceStores(StoreConfig{Root: root, Clock: ClockFunc(time.Now), Processes: fakeProcessTable{entries: map[int]ProcessInfo{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stores) != 1 {
+		t.Fatalf("stores = %d, want 1", len(stores))
+	}
+	if got := stores[0].Layout().Key; got != store.Layout().Key {
+		t.Fatalf("workspace key = %q, want %q", got, store.Layout().Key)
+	}
+	if got := stores[0].Layout().Workspace; got != "" {
+		t.Fatalf("workspace alias = %q, want empty for mismatched manifest cwd", got)
 	}
 }
 

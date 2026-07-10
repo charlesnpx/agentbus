@@ -236,7 +236,17 @@ func readWorkspaceManifestCWD(namespace, key string) string {
 	if manifest.Key != "" && manifest.Key != key {
 		return ""
 	}
-	return manifest.CWD
+	if manifest.CWD == "" {
+		return ""
+	}
+	cwd, err := CanonicalWorkspace(manifest.CWD)
+	if err != nil {
+		return ""
+	}
+	if WorkspaceKey(cwd) != key {
+		return ""
+	}
+	return cwd
 }
 
 // Save writes a job record atomically.
