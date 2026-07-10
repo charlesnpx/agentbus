@@ -54,6 +54,7 @@ type Event struct {
 	Text      string         `json:"text"`
 	Truncated bool           `json:"truncated"`
 	Metadata  map[string]any `json:"metadata,omitempty"`
+	RawText   string         `json:"-"`
 }
 
 const (

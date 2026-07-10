@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,13 +21,16 @@ import (
 )
 
 type fakeBackend struct {
-	name    string
-	delay   time.Duration
-	block   <-chan struct{}
-	started chan struct{}
-	turns   chan fakeTurn
-	count   atomic.Int64
-	events  func(prompt string, write bool) []engine.Event
+	name            string
+	delay           time.Duration
+	block           <-chan struct{}
+	started         chan struct{}
+	turns           chan fakeTurn
+	count           atomic.Int64
+	interrupts      atomic.Int64
+	events          func(prompt string, write bool) []engine.Event
+	processRef      engine.ProcessRef
+	backendChildPID int
 }
 
 type fakeTurn struct {
@@ -68,6 +73,9 @@ func (s *fakeSession) ID() string { return s.id }
 func (s *fakeSession) Turn(ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
 	ch := make(chan engine.Event, 8)
 	s.backend.turns <- fakeTurn{Prompt: input.Prompt, Write: input.Write}
+	if input.OnProcessStart != nil && (s.backend.processRef.PID > 0 || s.backend.processRef.PGID > 0 || s.backend.processRef.StartTime != "") {
+		input.OnProcessStart(s.backend.processRef, s.backend.backendChildPID)
+	}
 	if s.backend.started != nil {
 		s.backend.started <- struct{}{}
 	}
@@ -98,7 +106,10 @@ func (s *fakeSession) Turn(ctx context.Context, input engine.TurnInput) (<-chan 
 	return ch, nil
 }
 
-func (s *fakeSession) Interrupt(context.Context) error { return nil }
+func (s *fakeSession) Interrupt(context.Context) error {
+	s.backend.interrupts.Add(1)
+	return nil
+}
 
 func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	t.Parallel()
@@ -220,6 +231,34 @@ func TestTurnNotificationsCorrelationPolicyStampAndJobResult(t *testing.T) {
 	}
 }
 
+func TestPrepareWireEventStripsRawTextMetadata(t *testing.T) {
+	t.Parallel()
+	raw := strings.Repeat("x", engine.DefaultEventTextCap) + "SECRET_RAW_TAIL"
+	event := engine.Event{
+		Type:    engine.EventAgentText,
+		Text:    raw,
+		RawText: raw,
+		Metadata: map[string]any{
+			"agentbusRawText": raw,
+			"text":            raw,
+		},
+	}
+	if authoritativeText(event) != raw {
+		t.Fatal("authoritative text did not use internal raw text")
+	}
+	wire := prepareWireEvent(event)
+	if wire.RawText != "" || !wire.Truncated || strings.Contains(wire.Text, "SECRET_RAW_TAIL") {
+		t.Fatalf("wire event did not cap raw fields: %+v", wire)
+	}
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "agentbusRawText") || strings.Contains(string(encoded), "SECRET_RAW_TAIL") {
+		t.Fatalf("wire event leaked raw text: %s", encoded)
+	}
+}
+
 func TestSessionBusy(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
@@ -265,6 +304,226 @@ func TestConcurrentBackgroundJobs(t *testing.T) {
 	close(release)
 	waitJobState(t, conn, r, one.JobID, engine.StateCompleted)
 	waitJobState(t, conn, r, two.JobID, engine.StateCompleted)
+}
+
+func TestBackendProcessUpdatesWorkerIdentity(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	backend := newFakeBackend("fake")
+	backend.block = release
+	backend.started = make(chan struct{}, 1)
+	backend.processRef = engine.ProcessRef{PID: 4242, PGID: 4242, StartTime: "backend-start"}
+	backend.backendChildPID = 4243
+	processes := mapProcessTable{entries: map[int]engine.ProcessInfo{
+		os.Getpid(): {PID: os.Getpid()},
+		4242:        {PID: 4242, StartTime: "backend-start"},
+		4243:        {PID: 4243, StartTime: "child-start"},
+	}}
+	h := startTestServer(t, backend, Config{IdleTimeout: -1, ProcessTable: processes})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	var job protocol.JobSubmitResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"}}), &job)
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for job to start")
+	}
+	var status protocol.JobStatusResult
+	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: job.JobID}), &status)
+	if len(status.Jobs) != 1 || status.Jobs[0].WorkerPID != 4242 || status.Jobs[0].BackendChildPID != 4243 {
+		t.Fatalf("status worker identity = %+v", status)
+	}
+	record := loadJobRecord(t, h.root, h.cwd, job.JobID, processes)
+	if record.Worker.PID != 4242 || record.Worker.PGID != 4242 || record.Worker.StartTime != "backend-start" {
+		t.Fatalf("record worker = %+v", record.Worker)
+	}
+	close(release)
+	waitJobState(t, conn, r, job.JobID, engine.StateCompleted)
+}
+
+func TestJobCancelUsesStoreGraceAndDoesNotInterruptSession(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	backend := newFakeBackend("fake")
+	backend.block = release
+	backend.started = make(chan struct{}, 1)
+	backend.processRef = engine.ProcessRef{PID: 5252, PGID: 5250, StartTime: "worker-start"}
+	backend.backendChildPID = 5253
+	processes := mapProcessTable{entries: map[int]engine.ProcessInfo{
+		os.Getpid(): {PID: os.Getpid()},
+		5252:        {PID: 5252, StartTime: "worker-start"},
+		5253:        {PID: 5253, StartTime: "child-start"},
+	}}
+	groups := &recordingProcessGroups{}
+	waiter := newRecordingWaiter()
+	h := startTestServer(t, backend, Config{IdleTimeout: -1, ProcessTable: processes, ProcessGroups: groups, CancelWaiter: waiter})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	var job protocol.JobSubmitResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"}}), &job)
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for job to start")
+	}
+	var canceled protocol.JobCancelResult
+	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: job.JobID}), &canceled)
+	if canceled.State != engine.StateCanceled {
+		t.Fatalf("cancel result = %+v", canceled)
+	}
+	select {
+	case got := <-waiter.durations:
+		if got != engine.DefaultCancelGrace {
+			t.Fatalf("cancel grace = %s, want %s", got, engine.DefaultCancelGrace)
+		}
+	default:
+		t.Fatal("store cancellation did not wait the protocol grace")
+	}
+	signals := groups.snapshot()
+	if len(signals) != 2 || signals[0].Signal != syscall.SIGTERM || signals[1].Signal != syscall.SIGKILL || signals[0].PGID != 5250 || signals[1].PGID != 5250 {
+		t.Fatalf("signals = %+v", signals)
+	}
+	if got := backend.interrupts.Load(); got != 0 {
+		t.Fatalf("session interrupts = %d, want 0", got)
+	}
+	close(release)
+	waitJobState(t, conn, r, job.JobID, engine.StateCanceled)
+}
+
+func TestTurnInterruptRejectsBackgroundJob(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	backend := newFakeBackend("fake")
+	backend.block = release
+	backend.started = make(chan struct{}, 1)
+	h := startTestServer(t, backend, Config{IdleTimeout: -1})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	var job protocol.JobSubmitResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"}}), &job)
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for job to start")
+	}
+	resp := rpc(t, conn, r, "3", protocol.MethodTurnInterrupt, protocol.TurnInterruptParams{TurnID: job.JobID})
+	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
+	var status protocol.JobStatusResult
+	decodeResult(t, rpc(t, conn, r, "4", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: job.JobID}), &status)
+	if len(status.Jobs) != 1 || status.Jobs[0].State != engine.StateRunning {
+		t.Fatalf("background job state changed after turn.interrupt: %+v", status)
+	}
+	close(release)
+	waitJobState(t, conn, r, job.JobID, engine.StateCompleted)
+}
+
+func TestJobCancelRejectsForegroundTurn(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	backend := newFakeBackend("fake")
+	backend.block = release
+	backend.started = make(chan struct{}, 1)
+	h := startTestServer(t, backend, Config{IdleTimeout: -1})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+	var session protocol.SessionStartResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodSessionStart, protocol.SessionStartParams{Backend: "fake", CWD: h.cwd}), &session)
+	var turn protocol.TurnStartResult
+	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodTurnStart, protocol.TurnStartParams{SessionID: session.SessionID, Prompt: "hold"}), &turn)
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for turn to start")
+	}
+	resp := rpc(t, conn, r, "4", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: turn.JobID})
+	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
+	var sessions protocol.SessionListResult
+	decodeResult(t, rpc(t, conn, r, "5", protocol.MethodSessionList, protocol.SessionListParams{}), &sessions)
+	if len(sessions.Sessions) != 1 || sessions.Sessions[0].ActiveTurnID == nil || *sessions.Sessions[0].ActiveTurnID != turn.TurnID {
+		t.Fatalf("foreground turn was not left active: %+v", sessions)
+	}
+	close(release)
+	_ = readNotification(t, r)
+	_ = readNotification(t, r)
+}
+
+func TestSideEffectingNotificationsAreRejectedBeforeMutation(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	h := startTestServer(t, backend, Config{IdleTimeout: -1})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+	var session protocol.SessionStartResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodSessionStart, protocol.SessionStartParams{Backend: "fake", CWD: h.cwd}), &session)
+
+	notifyRPC(t, conn, protocol.MethodTurnStart, protocol.TurnStartParams{SessionID: session.SessionID, Prompt: "notification"})
+	assertRPCCode(t, readResponse(t, r), protocol.ErrorInvalidTaskSpec)
+	notifyRPC(t, conn, protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "notification"}})
+	assertRPCCode(t, readResponse(t, r), protocol.ErrorInvalidTaskSpec)
+
+	var sessions protocol.SessionListResult
+	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodSessionList, protocol.SessionListParams{}), &sessions)
+	if len(sessions.Sessions) != 1 || sessions.Sessions[0].ActiveTurnID != nil {
+		t.Fatalf("notification mutated session state: %+v", sessions)
+	}
+	var status protocol.JobStatusResult
+	decodeResult(t, rpc(t, conn, r, "4", protocol.MethodJobStatus, protocol.JobStatusParams{All: true}), &status)
+	if len(status.Jobs) != 0 {
+		t.Fatalf("notification created jobs: %+v", status)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts = %d, want only session.start", got)
+	}
+}
+
+func TestNamedPolicyResolvedAtSubmitTime(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	backend := newFakeBackend("fake")
+	backend.block = release
+	backend.started = make(chan struct{}, 1)
+	registry := engine.NewPolicyRegistry()
+	spec := engine.ContractSpec{Shape: &engine.ShapeSpec{FirstLineEnum: []string{"PASS"}, RequiredSections: []string{"Findings"}}}
+	if _, err := registry.Register("delegate/report@1", spec); err != nil {
+		t.Fatal(err)
+	}
+	h := startTestServer(t, backend, Config{IdleTimeout: -1, Registry: registry})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	var job protocol.JobSubmitResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{
+		Backend: "fake",
+		CWD:     h.cwd,
+		Write:   false,
+		Prompt:  "hold",
+		Policy:  &engine.TurnPolicy{Contract: &engine.ContractSpec{Named: "delegate/report@1"}},
+	}}), &job)
+	record := loadJobRecord(t, h.root, h.cwd, job.JobID, nil)
+	if record.ResolvedContract == nil || record.ResolvedContract.Shape == nil || record.ResolvedContract.Named != "" {
+		t.Fatalf("resolved contract was not persisted at submit time: %+v", record.ResolvedContract)
+	}
+	if record.Policy == nil || record.Policy.Contract == nil || record.Policy.Contract.Named != "delegate/report@1" {
+		t.Fatalf("submitted policy name was not retained: %+v", record.Policy)
+	}
+	close(release)
+	waitJobState(t, conn, r, job.JobID, engine.StateCompleted)
 }
 
 func TestIdleShutdownWaitsForActiveJobs(t *testing.T) {
@@ -336,6 +595,50 @@ type fakeProcessTable struct{}
 
 func (fakeProcessTable) Lookup(int) (engine.ProcessInfo, bool, error) {
 	return engine.ProcessInfo{}, false, nil
+}
+
+type mapProcessTable struct {
+	entries map[int]engine.ProcessInfo
+}
+
+func (p mapProcessTable) Lookup(pid int) (engine.ProcessInfo, bool, error) {
+	info, ok := p.entries[pid]
+	return info, ok, nil
+}
+
+type processSignal struct {
+	PGID   int
+	Signal syscall.Signal
+}
+
+type recordingProcessGroups struct {
+	mu      sync.Mutex
+	signals []processSignal
+}
+
+func (g *recordingProcessGroups) SignalProcessGroup(pgid int, signal syscall.Signal) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.signals = append(g.signals, processSignal{PGID: pgid, Signal: signal})
+	return nil
+}
+
+func (g *recordingProcessGroups) snapshot() []processSignal {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]processSignal(nil), g.signals...)
+}
+
+type recordingWaiter struct {
+	durations chan time.Duration
+}
+
+func newRecordingWaiter() *recordingWaiter {
+	return &recordingWaiter{durations: make(chan time.Duration, 4)}
+}
+
+func (w *recordingWaiter) Wait(d time.Duration) {
+	w.durations <- d
 }
 
 type testServer struct {
@@ -456,6 +759,29 @@ func rpc(t *testing.T, conn net.Conn, r *bufio.Reader, id, method string, params
 	}
 }
 
+func notifyRPC(t *testing.T, conn net.Conn, method string, params any) {
+	t.Helper()
+	req := protocol.Request{JSONRPC: "2.0", Method: method, Params: mustMarshal(t, params)}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(append(raw, '\n')); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readResponse(t *testing.T, r *bufio.Reader) protocol.Response {
+	t.Helper()
+	line, err := r.ReadBytes('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp protocol.Response
+	mustUnmarshal(t, line, &resp)
+	return resp
+}
+
 func readNotification(t *testing.T, r *bufio.Reader) rawNotification {
 	t.Helper()
 	line, err := r.ReadBytes('\n')
@@ -468,6 +794,24 @@ func readNotification(t *testing.T, r *bufio.Reader) rawNotification {
 		t.Fatalf("notification included id: %s", notice.ID)
 	}
 	return notice
+}
+
+func loadJobRecord(t *testing.T, root, cwd, jobID string, processes engine.ProcessTable) *engine.JobRecord {
+	t.Helper()
+	store, err := engine.NewStore(engine.StoreConfig{
+		Root:      root,
+		CWD:       cwd,
+		Clock:     engine.ClockFunc(time.Now),
+		Processes: processes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return record
 }
 
 func waitJobState(t *testing.T, conn net.Conn, r *bufio.Reader, jobID string, want engine.JobState) {

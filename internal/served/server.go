@@ -38,6 +38,9 @@ type Config struct {
 	Registry          *engine.PolicyRegistry
 	Clock             engine.Clock
 	ProcessTable      engine.ProcessTable
+	ProcessGroups     engine.ProcessGroupSignaler
+	CancelGrace       time.Duration
+	CancelWaiter      engine.Waiter
 	IdleTimeout       time.Duration
 	IdleCheckInterval time.Duration
 	InlineResultCap   int
@@ -54,6 +57,9 @@ type Server struct {
 	registry          *engine.PolicyRegistry
 	clock             engine.Clock
 	processes         engine.ProcessTable
+	processGroups     engine.ProcessGroupSignaler
+	cancelGrace       time.Duration
+	cancelWaiter      engine.Waiter
 	id                atomic.Uint64
 	clients           atomic.Int64
 	idleTimeout       time.Duration
@@ -109,6 +115,13 @@ type requestOutcome struct {
 	result any
 	err    *protocol.ErrorObject
 	after  func()
+}
+
+type resolvedPolicy struct {
+	policy   *engine.TurnPolicy
+	contract *engine.ContractSpec
+	name     string
+	hash     string
 }
 
 // New creates a daemon server and ensures state root and token file exist.
@@ -185,6 +198,9 @@ func New(cfg Config) (*Server, error) {
 		registry:          registry,
 		clock:             clock,
 		processes:         processes,
+		processGroups:     cfg.ProcessGroups,
+		cancelGrace:       cfg.CancelGrace,
+		cancelWaiter:      cfg.CancelWaiter,
 		idleTimeout:       idleTimeout,
 		idleCheckInterval: idleCheck,
 		inlineResultCap:   cfg.InlineResultCap,
@@ -352,6 +368,14 @@ func (c *connection) serve(ctx context.Context) {
 			})
 			continue
 		}
+		if len(req.ID) == 0 && requiresRequestID(req.Method) {
+			_ = c.writeResponse(protocol.Response{
+				JSONRPC: "2.0",
+				ID:      json.RawMessage("null"),
+				Error:   protocol.NewError(protocol.ErrorInvalidTaskSpec, req.Method+" requires a JSON-RPC id", protocol.ErrorData{}),
+			})
+			continue
+		}
 		out := c.server.handle(ctx, c, req)
 		if len(req.ID) != 0 {
 			resp := protocol.Response{JSONRPC: "2.0", ID: req.ID, Result: out.result, Error: out.err}
@@ -360,6 +384,26 @@ func (c *connection) serve(ctx context.Context) {
 				out.after()
 			}
 		}
+	}
+}
+
+func requiresRequestID(method string) bool {
+	switch method {
+	case protocol.MethodHello,
+		protocol.MethodSessionStart,
+		protocol.MethodSessionResume,
+		protocol.MethodSessionList,
+		protocol.MethodTurnStart,
+		protocol.MethodTurnInterrupt,
+		protocol.MethodJobSubmit,
+		protocol.MethodJobStatus,
+		protocol.MethodJobResult,
+		protocol.MethodJobCancel,
+		protocol.MethodPolicyValidate,
+		protocol.MethodPolicyRegister:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -404,7 +448,7 @@ func (s *Server) handle(ctx context.Context, c *connection, req protocol.Request
 	case protocol.MethodTurnStart:
 		return s.handleTurnStart(ctx, c, req.Params)
 	case protocol.MethodTurnInterrupt:
-		return s.handleTurnInterrupt(ctx, req.Params)
+		return s.handleTurnInterrupt(req.Params)
 	case protocol.MethodJobSubmit:
 		return s.handleJobSubmit(ctx, req.Params)
 	case protocol.MethodJobStatus:
@@ -412,7 +456,7 @@ func (s *Server) handle(ctx context.Context, c *connection, req protocol.Request
 	case protocol.MethodJobResult:
 		return s.handleJobResult(req.Params)
 	case protocol.MethodJobCancel:
-		return s.handleJobCancel(ctx, req.Params)
+		return s.handleJobCancel(req.Params)
 	case protocol.MethodPolicyValidate:
 		return s.handlePolicyValidate(req.Params)
 	case protocol.MethodPolicyRegister:
@@ -537,6 +581,10 @@ func (s *Server) handleTurnStart(ctx context.Context, c *connection, raw json.Ra
 	if errObj != nil {
 		return requestOutcome{err: errObj}
 	}
+	policy, err := s.resolvePolicy(params.Policy)
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{SessionID: params.SessionID})}
+	}
 	s.mu.Lock()
 	session := s.sessions[params.SessionID]
 	if session == nil {
@@ -562,7 +610,7 @@ func (s *Server) handleTurnStart(ctx context.Context, c *connection, raw json.Ra
 	}
 	s.jobStores[jobID] = store
 	s.mu.Unlock()
-	if err := s.createQueuedRecord(store, jobID, session.id, session.backend, session.tags, params.Policy); err != nil {
+	if err := s.createQueuedRecord(store, jobID, session.id, session.backend, session.tags, policy.policy, policy.contract, true); err != nil {
 		s.clearActiveTurn(session.id, jobID)
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{SessionID: params.SessionID, JobID: jobID, TurnID: jobID})}
 	}
@@ -570,18 +618,21 @@ func (s *Server) handleTurnStart(ctx context.Context, c *connection, raw json.Ra
 	active := &activeJob{jobID: jobID, sessionID: session.id, foreground: true, session: session.session, cancel: cancel}
 	s.addActiveJob(active)
 	run := jobRun{
-		jobID:      jobID,
-		sessionID:  session.id,
-		backend:    session.backend,
-		store:      store,
-		session:    session.session,
-		prompt:     params.Prompt,
-		write:      write,
-		policy:     params.Policy,
-		timeout:    timeout,
-		foreground: true,
-		conn:       c,
-		active:     active,
+		jobID:        jobID,
+		sessionID:    session.id,
+		backend:      session.backend,
+		store:        store,
+		session:      session.session,
+		prompt:       params.Prompt,
+		write:        write,
+		policy:       policy.policy,
+		contract:     policy.contract,
+		contractName: policy.name,
+		contractHash: policy.hash,
+		timeout:      timeout,
+		foreground:   true,
+		conn:         c,
+		active:       active,
 		onDone: func() {
 			s.clearActiveTurn(session.id, jobID)
 		},
@@ -592,7 +643,7 @@ func (s *Server) handleTurnStart(ctx context.Context, c *connection, raw json.Ra
 	}
 }
 
-func (s *Server) handleTurnInterrupt(ctx context.Context, raw json.RawMessage) requestOutcome {
+func (s *Server) handleTurnInterrupt(raw json.RawMessage) requestOutcome {
 	var params protocol.TurnInterruptParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
@@ -602,19 +653,32 @@ func (s *Server) handleTurnInterrupt(ctx context.Context, raw json.RawMessage) r
 	}
 	active := s.lookupActiveJob(params.TurnID)
 	if active != nil {
+		if !active.foreground {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turn.interrupt only applies to foreground turns", protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
+		}
 		active.requestTerminal(engine.StateInterrupted)
-		if active.session != nil {
-			_ = active.session.Interrupt(ctx)
-		}
-		if active.cancel != nil {
-			active.cancel()
-		}
 	}
 	store := s.storeForJob(params.TurnID)
-	if store != nil {
-		_ = s.transitionRecord(store, params.TurnID, engine.StateInterrupted)
+	if store == nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turn is not known", protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
 	}
-	return requestOutcome{result: protocol.TurnInterruptResult{TurnID: params.TurnID, JobID: params.TurnID, State: engine.StateInterrupted}}
+	if active == nil {
+		record, err := store.Load(params.TurnID)
+		if err != nil {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
+		}
+		if !record.Foreground {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turn.interrupt only applies to foreground turns", protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
+		}
+	}
+	record, err := store.Interrupt(params.TurnID)
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
+	}
+	if active != nil && active.cancel != nil {
+		active.cancel()
+	}
+	return requestOutcome{result: protocol.TurnInterruptResult{TurnID: params.TurnID, JobID: params.TurnID, State: record.State}}
 }
 
 func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) requestOutcome {
@@ -632,6 +696,10 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	timeout, errObj := timeoutFromMillis(spec.TimeoutMs)
 	if errObj != nil {
 		return requestOutcome{err: errObj}
+	}
+	policy, err := s.resolvePolicy(spec.Policy)
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 	}
 	backend, ok := s.backends[spec.Backend]
 	if !ok {
@@ -654,23 +722,26 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	jobID := s.nextID("job")
 	s.jobStores[jobID] = store
 	s.mu.Unlock()
-	if err := s.createQueuedRecord(store, jobID, sessionID, spec.Backend, spec.Tags, spec.Policy); err != nil {
+	if err := s.createQueuedRecord(store, jobID, sessionID, spec.Backend, spec.Tags, policy.policy, policy.contract, false); err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	active := &activeJob{jobID: jobID, sessionID: sessionID, session: session, cancel: cancel}
 	s.addActiveJob(active)
 	run := jobRun{
-		jobID:     jobID,
-		sessionID: sessionID,
-		backend:   spec.Backend,
-		store:     store,
-		session:   session,
-		prompt:    spec.Prompt,
-		write:     spec.Write,
-		policy:    spec.Policy,
-		timeout:   timeout,
-		active:    active,
+		jobID:        jobID,
+		sessionID:    sessionID,
+		backend:      spec.Backend,
+		store:        store,
+		session:      session,
+		prompt:       spec.Prompt,
+		write:        spec.Write,
+		policy:       policy.policy,
+		contract:     policy.contract,
+		contractName: policy.name,
+		contractHash: policy.hash,
+		timeout:      timeout,
+		active:       active,
 	}
 	return requestOutcome{
 		result: protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
@@ -725,7 +796,7 @@ func (s *Server) handleJobResult(raw json.RawMessage) requestOutcome {
 	return requestOutcome{result: resultFromRecord(*record)}
 }
 
-func (s *Server) handleJobCancel(ctx context.Context, raw json.RawMessage) requestOutcome {
+func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 	var params protocol.JobCancelParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
@@ -735,21 +806,28 @@ func (s *Server) handleJobCancel(ctx context.Context, raw json.RawMessage) reque
 	}
 	active := s.lookupActiveJob(params.JobID)
 	if active != nil {
+		if active.foreground {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: params.JobID, TurnID: params.JobID})}
+		}
 		active.requestTerminal(engine.StateCanceled)
-		if active.session != nil {
-			_ = active.session.Interrupt(ctx)
-		}
-		if active.cancel != nil {
-			active.cancel()
-		}
 	}
 	store := s.storeForJob(params.JobID)
 	if store == nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: params.JobID})}
 	}
-	record, err := store.Cancel(params.JobID)
+	record, err := store.Load(params.JobID)
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
+	}
+	if record.Foreground {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: params.JobID, TurnID: params.JobID})}
+	}
+	record, err = store.Cancel(params.JobID)
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
+	}
+	if active != nil && active.cancel != nil {
+		active.cancel()
 	}
 	return requestOutcome{result: protocol.JobCancelResult{JobID: record.JobID, State: record.State}}
 }
@@ -794,19 +872,22 @@ func (s *Server) handlePolicyRegister(raw json.RawMessage) requestOutcome {
 }
 
 type jobRun struct {
-	jobID      string
-	sessionID  string
-	backend    string
-	store      *engine.Store
-	session    engine.Session
-	prompt     string
-	write      bool
-	policy     *engine.TurnPolicy
-	timeout    time.Duration
-	foreground bool
-	conn       *connection
-	active     *activeJob
-	onDone     func()
+	jobID        string
+	sessionID    string
+	backend      string
+	store        *engine.Store
+	session      engine.Session
+	prompt       string
+	write        bool
+	policy       *engine.TurnPolicy
+	contract     *engine.ContractSpec
+	contractName string
+	contractHash string
+	timeout      time.Duration
+	foreground   bool
+	conn         *connection
+	active       *activeJob
+	onDone       func()
 }
 
 func (s *Server) runJob(ctx context.Context, run jobRun) {
@@ -841,19 +922,19 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			s.finalizeTerminal(run, engine.StateTimedOut, text, skippedStamp(run.policy, s.registry, engine.SkipTimeout))
+			s.finalizeTerminal(run, engine.StateTimedOut, text, skippedStampForRun(run, s.registry, engine.SkipTimeout))
 			return
 		}
 		if errors.Is(err, context.Canceled) {
 			state = engine.StateInterrupted
 		}
-		s.finalizeTerminal(run, state, text, skippedStamp(run.policy, s.registry, skippedReasonForState(state)))
+		s.finalizeTerminal(run, state, text, skippedStampForRun(run, s.registry, skippedReasonForState(state)))
 		return
 	}
 
-	validation, retryPrompt, compliantState, err := s.validateAttempt(text, run.policy, 1, false)
+	validation, retryPrompt, compliantState, err := s.validateAttempt(text, run, 1, false)
 	if err != nil {
-		s.finalizeTerminal(run, engine.StateFailed, text, skippedStamp(run.policy, s.registry, engine.SkipBackendError))
+		s.finalizeTerminal(run, engine.StateFailed, text, skippedStampForRun(run, s.registry, engine.SkipBackendError))
 		return
 	}
 	if retryPrompt != "" {
@@ -867,12 +948,12 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 			return
 		}
 		if retryErr != nil {
-			s.finalizeTerminal(run, retryState, retryText, skippedStamp(run.policy, s.registry, skippedReasonForState(retryState)))
+			s.finalizeTerminal(run, retryState, retryText, skippedStampForRun(run, s.registry, skippedReasonForState(retryState)))
 			return
 		}
-		retryValidation, _, retryCompliantState, err := s.validateAttempt(retryText, run.policy, 2, true)
+		retryValidation, _, retryCompliantState, err := s.validateAttempt(retryText, run, 2, true)
 		if err != nil {
-			s.finalizeTerminal(run, engine.StateFailed, retryText, skippedStamp(run.policy, s.registry, engine.SkipBackendError))
+			s.finalizeTerminal(run, engine.StateFailed, retryText, skippedStampForRun(run, s.registry, engine.SkipBackendError))
 			return
 		}
 		s.finalizeTerminal(run, retryCompliantState, retryText, retryValidation.Stamp)
@@ -930,10 +1011,7 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			}
 			if run.foreground && run.conn != nil {
 				sequence++
-				wireEvent := event
-				truncated := engine.TruncateEventText([]byte(wireEvent.Text), engine.DefaultEventTextCap)
-				wireEvent.Text = truncated.Text
-				wireEvent.Truncated = wireEvent.Truncated || truncated.Truncated
+				wireEvent := prepareWireEvent(event)
 				_ = run.conn.notify(protocol.NotificationTurnEvent, protocol.TurnEventParams{
 					SessionID: run.sessionID,
 					TurnID:    run.jobID,
@@ -946,16 +1024,23 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 	}
 }
 
-func (s *Server) validateAttempt(text string, policy *engine.TurnPolicy, attempts int, retryUsed bool) (engine.PolicyValidation, string, engine.JobState, error) {
-	if policy == nil || policy.Contract == nil {
+func (s *Server) validateAttempt(text string, run jobRun, attempts int, retryUsed bool) (engine.PolicyValidation, string, engine.JobState, error) {
+	if run.policy == nil || run.policy.Contract == nil {
 		return engine.PolicyValidation{}, "", engine.StateCompleted, nil
 	}
-	if err := validateRetryPolicy(policy.Retry); err != nil {
+	if err := validateRetryPolicy(run.policy.Retry); err != nil {
 		return engine.PolicyValidation{}, "", engine.StateFailed, err
 	}
-	resolved, name, _, err := engine.ResolveContract(*policy.Contract, s.registry)
-	if err != nil {
-		return engine.PolicyValidation{}, "", engine.StateFailed, err
+	var resolved engine.ContractSpec
+	name := run.contractName
+	if run.contract != nil {
+		resolved = *run.contract
+	} else {
+		var err error
+		resolved, name, _, err = engine.ResolveContract(*run.policy.Contract, s.registry)
+		if err != nil {
+			return engine.PolicyValidation{}, "", engine.StateFailed, err
+		}
 	}
 	result, err := engine.ValidateContract(text, resolved)
 	if err != nil {
@@ -963,8 +1048,8 @@ func (s *Server) validateAttempt(text string, policy *engine.TurnPolicy, attempt
 	}
 	stamp := engine.StampValidation(attempts, retryUsed, name, result, s.clock.Now().UTC())
 	validation := engine.PolicyValidation{Stamp: &stamp, ResolvedContract: &resolved}
-	if !result.Valid && !retryUsed && policy.Retry != nil && policy.Retry.Max == 1 {
-		retryPrompt := engine.RenderRetryTemplate(policy.Retry.Template, result.Missing)
+	if !result.Valid && !retryUsed && run.policy.Retry != nil && run.policy.Retry.Max == 1 {
+		retryPrompt := engine.RenderRetryTemplate(run.policy.Retry.Template, result.Missing)
 		return validation, retryPrompt, engine.StateCompletedNoncompliant, nil
 	}
 	if result.Valid {
@@ -993,6 +1078,20 @@ func validateRetryPolicy(retry *engine.RetryPolicy) error {
 	return nil
 }
 
+func (s *Server) resolvePolicy(policy *engine.TurnPolicy) (resolvedPolicy, error) {
+	if policy == nil || policy.Contract == nil {
+		return resolvedPolicy{policy: policy}, nil
+	}
+	if err := validateRetryPolicy(policy.Retry); err != nil {
+		return resolvedPolicy{}, err
+	}
+	resolved, name, hash, err := engine.ResolveContract(*policy.Contract, s.registry)
+	if err != nil {
+		return resolvedPolicy{}, err
+	}
+	return resolvedPolicy{policy: policy, contract: &resolved, name: name, hash: hash}, nil
+}
+
 func (s *Server) finalizeFailure(run jobRun, err error) {
 	_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
 }
@@ -1019,7 +1118,7 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 	var result *engine.ResultInfo
 	if state == engine.StateCompleted || state == engine.StateCompletedNoncompliant {
 		if text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
-			stamp = skippedStamp(run.policy, s.registry, engine.SkipNoFinalMessage)
+			stamp = skippedStampForRun(run, s.registry, engine.SkipNoFinalMessage)
 		}
 		info, err := run.store.WriteResult(run.jobID, []byte(text), s.inlineResultCap)
 		if err != nil {
@@ -1034,10 +1133,9 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 	if stamp != nil {
 		record.Contract = stamp
 	}
-	if run.policy != nil && run.policy.Contract != nil {
-		if resolved, _, _, err := engine.ResolveContract(*run.policy.Contract, s.registry); err == nil {
-			record.ResolvedContract = &resolved
-		}
+	if run.contract != nil {
+		resolved := *run.contract
+		record.ResolvedContract = &resolved
 	}
 	if err := run.store.Save(record); err != nil {
 		return err
@@ -1077,33 +1175,39 @@ func (s *Server) updateBackendProcess(store *engine.Store, jobID string, ref eng
 		return nil
 	}
 	record.BackendChildPID = backendChildPID
-	if record.Worker.PGID == 0 && ref.PGID > 0 {
-		record.Worker.PGID = ref.PGID
+	if ref.PID > 0 || ref.PGID > 0 || ref.StartTime != "" {
+		record.Worker = ref
 	}
 	return store.Save(record)
 }
 
-func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backend string, tags map[string]string, policy *engine.TurnPolicy) error {
+func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backend string, tags map[string]string, policy *engine.TurnPolicy, resolved *engine.ContractSpec, foreground bool) error {
 	logPaths, err := ensureLogFiles(store, jobID)
 	if err != nil {
 		return err
 	}
 	now := s.clock.Now().UTC()
 	ref := s.currentProcessRef()
+	var resolvedCopy *engine.ContractSpec
+	if resolved != nil {
+		copy := *resolved
+		resolvedCopy = &copy
+	}
 	record := &engine.JobRecord{
-		JobID:       jobID,
-		SessionID:   sessionID,
-		Backend:     backend,
-		State:       engine.StateQueued,
-		Tags:        cloneTags(tags),
-		StartedAt:   now,
-		UpdatedAt:   now,
-		HeartbeatAt: now,
-		Lease:       engine.Lease{ExpiresAt: now.Add(defaultLeaseDuration)},
-		Supervisor:  ref,
-		Worker:      ref,
-		LogPaths:    logPaths,
-		Policy:      policy,
+		JobID:            jobID,
+		SessionID:        sessionID,
+		Backend:          backend,
+		Foreground:       foreground,
+		State:            engine.StateQueued,
+		Tags:             cloneTags(tags),
+		StartedAt:        now,
+		UpdatedAt:        now,
+		HeartbeatAt:      now,
+		Lease:            engine.Lease{ExpiresAt: now.Add(defaultLeaseDuration)},
+		Supervisor:       ref,
+		LogPaths:         logPaths,
+		Policy:           policy,
+		ResolvedContract: resolvedCopy,
 	}
 	return store.Save(record)
 }
@@ -1145,10 +1249,13 @@ func (s *Server) storeForCWDLocked(cwd string) (*engine.Store, error) {
 		return store, nil
 	}
 	store, err = engine.NewStore(engine.StoreConfig{
-		Root:      s.stateRoot,
-		CWD:       canon,
-		Clock:     s.clock,
-		Processes: s.processes,
+		Root:          s.stateRoot,
+		CWD:           canon,
+		Clock:         s.clock,
+		Processes:     s.processes,
+		ProcessGroups: s.processGroups,
+		CancelGrace:   s.cancelGrace,
+		CancelWaiter:  s.cancelWaiter,
 	})
 	if err != nil {
 		return nil, err
@@ -1496,11 +1603,19 @@ func applyPrologue(policy *engine.TurnPolicy, prompt string) string {
 	return policy.Prologue + "\n\n" + prompt
 }
 
+func prepareWireEvent(event engine.Event) engine.Event {
+	wireEvent := event
+	truncated := engine.TruncateEventText([]byte(wireEvent.Text), engine.DefaultEventTextCap)
+	wireEvent.Text = truncated.Text
+	wireEvent.Truncated = wireEvent.Truncated || truncated.Truncated
+	wireEvent.RawText = ""
+	wireEvent.Metadata = engine.SanitizeEventMetadata(wireEvent.Metadata)
+	return wireEvent
+}
+
 func authoritativeText(event engine.Event) string {
-	if event.Metadata != nil {
-		if s, ok := event.Metadata["agentbusRawText"].(string); ok {
-			return s
-		}
+	if event.RawText != "" {
+		return event.RawText
 	}
 	return event.Text
 }
@@ -1533,6 +1648,28 @@ func skippedStamp(policy *engine.TurnPolicy, registry *engine.PolicyRegistry, re
 	_, name, hash, err := engine.ResolveContract(*policy.Contract, registry)
 	if err != nil {
 		return nil
+	}
+	stamp := engine.SkippedContractStamp(reason, 1, false, name, hash)
+	now := time.Now().UTC()
+	stamp.ValidatedAt = now
+	return &stamp
+}
+
+func skippedStampForRun(run jobRun, registry *engine.PolicyRegistry, reason engine.SkippedReason) *engine.ContractStamp {
+	if run.policy == nil || run.policy.Contract == nil {
+		return nil
+	}
+	name := run.contractName
+	hash := run.contractHash
+	if hash == "" && run.contract != nil {
+		computed, err := engine.ContractSHA256(*run.contract)
+		if err != nil {
+			return nil
+		}
+		hash = computed
+	}
+	if hash == "" {
+		return skippedStamp(run.policy, registry, reason)
 	}
 	stamp := engine.SkippedContractStamp(reason, 1, false, name, hash)
 	now := time.Now().UTC()

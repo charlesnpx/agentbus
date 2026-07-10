@@ -57,6 +57,7 @@ type JobRecord struct {
 	JobID            string            `json:"jobId"`
 	SessionID        string            `json:"sessionId,omitempty"`
 	Backend          string            `json:"backend,omitempty"`
+	Foreground       bool              `json:"foreground,omitempty"`
 	State            JobState          `json:"state"`
 	Tags             map[string]string `json:"tags,omitempty"`
 	CreatedAt        time.Time         `json:"createdAt"`
@@ -119,7 +120,7 @@ func LegalTransition(from, to JobState, retryCount int) bool {
 	}
 	switch from {
 	case StateQueued:
-		return to == StateStarting || to == StateCanceled || to == StateOrphaned
+		return to == StateStarting || to == StateInterrupted || to == StateCanceled || to == StateOrphaned
 	case StateStarting:
 		return to == StateRunning || to == StateFailed || to == StateTimedOut || to == StateInterrupted || to == StateCanceled || to == StateOrphaned
 	case StateRunning:

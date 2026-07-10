@@ -258,7 +258,7 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, s.backend.binary(), args...)
-	cmd.Cancel = func() error { return terminateProcessGroup(cmd, 500*time.Millisecond) }
+	cmd.Cancel = func() error { return terminateProcessGroup(cmd, engine.DefaultCancelGrace) }
 	cmd.WaitDelay = 200 * time.Millisecond
 	if s.opts.CWD != "" {
 		cmd.Dir = s.opts.CWD
@@ -365,7 +365,7 @@ func (s *Session) Interrupt(ctx context.Context) error {
 		return nil
 	}
 	done := make(chan error, 1)
-	go func() { done <- terminateProcessGroup(cmd, 500*time.Millisecond) }()
+	go func() { done <- terminateProcessGroup(cmd, engine.DefaultCancelGrace) }()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -422,12 +422,11 @@ func processRefForCmd(cmd *exec.Cmd) engine.ProcessRef {
 }
 
 func capEvent(ev engine.Event) engine.Event {
-	if ev.Metadata != nil && ev.Text != "" {
-		ev.Metadata["agentbusRawText"] = ev.Text
-	}
+	ev.RawText = ev.Text
 	text := engine.TruncateEventText([]byte(ev.Text), engine.DefaultEventTextCap)
 	ev.Text = text.Text
 	ev.Truncated = ev.Truncated || text.Truncated
+	ev.Metadata = engine.SanitizeEventMetadata(ev.Metadata)
 	return ev
 }
 
@@ -442,7 +441,9 @@ func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func terminateProcessGroup(cmd *exec.Cmd, grace time.Duration) error {
+var terminateProcessGroup = terminateProcessGroupImpl
+
+func terminateProcessGroupImpl(cmd *exec.Cmd, grace time.Duration) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
@@ -456,9 +457,24 @@ func terminateProcessGroup(cmd *exec.Cmd, grace time.Duration) error {
 		pgid = pid
 	}
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
-	time.Sleep(grace)
+	waitForProcessGroupExit(pgid, grace)
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
 	return nil
+}
+
+func waitForProcessGroupExit(pgid int, grace time.Duration) {
+	if grace <= 0 {
+		return
+	}
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(-pgid, 0); err != nil {
+			if err == syscall.ESRCH {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func commandOutput(ctx context.Context, binary string, arg ...string) (string, error) {

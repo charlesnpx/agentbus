@@ -241,10 +241,22 @@ func (s *Store) List() ([]JobRecord, error) {
 	return out, nil
 }
 
-// Cancel transitions a queued or active job record to canceled.
+// Interrupt transitions a queued or active foreground turn record to interrupted.
+func (s *Store) Interrupt(jobID string) (*JobRecord, error) {
+	return s.terminate(jobID, StateInterrupted)
+}
+
+// Cancel transitions a queued or active background job record to canceled.
 func (s *Store) Cancel(jobID string) (*JobRecord, error) {
+	return s.terminate(jobID, StateCanceled)
+}
+
+func (s *Store) terminate(jobID string, state JobState) (*JobRecord, error) {
 	if err := validateJobID(jobID); err != nil {
 		return nil, err
+	}
+	if state != StateInterrupted && state != StateCanceled {
+		return nil, fmt.Errorf("unsupported terminal state %q", state)
 	}
 	path, err := s.jobPath(jobID)
 	if err != nil {
@@ -265,7 +277,7 @@ func (s *Store) Cancel(jobID string) (*JobRecord, error) {
 		if err := s.cancelLiveProcessGroup(record); err != nil {
 			return err
 		}
-		if err := record.Transition(StateCanceled, now); err != nil {
+		if err := record.Transition(state, now); err != nil {
 			return err
 		}
 		if err := s.saveIfUnchanged(record, path, original); err != nil {

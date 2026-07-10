@@ -299,7 +299,12 @@ func (defaultStarter) StartDaemon(ctx context.Context, opts StartOptions) (int, 
 			}
 		}
 	}
-	cmd := exec.CommandContext(ctx, command, "serve", "--foreground")
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
+	}
+	cmd := exec.Command(command, "serve", "--foreground")
 	cmd.Env = append(os.Environ(), "AGENTBUS_STATE_ROOT="+opts.StateRoot)
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {

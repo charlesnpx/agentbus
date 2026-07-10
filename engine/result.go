@@ -3,6 +3,7 @@ package engine
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 )
@@ -51,6 +52,76 @@ func TruncateEventText(raw []byte, capBytes int) EventText {
 		return EventText{Text: string(raw)}
 	}
 	return EventText{Text: string(raw[:capBytes]), Truncated: true}
+}
+
+const (
+	eventMetadataStringCap     = 4 * 1024
+	eventMetadataKeyCap        = 128
+	eventMetadataMaxMapEntries = 32
+	eventMetadataMaxArrayItems = 32
+	eventMetadataMaxDepth      = 4
+)
+
+// SanitizeEventMetadata returns a JSON-safe bounded copy of backend metadata.
+func SanitizeEventMetadata(meta map[string]any) map[string]any {
+	if len(meta) == 0 {
+		return nil
+	}
+	sanitized, _ := sanitizeEventMetadataValue(meta, 0).(map[string]any)
+	if len(sanitized) == 0 {
+		return nil
+	}
+	raw, err := json.Marshal(sanitized)
+	if err != nil || len(raw) > DefaultEventTextCap {
+		return map[string]any{"truncated": true}
+	}
+	return sanitized
+}
+
+func sanitizeEventMetadataValue(v any, depth int) any {
+	if depth >= eventMetadataMaxDepth {
+		return "[agentbus: metadata truncated]"
+	}
+	switch x := v.(type) {
+	case string:
+		text := TruncateEventText([]byte(x), eventMetadataStringCap)
+		if text.Truncated {
+			return text.Text + "\n[agentbus: metadata truncated]"
+		}
+		return x
+	case map[string]any:
+		out := make(map[string]any, min(len(x), eventMetadataMaxMapEntries))
+		n := 0
+		for key, value := range x {
+			if key == "agentbusRawText" {
+				continue
+			}
+			if n >= eventMetadataMaxMapEntries {
+				out["truncated"] = true
+				break
+			}
+			out[capEventMetadataString(key, eventMetadataKeyCap)] = sanitizeEventMetadataValue(value, depth+1)
+			n++
+		}
+		return out
+	case []any:
+		limit := min(len(x), eventMetadataMaxArrayItems)
+		out := make([]any, 0, limit+1)
+		for i := 0; i < limit; i++ {
+			out = append(out, sanitizeEventMetadataValue(x[i], depth+1))
+		}
+		if len(x) > limit {
+			out = append(out, "[agentbus: metadata truncated]")
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func capEventMetadataString(s string, capBytes int) string {
+	text := TruncateEventText([]byte(s), capBytes)
+	return text.Text
 }
 
 // NewCappedLogWriter opens a protocol-mode capped log file.
