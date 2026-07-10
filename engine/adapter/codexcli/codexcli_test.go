@@ -96,14 +96,14 @@ func TestCodexPreflightAndFailures(t *testing.T) {
 	}
 }
 
-func TestCodexDiscoveryParsesFakeHelp(t *testing.T) {
+func TestCodexDiscoveryDoesNotScrapeHelpText(t *testing.T) {
 	fake := fakeCodex(t)
-	script := "#!/bin/sh\nif [ \"$1\" = --help ]; then echo 'Models available: [gpt-5.4, gpt-5.5]'; echo 'Reasoning effort possible values: [low, high, xhigh]'; exit 0; fi\nexec /bin/false\n"
+	script := "#!/bin/sh\nif [ \"$1\" = --help ]; then echo \"-m, --model <MODEL>  Model the agent should use\"; echo \"possible values: c, disk-full-read-access, o3\"; exit 0; fi\nexec /bin/false\n"
 	if err := os.WriteFile(fake.bin, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(engine.ModelDiscoverer).DiscoverModels(context.Background())
-	if err != nil || discovery == nil || strings.Join(discovery.Models, ",") != "gpt-5.4,gpt-5.5" || strings.Join(discovery.Efforts, ",") != "high,low,xhigh" {
+	if discovery != nil || err == nil || !strings.Contains(err.Error(), "no catalog exposed") {
 		t.Fatalf("discovery=%+v err=%v", discovery, err)
 	}
 }
@@ -113,7 +113,7 @@ func TestCodexDiscoveryReportsParserMiss(t *testing.T) {
 	if err := os.WriteFile(path, []byte("#!/bin/sh\necho generic help\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := discoverModels(context.Background(), path); err == nil || !strings.Contains(err.Error(), "parser found no model or effort") {
+	if discovery, err := discoverModels(context.Background(), path); discovery != nil || err == nil || !strings.Contains(err.Error(), "no catalog exposed") {
 		t.Fatalf("err=%v", err)
 	}
 }

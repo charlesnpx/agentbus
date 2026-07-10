@@ -83,7 +83,6 @@ func expectedClaudeReadOnlyArgv(resumeID string) string {
 		"--output-format",
 		"stream-json",
 		"--verbose",
-		"--bare",
 		"--strict-mcp-config",
 		"--mcp-config",
 		`{"mcpServers":{}}`,
