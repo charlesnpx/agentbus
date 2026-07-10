@@ -134,6 +134,8 @@ func LegalTransition(from, to JobState, retryCount int) bool {
 		return to == StateRunning || to == StateCompleted || to == StateCompletedNoncompliant || to == StateFailed || to == StateTimedOut || to == StateInterrupted || to == StateCanceled || to == StateOrphaned
 	case StateOrphaned:
 		return to == StateCompleted || to == StateCompletedNoncompliant || to == StateReaped
+	case StateReaped:
+		return to == StateCompleted || to == StateCompletedNoncompliant
 	default:
 		return false
 	}

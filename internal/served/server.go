@@ -947,25 +947,27 @@ func (s *Server) handlePolicyRegister(raw json.RawMessage) requestOutcome {
 }
 
 type jobRun struct {
-	jobID        string
-	sessionID    string
-	backend      string
-	store        *engine.Store
-	session      engine.Session
-	prompt       string
-	write        bool
-	policy       *engine.TurnPolicy
-	contract     *engine.ContractSpec
-	contractName string
-	contractHash string
-	timeout      time.Duration
-	foreground   bool
-	conn         *connection
-	active       *activeJob
-	onDone       func()
+	jobID                   string
+	sessionID               string
+	backend                 string
+	store                   *engine.Store
+	session                 engine.Session
+	prompt                  string
+	write                   bool
+	policy                  *engine.TurnPolicy
+	contract                *engine.ContractSpec
+	contractName            string
+	contractHash            string
+	timeout                 time.Duration
+	foreground              bool
+	conn                    *connection
+	active                  *activeJob
+	onDone                  func()
+	authoritativeCompletion bool
 }
 
 func (s *Server) runJob(ctx context.Context, run jobRun) {
+	run.authoritativeCompletion = true
 	defer s.removeActiveJob(run.jobID)
 	defer func() {
 		if run.onDone != nil {
@@ -1221,10 +1223,11 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		backendSessionID = run.session.ID()
 	}
 	record, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
-		if engine.IsTerminal(record.State) {
+		salvageReaped := run.authoritativeCompletion && record.State == engine.StateReaped && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant)
+		if engine.IsTerminal(record.State) && !salvageReaped {
 			return false, nil
 		}
-		salvaged := record.State == engine.StateOrphaned && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant)
+		salvaged := (record.State == engine.StateOrphaned || salvageReaped) && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant)
 		var result *engine.ResultInfo
 		if state == engine.StateCompleted || state == engine.StateCompletedNoncompliant {
 			if text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
@@ -1236,7 +1239,11 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 			}
 			result = &info
 		}
-		if err := transitionOrSet(record, state, s.clock.Now().UTC()); err != nil {
+		if salvageReaped {
+			if err := record.Transition(state, s.clock.Now().UTC()); err != nil {
+				return false, err
+			}
+		} else if err := transitionOrSet(record, state, s.clock.Now().UTC()); err != nil {
 			return false, err
 		}
 		record.Result = result
@@ -1251,7 +1258,7 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 			record.BackendSessionID = backendSessionID
 		}
 		if salvaged {
-			record.Warnings = append(record.Warnings, "late-finalization: recovered completed result from orphaned job")
+			record.Warnings = append(record.Warnings, "late-finalization: recovered authoritative completed result after orphan reconciliation")
 		}
 		return true, nil
 	})
@@ -1413,6 +1420,7 @@ func (s *Server) storeForCWDLocked(cwd string) (*engine.Store, error) {
 		ProcessGroups: s.processGroups,
 		CancelGrace:   s.cancelGrace,
 		CancelWaiter:  s.cancelWaiter,
+		LeaseDuration: s.leaseDuration,
 	})
 	if err != nil {
 		return nil, err
@@ -1565,6 +1573,7 @@ func (s *Server) storeConfig() engine.StoreConfig {
 		ProcessGroups: s.processGroups,
 		CancelGrace:   s.cancelGrace,
 		CancelWaiter:  s.cancelWaiter,
+		LeaseDuration: s.leaseDuration,
 	}
 }
 

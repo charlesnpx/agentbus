@@ -734,7 +734,7 @@ func TestFinalizeCompletedSalvagesOrphanedJob(t *testing.T) {
 	}
 }
 
-func TestFinalizeCompletedDoesNotSalvageReapedJob(t *testing.T) {
+func TestFinalizeCompletedSalvagesReapedJobOnlyWithAuthoritativeCompletion(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
 	server, _, cwd := newUnstartedTestServer(t, backend)
@@ -753,7 +753,7 @@ func TestFinalizeCompletedDoesNotSalvageReapedJob(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := server.finalizeTerminal(jobRun{jobID: jobID, store: store}, engine.StateCompleted, "lost", nil); err != nil {
+	if err := server.finalizeTerminal(jobRun{jobID: jobID, store: store}, engine.StateCompleted, "ignored", nil); err != nil {
 		t.Fatal(err)
 	}
 	record, err := store.Load(jobID)
@@ -762,6 +762,73 @@ func TestFinalizeCompletedDoesNotSalvageReapedJob(t *testing.T) {
 	}
 	if record.State != engine.StateReaped || record.Result != nil {
 		t.Fatalf("reaped record changed = %+v", record)
+	}
+	if err := server.finalizeTerminal(jobRun{jobID: jobID, store: store, authoritativeCompletion: true}, engine.StateCompleted, "salvaged", nil); err != nil {
+		t.Fatal(err)
+	}
+	record, err = store.Load(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != engine.StateCompleted || record.Result == nil || !strings.Contains(record.Result.Text, "salvaged") || len(record.Warnings) != 1 || !strings.Contains(record.Warnings[0], "authoritative") {
+		t.Fatalf("authoritative completion was not salvaged = %+v", record)
+	}
+}
+
+func TestBlockedUpdateRacesHeartbeatReaperAndFinalizer(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	store, err := engine.NewStore(engine.StoreConfig{
+		Root: filepath.Join(t.TempDir(), "state"), CWD: t.TempDir(), Clock: engine.ClockFunc(func() time.Time { return base }),
+		Processes: fakeProcessTable{}, LeaseDuration: time.Minute, OrphanGrace: time.Minute,
+		BeforeUpdate: func(string) { once.Do(func() { close(blocked); <-release }) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := &engine.JobRecord{JobID: "job_blocked_update", State: engine.StateRunning, UpdatedAt: base, Lease: engine.Lease{ExpiresAt: base.Add(time.Minute)}}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{clock: engine.ClockFunc(func() time.Time { return base }), inlineResultCap: 1024}
+	finalized := make(chan error, 1)
+	go func() {
+		finalized <- server.finalizeTerminal(jobRun{jobID: record.JobID, store: store, authoritativeCompletion: true}, engine.StateCompleted, "done", nil)
+	}()
+	<-blocked
+	heartbeatDone := make(chan error, 1)
+	go func() {
+		_, err := store.TouchHeartbeat(record.JobID, base.Add(time.Second), time.Minute)
+		heartbeatDone <- err
+	}()
+	select {
+	case err := <-heartbeatDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat blocked behind Store.Update")
+	}
+	reaped := make(chan error, 1)
+	go func() { reaped <- store.Reap() }()
+	close(release)
+	if err := <-finalized; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-reaped; err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != engine.StateCompleted || got.Result == nil {
+		t.Fatalf("final record = %+v", got)
+	}
+	if _, err := os.Stat(filepath.Join(store.Layout().Jobs, record.JobID+".heartbeat")); !os.IsNotExist(err) {
+		t.Fatalf("heartbeat sidecar remains: %v", err)
 	}
 }
 
@@ -966,13 +1033,17 @@ func TestIdleShutdownWaitsForActiveJobs(t *testing.T) {
 
 func TestStartReaperRecoversCrashedJob(t *testing.T) {
 	t.Parallel()
+	base := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	var clockNanos atomic.Int64
+	clockNanos.Store(base.UnixNano())
+	clock := engine.ClockFunc(func() time.Time { return time.Unix(0, clockNanos.Load()).UTC() })
 	root := shortTempDir(t)
 	jobCWD := shortTempDir(t)
 	daemonCWD := shortTempDir(t)
 	store, err := engine.NewStore(engine.StoreConfig{
 		Root:      root,
 		CWD:       jobCWD,
-		Clock:     engine.ClockFunc(time.Now),
+		Clock:     clock,
 		Processes: fakeProcessTable{},
 	})
 	if err != nil {
@@ -984,12 +1055,12 @@ func TestStartReaperRecoversCrashedJob(t *testing.T) {
 		Backend:   "fake",
 		State:     engine.StateRunning,
 		Worker:    engine.ProcessRef{PID: 999999, StartTime: "old"},
-		Lease:     engine.Lease{ExpiresAt: time.Now().Add(time.Minute)},
+		Lease:     engine.Lease{ExpiresAt: base.Add(time.Minute)},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	backend := newFakeBackend("fake")
-	h := startTestServerWithRoot(t, root, daemonCWD, backend, Config{IdleTimeout: -1, ProcessTable: fakeProcessTable{}})
+	h := startTestServerWithRoot(t, root, daemonCWD, backend, Config{IdleTimeout: -1, ProcessTable: fakeProcessTable{}, Clock: clock})
 	conn := dialRaw(t, h.socketPath)
 	defer conn.Close()
 	r := bufio.NewReader(conn)
@@ -997,8 +1068,14 @@ func TestStartReaperRecoversCrashedJob(t *testing.T) {
 	status := rpc(t, conn, r, "2", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: "job_crashed"})
 	var out protocol.JobStatusResult
 	decodeResult(t, status, &out)
-	if len(out.Jobs) != 1 || out.Jobs[0].State != engine.StateReaped {
+	if len(out.Jobs) != 1 || out.Jobs[0].State != engine.StateOrphaned {
 		t.Fatalf("status = %+v", out)
+	}
+	clockNanos.Store(base.Add(engine.DefaultLeaseDuration).UnixNano())
+	status = rpc(t, conn, r, "3", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: "job_crashed"})
+	decodeResult(t, status, &out)
+	if len(out.Jobs) != 1 || out.Jobs[0].State != engine.StateReaped {
+		t.Fatalf("status after orphan grace = %+v", out)
 	}
 }
 
