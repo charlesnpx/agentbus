@@ -87,6 +87,7 @@ type BackendSetupProbe struct {
 	DiscoveredModels  []string `json:"discoveredModels,omitempty"`
 	DiscoveredEfforts []string `json:"discoveredEfforts,omitempty"`
 	DiscoverySource   string   `json:"discoverySource,omitempty"`
+	DiscoveryWarnings []string `json:"discoveryWarnings,omitempty"`
 }
 
 type ModelDiscovery struct {

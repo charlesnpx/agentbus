@@ -334,7 +334,7 @@ func commandEnv(t *testing.T, overrides map[string]string) []string {
 
 func privateTmpDir(t *testing.T, pattern string) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/private/tmp", pattern)
+	dir, err := os.MkdirTemp(os.TempDir(), pattern)
 	if err != nil {
 		t.Fatal(err)
 	}

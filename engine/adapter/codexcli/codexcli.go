@@ -51,7 +51,7 @@ func discoverModels(ctx context.Context, binary string) (*engine.ModelDiscovery,
 	models := helpValues(string(out), `(?i)models?\s*(?:available|possible values|choices)?\s*[:=]\s*\[?([^\]\n]+)`)
 	efforts := helpValues(string(out), `(?i)(?:effort|reasoning effort)\s*(?:available|possible values|choices)?\s*[:=]\s*\[?([^\]\n]+)`)
 	if len(models) == 0 && len(efforts) == 0 {
-		return nil, nil
+		return nil, fmt.Errorf("codex --help model discovery parser found no model or effort listings")
 	}
 	return &engine.ModelDiscovery{Models: models, Efforts: efforts, Source: "codex --help (listing syntax when exposed)"}, nil
 }

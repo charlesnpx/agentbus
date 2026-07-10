@@ -110,7 +110,7 @@ func discoverModels(ctx context.Context, binary string) (*engine.ModelDiscovery,
 	efforts := valuesFromGroup(text, `(?m)--effort[^\n]*\n?[^\n]*\(([^)]+)\)`)
 	models := valuesFromGroup(text, `(?m)--model[^\n]*\n(?:[^\n]*\n){0,4}?[^\n]*\((?:e\.g\.\s*)?([^)]+)\)`)
 	if len(models) == 0 && len(efforts) == 0 {
-		return nil, nil
+		return nil, fmt.Errorf("claude --help model discovery parser found no model or effort listings")
 	}
 	return &engine.ModelDiscovery{Models: models, Efforts: efforts, Source: "claude --help"}, nil
 }

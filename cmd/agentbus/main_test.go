@@ -127,6 +127,22 @@ func TestSetupCachesProbeAndReportsJSON(t *testing.T) {
 	}
 }
 
+func TestSetupReportsDiscoveryWarnings(t *testing.T) {
+	t.Parallel()
+	a := testApp(t)
+	probe := engine.BackendSetupProbe{Backend: "claude", BinaryPath: "/tmp/bin/claude", Version: "2.1.205", StreamSchema: "claude-stream-json-v1", JSONEventsProbed: true, DiscoveryWarnings: []string{"claude model discovery failed: claude --help model discovery parser found no model or effort listings"}}
+	a.backends = []backendSpec{{name: "claude", backend: fakeBackend{name: "claude", health: engine.Health{Backend: "claude", BinaryPath: probe.BinaryPath, Version: probe.Version, StreamSchema: probe.StreamSchema}}, probe: fakeProbe{probe: probe}}}
+	code, stdout, stderr := runTestCLI(t, a, []string{"setup", "--json"}, "")
+	if code != 0 {
+		t.Fatalf("setup exit=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	var output setupOutput
+	decodeJSON(t, stdout, &output)
+	if len(output.Backends) != 1 || len(output.Backends[0].Warnings) != 1 || !strings.Contains(output.Backends[0].Warnings[0], "claude --help") {
+		t.Fatalf("output=%+v", output)
+	}
+}
+
 func TestSetupDriftDetectionFailsLoudly(t *testing.T) {
 	t.Parallel()
 	a := testApp(t)

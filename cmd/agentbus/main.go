@@ -553,6 +553,7 @@ func setupReportFromProbe(probe engine.BackendSetupProbe) setupBackendReport {
 		SandboxModes:      append([]string(nil), probe.SandboxModes...),
 		DiscoveredModels:  append([]string(nil), probe.DiscoveredModels...),
 		DiscoveredEfforts: append([]string(nil), probe.DiscoveredEfforts...),
+		Warnings:          append([]string(nil), probe.DiscoveryWarnings...),
 		JSONEventsProbe: setupJSONEventsProbe{
 			Ran:          probe.JSONEventsProbed,
 			Version:      probe.Version,

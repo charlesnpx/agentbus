@@ -56,6 +56,27 @@ func TestClaudeProfilesAndParsing(t *testing.T) {
 	assertLog(t, fake.stdin, "repair")
 }
 
+func TestClaudeDiscoveryReportsHelpFailures(t *testing.T) {
+	t.Run("command error", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "claude")
+		if err := os.WriteFile(path, []byte("#!/bin/sh\necho help exploded >&2\nexit 7\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := discoverModels(context.Background(), path); err == nil || !strings.Contains(err.Error(), "exit status 7") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("parser miss", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "claude")
+		if err := os.WriteFile(path, []byte("#!/bin/sh\necho generic help\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := discoverModels(context.Background(), path); err == nil || !strings.Contains(err.Error(), "parser found no model or effort") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+}
+
 func expectedClaudeReadOnlyArgv(resumeID string) string {
 	args := []string{
 		"--print",
@@ -212,7 +233,7 @@ esac
 
 func writeCache(t *testing.T, path, backend, bin, version, schema string) {
 	t.Helper()
-	raw, err := json.Marshal(engine.SetupProbeCache{Backends: []engine.BackendSetupProbe{{
+	raw, err := json.Marshal(engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{
 		Backend:          backend,
 		BinaryPath:       bin,
 		Version:          version,

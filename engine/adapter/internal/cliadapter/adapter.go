@@ -110,14 +110,11 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	session, err := b.Start(probeCtx, engine.SessionOpts{
+	session := &Session{backend: b, opts: engine.SessionOpts{
 		CWD:     cwd,
 		Write:   false,
 		Timeout: 2 * time.Minute,
-	})
-	if err != nil {
-		return engine.BackendSetupProbe{}, err
-	}
+	}, suppressValidationWarning: true}
 	events, err := session.Turn(probeCtx, engine.TurnInput{
 		Prompt:  "Reply with exactly: OK\n",
 		Write:   false,
@@ -160,25 +157,29 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 		probe.DiscoveredModels = discovered.Models
 		probe.DiscoveredEfforts = discovered.Efforts
 		probe.DiscoverySource = discovered.Source
+	} else if discoverErr != nil {
+		probe.DiscoveryWarnings = append(probe.DiscoveryWarnings, fmt.Sprintf("%s model discovery failed: %v", b.NameValue, discoverErr))
 	}
 	return probe, nil
 }
 
 func (b *Backend) Start(ctx context.Context, opts engine.SessionOpts) (engine.Session, error) {
-	if err := b.validateOptions(opts); err != nil {
+	warning, err := b.validateOptions(ctx, opts)
+	if err != nil {
 		return nil, err
 	}
-	return &Session{backend: b, opts: opts}, nil
+	return &Session{backend: b, opts: opts, validationWarning: warning}, nil
 }
 
 func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts) (engine.Session, error) {
 	if strings.TrimSpace(id) == "" {
 		return nil, errors.New("resume session id is required")
 	}
-	if err := b.validateOptions(opts); err != nil {
+	warning, err := b.validateOptions(ctx, opts)
+	if err != nil {
 		return nil, err
 	}
-	return &Session{backend: b, id: id, opts: opts}, nil
+	return &Session{backend: b, id: id, opts: opts, validationWarning: warning}, nil
 }
 
 func (b *Backend) binary() string {
@@ -202,25 +203,34 @@ func (b *Backend) normalizeVersion(s string) string {
 	return strings.TrimPrefix(s, "v")
 }
 
-func (b *Backend) validateOptions(opts engine.SessionOpts) error {
-	models, efforts := b.validationSets()
+func (b *Backend) validateOptions(ctx context.Context, opts engine.SessionOpts) (string, error) {
+	models, efforts, warning := b.validationSets(ctx)
 	if opts.Model != "" && len(models) > 0 {
 		if _, ok := models[opts.Model]; !ok {
-			return fmt.Errorf("unsupported model %q for %s", opts.Model, b.NameValue)
+			return warning, fmt.Errorf("unsupported model %q for %s", opts.Model, b.NameValue)
 		}
 	}
 	if opts.Effort != "" && len(efforts) > 0 {
 		if _, ok := efforts[opts.Effort]; !ok {
-			return fmt.Errorf("unsupported effort %q for %s", opts.Effort, b.NameValue)
+			return warning, fmt.Errorf("unsupported effort %q for %s", opts.Effort, b.NameValue)
 		}
 	}
-	return nil
+	return warning, nil
 }
 
-func (b *Backend) validationSets() (map[string]struct{}, map[string]struct{}) {
+func (b *Backend) validationSets(ctx context.Context) (map[string]struct{}, map[string]struct{}, string) {
 	cache, cacheErr := b.readCache()
 	probe, err := b.cachedProbe()
 	if cacheErr == nil && cache.Version == engine.SetupProbeCacheVersion && err == nil {
+		binary, binaryErr := exec.LookPath(b.binary())
+		version := ""
+		var versionErr error
+		if binaryErr == nil {
+			version, versionErr = commandOutput(ctx, binary, "--version")
+		}
+		if binaryErr != nil || versionErr != nil || probe.BinaryPath != binary || probe.Version != b.normalizeVersion(version) {
+			return b.AllowedModels, b.AllowedEfforts, "model discovery cache is stale; using static known-good validation lists"
+		}
 		models := b.AllowedModels
 		efforts := b.AllowedEfforts
 		if len(probe.DiscoveredModels) > 0 {
@@ -229,9 +239,12 @@ func (b *Backend) validationSets() (map[string]struct{}, map[string]struct{}) {
 		if len(probe.DiscoveredEfforts) > 0 {
 			efforts = StringSet(probe.DiscoveredEfforts...)
 		}
-		return models, efforts
+		return models, efforts, ""
 	}
-	return b.AllowedModels, b.AllowedEfforts
+	if cacheErr == nil {
+		return b.AllowedModels, b.AllowedEfforts, "model discovery cache is stale; using static known-good validation lists"
+	}
+	return b.AllowedModels, b.AllowedEfforts, ""
 }
 
 func (b *Backend) discoveryWarning(probe engine.BackendSetupProbe, version string) string {
@@ -273,11 +286,13 @@ func (b *Backend) cachedProbe() (engine.BackendSetupProbe, error) {
 }
 
 type Session struct {
-	backend *Backend
-	id      string
-	opts    engine.SessionOpts
-	mu      sync.Mutex
-	active  *exec.Cmd
+	backend                   *Backend
+	id                        string
+	opts                      engine.SessionOpts
+	validationWarning         string
+	suppressValidationWarning bool
+	mu                        sync.Mutex
+	active                    *exec.Cmd
 }
 
 func (s *Session) ID() string {
@@ -287,8 +302,15 @@ func (s *Session) ID() string {
 }
 
 func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
-	if err := s.backend.validateOptions(s.opts); err != nil {
+	warningText, err := s.backend.validateOptions(ctx, s.opts)
+	if err != nil {
 		return nil, err
+	}
+	if warningText == "" {
+		warningText = s.validationWarning
+	}
+	if s.suppressValidationWarning {
+		warningText = ""
 	}
 	s.mu.Lock()
 	if s.active != nil {
@@ -373,6 +395,9 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 	events := make(chan engine.Event, 16)
 	go func() {
 		defer close(events)
+		if warningText != "" {
+			events <- warning(warningText)
+		}
 		defer func() {
 			if stdoutLog != nil {
 				_ = stdoutLog.Close()
