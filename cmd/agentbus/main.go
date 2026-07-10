@@ -697,20 +697,22 @@ func cloneTags(in map[string]string) map[string]string {
 
 func statusFromRecord(record engine.JobRecord) jobStatus {
 	return jobStatus{
-		JobID:           record.JobID,
-		SessionID:       record.SessionID,
-		Backend:         record.Backend,
-		State:           record.State,
-		Tags:            cloneTags(record.Tags),
-		CreatedAt:       timePtr(record.CreatedAt),
-		StartedAt:       timePtr(record.StartedAt),
-		UpdatedAt:       timePtr(record.UpdatedAt),
-		HeartbeatAt:     timePtr(record.HeartbeatAt),
-		Lease:           leasePtr(record.Lease),
-		WorkerPID:       record.Worker.PID,
-		BackendChildPID: record.BackendChildPID,
-		StatePath:       record.StatePath,
-		LogPaths:        record.LogPaths,
+		JobID:                 record.JobID,
+		SessionID:             record.SessionID,
+		Backend:               record.Backend,
+		State:                 record.State,
+		Tags:                  cloneTags(record.Tags),
+		CreatedAt:             timePtr(record.CreatedAt),
+		StartedAt:             timePtr(record.StartedAt),
+		UpdatedAt:             timePtr(record.UpdatedAt),
+		HeartbeatAt:           timePtr(record.HeartbeatAt),
+		Lease:                 leasePtr(record.Lease),
+		WorkerPID:             record.Worker.PID,
+		WorkerStartTime:       record.Worker.StartTime,
+		BackendChildPID:       record.BackendChildPID,
+		BackendChildStartTime: record.BackendChildStartTime,
+		StatePath:             record.StatePath,
+		LogPaths:              record.LogPaths,
 	}
 }
 
@@ -916,20 +918,22 @@ type statusOutput struct {
 }
 
 type jobStatus struct {
-	JobID           string            `json:"jobId"`
-	SessionID       string            `json:"sessionId,omitempty"`
-	Backend         string            `json:"backend,omitempty"`
-	State           engine.JobState   `json:"state"`
-	Tags            map[string]string `json:"tags,omitempty"`
-	CreatedAt       *time.Time        `json:"createdAt,omitempty"`
-	StartedAt       *time.Time        `json:"startedAt,omitempty"`
-	UpdatedAt       *time.Time        `json:"updatedAt,omitempty"`
-	HeartbeatAt     *time.Time        `json:"heartbeatAt,omitempty"`
-	Lease           *engine.Lease     `json:"lease,omitempty"`
-	WorkerPID       int               `json:"workerPid,omitempty"`
-	BackendChildPID int               `json:"backendChildPid,omitempty"`
-	StatePath       string            `json:"statePath,omitempty"`
-	LogPaths        engine.LogPaths   `json:"logPaths,omitempty"`
+	JobID                 string            `json:"jobId"`
+	SessionID             string            `json:"sessionId,omitempty"`
+	Backend               string            `json:"backend,omitempty"`
+	State                 engine.JobState   `json:"state"`
+	Tags                  map[string]string `json:"tags,omitempty"`
+	CreatedAt             *time.Time        `json:"createdAt,omitempty"`
+	StartedAt             *time.Time        `json:"startedAt,omitempty"`
+	UpdatedAt             *time.Time        `json:"updatedAt,omitempty"`
+	HeartbeatAt           *time.Time        `json:"heartbeatAt,omitempty"`
+	Lease                 *engine.Lease     `json:"lease,omitempty"`
+	WorkerPID             int               `json:"workerPid,omitempty"`
+	WorkerStartTime       string            `json:"workerStartTime,omitempty"`
+	BackendChildPID       int               `json:"backendChildPid,omitempty"`
+	BackendChildStartTime string            `json:"backendChildStartTime,omitempty"`
+	StatePath             string            `json:"statePath,omitempty"`
+	LogPaths              engine.LogPaths   `json:"logPaths,omitempty"`
 }
 
 type jobResult struct {

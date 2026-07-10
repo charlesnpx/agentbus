@@ -1281,6 +1281,10 @@ func (s *Server) updateBackendProcess(store *engine.Store, jobID string, ref eng
 			return false, nil
 		}
 		record.BackendChildPID = backendChildPID
+		record.BackendChildStartTime = ""
+		if info, alive, err := s.processes.Lookup(backendChildPID); err == nil && alive {
+			record.BackendChildStartTime = info.StartTime
+		}
 		if ref.PID > 0 || ref.PGID > 0 || ref.StartTime != "" {
 			record.Worker = ref
 		}
@@ -1747,19 +1751,21 @@ func validateTaskSpecEnvelope(raw json.RawMessage) *protocol.ErrorObject {
 
 func statusFromRecord(record engine.JobRecord) protocol.JobStatus {
 	return protocol.JobStatus{
-		JobID:           record.JobID,
-		SessionID:       record.SessionID,
-		Backend:         record.Backend,
-		State:           record.State,
-		Tags:            cloneTags(record.Tags),
-		StartedAt:       timePtr(record.StartedAt),
-		UpdatedAt:       timePtr(record.UpdatedAt),
-		HeartbeatAt:     timePtr(record.HeartbeatAt),
-		Lease:           leasePtr(record.Lease),
-		WorkerPID:       record.Worker.PID,
-		BackendChildPID: record.BackendChildPID,
-		StatePath:       record.StatePath,
-		LogPaths:        record.LogPaths,
+		JobID:                 record.JobID,
+		SessionID:             record.SessionID,
+		Backend:               record.Backend,
+		State:                 record.State,
+		Tags:                  cloneTags(record.Tags),
+		StartedAt:             timePtr(record.StartedAt),
+		UpdatedAt:             timePtr(record.UpdatedAt),
+		HeartbeatAt:           timePtr(record.HeartbeatAt),
+		Lease:                 leasePtr(record.Lease),
+		WorkerPID:             record.Worker.PID,
+		WorkerStartTime:       record.Worker.StartTime,
+		BackendChildPID:       record.BackendChildPID,
+		BackendChildStartTime: record.BackendChildStartTime,
+		StatePath:             record.StatePath,
+		LogPaths:              record.LogPaths,
 	}
 }
 

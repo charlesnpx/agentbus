@@ -422,12 +422,19 @@ func TestBackendProcessUpdatesWorkerIdentity(t *testing.T) {
 	}
 	var status protocol.JobStatusResult
 	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: job.JobID}), &status)
-	if len(status.Jobs) != 1 || status.Jobs[0].WorkerPID != 4242 || status.Jobs[0].BackendChildPID != 4243 {
+	if len(status.Jobs) != 1 ||
+		status.Jobs[0].WorkerPID != 4242 ||
+		status.Jobs[0].WorkerStartTime != "backend-start" ||
+		status.Jobs[0].BackendChildPID != 4243 ||
+		status.Jobs[0].BackendChildStartTime != "child-start" {
 		t.Fatalf("status worker identity = %+v", status)
 	}
 	record := loadJobRecord(t, h.root, h.cwd, job.JobID, processes)
 	if record.Worker.PID != 4242 || record.Worker.PGID != 4242 || record.Worker.StartTime != "backend-start" {
 		t.Fatalf("record worker = %+v", record.Worker)
+	}
+	if record.BackendChildPID != 4243 || record.BackendChildStartTime != "child-start" {
+		t.Fatalf("record backend child identity = pid=%d startTime=%q", record.BackendChildPID, record.BackendChildStartTime)
 	}
 	close(release)
 	waitJobState(t, conn, r, job.JobID, engine.StateCompleted)
