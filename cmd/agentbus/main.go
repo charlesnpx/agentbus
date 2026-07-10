@@ -20,10 +20,11 @@ import (
 )
 
 const (
-	version       = "dev"
 	protocolMajor = 1
 	cliJSONSchema = 1
 )
+
+var version = "dev"
 
 type setupProber interface {
 	SetupProbe(ctx context.Context) (engine.BackendSetupProbe, error)
