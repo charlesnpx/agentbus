@@ -1,7 +1,10 @@
 package client
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,6 +17,69 @@ import (
 
 	"github.com/charlesnpx/agentbus/internal/served"
 )
+
+func TestClientHelloParsesBackendMetadata(t *testing.T) {
+	hello := runClientHello(t, `{"protocolVersion":1,"backends":["codex"],"backendMetadata":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}],"capabilities":{"models.discovery":true}}`)
+
+	if hello.ProtocolVersion != 1 || len(hello.Backends) != 1 || hello.Backends[0] != "codex" || !hello.Capabilities["models.discovery"] {
+		t.Fatalf("hello = %+v", hello)
+	}
+	if len(hello.BackendMetadata) != 1 {
+		t.Fatalf("backend metadata = %+v", hello.BackendMetadata)
+	}
+	info := hello.BackendMetadata[0]
+	if info.Name != "codex" || len(info.Models) != 1 || info.Models[0] != "gpt-5" || len(info.Efforts) != 1 || info.Efforts[0] != "high" {
+		t.Fatalf("backend metadata = %+v", hello.BackendMetadata)
+	}
+}
+
+func TestClientHelloParsesOldServerWithoutBackendMetadata(t *testing.T) {
+	hello := runClientHello(t, `{"protocolVersion":1,"backends":["codex"],"capabilities":{"models.discovery":false}}`)
+
+	if hello.ProtocolVersion != 1 || len(hello.Backends) != 1 || hello.Backends[0] != "codex" {
+		t.Fatalf("hello = %+v", hello)
+	}
+	if hello.BackendMetadata != nil {
+		t.Fatalf("backend metadata = %+v, want nil", hello.BackendMetadata)
+	}
+}
+
+func runClientHello(t *testing.T, result string) HelloResult {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(serverConn)
+		if _, err := reader.ReadBytes('\n'); err != nil {
+			errCh <- err
+			return
+		}
+		var value any
+		if err := json.Unmarshal([]byte(result), &value); err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- json.NewEncoder(serverConn).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      "hello",
+			"result":  value,
+		})
+	}()
+
+	hello, err := clientHello(context.Background(), clientConn, bufio.NewReader(clientConn), "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	return hello
+}
 
 func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 	t.Parallel()
