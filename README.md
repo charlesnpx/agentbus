@@ -97,13 +97,14 @@ import "github.com/charlesnpx/agentbus/engine"
 Backend adapters live under `github.com/charlesnpx/agentbus/engine/adapter`.
 The Claude Code and Codex CLI adapters implement the argv profiles and setup
 drift checks described in [docs/adapters.md](docs/adapters.md).
+Backend authors can follow the normative adding-a-backend recipe in that guide.
 
 ## Development
 
 ```sh
 go test ./...
 go test -race ./...
-scripts/release-check.sh v0.1.0
+scripts/release-check.sh v0.2.0
 ```
 
 Set `GOCACHE` under `/private/tmp` or another writable cache root when running
