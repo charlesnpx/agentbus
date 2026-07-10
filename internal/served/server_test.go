@@ -33,11 +33,17 @@ type fakeBackend struct {
 	events          func(prompt string, write bool) []engine.Event
 	processRef      engine.ProcessRef
 	backendChildPID int
+	resumes         chan resumedSession
 }
 
 type fakeTurn struct {
 	Prompt string
 	Write  bool
+}
+
+type resumedSession struct {
+	ID   string
+	Opts engine.SessionOpts
 }
 
 func newFakeBackend(name string) *fakeBackend {
@@ -61,8 +67,11 @@ func (b *fakeBackend) Start(context.Context, engine.SessionOpts) (engine.Session
 	return &fakeSession{id: b.name + "-session-" + stringID(n), backend: b}, nil
 }
 
-func (b *fakeBackend) Resume(context.Context, string, engine.SessionOpts) (engine.Session, error) {
-	return nil, errors.New("not used")
+func (b *fakeBackend) Resume(_ context.Context, id string, opts engine.SessionOpts) (engine.Session, error) {
+	if b.resumes != nil {
+		b.resumes <- resumedSession{ID: id, Opts: opts}
+	}
+	return &fakeSession{id: id, backend: b}, nil
 }
 
 type fakeSession struct {
@@ -171,6 +180,8 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 			t.Fatalf("missing capability %s in %+v", capability, hello.Capabilities)
 		}
 	}
+	resp = rpc(t, conn, r, "dup", protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: h.token})
+	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
 
 	bad := dialRaw(t, h.socketPath)
 	defer bad.Close()
@@ -251,6 +262,60 @@ func TestTurnNotificationsCorrelationPolicyStampAndJobResult(t *testing.T) {
 	gotTurn := <-backend.turns
 	if gotTurn.Write {
 		t.Fatalf("turn write = true, want per-turn downgrade to false")
+	}
+}
+
+func TestTerminalErrorEventFailsJob(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{
+			{Type: engine.EventAgentText, Text: "partial"},
+			{Type: engine.EventTerminalError, Text: "backend exploded"},
+		}
+	}
+	h := startTestServer(t, backend, Config{IdleTimeout: -1})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	var job protocol.JobSubmitResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "fail"},
+	}), &job)
+	waitJobState(t, conn, r, job.JobID, engine.StateFailed)
+	var result protocol.JobResult
+	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobResult, protocol.JobResultParams{JobID: job.JobID}), &result)
+	if result.State != engine.StateFailed || result.Result != nil {
+		t.Fatalf("terminal error result = %+v", result)
+	}
+}
+
+func TestResultMessageWinsOverAssistantTextWithoutDuplication(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{
+			{Type: engine.EventAgentText, Text: "hello"},
+			{Type: engine.EventResultMessage, Text: "hello"},
+		}
+	}
+	h := startTestServer(t, backend, Config{IdleTimeout: -1})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	var job protocol.JobSubmitResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "dedupe"},
+	}), &job)
+	waitJobState(t, conn, r, job.JobID, engine.StateCompleted)
+	var result protocol.JobResult
+	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobResult, protocol.JobResultParams{JobID: job.JobID}), &result)
+	if result.Result == nil || result.Result.Text != "hello" {
+		t.Fatalf("result = %+v, want single authoritative hello", result.Result)
 	}
 }
 
@@ -863,6 +928,55 @@ func TestJobLookupSurvivesRestartForNonStartupWorkspace(t *testing.T) {
 	decodeResult(t, rpc(t, conn, r, "5", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: submitted.JobID}), &canceled)
 	if canceled.JobID != submitted.JobID || canceled.State != engine.StateCompleted {
 		t.Fatalf("cancel after restart = %+v", canceled)
+	}
+}
+
+func TestBackendSessionIDPersistsAndSessionResumeUsesRecordAfterRestart(t *testing.T) {
+	t.Parallel()
+	root := shortTempDir(t)
+	jobCWD := shortTempDir(t)
+	canonicalJobCWD, err := engine.CanonicalWorkspace(jobCWD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemonCWD := shortTempDir(t)
+
+	first := startTestServerWithRoot(t, root, daemonCWD, newFakeBackend("fake"), Config{IdleTimeout: -1})
+	conn := dialRaw(t, first.socketPath)
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, first.token)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: jobCWD, Write: false, Prompt: "complete", Tags: map[string]string{"client": "resume-test"}},
+	}), &submitted)
+	waitJobState(t, conn, r, submitted.JobID, engine.StateCompleted)
+	record := loadJobRecord(t, root, jobCWD, submitted.JobID, fakeProcessTable{})
+	if record.BackendSessionID == "" {
+		t.Fatalf("backend session id was not persisted: %+v", record)
+	}
+	_ = conn.Close()
+	stopTestServer(t, first)
+
+	secondBackend := newFakeBackend("fake")
+	secondBackend.resumes = make(chan resumedSession, 1)
+	second := startTestServerWithRoot(t, root, daemonCWD, secondBackend, Config{IdleTimeout: -1})
+	conn = dialRaw(t, second.socketPath)
+	defer conn.Close()
+	r = bufio.NewReader(conn)
+	helloRaw(t, conn, r, second.token)
+
+	var resumed protocol.SessionStartResult
+	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: record.SessionID}), &resumed)
+	if resumed.SessionID != record.SessionID || resumed.Backend != "fake" {
+		t.Fatalf("resume result = %+v", resumed)
+	}
+	select {
+	case got := <-secondBackend.resumes:
+		if got.ID != record.BackendSessionID || got.Opts.CWD != canonicalJobCWD || got.Opts.Write {
+			t.Fatalf("backend resume = %+v, want id %q cwd %q read-only", got, record.BackendSessionID, canonicalJobCWD)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("backend.Resume was not called from persisted record")
 	}
 }
 

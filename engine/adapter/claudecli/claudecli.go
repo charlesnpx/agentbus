@@ -36,10 +36,14 @@ var readOnlyDeniedTools = []string{
 	"Write",
 	"NotebookEdit",
 	"mcp__*",
+	"Bash(*&&*)",
+	"Bash(*;*)",
+	"Bash(*|*)",
+	"Bash(*$(*)",
+	"Bash(*`*)",
+	"Bash(*<(*)",
 	"Bash(*>*)",
 	"Bash(*>>*)",
-	"Bash(*| tee*)",
-	"Bash(*|tee*)",
 	"Bash(sed -i*)",
 	"Bash(tee*)",
 	"Bash(find*)",
@@ -64,7 +68,7 @@ type Options struct {
 func New(opts Options) engine.Backend {
 	efforts := opts.SupportedEfforts
 	if len(efforts) == 0 {
-		efforts = []string{"low", "medium", "high", "xhigh", "max"}
+		efforts = []string{"low", "medium", "high", "max"}
 	}
 	return &cliadapter.Backend{
 		NameValue:      "claude",
@@ -115,7 +119,7 @@ func parseEvent(obj map[string]any) ([]engine.Event, string, error) {
 		return parseAssistant(obj, id)
 	case "result":
 		if text := firstString(obj, "result"); text != "" {
-			return []engine.Event{{Type: engine.EventAgentText, Text: text, Metadata: obj}}, id, nil
+			return []engine.Event{{Type: engine.EventResultMessage, Text: text, Metadata: obj}}, id, nil
 		}
 	case "user":
 		return nil, id, nil

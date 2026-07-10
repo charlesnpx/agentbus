@@ -444,6 +444,9 @@ func (s *Server) handle(ctx context.Context, c *connection, req protocol.Request
 	if !c.hello && req.Method != protocol.MethodHello {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorUnauthorized, "protocol.hello is required before other methods", protocol.ErrorData{})}
 	}
+	if c.hello && req.Method == protocol.MethodHello {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "protocol.hello has already been completed on this connection", protocol.ErrorData{})}
+	}
 	switch req.Method {
 	case protocol.MethodHello:
 		return s.handleHello(c, req.Params)
@@ -544,7 +547,35 @@ func (s *Server) handleSessionResume(ctx context.Context, raw json.RawMessage) r
 	if existing != nil {
 		return requestOutcome{result: protocol.SessionStartResult{SessionID: existing.id, Backend: existing.backend}}
 	}
-	return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "session is not known to this daemon", protocol.ErrorData{SessionID: params.SessionID})}
+	record, store := s.findPersistedSession(params.SessionID)
+	if record == nil || store == nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "session is not known to this daemon", protocol.ErrorData{SessionID: params.SessionID})}
+	}
+	backend, ok := s.backends[record.Backend]
+	if !ok {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{SessionID: params.SessionID})}
+	}
+	session, err := backend.Resume(ctx, record.BackendSessionID, engine.SessionOpts{
+		CWD:     store.Layout().Workspace,
+		Write:   false,
+		Timeout: protocol.DefaultTimeout,
+	})
+	if err != nil {
+		return requestOutcome{err: backendError(err)}
+	}
+	state := &sessionState{
+		id:           params.SessionID,
+		backend:      record.Backend,
+		cwd:          store.Layout().Workspace,
+		writeDefault: false,
+		tags:         cloneTags(record.Tags),
+		session:      session,
+	}
+	s.mu.Lock()
+	s.sessions[params.SessionID] = state
+	s.mu.Unlock()
+	s.touchActivity()
+	return requestOutcome{result: protocol.SessionStartResult{SessionID: params.SessionID, Backend: record.Backend}}
 }
 
 func (s *Server) handleSessionList(raw json.RawMessage) requestOutcome {
@@ -994,6 +1025,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 	if record != nil {
 		input.LogPaths = record.LogPaths
 	}
+	if id := run.session.ID(); id != "" {
+		_ = s.updateBackendSessionID(run.store, run.jobID, id)
+	}
 	events, err := run.session.Turn(attemptCtx, input)
 	if err != nil {
 		if strings.Contains(err.Error(), protocol.ErrorSessionBusy) {
@@ -1001,7 +1035,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		}
 		return "", engine.StateFailed, err
 	}
-	var final strings.Builder
+	var assistantText strings.Builder
+	var resultText string
+	hasResultMessage := false
 	sequence := 0
 	for {
 		select {
@@ -1009,19 +1045,34 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			if shouldInterruptSessionOnAttemptCancel(run, attemptCtx.Err()) {
 				_ = run.session.Interrupt(context.Background())
 			}
-			return final.String(), stateForContext(attemptCtx.Err()), attemptCtx.Err()
+			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), stateForContext(attemptCtx.Err()), attemptCtx.Err()
 		case event, ok := <-events:
 			if !ok {
 				if attemptCtx.Err() != nil {
-					return final.String(), stateForContext(attemptCtx.Err()), attemptCtx.Err()
+					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), stateForContext(attemptCtx.Err()), attemptCtx.Err()
 				}
-				return final.String(), engine.StateCompleted, nil
+				if id := run.session.ID(); id != "" {
+					_ = s.updateBackendSessionID(run.store, run.jobID, id)
+				}
+				return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateCompleted, nil
+			}
+			if id := run.session.ID(); id != "" {
+				_ = s.updateBackendSessionID(run.store, run.jobID, id)
 			}
 			rawText := authoritativeText(event)
-			if event.Type == engine.EventAgentText {
-				final.WriteString(rawText)
+			switch event.Type {
+			case engine.EventAgentText:
+				assistantText.WriteString(rawText)
+			case engine.EventResultMessage:
+				resultText = rawText
+				hasResultMessage = true
+			case engine.EventTerminalError:
+				if rawText == "" {
+					rawText = "backend failed"
+				}
+				return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, errors.New(rawText)
 			}
-			if run.foreground && run.conn != nil {
+			if run.foreground && run.conn != nil && event.Type != engine.EventResultMessage && event.Type != engine.EventTerminalError {
 				sequence++
 				wireEvent := prepareWireEvent(event)
 				_ = run.conn.notify(protocol.NotificationTurnEvent, protocol.TurnEventParams{
@@ -1034,6 +1085,13 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			}
 		}
 	}
+}
+
+func attemptFinalText(hasResultMessage bool, resultText, assistantText string) string {
+	if hasResultMessage {
+		return resultText
+	}
+	return assistantText
 }
 
 func shouldInterruptSessionOnAttemptCancel(run jobRun, err error) bool {
@@ -1124,6 +1182,10 @@ func (s *Server) finalizeRequestedTerminal(run jobRun) {
 }
 
 func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {
+	backendSessionID := ""
+	if run.session != nil {
+		backendSessionID = run.session.ID()
+	}
 	record, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
 		if engine.IsTerminal(record.State) {
 			return false, nil
@@ -1149,6 +1211,9 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		if run.contract != nil {
 			resolved := *run.contract
 			record.ResolvedContract = &resolved
+		}
+		if backendSessionID != "" {
+			record.BackendSessionID = backendSessionID
 		}
 		return true, nil
 	})
@@ -1219,6 +1284,20 @@ func (s *Server) updateBackendProcess(store *engine.Store, jobID string, ref eng
 		if ref.PID > 0 || ref.PGID > 0 || ref.StartTime != "" {
 			record.Worker = ref
 		}
+		return true, nil
+	})
+	return err
+}
+
+func (s *Server) updateBackendSessionID(store *engine.Store, jobID, backendSessionID string) error {
+	if backendSessionID == "" {
+		return nil
+	}
+	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
+		if record.BackendSessionID == backendSessionID {
+			return false, nil
+		}
+		record.BackendSessionID = backendSessionID
 		return true, nil
 	})
 	return err
@@ -1392,6 +1471,33 @@ func (s *Server) listKnownRecords() []engine.JobRecord {
 		}
 	}
 	return records
+}
+
+func (s *Server) findPersistedSession(sessionID string) (*engine.JobRecord, *engine.Store) {
+	stores, err := s.knownStores()
+	if err != nil {
+		return nil, nil
+	}
+	var newest *engine.JobRecord
+	var newestStore *engine.Store
+	for _, store := range stores {
+		records, err := store.List()
+		if err != nil {
+			continue
+		}
+		for i := range records {
+			record := records[i]
+			if record.SessionID != sessionID || record.Backend == "" || record.BackendSessionID == "" {
+				continue
+			}
+			if newest == nil || record.UpdatedAt.After(newest.UpdatedAt) {
+				copy := record
+				newest = &copy
+				newestStore = store
+			}
+		}
+	}
+	return newest, newestStore
 }
 
 func (s *Server) reapKnownStores() error {

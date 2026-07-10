@@ -47,7 +47,7 @@ invent additional permission modes under protocol v1.
 | codex | read-only | `codex exec --json --sandbox read-only --ignore-user-config` |
 | codex | corrective-resume | `codex exec resume <session-id> --json --sandbox read-only --ignore-user-config` |
 | claude | write | `claude --print --output-format stream-json --dangerously-skip-permissions` plus `--resume <session-id>` when resuming |
-| claude | read-only | `claude --print --output-format stream-json --bare --strict-mcp-config --mcp-config {} --permission-mode dontAsk --allowedTools Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(git status*),Bash(cat*),Bash(rg*),Bash(grep*),Bash(ls*),Bash(head*),Bash(tail*),Bash(wc*) --disallowedTools Edit,Write,NotebookEdit,mcp__*,Bash(*>*),Bash(*>>*),Bash(*\| tee*),Bash(*\|tee*),Bash(sed -i*),Bash(tee*),Bash(find*),Bash(rm*),Bash(mv*),Bash(cp*),Bash(git commit*),Bash(git push*),Bash(git checkout*),Bash(chmod*),Bash(curl*),Bash(wget*)` |
+| claude | read-only | `claude --print --output-format stream-json --bare --strict-mcp-config --mcp-config {} --permission-mode dontAsk --allowedTools <claude-read-only-allow-list> --disallowedTools <claude-read-only-deny-list>` |
 | claude | corrective-resume | claude read-only profile plus `--resume <session-id>` |
 
 ### codex write
@@ -100,6 +100,16 @@ claude --print --output-format stream-json --dangerously-skip-permissions --resu
 ```
 
 Write turns run under the user's normal Claude configuration.
+
+### claude effort values
+
+When `SessionOpts.Effort` is provided, the claude adapter passes it as:
+
+```text
+--effort <effort>
+```
+
+The default claude effort allow-list is `low`, `medium`, `high`, and `max`.
 
 ### claude read-only
 
@@ -160,26 +170,33 @@ Scoped Bash deny patterns:
 
 | Pattern |
 | --- |
-| output redirects anywhere in the command: `*>*` and `*>>*` |
-| pipes to `tee`: `*\| tee*` and `*\|tee*` |
-| `sed -i*` |
-| `tee*` |
-| `find*` |
-| `rm*` |
-| `mv*` |
-| `cp*` |
-| `git commit*` |
-| `git push*` |
-| `git checkout*` |
-| `chmod*` |
-| `curl*` |
-| `wget*` |
+| `Bash(*&&*)` |
+| `Bash(*;*)` |
+| `Bash(*\|*)` |
+| `Bash(*$(*)` |
+| ``Bash(*`*)`` |
+| `Bash(*<(*)` |
+| `Bash(*>*)` |
+| `Bash(*>>*)` |
+| `Bash(sed -i*)` |
+| `Bash(tee*)` |
+| `Bash(find*)` |
+| `Bash(rm*)` |
+| `Bash(mv*)` |
+| `Bash(cp*)` |
+| `Bash(git commit*)` |
+| `Bash(git push*)` |
+| `Bash(git checkout*)` |
+| `Bash(chmod*)` |
+| `Bash(curl*)` |
+| `Bash(wget*)` |
 
 Claude help documents allow/deny entries using the `Bash(...)` command pattern
 form with wildcard examples such as `Bash(git *)`, but does not formally define
 anchoring. agentbus therefore uses leading and trailing wildcards for redirect
-and pipe-to-tee denies so the deny pattern is expressed as a contains-style
-match in the same CLI pattern language.
+and shell composition denies so the deny pattern is expressed as a
+contains-style match in the same CLI pattern language. The `Bash(*\|*)` deny
+subsumes the older pipe-to-`tee` special cases.
 
 Default permission mode in `-p` / `--print` mode MUST fail closed. A command
 that is not allowed MUST be denied rather than prompting interactively.

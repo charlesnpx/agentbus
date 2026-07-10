@@ -58,9 +58,11 @@ type Event struct {
 }
 
 const (
-	EventAgentText = "AgentText"
-	EventToolUse   = "ToolUse"
-	EventWarning   = "Warning"
+	EventAgentText     = "AgentText"
+	EventToolUse       = "ToolUse"
+	EventWarning       = "Warning"
+	EventResultMessage = "ResultMessage"
+	EventTerminalError = "TerminalError"
 )
 
 // SetupProbeCache is written by setup after a live stream probe and read by

@@ -70,7 +70,7 @@ func expectedClaudeReadOnlyArgv(resumeID string) string {
 		"--allowedTools",
 		"Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(git status*),Bash(cat*),Bash(rg*),Bash(grep*),Bash(ls*),Bash(head*),Bash(tail*),Bash(wc*)",
 		"--disallowedTools",
-		"Edit,Write,NotebookEdit,mcp__*,Bash(*>*),Bash(*>>*),Bash(*| tee*),Bash(*|tee*),Bash(sed -i*),Bash(tee*),Bash(find*),Bash(rm*),Bash(mv*),Bash(cp*),Bash(git commit*),Bash(git push*),Bash(git checkout*),Bash(chmod*),Bash(curl*),Bash(wget*)",
+		"Edit,Write,NotebookEdit,mcp__*,Bash(*&&*),Bash(*;*),Bash(*|*),Bash(*$(*),Bash(*`*),Bash(*<(*),Bash(*>*),Bash(*>>*),Bash(sed -i*),Bash(tee*),Bash(find*),Bash(rm*),Bash(mv*),Bash(cp*),Bash(git commit*),Bash(git push*),Bash(git checkout*),Bash(chmod*),Bash(curl*),Bash(wget*)",
 	}
 	if resumeID != "" {
 		args = append(args, "--resume", resumeID)
@@ -95,9 +95,26 @@ func TestClaudePreflightAndFailures(t *testing.T) {
 	if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: "extreme"}); err == nil || !strings.Contains(err.Error(), "unsupported effort") {
 		t.Fatalf("unsupported effort err = %v", err)
 	}
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: "xhigh"}); err == nil || !strings.Contains(err.Error(), "unsupported effort") {
+		t.Fatalf("xhigh effort err = %v", err)
+	}
 	restricted := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"sonnet"}})
 	if _, err := restricted.Start(context.Background(), engine.SessionOpts{Model: "not-a-model"}); err == nil || !strings.Contains(err.Error(), "unsupported model") {
 		t.Fatalf("unsupported model err = %v", err)
+	}
+}
+
+func TestClaudeResultEventIsAuthoritativeResultMessage(t *testing.T) {
+	events, id, err := parseEvent(map[string]any{
+		"type":       "result",
+		"session_id": "claude-session",
+		"result":     "final answer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "claude-session" || len(events) != 1 || events[0].Type != engine.EventResultMessage || events[0].Text != "final answer" {
+		t.Fatalf("parse result = events:%#v id:%q", events, id)
 	}
 }
 
@@ -160,13 +177,13 @@ func fakeClaude(t *testing.T) fakeCLI {
 	}
 	script := `#!/bin/sh
 if [ "$1" = "--version" ]; then echo "2.1.205 (Claude Code)"; exit 0; fi
-trap 'echo TERM >> "$AGENTBUS_TERM_LOG"; sleep 5' TERM
+trap 'echo TERM >> "$AGENTBUS_TERM_LOG"; exit 0' TERM
 : > "$AGENTBUS_ARGV_LOG"
 for arg in "$@"; do printf '%s\n' "$arg" >> "$AGENTBUS_ARGV_LOG"; done
 input=$(cat)
 printf '%s' "$input" > "$AGENTBUS_STDIN_LOG"
 case "$input" in
-  *sleep*) sleep 5 ;;
+  *sleep*) while :; do :; done ;;
   *huge*) printf '{"type":"assistant","session_id":"claude-session","message":{"content":[{"type":"text","text":"'; i=0; while [ $i -lt 70000 ]; do printf a; i=$((i+1)); done; printf '"}]}}\n' ;;
   *) printf '{"type":"system","session_id":"claude-session"}\n{"type":"assistant","message":{"content":[{"type":"text","text":"hello text"},{"type":"tool_use","name":"Bash","input":{"command":"git status"}}]}}\n' ;;
 esac

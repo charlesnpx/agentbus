@@ -109,7 +109,7 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 	var sawEvent bool
 	var warnings []string
 	for event := range events {
-		if event.Type == engine.EventWarning {
+		if event.Type == engine.EventWarning || event.Type == engine.EventTerminalError {
 			warnings = append(warnings, event.Text)
 			continue
 		}
@@ -344,14 +344,14 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 			return
 		}
 		if parseErr != nil {
-			events <- warning(parseErr.Error())
+			events <- terminalError(parseErr.Error())
 		}
 		if waitErr != nil {
 			msg := strings.TrimSpace(stderr.String())
 			if msg == "" {
 				msg = waitErr.Error()
 			}
-			events <- warning(msg)
+			events <- terminalError(msg)
 		}
 	}()
 	return events, nil
@@ -432,6 +432,10 @@ func capEvent(ev engine.Event) engine.Event {
 
 func warning(text string) engine.Event {
 	return engine.Event{Type: engine.EventWarning, Text: text}
+}
+
+func terminalError(text string) engine.Event {
+	return engine.Event{Type: engine.EventTerminalError, Text: text}
 }
 
 func setProcessGroup(cmd *exec.Cmd) {
