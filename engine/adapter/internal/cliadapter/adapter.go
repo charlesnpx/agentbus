@@ -275,10 +275,40 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		return nil, err
 	}
 	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	var stderrLog *engine.CappedLogWriter
+	stderrWriter := io.Writer(&stderr)
+	if input.LogPaths.Stderr != "" {
+		stderrLog, err = engine.NewCappedLogWriter(input.LogPaths.Stderr, 0)
+		if err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+		stderrWriter = io.MultiWriter(&stderr, stderrLog)
+	}
+	cmd.Stderr = stderrWriter
+	var stdoutLog *engine.CappedLogWriter
+	if input.LogPaths.Stdout != "" {
+		stdoutLog, err = engine.NewCappedLogWriter(input.LogPaths.Stdout, 0)
+		if err != nil {
+			if stderrLog != nil {
+				_ = stderrLog.Close()
+			}
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
 	if err := cmd.Start(); err != nil {
+		if stdoutLog != nil {
+			_ = stdoutLog.Close()
+		}
+		if stderrLog != nil {
+			_ = stderrLog.Close()
+		}
 		s.mu.Unlock()
 		return nil, err
+	}
+	if input.OnProcessStart != nil {
+		input.OnProcessStart(processRefForCmd(cmd), cmd.Process.Pid)
 	}
 	s.active = cmd
 	s.mu.Unlock()
@@ -286,11 +316,23 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 	events := make(chan engine.Event, 16)
 	go func() {
 		defer close(events)
+		defer func() {
+			if stdoutLog != nil {
+				_ = stdoutLog.Close()
+			}
+			if stderrLog != nil {
+				_ = stderrLog.Close()
+			}
+		}()
 		go func() {
 			_, _ = io.WriteString(stdin, input.Prompt)
 			_ = stdin.Close()
 		}()
-		parseErr := s.scan(stdout, events)
+		var stdoutReader io.Reader = stdout
+		if stdoutLog != nil {
+			stdoutReader = io.TeeReader(stdout, stdoutLog)
+		}
+		parseErr := s.scan(stdoutReader, events)
 		waitErr := cmd.Wait()
 		s.mu.Lock()
 		if s.active == cmd {
@@ -362,7 +404,27 @@ func (s *Session) scan(r io.Reader, out chan<- engine.Event) error {
 	return scanner.Err()
 }
 
+func processRefForCmd(cmd *exec.Cmd) engine.ProcessRef {
+	ref := engine.ProcessRef{}
+	if cmd == nil || cmd.Process == nil {
+		return ref
+	}
+	ref.PID = cmd.Process.Pid
+	if runtime.GOOS != "windows" {
+		if pgid, err := syscall.Getpgid(ref.PID); err == nil {
+			ref.PGID = pgid
+		}
+	}
+	if info, alive, err := (engine.NativeProcessTable{}).Lookup(ref.PID); err == nil && alive {
+		ref.StartTime = info.StartTime
+	}
+	return ref
+}
+
 func capEvent(ev engine.Event) engine.Event {
+	if ev.Metadata != nil && ev.Text != "" {
+		ev.Metadata["agentbusRawText"] = ev.Text
+	}
 	text := engine.TruncateEventText([]byte(ev.Text), engine.DefaultEventTextCap)
 	ev.Text = text.Text
 	ev.Truncated = ev.Truncated || text.Truncated
