@@ -36,6 +36,7 @@ type testStoreOptions struct {
 	processGroups ProcessGroupSignaler
 	cancelWaiter  Waiter
 	cancelGrace   time.Duration
+	retention     RetentionConfig
 }
 
 func newTestStore(t *testing.T, now time.Time, pt ProcessTable) *Store {
@@ -44,6 +45,16 @@ func newTestStore(t *testing.T, now time.Time, pt ProcessTable) *Store {
 
 func newTestStoreWithOptions(t *testing.T, now time.Time, pt ProcessTable, opts testStoreOptions) *Store {
 	t.Helper()
+	retention := opts.retention
+	if retention.TerminalJobTTL == 0 {
+		retention.TerminalJobTTL = time.Hour
+	}
+	if retention.ResultTTL == 0 {
+		retention.ResultTTL = time.Hour
+	}
+	if retention.StaleJobAfter == 0 {
+		retention.StaleJobAfter = time.Minute
+	}
 	store, err := NewStore(StoreConfig{
 		Root:          filepath.Join(t.TempDir(), "state"),
 		CWD:           t.TempDir(),
@@ -52,11 +63,7 @@ func newTestStoreWithOptions(t *testing.T, now time.Time, pt ProcessTable, opts 
 		ProcessGroups: opts.processGroups,
 		CancelWaiter:  opts.cancelWaiter,
 		CancelGrace:   opts.cancelGrace,
-		Retention: RetentionConfig{
-			TerminalJobTTL: time.Hour,
-			ResultTTL:      time.Hour,
-			StaleJobAfter:  time.Minute,
-		},
+		Retention:     retention,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -496,6 +503,42 @@ func TestCancelRunningDeadProcessPersistsCanceledWithoutSignals(t *testing.T) {
 	}
 }
 
+func TestCancelRunningLiveBackendChildSignalsEvenWhenWorkerGone(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	entries := map[int]ProcessInfo{204: {PID: 204, StartTime: "child-start"}}
+	signaler := &recordingProcessGroupSignaler{}
+	waiter := &recordingWaiter{}
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: entries}, testStoreOptions{
+		processGroups: signaler,
+		cancelWaiter:  waiter,
+		cancelGrace:   500 * time.Millisecond,
+	})
+	record := &JobRecord{
+		JobID:           "job_cancel_child",
+		State:           StateRunning,
+		UpdatedAt:       base,
+		Lease:           Lease{ExpiresAt: base.Add(time.Minute)},
+		Worker:          ProcessRef{PID: 203, PGID: 303, StartTime: "worker-start"},
+		BackendChildPID: 204,
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	canceled, err := store.Cancel(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceled.State != StateCanceled {
+		t.Fatalf("cancel state = %s, want canceled", canceled.State)
+	}
+	assertProcessGroupSignals(t, signaler.signals, []processGroupSignal{
+		{pgid: 303, signal: syscall.SIGTERM},
+		{pgid: 303, signal: syscall.SIGKILL},
+	})
+	assertWaits(t, waiter.waits, []time.Duration{500 * time.Millisecond})
+}
+
 func TestLoadAndListRunReaperAndQuarantine(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
@@ -814,9 +857,140 @@ func TestGCRetention(t *testing.T) {
 	if err := store.Reap(); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{record.StatePath, logPath, inputPath, resultPath} {
+	recordPath := filepath.Join(store.Layout().Jobs, "job_gc.json")
+	for _, path := range []string{record.StatePath, recordPath, logPath, inputPath, resultPath} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("%s still exists or unexpected err: %v", path, err)
+		}
+	}
+}
+
+func TestTerminalUpdateSweepsJobInputImmediately(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	inputPath := filepath.Join(store.Layout().Inputs, "job_input_done.json")
+	if err := os.WriteFile(inputPath, []byte("prompt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record := &JobRecord{
+		JobID:     "job_input_done",
+		State:     StateRunning,
+		UpdatedAt: base,
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(record.JobID, func(record *JobRecord) (bool, error) {
+		return true, record.Transition(StateCompleted, base)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(inputPath); !os.IsNotExist(err) {
+		t.Fatalf("terminal input still exists or unexpected err: %v", err)
+	}
+	if _, err := os.Stat(record.StatePath); err != nil {
+		t.Fatalf("terminal record was removed before TTL: %v", err)
+	}
+}
+
+func TestGCKeepsReferencedResultUntilResultTTLAfterRecordTTL(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		retention: RetentionConfig{
+			TerminalJobTTL: time.Hour,
+			ResultTTL:      14 * 24 * time.Hour,
+			StaleJobAfter:  time.Minute,
+		},
+	})
+	logPath := filepath.Join(store.Layout().Logs, "job_result_retained.stdout.log")
+	inputPath := filepath.Join(store.Layout().Inputs, "job_result_retained.json")
+	resultPath := filepath.Join(store.Layout().Results, "job_result_retained.txt")
+	for _, path := range []string{logPath, inputPath, resultPath} {
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := base.Add(-2 * time.Hour)
+	if err := os.Chtimes(resultPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	record := &JobRecord{
+		JobID:     "job_result_retained",
+		State:     StateCompleted,
+		UpdatedAt: old,
+		LogPaths:  LogPaths{Stdout: logPath},
+		Result:    &ResultInfo{ResultPath: resultPath},
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	record.UpdatedAt = old
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{record.StatePath, logPath, inputPath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("%s still exists or unexpected err: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(resultPath); err != nil {
+		t.Fatalf("referenced result was removed before ResultTTL: %v", err)
+	}
+}
+
+func TestGCRemovesReferencedResultAtResultTTLBeforeRecordTTL(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		retention: RetentionConfig{
+			TerminalJobTTL: 14 * 24 * time.Hour,
+			ResultTTL:      time.Hour,
+			StaleJobAfter:  time.Minute,
+		},
+	})
+	logPath := filepath.Join(store.Layout().Logs, "job_result_expired.stdout.log")
+	inputPath := filepath.Join(store.Layout().Inputs, "job_result_expired.json")
+	resultPath := filepath.Join(store.Layout().Results, "job_result_expired.txt")
+	for _, path := range []string{logPath, inputPath, resultPath} {
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := base.Add(-2 * time.Hour)
+	if err := os.Chtimes(resultPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	record := &JobRecord{
+		JobID:     "job_result_expired",
+		State:     StateCompleted,
+		UpdatedAt: old,
+		LogPaths:  LogPaths{Stdout: logPath},
+		Result:    &ResultInfo{ResultPath: resultPath},
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	record.UpdatedAt = old
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(resultPath); !os.IsNotExist(err) {
+		t.Fatalf("expired result still exists or unexpected err: %v", err)
+	}
+	if _, err := os.Stat(inputPath); !os.IsNotExist(err) {
+		t.Fatalf("terminal input still exists or unexpected err: %v", err)
+	}
+	for _, path := range []string{record.StatePath, logPath} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("%s was removed before TerminalJobTTL: %v", path, err)
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -60,4 +61,80 @@ func TestSessionInterruptUsesProtocolDefaultGrace(t *testing.T) {
 	default:
 		t.Fatal("interrupt did not terminate the active process group")
 	}
+}
+
+func TestSessionTurnSurfacesMalformedStreamAsTerminalError(t *testing.T) {
+	fake := fakeTerminalErrorCLI(t)
+	backend := &Backend{
+		NameValue: "fake",
+		Binary:    fake,
+		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
+			return []string{"malformed"}, nil
+		},
+		Parse: func(map[string]any) ([]engine.Event, string, error) {
+			return nil, "", nil
+		},
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEvents(events)
+	if len(got) != 1 || got[0].Type != engine.EventTerminalError || !strings.Contains(got[0].Text, "malformed backend stream") {
+		t.Fatalf("events = %#v, want terminal malformed-stream error", got)
+	}
+}
+
+func TestSessionTurnSurfacesNonzeroExitAsTerminalError(t *testing.T) {
+	fake := fakeTerminalErrorCLI(t)
+	backend := &Backend{
+		NameValue: "fake",
+		Binary:    fake,
+		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
+			return []string{"fail"}, nil
+		},
+		Parse: func(map[string]any) ([]engine.Event, string, error) {
+			return nil, "", nil
+		},
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEvents(events)
+	if len(got) != 1 || got[0].Type != engine.EventTerminalError || !strings.Contains(got[0].Text, "backend exploded") {
+		t.Fatalf("events = %#v, want terminal nonzero-exit error", got)
+	}
+}
+
+func fakeTerminalErrorCLI(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fakecli")
+	script := `#!/bin/sh
+case "$1" in
+  malformed) printf 'not-json\n'; exit 0 ;;
+  fail) printf 'backend exploded\n' >&2; exit 7 ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func collectEvents(ch <-chan engine.Event) []engine.Event {
+	var out []engine.Event
+	for ev := range ch {
+		out = append(out, ev)
+	}
+	return out
 }

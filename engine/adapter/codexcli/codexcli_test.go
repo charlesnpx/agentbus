@@ -130,13 +130,13 @@ func fakeCodex(t *testing.T) fakeCLI {
 	}
 	script := `#!/bin/sh
 if [ "$1" = "--version" ]; then echo "codex-cli 0.143.0"; exit 0; fi
-trap 'echo TERM >> "$AGENTBUS_TERM_LOG"; sleep 5' TERM
+trap 'echo TERM >> "$AGENTBUS_TERM_LOG"; exit 0' TERM
 : > "$AGENTBUS_ARGV_LOG"
 for arg in "$@"; do printf '%s\n' "$arg" >> "$AGENTBUS_ARGV_LOG"; done
 input=$(cat)
 printf '%s' "$input" > "$AGENTBUS_STDIN_LOG"
 case "$input" in
-  *sleep*) sleep 5 ;;
+  *sleep*) while :; do :; done ;;
   *huge*) printf '{"type":"message","session_id":"codex-session","text":"'; i=0; while [ $i -lt 70000 ]; do printf a; i=$((i+1)); done; printf '"}\n' ;;
   *) printf '{"type":"message","session_id":"codex-session","text":"hello text"}\n{"type":"tool_use","name":"shell","text":"git status"}\n' ;;
 esac

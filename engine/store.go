@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -296,6 +297,9 @@ func (s *Store) Update(jobID string, mutate func(*JobRecord) (bool, error)) (*Jo
 			if err := s.saveRecordLocked(record, path); err != nil {
 				return err
 			}
+			if IsTerminal(record.State) {
+				s.sweepTerminalJobInput(record.JobID)
+			}
 		}
 		status := record.StatusRecord(s.clock.Now().UTC())
 		out = &status
@@ -428,6 +432,9 @@ func (s *Store) terminate(jobID string, state JobState) (*JobRecord, error) {
 		if err := s.saveIfUnchanged(record, path, original); err != nil {
 			return err
 		}
+		if IsTerminal(record.State) {
+			s.sweepTerminalJobInput(record.JobID)
+		}
 		status := record.StatusRecord(now)
 		out = &status
 		return nil
@@ -468,15 +475,30 @@ func (s *Store) liveCancelProcessGroup(record *JobRecord) (cancelProcessGroupTar
 	if record.Worker.PGID <= 0 {
 		return cancelProcessGroupTarget{}, false, nil
 	}
-	alive, err := s.processRefAlive(record.Worker)
-	if err != nil || !alive {
-		return cancelProcessGroupTarget{}, false, err
+	workerAlive, workerErr := s.processRefAlive(record.Worker)
+	childAlive, childErr := s.backendChildAlive(record.BackendChildPID)
+	if workerAlive || childAlive {
+		return cancelProcessGroupTarget{
+			pgid:            record.Worker.PGID,
+			worker:          record.Worker,
+			backendChildPID: record.BackendChildPID,
+		}, true, nil
 	}
-	return cancelProcessGroupTarget{
-		pgid:            record.Worker.PGID,
-		worker:          record.Worker,
-		backendChildPID: record.BackendChildPID,
-	}, true, nil
+	if workerErr != nil {
+		return cancelProcessGroupTarget{}, false, workerErr
+	}
+	if childErr != nil {
+		return cancelProcessGroupTarget{}, false, childErr
+	}
+	return cancelProcessGroupTarget{}, false, nil
+}
+
+func (s *Store) backendChildAlive(pid int) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+	_, alive, err := s.processes.Lookup(pid)
+	return alive, err
 }
 
 func (s *Store) cancelProcessGroupStillAlive(target cancelProcessGroupTarget) (bool, error) {
@@ -633,7 +655,15 @@ func (s *Store) gc(now time.Time) error {
 			continue
 		}
 		if record.Result != nil && record.Result.ResultPath != "" {
-			protectedResults[filepath.Clean(record.Result.ResultPath)] = struct{}{}
+			resultPath := filepath.Clean(record.Result.ResultPath)
+			if !pathWithinDir(s.layout.Results, resultPath) {
+				continue
+			}
+			if IsTerminal(record.State) && now.Sub(record.UpdatedAt) >= s.retention.ResultTTL {
+				logRemoveIfExists(resultPath)
+				continue
+			}
+			protectedResults[resultPath] = struct{}{}
 		}
 	}
 	for _, entry := range entries {
@@ -650,22 +680,16 @@ func (s *Store) gc(now time.Time) error {
 			if err != nil {
 				return nil
 			}
-			if !IsTerminal(record.State) || now.Sub(record.UpdatedAt) < s.retention.TerminalJobTTL {
+			if !IsTerminal(record.State) {
 				return nil
 			}
-			if record.Result != nil && record.Result.ResultPath != "" {
-				resultPath := filepath.Clean(record.Result.ResultPath)
-				delete(protectedResults, resultPath)
-				if pathWithinDir(s.layout.Results, resultPath) {
-					_ = removeIfExists(resultPath)
-				}
+			s.sweepTerminalJobInput(record.JobID)
+			if now.Sub(record.UpdatedAt) < s.retention.TerminalJobTTL {
+				return nil
 			}
-			_ = removeContainedIfExists(s.layout.Logs, record.LogPaths.Stdout)
-			_ = removeContainedIfExists(s.layout.Logs, record.LogPaths.Stderr)
-			if inputPath, err := safePathForID(s.layout.Inputs, record.JobID, ".json"); err == nil {
-				_ = removeIfExists(inputPath)
-			}
-			_ = removeIfExists(record.StatePath)
+			logRemoveContainedIfExists(s.layout.Logs, record.LogPaths.Stdout)
+			logRemoveContainedIfExists(s.layout.Logs, record.LogPaths.Stderr)
+			logRemoveIfExists(path)
 			return nil
 		}); err != nil {
 			return err
@@ -689,7 +713,7 @@ func (s *Store) gc(now time.Time) error {
 				continue
 			}
 			if now.Sub(info.ModTime()) >= s.retention.ResultTTL {
-				_ = os.Remove(path)
+				logRemoveIfExists(path)
 			}
 		}
 	}
@@ -841,6 +865,34 @@ func removeIfExists(path string) error {
 		return err
 	}
 	return nil
+}
+
+func logRemoveIfExists(path string) {
+	if err := removeIfExists(path); err != nil {
+		log.Printf("agentbus gc: failed to remove %s: %v", path, err)
+	}
+}
+
+func (s *Store) sweepTerminalJobInput(jobID string) {
+	inputPath, err := safePathForID(s.layout.Inputs, jobID, ".json")
+	if err != nil {
+		log.Printf("agentbus gc: invalid terminal input path for %s: %v", jobID, err)
+		return
+	}
+	if err := removeIfExists(inputPath); err != nil {
+		log.Printf("agentbus gc: failed to remove terminal input %s: %v", inputPath, err)
+	}
+}
+
+func logRemoveContainedIfExists(dir, path string) {
+	if path == "" {
+		return
+	}
+	clean := filepath.Clean(path)
+	if !pathWithinDir(dir, clean) {
+		return
+	}
+	logRemoveIfExists(clean)
 }
 
 func removeContainedIfExists(dir, path string) error {

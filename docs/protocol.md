@@ -1002,10 +1002,20 @@ The shape validator runs over raw result text after ANSI escape stripping. It
 performs no other normalization.
 
 Fenced code blocks are excluded entirely from section matching and attestation
-matching. Fences are Markdown-style lines beginning with at least three
-backticks. Text inside a fence MUST NOT satisfy a required section,
-attestation, or evidence pattern except for the fenced-command evidence pattern
-defined below.
+matching. Fence detection follows CommonMark fence pairing for backtick and
+tilde fences:
+
+- An opening fence line begins with zero to three spaces, followed by a run of
+  at least three backticks or at least three tildes.
+- The opening fence character and run length are remembered.
+- A closing fence line begins with zero to three spaces, uses the same fence
+  character, and has a run length greater than or equal to the opening run.
+- Lines indented four or more spaces do not open or close fences.
+- Text after the opening fence run is treated as an info string and is ignored
+  by the validator.
+
+Text inside a fence MUST NOT satisfy a required section, attestation, or
+evidence pattern except for the fenced-command evidence pattern defined below.
 
 Section matching:
 
