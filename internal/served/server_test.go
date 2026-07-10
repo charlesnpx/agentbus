@@ -703,6 +703,110 @@ func TestHeartbeatRacingCompletionDoesNotResurrectTerminalRecord(t *testing.T) {
 	}
 }
 
+func TestFinalizeCompletedSalvagesOrphanedJob(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := server.nextID("job")
+	if err := server.createQueuedRecord(store, jobID, "ses_salvage", "fake", nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning, engine.StateOrphaned} {
+		if err := server.transitionRecord(store, jobID, state); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := server.finalizeTerminal(jobRun{jobID: jobID, store: store}, engine.StateCompleted, "done", nil); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != engine.StateCompleted || record.Result == nil || len(record.Warnings) != 1 || !strings.Contains(record.Warnings[0], "late-finalization") {
+		t.Fatalf("salvaged record = %+v", record)
+	}
+}
+
+func TestFinalizeCompletedDoesNotSalvageReapedJob(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := server.nextID("job")
+	if err := server.createQueuedRecord(store, jobID, "ses_reaped", "fake", nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning, engine.StateOrphaned, engine.StateReaped} {
+		if err := server.transitionRecord(store, jobID, state); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := server.finalizeTerminal(jobRun{jobID: jobID, store: store}, engine.StateCompleted, "lost", nil); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != engine.StateReaped || record.Result != nil {
+		t.Fatalf("reaped record changed = %+v", record)
+	}
+}
+
+func TestHeartbeatDoesNotBlockOnJobLock(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := server.nextID("job")
+	if err := server.createQueuedRecord(store, jobID, "ses_lock", "fake", nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(store.Layout().Jobs, jobID+".lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	done := make(chan error, 1)
+	go func() {
+		active, err := server.refreshHeartbeat(store, jobID)
+		if err == nil && !active {
+			err = errors.New("heartbeat unexpectedly inactive")
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("heartbeat blocked on per-job lock")
+	}
+}
+
 func TestTurnInterruptRejectsBackgroundJob(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})

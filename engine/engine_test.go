@@ -306,10 +306,10 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 		want JobState
 	}{
 		{
-			name: "expired lease becomes orphaned",
+			name: "expired lease with alive worker is renewed",
 			job:  JobRecord{JobID: "job_lease", State: StateRunning, UpdatedAt: base, Lease: Lease{ExpiresAt: base.Add(-time.Second)}, Worker: ProcessRef{PID: 101, StartTime: "a"}},
 			pt:   fakeProcessTable{entries: map[int]ProcessInfo{101: {PID: 101, StartTime: "a"}}},
-			want: StateOrphaned,
+			want: StateRunning,
 		},
 		{
 			name: "stale queued reaped",
@@ -367,6 +367,11 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 			}
 			if got.State != tt.want {
 				t.Fatalf("state = %s, want %s", got.State, tt.want)
+			}
+			if tt.name == "expired lease with alive worker is renewed" {
+				if !got.Lease.ExpiresAt.After(base) || len(got.Warnings) != 1 || !strings.Contains(got.Warnings[0], "stale-heartbeat") {
+					t.Fatalf("renewed record = %+v", got)
+				}
 			}
 		})
 	}

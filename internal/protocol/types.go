@@ -259,6 +259,7 @@ type JobStatus struct {
 	BackendChildStartTime string            `json:"backendChildStartTime,omitempty"`
 	StatePath             string            `json:"statePath,omitempty"`
 	LogPaths              engine.LogPaths   `json:"logPaths,omitempty"`
+	Warnings              []string          `json:"warnings,omitempty"`
 }
 
 type JobResultParams struct {

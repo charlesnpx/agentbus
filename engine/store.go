@@ -84,6 +84,8 @@ type Store struct {
 	retention     RetentionConfig
 }
 
+const staleHeartbeatWarning = "stale-heartbeat: lease expired while process identity remained alive; lease renewed"
+
 // NewStore creates a state store and ensures protocol directories exist.
 func NewStore(cfg StoreConfig) (*Store, error) {
 	root := cfg.Root
@@ -308,6 +310,30 @@ func (s *Store) Update(jobID string, mutate func(*JobRecord) (bool, error)) (*Jo
 		return nil, err
 	}
 	return out, nil
+}
+
+// TouchHeartbeat records a heartbeat without waiting for the contended per-job lock.
+func (s *Store) TouchHeartbeat(jobID string, now time.Time, leaseDuration time.Duration) (bool, error) {
+	if err := validateJobID(jobID); err != nil {
+		return false, err
+	}
+	jobPath, err := s.jobPath(jobID)
+	if err != nil {
+		return false, err
+	}
+	record, err := s.loadPath(jobPath)
+	if err != nil {
+		return false, err
+	}
+	if IsTerminal(record.State) {
+		return false, nil
+	}
+	path, err := safePathForID(s.layout.Jobs, jobID, ".heartbeat")
+	if err != nil {
+		return false, err
+	}
+	payload := []byte(now.UTC().Format(time.RFC3339Nano) + "\n" + now.UTC().Add(leaseDuration).Format(time.RFC3339Nano) + "\n")
+	return true, atomicWriteFile(path, payload, 0o600)
 }
 
 // HasJob reports whether a persisted job record exists in this workspace store.
@@ -575,6 +601,12 @@ func (s *Store) Reap() error {
 }
 
 func (s *Store) reapRecord(record *JobRecord, now time.Time) (bool, error) {
+	changed := false
+	if heartbeatAt, expiresAt, ok := s.readHeartbeat(record.JobID); ok && heartbeatAt.After(record.HeartbeatAt) {
+		record.HeartbeatAt = heartbeatAt
+		record.Lease = Lease{ExpiresAt: expiresAt}
+		changed = true
+	}
 	switch record.State {
 	case StateOrphaned:
 		return true, record.Transition(StateReaped, now)
@@ -586,9 +618,6 @@ func (s *Store) reapRecord(record *JobRecord, now time.Time) (bool, error) {
 			return true, record.Transition(StateReaped, now)
 		}
 	case StateRunning, StateRetrying:
-		if !record.Lease.ExpiresAt.IsZero() && !now.Before(record.Lease.ExpiresAt) {
-			return true, record.Transition(StateOrphaned, now)
-		}
 		if s.processGoneOrReused(record.Worker) {
 			return true, record.Transition(StateOrphaned, now)
 		}
@@ -598,8 +627,61 @@ func (s *Store) reapRecord(record *JobRecord, now time.Time) (bool, error) {
 		if s.processMissing(record.BackendChildPID) {
 			return true, record.Transition(StateOrphaned, now)
 		}
+		if !record.Lease.ExpiresAt.IsZero() && !now.Before(record.Lease.ExpiresAt) {
+			if s.processIdentityConfirmed(record) {
+				record.HeartbeatAt = now
+				record.Lease = Lease{ExpiresAt: now.Add(5 * time.Minute)}
+				record.Warnings = appendWarning(record.Warnings, staleHeartbeatWarning)
+				return true, nil
+			}
+			return true, record.Transition(StateOrphaned, now)
+		}
 	}
-	return false, nil
+	return changed, nil
+}
+
+func (s *Store) processIdentityConfirmed(record *JobRecord) bool {
+	refs := []ProcessRef{record.Worker}
+	if record.BackendChildPID > 0 {
+		refs = append(refs, ProcessRef{PID: record.BackendChildPID, StartTime: record.BackendChildStartTime})
+	}
+	for _, ref := range refs {
+		if ref.PID <= 0 || ref.StartTime == "" {
+			continue
+		}
+		info, alive, err := s.processes.Lookup(ref.PID)
+		if err == nil && alive && info.StartTime != "" && info.StartTime == ref.StartTime {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) readHeartbeat(jobID string) (time.Time, time.Time, bool) {
+	path, err := safePathForID(s.layout.Jobs, jobID, ".heartbeat")
+	if err != nil {
+		return time.Time{}, time.Time{}, false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}, time.Time{}, false
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 2 {
+		return time.Time{}, time.Time{}, false
+	}
+	heartbeatAt, err1 := time.Parse(time.RFC3339Nano, lines[0])
+	expiresAt, err2 := time.Parse(time.RFC3339Nano, lines[1])
+	return heartbeatAt, expiresAt, err1 == nil && err2 == nil
+}
+
+func appendWarning(warnings []string, warning string) []string {
+	for _, existing := range warnings {
+		if existing == warning {
+			return warnings
+		}
+	}
+	return append(warnings, warning)
 }
 
 func (s *Store) processGoneOrReused(ref ProcessRef) bool {

@@ -24,8 +24,8 @@ import (
 )
 
 const (
-	defaultLeaseDuration = time.Minute
-	defaultHeartbeat     = 15 * time.Second
+	defaultLeaseDuration = 5 * time.Minute
+	defaultHeartbeat     = 30 * time.Second
 )
 
 // Config configures the local JSON-RPC daemon.
@@ -44,6 +44,8 @@ type Config struct {
 	IdleTimeout       time.Duration
 	IdleCheckInterval time.Duration
 	InlineResultCap   int
+	LeaseDuration     time.Duration
+	HeartbeatInterval time.Duration
 }
 
 // Server serves the protocol v1 socket API over engine backends.
@@ -65,6 +67,8 @@ type Server struct {
 	idleTimeout       time.Duration
 	idleCheckInterval time.Duration
 	inlineResultCap   int
+	leaseDuration     time.Duration
+	heartbeatInterval time.Duration
 
 	mu           sync.Mutex
 	sessions     map[string]*sessionState
@@ -190,6 +194,18 @@ func New(cfg Config) (*Server, error) {
 	if registry == nil {
 		registry = engine.NewPolicyRegistry()
 	}
+	inlineResultCap := cfg.InlineResultCap
+	if inlineResultCap <= 0 {
+		inlineResultCap = engine.DefaultInlineResultCap
+	}
+	leaseDuration := cfg.LeaseDuration
+	if leaseDuration <= 0 {
+		leaseDuration = defaultLeaseDuration
+	}
+	heartbeatInterval := cfg.HeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = defaultHeartbeat
+	}
 	return &Server{
 		stateRoot:         root,
 		cwd:               cwd,
@@ -205,7 +221,9 @@ func New(cfg Config) (*Server, error) {
 		cancelWaiter:      cfg.CancelWaiter,
 		idleTimeout:       idleTimeout,
 		idleCheckInterval: idleCheck,
-		inlineResultCap:   cfg.InlineResultCap,
+		inlineResultCap:   inlineResultCap,
+		leaseDuration:     leaseDuration,
+		heartbeatInterval: heartbeatInterval,
 		sessions:          make(map[string]*sessionState),
 		stores:            make(map[string]*engine.Store),
 		storesByKey:       make(map[string]*engine.Store),
@@ -1206,6 +1224,7 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		if engine.IsTerminal(record.State) {
 			return false, nil
 		}
+		salvaged := record.State == engine.StateOrphaned && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant)
 		var result *engine.ResultInfo
 		if state == engine.StateCompleted || state == engine.StateCompletedNoncompliant {
 			if text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
@@ -1231,6 +1250,9 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		if backendSessionID != "" {
 			record.BackendSessionID = backendSessionID
 		}
+		if salvaged {
+			record.Warnings = append(record.Warnings, "late-finalization: recovered completed result from orphaned job")
+		}
 		return true, nil
 	})
 	if err != nil {
@@ -1243,7 +1265,7 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 }
 
 func (s *Server) heartbeat(store *engine.Store, jobID string, done <-chan struct{}) {
-	ticker := time.NewTicker(defaultHeartbeat)
+	ticker := time.NewTicker(s.heartbeatInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1259,18 +1281,7 @@ func (s *Server) heartbeat(store *engine.Store, jobID string, done <-chan struct
 }
 
 func (s *Server) refreshHeartbeat(store *engine.Store, jobID string) (bool, error) {
-	active := false
-	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
-		if engine.IsTerminal(record.State) {
-			return false, nil
-		}
-		now := s.clock.Now().UTC()
-		record.HeartbeatAt = now
-		record.Lease = engine.Lease{ExpiresAt: now.Add(defaultLeaseDuration)}
-		active = true
-		return true, nil
-	})
-	return active, err
+	return store.TouchHeartbeat(jobID, s.clock.Now().UTC(), s.leaseDuration)
 }
 
 func (s *Server) abortUndeliveredRun(run jobRun, state engine.JobState) {
@@ -1345,7 +1356,7 @@ func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backe
 		StartedAt:        now,
 		UpdatedAt:        now,
 		HeartbeatAt:      now,
-		Lease:            engine.Lease{ExpiresAt: now.Add(defaultLeaseDuration)},
+		Lease:            engine.Lease{ExpiresAt: now.Add(s.leaseDuration)},
 		Supervisor:       ref,
 		LogPaths:         logPaths,
 		Policy:           policy,
@@ -1364,7 +1375,7 @@ func (s *Server) transitionRecord(store *engine.Store, jobID string, state engin
 		}
 		now := s.clock.Now().UTC()
 		record.HeartbeatAt = now
-		record.Lease = engine.Lease{ExpiresAt: now.Add(defaultLeaseDuration)}
+		record.Lease = engine.Lease{ExpiresAt: now.Add(s.leaseDuration)}
 		return true, nil
 	})
 	return err
@@ -1782,6 +1793,7 @@ func statusFromRecord(record engine.JobRecord) protocol.JobStatus {
 		BackendChildStartTime: record.BackendChildStartTime,
 		StatePath:             record.StatePath,
 		LogPaths:              record.LogPaths,
+		Warnings:              append([]string(nil), record.Warnings...),
 	}
 }
 
