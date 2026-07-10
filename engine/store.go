@@ -640,10 +640,7 @@ func (s *Store) reapRecord(record *JobRecord, now time.Time) (bool, error) {
 		return true, record.Transition(StateReaped, now)
 	case StateQueued, StateStarting:
 		if !record.UpdatedAt.IsZero() && now.Sub(record.UpdatedAt) >= s.retention.StaleJobAfter {
-			if err := record.Transition(StateOrphaned, now); err != nil {
-				return false, err
-			}
-			return true, record.Transition(StateReaped, now)
+			return true, record.Transition(StateOrphaned, now)
 		}
 	case StateRunning, StateRetrying:
 		if s.processGoneOrReused(record.Worker) {
@@ -669,7 +666,7 @@ func (s *Store) reapRecord(record *JobRecord, now time.Time) (bool, error) {
 }
 
 func (s *Store) processIdentityConfirmed(record *JobRecord) bool {
-	refs := []ProcessRef{record.Worker}
+	refs := []ProcessRef{record.Worker, record.Supervisor}
 	if record.BackendChildPID > 0 {
 		refs = append(refs, ProcessRef{PID: record.BackendChildPID, StartTime: record.BackendChildStartTime})
 	}

@@ -318,10 +318,10 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 			want: StateRunning,
 		},
 		{
-			name: "stale queued reaped",
+			name: "stale queued orphaned",
 			job:  JobRecord{JobID: "job_stale", State: StateQueued, UpdatedAt: base.Add(-2 * time.Minute)},
 			pt:   fakeProcessTable{entries: map[int]ProcessInfo{}},
-			want: StateReaped,
+			want: StateOrphaned,
 		},
 		{
 			name: "worker crash orphaned",
@@ -427,17 +427,37 @@ func TestReaperUsesConfiguredLeaseAndOrphanGrace(t *testing.T) {
 
 func TestLeaseRenewalRequiresAllPersistedProcessIdentities(t *testing.T) {
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
-	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{101: {PID: 101, StartTime: "worker"}, 202: {PID: 202, StartTime: "reused"}}})
-	record := &JobRecord{JobID: "job_all_identities", State: StateRunning, UpdatedAt: base, Lease: Lease{ExpiresAt: base.Add(-time.Second)}, Worker: ProcessRef{PID: 101, StartTime: "worker"}, BackendChildPID: 202, BackendChildStartTime: "backend"}
-	if err := store.Save(record); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name      string
+		jobID     string
+		processes map[int]ProcessInfo
+	}{
+		{
+			name:      "backend child mismatch",
+			jobID:     "job_backend_identity",
+			processes: map[int]ProcessInfo{101: {PID: 101, StartTime: "worker"}, 202: {PID: 202, StartTime: "reused"}, 303: {PID: 303, StartTime: "supervisor"}},
+		},
+		{
+			name:      "supervisor identity unavailable",
+			jobID:     "job_supervisor_identity",
+			processes: map[int]ProcessInfo{101: {PID: 101, StartTime: "worker"}, 202: {PID: 202, StartTime: "backend"}, 303: {PID: 303}},
+		},
 	}
-	if err := store.Reap(); err != nil {
-		t.Fatal(err)
-	}
-	got, _ := store.loadPath(record.StatePath)
-	if got.State != StateOrphaned {
-		t.Fatalf("state = %s", got.State)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestStore(t, base, fakeProcessTable{entries: tt.processes})
+			record := &JobRecord{JobID: tt.jobID, State: StateRunning, UpdatedAt: base, Lease: Lease{ExpiresAt: base.Add(-time.Second)}, Worker: ProcessRef{PID: 101, StartTime: "worker"}, Supervisor: ProcessRef{PID: 303, StartTime: "supervisor"}, BackendChildPID: 202, BackendChildStartTime: "backend"}
+			if err := store.Save(record); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Reap(); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := store.loadPath(record.StatePath)
+			if got.State != StateOrphaned {
+				t.Fatalf("state = %s", got.State)
+			}
+		})
 	}
 }
 
