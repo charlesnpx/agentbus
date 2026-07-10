@@ -69,6 +69,7 @@ type Server struct {
 	mu           sync.Mutex
 	sessions     map[string]*sessionState
 	stores       map[string]*engine.Store
+	storesByKey  map[string]*engine.Store
 	jobStores    map[string]*engine.Store
 	activeJobs   map[string]*activeJob
 	lastActivity time.Time
@@ -207,6 +208,7 @@ func New(cfg Config) (*Server, error) {
 		inlineResultCap:   cfg.InlineResultCap,
 		sessions:          make(map[string]*sessionState),
 		stores:            make(map[string]*engine.Store),
+		storesByKey:       make(map[string]*engine.Store),
 		jobStores:         make(map[string]*engine.Store),
 		activeJobs:        make(map[string]*activeJob),
 		lastActivity:      clock.Now().UTC(),
@@ -1288,6 +1290,11 @@ func (s *Server) storeForCWDLocked(cwd string) (*engine.Store, error) {
 	if store != nil {
 		return store, nil
 	}
+	key := engine.WorkspaceKey(canon)
+	if store := s.storesByKey[key]; store != nil {
+		s.stores[canon] = store
+		return store, nil
+	}
 	store, err = engine.NewStore(engine.StoreConfig{
 		Root:          s.stateRoot,
 		CWD:           canon,
@@ -1300,17 +1307,45 @@ func (s *Server) storeForCWDLocked(cwd string) (*engine.Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.stores[canon] = store
-	return store, nil
+	return s.rememberStoreLocked(store), nil
 }
 
 func (s *Server) storeForJob(jobID string) *engine.Store {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if store := s.jobStores[jobID]; store != nil {
+		s.mu.Unlock()
 		return store
 	}
-	if store, err := s.storeForCWDLocked(s.cwd); err == nil {
+	s.mu.Unlock()
+
+	stores, err := s.knownStores()
+	if err != nil {
+		return nil
+	}
+	if len(stores) == 0 {
+		s.mu.Lock()
+		store, err := s.storeForCWDLocked(s.cwd)
+		s.mu.Unlock()
+		if err != nil {
+			return nil
+		}
+		stores = []*engine.Store{store}
+	}
+	for _, store := range stores {
+		ok, err := store.HasJob(jobID)
+		if err != nil {
+			return store
+		}
+		if !ok {
+			continue
+		}
+		s.mu.Lock()
+		if existing := s.jobStores[jobID]; existing != nil {
+			s.mu.Unlock()
+			return existing
+		}
+		s.jobStores[jobID] = store
+		s.mu.Unlock()
 		return store
 	}
 	return nil
@@ -1345,21 +1380,10 @@ func (s *Server) clearActiveTurn(sessionID, jobID string) {
 }
 
 func (s *Server) listKnownRecords() []engine.JobRecord {
-	s.mu.Lock()
-	stores := make([]*engine.Store, 0, len(s.stores))
-	seen := make(map[*engine.Store]struct{}, len(s.stores))
-	for _, store := range s.stores {
-		if _, ok := seen[store]; !ok {
-			seen[store] = struct{}{}
-			stores = append(stores, store)
-		}
+	stores, err := s.knownStores()
+	if err != nil {
+		return nil
 	}
-	if len(stores) == 0 {
-		if store, err := s.storeForCWDLocked(s.cwd); err == nil {
-			stores = append(stores, store)
-		}
-	}
-	s.mu.Unlock()
 	var records []engine.JobRecord
 	for _, store := range stores {
 		list, err := store.List()
@@ -1371,13 +1395,66 @@ func (s *Server) listKnownRecords() []engine.JobRecord {
 }
 
 func (s *Server) reapKnownStores() error {
-	s.mu.Lock()
-	store, err := s.storeForCWDLocked(s.cwd)
-	s.mu.Unlock()
+	stores, err := s.knownStores()
 	if err != nil {
 		return err
 	}
-	return store.Reap()
+	for _, store := range stores {
+		if err := store.Reap(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) knownStores() ([]*engine.Store, error) {
+	discovered, err := engine.OpenWorkspaceStores(s.storeConfig())
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, store := range discovered {
+		s.rememberStoreLocked(store)
+	}
+	return s.storeSnapshotLocked(), nil
+}
+
+func (s *Server) storeConfig() engine.StoreConfig {
+	return engine.StoreConfig{
+		Root:          s.stateRoot,
+		Clock:         s.clock,
+		Processes:     s.processes,
+		ProcessGroups: s.processGroups,
+		CancelGrace:   s.cancelGrace,
+		CancelWaiter:  s.cancelWaiter,
+	}
+}
+
+func (s *Server) rememberStoreLocked(store *engine.Store) *engine.Store {
+	key := store.Layout().Key
+	if existing := s.storesByKey[key]; existing != nil {
+		if workspace := store.Layout().Workspace; workspace != "" {
+			s.stores[workspace] = existing
+		}
+		return existing
+	}
+	s.storesByKey[key] = store
+	if workspace := store.Layout().Workspace; workspace != "" {
+		s.stores[workspace] = store
+	}
+	return store
+}
+
+func (s *Server) storeSnapshotLocked() []*engine.Store {
+	stores := make([]*engine.Store, 0, len(s.storesByKey))
+	for _, store := range s.storesByKey {
+		stores = append(stores, store)
+	}
+	sort.Slice(stores, func(i, j int) bool {
+		return stores[i].Layout().Key < stores[j].Layout().Key
+	})
+	return stores
 }
 
 func (s *Server) currentProcessRef() engine.ProcessRef {

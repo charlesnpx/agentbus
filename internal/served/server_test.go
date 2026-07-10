@@ -788,10 +788,11 @@ func TestIdleShutdownWaitsForActiveJobs(t *testing.T) {
 func TestStartReaperRecoversCrashedJob(t *testing.T) {
 	t.Parallel()
 	root := shortTempDir(t)
-	cwd := shortTempDir(t)
+	jobCWD := shortTempDir(t)
+	daemonCWD := shortTempDir(t)
 	store, err := engine.NewStore(engine.StoreConfig{
 		Root:      root,
-		CWD:       cwd,
+		CWD:       jobCWD,
 		Clock:     engine.ClockFunc(time.Now),
 		Processes: fakeProcessTable{},
 	})
@@ -809,7 +810,7 @@ func TestStartReaperRecoversCrashedJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend := newFakeBackend("fake")
-	h := startTestServerWithRoot(t, root, cwd, backend, Config{IdleTimeout: -1, ProcessTable: fakeProcessTable{}})
+	h := startTestServerWithRoot(t, root, daemonCWD, backend, Config{IdleTimeout: -1, ProcessTable: fakeProcessTable{}})
 	conn := dialRaw(t, h.socketPath)
 	defer conn.Close()
 	r := bufio.NewReader(conn)
@@ -819,6 +820,49 @@ func TestStartReaperRecoversCrashedJob(t *testing.T) {
 	decodeResult(t, status, &out)
 	if len(out.Jobs) != 1 || out.Jobs[0].State != engine.StateReaped {
 		t.Fatalf("status = %+v", out)
+	}
+}
+
+func TestJobLookupSurvivesRestartForNonStartupWorkspace(t *testing.T) {
+	t.Parallel()
+	root := shortTempDir(t)
+	jobCWD := shortTempDir(t)
+	daemonCWD := shortTempDir(t)
+
+	first := startTestServerWithRoot(t, root, daemonCWD, newFakeBackend("fake"), Config{IdleTimeout: -1})
+	conn := dialRaw(t, first.socketPath)
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, first.token)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: jobCWD, Write: false, Prompt: "complete"},
+	}), &submitted)
+	waitJobState(t, conn, r, submitted.JobID, engine.StateCompleted)
+	_ = conn.Close()
+	stopTestServer(t, first)
+
+	second := startTestServerWithRoot(t, root, daemonCWD, newFakeBackend("fake"), Config{IdleTimeout: -1})
+	conn = dialRaw(t, second.socketPath)
+	defer conn.Close()
+	r = bufio.NewReader(conn)
+	helloRaw(t, conn, r, second.token)
+
+	var status protocol.JobStatusResult
+	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: submitted.JobID}), &status)
+	if len(status.Jobs) != 1 || status.Jobs[0].State != engine.StateCompleted {
+		t.Fatalf("status after restart = %+v", status)
+	}
+
+	var result protocol.JobResult
+	decodeResult(t, rpc(t, conn, r, "4", protocol.MethodJobResult, protocol.JobResultParams{JobID: submitted.JobID}), &result)
+	if result.JobID != submitted.JobID || result.State != engine.StateCompleted || result.Result == nil || result.Result.Text == "" {
+		t.Fatalf("result after restart = %+v", result)
+	}
+
+	var canceled protocol.JobCancelResult
+	decodeResult(t, rpc(t, conn, r, "5", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: submitted.JobID}), &canceled)
+	if canceled.JobID != submitted.JobID || canceled.State != engine.StateCompleted {
+		t.Fatalf("cancel after restart = %+v", canceled)
 	}
 }
 
@@ -920,6 +964,16 @@ func startTestServerWithRoot(t *testing.T, root, cwd string, backend engine.Back
 		}
 	})
 	return h
+}
+
+func stopTestServer(t *testing.T, h testServer) {
+	t.Helper()
+	h.cancel()
+	select {
+	case <-h.done:
+	case <-time.After(time.Second):
+		t.Fatalf("server did not stop")
+	}
 }
 
 func waitForSocket(t *testing.T, socketPath string, done <-chan error) {

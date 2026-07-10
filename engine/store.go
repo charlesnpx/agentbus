@@ -66,6 +66,12 @@ type StoreConfig struct {
 	Retention     RetentionConfig
 }
 
+type workspaceManifest struct {
+	Version int    `json:"version"`
+	CWD     string `json:"cwd"`
+	Key     string `json:"key"`
+}
+
 // Store persists job records for one workspace namespace.
 type Store struct {
 	layout        WorkspaceLayout
@@ -98,6 +104,58 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	store, err := newStoreWithLayout(cfg, layout)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeWorkspaceManifest(layout); err != nil {
+		return nil, err
+	}
+	return store, nil
+}
+
+// OpenWorkspaceStores opens every persisted workspace namespace under cfg.Root.
+func OpenWorkspaceStores(cfg StoreConfig) ([]*Store, error) {
+	root := cfg.Root
+	var err error
+	if root == "" {
+		root, err = ResolveStateRoot()
+		if err != nil {
+			return nil, err
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "workspaces"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	stores := make([]*Store, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		key := entry.Name()
+		if err := validateWorkspaceKey(key); err != nil {
+			continue
+		}
+		workspace := readWorkspaceManifestCWD(filepath.Join(root, "workspaces", key), key)
+		layout, err := layoutForWorkspaceKey(root, key, workspace)
+		if err != nil {
+			return nil, err
+		}
+		store, err := newStoreWithLayout(cfg, layout)
+		if err != nil {
+			return nil, err
+		}
+		stores = append(stores, store)
+	}
+	sort.Slice(stores, func(i, j int) bool { return stores[i].layout.Key < stores[j].layout.Key })
+	return stores, nil
+}
+
+func newStoreWithLayout(cfg StoreConfig, layout WorkspaceLayout) (*Store, error) {
 	if err := ensureLayout(layout); err != nil {
 		return nil, err
 	}
@@ -148,6 +206,38 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 
 // Layout returns the workspace layout used by the store.
 func (s *Store) Layout() WorkspaceLayout { return s.layout }
+
+func writeWorkspaceManifest(layout WorkspaceLayout) error {
+	if layout.Workspace == "" {
+		return nil
+	}
+	manifest := workspaceManifest{
+		Version: 1,
+		CWD:     layout.Workspace,
+		Key:     layout.Key,
+	}
+	raw, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	return atomicWriteFile(filepath.Join(layout.Namespace, workspaceManifestFile), raw, 0o600)
+}
+
+func readWorkspaceManifestCWD(namespace, key string) string {
+	raw, err := os.ReadFile(filepath.Join(namespace, workspaceManifestFile))
+	if err != nil {
+		return ""
+	}
+	var manifest workspaceManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return ""
+	}
+	if manifest.Key != "" && manifest.Key != key {
+		return ""
+	}
+	return manifest.CWD
+}
 
 // Save writes a job record atomically.
 func (s *Store) Save(record *JobRecord) error {
@@ -204,6 +294,24 @@ func (s *Store) Update(jobID string, mutate func(*JobRecord) (bool, error)) (*Jo
 		return nil, err
 	}
 	return out, nil
+}
+
+// HasJob reports whether a persisted job record exists in this workspace store.
+func (s *Store) HasJob(jobID string) (bool, error) {
+	if err := validateJobID(jobID); err != nil {
+		return false, err
+	}
+	path, err := s.jobPath(jobID)
+	if err != nil {
+		return false, err
+	}
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // Load reads a job record and computes status-only lease fields.
