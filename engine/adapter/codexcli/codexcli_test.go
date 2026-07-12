@@ -52,6 +52,11 @@ func TestCodexProfilesAndParsing(t *testing.T) {
 
 func TestCodexSetupProbeUsesStdinPromptArg(t *testing.T) {
 	fake := fakeCodex(t)
+	writeModelsCache(t, filepath.Dir(fake.bin), `{
+  "fetched_at": "2026-07-10T12:00:00Z",
+  "client_version": "0.142.0",
+  "models": [{"slug":"gpt-5.4","visibility":"list","supported_reasoning_levels":[{"effort":"high"}]}]
+}`)
 	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
 	probeBackend, ok := backend.(interface {
 		SetupProbe(context.Context) (engine.BackendSetupProbe, error)
@@ -65,6 +70,9 @@ func TestCodexSetupProbeUsesStdinPromptArg(t *testing.T) {
 	}
 	if !probe.JSONEventsProbed {
 		t.Fatalf("probe = %#v", probe)
+	}
+	if probe.DiscoverySource != "models_cache" || probe.DiscoveryFetchedAt != "2026-07-10T12:00:00Z" || probe.DiscoveryClientVersion != "0.142.0" || !containsString(probe.DiscoveryWarnings, "client_version") {
+		t.Fatalf("discovery provenance = %#v", probe)
 	}
 	assertLog(t, fake.argv, "exec\n--json\n--sandbox\nread-only\n--ignore-user-config\n-\n")
 	assertLog(t, fake.stdin, "Reply with exactly: OK")
@@ -96,31 +104,88 @@ func TestCodexPreflightAndFailures(t *testing.T) {
 	}
 }
 
-func TestCodexDiscoveryDoesNotScrapeHelpText(t *testing.T) {
+func TestCodexDiscoveryUsesModelsCacheRatherThanHelpText(t *testing.T) {
 	fake := fakeCodex(t)
 	script := "#!/bin/sh\nif [ \"$1\" = --help ]; then echo \"-m, --model <MODEL>  Model the agent should use\"; echo \"possible values: c, disk-full-read-access, o3\"; exit 0; fi\nexec /bin/false\n"
 	if err := os.WriteFile(fake.bin, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(engine.ModelDiscoverer).DiscoverModels(context.Background())
-	if discovery != nil || err == nil || !strings.Contains(err.Error(), "no catalog exposed") {
+	if discovery != nil || err == nil || !strings.Contains(err.Error(), "models cache") {
 		t.Fatalf("discovery=%+v err=%v", discovery, err)
 	}
 }
 
-func TestCodexDiscoveryReportsParserMiss(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "codex")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\necho generic help\n"), 0o755); err != nil {
+func TestCodexDiscoveryReadsModelsCache(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	writeModelsCache(t, home, `{
+  "fetched_at": "2026-07-11T12:00:00Z",
+  "client_version": "0.143.0",
+  "unexpected": "ignored",
+  "models": [
+    {"slug":"gpt-5.4","display_name":"GPT-5.4","visibility":"list","supported_reasoning_levels":[{"effort":"high"},{"effort":"low"},{"effort":"turbo"}]},
+    {"slug":"codex-auto-review","visibility":"hidden","supported_reasoning_levels":[{"effort":"ultra"}]},
+    {"slug":"","visibility":"hidden"},
+    {"slug":"  ","visibility":"list"},
+    {"slug":"gpt-5.3","visibility":"list","supported_reasoning_levels":[{"effort":"none"},{"effort":"max"},{"effort":"turbo"},{"effort":"custom"}]}
+  ]
+}`)
+	discovery, err := discoverModels(context.Background(), "unused")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if discovery, err := discoverModels(context.Background(), path); discovery != nil || err == nil || !strings.Contains(err.Error(), "no catalog exposed") {
-		t.Fatalf("err=%v", err)
+	if got, want := strings.Join(discovery.Models, ","), "gpt-5.4,gpt-5.3"; got != want {
+		t.Fatalf("models = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(discovery.Efforts, ","), "none,low,high,max,turbo,custom"; got != want {
+		t.Fatalf("efforts = %q, want %q", got, want)
+	}
+	if discovery.Source != "models_cache" || discovery.FetchedAt != "2026-07-11T12:00:00Z" || discovery.ClientVersion != "0.143.0" {
+		t.Fatalf("discovery provenance = %#v", discovery)
+	}
+	if !containsString(discovery.Warnings, "empty slug") {
+		t.Fatalf("warnings = %#v, want empty-slug skip warning", discovery.Warnings)
+	}
+}
+
+func TestCodexDiscoveryReportsMissingMalformedAndStaleCache(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	if discovery, err := discoverModels(context.Background(), "unused"); discovery != nil || err == nil || !strings.Contains(err.Error(), "models cache") {
+		t.Fatalf("missing discovery=%+v err=%v", discovery, err)
+	}
+	writeModelsCache(t, home, `{not-json`)
+	if discovery, err := discoverModels(context.Background(), "unused"); discovery != nil || err == nil || !strings.Contains(err.Error(), "parse models cache") {
+		t.Fatalf("malformed discovery=%+v err=%v", discovery, err)
+	}
+	writeModelsCache(t, home, `{"fetched_at":"2020-01-01T00:00:00Z","models":[{"slug":"gpt-5.4","visibility":"list"}]}`)
+	discovery, err := discoverModels(context.Background(), "unused")
+	if err != nil || !containsString(discovery.Warnings, "older than 7 days") {
+		t.Fatalf("stale discovery=%+v err=%v", discovery, err)
+	}
+}
+
+func TestCodexSetupProbeReportsModelsCacheFailuresWithoutFailing(t *testing.T) {
+	fake := fakeCodex(t)
+	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
+	probeBackend := backend.(interface {
+		SetupProbe(context.Context) (engine.BackendSetupProbe, error)
+	})
+	probe, err := probeBackend.SetupProbe(context.Background())
+	if err != nil || len(probe.DiscoveredModels) != 0 || len(probe.DiscoveredEfforts) != 0 || !containsString(probe.DiscoveryWarnings, "read models cache") {
+		t.Fatalf("missing cache probe=%#v err=%v", probe, err)
+	}
+	writeModelsCache(t, filepath.Dir(fake.bin), `{not-json`)
+	probe, err = probeBackend.SetupProbe(context.Background())
+	if err != nil || len(probe.DiscoveredModels) != 0 || len(probe.DiscoveredEfforts) != 0 || !containsString(probe.DiscoveryWarnings, "parse models cache") {
+		t.Fatalf("malformed cache probe=%#v err=%v", probe, err)
 	}
 }
 
 func TestCodexDiscoveredCacheWinsAndLegacyFallsBack(t *testing.T) {
 	fake := fakeCodex(t)
-	cache := engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{Backend: "codex", BinaryPath: fake.bin, Version: MinimumKnownGoodVersion, StreamSchema: StreamSchema, DiscoveredModels: []string{"discovered"}, DiscoveredEfforts: []string{"turbo"}}}}
+	cache := engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{Backend: "codex", BinaryPath: fake.bin, Version: MinimumKnownGoodVersion, StreamSchema: StreamSchema, DiscoveredModels: []string{"discovered"}, DiscoveredEfforts: []string{"turbo"}, DiscoverySource: "models_cache"}}}
 	if err := engine.WriteSetupProbeCache(fake.cache, cache); err != nil {
 		t.Fatal(err)
 	}
@@ -128,8 +193,16 @@ func TestCodexDiscoveredCacheWinsAndLegacyFallsBack(t *testing.T) {
 	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "discovered", Effort: "turbo"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "static"}); err == nil {
-		t.Fatal("static model unexpectedly beat discovered cache")
+	session, err := backend.Start(context.Background(), engine.SessionOpts{Model: "static", Effort: "low"})
+	if err != nil {
+		t.Fatalf("discovered mismatch should pass through: %v", err)
+	}
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := collect(events); !containsWarning(got, "not in the discovered") {
+		t.Fatalf("events=%#v, want discovered-catalog warning", got)
 	}
 	v1 := fmt.Sprintf(`{"version":1,"backends":[{"backend":"codex","binaryPath":%q,"version":%q,"streamSchema":%q,"jsonEventsProbed":true}]}`, fake.bin, MinimumKnownGoodVersion, StreamSchema)
 	if err := os.WriteFile(fake.cache, []byte(v1), 0o600); err != nil {
@@ -139,7 +212,7 @@ func TestCodexDiscoveredCacheWinsAndLegacyFallsBack(t *testing.T) {
 		t.Fatalf("legacy fallback: %v", err)
 	}
 	health, err := backend.Preflight(context.Background())
-	if err != nil || !strings.Contains(health.Warning, "stale") {
+	if err == nil || !strings.Contains(err.Error(), "re-run agentbus setup") {
 		t.Fatalf("health=%+v err=%v", health, err)
 	}
 	legacy, err := engine.ReadSetupProbeCache(fake.cache)
@@ -152,6 +225,41 @@ func TestCodexDiscoveredCacheWinsAndLegacyFallsBack(t *testing.T) {
 	migrated, err := engine.ReadSetupProbeCache(fake.cache)
 	if err != nil || migrated.Version != engine.SetupProbeCacheVersion {
 		t.Fatalf("migrated=%+v err=%v", migrated, err)
+	}
+}
+
+func TestCodexSetupProbeCacheProvenanceRoundTripAndLegacyRequiresSetup(t *testing.T) {
+	fake := fakeCodex(t)
+	cache := engine.SetupProbeCache{Backends: []engine.BackendSetupProbe{{
+		Backend:                "codex",
+		BinaryPath:             fake.bin,
+		Version:                MinimumKnownGoodVersion,
+		StreamSchema:           StreamSchema,
+		DiscoverySource:        "models_cache",
+		DiscoveryFetchedAt:     "2026-07-11T12:00:00Z",
+		DiscoveryClientVersion: MinimumKnownGoodVersion,
+		DiscoveredModels:       []string{"gpt-5.4"},
+		DiscoveredEfforts:      []string{"medium", "high"},
+		DiscoveryWarnings:      []string{"cache is stale"},
+	}}}
+	if err := engine.WriteSetupProbeCache(fake.cache, cache); err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := engine.ReadSetupProbeCache(fake.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip.Version != engine.SetupProbeCacheVersion || len(roundTrip.Backends) != 1 || roundTrip.Backends[0].DiscoveryFetchedAt != "2026-07-11T12:00:00Z" || roundTrip.Backends[0].DiscoveryClientVersion != MinimumKnownGoodVersion {
+		t.Fatalf("cache round trip = %#v", roundTrip)
+	}
+
+	legacy := fmt.Sprintf(`{"version":2,"backends":[{"backend":"codex","binaryPath":%q,"version":%q,"streamSchema":%q}]}`, fake.bin, MinimumKnownGoodVersion, StreamSchema)
+	if err := os.WriteFile(fake.cache, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
+	if _, err := backend.Preflight(context.Background()); err == nil || !strings.Contains(err.Error(), "re-run agentbus setup") {
+		t.Fatalf("legacy cache preflight err = %v", err)
 	}
 }
 
@@ -230,6 +338,17 @@ func TestCodexDottedEventSchema(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].Type != engine.EventToolUse || events[0].Text != "git status" {
 		t.Fatalf("parse tool item.completed = %#v", events)
+	}
+}
+
+func TestCodexParseReportedModel(t *testing.T) {
+	events, id, err := parseEvent(map[string]any{"type": "session_configured", "thread_id": "codex-session", "model": "gpt-5.4"})
+	if err != nil || id != "codex-session" || len(events) != 1 || events[0].Type != engine.EventModelReported || events[0].ModelReported != "gpt-5.4" {
+		t.Fatalf("session_configured events=%#v id=%q err=%v", events, id, err)
+	}
+	events, _, err = parseEvent(map[string]any{"type": "thread.started", "model": ""})
+	if err != nil || len(events) != 0 {
+		t.Fatalf("empty model events=%#v err=%v", events, err)
 	}
 }
 
@@ -313,8 +432,25 @@ esac
 	t.Setenv("AGENTBUS_ARGV_LOG", f.argv)
 	t.Setenv("AGENTBUS_STDIN_LOG", f.stdin)
 	t.Setenv("AGENTBUS_TERM_LOG", f.term)
+	t.Setenv("CODEX_HOME", dir)
 	writeCache(t, f.cache, "codex", f.bin, MinimumKnownGoodVersion, StreamSchema)
 	return f
+}
+
+func writeModelsCache(t *testing.T, home, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(home, "models_cache.json"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func containsString(values []string, sub string) bool {
+	for _, value := range values {
+		if strings.Contains(value, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 func writeCache(t *testing.T, path, backend, bin, version, schema string) {

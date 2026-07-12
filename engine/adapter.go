@@ -50,18 +50,20 @@ type TurnInput struct {
 
 // Event is an agentbus streaming event emitted by an adapter.
 type Event struct {
-	Type      string         `json:"type"`
-	Name      string         `json:"name,omitempty"`
-	Text      string         `json:"text"`
-	Truncated bool           `json:"truncated"`
-	Metadata  map[string]any `json:"metadata,omitempty"`
-	RawText   string         `json:"-"`
+	Type          string         `json:"type"`
+	Name          string         `json:"name,omitempty"`
+	Text          string         `json:"text"`
+	Truncated     bool           `json:"truncated"`
+	ModelReported string         `json:"modelReported,omitempty"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
+	RawText       string         `json:"-"`
 }
 
 const (
 	EventAgentText     = "AgentText"
 	EventToolUse       = "ToolUse"
 	EventWarning       = "Warning"
+	EventModelReported = "ModelReported"
 	EventResultMessage = "ResultMessage"
 	EventTerminalError = "TerminalError"
 )
@@ -73,27 +75,32 @@ type SetupProbeCache struct {
 	Backends []BackendSetupProbe `json:"backends"`
 }
 
-const SetupProbeCacheVersion = 2
+const SetupProbeCacheVersion = 3
 
 // BackendSetupProbe records the setup-time facts required by Preflight.
 type BackendSetupProbe struct {
-	Backend           string   `json:"backend"`
-	BinaryPath        string   `json:"binaryPath"`
-	Version           string   `json:"version"`
-	StreamSchema      string   `json:"streamSchema"`
-	ConfigMode        ModeInfo `json:"configMode"`
-	SandboxModes      []string `json:"sandboxModes"`
-	JSONEventsProbed  bool     `json:"jsonEventsProbed"`
-	DiscoveredModels  []string `json:"discoveredModels,omitempty"`
-	DiscoveredEfforts []string `json:"discoveredEfforts,omitempty"`
-	DiscoverySource   string   `json:"discoverySource,omitempty"`
-	DiscoveryWarnings []string `json:"discoveryWarnings,omitempty"`
+	Backend                string   `json:"backend"`
+	BinaryPath             string   `json:"binaryPath"`
+	Version                string   `json:"version"`
+	StreamSchema           string   `json:"streamSchema"`
+	ConfigMode             ModeInfo `json:"configMode"`
+	SandboxModes           []string `json:"sandboxModes"`
+	JSONEventsProbed       bool     `json:"jsonEventsProbed"`
+	DiscoveredModels       []string `json:"discoveredModels,omitempty"`
+	DiscoveredEfforts      []string `json:"discoveredEfforts,omitempty"`
+	DiscoverySource        string   `json:"discoverySource,omitempty"`
+	DiscoveryFetchedAt     string   `json:"discoveryFetchedAt,omitempty"`
+	DiscoveryClientVersion string   `json:"discoveryClientVersion,omitempty"`
+	DiscoveryWarnings      []string `json:"discoveryWarnings,omitempty"`
 }
 
 type ModelDiscovery struct {
-	Models  []string
-	Efforts []string
-	Source  string
+	Models        []string
+	Efforts       []string
+	Source        string
+	FetchedAt     string
+	ClientVersion string
+	Warnings      []string
 }
 
 type ModelDiscoverer interface {

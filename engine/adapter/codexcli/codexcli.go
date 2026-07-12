@@ -2,9 +2,12 @@ package codexcli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"os/exec"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/internal/cliadapter"
@@ -41,12 +44,107 @@ func New(opts Options) engine.Backend {
 	}
 }
 
-func discoverModels(ctx context.Context, binary string) (*engine.ModelDiscovery, error) {
-	_, err := exec.CommandContext(ctx, binary, "--help").CombinedOutput()
+func discoverModels(ctx context.Context, _ string) (*engine.ModelDiscovery, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	path, err := modelsCachePath()
 	if err != nil {
 		return nil, err
 	}
-	return nil, fmt.Errorf("codex model discovery unavailable: no catalog exposed")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read models cache %s: %w", path, err)
+	}
+	var cache modelsCache
+	if err := json.Unmarshal(raw, &cache); err != nil {
+		return nil, fmt.Errorf("parse models cache %s: %w", path, err)
+	}
+
+	discovery := &engine.ModelDiscovery{
+		Source:        "models_cache",
+		FetchedAt:     cache.FetchedAt,
+		ClientVersion: cache.ClientVersion,
+	}
+	seenEfforts := make(map[string]struct{})
+	unknownEfforts := make([]string, 0)
+	for _, model := range cache.Models {
+		if model.Visibility != "list" {
+			continue
+		}
+		slug := strings.TrimSpace(model.Slug)
+		if slug == "" {
+			discovery.Warnings = append(discovery.Warnings, fmt.Sprintf("codex models cache %s: skipped a list-visible entry with an empty slug", path))
+			continue
+		}
+		discovery.Models = append(discovery.Models, slug)
+		for _, level := range model.SupportedReasoningLevels {
+			effort := strings.TrimSpace(level.Effort)
+			if effort == "" {
+				continue
+			}
+			if _, seen := seenEfforts[effort]; seen {
+				continue
+			}
+			seenEfforts[effort] = struct{}{}
+			if _, known := canonicalEffortRank[effort]; !known {
+				unknownEfforts = append(unknownEfforts, effort)
+			}
+		}
+	}
+	for _, effort := range canonicalEffortOrder {
+		if _, seen := seenEfforts[effort]; seen {
+			discovery.Efforts = append(discovery.Efforts, effort)
+		}
+	}
+	discovery.Efforts = append(discovery.Efforts, unknownEfforts...)
+
+	if cache.FetchedAt != "" {
+		fetchedAt, err := time.Parse(time.RFC3339, cache.FetchedAt)
+		if err != nil {
+			discovery.Warnings = append(discovery.Warnings, fmt.Sprintf("codex models cache fetched_at %q is not RFC 3339", cache.FetchedAt))
+		} else if fetchedAt.Before(time.Now().UTC().Add(-7 * 24 * time.Hour)) {
+			discovery.Warnings = append(discovery.Warnings, fmt.Sprintf("codex models cache is stale: fetched_at %q is older than 7 days", cache.FetchedAt))
+		}
+	}
+	return discovery, nil
+}
+
+type modelsCache struct {
+	FetchedAt     string       `json:"fetched_at"`
+	ClientVersion string       `json:"client_version"`
+	Models        []cacheModel `json:"models"`
+}
+
+type cacheModel struct {
+	Slug                     string           `json:"slug"`
+	Visibility               string           `json:"visibility"`
+	SupportedReasoningLevels []reasoningLevel `json:"supported_reasoning_levels"`
+}
+
+type reasoningLevel struct {
+	Effort string `json:"effort"`
+}
+
+var canonicalEffortOrder = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+
+var canonicalEffortRank = func() map[string]int {
+	ranks := make(map[string]int, len(canonicalEffortOrder))
+	for i, effort := range canonicalEffortOrder {
+		ranks[effort] = i
+	}
+	return ranks
+}()
+
+func modelsCachePath() (string, error) {
+	if home := os.Getenv("CODEX_HOME"); home != "" {
+		return filepath.Join(home, "models_cache.json"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve CODEX_HOME: %w", err)
+	}
+	return filepath.Join(home, ".codex", "models_cache.json"), nil
 }
 
 func buildArgs(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error) {
@@ -77,7 +175,9 @@ func parseEvent(obj map[string]any) ([]engine.Event, string, error) {
 	id := firstString(obj, "thread_id", "session_id", "sessionId", "conversation_id", "conversationId", "id")
 	typ := strings.ToLower(firstString(obj, "type", "event"))
 	switch typ {
-	case "thread.started", "task_started", "turn.started", "turn_started", "item.updated", "session_configured", "token_count":
+	case "thread.started", "session_configured":
+		return modelReportedEvent(obj, id), id, nil
+	case "task_started", "turn.started", "turn_started", "item.updated", "token_count":
 		return nil, id, nil
 	case "item.completed":
 		return parseItemCompleted(obj, id)
@@ -103,6 +203,14 @@ func parseEvent(obj map[string]any) ([]engine.Event, string, error) {
 		return []engine.Event{{Type: engine.EventAgentText, Text: text, Metadata: obj}}, id, nil
 	}
 	return nil, id, nil
+}
+
+func modelReportedEvent(obj map[string]any, id string) []engine.Event {
+	model := strings.TrimSpace(firstString(obj, "model"))
+	if model == "" {
+		return nil
+	}
+	return []engine.Event{{Type: engine.EventModelReported, ModelReported: model, Metadata: obj}}
 }
 
 func parseItemCompleted(obj map[string]any, id string) ([]engine.Event, string, error) {

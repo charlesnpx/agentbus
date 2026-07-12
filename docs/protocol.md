@@ -272,15 +272,31 @@ Result:
     "policy.retry": true,
     "nativeStructuredOutput.codex": false,
     "nativeStructuredOutput.claude": false,
-    "models.discovery": true
+    "models.discovery": true,
+    "models.reported": true
   }
 }
 ```
 
-`backendMetadata` and `models.discovery` are additive protocol-v1 fields. Older
-clients may ignore them and continue using the stable `backends` string array.
-Empty `models` or `efforts` arrays mean no runtime listing was discoverable and
-the adapter uses its static known-good validation list.
+`backendMetadata`, `models.discovery`, and `models.reported` are additive
+protocol-v1 fields. Older clients may ignore them and continue using the stable
+`backends` string array. Clients that need backend-confirmed model identity MUST
+gate on `models.reported`.
+
+### Model discovery, validation, and reporting
+
+Runtime model and effort catalogs are best-effort discovery data, not an
+entitlement guarantee. If a requested model or effort is absent from a current
+discovered catalog, agentbus MUST emit a `Warning` event and pass the request to
+the backend; the backend remains authoritative for rejecting an invalid value.
+Only an adapter's explicitly configured static allow-list may cause agentbus to
+reject a model or effort before starting the backend.
+
+`modelReported`, when present on `turn.result`, `job.status`, or `job.result`,
+is the non-empty model value reported by the backend while executing the turn.
+It is best-effort and MAY be absent. It is also repeated in `result` when a
+persisted final result exists. An empty backend event MUST NOT erase a model
+reported earlier in the same job.
 
 Unauthorized error example:
 
@@ -502,11 +518,13 @@ Terminal foreground notification:
   "turnId": "job_01J00000000000000000000001",
   "jobId": "job_01J00000000000000000000001",
   "state": "completed",
+  "modelReported": "gpt-5.4",
   "result": {
     "text": "PASS\n\n## Findings\nNone.",
     "resultPath": "/home/me/.local/state/agentbus/results/job_01J00000000000000000000001.txt",
     "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
-    "bytes": 24
+    "bytes": 24,
+    "modelReported": "gpt-5.4"
   },
   "contract": {
     "status": "compliant",
@@ -638,6 +656,7 @@ Result:
       "sessionId": "ses_01J00000000000000000000002",
       "backend": "claude",
       "state": "running",
+      "modelReported": "claude-opus-4",
       "tags": {
         "client": "delegate",
         "kind": "task"
@@ -683,10 +702,12 @@ Result:
   "jobId": "job_01J00000000000000000000002",
   "sessionId": "ses_01J00000000000000000000002",
   "state": "completed_noncompliant",
+  "modelReported": "claude-opus-4",
   "result": {
     "resultPath": "/home/me/.local/state/agentbus/results/job_01J00000000000000000000002.txt",
     "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
-    "bytes": 327680
+    "bytes": 327680,
+    "modelReported": "claude-opus-4"
   },
   "contract": {
     "status": "noncompliant",
@@ -926,7 +947,8 @@ Inline result shape:
   "text": "Final answer.",
   "resultPath": "/home/me/.local/state/agentbus/results/job_01J00000000000000000000001.txt",
   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
-  "bytes": 13
+  "bytes": 13,
+  "modelReported": "gpt-5.4"
 }
 ```
 
@@ -936,7 +958,8 @@ Spilled-only result shape:
 {
   "resultPath": "/home/me/.local/state/agentbus/results/job_01J00000000000000000000001.txt",
   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
-  "bytes": 327680
+  "bytes": 327680,
+  "modelReported": "gpt-5.4"
 }
 ```
 
