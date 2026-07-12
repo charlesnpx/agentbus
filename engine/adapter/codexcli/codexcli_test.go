@@ -228,6 +228,21 @@ func TestCodexDiscoveredCacheWinsAndLegacyFallsBack(t *testing.T) {
 	}
 }
 
+func TestCodexEmptyDiscoveredCatalogFallsBackToStaticEnforcement(t *testing.T) {
+	fake := fakeCodex(t)
+	cache := engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{Backend: "codex", BinaryPath: fake.bin, Version: MinimumKnownGoodVersion, StreamSchema: StreamSchema, DiscoverySource: "models_cache"}}}
+	if err := engine.WriteSetupProbeCache(fake.cache, cache); err != nil {
+		t.Fatal(err)
+	}
+	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: "turbo"}); err == nil || !strings.Contains(err.Error(), "unsupported effort") {
+		t.Fatalf("empty discovered catalog must fall back to static effort enforcement, err=%v", err)
+	}
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: "xhigh"}); err != nil {
+		t.Fatalf("static effort should pass: %v", err)
+	}
+}
+
 func TestCodexSetupProbeCacheProvenanceRoundTripAndLegacyRequiresSetup(t *testing.T) {
 	fake := fakeCodex(t)
 	cache := engine.SetupProbeCache{Backends: []engine.BackendSetupProbe{{

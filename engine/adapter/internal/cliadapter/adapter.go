@@ -247,8 +247,8 @@ func (b *Backend) validationSets(ctx context.Context) (map[string]struct{}, map[
 		}
 		models := b.AllowedModels
 		efforts := b.AllowedEfforts
-		modelsDiscovered := probe.DiscoverySource != ""
-		effortsDiscovered := probe.DiscoverySource != ""
+		modelsDiscovered := probe.DiscoverySource != "" && len(probe.DiscoveredModels) > 0
+		effortsDiscovered := probe.DiscoverySource != "" && len(probe.DiscoveredEfforts) > 0
 		if modelsDiscovered {
 			models = StringSet(probe.DiscoveredModels...)
 		}

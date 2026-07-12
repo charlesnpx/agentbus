@@ -296,7 +296,10 @@ reject a model or effort before starting the backend.
 is the non-empty model value reported by the backend while executing the turn.
 It is best-effort and MAY be absent. It is also repeated in `result` when a
 persisted final result exists. An empty backend event MUST NOT erase a model
-reported earlier in the same job.
+reported earlier in the same job. When a backend reports more than one non-empty
+model in the same job, the most recent value wins: later configuration events
+(for example codex `session_configured` after `thread.started`) and later
+attempts refine earlier ones.
 
 Unauthorized error example:
 

@@ -546,14 +546,16 @@ func normalizeProbe(probe engine.BackendSetupProbe, name string) engine.BackendS
 
 func setupReportFromProbe(probe engine.BackendSetupProbe) setupBackendReport {
 	return setupBackendReport{
-		Backend:           probe.Backend,
-		BinaryPath:        probe.BinaryPath,
-		Version:           probe.Version,
-		ConfigMode:        probe.ConfigMode,
-		SandboxModes:      append([]string(nil), probe.SandboxModes...),
-		DiscoveredModels:  append([]string(nil), probe.DiscoveredModels...),
-		DiscoveredEfforts: append([]string(nil), probe.DiscoveredEfforts...),
-		Warnings:          append([]string(nil), probe.DiscoveryWarnings...),
+		Backend:                probe.Backend,
+		BinaryPath:             probe.BinaryPath,
+		Version:                probe.Version,
+		ConfigMode:             probe.ConfigMode,
+		SandboxModes:           append([]string(nil), probe.SandboxModes...),
+		DiscoveredModels:       append([]string(nil), probe.DiscoveredModels...),
+		DiscoveredEfforts:      append([]string(nil), probe.DiscoveredEfforts...),
+		DiscoveryFetchedAt:     probe.DiscoveryFetchedAt,
+		DiscoveryClientVersion: probe.DiscoveryClientVersion,
+		Warnings:               append([]string(nil), probe.DiscoveryWarnings...),
 		JSONEventsProbe: setupJSONEventsProbe{
 			Ran:          probe.JSONEventsProbed,
 			Version:      probe.Version,
@@ -895,16 +897,18 @@ type setupOutput struct {
 }
 
 type setupBackendReport struct {
-	Backend           string               `json:"backend"`
-	BinaryPath        string               `json:"binaryPath,omitempty"`
-	Version           string               `json:"version,omitempty"`
-	ConfigMode        engine.ModeInfo      `json:"configMode"`
-	SandboxModes      []string             `json:"sandboxModes,omitempty"`
-	JSONEventsProbe   setupJSONEventsProbe `json:"jsonEventsProbe"`
-	DiscoveredModels  []string             `json:"discoveredModels"`
-	DiscoveredEfforts []string             `json:"discoveredEfforts"`
-	Warnings          []string             `json:"warnings,omitempty"`
-	Error             string               `json:"error,omitempty"`
+	Backend                string               `json:"backend"`
+	BinaryPath             string               `json:"binaryPath,omitempty"`
+	Version                string               `json:"version,omitempty"`
+	ConfigMode             engine.ModeInfo      `json:"configMode"`
+	SandboxModes           []string             `json:"sandboxModes,omitempty"`
+	JSONEventsProbe        setupJSONEventsProbe `json:"jsonEventsProbe"`
+	DiscoveredModels       []string             `json:"discoveredModels"`
+	DiscoveredEfforts      []string             `json:"discoveredEfforts"`
+	DiscoveryFetchedAt     string               `json:"discoveryFetchedAt,omitempty"`
+	DiscoveryClientVersion string               `json:"discoveryClientVersion,omitempty"`
+	Warnings               []string             `json:"warnings,omitempty"`
+	Error                  string               `json:"error,omitempty"`
 }
 
 type setupJSONEventsProbe struct {
