@@ -1085,6 +1085,68 @@ func TestIdleShutdownWaitsForActiveJobs(t *testing.T) {
 	}
 }
 
+func TestBinaryChangeExitsPromptlyWhenQuiet(t *testing.T) {
+	t.Parallel()
+	changed := newBinaryChangeProbe()
+	h := startTestServer(t, newFakeBackend("fake"), Config{
+		IdleTimeout:         -1,
+		IdleCheckInterval:   10 * time.Millisecond,
+		BinaryIdentityProbe: changed.probe,
+	})
+	changed.changed.Store(true)
+
+	select {
+	case err := <-h.done:
+		if err != nil {
+			t.Fatalf("server exited with error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not restart promptly after its binary changed while quiet")
+	}
+}
+
+func TestBinaryChangeWaitsForConnectionsAndActiveJobs(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	backend := newFakeBackend("fake")
+	backend.block = release
+	backend.started = make(chan struct{}, 1)
+	changed := newBinaryChangeProbe()
+	h := startTestServer(t, backend, Config{
+		IdleTimeout:         -1,
+		IdleCheckInterval:   10 * time.Millisecond,
+		BinaryIdentityProbe: changed.probe,
+	})
+	conn := dialRaw(t, h.socketPath)
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+	var job protocol.JobSubmitResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{
+		Backend: "fake",
+		CWD:     h.cwd,
+		Write:   false,
+		Prompt:  "hold",
+	}}), &job)
+	<-backend.started
+	changed.changed.Store(true)
+
+	assertServerStillRunning(t, h.done, "a client connection was open")
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertServerStillRunning(t, h.done, "a job was active")
+	close(release)
+
+	select {
+	case err := <-h.done:
+		if err != nil {
+			t.Fatalf("server exited with error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not restart after its connection and active job cleared")
+	}
+}
+
 func TestStartReaperRecoversCrashedJob(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
@@ -1289,6 +1351,31 @@ type testServer struct {
 	token      string
 	done       chan error
 	cancel     context.CancelFunc
+}
+
+type binaryChangeProbe struct {
+	changed atomic.Bool
+}
+
+func newBinaryChangeProbe() *binaryChangeProbe {
+	return &binaryChangeProbe{}
+}
+
+func (p *binaryChangeProbe) probe(string) (BinaryIdentity, error) {
+	size := int64(1)
+	if p.changed.Load() {
+		size = 2
+	}
+	return BinaryIdentity{ModTime: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC), Size: size}, nil
+}
+
+func assertServerStillRunning(t *testing.T, done <-chan error, reason string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("server stopped while %s: %v", reason, err)
+	case <-time.After(80 * time.Millisecond):
+	}
 }
 
 func startTestServer(t *testing.T, backend engine.Backend, cfg Config) testServer {

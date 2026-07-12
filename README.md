@@ -47,6 +47,10 @@ the binary from source with Go, reports SHA-256 hashes on real installs, and
 does not install Claude or Codex skills in v1. The release tag should be
 `v$(cat VERSION)`; release tagging updates `VERSION`.
 
+## Release notes
+
+- v0.4.0: a real direct tools install stops a matching `agentbus serve` daemon after replacing the binary. For staged/mise upgrades, the running daemon detects that its on-disk binary changed and exits at its next quiet moment; the next client autostarts the upgraded binary.
+
 For local installer checks:
 
 ```sh
