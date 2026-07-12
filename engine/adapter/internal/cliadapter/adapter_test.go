@@ -84,7 +84,7 @@ func TestSessionTurnSurfacesMalformedStreamAsTerminalError(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEvents(events)
-	if len(got) != 1 || got[0].Type != engine.EventTerminalError || !strings.Contains(got[0].Text, "malformed backend stream") {
+	if len(got) == 0 || got[len(got)-1].Type != engine.EventTerminalError || !strings.Contains(got[len(got)-1].Text, "malformed backend stream") {
 		t.Fatalf("events = %#v, want terminal malformed-stream error", got)
 	}
 }
@@ -110,7 +110,7 @@ func TestSessionTurnSurfacesNonzeroExitAsTerminalError(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEvents(events)
-	if len(got) != 1 || got[0].Type != engine.EventTerminalError || !strings.Contains(got[0].Text, "backend exploded") {
+	if len(got) == 0 || got[len(got)-1].Type != engine.EventTerminalError || !strings.Contains(got[len(got)-1].Text, "backend exploded") {
 		t.Fatalf("events = %#v, want terminal nonzero-exit error", got)
 	}
 }

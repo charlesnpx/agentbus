@@ -164,7 +164,7 @@ func parseEvent(obj map[string]any) ([]engine.Event, string, error) {
 	typ := strings.ToLower(firstString(obj, "type"))
 	switch typ {
 	case "system":
-		return nil, id, nil
+		return modelReportedEvent(obj), id, nil
 	case "assistant":
 		return parseAssistant(obj, id)
 	case "result":
@@ -180,6 +180,14 @@ func parseEvent(obj map[string]any) ([]engine.Event, string, error) {
 		return []engine.Event{{Type: engine.EventAgentText, Text: text, Metadata: obj}}, id, nil
 	}
 	return nil, id, nil
+}
+
+func modelReportedEvent(obj map[string]any) []engine.Event {
+	model := strings.TrimSpace(firstString(obj, "model"))
+	if model == "" {
+		return nil
+	}
+	return []engine.Event{{Type: engine.EventModelReported, ModelReported: model, Metadata: obj}}
 }
 
 func parseAssistant(obj map[string]any, id string) ([]engine.Event, string, error) {

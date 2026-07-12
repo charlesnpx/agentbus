@@ -157,6 +157,12 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 		probe.DiscoveredModels = discovered.Models
 		probe.DiscoveredEfforts = discovered.Efforts
 		probe.DiscoverySource = discovered.Source
+		probe.DiscoveryFetchedAt = discovered.FetchedAt
+		probe.DiscoveryClientVersion = discovered.ClientVersion
+		probe.DiscoveryWarnings = append(probe.DiscoveryWarnings, discovered.Warnings...)
+		if discovered.ClientVersion != "" && b.normalizeVersion(discovered.ClientVersion) != version {
+			probe.DiscoveryWarnings = append(probe.DiscoveryWarnings, fmt.Sprintf("%s model discovery cache client_version %q does not match probed version %q", b.NameValue, discovered.ClientVersion, version))
+		}
 	} else if discoverErr != nil {
 		probe.DiscoveryWarnings = append(probe.DiscoveryWarnings, fmt.Sprintf("%s model discovery failed: %v", b.NameValue, discoverErr))
 	}
@@ -204,21 +210,29 @@ func (b *Backend) normalizeVersion(s string) string {
 }
 
 func (b *Backend) validateOptions(ctx context.Context, opts engine.SessionOpts) (string, error) {
-	models, efforts, warning := b.validationSets(ctx)
-	if opts.Model != "" && len(models) > 0 {
+	models, efforts, modelsDiscovered, effortsDiscovered, warning := b.validationSets(ctx)
+	if opts.Model != "" {
 		if _, ok := models[opts.Model]; !ok {
-			return warning, fmt.Errorf("unsupported model %q for %s", opts.Model, b.NameValue)
+			if modelsDiscovered {
+				warning = appendWarning(warning, fmt.Sprintf("model %q is not in the discovered %s catalog; passing through to backend", opts.Model, b.NameValue))
+			} else if len(models) > 0 {
+				return warning, fmt.Errorf("unsupported model %q for %s", opts.Model, b.NameValue)
+			}
 		}
 	}
-	if opts.Effort != "" && len(efforts) > 0 {
+	if opts.Effort != "" {
 		if _, ok := efforts[opts.Effort]; !ok {
-			return warning, fmt.Errorf("unsupported effort %q for %s", opts.Effort, b.NameValue)
+			if effortsDiscovered {
+				warning = appendWarning(warning, fmt.Sprintf("effort %q is not in the discovered %s catalog; passing through to backend", opts.Effort, b.NameValue))
+			} else if len(efforts) > 0 {
+				return warning, fmt.Errorf("unsupported effort %q for %s", opts.Effort, b.NameValue)
+			}
 		}
 	}
 	return warning, nil
 }
 
-func (b *Backend) validationSets(ctx context.Context) (map[string]struct{}, map[string]struct{}, string) {
+func (b *Backend) validationSets(ctx context.Context) (map[string]struct{}, map[string]struct{}, bool, bool, string) {
 	cache, cacheErr := b.readCache()
 	probe, err := b.cachedProbe()
 	if cacheErr == nil && cache.Version == engine.SetupProbeCacheVersion && err == nil {
@@ -229,29 +243,41 @@ func (b *Backend) validationSets(ctx context.Context) (map[string]struct{}, map[
 			version, versionErr = commandOutput(ctx, binary, "--version")
 		}
 		if binaryErr != nil || versionErr != nil || probe.BinaryPath != binary || probe.Version != b.normalizeVersion(version) {
-			return b.AllowedModels, b.AllowedEfforts, "model discovery cache is stale; using static known-good validation lists"
+			return b.AllowedModels, b.AllowedEfforts, false, false, "model discovery cache is stale; using static known-good validation lists"
 		}
 		models := b.AllowedModels
 		efforts := b.AllowedEfforts
-		if len(probe.DiscoveredModels) > 0 {
+		modelsDiscovered := probe.DiscoverySource != "" && len(probe.DiscoveredModels) > 0
+		effortsDiscovered := probe.DiscoverySource != "" && len(probe.DiscoveredEfforts) > 0
+		if modelsDiscovered {
 			models = StringSet(probe.DiscoveredModels...)
 		}
-		if len(probe.DiscoveredEfforts) > 0 {
+		if effortsDiscovered {
 			efforts = StringSet(probe.DiscoveredEfforts...)
 		}
-		return models, efforts, ""
+		return models, efforts, modelsDiscovered, effortsDiscovered, ""
 	}
 	if cacheErr == nil {
-		return b.AllowedModels, b.AllowedEfforts, "model discovery cache is stale; using static known-good validation lists"
+		return b.AllowedModels, b.AllowedEfforts, false, false, "model discovery cache is stale; using static known-good validation lists"
 	}
-	return b.AllowedModels, b.AllowedEfforts, ""
+	return b.AllowedModels, b.AllowedEfforts, false, false, ""
+}
+
+func appendWarning(existing, addition string) string {
+	if existing == "" {
+		return addition
+	}
+	return existing + "; " + addition
 }
 
 func (b *Backend) discoveryWarning(probe engine.BackendSetupProbe, version string) string {
 	if cache, err := b.readCache(); err == nil && cache.Version != engine.SetupProbeCacheVersion {
 		return "model discovery cache is stale; using static known-good validation lists"
 	}
-	if len(probe.DiscoveredModels) == 0 && len(probe.DiscoveredEfforts) == 0 {
+	if len(probe.DiscoveryWarnings) > 0 {
+		return strings.Join(probe.DiscoveryWarnings, "; ")
+	}
+	if probe.DiscoverySource == "" && len(probe.DiscoveredModels) == 0 && len(probe.DiscoveredEfforts) == 0 {
 		return "model discovery unavailable; using static known-good validation lists"
 	}
 	if probe.Version != version {
@@ -276,6 +302,9 @@ func (b *Backend) cachedProbe() (engine.BackendSetupProbe, error) {
 	cache, err := b.readCache()
 	if err != nil {
 		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache missing for %s; re-run agentbus setup: %w", b.NameValue, err)
+	}
+	if cache.Version != engine.SetupProbeCacheVersion {
+		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache version %d is stale; re-run agentbus setup", cache.Version)
 	}
 	for _, p := range cache.Backends {
 		if p.Backend == b.NameValue {

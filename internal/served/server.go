@@ -1096,6 +1096,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				_ = s.updateBackendSessionID(run.store, run.jobID, id)
 			}
 			rawText := authoritativeText(event)
+			if event.ModelReported != "" {
+				_ = s.updateModelReported(run.store, run.jobID, event.ModelReported)
+			}
 			switch event.Type {
 			case engine.EventAgentText:
 				assistantText.WriteString(rawText)
@@ -1108,7 +1111,7 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				}
 				return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, errors.New(rawText)
 			}
-			if run.foreground && run.conn != nil && event.Type != engine.EventResultMessage && event.Type != engine.EventTerminalError {
+			if run.foreground && run.conn != nil && event.Type != engine.EventResultMessage && event.Type != engine.EventTerminalError && event.Type != engine.EventModelReported {
 				sequence++
 				wireEvent := prepareWireEvent(event)
 				_ = run.conn.notify(protocol.NotificationTurnEvent, protocol.TurnEventParams{
@@ -1237,6 +1240,7 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 			if err != nil {
 				return false, err
 			}
+			info.ModelReported = record.ModelReported
 			result = &info
 		}
 		if salvageReaped {
@@ -1336,6 +1340,20 @@ func (s *Server) updateBackendSessionID(store *engine.Store, jobID, backendSessi
 			return false, nil
 		}
 		record.BackendSessionID = backendSessionID
+		return true, nil
+	})
+	return err
+}
+
+func (s *Server) updateModelReported(store *engine.Store, jobID, modelReported string) error {
+	if modelReported == "" {
+		return nil
+	}
+	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
+		if record.ModelReported == modelReported {
+			return false, nil
+		}
+		record.ModelReported = modelReported
 		return true, nil
 	})
 	return err
@@ -1802,28 +1820,31 @@ func statusFromRecord(record engine.JobRecord) protocol.JobStatus {
 		BackendChildStartTime: record.BackendChildStartTime,
 		StatePath:             record.StatePath,
 		LogPaths:              record.LogPaths,
+		ModelReported:         record.ModelReported,
 		Warnings:              append([]string(nil), record.Warnings...),
 	}
 }
 
 func resultFromRecord(record engine.JobRecord) protocol.JobResult {
 	return protocol.JobResult{
-		JobID:     record.JobID,
-		SessionID: record.SessionID,
-		State:     record.State,
-		Result:    record.Result,
-		Contract:  record.Contract,
+		JobID:         record.JobID,
+		SessionID:     record.SessionID,
+		State:         record.State,
+		Result:        record.Result,
+		ModelReported: record.ModelReported,
+		Contract:      record.Contract,
 	}
 }
 
 func turnResultFromRecord(record engine.JobRecord) protocol.TurnResultParams {
 	return protocol.TurnResultParams{
-		SessionID: record.SessionID,
-		TurnID:    record.JobID,
-		JobID:     record.JobID,
-		State:     record.State,
-		Result:    record.Result,
-		Contract:  record.Contract,
+		SessionID:     record.SessionID,
+		TurnID:        record.JobID,
+		JobID:         record.JobID,
+		State:         record.State,
+		Result:        record.Result,
+		ModelReported: record.ModelReported,
+		Contract:      record.Contract,
 	}
 }
 

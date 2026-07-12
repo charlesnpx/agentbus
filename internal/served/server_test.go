@@ -178,7 +178,7 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	if len(hello.BackendMetadata) != 1 || hello.BackendMetadata[0].Backend != "fake" || hello.BackendMetadata[0].Models == nil || hello.BackendMetadata[0].Efforts == nil {
 		t.Fatalf("hello backend metadata = %+v", hello.BackendMetadata)
 	}
-	for _, capability := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery"} {
+	for _, capability := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery", "models.reported"} {
 		if _, ok := hello.Capabilities[capability]; !ok {
 			t.Fatalf("missing capability %s in %+v", capability, hello.Capabilities)
 		}
@@ -265,6 +265,60 @@ func TestTurnNotificationsCorrelationPolicyStampAndJobResult(t *testing.T) {
 	gotTurn := <-backend.turns
 	if gotTurn.Write {
 		t.Fatalf("turn write = true, want per-turn downgrade to false")
+	}
+}
+
+func TestReportedModelPersistsToJobRecordAndWireResults(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{
+			{Type: engine.EventModelReported, ModelReported: "gpt-5.4"},
+			{Type: engine.EventModelReported},
+			{Type: engine.EventAgentText, Text: "hello"},
+			{Type: engine.EventResultMessage, Text: "hello"},
+		}
+	}
+	h := startTestServer(t, backend, Config{IdleTimeout: -1})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	var session protocol.SessionStartResult
+	decodeResult(t, rpc(t, conn, r, "1", protocol.MethodSessionStart, protocol.SessionStartParams{Backend: "fake", CWD: h.cwd}), &session)
+	var turn protocol.TurnStartResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodTurnStart, protocol.TurnStartParams{SessionID: session.SessionID, Prompt: "hello"}), &turn)
+
+	event := readNotification(t, r)
+	if event.Method != protocol.NotificationTurnEvent {
+		t.Fatalf("first notification = %s, want turn.event", event.Method)
+	}
+	var eventParams protocol.TurnEventParams
+	mustUnmarshal(t, event.Params, &eventParams)
+	if eventParams.Event.Type != engine.EventAgentText {
+		t.Fatalf("model event leaked as turn event: %+v", eventParams.Event)
+	}
+	resultNotice := readNotification(t, r)
+	var turnResult protocol.TurnResultParams
+	mustUnmarshal(t, resultNotice.Params, &turnResult)
+	if turnResult.ModelReported != "gpt-5.4" || turnResult.Result == nil || turnResult.Result.ModelReported != "gpt-5.4" {
+		t.Fatalf("turn result model = %+v", turnResult)
+	}
+
+	var status protocol.JobStatusResult
+	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: turn.JobID}), &status)
+	if len(status.Jobs) != 1 || status.Jobs[0].ModelReported != "gpt-5.4" {
+		t.Fatalf("job status = %+v", status)
+	}
+	var result protocol.JobResult
+	decodeResult(t, rpc(t, conn, r, "4", protocol.MethodJobResult, protocol.JobResultParams{JobID: turn.JobID}), &result)
+	if result.ModelReported != "gpt-5.4" || result.Result == nil || result.Result.ModelReported != "gpt-5.4" {
+		t.Fatalf("job result = %+v", result)
+	}
+	record := loadJobRecord(t, h.root, h.cwd, turn.JobID, engine.NativeProcessTable{})
+	if record.ModelReported != "gpt-5.4" || record.Result == nil || record.Result.ModelReported != "gpt-5.4" {
+		t.Fatalf("job record = %+v", record)
 	}
 }
 

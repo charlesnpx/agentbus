@@ -320,7 +320,7 @@ this shape:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "backends": [
     {
       "backend": "codex",
@@ -335,7 +335,9 @@ this shape:
       "jsonEventsProbed": true,
       "discoveredModels": ["gpt-5.4"],
       "discoveredEfforts": ["low", "medium", "high", "xhigh"],
-      "discoverySource": "codex --help (listing syntax when exposed)"
+      "discoverySource": "models_cache",
+      "discoveryFetchedAt": "2026-07-11T12:00:00Z",
+      "discoveryClientVersion": "0.143.0"
     }
   ]
 }
@@ -343,22 +345,40 @@ this shape:
 
 Model and effort discovery runs only inside `agentbus setup`, alongside the
 live stream probe. Routine `Preflight` reads the versioned cache and never runs
-a discovery command or network turn. A current non-empty discovery list wins
-for adapter option validation. Missing or legacy discovery data falls back to
-the adapter's static known-good list and emits a loud warning in setup output
-and `Health.Warning`; discovery data alone never causes a hard failure.
+a discovery command or network turn. A stale setup-probe cache version requires
+a new setup probe; it is not silently migrated into a trusted discovery result.
+
+For Codex, discovery reads `${CODEX_HOME:-~/.codex}/models_cache.json` locally.
+This is an undocumented internal Codex file and agentbus reads it strictly
+best-effort: it relies only on `fetched_at`, `client_version`, and
+`models[].slug`, `models[].visibility`, and
+`models[].supported_reasoning_levels[].effort`, tolerating all other fields.
+Only models with `visibility == "list"` are advertised. Models retain cache
+order; effort levels are the per-model union ordered as `none`, `minimal`,
+`low`, `medium`, `high`, `xhigh`, `max`, `ultra`, then first-seen unknown
+levels. A missing or malformed cache produces empty lists and an explicit setup
+warning. An old `fetched_at` (more than seven days) or a `client_version` that
+differs from the probed Codex version still supplies the catalog, with a
+staleness warning.
+
+Discovery data never makes a backend unavailable. A requested model or effort
+outside a discovered catalog emits a warning and is passed through to the
+backend. Only explicitly configured static allow-lists reject a selection
+before the backend starts. Missing discovery data falls back to those static
+known-good lists with a warning.
 
 Verified discovery surfaces for the installed CLIs:
 
 | Backend | Verified source | Discovery status |
 | --- | --- | --- |
-| codex | `codex --help`; user config contains selected model and effort but help exposes no available-model or effort listing | Parser accepts future help listing syntax; current installed CLI returns no discovery, so static fallback is used. |
+| codex | `${CODEX_HOME:-~/.codex}/models_cache.json` | Best-effort undocumented internal cache; `visibility == "list"` model slugs and supported reasoning efforts are cached. |
 | claude | `claude --help` lists effort choices and documents model aliases/examples | Efforts and documented model aliases/examples are cached. These are help-advertised values, not an account-entitlement query. |
 | gemini | `gemini --help` exposes `--model` but no model or effort listing | B1-ready discovery interface returns no listing; static fallback applies when the B2 adapter is added. |
 
-`agentbus setup --json` exposes `discoveredModels`, `discoveredEfforts`, and
-`warnings` per backend. `protocol.hello.backendMetadata` exposes the cached
-arrays with capability `models.discovery`; the protocol major remains 1.
+`agentbus setup --json` exposes `discoveredModels`, `discoveredEfforts`,
+`discoveryFetchedAt`, `discoveryClientVersion`, and `warnings` per backend.
+`protocol.hello.backendMetadata` exposes the cached arrays with capability
+`models.discovery`; the protocol major remains 1.
 
 ## A5 flag verification amendments
 
@@ -391,6 +411,7 @@ The codex adapter maps:
 | Codex event | agentbus event | Basis |
 | --- | --- | --- |
 | `thread.started.thread_id` | session ID | live-verified resume identifier |
+| `thread.started.model` or `session_configured.model` | reported model | best-effort backend-resolved model capture |
 | `item.completed` with `item.type=agent_message` | `AgentText` | live-verified nested message shape |
 | `item.completed` with another item type | `ToolUse` | covers command execution, todo lists, and future item types |
 | `turn.completed` | `ResultMessage` | uses its own result text when present, otherwise the last agent message |
@@ -427,13 +448,14 @@ The implementation MUST keep responsibilities at the existing boundary:
 Implement the B1 discovery hooks in addition to `Backend`: expose
 `ModelDiscoverer.DiscoverModels(context.Context)` and
 `BackendMetadataProvider.BackendMetadata(context.Context)`. Discovery MUST run
-only during `agentbus setup`, use local CLI surfaces such as verified help or
-config listings, and return `ModelDiscovery` with models, efforts, and an
-evidence-bearing source string. Cache non-empty results in `BackendSetupProbe`.
-Missing, failed, legacy, or stale discovery MUST fall back to static
-known-good validation lists with a warning; it MUST NOT make the backend
-unavailable. Metadata advertised by `protocol.hello` comes from the cache and
-MUST NOT launch discovery or a network turn.
+only during `agentbus setup`, use a local evidenced source, and return
+`ModelDiscovery` with models, efforts, provenance, and warnings as available.
+Cache the result in `BackendSetupProbe`. Missing or failed discovery MUST leave
+empty lists plus an explicit warning and MUST NOT make the backend unavailable.
+Selections outside a discovered set MUST warn and pass through; only an
+explicit static allow-list may reject them. Metadata advertised by
+`protocol.hello` comes from the cache and MUST NOT launch discovery or a
+network turn.
 
 ### 2. Verify and pin argv profiles
 
@@ -483,7 +505,9 @@ The adapter MUST parse the CLI's real streaming format incrementally, reject
 malformed records, and map backend events to `AgentText`, `ToolUse`, `Warning`,
 `ResultMessage`, and `TerminalError`. It MUST extract a stable backend session
 id from any documented start or event envelope, retain the first valid id, and
-use it for resume. It MUST distinguish progress text from the authoritative
+use it for resume. When a backend init/configuration event carries a model, the
+adapter MUST capture that non-empty model as best-effort reported-model data.
+It MUST distinguish progress text from the authoritative
 terminal result and map the latter to exactly the `ResultMessage` consumed by
 engine result selection. Parse errors, unsupported terminal shapes, and
 non-zero process exits MUST surface as terminal errors rather than successful

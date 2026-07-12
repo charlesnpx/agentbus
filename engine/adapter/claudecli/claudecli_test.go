@@ -157,6 +157,34 @@ func TestClaudeDiscoveryParsesFakeHelp(t *testing.T) {
 	}
 }
 
+func TestClaudeDiscoveredCatalogMismatchWarnsAndProceeds(t *testing.T) {
+	fake := fakeClaude(t)
+	cache := engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{
+		Backend:           "claude",
+		BinaryPath:        fake.bin,
+		Version:           MinimumKnownGoodVersion,
+		StreamSchema:      StreamSchema,
+		DiscoveredModels:  []string{"sonnet"},
+		DiscoveredEfforts: []string{"medium"},
+		DiscoverySource:   "claude --help",
+	}}}
+	if err := engine.WriteSetupProbeCache(fake.cache, cache); err != nil {
+		t.Fatal(err)
+	}
+	backend := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"static"}, SupportedEfforts: []string{"low"}})
+	session, err := backend.Start(context.Background(), engine.SessionOpts{Model: "not-discovered", Effort: "high"})
+	if err != nil {
+		t.Fatalf("discovered mismatch should pass through: %v", err)
+	}
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := collect(events); !containsWarning(got, "model \"not-discovered\"") || !containsWarning(got, "effort \"high\"") {
+		t.Fatalf("events=%#v, want model and effort discovery warnings", got)
+	}
+}
+
 func TestClaudeResultEventIsAuthoritativeResultMessage(t *testing.T) {
 	events, id, err := parseEvent(map[string]any{
 		"type":       "result",
@@ -168,6 +196,17 @@ func TestClaudeResultEventIsAuthoritativeResultMessage(t *testing.T) {
 	}
 	if id != "claude-session" || len(events) != 1 || events[0].Type != engine.EventResultMessage || events[0].Text != "final answer" {
 		t.Fatalf("parse result = events:%#v id:%q", events, id)
+	}
+}
+
+func TestClaudeParseReportedModel(t *testing.T) {
+	events, id, err := parseEvent(map[string]any{"type": "system", "session_id": "claude-session", "model": "claude-opus-4"})
+	if err != nil || id != "claude-session" || len(events) != 1 || events[0].Type != engine.EventModelReported || events[0].ModelReported != "claude-opus-4" {
+		t.Fatalf("system events=%#v id=%q err=%v", events, id, err)
+	}
+	events, _, err = parseEvent(map[string]any{"type": "system", "model": ""})
+	if err != nil || len(events) != 0 {
+		t.Fatalf("empty model events=%#v err=%v", events, err)
 	}
 }
 

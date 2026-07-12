@@ -46,10 +46,11 @@ type LogPaths struct {
 
 // ResultInfo describes the authoritative spilled final result.
 type ResultInfo struct {
-	Text       string `json:"text,omitempty"`
-	ResultPath string `json:"resultPath"`
-	SHA256     string `json:"sha256"`
-	Bytes      int64  `json:"bytes"`
+	Text          string `json:"text,omitempty"`
+	ResultPath    string `json:"resultPath"`
+	SHA256        string `json:"sha256"`
+	Bytes         int64  `json:"bytes"`
+	ModelReported string `json:"modelReported,omitempty"`
 }
 
 // JobRecord is the durable job state record stored as JSON.
@@ -70,6 +71,7 @@ type JobRecord struct {
 	BackendSessionID      string            `json:"backendSessionId,omitempty"`
 	BackendChildPID       int               `json:"backendChildPid,omitempty"`
 	BackendChildStartTime string            `json:"backendChildStartTime,omitempty"`
+	ModelReported         string            `json:"modelReported,omitempty"`
 	StatePath             string            `json:"statePath,omitempty"`
 	LogPaths              LogPaths          `json:"logPaths,omitempty"`
 	Result                *ResultInfo       `json:"result,omitempty"`

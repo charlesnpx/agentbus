@@ -116,6 +116,7 @@ func DefaultCapabilities() map[string]bool {
 		"nativeStructuredOutput.codex":  false,
 		"nativeStructuredOutput.claude": false,
 		"models.discovery":              true,
+		"models.reported":               true,
 	}
 }
 
@@ -195,12 +196,13 @@ type TurnEventParams struct {
 }
 
 type TurnResultParams struct {
-	SessionID string                `json:"sessionId"`
-	TurnID    string                `json:"turnId"`
-	JobID     string                `json:"jobId"`
-	State     engine.JobState       `json:"state"`
-	Result    *engine.ResultInfo    `json:"result,omitempty"`
-	Contract  *engine.ContractStamp `json:"contract,omitempty"`
+	SessionID     string                `json:"sessionId"`
+	TurnID        string                `json:"turnId"`
+	JobID         string                `json:"jobId"`
+	State         engine.JobState       `json:"state"`
+	Result        *engine.ResultInfo    `json:"result,omitempty"`
+	ModelReported string                `json:"modelReported,omitempty"`
+	Contract      *engine.ContractStamp `json:"contract,omitempty"`
 }
 
 type TurnInterruptParams struct {
@@ -259,6 +261,7 @@ type JobStatus struct {
 	BackendChildStartTime string            `json:"backendChildStartTime,omitempty"`
 	StatePath             string            `json:"statePath,omitempty"`
 	LogPaths              engine.LogPaths   `json:"logPaths,omitempty"`
+	ModelReported         string            `json:"modelReported,omitempty"`
 	Warnings              []string          `json:"warnings,omitempty"`
 }
 
@@ -267,11 +270,12 @@ type JobResultParams struct {
 }
 
 type JobResult struct {
-	JobID     string                `json:"jobId"`
-	SessionID string                `json:"sessionId,omitempty"`
-	State     engine.JobState       `json:"state"`
-	Result    *engine.ResultInfo    `json:"result,omitempty"`
-	Contract  *engine.ContractStamp `json:"contract,omitempty"`
+	JobID         string                `json:"jobId"`
+	SessionID     string                `json:"sessionId,omitempty"`
+	State         engine.JobState       `json:"state"`
+	Result        *engine.ResultInfo    `json:"result,omitempty"`
+	ModelReported string                `json:"modelReported,omitempty"`
+	Contract      *engine.ContractStamp `json:"contract,omitempty"`
 }
 
 type JobCancelParams struct {
