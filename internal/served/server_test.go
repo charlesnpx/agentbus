@@ -1332,6 +1332,62 @@ func TestStartReaperRecoversCrashedJob(t *testing.T) {
 	}
 }
 
+func TestBackgroundReapTickReapsWithoutClientRead(t *testing.T) {
+	base := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	clock := engine.ClockFunc(func() time.Time { return base })
+	root := shortTempDir(t)
+	jobCWD := shortTempDir(t)
+	daemonCWD := shortTempDir(t)
+	ticks := make(chan time.Time)
+	ticked := make(chan error, 1)
+	h := startTestServerWithRootAndHooks(t, root, daemonCWD, newFakeBackend("fake"), Config{
+		IdleTimeout:      -1,
+		Clock:            clock,
+		ProcessTable:     fakeProcessTable{},
+		ReapTickInterval: time.Hour,
+	}, func(server *Server) {
+		server.reapTickFactory = func(time.Duration) tickerSource {
+			return tickerSource{c: ticks, stop: func() {}}
+		}
+		server.afterReapTickHook = func(err error) { ticked <- err }
+	})
+	_ = h
+
+	store, err := engine.NewStore(engine.StoreConfig{
+		Root:      root,
+		CWD:       jobCWD,
+		Clock:     clock,
+		Processes: fakeProcessTable{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := &engine.JobRecord{
+		JobID:     "job_background_reap",
+		State:     engine.StateQueued,
+		UpdatedAt: base.Add(-time.Hour),
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	ticks <- base
+	if err := <-ticked; err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(record.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted engine.JobRecord
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.State != engine.StateOrphaned {
+		t.Fatalf("background reap state = %s, want orphaned", persisted.State)
+	}
+}
+
 func TestJobLookupSurvivesRestartForNonStartupWorkspace(t *testing.T) {
 	t.Parallel()
 	root := shortTempDir(t)

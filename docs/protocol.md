@@ -110,8 +110,12 @@ MUST detect expired heartbeat leases, stale queued jobs, foreground crashes,
 orphaned records, and PID reuse. PID reuse detection MUST compare the observed
 process start time with the start time recorded for that PID. Corrupted job
 records MUST be moved to a quarantine directory with diagnostics describing the
-record path and validation or parse failure. The daemon MUST run an independent
-reaper pass on daemon start and before every status call.
+record path and validation or parse failure. A single-job status or result read
+MUST reconcile only the requested record while holding that record's lock. Full
+workspace reconciliation runs independently on daemon start and on a periodic
+per-workspace daemon tick; enumerating all jobs also requests a full pass. Full
+passes are debounced and single-flighted per workspace (the default minimum
+interval is two seconds), so concurrent readers do not stampede the store.
 
 Job-record writes MUST be atomic: write a temporary file in the same directory,
 fsync that file, rename it over the target, then fsync the containing
@@ -129,7 +133,9 @@ logs MUST include a truncation marker.
 Terminal job records and logs MUST be retained for a default of 14 days.
 Spilled result files MUST be retained for a default of 14 days. Orphaned
 job-input files MUST be swept when their job is terminal. Garbage collection
-MUST piggyback on the reaper pass, and retention settings MUST be configurable.
+MUST piggyback on full reaper passes, reuse the records already read by that
+pass, and be throttled per workspace (the default minimum interval is 30
+seconds). Retention settings MUST be configurable.
 
 ## Identity model
 
