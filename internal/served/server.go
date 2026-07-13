@@ -84,6 +84,8 @@ type Server struct {
 	id                   atomic.Uint64
 	clients              atomic.Int64
 	accepting            atomic.Int64
+	acceptSettled        chan struct{}
+	acceptSettledOnce    sync.Once
 	idleTimeout          time.Duration
 	idleCheckInterval    time.Duration
 	binaryIdentityProbe  BinaryIdentityProbe
@@ -310,10 +312,16 @@ func (s *Server) Serve(ctx context.Context) error {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
+	s.acceptSettled = make(chan struct{})
 	go s.idleLoop(ctx, cancel, ln, socketIdentity)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			// The accept loop is sequential: once Accept returns an error,
+			// every connection it previously returned has completed
+			// registration. Signal that so the stale drain can trust the
+			// client counter (closes the post-Accept pre-register window).
+			s.acceptSettledOnce.Do(func() { close(s.acceptSettled) })
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -361,19 +369,21 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	if err != nil {
 		return nil, socketFileIdentity{}, err
 	}
-	identity, err := statSocketFileIdentity(s.socketPath)
-	if err != nil {
-		_ = ln.Close()
-		return nil, socketFileIdentity{}, fmt.Errorf("stat daemon socket %q: %w", s.socketPath, err)
-	}
+	// net.UnixListener normally removes its path on Close. Disable that BEFORE
+	// any other setup step so no error-path Close can remove a path that a
+	// replacement daemon may have re-bound; every removal goes through the
+	// identity-checked removeOwnedSocket instead.
 	unixListener, ok := ln.(*net.UnixListener)
 	if !ok {
 		_ = ln.Close()
 		return nil, socketFileIdentity{}, fmt.Errorf("daemon listener for %s is not a Unix listener", s.socketPath)
 	}
-	// net.UnixListener normally unlinks its path on Close. Keep that cleanup
-	// under our identity check so an old daemon cannot remove a replacement.
 	unixListener.SetUnlinkOnClose(false)
+	identity, err := statSocketFileIdentity(s.socketPath)
+	if err != nil {
+		_ = ln.Close()
+		return nil, socketFileIdentity{}, fmt.Errorf("stat daemon socket %q: %w", s.socketPath, err)
+	}
 	if err := os.Chmod(s.socketPath, 0o600); err != nil {
 		_ = ln.Close()
 		s.removeOwnedSocket(identity, "listener setup failure")
@@ -395,7 +405,16 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net
 			stale := s.checkBinaryStale()
 			quiet := s.clients.Load() == 0 && s.accepting.Load() == 0 && !s.activeWork()
 			if staleDraining {
-				if !quiet {
+				settled := false
+				select {
+				case <-s.acceptSettled:
+					settled = true
+				default:
+				}
+				// Quiet counters alone cannot be trusted until the accept
+				// loop confirms it has registered every connection Accept
+				// returned before the listener closed.
+				if !quiet || !settled {
 					if !drainLogged {
 						log.Print("agentbus daemon: stale listener is closed; draining accepted connections and active work")
 						drainLogged = true
