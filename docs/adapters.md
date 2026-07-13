@@ -87,6 +87,11 @@ so Codex retains its trust check there. The conditional bypass lets sanitized
 artifact workspaces and other non-repository scratch directories run: Codex's
 repository trust model does not apply to those directories.
 
+The detection is check-time, not spawn-time; `GIT_DIR` and `GIT_WORK_TREE`
+environment-defined worktrees are not consulted. Both choices are deliberate
+under agentbus's [same-user trust model](protocol.md#trust-model): a same-user
+process that can race the repository identity can already invoke Codex directly.
+
 ### codex effort values
 
 When `SessionOpts.Effort` is provided, the codex adapter passes it as:

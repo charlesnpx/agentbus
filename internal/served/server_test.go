@@ -1105,6 +1105,79 @@ func TestBinaryChangeExitsPromptlyWhenQuiet(t *testing.T) {
 	}
 }
 
+func TestBinaryChangeDrainsConnectionAcceptedAtQuietCheck(t *testing.T) {
+	t.Parallel()
+	changed := newBinaryChangeProbe()
+	beforeListenerClose := make(chan struct{})
+	releaseListenerClose := make(chan struct{})
+	listenerClosed := make(chan struct{})
+	var releaseCloseOnce sync.Once
+	var srv *Server
+	releaseCloseHook := func() { releaseCloseOnce.Do(func() { close(releaseListenerClose) }) }
+	t.Cleanup(releaseCloseHook)
+	h := startTestServerWithHooks(t, newFakeBackend("fake"), Config{
+		IdleTimeout:         -1,
+		IdleCheckInterval:   10 * time.Millisecond,
+		BinaryIdentityProbe: changed.probe,
+	}, func(server *Server) {
+		srv = server
+		server.beforeStaleCloseHook = func() {
+			close(beforeListenerClose)
+			<-releaseListenerClose
+		}
+		server.staleListenerHook = func() { close(listenerClosed) }
+	})
+
+	changed.changed.Store(true)
+	// The daemon parks in beforeStaleCloseHook at the quiet check, BEFORE the
+	// listener closes. A connection dialed now is exactly the race the drain
+	// logic must survive: accepted after the quiet decision, before close.
+	// (The hook may only fire once the harness readiness dial and any stray
+	// backlog connections from waitForSocket have fully drained; the quiet
+	// check itself guarantees that, so no extra synchronization is needed.)
+	select {
+	case <-beforeListenerClose:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale daemon did not reach its quiet listener-close check")
+	}
+	conn, err := net.Dial("unix", h.socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Wait until the accept loop has registered the connection so the close
+	// below provably happens with a live accepted client.
+	deadline := time.Now().Add(5 * time.Second)
+	for srv.clients.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if srv.clients.Load() == 0 {
+		t.Fatal("accepted connection did not register before listener close")
+	}
+
+	releaseCloseHook()
+	select {
+	case <-listenerClosed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale daemon did not close its listener")
+	}
+
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+	assertServerStillRunning(t, h.done, "an accepted connection was still open")
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-h.done:
+		if err != nil {
+			t.Fatalf("server exited with error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale daemon did not exit after the accepted connection drained")
+	}
+}
+
 func TestBinaryChangeWaitsForConnectionsAndActiveJobs(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
@@ -1144,6 +1217,62 @@ func TestBinaryChangeWaitsForConnectionsAndActiveJobs(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("server did not restart after its connection and active job cleared")
+	}
+}
+
+func TestBinaryChangeDoesNotUnlinkReplacementSocket(t *testing.T) {
+	t.Parallel()
+	changed := newBinaryChangeProbe()
+	listenerClosed := make(chan struct{})
+	releaseDrain := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseDrain) }) }
+	t.Cleanup(release)
+	h := startTestServerWithHooks(t, newFakeBackend("fake"), Config{
+		IdleTimeout:         -1,
+		IdleCheckInterval:   10 * time.Millisecond,
+		BinaryIdentityProbe: changed.probe,
+	}, func(server *Server) {
+		server.staleListenerHook = func() {
+			close(listenerClosed)
+			<-releaseDrain
+		}
+	})
+
+	changed.changed.Store(true)
+	select {
+	case <-listenerClosed:
+	case <-time.After(time.Second):
+		t.Fatal("stale daemon did not close its listener")
+	}
+	if err := os.Remove(h.socketPath); err != nil {
+		t.Fatalf("remove closed daemon socket: %v", err)
+	}
+	replacement, err := net.Listen("unix", h.socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	wantIdentity, err := statSocketFileIdentity(h.socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+
+	select {
+	case err := <-h.done:
+		if err != nil {
+			t.Fatalf("server exited with error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale daemon did not exit after closing its listener")
+	}
+	gotIdentity, err := statSocketFileIdentity(h.socketPath)
+	if err != nil {
+		t.Fatalf("replacement socket was removed: %v", err)
+	}
+	if gotIdentity != wantIdentity {
+		t.Fatalf("replacement socket identity = %+v, want %+v", gotIdentity, wantIdentity)
 	}
 }
 
@@ -1380,10 +1509,20 @@ func assertServerStillRunning(t *testing.T, done <-chan error, reason string) {
 
 func startTestServer(t *testing.T, backend engine.Backend, cfg Config) testServer {
 	t.Helper()
-	return startTestServerWithRoot(t, shortTempDir(t), shortTempDir(t), backend, cfg)
+	return startTestServerWithHooks(t, backend, cfg, nil)
+}
+
+func startTestServerWithHooks(t *testing.T, backend engine.Backend, cfg Config, configure func(*Server)) testServer {
+	t.Helper()
+	return startTestServerWithRootAndHooks(t, shortTempDir(t), shortTempDir(t), backend, cfg, configure)
 }
 
 func startTestServerWithRoot(t *testing.T, root, cwd string, backend engine.Backend, cfg Config) testServer {
+	t.Helper()
+	return startTestServerWithRootAndHooks(t, root, cwd, backend, cfg, nil)
+}
+
+func startTestServerWithRootAndHooks(t *testing.T, root, cwd string, backend engine.Backend, cfg Config, configure func(*Server)) testServer {
 	t.Helper()
 	cfg.StateRoot = root
 	cfg.CWD = cwd
@@ -1392,6 +1531,9 @@ func startTestServerWithRoot(t *testing.T, root, cwd string, backend engine.Back
 	server, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if configure != nil {
+		configure(server)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

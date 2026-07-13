@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
@@ -34,6 +35,11 @@ const (
 type BinaryIdentity struct {
 	ModTime time.Time
 	Size    int64
+}
+
+type socketFileIdentity struct {
+	dev uint64
+	ino uint64
 }
 
 // BinaryIdentityProbe reads the identity of the executable at path. It is
@@ -63,26 +69,29 @@ type Config struct {
 
 // Server serves the protocol v1 socket API over engine backends.
 type Server struct {
-	stateRoot           string
-	cwd                 string
-	socketPath          string
-	tokenPath           string
-	token               string
-	backends            map[string]engine.Backend
-	registry            *engine.PolicyRegistry
-	clock               engine.Clock
-	processes           engine.ProcessTable
-	processGroups       engine.ProcessGroupSignaler
-	cancelGrace         time.Duration
-	cancelWaiter        engine.Waiter
-	id                  atomic.Uint64
-	clients             atomic.Int64
-	idleTimeout         time.Duration
-	idleCheckInterval   time.Duration
-	binaryIdentityProbe BinaryIdentityProbe
-	inlineResultCap     int
-	leaseDuration       time.Duration
-	heartbeatInterval   time.Duration
+	stateRoot            string
+	cwd                  string
+	socketPath           string
+	tokenPath            string
+	token                string
+	backends             map[string]engine.Backend
+	registry             *engine.PolicyRegistry
+	clock                engine.Clock
+	processes            engine.ProcessTable
+	processGroups        engine.ProcessGroupSignaler
+	cancelGrace          time.Duration
+	cancelWaiter         engine.Waiter
+	id                   atomic.Uint64
+	clients              atomic.Int64
+	accepting            atomic.Int64
+	idleTimeout          time.Duration
+	idleCheckInterval    time.Duration
+	binaryIdentityProbe  BinaryIdentityProbe
+	beforeStaleCloseHook func()
+	staleListenerHook    func()
+	inlineResultCap      int
+	leaseDuration        time.Duration
+	heartbeatInterval    time.Duration
 
 	mu                 sync.Mutex
 	sessions           map[string]*sessionState
@@ -287,13 +296,13 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err := s.reapKnownStores(); err != nil {
 		return err
 	}
-	ln, err := s.listen()
+	ln, socketIdentity, err := s.listen()
 	if err != nil {
 		return err
 	}
 	defer func() {
 		_ = ln.Close()
-		_ = os.Remove(s.socketPath)
+		s.removeOwnedSocket(socketIdentity, "server shutdown")
 	}()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -301,16 +310,25 @@ func (s *Server) Serve(ctx context.Context) error {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
-	go s.idleLoop(ctx, cancel, ln)
+	go s.idleLoop(ctx, cancel, ln, socketIdentity)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if errors.Is(err, net.ErrClosed) {
+				// A stale daemon closes its listener before it cancels the
+				// context, so connections already accepted by this loop can
+				// register and drain without accepting any new connections.
+				<-ctx.Done()
 				return nil
 			}
 			return err
 		}
+		s.accepting.Add(1)
 		s.clients.Add(1)
+		s.accepting.Add(-1)
 		s.touchActivity()
 		c := &connection{server: s, conn: conn}
 		go func() {
@@ -321,53 +339,92 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-func (s *Server) listen() (net.Listener, error) {
+func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	if err := os.MkdirAll(filepath.Dir(s.socketPath), 0o700); err != nil {
-		return nil, err
+		return nil, socketFileIdentity{}, err
 	}
 	if err := os.Chmod(filepath.Dir(s.socketPath), 0o700); err != nil {
-		return nil, err
+		return nil, socketFileIdentity{}, err
 	}
 	if _, err := os.Lstat(s.socketPath); err == nil {
 		if conn, dialErr := net.DialTimeout("unix", s.socketPath, 100*time.Millisecond); dialErr == nil {
 			_ = conn.Close()
-			return nil, fmt.Errorf("agentbus daemon already listening at %s", s.socketPath)
+			return nil, socketFileIdentity{}, fmt.Errorf("agentbus daemon already listening at %s", s.socketPath)
 		}
 		if err := os.Remove(s.socketPath); err != nil {
-			return nil, err
+			return nil, socketFileIdentity{}, err
 		}
 	} else if !os.IsNotExist(err) {
-		return nil, err
+		return nil, socketFileIdentity{}, err
 	}
 	ln, err := net.Listen("unix", s.socketPath)
 	if err != nil {
-		return nil, err
+		return nil, socketFileIdentity{}, err
 	}
+	identity, err := statSocketFileIdentity(s.socketPath)
+	if err != nil {
+		_ = ln.Close()
+		return nil, socketFileIdentity{}, fmt.Errorf("stat daemon socket %q: %w", s.socketPath, err)
+	}
+	unixListener, ok := ln.(*net.UnixListener)
+	if !ok {
+		_ = ln.Close()
+		return nil, socketFileIdentity{}, fmt.Errorf("daemon listener for %s is not a Unix listener", s.socketPath)
+	}
+	// net.UnixListener normally unlinks its path on Close. Keep that cleanup
+	// under our identity check so an old daemon cannot remove a replacement.
+	unixListener.SetUnlinkOnClose(false)
 	if err := os.Chmod(s.socketPath, 0o600); err != nil {
 		_ = ln.Close()
-		return nil, err
+		s.removeOwnedSocket(identity, "listener setup failure")
+		return nil, socketFileIdentity{}, err
 	}
-	return ln, nil
+	return ln, identity, nil
 }
 
-func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener) {
+func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener, socketIdentity socketFileIdentity) {
 	ticker := time.NewTicker(s.idleCheckInterval)
 	defer ticker.Stop()
+	staleDraining := false
+	drainLogged := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			stale := s.checkBinaryStale()
-			if s.clients.Load() != 0 || s.activeWork() {
+			quiet := s.clients.Load() == 0 && s.accepting.Load() == 0 && !s.activeWork()
+			if staleDraining {
+				if !quiet {
+					if !drainLogged {
+						log.Print("agentbus daemon: stale listener is closed; draining accepted connections and active work")
+						drainLogged = true
+					}
+					continue
+				}
+				log.Print("agentbus daemon: stale daemon drained; shutting down")
+				cancel()
+				return
+			}
+			if !quiet {
 				s.touchActivity()
 				continue
 			}
 			if stale {
-				log.Print("agentbus daemon: exiting so the upgraded binary serves future connections")
-				cancel()
-				_ = ln.Close()
-				return
+				log.Print("agentbus daemon: stale daemon is quiet; closing listener before draining")
+				if s.beforeStaleCloseHook != nil {
+					s.beforeStaleCloseHook()
+				}
+				if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+					log.Printf("agentbus daemon: close stale listener: %v", err)
+				}
+				if s.staleListenerHook != nil {
+					s.staleListenerHook()
+				}
+				s.removeOwnedSocket(socketIdentity, "stale daemon listener close")
+				log.Print("agentbus daemon: stale listener closed; waiting for accepted connections and active work to drain")
+				staleDraining = true
+				continue
 			}
 			if s.idleTimeout < 0 {
 				continue
@@ -382,6 +439,35 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net
 			}
 		}
 	}
+}
+
+func statSocketFileIdentity(path string) (socketFileIdentity, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return socketFileIdentity{}, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return socketFileIdentity{}, fmt.Errorf("unexpected socket stat type %T", info.Sys())
+	}
+	return socketFileIdentity{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}, nil
+}
+
+func (s *Server) removeOwnedSocket(owned socketFileIdentity, phase string) {
+	actual, err := statSocketFileIdentity(s.socketPath)
+	if err != nil {
+		log.Printf("agentbus daemon: skipping socket removal during %s: cannot stat %s (%v); a replacement daemon may own the path", phase, s.socketPath, err)
+		return
+	}
+	if actual != owned {
+		log.Printf("agentbus daemon: skipping socket removal during %s: replacement daemon owns %s", phase, s.socketPath)
+		return
+	}
+	if err := os.Remove(s.socketPath); err != nil {
+		log.Printf("agentbus daemon: remove owned socket during %s: %v", phase, err)
+		return
+	}
+	log.Printf("agentbus daemon: removed owned socket during %s", phase)
 }
 
 func statBinaryIdentity(path string) (BinaryIdentity, error) {
