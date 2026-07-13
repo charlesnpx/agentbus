@@ -3,9 +3,13 @@ package engine
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const correctiveRetryTemplate = "Your response missed: {{missing}}. Emit the corrected report only; make no further changes."
@@ -202,6 +206,220 @@ func TestJSONSchemaContracts(t *testing.T) {
 				t.Fatalf("contract hash = %q", got.ContractSHA256)
 			}
 		})
+	}
+}
+
+func TestJSONSchemaViolationDetails(t *testing.T) {
+	t.Parallel()
+	contract := ContractSpec{JSONSchema: json.RawMessage(`{
+		"type":"object",
+		"required":["schema_version","mode","payload"],
+		"properties":{
+			"schema_version":{"const":"v1"},
+			"mode":{"enum":["summary","detail"]},
+			"payload":{
+				"type":"object",
+				"required":["title"],
+				"additionalProperties":false,
+				"properties":{"title":{"type":"string"}}
+			}
+		}
+	}`)}
+	result, err := ValidateContract(`{"schema_version":"v0","mode":"invented","payload":{"title":7,"wrong/key~name":true}}`, contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"/mode: value must be one of 'summary', 'detail'",
+		"/payload/title: got number, want string",
+		"/payload: additional properties 'wrong/key~name' not allowed",
+		"/schema_version: value must be 'v1'",
+	}
+	if result.Valid || !equalStringSlices(result.Missing, want) {
+		t.Fatalf("valid = %v, missing = %#v, want %#v", result.Valid, result.Missing, want)
+	}
+	stamp := StampValidation(1, false, "", result, time.Now())
+	if !equalStringSlices(stamp.Missing, result.Missing) {
+		t.Fatalf("stamp missing = %#v, want %#v", stamp.Missing, result.Missing)
+	}
+	if retryPrompt := RenderRetryTemplate("{{missing}}", result.Missing); retryPrompt != strings.Join(result.Missing, ", ") {
+		t.Fatalf("retry prompt = %q, want missing = %#v", retryPrompt, result.Missing)
+	}
+}
+
+func TestJSONSchemaViolationRequiredAndEscapedPointer(t *testing.T) {
+	t.Parallel()
+	contract := ContractSpec{JSONSchema: json.RawMessage(`{
+		"type":"object",
+		"properties":{"payload":{
+			"type":"object",
+			"required":["title"],
+			"additionalProperties":false,
+			"properties":{"slash/key~name":{"type":"string"}}
+		}},
+		"required":["payload"]
+	}`)}
+	result, err := ValidateContract(`{"payload":{"slash/key~name":7,"wrong/key~name":true}}`, contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"/payload/slash~1key~0name: got number, want string",
+		"/payload: additional properties 'wrong/key~name' not allowed",
+		"/payload: missing property 'title'",
+	}
+	if result.Valid || !equalStringSlices(result.Missing, want) {
+		t.Fatalf("valid = %v, missing = %#v, want %#v", result.Valid, result.Missing, want)
+	}
+}
+
+func TestJSONSchemaViolationLimitAndMessageTruncation(t *testing.T) {
+	t.Parallel()
+	var required []string
+	for i := 0; i < 25; i++ {
+		required = append(required, fmt.Sprintf("field-%02d", i))
+	}
+	var allOf []json.RawMessage
+	for _, field := range required {
+		allOf = append(allOf, json.RawMessage(`{"required":["`+field+`"]}`))
+	}
+	schema, err := json.Marshal(map[string]any{"allOf": allOf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := ValidateContract(`{}`, ContractSpec{JSONSchema: schema})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Missing) != maxSchemaViolationEntries {
+		t.Fatalf("missing count = %d, want %d: %#v", len(result.Missing), maxSchemaViolationEntries, result.Missing)
+	}
+	if got, want := result.Missing[len(result.Missing)-1], "+6 more schema violations"; got != want {
+		t.Fatalf("last missing = %q, want %q", got, want)
+	}
+	if !strings.HasPrefix(result.Missing[0], "/: ") {
+		t.Fatalf("root violation = %q, want JSON pointer root", result.Missing[0])
+	}
+
+	longName := strings.Repeat("x", maxSchemaViolationMessageRunes+20)
+	longSchema, err := json.Marshal(map[string]any{"required": []string{longName}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	longResult, err := ValidateContract(`{}`, ContractSpec{JSONSchema: longSchema})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(longResult.Missing) != 1 || !strings.HasSuffix(longResult.Missing[0], "...") {
+		t.Fatalf("truncated missing = %#v", longResult.Missing)
+	}
+
+	largeMissing := make([]string, maxSchemaViolationEntries)
+	for i := range largeMissing {
+		largeMissing[i] = strings.Repeat("x", maxSchemaViolationMessageRunes)
+	}
+	if prompt := RenderRetryTemplate("{{missing}}{{missing}}", largeMissing); len(prompt) > maxRetryViolationTextBytes {
+		t.Fatalf("retry violation text is %d bytes, want at most %d", len(prompt), maxRetryViolationTextBytes)
+	}
+}
+
+func TestJSONPointerRoundTripsPrintableBackslashAndQuote(t *testing.T) {
+	t.Parallel()
+	for _, key := range []string{`a\b`, `a"b`} {
+		t.Run(strconv.Quote(key), func(t *testing.T) {
+			pointer := jsonPointer([]string{key})
+			segment := strings.TrimPrefix(pointer, "/")
+			roundTripped := strings.ReplaceAll(strings.ReplaceAll(segment, "~1", "/"), "~0", "~")
+			if roundTripped != key {
+				t.Fatalf("pointer %q round-trips to %q, want %q", pointer, roundTripped, key)
+			}
+		})
+	}
+}
+
+func TestJSONSchemaViolationsEscapeAndBoundUntrustedPropertyNames(t *testing.T) {
+	t.Parallel()
+	propertyNames := []string{
+		"new\nline",
+		"return\rline",
+		"ansi" + string(rune(0x1b)) + "escape",
+		strings.Repeat("界", maxSchemaViolationMessageRunes+20),
+	}
+	for _, propertyName := range propertyNames {
+		t.Run(strconv.Quote(propertyName), func(t *testing.T) {
+			pointer := jsonPointer([]string{propertyName})
+			assertSingleLinePrintableViolation(t, pointer, 0)
+			pointerSchema, err := json.Marshal(map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					propertyName: map[string]any{"type": "string"},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			messageSchema, err := json.Marshal(map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			instance, err := json.Marshal(map[string]any{propertyName: 7})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for schemaIndex, schema := range []json.RawMessage{pointerSchema, messageSchema} {
+				result, err := ValidateContract(string(instance), ContractSpec{JSONSchema: schema})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result.Valid || len(result.Missing) == 0 {
+					t.Fatalf("valid = %v, missing = %#v", result.Valid, result.Missing)
+				}
+
+				stamp := StampValidation(1, false, "", result, time.Now())
+				for _, missing := range stamp.Missing {
+					assertSingleLinePrintableViolation(t, missing, maxSchemaViolationPointerRunes+len(": ")+maxSchemaViolationMessageRunes)
+				}
+				if schemaIndex == 0 && utf8.RuneCountInString(pointer) <= maxSchemaViolationPointerRunes {
+					if !strings.HasPrefix(stamp.Missing[0], pointer+": ") {
+						t.Fatalf("pointer violation = %q, want prefix %q", stamp.Missing[0], pointer+": ")
+					}
+				} else if schemaIndex == 0 && !strings.Contains(stamp.Missing[0], ": got number, want string") {
+					t.Fatalf("truncated pointer violation = %q, want diagnostic to survive", stamp.Missing[0])
+				}
+				prompt := RenderRetryTemplate("Correct these violations: {{missing}}", stamp.Missing)
+				assertSingleLinePrintableViolation(t, prompt, len("Correct these violations: ")+maxRetryViolationTextBytes)
+			}
+		})
+	}
+}
+
+func assertSingleLinePrintableViolation(t *testing.T, value string, maxRunes int) {
+	t.Helper()
+	if maxRunes > 0 && utf8.RuneCountInString(value) > maxRunes {
+		t.Fatalf("violation has %d runes, want at most %d: %q", utf8.RuneCountInString(value), maxRunes, value)
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		t.Fatalf("violation contains a line break: %q", value)
+	}
+	for _, r := range value {
+		if !unicode.IsPrint(r) {
+			t.Fatalf("violation contains non-printable %U: %q", r, value)
+		}
+	}
+}
+
+func TestJSONSchemaParseAndCompileFailureDetails(t *testing.T) {
+	t.Parallel()
+	schema := json.RawMessage(`{"type":"object"}`)
+	if got := validateJSONSchema(`{"value":`, schema); len(got) != 1 || !strings.HasPrefix(got[0], "json: ") || len(got[0]) == len("json: ") {
+		t.Fatalf("parse missing = %#v", got)
+	}
+	if got := validateJSONSchema(`{}`, json.RawMessage(`{"type":42}`)); len(got) != 1 || !strings.HasPrefix(got[0], "jsonSchema: ") || len(got[0]) == len("jsonSchema: ") {
+		t.Fatalf("compile missing = %#v", got)
 	}
 }
 
@@ -529,4 +747,16 @@ func contains(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func equalStringSlices(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }

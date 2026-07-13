@@ -14,8 +14,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
 )
 
 // TurnPolicy describes optional structural validation for a backend turn.
@@ -234,9 +238,22 @@ func ValidatePolicyText(text string, policy *TurnPolicy, registry *PolicyRegistr
 	return PolicyValidation{Stamp: &stamp, ResolvedContract: &resolved}, nil
 }
 
-// RenderRetryTemplate renders the corrective retry template.
+const (
+	maxSchemaViolationEntries      = 20
+	maxSchemaViolationPointerRunes = 120
+	maxSchemaViolationMessageRunes = 200
+	maxRetryViolationTextBytes     = 2 * 1024
+)
+
+// RenderRetryTemplate renders the corrective retry template. The substituted
+// violation text is capped so invalid responses cannot inflate a retry prompt.
 func RenderRetryTemplate(template string, missing []string) string {
-	return strings.ReplaceAll(template, "{{missing}}", strings.Join(missing, ", "))
+	const missingToken = "{{missing}}"
+	occurrences := strings.Count(template, missingToken)
+	if occurrences == 0 {
+		return template
+	}
+	return strings.ReplaceAll(template, missingToken, boundedViolationText(missing, maxRetryViolationTextBytes/occurrences))
 }
 
 // StampValidation builds a contract stamp for a completed validation pipeline.
@@ -730,16 +747,165 @@ func validateJSONSchema(text string, schemaRaw json.RawMessage) []string {
 	decoder := json.NewDecoder(strings.NewReader(text))
 	decoder.UseNumber()
 	if err := decodeJSONDocument(decoder, &value); err != nil {
-		return []string{"json"}
+		return []string{"json: " + truncateRunes(err.Error(), maxSchemaViolationMessageRunes)}
 	}
 	schema, err := compileJSONSchema(schemaRaw)
 	if err != nil {
-		return []string{"jsonSchema"}
+		return []string{"jsonSchema: " + truncateRunes(err.Error(), maxSchemaViolationMessageRunes)}
 	}
 	if err := schema.Validate(value); err != nil {
-		return []string{"jsonSchema"}
+		return jsonSchemaViolations(err)
 	}
 	return nil
+}
+
+func jsonSchemaViolations(err error) []string {
+	var validationErr *jsonschema.ValidationError
+	if !errors.As(err, &validationErr) {
+		return []string{"jsonSchema: " + truncateRunes(err.Error(), maxSchemaViolationMessageRunes)}
+	}
+
+	leaves := make([]*jsonschema.ValidationError, 0)
+	collectJSONSchemaLeaves(validationErr, &leaves)
+	violations := make([]string, 0, len(leaves))
+	seen := make(map[string]struct{}, len(leaves))
+	printer := message.NewPrinter(language.English)
+	for _, leaf := range leaves {
+		violationMessage := leaf.Error()
+		if leaf.ErrorKind != nil {
+			violationMessage = leaf.ErrorKind.LocalizedString(printer)
+		}
+		violation := schemaViolation(jsonPointer(leaf.InstanceLocation), violationMessage)
+		if _, ok := seen[violation]; ok {
+			continue
+		}
+		seen[violation] = struct{}{}
+		violations = append(violations, violation)
+	}
+	sort.Strings(violations)
+	if len(violations) <= maxSchemaViolationEntries {
+		return violations
+	}
+	more := len(violations) - (maxSchemaViolationEntries - 1)
+	violations = append([]string(nil), violations[:maxSchemaViolationEntries-1]...)
+	return append(violations, fmt.Sprintf("+%d more schema violations", more))
+}
+
+func collectJSONSchemaLeaves(err *jsonschema.ValidationError, leaves *[]*jsonschema.ValidationError) {
+	if len(err.Causes) == 0 {
+		*leaves = append(*leaves, err)
+		return
+	}
+	for _, cause := range err.Causes {
+		collectJSONSchemaLeaves(cause, leaves)
+	}
+}
+
+func jsonPointer(parts []string) string {
+	if len(parts) == 0 {
+		return "/"
+	}
+	var pointer strings.Builder
+	for _, part := range parts {
+		pointer.WriteByte('/')
+		part = strings.ReplaceAll(strings.ReplaceAll(part, "~", "~0"), "/", "~1")
+		pointer.WriteString(escapeNonPrintable(part))
+	}
+	return pointer.String()
+}
+
+// schemaViolation formats a schema validation leaf for persistence and retry
+// prompts. Both components must be printable because property names and schema
+// diagnostics originate from untrusted JSON.
+func schemaViolation(pointer, message string) string {
+	pointer = truncateRunesToLimit(escapeNonPrintable(pointer), maxSchemaViolationPointerRunes)
+	message = truncateRunesToLimit(escapeNonPrintable(message), maxSchemaViolationMessageRunes)
+	return pointer + ": " + message
+}
+
+// escapeNonPrintable returns value as printable text suitable for a single-line
+// diagnostic. It deliberately preserves printable punctuation so JSON Pointer
+// segments retain their meaning.
+func escapeNonPrintable(value string) string {
+	var escaped strings.Builder
+	escaped.Grow(len(value))
+	for _, r := range value {
+		if unicode.IsPrint(r) && r != 0x7f {
+			escaped.WriteRune(r)
+			continue
+		}
+		fmt.Fprintf(&escaped, "\\u%04X", r)
+	}
+	return escaped.String()
+}
+
+func truncateRunes(value string, limit int) string {
+	if limit < 1 {
+		return ""
+	}
+	count := 0
+	for index := range value {
+		if count == limit {
+			return value[:index] + "..."
+		}
+		count++
+	}
+	return value
+}
+
+// truncateRunesToLimit truncates value to at most limit runes, including an
+// ellipsis when the value does not fit.
+func truncateRunesToLimit(value string, limit int) string {
+	if limit < 1 {
+		return ""
+	}
+	if utf8.RuneCountInString(value) <= limit {
+		return value
+	}
+	if limit <= len("...") {
+		return strings.Repeat(".", limit)
+	}
+	return truncateRunes(value, limit-len("..."))
+}
+
+func boundedViolationText(violations []string, maxBytes int) string {
+	if maxBytes < 1 {
+		return ""
+	}
+	var text strings.Builder
+	for _, violation := range violations {
+		separator := ""
+		if text.Len() > 0 {
+			separator = ", "
+		}
+		if text.Len()+len(separator)+len(violation) <= maxBytes {
+			text.WriteString(separator)
+			text.WriteString(violation)
+			continue
+		}
+		if text.Len() == 0 {
+			return truncateUTF8Bytes(violation, maxBytes)
+		}
+		if text.Len()+len(", ...") <= maxBytes {
+			text.WriteString(", ...")
+		}
+		break
+	}
+	return text.String()
+}
+
+func truncateUTF8Bytes(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
+	}
+	if maxBytes <= len("...") {
+		return strings.Repeat(".", maxBytes)
+	}
+	prefixLength := maxBytes - len("...")
+	for prefixLength > 0 && !utf8.RuneStart(value[prefixLength]) {
+		prefixLength--
+	}
+	return value[:prefixLength] + "..."
 }
 
 func compileJSONSchema(schemaRaw json.RawMessage) (*jsonschema.Schema, error) {
