@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -239,6 +240,7 @@ func ValidatePolicyText(text string, policy *TurnPolicy, registry *PolicyRegistr
 
 const (
 	maxSchemaViolationEntries      = 20
+	maxSchemaViolationPointerRunes = 120
 	maxSchemaViolationMessageRunes = 200
 	maxRetryViolationTextBytes     = 2 * 1024
 )
@@ -816,17 +818,25 @@ func jsonPointer(parts []string) string {
 // prompts. Both components must be printable because property names and schema
 // diagnostics originate from untrusted JSON.
 func schemaViolation(pointer, message string) string {
-	message = truncateRunes(message, maxSchemaViolationMessageRunes)
-	violation := pointer + ": " + escapeNonPrintable(message)
-	return truncateRunesToLimit(violation, maxSchemaViolationMessageRunes)
+	pointer = truncateRunesToLimit(escapeNonPrintable(pointer), maxSchemaViolationPointerRunes)
+	message = truncateRunesToLimit(escapeNonPrintable(message), maxSchemaViolationMessageRunes)
+	return pointer + ": " + message
 }
 
 // escapeNonPrintable returns value as printable text suitable for a single-line
-// diagnostic. strconv.Quote applies Go string-literal escaping without changing
-// printable Unicode characters; discard its surrounding quotes for display.
+// diagnostic. It deliberately preserves printable punctuation so JSON Pointer
+// segments retain their meaning.
 func escapeNonPrintable(value string) string {
-	quoted := strconv.Quote(value)
-	return quoted[1 : len(quoted)-1]
+	var escaped strings.Builder
+	escaped.Grow(len(value))
+	for _, r := range value {
+		if unicode.IsPrint(r) && r != 0x7f {
+			escaped.WriteRune(r)
+			continue
+		}
+		fmt.Fprintf(&escaped, "\\u%04X", r)
+	}
+	return escaped.String()
 }
 
 func truncateRunes(value string, limit int) string {

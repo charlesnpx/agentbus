@@ -323,6 +323,20 @@ func TestJSONSchemaViolationLimitAndMessageTruncation(t *testing.T) {
 	}
 }
 
+func TestJSONPointerRoundTripsPrintableBackslashAndQuote(t *testing.T) {
+	t.Parallel()
+	for _, key := range []string{`a\b`, `a"b`} {
+		t.Run(strconv.Quote(key), func(t *testing.T) {
+			pointer := jsonPointer([]string{key})
+			segment := strings.TrimPrefix(pointer, "/")
+			roundTripped := strings.ReplaceAll(strings.ReplaceAll(segment, "~1", "/"), "~0", "~")
+			if roundTripped != key {
+				t.Fatalf("pointer %q round-trips to %q, want %q", pointer, roundTripped, key)
+			}
+		})
+	}
+}
+
 func TestJSONSchemaViolationsEscapeAndBoundUntrustedPropertyNames(t *testing.T) {
 	t.Parallel()
 	propertyNames := []string{
@@ -367,12 +381,14 @@ func TestJSONSchemaViolationsEscapeAndBoundUntrustedPropertyNames(t *testing.T) 
 
 				stamp := StampValidation(1, false, "", result, time.Now())
 				for _, missing := range stamp.Missing {
-					assertSingleLinePrintableViolation(t, missing, maxSchemaViolationMessageRunes)
+					assertSingleLinePrintableViolation(t, missing, maxSchemaViolationPointerRunes+len(": ")+maxSchemaViolationMessageRunes)
 				}
-				if schemaIndex == 0 && utf8.RuneCountInString(pointer) <= maxSchemaViolationMessageRunes-len(": ") {
+				if schemaIndex == 0 && utf8.RuneCountInString(pointer) <= maxSchemaViolationPointerRunes {
 					if !strings.HasPrefix(stamp.Missing[0], pointer+": ") {
 						t.Fatalf("pointer violation = %q, want prefix %q", stamp.Missing[0], pointer+": ")
 					}
+				} else if schemaIndex == 0 && !strings.Contains(stamp.Missing[0], ": got number, want string") {
+					t.Fatalf("truncated pointer violation = %q, want diagnostic to survive", stamp.Missing[0])
 				}
 				prompt := RenderRetryTemplate("Correct these violations: {{missing}}", stamp.Missing)
 				assertSingleLinePrintableViolation(t, prompt, len("Correct these violations: ")+maxRetryViolationTextBytes)
