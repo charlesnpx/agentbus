@@ -660,7 +660,9 @@ func (s *Store) processRefAlive(ref ProcessRef) (bool, error) {
 func (s *Store) Reap() error {
 	now := s.clock.Now().UTC()
 	s.reapMu.Lock()
-	if !s.lastReap.IsZero() && now.Sub(s.lastReap) < s.reapInterval {
+	if elapsed := now.Sub(s.lastReap); !s.lastReap.IsZero() && elapsed >= 0 && elapsed < s.reapInterval {
+		// A negative elapsed duration means the clock moved backward; treat
+		// the debounce window as expired instead of suspending reconciliation.
 		s.reapMu.Unlock()
 		return nil
 	}
@@ -757,7 +759,9 @@ func (s *Store) reapFull(now time.Time) error {
 			return err
 		}
 	}
-	if !s.lastGC.IsZero() && now.Sub(s.lastGC) < s.gcInterval {
+	if elapsed := now.Sub(s.lastGC); !s.lastGC.IsZero() && elapsed >= 0 && elapsed < s.gcInterval {
+		// Backward clock movement expires the gc throttle rather than
+		// suspending retention housekeeping until time catches up.
 		return nil
 	}
 	if err := s.gc(now, records); err != nil {

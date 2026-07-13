@@ -790,6 +790,99 @@ func TestReapDebouncesWithinInterval(t *testing.T) {
 	}
 }
 
+func TestReapRunsAfterClockRollback(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	clk := &fakeClock{now: base}
+	fullReaps := 0
+	store, err := NewStore(StoreConfig{
+		Root:         filepath.Join(t.TempDir(), "state"),
+		CWD:          t.TempDir(),
+		Clock:        clk,
+		Processes:    fakeProcessTable{entries: map[int]ProcessInfo{}},
+		Retention:    RetentionConfig{TerminalJobTTL: time.Hour, ResultTTL: time.Hour, StaleJobAfter: time.Minute},
+		ReapInterval: time.Minute,
+		GCInterval:   time.Minute,
+		BeforeReap:   func() { fullReaps++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if fullReaps != 1 {
+		t.Fatalf("initial full reap count = %d, want 1", fullReaps)
+	}
+	// A rollback expires the debounce rather than suspending reconciliation.
+	clk.now = base.Add(-time.Hour)
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if fullReaps != 2 {
+		t.Fatalf("full reap count after clock rollback = %d, want 2", fullReaps)
+	}
+	// Debounce still applies at the rolled-back time.
+	clk.now = clk.now.Add(time.Second)
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if fullReaps != 2 {
+		t.Fatalf("in-window reap after rollback ran; count = %d, want 2", fullReaps)
+	}
+}
+
+func TestGCRunsAfterClockRollback(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	rolledBack := base.Add(-time.Hour)
+	clk := &fakeClock{now: base}
+	store, err := NewStore(StoreConfig{
+		Root:         filepath.Join(t.TempDir(), "state"),
+		CWD:          t.TempDir(),
+		Clock:        clk,
+		Processes:    fakeProcessTable{entries: map[int]ProcessInfo{}},
+		Retention:    RetentionConfig{TerminalJobTTL: time.Hour, ResultTTL: time.Hour, StaleJobAfter: time.Minute},
+		ReapInterval: time.Nanosecond,
+		GCInterval:   time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if !store.lastGC.Equal(base) {
+		t.Fatalf("initial gc time = %v, want %v", store.lastGC, base)
+	}
+
+	// A full reap within the normal gc interval leaves the throttle timestamp
+	// unchanged.
+	clk.now = base.Add(time.Second)
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if !store.lastGC.Equal(base) {
+		t.Fatalf("in-window gc updated its throttle time to %v, want %v", store.lastGC, base)
+	}
+
+	// Clock rollback expires the gc throttle and records a new gc run.
+	clk.now = rolledBack
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if !store.lastGC.Equal(rolledBack) {
+		t.Fatalf("gc time after rollback = %v, want %v", store.lastGC, rolledBack)
+	}
+
+	// The throttle is again active within the rolled-back time window.
+	clk.now = rolledBack.Add(time.Second)
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if !store.lastGC.Equal(rolledBack) {
+		t.Fatalf("in-window gc after rollback updated its throttle time to %v, want %v", store.lastGC, rolledBack)
+	}
+}
+
 func TestReapSingleFlightsConcurrentLists(t *testing.T) {
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	started := make(chan struct{})
