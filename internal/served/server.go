@@ -84,8 +84,6 @@ type Server struct {
 	id                   atomic.Uint64
 	clients              atomic.Int64
 	accepting            atomic.Int64
-	acceptSettled        chan struct{}
-	acceptSettledOnce    sync.Once
 	idleTimeout          time.Duration
 	idleCheckInterval    time.Duration
 	binaryIdentityProbe  BinaryIdentityProbe
@@ -312,8 +310,11 @@ func (s *Server) Serve(ctx context.Context) error {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
-	s.acceptSettled = make(chan struct{})
-	go s.idleLoop(ctx, cancel, ln, socketIdentity)
+	// Invocation-local so a sequential re-Serve on the same Server can never
+	// pair a fresh channel with a spent sync.Once.
+	acceptSettled := make(chan struct{})
+	var settleOnce sync.Once
+	go s.idleLoop(ctx, cancel, ln, socketIdentity, acceptSettled)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -321,7 +322,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			// every connection it previously returned has completed
 			// registration. Signal that so the stale drain can trust the
 			// client counter (closes the post-Accept pre-register window).
-			s.acceptSettledOnce.Do(func() { close(s.acceptSettled) })
+			settleOnce.Do(func() { close(acceptSettled) })
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -392,7 +393,7 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	return ln, identity, nil
 }
 
-func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener, socketIdentity socketFileIdentity) {
+func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener, socketIdentity socketFileIdentity, acceptSettled <-chan struct{}) {
 	ticker := time.NewTicker(s.idleCheckInterval)
 	defer ticker.Stop()
 	staleDraining := false
@@ -407,7 +408,7 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net
 			if staleDraining {
 				settled := false
 				select {
-				case <-s.acceptSettled:
+				case <-acceptSettled:
 					settled = true
 				default:
 				}
