@@ -7,8 +7,10 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,37 @@ import (
 
 	"github.com/charlesnpx/agentbus/internal/served"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv("AGENTBUS_AUTOSTART_DETACH_HELPER") == "1" &&
+		len(os.Args) == 3 && os.Args[1] == "serve" && os.Args[2] == "--foreground" {
+		os.Exit(runAutostartDetachDaemon())
+	}
+	os.Exit(m.Run())
+}
+
+func runAutostartDetachDaemon() int {
+	server, err := served.New(served.Config{
+		StateRoot:   os.Getenv("AGENTBUS_STATE_ROOT"),
+		Token:       os.Getenv("AGENTBUS_AUTOSTART_DETACH_TOKEN"),
+		IdleTimeout: -1,
+	})
+	if err != nil {
+		recordAutostartDetachDaemonError(err)
+		return 1
+	}
+	if err := server.Serve(context.Background()); err != nil {
+		recordAutostartDetachDaemonError(err)
+		return 1
+	}
+	return 0
+}
+
+func recordAutostartDetachDaemonError(err error) {
+	if path := os.Getenv("AGENTBUS_AUTOSTART_DETACH_ERROR_PATH"); path != "" {
+		_ = os.WriteFile(path, []byte(err.Error()), 0o600)
+	}
+}
 
 func TestClientHelloParsesBackendMetadata(t *testing.T) {
 	hello := runClientHello(t, `{"protocolVersion":1,"backends":["codex"],"backendMetadata":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}],"capabilities":{"models.discovery":true}}`)
@@ -171,11 +204,25 @@ func TestAutostartReplacesRefusedSocket(t *testing.T) {
 	if err := stale.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if conn, err := net.DialTimeout("unix", socketPath, 100*time.Millisecond); err == nil {
-		_ = conn.Close()
-		t.Fatal("dial to closed socket unexpectedly succeeded")
-	} else if !errors.Is(err, syscall.ECONNREFUSED) {
-		t.Fatalf("dial to closed socket error = %v, want connection refused", err)
+	// A connect can transiently land in the closed listener's dying backlog
+	// (observed on macOS under load); the precondition under test is only that
+	// the socket BECOMES refused, so retry briefly instead of failing on the
+	// first successful dial.
+	refusedDeadline := time.Now().Add(2 * time.Second)
+	for {
+		conn, err := net.DialTimeout("unix", socketPath, 100*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			if time.Now().After(refusedDeadline) {
+				t.Fatal("socket never became connection-refused after listener close")
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if !errors.Is(err, syscall.ECONNREFUSED) {
+			t.Fatalf("dial to closed socket error = %v, want connection refused", err)
+		}
+		break
 	}
 
 	serverCtx, cancelServer := context.WithCancel(context.Background())
@@ -261,6 +308,109 @@ func TestDefaultStarterDoesNotCancelDaemonAfterStartupContextEnds(t *testing.T) 
 	time.Sleep(100 * time.Millisecond)
 	if err := syscall.Kill(pid, 0); err != nil {
 		t.Fatalf("autostarted daemon exited after startup context cancel: %v", err)
+	}
+}
+
+func TestAutostartedDaemonSurvivesLauncherProcessGroupTermination(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("Unix process-group test")
+	}
+	root := shortClientTempDir(t)
+	testBinary, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	const token = "detach-token"
+	errorPath := filepath.Join(root, "autostart-detach-daemon-error")
+
+	cmd := exec.Command(testBinary, "-test.run=^TestAutostartDetachHelper$")
+	cmd.Env = append(os.Environ(),
+		"AGENTBUS_AUTOSTART_DETACH_HELPER=1",
+		"AGENTBUS_AUTOSTART_DETACH_ROOT="+root,
+		"AGENTBUS_AUTOSTART_DETACH_TOKEN="+token,
+		"AGENTBUS_AUTOSTART_DETACH_COMMAND="+testBinary,
+		"AGENTBUS_AUTOSTART_DETACH_ERROR_PATH="+errorPath,
+	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var output strings.Builder
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	helperPID := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		if daemonErr, readErr := os.ReadFile(errorPath); readErr == nil && strings.Contains(string(daemonErr), "operation not permitted") {
+			t.Skipf("Unix socket bind denied by sandbox: %s", daemonErr)
+		}
+		t.Fatalf("autostart helper failed: %v\n%s", err, output.String())
+	}
+
+	pidData, err := os.ReadFile(filepath.Join(root, "agentbus.pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemonPID, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+	if err != nil {
+		t.Fatalf("parse daemon pid %q: %v", pidData, err)
+	}
+	t.Cleanup(func() {
+		if err := syscall.Kill(daemonPID, syscall.SIGTERM); err != nil {
+			if !errors.Is(err, syscall.ESRCH) {
+				t.Errorf("stop autostarted daemon: %v", err)
+			}
+			return
+		}
+		// Verify the daemon actually exits so a detached process can never
+		// outlive the suite; escalate to SIGKILL at the deadline.
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if err := syscall.Kill(daemonPID, 0); errors.Is(err, syscall.ESRCH) {
+				return
+			}
+			if time.Now().After(deadline) {
+				_ = syscall.Kill(daemonPID, syscall.SIGKILL)
+				t.Errorf("autostarted daemon %d did not exit after SIGTERM; sent SIGKILL", daemonPID)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
+
+	if err := syscall.Kill(-helperPID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("terminate helper process group: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := syscall.Kill(daemonPID, 0); err != nil {
+		t.Fatalf("autostarted daemon exited with launcher process group: %v", err)
+	}
+
+	client, err := Connect(context.Background(), Options{
+		StateRoot:        root,
+		Token:            token,
+		DisableAutoStart: true,
+	})
+	if err != nil {
+		t.Fatalf("connect to daemon after launcher process-group termination: %v", err)
+	}
+	defer client.Close()
+}
+
+func TestAutostartDetachHelper(t *testing.T) {
+	if os.Getenv("AGENTBUS_AUTOSTART_DETACH_HELPER") != "1" {
+		t.Skip("autostart detach helper")
+	}
+	client, err := Connect(context.Background(), Options{
+		StateRoot:    os.Getenv("AGENTBUS_AUTOSTART_DETACH_ROOT"),
+		Token:        os.Getenv("AGENTBUS_AUTOSTART_DETACH_TOKEN"),
+		CommandPath:  os.Getenv("AGENTBUS_AUTOSTART_DETACH_COMMAND"),
+		StartTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

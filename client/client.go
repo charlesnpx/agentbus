@@ -305,6 +305,10 @@ func (defaultStarter) StartDaemon(ctx context.Context, opts StartOptions) (int, 
 	default:
 	}
 	cmd := exec.Command(command, "serve", "--foreground")
+	// The client often runs under a process-group-scoped tool invocation. Give
+	// the daemon its own session so ending that invocation cannot terminate the
+	// daemon along with its launcher.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Env = append(os.Environ(), "AGENTBUS_STATE_ROOT="+opts.StateRoot)
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
@@ -318,7 +322,12 @@ func (defaultStarter) StartDaemon(ctx context.Context, opts StartOptions) (int, 
 		return 0, err
 	}
 	_ = devNull.Close()
-	return cmd.Process.Pid, nil
+	pid := cmd.Process.Pid
+	// Reap the daemon if it ever exits. Waiting asynchronously preserves
+	// autostart's non-blocking behavior while preventing a long-lived client
+	// process from retaining a zombie child.
+	go func() { _ = cmd.Wait() }()
+	return pid, nil
 }
 
 func (c *Client) readLoop(conn net.Conn, reader *bufio.Reader) {

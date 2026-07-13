@@ -69,29 +69,30 @@ type Config struct {
 
 // Server serves the protocol v1 socket API over engine backends.
 type Server struct {
-	stateRoot            string
-	cwd                  string
-	socketPath           string
-	tokenPath            string
-	token                string
-	backends             map[string]engine.Backend
-	registry             *engine.PolicyRegistry
-	clock                engine.Clock
-	processes            engine.ProcessTable
-	processGroups        engine.ProcessGroupSignaler
-	cancelGrace          time.Duration
-	cancelWaiter         engine.Waiter
-	id                   atomic.Uint64
-	clients              atomic.Int64
-	accepting            atomic.Int64
-	idleTimeout          time.Duration
-	idleCheckInterval    time.Duration
-	binaryIdentityProbe  BinaryIdentityProbe
-	beforeStaleCloseHook func()
-	staleListenerHook    func()
-	inlineResultCap      int
-	leaseDuration        time.Duration
-	heartbeatInterval    time.Duration
+	stateRoot              string
+	cwd                    string
+	socketPath             string
+	tokenPath              string
+	token                  string
+	backends               map[string]engine.Backend
+	registry               *engine.PolicyRegistry
+	clock                  engine.Clock
+	processes              engine.ProcessTable
+	processGroups          engine.ProcessGroupSignaler
+	cancelGrace            time.Duration
+	cancelWaiter           engine.Waiter
+	id                     atomic.Uint64
+	clients                atomic.Int64
+	accepting              atomic.Int64
+	idleTimeout            time.Duration
+	idleCheckInterval      time.Duration
+	binaryIdentityProbe    BinaryIdentityProbe
+	beforeStaleCloseHook   func()
+	staleListenerHook      func()
+	staleSocketRemovedHook func()
+	inlineResultCap        int
+	leaseDuration          time.Duration
+	heartbeatInterval      time.Duration
 
 	mu                 sync.Mutex
 	sessions           map[string]*sessionState
@@ -442,6 +443,9 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net
 					s.staleListenerHook()
 				}
 				s.removeOwnedSocket(socketIdentity, "stale daemon listener close")
+				if s.staleSocketRemovedHook != nil {
+					s.staleSocketRemovedHook()
+				}
 				log.Print("agentbus daemon: stale listener closed; waiting for accepted connections and active work to drain")
 				staleDraining = true
 				continue
