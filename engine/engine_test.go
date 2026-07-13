@@ -1707,9 +1707,12 @@ func TestRequestReservationReclaimsExpiredTornWrite(t *testing.T) {
 	if reservation.JobID != jobID || reservation.TaskSpecSHA256 != "sha256:reclaimed" {
 		t.Fatalf("reclaimed reservation = %+v", reservation)
 	}
+	if locks := requestLockCount(t, store); locks != 0 {
+		t.Fatalf("request lock files after stale reclaim = %d, want 0", locks)
+	}
 }
 
-func TestRequestReservationsUseOneLockPerRequest(t *testing.T) {
+func TestRequestReservationsReclaimLocksAfterResolution(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
@@ -1722,6 +1725,40 @@ func TestRequestReservationsUseOneLockPerRequest(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if locks := requestLockCount(t, store); locks != 0 {
+		t.Fatalf("request lock files after job creation = %d, want 0", locks)
+	}
+	if _, err := store.LookupRequestReservation("shared-lock-request-0", "sha256:different"); err == nil {
+		t.Fatal("conflicting request reservation was accepted")
+	} else {
+		var conflict *RequestConflictError
+		if !errors.As(err, &conflict) {
+			t.Fatalf("conflicting request reservation error = %v, want RequestConflictError", err)
+		}
+	}
+	if locks := requestLockCount(t, store); locks != 0 {
+		t.Fatalf("request lock files after conflict = %d, want 0", locks)
+	}
+}
+
+func TestGCReclaimsOrphanedRequestLock(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	path := store.requestLockPath(requestReservationKey("orphaned-request-lock-1"))
+	if err := os.WriteFile(path, []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned request lock remains after gc: %v", err)
+	}
+}
+
+func requestLockCount(t *testing.T, store *Store) int {
+	t.Helper()
 	entries, err := os.ReadDir(store.Layout().Requests)
 	if err != nil {
 		t.Fatal(err)
@@ -1732,9 +1769,7 @@ func TestRequestReservationsUseOneLockPerRequest(t *testing.T) {
 			locks++
 		}
 	}
-	if locks != 3 {
-		t.Fatalf("request lock files = %d, want 3", locks)
-	}
+	return locks
 }
 
 func TestGCAndConcurrentResubmitKeepReplacementReservation(t *testing.T) {

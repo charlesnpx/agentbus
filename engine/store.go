@@ -1173,6 +1173,9 @@ func (s *Store) gc(now time.Time, records []reapedRecord) error {
 	for _, record := range reservationsForRemoval {
 		s.removeRequestReservation(record)
 	}
+	if err := s.gcRequestLockFiles(); err != nil {
+		return err
+	}
 	for _, dir := range []string{s.layout.Results} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -1196,6 +1199,98 @@ func (s *Store) gc(now time.Time, records []reapedRecord) error {
 		}
 	}
 	return nil
+}
+
+// gcRequestLockFiles reclaims legacy request locks that were left behind by a
+// completed reservation, plus orphaned locks with no reservation. New request
+// operations remove their own lock before returning; this pass recovers locks
+// from interrupted older processes without disturbing an in-flight holder.
+func (s *Store) gcRequestLockFiles() error {
+	return s.withRequestLocksGuard(func() error {
+		entries, err := os.ReadDir(s.layout.Requests)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".lock") {
+				continue
+			}
+			key := strings.TrimSuffix(entry.Name(), ".lock")
+			if !validRequestLockKey(key) {
+				continue
+			}
+			path := s.requestLockPath(key)
+			f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			lockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+			if requestLockBusy(lockErr) {
+				_ = f.Close()
+				continue
+			}
+			if lockErr != nil {
+				_ = f.Close()
+				return lockErr
+			}
+			reclaim, err := s.requestLockReclaimable(key)
+			if err == nil && reclaim {
+				current, currentErr := requestLockCurrentAtPath(path, f)
+				if currentErr != nil {
+					err = currentErr
+				} else if current {
+					err = removeIfExists(path)
+				}
+			}
+			unlockAndClose(f)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func validRequestLockKey(key string) bool {
+	if len(key) != sha256.Size*2 {
+		return false
+	}
+	for _, r := range key {
+		if r >= '0' && r <= '9' || r >= 'a' && r <= 'f' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func requestLockBusy(err error) bool {
+	return errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN)
+}
+
+// requestLockReclaimable is called while holding the request-directory guard
+// and the candidate lock. A reservation with a live job remains protected;
+// a durable job means the reservation has resolved and its old lock is safe
+// to reclaim.
+func (s *Store) requestLockReclaimable(key string) (bool, error) {
+	reservation, err := s.loadRequestReservation(s.requestReservationPath(key))
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, nil
+	}
+	_, err = s.Load(reservation.JobID)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
 }
 
 func (s *Store) loadPath(path string) (*JobRecord, error) {
@@ -1333,20 +1428,122 @@ func (s *Store) withJobLock(jobID string, fn func() error) error {
 }
 
 func (s *Store) withRequestLock(key string, fn func() error) error {
-	// Reservations and their cleanup only contend when they address the same
-	// request key. Keeping the lock at this granularity lets unrelated submits
-	// proceed while a caller is publishing or recovering another request.
-	path := filepath.Join(s.layout.Requests, key+".lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if fn == nil {
+		return errors.New("nil request lock function")
+	}
+	// A request lock is only a transient serialization aid; the reservation is
+	// the durable replay record. The cleanup protocol below prevents one lock
+	// file per request from accumulating while keeping an opener that raced the
+	// unlink from entering through an unlinked inode.
+	for {
+		f, err := s.openRequestLock(key)
+		if err != nil {
+			return err
+		}
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			_ = f.Close()
+			return err
+		}
+		current, err := s.requestLockCurrent(key, f)
+		if err != nil {
+			unlockAndClose(f)
+			return err
+		}
+		if !current {
+			// Another owner unlinked the lock after this caller opened it. Do
+			// not execute under the old inode; reopen the current lock instead.
+			unlockAndClose(f)
+			continue
+		}
+
+		runErr := fn()
+		cleanupErr := s.removeRequestLockArtifact(key, f)
+		unlockAndClose(f)
+		if runErr != nil {
+			if cleanupErr != nil {
+				return fmt.Errorf("request lock operation: %w (remove request lock: %v)", runErr, cleanupErr)
+			}
+			return runErr
+		}
+		return cleanupErr
+	}
+}
+
+// withRequestLocksGuard serializes opening and unlinking request lock files.
+// It locks the already-persistent requests directory rather than creating a
+// second lock-file artifact.
+func (s *Store) withRequestLocksGuard(fn func() error) error {
+	dir, err := os.Open(s.layout.Requests)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	defer dir.Close()
+	if err := syscall.Flock(int(dir.Fd()), syscall.LOCK_EX); err != nil {
 		return err
 	}
-	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+	defer func() { _ = syscall.Flock(int(dir.Fd()), syscall.LOCK_UN) }()
 	return fn()
+}
+
+func (s *Store) openRequestLock(key string) (*os.File, error) {
+	var f *os.File
+	err := s.withRequestLocksGuard(func() error {
+		var err error
+		f, err = os.OpenFile(s.requestLockPath(key), os.O_CREATE|os.O_RDWR, 0o600)
+		return err
+	})
+	if err != nil && f != nil {
+		_ = f.Close()
+	}
+	return f, err
+}
+
+func (s *Store) requestLockPath(key string) string {
+	return filepath.Join(s.layout.Requests, key+".lock")
+}
+
+func (s *Store) requestLockCurrent(key string, f *os.File) (bool, error) {
+	current := false
+	err := s.withRequestLocksGuard(func() error {
+		var err error
+		current, err = requestLockCurrentAtPath(s.requestLockPath(key), f)
+		return err
+	})
+	return current, err
+}
+
+func requestLockCurrentAtPath(path string, f *os.File) (bool, error) {
+	fileInfo, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	pathInfo, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(fileInfo, pathInfo), nil
+}
+
+// removeRequestLockArtifact removes the lock only while its caller still owns
+// the current inode. Waiters verify that inode after acquiring flock and retry
+// if it was unlinked, so a new caller cannot bypass an older waiter.
+func (s *Store) removeRequestLockArtifact(key string, f *os.File) error {
+	return s.withRequestLocksGuard(func() error {
+		path := s.requestLockPath(key)
+		current, err := requestLockCurrentAtPath(path, f)
+		if err != nil || !current {
+			return err
+		}
+		return removeIfExists(path)
+	})
+}
+
+func unlockAndClose(f *os.File) {
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
 }
 
 func requestReservationKey(requestID string) string {

@@ -1073,17 +1073,18 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
 	if err != nil {
 		s.finalizeStartFailure(store, jobID)
-		return requestOutcome{result: protocol.JobSubmitResult{JobID: jobID, State: engine.StateFailed}}
+		return s.durableJobSubmitOutcome(store, jobID, false)
 	}
-	if backendSessionID := session.ID(); backendSessionID != "" {
-		sessionID = backendSessionID
-		if err := s.persistStartedSessionID(store, jobID, backendSessionID); err != nil {
-			log.Printf("agentbus: persist backend session id for %s: %v", jobID, err)
-		}
+	runCtx, active, record, err := s.activateStartedJob(ctx, store, jobID, sessionID, session)
+	if err != nil {
+		s.stopStartedSession(jobID, session)
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
 	}
-	runCtx, cancel := context.WithCancel(ctx)
-	active := &activeJob{jobID: jobID, sessionID: sessionID, session: session, cancel: cancel}
-	s.addActiveJob(active)
+	if active == nil {
+		s.stopStartedSession(jobID, session)
+		return requestOutcome{result: protocol.JobSubmitResult{JobID: record.JobID, State: record.State}}
+	}
+	sessionID = active.sessionID
 	run := jobRun{
 		jobID:        jobID,
 		sessionID:    sessionID,
@@ -1179,17 +1180,18 @@ func (s *Server) handleRequestIdentifiedJobSubmit(ctx context.Context, requestID
 		s.finalizeStartFailure(store, jobID)
 		// Keep the durable record and reservation so retrying this requestId
 		// replays its failed job instead of launching another backend.
-		return requestOutcome{result: protocol.JobSubmitResult{JobID: jobID, State: engine.StateFailed}}
+		return s.durableJobSubmitOutcome(store, jobID, false)
 	}
-	if backendSessionID := session.ID(); backendSessionID != "" {
-		sessionID = backendSessionID
-		if err := s.persistStartedSessionID(store, jobID, backendSessionID); err != nil {
-			log.Printf("agentbus: persist backend session id for %s: %v", jobID, err)
-		}
+	runCtx, active, record, err := s.activateStartedJob(ctx, store, jobID, sessionID, session)
+	if err != nil {
+		s.stopStartedSession(jobID, session)
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
 	}
-	runCtx, cancel := context.WithCancel(ctx)
-	active := &activeJob{jobID: jobID, sessionID: sessionID, session: session, cancel: cancel}
-	s.addActiveJob(active)
+	if active == nil {
+		s.stopStartedSession(jobID, session)
+		return requestOutcome{result: protocol.JobSubmitResult{JobID: record.JobID, State: record.State}}
+	}
+	sessionID = active.sessionID
 	run := jobRun{
 		jobID:        jobID,
 		sessionID:    sessionID,
@@ -1636,6 +1638,71 @@ func (s *Server) finalizeStartFailure(store *engine.Store, jobID string) {
 	}
 }
 
+// durableJobSubmitOutcome reports the durable state after a submission-side
+// transition. In particular, a failed backend start can race a cancellation,
+// so the response must never manufacture a state that was not persisted.
+func (s *Server) durableJobSubmitOutcome(store *engine.Store, jobID string, deduplicated bool) requestOutcome {
+	record, err := store.Load(jobID)
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
+	}
+	return requestOutcome{result: protocol.JobSubmitResult{JobID: record.JobID, State: record.State, Deduplicated: deduplicated}}
+}
+
+// activateStartedJob is the post-Start admission gate for a background job.
+// Backend.Start intentionally runs without the job lock, so cancellation can
+// win while it is in progress. Check the durable record and register the
+// active session while holding that same lock: cancellation then either wins
+// before admission (and the caller tears the new session down) or observes
+// the active job and cancels it normally.
+func (s *Server) activateStartedJob(ctx context.Context, store *engine.Store, jobID, fallbackSessionID string, session engine.Session) (context.Context, *activeJob, *engine.JobRecord, error) {
+	runCtx, cancel := context.WithCancel(ctx)
+	sessionID := fallbackSessionID
+	backendSessionID := session.ID()
+	if backendSessionID != "" {
+		sessionID = backendSessionID
+	}
+	var active *activeJob
+	record, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
+		// Only a queued or starting durable record may admit a newly started
+		// backend. A cancellation or any other terminal result wins instead.
+		if record.State != engine.StateQueued && record.State != engine.StateStarting {
+			return false, nil
+		}
+		changed := false
+		if backendSessionID != "" && record.SessionID != sessionID {
+			record.SessionID = sessionID
+			changed = true
+		}
+		if backendSessionID != "" && record.BackendSessionID != sessionID {
+			record.BackendSessionID = sessionID
+			changed = true
+		}
+		active = &activeJob{jobID: jobID, sessionID: sessionID, session: session, cancel: cancel}
+		s.addActiveJob(active)
+		return changed, nil
+	})
+	if err != nil {
+		if active != nil {
+			s.removeActiveJob(jobID)
+		}
+		cancel()
+	} else if active == nil {
+		cancel()
+	}
+	return runCtx, active, record, err
+}
+
+// stopStartedSession uses the same session interrupt primitive as runtime
+// teardown. It is required when cancellation won before the session could be
+// admitted to active-job bookkeeping, where the normal cancellation path has
+// no active job to signal.
+func (s *Server) stopStartedSession(jobID string, session engine.Session) {
+	if err := session.Interrupt(context.Background()); err != nil {
+		log.Printf("agentbus: stop unadmitted backend session for %s: %v", jobID, err)
+	}
+}
+
 func (s *Server) finalizeRequestedTerminal(run jobRun) {
 	state := run.active.requestedTerminal()
 	if state == "" {
@@ -1765,28 +1832,6 @@ func (s *Server) updateBackendSessionID(store *engine.Store, jobID, backendSessi
 		}
 		record.BackendSessionID = backendSessionID
 		return true, nil
-	})
-	return err
-}
-
-// persistStartedSessionID replaces the generated session identifier only when
-// the backend provides a durable identifier. The generated value remains the
-// fallback for backends that do not expose one.
-func (s *Server) persistStartedSessionID(store *engine.Store, jobID, backendSessionID string) error {
-	if backendSessionID == "" {
-		return nil
-	}
-	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
-		changed := false
-		if record.SessionID != backendSessionID {
-			record.SessionID = backendSessionID
-			changed = true
-		}
-		if record.BackendSessionID != backendSessionID {
-			record.BackendSessionID = backendSessionID
-			changed = true
-		}
-		return changed, nil
 	})
 	return err
 }

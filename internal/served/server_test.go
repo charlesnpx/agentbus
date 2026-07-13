@@ -551,6 +551,122 @@ func TestJobSubmitRequestIDSlowBackendStartDoesNotBlockUnrelatedRequest(t *testi
 	}
 }
 
+func TestJobSubmitRequestIDCancelDuringBackendStartStopsUnadmittedSession(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	releaseStart := make(chan struct{})
+	backend.startBlock = releaseStart
+	backend.startStarted = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	params := protocol.JobSubmitParams{RequestID: "request-cancel-during-start-1", TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "hold"}}
+	raw := mustMarshal(t, params)
+
+	firstDone := make(chan requestOutcome, 1)
+	go func() { firstDone <- server.handleJobSubmit(context.Background(), raw) }()
+	select {
+	case <-backend.startStarted:
+	case <-time.After(time.Second):
+		t.Fatal("submit did not enter backend.Start")
+	}
+
+	replay := server.handleJobSubmit(context.Background(), raw)
+	replayResult, ok := replay.result.(protocol.JobSubmitResult)
+	if replay.err != nil || !ok || !replayResult.Deduplicated || replayResult.State != engine.StateQueued {
+		t.Fatalf("replay during backend.Start = %+v, err = %+v", replay.result, replay.err)
+	}
+	canceled := server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: replayResult.JobID}))
+	cancelResult, ok := canceled.result.(protocol.JobCancelResult)
+	if canceled.err != nil || !ok || cancelResult.State != engine.StateCanceled {
+		t.Fatalf("cancel during backend.Start = %+v, err = %+v", canceled.result, canceled.err)
+	}
+
+	close(releaseStart)
+	select {
+	case first := <-firstDone:
+		result, ok := first.result.(protocol.JobSubmitResult)
+		if first.err != nil || !ok || result.JobID != replayResult.JobID || result.State != engine.StateCanceled || result.Deduplicated {
+			t.Fatalf("first submit after cancellation = %+v, err = %+v", first.result, first.err)
+		}
+		if first.after != nil {
+			t.Fatal("canceled job returned a deferred run")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("submit did not return after backend.Start released")
+	}
+	if got := backend.interrupts.Load(); got != 1 {
+		t.Fatalf("unadmitted session interrupts = %d, want 1", got)
+	}
+	if active := server.lookupActiveJob(replayResult.JobID); active != nil {
+		t.Fatalf("canceled job registered as active: %+v", active)
+	}
+	select {
+	case turn := <-backend.turns:
+		t.Fatalf("post-cancel backend turn = %+v", turn)
+	default:
+	}
+
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load(replayResult.JobID)
+	if err != nil || record.State != engine.StateCanceled || record.BackendSessionID != "" {
+		t.Fatalf("durable canceled record = %+v, err = %v", record, err)
+	}
+	replayAfterCancel := server.handleJobSubmit(context.Background(), raw)
+	replayAfterCancelResult, ok := replayAfterCancel.result.(protocol.JobSubmitResult)
+	if replayAfterCancel.err != nil || !ok || !replayAfterCancelResult.Deduplicated || replayAfterCancelResult.JobID != replayResult.JobID || replayAfterCancelResult.State != engine.StateCanceled {
+		t.Fatalf("replay after cancellation = %+v, err = %+v", replayAfterCancel.result, replayAfterCancel.err)
+	}
+}
+
+func TestJobSubmitRequestIDStartFailureReturnsCanceledDurableState(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.startErr = errors.New("backend start failed")
+	releaseStart := make(chan struct{})
+	backend.startBlock = releaseStart
+	backend.startStarted = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	params := protocol.JobSubmitParams{RequestID: "request-cancel-start-failure-1", TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "hold"}}
+	raw := mustMarshal(t, params)
+
+	firstDone := make(chan requestOutcome, 1)
+	go func() { firstDone <- server.handleJobSubmit(context.Background(), raw) }()
+	select {
+	case <-backend.startStarted:
+	case <-time.After(time.Second):
+		t.Fatal("submit did not enter backend.Start")
+	}
+	replay := server.handleJobSubmit(context.Background(), raw)
+	replayResult, ok := replay.result.(protocol.JobSubmitResult)
+	if replay.err != nil || !ok || !replayResult.Deduplicated || replayResult.State != engine.StateQueued {
+		t.Fatalf("replay during failed backend.Start = %+v, err = %+v", replay.result, replay.err)
+	}
+	canceled := server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: replayResult.JobID}))
+	if canceled.err != nil {
+		t.Fatalf("cancel during failed backend.Start = %+v", canceled.err)
+	}
+
+	close(releaseStart)
+	select {
+	case first := <-firstDone:
+		result, ok := first.result.(protocol.JobSubmitResult)
+		if first.err != nil || !ok || result.JobID != replayResult.JobID || result.State != engine.StateCanceled || result.Deduplicated {
+			t.Fatalf("failed first submit = %+v, err = %+v", first.result, first.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed submit did not return after backend.Start released")
+	}
+	replayAfterFailure := server.handleJobSubmit(context.Background(), raw)
+	result, ok := replayAfterFailure.result.(protocol.JobSubmitResult)
+	if replayAfterFailure.err != nil || !ok || !result.Deduplicated || result.JobID != replayResult.JobID || result.State != engine.StateCanceled {
+		t.Fatalf("replay after failed start = %+v, err = %+v", replayAfterFailure.result, replayAfterFailure.err)
+	}
+}
+
 func TestJobSubmitStartFailureReturnsDurableJobWithoutRequestID(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
