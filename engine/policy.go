@@ -803,7 +803,7 @@ func collectJSONSchemaLeaves(err *jsonschema.ValidationError, leaves *[]*jsonsch
 
 func jsonPointer(parts []string) string {
 	if len(parts) == 0 {
-		return "/"
+		return ""
 	}
 	var pointer strings.Builder
 	for _, part := range parts {
