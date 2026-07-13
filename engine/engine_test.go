@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,18 +56,19 @@ func (p *countingProcessTable) lookupCount(pid int) int {
 }
 
 type testStoreOptions struct {
-	processGroups    ProcessGroupSignaler
-	cancelWaiter     Waiter
-	cancelGrace      time.Duration
-	retention        RetentionConfig
-	leaseDuration    time.Duration
-	orphanGrace      time.Duration
-	beforeUpdate     func(string)
-	reapInterval     time.Duration
-	gcInterval       time.Duration
-	beforeReap       func()
-	onReapWait       func()
-	beforeRecordLoad func(string)
+	processGroups                  ProcessGroupSignaler
+	cancelWaiter                   Waiter
+	cancelGrace                    time.Duration
+	retention                      RetentionConfig
+	leaseDuration                  time.Duration
+	orphanGrace                    time.Duration
+	beforeUpdate                   func(string)
+	reapInterval                   time.Duration
+	gcInterval                     time.Duration
+	beforeReap                     func()
+	onReapWait                     func()
+	beforeRecordLoad               func(string)
+	beforeRequestReservationRemove func()
 }
 
 func newTestStore(t *testing.T, now time.Time, pt ProcessTable) *Store {
@@ -86,22 +88,23 @@ func newTestStoreWithOptions(t *testing.T, now time.Time, pt ProcessTable, opts 
 		retention.StaleJobAfter = time.Minute
 	}
 	store, err := NewStore(StoreConfig{
-		Root:             filepath.Join(t.TempDir(), "state"),
-		CWD:              t.TempDir(),
-		Clock:            &fakeClock{now: now},
-		Processes:        pt,
-		ProcessGroups:    opts.processGroups,
-		CancelWaiter:     opts.cancelWaiter,
-		CancelGrace:      opts.cancelGrace,
-		Retention:        retention,
-		LeaseDuration:    opts.leaseDuration,
-		OrphanGrace:      opts.orphanGrace,
-		BeforeUpdate:     opts.beforeUpdate,
-		ReapInterval:     opts.reapInterval,
-		GCInterval:       opts.gcInterval,
-		BeforeReap:       opts.beforeReap,
-		OnReapWait:       opts.onReapWait,
-		BeforeRecordLoad: opts.beforeRecordLoad,
+		Root:                           filepath.Join(t.TempDir(), "state"),
+		CWD:                            t.TempDir(),
+		Clock:                          &fakeClock{now: now},
+		Processes:                      pt,
+		ProcessGroups:                  opts.processGroups,
+		CancelWaiter:                   opts.cancelWaiter,
+		CancelGrace:                    opts.cancelGrace,
+		Retention:                      retention,
+		LeaseDuration:                  opts.leaseDuration,
+		OrphanGrace:                    opts.orphanGrace,
+		BeforeUpdate:                   opts.beforeUpdate,
+		ReapInterval:                   opts.reapInterval,
+		GCInterval:                     opts.gcInterval,
+		BeforeReap:                     opts.beforeReap,
+		OnReapWait:                     opts.onReapWait,
+		BeforeRecordLoad:               opts.beforeRecordLoad,
+		BeforeRequestReservationRemove: opts.beforeRequestReservationRemove,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1673,6 +1676,120 @@ func TestGCRemovesRequestReservationWithJobRecord(t *testing.T) {
 	}
 	if _, err := os.Stat(reservationPath); !os.IsNotExist(err) {
 		t.Fatalf("request reservation remains after gc: %v", err)
+	}
+}
+
+func TestRequestReservationReclaimsExpiredTornWrite(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	requestID := "torn-request-1"
+	path := store.requestReservationPath(requestReservationKey(requestID))
+	if err := os.WriteFile(path, []byte(`{"requestId":"torn-request-1"`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := base.Add(-DefaultRequestReservationGrace - time.Second)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	const jobID = "job_reclaimed_torn_reservation"
+	if _, deduplicated, err := store.WithRequestReservation(requestID, "sha256:reclaimed", jobID, func() error {
+		return store.Save(&JobRecord{JobID: jobID, State: StateQueued})
+	}); err != nil {
+		t.Fatalf("reclaim torn reservation: %v", err)
+	} else if deduplicated {
+		t.Fatal("torn reservation was treated as a replay")
+	}
+	reservation, err := store.loadRequestReservation(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reservation.JobID != jobID || reservation.TaskSpecSHA256 != "sha256:reclaimed" {
+		t.Fatalf("reclaimed reservation = %+v", reservation)
+	}
+}
+
+func TestRequestReservationsUseOneSharedLock(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	for i := 0; i < 3; i++ {
+		requestID := fmt.Sprintf("shared-lock-request-%d", i)
+		jobID := fmt.Sprintf("job_shared_lock_%d", i)
+		if _, _, err := store.WithRequestReservation(requestID, "sha256:shared", jobID, func() error {
+			return store.Save(&JobRecord{JobID: jobID, State: StateQueued})
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(store.Layout().Requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locks := 0
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".lock") {
+			locks++
+		}
+	}
+	if locks != 1 {
+		t.Fatalf("request lock files = %d, want 1", locks)
+	}
+}
+
+func TestGCAndConcurrentResubmitKeepReplacementReservation(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	enteredCleanup := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		retention: RetentionConfig{TerminalJobTTL: time.Hour, ResultTTL: time.Hour, StaleJobAfter: time.Minute},
+		beforeRequestReservationRemove: func() {
+			close(enteredCleanup)
+			<-releaseCleanup
+		},
+	})
+	const requestID = "gc-resubmit-request-1"
+	const oldJobID = "job_gc_resubmit_old"
+	const newJobID = "job_gc_resubmit_new"
+	old := base.Add(-2 * time.Hour)
+	if err := store.writeRequestReservation(store.requestReservationPath(requestReservationKey(requestID)), requestReservation{
+		RequestID:      requestID,
+		JobID:          oldJobID,
+		TaskSpecSHA256: "sha256:old",
+		CreatedAt:      old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(&JobRecord{JobID: oldJobID, RequestID: requestID, TaskSpecSHA256: "sha256:old", State: StateCompleted, UpdatedAt: old}); err != nil {
+		t.Fatal(err)
+	}
+	gcDone := make(chan error, 1)
+	go func() { gcDone <- store.Reap() }()
+	<-enteredCleanup
+	resubmitStarted := make(chan struct{})
+	resubmitDone := make(chan error, 1)
+	go func() {
+		close(resubmitStarted)
+		_, _, err := store.WithRequestReservation(requestID, "sha256:new", newJobID, func() error {
+			return store.Save(&JobRecord{JobID: newJobID, RequestID: requestID, TaskSpecSHA256: "sha256:new", State: StateQueued})
+		})
+		resubmitDone <- err
+	}()
+	<-resubmitStarted
+	close(releaseCleanup)
+	if err := <-gcDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-resubmitDone; err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := store.loadRequestReservation(store.requestReservationPath(requestReservationKey(requestID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reservation.JobID != newJobID || reservation.TaskSpecSHA256 != "sha256:new" {
+		t.Fatalf("replacement reservation = %+v", reservation)
 	}
 }
 

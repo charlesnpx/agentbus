@@ -1039,6 +1039,9 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{})}
 	}
+	if requestIDPresent {
+		return s.handleRequestIdentifiedJobSubmit(ctx, params.RequestID, spec, raw)
+	}
 	timeout, errObj := timeoutFromMillis(spec.TimeoutMs)
 	if errObj != nil {
 		return requestOutcome{err: errObj}
@@ -1051,28 +1054,26 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	if !ok {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{})}
 	}
-	if requestIDPresent {
-		return s.handleRequestIdentifiedJobSubmit(ctx, params.RequestID, spec, raw, policy, backend)
-	}
-	session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
-	if err != nil {
-		return requestOutcome{err: backendError(err)}
-	}
-	sessionID := session.ID()
-	if sessionID == "" {
-		sessionID = s.nextID("ses")
-	}
 	s.mu.Lock()
 	store, err := s.storeForCWDLocked(spec.CWD)
+	jobID := s.nextID("job")
+	s.mu.Unlock()
 	if err != nil {
-		s.mu.Unlock()
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 	}
-	jobID := s.nextID("job")
-	s.jobStores[jobID] = store
-	s.mu.Unlock()
+	// The durable record must exist before a backend process/session can be
+	// created, so a start failure remains visible to reaping and recovery.
+	sessionID := s.nextID("ses")
 	if err := s.createQueuedRecord(store, jobID, sessionID, spec.Backend, spec.Tags, policy.policy, policy.contract, false); err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
+	}
+	s.mu.Lock()
+	s.jobStores[jobID] = store
+	s.mu.Unlock()
+	session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
+	if err != nil {
+		s.finalizeStartFailure(store, jobID)
+		return requestOutcome{err: backendError(err)}
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	active := &activeJob{jobID: jobID, sessionID: sessionID, session: session, cancel: cancel}
@@ -1099,7 +1100,7 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	}
 }
 
-func (s *Server) handleRequestIdentifiedJobSubmit(ctx context.Context, requestID string, spec protocol.TaskSpec, raw json.RawMessage, policy resolvedPolicy, backend engine.Backend) requestOutcome {
+func (s *Server) handleRequestIdentifiedJobSubmit(ctx context.Context, requestID string, spec protocol.TaskSpec, raw json.RawMessage) requestOutcome {
 	taskSpecRaw, err := rawTaskSpec(raw)
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
@@ -1108,41 +1109,60 @@ func (s *Server) handleRequestIdentifiedJobSubmit(ctx context.Context, requestID
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 	}
-	timeout, errObj := timeoutFromMillis(spec.TimeoutMs)
-	if errObj != nil {
-		return requestOutcome{err: errObj}
-	}
 	s.mu.Lock()
 	store, err := s.storeForCWDLocked(spec.CWD)
-	jobID := ""
-	if err == nil {
-		jobID = s.nextID("job")
-	}
 	s.mu.Unlock()
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 	}
+	// Replay and conflict semantics are durable and must take precedence over
+	// current backend availability and policy validation.
+	existing, err := store.LookupRequestReservation(requestID, taskSpecSHA256)
+	if err != nil {
+		var conflict *engine.RequestConflictError
+		if errors.As(err, &conflict) {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorRequestConflict, "requestId was already submitted with a different taskSpec", protocol.ErrorData{JobID: conflict.JobID})}
+		}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+	}
+	if existing != nil {
+		return requestOutcome{result: protocol.JobSubmitResult{JobID: existing.JobID, State: existing.State, Deduplicated: true}}
+	}
+	timeout, errObj := timeoutFromMillis(spec.TimeoutMs)
+	if errObj != nil {
+		return requestOutcome{err: errObj}
+	}
+	policy, err := s.resolvePolicy(spec.Policy)
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+	}
+	backend, ok := s.backends[spec.Backend]
+	if !ok {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{})}
+	}
+	jobID := s.nextID("job")
+	sessionID := s.nextID("ses")
 
 	var run jobRun
 	var runCtx context.Context
-	var backendStarted bool
 	var backendStartErr error
 	existing, deduplicated, err := store.WithRequestReservation(requestID, taskSpecSHA256, jobID, func() error {
-		session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
-		if err != nil {
-			backendStartErr = err
-			return err
-		}
-		backendStarted = true
-		sessionID := session.ID()
-		if sessionID == "" {
-			sessionID = s.nextID("ses")
-		}
 		if s.beforeRequestRecordCreateHook != nil {
 			s.beforeRequestRecordCreateHook()
 		}
 		if err := s.createQueuedRequestRecord(store, jobID, sessionID, spec.Backend, spec.Tags, policy.policy, policy.contract, requestID, taskSpecSHA256); err != nil {
 			return err
+		}
+		s.mu.Lock()
+		s.jobStores[jobID] = store
+		s.mu.Unlock()
+		session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
+		if err != nil {
+			backendStartErr = err
+			s.finalizeStartFailure(store, jobID)
+			// Keep the durable record and reservation so retrying this requestId
+			// replays its failed job instead of launching another backend.
+			return nil
 		}
 		var cancel context.CancelFunc
 		runCtx, cancel = context.WithCancel(ctx)
@@ -1173,12 +1193,6 @@ func (s *Server) handleRequestIdentifiedJobSubmit(ctx context.Context, requestID
 		if errors.As(err, &conflict) {
 			return requestOutcome{err: protocol.NewError(protocol.ErrorRequestConflict, "requestId was already submitted with a different taskSpec", protocol.ErrorData{JobID: conflict.JobID})}
 		}
-		if backendStarted {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
-		}
-		if backendStartErr != nil {
-			return requestOutcome{err: backendError(backendStartErr)}
-		}
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 	}
 	if deduplicated {
@@ -1186,6 +1200,9 @@ func (s *Server) handleRequestIdentifiedJobSubmit(ctx context.Context, requestID
 			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "requestId replay could not load its job", protocol.ErrorData{})}
 		}
 		return requestOutcome{result: protocol.JobSubmitResult{JobID: existing.JobID, State: existing.State, Deduplicated: true}}
+	}
+	if backendStartErr != nil {
+		return requestOutcome{err: backendError(backendStartErr)}
 	}
 	return requestOutcome{
 		result:       protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
@@ -1606,6 +1623,16 @@ func (s *Server) resolvePolicy(policy *engine.TurnPolicy) (resolvedPolicy, error
 
 func (s *Server) finalizeFailure(run jobRun, err error) {
 	_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
+}
+
+func (s *Server) finalizeStartFailure(store *engine.Store, jobID string) {
+	if err := s.transitionRecord(store, jobID, engine.StateStarting); err != nil {
+		log.Printf("agentbus: mark backend start failure for %s: %v", jobID, err)
+		return
+	}
+	if err := s.finalizeTerminal(jobRun{jobID: jobID, store: store}, engine.StateFailed, "", nil); err != nil {
+		log.Printf("agentbus: finalize backend start failure for %s: %v", jobID, err)
+	}
 }
 
 func (s *Server) finalizeRequestedTerminal(run jobRun) {
@@ -2263,7 +2290,8 @@ func statusFiltersMatch(record engine.JobRecord, tags map[string]string, request
 		return false
 	}
 	for key, value := range tags {
-		if record.Tags[key] != value {
+		actual, ok := record.Tags[key]
+		if !ok || actual != value {
 			return false
 		}
 	}

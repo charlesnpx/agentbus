@@ -633,12 +633,12 @@ caller policy and requires a new request identifier. Reusing the same
 identifier with a different hash MUST return `request_conflict` and the
 existing `jobId` in error data.
 
-Before starting a worker, the server atomically creates an O_EXCL reservation
-keyed by a SHA-256 hash of `requestId`, then creates the job record while
-holding its request lock. A reservation with no job record can only represent
-a crash between those steps; it is retained for a bounded five-minute grace
-period and then reclaimed by a later submit. GC removes an index entry when it
-removes the referenced job record.
+Before starting a worker, the server atomically publishes a reservation keyed
+by a SHA-256 hash of `requestId`, then creates the job record while holding its
+request lock. A reservation with no job record can only represent a crash
+between those steps; it is retained for a bounded five-minute grace period and
+then reclaimed by a later submit. GC removes an index entry when it removes the
+referenced job record.
 
 Result:
 

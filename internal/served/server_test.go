@@ -30,6 +30,8 @@ type fakeBackend struct {
 	turns           chan fakeTurn
 	count           atomic.Int64
 	interrupts      atomic.Int64
+	startErr        error
+	startHook       func()
 	events          func(prompt string, write bool) []engine.Event
 	processRef      engine.ProcessRef
 	backendChildPID int
@@ -64,6 +66,12 @@ func (b *fakeBackend) Preflight(context.Context) (engine.Health, error) {
 
 func (b *fakeBackend) Start(context.Context, engine.SessionOpts) (engine.Session, error) {
 	n := b.count.Add(1)
+	if b.startHook != nil {
+		b.startHook()
+	}
+	if b.startErr != nil {
+		return nil, b.startErr
+	}
 	return &fakeSession{id: b.name + "-session-" + stringID(n), backend: b}, nil
 }
 
@@ -408,6 +416,89 @@ func TestJobSubmitRequestIDConflict(t *testing.T) {
 	}
 }
 
+func TestJobSubmitRequestIDReplayPrecedesCurrentBackendValidation(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	firstRaw := mustMarshal(t, protocol.JobSubmitParams{RequestID: "request-replay-before-validation-1", TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "first"}})
+	first := server.handleJobSubmit(context.Background(), firstRaw)
+	if first.err != nil {
+		t.Fatalf("first submit error = %+v", first.err)
+	}
+	firstResult := first.result.(protocol.JobSubmitResult)
+	delete(server.backends, "fake")
+
+	replay := server.handleJobSubmit(context.Background(), firstRaw)
+	if replay.err != nil {
+		t.Fatalf("replay error = %+v", replay.err)
+	}
+	replayResult, ok := replay.result.(protocol.JobSubmitResult)
+	if !ok || !replayResult.Deduplicated || replayResult.JobID != firstResult.JobID {
+		t.Fatalf("replay result = %+v, first = %+v", replay.result, firstResult)
+	}
+
+	conflictRaw := mustMarshal(t, protocol.JobSubmitParams{RequestID: "request-replay-before-validation-1", TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "different"}})
+	conflict := server.handleJobSubmit(context.Background(), conflictRaw)
+	if conflict.err == nil || conflict.err.Data.Code != protocol.ErrorRequestConflict || conflict.err.Data.JobID != firstResult.JobID {
+		t.Fatalf("conflict outcome = %+v", conflict)
+	}
+}
+
+func TestJobSubmitRequestIDPersistsBeforeBackendStartFailure(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.startErr = errors.New("backend start failed")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	var observedQueued bool
+	backend.startHook = func() {
+		server.mu.Lock()
+		store, err := server.storeForCWDLocked(cwd)
+		server.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobs, err := store.List()
+		if err != nil {
+			t.Fatal(err)
+		}
+		observedQueued = len(jobs) == 1 && jobs[0].State == engine.StateQueued
+	}
+	params := protocol.JobSubmitParams{RequestID: "request-durable-before-start-1", TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "persist"}}
+	first := server.handleJobSubmit(context.Background(), mustMarshal(t, params))
+	if first.err == nil {
+		t.Fatalf("first submit succeeded despite backend start failure: %+v", first)
+	}
+	if !observedQueued {
+		t.Fatal("backend started before its queued record was durable")
+	}
+
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].State != engine.StateFailed || jobs[0].RequestID != params.RequestID {
+		t.Fatalf("durable failed record = %+v", jobs)
+	}
+
+	replay := server.handleJobSubmit(context.Background(), mustMarshal(t, params))
+	if replay.err != nil {
+		t.Fatalf("failed-job replay error = %+v", replay.err)
+	}
+	result, ok := replay.result.(protocol.JobSubmitResult)
+	if !ok || !result.Deduplicated || result.JobID != jobs[0].JobID || result.State != engine.StateFailed {
+		t.Fatalf("failed-job replay = %+v", replay.result)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts = %d, want 1", got)
+	}
+}
+
 func TestJobSubmitRequestIDHashesSubmittedTaskSpecExactly(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -506,6 +597,7 @@ func TestJobStatusFiltersRequestIDAndTags(t *testing.T) {
 	}{
 		{primary, "job_filter_primary_match", map[string]string{"client": "delegate", "kind": "task"}, "request-filter-1"},
 		{primary, "job_filter_primary_other", map[string]string{"client": "delegate", "kind": "review"}, "request-filter-2"},
+		{primary, "job_filter_primary_without_client", map[string]string{"kind": "unlabeled"}, ""},
 		{other, "job_filter_other_workspace", map[string]string{"client": "delegate", "kind": "task"}, "request-filter-1"},
 	} {
 		if err := item.store.Save(&engine.JobRecord{JobID: item.jobID, State: engine.StateQueued, Tags: item.tags, RequestID: item.id}); err != nil {
@@ -526,6 +618,10 @@ func TestJobStatusFiltersRequestIDAndTags(t *testing.T) {
 	none := request(protocol.JobStatusParams{Tags: map[string]string{"client": "delegate", "kind": "missing"}})
 	if len(none.Jobs) != 0 {
 		t.Fatalf("single-workspace no-match = %+v", none)
+	}
+	emptyTag := request(protocol.JobStatusParams{Tags: map[string]string{"client": ""}})
+	if len(emptyTag.Jobs) != 0 {
+		t.Fatalf("missing tag matched empty filter = %+v", emptyTag)
 	}
 	all := request(protocol.JobStatusParams{All: true, Tags: map[string]string{"client": "delegate", "kind": "task"}, RequestID: "request-filter-1"})
 	if len(all.Jobs) != 2 {

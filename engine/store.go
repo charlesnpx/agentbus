@@ -90,9 +90,10 @@ type StoreConfig struct {
 	RequestReservationGrace time.Duration
 	// BeforeReap, OnReapWait, and BeforeRecordLoad are deterministic
 	// instrumentation hooks used by store tests and embedders.
-	BeforeReap       func()
-	OnReapWait       func()
-	BeforeRecordLoad func(string)
+	BeforeReap                     func()
+	OnReapWait                     func()
+	BeforeRecordLoad               func(string)
+	BeforeRequestReservationRemove func()
 }
 
 type workspaceManifest struct {
@@ -103,22 +104,23 @@ type workspaceManifest struct {
 
 // Store persists job records for one workspace namespace.
 type Store struct {
-	layout                  WorkspaceLayout
-	clock                   Clock
-	processes               ProcessTable
-	processGroups           ProcessGroupSignaler
-	cancelGrace             time.Duration
-	cancelWaiter            Waiter
-	retention               RetentionConfig
-	leaseDuration           time.Duration
-	orphanGrace             time.Duration
-	beforeUpdate            func(string)
-	reapInterval            time.Duration
-	gcInterval              time.Duration
-	requestReservationGrace time.Duration
-	beforeReap              func()
-	onReapWait              func()
-	beforeLoad              func(string)
+	layout                         WorkspaceLayout
+	clock                          Clock
+	processes                      ProcessTable
+	processGroups                  ProcessGroupSignaler
+	cancelGrace                    time.Duration
+	cancelWaiter                   Waiter
+	retention                      RetentionConfig
+	leaseDuration                  time.Duration
+	orphanGrace                    time.Duration
+	beforeUpdate                   func(string)
+	reapInterval                   time.Duration
+	gcInterval                     time.Duration
+	requestReservationGrace        time.Duration
+	beforeReap                     func()
+	onReapWait                     func()
+	beforeLoad                     func(string)
+	beforeRequestReservationRemove func()
 
 	reapMu         sync.Mutex
 	reapRunning    bool
@@ -306,22 +308,23 @@ func newStoreWithLayout(cfg StoreConfig, layout WorkspaceLayout) (*Store, error)
 		requestReservationGrace = DefaultRequestReservationGrace
 	}
 	return &Store{
-		layout:                  layout,
-		clock:                   clock,
-		processes:               processes,
-		processGroups:           processGroups,
-		cancelGrace:             cancelGrace,
-		cancelWaiter:            cancelWaiter,
-		retention:               retention,
-		leaseDuration:           leaseDuration,
-		orphanGrace:             orphanGrace,
-		beforeUpdate:            cfg.BeforeUpdate,
-		reapInterval:            reapInterval,
-		gcInterval:              gcInterval,
-		requestReservationGrace: requestReservationGrace,
-		beforeReap:              cfg.BeforeReap,
-		onReapWait:              cfg.OnReapWait,
-		beforeLoad:              cfg.BeforeRecordLoad,
+		layout:                         layout,
+		clock:                          clock,
+		processes:                      processes,
+		processGroups:                  processGroups,
+		cancelGrace:                    cancelGrace,
+		cancelWaiter:                   cancelWaiter,
+		retention:                      retention,
+		leaseDuration:                  leaseDuration,
+		orphanGrace:                    orphanGrace,
+		beforeUpdate:                   cfg.BeforeUpdate,
+		reapInterval:                   reapInterval,
+		gcInterval:                     gcInterval,
+		requestReservationGrace:        requestReservationGrace,
+		beforeReap:                     cfg.BeforeReap,
+		onReapWait:                     cfg.OnReapWait,
+		beforeLoad:                     cfg.BeforeRecordLoad,
+		beforeRequestReservationRemove: cfg.BeforeRequestReservationRemove,
 	}, nil
 }
 
@@ -387,8 +390,33 @@ func (s *Store) Save(record *JobRecord) error {
 	})
 }
 
+// LookupRequestReservation returns the durable result for a requestId before
+// validations that depend on current server configuration. A replay returns
+// the existing record; a different task hash returns RequestConflictError.
+//
+// A reservation without a job record is left behind only by a crash. It is
+// reclaimable after RequestReservationGrace.
+func (s *Store) LookupRequestReservation(requestID, taskSpecSHA256 string) (*JobRecord, error) {
+	if err := ValidateRequestID(requestID); err != nil {
+		return nil, err
+	}
+	if taskSpecSHA256 == "" {
+		return nil, errors.New("task spec hash is required")
+	}
+	key := requestReservationKey(requestID)
+	var existing *JobRecord
+	if err := s.withRequestLock(key, func() error {
+		var err error
+		existing, err = s.lookupRequestReservation(requestID, taskSpecSHA256, key)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	return existing, nil
+}
+
 // WithRequestReservation serializes idempotent background-job submission for a
-// requestId within this workspace. It creates an O_EXCL reservation before
+// requestId within this workspace. It atomically publishes a reservation before
 // calling create, which must durably save jobID before it returns. A replay
 // returns the existing record with deduplicated set to true. A different task
 // hash returns RequestConflictError.
@@ -412,35 +440,17 @@ func (s *Store) WithRequestReservation(requestID, taskSpecSHA256, jobID string, 
 	key := requestReservationKey(requestID)
 	if err := s.withRequestLock(key, func() error {
 		path := s.requestReservationPath(key)
-		reservation, loadErr := s.loadRequestReservation(path)
-		if loadErr == nil {
-			if reservation.RequestID != requestID {
-				return fmt.Errorf("request reservation hash collision")
-			}
-			record, recordErr := s.Load(reservation.JobID)
-			if recordErr == nil {
-				if reservation.TaskSpecSHA256 != taskSpecSHA256 {
-					return &RequestConflictError{JobID: reservation.JobID}
-				}
-				existing = record
-				deduplicated = true
-				return nil
-			}
-			if !errors.Is(recordErr, os.ErrNotExist) {
-				return recordErr
-			}
-			reclaimAt := reservation.CreatedAt.Add(s.requestReservationGrace)
-			if reservation.CreatedAt.IsZero() || s.clock.Now().UTC().Before(reclaimAt) {
-				return &RequestReservationPendingError{RetryAfter: reclaimAt}
-			}
-			if err := removeIfExists(path); err != nil {
-				return err
-			}
-		} else if !errors.Is(loadErr, os.ErrNotExist) {
-			return loadErr
+		var lookupErr error
+		existing, lookupErr = s.lookupRequestReservation(requestID, taskSpecSHA256, key)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if existing != nil {
+			deduplicated = true
+			return nil
 		}
 
-		reservation = requestReservation{
+		reservation := requestReservation{
 			RequestID:      requestID,
 			JobID:          jobID,
 			TaskSpecSHA256: taskSpecSHA256,
@@ -460,6 +470,62 @@ func (s *Store) WithRequestReservation(requestID, taskSpecSHA256, jobID string, 
 		return nil, false, err
 	}
 	return existing, deduplicated, nil
+}
+
+// lookupRequestReservation must be called while holding the request lock for
+// key. It returns nil when the reservation is absent or has been reclaimed.
+func (s *Store) lookupRequestReservation(requestID, taskSpecSHA256, key string) (*JobRecord, error) {
+	path := s.requestReservationPath(key)
+	reservation, loadErr := s.loadRequestReservation(path)
+	if errors.Is(loadErr, os.ErrNotExist) {
+		return nil, nil
+	}
+	if loadErr != nil {
+		return s.reclaimMalformedRequestReservation(path, loadErr)
+	}
+	if reservation.RequestID != requestID {
+		return nil, fmt.Errorf("request reservation hash collision")
+	}
+	record, recordErr := s.Load(reservation.JobID)
+	if recordErr == nil {
+		if reservation.TaskSpecSHA256 != taskSpecSHA256 {
+			return nil, &RequestConflictError{JobID: reservation.JobID}
+		}
+		return record, nil
+	}
+	if !errors.Is(recordErr, os.ErrNotExist) {
+		return nil, recordErr
+	}
+	reclaimAt := reservation.CreatedAt.Add(s.requestReservationGrace)
+	if s.clock.Now().UTC().Before(reclaimAt) {
+		return nil, &RequestReservationPendingError{RetryAfter: reclaimAt}
+	}
+	if err := removeIfExists(path); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+// reclaimMalformedRequestReservation leaves a recent malformed reservation in
+// place so a concurrent crash cannot be mistaken for a new submission. Once
+// the grace period expires, the caller already holds the request lock and can
+// safely reclaim it.
+func (s *Store) reclaimMalformedRequestReservation(path string, loadErr error) (*JobRecord, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stat malformed request reservation: %w", err)
+	}
+	reclaimAt := info.ModTime().UTC().Add(s.requestReservationGrace)
+	if s.clock.Now().UTC().Before(reclaimAt) {
+		return nil, &RequestReservationPendingError{RetryAfter: reclaimAt}
+	}
+	if err := removeIfExists(path); err != nil {
+		return nil, fmt.Errorf("reclaim malformed request reservation (%v): %w", loadErr, err)
+	}
+	return nil, nil
 }
 
 // ValidateRequestID validates the opaque idempotency key accepted by job.submit.
@@ -1050,6 +1116,7 @@ func (s *Store) quarantine(path string, cause error) error {
 
 func (s *Store) gc(now time.Time, records []reapedRecord) error {
 	protectedResults := make(map[string]struct{})
+	var reservationsForRemoval []*JobRecord
 	for _, item := range records {
 		record := item.record
 		if record.Result != nil && record.Result.ResultPath != "" {
@@ -1091,11 +1158,18 @@ func (s *Store) gc(now time.Time, records []reapedRecord) error {
 				log.Printf("agentbus gc: failed to remove %s: %v", item.path, err)
 				return nil
 			}
-			s.removeRequestReservation(record)
+			reservationsForRemoval = append(reservationsForRemoval, record)
 			return nil
 		}); err != nil {
 			return err
 		}
+	}
+	// Submission acquires the request lock before it saves a job record. Do not
+	// acquire that lock while holding a job lock above, or concurrent submission
+	// and GC could invert the lock order. Compare-and-delete after the job lock
+	// is released instead.
+	for _, record := range reservationsForRemoval {
+		s.removeRequestReservation(record)
 	}
 	for _, dir := range []string{s.layout.Results} {
 		entries, err := os.ReadDir(dir)
@@ -1256,8 +1330,10 @@ func (s *Store) withJobLock(jobID string, fn func() error) error {
 	return fn()
 }
 
-func (s *Store) withRequestLock(key string, fn func() error) error {
-	path := filepath.Join(s.layout.Requests, key+".lock")
+func (s *Store) withRequestLock(_ string, fn func() error) error {
+	// A single workspace request lock prevents unbounded per-request lock-file
+	// growth while retaining the submission/GC mutual exclusion guarantee.
+	path := filepath.Join(s.layout.Requests, "request.lock")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
@@ -1297,6 +1373,9 @@ func (s *Store) loadRequestReservation(path string) (requestReservation, error) 
 	if reservation.TaskSpecSHA256 == "" {
 		return requestReservation{}, errors.New("invalid request reservation: missing taskSpecSha256")
 	}
+	if reservation.CreatedAt.IsZero() {
+		return requestReservation{}, errors.New("invalid request reservation: missing createdAt")
+	}
 	return reservation, nil
 }
 
@@ -1306,38 +1385,34 @@ func (s *Store) writeRequestReservation(path string, reservation requestReservat
 		return err
 	}
 	raw = append(raw, '\n')
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
+	if _, err := os.Stat(path); err == nil {
+		return os.ErrExist
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if _, err := f.Write(raw); err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(path)
-		return err
-	}
-	return fsyncDir(s.layout.Requests)
+	// The request lock makes publication exclusive. Atomic publication ensures
+	// a crash leaves either no reservation or a complete, synced JSON file.
+	return atomicWriteFile(path, raw, 0o600)
 }
 
 func (s *Store) removeRequestReservation(record *JobRecord) {
 	if record == nil || record.RequestID == "" {
 		return
 	}
-	path := s.requestReservationPath(requestReservationKey(record.RequestID))
-	reservation, err := s.loadRequestReservation(path)
-	if err != nil || reservation.RequestID != record.RequestID || reservation.JobID != record.JobID {
+	key := requestReservationKey(record.RequestID)
+	if err := s.withRequestLock(key, func() error {
+		path := s.requestReservationPath(key)
+		reservation, err := s.loadRequestReservation(path)
+		if err != nil || reservation.RequestID != record.RequestID || reservation.JobID != record.JobID {
+			return nil
+		}
+		if s.beforeRequestReservationRemove != nil {
+			s.beforeRequestReservationRemove()
+		}
+		return removeIfExists(path)
+	}); err != nil {
+		log.Printf("agentbus gc: failed to remove request reservation for job %s: %v", record.JobID, err)
 		return
-	}
-	if err := removeIfExists(path); err != nil {
-		log.Printf("agentbus gc: failed to remove request reservation %s: %v", path, err)
 	}
 }
 
