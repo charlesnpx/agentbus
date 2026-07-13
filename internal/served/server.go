@@ -487,6 +487,17 @@ func (s *Server) removeOwnedSocket(owned socketFileIdentity, phase string) {
 		log.Printf("agentbus daemon: skipping socket removal during %s: replacement daemon owns %s", phase, s.socketPath)
 		return
 	}
+	// dev+inode alone cannot prove ownership: tmpfs (Linux /tmp) reuses inodes
+	// immediately, so a replacement daemon's socket can inherit the dead
+	// socket's exact identity. Removal only ever targets a socket whose own
+	// listener is already closed, so a successful dial proves a LIVE listener —
+	// necessarily a replacement — and skipping is always fail-safe (daemon
+	// startup dials and clears genuinely stale files itself).
+	if conn, dialErr := net.DialTimeout("unix", s.socketPath, 250*time.Millisecond); dialErr == nil {
+		_ = conn.Close()
+		log.Printf("agentbus daemon: skipping socket removal during %s: %s accepts connections; a replacement daemon owns it", phase, s.socketPath)
+		return
+	}
 	if err := os.Remove(s.socketPath); err != nil {
 		log.Printf("agentbus daemon: remove owned socket during %s: %v", phase, err)
 		return
