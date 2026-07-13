@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const correctiveRetryTemplate = "Your response missed: {{missing}}. Emit the corrected report only; make no further changes."
@@ -317,6 +320,79 @@ func TestJSONSchemaViolationLimitAndMessageTruncation(t *testing.T) {
 	}
 	if prompt := RenderRetryTemplate("{{missing}}{{missing}}", largeMissing); len(prompt) > maxRetryViolationTextBytes {
 		t.Fatalf("retry violation text is %d bytes, want at most %d", len(prompt), maxRetryViolationTextBytes)
+	}
+}
+
+func TestJSONSchemaViolationsEscapeAndBoundUntrustedPropertyNames(t *testing.T) {
+	t.Parallel()
+	propertyNames := []string{
+		"new\nline",
+		"return\rline",
+		"ansi" + string(rune(0x1b)) + "escape",
+		strings.Repeat("界", maxSchemaViolationMessageRunes+20),
+	}
+	for _, propertyName := range propertyNames {
+		t.Run(strconv.Quote(propertyName), func(t *testing.T) {
+			pointer := jsonPointer([]string{propertyName})
+			assertSingleLinePrintableViolation(t, pointer, 0)
+			pointerSchema, err := json.Marshal(map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					propertyName: map[string]any{"type": "string"},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			messageSchema, err := json.Marshal(map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			instance, err := json.Marshal(map[string]any{propertyName: 7})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for schemaIndex, schema := range []json.RawMessage{pointerSchema, messageSchema} {
+				result, err := ValidateContract(string(instance), ContractSpec{JSONSchema: schema})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result.Valid || len(result.Missing) == 0 {
+					t.Fatalf("valid = %v, missing = %#v", result.Valid, result.Missing)
+				}
+
+				stamp := StampValidation(1, false, "", result, time.Now())
+				for _, missing := range stamp.Missing {
+					assertSingleLinePrintableViolation(t, missing, maxSchemaViolationMessageRunes)
+				}
+				if schemaIndex == 0 && utf8.RuneCountInString(pointer) <= maxSchemaViolationMessageRunes-len(": ") {
+					if !strings.HasPrefix(stamp.Missing[0], pointer+": ") {
+						t.Fatalf("pointer violation = %q, want prefix %q", stamp.Missing[0], pointer+": ")
+					}
+				}
+				prompt := RenderRetryTemplate("Correct these violations: {{missing}}", stamp.Missing)
+				assertSingleLinePrintableViolation(t, prompt, len("Correct these violations: ")+maxRetryViolationTextBytes)
+			}
+		})
+	}
+}
+
+func assertSingleLinePrintableViolation(t *testing.T, value string, maxRunes int) {
+	t.Helper()
+	if maxRunes > 0 && utf8.RuneCountInString(value) > maxRunes {
+		t.Fatalf("violation has %d runes, want at most %d: %q", utf8.RuneCountInString(value), maxRunes, value)
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		t.Fatalf("violation contains a line break: %q", value)
+	}
+	for _, r := range value {
+		if !unicode.IsPrint(r) {
+			t.Fatalf("violation contains non-printable %U: %q", r, value)
+		}
 	}
 }
 

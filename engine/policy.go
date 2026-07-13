@@ -773,7 +773,7 @@ func jsonSchemaViolations(err error) []string {
 		if leaf.ErrorKind != nil {
 			violationMessage = leaf.ErrorKind.LocalizedString(printer)
 		}
-		violation := jsonPointer(leaf.InstanceLocation) + ": " + truncateRunes(violationMessage, maxSchemaViolationMessageRunes)
+		violation := schemaViolation(jsonPointer(leaf.InstanceLocation), violationMessage)
 		if _, ok := seen[violation]; ok {
 			continue
 		}
@@ -806,9 +806,27 @@ func jsonPointer(parts []string) string {
 	var pointer strings.Builder
 	for _, part := range parts {
 		pointer.WriteByte('/')
-		pointer.WriteString(strings.ReplaceAll(strings.ReplaceAll(part, "~", "~0"), "/", "~1"))
+		part = strings.ReplaceAll(strings.ReplaceAll(part, "~", "~0"), "/", "~1")
+		pointer.WriteString(escapeNonPrintable(part))
 	}
 	return pointer.String()
+}
+
+// schemaViolation formats a schema validation leaf for persistence and retry
+// prompts. Both components must be printable because property names and schema
+// diagnostics originate from untrusted JSON.
+func schemaViolation(pointer, message string) string {
+	message = truncateRunes(message, maxSchemaViolationMessageRunes)
+	violation := pointer + ": " + escapeNonPrintable(message)
+	return truncateRunesToLimit(violation, maxSchemaViolationMessageRunes)
+}
+
+// escapeNonPrintable returns value as printable text suitable for a single-line
+// diagnostic. strconv.Quote applies Go string-literal escaping without changing
+// printable Unicode characters; discard its surrounding quotes for display.
+func escapeNonPrintable(value string) string {
+	quoted := strconv.Quote(value)
+	return quoted[1 : len(quoted)-1]
 }
 
 func truncateRunes(value string, limit int) string {
@@ -823,6 +841,21 @@ func truncateRunes(value string, limit int) string {
 		count++
 	}
 	return value
+}
+
+// truncateRunesToLimit truncates value to at most limit runes, including an
+// ellipsis when the value does not fit.
+func truncateRunesToLimit(value string, limit int) string {
+	if limit < 1 {
+		return ""
+	}
+	if utf8.RuneCountInString(value) <= limit {
+		return value
+	}
+	if limit <= len("...") {
+		return strings.Repeat(".", limit)
+	}
+	return truncateRunes(value, limit-len("..."))
 }
 
 func boundedViolationText(violations []string, maxBytes int) string {
