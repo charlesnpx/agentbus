@@ -1488,7 +1488,7 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		if engine.IsTerminal(record.State) && !salvageReaped {
 			return false, nil
 		}
-		salvaged := (record.State == engine.StateOrphaned || salvageReaped) && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant)
+		lateFinalization := run.authoritativeCompletion && record.State == engine.StateOrphaned && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant || state == engine.StateFailed) || salvageReaped
 		var result *engine.ResultInfo
 		if state == engine.StateCompleted || state == engine.StateCompletedNoncompliant {
 			if text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
@@ -1519,8 +1519,8 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		if backendSessionID != "" {
 			record.BackendSessionID = backendSessionID
 		}
-		if salvaged {
-			record.Warnings = append(record.Warnings, "late-finalization: recovered authoritative completed result after orphan reconciliation")
+		if lateFinalization {
+			record.LateFinalization = true
 		}
 		return true, nil
 	})
@@ -2071,6 +2071,7 @@ func statusFromRecord(record engine.JobRecord) protocol.JobStatus {
 		SessionID:             record.SessionID,
 		Backend:               record.Backend,
 		State:                 record.State,
+		LateFinalization:      record.LateFinalization,
 		Tags:                  cloneTags(record.Tags),
 		StartedAt:             timePtr(record.StartedAt),
 		UpdatedAt:             timePtr(record.UpdatedAt),
@@ -2089,12 +2090,13 @@ func statusFromRecord(record engine.JobRecord) protocol.JobStatus {
 
 func resultFromRecord(record engine.JobRecord) protocol.JobResult {
 	return protocol.JobResult{
-		JobID:         record.JobID,
-		SessionID:     record.SessionID,
-		State:         record.State,
-		Result:        record.Result,
-		ModelReported: record.ModelReported,
-		Contract:      record.Contract,
+		JobID:            record.JobID,
+		SessionID:        record.SessionID,
+		State:            record.State,
+		LateFinalization: record.LateFinalization,
+		Result:           record.Result,
+		ModelReported:    record.ModelReported,
+		Contract:         record.Contract,
 	}
 }
 

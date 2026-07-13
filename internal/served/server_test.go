@@ -776,15 +776,33 @@ func TestFinalizeCompletedSalvagesOrphanedJob(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := server.finalizeTerminal(jobRun{jobID: jobID, store: store}, engine.StateCompleted, "done", nil); err != nil {
+	if err := server.finalizeTerminal(jobRun{jobID: jobID, store: store, authoritativeCompletion: true}, engine.StateCompleted, "done", nil); err != nil {
 		t.Fatal(err)
 	}
 	record, err := store.Load(jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.State != engine.StateCompleted || record.Result == nil || len(record.Warnings) != 1 || !strings.Contains(record.Warnings[0], "late-finalization") {
+	if record.State != engine.StateCompleted || record.Result == nil || !record.LateFinalization || len(record.Warnings) != 0 {
 		t.Fatalf("salvaged record = %+v", record)
+	}
+	statusRaw, err := json.Marshal(protocol.JobStatusParams{JobID: jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusOutcome := server.handleJobStatus(statusRaw)
+	status, ok := statusOutcome.result.(protocol.JobStatusResult)
+	if statusOutcome.err != nil || !ok || len(status.Jobs) != 1 || !status.Jobs[0].LateFinalization {
+		t.Fatalf("job.status outcome = %+v", statusOutcome)
+	}
+	resultRaw, err := json.Marshal(protocol.JobResultParams{JobID: jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultOutcome := server.handleJobResult(resultRaw)
+	result, ok := resultOutcome.result.(protocol.JobResult)
+	if resultOutcome.err != nil || !ok || !result.LateFinalization {
+		t.Fatalf("job.result outcome = %+v", resultOutcome)
 	}
 }
 
@@ -824,7 +842,7 @@ func TestFinalizeCompletedSalvagesReapedJobOnlyWithAuthoritativeCompletion(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.State != engine.StateCompleted || record.Result == nil || !strings.Contains(record.Result.Text, "salvaged") || len(record.Warnings) != 1 || !strings.Contains(record.Warnings[0], "authoritative") {
+	if record.State != engine.StateCompleted || record.Result == nil || !record.LateFinalization || !strings.Contains(record.Result.Text, "salvaged") || len(record.Warnings) != 0 {
 		t.Fatalf("authoritative completion was not salvaged = %+v", record)
 	}
 }

@@ -250,6 +250,7 @@ type JobStatus struct {
 	SessionID             string            `json:"sessionId,omitempty"`
 	Backend               string            `json:"backend,omitempty"`
 	State                 engine.JobState   `json:"state"`
+	LateFinalization      bool              `json:"lateFinalization,omitempty"`
 	Tags                  map[string]string `json:"tags,omitempty"`
 	StartedAt             *time.Time        `json:"startedAt,omitempty"`
 	UpdatedAt             *time.Time        `json:"updatedAt,omitempty"`
@@ -270,12 +271,13 @@ type JobResultParams struct {
 }
 
 type JobResult struct {
-	JobID         string                `json:"jobId"`
-	SessionID     string                `json:"sessionId,omitempty"`
-	State         engine.JobState       `json:"state"`
-	Result        *engine.ResultInfo    `json:"result,omitempty"`
-	ModelReported string                `json:"modelReported,omitempty"`
-	Contract      *engine.ContractStamp `json:"contract,omitempty"`
+	JobID            string                `json:"jobId"`
+	SessionID        string                `json:"sessionId,omitempty"`
+	State            engine.JobState       `json:"state"`
+	LateFinalization bool                  `json:"lateFinalization,omitempty"`
+	Result           *engine.ResultInfo    `json:"result,omitempty"`
+	ModelReported    string                `json:"modelReported,omitempty"`
+	Contract         *engine.ContractStamp `json:"contract,omitempty"`
 }
 
 type JobCancelParams struct {

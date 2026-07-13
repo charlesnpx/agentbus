@@ -645,6 +645,18 @@ PID and start-time token still matches the observed process. If any required
 identity is missing, dead, or reused, the reaper MUST move the record to
 `orphaned`.
 
+A backend child may legitimately exit at every turn boundary, before the worker
+persists its authoritative `turn.result`. Its absence alone MUST NOT orphan a
+`running` or `retrying` record. Outside the lease-expiry branch, reaping moves
+such a record to `orphaned` only when the worker or supervisor is missing or
+has been reused; an identity-confirmed worker owns reporting the turn result.
+
+`lateFinalization` is an optional boolean on `job.status` and `job.result`.
+When `true`, an authoritative terminal result arrived after the record had
+entered `orphaned`; it is an informational lifecycle annotation, not a warning
+condition or a different terminal state. It is additive and requires no
+capability negotiation; an omitted value is false.
+
 An orphaned record MUST remain non-terminal for an orphan grace period measured
 from the transition to `orphaned`. The default orphan grace is the configured
 lease duration and MUST NOT be shorter than that duration. After the grace
@@ -724,6 +736,7 @@ Result:
   "jobId": "job_01J00000000000000000000002",
   "sessionId": "ses_01J00000000000000000000002",
   "state": "completed_noncompliant",
+  "lateFinalization": true,
   "modelReported": "claude-opus-4",
   "result": {
     "resultPath": "/home/me/.local/state/agentbus/results/job_01J00000000000000000000002.txt",
@@ -896,12 +909,15 @@ queued -> starting -> running -> [retrying ->] completed
 Supervision states:
 
 ```text
-orphaned -> completed | completed_noncompliant | reaped
+orphaned -> completed | completed_noncompliant | failed | reaped
 reaped --authoritative in-process completion--> completed | completed_noncompliant
 quarantined
 ```
 
-The `reaped` completion amendments are intentionally narrow: only the daemon
+An authoritative completion may normally transition an `orphaned` record to
+`completed`, `completed_noncompliant`, or `failed`; a `lateFinalization: true`
+annotation records that ordering. The `reaped` completion amendments are
+intentionally narrow: only the daemon
 instance that already holds the authoritative backend completion may salvage a
 `reaped` record. Status clients, restarted daemons, and unauthenticated or
 out-of-process writers MUST treat `reaped` as terminal and MUST NOT synthesize a

@@ -75,6 +75,7 @@ type JobRecord struct {
 	StatePath             string            `json:"statePath,omitempty"`
 	LogPaths              LogPaths          `json:"logPaths,omitempty"`
 	Result                *ResultInfo       `json:"result,omitempty"`
+	LateFinalization      bool              `json:"lateFinalization,omitempty"`
 	Policy                *TurnPolicy       `json:"policy,omitempty"`
 	ResolvedContract      *ContractSpec     `json:"resolvedContract,omitempty"`
 	Contract              *ContractStamp    `json:"contract,omitempty"`
@@ -135,7 +136,7 @@ func LegalTransition(from, to JobState, retryCount int) bool {
 	case StateRetrying:
 		return to == StateRunning || to == StateCompleted || to == StateCompletedNoncompliant || to == StateFailed || to == StateTimedOut || to == StateInterrupted || to == StateCanceled || to == StateOrphaned
 	case StateOrphaned:
-		return to == StateCompleted || to == StateCompletedNoncompliant || to == StateReaped
+		return to == StateCompleted || to == StateCompletedNoncompliant || to == StateFailed || to == StateReaped
 	case StateReaped:
 		return to == StateCompleted || to == StateCompletedNoncompliant
 	default:

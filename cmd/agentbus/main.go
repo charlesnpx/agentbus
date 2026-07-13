@@ -712,6 +712,7 @@ func statusFromRecord(record engine.JobRecord) jobStatus {
 		SessionID:             record.SessionID,
 		Backend:               record.Backend,
 		State:                 record.State,
+		LateFinalization:      record.LateFinalization,
 		Tags:                  cloneTags(record.Tags),
 		CreatedAt:             timePtr(record.CreatedAt),
 		StartedAt:             timePtr(record.StartedAt),
@@ -729,11 +730,12 @@ func statusFromRecord(record engine.JobRecord) jobStatus {
 
 func resultFromRecord(record engine.JobRecord) jobResult {
 	return jobResult{
-		JobID:     record.JobID,
-		SessionID: record.SessionID,
-		State:     record.State,
-		Result:    record.Result,
-		Contract:  record.Contract,
+		JobID:            record.JobID,
+		SessionID:        record.SessionID,
+		State:            record.State,
+		LateFinalization: record.LateFinalization,
+		Result:           record.Result,
+		Contract:         record.Contract,
 	}
 }
 
@@ -938,6 +940,7 @@ type jobStatus struct {
 	SessionID             string            `json:"sessionId,omitempty"`
 	Backend               string            `json:"backend,omitempty"`
 	State                 engine.JobState   `json:"state"`
+	LateFinalization      bool              `json:"lateFinalization,omitempty"`
 	Tags                  map[string]string `json:"tags,omitempty"`
 	CreatedAt             *time.Time        `json:"createdAt,omitempty"`
 	StartedAt             *time.Time        `json:"startedAt,omitempty"`
@@ -953,11 +956,12 @@ type jobStatus struct {
 }
 
 type jobResult struct {
-	JobID     string                `json:"jobId"`
-	SessionID string                `json:"sessionId,omitempty"`
-	State     engine.JobState       `json:"state"`
-	Result    *engine.ResultInfo    `json:"result,omitempty"`
-	Contract  *engine.ContractStamp `json:"contract,omitempty"`
+	JobID            string                `json:"jobId"`
+	SessionID        string                `json:"sessionId,omitempty"`
+	State            engine.JobState       `json:"state"`
+	LateFinalization bool                  `json:"lateFinalization,omitempty"`
+	Result           *engine.ResultInfo    `json:"result,omitempty"`
+	Contract         *engine.ContractStamp `json:"contract,omitempty"`
 }
 
 type cancelOutput struct {
