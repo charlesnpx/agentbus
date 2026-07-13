@@ -297,8 +297,8 @@ func TestJSONSchemaViolationLimitAndMessageTruncation(t *testing.T) {
 	if got, want := result.Missing[len(result.Missing)-1], "+6 more schema violations"; got != want {
 		t.Fatalf("last missing = %q, want %q", got, want)
 	}
-	if !strings.HasPrefix(result.Missing[0], "/: ") {
-		t.Fatalf("root violation = %q, want JSON pointer root", result.Missing[0])
+	if !strings.HasPrefix(result.Missing[0], ": ") {
+		t.Fatalf("root violation = %q, want empty JSON pointer root", result.Missing[0])
 	}
 
 	longName := strings.Repeat("x", maxSchemaViolationMessageRunes+20)

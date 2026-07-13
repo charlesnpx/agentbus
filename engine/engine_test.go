@@ -736,6 +736,171 @@ func TestLoadLazilyReapsTargetAndListReapsAndQuarantines(t *testing.T) {
 	}
 }
 
+func TestLoadMissingRecordDoesNotQuarantine(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	jobID := "job_missing_record"
+	path := filepath.Join(store.Layout().Jobs, jobID+".json")
+
+	if _, err := store.Load(jobID); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Load error = %v, want job-not-found error", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing record path = %v, want not exist", err)
+	}
+	entries, err := os.ReadDir(store.Layout().Quarantine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("missing record produced quarantine entries: %#v", entries)
+	}
+}
+
+func TestBatchOperationsSkipRecordDeletedDuringLoad(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	operations := []struct {
+		name string
+		run  func(*Store) ([]JobRecord, error)
+	}{
+		{
+			name: "List",
+			run:  func(store *Store) ([]JobRecord, error) { return store.List() },
+		},
+		{
+			name: "Reap",
+			run: func(store *Store) ([]JobRecord, error) {
+				return nil, store.Reap()
+			},
+		},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			missingPath := ""
+			deleted := false
+			store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+				beforeRecordLoad: func(path string) {
+					if path != missingPath || deleted {
+						return
+					}
+					if err := os.Remove(path); err != nil {
+						t.Fatalf("remove record during load: %v", err)
+					}
+					deleted = true
+				},
+			})
+			missing := &JobRecord{JobID: "job_deleted_during_load", State: StateQueued, UpdatedAt: base}
+			remaining := &JobRecord{JobID: "job_remaining_after_delete", State: StateQueued, UpdatedAt: base}
+			if err := store.Save(missing); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Save(remaining); err != nil {
+				t.Fatal(err)
+			}
+			missingPath = missing.StatePath
+
+			records, err := operation.run(store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !deleted {
+				t.Fatal("BeforeRecordLoad did not delete the enumerated record")
+			}
+			if operation.name == "List" {
+				if len(records) != 1 || records[0].JobID != remaining.JobID {
+					t.Fatalf("List records = %#v, want only %q", records, remaining.JobID)
+				}
+			}
+			if _, err := store.Load(remaining.JobID); err != nil {
+				t.Fatalf("remaining record was not preserved: %v", err)
+			}
+		})
+	}
+}
+
+func TestUnreadableRecordsAreNotQuarantined(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read files with mode 000")
+	}
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	operations := []struct {
+		name string
+		run  func(*Store, string) error
+	}{
+		{
+			name: "Load",
+			run: func(store *Store, jobID string) error {
+				_, err := store.Load(jobID)
+				return err
+			},
+		},
+		{name: "Reap", run: func(store *Store, _ string) error { return store.Reap() }},
+		{
+			name: "List",
+			run: func(store *Store, _ string) error {
+				_, err := store.List()
+				return err
+			},
+		},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+			record := &JobRecord{JobID: "job_unreadable_record", State: StateQueued, UpdatedAt: base}
+			if err := store.Save(record); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(record.StatePath, 0); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := os.Chmod(record.StatePath, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("restore record mode: %v", err)
+				}
+			})
+
+			if err := operation.run(store, record.JobID); !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("operation error = %v, want permission error", err)
+			}
+			if _, err := os.Stat(record.StatePath); err != nil {
+				t.Fatalf("unreadable record was moved or removed: %v", err)
+			}
+			entries, err := os.ReadDir(store.Layout().Quarantine)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("unreadable record produced quarantine entries: %#v", entries)
+			}
+		})
+	}
+}
+
+func TestLoadQuarantinesCorruptRecord(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	path := filepath.Join(store.Layout().Jobs, "job_load_bad.json")
+	if err := os.WriteFile(path, []byte("{bad json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Load("job_load_bad"); err == nil {
+		t.Fatal("Load succeeded for corrupt record")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("corrupt record still exists after Load: %v", err)
+	}
+	entries, err := os.ReadDir(store.Layout().Quarantine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("Load did not quarantine corrupt record")
+	}
+}
+
 func TestLoadDoesNotRunFullStoreReap(t *testing.T) {
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	var mu sync.Mutex

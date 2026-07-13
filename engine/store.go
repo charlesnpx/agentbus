@@ -445,10 +445,16 @@ func (s *Store) Load(jobID string) (*JobRecord, error) {
 	if err := s.withJobLock(jobID, func() error {
 		record, original, err := s.loadPathWithBytes(path)
 		if err != nil {
-			if qerr := s.quarantine(path, err); qerr != nil {
+			if readErr := unwrapRecordReadError(err); readErr != nil {
+				if errors.Is(readErr, os.ErrNotExist) {
+					return fmt.Errorf("job %q not found: %w", jobID, os.ErrNotExist)
+				}
+				return readErr
+			}
+			if qerr := s.quarantine(path, unwrapRecordLoadError(err)); qerr != nil {
 				return qerr
 			}
-			return err
+			return unwrapRecordLoadError(err)
 		}
 		changed, err := s.reapRecord(record, now)
 		if err != nil {
@@ -493,10 +499,17 @@ func (s *Store) List() ([]JobRecord, error) {
 		}
 		var record *JobRecord
 		if err := s.withJobLock(jobID, func() error {
-			loaded, err := s.loadPath(path)
+			loaded, _, err := s.loadPathWithBytes(path)
 			if err != nil {
-				listLoadErrorHook(path, err)
-				if qerr := s.quarantine(path, err); qerr != nil {
+				if readErr := unwrapRecordReadError(err); readErr != nil {
+					if errors.Is(readErr, os.ErrNotExist) {
+						return nil
+					}
+					return readErr
+				}
+				cause := unwrapRecordLoadError(err)
+				listLoadErrorHook(path, cause)
+				if qerr := s.quarantine(path, cause); qerr != nil {
 					return qerr
 				}
 				return nil
@@ -739,7 +752,13 @@ func (s *Store) reapFull(now time.Time) error {
 		if err := s.withJobLock(jobID, func() error {
 			record, original, err := s.loadPathWithBytes(path)
 			if err != nil {
-				if qerr := s.quarantine(path, err); qerr != nil {
+				if readErr := unwrapRecordReadError(err); readErr != nil {
+					if errors.Is(readErr, os.ErrNotExist) {
+						return nil
+					}
+					return readErr
+				}
+				if qerr := s.quarantine(path, unwrapRecordLoadError(err)); qerr != nil {
 					return qerr
 				}
 				return nil
@@ -967,7 +986,45 @@ func (s *Store) gc(now time.Time, records []reapedRecord) error {
 
 func (s *Store) loadPath(path string) (*JobRecord, error) {
 	record, _, err := s.loadPathWithBytes(path)
-	return record, err
+	return record, unwrapRecordLoadError(err)
+}
+
+// recordReadError marks failures reading a record's bytes. Callers must return
+// these filesystem errors rather than treating the record as corrupt.
+type recordReadError struct{ err error }
+
+func (e *recordReadError) Error() string { return e.err.Error() }
+
+func (e *recordReadError) Unwrap() error { return e.err }
+
+// recordContentError marks successfully read records whose contents are not a
+// valid job record. These are eligible for quarantine.
+type recordContentError struct{ err error }
+
+func (e *recordContentError) Error() string { return e.err.Error() }
+
+func (e *recordContentError) Unwrap() error { return e.err }
+
+func unwrapRecordReadError(err error) error {
+	var readErr *recordReadError
+	if errors.As(err, &readErr) {
+		return readErr.err
+	}
+	return nil
+}
+
+func unwrapRecordLoadError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if readErr := unwrapRecordReadError(err); readErr != nil {
+		return readErr
+	}
+	var contentErr *recordContentError
+	if errors.As(err, &contentErr) {
+		return contentErr.err
+	}
+	return err
 }
 
 func (s *Store) loadPathWithBytes(path string) (*JobRecord, []byte, error) {
@@ -976,21 +1033,21 @@ func (s *Store) loadPathWithBytes(path string) (*JobRecord, []byte, error) {
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, &recordReadError{err: err}
 	}
 	var record JobRecord
 	if err := json.Unmarshal(b, &record); err != nil {
-		return nil, nil, err
+		return nil, nil, &recordContentError{err: err}
 	}
 	if record.JobID == "" || record.State == "" {
-		return nil, nil, errors.New("invalid job record: missing jobId or state")
+		return nil, nil, &recordContentError{err: errors.New("invalid job record: missing jobId or state")}
 	}
 	if err := validateJobID(record.JobID); err != nil {
-		return nil, nil, err
+		return nil, nil, &recordContentError{err: err}
 	}
 	expected := strings.TrimSuffix(filepath.Base(path), ".json")
 	if record.JobID != expected {
-		return nil, nil, fmt.Errorf("invalid job record: jobId %q does not match path %q", record.JobID, filepath.Base(path))
+		return nil, nil, &recordContentError{err: fmt.Errorf("invalid job record: jobId %q does not match path %q", record.JobID, filepath.Base(path))}
 	}
 	record.StatePath = path
 	status := record.StatusRecord(s.clock.Now().UTC())
