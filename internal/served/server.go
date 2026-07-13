@@ -1073,7 +1073,13 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
 	if err != nil {
 		s.finalizeStartFailure(store, jobID)
-		return requestOutcome{err: backendError(err)}
+		return requestOutcome{result: protocol.JobSubmitResult{JobID: jobID, State: engine.StateFailed}}
+	}
+	if backendSessionID := session.ID(); backendSessionID != "" {
+		sessionID = backendSessionID
+		if err := s.persistStartedSessionID(store, jobID, backendSessionID); err != nil {
+			log.Printf("agentbus: persist backend session id for %s: %v", jobID, err)
+		}
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	active := &activeJob{jobID: jobID, sessionID: sessionID, session: session, cancel: cancel}
@@ -1143,9 +1149,6 @@ func (s *Server) handleRequestIdentifiedJobSubmit(ctx context.Context, requestID
 	jobID := s.nextID("job")
 	sessionID := s.nextID("ses")
 
-	var run jobRun
-	var runCtx context.Context
-	var backendStartErr error
 	existing, deduplicated, err := store.WithRequestReservation(requestID, taskSpecSHA256, jobID, func() error {
 		if s.beforeRequestRecordCreateHook != nil {
 			s.beforeRequestRecordCreateHook()
@@ -1156,36 +1159,6 @@ func (s *Server) handleRequestIdentifiedJobSubmit(ctx context.Context, requestID
 		s.mu.Lock()
 		s.jobStores[jobID] = store
 		s.mu.Unlock()
-		session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
-		if err != nil {
-			backendStartErr = err
-			s.finalizeStartFailure(store, jobID)
-			// Keep the durable record and reservation so retrying this requestId
-			// replays its failed job instead of launching another backend.
-			return nil
-		}
-		var cancel context.CancelFunc
-		runCtx, cancel = context.WithCancel(ctx)
-		active := &activeJob{jobID: jobID, sessionID: sessionID, session: session, cancel: cancel}
-		s.addActiveJob(active)
-		s.mu.Lock()
-		s.jobStores[jobID] = store
-		s.mu.Unlock()
-		run = jobRun{
-			jobID:        jobID,
-			sessionID:    sessionID,
-			backend:      spec.Backend,
-			store:        store,
-			session:      session,
-			prompt:       spec.Prompt,
-			write:        spec.Write,
-			policy:       policy.policy,
-			contract:     policy.contract,
-			contractName: policy.name,
-			contractHash: policy.hash,
-			timeout:      timeout,
-			active:       active,
-		}
 		return nil
 	})
 	if err != nil {
@@ -1201,8 +1174,36 @@ func (s *Server) handleRequestIdentifiedJobSubmit(ctx context.Context, requestID
 		}
 		return requestOutcome{result: protocol.JobSubmitResult{JobID: existing.JobID, State: existing.State, Deduplicated: true}}
 	}
-	if backendStartErr != nil {
-		return requestOutcome{err: backendError(backendStartErr)}
+	session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
+	if err != nil {
+		s.finalizeStartFailure(store, jobID)
+		// Keep the durable record and reservation so retrying this requestId
+		// replays its failed job instead of launching another backend.
+		return requestOutcome{result: protocol.JobSubmitResult{JobID: jobID, State: engine.StateFailed}}
+	}
+	if backendSessionID := session.ID(); backendSessionID != "" {
+		sessionID = backendSessionID
+		if err := s.persistStartedSessionID(store, jobID, backendSessionID); err != nil {
+			log.Printf("agentbus: persist backend session id for %s: %v", jobID, err)
+		}
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	active := &activeJob{jobID: jobID, sessionID: sessionID, session: session, cancel: cancel}
+	s.addActiveJob(active)
+	run := jobRun{
+		jobID:        jobID,
+		sessionID:    sessionID,
+		backend:      spec.Backend,
+		store:        store,
+		session:      session,
+		prompt:       spec.Prompt,
+		write:        spec.Write,
+		policy:       policy.policy,
+		contract:     policy.contract,
+		contractName: policy.name,
+		contractHash: policy.hash,
+		timeout:      timeout,
+		active:       active,
 	}
 	return requestOutcome{
 		result:       protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
@@ -1764,6 +1765,28 @@ func (s *Server) updateBackendSessionID(store *engine.Store, jobID, backendSessi
 		}
 		record.BackendSessionID = backendSessionID
 		return true, nil
+	})
+	return err
+}
+
+// persistStartedSessionID replaces the generated session identifier only when
+// the backend provides a durable identifier. The generated value remains the
+// fallback for backends that do not expose one.
+func (s *Server) persistStartedSessionID(store *engine.Store, jobID, backendSessionID string) error {
+	if backendSessionID == "" {
+		return nil
+	}
+	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
+		changed := false
+		if record.SessionID != backendSessionID {
+			record.SessionID = backendSessionID
+			changed = true
+		}
+		if record.BackendSessionID != backendSessionID {
+			record.BackendSessionID = backendSessionID
+			changed = true
+		}
+		return changed, nil
 	})
 	return err
 }

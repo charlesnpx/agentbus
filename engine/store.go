@@ -423,7 +423,9 @@ func (s *Store) LookupRequestReservation(requestID, taskSpecSHA256 string) (*Job
 //
 // A reservation without a job record is left behind only by a crash. It is
 // reclaimable after RequestReservationGrace; a live caller never sees that
-// state because it holds the corresponding flock through create.
+// state because it holds the corresponding flock through create. Callers must
+// keep create limited to durable record publication so backend work does not
+// hold the request lock.
 func (s *Store) WithRequestReservation(requestID, taskSpecSHA256, jobID string, create func() error) (existing *JobRecord, deduplicated bool, err error) {
 	if err := ValidateRequestID(requestID); err != nil {
 		return nil, false, err
@@ -1330,10 +1332,11 @@ func (s *Store) withJobLock(jobID string, fn func() error) error {
 	return fn()
 }
 
-func (s *Store) withRequestLock(_ string, fn func() error) error {
-	// A single workspace request lock prevents unbounded per-request lock-file
-	// growth while retaining the submission/GC mutual exclusion guarantee.
-	path := filepath.Join(s.layout.Requests, "request.lock")
+func (s *Store) withRequestLock(key string, fn func() error) error {
+	// Reservations and their cleanup only contend when they address the same
+	// request key. Keeping the lock at this granularity lets unrelated submits
+	// proceed while a caller is publishing or recovering another request.
+	path := filepath.Join(s.layout.Requests, key+".lock")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err

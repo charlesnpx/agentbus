@@ -32,6 +32,8 @@ type fakeBackend struct {
 	interrupts      atomic.Int64
 	startErr        error
 	startHook       func()
+	startBlock      <-chan struct{}
+	startStarted    chan struct{}
 	events          func(prompt string, write bool) []engine.Event
 	processRef      engine.ProcessRef
 	backendChildPID int
@@ -66,8 +68,14 @@ func (b *fakeBackend) Preflight(context.Context) (engine.Health, error) {
 
 func (b *fakeBackend) Start(context.Context, engine.SessionOpts) (engine.Session, error) {
 	n := b.count.Add(1)
+	if b.startStarted != nil {
+		b.startStarted <- struct{}{}
+	}
 	if b.startHook != nil {
 		b.startHook()
+	}
+	if n == 1 && b.startBlock != nil {
+		<-b.startBlock
 	}
 	if b.startErr != nil {
 		return nil, b.startErr
@@ -465,8 +473,9 @@ func TestJobSubmitRequestIDPersistsBeforeBackendStartFailure(t *testing.T) {
 	}
 	params := protocol.JobSubmitParams{RequestID: "request-durable-before-start-1", TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "persist"}}
 	first := server.handleJobSubmit(context.Background(), mustMarshal(t, params))
-	if first.err == nil {
-		t.Fatalf("first submit succeeded despite backend start failure: %+v", first)
+	firstResult, ok := first.result.(protocol.JobSubmitResult)
+	if first.err != nil || !ok || firstResult.JobID == "" || firstResult.State != engine.StateFailed || firstResult.Deduplicated {
+		t.Fatalf("first submit result = %+v, err = %+v", first.result, first.err)
 	}
 	if !observedQueued {
 		t.Fatal("backend started before its queued record was durable")
@@ -496,6 +505,107 @@ func TestJobSubmitRequestIDPersistsBeforeBackendStartFailure(t *testing.T) {
 	}
 	if got := backend.count.Load(); got != 1 {
 		t.Fatalf("backend starts = %d, want 1", got)
+	}
+}
+
+func TestJobSubmitRequestIDSlowBackendStartDoesNotBlockUnrelatedRequest(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	releaseStart := make(chan struct{})
+	backend.startBlock = releaseStart
+	backend.startStarted = make(chan struct{}, 2)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+
+	slowRaw := mustMarshal(t, protocol.JobSubmitParams{RequestID: "request-slow-start-1", TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "slow"}})
+	slowDone := make(chan requestOutcome, 1)
+	go func() { slowDone <- server.handleJobSubmit(context.Background(), slowRaw) }()
+	select {
+	case <-backend.startStarted:
+	case <-time.After(time.Second):
+		t.Fatal("slow submit did not enter backend.Start")
+	}
+
+	otherRaw := mustMarshal(t, protocol.JobSubmitParams{RequestID: "request-unrelated-start-1", TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "other"}})
+	otherDone := make(chan requestOutcome, 1)
+	go func() { otherDone <- server.handleJobSubmit(context.Background(), otherRaw) }()
+	select {
+	case other := <-otherDone:
+		result, ok := other.result.(protocol.JobSubmitResult)
+		if other.err != nil || !ok || result.Deduplicated || result.JobID == "" {
+			t.Fatalf("unrelated submit = %+v, err = %+v", other.result, other.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unrelated requestId submit blocked behind slow backend.Start")
+	}
+	close(releaseStart)
+	select {
+	case slow := <-slowDone:
+		if slow.err != nil {
+			t.Fatalf("slow submit error = %+v", slow.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow submit did not finish after backend.Start released")
+	}
+	if got := backend.count.Load(); got != 2 {
+		t.Fatalf("backend starts = %d, want 2", got)
+	}
+}
+
+func TestJobSubmitStartFailureReturnsDurableJobWithoutRequestID(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.startErr = errors.New("backend start failed")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+
+	out := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "persist"}}))
+	result, ok := out.result.(protocol.JobSubmitResult)
+	if out.err != nil || !ok || result.JobID == "" || result.State != engine.StateFailed {
+		t.Fatalf("legacy start failure result = %+v, err = %+v", out.result, out.err)
+	}
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load(result.JobID)
+	if err != nil || record.State != engine.StateFailed {
+		t.Fatalf("durable legacy failure record = %+v, err = %v", record, err)
+	}
+}
+
+func TestJobSubmitPersistsBackendSessionIDBeforeRun(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name      string
+		requestID string
+	}{
+		{name: "legacy"},
+		{name: "requestId", requestID: "request-session-id-1"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := newFakeBackend("fake")
+			server, _, cwd := newUnstartedTestServer(t, backend)
+			out := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{RequestID: tt.requestID, TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "persist"}}))
+			result, ok := out.result.(protocol.JobSubmitResult)
+			if out.err != nil || !ok {
+				t.Fatalf("submit result = %+v, err = %+v", out.result, out.err)
+			}
+			server.mu.Lock()
+			store, err := server.storeForCWDLocked(cwd)
+			server.mu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			record, err := store.Load(result.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantSessionID := "fake-session-1"
+			if record.SessionID != wantSessionID || record.BackendSessionID != wantSessionID {
+				t.Fatalf("persisted session identifiers = sessionId %q backendSessionId %q, want %q", record.SessionID, record.BackendSessionID, wantSessionID)
+			}
+		})
 	}
 }
 

@@ -1709,7 +1709,7 @@ func TestRequestReservationReclaimsExpiredTornWrite(t *testing.T) {
 	}
 }
 
-func TestRequestReservationsUseOneSharedLock(t *testing.T) {
+func TestRequestReservationsUseOneLockPerRequest(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
@@ -1732,8 +1732,8 @@ func TestRequestReservationsUseOneSharedLock(t *testing.T) {
 			locks++
 		}
 	}
-	if locks != 1 {
-		t.Fatalf("request lock files = %d, want 1", locks)
+	if locks != 3 {
+		t.Fatalf("request lock files = %d, want 3", locks)
 	}
 }
 
