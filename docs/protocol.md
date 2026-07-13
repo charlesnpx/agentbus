@@ -81,6 +81,8 @@ continues serving active connections and work, then exits at the first quiet
 check without waiting for the normal 30-minute timeout. A later client
 connection autostarts the upgraded binary.
 
+Operationally, autostarted daemons detach into their own session; terminate them via agentbus's own mechanisms rather than the launcher's process group.
+
 State storage requirements:
 
 | Item | Requirement |
