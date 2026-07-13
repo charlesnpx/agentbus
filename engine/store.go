@@ -799,9 +799,6 @@ func (s *Store) reapRecordWithLookup(record *JobRecord, now time.Time, lookup fu
 		if processGoneOrReused(record.Supervisor, lookup) {
 			return true, record.Transition(StateOrphaned, now)
 		}
-		if processMissing(record.BackendChildPID, lookup) {
-			return true, record.Transition(StateOrphaned, now)
-		}
 		if !record.Lease.ExpiresAt.IsZero() && !now.Before(record.Lease.ExpiresAt) {
 			if processIdentityConfirmed(record, lookup) {
 				record.HeartbeatAt = now
@@ -878,18 +875,6 @@ func processGoneOrReused(ref ProcessRef, lookup func(int) (ProcessInfo, bool, er
 		return true
 	}
 	return ref.StartTime != "" && info.StartTime != "" && ref.StartTime != info.StartTime
-}
-
-func (s *Store) processMissing(pid int) bool {
-	return processMissing(pid, s.processes.Lookup)
-}
-
-func processMissing(pid int, lookup func(int) (ProcessInfo, bool, error)) bool {
-	if pid <= 0 {
-		return false
-	}
-	_, alive, err := lookup(pid)
-	return err != nil || !alive
 }
 
 func (s *Store) quarantine(path string, cause error) error {

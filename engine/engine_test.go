@@ -278,6 +278,9 @@ func TestStateMachineAndExitCodes(t *testing.T) {
 		{StateRunning, StateRetrying, 1, false},
 		{StateRetrying, StateCompletedNoncompliant, 1, true},
 		{StateCompleted, StateRunning, 0, false},
+		{StateOrphaned, StateCompleted, 0, true},
+		{StateOrphaned, StateCompletedNoncompliant, 0, true},
+		{StateOrphaned, StateFailed, 0, true},
 		{StateOrphaned, StateReaped, 0, true},
 		{StateQueued, StateCompleted, 0, false},
 	}
@@ -368,10 +371,10 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 			want: StateOrphaned,
 		},
 		{
-			name: "backend child crash orphaned",
-			job:  JobRecord{JobID: "job_child", State: StateRunning, UpdatedAt: base, Lease: Lease{ExpiresAt: base.Add(time.Minute)}, BackendChildPID: 104},
-			pt:   fakeProcessTable{entries: map[int]ProcessInfo{}},
-			want: StateOrphaned,
+			name: "backend child exit does not orphan live worker and supervisor",
+			job:  JobRecord{JobID: "job_child", State: StateRunning, UpdatedAt: base, Lease: Lease{ExpiresAt: base.Add(time.Minute)}, Worker: ProcessRef{PID: 104, StartTime: "worker"}, Supervisor: ProcessRef{PID: 105, StartTime: "supervisor"}, BackendChildPID: 106, BackendChildStartTime: "child"},
+			pt:   fakeProcessTable{entries: map[int]ProcessInfo{104: {PID: 104, StartTime: "worker"}, 105: {PID: 105, StartTime: "supervisor"}}},
+			want: StateRunning,
 		},
 		{
 			name: "orphaned reaped",
