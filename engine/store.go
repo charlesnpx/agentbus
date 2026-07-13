@@ -502,6 +502,9 @@ func (s *Store) List() ([]JobRecord, error) {
 			loaded, _, err := s.loadPathWithBytes(path)
 			if err != nil {
 				if readErr := unwrapRecordReadError(err); readErr != nil {
+					if errors.Is(readErr, os.ErrNotExist) {
+						return nil
+					}
 					return readErr
 				}
 				cause := unwrapRecordLoadError(err)
@@ -750,6 +753,9 @@ func (s *Store) reapFull(now time.Time) error {
 			record, original, err := s.loadPathWithBytes(path)
 			if err != nil {
 				if readErr := unwrapRecordReadError(err); readErr != nil {
+					if errors.Is(readErr, os.ErrNotExist) {
+						return nil
+					}
 					return readErr
 				}
 				if qerr := s.quarantine(path, unwrapRecordLoadError(err)); qerr != nil {

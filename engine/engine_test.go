@@ -758,6 +758,67 @@ func TestLoadMissingRecordDoesNotQuarantine(t *testing.T) {
 	}
 }
 
+func TestBatchOperationsSkipRecordDeletedDuringLoad(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	operations := []struct {
+		name string
+		run  func(*Store) ([]JobRecord, error)
+	}{
+		{
+			name: "List",
+			run:  func(store *Store) ([]JobRecord, error) { return store.List() },
+		},
+		{
+			name: "Reap",
+			run: func(store *Store) ([]JobRecord, error) {
+				return nil, store.Reap()
+			},
+		},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			missingPath := ""
+			deleted := false
+			store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+				beforeRecordLoad: func(path string) {
+					if path != missingPath || deleted {
+						return
+					}
+					if err := os.Remove(path); err != nil {
+						t.Fatalf("remove record during load: %v", err)
+					}
+					deleted = true
+				},
+			})
+			missing := &JobRecord{JobID: "job_deleted_during_load", State: StateQueued, UpdatedAt: base}
+			remaining := &JobRecord{JobID: "job_remaining_after_delete", State: StateQueued, UpdatedAt: base}
+			if err := store.Save(missing); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Save(remaining); err != nil {
+				t.Fatal(err)
+			}
+			missingPath = missing.StatePath
+
+			records, err := operation.run(store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !deleted {
+				t.Fatal("BeforeRecordLoad did not delete the enumerated record")
+			}
+			if operation.name == "List" {
+				if len(records) != 1 || records[0].JobID != remaining.JobID {
+					t.Fatalf("List records = %#v, want only %q", records, remaining.JobID)
+				}
+			}
+			if _, err := store.Load(remaining.JobID); err != nil {
+				t.Fatalf("remaining record was not preserved: %v", err)
+			}
+		})
+	}
+}
+
 func TestUnreadableRecordsAreNotQuarantined(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can read files with mode 000")
@@ -799,8 +860,8 @@ func TestUnreadableRecordsAreNotQuarantined(t *testing.T) {
 				}
 			})
 
-			if err := operation.run(store, record.JobID); err == nil {
-				t.Fatal("operation succeeded for unreadable record")
+			if err := operation.run(store, record.JobID); !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("operation error = %v, want permission error", err)
 			}
 			if _, err := os.Stat(record.StatePath); err != nil {
 				t.Fatalf("unreadable record was moved or removed: %v", err)
