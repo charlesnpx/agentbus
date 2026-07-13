@@ -8,7 +8,7 @@ import (
 func TestDefaultCapabilitiesAndStructuredError(t *testing.T) {
 	t.Parallel()
 	caps := DefaultCapabilities()
-	for _, name := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery"} {
+	for _, name := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery", "jobs.requestId"} {
 		if _, ok := caps[name]; !ok {
 			t.Fatalf("missing capability %s in %+v", name, caps)
 		}

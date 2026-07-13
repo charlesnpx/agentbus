@@ -1647,6 +1647,35 @@ func TestGCRetention(t *testing.T) {
 	}
 }
 
+func TestGCRemovesRequestReservationWithJobRecord(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		retention: RetentionConfig{TerminalJobTTL: time.Hour, ResultTTL: time.Hour, StaleJobAfter: time.Minute},
+	})
+	requestID := "gc-request-1"
+	jobID := "job_gc_request_reservation"
+	old := base.Add(-2 * time.Hour)
+	if _, _, err := store.WithRequestReservation(requestID, "sha256:test", jobID, func() error {
+		return store.Save(&JobRecord{JobID: jobID, RequestID: requestID, TaskSpecSHA256: "sha256:test", State: StateCompleted, UpdatedAt: old})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reservationPath := store.requestReservationPath(requestReservationKey(requestID))
+	if _, err := os.Stat(reservationPath); err != nil {
+		t.Fatalf("request reservation missing before gc: %v", err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(store.Layout().Jobs, jobID+".json")); !os.IsNotExist(err) {
+		t.Fatalf("job record remains after gc: %v", err)
+	}
+	if _, err := os.Stat(reservationPath); !os.IsNotExist(err) {
+		t.Fatalf("request reservation remains after gc: %v", err)
+	}
+}
+
 func TestTerminalUpdateSweepsJobInputImmediately(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)

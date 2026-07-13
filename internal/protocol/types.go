@@ -40,6 +40,7 @@ const (
 	ErrorQuarantined        = "quarantined"
 	ErrorResultTooLarge     = "result_too_large"
 	ErrorInvalidTaskSpec    = "invalid_task_spec"
+	ErrorRequestConflict    = "request_conflict"
 )
 
 const (
@@ -117,6 +118,7 @@ func DefaultCapabilities() map[string]bool {
 		"nativeStructuredOutput.claude": false,
 		"models.discovery":              true,
 		"models.reported":               true,
+		"jobs.requestId":                true,
 	}
 }
 
@@ -228,17 +230,21 @@ type TaskSpec struct {
 }
 
 type JobSubmitParams struct {
-	TaskSpec TaskSpec `json:"taskSpec"`
+	TaskSpec  TaskSpec `json:"taskSpec"`
+	RequestID string   `json:"requestId,omitempty"`
 }
 
 type JobSubmitResult struct {
-	JobID string          `json:"jobId"`
-	State engine.JobState `json:"state"`
+	JobID        string          `json:"jobId"`
+	State        engine.JobState `json:"state"`
+	Deduplicated bool            `json:"deduplicated,omitempty"`
 }
 
 type JobStatusParams struct {
-	JobID string `json:"jobId,omitempty"`
-	All   bool   `json:"all,omitempty"`
+	JobID     string            `json:"jobId,omitempty"`
+	All       bool              `json:"all,omitempty"`
+	Tags      map[string]string `json:"tags,omitempty"`
+	RequestID string            `json:"requestId,omitempty"`
 }
 
 type JobStatusResult struct {
@@ -247,6 +253,7 @@ type JobStatusResult struct {
 
 type JobStatus struct {
 	JobID                 string            `json:"jobId"`
+	RequestID             string            `json:"requestId,omitempty"`
 	SessionID             string            `json:"sessionId,omitempty"`
 	Backend               string            `json:"backend,omitempty"`
 	State                 engine.JobState   `json:"state"`
@@ -272,6 +279,7 @@ type JobResultParams struct {
 
 type JobResult struct {
 	JobID            string                `json:"jobId"`
+	RequestID        string                `json:"requestId,omitempty"`
 	SessionID        string                `json:"sessionId,omitempty"`
 	State            engine.JobState       `json:"state"`
 	LateFinalization bool                  `json:"lateFinalization,omitempty"`

@@ -20,6 +20,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/protocol"
@@ -111,6 +113,9 @@ type Server struct {
 	reapTickInterval       time.Duration
 	reapTickFactory        func(time.Duration) tickerSource
 	afterReapTickHook      func(error)
+	// beforeRequestRecordCreateHook is deterministic test instrumentation for
+	// requestId reservation serialization.
+	beforeRequestRecordCreateHook func()
 
 	mu                 sync.Mutex
 	sessions           map[string]*sessionState
@@ -1021,6 +1026,15 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
 	}
+	requestIDPresent, err := jsonFieldPresent(raw, "requestId")
+	if err != nil {
+		return invalidParams(err)
+	}
+	if requestIDPresent {
+		if err := engine.ValidateRequestID(params.RequestID); err != nil {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+		}
+	}
 	spec := params.TaskSpec
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{})}
@@ -1036,6 +1050,9 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	backend, ok := s.backends[spec.Backend]
 	if !ok {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{})}
+	}
+	if requestIDPresent {
+		return s.handleRequestIdentifiedJobSubmit(ctx, params.RequestID, spec, raw, policy, backend)
 	}
 	session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
 	if err != nil {
@@ -1082,13 +1099,117 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	}
 }
 
+func (s *Server) handleRequestIdentifiedJobSubmit(ctx context.Context, requestID string, spec protocol.TaskSpec, raw json.RawMessage, policy resolvedPolicy, backend engine.Backend) requestOutcome {
+	taskSpecRaw, err := rawTaskSpec(raw)
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+	}
+	taskSpecSHA256, err := engine.CanonicalJSONSHA256(taskSpecRaw)
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+	}
+	timeout, errObj := timeoutFromMillis(spec.TimeoutMs)
+	if errObj != nil {
+		return requestOutcome{err: errObj}
+	}
+	s.mu.Lock()
+	store, err := s.storeForCWDLocked(spec.CWD)
+	jobID := ""
+	if err == nil {
+		jobID = s.nextID("job")
+	}
+	s.mu.Unlock()
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+	}
+
+	var run jobRun
+	var runCtx context.Context
+	var backendStarted bool
+	var backendStartErr error
+	existing, deduplicated, err := store.WithRequestReservation(requestID, taskSpecSHA256, jobID, func() error {
+		session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
+		if err != nil {
+			backendStartErr = err
+			return err
+		}
+		backendStarted = true
+		sessionID := session.ID()
+		if sessionID == "" {
+			sessionID = s.nextID("ses")
+		}
+		if s.beforeRequestRecordCreateHook != nil {
+			s.beforeRequestRecordCreateHook()
+		}
+		if err := s.createQueuedRequestRecord(store, jobID, sessionID, spec.Backend, spec.Tags, policy.policy, policy.contract, requestID, taskSpecSHA256); err != nil {
+			return err
+		}
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithCancel(ctx)
+		active := &activeJob{jobID: jobID, sessionID: sessionID, session: session, cancel: cancel}
+		s.addActiveJob(active)
+		s.mu.Lock()
+		s.jobStores[jobID] = store
+		s.mu.Unlock()
+		run = jobRun{
+			jobID:        jobID,
+			sessionID:    sessionID,
+			backend:      spec.Backend,
+			store:        store,
+			session:      session,
+			prompt:       spec.Prompt,
+			write:        spec.Write,
+			policy:       policy.policy,
+			contract:     policy.contract,
+			contractName: policy.name,
+			contractHash: policy.hash,
+			timeout:      timeout,
+			active:       active,
+		}
+		return nil
+	})
+	if err != nil {
+		var conflict *engine.RequestConflictError
+		if errors.As(err, &conflict) {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorRequestConflict, "requestId was already submitted with a different taskSpec", protocol.ErrorData{JobID: conflict.JobID})}
+		}
+		if backendStarted {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
+		}
+		if backendStartErr != nil {
+			return requestOutcome{err: backendError(backendStartErr)}
+		}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+	}
+	if deduplicated {
+		if existing == nil {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "requestId replay could not load its job", protocol.ErrorData{})}
+		}
+		return requestOutcome{result: protocol.JobSubmitResult{JobID: existing.JobID, State: existing.State, Deduplicated: true}}
+	}
+	return requestOutcome{
+		result:       protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
+		after:        func() { go s.runJob(runCtx, run) },
+		onAckFailure: func(error) { s.abortUndeliveredRun(run, engine.StateCanceled) },
+	}
+}
+
 func (s *Server) handleJobStatus(raw json.RawMessage) requestOutcome {
 	var params protocol.JobStatusParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
 	}
-	if params.JobID == "" && !params.All {
-		params.All = true
+	requestIDPresent, err := jsonFieldPresent(raw, "requestId")
+	if err != nil {
+		return invalidParams(err)
+	}
+	if requestIDPresent {
+		if err := engine.ValidateRequestID(params.RequestID); err != nil {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+		}
+	}
+	if err := validateStatusTags(params.Tags); err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 	}
 	if params.JobID != "" {
 		store := s.storeForJob(params.JobID)
@@ -1101,9 +1222,26 @@ func (s *Server) handleJobStatus(raw json.RawMessage) requestOutcome {
 		}
 		return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{statusFromRecord(*record)}}}
 	}
-	records := s.listKnownRecords()
+	var records []engine.JobRecord
+	if params.All {
+		records = s.listKnownRecords()
+	} else {
+		s.mu.Lock()
+		store, err := s.storeForCWDLocked(s.cwd)
+		s.mu.Unlock()
+		if err != nil {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+		}
+		records, err = store.List()
+		if err != nil {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+		}
+	}
 	statuses := make([]protocol.JobStatus, 0, len(records))
 	for _, record := range records {
+		if !statusFiltersMatch(record, params.Tags, params.RequestID) {
+			continue
+		}
 		statuses = append(statuses, statusFromRecord(record))
 	}
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].JobID < statuses[j].JobID })
@@ -1618,6 +1756,14 @@ func (s *Server) updateModelReported(store *engine.Store, jobID, modelReported s
 }
 
 func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backend string, tags map[string]string, policy *engine.TurnPolicy, resolved *engine.ContractSpec, foreground bool) error {
+	return s.createQueuedRecordWithRequest(store, jobID, sessionID, backend, tags, policy, resolved, foreground, "", "")
+}
+
+func (s *Server) createQueuedRequestRecord(store *engine.Store, jobID, sessionID, backend string, tags map[string]string, policy *engine.TurnPolicy, resolved *engine.ContractSpec, requestID, taskSpecSHA256 string) error {
+	return s.createQueuedRecordWithRequest(store, jobID, sessionID, backend, tags, policy, resolved, false, requestID, taskSpecSHA256)
+}
+
+func (s *Server) createQueuedRecordWithRequest(store *engine.Store, jobID, sessionID, backend string, tags map[string]string, policy *engine.TurnPolicy, resolved *engine.ContractSpec, foreground bool, requestID, taskSpecSHA256 string) error {
 	logPaths, err := ensureLogFiles(store, jobID)
 	if err != nil {
 		return err
@@ -1631,6 +1777,8 @@ func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backe
 	}
 	record := &engine.JobRecord{
 		JobID:            jobID,
+		RequestID:        requestID,
+		TaskSpecSHA256:   taskSpecSHA256,
 		SessionID:        sessionID,
 		Backend:          backend,
 		Foreground:       foreground,
@@ -2065,9 +2213,67 @@ func validateTaskSpecEnvelope(raw json.RawMessage) *protocol.ErrorObject {
 	return nil
 }
 
+func rawTaskSpec(raw json.RawMessage) (json.RawMessage, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, err
+	}
+	specRaw, ok := envelope["taskSpec"]
+	if !ok {
+		return nil, errors.New("taskSpec is required")
+	}
+	return specRaw, nil
+}
+
+func jsonFieldPresent(raw json.RawMessage, name string) (bool, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return false, err
+	}
+	_, ok := fields[name]
+	return ok, nil
+}
+
+func validateStatusTags(tags map[string]string) error {
+	for key, value := range tags {
+		if err := validatePrintableStatusTag("tag key", key); err != nil {
+			return err
+		}
+		if err := validatePrintableStatusTag("tag value", value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatePrintableStatusTag(label, value string) error {
+	if !utf8.ValidString(value) || utf8.RuneCountInString(value) > 256 {
+		return fmt.Errorf("%s must contain at most 256 printable characters", label)
+	}
+	for _, r := range value {
+		if !unicode.IsPrint(r) {
+			return fmt.Errorf("%s must contain only printable characters", label)
+		}
+	}
+	return nil
+}
+
+func statusFiltersMatch(record engine.JobRecord, tags map[string]string, requestID string) bool {
+	if requestID != "" && record.RequestID != requestID {
+		return false
+	}
+	for key, value := range tags {
+		if record.Tags[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
 func statusFromRecord(record engine.JobRecord) protocol.JobStatus {
 	return protocol.JobStatus{
 		JobID:                 record.JobID,
+		RequestID:             record.RequestID,
 		SessionID:             record.SessionID,
 		Backend:               record.Backend,
 		State:                 record.State,
@@ -2091,6 +2297,7 @@ func statusFromRecord(record engine.JobRecord) protocol.JobStatus {
 func resultFromRecord(record engine.JobRecord) protocol.JobResult {
 	return protocol.JobResult{
 		JobID:            record.JobID,
+		RequestID:        record.RequestID,
 		SessionID:        record.SessionID,
 		State:            record.State,
 		LateFinalization: record.LateFinalization,

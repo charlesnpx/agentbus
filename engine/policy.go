@@ -297,14 +297,23 @@ func DisabledContractStamp() ContractStamp {
 	return ContractStamp{Status: ContractDisabled, Missing: []string{}, Attempts: 0}
 }
 
-// ContractSHA256 returns sha256:<hex> over canonical JSON for the resolved spec.
-func ContractSHA256(contract ContractSpec) (string, error) {
-	canonical, err := canonicalJSON(contract)
+// CanonicalJSONSHA256 returns sha256:<hex> over canonical JSON for v.
+//
+// It preserves JSON number lexemes while sorting object keys recursively, so
+// callers can use it for durable exact-spec identity without fuzzy
+// normalization.
+func CanonicalJSONSHA256(v any) (string, error) {
+	canonical, err := canonicalJSON(v)
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(canonical)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+// ContractSHA256 returns sha256:<hex> over canonical JSON for the resolved spec.
+func ContractSHA256(contract ContractSpec) (string, error) {
+	return CanonicalJSONSHA256(contract)
 }
 
 func validateConcreteContract(contract ContractSpec) error {

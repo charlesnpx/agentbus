@@ -56,6 +56,8 @@ type ResultInfo struct {
 // JobRecord is the durable job state record stored as JSON.
 type JobRecord struct {
 	JobID                 string            `json:"jobId"`
+	RequestID             string            `json:"requestId,omitempty"`
+	TaskSpecSHA256        string            `json:"taskSpecSha256,omitempty"`
 	SessionID             string            `json:"sessionId,omitempty"`
 	Backend               string            `json:"backend,omitempty"`
 	Foreground            bool              `json:"foreground,omitempty"`

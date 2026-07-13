@@ -39,7 +39,7 @@ Example request frame:
 Example response frame:
 
 ```json
-{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":1,"backends":["codex","claude"],"backendMetadata":[{"backend":"codex","models":["gpt-5.4"],"efforts":["low","medium","high","xhigh"]},{"backend":"claude","models":["sonnet","opus"],"efforts":["low","medium","high","xhigh","max"]}],"capabilities":{"policy.shape":true,"policy.jsonSchema":true,"models.discovery":true}}}
+{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":1,"backends":["codex","claude"],"backendMetadata":[{"backend":"codex","models":["gpt-5.4"],"efforts":["low","medium","high","xhigh"]},{"backend":"claude","models":["sonnet","opus"],"efforts":["low","medium","high","xhigh","max"]}],"capabilities":{"policy.shape":true,"policy.jsonSchema":true,"models.discovery":true,"jobs.requestId":true}}}
 ```
 
 `protocol.hello` MUST be the first request sent on a connection. A server MUST
@@ -233,6 +233,7 @@ numeric. Structured errors MUST put the stable v1 error identifier in
 | `quarantined` | A corrupt record was quarantined and cannot produce a normal result. |
 | `result_too_large` | A requested inline result exceeds the supported inline limit. |
 | `invalid_task_spec` | A `taskSpec` is malformed or contains unsupported fields. |
+| `request_conflict` | A `requestId` was reused with a different task specification; `error.data.jobId` identifies the existing job. |
 
 Example:
 
@@ -356,6 +357,8 @@ Version mismatch error example:
 `backends` is the list of backend names accepted by `session.start` and
 `job.submit`. `capabilities` is a string-keyed object. Clients MUST gate optional
 behavior on explicit capabilities rather than protocol major version alone.
+`jobs.requestId: true` advertises support for idempotent `job.submit` request
+identifiers.
 
 ### `session.start`
 
@@ -591,6 +594,7 @@ Request params:
 
 ```json
 {
+  "requestId": "delegate-run-20260713-001",
   "taskSpec": {
     "backend": "claude",
     "cwd": "/absolute/workspace/path",
@@ -616,6 +620,26 @@ Request params:
 }
 ```
 
+`requestId` is optional, opaque, and scoped to the canonical workspace. When
+present it MUST contain 1-128 printable characters and is persisted with the
+accepted job. The server hashes the submitted `taskSpec` as canonical JSON
+(recursively sorted object keys, with no fuzzy normalization) and stores the
+mapping `requestId -> { jobId, taskSpecSha256 }` durably.
+
+Repeating a `requestId` with the same hash MUST return the existing job's
+submit response, with additive `"deduplicated": true`. The existing job is
+returned in its current state, including `failed`; relaunching a failed job is
+caller policy and requires a new request identifier. Reusing the same
+identifier with a different hash MUST return `request_conflict` and the
+existing `jobId` in error data.
+
+Before starting a worker, the server atomically creates an O_EXCL reservation
+keyed by a SHA-256 hash of `requestId`, then creates the job record while
+holding its request lock. A reservation with no job record can only represent
+a crash between those steps; it is retained for a bounded five-minute grace
+period and then reclaimed by a later submit. GC removes an index entry when it
+removes the referenced job record.
+
 Result:
 
 ```json
@@ -624,6 +648,8 @@ Result:
   "state": "queued"
 }
 ```
+
+On a replay, the result additionally contains `"deduplicated": true`.
 
 ### `job.status`
 
@@ -680,6 +706,26 @@ Request params for all jobs:
 }
 ```
 
+Without `jobId`, `all: false` (or omission) lists the daemon's configured
+workspace; `all: true` lists every known workspace. Both listing forms accept
+optional exact-match filters, combined with AND semantics:
+
+```json
+{
+  "all": true,
+  "requestId": "delegate-run-20260713-001",
+  "tags": {
+    "client": "delegate",
+    "kind": "task"
+  }
+}
+```
+
+There are no glob or partial matches. Filter tag keys and values MUST be
+printable and at most 256 characters. A filter `requestId` follows the same
+1-128 printable-character validation as `job.submit`. `requestId` is echoed
+on `job.status` and `job.result` when the job was submitted with one.
+
 Result:
 
 ```json
@@ -687,6 +733,7 @@ Result:
   "jobs": [
     {
       "jobId": "job_01J00000000000000000000002",
+      "requestId": "delegate-run-20260713-001",
       "sessionId": "ses_01J00000000000000000000002",
       "backend": "claude",
       "state": "running",
@@ -734,6 +781,7 @@ Result:
 ```json
 {
   "jobId": "job_01J00000000000000000000002",
+  "requestId": "delegate-run-20260713-001",
   "sessionId": "ses_01J00000000000000000000002",
   "state": "completed_noncompliant",
   "lateFinalization": true,

@@ -178,7 +178,7 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	if len(hello.BackendMetadata) != 1 || hello.BackendMetadata[0].Backend != "fake" || hello.BackendMetadata[0].Models == nil || hello.BackendMetadata[0].Efforts == nil {
 		t.Fatalf("hello backend metadata = %+v", hello.BackendMetadata)
 	}
-	for _, capability := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery", "models.reported"} {
+	for _, capability := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery", "models.reported", "jobs.requestId"} {
 		if _, ok := hello.Capabilities[capability]; !ok {
 			t.Fatalf("missing capability %s in %+v", capability, hello.Capabilities)
 		}
@@ -346,6 +346,217 @@ func TestTerminalErrorEventFailsJob(t *testing.T) {
 	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobResult, protocol.JobResultParams{JobID: job.JobID}), &result)
 	if result.State != engine.StateFailed || result.Result != nil {
 		t.Fatalf("terminal error result = %+v", result)
+	}
+}
+
+func TestJobSubmitRequestIDReplayFailedJobAndEchoes(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{{Type: engine.EventTerminalError, Text: "backend exploded"}}
+	}
+	h := startTestServer(t, backend, Config{IdleTimeout: -1})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	params := protocol.JobSubmitParams{RequestID: "request-failed-1", TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "fail"}}
+	var first protocol.JobSubmitResult
+	decodeResult(t, rpc(t, conn, r, "1", protocol.MethodJobSubmit, params), &first)
+	waitJobState(t, conn, r, first.JobID, engine.StateFailed)
+
+	var replay protocol.JobSubmitResult
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, params), &replay)
+	if !replay.Deduplicated || replay.JobID != first.JobID || replay.State != engine.StateFailed {
+		t.Fatalf("replay = %+v, first = %+v", replay, first)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts = %d, want 1", got)
+	}
+
+	var status protocol.JobStatusResult
+	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: first.JobID}), &status)
+	if len(status.Jobs) != 1 || status.Jobs[0].RequestID != params.RequestID {
+		t.Fatalf("job.status = %+v", status)
+	}
+	var result protocol.JobResult
+	decodeResult(t, rpc(t, conn, r, "4", protocol.MethodJobResult, protocol.JobResultParams{JobID: first.JobID}), &result)
+	if result.RequestID != params.RequestID {
+		t.Fatalf("job.result = %+v", result)
+	}
+}
+
+func TestJobSubmitRequestIDConflict(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	h := startTestServer(t, backend, Config{IdleTimeout: -1})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	var first protocol.JobSubmitResult
+	decodeResult(t, rpc(t, conn, r, "1", protocol.MethodJobSubmit, protocol.JobSubmitParams{RequestID: "request-conflict-1", TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Prompt: "first"}}), &first)
+	conflict := rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{RequestID: "request-conflict-1", TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Prompt: "second"}})
+	assertRPCCode(t, conflict, protocol.ErrorRequestConflict)
+	if conflict.Error.Data.JobID != first.JobID {
+		t.Fatalf("conflict jobId = %q, want %q", conflict.Error.Data.JobID, first.JobID)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts = %d, want 1", got)
+	}
+}
+
+func TestJobSubmitRequestIDHashesSubmittedTaskSpecExactly(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	withExplicitEmptyModel := map[string]any{
+		"requestId": "request-exact-spec-1",
+		"taskSpec": map[string]any{
+			"backend": "fake",
+			"cwd":     cwd,
+			"write":   false,
+			"prompt":  "same",
+			"model":   "",
+		},
+	}
+	first := server.handleJobSubmit(context.Background(), mustMarshal(t, withExplicitEmptyModel))
+	if first.err != nil {
+		t.Fatalf("first submit error = %+v", first.err)
+	}
+	withoutModel := map[string]any{
+		"requestId": "request-exact-spec-1",
+		"taskSpec": map[string]any{
+			"backend": "fake",
+			"cwd":     cwd,
+			"write":   false,
+			"prompt":  "same",
+		},
+	}
+	second := server.handleJobSubmit(context.Background(), mustMarshal(t, withoutModel))
+	if second.err == nil || second.err.Data.Code != protocol.ErrorRequestConflict {
+		t.Fatalf("second submit outcome = %+v", second)
+	}
+}
+
+func TestJobSubmitRequestIDConcurrentReplayStartsOnce(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	server.beforeRequestRecordCreateHook = func() {
+		once.Do(func() { close(entered) })
+		<-release
+	}
+	params := protocol.JobSubmitParams{RequestID: "request-concurrent-1", TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "same"}}
+	raw := mustMarshal(t, params)
+	outcomes := make(chan requestOutcome, 2)
+	submit := func() { outcomes <- server.handleJobSubmit(context.Background(), raw) }
+	go submit()
+	<-entered
+	go submit()
+	close(release)
+	first := <-outcomes
+	second := <-outcomes
+	if first.err != nil || second.err != nil {
+		t.Fatalf("concurrent outcomes = %+v / %+v", first.err, second.err)
+	}
+	firstResult, ok := first.result.(protocol.JobSubmitResult)
+	if !ok {
+		t.Fatalf("first result type = %T", first.result)
+	}
+	secondResult, ok := second.result.(protocol.JobSubmitResult)
+	if !ok {
+		t.Fatalf("second result type = %T", second.result)
+	}
+	if firstResult.JobID != secondResult.JobID || firstResult.Deduplicated == secondResult.Deduplicated {
+		t.Fatalf("concurrent results = %+v / %+v", firstResult, secondResult)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts = %d, want exactly 1", got)
+	}
+}
+
+func TestJobStatusFiltersRequestIDAndTags(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	server.mu.Lock()
+	primary, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherCWD := shortTempDir(t)
+	server.mu.Lock()
+	other, err := server.storeForCWDLocked(otherCWD)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		store *engine.Store
+		jobID string
+		tags  map[string]string
+		id    string
+	}{
+		{primary, "job_filter_primary_match", map[string]string{"client": "delegate", "kind": "task"}, "request-filter-1"},
+		{primary, "job_filter_primary_other", map[string]string{"client": "delegate", "kind": "review"}, "request-filter-2"},
+		{other, "job_filter_other_workspace", map[string]string{"client": "delegate", "kind": "task"}, "request-filter-1"},
+	} {
+		if err := item.store.Save(&engine.JobRecord{JobID: item.jobID, State: engine.StateQueued, Tags: item.tags, RequestID: item.id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := func(params protocol.JobStatusParams) protocol.JobStatusResult {
+		out := server.handleJobStatus(mustMarshal(t, params))
+		if out.err != nil {
+			t.Fatalf("job.status error = %+v", out.err)
+		}
+		return out.result.(protocol.JobStatusResult)
+	}
+	match := request(protocol.JobStatusParams{Tags: map[string]string{"client": "delegate", "kind": "task"}, RequestID: "request-filter-1"})
+	if len(match.Jobs) != 1 || match.Jobs[0].JobID != "job_filter_primary_match" {
+		t.Fatalf("single-workspace match = %+v", match)
+	}
+	none := request(protocol.JobStatusParams{Tags: map[string]string{"client": "delegate", "kind": "missing"}})
+	if len(none.Jobs) != 0 {
+		t.Fatalf("single-workspace no-match = %+v", none)
+	}
+	all := request(protocol.JobStatusParams{All: true, Tags: map[string]string{"client": "delegate", "kind": "task"}, RequestID: "request-filter-1"})
+	if len(all.Jobs) != 2 {
+		t.Fatalf("all-workspaces match = %+v", all)
+	}
+}
+
+func TestJobRequestIDAndStatusFilterValidation(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	for _, requestID := range []string{"", "bad\nrequest", strings.Repeat("x", 129)} {
+		out := server.handleJobSubmit(context.Background(), mustMarshal(t, map[string]any{"requestId": requestID, "taskSpec": protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "check"}}))
+		if out.err == nil || out.err.Data.Code != protocol.ErrorInvalidTaskSpec {
+			t.Fatalf("requestId %q outcome = %+v", requestID, out)
+		}
+	}
+	for _, params := range []protocol.JobStatusParams{
+		{RequestID: ""},
+		{RequestID: "bad\nrequest"},
+		{Tags: map[string]string{strings.Repeat("k", 257): "value"}},
+		{Tags: map[string]string{"key": "bad\tvalue"}},
+	} {
+		raw := mustMarshal(t, params)
+		if params.RequestID == "" && len(params.Tags) == 0 {
+			raw = mustMarshal(t, map[string]any{"requestId": ""})
+		}
+		out := server.handleJobStatus(raw)
+		if out.err == nil || out.err.Data.Code != protocol.ErrorInvalidTaskSpec {
+			t.Fatalf("status params %+v outcome = %+v", params, out)
+		}
 	}
 }
 

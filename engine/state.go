@@ -97,6 +97,7 @@ type WorkspaceLayout struct {
 	Key        string
 	Namespace  string
 	Jobs       string
+	Requests   string
 	Logs       string
 	Results    string
 	Inputs     string
@@ -126,6 +127,7 @@ func layoutForWorkspaceKey(root, key, workspace string) (WorkspaceLayout, error)
 		Key:        key,
 		Namespace:  ns,
 		Jobs:       filepath.Join(ns, "jobs"),
+		Requests:   filepath.Join(ns, "requests"),
 		Logs:       filepath.Join(ns, "logs"),
 		Results:    filepath.Join(ns, "results"),
 		Inputs:     filepath.Join(ns, "inputs"),
@@ -147,7 +149,7 @@ func validateWorkspaceKey(key string) error {
 }
 
 func ensureLayout(layout WorkspaceLayout) error {
-	for _, dir := range []string{layout.Root, filepath.Join(layout.Root, "workspaces"), layout.Namespace, layout.Jobs, layout.Logs, layout.Results, layout.Inputs, layout.Quarantine} {
+	for _, dir := range []string{layout.Root, filepath.Join(layout.Root, "workspaces"), layout.Namespace, layout.Jobs, layout.Requests, layout.Logs, layout.Results, layout.Inputs, layout.Quarantine} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
 		}
