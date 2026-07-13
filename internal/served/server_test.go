@@ -783,7 +783,7 @@ func TestFinalizeCompletedSalvagesOrphanedJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.State != engine.StateCompleted || record.Result == nil || !record.LateFinalization || len(record.Warnings) != 1 || !strings.Contains(record.Warnings[0], "late-finalization: informational") {
+	if record.State != engine.StateCompleted || record.Result == nil || !record.LateFinalization || len(record.Warnings) != 0 {
 		t.Fatalf("salvaged record = %+v", record)
 	}
 	statusRaw, err := json.Marshal(protocol.JobStatusParams{JobID: jobID})
@@ -842,7 +842,7 @@ func TestFinalizeCompletedSalvagesReapedJobOnlyWithAuthoritativeCompletion(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.State != engine.StateCompleted || record.Result == nil || !strings.Contains(record.Result.Text, "salvaged") || len(record.Warnings) != 1 || !strings.Contains(record.Warnings[0], "authoritative") {
+	if record.State != engine.StateCompleted || record.Result == nil || !record.LateFinalization || !strings.Contains(record.Result.Text, "salvaged") || len(record.Warnings) != 0 {
 		t.Fatalf("authoritative completion was not salvaged = %+v", record)
 	}
 }

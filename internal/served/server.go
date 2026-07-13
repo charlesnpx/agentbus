@@ -1488,7 +1488,7 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		if engine.IsTerminal(record.State) && !salvageReaped {
 			return false, nil
 		}
-		lateFinalization := run.authoritativeCompletion && record.State == engine.StateOrphaned && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant || state == engine.StateFailed)
+		lateFinalization := run.authoritativeCompletion && record.State == engine.StateOrphaned && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant || state == engine.StateFailed) || salvageReaped
 		var result *engine.ResultInfo
 		if state == engine.StateCompleted || state == engine.StateCompletedNoncompliant {
 			if text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
@@ -1521,9 +1521,6 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		}
 		if lateFinalization {
 			record.LateFinalization = true
-			record.Warnings = append(record.Warnings, "late-finalization: informational; authoritative terminal outcome persisted after orphaning")
-		} else if salvageReaped {
-			record.Warnings = append(record.Warnings, "late-finalization: informational; authoritative completed result recovered after reaping")
 		}
 		return true, nil
 	})
