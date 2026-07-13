@@ -109,16 +109,21 @@ type Store struct {
 	onReapWait    func()
 	beforeLoad    func(string)
 
-	reapMu      sync.Mutex
-	reapRunning bool
-	reapDone    chan struct{}
-	lastReap    time.Time
-	lastGC      time.Time
+	reapMu         sync.Mutex
+	reapRunning    bool
+	reapGeneration *reapGeneration
+	lastReap       time.Time
+	lastGC         time.Time
 }
 
 const staleHeartbeatWarning = "stale-heartbeat: lease expired while process identity remained alive; lease renewed"
 
 const DefaultLeaseDuration = 5 * time.Minute
+
+type reapGeneration struct {
+	done chan struct{}
+	err  error
+}
 
 // NewStore creates a state store and ensures protocol directories exist.
 func NewStore(cfg StoreConfig) (*Store, error) {
@@ -653,38 +658,38 @@ func (s *Store) processRefAlive(ref ProcessRef) (bool, error) {
 // Reap performs a debounced, single-flighted full reconciliation pass. The
 // reap coordinator is never held while the pass acquires per-job locks.
 func (s *Store) Reap() error {
-	for {
-		now := s.clock.Now().UTC()
-		s.reapMu.Lock()
-		if !s.lastReap.IsZero() && now.Sub(s.lastReap) < s.reapInterval {
-			s.reapMu.Unlock()
-			return nil
-		}
-		if s.reapRunning {
-			done := s.reapDone
-			onReapWait := s.onReapWait
-			s.reapMu.Unlock()
-			if onReapWait != nil {
-				onReapWait()
-			}
-			<-done
-			continue
-		}
-		s.reapRunning = true
-		s.reapDone = make(chan struct{})
+	now := s.clock.Now().UTC()
+	s.reapMu.Lock()
+	if !s.lastReap.IsZero() && now.Sub(s.lastReap) < s.reapInterval {
 		s.reapMu.Unlock()
-
-		err := s.reapFull(now)
-
-		s.reapMu.Lock()
-		if err == nil {
-			s.lastReap = s.clock.Now().UTC()
-		}
-		s.reapRunning = false
-		close(s.reapDone)
-		s.reapMu.Unlock()
-		return err
+		return nil
 	}
+	if s.reapRunning {
+		generation := s.reapGeneration
+		onReapWait := s.onReapWait
+		s.reapMu.Unlock()
+		if onReapWait != nil {
+			onReapWait()
+		}
+		<-generation.done
+		return generation.err
+	}
+	generation := &reapGeneration{done: make(chan struct{})}
+	s.reapRunning = true
+	s.reapGeneration = generation
+	s.reapMu.Unlock()
+
+	err := s.reapFull(now)
+
+	s.reapMu.Lock()
+	if err == nil {
+		s.lastReap = s.clock.Now().UTC()
+	}
+	generation.err = err
+	s.reapRunning = false
+	close(generation.done)
+	s.reapMu.Unlock()
+	return err
 }
 
 type reapedRecord struct {
@@ -924,10 +929,20 @@ func (s *Store) gc(now time.Time, records []reapedRecord) error {
 			if !IsTerminal(record.State) {
 				return nil
 			}
-			s.sweepTerminalJobArtifacts(record.JobID)
 			if now.Sub(record.UpdatedAt) < s.retention.TerminalJobTTL {
+				s.sweepTerminalJobArtifacts(record.JobID)
 				return nil
 			}
+			// A deletion candidate may have been finalized after the reap pass.
+			// Re-read it while holding the job lock before removing any artifacts.
+			record, err := s.loadPath(item.path)
+			if err != nil {
+				return nil
+			}
+			if !IsTerminal(record.State) || now.Sub(record.UpdatedAt) < s.retention.TerminalJobTTL {
+				return nil
+			}
+			s.sweepTerminalJobArtifacts(record.JobID)
 			logRemoveContainedIfExists(s.layout.Logs, record.LogPaths.Stdout)
 			logRemoveContainedIfExists(s.layout.Logs, record.LogPaths.Stderr)
 			logRemoveIfExists(item.path)

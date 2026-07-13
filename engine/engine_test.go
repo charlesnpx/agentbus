@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -835,6 +836,76 @@ func TestReapSingleFlightsConcurrentLists(t *testing.T) {
 	}
 }
 
+func TestReapSharesFailedPassWithWaiters(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	started := make(chan struct{})
+	waitersReady := make(chan struct{})
+	release := make(chan struct{})
+	const waiterCount = 3
+	var startOnce sync.Once
+	var mu sync.Mutex
+	fullReaps := 0
+	waiters := 0
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		beforeReap: func() {
+			mu.Lock()
+			fullReaps++
+			mu.Unlock()
+			startOnce.Do(func() { close(started) })
+			<-release
+		},
+		onReapWait: func() {
+			mu.Lock()
+			defer mu.Unlock()
+			waiters++
+			if waiters == waiterCount {
+				close(waitersReady)
+			}
+		},
+	})
+	if err := os.Remove(store.Layout().Jobs); err != nil {
+		t.Fatal(err)
+	}
+
+	first := make(chan error, 1)
+	go func() { first <- store.Reap() }()
+	<-started
+	results := make(chan error, waiterCount)
+	for range waiterCount {
+		go func() { results <- store.Reap() }()
+	}
+	<-waitersReady
+	close(release)
+
+	firstErr := <-first
+	if !errors.Is(firstErr, os.ErrNotExist) {
+		t.Fatalf("first reap error = %v, want missing jobs directory", firstErr)
+	}
+	for range waiterCount {
+		if err := <-results; err != firstErr {
+			t.Fatalf("waiter reap error = %v, want shared error %v", err, firstErr)
+		}
+	}
+	mu.Lock()
+	if fullReaps != 1 {
+		mu.Unlock()
+		t.Fatalf("full reap count after waiters = %d, want 1", fullReaps)
+	}
+	mu.Unlock()
+
+	if err := os.Mkdir(store.Layout().Jobs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fullReaps != 2 {
+		t.Fatalf("full reap count after new caller = %d, want 2", fullReaps)
+	}
+}
+
 func TestReapCachesProcessLookupsPerPass(t *testing.T) {
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	processes := &countingProcessTable{
@@ -881,6 +952,116 @@ func TestGCReusesReapParsedRecords(t *testing.T) {
 	defer mu.Unlock()
 	if got := loads[record.StatePath]; got != 1 {
 		t.Fatalf("record parses during reap and gc = %d, want 1", got)
+	}
+}
+
+func TestGCDoesNotDeleteRefreshedTerminalCandidate(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	old := base.Add(-2 * time.Hour)
+	var store *Store
+	var triggerPath string
+	refreshed := false
+	store = newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		beforeRecordLoad: func(path string) {
+			if path != triggerPath || refreshed {
+				return
+			}
+			refreshed = true
+			_, err := store.Update("job_gc_refresh", func(record *JobRecord) (bool, error) {
+				return true, record.Transition(StateCompleted, base)
+			})
+			if err != nil {
+				t.Errorf("refresh terminal record: %v", err)
+			}
+		},
+	})
+	logPath := filepath.Join(store.Layout().Logs, "job_gc_refresh.stdout.log")
+	if err := os.WriteFile(logPath, []byte("log"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stale := &JobRecord{
+		JobID:     "job_gc_refresh",
+		State:     StateReaped,
+		UpdatedAt: old,
+		LogPaths:  LogPaths{Stdout: logPath},
+	}
+	if err := store.Save(stale); err != nil {
+		t.Fatal(err)
+	}
+	trigger := &JobRecord{JobID: "job_gc_trigger", State: StateQueued, UpdatedAt: base}
+	if err := store.Save(trigger); err != nil {
+		t.Fatal(err)
+	}
+	triggerPath = trigger.StatePath
+
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if !refreshed {
+		t.Fatal("test hook did not refresh the deletion candidate")
+	}
+	loaded, err := store.loadPath(stale.StatePath)
+	if err != nil {
+		t.Fatalf("refreshed record was deleted: %v", err)
+	}
+	if loaded.State != StateCompleted || !loaded.UpdatedAt.Equal(base) {
+		t.Fatalf("refreshed record = state %s at %s, want completed at %s", loaded.State, loaded.UpdatedAt, base)
+	}
+	if _, err := os.Stat(logPath); err != nil {
+		t.Fatalf("refreshed record log was deleted: %v", err)
+	}
+}
+
+func TestGCDeletesFreshTerminalCandidateStillPastTTL(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	old := base.Add(-2 * time.Hour)
+	var store *Store
+	var triggerPath string
+	refreshed := false
+	store = newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		beforeRecordLoad: func(path string) {
+			if path != triggerPath || refreshed {
+				return
+			}
+			refreshed = true
+			_, err := store.Update("job_gc_expired", func(record *JobRecord) (bool, error) {
+				record.UpdatedAt = old
+				return true, nil
+			})
+			if err != nil {
+				t.Errorf("refresh expired terminal record: %v", err)
+			}
+		},
+	})
+	logPath := filepath.Join(store.Layout().Logs, "job_gc_expired.stdout.log")
+	if err := os.WriteFile(logPath, []byte("log"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expired := &JobRecord{
+		JobID:     "job_gc_expired",
+		State:     StateCompleted,
+		UpdatedAt: old,
+		LogPaths:  LogPaths{Stdout: logPath},
+	}
+	if err := store.Save(expired); err != nil {
+		t.Fatal(err)
+	}
+	trigger := &JobRecord{JobID: "job_gc_trigger", State: StateQueued, UpdatedAt: base}
+	if err := store.Save(trigger); err != nil {
+		t.Fatal(err)
+	}
+	triggerPath = trigger.StatePath
+
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if !refreshed {
+		t.Fatal("test hook did not rewrite the deletion candidate")
+	}
+	for _, path := range []string{expired.StatePath, logPath} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expired terminal artifact %s still exists or stat failed: %v", path, err)
+		}
 	}
 }
 
