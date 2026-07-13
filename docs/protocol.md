@@ -1058,7 +1058,13 @@ Contract variants:
 
 `jsonSchema` contracts validate the final assistant message parsed as JSON. If
 the final assistant message is not valid JSON, validation fails. The v1 schema
-dialect is JSON Schema Draft 2020-12.
+dialect is JSON Schema Draft 2020-12. Schema failures in `ContractStamp.missing`
+and `{{missing}}` are leaf violations formatted as `<JSON Pointer>: <message>`
+(`/` denotes the root), sorted and de-duplicated. They include at most 20
+entries (with a final `+N more schema violations` entry when needed); parser and
+schema-compilation failures are single `json: ...` and `jsonSchema: ...` entries.
+Individual messages and rendered retry violation text are bounded to keep retry
+prompts safe.
 
 `retry.max` MUST be `0` or `1`. `retry.template` MUST include the literal token
 `{{missing}}` when `max == 1`. A corrective retry template MUST instruct the
