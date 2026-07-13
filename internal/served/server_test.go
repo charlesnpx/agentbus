@@ -690,6 +690,99 @@ func TestJobSubmitStartFailureReturnsDurableJobWithoutRequestID(t *testing.T) {
 	}
 }
 
+func TestJobSubmitActivationUpdateFailureFinalizesDurableRecord(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		requestID        string
+		persistentUpdate bool
+	}{
+		{name: "legacy"},
+		{name: "requestId", requestID: "request-activation-update-failure-1"},
+		{name: "legacy-persistent", persistentUpdate: true},
+		{name: "requestId-persistent", requestID: "request-activation-update-failure-persistent-1", persistentUpdate: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := newFakeBackend("fake")
+			server, root, cwd := newUnstartedTestServer(t, backend)
+			activationErr := errors.New("injected activation update failure")
+			updateFailures := 0
+			store, err := engine.NewStore(engine.StoreConfig{
+				Root:          root,
+				CWD:           cwd,
+				Clock:         server.clock,
+				Processes:     server.processes,
+				ProcessGroups: server.processGroups,
+				CancelGrace:   server.cancelGrace,
+				CancelWaiter:  server.cancelWaiter,
+				LeaseDuration: server.leaseDuration,
+				ReapInterval:  server.reapInterval,
+				GCInterval:    server.gcInterval,
+				UpdateError: func(string) error {
+					if tt.persistentUpdate || updateFailures == 0 {
+						updateFailures++
+						return activationErr
+					}
+					return nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server.mu.Lock()
+			server.rememberStoreLocked(store)
+			server.mu.Unlock()
+			params := protocol.JobSubmitParams{
+				RequestID: tt.requestID,
+				TaskSpec:  protocol.TaskSpec{Backend: "fake", CWD: cwd, Prompt: "persist"},
+			}
+
+			out := server.handleJobSubmit(context.Background(), mustMarshal(t, params))
+			result, ok := out.result.(protocol.JobSubmitResult)
+			if out.err != nil || !ok || result.JobID == "" || !engine.IsTerminal(result.State) || result.State == engine.StateQueued || result.State == engine.StateStarting {
+				t.Fatalf("activation failure result = %+v, err = %+v", out.result, out.err)
+			}
+			if tt.persistentUpdate {
+				if updateFailures < 2 || result.State != engine.StateQuarantined {
+					t.Fatalf("persistent activation failure result = %+v, update failures = %d", result, updateFailures)
+				}
+			} else if updateFailures != 1 || result.State != engine.StateFailed {
+				t.Fatalf("transient activation failure result = %+v, update failures = %d", result, updateFailures)
+			}
+			if out.after != nil {
+				t.Fatal("activation failure returned a deferred run")
+			}
+			if got := backend.interrupts.Load(); got != 1 {
+				t.Fatalf("unadmitted session interrupts = %d, want 1", got)
+			}
+			if active := server.lookupActiveJob(result.JobID); active != nil {
+				t.Fatalf("activation-failed job registered as active: %+v", active)
+			}
+
+			record, err := store.Load(result.JobID)
+			if err != nil || record.State != result.State || !engine.IsTerminal(record.State) {
+				t.Fatalf("durable activation-failure record = %+v, err = %v", record, err)
+			}
+			select {
+			case turn := <-backend.turns:
+				t.Fatalf("activation-failed backend turn = %+v", turn)
+			default:
+			}
+
+			if tt.requestID == "" {
+				return
+			}
+			replay := server.handleJobSubmit(context.Background(), mustMarshal(t, params))
+			replayResult, ok := replay.result.(protocol.JobSubmitResult)
+			if replay.err != nil || !ok || replayResult.JobID != result.JobID || !replayResult.Deduplicated || !engine.IsTerminal(replayResult.State) {
+				t.Fatalf("requestId replay after activation failure = %+v, err = %+v", replay.result, replay.err)
+			}
+			if got := backend.count.Load(); got != 1 {
+				t.Fatalf("requestId replay started backend %d times, want 1", got)
+			}
+		})
+	}
+}
+
 func TestJobSubmitPersistsBackendSessionIDBeforeRun(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {

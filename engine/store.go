@@ -83,8 +83,11 @@ type StoreConfig struct {
 	LeaseDuration time.Duration
 	OrphanGrace   time.Duration
 	BeforeUpdate  func(string)
-	ReapInterval  time.Duration
-	GCInterval    time.Duration
+	// UpdateError is deterministic test instrumentation that makes Update fail
+	// before invoking its mutation callback.
+	UpdateError  func(string) error
+	ReapInterval time.Duration
+	GCInterval   time.Duration
 	// RequestReservationGrace bounds how long a request reservation without a
 	// job record is retained after a process crash.
 	RequestReservationGrace time.Duration
@@ -114,6 +117,7 @@ type Store struct {
 	leaseDuration                  time.Duration
 	orphanGrace                    time.Duration
 	beforeUpdate                   func(string)
+	updateError                    func(string) error
 	reapInterval                   time.Duration
 	gcInterval                     time.Duration
 	requestReservationGrace        time.Duration
@@ -318,6 +322,7 @@ func newStoreWithLayout(cfg StoreConfig, layout WorkspaceLayout) (*Store, error)
 		leaseDuration:                  leaseDuration,
 		orphanGrace:                    orphanGrace,
 		beforeUpdate:                   cfg.BeforeUpdate,
+		updateError:                    cfg.UpdateError,
 		reapInterval:                   reapInterval,
 		gcInterval:                     gcInterval,
 		requestReservationGrace:        requestReservationGrace,
@@ -565,6 +570,11 @@ func (s *Store) Update(jobID string, mutate func(*JobRecord) (bool, error)) (*Jo
 		if s.beforeUpdate != nil {
 			s.beforeUpdate(jobID)
 		}
+		if s.updateError != nil {
+			if err := s.updateError(jobID); err != nil {
+				return err
+			}
+		}
 		changed, err := mutate(record)
 		if err != nil {
 			return err
@@ -579,6 +589,45 @@ func (s *Store) Update(jobID string, mutate func(*JobRecord) (bool, error)) (*Jo
 			if IsTerminal(record.State) {
 				s.sweepTerminalJobArtifacts(record.JobID)
 			}
+		}
+		status := record.StatusRecord(s.clock.Now().UTC())
+		out = &status
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// QuarantineJob forcefully terminalizes a valid record when its normal update
+// path cannot make progress. It deliberately bypasses guarded transitions: a
+// caller uses it only as containment for a record that must no longer be
+// eligible for work or requestId replay.
+func (s *Store) QuarantineJob(jobID, reason string) (*JobRecord, error) {
+	if err := validateJobID(jobID); err != nil {
+		return nil, err
+	}
+	path, err := s.jobPath(jobID)
+	if err != nil {
+		return nil, err
+	}
+	var out *JobRecord
+	if err := s.withJobLock(jobID, func() error {
+		record, err := s.loadPath(path)
+		if err != nil {
+			return err
+		}
+		if !IsTerminal(record.State) {
+			now := s.clock.Now().UTC()
+			record.State = StateQuarantined
+			record.QuarantineReason = reason
+			record.UpdatedAt = now
+			record.HeartbeatAt = time.Time{}
+			record.Lease = Lease{}
+			if err := s.saveRecordLocked(record, path); err != nil {
+				return err
+			}
+			s.sweepTerminalJobArtifacts(record.JobID)
 		}
 		status := record.StatusRecord(s.clock.Now().UTC())
 		out = &status

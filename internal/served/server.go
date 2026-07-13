@@ -1072,13 +1072,18 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	s.mu.Unlock()
 	session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
 	if err != nil {
-		s.finalizeStartFailure(store, jobID)
+		if finalizeErr := s.finalizeStartFailure(store, jobID); finalizeErr != nil {
+			log.Printf("agentbus: finalize backend start failure for %s: %v", jobID, finalizeErr)
+		}
 		return s.durableJobSubmitOutcome(store, jobID, false)
 	}
 	runCtx, active, record, err := s.activateStartedJob(ctx, store, jobID, sessionID, session)
 	if err != nil {
 		s.stopStartedSession(jobID, session)
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
+		if finalizeErr := s.finalizeActivationFailure(store, jobID, err); finalizeErr != nil {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, finalizeErr.Error(), protocol.ErrorData{JobID: jobID})}
+		}
+		return s.durableJobSubmitOutcome(store, jobID, false)
 	}
 	if active == nil {
 		s.stopStartedSession(jobID, session)
@@ -1177,7 +1182,9 @@ func (s *Server) handleRequestIdentifiedJobSubmit(ctx context.Context, requestID
 	}
 	session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
 	if err != nil {
-		s.finalizeStartFailure(store, jobID)
+		if finalizeErr := s.finalizeStartFailure(store, jobID); finalizeErr != nil {
+			log.Printf("agentbus: finalize backend start failure for %s: %v", jobID, finalizeErr)
+		}
 		// Keep the durable record and reservation so retrying this requestId
 		// replays its failed job instead of launching another backend.
 		return s.durableJobSubmitOutcome(store, jobID, false)
@@ -1185,7 +1192,10 @@ func (s *Server) handleRequestIdentifiedJobSubmit(ctx context.Context, requestID
 	runCtx, active, record, err := s.activateStartedJob(ctx, store, jobID, sessionID, session)
 	if err != nil {
 		s.stopStartedSession(jobID, session)
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
+		if finalizeErr := s.finalizeActivationFailure(store, jobID, err); finalizeErr != nil {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, finalizeErr.Error(), protocol.ErrorData{JobID: jobID})}
+		}
+		return s.durableJobSubmitOutcome(store, jobID, false)
 	}
 	if active == nil {
 		s.stopStartedSession(jobID, session)
@@ -1628,13 +1638,30 @@ func (s *Server) finalizeFailure(run jobRun, err error) {
 	_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
 }
 
-func (s *Server) finalizeStartFailure(store *engine.Store, jobID string) {
+func (s *Server) finalizeStartFailure(store *engine.Store, jobID string) error {
 	if err := s.transitionRecord(store, jobID, engine.StateStarting); err != nil {
-		log.Printf("agentbus: mark backend start failure for %s: %v", jobID, err)
-		return
+		return err
 	}
 	if err := s.finalizeTerminal(jobRun{jobID: jobID, store: store}, engine.StateFailed, "", nil); err != nil {
-		log.Printf("agentbus: finalize backend start failure for %s: %v", jobID, err)
+		return err
+	}
+	return nil
+}
+
+// finalizeActivationFailure ensures a session that started but could not be
+// admitted has a terminal durable record. A normal finalization is preferred;
+// quarantine is the last-resort containment when the regular update path is
+// unavailable, so requestId replay cannot adopt a runless queued record.
+func (s *Server) finalizeActivationFailure(store *engine.Store, jobID string, activationErr error) error {
+	if err := s.finalizeStartFailure(store, jobID); err == nil {
+		return nil
+	} else {
+		finalizeErr := err
+		if _, quarantineErr := store.QuarantineJob(jobID, "post-start activation failed: "+activationErr.Error()); quarantineErr == nil {
+			return nil
+		} else {
+			return fmt.Errorf("activate started job: %w (terminalize: %v; quarantine: %v)", activationErr, finalizeErr, quarantineErr)
+		}
 	}
 }
 
