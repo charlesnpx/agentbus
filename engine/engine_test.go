@@ -32,14 +32,40 @@ func (p fakeProcessTable) Lookup(pid int) (ProcessInfo, bool, error) {
 	return info, ok, nil
 }
 
+type countingProcessTable struct {
+	entries map[int]ProcessInfo
+
+	mu      sync.Mutex
+	lookups map[int]int
+}
+
+func (p *countingProcessTable) Lookup(pid int) (ProcessInfo, bool, error) {
+	p.mu.Lock()
+	p.lookups[pid]++
+	p.mu.Unlock()
+	info, ok := p.entries[pid]
+	return info, ok, nil
+}
+
+func (p *countingProcessTable) lookupCount(pid int) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lookups[pid]
+}
+
 type testStoreOptions struct {
-	processGroups ProcessGroupSignaler
-	cancelWaiter  Waiter
-	cancelGrace   time.Duration
-	retention     RetentionConfig
-	leaseDuration time.Duration
-	orphanGrace   time.Duration
-	beforeUpdate  func(string)
+	processGroups    ProcessGroupSignaler
+	cancelWaiter     Waiter
+	cancelGrace      time.Duration
+	retention        RetentionConfig
+	leaseDuration    time.Duration
+	orphanGrace      time.Duration
+	beforeUpdate     func(string)
+	reapInterval     time.Duration
+	gcInterval       time.Duration
+	beforeReap       func()
+	onReapWait       func()
+	beforeRecordLoad func(string)
 }
 
 func newTestStore(t *testing.T, now time.Time, pt ProcessTable) *Store {
@@ -59,17 +85,22 @@ func newTestStoreWithOptions(t *testing.T, now time.Time, pt ProcessTable, opts 
 		retention.StaleJobAfter = time.Minute
 	}
 	store, err := NewStore(StoreConfig{
-		Root:          filepath.Join(t.TempDir(), "state"),
-		CWD:           t.TempDir(),
-		Clock:         &fakeClock{now: now},
-		Processes:     pt,
-		ProcessGroups: opts.processGroups,
-		CancelWaiter:  opts.cancelWaiter,
-		CancelGrace:   opts.cancelGrace,
-		Retention:     retention,
-		LeaseDuration: opts.leaseDuration,
-		OrphanGrace:   opts.orphanGrace,
-		BeforeUpdate:  opts.beforeUpdate,
+		Root:             filepath.Join(t.TempDir(), "state"),
+		CWD:              t.TempDir(),
+		Clock:            &fakeClock{now: now},
+		Processes:        pt,
+		ProcessGroups:    opts.processGroups,
+		CancelWaiter:     opts.cancelWaiter,
+		CancelGrace:      opts.cancelGrace,
+		Retention:        retention,
+		LeaseDuration:    opts.leaseDuration,
+		OrphanGrace:      opts.orphanGrace,
+		BeforeUpdate:     opts.beforeUpdate,
+		ReapInterval:     opts.reapInterval,
+		GCInterval:       opts.gcInterval,
+		BeforeReap:       opts.beforeReap,
+		OnReapWait:       opts.onReapWait,
+		BeforeRecordLoad: opts.beforeRecordLoad,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -386,7 +417,7 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 func TestReaperUsesConfiguredLeaseAndOrphanGrace(t *testing.T) {
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	clock := &fakeClock{now: base}
-	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{101: {PID: 101, StartTime: "a"}}}, testStoreOptions{leaseDuration: 20 * time.Second, orphanGrace: 30 * time.Second})
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{101: {PID: 101, StartTime: "a"}}}, testStoreOptions{leaseDuration: 20 * time.Second, orphanGrace: 30 * time.Second, reapInterval: time.Nanosecond})
 	store.clock = clock
 	record := &JobRecord{JobID: "job_configured_lease", State: StateRunning, UpdatedAt: base, Lease: Lease{ExpiresAt: base.Add(-time.Second)}, Worker: ProcessRef{PID: 101, StartTime: "a"}}
 	if err := store.Save(record); err != nil {
@@ -661,7 +692,7 @@ func TestCancelRunningLiveBackendChildSignalsEvenWhenWorkerGone(t *testing.T) {
 	assertWaits(t, waiter.waits, []time.Duration{500 * time.Millisecond})
 }
 
-func TestLoadAndListRunReaperAndQuarantine(t *testing.T) {
+func TestLoadLazilyReapsTargetAndListReapsAndQuarantines(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
@@ -698,6 +729,193 @@ func TestLoadAndListRunReaperAndQuarantine(t *testing.T) {
 	}
 	if len(entries) == 0 {
 		t.Fatal("List did not quarantine corrupt record")
+	}
+}
+
+func TestLoadDoesNotRunFullStoreReap(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
+	var loaded []string
+	fullReaps := 0
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		beforeReap: func() {
+			mu.Lock()
+			fullReaps++
+			mu.Unlock()
+		},
+		beforeRecordLoad: func(path string) {
+			mu.Lock()
+			loaded = append(loaded, path)
+			mu.Unlock()
+		},
+	})
+	target := &JobRecord{JobID: "job_load_target", State: StateQueued, UpdatedAt: base}
+	other := &JobRecord{JobID: "job_load_other", State: StateQueued, UpdatedAt: base}
+	for _, record := range []*JobRecord{target, other} {
+		if err := store.Save(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := store.Load(target.JobID); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if fullReaps != 0 {
+		t.Fatalf("full reap count = %d, want 0", fullReaps)
+	}
+	if len(loaded) != 1 || loaded[0] != target.StatePath {
+		t.Fatalf("loaded paths = %v, want only %s", loaded, target.StatePath)
+	}
+}
+
+func TestReapDebouncesWithinInterval(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	fullReaps := 0
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		reapInterval: time.Minute,
+		beforeReap:   func() { fullReaps++ },
+	})
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if fullReaps != 1 {
+		t.Fatalf("full reap count = %d, want 1", fullReaps)
+	}
+}
+
+func TestReapSingleFlightsConcurrentLists(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	started := make(chan struct{})
+	waiting := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce sync.Once
+	var waitOnce sync.Once
+	var mu sync.Mutex
+	fullReaps := 0
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		reapInterval: time.Minute,
+		beforeReap: func() {
+			mu.Lock()
+			fullReaps++
+			mu.Unlock()
+			startOnce.Do(func() { close(started) })
+			<-release
+		},
+		onReapWait: func() { waitOnce.Do(func() { close(waiting) }) },
+	})
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+	go func() {
+		_, err := store.List()
+		first <- err
+	}()
+	<-started
+	go func() {
+		_, err := store.List()
+		second <- err
+	}()
+	<-waiting
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fullReaps != 1 {
+		t.Fatalf("full reap count = %d, want 1", fullReaps)
+	}
+}
+
+func TestReapCachesProcessLookupsPerPass(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	processes := &countingProcessTable{
+		entries: map[int]ProcessInfo{101: {PID: 101, StartTime: "same"}},
+		lookups: make(map[int]int),
+	}
+	store := newTestStore(t, base, processes)
+	for _, jobID := range []string{"job_lookup_one", "job_lookup_two"} {
+		if err := store.Save(&JobRecord{
+			JobID: jobID, State: StateRunning, UpdatedAt: base,
+			Worker: ProcessRef{PID: 101, StartTime: "same"},
+			Lease:  Lease{ExpiresAt: base.Add(time.Hour)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if got := processes.lookupCount(101); got != 1 {
+		t.Fatalf("process lookups for shared pid = %d, want 1", got)
+	}
+}
+
+func TestGCReusesReapParsedRecords(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
+	loads := make(map[string]int)
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		beforeRecordLoad: func(path string) {
+			mu.Lock()
+			loads[path]++
+			mu.Unlock()
+		},
+	})
+	record := &JobRecord{JobID: "job_gc_single_parse", State: StateCompleted, UpdatedAt: base}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got := loads[record.StatePath]; got != 1 {
+		t.Fatalf("record parses during reap and gc = %d, want 1", got)
+	}
+}
+
+func TestGCThrottlesBetweenFullReaps(t *testing.T) {
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	clock := &fakeClock{now: base}
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		reapInterval: time.Nanosecond,
+		gcInterval:   time.Minute,
+	})
+	store.clock = clock
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	resultPath := filepath.Join(store.Layout().Results, "stale-result.txt")
+	if err := os.WriteFile(resultPath, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := base.Add(-2 * time.Hour)
+	if err := os.Chtimes(resultPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = base.Add(time.Second)
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(resultPath); err != nil {
+		t.Fatalf("gc ran before its interval elapsed: %v", err)
+	}
+	clock.now = base.Add(time.Minute)
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(resultPath); !os.IsNotExist(err) {
+		t.Fatalf("gc did not run after its interval: %v", err)
 	}
 }
 

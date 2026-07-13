@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -38,6 +39,13 @@ func (f WaiterFunc) Wait(d time.Duration) { f(d) }
 
 // DefaultCancelGrace is the protocol default grace period before SIGKILL.
 const DefaultCancelGrace = 10 * time.Second
+
+// DefaultReapInterval bounds how often a store performs a full reconciliation
+// sweep in response to callers that enumerate jobs.
+const DefaultReapInterval = 2 * time.Second
+
+// DefaultGCInterval bounds how often a store performs retention housekeeping.
+const DefaultGCInterval = 30 * time.Second
 
 // RetentionConfig controls reaper garbage collection.
 type RetentionConfig struct {
@@ -68,6 +76,13 @@ type StoreConfig struct {
 	LeaseDuration time.Duration
 	OrphanGrace   time.Duration
 	BeforeUpdate  func(string)
+	ReapInterval  time.Duration
+	GCInterval    time.Duration
+	// BeforeReap, OnReapWait, and BeforeRecordLoad are deterministic
+	// instrumentation hooks used by store tests and embedders.
+	BeforeReap       func()
+	OnReapWait       func()
+	BeforeRecordLoad func(string)
 }
 
 type workspaceManifest struct {
@@ -88,6 +103,17 @@ type Store struct {
 	leaseDuration time.Duration
 	orphanGrace   time.Duration
 	beforeUpdate  func(string)
+	reapInterval  time.Duration
+	gcInterval    time.Duration
+	beforeReap    func()
+	onReapWait    func()
+	beforeLoad    func(string)
+
+	reapMu      sync.Mutex
+	reapRunning bool
+	reapDone    chan struct{}
+	lastReap    time.Time
+	lastGC      time.Time
 }
 
 const staleHeartbeatWarning = "stale-heartbeat: lease expired while process identity remained alive; lease renewed"
@@ -215,6 +241,20 @@ func newStoreWithLayout(cfg StoreConfig, layout WorkspaceLayout) (*Store, error)
 	if orphanGrace < leaseDuration {
 		return nil, errors.New("orphan grace cannot be shorter than lease duration")
 	}
+	reapInterval := cfg.ReapInterval
+	if reapInterval < 0 {
+		return nil, errors.New("reap interval cannot be negative")
+	}
+	if reapInterval == 0 {
+		reapInterval = DefaultReapInterval
+	}
+	gcInterval := cfg.GCInterval
+	if gcInterval < 0 {
+		return nil, errors.New("gc interval cannot be negative")
+	}
+	if gcInterval == 0 {
+		gcInterval = DefaultGCInterval
+	}
 	return &Store{
 		layout:        layout,
 		clock:         clock,
@@ -226,6 +266,11 @@ func newStoreWithLayout(cfg StoreConfig, layout WorkspaceLayout) (*Store, error)
 		leaseDuration: leaseDuration,
 		orphanGrace:   orphanGrace,
 		beforeUpdate:  cfg.BeforeUpdate,
+		reapInterval:  reapInterval,
+		gcInterval:    gcInterval,
+		beforeReap:    cfg.BeforeReap,
+		onReapWait:    cfg.OnReapWait,
+		beforeLoad:    cfg.BeforeRecordLoad,
 	}, nil
 }
 
@@ -379,19 +424,43 @@ func (s *Store) HasJob(jobID string) (bool, error) {
 	return true, nil
 }
 
-// Load reads a job record and computes status-only lease fields.
+// Load reads one job record, lazily reaping only that record before computing
+// status-only lease fields. It deliberately does not trigger a store-wide
+// reconciliation pass.
 func (s *Store) Load(jobID string) (*JobRecord, error) {
 	if err := validateJobID(jobID); err != nil {
-		return nil, err
-	}
-	if err := s.Reap(); err != nil {
 		return nil, err
 	}
 	path, err := s.jobPath(jobID)
 	if err != nil {
 		return nil, err
 	}
-	return s.loadPath(path)
+	now := s.clock.Now().UTC()
+	var out *JobRecord
+	if err := s.withJobLock(jobID, func() error {
+		record, original, err := s.loadPathWithBytes(path)
+		if err != nil {
+			if qerr := s.quarantine(path, err); qerr != nil {
+				return qerr
+			}
+			return err
+		}
+		changed, err := s.reapRecord(record, now)
+		if err != nil {
+			return err
+		}
+		if changed {
+			if err := s.saveIfUnchanged(record, path, original); err != nil {
+				return err
+			}
+		}
+		status := record.StatusRecord(now)
+		out = &status
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // List runs the reaper and loads all non-corrupt job records.
@@ -581,13 +650,73 @@ func (s *Store) processRefAlive(ref ProcessRef) (bool, error) {
 	return true, nil
 }
 
-// Reap scans records, quarantines corrupt files, finalizes orphaned work, and runs GC.
+// Reap performs a debounced, single-flighted full reconciliation pass. The
+// reap coordinator is never held while the pass acquires per-job locks.
 func (s *Store) Reap() error {
-	now := s.clock.Now().UTC()
+	for {
+		now := s.clock.Now().UTC()
+		s.reapMu.Lock()
+		if !s.lastReap.IsZero() && now.Sub(s.lastReap) < s.reapInterval {
+			s.reapMu.Unlock()
+			return nil
+		}
+		if s.reapRunning {
+			done := s.reapDone
+			onReapWait := s.onReapWait
+			s.reapMu.Unlock()
+			if onReapWait != nil {
+				onReapWait()
+			}
+			<-done
+			continue
+		}
+		s.reapRunning = true
+		s.reapDone = make(chan struct{})
+		s.reapMu.Unlock()
+
+		err := s.reapFull(now)
+
+		s.reapMu.Lock()
+		if err == nil {
+			s.lastReap = s.clock.Now().UTC()
+		}
+		s.reapRunning = false
+		close(s.reapDone)
+		s.reapMu.Unlock()
+		return err
+	}
+}
+
+type reapedRecord struct {
+	jobID  string
+	path   string
+	record *JobRecord
+}
+
+type processLookupResult struct {
+	info  ProcessInfo
+	alive bool
+	err   error
+}
+
+func (s *Store) reapFull(now time.Time) error {
+	if s.beforeReap != nil {
+		s.beforeReap()
+	}
 	entries, err := os.ReadDir(s.layout.Jobs)
 	if err != nil {
 		return err
 	}
+	lookups := make(map[int]processLookupResult)
+	lookup := func(pid int) (ProcessInfo, bool, error) {
+		if cached, ok := lookups[pid]; ok {
+			return cached.info, cached.alive, cached.err
+		}
+		info, alive, err := s.processes.Lookup(pid)
+		lookups[pid] = processLookupResult{info: info, alive: alive, err: err}
+		return info, alive, err
+	}
+	records := make([]reapedRecord, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
@@ -608,7 +737,7 @@ func (s *Store) Reap() error {
 				}
 				return nil
 			}
-			changed, err := s.reapRecord(record, now)
+			changed, err := s.reapRecordWithLookup(record, now, lookup)
 			if err != nil {
 				return err
 			}
@@ -617,15 +746,27 @@ func (s *Store) Reap() error {
 					return err
 				}
 			}
+			records = append(records, reapedRecord{jobID: jobID, path: path, record: record})
 			return nil
 		}); err != nil {
 			return err
 		}
 	}
-	return s.gc(now)
+	if !s.lastGC.IsZero() && now.Sub(s.lastGC) < s.gcInterval {
+		return nil
+	}
+	if err := s.gc(now, records); err != nil {
+		return err
+	}
+	s.lastGC = s.clock.Now().UTC()
+	return nil
 }
 
 func (s *Store) reapRecord(record *JobRecord, now time.Time) (bool, error) {
+	return s.reapRecordWithLookup(record, now, s.processes.Lookup)
+}
+
+func (s *Store) reapRecordWithLookup(record *JobRecord, now time.Time, lookup func(int) (ProcessInfo, bool, error)) (bool, error) {
 	changed := false
 	if heartbeatAt, expiresAt, ok := s.readHeartbeat(record.JobID); ok && heartbeatAt.After(record.HeartbeatAt) {
 		record.HeartbeatAt = heartbeatAt
@@ -643,17 +784,17 @@ func (s *Store) reapRecord(record *JobRecord, now time.Time) (bool, error) {
 			return true, record.Transition(StateOrphaned, now)
 		}
 	case StateRunning, StateRetrying:
-		if s.processGoneOrReused(record.Worker) {
+		if processGoneOrReused(record.Worker, lookup) {
 			return true, record.Transition(StateOrphaned, now)
 		}
-		if s.processGoneOrReused(record.Supervisor) {
+		if processGoneOrReused(record.Supervisor, lookup) {
 			return true, record.Transition(StateOrphaned, now)
 		}
-		if s.processMissing(record.BackendChildPID) {
+		if processMissing(record.BackendChildPID, lookup) {
 			return true, record.Transition(StateOrphaned, now)
 		}
 		if !record.Lease.ExpiresAt.IsZero() && !now.Before(record.Lease.ExpiresAt) {
-			if s.processIdentityConfirmed(record) {
+			if processIdentityConfirmed(record, lookup) {
 				record.HeartbeatAt = now
 				record.Lease = Lease{ExpiresAt: now.Add(s.leaseDuration)}
 				record.Warnings = appendWarning(record.Warnings, staleHeartbeatWarning)
@@ -666,6 +807,10 @@ func (s *Store) reapRecord(record *JobRecord, now time.Time) (bool, error) {
 }
 
 func (s *Store) processIdentityConfirmed(record *JobRecord) bool {
+	return processIdentityConfirmed(record, s.processes.Lookup)
+}
+
+func processIdentityConfirmed(record *JobRecord, lookup func(int) (ProcessInfo, bool, error)) bool {
 	refs := []ProcessRef{record.Worker, record.Supervisor}
 	if record.BackendChildPID > 0 {
 		refs = append(refs, ProcessRef{PID: record.BackendChildPID, StartTime: record.BackendChildStartTime})
@@ -676,7 +821,7 @@ func (s *Store) processIdentityConfirmed(record *JobRecord) bool {
 			continue
 		}
 		confirmed = true
-		info, alive, err := s.processes.Lookup(ref.PID)
+		info, alive, err := lookup(ref.PID)
 		if err != nil || !alive || info.StartTime == "" || info.StartTime != ref.StartTime {
 			return false
 		}
@@ -712,10 +857,14 @@ func appendWarning(warnings []string, warning string) []string {
 }
 
 func (s *Store) processGoneOrReused(ref ProcessRef) bool {
+	return processGoneOrReused(ref, s.processes.Lookup)
+}
+
+func processGoneOrReused(ref ProcessRef, lookup func(int) (ProcessInfo, bool, error)) bool {
 	if ref.PID <= 0 {
 		return false
 	}
-	info, alive, err := s.processes.Lookup(ref.PID)
+	info, alive, err := lookup(ref.PID)
 	if err != nil || !alive {
 		return true
 	}
@@ -723,10 +872,14 @@ func (s *Store) processGoneOrReused(ref ProcessRef) bool {
 }
 
 func (s *Store) processMissing(pid int) bool {
+	return processMissing(pid, s.processes.Lookup)
+}
+
+func processMissing(pid int, lookup func(int) (ProcessInfo, bool, error)) bool {
 	if pid <= 0 {
 		return false
 	}
-	_, alive, err := s.processes.Lookup(pid)
+	_, alive, err := lookup(pid)
 	return err != nil || !alive
 }
 
@@ -748,25 +901,10 @@ func (s *Store) quarantine(path string, cause error) error {
 	return fsyncDir(s.layout.Quarantine)
 }
 
-func (s *Store) gc(now time.Time) error {
-	entries, err := os.ReadDir(s.layout.Jobs)
-	if err != nil {
-		return err
-	}
+func (s *Store) gc(now time.Time, records []reapedRecord) error {
 	protectedResults := make(map[string]struct{})
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		path := filepath.Join(s.layout.Jobs, entry.Name())
-		jobID := strings.TrimSuffix(entry.Name(), ".json")
-		if err := validateJobID(jobID); err != nil {
-			continue
-		}
-		record, err := s.loadPath(path)
-		if err != nil {
-			continue
-		}
+	for _, item := range records {
+		record := item.record
 		if record.Result != nil && record.Result.ResultPath != "" {
 			resultPath := filepath.Clean(record.Result.ResultPath)
 			if !pathWithinDir(s.layout.Results, resultPath) {
@@ -779,20 +917,10 @@ func (s *Store) gc(now time.Time) error {
 			protectedResults[resultPath] = struct{}{}
 		}
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		path := filepath.Join(s.layout.Jobs, entry.Name())
-		jobID := strings.TrimSuffix(entry.Name(), ".json")
-		if err := validateJobID(jobID); err != nil {
-			continue
-		}
-		if err := s.withJobLock(jobID, func() error {
-			record, err := s.loadPath(path)
-			if err != nil {
-				return nil
-			}
+	for _, item := range records {
+		item := item
+		if err := s.withJobLock(item.jobID, func() error {
+			record := item.record
 			if !IsTerminal(record.State) {
 				return nil
 			}
@@ -802,7 +930,7 @@ func (s *Store) gc(now time.Time) error {
 			}
 			logRemoveContainedIfExists(s.layout.Logs, record.LogPaths.Stdout)
 			logRemoveContainedIfExists(s.layout.Logs, record.LogPaths.Stderr)
-			logRemoveIfExists(path)
+			logRemoveIfExists(item.path)
 			return nil
 		}); err != nil {
 			return err
@@ -839,6 +967,9 @@ func (s *Store) loadPath(path string) (*JobRecord, error) {
 }
 
 func (s *Store) loadPathWithBytes(path string) (*JobRecord, []byte, error) {
+	if s.beforeLoad != nil {
+		s.beforeLoad(path)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, nil, err

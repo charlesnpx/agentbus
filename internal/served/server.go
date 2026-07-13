@@ -65,6 +65,19 @@ type Config struct {
 	InlineResultCap     int
 	LeaseDuration       time.Duration
 	HeartbeatInterval   time.Duration
+	ReapInterval        time.Duration
+	GCInterval          time.Duration
+	ReapTickInterval    time.Duration
+}
+
+type tickerSource struct {
+	c    <-chan time.Time
+	stop func()
+}
+
+func newTickerSource(interval time.Duration) tickerSource {
+	ticker := time.NewTicker(interval)
+	return tickerSource{c: ticker.C, stop: ticker.Stop}
 }
 
 // Server serves the protocol v1 socket API over engine backends.
@@ -93,6 +106,11 @@ type Server struct {
 	inlineResultCap        int
 	leaseDuration          time.Duration
 	heartbeatInterval      time.Duration
+	reapInterval           time.Duration
+	gcInterval             time.Duration
+	reapTickInterval       time.Duration
+	reapTickFactory        func(time.Duration) tickerSource
+	afterReapTickHook      func(error)
 
 	mu                 sync.Mutex
 	sessions           map[string]*sessionState
@@ -233,6 +251,27 @@ func New(cfg Config) (*Server, error) {
 	if heartbeatInterval <= 0 {
 		heartbeatInterval = defaultHeartbeat
 	}
+	reapInterval := cfg.ReapInterval
+	if reapInterval < 0 {
+		return nil, errors.New("reap interval cannot be negative")
+	}
+	if reapInterval == 0 {
+		reapInterval = engine.DefaultReapInterval
+	}
+	gcInterval := cfg.GCInterval
+	if gcInterval < 0 {
+		return nil, errors.New("gc interval cannot be negative")
+	}
+	if gcInterval == 0 {
+		gcInterval = engine.DefaultGCInterval
+	}
+	reapTickInterval := cfg.ReapTickInterval
+	if reapTickInterval < 0 {
+		return nil, errors.New("reap tick interval cannot be negative")
+	}
+	if reapTickInterval == 0 {
+		reapTickInterval = reapInterval
+	}
 	binaryIdentityProbe := cfg.BinaryIdentityProbe
 	if binaryIdentityProbe == nil {
 		binaryIdentityProbe = statBinaryIdentity
@@ -256,6 +295,10 @@ func New(cfg Config) (*Server, error) {
 		inlineResultCap:     inlineResultCap,
 		leaseDuration:       leaseDuration,
 		heartbeatInterval:   heartbeatInterval,
+		reapInterval:        reapInterval,
+		gcInterval:          gcInterval,
+		reapTickInterval:    reapTickInterval,
+		reapTickFactory:     newTickerSource,
 		sessions:            make(map[string]*sessionState),
 		stores:              make(map[string]*engine.Store),
 		storesByKey:         make(map[string]*engine.Store),
@@ -397,12 +440,22 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener, socketIdentity socketFileIdentity, acceptSettled <-chan struct{}) {
 	ticker := time.NewTicker(s.idleCheckInterval)
 	defer ticker.Stop()
+	reapTicker := s.reapTickFactory(s.reapTickInterval)
+	defer reapTicker.stop()
 	staleDraining := false
 	drainLogged := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-reapTicker.c:
+			err := s.reapKnownStores()
+			if s.afterReapTickHook != nil {
+				s.afterReapTickHook(err)
+			}
+			if err != nil {
+				log.Printf("agentbus daemon: periodic reap: %v", err)
+			}
 		case <-ticker.C:
 			stale := s.checkBinaryStale()
 			quiet := s.clients.Load() == 0 && s.accepting.Load() == 0 && !s.activeWork()
@@ -1644,6 +1697,8 @@ func (s *Server) storeForCWDLocked(cwd string) (*engine.Store, error) {
 		CancelGrace:   s.cancelGrace,
 		CancelWaiter:  s.cancelWaiter,
 		LeaseDuration: s.leaseDuration,
+		ReapInterval:  s.reapInterval,
+		GCInterval:    s.gcInterval,
 	})
 	if err != nil {
 		return nil, err
@@ -1797,6 +1852,8 @@ func (s *Server) storeConfig() engine.StoreConfig {
 		CancelGrace:   s.cancelGrace,
 		CancelWaiter:  s.cancelWaiter,
 		LeaseDuration: s.leaseDuration,
+		ReapInterval:  s.reapInterval,
+		GCInterval:    s.gcInterval,
 	}
 }
 
