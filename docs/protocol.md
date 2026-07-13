@@ -81,7 +81,11 @@ continues serving active connections and work, then exits at the first quiet
 check without waiting for the normal 30-minute timeout. A later client
 connection autostarts the upgraded binary.
 
-Operationally, autostarted daemons detach into their own session; terminate them via agentbus's own mechanisms rather than the launcher's process group.
+Operationally, autostarted daemons detach into their own session, so ending the
+launching process group (or pressing Ctrl-C in the launching terminal) no longer
+stops them. A detached daemon exits on its own via the idle timeout, or at the
+first quiet moment after a binary upgrade. To stop one immediately, send SIGTERM
+to the PID recorded in `<state root>/agentbus.pid`.
 
 State storage requirements:
 

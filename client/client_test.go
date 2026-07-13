@@ -355,8 +355,25 @@ func TestAutostartedDaemonSurvivesLauncherProcessGroupTermination(t *testing.T) 
 		t.Fatalf("parse daemon pid %q: %v", pidData, err)
 	}
 	t.Cleanup(func() {
-		if err := syscall.Kill(daemonPID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-			t.Errorf("stop autostarted daemon: %v", err)
+		if err := syscall.Kill(daemonPID, syscall.SIGTERM); err != nil {
+			if !errors.Is(err, syscall.ESRCH) {
+				t.Errorf("stop autostarted daemon: %v", err)
+			}
+			return
+		}
+		// Verify the daemon actually exits so a detached process can never
+		// outlive the suite; escalate to SIGKILL at the deadline.
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if err := syscall.Kill(daemonPID, 0); errors.Is(err, syscall.ESRCH) {
+				return
+			}
+			if time.Now().After(deadline) {
+				_ = syscall.Kill(daemonPID, syscall.SIGKILL)
+				t.Errorf("autostarted daemon %d did not exit after SIGTERM; sent SIGKILL", daemonPID)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
 	})
 

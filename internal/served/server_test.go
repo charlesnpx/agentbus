@@ -1223,7 +1223,7 @@ func TestBinaryChangeWaitsForConnectionsAndActiveJobs(t *testing.T) {
 func TestBinaryChangeDoesNotUnlinkReplacementSocket(t *testing.T) {
 	t.Parallel()
 	changed := newBinaryChangeProbe()
-	listenerClosed := make(chan struct{})
+	socketRemoved := make(chan struct{})
 	releaseDrain := make(chan struct{})
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseDrain) }) }
@@ -1233,25 +1233,33 @@ func TestBinaryChangeDoesNotUnlinkReplacementSocket(t *testing.T) {
 		IdleCheckInterval:   10 * time.Millisecond,
 		BinaryIdentityProbe: changed.probe,
 	}, func(server *Server) {
-		server.staleListenerHook = func() {
-			close(listenerClosed)
+		server.staleSocketRemovedHook = func() {
+			close(socketRemoved)
 			<-releaseDrain
 		}
 	})
 
 	changed.changed.Store(true)
 	select {
-	case <-listenerClosed:
+	case <-socketRemoved:
 	case <-time.After(time.Second):
-		t.Fatal("stale daemon did not close its listener")
+		t.Fatal("stale daemon did not remove its socket")
 	}
-	if err := os.Remove(h.socketPath); err != nil {
-		t.Fatalf("remove closed daemon socket: %v", err)
+	if _, err := os.Lstat(h.socketPath); !os.IsNotExist(err) {
+		t.Fatalf("stale daemon socket still exists after owned removal: %v", err)
 	}
 	replacement, err := net.Listen("unix", h.socketPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	replacementUnix, ok := replacement.(*net.UnixListener)
+	if !ok {
+		_ = replacement.Close()
+		t.Fatalf("replacement listener type = %T, want *net.UnixListener", replacement)
+	}
+	// A UnixListener unlinks its path on Close by default. The test owns this
+	// listener, so prevent its cleanup from being mistaken for daemon removal.
+	replacementUnix.SetUnlinkOnClose(false)
 	defer replacement.Close()
 	wantIdentity, err := statSocketFileIdentity(h.socketPath)
 	if err != nil {
