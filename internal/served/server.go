@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
@@ -28,55 +30,79 @@ const (
 	defaultHeartbeat     = 30 * time.Second
 )
 
+// BinaryIdentity identifies the on-disk daemon executable by metadata that
+// changes when a replacement binary is installed.
+type BinaryIdentity struct {
+	ModTime time.Time
+	Size    int64
+}
+
+type socketFileIdentity struct {
+	dev uint64
+	ino uint64
+}
+
+// BinaryIdentityProbe reads the identity of the executable at path. It is
+// configurable so tests can model a replaced or removed binary.
+type BinaryIdentityProbe func(path string) (BinaryIdentity, error)
+
 // Config configures the local JSON-RPC daemon.
 type Config struct {
-	StateRoot         string
-	CWD               string
-	SocketPath        string
-	Token             string
-	Backends          []engine.Backend
-	Registry          *engine.PolicyRegistry
-	Clock             engine.Clock
-	ProcessTable      engine.ProcessTable
-	ProcessGroups     engine.ProcessGroupSignaler
-	CancelGrace       time.Duration
-	CancelWaiter      engine.Waiter
-	IdleTimeout       time.Duration
-	IdleCheckInterval time.Duration
-	InlineResultCap   int
-	LeaseDuration     time.Duration
-	HeartbeatInterval time.Duration
+	StateRoot           string
+	CWD                 string
+	SocketPath          string
+	Token               string
+	Backends            []engine.Backend
+	Registry            *engine.PolicyRegistry
+	Clock               engine.Clock
+	ProcessTable        engine.ProcessTable
+	ProcessGroups       engine.ProcessGroupSignaler
+	CancelGrace         time.Duration
+	CancelWaiter        engine.Waiter
+	IdleTimeout         time.Duration
+	IdleCheckInterval   time.Duration
+	BinaryIdentityProbe BinaryIdentityProbe
+	InlineResultCap     int
+	LeaseDuration       time.Duration
+	HeartbeatInterval   time.Duration
 }
 
 // Server serves the protocol v1 socket API over engine backends.
 type Server struct {
-	stateRoot         string
-	cwd               string
-	socketPath        string
-	tokenPath         string
-	token             string
-	backends          map[string]engine.Backend
-	registry          *engine.PolicyRegistry
-	clock             engine.Clock
-	processes         engine.ProcessTable
-	processGroups     engine.ProcessGroupSignaler
-	cancelGrace       time.Duration
-	cancelWaiter      engine.Waiter
-	id                atomic.Uint64
-	clients           atomic.Int64
-	idleTimeout       time.Duration
-	idleCheckInterval time.Duration
-	inlineResultCap   int
-	leaseDuration     time.Duration
-	heartbeatInterval time.Duration
+	stateRoot            string
+	cwd                  string
+	socketPath           string
+	tokenPath            string
+	token                string
+	backends             map[string]engine.Backend
+	registry             *engine.PolicyRegistry
+	clock                engine.Clock
+	processes            engine.ProcessTable
+	processGroups        engine.ProcessGroupSignaler
+	cancelGrace          time.Duration
+	cancelWaiter         engine.Waiter
+	id                   atomic.Uint64
+	clients              atomic.Int64
+	accepting            atomic.Int64
+	idleTimeout          time.Duration
+	idleCheckInterval    time.Duration
+	binaryIdentityProbe  BinaryIdentityProbe
+	beforeStaleCloseHook func()
+	staleListenerHook    func()
+	inlineResultCap      int
+	leaseDuration        time.Duration
+	heartbeatInterval    time.Duration
 
-	mu           sync.Mutex
-	sessions     map[string]*sessionState
-	stores       map[string]*engine.Store
-	storesByKey  map[string]*engine.Store
-	jobStores    map[string]*engine.Store
-	activeJobs   map[string]*activeJob
-	lastActivity time.Time
+	mu                 sync.Mutex
+	sessions           map[string]*sessionState
+	stores             map[string]*engine.Store
+	storesByKey        map[string]*engine.Store
+	jobStores          map[string]*engine.Store
+	activeJobs         map[string]*activeJob
+	lastActivity       time.Time
+	executablePath     string
+	executableIdentity BinaryIdentity
+	binaryStale        bool
 }
 
 type sessionState struct {
@@ -206,30 +232,35 @@ func New(cfg Config) (*Server, error) {
 	if heartbeatInterval <= 0 {
 		heartbeatInterval = defaultHeartbeat
 	}
+	binaryIdentityProbe := cfg.BinaryIdentityProbe
+	if binaryIdentityProbe == nil {
+		binaryIdentityProbe = statBinaryIdentity
+	}
 	return &Server{
-		stateRoot:         root,
-		cwd:               cwd,
-		socketPath:        socketPath,
-		tokenPath:         tokenPath,
-		token:             token,
-		backends:          backends,
-		registry:          registry,
-		clock:             clock,
-		processes:         processes,
-		processGroups:     cfg.ProcessGroups,
-		cancelGrace:       cfg.CancelGrace,
-		cancelWaiter:      cfg.CancelWaiter,
-		idleTimeout:       idleTimeout,
-		idleCheckInterval: idleCheck,
-		inlineResultCap:   inlineResultCap,
-		leaseDuration:     leaseDuration,
-		heartbeatInterval: heartbeatInterval,
-		sessions:          make(map[string]*sessionState),
-		stores:            make(map[string]*engine.Store),
-		storesByKey:       make(map[string]*engine.Store),
-		jobStores:         make(map[string]*engine.Store),
-		activeJobs:        make(map[string]*activeJob),
-		lastActivity:      clock.Now().UTC(),
+		stateRoot:           root,
+		cwd:                 cwd,
+		socketPath:          socketPath,
+		tokenPath:           tokenPath,
+		token:               token,
+		backends:            backends,
+		registry:            registry,
+		clock:               clock,
+		processes:           processes,
+		processGroups:       cfg.ProcessGroups,
+		cancelGrace:         cfg.CancelGrace,
+		cancelWaiter:        cfg.CancelWaiter,
+		idleTimeout:         idleTimeout,
+		idleCheckInterval:   idleCheck,
+		binaryIdentityProbe: binaryIdentityProbe,
+		inlineResultCap:     inlineResultCap,
+		leaseDuration:       leaseDuration,
+		heartbeatInterval:   heartbeatInterval,
+		sessions:            make(map[string]*sessionState),
+		stores:              make(map[string]*engine.Store),
+		storesByKey:         make(map[string]*engine.Store),
+		jobStores:           make(map[string]*engine.Store),
+		activeJobs:          make(map[string]*activeJob),
+		lastActivity:        clock.Now().UTC(),
 	}, nil
 }
 
@@ -259,16 +290,19 @@ func TokenPath(stateRoot string) (string, error) {
 
 // Serve listens on the configured Unix socket until ctx is canceled or idle shutdown fires.
 func (s *Server) Serve(ctx context.Context) error {
+	if err := s.captureBinaryIdentity(); err != nil {
+		return err
+	}
 	if err := s.reapKnownStores(); err != nil {
 		return err
 	}
-	ln, err := s.listen()
+	ln, socketIdentity, err := s.listen()
 	if err != nil {
 		return err
 	}
 	defer func() {
 		_ = ln.Close()
-		_ = os.Remove(s.socketPath)
+		s.removeOwnedSocket(socketIdentity, "server shutdown")
 	}()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -276,16 +310,34 @@ func (s *Server) Serve(ctx context.Context) error {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
-	go s.idleLoop(ctx, cancel, ln)
+	// Invocation-local so a sequential re-Serve on the same Server can never
+	// pair a fresh channel with a spent sync.Once.
+	acceptSettled := make(chan struct{})
+	var settleOnce sync.Once
+	go s.idleLoop(ctx, cancel, ln, socketIdentity, acceptSettled)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+			// The accept loop is sequential: once Accept returns an error,
+			// every connection it previously returned has completed
+			// registration. Signal that so the stale drain can trust the
+			// client counter (closes the post-Accept pre-register window).
+			settleOnce.Do(func() { close(acceptSettled) })
+			if ctx.Err() != nil {
+				return nil
+			}
+			if errors.Is(err, net.ErrClosed) {
+				// A stale daemon closes its listener before it cancels the
+				// context, so connections already accepted by this loop can
+				// register and drain without accepting any new connections.
+				<-ctx.Done()
 				return nil
 			}
 			return err
 		}
+		s.accepting.Add(1)
 		s.clients.Add(1)
+		s.accepting.Add(-1)
 		s.touchActivity()
 		c := &connection{server: s, conn: conn}
 		go func() {
@@ -296,48 +348,105 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-func (s *Server) listen() (net.Listener, error) {
+func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	if err := os.MkdirAll(filepath.Dir(s.socketPath), 0o700); err != nil {
-		return nil, err
+		return nil, socketFileIdentity{}, err
 	}
 	if err := os.Chmod(filepath.Dir(s.socketPath), 0o700); err != nil {
-		return nil, err
+		return nil, socketFileIdentity{}, err
 	}
 	if _, err := os.Lstat(s.socketPath); err == nil {
 		if conn, dialErr := net.DialTimeout("unix", s.socketPath, 100*time.Millisecond); dialErr == nil {
 			_ = conn.Close()
-			return nil, fmt.Errorf("agentbus daemon already listening at %s", s.socketPath)
+			return nil, socketFileIdentity{}, fmt.Errorf("agentbus daemon already listening at %s", s.socketPath)
 		}
 		if err := os.Remove(s.socketPath); err != nil {
-			return nil, err
+			return nil, socketFileIdentity{}, err
 		}
 	} else if !os.IsNotExist(err) {
-		return nil, err
+		return nil, socketFileIdentity{}, err
 	}
 	ln, err := net.Listen("unix", s.socketPath)
 	if err != nil {
-		return nil, err
+		return nil, socketFileIdentity{}, err
+	}
+	// net.UnixListener normally removes its path on Close. Disable that BEFORE
+	// any other setup step so no error-path Close can remove a path that a
+	// replacement daemon may have re-bound; every removal goes through the
+	// identity-checked removeOwnedSocket instead.
+	unixListener, ok := ln.(*net.UnixListener)
+	if !ok {
+		_ = ln.Close()
+		return nil, socketFileIdentity{}, fmt.Errorf("daemon listener for %s is not a Unix listener", s.socketPath)
+	}
+	unixListener.SetUnlinkOnClose(false)
+	identity, err := statSocketFileIdentity(s.socketPath)
+	if err != nil {
+		_ = ln.Close()
+		return nil, socketFileIdentity{}, fmt.Errorf("stat daemon socket %q: %w", s.socketPath, err)
 	}
 	if err := os.Chmod(s.socketPath, 0o600); err != nil {
 		_ = ln.Close()
-		return nil, err
+		s.removeOwnedSocket(identity, "listener setup failure")
+		return nil, socketFileIdentity{}, err
 	}
-	return ln, nil
+	return ln, identity, nil
 }
 
-func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener) {
-	if s.idleTimeout < 0 {
-		return
-	}
+func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener, socketIdentity socketFileIdentity, acceptSettled <-chan struct{}) {
 	ticker := time.NewTicker(s.idleCheckInterval)
 	defer ticker.Stop()
+	staleDraining := false
+	drainLogged := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if s.clients.Load() != 0 || s.activeWork() {
+			stale := s.checkBinaryStale()
+			quiet := s.clients.Load() == 0 && s.accepting.Load() == 0 && !s.activeWork()
+			if staleDraining {
+				settled := false
+				select {
+				case <-acceptSettled:
+					settled = true
+				default:
+				}
+				// Quiet counters alone cannot be trusted until the accept
+				// loop confirms it has registered every connection Accept
+				// returned before the listener closed.
+				if !quiet || !settled {
+					if !drainLogged {
+						log.Print("agentbus daemon: stale listener is closed; draining accepted connections and active work")
+						drainLogged = true
+					}
+					continue
+				}
+				log.Print("agentbus daemon: stale daemon drained; shutting down")
+				cancel()
+				return
+			}
+			if !quiet {
 				s.touchActivity()
+				continue
+			}
+			if stale {
+				log.Print("agentbus daemon: stale daemon is quiet; closing listener before draining")
+				if s.beforeStaleCloseHook != nil {
+					s.beforeStaleCloseHook()
+				}
+				if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+					log.Printf("agentbus daemon: close stale listener: %v", err)
+				}
+				if s.staleListenerHook != nil {
+					s.staleListenerHook()
+				}
+				s.removeOwnedSocket(socketIdentity, "stale daemon listener close")
+				log.Print("agentbus daemon: stale listener closed; waiting for accepted connections and active work to drain")
+				staleDraining = true
+				continue
+			}
+			if s.idleTimeout < 0 {
 				continue
 			}
 			s.mu.Lock()
@@ -350,6 +459,87 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net
 			}
 		}
 	}
+}
+
+func statSocketFileIdentity(path string) (socketFileIdentity, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return socketFileIdentity{}, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return socketFileIdentity{}, fmt.Errorf("unexpected socket stat type %T", info.Sys())
+	}
+	return socketFileIdentity{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}, nil
+}
+
+func (s *Server) removeOwnedSocket(owned socketFileIdentity, phase string) {
+	actual, err := statSocketFileIdentity(s.socketPath)
+	if err != nil {
+		log.Printf("agentbus daemon: skipping socket removal during %s: cannot stat %s (%v); a replacement daemon may own the path", phase, s.socketPath, err)
+		return
+	}
+	if actual != owned {
+		log.Printf("agentbus daemon: skipping socket removal during %s: replacement daemon owns %s", phase, s.socketPath)
+		return
+	}
+	if err := os.Remove(s.socketPath); err != nil {
+		log.Printf("agentbus daemon: remove owned socket during %s: %v", phase, err)
+		return
+	}
+	log.Printf("agentbus daemon: removed owned socket during %s", phase)
+}
+
+func statBinaryIdentity(path string) (BinaryIdentity, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return BinaryIdentity{}, err
+	}
+	return BinaryIdentity{ModTime: info.ModTime(), Size: info.Size()}, nil
+}
+
+func (s *Server) captureBinaryIdentity() error {
+	path, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("find daemon executable: %w", err)
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("resolve daemon executable %q: %w", path, err)
+	}
+	identity, err := s.binaryIdentityProbe(path)
+	if err != nil {
+		return fmt.Errorf("stat daemon executable %q: %w", path, err)
+	}
+	s.mu.Lock()
+	s.executablePath = path
+	s.executableIdentity = identity
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Server) checkBinaryStale() bool {
+	s.mu.Lock()
+	if s.binaryStale {
+		s.mu.Unlock()
+		return true
+	}
+	path := s.executablePath
+	expected := s.executableIdentity
+	s.mu.Unlock()
+
+	actual, err := s.binaryIdentityProbe(path)
+	if err == nil && actual.Size == expected.Size && actual.ModTime.Equal(expected.ModTime) {
+		return false
+	}
+
+	s.mu.Lock()
+	if !s.binaryStale {
+		s.binaryStale = true
+		log.Print("agentbus daemon: binary on disk changed; will restart when idle")
+	}
+	s.mu.Unlock()
+	return true
 }
 
 func (s *Server) activeWork() bool {

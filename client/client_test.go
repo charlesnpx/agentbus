@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -146,6 +147,82 @@ func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 		}
 		_ = c.Close()
 	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("starts = %d, want 1", got)
+	}
+}
+
+func TestAutostartReplacesRefusedSocket(t *testing.T) {
+	t.Parallel()
+	root := shortClientTempDir(t)
+	socketPath := filepath.Join(root, "agentbus.sock")
+	stale, err := net.Listen("unix", socketPath)
+	if err != nil {
+		if strings.Contains(err.Error(), "bind: operation not permitted") {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatal(err)
+	}
+	unixListener, ok := stale.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("listener type = %T, want *net.UnixListener", stale)
+	}
+	unixListener.SetUnlinkOnClose(false)
+	if err := stale.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if conn, err := net.DialTimeout("unix", socketPath, 100*time.Millisecond); err == nil {
+		_ = conn.Close()
+		t.Fatal("dial to closed socket unexpectedly succeeded")
+	} else if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("dial to closed socket error = %v, want connection refused", err)
+	}
+
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	var starts atomic.Int64
+	starter := StartFunc(func(ctx context.Context, opts StartOptions) (int, error) {
+		starts.Add(1)
+		server, err := served.New(served.Config{
+			StateRoot:   root,
+			Token:       "refused-token",
+			IdleTimeout: -1,
+		})
+		if err != nil {
+			return 0, err
+		}
+		go func() { serverDone <- server.Serve(serverCtx) }()
+		select {
+		case err := <-serverDone:
+			return 0, err
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+			return os.Getpid(), nil
+		}
+	})
+	t.Cleanup(func() {
+		cancelServer()
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Errorf("autostarted server exited with error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("autostarted server did not stop")
+		}
+	})
+
+	client, err := Connect(context.Background(), Options{
+		StateRoot:    root,
+		Token:        "refused-token",
+		StartTimeout: 2 * time.Second,
+		Starter:      starter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
 	if got := starts.Load(); got != 1 {
 		t.Fatalf("starts = %d, want 1", got)
 	}

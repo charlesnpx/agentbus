@@ -3,6 +3,7 @@ package codexcli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -149,6 +150,9 @@ func modelsCachePath() (string, error) {
 
 func buildArgs(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error) {
 	args := []string{"exec", "--json"}
+	if !isGitRepository(opts.CWD) {
+		args = append(args, "--skip-git-repo-check")
+	}
 	if opts.Model != "" {
 		args = append(args, "--model", opts.Model)
 	}
@@ -169,6 +173,45 @@ func buildArgs(resumeID string, opts engine.SessionOpts, input engine.TurnInput)
 		args = append(args, "-")
 	}
 	return args, nil
+}
+
+// isGitRepository reports whether cwd is inside a Git worktree without
+// invoking Git. Errors resolving or inspecting the directory fail closed so a
+// trust check is only bypassed for a directory proved not to be a repository.
+func isGitRepository(cwd string) bool {
+	resolved, err := resolvedCWD(cwd)
+	if err != nil {
+		return true
+	}
+	for {
+		_, err := os.Lstat(filepath.Join(resolved, ".git"))
+		if err == nil {
+			return true
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+		parent := filepath.Dir(resolved)
+		if parent == resolved {
+			return false
+		}
+		resolved = parent
+	}
+}
+
+func resolvedCWD(cwd string) (string, error) {
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			return "", err
+		}
+	}
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(abs)
 }
 
 func parseEvent(obj map[string]any) ([]engine.Event, string, error) {

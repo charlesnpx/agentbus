@@ -43,9 +43,9 @@ invent additional permission modes under protocol v1.
 
 | Backend | Profile | Argv shape |
 | --- | --- | --- |
-| codex | write | `codex exec --json --sandbox workspace-write -` |
-| codex | read-only | `codex exec --json --sandbox read-only --ignore-user-config -` |
-| codex | corrective-resume | `codex exec --json --sandbox read-only --ignore-user-config resume <session-id> -` |
+| codex | write | `codex exec --json [--skip-git-repo-check when CWD is non-git] --sandbox workspace-write -` |
+| codex | read-only | `codex exec --json [--skip-git-repo-check when CWD is non-git] --sandbox read-only --ignore-user-config -` |
+| codex | corrective-resume | `codex exec --json [--skip-git-repo-check when CWD is non-git] --sandbox read-only --ignore-user-config resume <session-id> -` |
 | claude | write | `claude --print --output-format stream-json --verbose --dangerously-skip-permissions` plus `--resume <session-id>` when resuming |
 | claude | read-only | `claude --print --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <claude-read-only-allow-list> --disallowedTools <claude-read-only-deny-list>` |
 | claude | corrective-resume | claude read-only profile plus `--resume <session-id>` |
@@ -53,7 +53,7 @@ invent additional permission modes under protocol v1.
 ### codex write
 
 ```text
-codex exec --json --sandbox workspace-write -
+codex exec --json [--skip-git-repo-check when CWD is non-git] --sandbox workspace-write -
 ```
 
 Write turns run under the user's normal Codex configuration.
@@ -61,7 +61,7 @@ Write turns run under the user's normal Codex configuration.
 ### codex read-only
 
 ```text
-codex exec --json --sandbox read-only --ignore-user-config -
+codex exec --json [--skip-git-repo-check when CWD is non-git] --sandbox read-only --ignore-user-config -
 ```
 
 Read-only turns MUST be hermetic and MUST ignore user configuration.
@@ -72,13 +72,25 @@ detection during setup probes.
 ### codex corrective-resume
 
 ```text
-codex exec --json --sandbox read-only --ignore-user-config resume <session-id> -
+codex exec --json [--skip-git-repo-check when CWD is non-git] --sandbox read-only --ignore-user-config resume <session-id> -
 ```
 
 Corrective resume is always read-only. It is used for policy repair after an
 invalid final result and MUST NOT inherit writable permissions from the original
 turn. The trailing `-` is the resume subcommand's prompt argument and makes the
 CLI read the corrective prompt from stdin.
+
+All Codex profiles include `--skip-git-repo-check` only when the resolved
+session CWD is outside a Git repository (the adapter walks ancestors for either
+a `.git` directory or a worktree `.git` file). It is omitted inside repositories
+so Codex retains its trust check there. The conditional bypass lets sanitized
+artifact workspaces and other non-repository scratch directories run: Codex's
+repository trust model does not apply to those directories.
+
+The detection is check-time, not spawn-time; `GIT_DIR` and `GIT_WORK_TREE`
+environment-defined worktrees are not consulted. Both choices are deliberate
+under agentbus's [same-user trust model](protocol.md#trust-model): a same-user
+process that can race the repository identity can already invoke Codex directly.
 
 ### codex effort values
 

@@ -50,6 +50,92 @@ func TestCodexProfilesAndParsing(t *testing.T) {
 	assertLog(t, fake.stdin, "repair")
 }
 
+func TestCodexTrustCheckFlagMatchesCWD(t *testing.T) {
+	gitRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(gitRoot, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	nestedGitDir := filepath.Join(gitRoot, "nested", "workspace")
+	if err := os.MkdirAll(nestedGitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	worktreeRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktreeRoot, ".git"), []byte("gitdir: /tmp/worktree.git\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name     string
+		cwd      string
+		resume   bool
+		write    bool
+		wantSkip bool
+	}{
+		{name: "git repository write", cwd: gitRoot, write: true},
+		{name: "nested git repository read-only", cwd: nestedGitDir},
+		{name: "git file worktree", cwd: worktreeRoot},
+		{name: "non-git write", cwd: t.TempDir(), write: true, wantSkip: true},
+		{name: "non-git read-only", cwd: t.TempDir(), wantSkip: true},
+		{name: "non-git resume", cwd: t.TempDir(), resume: true, wantSkip: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := fakeCodex(t)
+			backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
+			opts := engine.SessionOpts{CWD: test.cwd, Write: test.write}
+			var session engine.Session
+			var err error
+			if test.resume {
+				session, err = backend.Resume(context.Background(), "codex-session", opts)
+			} else {
+				session, err = backend.Start(context.Background(), opts)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello", Write: test.write})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = collect(events)
+			argv, err := os.ReadFile(fake.argv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotSkip := strings.Contains(string(argv), "--skip-git-repo-check\n")
+			if gotSkip != test.wantSkip {
+				t.Fatalf("argv = %q, skip flag = %t, want %t", string(argv), gotSkip, test.wantSkip)
+			}
+			if test.resume && !strings.Contains(string(argv), "resume\ncodex-session\n-\n") {
+				t.Fatalf("resume argv = %q", string(argv))
+			}
+		})
+	}
+}
+
+func TestCodexTrustCheckFlagUsesProcessCWDWhenUnset(t *testing.T) {
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(original); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	args, err := buildArgs("", engine.SessionOpts{}, engine.TurnInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(args, "--skip-git-repo-check") {
+		t.Fatalf("args = %#v, want non-git process CWD trust-check bypass", args)
+	}
+}
+
 func TestCodexSetupProbeUsesStdinPromptArg(t *testing.T) {
 	fake := fakeCodex(t)
 	writeModelsCache(t, filepath.Dir(fake.bin), `{

@@ -144,6 +144,76 @@ func TestInstallerInstallAndUninstallStagedTools(t *testing.T) {
 	}
 }
 
+func TestInstallerStagedInstallDoesNotRestartDaemon(t *testing.T) {
+	root := repoRoot(t)
+	stage := t.TempDir()
+	liveHome := t.TempDir()
+	stubBin := t.TempDir()
+	pgrepCalled := filepath.Join(t.TempDir(), "pgrep-called")
+	writeExecutable(t, filepath.Join(stubBin, "pgrep"), "#!/bin/sh\ntouch \"$AGENTBUS_PGREP_CALLED\"\nexit 1\n")
+
+	cmd := installerCommand(t, root, "--install", "--target", "tools", "--json", "--install-root", stage)
+	cmd.Env = offlineInstallerEnv(t, map[string]string{
+		"HOME":                  liveHome,
+		"PATH":                  stubBin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"AGENTBUS_PGREP_CALLED": pgrepCalled,
+	})
+	stdout, stderr, err := runCommand(cmd)
+	if err != nil {
+		t.Fatalf("staged install failed: %v stderr=%s stdout=%s", err, stderr, stdout)
+	}
+	if _, err := os.Stat(pgrepCalled); !os.IsNotExist(err) {
+		t.Fatalf("staged install invoked pgrep: stat err=%v", err)
+	}
+	if warnings := decodeInstallerResult(t, stdout).Warnings; containsWarningText(warnings, "daemon") {
+		t.Fatalf("staged install warnings = %#v, want no daemon restart warning", warnings)
+	}
+}
+
+func TestInstallerLiveInstallRestartsMatchingDaemon(t *testing.T) {
+	root := repoRoot(t)
+	home := t.TempDir()
+	stubBin := t.TempDir()
+	daemon := exec.Command("sleep", "30")
+	if err := daemon.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if daemon.Process != nil {
+			_ = daemon.Process.Kill()
+		}
+		_ = daemon.Wait()
+	})
+	canonicalHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolPath := filepath.Join(canonicalHome, ".local", "bin", "agentbus")
+	writeExecutable(t, filepath.Join(stubBin, "pgrep"), "#!/bin/sh\nprintf '%s\\n' \"$AGENTBUS_TEST_DAEMON_PID\"\n")
+	writeExecutable(t, filepath.Join(stubBin, "ps"), "#!/bin/sh\nprintf '%s\\n' \"$AGENTBUS_TEST_DAEMON_COMMAND\"\n")
+
+	cmd := installerCommand(t, root, "--install", "--target", "tools", "--json")
+	cmd.Env = offlineInstallerEnv(t, map[string]string{
+		"HOME":                         home,
+		"PATH":                         stubBin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"AGENTBUS_TEST_DAEMON_PID":     fmt.Sprintf("%d", daemon.Process.Pid),
+		"AGENTBUS_TEST_DAEMON_COMMAND": toolPath + " serve",
+	})
+	stdout, stderr, err := runCommand(cmd)
+	if err != nil {
+		t.Fatalf("live install failed: %v stderr=%s stdout=%s", err, stderr, stdout)
+	}
+	if warnings := decodeInstallerResult(t, stdout).Warnings; !containsWarningText(warnings, fmt.Sprintf("restarted running agentbus daemon (pid %d)", daemon.Process.Pid)) {
+		t.Fatalf("live install warnings = %#v", warnings)
+	}
+	if err := daemon.Wait(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ProcessState.ExitCode() == 0 {
+			t.Fatalf("daemon was not terminated by installer: %v", err)
+		}
+	}
+	daemon.Process = nil
+}
+
 func TestInstallerRejectsMalformedFlags(t *testing.T) {
 	root := repoRoot(t)
 	tests := []struct {
@@ -298,6 +368,20 @@ func offlineGoEnv(t *testing.T) []string {
 	})
 }
 
+func offlineInstallerEnv(t *testing.T, overrides map[string]string) []string {
+	t.Helper()
+	base := map[string]string{
+		"GOCACHE":    privateTmpDir(t, "agentbus-gocache-*"),
+		"GOMODCACHE": privateTmpDir(t, "agentbus-gomodcache-*"),
+		"GOPROXY":    "off",
+		"GOSUMDB":    "off",
+	}
+	for key, value := range overrides {
+		base[key] = value
+	}
+	return commandEnv(t, base)
+}
+
 func releaseCheckEnv(t *testing.T, gitBin string, headTag string) []string {
 	t.Helper()
 	env := map[string]string{
@@ -376,4 +460,20 @@ func fileSHA256(t *testing.T, path string) string {
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+func writeExecutable(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func containsWarningText(warnings []string, want string) bool {
+	for _, warning := range warnings {
+		if strings.Contains(warning, want) {
+			return true
+		}
+	}
+	return false
 }

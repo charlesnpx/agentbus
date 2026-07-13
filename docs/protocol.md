@@ -74,6 +74,13 @@ connections and no active or queued jobs or turns. A running background job
 always counts as activity. The daemon MUST support concurrent multi-job
 execution; the one-active-turn rule is per session, not per daemon.
 
+This is also an operational upgrade behavior, not a protocol change. At startup
+the daemon records its resolved executable's modification time and size. If a
+later housekeeping check finds that binary replaced or unavailable, the daemon
+continues serving active connections and work, then exits at the first quiet
+check without waiting for the normal 30-minute timeout. A later client
+connection autostarts the upgraded binary.
+
 State storage requirements:
 
 | Item | Requirement |

@@ -200,6 +200,43 @@ build_agentbus() {
   exit 1
 }
 
+live_install_root() {
+  [[ -n "${HOME:-}" && "$HOME" == /* && -d "$HOME" ]] || return 1
+  canonical_existing_dir "$HOME"
+}
+
+restart_live_daemon() {
+  [[ "$OPERATION" == "install" ]] || return 0
+  tools_requested || return 0
+
+  local live_root
+  live_root=$(live_install_root) || return 0
+  # mise-en-place invokes delegated installers with a temporary
+  # --install-root, then copies the staged file into the live destination.
+  # Signalling from that staged invocation would target the wrong binary.
+  [[ "$ROOT" == "$live_root" ]] || return 0
+
+  local pids pid command matched=0
+  pids=$(pgrep -f '[a]gentbus[[:space:]]+serve([[:space:]]|$)' 2>/dev/null || true)
+  for pid in $pids; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    command=${command#"${command%%[![:space:]]*}"}
+    if [[ "$command" != "$TOOL_PATH serve" && "$command" != "$TOOL_PATH serve "* ]]; then
+      continue
+    fi
+    matched=1
+    if kill -TERM "$pid" 2>/dev/null; then
+      add_warning "restarted running agentbus daemon (pid $pid) so the upgraded binary serves new connections; in-flight jobs are recovered by the reaper"
+    else
+      add_warning "could not restart running agentbus daemon (pid $pid) after upgrade"
+    fi
+  done
+  if [[ $matched -eq 0 ]]; then
+    add_warning "no running agentbus daemon found at $TOOL_PATH"
+  fi
+}
+
 TOOL_SHA=""
 
 case "$OPERATION" in
@@ -211,6 +248,7 @@ case "$OPERATION" in
       build_agentbus "$TOOL_PATH"
       TOOL_SHA=$(sha256_file "$TOOL_PATH")
       [[ -n "$TOOL_SHA" ]] || die "failed to compute sha256 for $TOOL_PATH"
+      restart_live_daemon
     fi
     ;;
   uninstall)
