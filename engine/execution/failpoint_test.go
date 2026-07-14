@@ -33,13 +33,14 @@ func TestFailpointHarnessCoversLifecycle(t *testing.T) {
 				t.Fatalf("no coverage scenario for failpoint %s", point)
 			}
 			injector := &FailureInjector{Target: point}
-			run(t, injector)
+			c := run(t, injector)
 			if !injector.Hit {
 				t.Fatalf("failpoint %s was not exercised", point)
 			}
 			if injector.Hits[point] == 0 {
 				t.Fatalf("failpoint %s was not reached by coverage matrix", point)
 			}
+			assertFailpointPostcondition(t, c)
 		})
 	}
 }
@@ -49,18 +50,19 @@ func TestFailpointCoverageMatrixReachesEveryEdgePoint(t *testing.T) {
 		edge := edge
 		t.Run(edge.name, func(t *testing.T) {
 			injector := &FailureInjector{}
-			edge.run(t, injector)
+			c := edge.run(t, injector)
 			if injector.Hits[edge.before] == 0 {
 				t.Fatalf("edge %s did not reach before point %s", edge.name, edge.before)
 			}
 			if injector.Hits[edge.after] == 0 {
 				t.Fatalf("edge %s did not reach after point %s", edge.name, edge.after)
 			}
+			assertFailpointPostcondition(t, c)
 		})
 	}
 }
 
-func TestExecDeathFailpointsLandOnDistinctModeledStartStates(t *testing.T) {
+func TestExecDeathFailpointsContainOrFailStop(t *testing.T) {
 	cases := []struct {
 		name  string
 		point Failpoint
@@ -70,7 +72,6 @@ func TestExecDeathFailpointsLandOnDistinctModeledStartStates(t *testing.T) {
 		{name: "execed", point: FailExecDeathAfterExecBeforeStart},
 		{name: "backend_started", point: FailExecDeathAfterStartBeforeCAS},
 	}
-	seen := map[string]Failpoint{}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := NewCoordinator(NewMemoryAdmissionStore(), "boot-exec-death-"+tc.name, "owner")
@@ -82,22 +83,225 @@ func TestExecDeathFailpointsLandOnDistinctModeledStartStates(t *testing.T) {
 			if !injector.Hit {
 				t.Fatalf("exec death failpoint %s was not hit", tc.point)
 			}
-			job, ok := c.Store.GetJob(res.JobID)
-			if !ok {
-				t.Fatal("job missing after exec death")
-			}
-			if previous, ok := seen[job.StartPhase]; ok {
-				t.Fatalf("exec death failpoint %s collapsed onto start phase %q already used by %s", tc.point, job.StartPhase, previous)
-			}
-			seen[job.StartPhase] = tc.point
+			assertContainedTerminalOrFailStopped(t, c, res.JobID)
 		})
+	}
+}
+
+func TestSupervisorRecordFailpointsRecoverPreparedWorker(t *testing.T) {
+	for _, point := range []Failpoint{FailSupervisorRecordBeforeCAS, FailSupervisorRecordAfterCAS} {
+		point := point
+		t.Run(string(point), func(t *testing.T) {
+			c := NewCoordinator(NewMemoryAdmissionStore(), "boot-supervisor-record-"+string(point), "owner")
+			res, err := c.Submit(modelRequest("ws-supervisor-record-"+string(point), "req-supervisor-record-"+string(point), "fp"), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			injector := &FailureInjector{Target: point}
+			if err := c.PrepareSupervisor(res.JobID, injector); err == nil {
+				t.Fatalf("PrepareSupervisor returned nil error for %s", point)
+			}
+			if !injector.Hit {
+				t.Fatalf("supervisor record failpoint %s was not hit", point)
+			}
+			if point == FailSupervisorRecordAfterCAS {
+				assertContainedTerminalOrFailStopped(t, c, res.JobID)
+				return
+			}
+			assertPreparedWorkerRetiredOrFailStopped(t, c, res.JobID)
+			assertFailpointPostcondition(t, c)
+		})
+	}
+}
+
+func TestPostGrantFailpointsRecoverThroughContainment(t *testing.T) {
+	for _, point := range []Failpoint{
+		FailGrantPermitAfterCAS,
+		FailPermitSendBeforeSideEffect,
+		FailPermitSendAfterSideEffect,
+		FailPermitMaybeSentBeforeCAS,
+		FailPermitMaybeSentAfterCAS,
+	} {
+		point := point
+		t.Run(string(point), func(t *testing.T) {
+			c := NewCoordinator(NewMemoryAdmissionStore(), "boot-post-grant-"+string(point), "owner")
+			res, err := c.Submit(modelRequest("ws-post-grant-"+string(point), "req-post-grant-"+string(point), "fp"), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.PrepareSupervisor(res.JobID, nil); err != nil {
+				t.Fatal(err)
+			}
+			injector := &FailureInjector{Target: point}
+			if err := c.GrantPermit(res.JobID, 1, "nonce-"+string(point), injector); err == nil {
+				t.Fatalf("GrantPermit returned nil error for %s", point)
+			}
+			if !injector.Hit {
+				t.Fatalf("post-grant failpoint %s was not hit", point)
+			}
+			assertContainedTerminalOrFailStopped(t, c, res.JobID)
+		})
+	}
+}
+
+func TestLegacyUnfencedAckGatedOutsideAdmissionStore(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-legacy-unfenced", "owner")
+	run, err := c.SubmitLegacyUnfenced(modelRequest("ws-legacy-unfenced-no-ack", "", "fp"), false, nil)
+	if err == nil || !IsCode(err, CodeLegacyUnfenced) {
+		t.Fatalf("unacknowledged legacy unfenced launch error = %v, want legacy_unfenced", err)
+	}
+	if !run.Started || run.Acknowledged || !run.Retired {
+		t.Fatalf("unacknowledged legacy unfenced run = %+v, want started, unacknowledged, retired", run)
+	}
+	if len(c.Store.jobs) != 0 {
+		t.Fatalf("legacy unfenced unacknowledged run entered AdmissionStore")
+	}
+
+	injector := &FailureInjector{Target: FailLegacyUnfencedStartAfter}
+	run, err = c.SubmitLegacyUnfenced(modelRequest("ws-legacy-unfenced-start-fail", "", "fp"), true, injector)
+	if err == nil || !IsCode(err, CodeLegacyUnfenced) {
+		t.Fatalf("failed legacy unfenced Start error = %v, want legacy_unfenced", err)
+	}
+	if !injector.Hit {
+		t.Fatalf("legacy unfenced Start failpoint was not hit")
+	}
+	if !run.Started || run.Acknowledged || !run.Retired {
+		t.Fatalf("failed legacy unfenced run = %+v, want started, unacknowledged, retired", run)
+	}
+	if len(c.Store.jobs) != 0 {
+		t.Fatalf("legacy unfenced failed Start entered AdmissionStore")
+	}
+
+	run, err = c.SubmitLegacyUnfenced(modelRequest("ws-legacy-unfenced-ack", "", "fp"), true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !run.Started || !run.Acknowledged || run.Retired {
+		t.Fatalf("acknowledged legacy unfenced run = %+v, want started, acknowledged, live", run)
+	}
+	if len(c.Store.jobs) != 0 {
+		t.Fatalf("legacy unfenced acknowledged run entered AdmissionStore")
+	}
+	if _, ok := c.legacyUnfenced[run.RunID]; !ok {
+		t.Fatalf("acknowledged legacy unfenced run was not tracked outside AdmissionStore")
+	}
+	assertFailpointPostcondition(t, c)
+}
+
+func assertFailpointPostcondition(t *testing.T, c *Coordinator) {
+	t.Helper()
+	if c == nil {
+		return
+	}
+	if err := c.Check(); err != nil {
+		t.Fatalf("global oracle failed: %v", err)
+	}
+	if c.FailStopping || c.LifecycleState == CoordinatorLifecycleFailStopped {
+		return
+	}
+	for _, job := range c.Store.jobs {
+		aggregate := job.copy()
+		if aggregate.Terminal() {
+			if !validTerminalProof(&aggregate) || !validTerminalOutcomeProofReason(&aggregate) {
+				t.Fatalf("job %s terminalized without valid proof: proof=%s reason=%q outcome=%s", aggregate.JobID, aggregate.TerminalProof, aggregate.TerminalReason, aggregate.Outcome)
+			}
+			continue
+		}
+		if executionUncertain(&aggregate) || aggregate.ContainmentRequired {
+			reconciling := aggregate.Dispatch == DispatchReconciling && aggregate.ContainmentRequired
+			containedPendingTerminal := aggregate.Dispatch == DispatchContained && aggregate.Contained && aggregate.Retired
+			obligation, actionable := c.obligations[aggregate.JobID]
+			actionable = actionable && obligation.runnable()
+			if !reconciling && !containedPendingTerminal && !actionable {
+				t.Fatalf("job %s has nonterminal uncertain authority without a recovery postcondition", aggregate.JobID)
+			}
+		}
+		if aggregate.BootID == c.BootID && aggregate.Mode != ModeLegacyUnfenced {
+			obligation, ok := c.obligations[aggregate.JobID]
+			if !ok || !obligation.runnable() {
+				t.Fatalf("job %s is nonterminal without a runnable coordinator obligation", aggregate.JobID)
+			}
+		}
+	}
+	for jobID, obligation := range c.obligations {
+		if obligation.PreparedSupervisor == nil {
+			continue
+		}
+		if obligation.Retired {
+			if !obligation.PreparedRetirement.Verified() {
+				t.Fatalf("prepared supervisor obligation %s is retired without proof", jobID)
+			}
+			continue
+		}
+		job, ok := c.Store.GetJob(jobID)
+		if !ok || !sameGroupRef(job.Supervisor, *obligation.PreparedSupervisor) {
+			t.Fatalf("prepared supervisor obligation %s is neither retired nor durably recorded", jobID)
+		}
+	}
+}
+
+func assertContainedTerminalOrFailStopped(t *testing.T, c *Coordinator, jobID string) {
+	t.Helper()
+	assertFailpointPostcondition(t, c)
+	if c.FailStopping || c.LifecycleState == CoordinatorLifecycleFailStopped {
+		return
+	}
+	job, ok := c.Store.GetJob(jobID)
+	if !ok {
+		t.Fatalf("job %s missing after recovery", jobID)
+	}
+	if !job.Terminal() || job.TerminalProof != ProofContained || !job.Contained {
+		t.Fatalf("job %s recovery proof = terminal:%v proof:%s contained:%v, want contained terminal or fail-stop", jobID, job.Terminal(), job.TerminalProof, job.Contained)
+	}
+}
+
+func assertPreparedWorkerRetiredOrFailStopped(t *testing.T, c *Coordinator, jobID string) {
+	t.Helper()
+	if c.FailStopping || c.LifecycleState == CoordinatorLifecycleFailStopped {
+		return
+	}
+	obligation, ok := c.obligations[jobID]
+	if !ok || obligation.PreparedSupervisor == nil {
+		t.Fatalf("job %s has no recoverable prepared supervisor obligation", jobID)
+	}
+	if !obligation.Retired || !obligation.PreparedRetirement.Verified() {
+		t.Fatalf("job %s prepared supervisor was not synchronously retired with proof", jobID)
+	}
+	job, ok := c.Store.GetJob(jobID)
+	if !ok {
+		t.Fatalf("job %s missing after prepared recovery", jobID)
+	}
+	if job.Supervisor.Valid() || executionUncertain(&job) {
+		t.Fatalf("job %s retained durable authority after prepared-worker retirement", jobID)
+	}
+}
+
+func assertAnchorInitPrefix(t *testing.T, state AnchorInitState) {
+	t.Helper()
+	if state.AnchorDirFsynced && !state.AnchorPublished {
+		t.Fatalf("anchor init dir fsync without anchor publish: %+v", state)
+	}
+	if state.AnchorPublished && !state.DirFsynced {
+		t.Fatalf("anchor publish without db directory fsync: %+v", state)
+	}
+	if state.DirFsynced && !state.Renamed {
+		t.Fatalf("db directory fsync without rename: %+v", state)
+	}
+	if state.Renamed && !state.DBFsynced {
+		t.Fatalf("db rename without db fsync: %+v", state)
+	}
+	if state.DBFsynced && !state.TempDBCreated {
+		t.Fatalf("db fsync without temp db creation: %+v", state)
+	}
+	if state.AnchorPublished && !state.EverInitialized {
+		t.Fatalf("anchor publish did not persist everInitialized: %+v", state)
 	}
 }
 
 type failpointCoverageEdge struct {
 	name          string
 	before, after Failpoint
-	run           func(*testing.T, *FailureInjector)
+	run           func(*testing.T, *FailureInjector) *Coordinator
 }
 
 func failpointCoverageEdges() []failpointCoverageEdge {
@@ -151,13 +355,14 @@ func failpointCoverageEdges() []failpointCoverageEdge {
 	}
 }
 
-func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) {
-	admission := func(t *testing.T, injector *FailureInjector) {
+func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) *Coordinator {
+	admission := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-admission", "owner")
 		_, _ = c.Submit(modelRequest("ws-admission", "req-admission", "fp"), injector)
+		return c
 	}
-	ack := func(t *testing.T, injector *FailureInjector) {
+	ack := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-ack-fp", "owner")
 		res, err := c.SubmitLegacyFenced(modelRequest("ws-ack-fp", "", "fp"), nil)
@@ -165,8 +370,9 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) {
 			t.Fatal(err)
 		}
 		_ = c.AcknowledgeWithInjector(res.JobID, injector)
+		return c
 	}
-	reject := func(t *testing.T, injector *FailureInjector) {
+	reject := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-reject-fp", "owner")
 		res, err := c.SubmitLegacyFenced(modelRequest("ws-reject-fp", "", "fp"), nil)
@@ -174,8 +380,9 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) {
 			t.Fatal(err)
 		}
 		_ = c.RejectUnacknowledgedWithInjector(res.JobID, injector)
+		return c
 	}
-	prepare := func(t *testing.T, injector *FailureInjector) {
+	prepare := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-prepare-fp", "owner")
 		res, err := c.Submit(modelRequest("ws-prepare-fp", "req-prepare-fp", "fp"), nil)
@@ -183,18 +390,21 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) {
 			t.Fatal(err)
 		}
 		_ = c.PrepareSupervisor(res.JobID, injector)
+		return c
 	}
-	legacyPrepare := func(t *testing.T, injector *FailureInjector) {
+	legacyPrepare := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-legacy-prepare-fp", "owner")
 		_, _ = c.SubmitLegacyFenced(modelRequest("ws-legacy-prepare-fp", "", "fp"), injector)
+		return c
 	}
-	legacyUnfenced := func(t *testing.T, injector *FailureInjector) {
+	legacyUnfenced := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-legacy-unfenced-fp", "owner")
 		_, _ = c.SubmitLegacyUnfenced(modelRequest("ws-legacy-unfenced-fp", "", "fp"), true, injector)
+		return c
 	}
-	cancel := func(t *testing.T, injector *FailureInjector) {
+	cancel := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-cancel-fp", "owner")
 		res, err := c.Submit(modelRequest("ws-cancel-fp", "req-cancel-fp", "fp"), nil)
@@ -205,8 +415,9 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) {
 			t.Fatal(err)
 		}
 		_ = c.CancelWithInjector(res.JobID, injector)
+		return c
 	}
-	grant := func(t *testing.T, injector *FailureInjector) {
+	grant := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-grant-fp", "owner")
 		res, err := c.Submit(modelRequest("ws-grant-fp", "req-grant-fp", "fp"), nil)
@@ -217,14 +428,16 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) {
 			t.Fatal(err)
 		}
 		_ = c.GrantPermit(res.JobID, 1, "nonce", injector)
+		return c
 	}
-	start := func(t *testing.T, injector *FailureInjector) {
+	start := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-start-fp", "owner")
 		res := submitPreparedPermitted(t, c, "ws-start-fp", "req-start-fp", "fp")
 		_ = c.Start(res.JobID, injector)
+		return c
 	}
-	complete := func(t *testing.T, injector *FailureInjector) {
+	complete := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-complete-fp", "owner")
 		res := submitPreparedPermitted(t, c, "ws-complete-fp", "req-complete-fp", "fp")
@@ -232,15 +445,17 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) {
 			t.Fatal(err)
 		}
 		_ = c.CompleteWithInjector(res.JobID, OutcomeCompleted, injector)
+		return c
 	}
-	reconcile := func(t *testing.T, injector *FailureInjector) {
+	reconcile := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-reconcile-fp", "owner")
 		res := submitPreparedPermitted(t, c, "ws-reconcile-fp", "req-reconcile-fp", "fp")
 		_ = c.LiveSupervisorLossWithInjector(res.JobID, injector)
 		assertTerminalizedOrFailStopped(t, c, res.JobID)
+		return c
 	}
-	expire := func(t *testing.T, injector *FailureInjector) {
+	expire := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-expire-fp", "owner")
 		req := modelRequest("ws-expire-fp", "req-expire-fp", "fp")
@@ -255,8 +470,9 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) {
 			t.Fatal(err)
 		}
 		_, _ = c.Expire(req.WorkspaceKey, req.RequestID, injector)
+		return c
 	}
-	corrupt := func(t *testing.T, injector *FailureInjector) {
+	corrupt := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-corrupt-fp", "owner")
 		res, err := c.Submit(modelRequest("ws-corrupt-fp", "req-corrupt-fp", "fp"), nil)
@@ -264,13 +480,16 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) {
 			t.Fatal(err)
 		}
 		_ = c.MarkCorrupt(res.JobID, false, true, "checksum", injector)
+		return c
 	}
-	anchor := func(t *testing.T, injector *FailureInjector) {
+	anchor := func(t *testing.T, injector *FailureInjector) *Coordinator {
 		t.Helper()
-		_, _ = RunAnchorInitialization(1, 1, injector)
+		state, _ := RunAnchorInitialization(1, 1, injector)
+		assertAnchorInitPrefix(t, state)
+		return nil
 	}
 
-	matrix := map[Failpoint]func(*testing.T, *FailureInjector){}
+	matrix := map[Failpoint]func(*testing.T, *FailureInjector) *Coordinator{}
 	for _, point := range []Failpoint{FailAdmissionBeforeCommit, FailAdmissionAfterCommit, FailPostCommitPreRunnable} {
 		matrix[point] = admission
 	}

@@ -27,6 +27,15 @@ func AllDecisions() []Decision {
 	}
 }
 
+func validDecision(decision Decision) bool {
+	switch decision {
+	case DecisionAccepted, DecisionAwaitingAck, DecisionCancelRequested, DecisionTerminal:
+		return true
+	default:
+		return false
+	}
+}
+
 type Dispatch string
 
 const (
@@ -55,6 +64,15 @@ func AllDispatches() []Dispatch {
 	}
 }
 
+func validDispatch(dispatch Dispatch) bool {
+	switch dispatch {
+	case DispatchNone, DispatchScheduled, DispatchSupervisorPrepared, DispatchPermitGranted, DispatchActive, DispatchReconciling, DispatchContained, DispatchResultPublishing, DispatchDone:
+		return true
+	default:
+		return false
+	}
+}
+
 type Outcome string
 
 const (
@@ -80,6 +98,24 @@ func AllOutcomes() []Outcome {
 		OutcomeReaped,
 		OutcomeInterrupted,
 		OutcomeQuarantined,
+	}
+}
+
+func validOutcome(outcome Outcome) bool {
+	switch outcome {
+	case OutcomeNone, OutcomeCompleted, OutcomeCompletedNoncompliant, OutcomeFailed, OutcomeTimedOut, OutcomeCanceled, OutcomeReaped, OutcomeInterrupted, OutcomeQuarantined:
+		return true
+	default:
+		return false
+	}
+}
+
+func completionOutcome(outcome Outcome) bool {
+	switch outcome {
+	case OutcomeCompleted, OutcomeCompletedNoncompliant:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -126,6 +162,15 @@ const (
 	ModeLegacyFenced     Mode = "LegacyFenced"
 	ModeLegacyUnfenced   Mode = "LegacyUnfenced"
 )
+
+func validMode(mode Mode) bool {
+	switch mode {
+	case ModeIdentifiedFenced, ModeLegacyFenced, ModeLegacyUnfenced:
+		return true
+	default:
+		return false
+	}
+}
 
 type TerminalProof string
 
@@ -544,6 +589,9 @@ func materializeLaunchSpec(req SubmitRequest, fingerprint Fingerprint) (LaunchSp
 }
 
 func validateLaunchSpec(spec LaunchSpec, mode Mode) error {
+	if !validMode(mode) {
+		return protocolError(CodeRejected, "", "unknown execution mode")
+	}
 	if spec.WorkspaceKey == "" || strings.ContainsRune(spec.WorkspaceKey, '\x00') {
 		return protocolError(CodeRejected, "", "invalid launch workspaceKey")
 	}
@@ -610,4 +658,23 @@ func backendSupportsFenced(backend string) bool {
 	default:
 		return false
 	}
+}
+
+func validateAggregateEnums(job *Aggregate) error {
+	if job == nil {
+		return nil
+	}
+	if !validMode(job.Mode) {
+		return protocolError(CodeRejected, job.JobID, "unknown execution mode")
+	}
+	if !validDecision(job.Decision) {
+		return protocolError(CodePreconditionFailed, job.JobID, "unknown decision state")
+	}
+	if !validDispatch(job.Dispatch) {
+		return protocolError(CodePreconditionFailed, job.JobID, "unknown dispatch state")
+	}
+	if !validOutcome(job.Outcome) {
+		return protocolError(CodePreconditionFailed, job.JobID, "unknown outcome state")
+	}
+	return nil
 }

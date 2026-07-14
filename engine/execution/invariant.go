@@ -35,7 +35,7 @@ func CheckInvariants(view InvariantView) error {
 	if store.replaySideEffects != 0 {
 		return fmt.Errorf("replay has execution side effects: %d", store.replaySideEffects)
 	}
-	if store.silentRecreated {
+	if store.silentRecreated && !view.FailStopping && lifecycleState != CoordinatorLifecycleFailStopped {
 		return fmt.Errorf("initialized AdmissionStore was silently recreated")
 	}
 
@@ -78,6 +78,9 @@ func CheckInvariants(view InvariantView) error {
 
 	for _, job := range store.jobs {
 		job.ensureMaps()
+		if err := validateAggregateEnums(job); err != nil {
+			return err
+		}
 		if PublicProjection(job.Decision, job.Dispatch, job.Outcome) == "" {
 			return fmt.Errorf("job %s has no public projection", job.JobID)
 		}
@@ -118,6 +121,9 @@ func CheckInvariants(view InvariantView) error {
 		}
 		if (job.PermitState == PermitGranted || job.PermitState == PermitMaybeSent || job.PermitState == PermitConsumed || job.PermitMaybeSent || job.Dispatch == DispatchPermitGranted || job.Dispatch == DispatchActive) && !job.Supervisor.Valid() {
 			return fmt.Errorf("job %s has permit without durable supervisor identity", job.JobID)
+		}
+		if job.Dispatch == DispatchScheduled && job.Supervisor.Valid() {
+			return fmt.Errorf("job %s has scheduled dispatch with durable supervisor identity", job.JobID)
 		}
 		if err := validateParkedExecIdentity(job); err != nil {
 			return err
@@ -309,7 +315,11 @@ func validTerminalProof(job *Aggregate) bool {
 		if !job.Retired || job.Contained || !terminalOutcome(job.Outcome) || hasLiveAuthority(job) {
 			return false
 		}
-		if job.LaunchOrdinal != 0 && !job.LaunchQuiescent[job.LaunchOrdinal] {
+		if job.LaunchOrdinal == 0 || !job.LaunchQuiescent[job.LaunchOrdinal] {
+			return false
+		}
+		evidence := job.LaunchEvidence[job.LaunchOrdinal]
+		if !evidence.ChildExited.Present() || !evidence.GroupEmpty.Present() {
 			return false
 		}
 		return job.RetirementEvidence.Present()
