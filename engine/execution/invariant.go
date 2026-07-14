@@ -3,10 +3,11 @@ package execution
 import "fmt"
 
 type InvariantView struct {
-	Store         *MemoryAdmissionStore
-	Obligations   map[string]CoordinatorObligation
-	FailStopping  bool
-	CurrentBootID string
+	Store            *MemoryAdmissionStore
+	Obligations      map[string]CoordinatorObligation
+	FailStopping     bool
+	CurrentBootID    string
+	AllowPreRunnable bool
 }
 
 func CheckInvariants(view InvariantView) error {
@@ -59,14 +60,20 @@ func CheckInvariants(view InvariantView) error {
 		}
 		if view.CurrentBootID != "" && job.BootID == view.CurrentBootID && !job.Terminal() && job.Mode != ModeLegacyUnfenced && !view.FailStopping {
 			obligation, ok := view.Obligations[job.JobID]
-			if !ok || !obligation.Committed {
+			if !ok || !obligation.committed() {
 				return fmt.Errorf("current-boot nonterminal job %s has no committed obligation", job.JobID)
+			}
+			if !validObligationState(obligation.state()) {
+				return fmt.Errorf("job %s obligation has invalid state %q", job.JobID, obligation.state())
 			}
 			if obligation.Mode != job.Mode {
 				return fmt.Errorf("job %s obligation mode %s does not match aggregate mode %s", job.JobID, obligation.Mode, job.Mode)
 			}
 			if obligation.LaunchSpec != job.LaunchSpec {
 				return fmt.Errorf("job %s obligation launch spec does not match aggregate launch spec", job.JobID)
+			}
+			if !obligation.runnable() && !view.FailStopping && !view.AllowPreRunnable {
+				return fmt.Errorf("current-boot nonterminal job %s has no runnable obligation", job.JobID)
 			}
 		}
 		if (job.PermitState == PermitGranted || job.PermitState == PermitMaybeSent || job.PermitState == PermitConsumed || job.PermitMaybeSent || job.Dispatch == DispatchPermitGranted || job.Dispatch == DispatchActive) && !job.Supervisor.Valid() {
@@ -153,6 +160,15 @@ func CheckInvariants(view InvariantView) error {
 		}
 	}
 	return nil
+}
+
+func validObligationState(state ObligationState) bool {
+	switch state {
+	case ObligationPending, ObligationCommitted, ObligationRunnable:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateLaunchNonceHistory(job *Aggregate) error {

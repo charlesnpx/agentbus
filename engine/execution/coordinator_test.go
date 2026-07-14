@@ -37,6 +37,43 @@ func TestIdentifiedLifecycleCompletes(t *testing.T) {
 	}
 }
 
+func TestPostCommitPreRunnableInterruptionFailStops(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-prerunnable", "owner")
+	injector := &FailureInjector{Target: FailPostCommitPreRunnable}
+
+	res, err := c.Submit(modelRequest("ws-prerunnable", "req-prerunnable", "fp-prerunnable"), injector)
+	if err == nil {
+		t.Fatal("Submit returned nil error for post-commit pre-runnable interruption")
+	}
+	if !injector.Hit {
+		t.Fatal("post-commit pre-runnable failpoint was not hit")
+	}
+	if !c.FailStopping {
+		t.Fatal("coordinator did not enter fail-stop after committed obligation failed to become runnable")
+	}
+
+	job, ok := c.Store.GetJob(res.JobID)
+	if !ok {
+		t.Fatal("accepted job missing after post-commit pre-runnable interruption")
+	}
+	if job.Terminal() || job.Decision != DecisionAccepted {
+		t.Fatalf("job = %+v, want accepted nonterminal job", job)
+	}
+	obligation, ok := c.Obligations()[res.JobID]
+	if !ok {
+		t.Fatal("obligation missing after durable acceptance")
+	}
+	if obligation.state() != ObligationCommitted || obligation.runnable() {
+		t.Fatalf("obligation state = %q, want committed and not runnable", obligation.state())
+	}
+	checkCoordinator(t, c)
+
+	c.FailStopping = false
+	if err := c.Check(); err == nil {
+		t.Fatal("CheckInvariants accepted nonterminal job without runnable obligation or fail-stop")
+	}
+}
+
 func TestCancelBeforePermitDoesNotStart(t *testing.T) {
 	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-cancel", "owner")
 	res, err := c.Submit(modelRequest("ws-cancel", "req-cancel", "fp-cancel"), nil)
