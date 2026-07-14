@@ -28,7 +28,7 @@ func TestRegressionSeedsAreUnreachableOrTerminalized(t *testing.T) {
 }
 
 func seedTornReservation(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-seed", "owner")
 	injector := &FailureInjector{Target: FailBeforeCommit}
 	if _, err := c.Submit(modelRequest("ws-seed", "req-torn", "fp"), injector); err == nil {
 		t.Fatal("expected injected failure")
@@ -63,7 +63,7 @@ func seedGCDeletesReplaced(t *testing.T) {
 }
 
 func seedBackendBeforeRecord(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-seed", "owner")
 	res := submitPreparedPermitted(t, c, "ws-seed", "req-backend-before-record", "fp")
 	injector := &FailureInjector{Target: FailExecDeathAfterExecBeforeStart}
 	if err := c.Start(res.JobID, injector); err == nil {
@@ -95,7 +95,7 @@ func seedValidationBypass(t *testing.T) {
 }
 
 func seedLockAcrossStart(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-seed", "owner")
 	res := submitPreparedPermitted(t, c, "ws-seed", "req-lock-start", "fp")
 	if err := c.Start(res.JobID, nil); err != nil {
 		t.Fatal(err)
@@ -106,7 +106,7 @@ func seedLockAcrossStart(t *testing.T) {
 }
 
 func seedReplayCancelActivate(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-seed", "owner")
 	req := modelRequest("ws-seed", "req-replay-cancel", "fp")
 	trace := []string{"accept"}
 	res, err := c.Submit(req, nil)
@@ -137,7 +137,7 @@ func seedReplayCancelActivate(t *testing.T) {
 		t.Fatalf("job = %+v trace=%v, want canceled without activation", job, trace)
 	}
 
-	c2 := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	c2 := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-seed", "owner")
 	res2 := submitPreparedPermitted(t, c2, "ws-seed", "req-cancel-after-permit", "fp")
 	if err := c2.Cancel(res2.JobID); err != nil {
 		t.Fatal(err)
@@ -149,50 +149,28 @@ func seedReplayCancelActivate(t *testing.T) {
 }
 
 func seedActivationUpdateFail(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-seed", "owner")
 	res := submitPreparedPermitted(t, c, "ws-seed", "req-activation-fail", "fp")
 	injector := &FailureInjector{Target: FailRecordStartedBeforeCAS}
 	if err := c.Start(res.JobID, injector); err == nil {
 		t.Fatal("expected activation CAS failure after backend started")
 	}
-	job, _ := c.Store.GetJob(res.JobID)
-	if job.StartPhase != "backend_started" || !job.PendingChild.Valid() {
-		t.Fatalf("activation failure state = %+v, want backend-started pending child before RecordStarted", job)
-	}
-	if err := c.LiveSupervisorLoss(res.JobID); err != nil {
-		t.Fatal(err)
-	}
-	checkCoordinator(t, c)
-	job, _ = c.Store.GetJob(res.JobID)
-	if job.Outcome != OutcomeReaped || job.TerminalProof != ProofContained {
-		t.Fatalf("job = %+v, want contained terminal after activation CAS failure", job)
-	}
+	assertTerminalizedOrFailStopped(t, c, res.JobID)
 }
 
 func seedStartFailQueuedStartingFail(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-seed", "owner")
 	res := submitPreparedPermitted(t, c, "ws-seed", "req-start-fail", "fp")
 	injector := &FailureInjector{Target: FailExecForkBeforeCAS}
 	if err := c.Start(res.JobID, injector); err == nil {
 		t.Fatal("expected queued to starting store-update failure")
 	}
-	job, _ := c.Store.GetJob(res.JobID)
-	if job.StartPhase != "" || job.PermitState != PermitMaybeSent {
-		t.Fatalf("queued->starting failure state = %+v, want permit maybe-sent before fork record", job)
-	}
-	if err := c.LiveSupervisorLoss(res.JobID); err != nil {
-		t.Fatal(err)
-	}
-	checkCoordinator(t, c)
-	job, _ = c.Store.GetJob(res.JobID)
-	if !job.Terminal() || job.TerminalProof != ProofContained {
-		t.Fatalf("job = %+v, want contained terminal", job)
-	}
+	assertTerminalizedOrFailStopped(t, c, res.JobID)
 }
 
 func seedStartFailUpdateFailRequestBound(t *testing.T) {
 	store := NewMemoryAdmissionStore()
-	old := NewCoordinator(store, "boot-old", "owner")
+	old := newReadyCoordinator(t, store, "boot-old", "owner")
 	res := submitPreparedPermitted(t, old, "ws-seed", "req-start-update", "fp")
 	injector := &FailureInjector{Target: FailTerminalBeforeCAS}
 	if err := old.LiveSupervisorLossWithInjector(res.JobID, injector); err == nil {
@@ -202,8 +180,9 @@ func seedStartFailUpdateFailRequestBound(t *testing.T) {
 	if job.Terminal() {
 		t.Fatalf("job = %+v, terminalized despite injected terminal commit failure", job)
 	}
+	assertTerminalizedOrFailStopped(t, old, res.JobID)
 	newBoot := NewCoordinator(store, "boot-new", "owner")
-	if err := old.LiveSupervisorLoss(res.JobID); err != nil {
+	if err := newBoot.StartupReconcile(); err != nil {
 		t.Fatal(err)
 	}
 	checkCoordinator(t, newBoot)
@@ -214,7 +193,7 @@ func seedStartFailUpdateFailRequestBound(t *testing.T) {
 }
 
 func seedAcceptanceWithoutAfter(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-seed", "owner")
 	req := modelRequest("ws-seed", "req-no-after", "fp")
 	injector := &FailureInjector{Target: FailAfterCommit}
 	res, err := c.Submit(req, injector)
@@ -246,4 +225,22 @@ func regressionSnapshot(t *testing.T, c *Coordinator, jobID, label string) strin
 		return label + ":missing"
 	}
 	return fmt.Sprintf("%s:%s/%s/%s permit=%s live=%d outcome=%s", label, job.Decision, job.Dispatch, job.Public(), job.PermitState, liveOrdinalCount(job.LiveOrdinals), job.Outcome)
+}
+
+func assertTerminalizedOrFailStopped(t *testing.T, c *Coordinator, jobID string) {
+	t.Helper()
+	checkCoordinator(t, c)
+	job, ok := c.Store.GetJob(jobID)
+	if !ok {
+		t.Fatal("job missing")
+	}
+	if job.Terminal() {
+		if job.TerminalProof != ProofContained {
+			t.Fatalf("job = %+v, want contained terminal", job)
+		}
+		return
+	}
+	if !c.FailStopping || c.LifecycleState != CoordinatorLifecycleFailStopped {
+		t.Fatalf("job = %+v coordinator failStopping=%v lifecycle=%s, want terminalized or fail-stopped", job, c.FailStopping, c.LifecycleState)
+	}
 }

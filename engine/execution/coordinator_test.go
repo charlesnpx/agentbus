@@ -6,7 +6,7 @@ import (
 )
 
 func TestIdentifiedLifecycleCompletes(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-life", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-life", "owner")
 	res, err := c.Submit(modelRequest("ws-life", "req-life", "fp-life"), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +41,7 @@ func TestIdentifiedLifecycleCompletes(t *testing.T) {
 }
 
 func TestPostCommitPreRunnableInterruptionFailStops(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-prerunnable", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-prerunnable", "owner")
 	injector := &FailureInjector{Target: FailPostCommitPreRunnable}
 
 	res, err := c.Submit(modelRequest("ws-prerunnable", "req-prerunnable", "fp-prerunnable"), injector)
@@ -134,7 +134,7 @@ func TestPostCommitPreRunnableInterruptionFailStops(t *testing.T) {
 }
 
 func TestCancelBeforePermitDoesNotStart(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-cancel", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-cancel", "owner")
 	res, err := c.Submit(modelRequest("ws-cancel", "req-cancel", "fp-cancel"), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +156,7 @@ func TestCancelBeforePermitDoesNotStart(t *testing.T) {
 }
 
 func TestCancelAfterPermitContainsBeforeTerminal(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-cancel2", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-cancel2", "owner")
 	res, err := c.Submit(modelRequest("ws-cancel2", "req-cancel2", "fp-cancel2"), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -177,8 +177,74 @@ func TestCancelAfterPermitContainsBeforeTerminal(t *testing.T) {
 	}
 }
 
+func TestMarkCorruptUsesIndependentPermitEvidence(t *testing.T) {
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-corrupt-permit", "owner")
+	res, err := c.Submit(modelRequest("ws-corrupt", "req-corrupt-permit", "fp-corrupt"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PrepareSupervisor(res.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	job, _ := c.Store.GetJob(res.JobID)
+	if executionUncertain(&job) {
+		t.Fatalf("test setup decoded permit evidence from aggregate: %+v", job)
+	}
+
+	if err := c.MarkCorrupt(res.JobID, true, true, "independent permit evidence", nil); err != nil {
+		t.Fatal(err)
+	}
+	checkCoordinator(t, c)
+	job, _ = c.Store.GetJob(res.JobID)
+	if !job.Terminal() || job.Outcome != OutcomeQuarantined || job.TerminalProof != ProofContained || !job.Contained {
+		t.Fatalf("job = %+v, want quarantined contained terminal from independent permit evidence", job)
+	}
+	if job.TerminalProof == ProofNeverPermittedAndRetired {
+		t.Fatalf("job = %+v, must not use never-permitted proof when independent permit evidence is present", job)
+	}
+}
+
+func TestMarkCorruptDoesNotContainWithoutVerification(t *testing.T) {
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-corrupt-verify", "owner")
+	res, err := c.Submit(modelRequest("ws-corrupt", "req-corrupt-verify", "fp-corrupt"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PrepareSupervisor(res.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	injector := &FailureInjector{Target: FailContainmentVerifyBefore}
+	if err := c.MarkCorrupt(res.JobID, true, true, "verification interrupted", injector); err == nil {
+		t.Fatal("expected containment verification interruption")
+	}
+	if !injector.Hit {
+		t.Fatal("containment verification failpoint was not hit")
+	}
+	job, _ := c.Store.GetJob(res.JobID)
+	if job.Contained || job.ContainmentVerified || job.Terminal() || job.Outcome == OutcomeQuarantined {
+		t.Fatalf("job = %+v, want no contained/quarantined state without verification", job)
+	}
+}
+
+func TestMarkCorruptUntrustedIdentityFailStops(t *testing.T) {
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-corrupt-fatal", "owner")
+	res, err := c.Submit(modelRequest("ws-corrupt", "req-corrupt-fatal", "fp-corrupt"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PrepareSupervisor(res.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.MarkCorrupt(res.JobID, true, false, "untrusted identity", nil); !IsCode(err, CodeCorruptFatal) {
+		t.Fatalf("err = %v, want corrupt fatal", err)
+	}
+	if !c.FailStopping || c.LifecycleState != CoordinatorLifecycleFailStopped {
+		t.Fatalf("coordinator did not fail-stop after untrusted corrupt identity: %+v", c)
+	}
+}
+
 func TestCorrectiveLaunchOrdinalRequiresQuiescence(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-ordinal", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-ordinal", "owner")
 	res := submitPreparedPermitted(t, c, "ws-ordinal", "req-ordinal", "fp-ordinal")
 	if err := c.GrantPermit(res.JobID, 2, "nonce-2", nil); !IsCode(err, CodePreconditionFailed) {
 		t.Fatalf("ordinal 2 before quiescence err = %v, want precondition failure", err)
@@ -198,7 +264,7 @@ func TestCorrectiveLaunchOrdinalRequiresQuiescence(t *testing.T) {
 }
 
 func TestParkedExecBackendIdentityMatchesSupervisorLeader(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-parked-exec", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-parked-exec", "owner")
 	res := submitPreparedPermitted(t, c, "ws-parked-exec", "req-parked-exec", "fp-parked-exec")
 	job, ok := c.Store.GetJob(res.JobID)
 	if !ok {
@@ -231,7 +297,7 @@ func TestParkedExecBackendIdentityMatchesSupervisorLeader(t *testing.T) {
 }
 
 func TestInvariantRejectsRegrantOrdinalOne(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-regrant-1", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-regrant-1", "owner")
 	res := submitPreparedPermitted(t, c, "ws-regrant-1", "req-regrant-1", "fp-regrant-1")
 	if err := c.Start(res.JobID, nil); err != nil {
 		t.Fatal(err)
@@ -252,7 +318,7 @@ func TestInvariantRejectsRegrantOrdinalOne(t *testing.T) {
 }
 
 func TestInvariantRejectsRegrantOrdinalTwo(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-regrant-2", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-regrant-2", "owner")
 	res := submitPreparedPermitted(t, c, "ws-regrant-2", "req-regrant-2", "fp-regrant-2")
 	if err := c.Start(res.JobID, nil); err != nil {
 		t.Fatal(err)
@@ -280,7 +346,7 @@ func TestInvariantRejectsRegrantOrdinalTwo(t *testing.T) {
 }
 
 func TestInvariantRejectsLaunchNonceReuse(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-nonce-reuse", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-nonce-reuse", "owner")
 	res := submitPreparedPermitted(t, c, "ws-nonce-reuse", "req-nonce-reuse", "fp-nonce-reuse")
 	if err := c.Start(res.JobID, nil); err != nil {
 		t.Fatal(err)
@@ -302,7 +368,7 @@ func TestInvariantRejectsLaunchNonceReuse(t *testing.T) {
 
 func TestStartupReconciliationTerminalizesPriorBootWork(t *testing.T) {
 	store := NewMemoryAdmissionStore()
-	old := NewCoordinator(store, "boot-old", "owner")
+	old := newReadyCoordinator(t, store, "boot-old", "owner")
 	beforeLaunch, err := old.Submit(modelRequest("ws-startup", "req-before", "fp-before"), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -324,8 +390,47 @@ func TestStartupReconciliationTerminalizesPriorBootWork(t *testing.T) {
 	}
 }
 
+func TestStartupReconciliationGatesReplayUntilReady(t *testing.T) {
+	store := NewMemoryAdmissionStore()
+	old := newReadyCoordinator(t, store, "boot-replay-old", "owner")
+	req := modelRequest("ws-startup-gate", "req-replay", "fp-replay")
+	res, err := old.Submit(req, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newBoot := NewCoordinator(store, "boot-replay-new", "owner")
+	replay, err := newBoot.Submit(req, nil)
+	if err == nil || !strings.Contains(err.Error(), "not ready") {
+		t.Fatalf("replay before StartupReconcile = (%+v,%v), want not-ready rejection", replay, err)
+	}
+	if replay.JobID != "" || replay.Job.JobID != "" {
+		t.Fatalf("replay before StartupReconcile returned job %+v", replay)
+	}
+	job, _ := store.GetJob(res.JobID)
+	if job.Terminal() {
+		t.Fatalf("old-boot job was terminal before StartupReconcile: %+v", job)
+	}
+
+	if err := newBoot.StartupReconcile(); err != nil {
+		t.Fatal(err)
+	}
+	checkCoordinator(t, newBoot)
+	job, _ = store.GetJob(res.JobID)
+	if job.Outcome != OutcomeFailed || job.TerminalProof != ProofNeverPermittedAndRetired || job.TerminalReason != "daemon_restarted_before_launch" {
+		t.Fatalf("old-boot job = %+v, want reconciled failed terminal", job)
+	}
+	replay, err = newBoot.Submit(req, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.JobID != res.JobID || !replay.Job.Terminal() || replay.Job.Outcome != OutcomeFailed {
+		t.Fatalf("replay after StartupReconcile = %+v, want terminal old-boot job %s", replay, res.JobID)
+	}
+}
+
 func TestResultCleanupExclusion(t *testing.T) {
-	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-cleanup", "owner")
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-cleanup", "owner")
 	res := submitPreparedPermitted(t, c, "ws-cleanup", "req-cleanup", "fp-cleanup")
 	if err := c.Start(res.JobID, nil); err != nil {
 		t.Fatal(err)
@@ -341,6 +446,15 @@ func TestResultCleanupExclusion(t *testing.T) {
 	if ResultCleanupEligible(job, c.Obligations(), "tmp-"+res.JobID) {
 		t.Fatalf("publishing job was eligible for cleanup")
 	}
+}
+
+func newReadyCoordinator(t *testing.T, store *MemoryAdmissionStore, bootID, ownerID string) *Coordinator {
+	t.Helper()
+	c := NewCoordinator(store, bootID, ownerID)
+	if err := c.StartupReconcile(); err != nil {
+		t.Fatal(err)
+	}
+	return c
 }
 
 func submitPreparedPermitted(t *testing.T, c *Coordinator, workspaceKey, requestID, fp string) ResolveResult {
