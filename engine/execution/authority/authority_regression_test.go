@@ -85,16 +85,16 @@ func (a *InMemoryAuthority) Snapshot(context.Context) (Snapshot, error) {
 	return Snapshot{}, errNotImplemented
 }
 
-type Ready struct {
+type legacyReady struct {
 	bootID string
 }
 
 type Coordinator struct {
 	authority AdmissionAuthority
-	ready     Ready
+	ready     legacyReady
 }
 
-func NewCoordinator(authority AdmissionAuthority, ready Ready) (*Coordinator, error) {
+func NewCoordinator(authority AdmissionAuthority, ready legacyReady) (*Coordinator, error) {
 	if authority == nil {
 		return nil, errors.New("admission authority is required")
 	}
@@ -186,7 +186,7 @@ func TestCoordinatorConstructibleAgainstAuthorityFake(t *testing.T) {
 	var fake AdmissionAuthority = fakeAuthority{}
 	t.Skip("implemented in Commit 3: coordinator accepts AdmissionAuthority")
 
-	coordinator, err := NewCoordinator(fake, Ready{bootID: "boot-1"})
+	coordinator, err := NewCoordinator(fake, legacyReady{bootID: "boot-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
