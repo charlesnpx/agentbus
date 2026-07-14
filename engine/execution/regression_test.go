@@ -53,12 +53,40 @@ func seedGCDeletesReplaced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	terminalizeDirectStoreForExpiry(t, store, res.JobID)
 	if _, err := store.Expire(req.WorkspaceKey, req.RequestID); err != nil {
 		t.Fatal(err)
 	}
 	result, err := store.ResolveOrAccept(req)
 	if !IsCode(err, CodeRequestExpired) || result.JobID != res.JobID {
 		t.Fatalf("replay after gc = (%v,%v), want expired original %s", result, err, res.JobID)
+	}
+}
+
+func terminalizeDirectStoreForExpiry(t *testing.T, store *MemoryAdmissionStore, jobID string) {
+	t.Helper()
+	job, ok := store.GetJob(jobID)
+	if !ok {
+		t.Fatal("job missing")
+	}
+	group := GroupRef{PGID: 10, LeaderPID: 10, HighResStartToken: "direct-expiry"}
+	if _, err := store.RecordSupervisor(jobID, job.AttemptID, job.Epoch, group); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordRetirementStarted(jobID, job.AttemptID, job.Epoch, Evidence{Kind: "control_closed", Detail: "direct expiry"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordRetirementWorkerExited(jobID, job.AttemptID, job.Epoch, Evidence{Kind: "worker_exit", Detail: "direct expiry"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordRetirementGroupEmpty(jobID, job.AttemptID, job.Epoch, Evidence{Kind: "group_empty", Detail: "direct expiry"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordOutcome(jobID, job.AttemptID, job.Epoch, OutcomeCanceled); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PublishTerminal(jobID, job.AttemptID, job.Epoch, OutcomeCanceled, ProofNeverPermittedAndRetired, "canceled_before_permit"); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -172,24 +200,19 @@ func seedStartFailUpdateFailRequestBound(t *testing.T) {
 	store := NewMemoryAdmissionStore()
 	old := newReadyCoordinator(t, store, "boot-old", "owner")
 	res := submitPreparedPermitted(t, old, "ws-seed", "req-start-update", "fp")
+	newBoot := NewCoordinator(store, "boot-new", "owner")
 	injector := &FailureInjector{Target: FailTerminalBeforeCAS}
-	if err := old.LiveSupervisorLossWithInjector(res.JobID, injector); err == nil {
-		t.Fatal("expected terminalization failure after Start failure")
+	if err := newBoot.StartupReconcileWithInjector(injector); err == nil {
+		t.Fatal("expected startup terminalization failure after request-bound start failure")
+	}
+	if !injector.Hit {
+		t.Fatal("startup reconciliation did not hit terminal failpoint")
 	}
 	job, _ := store.GetJob(res.JobID)
 	if job.Terminal() {
 		t.Fatalf("job = %+v, terminalized despite injected terminal commit failure", job)
 	}
-	assertTerminalizedOrFailStopped(t, old, res.JobID)
-	newBoot := NewCoordinator(store, "boot-new", "owner")
-	if err := newBoot.StartupReconcile(); err != nil {
-		t.Fatal(err)
-	}
-	checkCoordinator(t, newBoot)
-	job, _ = store.GetJob(res.JobID)
-	if job.Outcome != OutcomeReaped || job.TerminalProof != ProofContained {
-		t.Fatalf("job = %+v, want startup contained reaped terminal", job)
-	}
+	assertTerminalizedOrFailStopped(t, newBoot, res.JobID)
 }
 
 func seedAcceptanceWithoutAfter(t *testing.T) {

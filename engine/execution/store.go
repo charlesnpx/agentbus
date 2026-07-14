@@ -64,7 +64,7 @@ type AdmissionStore interface {
 	RecordRetirementGroupEmpty(jobID, attemptID string, epoch int64, evidence Evidence) (Aggregate, error)
 	RecordOutcome(jobID, attemptID string, epoch int64, outcome Outcome) (Aggregate, error)
 	BeginResultPublication(jobID, path, digest string, bytes int64) (Aggregate, error)
-	PublishTerminal(jobID, attemptID string, epoch int64, terminal Outcome, proof TerminalProof) (Aggregate, error)
+	PublishTerminal(jobID, attemptID string, epoch int64, terminal Outcome, proof TerminalProof, reason string) (Aggregate, error)
 	Expire(workspaceKey, requestID string) (string, error)
 }
 
@@ -222,6 +222,9 @@ func (s *MemoryAdmissionStore) ResolveOrAccept(req SubmitRequest) (ResolveResult
 			return ResolveResult{}, protocolError(CodePreconditionFailed, aggregate.JobID, "request key was already accepted")
 		}
 		s.acceptedKeys[key] = aggregate.JobID
+	}
+	if err := s.checkDirectBoundary(nil); err != nil {
+		return ResolveResult{}, err
 	}
 	return ResolveResult{Status: ResolveAcceptedNew, Job: aggregate.copy(), JobID: aggregate.JobID}, nil
 }
@@ -481,6 +484,9 @@ func (s *MemoryAdmissionStore) RequestCancel(jobID string) (Aggregate, error) {
 	if job.PermitMaybeSent {
 		job.ContainmentRequired = true
 	}
+	if err := s.checkDirectBoundary(nil); err != nil {
+		return Aggregate{}, err
+	}
 	return job.copy(), nil
 }
 
@@ -691,6 +697,9 @@ func (s *MemoryAdmissionStore) BeginResultPublication(jobID, path, digest string
 	job.UpdatedStep = s.step
 	job.Dispatch = DispatchResultPublishing
 	job.Result = ResultRef{Path: path, Digest: digest, Bytes: bytes}
+	if err := s.checkDirectBoundary(nil); err != nil {
+		return Aggregate{}, err
+	}
 	return job.copy(), nil
 }
 
@@ -704,7 +713,7 @@ func (s *MemoryAdmissionStore) RecordResultTempWritten(path, digest string, byte
 	artifact.Bytes = bytes
 	artifact.TempWritten = true
 	s.resultArtifacts[path] = artifact
-	return nil
+	return s.checkDirectBoundary(nil)
 }
 
 func (s *MemoryAdmissionStore) RecordResultTempSynced(path string) error {
@@ -714,7 +723,7 @@ func (s *MemoryAdmissionStore) RecordResultTempSynced(path string) error {
 	}
 	artifact.TempSynced = true
 	s.resultArtifacts[path] = artifact
-	return nil
+	return s.checkDirectBoundary(nil)
 }
 
 func (s *MemoryAdmissionStore) RecordResultClosed(path string) error {
@@ -724,7 +733,7 @@ func (s *MemoryAdmissionStore) RecordResultClosed(path string) error {
 	}
 	artifact.Closed = true
 	s.resultArtifacts[path] = artifact
-	return nil
+	return s.checkDirectBoundary(nil)
 }
 
 func (s *MemoryAdmissionStore) RecordResultRenamed(path string) error {
@@ -734,7 +743,7 @@ func (s *MemoryAdmissionStore) RecordResultRenamed(path string) error {
 	}
 	artifact.Renamed = true
 	s.resultArtifacts[path] = artifact
-	return nil
+	return s.checkDirectBoundary(nil)
 }
 
 func (s *MemoryAdmissionStore) RecordResultDirSynced(path string) error {
@@ -744,13 +753,16 @@ func (s *MemoryAdmissionStore) RecordResultDirSynced(path string) error {
 	}
 	artifact.DirSynced = true
 	s.resultArtifacts[path] = artifact
-	return nil
+	return s.checkDirectBoundary(nil)
 }
 
-func (s *MemoryAdmissionStore) PublishTerminal(jobID, attemptID string, epoch int64, terminal Outcome, proof TerminalProof) (Aggregate, error) {
+func (s *MemoryAdmissionStore) PublishTerminal(jobID, attemptID string, epoch int64, terminal Outcome, proof TerminalProof, reason string) (Aggregate, error) {
 	job, ok := s.jobs[jobID]
 	if !ok {
 		return Aggregate{}, protocolError(CodeUnknownJob, jobID, "unknown job")
+	}
+	if reason == "" {
+		return Aggregate{}, protocolError(CodePreconditionFailed, jobID, "terminal reason required")
 	}
 	if terminal == OutcomeCompleted || terminal == OutcomeCompletedNoncompliant {
 		artifact, ok := s.resultArtifacts[job.Result.Path]
@@ -777,9 +789,6 @@ func (s *MemoryAdmissionStore) PublishTerminal(jobID, attemptID string, epoch in
 		if proof == ProofNone {
 			return protocolError(CodePreconditionFailed, job.JobID, "terminal proof required")
 		}
-		if !validTerminalProof(job) && proof == job.TerminalProof {
-			return protocolError(CodePreconditionFailed, job.JobID, "terminal proof state is invalid")
-		}
 		if proof == ProofNeverPermittedAndRetired && (!job.Retired || executionUncertain(job)) {
 			return protocolError(CodePreconditionFailed, job.JobID, "never-permitted retired proof is not established")
 		}
@@ -790,6 +799,13 @@ func (s *MemoryAdmissionStore) PublishTerminal(jobID, attemptID string, epoch in
 			return protocolError(CodePreconditionFailed, job.JobID, "contained proof is not established")
 		}
 		job.TerminalProof = proof
+		job.TerminalReason = reason
+		if !validTerminalProof(job) {
+			return protocolError(CodePreconditionFailed, job.JobID, "terminal proof state is invalid")
+		}
+		if !validTerminalOutcomeProofReason(job) {
+			return protocolError(CodePreconditionFailed, job.JobID, "terminal outcome/proof/reason combination is invalid")
+		}
 		job.Decision = DecisionTerminal
 		job.Dispatch = DispatchDone
 		return nil
@@ -801,6 +817,19 @@ func (s *MemoryAdmissionStore) Expire(workspaceKey, requestID string) (string, e
 	binding, ok := s.bindings[key]
 	if !ok {
 		return "", protocolError(CodeUnknownJob, "", "binding not found")
+	}
+	job, ok := s.jobs[binding.JobID]
+	if !ok {
+		return "", protocolError(CodeUnknownJob, binding.JobID, "bound job not found")
+	}
+	if !job.Terminal() {
+		return "", protocolError(CodePreconditionFailed, binding.JobID, "expire requires terminal job")
+	}
+	if !job.Retired {
+		return "", protocolError(CodePreconditionFailed, binding.JobID, "expire requires retired supervisor")
+	}
+	if hasLiveAuthority(job) {
+		return "", protocolError(CodePreconditionFailed, binding.JobID, "expire requires no live authority")
 	}
 	s.mutating = true
 	defer func() { s.mutating = false }()
@@ -816,6 +845,9 @@ func (s *MemoryAdmissionStore) Expire(workspaceKey, requestID string) (string, e
 	}
 	s.tombstones[key] = tombstone
 	s.acceptedKeys[key] = binding.JobID
+	if err := s.checkDirectBoundary(nil); err != nil {
+		return "", err
+	}
 	return binding.JobID, nil
 }
 
@@ -850,6 +882,9 @@ func (s *MemoryAdmissionStore) MarkCorrupt(jobID string, permitMaybe bool, ident
 		job.PendingChild = ChildRef{}
 	}
 	job.UpdatedStep = s.step
+	if err := s.checkDirectBoundary(nil); err != nil {
+		return Aggregate{}, err
+	}
 	return job.copy(), nil
 }
 
@@ -872,6 +907,9 @@ func (s *MemoryAdmissionStore) mutate(jobID, attemptID string, epoch int64, fn f
 	}
 	s.step++
 	job.UpdatedStep = s.step
+	if err := s.checkDirectBoundary(nil); err != nil {
+		return Aggregate{}, err
+	}
 	return job.copy(), nil
 }
 
@@ -879,6 +917,16 @@ func (s *MemoryAdmissionStore) noteModeledSideEffect() {
 	if s.mutating {
 		s.sideEffectInCAS = true
 	}
+}
+
+func (s *MemoryAdmissionStore) checkDirectBoundary(err error) error {
+	if invErr := CheckInvariants(InvariantView{Store: s}); invErr != nil {
+		if err != nil {
+			return fmt.Errorf("%w; invariant boundary: %v", err, invErr)
+		}
+		return invErr
+	}
+	return err
 }
 
 func liveOrdinalCount(live map[int]int) int {

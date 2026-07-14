@@ -1,8 +1,10 @@
 package execution
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIdentifiedLifecycleCompletes(t *testing.T) {
@@ -174,6 +176,56 @@ func TestCancelAfterPermitContainsBeforeTerminal(t *testing.T) {
 	job, _ := c.Store.GetJob(res.JobID)
 	if job.Outcome != OutcomeCanceled || job.TerminalProof != ProofContained || !job.Contained {
 		t.Fatalf("job = %+v, want canceled contained proof", job)
+	}
+}
+
+func TestExpireRejectsNonterminalLiveObligation(t *testing.T) {
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-expire-live", "owner")
+	req := modelRequest("ws-expire-live", "req-expire-live", "fp-expire-live")
+	res, err := c.Submit(req, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Expire(req.WorkspaceKey, req.RequestID, nil); !IsCode(err, CodePreconditionFailed) {
+		t.Fatalf("Expire err = %v, want precondition failure", err)
+	}
+	if _, ok := c.Store.GetJob(res.JobID); !ok {
+		t.Fatal("nonterminal job was deleted by rejected Expire")
+	}
+	if _, ok := c.Obligations()[res.JobID]; !ok {
+		t.Fatal("live obligation was removed by rejected Expire")
+	}
+	checkCoordinator(t, c)
+}
+
+func TestShutdownBlocksUntilOwnedWorkDrained(t *testing.T) {
+	c := newReadyCoordinator(t, NewMemoryAdmissionStore(), "boot-shutdown", "owner")
+	res, err := c.Submit(modelRequest("ws-shutdown", "req-shutdown", "fp-shutdown"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PrepareSupervisor(res.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !c.HasOwnedWork() {
+		t.Fatal("HasOwnedWork returned false for prepared-but-unpermitted obligation")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	if err := c.Shutdown(ctx); err == nil {
+		t.Fatal("Shutdown returned nil while owned work was still live")
+	}
+	if err := c.Cancel(res.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if c.HasOwnedWork() {
+		t.Fatal("HasOwnedWork returned true after terminalization")
+	}
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c.LifecycleState != CoordinatorLifecycleNotReady {
+		t.Fatalf("lifecycle = %s, want not_ready", c.LifecycleState)
 	}
 }
 

@@ -54,6 +54,9 @@ func (d StartupDecision) Fatal() bool {
 
 func DecideStartupAnchor(input AnchorInput) StartupDecision {
 	if !input.DBPresent && !input.AnchorPresent {
+		if input.EverInitialized {
+			return StartupDecision{Action: StartupFatal, Reason: "initialized db and anchor absent"}
+		}
 		return StartupDecision{Action: StartupInitializeFirst, Reason: "db and anchor absent"}
 	}
 	if input.DBPresent && !input.DBValid {
@@ -84,6 +87,12 @@ func DecideStartupAnchor(input AnchorInput) StartupDecision {
 		return StartupDecision{Action: StartupAdvanceAnchor, Reason: "anchor high-water generation lags db"}
 	}
 	return StartupDecision{Action: StartupContinue, Reason: "db and anchor valid"}
+}
+
+func (s *MemoryAdmissionStore) ObserveStartupAnchor(input AnchorInput) StartupDecision {
+	decision := DecideStartupAnchor(input)
+	s.silentRecreated = input.EverInitialized && !input.DBPresent && !input.AnchorPresent
+	return decision
 }
 
 func AdvanceAnchorHighWater(anchor AnchorState, dbGeneration int64) AnchorState {

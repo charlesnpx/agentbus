@@ -30,6 +30,7 @@ func TestResolveReplayTombstoneAndFingerprintOrdering(t *testing.T) {
 		t.Fatalf("conflict err = %v, want request_conflict", err)
 	}
 
+	terminalizeDirectStoreForExpiry(t, store, accepted.JobID)
 	expiredID, err := store.Expire(req.WorkspaceKey, req.RequestID)
 	if err != nil {
 		t.Fatal(err)
@@ -159,6 +160,7 @@ func TestAnchorStartupDecisionTable(t *testing.T) {
 		want StartupAction
 	}{
 		{name: "first initialization", in: AnchorInput{}, want: StartupInitializeFirst},
+		{name: "silent recreation", in: AnchorInput{EverInitialized: true}, want: StartupFatal},
 		{name: "recover interrupted init", in: AnchorInput{DBPresent: true, DBValid: true}, want: StartupRecoverAnchor},
 		{name: "missing db after init", in: AnchorInput{AnchorPresent: true, AnchorValid: true}, want: StartupFatal},
 		{name: "uuid mismatch", in: AnchorInput{DBPresent: true, AnchorPresent: true, DBValid: true, AnchorValid: true, DBUUID: "a", AnchorDBUUID: "b"}, want: StartupFatal},
@@ -175,6 +177,17 @@ func TestAnchorStartupDecisionTable(t *testing.T) {
 				t.Fatalf("action = %s (%s), want %s", got.Action, got.Reason, tt.want)
 			}
 		})
+	}
+}
+
+func TestAnchorObservationDrivesSilentRecreatedInvariant(t *testing.T) {
+	store := NewMemoryAdmissionStore()
+	decision := store.ObserveStartupAnchor(AnchorInput{EverInitialized: true})
+	if decision.Action != StartupFatal {
+		t.Fatalf("action = %s (%s), want fatal", decision.Action, decision.Reason)
+	}
+	if err := CheckInvariants(InvariantView{Store: store}); err == nil {
+		t.Fatal("CheckInvariants accepted silently recreated initialized store")
 	}
 }
 
