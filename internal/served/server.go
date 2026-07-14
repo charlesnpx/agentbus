@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -117,6 +118,7 @@ type Server struct {
 	admissionBootstrapper        *admissionBootstrapper
 	admissionReady               *admissionReady
 	admissionCoordinator         *admissionCoordinator
+	admissionSupervisor          *servedAdmissionSupervisor
 	admissionClose               io.Closer
 	admissionBootstrapperFactory admissionBootstrapperFactory
 
@@ -125,6 +127,7 @@ type Server struct {
 	stores             map[string]*engine.Store
 	storesByKey        map[string]*engine.Store
 	jobStores          map[string]*engine.Store
+	admissionJobs      map[string]struct{}
 	activeJobs         map[string]*activeJob
 	lastActivity       time.Time
 	executablePath     string
@@ -311,6 +314,7 @@ func New(cfg Config) (*Server, error) {
 		stores:              make(map[string]*engine.Store),
 		storesByKey:         make(map[string]*engine.Store),
 		jobStores:           make(map[string]*engine.Store),
+		admissionJobs:       make(map[string]struct{}),
 		activeJobs:          make(map[string]*activeJob),
 		lastActivity:        clock.Now().UTC(),
 	}, nil
@@ -345,14 +349,17 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err := s.captureBinaryIdentity(); err != nil {
 		return err
 	}
-	if err := s.reapKnownStores(); err != nil {
-		return err
-	}
-	if err := s.bootstrapAdmission(ctx); err != nil {
-		return err
-	}
-	if s.admissionClose != nil {
-		defer s.admissionClose.Close()
+	if s.jobsRequestIDEnabled {
+		if err := s.bootstrapAdmission(ctx); err != nil {
+			return err
+		}
+		if s.admissionClose != nil {
+			defer s.admissionClose.Close()
+		}
+	} else {
+		if err := s.reapKnownStores(); err != nil {
+			return err
+		}
 	}
 	listen := s.listen
 	if s.listenerFactory != nil {
@@ -1184,6 +1191,17 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 	if record.Foreground {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: params.JobID, TurnID: params.JobID})}
 	}
+	if s.isAdmissionJob(params.JobID) && s.admissionCoordinator != nil {
+		snapshot, err := s.admissionCoordinator.Snapshot(context.Background(), model.JobID(params.JobID))
+		if err != nil {
+			return requestOutcome{err: admissionProtocolError(err)}
+		}
+		if snapshot.Record.Terminal == nil {
+			if err := s.admissionCoordinator.Cancel(context.Background(), model.JobID(params.JobID), nil); err != nil {
+				return requestOutcome{err: admissionProtocolError(err)}
+			}
+		}
+	}
 	record, err = store.Cancel(params.JobID)
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
@@ -1251,6 +1269,7 @@ type jobRun struct {
 	active                  *activeJob
 	onDone                  func()
 	authoritativeCompletion bool
+	admissionControlled     bool
 }
 
 func (s *Server) runJob(ctx context.Context, run jobRun) {
@@ -1508,6 +1527,11 @@ func (s *Server) finalizeRequestedTerminal(run jobRun) {
 }
 
 func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {
+	if run.admissionControlled {
+		if err := s.completeAdmissionRun(run, state, text); err != nil {
+			return err
+		}
+	}
 	backendSessionID := ""
 	if run.session != nil {
 		backendSessionID = run.session.ID()
@@ -2002,7 +2026,10 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		return err
 	}
-	return os.Chmod(path, mode)
+	if err := os.Chmod(path, mode); err != nil {
+		return err
+	}
+	return syncFileAndParent(path)
 }
 
 func ensureLogFiles(store *engine.Store, jobID string) (engine.LogPaths, error) {

@@ -29,7 +29,7 @@ type admissionBootstrapper = authority.Bootstrapper
 type admissionReady = authority.Ready
 type admissionCoordinator = coordinator.Coordinator
 
-type admissionBootstrapperFactory func(context.Context, *Server) (*admissionBootstrapper, io.Closer, error)
+type admissionBootstrapperFactory func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error)
 
 func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if s.admissionReady != nil && s.admissionCoordinator != nil {
@@ -40,7 +40,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if factory == nil {
 		factory = openAdmissionBootstrapper
 	}
-	bootstrapper, closer, err := factory(ctx, s)
+	bootstrapper, repo, closer, err := factory(ctx, s)
 	if err != nil {
 		return err
 	}
@@ -59,7 +59,14 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := recoverAdmissionBeforeReady(ctx, session); err != nil {
+	supervisor := s.admissionSupervisor
+	if supervisor == nil {
+		supervisor = newServedAdmissionSupervisor(s)
+	}
+	if err := recoverAdmissionBeforeReady(ctx, session, repo, supervisor, boot); err != nil {
+		return err
+	}
+	if err := s.reapKnownStores(); err != nil {
 		return err
 	}
 	ready, err := session.SealReady(ctx)
@@ -71,7 +78,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	coord, err := coordinator.New(adapter, servedDormantSupervisor{}, nil, owner)
+	coord, err := coordinator.New(adapter, supervisor, servedResultPublisher{server: s}, owner)
 	if err != nil {
 		return err
 	}
@@ -79,23 +86,24 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	s.admissionBootstrapper = bootstrapper
 	s.admissionReady = ready
 	s.admissionCoordinator = coord
+	s.admissionSupervisor = supervisor
 	s.admissionClose = closer
 	closeOnErr = false
 	return nil
 }
 
-func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootstrapper, io.Closer, error) {
+func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	repo, err := bboltrepo.NewRepository(filepath.Join(s.stateRoot, admissionRepositoryFile))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	dbUUID, schemaMajor, err := repo.AnchorIdentity()
 	if err != nil {
 		_ = repo.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	anchor := &fileAuthorityAnchor{
 		path:        filepath.Join(s.stateRoot, admissionAnchorFile),
@@ -105,12 +113,12 @@ func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootst
 	bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchor(anchor))
 	if err != nil {
 		_ = repo.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return bootstrapper, repo, nil
+	return bootstrapper, repo, repo, nil
 }
 
-func recoverAdmissionBeforeReady(ctx context.Context, session *authority.RecoverySession) error {
+func recoverAdmissionBeforeReady(ctx context.Context, session *authority.RecoverySession, repo repository.Repository, supervisor coordinator.Supervisor, boot model.BootRef) error {
 	const maxStartupRecoverySteps = 1024
 	for i := 0; i < maxStartupRecoverySteps; i++ {
 		plans, err := session.Plans(ctx)
@@ -121,20 +129,53 @@ func recoverAdmissionBeforeReady(ctx context.Context, session *authority.Recover
 			return nil
 		}
 		progressed := false
-		for _, plan := range plans {
-			switch plan.Next.Kind {
+		jobs, err := admissionStartupRecoveryJobs(ctx, repo, boot)
+		if err != nil {
+			return err
+		}
+		if len(jobs) == 0 {
+			return fmt.Errorf("%w: startup recovery could not identify job for %d plan(s)", authority.ErrRecoveryNeeded, len(plans))
+		}
+		for _, job := range jobs {
+			switch job.plan.Next.Kind {
 			case model.RecoveryFinalizeCertified:
-				if plan.Next.Finalize == nil {
+				if job.plan.Next.Finalize == nil {
 					return fmt.Errorf("%w: startup recovery finalize action missing receipt", authority.ErrRecoveryNeeded)
 				}
-				if err := session.ApplyReceipt(ctx, *plan.Next.Finalize); err != nil {
+				if err := session.ApplyReceipt(ctx, *job.plan.Next.Finalize); err != nil {
 					return err
 				}
 				progressed = true
-			case model.RecoveryRetireThenFinalize, model.RecoveryContainThenFinalize, model.RecoveryFatalUnprovable:
-				return fmt.Errorf("%w: startup recovery action %d requires supervisor reconciliation before Ready", authority.ErrRecoveryNeeded, plan.Next.Kind)
+			case model.RecoveryRetireThenFinalize:
+				prepared, err := admissionPreparedFromRecord(job.record)
+				if err != nil {
+					return err
+				}
+				receipt, err := supervisor.Retire(ctx, prepared)
+				if err != nil {
+					return err
+				}
+				if err := session.ApplyReceipt(ctx, model.CertifyRetirement{Ref: job.record.Attempt.Ref, Receipt: receipt}); err != nil {
+					return err
+				}
+				progressed = true
+			case model.RecoveryContainThenFinalize:
+				prepared, err := admissionPreparedFromRecord(job.record)
+				if err != nil {
+					return err
+				}
+				receipt, err := supervisor.Contain(ctx, prepared)
+				if err != nil {
+					return err
+				}
+				if err := session.ApplyReceipt(ctx, model.CertifyContainment{Ref: job.record.Attempt.Ref, Receipt: receipt}); err != nil {
+					return err
+				}
+				progressed = true
+			case model.RecoveryFatalUnprovable:
+				return fmt.Errorf("%w: startup recovery action %d is fatal for %s", authority.ErrRecoveryNeeded, job.plan.Next.Kind, job.record.JobID)
 			default:
-				return fmt.Errorf("%w: startup recovery action %d is unknown", authority.ErrRecoveryNeeded, plan.Next.Kind)
+				return fmt.Errorf("%w: startup recovery action %d is unknown", authority.ErrRecoveryNeeded, job.plan.Next.Kind)
 			}
 		}
 		if !progressed {
@@ -466,32 +507,6 @@ func admissionCancelBeforeAuthorizationPlan(record model.SafetyRecord) model.Rec
 	return plan
 }
 
-type servedDormantSupervisor struct{}
-
-func (servedDormantSupervisor) Prepare(context.Context, coordinator.LaunchPlan) (coordinator.PreparedSupervisor, error) {
-	return coordinator.PreparedSupervisor{}, errors.New("admission supervisor is not wired")
-}
-
-func (servedDormantSupervisor) SendPermit(context.Context, coordinator.PreparedSupervisor, model.LaunchGrant) error {
-	return errors.New("admission supervisor is not wired")
-}
-
-func (servedDormantSupervisor) ObserveLaunch(context.Context, coordinator.PreparedSupervisor, model.LaunchGrant) (coordinator.LaunchObservation, error) {
-	return coordinator.LaunchObservation{}, errors.New("admission supervisor is not wired")
-}
-
-func (servedDormantSupervisor) VerifyQuiescence(context.Context, coordinator.PreparedSupervisor, model.LaunchConsumed) (model.QuiescenceReceipt, error) {
-	return model.QuiescenceReceipt{}, errors.New("admission supervisor is not wired")
-}
-
-func (servedDormantSupervisor) Contain(context.Context, coordinator.PreparedSupervisor) (model.ContainmentReceipt, error) {
-	return model.ContainmentReceipt{}, errors.New("admission supervisor is not wired")
-}
-
-func (servedDormantSupervisor) Retire(context.Context, coordinator.PreparedSupervisor) (model.RetirementReceipt, error) {
-	return model.RetirementReceipt{}, errors.New("admission supervisor is not wired")
-}
-
 func jobSubmitIdentified(raw json.RawMessage, params protocol.JobSubmitParams) (bool, error) {
 	workspaceKeyPresent, err := jsonFieldPresent(raw, "workspaceKey")
 	if err != nil {
@@ -520,7 +535,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	if !s.jobsRequestIDEnabled {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorCapabilityMissing, "jobs.requestId capability is disabled", protocol.ErrorData{})}
 	}
-	if s.admissionCoordinator == nil {
+	if s.admissionCoordinator == nil || s.admissionReady == nil || s.admissionSupervisor == nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorCapabilityMissing, "admission authority is not ready", protocol.ErrorData{})}
 	}
 
@@ -533,6 +548,53 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 	}
 	taskIdentity, err := model.TaskIdentityFromRawTaskSpec(rawTaskSpec)
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+	}
+
+	replay, err := s.admissionReady.LookupReplay(ctx, requestKey)
+	if err != nil {
+		return requestOutcome{err: admissionProtocolError(err)}
+	}
+	switch replay.State {
+	case authority.ReplayLive:
+		if !replay.Binding.TaskIdentity.Equal(taskIdentity) || replay.Binding.Mode != model.ModeIdentifiedFenced {
+			return requestOutcome{err: admissionProtocolError(authority.ErrReplayConflict)}
+		}
+		return requestOutcome{result: protocol.JobSubmitResult{
+			JobID:        replay.Record.JobID.String(),
+			State:        admissionState(replay.Projection.Public),
+			Deduplicated: true,
+		}}
+	case authority.ReplayExpired:
+		if !replay.Tombstone.TaskIdentity.Equal(taskIdentity) {
+			return requestOutcome{err: admissionProtocolError(authority.ErrReplayConflict)}
+		}
+		return requestOutcome{err: admissionProtocolError(authority.ErrRequestExpired)}
+	}
+
+	if errObj := validateTaskSpecEnvelope(raw); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
+	spec := params.TaskSpec
+	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{})}
+	}
+	timeout, errObj := timeoutFromMillis(spec.TimeoutMs)
+	if errObj != nil {
+		return requestOutcome{err: errObj}
+	}
+	policy, err := s.resolvePolicy(spec.Policy)
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+	}
+	backend, ok := s.backends[spec.Backend]
+	if !ok {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{})}
+	}
+	s.mu.Lock()
+	store, err := s.storeForCWDLocked(spec.CWD)
+	s.mu.Unlock()
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 	}
@@ -555,69 +617,41 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 			Deduplicated: true,
 		}}
 	}
-
-	if errObj := validateTaskSpecEnvelope(raw); errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-	spec := params.TaskSpec
-	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{JobID: jobID})}
-	}
-	timeout, errObj := timeoutFromMillis(spec.TimeoutMs)
-	if errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-	policy, err := s.resolvePolicy(spec.Policy)
-	if err != nil {
+	jobModelID := accepted.Record.JobID
+	if err := s.admissionSupervisor.Register(jobModelID, backend, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout}); err != nil {
+		_ = s.admissionCoordinator.Cancel(context.Background(), jobModelID, nil)
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
 	}
-	backend, ok := s.backends[spec.Backend]
-	if !ok {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{JobID: jobID})}
+	if err := s.admissionCoordinator.PrepareSupervisor(ctx, jobModelID, nil); err != nil {
+		_ = s.admissionCoordinator.Cancel(context.Background(), jobModelID, nil)
+		return requestOutcome{err: admissionProtocolError(err)}
 	}
-
 	s.mu.Lock()
-	store, err := s.storeForCWDLocked(spec.CWD)
-	if err == nil {
-		s.jobStores[jobID] = store
-	}
+	s.jobStores[jobID] = store
 	s.mu.Unlock()
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
-	}
 	if err := s.createQueuedRecord(store, jobID, admissionSessionID, spec.Backend, spec.Tags, policy.policy, policy.contract, false); err != nil {
+		_ = s.admissionCoordinator.Cancel(context.Background(), jobModelID, nil)
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
 	}
-	session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
-	if err != nil {
-		return requestOutcome{err: backendError(err)}
-	}
-	sessionID := admissionSessionID
-	if id := session.ID(); id != "" {
-		sessionID = id
-	}
-	runCtx, cancel := context.WithCancel(ctx)
-	active := &activeJob{jobID: jobID, sessionID: sessionID, session: session, cancel: cancel}
-	s.addActiveJob(active)
+	s.markAdmissionJob(jobID)
 	run := jobRun{
-		jobID:        jobID,
-		sessionID:    sessionID,
-		backend:      spec.Backend,
-		store:        store,
-		session:      session,
-		prompt:       spec.Prompt,
-		write:        spec.Write,
-		policy:       policy.policy,
-		contract:     policy.contract,
-		contractName: policy.name,
-		contractHash: policy.hash,
-		timeout:      timeout,
-		active:       active,
+		jobID:               jobID,
+		sessionID:           admissionSessionID,
+		backend:             spec.Backend,
+		store:               store,
+		prompt:              spec.Prompt,
+		write:               spec.Write,
+		policy:              policy.policy,
+		contract:            policy.contract,
+		contractName:        policy.name,
+		contractHash:        policy.hash,
+		timeout:             timeout,
+		admissionControlled: true,
 	}
 	return requestOutcome{
 		result:       protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
-		after:        func() { go s.runJob(runCtx, run) },
-		onAckFailure: func(error) { s.abortUndeliveredRun(run, engine.StateCanceled) },
+		after:        func() { go s.launchAdmittedJob(ctx, run) },
+		onAckFailure: func(error) { s.abortUndeliveredAdmissionRun(run) },
 	}
 }
 
@@ -633,9 +667,57 @@ func rawTaskSpecFromSubmitParams(raw json.RawMessage) (json.RawMessage, error) {
 	return append(json.RawMessage(nil), taskSpec...), nil
 }
 
+func (s *Server) launchAdmittedJob(ctx context.Context, run jobRun) {
+	if s.admissionCoordinator == nil || s.admissionSupervisor == nil {
+		_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
+		return
+	}
+	jobID := model.JobID(run.jobID)
+	nonce := model.PermitNonce("permit-" + run.jobID + "-1")
+	if err := s.admissionCoordinator.GrantPermit(ctx, jobID, 1, nonce, nil); err != nil {
+		_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
+		return
+	}
+	if err := s.admissionCoordinator.Start(ctx, jobID, nil); err != nil {
+		_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
+		return
+	}
+	session, sessionID, err := s.admissionSupervisor.Started(jobID)
+	if err != nil {
+		_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
+		return
+	}
+	if sessionID != "" {
+		run.sessionID = sessionID
+	}
+	run.session = session
+	runCtx, cancel := context.WithCancel(ctx)
+	active := &activeJob{jobID: run.jobID, sessionID: run.sessionID, session: session, cancel: cancel}
+	run.active = active
+	s.addActiveJob(active)
+	s.admissionSupervisor.AttachActive(jobID, active)
+	s.runJob(runCtx, run)
+}
+
+func (s *Server) abortUndeliveredAdmissionRun(run jobRun) {
+	jobID := model.JobID(run.jobID)
+	if s.admissionCoordinator != nil {
+		_ = s.admissionCoordinator.Cancel(context.Background(), jobID, nil)
+	}
+	if run.store != nil {
+		_, _ = run.store.Cancel(run.jobID)
+	}
+	s.removeActiveJob(run.jobID)
+	if run.onDone != nil {
+		run.onDone()
+	}
+}
+
 func admissionProtocolError(err error) *protocol.ErrorObject {
 	switch {
 	case errors.Is(err, authority.ErrReplayConflict):
+		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
+	case errors.Is(err, authority.ErrRequestExpired):
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, authority.ErrNotReady), errors.Is(err, coordinator.ErrCoordinatorNotReady):
 		return protocol.NewError(protocol.ErrorCapabilityMissing, err.Error(), protocol.ErrorData{})
