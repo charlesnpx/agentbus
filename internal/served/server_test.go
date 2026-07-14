@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -31,6 +33,7 @@ type fakeBackend struct {
 	count           atomic.Int64
 	interrupts      atomic.Int64
 	events          func(prompt string, write bool) []engine.Event
+	startHook       func(engine.SessionOpts)
 	processRef      engine.ProcessRef
 	backendChildPID int
 	resumes         chan resumedSession
@@ -62,8 +65,11 @@ func (b *fakeBackend) Preflight(context.Context) (engine.Health, error) {
 	return engine.Health{Backend: b.name}, nil
 }
 
-func (b *fakeBackend) Start(context.Context, engine.SessionOpts) (engine.Session, error) {
+func (b *fakeBackend) Start(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
 	n := b.count.Add(1)
+	if b.startHook != nil {
+		b.startHook(opts)
+	}
 	return &fakeSession{id: b.name + "-session-" + stringID(n), backend: b}, nil
 }
 
@@ -178,10 +184,13 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	if len(hello.BackendMetadata) != 1 || hello.BackendMetadata[0].Backend != "fake" || hello.BackendMetadata[0].Models == nil || hello.BackendMetadata[0].Efforts == nil {
 		t.Fatalf("hello backend metadata = %+v", hello.BackendMetadata)
 	}
-	for _, capability := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery", "models.reported"} {
+	for _, capability := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery", "models.reported", "jobs.requestId"} {
 		if _, ok := hello.Capabilities[capability]; !ok {
 			t.Fatalf("missing capability %s in %+v", capability, hello.Capabilities)
 		}
+	}
+	if hello.Capabilities["jobs.requestId"] {
+		t.Fatalf("jobs.requestId capability is enabled in hello: %+v", hello.Capabilities)
 	}
 	resp = rpc(t, conn, r, "dup", protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: h.token})
 	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
@@ -197,6 +206,133 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	mismatchReader := bufio.NewReader(mismatch)
 	resp = rpc(t, mismatch, mismatchReader, "1", protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version + 1, Token: h.token})
 	assertRPCCode(t, resp, protocol.ErrorVersionMismatch)
+}
+
+func TestServeBootstrapsAdmissionBeforeListen(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	listenErr := errors.New("listener reached after admission ready")
+	listenCalled := false
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		listenCalled = true
+		if server.admissionBootstrapper == nil || server.admissionReady == nil || server.admissionCoordinator == nil {
+			return nil, socketFileIdentity{}, errors.New("listener called before admission ready")
+		}
+		return nil, socketFileIdentity{}, listenErr
+	}
+
+	err := server.Serve(context.Background())
+	if !errors.Is(err, listenErr) {
+		t.Fatalf("Serve error = %v, want %v", err, listenErr)
+	}
+	if !listenCalled {
+		t.Fatal("listener was not called")
+	}
+}
+
+func TestServeDoesNotListenWhenAdmissionBootstrapFails(t *testing.T) {
+	t.Parallel()
+	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	bootstrapErr := errors.New("admission bootstrap failed")
+	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, io.Closer, error) {
+		return nil, nil, bootstrapErr
+	}
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		return nil, socketFileIdentity{}, errors.New("listener should not be called")
+	}
+
+	err := server.Serve(context.Background())
+	if !errors.Is(err, bootstrapErr) {
+		t.Fatalf("Serve error = %v, want %v", err, bootstrapErr)
+	}
+	if _, err := os.Stat(filepath.Join(root, protocol.SocketName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("socket stat error = %v, want not exist", err)
+	}
+}
+
+func TestJobSubmitRequestIDCapabilityDisabledDoesNotStartBackend(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	h := startTestServer(t, backend, Config{IdleTimeout: -1})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	resp := rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-disabled",
+		RequestID:    "request-disabled",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"},
+	})
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0", got)
+	}
+}
+
+func TestIdentifiedJobSubmitAdmitsBeforeBackendStartAndReplaysBeforeBackendValidation(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	server.jobsRequestIDEnabled = true
+	if err := server.bootstrapAdmission(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if server.admissionClose != nil {
+		t.Cleanup(func() { _ = server.admissionClose.Close() })
+	}
+
+	key, err := model.NewRequestKey("workspace-enabled", "request-enabled")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var startErr error
+	var sawAdmission bool
+	backend.startHook = func(engine.SessionOpts) {
+		replay, err := server.admissionReady.LookupReplay(context.Background(), key)
+		if err != nil {
+			startErr = err
+			return
+		}
+		if replay.State != authority.ReplayLive {
+			startErr = errors.New("request was not live in authority before backend start")
+			return
+		}
+		sawAdmission = true
+	}
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: key.WorkspaceKey.String(),
+		RequestID:    key.RequestID.String(),
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "same"},
+	}
+	raw := mustMarshal(t, params)
+
+	first := server.handleJobSubmit(context.Background(), raw)
+	if first.err != nil {
+		t.Fatalf("first submit error = %+v", first.err)
+	}
+	if first.onAckFailure != nil {
+		first.onAckFailure(errors.New("test did not deliver ack"))
+	}
+	if startErr != nil {
+		t.Fatal(startErr)
+	}
+	if !sawAdmission {
+		t.Fatal("backend started before admission hook observed live request")
+	}
+	server.backends = map[string]engine.Backend{}
+
+	replay := server.handleJobSubmit(context.Background(), raw)
+	if replay.err != nil {
+		t.Fatalf("replay submit error = %+v", replay.err)
+	}
+	result, ok := replay.result.(protocol.JobSubmitResult)
+	if !ok || !result.Deduplicated {
+		t.Fatalf("replay result = %+v, want deduplicated JobSubmitResult", replay.result)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts after replay = %d, want 1", got)
+	}
 }
 
 func TestTurnNotificationsCorrelationPolicyStampAndJobResult(t *testing.T) {

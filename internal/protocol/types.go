@@ -117,6 +117,7 @@ func DefaultCapabilities() map[string]bool {
 		"nativeStructuredOutput.claude": false,
 		"models.discovery":              true,
 		"models.reported":               true,
+		"jobs.requestId":                false,
 	}
 }
 
@@ -228,12 +229,15 @@ type TaskSpec struct {
 }
 
 type JobSubmitParams struct {
-	TaskSpec TaskSpec `json:"taskSpec"`
+	WorkspaceKey string   `json:"workspaceKey,omitempty"`
+	RequestID    string   `json:"requestId,omitempty"`
+	TaskSpec     TaskSpec `json:"taskSpec"`
 }
 
 type JobSubmitResult struct {
-	JobID string          `json:"jobId"`
-	State engine.JobState `json:"state"`
+	JobID        string          `json:"jobId"`
+	State        engine.JobState `json:"state"`
+	Deduplicated bool            `json:"deduplicated,omitempty"`
 }
 
 type JobStatusParams struct {

@@ -1142,7 +1142,7 @@ func safePathForID(dir, id, ext string) (string, error) {
 }
 
 func validateJobID(jobID string) error {
-	if !strings.HasPrefix(jobID, "job_") || len(jobID) <= len("job_") || len(jobID) > 128 {
+	if (!strings.HasPrefix(jobID, "job_") && !strings.HasPrefix(jobID, "job-")) || len(jobID) <= len("job_") || len(jobID) > 128 {
 		return fmt.Errorf("invalid job id %q", jobID)
 	}
 	for _, r := range jobID {

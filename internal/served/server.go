@@ -111,6 +111,14 @@ type Server struct {
 	reapTickInterval       time.Duration
 	reapTickFactory        func(time.Duration) tickerSource
 	afterReapTickHook      func(error)
+	listenerFactory        func() (net.Listener, socketFileIdentity, error)
+	jobsRequestIDEnabled   bool
+
+	admissionBootstrapper        *admissionBootstrapper
+	admissionReady               *admissionReady
+	admissionCoordinator         *admissionCoordinator
+	admissionClose               io.Closer
+	admissionBootstrapperFactory admissionBootstrapperFactory
 
 	mu                 sync.Mutex
 	sessions           map[string]*sessionState
@@ -340,7 +348,17 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err := s.reapKnownStores(); err != nil {
 		return err
 	}
-	ln, socketIdentity, err := s.listen()
+	if err := s.bootstrapAdmission(ctx); err != nil {
+		return err
+	}
+	if s.admissionClose != nil {
+		defer s.admissionClose.Close()
+	}
+	listen := s.listen
+	if s.listenerFactory != nil {
+		listen = s.listenerFactory
+	}
+	ln, socketIdentity, err := listen()
 	if err != nil {
 		return err
 	}
@@ -1014,13 +1032,24 @@ func (s *Server) handleTurnInterrupt(raw json.RawMessage) requestOutcome {
 }
 
 func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) requestOutcome {
-	if errObj := validateTaskSpecEnvelope(raw); errObj != nil {
-		return requestOutcome{err: errObj}
-	}
 	var params protocol.JobSubmitParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
 	}
+	identified, err := jobSubmitIdentified(raw, params)
+	if err != nil {
+		return invalidParams(err)
+	}
+	if identified {
+		return s.handleIdentifiedJobSubmit(ctx, raw, params)
+	}
+	if errObj := validateTaskSpecEnvelope(raw); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
+	return s.handleLegacyJobSubmit(ctx, params)
+}
+
+func (s *Server) handleLegacyJobSubmit(ctx context.Context, params protocol.JobSubmitParams) requestOutcome {
 	spec := params.TaskSpec
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{})}
