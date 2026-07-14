@@ -1,0 +1,192 @@
+package execution
+
+import "testing"
+
+func TestRegressionSeedsAreUnreachableOrTerminalized(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{name: "torn reservation", run: seedTornReservation},
+		{name: "gc deletes replaced", run: seedGCDeletesReplaced},
+		{name: "backend before record", run: seedBackendBeforeRecord},
+		{name: "validation bypass", run: seedValidationBypass},
+		{name: "lock across start", run: seedLockAcrossStart},
+		{name: "replay cancel activate", run: seedReplayCancelActivate},
+		{name: "activation update fail leaves runless queued", run: seedActivationUpdateFail},
+		{name: "start fail queued to starting fail leaves runless queued", run: seedStartFailQueuedStartingFail},
+		{name: "start fail update fail request-bound runless job", run: seedStartFailUpdateFailRequestBound},
+		{name: "acceptance without after unreconstructable queued job", run: seedAcceptanceWithoutAfter},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, tt.run)
+	}
+}
+
+func seedTornReservation(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	injector := &FailureInjector{Target: FailBeforeCommit}
+	if _, err := c.Submit(modelRequest("ws-seed", "req-torn", "fp"), injector); err == nil {
+		t.Fatal("expected injected failure")
+	}
+	checkCoordinator(t, c)
+	if len(c.Store.jobs) != 0 || len(c.Store.bindings) != 0 {
+		t.Fatalf("durable state after torn reservation = jobs %d bindings %d", len(c.Store.jobs), len(c.Store.bindings))
+	}
+	res, err := c.Submit(modelRequest("ws-seed", "req-torn", "fp"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != ResolveAcceptedNew {
+		t.Fatalf("status = %s, want accepted_new", res.Status)
+	}
+}
+
+func seedGCDeletesReplaced(t *testing.T) {
+	store := NewMemoryAdmissionStore()
+	req := modelRequest("ws-seed", "req-gc", "fp")
+	res, err := store.ResolveOrAccept(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Expire(req.WorkspaceKey, req.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.ResolveOrAccept(req)
+	if !IsCode(err, CodeRequestExpired) || result.JobID != res.JobID {
+		t.Fatalf("replay after gc = (%v,%v), want expired original %s", result, err, res.JobID)
+	}
+}
+
+func seedBackendBeforeRecord(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	res := submitPreparedPermitted(t, c, "ws-seed", "req-backend-before-record", "fp")
+	injector := &FailureInjector{Target: FailExecDeathAfterExecBeforeStart}
+	if err := c.Start(res.JobID, injector); err == nil {
+		t.Fatal("expected injected death")
+	}
+	checkCoordinator(t, c)
+	job, _ := c.Store.GetJob(res.JobID)
+	if job.Outcome != OutcomeReaped || job.TerminalProof != ProofContained {
+		t.Fatalf("job = %+v, want contained reaped terminal", job)
+	}
+}
+
+func seedValidationBypass(t *testing.T) {
+	store := NewMemoryAdmissionStore()
+	req := modelRequest("ws-seed", "req-validation", "fp")
+	if _, err := store.ResolveOrAccept(req); err != nil {
+		t.Fatal(err)
+	}
+	replay := req
+	replay.WorkspaceKey = "ws-seed"
+	replay.Fingerprint = CurrentFingerprint("different")
+	replay.LaunchSpec.Task = ""
+	if _, err := store.ResolveOrAccept(replay); !IsCode(err, CodeRequestConflict) {
+		t.Fatalf("err = %v, want conflict before validation/new acceptance", err)
+	}
+	if len(store.jobs) != 1 {
+		t.Fatalf("jobs = %d, want original only", len(store.jobs))
+	}
+}
+
+func seedLockAcrossStart(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	res := submitPreparedPermitted(t, c, "ws-seed", "req-lock-start", "fp")
+	if err := c.Start(res.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if c.Store.sideEffectInCAS {
+		t.Fatalf("modeled side effect happened during a CAS mutation")
+	}
+}
+
+func seedReplayCancelActivate(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	req := modelRequest("ws-seed", "req-replay-cancel", "fp")
+	res, err := c.Submit(req, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PrepareSupervisor(res.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Cancel(res.JobID); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := c.Submit(req, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.JobID != res.JobID {
+		t.Fatalf("replay jobID = %s, want %s", replay.JobID, res.JobID)
+	}
+	job, _ := c.Store.GetJob(res.JobID)
+	if job.ExecutionSideEffects != 0 || job.Outcome != OutcomeCanceled {
+		t.Fatalf("job = %+v, want canceled without activation", job)
+	}
+}
+
+func seedActivationUpdateFail(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	injector := &FailureInjector{Target: FailPostCommitPreRunnable}
+	if _, err := c.Submit(modelRequest("ws-seed", "req-activation-fail", "fp"), injector); err == nil {
+		t.Fatal("expected injected failure")
+	}
+	if !c.FailStopping {
+		t.Fatalf("coordinator did not fail-stop after post-commit pre-runnable failure")
+	}
+	checkCoordinator(t, c)
+}
+
+func seedStartFailQueuedStartingFail(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	res := submitPreparedPermitted(t, c, "ws-seed", "req-start-fail", "fp")
+	injector := &FailureInjector{Target: FailExecDeathAfterStartBeforeCAS}
+	if err := c.Start(res.JobID, injector); err == nil {
+		t.Fatal("expected injected failure")
+	}
+	checkCoordinator(t, c)
+	job, _ := c.Store.GetJob(res.JobID)
+	if !job.Terminal() || job.TerminalProof != ProofContained {
+		t.Fatalf("job = %+v, want contained terminal", job)
+	}
+}
+
+func seedStartFailUpdateFailRequestBound(t *testing.T) {
+	store := NewMemoryAdmissionStore()
+	old := NewCoordinator(store, "boot-old", "owner")
+	res := submitPreparedPermitted(t, old, "ws-seed", "req-start-update", "fp")
+	injector := &FailureInjector{Target: FailAfterCAS}
+	if err := old.Start(res.JobID, injector); err == nil {
+		t.Fatal("expected injected failure after start record")
+	}
+	newBoot := NewCoordinator(store, "boot-new", "owner")
+	if err := newBoot.StartupReconcile(); err != nil {
+		t.Fatal(err)
+	}
+	checkCoordinator(t, newBoot)
+	job, _ := store.GetJob(res.JobID)
+	if job.Outcome != OutcomeReaped || job.TerminalProof != ProofContained {
+		t.Fatalf("job = %+v, want startup contained reaped terminal", job)
+	}
+}
+
+func seedAcceptanceWithoutAfter(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-seed", "owner")
+	req := modelRequest("ws-seed", "req-no-after", "fp")
+	injector := &FailureInjector{Target: FailAfterCommit}
+	res, err := c.Submit(req, injector)
+	if err == nil {
+		t.Fatal("expected injected failure")
+	}
+	checkCoordinator(t, c)
+	replay, err := c.Submit(req, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.JobID != res.JobID {
+		t.Fatalf("replay jobID = %s, want %s", replay.JobID, res.JobID)
+	}
+}
