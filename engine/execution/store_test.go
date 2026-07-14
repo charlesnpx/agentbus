@@ -24,7 +24,8 @@ func TestResolveReplayTombstoneAndFingerprintOrdering(t *testing.T) {
 	}
 
 	conflict := req
-	conflict.Fingerprint = CurrentFingerprint("different")
+	conflict.LaunchSpec.RawTask = "different"
+	conflict.LaunchSpec.Task = "model task different"
 	if _, err := store.ResolveOrAccept(conflict); !IsCode(err, CodeRequestConflict) {
 		t.Fatalf("conflict err = %v, want request_conflict", err)
 	}
@@ -124,7 +125,8 @@ func TestCorruptAggregateHandlingPreservesBinding(t *testing.T) {
 		t.Fatalf("replay = %+v, want quarantined original %s", replay, res.JobID)
 	}
 	conflict := req
-	conflict.Fingerprint = CurrentFingerprint("different")
+	conflict.LaunchSpec.RawTask = "different"
+	conflict.LaunchSpec.Task = "model task different"
 	if _, err := store.ResolveOrAccept(conflict); !IsCode(err, CodeRequestConflict) {
 		t.Fatalf("err = %v, want request_conflict", err)
 	}
@@ -135,7 +137,14 @@ func TestCorruptAggregateHandlingPreservesBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fatalStore.MarkCorrupt(fatalRes.JobID, true, false, "identity missing"); !IsCode(err, CodeCorruptFatal) {
+	fatalJob, _ := fatalStore.GetJob(fatalRes.JobID)
+	if _, err := fatalStore.RecordSupervisor(fatalRes.JobID, fatalJob.AttemptID, fatalJob.Epoch, GroupRef{PGID: 10, LeaderPID: 10, HighResStartToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fatalStore.GrantPermit(fatalRes.JobID, fatalJob.AttemptID, fatalJob.Epoch, 1, "nonce"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fatalStore.MarkCorrupt(fatalRes.JobID, false, false, "identity missing"); !IsCode(err, CodeCorruptFatal) {
 		t.Fatalf("err = %v, want corrupt_fatal", err)
 	}
 	if !fatalStore.fatal {
@@ -154,8 +163,9 @@ func TestAnchorStartupDecisionTable(t *testing.T) {
 		{name: "missing db after init", in: AnchorInput{AnchorPresent: true, AnchorValid: true}, want: StartupFatal},
 		{name: "uuid mismatch", in: AnchorInput{DBPresent: true, AnchorPresent: true, DBValid: true, AnchorValid: true, DBUUID: "a", AnchorDBUUID: "b"}, want: StartupFatal},
 		{name: "db rollback", in: AnchorInput{DBPresent: true, AnchorPresent: true, DBValid: true, AnchorValid: true, DBUUID: "a", AnchorDBUUID: "a", DBGeneration: 1, HighWaterGeneration: 2}, want: StartupFatal},
-		{name: "advance lagging anchor", in: AnchorInput{DBPresent: true, AnchorPresent: true, DBValid: true, AnchorValid: true, DBUUID: "a", AnchorDBUUID: "a", DBGeneration: 3, HighWaterGeneration: 2}, want: StartupAdvanceAnchor},
-		{name: "continue", in: AnchorInput{DBPresent: true, AnchorPresent: true, DBValid: true, AnchorValid: true, DBUUID: "a", AnchorDBUUID: "a", DBGeneration: 2, HighWaterGeneration: 2}, want: StartupContinue},
+		{name: "schema mismatch", in: AnchorInput{DBPresent: true, AnchorPresent: true, DBValid: true, AnchorValid: true, DBUUID: "a", AnchorDBUUID: "a", DBSchemaMajor: 1, AnchorSchemaMajor: 2, EverInitialized: true}, want: StartupFatal},
+		{name: "advance lagging anchor", in: AnchorInput{DBPresent: true, AnchorPresent: true, DBValid: true, AnchorValid: true, DBUUID: "a", AnchorDBUUID: "a", DBSchemaMajor: 1, AnchorSchemaMajor: 1, EverInitialized: true, DBGeneration: 3, HighWaterGeneration: 2}, want: StartupAdvanceAnchor},
+		{name: "continue", in: AnchorInput{DBPresent: true, AnchorPresent: true, DBValid: true, AnchorValid: true, DBUUID: "a", AnchorDBUUID: "a", DBSchemaMajor: 1, AnchorSchemaMajor: 1, EverInitialized: true, DBGeneration: 2, HighWaterGeneration: 2}, want: StartupContinue},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -169,6 +179,10 @@ func TestAnchorStartupDecisionTable(t *testing.T) {
 }
 
 func modelRequest(workspaceKey, requestID, fp string) SubmitRequest {
+	sessionID := "session-" + requestID
+	if requestID == "" {
+		sessionID = "session-" + workspaceKey
+	}
 	return SubmitRequest{
 		Mode:         ModeIdentifiedFenced,
 		WorkspaceKey: workspaceKey,
@@ -178,8 +192,11 @@ func modelRequest(workspaceKey, requestID, fp string) SubmitRequest {
 			WorkspaceKey: workspaceKey,
 			RequestID:    requestID,
 			Backend:      "codex",
-			Task:         "model task",
+			SessionID:    sessionID,
+			CWD:          "/workspaces/" + workspaceKey,
+			Task:         "model task " + fp,
+			RawTask:      fp,
 		},
-		SessionID: "session-" + requestID,
+		SessionID: sessionID,
 	}
 }

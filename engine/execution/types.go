@@ -1,8 +1,11 @@
 package execution
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -136,9 +139,11 @@ const (
 type PermitState string
 
 const (
-	PermitNone     PermitState = "none"
-	PermitGranted  PermitState = "granted"
-	PermitCanceled PermitState = "canceled"
+	PermitNone      PermitState = "none"
+	PermitGranted   PermitState = "granted"
+	PermitMaybeSent PermitState = "maybe_sent"
+	PermitConsumed  PermitState = "consumed"
+	PermitCanceled  PermitState = "canceled"
 )
 
 type Fingerprint struct {
@@ -146,6 +151,13 @@ type Fingerprint struct {
 	Version   int
 	Value     string
 }
+
+const (
+	FingerprintAlgorithmSHA256 = "sha256"
+	FingerprintVersionV1       = 1
+	FingerprintVersionV2       = 2
+	CurrentFingerprintVersion  = FingerprintVersionV2
+)
 
 func (f Fingerprint) normalized() Fingerprint {
 	if f.Algorithm == "" && f.Version == 0 && f.Value == "" {
@@ -162,27 +174,48 @@ func (f Fingerprint) Equal(other Fingerprint) bool {
 
 func (f Fingerprint) supported() bool {
 	f = f.normalized()
-	return f.Algorithm == "sha256" && f.Version == 1
+	return fingerprintSupported(f.Algorithm, f.Version)
 }
 
-func CurrentFingerprint(value string) Fingerprint {
-	return Fingerprint{Algorithm: "sha256", Version: 1, Value: value}
+func CurrentFingerprint(rawTask string) Fingerprint {
+	fp, err := FingerprintTask(FingerprintAlgorithmSHA256, CurrentFingerprintVersion, rawTask)
+	if err != nil {
+		return Fingerprint{Algorithm: FingerprintAlgorithmSHA256, Version: CurrentFingerprintVersion, Value: "unsupported"}
+	}
+	return fp
+}
+
+func FingerprintTask(algorithm string, version int, rawTask string) (Fingerprint, error) {
+	if !fingerprintSupported(algorithm, version) {
+		return Fingerprint{}, protocolError(CodeRequestFingerprintUnsupported, "", "fingerprint algorithm/version is unsupported")
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s/v%d\x00%s", algorithm, version, rawTask)))
+	return Fingerprint{Algorithm: algorithm, Version: version, Value: hex.EncodeToString(sum[:])}, nil
+}
+
+func fingerprintSupported(algorithm string, version int) bool {
+	return algorithm == FingerprintAlgorithmSHA256 && (version == FingerprintVersionV1 || version == FingerprintVersionV2)
 }
 
 type LaunchSpec struct {
-	WorkspaceKey string
-	RequestID    string
-	Backend      string
-	SessionID    string
-	Task         string
-	Fingerprint  Fingerprint
+	WorkspaceKey        string
+	RequestID           string
+	Backend             string
+	SessionID           string
+	CWD                 string
+	DerivedWorkspaceKey string
+	Task                string
+	RawTask             string
+	Fingerprint         Fingerprint
 }
 
 type CoordinatorObligation struct {
-	JobID      string
-	LaunchSpec LaunchSpec
-	Mode       Mode
-	Committed  bool
+	JobID              string
+	LaunchSpec         LaunchSpec
+	Mode               Mode
+	Committed          bool
+	PreparedSupervisor *GroupRef
+	Retired            bool
 }
 
 type GroupRef struct {
@@ -211,50 +244,81 @@ type Evidence struct {
 	Detail string
 }
 
+func (e Evidence) Present() bool {
+	return e.Kind != "" || e.Detail != ""
+}
+
+type LaunchQuiescenceEvidence struct {
+	ChildExited Evidence
+	GroupEmpty  Evidence
+}
+
 type ResultRef struct {
 	Path   string
 	Digest string
 	Bytes  int64
 }
 
+type ResultArtifact struct {
+	Path        string
+	Digest      string
+	Bytes       int64
+	TempWritten bool
+	TempSynced  bool
+	Closed      bool
+	Renamed     bool
+	DirSynced   bool
+}
+
 type Aggregate struct {
-	JobID                string
-	WorkspaceKey         string
-	RequestID            string
-	Fingerprint          Fingerprint
-	Mode                 Mode
-	LaunchSpec           LaunchSpec
-	BootID               string
-	OwnerID              string
-	AttemptID            string
-	Epoch                int64
-	Decision             Decision
-	Dispatch             Dispatch
-	Outcome              Outcome
-	Acknowledged         bool
-	PermitState          PermitState
-	PermitNonce          string
-	PermitMaybeSent      bool
-	ContainmentRequired  bool
-	LaunchOrdinal        int
-	ActiveOrdinal        int
-	LaunchQuiescent      map[int]bool
-	Supervisor           GroupRef
-	Child                ChildRef
-	TerminalProof        TerminalProof
-	TerminalReason       string
-	Retired              bool
-	Contained            bool
-	Containment          Evidence
-	Result               ResultRef
-	SessionID            string
-	CreatedStep          int64
-	UpdatedStep          int64
-	ExecutionSideEffects int
-	LossObserved         bool
-	Corrupt              bool
-	QuarantineDiagnostic string
-	StartupReconciled    bool
+	JobID                   string
+	WorkspaceKey            string
+	RequestID               string
+	Fingerprint             Fingerprint
+	Mode                    Mode
+	LaunchSpec              LaunchSpec
+	BootID                  string
+	OwnerID                 string
+	AttemptID               string
+	Epoch                   int64
+	Decision                Decision
+	Dispatch                Dispatch
+	Outcome                 Outcome
+	Acknowledged            bool
+	PermitState             PermitState
+	PermitNonce             string
+	PermitMaybeSent         bool
+	ContainmentRequired     bool
+	LaunchOrdinal           int
+	ActiveOrdinal           int
+	LaunchQuiescent         map[int]bool
+	LaunchEvidence          map[int]LaunchQuiescenceEvidence
+	LiveOrdinals            map[int]int
+	Supervisor              GroupRef
+	Child                   ChildRef
+	PendingChild            ChildRef
+	TerminalProof           TerminalProof
+	TerminalReason          string
+	Retired                 bool
+	RetirementStarted       bool
+	RetirementControlClosed bool
+	RetirementWorkerExited  bool
+	RetirementGroupEmpty    bool
+	RetirementEvidence      Evidence
+	Contained               bool
+	ContainmentSignaled     bool
+	ContainmentVerified     bool
+	Containment             Evidence
+	Result                  ResultRef
+	SessionID               string
+	CreatedStep             int64
+	UpdatedStep             int64
+	ExecutionSideEffects    int
+	LossObserved            bool
+	Corrupt                 bool
+	QuarantineDiagnostic    string
+	StartupReconciled       bool
+	StartPhase              string
 }
 
 func (a Aggregate) Terminal() bool {
@@ -269,10 +333,18 @@ func (a *Aggregate) ensureMaps() {
 	if a.LaunchQuiescent == nil {
 		a.LaunchQuiescent = map[int]bool{}
 	}
+	if a.LaunchEvidence == nil {
+		a.LaunchEvidence = map[int]LaunchQuiescenceEvidence{}
+	}
+	if a.LiveOrdinals == nil {
+		a.LiveOrdinals = map[int]int{}
+	}
 }
 
 func (a Aggregate) copy() Aggregate {
 	a.LaunchQuiescent = copyBoolMap(a.LaunchQuiescent)
+	a.LaunchEvidence = copyLaunchEvidenceMap(a.LaunchEvidence)
+	a.LiveOrdinals = copyIntMap(a.LiveOrdinals)
 	a.Supervisor.KnownChildRefs = append([]ChildRef(nil), a.Supervisor.KnownChildRefs...)
 	return a
 }
@@ -282,6 +354,28 @@ func copyBoolMap(in map[int]bool) map[int]bool {
 		return map[int]bool{}
 	}
 	out := make(map[int]bool, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func copyLaunchEvidenceMap(in map[int]LaunchQuiescenceEvidence) map[int]LaunchQuiescenceEvidence {
+	if len(in) == 0 {
+		return map[int]LaunchQuiescenceEvidence{}
+	}
+	out := make(map[int]LaunchQuiescenceEvidence, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func copyIntMap(in map[int]int) map[int]int {
+	if len(in) == 0 {
+		return map[int]int{}
+	}
+	out := make(map[int]int, len(in))
 	for k, v := range in {
 		out[k] = v
 	}
@@ -362,4 +456,94 @@ func validateWorkspaceRequest(workspaceKey, requestID string, requireRequest boo
 		return protocolError(CodeRejected, "", "invalid requestId")
 	}
 	return nil
+}
+
+func materializeLaunchSpec(req SubmitRequest, fingerprint Fingerprint) (LaunchSpec, error) {
+	spec := req.LaunchSpec
+	spec.WorkspaceKey = req.WorkspaceKey
+	spec.RequestID = req.RequestID
+	if spec.SessionID == "" {
+		spec.SessionID = req.SessionID
+	}
+	if spec.RawTask == "" {
+		spec.RawTask = spec.Task
+	}
+	if spec.CWD != "" {
+		derived, err := DeriveWorkspaceKey(spec.CWD)
+		if err != nil {
+			return LaunchSpec{}, err
+		}
+		spec.DerivedWorkspaceKey = derived
+	}
+	spec.Fingerprint = fingerprint
+	return spec, validateLaunchSpec(spec, req.Mode)
+}
+
+func validateLaunchSpec(spec LaunchSpec, mode Mode) error {
+	if spec.WorkspaceKey == "" || strings.ContainsRune(spec.WorkspaceKey, '\x00') {
+		return protocolError(CodeRejected, "", "invalid launch workspaceKey")
+	}
+	if spec.RequestID != "" && strings.ContainsRune(spec.RequestID, '\x00') {
+		return protocolError(CodeRejected, "", "invalid launch requestId")
+	}
+	if strings.TrimSpace(spec.Task) == "" {
+		return protocolError(CodeRejected, "", "empty launch task")
+	}
+	if spec.RawTask == "" {
+		return protocolError(CodeRejected, "", "empty raw task payload")
+	}
+	if strings.TrimSpace(spec.Backend) == "" {
+		return protocolError(CodeRejected, "", "empty backend")
+	}
+	if mode != ModeLegacyUnfenced && !backendSupportsFenced(spec.Backend) {
+		return protocolError(CodeRejected, "", "backend does not support fenced execution")
+	}
+	if strings.TrimSpace(spec.SessionID) == "" {
+		return protocolError(CodeRejected, "", "missing session data")
+	}
+	derived, err := DeriveWorkspaceKey(spec.CWD)
+	if err != nil {
+		return err
+	}
+	if spec.DerivedWorkspaceKey != "" && spec.DerivedWorkspaceKey != derived {
+		return protocolError(CodeRejected, "", "launch spec derived workspaceKey mismatch")
+	}
+	if derived != spec.WorkspaceKey {
+		return protocolError(CodeRejected, "", "supplied workspaceKey does not match canonical cwd")
+	}
+	if !spec.Fingerprint.supported() {
+		return protocolError(CodeRequestFingerprintUnsupported, "", "launch fingerprint is unsupported")
+	}
+	return nil
+}
+
+func requestRawTask(req SubmitRequest) string {
+	if req.LaunchSpec.RawTask != "" {
+		return req.LaunchSpec.RawTask
+	}
+	return req.LaunchSpec.Task
+}
+
+func DeriveWorkspaceKey(cwd string) (string, error) {
+	if strings.TrimSpace(cwd) == "" {
+		return "", protocolError(CodeRejected, "", "missing cwd")
+	}
+	clean := filepath.Clean(cwd)
+	if !filepath.IsAbs(clean) {
+		return "", protocolError(CodeRejected, "", "cwd is not canonical absolute path")
+	}
+	base := filepath.Base(clean)
+	if base == "." || base == string(filepath.Separator) || base == "" {
+		return "", protocolError(CodeRejected, "", "cwd cannot derive workspaceKey")
+	}
+	return base, nil
+}
+
+func backendSupportsFenced(backend string) bool {
+	switch backend {
+	case "codex", "claude":
+		return true
+	default:
+		return false
+	}
 }

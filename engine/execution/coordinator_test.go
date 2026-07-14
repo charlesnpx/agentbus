@@ -91,6 +91,9 @@ func TestCorrectiveLaunchOrdinalRequiresQuiescence(t *testing.T) {
 		t.Fatal(err)
 	}
 	job, _ := c.Store.GetJob(res.JobID)
+	if _, err := c.Store.RecordLaunchExitEvidence(res.JobID, job.AttemptID, job.Epoch, 1, Evidence{Kind: "child_exit", Detail: "test"}, Evidence{Kind: "group_empty", Detail: "test"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := c.Store.RecordLaunchQuiescent(res.JobID, job.AttemptID, job.Epoch, 1); err != nil {
 		t.Fatal(err)
 	}
