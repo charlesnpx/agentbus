@@ -1,14 +1,12 @@
 package model
 
 import (
-	"errors"
+	"encoding/json"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
-
-var errNotImplemented = errors.New("task spec identity skeleton: implemented in a later commit")
 
 type TaskSpecIdentity struct {
 	Algorithm string
@@ -19,8 +17,16 @@ func (i TaskSpecIdentity) Equal(other TaskSpecIdentity) bool {
 	return i.Algorithm == other.Algorithm && i.Value == other.Value
 }
 
-func CanonicalTaskSpecIdentity(protocol.TaskSpec) (TaskSpecIdentity, error) {
-	return TaskSpecIdentity{}, errNotImplemented
+func CanonicalTaskSpecIdentity(spec protocol.TaskSpec) (TaskSpecIdentity, error) {
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		return TaskSpecIdentity{}, err
+	}
+	identity, err := TaskIdentityFromRawTaskSpec(raw)
+	if err != nil {
+		return TaskSpecIdentity{}, err
+	}
+	return TaskSpecIdentity{Algorithm: identity.Algorithm, Value: identity.Value}, nil
 }
 
 func TestEveryActualTaskSpecFieldAffectsIdentity(t *testing.T) {
@@ -42,8 +48,6 @@ func TestEveryActualTaskSpecFieldAffectsIdentity(t *testing.T) {
 		Tags:      map[string]string{"suite": "architecture"},
 		TimeoutMs: &timeout,
 	}
-
-	t.Skip("implemented in Commit 2: canonical whole-taskSpec identity")
 
 	baseID, err := CanonicalTaskSpecIdentity(base)
 	if err != nil {
