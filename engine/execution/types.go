@@ -209,6 +209,13 @@ type LaunchSpec struct {
 	Fingerprint         Fingerprint
 }
 
+type CoordinatorLifecycleState string
+
+const (
+	CoordinatorLifecycleRunning     CoordinatorLifecycleState = "running"
+	CoordinatorLifecycleFailStopped CoordinatorLifecycleState = "fail_stopped"
+)
+
 type ObligationState string
 
 const (
@@ -224,7 +231,18 @@ type CoordinatorObligation struct {
 	State              ObligationState
 	Committed          bool
 	PreparedSupervisor *GroupRef
+	PreparedRetirement PreparedSupervisorRetirement
 	Retired            bool
+}
+
+type PreparedSupervisorRetirement struct {
+	ControlClosed Evidence
+	WorkerExited  Evidence
+	GroupEmpty    Evidence
+}
+
+func (r PreparedSupervisorRetirement) Verified() bool {
+	return r.ControlClosed.Present() && r.WorkerExited.Present() && r.GroupEmpty.Present()
 }
 
 func (o CoordinatorObligation) state() ObligationState {

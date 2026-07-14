@@ -3,16 +3,19 @@ package execution
 import "fmt"
 
 type Coordinator struct {
-	Store            *MemoryAdmissionStore
-	BootID           string
-	OwnerID          string
-	FailStopping     bool
-	allowPreRunnable bool
-	obligations      map[string]CoordinatorObligation
-	legacyUnfenced   map[string]LegacyUnfencedRun
-	nextAttempt      int
-	nextProcess      int
-	nextLegacyRunID  int
+	Store                           *MemoryAdmissionStore
+	BootID                          string
+	OwnerID                         string
+	FailStopping                    bool
+	LifecycleState                  CoordinatorLifecycleState
+	allowPreRunnable                bool
+	allowCurrentBootOrphanReconcile bool
+	obligations                     map[string]CoordinatorObligation
+	preparedRetirements             map[string]PreparedSupervisorRetirement
+	legacyUnfenced                  map[string]LegacyUnfencedRun
+	nextAttempt                     int
+	nextProcess                     int
+	nextLegacyRunID                 int
 }
 
 type LegacyUnfencedRun struct {
@@ -34,14 +37,16 @@ func NewCoordinator(store *MemoryAdmissionStore, bootID, ownerID string) *Coordi
 		ownerID = "owner-1"
 	}
 	return &Coordinator{
-		Store:           store,
-		BootID:          bootID,
-		OwnerID:         ownerID,
-		obligations:     map[string]CoordinatorObligation{},
-		legacyUnfenced:  map[string]LegacyUnfencedRun{},
-		nextAttempt:     1,
-		nextProcess:     100,
-		nextLegacyRunID: 1,
+		Store:               store,
+		BootID:              bootID,
+		OwnerID:             ownerID,
+		LifecycleState:      CoordinatorLifecycleRunning,
+		obligations:         map[string]CoordinatorObligation{},
+		preparedRetirements: map[string]PreparedSupervisorRetirement{},
+		legacyUnfenced:      map[string]LegacyUnfencedRun{},
+		nextAttempt:         1,
+		nextProcess:         100,
+		nextLegacyRunID:     1,
 	}
 }
 
@@ -55,20 +60,27 @@ func (c *Coordinator) Obligations() map[string]CoordinatorObligation {
 
 func (c *Coordinator) Check() error {
 	return CheckInvariants(InvariantView{
-		Store:            c.Store,
-		Obligations:      c.Obligations(),
-		FailStopping:     c.FailStopping,
-		CurrentBootID:    c.BootID,
-		AllowPreRunnable: c.allowPreRunnable,
+		Store:                           c.Store,
+		Obligations:                     c.Obligations(),
+		FailStopping:                    c.FailStopping,
+		CurrentBootID:                   c.BootID,
+		AllowPreRunnable:                c.allowPreRunnable,
+		AllowCurrentBootOrphanReconcile: c.allowCurrentBootOrphanReconcile,
 	})
 }
 
 func (c *Coordinator) Submit(req SubmitRequest, injector *FailureInjector) (ResolveResult, error) {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return ResolveResult{}, err
+	}
 	if req.Mode == "" {
 		req.Mode = ModeIdentifiedFenced
 	}
 	if req.Mode == ModeLegacyUnfenced {
 		return ResolveResult{}, protocolError(CodeLegacyUnfenced, "", "legacy unfenced path uses SubmitLegacyUnfenced")
+	}
+	if err := c.requireLegacyFencedPrepared(req); err != nil {
+		return ResolveResult{}, c.checkBoundary(err)
 	}
 	if req.Mode == ModeIdentifiedFenced {
 		if existing, ok, err := c.Store.ResolveExisting(req); err != nil {
@@ -93,7 +105,10 @@ func (c *Coordinator) Submit(req SubmitRequest, injector *FailureInjector) (Reso
 	spec, err := materializeLaunchSpec(req, req.Fingerprint)
 	if err != nil {
 		if req.PreparedSupervisor != nil {
-			c.retirePendingPrepared(req.JobID)
+			if retireErr := c.retirePendingPrepared(req.JobID, injector); retireErr != nil {
+				c.beginFailStop()
+				return ResolveResult{}, c.checkBoundary(fmt.Errorf("%w; prepared supervisor retirement: %v", err, retireErr))
+			}
 		}
 		return ResolveResult{}, c.checkBoundary(err)
 	}
@@ -107,23 +122,29 @@ func (c *Coordinator) Submit(req SubmitRequest, injector *FailureInjector) (Reso
 		PreparedSupervisor: req.PreparedSupervisor,
 	}
 	if err := c.inject(injector, FailAdmissionBeforeCommit); err != nil {
-		c.retirePendingPrepared(req.JobID)
+		if retireErr := c.retirePendingPrepared(req.JobID, injector); retireErr != nil {
+			c.beginFailStop()
+			return ResolveResult{}, c.checkBoundary(retireErr)
+		}
 		delete(c.obligations, req.JobID)
 		return ResolveResult{}, err
 	}
 	result, err := c.Store.ResolveOrAccept(req)
 	if err != nil {
-		c.retirePendingPrepared(req.JobID)
+		if retireErr := c.retirePendingPrepared(req.JobID, injector); retireErr != nil {
+			c.beginFailStop()
+			return ResolveResult{}, c.checkBoundary(fmt.Errorf("%w; prepared supervisor retirement: %v", err, retireErr))
+		}
 		delete(c.obligations, req.JobID)
 		return ResolveResult{}, c.checkBoundary(err)
 	}
 	c.setObligationState(req.JobID, ObligationCommitted)
 	if err := c.injectPreRunnable(injector, FailPostCommitPreRunnable); err != nil {
-		c.FailStopping = true
+		c.beginFailStop()
 		return result, c.checkBoundary(err)
 	}
 	if err := c.injectPreRunnable(injector, FailAdmissionAfterCommit); err != nil {
-		c.FailStopping = true
+		c.beginFailStop()
 		return result, c.checkBoundary(err)
 	}
 	c.setObligationState(req.JobID, ObligationRunnable)
@@ -131,6 +152,9 @@ func (c *Coordinator) Submit(req SubmitRequest, injector *FailureInjector) (Reso
 }
 
 func (c *Coordinator) SubmitLegacyFenced(req SubmitRequest, injector *FailureInjector) (ResolveResult, error) {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return ResolveResult{}, err
+	}
 	req.Mode = ModeLegacyFenced
 	if req.JobID == "" {
 		req.JobID = c.Store.AllocateJobID()
@@ -160,7 +184,10 @@ func (c *Coordinator) SubmitLegacyFenced(req SubmitRequest, injector *FailureInj
 	obligation.PreparedSupervisor = &group
 	c.obligations[req.JobID] = obligation
 	if err := c.inject(injector, FailRetirementCloseAfter); err != nil {
-		c.retirePendingPrepared(req.JobID)
+		if retireErr := c.retirePendingPrepared(req.JobID, injector); retireErr != nil {
+			c.beginFailStop()
+			return ResolveResult{}, c.checkBoundary(retireErr)
+		}
 		delete(c.obligations, req.JobID)
 		return ResolveResult{}, err
 	}
@@ -169,6 +196,9 @@ func (c *Coordinator) SubmitLegacyFenced(req SubmitRequest, injector *FailureInj
 }
 
 func (c *Coordinator) SubmitLegacyUnfenced(req SubmitRequest, responseDelivered bool, injector *FailureInjector) (LegacyUnfencedRun, error) {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return LegacyUnfencedRun{}, err
+	}
 	req.Mode = ModeLegacyUnfenced
 	run := LegacyUnfencedRun{
 		RunID:        fmt.Sprintf("legacy-unfenced-%d", c.nextLegacyRunID),
@@ -198,6 +228,9 @@ func (c *Coordinator) Acknowledge(jobID string) error {
 }
 
 func (c *Coordinator) AcknowledgeWithInjector(jobID string, injector *FailureInjector) error {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return err
+	}
 	job, ok := c.Store.GetJob(jobID)
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
@@ -213,6 +246,9 @@ func (c *Coordinator) RejectUnacknowledged(jobID string) error {
 }
 
 func (c *Coordinator) RejectUnacknowledgedWithInjector(jobID string, injector *FailureInjector) error {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return err
+	}
 	job, ok := c.Store.GetJob(jobID)
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
@@ -231,6 +267,9 @@ func (c *Coordinator) RejectUnacknowledgedWithInjector(jobID string, injector *F
 }
 
 func (c *Coordinator) PrepareSupervisor(jobID string, injector *FailureInjector) error {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return err
+	}
 	job, ok := c.Store.GetJob(jobID)
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
@@ -244,7 +283,7 @@ func (c *Coordinator) PrepareSupervisor(jobID string, injector *FailureInjector)
 	c.Store.noteModeledSideEffect()
 	group := c.nextGroupRef()
 	if err := c.inject(injector, FailRetirementCloseAfter); err != nil {
-		c.FailStopping = true
+		c.beginFailStop()
 		return c.checkBoundary(err)
 	}
 	err := c.StoreOp(FailSupervisorRecordAfterCAS, injector, func() error {
@@ -255,6 +294,9 @@ func (c *Coordinator) PrepareSupervisor(jobID string, injector *FailureInjector)
 }
 
 func (c *Coordinator) GrantPermit(jobID string, launchOrdinal int, nonce string, injector *FailureInjector) error {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return err
+	}
 	job, ok := c.Store.GetJob(jobID)
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
@@ -279,13 +321,16 @@ func (c *Coordinator) GrantPermit(jobID string, launchOrdinal int, nonce string,
 }
 
 func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return err
+	}
 	job, ok := c.Store.GetJob(jobID)
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
 	}
 	if err := c.inject(injector, FailExecDeathBeforeFork); err != nil {
 		if recErr := c.LiveSupervisorLossWithInjector(jobID, nil); recErr != nil {
-			c.FailStopping = true
+			c.beginFailStop()
 			return c.checkBoundary(recErr)
 		}
 		return c.checkBoundary(err)
@@ -298,7 +343,7 @@ func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
 	}
 	if err := c.inject(injector, FailExecDeathAfterForkBeforeExec); err != nil {
 		if recErr := c.LiveSupervisorLossWithInjector(jobID, nil); recErr != nil {
-			c.FailStopping = true
+			c.beginFailStop()
 			return c.checkBoundary(recErr)
 		}
 		return c.checkBoundary(err)
@@ -311,7 +356,7 @@ func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
 	}
 	if err := c.inject(injector, FailExecDeathAfterExecBeforeStart); err != nil {
 		if recErr := c.LiveSupervisorLossWithInjector(jobID, nil); recErr != nil {
-			c.FailStopping = true
+			c.beginFailStop()
 			return c.checkBoundary(recErr)
 		}
 		return c.checkBoundary(err)
@@ -326,7 +371,7 @@ func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
 	}
 	if err := c.inject(injector, FailExecDeathAfterStartBeforeCAS); err != nil {
 		if recErr := c.LiveSupervisorLossWithInjector(jobID, nil); recErr != nil {
-			c.FailStopping = true
+			c.beginFailStop()
 			return c.checkBoundary(recErr)
 		}
 		return c.checkBoundary(err)
@@ -342,6 +387,9 @@ func (c *Coordinator) Complete(jobID string, outcome Outcome) error {
 }
 
 func (c *Coordinator) CompleteWithInjector(jobID string, outcome Outcome, injector *FailureInjector) error {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return err
+	}
 	job, ok := c.Store.GetJob(jobID)
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
@@ -394,6 +442,9 @@ func (c *Coordinator) Cancel(jobID string) error {
 }
 
 func (c *Coordinator) CancelWithInjector(jobID string, injector *FailureInjector) error {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return err
+	}
 	job, ok := c.Store.GetJob(jobID)
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
@@ -433,6 +484,9 @@ func (c *Coordinator) LiveSupervisorLoss(jobID string) error {
 }
 
 func (c *Coordinator) LiveSupervisorLossWithInjector(jobID string, injector *FailureInjector) error {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return err
+	}
 	job, ok := c.Store.GetJob(jobID)
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
@@ -474,6 +528,12 @@ func (c *Coordinator) LiveSupervisorLossWithInjector(jobID string, injector *Fai
 }
 
 func (c *Coordinator) StartupReconcile() error {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return err
+	}
+	if err := c.reconcileCurrentBootOrphans(); err != nil {
+		return err
+	}
 	jobs, err := c.Store.ListPriorBootNonterminal(c.BootID)
 	if err != nil {
 		return err
@@ -526,6 +586,9 @@ func (c *Coordinator) StartupReconcile() error {
 }
 
 func (c *Coordinator) Expire(workspaceKey, requestID string, injector *FailureInjector) (string, error) {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return "", err
+	}
 	var expired string
 	err := c.casStep(injector, FailExpireBeforeCAS, FailExpireAfterCAS, func() error {
 		id, err := c.Store.Expire(workspaceKey, requestID)
@@ -536,6 +599,9 @@ func (c *Coordinator) Expire(workspaceKey, requestID string, injector *FailureIn
 }
 
 func (c *Coordinator) MarkCorrupt(jobID string, permitMaybe, identityTrustworthy bool, diagnostic string, injector *FailureInjector) error {
+	if err := c.rejectIfFailStopped(); err != nil {
+		return err
+	}
 	return c.casStep(injector, FailCorruptBeforeCAS, FailCorruptAfterCAS, func() error {
 		_, err := c.Store.MarkCorrupt(jobID, permitMaybe, identityTrustworthy, diagnostic)
 		return err
@@ -549,6 +615,133 @@ func (c *Coordinator) HasOwnedWork() bool {
 		}
 	}
 	return false
+}
+
+func (c *Coordinator) reconcileCurrentBootOrphans() error {
+	var jobs []Aggregate
+	for _, job := range c.Store.jobs {
+		if job.BootID == c.BootID && !job.Terminal() && job.Mode != ModeLegacyUnfenced && !c.hasCommittedObligationFor(job.copy()) {
+			jobs = append(jobs, job.copy())
+		}
+	}
+	for _, job := range jobs {
+		if err := c.withCurrentBootOrphanReconcile(func() error {
+			return c.terminalizeForStartup(job, "current_boot_orphan")
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Coordinator) terminalizeForStartup(job Aggregate, reasonPrefix string) error {
+	if executionUncertain(&job) {
+		if err := c.casStep(nil, FailReconciliationBeforeCAS, FailReconciliationAfterCAS, func() error {
+			_, err := c.Store.BeginReconciliation(job.JobID, job.AttemptID, job.Epoch)
+			return err
+		}); err != nil {
+			return err
+		}
+		if err := c.contain(job.JobID, nil, reasonPrefix); err != nil {
+			return err
+		}
+		if err := c.casStep(nil, FailOutcomeBeforeCAS, FailOutcomeAfterCAS, func() error {
+			_, err := c.Store.RecordOutcome(job.JobID, job.AttemptID, job.Epoch, OutcomeReaped)
+			return err
+		}); err != nil {
+			return err
+		}
+		if err := c.casStep(nil, FailTerminalBeforeCAS, FailTerminalAfterCAS, func() error {
+			_, err := c.Store.PublishTerminal(job.JobID, job.AttemptID, job.Epoch, OutcomeReaped, ProofContained)
+			return err
+		}); err != nil {
+			return err
+		}
+		c.Store.jobs[job.JobID].TerminalReason = reasonPrefix + "_contained"
+		return nil
+	}
+	if err := c.casStep(nil, FailOutcomeBeforeCAS, FailOutcomeAfterCAS, func() error {
+		_, err := c.Store.RecordOutcome(job.JobID, job.AttemptID, job.Epoch, OutcomeFailed)
+		return err
+	}); err != nil {
+		return err
+	}
+	refreshed, _ := c.Store.GetJob(job.JobID)
+	if err := c.retireSupervisor(refreshed, nil); err != nil {
+		return err
+	}
+	if err := c.casStep(nil, FailTerminalBeforeCAS, FailTerminalAfterCAS, func() error {
+		_, err := c.Store.PublishTerminal(job.JobID, job.AttemptID, job.Epoch, OutcomeFailed, ProofNeverPermittedAndRetired)
+		return err
+	}); err != nil {
+		return err
+	}
+	c.Store.jobs[job.JobID].TerminalReason = reasonPrefix + "_before_launch"
+	return nil
+}
+
+func (c *Coordinator) hasCommittedObligationFor(job Aggregate) bool {
+	obligation, ok := c.obligations[job.JobID]
+	return ok &&
+		obligation.committed() &&
+		obligation.Mode == job.Mode &&
+		obligation.LaunchSpec == job.LaunchSpec
+}
+
+func (c *Coordinator) requireLegacyFencedPrepared(req SubmitRequest) error {
+	if req.Mode != ModeLegacyFenced {
+		return nil
+	}
+	if req.PreparedSupervisor == nil || !req.PreparedSupervisor.Valid() {
+		return protocolError(CodePreconditionFailed, req.JobID, "legacy fenced admission requires prepared supervisor")
+	}
+	obligation, ok := c.obligations[req.JobID]
+	if !ok || obligation.PreparedSupervisor == nil || !obligation.PreparedSupervisor.Valid() {
+		return protocolError(CodePreconditionFailed, req.JobID, "legacy fenced admission requires pending retirement obligation")
+	}
+	if obligation.Retired {
+		return protocolError(CodePreconditionFailed, req.JobID, "legacy fenced prepared supervisor was already retired")
+	}
+	if !sameGroupRef(*obligation.PreparedSupervisor, *req.PreparedSupervisor) {
+		return protocolError(CodePreconditionFailed, req.JobID, "legacy fenced prepared supervisor does not match retirement obligation")
+	}
+	return nil
+}
+
+func sameGroupRef(a, b GroupRef) bool {
+	if a.PGID != b.PGID ||
+		a.LeaderPID != b.LeaderPID ||
+		a.HighResStartToken != b.HighResStartToken ||
+		a.PlatformRetainedID != b.PlatformRetainedID ||
+		len(a.KnownChildRefs) != len(b.KnownChildRefs) {
+		return false
+	}
+	for i := range a.KnownChildRefs {
+		if a.KnownChildRefs[i] != b.KnownChildRefs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Coordinator) withCurrentBootOrphanReconcile(fn func() error) error {
+	c.allowCurrentBootOrphanReconcile = true
+	defer func() {
+		c.allowCurrentBootOrphanReconcile = false
+	}()
+	return fn()
+}
+
+func (c *Coordinator) beginFailStop() {
+	c.FailStopping = true
+	c.LifecycleState = CoordinatorLifecycleFailStopped
+}
+
+func (c *Coordinator) rejectIfFailStopped() error {
+	if c.FailStopping || c.LifecycleState == CoordinatorLifecycleFailStopped {
+		return protocolError(CodePreconditionFailed, "", "coordinator is fail-stopped; create a new boot coordinator and run StartupReconcile")
+	}
+	return nil
 }
 
 func (c *Coordinator) publishResult(jobID, attemptID string, epoch int64, result ResultRef, injector *FailureInjector) error {
@@ -641,13 +834,47 @@ func (c *Coordinator) retireSupervisor(job Aggregate, injector *FailureInjector)
 	})
 }
 
-func (c *Coordinator) retirePendingPrepared(jobID string) {
+func (c *Coordinator) retirePendingPrepared(jobID string, injector *FailureInjector) error {
 	obligation, ok := c.obligations[jobID]
 	if !ok || obligation.PreparedSupervisor == nil {
-		return
+		return nil
+	}
+	if obligation.Retired && obligation.PreparedRetirement.Verified() {
+		return nil
+	}
+	if err := c.sideEffectStep(injector, FailRetirementCloseBefore, FailRetirementCloseAfter, func() error {
+		obligation.PreparedRetirement.ControlClosed = Evidence{Kind: "control_closed", Detail: "prepared supervisor retirement"}
+		c.obligations[jobID] = obligation
+		return nil
+	}); err != nil {
+		return err
+	}
+	obligation = c.obligations[jobID]
+	if err := c.sideEffectStep(injector, FailRetirementWaitBefore, FailRetirementWaitAfter, func() error {
+		obligation.PreparedRetirement.WorkerExited = Evidence{Kind: "worker_exit", Detail: "prepared supervisor retirement"}
+		c.obligations[jobID] = obligation
+		return nil
+	}); err != nil {
+		return err
+	}
+	obligation = c.obligations[jobID]
+	if err := c.sideEffectStep(injector, FailRetirementVerifyBefore, FailRetirementVerifyAfter, func() error {
+		obligation.PreparedRetirement.GroupEmpty = Evidence{Kind: "group_empty", Detail: "prepared supervisor retirement"}
+		obligation.Retired = true
+		c.obligations[jobID] = obligation
+		c.preparedRetirements[jobID] = obligation.PreparedRetirement
+		return nil
+	}); err != nil {
+		return err
+	}
+	obligation = c.obligations[jobID]
+	if !obligation.PreparedRetirement.Verified() {
+		return protocolError(CodePreconditionFailed, jobID, "prepared supervisor retirement evidence is incomplete")
 	}
 	obligation.Retired = true
 	c.obligations[jobID] = obligation
+	c.preparedRetirements[jobID] = obligation.PreparedRetirement
+	return nil
 }
 
 func (c *Coordinator) setObligationState(jobID string, state ObligationState) {

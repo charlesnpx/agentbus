@@ -172,13 +172,13 @@ func (s *MemoryAdmissionStore) ResolveOrAccept(req SubmitRequest) (ResolveResult
 	acknowledged := true
 	var supervisor GroupRef
 	if req.Mode == ModeLegacyFenced {
-		decision = DecisionAwaitingAck
-		dispatch = DispatchNone
-		acknowledged = false
-		if req.PreparedSupervisor != nil {
-			supervisor = *req.PreparedSupervisor
-			dispatch = DispatchSupervisorPrepared
+		if req.PreparedSupervisor == nil || !req.PreparedSupervisor.Valid() {
+			return ResolveResult{}, protocolError(CodePreconditionFailed, req.JobID, "legacy fenced admission requires prepared supervisor")
 		}
+		decision = DecisionAwaitingAck
+		dispatch = DispatchSupervisorPrepared
+		acknowledged = false
+		supervisor = *req.PreparedSupervisor
 	}
 	aggregate := &Aggregate{
 		JobID:              req.JobID,
