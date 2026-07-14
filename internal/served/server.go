@@ -114,6 +114,7 @@ type Server struct {
 	afterReapTickHook      func(error)
 	listenerFactory        func() (net.Listener, socketFileIdentity, error)
 	jobsRequestIDEnabled   bool
+	admissionSubmitMu      sync.Mutex
 
 	admissionBootstrapper        *admissionBootstrapper
 	admissionReady               *admissionReady
@@ -128,6 +129,7 @@ type Server struct {
 	storesByKey        map[string]*engine.Store
 	jobStores          map[string]*engine.Store
 	admissionJobs      map[string]struct{}
+	admissionEffectMu  map[string]*sync.Mutex
 	activeJobs         map[string]*activeJob
 	lastActivity       time.Time
 	executablePath     string
@@ -315,6 +317,7 @@ func New(cfg Config) (*Server, error) {
 		storesByKey:         make(map[string]*engine.Store),
 		jobStores:           make(map[string]*engine.Store),
 		admissionJobs:       make(map[string]struct{}),
+		admissionEffectMu:   make(map[string]*sync.Mutex),
 		activeJobs:          make(map[string]*activeJob),
 		lastActivity:        clock.Now().UTC(),
 	}, nil
@@ -1129,10 +1132,16 @@ func (s *Server) handleJobStatus(raw json.RawMessage) requestOutcome {
 	if params.JobID != "" {
 		store := s.storeForJob(params.JobID)
 		if store == nil {
+			if status, ok, errObj := s.authorityStatus(params.JobID); ok || errObj != nil {
+				return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{status}}, err: errObj}
+			}
 			return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{}}}
 		}
 		record, err := store.Load(params.JobID)
 		if err != nil {
+			if status, ok, errObj := s.authorityStatus(params.JobID); ok || errObj != nil {
+				return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{status}}, err: errObj}
+			}
 			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
 		}
 		return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{statusFromRecord(*record)}}}
@@ -1156,10 +1165,16 @@ func (s *Server) handleJobResult(raw json.RawMessage) requestOutcome {
 	}
 	store := s.storeForJob(params.JobID)
 	if store == nil {
+		if result, ok, errObj := s.authorityResult(params.JobID); ok || errObj != nil {
+			return requestOutcome{result: result, err: errObj}
+		}
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: params.JobID})}
 	}
 	record, err := store.Load(params.JobID)
 	if err != nil {
+		if result, ok, errObj := s.authorityResult(params.JobID); ok || errObj != nil {
+			return requestOutcome{result: result, err: errObj}
+		}
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
 	}
 	return requestOutcome{result: resultFromRecord(*record)}
@@ -1173,38 +1188,47 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 	if params.JobID == "" {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "jobId is required", protocol.ErrorData{})}
 	}
-	active := s.lookupActiveJob(params.JobID)
+	if s.isAdmissionJob(params.JobID) && s.admissionCoordinator != nil {
+		return s.withAdmissionJobEffect(params.JobID, func() requestOutcome {
+			return s.handleJobCancelLocked(params.JobID)
+		})
+	}
+	return s.handleJobCancelLocked(params.JobID)
+}
+
+func (s *Server) handleJobCancelLocked(jobID string) requestOutcome {
+	active := s.lookupActiveJob(jobID)
 	if active != nil {
 		if active.foreground {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: params.JobID, TurnID: params.JobID})}
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: jobID, TurnID: jobID})}
 		}
 		active.requestTerminal(engine.StateCanceled)
 	}
-	store := s.storeForJob(params.JobID)
+	store := s.storeForJob(jobID)
 	if store == nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: jobID})}
 	}
-	record, err := store.Load(params.JobID)
+	record, err := store.Load(jobID)
 	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
 	}
 	if record.Foreground {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: params.JobID, TurnID: params.JobID})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: jobID, TurnID: jobID})}
 	}
-	if s.isAdmissionJob(params.JobID) && s.admissionCoordinator != nil {
-		snapshot, err := s.admissionCoordinator.Snapshot(context.Background(), model.JobID(params.JobID))
+	if s.isAdmissionJob(jobID) && s.admissionCoordinator != nil {
+		snapshot, err := s.admissionCoordinator.Snapshot(context.Background(), model.JobID(jobID))
 		if err != nil {
 			return requestOutcome{err: admissionProtocolError(err)}
 		}
 		if snapshot.Record.Terminal == nil {
-			if err := s.admissionCoordinator.Cancel(context.Background(), model.JobID(params.JobID), nil); err != nil {
+			if err := s.admissionCoordinator.Cancel(context.Background(), model.JobID(jobID), nil); err != nil {
 				return requestOutcome{err: admissionProtocolError(err)}
 			}
 		}
 	}
-	record, err = store.Cancel(params.JobID)
+	record, err = store.Cancel(jobID)
 	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
 	}
 	if active != nil && active.cancel != nil {
 		active.cancel()
@@ -1814,6 +1838,34 @@ func (s *Server) removeActiveJob(jobID string) {
 	s.touchActivity()
 }
 
+func (s *Server) withAdmissionJobEffect(jobID string, fn func() requestOutcome) requestOutcome {
+	lock := s.admissionEffectLock(jobID)
+	lock.Lock()
+	defer lock.Unlock()
+	return fn()
+}
+
+func (s *Server) withAdmissionJobEffectErr(jobID string, fn func() error) error {
+	lock := s.admissionEffectLock(jobID)
+	lock.Lock()
+	defer lock.Unlock()
+	return fn()
+}
+
+func (s *Server) admissionEffectLock(jobID string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.admissionEffectMu == nil {
+		s.admissionEffectMu = make(map[string]*sync.Mutex)
+	}
+	lock := s.admissionEffectMu[jobID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		s.admissionEffectMu[jobID] = lock
+	}
+	return lock
+}
+
 func (s *Server) lookupActiveJob(jobID string) *activeJob {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2027,6 +2079,13 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	if err := os.Chmod(path, mode); err != nil {
+		return err
+	}
+	return nil
+}
+
+func atomicWriteDurable(path string, data []byte, mode os.FileMode) error {
+	if err := atomicWrite(path, data, mode); err != nil {
 		return err
 	}
 	return syncFileAndParent(path)

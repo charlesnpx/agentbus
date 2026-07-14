@@ -212,20 +212,33 @@ func (s *servedAdmissionSupervisor) Contain(ctx context.Context, prepared coordi
 	if err := prepared.ValidateFor(prepared.Ref); err != nil {
 		return model.ContainmentReceipt{}, err
 	}
-	if launch := s.launch(prepared.Ref.JobID); launch != nil {
-		launch.mu.Lock()
-		active := launch.active
-		session := launch.session
-		launch.mu.Unlock()
-		if active != nil {
-			active.requestTerminal(engine.StateCanceled)
-			if active.cancel != nil {
-				active.cancel()
-			}
+	launch := s.launch(prepared.Ref.JobID)
+	if launch == nil {
+		return model.ContainmentReceipt{}, fmt.Errorf("admission launch %s cannot be contained: supervisor identity is not registered in this boot", prepared.Ref.JobID)
+	}
+	launch.mu.Lock()
+	active := launch.active
+	session := launch.session
+	identity := launch.identity
+	launch.mu.Unlock()
+	if !identity.Equal(prepared.Identity) {
+		return model.ContainmentReceipt{}, fmt.Errorf("admission launch %s supervisor identity mismatch", prepared.Ref.JobID)
+	}
+	if active != nil {
+		active.requestTerminal(engine.StateCanceled)
+		if active.cancel != nil {
+			active.cancel()
 		}
-		if session != nil {
-			_ = session.Interrupt(ctx)
-		}
+	}
+	if session != nil {
+		_ = session.Interrupt(ctx)
+	}
+	store := s.server.storeForJob(prepared.Ref.JobID.String())
+	if store == nil {
+		return model.ContainmentReceipt{}, fmt.Errorf("admission launch %s cannot be contained: job store is not registered", prepared.Ref.JobID)
+	}
+	if _, err := store.Cancel(prepared.Ref.JobID.String()); err != nil {
+		return model.ContainmentReceipt{}, err
 	}
 	return model.ContainmentReceipt{
 		Attempt:    prepared.Ref,
@@ -245,13 +258,19 @@ func (s *servedAdmissionSupervisor) Retire(_ context.Context, prepared coordinat
 	if err := prepared.ValidateFor(prepared.Ref); err != nil {
 		return model.RetirementReceipt{}, err
 	}
-	if launch := s.launch(prepared.Ref.JobID); launch != nil {
-		launch.mu.Lock()
-		active := launch.active
-		launch.mu.Unlock()
-		if active != nil && active.cancel != nil {
-			active.cancel()
-		}
+	launch := s.launch(prepared.Ref.JobID)
+	if launch == nil {
+		return model.RetirementReceipt{}, fmt.Errorf("admission launch %s cannot be retired: supervisor identity is not registered in this boot", prepared.Ref.JobID)
+	}
+	launch.mu.Lock()
+	active := launch.active
+	identity := launch.identity
+	launch.mu.Unlock()
+	if !identity.Equal(prepared.Identity) {
+		return model.RetirementReceipt{}, fmt.Errorf("admission launch %s supervisor identity mismatch", prepared.Ref.JobID)
+	}
+	if active != nil && active.cancel != nil {
+		active.cancel()
 	}
 	return model.RetirementReceipt{
 		Attempt:    prepared.Ref,

@@ -360,7 +360,7 @@ func (a *fileAuthorityAnchor) save(snapshot authority.AnchorSnapshot) error {
 		return err
 	}
 	raw = append(raw, '\n')
-	return atomicWrite(a.path, raw, 0o600)
+	return atomicWriteDurable(a.path, raw, 0o600)
 }
 
 func (a *fileAuthorityAnchor) ensureIdentity(snapshot *authority.AnchorSnapshot, generation uint64) error {
@@ -552,6 +552,9 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 	}
 
+	s.admissionSubmitMu.Lock()
+	defer s.admissionSubmitMu.Unlock()
+
 	replay, err := s.admissionReady.LookupReplay(ctx, requestKey)
 	if err != nil {
 		return requestOutcome{err: admissionProtocolError(err)}
@@ -668,24 +671,56 @@ func rawTaskSpecFromSubmitParams(raw json.RawMessage) (json.RawMessage, error) {
 }
 
 func (s *Server) launchAdmittedJob(ctx context.Context, run jobRun) {
-	if s.admissionCoordinator == nil || s.admissionSupervisor == nil {
-		_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
-		return
-	}
-	jobID := model.JobID(run.jobID)
-	nonce := model.PermitNonce("permit-" + run.jobID + "-1")
-	if err := s.admissionCoordinator.GrantPermit(ctx, jobID, 1, nonce, nil); err != nil {
-		_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
-		return
-	}
-	if err := s.admissionCoordinator.Start(ctx, jobID, nil); err != nil {
-		_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
-		return
-	}
-	session, sessionID, err := s.admissionSupervisor.Started(jobID)
+	var launched jobRun
+	var runCtx context.Context
+	err := s.withAdmissionJobEffectErr(run.jobID, func() error {
+		var ok bool
+		var launchErr error
+		launched, runCtx, ok, launchErr = s.prepareAdmittedJobLaunch(ctx, run)
+		if !ok {
+			return nil
+		}
+		return launchErr
+	})
 	if err != nil {
 		_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
 		return
+	}
+	if launched.active == nil {
+		return
+	}
+	s.runJob(runCtx, launched)
+}
+
+func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobRun, context.Context, bool, error) {
+	if s.admissionCoordinator == nil || s.admissionSupervisor == nil {
+		return run, nil, false, errors.New("admission authority is not ready")
+	}
+	jobID := model.JobID(run.jobID)
+	snapshot, err := s.admissionCoordinator.Snapshot(ctx, jobID)
+	if err != nil {
+		return run, nil, false, err
+	}
+	if snapshot.Record.Terminal != nil || snapshot.Record.Cancel != nil {
+		return run, nil, false, nil
+	}
+	nonce := model.PermitNonce("permit-" + run.jobID + "-1")
+	if err := s.admissionCoordinator.GrantPermit(ctx, jobID, 1, nonce, nil); err != nil {
+		return run, nil, false, err
+	}
+	snapshot, err = s.admissionCoordinator.Snapshot(ctx, jobID)
+	if err != nil {
+		return run, nil, false, err
+	}
+	if snapshot.Record.Terminal != nil || snapshot.Record.Cancel != nil {
+		return run, nil, false, nil
+	}
+	if err := s.admissionCoordinator.Start(ctx, jobID, nil); err != nil {
+		return run, nil, false, err
+	}
+	session, sessionID, err := s.admissionSupervisor.Started(jobID)
+	if err != nil {
+		return run, nil, false, err
 	}
 	if sessionID != "" {
 		run.sessionID = sessionID
@@ -696,7 +731,7 @@ func (s *Server) launchAdmittedJob(ctx context.Context, run jobRun) {
 	run.active = active
 	s.addActiveJob(active)
 	s.admissionSupervisor.AttachActive(jobID, active)
-	s.runJob(runCtx, run)
+	return run, runCtx, true, nil
 }
 
 func (s *Server) abortUndeliveredAdmissionRun(run jobRun) {
@@ -728,4 +763,67 @@ func admissionProtocolError(err error) *protocol.ErrorObject {
 
 func admissionState(state model.PublicState) engine.JobState {
 	return engine.JobState(state.String())
+}
+
+func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *protocol.ErrorObject) {
+	_, projection, ok, errObj := s.authorityJobProjection(jobID)
+	if !ok || errObj != nil {
+		return protocol.JobStatus{}, ok, errObj
+	}
+	return protocol.JobStatus{
+		JobID:     projection.JobID.String(),
+		SessionID: projection.SessionID,
+		State:     admissionState(projection.Public),
+	}, true, nil
+}
+
+func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *protocol.ErrorObject) {
+	record, projection, ok, errObj := s.authorityJobProjection(jobID)
+	if !ok || errObj != nil {
+		return protocol.JobResult{}, ok, errObj
+	}
+	var result *engine.ResultInfo
+	if record.Terminal != nil && record.Terminal.Result != nil {
+		result = authorityResultInfo(*record.Terminal.Result)
+	} else if record.Result != nil {
+		result = authorityResultInfo(record.Result.Result)
+	}
+	return protocol.JobResult{
+		JobID:     projection.JobID.String(),
+		SessionID: projection.SessionID,
+		State:     admissionState(projection.Public),
+		Result:    result,
+	}, true, nil
+}
+
+func (s *Server) authorityJobProjection(jobID string) (model.SafetyRecord, model.JobProjection, bool, *protocol.ErrorObject) {
+	if s.admissionReady == nil {
+		return model.SafetyRecord{}, model.JobProjection{}, false, nil
+	}
+	modelJobID, err := model.NewJobID(jobID)
+	if err != nil {
+		return model.SafetyRecord{}, model.JobProjection{}, false, nil
+	}
+	image, err := s.admissionReady.LoadJob(context.Background(), modelJobID)
+	if err != nil {
+		return model.SafetyRecord{}, model.JobProjection{}, false, admissionProtocolError(err)
+	}
+	if image.Safety.State == repository.RecordMissing && image.Projection.State == repository.RecordMissing {
+		return model.SafetyRecord{}, model.JobProjection{}, false, nil
+	}
+	if image.Safety.State != repository.RecordValid {
+		return model.SafetyRecord{}, model.JobProjection{}, false, protocol.NewError(protocol.ErrorInvalidTaskSpec, "authority safety record is not valid", protocol.ErrorData{JobID: jobID})
+	}
+	if image.Projection.State != repository.RecordValid {
+		return model.SafetyRecord{}, model.JobProjection{}, false, protocol.NewError(protocol.ErrorInvalidTaskSpec, "authority projection is not valid", protocol.ErrorData{JobID: jobID})
+	}
+	return image.Safety.Value, image.Projection.Value, true, nil
+}
+
+func authorityResultInfo(ref model.ResultRef) *engine.ResultInfo {
+	return &engine.ResultInfo{
+		ResultPath: ref.Path,
+		SHA256:     ref.Digest,
+		Bytes:      ref.Bytes,
+	}
 }
