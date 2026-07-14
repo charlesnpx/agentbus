@@ -9,7 +9,7 @@ func TestEnumsMatchSpec(t *testing.T) {
 	assertStrings(t, "Public", publicsToStrings(AllPublicStates()), []string{"queued", "starting", "running", "retrying", "completed", "completed_noncompliant", "interrupted", "quarantined", "failed", "timed_out", "canceled", "reaped", "orphaned"})
 }
 
-func TestPublicProjectionIsTotal(t *testing.T) {
+func TestPublicProjectionIsDefinedForReachableTuples(t *testing.T) {
 	public := map[Public]bool{}
 	for _, state := range AllPublicStates() {
 		public[state] = true
@@ -18,11 +18,17 @@ func TestPublicProjectionIsTotal(t *testing.T) {
 		for _, dispatch := range AllDispatches() {
 			for _, outcome := range AllOutcomes() {
 				got := PublicProjection(decision, dispatch, outcome)
+				if got == "" {
+					if ReachableInternal(decision, dispatch, outcome) {
+						t.Fatalf("reachable projection(%s,%s,%s) is empty", decision, dispatch, outcome)
+					}
+					continue
+				}
 				if !public[got] {
 					t.Fatalf("projection(%s,%s,%s) = %q, not a public state", decision, dispatch, outcome, got)
 				}
-				if ReachableInternal(decision, dispatch, outcome) && got == "" {
-					t.Fatalf("reachable projection(%s,%s,%s) is empty", decision, dispatch, outcome)
+				if terminalPublicState(got) && (decision != DecisionTerminal || dispatch != DispatchDone || !terminalOutcome(outcome)) {
+					t.Fatalf("projection(%s,%s,%s) = %q, terminal public before terminal tuple", decision, dispatch, outcome, got)
 				}
 			}
 		}

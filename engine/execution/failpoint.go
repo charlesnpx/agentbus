@@ -13,6 +13,8 @@ const (
 	FailAcknowledgeAfterCAS           Failpoint = "acknowledge.after_cas"
 	FailRejectBeforeCAS               Failpoint = "reject.before_cas"
 	FailRejectAfterCAS                Failpoint = "reject.after_cas"
+	FailRejectFinalBeforeCAS          Failpoint = "reject_final.before_cas"
+	FailRejectFinalAfterCAS           Failpoint = "reject_final.after_cas"
 	FailSupervisorPrepareBefore       Failpoint = "supervisor_prepare.before_side_effect"
 	FailSupervisorPrepareAfter        Failpoint = "supervisor_prepare.after_side_effect"
 	FailSupervisorRecordBeforeCAS     Failpoint = "supervisor_record.before_cas"
@@ -122,6 +124,8 @@ func AllFailpoints() []Failpoint {
 		FailAcknowledgeAfterCAS,
 		FailRejectBeforeCAS,
 		FailRejectAfterCAS,
+		FailRejectFinalBeforeCAS,
+		FailRejectFinalAfterCAS,
 		FailSupervisorPrepareBefore,
 		FailSupervisorPrepareAfter,
 		FailSupervisorRecordBeforeCAS,
@@ -224,9 +228,11 @@ func (e InjectedFailure) Error() string {
 }
 
 type FailureInjector struct {
-	Target Failpoint
-	Hit    bool
-	Hits   map[Failpoint]int
+	Target      Failpoint
+	Script      []Failpoint
+	ScriptIndex int
+	Hit         bool
+	Hits        map[Failpoint]int
 }
 
 func (f *FailureInjector) Fail(point Failpoint) error {
@@ -237,6 +243,14 @@ func (f *FailureInjector) Fail(point Failpoint) error {
 		f.Hits = map[Failpoint]int{}
 	}
 	f.Hits[point]++
+	if len(f.Script) != 0 {
+		if f.ScriptIndex >= len(f.Script) || f.Script[f.ScriptIndex] != point {
+			return nil
+		}
+		f.ScriptIndex++
+		f.Hit = true
+		return InjectedFailure{Point: point}
+	}
 	if f.Hit || f.Target != point {
 		return nil
 	}

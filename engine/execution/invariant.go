@@ -49,6 +49,13 @@ func CheckInvariants(view InvariantView) error {
 		if _, ok := store.tombstones[key]; ok {
 			return fmt.Errorf("binding %q also has tombstone", key)
 		}
+		job, ok := store.jobs[binding.JobID]
+		if !ok {
+			return fmt.Errorf("binding %q references missing aggregate %s", key, binding.JobID)
+		}
+		if job.JobID != binding.JobID || job.WorkspaceKey != binding.WorkspaceKey || job.RequestID != binding.RequestID || !job.Fingerprint.Equal(binding.Fingerprint) {
+			return fmt.Errorf("binding %q does not match aggregate identity", key)
+		}
 		if accepted := store.acceptedKeys[key]; accepted != "" && accepted != binding.JobID {
 			return fmt.Errorf("request key %q reaccepted as %s after %s", key, binding.JobID, accepted)
 		}
@@ -87,8 +94,22 @@ func CheckInvariants(view InvariantView) error {
 		if !ReachableInternal(job.Decision, job.Dispatch, job.Outcome) {
 			return fmt.Errorf("job %s has unreachable internal tuple decision=%s dispatch=%s outcome=%s", job.JobID, job.Decision, job.Dispatch, job.Outcome)
 		}
-		if PublicProjection(job.Decision, job.Dispatch, job.Outcome) == "" {
+		public := PublicProjection(job.Decision, job.Dispatch, job.Outcome)
+		if public == "" {
 			return fmt.Errorf("job %s has no public projection", job.JobID)
+		}
+		if terminalPublicState(public) != (job.Decision == DecisionTerminal) {
+			return fmt.Errorf("job %s public terminal projection %s disagrees with decision %s", job.JobID, public, job.Decision)
+		}
+		if job.RequestID != "" {
+			key := bindingKey(job.WorkspaceKey, job.RequestID)
+			binding, ok := store.bindings[key]
+			if !ok {
+				return fmt.Errorf("job %s has no binding for request key %q", job.JobID, key)
+			}
+			if binding.JobID != job.JobID || !binding.Fingerprint.Equal(job.Fingerprint) {
+				return fmt.Errorf("job %s binding does not match aggregate identity", job.JobID)
+			}
 		}
 		if job.Mode != ModeLegacyUnfenced {
 			if err := validateLaunchSpec(job.LaunchSpec, job.Mode); err != nil {
@@ -206,6 +227,12 @@ func CheckInvariants(view InvariantView) error {
 		}
 		if job.Contained && (!job.ContainmentSignaled || !job.ContainmentVerified || !job.Containment.Present()) {
 			return fmt.Errorf("job %s is contained without containment signal/verification evidence", job.JobID)
+		}
+		if job.Contained {
+			authority := store.attemptAuthority(job.JobID)
+			if !job.Supervisor.Valid() && !authority.Supervisor.Valid() {
+				return fmt.Errorf("job %s is contained without trustworthy group identity", job.JobID)
+			}
 		}
 		if job.LossObserved {
 			if !job.Terminal() && !view.FailStopping {

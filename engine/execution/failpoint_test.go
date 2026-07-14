@@ -335,6 +335,7 @@ func failpointCoverageEdges() []failpointCoverageEdge {
 		{name: "admission_commit", before: FailAdmissionBeforeCommit, after: FailAdmissionAfterCommit, run: scenarios[FailAdmissionBeforeCommit]},
 		{name: "acknowledge_cas", before: FailAcknowledgeBeforeCAS, after: FailAcknowledgeAfterCAS, run: scenarios[FailAcknowledgeBeforeCAS]},
 		{name: "reject_cas", before: FailRejectBeforeCAS, after: FailRejectAfterCAS, run: scenarios[FailRejectBeforeCAS]},
+		{name: "reject_final_cas", before: FailRejectFinalBeforeCAS, after: FailRejectFinalAfterCAS, run: scenarios[FailRejectFinalBeforeCAS]},
 		{name: "supervisor_prepare_side_effect", before: FailSupervisorPrepareBefore, after: FailSupervisorPrepareAfter, run: scenarios[FailSupervisorPrepareBefore]},
 		{name: "supervisor_record_cas", before: FailSupervisorRecordBeforeCAS, after: FailSupervisorRecordAfterCAS, run: scenarios[FailSupervisorRecordBeforeCAS]},
 		{name: "legacy_supervisor_prepare_side_effect", before: FailLegacySupervisorPrepareBefore, after: FailLegacySupervisorPrepareAfter, run: scenarios[FailLegacySupervisorPrepareBefore]},
@@ -522,7 +523,7 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) *Coor
 	for _, point := range []Failpoint{FailAcknowledgeBeforeCAS, FailAcknowledgeAfterCAS} {
 		matrix[point] = ack
 	}
-	for _, point := range []Failpoint{FailRejectBeforeCAS, FailRejectAfterCAS} {
+	for _, point := range []Failpoint{FailRejectBeforeCAS, FailRejectAfterCAS, FailRejectFinalBeforeCAS, FailRejectFinalAfterCAS} {
 		matrix[point] = reject
 	}
 	for _, point := range []Failpoint{FailSupervisorPrepareBefore, FailSupervisorPrepareAfter, FailSupervisorRecordBeforeCAS, FailSupervisorRecordAfterCAS} {
