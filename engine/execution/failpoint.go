@@ -12,14 +12,20 @@ const (
 	FailAcknowledgeAfterCAS           Failpoint = "acknowledge.after_cas"
 	FailRejectBeforeCAS               Failpoint = "reject.before_cas"
 	FailRejectAfterCAS                Failpoint = "reject.after_cas"
+	FailSupervisorPrepareBefore       Failpoint = "supervisor_prepare.before_side_effect"
+	FailSupervisorPrepareAfter        Failpoint = "supervisor_prepare.after_side_effect"
 	FailSupervisorRecordBeforeCAS     Failpoint = "supervisor_record.before_cas"
 	FailSupervisorRecordAfterCAS      Failpoint = "supervisor_record.after_cas"
+	FailLegacySupervisorPrepareBefore Failpoint = "legacy_supervisor_prepare.before_side_effect"
+	FailLegacySupervisorPrepareAfter  Failpoint = "legacy_supervisor_prepare.after_side_effect"
 	FailCancelBeforeCAS               Failpoint = "cancel.before_cas"
 	FailCancelAfterCAS                Failpoint = "cancel.after_cas"
 	FailGrantPermitBeforeCAS          Failpoint = "permit_grant.before_cas"
 	FailGrantPermitAfterCAS           Failpoint = "permit_grant.after_cas"
 	FailPermitSendBeforeSideEffect    Failpoint = "permit_send.before_side_effect"
 	FailPermitSendAfterSideEffect     Failpoint = "permit_send.after_side_effect"
+	FailLegacyUnfencedStartBefore     Failpoint = "legacy_unfenced_start.before_side_effect"
+	FailLegacyUnfencedStartAfter      Failpoint = "legacy_unfenced_start.after_side_effect"
 	FailPermitMaybeSentBeforeCAS      Failpoint = "permit_maybe_sent.before_cas"
 	FailPermitMaybeSentAfterCAS       Failpoint = "permit_maybe_sent.after_cas"
 	FailExecDeathBeforeFork           Failpoint = "exec_death.before_fork"
@@ -104,14 +110,20 @@ func AllFailpoints() []Failpoint {
 		FailAcknowledgeAfterCAS,
 		FailRejectBeforeCAS,
 		FailRejectAfterCAS,
+		FailSupervisorPrepareBefore,
+		FailSupervisorPrepareAfter,
 		FailSupervisorRecordBeforeCAS,
 		FailSupervisorRecordAfterCAS,
+		FailLegacySupervisorPrepareBefore,
+		FailLegacySupervisorPrepareAfter,
 		FailCancelBeforeCAS,
 		FailCancelAfterCAS,
 		FailGrantPermitBeforeCAS,
 		FailGrantPermitAfterCAS,
 		FailPermitSendBeforeSideEffect,
 		FailPermitSendAfterSideEffect,
+		FailLegacyUnfencedStartBefore,
+		FailLegacyUnfencedStartAfter,
 		FailPermitMaybeSentBeforeCAS,
 		FailPermitMaybeSentAfterCAS,
 		FailExecDeathBeforeFork,
