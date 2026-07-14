@@ -3,15 +3,16 @@ package execution
 import "fmt"
 
 type Coordinator struct {
-	Store           *MemoryAdmissionStore
-	BootID          string
-	OwnerID         string
-	FailStopping    bool
-	obligations     map[string]CoordinatorObligation
-	legacyUnfenced  map[string]LegacyUnfencedRun
-	nextAttempt     int
-	nextProcess     int
-	nextLegacyRunID int
+	Store            *MemoryAdmissionStore
+	BootID           string
+	OwnerID          string
+	FailStopping     bool
+	allowPreRunnable bool
+	obligations      map[string]CoordinatorObligation
+	legacyUnfenced   map[string]LegacyUnfencedRun
+	nextAttempt      int
+	nextProcess      int
+	nextLegacyRunID  int
 }
 
 type LegacyUnfencedRun struct {
@@ -54,10 +55,11 @@ func (c *Coordinator) Obligations() map[string]CoordinatorObligation {
 
 func (c *Coordinator) Check() error {
 	return CheckInvariants(InvariantView{
-		Store:         c.Store,
-		Obligations:   c.Obligations(),
-		FailStopping:  c.FailStopping,
-		CurrentBootID: c.BootID,
+		Store:            c.Store,
+		Obligations:      c.Obligations(),
+		FailStopping:     c.FailStopping,
+		CurrentBootID:    c.BootID,
+		AllowPreRunnable: c.allowPreRunnable,
 	})
 }
 
@@ -101,6 +103,7 @@ func (c *Coordinator) Submit(req SubmitRequest, injector *FailureInjector) (Reso
 		JobID:              req.JobID,
 		LaunchSpec:         req.LaunchSpec,
 		Mode:               req.Mode,
+		State:              ObligationPending,
 		PreparedSupervisor: req.PreparedSupervisor,
 	}
 	if err := c.inject(injector, FailAdmissionBeforeCommit); err != nil {
@@ -114,17 +117,16 @@ func (c *Coordinator) Submit(req SubmitRequest, injector *FailureInjector) (Reso
 		delete(c.obligations, req.JobID)
 		return ResolveResult{}, c.checkBoundary(err)
 	}
-	obligation := c.obligations[req.JobID]
-	obligation.Committed = true
-	c.obligations[req.JobID] = obligation
-	if err := c.inject(injector, FailAdmissionAfterCommit); err != nil {
+	c.setObligationState(req.JobID, ObligationCommitted)
+	if err := c.injectPreRunnable(injector, FailPostCommitPreRunnable); err != nil {
 		c.FailStopping = true
 		return result, c.checkBoundary(err)
 	}
-	if err := c.inject(injector, FailPostCommitPreRunnable); err != nil {
+	if err := c.injectPreRunnable(injector, FailAdmissionAfterCommit); err != nil {
 		c.FailStopping = true
 		return result, c.checkBoundary(err)
 	}
+	c.setObligationState(req.JobID, ObligationRunnable)
 	return result, c.checkBoundary(nil)
 }
 
@@ -147,7 +149,7 @@ func (c *Coordinator) SubmitLegacyFenced(req SubmitRequest, injector *FailureInj
 		return ResolveResult{}, c.checkBoundary(err)
 	}
 	req.LaunchSpec = spec
-	c.obligations[req.JobID] = CoordinatorObligation{JobID: req.JobID, LaunchSpec: spec, Mode: req.Mode}
+	c.obligations[req.JobID] = CoordinatorObligation{JobID: req.JobID, LaunchSpec: spec, Mode: req.Mode, State: ObligationPending}
 	if err := c.inject(injector, FailRetirementCloseBefore); err != nil {
 		delete(c.obligations, req.JobID)
 		return ResolveResult{}, err
@@ -648,6 +650,13 @@ func (c *Coordinator) retirePendingPrepared(jobID string) {
 	c.obligations[jobID] = obligation
 }
 
+func (c *Coordinator) setObligationState(jobID string, state ObligationState) {
+	obligation := c.obligations[jobID]
+	obligation.State = state
+	obligation.Committed = state == ObligationCommitted || state == ObligationRunnable
+	c.obligations[jobID] = obligation
+}
+
 func (c *Coordinator) casStep(injector *FailureInjector, before, after Failpoint, op func() error) error {
 	if err := c.inject(injector, before); err != nil {
 		return err
@@ -681,6 +690,20 @@ func (c *Coordinator) sideEffectStep(injector *FailureInjector, before, after Fa
 	}
 	if err := c.inject(injector, after); err != nil {
 		return err
+	}
+	return c.checkBoundary(nil)
+}
+
+func (c *Coordinator) injectPreRunnable(injector *FailureInjector, point Failpoint) error {
+	if injector == nil {
+		return nil
+	}
+	c.allowPreRunnable = true
+	defer func() {
+		c.allowPreRunnable = false
+	}()
+	if err := injector.Fail(point); err != nil {
+		return c.checkBoundary(err)
 	}
 	return c.checkBoundary(nil)
 }

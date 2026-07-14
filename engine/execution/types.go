@@ -209,13 +209,41 @@ type LaunchSpec struct {
 	Fingerprint         Fingerprint
 }
 
+type ObligationState string
+
+const (
+	ObligationPending   ObligationState = "pending"
+	ObligationCommitted ObligationState = "committed"
+	ObligationRunnable  ObligationState = "runnable"
+)
+
 type CoordinatorObligation struct {
 	JobID              string
 	LaunchSpec         LaunchSpec
 	Mode               Mode
+	State              ObligationState
 	Committed          bool
 	PreparedSupervisor *GroupRef
 	Retired            bool
+}
+
+func (o CoordinatorObligation) state() ObligationState {
+	if o.State != "" {
+		return o.State
+	}
+	if o.Committed {
+		return ObligationRunnable
+	}
+	return ObligationPending
+}
+
+func (o CoordinatorObligation) committed() bool {
+	state := o.state()
+	return state == ObligationCommitted || state == ObligationRunnable
+}
+
+func (o CoordinatorObligation) runnable() bool {
+	return o.state() == ObligationRunnable
 }
 
 type GroupRef struct {
