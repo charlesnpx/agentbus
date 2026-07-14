@@ -15,6 +15,7 @@ func TestNegativeOracleRejectsForbiddenStates(t *testing.T) {
 		{name: "obligation launch spec mismatch", build: forbiddenObligationLaunchSpecMismatch},
 		{name: "accepted invalid empty launch spec", build: forbiddenAcceptedInvalidLaunchSpec},
 		{name: "completed terminal with unverified result digest", build: forbiddenCompletedUnverifiedResult},
+		{name: "terminal reason mismatch", build: forbiddenTerminalReasonMismatch},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -141,6 +142,20 @@ func forbiddenCompletedUnverifiedResult(t *testing.T) InvariantView {
 	}
 	job := c.Store.jobs[res.JobID]
 	delete(c.Store.resultArtifacts, job.Result.Path)
+	return invariantView(c)
+}
+
+func forbiddenTerminalReasonMismatch(t *testing.T) InvariantView {
+	t.Helper()
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-negative-reason", "owner")
+	res := submitPreparedPermitted(t, c, "ws-negative-reason", "req-negative-reason", "fp")
+	if err := c.Start(res.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Complete(res.JobID, OutcomeCompleted); err != nil {
+		t.Fatal(err)
+	}
+	c.Store.jobs[res.JobID].TerminalReason = "daemon_restarted"
 	return invariantView(c)
 }
 

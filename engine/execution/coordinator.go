@@ -1,6 +1,10 @@
 package execution
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
 type Coordinator struct {
 	Store                           *MemoryAdmissionStore
@@ -115,20 +119,21 @@ func (c *Coordinator) Submit(req SubmitRequest, injector *FailureInjector) (Reso
 	}
 	req.LaunchSpec = spec
 
-	c.obligations[req.JobID] = CoordinatorObligation{
+	if err := c.putObligation(CoordinatorObligation{
 		JobID:              req.JobID,
 		LaunchSpec:         req.LaunchSpec,
 		Mode:               req.Mode,
 		State:              ObligationPending,
 		PreparedSupervisor: req.PreparedSupervisor,
+	}); err != nil {
+		return ResolveResult{}, err
 	}
 	if err := c.inject(injector, FailAdmissionBeforeCommit); err != nil {
 		if retireErr := c.retirePendingPrepared(req.JobID, injector); retireErr != nil {
 			c.beginFailStop()
 			return ResolveResult{}, c.checkBoundary(retireErr)
 		}
-		delete(c.obligations, req.JobID)
-		return ResolveResult{}, err
+		return ResolveResult{}, c.deleteObligation(req.JobID, err)
 	}
 	result, err := c.Store.ResolveOrAccept(req)
 	if err != nil {
@@ -136,10 +141,11 @@ func (c *Coordinator) Submit(req SubmitRequest, injector *FailureInjector) (Reso
 			c.beginFailStop()
 			return ResolveResult{}, c.checkBoundary(fmt.Errorf("%w; prepared supervisor retirement: %v", err, retireErr))
 		}
-		delete(c.obligations, req.JobID)
-		return ResolveResult{}, c.checkBoundary(err)
+		return ResolveResult{}, c.deleteObligation(req.JobID, err)
 	}
-	c.setObligationState(req.JobID, ObligationCommitted)
+	if err := c.setObligationState(req.JobID, ObligationCommitted); err != nil {
+		return result, err
+	}
 	if err := c.injectPreRunnable(injector, FailPostCommitPreRunnable); err != nil {
 		c.beginFailStop()
 		return result, c.checkBoundary(err)
@@ -148,8 +154,10 @@ func (c *Coordinator) Submit(req SubmitRequest, injector *FailureInjector) (Reso
 		c.beginFailStop()
 		return result, c.checkBoundary(err)
 	}
-	c.setObligationState(req.JobID, ObligationRunnable)
-	return result, c.checkBoundary(nil)
+	if err := c.setObligationState(req.JobID, ObligationRunnable); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 func (c *Coordinator) SubmitLegacyFenced(req SubmitRequest, injector *FailureInjector) (ResolveResult, error) {
@@ -174,23 +182,26 @@ func (c *Coordinator) SubmitLegacyFenced(req SubmitRequest, injector *FailureInj
 		return ResolveResult{}, c.checkBoundary(err)
 	}
 	req.LaunchSpec = spec
-	c.obligations[req.JobID] = CoordinatorObligation{JobID: req.JobID, LaunchSpec: spec, Mode: req.Mode, State: ObligationPending}
-	if err := c.inject(injector, FailLegacySupervisorPrepareBefore); err != nil {
-		delete(c.obligations, req.JobID)
+	if err := c.putObligation(CoordinatorObligation{JobID: req.JobID, LaunchSpec: spec, Mode: req.Mode, State: ObligationPending}); err != nil {
 		return ResolveResult{}, err
+	}
+	if err := c.inject(injector, FailLegacySupervisorPrepareBefore); err != nil {
+		return ResolveResult{}, c.deleteObligation(req.JobID, err)
 	}
 	c.Store.noteModeledSideEffect()
 	group := c.nextGroupRef()
 	obligation := c.obligations[req.JobID]
 	obligation.PreparedSupervisor = &group
 	c.obligations[req.JobID] = obligation
+	if err := c.checkBoundary(nil); err != nil {
+		return ResolveResult{}, err
+	}
 	if err := c.inject(injector, FailLegacySupervisorPrepareAfter); err != nil {
 		if retireErr := c.retirePendingPrepared(req.JobID, injector); retireErr != nil {
 			c.beginFailStop()
 			return ResolveResult{}, c.checkBoundary(retireErr)
 		}
-		delete(c.obligations, req.JobID)
-		return ResolveResult{}, err
+		return ResolveResult{}, c.deleteObligation(req.JobID, err)
 	}
 	req.PreparedSupervisor = &group
 	return c.Submit(req, injector)
@@ -259,11 +270,11 @@ func (c *Coordinator) RejectUnacknowledgedWithInjector(jobID string, injector *F
 	}
 	err := c.casStep(injector, FailRejectBeforeCAS, FailRejectAfterCAS, func() error {
 		_, err := c.Store.RejectUnacknowledged(jobID, job.AttemptID, job.Epoch)
+		if err == nil {
+			delete(c.obligations, jobID)
+		}
 		return err
 	})
-	if err == nil {
-		delete(c.obligations, jobID)
-	}
 	return err
 }
 
@@ -275,9 +286,6 @@ func (c *Coordinator) PrepareSupervisor(jobID string, injector *FailureInjector)
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
 	}
-	if err := c.inject(injector, FailSupervisorRecordBeforeCAS); err != nil {
-		return err
-	}
 	if err := c.inject(injector, FailSupervisorPrepareBefore); err != nil {
 		return err
 	}
@@ -287,7 +295,7 @@ func (c *Coordinator) PrepareSupervisor(jobID string, injector *FailureInjector)
 		c.beginFailStop()
 		return c.checkBoundary(err)
 	}
-	err := c.StoreOp(FailSupervisorRecordAfterCAS, injector, func() error {
+	err := c.casStep(injector, FailSupervisorRecordBeforeCAS, FailSupervisorRecordAfterCAS, func() error {
 		_, err := c.Store.RecordSupervisor(jobID, job.AttemptID, job.Epoch, group)
 		return err
 	})
@@ -339,7 +347,9 @@ func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
 	}); err != nil {
 		return c.reconcilePostPermitError(jobID, postPermit, err)
 	}
-	c.setStartPhase(jobID, "forked")
+	if err := c.setStartPhase(jobID, "forked"); err != nil {
+		return c.reconcilePostPermitError(jobID, postPermit, err)
+	}
 	if err := c.inject(injector, FailExecDeathAfterForkBeforeExec); err != nil {
 		return c.reconcilePostPermitError(jobID, postPermit, err)
 	}
@@ -349,7 +359,9 @@ func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
 	}); err != nil {
 		return c.reconcilePostPermitError(jobID, postPermit, err)
 	}
-	c.setStartPhase(jobID, "execed")
+	if err := c.setStartPhase(jobID, "execed"); err != nil {
+		return c.reconcilePostPermitError(jobID, postPermit, err)
+	}
 	if err := c.inject(injector, FailExecDeathAfterExecBeforeStart); err != nil {
 		return c.reconcilePostPermitError(jobID, postPermit, err)
 	}
@@ -361,7 +373,9 @@ func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
 	}); err != nil {
 		return c.reconcilePostPermitError(jobID, postPermit, err)
 	}
-	c.setStartPhase(jobID, "backend_started")
+	if err := c.setStartPhase(jobID, "backend_started"); err != nil {
+		return c.reconcilePostPermitError(jobID, postPermit, err)
+	}
 	if err := c.inject(injector, FailExecDeathAfterStartBeforeCAS); err != nil {
 		return c.reconcilePostPermitError(jobID, postPermit, err)
 	}
@@ -370,7 +384,7 @@ func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
 		return err
 	})
 	if err == nil {
-		c.setStartPhase(jobID, "record_started")
+		err = c.setStartPhase(jobID, "record_started")
 	}
 	return c.reconcilePostPermitError(jobID, postPermit, err)
 }
@@ -420,14 +434,7 @@ func (c *Coordinator) CompleteWithInjector(jobID string, outcome Outcome, inject
 			return err
 		}
 	}
-	err := c.casStep(injector, FailTerminalBeforeCAS, FailTerminalAfterCAS, func() error {
-		_, err := c.Store.PublishTerminal(jobID, job.AttemptID, job.Epoch, outcome, ProofCleanQuiescentOutcomeAndRetired)
-		return err
-	})
-	if err == nil {
-		delete(c.obligations, jobID)
-	}
-	return err
+	return c.publishTerminal(jobID, job.AttemptID, job.Epoch, outcome, ProofCleanQuiescentOutcomeAndRetired, string(outcome), injector)
 }
 
 func (c *Coordinator) Cancel(jobID string) error {
@@ -462,14 +469,7 @@ func (c *Coordinator) CancelWithInjector(jobID string, injector *FailureInjector
 	if err := c.retireSupervisor(job, injector); err != nil {
 		return err
 	}
-	err := c.casStep(injector, FailTerminalBeforeCAS, FailTerminalAfterCAS, func() error {
-		_, err := c.Store.PublishTerminal(jobID, job.AttemptID, job.Epoch, OutcomeCanceled, ProofNeverPermittedAndRetired)
-		return err
-	})
-	if err == nil {
-		delete(c.obligations, jobID)
-	}
-	return err
+	return c.publishTerminal(jobID, job.AttemptID, job.Epoch, OutcomeCanceled, ProofNeverPermittedAndRetired, "canceled_before_permit", injector)
 }
 
 func (c *Coordinator) LiveSupervisorLoss(jobID string) error {
@@ -509,18 +509,17 @@ func (c *Coordinator) LiveSupervisorLossWithInjector(jobID string, injector *Fai
 	}); err != nil {
 		return c.failStopAfterReconciliationError(jobID, err)
 	}
-	if err := c.casStep(injector, FailTerminalBeforeCAS, FailTerminalAfterCAS, func() error {
-		_, err := c.Store.PublishTerminal(jobID, job.AttemptID, job.Epoch, outcome, ProofContained)
-		return err
-	}); err != nil {
+	if err := c.publishTerminal(jobID, job.AttemptID, job.Epoch, outcome, ProofContained, reason, injector); err != nil {
 		return c.failStopAfterReconciliationError(jobID, err)
 	}
-	c.Store.jobs[jobID].TerminalReason = reason
-	delete(c.obligations, jobID)
 	return c.checkBoundary(nil)
 }
 
-func (c *Coordinator) StartupReconcile() (err error) {
+func (c *Coordinator) StartupReconcile() error {
+	return c.StartupReconcileWithInjector(nil)
+}
+
+func (c *Coordinator) StartupReconcileWithInjector(injector *FailureInjector) (err error) {
 	if err := c.rejectIfFailStopped(); err != nil {
 		return err
 	}
@@ -539,7 +538,7 @@ func (c *Coordinator) StartupReconcile() (err error) {
 	if err := c.validateStartupAnchors(); err != nil {
 		return err
 	}
-	if err := c.reconcileCurrentBootOrphans(); err != nil {
+	if err := c.reconcileCurrentBootOrphans(injector); err != nil {
 		return err
 	}
 	jobs, err := c.Store.ListPriorBootNonterminal(c.BootID)
@@ -547,54 +546,46 @@ func (c *Coordinator) StartupReconcile() (err error) {
 		return err
 	}
 	for _, job := range jobs {
-		if done, err := c.publishContainedStartupTerminal(job, "daemon_restarted"); done || err != nil {
+		if done, err := c.publishContainedStartupTerminal(job, "daemon_restarted", injector); done || err != nil {
 			if err != nil {
-				return err
+				return c.failStopAfterReconciliationError(job.JobID, err)
 			}
 			continue
 		}
 		if executionUncertain(&job) {
-			if err := c.casStep(nil, FailReconciliationBeforeCAS, FailReconciliationAfterCAS, func() error {
+			if err := c.casStep(injector, FailReconciliationBeforeCAS, FailReconciliationAfterCAS, func() error {
 				_, err := c.Store.BeginReconciliation(job.JobID, job.AttemptID, job.Epoch)
 				return err
 			}); err != nil {
-				return err
+				return c.failStopAfterReconciliationError(job.JobID, err)
 			}
-			if err := c.contain(job.JobID, nil, "startup reconciliation"); err != nil {
-				return err
+			if err := c.contain(job.JobID, injector, "startup reconciliation"); err != nil {
+				return c.failStopAfterReconciliationError(job.JobID, err)
 			}
-			if err := c.casStep(nil, FailOutcomeBeforeCAS, FailOutcomeAfterCAS, func() error {
+			if err := c.casStep(injector, FailOutcomeBeforeCAS, FailOutcomeAfterCAS, func() error {
 				_, err := c.Store.RecordOutcome(job.JobID, job.AttemptID, job.Epoch, OutcomeReaped)
 				return err
 			}); err != nil {
-				return err
+				return c.failStopAfterReconciliationError(job.JobID, err)
 			}
-			if err := c.casStep(nil, FailTerminalBeforeCAS, FailTerminalAfterCAS, func() error {
-				_, err := c.Store.PublishTerminal(job.JobID, job.AttemptID, job.Epoch, OutcomeReaped, ProofContained)
-				return err
-			}); err != nil {
-				return err
+			if err := c.publishTerminal(job.JobID, job.AttemptID, job.Epoch, OutcomeReaped, ProofContained, "daemon_restarted", injector); err != nil {
+				return c.failStopAfterReconciliationError(job.JobID, err)
 			}
-			c.Store.jobs[job.JobID].TerminalReason = "daemon_restarted"
 			continue
 		}
-		if err := c.casStep(nil, FailOutcomeBeforeCAS, FailOutcomeAfterCAS, func() error {
+		if err := c.casStep(injector, FailOutcomeBeforeCAS, FailOutcomeAfterCAS, func() error {
 			_, err := c.Store.RecordOutcome(job.JobID, job.AttemptID, job.Epoch, OutcomeFailed)
 			return err
 		}); err != nil {
-			return err
+			return c.failStopAfterReconciliationError(job.JobID, err)
 		}
 		refreshed, _ := c.Store.GetJob(job.JobID)
-		if err := c.retireSupervisor(refreshed, nil); err != nil {
-			return err
+		if err := c.retireSupervisor(refreshed, injector); err != nil {
+			return c.failStopAfterReconciliationError(job.JobID, err)
 		}
-		if err := c.casStep(nil, FailTerminalBeforeCAS, FailTerminalAfterCAS, func() error {
-			_, err := c.Store.PublishTerminal(job.JobID, job.AttemptID, job.Epoch, OutcomeFailed, ProofNeverPermittedAndRetired)
-			return err
-		}); err != nil {
-			return err
+		if err := c.publishTerminal(job.JobID, job.AttemptID, job.Epoch, OutcomeFailed, ProofNeverPermittedAndRetired, "daemon_restarted_before_launch", injector); err != nil {
+			return c.failStopAfterReconciliationError(job.JobID, err)
 		}
-		c.Store.jobs[job.JobID].TerminalReason = "daemon_restarted_before_launch"
 	}
 	c.LifecycleState = CoordinatorLifecycleRunning
 	if err = c.checkBoundary(nil); err != nil {
@@ -611,6 +602,9 @@ func (c *Coordinator) Expire(workspaceKey, requestID string, injector *FailureIn
 	err := c.casStep(injector, FailExpireBeforeCAS, FailExpireAfterCAS, func() error {
 		id, err := c.Store.Expire(workspaceKey, requestID)
 		expired = id
+		if err == nil {
+			delete(c.obligations, id)
+		}
 		return err
 	})
 	return expired, err
@@ -646,19 +640,23 @@ func (c *Coordinator) MarkCorrupt(jobID string, permitMaybe, identityTrustworthy
 	if permitMaybe {
 		proof = ProofContained
 	}
-	err := c.casStep(injector, FailTerminalBeforeCAS, FailTerminalAfterCAS, func() error {
-		_, err := c.Store.PublishTerminal(jobID, job.AttemptID, job.Epoch, OutcomeQuarantined, proof)
-		return err
-	})
-	if err == nil {
-		delete(c.obligations, jobID)
+	reason := diagnostic
+	if reason == "" {
+		reason = "corrupt_quarantine"
 	}
-	return err
+	return c.publishTerminal(jobID, job.AttemptID, job.Epoch, OutcomeQuarantined, proof, reason, injector)
 }
 
 func (c *Coordinator) HasOwnedWork() bool {
-	if c.LifecycleState != CoordinatorLifecycleRunning {
-		return false
+	for _, obligation := range c.obligations {
+		if !obligation.Retired {
+			return true
+		}
+	}
+	for _, run := range c.legacyUnfenced {
+		if !run.Retired {
+			return true
+		}
 	}
 	for _, job := range c.Store.jobs {
 		if job.BootID == c.BootID && !job.Terminal() {
@@ -668,7 +666,27 @@ func (c *Coordinator) HasOwnedWork() bool {
 	return false
 }
 
-func (c *Coordinator) reconcileCurrentBootOrphans() error {
+func (c *Coordinator) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.rejectIfFailStopped(); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for c.HasOwnedWork() {
+		select {
+		case <-ctx.Done():
+			return c.checkBoundary(ctx.Err())
+		case <-ticker.C:
+		}
+	}
+	c.LifecycleState = CoordinatorLifecycleNotReady
+	return c.checkBoundary(nil)
+}
+
+func (c *Coordinator) reconcileCurrentBootOrphans(injector *FailureInjector) error {
 	var jobs []Aggregate
 	for _, job := range c.Store.jobs {
 		if job.BootID == c.BootID && !job.Terminal() && job.Mode != ModeLegacyUnfenced && !c.hasCommittedObligationFor(job.copy()) {
@@ -677,7 +695,7 @@ func (c *Coordinator) reconcileCurrentBootOrphans() error {
 	}
 	for _, job := range jobs {
 		if err := c.withCurrentBootOrphanReconcile(func() error {
-			return c.terminalizeForStartup(job, "current_boot_orphan")
+			return c.terminalizeForStartup(job, "current_boot_orphan", injector)
 		}); err != nil {
 			return err
 		}
@@ -730,66 +748,54 @@ func (c *Coordinator) validateStartupAnchors() error {
 	return nil
 }
 
-func (c *Coordinator) terminalizeForStartup(job Aggregate, reasonPrefix string) error {
-	if done, err := c.publishContainedStartupTerminal(job, reasonPrefix+"_contained"); done || err != nil {
+func (c *Coordinator) terminalizeForStartup(job Aggregate, reasonPrefix string, injector *FailureInjector) error {
+	if done, err := c.publishContainedStartupTerminal(job, reasonPrefix+"_contained", injector); done || err != nil {
 		return err
 	}
 	if executionUncertain(&job) {
-		if err := c.casStep(nil, FailReconciliationBeforeCAS, FailReconciliationAfterCAS, func() error {
+		if err := c.casStep(injector, FailReconciliationBeforeCAS, FailReconciliationAfterCAS, func() error {
 			_, err := c.Store.BeginReconciliation(job.JobID, job.AttemptID, job.Epoch)
 			return err
 		}); err != nil {
 			return err
 		}
-		if err := c.contain(job.JobID, nil, reasonPrefix); err != nil {
+		if err := c.contain(job.JobID, injector, reasonPrefix); err != nil {
 			return err
 		}
-		if err := c.casStep(nil, FailOutcomeBeforeCAS, FailOutcomeAfterCAS, func() error {
+		if err := c.casStep(injector, FailOutcomeBeforeCAS, FailOutcomeAfterCAS, func() error {
 			_, err := c.Store.RecordOutcome(job.JobID, job.AttemptID, job.Epoch, OutcomeReaped)
 			return err
 		}); err != nil {
 			return err
 		}
-		if err := c.casStep(nil, FailTerminalBeforeCAS, FailTerminalAfterCAS, func() error {
-			_, err := c.Store.PublishTerminal(job.JobID, job.AttemptID, job.Epoch, OutcomeReaped, ProofContained)
-			return err
-		}); err != nil {
+		if err := c.publishTerminal(job.JobID, job.AttemptID, job.Epoch, OutcomeReaped, ProofContained, reasonPrefix+"_contained", injector); err != nil {
 			return err
 		}
-		c.Store.jobs[job.JobID].TerminalReason = reasonPrefix + "_contained"
 		return nil
 	}
-	if err := c.casStep(nil, FailOutcomeBeforeCAS, FailOutcomeAfterCAS, func() error {
+	if err := c.casStep(injector, FailOutcomeBeforeCAS, FailOutcomeAfterCAS, func() error {
 		_, err := c.Store.RecordOutcome(job.JobID, job.AttemptID, job.Epoch, OutcomeFailed)
 		return err
 	}); err != nil {
 		return err
 	}
 	refreshed, _ := c.Store.GetJob(job.JobID)
-	if err := c.retireSupervisor(refreshed, nil); err != nil {
+	if err := c.retireSupervisor(refreshed, injector); err != nil {
 		return err
 	}
-	if err := c.casStep(nil, FailTerminalBeforeCAS, FailTerminalAfterCAS, func() error {
-		_, err := c.Store.PublishTerminal(job.JobID, job.AttemptID, job.Epoch, OutcomeFailed, ProofNeverPermittedAndRetired)
-		return err
-	}); err != nil {
+	if err := c.publishTerminal(job.JobID, job.AttemptID, job.Epoch, OutcomeFailed, ProofNeverPermittedAndRetired, reasonPrefix+"_before_launch", injector); err != nil {
 		return err
 	}
-	c.Store.jobs[job.JobID].TerminalReason = reasonPrefix + "_before_launch"
 	return nil
 }
 
-func (c *Coordinator) publishContainedStartupTerminal(job Aggregate, reason string) (bool, error) {
+func (c *Coordinator) publishContainedStartupTerminal(job Aggregate, reason string, injector *FailureInjector) (bool, error) {
 	if !job.Contained || !job.Retired || !terminalOutcome(job.Outcome) {
 		return false, nil
 	}
-	if err := c.casStep(nil, FailTerminalBeforeCAS, FailTerminalAfterCAS, func() error {
-		_, err := c.Store.PublishTerminal(job.JobID, job.AttemptID, job.Epoch, job.Outcome, ProofContained)
-		return err
-	}); err != nil {
+	if err := c.publishTerminal(job.JobID, job.AttemptID, job.Epoch, job.Outcome, ProofContained, reason, injector); err != nil {
 		return true, err
 	}
-	c.Store.jobs[job.JobID].TerminalReason = reason
 	return true, nil
 }
 
@@ -942,16 +948,22 @@ func (c *Coordinator) contain(jobID string, injector *FailureInjector, detail st
 	}); err != nil {
 		return err
 	}
-	if _, err := c.Store.RecordContainmentSignaled(jobID, job.AttemptID, job.Epoch, Evidence{Kind: "containment_signal", Detail: detail}); err != nil {
-		return c.checkBoundary(err)
+	if err := c.casStep(injector, FailContainmentSignalBeforeCAS, FailContainmentSignalAfterCAS, func() error {
+		_, err := c.Store.RecordContainmentSignaled(jobID, job.AttemptID, job.Epoch, Evidence{Kind: "containment_signal", Detail: detail})
+		return err
+	}); err != nil {
+		return err
 	}
 	if err := c.sideEffectStep(injector, FailContainmentVerifyBefore, FailContainmentVerifyAfter, func() error {
 		return nil
 	}); err != nil {
 		return err
 	}
-	if _, err := c.Store.RecordContainmentVerified(jobID, job.AttemptID, job.Epoch, Evidence{Kind: "verified_group_empty", Detail: detail}); err != nil {
-		return c.checkBoundary(err)
+	if err := c.casStep(injector, FailContainmentVerifyBeforeCAS, FailContainmentVerifyAfterCAS, func() error {
+		_, err := c.Store.RecordContainmentVerified(jobID, job.AttemptID, job.Epoch, Evidence{Kind: "verified_group_empty", Detail: detail})
+		return err
+	}); err != nil {
+		return err
 	}
 	return c.casStep(injector, FailContainmentRecordBeforeCAS, FailContainmentRecordAfterCAS, func() error {
 		_, err := c.Store.RecordContained(jobID, job.AttemptID, job.Epoch, Evidence{Kind: "verified_absent", Detail: detail})
@@ -968,16 +980,22 @@ func (c *Coordinator) retireSupervisor(job Aggregate, injector *FailureInjector)
 	}); err != nil {
 		return err
 	}
-	if _, err := c.Store.RecordRetirementStarted(job.JobID, job.AttemptID, job.Epoch, Evidence{Kind: "control_closed", Detail: "retirement"}); err != nil {
-		return c.checkBoundary(err)
+	if err := c.casStep(injector, FailRetirementStartedBeforeCAS, FailRetirementStartedAfterCAS, func() error {
+		_, err := c.Store.RecordRetirementStarted(job.JobID, job.AttemptID, job.Epoch, Evidence{Kind: "control_closed", Detail: "retirement"})
+		return err
+	}); err != nil {
+		return err
 	}
 	if err := c.sideEffectStep(injector, FailRetirementWaitBefore, FailRetirementWaitAfter, func() error {
 		return nil
 	}); err != nil {
 		return err
 	}
-	if _, err := c.Store.RecordRetirementWorkerExited(job.JobID, job.AttemptID, job.Epoch, Evidence{Kind: "worker_exit", Detail: "retirement"}); err != nil {
-		return c.checkBoundary(err)
+	if err := c.casStep(injector, FailRetirementWorkerBeforeCAS, FailRetirementWorkerAfterCAS, func() error {
+		_, err := c.Store.RecordRetirementWorkerExited(job.JobID, job.AttemptID, job.Epoch, Evidence{Kind: "worker_exit", Detail: "retirement"})
+		return err
+	}); err != nil {
+		return err
 	}
 	if err := c.sideEffectStep(injector, FailRetirementVerifyBefore, FailRetirementVerifyAfter, func() error {
 		return nil
@@ -1030,30 +1048,58 @@ func (c *Coordinator) retirePendingPrepared(jobID string, injector *FailureInjec
 	obligation.Retired = true
 	c.obligations[jobID] = obligation
 	c.preparedRetirements[jobID] = obligation.PreparedRetirement
-	return nil
+	return c.checkBoundary(nil)
 }
 
-func (c *Coordinator) setObligationState(jobID string, state ObligationState) {
+func (c *Coordinator) putObligation(obligation CoordinatorObligation) error {
+	c.obligations[obligation.JobID] = obligation
+	return c.checkBoundary(nil)
+}
+
+func (c *Coordinator) deleteObligation(jobID string, err error) error {
+	delete(c.obligations, jobID)
+	return c.checkBoundary(err)
+}
+
+func (c *Coordinator) setObligationState(jobID string, state ObligationState) error {
 	obligation := c.obligations[jobID]
 	obligation.State = state
 	obligation.Committed = state == ObligationCommitted || state == ObligationRunnable
 	c.obligations[jobID] = obligation
+	if state == ObligationCommitted {
+		return c.checkPreRunnableBoundary(nil)
+	}
+	return c.checkBoundary(nil)
 }
 
-func (c *Coordinator) setStartPhase(jobID, phase string) {
+func (c *Coordinator) setStartPhase(jobID, phase string) error {
 	if c.Store == nil {
-		return
+		return nil
 	}
 	job, ok := c.Store.jobs[jobID]
 	if !ok || job == nil {
-		return
+		return nil
 	}
 	job.StartPhase = phase
+	return c.checkBoundary(nil)
 }
 
-func (c *Coordinator) casStep(injector *FailureInjector, before, after Failpoint, op func() error) error {
+func (c *Coordinator) publishTerminal(jobID, attemptID string, epoch int64, terminal Outcome, proof TerminalProof, reason string, injector *FailureInjector) error {
+	return c.casStep(injector, FailTerminalBeforeCAS, FailTerminalAfterCAS, func() error {
+		_, err := c.Store.PublishTerminal(jobID, attemptID, epoch, terminal, proof, reason)
+		if err == nil {
+			delete(c.obligations, jobID)
+		}
+		return err
+	})
+}
+
+func (c *Coordinator) runStep(injector *FailureInjector, before, after Failpoint, modeledSideEffect bool, op func() error) error {
 	if err := c.inject(injector, before); err != nil {
 		return err
+	}
+	if modeledSideEffect {
+		c.Store.noteModeledSideEffect()
 	}
 	if err := op(); err != nil {
 		return c.checkBoundary(err)
@@ -1062,6 +1108,10 @@ func (c *Coordinator) casStep(injector *FailureInjector, before, after Failpoint
 		return err
 	}
 	return c.checkBoundary(nil)
+}
+
+func (c *Coordinator) casStep(injector *FailureInjector, before, after Failpoint, op func() error) error {
+	return c.runStep(injector, before, after, false, op)
 }
 
 func (c *Coordinator) StoreOp(after Failpoint, injector *FailureInjector, op func() error) error {
@@ -1075,17 +1125,7 @@ func (c *Coordinator) StoreOp(after Failpoint, injector *FailureInjector, op fun
 }
 
 func (c *Coordinator) sideEffectStep(injector *FailureInjector, before, after Failpoint, op func() error) error {
-	if err := c.inject(injector, before); err != nil {
-		return err
-	}
-	c.Store.noteModeledSideEffect()
-	if err := op(); err != nil {
-		return c.checkBoundary(err)
-	}
-	if err := c.inject(injector, after); err != nil {
-		return err
-	}
-	return c.checkBoundary(nil)
+	return c.runStep(injector, before, after, true, op)
 }
 
 func (c *Coordinator) injectPreRunnable(injector *FailureInjector, point Failpoint) error {
@@ -1120,6 +1160,14 @@ func (c *Coordinator) checkBoundary(err error) error {
 		return invErr
 	}
 	return err
+}
+
+func (c *Coordinator) checkPreRunnableBoundary(err error) error {
+	c.allowPreRunnable = true
+	defer func() {
+		c.allowPreRunnable = false
+	}()
+	return c.checkBoundary(err)
 }
 
 func (c *Coordinator) nextAttemptID() string {

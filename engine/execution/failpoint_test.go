@@ -122,10 +122,14 @@ func failpointCoverageEdges() []failpointCoverageEdge {
 		{name: "launch_quiescent_cas", before: FailLaunchQuiescentBeforeCAS, after: FailLaunchQuiescentAfterCAS, run: scenarios[FailLaunchQuiescentBeforeCAS]},
 		{name: "reconciliation_cas", before: FailReconciliationBeforeCAS, after: FailReconciliationAfterCAS, run: scenarios[FailReconciliationBeforeCAS]},
 		{name: "containment_signal_side_effect", before: FailContainmentSignalBefore, after: FailContainmentSignalAfter, run: scenarios[FailContainmentSignalBefore]},
+		{name: "containment_signal_cas", before: FailContainmentSignalBeforeCAS, after: FailContainmentSignalAfterCAS, run: scenarios[FailContainmentSignalBeforeCAS]},
 		{name: "containment_verify_side_effect", before: FailContainmentVerifyBefore, after: FailContainmentVerifyAfter, run: scenarios[FailContainmentVerifyBefore]},
+		{name: "containment_verify_cas", before: FailContainmentVerifyBeforeCAS, after: FailContainmentVerifyAfterCAS, run: scenarios[FailContainmentVerifyBeforeCAS]},
 		{name: "containment_record_cas", before: FailContainmentRecordBeforeCAS, after: FailContainmentRecordAfterCAS, run: scenarios[FailContainmentRecordBeforeCAS]},
 		{name: "retirement_close_side_effect", before: FailRetirementCloseBefore, after: FailRetirementCloseAfter, run: scenarios[FailRetirementCloseBefore]},
+		{name: "retirement_started_cas", before: FailRetirementStartedBeforeCAS, after: FailRetirementStartedAfterCAS, run: scenarios[FailRetirementStartedBeforeCAS]},
 		{name: "retirement_wait_side_effect", before: FailRetirementWaitBefore, after: FailRetirementWaitAfter, run: scenarios[FailRetirementWaitBefore]},
+		{name: "retirement_worker_exited_cas", before: FailRetirementWorkerBeforeCAS, after: FailRetirementWorkerAfterCAS, run: scenarios[FailRetirementWorkerBeforeCAS]},
 		{name: "retirement_verify_side_effect", before: FailRetirementVerifyBefore, after: FailRetirementVerifyAfter, run: scenarios[FailRetirementVerifyBefore]},
 		{name: "retirement_record_cas", before: FailRetirementRecordBeforeCAS, after: FailRetirementRecordAfterCAS, run: scenarios[FailRetirementRecordBeforeCAS]},
 		{name: "outcome_cas", before: FailOutcomeBeforeCAS, after: FailOutcomeAfterCAS, run: scenarios[FailOutcomeBeforeCAS]},
@@ -234,12 +238,20 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) {
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-reconcile-fp", "owner")
 		res := submitPreparedPermitted(t, c, "ws-reconcile-fp", "req-reconcile-fp", "fp")
 		_ = c.LiveSupervisorLossWithInjector(res.JobID, injector)
+		assertTerminalizedOrFailStopped(t, c, res.JobID)
 	}
 	expire := func(t *testing.T, injector *FailureInjector) {
 		t.Helper()
 		c := NewCoordinator(NewMemoryAdmissionStore(), "boot-expire-fp", "owner")
 		req := modelRequest("ws-expire-fp", "req-expire-fp", "fp")
-		if _, err := c.Submit(req, nil); err != nil {
+		res, err := c.Submit(req, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.PrepareSupervisor(res.JobID, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Cancel(res.JobID); err != nil {
 			t.Fatal(err)
 		}
 		_, _ = c.Expire(req.WorkspaceKey, req.RequestID, injector)
@@ -313,8 +325,12 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) {
 		FailLaunchQuiescentAfterCAS,
 		FailRetirementCloseBefore,
 		FailRetirementCloseAfter,
+		FailRetirementStartedBeforeCAS,
+		FailRetirementStartedAfterCAS,
 		FailRetirementWaitBefore,
 		FailRetirementWaitAfter,
+		FailRetirementWorkerBeforeCAS,
+		FailRetirementWorkerAfterCAS,
 		FailRetirementVerifyBefore,
 		FailRetirementVerifyAfter,
 		FailRetirementRecordBeforeCAS,
@@ -343,8 +359,12 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) {
 		FailReconciliationAfterCAS,
 		FailContainmentSignalBefore,
 		FailContainmentSignalAfter,
+		FailContainmentSignalBeforeCAS,
+		FailContainmentSignalAfterCAS,
 		FailContainmentVerifyBefore,
 		FailContainmentVerifyAfter,
+		FailContainmentVerifyBeforeCAS,
+		FailContainmentVerifyAfterCAS,
 		FailContainmentRecordBeforeCAS,
 		FailContainmentRecordAfterCAS,
 	} {

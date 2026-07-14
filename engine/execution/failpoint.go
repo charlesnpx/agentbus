@@ -48,14 +48,22 @@ const (
 	FailReconciliationAfterCAS        Failpoint = "reconciliation.after_cas"
 	FailContainmentSignalBefore       Failpoint = "containment_signal.before_side_effect"
 	FailContainmentSignalAfter        Failpoint = "containment_signal.after_side_effect"
+	FailContainmentSignalBeforeCAS    Failpoint = "containment_signal.before_cas"
+	FailContainmentSignalAfterCAS     Failpoint = "containment_signal.after_cas"
 	FailContainmentVerifyBefore       Failpoint = "containment_verify.before_side_effect"
 	FailContainmentVerifyAfter        Failpoint = "containment_verify.after_side_effect"
+	FailContainmentVerifyBeforeCAS    Failpoint = "containment_verify.before_cas"
+	FailContainmentVerifyAfterCAS     Failpoint = "containment_verify.after_cas"
 	FailContainmentRecordBeforeCAS    Failpoint = "containment_record.before_cas"
 	FailContainmentRecordAfterCAS     Failpoint = "containment_record.after_cas"
 	FailRetirementCloseBefore         Failpoint = "retirement_close.before_side_effect"
 	FailRetirementCloseAfter          Failpoint = "retirement_close.after_side_effect"
+	FailRetirementStartedBeforeCAS    Failpoint = "retirement_started.before_cas"
+	FailRetirementStartedAfterCAS     Failpoint = "retirement_started.after_cas"
 	FailRetirementWaitBefore          Failpoint = "retirement_wait.before_side_effect"
 	FailRetirementWaitAfter           Failpoint = "retirement_wait.after_side_effect"
+	FailRetirementWorkerBeforeCAS     Failpoint = "retirement_worker_exited.before_cas"
+	FailRetirementWorkerAfterCAS      Failpoint = "retirement_worker_exited.after_cas"
 	FailRetirementVerifyBefore        Failpoint = "retirement_verify.before_side_effect"
 	FailRetirementVerifyAfter         Failpoint = "retirement_verify.after_side_effect"
 	FailRetirementRecordBeforeCAS     Failpoint = "retirement_record.before_cas"
@@ -146,14 +154,22 @@ func AllFailpoints() []Failpoint {
 		FailReconciliationAfterCAS,
 		FailContainmentSignalBefore,
 		FailContainmentSignalAfter,
+		FailContainmentSignalBeforeCAS,
+		FailContainmentSignalAfterCAS,
 		FailContainmentVerifyBefore,
 		FailContainmentVerifyAfter,
+		FailContainmentVerifyBeforeCAS,
+		FailContainmentVerifyAfterCAS,
 		FailContainmentRecordBeforeCAS,
 		FailContainmentRecordAfterCAS,
 		FailRetirementCloseBefore,
 		FailRetirementCloseAfter,
+		FailRetirementStartedBeforeCAS,
+		FailRetirementStartedAfterCAS,
 		FailRetirementWaitBefore,
 		FailRetirementWaitAfter,
+		FailRetirementWorkerBeforeCAS,
+		FailRetirementWorkerAfterCAS,
 		FailRetirementVerifyBefore,
 		FailRetirementVerifyAfter,
 		FailRetirementRecordBeforeCAS,

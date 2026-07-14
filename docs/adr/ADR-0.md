@@ -16,8 +16,7 @@ and legacy unfenced submissions remain acknowledgement-gated. The model must def
 - One request key binds to one job and one fingerprint forever, including after GC through a tombstone.
 - Replay has no execution side effects.
 - Awaiting acknowledgement has no permit.
-- One live execution authority exists for each current-boot nonterminal job unless the daemon is
-  fail-stopping.
+- a current-boot nonterminal job has a matching live CoordinatorObligation OR the daemon is fail-stopping.
 - Permit implies durable supervisor identity; permit-maybe-sent implies containment is required.
 - Terminal jobs carry a valid terminal proof.
 - Owner or supervisor loss contains and terminalizes; it never auto-retries.

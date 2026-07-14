@@ -1,6 +1,9 @@
 package execution
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 type InvariantView struct {
 	Store                           *MemoryAdmissionStore
@@ -53,6 +56,23 @@ func CheckInvariants(view InvariantView) error {
 		}
 		if accepted := store.acceptedKeys[key]; accepted != "" && accepted != tombstone.JobID {
 			return fmt.Errorf("request key %q tombstone changed job from %s to %s", key, accepted, tombstone.JobID)
+		}
+	}
+	for jobID, obligation := range view.Obligations {
+		if !obligation.committed() {
+			continue
+		}
+		job, ok := store.jobs[jobID]
+		if !ok {
+			return fmt.Errorf("live obligation %s references missing aggregate", jobID)
+		}
+		if job.Terminal() {
+			return fmt.Errorf("live obligation %s references terminal aggregate", jobID)
+		}
+		for key, tombstone := range store.tombstones {
+			if tombstone.JobID == jobID {
+				return fmt.Errorf("tombstone %q has live obligation %s", key, jobID)
+			}
 		}
 	}
 
@@ -144,6 +164,9 @@ func CheckInvariants(view InvariantView) error {
 			return fmt.Errorf("job %s has invalid terminal proof %q", job.JobID, job.TerminalProof)
 		}
 		if job.Terminal() {
+			if !validTerminalOutcomeProofReason(job) {
+				return fmt.Errorf("job %s has invalid terminal outcome/proof/reason combination", job.JobID)
+			}
 			if job.PermitState == PermitGranted || job.PermitState == PermitMaybeSent || job.PermitState == PermitConsumed {
 				return fmt.Errorf("job %s is terminal with live permit state %s", job.JobID, job.PermitState)
 			}
@@ -292,6 +315,40 @@ func validTerminalProof(job *Aggregate) bool {
 		return job.RetirementEvidence.Present()
 	case ProofContained:
 		return job.Contained && job.Retired && job.ContainmentSignaled && job.ContainmentVerified && job.Containment.Present() && terminalOutcome(job.Outcome)
+	default:
+		return false
+	}
+}
+
+func validTerminalOutcomeProofReason(job *Aggregate) bool {
+	if job.TerminalReason == "" {
+		return false
+	}
+	switch job.TerminalProof {
+	case ProofNeverPermittedAndRetired:
+		switch job.Outcome {
+		case OutcomeCanceled:
+			return job.TerminalReason == "response_undeliverable" || job.TerminalReason == "canceled_before_permit"
+		case OutcomeFailed:
+			return strings.HasSuffix(job.TerminalReason, "_before_launch")
+		case OutcomeQuarantined:
+			return true
+		default:
+			return false
+		}
+	case ProofCleanQuiescentOutcomeAndRetired:
+		return terminalOutcome(job.Outcome) && job.TerminalReason == string(job.Outcome)
+	case ProofContained:
+		switch job.Outcome {
+		case OutcomeCanceled:
+			return job.TerminalReason == "canceled_after_permit"
+		case OutcomeReaped:
+			return job.TerminalReason == "daemon_restarted" || strings.HasSuffix(job.TerminalReason, "_contained")
+		case OutcomeQuarantined:
+			return true
+		default:
+			return false
+		}
 	default:
 		return false
 	}
