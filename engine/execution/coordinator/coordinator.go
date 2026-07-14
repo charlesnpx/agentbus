@@ -1,0 +1,561 @@
+package coordinator
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/charlesnpx/agentbus/engine/execution/model"
+)
+
+var (
+	ErrCoordinatorNotReady = errors.New("coordinator not ready")
+	ErrSupervisorRequired  = errors.New("coordinator supervisor is required")
+	ErrAuthorityRequired   = errors.New("coordinator authority is required")
+	ErrFatalRecovery       = errors.New("coordinator fatal recovery plan")
+)
+
+type AdmissionAuthority interface {
+	Accept(context.Context, AdmissionRequest) (AdmissionResult, error)
+	Apply(context.Context, model.JobID, model.Command) (StepResult, error)
+	Snapshot(context.Context, model.JobID) (JobSnapshot, error)
+	RecoveryPlan(context.Context, model.JobID, model.RecoveryTrigger) (model.RecoveryPlan, error)
+	ClaimPending(context.Context, model.AttemptRef, model.OwnerID) error
+	HasOwnedWork(context.Context) (bool, error)
+	FailStop(context.Context, error) error
+}
+
+type AdmissionRequest struct {
+	RequestKey   model.RequestKey
+	TaskIdentity model.TaskIdentity
+	Mode         model.Mode
+	SessionID    string
+}
+
+type AdmissionResult struct {
+	Record     model.SafetyRecord
+	Projection model.JobProjection
+	Replayed   bool
+}
+
+type StepResult struct {
+	Record     model.SafetyRecord
+	Projection model.JobProjection
+	Changed    bool
+}
+
+type JobSnapshot struct {
+	Record     model.SafetyRecord
+	Projection model.JobProjection
+}
+
+type Coordinator struct {
+	authority    AdmissionAuthority
+	supervisor   Supervisor
+	results      ResultPublisher
+	owner        model.OwnerID
+	shutdownPoll time.Duration
+}
+
+func New(authority AdmissionAuthority, supervisor Supervisor, results ResultPublisher, owner model.OwnerID) (*Coordinator, error) {
+	if authority == nil {
+		return nil, ErrAuthorityRequired
+	}
+	if supervisor == nil {
+		return nil, ErrSupervisorRequired
+	}
+	if err := owner.Validate(); err != nil {
+		return nil, fmt.Errorf("owner: %w", err)
+	}
+	return &Coordinator{
+		authority:    authority,
+		supervisor:   supervisor,
+		results:      results,
+		owner:        owner,
+		shutdownPoll: 10 * time.Millisecond,
+	}, nil
+}
+
+func (c *Coordinator) Submit(ctx context.Context, request AdmissionRequest) (AdmissionResult, error) {
+	if err := c.ready(); err != nil {
+		return AdmissionResult{}, err
+	}
+	accepted, err := c.authority.Accept(ctx, request)
+	if err != nil {
+		return AdmissionResult{}, err
+	}
+	if accepted.Record.Terminal != nil {
+		return accepted, nil
+	}
+	if err := c.authority.ClaimPending(ctx, accepted.Record.Attempt.Ref, c.owner); err != nil {
+		return accepted, c.failStop(ctx, fmt.Errorf("claim accepted attempt %s: %w", accepted.Record.JobID, err))
+	}
+	return accepted, nil
+}
+
+func (c *Coordinator) Snapshot(ctx context.Context, jobID model.JobID) (JobSnapshot, error) {
+	if err := c.ready(); err != nil {
+		return JobSnapshot{}, err
+	}
+	return c.authority.Snapshot(ctx, jobID)
+}
+
+func (c *Coordinator) PrepareSupervisor(ctx context.Context, jobID model.JobID, injector *FailureInjector) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	snapshot, err := c.authority.Snapshot(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if snapshot.Record.Terminal != nil || snapshot.Record.Attempt.Supervisor != nil {
+		return nil
+	}
+	if err := inject(injector, FailSupervisorPrepareBefore); err != nil {
+		return err
+	}
+	prepared, err := c.supervisor.Prepare(ctx, LaunchPlan{
+		JobID:        snapshot.Record.JobID,
+		Ref:          snapshot.Record.Attempt.Ref,
+		RequestKey:   snapshot.Record.RequestKey,
+		TaskIdentity: snapshot.Record.TaskIdentity,
+		SessionID:    snapshot.Projection.SessionID,
+	})
+	if err != nil {
+		return err
+	}
+	if err := prepared.ValidateFor(snapshot.Record.Attempt.Ref); err != nil {
+		return c.failStop(ctx, err)
+	}
+	if err := inject(injector, FailSupervisorPrepareAfter); err != nil {
+		return c.failStop(ctx, err)
+	}
+	_, err = c.authority.Apply(ctx, jobID, model.BindSupervisor{
+		Ref:        snapshot.Record.Attempt.Ref,
+		Supervisor: prepared.Identity,
+	})
+	if err != nil {
+		return c.failStop(ctx, fmt.Errorf("bind prepared supervisor: %w", err))
+	}
+	return nil
+}
+
+func (c *Coordinator) GrantPermit(ctx context.Context, jobID model.JobID, launchOrdinal uint8, nonce model.PermitNonce, injector *FailureInjector) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	ordinal, err := model.NewLaunchOrdinal(launchOrdinal)
+	if err != nil {
+		return err
+	}
+	if err := model.LaunchNonce(nonce).Validate(); err != nil {
+		return err
+	}
+	snapshot, err := c.authority.Snapshot(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if err := inject(injector, FailGrantBeforeCommit); err != nil {
+		return err
+	}
+	applied, err := c.authority.Apply(ctx, jobID, model.AuthorizeLaunch{
+		Ref:     snapshot.Record.Attempt.Ref,
+		Ordinal: ordinal,
+		Nonce:   nonce,
+	})
+	if err != nil {
+		return err
+	}
+	grant, ok := applied.Record.Attempt.Grants.Get(ordinal)
+	if !ok {
+		return c.failStop(ctx, fmt.Errorf("authority did not return launch grant %s for %s", ordinal, jobID))
+	}
+	prepared, err := preparedFromRecord(applied.Record)
+	if err != nil {
+		return c.failStop(ctx, err)
+	}
+	if err := inject(injector, FailGrantAfterCommit); err != nil {
+		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
+	}
+	if err := inject(injector, FailPermitSendBefore); err != nil {
+		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
+	}
+	if err := c.supervisor.SendPermit(ctx, prepared, *grant); err != nil {
+		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
+	}
+	if err := inject(injector, FailPermitSendAfter); err != nil {
+		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
+	}
+	return nil
+}
+
+func (c *Coordinator) Start(ctx context.Context, jobID model.JobID, injector *FailureInjector) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	snapshot, err := c.authority.Snapshot(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	prepared, err := preparedFromRecord(snapshot.Record)
+	if err != nil {
+		return err
+	}
+	grant, err := nextUnconsumedGrant(snapshot.Record)
+	if err != nil {
+		return err
+	}
+	if err := inject(injector, FailLaunchForked); err != nil {
+		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
+	}
+	if err := inject(injector, FailLaunchExeced); err != nil {
+		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
+	}
+	observation, err := c.supervisor.ObserveLaunch(ctx, prepared, grant)
+	if err != nil {
+		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
+	}
+	if observation.Ordinal == 0 {
+		observation.Ordinal = grant.Ordinal
+	}
+	if err := observation.ValidateFor(grant); err != nil {
+		return c.failStop(ctx, err)
+	}
+	_, err = c.authority.Apply(ctx, jobID, model.ObserveLaunchConsumed{
+		Ref:         snapshot.Record.Attempt.Ref,
+		Ordinal:     observation.Ordinal,
+		Child:       observation.Child,
+		Observation: observation.Evidence,
+	})
+	if err != nil {
+		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
+	}
+	return nil
+}
+
+func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome model.Outcome, result []byte, injector *FailureInjector) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	if !terminalOutcome(outcome) {
+		return fmt.Errorf("terminal outcome required: %s", outcome)
+	}
+	snapshot, err := c.authority.Snapshot(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	applied, err := c.authority.Apply(ctx, jobID, model.ObserveOutcome{
+		Ref:     snapshot.Record.Attempt.Ref,
+		Outcome: outcome,
+	})
+	if err != nil {
+		return err
+	}
+	record := applied.Record
+	if err := c.certifyQuiescence(ctx, &record, injector); err != nil {
+		return err
+	}
+	if completionOutcome(outcome) {
+		if c.results == nil {
+			return errors.New("result publisher is required for completed outcomes")
+		}
+		if err := c.publishResult(ctx, jobID, result, injector); err != nil {
+			return err
+		}
+	}
+	snapshot, err = c.authority.Snapshot(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if err := c.retire(ctx, snapshot.Record, injector); err != nil {
+		return err
+	}
+	snapshot, err = c.authority.Snapshot(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	_, err = c.authority.Apply(ctx, jobID, model.Finalize{
+		Ref: snapshot.Record.Attempt.Ref,
+		Intent: model.TerminalIntent{
+			Outcome: outcome,
+			Cause:   model.CauseCompletedNormally,
+		},
+	})
+	return err
+}
+
+func (c *Coordinator) Cancel(ctx context.Context, jobID model.JobID, injector *FailureInjector) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	if _, err := c.authority.Apply(ctx, jobID, model.RequestCancel{JobID: jobID}); err != nil {
+		return err
+	}
+	return c.recover(ctx, jobID, model.RecoveryCancelAfterGrant, nil, injector)
+}
+
+func (c *Coordinator) LiveSupervisorLoss(ctx context.Context, jobID model.JobID, injector *FailureInjector) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	return c.recover(ctx, jobID, model.RecoveryLiveLoss, nil, injector)
+}
+
+func (c *Coordinator) Recover(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, injector *FailureInjector) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	return c.recover(ctx, jobID, trigger, nil, injector)
+}
+
+func (c *Coordinator) HasOwnedWork(ctx context.Context) (bool, error) {
+	if err := c.ready(); err != nil {
+		return false, err
+	}
+	return c.authority.HasOwnedWork(ctx)
+}
+
+func (c *Coordinator) Shutdown(ctx context.Context) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	poll := c.shutdownPoll
+	if poll <= 0 {
+		poll = 10 * time.Millisecond
+	}
+	for {
+		owned, err := c.authority.HasOwnedWork(ctx)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return nil
+		}
+		timer := time.NewTimer(poll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *Coordinator) certifyQuiescence(ctx context.Context, record *model.SafetyRecord, injector *FailureInjector) error {
+	prepared, err := preparedFromRecord(*record)
+	if err != nil {
+		return err
+	}
+	for _, ordinal := range record.Attempt.Consumed.FilledOrdinals() {
+		consumed, ok := record.Attempt.Consumed.Get(ordinal)
+		if !ok {
+			continue
+		}
+		if _, ok := record.Attempt.Quiescence.Get(ordinal); ok {
+			continue
+		}
+		receipt, err := c.supervisor.VerifyQuiescence(ctx, prepared, *consumed)
+		if err != nil {
+			return err
+		}
+		if err := inject(injector, FailLaunchQuiescent); err != nil {
+			return err
+		}
+		applied, err := c.authority.Apply(ctx, record.JobID, model.ObserveLaunchQuiescent{
+			Ref:     record.Attempt.Ref,
+			Receipt: receipt,
+		})
+		if err != nil {
+			return err
+		}
+		*record = applied.Record
+	}
+	return nil
+}
+
+func (c *Coordinator) publishResult(ctx context.Context, jobID model.JobID, payload []byte, injector *FailureInjector) error {
+	if err := inject(injector, FailResultTempWrite); err != nil {
+		return err
+	}
+	published, err := c.results.Publish(ctx, jobID, payload)
+	if err != nil {
+		return err
+	}
+	if err := inject(injector, FailResultFsync); err != nil {
+		return err
+	}
+	verified, err := c.results.Verify(ctx, published.Result)
+	if err != nil {
+		return err
+	}
+	if err := inject(injector, FailResultRename); err != nil {
+		return err
+	}
+	snapshot, err := c.authority.Snapshot(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	_, err = c.authority.Apply(ctx, jobID, model.CertifyResult{
+		Ref:     snapshot.Record.Attempt.Ref,
+		Receipt: verified,
+	})
+	return err
+}
+
+func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, injector *FailureInjector) error {
+	for i := 0; i < 8; i++ {
+		plan, err := c.authority.RecoveryPlan(ctx, jobID, trigger)
+		if err != nil {
+			if cause != nil {
+				return fmt.Errorf("%w; recovery plan: %v", cause, err)
+			}
+			return err
+		}
+		switch plan.Next.Kind {
+		case model.RecoveryFinalizeCertified:
+			if plan.Next.Finalize == nil {
+				return cause
+			}
+			if _, err := c.authority.Apply(ctx, jobID, *plan.Next.Finalize); err != nil {
+				if cause != nil {
+					return fmt.Errorf("%w; finalize recovery: %v", cause, err)
+				}
+				return err
+			}
+			return cause
+		case model.RecoveryRetireThenFinalize:
+			snapshot, err := c.authority.Snapshot(ctx, jobID)
+			if err != nil {
+				return err
+			}
+			if err := c.retire(ctx, snapshot.Record, injector); err != nil {
+				return c.failStop(ctx, err)
+			}
+		case model.RecoveryContainThenFinalize:
+			snapshot, err := c.authority.Snapshot(ctx, jobID)
+			if err != nil {
+				return err
+			}
+			if err := c.contain(ctx, snapshot.Record, injector); err != nil {
+				return c.failStop(ctx, err)
+			}
+		case model.RecoveryFatalUnprovable:
+			err := fmt.Errorf("%w: %s trigger %d", ErrFatalRecovery, jobID, trigger)
+			if cause != nil {
+				err = fmt.Errorf("%w; %v", cause, err)
+			}
+			return c.failStop(ctx, err)
+		default:
+			return c.failStop(ctx, fmt.Errorf("%w: unknown recovery action %d", ErrFatalRecovery, plan.Next.Kind))
+		}
+	}
+	return c.failStop(ctx, fmt.Errorf("%w: recovery did not converge for %s", ErrFatalRecovery, jobID))
+}
+
+func (c *Coordinator) contain(ctx context.Context, record model.SafetyRecord, injector *FailureInjector) error {
+	if record.Attempt.Containment != nil {
+		return nil
+	}
+	prepared, err := preparedFromRecord(record)
+	if err != nil {
+		return err
+	}
+	if err := inject(injector, FailContainSignal); err != nil {
+		return err
+	}
+	receipt, err := c.supervisor.Contain(ctx, prepared)
+	if err != nil {
+		return err
+	}
+	if err := inject(injector, FailContainVerified); err != nil {
+		return err
+	}
+	_, err = c.authority.Apply(ctx, record.JobID, model.CertifyContainment{
+		Ref:     record.Attempt.Ref,
+		Receipt: receipt,
+	})
+	if err != nil {
+		return c.failStop(ctx, fmt.Errorf("certify containment: %w", err))
+	}
+	return nil
+}
+
+func (c *Coordinator) retire(ctx context.Context, record model.SafetyRecord, injector *FailureInjector) error {
+	if record.Attempt.Retirement != nil {
+		return nil
+	}
+	prepared, err := preparedFromRecord(record)
+	if err != nil {
+		return err
+	}
+	if err := inject(injector, FailRetireClose); err != nil {
+		return err
+	}
+	receipt, err := c.supervisor.Retire(ctx, prepared)
+	if err != nil {
+		return err
+	}
+	if err := inject(injector, FailRetireFsync); err != nil {
+		return err
+	}
+	_, err = c.authority.Apply(ctx, record.JobID, model.CertifyRetirement{
+		Ref:     record.Attempt.Ref,
+		Receipt: receipt,
+	})
+	if err != nil {
+		return c.failStop(ctx, fmt.Errorf("certify retirement: %w", err))
+	}
+	return nil
+}
+
+func (c *Coordinator) ready() error {
+	if c == nil || c.authority == nil {
+		return ErrCoordinatorNotReady
+	}
+	return nil
+}
+
+func (c *Coordinator) failStop(ctx context.Context, err error) error {
+	if c != nil && c.authority != nil && err != nil {
+		_ = c.authority.FailStop(ctx, err)
+	}
+	return err
+}
+
+func preparedFromRecord(record model.SafetyRecord) (PreparedSupervisor, error) {
+	if record.Attempt.Supervisor == nil {
+		return PreparedSupervisor{}, fmt.Errorf("supervisor identity is not bound for %s", record.JobID)
+	}
+	prepared := PreparedSupervisor{Ref: record.Attempt.Ref, Identity: *record.Attempt.Supervisor}
+	if err := prepared.ValidateFor(record.Attempt.Ref); err != nil {
+		return PreparedSupervisor{}, err
+	}
+	return prepared, nil
+}
+
+func nextUnconsumedGrant(record model.SafetyRecord) (model.LaunchGrant, error) {
+	for _, ordinal := range record.Attempt.Grants.FilledOrdinals() {
+		grant, ok := record.Attempt.Grants.Get(ordinal)
+		if !ok {
+			continue
+		}
+		if _, consumed := record.Attempt.Consumed.Get(ordinal); !consumed {
+			return *grant, nil
+		}
+	}
+	return model.LaunchGrant{}, fmt.Errorf("no unconsumed launch grant for %s", record.JobID)
+}
+
+func terminalOutcome(outcome model.Outcome) bool {
+	switch outcome {
+	case model.OutcomeCompleted, model.OutcomeCompletedNoncompliant, model.OutcomeFailed, model.OutcomeTimedOut, model.OutcomeCanceled, model.OutcomeReaped, model.OutcomeInterrupted, model.OutcomeQuarantined:
+		return true
+	default:
+		return false
+	}
+}
+
+func completionOutcome(outcome model.Outcome) bool {
+	return outcome == model.OutcomeCompleted || outcome == model.OutcomeCompletedNoncompliant
+}
