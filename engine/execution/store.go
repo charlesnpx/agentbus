@@ -181,28 +181,29 @@ func (s *MemoryAdmissionStore) ResolveOrAccept(req SubmitRequest) (ResolveResult
 		}
 	}
 	aggregate := &Aggregate{
-		JobID:           req.JobID,
-		WorkspaceKey:    req.WorkspaceKey,
-		RequestID:       req.RequestID,
-		Fingerprint:     req.Fingerprint,
-		Mode:            req.Mode,
-		LaunchSpec:      req.LaunchSpec,
-		BootID:          req.BootID,
-		OwnerID:         req.OwnerID,
-		AttemptID:       req.AttemptID,
-		Epoch:           req.Epoch,
-		Decision:        decision,
-		Dispatch:        dispatch,
-		Outcome:         OutcomeNone,
-		Acknowledged:    acknowledged,
-		PermitState:     PermitNone,
-		Supervisor:      supervisor,
-		SessionID:       req.SessionID,
-		CreatedStep:     s.step,
-		UpdatedStep:     s.step,
-		LaunchQuiescent: map[int]bool{},
-		LaunchEvidence:  map[int]LaunchQuiescenceEvidence{},
-		LiveOrdinals:    map[int]int{},
+		JobID:              req.JobID,
+		WorkspaceKey:       req.WorkspaceKey,
+		RequestID:          req.RequestID,
+		Fingerprint:        req.Fingerprint,
+		Mode:               req.Mode,
+		LaunchSpec:         req.LaunchSpec,
+		BootID:             req.BootID,
+		OwnerID:            req.OwnerID,
+		AttemptID:          req.AttemptID,
+		Epoch:              req.Epoch,
+		Decision:           decision,
+		Dispatch:           dispatch,
+		Outcome:            OutcomeNone,
+		Acknowledged:       acknowledged,
+		PermitState:        PermitNone,
+		Supervisor:         supervisor,
+		SessionID:          req.SessionID,
+		CreatedStep:        s.step,
+		UpdatedStep:        s.step,
+		LaunchQuiescent:    map[int]bool{},
+		LaunchEvidence:     map[int]LaunchQuiescenceEvidence{},
+		LaunchNonceHistory: map[int]string{},
+		LiveOrdinals:       map[int]int{},
 	}
 	if aggregate.SessionID == "" {
 		aggregate.SessionID = aggregate.LaunchSpec.SessionID
@@ -374,6 +375,28 @@ func (s *MemoryAdmissionStore) GrantPermit(jobID, attemptID string, epoch int64,
 		if launchOrdinal == 2 && !job.LaunchQuiescent[1] {
 			return protocolError(CodePreconditionFailed, job.JobID, "launch ordinal 1 is not quiescent")
 		}
+		if job.LaunchQuiescent[launchOrdinal] {
+			return protocolError(CodePreconditionFailed, job.JobID, "launch ordinal was already quiescent")
+		}
+		if _, used := job.LaunchNonceHistory[launchOrdinal]; used {
+			return protocolError(CodePreconditionFailed, job.JobID, "launch ordinal was already used")
+		}
+		if launchOrdinal == 1 && len(job.LaunchNonceHistory) != 0 {
+			return protocolError(CodePreconditionFailed, job.JobID, "launch ordinal 1 must be first")
+		}
+		if launchOrdinal == 2 {
+			if len(job.LaunchNonceHistory) != 1 {
+				return protocolError(CodePreconditionFailed, job.JobID, "launch ordinal 2 requires exactly ordinal 1 history")
+			}
+			if _, used := job.LaunchNonceHistory[1]; !used {
+				return protocolError(CodePreconditionFailed, job.JobID, "launch ordinal 1 history is missing")
+			}
+		}
+		for _, usedNonce := range job.LaunchNonceHistory {
+			if usedNonce == nonce {
+				return protocolError(CodePreconditionFailed, job.JobID, "launch nonce was already used")
+			}
+		}
 		if job.ActiveOrdinal != 0 || liveOrdinalCount(job.LiveOrdinals) != 0 || job.PermitState != PermitNone {
 			return protocolError(CodePreconditionFailed, job.JobID, "an ordinal is already active")
 		}
@@ -383,6 +406,7 @@ func (s *MemoryAdmissionStore) GrantPermit(jobID, attemptID string, epoch int64,
 		job.ContainmentRequired = true
 		job.LaunchOrdinal = launchOrdinal
 		job.ActiveOrdinal = launchOrdinal
+		job.LaunchNonceHistory[launchOrdinal] = nonce
 		job.LiveOrdinals[launchOrdinal] = 1
 		job.Retired = false
 		job.Dispatch = DispatchPermitGranted
