@@ -24,6 +24,12 @@ preconditions. Stale attempt, epoch, or launch-ordinal messages cannot mutate a 
 Production code must keep durable state and OS effects separated and make failure to terminalize a
 daemon-level problem.
 
+## ADR-11 amendment
+
+`AdmissionAuthority` owns request serialization, lifecycle linearization, and runtime ownership.
+The coordinator retains OS/process side effects. Store/repository methods no longer encode lifecycle
+policy.
+
 ## Non-goals
 
 This ADR does not define the bbolt schema; ADR-1 does.

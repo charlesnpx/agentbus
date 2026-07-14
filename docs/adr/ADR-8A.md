@@ -22,6 +22,11 @@ result names belonging to an active publication. Cleanup is never age-based.
 
 Cleanup must consult both durable state and live coordinator ownership.
 
+## ADR-11 amendment
+
+Cleanup consumes authority projections plus authority-owned runtime exclusions. It never reads
+proof-adjacent coordinator maps.
+
 ## Non-goals
 
 This ADR does not change the result file format.

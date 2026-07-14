@@ -24,6 +24,12 @@ fatal.
 
 Bindings outlive corrupt job records, and diagnostics must point operators to the corrupt aggregate.
 
+## ADR-11 amendment
+
+Projection corruption and safety-record corruption have different policies. A valid proof/safety
+record permits proof-derived recovery despite projection corruption. Missing or corrupt proof
+evidence, or untrustworthy containment identity, is fatal.
+
 ## Non-goals
 
 This ADR does not specify the diagnostic file format beyond requiring an external pointer.

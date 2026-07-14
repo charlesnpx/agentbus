@@ -24,6 +24,11 @@ inspection, containment, verified absence, and reaped terminalization. Unprovabl
 Startup latency includes reconciliation, and fatal diagnostics must identify the failing job and
 attempt.
 
+## ADR-11 amendment
+
+Startup reconciliation produces a non-forgeable `Ready` capability only after the durable boot-ready
+commit and startup-anchor advancement. Socket binding follows that capability.
+
 ## Non-goals
 
 This ADR does not promise durable execution after restart.

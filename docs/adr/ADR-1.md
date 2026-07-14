@@ -25,6 +25,12 @@ in the same transaction.
 Later bbolt implementation must model requests, tombstones, jobs, attempts, and quarantine as one
 root authority for fenced coordinator jobs.
 
+## ADR-11 amendment
+
+`AdmissionAuthority` is the coordinator/server-facing durable-operation boundary. Its repository is
+internal and record-oriented, not a public lifecycle-policy surface. Atomic acceptance still writes
+the request binding, safety/proof record, and projection in one root transaction.
+
 ## Non-goals
 
 The root store is not authoritative for every preexisting legacy JSON job.

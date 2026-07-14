@@ -29,6 +29,11 @@ contained and terminal-committed.
 
 Operational replacement becomes lifecycle-aware and may be delayed by reconciliation.
 
+## ADR-11 amendment
+
+`AdmissionAuthority` owns `HasOwnedWork` and terminal-release semantics. Coordinator shutdown executes
+authority plans rather than deriving release policy from private coordinator/store maps.
+
 ## Non-goals
 
 This ADR does not implement durable execution handoff to a replacement daemon.

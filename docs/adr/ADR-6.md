@@ -22,6 +22,11 @@ uncertain and requires containment. Completion versus cancel has a deterministic
 
 Crash on either side of the permit send is reconciled through durable state and containment.
 
+## ADR-11 amendment
+
+Grant and cancel are mutually exclusive authority commands. The authority allocates the permit nonce
+and commits the grant before returning that nonce to the coordinator.
+
 ## Non-goals
 
 This ADR does not implement backend cancellation mechanics.

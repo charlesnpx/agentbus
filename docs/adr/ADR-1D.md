@@ -1,5 +1,7 @@
 # ADR-1D: Execution command surface boundaries
 
+**Status:** Superseded by [ADR-11](ADR-11-admission-authority.md).
+
 ## Decision
 
 The execution model preserves the frozen AdmissionStore interface. The public store contract remains
@@ -18,3 +20,9 @@ The frozen surface is the durable storage contract, not the complete coordinator
 inventory. Internal phase helpers must remain typed to the concrete harness/store and must still be
 single-boundary transitions with immediate invariant checks and distinct failpoints where they represent
 a crash-sensitive mutation.
+
+## Supersession
+
+ADR-11 replaces this boundary. Concrete-only phase helpers are forbidden as an architecture boundary.
+Crash-sensitive intermediate phases remain effect diagnostics, while final proof-bearing receipts are
+commands to `AdmissionAuthority`.
