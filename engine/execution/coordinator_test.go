@@ -90,20 +90,84 @@ func TestCorrectiveLaunchOrdinalRequiresQuiescence(t *testing.T) {
 	if err := c.Start(res.JobID, nil); err != nil {
 		t.Fatal(err)
 	}
-	job, _ := c.Store.GetJob(res.JobID)
-	if _, err := c.Store.RecordLaunchExitEvidence(res.JobID, job.AttemptID, job.Epoch, 1, Evidence{Kind: "child_exit", Detail: "test"}, Evidence{Kind: "group_empty", Detail: "test"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.Store.RecordLaunchQuiescent(res.JobID, job.AttemptID, job.Epoch, 1); err != nil {
-		t.Fatal(err)
-	}
+	quiesceCurrentLaunch(t, c, res.JobID)
 	if err := c.GrantPermit(res.JobID, 2, "nonce-2", nil); err != nil {
 		t.Fatal(err)
 	}
 	checkCoordinator(t, c)
-	job, _ = c.Store.GetJob(res.JobID)
+	job, _ := c.Store.GetJob(res.JobID)
 	if job.LaunchOrdinal != 2 || !job.LaunchQuiescent[1] {
 		t.Fatalf("job = %+v, want ordinal 2 after ordinal 1 quiescent", job)
+	}
+}
+
+func TestInvariantRejectsRegrantOrdinalOne(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-regrant-1", "owner")
+	res := submitPreparedPermitted(t, c, "ws-regrant-1", "req-regrant-1", "fp-regrant-1")
+	if err := c.Start(res.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	quiesceCurrentLaunch(t, c, res.JobID)
+
+	job := c.Store.jobs[res.JobID]
+	job.PermitState = PermitGranted
+	job.PermitNonce = "nonce-regrant-1"
+	job.LaunchOrdinal = 1
+	job.ActiveOrdinal = 1
+	job.LiveOrdinals[1] = 1
+	job.Dispatch = DispatchPermitGranted
+
+	if err := c.Check(); err == nil {
+		t.Fatal("CheckInvariants returned nil for re-granted ordinal 1")
+	}
+}
+
+func TestInvariantRejectsRegrantOrdinalTwo(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-regrant-2", "owner")
+	res := submitPreparedPermitted(t, c, "ws-regrant-2", "req-regrant-2", "fp-regrant-2")
+	if err := c.Start(res.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	quiesceCurrentLaunch(t, c, res.JobID)
+	if err := c.GrantPermit(res.JobID, 2, "nonce-2", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(res.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	quiesceCurrentLaunch(t, c, res.JobID)
+
+	job := c.Store.jobs[res.JobID]
+	job.PermitState = PermitGranted
+	job.PermitNonce = "nonce-regrant-2"
+	job.LaunchOrdinal = 2
+	job.ActiveOrdinal = 2
+	job.LiveOrdinals[2] = 1
+	job.Dispatch = DispatchPermitGranted
+
+	if err := c.Check(); err == nil {
+		t.Fatal("CheckInvariants returned nil for re-granted ordinal 2")
+	}
+}
+
+func TestInvariantRejectsLaunchNonceReuse(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-nonce-reuse", "owner")
+	res := submitPreparedPermitted(t, c, "ws-nonce-reuse", "req-nonce-reuse", "fp-nonce-reuse")
+	if err := c.Start(res.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	quiesceCurrentLaunch(t, c, res.JobID)
+
+	job := c.Store.jobs[res.JobID]
+	job.LaunchNonceHistory[2] = job.LaunchNonceHistory[1]
+	job.LaunchQuiescent[2] = true
+	job.LaunchEvidence[2] = LaunchQuiescenceEvidence{
+		ChildExited: Evidence{Kind: "child_exit", Detail: "test"},
+		GroupEmpty:  Evidence{Kind: "group_empty", Detail: "test"},
+	}
+
+	if err := c.Check(); err == nil {
+		t.Fatal("CheckInvariants returned nil for reused launch nonce")
 	}
 }
 
@@ -164,6 +228,20 @@ func submitPreparedPermitted(t *testing.T, c *Coordinator, workspaceKey, request
 	}
 	checkCoordinator(t, c)
 	return res
+}
+
+func quiesceCurrentLaunch(t *testing.T, c *Coordinator, jobID string) {
+	t.Helper()
+	job, ok := c.Store.GetJob(jobID)
+	if !ok {
+		t.Fatal("job missing")
+	}
+	if _, err := c.Store.RecordLaunchExitEvidence(jobID, job.AttemptID, job.Epoch, job.LaunchOrdinal, Evidence{Kind: "child_exit", Detail: "test"}, Evidence{Kind: "group_empty", Detail: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Store.RecordLaunchQuiescent(jobID, job.AttemptID, job.Epoch, job.LaunchOrdinal); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func checkCoordinator(t *testing.T, c *Coordinator) {

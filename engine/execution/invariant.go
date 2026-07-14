@@ -87,6 +87,9 @@ func CheckInvariants(view InvariantView) error {
 				return fmt.Errorf("job %s launch ordinal %d quiescent without child-exit and group-empty evidence", job.JobID, ordinal)
 			}
 		}
+		if err := validateLaunchNonceHistory(job); err != nil {
+			return err
+		}
 		for ordinal, count := range job.LiveOrdinals {
 			if count < 0 {
 				return fmt.Errorf("job %s launch ordinal %d has negative live authority count", job.JobID, ordinal)
@@ -94,12 +97,18 @@ func CheckInvariants(view InvariantView) error {
 			if count > 1 {
 				return fmt.Errorf("job %s launch ordinal %d has %d live authorities", job.JobID, ordinal, count)
 			}
+			if count > 0 && job.LaunchQuiescent[ordinal] {
+				return fmt.Errorf("job %s launch ordinal %d has live authority after quiescence", job.JobID, ordinal)
+			}
 		}
 		if liveOrdinalCount(job.LiveOrdinals) > 1 {
 			return fmt.Errorf("job %s has more than one live execution authority", job.JobID)
 		}
 		if job.ActiveOrdinal != 0 && job.LiveOrdinals[job.ActiveOrdinal] != 1 {
 			return fmt.Errorf("job %s active ordinal %d is not represented in live authority set", job.JobID, job.ActiveOrdinal)
+		}
+		if job.ActiveOrdinal != 0 && job.LaunchQuiescent[job.ActiveOrdinal] {
+			return fmt.Errorf("job %s active ordinal %d was already quiescent", job.JobID, job.ActiveOrdinal)
 		}
 		if job.Terminal() && !validTerminalProof(job) {
 			return fmt.Errorf("job %s has invalid terminal proof %q", job.JobID, job.TerminalProof)
@@ -141,6 +150,61 @@ func CheckInvariants(view InvariantView) error {
 		}
 		if job.LaunchOrdinal == 2 && !job.LaunchQuiescent[1] {
 			return fmt.Errorf("job %s launch ordinal 2 without ordinal 1 quiescent", job.JobID)
+		}
+	}
+	return nil
+}
+
+func validateLaunchNonceHistory(job *Aggregate) error {
+	if len(job.LaunchNonceHistory) > 2 {
+		return fmt.Errorf("job %s has more than two launch nonce history entries", job.JobID)
+	}
+	seenNonces := map[string]int{}
+	for ordinal, nonce := range job.LaunchNonceHistory {
+		if ordinal != 1 && ordinal != 2 {
+			return fmt.Errorf("job %s has invalid launch nonce history ordinal %d", job.JobID, ordinal)
+		}
+		if previous, ok := seenNonces[nonce]; ok {
+			return fmt.Errorf("job %s launch nonce reused by ordinals %d and %d", job.JobID, previous, ordinal)
+		}
+		seenNonces[nonce] = ordinal
+	}
+	_, used1 := job.LaunchNonceHistory[1]
+	_, used2 := job.LaunchNonceHistory[2]
+	if used2 {
+		if !used1 {
+			return fmt.Errorf("job %s launch ordinal 2 history without ordinal 1 history", job.JobID)
+		}
+		if !job.LaunchQuiescent[1] {
+			return fmt.Errorf("job %s launch ordinal 2 history without ordinal 1 quiescent", job.JobID)
+		}
+	}
+	for ordinal, quiescent := range job.LaunchQuiescent {
+		if !quiescent {
+			continue
+		}
+		if ordinal != 1 && ordinal != 2 {
+			return fmt.Errorf("job %s has invalid quiescent launch ordinal %d", job.JobID, ordinal)
+		}
+		if _, used := job.LaunchNonceHistory[ordinal]; !used {
+			return fmt.Errorf("job %s launch ordinal %d quiescent without nonce history", job.JobID, ordinal)
+		}
+	}
+	if job.LaunchOrdinal != 0 {
+		if job.LaunchOrdinal != 1 && job.LaunchOrdinal != 2 {
+			return fmt.Errorf("job %s has invalid current launch ordinal %d", job.JobID, job.LaunchOrdinal)
+		}
+		if _, used := job.LaunchNonceHistory[job.LaunchOrdinal]; !used {
+			return fmt.Errorf("job %s current launch ordinal %d has no nonce history", job.JobID, job.LaunchOrdinal)
+		}
+	}
+	if job.PermitState == PermitGranted || job.PermitState == PermitMaybeSent || job.PermitState == PermitConsumed {
+		nonce, used := job.LaunchNonceHistory[job.LaunchOrdinal]
+		if !used || nonce != job.PermitNonce {
+			return fmt.Errorf("job %s live launch permit nonce does not match durable history", job.JobID)
+		}
+		if job.LaunchQuiescent[job.LaunchOrdinal] {
+			return fmt.Errorf("job %s live launch ordinal %d was already quiescent", job.JobID, job.LaunchOrdinal)
 		}
 	}
 	return nil

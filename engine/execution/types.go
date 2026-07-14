@@ -293,6 +293,7 @@ type Aggregate struct {
 	ActiveOrdinal           int
 	LaunchQuiescent         map[int]bool
 	LaunchEvidence          map[int]LaunchQuiescenceEvidence
+	LaunchNonceHistory      map[int]string
 	LiveOrdinals            map[int]int
 	Supervisor              GroupRef
 	Child                   ChildRef
@@ -336,6 +337,9 @@ func (a *Aggregate) ensureMaps() {
 	if a.LaunchEvidence == nil {
 		a.LaunchEvidence = map[int]LaunchQuiescenceEvidence{}
 	}
+	if a.LaunchNonceHistory == nil {
+		a.LaunchNonceHistory = map[int]string{}
+	}
 	if a.LiveOrdinals == nil {
 		a.LiveOrdinals = map[int]int{}
 	}
@@ -344,6 +348,7 @@ func (a *Aggregate) ensureMaps() {
 func (a Aggregate) copy() Aggregate {
 	a.LaunchQuiescent = copyBoolMap(a.LaunchQuiescent)
 	a.LaunchEvidence = copyLaunchEvidenceMap(a.LaunchEvidence)
+	a.LaunchNonceHistory = copyStringByIntMap(a.LaunchNonceHistory)
 	a.LiveOrdinals = copyIntMap(a.LiveOrdinals)
 	a.Supervisor.KnownChildRefs = append([]ChildRef(nil), a.Supervisor.KnownChildRefs...)
 	return a
@@ -376,6 +381,17 @@ func copyIntMap(in map[int]int) map[int]int {
 		return map[int]int{}
 	}
 	out := make(map[int]int, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func copyStringByIntMap(in map[int]string) map[int]string {
+	if len(in) == 0 {
+		return map[int]string{}
+	}
+	out := make(map[int]string, len(in))
 	for k, v := range in {
 		out[k] = v
 	}
