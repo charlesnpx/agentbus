@@ -11,6 +11,7 @@ They are constraints for the executable lifecycle model and later production uni
 | [ADR-1A](ADR-1A.md) | Whole-store integrity failures are fatal and never silently recreated. |
 | [ADR-1B](ADR-1B.md) | An external admission-authority anchor detects missing, mismatched, or rolled-back DBs. |
 | [ADR-1C](ADR-1C.md) | Corrupt aggregate values preserve request bindings and quarantine or fail visibly. |
+| [ADR-1D](ADR-1D.md) | AdmissionStore contains durable state transitions; coordinator-only phase tracking stays outside it. |
 | [ADR-2](ADR-2.md) | The current-boot coordinator owns OS effects; the store owns durable CAS transitions. |
 | [ADR-2A](ADR-2A.md) | Coordinator obligations are linearized before commit and the coordinator is fail-stop. |
 | [ADR-2B](ADR-2B.md) | Submission modes are IdentifiedFenced, LegacyFenced, and LegacyUnfenced. |

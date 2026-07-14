@@ -23,16 +23,25 @@ type Coordinator struct {
 }
 
 type LegacyUnfencedRun struct {
-	RunID        string
-	WorkspaceKey string
-	Started      bool
-	Acknowledged bool
-	Retired      bool
+	RunID                string
+	WorkspaceKey         string
+	BackendHandleCreated bool
+	Prepared             bool
+	Started              bool
+	Launched             bool
+	Launches             int
+	Acknowledged         bool
+	Retired              bool
 }
 
 func NewCoordinator(store *MemoryAdmissionStore, bootID, ownerID string) *Coordinator {
 	if store == nil {
 		store = NewMemoryAdmissionStore()
+	}
+	if store.hasInitializedStorage() {
+		store.startupAnchorObserved = false
+		store.startupAnchorDispositionPersisted = false
+		store.startupAnchorCompleted = false
 	}
 	if bootID == "" {
 		bootID = "boot-1"
@@ -146,14 +155,18 @@ func (c *Coordinator) Submit(req SubmitRequest, injector *FailureInjector) (Reso
 		}
 		return ResolveResult{}, c.deleteObligation(req.JobID, err)
 	}
-	if err := c.setObligationState(req.JobID, ObligationCommitted); err != nil {
-		return result, err
-	}
-	if err := c.injectPreRunnable(injector, FailPostCommitPreRunnable); err != nil {
+	if err := c.injectPreRunnable(injector, FailAdmissionAfterCommit); err != nil {
 		c.beginFailStop()
 		return result, c.checkBoundary(err)
 	}
-	if err := c.injectPreRunnable(injector, FailAdmissionAfterCommit); err != nil {
+	if err := c.setObligationState(req.JobID, ObligationCommitted); err != nil {
+		return result, err
+	}
+	if err := c.injectPreRunnable(injector, FailAdmissionCommittedMark); err != nil {
+		c.beginFailStop()
+		return result, c.checkBoundary(err)
+	}
+	if err := c.injectPreRunnable(injector, FailPostCommitPreRunnable); err != nil {
 		c.beginFailStop()
 		return result, c.checkBoundary(err)
 	}
@@ -220,12 +233,13 @@ func (c *Coordinator) SubmitLegacyUnfenced(req SubmitRequest, responseDelivered 
 		WorkspaceKey: req.WorkspaceKey,
 	}
 	c.nextLegacyRunID++
-	if err := c.inject(injector, FailLegacyUnfencedStartBefore); err != nil {
+	if err := c.inject(injector, FailLegacyUnfencedPrepareBefore); err != nil {
 		return run, err
 	}
 	c.Store.noteModeledSideEffect()
-	run.Started = true
-	if err := c.inject(injector, FailLegacyUnfencedStartAfter); err != nil {
+	run.BackendHandleCreated = true
+	run.Prepared = true
+	if err := c.inject(injector, FailLegacyUnfencedPrepareAfter); err != nil {
 		run.Retired = true
 		return run, protocolError(CodeLegacyUnfenced, "", "legacy unfenced Start failed before job acceptance")
 	}
@@ -234,6 +248,18 @@ func (c *Coordinator) SubmitLegacyUnfenced(req SubmitRequest, responseDelivered 
 		return run, protocolError(CodeLegacyUnfenced, "", "legacy unfenced response was not acknowledged")
 	}
 	run.Acknowledged = true
+	if err := c.inject(injector, FailLegacyUnfencedStartBefore); err != nil {
+		run.Retired = true
+		return run, err
+	}
+	c.Store.noteModeledSideEffect()
+	run.Launched = true
+	run.Started = true
+	run.Launches = 1
+	if err := c.inject(injector, FailLegacyUnfencedStartAfter); err != nil {
+		run.Retired = true
+		return run, protocolError(CodeLegacyUnfenced, "", "legacy unfenced Start failed after launch")
+	}
 	c.legacyUnfenced[run.RunID] = run
 	return run, c.checkBoundary(nil)
 }
@@ -268,17 +294,19 @@ func (c *Coordinator) RejectUnacknowledgedWithInjector(jobID string, injector *F
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
 	}
+	if job.Decision == DecisionAwaitingAck {
+		if err := c.casStep(injector, FailRejectBeforeCAS, FailRejectAfterCAS, func() error {
+			_, err := c.Store.BeginRejectUnacknowledged(jobID, job.AttemptID, job.Epoch)
+			return err
+		}); err != nil {
+			return err
+		}
+		job, _ = c.Store.GetJob(jobID)
+	}
 	if err := c.retireSupervisor(job, injector); err != nil {
 		return err
 	}
-	err := c.casStep(injector, FailRejectBeforeCAS, FailRejectAfterCAS, func() error {
-		_, err := c.Store.RejectUnacknowledged(jobID, job.AttemptID, job.Epoch)
-		if err == nil {
-			delete(c.obligations, jobID)
-		}
-		return err
-	})
-	return err
+	return c.finalizeRejectUnacknowledged(jobID)
 }
 
 func (c *Coordinator) PrepareSupervisor(jobID string, injector *FailureInjector) error {
@@ -560,7 +588,7 @@ func (c *Coordinator) StartupReconcileWithInjector(injector *FailureInjector) (e
 			c.LifecycleState = CoordinatorLifecycleNotReady
 		}
 	}()
-	if err := c.applyStartupAnchorBarrier(); err != nil {
+	if err := c.applyStartupAnchorBarrier(injector); err != nil {
 		return err
 	}
 	if err := c.validateStartupAnchors(); err != nil {
@@ -638,7 +666,7 @@ func (c *Coordinator) Expire(workspaceKey, requestID string, injector *FailureIn
 	return expired, err
 }
 
-func (c *Coordinator) MarkCorrupt(jobID string, permitMaybe, identityTrustworthy bool, diagnostic string, injector *FailureInjector) error {
+func (c *Coordinator) MarkCorrupt(jobID string, diagnostic string, injector *FailureInjector) error {
 	if err := c.rejectIfNotRunning(); err != nil {
 		return err
 	}
@@ -646,6 +674,9 @@ func (c *Coordinator) MarkCorrupt(jobID string, permitMaybe, identityTrustworthy
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
 	}
+	authority := c.Store.attemptAuthority(jobID)
+	permitMaybe := hasAnyGrantEvidence(&job, authority)
+	identityTrustworthy := authority.identityTrustworthy()
 	if !identityTrustworthy {
 		c.beginFailStop()
 		return protocolError(CodeCorruptFatal, jobID, "containment identity is untrustworthy")
@@ -659,7 +690,7 @@ func (c *Coordinator) MarkCorrupt(jobID string, permitMaybe, identityTrustworthy
 	}
 	job, _ = c.Store.GetJob(jobID)
 	if err := c.casStep(injector, FailCorruptBeforeCAS, FailCorruptAfterCAS, func() error {
-		_, err := c.Store.MarkCorrupt(jobID, permitMaybe, identityTrustworthy, diagnostic)
+		_, err := c.Store.MarkCorrupt(jobID, diagnostic)
 		return err
 	}); err != nil {
 		return err
@@ -673,6 +704,27 @@ func (c *Coordinator) MarkCorrupt(jobID string, permitMaybe, identityTrustworthy
 		reason = "corrupt_quarantine"
 	}
 	return c.publishTerminal(jobID, job.AttemptID, job.Epoch, OutcomeQuarantined, proof, reason, injector)
+}
+
+func (c *Coordinator) finalizeRejectUnacknowledged(jobID string) error {
+	job, ok := c.Store.GetJob(jobID)
+	if !ok {
+		return protocolError(CodeUnknownJob, jobID, "unknown job")
+	}
+	_, err := c.Store.RejectUnacknowledged(jobID, job.AttemptID, job.Epoch)
+	if err == nil {
+		delete(c.obligations, jobID)
+		return c.checkBoundary(nil)
+	}
+	refreshed, ok := c.Store.GetJob(jobID)
+	if ok {
+		if _, retryErr := c.Store.RejectUnacknowledged(jobID, refreshed.AttemptID, refreshed.Epoch); retryErr == nil {
+			delete(c.obligations, jobID)
+			return c.checkBoundary(nil)
+		}
+	}
+	c.beginFailStop()
+	return c.checkBoundary(err)
 }
 
 func (c *Coordinator) HasOwnedWork() bool {
@@ -780,18 +832,22 @@ func (c *Coordinator) validateStartupAnchors() error {
 	return nil
 }
 
-func (c *Coordinator) applyStartupAnchorBarrier() error {
+func (c *Coordinator) applyStartupAnchorBarrier(injector *FailureInjector) error {
 	if c.Store == nil {
 		return protocolError(CodePreconditionFailed, "", "missing admission store")
 	}
 	if !c.Store.startupAnchorObserved {
-		c.Store.ObserveStartupAnchor(c.Store.syntheticStartupAnchorInput())
+		if c.Store.hasInitializedStorage() {
+			c.beginFailStop()
+			return protocolError(CodeCorruptFatal, "", "startup anchor observation is required for initialized storage")
+		}
+		c.Store.ObserveStartupAnchor(AnchorInput{})
 	}
 	if !c.Store.startupAnchorDispositionPersisted {
 		c.beginFailStop()
 		return protocolError(CodeCorruptFatal, "", "startup anchor disposition was not persisted")
 	}
-	if err := c.Store.completeStartupAnchorDisposition(); err != nil {
+	if err := c.Store.completeStartupAnchorDisposition(injector); err != nil {
 		c.beginFailStop()
 		return err
 	}

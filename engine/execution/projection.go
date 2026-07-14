@@ -52,15 +52,41 @@ func ReachableInternal(decision Decision, dispatch Dispatch, outcome Outcome) bo
 		return false
 	}
 	if decision == DecisionTerminal {
-		return dispatch == DispatchDone && outcome != OutcomeNone
+		return dispatch == DispatchDone && terminalOutcome(outcome)
 	}
-	if outcome != OutcomeNone {
-		return dispatch == DispatchResultPublishing || dispatch == DispatchContained || dispatch == DispatchActive || dispatch == DispatchSupervisorPrepared
+	if outcome == OutcomeNone {
+		switch decision {
+		case DecisionAccepted:
+			switch dispatch {
+			case DispatchScheduled, DispatchSupervisorPrepared, DispatchPermitGranted, DispatchActive, DispatchReconciling, DispatchContained:
+				return true
+			default:
+				return false
+			}
+		case DecisionAwaitingAck:
+			return dispatch == DispatchSupervisorPrepared
+		case DecisionCancelRequested:
+			switch dispatch {
+			case DispatchScheduled, DispatchSupervisorPrepared, DispatchPermitGranted, DispatchActive, DispatchReconciling, DispatchContained:
+				return true
+			default:
+				return false
+			}
+		default:
+			return false
+		}
 	}
-	if decision == DecisionAwaitingAck {
-		return dispatch == DispatchNone || dispatch == DispatchSupervisorPrepared
+	if !terminalOutcome(outcome) {
+		return false
 	}
-	return dispatch != DispatchDone
+	switch dispatch {
+	case DispatchPermitGranted:
+		return false
+	case DispatchScheduled, DispatchSupervisorPrepared, DispatchActive, DispatchReconciling, DispatchContained, DispatchResultPublishing:
+		return decision == DecisionAccepted || decision == DecisionCancelRequested
+	default:
+		return false
+	}
 }
 
 func terminalOutcome(outcome Outcome) bool {

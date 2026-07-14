@@ -16,6 +16,7 @@ func TestNegativeOracleRejectsForbiddenStates(t *testing.T) {
 		{name: "accepted invalid empty launch spec", build: forbiddenAcceptedInvalidLaunchSpec},
 		{name: "completed terminal with unverified result digest", build: forbiddenCompletedUnverifiedResult},
 		{name: "terminal reason mismatch", build: forbiddenTerminalReasonMismatch},
+		{name: "completed outcome with permit granted dispatch", build: forbiddenCompletedPermitGranted},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -156,6 +157,15 @@ func forbiddenTerminalReasonMismatch(t *testing.T) InvariantView {
 		t.Fatal(err)
 	}
 	c.Store.jobs[res.JobID].TerminalReason = "daemon_restarted"
+	return invariantView(c)
+}
+
+func forbiddenCompletedPermitGranted(t *testing.T) InvariantView {
+	t.Helper()
+	c, jobID := acceptedPrepared(t, "completed-permit-granted")
+	job := c.Store.jobs[jobID]
+	job.Dispatch = DispatchPermitGranted
+	job.Outcome = OutcomeCompleted
 	return invariantView(c)
 }
 

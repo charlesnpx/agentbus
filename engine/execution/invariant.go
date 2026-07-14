@@ -35,6 +35,9 @@ func CheckInvariants(view InvariantView) error {
 	if store.replaySideEffects != 0 {
 		return fmt.Errorf("replay has execution side effects: %d", store.replaySideEffects)
 	}
+	if len(store.replayEvents) != 0 {
+		return fmt.Errorf("replay changed execution authority state: %v", store.replayEvents)
+	}
 	if store.silentRecreated && !view.FailStopping && lifecycleState != CoordinatorLifecycleFailStopped {
 		return fmt.Errorf("initialized AdmissionStore was silently recreated")
 	}
@@ -81,6 +84,9 @@ func CheckInvariants(view InvariantView) error {
 		if err := validateAggregateEnums(job); err != nil {
 			return err
 		}
+		if !ReachableInternal(job.Decision, job.Dispatch, job.Outcome) {
+			return fmt.Errorf("job %s has unreachable internal tuple decision=%s dispatch=%s outcome=%s", job.JobID, job.Decision, job.Dispatch, job.Outcome)
+		}
 		if PublicProjection(job.Decision, job.Dispatch, job.Outcome) == "" {
 			return fmt.Errorf("job %s has no public projection", job.JobID)
 		}
@@ -95,13 +101,16 @@ func CheckInvariants(view InvariantView) error {
 		if job.Decision == DecisionAwaitingAck && (job.PermitState == PermitGranted || job.PermitMaybeSent || job.Dispatch == DispatchPermitGranted || job.Dispatch == DispatchActive) {
 			return fmt.Errorf("job %s awaiting acknowledgement has permit state", job.JobID)
 		}
-		if job.Decision == DecisionAwaitingAck && (!job.Supervisor.Valid() || job.Dispatch == DispatchNone) {
+		if job.Decision == DecisionAwaitingAck && (!job.Supervisor.Valid() || job.Dispatch != DispatchSupervisorPrepared || job.Retired || job.RetirementStarted || job.TerminalizationStarted) {
 			return fmt.Errorf("job %s awaiting acknowledgement without prepared supervisor", job.JobID)
+		}
+		if job.TerminalizationStarted && !job.Terminal() && job.Decision != DecisionCancelRequested {
+			return fmt.Errorf("job %s has terminalization started from decision %s", job.JobID, job.Decision)
 		}
 		if view.CurrentBootID != "" && job.BootID == view.CurrentBootID && !job.Terminal() && job.Mode != ModeLegacyUnfenced && !view.FailStopping {
 			obligation, ok := view.Obligations[job.JobID]
 			if !ok || !obligation.committed() {
-				if view.AllowCurrentBootOrphanReconcile {
+				if view.AllowCurrentBootOrphanReconcile || (view.AllowPreRunnable && ok && obligation.state() == ObligationPending) {
 					continue
 				}
 				return fmt.Errorf("current-boot nonterminal job %s has no committed obligation", job.JobID)
@@ -172,6 +181,9 @@ func CheckInvariants(view InvariantView) error {
 		if job.Terminal() {
 			if !validTerminalOutcomeProofReason(job) {
 				return fmt.Errorf("job %s has invalid terminal outcome/proof/reason combination", job.JobID)
+			}
+			if job.TerminalProof == ProofNeverPermittedAndRetired && hasAnyGrantEvidence(job, store.attemptAuthority(job.JobID)) {
+				return fmt.Errorf("job %s uses never-permitted proof with grant evidence", job.JobID)
 			}
 			if job.PermitState == PermitGranted || job.PermitState == PermitMaybeSent || job.PermitState == PermitConsumed {
 				return fmt.Errorf("job %s is terminal with live permit state %s", job.JobID, job.PermitState)
@@ -310,7 +322,15 @@ func validateLaunchNonceHistory(job *Aggregate) error {
 func validTerminalProof(job *Aggregate) bool {
 	switch job.TerminalProof {
 	case ProofNeverPermittedAndRetired:
-		return !hasLiveAuthority(job) && !job.PermitMaybeSent && job.Retired && job.RetirementEvidence.Present() && terminalOutcome(job.Outcome)
+		return !hasLiveAuthority(job) &&
+			!job.PermitMaybeSent &&
+			job.PermitNonce == "" &&
+			job.LaunchOrdinal == 0 &&
+			len(job.LaunchNonceHistory) == 0 &&
+			job.ExecutionSideEffects == 0 &&
+			job.Retired &&
+			job.RetirementEvidence.Present() &&
+			terminalOutcome(job.Outcome)
 	case ProofCleanQuiescentOutcomeAndRetired:
 		if !job.Retired || job.Contained || !terminalOutcome(job.Outcome) || hasLiveAuthority(job) {
 			return false

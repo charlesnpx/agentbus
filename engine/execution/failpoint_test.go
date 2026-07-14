@@ -150,14 +150,17 @@ func TestLegacyUnfencedAckGatedOutsideAdmissionStore(t *testing.T) {
 	if err == nil || !IsCode(err, CodeLegacyUnfenced) {
 		t.Fatalf("unacknowledged legacy unfenced launch error = %v, want legacy_unfenced", err)
 	}
-	if !run.Started || run.Acknowledged || !run.Retired {
-		t.Fatalf("unacknowledged legacy unfenced run = %+v, want started, unacknowledged, retired", run)
+	if !run.Prepared || run.Started || run.Acknowledged || !run.Retired {
+		t.Fatalf("unacknowledged legacy unfenced run = %+v, want prepared-only, unacknowledged, retired", run)
+	}
+	if run.Launched || run.Launches != 0 {
+		t.Fatalf("unacknowledged legacy unfenced run launched %+v, want zero launches", run)
 	}
 	if len(c.Store.jobs) != 0 {
 		t.Fatalf("legacy unfenced unacknowledged run entered AdmissionStore")
 	}
 
-	injector := &FailureInjector{Target: FailLegacyUnfencedStartAfter}
+	injector := &FailureInjector{Target: FailLegacyUnfencedPrepareAfter}
 	run, err = c.SubmitLegacyUnfenced(modelRequest("ws-legacy-unfenced-start-fail", "", "fp"), true, injector)
 	if err == nil || !IsCode(err, CodeLegacyUnfenced) {
 		t.Fatalf("failed legacy unfenced Start error = %v, want legacy_unfenced", err)
@@ -165,8 +168,8 @@ func TestLegacyUnfencedAckGatedOutsideAdmissionStore(t *testing.T) {
 	if !injector.Hit {
 		t.Fatalf("legacy unfenced Start failpoint was not hit")
 	}
-	if !run.Started || run.Acknowledged || !run.Retired {
-		t.Fatalf("failed legacy unfenced run = %+v, want started, unacknowledged, retired", run)
+	if !run.Prepared || run.Launched || run.Acknowledged || !run.Retired || run.Launches != 0 {
+		t.Fatalf("failed legacy unfenced run = %+v, want prepared, unlaunched, unacknowledged, retired", run)
 	}
 	if len(c.Store.jobs) != 0 {
 		t.Fatalf("legacy unfenced failed Start entered AdmissionStore")
@@ -176,7 +179,7 @@ func TestLegacyUnfencedAckGatedOutsideAdmissionStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !run.Started || !run.Acknowledged || run.Retired {
+	if !run.Prepared || !run.Started || !run.Launched || run.Launches != 1 || !run.Acknowledged || run.Retired {
 		t.Fatalf("acknowledged legacy unfenced run = %+v, want started, acknowledged, live", run)
 	}
 	if len(c.Store.jobs) != 0 {
@@ -186,6 +189,28 @@ func TestLegacyUnfencedAckGatedOutsideAdmissionStore(t *testing.T) {
 		t.Fatalf("acknowledged legacy unfenced run was not tracked outside AdmissionStore")
 	}
 	assertFailpointPostcondition(t, c)
+}
+
+func TestStartupAnchorFailpointPersistsPrefixAndRestarts(t *testing.T) {
+	store := NewMemoryAdmissionStore()
+	c := NewCoordinator(store, "boot-anchor-failpoint", "owner")
+	injector := &FailureInjector{Target: FailAnchorPublishAfter}
+	if err := c.StartupReconcileWithInjector(injector); err == nil {
+		t.Fatal("StartupReconcile returned nil for anchor publish-after failure")
+	}
+	if !injector.Hit {
+		t.Fatal("anchor publish-after failpoint was not hit")
+	}
+	if !store.anchorInitState.AnchorPublished || store.anchorInitState.AnchorDirFsynced {
+		t.Fatalf("anchor init state = %+v, want published prefix without final dir fsync", store.anchorInitState)
+	}
+
+	restarted := NewCoordinator(store, "boot-anchor-restart", "owner")
+	observeInitializedAnchor(t, store)
+	if err := restarted.StartupReconcile(); err != nil {
+		t.Fatal(err)
+	}
+	checkCoordinator(t, restarted)
 }
 
 func assertFailpointPostcondition(t *testing.T, c *Coordinator) {
@@ -316,6 +341,7 @@ func failpointCoverageEdges() []failpointCoverageEdge {
 		{name: "cancel_cas", before: FailCancelBeforeCAS, after: FailCancelAfterCAS, run: scenarios[FailCancelBeforeCAS]},
 		{name: "permit_grant_cas", before: FailGrantPermitBeforeCAS, after: FailGrantPermitAfterCAS, run: scenarios[FailGrantPermitBeforeCAS]},
 		{name: "permit_send_side_effect", before: FailPermitSendBeforeSideEffect, after: FailPermitSendAfterSideEffect, run: scenarios[FailPermitSendBeforeSideEffect]},
+		{name: "legacy_unfenced_prepare_side_effect", before: FailLegacyUnfencedPrepareBefore, after: FailLegacyUnfencedPrepareAfter, run: scenarios[FailLegacyUnfencedPrepareBefore]},
 		{name: "legacy_unfenced_start_side_effect", before: FailLegacyUnfencedStartBefore, after: FailLegacyUnfencedStartAfter, run: scenarios[FailLegacyUnfencedStartBefore]},
 		{name: "permit_maybe_sent_cas", before: FailPermitMaybeSentBeforeCAS, after: FailPermitMaybeSentAfterCAS, run: scenarios[FailPermitMaybeSentBeforeCAS]},
 		{name: "exec_fork_cas", before: FailExecForkBeforeCAS, after: FailExecForkAfterCAS, run: scenarios[FailExecForkBeforeCAS]},
@@ -479,7 +505,7 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) *Coor
 		if err != nil {
 			t.Fatal(err)
 		}
-		_ = c.MarkCorrupt(res.JobID, false, true, "checksum", injector)
+		_ = c.MarkCorrupt(res.JobID, "checksum", injector)
 		return c
 	}
 	anchor := func(t *testing.T, injector *FailureInjector) *Coordinator {
@@ -490,7 +516,7 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) *Coor
 	}
 
 	matrix := map[Failpoint]func(*testing.T, *FailureInjector) *Coordinator{}
-	for _, point := range []Failpoint{FailAdmissionBeforeCommit, FailAdmissionAfterCommit, FailPostCommitPreRunnable} {
+	for _, point := range []Failpoint{FailAdmissionBeforeCommit, FailAdmissionAfterCommit, FailAdmissionCommittedMark, FailPostCommitPreRunnable} {
 		matrix[point] = admission
 	}
 	for _, point := range []Failpoint{FailAcknowledgeBeforeCAS, FailAcknowledgeAfterCAS} {
@@ -518,7 +544,7 @@ func failpointScenarios() map[Failpoint]func(*testing.T, *FailureInjector) *Coor
 	} {
 		matrix[point] = grant
 	}
-	for _, point := range []Failpoint{FailLegacyUnfencedStartBefore, FailLegacyUnfencedStartAfter} {
+	for _, point := range []Failpoint{FailLegacyUnfencedPrepareBefore, FailLegacyUnfencedPrepareAfter, FailLegacyUnfencedStartBefore, FailLegacyUnfencedStartAfter} {
 		matrix[point] = legacyUnfenced
 	}
 	for _, point := range []Failpoint{

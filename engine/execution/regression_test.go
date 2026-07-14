@@ -201,6 +201,7 @@ func seedStartFailUpdateFailRequestBound(t *testing.T) {
 	old := newReadyCoordinator(t, store, "boot-old", "owner")
 	res := submitPreparedPermitted(t, old, "ws-seed", "req-start-update", "fp")
 	newBoot := NewCoordinator(store, "boot-new", "owner")
+	observeInitializedAnchor(t, store)
 	injector := &FailureInjector{Target: FailTerminalBeforeCAS}
 	if err := newBoot.StartupReconcileWithInjector(injector); err == nil {
 		t.Fatal("expected startup terminalization failure after request-bound start failure")
@@ -228,6 +229,7 @@ func seedAcceptanceWithoutAfter(t *testing.T) {
 		t.Fatal("same coordinator accepted replay after fail-stop")
 	}
 	newBoot := NewCoordinator(c.Store, "boot-seed-new", "owner")
+	observeInitializedAnchor(t, c.Store)
 	if err := newBoot.StartupReconcile(); err != nil {
 		t.Fatal(err)
 	}

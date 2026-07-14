@@ -69,6 +69,23 @@ func TestRecordedUnknownFingerprintFailsClosed(t *testing.T) {
 	}
 }
 
+func TestReplaySnapshotRejectsAuthorityMutation(t *testing.T) {
+	store := NewMemoryAdmissionStore()
+	req := modelRequest("ws-replay-authority", "req-replay-authority", "fp-replay-authority")
+	accepted, err := store.ResolveOrAccept(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := store.executionAuthoritySnapshot()
+	store.jobs[accepted.JobID].ExecutionSideEffects++
+	if err := store.finishReplayObservation(before, "test-replay:"+accepted.JobID, nil); !IsCode(err, CodePreconditionFailed) {
+		t.Fatalf("finishReplayObservation err = %v, want precondition failure", err)
+	}
+	if err := CheckInvariants(InvariantView{Store: store}); err == nil {
+		t.Fatal("CheckInvariants accepted replay authority mutation")
+	}
+}
+
 func TestLegacyFencedAcknowledgementGatesPermit(t *testing.T) {
 	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-ack", "owner")
 	res, err := c.SubmitLegacyFenced(modelRequest("ws-legacy", "", "fp-legacy"), nil)
@@ -108,7 +125,7 @@ func TestCorruptAggregateHandlingPreservesBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.MarkCorrupt(res.JobID, false, true, "checksum mismatch"); err != nil {
+	if _, err := store.MarkCorrupt(res.JobID, "checksum mismatch"); err != nil {
 		t.Fatal(err)
 	}
 	if err := CheckInvariants(InvariantView{Store: store}); err != nil {
@@ -145,7 +162,8 @@ func TestCorruptAggregateHandlingPreservesBinding(t *testing.T) {
 	if _, err := fatalStore.GrantPermit(fatalRes.JobID, fatalJob.AttemptID, fatalJob.Epoch, 1, "nonce"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fatalStore.MarkCorrupt(fatalRes.JobID, false, false, "identity missing"); !IsCode(err, CodeCorruptFatal) {
+	fatalStore.attempts[fatalRes.JobID].Supervisor = GroupRef{}
+	if _, err := fatalStore.MarkCorrupt(fatalRes.JobID, "identity missing"); !IsCode(err, CodeCorruptFatal) {
 		t.Fatalf("err = %v, want corrupt_fatal", err)
 	}
 	if !fatalStore.fatal {
@@ -162,6 +180,7 @@ func TestAnchorStartupDecisionTable(t *testing.T) {
 		{name: "first initialization", in: AnchorInput{}, want: StartupInitializeFirst},
 		{name: "silent recreation", in: AnchorInput{EverInitialized: true}, want: StartupFatal},
 		{name: "recover interrupted init", in: AnchorInput{DBPresent: true, DBValid: true}, want: StartupRecoverAnchor},
+		{name: "recover initialized db with missing anchor", in: AnchorInput{DBPresent: true, DBValid: true, EverInitialized: true}, want: StartupRecoverAnchor},
 		{name: "missing db after init", in: AnchorInput{AnchorPresent: true, AnchorValid: true}, want: StartupFatal},
 		{name: "uuid mismatch", in: AnchorInput{DBPresent: true, AnchorPresent: true, DBValid: true, AnchorValid: true, DBUUID: "a", AnchorDBUUID: "b"}, want: StartupFatal},
 		{name: "db rollback", in: AnchorInput{DBPresent: true, AnchorPresent: true, DBValid: true, AnchorValid: true, DBUUID: "a", AnchorDBUUID: "a", DBGeneration: 1, HighWaterGeneration: 2}, want: StartupFatal},
