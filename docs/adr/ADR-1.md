@@ -1,0 +1,30 @@
+# ADR-1: Atomic root AdmissionStore
+
+## Decision
+
+All jobs admitted through the fenced coordinator use one small root AdmissionStore. Acceptance is one
+atomic update that resolves replay, creates the aggregate, establishes current-boot ownership, and
+commits the request binding and job together. GC deletes the job and binding and writes the tombstone
+in the same transaction.
+
+## Invariant(s)
+
+- Binding and job creation are atomic.
+- Job GC cannot remove a request key without writing the indefinite tombstone.
+- Prompt data stays outside the store.
+- The store interface exposes durable operations, not bucket, transaction, or encoding internals.
+
+## Rejected alternatives
+
+- Per-workspace authoritative stores.
+- Reservation grace files or partial acceptance states.
+- Letting prompt payloads become part of the admission DB.
+
+## Consequences
+
+Later bbolt implementation must model requests, tombstones, jobs, attempts, and quarantine as one
+root authority for fenced coordinator jobs.
+
+## Non-goals
+
+The root store is not authoritative for every preexisting legacy JSON job.
