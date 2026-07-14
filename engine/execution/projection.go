@@ -5,23 +5,11 @@ func PublicProjection(decision Decision, dispatch Dispatch, outcome Outcome) Pub
 	if !validDecision(decision) || !validDispatch(dispatch) || !validOutcome(outcome) {
 		return ""
 	}
-	switch outcome {
-	case OutcomeCompleted:
-		return PublicCompleted
-	case OutcomeCompletedNoncompliant:
-		return PublicCompletedNoncompliant
-	case OutcomeFailed:
-		return PublicFailed
-	case OutcomeTimedOut:
-		return PublicTimedOut
-	case OutcomeCanceled:
-		return PublicCanceled
-	case OutcomeReaped:
-		return PublicReaped
-	case OutcomeInterrupted:
-		return PublicInterrupted
-	case OutcomeQuarantined:
-		return PublicQuarantined
+	if decision == DecisionTerminal {
+		if dispatch != DispatchDone || !terminalOutcome(outcome) {
+			return ""
+		}
+		return terminalPublicForOutcome(outcome)
 	}
 
 	switch dispatch {
@@ -42,6 +30,38 @@ func PublicProjection(decision Decision, dispatch Dispatch, outcome Outcome) Pub
 		return PublicOrphaned
 	default:
 		return PublicFailed
+	}
+}
+
+func terminalPublicForOutcome(outcome Outcome) Public {
+	switch outcome {
+	case OutcomeCompleted:
+		return PublicCompleted
+	case OutcomeCompletedNoncompliant:
+		return PublicCompletedNoncompliant
+	case OutcomeFailed:
+		return PublicFailed
+	case OutcomeTimedOut:
+		return PublicTimedOut
+	case OutcomeCanceled:
+		return PublicCanceled
+	case OutcomeReaped:
+		return PublicReaped
+	case OutcomeInterrupted:
+		return PublicInterrupted
+	case OutcomeQuarantined:
+		return PublicQuarantined
+	default:
+		return ""
+	}
+}
+
+func terminalPublicState(public Public) bool {
+	switch public {
+	case PublicCompleted, PublicCompletedNoncompliant, PublicInterrupted, PublicQuarantined, PublicFailed, PublicTimedOut, PublicCanceled, PublicReaped:
+		return true
+	default:
+		return false
 	}
 }
 

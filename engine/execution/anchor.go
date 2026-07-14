@@ -171,6 +171,26 @@ func RunAnchorInitializationWithObserver(schemaMajor int, generation int64, inje
 	return state, nil
 }
 
+func RunAnchorPublishWithObserver(schemaMajor int, generation int64, injector *FailureInjector, observer func(AnchorInitState) error) (AnchorInitState, error) {
+	state := AnchorInitState{SchemaMajor: schemaMajor, HighWaterGeneration: generation}
+	if err := anchorStep(injector, FailAnchorPublishBefore, FailAnchorPublishAfter, func() {
+		state.AnchorPublished = true
+		state.EverInitialized = true
+	}, func() error {
+		return observeAnchorState(observer, state)
+	}); err != nil {
+		return state, err
+	}
+	if err := anchorStep(injector, FailAnchorPublishDirFsyncBefore, FailAnchorPublishDirFsyncAfter, func() {
+		state.AnchorDirFsynced = true
+	}, func() error {
+		return observeAnchorState(observer, state)
+	}); err != nil {
+		return state, err
+	}
+	return state, nil
+}
+
 func anchorStep(injector *FailureInjector, before, after Failpoint, op func(), observer func() error) error {
 	if injector != nil {
 		if err := injector.Fail(before); err != nil {

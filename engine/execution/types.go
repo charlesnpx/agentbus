@@ -204,22 +204,12 @@ const (
 	CurrentFingerprintVersion  = FingerprintVersionV2
 )
 
-func (f Fingerprint) normalized() Fingerprint {
-	if f.Algorithm == "" && f.Version == 0 && f.Value == "" {
-		return CurrentFingerprint("empty")
-	}
-	return f
-}
-
 func (f Fingerprint) Equal(other Fingerprint) bool {
-	f = f.normalized()
-	other = other.normalized()
 	return f.Algorithm == other.Algorithm && f.Version == other.Version && f.Value == other.Value
 }
 
 func (f Fingerprint) supported() bool {
-	f = f.normalized()
-	return fingerprintSupported(f.Algorithm, f.Version)
+	return fingerprintSupported(f.Algorithm, f.Version) && validSHA256Hex(f.Value)
 }
 
 func CurrentFingerprint(rawTask string) Fingerprint {
@@ -240,6 +230,59 @@ func FingerprintTask(algorithm string, version int, rawTask string) (Fingerprint
 
 func fingerprintSupported(algorithm string, version int) bool {
 	return algorithm == FingerprintAlgorithmSHA256 && (version == FingerprintVersionV1 || version == FingerprintVersionV2)
+}
+
+func CurrentRequestFingerprint(req SubmitRequest) (Fingerprint, error) {
+	return FingerprintRequest(FingerprintAlgorithmSHA256, CurrentFingerprintVersion, req)
+}
+
+func FingerprintRequest(algorithm string, version int, req SubmitRequest) (Fingerprint, error) {
+	payload, err := requestFingerprintPayload(version, req)
+	if err != nil {
+		return Fingerprint{}, err
+	}
+	return FingerprintTask(algorithm, version, payload)
+}
+
+func requestFingerprintPayload(version int, req SubmitRequest) (string, error) {
+	if !fingerprintSupported(FingerprintAlgorithmSHA256, version) {
+		return "", protocolError(CodeRequestFingerprintUnsupported, "", "fingerprint version is unsupported")
+	}
+	spec := req.LaunchSpec
+	sessionID := spec.SessionID
+	if sessionID == "" {
+		sessionID = req.SessionID
+	}
+	fields := []struct {
+		name  string
+		value string
+	}{
+		{name: "backend", value: spec.Backend},
+		{name: "cwd", value: spec.CWD},
+		{name: "session", value: sessionID},
+		{name: "policy", value: string(req.Mode)},
+		{name: "tags", value: ""},
+		{name: "prompt", value: requestRawTask(req)},
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "raw-task-spec/v%d", version)
+	for _, field := range fields {
+		fmt.Fprintf(&b, "\x00%d:%s=%d:%s", len(field.name), field.name, len(field.value), field.value)
+	}
+	return b.String(), nil
+}
+
+func validSHA256Hex(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, r := range value {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 type LaunchSpec struct {

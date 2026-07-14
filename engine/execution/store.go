@@ -47,22 +47,11 @@ type AdmissionStore interface {
 	FindSession(sessionID string) (Aggregate, bool)
 	ListPriorBootNonterminal(currentBootID string) ([]Aggregate, error)
 	Acknowledge(jobID, attemptID string, epoch int64) (Aggregate, error)
-	BeginRejectUnacknowledged(jobID, attemptID string, epoch int64) (Aggregate, error)
 	RejectUnacknowledged(jobID, attemptID string, epoch int64) (Aggregate, error)
 	RecordSupervisor(jobID, attemptID string, epoch int64, groupRef GroupRef) (Aggregate, error)
 	GrantPermit(jobID, attemptID string, epoch int64, launchOrdinal int, nonce string) (Aggregate, error)
 	RequestCancel(jobID string) (Aggregate, error)
-	RecordPermitMaybeSent(jobID, attemptID string, epoch int64, launchOrdinal int) (Aggregate, error)
 	RecordStarted(jobID, attemptID string, epoch int64, launchOrdinal int, childRef ChildRef) (Aggregate, error)
-	RecordLaunchExitEvidence(jobID, attemptID string, epoch int64, launchOrdinal int, childExited, groupEmpty Evidence) (Aggregate, error)
-	RecordLaunchQuiescent(jobID, attemptID string, epoch int64, launchOrdinal int) (Aggregate, error)
-	BeginReconciliation(jobID, attemptID string, epoch int64) (Aggregate, error)
-	RecordContainmentSignaled(jobID, attemptID string, epoch int64, evidence Evidence) (Aggregate, error)
-	RecordContainmentVerified(jobID, attemptID string, epoch int64, evidence Evidence) (Aggregate, error)
-	RecordContained(jobID, attemptID string, epoch int64, evidence Evidence) (Aggregate, error)
-	RecordRetirementStarted(jobID, attemptID string, epoch int64, evidence Evidence) (Aggregate, error)
-	RecordRetirementWorkerExited(jobID, attemptID string, epoch int64, evidence Evidence) (Aggregate, error)
-	RecordRetirementGroupEmpty(jobID, attemptID string, epoch int64, evidence Evidence) (Aggregate, error)
 	RecordOutcome(jobID, attemptID string, epoch int64, outcome Outcome) (Aggregate, error)
 	BeginResultPublication(jobID, path, digest string, bytes int64) (Aggregate, error)
 	PublishTerminal(jobID, attemptID string, epoch int64, terminal Outcome, proof TerminalProof, reason string) (Aggregate, error)
@@ -72,6 +61,7 @@ type AdmissionStore interface {
 type MemoryAdmissionStore struct {
 	step              int64
 	nextJob           int
+	allocatedJobIDs   map[string]bool
 	jobs              map[string]*Aggregate
 	bindings          map[string]Binding
 	tombstones        map[string]Tombstone
@@ -93,11 +83,14 @@ type MemoryAdmissionStore struct {
 	startupAnchorCompleted            bool
 	anchorState                       AnchorState
 	anchorInitState                   AnchorInitState
+	directBoundaryView                InvariantView
+	directBoundaryViewSet             bool
 }
 
 func NewMemoryAdmissionStore() *MemoryAdmissionStore {
 	return &MemoryAdmissionStore{
 		nextJob:         1,
+		allocatedJobIDs: map[string]bool{},
 		jobs:            map[string]*Aggregate{},
 		bindings:        map[string]Binding{},
 		tombstones:      map[string]Tombstone{},
@@ -108,8 +101,12 @@ func NewMemoryAdmissionStore() *MemoryAdmissionStore {
 }
 
 func (s *MemoryAdmissionStore) AllocateJobID() string {
+	if s.allocatedJobIDs == nil {
+		s.allocatedJobIDs = map[string]bool{}
+	}
 	id := fmt.Sprintf("job-%04d", s.nextJob)
 	s.nextJob++
+	s.allocatedJobIDs[id] = true
 	return id
 }
 
@@ -161,7 +158,11 @@ func (s *MemoryAdmissionStore) ResolveOrAccept(req SubmitRequest) (ResolveResult
 			return s.resolveTombstone(tombstone, req)
 		}
 	}
-	req.Fingerprint = CurrentFingerprint(requestRawTask(req))
+	fingerprint, err := CurrentRequestFingerprint(req)
+	if err != nil {
+		return ResolveResult{}, err
+	}
+	req.Fingerprint = fingerprint
 	spec, err := materializeLaunchSpec(req, req.Fingerprint)
 	if err != nil {
 		return ResolveResult{}, err
@@ -169,6 +170,10 @@ func (s *MemoryAdmissionStore) ResolveOrAccept(req SubmitRequest) (ResolveResult
 	req.LaunchSpec = spec
 	if req.JobID == "" {
 		req.JobID = s.AllocateJobID()
+	} else if !s.allocatedJobIDs[req.JobID] {
+		return ResolveResult{}, protocolError(CodePreconditionFailed, req.JobID, "job id is allocated by admission authority")
+	} else if _, exists := s.jobs[req.JobID]; exists {
+		return ResolveResult{}, protocolError(CodePreconditionFailed, req.JobID, "job id collision")
 	}
 	if req.BootID == "" {
 		req.BootID = "boot-1"
@@ -258,7 +263,7 @@ func (s *MemoryAdmissionStore) resolveBinding(binding Binding, req SubmitRequest
 	if !binding.Fingerprint.supported() {
 		return ResolveResult{}, protocolError(CodeRequestFingerprintUnsupported, binding.JobID, "recorded fingerprint is unsupported")
 	}
-	replayFingerprint, err := FingerprintTask(binding.Fingerprint.Algorithm, binding.Fingerprint.Version, requestRawTask(req))
+	replayFingerprint, err := FingerprintRequest(binding.Fingerprint.Algorithm, binding.Fingerprint.Version, req)
 	if err != nil {
 		return ResolveResult{}, protocolError(CodeRequestFingerprintUnsupported, binding.JobID, "recorded fingerprint is unsupported")
 	}
@@ -268,6 +273,9 @@ func (s *MemoryAdmissionStore) resolveBinding(binding Binding, req SubmitRequest
 	job, ok := s.jobs[binding.JobID]
 	if !ok {
 		return ResolveResult{}, protocolError(CodePreconditionFailed, binding.JobID, "binding references missing job")
+	}
+	if err := validateBindingAggregate(binding, job); err != nil {
+		return ResolveResult{}, err
 	}
 	return ResolveResult{Status: ResolveExisting, Job: job.copy(), JobID: binding.JobID}, nil
 }
@@ -280,7 +288,7 @@ func (s *MemoryAdmissionStore) resolveTombstone(tombstone Tombstone, req SubmitR
 	if !tombstone.Fingerprint.supported() {
 		return ResolveResult{}, protocolError(CodeRequestFingerprintUnsupported, tombstone.JobID, "recorded tombstone fingerprint is unsupported")
 	}
-	replayFingerprint, err := FingerprintTask(tombstone.Fingerprint.Algorithm, tombstone.Fingerprint.Version, requestRawTask(req))
+	replayFingerprint, err := FingerprintRequest(tombstone.Fingerprint.Algorithm, tombstone.Fingerprint.Version, req)
 	if err != nil {
 		return ResolveResult{}, protocolError(CodeRequestFingerprintUnsupported, tombstone.JobID, "recorded tombstone fingerprint is unsupported")
 	}
@@ -288,6 +296,19 @@ func (s *MemoryAdmissionStore) resolveTombstone(tombstone Tombstone, req SubmitR
 		return ResolveResult{}, protocolError(CodeRequestConflict, tombstone.JobID, "fingerprint mismatch")
 	}
 	return ResolveResult{Status: ResolveExpiredTombstone, JobID: tombstone.JobID, Tombstone: tombstone}, protocolError(CodeRequestExpired, tombstone.JobID, "job was expired")
+}
+
+func validateBindingAggregate(binding Binding, job *Aggregate) error {
+	if job == nil {
+		return protocolError(CodeCorruptFatal, binding.JobID, "binding references missing aggregate")
+	}
+	if job.JobID != binding.JobID ||
+		job.WorkspaceKey != binding.WorkspaceKey ||
+		job.RequestID != binding.RequestID ||
+		!job.Fingerprint.Equal(binding.Fingerprint) {
+		return protocolError(CodeCorruptFatal, binding.JobID, "binding does not match aggregate identity")
+	}
+	return nil
 }
 
 func (s *MemoryAdmissionStore) GetJob(jobID string) (Aggregate, bool) {
@@ -1086,7 +1107,7 @@ func (s *MemoryAdmissionStore) completeStartupAnchorDisposition(injector *Failur
 		if decision.Action == StartupAdvanceAnchor && generation < s.startupAnchorInput.HighWaterGeneration {
 			generation = s.startupAnchorInput.HighWaterGeneration
 		}
-		return s.persistStartupAnchor(schemaMajor, generation, injector)
+		return s.publishStartupAnchorOnly(schemaMajor, generation, injector)
 	case StartupContinue:
 		s.anchorState = AnchorState{
 			DBUUID:              anchorStateUUID(s.startupAnchorInput),
@@ -1103,6 +1124,36 @@ func (s *MemoryAdmissionStore) completeStartupAnchorDisposition(injector *Failur
 		s.fatal = true
 		return protocolError(CodeCorruptFatal, "", "startup anchor decision is invalid")
 	}
+}
+
+func (s *MemoryAdmissionStore) publishStartupAnchorOnly(schemaMajor int, generation int64, injector *FailureInjector) error {
+	if generation < s.step {
+		generation = s.step
+	}
+	state, err := RunAnchorPublishWithObserver(schemaMajor, generation, injector, func(state AnchorInitState) error {
+		s.anchorInitState = state
+		if state.AnchorPublished {
+			s.anchorState = AnchorState{
+				DBUUID:              anchorStateUUID(s.startupAnchorInput),
+				SchemaMajor:         state.SchemaMajor,
+				EverInitialized:     true,
+				HighWaterGeneration: state.HighWaterGeneration,
+			}
+		}
+		return s.checkDirectBoundary(nil)
+	})
+	s.anchorInitState = state
+	if err != nil {
+		return err
+	}
+	s.anchorState = AnchorState{
+		DBUUID:              anchorStateUUID(s.startupAnchorInput),
+		SchemaMajor:         state.SchemaMajor,
+		EverInitialized:     true,
+		HighWaterGeneration: state.HighWaterGeneration,
+	}
+	s.startupAnchorCompleted = true
+	return s.checkDirectBoundary(nil)
 }
 
 func (s *MemoryAdmissionStore) persistStartupAnchor(schemaMajor int, generation int64, injector *FailureInjector) error {
@@ -1163,13 +1214,33 @@ func (s *MemoryAdmissionStore) noteModeledSideEffect() {
 }
 
 func (s *MemoryAdmissionStore) checkDirectBoundary(err error) error {
-	if invErr := CheckInvariants(InvariantView{Store: s}); invErr != nil {
+	view := InvariantView{Store: s}
+	if s.directBoundaryViewSet {
+		view = s.directBoundaryView
+		view.Store = s
+	}
+	if invErr := CheckInvariants(view); invErr != nil {
 		if err != nil {
 			return fmt.Errorf("%w; invariant boundary: %v", err, invErr)
 		}
 		return invErr
 	}
 	return err
+}
+
+func (s *MemoryAdmissionStore) withDirectBoundaryView(view InvariantView, fn func() (ResolveResult, error)) (ResolveResult, error) {
+	previousView := s.directBoundaryView
+	previousSet := s.directBoundaryViewSet
+	if view.Store == nil {
+		view.Store = s
+	}
+	s.directBoundaryView = view
+	s.directBoundaryViewSet = true
+	defer func() {
+		s.directBoundaryView = previousView
+		s.directBoundaryViewSet = previousSet
+	}()
+	return fn()
 }
 
 func liveOrdinalCount(live map[int]int) int {
