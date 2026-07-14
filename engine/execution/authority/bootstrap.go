@@ -37,7 +37,8 @@ type RecoverySession struct {
 type BootstrapperOption func(*bootstrapConfig)
 
 type bootstrapConfig struct {
-	anchor Anchor
+	anchor      Anchor
+	anchorStore *AnchorStore
 }
 
 func WithAnchor(anchor Anchor) BootstrapperOption {
@@ -46,24 +47,39 @@ func WithAnchor(anchor Anchor) BootstrapperOption {
 	}
 }
 
+func WithAnchorStore(anchorStore *AnchorStore) BootstrapperOption {
+	return func(config *bootstrapConfig) {
+		config.anchorStore = anchorStore
+	}
+}
+
 func NewBootstrapper(repo repository.Repository, options ...BootstrapperOption) (*Bootstrapper, error) {
 	if repo == nil {
 		return nil, errors.New("authority repository is required")
 	}
-	config := bootstrapConfig{anchor: defaultFakeAnchorFor(repo)}
+	config := bootstrapConfig{}
 	for _, option := range options {
 		if option != nil {
 			option(&config)
 		}
 	}
-	if config.anchor == nil {
-		return nil, errors.New("authority anchor is required")
+	anchor := config.anchor
+	if anchor == nil {
+		dbUUID, schemaMajor, err := repositoryAnchorIdentity(repo)
+		if err != nil {
+			return nil, err
+		}
+		anchorStore := config.anchorStore
+		if anchorStore == nil {
+			anchorStore = defaultAnchorStoreFor(repo)
+		}
+		anchor = anchorStore.Adapter(dbUUID, schemaMajor)
 	}
 	return &Bootstrapper{
 		core: &authorityCore{
 			mu:      &sync.Mutex{},
 			repo:    repo,
-			anchor:  config.anchor,
+			anchor:  anchor,
 			runtime: newRuntimeRegistry(),
 		},
 	}, nil
@@ -87,6 +103,9 @@ func (b *Bootstrapper) Begin(ctx context.Context, boot model.BootRef) (*Recovery
 	if err := b.core.repo.View(ctx, func(tx repository.ReadTx) error {
 		meta, err := b.core.requireMeta(tx)
 		if err != nil {
+			return err
+		}
+		if _, err := startupMatrixTx(tx); err != nil {
 			return err
 		}
 		generation = meta.Generation
@@ -126,6 +145,9 @@ func (s *RecoverySession) Plans(ctx context.Context) ([]model.RecoveryPlan, erro
 		if _, err := s.core.requireRecoveryTx(tx, s.token); err != nil {
 			return err
 		}
+		if _, err := startupMatrixTx(tx); err != nil {
+			return err
+		}
 		jobPlans, err := recoveryPlansTx(tx, s.token.boot, model.RecoveryStartupLoss, true)
 		if err != nil {
 			return err
@@ -156,10 +178,14 @@ func (s *RecoverySession) ApplyReceipt(ctx context.Context, command model.Comman
 	boundCommand := commandWithBoot(command, s.token.boot)
 	terminalCommitted := false
 	commit, err := s.core.repo.Update(ctx, func(tx repository.WriteTx) error {
-		if _, err := s.core.requireRecoveryTx(tx, s.token); err != nil {
+		meta, err := s.core.requireRecoveryTx(tx, s.token)
+		if err != nil {
 			return err
 		}
-		applied, err := applyCommandTx(tx, jobID, boundCommand, "")
+		if _, err := startupMatrixTx(tx); err != nil {
+			return err
+		}
+		applied, err := applyRecoveryCommandTx(tx, jobID, boundCommand, meta.Generation+1)
 		if err != nil {
 			return err
 		}
@@ -185,8 +211,14 @@ func (s *RecoverySession) SealReady(ctx context.Context) (*Ready, error) {
 	s.core.mu.Lock()
 	defer s.core.mu.Unlock()
 
-	if err := s.core.repo.View(ctx, func(tx repository.ReadTx) error {
-		if _, err := s.core.requireRecoveryTx(tx, s.token); err != nil {
+	var recoveredRuntime *runtimeRegistry
+	commit, err := s.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+		meta, err := s.core.requireRecoveryTx(tx, s.token)
+		if err != nil {
+			return err
+		}
+		repairs, err := startupMatrixTx(tx)
+		if err != nil {
 			return err
 		}
 		plans, err := recoveryPlansTx(tx, s.token.boot, model.RecoveryStartupLoss, true)
@@ -196,14 +228,30 @@ func (s *RecoverySession) SealReady(ctx context.Context) (*Ready, error) {
 		if len(plans) != 0 {
 			return fmt.Errorf("%w: %d prior boot job(s)", ErrRecoveryNeeded, len(plans))
 		}
+		recoveredRuntime, err = runtimeRegistryForBootTx(tx, s.token.boot)
+		if err != nil {
+			return err
+		}
+		if err := repairStartupProjectionsTx(tx, repairs, meta.Generation+1); err != nil {
+			return err
+		}
 		return nil
-	}); err != nil {
-		return nil, err
-	}
-	token, err := s.core.anchor.SealReady(ctx, s.token.boot, s.token.generation)
+	})
 	if err != nil {
 		return nil, err
 	}
+	if err := s.core.advanceRecoveryLocked(ctx, &s.token, commit.Generation); err != nil {
+		return nil, err
+	}
+	if recoveredRuntime == nil {
+		recoveredRuntime = newRuntimeRegistry()
+	}
+	token, err := s.core.anchor.SealReady(ctx, s.token.boot, s.token.generation)
+	if err != nil {
+		s.core.failStopLocked(ctx, fmt.Sprintf("anchor seal ready: %v", err))
+		return nil, err
+	}
+	s.core.runtime = recoveredRuntime
 	s.core.boot = bootStatus{
 		ref:        s.token.boot,
 		phase:      bootReady,
@@ -229,20 +277,20 @@ type FakeAnchor struct {
 	reason     string
 }
 
-var defaultFakeAnchors sync.Map
+var defaultAnchorStores sync.Map
 
 func NewFakeAnchor() *FakeAnchor {
 	return &FakeAnchor{}
 }
 
-func defaultFakeAnchorFor(repo repository.Repository) *FakeAnchor {
+func defaultAnchorStoreFor(repo repository.Repository) *AnchorStore {
 	key := defaultAnchorKey(repo)
-	if existing, ok := defaultFakeAnchors.Load(key); ok {
-		return existing.(*FakeAnchor)
+	if existing, ok := defaultAnchorStores.Load(key); ok {
+		return existing.(*AnchorStore)
 	}
-	anchor := NewFakeAnchor()
-	actual, _ := defaultFakeAnchors.LoadOrStore(key, anchor)
-	return actual.(*FakeAnchor)
+	anchorStore := NewAnchorStore()
+	actual, _ := defaultAnchorStores.LoadOrStore(key, anchorStore)
+	return actual.(*AnchorStore)
 }
 
 func defaultAnchorKey(repo repository.Repository) string {
@@ -251,6 +299,13 @@ func defaultAnchorKey(repo repository.Repository) string {
 		return fmt.Sprintf("%s:%x", value.Type(), value.Pointer())
 	}
 	return fmt.Sprintf("%T", repo)
+}
+
+func repositoryAnchorIdentity(repo repository.Repository) (string, uint16, error) {
+	if identified, ok := repo.(anchorIdentityRepository); ok {
+		return identified.AnchorIdentity()
+	}
+	return defaultAnchorKey(repo), repository.CurrentAuthorityMetaSchemaVersion, nil
 }
 
 func (a *FakeAnchor) Begin(ctx context.Context, boot model.BootRef, generation uint64) (string, error) {

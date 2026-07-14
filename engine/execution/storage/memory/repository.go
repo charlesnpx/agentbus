@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 )
+
+var nextMemoryDBUUID uint64
 
 type Repository struct {
 	mu    sync.Mutex
@@ -19,6 +23,18 @@ type Repository struct {
 
 func NewRepository() *Repository {
 	return &Repository{state: newStoreState()}
+}
+
+func NewRepositoryFromSnapshotBytes(data []byte) (*Repository, error) {
+	var snap snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return nil, err
+	}
+	state, err := storeStateFromSnapshot(snap)
+	if err != nil {
+		return nil, err
+	}
+	return &Repository{state: state}, nil
 }
 
 func (r *Repository) View(ctx context.Context, fn func(repository.ReadTx) error) error {
@@ -76,10 +92,82 @@ func (r *Repository) SnapshotBytes() []byte {
 	return data
 }
 
+func (r *Repository) AnchorIdentity() (string, uint16, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state.dbUUID == "" {
+		return "", 0, fmt.Errorf("%w: db_uuid is missing", repository.ErrInvalidRecord)
+	}
+	if r.state.meta.state != repository.RecordValid {
+		return "", 0, fmt.Errorf("%w: meta is %s", repository.ErrInvalidRecord, r.state.meta.state)
+	}
+	return r.state.dbUUID, r.state.meta.value.SchemaVersion, nil
+}
+
 func (r *Repository) InjectCorruptSafetyForTest(jobID model.JobID, diagnostic string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.state.safety[jobID] = corruptSlot[model.SafetyRecord](diagnostic)
+}
+
+func (r *Repository) InjectMissingSafetyForTest(jobID model.JobID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.state.safety, jobID)
+}
+
+func (r *Repository) InjectCorruptProjectionForTest(jobID model.JobID, diagnostic string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.projections[jobID] = corruptSlot[model.JobProjection](diagnostic)
+}
+
+func (r *Repository) InjectMissingProjectionForTest(jobID model.JobID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.state.projections, jobID)
+}
+
+func (r *Repository) InjectCorruptBindingForTest(key model.RequestKey, diagnostic string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.bindings[key] = corruptSlot[model.Binding](diagnostic)
+}
+
+func (r *Repository) InjectMissingBindingForTest(key model.RequestKey) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.state.bindings, key)
+}
+
+func (r *Repository) InjectProjectionForTest(projection model.JobProjection) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.projections[projection.JobID] = validSlot(cloneProjection(projection))
+}
+
+func (r *Repository) InjectTombstoneForTest(tombstone repository.Tombstone) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.tombstones[tombstone.RequestKey] = validSlot(cloneTombstone(tombstone))
+}
+
+func (r *Repository) InjectCorruptMetaForTest(diagnostic string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.meta = corruptSlot[repository.AuthorityMeta](diagnostic)
+}
+
+func (r *Repository) InjectMissingMetaForTest() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.meta = recordSlot[repository.AuthorityMeta]{}
+}
+
+func (r *Repository) InjectDBUUIDForTest(uuid string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.dbUUID = uuid
 }
 
 type readTx struct {
@@ -246,7 +334,10 @@ func (tx *writeTx) PutProjection(projection model.JobProjection) error {
 	}
 	slot, ok := tx.state.projections[projection.JobID]
 	if ok && slot.state == repository.RecordCorrupt {
-		return corruptRecordError("projection", projection.JobID.String(), slot.diagnostic)
+		quarantine, quarantined := tx.state.quarantines[projection.JobID]
+		if !quarantined || quarantine.state != repository.RecordValid || strings.TrimSpace(quarantine.value.Diagnostic) == "" {
+			return corruptRecordError("projection", projection.JobID.String(), slot.diagnostic)
+		}
 	}
 	if ok && slot.state == repository.RecordValid && reflect.DeepEqual(slot.value, projection) {
 		return nil
@@ -324,6 +415,7 @@ func (tx *writeTx) DeleteLiveJob(jobID model.JobID) error {
 }
 
 type storeState struct {
+	dbUUID          string
 	generation      uint64
 	nextJobSequence uint64
 	meta            recordSlot[repository.AuthorityMeta]
@@ -336,6 +428,7 @@ type storeState struct {
 
 func newStoreState() storeState {
 	state := storeState{
+		dbUUID:          fmt.Sprintf("memory-db-%020d", atomic.AddUint64(&nextMemoryDBUUID, 1)),
 		generation:      0,
 		nextJobSequence: 1,
 		bindings:        map[model.RequestKey]recordSlot[model.Binding]{},
@@ -350,6 +443,7 @@ func newStoreState() storeState {
 
 func (s storeState) clone() storeState {
 	return storeState{
+		dbUUID:          s.dbUUID,
 		generation:      s.generation,
 		nextJobSequence: s.nextJobSequence,
 		meta:            cloneSlot(s.meta, cloneMeta),
@@ -729,6 +823,7 @@ func corruptRecordError(kind, key, diagnostic string) error {
 }
 
 type snapshot struct {
+	DBUUID          string                                       `json:"dbUUID"`
 	Generation      uint64                                       `json:"generation"`
 	NextJobSequence uint64                                       `json:"nextJobSequence"`
 	Meta            repository.Record[repository.AuthorityMeta]  `json:"meta"`
@@ -746,6 +841,7 @@ type snapshotEntry[T any] struct {
 
 func snapshotState(state storeState) snapshot {
 	return snapshot{
+		DBUUID:          state.dbUUID,
 		Generation:      state.generation,
 		NextJobSequence: state.nextJobSequence,
 		Meta:            state.metaRecord(),
@@ -755,6 +851,107 @@ func snapshotState(state storeState) snapshot {
 		Projections:     snapshotJobMap(state.projections, cloneProjection),
 		Quarantines:     snapshotJobMap(state.quarantines, cloneQuarantine),
 	}
+}
+
+func storeStateFromSnapshot(snap snapshot) (storeState, error) {
+	if snap.DBUUID == "" {
+		return storeState{}, fmt.Errorf("%w: snapshot.db_uuid is missing", repository.ErrInvalidRecord)
+	}
+	if snap.NextJobSequence == 0 {
+		return storeState{}, fmt.Errorf("%w: snapshot.next_job_sequence is missing", repository.ErrInvalidRecord)
+	}
+	meta, err := slotFromRecord(snap.Meta, cloneMeta)
+	if err != nil {
+		return storeState{}, fmt.Errorf("snapshot.meta: %w", err)
+	}
+	state := storeState{
+		dbUUID:          snap.DBUUID,
+		generation:      snap.Generation,
+		nextJobSequence: snap.NextJobSequence,
+		meta:            meta,
+		bindings:        map[model.RequestKey]recordSlot[model.Binding]{},
+		tombstones:      map[model.RequestKey]recordSlot[repository.Tombstone]{},
+		safety:          map[model.JobID]recordSlot[model.SafetyRecord]{},
+		projections:     map[model.JobID]recordSlot[model.JobProjection]{},
+		quarantines:     map[model.JobID]recordSlot[repository.QuarantineRecord]{},
+	}
+	for _, entry := range snap.Bindings {
+		key, err := parseSnapshotRequestKey(entry.Key)
+		if err != nil {
+			return storeState{}, fmt.Errorf("snapshot.binding %q: %w", entry.Key, err)
+		}
+		slot, err := slotFromRecord(entry.Record, cloneBinding)
+		if err != nil {
+			return storeState{}, fmt.Errorf("snapshot.binding %q: %w", entry.Key, err)
+		}
+		state.bindings[key] = slot
+	}
+	for _, entry := range snap.Tombstones {
+		key, err := parseSnapshotRequestKey(entry.Key)
+		if err != nil {
+			return storeState{}, fmt.Errorf("snapshot.tombstone %q: %w", entry.Key, err)
+		}
+		slot, err := slotFromRecord(entry.Record, cloneTombstone)
+		if err != nil {
+			return storeState{}, fmt.Errorf("snapshot.tombstone %q: %w", entry.Key, err)
+		}
+		state.tombstones[key] = slot
+	}
+	for _, entry := range snap.Safety {
+		key, err := model.NewJobID(entry.Key)
+		if err != nil {
+			return storeState{}, fmt.Errorf("snapshot.safety %q: %w", entry.Key, err)
+		}
+		slot, err := slotFromRecord(entry.Record, cloneSafetyRecord)
+		if err != nil {
+			return storeState{}, fmt.Errorf("snapshot.safety %q: %w", entry.Key, err)
+		}
+		state.safety[key] = slot
+	}
+	for _, entry := range snap.Projections {
+		key, err := model.NewJobID(entry.Key)
+		if err != nil {
+			return storeState{}, fmt.Errorf("snapshot.projection %q: %w", entry.Key, err)
+		}
+		slot, err := slotFromRecord(entry.Record, cloneProjection)
+		if err != nil {
+			return storeState{}, fmt.Errorf("snapshot.projection %q: %w", entry.Key, err)
+		}
+		state.projections[key] = slot
+	}
+	for _, entry := range snap.Quarantines {
+		key, err := model.NewJobID(entry.Key)
+		if err != nil {
+			return storeState{}, fmt.Errorf("snapshot.quarantine %q: %w", entry.Key, err)
+		}
+		slot, err := slotFromRecord(entry.Record, cloneQuarantine)
+		if err != nil {
+			return storeState{}, fmt.Errorf("snapshot.quarantine %q: %w", entry.Key, err)
+		}
+		state.quarantines[key] = slot
+	}
+	return state, nil
+}
+
+func slotFromRecord[T any](record repository.Record[T], clone func(T) T) (recordSlot[T], error) {
+	switch record.State {
+	case repository.RecordMissing:
+		return recordSlot[T]{}, nil
+	case repository.RecordValid:
+		return validSlot(clone(record.Value)), nil
+	case repository.RecordCorrupt:
+		return corruptSlot[T](record.Diagnostic), nil
+	default:
+		return recordSlot[T]{}, fmt.Errorf("%w: unknown record state %d", repository.ErrInvalidRecord, record.State)
+	}
+}
+
+func parseSnapshotRequestKey(value string) (model.RequestKey, error) {
+	parts := strings.Split(value, "/")
+	if len(parts) != 2 {
+		return model.RequestKey{}, fmt.Errorf("%w: request key %q is not workspace/request", repository.ErrInvalidRecord, value)
+	}
+	return model.NewRequestKey(parts[0], parts[1])
 }
 
 func snapshotRequestMap[T any](in map[model.RequestKey]recordSlot[T], clone func(T) T) []snapshotEntry[T] {
