@@ -97,6 +97,14 @@ func (s *MemoryAdmissionStore) ObserveStartupAnchor(input AnchorInput) StartupDe
 	s.startupAnchorDispositionPersisted = true
 	s.startupAnchorCompleted = false
 	s.silentRecreated = input.EverInitialized && !input.DBPresent && !input.AnchorPresent
+	if input.AnchorPresent && input.AnchorValid {
+		s.anchorState = AnchorState{
+			DBUUID:              anchorStateUUID(input),
+			SchemaMajor:         anchorStateSchemaMajor(input),
+			EverInitialized:     input.EverInitialized,
+			HighWaterGeneration: input.HighWaterGeneration,
+		}
+	}
 	if decision.Fatal() {
 		s.fatal = true
 	}
@@ -112,52 +120,80 @@ func AdvanceAnchorHighWater(anchor AnchorState, dbGeneration int64) AnchorState 
 }
 
 func RunAnchorInitialization(schemaMajor int, generation int64, injector *FailureInjector) (AnchorInitState, error) {
+	return RunAnchorInitializationWithObserver(schemaMajor, generation, injector, nil)
+}
+
+func RunAnchorInitializationWithObserver(schemaMajor int, generation int64, injector *FailureInjector, observer func(AnchorInitState) error) (AnchorInitState, error) {
 	state := AnchorInitState{SchemaMajor: schemaMajor, HighWaterGeneration: generation}
 	if err := anchorStep(injector, FailAnchorTempDBBefore, FailAnchorTempDBAfter, func() {
 		state.TempDBCreated = true
+	}, func() error {
+		return observeAnchorState(observer, state)
 	}); err != nil {
 		return state, err
 	}
 	if err := anchorStep(injector, FailAnchorDBFsyncBefore, FailAnchorDBFsyncAfter, func() {
 		state.DBFsynced = true
+	}, func() error {
+		return observeAnchorState(observer, state)
 	}); err != nil {
 		return state, err
 	}
 	if err := anchorStep(injector, FailAnchorRenameBefore, FailAnchorRenameAfter, func() {
 		state.Renamed = true
+	}, func() error {
+		return observeAnchorState(observer, state)
 	}); err != nil {
 		return state, err
 	}
 	if err := anchorStep(injector, FailAnchorDirFsyncBefore, FailAnchorDirFsyncAfter, func() {
 		state.DirFsynced = true
+	}, func() error {
+		return observeAnchorState(observer, state)
 	}); err != nil {
 		return state, err
 	}
 	if err := anchorStep(injector, FailAnchorPublishBefore, FailAnchorPublishAfter, func() {
 		state.AnchorPublished = true
 		state.EverInitialized = true
+	}, func() error {
+		return observeAnchorState(observer, state)
 	}); err != nil {
 		return state, err
 	}
 	if err := anchorStep(injector, FailAnchorPublishDirFsyncBefore, FailAnchorPublishDirFsyncAfter, func() {
 		state.AnchorDirFsynced = true
+	}, func() error {
+		return observeAnchorState(observer, state)
 	}); err != nil {
 		return state, err
 	}
 	return state, nil
 }
 
-func anchorStep(injector *FailureInjector, before, after Failpoint, op func()) error {
+func anchorStep(injector *FailureInjector, before, after Failpoint, op func(), observer func() error) error {
 	if injector != nil {
 		if err := injector.Fail(before); err != nil {
 			return err
 		}
 	}
 	op()
+	if observer != nil {
+		if err := observer(); err != nil {
+			return err
+		}
+	}
 	if injector != nil {
 		if err := injector.Fail(after); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func observeAnchorState(observer func(AnchorInitState) error, state AnchorInitState) error {
+	if observer == nil {
+		return nil
+	}
+	return observer(state)
 }

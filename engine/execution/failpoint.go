@@ -7,6 +7,7 @@ type Failpoint string
 const (
 	FailAdmissionBeforeCommit         Failpoint = "admission.before_commit"
 	FailAdmissionAfterCommit          Failpoint = "admission.after_commit"
+	FailAdmissionCommittedMark        Failpoint = "admission.committed_mark"
 	FailPostCommitPreRunnable         Failpoint = "admission.post_commit_pre_runnable"
 	FailAcknowledgeBeforeCAS          Failpoint = "acknowledge.before_cas"
 	FailAcknowledgeAfterCAS           Failpoint = "acknowledge.after_cas"
@@ -24,6 +25,8 @@ const (
 	FailGrantPermitAfterCAS           Failpoint = "permit_grant.after_cas"
 	FailPermitSendBeforeSideEffect    Failpoint = "permit_send.before_side_effect"
 	FailPermitSendAfterSideEffect     Failpoint = "permit_send.after_side_effect"
+	FailLegacyUnfencedPrepareBefore   Failpoint = "legacy_unfenced_prepare.before_side_effect"
+	FailLegacyUnfencedPrepareAfter    Failpoint = "legacy_unfenced_prepare.after_side_effect"
 	FailLegacyUnfencedStartBefore     Failpoint = "legacy_unfenced_start.before_side_effect"
 	FailLegacyUnfencedStartAfter      Failpoint = "legacy_unfenced_start.after_side_effect"
 	FailPermitMaybeSentBeforeCAS      Failpoint = "permit_maybe_sent.before_cas"
@@ -113,6 +116,7 @@ func AllFailpoints() []Failpoint {
 	return []Failpoint{
 		FailAdmissionBeforeCommit,
 		FailAdmissionAfterCommit,
+		FailAdmissionCommittedMark,
 		FailPostCommitPreRunnable,
 		FailAcknowledgeBeforeCAS,
 		FailAcknowledgeAfterCAS,
@@ -130,6 +134,8 @@ func AllFailpoints() []Failpoint {
 		FailGrantPermitAfterCAS,
 		FailPermitSendBeforeSideEffect,
 		FailPermitSendAfterSideEffect,
+		FailLegacyUnfencedPrepareBefore,
+		FailLegacyUnfencedPrepareAfter,
 		FailLegacyUnfencedStartBefore,
 		FailLegacyUnfencedStartAfter,
 		FailPermitMaybeSentBeforeCAS,

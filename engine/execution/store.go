@@ -1,6 +1,9 @@
 package execution
 
-import "fmt"
+import (
+	"fmt"
+	"reflect"
+)
 
 type StatusQuery struct {
 	PublicStates []Public
@@ -44,14 +47,12 @@ type AdmissionStore interface {
 	FindSession(sessionID string) (Aggregate, bool)
 	ListPriorBootNonterminal(currentBootID string) ([]Aggregate, error)
 	Acknowledge(jobID, attemptID string, epoch int64) (Aggregate, error)
+	BeginRejectUnacknowledged(jobID, attemptID string, epoch int64) (Aggregate, error)
 	RejectUnacknowledged(jobID, attemptID string, epoch int64) (Aggregate, error)
 	RecordSupervisor(jobID, attemptID string, epoch int64, groupRef GroupRef) (Aggregate, error)
 	GrantPermit(jobID, attemptID string, epoch int64, launchOrdinal int, nonce string) (Aggregate, error)
 	RequestCancel(jobID string) (Aggregate, error)
 	RecordPermitMaybeSent(jobID, attemptID string, epoch int64, launchOrdinal int) (Aggregate, error)
-	RecordExecForked(jobID, attemptID string, epoch int64) (Aggregate, error)
-	RecordExeced(jobID, attemptID string, epoch int64) (Aggregate, error)
-	RecordBackendStarted(jobID, attemptID string, epoch int64, childRef ChildRef) (Aggregate, error)
 	RecordStarted(jobID, attemptID string, epoch int64, launchOrdinal int, childRef ChildRef) (Aggregate, error)
 	RecordLaunchExitEvidence(jobID, attemptID string, epoch int64, launchOrdinal int, childExited, groupEmpty Evidence) (Aggregate, error)
 	RecordLaunchQuiescent(jobID, attemptID string, epoch int64, launchOrdinal int) (Aggregate, error)
@@ -76,7 +77,10 @@ type MemoryAdmissionStore struct {
 	tombstones        map[string]Tombstone
 	resultArtifacts   map[string]ResultArtifact
 	acceptedKeys      map[string]string
+	attempts          map[string]*AttemptAuthority
+	sideEffectLedger  int
 	replaySideEffects int
+	replayEvents      []string
 	silentRecreated   bool
 	fatal             bool
 	mutating          bool
@@ -87,6 +91,8 @@ type MemoryAdmissionStore struct {
 	startupAnchorDecision             StartupDecision
 	startupAnchorDispositionPersisted bool
 	startupAnchorCompleted            bool
+	anchorState                       AnchorState
+	anchorInitState                   AnchorInitState
 }
 
 func NewMemoryAdmissionStore() *MemoryAdmissionStore {
@@ -97,6 +103,7 @@ func NewMemoryAdmissionStore() *MemoryAdmissionStore {
 		tombstones:      map[string]Tombstone{},
 		resultArtifacts: map[string]ResultArtifact{},
 		acceptedKeys:    map[string]string{},
+		attempts:        map[string]*AttemptAuthority{},
 	}
 }
 
@@ -221,6 +228,8 @@ func (s *MemoryAdmissionStore) ResolveOrAccept(req SubmitRequest) (ResolveResult
 		aggregate.SessionID = aggregate.LaunchSpec.SessionID
 	}
 	s.jobs[aggregate.JobID] = aggregate
+	authority := &AttemptAuthority{Supervisor: supervisor, GrantNonceHistory: map[int]string{}}
+	s.attempts[aggregate.JobID] = authority
 	if req.RequestID != "" {
 		key := bindingKey(req.WorkspaceKey, req.RequestID)
 		binding := Binding{
@@ -241,7 +250,11 @@ func (s *MemoryAdmissionStore) ResolveOrAccept(req SubmitRequest) (ResolveResult
 	return ResolveResult{Status: ResolveAcceptedNew, Job: aggregate.copy(), JobID: aggregate.JobID}, nil
 }
 
-func (s *MemoryAdmissionStore) resolveBinding(binding Binding, req SubmitRequest) (ResolveResult, error) {
+func (s *MemoryAdmissionStore) resolveBinding(binding Binding, req SubmitRequest) (result ResolveResult, err error) {
+	before := s.executionAuthoritySnapshot()
+	defer func() {
+		err = s.finishReplayObservation(before, "binding:"+binding.JobID, err)
+	}()
 	if !binding.Fingerprint.supported() {
 		return ResolveResult{}, protocolError(CodeRequestFingerprintUnsupported, binding.JobID, "recorded fingerprint is unsupported")
 	}
@@ -259,7 +272,11 @@ func (s *MemoryAdmissionStore) resolveBinding(binding Binding, req SubmitRequest
 	return ResolveResult{Status: ResolveExisting, Job: job.copy(), JobID: binding.JobID}, nil
 }
 
-func (s *MemoryAdmissionStore) resolveTombstone(tombstone Tombstone, req SubmitRequest) (ResolveResult, error) {
+func (s *MemoryAdmissionStore) resolveTombstone(tombstone Tombstone, req SubmitRequest) (result ResolveResult, err error) {
+	before := s.executionAuthoritySnapshot()
+	defer func() {
+		err = s.finishReplayObservation(before, "tombstone:"+tombstone.JobID, err)
+	}()
 	if !tombstone.Fingerprint.supported() {
 		return ResolveResult{}, protocolError(CodeRequestFingerprintUnsupported, tombstone.JobID, "recorded tombstone fingerprint is unsupported")
 	}
@@ -323,6 +340,9 @@ func (s *MemoryAdmissionStore) Acknowledge(jobID, attemptID string, epoch int64)
 		if job.Decision != DecisionAwaitingAck {
 			return protocolError(CodePreconditionFailed, job.JobID, "job is not awaiting acknowledgement")
 		}
+		if job.TerminalizationStarted || job.RetirementStarted || job.Retired {
+			return protocolError(CodePreconditionFailed, job.JobID, "job is already terminalizing")
+		}
 		if job.PermitState != PermitNone || job.PermitMaybeSent {
 			return protocolError(CodePreconditionFailed, job.JobID, "permit exists before acknowledgement")
 		}
@@ -337,12 +357,33 @@ func (s *MemoryAdmissionStore) Acknowledge(jobID, attemptID string, epoch int64)
 	})
 }
 
-func (s *MemoryAdmissionStore) RejectUnacknowledged(jobID, attemptID string, epoch int64) (Aggregate, error) {
+func (s *MemoryAdmissionStore) BeginRejectUnacknowledged(jobID, attemptID string, epoch int64) (Aggregate, error) {
 	return s.mutate(jobID, attemptID, epoch, func(job *Aggregate) error {
+		if job.TerminalizationStarted && job.Decision == DecisionCancelRequested {
+			return nil
+		}
 		if job.Decision != DecisionAwaitingAck {
 			return protocolError(CodePreconditionFailed, job.JobID, "job is not awaiting acknowledgement")
 		}
-		if job.PermitState != PermitNone || job.PermitMaybeSent {
+		if job.PermitState != PermitNone || job.PermitMaybeSent || hasAnyGrantEvidence(job, s.attemptAuthority(job.JobID)) {
+			return protocolError(CodePreconditionFailed, job.JobID, "permit exists before rejection")
+		}
+		if !job.Supervisor.Valid() || job.Retired || job.RetirementStarted {
+			return protocolError(CodePreconditionFailed, job.JobID, "prepared supervisor is not live")
+		}
+		job.Decision = DecisionCancelRequested
+		job.PermitState = PermitCanceled
+		job.TerminalizationStarted = true
+		return nil
+	})
+}
+
+func (s *MemoryAdmissionStore) RejectUnacknowledged(jobID, attemptID string, epoch int64) (Aggregate, error) {
+	return s.mutate(jobID, attemptID, epoch, func(job *Aggregate) error {
+		if job.Decision != DecisionCancelRequested || !job.TerminalizationStarted {
+			return protocolError(CodePreconditionFailed, job.JobID, "job rejection was not durably started")
+		}
+		if job.PermitState != PermitCanceled || job.PermitMaybeSent || hasAnyGrantEvidence(job, s.attemptAuthority(job.JobID)) {
 			return protocolError(CodePreconditionFailed, job.JobID, "permit exists before rejection")
 		}
 		if job.Supervisor.Valid() && !job.Retired {
@@ -380,6 +421,8 @@ func (s *MemoryAdmissionStore) RecordSupervisor(jobID, attemptID string, epoch i
 		job.Supervisor = groupRef
 		job.Dispatch = DispatchSupervisorPrepared
 		job.Retired = false
+		authority := s.mutableAttemptAuthority(job.JobID)
+		authority.Supervisor = groupRef
 		return nil
 	})
 }
@@ -387,14 +430,20 @@ func (s *MemoryAdmissionStore) RecordSupervisor(jobID, attemptID string, epoch i
 func (s *MemoryAdmissionStore) GrantPermit(jobID, attemptID string, epoch int64, launchOrdinal int, nonce string) (Aggregate, error) {
 	return s.mutate(jobID, attemptID, epoch, func(job *Aggregate) error {
 		job.ensureMaps()
-		if job.Decision == DecisionAwaitingAck {
-			return protocolError(CodePreconditionFailed, job.JobID, "awaiting acknowledgement")
+		if job.Decision != DecisionAccepted {
+			return protocolError(CodePreconditionFailed, job.JobID, "permit requires accepted decision")
 		}
-		if job.Decision == DecisionCancelRequested {
-			return protocolError(CodePreconditionFailed, job.JobID, "cancel won before permit")
+		if job.Outcome != OutcomeNone {
+			return protocolError(CodePreconditionFailed, job.JobID, "permit requires no terminal outcome")
+		}
+		if job.Dispatch != DispatchSupervisorPrepared {
+			return protocolError(CodePreconditionFailed, job.JobID, "permit requires prepared supervisor dispatch")
 		}
 		if !job.Supervisor.Valid() {
 			return protocolError(CodePreconditionFailed, job.JobID, "supervisor identity is not durable")
+		}
+		if job.Retired || job.RetirementStarted || job.TerminalizationStarted {
+			return protocolError(CodePreconditionFailed, job.JobID, "supervisor is retiring or retired")
 		}
 		if launchOrdinal != 1 && launchOrdinal != 2 {
 			return protocolError(CodePreconditionFailed, job.JobID, "invalid launch ordinal")
@@ -437,6 +486,11 @@ func (s *MemoryAdmissionStore) GrantPermit(jobID, attemptID string, epoch int64,
 		job.LiveOrdinals[launchOrdinal] = 1
 		job.Retired = false
 		job.Dispatch = DispatchPermitGranted
+		authority := s.mutableAttemptAuthority(job.JobID)
+		if !authority.Supervisor.Valid() {
+			authority.Supervisor = job.Supervisor
+		}
+		authority.GrantNonceHistory[launchOrdinal] = nonce
 		return nil
 	})
 }
@@ -448,6 +502,7 @@ func (s *MemoryAdmissionStore) RecordPermitMaybeSent(jobID, attemptID string, ep
 		}
 		job.PermitState = PermitMaybeSent
 		job.Dispatch = DispatchPermitGranted
+		s.mutableAttemptAuthority(job.JobID).PermitMaybeSent = true
 		return nil
 	})
 }
@@ -539,6 +594,9 @@ func (s *MemoryAdmissionStore) RecordStarted(jobID, attemptID string, epoch int6
 		job.PermitState = PermitConsumed
 		job.Dispatch = DispatchActive
 		job.ExecutionSideEffects++
+		authority := s.mutableAttemptAuthority(job.JobID)
+		authority.PermitConsumed = true
+		authority.ExecutionSideCount++
 		job.ActiveOrdinal = launchOrdinal
 		return nil
 	})
@@ -899,7 +957,7 @@ func (s *MemoryAdmissionStore) Expire(workspaceKey, requestID string) (string, e
 	return binding.JobID, nil
 }
 
-func (s *MemoryAdmissionStore) MarkCorrupt(jobID string, permitMaybe bool, identityTrustworthy bool, diagnostic string) (Aggregate, error) {
+func (s *MemoryAdmissionStore) MarkCorrupt(jobID string, diagnostic string) (Aggregate, error) {
 	job, ok := s.jobs[jobID]
 	if !ok {
 		return Aggregate{}, protocolError(CodeUnknownJob, jobID, "unknown job")
@@ -910,6 +968,9 @@ func (s *MemoryAdmissionStore) MarkCorrupt(jobID string, permitMaybe bool, ident
 	if err := validateAggregateEnums(job); err != nil {
 		return Aggregate{}, err
 	}
+	authority := s.attemptAuthority(jobID)
+	permitMaybe := hasAnyGrantEvidence(job, authority)
+	identityTrustworthy := authority.identityTrustworthy()
 	if !identityTrustworthy {
 		s.fatal = true
 		return Aggregate{}, protocolError(CodeCorruptFatal, jobID, "containment identity is untrustworthy")
@@ -993,13 +1054,46 @@ func (s *MemoryAdmissionStore) syntheticStartupAnchorInput() AnchorInput {
 	}
 }
 
-func (s *MemoryAdmissionStore) completeStartupAnchorDisposition() error {
+func (s *MemoryAdmissionStore) hasInitializedStorage() bool {
+	return s.step != 0 ||
+		len(s.jobs) != 0 ||
+		len(s.bindings) != 0 ||
+		len(s.tombstones) != 0 ||
+		s.anchorState.EverInitialized ||
+		s.anchorInitState.EverInitialized
+}
+
+func (s *MemoryAdmissionStore) completeStartupAnchorDisposition(injector *FailureInjector) error {
 	if !s.startupAnchorDispositionPersisted {
 		return protocolError(CodePreconditionFailed, "", "startup anchor disposition was not persisted")
 	}
+	if s.startupAnchorCompleted {
+		return nil
+	}
 	decision := s.startupAnchorDecision
 	switch decision.Action {
-	case StartupInitializeFirst, StartupRecoverAnchor, StartupContinue, StartupAdvanceAnchor:
+	case StartupInitializeFirst:
+		return s.persistStartupAnchor(1, s.startupAnchorInput.DBGeneration, injector)
+	case StartupRecoverAnchor, StartupAdvanceAnchor:
+		schemaMajor := s.startupAnchorInput.DBSchemaMajor
+		if schemaMajor == 0 {
+			schemaMajor = s.startupAnchorInput.AnchorSchemaMajor
+		}
+		if schemaMajor == 0 {
+			schemaMajor = 1
+		}
+		generation := s.startupAnchorInput.DBGeneration
+		if decision.Action == StartupAdvanceAnchor && generation < s.startupAnchorInput.HighWaterGeneration {
+			generation = s.startupAnchorInput.HighWaterGeneration
+		}
+		return s.persistStartupAnchor(schemaMajor, generation, injector)
+	case StartupContinue:
+		s.anchorState = AnchorState{
+			DBUUID:              anchorStateUUID(s.startupAnchorInput),
+			SchemaMajor:         anchorStateSchemaMajor(s.startupAnchorInput),
+			EverInitialized:     true,
+			HighWaterGeneration: s.startupAnchorInput.HighWaterGeneration,
+		}
 		s.startupAnchorCompleted = true
 		return nil
 	case StartupFatal:
@@ -1011,7 +1105,58 @@ func (s *MemoryAdmissionStore) completeStartupAnchorDisposition() error {
 	}
 }
 
+func (s *MemoryAdmissionStore) persistStartupAnchor(schemaMajor int, generation int64, injector *FailureInjector) error {
+	if generation < s.step {
+		generation = s.step
+	}
+	state, err := RunAnchorInitializationWithObserver(schemaMajor, generation, injector, func(state AnchorInitState) error {
+		s.anchorInitState = state
+		if state.AnchorPublished {
+			s.anchorState = AnchorState{
+				DBUUID:              anchorStateUUID(s.startupAnchorInput),
+				SchemaMajor:         state.SchemaMajor,
+				EverInitialized:     true,
+				HighWaterGeneration: state.HighWaterGeneration,
+			}
+		}
+		return s.checkDirectBoundary(nil)
+	})
+	s.anchorInitState = state
+	if err != nil {
+		return err
+	}
+	s.anchorState = AnchorState{
+		DBUUID:              anchorStateUUID(s.startupAnchorInput),
+		SchemaMajor:         state.SchemaMajor,
+		EverInitialized:     true,
+		HighWaterGeneration: state.HighWaterGeneration,
+	}
+	s.startupAnchorCompleted = true
+	return s.checkDirectBoundary(nil)
+}
+
+func anchorStateUUID(input AnchorInput) string {
+	if input.DBUUID != "" {
+		return input.DBUUID
+	}
+	if input.AnchorDBUUID != "" {
+		return input.AnchorDBUUID
+	}
+	return "memory"
+}
+
+func anchorStateSchemaMajor(input AnchorInput) int {
+	if input.DBSchemaMajor != 0 {
+		return input.DBSchemaMajor
+	}
+	if input.AnchorSchemaMajor != 0 {
+		return input.AnchorSchemaMajor
+	}
+	return 1
+}
+
 func (s *MemoryAdmissionStore) noteModeledSideEffect() {
+	s.sideEffectLedger++
 	if s.mutating {
 		s.sideEffectInCAS = true
 	}
@@ -1054,4 +1199,175 @@ func hasLiveAuthority(job *Aggregate) bool {
 		liveOrdinalCount(job.LiveOrdinals) != 0 ||
 		job.Child.Valid() ||
 		job.PendingChild.Valid()
+}
+
+func hasAnyGrantEvidence(job *Aggregate, authority AttemptAuthority) bool {
+	if authority.permitEvidence() {
+		return true
+	}
+	if job == nil {
+		return false
+	}
+	return len(job.LaunchNonceHistory) != 0 ||
+		job.PermitNonce != "" ||
+		job.PermitMaybeSent ||
+		job.LaunchOrdinal != 0 ||
+		job.ExecutionSideEffects != 0
+}
+
+func (s *MemoryAdmissionStore) mutableAttemptAuthority(jobID string) *AttemptAuthority {
+	authority, ok := s.attempts[jobID]
+	if !ok || authority == nil {
+		authority = &AttemptAuthority{}
+		s.attempts[jobID] = authority
+	}
+	authority.ensureMaps()
+	return authority
+}
+
+func (s *MemoryAdmissionStore) attemptAuthority(jobID string) AttemptAuthority {
+	authority, ok := s.attempts[jobID]
+	if !ok || authority == nil {
+		return AttemptAuthority{GrantNonceHistory: map[int]string{}}
+	}
+	return authority.copy()
+}
+
+func (s *MemoryAdmissionStore) RecordIndependentGrantEvidence(jobID string, group GroupRef, launchOrdinal int, nonce string) error {
+	if launchOrdinal != 1 && launchOrdinal != 2 {
+		return protocolError(CodePreconditionFailed, jobID, "invalid launch ordinal")
+	}
+	if !group.Valid() || nonce == "" {
+		return protocolError(CodePreconditionFailed, jobID, "complete independent grant evidence required")
+	}
+	authority := s.mutableAttemptAuthority(jobID)
+	authority.Supervisor = group
+	authority.GrantNonceHistory[launchOrdinal] = nonce
+	return s.checkDirectBoundary(nil)
+}
+
+type executionAuthoritySnapshot struct {
+	Jobs            map[string]executionAuthorityJobSnapshot
+	Attempts        map[string]AttemptAuthority
+	ResultArtifacts map[string]ResultArtifact
+	SideEffects     int
+}
+
+type executionAuthorityJobSnapshot struct {
+	Decision                Decision
+	Dispatch                Dispatch
+	Outcome                 Outcome
+	Acknowledged            bool
+	PermitState             PermitState
+	PermitNonce             string
+	PermitMaybeSent         bool
+	ContainmentRequired     bool
+	LaunchOrdinal           int
+	ActiveOrdinal           int
+	LaunchQuiescent         map[int]bool
+	LaunchEvidence          map[int]LaunchQuiescenceEvidence
+	LaunchNonceHistory      map[int]string
+	LiveOrdinals            map[int]int
+	Supervisor              GroupRef
+	Child                   ChildRef
+	PendingChild            ChildRef
+	TerminalProof           TerminalProof
+	TerminalReason          string
+	TerminalizationStarted  bool
+	Retired                 bool
+	RetirementStarted       bool
+	RetirementControlClosed bool
+	RetirementWorkerExited  bool
+	RetirementGroupEmpty    bool
+	RetirementEvidence      Evidence
+	Contained               bool
+	ContainmentSignaled     bool
+	ContainmentVerified     bool
+	Containment             Evidence
+	Result                  ResultRef
+	ExecutionSideEffects    int
+	LossObserved            bool
+	Corrupt                 bool
+	StartPhase              string
+}
+
+func (s *MemoryAdmissionStore) executionAuthoritySnapshot() executionAuthoritySnapshot {
+	snapshot := executionAuthoritySnapshot{
+		Jobs:            map[string]executionAuthorityJobSnapshot{},
+		Attempts:        map[string]AttemptAuthority{},
+		ResultArtifacts: map[string]ResultArtifact{},
+		SideEffects:     s.sideEffectLedger,
+	}
+	for jobID, job := range s.jobs {
+		if job == nil {
+			continue
+		}
+		snapshot.Jobs[jobID] = executionAuthorityJobSnapshot{
+			Decision:                job.Decision,
+			Dispatch:                job.Dispatch,
+			Outcome:                 job.Outcome,
+			Acknowledged:            job.Acknowledged,
+			PermitState:             job.PermitState,
+			PermitNonce:             job.PermitNonce,
+			PermitMaybeSent:         job.PermitMaybeSent,
+			ContainmentRequired:     job.ContainmentRequired,
+			LaunchOrdinal:           job.LaunchOrdinal,
+			ActiveOrdinal:           job.ActiveOrdinal,
+			LaunchQuiescent:         copyBoolMap(job.LaunchQuiescent),
+			LaunchEvidence:          copyLaunchEvidenceMap(job.LaunchEvidence),
+			LaunchNonceHistory:      copyStringByIntMap(job.LaunchNonceHistory),
+			LiveOrdinals:            copyIntMap(job.LiveOrdinals),
+			Supervisor:              job.Supervisor,
+			Child:                   job.Child,
+			PendingChild:            job.PendingChild,
+			TerminalProof:           job.TerminalProof,
+			TerminalReason:          job.TerminalReason,
+			TerminalizationStarted:  job.TerminalizationStarted,
+			Retired:                 job.Retired,
+			RetirementStarted:       job.RetirementStarted,
+			RetirementControlClosed: job.RetirementControlClosed,
+			RetirementWorkerExited:  job.RetirementWorkerExited,
+			RetirementGroupEmpty:    job.RetirementGroupEmpty,
+			RetirementEvidence:      job.RetirementEvidence,
+			Contained:               job.Contained,
+			ContainmentSignaled:     job.ContainmentSignaled,
+			ContainmentVerified:     job.ContainmentVerified,
+			Containment:             job.Containment,
+			Result:                  job.Result,
+			ExecutionSideEffects:    job.ExecutionSideEffects,
+			LossObserved:            job.LossObserved,
+			Corrupt:                 job.Corrupt,
+			StartPhase:              job.StartPhase,
+		}
+	}
+	for jobID, authority := range s.attempts {
+		if authority == nil {
+			continue
+		}
+		snapshot.Attempts[jobID] = authority.copy()
+	}
+	for path, artifact := range s.resultArtifacts {
+		snapshot.ResultArtifacts[path] = artifact
+	}
+	return snapshot
+}
+
+func (s *MemoryAdmissionStore) finishReplayObservation(before executionAuthoritySnapshot, replayID string, err error) error {
+	after := s.executionAuthoritySnapshot()
+	if !reflect.DeepEqual(before, after) {
+		s.replaySideEffects++
+		s.replayEvents = append(s.replayEvents, replayID)
+		replayErr := protocolError(CodePreconditionFailed, "", "replay changed execution authority state")
+		if err != nil {
+			return fmt.Errorf("%w; %v", err, replayErr)
+		}
+		return replayErr
+	}
+	if invErr := s.checkDirectBoundary(nil); invErr != nil {
+		if err != nil {
+			return fmt.Errorf("%w; replay invariant boundary: %v", err, invErr)
+		}
+		return invErr
+	}
+	return err
 }

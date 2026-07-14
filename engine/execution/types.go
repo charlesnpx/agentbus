@@ -393,6 +393,7 @@ type Aggregate struct {
 	PendingChild            ChildRef
 	TerminalProof           TerminalProof
 	TerminalReason          string
+	TerminalizationStarted  bool
 	Retired                 bool
 	RetirementStarted       bool
 	RetirementControlClosed bool
@@ -413,6 +414,34 @@ type Aggregate struct {
 	QuarantineDiagnostic    string
 	StartupReconciled       bool
 	StartPhase              string
+}
+
+type AttemptAuthority struct {
+	Supervisor         GroupRef
+	GrantNonceHistory  map[int]string
+	PermitMaybeSent    bool
+	PermitConsumed     bool
+	ExecutionSideCount int
+}
+
+func (a *AttemptAuthority) ensureMaps() {
+	if a.GrantNonceHistory == nil {
+		a.GrantNonceHistory = map[int]string{}
+	}
+}
+
+func (a AttemptAuthority) copy() AttemptAuthority {
+	a.GrantNonceHistory = copyStringByIntMap(a.GrantNonceHistory)
+	a.Supervisor.KnownChildRefs = append([]ChildRef(nil), a.Supervisor.KnownChildRefs...)
+	return a
+}
+
+func (a AttemptAuthority) permitEvidence() bool {
+	return len(a.GrantNonceHistory) != 0 || a.PermitMaybeSent || a.PermitConsumed || a.ExecutionSideCount != 0
+}
+
+func (a AttemptAuthority) identityTrustworthy() bool {
+	return !a.permitEvidence() || a.Supervisor.Valid()
 }
 
 func (a Aggregate) Terminal() bool {

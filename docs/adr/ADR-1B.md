@@ -8,6 +8,17 @@ initialization is allowed only when both are absent, a missing DB with an existi
 UUID mismatch is fatal, DB generation below the anchor is fatal, and a lagging anchor may be advanced
 when the DB generation is higher.
 
+Startup decision rows:
+
+| DB | Anchor | Prior initialization | Decision |
+| --- | --- | --- | --- |
+| absent | absent | no | initialize first |
+| absent | absent | yes | fatal |
+| present and valid | absent | no | recover interrupted initialization |
+| present and valid | absent | yes | recover missing anchor from initialized DB |
+| absent | present and valid | any | fatal |
+| present and valid | present and valid | yes | continue, advance lagging anchor, or fatal on UUID/schema/rollback mismatch |
+
 ## Invariant(s)
 
 - DB deletion after initialization is detected and never recreated silently.

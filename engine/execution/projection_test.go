@@ -48,6 +48,12 @@ func TestTerminalOutcomesProjectToTerminalPublicStates(t *testing.T) {
 	}
 }
 
+func TestReachableInternalRejectsCompletedPermitGranted(t *testing.T) {
+	if ReachableInternal(DecisionAccepted, DispatchPermitGranted, OutcomeCompleted) {
+		t.Fatal("ReachableInternal accepted completed outcome with permit-granted dispatch")
+	}
+}
+
 func assertStrings(t *testing.T, label string, got, want []string) {
 	t.Helper()
 	if len(got) != len(want) {
