@@ -41,10 +41,18 @@ func CheckInvariants(view InvariantView) error {
 		}
 	}
 
-	activeOrdinals := map[string]int{}
 	for _, job := range store.jobs {
+		job.ensureMaps()
 		if PublicProjection(job.Decision, job.Dispatch, job.Outcome) == "" {
 			return fmt.Errorf("job %s has no public projection", job.JobID)
+		}
+		if job.Mode != ModeLegacyUnfenced {
+			if err := validateLaunchSpec(job.LaunchSpec, job.Mode); err != nil {
+				return fmt.Errorf("job %s has invalid immutable launch spec: %w", job.JobID, err)
+			}
+			if job.LaunchSpec.WorkspaceKey != job.WorkspaceKey || job.LaunchSpec.RequestID != job.RequestID || !job.LaunchSpec.Fingerprint.Equal(job.Fingerprint) {
+				return fmt.Errorf("job %s aggregate launch spec does not match aggregate identity", job.JobID)
+			}
 		}
 		if job.Decision == DecisionAwaitingAck && (job.PermitState == PermitGranted || job.PermitMaybeSent || job.Dispatch == DispatchPermitGranted || job.Dispatch == DispatchActive) {
 			return fmt.Errorf("job %s awaiting acknowledgement has permit state", job.JobID)
@@ -54,8 +62,14 @@ func CheckInvariants(view InvariantView) error {
 			if !ok || !obligation.Committed {
 				return fmt.Errorf("current-boot nonterminal job %s has no committed obligation", job.JobID)
 			}
+			if obligation.Mode != job.Mode {
+				return fmt.Errorf("job %s obligation mode %s does not match aggregate mode %s", job.JobID, obligation.Mode, job.Mode)
+			}
+			if obligation.LaunchSpec != job.LaunchSpec {
+				return fmt.Errorf("job %s obligation launch spec does not match aggregate launch spec", job.JobID)
+			}
 		}
-		if (job.PermitState == PermitGranted || job.PermitMaybeSent || job.Dispatch == DispatchPermitGranted || job.Dispatch == DispatchActive) && !job.Supervisor.Valid() {
+		if (job.PermitState == PermitGranted || job.PermitState == PermitMaybeSent || job.PermitState == PermitConsumed || job.PermitMaybeSent || job.Dispatch == DispatchPermitGranted || job.Dispatch == DispatchActive) && !job.Supervisor.Valid() {
 			return fmt.Errorf("job %s has permit without durable supervisor identity", job.JobID)
 		}
 		if job.PermitMaybeSent && job.ContainmentRequired && job.Terminal() && job.TerminalProof != ProofContained {
@@ -64,12 +78,62 @@ func CheckInvariants(view InvariantView) error {
 		if job.PermitMaybeSent && !job.LaunchQuiescent[job.LaunchOrdinal] && !job.Contained && !job.ContainmentRequired && !job.Terminal() {
 			return fmt.Errorf("job %s permit-maybe-sent is not marked containment-required", job.JobID)
 		}
+		for ordinal, quiescent := range job.LaunchQuiescent {
+			if !quiescent {
+				continue
+			}
+			evidence := job.LaunchEvidence[ordinal]
+			if !evidence.ChildExited.Present() || !evidence.GroupEmpty.Present() {
+				return fmt.Errorf("job %s launch ordinal %d quiescent without child-exit and group-empty evidence", job.JobID, ordinal)
+			}
+		}
+		for ordinal, count := range job.LiveOrdinals {
+			if count < 0 {
+				return fmt.Errorf("job %s launch ordinal %d has negative live authority count", job.JobID, ordinal)
+			}
+			if count > 1 {
+				return fmt.Errorf("job %s launch ordinal %d has %d live authorities", job.JobID, ordinal, count)
+			}
+		}
+		if liveOrdinalCount(job.LiveOrdinals) > 1 {
+			return fmt.Errorf("job %s has more than one live execution authority", job.JobID)
+		}
+		if job.ActiveOrdinal != 0 && job.LiveOrdinals[job.ActiveOrdinal] != 1 {
+			return fmt.Errorf("job %s active ordinal %d is not represented in live authority set", job.JobID, job.ActiveOrdinal)
+		}
 		if job.Terminal() && !validTerminalProof(job) {
 			return fmt.Errorf("job %s has invalid terminal proof %q", job.JobID, job.TerminalProof)
 		}
+		if job.Terminal() {
+			if job.PermitState == PermitGranted || job.PermitState == PermitMaybeSent || job.PermitState == PermitConsumed {
+				return fmt.Errorf("job %s is terminal with live permit state %s", job.JobID, job.PermitState)
+			}
+			if job.ActiveOrdinal != 0 || liveOrdinalCount(job.LiveOrdinals) != 0 {
+				return fmt.Errorf("job %s is terminal with live ordinal authority", job.JobID)
+			}
+			if job.Child.Valid() || job.PendingChild.Valid() {
+				return fmt.Errorf("job %s is terminal with child identity still live", job.JobID)
+			}
+			if !job.Retired {
+				return fmt.Errorf("job %s is terminal with unretired supervisor", job.JobID)
+			}
+			if (job.Outcome == OutcomeCompleted || job.Outcome == OutcomeCompletedNoncompliant) && !store.resultDurable(job.Result) {
+				return fmt.Errorf("job %s completed terminal references unverified result digest/bytes", job.JobID)
+			}
+		}
+		if job.Retired && !job.Contained && !job.RetirementEvidence.Present() {
+			return fmt.Errorf("job %s is retired without retirement evidence", job.JobID)
+		}
+		if job.Contained && (!job.ContainmentSignaled || !job.ContainmentVerified || !job.Containment.Present()) {
+			return fmt.Errorf("job %s is contained without containment signal/verification evidence", job.JobID)
+		}
 		if job.LossObserved {
 			if !job.Terminal() && !view.FailStopping {
-				return fmt.Errorf("job %s observed owner/supervisor loss but is not terminal", job.JobID)
+				reconciling := job.Dispatch == DispatchReconciling && job.ContainmentRequired
+				containedPendingTerminal := job.Dispatch == DispatchContained && job.Contained && job.Retired
+				if !reconciling && !containedPendingTerminal {
+					return fmt.Errorf("job %s observed loss without live containment obligation", job.JobID)
+				}
 			}
 			if job.Terminal() && job.TerminalProof != ProofContained {
 				return fmt.Errorf("job %s observed loss without containment proof", job.JobID)
@@ -78,12 +142,6 @@ func CheckInvariants(view InvariantView) error {
 		if job.LaunchOrdinal == 2 && !job.LaunchQuiescent[1] {
 			return fmt.Errorf("job %s launch ordinal 2 without ordinal 1 quiescent", job.JobID)
 		}
-		if job.ActiveOrdinal != 0 {
-			if prev := activeOrdinals[job.JobID]; prev != 0 {
-				return fmt.Errorf("job %s has multiple active ordinals %d and %d", job.JobID, prev, job.ActiveOrdinal)
-			}
-			activeOrdinals[job.JobID] = job.ActiveOrdinal
-		}
 	}
 	return nil
 }
@@ -91,14 +149,31 @@ func CheckInvariants(view InvariantView) error {
 func validTerminalProof(job *Aggregate) bool {
 	switch job.TerminalProof {
 	case ProofNeverPermittedAndRetired:
-		return !job.PermitMaybeSent && job.Retired && terminalOutcome(job.Outcome)
+		return !hasLiveAuthority(job) && !job.PermitMaybeSent && job.Retired && job.RetirementEvidence.Present() && terminalOutcome(job.Outcome)
 	case ProofCleanQuiescentOutcomeAndRetired:
-		return job.Retired && !job.Contained && terminalOutcome(job.Outcome)
+		if !job.Retired || job.Contained || !terminalOutcome(job.Outcome) || hasLiveAuthority(job) {
+			return false
+		}
+		if job.LaunchOrdinal != 0 && !job.LaunchQuiescent[job.LaunchOrdinal] {
+			return false
+		}
+		return job.RetirementEvidence.Present()
 	case ProofContained:
-		return job.Contained && job.Retired && terminalOutcome(job.Outcome)
+		return job.Contained && job.Retired && job.ContainmentSignaled && job.ContainmentVerified && job.Containment.Present() && terminalOutcome(job.Outcome)
 	default:
 		return false
 	}
+}
+
+func (s *MemoryAdmissionStore) resultDurable(result ResultRef) bool {
+	if result.Path == "" {
+		return false
+	}
+	artifact, ok := s.resultArtifacts[result.Path]
+	return ok &&
+		artifact.DirSynced &&
+		artifact.Digest == result.Digest &&
+		artifact.Bytes == result.Bytes
 }
 
 func ResultCleanupEligible(job Aggregate, obligations map[string]CoordinatorObligation, tempName string) bool {
