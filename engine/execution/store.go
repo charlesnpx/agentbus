@@ -819,15 +819,20 @@ func (s *MemoryAdmissionStore) Expire(workspaceKey, requestID string) (string, e
 	return binding.JobID, nil
 }
 
-func (s *MemoryAdmissionStore) MarkCorrupt(jobID string, _ bool, identityTrustworthy bool, diagnostic string) (Aggregate, error) {
+func (s *MemoryAdmissionStore) MarkCorrupt(jobID string, permitMaybe bool, identityTrustworthy bool, diagnostic string) (Aggregate, error) {
 	job, ok := s.jobs[jobID]
 	if !ok {
 		return Aggregate{}, protocolError(CodeUnknownJob, jobID, "unknown job")
 	}
-	permitMaybe := executionUncertain(job)
-	if permitMaybe && !identityTrustworthy {
+	if job.Terminal() {
+		return Aggregate{}, protocolError(CodePreconditionFailed, jobID, "terminal job")
+	}
+	if !identityTrustworthy {
 		s.fatal = true
 		return Aggregate{}, protocolError(CodeCorruptFatal, jobID, "containment identity is untrustworthy")
+	}
+	if permitMaybe && !job.Contained {
+		return Aggregate{}, protocolError(CodePreconditionFailed, jobID, "verified containment required before corrupt quarantine")
 	}
 	s.mutating = true
 	defer func() { s.mutating = false }()
@@ -835,36 +840,15 @@ func (s *MemoryAdmissionStore) MarkCorrupt(jobID string, _ bool, identityTrustwo
 	job.Corrupt = true
 	job.QuarantineDiagnostic = diagnostic
 	job.Outcome = OutcomeQuarantined
-	if permitMaybe {
-		job.PermitMaybeSent = true
-		job.ContainmentSignaled = true
-		job.ContainmentVerified = true
-		job.Contained = true
-		job.Retired = true
-		job.RetirementStarted = true
-		job.RetirementControlClosed = true
-		job.RetirementWorkerExited = true
-		job.RetirementGroupEmpty = true
-		job.RetirementEvidence = Evidence{Kind: "corrupt_containment_verified", Detail: diagnostic}
-		job.Containment = Evidence{Kind: "corrupt_containment_verified", Detail: diagnostic}
+	if !permitMaybe && job.Retired {
 		job.PermitState = PermitNone
+		job.PermitMaybeSent = false
+		job.ContainmentRequired = false
 		job.ActiveOrdinal = 0
 		job.LiveOrdinals = map[int]int{}
 		job.Child = ChildRef{}
 		job.PendingChild = ChildRef{}
-		job.ContainmentRequired = false
-		job.TerminalProof = ProofContained
-	} else {
-		job.RetirementStarted = true
-		job.RetirementControlClosed = true
-		job.RetirementWorkerExited = true
-		job.RetirementGroupEmpty = true
-		job.RetirementEvidence = Evidence{Kind: "never_permitted_corrupt_quarantine", Detail: diagnostic}
-		job.Retired = true
-		job.TerminalProof = ProofNeverPermittedAndRetired
 	}
-	job.Decision = DecisionTerminal
-	job.Dispatch = DispatchDone
 	job.UpdatedStep = s.step
 	return job.copy(), nil
 }

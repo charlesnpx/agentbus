@@ -212,6 +212,8 @@ type LaunchSpec struct {
 type CoordinatorLifecycleState string
 
 const (
+	CoordinatorLifecycleNotReady    CoordinatorLifecycleState = "not_ready"
+	CoordinatorLifecycleReconciling CoordinatorLifecycleState = "reconciling"
 	CoordinatorLifecycleRunning     CoordinatorLifecycleState = "running"
 	CoordinatorLifecycleFailStopped CoordinatorLifecycleState = "fail_stopped"
 )

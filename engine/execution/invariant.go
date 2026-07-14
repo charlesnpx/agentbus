@@ -7,6 +7,7 @@ type InvariantView struct {
 	Obligations                     map[string]CoordinatorObligation
 	FailStopping                    bool
 	CurrentBootID                   string
+	LifecycleState                  CoordinatorLifecycleState
 	AllowPreRunnable                bool
 	AllowCurrentBootOrphanReconcile bool
 }
@@ -14,6 +15,18 @@ type InvariantView struct {
 func CheckInvariants(view InvariantView) error {
 	if view.Store == nil {
 		return nil
+	}
+	lifecycleState := view.LifecycleState
+	if lifecycleState == "" {
+		lifecycleState = CoordinatorLifecycleRunning
+	}
+	switch lifecycleState {
+	case CoordinatorLifecycleNotReady, CoordinatorLifecycleReconciling, CoordinatorLifecycleRunning, CoordinatorLifecycleFailStopped:
+	default:
+		return fmt.Errorf("coordinator has invalid lifecycle state %q", lifecycleState)
+	}
+	if lifecycleState == CoordinatorLifecycleNotReady && !view.FailStopping && len(view.Obligations) != 0 {
+		return fmt.Errorf("not-ready coordinator has service obligations")
 	}
 	store := view.Store
 	if store.replaySideEffects != 0 {
