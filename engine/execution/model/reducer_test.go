@@ -197,6 +197,71 @@ func TestAuthorizeSecondOrdinalRequiresFirstQuiescence(t *testing.T) {
 	}
 }
 
+func TestStaleActionReceiptCannotCertifyDifferentAttemptOrSupervisor(t *testing.T) {
+	record := reducerGrantRecord(t)
+	before := cloneSafetyRecord(record)
+
+	staleAttempt := reducerContainmentCommand(t, record)
+	staleAttempt.Receipt.Attempt.AttemptID = "attempt-stale"
+	if _, err := Apply(record, staleAttempt); !errors.Is(err, ErrInvalidCommand) {
+		t.Fatalf("stale attempt receipt error = %v, want ErrInvalidCommand", err)
+	}
+	if !reflect.DeepEqual(record, before) {
+		t.Fatal("stale attempt receipt mutated input record")
+	}
+
+	wrongSupervisor := reducerContainmentCommand(t, record)
+	wrongSupervisor.Receipt.Supervisor.PGID++
+	wrongSupervisor.Receipt.Supervisor.LeaderPID++
+	wrongSupervisor.Receipt.Supervisor.HighResStartToken = "different-supervisor"
+	if _, err := Apply(record, wrongSupervisor); !errors.Is(err, ErrConflictingDuplicate) {
+		t.Fatalf("wrong supervisor receipt error = %v, want ErrConflictingDuplicate", err)
+	}
+	if !reflect.DeepEqual(record, before) {
+		t.Fatal("wrong supervisor receipt mutated input record")
+	}
+}
+
+func TestCleanTerminalProofRequiresEveryCommittedGrantOrdinalCovered(t *testing.T) {
+	uncovered := reducerCleanCompletedRecord(t)
+	secondGrant := LaunchGrant{
+		Attempt:    uncovered.Attempt.Ref,
+		Supervisor: *uncovered.Attempt.Supervisor,
+		Ordinal:    LaunchOrdinalTwo,
+		Nonce:      "nonce-2",
+		GrantedBy:  uncovered.AdmittedBy,
+	}
+	uncovered.Attempt.Grants.Second = &secondGrant
+	uncovered.Terminal = &TerminalCertificate{
+		JobID:               uncovered.JobID,
+		Attempt:             uncovered.Attempt.Ref,
+		Outcome:             OutcomeCompleted,
+		Proof:               ProofCleanQuiescentOutcomeAndRetired,
+		Cause:               CauseCompletedNormally,
+		DerivedFromRevision: uncovered.Revision,
+		DerivedBy:           uncovered.AdmittedBy,
+		Result:              &uncovered.Result.Result,
+	}
+	if err := ValidateSafetyRecord(uncovered); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("clean terminal with uncovered second grant error = %v, want ErrInvalidValue", err)
+	}
+
+	record := reducerQuiescentRecord(t)
+	record = reducerMustApply(t, record, AuthorizeLaunch{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Nonce: "nonce-2"})
+	record = reducerMustApply(t, record, ObserveLaunchConsumed{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Child: reducerChild(22)})
+	record = reducerMustApply(t, record, reducerQuiescenceCommand(t, record, LaunchOrdinalTwo))
+	record = reducerMustApply(t, record, ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeCompleted})
+	record = reducerRetiredRecord(t, record)
+	record = reducerMustApply(t, record, reducerResultCommand(t, record))
+	finalized, err := Apply(record, Finalize{Ref: reducerRef(), Intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally}})
+	if err != nil {
+		t.Fatalf("clean finalize with both grant ordinals covered error = %v", err)
+	}
+	if finalized.Record.Terminal == nil || finalized.Record.Terminal.Proof != ProofCleanQuiescentOutcomeAndRetired {
+		t.Fatalf("terminal = %#v, want clean quiescent proof", finalized.Record.Terminal)
+	}
+}
+
 func TestDeriveTerminalCertificateSelectsProofs(t *testing.T) {
 	tests := []struct {
 		name   string

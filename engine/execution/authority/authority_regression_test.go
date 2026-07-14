@@ -1,214 +1,264 @@
 package authority
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"reflect"
 	"testing"
+
+	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/engine/execution/repository"
+	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
 )
 
-var errNotImplemented = errors.New("admission authority skeleton: implemented in a later commit")
+func TestReplayConflictLeavesRepositoryAllocationAndAnchorUnchanged(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := NewAnchorStore()
+	ready := newReadyWithAnchorStore(t, repo, anchorStore, "accept-conflict")
+	request := acceptRequest(t, "accept-conflict")
 
-type AcceptanceCommand struct {
-	WorkspaceKey                        string
-	RequestID                           string
-	TaskIdentity                        string
-	InjectValidationFailureAfterBinding bool
-}
-
-type AcceptanceResult struct {
-	JobID     string
-	AttemptID string
-	Epoch     int64
-}
-
-type TerminalCommand struct {
-	JobID                   string
-	AttemptID               string
-	Epoch                   int64
-	Outcome                 string
-	RequestedProof          string
-	InjectValidationFailure bool
-}
-
-type TerminalResult struct {
-	JobID         string
-	TerminalProof string
-}
-
-type AttemptRef struct {
-	JobID     string
-	AttemptID string
-	Epoch     int64
-}
-
-type PermitCertainty string
-
-const (
-	PermitCertaintyUnknownMissing PermitCertainty = "unknown_missing"
-	PermitCertaintyNeverPermitted PermitCertainty = "never_permitted"
-	PermitCertaintyMaybePermitted PermitCertainty = "maybe_permitted"
-	PermitCertaintyPermitConsumed PermitCertainty = "permit_consumed"
-)
-
-type Snapshot struct {
-	JobCount              int
-	BindingCount          int
-	TerminalMutationCount int
-}
-
-type AdmissionAuthority interface {
-	Accept(context.Context, AcceptanceCommand) (AcceptanceResult, error)
-	PublishTerminal(context.Context, TerminalCommand) (TerminalResult, error)
-	ClassifyPermitCertainty(context.Context, AttemptRef) (PermitCertainty, error)
-	Snapshot(context.Context) (Snapshot, error)
-}
-
-type InMemoryAuthority struct{}
-
-func NewInMemoryAuthority() *InMemoryAuthority {
-	return &InMemoryAuthority{}
-}
-
-func (a *InMemoryAuthority) Accept(context.Context, AcceptanceCommand) (AcceptanceResult, error) {
-	return AcceptanceResult{}, errNotImplemented
-}
-
-func (a *InMemoryAuthority) PublishTerminal(context.Context, TerminalCommand) (TerminalResult, error) {
-	return TerminalResult{}, errNotImplemented
-}
-
-func (a *InMemoryAuthority) ClassifyPermitCertainty(context.Context, AttemptRef) (PermitCertainty, error) {
-	return "", errNotImplemented
-}
-
-func (a *InMemoryAuthority) Snapshot(context.Context) (Snapshot, error) {
-	return Snapshot{}, errNotImplemented
-}
-
-type legacyReady struct {
-	bootID string
-}
-
-type Coordinator struct {
-	authority AdmissionAuthority
-	ready     legacyReady
-}
-
-func NewCoordinator(authority AdmissionAuthority, ready legacyReady) (*Coordinator, error) {
-	if authority == nil {
-		return nil, errors.New("admission authority is required")
+	accepted, err := ready.Accept(ctx, request)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if ready.bootID == "" {
-		return nil, errors.New("ready capability is required")
+	beforeRepo := repo.SnapshotBytes()
+	beforeAnchor := anchorStore.SnapshotBytes()
+	beforeGeneration := ready.Generation()
+
+	conflict := request
+	conflict.TaskIdentity = model.NewSHA256TaskIdentity([]byte("different task"))
+	if _, err := ready.Accept(ctx, conflict); !errors.Is(err, ErrReplayConflict) {
+		t.Fatalf("conflicting replay error = %v, want ErrReplayConflict", err)
 	}
-	return &Coordinator{authority: authority, ready: ready}, nil
+	assertBytesEqual(t, "repository snapshot", beforeRepo, repo.SnapshotBytes())
+	assertBytesEqual(t, "anchor snapshot", beforeAnchor, anchorStore.SnapshotBytes())
+	if ready.Generation() != beforeGeneration {
+		t.Fatalf("generation = %d, want unchanged %d", ready.Generation(), beforeGeneration)
+	}
+
+	next, err := ready.Accept(ctx, acceptRequest(t, "accept-conflict-next"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Record.JobID != "job-00000000000000000002" {
+		t.Fatalf("next job id = %s, want job-00000000000000000002 after rolled-back allocation", next.Record.JobID)
+	}
+	if accepted.Record.JobID != "job-00000000000000000001" {
+		t.Fatalf("first job id = %s, want job-00000000000000000001", accepted.Record.JobID)
+	}
 }
 
-func TestFailedAcceptanceLeavesNoJobOrBinding(t *testing.T) {
-	authority := NewInMemoryAuthority()
-	t.Skip("implemented in Commit 2: transactional acceptance rollback")
+func TestRejectedFinalizationLeavesSafetyAndProjectionUnchanged(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	ready := newReady(t, repo, "finalize-rollback")
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "finalize-rollback"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ready.Apply(ctx, accepted.Record.JobID, model.BindSupervisor{
+		Ref:        accepted.Record.Attempt.Ref,
+		Supervisor: supervisorIdentity(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-	_, err := authority.Accept(context.Background(), AcceptanceCommand{
-		WorkspaceKey:                        "ws-rollback",
-		RequestID:                           "req-rollback",
-		TaskIdentity:                        "task-a",
-		InjectValidationFailureAfterBinding: true,
+	beforeRepo := repo.SnapshotBytes()
+	beforeImage, err := ready.LoadJob(ctx, accepted.Record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGeneration := ready.Generation()
+
+	_, err = ready.Apply(ctx, accepted.Record.JobID, model.Finalize{
+		Ref: accepted.Record.Attempt.Ref,
+		Intent: model.TerminalIntent{
+			Outcome: model.OutcomeCanceled,
+			Cause:   model.CauseCanceledBeforeAuthorization,
+		},
 	})
-	if err == nil {
-		t.Fatal("Accept succeeded, want validation failure")
+	if !errors.Is(err, model.ErrCommandPrecondition) {
+		t.Fatalf("rejected finalize error = %v, want ErrCommandPrecondition", err)
 	}
-	snapshot, err := authority.Snapshot(context.Background())
+	assertBytesEqual(t, "repository snapshot", beforeRepo, repo.SnapshotBytes())
+	if ready.Generation() != beforeGeneration {
+		t.Fatalf("generation = %d, want unchanged %d", ready.Generation(), beforeGeneration)
+	}
+
+	afterImage, err := ready.LoadJob(ctx, accepted.Record.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.JobCount != 0 || snapshot.BindingCount != 0 {
-		t.Fatalf("snapshot after failed acceptance = jobs %d bindings %d, want 0/0", snapshot.JobCount, snapshot.BindingCount)
+	if !reflect.DeepEqual(afterImage.Safety, beforeImage.Safety) {
+		t.Fatalf("safety changed after rejected finalization\nbefore: %#v\nafter:  %#v", beforeImage.Safety, afterImage.Safety)
+	}
+	if !reflect.DeepEqual(afterImage.Projection, beforeImage.Projection) {
+		t.Fatalf("projection changed after rejected finalization\nbefore: %#v\nafter:  %#v", beforeImage.Projection, afterImage.Projection)
 	}
 }
 
-func TestFailedTerminalValidationLeavesNoTerminalMutation(t *testing.T) {
-	authority := NewInMemoryAuthority()
-	t.Skip("implemented in Commit 2: terminal validation rollback")
+func TestDuplicateReceiptsAreNoopWithoutRevisionOrGenerationAdvance(t *testing.T) {
+	ctx := context.Background()
+	ready := newReady(t, memory.NewRepository(), "duplicate-receipts")
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "duplicate-receipts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := accepted.Record.Attempt.Ref
+	supervisor := supervisorIdentity()
 
-	accepted, err := authority.Accept(context.Background(), AcceptanceCommand{
-		WorkspaceKey: "ws-terminal-rollback",
-		RequestID:    "req-terminal-rollback",
-		TaskIdentity: "task-a",
+	bind := model.BindSupervisor{Ref: ref, Supervisor: supervisor}
+	bound, err := ready.Apply(ctx, accepted.Record.JobID, bind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicateBind, err := ready.Apply(ctx, accepted.Record.JobID, bind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoopApply(t, "duplicate supervisor binding", bound, duplicateBind)
+
+	retire := model.CertifyRetirement{Ref: ref, Receipt: retirementReceipt(ref, supervisor)}
+	retired, err := ready.Apply(ctx, accepted.Record.JobID, retire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicateRetire, err := ready.Apply(ctx, accepted.Record.JobID, retire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoopApply(t, "duplicate retirement receipt", retired, duplicateRetire)
+}
+
+func TestConflictingDuplicateReceiptsFailWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	ready := newReady(t, repo, "conflicting-receipts")
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "conflicting-receipts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := accepted.Record.Attempt.Ref
+	if _, err := ready.Apply(ctx, accepted.Record.JobID, model.BindSupervisor{
+		Ref:        ref,
+		Supervisor: supervisorIdentity(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := repo.SnapshotBytes()
+	beforeGeneration := ready.Generation()
+
+	conflicting := supervisorIdentity()
+	conflicting.PGID++
+	conflicting.LeaderPID++
+	conflicting.HighResStartToken = "different-supervisor"
+	_, err = ready.Apply(ctx, accepted.Record.JobID, model.BindSupervisor{
+		Ref:        ref,
+		Supervisor: conflicting,
 	})
+	if !errors.Is(err, model.ErrConflictingDuplicate) {
+		t.Fatalf("conflicting duplicate error = %v, want ErrConflictingDuplicate", err)
+	}
+	assertBytesEqual(t, "repository snapshot", before, repo.SnapshotBytes())
+	if ready.Generation() != beforeGeneration {
+		t.Fatalf("generation = %d, want unchanged %d", ready.Generation(), beforeGeneration)
+	}
+}
+
+func TestReplayTombstoneOrderingUsesAuthorityRecords(t *testing.T) {
+	ctx := context.Background()
+	ready := newReady(t, memory.NewRepository(), "replay-tombstone")
+	request := acceptRequest(t, "replay-tombstone")
+	accepted, err := ready.Accept(ctx, request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	before, err := authority.Snapshot(context.Background())
+	replayed, err := ready.Accept(ctx, request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = authority.PublishTerminal(context.Background(), TerminalCommand{
-		JobID:                   accepted.JobID,
-		AttemptID:               accepted.AttemptID,
-		Epoch:                   accepted.Epoch,
-		Outcome:                 "canceled",
-		RequestedProof:          "NeverPermittedAndRetired",
-		InjectValidationFailure: true,
-	})
-	if err == nil {
-		t.Fatal("PublishTerminal succeeded, want validation failure")
+	if !replayed.Replayed || replayed.Record.JobID != accepted.Record.JobID {
+		t.Fatalf("replay = %#v, want original job %s", replayed, accepted.Record.JobID)
 	}
-	after, err := authority.Snapshot(context.Background())
+
+	conflict := request
+	conflict.TaskIdentity = model.NewSHA256TaskIdentity([]byte("different replay task"))
+	if _, err := ready.Accept(ctx, conflict); !errors.Is(err, ErrReplayConflict) {
+		t.Fatalf("live conflicting replay error = %v, want ErrReplayConflict", err)
+	}
+
+	terminalizeReady(t, ctx, ready, accepted.Record.Attempt.Ref, accepted.Record.JobID)
+	tombstone, err := ready.Expire(ctx, request.RequestKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.TerminalMutationCount != before.TerminalMutationCount {
-		t.Fatalf("terminal mutations = %d, want unchanged %d", after.TerminalMutationCount, before.TerminalMutationCount)
+	if tombstone.JobID != accepted.Record.JobID {
+		t.Fatalf("tombstone job = %s, want %s", tombstone.JobID, accepted.Record.JobID)
 	}
-}
-
-func TestMissingIndependentProofCannotMeanNeverPermitted(t *testing.T) {
-	authority := NewInMemoryAuthority()
-	t.Skip("implemented in Commit 2: explicit missing/corrupt proof classification")
-
-	certainty, err := authority.ClassifyPermitCertainty(context.Background(), AttemptRef{
-		JobID:     "job-missing-proof",
-		AttemptID: "attempt-1",
-		Epoch:     1,
-	})
+	lookup, err := ready.LookupReplay(ctx, request.RequestKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if certainty == PermitCertaintyNeverPermitted {
-		t.Fatal("missing proof classified as never permitted")
+	if lookup.State != ReplayExpired || lookup.Tombstone.JobID != accepted.Record.JobID {
+		t.Fatalf("lookup = %#v, want expired original %s", lookup, accepted.Record.JobID)
 	}
-	if certainty != PermitCertaintyUnknownMissing {
-		t.Fatalf("certainty = %s, want %s", certainty, PermitCertaintyUnknownMissing)
+	if _, err := ready.Accept(ctx, request); !errors.Is(err, ErrRequestExpired) {
+		t.Fatalf("expired replay error = %v, want ErrRequestExpired", err)
 	}
 }
 
-func TestCoordinatorConstructibleAgainstAuthorityFake(t *testing.T) {
-	var fake AdmissionAuthority = fakeAuthority{}
-	t.Skip("implemented in Commit 3: coordinator accepts AdmissionAuthority")
-
-	coordinator, err := NewCoordinator(fake, legacyReady{bootID: "boot-1"})
+func TestMissingSafetyIsRecordMissingAndFatalBeforeReady(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := NewAnchorStore()
+	ready := newReadyWithAnchorStore(t, repo, anchorStore, "missing-safety-old")
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "missing-safety"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if coordinator.authority == nil {
-		t.Fatal("coordinator was not wired to the authority")
+	repo.InjectMissingSafetyForTest(accepted.Record.JobID)
+
+	if err := repo.View(ctx, func(tx repository.ReadTx) error {
+		image := tx.LoadJob(accepted.Record.JobID)
+		if image.Safety.State != repository.RecordMissing {
+			t.Fatalf("safety state = %s, want RecordMissing", image.Safety.State)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	restartRepo, restartAnchor := restoreAuthoritySnapshot(t, repo.SnapshotBytes(), anchorStore.SnapshotBytes())
+	_, err = beginRecoveryWithAnchorStore(t, restartRepo, restartAnchor, "missing-safety-new")
+	if !errors.Is(err, repository.ErrInvalidRecord) {
+		t.Fatalf("Begin error = %v, want ErrInvalidRecord before Ready", err)
 	}
 }
 
-type fakeAuthority struct{}
-
-func (fakeAuthority) Accept(context.Context, AcceptanceCommand) (AcceptanceResult, error) {
-	return AcceptanceResult{}, errors.New("not called")
+func assertNoopApply(t *testing.T, label string, first, duplicate ApplyResult) {
+	t.Helper()
+	if duplicate.Changed {
+		t.Fatalf("%s changed record", label)
+	}
+	if duplicate.Record.Revision != first.Record.Revision {
+		t.Fatalf("%s revision = %d, want unchanged %d", label, duplicate.Record.Revision, first.Record.Revision)
+	}
+	if duplicate.Commit.Generation != first.Commit.Generation {
+		t.Fatalf("%s generation = %d, want unchanged %d", label, duplicate.Commit.Generation, first.Commit.Generation)
+	}
+	if !reflect.DeepEqual(duplicate.Record, first.Record) {
+		t.Fatalf("%s record changed\nbefore: %#v\nafter:  %#v", label, first.Record, duplicate.Record)
+	}
+	if !reflect.DeepEqual(duplicate.Projection, first.Projection) {
+		t.Fatalf("%s projection changed\nbefore: %#v\nafter:  %#v", label, first.Projection, duplicate.Projection)
+	}
 }
 
-func (fakeAuthority) PublishTerminal(context.Context, TerminalCommand) (TerminalResult, error) {
-	return TerminalResult{}, errors.New("not called")
-}
-
-func (fakeAuthority) ClassifyPermitCertainty(context.Context, AttemptRef) (PermitCertainty, error) {
-	return "", errors.New("not called")
-}
-
-func (fakeAuthority) Snapshot(context.Context) (Snapshot, error) {
-	return Snapshot{}, errors.New("not called")
+func assertBytesEqual(t *testing.T, label string, before, after []byte) {
+	t.Helper()
+	if !bytes.Equal(before, after) {
+		t.Fatalf("%s changed\nbefore: %s\nafter:  %s", label, before, after)
+	}
 }

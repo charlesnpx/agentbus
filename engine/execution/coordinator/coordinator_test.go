@@ -4,6 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -234,11 +239,161 @@ func TestDoubleFaultDuringRecoveryFailStops(t *testing.T) {
 	}
 }
 
+func TestGrantBeforeCommitFailpointLeavesNoAuthorityCommitOrPermit(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "grant-before-commit")
+	accepted := h.submit(t, ctx, "grant-before-commit")
+	if err := h.coordinator.PrepareSupervisor(ctx, accepted.Record.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	injector := &FailureInjector{Target: FailGrantBeforeCommit}
+	if err := h.coordinator.GrantPermit(ctx, accepted.Record.JobID, 1, model.PermitNonce("nonce-1"), injector); err == nil {
+		t.Fatal("GrantPermit returned nil for grant before-commit failpoint")
+	}
+	if !injector.Hit {
+		t.Fatal("grant before-commit failpoint was not hit")
+	}
+	snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
+	if snapshot.Record.Attempt.Grants.Count() != 0 || snapshot.Record.Terminal != nil {
+		t.Fatalf("record after before-commit failure = %#v, want no grant and nonterminal", snapshot.Record)
+	}
+	if h.supervisor.permits != 0 {
+		t.Fatalf("permit sends = %d, want 0", h.supervisor.permits)
+	}
+}
+
+func TestPostGrantFailpointsRecoverWithTerminalProof(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name        string
+		point       Failpoint
+		wantPermits int
+	}{
+		{name: "after grant commit", point: FailGrantAfterCommit},
+		{name: "before permit send", point: FailPermitSendBefore},
+		{name: "after permit send", point: FailPermitSendAfter, wantPermits: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, "post-grant-"+strings.ReplaceAll(tt.name, " ", "-"))
+			accepted := h.submit(t, ctx, "post-grant-"+strings.ReplaceAll(tt.name, " ", "-"))
+			if err := h.coordinator.PrepareSupervisor(ctx, accepted.Record.JobID, nil); err != nil {
+				t.Fatal(err)
+			}
+			injector := &FailureInjector{Target: tt.point}
+
+			if err := h.coordinator.GrantPermit(ctx, accepted.Record.JobID, 1, model.PermitNonce("nonce-1"), injector); err == nil {
+				t.Fatalf("GrantPermit returned nil for %s", tt.point)
+			}
+			if !injector.Hit {
+				t.Fatalf("failpoint %s was not hit", tt.point)
+			}
+			snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
+			if snapshot.Record.Terminal == nil {
+				t.Fatal("terminal certificate missing after post-grant recovery")
+			}
+			if snapshot.Record.Terminal.Proof != model.ProofContained {
+				t.Fatalf("proof = %s, want %s", snapshot.Record.Terminal.Proof, model.ProofContained)
+			}
+			if snapshot.Record.Terminal.Outcome != model.OutcomeReaped {
+				t.Fatalf("outcome = %s, want %s", snapshot.Record.Terminal.Outcome, model.OutcomeReaped)
+			}
+			if h.supervisor.permits != tt.wantPermits {
+				t.Fatalf("permit sends = %d, want %d", h.supervisor.permits, tt.wantPermits)
+			}
+		})
+	}
+}
+
+func TestRegressionSeedPR28DoubleFaultNeverIssuesSecondGrant(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "pr28-double-fault")
+	accepted := h.submit(t, ctx, "pr28-double-fault")
+	if err := h.coordinator.PrepareSupervisor(ctx, accepted.Record.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.supervisor.failSend = true
+	h.supervisor.failContain = true
+
+	if err := h.coordinator.GrantPermit(ctx, accepted.Record.JobID, 1, model.PermitNonce("nonce-1"), nil); err == nil {
+		t.Fatal("GrantPermit returned nil for PR #28 double fault")
+	}
+	if !h.authority.failStopped {
+		t.Fatal("authority was not fail-stopped after PR #28 double fault")
+	}
+
+	h.supervisor.failSend = false
+	h.supervisor.failContain = false
+	if err := h.coordinator.GrantPermit(ctx, accepted.Record.JobID, 2, model.PermitNonce("nonce-2"), nil); err == nil {
+		t.Fatal("second grant succeeded after PR #28 double fault")
+	}
+	if h.supervisor.permits != 0 {
+		t.Fatalf("permit sends = %d, want no successful sends", h.supervisor.permits)
+	}
+	if err := h.repo.View(ctx, func(tx repository.ReadTx) error {
+		image := tx.LoadJob(accepted.Record.JobID)
+		if image.Safety.State != repository.RecordValid {
+			t.Fatalf("safety state = %s, want valid", image.Safety.State)
+		}
+		if _, ok := image.Safety.Value.Attempt.Grants.Get(model.LaunchOrdinalTwo); ok {
+			t.Fatal("ordinal 2 grant was recorded after PR #28 double fault")
+		}
+		if image.Safety.Value.Terminal != nil && image.Safety.Value.Terminal.Proof != model.ProofContained {
+			t.Fatalf("terminal proof = %s, want contained proof if terminalized", image.Safety.Value.Terminal.Proof)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCoordinatorProductionIsStorageAdapterIndependent(t *testing.T) {
+	for _, source := range coordinatorProductionSources(t) {
+		if strings.Contains(source.text, "engine/execution/repository") ||
+			strings.Contains(source.text, "engine/execution/storage") ||
+			strings.Contains(source.text, "repository.") ||
+			strings.Contains(source.text, "memory.") {
+			t.Fatalf("%s names repository/storage concrete details", source.path)
+		}
+	}
+}
+
+func TestNoListenerFactoryCallExistsBeforeReadyCapability(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	root := filepath.Dir(filepath.Dir(thisFile))
+	disallowed := []string{"NewListener(", "ListenerFactory", "listenerFactory", ".Listen("}
+	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, needle := range disallowed {
+			if strings.Contains(string(data), needle) {
+				t.Fatalf("%s contains listener factory call %q before a Ready-owned integration exists", path, needle)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type harness struct {
 	authority   *readyAuthority
 	coordinator *Coordinator
 	supervisor  *testSupervisor
 	results     *testResults
+	repo        *memory.Repository
 }
 
 func newHarness(t *testing.T, name string) *harness {
@@ -272,6 +427,7 @@ func newHarness(t *testing.T, name string) *harness {
 		coordinator: coordinator,
 		supervisor:  supervisor,
 		results:     results,
+		repo:        repo,
 	}
 }
 
@@ -551,4 +707,35 @@ func (r *testResults) Verify(ctx context.Context, ref model.ResultRef) (model.Re
 
 func evidence(kind string) model.Evidence {
 	return model.Evidence{Kind: kind, Detail: kind + "-evidence"}
+}
+
+type productionSource struct {
+	path string
+	text string
+}
+
+func coordinatorProductionSources(t *testing.T) []productionSource {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	dir := filepath.Dir(thisFile)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sources []productionSource
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sources = append(sources, productionSource{path: path, text: string(data)})
+	}
+	return sources
 }
