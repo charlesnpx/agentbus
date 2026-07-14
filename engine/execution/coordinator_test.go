@@ -1,6 +1,9 @@
 package execution
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestIdentifiedLifecycleCompletes(t *testing.T) {
 	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-life", "owner")
@@ -51,6 +54,9 @@ func TestPostCommitPreRunnableInterruptionFailStops(t *testing.T) {
 	if !c.FailStopping {
 		t.Fatal("coordinator did not enter fail-stop after committed obligation failed to become runnable")
 	}
+	if c.LifecycleState != CoordinatorLifecycleFailStopped {
+		t.Fatalf("lifecycle state = %q, want fail-stopped", c.LifecycleState)
+	}
 
 	job, ok := c.Store.GetJob(res.JobID)
 	if !ok {
@@ -68,9 +74,62 @@ func TestPostCommitPreRunnableInterruptionFailStops(t *testing.T) {
 	}
 	checkCoordinator(t, c)
 
+	failStoppedCalls := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "Submit", run: func() error {
+			_, err := c.Submit(modelRequest("ws-prerunnable", "req-after-stop", "fp-after-stop"), nil)
+			return err
+		}},
+		{name: "SubmitLegacyFenced", run: func() error {
+			_, err := c.SubmitLegacyFenced(modelRequest("ws-prerunnable", "req-legacy-fenced", "fp-legacy-fenced"), nil)
+			return err
+		}},
+		{name: "SubmitLegacyUnfenced", run: func() error {
+			_, err := c.SubmitLegacyUnfenced(modelRequest("ws-prerunnable", "", "fp-legacy-unfenced"), true, nil)
+			return err
+		}},
+		{name: "Acknowledge", run: func() error { return c.Acknowledge(res.JobID) }},
+		{name: "RejectUnacknowledged", run: func() error { return c.RejectUnacknowledged(res.JobID) }},
+		{name: "PrepareSupervisor", run: func() error { return c.PrepareSupervisor(res.JobID, nil) }},
+		{name: "GrantPermit", run: func() error { return c.GrantPermit(res.JobID, 1, "nonce-after-stop", nil) }},
+		{name: "Start", run: func() error { return c.Start(res.JobID, nil) }},
+		{name: "Complete", run: func() error { return c.Complete(res.JobID, OutcomeFailed) }},
+		{name: "Cancel", run: func() error { return c.Cancel(res.JobID) }},
+		{name: "LiveSupervisorLoss", run: func() error { return c.LiveSupervisorLoss(res.JobID) }},
+		{name: "StartupReconcile", run: func() error { return c.StartupReconcile() }},
+		{name: "Expire", run: func() error {
+			_, err := c.Expire("ws-prerunnable", "req-prerunnable", nil)
+			return err
+		}},
+		{name: "MarkCorrupt", run: func() error { return c.MarkCorrupt(res.JobID, false, true, "after fail-stop", nil) }},
+	}
+	for _, call := range failStoppedCalls {
+		if err := call.run(); err == nil || !strings.Contains(err.Error(), "fail-stopped") {
+			t.Fatalf("%s err = %v, want fail-stopped rejection", call.name, err)
+		}
+	}
+
 	c.FailStopping = false
 	if err := c.Check(); err == nil {
 		t.Fatal("CheckInvariants accepted nonterminal job without runnable obligation or fail-stop")
+	}
+
+	newBoot := NewCoordinator(c.Store, "boot-prerunnable-new", "owner")
+	if err := newBoot.StartupReconcile(); err != nil {
+		t.Fatal(err)
+	}
+	checkCoordinator(t, newBoot)
+	job, ok = c.Store.GetJob(res.JobID)
+	if !ok {
+		t.Fatal("accepted job missing after startup reconciliation")
+	}
+	if job.Outcome != OutcomeFailed || job.TerminalProof != ProofNeverPermittedAndRetired || job.TerminalReason != "daemon_restarted_before_launch" {
+		t.Fatalf("job = %+v, want startup-reconciled failed never-permitted terminal", job)
+	}
+	if _, err := newBoot.Submit(modelRequest("ws-prerunnable-new", "req-prerunnable-new", "fp-prerunnable-new"), nil); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -222,7 +222,15 @@ func seedAcceptanceWithoutAfter(t *testing.T) {
 		t.Fatal("expected injected failure")
 	}
 	checkCoordinator(t, c)
-	replay, err := c.Submit(req, nil)
+	if _, err := c.Submit(req, nil); err == nil {
+		t.Fatal("same coordinator accepted replay after fail-stop")
+	}
+	newBoot := NewCoordinator(c.Store, "boot-seed-new", "owner")
+	if err := newBoot.StartupReconcile(); err != nil {
+		t.Fatal(err)
+	}
+	checkCoordinator(t, newBoot)
+	replay, err := newBoot.Submit(req, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

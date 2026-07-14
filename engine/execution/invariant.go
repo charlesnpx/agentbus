@@ -3,11 +3,12 @@ package execution
 import "fmt"
 
 type InvariantView struct {
-	Store            *MemoryAdmissionStore
-	Obligations      map[string]CoordinatorObligation
-	FailStopping     bool
-	CurrentBootID    string
-	AllowPreRunnable bool
+	Store                           *MemoryAdmissionStore
+	Obligations                     map[string]CoordinatorObligation
+	FailStopping                    bool
+	CurrentBootID                   string
+	AllowPreRunnable                bool
+	AllowCurrentBootOrphanReconcile bool
 }
 
 func CheckInvariants(view InvariantView) error {
@@ -58,9 +59,15 @@ func CheckInvariants(view InvariantView) error {
 		if job.Decision == DecisionAwaitingAck && (job.PermitState == PermitGranted || job.PermitMaybeSent || job.Dispatch == DispatchPermitGranted || job.Dispatch == DispatchActive) {
 			return fmt.Errorf("job %s awaiting acknowledgement has permit state", job.JobID)
 		}
+		if job.Decision == DecisionAwaitingAck && (!job.Supervisor.Valid() || job.Dispatch == DispatchNone) {
+			return fmt.Errorf("job %s awaiting acknowledgement without prepared supervisor", job.JobID)
+		}
 		if view.CurrentBootID != "" && job.BootID == view.CurrentBootID && !job.Terminal() && job.Mode != ModeLegacyUnfenced && !view.FailStopping {
 			obligation, ok := view.Obligations[job.JobID]
 			if !ok || !obligation.committed() {
+				if view.AllowCurrentBootOrphanReconcile {
+					continue
+				}
 				return fmt.Errorf("current-boot nonterminal job %s has no committed obligation", job.JobID)
 			}
 			if !validObligationState(obligation.state()) {
