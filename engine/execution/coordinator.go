@@ -174,7 +174,7 @@ func (c *Coordinator) SubmitLegacyFenced(req SubmitRequest, injector *FailureInj
 	}
 	req.LaunchSpec = spec
 	c.obligations[req.JobID] = CoordinatorObligation{JobID: req.JobID, LaunchSpec: spec, Mode: req.Mode, State: ObligationPending}
-	if err := c.inject(injector, FailRetirementCloseBefore); err != nil {
+	if err := c.inject(injector, FailLegacySupervisorPrepareBefore); err != nil {
 		delete(c.obligations, req.JobID)
 		return ResolveResult{}, err
 	}
@@ -183,7 +183,7 @@ func (c *Coordinator) SubmitLegacyFenced(req SubmitRequest, injector *FailureInj
 	obligation := c.obligations[req.JobID]
 	obligation.PreparedSupervisor = &group
 	c.obligations[req.JobID] = obligation
-	if err := c.inject(injector, FailRetirementCloseAfter); err != nil {
+	if err := c.inject(injector, FailLegacySupervisorPrepareAfter); err != nil {
 		if retireErr := c.retirePendingPrepared(req.JobID, injector); retireErr != nil {
 			c.beginFailStop()
 			return ResolveResult{}, c.checkBoundary(retireErr)
@@ -205,12 +205,12 @@ func (c *Coordinator) SubmitLegacyUnfenced(req SubmitRequest, responseDelivered 
 		WorkspaceKey: req.WorkspaceKey,
 	}
 	c.nextLegacyRunID++
-	if err := c.inject(injector, FailPermitSendBeforeSideEffect); err != nil {
+	if err := c.inject(injector, FailLegacyUnfencedStartBefore); err != nil {
 		return run, err
 	}
 	c.Store.noteModeledSideEffect()
 	run.Started = true
-	if err := c.inject(injector, FailPermitSendAfterSideEffect); err != nil {
+	if err := c.inject(injector, FailLegacyUnfencedStartAfter); err != nil {
 		run.Retired = true
 		return run, protocolError(CodeLegacyUnfenced, "", "legacy unfenced Start failed before job acceptance")
 	}
@@ -277,12 +277,12 @@ func (c *Coordinator) PrepareSupervisor(jobID string, injector *FailureInjector)
 	if err := c.inject(injector, FailSupervisorRecordBeforeCAS); err != nil {
 		return err
 	}
-	if err := c.inject(injector, FailRetirementCloseBefore); err != nil {
+	if err := c.inject(injector, FailSupervisorPrepareBefore); err != nil {
 		return err
 	}
 	c.Store.noteModeledSideEffect()
 	group := c.nextGroupRef()
-	if err := c.inject(injector, FailRetirementCloseAfter); err != nil {
+	if err := c.inject(injector, FailSupervisorPrepareAfter); err != nil {
 		c.beginFailStop()
 		return c.checkBoundary(err)
 	}
@@ -341,6 +341,7 @@ func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
 	}); err != nil {
 		return err
 	}
+	c.setStartPhase(jobID, "forked")
 	if err := c.inject(injector, FailExecDeathAfterForkBeforeExec); err != nil {
 		if recErr := c.LiveSupervisorLossWithInjector(jobID, nil); recErr != nil {
 			c.beginFailStop()
@@ -354,6 +355,7 @@ func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
 	}); err != nil {
 		return err
 	}
+	c.setStartPhase(jobID, "execed")
 	if err := c.inject(injector, FailExecDeathAfterExecBeforeStart); err != nil {
 		if recErr := c.LiveSupervisorLossWithInjector(jobID, nil); recErr != nil {
 			c.beginFailStop()
@@ -362,13 +364,14 @@ func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
 		return c.checkBoundary(err)
 	}
 	c.Store.noteModeledSideEffect()
-	child := ChildRef{PID: c.nextPID(), HighResStartToken: fmt.Sprintf("child-token-%s", jobID)}
+	child := ChildRef{PID: job.Supervisor.LeaderPID, HighResStartToken: job.Supervisor.HighResStartToken}
 	if err := c.casStep(injector, FailBackendStartedBeforeCAS, FailBackendStartedAfterCAS, func() error {
 		_, err := c.Store.RecordBackendStarted(jobID, job.AttemptID, job.Epoch, child)
 		return err
 	}); err != nil {
 		return err
 	}
+	c.setStartPhase(jobID, "backend_started")
 	if err := c.inject(injector, FailExecDeathAfterStartBeforeCAS); err != nil {
 		if recErr := c.LiveSupervisorLossWithInjector(jobID, nil); recErr != nil {
 			c.beginFailStop()
@@ -376,10 +379,14 @@ func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
 		}
 		return c.checkBoundary(err)
 	}
-	return c.casStep(injector, FailRecordStartedBeforeCAS, FailRecordStartedAfterCAS, func() error {
+	err := c.casStep(injector, FailRecordStartedBeforeCAS, FailRecordStartedAfterCAS, func() error {
 		_, err := c.Store.RecordStarted(jobID, job.AttemptID, job.Epoch, job.LaunchOrdinal, child)
 		return err
 	})
+	if err == nil {
+		c.setStartPhase(jobID, "record_started")
+	}
+	return err
 }
 
 func (c *Coordinator) Complete(jobID string, outcome Outcome) error {
@@ -882,6 +889,17 @@ func (c *Coordinator) setObligationState(jobID string, state ObligationState) {
 	obligation.State = state
 	obligation.Committed = state == ObligationCommitted || state == ObligationRunnable
 	c.obligations[jobID] = obligation
+}
+
+func (c *Coordinator) setStartPhase(jobID, phase string) {
+	if c.Store == nil {
+		return
+	}
+	job, ok := c.Store.jobs[jobID]
+	if !ok || job == nil {
+		return
+	}
+	job.StartPhase = phase
 }
 
 func (c *Coordinator) casStep(injector *FailureInjector, before, after Failpoint, op func() error) error {

@@ -197,6 +197,39 @@ func TestCorrectiveLaunchOrdinalRequiresQuiescence(t *testing.T) {
 	}
 }
 
+func TestParkedExecBackendIdentityMatchesSupervisorLeader(t *testing.T) {
+	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-parked-exec", "owner")
+	res := submitPreparedPermitted(t, c, "ws-parked-exec", "req-parked-exec", "fp-parked-exec")
+	job, ok := c.Store.GetJob(res.JobID)
+	if !ok {
+		t.Fatal("job missing")
+	}
+	supervisor := job.Supervisor
+	if !supervisor.Valid() {
+		t.Fatal("prepared supervisor missing")
+	}
+
+	if err := c.Start(res.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	checkCoordinator(t, c)
+	job, ok = c.Store.GetJob(res.JobID)
+	if !ok {
+		t.Fatal("job missing after start")
+	}
+	want := ChildRef{PID: supervisor.LeaderPID, HighResStartToken: supervisor.HighResStartToken}
+	if job.Child != want {
+		t.Fatalf("backend identity child=%+v, want supervisor leader %+v", job.Child, want)
+	}
+
+	broken := c.Store.jobs[res.JobID]
+	broken.Child.PID++
+	c.Store.jobs[res.JobID] = broken
+	if err := c.Check(); err == nil {
+		t.Fatal("CheckInvariants accepted backend child PID mismatch")
+	}
+}
+
 func TestInvariantRejectsRegrantOrdinalOne(t *testing.T) {
 	c := NewCoordinator(NewMemoryAdmissionStore(), "boot-regrant-1", "owner")
 	res := submitPreparedPermitted(t, c, "ws-regrant-1", "req-regrant-1", "fp-regrant-1")

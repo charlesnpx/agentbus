@@ -86,6 +86,9 @@ func CheckInvariants(view InvariantView) error {
 		if (job.PermitState == PermitGranted || job.PermitState == PermitMaybeSent || job.PermitState == PermitConsumed || job.PermitMaybeSent || job.Dispatch == DispatchPermitGranted || job.Dispatch == DispatchActive) && !job.Supervisor.Valid() {
 			return fmt.Errorf("job %s has permit without durable supervisor identity", job.JobID)
 		}
+		if err := validateParkedExecIdentity(job); err != nil {
+			return err
+		}
 		if job.PermitMaybeSent && job.ContainmentRequired && job.Terminal() && job.TerminalProof != ProofContained {
 			return fmt.Errorf("job %s terminalized execution-uncertain state without containment", job.JobID)
 		}
@@ -167,6 +170,35 @@ func CheckInvariants(view InvariantView) error {
 		}
 	}
 	return nil
+}
+
+func validateParkedExecIdentity(job *Aggregate) error {
+	if job.Supervisor.Valid() {
+		for _, child := range job.Supervisor.KnownChildRefs {
+			if !child.Valid() {
+				return fmt.Errorf("job %s supervisor has invalid known child identity", job.JobID)
+			}
+			if sameChildAsSupervisorLeader(child, job.Supervisor) {
+				return fmt.Errorf("job %s tracks parked exec leader as a separate child", job.JobID)
+			}
+		}
+	}
+	for _, child := range []ChildRef{job.PendingChild, job.Child} {
+		if !child.Valid() {
+			continue
+		}
+		if !job.Supervisor.Valid() {
+			return fmt.Errorf("job %s backend child has no durable supervisor identity", job.JobID)
+		}
+		if !sameChildAsSupervisorLeader(child, job.Supervisor) {
+			return fmt.Errorf("job %s backend child identity diverges from parked exec supervisor leader", job.JobID)
+		}
+	}
+	return nil
+}
+
+func sameChildAsSupervisorLeader(child ChildRef, supervisor GroupRef) bool {
+	return child.PID == supervisor.LeaderPID && child.HighResStartToken == supervisor.HighResStartToken
 }
 
 func validObligationState(state ObligationState) bool {
