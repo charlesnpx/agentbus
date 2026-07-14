@@ -81,6 +81,12 @@ type MemoryAdmissionStore struct {
 	fatal             bool
 	mutating          bool
 	sideEffectInCAS   bool
+
+	startupAnchorObserved             bool
+	startupAnchorInput                AnchorInput
+	startupAnchorDecision             StartupDecision
+	startupAnchorDispositionPersisted bool
+	startupAnchorCompleted            bool
 }
 
 func NewMemoryAdmissionStore() *MemoryAdmissionStore {
@@ -103,6 +109,9 @@ func (s *MemoryAdmissionStore) AllocateJobID() string {
 func (s *MemoryAdmissionStore) ResolveExisting(req SubmitRequest) (ResolveResult, bool, error) {
 	if req.Mode == "" {
 		req.Mode = ModeIdentifiedFenced
+	}
+	if !validMode(req.Mode) {
+		return ResolveResult{}, false, protocolError(CodeRejected, "", "unknown execution mode")
 	}
 	if err := validateWorkspaceRequest(req.WorkspaceKey, req.RequestID, req.Mode == ModeIdentifiedFenced); err != nil {
 		return ResolveResult{}, false, err
@@ -128,6 +137,9 @@ func (s *MemoryAdmissionStore) ResolveOrAccept(req SubmitRequest) (ResolveResult
 	}
 	if req.Mode == "" {
 		req.Mode = ModeIdentifiedFenced
+	}
+	if !validMode(req.Mode) {
+		return ResolveResult{}, protocolError(CodeRejected, "", "unknown execution mode")
 	}
 
 	if err := validateWorkspaceRequest(req.WorkspaceKey, req.RequestID, req.Mode == ModeIdentifiedFenced); err != nil {
@@ -350,8 +362,20 @@ func (s *MemoryAdmissionStore) RecordSupervisor(jobID, attemptID string, epoch i
 		if !groupRef.Valid() {
 			return protocolError(CodePreconditionFailed, job.JobID, "invalid group identity")
 		}
-		if job.Decision == DecisionAwaitingAck {
-			return protocolError(CodePreconditionFailed, job.JobID, "awaiting acknowledgement")
+		if job.Supervisor.Valid() {
+			if sameGroupRef(job.Supervisor, groupRef) {
+				return nil
+			}
+			return protocolError(CodePreconditionFailed, job.JobID, "supervisor identity is already durable")
+		}
+		if job.Decision != DecisionAccepted {
+			return protocolError(CodePreconditionFailed, job.JobID, "supervisor can only be recorded for an accepted job")
+		}
+		if job.Dispatch != DispatchScheduled {
+			return protocolError(CodePreconditionFailed, job.JobID, "supervisor can only be recorded from scheduled dispatch")
+		}
+		if job.PermitState != PermitNone || job.PermitMaybeSent || hasLiveAuthority(job) {
+			return protocolError(CodePreconditionFailed, job.JobID, "supervisor can only be recorded before permit authority exists")
 		}
 		job.Supervisor = groupRef
 		job.Dispatch = DispatchSupervisorPrepared
@@ -467,6 +491,9 @@ func (s *MemoryAdmissionStore) RequestCancel(jobID string) (Aggregate, error) {
 	if !ok {
 		return Aggregate{}, protocolError(CodeUnknownJob, jobID, "unknown job")
 	}
+	if err := validateAggregateEnums(job); err != nil {
+		return Aggregate{}, err
+	}
 	if job.Terminal() {
 		return job.copy(), nil
 	}
@@ -485,6 +512,9 @@ func (s *MemoryAdmissionStore) RequestCancel(jobID string) (Aggregate, error) {
 		job.ContainmentRequired = true
 	}
 	if err := s.checkDirectBoundary(nil); err != nil {
+		return Aggregate{}, err
+	}
+	if err := validateAggregateEnums(job); err != nil {
 		return Aggregate{}, err
 	}
 	return job.copy(), nil
@@ -669,6 +699,9 @@ func (s *MemoryAdmissionStore) RecordOutcome(jobID, attemptID string, epoch int6
 		if !terminalOutcome(outcome) {
 			return protocolError(CodePreconditionFailed, job.JobID, "terminal outcome required")
 		}
+		if completionOutcome(outcome) && (job.PermitState != PermitConsumed || job.LaunchOrdinal == 0 || !job.Child.Valid()) {
+			return protocolError(CodePreconditionFailed, job.JobID, "completed outcome requires a consumed launch with durable child identity")
+		}
 		if job.Outcome != OutcomeNone && job.Outcome != outcome {
 			return protocolError(CodePreconditionFailed, job.JobID, "outcome already recorded")
 		}
@@ -685,6 +718,9 @@ func (s *MemoryAdmissionStore) BeginResultPublication(jobID, path, digest string
 	if job.Terminal() {
 		return Aggregate{}, protocolError(CodePreconditionFailed, jobID, "terminal job")
 	}
+	if err := validateAggregateEnums(job); err != nil {
+		return Aggregate{}, err
+	}
 	if job.Outcome != OutcomeCompleted && job.Outcome != OutcomeCompletedNoncompliant {
 		return Aggregate{}, protocolError(CodePreconditionFailed, jobID, "completed outcome required")
 	}
@@ -698,6 +734,9 @@ func (s *MemoryAdmissionStore) BeginResultPublication(jobID, path, digest string
 	job.Dispatch = DispatchResultPublishing
 	job.Result = ResultRef{Path: path, Digest: digest, Bytes: bytes}
 	if err := s.checkDirectBoundary(nil); err != nil {
+		return Aggregate{}, err
+	}
+	if err := validateAggregateEnums(job); err != nil {
 		return Aggregate{}, err
 	}
 	return job.copy(), nil
@@ -795,6 +834,12 @@ func (s *MemoryAdmissionStore) PublishTerminal(jobID, attemptID string, epoch in
 		if proof == ProofCleanQuiescentOutcomeAndRetired && (!job.Retired || job.Contained || job.ActiveOrdinal != 0 || liveOrdinalCount(job.LiveOrdinals) != 0 || job.Child.Valid()) {
 			return protocolError(CodePreconditionFailed, job.JobID, "clean quiescent retired proof is not established")
 		}
+		if proof == ProofCleanQuiescentOutcomeAndRetired {
+			evidence := job.LaunchEvidence[job.LaunchOrdinal]
+			if job.LaunchOrdinal == 0 || !job.LaunchQuiescent[job.LaunchOrdinal] || !evidence.ChildExited.Present() || !evidence.GroupEmpty.Present() {
+				return protocolError(CodePreconditionFailed, job.JobID, "clean quiescent launch evidence is not established")
+			}
+		}
 		if proof == ProofContained && (!job.Retired || !job.Contained) {
 			return protocolError(CodePreconditionFailed, job.JobID, "contained proof is not established")
 		}
@@ -824,6 +869,9 @@ func (s *MemoryAdmissionStore) Expire(workspaceKey, requestID string) (string, e
 	}
 	if !job.Terminal() {
 		return "", protocolError(CodePreconditionFailed, binding.JobID, "expire requires terminal job")
+	}
+	if err := validateAggregateEnums(job); err != nil {
+		return "", err
 	}
 	if !job.Retired {
 		return "", protocolError(CodePreconditionFailed, binding.JobID, "expire requires retired supervisor")
@@ -859,6 +907,9 @@ func (s *MemoryAdmissionStore) MarkCorrupt(jobID string, permitMaybe bool, ident
 	if job.Terminal() {
 		return Aggregate{}, protocolError(CodePreconditionFailed, jobID, "terminal job")
 	}
+	if err := validateAggregateEnums(job); err != nil {
+		return Aggregate{}, err
+	}
 	if !identityTrustworthy {
 		s.fatal = true
 		return Aggregate{}, protocolError(CodeCorruptFatal, jobID, "containment identity is untrustworthy")
@@ -885,6 +936,9 @@ func (s *MemoryAdmissionStore) MarkCorrupt(jobID string, permitMaybe bool, ident
 	if err := s.checkDirectBoundary(nil); err != nil {
 		return Aggregate{}, err
 	}
+	if err := validateAggregateEnums(job); err != nil {
+		return Aggregate{}, err
+	}
 	return job.copy(), nil
 }
 
@@ -899,6 +953,9 @@ func (s *MemoryAdmissionStore) mutate(jobID, attemptID string, epoch int64, fn f
 	if job.AttemptID != attemptID || job.Epoch != epoch {
 		return Aggregate{}, protocolError(CodePreconditionFailed, jobID, "attempt precondition failed")
 	}
+	if err := validateAggregateEnums(job); err != nil {
+		return Aggregate{}, err
+	}
 	job.ensureMaps()
 	s.mutating = true
 	defer func() { s.mutating = false }()
@@ -910,7 +967,48 @@ func (s *MemoryAdmissionStore) mutate(jobID, attemptID string, epoch int64, fn f
 	if err := s.checkDirectBoundary(nil); err != nil {
 		return Aggregate{}, err
 	}
+	if err := validateAggregateEnums(job); err != nil {
+		return Aggregate{}, err
+	}
 	return job.copy(), nil
+}
+
+func (s *MemoryAdmissionStore) syntheticStartupAnchorInput() AnchorInput {
+	dbPresent := s.step != 0 || len(s.jobs) != 0 || len(s.bindings) != 0 || len(s.tombstones) != 0
+	if !dbPresent {
+		return AnchorInput{}
+	}
+	return AnchorInput{
+		DBPresent:           true,
+		AnchorPresent:       true,
+		DBValid:             true,
+		AnchorValid:         true,
+		DBUUID:              "memory",
+		AnchorDBUUID:        "memory",
+		DBSchemaMajor:       1,
+		AnchorSchemaMajor:   1,
+		EverInitialized:     true,
+		DBGeneration:        s.step,
+		HighWaterGeneration: s.step,
+	}
+}
+
+func (s *MemoryAdmissionStore) completeStartupAnchorDisposition() error {
+	if !s.startupAnchorDispositionPersisted {
+		return protocolError(CodePreconditionFailed, "", "startup anchor disposition was not persisted")
+	}
+	decision := s.startupAnchorDecision
+	switch decision.Action {
+	case StartupInitializeFirst, StartupRecoverAnchor, StartupContinue, StartupAdvanceAnchor:
+		s.startupAnchorCompleted = true
+		return nil
+	case StartupFatal:
+		s.fatal = true
+		return protocolError(CodeCorruptFatal, "", "startup anchor fatal: "+decision.Reason)
+	default:
+		s.fatal = true
+		return protocolError(CodeCorruptFatal, "", "startup anchor decision is invalid")
+	}
 }
 
 func (s *MemoryAdmissionStore) noteModeledSideEffect() {

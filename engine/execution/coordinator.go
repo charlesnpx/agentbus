@@ -81,6 +81,9 @@ func (c *Coordinator) Submit(req SubmitRequest, injector *FailureInjector) (Reso
 	if req.Mode == "" {
 		req.Mode = ModeIdentifiedFenced
 	}
+	if !validMode(req.Mode) {
+		return ResolveResult{}, c.checkBoundary(protocolError(CodeRejected, "", "unknown execution mode"))
+	}
 	if req.Mode == ModeLegacyUnfenced {
 		return ResolveResult{}, protocolError(CodeLegacyUnfenced, "", "legacy unfenced path uses SubmitLegacyUnfenced")
 	}
@@ -291,15 +294,22 @@ func (c *Coordinator) PrepareSupervisor(jobID string, injector *FailureInjector)
 	}
 	c.Store.noteModeledSideEffect()
 	group := c.nextGroupRef()
-	if err := c.inject(injector, FailSupervisorPrepareAfter); err != nil {
-		c.beginFailStop()
-		return c.checkBoundary(err)
-	}
-	err := c.casStep(injector, FailSupervisorRecordBeforeCAS, FailSupervisorRecordAfterCAS, func() error {
-		_, err := c.Store.RecordSupervisor(jobID, job.AttemptID, job.Epoch, group)
+	if err := c.recordPreparedSupervisorObligation(job, group); err != nil {
 		return err
-	})
-	return err
+	}
+	if err := c.inject(injector, FailSupervisorPrepareAfter); err != nil {
+		return c.recoverPostPreparationOrPermit(jobID, err)
+	}
+	if err := c.inject(injector, FailSupervisorRecordBeforeCAS); err != nil {
+		return c.recoverPostPreparationOrPermit(jobID, err)
+	}
+	if _, err := c.Store.RecordSupervisor(jobID, job.AttemptID, job.Epoch, group); err != nil {
+		return c.recoverPostPreparationOrPermit(jobID, err)
+	}
+	if err := c.inject(injector, FailSupervisorRecordAfterCAS); err != nil {
+		return c.recoverPostPreparationOrPermit(jobID, err)
+	}
+	return c.checkBoundary(nil)
 }
 
 func (c *Coordinator) GrantPermit(jobID string, launchOrdinal int, nonce string, injector *FailureInjector) error {
@@ -310,23 +320,32 @@ func (c *Coordinator) GrantPermit(jobID string, launchOrdinal int, nonce string,
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
 	}
-	if err := c.casStep(injector, FailGrantPermitBeforeCAS, FailGrantPermitAfterCAS, func() error {
-		_, err := c.Store.GrantPermit(jobID, job.AttemptID, job.Epoch, launchOrdinal, nonce)
-		return err
-	}); err != nil {
+	if err := c.inject(injector, FailGrantPermitBeforeCAS); err != nil {
 		return err
 	}
-	if err := c.inject(injector, FailPermitSendBeforeSideEffect); err != nil {
+	if _, err := c.Store.GrantPermit(jobID, job.AttemptID, job.Epoch, launchOrdinal, nonce); err != nil {
 		return err
+	}
+	if err := c.inject(injector, FailGrantPermitAfterCAS); err != nil {
+		return c.recoverPostPreparationOrPermit(jobID, err)
+	}
+	if err := c.inject(injector, FailPermitSendBeforeSideEffect); err != nil {
+		return c.recoverPostPreparationOrPermit(jobID, err)
 	}
 	c.Store.noteModeledSideEffect()
 	if err := c.inject(injector, FailPermitSendAfterSideEffect); err != nil {
-		return err
+		return c.recoverPostPreparationOrPermit(jobID, err)
 	}
-	return c.casStep(injector, FailPermitMaybeSentBeforeCAS, FailPermitMaybeSentAfterCAS, func() error {
-		_, err := c.Store.RecordPermitMaybeSent(jobID, job.AttemptID, job.Epoch, launchOrdinal)
-		return err
-	})
+	if err := c.inject(injector, FailPermitMaybeSentBeforeCAS); err != nil {
+		return c.recoverPostPreparationOrPermit(jobID, err)
+	}
+	if _, err := c.Store.RecordPermitMaybeSent(jobID, job.AttemptID, job.Epoch, launchOrdinal); err != nil {
+		return c.recoverPostPreparationOrPermit(jobID, err)
+	}
+	if err := c.inject(injector, FailPermitMaybeSentAfterCAS); err != nil {
+		return c.recoverPostPreparationOrPermit(jobID, err)
+	}
+	return c.checkBoundary(nil)
 }
 
 func (c *Coordinator) Start(jobID string, injector *FailureInjector) error {
@@ -400,6 +419,12 @@ func (c *Coordinator) CompleteWithInjector(jobID string, outcome Outcome, inject
 	job, ok := c.Store.GetJob(jobID)
 	if !ok {
 		return protocolError(CodeUnknownJob, jobID, "unknown job")
+	}
+	if !terminalOutcome(outcome) {
+		return protocolError(CodePreconditionFailed, jobID, "terminal outcome required")
+	}
+	if job.PermitState != PermitConsumed || job.LaunchOrdinal == 0 || !job.Child.Valid() {
+		return protocolError(CodePreconditionFailed, jobID, "completion requires a consumed launch")
 	}
 	if err := c.casStep(injector, FailOutcomeBeforeCAS, FailOutcomeAfterCAS, func() error {
 		_, err := c.Store.RecordOutcome(jobID, job.AttemptID, job.Epoch, outcome)
@@ -535,6 +560,9 @@ func (c *Coordinator) StartupReconcileWithInjector(injector *FailureInjector) (e
 			c.LifecycleState = CoordinatorLifecycleNotReady
 		}
 	}()
+	if err := c.applyStartupAnchorBarrier(); err != nil {
+		return err
+	}
 	if err := c.validateStartupAnchors(); err != nil {
 		return err
 	}
@@ -707,6 +735,10 @@ func (c *Coordinator) validateStartupAnchors() error {
 	if c.Store == nil {
 		return protocolError(CodePreconditionFailed, "", "missing admission store")
 	}
+	if c.Store.fatal {
+		c.beginFailStop()
+		return protocolError(CodeCorruptFatal, "", "startup anchor fatal")
+	}
 	for key, binding := range c.Store.bindings {
 		if bindingKey(binding.WorkspaceKey, binding.RequestID) != key {
 			return fmt.Errorf("binding %q does not match workspace/request anchor", key)
@@ -744,6 +776,28 @@ func (c *Coordinator) validateStartupAnchors() error {
 		if accepted := c.Store.acceptedKeys[key]; accepted != "" && accepted != tombstone.JobID {
 			return fmt.Errorf("request key %q tombstone changed job from %s to %s", key, accepted, tombstone.JobID)
 		}
+	}
+	return nil
+}
+
+func (c *Coordinator) applyStartupAnchorBarrier() error {
+	if c.Store == nil {
+		return protocolError(CodePreconditionFailed, "", "missing admission store")
+	}
+	if !c.Store.startupAnchorObserved {
+		c.Store.ObserveStartupAnchor(c.Store.syntheticStartupAnchorInput())
+	}
+	if !c.Store.startupAnchorDispositionPersisted {
+		c.beginFailStop()
+		return protocolError(CodeCorruptFatal, "", "startup anchor disposition was not persisted")
+	}
+	if err := c.Store.completeStartupAnchorDisposition(); err != nil {
+		c.beginFailStop()
+		return err
+	}
+	if !c.Store.startupAnchorCompleted {
+		c.beginFailStop()
+		return protocolError(CodeCorruptFatal, "", "startup anchor disposition did not complete")
 	}
 	return nil
 }
@@ -885,10 +939,7 @@ func (c *Coordinator) reconcilePostPermitError(jobID string, postPermit bool, er
 	if !postPermit {
 		return err
 	}
-	if recErr := c.LiveSupervisorLossWithInjector(jobID, nil); recErr != nil {
-		return c.failStopAfterReconciliationError(jobID, fmt.Errorf("%w; post-permit reconciliation: %v", err, recErr))
-	}
-	return c.checkBoundary(err)
+	return c.recoverPostPreparationOrPermit(jobID, err)
 }
 
 func (c *Coordinator) failStopAfterReconciliationError(jobID string, err error) error {
@@ -900,6 +951,79 @@ func (c *Coordinator) failStopAfterReconciliationError(jobID string, err error) 
 		c.beginFailStop()
 	}
 	return c.checkBoundary(err)
+}
+
+func (c *Coordinator) recoverPostPreparationOrPermit(jobID string, cause error) error {
+	if cause == nil {
+		return c.checkBoundary(nil)
+	}
+	if err := c.runPostPreparationOrPermitRecovery(jobID); err != nil {
+		return c.failStopAfterReconciliationError(jobID, fmt.Errorf("%w; post-authority recovery: %v", cause, err))
+	}
+	if !c.postPreparationOrPermitRecovered(jobID) {
+		c.beginFailStop()
+		return c.checkBoundary(fmt.Errorf("%w; post-authority recovery proof missing", cause))
+	}
+	return c.checkBoundary(cause)
+}
+
+func (c *Coordinator) runPostPreparationOrPermitRecovery(jobID string) error {
+	job, ok := c.Store.GetJob(jobID)
+	if ok && job.Terminal() {
+		return nil
+	}
+	if ok && (job.Supervisor.Valid() || executionUncertain(&job) || job.ContainmentRequired) {
+		return c.terminalizeContainedRecovery(job, "post_authority_recovery")
+	}
+	return c.retirePendingPrepared(jobID, nil)
+}
+
+func (c *Coordinator) terminalizeContainedRecovery(job Aggregate, detail string) error {
+	if done, err := c.publishContainedStartupTerminal(job, detail+"_contained", nil); done || err != nil {
+		return err
+	}
+	if err := c.casStep(nil, FailReconciliationBeforeCAS, FailReconciliationAfterCAS, func() error {
+		_, err := c.Store.BeginReconciliation(job.JobID, job.AttemptID, job.Epoch)
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := c.contain(job.JobID, nil, detail); err != nil {
+		return err
+	}
+	refreshed, ok := c.Store.GetJob(job.JobID)
+	if !ok {
+		return protocolError(CodeUnknownJob, job.JobID, "unknown job")
+	}
+	outcome := OutcomeReaped
+	reason := detail + "_contained"
+	if refreshed.Decision == DecisionCancelRequested {
+		outcome = OutcomeCanceled
+		reason = "canceled_after_permit"
+	}
+	if err := c.casStep(nil, FailOutcomeBeforeCAS, FailOutcomeAfterCAS, func() error {
+		_, err := c.Store.RecordOutcome(job.JobID, refreshed.AttemptID, refreshed.Epoch, outcome)
+		return err
+	}); err != nil {
+		return err
+	}
+	return c.publishTerminal(job.JobID, refreshed.AttemptID, refreshed.Epoch, outcome, ProofContained, reason, nil)
+}
+
+func (c *Coordinator) postPreparationOrPermitRecovered(jobID string) bool {
+	if job, ok := c.Store.GetJob(jobID); ok {
+		if job.Terminal() {
+			return validTerminalProof(&job) && validTerminalOutcomeProofReason(&job)
+		}
+		if job.Supervisor.Valid() || executionUncertain(&job) || job.ContainmentRequired {
+			return false
+		}
+	}
+	obligation, ok := c.obligations[jobID]
+	if !ok || obligation.PreparedSupervisor == nil {
+		return true
+	}
+	return obligation.Retired && obligation.PreparedRetirement.Verified()
 }
 
 func (c *Coordinator) storeIsPristine() bool {
@@ -1048,6 +1172,18 @@ func (c *Coordinator) retirePendingPrepared(jobID string, injector *FailureInjec
 	obligation.Retired = true
 	c.obligations[jobID] = obligation
 	c.preparedRetirements[jobID] = obligation.PreparedRetirement
+	return c.checkBoundary(nil)
+}
+
+func (c *Coordinator) recordPreparedSupervisorObligation(job Aggregate, group GroupRef) error {
+	obligation, ok := c.obligations[job.JobID]
+	if !ok {
+		return protocolError(CodePreconditionFailed, job.JobID, "missing coordinator obligation for prepared supervisor")
+	}
+	obligation.PreparedSupervisor = &group
+	obligation.PreparedRetirement = PreparedSupervisorRetirement{}
+	obligation.Retired = false
+	c.obligations[job.JobID] = obligation
 	return c.checkBoundary(nil)
 }
 

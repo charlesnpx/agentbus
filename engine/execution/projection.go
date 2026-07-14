@@ -2,6 +2,9 @@ package execution
 
 // PublicProjection is the model's complete internal-to-public status table.
 func PublicProjection(decision Decision, dispatch Dispatch, outcome Outcome) Public {
+	if !validDecision(decision) || !validDispatch(dispatch) || !validOutcome(outcome) {
+		return ""
+	}
 	switch outcome {
 	case OutcomeCompleted:
 		return PublicCompleted
@@ -45,6 +48,9 @@ func PublicProjection(decision Decision, dispatch Dispatch, outcome Outcome) Pub
 // ReachableInternal reports whether the tuple is expected to arise in the
 // reference model. PublicProjection remains total even for unreachable tuples.
 func ReachableInternal(decision Decision, dispatch Dispatch, outcome Outcome) bool {
+	if !validDecision(decision) || !validDispatch(dispatch) || !validOutcome(outcome) {
+		return false
+	}
 	if decision == DecisionTerminal {
 		return dispatch == DispatchDone && outcome != OutcomeNone
 	}
@@ -58,5 +64,10 @@ func ReachableInternal(decision Decision, dispatch Dispatch, outcome Outcome) bo
 }
 
 func terminalOutcome(outcome Outcome) bool {
-	return outcome != OutcomeNone
+	switch outcome {
+	case OutcomeCompleted, OutcomeCompletedNoncompliant, OutcomeFailed, OutcomeTimedOut, OutcomeCanceled, OutcomeReaped, OutcomeInterrupted, OutcomeQuarantined:
+		return true
+	default:
+		return false
+	}
 }

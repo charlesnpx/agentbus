@@ -91,7 +91,15 @@ func DecideStartupAnchor(input AnchorInput) StartupDecision {
 
 func (s *MemoryAdmissionStore) ObserveStartupAnchor(input AnchorInput) StartupDecision {
 	decision := DecideStartupAnchor(input)
+	s.startupAnchorObserved = true
+	s.startupAnchorInput = input
+	s.startupAnchorDecision = decision
+	s.startupAnchorDispositionPersisted = true
+	s.startupAnchorCompleted = false
 	s.silentRecreated = input.EverInitialized && !input.DBPresent && !input.AnchorPresent
+	if decision.Fatal() {
+		s.fatal = true
+	}
 	return decision
 }
 
