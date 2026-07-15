@@ -108,11 +108,15 @@ func DecideContainmentAuthorization(input ContainmentAuthorization) (Containment
 }
 
 func decideLiveContainment(input ContainmentAuthorization) (ContainmentDecision, error) {
-	if input.Observation.Leader == ProcessIdentityMatching {
+	switch input.Observation.Leader {
+	case ProcessIdentityMatching:
 		return SignalDirectly, nil
-	}
-	if input.Session.BeganFromMatchingLeader && input.Session.ContinuouslyObservedLive {
-		return SignalDirectly, nil
+	case ProcessIdentityReused:
+		return Unprovable, nil
+	case ProcessIdentityMissing:
+		if input.Session.BeganFromMatchingLeader && input.Session.ContinuouslyObservedLive {
+			return SignalDirectly, nil
+		}
 	}
 	trusted, err := input.Observation.Monitor.TrustedFor(input.Group)
 	if err != nil {

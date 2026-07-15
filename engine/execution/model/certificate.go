@@ -237,8 +237,8 @@ func (ref GroupRef) Validate() error {
 	if err := validatePIDNamespace("group.pid_namespace", ref.PIDNamespaceID, ref.PIDNamespaceState); err != nil {
 		return err
 	}
-	if err := validatePositiveInt("group.pgid", ref.PGID); err != nil {
-		return err
+	if ref.PGID <= 1 {
+		return invalid("group.pgid", "must be greater than 1")
 	}
 	if err := ref.Leader.Validate(); err != nil {
 		return err

@@ -24,6 +24,28 @@ func TestContainmentSessionAuthorizesKillAfterLeaderExitWithLiveGrandchild(t *te
 	}
 }
 
+func TestContainmentSessionDoesNotAuthorizeReusedLeader(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	decision, err := DecideContainmentAuthorization(ContainmentAuthorization{
+		Group: ref,
+		Observation: ContainmentObservation{
+			KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+			Group:          GroupLive,
+			Leader:         ProcessIdentityReused,
+		},
+		Session: ContainmentSession{
+			BeganFromMatchingLeader:  true,
+			ContinuouslyObservedLive: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("DecideContainmentAuthorization error = %v", err)
+	}
+	if decision != Unprovable {
+		t.Fatalf("decision = %s, want %s", decision, Unprovable)
+	}
+}
+
 func TestColdLeaderMissingContainmentWaitsThenBecomesUnprovable(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
 	observation := ContainmentObservation{

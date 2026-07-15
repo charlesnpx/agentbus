@@ -28,18 +28,6 @@ type Clock interface {
 	Sleep(ctx context.Context, duration time.Duration) error
 }
 
-// Authorizer consumes the P0C containment authorization decision.
-type Authorizer interface {
-	AuthorizeContainment(input model.ContainmentAuthorization) (model.ContainmentDecision, error)
-}
-
-// ModelAuthorizer delegates to model.DecideContainmentAuthorization.
-type ModelAuthorizer struct{}
-
-func (ModelAuthorizer) AuthorizeContainment(input model.ContainmentAuthorization) (model.ContainmentDecision, error) {
-	return model.DecideContainmentAuthorization(input)
-}
-
 type Signal uint8
 
 const (
@@ -89,7 +77,6 @@ type Params struct {
 	PollTimeout                time.Duration
 	TrustedMonitorWait         time.Duration
 	TrustedMonitorPollInterval time.Duration
-	InitialSession             model.ContainmentSession
 }
 
 func (params Params) normalized() (Params, error) {

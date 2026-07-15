@@ -14,18 +14,21 @@ import (
 
 type RealSignaler struct{}
 
+var ErrUnsafeSignalTarget = errors.New("unsafe process group signal target")
+
 func (RealSignaler) SignalGroup(ctx context.Context, target model.GroupRef, signal Signal) (SignalResult, error) {
 	if err := ctx.Err(); err != nil {
 		return SignalUnprovable, err
 	}
-	if err := target.Validate(); err != nil {
+	nativeTarget, err := signalTarget(target)
+	if err != nil {
 		return SignalUnprovable, err
 	}
 	native, err := nativeSignal(signal)
 	if err != nil {
 		return SignalUnprovable, err
 	}
-	if err := unix.Kill(-target.PGID, native); err != nil {
+	if err := unix.Kill(nativeTarget, native); err != nil {
 		if errors.Is(err, unix.ESRCH) {
 			return SignalTargetAbsent, nil
 		}
@@ -38,16 +41,31 @@ func (RealSignaler) ProbeGroup(ctx context.Context, target model.GroupRef) (Prob
 	if err := ctx.Err(); err != nil {
 		return ProbeUnprovable, err
 	}
-	if err := target.Validate(); err != nil {
+	nativeTarget, err := signalTarget(target)
+	if err != nil {
 		return ProbeUnprovable, err
 	}
-	if err := unix.Kill(-target.PGID, syscall.Signal(0)); err != nil {
+	if err := unix.Kill(nativeTarget, syscall.Signal(0)); err != nil {
 		if errors.Is(err, unix.ESRCH) {
 			return ProbeAbsent, nil
 		}
 		return ProbeUnprovable, err
 	}
 	return ProbeLive, nil
+}
+
+func signalTarget(target model.GroupRef) (int, error) {
+	if target.PGID <= 1 {
+		return 0, fmt.Errorf("%w: pgid must be greater than 1", ErrUnsafeSignalTarget)
+	}
+	if err := target.Validate(); err != nil {
+		return 0, err
+	}
+	nativeTarget := -target.PGID
+	if nativeTarget >= 0 || nativeTarget == -1 {
+		return 0, fmt.Errorf("%w: pgid %d resolves to target %d", ErrUnsafeSignalTarget, target.PGID, nativeTarget)
+	}
+	return nativeTarget, nil
 }
 
 func nativeSignal(signal Signal) (syscall.Signal, error) {

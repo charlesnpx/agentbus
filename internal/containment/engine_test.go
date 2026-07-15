@@ -17,7 +17,7 @@ func TestContainmentAlreadyAbsentDoesNotSignal(t *testing.T) {
 	}}
 	signaler := &fakeSignaler{}
 
-	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams(), ModelAuthorizer{})
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
 
 	assertAbsent(t, outcome)
 	assertSignals(t, signaler)
@@ -31,7 +31,7 @@ func TestContainmentTermSufficesWithinGrace(t *testing.T) {
 	}}
 	signaler := &fakeSignaler{script: []signalScript{{signal: SignalTerminate, result: SignalDelivered}}}
 
-	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams(), ModelAuthorizer{})
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
 
 	assertAbsent(t, outcome)
 	assertSignals(t, signaler, SignalTerminate)
@@ -49,7 +49,7 @@ func TestContainmentTermIgnoredThenKillPollsAbsent(t *testing.T) {
 		{signal: SignalKill, result: SignalDelivered},
 	}}
 
-	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams(), ModelAuthorizer{})
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
 
 	assertAbsent(t, outcome)
 	assertSignals(t, signaler, SignalTerminate, SignalKill)
@@ -72,7 +72,7 @@ func TestContainmentNeverAbsentWithinBoundIsUnprovable(t *testing.T) {
 		probes: []ProbeResult{ProbeLive, ProbeLive, ProbeLive},
 	}
 
-	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams(), ModelAuthorizer{})
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
 
 	assertUnprovable(t, outcome, ReasonAbsenceDeadlineExceeded)
 	assertSignals(t, signaler, SignalTerminate, SignalKill)
@@ -87,7 +87,7 @@ func TestContainmentSignalAmbiguousIsUnprovable(t *testing.T) {
 		{signal: SignalTerminate, result: SignalUnprovable, err: errors.New("permission denied")},
 	}}
 
-	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams(), ModelAuthorizer{})
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
 
 	assertUnprovable(t, outcome, ReasonSignalUnprovable)
 	assertSignals(t, signaler, SignalTerminate)
@@ -112,7 +112,7 @@ func TestContainmentUnknownOrContradictoryObservationIsUnprovable(t *testing.T) 
 			}}
 			signaler := &fakeSignaler{}
 
-			outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams(), ModelAuthorizer{})
+			outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
 
 			assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
 			assertSignals(t, signaler)
@@ -129,16 +129,45 @@ func TestContainmentColdLeaderMissingWaitsWithoutSignalling(t *testing.T) {
 	}}
 	signaler := &fakeSignaler{}
 
-	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams(), ModelAuthorizer{})
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
 
 	assertUnprovable(t, outcome, ReasonUnauthorizedWaitExpired)
 	assertSignals(t, signaler)
 }
 
-func TestContainmentAuthorizedContinuousLiveGroupEscalatesAfterLeaderExit(t *testing.T) {
+func TestContainmentColdLeaderMissingFirstObservationIsUnprovableWithoutSignal(t *testing.T) {
 	target := testGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{}
+
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	assertSignals(t, signaler)
+}
+
+func TestContainmentReusedLeaderAfterTermRevokesAuthorityWithoutKill(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+	}}
+
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	assertSignals(t, signaler, SignalTerminate)
+}
+
+func TestContainmentEngineMintedContinuousLiveGroupEscalatesAfterLeaderExit(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
 		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
 		testObservation(target, model.GroupAbsent, model.ProcessIdentityMissing),
 	}}
@@ -146,13 +175,8 @@ func TestContainmentAuthorizedContinuousLiveGroupEscalatesAfterLeaderExit(t *tes
 		{signal: SignalTerminate, result: SignalDelivered},
 		{signal: SignalKill, result: SignalDelivered},
 	}}
-	params := testParams()
-	params.InitialSession = model.ContainmentSession{
-		BeganFromMatchingLeader:  true,
-		ContinuouslyObservedLive: true,
-	}
 
-	outcome := testEngine(observer, signaler).Contain(context.Background(), target, params, ModelAuthorizer{})
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
 
 	assertAbsent(t, outcome)
 	assertSignals(t, signaler, SignalTerminate, SignalKill)

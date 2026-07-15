@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -170,6 +171,26 @@ func TestGroupRefValidationRequiresLeaderToHeadPGID(t *testing.T) {
 	group.Leader.PID = group.PGID + 1
 	if err := group.Validate(); !errors.Is(err, ErrInvalidValue) {
 		t.Fatalf("group with non-leader pid error = %v, want ErrInvalidValue", err)
+	}
+}
+
+func TestGroupRefValidationRejectsUnsafePGID(t *testing.T) {
+	record := validSafetyRecord()
+	for _, pgid := range []int{0, 1} {
+		t.Run(fmt.Sprintf("pgid_%d", pgid), func(t *testing.T) {
+			group := *record.Attempt.Launches.First.Group
+			group.PGID = pgid
+			group.Leader.PID = pgid
+
+			err := group.Validate()
+			if !errors.Is(err, ErrInvalidValue) {
+				t.Fatalf("group pgid %d error = %v, want ErrInvalidValue", pgid, err)
+			}
+			var validation ValidationError
+			if !errors.As(err, &validation) || validation.Field != "group.pgid" {
+				t.Fatalf("group pgid %d error = %v, want group.pgid validation error", pgid, err)
+			}
+		})
 	}
 }
 

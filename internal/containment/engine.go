@@ -14,7 +14,7 @@ type Engine struct {
 	Clock    Clock
 }
 
-func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params Params, auth Authorizer) Outcome {
+func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params Params) Outcome {
 	if err := target.Validate(); err != nil {
 		return UnprovableOutcome(ReasonInvalidInput, "", err)
 	}
@@ -28,16 +28,13 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 	if engine.Clock == nil {
 		engine.Clock = RealClock{}
 	}
-	if auth == nil {
-		auth = ModelAuthorizer{}
-	}
 
 	observation, outcome := engine.observe(ctx, target)
 	if outcome.Kind != 0 {
 		return outcome
 	}
-	session := advanceSession(params.InitialSession, observation)
-	decision, outcome := authorize(auth, target, observation, session, false)
+	session := advanceSession(target, model.ContainmentSession{}, observation)
+	decision, outcome := authorize(target, observation, session, false)
 	if outcome.Kind != 0 {
 		return outcome
 	}
@@ -46,9 +43,9 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 	case model.AlreadyAbsent:
 		return AbsentOutcome(decision)
 	case model.SignalDirectly:
-		return engine.signalAuthorized(ctx, target, params, auth, session, decision)
+		return engine.signalAuthorized(ctx, target, params, session, decision)
 	case model.WaitBoundedForTrustedMonitor:
-		return engine.waitForTrustedMonitor(ctx, target, params, auth, session, observation)
+		return engine.waitForTrustedMonitor(ctx, target, params, session, observation)
 	case model.Unprovable:
 		return UnprovableOutcome(ReasonAuthorizationUnprovable, decision, nil)
 	default:
@@ -56,7 +53,7 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 	}
 }
 
-func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef, params Params, auth Authorizer, session model.ContainmentSession, decision model.ContainmentDecision) Outcome {
+func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef, params Params, session model.ContainmentSession, decision model.ContainmentDecision) Outcome {
 	if outcome := engine.signal(ctx, target, SignalTerminate, decision); outcome.Kind != 0 {
 		return outcome
 	}
@@ -68,8 +65,8 @@ func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef
 	if outcome.Kind != 0 {
 		return outcome
 	}
-	session = advanceSession(session, observation)
-	decision, outcome = authorize(auth, target, observation, session, false)
+	session = advanceSession(target, session, observation)
+	decision, outcome = authorize(target, observation, session, false)
 	if outcome.Kind != 0 {
 		return outcome
 	}
@@ -80,7 +77,7 @@ func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef
 		if outcome := engine.signal(ctx, target, SignalKill, decision); outcome.Kind != 0 {
 			return outcome
 		}
-		return engine.pollUntilAbsent(ctx, target, params, auth, session, decision)
+		return engine.pollUntilAbsent(ctx, target, params, session, decision)
 	case model.WaitBoundedForTrustedMonitor:
 		return UnprovableOutcome(ReasonAuthorizationUnprovable, decision, nil)
 	case model.Unprovable:
@@ -90,11 +87,11 @@ func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef
 	}
 }
 
-func (engine Engine) waitForTrustedMonitor(ctx context.Context, target model.GroupRef, params Params, auth Authorizer, session model.ContainmentSession, observation model.ContainmentObservation) Outcome {
+func (engine Engine) waitForTrustedMonitor(ctx context.Context, target model.GroupRef, params Params, session model.ContainmentSession, observation model.ContainmentObservation) Outcome {
 	deadline := engine.Clock.Now().Add(params.TrustedMonitorWait)
 	for {
 		expired := !engine.Clock.Now().Before(deadline)
-		decision, outcome := authorize(auth, target, observation, session, expired)
+		decision, outcome := authorize(target, observation, session, expired)
 		if outcome.Kind != 0 {
 			return outcome
 		}
@@ -102,7 +99,7 @@ func (engine Engine) waitForTrustedMonitor(ctx context.Context, target model.Gro
 		case model.AlreadyAbsent:
 			return AbsentOutcome(decision)
 		case model.SignalDirectly:
-			return engine.signalAuthorized(ctx, target, params, auth, session, decision)
+			return engine.signalAuthorized(ctx, target, params, session, decision)
 		case model.Unprovable:
 			if expired {
 				return UnprovableOutcome(ReasonUnauthorizedWaitExpired, decision, nil)
@@ -123,19 +120,19 @@ func (engine Engine) waitForTrustedMonitor(ctx context.Context, target model.Gro
 		if outcome.Kind != 0 {
 			return outcome
 		}
-		session = advanceSession(session, observation)
+		session = advanceSession(target, session, observation)
 	}
 }
 
-func (engine Engine) pollUntilAbsent(ctx context.Context, target model.GroupRef, params Params, auth Authorizer, session model.ContainmentSession, decision model.ContainmentDecision) Outcome {
+func (engine Engine) pollUntilAbsent(ctx context.Context, target model.GroupRef, params Params, session model.ContainmentSession, decision model.ContainmentDecision) Outcome {
 	deadline := engine.Clock.Now().Add(params.PollTimeout)
 	for {
 		observation, outcome := engine.observe(ctx, target)
 		if outcome.Kind != 0 {
 			return outcome
 		}
-		session = advanceSession(session, observation)
-		currentDecision, outcome := authorize(auth, target, observation, session, false)
+		session = advanceSession(target, session, observation)
+		currentDecision, outcome := authorize(target, observation, session, false)
 		if outcome.Kind != 0 {
 			return outcome
 		}
@@ -212,8 +209,8 @@ func (engine Engine) sleepUntil(ctx context.Context, interval time.Duration, dea
 	return engine.Clock.Sleep(ctx, interval)
 }
 
-func authorize(auth Authorizer, target model.GroupRef, observation model.ContainmentObservation, session model.ContainmentSession, deadlineExpired bool) (model.ContainmentDecision, Outcome) {
-	decision, err := auth.AuthorizeContainment(model.ContainmentAuthorization{
+func authorize(target model.GroupRef, observation model.ContainmentObservation, session model.ContainmentSession, deadlineExpired bool) (model.ContainmentDecision, Outcome) {
+	decision, err := model.DecideContainmentAuthorization(model.ContainmentAuthorization{
 		Group:           target,
 		Observation:     observation,
 		Session:         session,
@@ -225,21 +222,20 @@ func authorize(auth Authorizer, target model.GroupRef, observation model.Contain
 	return decision, Outcome{}
 }
 
-func advanceSession(session model.ContainmentSession, observation model.ContainmentObservation) model.ContainmentSession {
-	switch observation.Group {
-	case model.GroupLive:
-		if observation.Leader == model.ProcessIdentityMatching {
-			session.BeganFromMatchingLeader = true
-			session.ContinuouslyObservedLive = true
-			return session
+func advanceSession(target model.GroupRef, session model.ContainmentSession, observation model.ContainmentObservation) model.ContainmentSession {
+	if observation.Group != model.GroupLive || !target.KernelDomain().ProvablySame(observation.KernelDomainID) {
+		return model.ContainmentSession{}
+	}
+	switch observation.Leader {
+	case model.ProcessIdentityMatching:
+		return model.ContainmentSession{
+			BeganFromMatchingLeader:  true,
+			ContinuouslyObservedLive: true,
 		}
+	case model.ProcessIdentityMissing:
 		if session.BeganFromMatchingLeader && session.ContinuouslyObservedLive {
 			return session
 		}
-		session.ContinuouslyObservedLive = false
-		return session
-	default:
-		session.ContinuouslyObservedLive = false
-		return session
 	}
+	return model.ContainmentSession{}
 }
