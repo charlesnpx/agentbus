@@ -46,6 +46,26 @@ type RecoveryPlan struct {
 	Next            RecoveryAction
 }
 
+type RecoveryToken struct {
+	JobID           JobID
+	BasedOnRevision uint64
+	RecoveryBoot    BootRef
+	Opaque          string
+}
+
+func (token RecoveryToken) Validate() error {
+	if err := token.JobID.Validate(); err != nil {
+		return err
+	}
+	if err := validatePositiveUint64("recovery_token.based_on_revision", token.BasedOnRevision); err != nil {
+		return err
+	}
+	if err := token.RecoveryBoot.Validate(); err != nil {
+		return err
+	}
+	return validateToken("recovery_token.opaque", token.Opaque)
+}
+
 type GroupExistenceObservation string
 
 const (

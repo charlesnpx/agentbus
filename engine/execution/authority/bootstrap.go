@@ -31,8 +31,9 @@ type Bootstrapper struct {
 }
 
 type RecoverySession struct {
-	core  *authorityCore
-	token recoveryCapability
+	core   *authorityCore
+	token  recoveryCapability
+	tokens map[string]issuedRecoveryToken
 }
 
 type BootstrapperOption func(*bootstrapConfig)
@@ -139,7 +140,8 @@ func (b *Bootstrapper) Begin(ctx context.Context, boot model.BootRef) (*Recovery
 		generation: generation,
 	}
 	return &RecoverySession{
-		core: b.core,
+		core:   b.core,
+		tokens: make(map[string]issuedRecoveryToken),
 		token: recoveryCapability{
 			boot:       boot,
 			token:      token,
@@ -182,7 +184,18 @@ func (s *RecoverySession) Finalize(ctx context.Context, ref model.AttemptRef, in
 	return s.applyReceipt(ctx, model.Finalize{Ref: ref, Intent: intent})
 }
 
-func (s *RecoverySession) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) error {
+func (s *RecoverySession) RecordQuiescence(ctx context.Context, subject any, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) error {
+	switch value := subject.(type) {
+	case model.JobID:
+		return s.recordQuiescenceByJobID(ctx, value, ordinal, verified)
+	case model.RecoveryToken:
+		return s.recordQuiescenceByToken(ctx, value, ordinal, verified)
+	default:
+		return fmt.Errorf("%w: recovery quiescence subject %T", ErrInvalidRequest, subject)
+	}
+}
+
+func (s *RecoverySession) recordQuiescenceByJobID(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) error {
 	if s == nil || s.core == nil {
 		return ErrNotReady
 	}
