@@ -1,0 +1,741 @@
+//go:build darwin || linux
+
+package parklaunch
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/internal/parkproto"
+	"github.com/charlesnpx/agentbus/internal/procgroup"
+	"golang.org/x/sys/unix"
+)
+
+const (
+	parklaunchHelperEnv     = "AGENTBUS_PARKLAUNCH_HELPER"
+	parklaunchBackendMode   = "backend"
+	parklaunchMonitorMode   = "monitor"
+	parklaunchFDScanMode    = "fd-scan"
+	parklaunchMonitorFDMode = "monitor-fd"
+)
+
+var (
+	agentbusBuildOnce sync.Once
+	agentbusBuildPath string
+	agentbusBuildErr  error
+)
+
+func TestLaunchHappyPathReleasesBackendWithStablePIDAndEOF(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer stopMonitor(t, handle.Monitor)
+
+	stdout, err := io.ReadAll(handle.Stdout)
+	if err != nil {
+		t.Fatalf("read backend stdout: %v", err)
+	}
+	if !strings.Contains(string(stdout), "parklaunch-backend") {
+		t.Fatalf("backend stdout = %q", stdout)
+	}
+	if err := handle.Wait(); err != nil {
+		t.Fatalf("backend wait error = %v", err)
+	}
+	result := readBackendResult(t, fixture.backend.ResultPath)
+	if result.PID != handle.GroupRef.Leader.PID {
+		t.Fatalf("backend pid = %d, want stable worker pid %d", result.PID, handle.GroupRef.Leader.PID)
+	}
+	if result.PGID != handle.GroupRef.PGID {
+		t.Fatalf("backend pgid = %d, want target group %d", result.PGID, handle.GroupRef.PGID)
+	}
+	if handle.GroupRef.RetainedID != "" {
+		t.Fatalf("retained id = %q, want empty v1 retained id", handle.GroupRef.RetainedID)
+	}
+	if handle.GroupRef.Monitor.PID == handle.GroupRef.PGID {
+		t.Fatalf("monitor pid %d is target group leader", handle.GroupRef.Monitor.PID)
+	}
+	if len(result.OpenFDs) != 0 {
+		t.Fatalf("backend inherited unexpected fds: %v", result.OpenFDs)
+	}
+	if got := fixture.containment.CallCount(); got != 0 {
+		t.Fatalf("parent containment calls = %d, want 0", got)
+	}
+	assertFileAbsent(t, fixture.monitorMarker)
+}
+
+func TestLaunchIdentityMismatchFailsClosed(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	fixture.spec.identity = mismatchClassifyingReader{identityReader: nativeIdentityReader{}}
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err == nil {
+		stopMonitor(t, handle.Monitor)
+		t.Fatal("Launch() succeeded; want identity mismatch")
+	}
+	if !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("Launch() error = %v, want ErrIdentityMismatch", err)
+	}
+	if got := fixture.containment.CallCount(); got != 1 {
+		t.Fatalf("containment calls = %d, want 1", got)
+	}
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+	fixture.containment.WaitAbsent(t)
+}
+
+func TestLaunchReleaseIsOneUse(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer stopMonitor(t, handle.Monitor)
+
+	if err := handle.Release(fixture.ctx); !errors.Is(err, ErrReleaseAlreadySent) {
+		t.Fatalf("second Release() error = %v, want ErrReleaseAlreadySent", err)
+	}
+	_, _ = io.ReadAll(handle.Stdout)
+	if err := handle.Wait(); err != nil {
+		t.Fatalf("backend wait error = %v", err)
+	}
+	result := readBackendResult(t, fixture.backend.ResultPath)
+	if result.PID != handle.GroupRef.Leader.PID {
+		t.Fatalf("backend pid = %d, want stable worker pid %d", result.PID, handle.GroupRef.Leader.PID)
+	}
+	if got := fixture.containment.CallCount(); got != 0 {
+		t.Fatalf("parent containment calls = %d, want 0", got)
+	}
+}
+
+func TestLaunchChannelLossBeforeReleaseContainsTarget(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	fixture.spec.hooks.beforeRelease = func(snapshot launchControlSnapshot) error {
+		return snapshot.ControlWrite.Close()
+	}
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err == nil {
+		stopMonitor(t, handle.Monitor)
+		t.Fatal("Launch() succeeded; want channel-loss failure")
+	}
+	if !errors.Is(err, ErrChannelLostBeforeRelease) {
+		t.Fatalf("Launch() error = %v, want ErrChannelLostBeforeRelease", err)
+	}
+	if got := fixture.containment.CallCount(); got != 1 {
+		t.Fatalf("containment calls = %d, want 1", got)
+	}
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+	fixture.containment.WaitAbsent(t)
+}
+
+func TestMonitorDaemonEOFContainsExactlyOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	daemonRead, daemonWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = daemonWrite.Close()
+	})
+	marker := filepath.Join(dir, "containment.log")
+	monitor := startTestMonitor(t, ctx, daemonRead, marker)
+	claim, err := procgroup.ReadProcessClaim(monitor.PID)
+	if err != nil {
+		t.Fatalf("read monitor claim: %v", err)
+	}
+	if claim.PGID != claim.PID {
+		t.Fatalf("monitor pgid=%d pid=%d, want own process group", claim.PGID, claim.PID)
+	}
+	target := syntheticGroupRef(424242, 515151)
+	if err := monitor.BindTarget(target); err != nil {
+		t.Fatalf("BindTarget() error = %v", err)
+	}
+
+	if err := daemonWrite.Close(); err != nil {
+		t.Fatalf("close daemon write: %v", err)
+	}
+	waitMonitorSuccess(t, monitor)
+	lines := readLines(t, marker)
+	if len(lines) != 1 {
+		t.Fatalf("monitor containment lines = %d (%v), want 1", len(lines), lines)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "containment.log" {
+		t.Fatalf("monitor wrote unexpected durable files: %v", dirEntries(entries))
+	}
+}
+
+func TestLaunchFDOwnership(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: fdRange(3, 32)})
+	fdScanResult := filepath.Join(t.TempDir(), "fd-scan.json")
+	fixture.spec.hooks.afterPipesCreated = func(snapshot launchPipeSnapshot) error {
+		open, err := runFDScanHelper([]int{snapshot.ControlWriteFD, snapshot.BootstrapWriteFD}, fdScanResult)
+		if err != nil {
+			return err
+		}
+		if len(open) != 0 {
+			return fmt.Errorf("unrelated child inherited daemon-side fds: %v", open)
+		}
+		return nil
+	}
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer stopMonitor(t, handle.Monitor)
+	_, _ = io.ReadAll(handle.Stdout)
+	if err := handle.Wait(); err != nil {
+		t.Fatalf("backend wait error = %v", err)
+	}
+	result := readBackendResult(t, fixture.backend.ResultPath)
+	if len(result.OpenFDs) != 0 {
+		t.Fatalf("backend inherited non-stdio fds: %v", result.OpenFDs)
+	}
+}
+
+func TestParklaunchBackendHelperProcess(t *testing.T) {
+	if os.Getenv(parklaunchHelperEnv) != parklaunchBackendMode {
+		return
+	}
+	args, ok := helperArgs()
+	if !ok {
+		os.Exit(97)
+	}
+	os.Exit(runBackendHelper(args))
+}
+
+func TestParklaunchMonitorHelperProcess(t *testing.T) {
+	if os.Getenv(parklaunchHelperEnv) != parklaunchMonitorMode {
+		return
+	}
+	args, ok := helperArgs()
+	if !ok {
+		os.Exit(97)
+	}
+	os.Exit(runMonitorHelper(args))
+}
+
+func TestParklaunchFDScanHelperProcess(t *testing.T) {
+	if os.Getenv(parklaunchHelperEnv) != parklaunchFDScanMode {
+		return
+	}
+	args, ok := helperArgs()
+	if !ok {
+		os.Exit(97)
+	}
+	os.Exit(runFDScanHelperProcess(args))
+}
+
+type launchFixture struct {
+	ctx           context.Context
+	cancel        context.CancelFunc
+	spec          Spec
+	backend       backendFixtureSpec
+	containment   *recordingContainment
+	monitorMarker string
+	daemonWrite   *os.File
+}
+
+type backendFixtureOptions struct {
+	ClosedFDs []int
+}
+
+type backendFixtureSpec struct {
+	parkproto.ExecSpec
+	MarkerPath string
+	ResultPath string
+}
+
+type backendResult struct {
+	PID     int   `json:"pid"`
+	PGID    int   `json:"pgid"`
+	OpenFDs []int `json:"openFds"`
+}
+
+func newLaunchFixture(t *testing.T, backendOpts backendFixtureOptions) launchFixture {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
+	dir := t.TempDir()
+	daemonRead, daemonWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = daemonRead.Close()
+		_ = daemonWrite.Close()
+	})
+	backend := newBackendFixture(t, dir, backendOpts)
+	containment := &recordingContainment{kill: true}
+	attempt := model.AttemptRef{JobID: "job-parklaunch", AttemptID: "attempt-1", Epoch: 1}
+	launchKey := model.LaunchKey{Attempt: attempt, Ordinal: model.LaunchOrdinalOne}
+	boot := model.BootRef{BootID: "boot-parklaunch", OwnerID: "owner-parklaunch"}
+	monitorMarker := filepath.Join(dir, "monitor-containment.log")
+	spec := Spec{
+		AgentbusPath:  builtAgentbusPath(t),
+		ExecSpec:      backend.ExecSpec,
+		CustodyID:     "custody-parklaunch",
+		LaunchKey:     launchKey,
+		LogicalGrant:  model.LaunchGrant{Attempt: attempt, Ordinal: model.LaunchOrdinalOne, Nonce: "nonce-parklaunch", GrantedBy: boot},
+		ReleaseSecret: "release-secret-parklaunch",
+		Containment:   containment,
+		Monitor: &MonitorProcessSpec{
+			Command:           monitorCommand(t, monitorMarker),
+			DaemonControlRead: daemonRead,
+		},
+	}
+	return launchFixture{
+		ctx:           ctx,
+		cancel:        cancel,
+		spec:          spec,
+		backend:       backend,
+		containment:   containment,
+		monitorMarker: monitorMarker,
+		daemonWrite:   daemonWrite,
+	}
+}
+
+func newBackendFixture(t *testing.T, dir string, opts backendFixtureOptions) backendFixtureSpec {
+	t.Helper()
+	exe := testBinaryPath(t)
+	marker := filepath.Join(dir, "backend-started")
+	result := filepath.Join(dir, "backend-result.json")
+	closed := make([]string, 0, len(opts.ClosedFDs))
+	for _, fd := range opts.ClosedFDs {
+		closed = append(closed, strconv.Itoa(fd))
+	}
+	argv := []string{
+		exe,
+		"-test.run=TestParklaunchBackendHelperProcess",
+		"--",
+		"--marker", marker,
+		"--result", result,
+		"--closed-fds", strings.Join(closed, ","),
+	}
+	return backendFixtureSpec{
+		ExecSpec: parkproto.ExecSpec{
+			Path: exe,
+			Argv: argv,
+			Env:  []string{parklaunchHelperEnv + "=" + parklaunchBackendMode},
+			Dir:  filepath.Dir(exe),
+		},
+		MarkerPath: marker,
+		ResultPath: result,
+	}
+}
+
+func monitorCommand(t *testing.T, marker string) CommandSpec {
+	t.Helper()
+	exe := testBinaryPath(t)
+	return CommandSpec{
+		Path: exe,
+		Args: []string{
+			exe,
+			"-test.run=TestParklaunchMonitorHelperProcess",
+			"--",
+			"--daemon-fd", strconv.Itoa(MonitorDaemonControlFD),
+			"--target-fd", strconv.Itoa(MonitorTargetFD),
+			"--marker", marker,
+		},
+		Env: append(os.Environ(), parklaunchHelperEnv+"="+parklaunchMonitorMode),
+		Dir: filepath.Dir(exe),
+	}
+}
+
+func startTestMonitor(t *testing.T, ctx context.Context, daemonRead *os.File, marker string) *MonitorProcess {
+	t.Helper()
+	monitor, err := StartMonitorProcess(ctx, MonitorProcessSpec{
+		Command:           monitorCommand(t, marker),
+		DaemonControlRead: daemonRead,
+	})
+	if err != nil {
+		t.Fatalf("StartMonitorProcess() error = %v", err)
+	}
+	t.Cleanup(func() {
+		stopMonitor(t, monitor)
+	})
+	return monitor
+}
+
+func builtAgentbusPath(t *testing.T) string {
+	t.Helper()
+	agentbusBuildOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "agentbus-parklaunch-bin-")
+		if err != nil {
+			agentbusBuildErr = err
+			return
+		}
+		agentbusBuildPath = filepath.Join(dir, "agentbus")
+		if runtime.GOOS == "windows" {
+			agentbusBuildPath += ".exe"
+		}
+		cmd := exec.Command("go", "build", "-o", agentbusBuildPath, "./cmd/agentbus")
+		cmd.Dir = repoRootFromCaller()
+		cmd.Env = os.Environ()
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			agentbusBuildErr = fmt.Errorf("go build ./cmd/agentbus: %w\n%s", err, output)
+		}
+	})
+	if agentbusBuildErr != nil {
+		t.Fatal(agentbusBuildErr)
+	}
+	return agentbusBuildPath
+}
+
+func repoRootFromCaller() string {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		return "."
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+}
+
+func testBinaryPath(t *testing.T) string {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exe
+}
+
+type recordingContainment struct {
+	mu     sync.Mutex
+	groups []model.GroupRef
+	kill   bool
+}
+
+func (containment *recordingContainment) Contain(ctx context.Context, group model.GroupRef) error {
+	containment.mu.Lock()
+	containment.groups = append(containment.groups, group)
+	containment.mu.Unlock()
+	if !containment.kill {
+		return nil
+	}
+	err := unix.Kill(-group.PGID, unix.SIGKILL)
+	if err != nil && !errors.Is(err, unix.ESRCH) {
+		return err
+	}
+	return waitGroupAbsent(ctx, group)
+}
+
+func (containment *recordingContainment) CallCount() int {
+	containment.mu.Lock()
+	defer containment.mu.Unlock()
+	return len(containment.groups)
+}
+
+func (containment *recordingContainment) WaitAbsent(t *testing.T) {
+	t.Helper()
+	containment.mu.Lock()
+	groups := append([]model.GroupRef(nil), containment.groups...)
+	containment.mu.Unlock()
+	for _, group := range groups {
+		if err := waitGroupAbsent(context.Background(), group); err != nil {
+			t.Fatalf("group %d still present after containment: %v", group.PGID, err)
+		}
+	}
+}
+
+type mismatchClassifyingReader struct {
+	identityReader
+}
+
+func (reader mismatchClassifyingReader) ClassifyProcess(procgroup.ProcessClaim) model.ProcessIdentityObservation {
+	return model.ProcessIdentityReused
+}
+
+type markerContainment struct {
+	path string
+}
+
+func (containment markerContainment) Contain(_ context.Context, group model.GroupRef) error {
+	line := fmt.Sprintf("contained pgid=%d leader=%d\n", group.PGID, group.Leader.PID)
+	file, err := os.OpenFile(containment.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.WriteString(line)
+	return err
+}
+
+func runBackendHelper(args []string) int {
+	fs := flag.NewFlagSet("parklaunch-backend", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	marker := fs.String("marker", "", "marker path")
+	result := fs.String("result", "", "result path")
+	closedFDs := fs.String("closed-fds", "", "closed fds")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *marker == "" || *result == "" {
+		return 2
+	}
+	open := openFDs(parseFDList(*closedFDs))
+	pgid, err := unix.Getpgid(0)
+	if err != nil {
+		return 3
+	}
+	fmt.Printf("parklaunch-backend pid=%d pgid=%d\n", os.Getpid(), pgid)
+	if err := os.WriteFile(*marker, []byte("started\n"), 0o600); err != nil {
+		return 4
+	}
+	raw, err := json.Marshal(backendResult{PID: os.Getpid(), PGID: pgid, OpenFDs: open})
+	if err != nil {
+		return 5
+	}
+	if err := os.WriteFile(*result, append(raw, '\n'), 0o600); err != nil {
+		return 6
+	}
+	return 0
+}
+
+func runMonitorHelper(args []string) int {
+	fs := flag.NewFlagSet("parklaunch-monitor", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	daemonFD := fs.Int("daemon-fd", -1, "daemon fd")
+	targetFD := fs.Int("target-fd", -1, "target fd")
+	marker := fs.String("marker", "", "containment marker")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *daemonFD < 3 || *targetFD < 3 || *marker == "" {
+		return 2
+	}
+	if err := RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, markerContainment{path: *marker}); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 3
+	}
+	return 0
+}
+
+func runFDScanHelperProcess(args []string) int {
+	fs := flag.NewFlagSet("parklaunch-fd-scan", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fdsRaw := fs.String("fds", "", "fds")
+	result := fs.String("result", "", "result")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *result == "" {
+		return 2
+	}
+	open := openFDs(parseFDList(*fdsRaw))
+	raw, err := json.Marshal(open)
+	if err != nil {
+		return 3
+	}
+	if err := os.WriteFile(*result, append(raw, '\n'), 0o600); err != nil {
+		return 4
+	}
+	return 0
+}
+
+func runFDScanHelper(fds []int, result string) ([]int, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	parts := make([]string, 0, len(fds))
+	for _, fd := range fds {
+		parts = append(parts, strconv.Itoa(fd))
+	}
+	cmd := exec.Command(exe,
+		"-test.run=TestParklaunchFDScanHelperProcess",
+		"--",
+		"--fds", strings.Join(parts, ","),
+		"--result", result,
+	)
+	cmd.Env = append(os.Environ(), parklaunchHelperEnv+"="+parklaunchFDScanMode)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("fd scan helper: %w\n%s", err, output)
+	}
+	raw, err := os.ReadFile(result)
+	if err != nil {
+		return nil, err
+	}
+	var open []int
+	if err := json.Unmarshal(raw, &open); err != nil {
+		return nil, err
+	}
+	return open, nil
+}
+
+func readBackendResult(t *testing.T, path string) backendResult {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result backendResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func stopMonitor(t *testing.T, monitor *MonitorProcess) {
+	t.Helper()
+	if monitor == nil || monitor.cmd == nil || monitor.cmd.Process == nil {
+		return
+	}
+	if monitor.cmd.ProcessState != nil && monitor.cmd.ProcessState.Exited() {
+		return
+	}
+	select {
+	case <-monitor.done:
+		return
+	default:
+	}
+	_ = closeMonitorTarget(monitor)
+	_ = monitor.cmd.Process.Kill()
+	select {
+	case <-monitor.done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("monitor pid %d did not exit", monitor.PID)
+	}
+}
+
+func waitMonitorSuccess(t *testing.T, monitor *MonitorProcess) {
+	t.Helper()
+	select {
+	case err := <-monitor.done:
+		if err != nil {
+			t.Fatalf("monitor wait error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("monitor pid %d timed out", monitor.PID)
+	}
+}
+
+func waitGroupAbsent(ctx context.Context, group model.GroupRef) error {
+	claim, err := procgroup.NewGroupClaim(group.PGID, group.KernelDomain())
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if observed := procgroup.ClassifyGroup(claim); observed == model.GroupAbsent {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for group %d absence", group.PGID)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+func syntheticGroupRef(pgid, monitorPID int) model.GroupRef {
+	attempt := model.AttemptRef{JobID: "job-monitor", AttemptID: "attempt-monitor", Epoch: 1}
+	return model.GroupRef{
+		Version:           1,
+		CustodyID:         "custody-monitor",
+		Launch:            model.LaunchKey{Attempt: attempt, Ordinal: model.LaunchOrdinalOne},
+		HostBootID:        "boot-monitor",
+		PIDNamespaceState: model.PIDNamespaceNotApplicable,
+		PGID:              pgid,
+		Leader:            model.ProcessIdentity{PID: pgid, HighResStartToken: "start-monitor-leader"},
+		Monitor:           model.ProcessIdentity{PID: monitorPID, HighResStartToken: "start-monitor-helper"},
+	}
+}
+
+func helperArgs() ([]string, bool) {
+	for i, arg := range os.Args {
+		if arg == "--" {
+			return os.Args[i+1:], true
+		}
+	}
+	return nil, false
+}
+
+func parseFDList(raw string) []int {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	fds := make([]int, 0, len(parts))
+	for _, part := range parts {
+		fd, err := strconv.Atoi(part)
+		if err == nil {
+			fds = append(fds, fd)
+		}
+	}
+	return fds
+}
+
+func openFDs(fds []int) []int {
+	var open []int
+	for _, fd := range fds {
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
+			open = append(open, fd)
+		} else if !errors.Is(err, unix.EBADF) {
+			open = append(open, fd)
+		}
+	}
+	return open
+}
+
+func fdRange(first, last int) []int {
+	out := make([]int, 0, last-first+1)
+	for fd := first; fd <= last; fd++ {
+		out = append(out, fd)
+	}
+	return out
+}
+
+func readLines(t *testing.T, path string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, "\n")
+}
+
+func dirEntries(entries []os.DirEntry) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
+}
+
+func assertFileAbsent(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err == nil {
+		t.Fatalf("file exists unexpectedly: %s", path)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+}
