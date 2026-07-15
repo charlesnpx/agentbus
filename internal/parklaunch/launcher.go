@@ -33,6 +33,31 @@ var (
 	ErrMonitorNotArmed          = errors.New("parklaunch monitor not armed")
 )
 
+var cleanupTimeout = 3 * time.Second
+
+type ErrUncontainedTargetGroup struct {
+	GroupRef    model.GroupRef
+	Observation model.GroupExistenceObservation
+	Cause       error
+}
+
+func (err *ErrUncontainedTargetGroup) Error() string {
+	if err == nil {
+		return "fatal uncontained target group"
+	}
+	if err.Cause == nil {
+		return fmt.Sprintf("fatal uncontained target group pgid=%d observation=%s", err.GroupRef.PGID, err.Observation)
+	}
+	return fmt.Sprintf("fatal uncontained target group pgid=%d observation=%s: %v", err.GroupRef.PGID, err.Observation, err.Cause)
+}
+
+func (err *ErrUncontainedTargetGroup) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Cause
+}
+
 // Containment is the narrow cleanup dependency injected by S3A/S3B later. It
 // must not mint quiescence proofs or write durable state from this package.
 type Containment interface {
@@ -193,6 +218,7 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("start monitor: %w", err)
 	}
+	monitor.configureStopCleanup(spec.Containment, spec.identity)
 	var group model.GroupRef
 	launchSucceeded := false
 	monitorArmed := false
@@ -581,7 +607,7 @@ func readParkFrame(ctx context.Context, reader *parkproto.Reader) (parkproto.Rec
 }
 
 func cleanupContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 3*time.Second)
+	return context.WithTimeout(context.Background(), cleanupTimeout)
 }
 
 func failClosed(containment Containment, group model.GroupRef, cause error) error {
@@ -606,7 +632,7 @@ func cleanupArmedMonitorFailure(containment Containment, reader identityReader, 
 	if err := containTargetGroup(containment, group); err != nil {
 		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("contain target group: %w", err))
 	}
-	if err := waitArmedMonitorCleanup(reader, monitor, group); err != nil {
+	if err := waitArmedMonitorCleanup(containment, reader, monitor, group); err != nil {
 		cleanupErr = errors.Join(cleanupErr, err)
 	}
 	return cleanupErr
@@ -621,60 +647,97 @@ func containTargetGroup(containment Containment, group model.GroupRef) error {
 	return containment.Contain(ctx, group)
 }
 
-func waitArmedMonitorCleanup(reader identityReader, monitor *MonitorProcess, group model.GroupRef) error {
-	if monitor == nil || monitor.wait == nil {
-		return nil
-	}
+func waitArmedMonitorCleanup(containment Containment, reader identityReader, monitor *MonitorProcess, group model.GroupRef) error {
 	if reader == nil {
 		reader = nativeIdentityReader{}
 	}
 	ctx, cancel := cleanupContext()
 	defer cancel()
+	observation := observeArmedMonitorCleanup(ctx, reader, monitor, group)
+	if observation.absent {
+		reapCtx, reapCancel := cleanupContext()
+		defer reapCancel()
+		return waitMonitorExitAfterTargetAbsent(reapCtx, monitor)
+	}
+
+	containErr := containTargetGroup(containment, group)
+	reobserveCtx, reobserveCancel := cleanupContext()
+	defer reobserveCancel()
+	lastObservation, absent := waitTargetGroupAbsent(reobserveCtx, reader, group)
+	if !absent {
+		return &ErrUncontainedTargetGroup{
+			GroupRef:    group,
+			Observation: lastObservation,
+			Cause: errors.Join(
+				observation.err,
+				observation.monitorErr,
+				containErr,
+			),
+		}
+	}
+	reapCtx, reapCancel := cleanupContext()
+	defer reapCancel()
+	return waitMonitorExitAfterTargetAbsent(reapCtx, monitor)
+}
+
+type armedMonitorCleanupObservation struct {
+	absent          bool
+	monitorExited   bool
+	monitorErr      error
+	lastObservation model.GroupExistenceObservation
+	err             error
+}
+
+func observeArmedMonitorCleanup(ctx context.Context, reader identityReader, monitor *MonitorProcess, group model.GroupRef) armedMonitorCleanupObservation {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 
-	monitorExited := false
-	var monitorErr error
-	lastObservation := model.GroupExistenceUnknown
+	result := armedMonitorCleanupObservation{lastObservation: model.GroupExistenceUnknown}
 	for {
-		lastObservation = targetGroupObservation(reader, group)
-		if lastObservation == model.GroupAbsent {
-			if monitorExited {
-				if monitorErr != nil {
-					return fmt.Errorf("armed monitor exited after target absence: %w", monitorErr)
-				}
-				return nil
-			}
-			if err := waitMonitorExitAfterTargetAbsent(ctx, monitor); err != nil {
-				return fmt.Errorf("reap armed monitor after target absence: %w", err)
-			}
-			return nil
+		result.lastObservation = targetGroupObservation(reader, group)
+		if result.lastObservation == model.GroupAbsent {
+			result.absent = true
+			return result
 		}
-		if monitorExited && monitorErr != nil {
-			return fmt.Errorf("armed monitor exited before target absence: %w", monitorErr)
-		}
-
-		if monitorExited {
+		if !result.monitorExited && monitor != nil && monitor.wait != nil {
 			select {
-			case <-ctx.Done():
-				return fmt.Errorf("timeout waiting for target group absence after armed monitor exit; observation=%s", lastObservation)
-			case <-ticker.C:
+			case <-monitor.Done():
+				result.monitorExited = true
+				result.monitorErr = monitor.Wait()
+				result.lastObservation = targetGroupObservation(reader, group)
+				if result.lastObservation == model.GroupAbsent {
+					result.absent = true
+				}
+				return result
+			default:
 			}
-			continue
 		}
-
 		select {
-		case <-monitor.Done():
-			monitorExited = true
-			monitorErr = monitor.Wait()
 		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for armed monitor cleanup; target group observation=%s", lastObservation)
+			result.err = fmt.Errorf("timeout waiting for armed monitor cleanup; target group observation=%s: %w", result.lastObservation, ctx.Err())
+			return result
 		case <-ticker.C:
+		case <-monitorDone(monitor):
+			if !result.monitorExited && monitor != nil && monitor.wait != nil {
+				result.monitorExited = true
+				result.monitorErr = monitor.Wait()
+				result.lastObservation = targetGroupObservation(reader, group)
+				if result.lastObservation == model.GroupAbsent {
+					result.absent = true
+				}
+				return result
+			}
 		}
 	}
 }
 
 func targetGroupObservation(reader identityReader, group model.GroupRef) model.GroupExistenceObservation {
+	if reader == nil {
+		reader = nativeIdentityReader{}
+	}
 	claim, err := procgroup.NewGroupClaim(group.PGID, group.KernelDomain())
 	if err != nil {
 		return model.GroupExistenceUnknown
@@ -682,18 +745,50 @@ func targetGroupObservation(reader identityReader, group model.GroupRef) model.G
 	return reader.ClassifyGroup(claim)
 }
 
+func waitTargetGroupAbsent(ctx context.Context, reader identityReader, group model.GroupRef) (model.GroupExistenceObservation, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	lastObservation := model.GroupExistenceUnknown
+	for {
+		lastObservation = targetGroupObservation(reader, group)
+		if lastObservation == model.GroupAbsent {
+			return lastObservation, true
+		}
+		select {
+		case <-ctx.Done():
+			return lastObservation, false
+		case <-ticker.C:
+		}
+	}
+}
+
+func monitorDone(process *MonitorProcess) <-chan struct{} {
+	if process == nil || process.wait == nil {
+		return nil
+	}
+	return process.Done()
+}
+
 func waitMonitorExitAfterTargetAbsent(ctx context.Context, process *MonitorProcess) error {
 	if process == nil || process.wait == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	select {
 	case <-process.Done():
-		return process.Wait()
+		_ = process.Wait()
+		return nil
 	default:
 	}
 	select {
 	case <-process.Done():
-		return process.Wait()
+		_ = process.Wait()
+		return nil
 	case <-ctx.Done():
 	}
 	killErr := process.kill()
@@ -701,9 +796,13 @@ func waitMonitorExitAfterTargetAbsent(ctx context.Context, process *MonitorProce
 	defer timer.Stop()
 	select {
 	case <-process.Done():
-		return errors.Join(ctx.Err(), killErr, process.Wait())
+		_ = process.Wait()
+		return killErr
 	case <-timer.C:
-		return errors.Join(ctx.Err(), killErr)
+		if killErr == nil {
+			return fmt.Errorf("timeout waiting for monitor exit after target absence")
+		}
+		return killErr
 	}
 }
 

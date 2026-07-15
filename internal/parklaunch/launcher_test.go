@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -270,6 +271,167 @@ func TestMonitorStopConcurrentWithWaitIsRaceFree(t *testing.T) {
 	lines := readLines(t, marker)
 	if len(lines) != 1 {
 		t.Fatalf("monitor containment lines = %d (%v), want 1", len(lines), lines)
+	}
+}
+
+func TestMonitorStopCanceledContextWaitsForAbsenceBeforeKillingArmedMonitor(t *testing.T) {
+	withCleanupTimeout(t, 300*time.Millisecond)
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}, Hold: 5 * time.Second})
+	fixture.spec.Monitor.Command = monitorCommandWithOptions(t, fixture.monitorMarker, monitorCommandOptions{Delay: 2 * time.Second})
+	containment := &delayedRecordingContainment{
+		delay:   100 * time.Millisecond,
+		started: make(chan struct{}),
+	}
+	fixture.spec.Containment = containment
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupParkedHandle(t, handle)
+	waitBackendResult(t, fixture.backend.ResultPath)
+	target, _, reader, armed := handle.Monitor.armedCleanupState()
+	if !armed {
+		t.Fatal("monitor was not marked armed after Launch")
+	}
+	if observed := targetGroupObservation(reader, target); observed != model.GroupLive {
+		t.Fatalf("target group observation after Launch = %s, want %s", observed, model.GroupLive)
+	}
+
+	var killCount atomic.Int32
+	var killedBeforeAbsent atomic.Bool
+	handle.Monitor.killFunc = func(process *os.Process) error {
+		killCount.Add(1)
+		if !containment.AbsentObserved() {
+			killedBeforeAbsent.Store(true)
+		}
+		return process.Kill()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- handle.Monitor.Stop(ctx)
+	}()
+	select {
+	case <-containment.started:
+	case err := <-stopDone:
+		t.Fatalf("Stop() returned before parent containment started: %v; observation=%s", err, targetGroupObservation(reader, target))
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for containment to start")
+	}
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop() returned while containment was mid-flight: %v", err)
+	default:
+	}
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() timed out")
+	}
+	if killedBeforeAbsent.Load() {
+		t.Fatal("armed monitor was killed before target-group absence was observed")
+	}
+	if got := killCount.Load(); got > 1 {
+		t.Fatalf("monitor kill count = %d, want at most 1", got)
+	}
+	if err := waitGroupAbsent(context.Background(), handle.GroupRef); err != nil {
+		t.Fatalf("target group still present after Stop: %v", err)
+	}
+}
+
+func TestLaunchReturnsFatalWhenArmedCleanupCannotProveAbsence(t *testing.T) {
+	withCleanupTimeout(t, 100*time.Millisecond)
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}, Hold: 5 * time.Second})
+	parentContainment := &failingContainment{err: errors.New("synthetic parent containment failure")}
+	fixture.spec.Containment = parentContainment
+	fixture.spec.hooks.afterRelease = func(snapshot launchControlSnapshot) error {
+		waitBackendResult(t, fixture.backend.ResultPath)
+		return snapshot.ControlRead.Close()
+	}
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err == nil {
+		cleanupParkedHandle(t, handle)
+		t.Fatal("Launch() succeeded; want fatal uncontained group error")
+	}
+	if !errors.Is(err, ErrReleaseAck) {
+		t.Fatalf("Launch() error = %v, want ErrReleaseAck joined", err)
+	}
+	var fatal *ErrUncontainedTargetGroup
+	if !errors.As(err, &fatal) {
+		t.Fatalf("Launch() error = %v, want *ErrUncontainedTargetGroup", err)
+	}
+	if fatal.GroupRef.PGID == 0 {
+		t.Fatalf("fatal GroupRef was not populated: %+v", fatal.GroupRef)
+	}
+	if fatal.Observation != model.GroupLive {
+		t.Fatalf("fatal observation = %s, want %s", fatal.Observation, model.GroupLive)
+	}
+	waitPIDAbsent(t, fatal.GroupRef.Monitor.PID)
+	if calls := parentContainment.Calls(); len(calls) < 2 {
+		t.Fatalf("parent containment calls = %d, want initial attempt and fresh fallback", len(calls))
+	}
+	err = unix.Kill(-fatal.GroupRef.PGID, unix.SIGKILL)
+	if err != nil && !errors.Is(err, unix.ESRCH) {
+		t.Fatalf("cleanup kill backend group %d: %v", fatal.GroupRef.PGID, err)
+	}
+	if err := waitGroupAbsent(context.Background(), fatal.GroupRef); err != nil {
+		t.Fatalf("cleanup backend group: %v", err)
+	}
+}
+
+func TestMonitorStopConcurrentCallersShareSingleKillResult(t *testing.T) {
+	cmd := exec.Command("sleep", "5")
+	cmd.SysProcAttr = newProcessGroupSysProcAttr()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep helper: %v", err)
+	}
+	monitor := &MonitorProcess{
+		PID:     cmd.Process.Pid,
+		process: cmd.Process,
+		wait:    startProcessWait(cmd),
+	}
+	t.Cleanup(func() {
+		_ = monitor.kill()
+		_ = monitor.Wait()
+	})
+	var killCount atomic.Int32
+	monitor.killFunc = func(process *os.Process) error {
+		killCount.Add(1)
+		return process.Kill()
+	}
+
+	const callers = 32
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			<-start
+			if i%3 == 0 {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				results <- monitor.Stop(ctx)
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+			defer cancel()
+			results <- monitor.Stop(ctx)
+		}(i)
+	}
+	close(start)
+	for i := 0; i < callers; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("Stop() caller %d error = %v", i, err)
+		}
+	}
+	if got := killCount.Load(); got != 1 {
+		t.Fatalf("process kill count = %d, want 1", got)
 	}
 }
 
@@ -580,6 +742,16 @@ func monitorCommand(t *testing.T, marker string) CommandSpec {
 
 func monitorCommandWithKill(t *testing.T, marker string, kill bool) CommandSpec {
 	t.Helper()
+	return monitorCommandWithOptions(t, marker, monitorCommandOptions{Kill: kill})
+}
+
+type monitorCommandOptions struct {
+	Kill  bool
+	Delay time.Duration
+}
+
+func monitorCommandWithOptions(t *testing.T, marker string, opts monitorCommandOptions) CommandSpec {
+	t.Helper()
 	exe := testBinaryPath(t)
 	return CommandSpec{
 		Path: exe,
@@ -591,7 +763,8 @@ func monitorCommandWithKill(t *testing.T, marker string, kill bool) CommandSpec 
 			"--target-fd", strconv.Itoa(MonitorTargetFD),
 			"--ready-fd", strconv.Itoa(MonitorReadyFD),
 			"--marker", marker,
-			"--kill", strconv.FormatBool(kill),
+			"--kill=" + strconv.FormatBool(opts.Kill),
+			"--delay-ms", strconv.FormatInt(opts.Delay.Milliseconds(), 10),
 		},
 		Env: append(os.Environ(), parklaunchHelperEnv+"="+parklaunchMonitorMode),
 		Dir: filepath.Dir(exe),
@@ -671,6 +844,15 @@ func testBinaryPath(t *testing.T) string {
 	return exe
 }
 
+func withCleanupTimeout(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	previous := cleanupTimeout
+	cleanupTimeout = timeout
+	t.Cleanup(func() {
+		cleanupTimeout = previous
+	})
+}
+
 type recordingContainment struct {
 	mu     sync.Mutex
 	groups []model.GroupRef
@@ -707,6 +889,44 @@ func (containment *recordingContainment) WaitAbsent(t *testing.T) {
 			t.Fatalf("group %d still present after containment: %v", group.PGID, err)
 		}
 	}
+}
+
+type delayedRecordingContainment struct {
+	mu        sync.Mutex
+	groups    []model.GroupRef
+	delay     time.Duration
+	started   chan struct{}
+	startOnce sync.Once
+	absent    atomic.Bool
+}
+
+func (containment *delayedRecordingContainment) Contain(ctx context.Context, group model.GroupRef) error {
+	containment.mu.Lock()
+	containment.groups = append(containment.groups, group)
+	containment.mu.Unlock()
+	containment.startOnce.Do(func() {
+		close(containment.started)
+	})
+	if containment.delay > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(containment.delay):
+		}
+	}
+	err := unix.Kill(-group.PGID, unix.SIGKILL)
+	if err != nil && !errors.Is(err, unix.ESRCH) {
+		return err
+	}
+	if err := waitGroupAbsent(ctx, group); err != nil {
+		return err
+	}
+	containment.absent.Store(true)
+	return nil
+}
+
+func (containment *delayedRecordingContainment) AbsentObserved() bool {
+	return containment.absent.Load()
 }
 
 type failingContainment struct {
@@ -765,8 +985,9 @@ func (reader workerOnlyIdentityReader) ReadProcessClaim(pid int) (procgroup.Proc
 }
 
 type markerContainment struct {
-	path string
-	kill bool
+	path  string
+	kill  bool
+	delay time.Duration
 }
 
 func (containment markerContainment) Contain(ctx context.Context, group model.GroupRef) error {
@@ -778,6 +999,13 @@ func (containment markerContainment) Contain(ctx context.Context, group model.Gr
 	defer file.Close()
 	if _, err := file.WriteString(line); err != nil {
 		return err
+	}
+	if containment.delay > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(containment.delay):
+		}
 	}
 	if !containment.kill {
 		return nil
@@ -832,13 +1060,14 @@ func runMonitorHelper(args []string) int {
 	readyFD := fs.Int("ready-fd", -1, "ready fd")
 	marker := fs.String("marker", "", "containment marker")
 	kill := fs.Bool("kill", false, "kill target group")
+	delayMillis := fs.Int("delay-ms", 0, "delay before containment completes")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *daemonFD < 3 || *targetFD < 3 || *readyFD < 3 || *marker == "" {
 		return 2
 	}
-	if err := RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, *readyFD, markerContainment{path: *marker, kill: *kill}); err != nil {
+	if err := RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, *readyFD, markerContainment{path: *marker, kill: *kill, delay: time.Duration(*delayMillis) * time.Millisecond}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 3
 	}

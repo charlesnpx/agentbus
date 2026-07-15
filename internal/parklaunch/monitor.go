@@ -49,6 +49,12 @@ type MonitorProcess struct {
 	filesMu     sync.Mutex
 	stopOnce    sync.Once
 	stopErr     error
+	stateMu     sync.Mutex
+	stopTarget  model.GroupRef
+	stopArmed   bool
+	stopContain Containment
+	stopReader  identityReader
+	killFunc    func(*os.Process) error
 	bindOnce    sync.Once
 	bindErr     error
 }
@@ -80,14 +86,11 @@ func (process *MonitorProcess) Stop(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	_ = ctx
 	process.stopOnce.Do(func() {
-		process.stopErr = errors.Join(
-			closeMonitorTarget(process),
-			closeMonitorReady(process),
-			closeMonitorDaemonControl(process),
-		)
+		process.stopErr = process.stopShared()
 	})
-	return errors.Join(process.stopErr, process.waitOrKillAfterContext(ctx, 100*time.Millisecond))
+	return process.stopErr
 }
 
 func (process *MonitorProcess) BindTarget(group model.GroupRef) error {
@@ -120,11 +123,65 @@ func (process *MonitorProcess) BindTarget(group model.GroupRef) error {
 			process.targetWrite = nil
 			process.filesMu.Unlock()
 			process.bindErr = targetWrite.Close()
+			if process.bindErr == nil {
+				process.recordBoundTarget(group)
+			}
 			return
 		}
 		process.filesMu.Unlock()
 	})
 	return process.bindErr
+}
+
+func (process *MonitorProcess) configureStopCleanup(containment Containment, reader identityReader) {
+	if process == nil {
+		return
+	}
+	process.stateMu.Lock()
+	process.stopContain = containment
+	process.stopReader = reader
+	process.stateMu.Unlock()
+}
+
+func (process *MonitorProcess) recordBoundTarget(group model.GroupRef) {
+	process.stateMu.Lock()
+	process.stopTarget = group
+	process.stateMu.Unlock()
+}
+
+func (process *MonitorProcess) markArmed() {
+	process.stateMu.Lock()
+	defer process.stateMu.Unlock()
+	if process.stopTarget.Validate() == nil {
+		process.stopArmed = true
+	}
+}
+
+func (process *MonitorProcess) armedCleanupState() (model.GroupRef, Containment, identityReader, bool) {
+	process.stateMu.Lock()
+	defer process.stateMu.Unlock()
+	if !process.stopArmed || process.stopTarget.Validate() != nil {
+		return model.GroupRef{}, nil, nil, false
+	}
+	return process.stopTarget, process.stopContain, process.stopReader, true
+}
+
+func (process *MonitorProcess) stopShared() error {
+	target, containment, reader, armed := process.armedCleanupState()
+	if armed {
+		return errors.Join(
+			closeMonitorDaemonControl(process),
+			closeMonitorTarget(process),
+			closeMonitorReady(process),
+			waitArmedMonitorCleanup(containment, reader, process, target),
+		)
+	}
+	return errors.Join(
+		closeMonitorTarget(process),
+		closeMonitorReady(process),
+		closeMonitorDaemonControl(process),
+		process.waitOrKillNotArmed(100*time.Millisecond),
+	)
 }
 
 // StartMonitorProcess starts a one-shot monitor helper in its own process
@@ -241,6 +298,7 @@ func (process *MonitorProcess) WaitReady(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("%w: read readiness ack: %v", ErrMonitorNotArmed, err)
 		}
+		process.markArmed()
 		return nil
 	case <-process.Done():
 		return fmt.Errorf("%w: monitor exited before readiness: %v", ErrMonitorNotArmed, process.Wait())
@@ -470,33 +528,39 @@ func (process *MonitorProcess) kill() error {
 		return nil
 	default:
 	}
+	if process.killFunc != nil {
+		return process.killFunc(process.process)
+	}
 	return process.process.Kill()
 }
 
-func (process *MonitorProcess) waitOrKillAfterContext(ctx context.Context, killWait time.Duration) error {
+func (process *MonitorProcess) waitOrKillNotArmed(grace time.Duration) error {
 	if process == nil || process.wait == nil {
 		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
 	}
 	select {
 	case <-process.Done():
 		return process.Wait()
 	default:
 	}
+	timer := time.NewTimer(grace)
 	select {
 	case <-process.Done():
+		timer.Stop()
 		return process.Wait()
-	case <-ctx.Done():
+	case <-timer.C:
 	}
 	killErr := process.kill()
-	timer := time.NewTimer(killWait)
-	defer timer.Stop()
+	waitTimer := time.NewTimer(grace)
+	defer waitTimer.Stop()
 	select {
 	case <-process.Done():
-		return errors.Join(ctx.Err(), killErr, process.Wait())
-	case <-timer.C:
-		return errors.Join(ctx.Err(), killErr)
+		waitErr := process.Wait()
+		if killErr == nil {
+			return nil
+		}
+		return errors.Join(killErr, waitErr)
+	case <-waitTimer.C:
+		return killErr
 	}
 }
