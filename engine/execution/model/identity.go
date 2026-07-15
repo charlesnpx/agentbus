@@ -194,6 +194,12 @@ func (id KernelDomainID) Validate() error {
 }
 
 func (id KernelDomainID) Equal(other KernelDomainID) bool {
+	return id.HostBootID == other.HostBootID &&
+		id.PIDNamespaceID == other.PIDNamespaceID &&
+		id.PIDNamespaceState == other.PIDNamespaceState
+}
+
+func (id KernelDomainID) ProvablySame(other KernelDomainID) bool {
 	relation, err := compareKernelDomain(id, other)
 	if err != nil {
 		return false

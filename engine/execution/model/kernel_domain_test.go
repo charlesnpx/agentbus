@@ -23,8 +23,11 @@ func TestKernelDomainIDValidateAndEqual(t *testing.T) {
 	if err := unknown.Validate(); err != nil {
 		t.Fatalf("Validate() with unknown pid namespace error = %v", err)
 	}
-	if unknown.Equal(KernelDomainID{HostBootID: "host-boot-1"}) {
-		t.Fatalf("Equal() = true for matching unknown namespace domain")
+	if !unknown.Equal(KernelDomainID{HostBootID: "host-boot-1"}) {
+		t.Fatalf("Equal() = false for matching unknown namespace domain")
+	}
+	if unknown.ProvablySame(KernelDomainID{HostBootID: "host-boot-1"}) {
+		t.Fatalf("ProvablySame() = true for matching unknown namespace domain")
 	}
 	noNamespace := KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceState: PIDNamespaceNotApplicable}
 	if err := noNamespace.Validate(); err != nil {
@@ -32,6 +35,9 @@ func TestKernelDomainIDValidateAndEqual(t *testing.T) {
 	}
 	if !noNamespace.Equal(KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceState: PIDNamespaceNotApplicable}) {
 		t.Fatalf("Equal() = false for matching no-namespace platform domain")
+	}
+	if !noNamespace.ProvablySame(KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceState: PIDNamespaceNotApplicable}) {
+		t.Fatalf("ProvablySame() = false for matching no-namespace platform domain")
 	}
 	if withNamespace, err := NewKernelDomainID("host-boot-1", "pidns-1"); err != nil {
 		t.Fatalf("NewKernelDomainID() error = %v", err)
@@ -66,6 +72,23 @@ func TestGroupRefEqualUsesCanonicalKernelDomain(t *testing.T) {
 	if !left.KernelDomain().Equal(right.KernelDomain()) {
 		t.Fatal("KernelDomain().Equal() = false for identical known kernel domain")
 	}
+
+	legacyLeft := left
+	legacyLeft.PIDNamespaceID = ""
+	legacyLeft.PIDNamespaceState = PIDNamespaceUnknown
+	legacyRight := legacyLeft
+	if !legacyLeft.Equal(legacyRight) {
+		t.Fatal("GroupRef.Equal() = false for identical unknown kernel domain")
+	}
+	if legacyLeft.SamePhysicalIdentity(legacyRight) {
+		t.Fatal("SamePhysicalIdentity() = true for identical unknown kernel domain")
+	}
+	if !legacyLeft.KernelDomain().Equal(legacyRight.KernelDomain()) {
+		t.Fatal("KernelDomain().Equal() = false for identical unknown kernel domain")
+	}
+	if legacyLeft.KernelDomain().ProvablySame(legacyRight.KernelDomain()) {
+		t.Fatal("KernelDomain().ProvablySame() = true for identical unknown kernel domain")
+	}
 }
 
 func TestGroupRefDecodeLegacyHostBootOnlyUsesUnknownPIDNamespace(t *testing.T) {
@@ -97,6 +120,19 @@ func TestGroupRefDecodeLegacyHostBootOnlyUsesUnknownPIDNamespace(t *testing.T) {
 	}
 	if err := decoded.Validate(); err != nil {
 		t.Fatalf("decoded legacy GroupRef Validate() error = %v", err)
+	}
+	record := validSafetyRecord()
+	decoded.Launch.Attempt = record.Attempt.Ref
+	record.Attempt.Launches.First.Group = &decoded
+	record.Attempt.Launches.First.Quiescence = &QuiescenceCertificate{
+		Attempt:     record.Attempt.Ref,
+		Ordinal:     LaunchOrdinalOne,
+		Group:       decoded,
+		Method:      QuiescenceAlreadyAbsent,
+		CertifiedBy: record.AdmittedBy,
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatalf("legacy unknown GroupRef failed safety internal-consistency validation: %v", err)
 	}
 	decision, err := DecideGroupRecovery(decoded, liveMatchingObservation(KernelDomainID{
 		HostBootID:        decoded.HostBootID,

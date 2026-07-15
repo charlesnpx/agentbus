@@ -250,7 +250,7 @@ func (ref GroupRef) KernelDomain() KernelDomainID {
 }
 
 func (ref GroupRef) SamePhysicalIdentity(other GroupRef) bool {
-	return ref.KernelDomain().Equal(other.KernelDomain()) &&
+	return ref.KernelDomain().ProvablySame(other.KernelDomain()) &&
 		(ref.PGID == other.PGID || ref.Leader.Equal(other.Leader))
 }
 

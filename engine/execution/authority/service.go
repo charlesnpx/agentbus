@@ -99,12 +99,19 @@ type ApplyResult struct {
 type ApplyOption func(*applyConfig)
 
 type applyConfig struct {
-	sessionID string
+	sessionID          string
+	afterAnchorForTest func() error
 }
 
 func WithApplySessionID(sessionID string) ApplyOption {
 	return func(config *applyConfig) {
 		config.sessionID = sessionID
+	}
+}
+
+func withApplyAfterAnchorForTest(fn func() error) ApplyOption {
+	return func(config *applyConfig) {
+		config.afterAnchorForTest = fn
 	}
 }
 
@@ -238,6 +245,9 @@ func (r *Ready) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal
 	if terminalCommitted {
 		r.core.runtime.releaseTerminal(jobID)
 	}
+	if config.afterAnchorForTest != nil {
+		return result, config.afterAnchorForTest()
+	}
 	return result, nil
 }
 
@@ -286,6 +296,9 @@ func (r *Ready) apply(ctx context.Context, jobID model.JobID, command model.Comm
 	result.Durability = ClassifyDurableMutationOutcome(DBCommitted, true)
 	if terminalCommitted {
 		r.core.runtime.releaseTerminal(jobID)
+	}
+	if config.afterAnchorForTest != nil {
+		return result, config.afterAnchorForTest()
 	}
 	return result, nil
 }

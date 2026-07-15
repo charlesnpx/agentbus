@@ -223,7 +223,8 @@ func TestReadyApplySurfacesCommitOutcomeUnknownOnRealBboltCommitPhaseFault(t *te
 	ctx := context.Background()
 	ready, repo, _ := newBboltDurabilityReady(t, "real-bbolt-commit-phase")
 	run := prepareDurabilityMutation(t, ctx, ready, durabilityMutationBindGroup, "real-bbolt-commit-phase")
-	if err := repo.failCommitAfterCallbackForTest(errors.New("commit fsync failed")); err != nil {
+	beforeGeneration := repositoryGeneration(t, repo)
+	if err := repo.failCommitAfterCommitForTest(errors.New("commit fsync failed")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,6 +237,10 @@ func TestReadyApplySurfacesCommitOutcomeUnknownOnRealBboltCommitPhaseFault(t *te
 	}
 	if action := SafeActionForGrantDurability(applied.Durability); action != ContainFailStop {
 		t.Fatalf("SafeActionForGrantDurability() = %v, want %v", action, ContainFailStop)
+	}
+	afterGeneration := repositoryGeneration(t, repo)
+	if afterGeneration <= beforeGeneration {
+		t.Fatalf("repository generation = %d, want > %d", afterGeneration, beforeGeneration)
 	}
 }
 
@@ -267,7 +272,7 @@ func TestReadyDurabilityOutcomesAcrossMutationFailpoints(t *testing.T) {
 			wantAction:  ContainFailStop,
 		},
 		{
-			point:       durabilityFaultAnchorBegin,
+			point:       durabilityFaultReadyVerification,
 			wantErr:     true,
 			wantOutcome: DefinitelyNotCommitted,
 			wantAction:  Proceed,
@@ -286,6 +291,7 @@ func TestReadyDurabilityOutcomesAcrossMutationFailpoints(t *testing.T) {
 		},
 		{
 			point:       durabilityFaultBeforeReturn,
+			wantErr:     true,
 			wantOutcome: CommittedAndAnchored,
 			wantAction:  Proceed,
 		},
@@ -295,7 +301,7 @@ func TestReadyDurabilityOutcomesAcrossMutationFailpoints(t *testing.T) {
 		for _, tt := range failpoints {
 			t.Run(string(mutation)+"/"+string(tt.point), func(t *testing.T) {
 				ready, repo, anchorStore := newBboltDurabilityReady(t, string(mutation)+"-"+string(tt.point))
-				run := prepareDurabilityMutation(t, ctx, ready, mutation, string(tt.point))
+				run := prepareDurabilityMutation(t, ctx, ready, mutation, string(tt.point), applyOptionsForDurabilityFault(tt.point)...)
 				beforeGeneration := repositoryGeneration(t, repo)
 				injectDurabilityFault(t, ready, repo, anchorStore, tt.point)
 
@@ -311,11 +317,11 @@ func TestReadyDurabilityOutcomesAcrossMutationFailpoints(t *testing.T) {
 				}
 				afterGeneration := repositoryGeneration(t, repo)
 				switch tt.point {
-				case durabilityFaultAnchorAdvance, durabilityFaultAnchorComplete, durabilityFaultBeforeReturn:
+				case durabilityFaultPostDBCommit, durabilityFaultAnchorAdvance, durabilityFaultAnchorComplete, durabilityFaultBeforeReturn:
 					if afterGeneration <= beforeGeneration {
 						t.Fatalf("repository generation = %d, want > %d", afterGeneration, beforeGeneration)
 					}
-				case durabilityFaultPreDBCommit, durabilityFaultPostDBCommit, durabilityFaultAnchorBegin:
+				case durabilityFaultPreDBCommit, durabilityFaultReadyVerification:
 					if afterGeneration != beforeGeneration {
 						t.Fatalf("repository generation = %d, want unchanged %d", afterGeneration, beforeGeneration)
 					}
@@ -401,12 +407,12 @@ const (
 type durabilityFaultPoint string
 
 const (
-	durabilityFaultPreDBCommit    durabilityFaultPoint = "pre-db-commit"
-	durabilityFaultPostDBCommit   durabilityFaultPoint = "post-db-commit"
-	durabilityFaultAnchorBegin    durabilityFaultPoint = "anchor-begin"
-	durabilityFaultAnchorAdvance  durabilityFaultPoint = "anchor-advance"
-	durabilityFaultAnchorComplete durabilityFaultPoint = "anchor-complete"
-	durabilityFaultBeforeReturn   durabilityFaultPoint = "before-return"
+	durabilityFaultPreDBCommit       durabilityFaultPoint = "pre-db-commit"
+	durabilityFaultPostDBCommit      durabilityFaultPoint = "post-db-commit"
+	durabilityFaultReadyVerification durabilityFaultPoint = "ready-verification"
+	durabilityFaultAnchorAdvance     durabilityFaultPoint = "anchor-advance"
+	durabilityFaultAnchorComplete    durabilityFaultPoint = "anchor-complete"
+	durabilityFaultBeforeReturn      durabilityFaultPoint = "before-return"
 )
 
 var errInjectedDurabilityFault = errors.New("injected durability fault")
@@ -429,14 +435,14 @@ func (r *durabilityFaultingRepository) Update(ctx context.Context, fn func(repos
 	}
 }
 
-func (r *durabilityFaultingRepository) failCommitAfterCallbackForTest(err error) error {
+func (r *durabilityFaultingRepository) failCommitAfterCommitForTest(err error) error {
 	faulting, ok := r.inner.(interface {
-		FailCommitAfterCallbackForTest(error)
+		FailCommitAfterCommitForTest(error)
 	})
 	if !ok {
-		return fmt.Errorf("inner repository %T does not expose FailCommitAfterCallbackForTest", r.inner)
+		return fmt.Errorf("inner repository %T does not expose FailCommitAfterCommitForTest", r.inner)
 	}
-	faulting.FailCommitAfterCallbackForTest(err)
+	faulting.FailCommitAfterCommitForTest(err)
 	return nil
 }
 
@@ -457,7 +463,7 @@ type durabilityFaultingAnchor struct {
 
 func (a *durabilityFaultingAnchor) VerifyReady(boot model.BootRef, token string, generation uint64) error {
 	if a.failVerifyReady {
-		return fmt.Errorf("%w: injected anchor-begin failure", ErrAnchorInvariant)
+		return fmt.Errorf("%w: injected ready verification failure", ErrAnchorInvariant)
 	}
 	if verifier, ok := a.Anchor.(anchorVerifier); ok {
 		return verifier.VerifyReady(boot, token, generation)
@@ -489,7 +495,7 @@ func newBboltDurabilityReady(t *testing.T, name string) (*Ready, *durabilityFaul
 	return ready, repo, anchorStore
 }
 
-func prepareDurabilityMutation(t *testing.T, ctx context.Context, ready *Ready, mutation durabilityMutationKind, suffix string) func() (ApplyResult, error) {
+func prepareDurabilityMutation(t *testing.T, ctx context.Context, ready *Ready, mutation durabilityMutationKind, suffix string, options ...ApplyOption) func() (ApplyResult, error) {
 	t.Helper()
 	accepted, err := ready.Accept(ctx, acceptRequest(t, "durability-"+string(mutation)+"-"+suffix))
 	if err != nil {
@@ -500,12 +506,12 @@ func prepareDurabilityMutation(t *testing.T, ctx context.Context, ready *Ready, 
 	switch mutation {
 	case durabilityMutationBindGroup:
 		return func() (ApplyResult, error) {
-			return ready.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group)
+			return ready.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group, options...)
 		}
 	case durabilityMutationCommitGrant:
 		bindDurabilityGroup(t, ctx, ready, accepted, group)
 		return func() (ApplyResult, error) {
-			return ready.CommitGrant(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, model.PermitNonce("nonce-"+suffix))
+			return ready.CommitGrant(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, model.PermitNonce("nonce-"+suffix), options...)
 		}
 	case durabilityMutationRecordRelease:
 		bindDurabilityGroup(t, ctx, ready, accepted, group)
@@ -514,7 +520,7 @@ func prepareDurabilityMutation(t *testing.T, ctx context.Context, ready *Ready, 
 			return ready.RecordRelease(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, model.ChildIdentity{
 				PID:               group.Leader.PID,
 				HighResStartToken: group.Leader.HighResStartToken,
-			}, evidence("launch-"+suffix))
+			}, evidence("launch-"+suffix), options...)
 		}
 	case durabilityMutationFinalize:
 		bindDurabilityGroup(t, ctx, ready, accepted, group)
@@ -526,13 +532,13 @@ func prepareDurabilityMutation(t *testing.T, ctx context.Context, ready *Ready, 
 			return ready.Finalize(ctx, accepted.Record.JobID, ref, model.TerminalIntent{
 				Outcome: model.OutcomeCanceled,
 				Cause:   model.CauseCanceledBeforeAuthorization,
-			})
+			}, options...)
 		}
 	case durabilityMutationRecordQuiescence:
 		bindDurabilityGroup(t, ctx, ready, accepted, group)
 		verified := verifiedQuiescence(t, ready.Boot(), ref, model.LaunchOrdinalOne, group, model.QuiescenceAlreadyAbsent)
 		return func() (ApplyResult, error) {
-			return ready.RecordQuiescence(ctx, accepted.Record.JobID, model.LaunchOrdinalOne, verified)
+			return ready.RecordQuiescence(ctx, accepted.Record.JobID, model.LaunchOrdinalOne, verified, options...)
 		}
 	default:
 		t.Fatalf("unknown durability mutation %q", mutation)
@@ -568,11 +574,11 @@ func injectDurabilityFault(t *testing.T, ready *Ready, repo *durabilityFaultingR
 	case durabilityFaultPreDBCommit, durabilityFaultPostDBCommit:
 		repo.fault = point
 		if point == durabilityFaultPostDBCommit {
-			if err := repo.failCommitAfterCallbackForTest(errInjectedDurabilityFault); err != nil {
+			if err := repo.failCommitAfterCommitForTest(errInjectedDurabilityFault); err != nil {
 				t.Fatal(err)
 			}
 		}
-	case durabilityFaultAnchorBegin:
+	case durabilityFaultReadyVerification:
 		ready.core.anchor = &durabilityFaultingAnchor{Anchor: ready.core.anchor, failVerifyReady: true}
 	case durabilityFaultAnchorAdvance:
 		anchorStore.FailNextForTest(AnchorAdvance, nil)
@@ -582,6 +588,15 @@ func injectDurabilityFault(t *testing.T, ready *Ready, repo *durabilityFaultingR
 	default:
 		t.Fatalf("unknown durability fault point %q", point)
 	}
+}
+
+func applyOptionsForDurabilityFault(point durabilityFaultPoint) []ApplyOption {
+	if point != durabilityFaultBeforeReturn {
+		return nil
+	}
+	return []ApplyOption{withApplyAfterAnchorForTest(func() error {
+		return errInjectedDurabilityFault
+	})}
 }
 
 type repositoryAnchorBoundaryResult struct {

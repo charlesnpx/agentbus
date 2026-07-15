@@ -58,9 +58,9 @@ const (
 
 // Repository is a single-file bbolt implementation of repository.Repository.
 type Repository struct {
-	db                             *bolt.DB
-	testMu                         sync.Mutex
-	failCommitAfterCallbackForTest error
+	db                           *bolt.DB
+	testMu                       sync.Mutex
+	failCommitAfterCommitForTest error
 }
 
 // Open opens or initializes a root bbolt repository database at path. The file
@@ -94,12 +94,16 @@ func (r *Repository) Close() error {
 }
 
 func (r *Repository) FailCommitAfterCallbackForTest(err error) {
+	r.FailCommitAfterCommitForTest(err)
+}
+
+func (r *Repository) FailCommitAfterCommitForTest(err error) {
 	if err == nil {
 		err = fmt.Errorf("injected bbolt commit-phase failure")
 	}
 	r.testMu.Lock()
 	defer r.testMu.Unlock()
-	r.failCommitAfterCallbackForTest = err
+	r.failCommitAfterCommitForTest = err
 }
 
 func (r *Repository) View(ctx context.Context, fn func(repository.ReadTx) error) error {
@@ -122,8 +126,24 @@ func (r *Repository) Update(ctx context.Context, fn func(repository.WriteTx) err
 	if err := ctx.Err(); err != nil {
 		return repository.Commit{}, fmt.Errorf("%w: %w", repository.ErrDefinitelyNotCommitted, err)
 	}
-	callbackOK := false
-	err = r.db.Update(func(tx *bolt.Tx) (txErr error) {
+	tx, err := r.db.Begin(true)
+	if err != nil {
+		return repository.Commit{}, fmt.Errorf("%w: %w", repository.ErrDefinitelyNotCommitted, err)
+	}
+	txClosed := false
+	defer func() {
+		if !txClosed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	txErr := func() (txErr error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				txErr = fmt.Errorf("%w: %v", repository.ErrTransactionPanic, recovered)
+			}
+		}()
+
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -134,47 +154,40 @@ func (r *Repository) Update(ctx context.Context, fn func(repository.WriteTx) err
 		commit = repository.Commit{Generation: state.generation}
 		next := state.clone()
 		write := &writeTx{readTx: readTx{state: &next}}
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				txErr = fmt.Errorf("%w: %v", repository.ErrTransactionPanic, recovered)
-			}
-		}()
 
 		if err := fn(write); err != nil {
 			return err
 		}
-		if !write.changed {
-			callbackOK = true
-			return nil
-		}
-		if err := next.validateForCommit(); err != nil {
-			return err
-		}
-		next.advanceGeneration()
-		if err := persistState(tx, next); err != nil {
-			return err
-		}
-		commit = repository.Commit{Generation: next.generation}
-		callbackOK = true
-		if err := r.consumeCommitAfterCallbackFaultForTest(); err != nil {
-			return err
+		if write.changed {
+			if err := next.validateForCommit(); err != nil {
+				return err
+			}
+			next.advanceGeneration()
+			if err := persistState(tx, next); err != nil {
+				return err
+			}
+			commit = repository.Commit{Generation: next.generation}
 		}
 		return nil
-	})
-	if err != nil {
-		if callbackOK {
-			return commit, fmt.Errorf("%w: %w", repository.ErrAmbiguousCommit, err)
-		}
-		return commit, fmt.Errorf("%w: %w", repository.ErrDefinitelyNotCommitted, err)
+	}()
+	if txErr != nil {
+		return commit, fmt.Errorf("%w: %w", repository.ErrDefinitelyNotCommitted, txErr)
+	}
+	if err := tx.Commit(); err != nil {
+		return commit, fmt.Errorf("%w: %w", repository.ErrAmbiguousCommit, err)
+	}
+	txClosed = true
+	if err := r.consumeCommitAfterCommitFaultForTest(); err != nil {
+		return commit, fmt.Errorf("%w: %w", repository.ErrAmbiguousCommit, err)
 	}
 	return commit, nil
 }
 
-func (r *Repository) consumeCommitAfterCallbackFaultForTest() error {
+func (r *Repository) consumeCommitAfterCommitFaultForTest() error {
 	r.testMu.Lock()
 	defer r.testMu.Unlock()
-	err := r.failCommitAfterCallbackForTest
-	r.failCommitAfterCallbackForTest = nil
+	err := r.failCommitAfterCommitForTest
+	r.failCommitAfterCommitForTest = nil
 	return err
 }
 
