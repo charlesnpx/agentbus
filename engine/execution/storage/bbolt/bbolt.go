@@ -110,6 +110,7 @@ func (r *Repository) Update(ctx context.Context, fn func(repository.WriteTx) err
 	if err := ctx.Err(); err != nil {
 		return repository.Commit{}, err
 	}
+	callbackOK := false
 	err = r.db.Update(func(tx *bolt.Tx) (txErr error) {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -131,6 +132,7 @@ func (r *Repository) Update(ctx context.Context, fn func(repository.WriteTx) err
 			return err
 		}
 		if !write.changed {
+			callbackOK = true
 			return nil
 		}
 		if err := next.validateForCommit(); err != nil {
@@ -141,9 +143,13 @@ func (r *Repository) Update(ctx context.Context, fn func(repository.WriteTx) err
 			return err
 		}
 		commit = repository.Commit{Generation: next.generation}
+		callbackOK = true
 		return nil
 	})
 	if err != nil {
+		if callbackOK {
+			return commit, fmt.Errorf("%w: %v", repository.ErrAmbiguousCommit, err)
+		}
 		return commit, err
 	}
 	return commit, nil

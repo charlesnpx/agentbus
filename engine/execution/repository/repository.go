@@ -14,6 +14,7 @@ var (
 	ErrInvalidRecord      = errors.New("repository invalid record")
 	ErrTransactionPanic   = errors.New("repository transaction panic")
 	ErrProjectionMismatch = errors.New("repository projection mismatch")
+	ErrAmbiguousCommit    = errors.New("repository ambiguous commit")
 )
 
 type Commit struct {

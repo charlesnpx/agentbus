@@ -199,15 +199,7 @@ func (id KernelDomainID) Equal(other KernelDomainID) bool {
 	if err != nil {
 		return false
 	}
-	if relation == kernelDomainSame {
-		return true
-	}
-	if relation != kernelDomainUnprovable || id.HostBootID != other.HostBootID {
-		return false
-	}
-	leftNamespace := normalizePIDNamespace(id.PIDNamespaceID, id.PIDNamespaceState)
-	rightNamespace := normalizePIDNamespace(other.PIDNamespaceID, other.PIDNamespaceState)
-	return leftNamespace.state == PIDNamespaceUnknown && rightNamespace.state == PIDNamespaceUnknown
+	return relation == kernelDomainSame
 }
 
 type normalizedPIDNamespace struct {

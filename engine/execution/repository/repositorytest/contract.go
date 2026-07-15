@@ -498,8 +498,9 @@ func fixtureGroupRef(fixture fixture, ordinal model.LaunchOrdinal) model.GroupRe
 			Attempt: fixture.Record.Attempt.Ref,
 			Ordinal: ordinal,
 		},
-		HostBootID: "host-boot-" + fixture.JobID.String(),
-		PGID:       pgid,
+		HostBootID:        "host-boot-" + fixture.JobID.String(),
+		PIDNamespaceState: model.PIDNamespaceNotApplicable,
+		PGID:              pgid,
 		Leader: model.ProcessIdentity{
 			PID:               pgid,
 			HighResStartToken: "leader-start-" + ordinal.String(),

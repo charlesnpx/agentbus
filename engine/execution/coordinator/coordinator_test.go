@@ -16,6 +16,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
+	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
 )
 
@@ -295,6 +296,43 @@ func TestGrantPermitFailStopsOnUnknownCommitDurability(t *testing.T) {
 	if h.supervisor.permits != 0 {
 		t.Fatalf("permit sends = %d, want 0 after unknown commit durability", h.supervisor.permits)
 	}
+	if h.supervisor.contained != 1 {
+		t.Fatalf("containment calls = %d, want 1 after unknown commit durability", h.supervisor.contained)
+	}
+}
+
+func TestGrantPermitContainsAndFailStopsOnBboltAmbiguousCommit(t *testing.T) {
+	ctx := context.Background()
+	inner, err := bboltrepo.NewRepository(filepath.Join(t.TempDir(), "admission.bbolt"))
+	if err != nil {
+		t.Fatalf("NewRepository() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := inner.Close(); err != nil {
+			t.Fatalf("close bbolt repository: %v", err)
+		}
+	})
+	repo := &ambiguousCommitRepository{Repository: inner}
+	h := newHarnessWithRepo(t, "bbolt-ambiguous-commit", repo)
+	accepted := h.submit(t, ctx, "bbolt-ambiguous-commit")
+	if err := h.coordinator.PrepareSupervisor(ctx, accepted.Record.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	repo.failNext = true
+
+	err = h.coordinator.GrantPermit(ctx, accepted.Record.JobID, 1, model.PermitNonce("nonce-1"), nil)
+	if !errors.Is(err, repository.ErrAmbiguousCommit) {
+		t.Fatalf("GrantPermit error = %v, want ErrAmbiguousCommit", err)
+	}
+	if !h.authority.failStopped {
+		t.Fatal("authority was not fail-stopped after ambiguous bbolt commit")
+	}
+	if h.supervisor.contained != 1 {
+		t.Fatalf("containment calls = %d, want 1 after ambiguous bbolt commit", h.supervisor.contained)
+	}
+	if h.supervisor.permits != 0 {
+		t.Fatalf("permit sends = %d, want 0 after ambiguous bbolt commit", h.supervisor.permits)
+	}
 }
 
 func TestRecordQuiescenceFailStopsOnUnknownCommitDurability(t *testing.T) {
@@ -504,13 +542,17 @@ type harness struct {
 	coordinator *Coordinator
 	supervisor  *testSupervisor
 	results     *testResults
-	repo        *memory.Repository
+	repo        repository.Repository
 	anchorStore *authority.AnchorStore
 }
 
 func newHarness(t *testing.T, name string) *harness {
 	t.Helper()
-	repo := memory.NewRepository()
+	return newHarnessWithRepo(t, name, memory.NewRepository())
+}
+
+func newHarnessWithRepo(t *testing.T, name string, repo repository.Repository) *harness {
+	t.Helper()
 	anchorStore := authority.NewAnchorStore()
 	issuer, verifier := custodian.NewAttestationChannel()
 	bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(verifier))
@@ -544,6 +586,30 @@ func newHarness(t *testing.T, name string) *harness {
 		repo:        repo,
 		anchorStore: anchorStore,
 	}
+}
+
+type ambiguousCommitRepository struct {
+	repository.Repository
+	failNext bool
+}
+
+func (r *ambiguousCommitRepository) Update(ctx context.Context, fn func(repository.WriteTx) error) (repository.Commit, error) {
+	commit, err := r.Repository.Update(ctx, fn)
+	if err != nil || !r.failNext {
+		return commit, err
+	}
+	r.failNext = false
+	return commit, fmt.Errorf("%w: injected bbolt commit ambiguity", repository.ErrAmbiguousCommit)
+}
+
+func (r *ambiguousCommitRepository) AnchorIdentity() (string, uint16, error) {
+	identified, ok := r.Repository.(interface {
+		AnchorIdentity() (string, uint16, error)
+	})
+	if !ok {
+		return "", 0, fmt.Errorf("repository does not expose anchor identity")
+	}
+	return identified.AnchorIdentity()
 }
 
 func (h *harness) submit(t *testing.T, ctx context.Context, name string) AdmissionResult {

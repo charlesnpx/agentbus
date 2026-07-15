@@ -225,7 +225,7 @@ func (r *Ready) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal
 		return nil
 	})
 	if err != nil {
-		result.Durability = ClassifyDurableMutationOutcome(DBDefinitelyNotCommitted, false)
+		result.Durability = ClassifyDurableMutationOutcome(classifyRepositoryCommitError(err), false)
 		return result, err
 	}
 	if err := r.core.advanceReadyLocked(ctx, &r.token, commit.Generation); err != nil {
@@ -274,7 +274,7 @@ func (r *Ready) apply(ctx context.Context, jobID model.JobID, command model.Comm
 		return nil
 	})
 	if err != nil {
-		result.Durability = ClassifyDurableMutationOutcome(DBDefinitelyNotCommitted, false)
+		result.Durability = ClassifyDurableMutationOutcome(classifyRepositoryCommitError(err), false)
 		return result, err
 	}
 	if err := r.core.advanceReadyLocked(ctx, &r.token, commit.Generation); err != nil {
@@ -288,6 +288,13 @@ func (r *Ready) apply(ctx context.Context, jobID model.JobID, command model.Comm
 		r.core.runtime.releaseTerminal(jobID)
 	}
 	return result, nil
+}
+
+func classifyRepositoryCommitError(err error) DBCommitOutcome {
+	if errors.Is(err, repository.ErrAmbiguousCommit) {
+		return DBCommitUnknown
+	}
+	return DBDefinitelyNotCommitted
 }
 
 func (r *Ready) LoadJob(ctx context.Context, jobID model.JobID) (repository.JobImage, error) {

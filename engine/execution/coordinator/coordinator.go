@@ -568,10 +568,39 @@ func (c *Coordinator) failStopOnAmbiguousDurability(ctx context.Context, action 
 	if authority.SafeActionForGrantDurability(result.Durability) != authority.ContainFailStop {
 		return false, nil
 	}
+	containErr := c.containAmbiguousDurability(ctx, result.Record)
+	var reason error
 	if err != nil {
-		return true, c.failStop(ctx, fmt.Errorf("%s durability outcome %d: %w", action, result.Durability, err))
+		reason = fmt.Errorf("%s durability outcome %d: %w", action, result.Durability, err)
+	} else {
+		reason = fmt.Errorf("%s durability outcome %d", action, result.Durability)
 	}
-	return true, c.failStop(ctx, fmt.Errorf("%s durability outcome %d", action, result.Durability))
+	if containErr != nil {
+		reason = errors.Join(reason, fmt.Errorf("contain ambiguous durability: %w", containErr))
+	}
+	return true, c.failStop(ctx, reason)
+}
+
+func (c *Coordinator) containAmbiguousDurability(ctx context.Context, record model.SafetyRecord) error {
+	if c == nil || c.supervisor == nil {
+		return ErrSupervisorRequired
+	}
+	var containErr error
+	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launch, ok := record.Attempt.Launches.Get(ordinal)
+		if !ok || launch.Group == nil || launch.Quiescence != nil {
+			continue
+		}
+		prepared, err := preparedFromRecord(record, ordinal)
+		if err != nil {
+			containErr = errors.Join(containErr, err)
+			continue
+		}
+		if _, err := c.supervisor.Contain(ctx, prepared); err != nil {
+			containErr = errors.Join(containErr, err)
+		}
+	}
+	return containErr
 }
 
 func preparedFromRecord(record model.SafetyRecord, ordinal model.LaunchOrdinal) (PreparedSupervisor, error) {

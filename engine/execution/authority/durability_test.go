@@ -3,10 +3,13 @@ package authority
 import (
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
+	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
 )
 
@@ -166,6 +169,95 @@ func TestReadyApplySurfacesCommitOutcomeUnknownOnAnchorFailure(t *testing.T) {
 	}
 }
 
+func TestReadyDurabilityOutcomesAcrossMutationFailpoints(t *testing.T) {
+	ctx := context.Background()
+	mutations := []durabilityMutationKind{
+		durabilityMutationBindGroup,
+		durabilityMutationCommitGrant,
+		durabilityMutationRecordRelease,
+		durabilityMutationFinalize,
+		durabilityMutationRecordQuiescence,
+	}
+	failpoints := []struct {
+		point       durabilityFaultPoint
+		wantErr     bool
+		wantOutcome DurabilityOutcome
+		wantAction  GrantDurabilityAction
+	}{
+		{
+			point:       durabilityFaultPreDBCommit,
+			wantErr:     true,
+			wantOutcome: DefinitelyNotCommitted,
+			wantAction:  Proceed,
+		},
+		{
+			point:       durabilityFaultPostDBCommit,
+			wantErr:     true,
+			wantOutcome: CommitOutcomeUnknown,
+			wantAction:  ContainFailStop,
+		},
+		{
+			point:       durabilityFaultAnchorBegin,
+			wantErr:     true,
+			wantOutcome: DefinitelyNotCommitted,
+			wantAction:  Proceed,
+		},
+		{
+			point:       durabilityFaultAnchorAdvance,
+			wantErr:     true,
+			wantOutcome: CommitOutcomeUnknown,
+			wantAction:  ContainFailStop,
+		},
+		{
+			point:       durabilityFaultAnchorComplete,
+			wantErr:     true,
+			wantOutcome: CommitOutcomeUnknown,
+			wantAction:  ContainFailStop,
+		},
+		{
+			point:       durabilityFaultBeforeReturn,
+			wantOutcome: CommittedAndAnchored,
+			wantAction:  Proceed,
+		},
+	}
+
+	for _, mutation := range mutations {
+		for _, tt := range failpoints {
+			t.Run(string(mutation)+"/"+string(tt.point), func(t *testing.T) {
+				ready, repo, anchorStore := newBboltDurabilityReady(t, string(mutation)+"-"+string(tt.point))
+				run := prepareDurabilityMutation(t, ctx, ready, mutation, string(tt.point))
+				beforeGeneration := repositoryGeneration(t, repo)
+				injectDurabilityFault(t, ready, repo, anchorStore, tt.point)
+
+				applied, err := run()
+				if (err != nil) != tt.wantErr {
+					t.Fatalf("mutation error = %v, wantErr %v", err, tt.wantErr)
+				}
+				if applied.Durability != tt.wantOutcome {
+					t.Fatalf("durability = %v, want %v", applied.Durability, tt.wantOutcome)
+				}
+				if action := SafeActionForGrantDurability(applied.Durability); action != tt.wantAction {
+					t.Fatalf("SafeActionForGrantDurability() = %v, want %v", action, tt.wantAction)
+				}
+				afterGeneration := repositoryGeneration(t, repo)
+				switch tt.point {
+				case durabilityFaultPostDBCommit, durabilityFaultAnchorAdvance, durabilityFaultAnchorComplete, durabilityFaultBeforeReturn:
+					if afterGeneration <= beforeGeneration {
+						t.Fatalf("repository generation = %d, want > %d", afterGeneration, beforeGeneration)
+					}
+				case durabilityFaultPreDBCommit, durabilityFaultAnchorBegin:
+					if afterGeneration != beforeGeneration {
+						t.Fatalf("repository generation = %d, want unchanged %d", afterGeneration, beforeGeneration)
+					}
+				}
+				if tt.point == durabilityFaultPostDBCommit && !errors.Is(err, repository.ErrAmbiguousCommit) {
+					t.Fatalf("post-DB-commit error = %v, want ErrAmbiguousCommit", err)
+				}
+			})
+		}
+	}
+}
+
 func TestClassifyDurabilityAcrossRepositoryAnchorBoundary(t *testing.T) {
 	tests := []struct {
 		name               string
@@ -223,6 +315,192 @@ func TestClassifyDurabilityAcrossRepositoryAnchorBoundary(t *testing.T) {
 				t.Fatalf("SafeActionForGrantDurability() = %v, want %v", action, tt.wantAction)
 			}
 		})
+	}
+}
+
+type durabilityMutationKind string
+
+const (
+	durabilityMutationBindGroup        durabilityMutationKind = "bind_group"
+	durabilityMutationCommitGrant      durabilityMutationKind = "commit_grant"
+	durabilityMutationRecordRelease    durabilityMutationKind = "record_release"
+	durabilityMutationFinalize         durabilityMutationKind = "finalize"
+	durabilityMutationRecordQuiescence durabilityMutationKind = "record_quiescence"
+)
+
+type durabilityFaultPoint string
+
+const (
+	durabilityFaultPreDBCommit    durabilityFaultPoint = "pre-db-commit"
+	durabilityFaultPostDBCommit   durabilityFaultPoint = "post-db-commit"
+	durabilityFaultAnchorBegin    durabilityFaultPoint = "anchor-begin"
+	durabilityFaultAnchorAdvance  durabilityFaultPoint = "anchor-advance"
+	durabilityFaultAnchorComplete durabilityFaultPoint = "anchor-complete"
+	durabilityFaultBeforeReturn   durabilityFaultPoint = "before-return"
+)
+
+var errInjectedDurabilityFault = errors.New("injected durability fault")
+
+type durabilityFaultingRepository struct {
+	inner repository.Repository
+	fault durabilityFaultPoint
+}
+
+func (r *durabilityFaultingRepository) View(ctx context.Context, fn func(repository.ReadTx) error) error {
+	return r.inner.View(ctx, fn)
+}
+
+func (r *durabilityFaultingRepository) Update(ctx context.Context, fn func(repository.WriteTx) error) (repository.Commit, error) {
+	switch r.fault {
+	case durabilityFaultPreDBCommit:
+		return repository.Commit{}, fmt.Errorf("%w: pre-db-commit", errInjectedDurabilityFault)
+	case durabilityFaultPostDBCommit:
+		commit, err := r.inner.Update(ctx, fn)
+		if err != nil {
+			return commit, err
+		}
+		return commit, fmt.Errorf("%w: injected bbolt commit-phase failure", repository.ErrAmbiguousCommit)
+	default:
+		return r.inner.Update(ctx, fn)
+	}
+}
+
+func (r *durabilityFaultingRepository) AnchorIdentity() (string, uint16, error) {
+	identified, ok := r.inner.(interface {
+		AnchorIdentity() (string, uint16, error)
+	})
+	if !ok {
+		return "", 0, fmt.Errorf("inner repository does not expose anchor identity")
+	}
+	return identified.AnchorIdentity()
+}
+
+type durabilityFaultingAnchor struct {
+	Anchor
+	failVerifyReady bool
+}
+
+func (a *durabilityFaultingAnchor) VerifyReady(boot model.BootRef, token string, generation uint64) error {
+	if a.failVerifyReady {
+		return fmt.Errorf("%w: injected anchor-begin failure", ErrAnchorInvariant)
+	}
+	if verifier, ok := a.Anchor.(anchorVerifier); ok {
+		return verifier.VerifyReady(boot, token, generation)
+	}
+	return nil
+}
+
+func (a *durabilityFaultingAnchor) VerifyRecovery(boot model.BootRef, token string, generation uint64) error {
+	if verifier, ok := a.Anchor.(anchorVerifier); ok {
+		return verifier.VerifyRecovery(boot, token, generation)
+	}
+	return nil
+}
+
+func newBboltDurabilityReady(t *testing.T, name string) (*Ready, *durabilityFaultingRepository, *AnchorStore) {
+	t.Helper()
+	inner, err := bboltrepo.NewRepository(filepath.Join(t.TempDir(), "admission.bbolt"))
+	if err != nil {
+		t.Fatalf("NewRepository() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := inner.Close(); err != nil {
+			t.Fatalf("close bbolt repository: %v", err)
+		}
+	})
+	repo := &durabilityFaultingRepository{inner: inner}
+	anchorStore := NewAnchorStore()
+	ready := newReadyWithAnchorStore(t, repo, anchorStore, name)
+	return ready, repo, anchorStore
+}
+
+func prepareDurabilityMutation(t *testing.T, ctx context.Context, ready *Ready, mutation durabilityMutationKind, suffix string) func() (ApplyResult, error) {
+	t.Helper()
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "durability-"+string(mutation)+"-"+suffix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := accepted.Record.Attempt.Ref
+	group := groupRef(ref, model.LaunchOrdinalOne)
+	switch mutation {
+	case durabilityMutationBindGroup:
+		return func() (ApplyResult, error) {
+			return ready.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group)
+		}
+	case durabilityMutationCommitGrant:
+		bindDurabilityGroup(t, ctx, ready, accepted, group)
+		return func() (ApplyResult, error) {
+			return ready.CommitGrant(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, model.PermitNonce("nonce-"+suffix))
+		}
+	case durabilityMutationRecordRelease:
+		bindDurabilityGroup(t, ctx, ready, accepted, group)
+		commitDurabilityGrant(t, ctx, ready, accepted, suffix)
+		return func() (ApplyResult, error) {
+			return ready.RecordRelease(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, model.ChildIdentity{
+				PID:               group.Leader.PID,
+				HighResStartToken: group.Leader.HighResStartToken,
+			}, evidence("launch-"+suffix))
+		}
+	case durabilityMutationFinalize:
+		bindDurabilityGroup(t, ctx, ready, accepted, group)
+		if _, err := ready.RequestCancel(ctx, accepted.Record.JobID); err != nil {
+			t.Fatal(err)
+		}
+		recordDurabilityQuiescence(t, ctx, ready, accepted, group)
+		return func() (ApplyResult, error) {
+			return ready.Finalize(ctx, accepted.Record.JobID, ref, model.TerminalIntent{
+				Outcome: model.OutcomeCanceled,
+				Cause:   model.CauseCanceledBeforeAuthorization,
+			})
+		}
+	case durabilityMutationRecordQuiescence:
+		bindDurabilityGroup(t, ctx, ready, accepted, group)
+		verified := verifiedQuiescence(t, ready.Boot(), ref, model.LaunchOrdinalOne, group, model.QuiescenceAlreadyAbsent)
+		return func() (ApplyResult, error) {
+			return ready.RecordQuiescence(ctx, accepted.Record.JobID, model.LaunchOrdinalOne, verified)
+		}
+	default:
+		t.Fatalf("unknown durability mutation %q", mutation)
+		return nil
+	}
+}
+
+func bindDurabilityGroup(t *testing.T, ctx context.Context, ready *Ready, accepted AcceptResult, group model.GroupRef) {
+	t.Helper()
+	if _, err := ready.BindGroup(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.LaunchOrdinalOne, group); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func commitDurabilityGrant(t *testing.T, ctx context.Context, ready *Ready, accepted AcceptResult, suffix string) {
+	t.Helper()
+	if _, err := ready.CommitGrant(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.LaunchOrdinalOne, model.PermitNonce("setup-nonce-"+suffix)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func recordDurabilityQuiescence(t *testing.T, ctx context.Context, ready *Ready, accepted AcceptResult, group model.GroupRef) {
+	t.Helper()
+	verified := verifiedQuiescence(t, ready.Boot(), accepted.Record.Attempt.Ref, model.LaunchOrdinalOne, group, model.QuiescenceAlreadyAbsent)
+	if _, err := ready.RecordQuiescence(ctx, accepted.Record.JobID, model.LaunchOrdinalOne, verified); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func injectDurabilityFault(t *testing.T, ready *Ready, repo *durabilityFaultingRepository, anchorStore *AnchorStore, point durabilityFaultPoint) {
+	t.Helper()
+	switch point {
+	case durabilityFaultPreDBCommit, durabilityFaultPostDBCommit:
+		repo.fault = point
+	case durabilityFaultAnchorBegin:
+		ready.core.anchor = &durabilityFaultingAnchor{Anchor: ready.core.anchor, failVerifyReady: true}
+	case durabilityFaultAnchorAdvance:
+		anchorStore.FailNextForTest(AnchorAdvance, nil)
+	case durabilityFaultAnchorComplete:
+		anchorStore.FailNextForTest(AnchorComplete, nil)
+	case durabilityFaultBeforeReturn:
+	default:
+		t.Fatalf("unknown durability fault point %q", point)
 	}
 }
 

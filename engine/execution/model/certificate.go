@@ -1,5 +1,7 @@
 package model
 
+import "encoding/json"
+
 type LaunchNonce string
 
 func NewLaunchNonce(value string) (LaunchNonce, error) {
@@ -177,6 +179,24 @@ type GroupRef struct {
 	Leader            ProcessIdentity
 	Monitor           ProcessIdentity
 	RetainedID        string
+}
+
+func (ref *GroupRef) UnmarshalJSON(data []byte) error {
+	type groupRef GroupRef
+	var decoded groupRef
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	out := GroupRef(decoded)
+	if _, ok := fields["PIDNamespaceState"]; !ok && out.PIDNamespaceID == "" && out.HostBootID != "" {
+		out.PIDNamespaceState = PIDNamespaceNotApplicable
+	}
+	*ref = out
+	return nil
 }
 
 func (ref GroupRef) Validate() error {

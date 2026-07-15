@@ -1,6 +1,9 @@
 package model
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestKernelDomainIDValidateAndEqual(t *testing.T) {
 	same := KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceID: "pidns-1", PIDNamespaceState: PIDNamespaceKnown}
@@ -20,8 +23,8 @@ func TestKernelDomainIDValidateAndEqual(t *testing.T) {
 	if err := unknown.Validate(); err != nil {
 		t.Fatalf("Validate() with unknown pid namespace error = %v", err)
 	}
-	if !unknown.Equal(KernelDomainID{HostBootID: "host-boot-1"}) {
-		t.Fatalf("Equal() = false for matching unknown namespace domain")
+	if unknown.Equal(KernelDomainID{HostBootID: "host-boot-1"}) {
+		t.Fatalf("Equal() = true for matching unknown namespace domain")
 	}
 	noNamespace := KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceState: PIDNamespaceNotApplicable}
 	if err := noNamespace.Validate(); err != nil {
@@ -59,6 +62,38 @@ func TestGroupRefEqualUsesCanonicalKernelDomain(t *testing.T) {
 	}
 	if !left.KernelDomain().Equal(right.KernelDomain()) {
 		t.Fatal("KernelDomain().Equal() = false for identical known kernel domain")
+	}
+}
+
+func TestGroupRefDecodeLegacyHostBootOnlyUsesBootDomain(t *testing.T) {
+	original := kernelDomainTestGroupRef()
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("Unmarshal fields error = %v", err)
+	}
+	delete(fields, "PIDNamespaceID")
+	delete(fields, "PIDNamespaceState")
+	legacy, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("Marshal legacy fields error = %v", err)
+	}
+
+	var decoded GroupRef
+	if err := json.Unmarshal(legacy, &decoded); err != nil {
+		t.Fatalf("Unmarshal legacy GroupRef error = %v", err)
+	}
+	if decoded.PIDNamespaceState != PIDNamespaceNotApplicable {
+		t.Fatalf("decoded PIDNamespaceState = %v, want %v", decoded.PIDNamespaceState, PIDNamespaceNotApplicable)
+	}
+	if decoded.PIDNamespaceID != "" {
+		t.Fatalf("decoded PIDNamespaceID = %q, want empty", decoded.PIDNamespaceID)
+	}
+	if err := decoded.Validate(); err != nil {
+		t.Fatalf("decoded legacy GroupRef Validate() error = %v", err)
 	}
 }
 

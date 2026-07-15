@@ -53,3 +53,42 @@ func TestServedAdmissionSupervisorUsesUnavailableCustodian(t *testing.T) {
 		t.Fatalf("Retire = verified:%#v err:%v, want unavailable zero attestation", verified, err)
 	}
 }
+
+func TestServedAdmissionSupervisorRequiresAdvertisedRuntime(t *testing.T) {
+	ctx := context.Background()
+	support, err := custodian.NewSupport(custodian.Support{
+		ParkedExec:             true,
+		VerifiedContainment:    true,
+		ImplementationCompiled: true,
+		RuntimeProbePassed:     true,
+		FeatureConfigured:      true,
+		FeatureAdvertised:      false,
+	})
+	if err != nil {
+		t.Fatalf("NewSupport() error = %v", err)
+	}
+	if support.AdvertisedAvailable() {
+		t.Fatal("test support unexpectedly advertised available")
+	}
+	_, verifier := custodian.NewAttestationChannel()
+	supervisor := &servedAdmissionSupervisor{
+		runtime: fakeAdmissionRuntime{support: support, verifier: verifier},
+	}
+
+	if err := supervisor.verifiedContainmentSupported(ctx); !errors.Is(err, custodian.ErrSupervisorUnavailable) {
+		t.Fatalf("verifiedContainmentSupported error = %v, want supervisor_unavailable", err)
+	}
+}
+
+type fakeAdmissionRuntime struct {
+	support  custodian.Support
+	verifier custodian.AttestationVerifier
+}
+
+func (r fakeAdmissionRuntime) Support() custodian.Support {
+	return r.support
+}
+
+func (r fakeAdmissionRuntime) Verifier() custodian.AttestationVerifier {
+	return r.verifier
+}
