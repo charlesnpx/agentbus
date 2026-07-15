@@ -12,6 +12,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 )
@@ -20,26 +21,41 @@ type servedAdmissionSupervisor struct {
 	server *Server
 
 	mu       sync.Mutex
+	boot     model.BootRef
+	issuer   custodian.AttestationIssuer
+	verifier custodian.AttestationVerifier
 	launches map[model.JobID]*servedAdmissionLaunch
 }
 
 type servedAdmissionLaunch struct {
 	mu       sync.Mutex
 	plan     coordinator.LaunchPlan
-	identity model.SupervisorIdentity
+	groups   map[model.LaunchOrdinal]model.GroupRef
 	backend  engine.Backend
 	opts     engine.SessionOpts
-	permit   *model.LaunchGrant
+	permits  map[model.LaunchOrdinal]model.LaunchGrant
 	session  engine.Session
-	child    model.ChildIdentity
+	children map[model.LaunchOrdinal]model.ChildIdentity
 	active   *activeJob
 }
 
 func newServedAdmissionSupervisor(server *Server) *servedAdmissionSupervisor {
+	issuer, verifier := custodian.NewAttestationChannel()
 	return &servedAdmissionSupervisor{
 		server:   server,
+		issuer:   issuer,
+		verifier: verifier,
 		launches: make(map[model.JobID]*servedAdmissionLaunch),
 	}
+}
+
+func (s *servedAdmissionSupervisor) SetBoot(boot model.BootRef) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.boot = boot
+	s.mu.Unlock()
 }
 
 func (s *servedAdmissionSupervisor) Register(jobID model.JobID, backend engine.Backend, opts engine.SessionOpts) error {
@@ -56,7 +72,13 @@ func (s *servedAdmissionSupervisor) Register(jobID model.JobID, backend engine.B
 	defer s.mu.Unlock()
 	launch := s.launches[jobID]
 	if launch == nil {
-		launch = &servedAdmissionLaunch{backend: backend, opts: opts}
+		launch = &servedAdmissionLaunch{
+			backend:  backend,
+			opts:     opts,
+			groups:   make(map[model.LaunchOrdinal]model.GroupRef),
+			permits:  make(map[model.LaunchOrdinal]model.LaunchGrant),
+			children: make(map[model.LaunchOrdinal]model.ChildIdentity),
+		}
 		s.launches[jobID] = launch
 		return nil
 	}
@@ -104,26 +126,43 @@ func (s *servedAdmissionSupervisor) Prepare(_ context.Context, plan coordinator.
 	if err := plan.Ref.Validate(); err != nil {
 		return coordinator.PreparedSupervisor{}, err
 	}
+	if err := plan.Ordinal.Validate(); err != nil {
+		return coordinator.PreparedSupervisor{}, err
+	}
 	launch := s.launch(plan.JobID)
 	if launch == nil {
 		return coordinator.PreparedSupervisor{}, fmt.Errorf("admission launch %s is not registered", plan.JobID)
 	}
-	identity := model.SupervisorIdentity{
-		PGID:               os.Getpid(),
-		LeaderPID:          os.Getpid(),
-		HighResStartToken:  "served-" + plan.Ref.AttemptID.String(),
-		PlatformRetainedID: plan.JobID.String(),
+	pid := os.Getpid()
+	group := model.GroupRef{
+		Version:   1,
+		CustodyID: model.CustodyID(fmt.Sprintf("custody-%s-%s", plan.JobID, plan.Ordinal)),
+		Launch: model.LaunchKey{
+			Attempt: plan.Ref,
+			Ordinal: plan.Ordinal,
+		},
+		HostBootID: "served-host-boot",
+		PGID:       pid,
+		Leader: model.ProcessIdentity{
+			PID:               pid,
+			HighResStartToken: fmt.Sprintf("served-leader-%s-%s", plan.Ref.AttemptID, plan.Ordinal),
+		},
+		Monitor: model.ProcessIdentity{
+			PID:               pid,
+			HighResStartToken: fmt.Sprintf("served-monitor-%s-%s", plan.Ref.AttemptID, plan.Ordinal),
+		},
+		RetainedID: plan.JobID.String(),
 	}
-	if err := identity.Validate(); err != nil {
+	if err := group.Validate(); err != nil {
 		return coordinator.PreparedSupervisor{}, err
 	}
-	prepared := coordinator.PreparedSupervisor{Ref: plan.Ref, Identity: identity}
+	prepared := coordinator.PreparedSupervisor{Ref: plan.Ref, Ordinal: plan.Ordinal, Group: group}
 	if err := prepared.ValidateFor(plan.Ref); err != nil {
 		return coordinator.PreparedSupervisor{}, err
 	}
 	launch.mu.Lock()
 	launch.plan = plan
-	launch.identity = identity
+	launch.groups[plan.Ordinal] = group
 	launch.mu.Unlock()
 	return prepared, nil
 }
@@ -138,14 +177,16 @@ func (s *servedAdmissionSupervisor) SendPermit(_ context.Context, prepared coord
 	}
 	launch.mu.Lock()
 	defer launch.mu.Unlock()
-	if launch.permit != nil {
-		if *launch.permit == grant {
+	if prepared.Ordinal != grant.Ordinal {
+		return fmt.Errorf("admission launch %s permit ordinal mismatch", grant.Attempt.JobID)
+	}
+	if permit, ok := launch.permits[grant.Ordinal]; ok {
+		if permit == grant {
 			return nil
 		}
 		return fmt.Errorf("admission launch %s already has a different permit", grant.Attempt.JobID)
 	}
-	copied := grant
-	launch.permit = &copied
+	launch.permits[grant.Ordinal] = grant
 	return nil
 }
 
@@ -159,7 +200,7 @@ func (s *servedAdmissionSupervisor) ObserveLaunch(ctx context.Context, prepared 
 	}
 	launch.mu.Lock()
 	defer launch.mu.Unlock()
-	if launch.permit == nil || *launch.permit != grant {
+	if permit, ok := launch.permits[grant.Ordinal]; !ok || permit != grant {
 		return coordinator.LaunchObservation{}, fmt.Errorf("admission launch %s has no matching permit", grant.Attempt.JobID)
 	}
 	if launch.session == nil {
@@ -169,7 +210,8 @@ func (s *servedAdmissionSupervisor) ObserveLaunch(ctx context.Context, prepared 
 		}
 		launch.session = session
 	}
-	if launch.child.PID == 0 {
+	child := launch.children[grant.Ordinal]
+	if child.PID == 0 {
 		child := model.ChildIdentity{
 			PID:               os.Getpid(),
 			HighResStartToken: fmt.Sprintf("served-child-%s-%s", grant.Attempt.AttemptID, grant.Ordinal),
@@ -177,11 +219,11 @@ func (s *servedAdmissionSupervisor) ObserveLaunch(ctx context.Context, prepared 
 		if err := child.Validate(); err != nil {
 			return coordinator.LaunchObservation{}, err
 		}
-		launch.child = child
+		launch.children[grant.Ordinal] = child
 	}
 	return coordinator.LaunchObservation{
 		Ordinal: grant.Ordinal,
-		Child:   launch.child,
+		Child:   launch.children[grant.Ordinal],
 		Evidence: model.Evidence{
 			Kind:   "served_launch",
 			Detail: "backend_session_started",
@@ -189,40 +231,28 @@ func (s *servedAdmissionSupervisor) ObserveLaunch(ctx context.Context, prepared 
 	}, nil
 }
 
-func (s *servedAdmissionSupervisor) VerifyQuiescence(_ context.Context, prepared coordinator.PreparedSupervisor, consumed model.LaunchConsumed) (model.QuiescenceReceipt, error) {
-	if err := prepared.ValidateFor(consumed.Attempt); err != nil {
-		return model.QuiescenceReceipt{}, err
+func (s *servedAdmissionSupervisor) VerifyQuiescence(_ context.Context, prepared coordinator.PreparedSupervisor, released model.LaunchReleaseFact) (custodian.VerifiedQuiescence, error) {
+	if err := prepared.ValidateFor(released.Attempt); err != nil {
+		return custodian.VerifiedQuiescence{}, err
 	}
-	return model.QuiescenceReceipt{
-		Attempt: consumed.Attempt,
-		Ordinal: consumed.Ordinal,
-		Child:   consumed.Child,
-		ChildExited: model.Evidence{
-			Kind:   "served_quiescence",
-			Detail: "child_exited",
-		},
-		GroupEmpty: model.Evidence{
-			Kind:   "served_quiescence",
-			Detail: "group_empty",
-		},
-	}, nil
+	return s.attestQuiescence(prepared, model.QuiescenceNaturalExit)
 }
 
-func (s *servedAdmissionSupervisor) Contain(ctx context.Context, prepared coordinator.PreparedSupervisor) (model.ContainmentReceipt, error) {
+func (s *servedAdmissionSupervisor) Contain(ctx context.Context, prepared coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
 	if err := prepared.ValidateFor(prepared.Ref); err != nil {
-		return model.ContainmentReceipt{}, err
+		return custodian.VerifiedQuiescence{}, err
 	}
 	launch := s.launch(prepared.Ref.JobID)
 	if launch == nil {
-		return model.ContainmentReceipt{}, fmt.Errorf("admission launch %s cannot be contained: supervisor identity is not registered in this boot", prepared.Ref.JobID)
+		return custodian.VerifiedQuiescence{}, fmt.Errorf("admission launch %s cannot be contained: group reference is not registered in this boot", prepared.Ref.JobID)
 	}
 	launch.mu.Lock()
 	active := launch.active
 	session := launch.session
-	identity := launch.identity
+	group := launch.groups[prepared.Ordinal]
 	launch.mu.Unlock()
-	if !identity.Equal(prepared.Identity) {
-		return model.ContainmentReceipt{}, fmt.Errorf("admission launch %s supervisor identity mismatch", prepared.Ref.JobID)
+	if !group.Equal(prepared.Group) {
+		return custodian.VerifiedQuiescence{}, fmt.Errorf("admission launch %s group reference mismatch", prepared.Ref.JobID)
 	}
 	if active != nil {
 		active.requestTerminal(engine.StateCanceled)
@@ -235,59 +265,49 @@ func (s *servedAdmissionSupervisor) Contain(ctx context.Context, prepared coordi
 	}
 	store := s.server.storeForJob(prepared.Ref.JobID.String())
 	if store == nil {
-		return model.ContainmentReceipt{}, fmt.Errorf("admission launch %s cannot be contained: job store is not registered", prepared.Ref.JobID)
+		return custodian.VerifiedQuiescence{}, fmt.Errorf("admission launch %s cannot be contained: job store is not registered", prepared.Ref.JobID)
 	}
 	if _, err := store.Cancel(prepared.Ref.JobID.String()); err != nil {
-		return model.ContainmentReceipt{}, err
+		return custodian.VerifiedQuiescence{}, err
 	}
-	return model.ContainmentReceipt{
-		Attempt:    prepared.Ref,
-		Supervisor: prepared.Identity,
-		Signal: model.Evidence{
-			Kind:   "served_contain",
-			Detail: "cancel_requested",
-		},
-		Verification: model.Evidence{
-			Kind:   "served_contain",
-			Detail: "containment_verified",
-		},
-	}, nil
+	return s.attestQuiescence(prepared, model.QuiescenceTermKill)
 }
 
-func (s *servedAdmissionSupervisor) Retire(_ context.Context, prepared coordinator.PreparedSupervisor) (model.RetirementReceipt, error) {
+func (s *servedAdmissionSupervisor) Retire(_ context.Context, prepared coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
 	if err := prepared.ValidateFor(prepared.Ref); err != nil {
-		return model.RetirementReceipt{}, err
+		return custodian.VerifiedQuiescence{}, err
 	}
 	launch := s.launch(prepared.Ref.JobID)
 	if launch == nil {
-		return model.RetirementReceipt{}, fmt.Errorf("admission launch %s cannot be retired: supervisor identity is not registered in this boot", prepared.Ref.JobID)
+		return custodian.VerifiedQuiescence{}, fmt.Errorf("admission launch %s cannot be retired: group reference is not registered in this boot", prepared.Ref.JobID)
 	}
 	launch.mu.Lock()
 	active := launch.active
-	identity := launch.identity
+	group := launch.groups[prepared.Ordinal]
 	launch.mu.Unlock()
-	if !identity.Equal(prepared.Identity) {
-		return model.RetirementReceipt{}, fmt.Errorf("admission launch %s supervisor identity mismatch", prepared.Ref.JobID)
+	if !group.Equal(prepared.Group) {
+		return custodian.VerifiedQuiescence{}, fmt.Errorf("admission launch %s group reference mismatch", prepared.Ref.JobID)
 	}
 	if active != nil && active.cancel != nil {
 		active.cancel()
 	}
-	return model.RetirementReceipt{
-		Attempt:    prepared.Ref,
-		Supervisor: prepared.Identity,
-		ControlClosed: model.Evidence{
-			Kind:   "served_retire",
-			Detail: "control_closed",
-		},
-		WorkerExited: model.Evidence{
-			Kind:   "served_retire",
-			Detail: "worker_exited",
-		},
-		GroupEmpty: model.Evidence{
-			Kind:   "served_retire",
-			Detail: "group_empty",
-		},
-	}, nil
+	return s.attestQuiescence(prepared, model.QuiescenceAlreadyAbsent)
+}
+
+func (s *servedAdmissionSupervisor) attestQuiescence(prepared coordinator.PreparedSupervisor, method model.QuiescenceMethod) (custodian.VerifiedQuiescence, error) {
+	s.mu.Lock()
+	boot := s.boot
+	s.mu.Unlock()
+	if boot.BootID == "" {
+		boot = model.BootRef{BootID: "served-boot", OwnerID: "served-owner"}
+	}
+	return s.issuer.AttestQuiescence(model.QuiescenceCertificate{
+		Attempt:     prepared.Ref,
+		Ordinal:     prepared.Ordinal,
+		Group:       prepared.Group,
+		Method:      method,
+		CertifiedBy: boot,
+	})
 }
 
 func (s *servedAdmissionSupervisor) launch(jobID model.JobID) *servedAdmissionLaunch {
@@ -460,11 +480,12 @@ func admissionStartupRecoveryJobs(ctx context.Context, repo repository.Repositor
 	return jobs, nil
 }
 
-func admissionPreparedFromRecord(record model.SafetyRecord) (coordinator.PreparedSupervisor, error) {
-	if record.Attempt.Supervisor == nil {
-		return coordinator.PreparedSupervisor{}, fmt.Errorf("supervisor identity is not bound for %s", record.JobID)
+func admissionPreparedFromRecord(record model.SafetyRecord, ordinal model.LaunchOrdinal) (coordinator.PreparedSupervisor, error) {
+	launch, ok := record.Attempt.Launches.Get(ordinal)
+	if !ok || launch.Group == nil {
+		return coordinator.PreparedSupervisor{}, fmt.Errorf("group reference is not bound for %s ordinal %s", record.JobID, ordinal)
 	}
-	prepared := coordinator.PreparedSupervisor{Ref: record.Attempt.Ref, Identity: *record.Attempt.Supervisor}
+	prepared := coordinator.PreparedSupervisor{Ref: record.Attempt.Ref, Ordinal: ordinal, Group: *launch.Group}
 	if err := prepared.ValidateFor(record.Attempt.Ref); err != nil {
 		return coordinator.PreparedSupervisor{}, err
 	}

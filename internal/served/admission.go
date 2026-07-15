@@ -14,6 +14,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
@@ -36,6 +37,11 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		return nil
 	}
 
+	supervisor := s.admissionSupervisor
+	if supervisor == nil {
+		supervisor = newServedAdmissionSupervisor(s)
+		s.admissionSupervisor = supervisor
+	}
 	factory := s.admissionBootstrapperFactory
 	if factory == nil {
 		factory = openAdmissionBootstrapper
@@ -55,13 +61,10 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	supervisor.SetBoot(boot)
 	session, err := bootstrapper.Begin(ctx, boot)
 	if err != nil {
 		return err
-	}
-	supervisor := s.admissionSupervisor
-	if supervisor == nil {
-		supervisor = newServedAdmissionSupervisor(s)
 	}
 	if err := recoverAdmissionBeforeReady(ctx, session, repo, supervisor, boot); err != nil {
 		return err
@@ -110,7 +113,11 @@ func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootst
 		dbUUID:      dbUUID,
 		schemaMajor: schemaMajor,
 	}
-	bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchor(anchor))
+	options := []authority.BootstrapperOption{authority.WithAnchor(anchor)}
+	if s.admissionSupervisor != nil {
+		options = append(options, authority.WithQuiescenceVerifier(s.admissionSupervisor.verifier))
+	}
+	bootstrapper, err := authority.NewBootstrapper(repo, options...)
 	if err != nil {
 		_ = repo.Close()
 		return nil, nil, nil, err
@@ -142,34 +149,38 @@ func recoverAdmissionBeforeReady(ctx context.Context, session *authority.Recover
 				if job.plan.Next.Finalize == nil {
 					return fmt.Errorf("%w: startup recovery finalize action missing receipt", authority.ErrRecoveryNeeded)
 				}
-				if err := session.ApplyReceipt(ctx, *job.plan.Next.Finalize); err != nil {
+				if err := session.Finalize(ctx, job.plan.Next.Finalize.Ref, job.plan.Next.Finalize.Intent); err != nil {
 					return err
 				}
 				progressed = true
 			case model.RecoveryRetireThenFinalize:
-				prepared, err := admissionPreparedFromRecord(job.record)
-				if err != nil {
-					return err
-				}
-				receipt, err := supervisor.Retire(ctx, prepared)
-				if err != nil {
-					return err
-				}
-				if err := session.ApplyReceipt(ctx, model.CertifyRetirement{Ref: job.record.Attempt.Ref, Receipt: receipt}); err != nil {
-					return err
+				for _, ordinal := range admissionUnquiescedOrdinals(job.record) {
+					prepared, err := admissionPreparedFromRecord(job.record, ordinal)
+					if err != nil {
+						return err
+					}
+					verified, err := supervisor.Retire(ctx, prepared)
+					if err != nil {
+						return err
+					}
+					if err := session.RecordQuiescence(ctx, job.record.JobID, ordinal, verified); err != nil {
+						return err
+					}
 				}
 				progressed = true
 			case model.RecoveryContainThenFinalize:
-				prepared, err := admissionPreparedFromRecord(job.record)
-				if err != nil {
-					return err
-				}
-				receipt, err := supervisor.Contain(ctx, prepared)
-				if err != nil {
-					return err
-				}
-				if err := session.ApplyReceipt(ctx, model.CertifyContainment{Ref: job.record.Attempt.Ref, Receipt: receipt}); err != nil {
-					return err
+				for _, ordinal := range admissionUnquiescedOrdinals(job.record) {
+					prepared, err := admissionPreparedFromRecord(job.record, ordinal)
+					if err != nil {
+						return err
+					}
+					verified, err := supervisor.Contain(ctx, prepared)
+					if err != nil {
+						return err
+					}
+					if err := session.RecordQuiescence(ctx, job.record.JobID, ordinal, verified); err != nil {
+						return err
+					}
 				}
 				progressed = true
 			case model.RecoveryFatalUnprovable:
@@ -428,8 +439,47 @@ func (a *servedAdmissionAuthority) Accept(ctx context.Context, request coordinat
 	return coordinator.AdmissionResult{Record: accepted.Record, Projection: accepted.Projection, Replayed: accepted.Replayed}, nil
 }
 
-func (a *servedAdmissionAuthority) Apply(ctx context.Context, jobID model.JobID, command model.Command) (coordinator.StepResult, error) {
-	applied, err := a.ready.Apply(ctx, jobID, command)
+func (a *servedAdmissionAuthority) BindGroup(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, group model.GroupRef) (coordinator.StepResult, error) {
+	applied, err := a.ready.BindGroup(ctx, jobID, ref, ordinal, group)
+	return admissionStepResult(applied, err)
+}
+
+func (a *servedAdmissionAuthority) CommitGrant(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, nonce model.PermitNonce) (coordinator.StepResult, error) {
+	applied, err := a.ready.CommitGrant(ctx, jobID, ref, ordinal, nonce)
+	return admissionStepResult(applied, err)
+}
+
+func (a *servedAdmissionAuthority) RecordRelease(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, child model.ChildIdentity, evidence model.Evidence) (coordinator.StepResult, error) {
+	applied, err := a.ready.RecordRelease(ctx, jobID, ref, ordinal, child, evidence)
+	return admissionStepResult(applied, err)
+}
+
+func (a *servedAdmissionAuthority) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) (coordinator.StepResult, error) {
+	applied, err := a.ready.RecordQuiescence(ctx, jobID, ordinal, verified)
+	return admissionStepResult(applied, err)
+}
+
+func (a *servedAdmissionAuthority) RequestCancel(ctx context.Context, jobID model.JobID) (coordinator.StepResult, error) {
+	applied, err := a.ready.RequestCancel(ctx, jobID)
+	return admissionStepResult(applied, err)
+}
+
+func (a *servedAdmissionAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) (coordinator.StepResult, error) {
+	applied, err := a.ready.RecordOutcome(ctx, jobID, ref, outcome)
+	return admissionStepResult(applied, err)
+}
+
+func (a *servedAdmissionAuthority) RecordResult(ctx context.Context, jobID model.JobID, ref model.AttemptRef, receipt model.ResultReceipt) (coordinator.StepResult, error) {
+	applied, err := a.ready.RecordResult(ctx, jobID, ref, receipt)
+	return admissionStepResult(applied, err)
+}
+
+func (a *servedAdmissionAuthority) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent) (coordinator.StepResult, error) {
+	applied, err := a.ready.Finalize(ctx, jobID, ref, intent)
+	return admissionStepResult(applied, err)
+}
+
+func admissionStepResult(applied authority.ApplyResult, err error) (coordinator.StepResult, error) {
 	if err != nil {
 		return coordinator.StepResult{}, err
 	}
@@ -455,7 +505,7 @@ func (a *servedAdmissionAuthority) RecoveryPlan(ctx context.Context, jobID model
 	if err != nil {
 		return model.RecoveryPlan{}, err
 	}
-	if trigger == model.RecoveryCancelAfterGrant && !admissionHasLaunchEvidence(snapshot.Record) {
+	if trigger == model.RecoveryCancelAfterGrant && !admissionHasAuthorizationEvidence(snapshot.Record) {
 		return admissionCancelBeforeAuthorizationPlan(snapshot.Record), nil
 	}
 	return model.PlanRecovery(snapshot.Record, trigger)
@@ -480,8 +530,14 @@ func (a *servedAdmissionAuthority) FailStop(ctx context.Context, err error) erro
 	return a.ready.FailStop(ctx, err.Error())
 }
 
-func admissionHasLaunchEvidence(record model.SafetyRecord) bool {
-	return record.Attempt.Grants.Count() != 0 || record.Attempt.Consumed.Count() != 0 || record.Attempt.Quiescence.Count() != 0
+func admissionHasAuthorizationEvidence(record model.SafetyRecord) bool {
+	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launch, ok := record.Attempt.Launches.Get(ordinal)
+		if ok && (launch.Grant != nil || launch.Released != nil) {
+			return true
+		}
+	}
+	return false
 }
 
 func admissionCancelBeforeAuthorizationPlan(record model.SafetyRecord) model.RecoveryPlan {
@@ -499,12 +555,33 @@ func admissionCancelBeforeAuthorizationPlan(record model.SafetyRecord) model.Rec
 		plan.Next = model.RecoveryAction{Kind: model.RecoveryFinalizeCertified, Finalize: &finalize}
 		return plan
 	}
-	if record.Attempt.Supervisor != nil && record.Attempt.Retirement == nil {
+	if !admissionAllLaunchGroupsQuiescent(record) {
 		plan.Next = model.RecoveryAction{Kind: model.RecoveryRetireThenFinalize}
 		return plan
 	}
 	plan.Next = model.RecoveryAction{Kind: model.RecoveryFatalUnprovable}
 	return plan
+}
+
+func admissionAllLaunchGroupsQuiescent(record model.SafetyRecord) bool {
+	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launch, ok := record.Attempt.Launches.Get(ordinal)
+		if !ok || launch.Group == nil || launch.Quiescence == nil {
+			return false
+		}
+	}
+	return true
+}
+
+func admissionUnquiescedOrdinals(record model.SafetyRecord) []model.LaunchOrdinal {
+	ordinals := make([]model.LaunchOrdinal, 0, record.Attempt.Launches.Count())
+	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launch, ok := record.Attempt.Launches.Get(ordinal)
+		if ok && launch.Group != nil && launch.Quiescence == nil {
+			ordinals = append(ordinals, ordinal)
+		}
+	}
+	return ordinals
 }
 
 func jobSubmitIdentified(raw json.RawMessage, params protocol.JobSubmitParams) (bool, error) {

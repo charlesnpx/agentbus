@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 )
@@ -202,6 +203,70 @@ func applyRecoveryCommandTx(tx repository.WriteTx, jobID model.JobID, command mo
 	}
 	sessionID := repair.SessionID
 	applied, err := model.Apply(record, command)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if !applied.Changed {
+		if !needsRepair {
+			projection := image.Projection.Value
+			return ApplyResult{Record: record, Projection: projection}, nil
+		}
+		if err := putProjectionFromSafetyTx(tx, record, sessionID, repair.Diagnostic, repair.Quarantine, nextGeneration); err != nil {
+			return ApplyResult{}, err
+		}
+		projection, err := model.Project(record, model.ProjectionMetadata{SessionID: sessionID})
+		if err != nil {
+			projection, err = model.Project(record, model.ProjectionMetadata{})
+			if err != nil {
+				return ApplyResult{}, err
+			}
+		}
+		return ApplyResult{Record: record, Projection: projection}, nil
+	}
+	nextProjection, err := model.Project(applied.Record, model.ProjectionMetadata{SessionID: sessionID})
+	if err != nil {
+		nextProjection, err = model.Project(applied.Record, model.ProjectionMetadata{})
+		if err != nil {
+			return ApplyResult{}, err
+		}
+	}
+	if err := tx.PutSafety(applied.Record, record.Revision); err != nil {
+		return ApplyResult{}, err
+	}
+	if repair.Quarantine {
+		if err := tx.PutQuarantine(repository.QuarantineRecord{
+			JobID:      record.JobID,
+			Diagnostic: repair.Diagnostic,
+			Generation: nextGeneration,
+		}); err != nil {
+			return ApplyResult{}, err
+		}
+	}
+	if err := tx.PutProjection(nextProjection); err != nil {
+		return ApplyResult{}, err
+	}
+	return ApplyResult{Record: applied.Record, Projection: nextProjection, Changed: true}, nil
+}
+
+func applyRecoveryQuiescenceTx(tx repository.WriteTx, jobID model.JobID, ordinal model.LaunchOrdinal, verifier custodian.AttestationVerifier, verified custodian.VerifiedQuiescence, boot model.BootRef, nextGeneration uint64) (ApplyResult, error) {
+	image := tx.LoadJob(jobID)
+	if err := requireRecord("safety", image.Safety.State, image.Safety.Diagnostic); err != nil {
+		return ApplyResult{}, err
+	}
+	record := image.Safety.Value
+	if err := model.ValidateSafetyRecord(record); err != nil {
+		return ApplyResult{}, fatalStartup("safety %s is unsupported: %v", record.JobID, err)
+	}
+	repair, needsRepair, err := projectionRepair(record, image.Projection)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	sessionID := repair.SessionID
+	certificate, err := verifyQuiescenceForRecord(record, ordinal, verifier, verified, boot)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	applied, err := model.Apply(record, model.RecordQuiescence{Ref: record.Attempt.Ref, Receipt: certificate})
 	if err != nil {
 		return ApplyResult{}, err
 	}

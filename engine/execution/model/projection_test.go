@@ -65,15 +65,15 @@ func TestProjectDerivesReadModelFromSafetyRecordOnly(t *testing.T) {
 		t.Fatalf("projection = decision:%s dispatch:%s outcome:%s public:%s", projection.Decision, projection.Dispatch, projection.Outcome, projection.Public)
 	}
 
-	consumed := LaunchConsumed{
+	release := LaunchReleaseFact{
 		Attempt:     record.Attempt.Ref,
 		Ordinal:     LaunchOrdinalOne,
 		Nonce:       "nonce-1",
 		Child:       mustChild(t),
-		ConsumedBy:  record.AdmittedBy,
+		ReleasedBy:  record.AdmittedBy,
 		Observation: mustEvidence(t, "started", "child observed"),
 	}
-	record.Attempt.Consumed.First = &consumed
+	record.Attempt.Launches.First.Released = &release
 	projection, err = Project(record, ProjectionMetadata{})
 	if err != nil {
 		t.Fatalf("project active record: %v", err)
@@ -84,21 +84,12 @@ func TestProjectDerivesReadModelFromSafetyRecordOnly(t *testing.T) {
 
 	result := ResultRef{Path: "results/job-0001.txt", Digest: "sha256:abc123", Bytes: 3}
 	record.Outcome = &OutcomeFact{Attempt: record.Attempt.Ref, Outcome: OutcomeCompleted}
-	record.Attempt.Quiescence.First = &QuiescenceCertificate{
+	record.Attempt.Launches.First.Quiescence = &QuiescenceCertificate{
 		Attempt:     record.Attempt.Ref,
 		Ordinal:     LaunchOrdinalOne,
-		Child:       consumed.Child,
-		ChildExited: mustEvidence(t, "child_exit", "child exited"),
-		GroupEmpty:  mustEvidence(t, "group_empty", "process group empty"),
+		Group:       *record.Attempt.Launches.First.Group,
+		Method:      QuiescenceNaturalExit,
 		CertifiedBy: record.AdmittedBy,
-	}
-	record.Attempt.Retirement = &RetirementCertificate{
-		Attempt:       record.Attempt.Ref,
-		Supervisor:    *record.Attempt.Supervisor,
-		ControlClosed: mustEvidence(t, "control_closed", "control channel closed"),
-		WorkerExited:  mustEvidence(t, "worker_exit", "worker exited"),
-		GroupEmpty:    mustEvidence(t, "group_empty", "process group empty"),
-		CertifiedBy:   record.AdmittedBy,
 	}
 	record.Result = &ResultCertificate{
 		JobID:       record.JobID,

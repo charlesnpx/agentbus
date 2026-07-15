@@ -69,22 +69,18 @@ func applyOpen(next *SafetyRecord, current SafetyRecord, command any) (bool, err
 		return applyAcknowledge(next, current, c)
 	case BeginReject:
 		return applyBeginReject(next, current, c)
-	case BindSupervisor:
-		return applyBindSupervisor(next, current, c)
-	case AuthorizeLaunch:
-		return applyAuthorizeLaunch(next, current, c)
-	case ObserveLaunchConsumed:
-		return applyObserveLaunchConsumed(next, current, c)
-	case ObserveLaunchQuiescent:
-		return applyObserveLaunchQuiescent(next, current, c)
+	case BindGroup:
+		return applyBindGroup(next, current, c)
+	case CommitGrant:
+		return applyCommitGrant(next, current, c)
+	case RecordRelease:
+		return applyRecordRelease(next, current, c)
+	case RecordQuiescence:
+		return applyRecordQuiescence(next, current, c)
 	case RequestCancel:
 		return applyRequestCancel(next, current, c)
 	case ObserveOutcome:
 		return applyObserveOutcome(next, current, c)
-	case CertifyRetirement:
-		return applyCertifyRetirement(next, current, c)
-	case CertifyContainment:
-		return applyCertifyContainment(next, current, c)
 	case CertifyResult:
 		return applyCertifyResult(next, current, c)
 	case Finalize:
@@ -130,37 +126,61 @@ func applyBeginReject(next *SafetyRecord, current SafetyRecord, command BeginRej
 	if current.Mode != ModeLegacyFenced || current.Acknowledgement != nil {
 		return false, precondition("reject can only begin for an unacknowledged legacy fenced record")
 	}
-	if current.Outcome != nil || hasAnyLaunchEvidence(current.Attempt) || current.Attempt.Retirement != nil || current.Attempt.Containment != nil {
+	if current.Outcome != nil || hasAnyLaunchEvidence(current.Attempt) {
 		return false, precondition("reject requires no launch, outcome, or terminal evidence")
 	}
 	return mergeFact(&next.Cancel, fact, "cancel")
 }
 
-func applyBindSupervisor(next *SafetyRecord, current SafetyRecord, command BindSupervisor) (bool, error) {
+func applyBindGroup(next *SafetyRecord, current SafetyRecord, command BindGroup) (bool, error) {
 	if err := ensureAttempt(current, command.Ref); err != nil {
 		return false, err
 	}
-	if err := command.Supervisor.Validate(); err != nil {
-		return false, invalidCommand("supervisor: %v", err)
+	if err := command.Ordinal.Validate(); err != nil {
+		return false, invalidCommand("launch ordinal: %v", err)
 	}
-	if current.Attempt.Supervisor != nil {
-		if current.Attempt.Supervisor.Equal(command.Supervisor) {
+	if err := command.Group.Validate(); err != nil {
+		return false, invalidCommand("group: %v", err)
+	}
+	if !command.Group.Launch.Attempt.Equal(current.Attempt.Ref) {
+		return false, invalidCommand("group launch attempt does not match command attempt")
+	}
+	if command.Group.Launch.Ordinal != command.Ordinal {
+		return false, invalidCommand("group launch ordinal does not match command ordinal")
+	}
+	if existing, ok := current.Attempt.Launches.Get(command.Ordinal); ok {
+		if existing.Group != nil && existing.Group.Equal(command.Group) {
 			return false, nil
 		}
-		return false, conflict("supervisor identity is already recorded")
+		return false, conflict("group reference is already recorded")
+	} else if existing != nil {
+		return false, conflict("launch slot is inconsistent")
 	}
 	if !acceptedOrAcknowledged(current) {
-		return false, precondition("supervisor binding requires accepted or acknowledged state")
+		return false, precondition("group binding requires accepted or acknowledged state")
 	}
-	if current.Cancel != nil || current.Outcome != nil || hasAnyLaunchEvidence(current.Attempt) || current.Attempt.Retirement != nil || current.Attempt.Containment != nil {
-		return false, precondition("supervisor binding must precede cancellation, launch, and retirement evidence")
+	if current.Cancel != nil || current.Outcome != nil {
+		return false, precondition("group binding must precede cancellation and outcome evidence")
 	}
-	supervisor := command.Supervisor
-	next.Attempt.Supervisor = &supervisor
-	return true, nil
+	if command.Ordinal == LaunchOrdinalOne {
+		if hasAnyLaunchEvidence(current.Attempt) {
+			return false, precondition("launch ordinal 1 must be the first group binding")
+		}
+	} else {
+		first, ok := current.Attempt.Launches.Get(LaunchOrdinalOne)
+		if !ok || first.Quiescence == nil {
+			return false, precondition("launch ordinal 2 requires ordinal 1 quiescence")
+		}
+		if hasUnconsumedGrant(current.Attempt) || hasActiveLaunch(current.Attempt) {
+			return false, precondition("launch ordinal 2 requires no live ordinal")
+		}
+	}
+	group := command.Group
+	launch := LaunchProof{Ordinal: command.Ordinal, Group: &group}
+	return mergeLaunchSlot(&next.Attempt.Launches, command.Ordinal, launch, "launch")
 }
 
-func applyAuthorizeLaunch(next *SafetyRecord, current SafetyRecord, command AuthorizeLaunch) (bool, error) {
+func applyCommitGrant(next *SafetyRecord, current SafetyRecord, command CommitGrant) (bool, error) {
 	if err := ensureAttempt(current, command.Ref); err != nil {
 		return false, err
 	}
@@ -174,49 +194,37 @@ func applyAuthorizeLaunch(next *SafetyRecord, current SafetyRecord, command Auth
 	if err != nil {
 		return false, err
 	}
-	if current.Attempt.Supervisor == nil {
-		return false, precondition("launch authorization requires durable supervisor identity")
+	launch, ok := current.Attempt.Launches.Get(command.Ordinal)
+	if !ok {
+		return false, precondition("grant commit requires durable group reference")
 	}
 	grant := LaunchGrant{
-		Attempt:    current.Attempt.Ref,
-		Supervisor: *current.Attempt.Supervisor,
-		Ordinal:    command.Ordinal,
-		Nonce:      LaunchNonce(command.Nonce),
-		GrantedBy:  grantedBy,
+		Attempt:   current.Attempt.Ref,
+		Ordinal:   command.Ordinal,
+		Nonce:     LaunchNonce(command.Nonce),
+		GrantedBy: grantedBy,
 	}
-	if existing, ok := current.Attempt.Grants.Get(command.Ordinal); ok {
-		return mergeLaunchSlot(&next.Attempt.Grants, command.Ordinal, grant, "launch grant")
-	} else if existing != nil {
-		return false, conflict("launch grant slot is inconsistent")
+	if launch.Grant != nil {
+		if *launch.Grant == grant {
+			return false, nil
+		}
+		return false, conflict("launch grant already recorded with different evidence")
 	}
-	if nonceUsedByOtherGrant(current.Attempt.Grants, command.Ordinal, LaunchNonce(command.Nonce)) {
+	if nonceUsedByOtherGrant(current.Attempt, command.Ordinal, LaunchNonce(command.Nonce)) {
 		return false, conflict("permit nonce is already bound to another launch")
 	}
-	if current.Cancel != nil || current.Outcome != nil || current.Attempt.Retirement != nil || current.Attempt.Containment != nil {
-		return false, precondition("launch authorization requires no cancellation, outcome, retirement, or containment evidence")
+	if current.Cancel != nil || current.Outcome != nil {
+		return false, precondition("grant commit requires no cancellation or outcome evidence")
 	}
 	if !acceptedOrAcknowledged(current) {
-		return false, precondition("launch authorization requires accepted or acknowledged state")
+		return false, precondition("grant commit requires accepted or acknowledged state")
 	}
-	if command.Ordinal == LaunchOrdinalOne {
-		if current.Attempt.Grants.Count() != 0 || current.Attempt.Consumed.Count() != 0 || current.Attempt.Quiescence.Count() != 0 {
-			return false, precondition("launch ordinal 1 must be the first launch authority")
-		}
-	} else {
-		if _, ok := current.Attempt.Grants.Get(LaunchOrdinalOne); !ok {
-			return false, precondition("launch ordinal 2 requires ordinal 1 grant history")
-		}
-		if _, ok := current.Attempt.Quiescence.Get(LaunchOrdinalOne); !ok {
-			return false, precondition("launch ordinal 2 requires ordinal 1 quiescence")
-		}
-		if hasUnconsumedGrant(current.Attempt) || hasActiveLaunch(current.Attempt) {
-			return false, precondition("launch ordinal 2 requires no live ordinal")
-		}
-	}
-	return mergeLaunchSlot(&next.Attempt.Grants, command.Ordinal, grant, "launch grant")
+	nextLaunch := *launch
+	nextLaunch.Grant = &grant
+	return replaceLaunchSlot(&next.Attempt.Launches, command.Ordinal, nextLaunch)
 }
 
-func applyObserveLaunchConsumed(next *SafetyRecord, current SafetyRecord, command ObserveLaunchConsumed) (bool, error) {
+func applyRecordRelease(next *SafetyRecord, current SafetyRecord, command RecordRelease) (bool, error) {
 	if err := ensureAttempt(current, command.Ref); err != nil {
 		return false, err
 	}
@@ -226,38 +234,41 @@ func applyObserveLaunchConsumed(next *SafetyRecord, current SafetyRecord, comman
 	if err := command.Child.Validate(); err != nil {
 		return false, invalidCommand("child identity: %v", err)
 	}
-	consumedBy, err := resolveBootRef(command.ConsumedBy, current.AdmittedBy, "launch_consumed.consumed_by")
+	releasedBy, err := resolveBootRef(command.ReleasedBy, current.AdmittedBy, "launch_release.released_by")
 	if err != nil {
 		return false, err
 	}
-	observation, err := resolveEvidence(command.Observation, "launch_consumed", "launch consumed", "launch_consumed.observation")
+	observation, err := resolveEvidence(command.Observation, "launch_release", "launch released", "launch_release.observation")
 	if err != nil {
 		return false, err
 	}
-	grant, ok := current.Attempt.Grants.Get(command.Ordinal)
-	if !ok {
-		return false, precondition("launch consumption requires matching grant")
+	launch, ok := current.Attempt.Launches.Get(command.Ordinal)
+	if !ok || launch.Grant == nil {
+		return false, precondition("launch release requires matching grant")
 	}
-	consumed := LaunchConsumed{
+	release := LaunchReleaseFact{
 		Attempt:     current.Attempt.Ref,
 		Ordinal:     command.Ordinal,
-		Nonce:       grant.Nonce,
+		Nonce:       launch.Grant.Nonce,
 		Child:       command.Child,
-		ConsumedBy:  consumedBy,
+		ReleasedBy:  releasedBy,
 		Observation: observation,
 	}
-	if existing, ok := current.Attempt.Consumed.Get(command.Ordinal); ok {
-		return mergeLaunchSlot(&next.Attempt.Consumed, command.Ordinal, consumed, "launch consumption")
-	} else if existing != nil {
-		return false, conflict("launch consumption slot is inconsistent")
+	if launch.Released != nil {
+		if *launch.Released == release {
+			return false, nil
+		}
+		return false, conflict("launch release already recorded with different evidence")
 	}
-	if current.Attempt.Retirement != nil || current.Attempt.Containment != nil {
-		return false, precondition("new launch consumption cannot follow retirement or containment")
+	if launch.Quiescence != nil {
+		return false, precondition("new launch release cannot follow quiescence")
 	}
-	return mergeLaunchSlot(&next.Attempt.Consumed, command.Ordinal, consumed, "launch consumption")
+	nextLaunch := *launch
+	nextLaunch.Released = &release
+	return replaceLaunchSlot(&next.Attempt.Launches, command.Ordinal, nextLaunch)
 }
 
-func applyObserveLaunchQuiescent(next *SafetyRecord, current SafetyRecord, command ObserveLaunchQuiescent) (bool, error) {
+func applyRecordQuiescence(next *SafetyRecord, current SafetyRecord, command RecordQuiescence) (bool, error) {
 	if err := ensureAttempt(current, command.Ref); err != nil {
 		return false, err
 	}
@@ -268,18 +279,22 @@ func applyObserveLaunchQuiescent(next *SafetyRecord, current SafetyRecord, comma
 	if err := validateAttemptField("quiescence.attempt", receipt.Attempt, current.Attempt.Ref); err != nil {
 		return false, invalidCommand("%v", err)
 	}
-	if existing, ok := current.Attempt.Quiescence.Get(receipt.Ordinal); ok {
-		return mergeLaunchSlot(&next.Attempt.Quiescence, receipt.Ordinal, receipt, "quiescence")
-	} else if existing != nil {
-		return false, conflict("quiescence slot is inconsistent")
+	launch, ok := current.Attempt.Launches.Get(receipt.Ordinal)
+	if !ok || launch.Group == nil {
+		return false, precondition("quiescence requires durable group reference")
 	}
-	if _, ok := current.Attempt.Consumed.Get(receipt.Ordinal); !ok {
-		return false, precondition("quiescence requires matching launch consumption")
+	if !receipt.Group.Equal(*launch.Group) {
+		return false, conflict("quiescence group does not match durable group")
 	}
-	if current.Attempt.Retirement != nil || current.Attempt.Containment != nil {
-		return false, precondition("new quiescence cannot follow retirement or containment")
+	if launch.Quiescence != nil {
+		if *launch.Quiescence == receipt {
+			return false, nil
+		}
+		return false, conflict("quiescence already recorded with different evidence")
 	}
-	return mergeLaunchSlot(&next.Attempt.Quiescence, receipt.Ordinal, receipt, "quiescence")
+	nextLaunch := *launch
+	nextLaunch.Quiescence = &receipt
+	return replaceLaunchSlot(&next.Attempt.Launches, receipt.Ordinal, nextLaunch)
 }
 
 func applyRequestCancel(next *SafetyRecord, current SafetyRecord, command RequestCancel) (bool, error) {
@@ -311,59 +326,13 @@ func applyObserveOutcome(next *SafetyRecord, current SafetyRecord, command Obser
 	if current.Outcome != nil {
 		return mergeFact(&next.Outcome, fact, "outcome")
 	}
-	if completionOutcome(command.Outcome) && current.Attempt.Consumed.Count() == 0 {
-		return false, precondition("completed outcome requires consumed launch evidence")
+	if completionOutcome(command.Outcome) && !hasAnyRelease(current.Attempt) {
+		return false, precondition("completed outcome requires release evidence")
 	}
 	if current.Cancel != nil && !hasAnyLaunchEvidence(current.Attempt) && command.Outcome != OutcomeCanceled {
 		return false, precondition("cancel before authorization cannot be rewritten by outcome")
 	}
 	return mergeFact(&next.Outcome, fact, "outcome")
-}
-
-func applyCertifyRetirement(next *SafetyRecord, current SafetyRecord, command CertifyRetirement) (bool, error) {
-	if err := ensureAttempt(current, command.Ref); err != nil {
-		return false, err
-	}
-	receipt := RetirementCertificate(command.Receipt)
-	if err := receipt.Validate(); err != nil {
-		return false, invalidCommand("retirement receipt: %v", err)
-	}
-	if err := validateAttemptField("retirement.attempt", receipt.Attempt, current.Attempt.Ref); err != nil {
-		return false, invalidCommand("%v", err)
-	}
-	if current.Attempt.Supervisor == nil {
-		return false, precondition("retirement requires durable supervisor identity")
-	}
-	if !receipt.Supervisor.Equal(*current.Attempt.Supervisor) {
-		return false, conflict("retirement supervisor does not match durable supervisor")
-	}
-	if current.Attempt.Retirement != nil {
-		return mergeFact(&next.Attempt.Retirement, receipt, "retirement")
-	}
-	if current.Attempt.Containment == nil && (hasUnconsumedGrant(current.Attempt) || hasActiveLaunch(current.Attempt)) {
-		return false, precondition("retirement before containment requires no live or uncertain launch")
-	}
-	return mergeFact(&next.Attempt.Retirement, receipt, "retirement")
-}
-
-func applyCertifyContainment(next *SafetyRecord, current SafetyRecord, command CertifyContainment) (bool, error) {
-	if err := ensureAttempt(current, command.Ref); err != nil {
-		return false, err
-	}
-	receipt := ContainmentCertificate(command.Receipt)
-	if err := receipt.Validate(); err != nil {
-		return false, invalidCommand("containment receipt: %v", err)
-	}
-	if err := validateAttemptField("containment.attempt", receipt.Attempt, current.Attempt.Ref); err != nil {
-		return false, invalidCommand("%v", err)
-	}
-	if current.Attempt.Supervisor == nil {
-		return false, precondition("containment requires durable supervisor identity")
-	}
-	if !receipt.Supervisor.Equal(*current.Attempt.Supervisor) {
-		return false, conflict("containment supervisor does not match durable supervisor")
-	}
-	return mergeFact(&next.Attempt.Containment, receipt, "containment")
 }
 
 func applyCertifyResult(next *SafetyRecord, current SafetyRecord, command CertifyResult) (bool, error) {
@@ -436,30 +405,30 @@ func normalizeCommand(command Command) (any, error) {
 			return nil, invalidCommand("command is nil")
 		}
 		return *c, nil
-	case BindSupervisor:
+	case BindGroup:
 		return c, nil
-	case *BindSupervisor:
+	case *BindGroup:
 		if c == nil {
 			return nil, invalidCommand("command is nil")
 		}
 		return *c, nil
-	case AuthorizeLaunch:
+	case CommitGrant:
 		return c, nil
-	case *AuthorizeLaunch:
+	case *CommitGrant:
 		if c == nil {
 			return nil, invalidCommand("command is nil")
 		}
 		return *c, nil
-	case ObserveLaunchConsumed:
+	case RecordRelease:
 		return c, nil
-	case *ObserveLaunchConsumed:
+	case *RecordRelease:
 		if c == nil {
 			return nil, invalidCommand("command is nil")
 		}
 		return *c, nil
-	case ObserveLaunchQuiescent:
+	case RecordQuiescence:
 		return c, nil
-	case *ObserveLaunchQuiescent:
+	case *RecordQuiescence:
 		if c == nil {
 			return nil, invalidCommand("command is nil")
 		}
@@ -474,20 +443,6 @@ func normalizeCommand(command Command) (any, error) {
 	case ObserveOutcome:
 		return c, nil
 	case *ObserveOutcome:
-		if c == nil {
-			return nil, invalidCommand("command is nil")
-		}
-		return *c, nil
-	case CertifyRetirement:
-		return c, nil
-	case *CertifyRetirement:
-		if c == nil {
-			return nil, invalidCommand("command is nil")
-		}
-		return *c, nil
-	case CertifyContainment:
-		return c, nil
-	case *CertifyContainment:
 		if c == nil {
 			return nil, invalidCommand("command is nil")
 		}
@@ -560,16 +515,59 @@ func emptyBootRef(value BootRef) bool {
 }
 
 func hasAnyLaunchEvidence(proof AttemptProof) bool {
-	return proof.Grants.Count() != 0 || proof.Consumed.Count() != 0 || proof.Quiescence.Count() != 0
+	return proof.Launches.Count() != 0
 }
 
-func nonceUsedByOtherGrant(slots LaunchSlots[LaunchGrant], ordinal LaunchOrdinal, nonce LaunchNonce) bool {
-	for _, filled := range slots.FilledOrdinals() {
+func hasAnyGrant(proof AttemptProof) bool {
+	for _, ordinal := range proof.Launches.FilledOrdinals() {
+		launch, ok := proof.Launches.Get(ordinal)
+		if ok && launch.Grant != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyRelease(proof AttemptProof) bool {
+	for _, ordinal := range proof.Launches.FilledOrdinals() {
+		launch, ok := proof.Launches.Get(ordinal)
+		if ok && launch.Released != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func allLaunchGroupsQuiescent(proof AttemptProof) bool {
+	for _, ordinal := range proof.Launches.FilledOrdinals() {
+		launch, ok := proof.Launches.Get(ordinal)
+		if !ok || launch.Group == nil || launch.Quiescence == nil {
+			return false
+		}
+	}
+	return true
+}
+
+func allGrantedLaunchesReleasedAndQuiescent(proof AttemptProof) bool {
+	for _, ordinal := range proof.Launches.FilledOrdinals() {
+		launch, ok := proof.Launches.Get(ordinal)
+		if !ok || launch.Grant == nil {
+			continue
+		}
+		if launch.Released == nil || launch.Quiescence == nil {
+			return false
+		}
+	}
+	return true
+}
+
+func nonceUsedByOtherGrant(proof AttemptProof, ordinal LaunchOrdinal, nonce LaunchNonce) bool {
+	for _, filled := range proof.Launches.FilledOrdinals() {
 		if filled == ordinal {
 			continue
 		}
-		grant, ok := slots.Get(filled)
-		if ok && grant.Nonce == nonce {
+		launch, ok := proof.Launches.Get(filled)
+		if ok && launch.Grant != nil && launch.Grant.Nonce == nonce {
 			return true
 		}
 	}
@@ -608,6 +606,18 @@ func mergeLaunchSlot[T comparable](slots *LaunchSlots[T], ordinal LaunchOrdinal,
 	return false, conflict("%s already recorded with different evidence", label)
 }
 
+func replaceLaunchSlot(slots *LaunchSlots[LaunchProof], ordinal LaunchOrdinal, launch LaunchProof) (bool, error) {
+	switch ordinal {
+	case LaunchOrdinalOne:
+		slots.First = &launch
+	case LaunchOrdinalTwo:
+		slots.Second = &launch
+	default:
+		return false, invalidCommand("launch ordinal is invalid")
+	}
+	return true, nil
+}
+
 func mergeTerminal(record *SafetyRecord, certificate TerminalCertificate) (bool, error) {
 	if record.Terminal == nil {
 		copied := certificate
@@ -638,12 +648,7 @@ func terminalCertificateEqual(left, right TerminalCertificate) bool {
 
 func cloneSafetyRecord(record SafetyRecord) SafetyRecord {
 	next := record
-	next.Attempt.Supervisor = clonePtr(record.Attempt.Supervisor)
-	next.Attempt.Grants = cloneLaunchSlots(record.Attempt.Grants)
-	next.Attempt.Consumed = cloneLaunchSlots(record.Attempt.Consumed)
-	next.Attempt.Quiescence = cloneLaunchSlots(record.Attempt.Quiescence)
-	next.Attempt.Retirement = clonePtr(record.Attempt.Retirement)
-	next.Attempt.Containment = clonePtr(record.Attempt.Containment)
+	next.Attempt.Launches = cloneLaunchSlots(record.Attempt.Launches)
 	next.Acknowledgement = clonePtr(record.Acknowledgement)
 	next.Cancel = clonePtr(record.Cancel)
 	next.Outcome = clonePtr(record.Outcome)

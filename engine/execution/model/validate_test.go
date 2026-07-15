@@ -126,22 +126,22 @@ func TestSafetyRecordValidationRequiresMatchingProofIdentities(t *testing.T) {
 		t.Fatalf("mismatched attempt job error = %v, want ErrInvalidValue", err)
 	}
 
-	missingGrant := record
-	missingGrant.Attempt.Consumed.First = &LaunchConsumed{
+	missingGrant := cloneSafetyRecord(record)
+	missingGrant.Attempt.Launches.First.Released = &LaunchReleaseFact{
 		Attempt:     record.Attempt.Ref,
 		Ordinal:     LaunchOrdinalOne,
 		Nonce:       "nonce-1",
 		Child:       mustChild(t),
-		ConsumedBy:  record.AdmittedBy,
+		ReleasedBy:  record.AdmittedBy,
 		Observation: mustEvidence(t, "started", "child observed"),
 	}
-	missingGrant.Attempt.Grants.First = nil
+	missingGrant.Attempt.Launches.First.Grant = nil
 	if err := missingGrant.Validate(); !errors.Is(err, ErrInvalidValue) {
 		t.Fatalf("missing grant error = %v, want ErrInvalidValue", err)
 	}
 
-	wrongSlot := record
-	wrongSlot.Attempt.Grants.First.Ordinal = LaunchOrdinalTwo
+	wrongSlot := cloneSafetyRecord(record)
+	wrongSlot.Attempt.Launches.First.Grant.Ordinal = LaunchOrdinalTwo
 	if err := wrongSlot.Validate(); !errors.Is(err, ErrInvalidValue) {
 		t.Fatalf("wrong slot error = %v, want ErrInvalidValue", err)
 	}
@@ -176,33 +176,40 @@ func TestTerminalProofRequiresSupportingCertificates(t *testing.T) {
 		DerivedBy:           record.AdmittedBy,
 	}
 	if err := record.Validate(); !errors.Is(err, ErrInvalidValue) {
-		t.Fatalf("terminal without supporting retirement error = %v, want ErrInvalidValue", err)
+		t.Fatalf("terminal without supporting quiescence error = %v, want ErrInvalidValue", err)
 	}
 
-	record.Attempt.Grants = LaunchSlots[LaunchGrant]{}
-	record.Attempt.Retirement = &RetirementCertificate{
-		Attempt:       record.Attempt.Ref,
-		Supervisor:    *record.Attempt.Supervisor,
-		ControlClosed: mustEvidence(t, "control_closed", "control channel closed"),
-		WorkerExited:  mustEvidence(t, "worker_exit", "worker exited"),
-		GroupEmpty:    mustEvidence(t, "group_empty", "process group empty"),
-		CertifiedBy:   record.AdmittedBy,
+	record.Attempt.Launches.First.Grant = nil
+	record.Attempt.Launches.First.Quiescence = &QuiescenceCertificate{
+		Attempt:     record.Attempt.Ref,
+		Ordinal:     LaunchOrdinalOne,
+		Group:       *record.Attempt.Launches.First.Group,
+		Method:      QuiescenceAlreadyAbsent,
+		CertifiedBy: record.AdmittedBy,
 	}
 	if err := record.Validate(); err != nil {
-		t.Fatalf("terminal with supporting retirement rejected: %v", err)
+		t.Fatalf("terminal with supporting quiescence rejected: %v", err)
 	}
 }
 
 func validSafetyRecord() SafetyRecord {
 	boot := BootRef{BootID: "boot-1", OwnerID: "owner-1"}
 	attempt := AttemptRef{JobID: "job-0001", AttemptID: "attempt-1", Epoch: 1}
-	supervisor := SupervisorIdentity{PGID: 10, LeaderPID: 11, HighResStartToken: "start-10"}
+	group := GroupRef{
+		Version:    1,
+		CustodyID:  "custody-1",
+		Launch:     LaunchKey{Attempt: attempt, Ordinal: LaunchOrdinalOne},
+		HostBootID: "host-boot-1",
+		PGID:       10,
+		Leader:     ProcessIdentity{PID: 11, HighResStartToken: "leader-start-10"},
+		Monitor:    ProcessIdentity{PID: 12, HighResStartToken: "monitor-start-10"},
+		RetainedID: "retained-1",
+	}
 	grant := LaunchGrant{
-		Attempt:    attempt,
-		Supervisor: supervisor,
-		Ordinal:    LaunchOrdinalOne,
-		Nonce:      "nonce-1",
-		GrantedBy:  boot,
+		Attempt:   attempt,
+		Ordinal:   LaunchOrdinalOne,
+		Nonce:     "nonce-1",
+		GrantedBy: boot,
 	}
 	return SafetyRecord{
 		SchemaVersion: 1,
@@ -213,9 +220,12 @@ func validSafetyRecord() SafetyRecord {
 		Mode:          ModeIdentifiedFenced,
 		AdmittedBy:    boot,
 		Attempt: AttemptProof{
-			Ref:        attempt,
-			Supervisor: &supervisor,
-			Grants:     LaunchSlots[LaunchGrant]{First: &grant},
+			Ref: attempt,
+			Launches: LaunchSlots[LaunchProof]{First: &LaunchProof{
+				Ordinal: LaunchOrdinalOne,
+				Group:   &group,
+				Grant:   &grant,
+			}},
 		},
 	}
 }

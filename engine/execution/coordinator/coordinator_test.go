@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
@@ -189,7 +190,8 @@ func TestCorrectiveLaunchRequiresQuiescence(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot = h.snapshot(t, ctx, accepted.Record.JobID)
-	if _, ok := snapshot.Record.Attempt.Grants.Get(model.LaunchOrdinalTwo); !ok {
+	launch, ok := snapshot.Record.Attempt.Launches.Get(model.LaunchOrdinalTwo)
+	if !ok || launch.Grant == nil {
 		t.Fatal("ordinal 2 grant missing after quiescence")
 	}
 }
@@ -215,8 +217,8 @@ func TestPostGrantFailureRecoveryContainsAndRetires(t *testing.T) {
 	if snapshot.Record.Terminal.Proof != model.ProofContained {
 		t.Fatalf("proof = %s, want %s", snapshot.Record.Terminal.Proof, model.ProofContained)
 	}
-	if h.supervisor.contained != 1 || h.supervisor.retired != 1 {
-		t.Fatalf("recovery effects contain=%d retire=%d, want 1/1", h.supervisor.contained, h.supervisor.retired)
+	if h.supervisor.contained != 1 || h.supervisor.retired != 0 {
+		t.Fatalf("recovery effects contain=%d retire=%d, want 1/0", h.supervisor.contained, h.supervisor.retired)
 	}
 }
 
@@ -255,7 +257,7 @@ func TestGrantBeforeCommitFailpointLeavesNoAuthorityCommitOrPermit(t *testing.T)
 		t.Fatal("grant before-commit failpoint was not hit")
 	}
 	snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
-	if snapshot.Record.Attempt.Grants.Count() != 0 || snapshot.Record.Terminal != nil {
+	if hasCommittedGrant(snapshot.Record) || snapshot.Record.Terminal != nil {
 		t.Fatalf("record after before-commit failure = %#v, want no grant and nonterminal", snapshot.Record)
 	}
 	if h.supervisor.permits != 0 {
@@ -336,7 +338,8 @@ func TestRegressionSeedPR28DoubleFaultNeverIssuesSecondGrant(t *testing.T) {
 		if image.Safety.State != repository.RecordValid {
 			t.Fatalf("safety state = %s, want valid", image.Safety.State)
 		}
-		if _, ok := image.Safety.Value.Attempt.Grants.Get(model.LaunchOrdinalTwo); ok {
+		launch, ok := image.Safety.Value.Attempt.Launches.Get(model.LaunchOrdinalTwo)
+		if ok && launch.Grant != nil {
 			t.Fatal("ordinal 2 grant was recorded after PR #28 double fault")
 		}
 		if image.Safety.Value.Terminal != nil && image.Safety.Value.Terminal.Proof != model.ProofContained {
@@ -399,7 +402,8 @@ type harness struct {
 func newHarness(t *testing.T, name string) *harness {
 	t.Helper()
 	repo := memory.NewRepository()
-	bootstrapper, err := authority.NewBootstrapper(repo)
+	issuer, verifier := custodian.NewAttestationChannel()
+	bootstrapper, err := authority.NewBootstrapper(repo, authority.WithQuiescenceVerifier(verifier))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +420,7 @@ func newHarness(t *testing.T, name string) *harness {
 		t.Fatal(err)
 	}
 	auth := &readyAuthority{ready: ready}
-	supervisor := &testSupervisor{}
+	supervisor := &testSupervisor{issuer: issuer, boot: boot}
 	results := &testResults{receipts: map[model.ResultRef]model.ResultReceipt{}}
 	coordinator, err := New(auth, supervisor, results, model.OwnerID("coordinator-"+name))
 	if err != nil {
@@ -493,8 +497,47 @@ func (a *readyAuthority) Accept(ctx context.Context, request AdmissionRequest) (
 	return AdmissionResult{Record: accepted.Record, Projection: accepted.Projection, Replayed: accepted.Replayed}, nil
 }
 
-func (a *readyAuthority) Apply(ctx context.Context, jobID model.JobID, command model.Command) (StepResult, error) {
-	applied, err := a.ready.Apply(ctx, jobID, command)
+func (a *readyAuthority) BindGroup(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, group model.GroupRef) (StepResult, error) {
+	applied, err := a.ready.BindGroup(ctx, jobID, ref, ordinal, group)
+	return stepResult(applied, err)
+}
+
+func (a *readyAuthority) CommitGrant(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, nonce model.PermitNonce) (StepResult, error) {
+	applied, err := a.ready.CommitGrant(ctx, jobID, ref, ordinal, nonce)
+	return stepResult(applied, err)
+}
+
+func (a *readyAuthority) RecordRelease(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, child model.ChildIdentity, evidence model.Evidence) (StepResult, error) {
+	applied, err := a.ready.RecordRelease(ctx, jobID, ref, ordinal, child, evidence)
+	return stepResult(applied, err)
+}
+
+func (a *readyAuthority) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) (StepResult, error) {
+	applied, err := a.ready.RecordQuiescence(ctx, jobID, ordinal, verified)
+	return stepResult(applied, err)
+}
+
+func (a *readyAuthority) RequestCancel(ctx context.Context, jobID model.JobID) (StepResult, error) {
+	applied, err := a.ready.RequestCancel(ctx, jobID)
+	return stepResult(applied, err)
+}
+
+func (a *readyAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) (StepResult, error) {
+	applied, err := a.ready.RecordOutcome(ctx, jobID, ref, outcome)
+	return stepResult(applied, err)
+}
+
+func (a *readyAuthority) RecordResult(ctx context.Context, jobID model.JobID, ref model.AttemptRef, receipt model.ResultReceipt) (StepResult, error) {
+	applied, err := a.ready.RecordResult(ctx, jobID, ref, receipt)
+	return stepResult(applied, err)
+}
+
+func (a *readyAuthority) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent) (StepResult, error) {
+	applied, err := a.ready.Finalize(ctx, jobID, ref, intent)
+	return stepResult(applied, err)
+}
+
+func stepResult(applied authority.ApplyResult, err error) (StepResult, error) {
 	if err != nil {
 		return StepResult{}, err
 	}
@@ -520,7 +563,7 @@ func (a *readyAuthority) RecoveryPlan(ctx context.Context, jobID model.JobID, tr
 	if err != nil {
 		return model.RecoveryPlan{}, err
 	}
-	if trigger == model.RecoveryCancelAfterGrant && !hasLaunchEvidence(snapshot.Record) {
+	if trigger == model.RecoveryCancelAfterGrant && !hasAuthorizationEvidence(snapshot.Record) {
 		return cancelBeforeAuthorizationPlan(snapshot.Record), nil
 	}
 	return model.PlanRecovery(snapshot.Record, trigger)
@@ -547,8 +590,14 @@ func (a *readyAuthority) FailStop(ctx context.Context, err error) error {
 	return a.ready.FailStop(ctx, err.Error())
 }
 
-func hasLaunchEvidence(record model.SafetyRecord) bool {
-	return record.Attempt.Grants.Count() != 0 || record.Attempt.Consumed.Count() != 0 || record.Attempt.Quiescence.Count() != 0
+func hasAuthorizationEvidence(record model.SafetyRecord) bool {
+	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launch, ok := record.Attempt.Launches.Get(ordinal)
+		if ok && (launch.Grant != nil || launch.Released != nil) {
+			return true
+		}
+	}
+	return false
 }
 
 func cancelBeforeAuthorizationPlan(record model.SafetyRecord) model.RecoveryPlan {
@@ -566,12 +615,32 @@ func cancelBeforeAuthorizationPlan(record model.SafetyRecord) model.RecoveryPlan
 		plan.Next = model.RecoveryAction{Kind: model.RecoveryFinalizeCertified, Finalize: &finalize}
 		return plan
 	}
-	if record.Attempt.Supervisor != nil && record.Attempt.Retirement == nil {
+	if hasPreparedUnquiescedGroup(record) {
 		plan.Next = model.RecoveryAction{Kind: model.RecoveryRetireThenFinalize}
 		return plan
 	}
 	plan.Next = model.RecoveryAction{Kind: model.RecoveryFatalUnprovable}
 	return plan
+}
+
+func hasPreparedUnquiescedGroup(record model.SafetyRecord) bool {
+	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launch, ok := record.Attempt.Launches.Get(ordinal)
+		if ok && launch.Group != nil && launch.Quiescence == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCommittedGrant(record model.SafetyRecord) bool {
+	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launch, ok := record.Attempt.Launches.Get(ordinal)
+		if ok && launch.Grant != nil {
+			return true
+		}
+	}
+	return false
 }
 
 type testSupervisor struct {
@@ -581,6 +650,8 @@ type testSupervisor struct {
 	retired     int
 	failSend    bool
 	failContain bool
+	issuer      custodian.AttestationIssuer
+	boot        model.BootRef
 }
 
 func (s *testSupervisor) Prepare(ctx context.Context, plan LaunchPlan) (PreparedSupervisor, error) {
@@ -588,14 +659,29 @@ func (s *testSupervisor) Prepare(ctx context.Context, plan LaunchPlan) (Prepared
 		return PreparedSupervisor{}, err
 	}
 	s.next++
-	return PreparedSupervisor{
-		Ref: plan.Ref,
-		Identity: model.SupervisorIdentity{
-			PGID:               1000 + s.next,
-			LeaderPID:          2000 + s.next,
-			HighResStartToken:  fmt.Sprintf("supervisor-token-%d", s.next),
-			PlatformRetainedID: fmt.Sprintf("retained-%d", s.next),
+	group := model.GroupRef{
+		Version:   1,
+		CustodyID: model.CustodyID(fmt.Sprintf("custody-%s-%s", plan.Ref.JobID, plan.Ordinal)),
+		Launch: model.LaunchKey{
+			Attempt: plan.Ref,
+			Ordinal: plan.Ordinal,
 		},
+		HostBootID: "host-boot-" + plan.Ref.JobID.String(),
+		PGID:       1000 + s.next,
+		Leader: model.ProcessIdentity{
+			PID:               2000 + s.next,
+			HighResStartToken: fmt.Sprintf("leader-token-%d", s.next),
+		},
+		Monitor: model.ProcessIdentity{
+			PID:               3000 + s.next,
+			HighResStartToken: fmt.Sprintf("monitor-token-%d", s.next),
+		},
+		RetainedID: fmt.Sprintf("retained-%d", s.next),
+	}
+	return PreparedSupervisor{
+		Ref:     plan.Ref,
+		Ordinal: plan.Ordinal,
+		Group:   group,
 	}, nil
 }
 
@@ -617,54 +703,47 @@ func (s *testSupervisor) ObserveLaunch(ctx context.Context, prepared PreparedSup
 	return LaunchObservation{
 		Ordinal: grant.Ordinal,
 		Child: model.ChildIdentity{
-			PID:               prepared.Identity.LeaderPID,
-			HighResStartToken: prepared.Identity.HighResStartToken,
+			PID:               prepared.Group.Leader.PID,
+			HighResStartToken: prepared.Group.Leader.HighResStartToken,
 		},
 		Evidence: evidence("launch-consumed"),
 	}, nil
 }
 
-func (s *testSupervisor) VerifyQuiescence(ctx context.Context, prepared PreparedSupervisor, consumed model.LaunchConsumed) (model.QuiescenceReceipt, error) {
+func (s *testSupervisor) VerifyQuiescence(ctx context.Context, prepared PreparedSupervisor, released model.LaunchReleaseFact) (custodian.VerifiedQuiescence, error) {
 	if err := ctx.Err(); err != nil {
-		return model.QuiescenceReceipt{}, err
+		return custodian.VerifiedQuiescence{}, err
 	}
-	return model.QuiescenceReceipt{
-		Attempt:     prepared.Ref,
-		Ordinal:     consumed.Ordinal,
-		Child:       consumed.Child,
-		ChildExited: evidence("child-exit"),
-		GroupEmpty:  evidence("group-empty"),
-	}, nil
+	return s.attest(prepared, model.QuiescenceNaturalExit)
 }
 
-func (s *testSupervisor) Contain(ctx context.Context, prepared PreparedSupervisor) (model.ContainmentReceipt, error) {
+func (s *testSupervisor) Contain(ctx context.Context, prepared PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
 	if err := ctx.Err(); err != nil {
-		return model.ContainmentReceipt{}, err
+		return custodian.VerifiedQuiescence{}, err
 	}
 	if s.failContain {
-		return model.ContainmentReceipt{}, errors.New("containment failed")
+		return custodian.VerifiedQuiescence{}, errors.New("containment failed")
 	}
 	s.contained++
-	return model.ContainmentReceipt{
-		Attempt:      prepared.Ref,
-		Supervisor:   prepared.Identity,
-		Signal:       evidence("contain-signal"),
-		Verification: evidence("contain-verified"),
-	}, nil
+	return s.attest(prepared, model.QuiescenceTermKill)
 }
 
-func (s *testSupervisor) Retire(ctx context.Context, prepared PreparedSupervisor) (model.RetirementReceipt, error) {
+func (s *testSupervisor) Retire(ctx context.Context, prepared PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
 	if err := ctx.Err(); err != nil {
-		return model.RetirementReceipt{}, err
+		return custodian.VerifiedQuiescence{}, err
 	}
 	s.retired++
-	return model.RetirementReceipt{
-		Attempt:       prepared.Ref,
-		Supervisor:    prepared.Identity,
-		ControlClosed: evidence("control-closed"),
-		WorkerExited:  evidence("worker-exited"),
-		GroupEmpty:    evidence("retire-group-empty"),
-	}, nil
+	return s.attest(prepared, model.QuiescenceAlreadyAbsent)
+}
+
+func (s *testSupervisor) attest(prepared PreparedSupervisor, method model.QuiescenceMethod) (custodian.VerifiedQuiescence, error) {
+	return s.issuer.AttestQuiescence(model.QuiescenceCertificate{
+		Attempt:     prepared.Ref,
+		Ordinal:     prepared.Ordinal,
+		Group:       prepared.Group,
+		Method:      method,
+		CertifiedBy: s.boot,
+	})
 }
 
 type testResults struct {

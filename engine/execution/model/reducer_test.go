@@ -30,27 +30,27 @@ func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
 			command: BeginReject{Ref: reducerRef()},
 		},
 		{
-			name:    "bind supervisor",
+			name:    "bind group",
 			valid:   reducerBaseRecord(),
 			invalid: reducerCanceledNoSupervisorRecord(t),
-			command: BindSupervisor{Ref: reducerRef(), Supervisor: reducerSupervisor()},
+			command: BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Group: reducerGroup(LaunchOrdinalOne)},
 		},
 		{
-			name:    "authorize launch",
+			name:    "commit grant",
 			valid:   reducerSupervisorRecord(),
 			invalid: reducerBaseRecord(),
-			command: AuthorizeLaunch{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Nonce: "nonce-1"},
+			command: CommitGrant{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Nonce: "nonce-1"},
 		},
 		{
-			name:    "observe launch consumed",
+			name:    "record release",
 			valid:   reducerGrantRecord(t),
 			invalid: reducerSupervisorRecord(),
-			command: ObserveLaunchConsumed{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Child: reducerChild(21)},
+			command: RecordRelease{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Child: reducerChild(21)},
 		},
 		{
-			name:    "observe launch quiescent",
+			name:    "record quiescence",
 			valid:   reducerConsumedRecord(t),
-			invalid: reducerGrantRecord(t),
+			invalid: reducerBaseRecord(),
 			command: reducerQuiescenceCommand(t, reducerConsumedRecord(t), LaunchOrdinalOne),
 		},
 		{
@@ -64,18 +64,6 @@ func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
 			valid:   reducerConsumedRecord(t),
 			invalid: reducerSupervisorRecord(),
 			command: ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeCompleted},
-		},
-		{
-			name:    "certify retirement",
-			valid:   reducerSupervisorRecord(),
-			invalid: reducerGrantRecord(t),
-			command: reducerRetirementCommand(t, reducerSupervisorRecord()),
-		},
-		{
-			name:    "certify containment",
-			valid:   reducerGrantRecord(t),
-			invalid: reducerBaseRecord(),
-			command: reducerContainmentCommand(t, reducerGrantRecord(t)),
 		},
 		{
 			name:    "certify result",
@@ -144,16 +132,16 @@ func TestApplyRejectsConflictingDuplicates(t *testing.T) {
 		conflict Command
 	}{
 		{
-			name:     "supervisor",
+			name:     "group",
 			record:   reducerBaseRecord(),
-			first:    BindSupervisor{Ref: reducerRef(), Supervisor: reducerSupervisor()},
-			conflict: BindSupervisor{Ref: reducerRef(), Supervisor: SupervisorIdentity{PGID: 20, LeaderPID: 21, HighResStartToken: "supervisor-start-20"}},
+			first:    BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Group: reducerGroup(LaunchOrdinalOne)},
+			conflict: BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Group: reducerConflictingGroup(LaunchOrdinalOne)},
 		},
 		{
 			name:     "grant nonce",
 			record:   reducerSupervisorRecord(),
-			first:    AuthorizeLaunch{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Nonce: "nonce-1"},
-			conflict: AuthorizeLaunch{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Nonce: "nonce-other"},
+			first:    CommitGrant{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Nonce: "nonce-1"},
+			conflict: CommitGrant{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Nonce: "nonce-other"},
 		},
 		{
 			name:     "outcome",
@@ -184,20 +172,25 @@ func TestApplyRejectsConflictingDuplicates(t *testing.T) {
 
 func TestAuthorizeSecondOrdinalRequiresFirstQuiescence(t *testing.T) {
 	first := reducerGrantRecord(t)
-	if _, err := Apply(first, AuthorizeLaunch{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Nonce: "nonce-2"}); !errors.Is(err, ErrCommandPrecondition) {
-		t.Fatalf("ordinal 2 before quiescence error = %v, want ErrCommandPrecondition", err)
+	if _, err := Apply(first, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: reducerGroup(LaunchOrdinalTwo)}); !errors.Is(err, ErrCommandPrecondition) {
+		t.Fatalf("ordinal 2 bind before quiescence error = %v, want ErrCommandPrecondition", err)
 	}
 	quiescent := reducerQuiescentRecord(t)
-	result, err := Apply(quiescent, AuthorizeLaunch{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Nonce: "nonce-2"})
+	bound, err := Apply(quiescent, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: reducerGroup(LaunchOrdinalTwo)})
 	if err != nil {
-		t.Fatalf("ordinal 2 after quiescence error = %v", err)
+		t.Fatalf("ordinal 2 bind after quiescence error = %v", err)
 	}
-	if _, ok := result.Record.Attempt.Grants.Get(LaunchOrdinalTwo); !ok {
+	result, err := Apply(bound.Record, CommitGrant{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Nonce: "nonce-2"})
+	if err != nil {
+		t.Fatalf("ordinal 2 grant after bind error = %v", err)
+	}
+	launch, ok := result.Record.Attempt.Launches.Get(LaunchOrdinalTwo)
+	if !ok || launch.Grant == nil {
 		t.Fatal("ordinal 2 grant was not recorded")
 	}
 }
 
-func TestStaleActionReceiptCannotCertifyDifferentAttemptOrSupervisor(t *testing.T) {
+func TestStaleActionReceiptCannotCertifyDifferentAttemptOrGroup(t *testing.T) {
 	record := reducerGrantRecord(t)
 	before := cloneSafetyRecord(record)
 
@@ -210,28 +203,28 @@ func TestStaleActionReceiptCannotCertifyDifferentAttemptOrSupervisor(t *testing.
 		t.Fatal("stale attempt receipt mutated input record")
 	}
 
-	wrongSupervisor := reducerContainmentCommand(t, record)
-	wrongSupervisor.Receipt.Supervisor.PGID++
-	wrongSupervisor.Receipt.Supervisor.LeaderPID++
-	wrongSupervisor.Receipt.Supervisor.HighResStartToken = "different-supervisor"
-	if _, err := Apply(record, wrongSupervisor); !errors.Is(err, ErrConflictingDuplicate) {
-		t.Fatalf("wrong supervisor receipt error = %v, want ErrConflictingDuplicate", err)
+	wrongGroup := reducerContainmentCommand(t, record)
+	wrongGroup.Receipt.Group.PGID++
+	wrongGroup.Receipt.Group.Leader.PID++
+	wrongGroup.Receipt.Group.Leader.HighResStartToken = "different-group"
+	if _, err := Apply(record, wrongGroup); !errors.Is(err, ErrConflictingDuplicate) {
+		t.Fatalf("wrong group receipt error = %v, want ErrConflictingDuplicate", err)
 	}
 	if !reflect.DeepEqual(record, before) {
-		t.Fatal("wrong supervisor receipt mutated input record")
+		t.Fatal("wrong group receipt mutated input record")
 	}
 }
 
 func TestCleanTerminalProofRequiresEveryCommittedGrantOrdinalCovered(t *testing.T) {
 	uncovered := reducerCleanCompletedRecord(t)
+	secondGroup := reducerGroup(LaunchOrdinalTwo)
 	secondGrant := LaunchGrant{
-		Attempt:    uncovered.Attempt.Ref,
-		Supervisor: *uncovered.Attempt.Supervisor,
-		Ordinal:    LaunchOrdinalTwo,
-		Nonce:      "nonce-2",
-		GrantedBy:  uncovered.AdmittedBy,
+		Attempt:   uncovered.Attempt.Ref,
+		Ordinal:   LaunchOrdinalTwo,
+		Nonce:     "nonce-2",
+		GrantedBy: uncovered.AdmittedBy,
 	}
-	uncovered.Attempt.Grants.Second = &secondGrant
+	uncovered.Attempt.Launches.Second = &LaunchProof{Ordinal: LaunchOrdinalTwo, Group: &secondGroup, Grant: &secondGrant}
 	uncovered.Terminal = &TerminalCertificate{
 		JobID:               uncovered.JobID,
 		Attempt:             uncovered.Attempt.Ref,
@@ -247,11 +240,11 @@ func TestCleanTerminalProofRequiresEveryCommittedGrantOrdinalCovered(t *testing.
 	}
 
 	record := reducerQuiescentRecord(t)
-	record = reducerMustApply(t, record, AuthorizeLaunch{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Nonce: "nonce-2"})
-	record = reducerMustApply(t, record, ObserveLaunchConsumed{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Child: reducerChild(22)})
+	record = reducerMustApply(t, record, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: reducerGroup(LaunchOrdinalTwo)})
+	record = reducerMustApply(t, record, CommitGrant{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Nonce: "nonce-2"})
+	record = reducerMustApply(t, record, RecordRelease{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Child: reducerChild(22)})
 	record = reducerMustApply(t, record, reducerQuiescenceCommand(t, record, LaunchOrdinalTwo))
 	record = reducerMustApply(t, record, ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeCompleted})
-	record = reducerRetiredRecord(t, record)
 	record = reducerMustApply(t, record, reducerResultCommand(t, record))
 	finalized, err := Apply(record, Finalize{Ref: reducerRef(), Intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally}})
 	if err != nil {
@@ -372,7 +365,7 @@ func reducerBaseRecord() SafetyRecord {
 }
 
 func reducerLegacyAwaitingRecord() SafetyRecord {
-	record := reducerSupervisorRecord()
+	record := reducerBaseRecord()
 	record.Mode = ModeLegacyFenced
 	record.Acknowledgement = nil
 	return record
@@ -387,19 +380,19 @@ func reducerLegacyAcknowledgedRecord() SafetyRecord {
 
 func reducerSupervisorRecord() SafetyRecord {
 	record := reducerBaseRecord()
-	supervisor := reducerSupervisor()
-	record.Attempt.Supervisor = &supervisor
+	group := reducerGroup(LaunchOrdinalOne)
+	record.Attempt.Launches.First = &LaunchProof{Ordinal: LaunchOrdinalOne, Group: &group}
 	return record
 }
 
 func reducerGrantRecord(t *testing.T) SafetyRecord {
 	t.Helper()
-	return reducerMustApply(t, reducerSupervisorRecord(), AuthorizeLaunch{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Nonce: "nonce-1"})
+	return reducerMustApply(t, reducerSupervisorRecord(), CommitGrant{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Nonce: "nonce-1"})
 }
 
 func reducerConsumedRecord(t *testing.T) SafetyRecord {
 	t.Helper()
-	return reducerMustApply(t, reducerGrantRecord(t), ObserveLaunchConsumed{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Child: reducerChild(21)})
+	return reducerMustApply(t, reducerGrantRecord(t), RecordRelease{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Child: reducerChild(21)})
 }
 
 func reducerQuiescentRecord(t *testing.T) SafetyRecord {
@@ -420,7 +413,13 @@ func reducerCanceledNoSupervisorRecord(t *testing.T) SafetyRecord {
 
 func reducerRetiredRecord(t *testing.T, record SafetyRecord) SafetyRecord {
 	t.Helper()
-	return reducerMustApply(t, record, reducerRetirementCommand(t, record))
+	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launch, ok := record.Attempt.Launches.Get(ordinal)
+		if ok && launch.Group != nil && launch.Quiescence == nil {
+			record = reducerMustApply(t, record, reducerQuiescenceCommandWithMethod(t, record, ordinal, QuiescenceAlreadyAbsent))
+		}
+	}
+	return record
 }
 
 func reducerCanceledRetiredRecord(t *testing.T) SafetyRecord {
@@ -430,7 +429,8 @@ func reducerCanceledRetiredRecord(t *testing.T) SafetyRecord {
 
 func reducerContainedRecord(t *testing.T) SafetyRecord {
 	t.Helper()
-	return reducerMustApply(t, reducerGrantRecord(t), reducerContainmentCommand(t, reducerGrantRecord(t)))
+	record := reducerGrantRecord(t)
+	return reducerMustApply(t, record, reducerContainmentCommand(t, record))
 }
 
 func reducerContainedRetiredRecord(t *testing.T) SafetyRecord {
@@ -449,7 +449,6 @@ func reducerCleanCompletedRecord(t *testing.T) SafetyRecord {
 	t.Helper()
 	record := reducerCompletedOutcomeRecord(t)
 	record = reducerMustApply(t, record, reducerQuiescenceCommand(t, record, LaunchOrdinalOne))
-	record = reducerRetiredRecord(t, record)
 	return reducerMustApply(t, record, reducerResultCommand(t, record))
 }
 
@@ -468,58 +467,32 @@ func reducerMustApply(t *testing.T, record SafetyRecord, command Command) Safety
 	return result.Record
 }
 
-func reducerQuiescenceCommand(t *testing.T, record SafetyRecord, ordinal LaunchOrdinal) ObserveLaunchQuiescent {
+func reducerQuiescenceCommand(t *testing.T, record SafetyRecord, ordinal LaunchOrdinal) RecordQuiescence {
 	t.Helper()
-	consumed, ok := record.Attempt.Consumed.Get(ordinal)
-	if !ok {
-		t.Fatalf("missing consumed launch for ordinal %s", ordinal)
+	return reducerQuiescenceCommandWithMethod(t, record, ordinal, QuiescenceNaturalExit)
+}
+
+func reducerQuiescenceCommandWithMethod(t *testing.T, record SafetyRecord, ordinal LaunchOrdinal, method QuiescenceMethod) RecordQuiescence {
+	t.Helper()
+	launch, ok := record.Attempt.Launches.Get(ordinal)
+	if !ok || launch.Group == nil {
+		t.Fatalf("missing launch group for ordinal %s", ordinal)
 	}
-	return ObserveLaunchQuiescent{
+	return RecordQuiescence{
 		Ref: record.Attempt.Ref,
 		Receipt: QuiescenceReceipt{
 			Attempt:     record.Attempt.Ref,
 			Ordinal:     ordinal,
-			Child:       consumed.Child,
-			ChildExited: mustEvidence(t, "child_exit", "child exited"),
-			GroupEmpty:  mustEvidence(t, "group_empty", "process group empty"),
+			Group:       *launch.Group,
+			Method:      method,
 			CertifiedBy: record.AdmittedBy,
 		},
 	}
 }
 
-func reducerRetirementCommand(t *testing.T, record SafetyRecord) CertifyRetirement {
+func reducerContainmentCommand(t *testing.T, record SafetyRecord) RecordQuiescence {
 	t.Helper()
-	if record.Attempt.Supervisor == nil {
-		t.Fatal("missing supervisor")
-	}
-	return CertifyRetirement{
-		Ref: record.Attempt.Ref,
-		Receipt: RetirementReceipt{
-			Attempt:       record.Attempt.Ref,
-			Supervisor:    *record.Attempt.Supervisor,
-			ControlClosed: mustEvidence(t, "control_closed", "control channel closed"),
-			WorkerExited:  mustEvidence(t, "worker_exit", "worker exited"),
-			GroupEmpty:    mustEvidence(t, "group_empty", "process group empty"),
-			CertifiedBy:   record.AdmittedBy,
-		},
-	}
-}
-
-func reducerContainmentCommand(t *testing.T, record SafetyRecord) CertifyContainment {
-	t.Helper()
-	if record.Attempt.Supervisor == nil {
-		t.Fatal("missing supervisor")
-	}
-	return CertifyContainment{
-		Ref: record.Attempt.Ref,
-		Receipt: ContainmentReceipt{
-			Attempt:      record.Attempt.Ref,
-			Supervisor:   *record.Attempt.Supervisor,
-			Signal:       mustEvidence(t, "containment_signal", "containment signal sent"),
-			Verification: mustEvidence(t, "verified_absent", "process group absent"),
-			CertifiedBy:  record.AdmittedBy,
-		},
-	}
+	return reducerQuiescenceCommandWithMethod(t, record, LaunchOrdinalOne, QuiescenceTermKill)
 }
 
 func reducerResultCommand(t *testing.T, record SafetyRecord) CertifyResult {
@@ -547,8 +520,29 @@ func reducerBoot() BootRef {
 	return BootRef{BootID: "boot-reducer", OwnerID: "owner-reducer"}
 }
 
-func reducerSupervisor() SupervisorIdentity {
-	return SupervisorIdentity{PGID: 10, LeaderPID: 11, HighResStartToken: "supervisor-start-10"}
+func reducerGroup(ordinal LaunchOrdinal) GroupRef {
+	return GroupRef{
+		Version:   1,
+		CustodyID: CustodyID("custody-reducer-" + ordinal.String()),
+		Launch: LaunchKey{
+			Attempt: reducerRef(),
+			Ordinal: ordinal,
+		},
+		HostBootID: "host-boot-reducer",
+		PGID:       10 + int(ordinal),
+		Leader:     ProcessIdentity{PID: 20 + int(ordinal), HighResStartToken: "leader-start-" + ordinal.String()},
+		Monitor:    ProcessIdentity{PID: 30 + int(ordinal), HighResStartToken: "monitor-start-" + ordinal.String()},
+		RetainedID: "retained-" + ordinal.String(),
+	}
+}
+
+func reducerConflictingGroup(ordinal LaunchOrdinal) GroupRef {
+	group := reducerGroup(ordinal)
+	group.CustodyID = CustodyID("custody-conflict-" + ordinal.String())
+	group.PGID += 100
+	group.Leader.PID += 100
+	group.Leader.HighResStartToken = "leader-conflict-" + ordinal.String()
+	return group
 }
 
 func reducerChild(pid int) ChildIdentity {

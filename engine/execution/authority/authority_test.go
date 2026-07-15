@@ -3,8 +3,10 @@ package authority
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
@@ -12,8 +14,10 @@ import (
 
 type readyAdmission interface {
 	Accept(context.Context, AcceptRequest) (AcceptResult, error)
-	Apply(context.Context, model.JobID, model.Command, ...ApplyOption) (ApplyResult, error)
+	BindGroup(context.Context, model.JobID, model.AttemptRef, model.LaunchOrdinal, model.GroupRef, ...ApplyOption) (ApplyResult, error)
 }
+
+var testAttestationIssuers sync.Map
 
 func TestReadyTypestateExposesAdmissionOnlyAfterSeal(t *testing.T) {
 	var _ readyAdmission = (*Ready)(nil)
@@ -96,14 +100,11 @@ func TestReadyRejectsStaleAndNotReadyAtTransactionBoundary(t *testing.T) {
 	}
 	stale := *ready
 
-	supervisor := supervisorIdentity()
-	if _, err := ready.Apply(ctx, accepted.Record.JobID, model.BindSupervisor{
-		Ref:        accepted.Record.Attempt.Ref,
-		Supervisor: supervisor,
-	}); err != nil {
+	group := groupRef(accepted.Record.Attempt.Ref, model.LaunchOrdinalOne)
+	if _, err := ready.BindGroup(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.LaunchOrdinalOne, group); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stale.Apply(ctx, accepted.Record.JobID, model.RequestCancel{JobID: accepted.Record.JobID}); !errors.Is(err, ErrStaleCapability) {
+	if _, err := stale.RequestCancel(ctx, accepted.Record.JobID); !errors.Is(err, ErrStaleCapability) {
 		t.Fatalf("stale apply error = %v, want ErrStaleCapability", err)
 	}
 
@@ -128,26 +129,21 @@ func TestApplyReducerProjectionAndTerminalReleaseAfterCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	supervisor := supervisorIdentity()
-	commands := []model.Command{
-		model.BindSupervisor{Ref: ref, Supervisor: supervisor},
-		model.RequestCancel{JobID: accepted.Record.JobID},
-		model.CertifyRetirement{Ref: ref, Receipt: model.RetirementCertificate{
-			Attempt:       ref,
-			Supervisor:    supervisor,
-			ControlClosed: evidence("control"),
-			WorkerExited:  evidence("worker"),
-			GroupEmpty:    evidence("group"),
-		}},
-		model.Finalize{Ref: ref, Intent: model.TerminalIntent{
-			Outcome: model.OutcomeCanceled,
-			Cause:   model.CauseCanceledBeforeAuthorization,
-		}},
+	group := groupRef(ref, model.LaunchOrdinalOne)
+	if _, err := ready.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
+		t.Fatal(err)
 	}
-	for _, command := range commands {
-		if _, err := ready.Apply(ctx, accepted.Record.JobID, command); err != nil {
-			t.Fatalf("Apply(%T): %v", command, err)
-		}
+	if _, err := ready.RequestCancel(ctx, accepted.Record.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ready.RecordQuiescence(ctx, accepted.Record.JobID, model.LaunchOrdinalOne, verifiedQuiescence(t, ready.Boot(), ref, model.LaunchOrdinalOne, group, model.QuiescenceAlreadyAbsent)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ready.Finalize(ctx, accepted.Record.JobID, ref, model.TerminalIntent{
+		Outcome: model.OutcomeCanceled,
+		Cause:   model.CauseCanceledBeforeAuthorization,
+	}); err != nil {
+		t.Fatal(err)
 	}
 
 	image, err := ready.LoadJob(ctx, accepted.Record.JobID)
@@ -218,7 +214,8 @@ func newReady(t *testing.T, repo repository.Repository, name string) *Ready {
 
 func newRecoverySession(t *testing.T, repo repository.Repository, name string) *RecoverySession {
 	t.Helper()
-	bootstrapper, err := NewBootstrapper(repo)
+	issuer, verifier := custodian.NewAttestationChannel()
+	bootstrapper, err := NewBootstrapper(repo, WithQuiescenceVerifier(verifier))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,6 +223,7 @@ func newRecoverySession(t *testing.T, repo repository.Repository, name string) *
 	if err != nil {
 		t.Fatal(err)
 	}
+	testAttestationIssuers.Store(boot, issuer)
 	session, err := bootstrapper.Begin(context.Background(), boot)
 	if err != nil {
 		t.Fatal(err)
@@ -268,12 +266,46 @@ func assertAcceptedImage(t *testing.T, repo repository.Repository, accepted Acce
 	}
 }
 
-func supervisorIdentity() model.SupervisorIdentity {
-	return model.SupervisorIdentity{
-		PGID:              10,
-		LeaderPID:         11,
-		HighResStartToken: "supervisor-start",
+func groupRef(ref model.AttemptRef, ordinal model.LaunchOrdinal) model.GroupRef {
+	return model.GroupRef{
+		Version:   1,
+		CustodyID: model.CustodyID("custody-" + ref.JobID.String() + "-" + ordinal.String()),
+		Launch: model.LaunchKey{
+			Attempt: ref,
+			Ordinal: ordinal,
+		},
+		HostBootID: "host-boot-" + ref.JobID.String(),
+		PGID:       10 + int(ordinal),
+		Leader: model.ProcessIdentity{
+			PID:               20 + int(ordinal),
+			HighResStartToken: "leader-start-" + ordinal.String(),
+		},
+		Monitor: model.ProcessIdentity{
+			PID:               30 + int(ordinal),
+			HighResStartToken: "monitor-start-" + ordinal.String(),
+		},
+		RetainedID: "retained-" + ref.JobID.String() + "-" + ordinal.String(),
 	}
+}
+
+func verifiedQuiescence(t *testing.T, boot model.BootRef, ref model.AttemptRef, ordinal model.LaunchOrdinal, group model.GroupRef, method model.QuiescenceMethod) custodian.VerifiedQuiescence {
+	t.Helper()
+	value, ok := testAttestationIssuers.Load(boot)
+	if !ok {
+		t.Fatalf("missing test attestation issuer for boot %s", boot.BootID)
+	}
+	issuer := value.(custodian.AttestationIssuer)
+	verified, err := issuer.AttestQuiescence(model.QuiescenceCertificate{
+		Attempt:     ref,
+		Ordinal:     ordinal,
+		Group:       group,
+		Method:      method,
+		CertifiedBy: boot,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return verified
 }
 
 func evidence(kind string) model.Evidence {

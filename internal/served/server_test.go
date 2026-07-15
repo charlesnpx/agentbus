@@ -402,7 +402,8 @@ func TestIdentifiedJobSubmitAdmitsBeforeBackendStartAndReplaysBeforeBackendValid
 			startErr = errors.New("request was not live in authority before backend start")
 			return
 		}
-		if replay.Record.Attempt.Grants.Count() != 1 {
+		launch, ok := replay.Record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+		if !ok || launch.Grant == nil {
 			startErr = errors.New("backend started before authority launch grant")
 			return
 		}
@@ -669,8 +670,8 @@ func TestStartupRecoveryFailsClosedWhenSupervisorIdentityCannotBeVerified(t *tes
 	}
 
 	err = second.Serve(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "supervisor identity is not registered in this boot") {
-		t.Fatalf("Serve error = %v, want fail-closed supervisor verification error", err)
+	if err == nil || !strings.Contains(err.Error(), "group reference is not registered in this boot") {
+		t.Fatalf("Serve error = %v, want fail-closed group verification error", err)
 	}
 }
 

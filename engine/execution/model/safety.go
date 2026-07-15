@@ -75,119 +75,108 @@ func (slots LaunchSlots[T]) FilledOrdinals() []LaunchOrdinal {
 	return out
 }
 
+type LaunchProof struct {
+	Ordinal    LaunchOrdinal
+	Group      *GroupRef
+	Grant      *LaunchGrant
+	Released   *LaunchReleaseFact
+	Quiescence *QuiescenceCertificate
+}
+
 type AttemptProof struct {
-	Ref         AttemptRef
-	Supervisor  *SupervisorIdentity
-	Grants      LaunchSlots[LaunchGrant]
-	Consumed    LaunchSlots[LaunchConsumed]
-	Quiescence  LaunchSlots[QuiescenceCertificate]
-	Retirement  *RetirementCertificate
-	Containment *ContainmentCertificate
+	Ref      AttemptRef
+	Launches LaunchSlots[LaunchProof]
 }
 
 func (proof AttemptProof) Validate() error {
 	if err := proof.Ref.Validate(); err != nil {
 		return err
 	}
-	if proof.Supervisor != nil {
-		if err := proof.Supervisor.Validate(); err != nil {
+	return forEachLaunchSlot(proof.Launches, func(ordinal LaunchOrdinal, launch LaunchProof) error {
+		if err := launch.Validate(); err != nil {
 			return err
 		}
-	}
-	if err := proof.validateLaunchGrants(); err != nil {
+		if launch.Ordinal != ordinal {
+			return invalid("launch.ordinal", "does not match fixed slot")
+		}
+		if err := validateLaunchProofAttempt(proof.Ref, launch); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func (launch LaunchProof) Validate() error {
+	if err := launch.Ordinal.Validate(); err != nil {
 		return err
 	}
-	if err := proof.validateLaunchConsumed(); err != nil {
+	if launch.Group == nil {
+		return invalid("launch.group", "durable group reference is required")
+	}
+	if err := launch.Group.Validate(); err != nil {
 		return err
 	}
-	if err := proof.validateQuiescence(); err != nil {
-		return err
+	if launch.Group.Launch.Ordinal != launch.Ordinal {
+		return invalid("launch.group.ordinal", "does not match launch ordinal")
 	}
-	if proof.Retirement != nil {
-		if err := proof.Retirement.Validate(); err != nil {
+	if launch.Grant != nil {
+		if err := launch.Grant.Validate(); err != nil {
 			return err
 		}
-		if err := validateAttemptField("retirement.attempt", proof.Retirement.Attempt, proof.Ref); err != nil {
-			return err
-		}
-		if proof.Supervisor != nil && !proof.Retirement.Supervisor.Equal(*proof.Supervisor) {
-			return invalid("retirement.supervisor", "supervisor identity mismatch")
+		if launch.Grant.Ordinal != launch.Ordinal {
+			return invalid("launch_grant.ordinal", "does not match launch ordinal")
 		}
 	}
-	if proof.Containment != nil {
-		if err := proof.Containment.Validate(); err != nil {
+	if launch.Released != nil {
+		if err := launch.Released.Validate(); err != nil {
 			return err
 		}
-		if err := validateAttemptField("containment.attempt", proof.Containment.Attempt, proof.Ref); err != nil {
+		if launch.Released.Ordinal != launch.Ordinal {
+			return invalid("launch_release.ordinal", "does not match launch ordinal")
+		}
+		if launch.Grant == nil {
+			return invalid("launch_release.grant", "matching grant is required")
+		}
+		if launch.Released.Nonce != launch.Grant.Nonce {
+			return invalid("launch_release.nonce", "does not match grant nonce")
+		}
+	}
+	if launch.Quiescence != nil {
+		if err := launch.Quiescence.Validate(); err != nil {
 			return err
 		}
-		if proof.Supervisor != nil && !proof.Containment.Supervisor.Equal(*proof.Supervisor) {
-			return invalid("containment.supervisor", "supervisor identity mismatch")
+		if launch.Quiescence.Ordinal != launch.Ordinal {
+			return invalid("quiescence.ordinal", "does not match launch ordinal")
+		}
+		if !launch.Quiescence.Group.Equal(*launch.Group) {
+			return invalid("quiescence.group", "does not match durable group")
 		}
 	}
 	return nil
 }
 
-func (proof AttemptProof) validateLaunchGrants() error {
-	return forEachLaunchSlot(proof.Grants, func(ordinal LaunchOrdinal, grant LaunchGrant) error {
-		if err := grant.Validate(); err != nil {
+func validateLaunchProofAttempt(ref AttemptRef, launch LaunchProof) error {
+	if launch.Group != nil {
+		if err := validateAttemptField("launch.group.attempt", launch.Group.Launch.Attempt, ref); err != nil {
 			return err
 		}
-		if grant.Ordinal != ordinal {
-			return invalid("launch_grant.ordinal", "does not match fixed slot")
-		}
-		if err := validateAttemptField("launch_grant.attempt", grant.Attempt, proof.Ref); err != nil {
+	}
+	if launch.Grant != nil {
+		if err := validateAttemptField("launch_grant.attempt", launch.Grant.Attempt, ref); err != nil {
 			return err
 		}
-		if proof.Supervisor != nil && !grant.Supervisor.Equal(*proof.Supervisor) {
-			return invalid("launch_grant.supervisor", "supervisor identity mismatch")
-		}
-		return nil
-	})
-}
-
-func (proof AttemptProof) validateLaunchConsumed() error {
-	return forEachLaunchSlot(proof.Consumed, func(ordinal LaunchOrdinal, consumed LaunchConsumed) error {
-		if err := consumed.Validate(); err != nil {
+	}
+	if launch.Released != nil {
+		if err := validateAttemptField("launch_release.attempt", launch.Released.Attempt, ref); err != nil {
 			return err
 		}
-		if consumed.Ordinal != ordinal {
-			return invalid("launch_consumed.ordinal", "does not match fixed slot")
-		}
-		if err := validateAttemptField("launch_consumed.attempt", consumed.Attempt, proof.Ref); err != nil {
+	}
+	if launch.Quiescence != nil {
+		if err := validateAttemptField("quiescence.attempt", launch.Quiescence.Attempt, ref); err != nil {
 			return err
 		}
-		grant, ok := proof.Grants.Get(ordinal)
-		if !ok {
-			return invalid("launch_consumed.grant", "matching grant is required")
-		}
-		if consumed.Nonce != grant.Nonce {
-			return invalid("launch_consumed.nonce", "does not match grant nonce")
-		}
-		return nil
-	})
-}
-
-func (proof AttemptProof) validateQuiescence() error {
-	return forEachLaunchSlot(proof.Quiescence, func(ordinal LaunchOrdinal, certificate QuiescenceCertificate) error {
-		if err := certificate.Validate(); err != nil {
-			return err
-		}
-		if certificate.Ordinal != ordinal {
-			return invalid("quiescence.ordinal", "does not match fixed slot")
-		}
-		if err := validateAttemptField("quiescence.attempt", certificate.Attempt, proof.Ref); err != nil {
-			return err
-		}
-		consumed, ok := proof.Consumed.Get(ordinal)
-		if !ok {
-			return invalid("quiescence.consumed", "matching launch consumption is required")
-		}
-		if !certificate.Child.Equal(consumed.Child) {
-			return invalid("quiescence.child", "does not match launch consumption")
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func forEachLaunchSlot[T any](slots LaunchSlots[T], fn func(LaunchOrdinal, T) error) error {
@@ -316,36 +305,25 @@ func (record SafetyRecord) validateOptionalFacts() error {
 func (record SafetyRecord) validateTerminalProofSupport() error {
 	switch record.Terminal.Proof {
 	case ProofNeverPermittedAndRetired:
-		if record.Attempt.Grants.Count() != 0 || record.Attempt.Consumed.Count() != 0 || record.Attempt.Quiescence.Count() != 0 {
-			return invalid("terminal.proof", "never-permitted proof cannot have launch evidence")
+		if hasAnyGrant(record.Attempt) || hasAnyRelease(record.Attempt) {
+			return invalid("terminal.proof", "never-permitted proof cannot have grant or release evidence")
 		}
-		if record.Attempt.Retirement == nil {
-			return invalid("terminal.proof", "never-permitted proof requires retirement certificate")
+		if !allLaunchGroupsQuiescent(record.Attempt) {
+			return invalid("terminal.proof", "never-permitted proof requires quiescence for every bound group")
 		}
 	case ProofCleanQuiescentOutcomeAndRetired:
-		if record.Attempt.Retirement == nil {
-			return invalid("terminal.proof", "clean proof requires retirement certificate")
-		}
-		if record.Attempt.Containment != nil {
-			return invalid("terminal.proof", "clean proof cannot include containment")
-		}
-		if record.Attempt.Grants.Count() == 0 {
+		if !hasAnyGrant(record.Attempt) {
 			return invalid("terminal.proof", "clean proof requires launch grant evidence")
 		}
-		for _, ordinal := range record.Attempt.Grants.FilledOrdinals() {
-			if _, ok := record.Attempt.Consumed.Get(ordinal); !ok {
-				return invalid("terminal.proof", "clean proof requires every grant to be consumed")
-			}
-			if _, ok := record.Attempt.Quiescence.Get(ordinal); !ok {
-				return invalid("terminal.proof", "clean proof requires every launch to be quiescent")
-			}
+		if !allGrantedLaunchesReleasedAndQuiescent(record.Attempt) {
+			return invalid("terminal.proof", "clean proof requires every granted launch to be released and quiescent")
 		}
 	case ProofContained:
-		if record.Attempt.Containment == nil {
-			return invalid("terminal.proof", "contained proof requires containment certificate")
+		if !hasAnyLaunchEvidence(record.Attempt) {
+			return invalid("terminal.proof", "contained proof requires launch evidence")
 		}
-		if record.Attempt.Retirement == nil {
-			return invalid("terminal.proof", "contained proof requires retirement certificate")
+		if !allLaunchGroupsQuiescent(record.Attempt) {
+			return invalid("terminal.proof", "contained proof requires quiescence for every bound group")
 		}
 	default:
 		return invalid("terminal.proof", "is unknown")

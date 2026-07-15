@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 )
@@ -34,11 +35,12 @@ const (
 )
 
 type authorityCore struct {
-	mu      syncMutex
-	repo    repository.Repository
-	anchor  Anchor
-	runtime *runtimeRegistry
-	boot    bootStatus
+	mu       syncMutex
+	repo     repository.Repository
+	anchor   Anchor
+	runtime  *runtimeRegistry
+	verifier custodian.AttestationVerifier
+	boot     bootStatus
 }
 
 type syncMutex interface {
@@ -159,7 +161,82 @@ func (r *Ready) Accept(ctx context.Context, request AcceptRequest) (AcceptResult
 	return result, nil
 }
 
-func (r *Ready) Apply(ctx context.Context, jobID model.JobID, command model.Command, options ...ApplyOption) (ApplyResult, error) {
+func (r *Ready) BindGroup(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, group model.GroupRef, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.BindGroup{Ref: ref, Ordinal: ordinal, Group: group}, options...)
+}
+
+func (r *Ready) CommitGrant(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, nonce model.PermitNonce, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.CommitGrant{Ref: ref, Ordinal: ordinal, Nonce: nonce}, options...)
+}
+
+func (r *Ready) RecordRelease(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, child model.ChildIdentity, observation model.Evidence, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.RecordRelease{Ref: ref, Ordinal: ordinal, Child: child, Observation: observation}, options...)
+}
+
+func (r *Ready) RequestCancel(ctx context.Context, jobID model.JobID, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.RequestCancel{JobID: jobID}, options...)
+}
+
+func (r *Ready) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.ObserveOutcome{Ref: ref, Outcome: outcome}, options...)
+}
+
+func (r *Ready) RecordResult(ctx context.Context, jobID model.JobID, ref model.AttemptRef, receipt model.ResultReceipt, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.CertifyResult{Ref: ref, Receipt: receipt}, options...)
+}
+
+func (r *Ready) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.Finalize{Ref: ref, Intent: intent}, options...)
+}
+
+func (r *Ready) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence, options ...ApplyOption) (ApplyResult, error) {
+	if r == nil || r.core == nil {
+		return ApplyResult{}, ErrNotReady
+	}
+	if err := jobID.Validate(); err != nil {
+		return ApplyResult{}, fmt.Errorf("%w: job_id: %v", ErrInvalidRequest, err)
+	}
+	if err := ordinal.Validate(); err != nil {
+		return ApplyResult{}, fmt.Errorf("%w: launch_ordinal: %v", ErrInvalidRequest, err)
+	}
+	config := applyConfig{}
+	for _, option := range options {
+		if option != nil {
+			option(&config)
+		}
+	}
+
+	r.core.mu.Lock()
+	defer r.core.mu.Unlock()
+
+	var result ApplyResult
+	terminalCommitted := false
+	commit, err := r.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+		if _, err := r.core.requireReadyTx(tx, r.token); err != nil {
+			return err
+		}
+		applied, err := applyQuiescenceTx(tx, jobID, ordinal, r.core.verifier, verified, r.token.boot, config.sessionID)
+		if err != nil {
+			return err
+		}
+		result = applied
+		terminalCommitted = applied.Changed && applied.Record.Terminal != nil
+		return nil
+	})
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if err := r.core.advanceReadyLocked(ctx, &r.token, commit.Generation); err != nil {
+		return ApplyResult{}, err
+	}
+	result.Commit = commit
+	if terminalCommitted {
+		r.core.runtime.releaseTerminal(jobID)
+	}
+	return result, nil
+}
+
+func (r *Ready) apply(ctx context.Context, jobID model.JobID, command model.Command, options ...ApplyOption) (ApplyResult, error) {
 	if r == nil || r.core == nil {
 		return ApplyResult{}, ErrNotReady
 	}
@@ -374,6 +451,70 @@ func applyCommandTx(tx repository.WriteTx, jobID model.JobID, command model.Comm
 	return ApplyResult{Record: applied.Record, Projection: nextProjection, Changed: true}, nil
 }
 
+func applyQuiescenceTx(tx repository.WriteTx, jobID model.JobID, ordinal model.LaunchOrdinal, verifier custodian.AttestationVerifier, verified custodian.VerifiedQuiescence, boot model.BootRef, sessionID string) (ApplyResult, error) {
+	image := tx.LoadJob(jobID)
+	record, projection, err := validJobImage(image)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if sessionID == "" {
+		sessionID = projection.SessionID
+	}
+	certificate, err := verifyQuiescenceForRecord(record, ordinal, verifier, verified, boot)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	return applyCommandToLoadedTx(tx, record, projection, model.RecordQuiescence{Ref: record.Attempt.Ref, Receipt: certificate}, sessionID)
+}
+
+func applyCommandToLoadedTx(tx repository.WriteTx, record model.SafetyRecord, projection model.JobProjection, command model.Command, sessionID string) (ApplyResult, error) {
+	applied, err := model.Apply(record, command)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if !applied.Changed {
+		return ApplyResult{Record: record, Projection: projection}, nil
+	}
+	nextProjection, err := model.Project(applied.Record, model.ProjectionMetadata{SessionID: sessionID})
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if err := tx.PutSafety(applied.Record, record.Revision); err != nil {
+		return ApplyResult{}, err
+	}
+	if err := tx.PutProjection(nextProjection); err != nil {
+		return ApplyResult{}, err
+	}
+	return ApplyResult{Record: applied.Record, Projection: nextProjection, Changed: true}, nil
+}
+
+func verifyQuiescenceForRecord(record model.SafetyRecord, ordinal model.LaunchOrdinal, verifier custodian.AttestationVerifier, verified custodian.VerifiedQuiescence, boot model.BootRef) (model.QuiescenceCertificate, error) {
+	launch, ok := record.Attempt.Launches.Get(ordinal)
+	if !ok || launch.Group == nil {
+		return model.QuiescenceCertificate{}, fmt.Errorf("%w: durable group reference missing for ordinal %s", ErrInvalidRequest, ordinal)
+	}
+	certificate, err := verifier.VerifyQuiescence(verified)
+	if err != nil {
+		return model.QuiescenceCertificate{}, err
+	}
+	if !certificate.Attempt.Equal(record.Attempt.Ref) {
+		return model.QuiescenceCertificate{}, fmt.Errorf("%w: quiescence attempt mismatch", ErrInvalidRequest)
+	}
+	if certificate.Ordinal != ordinal {
+		return model.QuiescenceCertificate{}, fmt.Errorf("%w: quiescence ordinal mismatch", ErrInvalidRequest)
+	}
+	if !certificate.Group.Equal(*launch.Group) {
+		return model.QuiescenceCertificate{}, fmt.Errorf("%w: quiescence group mismatch", ErrInvalidRequest)
+	}
+	if certificate.Group.CustodyID != launch.Group.CustodyID {
+		return model.QuiescenceCertificate{}, fmt.Errorf("%w: quiescence custody mismatch", ErrInvalidRequest)
+	}
+	if emptyBootRef(certificate.CertifiedBy) {
+		certificate.CertifiedBy = boot
+	}
+	return certificate, nil
+}
+
 func validJobImage(image repository.JobImage) (model.SafetyRecord, model.JobProjection, error) {
 	if err := requireRecord("binding", image.Binding.State, image.Binding.Diagnostic); err != nil {
 		return model.SafetyRecord{}, model.JobProjection{}, err
@@ -553,12 +694,12 @@ func commandWithBoot(command model.Command, boot model.BootRef) model.Command {
 			next.RequestedBy = boot
 		}
 		return next
-	case model.AuthorizeLaunch:
+	case model.CommitGrant:
 		if emptyBootRef(c.GrantedBy) {
 			c.GrantedBy = boot
 		}
 		return c
-	case *model.AuthorizeLaunch:
+	case *model.CommitGrant:
 		if c == nil {
 			return c
 		}
@@ -567,26 +708,26 @@ func commandWithBoot(command model.Command, boot model.BootRef) model.Command {
 			next.GrantedBy = boot
 		}
 		return next
-	case model.ObserveLaunchConsumed:
-		if emptyBootRef(c.ConsumedBy) {
-			c.ConsumedBy = boot
+	case model.RecordRelease:
+		if emptyBootRef(c.ReleasedBy) {
+			c.ReleasedBy = boot
 		}
 		return c
-	case *model.ObserveLaunchConsumed:
+	case *model.RecordRelease:
 		if c == nil {
 			return c
 		}
 		next := *c
-		if emptyBootRef(next.ConsumedBy) {
-			next.ConsumedBy = boot
+		if emptyBootRef(next.ReleasedBy) {
+			next.ReleasedBy = boot
 		}
 		return next
-	case model.ObserveLaunchQuiescent:
+	case model.RecordQuiescence:
 		if emptyBootRef(c.Receipt.CertifiedBy) {
 			c.Receipt.CertifiedBy = boot
 		}
 		return c
-	case *model.ObserveLaunchQuiescent:
+	case *model.RecordQuiescence:
 		if c == nil {
 			return c
 		}
@@ -607,34 +748,6 @@ func commandWithBoot(command model.Command, boot model.BootRef) model.Command {
 		next := *c
 		if emptyBootRef(next.RequestedBy) {
 			next.RequestedBy = boot
-		}
-		return next
-	case model.CertifyRetirement:
-		if emptyBootRef(c.Receipt.CertifiedBy) {
-			c.Receipt.CertifiedBy = boot
-		}
-		return c
-	case *model.CertifyRetirement:
-		if c == nil {
-			return c
-		}
-		next := *c
-		if emptyBootRef(next.Receipt.CertifiedBy) {
-			next.Receipt.CertifiedBy = boot
-		}
-		return next
-	case model.CertifyContainment:
-		if emptyBootRef(c.Receipt.CertifiedBy) {
-			c.Receipt.CertifiedBy = boot
-		}
-		return c
-	case *model.CertifyContainment:
-		if c == nil {
-			return c
-		}
-		next := *c
-		if emptyBootRef(next.Receipt.CertifiedBy) {
-			next.Receipt.CertifiedBy = boot
 		}
 		return next
 	case model.CertifyResult:
@@ -690,30 +803,30 @@ func commandJobID(command model.Command) (model.JobID, error) {
 			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
 		}
 		return c.Ref.JobID, nil
-	case model.BindSupervisor:
+	case model.BindGroup:
 		return c.Ref.JobID, nil
-	case *model.BindSupervisor:
+	case *model.BindGroup:
 		if c == nil {
 			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
 		}
 		return c.Ref.JobID, nil
-	case model.AuthorizeLaunch:
+	case model.CommitGrant:
 		return c.Ref.JobID, nil
-	case *model.AuthorizeLaunch:
+	case *model.CommitGrant:
 		if c == nil {
 			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
 		}
 		return c.Ref.JobID, nil
-	case model.ObserveLaunchConsumed:
+	case model.RecordRelease:
 		return c.Ref.JobID, nil
-	case *model.ObserveLaunchConsumed:
+	case *model.RecordRelease:
 		if c == nil {
 			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
 		}
 		return c.Ref.JobID, nil
-	case model.ObserveLaunchQuiescent:
+	case model.RecordQuiescence:
 		return c.Ref.JobID, nil
-	case *model.ObserveLaunchQuiescent:
+	case *model.RecordQuiescence:
 		if c == nil {
 			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
 		}
@@ -728,20 +841,6 @@ func commandJobID(command model.Command) (model.JobID, error) {
 	case model.ObserveOutcome:
 		return c.Ref.JobID, nil
 	case *model.ObserveOutcome:
-		if c == nil {
-			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
-		}
-		return c.Ref.JobID, nil
-	case model.CertifyRetirement:
-		return c.Ref.JobID, nil
-	case *model.CertifyRetirement:
-		if c == nil {
-			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
-		}
-		return c.Ref.JobID, nil
-	case model.CertifyContainment:
-		return c.Ref.JobID, nil
-	case *model.CertifyContainment:
 		if c == nil {
 			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
 		}

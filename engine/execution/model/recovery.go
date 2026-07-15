@@ -71,20 +71,20 @@ func PlanRecovery(record SafetyRecord, trigger RecoveryTrigger) (RecoveryPlan, e
 		return plan, nil
 	}
 	if needsContainment(record, trigger) {
-		if record.Attempt.Supervisor == nil {
+		if !hasPreparedLaunch(record.Attempt) {
 			plan.Next = RecoveryAction{Kind: RecoveryFatalUnprovable}
 			return plan, nil
 		}
-		if record.Attempt.Containment == nil {
+		if !allLaunchGroupsQuiescent(record.Attempt) {
 			plan.Next = RecoveryAction{Kind: RecoveryContainThenFinalize}
 			return plan, nil
 		}
 	}
-	if record.Attempt.Supervisor == nil {
+	if !hasPreparedLaunch(record.Attempt) {
 		plan.Next = RecoveryAction{Kind: RecoveryFatalUnprovable}
 		return plan, nil
 	}
-	if record.Attempt.Retirement == nil {
+	if !allLaunchGroupsQuiescent(record.Attempt) {
 		plan.Next = RecoveryAction{Kind: RecoveryRetireThenFinalize}
 		return plan, nil
 	}
@@ -98,7 +98,7 @@ func finalizable(record SafetyRecord, intent TerminalIntent) bool {
 }
 
 func needsContainment(record SafetyRecord, trigger RecoveryTrigger) bool {
-	if hasAnyLaunchEvidence(record.Attempt) {
+	if hasAnyGrant(record.Attempt) || hasAnyRelease(record.Attempt) {
 		return true
 	}
 	switch trigger {
@@ -110,7 +110,7 @@ func needsContainment(record SafetyRecord, trigger RecoveryTrigger) bool {
 }
 
 func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger) TerminalIntent {
-	afterAuthorization := hasAnyLaunchEvidence(record.Attempt)
+	afterAuthorization := hasAnyGrant(record.Attempt) || hasAnyRelease(record.Attempt)
 	intent := TerminalIntent{DerivedBy: record.AdmittedBy}
 	switch trigger {
 	case RecoveryCancelAfterGrant:

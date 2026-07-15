@@ -58,10 +58,8 @@ func TestRejectedFinalizationLeavesSafetyAndProjectionUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ready.Apply(ctx, accepted.Record.JobID, model.BindSupervisor{
-		Ref:        accepted.Record.Attempt.Ref,
-		Supervisor: supervisorIdentity(),
-	}); err != nil {
+	group := groupRef(accepted.Record.Attempt.Ref, model.LaunchOrdinalOne)
+	if _, err := ready.BindGroup(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.LaunchOrdinalOne, group); err != nil {
 		t.Fatal(err)
 	}
 
@@ -72,12 +70,9 @@ func TestRejectedFinalizationLeavesSafetyAndProjectionUnchanged(t *testing.T) {
 	}
 	beforeGeneration := ready.Generation()
 
-	_, err = ready.Apply(ctx, accepted.Record.JobID, model.Finalize{
-		Ref: accepted.Record.Attempt.Ref,
-		Intent: model.TerminalIntent{
-			Outcome: model.OutcomeCanceled,
-			Cause:   model.CauseCanceledBeforeAuthorization,
-		},
+	_, err = ready.Finalize(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.TerminalIntent{
+		Outcome: model.OutcomeCanceled,
+		Cause:   model.CauseCanceledBeforeAuthorization,
 	})
 	if !errors.Is(err, model.ErrCommandPrecondition) {
 		t.Fatalf("rejected finalize error = %v, want ErrCommandPrecondition", err)
@@ -107,25 +102,24 @@ func TestDuplicateReceiptsAreNoopWithoutRevisionOrGenerationAdvance(t *testing.T
 		t.Fatal(err)
 	}
 	ref := accepted.Record.Attempt.Ref
-	supervisor := supervisorIdentity()
+	group := groupRef(ref, model.LaunchOrdinalOne)
 
-	bind := model.BindSupervisor{Ref: ref, Supervisor: supervisor}
-	bound, err := ready.Apply(ctx, accepted.Record.JobID, bind)
+	bound, err := ready.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group)
 	if err != nil {
 		t.Fatal(err)
 	}
-	duplicateBind, err := ready.Apply(ctx, accepted.Record.JobID, bind)
+	duplicateBind, err := ready.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertNoopApply(t, "duplicate supervisor binding", bound, duplicateBind)
 
-	retire := model.CertifyRetirement{Ref: ref, Receipt: retirementReceipt(ref, supervisor)}
-	retired, err := ready.Apply(ctx, accepted.Record.JobID, retire)
+	verified := verifiedQuiescence(t, ready.Boot(), ref, model.LaunchOrdinalOne, group, model.QuiescenceAlreadyAbsent)
+	retired, err := ready.RecordQuiescence(ctx, accepted.Record.JobID, model.LaunchOrdinalOne, verified)
 	if err != nil {
 		t.Fatal(err)
 	}
-	duplicateRetire, err := ready.Apply(ctx, accepted.Record.JobID, retire)
+	duplicateRetire, err := ready.RecordQuiescence(ctx, accepted.Record.JobID, model.LaunchOrdinalOne, verified)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,23 +135,19 @@ func TestConflictingDuplicateReceiptsFailWithoutMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref := accepted.Record.Attempt.Ref
-	if _, err := ready.Apply(ctx, accepted.Record.JobID, model.BindSupervisor{
-		Ref:        ref,
-		Supervisor: supervisorIdentity(),
-	}); err != nil {
+	group := groupRef(ref, model.LaunchOrdinalOne)
+	if _, err := ready.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
 		t.Fatal(err)
 	}
 	before := repo.SnapshotBytes()
 	beforeGeneration := ready.Generation()
 
-	conflicting := supervisorIdentity()
+	conflicting := group
+	conflicting.CustodyID = "custody-conflicting"
 	conflicting.PGID++
-	conflicting.LeaderPID++
-	conflicting.HighResStartToken = "different-supervisor"
-	_, err = ready.Apply(ctx, accepted.Record.JobID, model.BindSupervisor{
-		Ref:        ref,
-		Supervisor: conflicting,
-	})
+	conflicting.Leader.PID++
+	conflicting.Leader.HighResStartToken = "different-group"
+	_, err = ready.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, conflicting)
 	if !errors.Is(err, model.ErrConflictingDuplicate) {
 		t.Fatalf("conflicting duplicate error = %v, want ErrConflictingDuplicate", err)
 	}

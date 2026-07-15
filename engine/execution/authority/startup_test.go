@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
@@ -206,8 +207,8 @@ func TestProjectionCorruptionNeverSuppliesGrantCertainty(t *testing.T) {
 	if len(plans) != 1 {
 		t.Fatalf("plans = %d, want 1", len(plans))
 	}
-	if plans[0].Next.Kind != model.RecoveryFatalUnprovable {
-		t.Fatalf("plan kind = %v, want RecoveryFatalUnprovable from safety without supervisor/grant", plans[0].Next.Kind)
+	if plans[0].Next.Kind != model.RecoveryFinalizeCertified {
+		t.Fatalf("plan kind = %v, want RecoveryFinalizeCertified from safety without launch evidence", plans[0].Next.Kind)
 	}
 
 	terminalizeRecovery(t, ctx, session, accepted.Record.Attempt.Ref)
@@ -347,19 +348,22 @@ func TestAnchorStoreStartupBarrierFromSnapshots(t *testing.T) {
 }
 
 func newBootstrapperWithAnchorStore(repo repository.Repository, anchorStore *AnchorStore) (*Bootstrapper, error) {
-	return NewBootstrapper(repo, WithAnchorStore(anchorStore))
+	_, verifier := custodian.NewAttestationChannel()
+	return NewBootstrapper(repo, WithAnchorStore(anchorStore), WithQuiescenceVerifier(verifier))
 }
 
 func beginRecoveryWithAnchorStore(t *testing.T, repo repository.Repository, anchorStore *AnchorStore, name string) (*RecoverySession, error) {
 	t.Helper()
-	bootstrapper, err := newBootstrapperWithAnchorStore(repo, anchorStore)
-	if err != nil {
-		return nil, err
-	}
 	boot, err := model.NewBootRef("boot-"+name, "owner-"+name)
 	if err != nil {
 		t.Fatal(err)
 	}
+	issuer, verifier := custodian.NewAttestationChannel()
+	bootstrapper, err := NewBootstrapper(repo, WithAnchorStore(anchorStore), WithQuiescenceVerifier(verifier))
+	if err != nil {
+		return nil, err
+	}
+	testAttestationIssuers.Store(boot, issuer)
 	return bootstrapper.Begin(context.Background(), boot)
 }
 
@@ -407,47 +411,37 @@ func restoreAnchorStore(t *testing.T, snapshot []byte) *AnchorStore {
 
 func terminalizeReady(t *testing.T, ctx context.Context, ready *Ready, ref model.AttemptRef, jobID model.JobID) {
 	t.Helper()
-	supervisor := supervisorIdentity()
-	commands := []model.Command{
-		model.BindSupervisor{Ref: ref, Supervisor: supervisor},
-		model.CertifyRetirement{Ref: ref, Receipt: retirementReceipt(ref, supervisor)},
-		model.Finalize{Ref: ref, Intent: model.TerminalIntent{
-			Outcome: model.OutcomeFailed,
-			Cause:   model.CauseDaemonRestartedBeforeAuthorization,
-		}},
+	group := groupRef(ref, model.LaunchOrdinalOne)
+	if _, err := ready.BindGroup(ctx, jobID, ref, model.LaunchOrdinalOne, group); err != nil {
+		t.Fatalf("Ready.BindGroup: %v", err)
 	}
-	for _, command := range commands {
-		if _, err := ready.Apply(ctx, jobID, command); err != nil {
-			t.Fatalf("Ready.Apply(%T): %v", command, err)
-		}
+	verified := verifiedQuiescence(t, ready.Boot(), ref, model.LaunchOrdinalOne, group, model.QuiescenceAlreadyAbsent)
+	if _, err := ready.RecordQuiescence(ctx, jobID, model.LaunchOrdinalOne, verified); err != nil {
+		t.Fatalf("Ready.RecordQuiescence: %v", err)
+	}
+	if _, err := ready.Finalize(ctx, jobID, ref, model.TerminalIntent{
+		Outcome: model.OutcomeFailed,
+		Cause:   model.CauseDaemonRestartedBeforeAuthorization,
+	}); err != nil {
+		t.Fatalf("Ready.Finalize: %v", err)
 	}
 }
 
 func terminalizeRecovery(t *testing.T, ctx context.Context, session *RecoverySession, ref model.AttemptRef) {
 	t.Helper()
-	supervisor := supervisorIdentity()
-	commands := []model.Command{
-		model.BindSupervisor{Ref: ref, Supervisor: supervisor},
-		model.CertifyRetirement{Ref: ref, Receipt: retirementReceipt(ref, supervisor)},
-		model.Finalize{Ref: ref, Intent: model.TerminalIntent{
-			Outcome: model.OutcomeFailed,
-			Cause:   model.CauseDaemonRestartedBeforeAuthorization,
-		}},
+	group := groupRef(ref, model.LaunchOrdinalOne)
+	if err := session.applyReceipt(ctx, model.BindGroup{Ref: ref, Ordinal: model.LaunchOrdinalOne, Group: group}); err != nil {
+		t.Fatalf("RecoverySession.BindGroup: %v", err)
 	}
-	for _, command := range commands {
-		if err := session.ApplyReceipt(ctx, command); err != nil {
-			t.Fatalf("RecoverySession.ApplyReceipt(%T): %v", command, err)
-		}
+	verified := verifiedQuiescence(t, session.token.boot, ref, model.LaunchOrdinalOne, group, model.QuiescenceAlreadyAbsent)
+	if err := session.RecordQuiescence(ctx, ref.JobID, model.LaunchOrdinalOne, verified); err != nil {
+		t.Fatalf("RecoverySession.RecordQuiescence: %v", err)
 	}
-}
-
-func retirementReceipt(ref model.AttemptRef, supervisor model.SupervisorIdentity) model.RetirementCertificate {
-	return model.RetirementCertificate{
-		Attempt:       ref,
-		Supervisor:    supervisor,
-		ControlClosed: evidence("control"),
-		WorkerExited:  evidence("worker"),
-		GroupEmpty:    evidence("group"),
+	if err := session.Finalize(ctx, ref, model.TerminalIntent{
+		Outcome: model.OutcomeFailed,
+		Cause:   model.CauseDaemonRestartedBeforeAuthorization,
+	}); err != nil {
+		t.Fatalf("RecoverySession.Finalize: %v", err)
 	}
 }
 

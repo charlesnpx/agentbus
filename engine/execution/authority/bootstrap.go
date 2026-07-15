@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sync"
 
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 )
@@ -37,8 +38,10 @@ type RecoverySession struct {
 type BootstrapperOption func(*bootstrapConfig)
 
 type bootstrapConfig struct {
-	anchor      Anchor
-	anchorStore *AnchorStore
+	anchor                Anchor
+	anchorStore           *AnchorStore
+	quiescenceVerifier    custodian.AttestationVerifier
+	hasQuiescenceVerifier bool
 }
 
 func WithAnchor(anchor Anchor) BootstrapperOption {
@@ -50,6 +53,13 @@ func WithAnchor(anchor Anchor) BootstrapperOption {
 func WithAnchorStore(anchorStore *AnchorStore) BootstrapperOption {
 	return func(config *bootstrapConfig) {
 		config.anchorStore = anchorStore
+	}
+}
+
+func WithQuiescenceVerifier(verifier custodian.AttestationVerifier) BootstrapperOption {
+	return func(config *bootstrapConfig) {
+		config.quiescenceVerifier = verifier
+		config.hasQuiescenceVerifier = true
 	}
 }
 
@@ -75,12 +85,17 @@ func NewBootstrapper(repo repository.Repository, options ...BootstrapperOption) 
 		}
 		anchor = anchorStore.Adapter(dbUUID, schemaMajor)
 	}
+	verifier := config.quiescenceVerifier
+	if !config.hasQuiescenceVerifier {
+		_, verifier = custodian.NewAttestationChannel()
+	}
 	return &Bootstrapper{
 		core: &authorityCore{
-			mu:      &sync.Mutex{},
-			repo:    repo,
-			anchor:  anchor,
-			runtime: newRuntimeRegistry(),
+			mu:       &sync.Mutex{},
+			repo:     repo,
+			anchor:   anchor,
+			runtime:  newRuntimeRegistry(),
+			verifier: verifier,
 		},
 	}, nil
 }
@@ -163,7 +178,53 @@ func (s *RecoverySession) Plans(ctx context.Context) ([]model.RecoveryPlan, erro
 	return plans, nil
 }
 
-func (s *RecoverySession) ApplyReceipt(ctx context.Context, command model.Command) error {
+func (s *RecoverySession) Finalize(ctx context.Context, ref model.AttemptRef, intent model.TerminalIntent) error {
+	return s.applyReceipt(ctx, model.Finalize{Ref: ref, Intent: intent})
+}
+
+func (s *RecoverySession) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) error {
+	if s == nil || s.core == nil {
+		return ErrNotReady
+	}
+	if err := jobID.Validate(); err != nil {
+		return fmt.Errorf("%w: job_id: %v", ErrInvalidRequest, err)
+	}
+	if err := ordinal.Validate(); err != nil {
+		return fmt.Errorf("%w: launch_ordinal: %v", ErrInvalidRequest, err)
+	}
+
+	s.core.mu.Lock()
+	defer s.core.mu.Unlock()
+
+	terminalCommitted := false
+	commit, err := s.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+		meta, err := s.core.requireRecoveryTx(tx, s.token)
+		if err != nil {
+			return err
+		}
+		if _, err := startupMatrixTx(tx); err != nil {
+			return err
+		}
+		applied, err := applyRecoveryQuiescenceTx(tx, jobID, ordinal, s.core.verifier, verified, s.token.boot, meta.Generation+1)
+		if err != nil {
+			return err
+		}
+		terminalCommitted = applied.Changed && applied.Record.Terminal != nil
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if err := s.core.advanceRecoveryLocked(ctx, &s.token, commit.Generation); err != nil {
+		return err
+	}
+	if terminalCommitted {
+		s.core.runtime.releaseTerminal(jobID)
+	}
+	return nil
+}
+
+func (s *RecoverySession) applyReceipt(ctx context.Context, command model.Command) error {
 	if s == nil || s.core == nil {
 		return ErrNotReady
 	}

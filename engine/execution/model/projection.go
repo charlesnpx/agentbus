@@ -89,7 +89,7 @@ func projectDispatch(record SafetyRecord) Dispatch {
 	if record.Result != nil {
 		return DispatchResultPublishing
 	}
-	if record.Attempt.Containment != nil {
+	if hasContainedQuiescence(record.Attempt) {
 		return DispatchContained
 	}
 	if hasActiveLaunch(record.Attempt) {
@@ -98,18 +98,19 @@ func projectDispatch(record SafetyRecord) Dispatch {
 	if hasUnconsumedGrant(record.Attempt) {
 		return DispatchPermitGranted
 	}
-	if record.Cancel != nil && record.Attempt.Retirement != nil {
+	if record.Cancel != nil && allLaunchGroupsQuiescent(record.Attempt) {
 		return DispatchReconciling
 	}
-	if record.Attempt.Supervisor != nil {
+	if hasPreparedLaunch(record.Attempt) {
 		return DispatchSupervisorPrepared
 	}
 	return DispatchScheduled
 }
 
 func hasUnconsumedGrant(proof AttemptProof) bool {
-	for _, ordinal := range proof.Grants.FilledOrdinals() {
-		if _, consumed := proof.Consumed.Get(ordinal); !consumed {
+	for _, ordinal := range proof.Launches.FilledOrdinals() {
+		launch, ok := proof.Launches.Get(ordinal)
+		if ok && launch.Grant != nil && launch.Released == nil {
 			return true
 		}
 	}
@@ -117,8 +118,29 @@ func hasUnconsumedGrant(proof AttemptProof) bool {
 }
 
 func hasActiveLaunch(proof AttemptProof) bool {
-	for _, ordinal := range proof.Consumed.FilledOrdinals() {
-		if _, quiescent := proof.Quiescence.Get(ordinal); !quiescent {
+	for _, ordinal := range proof.Launches.FilledOrdinals() {
+		launch, ok := proof.Launches.Get(ordinal)
+		if ok && launch.Released != nil && launch.Quiescence == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPreparedLaunch(proof AttemptProof) bool {
+	for _, ordinal := range proof.Launches.FilledOrdinals() {
+		launch, ok := proof.Launches.Get(ordinal)
+		if ok && launch.Group != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func hasContainedQuiescence(proof AttemptProof) bool {
+	for _, ordinal := range proof.Launches.FilledOrdinals() {
+		launch, ok := proof.Launches.Get(ordinal)
+		if ok && launch.Quiescence != nil && launch.Quiescence.Method == QuiescenceTermKill {
 			return true
 		}
 	}
@@ -199,7 +221,7 @@ func ReachableInternal(decision Decision, dispatch Dispatch, outcome Outcome) bo
 				return false
 			}
 		case DecisionAwaitingAck:
-			return dispatch == DispatchSupervisorPrepared
+			return dispatch == DispatchScheduled || dispatch == DispatchSupervisorPrepared
 		case DecisionCancelRequested:
 			switch dispatch {
 			case DispatchScheduled, DispatchSupervisorPrepared, DispatchPermitGranted, DispatchActive, DispatchReconciling, DispatchContained:

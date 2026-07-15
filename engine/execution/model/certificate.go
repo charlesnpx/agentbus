@@ -66,6 +66,30 @@ func (identity ChildIdentity) Equal(other ChildIdentity) bool {
 	return identity.PID == other.PID && identity.HighResStartToken == other.HighResStartToken
 }
 
+type ProcessIdentity struct {
+	PID               int
+	HighResStartToken string
+}
+
+func NewProcessIdentity(pid int, highResStartToken string) (ProcessIdentity, error) {
+	identity := ProcessIdentity{PID: pid, HighResStartToken: highResStartToken}
+	if err := identity.Validate(); err != nil {
+		return ProcessIdentity{}, err
+	}
+	return identity, nil
+}
+
+func (identity ProcessIdentity) Validate() error {
+	if err := validatePositiveInt("process.pid", identity.PID); err != nil {
+		return err
+	}
+	return validateToken("process.high_res_start_token", identity.HighResStartToken)
+}
+
+func (identity ProcessIdentity) Equal(other ProcessIdentity) bool {
+	return identity.PID == other.PID && identity.HighResStartToken == other.HighResStartToken
+}
+
 type SupervisorIdentity struct {
 	PGID               int
 	LeaderPID          int
@@ -106,6 +130,87 @@ func (identity SupervisorIdentity) Equal(other SupervisorIdentity) bool {
 		identity.PlatformRetainedID == other.PlatformRetainedID
 }
 
+type CustodyID string
+
+func NewCustodyID(value string) (CustodyID, error) {
+	id := CustodyID(value)
+	if err := id.Validate(); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func (id CustodyID) String() string {
+	return string(id)
+}
+
+func (id CustodyID) Validate() error {
+	return validateToken("custody_id", string(id))
+}
+
+type LaunchKey struct {
+	Attempt AttemptRef
+	Ordinal LaunchOrdinal
+}
+
+func (key LaunchKey) Validate() error {
+	if err := key.Attempt.Validate(); err != nil {
+		return err
+	}
+	return key.Ordinal.Validate()
+}
+
+func (key LaunchKey) Equal(other LaunchKey) bool {
+	return key.Attempt.Equal(other.Attempt) && key.Ordinal == other.Ordinal
+}
+
+type GroupRef struct {
+	Version    uint16
+	CustodyID  CustodyID
+	Launch     LaunchKey
+	HostBootID string
+	PGID       int
+	Leader     ProcessIdentity
+	Monitor    ProcessIdentity
+	RetainedID string
+}
+
+func (ref GroupRef) Validate() error {
+	if err := validatePositiveUint16("group.version", ref.Version); err != nil {
+		return err
+	}
+	if err := ref.CustodyID.Validate(); err != nil {
+		return err
+	}
+	if err := ref.Launch.Validate(); err != nil {
+		return err
+	}
+	if err := validateToken("group.host_boot_id", ref.HostBootID); err != nil {
+		return err
+	}
+	if err := validatePositiveInt("group.pgid", ref.PGID); err != nil {
+		return err
+	}
+	if err := ref.Leader.Validate(); err != nil {
+		return err
+	}
+	if err := ref.Monitor.Validate(); err != nil {
+		return err
+	}
+	return validateOptionalToken("group.retained_id", ref.RetainedID)
+}
+
+func (ref GroupRef) Equal(other GroupRef) bool {
+	return ref.Version == other.Version &&
+		ref.CustodyID == other.CustodyID &&
+		ref.Launch.Equal(other.Launch) &&
+		ref.HostBootID == other.HostBootID &&
+		ref.PGID == other.PGID &&
+		ref.Leader.Equal(other.Leader) &&
+		ref.Monitor.Equal(other.Monitor) &&
+		ref.RetainedID == other.RetainedID
+}
+
 type AcknowledgementFact struct {
 	Attempt        AttemptRef
 	AcknowledgedBy BootRef
@@ -143,18 +248,14 @@ func (fact OutcomeFact) Validate() error {
 }
 
 type LaunchGrant struct {
-	Attempt    AttemptRef
-	Supervisor SupervisorIdentity
-	Ordinal    LaunchOrdinal
-	Nonce      LaunchNonce
-	GrantedBy  BootRef
+	Attempt   AttemptRef
+	Ordinal   LaunchOrdinal
+	Nonce     LaunchNonce
+	GrantedBy BootRef
 }
 
 func (grant LaunchGrant) Validate() error {
 	if err := grant.Attempt.Validate(); err != nil {
-		return err
-	}
-	if err := grant.Supervisor.Validate(); err != nil {
 		return err
 	}
 	if err := grant.Ordinal.Validate(); err != nil {
@@ -166,40 +267,66 @@ func (grant LaunchGrant) Validate() error {
 	return grant.GrantedBy.Validate()
 }
 
-type LaunchConsumed struct {
+type LaunchReleaseFact struct {
 	Attempt     AttemptRef
 	Ordinal     LaunchOrdinal
 	Nonce       LaunchNonce
 	Child       ChildIdentity
-	ConsumedBy  BootRef
+	ReleasedBy  BootRef
 	Observation Evidence
 }
 
-func (consumed LaunchConsumed) Validate() error {
-	if err := consumed.Attempt.Validate(); err != nil {
+func (fact LaunchReleaseFact) Validate() error {
+	if err := fact.Attempt.Validate(); err != nil {
 		return err
 	}
-	if err := consumed.Ordinal.Validate(); err != nil {
+	if err := fact.Ordinal.Validate(); err != nil {
 		return err
 	}
-	if err := consumed.Nonce.Validate(); err != nil {
+	if err := fact.Nonce.Validate(); err != nil {
 		return err
 	}
-	if err := consumed.Child.Validate(); err != nil {
+	if err := fact.Child.Validate(); err != nil {
 		return err
 	}
-	if err := consumed.ConsumedBy.Validate(); err != nil {
+	if err := fact.ReleasedBy.Validate(); err != nil {
 		return err
 	}
-	return consumed.Observation.Validate()
+	return fact.Observation.Validate()
+}
+
+type LaunchConsumed = LaunchReleaseFact
+
+type QuiescenceMethod string
+
+const (
+	QuiescenceAlreadyAbsent QuiescenceMethod = "already_absent"
+	QuiescenceNaturalExit   QuiescenceMethod = "natural_exit"
+	QuiescenceTermKill      QuiescenceMethod = "term_kill"
+	QuiescenceHostReboot    QuiescenceMethod = "host_reboot"
+)
+
+func (method QuiescenceMethod) Valid() bool {
+	switch method {
+	case QuiescenceAlreadyAbsent, QuiescenceNaturalExit, QuiescenceTermKill, QuiescenceHostReboot:
+		return true
+	default:
+		return false
+	}
+}
+
+func (method QuiescenceMethod) Validate() error {
+	if !method.Valid() {
+		return invalid("quiescence.method", "is unknown")
+	}
+	return nil
 }
 
 type QuiescenceCertificate struct {
 	Attempt     AttemptRef
 	Ordinal     LaunchOrdinal
-	Child       ChildIdentity
-	ChildExited Evidence
-	GroupEmpty  Evidence
+	Group       GroupRef
+	Method      QuiescenceMethod
 	CertifiedBy BootRef
 }
 
@@ -210,65 +337,10 @@ func (certificate QuiescenceCertificate) Validate() error {
 	if err := certificate.Ordinal.Validate(); err != nil {
 		return err
 	}
-	if err := certificate.Child.Validate(); err != nil {
+	if err := certificate.Group.Validate(); err != nil {
 		return err
 	}
-	if err := certificate.ChildExited.Validate(); err != nil {
-		return err
-	}
-	if err := certificate.GroupEmpty.Validate(); err != nil {
-		return err
-	}
-	return certificate.CertifiedBy.Validate()
-}
-
-type ContainmentCertificate struct {
-	Attempt      AttemptRef
-	Supervisor   SupervisorIdentity
-	Signal       Evidence
-	Verification Evidence
-	CertifiedBy  BootRef
-}
-
-func (certificate ContainmentCertificate) Validate() error {
-	if err := certificate.Attempt.Validate(); err != nil {
-		return err
-	}
-	if err := certificate.Supervisor.Validate(); err != nil {
-		return err
-	}
-	if err := certificate.Signal.Validate(); err != nil {
-		return err
-	}
-	if err := certificate.Verification.Validate(); err != nil {
-		return err
-	}
-	return certificate.CertifiedBy.Validate()
-}
-
-type RetirementCertificate struct {
-	Attempt       AttemptRef
-	Supervisor    SupervisorIdentity
-	ControlClosed Evidence
-	WorkerExited  Evidence
-	GroupEmpty    Evidence
-	CertifiedBy   BootRef
-}
-
-func (certificate RetirementCertificate) Validate() error {
-	if err := certificate.Attempt.Validate(); err != nil {
-		return err
-	}
-	if err := certificate.Supervisor.Validate(); err != nil {
-		return err
-	}
-	if err := certificate.ControlClosed.Validate(); err != nil {
-		return err
-	}
-	if err := certificate.WorkerExited.Validate(); err != nil {
-		return err
-	}
-	if err := certificate.GroupEmpty.Validate(); err != nil {
+	if err := certificate.Method.Validate(); err != nil {
 		return err
 	}
 	return certificate.CertifiedBy.Validate()

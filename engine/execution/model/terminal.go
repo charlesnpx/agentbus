@@ -61,16 +61,19 @@ func terminalResult(record SafetyRecord, outcome Outcome) (*ResultRef, error) {
 }
 
 func deriveTerminalProof(record SafetyRecord, intent TerminalIntent) (TerminalProof, error) {
-	if record.Attempt.Retirement == nil {
-		return 0, precondition("terminal derivation requires retirement certificate")
-	}
-	if record.Attempt.Grants.Count() == 0 && record.Attempt.Consumed.Count() == 0 && record.Attempt.Quiescence.Count() == 0 {
+	if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
+		if !allLaunchGroupsQuiescent(record.Attempt) {
+			return 0, precondition("terminal derivation requires quiescence for every bound group")
+		}
 		if !validNeverPermittedIntent(intent) {
 			return 0, precondition("terminal intent is incompatible with never-permitted proof")
 		}
 		return ProofNeverPermittedAndRetired, nil
 	}
-	if record.Attempt.Containment != nil {
+	if hasContainedQuiescence(record.Attempt) {
+		if !allLaunchGroupsQuiescent(record.Attempt) {
+			return 0, precondition("contained proof requires quiescence for every bound group")
+		}
 		if !validContainedIntent(intent) {
 			return 0, precondition("terminal intent is incompatible with contained proof")
 		}
@@ -89,16 +92,11 @@ func cleanQuiescentOutcomeAndRetired(record SafetyRecord, intent TerminalIntent)
 	if record.Outcome == nil || record.Outcome.Outcome != intent.Outcome {
 		return false
 	}
-	if record.Attempt.Containment != nil || record.Attempt.Grants.Count() == 0 {
+	if hasContainedQuiescence(record.Attempt) || !hasAnyGrant(record.Attempt) {
 		return false
 	}
-	for _, ordinal := range record.Attempt.Grants.FilledOrdinals() {
-		if _, ok := record.Attempt.Consumed.Get(ordinal); !ok {
-			return false
-		}
-		if _, ok := record.Attempt.Quiescence.Get(ordinal); !ok {
-			return false
-		}
+	if !allGrantedLaunchesReleasedAndQuiescent(record.Attempt) {
+		return false
 	}
 	return !hasUnconsumedGrant(record.Attempt) && !hasActiveLaunch(record.Attempt)
 }

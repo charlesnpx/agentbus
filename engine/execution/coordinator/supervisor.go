@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 )
 
@@ -11,30 +12,38 @@ type Supervisor interface {
 	Prepare(context.Context, LaunchPlan) (PreparedSupervisor, error)
 	SendPermit(context.Context, PreparedSupervisor, model.LaunchGrant) error
 	ObserveLaunch(context.Context, PreparedSupervisor, model.LaunchGrant) (LaunchObservation, error)
-	VerifyQuiescence(context.Context, PreparedSupervisor, model.LaunchConsumed) (model.QuiescenceReceipt, error)
-	Contain(context.Context, PreparedSupervisor) (model.ContainmentReceipt, error)
-	Retire(context.Context, PreparedSupervisor) (model.RetirementReceipt, error)
+	VerifyQuiescence(context.Context, PreparedSupervisor, model.LaunchReleaseFact) (custodian.VerifiedQuiescence, error)
+	Contain(context.Context, PreparedSupervisor) (custodian.VerifiedQuiescence, error)
+	Retire(context.Context, PreparedSupervisor) (custodian.VerifiedQuiescence, error)
 }
 
 type LaunchPlan struct {
 	JobID        model.JobID
 	Ref          model.AttemptRef
+	Ordinal      model.LaunchOrdinal
 	RequestKey   model.RequestKey
 	TaskIdentity model.TaskIdentity
 	SessionID    string
 }
 
 type PreparedSupervisor struct {
-	Ref      model.AttemptRef
-	Identity model.SupervisorIdentity
+	Ref     model.AttemptRef
+	Ordinal model.LaunchOrdinal
+	Group   model.GroupRef
 }
 
 func (prepared PreparedSupervisor) ValidateFor(ref model.AttemptRef) error {
 	if !prepared.Ref.Equal(ref) {
 		return fmt.Errorf("prepared supervisor attempt mismatch")
 	}
-	if err := prepared.Identity.Validate(); err != nil {
-		return fmt.Errorf("prepared supervisor identity: %w", err)
+	if err := prepared.Ordinal.Validate(); err != nil {
+		return fmt.Errorf("prepared supervisor ordinal: %w", err)
+	}
+	if err := prepared.Group.Validate(); err != nil {
+		return fmt.Errorf("prepared supervisor group: %w", err)
+	}
+	if !prepared.Group.Launch.Attempt.Equal(ref) || prepared.Group.Launch.Ordinal != prepared.Ordinal {
+		return fmt.Errorf("prepared supervisor group launch mismatch")
 	}
 	return nil
 }

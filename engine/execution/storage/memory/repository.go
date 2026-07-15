@@ -735,12 +735,7 @@ func cloneQuarantine(record repository.QuarantineRecord) repository.QuarantineRe
 
 func cloneSafetyRecord(record model.SafetyRecord) model.SafetyRecord {
 	next := record
-	next.Attempt.Supervisor = clonePtr(record.Attempt.Supervisor)
-	next.Attempt.Grants = cloneLaunchSlots(record.Attempt.Grants)
-	next.Attempt.Consumed = cloneLaunchSlots(record.Attempt.Consumed)
-	next.Attempt.Quiescence = cloneLaunchSlots(record.Attempt.Quiescence)
-	next.Attempt.Retirement = clonePtr(record.Attempt.Retirement)
-	next.Attempt.Containment = clonePtr(record.Attempt.Containment)
+	next.Attempt.Launches = cloneLaunchSlots(record.Attempt.Launches)
 	next.Acknowledgement = clonePtr(record.Acknowledgement)
 	next.Cancel = clonePtr(record.Cancel)
 	next.Outcome = clonePtr(record.Outcome)

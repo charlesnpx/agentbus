@@ -2,8 +2,6 @@ package model
 
 type PermitNonce = LaunchNonce
 type QuiescenceReceipt = QuiescenceCertificate
-type RetirementReceipt = RetirementCertificate
-type ContainmentReceipt = ContainmentCertificate
 type ResultReceipt = ResultCertificate
 
 type Command interface {
@@ -20,27 +18,28 @@ type BeginReject struct {
 	RequestedBy BootRef
 }
 
-type BindSupervisor struct {
-	Ref        AttemptRef
-	Supervisor SupervisorIdentity
+type BindGroup struct {
+	Ref     AttemptRef
+	Ordinal LaunchOrdinal
+	Group   GroupRef
 }
 
-type AuthorizeLaunch struct {
+type CommitGrant struct {
 	Ref       AttemptRef
 	Ordinal   LaunchOrdinal
 	Nonce     PermitNonce
 	GrantedBy BootRef
 }
 
-type ObserveLaunchConsumed struct {
+type RecordRelease struct {
 	Ref         AttemptRef
 	Ordinal     LaunchOrdinal
 	Child       ChildIdentity
-	ConsumedBy  BootRef
+	ReleasedBy  BootRef
 	Observation Evidence
 }
 
-type ObserveLaunchQuiescent struct {
+type RecordQuiescence struct {
 	Ref     AttemptRef
 	Receipt QuiescenceReceipt
 }
@@ -53,16 +52,6 @@ type RequestCancel struct {
 type ObserveOutcome struct {
 	Ref     AttemptRef
 	Outcome Outcome
-}
-
-type CertifyRetirement struct {
-	Ref     AttemptRef
-	Receipt RetirementReceipt
-}
-
-type CertifyContainment struct {
-	Ref     AttemptRef
-	Receipt ContainmentReceipt
 }
 
 type CertifyResult struct {
@@ -81,15 +70,13 @@ type Finalize struct {
 	Intent TerminalIntent
 }
 
-func (Acknowledge) isCommand()            {}
-func (BeginReject) isCommand()            {}
-func (BindSupervisor) isCommand()         {}
-func (AuthorizeLaunch) isCommand()        {}
-func (ObserveLaunchConsumed) isCommand()  {}
-func (ObserveLaunchQuiescent) isCommand() {}
-func (RequestCancel) isCommand()          {}
-func (ObserveOutcome) isCommand()         {}
-func (CertifyRetirement) isCommand()      {}
-func (CertifyContainment) isCommand()     {}
-func (CertifyResult) isCommand()          {}
-func (Finalize) isCommand()               {}
+func (Acknowledge) isCommand()      {}
+func (BeginReject) isCommand()      {}
+func (BindGroup) isCommand()        {}
+func (CommitGrant) isCommand()      {}
+func (RecordRelease) isCommand()    {}
+func (RecordQuiescence) isCommand() {}
+func (RequestCancel) isCommand()    {}
+func (ObserveOutcome) isCommand()   {}
+func (CertifyResult) isCommand()    {}
+func (Finalize) isCommand()         {}
