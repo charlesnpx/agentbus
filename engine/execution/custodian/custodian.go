@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 
+	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 )
 
@@ -12,19 +13,6 @@ var (
 	ErrInvalidAttestation    = errors.New("invalid quiescence attestation")
 	ErrSupervisorUnavailable = errors.New("supervisor_unavailable")
 )
-
-type ExecSpec struct {
-	Argv []string
-	Env  []string
-	Dir  string
-}
-
-type ExitObservation struct {
-	Exited   bool
-	Code     int
-	Signal   string
-	Evidence model.Evidence
-}
 
 type GrantToken string
 
@@ -38,21 +26,9 @@ const (
 	QuiescenceCauseHostBoot QuiescenceCause = "host_boot"
 )
 
-type CommandRunner interface {
-	Start(context.Context, ExecSpec) (RunningCommand, error)
-}
-
-type RunningCommand interface {
-	Stdin() io.WriteCloser
-	Stdout() io.ReadCloser
-	Stderr() io.ReadCloser
-	Wait(context.Context) (ExitObservation, error)
-	Interrupt(context.Context) error
-}
-
 type ProcessCustodian interface {
 	processCustodian()
-	Prepare(context.Context, ExecSpec, model.LaunchKey) (PreparedProcess, error)
+	Prepare(context.Context, command.ExecSpec, model.LaunchKey) (PreparedProcess, error)
 	ContainAndVerify(context.Context, model.GroupRef, QuiescenceCause) (VerifiedQuiescence, error)
 }
 
@@ -68,7 +44,7 @@ type PreparedProcess interface {
 
 type RunningProcess interface {
 	runningProcess()
-	WaitAndVerify(context.Context) (ExitObservation, VerifiedQuiescence, error)
+	WaitAndVerify(context.Context) (command.ExitObservation, VerifiedQuiescence, error)
 	ContainAndVerify(context.Context, QuiescenceCause) (VerifiedQuiescence, error)
 }
 
@@ -76,7 +52,7 @@ type UnavailableCustodian struct{}
 
 func (UnavailableCustodian) processCustodian() {}
 
-func (UnavailableCustodian) Prepare(context.Context, ExecSpec, model.LaunchKey) (PreparedProcess, error) {
+func (UnavailableCustodian) Prepare(context.Context, command.ExecSpec, model.LaunchKey) (PreparedProcess, error) {
 	return nil, ErrSupervisorUnavailable
 }
 

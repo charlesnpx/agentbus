@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
-	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	"github.com/charlesnpx/agentbus/engine/command"
 )
 
 const DriftError = "backend version changed since setup; re-run agentbus setup"
@@ -35,7 +35,6 @@ type Backend struct {
 	Parse            func(map[string]any) ([]engine.Event, string, error)
 	VersionTransform func(string) string
 	Discover         func(context.Context, string) (*engine.ModelDiscovery, error)
-	CommandRunner    custodian.CommandRunner
 }
 
 func (b *Backend) Name() string { return b.NameValue }
@@ -197,13 +196,6 @@ func (b *Backend) binary() string {
 	return b.NameValue
 }
 
-func (b *Backend) commandRunner() custodian.CommandRunner {
-	if b.CommandRunner != nil {
-		return b.CommandRunner
-	}
-	return DirectCommandRunner{}
-}
-
 func (b *Backend) normalizeVersion(s string) string {
 	s = strings.TrimSpace(s)
 	if b.VersionTransform != nil {
@@ -330,7 +322,7 @@ type Session struct {
 	validationWarning         string
 	suppressValidationWarning bool
 	mu                        sync.Mutex
-	active                    custodian.RunningCommand
+	active                    command.RunningCommand
 	lastAgentMessage          string
 }
 
@@ -341,6 +333,13 @@ func (s *Session) ID() string {
 }
 
 func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+	return s.TurnWithRunner(ctx, input, DirectCommandRunner{})
+}
+
+func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, runner command.Runner) (<-chan engine.Event, error) {
+	if runner == nil {
+		return nil, errors.New("command runner is required")
+	}
 	warningText, err := s.backend.validateOptions(ctx, s.opts)
 	if err != nil {
 		return nil, err
@@ -376,7 +375,7 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		s.mu.Unlock()
 		return nil, err
 	}
-	spec := custodian.ExecSpec{Argv: append([]string{s.backend.binary()}, args...)}
+	spec := command.ExecSpec{Argv: append([]string{s.backend.binary()}, args...)}
 	if s.opts.CWD != "" {
 		spec.Dir = s.opts.CWD
 	}
@@ -402,7 +401,7 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 			return nil, err
 		}
 	}
-	command, err := s.backend.commandRunner().Start(ctx, spec)
+	command, err := runner.Start(ctx, spec)
 	if err != nil {
 		if stdoutLog != nil {
 			_ = stdoutLog.Close()

@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
-	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	"github.com/charlesnpx/agentbus/engine/command"
 )
 
 func TestCapEventKeepsRawTextOutOfJSONMetadata(t *testing.T) {
@@ -214,10 +214,9 @@ func TestCopyAndCloseClosesSourceOnWriterFailure(t *testing.T) {
 func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 	runner := &fakeCommandRunner{}
 	backend := &Backend{
-		NameValue:     "fake",
-		Binary:        "fake-binary",
-		CachePath:     filepath.Join(t.TempDir(), "missing-cache.json"),
-		CommandRunner: runner,
+		NameValue: "fake",
+		Binary:    "fake-binary",
+		CachePath: filepath.Join(t.TempDir(), "missing-cache.json"),
 		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
 			return []string{"run", "--json"}, nil
 		},
@@ -230,7 +229,7 @@ func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +261,7 @@ func assertDirectCommandRunnerContextDoneTerminatesOnce(t *testing.T, ctx contex
 	}
 	t.Cleanup(func() { terminateProcessGroup = original })
 
-	running, err := (DirectCommandRunner{CancelGrace: 10 * time.Millisecond}).Start(ctx, custodian.ExecSpec{
+	running, err := (DirectCommandRunner{CancelGrace: 10 * time.Millisecond}).Start(ctx, command.ExecSpec{
 		Argv: []string{"/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done"},
 	})
 	if err != nil {
@@ -357,10 +356,10 @@ func (r *recordingReadCloser) Close() error {
 }
 
 type fakeCommandRunner struct {
-	spec custodian.ExecSpec
+	spec command.ExecSpec
 }
 
-func (r *fakeCommandRunner) Start(_ context.Context, spec custodian.ExecSpec) (custodian.RunningCommand, error) {
+func (r *fakeCommandRunner) Start(_ context.Context, spec command.ExecSpec) (command.RunningCommand, error) {
 	r.spec = spec
 	return &fakeRunningCommand{
 		stdin:  discardWriteCloser{},
@@ -387,8 +386,8 @@ func (c fakeRunningCommand) Stderr() io.ReadCloser {
 	return c.stderr
 }
 
-func (c fakeRunningCommand) Wait(context.Context) (custodian.ExitObservation, error) {
-	return custodian.ExitObservation{Exited: true, Code: 0}, nil
+func (c fakeRunningCommand) Wait(context.Context) (command.ExitObservation, error) {
+	return command.ExitObservation{Exited: true, Code: 0}, nil
 }
 
 func (c fakeRunningCommand) Interrupt(context.Context) error {

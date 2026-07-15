@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
-	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	"github.com/charlesnpx/agentbus/engine/command"
 )
 
 // DirectCommandRunner preserves the legacy adapter subprocess path.
@@ -19,7 +19,7 @@ type DirectCommandRunner struct {
 	CancelGrace time.Duration
 }
 
-func (r DirectCommandRunner) Start(ctx context.Context, spec custodian.ExecSpec) (custodian.RunningCommand, error) {
+func (r DirectCommandRunner) Start(ctx context.Context, spec command.ExecSpec) (command.RunningCommand, error) {
 	if len(spec.Argv) == 0 || strings.TrimSpace(spec.Argv[0]) == "" {
 		return nil, errors.New("command argv is required")
 	}
@@ -86,7 +86,7 @@ func (r *directRunningCommand) Stderr() io.ReadCloser {
 	return r.stderr
 }
 
-func (r *directRunningCommand) Wait(context.Context) (custodian.ExitObservation, error) {
+func (r *directRunningCommand) Wait(context.Context) (command.ExitObservation, error) {
 	err := r.cmd.Wait()
 	if r.stderrWriter != nil {
 		_ = r.stderrWriter.Close()
@@ -127,8 +127,8 @@ func processRefForCmd(cmd *exec.Cmd) engine.ProcessRef {
 	return ref
 }
 
-func exitObservationForCmd(cmd *exec.Cmd) custodian.ExitObservation {
-	observation := custodian.ExitObservation{}
+func exitObservationForCmd(cmd *exec.Cmd) command.ExitObservation {
+	observation := command.ExitObservation{}
 	if cmd == nil || cmd.ProcessState == nil {
 		return observation
 	}
