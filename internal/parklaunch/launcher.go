@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -29,6 +30,7 @@ var (
 	ErrChannelLostBeforeRelease = errors.New("parked worker channel lost before release")
 	ErrReleaseAlreadySent       = errors.New("parked worker release already sent")
 	ErrReleaseAck               = errors.New("parked worker release ack failed")
+	ErrMonitorNotArmed          = errors.New("parklaunch monitor not armed")
 )
 
 // Containment is the narrow cleanup dependency injected by S3A/S3B later. It
@@ -76,8 +78,10 @@ func (nativeIdentityReader) ClassifyGroup(claim procgroup.GroupClaim) model.Grou
 }
 
 type launchHooks struct {
-	afterPipesCreated func(launchPipeSnapshot) error
-	beforeRelease     func(launchControlSnapshot) error
+	afterPipesCreated   func(launchPipeSnapshot) error
+	afterMonitorStarted func(*MonitorProcess) error
+	afterWorkerStarted  func(int) error
+	beforeRelease       func(launchControlSnapshot) error
 }
 
 type launchPipeSnapshot struct {
@@ -190,11 +194,18 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	defer func() {
 		if !launchSucceeded {
 			_ = closeMonitorTarget(monitor)
+			_ = closeMonitorReady(monitor)
 			_ = waitMonitorOrKill(monitor)
+			_ = closeMonitorDaemonControl(monitor)
 		}
 	}()
+	if spec.hooks.afterMonitorStarted != nil {
+		if err := spec.hooks.afterMonitorStarted(monitor); err != nil {
+			return nil, err
+		}
+	}
 
-	cmd := exec.CommandContext(ctx, spec.AgentbusPath,
+	cmd := exec.Command(spec.AgentbusPath,
 		"internal-parked-worker",
 		"--control-read-fd", fmt.Sprint(workerControlReadFD),
 		"--control-write-fd", fmt.Sprint(workerControlWriteFD),
@@ -220,79 +231,98 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	started := true
 	var group model.GroupRef
 	released := false
+	preIdentityAbort := func(cause error) error {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		if err := terminateStartedProcess(cleanupCtx, cmd.Process, done); err != nil {
+			return errors.Join(cause, fmt.Errorf("terminate parked worker before identity: %w", err))
+		}
+		return cause
+	}
 	defer func() {
 		if started && !released {
 			_ = pipes.closeControl()
 		}
 	}()
+	if spec.hooks.afterWorkerStarted != nil {
+		if err := spec.hooks.afterWorkerStarted(cmd.Process.Pid); err != nil {
+			return nil, preIdentityAbort(err)
+		}
+	}
 
 	workerClaim, err := waitProcessGroupLeaderClaim(ctx, spec.identity, cmd.Process.Pid)
 	if err != nil {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("%w: read worker identity before bootstrap: %v", ErrIdentityMismatch, err))
+		return nil, preIdentityAbort(fmt.Errorf("%w: read worker identity before bootstrap: %v", ErrIdentityMismatch, err))
 	}
 	monitorClaim, err := waitProcessGroupLeaderClaim(ctx, spec.identity, monitor.PID)
 	if err != nil {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("read monitor identity: %w", err))
+		return nil, preIdentityAbort(fmt.Errorf("read monitor identity: %w", err))
 	}
 	if workerClaim.PGID != workerClaim.PID {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("%w: worker pgid=%d pid=%d", ErrIdentityMismatch, workerClaim.PGID, workerClaim.PID))
+		return nil, preIdentityAbort(fmt.Errorf("%w: worker pgid=%d pid=%d", ErrIdentityMismatch, workerClaim.PGID, workerClaim.PID))
 	}
 	if monitorClaim.PGID != monitorClaim.PID {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("monitor pgid=%d pid=%d", monitorClaim.PGID, monitorClaim.PID))
+		return nil, preIdentityAbort(fmt.Errorf("monitor pgid=%d pid=%d", monitorClaim.PGID, monitorClaim.PID))
 	}
 	if monitorClaim.PGID == workerClaim.PGID {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("monitor joined target process group %d", workerClaim.PGID))
+		return nil, preIdentityAbort(fmt.Errorf("monitor joined target process group %d", workerClaim.PGID))
 	}
 
 	group = groupRefFromClaims(workerClaim, monitorClaim, spec.CustodyID, spec.LaunchKey)
 	expectation, err := releaseExpectation(spec, group)
 	if err != nil {
-		return nil, failClosed(ctx, spec.Containment, group, err)
+		return nil, failClosed(spec.Containment, group, err)
 	}
 	if err := writeReleaseExpectation(pipes.bootstrapWrite, expectation); err != nil {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("write release expectation bootstrap: %w", err))
+		return nil, failClosed(spec.Containment, group, fmt.Errorf("write release expectation bootstrap: %w", err))
 	}
 	_ = pipes.bootstrapWrite.Close()
 	pipes.bootstrapWrite = nil
 
 	if err := monitor.BindTarget(group); err != nil {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("bind monitor target: %w", err))
+		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: bind monitor target: %v", ErrMonitorNotArmed, err))
+	}
+	if err := monitor.WaitReady(ctx); err != nil {
+		return nil, failClosed(spec.Containment, group, err)
 	}
 
 	reader := parkproto.NewReader(pipes.fromWorkerRead)
-	received, err := reader.Read()
+	received, err := readParkFrame(ctx, reader)
 	if err != nil {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("%w: read identity report: %v", ErrChannelLostBeforeRelease, err))
+		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: read identity report: %v", ErrChannelLostBeforeRelease, err))
 	}
 	report, ok := received.Message.(parkproto.IdentityReport)
 	if !ok {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("%w: first worker frame was %T", ErrIdentityMismatch, received.Message))
+		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: first worker frame was %T", ErrIdentityMismatch, received.Message))
 	}
 	if err := verifyIdentityReport(spec.identity, report, workerClaim, group); err != nil {
-		return nil, failClosed(ctx, spec.Containment, group, err)
+		return nil, failClosed(spec.Containment, group, err)
 	}
 	if spec.hooks.beforeRelease != nil {
 		if err := spec.hooks.beforeRelease(launchControlSnapshot{ControlWrite: pipes.toWorkerWrite, ControlRead: pipes.fromWorkerRead}); err != nil {
-			return nil, failClosed(ctx, spec.Containment, group, err)
+			return nil, failClosed(spec.Containment, group, err)
 		}
+	}
+	if err := verifyMonitorReadyIdentity(spec.identity, monitor, monitorClaim, group); err != nil {
+		return nil, failClosed(spec.Containment, group, err)
 	}
 
 	writer := parkproto.NewWriter(pipes.toWorkerWrite)
 	release := releaseForReport(expectation, group, spec.ExecSpec, report)
 	releaser := &releaseGate{}
 	if err := releaser.send(writer, release); err != nil {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("%w: %v", ErrChannelLostBeforeRelease, err))
+		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: %v", ErrChannelLostBeforeRelease, err))
 	}
-	ackFrame, err := reader.Read()
+	ackFrame, err := readParkFrame(ctx, reader)
 	if err != nil {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("%w: %v", ErrReleaseAck, err))
+		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: %v", ErrReleaseAck, err))
 	}
 	ack, ok := ackFrame.Message.(parkproto.ReleaseAck)
 	if !ok {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("%w: got %T", ErrReleaseAck, ackFrame.Message))
+		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: got %T", ErrReleaseAck, ackFrame.Message))
 	}
 	if ackFrame.Sequence != 2 || ack.AcceptedSequence != release.Binding.Sequence {
-		return nil, failClosed(ctx, spec.Containment, group, fmt.Errorf("%w: sequence=%d accepted=%d", ErrReleaseAck, ackFrame.Sequence, ack.AcceptedSequence))
+		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: sequence=%d accepted=%d", ErrReleaseAck, ackFrame.Sequence, ack.AcceptedSequence))
 	}
 
 	released = true
@@ -425,6 +455,49 @@ func verifyIdentityReport(reader identityReader, report parkproto.IdentityReport
 	return nil
 }
 
+func verifyMonitorReadyIdentity(reader identityReader, monitor *MonitorProcess, initial procgroup.ProcessClaim, group model.GroupRef) error {
+	if monitor == nil {
+		return fmt.Errorf("%w: monitor process is nil", ErrMonitorNotArmed)
+	}
+	select {
+	case <-monitor.wait.exited:
+		return fmt.Errorf("%w: monitor exited before final identity check: %v", ErrMonitorNotArmed, monitor.wait.Err())
+	default:
+	}
+	reread, err := reader.ReadProcessClaim(monitor.PID)
+	if err != nil {
+		return fmt.Errorf("%w: re-read monitor identity: %v", ErrIdentityMismatch, err)
+	}
+	if reread.PID != initial.PID || reread.PGID != initial.PGID || reread.StartToken != initial.StartToken || !reread.KernelDomainID.Equal(initial.KernelDomainID) {
+		return fmt.Errorf("%w: monitor re-read claim differs", ErrIdentityMismatch)
+	}
+	if reread.PGID != reread.PID {
+		return fmt.Errorf("%w: monitor pgid=%d pid=%d", ErrIdentityMismatch, reread.PGID, reread.PID)
+	}
+	if reread.PGID == group.PGID {
+		return fmt.Errorf("%w: monitor joined target process group %d", ErrIdentityMismatch, group.PGID)
+	}
+	if observed := reader.ClassifyProcess(reread); observed != model.ProcessIdentityMatching {
+		return fmt.Errorf("%w: monitor process observation=%s", ErrIdentityMismatch, observed)
+	}
+	groupClaim, err := procgroup.NewGroupClaim(reread.PGID, reread.KernelDomainID)
+	if err != nil {
+		return fmt.Errorf("%w: monitor group claim: %v", ErrIdentityMismatch, err)
+	}
+	if observed := reader.ClassifyGroup(groupClaim); observed != model.GroupLive {
+		return fmt.Errorf("%w: monitor group observation=%s", ErrIdentityMismatch, observed)
+	}
+	if group.Monitor.PID != reread.PID || group.Monitor.HighResStartToken != reread.StartToken.String() {
+		return fmt.Errorf("%w: group ref does not bind monitor identity", ErrIdentityMismatch)
+	}
+	select {
+	case <-monitor.wait.exited:
+		return fmt.Errorf("%w: monitor exited after final identity check: %v", ErrMonitorNotArmed, monitor.wait.Err())
+	default:
+	}
+	return nil
+}
+
 func groupRefFromClaims(worker, monitor procgroup.ProcessClaim, custodyID model.CustodyID, launchKey model.LaunchKey) model.GroupRef {
 	return model.GroupRef{
 		Version:           1,
@@ -469,13 +542,66 @@ func waitProcessGroupLeaderClaim(ctx context.Context, reader identityReader, pid
 	}
 }
 
-func failClosed(ctx context.Context, containment Containment, group model.GroupRef, cause error) error {
+func readParkFrame(ctx context.Context, reader *parkproto.Reader) (parkproto.Received, error) {
+	type readResult struct {
+		received parkproto.Received
+		err      error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		received, err := reader.Read()
+		done <- readResult{received: received, err: err}
+	}()
+	select {
+	case result := <-done:
+		return result.received, result.err
+	case <-ctx.Done():
+		return parkproto.Received{}, ctx.Err()
+	}
+}
+
+func cleanupContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 3*time.Second)
+}
+
+func failClosed(containment Containment, group model.GroupRef, cause error) error {
 	if group.Validate() == nil && containment != nil {
+		ctx, cancel := cleanupContext()
+		defer cancel()
 		if err := containment.Contain(ctx, group); err != nil {
 			return errors.Join(cause, fmt.Errorf("contain target group: %w", err))
 		}
 	}
 	return cause
+}
+
+func terminateStartedProcess(ctx context.Context, process *os.Process, done <-chan error) error {
+	if process == nil || done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	_ = process.Signal(syscall.SIGTERM)
+	timer := time.NewTimer(100 * time.Millisecond)
+	select {
+	case <-done:
+		timer.Stop()
+		return nil
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	case <-timer.C:
+	}
+	_ = process.Kill()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func zeroBytes(raw []byte) {

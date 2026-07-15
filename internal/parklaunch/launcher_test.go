@@ -29,7 +29,9 @@ const (
 	parklaunchHelperEnv     = "AGENTBUS_PARKLAUNCH_HELPER"
 	parklaunchBackendMode   = "backend"
 	parklaunchMonitorMode   = "monitor"
+	parklaunchMonitorNoAck  = "monitor-no-ack"
 	parklaunchFDScanMode    = "fd-scan"
+	parklaunchFDHoldMode    = "fd-hold"
 	parklaunchMonitorFDMode = "monitor-fd"
 )
 
@@ -147,15 +149,8 @@ func TestMonitorDaemonEOFContainsExactlyOnce(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	dir := t.TempDir()
-	daemonRead, daemonWrite, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = daemonWrite.Close()
-	})
 	marker := filepath.Join(dir, "containment.log")
-	monitor := startTestMonitor(t, ctx, daemonRead, marker)
+	monitor := startTestMonitor(t, ctx, marker)
 	claim, err := procgroup.ReadProcessClaim(monitor.PID)
 	if err != nil {
 		t.Fatalf("read monitor claim: %v", err)
@@ -167,8 +162,11 @@ func TestMonitorDaemonEOFContainsExactlyOnce(t *testing.T) {
 	if err := monitor.BindTarget(target); err != nil {
 		t.Fatalf("BindTarget() error = %v", err)
 	}
+	if err := monitor.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady() error = %v", err)
+	}
 
-	if err := daemonWrite.Close(); err != nil {
+	if err := closeMonitorDaemonControl(monitor); err != nil {
 		t.Fatalf("close daemon write: %v", err)
 	}
 	waitMonitorSuccess(t, monitor)
@@ -213,6 +211,130 @@ func TestLaunchFDOwnership(t *testing.T) {
 	}
 }
 
+func TestLaunchStartupContextCancelAfterReturnDoesNotKillBackendOrMonitor(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}, Hold: 5 * time.Second})
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupParkedHandle(t, handle)
+
+	result := waitBackendResult(t, fixture.backend.ResultPath)
+	fixture.cancel()
+	time.Sleep(200 * time.Millisecond)
+	assertProcessMatches(t, result.PID, handle.GroupRef.Leader.HighResStartToken)
+	assertProcessMatches(t, handle.Monitor.PID, handle.GroupRef.Monitor.HighResStartToken)
+	if got := fixture.containment.CallCount(); got != 0 {
+		t.Fatalf("parent containment calls after startup cancel = %d, want 0", got)
+	}
+
+	if err := closeMonitorDaemonControl(handle.Monitor); err != nil {
+		t.Fatalf("close daemon control: %v", err)
+	}
+	waitMonitorSuccess(t, handle.Monitor)
+	lines := readLines(t, fixture.monitorMarker)
+	if len(lines) != 1 {
+		t.Fatalf("monitor containment lines = %d (%v), want 1", len(lines), lines)
+	}
+}
+
+func TestLaunchMonitorExitBeforeReadyFailsClosedWithoutRelease(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	fixture.spec.Monitor.Command = monitorNoAckCommand(t)
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err == nil {
+		stopMonitor(t, handle.Monitor)
+		t.Fatal("Launch() succeeded; want monitor-not-armed failure")
+	}
+	if !errors.Is(err, ErrMonitorNotArmed) {
+		t.Fatalf("Launch() error = %v, want ErrMonitorNotArmed", err)
+	}
+	if got := fixture.containment.CallCount(); got != 1 {
+		t.Fatalf("containment calls = %d, want 1", got)
+	}
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+	fixture.containment.WaitAbsent(t)
+}
+
+func TestLaunchDaemonControlWriterNotInheritedByUnrelatedChild(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	duringLaunchScan := filepath.Join(t.TempDir(), "during-launch-fds.json")
+	fixture.spec.hooks.afterMonitorStarted = func(monitor *MonitorProcess) error {
+		open, err := runFDScanHelper([]int{int(monitor.DaemonControlWrite.Fd())}, duringLaunchScan)
+		if err != nil {
+			return err
+		}
+		if len(open) != 0 {
+			return fmt.Errorf("unrelated child inherited daemon-control writer during launch: %v", open)
+		}
+		return nil
+	}
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupParkedHandle(t, handle)
+
+	afterLaunchScan := filepath.Join(t.TempDir(), "after-launch-fds.json")
+	startFDHoldHelper(t, []int{int(handle.Monitor.DaemonControlWrite.Fd())}, afterLaunchScan, 5*time.Second)
+	if open := waitOpenFDResult(t, afterLaunchScan); len(open) != 0 {
+		t.Fatalf("unrelated child inherited daemon-control writer after launch: %v", open)
+	}
+	if err := closeMonitorDaemonControl(handle.Monitor); err != nil {
+		t.Fatalf("close daemon control: %v", err)
+	}
+	waitMonitorSuccess(t, handle.Monitor)
+}
+
+func TestLaunchPreIdentityFailureTerminatesAndReapsWorker(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	fixture.ctx = ctx
+	workerPID := 0
+	fixture.spec.hooks.afterWorkerStarted = func(pid int) error {
+		workerPID = pid
+		return nil
+	}
+	fixture.spec.identity = workerOnlyIdentityReader{identityReader: nativeIdentityReader{}, workerPID: &workerPID}
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err == nil {
+		stopMonitor(t, handle.Monitor)
+		t.Fatal("Launch() succeeded; want pre-identity failure")
+	}
+	if workerPID == 0 {
+		t.Fatal("worker pid was not recorded")
+	}
+	if got := fixture.containment.CallCount(); got != 0 {
+		t.Fatalf("containment calls = %d, want 0 before valid GroupRef", got)
+	}
+	waitPIDAbsent(t, workerPID)
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+}
+
+func TestStartMonitorProcessStartFailureDoesNotLeakFDs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	missing := filepath.Join(t.TempDir(), "missing-monitor")
+	before := openFDSet(fdRange(3, 256))
+	for i := 0; i < 25; i++ {
+		monitor, err := StartMonitorProcess(ctx, MonitorProcessSpec{
+			Command: CommandSpec{Path: missing},
+		})
+		if err == nil {
+			stopMonitor(t, monitor)
+			t.Fatal("StartMonitorProcess() succeeded; want start failure")
+		}
+	}
+	after := openFDSet(fdRange(3, 256))
+	if extra := fdSetDifference(after, before); len(extra) != 0 {
+		t.Fatalf("monitor start failure leaked fds: %v", extra)
+	}
+}
+
 func TestParklaunchBackendHelperProcess(t *testing.T) {
 	if os.Getenv(parklaunchHelperEnv) != parklaunchBackendMode {
 		return
@@ -235,6 +357,17 @@ func TestParklaunchMonitorHelperProcess(t *testing.T) {
 	os.Exit(runMonitorHelper(args))
 }
 
+func TestParklaunchMonitorNoAckHelperProcess(t *testing.T) {
+	if os.Getenv(parklaunchHelperEnv) != parklaunchMonitorNoAck {
+		return
+	}
+	args, ok := helperArgs()
+	if !ok {
+		os.Exit(97)
+	}
+	os.Exit(runMonitorNoAckHelper(args))
+}
+
 func TestParklaunchFDScanHelperProcess(t *testing.T) {
 	if os.Getenv(parklaunchHelperEnv) != parklaunchFDScanMode {
 		return
@@ -246,6 +379,17 @@ func TestParklaunchFDScanHelperProcess(t *testing.T) {
 	os.Exit(runFDScanHelperProcess(args))
 }
 
+func TestParklaunchFDHoldHelperProcess(t *testing.T) {
+	if os.Getenv(parklaunchHelperEnv) != parklaunchFDHoldMode {
+		return
+	}
+	args, ok := helperArgs()
+	if !ok {
+		os.Exit(97)
+	}
+	os.Exit(runFDHoldHelperProcess(args))
+}
+
 type launchFixture struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -253,11 +397,11 @@ type launchFixture struct {
 	backend       backendFixtureSpec
 	containment   *recordingContainment
 	monitorMarker string
-	daemonWrite   *os.File
 }
 
 type backendFixtureOptions struct {
 	ClosedFDs []int
+	Hold      time.Duration
 }
 
 type backendFixtureSpec struct {
@@ -277,14 +421,6 @@ func newLaunchFixture(t *testing.T, backendOpts backendFixtureOptions) launchFix
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 	dir := t.TempDir()
-	daemonRead, daemonWrite, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = daemonRead.Close()
-		_ = daemonWrite.Close()
-	})
 	backend := newBackendFixture(t, dir, backendOpts)
 	containment := &recordingContainment{kill: true}
 	attempt := model.AttemptRef{JobID: "job-parklaunch", AttemptID: "attempt-1", Epoch: 1}
@@ -300,8 +436,7 @@ func newLaunchFixture(t *testing.T, backendOpts backendFixtureOptions) launchFix
 		ReleaseSecret: "release-secret-parklaunch",
 		Containment:   containment,
 		Monitor: &MonitorProcessSpec{
-			Command:           monitorCommand(t, monitorMarker),
-			DaemonControlRead: daemonRead,
+			Command: monitorCommand(t, monitorMarker),
 		},
 	}
 	return launchFixture{
@@ -311,7 +446,6 @@ func newLaunchFixture(t *testing.T, backendOpts backendFixtureOptions) launchFix
 		backend:       backend,
 		containment:   containment,
 		monitorMarker: monitorMarker,
-		daemonWrite:   daemonWrite,
 	}
 }
 
@@ -324,6 +458,10 @@ func newBackendFixture(t *testing.T, dir string, opts backendFixtureOptions) bac
 	for _, fd := range opts.ClosedFDs {
 		closed = append(closed, strconv.Itoa(fd))
 	}
+	holdMillis := "0"
+	if opts.Hold > 0 {
+		holdMillis = strconv.FormatInt(opts.Hold.Milliseconds(), 10)
+	}
 	argv := []string{
 		exe,
 		"-test.run=TestParklaunchBackendHelperProcess",
@@ -331,6 +469,7 @@ func newBackendFixture(t *testing.T, dir string, opts backendFixtureOptions) bac
 		"--marker", marker,
 		"--result", result,
 		"--closed-fds", strings.Join(closed, ","),
+		"--hold-ms", holdMillis,
 	}
 	return backendFixtureSpec{
 		ExecSpec: parkproto.ExecSpec{
@@ -355,6 +494,7 @@ func monitorCommand(t *testing.T, marker string) CommandSpec {
 			"--",
 			"--daemon-fd", strconv.Itoa(MonitorDaemonControlFD),
 			"--target-fd", strconv.Itoa(MonitorTargetFD),
+			"--ready-fd", strconv.Itoa(MonitorReadyFD),
 			"--marker", marker,
 		},
 		Env: append(os.Environ(), parklaunchHelperEnv+"="+parklaunchMonitorMode),
@@ -362,11 +502,26 @@ func monitorCommand(t *testing.T, marker string) CommandSpec {
 	}
 }
 
-func startTestMonitor(t *testing.T, ctx context.Context, daemonRead *os.File, marker string) *MonitorProcess {
+func monitorNoAckCommand(t *testing.T) CommandSpec {
+	t.Helper()
+	exe := testBinaryPath(t)
+	return CommandSpec{
+		Path: exe,
+		Args: []string{
+			exe,
+			"-test.run=TestParklaunchMonitorNoAckHelperProcess",
+			"--",
+			"--target-fd", strconv.Itoa(MonitorTargetFD),
+		},
+		Env: append(os.Environ(), parklaunchHelperEnv+"="+parklaunchMonitorNoAck),
+		Dir: filepath.Dir(exe),
+	}
+}
+
+func startTestMonitor(t *testing.T, ctx context.Context, marker string) *MonitorProcess {
 	t.Helper()
 	monitor, err := StartMonitorProcess(ctx, MonitorProcessSpec{
-		Command:           monitorCommand(t, marker),
-		DaemonControlRead: daemonRead,
+		Command: monitorCommand(t, marker),
 	})
 	if err != nil {
 		t.Fatalf("StartMonitorProcess() error = %v", err)
@@ -466,6 +621,18 @@ func (reader mismatchClassifyingReader) ClassifyProcess(procgroup.ProcessClaim) 
 	return model.ProcessIdentityReused
 }
 
+type workerOnlyIdentityReader struct {
+	identityReader
+	workerPID *int
+}
+
+func (reader workerOnlyIdentityReader) ReadProcessClaim(pid int) (procgroup.ProcessClaim, error) {
+	if reader.workerPID != nil && pid == *reader.workerPID {
+		return reader.identityReader.ReadProcessClaim(pid)
+	}
+	return procgroup.ProcessClaim{}, fmt.Errorf("synthetic monitor identity failure for pid %d", pid)
+}
+
 type markerContainment struct {
 	path string
 }
@@ -487,6 +654,7 @@ func runBackendHelper(args []string) int {
 	marker := fs.String("marker", "", "marker path")
 	result := fs.String("result", "", "result path")
 	closedFDs := fs.String("closed-fds", "", "closed fds")
+	holdMillis := fs.Int("hold-ms", 0, "hold duration in milliseconds")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -509,6 +677,9 @@ func runBackendHelper(args []string) int {
 	if err := os.WriteFile(*result, append(raw, '\n'), 0o600); err != nil {
 		return 6
 	}
+	if *holdMillis > 0 {
+		time.Sleep(time.Duration(*holdMillis) * time.Millisecond)
+	}
 	return 0
 }
 
@@ -517,16 +688,38 @@ func runMonitorHelper(args []string) int {
 	fs.SetOutput(io.Discard)
 	daemonFD := fs.Int("daemon-fd", -1, "daemon fd")
 	targetFD := fs.Int("target-fd", -1, "target fd")
+	readyFD := fs.Int("ready-fd", -1, "ready fd")
 	marker := fs.String("marker", "", "containment marker")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *daemonFD < 3 || *targetFD < 3 || *marker == "" {
+	if *daemonFD < 3 || *targetFD < 3 || *readyFD < 3 || *marker == "" {
 		return 2
 	}
-	if err := RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, markerContainment{path: *marker}); err != nil {
+	if err := RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, *readyFD, markerContainment{path: *marker}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 3
+	}
+	return 0
+}
+
+func runMonitorNoAckHelper(args []string) int {
+	fs := flag.NewFlagSet("parklaunch-monitor-no-ack", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	targetFD := fs.Int("target-fd", -1, "target fd")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *targetFD < 3 {
+		return 2
+	}
+	targetFile := os.NewFile(uintptr(*targetFD), "agentbus-parklaunch-monitor-target-no-ack")
+	if targetFile == nil {
+		return 3
+	}
+	defer targetFile.Close()
+	if _, err := io.ReadAll(targetFile); err != nil {
+		return 4
 	}
 	return 0
 }
@@ -549,6 +742,32 @@ func runFDScanHelperProcess(args []string) int {
 	}
 	if err := os.WriteFile(*result, append(raw, '\n'), 0o600); err != nil {
 		return 4
+	}
+	return 0
+}
+
+func runFDHoldHelperProcess(args []string) int {
+	fs := flag.NewFlagSet("parklaunch-fd-hold", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fdsRaw := fs.String("fds", "", "fds")
+	result := fs.String("result", "", "result")
+	holdMillis := fs.Int("hold-ms", 5000, "hold duration in milliseconds")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *result == "" {
+		return 2
+	}
+	open := openFDs(parseFDList(*fdsRaw))
+	raw, err := json.Marshal(open)
+	if err != nil {
+		return 3
+	}
+	if err := os.WriteFile(*result, append(raw, '\n'), 0o600); err != nil {
+		return 4
+	}
+	if *holdMillis > 0 {
+		time.Sleep(time.Duration(*holdMillis) * time.Millisecond)
 	}
 	return 0
 }
@@ -584,6 +803,36 @@ func runFDScanHelper(fds []int, result string) ([]int, error) {
 	return open, nil
 }
 
+func startFDHoldHelper(t *testing.T, fds []int, result string, hold time.Duration) *exec.Cmd {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := make([]string, 0, len(fds))
+	for _, fd := range fds {
+		parts = append(parts, strconv.Itoa(fd))
+	}
+	cmd := exec.Command(exe,
+		"-test.run=TestParklaunchFDHoldHelperProcess",
+		"--",
+		"--fds", strings.Join(parts, ","),
+		"--result", result,
+		"--hold-ms", strconv.FormatInt(hold.Milliseconds(), 10),
+	)
+	cmd.Env = append(os.Environ(), parklaunchHelperEnv+"="+parklaunchFDHoldMode)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fd hold helper: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
+	return cmd
+}
+
 func readBackendResult(t *testing.T, path string) backendResult {
 	t.Helper()
 	raw, err := os.ReadFile(path)
@@ -595,6 +844,56 @@ func readBackendResult(t *testing.T, path string) backendResult {
 		t.Fatal(err)
 	}
 	return result
+}
+
+func waitBackendResult(t *testing.T, path string) backendResult {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			var result backendResult
+			if err := json.Unmarshal(raw, &result); err != nil {
+				t.Fatal(err)
+			}
+			return result
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for backend result %s: %v", path, lastErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func cleanupParkedHandle(t *testing.T, handle *ParkedHandle) {
+	t.Helper()
+	if handle == nil {
+		return
+	}
+	_ = closeMonitorDaemonControl(handle.Monitor)
+	stopMonitor(t, handle.Monitor)
+	if handle.Stdin != nil {
+		_ = handle.Stdin.Close()
+	}
+	if handle.Stdout != nil {
+		_ = handle.Stdout.Close()
+	}
+	if handle.Stderr != nil {
+		_ = handle.Stderr.Close()
+	}
+	if handle.GroupRef.PGID > 0 {
+		err := unix.Kill(-handle.GroupRef.PGID, unix.SIGKILL)
+		if err != nil && !errors.Is(err, unix.ESRCH) {
+			t.Fatalf("kill backend group %d: %v", handle.GroupRef.PGID, err)
+		}
+	}
+	select {
+	case <-handle.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("backend pid %d did not exit", handle.GroupRef.Leader.PID)
+	}
 }
 
 func stopMonitor(t *testing.T, monitor *MonitorProcess) {
@@ -611,11 +910,38 @@ func stopMonitor(t *testing.T, monitor *MonitorProcess) {
 	default:
 	}
 	_ = closeMonitorTarget(monitor)
+	_ = closeMonitorReady(monitor)
+	_ = closeMonitorDaemonControl(monitor)
 	_ = monitor.cmd.Process.Kill()
 	select {
 	case <-monitor.done:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("monitor pid %d did not exit", monitor.PID)
+	}
+}
+
+func assertProcessMatches(t *testing.T, pid int, startToken string) {
+	t.Helper()
+	claim, err := procgroup.ReadProcessClaim(pid)
+	if err != nil {
+		t.Fatalf("read process %d claim: %v", pid, err)
+	}
+	if claim.StartToken.String() != startToken {
+		t.Fatalf("process %d start token = %s, want %s", pid, claim.StartToken, startToken)
+	}
+}
+
+func waitPIDAbsent(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := unix.Kill(pid, 0); errors.Is(err, unix.ESRCH) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d still exists", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -700,6 +1026,45 @@ func openFDs(fds []int) []int {
 		}
 	}
 	return open
+}
+
+func openFDSet(fds []int) map[int]struct{} {
+	out := make(map[int]struct{})
+	for _, fd := range openFDs(fds) {
+		out[fd] = struct{}{}
+	}
+	return out
+}
+
+func fdSetDifference(a, b map[int]struct{}) []int {
+	var out []int
+	for fd := range a {
+		if _, ok := b[fd]; !ok {
+			out = append(out, fd)
+		}
+	}
+	return out
+}
+
+func waitOpenFDResult(t *testing.T, path string) []int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			var open []int
+			if err := json.Unmarshal(raw, &open); err != nil {
+				t.Fatal(err)
+			}
+			return open
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for fd helper result %s: %v", path, lastErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func fdRange(first, last int) []int {
