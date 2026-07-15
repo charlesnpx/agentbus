@@ -86,13 +86,14 @@ func (observation ProcessIdentityObservation) Validate() error {
 }
 
 type GroupRecoveryObservation struct {
-	HostBootID string
-	Group      GroupExistenceObservation
-	Leader     ProcessIdentityObservation
+	KernelDomainID KernelDomainID
+	HostBootID     string
+	Group          GroupExistenceObservation
+	Leader         ProcessIdentityObservation
 }
 
 func (observation GroupRecoveryObservation) Validate() error {
-	if err := validateToken("group.host_boot_id", observation.HostBootID); err != nil {
+	if _, err := observation.kernelDomain(); err != nil {
 		return err
 	}
 	if err := observation.Group.Validate(); err != nil {
@@ -102,6 +103,20 @@ func (observation GroupRecoveryObservation) Validate() error {
 		return err
 	}
 	return nil
+}
+
+func (observation GroupRecoveryObservation) kernelDomain() (KernelDomainID, error) {
+	domain := observation.KernelDomainID
+	if domain.HostBootID == "" && observation.HostBootID != "" {
+		domain.HostBootID = observation.HostBootID
+	}
+	if observation.HostBootID != "" && domain.HostBootID != observation.HostBootID {
+		return KernelDomainID{}, invalid("group.host_boot_id", "does not match kernel domain")
+	}
+	if err := domain.Validate(); err != nil {
+		return KernelDomainID{}, err
+	}
+	return domain, nil
 }
 
 type GroupRecoveryDecision string
@@ -119,7 +134,11 @@ func DecideGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) (Gr
 	if err := observation.Validate(); err != nil {
 		return "", err
 	}
-	if observation.HostBootID != ref.HostBootID {
+	observationDomain, err := observation.kernelDomain()
+	if err != nil {
+		return "", err
+	}
+	if !observationDomain.Equal(ref.KernelDomain()) {
 		return GroupRecoveryQuiescent, nil
 	}
 	if observation.Group == GroupAbsent {

@@ -169,10 +169,12 @@ type GroupRef struct {
 	CustodyID  CustodyID
 	Launch     LaunchKey
 	HostBootID string
-	PGID       int
-	Leader     ProcessIdentity
-	Monitor    ProcessIdentity
-	RetainedID string
+	// PIDNamespaceID is empty on platforms where the kernel exposes no PID namespace identity.
+	PIDNamespaceID string `json:"PIDNamespaceID,omitempty"`
+	PGID           int
+	Leader         ProcessIdentity
+	Monitor        ProcessIdentity
+	RetainedID     string
 }
 
 func (ref GroupRef) Validate() error {
@@ -186,6 +188,9 @@ func (ref GroupRef) Validate() error {
 		return err
 	}
 	if err := validateToken("group.host_boot_id", ref.HostBootID); err != nil {
+		return err
+	}
+	if err := validateOptionalToken("group.pid_namespace_id", ref.PIDNamespaceID); err != nil {
 		return err
 	}
 	if err := validatePositiveInt("group.pgid", ref.PGID); err != nil {
@@ -208,14 +213,19 @@ func (ref GroupRef) Equal(other GroupRef) bool {
 		ref.CustodyID == other.CustodyID &&
 		ref.Launch.Equal(other.Launch) &&
 		ref.HostBootID == other.HostBootID &&
+		ref.PIDNamespaceID == other.PIDNamespaceID &&
 		ref.PGID == other.PGID &&
 		ref.Leader.Equal(other.Leader) &&
 		ref.Monitor.Equal(other.Monitor) &&
 		ref.RetainedID == other.RetainedID
 }
 
+func (ref GroupRef) KernelDomain() KernelDomainID {
+	return KernelDomainID{HostBootID: ref.HostBootID, PIDNamespaceID: ref.PIDNamespaceID}
+}
+
 func (ref GroupRef) SamePhysicalIdentity(other GroupRef) bool {
-	return ref.HostBootID == other.HostBootID &&
+	return ref.KernelDomain().Equal(other.KernelDomain()) &&
 		(ref.PGID == other.PGID || ref.Leader.Equal(other.Leader))
 }
 

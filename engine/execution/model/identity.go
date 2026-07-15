@@ -144,6 +144,30 @@ func (id BootID) Validate() error {
 	return validateToken("boot_id", string(id))
 }
 
+type KernelDomainID struct {
+	HostBootID     string
+	PIDNamespaceID string
+}
+
+func NewKernelDomainID(hostBootID, pidNamespaceID string) (KernelDomainID, error) {
+	id := KernelDomainID{HostBootID: hostBootID, PIDNamespaceID: pidNamespaceID}
+	if err := id.Validate(); err != nil {
+		return KernelDomainID{}, err
+	}
+	return id, nil
+}
+
+func (id KernelDomainID) Validate() error {
+	if err := validateToken("kernel_domain.host_boot_id", id.HostBootID); err != nil {
+		return err
+	}
+	return validateOptionalToken("kernel_domain.pid_namespace_id", id.PIDNamespaceID)
+}
+
+func (id KernelDomainID) Equal(other KernelDomainID) bool {
+	return id.HostBootID == other.HostBootID && id.PIDNamespaceID == other.PIDNamespaceID
+}
+
 type OwnerID string
 
 func NewOwnerID(value string) (OwnerID, error) {

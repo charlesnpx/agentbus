@@ -61,11 +61,19 @@ func (UnavailableCustodian) ContainAndVerify(context.Context, model.GroupRef, Qu
 	return VerifiedQuiescence{}, ErrSupervisorUnavailable
 }
 
+// Support reports separate lifecycle facts: compiled-in implementation,
+// runtime probe result, local configuration, and advertised availability are
+// distinct states and must not be collapsed into one supported flag.
 type Support struct {
-	ParkedExec          bool
-	VerifiedContainment bool
-	Platform            string
-	Reason              error
+	ParkedExec             bool
+	VerifiedContainment    bool
+	ImplementationCompiled bool
+	RuntimeProbePassed     bool
+	FeatureConfigured      bool
+	FeatureAdvertised      bool
+	RuntimeProbeResult     error
+	Platform               string
+	Reason                 error
 }
 
 type Runtime struct {
@@ -83,10 +91,15 @@ func NewUnavailableRuntime(reason error) Runtime {
 		process:  UnavailableCustodian{},
 		verifier: verifier,
 		support: Support{
-			ParkedExec:          false,
-			VerifiedContainment: false,
-			Platform:            runtime.GOOS,
-			Reason:              reason,
+			ParkedExec:             false,
+			VerifiedContainment:    false,
+			ImplementationCompiled: false,
+			RuntimeProbePassed:     false,
+			FeatureConfigured:      false,
+			FeatureAdvertised:      false,
+			RuntimeProbeResult:     reason,
+			Platform:               runtime.GOOS,
+			Reason:                 reason,
 		},
 	}
 }

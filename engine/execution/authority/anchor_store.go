@@ -19,6 +19,7 @@ const (
 	AnchorBegin     AnchorOperation = "begin"
 	AnchorSealReady AnchorOperation = "seal_ready"
 	AnchorAdvance   AnchorOperation = "advance"
+	AnchorComplete  AnchorOperation = "complete"
 	AnchorFailStop  AnchorOperation = "fail_stop"
 )
 
@@ -185,6 +186,9 @@ func (a anchorAdapter) Advance(ctx context.Context, boot model.BootRef, generati
 	}
 	a.store.state.Generation = generation
 	a.store.state.Boot = boot
+	if err := a.store.failLocked(AnchorComplete); err != nil {
+		return err
+	}
 	return nil
 }
 

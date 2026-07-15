@@ -41,6 +41,18 @@ func (mode Mode) String() string {
 	}
 }
 
+type ContainmentScope uint8
+
+const (
+	ContainTargetProcessGroup ContainmentScope = iota + 1
+	ContainDescendantTree
+)
+
+// CurrentContainmentScope states the v1 containment contract: Agentbus contains
+// the target process group. Processes that escape via setsid or a new session
+// are explicitly out of scope and require stronger platform facilities.
+const CurrentContainmentScope = ContainTargetProcessGroup
+
 type Decision uint8
 
 const (
