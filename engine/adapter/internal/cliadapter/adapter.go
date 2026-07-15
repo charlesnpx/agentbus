@@ -441,10 +441,9 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 				_ = stderrLog.Close()
 			}
 		}()
-		stderrDone := make(chan struct{})
+		stderrDone := make(chan error, 1)
 		go func() {
-			_, _ = io.Copy(stderrWriter, stderrPipe)
-			close(stderrDone)
+			stderrDone <- copyAndClose(stderrWriter, stderrPipe)
 		}()
 		go func() {
 			_, _ = io.WriteString(stdin, input.Prompt)
@@ -456,7 +455,7 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		}
 		parseErr := s.scan(stdoutReader, events)
 		_, waitErr := command.Wait(ctx)
-		<-stderrDone
+		stderrCopyErr := <-stderrDone
 		s.mu.Lock()
 		if s.active == command {
 			s.active = nil
@@ -471,10 +470,17 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		}
 		if waitErr != nil {
 			msg := strings.TrimSpace(stderr.String())
+			if msg == "" && stderrCopyErr != nil {
+				msg = stderrCopyErr.Error()
+			}
 			if msg == "" {
 				msg = waitErr.Error()
 			}
 			events <- terminalError(msg)
+			return
+		}
+		if stderrCopyErr != nil {
+			events <- terminalError(stderrCopyErr.Error())
 		}
 	}()
 	return events, nil
@@ -528,6 +534,12 @@ func (s *Session) scan(r io.Reader, out chan<- engine.Event) error {
 		}
 	}
 	return scanner.Err()
+}
+
+func copyAndClose(dst io.Writer, src io.ReadCloser) error {
+	defer func() { _ = src.Close() }()
+	_, err := io.Copy(dst, src)
+	return err
 }
 
 func capEvent(ev engine.Event) engine.Event {

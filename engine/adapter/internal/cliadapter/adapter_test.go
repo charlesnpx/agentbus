@@ -3,11 +3,14 @@ package cliadapter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -68,6 +71,17 @@ func TestSessionInterruptUsesProtocolDefaultGrace(t *testing.T) {
 	}
 }
 
+func TestDirectCommandRunnerTimeoutTerminatesOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	assertDirectCommandRunnerContextDoneTerminatesOnce(t, ctx, func() {})
+}
+
+func TestDirectCommandRunnerContextCancelTerminatesOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	assertDirectCommandRunnerContextDoneTerminatesOnce(t, ctx, cancel)
+}
+
 func TestSessionTurnSurfacesMalformedStreamAsTerminalError(t *testing.T) {
 	fake := fakeTerminalErrorCLI(t)
 	backend := &Backend{
@@ -120,6 +134,83 @@ func TestSessionTurnSurfacesNonzeroExitAsTerminalError(t *testing.T) {
 	}
 }
 
+func TestSessionTurnPreservesLargeStderrTail(t *testing.T) {
+	fake := fakeTerminalErrorCLI(t)
+	backend := &Backend{
+		NameValue: "fake",
+		Binary:    fake,
+		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
+			return []string{"large-stderr"}, nil
+		},
+		Parse: func(map[string]any) ([]engine.Event, string, error) {
+			return nil, "", nil
+		},
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	events, err := session.Turn(ctx, engine.TurnInput{Prompt: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 3*time.Second)
+	if ctx.Err() != nil {
+		t.Fatalf("turn context ended unexpectedly: %v", ctx.Err())
+	}
+	if len(got) == 0 || got[len(got)-1].Type != engine.EventTerminalError || !strings.Contains(got[len(got)-1].Text, "TAIL_MARKER") {
+		t.Fatalf("events = %#v, want terminal stderr error with tail marker", got)
+	}
+}
+
+func TestSessionTurnInheritedStderrDoesNotHang(t *testing.T) {
+	fake := fakeTerminalErrorCLI(t)
+	backend := &Backend{
+		NameValue: "fake",
+		Binary:    fake,
+		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
+			return []string{"inherited-stderr"}, nil
+		},
+		Parse: func(map[string]any) ([]engine.Event, string, error) {
+			return []engine.Event{{Type: engine.EventAgentText, Text: "ok"}}, "", nil
+		},
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	events, err := session.Turn(ctx, engine.TurnInput{Prompt: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 3*time.Second)
+	if ctx.Err() != nil {
+		t.Fatalf("turn context ended unexpectedly: %v", ctx.Err())
+	}
+	for _, ev := range got {
+		if ev.Type == engine.EventAgentText && ev.Text == "ok" {
+			return
+		}
+	}
+	t.Fatalf("events = %#v, want parsed event before inherited stderr closes", got)
+}
+
+func TestCopyAndCloseClosesSourceOnWriterFailure(t *testing.T) {
+	wantErr := errors.New("writer failed")
+	src := &recordingReadCloser{Reader: strings.NewReader("stderr")}
+	err := copyAndClose(errorWriter{err: wantErr}, src)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("copyAndClose error = %v, want %v", err, wantErr)
+	}
+	if !src.closed {
+		t.Fatal("copyAndClose did not close the source after writer failure")
+	}
+}
+
 func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 	runner := &fakeCommandRunner{}
 	backend := &Backend{
@@ -158,6 +249,39 @@ func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 	}
 }
 
+func assertDirectCommandRunnerContextDoneTerminatesOnce(t *testing.T, ctx context.Context, triggerCancel func()) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("process group signal assertions are unix-only")
+	}
+	original := terminateProcessGroup
+	var calls atomic.Int32
+	terminateProcessGroup = func(cmd *exec.Cmd, grace time.Duration) error {
+		calls.Add(1)
+		return original(cmd, grace)
+	}
+	t.Cleanup(func() { terminateProcessGroup = original })
+
+	running, err := (DirectCommandRunner{CancelGrace: 10 * time.Millisecond}).Start(ctx, custodian.ExecSpec{
+		Argv: []string{"/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = running.Stdin().Close() }()
+	defer func() { _ = running.Stdout().Close() }()
+	defer func() { _ = running.Stderr().Close() }()
+
+	triggerCancel()
+	_, err = running.Wait(context.Background())
+	if err == nil {
+		t.Fatal("Wait succeeded, want cancellation error")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("terminateProcessGroup calls = %d, want 1", got)
+	}
+}
+
 func fakeTerminalErrorCLI(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fakecli")
@@ -165,6 +289,20 @@ func fakeTerminalErrorCLI(t *testing.T) string {
 case "$1" in
   malformed) printf 'not-json\n'; exit 0 ;;
   fail) printf 'backend exploded\n' >&2; exit 7 ;;
+  large-stderr)
+    i=0
+    while [ "$i" -lt 4096 ]; do
+      printf '0123456789abcdef0123456789abcdef\n' >&2
+      i=$((i + 1))
+    done
+    printf 'TAIL_MARKER\n' >&2
+    exit 9
+    ;;
+  inherited-stderr)
+    (sleep 5 >/dev/null &)
+    printf '{"event":"ok"}\n'
+    exit 0
+    ;;
 esac
 exit 0
 `
@@ -180,6 +318,42 @@ func collectEvents(ch <-chan engine.Event) []engine.Event {
 		out = append(out, ev)
 	}
 	return out
+}
+
+func collectEventsWithTimeout(t *testing.T, ch <-chan engine.Event, timeout time.Duration) []engine.Event {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var out []engine.Event
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				return out
+			}
+			out = append(out, ev)
+		case <-timer.C:
+			t.Fatalf("timed out collecting events after %s; collected %#v", timeout, out)
+		}
+	}
+}
+
+type errorWriter struct {
+	err error
+}
+
+func (w errorWriter) Write([]byte) (int, error) {
+	return 0, w.err
+}
+
+type recordingReadCloser struct {
+	io.Reader
+	closed bool
+}
+
+func (r *recordingReadCloser) Close() error {
+	r.closed = true
+	return nil
 }
 
 type fakeCommandRunner struct {

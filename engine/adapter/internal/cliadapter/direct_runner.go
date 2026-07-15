@@ -46,33 +46,32 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec custodian.ExecSpec)
 		_ = stdin.Close()
 		return nil, err
 	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		_ = stdin.Close()
-		_ = stdout.Close()
-		return nil, err
-	}
+	stderrReader, stderrWriter := io.Pipe()
+	cmd.Stderr = stderrWriter
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
-		_ = stderr.Close()
+		_ = stderrReader.Close()
+		_ = stderrWriter.Close()
 		return nil, err
 	}
 	return &directRunningCommand{
-		cmd:         cmd,
-		stdin:       stdin,
-		stdout:      stdout,
-		stderr:      stderr,
-		cancelGrace: grace,
+		cmd:          cmd,
+		stdin:        stdin,
+		stdout:       stdout,
+		stderr:       stderrReader,
+		stderrWriter: stderrWriter,
+		cancelGrace:  grace,
 	}, nil
 }
 
 type directRunningCommand struct {
-	cmd         *exec.Cmd
-	stdin       io.WriteCloser
-	stdout      io.ReadCloser
-	stderr      io.ReadCloser
-	cancelGrace time.Duration
+	cmd          *exec.Cmd
+	stdin        io.WriteCloser
+	stdout       io.ReadCloser
+	stderr       io.ReadCloser
+	stderrWriter *io.PipeWriter
+	cancelGrace  time.Duration
 }
 
 func (r *directRunningCommand) Stdin() io.WriteCloser {
@@ -87,19 +86,12 @@ func (r *directRunningCommand) Stderr() io.ReadCloser {
 	return r.stderr
 }
 
-func (r *directRunningCommand) Wait(ctx context.Context) (custodian.ExitObservation, error) {
-	done := make(chan error, 1)
-	go func() {
-		done <- r.cmd.Wait()
-	}()
-	select {
-	case err := <-done:
-		return exitObservationForCmd(r.cmd), err
-	case <-ctx.Done():
-		_ = r.Interrupt(context.Background())
-		err := <-done
-		return exitObservationForCmd(r.cmd), err
+func (r *directRunningCommand) Wait(context.Context) (custodian.ExitObservation, error) {
+	err := r.cmd.Wait()
+	if r.stderrWriter != nil {
+		_ = r.stderrWriter.Close()
 	}
+	return exitObservationForCmd(r.cmd), err
 }
 
 func (r *directRunningCommand) Interrupt(ctx context.Context) error {
