@@ -37,11 +37,11 @@ func TestContainmentTermSufficesWithinGrace(t *testing.T) {
 	assertSignals(t, signaler, SignalTerminate)
 }
 
-func TestContainmentTermIgnoredThenKillPollsAbsent(t *testing.T) {
+func TestContainmentMatchingLeaderAfterGraceAuthorizesKillWithoutWitness(t *testing.T) {
 	target := testGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
-		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
 		testObservation(target, model.GroupAbsent, model.ProcessIdentityMissing),
 	}}
 	signaler := &fakeSignaler{script: []signalScript{
@@ -71,8 +71,9 @@ func TestContainmentNeverAbsentWithinBoundIsUnprovable(t *testing.T) {
 		},
 		probes: []ProbeResult{ProbeLive, ProbeLive, ProbeLive},
 	}
+	witness := &fakeContinuityWitness{confirmed: true}
 
-	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
+	outcome := testEngineWithContinuity(observer, signaler, witness).Contain(context.Background(), target, testParams())
 
 	assertUnprovable(t, outcome, ReasonAbsenceDeadlineExceeded)
 	assertSignals(t, signaler, SignalTerminate, SignalKill)
@@ -164,7 +165,23 @@ func TestContainmentReusedLeaderAfterTermRevokesAuthorityWithoutKill(t *testing.
 	assertSignals(t, signaler, SignalTerminate)
 }
 
-func TestContainmentEngineMintedContinuousLiveGroupEscalatesAfterLeaderExit(t *testing.T) {
+func TestContainmentLeaderMissingAfterGraceWithoutContinuityIsUnprovable(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+	}}
+
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	assertSignals(t, signaler, SignalTerminate)
+}
+
+func TestContainmentContinuityWitnessAuthorizesKillAfterLeaderExit(t *testing.T) {
 	target := testGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
@@ -175,15 +192,39 @@ func TestContainmentEngineMintedContinuousLiveGroupEscalatesAfterLeaderExit(t *t
 		{signal: SignalTerminate, result: SignalDelivered},
 		{signal: SignalKill, result: SignalDelivered},
 	}}
+	witness := &fakeContinuityWitness{confirmed: true}
 
-	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
+	outcome := testEngineWithContinuity(observer, signaler, witness).Contain(context.Background(), target, testParams())
 
 	assertAbsent(t, outcome)
 	assertSignals(t, signaler, SignalTerminate, SignalKill)
+	if witness.confirms == 0 {
+		t.Fatalf("continuity witness was not consulted")
+	}
+}
+
+func TestContainmentReusedPGIDLeaderMissingWithoutContinuityDoesNotKill(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+	}}
+
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	assertSignals(t, signaler, SignalTerminate)
 }
 
 func testEngine(observer *fakeObserver, signaler *fakeSignaler) Engine {
-	return Engine{Observer: observer, Signaler: signaler, Clock: newFakeClock()}
+	return testEngineWithContinuity(observer, signaler, nil)
+}
+
+func testEngineWithContinuity(observer *fakeObserver, signaler *fakeSignaler, witness ContinuityWitness) Engine {
+	return Engine{Observer: observer, Signaler: signaler, Clock: newFakeClock(), Continuity: witness}
 }
 
 func testParams() Params {

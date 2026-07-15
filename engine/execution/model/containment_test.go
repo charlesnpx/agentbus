@@ -2,7 +2,7 @@ package model
 
 import "testing"
 
-func TestContainmentSessionAuthorizesKillAfterLeaderExitWithLiveGrandchild(t *testing.T) {
+func TestContainmentCallerSuppliedContinuityAuthorizesKillAfterLeaderExitWithLiveGrandchild(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
 	decision, err := DecideContainmentAuthorization(ContainmentAuthorization{
 		Group: ref,
@@ -99,6 +99,36 @@ func TestContainmentAlreadyAbsentAfterIndependentObservation(t *testing.T) {
 	}
 	if decision != AlreadyAbsent {
 		t.Fatalf("decision = %s, want %s", decision, AlreadyAbsent)
+	}
+}
+
+func TestContainmentIncoherentAbsentLiveLeaderIsUnprovable(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	tests := []struct {
+		name   string
+		leader ProcessIdentityObservation
+	}{
+		{name: "matching", leader: ProcessIdentityMatching},
+		{name: "reused", leader: ProcessIdentityReused},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision, err := DecideContainmentAuthorization(ContainmentAuthorization{
+				Group: ref,
+				Observation: ContainmentObservation{
+					KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+					Group:          GroupAbsent,
+					Leader:         tt.leader,
+				},
+			})
+			if err != nil {
+				t.Fatalf("DecideContainmentAuthorization error = %v", err)
+			}
+			if decision != Unprovable {
+				t.Fatalf("decision = %s, want %s", decision, Unprovable)
+			}
+		})
 	}
 }
 

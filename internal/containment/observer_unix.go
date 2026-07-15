@@ -12,6 +12,11 @@ import (
 
 type RealObserver struct{}
 
+type groupLeaderObservation struct {
+	Group  model.GroupExistenceObservation
+	Leader model.ProcessIdentityObservation
+}
+
 func (RealObserver) ObserveGroup(ctx context.Context, target model.GroupRef) (model.ContainmentObservation, error) {
 	if err := ctx.Err(); err != nil {
 		return model.ContainmentObservation{}, err
@@ -36,12 +41,48 @@ func (RealObserver) ObserveGroup(ctx context.Context, target model.GroupRef) (mo
 	if err != nil {
 		return model.ContainmentObservation{}, err
 	}
+	groupLeader := stableGroupLeaderObservation(func() groupLeaderObservation {
+		return groupLeaderObservation{
+			Group:  procgroup.ClassifyGroup(groupClaim),
+			Leader: procgroup.ClassifyProcess(leaderClaim),
+		}
+	})
 	return model.ContainmentObservation{
 		KernelDomainID: currentDomain,
-		Group:          procgroup.ClassifyGroup(groupClaim),
-		Leader:         procgroup.ClassifyProcess(leaderClaim),
+		Group:          groupLeader.Group,
+		Leader:         groupLeader.Leader,
 		Monitor:        observeMonitor(target, currentDomain),
 	}, nil
+}
+
+func stableGroupLeaderObservation(read func() groupLeaderObservation) groupLeaderObservation {
+	first := read()
+	if groupLeaderIncoherent(first) {
+		return unknownGroupLeaderObservation()
+	}
+	if first.Group != model.GroupAbsent {
+		return first
+	}
+	second := read()
+	if groupLeaderIncoherent(second) || first != second {
+		return unknownGroupLeaderObservation()
+	}
+	if first.Leader != model.ProcessIdentityMissing {
+		return unknownGroupLeaderObservation()
+	}
+	return first
+}
+
+func groupLeaderIncoherent(observation groupLeaderObservation) bool {
+	return observation.Group == model.GroupAbsent &&
+		(observation.Leader == model.ProcessIdentityMatching || observation.Leader == model.ProcessIdentityReused)
+}
+
+func unknownGroupLeaderObservation() groupLeaderObservation {
+	return groupLeaderObservation{
+		Group:  model.GroupExistenceUnknown,
+		Leader: model.ProcessIdentityUnknown,
+	}
 }
 
 func observeMonitor(target model.GroupRef, currentDomain model.KernelDomainID) model.ContainmentMonitorObservation {

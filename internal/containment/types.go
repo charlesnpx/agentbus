@@ -15,6 +15,20 @@ type Observer interface {
 	ObserveGroup(ctx context.Context, target model.GroupRef) (model.ContainmentObservation, error)
 }
 
+// ContinuityWitness can bind a live matching-leader observation to a capability
+// that later attests the exact group never became absent. A nil witness means
+// the engine has no continuity capability and must fail closed on leader-missing
+// escalation.
+type ContinuityWitness interface {
+	BeginGroupContinuity(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation) GroupContinuity
+}
+
+// GroupContinuity confirms uninterrupted liveness of the exact target group
+// since the matching-leader observation that created it.
+type GroupContinuity interface {
+	ConfirmContinuouslyLive(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation) bool
+}
+
 // Signaler sends signals only to the exact target process group and can probe
 // group existence. Ambiguous syscall results must be reported as unprovable.
 type Signaler interface {

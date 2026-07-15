@@ -10,6 +10,8 @@ const (
 )
 
 type ContainmentSession struct {
+	// ContinuouslyObservedLive is a caller-supplied capability result. The model
+	// consumes it but does not infer continuity from discrete observations.
 	BeganFromMatchingLeader  bool
 	ContinuouslyObservedLive bool
 }
@@ -87,6 +89,9 @@ func DecideContainmentAuthorization(input ContainmentAuthorization) (Containment
 	if err := input.Observation.Validate(); err != nil {
 		return "", err
 	}
+	if !input.Observation.coherent() {
+		return Unprovable, nil
+	}
 	relation, err := compareKernelDomain(input.Group.KernelDomain(), input.Observation.KernelDomainID)
 	if err != nil {
 		return "", err
@@ -126,4 +131,40 @@ func decideLiveContainment(input ContainmentAuthorization) (ContainmentDecision,
 		return WaitBoundedForTrustedMonitor, nil
 	}
 	return Unprovable, nil
+}
+
+func (observation ContainmentObservation) coherent() bool {
+	if observation.Group == GroupAbsent && observation.leaderObservedLive() {
+		return false
+	}
+	return observation.Monitor.coherent()
+}
+
+func (observation ContainmentObservation) leaderObservedLive() bool {
+	switch observation.Leader {
+	case ProcessIdentityMatching, ProcessIdentityReused:
+		return true
+	default:
+		return false
+	}
+}
+
+func (observation ContainmentMonitorObservation) coherent() bool {
+	if !observation.Observed {
+		return !observation.Alive && observation.Identity == "" && !observation.BoundToExactGroup
+	}
+	switch observation.Identity {
+	case ProcessIdentityMatching, ProcessIdentityReused:
+		if !observation.Alive {
+			return false
+		}
+	case ProcessIdentityMissing:
+		if observation.Alive {
+			return false
+		}
+	}
+	if observation.BoundToExactGroup && (!observation.Alive || observation.Identity != ProcessIdentityMatching) {
+		return false
+	}
+	return true
 }

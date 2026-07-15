@@ -26,6 +26,22 @@ func (observer *fakeObserver) ObserveGroup(_ context.Context, _ model.GroupRef) 
 	return observer.observations[index], nil
 }
 
+type fakeContinuityWitness struct {
+	confirmed bool
+	starts    int
+	confirms  int
+}
+
+func (witness *fakeContinuityWitness) BeginGroupContinuity(_ context.Context, _ model.GroupRef, _ model.ContainmentObservation) GroupContinuity {
+	witness.starts++
+	return witness
+}
+
+func (witness *fakeContinuityWitness) ConfirmContinuouslyLive(_ context.Context, _ model.GroupRef, _ model.ContainmentObservation) bool {
+	witness.confirms++
+	return witness.confirmed
+}
+
 type signalScript struct {
 	signal Signal
 	result SignalResult
