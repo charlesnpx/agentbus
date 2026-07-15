@@ -166,6 +166,90 @@ func TestCodecRejectsStrictJSONViolations(t *testing.T) {
 	}
 }
 
+func TestCodecRejectsCaseFoldedDuplicateJSONKeys(t *testing.T) {
+	goodFrame := mustFrame(t, Version, 1, ReleaseAck{AcceptedSequence: 1})
+	t.Run("legitimate single-cased frame decodes", func(t *testing.T) {
+		received, err := NewReader(bytes.NewReader(goodFrame)).Read()
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if received.Sequence != 1 {
+			t.Fatalf("sequence=%d, want 1", received.Sequence)
+		}
+		if got, ok := received.Message.(ReleaseAck); !ok || got.AcceptedSequence != 1 {
+			t.Fatalf("message=%#v, want ReleaseAck acceptedSequence=1", received.Message)
+		}
+	})
+
+	releasePayload := mustReleasePayload(t)
+	mixedCaseReleaseSecretPayload := bytes.Replace(
+		releasePayload,
+		[]byte(`"releaseSecret":"release-secret-1"`),
+		[]byte(`"releaseSecret":"release-secret-1","ReleaseSecret":"release-secret-2"`),
+		1,
+	)
+	if bytes.Equal(mixedCaseReleaseSecretPayload, releasePayload) {
+		t.Fatal("test release payload did not contain releaseSecret")
+	}
+
+	for _, tt := range []struct {
+		name string
+		raw  []byte
+	}{
+		{
+			name: "mixed-case duplicate sequence",
+			raw: rawPayload([]byte(fmt.Sprintf(
+				`{"version":%d,"sequence":999,"Sequence":1,"type":"ReleaseAck","payload":{"acceptedSequence":1}}`,
+				Version,
+			))),
+		},
+		{
+			name: "mixed-case duplicate type",
+			raw: rawPayload([]byte(fmt.Sprintf(
+				`{"version":%d,"sequence":1,"type":"IdentityReport","Type":"ReleaseAck","payload":{"acceptedSequence":1}}`,
+				Version,
+			))),
+		},
+		{
+			name: "nested mixed-case duplicate release secret",
+			raw: rawPayload([]byte(fmt.Sprintf(
+				`{"version":%d,"sequence":1,"type":"Release","payload":%s}`,
+				Version,
+				mixedCaseReleaseSecretPayload,
+			))),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var stream bytes.Buffer
+			stream.Write(tt.raw)
+			stream.Write(goodFrame)
+
+			reader := NewReader(&stream)
+			received, err := reader.Read()
+			if !errors.Is(err, ErrMalformed) {
+				t.Fatalf("Read() error=%v, want %v", err, ErrMalformed)
+			}
+			if received.Sequence != 0 || received.Message != nil {
+				t.Fatalf("Read() received=%#v, want zero value on rejection", received)
+			}
+			if reader.lastSeq != 0 {
+				t.Fatalf("lastSeq=%d, want 0 after rejection", reader.lastSeq)
+			}
+
+			received, err = reader.Read()
+			if err != nil {
+				t.Fatalf("Read() after rejection error = %v", err)
+			}
+			if received.Sequence != 1 {
+				t.Fatalf("sequence after rejection=%d, want 1", received.Sequence)
+			}
+			if _, ok := received.Message.(ReleaseAck); !ok {
+				t.Fatalf("message after rejection=%T, want ReleaseAck", received.Message)
+			}
+		})
+	}
+}
+
 func TestReadRawFrameRejectsOversizedDeclaredLengthBeforeBodyRead(t *testing.T) {
 	reader := newDeclaredLengthOnlyReader(uint32(MaxFrameSize + 32*1024*1024))
 	_, err := readRawFrame(reader, MaxFrameSize)

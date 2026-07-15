@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 )
@@ -241,6 +243,7 @@ func scanJSONValue(decoder *json.Decoder) error {
 	switch delim {
 	case '{':
 		seen := make(map[string]struct{})
+		seenFolded := make(map[string]string)
 		for decoder.More() {
 			keyToken, err := decoder.Token()
 			if err != nil {
@@ -254,6 +257,11 @@ func scanJSONValue(decoder *json.Decoder) error {
 				return fmt.Errorf("duplicate JSON key %q", key)
 			}
 			seen[key] = struct{}{}
+			foldedKey := foldedJSONKey(key)
+			if previous, exists := seenFolded[foldedKey]; exists {
+				return fmt.Errorf("duplicate JSON key %q conflicts with %q by case-insensitive match", key, previous)
+			}
+			seenFolded[foldedKey] = key
 			if err := scanJSONValue(decoder); err != nil {
 				return err
 			}
@@ -268,6 +276,34 @@ func scanJSONValue(decoder *json.Decoder) error {
 		return consumeJSONEnd(decoder, ']')
 	default:
 		return fmt.Errorf("unexpected JSON delimiter %q", delim)
+	}
+}
+
+func foldedJSONKey(key string) string {
+	folded := make([]byte, 0, len(key))
+	for i := 0; i < len(key); {
+		if c := key[i]; c < utf8.RuneSelf {
+			if 'a' <= c && c <= 'z' {
+				c -= 'a' - 'A'
+			}
+			folded = append(folded, c)
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(key[i:])
+		folded = utf8.AppendRune(folded, foldJSONRune(r))
+		i += size
+	}
+	return string(folded)
+}
+
+func foldJSONRune(r rune) rune {
+	for {
+		next := unicode.SimpleFold(r)
+		if next <= r {
+			return next
+		}
+		r = next
 	}
 }
 
