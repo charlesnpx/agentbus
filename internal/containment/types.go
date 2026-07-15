@@ -141,6 +141,11 @@ type Params struct {
 	TrustedMonitorPollInterval time.Duration
 }
 
+func (params Params) Validate() error {
+	_, err := params.normalized()
+	return err
+}
+
 func (params Params) normalized() (Params, error) {
 	if params.GracePeriod < 0 {
 		return Params{}, fmt.Errorf("grace period must be non-negative")

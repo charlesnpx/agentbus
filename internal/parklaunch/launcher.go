@@ -75,6 +75,12 @@ type Spec struct {
 	Containment   Containment
 	Monitor       *MonitorProcessSpec
 
+	// RetainLeaderUnreaped leaves the target group leader as an unreaped child
+	// until ParkedHandle.Wait or ParkedHandle.WaitState is called. Native
+	// custody uses this to keep the group identity unrecyclable through
+	// containment and independent absence verification.
+	RetainLeaderUnreaped bool
+
 	WorkerEnv []string
 	WorkerDir string
 
@@ -145,6 +151,20 @@ func (handle *ParkedHandle) Wait() error {
 		return nil
 	}
 	return handle.wait.Wait()
+}
+
+func (handle *ParkedHandle) WaitState() (*os.ProcessState, error) {
+	if handle == nil || handle.wait == nil {
+		return nil, nil
+	}
+	return handle.wait.WaitState()
+}
+
+func (handle *ParkedHandle) LeaderReaped() bool {
+	if handle == nil || handle.wait == nil {
+		return true
+	}
+	return handle.wait.DoneClosed()
 }
 
 // Release is intentionally one-use. Launch already sent the release; calling
@@ -264,7 +284,12 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 
 	workerProcess := cmd.Process
 	workerPID := workerProcess.Pid
-	wait := startProcessWait(cmd)
+	var wait *processWait
+	if spec.RetainLeaderUnreaped {
+		wait = startHeldProcessWait(cmd)
+	} else {
+		wait = startProcessWait(cmd)
+	}
 
 	started := true
 	released := false
@@ -273,6 +298,7 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 		return failClosedArmed(spec.Containment, spec.identity, monitor, group, cause)
 	}
 	preIdentityAbort := func(cause error) error {
+		wait.Start()
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
 		if err := terminateStartedProcess(cleanupCtx, workerProcess, wait.Done()); err != nil {
@@ -280,6 +306,11 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 		}
 		return cause
 	}
+	defer func() {
+		if started && !launchSucceeded {
+			wait.Start()
+		}
+	}()
 	defer func() {
 		if started && !released {
 			_ = pipes.closeControl()

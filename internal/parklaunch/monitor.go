@@ -471,23 +471,51 @@ func waitMonitorOrKill(process *MonitorProcess) error {
 }
 
 type processWait struct {
-	done chan struct{}
-	mu   sync.Mutex
-	err  error
+	done  chan struct{}
+	once  sync.Once
+	cmd   *exec.Cmd
+	mu    sync.Mutex
+	err   error
+	state *os.ProcessState
 }
 
 func startProcessWait(cmd *exec.Cmd) *processWait {
-	wait := &processWait{
+	wait := startHeldProcessWait(cmd)
+	wait.Start()
+	return wait
+}
+
+func startHeldProcessWait(cmd *exec.Cmd) *processWait {
+	return &processWait{
 		done: make(chan struct{}),
+		cmd:  cmd,
 	}
-	go func() {
-		err := cmd.Wait()
+}
+
+func (wait *processWait) Start() {
+	if wait == nil {
+		return
+	}
+	go wait.waitOnce()
+}
+
+func (wait *processWait) waitOnce() {
+	if wait == nil {
+		return
+	}
+	wait.once.Do(func() {
+		var err error
+		if wait.cmd != nil {
+			err = wait.cmd.Wait()
+		}
 		wait.mu.Lock()
 		wait.err = err
+		if wait.cmd != nil {
+			wait.state = wait.cmd.ProcessState
+		}
 		wait.mu.Unlock()
 		close(wait.done)
-	}()
-	return wait
+	})
 }
 
 func (wait *processWait) Done() <-chan struct{} {
@@ -501,8 +529,18 @@ func (wait *processWait) Wait() error {
 	if wait == nil {
 		return nil
 	}
-	<-wait.done
+	wait.waitOnce()
 	return wait.errLocked()
+}
+
+func (wait *processWait) WaitState() (*os.ProcessState, error) {
+	if wait == nil {
+		return nil, nil
+	}
+	wait.waitOnce()
+	wait.mu.Lock()
+	defer wait.mu.Unlock()
+	return wait.state, wait.err
 }
 
 func (wait *processWait) Err() error {
@@ -511,6 +549,18 @@ func (wait *processWait) Err() error {
 	}
 	<-wait.done
 	return wait.errLocked()
+}
+
+func (wait *processWait) DoneClosed() bool {
+	if wait == nil {
+		return true
+	}
+	select {
+	case <-wait.done:
+		return true
+	default:
+		return false
+	}
 }
 
 func (wait *processWait) errLocked() error {
