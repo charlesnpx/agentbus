@@ -215,14 +215,15 @@ func validSafetyRecord() SafetyRecord {
 	boot := BootRef{BootID: "boot-1", OwnerID: "owner-1"}
 	attempt := AttemptRef{JobID: "job-0001", AttemptID: "attempt-1", Epoch: 1}
 	group := GroupRef{
-		Version:    1,
-		CustodyID:  "custody-1",
-		Launch:     LaunchKey{Attempt: attempt, Ordinal: LaunchOrdinalOne},
-		HostBootID: "host-boot-1",
-		PGID:       10,
-		Leader:     ProcessIdentity{PID: 10, HighResStartToken: "leader-start-10"},
-		Monitor:    ProcessIdentity{PID: 12, HighResStartToken: "monitor-start-10"},
-		RetainedID: "retained-1",
+		Version:           1,
+		CustodyID:         "custody-1",
+		Launch:            LaunchKey{Attempt: attempt, Ordinal: LaunchOrdinalOne},
+		HostBootID:        "host-boot-1",
+		PIDNamespaceState: PIDNamespaceNotApplicable,
+		PGID:              10,
+		Leader:            ProcessIdentity{PID: 10, HighResStartToken: "leader-start-10"},
+		Monitor:           ProcessIdentity{PID: 12, HighResStartToken: "monitor-start-10"},
+		RetainedID:        "retained-1",
 	}
 	grant := LaunchGrant{
 		Attempt:   attempt,

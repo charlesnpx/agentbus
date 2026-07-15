@@ -138,8 +138,15 @@ func DecideGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) (Gr
 	if err != nil {
 		return "", err
 	}
-	if !observationDomain.Equal(ref.KernelDomain()) {
+	relation, err := compareKernelDomain(ref.KernelDomain(), observationDomain)
+	if err != nil {
+		return "", err
+	}
+	if relation == kernelDomainDifferent {
 		return GroupRecoveryQuiescent, nil
+	}
+	if relation == kernelDomainUnprovable {
+		return GroupRecoveryUnprovable, nil
 	}
 	if observation.Group == GroupAbsent {
 		return GroupRecoveryQuiescent, nil

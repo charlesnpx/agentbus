@@ -680,11 +680,12 @@ func reducerGroup(ordinal LaunchOrdinal) GroupRef {
 			Attempt: reducerRef(),
 			Ordinal: ordinal,
 		},
-		HostBootID: "host-boot-reducer",
-		PGID:       pgid,
-		Leader:     ProcessIdentity{PID: pgid, HighResStartToken: "leader-start-" + ordinal.String()},
-		Monitor:    ProcessIdentity{PID: 30 + int(ordinal), HighResStartToken: "monitor-start-" + ordinal.String()},
-		RetainedID: "retained-" + ordinal.String(),
+		HostBootID:        "host-boot-reducer",
+		PIDNamespaceState: PIDNamespaceNotApplicable,
+		PGID:              pgid,
+		Leader:            ProcessIdentity{PID: pgid, HighResStartToken: "leader-start-" + ordinal.String()},
+		Monitor:           ProcessIdentity{PID: 30 + int(ordinal), HighResStartToken: "monitor-start-" + ordinal.String()},
+		RetainedID:        "retained-" + ordinal.String(),
 	}
 }
 

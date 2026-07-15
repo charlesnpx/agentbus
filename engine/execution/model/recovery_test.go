@@ -31,9 +31,9 @@ func TestDecideGroupRecoveryMatrix(t *testing.T) {
 		for _, group := range groups {
 			for _, leader := range identities {
 				observation := GroupRecoveryObservation{
-					HostBootID: boot.id,
-					Group:      group,
-					Leader:     leader,
+					KernelDomainID: noPIDNamespaceDomain(boot.id),
+					Group:          group,
+					Leader:         leader,
 				}
 				want := expectedGroupRecovery(ref, observation)
 				count++
@@ -65,9 +65,9 @@ func TestDecideGroupRecoveryMonitorStateIsNotCorrectnessInput(t *testing.T) {
 	for _, priorMonitor := range priorMonitorStates {
 		t.Run("prior_monitor_"+string(priorMonitor), func(t *testing.T) {
 			observation := GroupRecoveryObservation{
-				HostBootID: ref.HostBootID,
-				Group:      GroupLive,
-				Leader:     ProcessIdentityMatching,
+				KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+				Group:          GroupLive,
+				Leader:         ProcessIdentityMatching,
 			}
 			got, err := DecideGroupRecovery(ref, observation)
 			if err != nil {
@@ -89,49 +89,49 @@ func TestDecideGroupRecoveryFailClosedOnSameBoot(t *testing.T) {
 		{
 			name: "unknown_group",
 			observation: GroupRecoveryObservation{
-				HostBootID: ref.HostBootID,
-				Group:      GroupExistenceUnknown,
-				Leader:     ProcessIdentityMatching,
+				KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+				Group:          GroupExistenceUnknown,
+				Leader:         ProcessIdentityMatching,
 			},
 		},
 		{
 			name: "contradictory_group",
 			observation: GroupRecoveryObservation{
-				HostBootID: ref.HostBootID,
-				Group:      GroupExistenceContradictory,
-				Leader:     ProcessIdentityMatching,
+				KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+				Group:          GroupExistenceContradictory,
+				Leader:         ProcessIdentityMatching,
 			},
 		},
 		{
 			name: "permission_denied_group",
 			observation: GroupRecoveryObservation{
-				HostBootID: ref.HostBootID,
-				Group:      GroupExistencePermissionDenied,
-				Leader:     ProcessIdentityMatching,
+				KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+				Group:          GroupExistencePermissionDenied,
+				Leader:         ProcessIdentityMatching,
 			},
 		},
 		{
 			name: "unsupported_group",
 			observation: GroupRecoveryObservation{
-				HostBootID: ref.HostBootID,
-				Group:      GroupExistenceUnsupported,
-				Leader:     ProcessIdentityMatching,
+				KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+				Group:          GroupExistenceUnsupported,
+				Leader:         ProcessIdentityMatching,
 			},
 		},
 		{
 			name: "leader_missing_on_live_group",
 			observation: GroupRecoveryObservation{
-				HostBootID: ref.HostBootID,
-				Group:      GroupLive,
-				Leader:     ProcessIdentityMissing,
+				KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+				Group:          GroupLive,
+				Leader:         ProcessIdentityMissing,
 			},
 		},
 		{
 			name: "leader_reused_on_live_group",
 			observation: GroupRecoveryObservation{
-				HostBootID: ref.HostBootID,
-				Group:      GroupLive,
-				Leader:     ProcessIdentityReused,
+				KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+				Group:          GroupLive,
+				Leader:         ProcessIdentityReused,
 			},
 		},
 	}
@@ -150,8 +150,19 @@ func TestDecideGroupRecoveryFailClosedOnSameBoot(t *testing.T) {
 }
 
 func expectedGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) GroupRecoveryDecision {
-	if observation.HostBootID != ref.HostBootID {
+	observationDomain, err := observation.kernelDomain()
+	if err != nil {
+		return GroupRecoveryUnprovable
+	}
+	relation, err := compareKernelDomain(ref.KernelDomain(), observationDomain)
+	if err != nil {
+		return GroupRecoveryUnprovable
+	}
+	if relation == kernelDomainDifferent {
 		return GroupRecoveryQuiescent
+	}
+	if relation == kernelDomainUnprovable {
+		return GroupRecoveryUnprovable
 	}
 	if observation.Group == GroupAbsent {
 		return GroupRecoveryQuiescent
@@ -160,4 +171,8 @@ func expectedGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) G
 		return GroupRecoverySignal
 	}
 	return GroupRecoveryUnprovable
+}
+
+func noPIDNamespaceDomain(hostBootID string) KernelDomainID {
+	return KernelDomainID{HostBootID: hostBootID, PIDNamespaceState: PIDNamespaceNotApplicable}
 }

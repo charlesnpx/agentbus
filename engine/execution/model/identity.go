@@ -144,9 +144,27 @@ func (id BootID) Validate() error {
 	return validateToken("boot_id", string(id))
 }
 
+type PIDNamespaceState uint8
+
+const (
+	PIDNamespaceUnknown PIDNamespaceState = iota
+	PIDNamespaceKnown
+	PIDNamespaceNotApplicable
+)
+
+func (state PIDNamespaceState) Validate() error {
+	switch state {
+	case PIDNamespaceUnknown, PIDNamespaceKnown, PIDNamespaceNotApplicable:
+		return nil
+	default:
+		return invalid("pid_namespace.state", "is unknown")
+	}
+}
+
 type KernelDomainID struct {
-	HostBootID     string
-	PIDNamespaceID string
+	HostBootID        string
+	PIDNamespaceID    string
+	PIDNamespaceState PIDNamespaceState
 }
 
 func NewKernelDomainID(hostBootID, pidNamespaceID string) (KernelDomainID, error) {
@@ -157,15 +175,90 @@ func NewKernelDomainID(hostBootID, pidNamespaceID string) (KernelDomainID, error
 	return id, nil
 }
 
+func NewKernelDomainIDWithoutPIDNamespace(hostBootID string) (KernelDomainID, error) {
+	id := KernelDomainID{HostBootID: hostBootID, PIDNamespaceState: PIDNamespaceNotApplicable}
+	if err := id.Validate(); err != nil {
+		return KernelDomainID{}, err
+	}
+	return id, nil
+}
+
 func (id KernelDomainID) Validate() error {
 	if err := validateToken("kernel_domain.host_boot_id", id.HostBootID); err != nil {
 		return err
 	}
-	return validateOptionalToken("kernel_domain.pid_namespace_id", id.PIDNamespaceID)
+	return validatePIDNamespace("kernel_domain.pid_namespace", id.PIDNamespaceID, id.PIDNamespaceState)
 }
 
 func (id KernelDomainID) Equal(other KernelDomainID) bool {
-	return id.HostBootID == other.HostBootID && id.PIDNamespaceID == other.PIDNamespaceID
+	relation, err := compareKernelDomain(id, other)
+	return err == nil && relation == kernelDomainSame
+}
+
+type normalizedPIDNamespace struct {
+	state PIDNamespaceState
+	id    string
+}
+
+type kernelDomainRelation uint8
+
+const (
+	kernelDomainSame kernelDomainRelation = iota + 1
+	kernelDomainDifferent
+	kernelDomainUnprovable
+)
+
+func compareKernelDomain(left, right KernelDomainID) (kernelDomainRelation, error) {
+	if err := left.Validate(); err != nil {
+		return 0, err
+	}
+	if err := right.Validate(); err != nil {
+		return 0, err
+	}
+	if left.HostBootID != right.HostBootID {
+		return kernelDomainDifferent, nil
+	}
+	leftNamespace := normalizePIDNamespace(left.PIDNamespaceID, left.PIDNamespaceState)
+	rightNamespace := normalizePIDNamespace(right.PIDNamespaceID, right.PIDNamespaceState)
+	if leftNamespace.state == PIDNamespaceKnown && rightNamespace.state == PIDNamespaceKnown {
+		if leftNamespace.id == rightNamespace.id {
+			return kernelDomainSame, nil
+		}
+		return kernelDomainDifferent, nil
+	}
+	if leftNamespace.state == PIDNamespaceNotApplicable && rightNamespace.state == PIDNamespaceNotApplicable {
+		return kernelDomainSame, nil
+	}
+	return kernelDomainUnprovable, nil
+}
+
+func validatePIDNamespace(field string, id string, state PIDNamespaceState) error {
+	if err := validateOptionalToken(field+"_id", id); err != nil {
+		return err
+	}
+	if err := state.Validate(); err != nil {
+		return err
+	}
+	if id != "" {
+		if state == PIDNamespaceNotApplicable {
+			return invalid(field, "cannot carry an id when not applicable")
+		}
+		return nil
+	}
+	if state == PIDNamespaceKnown {
+		return invalid(field, "known namespace requires an id")
+	}
+	return nil
+}
+
+func normalizePIDNamespace(id string, state PIDNamespaceState) normalizedPIDNamespace {
+	if id != "" {
+		return normalizedPIDNamespace{state: PIDNamespaceKnown, id: id}
+	}
+	if state == PIDNamespaceNotApplicable {
+		return normalizedPIDNamespace{state: PIDNamespaceNotApplicable}
+	}
+	return normalizedPIDNamespace{state: PIDNamespaceUnknown}
 }
 
 type OwnerID string

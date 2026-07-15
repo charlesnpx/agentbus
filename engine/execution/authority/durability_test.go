@@ -5,92 +5,79 @@ import (
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/engine/execution/repository"
+	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
 )
 
 func TestClassifyDurableMutationOutcomeAndGrantSafety(t *testing.T) {
-	ctx := context.Background()
-	boot := model.BootRef{BootID: model.BootID("boot-1"), OwnerID: model.OwnerID("owner-1")}
-
 	tests := []struct {
-		name       string
-		run        func(t *testing.T) (dbCommitted bool, anchorAdvanced bool)
-		want       DurabilityOutcome
-		wantAction GrantDurabilityAction
+		name           string
+		dbCommit       DBCommitOutcome
+		anchorAdvanced bool
+		want           DurabilityOutcome
+		wantAction     GrantDurabilityAction
 	}{
 		{
-			name: "db commit failed before commit",
-			run: func(t *testing.T) (bool, bool) {
-				return false, false
-			},
-			want:       DefinitelyNotCommitted,
-			wantAction: Proceed,
+			name:           "db definitely not committed",
+			dbCommit:       DBDefinitelyNotCommitted,
+			anchorAdvanced: false,
+			want:           DefinitelyNotCommitted,
+			wantAction:     Proceed,
 		},
 		{
-			name: "db committed then stopped before anchor begin",
-			run: func(t *testing.T) (bool, bool) {
-				return true, false
-			},
-			want:       CommitOutcomeUnknown,
-			wantAction: ContainFailStop,
+			name:           "db committed but anchor not advanced",
+			dbCommit:       DBCommitted,
+			anchorAdvanced: false,
+			want:           CommitOutcomeUnknown,
+			wantAction:     ContainFailStop,
 		},
 		{
-			name: "db committed then anchor begin failed",
-			run: func(t *testing.T) (bool, bool) {
-				store := NewAnchorStore()
-				anchor := store.Adapter("db-1", 1)
-				store.FailNextForTest(AnchorBegin, nil)
-				if _, err := anchor.Begin(ctx, boot, 0); err == nil {
-					t.Fatalf("Begin() error = nil, want injected failure")
-				}
-				return true, false
-			},
-			want:       CommitOutcomeUnknown,
-			wantAction: ContainFailStop,
+			name:           "db committed and anchor advanced",
+			dbCommit:       DBCommitted,
+			anchorAdvanced: true,
+			want:           CommittedAndAnchored,
+			wantAction:     Proceed,
 		},
 		{
-			name: "db committed then anchor advance failed before state write",
-			run: func(t *testing.T) (bool, bool) {
-				store, anchor := initializedDurabilityAnchor(t, ctx, boot)
-				store.FailNextForTest(AnchorAdvance, nil)
-				if err := anchor.Advance(ctx, boot, 1); err == nil {
-					t.Fatalf("Advance() error = nil, want injected failure")
-				}
-				return true, anchorAdvancedToGeneration(t, store, 1)
-			},
-			want:       CommitOutcomeUnknown,
-			wantAction: ContainFailStop,
+			name:           "db commit unknown before anchor",
+			dbCommit:       DBCommitUnknown,
+			anchorAdvanced: false,
+			want:           CommitOutcomeUnknown,
+			wantAction:     ContainFailStop,
 		},
 		{
-			name: "db committed then anchor complete failed after state write",
-			run: func(t *testing.T) (bool, bool) {
-				store, anchor := initializedDurabilityAnchor(t, ctx, boot)
-				store.FailNextForTest(AnchorComplete, nil)
-				if err := anchor.Advance(ctx, boot, 1); err == nil {
-					t.Fatalf("Advance() error = nil, want injected post-complete failure")
-				}
-				return true, anchorAdvancedToGeneration(t, store, 1)
-			},
-			want:       CommittedAndAnchored,
-			wantAction: Proceed,
+			name:           "db commit unknown after anchor",
+			dbCommit:       DBCommitUnknown,
+			anchorAdvanced: true,
+			want:           CommitOutcomeUnknown,
+			wantAction:     ContainFailStop,
 		},
 		{
-			name: "db committed then anchor advanced",
-			run: func(t *testing.T) (bool, bool) {
-				store, anchor := initializedDurabilityAnchor(t, ctx, boot)
-				if err := anchor.Advance(ctx, boot, 1); err != nil {
-					t.Fatalf("Advance() error = %v", err)
-				}
-				return true, anchorAdvancedToGeneration(t, store, 1)
-			},
-			want:       CommittedAndAnchored,
-			wantAction: Proceed,
+			name:           "not committed but anchor advanced is contradictory",
+			dbCommit:       DBDefinitelyNotCommitted,
+			anchorAdvanced: true,
+			want:           CommitOutcomeUnknown,
+			wantAction:     ContainFailStop,
+		},
+		{
+			name:           "zero db commit outcome fails closed",
+			dbCommit:       DBCommitOutcome(0),
+			anchorAdvanced: false,
+			want:           CommitOutcomeUnknown,
+			wantAction:     ContainFailStop,
+		},
+		{
+			name:           "invalid db commit outcome fails closed",
+			dbCommit:       DBCommitOutcome(99),
+			anchorAdvanced: true,
+			want:           CommitOutcomeUnknown,
+			wantAction:     ContainFailStop,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dbCommitted, anchorAdvanced := tt.run(t)
-			got := ClassifyDurableMutationOutcome(dbCommitted, anchorAdvanced)
+			got := ClassifyDurableMutationOutcome(tt.dbCommit, tt.anchorAdvanced)
 			if got != tt.want {
 				t.Fatalf("ClassifyDurableMutationOutcome() = %v, want %v", got, tt.want)
 			}
@@ -98,6 +85,146 @@ func TestClassifyDurableMutationOutcomeAndGrantSafety(t *testing.T) {
 				t.Fatalf("SafeActionForGrantDurability() = %v, want %v", gotAction, tt.wantAction)
 			}
 		})
+	}
+}
+
+func TestSafeActionForGrantDurabilityFailsClosedOnZeroAndInvalid(t *testing.T) {
+	tests := []struct {
+		name    string
+		outcome DurabilityOutcome
+	}{
+		{name: "zero", outcome: DurabilityOutcome(0)},
+		{name: "unknown", outcome: CommitOutcomeUnknown},
+		{name: "invalid", outcome: DurabilityOutcome(99)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SafeActionForGrantDurability(tt.outcome); got != ContainFailStop {
+				t.Fatalf("SafeActionForGrantDurability(%v) = %v, want %v", tt.outcome, got, ContainFailStop)
+			}
+		})
+	}
+}
+
+func TestClassifyDurabilityAcrossRepositoryAnchorBoundary(t *testing.T) {
+	tests := []struct {
+		name               string
+		fail               AnchorOperation
+		wantErr            bool
+		wantDBCommit       DBCommitOutcome
+		wantAnchorAdvanced bool
+		wantOutcome        DurabilityOutcome
+		wantAction         GrantDurabilityAction
+	}{
+		{
+			name:               "success commits db and advances anchor",
+			wantDBCommit:       DBCommitted,
+			wantAnchorAdvanced: true,
+			wantOutcome:        CommittedAndAnchored,
+			wantAction:         Proceed,
+		},
+		{
+			name:               "post db commit pre anchor advance failure is unknown",
+			fail:               AnchorAdvance,
+			wantErr:            true,
+			wantDBCommit:       DBCommitted,
+			wantAnchorAdvanced: false,
+			wantOutcome:        CommitOutcomeUnknown,
+			wantAction:         ContainFailStop,
+		},
+		{
+			name:               "anchor begin failure happens before db commit",
+			fail:               AnchorBegin,
+			wantErr:            true,
+			wantDBCommit:       DBDefinitelyNotCommitted,
+			wantAnchorAdvanced: false,
+			wantOutcome:        DefinitelyNotCommitted,
+			wantAction:         Proceed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runRepositoryAnchorBoundary(t, tt.fail)
+			if (got.err != nil) != tt.wantErr {
+				t.Fatalf("error = %v, wantErr %v", got.err, tt.wantErr)
+			}
+			if got.dbCommit != tt.wantDBCommit {
+				t.Fatalf("db commit = %v, want %v", got.dbCommit, tt.wantDBCommit)
+			}
+			if got.anchorAdvanced != tt.wantAnchorAdvanced {
+				t.Fatalf("anchor advanced = %v, want %v", got.anchorAdvanced, tt.wantAnchorAdvanced)
+			}
+			outcome := ClassifyDurableMutationOutcome(got.dbCommit, got.anchorAdvanced)
+			if outcome != tt.wantOutcome {
+				t.Fatalf("ClassifyDurableMutationOutcome() = %v, want %v", outcome, tt.wantOutcome)
+			}
+			if action := SafeActionForGrantDurability(outcome); action != tt.wantAction {
+				t.Fatalf("SafeActionForGrantDurability() = %v, want %v", action, tt.wantAction)
+			}
+		})
+	}
+}
+
+type repositoryAnchorBoundaryResult struct {
+	dbCommit       DBCommitOutcome
+	anchorAdvanced bool
+	err            error
+}
+
+func runRepositoryAnchorBoundary(t *testing.T, fail AnchorOperation) repositoryAnchorBoundaryResult {
+	t.Helper()
+	ctx := context.Background()
+	boot := model.BootRef{BootID: model.BootID("boot-boundary"), OwnerID: model.OwnerID("owner-boundary")}
+	repo := memory.NewRepository()
+	dbUUID, schemaMajor, err := repo.AnchorIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewAnchorStore()
+	anchor := store.Adapter(dbUUID, schemaMajor)
+
+	if fail == AnchorBegin {
+		store.FailNextForTest(AnchorBegin, nil)
+	}
+	if _, err := anchor.Begin(ctx, boot, 0); err != nil {
+		if fail != AnchorBegin {
+			t.Fatalf("Begin() error = %v", err)
+		}
+		if generation := repositoryGeneration(t, repo); generation != 0 {
+			t.Fatalf("repository generation = %d after failed Begin, want 0", generation)
+		}
+		return repositoryAnchorBoundaryResult{dbCommit: DBDefinitelyNotCommitted, err: err}
+	}
+
+	commit, err := repo.Update(ctx, func(tx repository.WriteTx) error {
+		_, err := tx.AllocateJobID()
+		return err
+	})
+	if err != nil {
+		t.Fatalf("repository Update() error = %v", err)
+	}
+	if commit.Generation == 0 {
+		t.Fatalf("repository Update() generation = 0, want real mutation")
+	}
+
+	if fail == AnchorAdvance {
+		store.FailNextForTest(AnchorAdvance, nil)
+	}
+	if err := anchor.Advance(ctx, boot, commit.Generation); err != nil {
+		if fail != AnchorAdvance {
+			t.Fatalf("Advance() error = %v", err)
+		}
+		return repositoryAnchorBoundaryResult{
+			dbCommit:       DBCommitted,
+			anchorAdvanced: anchorAdvancedToGeneration(t, store, commit.Generation),
+			err:            err,
+		}
+	}
+	return repositoryAnchorBoundaryResult{
+		dbCommit:       DBCommitted,
+		anchorAdvanced: anchorAdvancedToGeneration(t, store, commit.Generation),
 	}
 }
 
@@ -109,6 +236,22 @@ func initializedDurabilityAnchor(t *testing.T, ctx context.Context, boot model.B
 		t.Fatalf("Begin() error = %v", err)
 	}
 	return store, anchor
+}
+
+func repositoryGeneration(t *testing.T, repo repository.Repository) uint64 {
+	t.Helper()
+	var generation uint64
+	if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+		meta := tx.Meta()
+		if meta.State != repository.RecordValid {
+			t.Fatalf("meta state = %s, want valid", meta.State)
+		}
+		generation = meta.Value.Generation
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return generation
 }
 
 func anchorAdvancedToGeneration(t *testing.T, store *AnchorStore, generation uint64) bool {

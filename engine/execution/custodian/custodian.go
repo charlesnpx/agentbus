@@ -3,6 +3,7 @@ package custodian
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"runtime"
 
@@ -13,6 +14,7 @@ import (
 var (
 	ErrInvalidAttestation    = errors.New("invalid quiescence attestation")
 	ErrSupervisorUnavailable = errors.New("supervisor_unavailable")
+	ErrInvalidSupport        = errors.New("invalid custodian support")
 )
 
 type GrantToken string
@@ -76,6 +78,41 @@ type Support struct {
 	Reason                 error
 }
 
+func NewSupport(support Support) (Support, error) {
+	if err := support.Validate(); err != nil {
+		return Support{}, err
+	}
+	return support, nil
+}
+
+func (support Support) Validate() error {
+	if support.FeatureAdvertised && !support.FeatureConfigured {
+		return fmt.Errorf("%w: advertised feature requires configuration", ErrInvalidSupport)
+	}
+	if support.FeatureConfigured && !support.RuntimeProbePassed {
+		return fmt.Errorf("%w: configured feature requires passing runtime probe", ErrInvalidSupport)
+	}
+	if support.RuntimeProbePassed && !support.ImplementationCompiled {
+		return fmt.Errorf("%w: passing runtime probe requires compiled implementation", ErrInvalidSupport)
+	}
+	if support.FeatureAdvertised && !support.ParkedExec {
+		return fmt.Errorf("%w: advertised feature requires parked exec support", ErrInvalidSupport)
+	}
+	if support.FeatureAdvertised && !support.VerifiedContainment {
+		return fmt.Errorf("%w: advertised feature requires verified containment support", ErrInvalidSupport)
+	}
+	return nil
+}
+
+func (support Support) AdvertisedAvailable() bool {
+	return support.FeatureAdvertised &&
+		support.FeatureConfigured &&
+		support.RuntimeProbePassed &&
+		support.ImplementationCompiled &&
+		support.ParkedExec &&
+		support.VerifiedContainment
+}
+
 type Runtime struct {
 	process  ProcessCustodian
 	verifier AttestationVerifier
@@ -87,20 +124,24 @@ func NewUnavailableRuntime(reason error) Runtime {
 		reason = ErrSupervisorUnavailable
 	}
 	_, verifier := NewAttestationChannel()
+	support, err := NewSupport(Support{
+		ParkedExec:             false,
+		VerifiedContainment:    false,
+		ImplementationCompiled: false,
+		RuntimeProbePassed:     false,
+		FeatureConfigured:      false,
+		FeatureAdvertised:      false,
+		RuntimeProbeResult:     reason,
+		Platform:               runtime.GOOS,
+		Reason:                 reason,
+	})
+	if err != nil {
+		panic(err)
+	}
 	return Runtime{
 		process:  UnavailableCustodian{},
 		verifier: verifier,
-		support: Support{
-			ParkedExec:             false,
-			VerifiedContainment:    false,
-			ImplementationCompiled: false,
-			RuntimeProbePassed:     false,
-			FeatureConfigured:      false,
-			FeatureAdvertised:      false,
-			RuntimeProbeResult:     reason,
-			Platform:               runtime.GOOS,
-			Reason:                 reason,
-		},
+		support:  support,
 	}
 }
 

@@ -8,14 +8,31 @@ const (
 	CommitOutcomeUnknown
 )
 
-func ClassifyDurableMutationOutcome(dbCommitted, anchorAdvanced bool) DurabilityOutcome {
-	if !dbCommitted {
+type DBCommitOutcome uint8
+
+const (
+	DBDefinitelyNotCommitted DBCommitOutcome = iota + 1
+	DBCommitted
+	DBCommitUnknown
+)
+
+func ClassifyDurableMutationOutcome(dbCommit DBCommitOutcome, anchorAdvanced bool) DurabilityOutcome {
+	switch dbCommit {
+	case DBDefinitelyNotCommitted:
+		if anchorAdvanced {
+			return CommitOutcomeUnknown
+		}
 		return DefinitelyNotCommitted
+	case DBCommitted:
+		if anchorAdvanced {
+			return CommittedAndAnchored
+		}
+		return CommitOutcomeUnknown
+	case DBCommitUnknown:
+		return CommitOutcomeUnknown
+	default:
+		return CommitOutcomeUnknown
 	}
-	if anchorAdvanced {
-		return CommittedAndAnchored
-	}
-	return CommitOutcomeUnknown
 }
 
 type GrantDurabilityAction uint8
@@ -26,8 +43,12 @@ const (
 )
 
 func SafeActionForGrantDurability(outcome DurabilityOutcome) GrantDurabilityAction {
-	if outcome == CommitOutcomeUnknown {
+	switch outcome {
+	case DefinitelyNotCommitted, CommittedAndAnchored:
+		return Proceed
+	case CommitOutcomeUnknown:
+		return ContainFailStop
+	default:
 		return ContainFailStop
 	}
-	return Proceed
 }

@@ -84,6 +84,98 @@ func TestProductionCodeDoesNotMintQuiescenceOutsideCustodian(t *testing.T) {
 	}
 }
 
+func TestSupportValidationRejectsContradictoryStates(t *testing.T) {
+	tests := []struct {
+		name    string
+		support Support
+	}{
+		{
+			name: "advertised without configured",
+			support: supportWith(func(s *Support) {
+				s.FeatureConfigured = false
+			}),
+		},
+		{
+			name: "configured without probe",
+			support: supportWith(func(s *Support) {
+				s.RuntimeProbePassed = false
+			}),
+		},
+		{
+			name: "probe without implementation",
+			support: supportWith(func(s *Support) {
+				s.ImplementationCompiled = false
+			}),
+		},
+		{
+			name: "advertised without parked exec",
+			support: supportWith(func(s *Support) {
+				s.ParkedExec = false
+			}),
+		},
+		{
+			name: "advertised without verified containment",
+			support: supportWith(func(s *Support) {
+				s.VerifiedContainment = false
+			}),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := NewSupport(tt.support); !errors.Is(err, ErrInvalidSupport) {
+				t.Fatalf("NewSupport() error = %v, want ErrInvalidSupport", err)
+			}
+		})
+	}
+}
+
+func TestSupportAdvertisedAvailableRequiresFullChain(t *testing.T) {
+	available, err := NewSupport(supportWith(nil))
+	if err != nil {
+		t.Fatalf("NewSupport() available error = %v", err)
+	}
+	if !available.AdvertisedAvailable() {
+		t.Fatal("AdvertisedAvailable() = false, want true")
+	}
+
+	capabilityOnly, err := NewSupport(Support{
+		ParkedExec:             true,
+		VerifiedContainment:    true,
+		ImplementationCompiled: true,
+		RuntimeProbePassed:     true,
+	})
+	if err != nil {
+		t.Fatalf("NewSupport() capability-only error = %v", err)
+	}
+	if capabilityOnly.AdvertisedAvailable() {
+		t.Fatal("AdvertisedAvailable() = true without configured/advertised lifecycle")
+	}
+
+	unavailable := NewUnavailableRuntime(nil).Support()
+	if err := unavailable.Validate(); err != nil {
+		t.Fatalf("NewUnavailableRuntime support Validate() error = %v", err)
+	}
+	if unavailable.AdvertisedAvailable() {
+		t.Fatal("NewUnavailableRuntime support advertised available")
+	}
+}
+
+func supportWith(mutate func(*Support)) Support {
+	support := Support{
+		ParkedExec:             true,
+		VerifiedContainment:    true,
+		ImplementationCompiled: true,
+		RuntimeProbePassed:     true,
+		FeatureConfigured:      true,
+		FeatureAdvertised:      true,
+	}
+	if mutate != nil {
+		mutate(&support)
+	}
+	return support
+}
+
 func testPhysicalQuiescence() PhysicalQuiescence {
 	ref := model.AttemptRef{JobID: "job-custodian", AttemptID: "attempt-custodian", Epoch: 1}
 	group := model.GroupRef{
