@@ -38,10 +38,13 @@ func TestKernelDomainIDValidateAndEqual(t *testing.T) {
 	} else if withNamespace.PIDNamespaceState != PIDNamespaceKnown {
 		t.Fatalf("NewKernelDomainID() state = %v, want %v", withNamespace.PIDNamespaceState, PIDNamespaceKnown)
 	}
-	if withoutNamespace, err := NewKernelDomainID("host-boot-1", ""); err != nil {
-		t.Fatalf("NewKernelDomainID() without namespace error = %v", err)
+	if _, err := NewKernelDomainID("host-boot-1", ""); err == nil {
+		t.Fatalf("NewKernelDomainID() accepted empty namespace")
+	}
+	if withoutNamespace, err := NewKernelDomainIDWithoutPIDNamespace("host-boot-1"); err != nil {
+		t.Fatalf("NewKernelDomainIDWithoutPIDNamespace() error = %v", err)
 	} else if withoutNamespace.PIDNamespaceState != PIDNamespaceNotApplicable {
-		t.Fatalf("NewKernelDomainID() without namespace state = %v, want %v", withoutNamespace.PIDNamespaceState, PIDNamespaceNotApplicable)
+		t.Fatalf("NewKernelDomainIDWithoutPIDNamespace() state = %v, want %v", withoutNamespace.PIDNamespaceState, PIDNamespaceNotApplicable)
 	}
 	if err := (KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceID: "pidns-1", PIDNamespaceState: PIDNamespaceUnknown}).Validate(); err == nil {
 		t.Fatal("Validate() accepted non-empty pid namespace with unknown state")
@@ -65,7 +68,7 @@ func TestGroupRefEqualUsesCanonicalKernelDomain(t *testing.T) {
 	}
 }
 
-func TestGroupRefDecodeLegacyHostBootOnlyUsesBootDomain(t *testing.T) {
+func TestGroupRefDecodeLegacyHostBootOnlyUsesUnknownPIDNamespace(t *testing.T) {
 	original := kernelDomainTestGroupRef()
 	data, err := json.Marshal(original)
 	if err != nil {
@@ -86,14 +89,62 @@ func TestGroupRefDecodeLegacyHostBootOnlyUsesBootDomain(t *testing.T) {
 	if err := json.Unmarshal(legacy, &decoded); err != nil {
 		t.Fatalf("Unmarshal legacy GroupRef error = %v", err)
 	}
-	if decoded.PIDNamespaceState != PIDNamespaceNotApplicable {
-		t.Fatalf("decoded PIDNamespaceState = %v, want %v", decoded.PIDNamespaceState, PIDNamespaceNotApplicable)
+	if decoded.PIDNamespaceState != PIDNamespaceUnknown {
+		t.Fatalf("decoded PIDNamespaceState = %v, want %v", decoded.PIDNamespaceState, PIDNamespaceUnknown)
 	}
 	if decoded.PIDNamespaceID != "" {
 		t.Fatalf("decoded PIDNamespaceID = %q, want empty", decoded.PIDNamespaceID)
 	}
 	if err := decoded.Validate(); err != nil {
 		t.Fatalf("decoded legacy GroupRef Validate() error = %v", err)
+	}
+	decision, err := DecideGroupRecovery(decoded, liveMatchingObservation(KernelDomainID{
+		HostBootID:        decoded.HostBootID,
+		PIDNamespaceState: PIDNamespaceNotApplicable,
+	}))
+	if err != nil {
+		t.Fatalf("DecideGroupRecovery() legacy GroupRef error = %v", err)
+	}
+	if decision != GroupRecoveryUnprovable {
+		t.Fatalf("legacy recovery decision = %s, want %s", decision, GroupRecoveryUnprovable)
+	}
+}
+
+func TestLegacyHostBootOnlyObservationIsUnknownAndUnprovable(t *testing.T) {
+	ref := kernelDomainTestGroupRef()
+	observation := GroupRecoveryObservation{
+		HostBootID: ref.HostBootID,
+		Group:      GroupLive,
+		Leader:     ProcessIdentityMatching,
+	}
+
+	domain, err := observation.kernelDomain()
+	if err != nil {
+		t.Fatalf("kernelDomain() error = %v", err)
+	}
+	if domain.PIDNamespaceState != PIDNamespaceUnknown {
+		t.Fatalf("legacy observation PIDNamespaceState = %v, want %v", domain.PIDNamespaceState, PIDNamespaceUnknown)
+	}
+	got, err := DecideGroupRecovery(ref, observation)
+	if err != nil {
+		t.Fatalf("DecideGroupRecovery() error = %v", err)
+	}
+	if got != GroupRecoveryUnprovable {
+		t.Fatalf("DecideGroupRecovery() = %s, want %s", got, GroupRecoveryUnprovable)
+	}
+}
+
+func TestExplicitNoPIDNamespaceDomainUsesBootEquality(t *testing.T) {
+	left, err := NewKernelDomainIDWithoutPIDNamespace("host-boot-1")
+	if err != nil {
+		t.Fatalf("NewKernelDomainIDWithoutPIDNamespace() left error = %v", err)
+	}
+	right, err := NewKernelDomainIDWithoutPIDNamespace("host-boot-1")
+	if err != nil {
+		t.Fatalf("NewKernelDomainIDWithoutPIDNamespace() right error = %v", err)
+	}
+	if !left.Equal(right) {
+		t.Fatalf("Equal() = false for explicit no-PID-namespace boot equality")
 	}
 }
 

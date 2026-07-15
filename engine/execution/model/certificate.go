@@ -193,7 +193,7 @@ func (ref *GroupRef) UnmarshalJSON(data []byte) error {
 	}
 	out := GroupRef(decoded)
 	if _, ok := fields["PIDNamespaceState"]; !ok && out.PIDNamespaceID == "" && out.HostBootID != "" {
-		out.PIDNamespaceState = PIDNamespaceNotApplicable
+		out.PIDNamespaceState = PIDNamespaceUnknown
 	}
 	*ref = out
 	return nil

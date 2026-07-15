@@ -294,7 +294,10 @@ func classifyRepositoryCommitError(err error) DBCommitOutcome {
 	if errors.Is(err, repository.ErrAmbiguousCommit) {
 		return DBCommitUnknown
 	}
-	return DBDefinitelyNotCommitted
+	if errors.Is(err, repository.ErrDefinitelyNotCommitted) {
+		return DBDefinitelyNotCommitted
+	}
+	return DBCommitUnknown
 }
 
 func (r *Ready) LoadJob(ctx context.Context, jobID model.JobID) (repository.JobImage, error) {

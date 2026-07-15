@@ -149,7 +149,7 @@ func TestDecideGroupRecoveryFailClosedOnSameBoot(t *testing.T) {
 	}
 }
 
-func TestDecideGroupRecoveryLegacyHostBootOnlyObservationPreservesBootDomain(t *testing.T) {
+func TestDecideGroupRecoveryLegacyHostBootOnlyObservationIsUnprovable(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
 	observation := GroupRecoveryObservation{
 		HostBootID: ref.HostBootID,
@@ -160,15 +160,15 @@ func TestDecideGroupRecoveryLegacyHostBootOnlyObservationPreservesBootDomain(t *
 	if err != nil {
 		t.Fatalf("kernelDomain() error = %v", err)
 	}
-	if domain.PIDNamespaceState != PIDNamespaceNotApplicable {
-		t.Fatalf("kernelDomain PIDNamespaceState = %v, want %v", domain.PIDNamespaceState, PIDNamespaceNotApplicable)
+	if domain.PIDNamespaceState != PIDNamespaceUnknown {
+		t.Fatalf("kernelDomain PIDNamespaceState = %v, want %v", domain.PIDNamespaceState, PIDNamespaceUnknown)
 	}
 	got, err := DecideGroupRecovery(ref, observation)
 	if err != nil {
 		t.Fatalf("DecideGroupRecovery error = %v", err)
 	}
-	if got != GroupRecoverySignal {
-		t.Fatalf("decision = %s, want %s", got, GroupRecoverySignal)
+	if got != GroupRecoveryUnprovable {
+		t.Fatalf("decision = %s, want %s", got, GroupRecoveryUnprovable)
 	}
 }
 

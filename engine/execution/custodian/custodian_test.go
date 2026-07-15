@@ -175,6 +175,13 @@ func TestSupportAdvertisedAvailableRequiresFullChain(t *testing.T) {
 	if unavailable.AdvertisedAvailable() {
 		t.Fatal("NewUnavailableRuntime support advertised available")
 	}
+
+	invalidProbeResult := supportWith(func(s *Support) {
+		s.RuntimeProbeResult = errors.New("probe failed")
+	})
+	if invalidProbeResult.AdvertisedAvailable() {
+		t.Fatal("AdvertisedAvailable() = true with non-nil runtime probe result")
+	}
 }
 
 func supportWith(mutate func(*Support)) Support {

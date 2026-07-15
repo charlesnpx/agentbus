@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -57,7 +58,9 @@ const (
 
 // Repository is a single-file bbolt implementation of repository.Repository.
 type Repository struct {
-	db *bolt.DB
+	db                             *bolt.DB
+	testMu                         sync.Mutex
+	failCommitAfterCallbackForTest error
 }
 
 // Open opens or initializes a root bbolt repository database at path. The file
@@ -90,6 +93,15 @@ func (r *Repository) Close() error {
 	return r.db.Close()
 }
 
+func (r *Repository) FailCommitAfterCallbackForTest(err error) {
+	if err == nil {
+		err = fmt.Errorf("injected bbolt commit-phase failure")
+	}
+	r.testMu.Lock()
+	defer r.testMu.Unlock()
+	r.failCommitAfterCallbackForTest = err
+}
+
 func (r *Repository) View(ctx context.Context, fn func(repository.ReadTx) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -108,7 +120,7 @@ func (r *Repository) View(ctx context.Context, fn func(repository.ReadTx) error)
 
 func (r *Repository) Update(ctx context.Context, fn func(repository.WriteTx) error) (commit repository.Commit, err error) {
 	if err := ctx.Err(); err != nil {
-		return repository.Commit{}, err
+		return repository.Commit{}, fmt.Errorf("%w: %w", repository.ErrDefinitelyNotCommitted, err)
 	}
 	callbackOK := false
 	err = r.db.Update(func(tx *bolt.Tx) (txErr error) {
@@ -144,15 +156,26 @@ func (r *Repository) Update(ctx context.Context, fn func(repository.WriteTx) err
 		}
 		commit = repository.Commit{Generation: next.generation}
 		callbackOK = true
+		if err := r.consumeCommitAfterCallbackFaultForTest(); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
 		if callbackOK {
-			return commit, fmt.Errorf("%w: %v", repository.ErrAmbiguousCommit, err)
+			return commit, fmt.Errorf("%w: %w", repository.ErrAmbiguousCommit, err)
 		}
-		return commit, err
+		return commit, fmt.Errorf("%w: %w", repository.ErrDefinitelyNotCommitted, err)
 	}
 	return commit, nil
+}
+
+func (r *Repository) consumeCommitAfterCallbackFaultForTest() error {
+	r.testMu.Lock()
+	defer r.testMu.Unlock()
+	err := r.failCommitAfterCallbackForTest
+	r.failCommitAfterCallbackForTest = nil
+	return err
 }
 
 func (r *Repository) SnapshotBytes() []byte {

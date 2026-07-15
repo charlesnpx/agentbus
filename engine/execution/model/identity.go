@@ -168,11 +168,10 @@ type KernelDomainID struct {
 }
 
 func NewKernelDomainID(hostBootID, pidNamespaceID string) (KernelDomainID, error) {
-	id := KernelDomainID{HostBootID: hostBootID, PIDNamespaceState: PIDNamespaceNotApplicable}
-	if pidNamespaceID != "" {
-		id.PIDNamespaceID = pidNamespaceID
-		id.PIDNamespaceState = PIDNamespaceKnown
+	if pidNamespaceID == "" {
+		return KernelDomainID{}, invalid("kernel_domain.pid_namespace", "generic constructor requires an id")
 	}
+	id := KernelDomainID{HostBootID: hostBootID, PIDNamespaceID: pidNamespaceID, PIDNamespaceState: PIDNamespaceKnown}
 	if err := id.Validate(); err != nil {
 		return KernelDomainID{}, err
 	}

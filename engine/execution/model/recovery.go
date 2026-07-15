@@ -109,9 +109,6 @@ func (observation GroupRecoveryObservation) kernelDomain() (KernelDomainID, erro
 	domain := observation.KernelDomainID
 	if domain.HostBootID == "" && observation.HostBootID != "" {
 		domain.HostBootID = observation.HostBootID
-		if domain.PIDNamespaceID == "" && domain.PIDNamespaceState == PIDNamespaceUnknown {
-			domain.PIDNamespaceState = PIDNamespaceNotApplicable
-		}
 	}
 	if observation.HostBootID != "" && domain.HostBootID != observation.HostBootID {
 		return KernelDomainID{}, invalid("group.host_boot_id", "does not match kernel domain")

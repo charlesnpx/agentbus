@@ -51,12 +51,12 @@ func (r *Repository) View(ctx context.Context, fn func(repository.ReadTx) error)
 
 func (r *Repository) Update(ctx context.Context, fn func(repository.WriteTx) error) (commit repository.Commit, err error) {
 	if err := ctx.Err(); err != nil {
-		return repository.Commit{}, err
+		return repository.Commit{}, fmt.Errorf("%w: %w", repository.ErrDefinitelyNotCommitted, err)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return repository.Commit{}, err
+		return repository.Commit{}, fmt.Errorf("%w: %w", repository.ErrDefinitelyNotCommitted, err)
 	}
 
 	next := r.state.clone()
@@ -64,18 +64,18 @@ func (r *Repository) Update(ctx context.Context, fn func(repository.WriteTx) err
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			commit = repository.Commit{Generation: r.state.generation}
-			err = fmt.Errorf("%w: %v", repository.ErrTransactionPanic, recovered)
+			err = fmt.Errorf("%w: %w: %v", repository.ErrDefinitelyNotCommitted, repository.ErrTransactionPanic, recovered)
 		}
 	}()
 
 	if err := fn(tx); err != nil {
-		return repository.Commit{Generation: r.state.generation}, err
+		return repository.Commit{Generation: r.state.generation}, fmt.Errorf("%w: %w", repository.ErrDefinitelyNotCommitted, err)
 	}
 	if !tx.changed {
 		return repository.Commit{Generation: r.state.generation}, nil
 	}
 	if err := next.validateForCommit(); err != nil {
-		return repository.Commit{Generation: r.state.generation}, err
+		return repository.Commit{Generation: r.state.generation}, fmt.Errorf("%w: %w", repository.ErrDefinitelyNotCommitted, err)
 	}
 	next.advanceGeneration()
 	r.state = next

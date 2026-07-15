@@ -112,6 +112,9 @@ func (support Support) Validate() error {
 }
 
 func (support Support) AdvertisedAvailable() bool {
+	if support.Validate() != nil || support.RuntimeProbeResult != nil {
+		return false
+	}
 	return support.FeatureAdvertised &&
 		support.FeatureConfigured &&
 		support.RuntimeProbePassed &&

@@ -207,6 +207,9 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 		if !errors.Is(err, sentinel) {
 			t.Fatalf("callback rejection error = %v, want sentinel", err)
 		}
+		if !errors.Is(err, repository.ErrDefinitelyNotCommitted) {
+			t.Fatalf("callback rejection error = %v, want ErrDefinitelyNotCommitted", err)
+		}
 		assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
 
 		_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
@@ -217,6 +220,9 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 		})
 		if !errors.Is(err, repository.ErrTransactionPanic) {
 			t.Fatalf("panic error = %v, want ErrTransactionPanic", err)
+		}
+		if !errors.Is(err, repository.ErrDefinitelyNotCommitted) {
+			t.Fatalf("panic error = %v, want ErrDefinitelyNotCommitted", err)
 		}
 		assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
 	})

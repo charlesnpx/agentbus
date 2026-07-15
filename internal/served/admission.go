@@ -485,9 +485,9 @@ func (a *servedAdmissionAuthority) Finalize(ctx context.Context, jobID model.Job
 
 func admissionStepResult(applied authority.ApplyResult, err error) (coordinator.StepResult, error) {
 	if err != nil {
-		return coordinator.StepResult{Record: applied.Record, Projection: applied.Projection, Durability: applied.Durability, Changed: applied.Changed}, err
+		return coordinator.StepResult{}, err
 	}
-	return coordinator.StepResult{Record: applied.Record, Projection: applied.Projection, Durability: applied.Durability, Changed: applied.Changed}, nil
+	return coordinator.StepResult{Record: applied.Record, Projection: applied.Projection, Changed: applied.Changed}, nil
 }
 
 func (a *servedAdmissionAuthority) Snapshot(ctx context.Context, jobID model.JobID) (coordinator.JobSnapshot, error) {

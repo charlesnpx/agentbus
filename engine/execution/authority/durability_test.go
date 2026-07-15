@@ -111,6 +111,39 @@ func TestSafeActionForGrantDurabilityFailsClosedOnZeroAndInvalid(t *testing.T) {
 	}
 }
 
+func TestClassifyRepositoryCommitErrorFailsClosed(t *testing.T) {
+	rawErr := errors.New("raw repository error")
+	tests := []struct {
+		name string
+		err  error
+		want DBCommitOutcome
+	}{
+		{
+			name: "ambiguous commit",
+			err:  fmt.Errorf("%w: fsync failed", repository.ErrAmbiguousCommit),
+			want: DBCommitUnknown,
+		},
+		{
+			name: "definitely not committed",
+			err:  fmt.Errorf("%w: %w", repository.ErrDefinitelyNotCommitted, rawErr),
+			want: DBDefinitelyNotCommitted,
+		},
+		{
+			name: "unrecognized raw error fails closed",
+			err:  rawErr,
+			want: DBCommitUnknown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyRepositoryCommitError(tt.err); got != tt.want {
+				t.Fatalf("classifyRepositoryCommitError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestReadyApplySurfacesCommitOutcomeUnknownOnAnchorFailure(t *testing.T) {
 	ctx := context.Background()
 	tests := []struct {
@@ -166,6 +199,43 @@ func TestReadyApplySurfacesCommitOutcomeUnknownOnAnchorFailure(t *testing.T) {
 				t.Fatal("commit generation = 0, want committed DB generation")
 			}
 		})
+	}
+}
+
+func TestBootstrapUsesAnchorStoreFailNextForAnchorBegin(t *testing.T) {
+	repo := memory.NewRepository()
+	anchorStore := NewAnchorStore()
+	anchorStore.FailNextForTest(AnchorBegin, nil)
+
+	session, err := beginRecoveryWithAnchorStore(t, repo, anchorStore, "durability-anchor-begin")
+	if session != nil {
+		t.Fatalf("Begin returned session %#v, want nil", session)
+	}
+	if !errors.Is(err, ErrAnchorInvariant) {
+		t.Fatalf("Begin error = %v, want ErrAnchorInvariant", err)
+	}
+	if generation := repositoryGeneration(t, repo); generation != 0 {
+		t.Fatalf("repository generation = %d, want unchanged 0", generation)
+	}
+}
+
+func TestReadyApplySurfacesCommitOutcomeUnknownOnRealBboltCommitPhaseFault(t *testing.T) {
+	ctx := context.Background()
+	ready, repo, _ := newBboltDurabilityReady(t, "real-bbolt-commit-phase")
+	run := prepareDurabilityMutation(t, ctx, ready, durabilityMutationBindGroup, "real-bbolt-commit-phase")
+	if err := repo.failCommitAfterCallbackForTest(errors.New("commit fsync failed")); err != nil {
+		t.Fatal(err)
+	}
+
+	applied, err := run()
+	if !errors.Is(err, repository.ErrAmbiguousCommit) {
+		t.Fatalf("mutation error = %v, want ErrAmbiguousCommit", err)
+	}
+	if applied.Durability != CommitOutcomeUnknown {
+		t.Fatalf("durability = %v, want %v", applied.Durability, CommitOutcomeUnknown)
+	}
+	if action := SafeActionForGrantDurability(applied.Durability); action != ContainFailStop {
+		t.Fatalf("SafeActionForGrantDurability() = %v, want %v", action, ContainFailStop)
 	}
 }
 
@@ -241,11 +311,11 @@ func TestReadyDurabilityOutcomesAcrossMutationFailpoints(t *testing.T) {
 				}
 				afterGeneration := repositoryGeneration(t, repo)
 				switch tt.point {
-				case durabilityFaultPostDBCommit, durabilityFaultAnchorAdvance, durabilityFaultAnchorComplete, durabilityFaultBeforeReturn:
+				case durabilityFaultAnchorAdvance, durabilityFaultAnchorComplete, durabilityFaultBeforeReturn:
 					if afterGeneration <= beforeGeneration {
 						t.Fatalf("repository generation = %d, want > %d", afterGeneration, beforeGeneration)
 					}
-				case durabilityFaultPreDBCommit, durabilityFaultAnchorBegin:
+				case durabilityFaultPreDBCommit, durabilityFaultPostDBCommit, durabilityFaultAnchorBegin:
 					if afterGeneration != beforeGeneration {
 						t.Fatalf("repository generation = %d, want unchanged %d", afterGeneration, beforeGeneration)
 					}
@@ -353,16 +423,21 @@ func (r *durabilityFaultingRepository) View(ctx context.Context, fn func(reposit
 func (r *durabilityFaultingRepository) Update(ctx context.Context, fn func(repository.WriteTx) error) (repository.Commit, error) {
 	switch r.fault {
 	case durabilityFaultPreDBCommit:
-		return repository.Commit{}, fmt.Errorf("%w: pre-db-commit", errInjectedDurabilityFault)
-	case durabilityFaultPostDBCommit:
-		commit, err := r.inner.Update(ctx, fn)
-		if err != nil {
-			return commit, err
-		}
-		return commit, fmt.Errorf("%w: injected bbolt commit-phase failure", repository.ErrAmbiguousCommit)
+		return repository.Commit{}, fmt.Errorf("%w: %w: pre-db-commit", repository.ErrDefinitelyNotCommitted, errInjectedDurabilityFault)
 	default:
 		return r.inner.Update(ctx, fn)
 	}
+}
+
+func (r *durabilityFaultingRepository) failCommitAfterCallbackForTest(err error) error {
+	faulting, ok := r.inner.(interface {
+		FailCommitAfterCallbackForTest(error)
+	})
+	if !ok {
+		return fmt.Errorf("inner repository %T does not expose FailCommitAfterCallbackForTest", r.inner)
+	}
+	faulting.FailCommitAfterCallbackForTest(err)
+	return nil
 }
 
 func (r *durabilityFaultingRepository) AnchorIdentity() (string, uint16, error) {
@@ -492,6 +567,11 @@ func injectDurabilityFault(t *testing.T, ready *Ready, repo *durabilityFaultingR
 	switch point {
 	case durabilityFaultPreDBCommit, durabilityFaultPostDBCommit:
 		repo.fault = point
+		if point == durabilityFaultPostDBCommit {
+			if err := repo.failCommitAfterCallbackForTest(errInjectedDurabilityFault); err != nil {
+				t.Fatal(err)
+			}
+		}
 	case durabilityFaultAnchorBegin:
 		ready.core.anchor = &durabilityFaultingAnchor{Anchor: ready.core.anchor, failVerifyReady: true}
 	case durabilityFaultAnchorAdvance:

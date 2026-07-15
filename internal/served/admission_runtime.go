@@ -17,12 +17,7 @@ import (
 )
 
 type servedAdmissionSupervisor struct {
-	runtime admissionCustodianRuntime
-}
-
-type admissionCustodianRuntime interface {
-	Support() custodian.Support
-	Verifier() custodian.AttestationVerifier
+	runtime custodian.Runtime
 }
 
 func newServedAdmissionSupervisor(_ *Server) *servedAdmissionSupervisor {
@@ -41,18 +36,12 @@ func (s *servedAdmissionSupervisor) verifiedContainmentSupported(ctx context.Con
 	if s == nil {
 		return fmt.Errorf("%w: admission supervisor is nil", custodian.ErrSupervisorUnavailable)
 	}
-	if s.runtime == nil {
-		return fmt.Errorf("%w: admission runtime is nil", custodian.ErrSupervisorUnavailable)
-	}
 	support := s.runtime.Support()
-	if support.AdvertisedAvailable() {
+	if support.VerifiedContainment {
 		return nil
 	}
 	if support.Reason != nil {
 		return support.Reason
-	}
-	if support.RuntimeProbeResult != nil {
-		return support.RuntimeProbeResult
 	}
 	return fmt.Errorf("%w: verified containment unsupported", custodian.ErrSupervisorUnavailable)
 }
