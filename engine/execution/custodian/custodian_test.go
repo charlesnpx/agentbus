@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -14,12 +15,29 @@ import (
 func TestAttestationChannelsRejectCrossChannelQuiescence(t *testing.T) {
 	_, verifierA := NewAttestationChannel()
 	issuerB, _ := NewAttestationChannel()
-	verified, err := issuerB.AttestQuiescence(testQuiescenceCertificate())
+	verified, err := issuerB.AttestQuiescence(testPhysicalQuiescence())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := verifierA.VerifyQuiescence(verified); !errors.Is(err, ErrInvalidAttestation) {
 		t.Fatalf("cross-channel VerifyQuiescence error = %v, want ErrInvalidAttestation", err)
+	}
+}
+
+func TestPhysicalQuiescenceCarriesOnlyPhysicalFields(t *testing.T) {
+	payloadType := reflect.TypeOf(PhysicalQuiescence{})
+	if payloadType.NumField() != 2 {
+		t.Fatalf("PhysicalQuiescence fields = %d, want 2", payloadType.NumField())
+	}
+	for _, name := range []string{"Group", "Method"} {
+		if _, ok := payloadType.FieldByName(name); !ok {
+			t.Fatalf("PhysicalQuiescence missing field %s", name)
+		}
+	}
+	for _, name := range []string{"Attempt", "Ordinal", "CertifiedBy"} {
+		if _, ok := payloadType.FieldByName(name); ok {
+			t.Fatalf("PhysicalQuiescence carries logical field %s", name)
+		}
 	}
 }
 
@@ -66,7 +84,7 @@ func TestProductionCodeDoesNotMintQuiescenceOutsideCustodian(t *testing.T) {
 	}
 }
 
-func testQuiescenceCertificate() model.QuiescenceCertificate {
+func testPhysicalQuiescence() PhysicalQuiescence {
 	ref := model.AttemptRef{JobID: "job-custodian", AttemptID: "attempt-custodian", Epoch: 1}
 	group := model.GroupRef{
 		Version:   1,
@@ -81,11 +99,8 @@ func testQuiescenceCertificate() model.QuiescenceCertificate {
 		Monitor:    model.ProcessIdentity{PID: 102, HighResStartToken: "monitor-start-custodian"},
 		RetainedID: "retained-custodian",
 	}
-	return model.QuiescenceCertificate{
-		Attempt:     ref,
-		Ordinal:     model.LaunchOrdinalOne,
-		Group:       group,
-		Method:      model.QuiescenceAlreadyAbsent,
-		CertifiedBy: model.BootRef{BootID: "boot-custodian", OwnerID: "owner-custodian"},
+	return PhysicalQuiescence{
+		Group:  group,
+		Method: model.QuiescenceAlreadyAbsent,
 	}
 }

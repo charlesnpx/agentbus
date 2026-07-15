@@ -14,6 +14,10 @@ import (
 func TestServedAdmissionSupervisorUsesUnavailableCustodian(t *testing.T) {
 	ctx := context.Background()
 	supervisor := newServedAdmissionSupervisor(nil)
+	support := supervisor.runtime.Support()
+	if support.ParkedExec || support.VerifiedContainment || !errors.Is(support.Reason, custodian.ErrSupervisorUnavailable) {
+		t.Fatalf("runtime support = %#v, want parked_exec:false verified_containment:false supervisor_unavailable", support)
+	}
 	if err := supervisor.verifiedContainmentSupported(ctx); !errors.Is(err, custodian.ErrSupervisorUnavailable) {
 		t.Fatalf("verifiedContainmentSupported error = %v, want supervisor_unavailable", err)
 	}

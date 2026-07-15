@@ -510,24 +510,19 @@ func verifyQuiescenceForRecord(record model.SafetyRecord, ordinal model.LaunchOr
 	if !ok || launch.Group == nil {
 		return model.QuiescenceCertificate{}, fmt.Errorf("%w: durable group reference missing for ordinal %s", ErrInvalidRequest, ordinal)
 	}
-	certificate, err := verifier.VerifyQuiescence(verified)
+	physical, err := verifier.VerifyQuiescence(verified)
 	if err != nil {
 		return model.QuiescenceCertificate{}, err
 	}
-	if !certificate.Attempt.Equal(record.Attempt.Ref) {
-		return model.QuiescenceCertificate{}, fmt.Errorf("%w: quiescence attempt mismatch", ErrInvalidRequest)
-	}
-	if certificate.Ordinal != ordinal {
-		return model.QuiescenceCertificate{}, fmt.Errorf("%w: quiescence ordinal mismatch", ErrInvalidRequest)
-	}
-	if !certificate.Group.Equal(*launch.Group) {
+	if !physical.Group.Equal(*launch.Group) {
 		return model.QuiescenceCertificate{}, fmt.Errorf("%w: quiescence group mismatch", ErrInvalidRequest)
 	}
-	if certificate.Group.CustodyID != launch.Group.CustodyID {
-		return model.QuiescenceCertificate{}, fmt.Errorf("%w: quiescence custody mismatch", ErrInvalidRequest)
-	}
-	if emptyBootRef(certificate.CertifiedBy) {
-		certificate.CertifiedBy = boot
+	certificate := model.QuiescenceCertificate{
+		Attempt:     record.Attempt.Ref,
+		Ordinal:     ordinal,
+		Group:       physical.Group,
+		Method:      physical.Method,
+		CertifiedBy: boot,
 	}
 	return certificate, nil
 }

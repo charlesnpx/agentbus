@@ -805,12 +805,9 @@ func (s *testSupervisor) Retire(ctx context.Context, prepared PreparedSupervisor
 }
 
 func (s *testSupervisor) attest(prepared PreparedSupervisor, method model.QuiescenceMethod) (custodian.VerifiedQuiescence, error) {
-	return s.issuer.AttestQuiescence(model.QuiescenceCertificate{
-		Attempt:     prepared.Ref,
-		Ordinal:     prepared.Ordinal,
-		Group:       prepared.Group,
-		Method:      method,
-		CertifiedBy: s.boot,
+	return s.issuer.AttestQuiescence(custodian.PhysicalQuiescence{
+		Group:  prepared.Group,
+		Method: method,
 	})
 }
 

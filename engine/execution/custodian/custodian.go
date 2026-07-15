@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"runtime"
 
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -60,8 +61,46 @@ func (UnavailableCustodian) ContainAndVerify(context.Context, model.GroupRef, Qu
 	return VerifiedQuiescence{}, ErrSupervisorUnavailable
 }
 
-func (UnavailableCustodian) VerifiedContainmentSupported(context.Context) error {
-	return ErrSupervisorUnavailable
+type Support struct {
+	ParkedExec          bool
+	VerifiedContainment bool
+	Platform            string
+	Reason              error
+}
+
+type Runtime struct {
+	process  ProcessCustodian
+	verifier AttestationVerifier
+	support  Support
+}
+
+func NewUnavailableRuntime(reason error) Runtime {
+	if reason == nil {
+		reason = ErrSupervisorUnavailable
+	}
+	_, verifier := NewAttestationChannel()
+	return Runtime{
+		process:  UnavailableCustodian{},
+		verifier: verifier,
+		support: Support{
+			ParkedExec:          false,
+			VerifiedContainment: false,
+			Platform:            runtime.GOOS,
+			Reason:              reason,
+		},
+	}
+}
+
+func (runtime Runtime) Process() ProcessCustodian {
+	return runtime.process
+}
+
+func (runtime Runtime) Verifier() AttestationVerifier {
+	return runtime.verifier
+}
+
+func (runtime Runtime) Support() Support {
+	return runtime.support
 }
 
 type AttestationIssuer struct {
@@ -73,8 +112,20 @@ type AttestationVerifier struct {
 }
 
 type VerifiedQuiescence struct {
-	token       *attestationToken
-	certificate model.QuiescenceCertificate
+	token   *attestationToken
+	payload PhysicalQuiescence
+}
+
+type PhysicalQuiescence struct {
+	Group  model.GroupRef
+	Method model.QuiescenceMethod
+}
+
+func (quiescence PhysicalQuiescence) Validate() error {
+	if err := quiescence.Group.Validate(); err != nil {
+		return err
+	}
+	return quiescence.Method.Validate()
 }
 
 type attestationToken struct {
@@ -86,22 +137,22 @@ func NewAttestationChannel() (AttestationIssuer, AttestationVerifier) {
 	return AttestationIssuer{token: token}, AttestationVerifier{token: token}
 }
 
-func (issuer AttestationIssuer) AttestQuiescence(certificate model.QuiescenceCertificate) (VerifiedQuiescence, error) {
+func (issuer AttestationIssuer) AttestQuiescence(quiescence PhysicalQuiescence) (VerifiedQuiescence, error) {
 	if issuer.token == nil {
 		return VerifiedQuiescence{}, ErrInvalidAttestation
 	}
-	if err := certificate.Validate(); err != nil {
+	if err := quiescence.Validate(); err != nil {
 		return VerifiedQuiescence{}, err
 	}
-	return VerifiedQuiescence{token: issuer.token, certificate: certificate}, nil
+	return VerifiedQuiescence{token: issuer.token, payload: quiescence}, nil
 }
 
-func (verifier AttestationVerifier) VerifyQuiescence(attestation VerifiedQuiescence) (model.QuiescenceCertificate, error) {
+func (verifier AttestationVerifier) VerifyQuiescence(attestation VerifiedQuiescence) (PhysicalQuiescence, error) {
 	if verifier.token == nil || attestation.token == nil || verifier.token != attestation.token {
-		return model.QuiescenceCertificate{}, ErrInvalidAttestation
+		return PhysicalQuiescence{}, ErrInvalidAttestation
 	}
-	if err := attestation.certificate.Validate(); err != nil {
-		return model.QuiescenceCertificate{}, err
+	if err := attestation.payload.Validate(); err != nil {
+		return PhysicalQuiescence{}, err
 	}
-	return attestation.certificate, nil
+	return attestation.payload, nil
 }

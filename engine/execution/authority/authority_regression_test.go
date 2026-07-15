@@ -162,6 +162,15 @@ func TestRecordQuiescenceResultMutationDoesNotRewriteStoredProof(t *testing.T) {
 	if !launch.Quiescence.Group.Equal(group) {
 		t.Fatalf("stored quiescence group = %#v, want %#v", launch.Quiescence.Group, group)
 	}
+	if !launch.Quiescence.Attempt.Equal(ref) {
+		t.Fatalf("stored quiescence attempt = %#v, want %#v", launch.Quiescence.Attempt, ref)
+	}
+	if launch.Quiescence.Ordinal != model.LaunchOrdinalOne {
+		t.Fatalf("stored quiescence ordinal = %s, want %s", launch.Quiescence.Ordinal, model.LaunchOrdinalOne)
+	}
+	if launch.Quiescence.CertifiedBy != ready.Boot() {
+		t.Fatalf("stored quiescence CertifiedBy = %#v, want authority boot %#v", launch.Quiescence.CertifiedBy, ready.Boot())
+	}
 }
 
 func TestConflictingDuplicateReceiptsFailWithoutMutation(t *testing.T) {

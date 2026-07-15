@@ -49,14 +49,18 @@ type RecoveryPlan struct {
 type GroupExistenceObservation string
 
 const (
-	GroupExistenceUnknown GroupExistenceObservation = "unknown"
-	GroupAbsent           GroupExistenceObservation = "absent"
-	GroupLive             GroupExistenceObservation = "live"
+	GroupExistenceUnknown          GroupExistenceObservation = "unknown"
+	GroupAbsent                    GroupExistenceObservation = "absent"
+	GroupLive                      GroupExistenceObservation = "live"
+	GroupExistenceContradictory    GroupExistenceObservation = "contradictory"
+	GroupExistencePermissionDenied GroupExistenceObservation = "permission_denied"
+	GroupExistenceUnsupported      GroupExistenceObservation = "unsupported"
 )
 
 func (observation GroupExistenceObservation) Validate() error {
 	switch observation {
-	case GroupExistenceUnknown, GroupAbsent, GroupLive:
+	case GroupExistenceUnknown, GroupAbsent, GroupLive, GroupExistenceContradictory,
+		GroupExistencePermissionDenied, GroupExistenceUnsupported:
 		return nil
 	default:
 		return invalid("group.existence", "is unknown")
@@ -81,29 +85,10 @@ func (observation ProcessIdentityObservation) Validate() error {
 	}
 }
 
-type DescendantObservation string
-
-const (
-	DescendantsUnknown DescendantObservation = "unknown"
-	DescendantsAbsent  DescendantObservation = "absent"
-	DescendantsPresent DescendantObservation = "present"
-)
-
-func (observation DescendantObservation) Validate() error {
-	switch observation {
-	case DescendantsUnknown, DescendantsAbsent, DescendantsPresent:
-		return nil
-	default:
-		return invalid("descendants", "is unknown")
-	}
-}
-
 type GroupRecoveryObservation struct {
-	HostBootID  string
-	Group       GroupExistenceObservation
-	Leader      ProcessIdentityObservation
-	Monitor     ProcessIdentityObservation
-	Descendants DescendantObservation
+	HostBootID string
+	Group      GroupExistenceObservation
+	Leader     ProcessIdentityObservation
 }
 
 func (observation GroupRecoveryObservation) Validate() error {
@@ -116,10 +101,7 @@ func (observation GroupRecoveryObservation) Validate() error {
 	if err := observation.Leader.Validate(); err != nil {
 		return err
 	}
-	if err := observation.Monitor.Validate(); err != nil {
-		return err
-	}
-	return observation.Descendants.Validate()
+	return nil
 }
 
 type GroupRecoveryDecision string
@@ -140,17 +122,8 @@ func DecideGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) (Gr
 	if observation.HostBootID != ref.HostBootID {
 		return GroupRecoveryQuiescent, nil
 	}
-	if observation.Descendants != DescendantsAbsent &&
-		(recordedIdentityGone(observation.Leader) || recordedIdentityGone(observation.Monitor)) {
-		return GroupRecoveryUnprovable, nil
-	}
 	if observation.Group == GroupAbsent {
-		if recordedIdentityGone(observation.Leader) &&
-			recordedIdentityGone(observation.Monitor) &&
-			observation.Descendants == DescendantsAbsent {
-			return GroupRecoveryQuiescent, nil
-		}
-		return GroupRecoveryUnprovable, nil
+		return GroupRecoveryQuiescent, nil
 	}
 	if observation.Group == GroupLive && observation.Leader == ProcessIdentityMatching {
 		return GroupRecoverySignal, nil
@@ -159,10 +132,6 @@ func DecideGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) (Gr
 		return GroupRecoveryUnprovable, nil
 	}
 	return GroupRecoveryUnprovable, nil
-}
-
-func recordedIdentityGone(observation ProcessIdentityObservation) bool {
-	return observation == ProcessIdentityMissing || observation == ProcessIdentityReused
 }
 
 func PlanRecovery(record SafetyRecord, trigger RecoveryTrigger) (RecoveryPlan, error) {

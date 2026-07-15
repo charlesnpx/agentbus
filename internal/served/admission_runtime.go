@@ -17,19 +17,12 @@ import (
 )
 
 type servedAdmissionSupervisor struct {
-	process  custodian.ProcessCustodian
-	verifier custodian.AttestationVerifier
-}
-
-type verifiedContainmentSupporter interface {
-	VerifiedContainmentSupported(context.Context) error
+	runtime custodian.Runtime
 }
 
 func newServedAdmissionSupervisor(_ *Server) *servedAdmissionSupervisor {
-	_, verifier := custodian.NewAttestationChannel()
 	return &servedAdmissionSupervisor{
-		process:  custodian.UnavailableCustodian{},
-		verifier: verifier,
+		runtime: custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable),
 	}
 }
 
@@ -37,17 +30,20 @@ func (s *servedAdmissionSupervisor) SetBoot(model.BootRef) {
 }
 
 func (s *servedAdmissionSupervisor) verifiedContainmentSupported(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s == nil {
 		return fmt.Errorf("%w: admission supervisor is nil", custodian.ErrSupervisorUnavailable)
 	}
-	if s.process == nil {
-		return fmt.Errorf("%w: process custodian is nil", custodian.ErrSupervisorUnavailable)
+	support := s.runtime.Support()
+	if support.VerifiedContainment {
+		return nil
 	}
-	reporter, ok := s.process.(verifiedContainmentSupporter)
-	if !ok {
-		return fmt.Errorf("%w: process custodian does not report verified containment support", custodian.ErrSupervisorUnavailable)
+	if support.Reason != nil {
+		return support.Reason
 	}
-	return reporter.VerifiedContainmentSupported(ctx)
+	return fmt.Errorf("%w: verified containment unsupported", custodian.ErrSupervisorUnavailable)
 }
 
 func (s *servedAdmissionSupervisor) Register(model.JobID, engine.Backend, engine.SessionOpts) error {

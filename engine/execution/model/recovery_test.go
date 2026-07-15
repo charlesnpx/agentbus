@@ -11,73 +11,134 @@ func TestDecideGroupRecoveryMatrix(t *testing.T) {
 		{name: "same_boot", id: ref.HostBootID},
 		{name: "different_boot", id: "host-boot-after-restart"},
 	}
-	groups := []GroupExistenceObservation{GroupLive, GroupAbsent}
-	identities := []ProcessIdentityObservation{ProcessIdentityMatching, ProcessIdentityMissing, ProcessIdentityReused}
-	descendants := []DescendantObservation{DescendantsPresent, DescendantsAbsent, DescendantsUnknown}
+	groups := []GroupExistenceObservation{
+		GroupLive,
+		GroupAbsent,
+		GroupExistenceUnknown,
+		GroupExistenceContradictory,
+		GroupExistencePermissionDenied,
+		GroupExistenceUnsupported,
+	}
+	identities := []ProcessIdentityObservation{
+		ProcessIdentityMatching,
+		ProcessIdentityMissing,
+		ProcessIdentityReused,
+		ProcessIdentityUnknown,
+	}
 
 	count := 0
 	for _, boot := range boots {
 		for _, group := range groups {
 			for _, leader := range identities {
-				for _, monitor := range identities {
-					for _, descendant := range descendants {
-						observation := GroupRecoveryObservation{
-							HostBootID:  boot.id,
-							Group:       group,
-							Leader:      leader,
-							Monitor:     monitor,
-							Descendants: descendant,
-						}
-						want := expectedGroupRecovery(ref, observation)
-						count++
-						t.Run(boot.name+"/"+string(group)+"/leader_"+string(leader)+"/monitor_"+string(monitor)+"/desc_"+string(descendant), func(t *testing.T) {
-							got, err := DecideGroupRecovery(ref, observation)
-							if err != nil {
-								t.Fatalf("DecideGroupRecovery error = %v", err)
-							}
-							if got != want {
-								t.Fatalf("decision = %s, want %s", got, want)
-							}
-						})
-					}
+				observation := GroupRecoveryObservation{
+					HostBootID: boot.id,
+					Group:      group,
+					Leader:     leader,
 				}
+				want := expectedGroupRecovery(ref, observation)
+				count++
+				t.Run(boot.name+"/"+string(group)+"/leader_"+string(leader), func(t *testing.T) {
+					got, err := DecideGroupRecovery(ref, observation)
+					if err != nil {
+						t.Fatalf("DecideGroupRecovery error = %v", err)
+					}
+					if got != want {
+						t.Fatalf("decision = %s, want %s", got, want)
+					}
+				})
 			}
 		}
 	}
-	if count != 108 {
-		t.Fatalf("covered %d matrix cases, want 108", count)
+	if count != 48 {
+		t.Fatalf("covered %d matrix cases, want 48", count)
 	}
 }
 
-func TestDecideGroupRecoveryUnknownObservationsFailClosedOnSameBoot(t *testing.T) {
+func TestDecideGroupRecoveryMonitorStateIsNotCorrectnessInput(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
-	tests := []GroupRecoveryObservation{
+	priorMonitorStates := []ProcessIdentityObservation{
+		ProcessIdentityMissing,
+		ProcessIdentityReused,
+		ProcessIdentityMatching,
+	}
+
+	for _, priorMonitor := range priorMonitorStates {
+		t.Run("prior_monitor_"+string(priorMonitor), func(t *testing.T) {
+			observation := GroupRecoveryObservation{
+				HostBootID: ref.HostBootID,
+				Group:      GroupLive,
+				Leader:     ProcessIdentityMatching,
+			}
+			got, err := DecideGroupRecovery(ref, observation)
+			if err != nil {
+				t.Fatalf("DecideGroupRecovery error = %v", err)
+			}
+			if got != GroupRecoverySignal {
+				t.Fatalf("decision = %s, want %s", got, GroupRecoverySignal)
+			}
+		})
+	}
+}
+
+func TestDecideGroupRecoveryFailClosedOnSameBoot(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	tests := []struct {
+		name        string
+		observation GroupRecoveryObservation
+	}{
 		{
-			HostBootID:  ref.HostBootID,
-			Group:       GroupExistenceUnknown,
-			Leader:      ProcessIdentityMissing,
-			Monitor:     ProcessIdentityMissing,
-			Descendants: DescendantsAbsent,
+			name: "unknown_group",
+			observation: GroupRecoveryObservation{
+				HostBootID: ref.HostBootID,
+				Group:      GroupExistenceUnknown,
+				Leader:     ProcessIdentityMatching,
+			},
 		},
 		{
-			HostBootID:  ref.HostBootID,
-			Group:       GroupAbsent,
-			Leader:      ProcessIdentityUnknown,
-			Monitor:     ProcessIdentityMissing,
-			Descendants: DescendantsAbsent,
+			name: "contradictory_group",
+			observation: GroupRecoveryObservation{
+				HostBootID: ref.HostBootID,
+				Group:      GroupExistenceContradictory,
+				Leader:     ProcessIdentityMatching,
+			},
 		},
 		{
-			HostBootID:  ref.HostBootID,
-			Group:       GroupAbsent,
-			Leader:      ProcessIdentityMissing,
-			Monitor:     ProcessIdentityUnknown,
-			Descendants: DescendantsAbsent,
+			name: "permission_denied_group",
+			observation: GroupRecoveryObservation{
+				HostBootID: ref.HostBootID,
+				Group:      GroupExistencePermissionDenied,
+				Leader:     ProcessIdentityMatching,
+			},
+		},
+		{
+			name: "unsupported_group",
+			observation: GroupRecoveryObservation{
+				HostBootID: ref.HostBootID,
+				Group:      GroupExistenceUnsupported,
+				Leader:     ProcessIdentityMatching,
+			},
+		},
+		{
+			name: "leader_missing_on_live_group",
+			observation: GroupRecoveryObservation{
+				HostBootID: ref.HostBootID,
+				Group:      GroupLive,
+				Leader:     ProcessIdentityMissing,
+			},
+		},
+		{
+			name: "leader_reused_on_live_group",
+			observation: GroupRecoveryObservation{
+				HostBootID: ref.HostBootID,
+				Group:      GroupLive,
+				Leader:     ProcessIdentityReused,
+			},
 		},
 	}
 
-	for _, observation := range tests {
-		t.Run(string(observation.Group)+"/leader_"+string(observation.Leader)+"/monitor_"+string(observation.Monitor), func(t *testing.T) {
-			got, err := DecideGroupRecovery(ref, observation)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := DecideGroupRecovery(ref, test.observation)
 			if err != nil {
 				t.Fatalf("DecideGroupRecovery error = %v", err)
 			}
@@ -92,27 +153,11 @@ func expectedGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) G
 	if observation.HostBootID != ref.HostBootID {
 		return GroupRecoveryQuiescent
 	}
-	if observation.Descendants != DescendantsAbsent &&
-		(recoveryTestIdentityGone(observation.Leader) || recoveryTestIdentityGone(observation.Monitor)) {
-		return GroupRecoveryUnprovable
-	}
-	if observation.Group == GroupAbsent &&
-		recoveryTestIdentityGone(observation.Leader) &&
-		recoveryTestIdentityGone(observation.Monitor) &&
-		observation.Descendants == DescendantsAbsent {
+	if observation.Group == GroupAbsent {
 		return GroupRecoveryQuiescent
 	}
 	if observation.Group == GroupLive && observation.Leader == ProcessIdentityMatching {
 		return GroupRecoverySignal
 	}
 	return GroupRecoveryUnprovable
-}
-
-func recoveryTestIdentityGone(observation ProcessIdentityObservation) bool {
-	switch observation {
-	case ProcessIdentityMissing, ProcessIdentityReused:
-		return true
-	default:
-		return false
-	}
 }

@@ -119,7 +119,7 @@ func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootst
 	}
 	options := []authority.BootstrapperOption{authority.WithAnchor(anchor)}
 	if s.admissionSupervisor != nil {
-		options = append(options, authority.WithQuiescenceVerifier(s.admissionSupervisor.verifier))
+		options = append(options, authority.WithQuiescenceVerifier(s.admissionSupervisor.runtime.Verifier()))
 	}
 	bootstrapper, err := authority.NewBootstrapper(repo, options...)
 	if err != nil {

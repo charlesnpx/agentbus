@@ -296,12 +296,9 @@ func verifiedQuiescence(t *testing.T, boot model.BootRef, ref model.AttemptRef, 
 		t.Fatalf("missing test attestation issuer for boot %s", boot.BootID)
 	}
 	issuer := value.(custodian.AttestationIssuer)
-	verified, err := issuer.AttestQuiescence(model.QuiescenceCertificate{
-		Attempt:     ref,
-		Ordinal:     ordinal,
-		Group:       group,
-		Method:      method,
-		CertifiedBy: boot,
+	verified, err := issuer.AttestQuiescence(custodian.PhysicalQuiescence{
+		Group:  group,
+		Method: method,
 	})
 	if err != nil {
 		t.Fatal(err)
