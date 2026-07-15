@@ -104,20 +104,22 @@ type ParkedHandle struct {
 	Stderr   *os.File
 	Monitor  *MonitorProcess
 
-	cmd      *exec.Cmd
-	done     <-chan error
+	wait     *processWait
 	releaser *releaseGate
 }
 
-func (handle *ParkedHandle) Done() <-chan error {
-	return handle.done
+func (handle *ParkedHandle) Done() <-chan struct{} {
+	if handle == nil || handle.wait == nil {
+		return closedProcessDone
+	}
+	return handle.wait.Done()
 }
 
 func (handle *ParkedHandle) Wait() error {
-	if handle == nil || handle.done == nil {
+	if handle == nil || handle.wait == nil {
 		return nil
 	}
-	return <-handle.done
+	return handle.wait.Wait()
 }
 
 // Release is intentionally one-use. Launch already sent the release; calling
@@ -234,10 +236,9 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	}
 	pipes.closeWorkerCopiesInParent()
 
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
+	workerProcess := cmd.Process
+	workerPID := workerProcess.Pid
+	wait := startProcessWait(cmd)
 
 	started := true
 	released := false
@@ -248,7 +249,7 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	preIdentityAbort := func(cause error) error {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
-		if err := terminateStartedProcess(cleanupCtx, cmd.Process, done); err != nil {
+		if err := terminateStartedProcess(cleanupCtx, workerProcess, wait.Done()); err != nil {
 			return errors.Join(cause, fmt.Errorf("terminate parked worker before identity: %w", err))
 		}
 		return cause
@@ -259,12 +260,12 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 		}
 	}()
 	if spec.hooks.afterWorkerStarted != nil {
-		if err := spec.hooks.afterWorkerStarted(cmd.Process.Pid); err != nil {
+		if err := spec.hooks.afterWorkerStarted(workerPID); err != nil {
 			return nil, preIdentityAbort(err)
 		}
 	}
 
-	workerClaim, err := waitProcessGroupLeaderClaim(ctx, spec.identity, cmd.Process.Pid)
+	workerClaim, err := waitProcessGroupLeaderClaim(ctx, spec.identity, workerPID)
 	if err != nil {
 		return nil, preIdentityAbort(fmt.Errorf("%w: read worker identity before bootstrap: %v", ErrIdentityMismatch, err))
 	}
@@ -353,8 +354,7 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 		Stdout:   pipes.backendStdoutRead,
 		Stderr:   pipes.backendStderrRead,
 		Monitor:  monitor,
-		cmd:      cmd,
-		done:     done,
+		wait:     wait,
 		releaser: releaser,
 	}
 	pipes.disownBackendParentFiles()
@@ -480,8 +480,8 @@ func verifyMonitorReadyIdentity(reader identityReader, monitor *MonitorProcess, 
 		return fmt.Errorf("%w: monitor process is nil", ErrMonitorNotArmed)
 	}
 	select {
-	case <-monitor.wait.exited:
-		return fmt.Errorf("%w: monitor exited before final identity check: %v", ErrMonitorNotArmed, monitor.wait.Err())
+	case <-monitor.Done():
+		return fmt.Errorf("%w: monitor exited before final identity check: %v", ErrMonitorNotArmed, monitor.Wait())
 	default:
 	}
 	reread, err := reader.ReadProcessClaim(monitor.PID)
@@ -511,8 +511,8 @@ func verifyMonitorReadyIdentity(reader identityReader, monitor *MonitorProcess, 
 		return fmt.Errorf("%w: group ref does not bind monitor identity", ErrIdentityMismatch)
 	}
 	select {
-	case <-monitor.wait.exited:
-		return fmt.Errorf("%w: monitor exited after final identity check: %v", ErrMonitorNotArmed, monitor.wait.Err())
+	case <-monitor.Done():
+		return fmt.Errorf("%w: monitor exited after final identity check: %v", ErrMonitorNotArmed, monitor.Wait())
 	default:
 	}
 	return nil
@@ -622,7 +622,7 @@ func containTargetGroup(containment Containment, group model.GroupRef) error {
 }
 
 func waitArmedMonitorCleanup(reader identityReader, monitor *MonitorProcess, group model.GroupRef) error {
-	if monitor == nil || monitor.done == nil {
+	if monitor == nil || monitor.wait == nil {
 		return nil
 	}
 	if reader == nil {
@@ -664,9 +664,9 @@ func waitArmedMonitorCleanup(reader identityReader, monitor *MonitorProcess, gro
 		}
 
 		select {
-		case err := <-monitor.done:
+		case <-monitor.Done():
 			monitorExited = true
-			monitorErr = err
+			monitorErr = monitor.Wait()
 		case <-ctx.Done():
 			return fmt.Errorf("timeout waiting for armed monitor cleanup; target group observation=%s", lastObservation)
 		case <-ticker.C:
@@ -683,31 +683,31 @@ func targetGroupObservation(reader identityReader, group model.GroupRef) model.G
 }
 
 func waitMonitorExitAfterTargetAbsent(ctx context.Context, process *MonitorProcess) error {
-	if process == nil || process.done == nil || process.cmd == nil || process.cmd.Process == nil {
+	if process == nil || process.wait == nil {
 		return nil
 	}
 	select {
-	case err := <-process.done:
-		return err
+	case <-process.Done():
+		return process.Wait()
 	default:
 	}
 	select {
-	case err := <-process.done:
-		return err
+	case <-process.Done():
+		return process.Wait()
 	case <-ctx.Done():
 	}
-	killErr := process.cmd.Process.Kill()
+	killErr := process.kill()
 	timer := time.NewTimer(100 * time.Millisecond)
 	defer timer.Stop()
 	select {
-	case err := <-process.done:
-		return errors.Join(ctx.Err(), killErr, err)
+	case <-process.Done():
+		return errors.Join(ctx.Err(), killErr, process.Wait())
 	case <-timer.C:
 		return errors.Join(ctx.Err(), killErr)
 	}
 }
 
-func terminateStartedProcess(ctx context.Context, process *os.Process, done <-chan error) error {
+func terminateStartedProcess(ctx context.Context, process *os.Process, done <-chan struct{}) error {
 	if process == nil || done == nil {
 		return nil
 	}

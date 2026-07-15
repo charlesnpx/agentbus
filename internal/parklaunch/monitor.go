@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -41,24 +42,52 @@ type MonitorProcess struct {
 
 	DaemonControlWrite *os.File
 
-	cmd         *exec.Cmd
+	process     *os.Process
 	targetWrite *os.File
 	readyRead   *os.File
 	wait        *processWait
-	done        <-chan error
+	filesMu     sync.Mutex
+	stopOnce    sync.Once
+	stopErr     error
 	bindOnce    sync.Once
 	bindErr     error
 }
 
-func (process *MonitorProcess) Done() <-chan error {
-	return process.done
+var closedProcessDone = func() <-chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
+}()
+
+func (process *MonitorProcess) Done() <-chan struct{} {
+	if process == nil || process.wait == nil {
+		return closedProcessDone
+	}
+	return process.wait.Done()
 }
 
 func (process *MonitorProcess) Wait() error {
-	if process == nil || process.done == nil {
+	if process == nil || process.wait == nil {
 		return nil
 	}
-	return <-process.done
+	return process.wait.Wait()
+}
+
+func (process *MonitorProcess) Stop(ctx context.Context) error {
+	if process == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	process.stopOnce.Do(func() {
+		process.stopErr = errors.Join(
+			closeMonitorTarget(process),
+			closeMonitorReady(process),
+			closeMonitorDaemonControl(process),
+		)
+	})
+	return errors.Join(process.stopErr, process.waitOrKillAfterContext(ctx, 100*time.Millisecond))
 }
 
 func (process *MonitorProcess) BindTarget(group model.GroupRef) error {
@@ -75,12 +104,25 @@ func (process *MonitorProcess) BindTarget(group model.GroupRef) error {
 			process.bindErr = err
 			return
 		}
-		if _, err := process.targetWrite.Write(raw); err != nil {
+		process.filesMu.Lock()
+		targetWrite := process.targetWrite
+		process.filesMu.Unlock()
+		if targetWrite == nil {
+			process.bindErr = fmt.Errorf("%w: monitor target writer is closed", ErrMonitorNotArmed)
+			return
+		}
+		if _, err := targetWrite.Write(raw); err != nil {
 			process.bindErr = err
 			return
 		}
-		process.bindErr = process.targetWrite.Close()
-		process.targetWrite = nil
+		process.filesMu.Lock()
+		if process.targetWrite == targetWrite {
+			process.targetWrite = nil
+			process.filesMu.Unlock()
+			process.bindErr = targetWrite.Close()
+			return
+		}
+		process.filesMu.Unlock()
 	})
 	return process.bindErr
 }
@@ -151,15 +193,15 @@ func StartMonitorProcess(ctx context.Context, spec MonitorProcessSpec) (*Monitor
 	_ = targetRead.Close()
 	_ = readyWrite.Close()
 
+	startedProcess := cmd.Process
 	wait := startProcessWait(cmd)
 	return &MonitorProcess{
-		PID:                cmd.Process.Pid,
+		PID:                startedProcess.Pid,
 		DaemonControlWrite: daemonWrite,
-		cmd:                cmd,
+		process:            startedProcess,
 		targetWrite:        targetWrite,
 		readyRead:          readyRead,
 		wait:               wait,
-		done:               wait.done,
 	}, nil
 }
 
@@ -170,10 +212,12 @@ func (process *MonitorProcess) WaitReady(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if process.readyRead == nil {
+	process.filesMu.Lock()
+	readyRead := process.readyRead
+	process.filesMu.Unlock()
+	if readyRead == nil {
 		return nil
 	}
-	readyRead := process.readyRead
 	readDone := make(chan error, 1)
 	go func() {
 		var ack [1]byte
@@ -190,10 +234,7 @@ func (process *MonitorProcess) WaitReady(ctx context.Context) error {
 	timer := time.NewTimer(2 * time.Second)
 	defer timer.Stop()
 	defer func() {
-		_ = readyRead.Close()
-		if process.readyRead == readyRead {
-			process.readyRead = nil
-		}
+		_ = closeMonitorReady(process)
 	}()
 	select {
 	case err := <-readDone:
@@ -201,8 +242,8 @@ func (process *MonitorProcess) WaitReady(ctx context.Context) error {
 			return fmt.Errorf("%w: read readiness ack: %v", ErrMonitorNotArmed, err)
 		}
 		return nil
-	case <-process.wait.exited:
-		return fmt.Errorf("%w: monitor exited before readiness: %v", ErrMonitorNotArmed, process.wait.Err())
+	case <-process.Done():
+		return fmt.Errorf("%w: monitor exited before readiness: %v", ErrMonitorNotArmed, process.Wait())
 	case <-ctx.Done():
 		return fmt.Errorf("%w: %v", ErrMonitorNotArmed, ctx.Err())
 	case <-timer.C:
@@ -317,70 +358,145 @@ func readMonitorTarget(r io.Reader) (model.GroupRef, error) {
 }
 
 func closeMonitorTarget(process *MonitorProcess) error {
-	if process == nil || process.targetWrite == nil {
+	if process == nil {
 		return nil
 	}
-	err := process.targetWrite.Close()
+	process.filesMu.Lock()
+	targetWrite := process.targetWrite
 	process.targetWrite = nil
-	return err
+	process.filesMu.Unlock()
+	if targetWrite == nil {
+		return nil
+	}
+	return targetWrite.Close()
 }
 
 func closeMonitorReady(process *MonitorProcess) error {
-	if process == nil || process.readyRead == nil {
+	if process == nil {
 		return nil
 	}
-	err := process.readyRead.Close()
+	process.filesMu.Lock()
+	readyRead := process.readyRead
 	process.readyRead = nil
-	return err
+	process.filesMu.Unlock()
+	if readyRead == nil {
+		return nil
+	}
+	return readyRead.Close()
 }
 
 func closeMonitorDaemonControl(process *MonitorProcess) error {
-	if process == nil || process.DaemonControlWrite == nil {
+	if process == nil {
 		return nil
 	}
-	err := process.DaemonControlWrite.Close()
+	process.filesMu.Lock()
+	daemonControlWrite := process.DaemonControlWrite
 	process.DaemonControlWrite = nil
-	return err
+	process.filesMu.Unlock()
+	if daemonControlWrite == nil {
+		return nil
+	}
+	return daemonControlWrite.Close()
 }
 
 func waitMonitorOrKill(process *MonitorProcess) error {
-	if process == nil || process.cmd == nil || process.cmd.Process == nil {
+	if process == nil {
 		return nil
 	}
 	select {
-	case err := <-process.done:
-		return err
+	case <-process.Done():
+		return process.Wait()
 	default:
-		_ = process.cmd.Process.Kill()
-		return <-process.done
+		_ = process.kill()
+		return process.Wait()
 	}
 }
 
 type processWait struct {
-	done   chan error
-	exited chan struct{}
-	mu     sync.Mutex
-	err    error
+	done chan struct{}
+	mu   sync.Mutex
+	err  error
 }
 
 func startProcessWait(cmd *exec.Cmd) *processWait {
 	wait := &processWait{
-		done:   make(chan error, 1),
-		exited: make(chan struct{}),
+		done: make(chan struct{}),
 	}
 	go func() {
 		err := cmd.Wait()
 		wait.mu.Lock()
 		wait.err = err
 		wait.mu.Unlock()
-		wait.done <- err
-		close(wait.exited)
+		close(wait.done)
 	}()
 	return wait
 }
 
+func (wait *processWait) Done() <-chan struct{} {
+	if wait == nil {
+		return closedProcessDone
+	}
+	return wait.done
+}
+
+func (wait *processWait) Wait() error {
+	if wait == nil {
+		return nil
+	}
+	<-wait.done
+	return wait.errLocked()
+}
+
 func (wait *processWait) Err() error {
+	if wait == nil {
+		return nil
+	}
+	<-wait.done
+	return wait.errLocked()
+}
+
+func (wait *processWait) errLocked() error {
 	wait.mu.Lock()
 	defer wait.mu.Unlock()
 	return wait.err
+}
+
+func (process *MonitorProcess) kill() error {
+	if process == nil || process.process == nil {
+		return nil
+	}
+	select {
+	case <-process.Done():
+		return nil
+	default:
+	}
+	return process.process.Kill()
+}
+
+func (process *MonitorProcess) waitOrKillAfterContext(ctx context.Context, killWait time.Duration) error {
+	if process == nil || process.wait == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-process.Done():
+		return process.Wait()
+	default:
+	}
+	select {
+	case <-process.Done():
+		return process.Wait()
+	case <-ctx.Done():
+	}
+	killErr := process.kill()
+	timer := time.NewTimer(killWait)
+	defer timer.Stop()
+	select {
+	case <-process.Done():
+		return errors.Join(ctx.Err(), killErr, process.Wait())
+	case <-timer.C:
+		return errors.Join(ctx.Err(), killErr)
+	}
 }

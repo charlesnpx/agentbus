@@ -230,6 +230,49 @@ func TestMonitorDaemonEOFContainsExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestMonitorStopConcurrentWithWaitIsRaceFree(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "containment.log")
+	monitor := startTestMonitor(t, ctx, marker)
+	target := syntheticGroupRef(424243, monitor.PID)
+	if err := monitor.BindTarget(target); err != nil {
+		t.Fatalf("BindTarget() error = %v", err)
+	}
+	if err := monitor.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady() error = %v", err)
+	}
+
+	const goroutines = 8
+	start := make(chan struct{})
+	results := make(chan error, goroutines*2)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			<-start
+			results <- monitor.Stop(ctx)
+		}()
+		go func() {
+			<-start
+			<-monitor.Done()
+			results <- monitor.Wait()
+		}()
+	}
+	close(start)
+	for i := 0; i < goroutines*2; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent monitor stop/wait error = %v", err)
+		}
+	}
+	if err := monitor.Wait(); err != nil {
+		t.Fatalf("repeat monitor wait error = %v", err)
+	}
+	lines := readLines(t, marker)
+	if len(lines) != 1 {
+		t.Fatalf("monitor containment lines = %d (%v), want 1", len(lines), lines)
+	}
+}
+
 func TestLaunchFDOwnership(t *testing.T) {
 	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: fdRange(3, 32)})
 	fdScanResult := filepath.Join(t.TempDir(), "fd-scan.json")
@@ -997,24 +1040,12 @@ func cleanupParkedHandle(t *testing.T, handle *ParkedHandle) {
 
 func stopMonitor(t *testing.T, monitor *MonitorProcess) {
 	t.Helper()
-	if monitor == nil || monitor.cmd == nil || monitor.cmd.Process == nil {
+	if monitor == nil {
 		return
 	}
-	if monitor.cmd.ProcessState != nil && monitor.cmd.ProcessState.Exited() {
-		return
-	}
-	select {
-	case <-monitor.done:
-		return
-	default:
-	}
-	_ = closeMonitorTarget(monitor)
-	_ = closeMonitorReady(monitor)
-	_ = closeMonitorDaemonControl(monitor)
-	_ = monitor.cmd.Process.Kill()
-	select {
-	case <-monitor.done:
-	case <-time.After(5 * time.Second):
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := monitor.Stop(ctx); errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("monitor pid %d did not exit", monitor.PID)
 	}
 }
@@ -1047,8 +1078,8 @@ func waitPIDAbsent(t *testing.T, pid int) {
 func waitMonitorSuccess(t *testing.T, monitor *MonitorProcess) {
 	t.Helper()
 	select {
-	case err := <-monitor.done:
-		if err != nil {
+	case <-monitor.Done():
+		if err := monitor.Wait(); err != nil {
 			t.Fatalf("monitor wait error = %v", err)
 		}
 	case <-time.After(5 * time.Second):
