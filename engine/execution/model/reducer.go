@@ -258,7 +258,7 @@ func applyCommitGrant(next *SafetyRecord, current SafetyRecord, command CommitGr
 	if !acceptedOrAcknowledged(current) {
 		return false, precondition("grant commit requires accepted or acknowledged state")
 	}
-	nextLaunch := *launch
+	nextLaunch := *cloneLaunchProof(launch)
 	nextLaunch.Grant = &grant
 	return replaceLaunchSlot(&next.Attempt.Launches, command.Ordinal, nextLaunch)
 }
@@ -302,7 +302,7 @@ func applyRecordRelease(next *SafetyRecord, current SafetyRecord, command Record
 	if launch.Quiescence != nil {
 		return false, precondition("new launch release cannot follow quiescence")
 	}
-	nextLaunch := *launch
+	nextLaunch := *cloneLaunchProof(launch)
 	nextLaunch.Released = &release
 	return replaceLaunchSlot(&next.Attempt.Launches, command.Ordinal, nextLaunch)
 }
@@ -331,7 +331,7 @@ func applyRecordQuiescence(next *SafetyRecord, current SafetyRecord, command Rec
 		}
 		return false, conflict("quiescence already recorded with different evidence")
 	}
-	nextLaunch := *launch
+	nextLaunch := *cloneLaunchProof(launch)
 	nextLaunch.Quiescence = &receipt
 	return replaceLaunchSlot(&next.Attempt.Launches, receipt.Ordinal, nextLaunch)
 }
@@ -715,11 +715,23 @@ func cloneSafetyRecord(record SafetyRecord) SafetyRecord {
 	return next
 }
 
-func cloneLaunchSlots[T any](slots LaunchSlots[T]) LaunchSlots[T] {
-	return LaunchSlots[T]{
-		First:  clonePtr(slots.First),
-		Second: clonePtr(slots.Second),
+func cloneLaunchSlots(slots LaunchSlots[LaunchProof]) LaunchSlots[LaunchProof] {
+	return LaunchSlots[LaunchProof]{
+		First:  cloneLaunchProof(slots.First),
+		Second: cloneLaunchProof(slots.Second),
 	}
+}
+
+func cloneLaunchProof(launch *LaunchProof) *LaunchProof {
+	if launch == nil {
+		return nil
+	}
+	copied := *launch
+	copied.Group = clonePtr(launch.Group)
+	copied.Grant = clonePtr(launch.Grant)
+	copied.Released = clonePtr(launch.Released)
+	copied.Quiescence = clonePtr(launch.Quiescence)
+	return &copied
 }
 
 func clonePtr[T any](value *T) *T {

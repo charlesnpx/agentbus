@@ -214,9 +214,7 @@ func (ref GroupRef) Equal(other GroupRef) bool {
 func (ref GroupRef) SamePhysicalIdentity(other GroupRef) bool {
 	return ref.HostBootID == other.HostBootID &&
 		ref.PGID == other.PGID &&
-		ref.Leader.Equal(other.Leader) &&
-		ref.Monitor.Equal(other.Monitor) &&
-		ref.RetainedID == other.RetainedID
+		ref.Leader.Equal(other.Leader)
 }
 
 type AcknowledgementFact struct {

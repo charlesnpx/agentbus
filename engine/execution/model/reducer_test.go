@@ -213,6 +213,37 @@ func TestAuthorizeSecondOrdinalRejectsSharedCustodyOrPhysicalIdentity(t *testing
 		t.Fatalf("shared physical identity bind error = %v, want ErrConflictingDuplicate", err)
 	}
 
+	for _, tt := range []struct {
+		name   string
+		mutate func(*GroupRef)
+	}{
+		{
+			name: "different monitor",
+			mutate: func(group *GroupRef) {
+				group.Monitor = ProcessIdentity{PID: first.Group.Monitor.PID + 100, HighResStartToken: "different-monitor"}
+				group.RetainedID = first.Group.RetainedID
+			},
+		},
+		{
+			name: "different retained id",
+			mutate: func(group *GroupRef) {
+				group.Monitor = first.Group.Monitor
+				group.RetainedID = "different-retained"
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			sharedTarget := reducerGroup(LaunchOrdinalTwo)
+			sharedTarget.HostBootID = first.Group.HostBootID
+			sharedTarget.PGID = first.Group.PGID
+			sharedTarget.Leader = first.Group.Leader
+			tt.mutate(&sharedTarget)
+			if _, err := apply(record, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: sharedTarget}); !errors.Is(err, ErrConflictingDuplicate) {
+				t.Fatalf("shared target identity bind error = %v, want ErrConflictingDuplicate", err)
+			}
+		})
+	}
+
 	forged := cloneSafetyRecord(record)
 	forged.Attempt.Launches.Second = &LaunchProof{Ordinal: LaunchOrdinalTwo, Group: &sharedPhysical}
 	if err := ValidateSafetyRecord(forged); !errors.Is(err, ErrInvalidValue) {
@@ -242,6 +273,43 @@ func TestStaleActionReceiptCannotCertifyDifferentAttemptOrGroup(t *testing.T) {
 	}
 	if !reflect.DeepEqual(record, before) {
 		t.Fatal("wrong group receipt mutated input record")
+	}
+}
+
+func TestApplyDeepClonesLaunchProofPointers(t *testing.T) {
+	record := reducerConsumedRecord(t)
+	inputLaunch, ok := record.Attempt.Launches.Get(LaunchOrdinalOne)
+	if !ok || inputLaunch.Group == nil || inputLaunch.Grant == nil || inputLaunch.Released == nil {
+		t.Fatal("input launch proof is incomplete")
+	}
+	beforeGroup := *inputLaunch.Group
+	beforeGrant := *inputLaunch.Grant
+	beforeRelease := *inputLaunch.Released
+
+	result, err := apply(record, reducerQuiescenceCommand(t, record, LaunchOrdinalOne))
+	if err != nil {
+		t.Fatalf("record quiescence error = %v", err)
+	}
+	outputLaunch, ok := result.Record.Attempt.Launches.Get(LaunchOrdinalOne)
+	if !ok || outputLaunch.Group == nil || outputLaunch.Grant == nil || outputLaunch.Released == nil || outputLaunch.Quiescence == nil {
+		t.Fatal("output launch proof is incomplete")
+	}
+	outputLaunch.Group.PGID++
+	outputLaunch.Group.Leader.PID++
+	outputLaunch.Group.Leader.HighResStartToken = "forged-leader"
+	outputLaunch.Grant.Nonce = "forged-nonce"
+	outputLaunch.Released.Child.PID++
+	outputLaunch.Released.Child.HighResStartToken = "forged-child"
+	outputLaunch.Quiescence.Group = *outputLaunch.Group
+
+	if !inputLaunch.Group.Equal(beforeGroup) {
+		t.Fatalf("input group mutated through output alias: %#v, want %#v", *inputLaunch.Group, beforeGroup)
+	}
+	if *inputLaunch.Grant != beforeGrant {
+		t.Fatalf("input grant mutated through output alias: %#v, want %#v", *inputLaunch.Grant, beforeGrant)
+	}
+	if *inputLaunch.Released != beforeRelease {
+		t.Fatalf("input release mutated through output alias: %#v, want %#v", *inputLaunch.Released, beforeRelease)
 	}
 }
 

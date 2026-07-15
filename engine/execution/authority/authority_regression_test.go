@@ -126,6 +126,44 @@ func TestDuplicateReceiptsAreNoopWithoutRevisionOrGenerationAdvance(t *testing.T
 	assertNoopApply(t, "duplicate retirement receipt", retired, duplicateRetire)
 }
 
+func TestRecordQuiescenceResultMutationDoesNotRewriteStoredProof(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	ready := newReady(t, repo, "quiescence-alias")
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "quiescence-alias"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := accepted.Record.Attempt.Ref
+	group := groupRef(ref, model.LaunchOrdinalOne)
+	if _, err := ready.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := ready.RecordQuiescence(ctx, accepted.Record.JobID, model.LaunchOrdinalOne, verifiedQuiescence(t, ready.Boot(), ref, model.LaunchOrdinalOne, group, model.QuiescenceAlreadyAbsent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := repo.SnapshotBytes()
+
+	mutateLaunchPhysicalFact(t, &applied.Record, model.LaunchOrdinalOne)
+
+	assertBytesEqual(t, "repository snapshot after returned record mutation", before, repo.SnapshotBytes())
+	image, err := ready.LoadJob(ctx, accepted.Record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch, ok := image.Safety.Value.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || launch.Group == nil || launch.Quiescence == nil {
+		t.Fatalf("stored launch after returned record mutation = %#v", launch)
+	}
+	if !launch.Group.Equal(group) {
+		t.Fatalf("stored group = %#v, want %#v", *launch.Group, group)
+	}
+	if !launch.Quiescence.Group.Equal(group) {
+		t.Fatalf("stored quiescence group = %#v, want %#v", launch.Quiescence.Group, group)
+	}
+}
+
 func TestConflictingDuplicateReceiptsFailWithoutMutation(t *testing.T) {
 	ctx := context.Background()
 	repo := memory.NewRepository()
@@ -251,4 +289,20 @@ func assertBytesEqual(t *testing.T, label string, before, after []byte) {
 	if !bytes.Equal(before, after) {
 		t.Fatalf("%s changed\nbefore: %s\nafter:  %s", label, before, after)
 	}
+}
+
+func mutateLaunchPhysicalFact(t *testing.T, record *model.SafetyRecord, ordinal model.LaunchOrdinal) {
+	t.Helper()
+	launch, ok := record.Attempt.Launches.Get(ordinal)
+	if !ok || launch.Group == nil || launch.Quiescence == nil {
+		t.Fatalf("launch %s is missing group or quiescence", ordinal)
+	}
+	launch.Group.CustodyID = model.CustodyID("custody-forged-" + record.JobID.String())
+	launch.Group.PGID += 1000
+	launch.Group.Leader.PID += 1000
+	launch.Group.Leader.HighResStartToken = "forged-leader"
+	launch.Group.Monitor.PID += 1000
+	launch.Group.Monitor.HighResStartToken = "forged-monitor"
+	launch.Group.RetainedID = "forged-retained-" + record.JobID.String()
+	launch.Quiescence.Group = *launch.Group
 }

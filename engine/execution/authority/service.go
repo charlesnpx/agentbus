@@ -586,6 +586,18 @@ func cloneLaunchProofForAuthority(launch *model.LaunchProof) *model.LaunchProof 
 		return nil
 	}
 	copied := *launch
+	copied.Group = clonePtrForAuthority(launch.Group)
+	copied.Grant = clonePtrForAuthority(launch.Grant)
+	copied.Released = clonePtrForAuthority(launch.Released)
+	copied.Quiescence = clonePtrForAuthority(launch.Quiescence)
+	return &copied
+}
+
+func clonePtrForAuthority[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	copied := *value
 	return &copied
 }
 

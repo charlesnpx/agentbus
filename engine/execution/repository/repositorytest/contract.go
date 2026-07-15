@@ -260,6 +260,33 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 		}
 	})
 
+	t.Run("safety launch proof pointers are isolated", func(t *testing.T) {
+		repo := factory.New(t)
+		fixture := newQuiescentFixture(t, "launch-clone")
+		want := cloneSafetyRecordForTest(fixture.Record)
+
+		_, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+			if _, err := tx.AllocateJobID(); err != nil {
+				return err
+			}
+			if err := putAcceptance(tx, fixture); err != nil {
+				return err
+			}
+			mutateLaunchPhysicalFactForTest(t, &fixture.Record, model.LaunchOrdinalOne)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("launch clone acceptance Update error = %v", err)
+		}
+		assertJobSafetyRecord(t, repo, fixture.JobID, want)
+
+		before := factory.Snapshot(t, repo)
+		loaded := loadSafetyRecord(t, repo, fixture.JobID)
+		mutateLaunchPhysicalFactForTest(t, &loaded, model.LaunchOrdinalOne)
+		assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
+		assertJobSafetyRecord(t, repo, fixture.JobID, want)
+	})
+
 	t.Run("expiry atomically replaces live records with tombstone", func(t *testing.T) {
 		repo := factory.New(t)
 		fixture := newFixture(t, "expiry")
@@ -435,6 +462,55 @@ func newFixture(t *testing.T, name string) fixture {
 	}
 }
 
+func newQuiescentFixture(t *testing.T, name string) fixture {
+	t.Helper()
+	fixture := newFixture(t, name)
+	group := fixtureGroupRef(fixture, model.LaunchOrdinalOne)
+	quiescence := model.QuiescenceCertificate{
+		Attempt:     fixture.Record.Attempt.Ref,
+		Ordinal:     model.LaunchOrdinalOne,
+		Group:       group,
+		Method:      model.QuiescenceAlreadyAbsent,
+		CertifiedBy: fixture.Boot,
+	}
+	fixture.Record.Attempt.Launches.First = &model.LaunchProof{
+		Ordinal:    model.LaunchOrdinalOne,
+		Group:      &group,
+		Quiescence: &quiescence,
+	}
+	if err := model.ValidateSafetyRecord(fixture.Record); err != nil {
+		t.Fatalf("quiescent fixture safety record is invalid: %v", err)
+	}
+	projection, err := model.Project(fixture.Record, model.ProjectionMetadata{SessionID: "session-" + name})
+	if err != nil {
+		t.Fatalf("Project quiescent fixture: %v", err)
+	}
+	fixture.Projection = projection
+	return fixture
+}
+
+func fixtureGroupRef(fixture fixture, ordinal model.LaunchOrdinal) model.GroupRef {
+	return model.GroupRef{
+		Version:   1,
+		CustodyID: model.CustodyID("custody-" + fixture.JobID.String() + "-" + ordinal.String()),
+		Launch: model.LaunchKey{
+			Attempt: fixture.Record.Attempt.Ref,
+			Ordinal: ordinal,
+		},
+		HostBootID: "host-boot-" + fixture.JobID.String(),
+		PGID:       10 + int(ordinal),
+		Leader: model.ProcessIdentity{
+			PID:               20 + int(ordinal),
+			HighResStartToken: "leader-start-" + ordinal.String(),
+		},
+		Monitor: model.ProcessIdentity{
+			PID:               30 + int(ordinal),
+			HighResStartToken: "monitor-start-" + ordinal.String(),
+		},
+		RetainedID: "retained-" + fixture.JobID.String() + "-" + ordinal.String(),
+	}
+}
+
 func acceptFixture(t *testing.T, repo repository.Repository, fixture fixture) repository.Commit {
 	t.Helper()
 	commit, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
@@ -478,6 +554,30 @@ func assertRequestBinding(t *testing.T, repo repository.Repository, binding mode
 	}
 }
 
+func loadSafetyRecord(t *testing.T, repo repository.Repository, jobID model.JobID) model.SafetyRecord {
+	t.Helper()
+	var record model.SafetyRecord
+	if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+		job := tx.LoadJob(jobID)
+		if job.Safety.State != repository.RecordValid {
+			return fmt.Errorf("job safety state = %s, want valid", job.Safety.State)
+		}
+		record = job.Safety.Value
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return record
+}
+
+func assertJobSafetyRecord(t *testing.T, repo repository.Repository, jobID model.JobID, want model.SafetyRecord) {
+	t.Helper()
+	got := loadSafetyRecord(t, repo, jobID)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("safety = %#v, want %#v", got, want)
+	}
+}
+
 func assertJobImage(t *testing.T, repo repository.Repository, fixture fixture) {
 	t.Helper()
 	if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
@@ -508,4 +608,54 @@ func assertSnapshotUnchanged(t *testing.T, before, after []byte) {
 	if !bytes.Equal(before, after) {
 		t.Fatalf("snapshot changed after rejected transaction\nbefore: %s\nafter:  %s", before, after)
 	}
+}
+
+func mutateLaunchPhysicalFactForTest(t *testing.T, record *model.SafetyRecord, ordinal model.LaunchOrdinal) {
+	t.Helper()
+	launch, ok := record.Attempt.Launches.Get(ordinal)
+	if !ok || launch.Group == nil || launch.Quiescence == nil {
+		t.Fatalf("launch %s is missing group or quiescence", ordinal)
+	}
+	launch.Group.CustodyID = model.CustodyID("custody-forged-" + record.JobID.String())
+	launch.Group.PGID += 1000
+	launch.Group.Leader.PID += 1000
+	launch.Group.Leader.HighResStartToken = "forged-leader"
+	launch.Group.Monitor.PID += 1000
+	launch.Group.Monitor.HighResStartToken = "forged-monitor"
+	launch.Group.RetainedID = "forged-retained-" + record.JobID.String()
+	launch.Quiescence.Group = *launch.Group
+}
+
+func cloneSafetyRecordForTest(record model.SafetyRecord) model.SafetyRecord {
+	next := record
+	next.Attempt.Launches = model.LaunchSlots[model.LaunchProof]{
+		First:  cloneLaunchProofForTest(record.Attempt.Launches.First),
+		Second: cloneLaunchProofForTest(record.Attempt.Launches.Second),
+	}
+	next.Acknowledgement = clonePtrForTest(record.Acknowledgement)
+	next.Cancel = clonePtrForTest(record.Cancel)
+	next.Outcome = clonePtrForTest(record.Outcome)
+	next.Result = clonePtrForTest(record.Result)
+	next.Terminal = clonePtrForTest(record.Terminal)
+	return next
+}
+
+func cloneLaunchProofForTest(launch *model.LaunchProof) *model.LaunchProof {
+	if launch == nil {
+		return nil
+	}
+	copied := *launch
+	copied.Group = clonePtrForTest(launch.Group)
+	copied.Grant = clonePtrForTest(launch.Grant)
+	copied.Released = clonePtrForTest(launch.Released)
+	copied.Quiescence = clonePtrForTest(launch.Quiescence)
+	return &copied
+}
+
+func clonePtrForTest[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
 }

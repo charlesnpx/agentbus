@@ -744,11 +744,23 @@ func cloneSafetyRecord(record model.SafetyRecord) model.SafetyRecord {
 	return next
 }
 
-func cloneLaunchSlots[T any](slots model.LaunchSlots[T]) model.LaunchSlots[T] {
-	return model.LaunchSlots[T]{
-		First:  clonePtr(slots.First),
-		Second: clonePtr(slots.Second),
+func cloneLaunchSlots(slots model.LaunchSlots[model.LaunchProof]) model.LaunchSlots[model.LaunchProof] {
+	return model.LaunchSlots[model.LaunchProof]{
+		First:  cloneLaunchProof(slots.First),
+		Second: cloneLaunchProof(slots.Second),
 	}
+}
+
+func cloneLaunchProof(launch *model.LaunchProof) *model.LaunchProof {
+	if launch == nil {
+		return nil
+	}
+	copied := *launch
+	copied.Group = clonePtr(launch.Group)
+	copied.Grant = clonePtr(launch.Grant)
+	copied.Released = clonePtr(launch.Released)
+	copied.Quiescence = clonePtr(launch.Quiescence)
+	return &copied
 }
 
 func clonePtr[T any](value *T) *T {
