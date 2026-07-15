@@ -4,143 +4,115 @@ import "testing"
 
 func TestDecideGroupRecoveryMatrix(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
-	tests := []struct {
-		name        string
-		observation GroupRecoveryObservation
-		want        GroupRecoveryDecision
+	boots := []struct {
+		name string
+		id   string
 	}{
+		{name: "same_boot", id: ref.HostBootID},
+		{name: "different_boot", id: "host-boot-after-restart"},
+	}
+	groups := []GroupExistenceObservation{GroupLive, GroupAbsent}
+	identities := []ProcessIdentityObservation{ProcessIdentityMatching, ProcessIdentityMissing, ProcessIdentityReused}
+	descendants := []DescendantObservation{DescendantsPresent, DescendantsAbsent, DescendantsUnknown}
+
+	count := 0
+	for _, boot := range boots {
+		for _, group := range groups {
+			for _, leader := range identities {
+				for _, monitor := range identities {
+					for _, descendant := range descendants {
+						observation := GroupRecoveryObservation{
+							HostBootID:  boot.id,
+							Group:       group,
+							Leader:      leader,
+							Monitor:     monitor,
+							Descendants: descendant,
+						}
+						want := expectedGroupRecovery(ref, observation)
+						count++
+						t.Run(boot.name+"/"+string(group)+"/leader_"+string(leader)+"/monitor_"+string(monitor)+"/desc_"+string(descendant), func(t *testing.T) {
+							got, err := DecideGroupRecovery(ref, observation)
+							if err != nil {
+								t.Fatalf("DecideGroupRecovery error = %v", err)
+							}
+							if got != want {
+								t.Fatalf("decision = %s, want %s", got, want)
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+	if count != 108 {
+		t.Fatalf("covered %d matrix cases, want 108", count)
+	}
+}
+
+func TestDecideGroupRecoveryUnknownObservationsFailClosedOnSameBoot(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	tests := []GroupRecoveryObservation{
 		{
-			name: "different boot is absent",
-			observation: GroupRecoveryObservation{
-				HostBootID:  "host-boot-after-restart",
-				Group:       GroupExistenceUnknown,
-				Leader:      ProcessIdentityUnknown,
-				Monitor:     ProcessIdentityUnknown,
-				Descendants: DescendantsUnknown,
-			},
-			want: GroupRecoveryQuiescent,
+			HostBootID:  ref.HostBootID,
+			Group:       GroupExistenceUnknown,
+			Leader:      ProcessIdentityMissing,
+			Monitor:     ProcessIdentityMissing,
+			Descendants: DescendantsAbsent,
 		},
 		{
-			name: "same boot matching leader and live group signals",
-			observation: GroupRecoveryObservation{
-				HostBootID:  ref.HostBootID,
-				Group:       GroupLive,
-				Leader:      ProcessIdentityMatching,
-				Monitor:     ProcessIdentityMatching,
-				Descendants: DescendantsPresent,
-			},
-			want: GroupRecoverySignal,
+			HostBootID:  ref.HostBootID,
+			Group:       GroupAbsent,
+			Leader:      ProcessIdentityUnknown,
+			Monitor:     ProcessIdentityMissing,
+			Descendants: DescendantsAbsent,
 		},
 		{
-			name: "same boot absent group is quiescent",
-			observation: GroupRecoveryObservation{
-				HostBootID:  ref.HostBootID,
-				Group:       GroupAbsent,
-				Leader:      ProcessIdentityMissing,
-				Monitor:     ProcessIdentityMissing,
-				Descendants: DescendantsAbsent,
-			},
-			want: GroupRecoveryQuiescent,
-		},
-		{
-			name: "same boot absent group with matching leader is unprovable",
-			observation: GroupRecoveryObservation{
-				HostBootID:  ref.HostBootID,
-				Group:       GroupAbsent,
-				Leader:      ProcessIdentityMatching,
-				Monitor:     ProcessIdentityMissing,
-				Descendants: DescendantsAbsent,
-			},
-			want: GroupRecoveryUnprovable,
-		},
-		{
-			name: "same boot absent group with live descendants is unprovable",
-			observation: GroupRecoveryObservation{
-				HostBootID:  ref.HostBootID,
-				Group:       GroupAbsent,
-				Leader:      ProcessIdentityMissing,
-				Monitor:     ProcessIdentityMissing,
-				Descendants: DescendantsPresent,
-			},
-			want: GroupRecoveryUnprovable,
-		},
-		{
-			name: "same boot absent group with matching monitor and absent descendants is quiescent",
-			observation: GroupRecoveryObservation{
-				HostBootID:  ref.HostBootID,
-				Group:       GroupAbsent,
-				Leader:      ProcessIdentityMissing,
-				Monitor:     ProcessIdentityMatching,
-				Descendants: DescendantsAbsent,
-			},
-			want: GroupRecoveryQuiescent,
-		},
-		{
-			name: "same boot absent group with reused leader and absent descendants is quiescent",
-			observation: GroupRecoveryObservation{
-				HostBootID:  ref.HostBootID,
-				Group:       GroupAbsent,
-				Leader:      ProcessIdentityReused,
-				Monitor:     ProcessIdentityMatching,
-				Descendants: DescendantsAbsent,
-			},
-			want: GroupRecoveryQuiescent,
-		},
-		{
-			name: "same boot absent group with leader and monitor gone and unknown descendants is unprovable",
-			observation: GroupRecoveryObservation{
-				HostBootID:  ref.HostBootID,
-				Group:       GroupAbsent,
-				Leader:      ProcessIdentityMissing,
-				Monitor:     ProcessIdentityMissing,
-				Descendants: DescendantsUnknown,
-			},
-			want: GroupRecoveryUnprovable,
-		},
-		{
-			name: "same boot reused leader while group exists is unprovable",
-			observation: GroupRecoveryObservation{
-				HostBootID:  ref.HostBootID,
-				Group:       GroupLive,
-				Leader:      ProcessIdentityReused,
-				Monitor:     ProcessIdentityMatching,
-				Descendants: DescendantsPresent,
-			},
-			want: GroupRecoveryUnprovable,
-		},
-		{
-			name: "same boot missing leader while group exists is unprovable",
-			observation: GroupRecoveryObservation{
-				HostBootID:  ref.HostBootID,
-				Group:       GroupLive,
-				Leader:      ProcessIdentityMissing,
-				Monitor:     ProcessIdentityMatching,
-				Descendants: DescendantsPresent,
-			},
-			want: GroupRecoveryUnprovable,
-		},
-		{
-			name: "leader and monitor gone with unknown descendants is unprovable",
-			observation: GroupRecoveryObservation{
-				HostBootID:  ref.HostBootID,
-				Group:       GroupExistenceUnknown,
-				Leader:      ProcessIdentityMissing,
-				Monitor:     ProcessIdentityMissing,
-				Descendants: DescendantsUnknown,
-			},
-			want: GroupRecoveryUnprovable,
+			HostBootID:  ref.HostBootID,
+			Group:       GroupAbsent,
+			Leader:      ProcessIdentityMissing,
+			Monitor:     ProcessIdentityUnknown,
+			Descendants: DescendantsAbsent,
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := DecideGroupRecovery(ref, tt.observation)
+	for _, observation := range tests {
+		t.Run(string(observation.Group)+"/leader_"+string(observation.Leader)+"/monitor_"+string(observation.Monitor), func(t *testing.T) {
+			got, err := DecideGroupRecovery(ref, observation)
 			if err != nil {
 				t.Fatalf("DecideGroupRecovery error = %v", err)
 			}
-			if got != tt.want {
-				t.Fatalf("decision = %s, want %s", got, tt.want)
+			if got != GroupRecoveryUnprovable {
+				t.Fatalf("decision = %s, want %s", got, GroupRecoveryUnprovable)
 			}
 		})
+	}
+}
+
+func expectedGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) GroupRecoveryDecision {
+	if observation.HostBootID != ref.HostBootID {
+		return GroupRecoveryQuiescent
+	}
+	if observation.Descendants != DescendantsAbsent &&
+		(recoveryTestIdentityGone(observation.Leader) || recoveryTestIdentityGone(observation.Monitor)) {
+		return GroupRecoveryUnprovable
+	}
+	if observation.Group == GroupAbsent &&
+		recoveryTestIdentityGone(observation.Leader) &&
+		recoveryTestIdentityGone(observation.Monitor) &&
+		observation.Descendants == DescendantsAbsent {
+		return GroupRecoveryQuiescent
+	}
+	if observation.Group == GroupLive && observation.Leader == ProcessIdentityMatching {
+		return GroupRecoverySignal
+	}
+	return GroupRecoveryUnprovable
+}
+
+func recoveryTestIdentityGone(observation ProcessIdentityObservation) bool {
+	switch observation {
+	case ProcessIdentityMissing, ProcessIdentityReused:
+		return true
+	default:
+		return false
 	}
 }

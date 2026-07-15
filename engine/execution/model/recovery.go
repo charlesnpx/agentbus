@@ -140,16 +140,17 @@ func DecideGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) (Gr
 	if observation.HostBootID != ref.HostBootID {
 		return GroupRecoveryQuiescent, nil
 	}
-	if observation.Leader == ProcessIdentityMissing &&
-		observation.Monitor == ProcessIdentityMissing &&
-		observation.Descendants == DescendantsUnknown {
+	if observation.Descendants != DescendantsAbsent &&
+		(recordedIdentityGone(observation.Leader) || recordedIdentityGone(observation.Monitor)) {
 		return GroupRecoveryUnprovable, nil
 	}
 	if observation.Group == GroupAbsent {
-		if absentObservationContradicted(observation) {
-			return GroupRecoveryUnprovable, nil
+		if recordedIdentityGone(observation.Leader) &&
+			recordedIdentityGone(observation.Monitor) &&
+			observation.Descendants == DescendantsAbsent {
+			return GroupRecoveryQuiescent, nil
 		}
-		return GroupRecoveryQuiescent, nil
+		return GroupRecoveryUnprovable, nil
 	}
 	if observation.Group == GroupLive && observation.Leader == ProcessIdentityMatching {
 		return GroupRecoverySignal, nil
@@ -160,9 +161,8 @@ func DecideGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) (Gr
 	return GroupRecoveryUnprovable, nil
 }
 
-func absentObservationContradicted(observation GroupRecoveryObservation) bool {
-	return observation.Leader == ProcessIdentityMatching ||
-		observation.Descendants == DescendantsPresent
+func recordedIdentityGone(observation ProcessIdentityObservation) bool {
+	return observation == ProcessIdentityMissing || observation == ProcessIdentityReused
 }
 
 func PlanRecovery(record SafetyRecord, trigger RecoveryTrigger) (RecoveryPlan, error) {
