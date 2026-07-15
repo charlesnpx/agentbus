@@ -2,6 +2,7 @@ package authority
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -102,6 +103,64 @@ func TestSafeActionForGrantDurabilityFailsClosedOnZeroAndInvalid(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := SafeActionForGrantDurability(tt.outcome); got != ContainFailStop {
 				t.Fatalf("SafeActionForGrantDurability(%v) = %v, want %v", tt.outcome, got, ContainFailStop)
+			}
+		})
+	}
+}
+
+func TestReadyApplySurfacesCommitOutcomeUnknownOnAnchorFailure(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		fail AnchorOperation
+		kind string
+	}{
+		{name: "commit-grant-anchor-advance", fail: AnchorAdvance, kind: "commit_grant"},
+		{name: "commit-grant-anchor-complete", fail: AnchorComplete, kind: "commit_grant"},
+		{name: "record-quiescence-anchor-advance", fail: AnchorAdvance, kind: "record_quiescence"},
+		{name: "record-quiescence-anchor-complete", fail: AnchorComplete, kind: "record_quiescence"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := memory.NewRepository()
+			anchorStore := NewAnchorStore()
+			ready := newReadyWithAnchorStore(t, repo, anchorStore, tt.name)
+			accepted, err := ready.Accept(ctx, acceptRequest(t, tt.name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref := accepted.Record.Attempt.Ref
+			group := groupRef(ref, model.LaunchOrdinalOne)
+			if _, err := ready.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
+				t.Fatal(err)
+			}
+
+			anchorStore.FailNextForTest(tt.fail, nil)
+			var applied ApplyResult
+			switch tt.kind {
+			case "commit_grant":
+				applied, err = ready.CommitGrant(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, model.PermitNonce("nonce-1"))
+			case "record_quiescence":
+				verified := verifiedQuiescence(t, ready.Boot(), ref, model.LaunchOrdinalOne, group, model.QuiescenceAlreadyAbsent)
+				applied, err = ready.RecordQuiescence(ctx, accepted.Record.JobID, model.LaunchOrdinalOne, verified)
+			default:
+				t.Fatalf("unknown mutation kind %q", tt.kind)
+			}
+			if !errors.Is(err, ErrAnchorInvariant) {
+				t.Fatalf("mutation error = %v, want ErrAnchorInvariant", err)
+			}
+			if applied.Durability != CommitOutcomeUnknown {
+				t.Fatalf("durability = %v, want %v", applied.Durability, CommitOutcomeUnknown)
+			}
+			if SafeActionForGrantDurability(applied.Durability) != ContainFailStop {
+				t.Fatalf("SafeActionForGrantDurability() = %v, want %v", SafeActionForGrantDurability(applied.Durability), ContainFailStop)
+			}
+			if !applied.Changed {
+				t.Fatal("applied.Changed = false, want committed DB mutation")
+			}
+			if applied.Commit.Generation == 0 {
+				t.Fatal("commit generation = 0, want committed DB generation")
 			}
 		})
 	}

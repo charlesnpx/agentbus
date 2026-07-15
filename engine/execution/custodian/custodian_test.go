@@ -99,6 +99,7 @@ func TestSupportValidationRejectsContradictoryStates(t *testing.T) {
 			name: "configured without probe",
 			support: supportWith(func(s *Support) {
 				s.RuntimeProbePassed = false
+				s.RuntimeProbeResult = errors.New("probe failed")
 			}),
 		},
 		{
@@ -118,6 +119,21 @@ func TestSupportValidationRejectsContradictoryStates(t *testing.T) {
 			support: supportWith(func(s *Support) {
 				s.VerifiedContainment = false
 			}),
+		},
+		{
+			name: "probe passed with failure result",
+			support: supportWith(func(s *Support) {
+				s.RuntimeProbeResult = errors.New("probe failed")
+			}),
+		},
+		{
+			name: "probe failed without result",
+			support: Support{
+				ParkedExec:             true,
+				VerifiedContainment:    true,
+				ImplementationCompiled: true,
+				RuntimeProbePassed:     false,
+			},
 		},
 	}
 
@@ -185,11 +201,12 @@ func testPhysicalQuiescence() PhysicalQuiescence {
 			Attempt: ref,
 			Ordinal: model.LaunchOrdinalOne,
 		},
-		HostBootID: "host-boot-custodian",
-		PGID:       100,
-		Leader:     model.ProcessIdentity{PID: 100, HighResStartToken: "leader-start-custodian"},
-		Monitor:    model.ProcessIdentity{PID: 102, HighResStartToken: "monitor-start-custodian"},
-		RetainedID: "retained-custodian",
+		HostBootID:        "host-boot-custodian",
+		PIDNamespaceState: model.PIDNamespaceNotApplicable,
+		PGID:              100,
+		Leader:            model.ProcessIdentity{PID: 100, HighResStartToken: "leader-start-custodian"},
+		Monitor:           model.ProcessIdentity{PID: 102, HighResStartToken: "monitor-start-custodian"},
+		RetainedID:        "retained-custodian",
 	}
 	return PhysicalQuiescence{
 		Group:  group,

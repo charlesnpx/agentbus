@@ -37,7 +37,7 @@ func (s *servedAdmissionSupervisor) verifiedContainmentSupported(ctx context.Con
 		return fmt.Errorf("%w: admission supervisor is nil", custodian.ErrSupervisorUnavailable)
 	}
 	support := s.runtime.Support()
-	if support.AdvertisedAvailable() {
+	if support.VerifiedContainment {
 		return nil
 	}
 	if support.Reason != nil {

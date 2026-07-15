@@ -3,22 +3,25 @@ package model
 import "testing"
 
 func TestKernelDomainIDValidateAndEqual(t *testing.T) {
-	same := KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceID: "pidns-1"}
+	same := KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceID: "pidns-1", PIDNamespaceState: PIDNamespaceKnown}
 	if err := same.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
 	}
-	if !same.Equal(KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceID: "pidns-1"}) {
+	if !same.Equal(KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceID: "pidns-1", PIDNamespaceState: PIDNamespaceKnown}) {
 		t.Fatalf("Equal() = false for matching domain")
 	}
-	if same.Equal(KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceID: "pidns-2"}) {
+	if same.Equal(KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceID: "pidns-2", PIDNamespaceState: PIDNamespaceKnown}) {
 		t.Fatalf("Equal() = true for different pid namespace")
 	}
-	if !same.Equal(KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceID: "pidns-1"}) {
+	if !same.Equal(KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceID: "pidns-1", PIDNamespaceState: PIDNamespaceKnown}) {
 		t.Fatalf("Equal() changed after mismatch check")
 	}
 	unknown := KernelDomainID{HostBootID: "host-boot-1"}
 	if err := unknown.Validate(); err != nil {
 		t.Fatalf("Validate() with unknown pid namespace error = %v", err)
+	}
+	if !unknown.Equal(KernelDomainID{HostBootID: "host-boot-1"}) {
+		t.Fatalf("Equal() = false for matching unknown namespace domain")
 	}
 	noNamespace := KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceState: PIDNamespaceNotApplicable}
 	if err := noNamespace.Validate(); err != nil {
@@ -26,6 +29,36 @@ func TestKernelDomainIDValidateAndEqual(t *testing.T) {
 	}
 	if !noNamespace.Equal(KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceState: PIDNamespaceNotApplicable}) {
 		t.Fatalf("Equal() = false for matching no-namespace platform domain")
+	}
+	if withNamespace, err := NewKernelDomainID("host-boot-1", "pidns-1"); err != nil {
+		t.Fatalf("NewKernelDomainID() error = %v", err)
+	} else if withNamespace.PIDNamespaceState != PIDNamespaceKnown {
+		t.Fatalf("NewKernelDomainID() state = %v, want %v", withNamespace.PIDNamespaceState, PIDNamespaceKnown)
+	}
+	if withoutNamespace, err := NewKernelDomainID("host-boot-1", ""); err != nil {
+		t.Fatalf("NewKernelDomainID() without namespace error = %v", err)
+	} else if withoutNamespace.PIDNamespaceState != PIDNamespaceNotApplicable {
+		t.Fatalf("NewKernelDomainID() without namespace state = %v, want %v", withoutNamespace.PIDNamespaceState, PIDNamespaceNotApplicable)
+	}
+	if err := (KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceID: "pidns-1", PIDNamespaceState: PIDNamespaceUnknown}).Validate(); err == nil {
+		t.Fatal("Validate() accepted non-empty pid namespace with unknown state")
+	}
+	if err := (KernelDomainID{HostBootID: "host-boot-1", PIDNamespaceID: "pidns-1", PIDNamespaceState: PIDNamespaceNotApplicable}).Validate(); err == nil {
+		t.Fatal("Validate() accepted non-empty pid namespace with not-applicable state")
+	}
+}
+
+func TestGroupRefEqualUsesCanonicalKernelDomain(t *testing.T) {
+	left := kernelDomainTestGroupRef()
+	right := left
+	if !left.Equal(right) {
+		t.Fatal("GroupRef.Equal() = false for identical known kernel domain")
+	}
+	if !left.SamePhysicalIdentity(right) {
+		t.Fatal("SamePhysicalIdentity() = false for identical known kernel domain")
+	}
+	if !left.KernelDomain().Equal(right.KernelDomain()) {
+		t.Fatal("KernelDomain().Equal() = false for identical known kernel domain")
 	}
 }
 
@@ -40,7 +73,7 @@ func TestDecideGroupRecoveryUsesKernelDomain(t *testing.T) {
 		{
 			name: "same full domain signals matching live leader",
 			observation: GroupRecoveryObservation{
-				KernelDomainID: KernelDomainID{HostBootID: ref.HostBootID, PIDNamespaceID: ref.PIDNamespaceID},
+				KernelDomainID: KernelDomainID{HostBootID: ref.HostBootID, PIDNamespaceID: ref.PIDNamespaceID, PIDNamespaceState: PIDNamespaceKnown},
 				Group:          GroupLive,
 				Leader:         ProcessIdentityMatching,
 			},
@@ -49,7 +82,7 @@ func TestDecideGroupRecoveryUsesKernelDomain(t *testing.T) {
 		{
 			name: "same host boot but different pid namespace is host reboot equivalent",
 			observation: GroupRecoveryObservation{
-				KernelDomainID: KernelDomainID{HostBootID: ref.HostBootID, PIDNamespaceID: "pidns-2"},
+				KernelDomainID: KernelDomainID{HostBootID: ref.HostBootID, PIDNamespaceID: "pidns-2", PIDNamespaceState: PIDNamespaceKnown},
 				Group:          GroupLive,
 				Leader:         ProcessIdentityMatching,
 			},
@@ -105,8 +138,9 @@ func TestDecideGroupRecoveryPIDNamespaceKnowledge(t *testing.T) {
 			name: "empty reference and nonempty observation is unprovable",
 			ref:  unknownRef,
 			observation: liveMatchingObservation(KernelDomainID{
-				HostBootID:     knownRef.HostBootID,
-				PIDNamespaceID: knownRef.PIDNamespaceID,
+				HostBootID:        knownRef.HostBootID,
+				PIDNamespaceID:    knownRef.PIDNamespaceID,
+				PIDNamespaceState: PIDNamespaceKnown,
 			}),
 			want: GroupRecoveryUnprovable,
 		},
@@ -131,8 +165,9 @@ func TestDecideGroupRecoveryPIDNamespaceKnowledge(t *testing.T) {
 			name: "known differing namespaces are quiescent",
 			ref:  knownRef,
 			observation: liveMatchingObservation(KernelDomainID{
-				HostBootID:     knownRef.HostBootID,
-				PIDNamespaceID: "pidns-2",
+				HostBootID:        knownRef.HostBootID,
+				PIDNamespaceID:    "pidns-2",
+				PIDNamespaceState: PIDNamespaceKnown,
 			}),
 			want: GroupRecoveryQuiescent,
 		},
@@ -162,13 +197,14 @@ func liveMatchingObservation(domain KernelDomainID) GroupRecoveryObservation {
 func kernelDomainTestGroupRef() GroupRef {
 	leader := ProcessIdentity{PID: 4321, HighResStartToken: "leader-start"}
 	return GroupRef{
-		Version:        1,
-		CustodyID:      CustodyID("custody-1"),
-		Launch:         LaunchKey{Attempt: AttemptRef{JobID: JobID("job-1"), AttemptID: AttemptID("attempt-1"), Epoch: 1}, Ordinal: LaunchOrdinal(1)},
-		HostBootID:     "host-boot-1",
-		PIDNamespaceID: "pidns-1",
-		PGID:           leader.PID,
-		Leader:         leader,
-		Monitor:        ProcessIdentity{PID: 4322, HighResStartToken: "monitor-start"},
+		Version:           1,
+		CustodyID:         CustodyID("custody-1"),
+		Launch:            LaunchKey{Attempt: AttemptRef{JobID: JobID("job-1"), AttemptID: AttemptID("attempt-1"), Epoch: 1}, Ordinal: LaunchOrdinal(1)},
+		HostBootID:        "host-boot-1",
+		PIDNamespaceID:    "pidns-1",
+		PIDNamespaceState: PIDNamespaceKnown,
+		PGID:              leader.PID,
+		Leader:            leader,
+		Monitor:           ProcessIdentity{PID: 4322, HighResStartToken: "monitor-start"},
 	}
 }

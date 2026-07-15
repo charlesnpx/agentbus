@@ -92,6 +92,7 @@ type ApplyResult struct {
 	Record     model.SafetyRecord
 	Projection model.JobProjection
 	Commit     repository.Commit
+	Durability DurabilityOutcome
 	Changed    bool
 }
 
@@ -191,13 +192,13 @@ func (r *Ready) Finalize(ctx context.Context, jobID model.JobID, ref model.Attem
 
 func (r *Ready) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence, options ...ApplyOption) (ApplyResult, error) {
 	if r == nil || r.core == nil {
-		return ApplyResult{}, ErrNotReady
+		return ApplyResult{Durability: DefinitelyNotCommitted}, ErrNotReady
 	}
 	if err := jobID.Validate(); err != nil {
-		return ApplyResult{}, fmt.Errorf("%w: job_id: %v", ErrInvalidRequest, err)
+		return ApplyResult{Durability: DefinitelyNotCommitted}, fmt.Errorf("%w: job_id: %v", ErrInvalidRequest, err)
 	}
 	if err := ordinal.Validate(); err != nil {
-		return ApplyResult{}, fmt.Errorf("%w: launch_ordinal: %v", ErrInvalidRequest, err)
+		return ApplyResult{Durability: DefinitelyNotCommitted}, fmt.Errorf("%w: launch_ordinal: %v", ErrInvalidRequest, err)
 	}
 	config := applyConfig{}
 	for _, option := range options {
@@ -224,12 +225,16 @@ func (r *Ready) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal
 		return nil
 	})
 	if err != nil {
-		return ApplyResult{}, err
+		result.Durability = ClassifyDurableMutationOutcome(DBDefinitelyNotCommitted, false)
+		return result, err
 	}
 	if err := r.core.advanceReadyLocked(ctx, &r.token, commit.Generation); err != nil {
-		return ApplyResult{}, err
+		result.Commit = commit
+		result.Durability = ClassifyDurableMutationOutcome(DBCommitted, false)
+		return result, err
 	}
 	result.Commit = commit
+	result.Durability = ClassifyDurableMutationOutcome(DBCommitted, true)
 	if terminalCommitted {
 		r.core.runtime.releaseTerminal(jobID)
 	}
@@ -238,10 +243,10 @@ func (r *Ready) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal
 
 func (r *Ready) apply(ctx context.Context, jobID model.JobID, command model.Command, options ...ApplyOption) (ApplyResult, error) {
 	if r == nil || r.core == nil {
-		return ApplyResult{}, ErrNotReady
+		return ApplyResult{Durability: DefinitelyNotCommitted}, ErrNotReady
 	}
 	if err := jobID.Validate(); err != nil {
-		return ApplyResult{}, fmt.Errorf("%w: job_id: %v", ErrInvalidRequest, err)
+		return ApplyResult{Durability: DefinitelyNotCommitted}, fmt.Errorf("%w: job_id: %v", ErrInvalidRequest, err)
 	}
 	config := applyConfig{}
 	for _, option := range options {
@@ -269,12 +274,16 @@ func (r *Ready) apply(ctx context.Context, jobID model.JobID, command model.Comm
 		return nil
 	})
 	if err != nil {
-		return ApplyResult{}, err
+		result.Durability = ClassifyDurableMutationOutcome(DBDefinitelyNotCommitted, false)
+		return result, err
 	}
 	if err := r.core.advanceReadyLocked(ctx, &r.token, commit.Generation); err != nil {
-		return ApplyResult{}, err
+		result.Commit = commit
+		result.Durability = ClassifyDurableMutationOutcome(DBCommitted, false)
+		return result, err
 	}
 	result.Commit = commit
+	result.Durability = ClassifyDurableMutationOutcome(DBCommitted, true)
 	if terminalCommitted {
 		r.core.runtime.releaseTerminal(jobID)
 	}

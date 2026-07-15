@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 )
@@ -50,6 +51,7 @@ type AdmissionResult struct {
 type StepResult struct {
 	Record     model.SafetyRecord
 	Projection model.JobProjection
+	Durability authority.DurabilityOutcome
 	Changed    bool
 }
 
@@ -143,7 +145,10 @@ func (c *Coordinator) PrepareSupervisor(ctx context.Context, jobID model.JobID, 
 	if err := inject(injector, FailSupervisorPrepareAfter); err != nil {
 		return c.failStop(ctx, err)
 	}
-	_, err = c.authority.BindGroup(ctx, jobID, snapshot.Record.Attempt.Ref, model.LaunchOrdinalOne, prepared.Group)
+	applied, err := c.authority.BindGroup(ctx, jobID, snapshot.Record.Attempt.Ref, model.LaunchOrdinalOne, prepared.Group)
+	if handled, failErr := c.failStopOnAmbiguousDurability(ctx, "bind prepared supervisor", applied, err); handled {
+		return failErr
+	}
 	if err != nil {
 		return c.failStop(ctx, fmt.Errorf("bind prepared supervisor: %w", err))
 	}
@@ -181,6 +186,9 @@ func (c *Coordinator) GrantPermit(ctx context.Context, jobID model.JobID, launch
 			return c.failStop(ctx, err)
 		}
 		applied, err := c.authority.BindGroup(ctx, jobID, snapshot.Record.Attempt.Ref, ordinal, prepared.Group)
+		if handled, failErr := c.failStopOnAmbiguousDurability(ctx, "bind grant supervisor", applied, err); handled {
+			return failErr
+		}
 		if err != nil {
 			return err
 		}
@@ -190,6 +198,9 @@ func (c *Coordinator) GrantPermit(ctx context.Context, jobID model.JobID, launch
 		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
 	}
 	applied, err := c.authority.CommitGrant(ctx, jobID, snapshot.Record.Attempt.Ref, ordinal, nonce)
+	if handled, failErr := c.failStopOnAmbiguousDurability(ctx, "commit launch grant", applied, err); handled {
+		return failErr
+	}
 	if err != nil {
 		return err
 	}
@@ -248,7 +259,10 @@ func (c *Coordinator) Start(ctx context.Context, jobID model.JobID, injector *Fa
 	if err := observation.ValidateFor(grant); err != nil {
 		return c.failStop(ctx, err)
 	}
-	_, err = c.authority.RecordRelease(ctx, jobID, snapshot.Record.Attempt.Ref, observation.Ordinal, observation.Child, observation.Evidence)
+	applied, err := c.authority.RecordRelease(ctx, jobID, snapshot.Record.Attempt.Ref, observation.Ordinal, observation.Child, observation.Evidence)
+	if handled, failErr := c.failStopOnAmbiguousDurability(ctx, "record launch release", applied, err); handled {
+		return failErr
+	}
 	if err != nil {
 		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
 	}
@@ -267,6 +281,9 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 		return err
 	}
 	applied, err := c.authority.RecordOutcome(ctx, jobID, snapshot.Record.Attempt.Ref, outcome)
+	if handled, failErr := c.failStopOnAmbiguousDurability(ctx, "record outcome", applied, err); handled {
+		return failErr
+	}
 	if err != nil {
 		return err
 	}
@@ -286,10 +303,13 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 	if err != nil {
 		return err
 	}
-	_, err = c.authority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, model.TerminalIntent{
+	applied, err = c.authority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, model.TerminalIntent{
 		Outcome: outcome,
 		Cause:   model.CauseCompletedNormally,
 	})
+	if handled, failErr := c.failStopOnAmbiguousDurability(ctx, "finalize completion", applied, err); handled {
+		return failErr
+	}
 	return err
 }
 
@@ -297,7 +317,11 @@ func (c *Coordinator) Cancel(ctx context.Context, jobID model.JobID, injector *F
 	if err := c.ready(); err != nil {
 		return err
 	}
-	if _, err := c.authority.RequestCancel(ctx, jobID); err != nil {
+	applied, err := c.authority.RequestCancel(ctx, jobID)
+	if handled, failErr := c.failStopOnAmbiguousDurability(ctx, "request cancel", applied, err); handled {
+		return failErr
+	}
+	if err != nil {
 		return err
 	}
 	return c.recover(ctx, jobID, model.RecoveryCancelAfterGrant, nil, injector)
@@ -368,6 +392,9 @@ func (c *Coordinator) certifyQuiescence(ctx context.Context, record *model.Safet
 			return err
 		}
 		applied, err := c.authority.RecordQuiescence(ctx, record.JobID, ordinal, verified)
+		if handled, failErr := c.failStopOnAmbiguousDurability(ctx, "record verified quiescence", applied, err); handled {
+			return failErr
+		}
 		if err != nil {
 			return err
 		}
@@ -398,7 +425,10 @@ func (c *Coordinator) publishResult(ctx context.Context, jobID model.JobID, payl
 	if err != nil {
 		return err
 	}
-	_, err = c.authority.RecordResult(ctx, jobID, snapshot.Record.Attempt.Ref, verified)
+	applied, err := c.authority.RecordResult(ctx, jobID, snapshot.Record.Attempt.Ref, verified)
+	if handled, failErr := c.failStopOnAmbiguousDurability(ctx, "record result", applied, err); handled {
+		return failErr
+	}
 	return err
 }
 
@@ -416,7 +446,11 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 			if plan.Next.Finalize == nil {
 				return cause
 			}
-			if _, err := c.authority.Finalize(ctx, jobID, plan.Next.Finalize.Ref, plan.Next.Finalize.Intent); err != nil {
+			applied, err := c.authority.Finalize(ctx, jobID, plan.Next.Finalize.Ref, plan.Next.Finalize.Intent)
+			if handled, failErr := c.failStopOnAmbiguousDurability(ctx, "finalize recovery", applied, err); handled {
+				return failErr
+			}
+			if err != nil {
 				if cause != nil {
 					return fmt.Errorf("%w; finalize recovery: %v", cause, err)
 				}
@@ -473,6 +507,9 @@ func (c *Coordinator) contain(ctx context.Context, record model.SafetyRecord, in
 			return err
 		}
 		applied, err := c.authority.RecordQuiescence(ctx, record.JobID, ordinal, verified)
+		if handled, failErr := c.failStopOnAmbiguousDurability(ctx, "record containment quiescence", applied, err); handled {
+			return failErr
+		}
 		if err != nil {
 			return c.failStop(ctx, fmt.Errorf("record containment quiescence: %w", err))
 		}
@@ -502,6 +539,9 @@ func (c *Coordinator) retire(ctx context.Context, record model.SafetyRecord, inj
 			return err
 		}
 		applied, err := c.authority.RecordQuiescence(ctx, record.JobID, ordinal, verified)
+		if handled, failErr := c.failStopOnAmbiguousDurability(ctx, "record retirement quiescence", applied, err); handled {
+			return failErr
+		}
 		if err != nil {
 			return c.failStop(ctx, fmt.Errorf("record retirement quiescence: %w", err))
 		}
@@ -522,6 +562,16 @@ func (c *Coordinator) failStop(ctx context.Context, err error) error {
 		_ = c.authority.FailStop(ctx, err)
 	}
 	return err
+}
+
+func (c *Coordinator) failStopOnAmbiguousDurability(ctx context.Context, action string, result StepResult, err error) (bool, error) {
+	if authority.SafeActionForGrantDurability(result.Durability) != authority.ContainFailStop {
+		return false, nil
+	}
+	if err != nil {
+		return true, c.failStop(ctx, fmt.Errorf("%s durability outcome %d: %w", action, result.Durability, err))
+	}
+	return true, c.failStop(ctx, fmt.Errorf("%s durability outcome %d", action, result.Durability))
 }
 
 func preparedFromRecord(record model.SafetyRecord, ordinal model.LaunchOrdinal) (PreparedSupervisor, error) {

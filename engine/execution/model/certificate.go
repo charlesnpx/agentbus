@@ -214,9 +214,7 @@ func (ref GroupRef) Equal(other GroupRef) bool {
 	return ref.Version == other.Version &&
 		ref.CustodyID == other.CustodyID &&
 		ref.Launch.Equal(other.Launch) &&
-		ref.HostBootID == other.HostBootID &&
-		ref.PIDNamespaceID == other.PIDNamespaceID &&
-		ref.PIDNamespaceState == other.PIDNamespaceState &&
+		ref.KernelDomain().Equal(other.KernelDomain()) &&
 		ref.PGID == other.PGID &&
 		ref.Leader.Equal(other.Leader) &&
 		ref.Monitor.Equal(other.Monitor) &&

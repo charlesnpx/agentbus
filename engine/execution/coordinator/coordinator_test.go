@@ -276,6 +276,47 @@ func TestPostGrantFailureRecoveryContainsAndRetires(t *testing.T) {
 	}
 }
 
+func TestGrantPermitFailStopsOnUnknownCommitDurability(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "grant-unknown-durability")
+	accepted := h.submit(t, ctx, "grant-unknown-durability")
+	if err := h.coordinator.PrepareSupervisor(ctx, accepted.Record.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.anchorStore.FailNextForTest(authority.AnchorComplete, nil)
+
+	err := h.coordinator.GrantPermit(ctx, accepted.Record.JobID, 1, model.PermitNonce("nonce-1"), nil)
+	if !errors.Is(err, authority.ErrAnchorInvariant) {
+		t.Fatalf("GrantPermit error = %v, want ErrAnchorInvariant", err)
+	}
+	if !h.authority.failStopped {
+		t.Fatal("authority was not fail-stopped after unknown commit durability")
+	}
+	if h.supervisor.permits != 0 {
+		t.Fatalf("permit sends = %d, want 0 after unknown commit durability", h.supervisor.permits)
+	}
+}
+
+func TestRecordQuiescenceFailStopsOnUnknownCommitDurability(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "quiescence-unknown-durability")
+	accepted := h.submitPreparedPermitted(t, ctx, "quiescence-unknown-durability")
+	if err := h.coordinator.Start(ctx, accepted.Record.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
+	record := snapshot.Record
+	h.anchorStore.FailNextForTest(authority.AnchorAdvance, nil)
+
+	err := h.coordinator.certifyQuiescence(ctx, &record, nil)
+	if !errors.Is(err, authority.ErrAnchorInvariant) {
+		t.Fatalf("certifyQuiescence error = %v, want ErrAnchorInvariant", err)
+	}
+	if !h.authority.failStopped {
+		t.Fatal("authority was not fail-stopped after unknown quiescence durability")
+	}
+}
+
 func TestDoubleFaultDuringRecoveryFailStops(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, "double-fault")
@@ -464,13 +505,15 @@ type harness struct {
 	supervisor  *testSupervisor
 	results     *testResults
 	repo        *memory.Repository
+	anchorStore *authority.AnchorStore
 }
 
 func newHarness(t *testing.T, name string) *harness {
 	t.Helper()
 	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
 	issuer, verifier := custodian.NewAttestationChannel()
-	bootstrapper, err := authority.NewBootstrapper(repo, authority.WithQuiescenceVerifier(verifier))
+	bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(verifier))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,6 +542,7 @@ func newHarness(t *testing.T, name string) *harness {
 		supervisor:  supervisor,
 		results:     results,
 		repo:        repo,
+		anchorStore: anchorStore,
 	}
 }
 
@@ -606,9 +650,9 @@ func (a *readyAuthority) Finalize(ctx context.Context, jobID model.JobID, ref mo
 
 func stepResult(applied authority.ApplyResult, err error) (StepResult, error) {
 	if err != nil {
-		return StepResult{}, err
+		return StepResult{Record: applied.Record, Projection: applied.Projection, Durability: applied.Durability, Changed: applied.Changed}, err
 	}
-	return StepResult{Record: applied.Record, Projection: applied.Projection, Changed: applied.Changed}, nil
+	return StepResult{Record: applied.Record, Projection: applied.Projection, Durability: applied.Durability, Changed: applied.Changed}, nil
 }
 
 func (a *readyAuthority) Snapshot(ctx context.Context, jobID model.JobID) (JobSnapshot, error) {
@@ -734,8 +778,9 @@ func (s *testSupervisor) Prepare(ctx context.Context, plan LaunchPlan) (Prepared
 			Attempt: plan.Ref,
 			Ordinal: plan.Ordinal,
 		},
-		HostBootID: "host-boot-" + plan.Ref.JobID.String(),
-		PGID:       pgid,
+		HostBootID:        "host-boot-" + plan.Ref.JobID.String(),
+		PIDNamespaceState: model.PIDNamespaceNotApplicable,
+		PGID:              pgid,
 		Leader: model.ProcessIdentity{
 			PID:               pgid,
 			HighResStartToken: fmt.Sprintf("leader-token-%d", s.next),

@@ -275,8 +275,9 @@ func groupRef(ref model.AttemptRef, ordinal model.LaunchOrdinal) model.GroupRef 
 			Attempt: ref,
 			Ordinal: ordinal,
 		},
-		HostBootID: "host-boot-" + ref.JobID.String(),
-		PGID:       pgid,
+		HostBootID:        "host-boot-" + ref.JobID.String(),
+		PIDNamespaceState: model.PIDNamespaceNotApplicable,
+		PGID:              pgid,
 		Leader: model.ProcessIdentity{
 			PID:               pgid,
 			HighResStartToken: "leader-start-" + ordinal.String(),

@@ -86,6 +86,13 @@ func NewSupport(support Support) (Support, error) {
 }
 
 func (support Support) Validate() error {
+	if support.RuntimeProbePassed {
+		if support.RuntimeProbeResult != nil {
+			return fmt.Errorf("%w: passing runtime probe cannot carry a failure result", ErrInvalidSupport)
+		}
+	} else if support.RuntimeProbeResult == nil {
+		return fmt.Errorf("%w: failing runtime probe requires a result", ErrInvalidSupport)
+	}
 	if support.FeatureAdvertised && !support.FeatureConfigured {
 		return fmt.Errorf("%w: advertised feature requires configuration", ErrInvalidSupport)
 	}

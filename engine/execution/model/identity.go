@@ -168,7 +168,11 @@ type KernelDomainID struct {
 }
 
 func NewKernelDomainID(hostBootID, pidNamespaceID string) (KernelDomainID, error) {
-	id := KernelDomainID{HostBootID: hostBootID, PIDNamespaceID: pidNamespaceID}
+	id := KernelDomainID{HostBootID: hostBootID, PIDNamespaceState: PIDNamespaceNotApplicable}
+	if pidNamespaceID != "" {
+		id.PIDNamespaceID = pidNamespaceID
+		id.PIDNamespaceState = PIDNamespaceKnown
+	}
 	if err := id.Validate(); err != nil {
 		return KernelDomainID{}, err
 	}
@@ -192,7 +196,18 @@ func (id KernelDomainID) Validate() error {
 
 func (id KernelDomainID) Equal(other KernelDomainID) bool {
 	relation, err := compareKernelDomain(id, other)
-	return err == nil && relation == kernelDomainSame
+	if err != nil {
+		return false
+	}
+	if relation == kernelDomainSame {
+		return true
+	}
+	if relation != kernelDomainUnprovable || id.HostBootID != other.HostBootID {
+		return false
+	}
+	leftNamespace := normalizePIDNamespace(id.PIDNamespaceID, id.PIDNamespaceState)
+	rightNamespace := normalizePIDNamespace(other.PIDNamespaceID, other.PIDNamespaceState)
+	return leftNamespace.state == PIDNamespaceUnknown && rightNamespace.state == PIDNamespaceUnknown
 }
 
 type normalizedPIDNamespace struct {
@@ -240,6 +255,9 @@ func validatePIDNamespace(field string, id string, state PIDNamespaceState) erro
 		return err
 	}
 	if id != "" {
+		if state == PIDNamespaceUnknown {
+			return invalid(field, "cannot carry an id when state is unknown")
+		}
 		if state == PIDNamespaceNotApplicable {
 			return invalid(field, "cannot carry an id when not applicable")
 		}
