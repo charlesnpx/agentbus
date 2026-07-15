@@ -5,12 +5,21 @@ package procgroup
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"golang.org/x/sys/unix"
 )
 
 func nativeHostBootID() (string, error) {
+	bootSessionUUID, err := darwinBootSessionUUID()
+	if err == nil {
+		return bootSessionUUID, nil
+	}
+	if !darwinBootSessionUUIDUnavailable(err) {
+		return "", err
+	}
+
 	boottime, err := unix.SysctlTimeval("kern.boottime")
 	if err == nil && boottime == nil {
 		return "", fmt.Errorf("kern.boottime returned nil")
@@ -29,6 +38,25 @@ func nativeHostBootID() (string, error) {
 		return "", fmt.Errorf("kern.boottime: %w; pid1 start fallback: %v", err, fallbackErr)
 	}
 	return "darwin-pid1-start-" + pidOne.StartToken.String(), nil
+}
+
+func darwinBootSessionUUID() (string, error) {
+	bootSessionUUID, err := unix.Sysctl("kern.bootsessionuuid")
+	if err != nil {
+		return "", err
+	}
+	bootSessionUUID = strings.TrimSpace(bootSessionUUID)
+	if bootSessionUUID == "" {
+		return "", fmt.Errorf("kern.bootsessionuuid is empty")
+	}
+	return "darwin-bootsessionuuid-" + bootSessionUUID, nil
+}
+
+func darwinBootSessionUUIDUnavailable(err error) bool {
+	return errors.Is(err, unix.ENOENT) ||
+		errors.Is(err, unix.EPERM) ||
+		errors.Is(err, unix.ENOTSUP) ||
+		errors.Is(err, unix.EOPNOTSUPP)
 }
 
 func nativePIDNamespaceID() (string, error) {
@@ -99,19 +127,43 @@ func darwinProcessSnapshot(process unix.KinfoProc) (processSnapshot, error) {
 	if pgid <= 0 {
 		return processSnapshot{}, fmt.Errorf("kinfo process %d has invalid pgid %d", pid, pgid)
 	}
-	start := process.Proc.P_starttime
-	if start.Sec <= 0 {
-		return processSnapshot{}, fmt.Errorf("kinfo process %d has invalid start time %d.%d", pid, start.Sec, start.Usec)
+	startToken, err := darwinProcessStartToken(process)
+	if err != nil {
+		return processSnapshot{}, fmt.Errorf("kinfo process %d: %w", pid, err)
 	}
 	snapshot := processSnapshot{
 		PID:        pid,
 		PGID:       pgid,
-		StartToken: StartToken(formatDarwinTimeToken("", start.Sec, start.Usec)),
+		StartToken: startToken,
 	}
 	if err := snapshot.validate(); err != nil {
 		return processSnapshot{}, err
 	}
 	return snapshot, nil
+}
+
+// darwinProcessStartToken combines stable kinfo_proc fields to narrow PID reuse
+// collisions beyond Darwin's microsecond p_starttime. Residual bound: an
+// in-same-instant PID reuse with identical start time, real uid, and parent pid
+// remains theoretically possible on Darwin, and Linux start-clock tokens have an
+// analogous collision bound; the S3B custodian binds stronger identity.
+func darwinProcessStartToken(process unix.KinfoProc) (StartToken, error) {
+	start := process.Proc.P_starttime
+	if start.Sec <= 0 {
+		return "", fmt.Errorf("invalid start time %d.%d", start.Sec, start.Usec)
+	}
+	if start.Usec < 0 || start.Usec > 999999 {
+		return "", fmt.Errorf("invalid start time usec %d", start.Usec)
+	}
+	ppid := process.Eproc.Ppid
+	if ppid < 0 {
+		return "", fmt.Errorf("invalid parent pid %d", ppid)
+	}
+	return StartToken(formatDarwinStartToken(start.Sec, start.Usec, process.Eproc.Pcred.P_ruid, ppid)), nil
+}
+
+func formatDarwinStartToken(sec int64, usec int32, realUID uint32, ppid int32) string {
+	return fmt.Sprintf("%d.%06d-uid-%d-ppid-%d", sec, usec, realUID, ppid)
 }
 
 func formatDarwinTimeToken(prefix string, sec int64, usec int32) string {

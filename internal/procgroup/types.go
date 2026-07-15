@@ -12,7 +12,9 @@ import (
 // requested PID has no process table entry.
 var ErrProcessMissing = errors.New("process missing")
 
-// StartToken identifies one process incarnation within a host boot.
+// StartToken identifies one process incarnation within a host boot. Identical
+// native values across an in-same-instant PID reuse remain theoretically
+// possible on both Darwin and Linux; the S3B custodian binds stronger identity.
 type StartToken string
 
 func (token StartToken) String() string {
