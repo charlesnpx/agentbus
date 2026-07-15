@@ -203,6 +203,47 @@ func TestContainmentContinuityWitnessAuthorizesKillAfterLeaderExit(t *testing.T)
 	}
 }
 
+func TestContainmentRejectsWrongGroupContinuityEvidence(t *testing.T) {
+	target := testGroupRef(t)
+	evidenceTarget := wrongPhysicalGroupRef(target)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+	}}
+	witness := &fakeContinuityWitness{confirmed: true, evidenceTarget: &evidenceTarget}
+
+	outcome := testEngineWithContinuity(observer, signaler, witness).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	assertSignals(t, signaler, SignalTerminate)
+	if witness.confirms == 0 {
+		t.Fatalf("continuity witness was not consulted")
+	}
+}
+
+func TestContainmentRejectsPartialContinuityInterval(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+	}}
+	witness := &fakeContinuityWitness{confirmed: true, endOffset: -time.Nanosecond}
+
+	outcome := testEngineWithContinuity(observer, signaler, witness).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	assertSignals(t, signaler, SignalTerminate)
+	if witness.confirms == 0 {
+		t.Fatalf("continuity witness was not consulted")
+	}
+}
+
 func TestContainmentReusedPGIDLeaderMissingWithoutContinuityDoesNotKill(t *testing.T) {
 	target := testGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
@@ -275,6 +316,12 @@ func testGroupRef(t *testing.T) model.GroupRef {
 	if err := ref.Validate(); err != nil {
 		t.Fatalf("test GroupRef invalid: %v", err)
 	}
+	return ref
+}
+
+func wrongPhysicalGroupRef(ref model.GroupRef) model.GroupRef {
+	ref.PGID++
+	ref.Leader = model.ProcessIdentity{PID: ref.PGID, HighResStartToken: "leader-start-wrong"}
 	return ref
 }
 

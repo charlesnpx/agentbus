@@ -20,13 +20,61 @@ type Observer interface {
 // the engine has no continuity capability and must fail closed on leader-missing
 // escalation.
 type ContinuityWitness interface {
-	BeginGroupContinuity(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation) GroupContinuity
+	BeginGroupContinuity(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation, observedAt time.Time) GroupContinuity
 }
 
 // GroupContinuity confirms uninterrupted liveness of the exact target group
 // since the matching-leader observation that created it.
 type GroupContinuity interface {
-	ConfirmContinuouslyLive(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation) bool
+	ConfirmContinuouslyLive(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation, begin, end time.Time) GroupContinuityEvidence
+}
+
+// GroupContinuityEvidence is sealed continuity evidence: callers can only build
+// it through the constructor, and the engine still validates the target and
+// interval before trusting it.
+type GroupContinuityEvidence struct {
+	group model.GroupRef
+	begin time.Time
+	end   time.Time
+}
+
+func NewGroupContinuityEvidence(group model.GroupRef, begin, end time.Time) (GroupContinuityEvidence, error) {
+	evidence := GroupContinuityEvidence{group: group, begin: begin, end: end}
+	if err := evidence.validate(); err != nil {
+		return GroupContinuityEvidence{}, err
+	}
+	return evidence, nil
+}
+
+func (evidence GroupContinuityEvidence) Covers(target model.GroupRef, begin, end time.Time) bool {
+	if err := target.Validate(); err != nil {
+		return false
+	}
+	if begin.IsZero() || end.IsZero() || end.Before(begin) {
+		return false
+	}
+	if err := evidence.validate(); err != nil {
+		return false
+	}
+	return evidence.group.Equal(target) &&
+		!evidence.begin.After(begin) &&
+		!evidence.end.Before(end)
+}
+
+func (evidence GroupContinuityEvidence) validate() error {
+	if err := evidence.group.Validate(); err != nil {
+		return err
+	}
+	if evidence.begin.IsZero() {
+		return fmt.Errorf("continuity evidence begin must be set")
+	}
+	if evidence.end.IsZero() {
+		return fmt.Errorf("continuity evidence end must be set")
+	}
+	if evidence.end.Before(evidence.begin) {
+		return fmt.Errorf("continuity evidence end precedes begin")
+	}
+	return nil
 }
 
 // Signaler sends signals only to the exact target process group and can probe

@@ -27,19 +27,33 @@ func (observer *fakeObserver) ObserveGroup(_ context.Context, _ model.GroupRef) 
 }
 
 type fakeContinuityWitness struct {
-	confirmed bool
-	starts    int
-	confirms  int
+	confirmed      bool
+	evidenceTarget *model.GroupRef
+	beginOffset    time.Duration
+	endOffset      time.Duration
+	starts         int
+	confirms       int
 }
 
-func (witness *fakeContinuityWitness) BeginGroupContinuity(_ context.Context, _ model.GroupRef, _ model.ContainmentObservation) GroupContinuity {
+func (witness *fakeContinuityWitness) BeginGroupContinuity(_ context.Context, _ model.GroupRef, _ model.ContainmentObservation, _ time.Time) GroupContinuity {
 	witness.starts++
 	return witness
 }
 
-func (witness *fakeContinuityWitness) ConfirmContinuouslyLive(_ context.Context, _ model.GroupRef, _ model.ContainmentObservation) bool {
+func (witness *fakeContinuityWitness) ConfirmContinuouslyLive(_ context.Context, target model.GroupRef, _ model.ContainmentObservation, begin, end time.Time) GroupContinuityEvidence {
 	witness.confirms++
-	return witness.confirmed
+	if !witness.confirmed {
+		return GroupContinuityEvidence{}
+	}
+	evidenceTarget := target
+	if witness.evidenceTarget != nil {
+		evidenceTarget = *witness.evidenceTarget
+	}
+	evidence, err := NewGroupContinuityEvidence(evidenceTarget, begin.Add(witness.beginOffset), end.Add(witness.endOffset))
+	if err != nil {
+		return GroupContinuityEvidence{}
+	}
+	return evidence
 }
 
 type signalScript struct {

@@ -10,8 +10,8 @@ const (
 )
 
 type ContainmentSession struct {
-	// ContinuouslyObservedLive is a caller-supplied capability result. The model
-	// consumes it but does not infer continuity from discrete observations.
+	// ContinuouslyObservedLive is set only after the engine validates continuity
+	// evidence; the model does not infer continuity from discrete observations.
 	BeganFromMatchingLeader  bool
 	ContinuouslyObservedLive bool
 }
@@ -134,19 +134,10 @@ func decideLiveContainment(input ContainmentAuthorization) (ContainmentDecision,
 }
 
 func (observation ContainmentObservation) coherent() bool {
-	if observation.Group == GroupAbsent && observation.leaderObservedLive() {
+	if observation.Group == GroupAbsent && observation.Leader != ProcessIdentityMissing {
 		return false
 	}
 	return observation.Monitor.coherent()
-}
-
-func (observation ContainmentObservation) leaderObservedLive() bool {
-	switch observation.Leader {
-	case ProcessIdentityMatching, ProcessIdentityReused:
-		return true
-	default:
-		return false
-	}
 }
 
 func (observation ContainmentMonitorObservation) coherent() bool {

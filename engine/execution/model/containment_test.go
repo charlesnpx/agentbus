@@ -102,6 +102,51 @@ func TestContainmentAlreadyAbsentAfterIndependentObservation(t *testing.T) {
 	}
 }
 
+func TestContainmentGroupLeaderCoherenceExhaustive(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	groups := []GroupExistenceObservation{
+		GroupLive,
+		GroupAbsent,
+		GroupExistenceUnknown,
+		GroupExistenceContradictory,
+	}
+	leaders := []ProcessIdentityObservation{
+		ProcessIdentityMatching,
+		ProcessIdentityMissing,
+		ProcessIdentityReused,
+		ProcessIdentityUnknown,
+	}
+
+	for _, group := range groups {
+		for _, leader := range leaders {
+			t.Run(string(group)+"/"+string(leader), func(t *testing.T) {
+				want := Unprovable
+				if group == GroupAbsent && leader == ProcessIdentityMissing {
+					want = AlreadyAbsent
+				}
+				if group == GroupLive && leader == ProcessIdentityMatching {
+					want = SignalDirectly
+				}
+
+				decision, err := DecideContainmentAuthorization(ContainmentAuthorization{
+					Group: ref,
+					Observation: ContainmentObservation{
+						KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+						Group:          group,
+						Leader:         leader,
+					},
+				})
+				if err != nil {
+					t.Fatalf("DecideContainmentAuthorization error = %v", err)
+				}
+				if decision != want {
+					t.Fatalf("decision = %s, want %s", decision, want)
+				}
+			})
+		}
+	}
+}
+
 func TestContainmentIncoherentAbsentLiveLeaderIsUnprovable(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
 	tests := []struct {
