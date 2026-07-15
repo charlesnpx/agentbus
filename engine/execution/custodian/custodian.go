@@ -8,7 +8,10 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 )
 
-var ErrInvalidAttestation = errors.New("invalid quiescence attestation")
+var (
+	ErrInvalidAttestation    = errors.New("invalid quiescence attestation")
+	ErrSupervisorUnavailable = errors.New("supervisor_unavailable")
+)
 
 type ExecSpec struct {
 	Argv []string
@@ -69,6 +72,18 @@ type RunningProcess interface {
 	ContainAndVerify(context.Context, QuiescenceCause) (VerifiedQuiescence, error)
 }
 
+type UnavailableCustodian struct{}
+
+func (UnavailableCustodian) processCustodian() {}
+
+func (UnavailableCustodian) Prepare(context.Context, ExecSpec, model.LaunchKey) (PreparedProcess, error) {
+	return nil, ErrSupervisorUnavailable
+}
+
+func (UnavailableCustodian) ContainAndVerify(context.Context, model.GroupRef, QuiescenceCause) (VerifiedQuiescence, error) {
+	return VerifiedQuiescence{}, ErrSupervisorUnavailable
+}
+
 type AttestationIssuer struct {
 	channel *attestationChannel
 }
@@ -82,10 +97,12 @@ type VerifiedQuiescence struct {
 	certificate model.QuiescenceCertificate
 }
 
-type attestationChannel struct{}
+type attestationChannel struct {
+	secret byte
+}
 
 func NewAttestationChannel() (AttestationIssuer, AttestationVerifier) {
-	channel := &attestationChannel{}
+	channel := &attestationChannel{secret: 1}
 	return AttestationIssuer{channel: channel}, AttestationVerifier{channel: channel}
 }
 

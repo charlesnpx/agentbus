@@ -431,7 +431,7 @@ func applyCommandTx(tx repository.WriteTx, jobID model.JobID, command model.Comm
 	if sessionID == "" {
 		sessionID = projection.SessionID
 	}
-	applied, err := model.Apply(record, command)
+	applied, err := applyLogicalCommand(record, command)
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -464,11 +464,28 @@ func applyQuiescenceTx(tx repository.WriteTx, jobID model.JobID, ordinal model.L
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	return applyCommandToLoadedTx(tx, record, projection, model.RecordQuiescence{Ref: record.Attempt.Ref, Receipt: certificate}, sessionID)
+	applied, err := applyVerifiedQuiescence(record, certificate)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if !applied.Changed {
+		return ApplyResult{Record: record, Projection: projection}, nil
+	}
+	nextProjection, err := model.Project(applied.Record, model.ProjectionMetadata{SessionID: sessionID})
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if err := tx.PutSafety(applied.Record, record.Revision); err != nil {
+		return ApplyResult{}, err
+	}
+	if err := tx.PutProjection(nextProjection); err != nil {
+		return ApplyResult{}, err
+	}
+	return ApplyResult{Record: applied.Record, Projection: nextProjection, Changed: true}, nil
 }
 
 func applyCommandToLoadedTx(tx repository.WriteTx, record model.SafetyRecord, projection model.JobProjection, command model.Command, sessionID string) (ApplyResult, error) {
-	applied, err := model.Apply(record, command)
+	applied, err := applyLogicalCommand(record, command)
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -513,6 +530,135 @@ func verifyQuiescenceForRecord(record model.SafetyRecord, ordinal model.LaunchOr
 		certificate.CertifiedBy = boot
 	}
 	return certificate, nil
+}
+
+func applyVerifiedQuiescence(record model.SafetyRecord, certificate model.QuiescenceCertificate) (model.ApplyResult, error) {
+	if err := model.ValidateSafetyRecord(record); err != nil {
+		return model.ApplyResult{}, fmt.Errorf("%w: current safety record is invalid: %v", model.ErrInvalidCommand, err)
+	}
+	if err := certificate.Validate(); err != nil {
+		return model.ApplyResult{}, fmt.Errorf("%w: quiescence receipt: %v", model.ErrInvalidCommand, err)
+	}
+	if !certificate.Attempt.Equal(record.Attempt.Ref) {
+		return model.ApplyResult{}, fmt.Errorf("%w: quiescence attempt mismatch", model.ErrInvalidCommand)
+	}
+	launch, ok := record.Attempt.Launches.Get(certificate.Ordinal)
+	if !ok || launch.Group == nil {
+		return model.ApplyResult{}, fmt.Errorf("%w: quiescence requires durable group reference", model.ErrCommandPrecondition)
+	}
+	if !certificate.Group.Equal(*launch.Group) {
+		return model.ApplyResult{}, fmt.Errorf("%w: quiescence group does not match durable group", model.ErrConflictingDuplicate)
+	}
+	if launch.Quiescence != nil {
+		if *launch.Quiescence == certificate {
+			return model.ApplyResult{Record: record, Changed: false}, nil
+		}
+		return model.ApplyResult{}, fmt.Errorf("%w: quiescence already recorded with different evidence", model.ErrConflictingDuplicate)
+	}
+	if record.Revision == ^uint64(0) {
+		return model.ApplyResult{}, fmt.Errorf("%w: safety record revision overflow", model.ErrCommandPrecondition)
+	}
+
+	next := record
+	next.Attempt.Launches = cloneLaunchSlotsForAuthority(record.Attempt.Launches)
+	nextLaunch, ok := next.Attempt.Launches.Get(certificate.Ordinal)
+	if !ok || nextLaunch.Group == nil {
+		return model.ApplyResult{}, fmt.Errorf("%w: quiescence requires durable group reference", model.ErrCommandPrecondition)
+	}
+	receipt := certificate
+	nextLaunch.Quiescence = &receipt
+	next.Revision = record.Revision + 1
+	if err := model.ValidateSafetyRecord(next); err != nil {
+		return model.ApplyResult{}, fmt.Errorf("reducer produced invalid safety record: %w", err)
+	}
+	return model.ApplyResult{Record: next, Changed: true}, nil
+}
+
+func cloneLaunchSlotsForAuthority(slots model.LaunchSlots[model.LaunchProof]) model.LaunchSlots[model.LaunchProof] {
+	return model.LaunchSlots[model.LaunchProof]{
+		First:  cloneLaunchProofForAuthority(slots.First),
+		Second: cloneLaunchProofForAuthority(slots.Second),
+	}
+}
+
+func cloneLaunchProofForAuthority(launch *model.LaunchProof) *model.LaunchProof {
+	if launch == nil {
+		return nil
+	}
+	copied := *launch
+	return &copied
+}
+
+func applyLogicalCommand(record model.SafetyRecord, command model.Command) (model.ApplyResult, error) {
+	switch c := command.(type) {
+	case model.Acknowledge:
+		return model.ApplyAcknowledge(record, c)
+	case *model.Acknowledge:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyAcknowledge(record, *c)
+	case model.BeginReject:
+		return model.ApplyBeginReject(record, c)
+	case *model.BeginReject:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyBeginReject(record, *c)
+	case model.BindGroup:
+		return model.ApplyBindGroup(record, c)
+	case *model.BindGroup:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyBindGroup(record, *c)
+	case model.CommitGrant:
+		return model.ApplyCommitGrant(record, c)
+	case *model.CommitGrant:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyCommitGrant(record, *c)
+	case model.RecordRelease:
+		return model.ApplyRecordRelease(record, c)
+	case *model.RecordRelease:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyRecordRelease(record, *c)
+	case model.RequestCancel:
+		return model.ApplyRequestCancel(record, c)
+	case *model.RequestCancel:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyRequestCancel(record, *c)
+	case model.ObserveOutcome:
+		return model.ApplyObserveOutcome(record, c)
+	case *model.ObserveOutcome:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyObserveOutcome(record, *c)
+	case model.CertifyResult:
+		return model.ApplyCertifyResult(record, c)
+	case *model.CertifyResult:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyCertifyResult(record, *c)
+	case model.Finalize:
+		return model.ApplyFinalize(record, c)
+	case *model.Finalize:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyFinalize(record, *c)
+	case model.RecordQuiescence, *model.RecordQuiescence:
+		return model.ApplyResult{}, fmt.Errorf("%w: quiescence must be recorded through verified authority ingress", ErrInvalidRequest)
+	default:
+		return model.ApplyResult{}, fmt.Errorf("%w: unsupported command %T", model.ErrInvalidCommand, command)
+	}
 }
 
 func validJobImage(image repository.JobImage) (model.SafetyRecord, model.JobProjection, error) {

@@ -22,7 +22,6 @@ type servedAdmissionSupervisor struct {
 
 	mu       sync.Mutex
 	boot     model.BootRef
-	issuer   custodian.AttestationIssuer
 	verifier custodian.AttestationVerifier
 	launches map[model.JobID]*servedAdmissionLaunch
 }
@@ -40,10 +39,9 @@ type servedAdmissionLaunch struct {
 }
 
 func newServedAdmissionSupervisor(server *Server) *servedAdmissionSupervisor {
-	issuer, verifier := custodian.NewAttestationChannel()
+	_, verifier := custodian.NewAttestationChannel()
 	return &servedAdmissionSupervisor{
 		server:   server,
-		issuer:   issuer,
 		verifier: verifier,
 		launches: make(map[model.JobID]*servedAdmissionLaunch),
 	}
@@ -235,79 +233,21 @@ func (s *servedAdmissionSupervisor) VerifyQuiescence(_ context.Context, prepared
 	if err := prepared.ValidateFor(released.Attempt); err != nil {
 		return custodian.VerifiedQuiescence{}, err
 	}
-	return s.attestQuiescence(prepared, model.QuiescenceNaturalExit)
+	return custodian.VerifiedQuiescence{}, custodian.ErrSupervisorUnavailable
 }
 
-func (s *servedAdmissionSupervisor) Contain(ctx context.Context, prepared coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
+func (s *servedAdmissionSupervisor) Contain(_ context.Context, prepared coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
 	if err := prepared.ValidateFor(prepared.Ref); err != nil {
 		return custodian.VerifiedQuiescence{}, err
 	}
-	launch := s.launch(prepared.Ref.JobID)
-	if launch == nil {
-		return custodian.VerifiedQuiescence{}, fmt.Errorf("admission launch %s cannot be contained: group reference is not registered in this boot", prepared.Ref.JobID)
-	}
-	launch.mu.Lock()
-	active := launch.active
-	session := launch.session
-	group := launch.groups[prepared.Ordinal]
-	launch.mu.Unlock()
-	if !group.Equal(prepared.Group) {
-		return custodian.VerifiedQuiescence{}, fmt.Errorf("admission launch %s group reference mismatch", prepared.Ref.JobID)
-	}
-	if active != nil {
-		active.requestTerminal(engine.StateCanceled)
-		if active.cancel != nil {
-			active.cancel()
-		}
-	}
-	if session != nil {
-		_ = session.Interrupt(ctx)
-	}
-	store := s.server.storeForJob(prepared.Ref.JobID.String())
-	if store == nil {
-		return custodian.VerifiedQuiescence{}, fmt.Errorf("admission launch %s cannot be contained: job store is not registered", prepared.Ref.JobID)
-	}
-	if _, err := store.Cancel(prepared.Ref.JobID.String()); err != nil {
-		return custodian.VerifiedQuiescence{}, err
-	}
-	return s.attestQuiescence(prepared, model.QuiescenceTermKill)
+	return custodian.VerifiedQuiescence{}, custodian.ErrSupervisorUnavailable
 }
 
 func (s *servedAdmissionSupervisor) Retire(_ context.Context, prepared coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
 	if err := prepared.ValidateFor(prepared.Ref); err != nil {
 		return custodian.VerifiedQuiescence{}, err
 	}
-	launch := s.launch(prepared.Ref.JobID)
-	if launch == nil {
-		return custodian.VerifiedQuiescence{}, fmt.Errorf("admission launch %s cannot be retired: group reference is not registered in this boot", prepared.Ref.JobID)
-	}
-	launch.mu.Lock()
-	active := launch.active
-	group := launch.groups[prepared.Ordinal]
-	launch.mu.Unlock()
-	if !group.Equal(prepared.Group) {
-		return custodian.VerifiedQuiescence{}, fmt.Errorf("admission launch %s group reference mismatch", prepared.Ref.JobID)
-	}
-	if active != nil && active.cancel != nil {
-		active.cancel()
-	}
-	return s.attestQuiescence(prepared, model.QuiescenceAlreadyAbsent)
-}
-
-func (s *servedAdmissionSupervisor) attestQuiescence(prepared coordinator.PreparedSupervisor, method model.QuiescenceMethod) (custodian.VerifiedQuiescence, error) {
-	s.mu.Lock()
-	boot := s.boot
-	s.mu.Unlock()
-	if boot.BootID == "" {
-		boot = model.BootRef{BootID: "served-boot", OwnerID: "served-owner"}
-	}
-	return s.issuer.AttestQuiescence(model.QuiescenceCertificate{
-		Attempt:     prepared.Ref,
-		Ordinal:     prepared.Ordinal,
-		Group:       prepared.Group,
-		Method:      method,
-		CertifiedBy: boot,
-	})
+	return custodian.VerifiedQuiescence{}, custodian.ErrSupervisorUnavailable
 }
 
 func (s *servedAdmissionSupervisor) launch(jobID model.JobID) *servedAdmissionLaunch {

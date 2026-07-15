@@ -536,12 +536,8 @@ func TestIdentifiedJobCancelBeforeDeferredLaunchDoesNotStartBackend(t *testing.T
 		t.Fatalf("submit result = %+v", submit.result)
 	}
 	cancel := server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: result.JobID}))
-	if cancel.err != nil {
-		t.Fatalf("cancel error = %+v", cancel.err)
-	}
-	canceled, ok := cancel.result.(protocol.JobCancelResult)
-	if !ok || canceled.State != engine.StateCanceled {
-		t.Fatalf("cancel result = %+v", cancel.result)
+	if cancel.err == nil || !strings.Contains(cancel.err.Message, "supervisor_unavailable") {
+		t.Fatalf("cancel outcome = %+v, want supervisor_unavailable", cancel)
 	}
 
 	submit.after()
@@ -670,8 +666,8 @@ func TestStartupRecoveryFailsClosedWhenSupervisorIdentityCannotBeVerified(t *tes
 	}
 
 	err = second.Serve(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "group reference is not registered in this boot") {
-		t.Fatalf("Serve error = %v, want fail-closed group verification error", err)
+	if err == nil || !strings.Contains(err.Error(), "supervisor_unavailable") {
+		t.Fatalf("Serve error = %v, want fail-closed supervisor_unavailable error", err)
 	}
 }
 

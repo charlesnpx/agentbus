@@ -315,8 +315,8 @@ func (record SafetyRecord) validateTerminalProofSupport() error {
 		if !hasAnyGrant(record.Attempt) {
 			return invalid("terminal.proof", "clean proof requires launch grant evidence")
 		}
-		if !allGrantedLaunchesReleasedAndQuiescent(record.Attempt) {
-			return invalid("terminal.proof", "clean proof requires every granted launch to be released and quiescent")
+		if !allBoundLaunchesReleasedWhenGrantedAndQuiescent(record.Attempt) {
+			return invalid("terminal.proof", "clean proof requires every bound launch to be quiescent and every granted launch to be released")
 		}
 	case ProofContained:
 		if !hasAnyLaunchEvidence(record.Attempt) {

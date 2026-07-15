@@ -46,6 +46,117 @@ type RecoveryPlan struct {
 	Next            RecoveryAction
 }
 
+type GroupExistenceObservation string
+
+const (
+	GroupExistenceUnknown GroupExistenceObservation = "unknown"
+	GroupAbsent           GroupExistenceObservation = "absent"
+	GroupLive             GroupExistenceObservation = "live"
+)
+
+func (observation GroupExistenceObservation) Validate() error {
+	switch observation {
+	case GroupExistenceUnknown, GroupAbsent, GroupLive:
+		return nil
+	default:
+		return invalid("group.existence", "is unknown")
+	}
+}
+
+type ProcessIdentityObservation string
+
+const (
+	ProcessIdentityUnknown  ProcessIdentityObservation = "unknown"
+	ProcessIdentityMissing  ProcessIdentityObservation = "missing"
+	ProcessIdentityMatching ProcessIdentityObservation = "matching"
+	ProcessIdentityReused   ProcessIdentityObservation = "reused"
+)
+
+func (observation ProcessIdentityObservation) Validate() error {
+	switch observation {
+	case ProcessIdentityUnknown, ProcessIdentityMissing, ProcessIdentityMatching, ProcessIdentityReused:
+		return nil
+	default:
+		return invalid("process.identity", "is unknown")
+	}
+}
+
+type DescendantObservation string
+
+const (
+	DescendantsUnknown DescendantObservation = "unknown"
+	DescendantsAbsent  DescendantObservation = "absent"
+	DescendantsPresent DescendantObservation = "present"
+)
+
+func (observation DescendantObservation) Validate() error {
+	switch observation {
+	case DescendantsUnknown, DescendantsAbsent, DescendantsPresent:
+		return nil
+	default:
+		return invalid("descendants", "is unknown")
+	}
+}
+
+type GroupRecoveryObservation struct {
+	HostBootID  string
+	Group       GroupExistenceObservation
+	Leader      ProcessIdentityObservation
+	Monitor     ProcessIdentityObservation
+	Descendants DescendantObservation
+}
+
+func (observation GroupRecoveryObservation) Validate() error {
+	if err := validateToken("group.host_boot_id", observation.HostBootID); err != nil {
+		return err
+	}
+	if err := observation.Group.Validate(); err != nil {
+		return err
+	}
+	if err := observation.Leader.Validate(); err != nil {
+		return err
+	}
+	if err := observation.Monitor.Validate(); err != nil {
+		return err
+	}
+	return observation.Descendants.Validate()
+}
+
+type GroupRecoveryDecision string
+
+const (
+	GroupRecoveryQuiescent  GroupRecoveryDecision = "quiescent"
+	GroupRecoverySignal     GroupRecoveryDecision = "signal"
+	GroupRecoveryUnprovable GroupRecoveryDecision = "recovery_unprovable"
+)
+
+func DecideGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) (GroupRecoveryDecision, error) {
+	if err := ref.Validate(); err != nil {
+		return "", err
+	}
+	if err := observation.Validate(); err != nil {
+		return "", err
+	}
+	if observation.HostBootID != ref.HostBootID {
+		return GroupRecoveryQuiescent, nil
+	}
+	if observation.Group == GroupAbsent {
+		return GroupRecoveryQuiescent, nil
+	}
+	if observation.Group == GroupLive && observation.Leader == ProcessIdentityMatching {
+		return GroupRecoverySignal, nil
+	}
+	if observation.Group == GroupLive {
+		return GroupRecoveryUnprovable, nil
+	}
+	if observation.Leader == ProcessIdentityMissing &&
+		observation.Monitor == ProcessIdentityMissing &&
+		observation.Descendants == DescendantsUnknown {
+		return GroupRecoveryUnprovable, nil
+	}
+	return GroupRecoveryUnprovable, nil
+}
+
 func PlanRecovery(record SafetyRecord, trigger RecoveryTrigger) (RecoveryPlan, error) {
 	if err := trigger.Validate(); err != nil {
 		return RecoveryPlan{}, err
@@ -97,16 +208,8 @@ func finalizable(record SafetyRecord, intent TerminalIntent) bool {
 	return err == nil
 }
 
-func needsContainment(record SafetyRecord, trigger RecoveryTrigger) bool {
-	if hasAnyGrant(record.Attempt) || hasAnyRelease(record.Attempt) {
-		return true
-	}
-	switch trigger {
-	case RecoveryCancelAfterGrant, RecoveryPostGrantFailure:
-		return true
-	default:
-		return false
-	}
+func needsContainment(record SafetyRecord, _ RecoveryTrigger) bool {
+	return hasAnyGrant(record.Attempt) || hasAnyRelease(record.Attempt)
 }
 
 func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger) TerminalIntent {

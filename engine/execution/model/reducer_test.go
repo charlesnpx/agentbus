@@ -82,7 +82,7 @@ func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			before := cloneSafetyRecord(tt.valid)
-			result, err := Apply(tt.valid, tt.command)
+			result, err := apply(tt.valid, tt.command)
 			if err != nil {
 				t.Fatalf("Apply valid predecessor error = %v", err)
 			}
@@ -99,7 +99,7 @@ func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
 				t.Fatalf("successful output failed ValidateSafetyRecord: %v", err)
 			}
 
-			repeated, err := Apply(result.Record, tt.command)
+			repeated, err := apply(result.Record, tt.command)
 			if err != nil {
 				t.Fatalf("Apply duplicate error = %v", err)
 			}
@@ -114,7 +114,7 @@ func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
 			}
 
 			invalidBefore := cloneSafetyRecord(tt.invalid)
-			if _, err := Apply(tt.invalid, tt.command); err == nil {
+			if _, err := apply(tt.invalid, tt.command); err == nil {
 				t.Fatal("Apply invalid predecessor succeeded")
 			}
 			if !reflect.DeepEqual(tt.invalid, invalidBefore) {
@@ -159,11 +159,11 @@ func TestApplyRejectsConflictingDuplicates(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			first, err := Apply(tt.record, tt.first)
+			first, err := apply(tt.record, tt.first)
 			if err != nil {
 				t.Fatalf("first Apply error = %v", err)
 			}
-			if _, err := Apply(first.Record, tt.conflict); !errors.Is(err, ErrConflictingDuplicate) {
+			if _, err := apply(first.Record, tt.conflict); !errors.Is(err, ErrConflictingDuplicate) {
 				t.Fatalf("conflicting duplicate error = %v, want ErrConflictingDuplicate", err)
 			}
 		})
@@ -172,15 +172,15 @@ func TestApplyRejectsConflictingDuplicates(t *testing.T) {
 
 func TestAuthorizeSecondOrdinalRequiresFirstQuiescence(t *testing.T) {
 	first := reducerGrantRecord(t)
-	if _, err := Apply(first, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: reducerGroup(LaunchOrdinalTwo)}); !errors.Is(err, ErrCommandPrecondition) {
+	if _, err := apply(first, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: reducerGroup(LaunchOrdinalTwo)}); !errors.Is(err, ErrCommandPrecondition) {
 		t.Fatalf("ordinal 2 bind before quiescence error = %v, want ErrCommandPrecondition", err)
 	}
 	quiescent := reducerQuiescentRecord(t)
-	bound, err := Apply(quiescent, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: reducerGroup(LaunchOrdinalTwo)})
+	bound, err := apply(quiescent, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: reducerGroup(LaunchOrdinalTwo)})
 	if err != nil {
 		t.Fatalf("ordinal 2 bind after quiescence error = %v", err)
 	}
-	result, err := Apply(bound.Record, CommitGrant{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Nonce: "nonce-2"})
+	result, err := apply(bound.Record, CommitGrant{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Nonce: "nonce-2"})
 	if err != nil {
 		t.Fatalf("ordinal 2 grant after bind error = %v", err)
 	}
@@ -196,7 +196,7 @@ func TestStaleActionReceiptCannotCertifyDifferentAttemptOrGroup(t *testing.T) {
 
 	staleAttempt := reducerContainmentCommand(t, record)
 	staleAttempt.Receipt.Attempt.AttemptID = "attempt-stale"
-	if _, err := Apply(record, staleAttempt); !errors.Is(err, ErrInvalidCommand) {
+	if _, err := apply(record, staleAttempt); !errors.Is(err, ErrInvalidCommand) {
 		t.Fatalf("stale attempt receipt error = %v, want ErrInvalidCommand", err)
 	}
 	if !reflect.DeepEqual(record, before) {
@@ -207,7 +207,7 @@ func TestStaleActionReceiptCannotCertifyDifferentAttemptOrGroup(t *testing.T) {
 	wrongGroup.Receipt.Group.PGID++
 	wrongGroup.Receipt.Group.Leader.PID++
 	wrongGroup.Receipt.Group.Leader.HighResStartToken = "different-group"
-	if _, err := Apply(record, wrongGroup); !errors.Is(err, ErrConflictingDuplicate) {
+	if _, err := apply(record, wrongGroup); !errors.Is(err, ErrConflictingDuplicate) {
 		t.Fatalf("wrong group receipt error = %v, want ErrConflictingDuplicate", err)
 	}
 	if !reflect.DeepEqual(record, before) {
@@ -246,9 +246,29 @@ func TestCleanTerminalProofRequiresEveryCommittedGrantOrdinalCovered(t *testing.
 	record = reducerMustApply(t, record, reducerQuiescenceCommand(t, record, LaunchOrdinalTwo))
 	record = reducerMustApply(t, record, ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeCompleted})
 	record = reducerMustApply(t, record, reducerResultCommand(t, record))
-	finalized, err := Apply(record, Finalize{Ref: reducerRef(), Intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally}})
+	finalized, err := apply(record, Finalize{Ref: reducerRef(), Intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally}})
 	if err != nil {
 		t.Fatalf("clean finalize with both grant ordinals covered error = %v", err)
+	}
+	if finalized.Record.Terminal == nil || finalized.Record.Terminal.Proof != ProofCleanQuiescentOutcomeAndRetired {
+		t.Fatalf("terminal = %#v, want clean quiescent proof", finalized.Record.Terminal)
+	}
+}
+
+func TestCleanTerminalProofRequiresBoundUngrantedOrdinalQuiescence(t *testing.T) {
+	record := reducerQuiescentRecord(t)
+	record = reducerMustApply(t, record, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: reducerGroup(LaunchOrdinalTwo)})
+	record = reducerMustApply(t, record, ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeCompleted})
+	record = reducerMustApply(t, record, reducerResultCommand(t, record))
+
+	if _, err := apply(record, Finalize{Ref: reducerRef(), Intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally}}); !errors.Is(err, ErrCommandPrecondition) {
+		t.Fatalf("clean finalize with unretired bound ordinal error = %v, want ErrCommandPrecondition", err)
+	}
+
+	record = reducerMustApply(t, record, reducerQuiescenceCommandWithMethod(t, record, LaunchOrdinalTwo, QuiescenceAlreadyAbsent))
+	finalized, err := apply(record, Finalize{Ref: reducerRef(), Intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally}})
+	if err != nil {
+		t.Fatalf("clean finalize after retiring bound ordinal error = %v", err)
 	}
 	if finalized.Record.Terminal == nil || finalized.Record.Terminal.Proof != ProofCleanQuiescentOutcomeAndRetired {
 		t.Fatalf("terminal = %#v, want clean quiescent proof", finalized.Record.Terminal)
@@ -325,6 +345,7 @@ func TestPlanRecoveryUsesOnePlannerForRecoveryTriggers(t *testing.T) {
 		want    RecoveryActionKind
 	}{
 		{name: "startup loss without grant", record: reducerSupervisorRecord(), trigger: RecoveryStartupLoss, want: RecoveryRetireThenFinalize},
+		{name: "post grant failure before grant commit", record: reducerSupervisorRecord(), trigger: RecoveryPostGrantFailure, want: RecoveryRetireThenFinalize},
 		{name: "live loss with grant", record: reducerGrantRecord(t), trigger: RecoveryLiveLoss, want: RecoveryContainThenFinalize},
 		{name: "cancel with grant", record: reducerGrantRecord(t), trigger: RecoveryCancelAfterGrant, want: RecoveryContainThenFinalize},
 		{name: "corrupt with grant", record: reducerGrantRecord(t), trigger: RecoveryCorruption, want: RecoveryContainThenFinalize},
@@ -454,15 +475,15 @@ func reducerCleanCompletedRecord(t *testing.T) SafetyRecord {
 
 func reducerMustApply(t *testing.T, record SafetyRecord, command Command) SafetyRecord {
 	t.Helper()
-	result, err := Apply(record, command)
+	result, err := apply(record, command)
 	if err != nil {
-		t.Fatalf("Apply(%T) error = %v", command, err)
+		t.Fatalf("apply(%T) error = %v", command, err)
 	}
 	if !result.Changed {
-		t.Fatalf("Apply(%T) did not change record", command)
+		t.Fatalf("apply(%T) did not change record", command)
 	}
 	if err := ValidateSafetyRecord(result.Record); err != nil {
-		t.Fatalf("Apply(%T) output invalid: %v", command, err)
+		t.Fatalf("apply(%T) output invalid: %v", command, err)
 	}
 	return result.Record
 }

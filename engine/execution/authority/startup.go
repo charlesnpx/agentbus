@@ -202,7 +202,7 @@ func applyRecoveryCommandTx(tx repository.WriteTx, jobID model.JobID, command mo
 		return ApplyResult{}, err
 	}
 	sessionID := repair.SessionID
-	applied, err := model.Apply(record, command)
+	applied, err := applyLogicalCommand(record, command)
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -266,7 +266,7 @@ func applyRecoveryQuiescenceTx(tx repository.WriteTx, jobID model.JobID, ordinal
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	applied, err := model.Apply(record, model.RecordQuiescence{Ref: record.Attempt.Ref, Receipt: certificate})
+	applied, err := applyVerifiedQuiescence(record, certificate)
 	if err != nil {
 		return ApplyResult{}, err
 	}

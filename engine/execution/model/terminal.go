@@ -95,7 +95,7 @@ func cleanQuiescentOutcomeAndRetired(record SafetyRecord, intent TerminalIntent)
 	if hasContainedQuiescence(record.Attempt) || !hasAnyGrant(record.Attempt) {
 		return false
 	}
-	if !allGrantedLaunchesReleasedAndQuiescent(record.Attempt) {
+	if !allBoundLaunchesReleasedWhenGrantedAndQuiescent(record.Attempt) {
 		return false
 	}
 	return !hasUnconsumedGrant(record.Attempt) && !hasActiveLaunch(record.Attempt)

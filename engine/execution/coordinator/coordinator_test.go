@@ -196,6 +196,54 @@ func TestCorrectiveLaunchRequiresQuiescence(t *testing.T) {
 	}
 }
 
+func TestCorrectiveLaunchUsesIndependentOrdinalCustody(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "corrective-independent")
+	accepted := h.submitPreparedPermitted(t, ctx, "corrective-independent")
+	if err := h.coordinator.Start(ctx, accepted.Record.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
+	record := snapshot.Record
+	if err := h.coordinator.certifyQuiescence(ctx, &record, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.coordinator.GrantPermit(ctx, accepted.Record.JobID, 2, model.PermitNonce("nonce-2"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.coordinator.Start(ctx, accepted.Record.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.coordinator.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot = h.snapshot(t, ctx, accepted.Record.JobID)
+	first, ok := snapshot.Record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok {
+		t.Fatal("ordinal 1 launch missing")
+	}
+	second, ok := snapshot.Record.Attempt.Launches.Get(model.LaunchOrdinalTwo)
+	if !ok {
+		t.Fatal("ordinal 2 launch missing")
+	}
+	if first.Group == nil || second.Group == nil || first.Group.Equal(*second.Group) {
+		t.Fatalf("launch groups = first:%#v second:%#v, want independent groups", first.Group, second.Group)
+	}
+	if first.Grant == nil || second.Grant == nil || first.Grant.Ordinal != model.LaunchOrdinalOne || second.Grant.Ordinal != model.LaunchOrdinalTwo {
+		t.Fatalf("launch grants = first:%#v second:%#v, want per-ordinal grants", first.Grant, second.Grant)
+	}
+	if first.Released == nil || second.Released == nil || first.Released.Ordinal != model.LaunchOrdinalOne || second.Released.Ordinal != model.LaunchOrdinalTwo {
+		t.Fatalf("launch releases = first:%#v second:%#v, want per-ordinal releases", first.Released, second.Released)
+	}
+	if first.Quiescence == nil || second.Quiescence == nil {
+		t.Fatalf("launch quiescence = first:%#v second:%#v, want both ordinals quiescent", first.Quiescence, second.Quiescence)
+	}
+	if !first.Quiescence.Group.Equal(*first.Group) || !second.Quiescence.Group.Equal(*second.Group) {
+		t.Fatalf("quiescence groups = first:%#v second:%#v, want matching per-ordinal groups", first.Quiescence.Group, second.Quiescence.Group)
+	}
+}
+
 func TestPostGrantFailureRecoveryContainsAndRetires(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, "post-grant")
@@ -241,7 +289,7 @@ func TestDoubleFaultDuringRecoveryFailStops(t *testing.T) {
 	}
 }
 
-func TestGrantBeforeCommitFailpointLeavesNoAuthorityCommitOrPermit(t *testing.T) {
+func TestGrantBeforeCommitFailpointRetiresBoundGroupWithoutPermit(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, "grant-before-commit")
 	accepted := h.submit(t, ctx, "grant-before-commit")
@@ -257,11 +305,24 @@ func TestGrantBeforeCommitFailpointLeavesNoAuthorityCommitOrPermit(t *testing.T)
 		t.Fatal("grant before-commit failpoint was not hit")
 	}
 	snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
-	if hasCommittedGrant(snapshot.Record) || snapshot.Record.Terminal != nil {
-		t.Fatalf("record after before-commit failure = %#v, want no grant and nonterminal", snapshot.Record)
+	if hasCommittedGrant(snapshot.Record) {
+		t.Fatalf("record after before-commit failure = %#v, want no grant", snapshot.Record)
+	}
+	launch, ok := snapshot.Record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || launch.Quiescence == nil {
+		t.Fatalf("launch after before-commit failure = %#v, want retired quiescence", launch)
+	}
+	if snapshot.Record.Terminal == nil {
+		t.Fatal("terminal certificate missing after before-commit recovery")
+	}
+	if snapshot.Record.Terminal.Proof != model.ProofNeverPermittedAndRetired {
+		t.Fatalf("proof = %s, want %s", snapshot.Record.Terminal.Proof, model.ProofNeverPermittedAndRetired)
 	}
 	if h.supervisor.permits != 0 {
 		t.Fatalf("permit sends = %d, want 0", h.supervisor.permits)
+	}
+	if h.supervisor.retired != 1 {
+		t.Fatalf("retire calls = %d, want 1", h.supervisor.retired)
 	}
 }
 

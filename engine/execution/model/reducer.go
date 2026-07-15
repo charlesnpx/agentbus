@@ -30,7 +30,43 @@ func ValidateSafetyRecord(record SafetyRecord) error {
 	return nil
 }
 
-func Apply(current SafetyRecord, command Command) (ApplyResult, error) {
+func ApplyAcknowledge(current SafetyRecord, command Acknowledge) (ApplyResult, error) {
+	return apply(current, command)
+}
+
+func ApplyBeginReject(current SafetyRecord, command BeginReject) (ApplyResult, error) {
+	return apply(current, command)
+}
+
+func ApplyBindGroup(current SafetyRecord, command BindGroup) (ApplyResult, error) {
+	return apply(current, command)
+}
+
+func ApplyCommitGrant(current SafetyRecord, command CommitGrant) (ApplyResult, error) {
+	return apply(current, command)
+}
+
+func ApplyRecordRelease(current SafetyRecord, command RecordRelease) (ApplyResult, error) {
+	return apply(current, command)
+}
+
+func ApplyRequestCancel(current SafetyRecord, command RequestCancel) (ApplyResult, error) {
+	return apply(current, command)
+}
+
+func ApplyObserveOutcome(current SafetyRecord, command ObserveOutcome) (ApplyResult, error) {
+	return apply(current, command)
+}
+
+func ApplyCertifyResult(current SafetyRecord, command CertifyResult) (ApplyResult, error) {
+	return apply(current, command)
+}
+
+func ApplyFinalize(current SafetyRecord, command Finalize) (ApplyResult, error) {
+	return apply(current, command)
+}
+
+func apply(current SafetyRecord, command Command) (ApplyResult, error) {
 	if err := ValidateSafetyRecord(current); err != nil {
 		return ApplyResult{}, invalidCommand("current safety record is invalid: %v", err)
 	}
@@ -548,13 +584,13 @@ func allLaunchGroupsQuiescent(proof AttemptProof) bool {
 	return true
 }
 
-func allGrantedLaunchesReleasedAndQuiescent(proof AttemptProof) bool {
+func allBoundLaunchesReleasedWhenGrantedAndQuiescent(proof AttemptProof) bool {
 	for _, ordinal := range proof.Launches.FilledOrdinals() {
 		launch, ok := proof.Launches.Get(ordinal)
-		if !ok || launch.Grant == nil {
-			continue
+		if !ok || launch.Group == nil || launch.Quiescence == nil {
+			return false
 		}
-		if launch.Released == nil || launch.Quiescence == nil {
+		if launch.Grant != nil && launch.Released == nil {
 			return false
 		}
 	}

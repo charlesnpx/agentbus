@@ -187,7 +187,7 @@ func (c *Coordinator) GrantPermit(ctx context.Context, jobID model.JobID, launch
 		snapshot.Record = applied.Record
 	}
 	if err := inject(injector, FailGrantBeforeCommit); err != nil {
-		return err
+		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
 	}
 	applied, err := c.authority.CommitGrant(ctx, jobID, snapshot.Record.Attempt.Ref, ordinal, nonce)
 	if err != nil {
