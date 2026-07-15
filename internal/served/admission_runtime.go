@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
@@ -17,278 +16,73 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 )
 
-const servedAdmissionHostBootID = "served-host-boot"
-
 type servedAdmissionSupervisor struct {
-	server *Server
-
-	mu       sync.Mutex
-	boot     model.BootRef
+	process  custodian.ProcessCustodian
 	verifier custodian.AttestationVerifier
-	launches map[model.JobID]*servedAdmissionLaunch
 }
 
-type servedAdmissionLaunch struct {
-	mu       sync.Mutex
-	plans    map[model.LaunchOrdinal]coordinator.LaunchPlan
-	groups   map[model.LaunchOrdinal]model.GroupRef
-	backend  engine.Backend
-	opts     engine.SessionOpts
-	permits  map[model.LaunchOrdinal]model.LaunchGrant
-	sessions map[model.LaunchOrdinal]engine.Session
-	children map[model.LaunchOrdinal]model.ChildIdentity
-	active   *activeJob
+type verifiedContainmentSupporter interface {
+	VerifiedContainmentSupported(context.Context) error
 }
 
-func newServedAdmissionSupervisor(server *Server) *servedAdmissionSupervisor {
+func newServedAdmissionSupervisor(_ *Server) *servedAdmissionSupervisor {
 	_, verifier := custodian.NewAttestationChannel()
 	return &servedAdmissionSupervisor{
-		server:   server,
+		process:  custodian.UnavailableCustodian{},
 		verifier: verifier,
-		launches: make(map[model.JobID]*servedAdmissionLaunch),
 	}
 }
 
-func (s *servedAdmissionSupervisor) SetBoot(boot model.BootRef) {
+func (s *servedAdmissionSupervisor) SetBoot(model.BootRef) {
+}
+
+func (s *servedAdmissionSupervisor) verifiedContainmentSupported(ctx context.Context) error {
 	if s == nil {
-		return
+		return fmt.Errorf("%w: admission supervisor is nil", custodian.ErrSupervisorUnavailable)
 	}
-	s.mu.Lock()
-	s.boot = boot
-	s.mu.Unlock()
+	if s.process == nil {
+		return fmt.Errorf("%w: process custodian is nil", custodian.ErrSupervisorUnavailable)
+	}
+	reporter, ok := s.process.(verifiedContainmentSupporter)
+	if !ok {
+		return fmt.Errorf("%w: process custodian does not report verified containment support", custodian.ErrSupervisorUnavailable)
+	}
+	return reporter.VerifiedContainmentSupported(ctx)
 }
 
-func (s *servedAdmissionSupervisor) Register(jobID model.JobID, backend engine.Backend, opts engine.SessionOpts) error {
-	if s == nil {
-		return errors.New("admission supervisor is nil")
-	}
-	if err := jobID.Validate(); err != nil {
-		return err
-	}
-	if backend == nil {
-		return errors.New("backend is required")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	launch := s.launches[jobID]
-	if launch == nil {
-		launch = &servedAdmissionLaunch{
-			backend:  backend,
-			opts:     opts,
-			plans:    make(map[model.LaunchOrdinal]coordinator.LaunchPlan),
-			groups:   make(map[model.LaunchOrdinal]model.GroupRef),
-			permits:  make(map[model.LaunchOrdinal]model.LaunchGrant),
-			sessions: make(map[model.LaunchOrdinal]engine.Session),
-			children: make(map[model.LaunchOrdinal]model.ChildIdentity),
-		}
-		s.launches[jobID] = launch
-		return nil
-	}
-	launch.mu.Lock()
-	defer launch.mu.Unlock()
-	if len(launch.sessions) != 0 {
-		return fmt.Errorf("admission launch already started for %s", jobID)
-	}
-	launch.backend = backend
-	launch.opts = opts
-	return nil
+func (s *servedAdmissionSupervisor) Register(model.JobID, engine.Backend, engine.SessionOpts) error {
+	return custodian.ErrSupervisorUnavailable
 }
 
-func (s *servedAdmissionSupervisor) AttachActive(jobID model.JobID, active *activeJob) {
-	launch := s.launch(jobID)
-	if launch == nil {
-		return
-	}
-	launch.mu.Lock()
-	launch.active = active
-	launch.mu.Unlock()
+func (s *servedAdmissionSupervisor) AttachActive(model.JobID, *activeJob) {
 }
 
-func (s *servedAdmissionSupervisor) Started(jobID model.JobID, ordinal model.LaunchOrdinal) (engine.Session, string, error) {
-	if err := ordinal.Validate(); err != nil {
-		return nil, "", err
-	}
-	launch := s.launch(jobID)
-	if launch == nil {
-		return nil, "", fmt.Errorf("admission launch %s is not registered", jobID)
-	}
-	launch.mu.Lock()
-	defer launch.mu.Unlock()
-	session := launch.sessions[ordinal]
-	if session == nil {
-		return nil, "", fmt.Errorf("admission launch %s ordinal %s has not started", jobID, ordinal)
-	}
-	sessionID := launch.plans[ordinal].SessionID
-	if id := session.ID(); id != "" {
-		sessionID = id
-	}
-	return session, sessionID, nil
+func (s *servedAdmissionSupervisor) Started(model.JobID, model.LaunchOrdinal) (engine.Session, string, error) {
+	return nil, "", custodian.ErrSupervisorUnavailable
 }
 
-func (s *servedAdmissionSupervisor) Prepare(_ context.Context, plan coordinator.LaunchPlan) (coordinator.PreparedSupervisor, error) {
-	if err := plan.JobID.Validate(); err != nil {
-		return coordinator.PreparedSupervisor{}, err
-	}
-	if err := plan.Ref.Validate(); err != nil {
-		return coordinator.PreparedSupervisor{}, err
-	}
-	if err := plan.Ordinal.Validate(); err != nil {
-		return coordinator.PreparedSupervisor{}, err
-	}
-	launch := s.launch(plan.JobID)
-	if launch == nil {
-		return coordinator.PreparedSupervisor{}, fmt.Errorf("admission launch %s is not registered", plan.JobID)
-	}
-	pid := os.Getpid()
-	group := model.GroupRef{
-		Version:   1,
-		CustodyID: model.CustodyID(fmt.Sprintf("custody-%s-%s", plan.JobID, plan.Ordinal)),
-		Launch: model.LaunchKey{
-			Attempt: plan.Ref,
-			Ordinal: plan.Ordinal,
-		},
-		HostBootID: servedAdmissionHostBootID,
-		PGID:       pid,
-		Leader: model.ProcessIdentity{
-			PID:               pid,
-			HighResStartToken: fmt.Sprintf("served-leader-%s-%s", plan.Ref.AttemptID, plan.Ordinal),
-		},
-		Monitor: model.ProcessIdentity{
-			PID:               pid,
-			HighResStartToken: fmt.Sprintf("served-monitor-%s-%s", plan.Ref.AttemptID, plan.Ordinal),
-		},
-		RetainedID: plan.JobID.String(),
-	}
-	if err := group.Validate(); err != nil {
-		return coordinator.PreparedSupervisor{}, err
-	}
-	prepared := coordinator.PreparedSupervisor{Ref: plan.Ref, Ordinal: plan.Ordinal, Group: group}
-	if err := prepared.ValidateFor(plan.Ref); err != nil {
-		return coordinator.PreparedSupervisor{}, err
-	}
-	launch.mu.Lock()
-	if launch.plans == nil {
-		launch.plans = make(map[model.LaunchOrdinal]coordinator.LaunchPlan)
-	}
-	if launch.groups == nil {
-		launch.groups = make(map[model.LaunchOrdinal]model.GroupRef)
-	}
-	launch.plans[plan.Ordinal] = plan
-	launch.groups[plan.Ordinal] = group
-	launch.mu.Unlock()
-	return prepared, nil
+func (s *servedAdmissionSupervisor) Prepare(context.Context, coordinator.LaunchPlan) (coordinator.PreparedSupervisor, error) {
+	return coordinator.PreparedSupervisor{}, custodian.ErrSupervisorUnavailable
 }
 
-func (s *servedAdmissionSupervisor) SendPermit(_ context.Context, prepared coordinator.PreparedSupervisor, grant model.LaunchGrant) error {
-	if err := prepared.ValidateFor(grant.Attempt); err != nil {
-		return err
-	}
-	launch := s.launch(grant.Attempt.JobID)
-	if launch == nil {
-		return fmt.Errorf("admission launch %s is not registered", grant.Attempt.JobID)
-	}
-	launch.mu.Lock()
-	defer launch.mu.Unlock()
-	if prepared.Ordinal != grant.Ordinal {
-		return fmt.Errorf("admission launch %s permit ordinal mismatch", grant.Attempt.JobID)
-	}
-	if permit, ok := launch.permits[grant.Ordinal]; ok {
-		if permit == grant {
-			return nil
-		}
-		return fmt.Errorf("admission launch %s already has a different permit", grant.Attempt.JobID)
-	}
-	launch.permits[grant.Ordinal] = grant
-	return nil
+func (s *servedAdmissionSupervisor) SendPermit(context.Context, coordinator.PreparedSupervisor, model.LaunchGrant) error {
+	return custodian.ErrSupervisorUnavailable
 }
 
-func (s *servedAdmissionSupervisor) ObserveLaunch(ctx context.Context, prepared coordinator.PreparedSupervisor, grant model.LaunchGrant) (coordinator.LaunchObservation, error) {
-	if err := prepared.ValidateFor(grant.Attempt); err != nil {
-		return coordinator.LaunchObservation{}, err
-	}
-	launch := s.launch(grant.Attempt.JobID)
-	if launch == nil {
-		return coordinator.LaunchObservation{}, fmt.Errorf("admission launch %s is not registered", grant.Attempt.JobID)
-	}
-	launch.mu.Lock()
-	defer launch.mu.Unlock()
-	if permit, ok := launch.permits[grant.Ordinal]; !ok || permit != grant {
-		return coordinator.LaunchObservation{}, fmt.Errorf("admission launch %s has no matching permit", grant.Attempt.JobID)
-	}
-	if launch.sessions == nil {
-		launch.sessions = make(map[model.LaunchOrdinal]engine.Session)
-	}
-	if launch.sessions[grant.Ordinal] == nil {
-		session, err := launch.backend.Start(ctx, launch.opts)
-		if err != nil {
-			return coordinator.LaunchObservation{}, err
-		}
-		launch.sessions[grant.Ordinal] = session
-	}
-	child := launch.children[grant.Ordinal]
-	if child.PID == 0 {
-		child := model.ChildIdentity{
-			PID:               os.Getpid(),
-			HighResStartToken: fmt.Sprintf("served-child-%s-%s", grant.Attempt.AttemptID, grant.Ordinal),
-		}
-		if err := child.Validate(); err != nil {
-			return coordinator.LaunchObservation{}, err
-		}
-		launch.children[grant.Ordinal] = child
-	}
-	return coordinator.LaunchObservation{
-		Ordinal: grant.Ordinal,
-		Child:   launch.children[grant.Ordinal],
-		Evidence: model.Evidence{
-			Kind:   "served_launch",
-			Detail: "backend_session_started",
-		},
-	}, nil
+func (s *servedAdmissionSupervisor) ObserveLaunch(context.Context, coordinator.PreparedSupervisor, model.LaunchGrant) (coordinator.LaunchObservation, error) {
+	return coordinator.LaunchObservation{}, custodian.ErrSupervisorUnavailable
 }
 
-func (s *servedAdmissionSupervisor) VerifyQuiescence(_ context.Context, prepared coordinator.PreparedSupervisor, released model.LaunchReleaseFact) (custodian.VerifiedQuiescence, error) {
-	if err := prepared.ValidateFor(released.Attempt); err != nil {
-		return custodian.VerifiedQuiescence{}, err
-	}
-	return custodian.VerifiedQuiescence{}, custodian.ErrSupervisorUnavailable
+func (s *servedAdmissionSupervisor) VerifyQuiescence(context.Context, coordinator.PreparedSupervisor, model.LaunchReleaseFact) (verified custodian.VerifiedQuiescence, err error) {
+	return verified, custodian.ErrSupervisorUnavailable
 }
 
-func (s *servedAdmissionSupervisor) Contain(_ context.Context, prepared coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
-	return s.unavailableAfterRecoveryDecision(prepared)
+func (s *servedAdmissionSupervisor) Contain(context.Context, coordinator.PreparedSupervisor) (verified custodian.VerifiedQuiescence, err error) {
+	return verified, custodian.ErrSupervisorUnavailable
 }
 
-func (s *servedAdmissionSupervisor) Retire(_ context.Context, prepared coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
-	return s.unavailableAfterRecoveryDecision(prepared)
-}
-
-func (s *servedAdmissionSupervisor) unavailableAfterRecoveryDecision(prepared coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
-	decision, err := s.recoveryDecision(prepared)
-	if err != nil {
-		return custodian.VerifiedQuiescence{}, err
-	}
-	return custodian.VerifiedQuiescence{}, fmt.Errorf("%w: %s", custodian.ErrSupervisorUnavailable, decision)
-}
-
-func (s *servedAdmissionSupervisor) recoveryDecision(prepared coordinator.PreparedSupervisor) (model.GroupRecoveryDecision, error) {
-	if err := prepared.ValidateFor(prepared.Ref); err != nil {
-		return "", err
-	}
-	return model.DecideGroupRecovery(prepared.Group, model.GroupRecoveryObservation{
-		HostBootID:  servedAdmissionHostBootID,
-		Group:       model.GroupExistenceUnknown,
-		Leader:      model.ProcessIdentityUnknown,
-		Monitor:     model.ProcessIdentityUnknown,
-		Descendants: model.DescendantsUnknown,
-	})
-}
-
-func (s *servedAdmissionSupervisor) launch(jobID model.JobID) *servedAdmissionLaunch {
-	if s == nil {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.launches[jobID]
+func (s *servedAdmissionSupervisor) Retire(context.Context, coordinator.PreparedSupervisor) (verified custodian.VerifiedQuiescence, err error) {
+	return verified, custodian.ErrSupervisorUnavailable
 }
 
 type servedResultPublisher struct {

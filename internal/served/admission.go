@@ -33,15 +33,19 @@ type admissionCoordinator = coordinator.Coordinator
 type admissionBootstrapperFactory func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error)
 
 func (s *Server) bootstrapAdmission(ctx context.Context) error {
-	if s.admissionReady != nil && s.admissionCoordinator != nil {
-		return nil
-	}
-
 	supervisor := s.admissionSupervisor
 	if supervisor == nil {
 		supervisor = newServedAdmissionSupervisor(s)
 		s.admissionSupervisor = supervisor
 	}
+	if err := supervisor.verifiedContainmentSupported(ctx); err != nil {
+		s.jobsRequestIDEnabled = false
+		return err
+	}
+	if s.admissionReady != nil && s.admissionCoordinator != nil {
+		return nil
+	}
+
 	factory := s.admissionBootstrapperFactory
 	if factory == nil {
 		factory = openAdmissionBootstrapper
@@ -831,6 +835,8 @@ func admissionProtocolError(err error) *protocol.ErrorObject {
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, authority.ErrRequestExpired):
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
+	case errors.Is(err, custodian.ErrSupervisorUnavailable):
+		return protocol.NewError(protocol.ErrorCapabilityMissing, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, authority.ErrNotReady), errors.Is(err, coordinator.ErrCoordinatorNotReady):
 		return protocol.NewError(protocol.ErrorCapabilityMissing, err.Error(), protocol.ErrorData{})
 	default:

@@ -117,7 +117,6 @@ func DefaultCapabilities() map[string]bool {
 		"nativeStructuredOutput.claude": false,
 		"models.discovery":              true,
 		"models.reported":               true,
-		"jobs.requestId":                false,
 	}
 }
 

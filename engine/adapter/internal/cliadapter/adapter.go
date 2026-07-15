@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 )
 
 const DriftError = "backend version changed since setup; re-run agentbus setup"
@@ -34,6 +35,7 @@ type Backend struct {
 	Parse            func(map[string]any) ([]engine.Event, string, error)
 	VersionTransform func(string) string
 	Discover         func(context.Context, string) (*engine.ModelDiscovery, error)
+	CommandRunner    custodian.CommandRunner
 }
 
 func (b *Backend) Name() string { return b.NameValue }
@@ -195,6 +197,13 @@ func (b *Backend) binary() string {
 	return b.NameValue
 }
 
+func (b *Backend) commandRunner() custodian.CommandRunner {
+	if b.CommandRunner != nil {
+		return b.CommandRunner
+	}
+	return DirectCommandRunner{}
+}
+
 func (b *Backend) normalizeVersion(s string) string {
 	s = strings.TrimSpace(s)
 	if b.VersionTransform != nil {
@@ -321,7 +330,7 @@ type Session struct {
 	validationWarning         string
 	suppressValidationWarning bool
 	mu                        sync.Mutex
-	active                    *exec.Cmd
+	active                    custodian.RunningCommand
 	lastAgentMessage          string
 }
 
@@ -367,22 +376,9 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		s.mu.Unlock()
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, s.backend.binary(), args...)
-	cmd.Cancel = func() error { return terminateProcessGroup(cmd, engine.DefaultCancelGrace) }
-	cmd.WaitDelay = 200 * time.Millisecond
+	spec := custodian.ExecSpec{Argv: append([]string{s.backend.binary()}, args...)}
 	if s.opts.CWD != "" {
-		cmd.Dir = s.opts.CWD
-	}
-	setProcessGroup(cmd)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		s.mu.Unlock()
-		return nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		s.mu.Unlock()
-		return nil, err
+		spec.Dir = s.opts.CWD
 	}
 	var stderr bytes.Buffer
 	var stderrLog *engine.CappedLogWriter
@@ -395,7 +391,6 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		}
 		stderrWriter = io.MultiWriter(&stderr, stderrLog)
 	}
-	cmd.Stderr = stderrWriter
 	var stdoutLog *engine.CappedLogWriter
 	if input.LogPaths.Stdout != "" {
 		stdoutLog, err = engine.NewCappedLogWriter(input.LogPaths.Stdout, 0)
@@ -407,7 +402,8 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 			return nil, err
 		}
 	}
-	if err := cmd.Start(); err != nil {
+	command, err := s.backend.commandRunner().Start(ctx, spec)
+	if err != nil {
 		if stdoutLog != nil {
 			_ = stdoutLog.Close()
 		}
@@ -418,9 +414,17 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		return nil, err
 	}
 	if input.OnProcessStart != nil {
-		input.OnProcessStart(processRefForCmd(cmd), cmd.Process.Pid)
+		if reporter, ok := command.(interface {
+			ProcessRef() (engine.ProcessRef, int)
+		}); ok {
+			ref, backendChildPID := reporter.ProcessRef()
+			input.OnProcessStart(ref, backendChildPID)
+		}
 	}
-	s.active = cmd
+	stdin := command.Stdin()
+	stdout := command.Stdout()
+	stderrPipe := command.Stderr()
+	s.active = command
 	s.mu.Unlock()
 
 	events := make(chan engine.Event, 16)
@@ -437,6 +441,11 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 				_ = stderrLog.Close()
 			}
 		}()
+		stderrDone := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(stderrWriter, stderrPipe)
+			close(stderrDone)
+		}()
 		go func() {
 			_, _ = io.WriteString(stdin, input.Prompt)
 			_ = stdin.Close()
@@ -446,9 +455,10 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 			stdoutReader = io.TeeReader(stdout, stdoutLog)
 		}
 		parseErr := s.scan(stdoutReader, events)
-		waitErr := cmd.Wait()
+		_, waitErr := command.Wait(ctx)
+		<-stderrDone
 		s.mu.Lock()
-		if s.active == cmd {
+		if s.active == command {
 			s.active = nil
 		}
 		s.mu.Unlock()
@@ -472,19 +482,12 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 
 func (s *Session) Interrupt(ctx context.Context) error {
 	s.mu.Lock()
-	cmd := s.active
+	command := s.active
 	s.mu.Unlock()
-	if cmd == nil {
+	if command == nil {
 		return nil
 	}
-	done := make(chan error, 1)
-	go func() { done <- terminateProcessGroup(cmd, engine.DefaultCancelGrace) }()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-done:
-		return err
-	}
+	return command.Interrupt(ctx)
 }
 
 func (s *Session) scan(r io.Reader, out chan<- engine.Event) error {
@@ -525,23 +528,6 @@ func (s *Session) scan(r io.Reader, out chan<- engine.Event) error {
 		}
 	}
 	return scanner.Err()
-}
-
-func processRefForCmd(cmd *exec.Cmd) engine.ProcessRef {
-	ref := engine.ProcessRef{}
-	if cmd == nil || cmd.Process == nil {
-		return ref
-	}
-	ref.PID = cmd.Process.Pid
-	if runtime.GOOS != "windows" {
-		if pgid, err := syscall.Getpgid(ref.PID); err == nil {
-			ref.PGID = pgid
-		}
-	}
-	if info, alive, err := (engine.NativeProcessTable{}).Lookup(ref.PID); err == nil && alive {
-		ref.StartTime = info.StartTime
-	}
-	return ref
 }
 
 func capEvent(ev engine.Event) engine.Event {

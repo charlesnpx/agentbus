@@ -29,6 +29,11 @@ receives a permit.
 The durable store can identify each executing group even when failure occurs before `BACKEND_STARTED`.
 Admission authority holds only the attestation verifier; the custodian holds the issuer.
 
+S1 ships only the honest disabled foundation: `DirectCommandRunner` preserves v0.5.1 process behavior
+when admission is off, and production admission composes `UnavailableCustodian`, which reports
+`supervisor_unavailable` instead of physical containment support. The real custodian TCB remains pending
+in S2-S4.
+
 ## Non-goals
 
 This ADR does not define adapter-specific command-line details.

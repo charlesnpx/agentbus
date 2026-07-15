@@ -5,7 +5,7 @@ They are constraints for the executable lifecycle model and later production uni
 
 | ADR | Decision |
 | --- | --- |
-| [ADR-0](ADR-0.md) | Reliable admission is exactly-once by request key and fail-closed for execution. |
+| [ADR-0](ADR-0.md) | Reliable admission target is exactly-once by request key and fail-closed for execution. |
 | [ADR-0B](ADR-0B.md) | Replays use a stable client-supplied workspace key and recorded fingerprint version. |
 | [ADR-1](ADR-1.md) | Fenced coordinator admissions use one atomic root AdmissionStore. |
 | [ADR-1A](ADR-1A.md) | Whole-store integrity failures are fatal and never silently recreated. |

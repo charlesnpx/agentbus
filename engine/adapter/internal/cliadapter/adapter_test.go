@@ -3,6 +3,7 @@ package cliadapter
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 )
 
 func TestCapEventKeepsRawTextOutOfJSONMetadata(t *testing.T) {
@@ -49,7 +51,10 @@ func TestSessionInterruptUsesProtocolDefaultGrace(t *testing.T) {
 		seen <- grace
 		return nil
 	}
-	session := &Session{active: &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}}
+	session := &Session{active: &directRunningCommand{
+		cmd:         &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}},
+		cancelGrace: engine.DefaultCancelGrace,
+	}}
 	if err := session.Interrupt(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -115,6 +120,44 @@ func TestSessionTurnSurfacesNonzeroExitAsTerminalError(t *testing.T) {
 	}
 }
 
+func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
+	runner := &fakeCommandRunner{}
+	backend := &Backend{
+		NameValue:     "fake",
+		Binary:        "fake-binary",
+		CachePath:     filepath.Join(t.TempDir(), "missing-cache.json"),
+		CommandRunner: runner,
+		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
+			return []string{"run", "--json"}, nil
+		},
+		Parse: func(map[string]any) ([]engine.Event, string, error) {
+			return []engine.Event{{Type: engine.EventAgentText, Text: "ok"}}, "stream-session", nil
+		},
+	}
+	cwd := t.TempDir()
+	session, err := backend.Start(context.Background(), engine.SessionOpts{CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEvents(events)
+	if len(got) != 1 || got[0].Type != engine.EventAgentText || got[0].Text != "ok" {
+		t.Fatalf("events = %#v, want parsed adapter event", got)
+	}
+	if session.ID() != "stream-session" {
+		t.Fatalf("session id = %q, want stream-session", session.ID())
+	}
+	if strings.Join(runner.spec.Argv, "\x00") != strings.Join([]string{"fake-binary", "run", "--json"}, "\x00") {
+		t.Fatalf("argv = %#v", runner.spec.Argv)
+	}
+	if runner.spec.Dir != cwd {
+		t.Fatalf("dir = %q, want %q", runner.spec.Dir, cwd)
+	}
+}
+
 func fakeTerminalErrorCLI(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fakecli")
@@ -137,4 +180,53 @@ func collectEvents(ch <-chan engine.Event) []engine.Event {
 		out = append(out, ev)
 	}
 	return out
+}
+
+type fakeCommandRunner struct {
+	spec custodian.ExecSpec
+}
+
+func (r *fakeCommandRunner) Start(_ context.Context, spec custodian.ExecSpec) (custodian.RunningCommand, error) {
+	r.spec = spec
+	return &fakeRunningCommand{
+		stdin:  discardWriteCloser{},
+		stdout: io.NopCloser(strings.NewReader(`{"event":"ok"}` + "\n")),
+		stderr: io.NopCloser(strings.NewReader("")),
+	}, nil
+}
+
+type fakeRunningCommand struct {
+	stdin  io.WriteCloser
+	stdout io.ReadCloser
+	stderr io.ReadCloser
+}
+
+func (c fakeRunningCommand) Stdin() io.WriteCloser {
+	return c.stdin
+}
+
+func (c fakeRunningCommand) Stdout() io.ReadCloser {
+	return c.stdout
+}
+
+func (c fakeRunningCommand) Stderr() io.ReadCloser {
+	return c.stderr
+}
+
+func (c fakeRunningCommand) Wait(context.Context) (custodian.ExitObservation, error) {
+	return custodian.ExitObservation{Exited: true, Code: 0}, nil
+}
+
+func (c fakeRunningCommand) Interrupt(context.Context) error {
+	return nil
+}
+
+type discardWriteCloser struct{}
+
+func (discardWriteCloser) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (discardWriteCloser) Close() error {
+	return nil
 }

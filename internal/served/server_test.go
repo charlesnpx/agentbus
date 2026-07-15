@@ -19,8 +19,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
-	"github.com/charlesnpx/agentbus/engine/execution/authority"
-	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
@@ -185,13 +184,13 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	if len(hello.BackendMetadata) != 1 || hello.BackendMetadata[0].Backend != "fake" || hello.BackendMetadata[0].Models == nil || hello.BackendMetadata[0].Efforts == nil {
 		t.Fatalf("hello backend metadata = %+v", hello.BackendMetadata)
 	}
-	for _, capability := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery", "models.reported", "jobs.requestId"} {
+	for _, capability := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery", "models.reported"} {
 		if _, ok := hello.Capabilities[capability]; !ok {
 			t.Fatalf("missing capability %s in %+v", capability, hello.Capabilities)
 		}
 	}
-	if hello.Capabilities["jobs.requestId"] {
-		t.Fatalf("jobs.requestId capability is enabled in hello: %+v", hello.Capabilities)
+	if _, ok := hello.Capabilities["jobs.requestId"]; ok {
+		t.Fatalf("jobs.requestId capability is advertised in hello: %+v", hello.Capabilities)
 	}
 	resp = rpc(t, conn, r, "dup", protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: h.token})
 	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
@@ -209,47 +208,60 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	assertRPCCode(t, resp, protocol.ErrorVersionMismatch)
 }
 
-func TestServeBootstrapsAdmissionBeforeListen(t *testing.T) {
+func TestServeRefusesAdmissionBeforeListenWhenCustodianUnavailable(t *testing.T) {
 	t.Parallel()
 	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
 	server.jobsRequestIDEnabled = true
-	listenErr := errors.New("listener reached after admission ready")
+	bootstrapCalled := false
+	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		bootstrapCalled = true
+		return nil, nil, nil, errors.New("bootstrap should not run")
+	}
 	listenCalled := false
 	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
 		listenCalled = true
-		if server.admissionBootstrapper == nil || server.admissionReady == nil || server.admissionCoordinator == nil {
-			return nil, socketFileIdentity{}, errors.New("listener called before admission ready")
-		}
-		return nil, socketFileIdentity{}, listenErr
-	}
-
-	err := server.Serve(context.Background())
-	if !errors.Is(err, listenErr) {
-		t.Fatalf("Serve error = %v, want %v", err, listenErr)
-	}
-	if !listenCalled {
-		t.Fatal("listener was not called")
-	}
-}
-
-func TestServeDoesNotListenWhenAdmissionBootstrapFails(t *testing.T) {
-	t.Parallel()
-	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
-	server.jobsRequestIDEnabled = true
-	bootstrapErr := errors.New("admission bootstrap failed")
-	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
-		return nil, nil, nil, bootstrapErr
-	}
-	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
 		return nil, socketFileIdentity{}, errors.New("listener should not be called")
 	}
 
 	err := server.Serve(context.Background())
-	if !errors.Is(err, bootstrapErr) {
-		t.Fatalf("Serve error = %v, want %v", err, bootstrapErr)
+	if !errors.Is(err, custodian.ErrSupervisorUnavailable) {
+		t.Fatalf("Serve error = %v, want supervisor_unavailable", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, protocol.SocketName)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("socket stat error = %v, want not exist", err)
+	if listenCalled {
+		t.Fatal("listener was called after unavailable custodian")
+	}
+	if bootstrapCalled {
+		t.Fatal("admission bootstrap ran before custodian support was verified")
+	}
+	if server.jobsRequestIDEnabled {
+		t.Fatal("jobs.requestId remained enabled after unavailable custodian")
+	}
+}
+
+func TestBootstrapAdmissionRefusesUnavailableCustodianBeforeRepositoryOpen(t *testing.T) {
+	t.Parallel()
+	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	server.jobsRequestIDEnabled = true
+	bootstrapCalled := false
+	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		bootstrapCalled = true
+		return nil, nil, nil, errors.New("bootstrap should not run")
+	}
+
+	err := server.bootstrapAdmission(context.Background())
+	if !errors.Is(err, custodian.ErrSupervisorUnavailable) {
+		t.Fatalf("bootstrapAdmission error = %v, want supervisor_unavailable", err)
+	}
+	if bootstrapCalled {
+		t.Fatal("admission bootstrap factory ran before custodian support was verified")
+	}
+	if server.jobsRequestIDEnabled {
+		t.Fatal("jobs.requestId remained enabled after unavailable custodian")
+	}
+	for _, name := range []string{admissionRepositoryFile, admissionAnchorFile} {
+		if _, err := os.Stat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s stat error = %v, want not exist", name, err)
+		}
 	}
 }
 
@@ -370,304 +382,6 @@ func TestJobSubmitRequestIDCapabilityDisabledDoesNotStartBackend(t *testing.T) {
 	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
 	if got := backend.count.Load(); got != 0 {
 		t.Fatalf("backend starts = %d, want 0", got)
-	}
-}
-
-func TestIdentifiedJobSubmitAdmitsBeforeBackendStartAndReplaysBeforeBackendValidation(t *testing.T) {
-	t.Parallel()
-	backend := newFakeBackend("fake")
-	server, _, cwd := newUnstartedTestServer(t, backend)
-	server.jobsRequestIDEnabled = true
-	if err := server.bootstrapAdmission(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if server.admissionClose != nil {
-		t.Cleanup(func() { _ = server.admissionClose.Close() })
-	}
-
-	key, err := model.NewRequestKey("workspace-enabled", "request-enabled")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var startErr error
-	var sawAdmission bool
-	startObserved := make(chan struct{}, 1)
-	backend.startHook = func(engine.SessionOpts) {
-		replay, err := server.admissionReady.LookupReplay(context.Background(), key)
-		if err != nil {
-			startErr = err
-			return
-		}
-		if replay.State != authority.ReplayLive {
-			startErr = errors.New("request was not live in authority before backend start")
-			return
-		}
-		launch, ok := replay.Record.Attempt.Launches.Get(model.LaunchOrdinalOne)
-		if !ok || launch.Grant == nil {
-			startErr = errors.New("backend started before authority launch grant")
-			return
-		}
-		sawAdmission = true
-		startObserved <- struct{}{}
-	}
-	params := protocol.JobSubmitParams{
-		WorkspaceKey: key.WorkspaceKey.String(),
-		RequestID:    key.RequestID.String(),
-		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "same"},
-	}
-	raw := mustMarshal(t, params)
-
-	first := server.handleJobSubmit(context.Background(), raw)
-	if first.err != nil {
-		t.Fatalf("first submit error = %+v", first.err)
-	}
-	if got := backend.count.Load(); got != 0 {
-		t.Fatalf("backend starts before ack/permit = %d, want 0", got)
-	}
-	if first.after == nil {
-		t.Fatal("identified submit did not defer launch")
-	}
-	first.after()
-	select {
-	case <-startObserved:
-	case <-time.After(time.Second):
-		t.Fatal("backend did not start after deferred launch")
-	}
-	if startErr != nil {
-		t.Fatal(startErr)
-	}
-	if !sawAdmission {
-		t.Fatal("backend started before admission hook observed live request")
-	}
-	server.backends = map[string]engine.Backend{}
-
-	replay := server.handleJobSubmit(context.Background(), raw)
-	if replay.err != nil {
-		t.Fatalf("replay submit error = %+v", replay.err)
-	}
-	result, ok := replay.result.(protocol.JobSubmitResult)
-	if !ok || !result.Deduplicated {
-		t.Fatalf("replay result = %+v, want deduplicated JobSubmitResult", replay.result)
-	}
-	if got := backend.count.Load(); got != 1 {
-		t.Fatalf("backend starts after replay = %d, want 1", got)
-	}
-}
-
-func TestIdentifiedJobSubmitInvalidFirstAttemptDoesNotBindReplayKey(t *testing.T) {
-	t.Parallel()
-	backend := newFakeBackend("fake")
-	server, _, cwd := newUnstartedTestServer(t, backend)
-	server.jobsRequestIDEnabled = true
-	if err := server.bootstrapAdmission(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if server.admissionClose != nil {
-		t.Cleanup(func() { _ = server.admissionClose.Close() })
-	}
-	key, err := model.NewRequestKey("workspace-unpoisoned", "request-unpoisoned")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	bad := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
-		WorkspaceKey: key.WorkspaceKey.String(),
-		RequestID:    key.RequestID.String(),
-		TaskSpec:     protocol.TaskSpec{Backend: "missing", CWD: cwd, Write: false, Prompt: "same request"},
-	}))
-	if bad.err == nil || bad.err.Data.Code != protocol.ErrorBackendUnavailable {
-		t.Fatalf("bad submit outcome = %+v, want backend_unavailable", bad)
-	}
-	replay, err := server.admissionReady.LookupReplay(context.Background(), key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if replay.State != authority.ReplayMissing {
-		t.Fatalf("replay after invalid first submit = %d, want missing", replay.State)
-	}
-
-	good := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
-		WorkspaceKey: key.WorkspaceKey.String(),
-		RequestID:    key.RequestID.String(),
-		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "same request"},
-	}))
-	if good.err != nil {
-		t.Fatalf("corrected submit error = %+v", good.err)
-	}
-	if good.after == nil {
-		t.Fatal("corrected submit did not defer launch")
-	}
-	good.after()
-	deadline := time.Now().Add(time.Second)
-	for backend.count.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if got := backend.count.Load(); got != 1 {
-		t.Fatalf("backend starts after corrected submit = %d, want 1", got)
-	}
-}
-
-func TestIdentifiedJobCancelBeforeDeferredLaunchDoesNotStartBackend(t *testing.T) {
-	t.Parallel()
-	backend := newFakeBackend("fake")
-	started := make(chan struct{}, 1)
-	backend.startHook = func(engine.SessionOpts) {
-		started <- struct{}{}
-	}
-	server, _, cwd := newUnstartedTestServer(t, backend)
-	server.jobsRequestIDEnabled = true
-	if err := server.bootstrapAdmission(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if server.admissionClose != nil {
-		t.Cleanup(func() { _ = server.admissionClose.Close() })
-	}
-
-	submit := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
-		WorkspaceKey: "workspace-cancel-before-launch",
-		RequestID:    "request-cancel-before-launch",
-		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "should not start"},
-	}))
-	if submit.err != nil {
-		t.Fatalf("submit error = %+v", submit.err)
-	}
-	result, ok := submit.result.(protocol.JobSubmitResult)
-	if !ok || result.JobID == "" || submit.after == nil {
-		t.Fatalf("submit result = %+v", submit.result)
-	}
-	cancel := server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: result.JobID}))
-	if cancel.err == nil || !strings.Contains(cancel.err.Message, "supervisor_unavailable") {
-		t.Fatalf("cancel outcome = %+v, want supervisor_unavailable", cancel)
-	}
-
-	submit.after()
-	select {
-	case <-started:
-		t.Fatal("backend started after cancellation won before launch authorization")
-	case <-time.After(100 * time.Millisecond):
-	}
-	if got := backend.count.Load(); got != 0 {
-		t.Fatalf("backend starts = %d, want 0", got)
-	}
-}
-
-func TestAuthorityProjectionServesStatusAndResultWhenLegacyRecordMissing(t *testing.T) {
-	t.Parallel()
-	backend := newFakeBackend("fake")
-	server, _, cwd := newUnstartedTestServer(t, backend)
-	server.jobsRequestIDEnabled = true
-	if err := server.bootstrapAdmission(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if server.admissionClose != nil {
-		t.Cleanup(func() { _ = server.admissionClose.Close() })
-	}
-	submit := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
-		WorkspaceKey: "workspace-authority-fallback",
-		RequestID:    "request-authority-fallback",
-		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "queued"},
-	}))
-	if submit.err != nil {
-		t.Fatalf("submit error = %+v", submit.err)
-	}
-	result, ok := submit.result.(protocol.JobSubmitResult)
-	if !ok || result.JobID == "" {
-		t.Fatalf("submit result = %+v", submit.result)
-	}
-	store := server.storeForJob(result.JobID)
-	if store == nil {
-		t.Fatal("legacy store was not mapped")
-	}
-	record, err := store.Load(result.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(record.StatePath); err != nil {
-		t.Fatal(err)
-	}
-
-	statusOutcome := server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{JobID: result.JobID}))
-	if statusOutcome.err != nil {
-		t.Fatalf("status error = %+v", statusOutcome.err)
-	}
-	status, ok := statusOutcome.result.(protocol.JobStatusResult)
-	if !ok || len(status.Jobs) != 1 || status.Jobs[0].JobID != result.JobID || status.Jobs[0].State != engine.StateStarting {
-		t.Fatalf("status fallback = %+v", statusOutcome.result)
-	}
-	resultOutcome := server.handleJobResult(mustMarshal(t, protocol.JobResultParams{JobID: result.JobID}))
-	if resultOutcome.err != nil {
-		t.Fatalf("result error = %+v", resultOutcome.err)
-	}
-	jobResult, ok := resultOutcome.result.(protocol.JobResult)
-	if !ok || jobResult.JobID != result.JobID || jobResult.State != engine.StateStarting {
-		t.Fatalf("result fallback = %+v", resultOutcome.result)
-	}
-}
-
-func TestStartupRecoveryFailsClosedWhenSupervisorIdentityCannotBeVerified(t *testing.T) {
-	t.Parallel()
-	root := shortTempDir(t)
-	cwd := shortTempDir(t)
-	firstClock := engine.ClockFunc(func() time.Time {
-		return time.Date(2026, 7, 14, 13, 0, 0, 0, time.UTC)
-	})
-	first, err := New(Config{
-		StateRoot:   root,
-		CWD:         cwd,
-		Token:       "test-token",
-		Backends:    []engine.Backend{newFakeBackend("fake")},
-		IdleTimeout: -1,
-		Clock:       firstClock,
-		ProcessTable: mapProcessTable{entries: map[int]engine.ProcessInfo{
-			os.Getpid(): {PID: os.Getpid()},
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	first.jobsRequestIDEnabled = true
-	if err := first.bootstrapAdmission(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	submit := first.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
-		WorkspaceKey: "workspace-recovery-fail-closed",
-		RequestID:    "request-recovery-fail-closed",
-		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "queued"},
-	}))
-	if submit.err != nil {
-		t.Fatalf("submit error = %+v", submit.err)
-	}
-	if first.admissionClose != nil {
-		if err := first.admissionClose.Close(); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	secondClock := engine.ClockFunc(func() time.Time {
-		return time.Date(2026, 7, 14, 13, 0, 1, 0, time.UTC)
-	})
-	second, err := New(Config{
-		StateRoot:   root,
-		CWD:         cwd,
-		Token:       "test-token",
-		Backends:    []engine.Backend{newFakeBackend("fake")},
-		IdleTimeout: -1,
-		Clock:       secondClock,
-		ProcessTable: mapProcessTable{entries: map[int]engine.ProcessInfo{
-			os.Getpid(): {PID: os.Getpid()},
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	second.jobsRequestIDEnabled = true
-	second.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
-		return nil, socketFileIdentity{}, errors.New("listener should not be called")
-	}
-
-	err = second.Serve(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "supervisor_unavailable") {
-		t.Fatalf("Serve error = %v, want fail-closed supervisor_unavailable error", err)
 	}
 }
 

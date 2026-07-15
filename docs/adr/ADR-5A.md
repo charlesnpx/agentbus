@@ -31,6 +31,9 @@ only; none is a terminal-proof predicate.
 The daemon must own current-boot supervisor-loss reconciliation as a normal lifecycle event, but the
 custodian remains the trusted computing base for physical absence.
 
+Until the real custodian exists, this path is not enabled in production. `UnavailableCustodian` refuses
+bootstrap with `supervisor_unavailable`; it does not certify live supervisor-loss handling.
+
 ## Non-goals
 
 This ADR does not define durable execution recovery.

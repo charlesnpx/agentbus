@@ -27,4 +27,5 @@ admission.
 
 ## Non-goals
 
-This ADR does not enable `jobs.requestId` capability by itself.
+This ADR does not enable or advertise `jobs.requestId` capability by itself. S1 keeps it gated off
+until a verified platform custodian is available.

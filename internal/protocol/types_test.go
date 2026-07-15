@@ -8,13 +8,13 @@ import (
 func TestDefaultCapabilitiesAndStructuredError(t *testing.T) {
 	t.Parallel()
 	caps := DefaultCapabilities()
-	for _, name := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery", "jobs.requestId"} {
+	for _, name := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery", "models.reported"} {
 		if _, ok := caps[name]; !ok {
 			t.Fatalf("missing capability %s in %+v", name, caps)
 		}
 	}
-	if caps["jobs.requestId"] {
-		t.Fatalf("jobs.requestId capability is enabled: %+v", caps)
+	if _, ok := caps["jobs.requestId"]; ok {
+		t.Fatalf("jobs.requestId capability is advertised: %+v", caps)
 	}
 	err := NewError(ErrorVersionMismatch, "protocol major version mismatch", ErrorData{ServerProtocolVersion: Version})
 	if err.Code == 0 || err.Data.Code != ErrorVersionMismatch || err.Data.ServerProtocolVersion != Version {

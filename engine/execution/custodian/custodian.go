@@ -84,6 +84,10 @@ func (UnavailableCustodian) ContainAndVerify(context.Context, model.GroupRef, Qu
 	return VerifiedQuiescence{}, ErrSupervisorUnavailable
 }
 
+func (UnavailableCustodian) VerifiedContainmentSupported(context.Context) error {
+	return ErrSupervisorUnavailable
+}
+
 type AttestationIssuer struct {
 	token *attestationToken
 }

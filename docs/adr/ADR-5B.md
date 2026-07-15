@@ -35,6 +35,8 @@ The recovery matrix is:
 ## Consequences
 
 Production tests must inject process death at every listed point and verify the recovery matrix.
+S1 does not implement these probes or signals; the unavailable production custodian refuses enablement
+until the platform-specific containment TCB can satisfy this matrix.
 
 ## Non-goals
 
