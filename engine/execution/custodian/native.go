@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -61,6 +62,8 @@ type NativeOptions struct {
 	ContainmentParams containment.Params
 	WorkerEnv         []string
 	WorkerDir         string
+
+	newLeaderRetention func(model.GroupRef) (*leaderRetention, error)
 }
 
 type NativeLaunchSpec struct {
@@ -93,24 +96,28 @@ func NewNativeCustodian(options NativeOptions) (*NativeCustodian, error) {
 // proof issuer; S3B-B owns proof minting.
 func NewNativeRuntime(options NativeOptions) (*NativeCustodian, Support, error) {
 	native, err := NewNativeCustodian(options)
+	probeErr := err
+	if probeErr == nil {
+		probeErr = probeNativeRuntime(options)
+	}
 	support := Support{
 		ParkedExec:             err == nil,
-		VerifiedContainment:    err == nil,
+		VerifiedContainment:    probeErr == nil,
 		ImplementationCompiled: true,
-		RuntimeProbePassed:     err == nil,
+		RuntimeProbePassed:     probeErr == nil,
 		FeatureConfigured:      false,
 		FeatureAdvertised:      false,
-		RuntimeProbeResult:     err,
+		RuntimeProbeResult:     probeErr,
 		Platform:               runtime.GOOS,
-		Reason:                 err,
+		Reason:                 probeErr,
 	}
-	if err == nil {
+	if probeErr == nil {
 		support.RuntimeProbeResult = nil
 	}
 	if _, supportErr := NewSupport(support); supportErr != nil {
 		return nil, Support{}, supportErr
 	}
-	return native, support, err
+	return native, support, probeErr
 }
 
 func (custodian *NativeCustodian) Launch(ctx context.Context, spec NativeLaunchSpec) (*NativeRunningProcess, error) {
@@ -123,19 +130,37 @@ func (custodian *NativeCustodian) Launch(ctx context.Context, spec NativeLaunchS
 	if err := spec.Validate(); err != nil {
 		return nil, err
 	}
-	parkSpec, err := custodian.parklaunchSpec(spec)
+	launchContainment := &nativeLaunchContainment{params: custodian.options.ContainmentParams}
+	var retention *leaderRetention
+	parkSpec, err := custodian.parklaunchSpec(spec, launchContainment, func(ctx context.Context, group model.GroupRef) error {
+		factory := custodian.options.newLeaderRetention
+		if factory == nil {
+			factory = newLeaderRetentionForGroup
+		}
+		acquired, err := factory(group)
+		if err != nil {
+			return err
+		}
+		retention = acquired
+		launchContainment.setWitness(acquired)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
 	handle, err := parklaunch.Launch(ctx, parkSpec)
 	if err != nil {
+		if retention != nil {
+			err = errors.Join(err, retention.close())
+		}
 		return nil, err
 	}
-	retention, err := newLeaderRetention(handle)
-	if err != nil {
+	if retention == nil {
+		err := fmt.Errorf("%w: leader continuity handle was not acquired before release", ErrNativeCustodianUnavailable)
 		cleanupErr := cleanupLaunchedHandle(ctx, handle, custodian.options.ContainmentParams)
 		return nil, errors.Join(err, cleanupErr)
 	}
+	retention.attachHandle(handle)
 	running := &NativeRunningProcess{
 		custodian: custodian,
 		handle:    handle,
@@ -159,24 +184,10 @@ func (custodian *NativeCustodian) ContainAndVerify(ctx context.Context, group mo
 		return unprovablePhysical(group, containment.ReasonInvalidInput, "", err)
 	}
 	running := custodian.lookup(group)
-	var witness containment.ContinuityWitness
-	if running != nil && running.leader != nil && running.leader.unreapedFor(group) {
-		witness = running.leader
-	}
-	var retained *leaderRetention
 	if running != nil {
-		retained = running.leader
+		return running.containAndVerify(ctx)
 	}
-	outcome := containPhysical(ctx, group, custodian.options.ContainmentParams, witness, retained)
-	if outcome.Unprovable() {
-		return outcome
-	}
-	if running != nil {
-		if err := running.finalizeAfterAbsence(ctx); err != nil {
-			return unprovablePhysical(group, containment.ReasonProbeUnprovable, outcome.Decision, err)
-		}
-	}
-	return outcome
+	return containPhysical(ctx, group, custodian.options.ContainmentParams, nil)
 }
 
 func (custodian *NativeCustodian) lookup(group model.GroupRef) *NativeRunningProcess {
@@ -195,7 +206,7 @@ func (custodian *NativeCustodian) forget(group model.GroupRef) {
 	delete(custodian.running, groupKey(group))
 }
 
-func (custodian *NativeCustodian) parklaunchSpec(spec NativeLaunchSpec) (parklaunch.Spec, error) {
+func (custodian *NativeCustodian) parklaunchSpec(spec NativeLaunchSpec, launchContainment parklaunch.Containment, beforeRelease func(context.Context, model.GroupRef) error) (parklaunch.Spec, error) {
 	execSpec, err := parkprotoExecSpec(spec.Exec)
 	if err != nil {
 		return parklaunch.Spec{}, err
@@ -211,9 +222,10 @@ func (custodian *NativeCustodian) parklaunchSpec(spec NativeLaunchSpec) (parklau
 		LaunchKey:            spec.LaunchKey,
 		LogicalGrant:         spec.LogicalGrant,
 		ReleaseSecret:        spec.ReleaseSecret,
-		Containment:          RealContainment{Params: custodian.options.ContainmentParams},
+		Containment:          launchContainment,
 		Monitor:              &parklaunch.MonitorProcessSpec{Command: custodian.options.MonitorCommand},
 		RetainLeaderUnreaped: true,
+		BeforeRelease:        beforeRelease,
 		WorkerEnv:            workerEnv,
 		WorkerDir:            custodian.options.WorkerDir,
 	}, nil
@@ -236,6 +248,104 @@ func validateNativeOptions(options NativeOptions) error {
 		return err
 	}
 	return nil
+}
+
+func probeNativeRuntime(options NativeOptions) error {
+	if err := probeNativeLeaderPlatform(); err != nil {
+		return fmt.Errorf("%w: leader continuity probe: %v", ErrNativeCustodianUnavailable, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.Command("/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("%w: start containment probe: %v", ErrNativeCustodianUnavailable, err)
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- cmd.Wait()
+	}()
+	group, err := probeGroupRef(ctx, cmd.Process.Pid)
+	if err != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		<-waitDone
+		return err
+	}
+	retention, err := newLeaderRetentionForGroup(group)
+	if err != nil {
+		_ = syscall.Kill(-group.PGID, syscall.SIGKILL)
+		<-waitDone
+		return err
+	}
+	defer retention.close()
+
+	params := options.ContainmentParams
+	if params.GracePeriod == 0 {
+		params.GracePeriod = 20 * time.Millisecond
+	}
+	if params.PollInterval == 0 {
+		params.PollInterval = 20 * time.Millisecond
+	}
+	if params.PollTimeout == 0 {
+		params.PollTimeout = 2 * time.Second
+	}
+	outcome := containPhysical(ctx, group, params, retention)
+	if !outcome.Absent() {
+		_ = syscall.Kill(-group.PGID, syscall.SIGKILL)
+		<-waitDone
+		if outcome.Err != nil {
+			return fmt.Errorf("%w: containment probe %s: %v", ErrNativeCustodianUnavailable, outcome.Reason, outcome.Err)
+		}
+		return fmt.Errorf("%w: containment probe outcome=%s reason=%s", ErrNativeCustodianUnavailable, outcome.Kind, outcome.Reason)
+	}
+	<-waitDone
+	return nil
+}
+
+func probeGroupRef(ctx context.Context, leaderPID int) (model.GroupRef, error) {
+	var leader procgroup.ProcessClaim
+	var err error
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		leader, err = procgroup.ReadProcessClaim(leaderPID)
+		if err == nil && leader.PGID == leader.PID {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			if err != nil {
+				return model.GroupRef{}, err
+			}
+			return model.GroupRef{}, fmt.Errorf("probe leader pgid=%d pid=%d", leader.PGID, leader.PID)
+		}
+		if sleepErr := sleepContext(ctx, 10*time.Millisecond); sleepErr != nil {
+			return model.GroupRef{}, sleepErr
+		}
+	}
+	monitor, err := procgroup.ReadProcessClaim(os.Getpid())
+	if err != nil {
+		return model.GroupRef{}, err
+	}
+	attempt := model.AttemptRef{JobID: "job-native-probe", AttemptID: "attempt-native-probe", Epoch: 1}
+	return model.GroupRef{
+		Version:   1,
+		CustodyID: "custody-native-probe",
+		Launch: model.LaunchKey{
+			Attempt: attempt,
+			Ordinal: model.LaunchOrdinalOne,
+		},
+		HostBootID:        leader.KernelDomainID.HostBootID,
+		PIDNamespaceID:    leader.KernelDomainID.PIDNamespaceID,
+		PIDNamespaceState: leader.KernelDomainID.PIDNamespaceState,
+		PGID:              leader.PGID,
+		Leader: model.ProcessIdentity{
+			PID:               leader.PID,
+			HighResStartToken: leader.StartToken.String(),
+		},
+		Monitor: model.ProcessIdentity{
+			PID:               monitor.PID,
+			HighResStartToken: monitor.StartToken.String(),
+		},
+	}, nil
 }
 
 func (spec NativeLaunchSpec) Validate() error {
@@ -283,8 +393,12 @@ type NativeRunningProcess struct {
 	group     model.GroupRef
 	leader    *leaderRetention
 
-	finalOnce sync.Once
-	finalErr  error
+	lifecycleMu  sync.Mutex
+	finalized    bool
+	finalOutcome PhysicalOutcome
+	finalExit    command.ExitObservation
+	finalWaitErr error
+	finalErr     error
 }
 
 func (process *NativeRunningProcess) Ref() model.GroupRef {
@@ -322,14 +436,36 @@ func (process *NativeRunningProcess) Wait(ctx context.Context) (command.ExitObse
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	state, err := waitHandleState(ctx, process.handle)
-	observation := exitObservationForState(state)
-	if absent, _ := independentlyAbsent(process.group, process.leader); absent {
-		if finalizeErr := process.finalizeAfterAbsence(ctx); err == nil {
-			err = finalizeErr
+	if process.leader != nil {
+		if err := process.leader.waitExited(ctx); err != nil {
+			return command.ExitObservation{}, err
 		}
 	}
-	return observation, err
+	for {
+		process.lifecycleMu.Lock()
+		if process.finalized {
+			exit, err := process.finalExit, errors.Join(process.finalWaitErr, process.finalErr)
+			process.lifecycleMu.Unlock()
+			return exit, err
+		}
+		outcome, exit, err := process.finalizeIfSoleLeaderLocked(ctx, PhysicalOutcome{
+			Kind:     PhysicalOutcomeAbsent,
+			Group:    process.group,
+			Method:   model.QuiescenceAlreadyAbsent,
+			Decision: model.AlreadyAbsent,
+		}, 0)
+		if outcome.Absent() || err != nil {
+			if outcome.Absent() {
+				err = errors.Join(process.finalWaitErr, err)
+			}
+			process.lifecycleMu.Unlock()
+			return exit, err
+		}
+		process.lifecycleMu.Unlock()
+		if err := sleepContext(ctx, 20*time.Millisecond); err != nil {
+			return command.ExitObservation{}, err
+		}
+	}
 }
 
 func (process *NativeRunningProcess) ContainAndVerify(ctx context.Context) PhysicalOutcome {
@@ -339,28 +475,144 @@ func (process *NativeRunningProcess) ContainAndVerify(ctx context.Context) Physi
 	return process.custodian.ContainAndVerify(ctx, process.group)
 }
 
-func (process *NativeRunningProcess) finalizeAfterAbsence(ctx context.Context) error {
+func (process *NativeRunningProcess) containAndVerify(ctx context.Context) PhysicalOutcome {
 	if process == nil {
-		return nil
+		return unprovablePhysical(model.GroupRef{}, containment.ReasonInvalidInput, "", fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable))
 	}
-	process.finalOnce.Do(func() {
-		if process.handle != nil {
-			if !process.handle.LeaderReaped() {
-				_, _ = waitHandleState(ctx, process.handle)
-			}
-			_ = closeNativeProcessFiles(process.handle)
-			if process.handle.Monitor != nil {
-				process.finalErr = errors.Join(process.finalErr, process.handle.Monitor.Stop(ctx))
-			}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	process.lifecycleMu.Lock()
+	defer process.lifecycleMu.Unlock()
+	if process.finalized {
+		return process.finalOutcome
+	}
+	outcome := containPhysical(ctx, process.group, process.custodian.options.ContainmentParams, process.leader)
+	if outcome.Unprovable() {
+		finalOutcome, _, err := process.finalizeIfSoleLeaderLocked(ctx, PhysicalOutcome{
+			Kind:     PhysicalOutcomeAbsent,
+			Group:    process.group,
+			Method:   model.QuiescenceTermKill,
+			Decision: outcome.Decision,
+		}, process.custodian.options.ContainmentParams.PollTimeout)
+		if err != nil {
+			return unprovablePhysical(process.group, containment.ReasonProbeUnprovable, outcome.Decision, err)
 		}
-		if process.leader != nil {
-			process.finalErr = errors.Join(process.finalErr, process.leader.close())
+		if finalOutcome.Absent() {
+			return finalOutcome
 		}
-		if process.custodian != nil {
-			process.custodian.forget(process.group)
+		return outcome
+	}
+	finalOutcome, _, err := process.finalizeAbsentLocked(ctx, outcome)
+	if err != nil {
+		return unprovablePhysical(process.group, containment.ReasonProbeUnprovable, outcome.Decision, err)
+	}
+	return finalOutcome
+}
+
+func (process *NativeRunningProcess) finalizeIfSoleLeaderLocked(ctx context.Context, outcome PhysicalOutcome, waitForSole time.Duration) (PhysicalOutcome, command.ExitObservation, error) {
+	if process == nil {
+		return PhysicalOutcome{}, command.ExitObservation{}, fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable)
+	}
+	if process.finalized {
+		return process.finalOutcome, process.finalExit, process.finalErr
+	}
+	if process.leader == nil || !process.leader.unreapedFor(process.group) {
+		return PhysicalOutcome{}, command.ExitObservation{}, nil
+	}
+	deadline := time.Now().Add(waitForSole)
+	for {
+		soleLeader, err := groupHasNoMembersExceptLeader(process.group)
+		if err != nil {
+			return PhysicalOutcome{}, command.ExitObservation{}, err
 		}
-	})
-	return process.finalErr
+		if soleLeader {
+			break
+		}
+		if waitForSole <= 0 || !time.Now().Before(deadline) {
+			return PhysicalOutcome{}, command.ExitObservation{}, nil
+		}
+		if err := sleepContext(ctx, 20*time.Millisecond); err != nil {
+			return PhysicalOutcome{}, command.ExitObservation{}, err
+		}
+	}
+	exit, waitErr, err := process.reapLeaderLocked(ctx)
+	if err != nil {
+		return PhysicalOutcome{}, command.ExitObservation{}, err
+	}
+	absent, err := stableIndependentAbsent(ctx, process.group)
+	if err != nil {
+		return PhysicalOutcome{}, exit, err
+	}
+	if !absent {
+		return PhysicalOutcome{}, exit, nil
+	}
+	finalOutcome, err := process.cacheFinalLocked(ctx, outcome, exit, waitErr)
+	return finalOutcome, exit, err
+}
+
+func (process *NativeRunningProcess) finalizeAbsentLocked(ctx context.Context, outcome PhysicalOutcome) (PhysicalOutcome, command.ExitObservation, error) {
+	if process == nil {
+		return PhysicalOutcome{}, command.ExitObservation{}, fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable)
+	}
+	if process.finalized {
+		return process.finalOutcome, process.finalExit, process.finalErr
+	}
+	absent, err := stableIndependentAbsent(ctx, process.group)
+	if err != nil {
+		return PhysicalOutcome{}, command.ExitObservation{}, err
+	}
+	if !absent {
+		return PhysicalOutcome{}, command.ExitObservation{}, fmt.Errorf("target group is not stably absent")
+	}
+	var exit command.ExitObservation
+	var waitErr error
+	if process.handle != nil && !process.handle.LeaderReaped() {
+		exit, waitErr, err = process.reapLeaderLocked(ctx)
+		if err != nil {
+			return PhysicalOutcome{}, command.ExitObservation{}, err
+		}
+	}
+	finalOutcome, err := process.cacheFinalLocked(ctx, outcome, exit, waitErr)
+	return finalOutcome, exit, err
+}
+
+func (process *NativeRunningProcess) reapLeaderLocked(ctx context.Context) (command.ExitObservation, error, error) {
+	if process == nil || process.handle == nil || process.handle.LeaderReaped() {
+		return command.ExitObservation{}, nil, nil
+	}
+	if process.leader != nil {
+		if err := process.leader.waitExited(ctx); err != nil {
+			return command.ExitObservation{}, nil, err
+		}
+	}
+	state, waitErr := process.handle.WaitState()
+	return exitObservationForState(state), waitErr, nil
+}
+
+func (process *NativeRunningProcess) cacheFinalLocked(ctx context.Context, outcome PhysicalOutcome, exit command.ExitObservation, waitErr error) (PhysicalOutcome, error) {
+	if process.finalized {
+		return process.finalOutcome, process.finalErr
+	}
+	var cleanupErr error
+	if process.handle != nil {
+		cleanupErr = errors.Join(cleanupErr, closeNativeProcessFiles(process.handle))
+		if process.handle.Monitor != nil {
+			cleanupErr = errors.Join(cleanupErr, process.handle.Monitor.Stop(ctx))
+		}
+	}
+	if process.leader != nil {
+		cleanupErr = errors.Join(cleanupErr, process.leader.close())
+	}
+	if process.custodian != nil {
+		process.custodian.forget(process.group)
+	}
+	process.finalized = true
+	process.finalOutcome = outcome
+	process.finalExit = exit
+	process.finalWaitErr = waitErr
+	process.finalErr = cleanupErr
+	return outcome, cleanupErr
 }
 
 type RealContainment struct {
@@ -368,8 +620,8 @@ type RealContainment struct {
 	Witness containment.ContinuityWitness
 }
 
-func (containment RealContainment) Contain(ctx context.Context, group model.GroupRef) error {
-	outcome := containPhysical(ctx, group, containment.Params, containment.Witness, nil)
+func (real RealContainment) Contain(ctx context.Context, group model.GroupRef) error {
+	outcome := containPhysical(ctx, group, real.Params, real.Witness)
 	if outcome.Absent() {
 		return nil
 	}
@@ -379,7 +631,36 @@ func (containment RealContainment) Contain(ctx context.Context, group model.Grou
 	return fmt.Errorf("%w: %s", ErrPhysicalContainment, outcome.Reason)
 }
 
-func containPhysical(ctx context.Context, group model.GroupRef, params containment.Params, witness containment.ContinuityWitness, retained *leaderRetention) PhysicalOutcome {
+func (real RealContainment) BindContainmentTarget(ctx context.Context, group model.GroupRef) (parklaunch.Containment, error) {
+	_ = ctx
+	retention, err := newLeaderRetentionForGroup(group)
+	if err != nil {
+		return nil, err
+	}
+	return RealContainment{Params: real.Params, Witness: retention}, nil
+}
+
+type nativeLaunchContainment struct {
+	mu      sync.RWMutex
+	params  containment.Params
+	witness containment.ContinuityWitness
+}
+
+func (native *nativeLaunchContainment) setWitness(witness containment.ContinuityWitness) {
+	native.mu.Lock()
+	defer native.mu.Unlock()
+	native.witness = witness
+}
+
+func (native *nativeLaunchContainment) Contain(ctx context.Context, group model.GroupRef) error {
+	native.mu.RLock()
+	params := native.params
+	witness := native.witness
+	native.mu.RUnlock()
+	return RealContainment{Params: params, Witness: witness}.Contain(ctx, group)
+}
+
+func containPhysical(ctx context.Context, group model.GroupRef, params containment.Params, witness containment.ContinuityWitness) PhysicalOutcome {
 	engine := containment.Engine{
 		Observer:   containment.RealObserver{},
 		Signaler:   containment.RealSignaler{},
@@ -388,32 +669,6 @@ func containPhysical(ctx context.Context, group model.GroupRef, params containme
 	}
 	outcome := engine.Contain(ctx, group, params)
 	if outcome.Unprovable() {
-		if unprovableMayStillResolveAbsent(outcome.Reason) {
-			if absent, err := independentlyAbsent(group, retained); err == nil && absent {
-				return PhysicalOutcome{
-					Kind:     PhysicalOutcomeAbsent,
-					Group:    group,
-					Method:   methodForDecision(outcome.Decision),
-					Decision: outcome.Decision,
-				}
-			}
-			if waitGroupHasNoLiveMembers(ctx, group) {
-				return PhysicalOutcome{
-					Kind:     PhysicalOutcomeAbsent,
-					Group:    group,
-					Method:   methodForDecision(outcome.Decision),
-					Decision: outcome.Decision,
-				}
-			}
-		}
-		if retainedGroupAbsentExceptLeader(ctx, group, retained, outcome.Reason) {
-			return PhysicalOutcome{
-				Kind:     PhysicalOutcomeAbsent,
-				Group:    group,
-				Method:   model.QuiescenceTermKill,
-				Decision: outcome.Decision,
-			}
-		}
 		return PhysicalOutcome{
 			Kind:     PhysicalOutcomeUnprovable,
 			Group:    group,
@@ -422,7 +677,7 @@ func containPhysical(ctx context.Context, group model.GroupRef, params containme
 			Err:      outcome.Err,
 		}
 	}
-	absent, err := independentlyAbsent(group, retained)
+	absent, err := stableIndependentAbsent(ctx, group)
 	if err != nil {
 		return unprovablePhysical(group, containment.ReasonProbeUnprovable, outcome.Decision, err)
 	}
@@ -454,7 +709,7 @@ func unprovablePhysical(group model.GroupRef, reason containment.UnprovableReaso
 	}
 }
 
-func independentlyAbsent(group model.GroupRef, retained *leaderRetention) (bool, error) {
+func independentlyAbsent(group model.GroupRef) (bool, error) {
 	if err := group.Validate(); err != nil {
 		return false, err
 	}
@@ -466,70 +721,37 @@ func independentlyAbsent(group model.GroupRef, retained *leaderRetention) (bool,
 	case model.GroupAbsent:
 		return true, nil
 	case model.GroupLive:
-		if retained != nil && retained.unreapedFor(group) {
-			return groupHasNoMembersExceptLeader(group)
-		}
 		return false, nil
 	default:
 		return false, fmt.Errorf("independent group observation is %s", procgroup.ClassifyGroup(claim))
 	}
 }
 
-func unprovableMayStillResolveAbsent(reason containment.UnprovableReason) bool {
-	switch reason {
-	case containment.ReasonSignalUnprovable,
-		containment.ReasonProbeUnprovable,
-		containment.ReasonProbeContradictedObserver,
-		containment.ReasonAbsenceDeadlineExceeded:
-		return true
-	default:
-		return false
+func stableIndependentAbsent(ctx context.Context, group model.GroupRef) (bool, error) {
+	absent, err := independentlyAbsent(group)
+	if err != nil || !absent {
+		return absent, err
 	}
+	if err := sleepContext(ctx, 20*time.Millisecond); err != nil {
+		return false, err
+	}
+	return independentlyAbsent(group)
 }
 
-func waitGroupHasNoLiveMembers(ctx context.Context, group model.GroupRef) bool {
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		absent, err := groupHasNoLiveMembers(group)
-		if err == nil && absent {
-			return true
-		}
-		if ctx != nil {
-			if err := ctx.Err(); err != nil {
-				return false
-			}
-		}
-		if !time.Now().Before(deadline) {
-			return false
-		}
-		time.Sleep(20 * time.Millisecond)
+func sleepContext(ctx context.Context, duration time.Duration) error {
+	if duration <= 0 {
+		return nil
 	}
-}
-
-func retainedGroupAbsentExceptLeader(ctx context.Context, group model.GroupRef, retained *leaderRetention, reason containment.UnprovableReason) bool {
-	switch reason {
-	case containment.ReasonProbeUnprovable, containment.ReasonProbeContradictedObserver, containment.ReasonAbsenceDeadlineExceeded:
-	default:
-		return false
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if retained == nil || !retained.unreapedFor(group) {
-		return false
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		absent, err := groupHasNoMembersExceptLeader(group)
-		if err == nil && absent {
-			return true
-		}
-		if ctx != nil {
-			if err := ctx.Err(); err != nil {
-				return false
-			}
-		}
-		if !time.Now().Before(deadline) {
-			return false
-		}
-		time.Sleep(20 * time.Millisecond)
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -539,7 +761,7 @@ func cleanupLaunchedHandle(ctx context.Context, handle *parklaunch.ParkedHandle,
 	}
 	var out error
 	out = errors.Join(out, RealContainment{Params: params}.Contain(ctx, handle.GroupRef))
-	_, waitErr := waitHandleState(ctx, handle)
+	_, waitErr := handle.WaitState()
 	out = errors.Join(out, waitErr)
 	out = errors.Join(out, closeNativeProcessFiles(handle))
 	if handle.Monitor != nil {
@@ -565,24 +787,6 @@ func closeNativeProcessFiles(handle *parklaunch.ParkedHandle) error {
 	return err
 }
 
-func waitHandleState(ctx context.Context, handle *parklaunch.ParkedHandle) (*os.ProcessState, error) {
-	type result struct {
-		state *os.ProcessState
-		err   error
-	}
-	done := make(chan result, 1)
-	go func() {
-		state, err := handle.WaitState()
-		done <- result{state: state, err: err}
-	}()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case result := <-done:
-		return result.state, result.err
-	}
-}
-
 func exitObservationForState(state *os.ProcessState) command.ExitObservation {
 	observation := command.ExitObservation{}
 	if state == nil {
@@ -604,23 +808,49 @@ type leaderRetention struct {
 	heldSince time.Time
 }
 
-func newLeaderRetention(handle *parklaunch.ParkedHandle) (*leaderRetention, error) {
-	if handle == nil {
-		return nil, fmt.Errorf("%w: parked handle is nil", ErrNativeCustodianUnavailable)
-	}
-	if err := handle.GroupRef.Validate(); err != nil {
+func newLeaderRetentionForGroup(group model.GroupRef) (*leaderRetention, error) {
+	if err := validateLeaderContinuityTarget(group); err != nil {
 		return nil, err
 	}
-	platform, err := openNativeLeaderPlatformHandle(handle.GroupRef.Leader.PID)
+	platform, err := openNativeLeaderPlatformHandle(group.Leader.PID)
 	if err != nil {
 		return nil, err
 	}
+	if err := validateLeaderContinuityTarget(group); err != nil {
+		_ = platform.close()
+		return nil, err
+	}
 	return &leaderRetention{
-		group:     handle.GroupRef,
-		handle:    handle,
+		group:     group,
 		platform:  platform,
 		heldSince: time.Now(),
 	}, nil
+}
+
+func validateLeaderContinuityTarget(group model.GroupRef) error {
+	if err := group.Validate(); err != nil {
+		return err
+	}
+	claim, err := procgroup.ReadProcessClaim(group.Leader.PID)
+	if err != nil {
+		return err
+	}
+	if claim.PID != group.Leader.PID ||
+		claim.PGID != group.PGID ||
+		claim.StartToken.String() != group.Leader.HighResStartToken ||
+		!claim.KernelDomainID.Equal(group.KernelDomain()) {
+		return fmt.Errorf("%w: leader identity changed before continuity handle acquisition", ErrNativeCustodianUnavailable)
+	}
+	return nil
+}
+
+func (retention *leaderRetention) attachHandle(handle *parklaunch.ParkedHandle) {
+	if retention == nil {
+		return
+	}
+	retention.mu.Lock()
+	defer retention.mu.Unlock()
+	retention.handle = handle
 }
 
 func (retention *leaderRetention) BeginGroupContinuity(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation, observedAt time.Time) containment.GroupContinuity {
@@ -635,7 +865,7 @@ func (retention *leaderRetention) BeginGroupContinuity(ctx context.Context, targ
 }
 
 func (retention *leaderRetention) unreapedFor(target model.GroupRef) bool {
-	if retention == nil || retention.handle == nil {
+	if retention == nil {
 		return false
 	}
 	retention.mu.Lock()
@@ -643,10 +873,28 @@ func (retention *leaderRetention) unreapedFor(target model.GroupRef) bool {
 	if !retention.group.Equal(target) {
 		return false
 	}
-	if retention.handle.LeaderReaped() {
+	if retention.handle != nil && retention.handle.LeaderReaped() {
 		return false
 	}
 	return retention.platform.held()
+}
+
+func (retention *leaderRetention) waitExited(ctx context.Context) error {
+	if retention == nil {
+		return fmt.Errorf("%w: leader retention is nil", ErrNativeCustodianUnavailable)
+	}
+	retention.mu.Lock()
+	if !retention.platform.held() {
+		retention.mu.Unlock()
+		return fmt.Errorf("%w: leader continuity handle is closed", ErrNativeCustodianUnavailable)
+	}
+	waitHandle, err := retention.platform.clone()
+	retention.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	defer waitHandle.close()
+	return waitHandle.waitExited(ctx)
 }
 
 func (retention *leaderRetention) close() error {

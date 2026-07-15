@@ -377,6 +377,16 @@ func RunMonitorFromFDs(ctx context.Context, daemonFD, targetFD, readyFD int, con
 	if err != nil {
 		return err
 	}
+	if binder, ok := containment.(TargetBindingContainment); ok {
+		bound, err := binder.BindContainmentTarget(ctx, target)
+		if err != nil {
+			return fmt.Errorf("bind monitor containment target: %w", err)
+		}
+		if bound == nil {
+			return fmt.Errorf("bind monitor containment target returned nil")
+		}
+		containment = bound
+	}
 	return RunMonitor(ctx, MonitorRunSpec{
 		DaemonControl: daemonFile,
 		Ready:         readyFile,

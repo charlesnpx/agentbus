@@ -157,7 +157,93 @@ func TestNativeContainAndVerifyKillsTermIgnoringGrandchild(t *testing.T) {
 	waitGroupAbsent(t, running.Ref(), 5*time.Second)
 }
 
-func TestNativeContainAndVerifyUnprovableWhenContinuityBroken(t *testing.T) {
+func TestNativeZombieOnlyGroupIsUnprovableUntilOwnerReaps(t *testing.T) {
+	params := defaultNativeTestParams()
+	params.PollTimeout = 100 * time.Millisecond
+	params.PollInterval = 20 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	native := newNativeCustodianForTest(t, params)
+	spec, _ := nativeSimpleLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	if _, err := io.ReadAll(running.Stdout()); err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	if err := running.leader.waitExited(ctx); err != nil {
+		t.Fatalf("wait leader exit notification: %v", err)
+	}
+	if running.handle.LeaderReaped() {
+		t.Fatal("leader was reaped before owner finalization")
+	}
+
+	outcome := containPhysical(ctx, running.Ref(), params, running.leader)
+	if outcome.Absent() {
+		t.Fatalf("containPhysical zombie-only outcome = %+v, want Unprovable before owner reap", outcome)
+	}
+	final := running.ContainAndVerify(ctx)
+	if !final.Absent() {
+		t.Fatalf("ContainAndVerify() after owner reap = %+v, want Absent", final)
+	}
+	waitGroupAbsent(t, running.Ref(), 5*time.Second)
+}
+
+func TestNativeWaitAndContainShareSerializedFinalization(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	native := newNativeCustodianForTest(t, defaultNativeTestParams())
+	spec, resultPath := nativeTermGrandchildLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	waitNativeReadyLine(t, running.Stdout(), "term-grandchild-ready")
+	result := readNativeBackendResult(t, resultPath)
+	if result.GrandchildPGID != running.Ref().PGID {
+		t.Fatalf("grandchild pgid = %d, want target group %d", result.GrandchildPGID, running.Ref().PGID)
+	}
+	if err := unix.Kill(running.Ref().Leader.PID, unix.SIGTERM); err != nil {
+		t.Fatalf("signal leader TERM: %v", err)
+	}
+	if err := running.leader.waitExited(ctx); err != nil {
+		t.Fatalf("wait leader exit notification: %v", err)
+	}
+
+	waitDone := make(chan command.ExitObservation, 1)
+	waitErr := make(chan error, 1)
+	go func() {
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer waitCancel()
+		exit, err := running.Wait(waitCtx)
+		waitDone <- exit
+		waitErr <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if running.handle.LeaderReaped() {
+		t.Fatal("Wait reaped leader while residual group members remained")
+	}
+	outcome := running.ContainAndVerify(ctx)
+	if !outcome.Absent() {
+		t.Fatalf("ContainAndVerify() = %+v, want Absent", outcome)
+	}
+	exit := <-waitDone
+	err = <-waitErr
+	if exit.Signal == "" && !exit.Exited {
+		t.Fatalf("Wait exit observation = %+v, want cached leader exit", exit)
+	}
+	if err != nil {
+		t.Fatalf("Wait() error = %v, want nil for TERM-handled helper", err)
+	}
+	waitGroupAbsent(t, running.Ref(), 5*time.Second)
+}
+
+func TestNativeContainAndVerifyUnprovableWhenLeaderReapedOutOfBand(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -177,10 +263,14 @@ func TestNativeContainAndVerifyUnprovableWhenContinuityBroken(t *testing.T) {
 	if err := unix.Kill(running.Ref().Leader.PID, unix.SIGTERM); err != nil {
 		t.Fatalf("signal leader TERM: %v", err)
 	}
-	exit, err := running.Wait(ctx)
-	if err != nil {
-		t.Fatalf("reap leader Wait() error = %v", err)
+	if err := running.leader.waitExited(ctx); err != nil {
+		t.Fatalf("wait leader exit notification: %v", err)
 	}
+	state, err := running.handle.WaitState()
+	if err != nil {
+		t.Fatalf("reap leader WaitState() error = %v", err)
+	}
+	exit := exitObservationForState(state)
 	if !exit.Exited {
 		t.Fatalf("leader exit observation = %+v, want exited", exit)
 	}
@@ -190,6 +280,101 @@ func TestNativeContainAndVerifyUnprovableWhenContinuityBroken(t *testing.T) {
 	}
 	if err := unix.Kill(result.GrandchildPID, 0); err != nil {
 		t.Fatalf("grandchild pid %d was killed after unprovable outcome: %v", result.GrandchildPID, err)
+	}
+}
+
+func TestNativeMonitorDaemonEOFContainsTermIgnoringGrandchild(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	native := newNativeCustodianForTest(t, defaultNativeTestParams())
+	spec, resultPath := nativeTermGrandchildLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	waitNativeReadyLine(t, running.Stdout(), "term-grandchild-ready")
+	result := readNativeBackendResult(t, resultPath)
+	if result.GrandchildPID <= 0 {
+		t.Fatalf("grandchild pid = %d, want positive", result.GrandchildPID)
+	}
+
+	if err := running.handle.Monitor.DaemonControlWrite.Close(); err != nil {
+		t.Fatalf("close daemon control: %v", err)
+	}
+	running.handle.Monitor.DaemonControlWrite = nil
+	select {
+	case <-running.handle.Monitor.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("monitor did not exit after daemon EOF")
+	}
+	_ = running.handle.Monitor.Wait()
+	waitPIDAbsent(t, result.GrandchildPID, 5*time.Second)
+	final := running.ContainAndVerify(ctx)
+	if !final.Absent() {
+		t.Fatalf("final ContainAndVerify() = %+v, want Absent after monitor containment", final)
+	}
+}
+
+func TestNativePreReleaseHandleFailureAbortsUnreleasedWorker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	native := newNativeCustodianForTest(t, defaultNativeTestParams())
+	native.options.newLeaderRetention = func(model.GroupRef) (*leaderRetention, error) {
+		return nil, errors.New("injected leader handle failure")
+	}
+	spec, resultPath := nativeSimpleLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err == nil {
+		cleanupNativeRunning(t, running)
+		t.Fatal("Launch() succeeded, want pre-release handle failure")
+	}
+	if !strings.Contains(err.Error(), "injected leader handle failure") {
+		t.Fatalf("Launch() error = %v, want injected handle failure", err)
+	}
+	if _, statErr := os.Stat(resultPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("backend result stat = %v, want not exist because release never happened", statErr)
+	}
+}
+
+func TestNativeCanceledWaitsDoNotLeakReapers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	native := newNativeCustodianForTest(t, defaultNativeTestParams())
+	spec, resultPath := nativeTermGrandchildLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	waitNativeReadyLine(t, running.Stdout(), "term-grandchild-ready")
+	_ = readNativeBackendResult(t, resultPath)
+	before := runtime.NumGoroutine()
+	if err := unix.Kill(running.Ref().Leader.PID, unix.SIGTERM); err != nil {
+		t.Fatalf("signal leader TERM: %v", err)
+	}
+	if err := running.leader.waitExited(ctx); err != nil {
+		t.Fatalf("wait leader exit notification: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Millisecond)
+		_, _ = running.Wait(waitCtx)
+		waitCancel()
+	}
+	time.Sleep(100 * time.Millisecond)
+	if running.handle.LeaderReaped() {
+		t.Fatal("canceled Wait reaped leader later")
+	}
+	after := runtime.NumGoroutine()
+	if after > before+5 {
+		t.Fatalf("goroutines before=%d after=%d, want no repeated wait leak", before, after)
+	}
+	outcome := running.ContainAndVerify(ctx)
+	if !outcome.Absent() {
+		t.Fatalf("ContainAndVerify() = %+v, want Absent after canceled waits", outcome)
 	}
 }
 
@@ -229,6 +414,29 @@ func TestNativeCustodianDoesNotMintProofAndProductionUnavailable(t *testing.T) {
 	}
 	if runtime.Support().VerifiedContainment || runtime.Support().AdvertisedAvailable() {
 		t.Fatalf("production runtime support = %+v, want unavailable", runtime.Support())
+	}
+}
+
+func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing.T) {
+	exe := nativeTestBinaryPath(t)
+	native, support, err := NewNativeRuntime(NativeOptions{
+		AgentbusPath:      builtNativeAgentbusPath(t),
+		MonitorCommand:    nativeMonitorCommand(t),
+		ContainmentParams: defaultNativeTestParams(),
+		WorkerEnv:         append(os.Environ(), nativeHelperAgentbusGOCACHE, nativeHelperAgentbusMOD),
+		WorkerDir:         filepath.Dir(exe),
+	})
+	if err != nil {
+		t.Fatalf("NewNativeRuntime() error = %v", err)
+	}
+	if native == nil {
+		t.Fatal("NewNativeRuntime() native custodian is nil")
+	}
+	if !support.RuntimeProbePassed || !support.VerifiedContainment || support.RuntimeProbeResult != nil {
+		t.Fatalf("native runtime support = %+v, want passed containment probe", support)
+	}
+	if support.FeatureConfigured || support.FeatureAdvertised || support.AdvertisedAvailable() {
+		t.Fatalf("native runtime support = %+v, want capability off/not advertised", support)
 	}
 }
 
@@ -430,9 +638,7 @@ func cleanupNativeRunning(t *testing.T, running *NativeRunningProcess) {
 		}
 	}
 	if running.handle != nil && !running.handle.LeaderReaped() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, _ = waitHandleState(ctx, running.handle)
-		cancel()
+		_, _ = running.handle.WaitState()
 	}
 	waitGroupAbsent(t, group, 5*time.Second)
 	if running.handle != nil && running.handle.Monitor != nil {
@@ -462,6 +668,24 @@ func waitGroupAbsent(t *testing.T, group model.GroupRef, timeout time.Duration) 
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("group %d observation = %s after %s, want absent", group.PGID, last, timeout)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func waitPIDAbsent(t *testing.T, pid int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		_, err := procgroup.ReadProcessClaim(pid)
+		if errors.Is(err, procgroup.ErrProcessMissing) {
+			return
+		}
+		if err != nil && time.Now().After(deadline) {
+			t.Fatalf("pid %d read error after %s: %v", pid, timeout, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d still exists after %s", pid, timeout)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

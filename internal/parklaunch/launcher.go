@@ -64,6 +64,14 @@ type Containment interface {
 	Contain(context.Context, model.GroupRef) error
 }
 
+// TargetBindingContainment lets a monitor containment implementation acquire
+// target-scoped resources after the target has been decoded and before the
+// monitor reports readiness to the daemon.
+type TargetBindingContainment interface {
+	Containment
+	BindContainmentTarget(context.Context, model.GroupRef) (Containment, error)
+}
+
 // Spec describes one parent-side parked-worker launch.
 type Spec struct {
 	AgentbusPath  string
@@ -80,6 +88,8 @@ type Spec struct {
 	// custody uses this to keep the group identity unrecyclable through
 	// containment and independent absence verification.
 	RetainLeaderUnreaped bool
+
+	BeforeRelease func(context.Context, model.GroupRef) error
 
 	WorkerEnv []string
 	WorkerDir string
@@ -378,6 +388,11 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	}
 	if err := verifyMonitorReadyIdentity(spec.identity, monitor, monitorClaim, group); err != nil {
 		return nil, failArmed(err)
+	}
+	if spec.BeforeRelease != nil {
+		if err := spec.BeforeRelease(ctx, group); err != nil {
+			return nil, failArmed(fmt.Errorf("before release: %w", err))
+		}
 	}
 
 	writer := parkproto.NewWriter(pipes.toWorkerWrite)

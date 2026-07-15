@@ -29,44 +29,14 @@ func groupHasNoMembersExceptLeader(group model.GroupRef) (bool, error) {
 		if err != nil || pid <= 0 {
 			continue
 		}
-		state, pgid, err := linuxProcessStateGroup(pid)
+		_, pgid, err := linuxProcessStateGroup(pid)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err != nil {
 			return false, err
 		}
-		if pgid == group.PGID && pid != group.Leader.PID && state != "Z" {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-func groupHasNoLiveMembers(group model.GroupRef) (bool, error) {
-	if err := group.Validate(); err != nil {
-		return false, err
-	}
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return false, err
-	}
-	for _, entry := range entries {
-		if !entry.Type().IsRegular() && !entry.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil || pid <= 0 {
-			continue
-		}
-		state, pgid, err := linuxProcessStateGroup(pid)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return false, err
-		}
-		if pgid == group.PGID && state != "Z" {
+		if pgid == group.PGID && pid != group.Leader.PID {
 			return false, nil
 		}
 	}
