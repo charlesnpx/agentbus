@@ -43,6 +43,39 @@ func TestDecideGroupRecoveryMatrix(t *testing.T) {
 			want: GroupRecoveryQuiescent,
 		},
 		{
+			name: "same boot absent group with matching leader is unprovable",
+			observation: GroupRecoveryObservation{
+				HostBootID:  ref.HostBootID,
+				Group:       GroupAbsent,
+				Leader:      ProcessIdentityMatching,
+				Monitor:     ProcessIdentityMissing,
+				Descendants: DescendantsAbsent,
+			},
+			want: GroupRecoveryUnprovable,
+		},
+		{
+			name: "same boot absent group with live descendants is unprovable",
+			observation: GroupRecoveryObservation{
+				HostBootID:  ref.HostBootID,
+				Group:       GroupAbsent,
+				Leader:      ProcessIdentityMissing,
+				Monitor:     ProcessIdentityMissing,
+				Descendants: DescendantsPresent,
+			},
+			want: GroupRecoveryUnprovable,
+		},
+		{
+			name: "same boot absent group with matching monitor is unprovable",
+			observation: GroupRecoveryObservation{
+				HostBootID:  ref.HostBootID,
+				Group:       GroupAbsent,
+				Leader:      ProcessIdentityMissing,
+				Monitor:     ProcessIdentityMatching,
+				Descendants: DescendantsAbsent,
+			},
+			want: GroupRecoveryUnprovable,
+		},
+		{
 			name: "same boot reused leader while group exists is unprovable",
 			observation: GroupRecoveryObservation{
 				HostBootID:  ref.HostBootID,

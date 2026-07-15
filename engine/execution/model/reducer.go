@@ -211,6 +211,9 @@ func applyBindGroup(next *SafetyRecord, current SafetyRecord, command BindGroup)
 			return false, precondition("launch ordinal 2 requires no live ordinal")
 		}
 	}
+	if err := ensureDistinctLaunchGroup(current.Attempt, command.Ordinal, command.Group); err != nil {
+		return false, err
+	}
 	group := command.Group
 	launch := LaunchProof{Ordinal: command.Ordinal, Group: &group}
 	return mergeLaunchSlot(&next.Attempt.Launches, command.Ordinal, launch, "launch")
@@ -608,6 +611,25 @@ func nonceUsedByOtherGrant(proof AttemptProof, ordinal LaunchOrdinal, nonce Laun
 		}
 	}
 	return false
+}
+
+func ensureDistinctLaunchGroup(proof AttemptProof, ordinal LaunchOrdinal, group GroupRef) error {
+	for _, filled := range proof.Launches.FilledOrdinals() {
+		if filled == ordinal {
+			continue
+		}
+		launch, ok := proof.Launches.Get(filled)
+		if !ok || launch.Group == nil {
+			continue
+		}
+		if launch.Group.CustodyID == group.CustodyID {
+			return conflict("custody id is already bound to another launch")
+		}
+		if launch.Group.SamePhysicalIdentity(group) {
+			return conflict("physical group identity is already bound to another launch")
+		}
+	}
+	return nil
 }
 
 func mergeFact[T comparable](target **T, fact T, label string) (bool, error) {

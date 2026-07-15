@@ -795,7 +795,7 @@ func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobR
 	if err := s.admissionCoordinator.Start(ctx, jobID, nil); err != nil {
 		return run, nil, false, err
 	}
-	session, sessionID, err := s.admissionSupervisor.Started(jobID)
+	session, sessionID, err := s.admissionSupervisor.Started(jobID, model.LaunchOrdinalOne)
 	if err != nil {
 		return run, nil, false, err
 	}

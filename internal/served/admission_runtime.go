@@ -17,6 +17,8 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 )
 
+const servedAdmissionHostBootID = "served-host-boot"
+
 type servedAdmissionSupervisor struct {
 	server *Server
 
@@ -28,12 +30,12 @@ type servedAdmissionSupervisor struct {
 
 type servedAdmissionLaunch struct {
 	mu       sync.Mutex
-	plan     coordinator.LaunchPlan
+	plans    map[model.LaunchOrdinal]coordinator.LaunchPlan
 	groups   map[model.LaunchOrdinal]model.GroupRef
 	backend  engine.Backend
 	opts     engine.SessionOpts
 	permits  map[model.LaunchOrdinal]model.LaunchGrant
-	session  engine.Session
+	sessions map[model.LaunchOrdinal]engine.Session
 	children map[model.LaunchOrdinal]model.ChildIdentity
 	active   *activeJob
 }
@@ -73,8 +75,10 @@ func (s *servedAdmissionSupervisor) Register(jobID model.JobID, backend engine.B
 		launch = &servedAdmissionLaunch{
 			backend:  backend,
 			opts:     opts,
+			plans:    make(map[model.LaunchOrdinal]coordinator.LaunchPlan),
 			groups:   make(map[model.LaunchOrdinal]model.GroupRef),
 			permits:  make(map[model.LaunchOrdinal]model.LaunchGrant),
+			sessions: make(map[model.LaunchOrdinal]engine.Session),
 			children: make(map[model.LaunchOrdinal]model.ChildIdentity),
 		}
 		s.launches[jobID] = launch
@@ -82,7 +86,7 @@ func (s *servedAdmissionSupervisor) Register(jobID model.JobID, backend engine.B
 	}
 	launch.mu.Lock()
 	defer launch.mu.Unlock()
-	if launch.session != nil {
+	if len(launch.sessions) != 0 {
 		return fmt.Errorf("admission launch already started for %s", jobID)
 	}
 	launch.backend = backend
@@ -100,21 +104,25 @@ func (s *servedAdmissionSupervisor) AttachActive(jobID model.JobID, active *acti
 	launch.mu.Unlock()
 }
 
-func (s *servedAdmissionSupervisor) Started(jobID model.JobID) (engine.Session, string, error) {
+func (s *servedAdmissionSupervisor) Started(jobID model.JobID, ordinal model.LaunchOrdinal) (engine.Session, string, error) {
+	if err := ordinal.Validate(); err != nil {
+		return nil, "", err
+	}
 	launch := s.launch(jobID)
 	if launch == nil {
 		return nil, "", fmt.Errorf("admission launch %s is not registered", jobID)
 	}
 	launch.mu.Lock()
 	defer launch.mu.Unlock()
-	if launch.session == nil {
-		return nil, "", fmt.Errorf("admission launch %s has not started", jobID)
+	session := launch.sessions[ordinal]
+	if session == nil {
+		return nil, "", fmt.Errorf("admission launch %s ordinal %s has not started", jobID, ordinal)
 	}
-	sessionID := launch.plan.SessionID
-	if id := launch.session.ID(); id != "" {
+	sessionID := launch.plans[ordinal].SessionID
+	if id := session.ID(); id != "" {
 		sessionID = id
 	}
-	return launch.session, sessionID, nil
+	return session, sessionID, nil
 }
 
 func (s *servedAdmissionSupervisor) Prepare(_ context.Context, plan coordinator.LaunchPlan) (coordinator.PreparedSupervisor, error) {
@@ -139,7 +147,7 @@ func (s *servedAdmissionSupervisor) Prepare(_ context.Context, plan coordinator.
 			Attempt: plan.Ref,
 			Ordinal: plan.Ordinal,
 		},
-		HostBootID: "served-host-boot",
+		HostBootID: servedAdmissionHostBootID,
 		PGID:       pid,
 		Leader: model.ProcessIdentity{
 			PID:               pid,
@@ -159,7 +167,13 @@ func (s *servedAdmissionSupervisor) Prepare(_ context.Context, plan coordinator.
 		return coordinator.PreparedSupervisor{}, err
 	}
 	launch.mu.Lock()
-	launch.plan = plan
+	if launch.plans == nil {
+		launch.plans = make(map[model.LaunchOrdinal]coordinator.LaunchPlan)
+	}
+	if launch.groups == nil {
+		launch.groups = make(map[model.LaunchOrdinal]model.GroupRef)
+	}
+	launch.plans[plan.Ordinal] = plan
 	launch.groups[plan.Ordinal] = group
 	launch.mu.Unlock()
 	return prepared, nil
@@ -201,12 +215,15 @@ func (s *servedAdmissionSupervisor) ObserveLaunch(ctx context.Context, prepared 
 	if permit, ok := launch.permits[grant.Ordinal]; !ok || permit != grant {
 		return coordinator.LaunchObservation{}, fmt.Errorf("admission launch %s has no matching permit", grant.Attempt.JobID)
 	}
-	if launch.session == nil {
+	if launch.sessions == nil {
+		launch.sessions = make(map[model.LaunchOrdinal]engine.Session)
+	}
+	if launch.sessions[grant.Ordinal] == nil {
 		session, err := launch.backend.Start(ctx, launch.opts)
 		if err != nil {
 			return coordinator.LaunchObservation{}, err
 		}
-		launch.session = session
+		launch.sessions[grant.Ordinal] = session
 	}
 	child := launch.children[grant.Ordinal]
 	if child.PID == 0 {
@@ -237,17 +254,32 @@ func (s *servedAdmissionSupervisor) VerifyQuiescence(_ context.Context, prepared
 }
 
 func (s *servedAdmissionSupervisor) Contain(_ context.Context, prepared coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
-	if err := prepared.ValidateFor(prepared.Ref); err != nil {
-		return custodian.VerifiedQuiescence{}, err
-	}
-	return custodian.VerifiedQuiescence{}, custodian.ErrSupervisorUnavailable
+	return s.unavailableAfterRecoveryDecision(prepared)
 }
 
 func (s *servedAdmissionSupervisor) Retire(_ context.Context, prepared coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
-	if err := prepared.ValidateFor(prepared.Ref); err != nil {
+	return s.unavailableAfterRecoveryDecision(prepared)
+}
+
+func (s *servedAdmissionSupervisor) unavailableAfterRecoveryDecision(prepared coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
+	decision, err := s.recoveryDecision(prepared)
+	if err != nil {
 		return custodian.VerifiedQuiescence{}, err
 	}
-	return custodian.VerifiedQuiescence{}, custodian.ErrSupervisorUnavailable
+	return custodian.VerifiedQuiescence{}, fmt.Errorf("%w: %s", custodian.ErrSupervisorUnavailable, decision)
+}
+
+func (s *servedAdmissionSupervisor) recoveryDecision(prepared coordinator.PreparedSupervisor) (model.GroupRecoveryDecision, error) {
+	if err := prepared.ValidateFor(prepared.Ref); err != nil {
+		return "", err
+	}
+	return model.DecideGroupRecovery(prepared.Group, model.GroupRecoveryObservation{
+		HostBootID:  servedAdmissionHostBootID,
+		Group:       model.GroupExistenceUnknown,
+		Leader:      model.ProcessIdentityUnknown,
+		Monitor:     model.ProcessIdentityUnknown,
+		Descendants: model.DescendantsUnknown,
+	})
 }
 
 func (s *servedAdmissionSupervisor) launch(jobID model.JobID) *servedAdmissionLaunch {

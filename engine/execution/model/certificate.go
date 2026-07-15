@@ -211,6 +211,14 @@ func (ref GroupRef) Equal(other GroupRef) bool {
 		ref.RetainedID == other.RetainedID
 }
 
+func (ref GroupRef) SamePhysicalIdentity(other GroupRef) bool {
+	return ref.HostBootID == other.HostBootID &&
+		ref.PGID == other.PGID &&
+		ref.Leader.Equal(other.Leader) &&
+		ref.Monitor.Equal(other.Monitor) &&
+		ref.RetainedID == other.RetainedID
+}
+
 type AcknowledgementFact struct {
 	Attempt        AttemptRef
 	AcknowledgedBy BootRef

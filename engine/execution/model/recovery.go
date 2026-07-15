@@ -141,6 +141,9 @@ func DecideGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) (Gr
 		return GroupRecoveryQuiescent, nil
 	}
 	if observation.Group == GroupAbsent {
+		if absentObservationContradicted(observation) {
+			return GroupRecoveryUnprovable, nil
+		}
 		return GroupRecoveryQuiescent, nil
 	}
 	if observation.Group == GroupLive && observation.Leader == ProcessIdentityMatching {
@@ -155,6 +158,14 @@ func DecideGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) (Gr
 		return GroupRecoveryUnprovable, nil
 	}
 	return GroupRecoveryUnprovable, nil
+}
+
+func absentObservationContradicted(observation GroupRecoveryObservation) bool {
+	return observation.Leader == ProcessIdentityMatching ||
+		observation.Leader == ProcessIdentityReused ||
+		observation.Monitor == ProcessIdentityMatching ||
+		observation.Monitor == ProcessIdentityReused ||
+		observation.Descendants == DescendantsPresent
 }
 
 func PlanRecovery(record SafetyRecord, trigger RecoveryTrigger) (RecoveryPlan, error) {

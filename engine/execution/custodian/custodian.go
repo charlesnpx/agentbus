@@ -85,39 +85,39 @@ func (UnavailableCustodian) ContainAndVerify(context.Context, model.GroupRef, Qu
 }
 
 type AttestationIssuer struct {
-	channel *attestationChannel
+	token *attestationToken
 }
 
 type AttestationVerifier struct {
-	channel *attestationChannel
+	token *attestationToken
 }
 
 type VerifiedQuiescence struct {
-	channel     *attestationChannel
+	token       *attestationToken
 	certificate model.QuiescenceCertificate
 }
 
-type attestationChannel struct {
-	secret byte
+type attestationToken struct {
+	_ byte
 }
 
 func NewAttestationChannel() (AttestationIssuer, AttestationVerifier) {
-	channel := &attestationChannel{secret: 1}
-	return AttestationIssuer{channel: channel}, AttestationVerifier{channel: channel}
+	token := &attestationToken{}
+	return AttestationIssuer{token: token}, AttestationVerifier{token: token}
 }
 
 func (issuer AttestationIssuer) AttestQuiescence(certificate model.QuiescenceCertificate) (VerifiedQuiescence, error) {
-	if issuer.channel == nil {
+	if issuer.token == nil {
 		return VerifiedQuiescence{}, ErrInvalidAttestation
 	}
 	if err := certificate.Validate(); err != nil {
 		return VerifiedQuiescence{}, err
 	}
-	return VerifiedQuiescence{channel: issuer.channel, certificate: certificate}, nil
+	return VerifiedQuiescence{token: issuer.token, certificate: certificate}, nil
 }
 
 func (verifier AttestationVerifier) VerifyQuiescence(attestation VerifiedQuiescence) (model.QuiescenceCertificate, error) {
-	if verifier.channel == nil || attestation.channel == nil || verifier.channel != attestation.channel {
+	if verifier.token == nil || attestation.token == nil || verifier.token != attestation.token {
 		return model.QuiescenceCertificate{}, ErrInvalidAttestation
 	}
 	if err := attestation.certificate.Validate(); err != nil {

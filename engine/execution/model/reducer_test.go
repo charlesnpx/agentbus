@@ -190,6 +190,36 @@ func TestAuthorizeSecondOrdinalRequiresFirstQuiescence(t *testing.T) {
 	}
 }
 
+func TestAuthorizeSecondOrdinalRejectsSharedCustodyOrPhysicalIdentity(t *testing.T) {
+	record := reducerQuiescentRecord(t)
+	first, ok := record.Attempt.Launches.Get(LaunchOrdinalOne)
+	if !ok || first.Group == nil {
+		t.Fatal("ordinal 1 group missing")
+	}
+
+	sharedCustody := reducerGroup(LaunchOrdinalTwo)
+	sharedCustody.CustodyID = first.Group.CustodyID
+	if _, err := apply(record, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: sharedCustody}); !errors.Is(err, ErrConflictingDuplicate) {
+		t.Fatalf("shared custody bind error = %v, want ErrConflictingDuplicate", err)
+	}
+
+	sharedPhysical := reducerGroup(LaunchOrdinalTwo)
+	sharedPhysical.HostBootID = first.Group.HostBootID
+	sharedPhysical.PGID = first.Group.PGID
+	sharedPhysical.Leader = first.Group.Leader
+	sharedPhysical.Monitor = first.Group.Monitor
+	sharedPhysical.RetainedID = first.Group.RetainedID
+	if _, err := apply(record, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: sharedPhysical}); !errors.Is(err, ErrConflictingDuplicate) {
+		t.Fatalf("shared physical identity bind error = %v, want ErrConflictingDuplicate", err)
+	}
+
+	forged := cloneSafetyRecord(record)
+	forged.Attempt.Launches.Second = &LaunchProof{Ordinal: LaunchOrdinalTwo, Group: &sharedPhysical}
+	if err := ValidateSafetyRecord(forged); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("forged shared physical safety error = %v, want ErrInvalidValue", err)
+	}
+}
+
 func TestStaleActionReceiptCannotCertifyDifferentAttemptOrGroup(t *testing.T) {
 	record := reducerGrantRecord(t)
 	before := cloneSafetyRecord(record)

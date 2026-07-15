@@ -92,7 +92,7 @@ func (proof AttemptProof) Validate() error {
 	if err := proof.Ref.Validate(); err != nil {
 		return err
 	}
-	return forEachLaunchSlot(proof.Launches, func(ordinal LaunchOrdinal, launch LaunchProof) error {
+	if err := forEachLaunchSlot(proof.Launches, func(ordinal LaunchOrdinal, launch LaunchProof) error {
 		if err := launch.Validate(); err != nil {
 			return err
 		}
@@ -103,7 +103,10 @@ func (proof AttemptProof) Validate() error {
 			return err
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	return validateLaunchGroupsDistinct(proof.Launches)
 }
 
 func (launch LaunchProof) Validate() error {
@@ -175,6 +178,19 @@ func validateLaunchProofAttempt(ref AttemptRef, launch LaunchProof) error {
 		if err := validateAttemptField("quiescence.attempt", launch.Quiescence.Attempt, ref); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateLaunchGroupsDistinct(slots LaunchSlots[LaunchProof]) error {
+	if slots.First == nil || slots.Second == nil || slots.First.Group == nil || slots.Second.Group == nil {
+		return nil
+	}
+	if slots.First.Group.CustodyID == slots.Second.Group.CustodyID {
+		return invalid("launch.group.custody_id", "must be unique per launch ordinal")
+	}
+	if slots.First.Group.SamePhysicalIdentity(*slots.Second.Group) {
+		return invalid("launch.group.physical_identity", "must be unique per launch ordinal")
 	}
 	return nil
 }

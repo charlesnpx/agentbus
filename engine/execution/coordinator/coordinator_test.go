@@ -227,8 +227,14 @@ func TestCorrectiveLaunchUsesIndependentOrdinalCustody(t *testing.T) {
 	if !ok {
 		t.Fatal("ordinal 2 launch missing")
 	}
-	if first.Group == nil || second.Group == nil || first.Group.Equal(*second.Group) {
-		t.Fatalf("launch groups = first:%#v second:%#v, want independent groups", first.Group, second.Group)
+	if first.Group == nil || second.Group == nil {
+		t.Fatalf("launch groups = first:%#v second:%#v, want both groups", first.Group, second.Group)
+	}
+	if first.Group.CustodyID == second.Group.CustodyID {
+		t.Fatalf("custody id reused across ordinals: %s", first.Group.CustodyID)
+	}
+	if first.Group.SamePhysicalIdentity(*second.Group) {
+		t.Fatalf("physical identity reused across ordinals: first:%#v second:%#v", first.Group, second.Group)
 	}
 	if first.Grant == nil || second.Grant == nil || first.Grant.Ordinal != model.LaunchOrdinalOne || second.Grant.Ordinal != model.LaunchOrdinalTwo {
 		t.Fatalf("launch grants = first:%#v second:%#v, want per-ordinal grants", first.Grant, second.Grant)
