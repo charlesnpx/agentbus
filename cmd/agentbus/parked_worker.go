@@ -1,13 +1,14 @@
 package main
 
 import (
-	"encoding/base64"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"syscall"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -19,9 +20,9 @@ import (
 const internalParkedWorkerCommand = "internal-parked-worker"
 
 type parkedWorkerOptions struct {
-	controlReadFD       int
-	controlWriteFD      int
-	expectationTemplate parkproto.ReleaseExpectation
+	controlReadFD  int
+	controlWriteFD int
+	bootstrapFD    int
 }
 
 func (a *app) runInternalParkedWorker(args []string, errOut io.Writer) int {
@@ -43,7 +44,7 @@ func parseParkedWorkerOptions(args []string, errOut io.Writer) (parkedWorkerOpti
 	}
 	controlReadFD := fs.Int("control-read-fd", -1, "internal control read fd")
 	controlWriteFD := fs.Int("control-write-fd", -1, "internal control write fd")
-	encodedExpectation := fs.String("release-expectation", "", "base64 JSON release expectation")
+	bootstrapFD := fs.Int("bootstrap-fd", -1, "internal bootstrap fd")
 	if err := fs.Parse(args); err != nil {
 		return parkedWorkerOptions{}, err
 	}
@@ -56,33 +57,60 @@ func parseParkedWorkerOptions(args []string, errOut io.Writer) (parkedWorkerOpti
 	if *controlWriteFD < 3 {
 		return parkedWorkerOptions{}, fmt.Errorf("control write fd must be >= 3")
 	}
-	expectation, err := decodeReleaseExpectation(*encodedExpectation)
-	if err != nil {
-		return parkedWorkerOptions{}, err
+	if *bootstrapFD < 3 {
+		return parkedWorkerOptions{}, fmt.Errorf("bootstrap fd must be >= 3")
+	}
+	if *bootstrapFD == *controlReadFD || *bootstrapFD == *controlWriteFD {
+		return parkedWorkerOptions{}, fmt.Errorf("bootstrap fd must be distinct from control fds")
 	}
 	return parkedWorkerOptions{
-		controlReadFD:       *controlReadFD,
-		controlWriteFD:      *controlWriteFD,
-		expectationTemplate: expectation,
+		controlReadFD:  *controlReadFD,
+		controlWriteFD: *controlWriteFD,
+		bootstrapFD:    *bootstrapFD,
 	}, nil
 }
 
-func decodeReleaseExpectation(encoded string) (parkproto.ReleaseExpectation, error) {
-	if encoded == "" {
-		return parkproto.ReleaseExpectation{}, fmt.Errorf("release expectation is required")
+func readReleaseExpectationFromBootstrapFD(fd int) (parkproto.ReleaseExpectation, error) {
+	file := os.NewFile(uintptr(fd), "agentbus-park-bootstrap")
+	if file == nil {
+		return parkproto.ReleaseExpectation{}, fmt.Errorf("open bootstrap fd %d", fd)
 	}
-	raw, err := base64.StdEncoding.DecodeString(encoded)
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, parkproto.MaxFrameSize+1))
 	if err != nil {
-		return parkproto.ReleaseExpectation{}, fmt.Errorf("decode release expectation: %w", err)
+		return parkproto.ReleaseExpectation{}, fmt.Errorf("read release expectation bootstrap: %w", err)
+	}
+	defer zeroBytes(raw)
+	if len(raw) == 0 {
+		return parkproto.ReleaseExpectation{}, fmt.Errorf("release expectation bootstrap is empty")
+	}
+	if len(raw) > parkproto.MaxFrameSize {
+		return parkproto.ReleaseExpectation{}, fmt.Errorf("release expectation bootstrap is too large")
 	}
 	var expectation parkproto.ReleaseExpectation
-	if err := json.Unmarshal(raw, &expectation); err != nil {
-		return parkproto.ReleaseExpectation{}, fmt.Errorf("parse release expectation: %w", err)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&expectation); err != nil {
+		return parkproto.ReleaseExpectation{}, fmt.Errorf("parse release expectation bootstrap: %w", err)
+	}
+	var trailing struct{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return parkproto.ReleaseExpectation{}, fmt.Errorf("parse release expectation bootstrap: trailing JSON value")
+		}
+		return parkproto.ReleaseExpectation{}, fmt.Errorf("parse release expectation bootstrap: %w", err)
 	}
 	return expectation, nil
 }
 
 func runParkedWorker(opts parkedWorkerOptions) error {
+	if err := setCloseOnExecForInheritedFDs(opts.controlReadFD, opts.controlWriteFD, opts.bootstrapFD); err != nil {
+		return fmt.Errorf("prepare inherited fds: %w", err)
+	}
+	expectationTemplate, err := readReleaseExpectationFromBootstrapFD(opts.bootstrapFD)
+	if err != nil {
+		return err
+	}
 	controlRead, controlWrite, err := openControlFiles(opts.controlReadFD, opts.controlWriteFD)
 	if err != nil {
 		return err
@@ -98,7 +126,7 @@ func runParkedWorker(opts parkedWorkerOptions) error {
 	if err != nil {
 		return fmt.Errorf("read worker identity: %w", err)
 	}
-	expectation := bindReportedIdentity(opts.expectationTemplate, report)
+	expectation := bindReportedIdentity(expectationTemplate, report)
 	if err := expectation.Validate(); err != nil {
 		return fmt.Errorf("release expectation: %w", err)
 	}
@@ -179,6 +207,86 @@ func openControlFiles(readFD, writeFD int) (*os.File, *os.File, error) {
 		return nil, nil, fmt.Errorf("open control write fd %d", writeFD)
 	}
 	return readFile, writeFile, nil
+}
+
+func setCloseOnExecForInheritedFDs(controlReadFD, controlWriteFD, bootstrapFD int) error {
+	keep := map[int]struct{}{
+		controlReadFD:  {},
+		controlWriteFD: {},
+		bootstrapFD:    {},
+	}
+	return setCloseOnExecForAllOpenFDsExcept(keep)
+}
+
+func setCloseOnExecForAllOpenFDsExcept(keep map[int]struct{}) error {
+	for _, dir := range []string{"/proc/self/fd", "/dev/fd"} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("read %s: %w", dir, err)
+		}
+		return setCloseOnExecForFDEntries(entries, keep)
+	}
+	return scanCloseOnExecForOpenFDs(keep)
+}
+
+func setCloseOnExecForFDEntries(entries []os.DirEntry, keep map[int]struct{}) error {
+	var out error
+	for _, entry := range entries {
+		fd, err := strconv.Atoi(entry.Name())
+		if err != nil || fd < 3 {
+			continue
+		}
+		if _, ok := keep[fd]; ok {
+			continue
+		}
+		if err := setCloseOnExecIfOpen(fd); err != nil {
+			out = errors.Join(out, fmt.Errorf("fd %d: %w", fd, err))
+		}
+	}
+	return out
+}
+
+func scanCloseOnExecForOpenFDs(keep map[int]struct{}) error {
+	var limit unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
+		return fmt.Errorf("read fd limit: %w", err)
+	}
+	var out error
+	for fd := 3; uint64(fd) < limit.Cur; fd++ {
+		if _, ok := keep[fd]; ok {
+			continue
+		}
+		if err := setCloseOnExecIfOpen(fd); err != nil {
+			out = errors.Join(out, fmt.Errorf("fd %d: %w", fd, err))
+		}
+	}
+	return out
+}
+
+func setCloseOnExecIfOpen(fd int) error {
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	if err != nil {
+		if errors.Is(err, unix.EBADF) {
+			return nil
+		}
+		return err
+	}
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, flags|unix.FD_CLOEXEC); err != nil {
+		if errors.Is(err, unix.EBADF) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func zeroBytes(raw []byte) {
+	for i := range raw {
+		raw[i] = 0
+	}
 }
 
 func bindReportedIdentity(expectation parkproto.ReleaseExpectation, report parkproto.IdentityReport) parkproto.ReleaseExpectation {

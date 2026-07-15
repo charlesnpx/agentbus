@@ -172,10 +172,8 @@ func (binding ReleaseBinding) validateExpectation() error {
 	if err := binding.LaunchKey.Validate(); err != nil {
 		return err
 	}
-	if binding.GroupRefDigest != "" {
-		if err := validateDigest("group ref digest", binding.GroupRefDigest); err != nil {
-			return err
-		}
+	if err := validateDigest("group ref digest", binding.GroupRefDigest); err != nil {
+		return err
 	}
 	if err := binding.LogicalGrant.Validate(); err != nil {
 		return err
@@ -228,7 +226,7 @@ func (binding ReleaseBinding) equal(other ReleaseBinding) bool {
 		binding.StartToken == other.StartToken &&
 		binding.CustodyID == other.CustodyID &&
 		binding.LaunchKey.Equal(other.LaunchKey) &&
-		(other.GroupRefDigest == "" || binding.GroupRefDigest == other.GroupRefDigest) &&
+		binding.GroupRefDigest == other.GroupRefDigest &&
 		binding.LogicalGrant.Attempt.Equal(other.LogicalGrant.Attempt) &&
 		binding.LogicalGrant.Ordinal == other.LogicalGrant.Ordinal &&
 		binding.LogicalGrant.Nonce == other.LogicalGrant.Nonce &&

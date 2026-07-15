@@ -3,7 +3,9 @@ package parkproto
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -99,6 +101,71 @@ func TestCodecRejectsDuplicateAndOutOfOrderSequences(t *testing.T) {
 	}
 }
 
+func TestCodecRejectsStrictJSONViolations(t *testing.T) {
+	releasePayload := mustReleasePayload(t)
+	duplicateReleaseSecretPayload := bytes.Replace(
+		releasePayload,
+		[]byte(`"releaseSecret":"release-secret-1"`),
+		[]byte(`"releaseSecret":"release-secret-1","releaseSecret":"release-secret-2"`),
+		1,
+	)
+	for _, tt := range []struct {
+		name string
+		raw  []byte
+	}{
+		{
+			name: "unknown envelope field",
+			raw: rawPayload([]byte(fmt.Sprintf(
+				`{"version":%d,"sequence":1,"type":"ReleaseAck","payload":{"acceptedSequence":1},"extra":true}`,
+				Version,
+			))),
+		},
+		{
+			name: "unknown payload field",
+			raw: rawPayload([]byte(fmt.Sprintf(
+				`{"version":%d,"sequence":1,"type":"ReleaseAck","payload":{"acceptedSequence":1,"extra":true}}`,
+				Version,
+			))),
+		},
+		{
+			name: "duplicate sequence",
+			raw: rawPayload([]byte(fmt.Sprintf(
+				`{"version":%d,"sequence":1,"sequence":1,"type":"ReleaseAck","payload":{"acceptedSequence":1}}`,
+				Version,
+			))),
+		},
+		{
+			name: "duplicate type",
+			raw: rawPayload([]byte(fmt.Sprintf(
+				`{"version":%d,"sequence":1,"type":"ReleaseAck","type":"ReleaseAck","payload":{"acceptedSequence":1}}`,
+				Version,
+			))),
+		},
+		{
+			name: "duplicate release secret",
+			raw: rawPayload([]byte(fmt.Sprintf(
+				`{"version":%d,"sequence":1,"type":"Release","payload":%s}`,
+				Version,
+				duplicateReleaseSecretPayload,
+			))),
+		},
+		{
+			name: "trailing data",
+			raw: rawPayload([]byte(fmt.Sprintf(
+				`{"version":%d,"sequence":1,"type":"ReleaseAck","payload":{"acceptedSequence":1}} true`,
+				Version,
+			))),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewReader(bytes.NewReader(tt.raw)).Read()
+			if !errors.Is(err, ErrMalformed) {
+				t.Fatalf("Read() error=%v, want %v", err, ErrMalformed)
+			}
+		})
+	}
+}
+
 func TestReadRawFrameRejectsOversizedDeclaredLengthBeforeBodyRead(t *testing.T) {
 	reader := newDeclaredLengthOnlyReader(uint32(MaxFrameSize + 32*1024*1024))
 	_, err := readRawFrame(reader, MaxFrameSize)
@@ -124,7 +191,6 @@ func TestReleaseBindingChecksPhysicalSecretGroupDigestAndExecDigest(t *testing.T
 	binding := testReleaseBinding(execDigest)
 	binding.GroupRefDigest = groupDigest
 	expectation := binding
-	expectation.GroupRefDigest = ""
 	release := Release{Binding: binding, ExpectedGroupRef: groupRef, ExecSpec: execSpec}
 	if err := release.ValidateFor(1, ReleaseExpectation{Binding: expectation}); err != nil {
 		t.Fatalf("valid release rejected: %v", err)
@@ -137,7 +203,7 @@ func TestReleaseBindingChecksPhysicalSecretGroupDigestAndExecDigest(t *testing.T
 	}
 
 	wrongDigest := expectation
-	wrongDigest.GroupRefDigest = strings.Replace(binding.GroupRefDigest, "a", "b", 1)
+	wrongDigest.GroupRefDigest = "sha256:" + strings.Repeat("0", 64)
 	if err := release.ValidateFor(1, ReleaseExpectation{Binding: wrongDigest}); !errors.Is(err, ErrBinding) {
 		t.Fatalf("wrong group digest error=%v, want %v", err, ErrBinding)
 	}
@@ -163,7 +229,6 @@ func TestReleaseBindingRejectsReplayAcrossParkInstancesAndConsumesOnce(t *testin
 	bindingA := testReleaseBinding(execDigest)
 	bindingA.GroupRefDigest = groupDigest
 	expectationA := bindingA
-	expectationA.GroupRefDigest = ""
 	releaseA := Release{Binding: bindingA, ExpectedGroupRef: groupRef, ExecSpec: execSpec}
 	if err := releaseA.ValidateFor(1, ReleaseExpectation{Binding: expectationA}); err != nil {
 		t.Fatalf("matching instance release rejected: %v", err)
@@ -209,6 +274,39 @@ func TestReleaseBindingRejectsReplayAcrossParkInstancesAndConsumesOnce(t *testin
 	}
 	if _, err := reader.Read(); !errors.Is(err, ErrSequence) {
 		t.Fatalf("second release read error=%v, want %v", err, ErrSequence)
+	}
+}
+
+func TestReleaseBindingRequiresExactExpectedGroupDigest(t *testing.T) {
+	execSpec := ExecSpec{Path: "/bin/echo", Argv: []string{"/bin/echo", "ok"}, Env: []string{"A=B"}, Dir: "/tmp"}
+	execDigest, err := DigestExecSpec(execSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupRef := testGroupRef()
+	groupDigest, err := DigestGroupRef(groupRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := testReleaseBinding(execDigest)
+	binding.GroupRefDigest = groupDigest
+	release := Release{Binding: binding, ExpectedGroupRef: groupRef, ExecSpec: execSpec}
+
+	wildcardExpectation := binding
+	wildcardExpectation.GroupRefDigest = ""
+	if err := release.ValidateFor(1, ReleaseExpectation{Binding: wildcardExpectation}); !errors.Is(err, ErrBinding) {
+		t.Fatalf("empty expected group digest error=%v, want %v", err, ErrBinding)
+	}
+
+	mutated := release
+	mutated.ExpectedGroupRef.Monitor = model.ProcessIdentity{PID: 202, HighResStartToken: "start-202"}
+	mutatedDigest, err := DigestGroupRef(mutated.ExpectedGroupRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated.Binding.GroupRefDigest = mutatedDigest
+	if err := mutated.ValidateFor(1, ReleaseExpectation{Binding: binding}); !errors.Is(err, ErrBinding) {
+		t.Fatalf("self-consistent wrong group digest error=%v, want %v", err, ErrBinding)
 	}
 }
 
@@ -301,6 +399,27 @@ func testGroupRef() model.GroupRef {
 		Leader:            model.ProcessIdentity{PID: 101, HighResStartToken: "start-101"},
 		Monitor:           model.ProcessIdentity{PID: 101, HighResStartToken: "start-101"},
 	}
+}
+
+func mustReleasePayload(t *testing.T) []byte {
+	t.Helper()
+	execSpec := ExecSpec{Path: "/bin/echo", Argv: []string{"/bin/echo", "ok"}, Env: []string{"A=B"}, Dir: "/tmp"}
+	execDigest, err := DigestExecSpec(execSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupRef := testGroupRef()
+	groupDigest, err := DigestGroupRef(groupRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := testReleaseBinding(execDigest)
+	binding.GroupRefDigest = groupDigest
+	raw, err := json.Marshal(Release{Binding: binding, ExpectedGroupRef: groupRef, ExecSpec: execSpec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 var _ io.Reader = (*bytes.Reader)(nil)

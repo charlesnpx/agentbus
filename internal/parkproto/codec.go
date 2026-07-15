@@ -1,11 +1,14 @@
 package parkproto
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/charlesnpx/agentbus/engine/execution/model"
 )
 
 type Reader struct {
@@ -47,7 +50,7 @@ func (reader *Reader) Read() (Received, error) {
 		return Received{}, err
 	}
 	var env envelope
-	if err := json.Unmarshal(frame, &env); err != nil {
+	if err := strictUnmarshalJSON(frame, &env); err != nil {
 		return Received{}, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
 	if env.Version != reader.version {
@@ -166,7 +169,7 @@ func decodePayload(messageType MessageType, payload json.RawMessage) (Message, e
 	switch messageType {
 	case MessageIdentityReport:
 		var report IdentityReport
-		if err := json.Unmarshal(payload, &report); err != nil {
+		if err := strictUnmarshalJSON(payload, &report); err != nil {
 			return nil, fmt.Errorf("%w: identity report: %v", ErrMalformed, err)
 		}
 		if err := report.Validate(); err != nil {
@@ -174,14 +177,14 @@ func decodePayload(messageType MessageType, payload json.RawMessage) (Message, e
 		}
 		return report, nil
 	case MessageRelease:
-		var release Release
-		if err := json.Unmarshal(payload, &release); err != nil {
+		var release strictReleaseJSON
+		if err := strictUnmarshalJSON(payload, &release); err != nil {
 			return nil, fmt.Errorf("%w: release: %v", ErrMalformed, err)
 		}
-		return release, nil
+		return release.toRelease(), nil
 	case MessageReleaseAck:
 		var ack ReleaseAck
-		if err := json.Unmarshal(payload, &ack); err != nil {
+		if err := strictUnmarshalJSON(payload, &ack); err != nil {
 			return nil, fmt.Errorf("%w: release ack: %v", ErrMalformed, err)
 		}
 		if err := ack.Validate(); err != nil {
@@ -190,5 +193,133 @@ func decodePayload(messageType MessageType, payload json.RawMessage) (Message, e
 		return ack, nil
 	default:
 		return nil, fmt.Errorf("%w: unknown message type %q", ErrMalformed, messageType)
+	}
+}
+
+func strictUnmarshalJSON(raw []byte, out any) error {
+	if err := rejectDuplicateJSONKeys(raw); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(out); err != nil {
+		return err
+	}
+	var trailing struct{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func rejectDuplicateJSONKeys(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := scanJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func scanJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("object key is not a string")
+			}
+			if _, exists := seen[key]; exists {
+				return fmt.Errorf("duplicate JSON key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		return consumeJSONEnd(decoder, '}')
+	case '[':
+		for decoder.More() {
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		return consumeJSONEnd(decoder, ']')
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delim)
+	}
+}
+
+func consumeJSONEnd(decoder *json.Decoder, want json.Delim) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token != want {
+		return fmt.Errorf("unexpected JSON delimiter %q, want %q", token, want)
+	}
+	return nil
+}
+
+type strictReleaseJSON struct {
+	Binding          ReleaseBinding     `json:"binding"`
+	ExpectedGroupRef strictGroupRefJSON `json:"expectedGroupRef"`
+	ExecSpec         ExecSpec           `json:"execSpec"`
+}
+
+func (release strictReleaseJSON) toRelease() Release {
+	return Release{
+		Binding:          release.Binding,
+		ExpectedGroupRef: release.ExpectedGroupRef.toGroupRef(),
+		ExecSpec:         release.ExecSpec,
+	}
+}
+
+type strictGroupRefJSON struct {
+	Version           uint16
+	CustodyID         model.CustodyID
+	Launch            model.LaunchKey
+	HostBootID        string
+	PIDNamespaceID    string `json:"PIDNamespaceID,omitempty"`
+	PIDNamespaceState model.PIDNamespaceState
+	PGID              int
+	Leader            model.ProcessIdentity
+	Monitor           model.ProcessIdentity
+	RetainedID        string
+}
+
+func (ref strictGroupRefJSON) toGroupRef() model.GroupRef {
+	return model.GroupRef{
+		Version:           ref.Version,
+		CustodyID:         ref.CustodyID,
+		Launch:            ref.Launch,
+		HostBootID:        ref.HostBootID,
+		PIDNamespaceID:    ref.PIDNamespaceID,
+		PIDNamespaceState: ref.PIDNamespaceState,
+		PGID:              ref.PGID,
+		Leader:            ref.Leader,
+		Monitor:           ref.Monitor,
+		RetainedID:        ref.RetainedID,
 	}
 }

@@ -4,7 +4,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -22,6 +21,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/parkproto"
+	"github.com/charlesnpx/agentbus/internal/procgroup"
 	"golang.org/x/sys/unix"
 )
 
@@ -31,6 +31,9 @@ const (
 	parkedBackendMode      = "parked-backend"
 	workerControlReadFD    = 3
 	workerControlWriteFD   = 4
+	workerBootstrapFD      = 5
+	workerExtraInheritedFD = 6
+	workerDuplicatedFD     = 7
 )
 
 func TestInternalParkedWorkerHiddenFromHelp(t *testing.T) {
@@ -69,6 +72,52 @@ func TestParkedWorkerReleaseGateExecPIDAndFDs(t *testing.T) {
 	if len(result.OpenFDs) != 0 {
 		t.Fatalf("backend inherited control fds: %v", result.OpenFDs)
 	}
+}
+
+func TestParkedWorkerClosesUnexpectedInheritedFDsBeforeBackendExec(t *testing.T) {
+	harness := startParkedWorkerHarnessWithOptions(t, newBackendFixtureSpec(t, backendFixtureOptions{
+		MarkerPath: t.TempDir() + "/backend-started",
+		ResultPath: t.TempDir() + "/backend-result.json",
+		ClosedFDs:  append(defaultClosedWorkerFDs(), workerExtraInheritedFD, workerDuplicatedFD),
+	}), parkedWorkerHarnessOptions{includeUnexpectedInheritedFDs: true})
+	report := harness.readIdentity(t)
+
+	release := harness.releaseForReport(t, report, nil)
+	harness.writeRelease(t, release)
+	harness.readReleaseAck(t)
+	harness.waitSuccess(t)
+
+	result := readBackendFixtureResult(t, harness.backend.ResultPath)
+	if len(result.OpenFDs) != 0 {
+		t.Fatalf("backend inherited unexpected fds: %v", result.OpenFDs)
+	}
+}
+
+func TestParkedWorkerReleaseExpectationSecretNotInArgvOrEnv(t *testing.T) {
+	harness := startParkedWorkerHarness(t, newBackendFixtureSpec(t, backendFixtureOptions{
+		MarkerPath: t.TempDir() + "/backend-started",
+		ResultPath: t.TempDir() + "/backend-result.json",
+		ClosedFDs:  defaultClosedWorkerFDs(),
+	}))
+	report := harness.readIdentity(t)
+
+	secret := string(harness.expectation.Binding.ReleaseSecret)
+	for _, arg := range harness.cmd.Args {
+		if strings.Contains(arg, secret) {
+			t.Fatalf("release secret leaked into argv element %q", arg)
+		}
+	}
+	for _, env := range harness.cmd.Env {
+		if strings.Contains(env, secret) {
+			t.Fatalf("release secret leaked into env element %q", env)
+		}
+	}
+	assertProcessCommandLineOmits(t, harness.cmd.Process.Pid, secret)
+
+	release := harness.releaseForReport(t, report, nil)
+	harness.writeRelease(t, release)
+	harness.readReleaseAck(t)
+	harness.waitSuccess(t)
 }
 
 func TestParkedWorkerReleaseIsOneUse(t *testing.T) {
@@ -141,6 +190,20 @@ func TestParkedWorkerRejectsWrongReleaseBinding(t *testing.T) {
 			name: "wrong group identity",
 			mutate: func(t *testing.T, release *parkproto.Release) {
 				release.ExpectedGroupRef.HostBootID += "-other"
+				groupDigest, err := parkproto.DigestGroupRef(release.ExpectedGroupRef)
+				if err != nil {
+					t.Fatal(err)
+				}
+				release.Binding.GroupRefDigest = groupDigest
+			},
+		},
+		{
+			name: "self-consistent wrong monitor",
+			mutate: func(t *testing.T, release *parkproto.Release) {
+				release.ExpectedGroupRef.Monitor = model.ProcessIdentity{
+					PID:               release.ExpectedGroupRef.Monitor.PID + 1,
+					HighResStartToken: release.ExpectedGroupRef.Monitor.HighResStartToken + "-other",
+				}
 				groupDigest, err := parkproto.DigestGroupRef(release.ExpectedGroupRef)
 				if err != nil {
 					t.Fatal(err)
@@ -274,6 +337,7 @@ func newBackendFixtureSpec(t *testing.T, opts backendFixtureOptions) backendFixt
 	if opts.MarkerPath == "" || opts.ResultPath == "" {
 		t.Fatalf("backend fixture marker and result paths are required")
 	}
+	opts.ClosedFDs = requireDefaultClosedWorkerFDs(opts.ClosedFDs)
 	closedFDs := make([]string, 0, len(opts.ClosedFDs))
 	for _, fd := range opts.ClosedFDs {
 		closedFDs = append(closedFDs, strconv.Itoa(fd))
@@ -337,10 +401,17 @@ type parkedWorkerHarness struct {
 	waitErr     error
 }
 
+type parkedWorkerHarnessOptions struct {
+	includeUnexpectedInheritedFDs bool
+}
+
 func startParkedWorkerHarness(t *testing.T, backend backendFixtureSpec) *parkedWorkerHarness {
 	t.Helper()
-	expectation := releaseExpectationTemplate(t, backend.ExecSpec)
-	encodedExpectation := encodeReleaseExpectation(t, expectation)
+	return startParkedWorkerHarnessWithOptions(t, backend, parkedWorkerHarnessOptions{})
+}
+
+func startParkedWorkerHarnessWithOptions(t *testing.T, backend backendFixtureSpec, opts parkedWorkerHarnessOptions) *parkedWorkerHarness {
+	t.Helper()
 
 	releaseRead, releaseWrite, err := os.Pipe()
 	if err != nil {
@@ -352,7 +423,15 @@ func startParkedWorkerHarness(t *testing.T, backend backendFixtureSpec) *parkedW
 		_ = releaseWrite.Close()
 		t.Fatal(err)
 	}
-	extraFiles, closeExtraFiles := childExtraFiles(t, releaseRead, reportWrite)
+	bootstrapRead, bootstrapWrite, err := os.Pipe()
+	if err != nil {
+		_ = releaseRead.Close()
+		_ = releaseWrite.Close()
+		_ = reportRead.Close()
+		_ = reportWrite.Close()
+		t.Fatal(err)
+	}
+	extraFiles, closeExtraFiles := childExtraFiles(t, releaseRead, reportWrite, bootstrapRead, opts.includeUnexpectedInheritedFDs)
 	t.Cleanup(closeExtraFiles)
 
 	exe, err := os.Executable()
@@ -366,17 +445,25 @@ func startParkedWorkerHarness(t *testing.T, backend backendFixtureSpec) *parkedW
 		internalParkedWorkerCommand,
 		"--control-read-fd", strconv.Itoa(workerControlReadFD),
 		"--control-write-fd", strconv.Itoa(workerControlWriteFD),
-		"--release-expectation", encodedExpectation,
+		"--bootstrap-fd", strconv.Itoa(workerBootstrapFD),
 	)
 	cmd.Env = []string{parkedWorkerHelperEnv + "=" + parkedWorkerHelperMode}
 	cmd.ExtraFiles = extraFiles
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
+		_ = bootstrapRead.Close()
+		_ = bootstrapWrite.Close()
 		t.Fatal(err)
 	}
 	_ = releaseRead.Close()
 	_ = reportWrite.Close()
+	_ = bootstrapRead.Close()
+	closeExtraFiles()
+
+	expectation := releaseExpectationForProcess(t, backend.ExecSpec, cmd.Process.Pid)
+	writeReleaseExpectationBootstrap(t, bootstrapWrite, expectation)
+	_ = bootstrapWrite.Close()
 
 	harness := &parkedWorkerHarness{
 		cmd:         cmd,
@@ -567,13 +654,52 @@ func releaseExpectationTemplate(t *testing.T, execSpec parkproto.ExecSpec) parkp
 	}}
 }
 
-func encodeReleaseExpectation(t *testing.T, expectation parkproto.ReleaseExpectation) string {
+func releaseExpectationForProcess(t *testing.T, execSpec parkproto.ExecSpec, pid int) parkproto.ReleaseExpectation {
+	t.Helper()
+	expectation := releaseExpectationTemplate(t, execSpec)
+	claim := readProcessClaimForTest(t, pid)
+	groupRef := groupRefFromClaim(claim, expectation.Binding.CustodyID, expectation.Binding.LaunchKey)
+	groupDigest, err := parkproto.DigestGroupRef(groupRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectation.Binding.GroupRefDigest = groupDigest
+	return expectation
+}
+
+func readProcessClaimForTest(t *testing.T, pid int) procgroup.ProcessClaim {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		claim, err := procgroup.ReadProcessClaim(pid)
+		if err == nil && claim.PGID == pid {
+			return claim
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("pgid=%d, want %d", claim.PGID, pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("read child process claim: %v", lastErr)
+	return procgroup.ProcessClaim{}
+}
+
+func writeReleaseExpectationBootstrap(t *testing.T, file *os.File, expectation parkproto.ReleaseExpectation) {
 	t.Helper()
 	raw, err := json.Marshal(expectation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return base64.StdEncoding.EncodeToString(raw)
+	n, err := file.Write(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(raw) {
+		t.Fatalf("bootstrap write length = %d, want %d", n, len(raw))
+	}
 }
 
 func groupRefFromReport(report parkproto.IdentityReport, custodyID model.CustodyID, launchKey model.LaunchKey) model.GroupRef {
@@ -590,11 +716,66 @@ func groupRefFromReport(report parkproto.IdentityReport, custodyID model.Custody
 	}
 }
 
-func childExtraFiles(t *testing.T, controlRead, controlWrite *os.File) ([]*os.File, func()) {
-	t.Helper()
-	files := []*os.File{controlRead, controlWrite}
-	return files, func() {
+func groupRefFromClaim(claim procgroup.ProcessClaim, custodyID model.CustodyID, launchKey model.LaunchKey) model.GroupRef {
+	return model.GroupRef{
+		Version:           1,
+		CustodyID:         custodyID,
+		Launch:            launchKey,
+		HostBootID:        claim.KernelDomainID.HostBootID,
+		PIDNamespaceID:    claim.KernelDomainID.PIDNamespaceID,
+		PIDNamespaceState: claim.KernelDomainID.PIDNamespaceState,
+		PGID:              claim.PGID,
+		Leader:            model.ProcessIdentity{PID: claim.PID, HighResStartToken: claim.StartToken.String()},
+		Monitor:           model.ProcessIdentity{PID: claim.PID, HighResStartToken: claim.StartToken.String()},
 	}
+}
+
+func childExtraFiles(t *testing.T, controlRead, controlWrite, bootstrapRead *os.File, includeUnexpectedInheritedFDs bool) ([]*os.File, func()) {
+	t.Helper()
+	files := []*os.File{controlRead, controlWrite, bootstrapRead}
+	var closeFiles []*os.File
+	if includeUnexpectedInheritedFDs {
+		extraFile, err := os.CreateTemp(t.TempDir(), "extra-inherited-fd")
+		if err != nil {
+			t.Fatal(err)
+		}
+		duplicatedFD, err := unix.Dup(int(controlWrite.Fd()))
+		if err != nil {
+			_ = extraFile.Close()
+			t.Fatal(err)
+		}
+		duplicatedFile := os.NewFile(uintptr(duplicatedFD), "duplicated-control-write")
+		files = append(files, extraFile, duplicatedFile)
+		closeFiles = append(closeFiles, extraFile, duplicatedFile)
+	}
+	return files, func() {
+		for _, file := range closeFiles {
+			_ = file.Close()
+		}
+	}
+}
+
+func defaultClosedWorkerFDs() []int {
+	return []int{workerControlReadFD, workerControlWriteFD, workerBootstrapFD}
+}
+
+func requireDefaultClosedWorkerFDs(fds []int) []int {
+	out := append([]int(nil), fds...)
+	for _, fd := range defaultClosedWorkerFDs() {
+		if !containsFD(out, fd) {
+			out = append(out, fd)
+		}
+	}
+	return out
+}
+
+func containsFD(fds []int, want int) bool {
+	for _, fd := range fds {
+		if fd == want {
+			return true
+		}
+	}
+	return false
 }
 
 func readBackendFixtureResult(t *testing.T, path string) backendFixtureResult {
@@ -644,6 +825,24 @@ func openFDs(fds []int) []int {
 		}
 	}
 	return open
+}
+
+func assertProcessCommandLineOmits(t *testing.T, pid int, secret string) {
+	t.Helper()
+	if raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
+		if strings.Contains(string(bytes.ReplaceAll(raw, []byte{0}, []byte{' '})), secret) {
+			t.Fatalf("release secret leaked into /proc cmdline")
+		}
+		return
+	}
+	output, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	if err != nil {
+		t.Logf("process command line inspection unavailable: %v", err)
+		return
+	}
+	if strings.Contains(string(output), secret) {
+		t.Fatalf("release secret leaked into process command line: %s", output)
+	}
 }
 
 func assertFileAbsentFor(t *testing.T, path string, duration time.Duration) {
