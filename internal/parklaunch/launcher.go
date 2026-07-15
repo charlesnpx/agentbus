@@ -82,6 +82,7 @@ type launchHooks struct {
 	afterMonitorStarted func(*MonitorProcess) error
 	afterWorkerStarted  func(int) error
 	beforeRelease       func(launchControlSnapshot) error
+	afterRelease        func(launchControlSnapshot) error
 }
 
 type launchPipeSnapshot struct {
@@ -190,9 +191,19 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("start monitor: %w", err)
 	}
+	var group model.GroupRef
 	launchSucceeded := false
+	monitorArmed := false
+	monitorFailureCleaned := false
 	defer func() {
 		if !launchSucceeded {
+			if monitorArmed && group.Validate() == nil {
+				if !monitorFailureCleaned {
+					_ = cleanupArmedMonitorFailure(spec.Containment, spec.identity, monitor, group)
+					monitorFailureCleaned = true
+				}
+				return
+			}
 			_ = closeMonitorTarget(monitor)
 			_ = closeMonitorReady(monitor)
 			_ = waitMonitorOrKill(monitor)
@@ -229,8 +240,11 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	}()
 
 	started := true
-	var group model.GroupRef
 	released := false
+	failArmed := func(cause error) error {
+		monitorFailureCleaned = true
+		return failClosedArmed(spec.Containment, spec.identity, monitor, group, cause)
+	}
 	preIdentityAbort := func(cause error) error {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
@@ -285,44 +299,50 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	if err := monitor.WaitReady(ctx); err != nil {
 		return nil, failClosed(spec.Containment, group, err)
 	}
+	monitorArmed = true
 
 	reader := parkproto.NewReader(pipes.fromWorkerRead)
 	received, err := readParkFrame(ctx, reader)
 	if err != nil {
-		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: read identity report: %v", ErrChannelLostBeforeRelease, err))
+		return nil, failArmed(fmt.Errorf("%w: read identity report: %v", ErrChannelLostBeforeRelease, err))
 	}
 	report, ok := received.Message.(parkproto.IdentityReport)
 	if !ok {
-		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: first worker frame was %T", ErrIdentityMismatch, received.Message))
+		return nil, failArmed(fmt.Errorf("%w: first worker frame was %T", ErrIdentityMismatch, received.Message))
 	}
 	if err := verifyIdentityReport(spec.identity, report, workerClaim, group); err != nil {
-		return nil, failClosed(spec.Containment, group, err)
+		return nil, failArmed(err)
 	}
 	if spec.hooks.beforeRelease != nil {
 		if err := spec.hooks.beforeRelease(launchControlSnapshot{ControlWrite: pipes.toWorkerWrite, ControlRead: pipes.fromWorkerRead}); err != nil {
-			return nil, failClosed(spec.Containment, group, err)
+			return nil, failArmed(err)
 		}
 	}
 	if err := verifyMonitorReadyIdentity(spec.identity, monitor, monitorClaim, group); err != nil {
-		return nil, failClosed(spec.Containment, group, err)
+		return nil, failArmed(err)
 	}
 
 	writer := parkproto.NewWriter(pipes.toWorkerWrite)
 	release := releaseForReport(expectation, group, spec.ExecSpec, report)
 	releaser := &releaseGate{}
 	if err := releaser.send(writer, release); err != nil {
-		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: %v", ErrChannelLostBeforeRelease, err))
+		return nil, failArmed(fmt.Errorf("%w: %v", ErrChannelLostBeforeRelease, err))
+	}
+	if spec.hooks.afterRelease != nil {
+		if err := spec.hooks.afterRelease(launchControlSnapshot{ControlWrite: pipes.toWorkerWrite, ControlRead: pipes.fromWorkerRead}); err != nil {
+			return nil, failArmed(err)
+		}
 	}
 	ackFrame, err := readParkFrame(ctx, reader)
 	if err != nil {
-		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: %v", ErrReleaseAck, err))
+		return nil, failArmed(fmt.Errorf("%w: %v", ErrReleaseAck, err))
 	}
 	ack, ok := ackFrame.Message.(parkproto.ReleaseAck)
 	if !ok {
-		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: got %T", ErrReleaseAck, ackFrame.Message))
+		return nil, failArmed(fmt.Errorf("%w: got %T", ErrReleaseAck, ackFrame.Message))
 	}
 	if ackFrame.Sequence != 2 || ack.AcceptedSequence != release.Binding.Sequence {
-		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: sequence=%d accepted=%d", ErrReleaseAck, ackFrame.Sequence, ack.AcceptedSequence))
+		return nil, failArmed(fmt.Errorf("%w: sequence=%d accepted=%d", ErrReleaseAck, ackFrame.Sequence, ack.AcceptedSequence))
 	}
 
 	released = true
@@ -565,14 +585,126 @@ func cleanupContext() (context.Context, context.CancelFunc) {
 }
 
 func failClosed(containment Containment, group model.GroupRef, cause error) error {
-	if group.Validate() == nil && containment != nil {
-		ctx, cancel := cleanupContext()
-		defer cancel()
-		if err := containment.Contain(ctx, group); err != nil {
-			return errors.Join(cause, fmt.Errorf("contain target group: %w", err))
-		}
+	if err := containTargetGroup(containment, group); err != nil {
+		return errors.Join(cause, fmt.Errorf("contain target group: %w", err))
 	}
 	return cause
+}
+
+func failClosedArmed(containment Containment, reader identityReader, monitor *MonitorProcess, group model.GroupRef, cause error) error {
+	if err := cleanupArmedMonitorFailure(containment, reader, monitor, group); err != nil {
+		return errors.Join(cause, err)
+	}
+	return cause
+}
+
+func cleanupArmedMonitorFailure(containment Containment, reader identityReader, monitor *MonitorProcess, group model.GroupRef) error {
+	var cleanupErr error
+	if err := closeMonitorDaemonControl(monitor); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("close monitor daemon control: %w", err))
+	}
+	if err := containTargetGroup(containment, group); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("contain target group: %w", err))
+	}
+	if err := waitArmedMonitorCleanup(reader, monitor, group); err != nil {
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+	return cleanupErr
+}
+
+func containTargetGroup(containment Containment, group model.GroupRef) error {
+	if group.Validate() != nil || containment == nil {
+		return nil
+	}
+	ctx, cancel := cleanupContext()
+	defer cancel()
+	return containment.Contain(ctx, group)
+}
+
+func waitArmedMonitorCleanup(reader identityReader, monitor *MonitorProcess, group model.GroupRef) error {
+	if monitor == nil || monitor.done == nil {
+		return nil
+	}
+	if reader == nil {
+		reader = nativeIdentityReader{}
+	}
+	ctx, cancel := cleanupContext()
+	defer cancel()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	monitorExited := false
+	var monitorErr error
+	lastObservation := model.GroupExistenceUnknown
+	for {
+		lastObservation = targetGroupObservation(reader, group)
+		if lastObservation == model.GroupAbsent {
+			if monitorExited {
+				if monitorErr != nil {
+					return fmt.Errorf("armed monitor exited after target absence: %w", monitorErr)
+				}
+				return nil
+			}
+			if err := waitMonitorExitAfterTargetAbsent(ctx, monitor); err != nil {
+				return fmt.Errorf("reap armed monitor after target absence: %w", err)
+			}
+			return nil
+		}
+		if monitorExited && monitorErr != nil {
+			return fmt.Errorf("armed monitor exited before target absence: %w", monitorErr)
+		}
+
+		if monitorExited {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("timeout waiting for target group absence after armed monitor exit; observation=%s", lastObservation)
+			case <-ticker.C:
+			}
+			continue
+		}
+
+		select {
+		case err := <-monitor.done:
+			monitorExited = true
+			monitorErr = err
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for armed monitor cleanup; target group observation=%s", lastObservation)
+		case <-ticker.C:
+		}
+	}
+}
+
+func targetGroupObservation(reader identityReader, group model.GroupRef) model.GroupExistenceObservation {
+	claim, err := procgroup.NewGroupClaim(group.PGID, group.KernelDomain())
+	if err != nil {
+		return model.GroupExistenceUnknown
+	}
+	return reader.ClassifyGroup(claim)
+}
+
+func waitMonitorExitAfterTargetAbsent(ctx context.Context, process *MonitorProcess) error {
+	if process == nil || process.done == nil || process.cmd == nil || process.cmd.Process == nil {
+		return nil
+	}
+	select {
+	case err := <-process.done:
+		return err
+	default:
+	}
+	select {
+	case err := <-process.done:
+		return err
+	case <-ctx.Done():
+	}
+	killErr := process.cmd.Process.Kill()
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case err := <-process.done:
+		return errors.Join(ctx.Err(), killErr, err)
+	case <-timer.C:
+		return errors.Join(ctx.Err(), killErr)
+	}
 }
 
 func terminateStartedProcess(ctx context.Context, process *os.Process, done <-chan error) error {

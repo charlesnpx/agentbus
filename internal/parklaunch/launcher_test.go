@@ -145,6 +145,53 @@ func TestLaunchChannelLossBeforeReleaseContainsTarget(t *testing.T) {
 	fixture.containment.WaitAbsent(t)
 }
 
+func TestLaunchAckReadFailureAfterReleaseLetsArmedMonitorContainWhenParentContainmentFails(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}, Hold: 5 * time.Second})
+	fixture.spec.Monitor.Command = monitorCommandWithKill(t, fixture.monitorMarker, true)
+	parentContainment := &failingContainment{err: errors.New("synthetic parent containment failure")}
+	fixture.spec.Containment = parentContainment
+	fixture.spec.hooks.afterMonitorStarted = func(monitor *MonitorProcess) error {
+		parentContainment.daemonClosed = func() bool {
+			return monitor.DaemonControlWrite == nil
+		}
+		return nil
+	}
+	fixture.spec.hooks.afterRelease = func(snapshot launchControlSnapshot) error {
+		waitBackendResult(t, fixture.backend.ResultPath)
+		return snapshot.ControlRead.Close()
+	}
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err == nil {
+		cleanupParkedHandle(t, handle)
+		t.Fatal("Launch() succeeded; want release-ack failure")
+	}
+	if !errors.Is(err, ErrReleaseAck) {
+		t.Fatalf("Launch() error = %v, want ErrReleaseAck", err)
+	}
+	if !strings.Contains(err.Error(), "synthetic parent containment failure") {
+		t.Fatalf("Launch() error = %v, want parent containment failure joined", err)
+	}
+	calls := parentContainment.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("parent containment calls = %d, want 1", len(calls))
+	}
+	if !calls[0].daemonControlClosed {
+		t.Fatal("parent containment ran before daemon-control writer was closed")
+	}
+	lines := readLines(t, fixture.monitorMarker)
+	if len(lines) != 1 {
+		t.Fatalf("monitor containment lines = %d (%v), want 1", len(lines), lines)
+	}
+	wantLine := fmt.Sprintf("contained pgid=%d leader=%d", calls[0].group.PGID, calls[0].group.Leader.PID)
+	if lines[0] != wantLine {
+		t.Fatalf("monitor containment line = %q, want %q", lines[0], wantLine)
+	}
+	if err := waitGroupAbsent(context.Background(), calls[0].group); err != nil {
+		t.Fatalf("target group still present after armed monitor containment: %v", err)
+	}
+}
+
 func TestMonitorDaemonEOFContainsExactlyOnce(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -485,6 +532,11 @@ func newBackendFixture(t *testing.T, dir string, opts backendFixtureOptions) bac
 
 func monitorCommand(t *testing.T, marker string) CommandSpec {
 	t.Helper()
+	return monitorCommandWithKill(t, marker, false)
+}
+
+func monitorCommandWithKill(t *testing.T, marker string, kill bool) CommandSpec {
+	t.Helper()
 	exe := testBinaryPath(t)
 	return CommandSpec{
 		Path: exe,
@@ -496,6 +548,7 @@ func monitorCommand(t *testing.T, marker string) CommandSpec {
 			"--target-fd", strconv.Itoa(MonitorTargetFD),
 			"--ready-fd", strconv.Itoa(MonitorReadyFD),
 			"--marker", marker,
+			"--kill", strconv.FormatBool(kill),
 		},
 		Env: append(os.Environ(), parklaunchHelperEnv+"="+parklaunchMonitorMode),
 		Dir: filepath.Dir(exe),
@@ -613,6 +666,41 @@ func (containment *recordingContainment) WaitAbsent(t *testing.T) {
 	}
 }
 
+type failingContainment struct {
+	mu           sync.Mutex
+	err          error
+	daemonClosed func() bool
+	calls        []failingContainmentCall
+}
+
+type failingContainmentCall struct {
+	group               model.GroupRef
+	daemonControlClosed bool
+}
+
+func (containment *failingContainment) Contain(_ context.Context, group model.GroupRef) error {
+	daemonControlClosed := false
+	if containment.daemonClosed != nil {
+		daemonControlClosed = containment.daemonClosed()
+	}
+	containment.mu.Lock()
+	containment.calls = append(containment.calls, failingContainmentCall{
+		group:               group,
+		daemonControlClosed: daemonControlClosed,
+	})
+	containment.mu.Unlock()
+	if containment.err != nil {
+		return containment.err
+	}
+	return errors.New("synthetic parent containment failure")
+}
+
+func (containment *failingContainment) Calls() []failingContainmentCall {
+	containment.mu.Lock()
+	defer containment.mu.Unlock()
+	return append([]failingContainmentCall(nil), containment.calls...)
+}
+
 type mismatchClassifyingReader struct {
 	identityReader
 }
@@ -635,17 +723,27 @@ func (reader workerOnlyIdentityReader) ReadProcessClaim(pid int) (procgroup.Proc
 
 type markerContainment struct {
 	path string
+	kill bool
 }
 
-func (containment markerContainment) Contain(_ context.Context, group model.GroupRef) error {
+func (containment markerContainment) Contain(ctx context.Context, group model.GroupRef) error {
 	line := fmt.Sprintf("contained pgid=%d leader=%d\n", group.PGID, group.Leader.PID)
 	file, err := os.OpenFile(containment.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	_, err = file.WriteString(line)
-	return err
+	if _, err := file.WriteString(line); err != nil {
+		return err
+	}
+	if !containment.kill {
+		return nil
+	}
+	err = unix.Kill(-group.PGID, unix.SIGKILL)
+	if err != nil && !errors.Is(err, unix.ESRCH) {
+		return err
+	}
+	return waitGroupAbsent(ctx, group)
 }
 
 func runBackendHelper(args []string) int {
@@ -690,13 +788,14 @@ func runMonitorHelper(args []string) int {
 	targetFD := fs.Int("target-fd", -1, "target fd")
 	readyFD := fs.Int("ready-fd", -1, "ready fd")
 	marker := fs.String("marker", "", "containment marker")
+	kill := fs.Bool("kill", false, "kill target group")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *daemonFD < 3 || *targetFD < 3 || *readyFD < 3 || *marker == "" {
 		return 2
 	}
-	if err := RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, *readyFD, markerContainment{path: *marker}); err != nil {
+	if err := RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, *readyFD, markerContainment{path: *marker, kill: *kill}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 3
 	}
