@@ -20,6 +20,7 @@ The recovery matrix is:
 ## Invariant(s)
 
 - PID reuse is fenced by high-resolution process identity.
+- The process-group leader identity is bound to the group id (`Leader.PID == PGID` on POSIX).
 - `kill(-pgid)` attempted is not a quiescence proof.
 - Prior-boot durable refs normally recover to ready state; only genuinely unprovable evidence is fatal.
 - All four real-process death points are modeled.

@@ -194,6 +194,9 @@ func (ref GroupRef) Validate() error {
 	if err := ref.Leader.Validate(); err != nil {
 		return err
 	}
+	if ref.Leader.PID != ref.PGID {
+		return invalid("group.leader.pid", "must match group pgid")
+	}
 	if err := ref.Monitor.Validate(); err != nil {
 		return err
 	}
@@ -213,8 +216,7 @@ func (ref GroupRef) Equal(other GroupRef) bool {
 
 func (ref GroupRef) SamePhysicalIdentity(other GroupRef) bool {
 	return ref.HostBootID == other.HostBootID &&
-		ref.PGID == other.PGID &&
-		ref.Leader.Equal(other.Leader)
+		(ref.PGID == other.PGID || ref.Leader.Equal(other.Leader))
 }
 
 type AcknowledgementFact struct {

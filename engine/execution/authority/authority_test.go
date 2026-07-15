@@ -267,6 +267,7 @@ func assertAcceptedImage(t *testing.T, repo repository.Repository, accepted Acce
 }
 
 func groupRef(ref model.AttemptRef, ordinal model.LaunchOrdinal) model.GroupRef {
+	pgid := 20 + int(ordinal)
 	return model.GroupRef{
 		Version:   1,
 		CustodyID: model.CustodyID("custody-" + ref.JobID.String() + "-" + ordinal.String()),
@@ -275,9 +276,9 @@ func groupRef(ref model.AttemptRef, ordinal model.LaunchOrdinal) model.GroupRef 
 			Ordinal: ordinal,
 		},
 		HostBootID: "host-boot-" + ref.JobID.String(),
-		PGID:       10 + int(ordinal),
+		PGID:       pgid,
 		Leader: model.ProcessIdentity{
-			PID:               20 + int(ordinal),
+			PID:               pgid,
 			HighResStartToken: "leader-start-" + ordinal.String(),
 		},
 		Monitor: model.ProcessIdentity{

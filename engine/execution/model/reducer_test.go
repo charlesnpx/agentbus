@@ -415,6 +415,38 @@ func TestDeriveTerminalCertificateSelectsProofs(t *testing.T) {
 	}
 }
 
+func TestPostGrantRecoveryTerminalizesFromAnyVerifiedQuiescenceMethod(t *testing.T) {
+	tests := []struct {
+		name   string
+		method QuiescenceMethod
+	}{
+		{name: "already absent", method: QuiescenceAlreadyAbsent},
+		{name: "natural exit", method: QuiescenceNaturalExit},
+		{name: "host reboot", method: QuiescenceHostReboot},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			record := reducerGrantRecord(t)
+			record = reducerMustApply(t, record, reducerQuiescenceCommandWithMethod(t, record, LaunchOrdinalOne, tt.method))
+
+			plan, err := PlanRecovery(record, RecoveryStartupLoss)
+			if err != nil {
+				t.Fatalf("PlanRecovery error = %v", err)
+			}
+			if plan.Next.Kind != RecoveryFinalizeCertified || plan.Next.Finalize == nil {
+				t.Fatalf("plan = %#v, want finalize-certified action", plan.Next)
+			}
+			finalized, err := apply(record, *plan.Next.Finalize)
+			if err != nil {
+				t.Fatalf("Finalize after %s quiescence error = %v", tt.method, err)
+			}
+			if finalized.Record.Terminal == nil || finalized.Record.Terminal.Proof != ProofContained {
+				t.Fatalf("terminal = %#v, want contained proof", finalized.Record.Terminal)
+			}
+		})
+	}
+}
+
 func TestOnlyTerminalGoSelectsProofKind(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -640,6 +672,7 @@ func reducerBoot() BootRef {
 }
 
 func reducerGroup(ordinal LaunchOrdinal) GroupRef {
+	pgid := 20 + int(ordinal)
 	return GroupRef{
 		Version:   1,
 		CustodyID: CustodyID("custody-reducer-" + ordinal.String()),
@@ -648,8 +681,8 @@ func reducerGroup(ordinal LaunchOrdinal) GroupRef {
 			Ordinal: ordinal,
 		},
 		HostBootID: "host-boot-reducer",
-		PGID:       10 + int(ordinal),
-		Leader:     ProcessIdentity{PID: 20 + int(ordinal), HighResStartToken: "leader-start-" + ordinal.String()},
+		PGID:       pgid,
+		Leader:     ProcessIdentity{PID: pgid, HighResStartToken: "leader-start-" + ordinal.String()},
 		Monitor:    ProcessIdentity{PID: 30 + int(ordinal), HighResStartToken: "monitor-start-" + ordinal.String()},
 		RetainedID: "retained-" + ordinal.String(),
 	}

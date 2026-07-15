@@ -490,6 +490,7 @@ func newQuiescentFixture(t *testing.T, name string) fixture {
 }
 
 func fixtureGroupRef(fixture fixture, ordinal model.LaunchOrdinal) model.GroupRef {
+	pgid := 20 + int(ordinal)
 	return model.GroupRef{
 		Version:   1,
 		CustodyID: model.CustodyID("custody-" + fixture.JobID.String() + "-" + ordinal.String()),
@@ -498,9 +499,9 @@ func fixtureGroupRef(fixture fixture, ordinal model.LaunchOrdinal) model.GroupRe
 			Ordinal: ordinal,
 		},
 		HostBootID: "host-boot-" + fixture.JobID.String(),
-		PGID:       10 + int(ordinal),
+		PGID:       pgid,
 		Leader: model.ProcessIdentity{
-			PID:               20 + int(ordinal),
+			PID:               pgid,
 			HighResStartToken: "leader-start-" + ordinal.String(),
 		},
 		Monitor: model.ProcessIdentity{

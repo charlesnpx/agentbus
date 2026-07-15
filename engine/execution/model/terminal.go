@@ -70,13 +70,7 @@ func deriveTerminalProof(record SafetyRecord, intent TerminalIntent) (TerminalPr
 		}
 		return ProofNeverPermittedAndRetired, nil
 	}
-	if hasContainedQuiescence(record.Attempt) {
-		if !allLaunchGroupsQuiescent(record.Attempt) {
-			return 0, precondition("contained proof requires quiescence for every bound group")
-		}
-		if !validContainedIntent(intent) {
-			return 0, precondition("terminal intent is incompatible with contained proof")
-		}
+	if allLaunchGroupsQuiescent(record.Attempt) && validContainedIntent(intent) {
 		return ProofContained, nil
 	}
 	if cleanQuiescentOutcomeAndRetired(record, intent) {
@@ -92,7 +86,7 @@ func cleanQuiescentOutcomeAndRetired(record SafetyRecord, intent TerminalIntent)
 	if record.Outcome == nil || record.Outcome.Outcome != intent.Outcome {
 		return false
 	}
-	if hasContainedQuiescence(record.Attempt) || !hasAnyGrant(record.Attempt) {
+	if !hasAnyGrant(record.Attempt) {
 		return false
 	}
 	if !allBoundLaunchesReleasedWhenGrantedAndQuiescent(record.Attempt) {

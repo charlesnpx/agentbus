@@ -164,6 +164,25 @@ func TestBindingMustMatchSafetyRecordIdentity(t *testing.T) {
 	}
 }
 
+func TestGroupRefValidationRequiresLeaderToHeadPGID(t *testing.T) {
+	record := validSafetyRecord()
+	group := *record.Attempt.Launches.First.Group
+	group.Leader.PID = group.PGID + 1
+	if err := group.Validate(); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("group with non-leader pid error = %v, want ErrInvalidValue", err)
+	}
+}
+
+func TestGroupPhysicalIdentityIncludesLeaderReuseAcrossPGIDs(t *testing.T) {
+	record := validSafetyRecord()
+	first := *record.Attempt.Launches.First.Group
+	second := first
+	second.PGID = first.PGID + 1
+	if !first.SamePhysicalIdentity(second) {
+		t.Fatalf("SamePhysicalIdentity returned false for reused leader identity across pgids")
+	}
+}
+
 func TestTerminalProofRequiresSupportingCertificates(t *testing.T) {
 	record := validSafetyRecord()
 	record.Terminal = &TerminalCertificate{
@@ -201,7 +220,7 @@ func validSafetyRecord() SafetyRecord {
 		Launch:     LaunchKey{Attempt: attempt, Ordinal: LaunchOrdinalOne},
 		HostBootID: "host-boot-1",
 		PGID:       10,
-		Leader:     ProcessIdentity{PID: 11, HighResStartToken: "leader-start-10"},
+		Leader:     ProcessIdentity{PID: 10, HighResStartToken: "leader-start-10"},
 		Monitor:    ProcessIdentity{PID: 12, HighResStartToken: "monitor-start-10"},
 		RetainedID: "retained-1",
 	}

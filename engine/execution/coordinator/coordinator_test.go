@@ -726,6 +726,7 @@ func (s *testSupervisor) Prepare(ctx context.Context, plan LaunchPlan) (Prepared
 		return PreparedSupervisor{}, err
 	}
 	s.next++
+	pgid := 1000 + s.next
 	group := model.GroupRef{
 		Version:   1,
 		CustodyID: model.CustodyID(fmt.Sprintf("custody-%s-%s", plan.Ref.JobID, plan.Ordinal)),
@@ -734,9 +735,9 @@ func (s *testSupervisor) Prepare(ctx context.Context, plan LaunchPlan) (Prepared
 			Ordinal: plan.Ordinal,
 		},
 		HostBootID: "host-boot-" + plan.Ref.JobID.String(),
-		PGID:       1000 + s.next,
+		PGID:       pgid,
 		Leader: model.ProcessIdentity{
-			PID:               2000 + s.next,
+			PID:               pgid,
 			HighResStartToken: fmt.Sprintf("leader-token-%d", s.next),
 		},
 		Monitor: model.ProcessIdentity{

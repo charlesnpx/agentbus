@@ -77,7 +77,7 @@ func testQuiescenceCertificate() model.QuiescenceCertificate {
 		},
 		HostBootID: "host-boot-custodian",
 		PGID:       100,
-		Leader:     model.ProcessIdentity{PID: 101, HighResStartToken: "leader-start-custodian"},
+		Leader:     model.ProcessIdentity{PID: 100, HighResStartToken: "leader-start-custodian"},
 		Monitor:    model.ProcessIdentity{PID: 102, HighResStartToken: "monitor-start-custodian"},
 		RetainedID: "retained-custodian",
 	}
