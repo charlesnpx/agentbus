@@ -3,8 +3,6 @@ package command
 import (
 	"context"
 	"io"
-
-	"github.com/charlesnpx/agentbus/engine/execution/model"
 )
 
 type ExecSpec struct {
@@ -14,10 +12,9 @@ type ExecSpec struct {
 }
 
 type ExitObservation struct {
-	Exited   bool
-	Code     int
-	Signal   string
-	Evidence model.Evidence
+	Exited bool
+	Code   int
+	Signal string
 }
 
 type Runner interface {
