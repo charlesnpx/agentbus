@@ -106,3 +106,58 @@ func TestSafetyLatchConcurrentTripsAreSafe(t *testing.T) {
 		t.Fatal("Done did not close after concurrent Trips")
 	}
 }
+
+func TestSafetyLatchReasonConcurrentWithTripIsRaceFree(t *testing.T) {
+	latch := NewSafetyLatch()
+	first := errors.New("first")
+	second := errors.New("second")
+	const readers = 64
+
+	var readersWG sync.WaitGroup
+	var tripWG sync.WaitGroup
+	start := make(chan struct{})
+	stop := make(chan struct{})
+
+	for range readers {
+		readersWG.Add(1)
+		go func() {
+			defer readersWG.Done()
+			<-start
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+
+				_ = latch.Reason()
+				select {
+				case <-latch.Done():
+				default:
+				}
+			}
+		}()
+	}
+
+	tripWG.Add(1)
+	go func() {
+		defer tripWG.Done()
+		<-start
+		latch.Trip(first)
+	}()
+
+	close(start)
+	tripWG.Wait()
+	latch.Trip(second)
+	close(stop)
+	readersWG.Wait()
+
+	if got := latch.Reason(); !errors.Is(got, first) {
+		t.Fatalf("Reason() = %v, want first error", got)
+	}
+	select {
+	case <-latch.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Done did not close after concurrent Reason and Trip")
+	}
+}
