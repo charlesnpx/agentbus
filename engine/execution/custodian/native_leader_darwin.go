@@ -19,6 +19,9 @@ type nativeLeaderPlatformHandle struct {
 	closed bool
 }
 
+// openNativeLeaderPlatformHandle registers a kqueue NOTE_EXIT watcher for exit
+// notification only. A kqueue held by a non-parent does not keep the numeric
+// PID/PGID unrecycled after the real parent reaps the process.
 func openNativeLeaderPlatformHandle(pid int) (nativeLeaderPlatformHandle, error) {
 	kq, err := unix.Kqueue()
 	if err != nil {

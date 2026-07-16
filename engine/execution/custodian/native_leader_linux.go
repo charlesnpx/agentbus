@@ -15,6 +15,9 @@ type nativeLeaderPlatformHandle struct {
 	closed bool
 }
 
+// openNativeLeaderPlatformHandle opens a pidfd for exit notification only. A
+// pidfd held by a non-parent does not keep the numeric PID/PGID unrecycled after
+// the real parent reaps the process.
 func openNativeLeaderPlatformHandle(pid int) (nativeLeaderPlatformHandle, error) {
 	fd, err := unix.PidfdOpen(pid, 0)
 	if err != nil {

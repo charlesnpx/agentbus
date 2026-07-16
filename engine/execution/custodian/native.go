@@ -22,6 +22,7 @@ import (
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
 	"github.com/charlesnpx/agentbus/internal/parkproto"
 	"github.com/charlesnpx/agentbus/internal/procgroup"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -436,15 +437,36 @@ func (process *NativeRunningProcess) Wait(ctx context.Context) (command.ExitObse
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if process.leader != nil {
-		if err := process.leader.waitExited(ctx); err != nil {
-			return command.ExitObservation{}, err
-		}
-	}
 	for {
+		var waitHandle nativeLeaderPlatformHandle
+		haveWaitHandle := false
 		process.lifecycleMu.Lock()
 		if process.finalized {
-			exit, err := process.finalExit, errors.Join(process.finalWaitErr, process.finalErr)
+			exit, err := process.finalizedWaitResultLocked()
+			process.lifecycleMu.Unlock()
+			return exit, err
+		}
+		if process.leader != nil {
+			cloned, err := process.leader.cloneExitNotification()
+			if err != nil {
+				process.lifecycleMu.Unlock()
+				return process.finalizedWaitResultOrError(err)
+			}
+			waitHandle = cloned
+			haveWaitHandle = true
+		}
+		process.lifecycleMu.Unlock()
+		if haveWaitHandle {
+			if err := waitHandle.waitExited(ctx); err != nil {
+				_ = waitHandle.close()
+				return process.finalizedWaitResultOrError(err)
+			}
+			_ = waitHandle.close()
+		}
+
+		process.lifecycleMu.Lock()
+		if process.finalized {
+			exit, err := process.finalizedWaitResultLocked()
 			process.lifecycleMu.Unlock()
 			return exit, err
 		}
@@ -468,6 +490,19 @@ func (process *NativeRunningProcess) Wait(ctx context.Context) (command.ExitObse
 	}
 }
 
+func (process *NativeRunningProcess) finalizedWaitResultLocked() (command.ExitObservation, error) {
+	return process.finalExit, errors.Join(process.finalWaitErr, process.finalErr)
+}
+
+func (process *NativeRunningProcess) finalizedWaitResultOrError(err error) (command.ExitObservation, error) {
+	process.lifecycleMu.Lock()
+	defer process.lifecycleMu.Unlock()
+	if process.finalized {
+		return process.finalizedWaitResultLocked()
+	}
+	return command.ExitObservation{}, err
+}
+
 func (process *NativeRunningProcess) ContainAndVerify(ctx context.Context) PhysicalOutcome {
 	if process == nil || process.custodian == nil {
 		return unprovablePhysical(model.GroupRef{}, containment.ReasonInvalidInput, "", fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable))
@@ -489,15 +524,15 @@ func (process *NativeRunningProcess) containAndVerify(ctx context.Context) Physi
 	}
 	outcome := containPhysical(ctx, process.group, process.custodian.options.ContainmentParams, process.leader)
 	if outcome.Unprovable() {
-		finalOutcome, _, err := process.finalizeIfSoleLeaderLocked(ctx, PhysicalOutcome{
+		if !mayFinalizeSoleLeaderAfterUnprovable(outcome) {
+			return outcome
+		}
+		finalOutcome, _, _ := process.finalizeIfSoleLeaderLocked(ctx, PhysicalOutcome{
 			Kind:     PhysicalOutcomeAbsent,
 			Group:    process.group,
 			Method:   model.QuiescenceTermKill,
 			Decision: outcome.Decision,
-		}, process.custodian.options.ContainmentParams.PollTimeout)
-		if err != nil {
-			return unprovablePhysical(process.group, containment.ReasonProbeUnprovable, outcome.Decision, err)
-		}
+		}, 0)
 		if finalOutcome.Absent() {
 			return finalOutcome
 		}
@@ -508,6 +543,13 @@ func (process *NativeRunningProcess) containAndVerify(ctx context.Context) Physi
 		return unprovablePhysical(process.group, containment.ReasonProbeUnprovable, outcome.Decision, err)
 	}
 	return finalOutcome
+}
+
+func mayFinalizeSoleLeaderAfterUnprovable(outcome PhysicalOutcome) bool {
+	return outcome.Unprovable() &&
+		outcome.Reason == containment.ReasonAbsenceDeadlineExceeded &&
+		outcome.Decision == model.SignalDirectly &&
+		outcome.Err == nil
 }
 
 func (process *NativeRunningProcess) finalizeIfSoleLeaderLocked(ctx context.Context, outcome PhysicalOutcome, waitForSole time.Duration) (PhysicalOutcome, command.ExitObservation, error) {
@@ -663,7 +705,7 @@ func (native *nativeLaunchContainment) Contain(ctx context.Context, group model.
 func containPhysical(ctx context.Context, group model.GroupRef, params containment.Params, witness containment.ContinuityWitness) PhysicalOutcome {
 	engine := containment.Engine{
 		Observer:   containment.RealObserver{},
-		Signaler:   containment.RealSignaler{},
+		Signaler:   nativeSignalerFor(witness),
 		Clock:      containment.RealClock{},
 		Continuity: witness,
 	}
@@ -690,6 +732,43 @@ func containPhysical(ctx context.Context, group model.GroupRef, params containme
 		Method:   methodForDecision(outcome.Decision),
 		Decision: outcome.Decision,
 	}
+}
+
+func nativeSignalerFor(witness containment.ContinuityWitness) containment.Signaler {
+	signaler := nativeContainmentSignaler{}
+	if retention, ok := witness.(*leaderRetention); ok {
+		signaler.retention = retention
+	}
+	return signaler
+}
+
+type nativeContainmentSignaler struct {
+	retention *leaderRetention
+}
+
+// nativeContainmentSignaler keeps shared containment fail-closed while smoothing
+// native owner facts: kill(0) EPERM proves group existence, and a signal EPERM is
+// non-fatal only when the parent-held leader is the sole remaining group member.
+func (signaler nativeContainmentSignaler) SignalGroup(ctx context.Context, target model.GroupRef, signal containment.Signal) (containment.SignalResult, error) {
+	result, err := containment.RealSignaler{}.SignalGroup(ctx, target, signal)
+	if err == nil {
+		return result, nil
+	}
+	if errors.Is(err, unix.EPERM) && signaler.retention != nil && signaler.retention.unreapedFor(target) {
+		soleLeader, soleErr := groupHasNoMembersExceptLeader(target)
+		if soleErr == nil && soleLeader {
+			return containment.SignalDelivered, nil
+		}
+	}
+	return result, err
+}
+
+func (nativeContainmentSignaler) ProbeGroup(ctx context.Context, target model.GroupRef) (containment.ProbeResult, error) {
+	result, err := containment.RealSignaler{}.ProbeGroup(ctx, target)
+	if errors.Is(err, unix.EPERM) {
+		return containment.ProbeLive, nil
+	}
+	return result, err
 }
 
 func methodForDecision(decision model.ContainmentDecision) model.QuiescenceMethod {
@@ -864,6 +943,16 @@ func (retention *leaderRetention) BeginGroupContinuity(ctx context.Context, targ
 	return &leaderContinuity{retention: retention, begin: observedAt}
 }
 
+// unreapedFor is true only for genuine non-reaping parent ownership: this
+// process must hold the ParkedHandle for the exact leader and must not have
+// called Wait/WaitState. A pidfd or kqueue opened by a non-parent is only an
+// exit-notification handle; it does not stop PID/PGID reuse after the real parent
+// reaps the zombie.
+//
+// Ledger: robust after-daemon-death containment of TERM-ignoring descendants
+// needs a reuse-proof group lifetime object, such as Linux cgroup v2
+// cgroup.procs/cgroup.kill. That mechanism is forward-tracked and intentionally
+// not approximated with pidfd/kqueue retention here.
 func (retention *leaderRetention) unreapedFor(target model.GroupRef) bool {
 	if retention == nil {
 		return false
@@ -873,23 +962,26 @@ func (retention *leaderRetention) unreapedFor(target model.GroupRef) bool {
 	if !retention.group.Equal(target) {
 		return false
 	}
-	if retention.handle != nil && retention.handle.LeaderReaped() {
+	if retention.handle == nil || retention.handle.LeaderReaped() {
 		return false
 	}
 	return retention.platform.held()
 }
 
-func (retention *leaderRetention) waitExited(ctx context.Context) error {
+func (retention *leaderRetention) cloneExitNotification() (nativeLeaderPlatformHandle, error) {
 	if retention == nil {
-		return fmt.Errorf("%w: leader retention is nil", ErrNativeCustodianUnavailable)
+		return nativeLeaderPlatformHandle{}, fmt.Errorf("%w: leader retention is nil", ErrNativeCustodianUnavailable)
 	}
 	retention.mu.Lock()
+	defer retention.mu.Unlock()
 	if !retention.platform.held() {
-		retention.mu.Unlock()
-		return fmt.Errorf("%w: leader continuity handle is closed", ErrNativeCustodianUnavailable)
+		return nativeLeaderPlatformHandle{}, fmt.Errorf("%w: leader continuity handle is closed", ErrNativeCustodianUnavailable)
 	}
-	waitHandle, err := retention.platform.clone()
-	retention.mu.Unlock()
+	return retention.platform.clone()
+}
+
+func (retention *leaderRetention) waitExited(ctx context.Context) error {
+	waitHandle, err := retention.cloneExitNotification()
 	if err != nil {
 		return err
 	}
