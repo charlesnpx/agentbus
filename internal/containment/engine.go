@@ -70,7 +70,11 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 }
 
 func (engine Engine) acquireRetainedObject(ctx context.Context, target model.GroupRef) (containmentState, Outcome) {
-	if !retainedObjectRequired(target) {
+	required, err := model.ContainmentRequiresRetainedObject(target)
+	if err != nil {
+		return containmentState{}, UnprovableOutcome(ReasonInvalidInput, "", err)
+	}
+	if !required {
 		return containmentState{}, Outcome{}
 	}
 	acquiredAt := engine.Clock.Now()
@@ -91,10 +95,6 @@ func (engine Engine) acquireRetainedObject(ctx context.Context, target model.Gro
 		return containmentState{retainedAcquisitionErr: err, operationBegin: acquiredAt}, UnprovableOutcome(ReasonAuthorizationUnprovable, model.Unprovable, err)
 	}
 	return containmentState{retainedObject: retainedObject, operationBegin: acquiredAt}, Outcome{}
-}
-
-func retainedObjectRequired(target model.GroupRef) bool {
-	return target.RetainedDomainID != "" || target.RetainedDomainState == model.RetainedDomainKnown
 }
 
 func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef, params Params, state containmentState, authorization model.ContainmentAuthorizationResult) Outcome {
@@ -328,7 +328,11 @@ func (engine Engine) authorize(ctx context.Context, target model.GroupRef, obser
 }
 
 func (engine Engine) retainedObjectProof(ctx context.Context, target model.GroupRef, state containmentState, observedAt time.Time) (model.RetainedObjectProof, bool) {
-	if !retainedObjectRequired(target) {
+	required, err := model.ContainmentRequiresRetainedObject(target)
+	if err != nil {
+		return model.RetainedObjectProofUnknown, false
+	}
+	if !required {
 		return model.RetainedObjectProofNone, true
 	}
 	if state.retainedAcquisitionErr != nil || state.retainedObject == nil || target.RetainedID == "" || state.operationBegin.IsZero() || observedAt.IsZero() || observedAt.Before(state.operationBegin) {

@@ -452,7 +452,7 @@ func TestContainmentRetainedAuthorityUsesRetainedTeardownForReusedPGID(t *testin
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
 		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
-		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
+		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
 	}}
 	signaler := &fakeSignaler{}
 	retained := &fakeRetainedObject{
