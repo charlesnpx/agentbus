@@ -224,13 +224,6 @@ func TestAuthorizeSecondOrdinalRejectsSharedCustodyOrPhysicalIdentity(t *testing
 				group.RetainedID = first.Group.RetainedID
 			},
 		},
-		{
-			name: "different retained id",
-			mutate: func(group *GroupRef) {
-				group.Monitor = first.Group.Monitor
-				group.RetainedID = "different-retained"
-			},
-		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			sharedTarget := reducerGroup(LaunchOrdinalTwo)
@@ -242,6 +235,16 @@ func TestAuthorizeSecondOrdinalRejectsSharedCustodyOrPhysicalIdentity(t *testing
 				t.Fatalf("shared target identity bind error = %v, want ErrConflictingDuplicate", err)
 			}
 		})
+	}
+
+	differentRetained := reducerGroup(LaunchOrdinalTwo)
+	differentRetained.HostBootID = first.Group.HostBootID
+	differentRetained.PGID = first.Group.PGID
+	differentRetained.Leader = first.Group.Leader
+	differentRetained.Monitor = first.Group.Monitor
+	differentRetained.RetainedID = "different-retained"
+	if _, err := apply(record, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: differentRetained}); err != nil {
+		t.Fatalf("different retained id bind error = %v, want nil", err)
 	}
 
 	forged := cloneSafetyRecord(record)

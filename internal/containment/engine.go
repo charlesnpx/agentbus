@@ -9,15 +9,17 @@ import (
 )
 
 type Engine struct {
-	Observer   Observer
-	Signaler   Signaler
-	Clock      Clock
-	Continuity ContinuityWitness
+	Observer       Observer
+	Signaler       Signaler
+	Clock          Clock
+	Continuity     ContinuityWitness
+	RetainedObject RetainedGroupObject
 }
 
 type containmentState struct {
 	session                  model.ContainmentSession
 	continuity               GroupContinuity
+	operationBegin           time.Time
 	matchingLeaderObservedAt time.Time
 }
 
@@ -40,8 +42,8 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 	if outcome.Kind != 0 {
 		return outcome
 	}
-	state := engine.advanceSession(ctx, target, containmentState{}, observation, observedAt)
-	decision, outcome := authorize(target, observation, state.session, false)
+	state := engine.advanceSession(ctx, target, containmentState{operationBegin: observedAt}, observation, observedAt)
+	decision, outcome := engine.authorize(ctx, target, observation, state, false, observedAt)
 	if outcome.Kind != 0 {
 		return outcome
 	}
@@ -73,7 +75,7 @@ func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef
 		return outcome
 	}
 	state = engine.advanceSession(ctx, target, state, observation, observedAt)
-	decision, outcome = authorize(target, observation, state.session, false)
+	decision, outcome = engine.authorize(ctx, target, observation, state, false, observedAt)
 	if outcome.Kind != 0 {
 		return outcome
 	}
@@ -98,7 +100,7 @@ func (engine Engine) waitForTrustedMonitor(ctx context.Context, target model.Gro
 	deadline := engine.Clock.Now().Add(params.TrustedMonitorWait)
 	for {
 		expired := !engine.Clock.Now().Before(deadline)
-		decision, outcome := authorize(target, observation, state.session, expired)
+		decision, outcome := engine.authorize(ctx, target, observation, state, expired, engine.Clock.Now())
 		if outcome.Kind != 0 {
 			return outcome
 		}
@@ -140,7 +142,7 @@ func (engine Engine) pollUntilAbsent(ctx context.Context, target model.GroupRef,
 			return outcome
 		}
 		state = engine.advanceSession(ctx, target, state, observation, observedAt)
-		currentDecision, outcome := authorize(target, observation, state.session, false)
+		currentDecision, outcome := engine.authorize(ctx, target, observation, state, false, observedAt)
 		if outcome.Kind != 0 {
 			return outcome
 		}
@@ -217,11 +219,12 @@ func (engine Engine) sleepUntil(ctx context.Context, interval time.Duration, dea
 	return engine.Clock.Sleep(ctx, interval)
 }
 
-func authorize(target model.GroupRef, observation model.ContainmentObservation, session model.ContainmentSession, deadlineExpired bool) (model.ContainmentDecision, Outcome) {
+func (engine Engine) authorize(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation, state containmentState, deadlineExpired bool, observedAt time.Time) (model.ContainmentDecision, Outcome) {
 	decision, err := model.DecideContainmentAuthorization(model.ContainmentAuthorization{
 		Group:           target,
 		Observation:     observation,
-		Session:         session,
+		Session:         state.session,
+		RetainedObject:  engine.retainedObjectProof(ctx, target, state.operationBegin, observedAt),
 		DeadlineExpired: deadlineExpired,
 	})
 	if err != nil {
@@ -230,14 +233,29 @@ func authorize(target model.GroupRef, observation model.ContainmentObservation, 
 	return decision, Outcome{}
 }
 
+func (engine Engine) retainedObjectProof(ctx context.Context, target model.GroupRef, begin, end time.Time) model.RetainedObjectProof {
+	if engine.RetainedObject == nil || target.RetainedID == "" || begin.IsZero() || end.IsZero() || end.Before(begin) {
+		return model.RetainedObjectProofNone
+	}
+	evidence, err := engine.RetainedObject.ProveRetainedGroup(ctx, target, begin, end)
+	if err != nil {
+		return model.RetainedObjectProofUnknown
+	}
+	return evidence.ProofFor(target, begin, end)
+}
+
 func (engine Engine) advanceSession(ctx context.Context, target model.GroupRef, state containmentState, observation model.ContainmentObservation, observedAt time.Time) containmentState {
+	if state.operationBegin.IsZero() {
+		state.operationBegin = observedAt
+	}
 	if observation.Group != model.GroupLive || !target.KernelDomain().ProvablySame(observation.KernelDomainID) {
-		return containmentState{}
+		return containmentState{operationBegin: state.operationBegin}
 	}
 	switch observation.Leader {
 	case model.ProcessIdentityMatching:
 		next := containmentState{
 			session:                  model.ContainmentSession{BeganFromMatchingLeader: true},
+			operationBegin:           state.operationBegin,
 			matchingLeaderObservedAt: observedAt,
 		}
 		if engine.Continuity != nil {
@@ -248,11 +266,11 @@ func (engine Engine) advanceSession(ctx context.Context, target model.GroupRef, 
 		if state.session.BeganFromMatchingLeader && state.continuity != nil {
 			evidence := state.continuity.ConfirmContinuouslyLive(ctx, target, observation, state.matchingLeaderObservedAt, observedAt)
 			if !evidence.Covers(target, state.matchingLeaderObservedAt, observedAt) {
-				return containmentState{}
+				return containmentState{operationBegin: state.operationBegin}
 			}
 			state.session.ContinuouslyObservedLive = true
 			return state
 		}
 	}
-	return containmentState{}
+	return containmentState{operationBegin: state.operationBegin}
 }

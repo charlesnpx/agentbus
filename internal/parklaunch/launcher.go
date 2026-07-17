@@ -3,6 +3,8 @@ package parklaunch
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -82,6 +84,7 @@ type Spec struct {
 	ReleaseSecret model.ReleaseSecret
 	Containment   Containment
 	Monitor       *MonitorProcessSpec
+	RetainedID    string
 
 	// RetainLeaderUnreaped leaves the target group leader as an unreaped child
 	// until ParkedHandle.Wait or ParkedHandle.WaitState is called. Native
@@ -350,7 +353,7 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 		return nil, preIdentityAbort(fmt.Errorf("monitor joined target process group %d", workerClaim.PGID))
 	}
 
-	group = groupRefFromClaims(workerClaim, monitorClaim, spec.CustodyID, spec.LaunchKey)
+	group = groupRefFromClaims(workerClaim, monitorClaim, spec.CustodyID, spec.LaunchKey, spec.RetainedID)
 	expectation, err := releaseExpectation(spec, group)
 	if err != nil {
 		return nil, failClosed(spec.Containment, group, err)
@@ -590,7 +593,10 @@ func verifyMonitorReadyIdentity(reader identityReader, monitor *MonitorProcess, 
 	return nil
 }
 
-func groupRefFromClaims(worker, monitor procgroup.ProcessClaim, custodyID model.CustodyID, launchKey model.LaunchKey) model.GroupRef {
+func groupRefFromClaims(worker, monitor procgroup.ProcessClaim, custodyID model.CustodyID, launchKey model.LaunchKey, retainedID string) model.GroupRef {
+	if retainedID == "" {
+		retainedID = defaultRetainedID(worker, monitor, custodyID, launchKey)
+	}
 	return model.GroupRef{
 		Version:           1,
 		CustodyID:         custodyID,
@@ -607,7 +613,26 @@ func groupRefFromClaims(worker, monitor procgroup.ProcessClaim, custodyID model.
 			PID:               monitor.PID,
 			HighResStartToken: monitor.StartToken.String(),
 		},
+		RetainedID: retainedID,
 	}
+}
+
+func defaultRetainedID(worker, monitor procgroup.ProcessClaim, custodyID model.CustodyID, launchKey model.LaunchKey) string {
+	hash := sha256.New()
+	fmt.Fprintf(hash, "parklaunch-retained-v1\x00%s\x00%s\x00%s\x00%d\x00%s\x00%d\x00%s\x00%s\x00%s\x00%d\x00%s",
+		custodyID,
+		launchKey.Attempt.JobID,
+		launchKey.Attempt.AttemptID,
+		launchKey.Attempt.Epoch,
+		launchKey.Ordinal,
+		worker.PID,
+		worker.StartToken,
+		worker.KernelDomainID.HostBootID,
+		worker.KernelDomainID.PIDNamespaceID,
+		monitor.PID,
+		monitor.StartToken,
+	)
+	return "parklaunch-retained-sha256-" + hex.EncodeToString(hash.Sum(nil))
 }
 
 func waitProcessGroupLeaderClaim(ctx context.Context, reader identityReader, pid int) (procgroup.ProcessClaim, error) {

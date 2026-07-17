@@ -272,8 +272,13 @@ func (ref GroupRef) KernelDomain() KernelDomainID {
 }
 
 func (ref GroupRef) SamePhysicalIdentity(other GroupRef) bool {
-	return ref.KernelDomain().ProvablySame(other.KernelDomain()) &&
-		(ref.PGID == other.PGID || ref.Leader.Equal(other.Leader))
+	if !ref.KernelDomain().ProvablySame(other.KernelDomain()) {
+		return false
+	}
+	if ref.RetainedID != "" || other.RetainedID != "" {
+		return ref.RetainedID != "" && other.RetainedID != "" && ref.RetainedID == other.RetainedID
+	}
+	return ref.PGID == other.PGID || ref.Leader.Equal(other.Leader)
 }
 
 type AcknowledgementFact struct {

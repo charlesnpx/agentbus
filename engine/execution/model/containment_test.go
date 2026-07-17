@@ -24,6 +24,82 @@ func TestContainmentCallerSuppliedContinuityAuthorizesKillAfterLeaderExitWithLiv
 	}
 }
 
+func TestContainmentRetainedObjectProofAuthorizesMissingLeader(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	decision, err := DecideContainmentAuthorization(ContainmentAuthorization{
+		Group: ref,
+		Observation: ContainmentObservation{
+			KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+			Group:          GroupLive,
+			Leader:         ProcessIdentityMissing,
+		},
+		RetainedObject: RetainedObjectProofMembersPresent,
+	})
+	if err != nil {
+		t.Fatalf("DecideContainmentAuthorization error = %v", err)
+	}
+	if decision != SignalDirectly {
+		t.Fatalf("decision = %s, want %s", decision, SignalDirectly)
+	}
+}
+
+func TestContainmentRetainedObjectEmptyProofProvesAbsent(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	decision, err := DecideContainmentAuthorization(ContainmentAuthorization{
+		Group: ref,
+		Observation: ContainmentObservation{
+			KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+			Group:          GroupLive,
+			Leader:         ProcessIdentityMissing,
+		},
+		RetainedObject: RetainedObjectProofEmpty,
+	})
+	if err != nil {
+		t.Fatalf("DecideContainmentAuthorization error = %v", err)
+	}
+	if decision != AlreadyAbsent {
+		t.Fatalf("decision = %s, want %s", decision, AlreadyAbsent)
+	}
+}
+
+func TestContainmentRetainedObjectUnknownProofDoesNotProveAbsentOrSignal(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	decision, err := DecideContainmentAuthorization(ContainmentAuthorization{
+		Group: ref,
+		Observation: ContainmentObservation{
+			KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+			Group:          GroupLive,
+			Leader:         ProcessIdentityMissing,
+		},
+		RetainedObject: RetainedObjectProofUnknown,
+	})
+	if err != nil {
+		t.Fatalf("DecideContainmentAuthorization error = %v", err)
+	}
+	if decision != Unprovable {
+		t.Fatalf("decision = %s, want %s", decision, Unprovable)
+	}
+}
+
+func TestContainmentRetainedObjectMembersContradictIndependentAbsent(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	decision, err := DecideContainmentAuthorization(ContainmentAuthorization{
+		Group: ref,
+		Observation: ContainmentObservation{
+			KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+			Group:          GroupAbsent,
+			Leader:         ProcessIdentityMissing,
+		},
+		RetainedObject: RetainedObjectProofMembersPresent,
+	})
+	if err != nil {
+		t.Fatalf("DecideContainmentAuthorization error = %v", err)
+	}
+	if decision != Unprovable {
+		t.Fatalf("decision = %s, want %s", decision, Unprovable)
+	}
+}
+
 func TestContainmentSessionDoesNotAuthorizeReusedLeader(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
 	decision, err := DecideContainmentAuthorization(ContainmentAuthorization{

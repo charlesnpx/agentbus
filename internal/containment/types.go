@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 )
@@ -13,6 +14,117 @@ import (
 // errors; they must never be reported as absent.
 type Observer interface {
 	ObserveGroup(ctx context.Context, target model.GroupRef) (model.ContainmentObservation, error)
+}
+
+// RetainedGroupObject proves membership or absence for a durable group-lifetime
+// object identified by GroupRef.RetainedID. It must not infer from PID/PGID
+// samples; unknown or ambiguous state is represented by sealed unknown evidence
+// or by returning an error.
+type RetainedGroupObject interface {
+	ProveRetainedGroup(ctx context.Context, target model.GroupRef, begin, end time.Time) (RetainedGroupEvidence, error)
+}
+
+type RetainedGroupMembership uint8
+
+const (
+	RetainedMembershipUnknown RetainedGroupMembership = iota + 1
+	RetainedMembershipPresent
+	RetainedMembershipEmpty
+)
+
+func (membership RetainedGroupMembership) validate() error {
+	switch membership {
+	case RetainedMembershipUnknown, RetainedMembershipPresent, RetainedMembershipEmpty:
+		return nil
+	default:
+		return fmt.Errorf("retained group membership is unknown")
+	}
+}
+
+// RetainedGroupEvidence is sealed retained-object evidence: callers can only
+// build it through the constructor, and the engine validates retained identity
+// and interval coverage before passing a proof state to the model.
+type RetainedGroupEvidence struct {
+	retainedID string
+	begin      time.Time
+	end        time.Time
+	membership RetainedGroupMembership
+}
+
+func NewRetainedGroupEvidence(retainedID string, begin, end time.Time, membership RetainedGroupMembership) (RetainedGroupEvidence, error) {
+	evidence := RetainedGroupEvidence{
+		retainedID: retainedID,
+		begin:      begin,
+		end:        end,
+		membership: membership,
+	}
+	if err := evidence.validate(); err != nil {
+		return RetainedGroupEvidence{}, err
+	}
+	return evidence, nil
+}
+
+func (evidence RetainedGroupEvidence) ProofFor(target model.GroupRef, begin, end time.Time) model.RetainedObjectProof {
+	if err := target.Validate(); err != nil {
+		return model.RetainedObjectProofNone
+	}
+	if target.RetainedID == "" {
+		return model.RetainedObjectProofNone
+	}
+	if begin.IsZero() || end.IsZero() || end.Before(begin) {
+		return model.RetainedObjectProofNone
+	}
+	if err := evidence.validate(); err != nil {
+		return model.RetainedObjectProofNone
+	}
+	if evidence.retainedID != target.RetainedID || evidence.begin.After(begin) || evidence.end.Before(end) {
+		return model.RetainedObjectProofNone
+	}
+	switch evidence.membership {
+	case RetainedMembershipPresent:
+		return model.RetainedObjectProofMembersPresent
+	case RetainedMembershipEmpty:
+		return model.RetainedObjectProofEmpty
+	case RetainedMembershipUnknown:
+		return model.RetainedObjectProofUnknown
+	default:
+		return model.RetainedObjectProofNone
+	}
+}
+
+func (evidence RetainedGroupEvidence) validate() error {
+	if err := validateRetainedEvidenceID(evidence.retainedID); err != nil {
+		return err
+	}
+	if evidence.begin.IsZero() {
+		return fmt.Errorf("retained group evidence begin must be set")
+	}
+	if evidence.end.IsZero() {
+		return fmt.Errorf("retained group evidence end must be set")
+	}
+	if evidence.end.Before(evidence.begin) {
+		return fmt.Errorf("retained group evidence end precedes begin")
+	}
+	return evidence.membership.validate()
+}
+
+func validateRetainedEvidenceID(value string) error {
+	const maxTokenBytes = 256
+	if value == "" {
+		return fmt.Errorf("retained group evidence retained id is required")
+	}
+	if len(value) > maxTokenBytes {
+		return fmt.Errorf("retained group evidence retained id is too long")
+	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("retained group evidence retained id must be valid UTF-8")
+	}
+	for _, r := range value {
+		if r <= ' ' || r == 0x7f {
+			return fmt.Errorf("retained group evidence retained id must not contain whitespace or control characters")
+		}
+	}
+	return nil
 }
 
 // ContinuityWitness can bind a live matching-leader observation to a capability

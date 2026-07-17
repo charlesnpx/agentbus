@@ -204,6 +204,37 @@ func TestGroupPhysicalIdentityIncludesLeaderReuseAcrossPGIDs(t *testing.T) {
 	}
 }
 
+func TestGroupPhysicalIdentityRequiresRetainedIDMatchWhenPresent(t *testing.T) {
+	record := validSafetyRecord()
+	first := *record.Attempt.Launches.First.Group
+	tests := []struct {
+		name   string
+		mutate func(*GroupRef)
+	}{
+		{
+			name: "different_retained_id",
+			mutate: func(group *GroupRef) {
+				group.RetainedID = "different-retained"
+			},
+		},
+		{
+			name: "empty_vs_present",
+			mutate: func(group *GroupRef) {
+				group.RetainedID = ""
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			second := first
+			tt.mutate(&second)
+			if first.SamePhysicalIdentity(second) {
+				t.Fatalf("SamePhysicalIdentity returned true for %s", tt.name)
+			}
+		})
+	}
+}
+
 func TestTerminalProofRequiresSupportingCertificates(t *testing.T) {
 	record := validSafetyRecord()
 	record.Terminal = &TerminalCertificate{

@@ -56,6 +56,50 @@ func (witness *fakeContinuityWitness) ConfirmContinuouslyLive(_ context.Context,
 	return evidence
 }
 
+type fakeRetainedObject struct {
+	membership  RetainedGroupMembership
+	memberships []RetainedGroupMembership
+	retainedID  string
+	begin       time.Time
+	end         time.Time
+	err         error
+	calls       int
+}
+
+func (object *fakeRetainedObject) ProveRetainedGroup(_ context.Context, target model.GroupRef, begin, end time.Time) (RetainedGroupEvidence, error) {
+	if object == nil {
+		return RetainedGroupEvidence{}, errors.New("retained object proof is missing")
+	}
+	index := object.calls
+	object.calls++
+	if object.err != nil {
+		return RetainedGroupEvidence{}, object.err
+	}
+	membership := object.membership
+	if index < len(object.memberships) {
+		membership = object.memberships[index]
+	} else if len(object.memberships) > 0 {
+		membership = object.memberships[len(object.memberships)-1]
+	}
+	retainedID := object.retainedID
+	if retainedID == "" {
+		retainedID = target.RetainedID
+	}
+	evidenceBegin := object.begin
+	if evidenceBegin.IsZero() {
+		evidenceBegin = begin
+	}
+	evidenceEnd := object.end
+	if evidenceEnd.IsZero() {
+		evidenceEnd = end
+	}
+	evidence, err := NewRetainedGroupEvidence(retainedID, evidenceBegin, evidenceEnd, membership)
+	if err != nil {
+		return RetainedGroupEvidence{}, err
+	}
+	return evidence, nil
+}
+
 type signalScript struct {
 	signal Signal
 	result SignalResult

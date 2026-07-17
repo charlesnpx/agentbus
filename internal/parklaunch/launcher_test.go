@@ -67,8 +67,8 @@ func TestLaunchHappyPathReleasesBackendWithStablePIDAndEOF(t *testing.T) {
 	if result.PGID != handle.GroupRef.PGID {
 		t.Fatalf("backend pgid = %d, want target group %d", result.PGID, handle.GroupRef.PGID)
 	}
-	if handle.GroupRef.RetainedID != "" {
-		t.Fatalf("retained id = %q, want empty v1 retained id", handle.GroupRef.RetainedID)
+	if !strings.HasPrefix(handle.GroupRef.RetainedID, "parklaunch-retained-sha256-") {
+		t.Fatalf("retained id = %q, want parklaunch-retained-sha256-*", handle.GroupRef.RetainedID)
 	}
 	if handle.GroupRef.Monitor.PID == handle.GroupRef.PGID {
 		t.Fatalf("monitor pid %d is target group leader", handle.GroupRef.Monitor.PID)

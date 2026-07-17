@@ -60,6 +60,70 @@ func TestKernelDomainIDValidateAndEqual(t *testing.T) {
 	}
 }
 
+func TestKernelDomainIDRetainedDomainKnowledge(t *testing.T) {
+	notApplicable := KernelDomainID{
+		HostBootID:          "host-boot-1",
+		PIDNamespaceState:   PIDNamespaceNotApplicable,
+		RetainedDomainState: RetainedDomainNotApplicable,
+	}
+	if err := notApplicable.Validate(); err != nil {
+		t.Fatalf("Validate() not-applicable retained domain error = %v", err)
+	}
+	if !notApplicable.ProvablySame(KernelDomainID{
+		HostBootID:          "host-boot-1",
+		PIDNamespaceState:   PIDNamespaceNotApplicable,
+		RetainedDomainState: RetainedDomainNotApplicable,
+	}) {
+		t.Fatal("ProvablySame() = false for not-applicable retained domain")
+	}
+
+	unknown := KernelDomainID{
+		HostBootID:          "host-boot-1",
+		PIDNamespaceState:   PIDNamespaceNotApplicable,
+		RetainedDomainState: RetainedDomainUnknown,
+	}
+	if err := unknown.Validate(); err != nil {
+		t.Fatalf("Validate() unknown retained domain error = %v", err)
+	}
+	if unknown.ProvablySame(unknown) {
+		t.Fatal("ProvablySame() = true for unknown retained domain")
+	}
+
+	known, err := NewKernelDomainIDWithRetainedDomain("host-boot-1", "pidns-1", "retained-domain-1")
+	if err != nil {
+		t.Fatalf("NewKernelDomainIDWithRetainedDomain() error = %v", err)
+	}
+	sameKnown, err := NewKernelDomainIDWithRetainedDomain("host-boot-1", "pidns-1", "retained-domain-1")
+	if err != nil {
+		t.Fatalf("NewKernelDomainIDWithRetainedDomain() same error = %v", err)
+	}
+	if !known.ProvablySame(sameKnown) {
+		t.Fatal("ProvablySame() = false for matching known retained domain")
+	}
+	differentKnown, err := NewKernelDomainIDWithRetainedDomain("host-boot-1", "pidns-1", "retained-domain-2")
+	if err != nil {
+		t.Fatalf("NewKernelDomainIDWithRetainedDomain() different error = %v", err)
+	}
+	if known.ProvablySame(differentKnown) {
+		t.Fatal("ProvablySame() = true for different known retained domains")
+	}
+	if err := (KernelDomainID{
+		HostBootID:          "host-boot-1",
+		PIDNamespaceState:   PIDNamespaceNotApplicable,
+		RetainedDomainID:    "retained-domain-1",
+		RetainedDomainState: RetainedDomainUnknown,
+	}).Validate(); err == nil {
+		t.Fatal("Validate() accepted retained-domain id with unknown state")
+	}
+	if err := (KernelDomainID{
+		HostBootID:          "host-boot-1",
+		PIDNamespaceState:   PIDNamespaceNotApplicable,
+		RetainedDomainState: RetainedDomainKnown,
+	}).Validate(); err == nil {
+		t.Fatal("Validate() accepted known retained domain without id")
+	}
+}
+
 func TestGroupRefEqualUsesCanonicalKernelDomain(t *testing.T) {
 	left := kernelDomainTestGroupRef()
 	right := left

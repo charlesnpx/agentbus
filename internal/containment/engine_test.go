@@ -244,6 +244,100 @@ func TestContainmentRejectsPartialContinuityInterval(t *testing.T) {
 	}
 }
 
+func TestContainmentRetainedObjectProofAuthorizesKillWithMissingLeader(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+		{signal: SignalKill, result: SignalDelivered},
+	}}
+	retained := &fakeRetainedObject{memberships: []RetainedGroupMembership{
+		RetainedMembershipPresent,
+		RetainedMembershipPresent,
+		RetainedMembershipEmpty,
+	}}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertAbsent(t, outcome)
+	assertSignals(t, signaler, SignalTerminate, SignalKill)
+	if retained.calls == 0 {
+		t.Fatalf("retained object was not consulted")
+	}
+}
+
+func TestContainmentRetainedObjectProofMustMatchObjectAndInterval(t *testing.T) {
+	target := testGroupRef(t)
+	now := newFakeClock().Now()
+	tests := []struct {
+		name     string
+		retained *fakeRetainedObject
+	}{
+		{
+			name:     "wrong_object",
+			retained: &fakeRetainedObject{membership: RetainedMembershipPresent, retainedID: "different-retained-object"},
+		},
+		{
+			name: "stale_interval",
+			retained: &fakeRetainedObject{
+				membership: RetainedMembershipPresent,
+				begin:      now.Add(-2 * time.Second),
+				end:        now.Add(-time.Second),
+			},
+		},
+		{
+			name:     "missing_proof",
+			retained: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			observer := &fakeObserver{observations: []model.ContainmentObservation{
+				testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+			}}
+			signaler := &fakeSignaler{}
+
+			outcome := testEngineWithRetained(observer, signaler, tt.retained).Contain(context.Background(), target, testParams())
+
+			assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+			assertSignals(t, signaler)
+		})
+	}
+}
+
+func TestContainmentRetainedObjectEmptyProofProvesAbsent(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{}
+	retained := &fakeRetainedObject{membership: RetainedMembershipEmpty}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertAbsent(t, outcome)
+	assertSignals(t, signaler)
+}
+
+func TestContainmentRetainedObjectUnknownProofIsUnprovable(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{}
+	retained := &fakeRetainedObject{membership: RetainedMembershipUnknown}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	assertSignals(t, signaler)
+}
+
 func TestContainmentReusedPGIDLeaderMissingWithoutContinuityDoesNotKill(t *testing.T) {
 	target := testGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
@@ -266,6 +360,10 @@ func testEngine(observer *fakeObserver, signaler *fakeSignaler) Engine {
 
 func testEngineWithContinuity(observer *fakeObserver, signaler *fakeSignaler, witness ContinuityWitness) Engine {
 	return Engine{Observer: observer, Signaler: signaler, Clock: newFakeClock(), Continuity: witness}
+}
+
+func testEngineWithRetained(observer *fakeObserver, signaler *fakeSignaler, retained RetainedGroupObject) Engine {
+	return Engine{Observer: observer, Signaler: signaler, Clock: newFakeClock(), RetainedObject: retained}
 }
 
 func testParams() Params {
@@ -312,6 +410,7 @@ func testGroupRef(t *testing.T) model.GroupRef {
 		PGID:              1001,
 		Leader:            model.ProcessIdentity{PID: 1001, HighResStartToken: "leader-start-1001"},
 		Monitor:           model.ProcessIdentity{PID: 2001, HighResStartToken: "monitor-start-2001"},
+		RetainedID:        "retained-1001",
 	}
 	if err := ref.Validate(); err != nil {
 		t.Fatalf("test GroupRef invalid: %v", err)

@@ -161,17 +161,61 @@ func (state PIDNamespaceState) Validate() error {
 	}
 }
 
+type RetainedDomainState uint8
+
+const (
+	RetainedDomainNotApplicable RetainedDomainState = iota
+	RetainedDomainKnown
+	RetainedDomainUnknown
+)
+
+func (state RetainedDomainState) Validate() error {
+	switch state {
+	case RetainedDomainUnknown, RetainedDomainKnown, RetainedDomainNotApplicable:
+		return nil
+	default:
+		return invalid("retained_domain.state", "is unknown")
+	}
+}
+
 type KernelDomainID struct {
-	HostBootID        string
-	PIDNamespaceID    string
-	PIDNamespaceState PIDNamespaceState
+	HostBootID          string
+	PIDNamespaceID      string
+	PIDNamespaceState   PIDNamespaceState
+	RetainedDomainID    string
+	RetainedDomainState RetainedDomainState
 }
 
 func NewKernelDomainID(hostBootID, pidNamespaceID string) (KernelDomainID, error) {
 	if pidNamespaceID == "" {
 		return KernelDomainID{}, invalid("kernel_domain.pid_namespace", "generic constructor requires an id")
 	}
-	id := KernelDomainID{HostBootID: hostBootID, PIDNamespaceID: pidNamespaceID, PIDNamespaceState: PIDNamespaceKnown}
+	id := KernelDomainID{
+		HostBootID:          hostBootID,
+		PIDNamespaceID:      pidNamespaceID,
+		PIDNamespaceState:   PIDNamespaceKnown,
+		RetainedDomainState: RetainedDomainNotApplicable,
+	}
+	if err := id.Validate(); err != nil {
+		return KernelDomainID{}, err
+	}
+	return id, nil
+}
+
+func NewKernelDomainIDWithRetainedDomain(hostBootID, pidNamespaceID, retainedDomainID string) (KernelDomainID, error) {
+	if pidNamespaceID == "" {
+		return KernelDomainID{}, invalid("kernel_domain.pid_namespace", "retained-domain constructor requires a pid namespace id")
+	}
+	if retainedDomainID == "" {
+		return KernelDomainID{}, invalid("kernel_domain.retained_domain", "retained-domain constructor requires an id")
+	}
+	id := KernelDomainID{
+		HostBootID:          hostBootID,
+		PIDNamespaceID:      pidNamespaceID,
+		PIDNamespaceState:   PIDNamespaceKnown,
+		RetainedDomainID:    retainedDomainID,
+		RetainedDomainState: RetainedDomainKnown,
+	}
 	if err := id.Validate(); err != nil {
 		return KernelDomainID{}, err
 	}
@@ -179,7 +223,11 @@ func NewKernelDomainID(hostBootID, pidNamespaceID string) (KernelDomainID, error
 }
 
 func NewKernelDomainIDWithoutPIDNamespace(hostBootID string) (KernelDomainID, error) {
-	id := KernelDomainID{HostBootID: hostBootID, PIDNamespaceState: PIDNamespaceNotApplicable}
+	id := KernelDomainID{
+		HostBootID:          hostBootID,
+		PIDNamespaceState:   PIDNamespaceNotApplicable,
+		RetainedDomainState: RetainedDomainNotApplicable,
+	}
 	if err := id.Validate(); err != nil {
 		return KernelDomainID{}, err
 	}
@@ -190,13 +238,18 @@ func (id KernelDomainID) Validate() error {
 	if err := validateToken("kernel_domain.host_boot_id", id.HostBootID); err != nil {
 		return err
 	}
-	return validatePIDNamespace("kernel_domain.pid_namespace", id.PIDNamespaceID, id.PIDNamespaceState)
+	if err := validatePIDNamespace("kernel_domain.pid_namespace", id.PIDNamespaceID, id.PIDNamespaceState); err != nil {
+		return err
+	}
+	return validateRetainedDomain("kernel_domain.retained_domain", id.RetainedDomainID, id.RetainedDomainState)
 }
 
 func (id KernelDomainID) Equal(other KernelDomainID) bool {
 	return id.HostBootID == other.HostBootID &&
 		id.PIDNamespaceID == other.PIDNamespaceID &&
-		id.PIDNamespaceState == other.PIDNamespaceState
+		id.PIDNamespaceState == other.PIDNamespaceState &&
+		id.RetainedDomainID == other.RetainedDomainID &&
+		id.RetainedDomainState == other.RetainedDomainState
 }
 
 func (id KernelDomainID) ProvablySame(other KernelDomainID) bool {
@@ -209,6 +262,11 @@ func (id KernelDomainID) ProvablySame(other KernelDomainID) bool {
 
 type normalizedPIDNamespace struct {
 	state PIDNamespaceState
+	id    string
+}
+
+type normalizedRetainedDomain struct {
+	state RetainedDomainState
 	id    string
 }
 
@@ -234,14 +292,29 @@ func compareKernelDomain(left, right KernelDomainID) (kernelDomainRelation, erro
 	rightNamespace := normalizePIDNamespace(right.PIDNamespaceID, right.PIDNamespaceState)
 	if leftNamespace.state == PIDNamespaceKnown && rightNamespace.state == PIDNamespaceKnown {
 		if leftNamespace.id == rightNamespace.id {
-			return kernelDomainSame, nil
+			return compareRetainedDomain(left, right), nil
 		}
 		return kernelDomainDifferent, nil
 	}
 	if leftNamespace.state == PIDNamespaceNotApplicable && rightNamespace.state == PIDNamespaceNotApplicable {
-		return kernelDomainSame, nil
+		return compareRetainedDomain(left, right), nil
 	}
 	return kernelDomainUnprovable, nil
+}
+
+func compareRetainedDomain(left, right KernelDomainID) kernelDomainRelation {
+	leftDomain := normalizeRetainedDomain(left.RetainedDomainID, left.RetainedDomainState)
+	rightDomain := normalizeRetainedDomain(right.RetainedDomainID, right.RetainedDomainState)
+	if leftDomain.state == RetainedDomainKnown && rightDomain.state == RetainedDomainKnown {
+		if leftDomain.id == rightDomain.id {
+			return kernelDomainSame
+		}
+		return kernelDomainDifferent
+	}
+	if leftDomain.state == RetainedDomainNotApplicable && rightDomain.state == RetainedDomainNotApplicable {
+		return kernelDomainSame
+	}
+	return kernelDomainUnprovable
 }
 
 func validatePIDNamespace(field string, id string, state PIDNamespaceState) error {
@@ -274,6 +347,38 @@ func normalizePIDNamespace(id string, state PIDNamespaceState) normalizedPIDName
 		return normalizedPIDNamespace{state: PIDNamespaceNotApplicable}
 	}
 	return normalizedPIDNamespace{state: PIDNamespaceUnknown}
+}
+
+func validateRetainedDomain(field string, id string, state RetainedDomainState) error {
+	if err := validateOptionalToken(field+"_id", id); err != nil {
+		return err
+	}
+	if err := state.Validate(); err != nil {
+		return err
+	}
+	if id != "" {
+		if state == RetainedDomainUnknown {
+			return invalid(field, "cannot carry an id when state is unknown")
+		}
+		if state == RetainedDomainNotApplicable {
+			return invalid(field, "cannot carry an id when not applicable")
+		}
+		return nil
+	}
+	if state == RetainedDomainKnown {
+		return invalid(field, "known domain requires an id")
+	}
+	return nil
+}
+
+func normalizeRetainedDomain(id string, state RetainedDomainState) normalizedRetainedDomain {
+	if id != "" {
+		return normalizedRetainedDomain{state: RetainedDomainKnown, id: id}
+	}
+	if state == RetainedDomainUnknown {
+		return normalizedRetainedDomain{state: RetainedDomainUnknown}
+	}
+	return normalizedRetainedDomain{state: RetainedDomainNotApplicable}
 }
 
 type OwnerID string

@@ -4,6 +4,8 @@ package custodian
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -346,7 +348,21 @@ func probeGroupRef(ctx context.Context, leaderPID int) (model.GroupRef, error) {
 			PID:               monitor.PID,
 			HighResStartToken: monitor.StartToken.String(),
 		},
+		RetainedID: nativeProbeRetainedID(leader, monitor),
 	}, nil
+}
+
+func nativeProbeRetainedID(leader, monitor procgroup.ProcessClaim) string {
+	hash := sha256.New()
+	fmt.Fprintf(hash, "native-probe-retained-v1\x00%d\x00%s\x00%s\x00%s\x00%d\x00%s",
+		leader.PID,
+		leader.StartToken,
+		leader.KernelDomainID.HostBootID,
+		leader.KernelDomainID.PIDNamespaceID,
+		monitor.PID,
+		monitor.StartToken,
+	)
+	return "native-probe-retained-sha256-" + hex.EncodeToString(hash.Sum(nil))
 }
 
 func (spec NativeLaunchSpec) Validate() error {

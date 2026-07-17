@@ -16,6 +16,24 @@ type ContainmentSession struct {
 	ContinuouslyObservedLive bool
 }
 
+type RetainedObjectProof string
+
+const (
+	RetainedObjectProofNone           RetainedObjectProof = ""
+	RetainedObjectProofMembersPresent RetainedObjectProof = "members_present"
+	RetainedObjectProofEmpty          RetainedObjectProof = "empty"
+	RetainedObjectProofUnknown        RetainedObjectProof = "unknown"
+)
+
+func (proof RetainedObjectProof) Validate() error {
+	switch proof {
+	case RetainedObjectProofNone, RetainedObjectProofMembersPresent, RetainedObjectProofEmpty, RetainedObjectProofUnknown:
+		return nil
+	default:
+		return invalid("containment.retained_object_proof", "is unknown")
+	}
+}
+
 type ContainmentMonitorObservation struct {
 	Observed          bool
 	KernelDomainID    KernelDomainID
@@ -77,6 +95,7 @@ type ContainmentAuthorization struct {
 	Group           GroupRef
 	Observation     ContainmentObservation
 	Session         ContainmentSession
+	RetainedObject  RetainedObjectProof
 	DeadlineExpired bool
 }
 
@@ -87,6 +106,9 @@ func DecideContainmentAuthorization(input ContainmentAuthorization) (Containment
 		return "", err
 	}
 	if err := input.Observation.Validate(); err != nil {
+		return "", err
+	}
+	if err := input.RetainedObject.Validate(); err != nil {
 		return "", err
 	}
 	if !input.Observation.coherent() {
@@ -101,6 +123,20 @@ func DecideContainmentAuthorization(input ContainmentAuthorization) (Containment
 	}
 	if relation == kernelDomainUnprovable {
 		return Unprovable, nil
+	}
+	switch input.RetainedObject {
+	case RetainedObjectProofEmpty:
+		if input.Observation.Leader == ProcessIdentityMatching {
+			return Unprovable, nil
+		}
+		return AlreadyAbsent, nil
+	case RetainedObjectProofMembersPresent:
+		if input.Observation.Group == GroupAbsent {
+			return Unprovable, nil
+		}
+		return SignalDirectly, nil
+	case RetainedObjectProofUnknown:
+		// Unknown retained-object state never proves absence or signal authority.
 	}
 	switch input.Observation.Group {
 	case GroupAbsent:
