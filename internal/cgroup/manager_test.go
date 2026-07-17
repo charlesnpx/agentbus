@@ -1,9 +1,11 @@
 package cgroup
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"testing"
 	"time"
@@ -38,24 +40,39 @@ func TestAcquireCreatesUniqueLeaf(t *testing.T) {
 	}
 }
 
-func TestAcquireNeverReusesLeafNameWithinManagerLifetime(t *testing.T) {
+func TestAcquireFailsClosedWhenCryptoRandomLeafUnavailable(t *testing.T) {
 	fs := newFakeCgroupFS()
-	manager := newFakeManager(fs, leafSequence("cg-reused", "cg-reused"))
+	manager := newFakeManager(fs, func() (string, error) {
+		return randomLeafFromReader(errReader{})
+	})
 
-	first := acquireCapability(t, manager)
-	if err := first.Remove(context.Background()); err != nil {
-		t.Fatalf("Remove() first leaf error = %v", err)
+	capability, err := manager.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now())
+	if capability != nil || !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("AcquireRetainedGroup() with unavailable crypto rand = %T, %v; want nil ErrUnsupported", capability, err)
 	}
-	second, err := manager.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now())
-	if second != nil || !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("AcquireRetainedGroup() reused leaf = %T, %v; want nil ErrUnsupported", second, err)
+}
+
+func TestRandomLeafUsesCryptoEntropyForManagedNames(t *testing.T) {
+	first, err := randomLeafFromReader(bytes.NewReader(bytes.Repeat([]byte{0x11}, 16)))
+	if err != nil {
+		t.Fatalf("randomLeafFromReader() first error = %v", err)
+	}
+	second, err := randomLeafFromReader(bytes.NewReader(bytes.Repeat([]byte{0x22}, 16)))
+	if err != nil {
+		t.Fatalf("randomLeafFromReader() second error = %v", err)
+	}
+	if first == second {
+		t.Fatalf("random leaves reused name %q for distinct entropy", first)
+	}
+	if !isManagedLeafName(first) || !isManagedLeafName(second) {
+		t.Fatalf("random leaves = %q/%q, want managed names", first, second)
 	}
 }
 
 func TestAcquireFailsClosedWhenLeafRecreatedBetweenMkdirAndOpen(t *testing.T) {
 	fs := newFakeCgroupFS()
 	recreated := false
-	fs.onAfterMkdirBeforeOpen = func(name string) {
+	fs.onOpen = func(name string) {
 		if recreated {
 			return
 		}
@@ -70,6 +87,65 @@ func TestAcquireFailsClosedWhenLeafRecreatedBetweenMkdirAndOpen(t *testing.T) {
 	}
 	if !fs.exists("cg-acquire-race") {
 		t.Fatalf("replacement leaf was removed during failed acquisition")
+	}
+}
+
+func TestAcquireFailsClosedWhenLeafRecreatedBetweenPathStatAndHandle(t *testing.T) {
+	fs := newFakeCgroupFS()
+	recreated := false
+	fs.onPathHandle = func(name string) {
+		if recreated {
+			return
+		}
+		recreated = true
+		fs.recreate(name)
+	}
+	manager := newFakeManager(fs, leafSequence("cg-path-handle-race"))
+
+	capability, err := manager.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now())
+	if capability != nil || !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("AcquireRetainedGroup() after path handle race = %T, %v; want nil ErrUnsupported", capability, err)
+	}
+	if !fs.exists("cg-path-handle-race") {
+		t.Fatalf("replacement leaf was removed during failed acquisition")
+	}
+}
+
+func TestAcquireFailsClosedWhenRootRetargetsBetweenProbeAndCreate(t *testing.T) {
+	fs := newFakeCgroupFS()
+	retargeted := false
+	fs.onAfterRootIdentity = func() {
+		if retargeted {
+			return
+		}
+		retargeted = true
+		fs.root.RootObject = ObjectIdentity{Device: 9, Inode: 9, Generation: "root-retargeted"}
+	}
+	manager := newFakeManager(fs, leafSequence("cg-root-retarget"))
+
+	capability, err := manager.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now())
+	if capability != nil || !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("AcquireRetainedGroup() after root retarget = %T, %v; want nil ErrUnsupported", capability, err)
+	}
+}
+
+func TestExclusiveLeaseAllowsOnlyOneManager(t *testing.T) {
+	lease := &fakeRootLease{}
+	firstFS := newFakeCgroupFS()
+	firstFS.lease = lease
+	secondFS := newFakeCgroupFS()
+	secondFS.lease = lease
+	first := newFakeManager(firstFS, leafSequence("cg-first"))
+	second := newFakeManager(secondFS, leafSequence("cg-second"))
+
+	if capability, err := first.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now()); err != nil {
+		t.Fatalf("first AcquireRetainedGroup() error = %v", err)
+	} else if capability == nil {
+		t.Fatalf("first AcquireRetainedGroup() capability is nil")
+	}
+	capability, err := second.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now())
+	if capability != nil || !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("second AcquireRetainedGroup() with held lease = %T, %v; want nil ErrUnsupported", capability, err)
 	}
 }
 
@@ -134,12 +210,12 @@ func TestRemoveBeforeEmptyRefused(t *testing.T) {
 	}
 }
 
-func TestRemoveFailsClosedWhenLeafRecreatedBeforeRmdir(t *testing.T) {
+func TestRemoveFailsClosedWhenLeafRecreatedBetweenFinalVerifyAndRmdir(t *testing.T) {
 	fs := newFakeCgroupFS()
 	manager := newFakeManager(fs, leafSequence("cg-remove-race"))
 	capability := acquireCapability(t, manager)
 	recreated := false
-	fs.onBeforeRemoveFinalVerify = func(name string) {
+	fs.onUnlink = func(name string) {
 		if recreated {
 			return
 		}
@@ -537,7 +613,7 @@ func membership(t *testing.T, capability *Capability) containment.RetainedGroupM
 	return membership
 }
 
-func newFakeManager(fs *fakeCgroupFS, leaves func() string) *Manager {
+func newFakeManager(fs *fakeCgroupFS, leaves func() (string, error)) *Manager {
 	return newManagerWithFS(fs, managerOptions{
 		newLeaf:    leaves,
 		terminator: &recordingTerminator{},
@@ -545,16 +621,22 @@ func newFakeManager(fs *fakeCgroupFS, leaves func() string) *Manager {
 	})
 }
 
-func leafSequence(values ...string) func() string {
+func leafSequence(values ...string) func() (string, error) {
 	index := 0
-	return func() string {
+	return func() (string, error) {
 		if index >= len(values) {
-			return values[len(values)-1]
+			return values[len(values)-1], nil
 		}
 		value := values[index]
 		index++
-		return value
+		return value, nil
 	}
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) {
+	return 0, io.ErrUnexpectedEOF
 }
 
 func fakeProbeSpawner(context.Context) (probeProcess, error) {
@@ -581,19 +663,28 @@ func (terminator *recordingTerminator) Close(handle processHandle) error {
 }
 
 type fakeCgroupFS struct {
-	root                      RootIdentity
-	rootErr                   error
-	leaves                    map[string]*fakeLeaf
-	nextInode                 uint64
-	nextGeneration            uint64
-	generationAvailable       bool
-	onAfterMkdirBeforeOpen    func(string)
-	onBeforeReadProcs         func(string)
-	onReadProcs               func(string, []int)
-	onBeforeWriteKill         func(string)
-	onBeforeRemoveFinalVerify func(string)
-	killWrites                int
-	removeCalls               int
+	root                RootIdentity
+	rootErr             error
+	lease               *fakeRootLease
+	leaves              map[string]*fakeLeaf
+	nextInode           uint64
+	nextGeneration      uint64
+	generationAvailable bool
+	onAfterRootIdentity func()
+	onPathStat          func(string)
+	onPathHandle        func(string)
+	onOpen              func(string)
+	onFinalVerify       func(string)
+	onUnlink            func(string)
+	onBeforeReadProcs   func(string)
+	onReadProcs         func(string, []int)
+	onBeforeWriteKill   func(string)
+	killWrites          int
+	removeCalls         int
+}
+
+type fakeRootLease struct {
+	holder *fakeCgroupFS
 }
 
 type fakeLeaf struct {
@@ -642,7 +733,7 @@ func (object *fakeCgroupObject) Close() error {
 }
 
 func newFakeCgroupFS() *fakeCgroupFS {
-	return &fakeCgroupFS{
+	fs := &fakeCgroupFS{
 		root: RootIdentity{
 			HostBootID:        "host-boot-1",
 			PIDNamespaceID:    "pidns-1",
@@ -661,15 +752,27 @@ func newFakeCgroupFS() *fakeCgroupFS {
 		nextGeneration:      10,
 		generationAvailable: true,
 	}
+	fs.lease = &fakeRootLease{}
+	return fs
 }
 
 func (fs *fakeCgroupFS) RootIdentity(context.Context) (RootIdentity, error) {
 	if fs.rootErr != nil {
 		return RootIdentity{}, fs.rootErr
 	}
+	if fs.lease != nil {
+		if fs.lease.holder == nil {
+			fs.lease.holder = fs
+		} else if fs.lease.holder != fs {
+			return RootIdentity{}, fmt.Errorf("%w: exclusive delegation already leased", ErrUnsupported)
+		}
+	}
 	root := fs.root
 	if !fs.generationAvailable {
 		root.RootObject.Generation = ""
+	}
+	if fs.onAfterRootIdentity != nil {
+		fs.onAfterRootIdentity()
 	}
 	return root, nil
 }
@@ -679,31 +782,28 @@ func (fs *fakeCgroupFS) CreateChild(_ context.Context, id string) (cgroupObject,
 		return nil, err
 	}
 	if leaf, ok := fs.leaves[id]; ok && !leaf.removed {
-		return nil, fmt.Errorf("%w: exists", ErrUnsupported)
+		return nil, fmt.Errorf("%w: %w", ErrUnsupported, errLeafCollision)
 	}
 	leaf := fs.newLeaf()
 	fs.leaves[id] = leaf
-	if fs.onAfterMkdirBeforeOpen != nil {
-		fs.onAfterMkdirBeforeOpen(id)
+	createdLeaf, err := fs.identityAt(id)
+	if err != nil {
+		return nil, err
 	}
-	current, ok := fs.leaves[id]
-	if !ok || current.removed {
-		return nil, fmt.Errorf("%w: created cgroup leaf is no longer named", ErrUnsupported)
+	object, err := fs.openObject(id)
+	if err != nil {
+		fs.removeNameIfMatches(id, createdLeaf)
+		return nil, err
 	}
-	object := fs.objectFor(id, current)
-	if !leaf.object.durableEqual(object.leaf) {
-		fs.removeNameIfMatches(id, leaf.object)
+	if !createdLeaf.durableEqual(object.leaf) || !leaf.object.durableEqual(object.leaf) {
+		fs.removeNameIfMatches(id, createdLeaf)
 		return nil, fmt.Errorf("%w: created cgroup leaf was replaced before open", ErrUnsupported)
 	}
 	return object, nil
 }
 
 func (fs *fakeCgroupFS) Open(_ context.Context, id string) (cgroupObject, error) {
-	leaf, ok := fs.leaves[id]
-	if !ok || leaf.removed {
-		return nil, fmt.Errorf("%w: missing leaf", ErrUnsupported)
-	}
-	return fs.objectFor(id, leaf), nil
+	return fs.openObject(id)
 }
 
 func (fs *fakeCgroupFS) Verify(_ context.Context, object cgroupObject) (bool, error) {
@@ -713,6 +813,16 @@ func (fs *fakeCgroupFS) Verify(_ context.Context, object cgroupObject) (bool, er
 			return false, nil
 		}
 		return false, err
+	}
+	current, err := fs.identityAt(object.LeafName())
+	if err != nil {
+		if errors.Is(err, ErrUnsupported) || errors.Is(err, ErrInvalid) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !object.LeafObject().durableEqual(current) {
+		return false, nil
 	}
 	return true, nil
 }
@@ -832,8 +942,15 @@ func (fs *fakeCgroupFS) Remove(_ context.Context, object cgroupObject) error {
 	if leaf.populated() {
 		return ErrPopulated
 	}
-	if fs.onBeforeRemoveFinalVerify != nil {
-		fs.onBeforeRemoveFinalVerify(object.LeafName())
+	if fs.onFinalVerify != nil {
+		fs.onFinalVerify(object.LeafName())
+	}
+	currentIdentity, err := fs.identityAt(object.LeafName())
+	if err != nil || !object.LeafObject().durableEqual(currentIdentity) {
+		return fmt.Errorf("%w: cgroup object is no longer held", ErrUnsupported)
+	}
+	if fs.onUnlink != nil {
+		fs.onUnlink(object.LeafName())
 	}
 	current, ok := fs.leaves[object.LeafName()]
 	if !ok || current.removed || current != leaf || !leaf.object.durableEqual(object.LeafObject()) {
@@ -968,6 +1085,40 @@ func (fs *fakeCgroupFS) objectFor(name string, leaf *fakeLeaf) *fakeCgroupObject
 		leaf:    object,
 		leafRef: leaf,
 	}
+}
+
+func (fs *fakeCgroupFS) identityAt(name string) (ObjectIdentity, error) {
+	if fs.onPathStat != nil {
+		fs.onPathStat(name)
+	}
+	leaf, err := fs.leaf(name)
+	if err != nil {
+		return ObjectIdentity{}, err
+	}
+	identity := leaf.object
+	identity.Generation = ""
+	if fs.onPathHandle != nil {
+		fs.onPathHandle(name)
+	}
+	leaf, err = fs.leaf(name)
+	if err != nil {
+		return ObjectIdentity{}, err
+	}
+	if fs.generationAvailable {
+		identity.Generation = leaf.object.Generation
+	}
+	return identity, nil
+}
+
+func (fs *fakeCgroupFS) openObject(name string) (*fakeCgroupObject, error) {
+	if fs.onOpen != nil {
+		fs.onOpen(name)
+	}
+	leaf, err := fs.leaf(name)
+	if err != nil {
+		return nil, err
+	}
+	return fs.objectFor(name, leaf), nil
 }
 
 func (fs *fakeCgroupFS) leafForObject(object cgroupObject) (*fakeLeaf, error) {

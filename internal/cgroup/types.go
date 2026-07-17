@@ -8,13 +8,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -22,10 +22,11 @@ import (
 )
 
 var (
-	ErrUnsupported = errors.New("cgroup unsupported")
-	ErrInvalid     = errors.New("cgroup invalid")
-	ErrPopulated   = errors.New("cgroup populated")
-	errProcessGone = errors.New("process gone")
+	ErrUnsupported   = errors.New("cgroup unsupported")
+	ErrInvalid       = errors.New("cgroup invalid")
+	ErrPopulated     = errors.New("cgroup populated")
+	errLeafCollision = errors.New("cgroup leaf collision")
+	errProcessGone   = errors.New("process gone")
 )
 
 type Support struct {
@@ -209,18 +210,16 @@ type probeProcess struct {
 type probeSpawner func(context.Context) (probeProcess, error)
 
 type managerOptions struct {
-	newLeaf    func() string
+	newLeaf    func() (string, error)
 	terminator processTerminator
 	spawnProbe probeSpawner
 }
 
 type Manager struct {
 	fs         cgroupFS
-	newLeaf    func() string
+	newLeaf    func() (string, error)
 	terminator processTerminator
 	spawnProbe probeSpawner
-	mu         sync.Mutex
-	issuedLeaf map[string]struct{}
 }
 
 func newManagerWithFS(fs cgroupFS, options managerOptions) *Manager {
@@ -238,7 +237,6 @@ func newManagerWithFS(fs cgroupFS, options managerOptions) *Manager {
 		newLeaf:    options.newLeaf,
 		terminator: options.terminator,
 		spawnProbe: options.spawnProbe,
-		issuedLeaf: make(map[string]struct{}),
 	}
 }
 
@@ -447,19 +445,26 @@ func (manager *Manager) create(ctx context.Context, root RootIdentity) (*Capabil
 		return nil, err
 	}
 	for attempt := 0; attempt < 16; attempt++ {
-		retainedID := manager.newLeaf()
+		retainedID, err := manager.newLeaf()
+		if err != nil {
+			return nil, err
+		}
 		if err := validateRetainedID(retainedID); err != nil {
 			return nil, err
 		}
-		if !manager.reserveLeaf(retainedID) {
-			continue
-		}
 		object, err := manager.fs.CreateChild(ctx, retainedID)
 		if err != nil {
+			if errors.Is(err, errLeafCollision) {
+				continue
+			}
 			if errors.Is(err, ErrInvalid) {
 				return nil, err
 			}
-			continue
+			return nil, err
+		}
+		if !root.RootObject.durableEqual(object.RootObject()) {
+			_ = object.Close()
+			return nil, fmt.Errorf("%w: cgroup root changed during acquisition", ErrUnsupported)
 		}
 		durableID, err := newRetainedID(retainedID, object)
 		if err != nil {
@@ -478,16 +483,6 @@ func (manager *Manager) create(ctx context.Context, root RootIdentity) (*Capabil
 	return nil, fmt.Errorf("%w: could not allocate unique cgroup leaf", ErrUnsupported)
 }
 
-func (manager *Manager) reserveLeaf(leafName string) bool {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	if _, ok := manager.issuedLeaf[leafName]; ok {
-		return false
-	}
-	manager.issuedLeaf[leafName] = struct{}{}
-	return true
-}
-
 func (manager *Manager) open(ctx context.Context, root RootIdentity, retainedID string) (*Capability, error) {
 	descriptor, err := parseRetainedID(retainedID)
 	if err != nil {
@@ -500,6 +495,10 @@ func (manager *Manager) open(ctx context.Context, root RootIdentity, retainedID 
 	object, err := manager.fs.Open(ctx, descriptor.leafName)
 	if err != nil {
 		return nil, err
+	}
+	if !root.RootObject.durableEqual(object.RootObject()) {
+		_ = object.Close()
+		return nil, fmt.Errorf("%w: cgroup root changed during acquisition", ErrUnsupported)
 	}
 	if !descriptor.matches(object) {
 		_ = object.Close()
@@ -824,13 +823,31 @@ func tokenOrDigest(prefix, value string) string {
 	return tokenize(prefix, value)
 }
 
-func randomLeaf() string {
+func randomLeaf() (string, error) {
+	return randomLeafFromReader(rand.Reader)
+}
+
+func randomLeafFromReader(reader io.Reader) (string, error) {
 	var raw [16]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		now := time.Now().UnixNano()
-		return "cg-" + strconv.FormatInt(now, 36)
+	if _, err := io.ReadFull(reader, raw[:]); err != nil {
+		return "", fmt.Errorf("%w: crypto-random cgroup leaf unavailable: %v", ErrUnsupported, err)
 	}
-	return "cg-" + hex.EncodeToString(raw[:])
+	return "cg-" + hex.EncodeToString(raw[:]), nil
+}
+
+func isManagedLeafName(name string) bool {
+	if len(name) != len("cg-")+32 || !strings.HasPrefix(name, "cg-") {
+		return false
+	}
+	for _, r := range name[len("cg-"):] {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func tokenize(prefix, value string) string {

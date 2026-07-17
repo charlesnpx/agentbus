@@ -245,7 +245,7 @@ func TestContainmentRejectsPartialContinuityInterval(t *testing.T) {
 }
 
 func TestContainmentRetainedObjectProofAuthorizesKillWithMissingLeader(t *testing.T) {
-	target := testGroupRef(t)
+	target := testRetainedGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
 		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
@@ -272,7 +272,7 @@ func TestContainmentRetainedObjectProofAuthorizesKillWithMissingLeader(t *testin
 }
 
 func TestContainmentRetainedSignalAbsentRequiresEmptyProof(t *testing.T) {
-	target := testGroupRef(t)
+	target := testRetainedGroupRef(t)
 	tests := []struct {
 		name        string
 		memberships []RetainedGroupMembership
@@ -317,7 +317,7 @@ func TestContainmentRetainedSignalAbsentRequiresEmptyProof(t *testing.T) {
 }
 
 func TestContainmentRetainedObjectCapabilityMustMatchObjectAndCoverOperation(t *testing.T) {
-	target := testGroupRef(t)
+	target := testRetainedGroupRef(t)
 	differentDomain := target.KernelDomain()
 	differentDomain.HostBootID = "different-host-boot"
 	tests := []struct {
@@ -364,7 +364,7 @@ func TestContainmentRetainedObjectCapabilityMustMatchObjectAndCoverOperation(t *
 }
 
 func TestContainmentRetainedObjectEmptyProofProvesAbsent(t *testing.T) {
-	target := testGroupRef(t)
+	target := testRetainedGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
 	}}
@@ -381,7 +381,7 @@ func TestContainmentRetainedObjectEmptyProofProvesAbsent(t *testing.T) {
 }
 
 func TestContainmentRetainedObjectUnknownProofIsUnprovable(t *testing.T) {
-	target := testGroupRef(t)
+	target := testRetainedGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
 	}}
@@ -395,7 +395,7 @@ func TestContainmentRetainedObjectUnknownProofIsUnprovable(t *testing.T) {
 }
 
 func TestContainmentRetainedObjectUnknownStopsLeaderAuthorization(t *testing.T) {
-	target := testGroupRef(t)
+	target := testRetainedGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
 	}}
@@ -412,7 +412,7 @@ func TestContainmentRetainedObjectUnknownStopsLeaderAuthorization(t *testing.T) 
 }
 
 func TestContainmentRetainedAuthorityUsesRetainedTeardownForReusedPGID(t *testing.T) {
-	target := testGroupRef(t)
+	target := testRetainedGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
 		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
@@ -438,7 +438,7 @@ func TestContainmentRetainedAuthorityUsesRetainedTeardownForReusedPGID(t *testin
 }
 
 func TestContainmentRetainedProbeUsesRetainedCapabilityMembership(t *testing.T) {
-	target := testGroupRef(t)
+	target := testRetainedGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
 		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
@@ -468,7 +468,7 @@ func TestContainmentRetainedProbeUsesRetainedCapabilityMembership(t *testing.T) 
 }
 
 func TestContainmentAcquiresRetainedCapabilityBeforeFirstObservation(t *testing.T) {
-	target := testGroupRef(t)
+	target := testRetainedGroupRef(t)
 	retained := &fakeRetainedObject{membership: RetainedMembershipEmpty}
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
@@ -491,6 +491,56 @@ func TestContainmentAcquiresRetainedCapabilityBeforeFirstObservation(t *testing.
 	}
 	if retained.releaseCalls != 1 {
 		t.Fatalf("retained release calls = %d, want 1", retained.releaseCalls)
+	}
+}
+
+func TestContainmentRetainedDomainNotApplicableDoesNotRequireRetainedAcquisition(t *testing.T) {
+	target := testGroupRef(t)
+	target.RetainedID = "legacy-retained-1001"
+	if err := target.Validate(); err != nil {
+		t.Fatalf("legacy retained GroupRef invalid: %v", err)
+	}
+	retained := &fakeRetainedObject{acquireErr: errors.New("should not acquire")}
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+	}}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertAbsent(t, outcome)
+	assertSignals(t, signaler, SignalTerminate)
+	if retained.acquireCalls != 0 {
+		t.Fatalf("retained acquire calls = %d, want 0", retained.acquireCalls)
+	}
+}
+
+func TestContainmentRequiredRetainedAcquisitionErrorStopsLeaderPGIDSignal(t *testing.T) {
+	target := testRetainedGroupRef(t)
+	acquireErr := errors.New("retained reacquisition failed")
+	retained := &fakeRetainedObject{acquireErr: acquireErr}
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+	}}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	if !errors.Is(outcome.Err, acquireErr) {
+		t.Fatalf("outcome error = %v, want acquisition error", outcome.Err)
+	}
+	assertSignals(t, signaler)
+	if retained.acquireCalls != 1 {
+		t.Fatalf("retained acquire calls = %d, want 1", retained.acquireCalls)
+	}
+	if retained.releaseCalls != 0 {
+		t.Fatalf("retained release calls = %d, want 0", retained.releaseCalls)
 	}
 }
 
@@ -566,10 +616,21 @@ func testGroupRef(t *testing.T) model.GroupRef {
 		PGID:              1001,
 		Leader:            model.ProcessIdentity{PID: 1001, HighResStartToken: "leader-start-1001"},
 		Monitor:           model.ProcessIdentity{PID: 2001, HighResStartToken: "monitor-start-2001"},
-		RetainedID:        "retained-1001",
 	}
 	if err := ref.Validate(); err != nil {
 		t.Fatalf("test GroupRef invalid: %v", err)
+	}
+	return ref
+}
+
+func testRetainedGroupRef(t *testing.T) model.GroupRef {
+	t.Helper()
+	ref := testGroupRef(t)
+	ref.RetainedDomainID = "retained-domain-1"
+	ref.RetainedDomainState = model.RetainedDomainKnown
+	ref.RetainedID = "retained-1001"
+	if err := ref.Validate(); err != nil {
+		t.Fatalf("test retained GroupRef invalid: %v", err)
 	}
 	return ref
 }

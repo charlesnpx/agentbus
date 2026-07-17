@@ -20,6 +20,7 @@ type containmentState struct {
 	session                  model.ContainmentSession
 	continuity               GroupContinuity
 	retainedObject           RetainedGroupCapability
+	retainedAcquisitionErr   error
 	operationBegin           time.Time
 	matchingLeaderObservedAt time.Time
 }
@@ -39,7 +40,10 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 		engine.Clock = RealClock{}
 	}
 
-	state := engine.acquireRetainedObject(ctx, target)
+	state, outcome := engine.acquireRetainedObject(ctx, target)
+	if outcome.Kind != 0 {
+		return outcome
+	}
 	defer state.releaseRetainedObject()
 	observation, observedAt, outcome := engine.observe(ctx, target)
 	if outcome.Kind != 0 {
@@ -65,16 +69,32 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 	}
 }
 
-func (engine Engine) acquireRetainedObject(ctx context.Context, target model.GroupRef) containmentState {
-	if engine.RetainedObject == nil || target.RetainedID == "" {
-		return containmentState{}
+func (engine Engine) acquireRetainedObject(ctx context.Context, target model.GroupRef) (containmentState, Outcome) {
+	if !retainedObjectRequired(target) {
+		return containmentState{}, Outcome{}
 	}
 	acquiredAt := engine.Clock.Now()
-	retainedObject, err := engine.RetainedObject.AcquireRetainedGroup(ctx, target, acquiredAt)
-	if err != nil || retainedObject == nil {
-		return containmentState{}
+	if target.RetainedID == "" {
+		err := errors.New("required retained object id is missing")
+		return containmentState{retainedAcquisitionErr: err, operationBegin: acquiredAt}, UnprovableOutcome(ReasonAuthorizationUnprovable, model.Unprovable, err)
 	}
-	return containmentState{retainedObject: retainedObject, operationBegin: acquiredAt}
+	if engine.RetainedObject == nil {
+		err := errors.New("required retained object acquisition provider is missing")
+		return containmentState{retainedAcquisitionErr: err, operationBegin: acquiredAt}, UnprovableOutcome(ReasonAuthorizationUnprovable, model.Unprovable, err)
+	}
+	retainedObject, err := engine.RetainedObject.AcquireRetainedGroup(ctx, target, acquiredAt)
+	if err != nil {
+		return containmentState{retainedAcquisitionErr: err, operationBegin: acquiredAt}, UnprovableOutcome(ReasonAuthorizationUnprovable, model.Unprovable, err)
+	}
+	if retainedObject == nil {
+		err := errors.New("required retained object acquisition returned nil capability")
+		return containmentState{retainedAcquisitionErr: err, operationBegin: acquiredAt}, UnprovableOutcome(ReasonAuthorizationUnprovable, model.Unprovable, err)
+	}
+	return containmentState{retainedObject: retainedObject, operationBegin: acquiredAt}, Outcome{}
+}
+
+func retainedObjectRequired(target model.GroupRef) bool {
+	return target.RetainedDomainID != "" || target.RetainedDomainState == model.RetainedDomainKnown
 }
 
 func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef, params Params, state containmentState, authorization model.ContainmentAuthorizationResult) Outcome {
@@ -308,8 +328,11 @@ func (engine Engine) authorize(ctx context.Context, target model.GroupRef, obser
 }
 
 func (engine Engine) retainedObjectProof(ctx context.Context, target model.GroupRef, state containmentState, observedAt time.Time) (model.RetainedObjectProof, bool) {
-	if state.retainedObject == nil || target.RetainedID == "" || state.operationBegin.IsZero() || observedAt.IsZero() || observedAt.Before(state.operationBegin) {
+	if !retainedObjectRequired(target) {
 		return model.RetainedObjectProofNone, true
+	}
+	if state.retainedAcquisitionErr != nil || state.retainedObject == nil || target.RetainedID == "" || state.operationBegin.IsZero() || observedAt.IsZero() || observedAt.Before(state.operationBegin) {
+		return model.RetainedObjectProofUnknown, false
 	}
 	identity := state.retainedObject.Identity()
 	if !identity.matches(target) {
@@ -335,13 +358,14 @@ func (engine Engine) advanceSession(ctx context.Context, target model.GroupRef, 
 		state.operationBegin = observedAt
 	}
 	if observation.Group != model.GroupLive || !target.KernelDomain().ProvablySame(observation.KernelDomainID) {
-		return containmentState{retainedObject: state.retainedObject, operationBegin: state.operationBegin}
+		return state.retentionState()
 	}
 	switch observation.Leader {
 	case model.ProcessIdentityMatching:
 		next := containmentState{
 			session:                  model.ContainmentSession{BeganFromMatchingLeader: true},
 			retainedObject:           state.retainedObject,
+			retainedAcquisitionErr:   state.retainedAcquisitionErr,
 			operationBegin:           state.operationBegin,
 			matchingLeaderObservedAt: observedAt,
 		}
@@ -353,13 +377,21 @@ func (engine Engine) advanceSession(ctx context.Context, target model.GroupRef, 
 		if state.session.BeganFromMatchingLeader && state.continuity != nil {
 			evidence := state.continuity.ConfirmContinuouslyLive(ctx, target, observation, state.matchingLeaderObservedAt, observedAt)
 			if !evidence.Covers(target, state.matchingLeaderObservedAt, observedAt) {
-				return containmentState{retainedObject: state.retainedObject, operationBegin: state.operationBegin}
+				return state.retentionState()
 			}
 			state.session.ContinuouslyObservedLive = true
 			return state
 		}
 	}
-	return containmentState{retainedObject: state.retainedObject, operationBegin: state.operationBegin}
+	return state.retentionState()
+}
+
+func (state containmentState) retentionState() containmentState {
+	return containmentState{
+		retainedObject:         state.retainedObject,
+		retainedAcquisitionErr: state.retainedAcquisitionErr,
+		operationBegin:         state.operationBegin,
+	}
 }
 
 func (state containmentState) releaseRetainedObject() {
