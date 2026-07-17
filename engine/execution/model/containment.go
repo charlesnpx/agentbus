@@ -141,6 +141,9 @@ func DecideContainmentAuthorizationWithBasis(input ContainmentAuthorization) (Co
 	if err != nil {
 		return ContainmentAuthorizationResult{}, err
 	}
+	if retainedContainmentRequired(input.Group) {
+		return decideRetainedContainment(input, relation)
+	}
 	if input.RetainedObject != RetainedObjectProofNone {
 		return decideRetainedContainment(input, relation)
 	}
@@ -151,6 +154,10 @@ func DecideContainmentAuthorizationWithBasis(input ContainmentAuthorization) (Co
 		return containmentAuthorizationResult(Unprovable, ContainmentBasisNone), nil
 	}
 	return decideObservedContainment(input)
+}
+
+func retainedContainmentRequired(ref GroupRef) bool {
+	return ref.RetainedDomainID != "" || ref.RetainedDomainState == RetainedDomainKnown
 }
 
 func decideRetainedContainment(input ContainmentAuthorization, relation kernelDomainRelation) (ContainmentAuthorizationResult, error) {

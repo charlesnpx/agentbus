@@ -64,6 +64,56 @@ func TestContainmentRetainedMembersPresentContradictsDifferentKernelDomain(t *te
 	}
 }
 
+func TestContainmentRequiredRetainedMissingProofIsUnprovable(t *testing.T) {
+	ref := retainedReducerGroup(LaunchOrdinalOne)
+	differentDomain := ref.KernelDomain()
+	differentDomain.RetainedDomainID = "retained-domain-different"
+	tests := []struct {
+		name        string
+		observation ContainmentObservation
+	}{
+		{
+			name: "different_domain",
+			observation: ContainmentObservation{
+				KernelDomainID: differentDomain,
+				Group:          GroupLive,
+				Leader:         ProcessIdentityMissing,
+			},
+		},
+		{
+			name: "observed_absent",
+			observation: ContainmentObservation{
+				KernelDomainID: ref.KernelDomain(),
+				Group:          GroupAbsent,
+				Leader:         ProcessIdentityMissing,
+			},
+		},
+		{
+			name: "matching_live_leader",
+			observation: ContainmentObservation{
+				KernelDomainID: ref.KernelDomain(),
+				Group:          GroupLive,
+				Leader:         ProcessIdentityMatching,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := DecideContainmentAuthorizationWithBasis(ContainmentAuthorization{
+				Group:       ref,
+				Observation: tt.observation,
+			})
+			if err != nil {
+				t.Fatalf("DecideContainmentAuthorizationWithBasis error = %v", err)
+			}
+			if result.Decision != Unprovable || result.Basis != ContainmentBasisNone {
+				t.Fatalf("authorization = %#v, want unprovable/no basis", result)
+			}
+		})
+	}
+}
+
 func TestContainmentAuthorizationCarriesBasis(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
 	leaderResult, err := DecideContainmentAuthorizationWithBasis(ContainmentAuthorization{
