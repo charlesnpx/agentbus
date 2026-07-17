@@ -24,13 +24,38 @@ type RetainedGroupObject interface {
 	AcquireRetainedGroup(ctx context.Context, target model.GroupRef, acquiredAt time.Time) (RetainedGroupCapability, error)
 }
 
-// RetainedGroupCapability is a held retained-object capability. Membership,
-// absence probes, and teardown all act on this same object, so a reused numeric
-// process group cannot be mutated under retained-object authority.
+// RetainedGroupCapability is a held retained-object capability. Backends report
+// facts about the acquired object only; the containment package records the
+// acquisition window and mints sealed retained-object evidence internally.
 type RetainedGroupCapability interface {
-	Membership(ctx context.Context, target model.GroupRef, observedAt time.Time) (RetainedGroupEvidence, error)
-	SignalGroup(ctx context.Context, target model.GroupRef, signal Signal) (SignalResult, error)
-	ProbeGroup(ctx context.Context, target model.GroupRef) (ProbeResult, error)
+	Identity() RetainedGroupIdentity
+	Membership(ctx context.Context) (RetainedGroupMembership, error)
+	StillHeld(ctx context.Context) (bool, error)
+	SignalTerm(ctx context.Context) (SignalResult, error)
+	Kill(ctx context.Context) (SignalResult, error)
+	Release() error
+}
+
+type RetainedGroupIdentity struct {
+	RetainedID     string
+	KernelDomainID model.KernelDomainID
+}
+
+func (identity RetainedGroupIdentity) validate() error {
+	if err := validateRetainedEvidenceID(identity.RetainedID); err != nil {
+		return err
+	}
+	return identity.KernelDomainID.Validate()
+}
+
+func (identity RetainedGroupIdentity) matches(target model.GroupRef) bool {
+	if err := target.Validate(); err != nil {
+		return false
+	}
+	if err := identity.validate(); err != nil {
+		return false
+	}
+	return identity.RetainedID == target.RetainedID && identity.KernelDomainID.ProvablySame(target.KernelDomain())
 }
 
 type RetainedGroupMembership uint8
@@ -54,15 +79,15 @@ func (membership RetainedGroupMembership) validate() error {
 // held retained capability, and the engine validates retained identity and
 // interval coverage before passing a proof state to the model.
 type RetainedGroupEvidence struct {
-	retainedID string
+	identity   RetainedGroupIdentity
 	begin      time.Time
 	end        time.Time
 	membership RetainedGroupMembership
 }
 
-func newRetainedGroupEvidence(retainedID string, begin, end time.Time, membership RetainedGroupMembership) (RetainedGroupEvidence, error) {
+func newRetainedGroupEvidence(identity RetainedGroupIdentity, begin, end time.Time, membership RetainedGroupMembership) (RetainedGroupEvidence, error) {
 	evidence := RetainedGroupEvidence{
-		retainedID: retainedID,
+		identity:   identity,
 		begin:      begin,
 		end:        end,
 		membership: membership,
@@ -86,7 +111,7 @@ func (evidence RetainedGroupEvidence) ProofFor(target model.GroupRef, begin, end
 	if err := evidence.validate(); err != nil {
 		return model.RetainedObjectProofNone
 	}
-	if evidence.retainedID != target.RetainedID || evidence.begin.After(begin) || evidence.end.Before(end) {
+	if !evidence.identity.matches(target) || evidence.begin.After(begin) || evidence.end.Before(end) {
 		return model.RetainedObjectProofNone
 	}
 	switch evidence.membership {
@@ -102,7 +127,7 @@ func (evidence RetainedGroupEvidence) ProofFor(target model.GroupRef, begin, end
 }
 
 func (evidence RetainedGroupEvidence) validate() error {
-	if err := validateRetainedEvidenceID(evidence.retainedID); err != nil {
+	if err := evidence.identity.validate(); err != nil {
 		return err
 	}
 	if evidence.begin.IsZero() {

@@ -64,22 +64,22 @@ type fakeRetainedObject struct {
 	membership      RetainedGroupMembership
 	memberships     []RetainedGroupMembership
 	retainedID      string
-	beginOffset     time.Duration
-	endOffset       time.Duration
+	kernelDomainID  model.KernelDomainID
+	stillHelds      []bool
 	acquireErr      error
 	membershipErr   error
+	stillHeldErr    error
 	script          []signalScript
-	probes          []ProbeResult
-	probeErrors     []error
 	acquired        bool
 	acquiredAt      time.Time
 	acquireCalls    int
 	membershipCalls int
+	stillHeldCalls  int
 	signalCalls     []signalCall
-	probeCalls      int
+	releaseCalls    int
 }
 
-func (object *fakeRetainedObject) AcquireRetainedGroup(_ context.Context, _ model.GroupRef, acquiredAt time.Time) (RetainedGroupCapability, error) {
+func (object *fakeRetainedObject) AcquireRetainedGroup(_ context.Context, target model.GroupRef, acquiredAt time.Time) (RetainedGroupCapability, error) {
 	if object == nil {
 		return nil, errors.New("retained object capability is missing")
 	}
@@ -89,17 +89,30 @@ func (object *fakeRetainedObject) AcquireRetainedGroup(_ context.Context, _ mode
 	}
 	object.acquired = true
 	object.acquiredAt = acquiredAt
+	if object.retainedID == "" {
+		object.retainedID = target.RetainedID
+	}
+	if object.kernelDomainID == (model.KernelDomainID{}) {
+		object.kernelDomainID = target.KernelDomain()
+	}
 	return object, nil
 }
 
-func (object *fakeRetainedObject) Membership(_ context.Context, target model.GroupRef, observedAt time.Time) (RetainedGroupEvidence, error) {
+func (object *fakeRetainedObject) Identity() RetainedGroupIdentity {
+	return RetainedGroupIdentity{
+		RetainedID:     object.retainedID,
+		KernelDomainID: object.kernelDomainID,
+	}
+}
+
+func (object *fakeRetainedObject) Membership(_ context.Context) (RetainedGroupMembership, error) {
 	if object == nil || !object.acquired {
-		return RetainedGroupEvidence{}, errors.New("retained object capability is missing")
+		return RetainedMembershipUnknown, errors.New("retained object capability is missing")
 	}
 	index := object.membershipCalls
 	object.membershipCalls++
 	if object.membershipErr != nil {
-		return RetainedGroupEvidence{}, object.membershipErr
+		return RetainedMembershipUnknown, object.membershipErr
 	}
 	membership := object.membership
 	if index < len(object.memberships) {
@@ -107,19 +120,40 @@ func (object *fakeRetainedObject) Membership(_ context.Context, target model.Gro
 	} else if len(object.memberships) > 0 {
 		membership = object.memberships[len(object.memberships)-1]
 	}
-	retainedID := object.retainedID
-	if retainedID == "" {
-		retainedID = target.RetainedID
-	}
-	evidence, err := newRetainedGroupEvidence(retainedID, object.acquiredAt.Add(object.beginOffset), observedAt.Add(object.endOffset), membership)
-	if err != nil {
-		return RetainedGroupEvidence{}, err
-	}
-	return evidence, nil
+	return membership, nil
 }
 
-func (object *fakeRetainedObject) SignalGroup(_ context.Context, target model.GroupRef, signal Signal) (SignalResult, error) {
-	object.signalCalls = append(object.signalCalls, signalCall{signal: signal, pgid: target.PGID})
+func (object *fakeRetainedObject) StillHeld(_ context.Context) (bool, error) {
+	if object == nil || !object.acquired {
+		return false, errors.New("retained object capability is missing")
+	}
+	index := object.stillHeldCalls
+	object.stillHeldCalls++
+	if object.stillHeldErr != nil {
+		return false, object.stillHeldErr
+	}
+	if index < len(object.stillHelds) {
+		return object.stillHelds[index], nil
+	}
+	if len(object.stillHelds) > 0 {
+		return object.stillHelds[len(object.stillHelds)-1], nil
+	}
+	return true, nil
+}
+
+func (object *fakeRetainedObject) SignalTerm(ctx context.Context) (SignalResult, error) {
+	return object.signal(ctx, SignalTerminate)
+}
+
+func (object *fakeRetainedObject) Kill(ctx context.Context) (SignalResult, error) {
+	return object.signal(ctx, SignalKill)
+}
+
+func (object *fakeRetainedObject) signal(ctx context.Context, signal Signal) (SignalResult, error) {
+	if err := ctx.Err(); err != nil {
+		return SignalUnprovable, err
+	}
+	object.signalCalls = append(object.signalCalls, signalCall{signal: signal})
 	if len(object.script) == 0 {
 		return SignalDelivered, nil
 	}
@@ -131,16 +165,9 @@ func (object *fakeRetainedObject) SignalGroup(_ context.Context, target model.Gr
 	return next.result, next.err
 }
 
-func (object *fakeRetainedObject) ProbeGroup(_ context.Context, _ model.GroupRef) (ProbeResult, error) {
-	index := object.probeCalls
-	object.probeCalls++
-	if index < len(object.probeErrors) && object.probeErrors[index] != nil {
-		return ProbeUnprovable, object.probeErrors[index]
-	}
-	if index < len(object.probes) {
-		return object.probes[index], nil
-	}
-	return ProbeLive, nil
+func (object *fakeRetainedObject) Release() error {
+	object.releaseCalls++
+	return nil
 }
 
 type signalScript struct {

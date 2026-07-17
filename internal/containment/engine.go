@@ -40,6 +40,7 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 	}
 
 	state := engine.acquireRetainedObject(ctx, target)
+	defer state.releaseRetainedObject()
 	observation, observedAt, outcome := engine.observe(ctx, target)
 	if outcome.Kind != 0 {
 		return outcome
@@ -222,7 +223,14 @@ func (engine Engine) signalGroup(ctx context.Context, target model.GroupRef, sta
 		if state.retainedObject == nil {
 			return SignalUnprovable, errors.New("retained object capability is missing")
 		}
-		return state.retainedObject.SignalGroup(ctx, target, signal)
+		switch signal {
+		case SignalTerminate:
+			return state.retainedObject.SignalTerm(ctx)
+		case SignalKill:
+			return state.retainedObject.Kill(ctx)
+		default:
+			return SignalUnprovable, errors.New("retained object signal is unknown")
+		}
 	default:
 		return SignalUnprovable, errors.New("signal authority basis is missing")
 	}
@@ -236,7 +244,18 @@ func (engine Engine) probe(ctx context.Context, target model.GroupRef, state con
 		if state.retainedObject == nil {
 			return ProbeUnprovable, errors.New("retained object capability is missing")
 		}
-		return state.retainedObject.ProbeGroup(ctx, target)
+		proof, valid := engine.retainedObjectProof(ctx, target, state, engine.Clock.Now())
+		if !valid {
+			return ProbeUnprovable, nil
+		}
+		switch proof {
+		case model.RetainedObjectProofMembersPresent:
+			return ProbeLive, nil
+		case model.RetainedObjectProofEmpty:
+			return ProbeAbsent, nil
+		default:
+			return ProbeUnprovable, nil
+		}
 	default:
 		return ProbeUnprovable, errors.New("probe authority basis is missing")
 	}
@@ -265,11 +284,15 @@ func (engine Engine) sleepUntil(ctx context.Context, interval time.Duration, dea
 }
 
 func (engine Engine) authorize(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation, state containmentState, deadlineExpired bool, observedAt time.Time) (model.ContainmentAuthorizationResult, Outcome) {
+	retainedProof, retainedValid := engine.retainedObjectProof(ctx, target, state, observedAt)
+	if !retainedValid {
+		return model.ContainmentAuthorizationResult{}, UnprovableOutcome(ReasonAuthorizationUnprovable, model.Unprovable, nil)
+	}
 	authorization, err := model.DecideContainmentAuthorizationWithBasis(model.ContainmentAuthorization{
 		Group:           target,
 		Observation:     observation,
 		Session:         state.session,
-		RetainedObject:  engine.retainedObjectProof(ctx, target, state, observedAt),
+		RetainedObject:  retainedProof,
 		DeadlineExpired: deadlineExpired,
 	})
 	if err != nil {
@@ -278,15 +301,27 @@ func (engine Engine) authorize(ctx context.Context, target model.GroupRef, obser
 	return authorization, Outcome{}
 }
 
-func (engine Engine) retainedObjectProof(ctx context.Context, target model.GroupRef, state containmentState, observedAt time.Time) model.RetainedObjectProof {
+func (engine Engine) retainedObjectProof(ctx context.Context, target model.GroupRef, state containmentState, observedAt time.Time) (model.RetainedObjectProof, bool) {
 	if state.retainedObject == nil || target.RetainedID == "" || state.operationBegin.IsZero() || observedAt.IsZero() || observedAt.Before(state.operationBegin) {
-		return model.RetainedObjectProofNone
+		return model.RetainedObjectProofNone, true
 	}
-	evidence, err := state.retainedObject.Membership(ctx, target, observedAt)
+	identity := state.retainedObject.Identity()
+	if !identity.matches(target) {
+		return model.RetainedObjectProofUnknown, false
+	}
+	membership, err := state.retainedObject.Membership(ctx)
+	if err != nil || membership == RetainedMembershipUnknown {
+		return model.RetainedObjectProofUnknown, false
+	}
+	stillHeld, err := state.retainedObject.StillHeld(ctx)
+	if err != nil || !stillHeld {
+		return model.RetainedObjectProofUnknown, false
+	}
+	evidence, err := newRetainedGroupEvidence(identity, state.operationBegin, observedAt, membership)
 	if err != nil {
-		return model.RetainedObjectProofUnknown
+		return model.RetainedObjectProofUnknown, false
 	}
-	return evidence.ProofFor(target, state.operationBegin, observedAt)
+	return evidence.ProofFor(target, state.operationBegin, observedAt), true
 }
 
 func (engine Engine) advanceSession(ctx context.Context, target model.GroupRef, state containmentState, observation model.ContainmentObservation, observedAt time.Time) containmentState {
@@ -319,4 +354,11 @@ func (engine Engine) advanceSession(ctx context.Context, target model.GroupRef, 
 		}
 	}
 	return containmentState{retainedObject: state.retainedObject, operationBegin: state.operationBegin}
+}
+
+func (state containmentState) releaseRetainedObject() {
+	if state.retainedObject == nil {
+		return
+	}
+	_ = state.retainedObject.Release()
 }

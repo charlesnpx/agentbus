@@ -273,6 +273,8 @@ func TestContainmentRetainedObjectProofAuthorizesKillWithMissingLeader(t *testin
 
 func TestContainmentRetainedObjectCapabilityMustMatchObjectAndCoverOperation(t *testing.T) {
 	target := testGroupRef(t)
+	differentDomain := target.KernelDomain()
+	differentDomain.HostBootID = "different-host-boot"
 	tests := []struct {
 		name     string
 		retained *fakeRetainedObject
@@ -282,17 +284,17 @@ func TestContainmentRetainedObjectCapabilityMustMatchObjectAndCoverOperation(t *
 			retained: &fakeRetainedObject{membership: RetainedMembershipPresent, retainedID: "different-retained-object"},
 		},
 		{
-			name: "partial_present_retention_interval",
+			name: "wrong_domain",
 			retained: &fakeRetainedObject{
-				membership:  RetainedMembershipPresent,
-				beginOffset: time.Nanosecond,
+				membership:     RetainedMembershipPresent,
+				kernelDomainID: differentDomain,
 			},
 		},
 		{
-			name: "partial_empty_retention_interval",
+			name: "stale_object",
 			retained: &fakeRetainedObject{
-				membership:  RetainedMembershipEmpty,
-				beginOffset: time.Nanosecond,
+				membership: RetainedMembershipPresent,
+				stillHelds: []bool{false},
 			},
 		},
 		{
@@ -347,6 +349,23 @@ func TestContainmentRetainedObjectUnknownProofIsUnprovable(t *testing.T) {
 	assertSignals(t, signaler)
 }
 
+func TestContainmentRetainedObjectUnknownStopsLeaderAuthorization(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+	}}
+	signaler := &fakeSignaler{}
+	retained := &fakeRetainedObject{membership: RetainedMembershipUnknown}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	assertSignals(t, signaler)
+	if retained.membershipCalls == 0 {
+		t.Fatalf("retained capability membership was not consulted")
+	}
+}
+
 func TestContainmentRetainedAuthorityUsesRetainedTeardownForReusedPGID(t *testing.T) {
 	target := testGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
@@ -368,12 +387,12 @@ func TestContainmentRetainedAuthorityUsesRetainedTeardownForReusedPGID(t *testin
 	assertAbsent(t, outcome)
 	assertSignals(t, signaler)
 	assertRetainedSignals(t, retained, SignalTerminate, SignalKill)
-	if retained.probeCalls != 0 {
-		t.Fatalf("retained probes = %d, want 0 after retained empty membership proved absence", retained.probeCalls)
+	if retained.membershipCalls == 0 {
+		t.Fatalf("retained membership was not consulted")
 	}
 }
 
-func TestContainmentRetainedProbeUsesRetainedCapability(t *testing.T) {
+func TestContainmentRetainedProbeUsesRetainedCapabilityMembership(t *testing.T) {
 	target := testGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
@@ -382,8 +401,12 @@ func TestContainmentRetainedProbeUsesRetainedCapability(t *testing.T) {
 	}}
 	signaler := &fakeSignaler{}
 	retained := &fakeRetainedObject{
-		membership: RetainedMembershipPresent,
-		probes:     []ProbeResult{ProbeAbsent},
+		memberships: []RetainedGroupMembership{
+			RetainedMembershipPresent,
+			RetainedMembershipPresent,
+			RetainedMembershipPresent,
+			RetainedMembershipEmpty,
+		},
 	}
 
 	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
@@ -391,8 +414,8 @@ func TestContainmentRetainedProbeUsesRetainedCapability(t *testing.T) {
 	assertAbsent(t, outcome)
 	assertSignals(t, signaler)
 	assertRetainedSignals(t, retained, SignalTerminate, SignalKill)
-	if retained.probeCalls != 1 {
-		t.Fatalf("retained probes = %d, want 1", retained.probeCalls)
+	if retained.membershipCalls != 4 {
+		t.Fatalf("retained membership calls = %d, want 4", retained.membershipCalls)
 	}
 	if signaler.probeCalls != 0 {
 		t.Fatalf("numeric PGID probes = %d, want 0", signaler.probeCalls)
@@ -420,6 +443,9 @@ func TestContainmentAcquiresRetainedCapabilityBeforeFirstObservation(t *testing.
 	}
 	if retained.acquiredAt.IsZero() {
 		t.Fatalf("retained acquiredAt was not recorded")
+	}
+	if retained.releaseCalls != 1 {
+		t.Fatalf("retained release calls = %d, want 1", retained.releaseCalls)
 	}
 }
 
