@@ -11,6 +11,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const darwinProcessStateZombie = int8(5)
+
 func nativeHostBootID() (string, error) {
 	bootSessionUUID, err := darwinBootSessionUUID()
 	if err == nil {
@@ -135,11 +137,19 @@ func darwinProcessSnapshot(process unix.KinfoProc) (processSnapshot, error) {
 		PID:        pid,
 		PGID:       pgid,
 		StartToken: startToken,
+		RunState:   darwinProcessRunState(process),
 	}
 	if err := snapshot.validate(); err != nil {
 		return processSnapshot{}, err
 	}
 	return snapshot, nil
+}
+
+func darwinProcessRunState(process unix.KinfoProc) ProcessRunState {
+	if process.Proc.P_stat == darwinProcessStateZombie {
+		return ProcessRunStateZombie
+	}
+	return ProcessRunStateRunning
 }
 
 // darwinProcessStartToken combines stable kinfo_proc fields to narrow PID reuse

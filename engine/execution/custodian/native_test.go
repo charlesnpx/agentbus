@@ -31,13 +31,14 @@ import (
 )
 
 const (
-	nativeHelperEnv             = "AGENTBUS_NATIVE_CUSTODIAN_HELPER"
-	nativeHelperSimple          = "simple"
-	nativeHelperTermGrandchild  = "term-grandchild"
-	nativeHelperGrandchild      = "grandchild"
-	nativeHelperMonitor         = "monitor"
-	nativeHelperAgentbusGOCACHE = "GOCACHE=/tmp/abd-gocache"
-	nativeHelperAgentbusMOD     = "GOMODCACHE=/tmp/abd-gomodcache"
+	nativeHelperEnv                  = "AGENTBUS_NATIVE_CUSTODIAN_HELPER"
+	nativeHelperSimple               = "simple"
+	nativeHelperTermGrandchild       = "term-grandchild"
+	nativeHelperIgnoreTermGrandchild = "ignore-term-grandchild"
+	nativeHelperGrandchild           = "grandchild"
+	nativeHelperMonitor              = "monitor"
+	nativeHelperAgentbusGOCACHE      = "GOCACHE=/tmp/abd-gocache"
+	nativeHelperAgentbusMOD          = "GOMODCACHE=/tmp/abd-gomodcache"
 )
 
 var (
@@ -66,6 +67,17 @@ func TestNativeHelperTermGrandchildProcess(t *testing.T) {
 		os.Exit(97)
 	}
 	os.Exit(runNativeTermGrandchildHelper(args))
+}
+
+func TestNativeHelperIgnoreTermGrandchildProcess(t *testing.T) {
+	if os.Getenv(nativeHelperEnv) != nativeHelperIgnoreTermGrandchild {
+		return
+	}
+	args, ok := nativeHelperArgs()
+	if !ok {
+		os.Exit(97)
+	}
+	os.Exit(runNativeIgnoreTermGrandchildHelper(args))
 }
 
 func TestNativeHelperGrandchildProcess(t *testing.T) {
@@ -154,6 +166,47 @@ func TestNativeWaitReturnsCachedResultAfterFinalization(t *testing.T) {
 	}
 }
 
+func TestNativeWaitIgnoresCallerClosedStreamsAndSharesFinalizedOutcome(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	native := newNativeCustodianForTest(t, defaultNativeTestParams())
+	spec, _ := nativeSimpleLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	if _, err := io.ReadAll(running.Stdout()); err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	closeNativeExposedStreamsForTest(t, running)
+
+	exit, err := running.Wait(ctx)
+	if err != nil {
+		t.Fatalf("Wait() error = %v, want nil after caller-closed streams", err)
+	}
+	if !exit.Exited || exit.Code != 0 || exit.Signal != "" {
+		t.Fatalf("exit observation = %+v, want clean exit", exit)
+	}
+	second, err := running.Wait(ctx)
+	if err != nil {
+		t.Fatalf("cached Wait() error = %v, want nil", err)
+	}
+	if second != exit {
+		t.Fatalf("cached Wait() exit = %+v, want %+v", second, exit)
+	}
+	cached := running.finalOutcome
+	if !cached.Absent() || cached.Method != model.QuiescenceAlreadyAbsent {
+		t.Fatalf("cached physical outcome = %+v, want already-absent", cached)
+	}
+	canceled, cancelContain := context.WithCancel(context.Background())
+	cancelContain()
+	if got := running.ContainAndVerify(canceled); got != cached {
+		t.Fatalf("ContainAndVerify(canceled) after Wait = %+v, want cached %+v", got, cached)
+	}
+}
+
 func TestNativeContainAndVerifyKillsTermIgnoringGrandchild(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -181,6 +234,42 @@ func TestNativeContainAndVerifyKillsTermIgnoringGrandchild(t *testing.T) {
 	}
 	if outcome.Method != model.QuiescenceTermKill {
 		t.Fatalf("physical method = %s, want term_kill", outcome.Method)
+	}
+	waitGroupAbsent(t, running.Ref(), 5*time.Second)
+}
+
+func TestNativeContainAndVerifyIgnoresCallerClosedStreamsAndSharesFinalizedOutcome(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	native := newNativeCustodianForTest(t, defaultNativeTestParams())
+	spec, resultPath := nativeTermGrandchildLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	waitNativeReadyLine(t, running.Stdout(), "term-grandchild-ready")
+	result := readNativeBackendResult(t, resultPath)
+	if result.GrandchildPGID != running.Ref().PGID {
+		t.Fatalf("grandchild pgid = %d, want target group %d", result.GrandchildPGID, running.Ref().PGID)
+	}
+	closeNativeExposedStreamsForTest(t, running)
+
+	outcome := running.ContainAndVerify(ctx)
+	if !outcome.Absent() {
+		t.Fatalf("ContainAndVerify() = %+v, want Absent after caller-closed streams", outcome)
+	}
+	if outcome.Method != model.QuiescenceTermKill {
+		t.Fatalf("physical method = %s, want term_kill", outcome.Method)
+	}
+	if running.finalOutcome != outcome {
+		t.Fatalf("cached physical outcome = %+v, want returned %+v", running.finalOutcome, outcome)
+	}
+	canceled, cancelContain := context.WithCancel(context.Background())
+	cancelContain()
+	if got := running.ContainAndVerify(canceled); got != outcome {
+		t.Fatalf("ContainAndVerify(canceled) after finalization = %+v, want cached %+v", got, outcome)
 	}
 	waitGroupAbsent(t, running.Ref(), 5*time.Second)
 }
@@ -318,14 +407,14 @@ func TestNativeMonitorDaemonEOFContainsTermIgnoringGrandchild(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
-	spec, resultPath := nativeTermGrandchildLaunchSpec(t)
+	spec, resultPath := nativeIgnoreTermGrandchildLaunchSpec(t)
 
 	running, err := native.Launch(ctx, spec)
 	if err != nil {
 		t.Fatalf("Launch() error = %v", err)
 	}
 	defer cleanupNativeRunning(t, running)
-	waitNativeReadyLine(t, running.Stdout(), "term-grandchild-ready")
+	waitNativeReadyLine(t, running.Stdout(), "ignore-term-grandchild-ready")
 	result := readNativeBackendResult(t, resultPath)
 	if result.GrandchildPID <= 0 {
 		t.Fatalf("grandchild pid = %d, want positive", result.GrandchildPID)
@@ -392,6 +481,59 @@ func TestNativeMonitorDaemonEOFDoesNotKillAfterLeaderReaped(t *testing.T) {
 	}
 	if err := unix.Kill(result.GrandchildPID, 0); err != nil {
 		t.Fatalf("grandchild pid %d was killed after unprovable monitor outcome: %v", result.GrandchildPID, err)
+	}
+}
+
+func TestNativeMonitorDaemonEOFDoesNotKillUnreapedZombieLeader(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	native := newNativeCustodianForTest(t, defaultNativeTestParams())
+	spec, resultPath := nativeTermGrandchildLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	waitNativeReadyLine(t, running.Stdout(), "term-grandchild-ready")
+	result := readNativeBackendResult(t, resultPath)
+	if result.GrandchildPID <= 0 {
+		t.Fatalf("grandchild pid = %d, want positive", result.GrandchildPID)
+	}
+	if err := unix.Kill(running.Ref().Leader.PID, unix.SIGTERM); err != nil {
+		t.Fatalf("signal leader TERM: %v", err)
+	}
+	if err := running.leader.waitExited(ctx); err != nil {
+		t.Fatalf("wait leader exit notification: %v", err)
+	}
+	if running.handle.LeaderReaped() {
+		t.Fatal("leader was reaped before monitor containment")
+	}
+	leader := waitLeaderRunState(t, running.Ref(), procgroup.ProcessRunStateZombie, 5*time.Second)
+	if leader.Identity != model.ProcessIdentityMatching {
+		t.Fatalf("leader identity before monitor EOF = %s, want matching", leader.Identity)
+	}
+	if err := unix.Kill(result.GrandchildPID, 0); err != nil {
+		t.Fatalf("grandchild pid %d missing before monitor EOF: %v", result.GrandchildPID, err)
+	}
+
+	if err := running.handle.Monitor.DaemonControlWrite.Close(); err != nil {
+		t.Fatalf("close daemon control: %v", err)
+	}
+	running.handle.Monitor.DaemonControlWrite = nil
+	select {
+	case <-running.handle.Monitor.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("monitor did not exit after daemon EOF")
+	}
+	if err := running.handle.Monitor.Wait(); err == nil {
+		t.Fatal("monitor Wait() error = nil, want unprovable containment failure")
+	}
+	if err := unix.Kill(result.GrandchildPID, 0); err != nil {
+		t.Fatalf("grandchild pid %d was killed after unreaped-zombie monitor outcome: %v", result.GrandchildPID, err)
+	}
+	if running.handle.LeaderReaped() {
+		t.Fatal("non-parent monitor reaped the leader")
 	}
 }
 
@@ -592,6 +734,26 @@ func nativeTermGrandchildLaunchSpec(t *testing.T) (NativeLaunchSpec, string) {
 	return spec, resultPath
 }
 
+func nativeIgnoreTermGrandchildLaunchSpec(t *testing.T) (NativeLaunchSpec, string) {
+	t.Helper()
+	dir := t.TempDir()
+	resultPath := filepath.Join(dir, "ignore-term-grandchild-result.json")
+	readyPath := filepath.Join(dir, "ignore-term-grandchild-ready")
+	exe := nativeTestBinaryPath(t)
+	spec := nativeLaunchSpec(t, command.ExecSpec{
+		Argv: []string{
+			exe,
+			"-test.run=^TestNativeHelperIgnoreTermGrandchildProcess$",
+			"--",
+			"--result", resultPath,
+			"--grandchild-ready", readyPath,
+		},
+		Env: append(os.Environ(), nativeHelperEnv+"="+nativeHelperIgnoreTermGrandchild),
+		Dir: filepath.Dir(exe),
+	})
+	return spec, resultPath
+}
+
 func nativeLaunchSpec(t *testing.T, exec command.ExecSpec) NativeLaunchSpec {
 	t.Helper()
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -734,6 +896,29 @@ func cleanupNativeRunning(t *testing.T, running *NativeRunningProcess) {
 	}
 }
 
+func closeNativeExposedStreamsForTest(t *testing.T, running *NativeRunningProcess) {
+	t.Helper()
+	if running == nil {
+		t.Fatal("running process is nil")
+	}
+	closers := []struct {
+		name   string
+		closer io.Closer
+	}{
+		{name: "stdin", closer: running.Stdin()},
+		{name: "stdout", closer: running.Stdout()},
+		{name: "stderr", closer: running.Stderr()},
+	}
+	for _, stream := range closers {
+		if stream.closer == nil {
+			continue
+		}
+		if err := stream.closer.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("close %s: %v", stream.name, err)
+		}
+	}
+}
+
 func waitGroupAbsent(t *testing.T, group model.GroupRef, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -767,6 +952,31 @@ func waitPIDAbsent(t *testing.T, pid int, timeout time.Duration) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("pid %d still exists after %s", pid, timeout)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func waitLeaderRunState(t *testing.T, group model.GroupRef, state procgroup.ProcessRunState, timeout time.Duration) procgroup.ProcessObservation {
+	t.Helper()
+	leader, err := procgroup.NewProcessClaim(
+		group.Leader.PID,
+		group.PGID,
+		procgroup.StartToken(group.Leader.HighResStartToken),
+		group.KernelDomain(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(timeout)
+	var last procgroup.ProcessObservation
+	for {
+		last = procgroup.ObserveProcess(leader)
+		if last.RunState == state {
+			return last
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("leader pid %d run state = %s after %s, want %s (identity=%s)", group.Leader.PID, last.RunState, timeout, state, last.Identity)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -900,6 +1110,56 @@ func runNativeTermGrandchildHelper(args []string) int {
 	signal.Notify(signals, syscall.SIGTERM)
 	<-signals
 	return 0
+}
+
+func runNativeIgnoreTermGrandchildHelper(args []string) int {
+	fs := flag.NewFlagSet("native-ignore-term-grandchild", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	resultPath := fs.String("result", "", "result path")
+	grandchildReady := fs.String("grandchild-ready", "", "grandchild ready path")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *resultPath == "" || *grandchildReady == "" {
+		return 2
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return 3
+	}
+	cmd := exec.Command(exe,
+		"-test.run=^TestNativeHelperGrandchildProcess$",
+		"--",
+		"--ready", *grandchildReady,
+	)
+	cmd.Env = append(os.Environ(), nativeHelperEnv+"="+nativeHelperGrandchild)
+	cmd.Dir = filepath.Dir(exe)
+	if err := cmd.Start(); err != nil {
+		return 4
+	}
+	if err := waitForFile(*grandchildReady, 5*time.Second); err != nil {
+		_ = cmd.Process.Kill()
+		return 5
+	}
+	childPGID, err := readGrandchildPGID(*grandchildReady)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		return 6
+	}
+	pgid, err := unix.Getpgid(0)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		return 7
+	}
+	if code := writeNativeBackendResult(*resultPath, nativeBackendResult{PID: os.Getpid(), PGID: pgid, GrandchildPID: cmd.Process.Pid, GrandchildPGID: childPGID}); code != 0 {
+		_ = cmd.Process.Kill()
+		return code
+	}
+	fmt.Printf("ignore-term-grandchild-ready pid=%d pgid=%d child=%d\n", os.Getpid(), pgid, cmd.Process.Pid)
+	signal.Ignore(syscall.SIGTERM)
+	for {
+		time.Sleep(time.Hour)
+	}
 }
 
 func runNativeGrandchildHelper(args []string) int {

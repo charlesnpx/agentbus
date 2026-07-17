@@ -413,6 +413,8 @@ func (process *NativeRunningProcess) Stdin() io.WriteCloser {
 	if process == nil || process.handle == nil {
 		return nil
 	}
+	process.lifecycleMu.Lock()
+	defer process.lifecycleMu.Unlock()
 	return process.handle.Stdin
 }
 
@@ -420,6 +422,8 @@ func (process *NativeRunningProcess) Stdout() io.ReadCloser {
 	if process == nil || process.handle == nil {
 		return nil
 	}
+	process.lifecycleMu.Lock()
+	defer process.lifecycleMu.Unlock()
 	return process.handle.Stdout
 }
 
@@ -427,6 +431,8 @@ func (process *NativeRunningProcess) Stderr() io.ReadCloser {
 	if process == nil || process.handle == nil {
 		return nil
 	}
+	process.lifecycleMu.Lock()
+	defer process.lifecycleMu.Unlock()
 	return process.handle.Stderr
 }
 
@@ -507,7 +513,7 @@ func (process *NativeRunningProcess) ContainAndVerify(ctx context.Context) Physi
 	if process == nil || process.custodian == nil {
 		return unprovablePhysical(model.GroupRef{}, containment.ReasonInvalidInput, "", fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable))
 	}
-	return process.custodian.ContainAndVerify(ctx, process.group)
+	return process.containAndVerify(ctx)
 }
 
 func (process *NativeRunningProcess) containAndVerify(ctx context.Context) PhysicalOutcome {
@@ -539,7 +545,7 @@ func (process *NativeRunningProcess) containAndVerify(ctx context.Context) Physi
 		return outcome
 	}
 	finalOutcome, _, err := process.finalizeAbsentLocked(ctx, outcome)
-	if err != nil {
+	if err != nil && !process.finalized {
 		return unprovablePhysical(process.group, containment.ReasonProbeUnprovable, outcome.Decision, err)
 	}
 	return finalOutcome
@@ -704,7 +710,7 @@ func (native *nativeLaunchContainment) Contain(ctx context.Context, group model.
 
 func containPhysical(ctx context.Context, group model.GroupRef, params containment.Params, witness containment.ContinuityWitness) PhysicalOutcome {
 	engine := containment.Engine{
-		Observer:   containment.RealObserver{},
+		Observer:   nativeObserverFor(witness),
 		Signaler:   nativeSignalerFor(witness),
 		Clock:      containment.RealClock{},
 		Continuity: witness,
@@ -732,6 +738,58 @@ func containPhysical(ctx context.Context, group model.GroupRef, params containme
 		Method:   methodForDecision(outcome.Decision),
 		Decision: outcome.Decision,
 	}
+}
+
+func nativeObserverFor(witness containment.ContinuityWitness) containment.Observer {
+	observer := nativeContainmentObserver{}
+	if retention, ok := witness.(*leaderRetention); ok {
+		observer.retention = retention
+	}
+	return observer
+}
+
+type nativeContainmentObserver struct {
+	retention *leaderRetention
+}
+
+func (observer nativeContainmentObserver) ObserveGroup(ctx context.Context, target model.GroupRef) (model.ContainmentObservation, error) {
+	observation, err := containment.RealObserver{}.ObserveGroup(ctx, target)
+	if err != nil {
+		return model.ContainmentObservation{}, err
+	}
+	if observation.Group != model.GroupLive || observation.Leader != model.ProcessIdentityMatching {
+		return observation, nil
+	}
+	leader, err := observeNativeLeader(target)
+	if err != nil {
+		observation.Leader = model.ProcessIdentityUnknown
+		return observation, nil
+	}
+	if leader.Identity != model.ProcessIdentityMatching {
+		observation.Leader = leader.Identity
+		return observation, nil
+	}
+	if leader.RunState == procgroup.ProcessRunStateRunning {
+		return observation, nil
+	}
+	if leader.RunState == procgroup.ProcessRunStateZombie && observer.retention != nil && observer.retention.unreapedFor(target) {
+		return observation, nil
+	}
+	observation.Leader = model.ProcessIdentityUnknown
+	return observation, nil
+}
+
+func observeNativeLeader(target model.GroupRef) (procgroup.ProcessObservation, error) {
+	claim, err := procgroup.NewProcessClaim(
+		target.Leader.PID,
+		target.PGID,
+		procgroup.StartToken(target.Leader.HighResStartToken),
+		target.KernelDomain(),
+	)
+	if err != nil {
+		return procgroup.ProcessObservation{}, err
+	}
+	return procgroup.ObserveProcess(claim), nil
 }
 
 func nativeSignalerFor(witness containment.ContinuityWitness) containment.Signaler {
@@ -853,15 +911,22 @@ func closeNativeProcessFiles(handle *parklaunch.ParkedHandle) error {
 	if handle == nil {
 		return nil
 	}
+	stdin, stdout, stderr := handle.Stdin, handle.Stdout, handle.Stderr
+	handle.Stdin, handle.Stdout, handle.Stderr = nil, nil, nil
 	var err error
-	if handle.Stdin != nil {
-		err = errors.Join(err, handle.Stdin.Close())
+	err = errors.Join(err, closeNativeProcessFile(stdin))
+	err = errors.Join(err, closeNativeProcessFile(stdout))
+	err = errors.Join(err, closeNativeProcessFile(stderr))
+	return err
+}
+
+func closeNativeProcessFile(file *os.File) error {
+	if file == nil {
+		return nil
 	}
-	if handle.Stdout != nil {
-		err = errors.Join(err, handle.Stdout.Close())
-	}
-	if handle.Stderr != nil {
-		err = errors.Join(err, handle.Stderr.Close())
+	err := file.Close()
+	if errors.Is(err, os.ErrClosed) {
+		return nil
 	}
 	return err
 }

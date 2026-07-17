@@ -25,6 +25,7 @@ func parseLinuxProcStat(stat string) (processSnapshot, error) {
 	if len(fields) < 20 {
 		return processSnapshot{}, fmt.Errorf("proc stat too short: got %d fields after command", len(fields))
 	}
+	runState := linuxProcRunState(fields[0])
 	pgid, err := strconv.Atoi(fields[2])
 	if err != nil || pgid <= 0 {
 		return processSnapshot{}, fmt.Errorf("proc stat invalid pgid %q", fields[2])
@@ -33,9 +34,19 @@ func parseLinuxProcStat(stat string) (processSnapshot, error) {
 	if _, err := strconv.ParseUint(startTime, 10, 64); err != nil {
 		return processSnapshot{}, fmt.Errorf("proc stat invalid starttime %q", startTime)
 	}
-	snapshot := processSnapshot{PID: pid, PGID: pgid, StartToken: StartToken(startTime)}
+	snapshot := processSnapshot{PID: pid, PGID: pgid, StartToken: StartToken(startTime), RunState: runState}
 	if err := snapshot.validate(); err != nil {
 		return processSnapshot{}, err
 	}
 	return snapshot, nil
+}
+
+func linuxProcRunState(state string) ProcessRunState {
+	if state == "Z" {
+		return ProcessRunStateZombie
+	}
+	if state == "" {
+		return ProcessRunStateUnknown
+	}
+	return ProcessRunStateRunning
 }

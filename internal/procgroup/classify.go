@@ -71,47 +71,67 @@ func ReadProcessClaim(pid int) (ProcessClaim, error) {
 // ClassifyProcess re-reads the kernel and maps the result to the model
 // observation enum. Any uncertain read maps to ProcessIdentityUnknown.
 func ClassifyProcess(expected ProcessClaim) model.ProcessIdentityObservation {
-	return classifyProcess(nativeKernelReader{}, expected)
+	return ObserveProcess(expected).Identity
+}
+
+// ObserveProcess re-reads the kernel and returns both the legacy identity
+// classification and the observed process run state when the process table entry
+// can be read.
+func ObserveProcess(expected ProcessClaim) ProcessObservation {
+	return observeProcess(nativeKernelReader{}, expected)
 }
 
 func classifyProcess(reader kernelReader, expected ProcessClaim) model.ProcessIdentityObservation {
+	return observeProcess(reader, expected).Identity
+}
+
+func observeProcess(reader kernelReader, expected ProcessClaim) ProcessObservation {
 	if err := expected.validate(); err != nil {
-		return model.ProcessIdentityUnknown
+		return processObservation(model.ProcessIdentityUnknown, ProcessRunStateUnknown)
 	}
 	currentDomain, err := reader.CurrentKernelDomain()
 	if err != nil {
-		return model.ProcessIdentityUnknown
+		return processObservation(model.ProcessIdentityUnknown, ProcessRunStateUnknown)
 	}
 	relation, err := compareKernelDomain(expected.KernelDomainID, currentDomain)
 	if err != nil {
-		return model.ProcessIdentityUnknown
+		return processObservation(model.ProcessIdentityUnknown, ProcessRunStateUnknown)
 	}
 	snapshot, err := reader.ReadProcess(expected.PID)
 	if errors.Is(err, ErrProcessMissing) {
-		return model.ProcessIdentityMissing
+		return processObservation(model.ProcessIdentityMissing, ProcessRunStateUnknown)
 	}
 	if err != nil {
-		return model.ProcessIdentityUnknown
+		return processObservation(model.ProcessIdentityUnknown, ProcessRunStateUnknown)
 	}
 	if err := snapshot.validate(); err != nil {
-		return model.ProcessIdentityUnknown
+		return processObservation(model.ProcessIdentityUnknown, ProcessRunStateUnknown)
 	}
+	runState := snapshot.RunState.known()
 	if snapshot.PID != expected.PID {
-		return model.ProcessIdentityUnknown
+		return processObservation(model.ProcessIdentityUnknown, runState)
 	}
 	if relation == kernelDomainUnprovable {
-		return model.ProcessIdentityUnknown
+		return processObservation(model.ProcessIdentityUnknown, runState)
 	}
 	if relation == kernelDomainDifferent {
-		return model.ProcessIdentityReused
+		return processObservation(model.ProcessIdentityReused, runState)
 	}
 	if snapshot.StartToken != expected.StartToken {
-		return model.ProcessIdentityReused
+		return processObservation(model.ProcessIdentityReused, runState)
 	}
 	if snapshot.PGID != expected.PGID {
-		return model.ProcessIdentityReused
+		return processObservation(model.ProcessIdentityReused, runState)
 	}
-	return model.ProcessIdentityMatching
+	return processObservation(model.ProcessIdentityMatching, runState)
+}
+
+func processObservation(identity model.ProcessIdentityObservation, runState ProcessRunState) ProcessObservation {
+	observation := ProcessObservation{Identity: identity, RunState: runState.known()}
+	if err := observation.validate(); err != nil {
+		return ProcessObservation{Identity: model.ProcessIdentityUnknown, RunState: ProcessRunStateUnknown}
+	}
+	return observation
 }
 
 // ClassifyGroup re-reads the kernel and maps the process-group result to the

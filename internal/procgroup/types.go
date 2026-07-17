@@ -75,6 +75,47 @@ func (claim ProcessClaim) validate() error {
 	return nil
 }
 
+// ProcessRunState is the coarse liveness state needed by native containment.
+// Running means the process-table entry is not a zombie/defunct entry; it does
+// not distinguish runnable, sleeping, stopped, or other non-zombie states.
+type ProcessRunState string
+
+const (
+	ProcessRunStateUnknown ProcessRunState = "unknown"
+	ProcessRunStateRunning ProcessRunState = "running"
+	ProcessRunStateZombie  ProcessRunState = "zombie"
+)
+
+func (state ProcessRunState) known() ProcessRunState {
+	if state == "" {
+		return ProcessRunStateUnknown
+	}
+	return state
+}
+
+func (state ProcessRunState) validate() error {
+	switch state.known() {
+	case ProcessRunStateUnknown, ProcessRunStateRunning, ProcessRunStateZombie:
+		return nil
+	default:
+		return fmt.Errorf("process run state is unknown")
+	}
+}
+
+// ProcessObservation adds run-state to the legacy identity classification
+// without changing the meaning of ProcessIdentityMatching for existing callers.
+type ProcessObservation struct {
+	Identity model.ProcessIdentityObservation
+	RunState ProcessRunState
+}
+
+func (observation ProcessObservation) validate() error {
+	if err := observation.Identity.Validate(); err != nil {
+		return err
+	}
+	return observation.RunState.validate()
+}
+
 // GroupClaim is the expected process-group identity in a kernel domain.
 type GroupClaim struct {
 	PGID           int
@@ -103,6 +144,7 @@ type processSnapshot struct {
 	PID        int
 	PGID       int
 	StartToken StartToken
+	RunState   ProcessRunState
 }
 
 func (snapshot processSnapshot) validate() error {
@@ -112,5 +154,8 @@ func (snapshot processSnapshot) validate() error {
 	if snapshot.PGID <= 0 {
 		return fmt.Errorf("snapshot pgid must be positive")
 	}
-	return snapshot.StartToken.validate("snapshot start token")
+	if err := snapshot.StartToken.validate("snapshot start token"); err != nil {
+		return err
+	}
+	return snapshot.RunState.validate()
 }

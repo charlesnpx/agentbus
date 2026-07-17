@@ -2,6 +2,7 @@ package procgroup
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -120,6 +121,28 @@ func TestClassifyProcessWithFakeReader(t *testing.T) {
 	}
 }
 
+func TestObserveProcessSurfacesRunStateWithoutChangingIdentity(t *testing.T) {
+	domain := testDomain(t, "boot-process-state")
+	expected := ProcessClaim{PID: 10, PGID: 20, StartToken: "start-10", KernelDomainID: domain}
+	reader := fakeKernelReader{
+		domain: domain,
+		processes: map[int]processSnapshot{
+			10: {PID: 10, PGID: 20, StartToken: "start-10", RunState: ProcessRunStateZombie},
+		},
+	}
+
+	observation := observeProcess(reader, expected)
+	if observation.Identity != model.ProcessIdentityMatching {
+		t.Fatalf("observeProcess().Identity = %v, want %v", observation.Identity, model.ProcessIdentityMatching)
+	}
+	if observation.RunState != ProcessRunStateZombie {
+		t.Fatalf("observeProcess().RunState = %v, want %v", observation.RunState, ProcessRunStateZombie)
+	}
+	if got := classifyProcess(reader, expected); got != model.ProcessIdentityMatching {
+		t.Fatalf("classifyProcess() = %v, want %v", got, model.ProcessIdentityMatching)
+	}
+}
+
 func TestClassifyGroupWithFakeReader(t *testing.T) {
 	domain := testDomain(t, "boot-group")
 	base := GroupClaim{PGID: 20, KernelDomainID: domain}
@@ -221,6 +244,16 @@ func TestParseLinuxProcStat(t *testing.T) {
 	}
 	if snapshot.StartToken != "987654321" {
 		t.Fatalf("snapshot StartToken = %q, want 987654321", snapshot.StartToken)
+	}
+	if snapshot.RunState != ProcessRunStateRunning {
+		t.Fatalf("snapshot RunState = %q, want %q", snapshot.RunState, ProcessRunStateRunning)
+	}
+	zombie, err := parseLinuxProcStat(strings.Replace(stat, ") S ", ") Z ", 1))
+	if err != nil {
+		t.Fatalf("parseLinuxProcStat(zombie) error = %v", err)
+	}
+	if zombie.RunState != ProcessRunStateZombie {
+		t.Fatalf("zombie RunState = %q, want %q", zombie.RunState, ProcessRunStateZombie)
 	}
 }
 
