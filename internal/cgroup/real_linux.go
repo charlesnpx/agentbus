@@ -296,16 +296,6 @@ func (fs *realFS) Verify(ctx context.Context, object cgroupObject) (bool, error)
 	if !realObject.root.sameLiveObject(root) || !realObject.leaf.sameLiveObject(leaf) || !realObject.root.durableEqual(root) || !realObject.leaf.durableEqual(leaf) {
 		return false, nil
 	}
-	current, err := identityAt(realObject.rootfd, realObject.leafName)
-	if err != nil {
-		if isMissingObjectErr(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	if !realObject.leaf.durableEqual(current) {
-		return false, nil
-	}
 	fd, err := unix.Openat(realObject.leaffd, "cgroup.events", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESTALE) || errors.Is(err, unix.ENOTDIR) {
@@ -549,12 +539,6 @@ func durableHandleError(err error) error {
 		return nil
 	}
 	return fmt.Errorf("%w: lifetime-unique cgroup handle unavailable: %v", ErrUnsupported, err)
-}
-
-func isMissingObjectErr(err error) bool {
-	return errors.Is(err, unix.ENOENT) ||
-		errors.Is(err, unix.ESTALE) ||
-		errors.Is(err, unix.ENOTDIR)
 }
 
 func (fs *realFS) recordTombstoneIfNameMatches(rootfd int, name string, expected ObjectIdentity) {

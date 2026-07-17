@@ -182,10 +182,14 @@ type cgroupFS interface {
 	RootIdentity(context.Context) (RootIdentity, error)
 	CreateChild(context.Context, string) (cgroupObject, error)
 	Open(context.Context, string) (cgroupObject, error)
+	// Verify validates the held root/leaf object handles only. The current leaf
+	// pathname is reserved for Open and guarded tombstone cleanup decisions.
 	Verify(context.Context, cgroupObject) (bool, error)
 	ProbeFeatures(context.Context, cgroupObject) (CgroupFeatures, error)
 	WriteProcs(context.Context, cgroupObject, int) error
 	ReadProcs(context.Context, cgroupObject) ([]int, error)
+	// ReadEvents reads cgroup.events from the held leaf object, not the current
+	// leaf name target.
 	ReadEvents(context.Context, cgroupObject) (Events, error)
 	WriteKill(context.Context, cgroupObject) error
 	WriteFreeze(context.Context, cgroupObject, FreezeState) error

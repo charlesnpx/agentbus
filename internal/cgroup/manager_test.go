@@ -174,6 +174,64 @@ func TestMembershipMapsPopulatedEmptyAndUnknown(t *testing.T) {
 	}
 }
 
+func TestNameReplacementDoesNotVetoHeldObjectEmptyProof(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-name-replacement"))
+	capability := acquireCapability(t, manager)
+	heldObject := capability.object.(*fakeCgroupObject)
+	heldLeaf := heldObject.leafRef
+	heldIdentity := heldObject.LeafObject()
+
+	if got := membership(t, capability); got != containment.RetainedMembershipEmpty {
+		t.Fatalf("membership before name replacement = %v, want empty", got)
+	}
+	fs.replaceNameTarget(capability.retainedID)
+	replacement, err := fs.leaf(capability.retainedID)
+	if err != nil {
+		t.Fatalf("replacement leaf missing: %v", err)
+	}
+	if replacement == heldLeaf {
+		t.Fatalf("replacement reused held leaf")
+	}
+	if heldIdentity == replacement.object {
+		t.Fatalf("replacement identity = held identity %#v", heldIdentity)
+	}
+	fs.setProcs(capability.retainedID, 999)
+
+	if got := membership(t, capability); got != containment.RetainedMembershipEmpty {
+		t.Fatalf("membership after name replacement = %v, want held-object empty", got)
+	}
+	held, err := capability.StillHeld(context.Background())
+	if err != nil || !held {
+		t.Fatalf("StillHeld() after name replacement = %v, %v; want true nil", held, err)
+	}
+	if heldLeaf.populated() {
+		t.Fatalf("held leaf became populated through replacement name target")
+	}
+}
+
+func TestDestroyedHeldObjectReportsUnknownMembershipAndUnheld(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-destroyed"))
+	capability := acquireCapability(t, manager)
+
+	fs.recreate(capability.retainedID)
+	membership, err := capability.Membership(context.Background())
+	if err != nil {
+		t.Fatalf("Membership() after destroy error = %v", err)
+	}
+	if membership != containment.RetainedMembershipUnknown {
+		t.Fatalf("Membership() after destroy = %v, want unknown", membership)
+	}
+	held, err := capability.StillHeld(context.Background())
+	if err != nil {
+		t.Fatalf("StillHeld() after destroy error = %v", err)
+	}
+	if held {
+		t.Fatalf("StillHeld() after destroy = true, want false")
+	}
+}
+
 func TestKillEmptiesThenRemoveTombstonesAfterEmptyProof(t *testing.T) {
 	fs := newFakeCgroupFS()
 	manager := newFakeManager(fs, leafSequence("cg-kill"))
@@ -220,6 +278,7 @@ func TestRemoveTombstonesWhenEmptyReplacementAppearsAfterFinalVerify(t *testing.
 	fs := newFakeCgroupFS()
 	manager := newFakeManager(fs, leafSequence("cg-remove-race"))
 	capability := acquireCapability(t, manager)
+	heldIdentity := capability.object.LeafObject()
 	recreated := false
 	fs.onAfterFinalVerify = func(name string) {
 		if recreated {
@@ -236,12 +295,23 @@ func TestRemoveTombstonesWhenEmptyReplacementAppearsAfterFinalVerify(t *testing.
 	if fs.removeCalls != 0 {
 		t.Fatalf("remove calls = %d, want 0", fs.removeCalls)
 	}
-	if !fs.tombstoned(capability.retainedID) {
+	name := fs.leafName(capability.retainedID)
+	tombstone, ok := fs.tombstones[name]
+	if !ok {
 		t.Fatalf("held empty leaf was not recorded as a tombstone")
+	}
+	if tombstone != heldIdentity {
+		t.Fatalf("tombstone identity = %#v, want held identity %#v", tombstone, heldIdentity)
 	}
 	leaf, err := fs.leaf(capability.retainedID)
 	if err != nil {
 		t.Fatalf("replacement leaf missing: %v", err)
+	}
+	if leaf.object == heldIdentity {
+		t.Fatalf("replacement identity = held identity %#v", heldIdentity)
+	}
+	if tombstone == leaf.object {
+		t.Fatalf("tombstone identity = replacement identity %#v", tombstone)
 	}
 	if leaf.populated() {
 		t.Fatalf("replacement leaf populated = true, want empty")
@@ -849,22 +919,12 @@ func (fs *fakeCgroupFS) Open(_ context.Context, id string) (cgroupObject, error)
 }
 
 func (fs *fakeCgroupFS) Verify(_ context.Context, object cgroupObject) (bool, error) {
-	_, err := fs.leafForObject(object)
+	_, err := fs.heldLeafForObject(object)
 	if err != nil {
 		if errors.Is(err, ErrUnsupported) || errors.Is(err, ErrInvalid) {
 			return false, nil
 		}
 		return false, err
-	}
-	current, err := fs.identityAt(object.LeafName())
-	if err != nil {
-		if errors.Is(err, ErrUnsupported) || errors.Is(err, ErrInvalid) {
-			return false, nil
-		}
-		return false, err
-	}
-	if !object.LeafObject().durableEqual(current) {
-		return false, nil
 	}
 	return true, nil
 }
@@ -1074,6 +1134,11 @@ func (fs *fakeCgroupFS) recreate(id string) {
 	fs.leaves[name] = fs.newLeaf()
 }
 
+func (fs *fakeCgroupFS) replaceNameTarget(id string) {
+	name := fs.leafName(id)
+	fs.leaves[name] = fs.newLeaf()
+}
+
 func (fs *fakeCgroupFS) recreateReusingInode(id string) {
 	name := fs.leafName(id)
 	leaf, err := fs.leaf(name)
@@ -1170,24 +1235,7 @@ func (fs *fakeCgroupFS) openObject(name string) (*fakeCgroupObject, error) {
 }
 
 func (fs *fakeCgroupFS) leafForObject(object cgroupObject) (*fakeLeaf, error) {
-	fakeObject, ok := object.(*fakeCgroupObject)
-	if !ok || fakeObject == nil || fakeObject.closed {
-		return nil, fmt.Errorf("%w: invalid cgroup object", ErrInvalid)
-	}
-	current, ok := fs.leaves[fakeObject.name]
-	if !ok || current.removed || fakeObject.leafRef.removed || current != fakeObject.leafRef {
-		return nil, fmt.Errorf("%w: stale cgroup object", ErrUnsupported)
-	}
-	root := fs.root.RootObject
-	leaf := current.object
-	if !fs.generationAvailable {
-		root.Generation = ""
-		leaf.Generation = ""
-	}
-	if !fakeObject.root.durableEqual(root) || !fakeObject.leaf.durableEqual(leaf) {
-		return nil, fmt.Errorf("%w: stale cgroup object", ErrUnsupported)
-	}
-	return current, nil
+	return fs.heldLeafForObject(object)
 }
 
 func (fs *fakeCgroupFS) heldLeafForObject(object cgroupObject) (*fakeLeaf, error) {
