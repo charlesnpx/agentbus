@@ -365,6 +365,8 @@ func TestContainmentAuthorizationTargetStateDecisionTable(t *testing.T) {
 		GroupAbsent,
 		GroupExistenceUnknown,
 		GroupExistenceContradictory,
+		GroupExistencePermissionDenied,
+		GroupExistenceUnsupported,
 	}
 	leaders := []ProcessIdentityObservation{
 		ProcessIdentityMatching,
@@ -380,13 +382,15 @@ func TestContainmentAuthorizationTargetStateDecisionTable(t *testing.T) {
 			for _, relation := range relations {
 				for _, group := range groups {
 					for _, leader := range leaders {
-						name := retainedState.name + "/" + proof.name + "/" + relation.name + "/" + string(group) + "/" + string(leader)
-						t.Run(name, func(t *testing.T) {
+						t.Run(retainedState.name+"/"+proof.name+"/"+relation.name+"/"+string(group)+"/"+string(leader), func(t *testing.T) {
 							target := decisionTableGroup(t, retainedState.state)
 							observationDomain, ok := decisionTableObservationDomain(target, relation.relation)
 							if !ok {
 								// A target with an unknown retained domain cannot be
 								// proven in the same retained domain by construction.
+								// This is the only pruned combination; expanding the
+								// group axis from four to six states increases it from
+								// 64 to 96 base cells.
 								pruned++
 								return
 							}
@@ -398,34 +402,39 @@ func TestContainmentAuthorizationTargetStateDecisionTable(t *testing.T) {
 								t.Fatalf("constructed relation = %v, want %v", actualRelation, relation.relation)
 							}
 
-							got, err := DecideContainmentAuthorizationWithBasis(ContainmentAuthorization{
-								Group: target,
-								Observation: ContainmentObservation{
-									KernelDomainID: observationDomain,
-									Group:          group,
-									Leader:         leader,
-								},
-								RetainedObject: proof.proof,
-							})
-							if err != nil {
-								t.Fatalf("DecideContainmentAuthorizationWithBasis error = %v", err)
+							for _, monitor := range decisionTableMonitorCases(target, retainedState.state, proof.proof, group, leader) {
+								t.Run(monitor.name, func(t *testing.T) {
+									got, err := DecideContainmentAuthorizationWithBasis(ContainmentAuthorization{
+										Group: target,
+										Observation: ContainmentObservation{
+											KernelDomainID: observationDomain,
+											Group:          group,
+											Leader:         leader,
+											Monitor:        monitor.observation,
+										},
+										RetainedObject: proof.proof,
+									})
+									if err != nil {
+										t.Fatalf("DecideContainmentAuthorizationWithBasis error = %v", err)
+									}
+									want := decisionTableAuthorization(retainedState.state, proof.proof, relation.relation, group, leader, monitor.observation)
+									if got != want {
+										t.Fatalf("authorization = %#v, want %#v", got, want)
+									}
+									checked++
+								})
 							}
-							want := decisionTableAuthorization(retainedState.state, proof.proof, relation.relation, group, leader)
-							if got != want {
-								t.Fatalf("authorization = %#v, want %#v", got, want)
-							}
-							checked++
 						})
 					}
 				}
 			}
 		}
 	}
-	if checked != 512 {
-		t.Fatalf("checked decision-table cells = %d, want 512", checked)
+	if checked != 774 {
+		t.Fatalf("checked decision-table cells = %d, want 774", checked)
 	}
-	if pruned != 64 {
-		t.Fatalf("pruned decision-table cells = %d, want 64", pruned)
+	if pruned != 96 {
+		t.Fatalf("pruned decision-table cells = %d, want 96", pruned)
 	}
 }
 
@@ -567,7 +576,31 @@ func decisionTableObservationDomain(target GroupRef, relation kernelDomainRelati
 	return KernelDomainID{}, false
 }
 
-func decisionTableAuthorization(retainedState RetainedDomainState, proof RetainedObjectProof, relation kernelDomainRelation, group GroupExistenceObservation, leader ProcessIdentityObservation) ContainmentAuthorizationResult {
+type decisionTableMonitorCase struct {
+	name        string
+	observation ContainmentMonitorObservation
+}
+
+func decisionTableMonitorCases(target GroupRef, retainedState RetainedDomainState, proof RetainedObjectProof, group GroupExistenceObservation, leader ProcessIdentityObservation) []decisionTableMonitorCase {
+	cases := []decisionTableMonitorCase{{name: "coherent_monitor"}}
+	if retainedState == RetainedDomainKnown &&
+		proof == RetainedObjectProofEmpty &&
+		(group == GroupLive || group == GroupAbsent) &&
+		leader == ProcessIdentityMissing {
+		cases = append(cases, decisionTableMonitorCase{
+			name: "incoherent_monitor",
+			observation: ContainmentMonitorObservation{
+				Observed:          true,
+				KernelDomainID:    target.KernelDomain(),
+				Identity:          ProcessIdentityMatching,
+				BoundToExactGroup: true,
+			},
+		})
+	}
+	return cases
+}
+
+func decisionTableAuthorization(retainedState RetainedDomainState, proof RetainedObjectProof, relation kernelDomainRelation, group GroupExistenceObservation, leader ProcessIdentityObservation, monitor ContainmentMonitorObservation) ContainmentAuthorizationResult {
 	switch retainedState {
 	case RetainedDomainUnknown:
 		return containmentAuthorizationResult(Unprovable, ContainmentBasisNone)
@@ -579,7 +612,7 @@ func decisionTableAuthorization(retainedState RetainedDomainState, proof Retaine
 			}
 			return containmentAuthorizationResult(SignalDirectly, ContainmentBasisRetainedObject)
 		case RetainedObjectProofEmpty:
-			if (group == GroupLive || group == GroupAbsent) && leader == ProcessIdentityMissing {
+			if monitor.coherent() && (group == GroupLive || group == GroupAbsent) && leader == ProcessIdentityMissing {
 				return containmentAuthorizationResult(AlreadyAbsent, ContainmentBasisRetainedObject)
 			}
 			return containmentAuthorizationResult(Unprovable, ContainmentBasisNone)
