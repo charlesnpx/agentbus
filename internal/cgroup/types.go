@@ -190,6 +190,8 @@ type cgroupFS interface {
 	WriteKill(context.Context, cgroupObject) error
 	WriteFreeze(context.Context, cgroupObject, FreezeState) error
 	ReadFreeze(context.Context, cgroupObject) (FreezeState, error)
+	// Remove is best-effort cleanup for a held object already proven empty by
+	// Membership. Absence must not depend on name-based directory removal.
 	Remove(context.Context, cgroupObject) error
 }
 
@@ -655,12 +657,7 @@ func (capability *Capability) Remove(ctx context.Context) error {
 	if membership != containment.RetainedMembershipEmpty {
 		return ErrPopulated
 	}
-	if err := capability.requireHeld(ctx); err != nil {
-		return err
-	}
-	if err := capability.fs.Remove(ctx, capability.object); err != nil {
-		return err
-	}
+	_ = capability.fs.Remove(ctx, capability.object)
 	capability.removed = true
 	return nil
 }

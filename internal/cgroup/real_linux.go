@@ -32,9 +32,10 @@ func New(root string) (*Manager, error) {
 }
 
 type realFS struct {
-	root string
-	mu   sync.Mutex
-	held *realRoot
+	root       string
+	mu         sync.Mutex
+	held       *realRoot
+	tombstones map[string]ObjectIdentity
 }
 
 type realRoot struct {
@@ -219,23 +220,23 @@ func (fs *realFS) CreateChild(ctx context.Context, name string) (cgroupObject, e
 	}
 	leaffd, err := fs.openLeaf(rootfd, name)
 	if err != nil {
-		fs.removeNameIfMatches(rootfd, name, createdLeaf)
+		fs.recordTombstoneIfNameMatches(rootfd, name, createdLeaf)
 		return nil, err
 	}
 	leafObject, err := identityFromFD(leaffd)
 	if err != nil {
 		_ = unix.Close(leaffd)
-		fs.removeNameIfMatches(rootfd, name, createdLeaf)
+		fs.recordTombstoneIfNameMatches(rootfd, name, createdLeaf)
 		return nil, err
 	}
 	if !createdLeaf.durableEqual(leafObject) {
 		_ = unix.Close(leaffd)
-		fs.removeNameIfMatches(rootfd, name, createdLeaf)
+		fs.recordTombstoneIfNameMatches(rootfd, name, createdLeaf)
 		return nil, fmt.Errorf("%w: created cgroup leaf was replaced before open", ErrUnsupported)
 	}
 	if err := verifyRootHandle(rootfd, rootObject); err != nil {
 		_ = unix.Close(leaffd)
-		fs.removeNameIfMatches(rootfd, name, createdLeaf)
+		fs.recordTombstoneIfNameMatches(rootfd, name, createdLeaf)
 		return nil, err
 	}
 	return &realObject{rootPath: fs.root, leafName: name, rootfd: rootfd, leaffd: leaffd, root: rootObject, leaf: leafObject}, nil
@@ -417,21 +418,8 @@ func (fs *realFS) Remove(ctx context.Context, object cgroupObject) error {
 	if err != nil {
 		return err
 	}
-	events, err := fs.ReadEvents(ctx, object)
-	if err != nil {
-		return err
-	}
-	if events.Populated {
-		return ErrPopulated
-	}
-	held, err := fs.Verify(ctx, object)
-	if err != nil {
-		return err
-	}
-	if !held {
-		return fmt.Errorf("%w: cgroup object is no longer held", ErrUnsupported)
-	}
-	return unix.Unlinkat(realObject.rootfd, realObject.leafName, unix.AT_REMOVEDIR)
+	fs.recordTombstone(realObject.leafName, realObject.leaf)
+	return nil
 }
 
 func (fs *realFS) openRoot() (int, error) {
@@ -569,12 +557,21 @@ func isMissingObjectErr(err error) bool {
 		errors.Is(err, unix.ENOTDIR)
 }
 
-func (fs *realFS) removeNameIfMatches(rootfd int, name string, expected ObjectIdentity) {
+func (fs *realFS) recordTombstoneIfNameMatches(rootfd int, name string, expected ObjectIdentity) {
 	current, err := identityAt(rootfd, name)
 	if err != nil || !expected.durableEqual(current) {
 		return
 	}
-	_ = unix.Unlinkat(rootfd, name, unix.AT_REMOVEDIR)
+	fs.recordTombstone(name, expected)
+}
+
+func (fs *realFS) recordTombstone(name string, identity ObjectIdentity) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.tombstones == nil {
+		fs.tombstones = map[string]ObjectIdentity{}
+	}
+	fs.tombstones[name] = identity
 }
 
 func (fs *realFS) establishExclusiveDelegation(rootfd int) (bool, error) {

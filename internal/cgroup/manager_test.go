@@ -174,7 +174,7 @@ func TestMembershipMapsPopulatedEmptyAndUnknown(t *testing.T) {
 	}
 }
 
-func TestKillEmptiesThenRemoveFences(t *testing.T) {
+func TestKillEmptiesThenRemoveTombstonesAfterEmptyProof(t *testing.T) {
 	fs := newFakeCgroupFS()
 	manager := newFakeManager(fs, leafSequence("cg-kill"))
 	capability := acquireCapability(t, manager)
@@ -190,8 +190,14 @@ func TestKillEmptiesThenRemoveFences(t *testing.T) {
 	if err := capability.Remove(context.Background()); err != nil {
 		t.Fatalf("Remove() after empty error = %v", err)
 	}
-	if fs.exists(capability.retainedID) {
-		t.Fatalf("leaf still exists after remove")
+	if !fs.exists(capability.retainedID) {
+		t.Fatalf("empty leaf was unlinked; want tombstone left behind")
+	}
+	if !fs.tombstoned(capability.retainedID) {
+		t.Fatalf("empty leaf was not recorded as a tombstone")
+	}
+	if fs.removeCalls != 0 {
+		t.Fatalf("remove calls = %d, want 0", fs.removeCalls)
 	}
 }
 
@@ -210,33 +216,64 @@ func TestRemoveBeforeEmptyRefused(t *testing.T) {
 	}
 }
 
-func TestRemoveFailsClosedWhenLeafRecreatedBetweenFinalVerifyAndRmdir(t *testing.T) {
+func TestRemoveTombstonesWhenEmptyReplacementAppearsAfterFinalVerify(t *testing.T) {
 	fs := newFakeCgroupFS()
 	manager := newFakeManager(fs, leafSequence("cg-remove-race"))
 	capability := acquireCapability(t, manager)
 	recreated := false
-	fs.onUnlink = func(name string) {
+	fs.onAfterFinalVerify = func(name string) {
 		if recreated {
 			return
 		}
 		recreated = true
 		fs.recreate(name)
-		fs.setProcs(name, 999)
 	}
 
 	err := capability.Remove(context.Background())
-	if !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("Remove() after recreate error = %v, want ErrUnsupported", err)
+	if err != nil {
+		t.Fatalf("Remove() after empty replacement error = %v", err)
 	}
 	if fs.removeCalls != 0 {
 		t.Fatalf("remove calls = %d, want 0", fs.removeCalls)
+	}
+	if !fs.tombstoned(capability.retainedID) {
+		t.Fatalf("held empty leaf was not recorded as a tombstone")
 	}
 	leaf, err := fs.leaf(capability.retainedID)
 	if err != nil {
 		t.Fatalf("replacement leaf missing: %v", err)
 	}
-	if _, ok := leaf.procs[999]; !ok {
-		t.Fatalf("replacement leaf procs = %v, want untouched pid 999", leaf.procs)
+	if leaf.populated() {
+		t.Fatalf("replacement leaf populated = true, want empty")
+	}
+}
+
+func TestFakeUnlinkRemovesCurrentNameTarget(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-unlink-name"))
+	capability := acquireCapability(t, manager)
+	name := capability.leafName
+	heldLeaf := capability.object.(*fakeCgroupObject).leafRef
+
+	fs.recreate(name)
+	replacement, err := fs.leaf(name)
+	if err != nil {
+		t.Fatalf("replacement leaf missing: %v", err)
+	}
+	if replacement == heldLeaf {
+		t.Fatalf("replacement reused held leaf")
+	}
+	if err := fs.unlinkName(name); err != nil {
+		t.Fatalf("unlinkName() error = %v", err)
+	}
+	if fs.exists(name) {
+		t.Fatalf("current name target still exists after unlink")
+	}
+	if !heldLeaf.removed {
+		t.Fatalf("held leaf should have been detached by recreate")
+	}
+	if !replacement.removed {
+		t.Fatalf("replacement was not removed by name-based unlink")
 	}
 }
 
@@ -501,8 +538,8 @@ func TestProbeClassifiesStrictSupportAndUnsupportedConditions(t *testing.T) {
 		if !support.Strict() {
 			t.Fatalf("Probe() support = %#v, want strict supported", support)
 		}
-		if fs.killWrites != 2 || fs.removeCalls != 1 {
-			t.Fatalf("probe kill/remove calls = %d/%d, want 2/1", fs.killWrites, fs.removeCalls)
+		if fs.killWrites != 2 || fs.removeCalls != 0 || fs.tombstoneCalls != 1 {
+			t.Fatalf("probe kill/remove/tombstone calls = %d/%d/%d, want 2/0/1", fs.killWrites, fs.removeCalls, fs.tombstoneCalls)
 		}
 	})
 
@@ -667,20 +704,24 @@ type fakeCgroupFS struct {
 	rootErr             error
 	lease               *fakeRootLease
 	leaves              map[string]*fakeLeaf
+	tombstones          map[string]ObjectIdentity
 	nextInode           uint64
 	nextGeneration      uint64
 	generationAvailable bool
+	nameCleanupAllowed  bool
 	onAfterRootIdentity func()
 	onPathStat          func(string)
 	onPathHandle        func(string)
 	onOpen              func(string)
 	onFinalVerify       func(string)
+	onAfterFinalVerify  func(string)
 	onUnlink            func(string)
 	onBeforeReadProcs   func(string)
 	onReadProcs         func(string, []int)
 	onBeforeWriteKill   func(string)
 	killWrites          int
 	removeCalls         int
+	tombstoneCalls      int
 }
 
 type fakeRootLease struct {
@@ -748,6 +789,7 @@ func newFakeCgroupFS() *fakeCgroupFS {
 			RootObject:        ObjectIdentity{Device: 1, Inode: 2, Generation: "root-1"},
 		},
 		leaves:              map[string]*fakeLeaf{},
+		tombstones:          map[string]ObjectIdentity{},
 		nextInode:           10,
 		nextGeneration:      10,
 		generationAvailable: true,
@@ -792,11 +834,11 @@ func (fs *fakeCgroupFS) CreateChild(_ context.Context, id string) (cgroupObject,
 	}
 	object, err := fs.openObject(id)
 	if err != nil {
-		fs.removeNameIfMatches(id, createdLeaf)
+		fs.recordTombstoneIfNameMatches(id, createdLeaf)
 		return nil, err
 	}
 	if !createdLeaf.durableEqual(object.leaf) || !leaf.object.durableEqual(object.leaf) {
-		fs.removeNameIfMatches(id, createdLeaf)
+		fs.recordTombstoneIfNameMatches(id, createdLeaf)
 		return nil, fmt.Errorf("%w: created cgroup leaf was replaced before open", ErrUnsupported)
 	}
 	return object, nil
@@ -935,7 +977,7 @@ func (fs *fakeCgroupFS) ReadFreeze(_ context.Context, object cgroupObject) (Free
 }
 
 func (fs *fakeCgroupFS) Remove(_ context.Context, object cgroupObject) error {
-	leaf, err := fs.leafForObject(object)
+	leaf, err := fs.heldLeafForObject(object)
 	if err != nil {
 		return err
 	}
@@ -947,19 +989,20 @@ func (fs *fakeCgroupFS) Remove(_ context.Context, object cgroupObject) error {
 	}
 	currentIdentity, err := fs.identityAt(object.LeafName())
 	if err != nil || !object.LeafObject().durableEqual(currentIdentity) {
-		return fmt.Errorf("%w: cgroup object is no longer held", ErrUnsupported)
+		fs.recordTombstone(object.LeafName(), object.LeafObject())
+		return nil
+	}
+	if fs.onAfterFinalVerify != nil {
+		fs.onAfterFinalVerify(object.LeafName())
+	}
+	if !fs.nameCleanupAllowed {
+		fs.recordTombstone(object.LeafName(), object.LeafObject())
+		return nil
 	}
 	if fs.onUnlink != nil {
 		fs.onUnlink(object.LeafName())
 	}
-	current, ok := fs.leaves[object.LeafName()]
-	if !ok || current.removed || current != leaf || !leaf.object.durableEqual(object.LeafObject()) {
-		return fmt.Errorf("%w: cgroup object is no longer held", ErrUnsupported)
-	}
-	fs.removeCalls++
-	delete(fs.leaves, object.LeafName())
-	leaf.removed = true
-	return nil
+	return fs.unlinkName(object.LeafName())
 }
 
 func (fs *fakeCgroupFS) mustCreate(id string) {
@@ -971,6 +1014,11 @@ func (fs *fakeCgroupFS) mustCreate(id string) {
 func (fs *fakeCgroupFS) exists(id string) bool {
 	leaf, ok := fs.leaves[fs.leafName(id)]
 	return ok && !leaf.removed
+}
+
+func (fs *fakeCgroupFS) tombstoned(id string) bool {
+	_, ok := fs.tombstones[fs.leafName(id)]
+	return ok
 }
 
 func (fs *fakeCgroupFS) setProcs(id string, pids ...int) {
@@ -1142,13 +1190,45 @@ func (fs *fakeCgroupFS) leafForObject(object cgroupObject) (*fakeLeaf, error) {
 	return current, nil
 }
 
-func (fs *fakeCgroupFS) removeNameIfMatches(name string, expected ObjectIdentity) {
+func (fs *fakeCgroupFS) heldLeafForObject(object cgroupObject) (*fakeLeaf, error) {
+	fakeObject, ok := object.(*fakeCgroupObject)
+	if !ok || fakeObject == nil || fakeObject.closed || fakeObject.leafRef == nil || fakeObject.leafRef.removed {
+		return nil, fmt.Errorf("%w: invalid cgroup object", ErrInvalid)
+	}
+	root := fs.root.RootObject
+	leaf := fakeObject.leafRef.object
+	if !fs.generationAvailable {
+		root.Generation = ""
+		leaf.Generation = ""
+	}
+	if !fakeObject.root.durableEqual(root) || !fakeObject.leaf.durableEqual(leaf) {
+		return nil, fmt.Errorf("%w: stale cgroup object", ErrUnsupported)
+	}
+	return fakeObject.leafRef, nil
+}
+
+func (fs *fakeCgroupFS) recordTombstoneIfNameMatches(name string, expected ObjectIdentity) {
 	current, ok := fs.leaves[name]
 	if !ok || current.removed || !expected.durableEqual(current.object) {
 		return
 	}
+	fs.recordTombstone(name, expected)
+}
+
+func (fs *fakeCgroupFS) recordTombstone(name string, identity ObjectIdentity) {
+	fs.tombstoneCalls++
+	fs.tombstones[name] = identity
+}
+
+func (fs *fakeCgroupFS) unlinkName(name string) error {
+	current, ok := fs.leaves[name]
+	if !ok || current.removed {
+		return nil
+	}
+	fs.removeCalls++
 	current.removed = true
 	delete(fs.leaves, name)
+	return nil
 }
 
 func (leaf *fakeLeaf) populated() bool {
