@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -48,6 +49,7 @@ type RootIdentity struct {
 	Unified           bool
 	ReadOnly          bool
 	Delegated         bool
+	Exclusive         bool
 	Threaded          bool
 	KillAvailable     bool
 	FreezeAvailable   bool
@@ -92,11 +94,26 @@ type ObjectIdentity struct {
 func (identity ObjectIdentity) Equal(other ObjectIdentity) bool {
 	return identity.Device == other.Device &&
 		identity.Inode == other.Inode &&
-		(identity.Generation == "" || other.Generation == "" || identity.Generation == other.Generation)
+		identity.Generation == other.Generation
 }
 
 func (identity ObjectIdentity) valid() bool {
 	return identity.Device != 0 && identity.Inode != 0
+}
+
+func (identity ObjectIdentity) durable() bool {
+	return identity.valid() && identity.Generation != ""
+}
+
+func (identity ObjectIdentity) sameLiveObject(other ObjectIdentity) bool {
+	return identity.valid() &&
+		other.valid() &&
+		identity.Device == other.Device &&
+		identity.Inode == other.Inode
+}
+
+func (identity ObjectIdentity) durableEqual(other ObjectIdentity) bool {
+	return identity.durable() && other.durable() && identity.Equal(other)
 }
 
 func (identity ObjectIdentity) stableToken() string {
@@ -202,6 +219,8 @@ type Manager struct {
 	newLeaf    func() string
 	terminator processTerminator
 	spawnProbe probeSpawner
+	mu         sync.Mutex
+	issuedLeaf map[string]struct{}
 }
 
 func newManagerWithFS(fs cgroupFS, options managerOptions) *Manager {
@@ -219,6 +238,7 @@ func newManagerWithFS(fs cgroupFS, options managerOptions) *Manager {
 		newLeaf:    options.newLeaf,
 		terminator: options.terminator,
 		spawnProbe: options.spawnProbe,
+		issuedLeaf: make(map[string]struct{}),
 	}
 }
 
@@ -307,10 +327,12 @@ func strictSupportError(root RootIdentity) error {
 		return fmt.Errorf("%w: cgroupfs is read-only", ErrUnsupported)
 	case !root.Delegated:
 		return fmt.Errorf("%w: delegated writable cgroup root is required", ErrUnsupported)
+	case !root.Exclusive:
+		return fmt.Errorf("%w: exclusive delegated cgroup root ownership is required", ErrUnsupported)
 	case root.Threaded:
 		return fmt.Errorf("%w: threaded cgroups are not strict containment", ErrUnsupported)
-	case !root.RootObject.valid():
-		return fmt.Errorf("%w: delegated cgroup root object identity is required", ErrUnsupported)
+	case !root.RootObject.durable():
+		return fmt.Errorf("%w: delegated cgroup root durable identity is required", ErrUnsupported)
 	default:
 		return nil
 	}
@@ -345,8 +367,8 @@ func newRetainedID(leafName string, object cgroupObject) (string, error) {
 	}
 	root := object.RootObject()
 	leaf := object.LeafObject()
-	if !root.valid() || !leaf.valid() {
-		return "", fmt.Errorf("%w: cgroup object identity is incomplete", ErrInvalid)
+	if !root.durable() || !leaf.durable() {
+		return "", fmt.Errorf("%w: cgroup durable object identity is required", ErrUnsupported)
 	}
 	encodedLeaf := base64.RawURLEncoding.EncodeToString([]byte(leafName))
 	retainedID := strings.Join([]string{
@@ -390,8 +412,8 @@ func (descriptor retainedDescriptor) matches(object cgroupObject) bool {
 		return false
 	}
 	return descriptor.leafName == object.LeafName() &&
-		descriptor.root.Equal(object.RootObject()) &&
-		descriptor.leaf.Equal(object.LeafObject())
+		descriptor.root.durableEqual(object.RootObject()) &&
+		descriptor.leaf.durableEqual(object.LeafObject())
 }
 
 func (manager *Manager) AcquireRetainedGroup(ctx context.Context, target model.GroupRef, _ time.Time) (containment.RetainedGroupCapability, error) {
@@ -429,6 +451,9 @@ func (manager *Manager) create(ctx context.Context, root RootIdentity) (*Capabil
 		if err := validateRetainedID(retainedID); err != nil {
 			return nil, err
 		}
+		if !manager.reserveLeaf(retainedID) {
+			continue
+		}
 		object, err := manager.fs.CreateChild(ctx, retainedID)
 		if err != nil {
 			if errors.Is(err, ErrInvalid) {
@@ -451,6 +476,16 @@ func (manager *Manager) create(ctx context.Context, root RootIdentity) (*Capabil
 		}, nil
 	}
 	return nil, fmt.Errorf("%w: could not allocate unique cgroup leaf", ErrUnsupported)
+}
+
+func (manager *Manager) reserveLeaf(leafName string) bool {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if _, ok := manager.issuedLeaf[leafName]; ok {
+		return false
+	}
+	manager.issuedLeaf[leafName] = struct{}{}
+	return true
 }
 
 func (manager *Manager) open(ctx context.Context, root RootIdentity, retainedID string) (*Capability, error) {

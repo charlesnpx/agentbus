@@ -38,6 +38,41 @@ func TestAcquireCreatesUniqueLeaf(t *testing.T) {
 	}
 }
 
+func TestAcquireNeverReusesLeafNameWithinManagerLifetime(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-reused", "cg-reused"))
+
+	first := acquireCapability(t, manager)
+	if err := first.Remove(context.Background()); err != nil {
+		t.Fatalf("Remove() first leaf error = %v", err)
+	}
+	second, err := manager.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now())
+	if second != nil || !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("AcquireRetainedGroup() reused leaf = %T, %v; want nil ErrUnsupported", second, err)
+	}
+}
+
+func TestAcquireFailsClosedWhenLeafRecreatedBetweenMkdirAndOpen(t *testing.T) {
+	fs := newFakeCgroupFS()
+	recreated := false
+	fs.onAfterMkdirBeforeOpen = func(name string) {
+		if recreated {
+			return
+		}
+		recreated = true
+		fs.recreate(name)
+	}
+	manager := newFakeManager(fs, leafSequence("cg-acquire-race"))
+
+	capability, err := manager.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now())
+	if capability != nil || !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("AcquireRetainedGroup() after recreate = %T, %v; want nil ErrUnsupported", capability, err)
+	}
+	if !fs.exists("cg-acquire-race") {
+		t.Fatalf("replacement leaf was removed during failed acquisition")
+	}
+}
+
 func TestMembershipMapsPopulatedEmptyAndUnknown(t *testing.T) {
 	fs := newFakeCgroupFS()
 	manager := newFakeManager(fs, leafSequence("cg-membership"))
@@ -99,6 +134,36 @@ func TestRemoveBeforeEmptyRefused(t *testing.T) {
 	}
 }
 
+func TestRemoveFailsClosedWhenLeafRecreatedBeforeRmdir(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-remove-race"))
+	capability := acquireCapability(t, manager)
+	recreated := false
+	fs.onBeforeRemoveFinalVerify = func(name string) {
+		if recreated {
+			return
+		}
+		recreated = true
+		fs.recreate(name)
+		fs.setProcs(name, 999)
+	}
+
+	err := capability.Remove(context.Background())
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("Remove() after recreate error = %v, want ErrUnsupported", err)
+	}
+	if fs.removeCalls != 0 {
+		t.Fatalf("remove calls = %d, want 0", fs.removeCalls)
+	}
+	leaf, err := fs.leaf(capability.retainedID)
+	if err != nil {
+		t.Fatalf("replacement leaf missing: %v", err)
+	}
+	if _, ok := leaf.procs[999]; !ok {
+		t.Fatalf("replacement leaf procs = %v, want untouched pid 999", leaf.procs)
+	}
+}
+
 func TestRecreatedLeafInvalidatesStillHeld(t *testing.T) {
 	fs := newFakeCgroupFS()
 	manager := newFakeManager(fs, leafSequence("cg-recreated"))
@@ -128,6 +193,43 @@ func TestOpenRejectsRecreatedLeafDurableIdentityMismatch(t *testing.T) {
 	reopened, err := manager.AcquireRetainedGroup(context.Background(), model.GroupRef{RetainedID: retainedID}, time.Now())
 	if reopened != nil || !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("AcquireRetainedGroup() after recreate = %T, %v; want nil ErrUnsupported", reopened, err)
+	}
+}
+
+func TestOpenRejectsSameNameInodeReuseDurableIdentityMismatch(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-open-inode-reuse"))
+	capability := acquireCapability(t, manager)
+	retainedID := capability.retainedID
+	descriptor, err := parseRetainedID(retainedID)
+	if err != nil {
+		t.Fatalf("parse retained id error = %v", err)
+	}
+	fs.recreateReusingInode(retainedID)
+	replacement, err := fs.leaf(retainedID)
+	if err != nil {
+		t.Fatalf("replacement leaf missing: %v", err)
+	}
+	if replacement.object.Inode != descriptor.leaf.Inode || replacement.object.Generation == descriptor.leaf.Generation {
+		t.Fatalf("replacement identity = %#v, want same inode and different generation from %#v", replacement.object, descriptor.leaf)
+	}
+
+	reopened, err := manager.AcquireRetainedGroup(context.Background(), model.GroupRef{RetainedID: retainedID}, time.Now())
+	if reopened != nil || !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("AcquireRetainedGroup() after inode reuse = %T, %v; want nil ErrUnsupported", reopened, err)
+	}
+}
+
+func TestOpenRejectsGenerationUnavailable(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-open-no-generation"))
+	capability := acquireCapability(t, manager)
+	retainedID := capability.retainedID
+	fs.generationAvailable = false
+
+	reopened, err := manager.AcquireRetainedGroup(context.Background(), model.GroupRef{RetainedID: retainedID}, time.Now())
+	if reopened != nil || !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("AcquireRetainedGroup() without generation = %T, %v; want nil ErrUnsupported", reopened, err)
 	}
 }
 
@@ -287,6 +389,12 @@ func TestProbeClassifiesStrictSupportAndUnsupportedConditions(t *testing.T) {
 			name: "no_delegation",
 			mutate: func(root *RootIdentity, _ *fakeCgroupFS) {
 				root.Delegated = false
+			},
+		},
+		{
+			name: "exclusive_delegation_not_established",
+			mutate: func(root *RootIdentity, _ *fakeCgroupFS) {
+				root.Exclusive = false
 			},
 		},
 		{
@@ -473,15 +581,19 @@ func (terminator *recordingTerminator) Close(handle processHandle) error {
 }
 
 type fakeCgroupFS struct {
-	root              RootIdentity
-	rootErr           error
-	leaves            map[string]*fakeLeaf
-	nextInode         uint64
-	onBeforeReadProcs func(string)
-	onReadProcs       func(string, []int)
-	onBeforeWriteKill func(string)
-	killWrites        int
-	removeCalls       int
+	root                      RootIdentity
+	rootErr                   error
+	leaves                    map[string]*fakeLeaf
+	nextInode                 uint64
+	nextGeneration            uint64
+	generationAvailable       bool
+	onAfterMkdirBeforeOpen    func(string)
+	onBeforeReadProcs         func(string)
+	onReadProcs               func(string, []int)
+	onBeforeWriteKill         func(string)
+	onBeforeRemoveFinalVerify func(string)
+	killWrites                int
+	removeCalls               int
 }
 
 type fakeLeaf struct {
@@ -539,12 +651,15 @@ func newFakeCgroupFS() *fakeCgroupFS {
 			HierarchyID:       "hierarchy-1",
 			Unified:           true,
 			Delegated:         true,
+			Exclusive:         true,
 			KillAvailable:     true,
 			FreezeAvailable:   true,
 			RootObject:        ObjectIdentity{Device: 1, Inode: 2, Generation: "root-1"},
 		},
-		leaves:    map[string]*fakeLeaf{},
-		nextInode: 10,
+		leaves:              map[string]*fakeLeaf{},
+		nextInode:           10,
+		nextGeneration:      10,
+		generationAvailable: true,
 	}
 }
 
@@ -552,7 +667,11 @@ func (fs *fakeCgroupFS) RootIdentity(context.Context) (RootIdentity, error) {
 	if fs.rootErr != nil {
 		return RootIdentity{}, fs.rootErr
 	}
-	return fs.root, nil
+	root := fs.root
+	if !fs.generationAvailable {
+		root.RootObject.Generation = ""
+	}
+	return root, nil
 }
 
 func (fs *fakeCgroupFS) CreateChild(_ context.Context, id string) (cgroupObject, error) {
@@ -564,7 +683,19 @@ func (fs *fakeCgroupFS) CreateChild(_ context.Context, id string) (cgroupObject,
 	}
 	leaf := fs.newLeaf()
 	fs.leaves[id] = leaf
-	return fs.objectFor(id, leaf), nil
+	if fs.onAfterMkdirBeforeOpen != nil {
+		fs.onAfterMkdirBeforeOpen(id)
+	}
+	current, ok := fs.leaves[id]
+	if !ok || current.removed {
+		return nil, fmt.Errorf("%w: created cgroup leaf is no longer named", ErrUnsupported)
+	}
+	object := fs.objectFor(id, current)
+	if !leaf.object.durableEqual(object.leaf) {
+		fs.removeNameIfMatches(id, leaf.object)
+		return nil, fmt.Errorf("%w: created cgroup leaf was replaced before open", ErrUnsupported)
+	}
+	return object, nil
 }
 
 func (fs *fakeCgroupFS) Open(_ context.Context, id string) (cgroupObject, error) {
@@ -701,7 +832,15 @@ func (fs *fakeCgroupFS) Remove(_ context.Context, object cgroupObject) error {
 	if leaf.populated() {
 		return ErrPopulated
 	}
+	if fs.onBeforeRemoveFinalVerify != nil {
+		fs.onBeforeRemoveFinalVerify(object.LeafName())
+	}
+	current, ok := fs.leaves[object.LeafName()]
+	if !ok || current.removed || current != leaf || !leaf.object.durableEqual(object.LeafObject()) {
+		return fmt.Errorf("%w: cgroup object is no longer held", ErrUnsupported)
+	}
 	fs.removeCalls++
+	delete(fs.leaves, object.LeafName())
 	leaf.removed = true
 	return nil
 }
@@ -763,12 +902,22 @@ func (fs *fakeCgroupFS) setEventsErr(id string, err error) {
 }
 
 func (fs *fakeCgroupFS) recreate(id string) {
-	leaf, err := fs.leaf(id)
+	name := fs.leafName(id)
+	if leaf, ok := fs.leaves[name]; ok {
+		leaf.removed = true
+	}
+	fs.leaves[name] = fs.newLeaf()
+}
+
+func (fs *fakeCgroupFS) recreateReusingInode(id string) {
+	name := fs.leafName(id)
+	leaf, err := fs.leaf(name)
 	if err != nil {
 		panic(err)
 	}
+	inode := leaf.object.Inode
 	leaf.removed = true
-	fs.leaves[fs.leafName(id)] = fs.newLeaf()
+	fs.leaves[name] = fs.newLeafWithInode(inode)
 }
 
 func (fs *fakeCgroupFS) leaf(id string) (*fakeLeaf, error) {
@@ -793,8 +942,13 @@ func (fs *fakeCgroupFS) leafName(id string) string {
 
 func (fs *fakeCgroupFS) newLeaf() *fakeLeaf {
 	fs.nextInode++
+	return fs.newLeafWithInode(fs.nextInode)
+}
+
+func (fs *fakeCgroupFS) newLeafWithInode(inode uint64) *fakeLeaf {
+	fs.nextGeneration++
 	return &fakeLeaf{
-		object:   ObjectIdentity{Device: 1, Inode: fs.nextInode, Generation: fmt.Sprintf("gen-%d", fs.nextInode)},
+		object:   ObjectIdentity{Device: 1, Inode: inode, Generation: fmt.Sprintf("gen-%d", fs.nextGeneration)},
 		procs:    map[int]struct{}{},
 		children: map[string]map[int]struct{}{},
 		freeze:   FreezeThawed,
@@ -802,10 +956,16 @@ func (fs *fakeCgroupFS) newLeaf() *fakeLeaf {
 }
 
 func (fs *fakeCgroupFS) objectFor(name string, leaf *fakeLeaf) *fakeCgroupObject {
+	root := fs.root.RootObject
+	object := leaf.object
+	if !fs.generationAvailable {
+		root.Generation = ""
+		object.Generation = ""
+	}
 	return &fakeCgroupObject{
 		name:    name,
-		root:    fs.root.RootObject,
-		leaf:    leaf.object,
+		root:    root,
+		leaf:    object,
 		leafRef: leaf,
 	}
 }
@@ -819,10 +979,25 @@ func (fs *fakeCgroupFS) leafForObject(object cgroupObject) (*fakeLeaf, error) {
 	if !ok || current.removed || fakeObject.leafRef.removed || current != fakeObject.leafRef {
 		return nil, fmt.Errorf("%w: stale cgroup object", ErrUnsupported)
 	}
-	if !fakeObject.root.Equal(fs.root.RootObject) || !fakeObject.leaf.Equal(current.object) {
+	root := fs.root.RootObject
+	leaf := current.object
+	if !fs.generationAvailable {
+		root.Generation = ""
+		leaf.Generation = ""
+	}
+	if !fakeObject.root.durableEqual(root) || !fakeObject.leaf.durableEqual(leaf) {
 		return nil, fmt.Errorf("%w: stale cgroup object", ErrUnsupported)
 	}
 	return current, nil
+}
+
+func (fs *fakeCgroupFS) removeNameIfMatches(name string, expected ObjectIdentity) {
+	current, ok := fs.leaves[name]
+	if !ok || current.removed || !expected.durableEqual(current.object) {
+		return
+	}
+	current.removed = true
+	delete(fs.leaves, name)
 }
 
 func (leaf *fakeLeaf) populated() bool {
