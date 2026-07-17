@@ -149,6 +149,40 @@ func TestExclusiveLeaseAllowsOnlyOneManager(t *testing.T) {
 	}
 }
 
+func TestManagerCloseReleasesExclusiveRootLease(t *testing.T) {
+	lease := &fakeRootLease{}
+	firstFS := newFakeCgroupFS()
+	firstFS.lease = lease
+	secondFS := newFakeCgroupFS()
+	secondFS.lease = lease
+	first := newFakeManager(firstFS, leafSequence("cg-first"))
+	second := newFakeManager(secondFS, leafSequence("cg-second"))
+
+	capability := acquireCapability(t, first)
+	if _, err := second.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now()); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("second AcquireRetainedGroup() before close error = %v, want ErrUnsupported", err)
+	}
+	if err := capability.Release(); err != nil {
+		t.Fatalf("Release() error = %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if firstFS.closeCalls != 1 {
+		t.Fatalf("first fs close calls = %d, want 1", firstFS.closeCalls)
+	}
+	if lease.holder != nil {
+		t.Fatalf("lease holder after Close() = %p, want nil", lease.holder)
+	}
+	secondCapability, err := second.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now())
+	if err != nil {
+		t.Fatalf("second AcquireRetainedGroup() after close error = %v", err)
+	}
+	if secondCapability == nil {
+		t.Fatalf("second AcquireRetainedGroup() after close capability is nil")
+	}
+}
+
 func TestMembershipMapsPopulatedEmptyAndUnknown(t *testing.T) {
 	fs := newFakeCgroupFS()
 	manager := newFakeManager(fs, leafSequence("cg-membership"))
@@ -171,6 +205,50 @@ func TestMembershipMapsPopulatedEmptyAndUnknown(t *testing.T) {
 	}
 	if got != containment.RetainedMembershipUnknown {
 		t.Fatalf("membership on events read error = %v, want unknown", got)
+	}
+}
+
+func TestPlacePIDWritesHeldObjectBeforeRelease(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-place"))
+	capability := acquireCapability(t, manager)
+
+	if err := capability.PlacePID(context.Background(), 1234); err != nil {
+		t.Fatalf("PlacePID() error = %v", err)
+	}
+
+	pids, err := capability.fs.ReadProcs(context.Background(), capability.object)
+	if err != nil {
+		t.Fatalf("ReadProcs() error = %v", err)
+	}
+	if !slices.Contains(pids, 1234) {
+		t.Fatalf("placed pids = %v, want 1234", pids)
+	}
+	if got := membership(t, capability); got != containment.RetainedMembershipPresent {
+		t.Fatalf("membership after PlacePID() = %v, want present", got)
+	}
+}
+
+func TestPlacePIDWritesHeldObjectAfterNameReplacement(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-place-replaced"))
+	capability := acquireCapability(t, manager)
+	heldLeaf := capability.object.(*fakeCgroupObject).leafRef
+	fs.replaceNameTarget(capability.retainedID)
+
+	if err := capability.PlacePID(context.Background(), 4321); err != nil {
+		t.Fatalf("PlacePID() error = %v", err)
+	}
+
+	if _, ok := heldLeaf.procs[4321]; !ok {
+		t.Fatalf("held leaf procs = %v, want placed pid", heldLeaf.procs)
+	}
+	replacement, err := fs.leaf(capability.retainedID)
+	if err != nil {
+		t.Fatalf("replacement leaf missing: %v", err)
+	}
+	if _, ok := replacement.procs[4321]; ok {
+		t.Fatalf("replacement leaf received placed pid")
 	}
 }
 
@@ -256,6 +334,26 @@ func TestKillEmptiesThenRemoveTombstonesAfterEmptyProof(t *testing.T) {
 	}
 	if fs.removeCalls != 0 {
 		t.Fatalf("remove calls = %d, want 0", fs.removeCalls)
+	}
+}
+
+func TestRemoveRetiresEmptyLeafWhenCurrentNameStillMatches(t *testing.T) {
+	fs := newFakeCgroupFS()
+	fs.nameCleanupAllowed = true
+	manager := newFakeManager(fs, leafSequence("cg-retire"))
+	capability := acquireCapability(t, manager)
+
+	if got := membership(t, capability); got != containment.RetainedMembershipEmpty {
+		t.Fatalf("membership before Remove() = %v, want empty", got)
+	}
+	if err := capability.Remove(context.Background()); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if fs.exists(capability.retainedID) {
+		t.Fatalf("empty leaf still exists after Remove()")
+	}
+	if fs.removeCalls != 1 {
+		t.Fatalf("remove calls = %d, want 1", fs.removeCalls)
 	}
 }
 
@@ -792,6 +890,7 @@ type fakeCgroupFS struct {
 	killWrites          int
 	removeCalls         int
 	tombstoneCalls      int
+	closeCalls          int
 }
 
 type fakeRootLease struct {
@@ -887,6 +986,14 @@ func (fs *fakeCgroupFS) RootIdentity(context.Context) (RootIdentity, error) {
 		fs.onAfterRootIdentity()
 	}
 	return root, nil
+}
+
+func (fs *fakeCgroupFS) Close() error {
+	fs.closeCalls++
+	if fs.lease != nil && fs.lease.holder == fs {
+		fs.lease.holder = nil
+	}
+	return nil
 }
 
 func (fs *fakeCgroupFS) CreateChild(_ context.Context, id string) (cgroupObject, error) {

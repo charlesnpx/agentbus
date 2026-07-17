@@ -39,6 +39,8 @@ const (
 	nativeHelperMonitor              = "monitor"
 	nativeHelperAgentbusGOCACHE      = "GOCACHE=/tmp/abd-gocache"
 	nativeHelperAgentbusMOD          = "GOMODCACHE=/tmp/abd-gomodcache"
+	nativeHelperRetainedNoopMonitor  = "AGENTBUS_NATIVE_RETAINED_NOOP_MONITOR"
+	nativeCgroupConformanceEnv       = "AGENTBUS_CGROUP_CONFORMANCE"
 )
 
 var (
@@ -46,6 +48,17 @@ var (
 	nativeAgentbusBuildPath string
 	nativeAgentbusBuildErr  error
 )
+
+func requireRealNativeContainmentOrSkip(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return
+	}
+	if os.Getenv(nativeCgroupConformanceEnv) == "1" {
+		return
+	}
+	t.Skip("real cgroup conformance deferred to the privileged-container unit; set AGENTBUS_CGROUP_CONFORMANCE=1 to run")
+}
 
 func TestNativeHelperSimpleProcess(t *testing.T) {
 	if os.Getenv(nativeHelperEnv) != nativeHelperSimple {
@@ -103,6 +116,7 @@ func TestNativeHelperMonitorProcess(t *testing.T) {
 }
 
 func TestNativeCustodianLaunchesParkedBackendAndObservesExit(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -139,6 +153,7 @@ func TestNativeCustodianLaunchesParkedBackendAndObservesExit(t *testing.T) {
 }
 
 func TestNativeWaitReturnsCachedResultAfterFinalization(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -167,6 +182,7 @@ func TestNativeWaitReturnsCachedResultAfterFinalization(t *testing.T) {
 }
 
 func TestNativeWaitIgnoresCallerClosedStreamsAndSharesFinalizedOutcome(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -208,6 +224,7 @@ func TestNativeWaitIgnoresCallerClosedStreamsAndSharesFinalizedOutcome(t *testin
 }
 
 func TestNativeContainAndVerifyKillsTermIgnoringGrandchild(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -239,6 +256,7 @@ func TestNativeContainAndVerifyKillsTermIgnoringGrandchild(t *testing.T) {
 }
 
 func TestNativeContainAndVerifyIgnoresCallerClosedStreamsAndSharesFinalizedOutcome(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -275,6 +293,7 @@ func TestNativeContainAndVerifyIgnoresCallerClosedStreamsAndSharesFinalizedOutco
 }
 
 func TestNativeZombieOnlyGroupIsUnprovableUntilOwnerReaps(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	params := defaultNativeTestParams()
 	params.PollTimeout = 100 * time.Millisecond
 	params.PollInterval = 20 * time.Millisecond
@@ -298,7 +317,7 @@ func TestNativeZombieOnlyGroupIsUnprovableUntilOwnerReaps(t *testing.T) {
 		t.Fatal("leader was reaped before owner finalization")
 	}
 
-	outcome := containPhysical(ctx, running.Ref(), params, running.leader)
+	outcome := containPhysical(ctx, running.Ref(), params, running.leader, nil)
 	if outcome.Absent() {
 		t.Fatalf("containPhysical zombie-only outcome = %+v, want Unprovable before owner reap", outcome)
 	}
@@ -313,6 +332,7 @@ func TestNativeZombieOnlyGroupIsUnprovableUntilOwnerReaps(t *testing.T) {
 }
 
 func TestNativeWaitAndContainShareSerializedFinalization(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -364,6 +384,7 @@ func TestNativeWaitAndContainShareSerializedFinalization(t *testing.T) {
 }
 
 func TestNativeContainAndVerifyUnprovableWhenLeaderReapedOutOfBand(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -404,6 +425,7 @@ func TestNativeContainAndVerifyUnprovableWhenLeaderReapedOutOfBand(t *testing.T)
 }
 
 func TestNativeMonitorDaemonEOFContainsTermIgnoringGrandchild(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -438,6 +460,7 @@ func TestNativeMonitorDaemonEOFContainsTermIgnoringGrandchild(t *testing.T) {
 }
 
 func TestNativeMonitorDaemonEOFDoesNotKillAfterLeaderReaped(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -485,6 +508,7 @@ func TestNativeMonitorDaemonEOFDoesNotKillAfterLeaderReaped(t *testing.T) {
 }
 
 func TestNativeMonitorDaemonEOFDoesNotKillUnreapedZombieLeader(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -538,6 +562,7 @@ func TestNativeMonitorDaemonEOFDoesNotKillUnreapedZombieLeader(t *testing.T) {
 }
 
 func TestNativePreReleaseHandleFailureAbortsUnreleasedWorker(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -560,6 +585,7 @@ func TestNativePreReleaseHandleFailureAbortsUnreleasedWorker(t *testing.T) {
 }
 
 func TestNativeCanceledWaitsDoNotLeakReapers(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
@@ -599,6 +625,7 @@ func TestNativeCanceledWaitsDoNotLeakReapers(t *testing.T) {
 }
 
 func TestNativeContainAndVerifyUnprovableWhenBoundsExpire(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	params := defaultNativeTestParams()
 	params.GracePeriod = 200 * time.Millisecond
 	native := newNativeCustodianForTest(t, params)
@@ -641,6 +668,7 @@ func TestNativeCustodianDoesNotMintProofAndProductionUnavailable(t *testing.T) {
 }
 
 func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing.T) {
+	requireRealNativeContainmentOrSkip(t)
 	exe := nativeTestBinaryPath(t)
 	native, support, err := NewNativeRuntime(NativeOptions{
 		AgentbusPath:      builtNativeAgentbusPath(t),
@@ -649,6 +677,7 @@ func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing
 		WorkerEnv:         append(os.Environ(), nativeHelperAgentbusGOCACHE, nativeHelperAgentbusMOD),
 		WorkerDir:         filepath.Dir(exe),
 	})
+	cleanupNativeCustodianForTest(t, native)
 	if err != nil {
 		t.Fatalf("NewNativeRuntime() error = %v", err)
 	}
@@ -663,6 +692,172 @@ func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing
 	}
 }
 
+func TestNativeRetainedWaitCompletesWithoutLeaderRetention(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	manager := newFakeNativeRetainedManager()
+	native := newNativeCustodianWithRetainedManagerForTest(t, defaultNativeTestParams(), manager)
+	spec, _ := nativeSimpleLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	if running.leader != nil {
+		t.Fatalf("retained backend leader = %T, want nil", running.leader)
+	}
+	if _, err := io.ReadAll(running.Stdout()); err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	manager.setMembership(running.Ref().RetainedID, containment.RetainedMembershipEmpty)
+
+	exit, err := running.Wait(ctx)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if !exit.Exited || exit.Code != 0 || exit.Signal != "" {
+		t.Fatalf("exit observation = %+v, want clean retained worker exit", exit)
+	}
+	leaf := manager.leafForRetainedID(t, running.Ref().RetainedID)
+	if leaf.removeCalls != 1 || !leaf.removed {
+		t.Fatalf("leaf remove calls/removed = %d/%t, want 1/true", leaf.removeCalls, leaf.removed)
+	}
+	if !running.finalOutcome.Absent() || running.finalOutcome.Method != model.QuiescenceAlreadyAbsent {
+		t.Fatalf("final outcome = %+v, want already-absent", running.finalOutcome)
+	}
+}
+
+func TestNativeRetainedWaitDoesNotFinalizeWhileRetainedObjectPopulated(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	manager := newFakeNativeRetainedManager()
+	native := newNativeCustodianWithRetainedManagerForTest(t, defaultNativeTestParams(), manager)
+	spec, _ := nativeSimpleLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	if _, err := io.ReadAll(running.Stdout()); err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	_, err = running.Wait(waitCtx)
+	waitCancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Wait() while retained object populated error = %v, want deadline", err)
+	}
+	if running.finalized {
+		t.Fatalf("running finalized while retained object was still populated: %+v", running.finalOutcome)
+	}
+	leaf := manager.leafForRetainedID(t, running.Ref().RetainedID)
+	if leaf.removeCalls != 0 || leaf.removed {
+		t.Fatalf("populated leaf remove calls/removed = %d/%t, want 0/false", leaf.removeCalls, leaf.removed)
+	}
+
+	manager.setMembership(running.Ref().RetainedID, containment.RetainedMembershipEmpty)
+	if _, err := running.Wait(ctx); err != nil {
+		t.Fatalf("cleanup Wait() after retained object empty error = %v", err)
+	}
+}
+
+func TestNativeRetainedSharedManagerSequentialAndConcurrentLaunches(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	manager := newFakeNativeRetainedManager()
+	var factoryCalls int
+	native := newNativeCustodianWithRetainedFactoryForTest(t, defaultNativeTestParams(), func() (containment.RetainedGroupObject, error) {
+		factoryCalls++
+		return manager, nil
+	})
+
+	first := launchAndWaitRetainedSimple(t, ctx, native, manager)
+	second := launchAndWaitRetainedSimple(t, ctx, native, manager)
+	if first.RetainedID == second.RetainedID {
+		t.Fatalf("sequential retained ids both = %q, want distinct leaves", first.RetainedID)
+	}
+
+	specA, _ := nativeSimpleLaunchSpec(t)
+	specB, _ := nativeSimpleLaunchSpec(t)
+	type launchResult struct {
+		group model.GroupRef
+		err   error
+	}
+	results := make(chan launchResult, 2)
+	for _, spec := range []NativeLaunchSpec{specA, specB} {
+		spec := spec
+		go func() {
+			running, err := native.Launch(ctx, spec)
+			if err != nil {
+				results <- launchResult{err: err}
+				return
+			}
+			defer cleanupNativeRunning(t, running)
+			if _, err := io.ReadAll(running.Stdout()); err != nil {
+				results <- launchResult{err: err}
+				return
+			}
+			manager.setMembership(running.Ref().RetainedID, containment.RetainedMembershipEmpty)
+			if _, err := running.Wait(ctx); err != nil {
+				results <- launchResult{err: err}
+				return
+			}
+			results <- launchResult{group: running.Ref()}
+		}()
+	}
+	concurrent := make([]model.GroupRef, 0, 2)
+	for i := 0; i < 2; i++ {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("concurrent retained launch %d error = %v", i, result.err)
+		}
+		concurrent = append(concurrent, result.group)
+	}
+	if concurrent[0].RetainedID == concurrent[1].RetainedID {
+		t.Fatalf("concurrent retained ids both = %q, want distinct leaves", concurrent[0].RetainedID)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("retained manager factory calls = %d, want 1", factoryCalls)
+	}
+	if err := native.Close(); err != nil {
+		t.Fatalf("NativeCustodian.Close() error = %v", err)
+	}
+	if manager.closeCalls != 1 {
+		t.Fatalf("retained manager close calls = %d, want 1", manager.closeCalls)
+	}
+}
+
+func TestNativeRetainedLeafRetiredAfterPlacePIDFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	manager := newFakeNativeRetainedManager()
+	manager.placeErr = errors.New("injected PlacePID failure")
+	native := newNativeCustodianWithRetainedManagerForTest(t, defaultNativeTestParams(), manager)
+	spec, _ := nativeSimpleLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err == nil {
+		cleanupNativeRunning(t, running)
+		t.Fatal("Launch() succeeded, want injected PlacePID failure")
+	}
+	if !strings.Contains(err.Error(), "injected PlacePID failure") {
+		t.Fatalf("Launch() error = %v, want injected PlacePID failure", err)
+	}
+	leaves := manager.leavesSnapshot()
+	if len(leaves) != 1 {
+		t.Fatalf("fake retained leaves = %d, want 1", len(leaves))
+	}
+	if leaves[0].removeCalls != 1 || !leaves[0].removed {
+		t.Fatalf("early-error leaf remove calls/removed = %d/%t, want 1/true", leaves[0].removeCalls, leaves[0].removed)
+	}
+	if err := native.Close(); err != nil {
+		t.Fatalf("NativeCustodian.Close() error = %v", err)
+	}
+}
+
 type nativeBackendResult struct {
 	PID            int `json:"pid"`
 	PGID           int `json:"pgid"`
@@ -672,18 +867,64 @@ type nativeBackendResult struct {
 
 func newNativeCustodianForTest(t *testing.T, params containment.Params) *NativeCustodian {
 	t.Helper()
+	native := newNativeCustodianWithRetainedFactoryForTest(t, params, nil)
+	cleanupNativeCustodianForTest(t, native)
+	return native
+}
+
+func newNativeCustodianWithRetainedManagerForTest(t *testing.T, params containment.Params, manager *fakeNativeRetainedManager) *NativeCustodian {
+	t.Helper()
+	return newNativeCustodianWithRetainedFactoryForTest(t, params, func() (containment.RetainedGroupObject, error) {
+		return manager, nil
+	})
+}
+
+func newNativeCustodianWithRetainedFactoryForTest(t *testing.T, params containment.Params, factory func() (containment.RetainedGroupObject, error)) *NativeCustodian {
+	t.Helper()
 	exe := nativeTestBinaryPath(t)
+	monitorCommand := nativeMonitorCommand(t)
+	if factory != nil {
+		monitorCommand.Env = append(monitorCommand.Env, nativeHelperRetainedNoopMonitor+"=1")
+	}
 	native, err := NewNativeCustodian(NativeOptions{
 		AgentbusPath:      builtNativeAgentbusPath(t),
-		MonitorCommand:    nativeMonitorCommand(t),
+		MonitorCommand:    monitorCommand,
 		ContainmentParams: params,
 		WorkerEnv:         append(os.Environ(), nativeHelperAgentbusGOCACHE, nativeHelperAgentbusMOD),
 		WorkerDir:         filepath.Dir(exe),
+		newRetainedGroup:  factory,
 	})
 	if err != nil {
 		t.Fatalf("NewNativeCustodian() error = %v", err)
 	}
 	return native
+}
+
+func cleanupNativeCustodianForTest(t *testing.T, native *NativeCustodian) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := native.Close(); err != nil {
+			t.Fatalf("NativeCustodian.Close() error = %v", err)
+		}
+	})
+}
+
+func launchAndWaitRetainedSimple(t *testing.T, ctx context.Context, native *NativeCustodian, manager *fakeNativeRetainedManager) model.GroupRef {
+	t.Helper()
+	spec, _ := nativeSimpleLaunchSpec(t)
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	if _, err := io.ReadAll(running.Stdout()); err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	manager.setMembership(running.Ref().RetainedID, containment.RetainedMembershipEmpty)
+	if _, err := running.Wait(ctx); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	return running.Ref()
 }
 
 func defaultNativeTestParams() containment.Params {
@@ -894,6 +1135,27 @@ func cleanupNativeRunning(t *testing.T, running *NativeRunningProcess) {
 	if running.leader != nil {
 		_ = running.leader.close()
 	}
+	cleanupUnfinalizedNativeRunning(t, running, group)
+}
+
+func cleanupUnfinalizedNativeRunning(t *testing.T, running *NativeRunningProcess, group model.GroupRef) {
+	t.Helper()
+	running.lifecycleMu.Lock()
+	finalized := running.finalized
+	running.lifecycleMu.Unlock()
+	if finalized {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if running.containment != nil {
+		if err := running.containment.close(ctx); err != nil {
+			t.Fatalf("cleanup containment close: %v", err)
+		}
+	}
+	if running.custodian != nil {
+		running.custodian.forget(group)
+	}
 }
 
 func closeNativeExposedStreamsForTest(t *testing.T, running *NativeRunningProcess) {
@@ -1033,6 +1295,230 @@ func assertNativeSourceDoesNotMintProof(t *testing.T) {
 			}
 		}
 	}
+}
+
+type fakeNativeRetainedManager struct {
+	mu         sync.Mutex
+	next       int
+	leaves     map[string]*fakeNativeRetainedLeaf
+	placeErr   error
+	closeCalls int
+}
+
+type fakeNativeRetainedLeaf struct {
+	retainedID  string
+	domain      model.KernelDomainID
+	membership  containment.RetainedGroupMembership
+	placedPIDs  []int
+	removeCalls int
+	removed     bool
+	releases    int
+}
+
+type fakeNativeRetainedCapability struct {
+	manager  *fakeNativeRetainedManager
+	leaf     *fakeNativeRetainedLeaf
+	released bool
+}
+
+type fakeNativeRetainedContinuity struct {
+	capability *fakeNativeRetainedCapability
+	begin      time.Time
+}
+
+func newFakeNativeRetainedManager() *fakeNativeRetainedManager {
+	return &fakeNativeRetainedManager{leaves: map[string]*fakeNativeRetainedLeaf{}}
+}
+
+func (manager *fakeNativeRetainedManager) AcquireRetainedGroup(_ context.Context, target model.GroupRef, _ time.Time) (containment.RetainedGroupCapability, error) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	var leaf *fakeNativeRetainedLeaf
+	if target.RetainedID == "" {
+		manager.next++
+		retainedID := fmt.Sprintf("retained-fake-%d", manager.next)
+		domain, err := model.NewKernelDomainIDWithRetainedDomain("host-fake", "pidns-fake", fmt.Sprintf("domain-fake-%d", manager.next))
+		if err != nil {
+			return nil, err
+		}
+		leaf = &fakeNativeRetainedLeaf{
+			retainedID: retainedID,
+			domain:     domain,
+			membership: containment.RetainedMembershipEmpty,
+		}
+		manager.leaves[retainedID] = leaf
+	} else {
+		leaf = manager.leaves[target.RetainedID]
+		if leaf == nil {
+			return nil, fmt.Errorf("unknown retained id %q", target.RetainedID)
+		}
+	}
+	return &fakeNativeRetainedCapability{manager: manager, leaf: leaf}, nil
+}
+
+func (manager *fakeNativeRetainedManager) Close() error {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	manager.closeCalls++
+	return nil
+}
+
+func (manager *fakeNativeRetainedManager) setMembership(retainedID string, membership containment.RetainedGroupMembership) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	leaf := manager.leaves[retainedID]
+	if leaf != nil {
+		leaf.membership = membership
+	}
+}
+
+func (manager *fakeNativeRetainedManager) leafForRetainedID(t *testing.T, retainedID string) *fakeNativeRetainedLeaf {
+	t.Helper()
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	leaf := manager.leaves[retainedID]
+	if leaf == nil {
+		t.Fatalf("retained leaf %q missing", retainedID)
+	}
+	copyLeaf := *leaf
+	return &copyLeaf
+}
+
+func (manager *fakeNativeRetainedManager) leavesSnapshot() []fakeNativeRetainedLeaf {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	out := make([]fakeNativeRetainedLeaf, 0, len(manager.leaves))
+	for _, leaf := range manager.leaves {
+		out = append(out, *leaf)
+	}
+	return out
+}
+
+func (capability *fakeNativeRetainedCapability) Identity() containment.RetainedGroupIdentity {
+	if capability == nil || capability.leaf == nil {
+		return containment.RetainedGroupIdentity{}
+	}
+	return containment.RetainedGroupIdentity{
+		RetainedID:     capability.leaf.retainedID,
+		KernelDomainID: capability.leaf.domain,
+	}
+}
+
+func (capability *fakeNativeRetainedCapability) Membership(context.Context) (containment.RetainedGroupMembership, error) {
+	if err := capability.usable(); err != nil {
+		return containment.RetainedMembershipUnknown, err
+	}
+	capability.manager.mu.Lock()
+	defer capability.manager.mu.Unlock()
+	if capability.leaf.removed {
+		return containment.RetainedMembershipUnknown, nil
+	}
+	return capability.leaf.membership, nil
+}
+
+func (capability *fakeNativeRetainedCapability) StillHeld(context.Context) (bool, error) {
+	if capability == nil || capability.released || capability.leaf == nil {
+		return false, nil
+	}
+	capability.manager.mu.Lock()
+	defer capability.manager.mu.Unlock()
+	return !capability.leaf.removed, nil
+}
+
+func (capability *fakeNativeRetainedCapability) SignalTerm(context.Context) (containment.SignalResult, error) {
+	return capability.emptyBySignal()
+}
+
+func (capability *fakeNativeRetainedCapability) Kill(context.Context) (containment.SignalResult, error) {
+	return capability.emptyBySignal()
+}
+
+func (capability *fakeNativeRetainedCapability) PlacePID(_ context.Context, pid int) error {
+	if err := capability.usable(); err != nil {
+		return err
+	}
+	if capability.manager.placeErr != nil {
+		return capability.manager.placeErr
+	}
+	capability.manager.mu.Lock()
+	defer capability.manager.mu.Unlock()
+	capability.leaf.placedPIDs = append(capability.leaf.placedPIDs, pid)
+	capability.leaf.membership = containment.RetainedMembershipPresent
+	return nil
+}
+
+func (capability *fakeNativeRetainedCapability) Remove(context.Context) error {
+	if err := capability.usable(); err != nil {
+		return err
+	}
+	capability.manager.mu.Lock()
+	defer capability.manager.mu.Unlock()
+	if capability.leaf.membership != containment.RetainedMembershipEmpty {
+		return fmt.Errorf("retained leaf still populated")
+	}
+	if capability.leaf.removed {
+		return nil
+	}
+	capability.leaf.removeCalls++
+	capability.leaf.removed = true
+	return nil
+}
+
+func (capability *fakeNativeRetainedCapability) Release() error {
+	if capability == nil || capability.released {
+		return nil
+	}
+	capability.released = true
+	if capability.manager != nil && capability.leaf != nil {
+		capability.manager.mu.Lock()
+		capability.leaf.releases++
+		capability.manager.mu.Unlock()
+	}
+	return nil
+}
+
+func (capability *fakeNativeRetainedCapability) BeginGroupContinuity(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation, observedAt time.Time) containment.GroupContinuity {
+	_ = ctx
+	if capability == nil || observedAt.IsZero() || observation.Group != model.GroupLive || observation.Leader != model.ProcessIdentityMatching {
+		return brokenContinuity{}
+	}
+	identity := capability.Identity()
+	if identity.RetainedID != target.RetainedID || !identity.KernelDomainID.ProvablySame(target.KernelDomain()) {
+		return brokenContinuity{}
+	}
+	return fakeNativeRetainedContinuity{capability: capability, begin: observedAt}
+}
+
+func (continuity fakeNativeRetainedContinuity) ConfirmContinuouslyLive(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation, begin, end time.Time) containment.GroupContinuityEvidence {
+	_ = ctx
+	if continuity.capability == nil || begin.Before(continuity.begin) || end.Before(begin) || observation.Group != model.GroupLive {
+		return containment.GroupContinuityEvidence{}
+	}
+	evidence, err := containment.NewGroupContinuityEvidence(target, begin, end)
+	if err != nil {
+		return containment.GroupContinuityEvidence{}
+	}
+	return evidence
+}
+
+func (capability *fakeNativeRetainedCapability) emptyBySignal() (containment.SignalResult, error) {
+	if err := capability.usable(); err != nil {
+		return containment.SignalUnprovable, err
+	}
+	capability.manager.mu.Lock()
+	defer capability.manager.mu.Unlock()
+	if capability.leaf.membership == containment.RetainedMembershipEmpty {
+		return containment.SignalTargetAbsent, nil
+	}
+	capability.leaf.membership = containment.RetainedMembershipEmpty
+	return containment.SignalDelivered, nil
+}
+
+func (capability *fakeNativeRetainedCapability) usable() error {
+	if capability == nil || capability.released || capability.leaf == nil || capability.manager == nil {
+		return errors.New("fake retained capability is closed")
+	}
+	return nil
 }
 
 func nativeHelperArgs() ([]string, bool) {
@@ -1197,12 +1683,26 @@ func runNativeMonitorHelper(args []string) int {
 	if *daemonFD < 3 || *targetFD < 3 || *readyFD < 3 {
 		return 2
 	}
-	err := parklaunch.RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, *readyFD, RealContainment{Params: defaultNativeTestParams()})
+	var containmentImpl parklaunch.Containment = RealContainment{Params: defaultNativeTestParams()}
+	if os.Getenv(nativeHelperRetainedNoopMonitor) == "1" {
+		containmentImpl = noopNativeMonitorContainment{}
+	}
+	err := parklaunch.RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, *readyFD, containmentImpl)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 3
 	}
 	return 0
+}
+
+type noopNativeMonitorContainment struct{}
+
+func (noopNativeMonitorContainment) Contain(context.Context, model.GroupRef) error {
+	return nil
+}
+
+func (containment noopNativeMonitorContainment) BindContainmentTarget(context.Context, model.GroupRef) (parklaunch.Containment, error) {
+	return containment, nil
 }
 
 func writeNativeBackendResult(path string, result nativeBackendResult) int {

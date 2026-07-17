@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -222,10 +223,12 @@ type managerOptions struct {
 }
 
 type Manager struct {
+	mu         sync.Mutex
 	fs         cgroupFS
 	newLeaf    func() (string, error)
 	terminator processTerminator
 	spawnProbe probeSpawner
+	closed     bool
 }
 
 func newManagerWithFS(fs cgroupFS, options managerOptions) *Manager {
@@ -249,6 +252,11 @@ func newManagerWithFS(fs cgroupFS, options managerOptions) *Manager {
 func (manager *Manager) Probe(ctx context.Context) Support {
 	if manager == nil || manager.fs == nil {
 		return unsupportedSupport(fmt.Errorf("%w: manager is nil", ErrUnsupported))
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if manager.closed {
+		return unsupportedSupport(fmt.Errorf("%w: manager is closed", ErrUnsupported))
 	}
 	root, err := manager.fs.RootIdentity(ctx)
 	if err != nil {
@@ -424,6 +432,11 @@ func (manager *Manager) AcquireRetainedGroup(ctx context.Context, target model.G
 	if manager == nil || manager.fs == nil {
 		return nil, fmt.Errorf("%w: manager is nil", ErrUnsupported)
 	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if manager.closed {
+		return nil, fmt.Errorf("%w: manager is closed", ErrUnsupported)
+	}
 	root, err := manager.fs.RootIdentity(ctx)
 	if err != nil {
 		return nil, err
@@ -443,6 +456,23 @@ func (manager *Manager) AcquireRetainedGroup(ctx context.Context, target model.G
 		return nil, err
 	}
 	return capability, nil
+}
+
+func (manager *Manager) Close() error {
+	if manager == nil {
+		return nil
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if manager.closed {
+		return nil
+	}
+	manager.closed = true
+	closer, ok := manager.fs.(interface{ Close() error })
+	if !ok || closer == nil {
+		return nil
+	}
+	return closer.Close()
 }
 
 func (manager *Manager) create(ctx context.Context, root RootIdentity) (*Capability, error) {
@@ -558,6 +588,32 @@ func (capability *Capability) Membership(ctx context.Context) (containment.Retai
 	return containment.RetainedMembershipEmpty, nil
 }
 
+func (capability *Capability) PlacePID(ctx context.Context, pid int) error {
+	if capability == nil || capability.released || capability.removed {
+		return fmt.Errorf("%w: cgroup capability is closed", ErrInvalid)
+	}
+	if pid <= 0 {
+		return fmt.Errorf("%w: pid must be positive", ErrInvalid)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := capability.requireHeld(ctx); err != nil {
+		return err
+	}
+	if err := capability.fs.WriteProcs(ctx, capability.object, pid); err != nil {
+		return err
+	}
+	pids, err := capability.fs.ReadProcs(ctx, capability.object)
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(pids, pid) {
+		return fmt.Errorf("%w: pid %d was not observed in retained cgroup after placement", ErrUnsupported, pid)
+	}
+	return nil
+}
+
 func (capability *Capability) StillHeld(ctx context.Context) (bool, error) {
 	if capability == nil || capability.released || capability.removed {
 		return false, nil
@@ -566,6 +622,65 @@ func (capability *Capability) StillHeld(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return capability.fs.Verify(ctx, capability.object)
+}
+
+func (capability *Capability) BeginGroupContinuity(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation, observedAt time.Time) containment.GroupContinuity {
+	if capability == nil || observedAt.IsZero() || observation.Group != model.GroupLive || observation.Leader != model.ProcessIdentityMatching {
+		return cgroupContinuity{}
+	}
+	if !capability.identityMatches(target) {
+		return cgroupContinuity{}
+	}
+	membership, err := capability.Membership(ctx)
+	if err != nil || membership != containment.RetainedMembershipPresent {
+		return cgroupContinuity{}
+	}
+	held, err := capability.StillHeld(ctx)
+	if err != nil || !held {
+		return cgroupContinuity{}
+	}
+	return cgroupContinuity{capability: capability, begin: observedAt}
+}
+
+type cgroupContinuity struct {
+	capability *Capability
+	begin      time.Time
+}
+
+func (continuity cgroupContinuity) ConfirmContinuouslyLive(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation, begin, end time.Time) containment.GroupContinuityEvidence {
+	if continuity.capability == nil || begin.Before(continuity.begin) || end.Before(begin) {
+		return containment.GroupContinuityEvidence{}
+	}
+	if observation.Group != model.GroupLive || !continuity.capability.identityMatches(target) {
+		return containment.GroupContinuityEvidence{}
+	}
+	membership, err := continuity.capability.Membership(ctx)
+	if err != nil || membership != containment.RetainedMembershipPresent {
+		return containment.GroupContinuityEvidence{}
+	}
+	held, err := continuity.capability.StillHeld(ctx)
+	if err != nil || !held {
+		return containment.GroupContinuityEvidence{}
+	}
+	evidence, err := containment.NewGroupContinuityEvidence(target, begin, end)
+	if err != nil {
+		return containment.GroupContinuityEvidence{}
+	}
+	return evidence
+}
+
+func (capability *Capability) identityMatches(target model.GroupRef) bool {
+	if capability == nil {
+		return false
+	}
+	if err := target.Validate(); err != nil {
+		return false
+	}
+	identity := capability.Identity()
+	if err := identity.KernelDomainID.Validate(); err != nil {
+		return false
+	}
+	return identity.RetainedID == target.RetainedID && identity.KernelDomainID.ProvablySame(target.KernelDomain())
 }
 
 func (capability *Capability) ProbeFeatures(ctx context.Context) (CgroupFeatures, error) {

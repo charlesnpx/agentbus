@@ -125,6 +125,40 @@ func TestLaunchReleaseIsOneUse(t *testing.T) {
 	}
 }
 
+func TestLaunchBeforeMonitorBindRefinesReturnedTarget(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	fixture.spec.RetainedID = "cgroup-retained-test"
+	fixture.spec.BeforeMonitorBind = func(_ context.Context, group model.GroupRef) (model.GroupRef, error) {
+		group.RetainedDomainID = "cgroup-domain-test"
+		group.RetainedDomainState = model.RetainedDomainKnown
+		return group, nil
+	}
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer stopMonitor(t, handle.Monitor)
+
+	if handle.GroupRef.RetainedID != "cgroup-retained-test" {
+		t.Fatalf("handle retained id = %q, want cgroup-retained-test", handle.GroupRef.RetainedID)
+	}
+	if handle.GroupRef.RetainedDomainState != model.RetainedDomainKnown || handle.GroupRef.RetainedDomainID != "cgroup-domain-test" {
+		t.Fatalf("handle retained domain = %q/%v, want cgroup-domain-test/known", handle.GroupRef.RetainedDomainID, handle.GroupRef.RetainedDomainState)
+	}
+	target, _, _, armed := handle.Monitor.armedCleanupState()
+	if !armed {
+		t.Fatal("monitor was not armed")
+	}
+	if !target.Equal(handle.GroupRef) {
+		t.Fatalf("monitor target = %#v, want handle group %#v", target, handle.GroupRef)
+	}
+	_, _ = io.ReadAll(handle.Stdout)
+	if err := handle.Wait(); err != nil {
+		t.Fatalf("backend wait error = %v", err)
+	}
+}
+
 func TestLaunchChannelLossBeforeReleaseContainsTarget(t *testing.T) {
 	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
 	fixture.spec.hooks.beforeRelease = func(snapshot launchControlSnapshot) error {

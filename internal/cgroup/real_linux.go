@@ -103,6 +103,25 @@ func (fs *realFS) RootIdentity(ctx context.Context) (RootIdentity, error) {
 	return held.identity, nil
 }
 
+func (fs *realFS) Close() error {
+	if fs == nil {
+		return nil
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.held == nil {
+		return nil
+	}
+	fd := fs.held.fd
+	fs.held = nil
+	var err error
+	if fd >= 0 {
+		err = errors.Join(err, unix.Flock(fd, unix.LOCK_UN))
+		err = errors.Join(err, unix.Close(fd))
+	}
+	return err
+}
+
 func (fs *realFS) heldRoot(ctx context.Context) (*realRoot, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -406,6 +425,21 @@ func (fs *realFS) Remove(ctx context.Context, object cgroupObject) error {
 	}
 	realObject, err := fs.realObject(ctx, object)
 	if err != nil {
+		return err
+	}
+	current, err := identityAt(realObject.rootfd, realObject.leafName)
+	if err != nil || !realObject.leaf.durableEqual(current) {
+		fs.recordTombstone(realObject.leafName, realObject.leaf)
+		return nil
+	}
+	if err := verifyRootHandle(realObject.rootfd, realObject.root); err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(realObject.rootfd, realObject.leafName, unix.AT_REMOVEDIR); err != nil {
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESTALE) {
+			fs.recordTombstone(realObject.leafName, realObject.leaf)
+			return nil
+		}
 		return err
 	}
 	fs.recordTombstone(realObject.leafName, realObject.leaf)

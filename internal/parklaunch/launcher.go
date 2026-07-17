@@ -92,7 +92,13 @@ type Spec struct {
 	// containment and independent absence verification.
 	RetainLeaderUnreaped bool
 
-	BeforeRelease func(context.Context, model.GroupRef) error
+	// BeforeMonitorBind may bind platform containment state after the worker
+	// identity is verified and before the monitor receives its target. It may
+	// return a refined GroupRef for monitor cleanup and the returned handle; the
+	// worker release binding continues to use the process-domain GroupRef that
+	// the parked worker can independently validate.
+	BeforeMonitorBind func(context.Context, model.GroupRef) (model.GroupRef, error)
+	BeforeRelease     func(context.Context, model.GroupRef) error
 
 	WorkerEnv []string
 	WorkerDir string
@@ -354,7 +360,8 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	}
 
 	group = groupRefFromClaims(workerClaim, monitorClaim, spec.CustodyID, spec.LaunchKey, spec.RetainedID)
-	expectation, err := releaseExpectation(spec, group)
+	releaseGroup := group
+	expectation, err := releaseExpectation(spec, releaseGroup)
 	if err != nil {
 		return nil, failClosed(spec.Containment, group, err)
 	}
@@ -364,6 +371,28 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	_ = pipes.bootstrapWrite.Close()
 	pipes.bootstrapWrite = nil
 
+	reader := parkproto.NewReader(pipes.fromWorkerRead)
+	received, err := readParkFrame(ctx, reader)
+	if err != nil {
+		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: read identity report: %v", ErrChannelLostBeforeRelease, err))
+	}
+	report, ok := received.Message.(parkproto.IdentityReport)
+	if !ok {
+		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: first worker frame was %T", ErrIdentityMismatch, received.Message))
+	}
+	if err := verifyIdentityReport(spec.identity, report, workerClaim, releaseGroup); err != nil {
+		return nil, failClosed(spec.Containment, group, err)
+	}
+	if spec.BeforeMonitorBind != nil {
+		boundGroup, err := spec.BeforeMonitorBind(ctx, group)
+		if err != nil {
+			return nil, failClosed(spec.Containment, group, fmt.Errorf("before monitor bind: %w", err))
+		}
+		if err := validateBoundMonitorGroup(releaseGroup, boundGroup); err != nil {
+			return nil, failClosed(spec.Containment, group, fmt.Errorf("before monitor bind: %w", err))
+		}
+		group = boundGroup
+	}
 	if err := monitor.BindTarget(group); err != nil {
 		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: bind monitor target: %v", ErrMonitorNotArmed, err))
 	}
@@ -371,19 +400,6 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 		return nil, failClosed(spec.Containment, group, err)
 	}
 	monitorArmed = true
-
-	reader := parkproto.NewReader(pipes.fromWorkerRead)
-	received, err := readParkFrame(ctx, reader)
-	if err != nil {
-		return nil, failArmed(fmt.Errorf("%w: read identity report: %v", ErrChannelLostBeforeRelease, err))
-	}
-	report, ok := received.Message.(parkproto.IdentityReport)
-	if !ok {
-		return nil, failArmed(fmt.Errorf("%w: first worker frame was %T", ErrIdentityMismatch, received.Message))
-	}
-	if err := verifyIdentityReport(spec.identity, report, workerClaim, group); err != nil {
-		return nil, failArmed(err)
-	}
 	if spec.hooks.beforeRelease != nil {
 		if err := spec.hooks.beforeRelease(launchControlSnapshot{ControlWrite: pipes.toWorkerWrite, ControlRead: pipes.fromWorkerRead}); err != nil {
 			return nil, failArmed(err)
@@ -399,7 +415,7 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	}
 
 	writer := parkproto.NewWriter(pipes.toWorkerWrite)
-	release := releaseForReport(expectation, group, spec.ExecSpec, report)
+	release := releaseForReport(expectation, releaseGroup, spec.ExecSpec, report)
 	releaser := &releaseGate{}
 	if err := releaser.send(writer, release); err != nil {
 		return nil, failArmed(fmt.Errorf("%w: %v", ErrChannelLostBeforeRelease, err))
@@ -514,6 +530,31 @@ func releaseForReport(expectation parkproto.ReleaseExpectation, group model.Grou
 		ExpectedGroupRef: group,
 		ExecSpec:         execSpec,
 	}
+}
+
+func validateBoundMonitorGroup(releaseGroup, boundGroup model.GroupRef) error {
+	if err := boundGroup.Validate(); err != nil {
+		return err
+	}
+	if releaseGroup.CustodyID != boundGroup.CustodyID {
+		return fmt.Errorf("bound group custody changed")
+	}
+	if !releaseGroup.Launch.Equal(boundGroup.Launch) {
+		return fmt.Errorf("bound group launch changed")
+	}
+	if releaseGroup.PGID != boundGroup.PGID {
+		return fmt.Errorf("bound group pgid changed")
+	}
+	if releaseGroup.Leader != boundGroup.Leader {
+		return fmt.Errorf("bound group leader changed")
+	}
+	if releaseGroup.Monitor != boundGroup.Monitor {
+		return fmt.Errorf("bound group monitor changed")
+	}
+	if releaseGroup.RetainedID != boundGroup.RetainedID {
+		return fmt.Errorf("bound group retained id changed")
+	}
+	return nil
 }
 
 func verifyIdentityReport(reader identityReader, report parkproto.IdentityReport, initial procgroup.ProcessClaim, group model.GroupRef) error {
@@ -734,6 +775,11 @@ func waitArmedMonitorCleanup(containment Containment, reader identityReader, mon
 	}
 
 	containErr := containTargetGroup(containment, group)
+	if containErr == nil && requiresRetainedObject(group) {
+		reapCtx, reapCancel := cleanupContext()
+		defer reapCancel()
+		return waitMonitorExitAfterTargetAbsent(reapCtx, monitor)
+	}
 	reobserveCtx, reobserveCancel := cleanupContext()
 	defer reobserveCancel()
 	lastObservation, absent := waitTargetGroupAbsent(reobserveCtx, reader, group)
@@ -816,6 +862,11 @@ func targetGroupObservation(reader identityReader, group model.GroupRef) model.G
 		return model.GroupExistenceUnknown
 	}
 	return reader.ClassifyGroup(claim)
+}
+
+func requiresRetainedObject(group model.GroupRef) bool {
+	required, err := model.ContainmentRequiresRetainedObject(group)
+	return err == nil && required
 }
 
 func waitTargetGroupAbsent(ctx context.Context, reader identityReader, group model.GroupRef) (model.GroupExistenceObservation, bool) {
