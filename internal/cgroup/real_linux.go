@@ -3,11 +3,9 @@
 package cgroup
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,6 +33,58 @@ type realFS struct {
 	root string
 }
 
+type realObject struct {
+	rootPath string
+	leafName string
+	rootfd   int
+	leaffd   int
+	root     ObjectIdentity
+	leaf     ObjectIdentity
+	closed   bool
+}
+
+func (object *realObject) LeafName() string {
+	if object == nil {
+		return ""
+	}
+	return object.leafName
+}
+
+func (object *realObject) RootObject() ObjectIdentity {
+	if object == nil {
+		return ObjectIdentity{}
+	}
+	return object.root
+}
+
+func (object *realObject) LeafObject() ObjectIdentity {
+	if object == nil {
+		return ObjectIdentity{}
+	}
+	return object.leaf
+}
+
+func (object *realObject) Close() error {
+	if object == nil || object.closed {
+		return nil
+	}
+	object.closed = true
+	var err error
+	if object.leaffd >= 0 {
+		if closeErr := unix.Close(object.leaffd); closeErr != nil {
+			err = closeErr
+		}
+		object.leaffd = -1
+	}
+	if object.rootfd >= 0 {
+		if closeErr := unix.Close(object.rootfd); err == nil && closeErr != nil {
+			err = closeErr
+		}
+		object.rootfd = -1
+	}
+	return err
+}
+
 func (fs realFS) RootIdentity(ctx context.Context) (RootIdentity, error) {
 	if err := ctx.Err(); err != nil {
 		return RootIdentity{}, err
@@ -43,76 +93,188 @@ func (fs realFS) RootIdentity(ctx context.Context) (RootIdentity, error) {
 	if err := unix.Statfs(fs.root, &statfs); err != nil {
 		return RootIdentity{}, fmt.Errorf("%w: cgroupfs absent: %v", ErrUnsupported, err)
 	}
-	unified := statfs.Type == unix.CGROUP2_SUPER_MAGIC
-	if statfs.Type == unix.CGROUP_SUPER_MAGIC {
-		unified = false
+	if statfs.Type != unix.CGROUP2_SUPER_MAGIC {
+		return RootIdentity{}, fmt.Errorf("%w: cgroup root is not cgroup2", ErrUnsupported)
+	}
+	rootfd, err := fs.openRoot()
+	if err != nil {
+		return RootIdentity{}, err
+	}
+	defer unix.Close(rootfd)
+	rootObject, err := statFD(rootfd)
+	if err != nil {
+		return RootIdentity{}, err
+	}
+	selfCgroup, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return RootIdentity{}, fmt.Errorf("%w: read /proc/self/cgroup: %v", ErrUnsupported, err)
+	}
+	mountData, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return RootIdentity{}, fmt.Errorf("%w: read /proc/self/mountinfo: %v", ErrUnsupported, err)
+	}
+	mounts, err := parseMountInfo(string(mountData))
+	if err != nil {
+		return RootIdentity{}, err
+	}
+	mount, err := classifyUnifiedCgroupRoot(string(selfCgroup), mounts, fs.root)
+	if err != nil {
+		return RootIdentity{}, err
+	}
+	cgroupTypeData, err := os.ReadFile(filepath.Join(fs.root, "cgroup.type"))
+	if err != nil {
+		return RootIdentity{}, fmt.Errorf("%w: read cgroup.type: %v", ErrUnsupported, err)
+	}
+	cgroupType := strings.TrimSpace(string(cgroupTypeData))
+	if cgroupType != "domain" {
+		return RootIdentity{}, fmt.Errorf("%w: unsupported cgroup.type %q", ErrUnsupported, cgroupType)
 	}
 	readOnly := unix.Access(fs.root, unix.W_OK) != nil
-	threaded := false
-	if data, err := os.ReadFile(filepath.Join(fs.root, "cgroup.type")); err == nil {
-		threaded = strings.TrimSpace(string(data)) == "threaded"
-	}
 	root := RootIdentity{
 		HostBootID:        readFirstToken("/proc/sys/kernel/random/boot_id"),
 		PIDNamespaceID:    readNamespaceToken("/proc/self/ns/pid"),
 		CgroupNamespaceID: readNamespaceToken("/proc/self/ns/cgroup"),
-		MountID:           mountIdentity(fs.root),
+		MountID:           mount.ID,
 		HierarchyID:       hierarchyIdentity(statfs),
-		Unified:           unified,
+		Unified:           true,
 		ReadOnly:          readOnly,
 		Delegated:         !readOnly,
-		Threaded:          threaded,
-		KillAvailable:     unified,
-		FreezeAvailable:   fileExists(filepath.Join(fs.root, "cgroup.freeze")),
+		RootObject:        rootObject,
 	}
-	if root.HostBootID == "" || root.PIDNamespaceID == "" || root.CgroupNamespaceID == "" || root.MountID == "" || root.HierarchyID == "" {
+	if root.HostBootID == "" || root.PIDNamespaceID == "" || root.CgroupNamespaceID == "" || root.MountID == "" || root.HierarchyID == "" || !root.RootObject.valid() {
 		return RootIdentity{}, fmt.Errorf("%w: incomplete cgroup domain identity", ErrUnsupported)
 	}
 	return root, nil
 }
 
-func (fs realFS) CreateChild(ctx context.Context, name string) (ObjectIdentity, error) {
+func (fs realFS) CreateChild(ctx context.Context, name string) (cgroupObject, error) {
 	if err := ctx.Err(); err != nil {
-		return ObjectIdentity{}, err
+		return nil, err
 	}
 	if err := validateRetainedID(name); err != nil {
-		return ObjectIdentity{}, err
+		return nil, err
 	}
 	rootfd, err := fs.openRoot()
 	if err != nil {
-		return ObjectIdentity{}, err
+		return nil, err
 	}
-	defer unix.Close(rootfd)
+	rootObject, err := statFD(rootfd)
+	if err != nil {
+		_ = unix.Close(rootfd)
+		return nil, err
+	}
 	if err := unix.Mkdirat(rootfd, name, 0o755); err != nil {
+		_ = unix.Close(rootfd)
 		if errors.Is(err, unix.EEXIST) {
-			return ObjectIdentity{}, fmt.Errorf("%w: leaf already exists", ErrUnsupported)
+			return nil, fmt.Errorf("%w: leaf already exists", ErrUnsupported)
 		}
-		return ObjectIdentity{}, err
+		return nil, err
 	}
-	return statLeaf(rootfd, name)
+	leaffd, err := fs.openLeaf(rootfd, name)
+	if err != nil {
+		_ = unix.Unlinkat(rootfd, name, unix.AT_REMOVEDIR)
+		_ = unix.Close(rootfd)
+		return nil, err
+	}
+	leafObject, err := statFD(leaffd)
+	if err != nil {
+		_ = unix.Close(leaffd)
+		_ = unix.Unlinkat(rootfd, name, unix.AT_REMOVEDIR)
+		_ = unix.Close(rootfd)
+		return nil, err
+	}
+	return &realObject{rootPath: fs.root, leafName: name, rootfd: rootfd, leaffd: leaffd, root: rootObject, leaf: leafObject}, nil
 }
 
-func (fs realFS) Open(ctx context.Context, name string) (ObjectIdentity, error) {
+func (fs realFS) Open(ctx context.Context, name string) (cgroupObject, error) {
 	if err := ctx.Err(); err != nil {
-		return ObjectIdentity{}, err
+		return nil, err
 	}
 	if err := validateRetainedID(name); err != nil {
-		return ObjectIdentity{}, err
+		return nil, err
 	}
 	rootfd, err := fs.openRoot()
 	if err != nil {
-		return ObjectIdentity{}, err
+		return nil, err
 	}
-	defer unix.Close(rootfd)
-	return statLeaf(rootfd, name)
+	rootObject, err := statFD(rootfd)
+	if err != nil {
+		_ = unix.Close(rootfd)
+		return nil, err
+	}
+	leaffd, err := fs.openLeaf(rootfd, name)
+	if err != nil {
+		_ = unix.Close(rootfd)
+		return nil, err
+	}
+	leafObject, err := statFD(leaffd)
+	if err != nil {
+		_ = unix.Close(leaffd)
+		_ = unix.Close(rootfd)
+		return nil, err
+	}
+	return &realObject{rootPath: fs.root, leafName: name, rootfd: rootfd, leaffd: leaffd, root: rootObject, leaf: leafObject}, nil
 }
 
-func (fs realFS) WriteProcs(ctx context.Context, name string, pid int) error {
-	return fs.writeFile(ctx, name, "cgroup.procs", []byte(strconv.Itoa(pid)+"\n"))
+func (fs realFS) Verify(ctx context.Context, object cgroupObject) (bool, error) {
+	realObject, err := fs.realObject(ctx, object)
+	if err != nil {
+		return false, err
+	}
+	root, err := statFD(realObject.rootfd)
+	if err != nil {
+		if errors.Is(err, unix.EBADF) || errors.Is(err, unix.ESTALE) {
+			return false, nil
+		}
+		return false, err
+	}
+	leaf, err := statFD(realObject.leaffd)
+	if err != nil {
+		if errors.Is(err, unix.EBADF) || errors.Is(err, unix.ESTALE) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !realObject.root.Equal(root) || !realObject.leaf.Equal(leaf) {
+		return false, nil
+	}
+	fd, err := unix.Openat(realObject.leaffd, "cgroup.events", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESTALE) || errors.Is(err, unix.ENOTDIR) {
+			return false, nil
+		}
+		return false, err
+	}
+	_ = unix.Close(fd)
+	return true, nil
 }
 
-func (fs realFS) ReadProcs(ctx context.Context, name string) ([]int, error) {
-	data, err := fs.readFile(ctx, name, "cgroup.procs")
+func (fs realFS) ProbeFeatures(ctx context.Context, object cgroupObject) (CgroupFeatures, error) {
+	features := CgroupFeatures{}
+	if err := fs.writeFile(ctx, object, "cgroup.kill", []byte("1\n")); err == nil {
+		features.KillAvailable = true
+	}
+	if err := fs.WriteFreeze(ctx, object, FreezeFrozen); err == nil {
+		state, readErr := fs.ReadFreeze(ctx, object)
+		if err := fs.WriteFreeze(ctx, object, FreezeThawed); err != nil {
+			return features, err
+		}
+		if readErr == nil && state == FreezeFrozen {
+			state, readErr = fs.ReadFreeze(ctx, object)
+			if readErr == nil && state == FreezeThawed {
+				features.FreezeAvailable = true
+			}
+		}
+	}
+	return features, nil
+}
+
+func (fs realFS) WriteProcs(ctx context.Context, object cgroupObject, pid int) error {
+	return fs.writeFile(ctx, object, "cgroup.procs", []byte(strconv.Itoa(pid)+"\n"))
+}
+
+func (fs realFS) ReadProcs(ctx context.Context, object cgroupObject) ([]int, error) {
+	data, err := fs.readFile(ctx, object, "cgroup.procs")
 	if err != nil {
 		return nil, err
 	}
@@ -128,8 +290,8 @@ func (fs realFS) ReadProcs(ctx context.Context, name string) ([]int, error) {
 	return pids, nil
 }
 
-func (fs realFS) ReadEvents(ctx context.Context, name string) (Events, error) {
-	data, err := fs.readFile(ctx, name, "cgroup.events")
+func (fs realFS) ReadEvents(ctx context.Context, object cgroupObject) (Events, error) {
+	data, err := fs.readFile(ctx, object, "cgroup.events")
 	if err != nil {
 		return Events{}, err
 	}
@@ -150,23 +312,23 @@ func (fs realFS) ReadEvents(ctx context.Context, name string) (Events, error) {
 	return Events{}, fmt.Errorf("%w: cgroup.events missing populated", ErrInvalid)
 }
 
-func (fs realFS) WriteKill(ctx context.Context, name string) error {
-	return fs.writeFile(ctx, name, "cgroup.kill", []byte("1\n"))
+func (fs realFS) WriteKill(ctx context.Context, object cgroupObject) error {
+	return fs.writeFile(ctx, object, "cgroup.kill", []byte("1\n"))
 }
 
-func (fs realFS) WriteFreeze(ctx context.Context, name string, state FreezeState) error {
+func (fs realFS) WriteFreeze(ctx context.Context, object cgroupObject, state FreezeState) error {
 	switch state {
 	case FreezeFrozen:
-		return fs.writeFile(ctx, name, "cgroup.freeze", []byte("1\n"))
+		return fs.writeFile(ctx, object, "cgroup.freeze", []byte("1\n"))
 	case FreezeThawed:
-		return fs.writeFile(ctx, name, "cgroup.freeze", []byte("0\n"))
+		return fs.writeFile(ctx, object, "cgroup.freeze", []byte("0\n"))
 	default:
 		return fmt.Errorf("%w: freeze state is unknown", ErrInvalid)
 	}
 }
 
-func (fs realFS) ReadFreeze(ctx context.Context, name string) (FreezeState, error) {
-	data, err := fs.readFile(ctx, name, "cgroup.freeze")
+func (fs realFS) ReadFreeze(ctx context.Context, object cgroupObject) (FreezeState, error) {
+	data, err := fs.readFile(ctx, object, "cgroup.freeze")
 	if err != nil {
 		return FreezeUnknown, err
 	}
@@ -180,47 +342,59 @@ func (fs realFS) ReadFreeze(ctx context.Context, name string) (FreezeState, erro
 	}
 }
 
-func (fs realFS) Remove(ctx context.Context, name string) error {
+func (fs realFS) Remove(ctx context.Context, object cgroupObject) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := validateRetainedID(name); err != nil {
-		return err
-	}
-	rootfd, err := fs.openRoot()
+	realObject, err := fs.realObject(ctx, object)
 	if err != nil {
 		return err
 	}
-	defer unix.Close(rootfd)
-	return unix.Unlinkat(rootfd, name, unix.AT_REMOVEDIR)
+	held, err := fs.Verify(ctx, object)
+	if err != nil {
+		return err
+	}
+	if !held {
+		return fmt.Errorf("%w: cgroup object is no longer held", ErrUnsupported)
+	}
+	return unix.Unlinkat(realObject.rootfd, realObject.leafName, unix.AT_REMOVEDIR)
 }
 
 func (fs realFS) openRoot() (int, error) {
-	return unix.Open(fs.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	return unix.Open(fs.root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 }
 
 func (fs realFS) openLeaf(rootfd int, name string) (int, error) {
 	if err := validateRetainedID(name); err != nil {
 		return -1, err
 	}
-	return unix.Openat(rootfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	return unix.Openat(rootfd, name, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 }
 
-func (fs realFS) readFile(ctx context.Context, name, file string) ([]byte, error) {
+func (fs realFS) realObject(ctx context.Context, object cgroupObject) (*realObject, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	rootfd, err := fs.openRoot()
+	realObject, ok := object.(*realObject)
+	if !ok || realObject == nil || realObject.closed || realObject.rootPath != fs.root || realObject.rootfd < 0 || realObject.leaffd < 0 {
+		return nil, fmt.Errorf("%w: invalid cgroup object", ErrInvalid)
+	}
+	return realObject, nil
+}
+
+func (fs realFS) readFile(ctx context.Context, object cgroupObject, file string) ([]byte, error) {
+	realObject, err := fs.realObject(ctx, object)
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(rootfd)
-	leaffd, err := fs.openLeaf(rootfd, name)
+	held, err := fs.Verify(ctx, object)
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(leaffd)
-	fd, err := unix.Openat(leaffd, file, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if !held {
+		return nil, fmt.Errorf("%w: cgroup object is no longer held", ErrUnsupported)
+	}
+	fd, err := unix.Openat(realObject.leaffd, file, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -228,21 +402,19 @@ func (fs realFS) readFile(ctx context.Context, name, file string) ([]byte, error
 	return readAll(fd)
 }
 
-func (fs realFS) writeFile(ctx context.Context, name, file string, data []byte) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	rootfd, err := fs.openRoot()
+func (fs realFS) writeFile(ctx context.Context, object cgroupObject, file string, data []byte) error {
+	realObject, err := fs.realObject(ctx, object)
 	if err != nil {
 		return err
 	}
-	defer unix.Close(rootfd)
-	leaffd, err := fs.openLeaf(rootfd, name)
+	held, err := fs.Verify(ctx, object)
 	if err != nil {
 		return err
 	}
-	defer unix.Close(leaffd)
-	fd, err := unix.Openat(leaffd, file, unix.O_WRONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if !held {
+		return fmt.Errorf("%w: cgroup object is no longer held", ErrUnsupported)
+	}
+	fd, err := unix.Openat(realObject.leaffd, file, unix.O_WRONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}
@@ -250,9 +422,9 @@ func (fs realFS) writeFile(ctx context.Context, name, file string, data []byte) 
 	return writeAll(fd, data)
 }
 
-func statLeaf(rootfd int, name string) (ObjectIdentity, error) {
+func statFD(fd int) (ObjectIdentity, error) {
 	var stat unix.Stat_t
-	if err := unix.Fstatat(rootfd, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := unix.Fstat(fd, &stat); err != nil {
 		return ObjectIdentity{}, err
 	}
 	return ObjectIdentity{
@@ -313,52 +485,8 @@ func readNamespaceToken(path string) string {
 	return target
 }
 
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
 func hierarchyIdentity(statfs unix.Statfs_t) string {
 	return fmt.Sprintf("type-%x-fsid-%x-%x", uint64(statfs.Type), uint32(statfs.Fsid.Val[0]), uint32(statfs.Fsid.Val[1]))
-}
-
-func mountIdentity(root string) string {
-	file, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return ""
-	}
-	defer file.Close()
-	root = filepath.Clean(root)
-	var bestID string
-	bestLen := -1
-	reader := bufio.NewReader(file)
-	for {
-		line, err := reader.ReadString('\n')
-		if line != "" {
-			fields := strings.Fields(line)
-			if len(fields) >= 5 {
-				mountPoint := unescapeMountInfo(fields[4])
-				if root == mountPoint || strings.HasPrefix(root, mountPoint+"/") {
-					if len(mountPoint) > bestLen {
-						bestLen = len(mountPoint)
-						bestID = fields[0]
-					}
-				}
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return ""
-		}
-	}
-	return bestID
-}
-
-func unescapeMountInfo(value string) string {
-	replacer := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
-	return replacer.Replace(value)
 }
 
 type pidfdTerminator struct{}

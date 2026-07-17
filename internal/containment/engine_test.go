@@ -271,6 +271,51 @@ func TestContainmentRetainedObjectProofAuthorizesKillWithMissingLeader(t *testin
 	}
 }
 
+func TestContainmentRetainedSignalAbsentRequiresEmptyProof(t *testing.T) {
+	target := testGroupRef(t)
+	tests := []struct {
+		name        string
+		memberships []RetainedGroupMembership
+		wantAbsent  bool
+	}{
+		{
+			name:        "recursive_empty",
+			memberships: []RetainedGroupMembership{RetainedMembershipPresent, RetainedMembershipEmpty},
+			wantAbsent:  true,
+		},
+		{
+			name:        "still_populated",
+			memberships: []RetainedGroupMembership{RetainedMembershipPresent, RetainedMembershipPresent},
+			wantAbsent:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			observer := &fakeObserver{observations: []model.ContainmentObservation{
+				testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+			}}
+			signaler := &fakeSignaler{}
+			retained := &fakeRetainedObject{
+				memberships: tt.memberships,
+				script: []signalScript{
+					{signal: SignalTerminate, result: SignalTargetAbsent},
+				},
+			}
+
+			outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+			if tt.wantAbsent {
+				assertAbsent(t, outcome)
+			} else {
+				assertUnprovable(t, outcome, ReasonSignalUnprovable)
+			}
+			assertSignals(t, signaler)
+			assertRetainedSignals(t, retained, SignalTerminate)
+		})
+	}
+}
+
 func TestContainmentRetainedObjectCapabilityMustMatchObjectAndCoverOperation(t *testing.T) {
 	target := testGroupRef(t)
 	differentDomain := target.KernelDomain()

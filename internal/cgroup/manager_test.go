@@ -23,8 +23,12 @@ func TestAcquireCreatesUniqueLeaf(t *testing.T) {
 	}
 
 	identity := capability.Identity()
-	if identity.RetainedID != "cg-next" {
-		t.Fatalf("retained id = %q, want cg-next", identity.RetainedID)
+	descriptor, err := parseRetainedID(identity.RetainedID)
+	if err != nil {
+		t.Fatalf("retained id %q did not parse: %v", identity.RetainedID, err)
+	}
+	if descriptor.leafName != "cg-next" {
+		t.Fatalf("retained leaf = %q, want cg-next", descriptor.leafName)
 	}
 	if !fs.exists("cg-next") {
 		t.Fatalf("created leaf was not present in fake fs")
@@ -114,6 +118,19 @@ func TestRecreatedLeafInvalidatesStillHeld(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsRecreatedLeafDurableIdentityMismatch(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-open-recreated"))
+	capability := acquireCapability(t, manager)
+	retainedID := capability.retainedID
+	fs.recreate(retainedID)
+
+	reopened, err := manager.AcquireRetainedGroup(context.Background(), model.GroupRef{RetainedID: retainedID}, time.Now())
+	if reopened != nil || !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("AcquireRetainedGroup() after recreate = %T, %v; want nil ErrUnsupported", reopened, err)
+	}
+}
+
 func TestSignalTermUsesPidfdVerificationAndDoesNotChasePostEnumerationFork(t *testing.T) {
 	fs := newFakeCgroupFS()
 	terminator := &recordingTerminator{}
@@ -126,7 +143,7 @@ func TestSignalTermUsesPidfdVerificationAndDoesNotChasePostEnumerationFork(t *te
 	fs.setProcs(capability.retainedID, 100)
 	added := false
 	fs.onReadProcs = func(id string, _ []int) {
-		if id == capability.retainedID && !added {
+		if id == capability.leafName && !added {
 			added = true
 			fs.addProcs(id, 101)
 		}
@@ -141,6 +158,105 @@ func TestSignalTermUsesPidfdVerificationAndDoesNotChasePostEnumerationFork(t *te
 	}
 	if got := membership(t, capability); got != containment.RetainedMembershipPresent {
 		t.Fatalf("membership after fork race = %v, want present", got)
+	}
+}
+
+func TestSignalTermDirectEmptyButDescendantPopulatedIsNotAbsent(t *testing.T) {
+	fs := newFakeCgroupFS()
+	terminator := &recordingTerminator{}
+	manager := newManagerWithFS(fs, managerOptions{
+		newLeaf:    leafSequence("cg-nested"),
+		terminator: terminator,
+		spawnProbe: fakeProbeSpawner,
+	})
+	capability := acquireCapability(t, manager)
+	fs.addChildProcs(capability.retainedID, "child", 200)
+
+	result, err := capability.SignalTerm(context.Background())
+	if err != nil || result != containment.SignalDelivered {
+		t.Fatalf("SignalTerm() = %v, %v; want delivered nil", result, err)
+	}
+	if len(terminator.signaled) != 0 {
+		t.Fatalf("signaled direct pids = %v, want none", terminator.signaled)
+	}
+	if got := membership(t, capability); got != containment.RetainedMembershipPresent {
+		t.Fatalf("membership with populated child = %v, want present", got)
+	}
+
+	result, err = capability.Kill(context.Background())
+	if err != nil || result != containment.SignalDelivered {
+		t.Fatalf("Kill() = %v, %v; want delivered nil", result, err)
+	}
+	result, err = capability.SignalTerm(context.Background())
+	if err != nil || result != containment.SignalTargetAbsent {
+		t.Fatalf("SignalTerm() after recursive empty = %v, %v; want absent nil", result, err)
+	}
+}
+
+func TestSignalTermFailsClosedWhenLeafRecreatedBeforeRead(t *testing.T) {
+	fs := newFakeCgroupFS()
+	terminator := &recordingTerminator{}
+	manager := newManagerWithFS(fs, managerOptions{
+		newLeaf:    leafSequence("cg-term-recreate"),
+		terminator: terminator,
+		spawnProbe: fakeProbeSpawner,
+	})
+	capability := acquireCapability(t, manager)
+	fs.setProcs(capability.retainedID, 100)
+	recreated := false
+	fs.onBeforeReadProcs = func(id string) {
+		if id != capability.leafName || recreated {
+			return
+		}
+		recreated = true
+		fs.recreate(capability.retainedID)
+		fs.setProcs(capability.retainedID, 999)
+	}
+
+	result, err := capability.SignalTerm(context.Background())
+	if err == nil || result != containment.SignalUnprovable {
+		t.Fatalf("SignalTerm() = %v, %v; want unprovable error", result, err)
+	}
+	if len(terminator.signaled) != 0 {
+		t.Fatalf("signaled pids = %v, want none", terminator.signaled)
+	}
+	leaf, err := fs.leaf(capability.retainedID)
+	if err != nil {
+		t.Fatalf("replacement leaf missing: %v", err)
+	}
+	if _, ok := leaf.procs[999]; !ok {
+		t.Fatalf("replacement leaf procs = %v, want untouched pid 999", leaf.procs)
+	}
+}
+
+func TestKillFailsClosedWhenLeafRecreatedBeforeWrite(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-kill-recreate"))
+	capability := acquireCapability(t, manager)
+	fs.setProcs(capability.retainedID, 100)
+	recreated := false
+	fs.onBeforeWriteKill = func(id string) {
+		if id != capability.leafName || recreated {
+			return
+		}
+		recreated = true
+		fs.recreate(capability.retainedID)
+		fs.setProcs(capability.retainedID, 999)
+	}
+
+	result, err := capability.Kill(context.Background())
+	if err == nil || result != containment.SignalUnprovable {
+		t.Fatalf("Kill() = %v, %v; want unprovable error", result, err)
+	}
+	if fs.killWrites != 0 {
+		t.Fatalf("kill writes = %d, want 0", fs.killWrites)
+	}
+	leaf, err := fs.leaf(capability.retainedID)
+	if err != nil {
+		t.Fatalf("replacement leaf missing: %v", err)
+	}
+	if _, ok := leaf.procs[999]; !ok {
+		t.Fatalf("replacement leaf procs = %v, want untouched pid 999", leaf.procs)
 	}
 }
 
@@ -186,9 +302,10 @@ func TestProbeClassifiesStrictSupportAndUnsupportedConditions(t *testing.T) {
 			},
 		},
 		{
-			name: "missing_kill",
+			name: "missing_kill_without_freeze_fallback",
 			mutate: func(root *RootIdentity, _ *fakeCgroupFS) {
 				root.KillAvailable = false
+				root.FreezeAvailable = false
 			},
 		},
 	}
@@ -200,8 +317,8 @@ func TestProbeClassifiesStrictSupportAndUnsupportedConditions(t *testing.T) {
 		if !support.Strict() {
 			t.Fatalf("Probe() support = %#v, want strict supported", support)
 		}
-		if fs.killWrites != 1 || fs.removeCalls != 1 {
-			t.Fatalf("probe kill/remove calls = %d/%d, want 1/1", fs.killWrites, fs.removeCalls)
+		if fs.killWrites != 2 || fs.removeCalls != 1 {
+			t.Fatalf("probe kill/remove calls = %d/%d, want 2/1", fs.killWrites, fs.removeCalls)
 		}
 	})
 
@@ -229,6 +346,64 @@ func TestProbeFlagsFreezeFallbackAsDegraded(t *testing.T) {
 	support := manager.Probe(context.Background())
 	if support.Supported || support.RuntimeProbePassed || !support.Degraded || !errors.Is(support.Reason, ErrUnsupported) {
 		t.Fatalf("Probe() support = %#v, want degraded unsupported", support)
+	}
+}
+
+func TestClassifyUnifiedCgroupRootRejectsHybridAndAmbiguous(t *testing.T) {
+	validMounts := []cgroupMount{{ID: "42", MountPoint: "/sys/fs/cgroup", FSType: "cgroup2"}}
+	mount, err := classifyUnifiedCgroupRoot("0::/\n", validMounts, "/sys/fs/cgroup")
+	if err != nil {
+		t.Fatalf("classify valid unified root error = %v", err)
+	}
+	if mount.ID != "42" {
+		t.Fatalf("mount id = %q, want 42", mount.ID)
+	}
+
+	tests := []struct {
+		name   string
+		cgroup string
+		mounts []cgroupMount
+		root   string
+	}{
+		{
+			name:   "hybrid",
+			cgroup: "0::/\n2:cpu,cpuacct:/\n",
+			mounts: validMounts,
+			root:   "/sys/fs/cgroup",
+		},
+		{
+			name:   "legacy_only",
+			cgroup: "2:cpu,cpuacct:/\n",
+			mounts: validMounts,
+			root:   "/sys/fs/cgroup",
+		},
+		{
+			name:   "malformed",
+			cgroup: "not-a-cgroup-record\n",
+			mounts: validMounts,
+			root:   "/sys/fs/cgroup",
+		},
+		{
+			name:   "non_cgroup2_mount",
+			cgroup: "0::/\n",
+			mounts: []cgroupMount{{ID: "10", MountPoint: "/sys/fs/cgroup", FSType: "cgroup"}},
+			root:   "/sys/fs/cgroup",
+		},
+		{
+			name:   "missing_mount",
+			cgroup: "0::/\n",
+			mounts: validMounts,
+			root:   "/not/sys/fs/cgroup",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := classifyUnifiedCgroupRoot(tt.cgroup, tt.mounts, tt.root)
+			if !errors.Is(err, ErrUnsupported) {
+				t.Fatalf("classify error = %v, want ErrUnsupported", err)
+			}
+		})
 	}
 }
 
@@ -298,21 +473,60 @@ func (terminator *recordingTerminator) Close(handle processHandle) error {
 }
 
 type fakeCgroupFS struct {
-	root        RootIdentity
-	rootErr     error
-	leaves      map[string]*fakeLeaf
-	nextInode   uint64
-	onReadProcs func(string, []int)
-	killWrites  int
-	removeCalls int
+	root              RootIdentity
+	rootErr           error
+	leaves            map[string]*fakeLeaf
+	nextInode         uint64
+	onBeforeReadProcs func(string)
+	onReadProcs       func(string, []int)
+	onBeforeWriteKill func(string)
+	killWrites        int
+	removeCalls       int
 }
 
 type fakeLeaf struct {
 	object    ObjectIdentity
 	procs     map[int]struct{}
+	children  map[string]map[int]struct{}
 	eventsErr error
 	freeze    FreezeState
 	removed   bool
+}
+
+type fakeCgroupObject struct {
+	name    string
+	root    ObjectIdentity
+	leaf    ObjectIdentity
+	leafRef *fakeLeaf
+	closed  bool
+}
+
+func (object *fakeCgroupObject) LeafName() string {
+	if object == nil {
+		return ""
+	}
+	return object.name
+}
+
+func (object *fakeCgroupObject) RootObject() ObjectIdentity {
+	if object == nil {
+		return ObjectIdentity{}
+	}
+	return object.root
+}
+
+func (object *fakeCgroupObject) LeafObject() ObjectIdentity {
+	if object == nil {
+		return ObjectIdentity{}
+	}
+	return object.leaf
+}
+
+func (object *fakeCgroupObject) Close() error {
+	if object != nil {
+		object.closed = true
+	}
+	return nil
 }
 
 func newFakeCgroupFS() *fakeCgroupFS {
@@ -327,6 +541,7 @@ func newFakeCgroupFS() *fakeCgroupFS {
 			Delegated:         true,
 			KillAvailable:     true,
 			FreezeAvailable:   true,
+			RootObject:        ObjectIdentity{Device: 1, Inode: 2, Generation: "root-1"},
 		},
 		leaves:    map[string]*fakeLeaf{},
 		nextInode: 10,
@@ -340,33 +555,67 @@ func (fs *fakeCgroupFS) RootIdentity(context.Context) (RootIdentity, error) {
 	return fs.root, nil
 }
 
-func (fs *fakeCgroupFS) CreateChild(_ context.Context, id string) (ObjectIdentity, error) {
+func (fs *fakeCgroupFS) CreateChild(_ context.Context, id string) (cgroupObject, error) {
 	if err := validateRetainedID(id); err != nil {
-		return ObjectIdentity{}, err
+		return nil, err
 	}
 	if leaf, ok := fs.leaves[id]; ok && !leaf.removed {
-		return ObjectIdentity{}, fmt.Errorf("%w: exists", ErrUnsupported)
+		return nil, fmt.Errorf("%w: exists", ErrUnsupported)
 	}
-	fs.nextInode++
-	leaf := &fakeLeaf{
-		object: ObjectIdentity{Device: 1, Inode: fs.nextInode, Generation: fmt.Sprintf("gen-%d", fs.nextInode)},
-		procs:  map[int]struct{}{},
-		freeze: FreezeThawed,
-	}
+	leaf := fs.newLeaf()
 	fs.leaves[id] = leaf
-	return leaf.object, nil
+	return fs.objectFor(id, leaf), nil
 }
 
-func (fs *fakeCgroupFS) Open(_ context.Context, id string) (ObjectIdentity, error) {
+func (fs *fakeCgroupFS) Open(_ context.Context, id string) (cgroupObject, error) {
 	leaf, ok := fs.leaves[id]
 	if !ok || leaf.removed {
-		return ObjectIdentity{}, fmt.Errorf("%w: missing leaf", ErrUnsupported)
+		return nil, fmt.Errorf("%w: missing leaf", ErrUnsupported)
 	}
-	return leaf.object, nil
+	return fs.objectFor(id, leaf), nil
 }
 
-func (fs *fakeCgroupFS) WriteProcs(_ context.Context, id string, pid int) error {
-	leaf, err := fs.leaf(id)
+func (fs *fakeCgroupFS) Verify(_ context.Context, object cgroupObject) (bool, error) {
+	_, err := fs.leafForObject(object)
+	if err != nil {
+		if errors.Is(err, ErrUnsupported) || errors.Is(err, ErrInvalid) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (fs *fakeCgroupFS) ProbeFeatures(ctx context.Context, object cgroupObject) (CgroupFeatures, error) {
+	features := CgroupFeatures{}
+	if fs.root.KillAvailable {
+		if err := fs.WriteKill(ctx, object); err != nil {
+			return features, err
+		}
+		features.KillAvailable = true
+	}
+	if fs.root.FreezeAvailable {
+		if err := fs.WriteFreeze(ctx, object, FreezeFrozen); err != nil {
+			return features, err
+		}
+		state, err := fs.ReadFreeze(ctx, object)
+		if err != nil {
+			return features, err
+		}
+		if err := fs.WriteFreeze(ctx, object, FreezeThawed); err != nil {
+			return features, err
+		}
+		thawed, err := fs.ReadFreeze(ctx, object)
+		if err != nil {
+			return features, err
+		}
+		features.FreezeAvailable = state == FreezeFrozen && thawed == FreezeThawed
+	}
+	return features, nil
+}
+
+func (fs *fakeCgroupFS) WriteProcs(_ context.Context, object cgroupObject, pid int) error {
+	leaf, err := fs.leafForObject(object)
 	if err != nil {
 		return err
 	}
@@ -374,8 +623,11 @@ func (fs *fakeCgroupFS) WriteProcs(_ context.Context, id string, pid int) error 
 	return nil
 }
 
-func (fs *fakeCgroupFS) ReadProcs(_ context.Context, id string) ([]int, error) {
-	leaf, err := fs.leaf(id)
+func (fs *fakeCgroupFS) ReadProcs(_ context.Context, object cgroupObject) ([]int, error) {
+	if fs.onBeforeReadProcs != nil {
+		fs.onBeforeReadProcs(object.LeafName())
+	}
+	leaf, err := fs.leafForObject(object)
 	if err != nil {
 		return nil, err
 	}
@@ -385,40 +637,44 @@ func (fs *fakeCgroupFS) ReadProcs(_ context.Context, id string) ([]int, error) {
 	}
 	slices.Sort(pids)
 	if fs.onReadProcs != nil {
-		fs.onReadProcs(id, slices.Clone(pids))
+		fs.onReadProcs(object.LeafName(), slices.Clone(pids))
 	}
 	return pids, nil
 }
 
-func (fs *fakeCgroupFS) ReadEvents(_ context.Context, id string) (Events, error) {
-	leaf, err := fs.leaf(id)
+func (fs *fakeCgroupFS) ReadEvents(_ context.Context, object cgroupObject) (Events, error) {
+	leaf, err := fs.leafForObject(object)
 	if err != nil {
 		return Events{}, err
 	}
 	if leaf.eventsErr != nil {
 		return Events{}, leaf.eventsErr
 	}
-	return Events{Populated: len(leaf.procs) > 0}, nil
+	return Events{Populated: leaf.populated()}, nil
 }
 
-func (fs *fakeCgroupFS) WriteKill(_ context.Context, id string) error {
+func (fs *fakeCgroupFS) WriteKill(_ context.Context, object cgroupObject) error {
 	if !fs.root.KillAvailable {
 		return fmt.Errorf("%w: cgroup.kill missing", ErrUnsupported)
 	}
-	leaf, err := fs.leaf(id)
+	if fs.onBeforeWriteKill != nil {
+		fs.onBeforeWriteKill(object.LeafName())
+	}
+	leaf, err := fs.leafForObject(object)
 	if err != nil {
 		return err
 	}
 	fs.killWrites++
 	leaf.procs = map[int]struct{}{}
+	leaf.children = map[string]map[int]struct{}{}
 	return nil
 }
 
-func (fs *fakeCgroupFS) WriteFreeze(_ context.Context, id string, state FreezeState) error {
+func (fs *fakeCgroupFS) WriteFreeze(_ context.Context, object cgroupObject, state FreezeState) error {
 	if !fs.root.FreezeAvailable {
 		return fmt.Errorf("%w: cgroup.freeze missing", ErrUnsupported)
 	}
-	leaf, err := fs.leaf(id)
+	leaf, err := fs.leafForObject(object)
 	if err != nil {
 		return err
 	}
@@ -426,23 +682,23 @@ func (fs *fakeCgroupFS) WriteFreeze(_ context.Context, id string, state FreezeSt
 	return nil
 }
 
-func (fs *fakeCgroupFS) ReadFreeze(_ context.Context, id string) (FreezeState, error) {
+func (fs *fakeCgroupFS) ReadFreeze(_ context.Context, object cgroupObject) (FreezeState, error) {
 	if !fs.root.FreezeAvailable {
 		return FreezeUnknown, fmt.Errorf("%w: cgroup.freeze missing", ErrUnsupported)
 	}
-	leaf, err := fs.leaf(id)
+	leaf, err := fs.leafForObject(object)
 	if err != nil {
 		return FreezeUnknown, err
 	}
 	return leaf.freeze, nil
 }
 
-func (fs *fakeCgroupFS) Remove(_ context.Context, id string) error {
-	leaf, err := fs.leaf(id)
+func (fs *fakeCgroupFS) Remove(_ context.Context, object cgroupObject) error {
+	leaf, err := fs.leafForObject(object)
 	if err != nil {
 		return err
 	}
-	if len(leaf.procs) > 0 {
+	if leaf.populated() {
 		return ErrPopulated
 	}
 	fs.removeCalls++
@@ -457,7 +713,7 @@ func (fs *fakeCgroupFS) mustCreate(id string) {
 }
 
 func (fs *fakeCgroupFS) exists(id string) bool {
-	leaf, ok := fs.leaves[id]
+	leaf, ok := fs.leaves[fs.leafName(id)]
 	return ok && !leaf.removed
 }
 
@@ -482,6 +738,22 @@ func (fs *fakeCgroupFS) addProcs(id string, pids ...int) {
 	}
 }
 
+func (fs *fakeCgroupFS) addChildProcs(id, child string, pids ...int) {
+	leaf, err := fs.leaf(id)
+	if err != nil {
+		panic(err)
+	}
+	if leaf.children == nil {
+		leaf.children = map[string]map[int]struct{}{}
+	}
+	if leaf.children[child] == nil {
+		leaf.children[child] = map[int]struct{}{}
+	}
+	for _, pid := range pids {
+		leaf.children[child][pid] = struct{}{}
+	}
+}
+
 func (fs *fakeCgroupFS) setEventsErr(id string, err error) {
 	leaf, leafErr := fs.leaf(id)
 	if leafErr != nil {
@@ -495,14 +767,72 @@ func (fs *fakeCgroupFS) recreate(id string) {
 	if err != nil {
 		panic(err)
 	}
-	fs.nextInode++
-	leaf.object = ObjectIdentity{Device: 1, Inode: fs.nextInode, Generation: fmt.Sprintf("gen-%d", fs.nextInode)}
+	leaf.removed = true
+	fs.leaves[fs.leafName(id)] = fs.newLeaf()
 }
 
 func (fs *fakeCgroupFS) leaf(id string) (*fakeLeaf, error) {
-	leaf, ok := fs.leaves[id]
+	name := fs.leafName(id)
+	leaf, ok := fs.leaves[name]
 	if !ok || leaf.removed {
 		return nil, fmt.Errorf("%w: missing leaf", ErrUnsupported)
 	}
 	return leaf, nil
+}
+
+func (fs *fakeCgroupFS) leafName(id string) string {
+	if _, ok := fs.leaves[id]; ok {
+		return id
+	}
+	descriptor, err := parseRetainedID(id)
+	if err == nil {
+		return descriptor.leafName
+	}
+	return id
+}
+
+func (fs *fakeCgroupFS) newLeaf() *fakeLeaf {
+	fs.nextInode++
+	return &fakeLeaf{
+		object:   ObjectIdentity{Device: 1, Inode: fs.nextInode, Generation: fmt.Sprintf("gen-%d", fs.nextInode)},
+		procs:    map[int]struct{}{},
+		children: map[string]map[int]struct{}{},
+		freeze:   FreezeThawed,
+	}
+}
+
+func (fs *fakeCgroupFS) objectFor(name string, leaf *fakeLeaf) *fakeCgroupObject {
+	return &fakeCgroupObject{
+		name:    name,
+		root:    fs.root.RootObject,
+		leaf:    leaf.object,
+		leafRef: leaf,
+	}
+}
+
+func (fs *fakeCgroupFS) leafForObject(object cgroupObject) (*fakeLeaf, error) {
+	fakeObject, ok := object.(*fakeCgroupObject)
+	if !ok || fakeObject == nil || fakeObject.closed {
+		return nil, fmt.Errorf("%w: invalid cgroup object", ErrInvalid)
+	}
+	current, ok := fs.leaves[fakeObject.name]
+	if !ok || current.removed || fakeObject.leafRef.removed || current != fakeObject.leafRef {
+		return nil, fmt.Errorf("%w: stale cgroup object", ErrUnsupported)
+	}
+	if !fakeObject.root.Equal(fs.root.RootObject) || !fakeObject.leaf.Equal(current.object) {
+		return nil, fmt.Errorf("%w: stale cgroup object", ErrUnsupported)
+	}
+	return current, nil
+}
+
+func (leaf *fakeLeaf) populated() bool {
+	if len(leaf.procs) > 0 {
+		return true
+	}
+	for _, procs := range leaf.children {
+		if len(procs) > 0 {
+			return true
+		}
+	}
+	return false
 }

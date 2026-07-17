@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -49,6 +51,7 @@ type RootIdentity struct {
 	Threaded          bool
 	KillAvailable     bool
 	FreezeAvailable   bool
+	RootObject        ObjectIdentity
 }
 
 func (identity RootIdentity) kernelDomain() (model.KernelDomainID, error) {
@@ -72,6 +75,7 @@ func (identity RootIdentity) retainedDomainID() string {
 		identity.CgroupNamespaceID,
 		identity.MountID,
 		identity.HierarchyID,
+		identity.RootObject.stableToken(),
 	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return "cgdomain-" + hex.EncodeToString(sum[:16])
@@ -88,9 +92,48 @@ type ObjectIdentity struct {
 func (identity ObjectIdentity) Equal(other ObjectIdentity) bool {
 	return identity.Device == other.Device &&
 		identity.Inode == other.Inode &&
-		identity.ChangeSec == other.ChangeSec &&
-		identity.ChangeNsec == other.ChangeNsec &&
-		identity.Generation == other.Generation
+		(identity.Generation == "" || other.Generation == "" || identity.Generation == other.Generation)
+}
+
+func (identity ObjectIdentity) valid() bool {
+	return identity.Device != 0 && identity.Inode != 0
+}
+
+func (identity ObjectIdentity) stableToken() string {
+	if !identity.valid() {
+		return ""
+	}
+	if identity.Generation != "" {
+		return fmt.Sprintf("%x-%x-%s", identity.Device, identity.Inode, hex.EncodeToString([]byte(identity.Generation)))
+	}
+	return fmt.Sprintf("%x-%x", identity.Device, identity.Inode)
+}
+
+func parseObjectIdentityToken(token string) (ObjectIdentity, error) {
+	parts := strings.Split(token, "-")
+	if len(parts) != 2 && len(parts) != 3 {
+		return ObjectIdentity{}, fmt.Errorf("%w: invalid object identity token", ErrInvalid)
+	}
+	device, err := strconv.ParseUint(parts[0], 16, 64)
+	if err != nil {
+		return ObjectIdentity{}, fmt.Errorf("%w: invalid object identity device", ErrInvalid)
+	}
+	inode, err := strconv.ParseUint(parts[1], 16, 64)
+	if err != nil {
+		return ObjectIdentity{}, fmt.Errorf("%w: invalid object identity inode", ErrInvalid)
+	}
+	identity := ObjectIdentity{Device: device, Inode: inode}
+	if len(parts) == 3 {
+		generation, err := hex.DecodeString(parts[2])
+		if err != nil {
+			return ObjectIdentity{}, fmt.Errorf("%w: invalid object identity generation", ErrInvalid)
+		}
+		identity.Generation = string(generation)
+	}
+	if !identity.valid() {
+		return ObjectIdentity{}, fmt.Errorf("%w: incomplete object identity", ErrInvalid)
+	}
+	return identity, nil
 }
 
 type Events struct {
@@ -105,17 +148,31 @@ const (
 	FreezeFrozen
 )
 
+type CgroupFeatures struct {
+	KillAvailable   bool
+	FreezeAvailable bool
+}
+
+type cgroupObject interface {
+	LeafName() string
+	RootObject() ObjectIdentity
+	LeafObject() ObjectIdentity
+	Close() error
+}
+
 type cgroupFS interface {
 	RootIdentity(context.Context) (RootIdentity, error)
-	CreateChild(context.Context, string) (ObjectIdentity, error)
-	Open(context.Context, string) (ObjectIdentity, error)
-	WriteProcs(context.Context, string, int) error
-	ReadProcs(context.Context, string) ([]int, error)
-	ReadEvents(context.Context, string) (Events, error)
-	WriteKill(context.Context, string) error
-	WriteFreeze(context.Context, string, FreezeState) error
-	ReadFreeze(context.Context, string) (FreezeState, error)
-	Remove(context.Context, string) error
+	CreateChild(context.Context, string) (cgroupObject, error)
+	Open(context.Context, string) (cgroupObject, error)
+	Verify(context.Context, cgroupObject) (bool, error)
+	ProbeFeatures(context.Context, cgroupObject) (CgroupFeatures, error)
+	WriteProcs(context.Context, cgroupObject, int) error
+	ReadProcs(context.Context, cgroupObject) ([]int, error)
+	ReadEvents(context.Context, cgroupObject) (Events, error)
+	WriteKill(context.Context, cgroupObject) error
+	WriteFreeze(context.Context, cgroupObject, FreezeState) error
+	ReadFreeze(context.Context, cgroupObject) (FreezeState, error)
+	Remove(context.Context, cgroupObject) error
 }
 
 type processTerminator interface {
@@ -174,15 +231,6 @@ func (manager *Manager) Probe(ctx context.Context) Support {
 		return unsupportedSupport(err)
 	}
 	if err := strictSupportError(root); err != nil {
-		if !root.KillAvailable && root.FreezeAvailable {
-			return Support{
-				Supported:          false,
-				RuntimeProbePassed: false,
-				Degraded:           true,
-				Platform:           runtime.GOOS,
-				Reason:             err,
-			}
-		}
 		return unsupportedSupport(err)
 	}
 
@@ -199,6 +247,24 @@ func (manager *Manager) Probe(ctx context.Context) Support {
 		_ = capability.Remove(ctx)
 	}()
 
+	features, err := capability.ProbeFeatures(ctx)
+	if err != nil {
+		return unsupportedSupport(fmt.Errorf("%w: probe cgroup features: %v", ErrUnsupported, err))
+	}
+	if !features.KillAvailable {
+		reason := fmt.Errorf("%w: cgroup.kill is required", ErrUnsupported)
+		if features.FreezeAvailable {
+			return Support{
+				Supported:          false,
+				RuntimeProbePassed: false,
+				Degraded:           true,
+				Platform:           runtime.GOOS,
+				Reason:             reason,
+			}
+		}
+		return unsupportedSupport(reason)
+	}
+
 	proc, err := manager.spawnProbe(ctx)
 	if err != nil {
 		return unsupportedSupport(fmt.Errorf("%w: probe process: %v", ErrUnsupported, err))
@@ -206,7 +272,7 @@ func (manager *Manager) Probe(ctx context.Context) Support {
 	if proc.Cleanup != nil {
 		defer proc.Cleanup()
 	}
-	if err := manager.fs.WriteProcs(ctx, capability.retainedID, proc.PID); err != nil {
+	if err := manager.fs.WriteProcs(ctx, capability.object, proc.PID); err != nil {
 		return unsupportedSupport(fmt.Errorf("%w: place probe process: %v", ErrUnsupported, err))
 	}
 	if membership, err := capability.Membership(ctx); err != nil || membership != containment.RetainedMembershipPresent {
@@ -243,8 +309,8 @@ func strictSupportError(root RootIdentity) error {
 		return fmt.Errorf("%w: delegated writable cgroup root is required", ErrUnsupported)
 	case root.Threaded:
 		return fmt.Errorf("%w: threaded cgroups are not strict containment", ErrUnsupported)
-	case !root.KillAvailable:
-		return fmt.Errorf("%w: cgroup.kill is required", ErrUnsupported)
+	case !root.RootObject.valid():
+		return fmt.Errorf("%w: delegated cgroup root object identity is required", ErrUnsupported)
 	default:
 		return nil
 	}
@@ -262,6 +328,72 @@ func unsupportedSupport(reason error) Support {
 	}
 }
 
+const retainedIDVersion = "cg2a"
+
+type retainedDescriptor struct {
+	leafName string
+	root     ObjectIdentity
+	leaf     ObjectIdentity
+}
+
+func newRetainedID(leafName string, object cgroupObject) (string, error) {
+	if object == nil {
+		return "", fmt.Errorf("%w: cgroup object is missing", ErrInvalid)
+	}
+	if err := validateRetainedID(leafName); err != nil {
+		return "", err
+	}
+	root := object.RootObject()
+	leaf := object.LeafObject()
+	if !root.valid() || !leaf.valid() {
+		return "", fmt.Errorf("%w: cgroup object identity is incomplete", ErrInvalid)
+	}
+	encodedLeaf := base64.RawURLEncoding.EncodeToString([]byte(leafName))
+	retainedID := strings.Join([]string{
+		retainedIDVersion,
+		encodedLeaf,
+		root.stableToken(),
+		leaf.stableToken(),
+	}, ".")
+	if len(retainedID) > 256 {
+		return "", fmt.Errorf("%w: retained id is too long", ErrInvalid)
+	}
+	return retainedID, nil
+}
+
+func parseRetainedID(retainedID string) (retainedDescriptor, error) {
+	parts := strings.Split(retainedID, ".")
+	if len(parts) != 4 || parts[0] != retainedIDVersion {
+		return retainedDescriptor{}, fmt.Errorf("%w: retained id does not carry cgroup object identity", ErrInvalid)
+	}
+	leafBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return retainedDescriptor{}, fmt.Errorf("%w: retained id leaf name is invalid", ErrInvalid)
+	}
+	leafName := string(leafBytes)
+	if err := validateRetainedID(leafName); err != nil {
+		return retainedDescriptor{}, err
+	}
+	root, err := parseObjectIdentityToken(parts[2])
+	if err != nil {
+		return retainedDescriptor{}, err
+	}
+	leaf, err := parseObjectIdentityToken(parts[3])
+	if err != nil {
+		return retainedDescriptor{}, err
+	}
+	return retainedDescriptor{leafName: leafName, root: root, leaf: leaf}, nil
+}
+
+func (descriptor retainedDescriptor) matches(object cgroupObject) bool {
+	if object == nil {
+		return false
+	}
+	return descriptor.leafName == object.LeafName() &&
+		descriptor.root.Equal(object.RootObject()) &&
+		descriptor.leaf.Equal(object.LeafObject())
+}
+
 func (manager *Manager) AcquireRetainedGroup(ctx context.Context, target model.GroupRef, _ time.Time) (containment.RetainedGroupCapability, error) {
 	if manager == nil || manager.fs == nil {
 		return nil, fmt.Errorf("%w: manager is nil", ErrUnsupported)
@@ -274,9 +406,17 @@ func (manager *Manager) AcquireRetainedGroup(ctx context.Context, target model.G
 		return nil, err
 	}
 	if target.RetainedID == "" {
-		return manager.create(ctx, root)
+		capability, err := manager.create(ctx, root)
+		if err != nil {
+			return nil, err
+		}
+		return capability, nil
 	}
-	return manager.open(ctx, root, target.RetainedID)
+	capability, err := manager.open(ctx, root, target.RetainedID)
+	if err != nil {
+		return nil, err
+	}
+	return capability, nil
 }
 
 func (manager *Manager) create(ctx context.Context, root RootIdentity) (*Capability, error) {
@@ -296,10 +436,16 @@ func (manager *Manager) create(ctx context.Context, root RootIdentity) (*Capabil
 			}
 			continue
 		}
+		durableID, err := newRetainedID(retainedID, object)
+		if err != nil {
+			_ = object.Close()
+			return nil, err
+		}
 		return &Capability{
 			fs:           manager.fs,
 			terminator:   manager.terminator,
-			retainedID:   retainedID,
+			retainedID:   durableID,
+			leafName:     retainedID,
 			kernelDomain: kernelDomain,
 			object:       object,
 		}, nil
@@ -308,21 +454,27 @@ func (manager *Manager) create(ctx context.Context, root RootIdentity) (*Capabil
 }
 
 func (manager *Manager) open(ctx context.Context, root RootIdentity, retainedID string) (*Capability, error) {
-	if err := validateRetainedID(retainedID); err != nil {
+	descriptor, err := parseRetainedID(retainedID)
+	if err != nil {
 		return nil, err
 	}
 	kernelDomain, err := root.kernelDomain()
 	if err != nil {
 		return nil, err
 	}
-	object, err := manager.fs.Open(ctx, retainedID)
+	object, err := manager.fs.Open(ctx, descriptor.leafName)
 	if err != nil {
 		return nil, err
+	}
+	if !descriptor.matches(object) {
+		_ = object.Close()
+		return nil, fmt.Errorf("%w: retained cgroup object identity mismatch", ErrUnsupported)
 	}
 	return &Capability{
 		fs:           manager.fs,
 		terminator:   manager.terminator,
 		retainedID:   retainedID,
+		leafName:     descriptor.leafName,
 		kernelDomain: kernelDomain,
 		object:       object,
 	}, nil
@@ -332,8 +484,9 @@ type Capability struct {
 	fs           cgroupFS
 	terminator   processTerminator
 	retainedID   string
+	leafName     string
 	kernelDomain model.KernelDomainID
-	object       ObjectIdentity
+	object       cgroupObject
 	released     bool
 	removed      bool
 }
@@ -355,7 +508,7 @@ func (capability *Capability) Membership(ctx context.Context) (containment.Retai
 	if err := ctx.Err(); err != nil {
 		return containment.RetainedMembershipUnknown, err
 	}
-	events, err := capability.fs.ReadEvents(ctx, capability.retainedID)
+	events, err := capability.fs.ReadEvents(ctx, capability.object)
 	if err != nil {
 		return containment.RetainedMembershipUnknown, nil
 	}
@@ -372,11 +525,17 @@ func (capability *Capability) StillHeld(ctx context.Context) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	current, err := capability.fs.Open(ctx, capability.retainedID)
-	if err != nil {
-		return false, nil
+	return capability.fs.Verify(ctx, capability.object)
+}
+
+func (capability *Capability) ProbeFeatures(ctx context.Context) (CgroupFeatures, error) {
+	if capability == nil || capability.released || capability.removed {
+		return CgroupFeatures{}, fmt.Errorf("%w: cgroup capability is closed", ErrInvalid)
 	}
-	return capability.object.Equal(current), nil
+	if err := ctx.Err(); err != nil {
+		return CgroupFeatures{}, err
+	}
+	return capability.fs.ProbeFeatures(ctx, capability.object)
 }
 
 func (capability *Capability) SignalTerm(ctx context.Context) (containment.SignalResult, error) {
@@ -386,12 +545,22 @@ func (capability *Capability) SignalTerm(ctx context.Context) (containment.Signa
 	if err := ctx.Err(); err != nil {
 		return containment.SignalUnprovable, err
 	}
-	pids, err := capability.fs.ReadProcs(ctx, capability.retainedID)
+	if err := capability.requireHeld(ctx); err != nil {
+		return containment.SignalUnprovable, err
+	}
+	pids, err := capability.fs.ReadProcs(ctx, capability.object)
 	if err != nil {
 		return containment.SignalUnprovable, err
 	}
 	pids = uniquePIDs(pids)
 	if len(pids) == 0 {
+		events, err := capability.fs.ReadEvents(ctx, capability.object)
+		if err != nil {
+			return containment.SignalUnprovable, err
+		}
+		if events.Populated {
+			return containment.SignalDelivered, nil
+		}
 		return containment.SignalTargetAbsent, nil
 	}
 	for _, pid := range pids {
@@ -402,7 +571,7 @@ func (capability *Capability) SignalTerm(ctx context.Context) (containment.Signa
 			}
 			return containment.SignalUnprovable, err
 		}
-		current, verifyErr := capability.fs.ReadProcs(ctx, capability.retainedID)
+		current, verifyErr := capability.fs.ReadProcs(ctx, capability.object)
 		if verifyErr != nil {
 			_ = capability.terminator.Close(handle)
 			return containment.SignalUnprovable, verifyErr
@@ -429,7 +598,10 @@ func (capability *Capability) Kill(ctx context.Context) (containment.SignalResul
 	if err := ctx.Err(); err != nil {
 		return containment.SignalUnprovable, err
 	}
-	if err := capability.fs.WriteKill(ctx, capability.retainedID); err != nil {
+	if err := capability.requireHeld(ctx); err != nil {
+		return containment.SignalUnprovable, err
+	}
+	if err := capability.fs.WriteKill(ctx, capability.object); err != nil {
 		return containment.SignalUnprovable, err
 	}
 	return containment.SignalDelivered, nil
@@ -449,7 +621,10 @@ func (capability *Capability) Remove(ctx context.Context) error {
 	if membership != containment.RetainedMembershipEmpty {
 		return ErrPopulated
 	}
-	if err := capability.fs.Remove(ctx, capability.retainedID); err != nil {
+	if err := capability.requireHeld(ctx); err != nil {
+		return err
+	}
+	if err := capability.fs.Remove(ctx, capability.object); err != nil {
 		return err
 	}
 	capability.removed = true
@@ -460,7 +635,24 @@ func (capability *Capability) Release() error {
 	if capability == nil {
 		return nil
 	}
+	if capability.released {
+		return nil
+	}
 	capability.released = true
+	if capability.object == nil {
+		return nil
+	}
+	return capability.object.Close()
+}
+
+func (capability *Capability) requireHeld(ctx context.Context) error {
+	held, err := capability.StillHeld(ctx)
+	if err != nil {
+		return err
+	}
+	if !held {
+		return fmt.Errorf("%w: cgroup object is no longer held", ErrUnsupported)
+	}
 	return nil
 }
 
@@ -475,6 +667,101 @@ func validateRetainedID(retainedID string) error {
 		return fmt.Errorf("%w: retained id must be token-safe", ErrInvalid)
 	}
 	return nil
+}
+
+type cgroupMount struct {
+	ID         string
+	MountPoint string
+	FSType     string
+}
+
+func classifyUnifiedCgroupRoot(procSelfCgroup string, mounts []cgroupMount, root string) (cgroupMount, error) {
+	if err := requireUnifiedSelfCgroup(procSelfCgroup); err != nil {
+		return cgroupMount{}, err
+	}
+	mount, ok := bestMountForRoot(mounts, root)
+	if !ok {
+		return cgroupMount{}, fmt.Errorf("%w: cgroup mount for root is unknown", ErrUnsupported)
+	}
+	if mount.FSType != "cgroup2" {
+		return cgroupMount{}, fmt.Errorf("%w: cgroup root is not a unified cgroup2 mount", ErrUnsupported)
+	}
+	if strings.TrimSpace(mount.ID) == "" {
+		return cgroupMount{}, fmt.Errorf("%w: cgroup mount id is unknown", ErrUnsupported)
+	}
+	return mount, nil
+}
+
+func requireUnifiedSelfCgroup(data string) error {
+	lines := strings.Split(data, "\n")
+	unified := 0
+	legacy := 0
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			return fmt.Errorf("%w: malformed /proc/self/cgroup", ErrUnsupported)
+		}
+		if parts[0] == "0" && parts[1] == "" {
+			unified++
+			continue
+		}
+		legacy++
+	}
+	if unified != 1 || legacy != 0 {
+		return fmt.Errorf("%w: cgroup hierarchy is legacy, hybrid, or ambiguous", ErrUnsupported)
+	}
+	return nil
+}
+
+func bestMountForRoot(mounts []cgroupMount, root string) (cgroupMount, bool) {
+	root = filepath.Clean(root)
+	var best cgroupMount
+	bestLen := -1
+	for _, mount := range mounts {
+		mountPoint := filepath.Clean(mount.MountPoint)
+		if root != mountPoint && !strings.HasPrefix(root, mountPoint+"/") {
+			continue
+		}
+		if len(mountPoint) > bestLen {
+			best = mount
+			bestLen = len(mountPoint)
+		}
+	}
+	return best, bestLen >= 0
+}
+
+func parseMountInfo(data string) ([]cgroupMount, error) {
+	lines := strings.Split(data, "\n")
+	mounts := make([]cgroupMount, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			return nil, fmt.Errorf("%w: malformed mountinfo", ErrUnsupported)
+		}
+		separator := slices.Index(fields, "-")
+		if separator < 0 || separator+1 >= len(fields) || separator < 5 {
+			return nil, fmt.Errorf("%w: malformed mountinfo", ErrUnsupported)
+		}
+		mounts = append(mounts, cgroupMount{
+			ID:         fields[0],
+			MountPoint: unescapeMountInfo(fields[4]),
+			FSType:     fields[separator+1],
+		})
+	}
+	return mounts, nil
+}
+
+func unescapeMountInfo(value string) string {
+	replacer := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
+	return replacer.Replace(value)
 }
 
 func tokenSafe(value string) bool {

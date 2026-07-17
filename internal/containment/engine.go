@@ -207,6 +207,12 @@ func (engine Engine) signal(ctx context.Context, target model.GroupRef, state co
 	case SignalDelivered:
 		return Outcome{}
 	case SignalTargetAbsent:
+		if authorization.Basis == model.ContainmentBasisRetainedObject {
+			proof, valid := engine.retainedObjectProof(ctx, target, state, engine.Clock.Now())
+			if !valid || proof != model.RetainedObjectProofEmpty {
+				return UnprovableOutcome(ReasonSignalUnprovable, authorization.Decision, nil)
+			}
+		}
 		return AbsentOutcome(model.AlreadyAbsent)
 	case SignalUnprovable:
 		return UnprovableOutcome(ReasonSignalUnprovable, authorization.Decision, nil)
