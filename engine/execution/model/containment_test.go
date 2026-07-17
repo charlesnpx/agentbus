@@ -43,6 +43,27 @@ func TestContainmentRetainedObjectProofAuthorizesMissingLeader(t *testing.T) {
 	}
 }
 
+func TestContainmentRetainedMembersPresentContradictsDifferentKernelDomain(t *testing.T) {
+	ref := retainedReducerGroup(LaunchOrdinalOne)
+	differentDomain := ref.KernelDomain()
+	differentDomain.RetainedDomainID = "retained-domain-different"
+	result, err := DecideContainmentAuthorizationWithBasis(ContainmentAuthorization{
+		Group: ref,
+		Observation: ContainmentObservation{
+			KernelDomainID: differentDomain,
+			Group:          GroupLive,
+			Leader:         ProcessIdentityMissing,
+		},
+		RetainedObject: RetainedObjectProofMembersPresent,
+	})
+	if err != nil {
+		t.Fatalf("DecideContainmentAuthorizationWithBasis error = %v", err)
+	}
+	if result.Decision != Unprovable || result.Basis != ContainmentBasisNone {
+		t.Fatalf("authorization = %#v, want unprovable/no basis", result)
+	}
+}
+
 func TestContainmentAuthorizationCarriesBasis(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
 	leaderResult, err := DecideContainmentAuthorizationWithBasis(ContainmentAuthorization{
@@ -93,6 +114,27 @@ func TestContainmentRetainedObjectEmptyProofProvesAbsent(t *testing.T) {
 	}
 	if decision != AlreadyAbsent {
 		t.Fatalf("decision = %s, want %s", decision, AlreadyAbsent)
+	}
+}
+
+func TestContainmentRetainedObjectEmptyProofProvesAbsentWithDifferentKernelDomain(t *testing.T) {
+	ref := retainedReducerGroup(LaunchOrdinalOne)
+	differentDomain := ref.KernelDomain()
+	differentDomain.RetainedDomainID = "retained-domain-different"
+	result, err := DecideContainmentAuthorizationWithBasis(ContainmentAuthorization{
+		Group: ref,
+		Observation: ContainmentObservation{
+			KernelDomainID: differentDomain,
+			Group:          GroupLive,
+			Leader:         ProcessIdentityMissing,
+		},
+		RetainedObject: RetainedObjectProofEmpty,
+	})
+	if err != nil {
+		t.Fatalf("DecideContainmentAuthorizationWithBasis error = %v", err)
+	}
+	if result.Decision != AlreadyAbsent || result.Basis != ContainmentBasisRetainedObject {
+		t.Fatalf("authorization = %#v, want already_absent/retained_object", result)
 	}
 }
 
@@ -212,6 +254,25 @@ func TestContainmentAlreadyAbsentAfterIndependentObservation(t *testing.T) {
 	}
 }
 
+func TestContainmentNonRetainedDifferentKernelDomainRemainsAlreadyAbsent(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	differentDomain := noPIDNamespaceDomain("different-host-boot")
+	result, err := DecideContainmentAuthorizationWithBasis(ContainmentAuthorization{
+		Group: ref,
+		Observation: ContainmentObservation{
+			KernelDomainID: differentDomain,
+			Group:          GroupLive,
+			Leader:         ProcessIdentityMissing,
+		},
+	})
+	if err != nil {
+		t.Fatalf("DecideContainmentAuthorizationWithBasis error = %v", err)
+	}
+	if result.Decision != AlreadyAbsent || result.Basis != ContainmentBasisNone {
+		t.Fatalf("authorization = %#v, want already_absent/no basis", result)
+	}
+}
+
 func TestContainmentGroupLeaderCoherenceExhaustive(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
 	groups := []GroupExistenceObservation{
@@ -255,6 +316,13 @@ func TestContainmentGroupLeaderCoherenceExhaustive(t *testing.T) {
 			})
 		}
 	}
+}
+
+func retainedReducerGroup(ordinal LaunchOrdinal) GroupRef {
+	ref := reducerGroup(ordinal)
+	ref.RetainedDomainID = "retained-domain-" + ordinal.String()
+	ref.RetainedDomainState = RetainedDomainKnown
+	return ref
 }
 
 func TestContainmentIncoherentAbsentLiveLeaderIsUnprovable(t *testing.T) {

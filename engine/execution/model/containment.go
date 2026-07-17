@@ -141,12 +141,19 @@ func DecideContainmentAuthorizationWithBasis(input ContainmentAuthorization) (Co
 	if err != nil {
 		return ContainmentAuthorizationResult{}, err
 	}
+	if input.RetainedObject != RetainedObjectProofNone {
+		return decideRetainedContainment(input, relation)
+	}
 	if relation == kernelDomainDifferent {
 		return containmentAuthorizationResult(AlreadyAbsent, ContainmentBasisNone), nil
 	}
 	if relation == kernelDomainUnprovable {
 		return containmentAuthorizationResult(Unprovable, ContainmentBasisNone), nil
 	}
+	return decideObservedContainment(input)
+}
+
+func decideRetainedContainment(input ContainmentAuthorization, relation kernelDomainRelation) (ContainmentAuthorizationResult, error) {
 	switch input.RetainedObject {
 	case RetainedObjectProofEmpty:
 		if input.Observation.Leader == ProcessIdentityMatching {
@@ -154,13 +161,20 @@ func DecideContainmentAuthorizationWithBasis(input ContainmentAuthorization) (Co
 		}
 		return containmentAuthorizationResult(AlreadyAbsent, ContainmentBasisRetainedObject), nil
 	case RetainedObjectProofMembersPresent:
-		if input.Observation.Group == GroupAbsent {
+		if relation == kernelDomainDifferent || input.Observation.Group == GroupAbsent {
+			return containmentAuthorizationResult(Unprovable, ContainmentBasisNone), nil
+		}
+		if relation == kernelDomainUnprovable {
 			return containmentAuthorizationResult(Unprovable, ContainmentBasisNone), nil
 		}
 		return containmentAuthorizationResult(SignalDirectly, ContainmentBasisRetainedObject), nil
 	case RetainedObjectProofUnknown:
 		// Unknown retained-object state never proves absence or signal authority.
 	}
+	return containmentAuthorizationResult(Unprovable, ContainmentBasisNone), nil
+}
+
+func decideObservedContainment(input ContainmentAuthorization) (ContainmentAuthorizationResult, error) {
 	switch input.Observation.Group {
 	case GroupAbsent:
 		return containmentAuthorizationResult(AlreadyAbsent, ContainmentBasisNone), nil

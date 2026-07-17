@@ -380,6 +380,42 @@ func TestContainmentRetainedObjectEmptyProofProvesAbsent(t *testing.T) {
 	}
 }
 
+func TestContainmentRetainedObjectMembersPresentDifferentKernelDomainIsUnprovable(t *testing.T) {
+	target := testRetainedGroupRef(t)
+	observation := testObservation(target, model.GroupLive, model.ProcessIdentityMissing)
+	observation.KernelDomainID.RetainedDomainID = "retained-domain-different"
+	observer := &fakeObserver{observations: []model.ContainmentObservation{observation}}
+	signaler := &fakeSignaler{}
+	retained := &fakeRetainedObject{membership: RetainedMembershipPresent}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	assertSignals(t, signaler)
+	assertRetainedSignals(t, retained)
+	if retained.membershipCalls == 0 {
+		t.Fatalf("retained capability membership was not consulted")
+	}
+}
+
+func TestContainmentRetainedObjectEmptyProofDifferentKernelDomainProvesAbsent(t *testing.T) {
+	target := testRetainedGroupRef(t)
+	observation := testObservation(target, model.GroupLive, model.ProcessIdentityMissing)
+	observation.KernelDomainID.RetainedDomainID = "retained-domain-different"
+	observer := &fakeObserver{observations: []model.ContainmentObservation{observation}}
+	signaler := &fakeSignaler{}
+	retained := &fakeRetainedObject{membership: RetainedMembershipEmpty}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertAbsent(t, outcome)
+	assertSignals(t, signaler)
+	assertRetainedSignals(t, retained)
+	if retained.membershipCalls == 0 {
+		t.Fatalf("retained capability membership was not consulted")
+	}
+}
+
 func TestContainmentRetainedObjectUnknownProofIsUnprovable(t *testing.T) {
 	target := testRetainedGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
