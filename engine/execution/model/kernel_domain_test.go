@@ -60,6 +60,27 @@ func TestKernelDomainIDValidateAndEqual(t *testing.T) {
 	}
 }
 
+func TestKernelDomainSourceCanonicalization(t *testing.T) {
+	hostBootID, err := CanonicalHostBootID("  host-boot-1\n")
+	if err != nil {
+		t.Fatalf("CanonicalHostBootID() error = %v", err)
+	}
+	if hostBootID != "host-boot-1" {
+		t.Fatalf("CanonicalHostBootID() = %q, want host-boot-1", hostBootID)
+	}
+
+	pidNamespaceID, err := CanonicalPIDNamespaceID("pid:[4026531836]")
+	if err != nil {
+		t.Fatalf("CanonicalPIDNamespaceID() error = %v", err)
+	}
+	if pidNamespaceID != "pidns-pid--4026531836-" {
+		t.Fatalf("CanonicalPIDNamespaceID() = %q, want pidns-pid--4026531836-", pidNamespaceID)
+	}
+	if _, err := NewKernelDomainID(hostBootID, pidNamespaceID); err != nil {
+		t.Fatalf("NewKernelDomainID(canonical values) error = %v", err)
+	}
+}
+
 func TestKernelDomainIDRetainedDomainKnowledge(t *testing.T) {
 	notApplicable := KernelDomainID{
 		HostBootID:          "host-boot-1",

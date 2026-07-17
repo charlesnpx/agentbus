@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"golang.org/x/sys/unix"
@@ -19,11 +18,7 @@ func nativeHostBootID() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	bootID := strings.TrimSpace(string(data))
-	if bootID == "" {
-		return "", fmt.Errorf("kernel boot id is empty")
-	}
-	return bootID, nil
+	return model.CanonicalHostBootID(string(data))
 }
 
 func nativePIDNamespaceID() (string, error) {
@@ -31,10 +26,7 @@ func nativePIDNamespaceID() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if namespaceID == "" {
-		return "", fmt.Errorf("pid namespace id is empty")
-	}
-	return namespaceID, nil
+	return model.CanonicalPIDNamespaceID(namespaceID)
 }
 
 func (nativeKernelReader) CurrentKernelDomain() (model.KernelDomainID, error) {

@@ -65,9 +65,17 @@ func (identity RootIdentity) kernelDomain() (model.KernelDomainID, error) {
 	if strings.TrimSpace(identity.PIDNamespaceID) == "" {
 		return model.KernelDomainID{}, fmt.Errorf("%w: pid namespace id is required", ErrInvalid)
 	}
+	hostBootID, err := model.CanonicalHostBootID(identity.HostBootID)
+	if err != nil {
+		return model.KernelDomainID{}, err
+	}
+	pidNamespaceID, err := model.CanonicalPIDNamespaceID(identity.PIDNamespaceID)
+	if err != nil {
+		return model.KernelDomainID{}, err
+	}
 	return model.NewKernelDomainIDWithRetainedDomain(
-		tokenOrDigest("boot", identity.HostBootID),
-		tokenOrDigest("pidns", identity.PIDNamespaceID),
+		hostBootID,
+		pidNamespaceID,
 		identity.retainedDomainID(),
 	)
 }
@@ -931,14 +939,6 @@ func tokenSafe(value string) bool {
 	return true
 }
 
-func tokenOrDigest(prefix, value string) string {
-	value = strings.TrimSpace(value)
-	if tokenSafe(value) {
-		return value
-	}
-	return tokenize(prefix, value)
-}
-
 func randomLeaf() (string, error) {
 	return randomLeafFromReader(rand.Reader)
 }
@@ -964,36 +964,6 @@ func isManagedLeafName(name string) bool {
 		}
 	}
 	return true
-}
-
-func tokenize(prefix, value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return prefix + "-unknown"
-	}
-	var builder strings.Builder
-	builder.WriteString(prefix)
-	builder.WriteByte('-')
-	for _, r := range value {
-		switch {
-		case r >= 'a' && r <= 'z':
-			builder.WriteRune(r)
-		case r >= 'A' && r <= 'Z':
-			builder.WriteRune(r)
-		case r >= '0' && r <= '9':
-			builder.WriteRune(r)
-		case r == '-' || r == '_' || r == '.':
-			builder.WriteRune(r)
-		default:
-			builder.WriteByte('-')
-		}
-	}
-	out := builder.String()
-	if len(out) <= 256 {
-		return out
-	}
-	sum := sha256.Sum256([]byte(value))
-	return prefix + "-" + hex.EncodeToString(sum[:16])
 }
 
 func uniquePIDs(pids []int) []int {
