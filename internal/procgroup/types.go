@@ -12,6 +12,14 @@ import (
 // requested PID has no process table entry.
 var ErrProcessMissing = errors.New("process missing")
 
+type groupExistenceProbeResult int
+
+const (
+	groupExistenceIndeterminate groupExistenceProbeResult = iota
+	groupExistenceDefinitelyAbsent
+	groupExistenceExists
+)
+
 // StartToken identifies one process incarnation within a host boot. Identical
 // native values across an in-same-instant PID reuse remain theoretically
 // possible on both Darwin and Linux; the S3B custodian binds stronger identity.

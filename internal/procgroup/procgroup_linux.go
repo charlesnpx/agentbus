@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"golang.org/x/sys/unix"
 )
 
 func nativeHostBootID() (string, error) {
@@ -60,6 +61,14 @@ func (nativeKernelReader) ProcessesInGroup(pgid int) ([]processSnapshot, error) 
 	if err != nil {
 		return nil, err
 	}
+	return linuxProcessesInGroup(pgid, entries, readLinuxProcess)
+}
+
+func (nativeKernelReader) GroupExistenceProbe(pgid int) groupExistenceProbeResult {
+	return probeProcessGroupExistence(pgid, unix.Kill)
+}
+
+func linuxProcessesInGroup(pgid int, entries []os.DirEntry, readProcess func(int) (processSnapshot, error)) ([]processSnapshot, error) {
 	var members []processSnapshot
 	for _, entry := range entries {
 		if !entry.Type().IsRegular() && !entry.IsDir() {
@@ -69,9 +78,9 @@ func (nativeKernelReader) ProcessesInGroup(pgid int) ([]processSnapshot, error) 
 		if err != nil || pid <= 0 {
 			continue
 		}
-		snapshot, err := readLinuxProcess(pid)
+		snapshot, err := readProcess(pid)
 		if errors.Is(err, ErrProcessMissing) {
-			return nil, fmt.Errorf("process table changed while reading pid %d: %w", pid, err)
+			continue
 		}
 		if err != nil {
 			return nil, err

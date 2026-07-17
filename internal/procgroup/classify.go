@@ -10,6 +10,7 @@ type kernelReader interface {
 	CurrentKernelDomain() (model.KernelDomainID, error)
 	ReadProcess(pid int) (processSnapshot, error)
 	ProcessesInGroup(pgid int) ([]processSnapshot, error)
+	GroupExistenceProbe(pgid int) groupExistenceProbeResult
 }
 
 type nativeKernelReader struct{}
@@ -163,7 +164,10 @@ func classifyGroup(reader kernelReader, expected GroupClaim) model.GroupExistenc
 		return model.GroupExistenceUnknown
 	}
 	if len(members) == 0 {
-		return model.GroupAbsent
+		if reader.GroupExistenceProbe(expected.PGID) == groupExistenceDefinitelyAbsent {
+			return model.GroupAbsent
+		}
+		return model.GroupExistenceUnknown
 	}
 	seen := make(map[int]processSnapshot, len(members))
 	for _, member := range members {

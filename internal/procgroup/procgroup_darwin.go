@@ -96,6 +96,10 @@ func (nativeKernelReader) ProcessesInGroup(pgid int) ([]processSnapshot, error) 
 	return members, nil
 }
 
+func (nativeKernelReader) GroupExistenceProbe(pgid int) groupExistenceProbeResult {
+	return probeProcessGroupExistence(pgid, unix.Kill)
+}
+
 func readDarwinProcess(pid int) (processSnapshot, error) {
 	if pid <= 0 {
 		return processSnapshot{}, fmt.Errorf("pid must be positive")

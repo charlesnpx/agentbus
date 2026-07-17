@@ -3,6 +3,7 @@ package procgroup
 import (
 	"errors"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -15,6 +16,9 @@ type fakeKernelReader struct {
 	processErr map[int]error
 	groups     map[int][]processSnapshot
 	groupErr   map[int]error
+	groupProbe map[int]groupExistenceProbeResult
+	probeFunc  func(int) groupExistenceProbeResult
+	probeCalls map[int]int
 }
 
 func (reader fakeKernelReader) CurrentKernelDomain() (model.KernelDomainID, error) {
@@ -40,6 +44,19 @@ func (reader fakeKernelReader) ProcessesInGroup(pgid int) ([]processSnapshot, er
 		return nil, err
 	}
 	return reader.groups[pgid], nil
+}
+
+func (reader fakeKernelReader) GroupExistenceProbe(pgid int) groupExistenceProbeResult {
+	if reader.probeCalls != nil {
+		reader.probeCalls[pgid]++
+	}
+	if reader.probeFunc != nil {
+		return reader.probeFunc(pgid)
+	}
+	if result, ok := reader.groupProbe[pgid]; ok {
+		return result
+	}
+	return groupExistenceIndeterminate
 }
 
 func TestClassifyProcessWithFakeReader(t *testing.T) {
@@ -155,24 +172,46 @@ func TestClassifyGroupWithFakeReader(t *testing.T) {
 		want     model.GroupExistenceObservation
 	}{
 		{
-			name: "live",
+			name: "live does not require probe",
 			reader: fakeKernelReader{
 				domain: domain,
 				groups: map[int][]processSnapshot{
 					20: {{PID: 10, PGID: 20, StartToken: "start-10"}},
 				},
+				probeCalls: map[int]int{},
 			},
 			expected: base,
 			want:     model.GroupLive,
 		},
 		{
-			name: "absent",
+			name: "empty group is absent only after definite absence probe",
 			reader: fakeKernelReader{
-				domain: domain,
-				groups: map[int][]processSnapshot{20: nil},
+				domain:     domain,
+				groups:     map[int][]processSnapshot{20: nil},
+				groupProbe: map[int]groupExistenceProbeResult{20: groupExistenceDefinitelyAbsent},
 			},
 			expected: base,
 			want:     model.GroupAbsent,
+		},
+		{
+			name: "empty group with existing invisible member is unknown",
+			reader: fakeKernelReader{
+				domain:     domain,
+				groups:     map[int][]processSnapshot{20: nil},
+				groupProbe: map[int]groupExistenceProbeResult{20: groupExistenceExists},
+			},
+			expected: base,
+			want:     model.GroupExistenceUnknown,
+		},
+		{
+			name: "empty group with indeterminate probe is unknown",
+			reader: fakeKernelReader{
+				domain:     domain,
+				groups:     map[int][]processSnapshot{20: nil},
+				groupProbe: map[int]groupExistenceProbeResult{20: groupExistenceIndeterminate},
+			},
+			expected: base,
+			want:     model.GroupExistenceUnknown,
 		},
 		{
 			name: "read error is unknown",
@@ -226,7 +265,29 @@ func TestClassifyGroupWithFakeReader(t *testing.T) {
 			if got := classifyGroup(tt.reader, tt.expected); got != tt.want {
 				t.Fatalf("classifyGroup() = %v, want %v", got, tt.want)
 			}
+			if tt.name == "live does not require probe" && tt.reader.probeCalls[20] != 0 {
+				t.Fatalf("GroupExistenceProbe(%d) called %d times, want 0", 20, tt.reader.probeCalls[20])
+			}
 		})
+	}
+}
+
+func TestClassifyGroupPGIDOneEmptyMembershipIsUnknown(t *testing.T) {
+	domain := testDomain(t, "boot-group-pgid-one")
+	reader := fakeKernelReader{
+		domain: domain,
+		groups: map[int][]processSnapshot{1: nil},
+		probeFunc: func(pgid int) groupExistenceProbeResult {
+			return probeProcessGroupExistence(pgid, func(pid int, signal syscall.Signal) error {
+				t.Fatalf("kill(%d, %d) should not be called for pgid 1", pid, signal)
+				return nil
+			})
+		},
+	}
+	expected := GroupClaim{PGID: 1, KernelDomainID: domain}
+
+	if got := classifyGroup(reader, expected); got != model.GroupExistenceUnknown {
+		t.Fatalf("classifyGroup(pgid 1 empty membership) = %v, want %v", got, model.GroupExistenceUnknown)
 	}
 }
 
