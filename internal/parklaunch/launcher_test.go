@@ -34,6 +34,7 @@ const (
 	parklaunchFDScanMode    = "fd-scan"
 	parklaunchFDHoldMode    = "fd-hold"
 	parklaunchMonitorFDMode = "monitor-fd"
+	parklaunchTestGMP       = "GOMAXPROCS=2"
 )
 
 var (
@@ -724,6 +725,7 @@ func newLaunchFixture(t *testing.T, backendOpts backendFixtureOptions) launchFix
 		Monitor: &MonitorProcessSpec{
 			Command: monitorCommand(t, monitorMarker),
 		},
+		WorkerEnv: parklaunchTestEnv(os.Environ()),
 	}
 	return launchFixture{
 		ctx:           ctx,
@@ -761,7 +763,7 @@ func newBackendFixture(t *testing.T, dir string, opts backendFixtureOptions) bac
 		ExecSpec: parkproto.ExecSpec{
 			Path: exe,
 			Argv: argv,
-			Env:  []string{parklaunchHelperEnv + "=" + parklaunchBackendMode},
+			Env:  parklaunchTestEnv(nil, parklaunchHelperEnv+"="+parklaunchBackendMode),
 			Dir:  filepath.Dir(exe),
 		},
 		MarkerPath: marker,
@@ -800,7 +802,7 @@ func monitorCommandWithOptions(t *testing.T, marker string, opts monitorCommandO
 			"--kill=" + strconv.FormatBool(opts.Kill),
 			"--delay-ms", strconv.FormatInt(opts.Delay.Milliseconds(), 10),
 		},
-		Env: append(os.Environ(), parklaunchHelperEnv+"="+parklaunchMonitorMode),
+		Env: parklaunchTestEnv(os.Environ(), parklaunchHelperEnv+"="+parklaunchMonitorMode),
 		Dir: filepath.Dir(exe),
 	}
 }
@@ -816,7 +818,7 @@ func monitorNoAckCommand(t *testing.T) CommandSpec {
 			"--",
 			"--target-fd", strconv.Itoa(MonitorTargetFD),
 		},
-		Env: append(os.Environ(), parklaunchHelperEnv+"="+parklaunchMonitorNoAck),
+		Env: parklaunchTestEnv(os.Environ(), parklaunchHelperEnv+"="+parklaunchMonitorNoAck),
 		Dir: filepath.Dir(exe),
 	}
 }
@@ -1192,7 +1194,7 @@ func runFDScanHelper(fds []int, result string) ([]int, error) {
 		"--fds", strings.Join(parts, ","),
 		"--result", result,
 	)
-	cmd.Env = append(os.Environ(), parklaunchHelperEnv+"="+parklaunchFDScanMode)
+	cmd.Env = parklaunchTestEnv(os.Environ(), parklaunchHelperEnv+"="+parklaunchFDScanMode)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("fd scan helper: %w\n%s", err, output)
@@ -1225,7 +1227,7 @@ func startFDHoldHelper(t *testing.T, fds []int, result string, hold time.Duratio
 		"--result", result,
 		"--hold-ms", strconv.FormatInt(hold.Milliseconds(), 10),
 	)
-	cmd.Env = append(os.Environ(), parklaunchHelperEnv+"="+parklaunchFDHoldMode)
+	cmd.Env = parklaunchTestEnv(os.Environ(), parklaunchHelperEnv+"="+parklaunchFDHoldMode)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start fd hold helper: %v", err)
 	}
@@ -1394,6 +1396,29 @@ func helperArgs() ([]string, bool) {
 	return nil, false
 }
 
+func parklaunchTestEnv(base []string, kvs ...string) []string {
+	env := append([]string(nil), base...)
+	for _, kv := range append(kvs, parklaunchTestGMP) {
+		env = upsertTestEnv(env, kv)
+	}
+	return env
+}
+
+func upsertTestEnv(env []string, kv string) []string {
+	key, _, ok := strings.Cut(kv, "=")
+	if !ok {
+		return append(env, kv)
+	}
+	prefix := key + "="
+	for i, existing := range env {
+		if strings.HasPrefix(existing, prefix) {
+			env[i] = kv
+			return env
+		}
+	}
+	return append(env, kv)
+}
+
 func parseFDList(raw string) []int {
 	if raw == "" {
 		return nil
@@ -1413,12 +1438,29 @@ func openFDs(fds []int) []int {
 	var open []int
 	for _, fd := range fds {
 		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
+			if runtimeOwnedFDForTest(fd) {
+				continue
+			}
 			open = append(open, fd)
 		} else if !errors.Is(err, unix.EBADF) {
+			if runtimeOwnedFDForTest(fd) {
+				continue
+			}
 			open = append(open, fd)
 		}
 	}
 	return open
+}
+
+func runtimeOwnedFDForTest(fd int) bool {
+	target, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+	if err != nil {
+		target, err = os.Readlink(fmt.Sprintf("/dev/fd/%d", fd))
+	}
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(target, "anon_inode:") || strings.HasPrefix(target, "/sys/fs/cgroup/")
 }
 
 func openFDSet(fds []int) map[int]struct{} {

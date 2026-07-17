@@ -163,6 +163,9 @@ func runParkedWorker(opts parkedWorkerOptions) error {
 			return fmt.Errorf("chdir for backend exec: %w", err)
 		}
 	}
+	if err := setCloseOnExecForAllOpenFDsExcept(map[int]struct{}{}); err != nil {
+		return fmt.Errorf("prepare backend exec fds: %w", err)
+	}
 	return syscall.Exec(release.ExecSpec.Path, release.ExecSpec.Argv, release.ExecSpec.Env)
 }
 
@@ -219,17 +222,22 @@ func setCloseOnExecForInheritedFDs(controlReadFD, controlWriteFD, bootstrapFD in
 }
 
 func setCloseOnExecForAllOpenFDsExcept(keep map[int]struct{}) error {
+	var readErr error
 	for _, dir := range []string{"/proc/self/fd", "/dev/fd"} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
-			return fmt.Errorf("read %s: %w", dir, err)
+			readErr = errors.Join(readErr, fmt.Errorf("read %s: %w", dir, err))
+			continue
 		}
 		return setCloseOnExecForFDEntries(entries, keep)
 	}
-	return scanCloseOnExecForOpenFDs(keep)
+	if err := scanCloseOnExecForOpenFDs(keep); err != nil {
+		return errors.Join(readErr, err)
+	}
+	return nil
 }
 
 func setCloseOnExecForFDEntries(entries []os.DirEntry, keep map[int]struct{}) error {

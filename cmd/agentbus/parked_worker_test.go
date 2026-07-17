@@ -29,6 +29,8 @@ const (
 	parkedWorkerHelperEnv  = "AGENTBUS_TEST_HELPER"
 	parkedWorkerHelperMode = "parked-worker"
 	parkedBackendMode      = "parked-backend"
+	parkedFinalSweepMode   = "parked-final-sweep"
+	parkedWorkerTestGMP    = "GOMAXPROCS=2"
 	workerControlReadFD    = 3
 	workerControlWriteFD   = 4
 	workerBootstrapFD      = 5
@@ -90,6 +92,34 @@ func TestParkedWorkerClosesUnexpectedInheritedFDsBeforeBackendExec(t *testing.T)
 	result := readBackendFixtureResult(t, harness.backend.ResultPath)
 	if len(result.OpenFDs) != 0 {
 		t.Fatalf("backend inherited unexpected fds: %v", result.OpenFDs)
+	}
+}
+
+func TestParkedWorkerFinalSweepClosesLateOpenedFDsBeforeBackendExec(t *testing.T) {
+	dir := t.TempDir()
+	markerPath := filepath.Join(dir, "backend-started")
+	resultPath := filepath.Join(dir, "backend-result.json")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe,
+		"-test.run=TestParkedWorkerFinalSweepHelperProcess",
+		"--",
+		"--marker", markerPath,
+		"--result", resultPath,
+	)
+	cmd.Env = parkedWorkerTestEnv(nil, parkedWorkerHelperEnv+"="+parkedFinalSweepMode)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("final sweep helper failed: %v output=%s", err, output)
+	}
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("backend marker was not written after final sweep helper exec: %v", err)
+	}
+	result := readBackendFixtureResult(t, resultPath)
+	if len(result.OpenFDs) != 0 {
+		t.Fatalf("backend inherited late-opened fds: %v", result.OpenFDs)
 	}
 }
 
@@ -312,6 +342,17 @@ func TestParkedBackendFixtureHelperProcess(t *testing.T) {
 	os.Exit(runParkedBackendFixture(args))
 }
 
+func TestParkedWorkerFinalSweepHelperProcess(t *testing.T) {
+	if os.Getenv(parkedWorkerHelperEnv) != parkedFinalSweepMode {
+		return
+	}
+	args, ok := helperArgs()
+	if !ok {
+		os.Exit(97)
+	}
+	os.Exit(runParkedFinalSweepFixture(args))
+}
+
 type backendFixtureOptions struct {
 	MarkerPath string
 	ResultPath string
@@ -354,7 +395,7 @@ func newBackendFixtureSpec(t *testing.T, opts backendFixtureOptions) backendFixt
 		ExecSpec: parkproto.ExecSpec{
 			Path: exe,
 			Argv: argv,
-			Env:  []string{parkedWorkerHelperEnv + "=" + parkedBackendMode},
+			Env:  parkedWorkerTestEnv(nil, parkedWorkerHelperEnv+"="+parkedBackendMode),
 			Dir:  filepath.Dir(exe),
 		},
 		backendFixtureOptions: opts,
@@ -383,6 +424,57 @@ func runParkedBackendFixture(args []string) int {
 	}
 	if err := os.WriteFile(*resultPath, append(raw, '\n'), 0o600); err != nil {
 		return 5
+	}
+	return 0
+}
+
+func runParkedFinalSweepFixture(args []string) int {
+	fs := flag.NewFlagSet("parked-final-sweep-fixture", flag.ContinueOnError)
+	fs.SetOutput(ioDiscard{})
+	markerPath := fs.String("marker", "", "marker path")
+	resultPath := fs.String("result", "", "result path")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *markerPath == "" || *resultPath == "" {
+		return 2
+	}
+	if err := setCloseOnExecForAllOpenFDsExcept(map[int]struct{}{}); err != nil {
+		fmt.Fprintf(os.Stderr, "initial sweep: %v\n", err)
+		return 3
+	}
+	lateFile, err := os.Open(os.DevNull)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open late fd: %v\n", err)
+		return 4
+	}
+	defer lateFile.Close()
+	lateFD := int(lateFile.Fd())
+	if err := clearCloseOnExecForTest(lateFD); err != nil {
+		fmt.Fprintf(os.Stderr, "clear late fd cloexec: %v\n", err)
+		return 5
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "executable: %v\n", err)
+		return 6
+	}
+	argv := []string{
+		exe,
+		"-test.run=TestParkedBackendFixtureHelperProcess",
+		"--",
+		"--marker", *markerPath,
+		"--result", *resultPath,
+		"--closed-fds", strconv.Itoa(lateFD),
+	}
+	env := parkedWorkerTestEnv(nil, parkedWorkerHelperEnv+"="+parkedBackendMode)
+	if err := setCloseOnExecForAllOpenFDsExcept(map[int]struct{}{}); err != nil {
+		fmt.Fprintf(os.Stderr, "final sweep: %v\n", err)
+		return 7
+	}
+	if err := syscall.Exec(exe, argv, env); err != nil {
+		fmt.Fprintf(os.Stderr, "exec backend: %v\n", err)
+		return 8
 	}
 	return 0
 }
@@ -447,7 +539,7 @@ func startParkedWorkerHarnessWithOptions(t *testing.T, backend backendFixtureSpe
 		"--control-write-fd", strconv.Itoa(workerControlWriteFD),
 		"--bootstrap-fd", strconv.Itoa(workerBootstrapFD),
 	)
-	cmd.Env = []string{parkedWorkerHelperEnv + "=" + parkedWorkerHelperMode}
+	cmd.Env = parkedWorkerTestEnv(nil, parkedWorkerHelperEnv+"="+parkedWorkerHelperMode)
 	cmd.ExtraFiles = extraFiles
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stderr = &stderr
@@ -800,6 +892,29 @@ func helperArgs() ([]string, bool) {
 	return nil, false
 }
 
+func parkedWorkerTestEnv(base []string, kvs ...string) []string {
+	env := append([]string(nil), base...)
+	for _, kv := range append(kvs, parkedWorkerTestGMP) {
+		env = upsertTestEnv(env, kv)
+	}
+	return env
+}
+
+func upsertTestEnv(env []string, kv string) []string {
+	key, _, ok := strings.Cut(kv, "=")
+	if !ok {
+		return append(env, kv)
+	}
+	prefix := key + "="
+	for i, existing := range env {
+		if strings.HasPrefix(existing, prefix) {
+			env[i] = kv
+			return env
+		}
+	}
+	return append(env, kv)
+}
+
 func parseFDList(raw string) []int {
 	if raw == "" {
 		return nil
@@ -819,12 +934,38 @@ func openFDs(fds []int) []int {
 	var open []int
 	for _, fd := range fds {
 		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
+			if runtimeOwnedFDForTest(fd) {
+				continue
+			}
 			open = append(open, fd)
 		} else if !errors.Is(err, unix.EBADF) {
+			if runtimeOwnedFDForTest(fd) {
+				continue
+			}
 			open = append(open, fd)
 		}
 	}
 	return open
+}
+
+func runtimeOwnedFDForTest(fd int) bool {
+	target, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+	if err != nil {
+		target, err = os.Readlink(fmt.Sprintf("/dev/fd/%d", fd))
+	}
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(target, "anon_inode:") || strings.HasPrefix(target, "/sys/fs/cgroup/")
+}
+
+func clearCloseOnExecForTest(fd int) error {
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	if err != nil {
+		return err
+	}
+	_, err = unix.FcntlInt(uintptr(fd), unix.F_SETFD, flags&^unix.FD_CLOEXEC)
+	return err
 }
 
 func assertProcessCommandLineOmits(t *testing.T, pid int, secret string) {
