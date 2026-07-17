@@ -9,6 +9,14 @@ const (
 	Unprovable                   ContainmentDecision = "unprovable"
 )
 
+type ContainmentAuthorizationBasis string
+
+const (
+	ContainmentBasisNone           ContainmentAuthorizationBasis = ""
+	ContainmentBasisLeader         ContainmentAuthorizationBasis = "leader"
+	ContainmentBasisRetainedObject ContainmentAuthorizationBasis = "retained_object"
+)
+
 type ContainmentSession struct {
 	// ContinuouslyObservedLive is set only after the engine validates continuity
 	// evidence; the model does not infer continuity from discrete observations.
@@ -99,74 +107,93 @@ type ContainmentAuthorization struct {
 	DeadlineExpired bool
 }
 
+type ContainmentAuthorizationResult struct {
+	Decision ContainmentDecision
+	Basis    ContainmentAuthorizationBasis
+}
+
 // DecideContainmentAuthorization is pure decision logic; callers supply all
 // observations, session continuity, and deadline state.
 func DecideContainmentAuthorization(input ContainmentAuthorization) (ContainmentDecision, error) {
-	if err := input.Group.Validate(); err != nil {
-		return "", err
-	}
-	if err := input.Observation.Validate(); err != nil {
-		return "", err
-	}
-	if err := input.RetainedObject.Validate(); err != nil {
-		return "", err
-	}
-	if !input.Observation.coherent() {
-		return Unprovable, nil
-	}
-	relation, err := compareKernelDomain(input.Group.KernelDomain(), input.Observation.KernelDomainID)
+	result, err := DecideContainmentAuthorizationWithBasis(input)
 	if err != nil {
 		return "", err
 	}
+	return result.Decision, nil
+}
+
+// DecideContainmentAuthorizationWithBasis is pure decision logic with the
+// authority basis preserved for mutating callers.
+func DecideContainmentAuthorizationWithBasis(input ContainmentAuthorization) (ContainmentAuthorizationResult, error) {
+	if err := input.Group.Validate(); err != nil {
+		return ContainmentAuthorizationResult{}, err
+	}
+	if err := input.Observation.Validate(); err != nil {
+		return ContainmentAuthorizationResult{}, err
+	}
+	if err := input.RetainedObject.Validate(); err != nil {
+		return ContainmentAuthorizationResult{}, err
+	}
+	if !input.Observation.coherent() {
+		return containmentAuthorizationResult(Unprovable, ContainmentBasisNone), nil
+	}
+	relation, err := compareKernelDomain(input.Group.KernelDomain(), input.Observation.KernelDomainID)
+	if err != nil {
+		return ContainmentAuthorizationResult{}, err
+	}
 	if relation == kernelDomainDifferent {
-		return AlreadyAbsent, nil
+		return containmentAuthorizationResult(AlreadyAbsent, ContainmentBasisNone), nil
 	}
 	if relation == kernelDomainUnprovable {
-		return Unprovable, nil
+		return containmentAuthorizationResult(Unprovable, ContainmentBasisNone), nil
 	}
 	switch input.RetainedObject {
 	case RetainedObjectProofEmpty:
 		if input.Observation.Leader == ProcessIdentityMatching {
-			return Unprovable, nil
+			return containmentAuthorizationResult(Unprovable, ContainmentBasisNone), nil
 		}
-		return AlreadyAbsent, nil
+		return containmentAuthorizationResult(AlreadyAbsent, ContainmentBasisRetainedObject), nil
 	case RetainedObjectProofMembersPresent:
 		if input.Observation.Group == GroupAbsent {
-			return Unprovable, nil
+			return containmentAuthorizationResult(Unprovable, ContainmentBasisNone), nil
 		}
-		return SignalDirectly, nil
+		return containmentAuthorizationResult(SignalDirectly, ContainmentBasisRetainedObject), nil
 	case RetainedObjectProofUnknown:
 		// Unknown retained-object state never proves absence or signal authority.
 	}
 	switch input.Observation.Group {
 	case GroupAbsent:
-		return AlreadyAbsent, nil
+		return containmentAuthorizationResult(AlreadyAbsent, ContainmentBasisNone), nil
 	case GroupLive:
 		return decideLiveContainment(input)
 	default:
-		return Unprovable, nil
+		return containmentAuthorizationResult(Unprovable, ContainmentBasisNone), nil
 	}
 }
 
-func decideLiveContainment(input ContainmentAuthorization) (ContainmentDecision, error) {
+func containmentAuthorizationResult(decision ContainmentDecision, basis ContainmentAuthorizationBasis) ContainmentAuthorizationResult {
+	return ContainmentAuthorizationResult{Decision: decision, Basis: basis}
+}
+
+func decideLiveContainment(input ContainmentAuthorization) (ContainmentAuthorizationResult, error) {
 	switch input.Observation.Leader {
 	case ProcessIdentityMatching:
-		return SignalDirectly, nil
+		return containmentAuthorizationResult(SignalDirectly, ContainmentBasisLeader), nil
 	case ProcessIdentityReused:
-		return Unprovable, nil
+		return containmentAuthorizationResult(Unprovable, ContainmentBasisNone), nil
 	case ProcessIdentityMissing:
 		if input.Session.BeganFromMatchingLeader && input.Session.ContinuouslyObservedLive {
-			return SignalDirectly, nil
+			return containmentAuthorizationResult(SignalDirectly, ContainmentBasisLeader), nil
 		}
 	}
 	trusted, err := input.Observation.Monitor.TrustedFor(input.Group)
 	if err != nil {
-		return "", err
+		return ContainmentAuthorizationResult{}, err
 	}
 	if trusted && !input.DeadlineExpired {
-		return WaitBoundedForTrustedMonitor, nil
+		return containmentAuthorizationResult(WaitBoundedForTrustedMonitor, ContainmentBasisNone), nil
 	}
-	return Unprovable, nil
+	return containmentAuthorizationResult(Unprovable, ContainmentBasisNone), nil
 }
 
 func (observation ContainmentObservation) coherent() bool {

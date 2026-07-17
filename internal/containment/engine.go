@@ -19,6 +19,7 @@ type Engine struct {
 type containmentState struct {
 	session                  model.ContainmentSession
 	continuity               GroupContinuity
+	retainedObject           RetainedGroupCapability
 	operationBegin           time.Time
 	matchingLeaderObservedAt time.Time
 }
@@ -38,36 +39,49 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 		engine.Clock = RealClock{}
 	}
 
+	state := engine.acquireRetainedObject(ctx, target)
 	observation, observedAt, outcome := engine.observe(ctx, target)
 	if outcome.Kind != 0 {
 		return outcome
 	}
-	state := engine.advanceSession(ctx, target, containmentState{operationBegin: observedAt}, observation, observedAt)
-	decision, outcome := engine.authorize(ctx, target, observation, state, false, observedAt)
+	state = engine.advanceSession(ctx, target, state, observation, observedAt)
+	authorization, outcome := engine.authorize(ctx, target, observation, state, false, observedAt)
 	if outcome.Kind != 0 {
 		return outcome
 	}
 
-	switch decision {
+	switch authorization.Decision {
 	case model.AlreadyAbsent:
-		return AbsentOutcome(decision)
+		return AbsentOutcome(authorization.Decision)
 	case model.SignalDirectly:
-		return engine.signalAuthorized(ctx, target, params, state, decision)
+		return engine.signalAuthorized(ctx, target, params, state, authorization)
 	case model.WaitBoundedForTrustedMonitor:
 		return engine.waitForTrustedMonitor(ctx, target, params, state, observation)
 	case model.Unprovable:
-		return UnprovableOutcome(ReasonAuthorizationUnprovable, decision, nil)
+		return UnprovableOutcome(ReasonAuthorizationUnprovable, authorization.Decision, nil)
 	default:
-		return UnprovableOutcome(ReasonUnexpectedDecision, decision, nil)
+		return UnprovableOutcome(ReasonUnexpectedDecision, authorization.Decision, nil)
 	}
 }
 
-func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef, params Params, state containmentState, decision model.ContainmentDecision) Outcome {
-	if outcome := engine.signal(ctx, target, SignalTerminate, decision); outcome.Kind != 0 {
+func (engine Engine) acquireRetainedObject(ctx context.Context, target model.GroupRef) containmentState {
+	if engine.RetainedObject == nil || target.RetainedID == "" {
+		return containmentState{}
+	}
+	acquiredAt := engine.Clock.Now()
+	retainedObject, err := engine.RetainedObject.AcquireRetainedGroup(ctx, target, acquiredAt)
+	if err != nil || retainedObject == nil {
+		return containmentState{}
+	}
+	return containmentState{retainedObject: retainedObject, operationBegin: acquiredAt}
+}
+
+func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef, params Params, state containmentState, authorization model.ContainmentAuthorizationResult) Outcome {
+	if outcome := engine.signal(ctx, target, state, authorization, SignalTerminate); outcome.Kind != 0 {
 		return outcome
 	}
 	if err := engine.Clock.Sleep(ctx, params.GracePeriod); err != nil {
-		return UnprovableOutcome(ReasonContextDone, decision, err)
+		return UnprovableOutcome(ReasonContextDone, authorization.Decision, err)
 	}
 
 	observation, observedAt, outcome := engine.observe(ctx, target)
@@ -75,24 +89,24 @@ func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef
 		return outcome
 	}
 	state = engine.advanceSession(ctx, target, state, observation, observedAt)
-	decision, outcome = engine.authorize(ctx, target, observation, state, false, observedAt)
+	authorization, outcome = engine.authorize(ctx, target, observation, state, false, observedAt)
 	if outcome.Kind != 0 {
 		return outcome
 	}
-	switch decision {
+	switch authorization.Decision {
 	case model.AlreadyAbsent:
-		return AbsentOutcome(decision)
+		return AbsentOutcome(authorization.Decision)
 	case model.SignalDirectly:
-		if outcome := engine.signal(ctx, target, SignalKill, decision); outcome.Kind != 0 {
+		if outcome := engine.signal(ctx, target, state, authorization, SignalKill); outcome.Kind != 0 {
 			return outcome
 		}
-		return engine.pollUntilAbsent(ctx, target, params, state, decision)
+		return engine.pollUntilAbsent(ctx, target, params, state, authorization)
 	case model.WaitBoundedForTrustedMonitor:
-		return UnprovableOutcome(ReasonAuthorizationUnprovable, decision, nil)
+		return UnprovableOutcome(ReasonAuthorizationUnprovable, authorization.Decision, nil)
 	case model.Unprovable:
-		return UnprovableOutcome(ReasonAuthorizationUnprovable, decision, nil)
+		return UnprovableOutcome(ReasonAuthorizationUnprovable, authorization.Decision, nil)
 	default:
-		return UnprovableOutcome(ReasonUnexpectedDecision, decision, nil)
+		return UnprovableOutcome(ReasonUnexpectedDecision, authorization.Decision, nil)
 	}
 }
 
@@ -100,26 +114,26 @@ func (engine Engine) waitForTrustedMonitor(ctx context.Context, target model.Gro
 	deadline := engine.Clock.Now().Add(params.TrustedMonitorWait)
 	for {
 		expired := !engine.Clock.Now().Before(deadline)
-		decision, outcome := engine.authorize(ctx, target, observation, state, expired, engine.Clock.Now())
+		authorization, outcome := engine.authorize(ctx, target, observation, state, expired, engine.Clock.Now())
 		if outcome.Kind != 0 {
 			return outcome
 		}
-		switch decision {
+		switch authorization.Decision {
 		case model.AlreadyAbsent:
-			return AbsentOutcome(decision)
+			return AbsentOutcome(authorization.Decision)
 		case model.SignalDirectly:
-			return engine.signalAuthorized(ctx, target, params, state, decision)
+			return engine.signalAuthorized(ctx, target, params, state, authorization)
 		case model.Unprovable:
 			if expired {
-				return UnprovableOutcome(ReasonUnauthorizedWaitExpired, decision, nil)
+				return UnprovableOutcome(ReasonUnauthorizedWaitExpired, authorization.Decision, nil)
 			}
-			return UnprovableOutcome(ReasonAuthorizationUnprovable, decision, nil)
+			return UnprovableOutcome(ReasonAuthorizationUnprovable, authorization.Decision, nil)
 		case model.WaitBoundedForTrustedMonitor:
 			if expired {
-				return UnprovableOutcome(ReasonUnauthorizedWaitExpired, decision, nil)
+				return UnprovableOutcome(ReasonUnauthorizedWaitExpired, authorization.Decision, nil)
 			}
 		default:
-			return UnprovableOutcome(ReasonUnexpectedDecision, decision, nil)
+			return UnprovableOutcome(ReasonUnexpectedDecision, authorization.Decision, nil)
 		}
 
 		if err := engine.sleepUntil(ctx, params.TrustedMonitorPollInterval, deadline); err != nil {
@@ -134,7 +148,7 @@ func (engine Engine) waitForTrustedMonitor(ctx context.Context, target model.Gro
 	}
 }
 
-func (engine Engine) pollUntilAbsent(ctx context.Context, target model.GroupRef, params Params, state containmentState, decision model.ContainmentDecision) Outcome {
+func (engine Engine) pollUntilAbsent(ctx context.Context, target model.GroupRef, params Params, state containmentState, authorization model.ContainmentAuthorizationResult) Outcome {
 	deadline := engine.Clock.Now().Add(params.PollTimeout)
 	for {
 		observation, observedAt, outcome := engine.observe(ctx, target)
@@ -142,48 +156,51 @@ func (engine Engine) pollUntilAbsent(ctx context.Context, target model.GroupRef,
 			return outcome
 		}
 		state = engine.advanceSession(ctx, target, state, observation, observedAt)
-		currentDecision, outcome := engine.authorize(ctx, target, observation, state, false, observedAt)
+		currentAuthorization, outcome := engine.authorize(ctx, target, observation, state, false, observedAt)
 		if outcome.Kind != 0 {
 			return outcome
 		}
-		switch currentDecision {
+		switch currentAuthorization.Decision {
 		case model.AlreadyAbsent:
-			return AbsentOutcome(currentDecision)
+			return AbsentOutcome(currentAuthorization.Decision)
 		case model.SignalDirectly:
 		case model.WaitBoundedForTrustedMonitor, model.Unprovable:
-			return UnprovableOutcome(ReasonAuthorizationUnprovable, currentDecision, nil)
+			return UnprovableOutcome(ReasonAuthorizationUnprovable, currentAuthorization.Decision, nil)
 		default:
-			return UnprovableOutcome(ReasonUnexpectedDecision, currentDecision, nil)
+			return UnprovableOutcome(ReasonUnexpectedDecision, currentAuthorization.Decision, nil)
 		}
-		probe, err := engine.Signaler.ProbeGroup(ctx, target)
+		probe, err := engine.probe(ctx, target, state, currentAuthorization)
 		if err != nil {
-			return UnprovableOutcome(ReasonProbeUnprovable, decision, err)
+			return UnprovableOutcome(ReasonProbeUnprovable, authorization.Decision, err)
 		}
 		switch probe {
 		case ProbeLive:
 		case ProbeAbsent:
-			return UnprovableOutcome(ReasonProbeContradictedObserver, decision, nil)
+			if currentAuthorization.Basis == model.ContainmentBasisRetainedObject {
+				return AbsentOutcome(model.AlreadyAbsent)
+			}
+			return UnprovableOutcome(ReasonProbeContradictedObserver, authorization.Decision, nil)
 		case ProbeUnprovable:
-			return UnprovableOutcome(ReasonProbeUnprovable, decision, nil)
+			return UnprovableOutcome(ReasonProbeUnprovable, authorization.Decision, nil)
 		default:
-			return UnprovableOutcome(ReasonProbeUnprovable, decision, nil)
+			return UnprovableOutcome(ReasonProbeUnprovable, authorization.Decision, nil)
 		}
 		if !engine.Clock.Now().Before(deadline) {
-			return UnprovableOutcome(ReasonAbsenceDeadlineExceeded, decision, nil)
+			return UnprovableOutcome(ReasonAbsenceDeadlineExceeded, authorization.Decision, nil)
 		}
 		if err := engine.sleepUntil(ctx, params.PollInterval, deadline); err != nil {
-			return UnprovableOutcome(ReasonContextDone, decision, err)
+			return UnprovableOutcome(ReasonContextDone, authorization.Decision, err)
 		}
 	}
 }
 
-func (engine Engine) signal(ctx context.Context, target model.GroupRef, signal Signal, decision model.ContainmentDecision) Outcome {
+func (engine Engine) signal(ctx context.Context, target model.GroupRef, state containmentState, authorization model.ContainmentAuthorizationResult, signal Signal) Outcome {
 	if err := signal.validate(); err != nil {
-		return UnprovableOutcome(ReasonInvalidInput, decision, err)
+		return UnprovableOutcome(ReasonInvalidInput, authorization.Decision, err)
 	}
-	result, err := engine.Signaler.SignalGroup(ctx, target, signal)
+	result, err := engine.signalGroup(ctx, target, state, authorization, signal)
 	if err != nil {
-		return UnprovableOutcome(ReasonSignalUnprovable, decision, err)
+		return UnprovableOutcome(ReasonSignalUnprovable, authorization.Decision, err)
 	}
 	switch result {
 	case SignalDelivered:
@@ -191,9 +208,37 @@ func (engine Engine) signal(ctx context.Context, target model.GroupRef, signal S
 	case SignalTargetAbsent:
 		return AbsentOutcome(model.AlreadyAbsent)
 	case SignalUnprovable:
-		return UnprovableOutcome(ReasonSignalUnprovable, decision, nil)
+		return UnprovableOutcome(ReasonSignalUnprovable, authorization.Decision, nil)
 	default:
-		return UnprovableOutcome(ReasonSignalUnprovable, decision, nil)
+		return UnprovableOutcome(ReasonSignalUnprovable, authorization.Decision, nil)
+	}
+}
+
+func (engine Engine) signalGroup(ctx context.Context, target model.GroupRef, state containmentState, authorization model.ContainmentAuthorizationResult, signal Signal) (SignalResult, error) {
+	switch authorization.Basis {
+	case model.ContainmentBasisLeader:
+		return engine.Signaler.SignalGroup(ctx, target, signal)
+	case model.ContainmentBasisRetainedObject:
+		if state.retainedObject == nil {
+			return SignalUnprovable, errors.New("retained object capability is missing")
+		}
+		return state.retainedObject.SignalGroup(ctx, target, signal)
+	default:
+		return SignalUnprovable, errors.New("signal authority basis is missing")
+	}
+}
+
+func (engine Engine) probe(ctx context.Context, target model.GroupRef, state containmentState, authorization model.ContainmentAuthorizationResult) (ProbeResult, error) {
+	switch authorization.Basis {
+	case model.ContainmentBasisLeader:
+		return engine.Signaler.ProbeGroup(ctx, target)
+	case model.ContainmentBasisRetainedObject:
+		if state.retainedObject == nil {
+			return ProbeUnprovable, errors.New("retained object capability is missing")
+		}
+		return state.retainedObject.ProbeGroup(ctx, target)
+	default:
+		return ProbeUnprovable, errors.New("probe authority basis is missing")
 	}
 }
 
@@ -219,29 +264,29 @@ func (engine Engine) sleepUntil(ctx context.Context, interval time.Duration, dea
 	return engine.Clock.Sleep(ctx, interval)
 }
 
-func (engine Engine) authorize(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation, state containmentState, deadlineExpired bool, observedAt time.Time) (model.ContainmentDecision, Outcome) {
-	decision, err := model.DecideContainmentAuthorization(model.ContainmentAuthorization{
+func (engine Engine) authorize(ctx context.Context, target model.GroupRef, observation model.ContainmentObservation, state containmentState, deadlineExpired bool, observedAt time.Time) (model.ContainmentAuthorizationResult, Outcome) {
+	authorization, err := model.DecideContainmentAuthorizationWithBasis(model.ContainmentAuthorization{
 		Group:           target,
 		Observation:     observation,
 		Session:         state.session,
-		RetainedObject:  engine.retainedObjectProof(ctx, target, state.operationBegin, observedAt),
+		RetainedObject:  engine.retainedObjectProof(ctx, target, state, observedAt),
 		DeadlineExpired: deadlineExpired,
 	})
 	if err != nil {
-		return "", UnprovableOutcome(ReasonAuthorizationFailed, "", err)
+		return model.ContainmentAuthorizationResult{}, UnprovableOutcome(ReasonAuthorizationFailed, "", err)
 	}
-	return decision, Outcome{}
+	return authorization, Outcome{}
 }
 
-func (engine Engine) retainedObjectProof(ctx context.Context, target model.GroupRef, begin, end time.Time) model.RetainedObjectProof {
-	if engine.RetainedObject == nil || target.RetainedID == "" || begin.IsZero() || end.IsZero() || end.Before(begin) {
+func (engine Engine) retainedObjectProof(ctx context.Context, target model.GroupRef, state containmentState, observedAt time.Time) model.RetainedObjectProof {
+	if state.retainedObject == nil || target.RetainedID == "" || state.operationBegin.IsZero() || observedAt.IsZero() || observedAt.Before(state.operationBegin) {
 		return model.RetainedObjectProofNone
 	}
-	evidence, err := engine.RetainedObject.ProveRetainedGroup(ctx, target, begin, end)
+	evidence, err := state.retainedObject.Membership(ctx, target, observedAt)
 	if err != nil {
 		return model.RetainedObjectProofUnknown
 	}
-	return evidence.ProofFor(target, begin, end)
+	return evidence.ProofFor(target, state.operationBegin, observedAt)
 }
 
 func (engine Engine) advanceSession(ctx context.Context, target model.GroupRef, state containmentState, observation model.ContainmentObservation, observedAt time.Time) containmentState {
@@ -249,12 +294,13 @@ func (engine Engine) advanceSession(ctx context.Context, target model.GroupRef, 
 		state.operationBegin = observedAt
 	}
 	if observation.Group != model.GroupLive || !target.KernelDomain().ProvablySame(observation.KernelDomainID) {
-		return containmentState{operationBegin: state.operationBegin}
+		return containmentState{retainedObject: state.retainedObject, operationBegin: state.operationBegin}
 	}
 	switch observation.Leader {
 	case model.ProcessIdentityMatching:
 		next := containmentState{
 			session:                  model.ContainmentSession{BeganFromMatchingLeader: true},
+			retainedObject:           state.retainedObject,
 			operationBegin:           state.operationBegin,
 			matchingLeaderObservedAt: observedAt,
 		}
@@ -266,11 +312,11 @@ func (engine Engine) advanceSession(ctx context.Context, target model.GroupRef, 
 		if state.session.BeganFromMatchingLeader && state.continuity != nil {
 			evidence := state.continuity.ConfirmContinuouslyLive(ctx, target, observation, state.matchingLeaderObservedAt, observedAt)
 			if !evidence.Covers(target, state.matchingLeaderObservedAt, observedAt) {
-				return containmentState{operationBegin: state.operationBegin}
+				return containmentState{retainedObject: state.retainedObject, operationBegin: state.operationBegin}
 			}
 			state.session.ContinuouslyObservedLive = true
 			return state
 		}
 	}
-	return containmentState{operationBegin: state.operationBegin}
+	return containmentState{retainedObject: state.retainedObject, operationBegin: state.operationBegin}
 }

@@ -155,6 +155,42 @@ func TestGroupRefEqualUsesCanonicalKernelDomain(t *testing.T) {
 	}
 }
 
+func TestGroupRefRetainedDomainIdentity(t *testing.T) {
+	knownLeft := kernelDomainTestGroupRef()
+	knownLeft.RetainedDomainID = "retained-domain-1"
+	knownLeft.RetainedDomainState = RetainedDomainKnown
+	knownRight := knownLeft
+	if !knownLeft.Equal(knownRight) {
+		t.Fatal("GroupRef.Equal() = false for identical known retained domain")
+	}
+	if !knownLeft.KernelDomain().ProvablySame(knownRight.KernelDomain()) {
+		t.Fatal("Known retained-domain GroupRef is not provably same as itself")
+	}
+
+	knownDifferent := knownLeft
+	knownDifferent.RetainedDomainID = "retained-domain-2"
+	if knownLeft.KernelDomain().ProvablySame(knownDifferent.KernelDomain()) {
+		t.Fatal("different known retained domains were provably same")
+	}
+	if knownLeft.Equal(knownDifferent) {
+		t.Fatal("GroupRef.Equal() = true for different known retained domain")
+	}
+
+	unknown := knownLeft
+	unknown.RetainedDomainID = ""
+	unknown.RetainedDomainState = RetainedDomainUnknown
+	if unknown.KernelDomain().ProvablySame(unknown.KernelDomain()) {
+		t.Fatal("unknown retained domain was provably same")
+	}
+
+	notApplicable := knownLeft
+	notApplicable.RetainedDomainID = ""
+	notApplicable.RetainedDomainState = RetainedDomainNotApplicable
+	if !notApplicable.KernelDomain().ProvablySame(notApplicable.KernelDomain()) {
+		t.Fatal("not-applicable retained domains were not provably same")
+	}
+}
+
 func TestGroupRefDecodeLegacyHostBootOnlyUsesUnknownPIDNamespace(t *testing.T) {
 	original := kernelDomainTestGroupRef()
 	data, err := json.Marshal(original)
@@ -207,6 +243,43 @@ func TestGroupRefDecodeLegacyHostBootOnlyUsesUnknownPIDNamespace(t *testing.T) {
 	}
 	if decision != GroupRecoveryUnprovable {
 		t.Fatalf("legacy recovery decision = %s, want %s", decision, GroupRecoveryUnprovable)
+	}
+}
+
+func TestGroupRefDecodeLegacyMissingRetainedDomainUsesUnknown(t *testing.T) {
+	original := kernelDomainTestGroupRef()
+	original.RetainedDomainID = "retained-domain-1"
+	original.RetainedDomainState = RetainedDomainKnown
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("Unmarshal fields error = %v", err)
+	}
+	delete(fields, "RetainedDomainID")
+	delete(fields, "RetainedDomainState")
+	legacy, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("Marshal legacy fields error = %v", err)
+	}
+
+	var decoded GroupRef
+	if err := json.Unmarshal(legacy, &decoded); err != nil {
+		t.Fatalf("Unmarshal legacy GroupRef error = %v", err)
+	}
+	if decoded.RetainedDomainState != RetainedDomainUnknown {
+		t.Fatalf("decoded RetainedDomainState = %v, want %v", decoded.RetainedDomainState, RetainedDomainUnknown)
+	}
+	if decoded.RetainedDomainID != "" {
+		t.Fatalf("decoded RetainedDomainID = %q, want empty", decoded.RetainedDomainID)
+	}
+	if err := decoded.Validate(); err != nil {
+		t.Fatalf("decoded legacy GroupRef Validate() error = %v", err)
+	}
+	if decoded.KernelDomain().ProvablySame(original.KernelDomain()) {
+		t.Fatal("legacy missing retained domain was provably same as known retained domain")
 	}
 }
 

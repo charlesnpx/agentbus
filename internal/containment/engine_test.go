@@ -264,15 +264,15 @@ func TestContainmentRetainedObjectProofAuthorizesKillWithMissingLeader(t *testin
 	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
 
 	assertAbsent(t, outcome)
-	assertSignals(t, signaler, SignalTerminate, SignalKill)
-	if retained.calls == 0 {
-		t.Fatalf("retained object was not consulted")
+	assertSignals(t, signaler)
+	assertRetainedSignals(t, retained, SignalTerminate, SignalKill)
+	if retained.membershipCalls == 0 {
+		t.Fatalf("retained capability membership was not consulted")
 	}
 }
 
-func TestContainmentRetainedObjectProofMustMatchObjectAndInterval(t *testing.T) {
+func TestContainmentRetainedObjectCapabilityMustMatchObjectAndCoverOperation(t *testing.T) {
 	target := testGroupRef(t)
-	now := newFakeClock().Now()
 	tests := []struct {
 		name     string
 		retained *fakeRetainedObject
@@ -282,11 +282,17 @@ func TestContainmentRetainedObjectProofMustMatchObjectAndInterval(t *testing.T) 
 			retained: &fakeRetainedObject{membership: RetainedMembershipPresent, retainedID: "different-retained-object"},
 		},
 		{
-			name: "stale_interval",
+			name: "partial_present_retention_interval",
 			retained: &fakeRetainedObject{
-				membership: RetainedMembershipPresent,
-				begin:      now.Add(-2 * time.Second),
-				end:        now.Add(-time.Second),
+				membership:  RetainedMembershipPresent,
+				beginOffset: time.Nanosecond,
+			},
+		},
+		{
+			name: "partial_empty_retention_interval",
+			retained: &fakeRetainedObject{
+				membership:  RetainedMembershipEmpty,
+				beginOffset: time.Nanosecond,
 			},
 		},
 		{
@@ -322,6 +328,9 @@ func TestContainmentRetainedObjectEmptyProofProvesAbsent(t *testing.T) {
 
 	assertAbsent(t, outcome)
 	assertSignals(t, signaler)
+	if retained.membershipCalls == 0 {
+		t.Fatalf("retained capability membership was not consulted")
+	}
 }
 
 func TestContainmentRetainedObjectUnknownProofIsUnprovable(t *testing.T) {
@@ -336,6 +345,82 @@ func TestContainmentRetainedObjectUnknownProofIsUnprovable(t *testing.T) {
 
 	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
 	assertSignals(t, signaler)
+}
+
+func TestContainmentRetainedAuthorityUsesRetainedTeardownForReusedPGID(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
+		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
+		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
+	}}
+	signaler := &fakeSignaler{}
+	retained := &fakeRetainedObject{
+		memberships: []RetainedGroupMembership{
+			RetainedMembershipPresent,
+			RetainedMembershipPresent,
+			RetainedMembershipEmpty,
+		},
+	}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertAbsent(t, outcome)
+	assertSignals(t, signaler)
+	assertRetainedSignals(t, retained, SignalTerminate, SignalKill)
+	if retained.probeCalls != 0 {
+		t.Fatalf("retained probes = %d, want 0 after retained empty membership proved absence", retained.probeCalls)
+	}
+}
+
+func TestContainmentRetainedProbeUsesRetainedCapability(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
+		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
+		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
+	}}
+	signaler := &fakeSignaler{}
+	retained := &fakeRetainedObject{
+		membership: RetainedMembershipPresent,
+		probes:     []ProbeResult{ProbeAbsent},
+	}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertAbsent(t, outcome)
+	assertSignals(t, signaler)
+	assertRetainedSignals(t, retained, SignalTerminate, SignalKill)
+	if retained.probeCalls != 1 {
+		t.Fatalf("retained probes = %d, want 1", retained.probeCalls)
+	}
+	if signaler.probeCalls != 0 {
+		t.Fatalf("numeric PGID probes = %d, want 0", signaler.probeCalls)
+	}
+}
+
+func TestContainmentAcquiresRetainedCapabilityBeforeFirstObservation(t *testing.T) {
+	target := testGroupRef(t)
+	retained := &fakeRetainedObject{membership: RetainedMembershipEmpty}
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+	}}
+	observer.onObserve = func() {
+		if !retained.acquired {
+			t.Fatalf("retained capability was not acquired before first observation")
+		}
+	}
+	signaler := &fakeSignaler{}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertAbsent(t, outcome)
+	if retained.acquireCalls != 1 {
+		t.Fatalf("retained acquire calls = %d, want 1", retained.acquireCalls)
+	}
+	if retained.acquiredAt.IsZero() {
+		t.Fatalf("retained acquiredAt was not recorded")
+	}
 }
 
 func TestContainmentReusedPGIDLeaderMissingWithoutContinuityDoesNotKill(t *testing.T) {
@@ -449,5 +534,16 @@ func assertSignals(t *testing.T, signaler *fakeSignaler, signals ...Signal) {
 	}
 	if !slices.Equal(got, signals) {
 		t.Fatalf("signals = %v, want %v", got, signals)
+	}
+}
+
+func assertRetainedSignals(t *testing.T, retained *fakeRetainedObject, signals ...Signal) {
+	t.Helper()
+	got := make([]Signal, len(retained.signalCalls))
+	for i, call := range retained.signalCalls {
+		got[i] = call.signal
+	}
+	if !slices.Equal(got, signals) {
+		t.Fatalf("retained signals = %v, want %v", got, signals)
 	}
 }

@@ -16,12 +16,21 @@ type Observer interface {
 	ObserveGroup(ctx context.Context, target model.GroupRef) (model.ContainmentObservation, error)
 }
 
-// RetainedGroupObject proves membership or absence for a durable group-lifetime
-// object identified by GroupRef.RetainedID. It must not infer from PID/PGID
-// samples; unknown or ambiguous state is represented by sealed unknown evidence
-// or by returning an error.
+// RetainedGroupObject acquires a held capability for the durable group-lifetime
+// object identified by GroupRef.RetainedID. The held capability, not a later
+// reconstruction from PID/PGID samples, is the provenance for membership proof,
+// absence proof, and teardown.
 type RetainedGroupObject interface {
-	ProveRetainedGroup(ctx context.Context, target model.GroupRef, begin, end time.Time) (RetainedGroupEvidence, error)
+	AcquireRetainedGroup(ctx context.Context, target model.GroupRef, acquiredAt time.Time) (RetainedGroupCapability, error)
+}
+
+// RetainedGroupCapability is a held retained-object capability. Membership,
+// absence probes, and teardown all act on this same object, so a reused numeric
+// process group cannot be mutated under retained-object authority.
+type RetainedGroupCapability interface {
+	Membership(ctx context.Context, target model.GroupRef, observedAt time.Time) (RetainedGroupEvidence, error)
+	SignalGroup(ctx context.Context, target model.GroupRef, signal Signal) (SignalResult, error)
+	ProbeGroup(ctx context.Context, target model.GroupRef) (ProbeResult, error)
 }
 
 type RetainedGroupMembership uint8
@@ -41,9 +50,9 @@ func (membership RetainedGroupMembership) validate() error {
 	}
 }
 
-// RetainedGroupEvidence is sealed retained-object evidence: callers can only
-// build it through the constructor, and the engine validates retained identity
-// and interval coverage before passing a proof state to the model.
+// RetainedGroupEvidence is sealed retained-object evidence. It is built by a
+// held retained capability, and the engine validates retained identity and
+// interval coverage before passing a proof state to the model.
 type RetainedGroupEvidence struct {
 	retainedID string
 	begin      time.Time
@@ -51,7 +60,7 @@ type RetainedGroupEvidence struct {
 	membership RetainedGroupMembership
 }
 
-func NewRetainedGroupEvidence(retainedID string, begin, end time.Time, membership RetainedGroupMembership) (RetainedGroupEvidence, error) {
+func newRetainedGroupEvidence(retainedID string, begin, end time.Time, membership RetainedGroupMembership) (RetainedGroupEvidence, error) {
 	evidence := RetainedGroupEvidence{
 		retainedID: retainedID,
 		begin:      begin,

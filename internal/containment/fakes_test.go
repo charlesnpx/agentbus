@@ -11,12 +11,16 @@ import (
 
 type fakeObserver struct {
 	observations []model.ContainmentObservation
+	onObserve    func()
 	calls        int
 }
 
 func (observer *fakeObserver) ObserveGroup(_ context.Context, _ model.GroupRef) (model.ContainmentObservation, error) {
 	if len(observer.observations) == 0 {
 		return model.ContainmentObservation{}, errors.New("no scripted observations")
+	}
+	if observer.onObserve != nil {
+		observer.onObserve()
 	}
 	index := observer.calls
 	if index >= len(observer.observations) {
@@ -57,23 +61,45 @@ func (witness *fakeContinuityWitness) ConfirmContinuouslyLive(_ context.Context,
 }
 
 type fakeRetainedObject struct {
-	membership  RetainedGroupMembership
-	memberships []RetainedGroupMembership
-	retainedID  string
-	begin       time.Time
-	end         time.Time
-	err         error
-	calls       int
+	membership      RetainedGroupMembership
+	memberships     []RetainedGroupMembership
+	retainedID      string
+	beginOffset     time.Duration
+	endOffset       time.Duration
+	acquireErr      error
+	membershipErr   error
+	script          []signalScript
+	probes          []ProbeResult
+	probeErrors     []error
+	acquired        bool
+	acquiredAt      time.Time
+	acquireCalls    int
+	membershipCalls int
+	signalCalls     []signalCall
+	probeCalls      int
 }
 
-func (object *fakeRetainedObject) ProveRetainedGroup(_ context.Context, target model.GroupRef, begin, end time.Time) (RetainedGroupEvidence, error) {
+func (object *fakeRetainedObject) AcquireRetainedGroup(_ context.Context, _ model.GroupRef, acquiredAt time.Time) (RetainedGroupCapability, error) {
 	if object == nil {
-		return RetainedGroupEvidence{}, errors.New("retained object proof is missing")
+		return nil, errors.New("retained object capability is missing")
 	}
-	index := object.calls
-	object.calls++
-	if object.err != nil {
-		return RetainedGroupEvidence{}, object.err
+	object.acquireCalls++
+	if object.acquireErr != nil {
+		return nil, object.acquireErr
+	}
+	object.acquired = true
+	object.acquiredAt = acquiredAt
+	return object, nil
+}
+
+func (object *fakeRetainedObject) Membership(_ context.Context, target model.GroupRef, observedAt time.Time) (RetainedGroupEvidence, error) {
+	if object == nil || !object.acquired {
+		return RetainedGroupEvidence{}, errors.New("retained object capability is missing")
+	}
+	index := object.membershipCalls
+	object.membershipCalls++
+	if object.membershipErr != nil {
+		return RetainedGroupEvidence{}, object.membershipErr
 	}
 	membership := object.membership
 	if index < len(object.memberships) {
@@ -85,19 +111,36 @@ func (object *fakeRetainedObject) ProveRetainedGroup(_ context.Context, target m
 	if retainedID == "" {
 		retainedID = target.RetainedID
 	}
-	evidenceBegin := object.begin
-	if evidenceBegin.IsZero() {
-		evidenceBegin = begin
-	}
-	evidenceEnd := object.end
-	if evidenceEnd.IsZero() {
-		evidenceEnd = end
-	}
-	evidence, err := NewRetainedGroupEvidence(retainedID, evidenceBegin, evidenceEnd, membership)
+	evidence, err := newRetainedGroupEvidence(retainedID, object.acquiredAt.Add(object.beginOffset), observedAt.Add(object.endOffset), membership)
 	if err != nil {
 		return RetainedGroupEvidence{}, err
 	}
 	return evidence, nil
+}
+
+func (object *fakeRetainedObject) SignalGroup(_ context.Context, target model.GroupRef, signal Signal) (SignalResult, error) {
+	object.signalCalls = append(object.signalCalls, signalCall{signal: signal, pgid: target.PGID})
+	if len(object.script) == 0 {
+		return SignalDelivered, nil
+	}
+	next := object.script[0]
+	object.script = object.script[1:]
+	if next.signal != 0 && next.signal != signal {
+		return SignalUnprovable, fmt.Errorf("retained signal = %s, want %s", signal, next.signal)
+	}
+	return next.result, next.err
+}
+
+func (object *fakeRetainedObject) ProbeGroup(_ context.Context, _ model.GroupRef) (ProbeResult, error) {
+	index := object.probeCalls
+	object.probeCalls++
+	if index < len(object.probeErrors) && object.probeErrors[index] != nil {
+		return ProbeUnprovable, object.probeErrors[index]
+	}
+	if index < len(object.probes) {
+		return object.probes[index], nil
+	}
+	return ProbeLive, nil
 }
 
 type signalScript struct {

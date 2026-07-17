@@ -43,6 +43,40 @@ func TestContainmentRetainedObjectProofAuthorizesMissingLeader(t *testing.T) {
 	}
 }
 
+func TestContainmentAuthorizationCarriesBasis(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	leaderResult, err := DecideContainmentAuthorizationWithBasis(ContainmentAuthorization{
+		Group: ref,
+		Observation: ContainmentObservation{
+			KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+			Group:          GroupLive,
+			Leader:         ProcessIdentityMatching,
+		},
+	})
+	if err != nil {
+		t.Fatalf("leader authorization error = %v", err)
+	}
+	if leaderResult.Decision != SignalDirectly || leaderResult.Basis != ContainmentBasisLeader {
+		t.Fatalf("leader authorization = %#v, want signal_directly/leader", leaderResult)
+	}
+
+	retainedResult, err := DecideContainmentAuthorizationWithBasis(ContainmentAuthorization{
+		Group: ref,
+		Observation: ContainmentObservation{
+			KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+			Group:          GroupLive,
+			Leader:         ProcessIdentityReused,
+		},
+		RetainedObject: RetainedObjectProofMembersPresent,
+	})
+	if err != nil {
+		t.Fatalf("retained authorization error = %v", err)
+	}
+	if retainedResult.Decision != SignalDirectly || retainedResult.Basis != ContainmentBasisRetainedObject {
+		t.Fatalf("retained authorization = %#v, want signal_directly/retained_object", retainedResult)
+	}
+}
+
 func TestContainmentRetainedObjectEmptyProofProvesAbsent(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
 	decision, err := DecideContainmentAuthorization(ContainmentAuthorization{

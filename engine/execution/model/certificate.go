@@ -195,12 +195,14 @@ type GroupRef struct {
 	HostBootID string
 	// PIDNamespaceID carries a known PID namespace value. PIDNamespaceState
 	// distinguishes unknown namespace evidence from platforms without PID namespaces.
-	PIDNamespaceID    string `json:"PIDNamespaceID,omitempty"`
-	PIDNamespaceState PIDNamespaceState
-	PGID              int
-	Leader            ProcessIdentity
-	Monitor           ProcessIdentity
-	RetainedID        string
+	PIDNamespaceID      string `json:"PIDNamespaceID,omitempty"`
+	PIDNamespaceState   PIDNamespaceState
+	RetainedDomainID    string `json:"RetainedDomainID,omitempty"`
+	RetainedDomainState RetainedDomainState
+	PGID                int
+	Leader              ProcessIdentity
+	Monitor             ProcessIdentity
+	RetainedID          string
 }
 
 func (ref *GroupRef) UnmarshalJSON(data []byte) error {
@@ -216,6 +218,9 @@ func (ref *GroupRef) UnmarshalJSON(data []byte) error {
 	out := GroupRef(decoded)
 	if _, ok := fields["PIDNamespaceState"]; !ok && out.PIDNamespaceID == "" && out.HostBootID != "" {
 		out.PIDNamespaceState = PIDNamespaceUnknown
+	}
+	if _, ok := fields["RetainedDomainState"]; !ok && out.HostBootID != "" {
+		out.RetainedDomainState = RetainedDomainUnknown
 	}
 	*ref = out
 	return nil
@@ -235,6 +240,9 @@ func (ref GroupRef) Validate() error {
 		return err
 	}
 	if err := validatePIDNamespace("group.pid_namespace", ref.PIDNamespaceID, ref.PIDNamespaceState); err != nil {
+		return err
+	}
+	if err := validateRetainedDomain("group.retained_domain", ref.RetainedDomainID, ref.RetainedDomainState); err != nil {
 		return err
 	}
 	if ref.PGID <= 1 {
@@ -265,9 +273,11 @@ func (ref GroupRef) Equal(other GroupRef) bool {
 
 func (ref GroupRef) KernelDomain() KernelDomainID {
 	return KernelDomainID{
-		HostBootID:        ref.HostBootID,
-		PIDNamespaceID:    ref.PIDNamespaceID,
-		PIDNamespaceState: ref.PIDNamespaceState,
+		HostBootID:          ref.HostBootID,
+		PIDNamespaceID:      ref.PIDNamespaceID,
+		PIDNamespaceState:   ref.PIDNamespaceState,
+		RetainedDomainID:    ref.RetainedDomainID,
+		RetainedDomainState: ref.RetainedDomainState,
 	}
 }
 

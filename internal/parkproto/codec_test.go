@@ -298,6 +298,80 @@ func TestReleaseBindingChecksPhysicalSecretGroupDigestAndExecDigest(t *testing.T
 	}
 }
 
+func TestReleaseGroupRefRetainedDomainRoundTripAndLegacyDecode(t *testing.T) {
+	execSpec := ExecSpec{Path: "/bin/echo", Argv: []string{"/bin/echo", "ok"}, Env: []string{"A=B"}, Dir: "/tmp"}
+	execDigest, err := DigestExecSpec(execSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupRef := testGroupRef()
+	groupRef.PIDNamespaceID = "pidns-1"
+	groupRef.PIDNamespaceState = model.PIDNamespaceKnown
+	groupRef.RetainedDomainID = "retained-domain-1"
+	groupRef.RetainedDomainState = model.RetainedDomainKnown
+	groupDigest, err := DigestGroupRef(groupRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := testReleaseBinding(execDigest)
+	binding.GroupRefDigest = groupDigest
+	release := Release{Binding: binding, ExpectedGroupRef: groupRef, ExecSpec: execSpec}
+
+	var roundTrip bytes.Buffer
+	if err := WriteFrame(&roundTrip, Version, 1, release); err != nil {
+		t.Fatalf("WriteFrame() error = %v", err)
+	}
+	received, err := NewReader(&roundTrip).Read()
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	decoded, ok := received.Message.(Release)
+	if !ok {
+		t.Fatalf("decoded message = %T, want Release", received.Message)
+	}
+	if !decoded.ExpectedGroupRef.Equal(groupRef) {
+		t.Fatalf("decoded GroupRef = %#v, want %#v", decoded.ExpectedGroupRef, groupRef)
+	}
+	if !decoded.ExpectedGroupRef.KernelDomain().ProvablySame(groupRef.KernelDomain()) {
+		t.Fatalf("decoded retained domain was not provably same")
+	}
+
+	payload, err := json.Marshal(release)
+	if err != nil {
+		t.Fatalf("Marshal release error = %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		t.Fatalf("Unmarshal release fields error = %v", err)
+	}
+	var groupFields map[string]json.RawMessage
+	if err := json.Unmarshal(fields["expectedGroupRef"], &groupFields); err != nil {
+		t.Fatalf("Unmarshal group fields error = %v", err)
+	}
+	delete(groupFields, "RetainedDomainID")
+	delete(groupFields, "RetainedDomainState")
+	legacyGroup, err := json.Marshal(groupFields)
+	if err != nil {
+		t.Fatalf("Marshal legacy group error = %v", err)
+	}
+	fields["expectedGroupRef"] = legacyGroup
+	legacyPayload, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("Marshal legacy payload error = %v", err)
+	}
+	legacyMessage, err := decodePayload(MessageRelease, legacyPayload)
+	if err != nil {
+		t.Fatalf("decode legacy release error = %v", err)
+	}
+	legacyRelease := legacyMessage.(Release)
+	if legacyRelease.ExpectedGroupRef.RetainedDomainState != model.RetainedDomainUnknown {
+		t.Fatalf("legacy retained domain state = %v, want %v", legacyRelease.ExpectedGroupRef.RetainedDomainState, model.RetainedDomainUnknown)
+	}
+	if legacyRelease.ExpectedGroupRef.KernelDomain().ProvablySame(groupRef.KernelDomain()) {
+		t.Fatalf("legacy missing retained domain was provably same as known retained domain")
+	}
+}
+
 func TestReleaseBindingRejectsReplayAcrossParkInstancesAndConsumesOnce(t *testing.T) {
 	execSpec := ExecSpec{Path: "/bin/echo", Argv: []string{"/bin/echo", "ok"}, Env: []string{"A=B"}, Dir: "/tmp"}
 	execDigest, err := DigestExecSpec(execSpec)

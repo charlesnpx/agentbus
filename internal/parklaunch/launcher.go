@@ -598,13 +598,15 @@ func groupRefFromClaims(worker, monitor procgroup.ProcessClaim, custodyID model.
 		retainedID = defaultRetainedID(worker, monitor, custodyID, launchKey)
 	}
 	return model.GroupRef{
-		Version:           1,
-		CustodyID:         custodyID,
-		Launch:            launchKey,
-		HostBootID:        worker.KernelDomainID.HostBootID,
-		PIDNamespaceID:    worker.KernelDomainID.PIDNamespaceID,
-		PIDNamespaceState: worker.KernelDomainID.PIDNamespaceState,
-		PGID:              worker.PGID,
+		Version:             1,
+		CustodyID:           custodyID,
+		Launch:              launchKey,
+		HostBootID:          worker.KernelDomainID.HostBootID,
+		PIDNamespaceID:      worker.KernelDomainID.PIDNamespaceID,
+		PIDNamespaceState:   worker.KernelDomainID.PIDNamespaceState,
+		RetainedDomainID:    worker.KernelDomainID.RetainedDomainID,
+		RetainedDomainState: worker.KernelDomainID.RetainedDomainState,
+		PGID:                worker.PGID,
 		Leader: model.ProcessIdentity{
 			PID:               worker.PID,
 			HighResStartToken: worker.StartToken.String(),

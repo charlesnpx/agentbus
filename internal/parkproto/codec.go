@@ -333,29 +333,37 @@ func (release strictReleaseJSON) toRelease() Release {
 }
 
 type strictGroupRefJSON struct {
-	Version           uint16
-	CustodyID         model.CustodyID
-	Launch            model.LaunchKey
-	HostBootID        string
-	PIDNamespaceID    string `json:"PIDNamespaceID,omitempty"`
-	PIDNamespaceState model.PIDNamespaceState
-	PGID              int
-	Leader            model.ProcessIdentity
-	Monitor           model.ProcessIdentity
-	RetainedID        string
+	Version             uint16
+	CustodyID           model.CustodyID
+	Launch              model.LaunchKey
+	HostBootID          string
+	PIDNamespaceID      string `json:"PIDNamespaceID,omitempty"`
+	PIDNamespaceState   model.PIDNamespaceState
+	RetainedDomainID    string `json:"RetainedDomainID,omitempty"`
+	RetainedDomainState *model.RetainedDomainState
+	PGID                int
+	Leader              model.ProcessIdentity
+	Monitor             model.ProcessIdentity
+	RetainedID          string
 }
 
 func (ref strictGroupRefJSON) toGroupRef() model.GroupRef {
+	retainedDomainState := model.RetainedDomainUnknown
+	if ref.RetainedDomainState != nil {
+		retainedDomainState = *ref.RetainedDomainState
+	}
 	return model.GroupRef{
-		Version:           ref.Version,
-		CustodyID:         ref.CustodyID,
-		Launch:            ref.Launch,
-		HostBootID:        ref.HostBootID,
-		PIDNamespaceID:    ref.PIDNamespaceID,
-		PIDNamespaceState: ref.PIDNamespaceState,
-		PGID:              ref.PGID,
-		Leader:            ref.Leader,
-		Monitor:           ref.Monitor,
-		RetainedID:        ref.RetainedID,
+		Version:             ref.Version,
+		CustodyID:           ref.CustodyID,
+		Launch:              ref.Launch,
+		HostBootID:          ref.HostBootID,
+		PIDNamespaceID:      ref.PIDNamespaceID,
+		PIDNamespaceState:   ref.PIDNamespaceState,
+		RetainedDomainID:    ref.RetainedDomainID,
+		RetainedDomainState: retainedDomainState,
+		PGID:                ref.PGID,
+		Leader:              ref.Leader,
+		Monitor:             ref.Monitor,
+		RetainedID:          ref.RetainedID,
 	}
 }
