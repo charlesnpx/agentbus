@@ -860,6 +860,119 @@ func TestIdentifiedFencedJobReadsAuthorityWithoutJSONRecordAndDiagnosesDuplicate
 	}
 }
 
+func TestIdentifiedFencedResultPublishUsesDurableWorkspaceLayoutKeyWithoutJobStore(t *testing.T) {
+	t.Parallel()
+	holdNaturalExit := make(chan struct{})
+	var release sync.Once
+	defer release.Do(func() { close(holdNaturalExit) })
+	backend := newFakeBackend("fake")
+	backend.started = make(chan struct{}, 1)
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitAndVerify = holdNaturalExit
+	enableTestAdmission(t, server, launcher)
+
+	requestWorkspaceKey := "workspace-identified"
+	if _, err := engine.LayoutForWorkspaceKey(root, requestWorkspaceKey); err == nil {
+		t.Fatalf("request workspace key %q unexpectedly accepted as engine layout key", requestWorkspaceKey)
+	}
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: requestWorkspaceKey,
+		RequestID:    "request-authority-result-publish",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	if submitted.JobID == "" || submitted.Deduplicated {
+		t.Fatalf("submit result = %+v", submitted)
+	}
+	waitBackendStarted(t, backend)
+
+	initialStore := server.storeForJob(submitted.JobID)
+	if initialStore == nil {
+		t.Fatalf("job store missing before simulated restart for %s", submitted.JobID)
+	}
+	if _, err := initialStore.Load(submitted.JobID); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("JSON job record load error = %v, want not exist", err)
+	}
+	server.mu.Lock()
+	server.jobStores = make(map[string]*engine.Store)
+	server.mu.Unlock()
+	if store := server.storeForJob(submitted.JobID); store != nil {
+		t.Fatalf("storeForJob(%s) = %+v after clearing jobStores with no JSON record, want nil", submitted.JobID, store.Layout())
+	}
+
+	release.Do(func() { close(holdNaturalExit) })
+	record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+	if got := record.RequestKey.WorkspaceKey.String(); got != requestWorkspaceKey {
+		t.Fatalf("record request workspace key = %q, want %q", got, requestWorkspaceKey)
+	}
+	canonicalCWD, err := engine.CanonicalWorkspace(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLayoutKey := engine.WorkspaceKey(canonicalCWD)
+	if got := record.WorkspaceLayoutKey.String(); got != wantLayoutKey {
+		t.Fatalf("record workspace layout key = %q, want %q", got, wantLayoutKey)
+	}
+	if record.WorkspaceLayoutKey.String() == record.RequestKey.WorkspaceKey.String() {
+		t.Fatalf("workspace layout key conflated with request workspace key %q", record.RequestKey.WorkspaceKey)
+	}
+	layout, err := engine.LayoutForWorkspaceKey(root, record.WorkspaceLayoutKey.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedPath, err := engine.ResultPathForLayout(layout, submitted.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !servedPathWithinDir(layout.Results, expectedPath) {
+		t.Fatalf("expected result path %q outside results root %q", expectedPath, layout.Results)
+	}
+	if record.Result == nil || record.Result.Result.Path != expectedPath {
+		t.Fatalf("record result = %+v, want path %q", record.Result, expectedPath)
+	}
+	if record.Terminal == nil || record.Terminal.Result == nil || record.Terminal.Result.Path != expectedPath {
+		t.Fatalf("terminal result = %+v, want path %q", record.Terminal, expectedPath)
+	}
+	raw, err := os.ReadFile(expectedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "PASS\n\n## Findings\nNone.\n" {
+		t.Fatalf("result artifact = %q, want backend final text", string(raw))
+	}
+
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: submitted.JobID})
+	if result.JobID != submitted.JobID || result.State != engine.StateCompleted || result.Result == nil || result.Result.ResultPath != expectedPath {
+		t.Fatalf("authority result = %+v, want completed result at %q", result, expectedPath)
+	}
+	server.mu.Lock()
+	server.jobStores = make(map[string]*engine.Store)
+	server.mu.Unlock()
+	again := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: submitted.JobID})
+	if again.Result == nil || again.Result.ResultPath != expectedPath {
+		t.Fatalf("authority result after clearing jobStores again = %+v, want path %q", again, expectedPath)
+	}
+
+	outsidePath := filepath.Join(root, "outside-results", submitted.JobID+".txt")
+	if err := os.MkdirAll(filepath.Dir(outsidePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outsidePath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = (servedResultPublisher{server: server}).Verify(context.Background(), model.ResultRef{
+		Path:   outsidePath,
+		Digest: record.Result.Result.Digest,
+		Bytes:  record.Result.Result.Bytes,
+	})
+	if err == nil || !strings.Contains(err.Error(), "escapes results root") {
+		t.Fatalf("Verify outside results root error = %v, want path escape rejection", err)
+	}
+}
+
 func TestIdentifiedFencedCancelUsesAuthorityWhenAdmissionMarkerCleared(t *testing.T) {
 	t.Parallel()
 	holdNaturalExit := make(chan struct{})

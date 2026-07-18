@@ -115,6 +115,12 @@ func LayoutForWorkspace(root, cwd string) (WorkspaceLayout, error) {
 	return layoutForWorkspaceKey(root, key, canon)
 }
 
+// LayoutForWorkspaceKey describes the state layout for a persisted workspace
+// namespace key without requiring the original workspace path.
+func LayoutForWorkspaceKey(root, key string) (WorkspaceLayout, error) {
+	return layoutForWorkspaceKey(root, key, "")
+}
+
 func layoutForWorkspaceKey(root, key, workspace string) (WorkspaceLayout, error) {
 	if err := validateWorkspaceKey(key); err != nil {
 		return WorkspaceLayout{}, err

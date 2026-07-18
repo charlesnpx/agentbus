@@ -210,19 +210,20 @@ func forEachLaunchSlot[T any](slots LaunchSlots[T], fn func(LaunchOrdinal, T) er
 }
 
 type SafetyRecord struct {
-	SchemaVersion   uint16
-	Revision        uint64
-	JobID           JobID
-	RequestKey      RequestKey
-	TaskIdentity    TaskIdentity
-	Mode            Mode
-	AdmittedBy      BootRef
-	Attempt         AttemptProof
-	Acknowledgement *AcknowledgementFact
-	Cancel          *CancelFact
-	Outcome         *OutcomeFact
-	Result          *ResultCertificate
-	Terminal        *TerminalCertificate
+	SchemaVersion      uint16
+	Revision           uint64
+	JobID              JobID
+	RequestKey         RequestKey
+	WorkspaceLayoutKey WorkspaceKey
+	TaskIdentity       TaskIdentity
+	Mode               Mode
+	AdmittedBy         BootRef
+	Attempt            AttemptProof
+	Acknowledgement    *AcknowledgementFact
+	Cancel             *CancelFact
+	Outcome            *OutcomeFact
+	Result             *ResultCertificate
+	Terminal           *TerminalCertificate
 }
 
 func (record SafetyRecord) Validate() error {
@@ -236,6 +237,9 @@ func (record SafetyRecord) Validate() error {
 		return err
 	}
 	if err := record.RequestKey.Validate(); err != nil {
+		return err
+	}
+	if err := validateOptionalWorkspaceLayoutKey("workspace_layout_key", record.WorkspaceLayoutKey); err != nil {
 		return err
 	}
 	if err := record.TaskIdentity.Validate(); err != nil {

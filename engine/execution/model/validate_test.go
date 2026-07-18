@@ -323,6 +323,19 @@ func TestValidateSafetyRecordRejectsTerminalProofFromWrongMode(t *testing.T) {
 	}
 }
 
+func TestValidateSafetyRecordValidatesOptionalWorkspaceLayoutKey(t *testing.T) {
+	record := validSafetyRecord()
+	record.WorkspaceLayoutKey = WorkspaceKey(strings.Repeat("a", 64))
+	if err := ValidateSafetyRecord(record); err != nil {
+		t.Fatalf("valid workspace layout key rejected: %v", err)
+	}
+
+	record.WorkspaceLayoutKey = "workspace-identified"
+	if err := ValidateSafetyRecord(record); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("invalid workspace layout key error = %v, want ErrInvalidValue", err)
+	}
+}
+
 func validSafetyRecord() SafetyRecord {
 	boot := BootRef{BootID: "boot-1", OwnerID: "owner-1"}
 	attempt := AttemptRef{JobID: "job-0001", AttemptID: "attempt-1", Epoch: 1}

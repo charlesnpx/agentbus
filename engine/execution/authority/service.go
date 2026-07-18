@@ -75,10 +75,11 @@ type Ready struct {
 }
 
 type AcceptRequest struct {
-	RequestKey   model.RequestKey
-	TaskIdentity model.TaskIdentity
-	Mode         model.Mode
-	SessionID    string
+	RequestKey         model.RequestKey
+	WorkspaceLayoutKey model.WorkspaceKey
+	TaskIdentity       model.TaskIdentity
+	Mode               model.Mode
+	SessionID          string
 }
 
 type AcceptResult struct {
@@ -393,13 +394,14 @@ func normalizeAcceptRequest(request AcceptRequest) (AcceptRequest, error) {
 		return AcceptRequest{}, fmt.Errorf("%w: mode: %v", ErrInvalidRequest, err)
 	}
 	if _, err := model.Project(model.SafetyRecord{
-		SchemaVersion: safetySchemaVersion,
-		Revision:      1,
-		JobID:         model.JobID("job-validation"),
-		RequestKey:    request.RequestKey,
-		TaskIdentity:  request.TaskIdentity,
-		Mode:          request.Mode,
-		AdmittedBy:    model.BootRef{BootID: "boot-validation", OwnerID: "owner-validation"},
+		SchemaVersion:      safetySchemaVersion,
+		Revision:           1,
+		JobID:              model.JobID("job-validation"),
+		RequestKey:         request.RequestKey,
+		WorkspaceLayoutKey: request.WorkspaceLayoutKey,
+		TaskIdentity:       request.TaskIdentity,
+		Mode:               request.Mode,
+		AdmittedBy:         model.BootRef{BootID: "boot-validation", OwnerID: "owner-validation"},
 		Attempt: model.AttemptProof{
 			Ref: model.AttemptRef{JobID: "job-validation", AttemptID: "attempt-validation", Epoch: 1},
 		},
@@ -430,13 +432,14 @@ func acceptTx(tx repository.WriteTx, request AcceptRequest, boot model.BootRef) 
 		return AcceptResult{}, fmt.Errorf("%w: allocated attempt_id: %v", ErrInvalidRequest, err)
 	}
 	record := model.SafetyRecord{
-		SchemaVersion: safetySchemaVersion,
-		Revision:      1,
-		JobID:         jobID,
-		RequestKey:    request.RequestKey,
-		TaskIdentity:  request.TaskIdentity,
-		Mode:          request.Mode,
-		AdmittedBy:    boot,
+		SchemaVersion:      safetySchemaVersion,
+		Revision:           1,
+		JobID:              jobID,
+		RequestKey:         request.RequestKey,
+		WorkspaceLayoutKey: request.WorkspaceLayoutKey,
+		TaskIdentity:       request.TaskIdentity,
+		Mode:               request.Mode,
+		AdmittedBy:         boot,
 		Attempt: model.AttemptProof{
 			Ref: model.AttemptRef{JobID: jobID, AttemptID: attemptID, Epoch: 1},
 		},

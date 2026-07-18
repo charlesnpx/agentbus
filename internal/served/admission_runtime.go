@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
@@ -220,6 +221,17 @@ func (p servedResultPublisher) Publish(ctx context.Context, jobID model.JobID, p
 	if err := ctx.Err(); err != nil {
 		return model.ResultReceipt{}, err
 	}
+	record, authorityOwned, err := p.authorityRecord(ctx, jobID)
+	if err != nil {
+		return model.ResultReceipt{}, err
+	}
+	if authorityOwned {
+		return p.publishAuthorityResult(jobID, record, payload)
+	}
+	return p.publishLegacyResult(jobID, payload)
+}
+
+func (p servedResultPublisher) publishLegacyResult(jobID model.JobID, payload []byte) (model.ResultReceipt, error) {
 	store := p.server.storeForJob(jobID.String())
 	if store == nil {
 		return model.ResultReceipt{}, fmt.Errorf("job store not found for %s", jobID)
@@ -228,6 +240,25 @@ func (p servedResultPublisher) Publish(ctx context.Context, jobID model.JobID, p
 	if err != nil {
 		return model.ResultReceipt{}, err
 	}
+	return servedResultReceipt(jobID, info), nil
+}
+
+func (p servedResultPublisher) publishAuthorityResult(jobID model.JobID, record model.SafetyRecord, payload []byte) (model.ResultReceipt, error) {
+	layout, err := authorityResultLayout(p.server.stateRoot, record)
+	if err != nil {
+		return model.ResultReceipt{}, err
+	}
+	info, err := engine.WriteResultForLayout(layout, jobID.String(), payload, p.server.inlineResultCap)
+	if err != nil {
+		return model.ResultReceipt{}, err
+	}
+	if !servedPathWithinDir(layout.Results, info.ResultPath) {
+		return model.ResultReceipt{}, fmt.Errorf("authority result path %q escapes results root %q", info.ResultPath, layout.Results)
+	}
+	return servedResultReceipt(jobID, info), nil
+}
+
+func servedResultReceipt(jobID model.JobID, info engine.ResultInfo) model.ResultReceipt {
 	return model.ResultReceipt{
 		JobID: jobID,
 		Result: model.ResultRef{
@@ -239,12 +270,25 @@ func (p servedResultPublisher) Publish(ctx context.Context, jobID model.JobID, p
 			Kind:   "served_result",
 			Detail: "directory_synced",
 		},
-	}, nil
+	}
 }
 
 func (p servedResultPublisher) Verify(ctx context.Context, result model.ResultRef) (model.ResultReceipt, error) {
 	if err := ctx.Err(); err != nil {
 		return model.ResultReceipt{}, err
+	}
+	jobID, err := jobIDFromResultPath(result.Path)
+	if err != nil {
+		return model.ResultReceipt{}, err
+	}
+	record, authorityOwned, err := p.authorityRecord(ctx, jobID)
+	if err != nil {
+		return model.ResultReceipt{}, err
+	}
+	if authorityOwned {
+		if err := validateAuthorityResultPath(p.server.stateRoot, record, jobID, result.Path); err != nil {
+			return model.ResultReceipt{}, err
+		}
 	}
 	raw, err := os.ReadFile(result.Path)
 	if err != nil {
@@ -257,10 +301,6 @@ func (p servedResultPublisher) Verify(ctx context.Context, result model.ResultRe
 	if int64(len(raw)) != result.Bytes {
 		return model.ResultReceipt{}, fmt.Errorf("result bytes = %d, want %d", len(raw), result.Bytes)
 	}
-	jobID, err := jobIDFromResultPath(result.Path)
-	if err != nil {
-		return model.ResultReceipt{}, err
-	}
 	return model.ResultReceipt{
 		JobID:  jobID,
 		Result: result,
@@ -269,6 +309,73 @@ func (p servedResultPublisher) Verify(ctx context.Context, result model.ResultRe
 			Detail: "directory_synced",
 		},
 	}, nil
+}
+
+func (p servedResultPublisher) authorityRecord(ctx context.Context, jobID model.JobID) (model.SafetyRecord, bool, error) {
+	if p.server == nil || p.server.admissionRepository == nil {
+		return model.SafetyRecord{}, false, nil
+	}
+	var image repository.JobImage
+	if err := p.server.admissionRepository.View(ctx, func(tx repository.ReadTx) error {
+		image = tx.LoadJob(jobID)
+		return nil
+	}); err != nil {
+		return model.SafetyRecord{}, false, err
+	}
+	if image.Safety.State == repository.RecordValid {
+		return image.Safety.Value, true, nil
+	}
+	if image.Safety.State == repository.RecordMissing &&
+		image.Binding.State == repository.RecordMissing &&
+		image.Projection.State == repository.RecordMissing &&
+		image.Quarantine.State == repository.RecordMissing {
+		return model.SafetyRecord{}, false, nil
+	}
+	if image.Safety.State == repository.RecordCorrupt {
+		diagnostic := image.Safety.Diagnostic
+		if diagnostic == "" {
+			diagnostic = "corrupt"
+		}
+		return model.SafetyRecord{}, false, fmt.Errorf("%w: safety: %s", repository.ErrCorruptRecord, diagnostic)
+	}
+	return model.SafetyRecord{}, false, fmt.Errorf("authority safety state = %s for %s", image.Safety.State, jobID)
+}
+
+func authorityResultLayout(root string, record model.SafetyRecord) (engine.WorkspaceLayout, error) {
+	if record.WorkspaceLayoutKey == "" {
+		return engine.WorkspaceLayout{}, fmt.Errorf("authority workspace layout key missing for %s", record.JobID)
+	}
+	layout, err := engine.LayoutForWorkspaceKey(root, record.WorkspaceLayoutKey.String())
+	if err != nil {
+		return engine.WorkspaceLayout{}, fmt.Errorf("authority workspace layout for %s: %w", record.JobID, err)
+	}
+	return layout, nil
+}
+
+func validateAuthorityResultPath(root string, record model.SafetyRecord, jobID model.JobID, path string) error {
+	layout, err := authorityResultLayout(root, record)
+	if err != nil {
+		return err
+	}
+	if !servedPathWithinDir(layout.Results, path) {
+		return fmt.Errorf("authority result path %q escapes results root %q", path, layout.Results)
+	}
+	expected, err := engine.ResultPathForLayout(layout, jobID.String())
+	if err != nil {
+		return err
+	}
+	if filepath.Clean(path) != filepath.Clean(expected) {
+		return fmt.Errorf("authority result path = %q, want %q", path, expected)
+	}
+	return nil
+}
+
+func servedPathWithinDir(dir, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
 }
 
 func jobIDFromResultPath(path string) (model.JobID, error) {

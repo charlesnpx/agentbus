@@ -1407,8 +1407,13 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	if err != nil {
 		return requestOutcome{err: admissionProtocolError(err)}
 	}
+	canonicalCWD, err := engine.CanonicalWorkspace(spec.CWD)
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+	}
+	workspaceLayoutKey := model.WorkspaceKey(engine.WorkspaceKey(canonicalCWD))
 	s.mu.Lock()
-	store, err := s.storeForCWDLocked(spec.CWD)
+	store, err := s.storeForCWDLocked(canonicalCWD)
 	s.mu.Unlock()
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
@@ -1450,10 +1455,11 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		}
 	}
 	request := authority.AcceptRequest{
-		RequestKey:   requestKey,
-		TaskIdentity: taskIdentity,
-		Mode:         mode,
-		SessionID:    admissionSessionID,
+		RequestKey:         requestKey,
+		WorkspaceLayoutKey: workspaceLayoutKey,
+		TaskIdentity:       taskIdentity,
+		Mode:               mode,
+		SessionID:          admissionSessionID,
 	}
 	var accepted authority.AcceptResult
 	var legacyFencedPreparation authority.LegacyFencedPreparation

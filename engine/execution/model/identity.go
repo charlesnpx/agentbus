@@ -42,6 +42,23 @@ func (key WorkspaceKey) Validate() error {
 	return validateToken("workspace_key", string(key))
 }
 
+func validateOptionalWorkspaceLayoutKey(field string, key WorkspaceKey) error {
+	value := key.String()
+	if value == "" {
+		return nil
+	}
+	if len(value) != sha256.Size*2 {
+		return invalid(field, "must be a 64-hex workspace layout key")
+	}
+	for _, r := range value {
+		if r >= '0' && r <= '9' || r >= 'a' && r <= 'f' {
+			continue
+		}
+		return invalid(field, "must be a 64-hex workspace layout key")
+	}
+	return nil
+}
+
 type RequestID string
 
 func NewRequestID(value string) (RequestID, error) {
