@@ -40,12 +40,12 @@ type admissionCoordinator = coordinator.Coordinator
 type admissionBootstrapperFactory func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error)
 
 func (s *Server) bootstrapAdmission(ctx context.Context) error {
-	supervisor := s.admissionSupervisor
-	if supervisor == nil {
-		supervisor = newServedAdmissionSupervisor(s)
-		s.admissionSupervisor = supervisor
+	runtime := s.admissionRuntime
+	if runtime == nil {
+		runtime = newServedAdmissionRuntime(s)
+		s.admissionRuntime = runtime
 	}
-	if err := supervisor.verifiedContainmentSupported(ctx); err != nil {
+	if err := runtime.verifiedContainmentSupported(ctx); err != nil {
 		s.jobsRequestIDEnabled = false
 		return err
 	}
@@ -72,12 +72,11 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	supervisor.SetBoot(boot)
 	session, err := bootstrapper.Begin(ctx, boot)
 	if err != nil {
 		return err
 	}
-	if err := recoverAdmissionBeforeReady(ctx, session, supervisor.launchPort(), s.safetyLatch); err != nil {
+	if err := recoverAdmissionBeforeReady(ctx, session, runtime.launchPort(), s.safetyLatch); err != nil {
 		return err
 	}
 	if err := s.reapKnownStores(); err != nil {
@@ -92,11 +91,11 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	launchController, err := launch.New(servedLaunchAuthority{ready: ready, latch: s.safetyLatch}, supervisor.launchPort())
+	launchController, err := launch.New(servedLaunchAuthority{ready: ready, latch: s.safetyLatch}, runtime.launchPort())
 	if err != nil {
 		return err
 	}
-	coord, err := coordinator.New(adapter, supervisor, launchController, servedResultPublisher{server: s}, owner)
+	coord, err := coordinator.New(adapter, launchController, servedResultPublisher{server: s}, owner)
 	if err != nil {
 		return err
 	}
@@ -112,7 +111,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	s.admissionCoordinator = coord
 	s.admissionOwnedWorkChecker = coord
 	s.admissionSubmission = submission
-	s.admissionSupervisor = supervisor
+	s.admissionRuntime = runtime
 	s.admissionRepository = repo
 	s.admissionClose = closer
 	closeOnErr = false
@@ -139,8 +138,8 @@ func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootst
 		latch:       s.safetyLatch,
 	}
 	options := []authority.BootstrapperOption{authority.WithAnchor(anchor)}
-	if s.admissionSupervisor != nil {
-		options = append(options, authority.WithQuiescenceVerifier(s.admissionSupervisor.quiescenceVerifier()))
+	if s.admissionRuntime != nil {
+		options = append(options, authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
 	}
 	bootstrapper, err := authority.NewBootstrapper(repo, options...)
 	if err != nil {
@@ -401,7 +400,7 @@ type admissionParkableBackend interface {
 func (s *Server) admissionExecutionCapabilities(backend engine.Backend) model.ExecutionCapabilities {
 	return model.ExecutionCapabilities{
 		ExternalRunner: admissionBackendExternalRunner(backend),
-		FencedLaunch:   s.admissionSupervisor != nil && s.admissionSupervisor.support().ParkedExec,
+		FencedLaunch:   s.admissionRuntime != nil && s.admissionRuntime.support().ParkedExec,
 	}
 }
 
@@ -1149,34 +1148,6 @@ type servedAdmissionAuthority struct {
 	latch *SafetyLatch
 }
 
-func (a *servedAdmissionAuthority) Accept(ctx context.Context, request coordinator.AdmissionRequest) (coordinator.AdmissionResult, error) {
-	accepted, err := a.ready.Accept(ctx, authority.AcceptRequest{
-		RequestKey:   request.RequestKey,
-		TaskIdentity: request.TaskIdentity,
-		Mode:         request.Mode,
-		SessionID:    request.SessionID,
-	})
-	if err != nil {
-		return coordinator.AdmissionResult{}, err
-	}
-	return coordinator.AdmissionResult{Record: accepted.Record, Projection: accepted.Projection, Replayed: accepted.Replayed}, nil
-}
-
-func (a *servedAdmissionAuthority) BindGroup(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, group model.GroupRef) (coordinator.StepResult, error) {
-	applied, err := a.ready.BindGroup(ctx, jobID, ref, ordinal, group)
-	return admissionStepResult(applied, err)
-}
-
-func (a *servedAdmissionAuthority) CommitGrant(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, nonce model.PermitNonce) (coordinator.StepResult, error) {
-	applied, err := a.ready.CommitGrant(ctx, jobID, ref, ordinal, nonce)
-	return admissionStepResult(applied, err)
-}
-
-func (a *servedAdmissionAuthority) RecordRelease(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, child model.ChildIdentity, evidence model.Evidence) (coordinator.StepResult, error) {
-	applied, err := a.ready.RecordRelease(ctx, jobID, ref, ordinal, child, evidence)
-	return admissionStepResult(applied, err)
-}
-
 func (a *servedAdmissionAuthority) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) (coordinator.StepResult, error) {
 	applied, err := a.ready.RecordQuiescence(ctx, jobID, ordinal, verified)
 	return admissionStepResult(applied, err)
@@ -1232,10 +1203,6 @@ func (a *servedAdmissionAuthority) RecoveryPlan(ctx context.Context, jobID model
 		return admissionCancelBeforeAuthorizationPlan(snapshot.Record), nil
 	}
 	return model.PlanRecovery(snapshot.Record, trigger)
-}
-
-func (a *servedAdmissionAuthority) ClaimPending(ctx context.Context, ref model.AttemptRef, owner model.OwnerID) error {
-	return a.ready.ClaimPending(ctx, ref, owner)
 }
 
 func (a *servedAdmissionAuthority) HasOwnedWork(ctx context.Context) (bool, error) {
@@ -1344,10 +1311,10 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	if !s.jobsRequestIDEnabled {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorCapabilityMissing, "jobs.requestId capability is disabled", protocol.ErrorData{})}
 	}
-	if s.admissionCoordinator == nil || s.admissionReady == nil || s.admissionSubmission == nil || s.admissionSupervisor == nil {
+	if s.admissionCoordinator == nil || s.admissionReady == nil || s.admissionSubmission == nil || s.admissionRuntime == nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorCapabilityMissing, "admission authority is not ready", protocol.ErrorData{})}
 	}
-	if err := s.admissionSupervisor.verifiedContainmentSupported(ctx); err != nil {
+	if err := s.admissionRuntime.verifiedContainmentSupported(ctx); err != nil {
 		return requestOutcome{err: admissionProtocolError(err)}
 	}
 

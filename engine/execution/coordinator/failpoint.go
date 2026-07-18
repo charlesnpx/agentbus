@@ -5,22 +5,13 @@ import "fmt"
 type Failpoint string
 
 const (
-	FailSupervisorPrepareBefore Failpoint = "supervisor.prepare.before"
-	FailSupervisorPrepareAfter  Failpoint = "supervisor.prepare.after"
-	FailGrantBeforeCommit       Failpoint = "grant.before_commit"
-	FailGrantAfterCommit        Failpoint = "grant.after_commit"
-	FailPermitSendBefore        Failpoint = "permit_send.before"
-	FailPermitSendAfter         Failpoint = "permit_send.after"
-	FailLaunchForked            Failpoint = "launch.forked"
-	FailLaunchExeced            Failpoint = "launch.execed"
-	FailLaunchQuiescent         Failpoint = "launch.quiescent"
-	FailContainSignal           Failpoint = "contain.signal"
-	FailContainVerified         Failpoint = "contain.verified"
-	FailRetireClose             Failpoint = "retire.close"
-	FailRetireFsync             Failpoint = "retire.fsync"
-	FailResultTempWrite         Failpoint = "result.temp_write"
-	FailResultFsync             Failpoint = "result.fsync"
-	FailResultRename            Failpoint = "result.rename"
+	FailContainSignal   Failpoint = "contain.signal"
+	FailContainVerified Failpoint = "contain.verified"
+	FailRetireClose     Failpoint = "retire.close"
+	FailRetireFsync     Failpoint = "retire.fsync"
+	FailResultTempWrite Failpoint = "result.temp_write"
+	FailResultFsync     Failpoint = "result.fsync"
+	FailResultRename    Failpoint = "result.rename"
 )
 
 type InjectedFailure struct {

@@ -13,17 +13,12 @@ import (
 
 var (
 	ErrCoordinatorNotReady       = errors.New("coordinator not ready")
-	ErrSupervisorRequired        = errors.New("coordinator supervisor is required")
 	ErrAuthorityRequired         = errors.New("coordinator authority is required")
 	ErrLaunchContainmentRequired = errors.New("coordinator launch containment is required")
 	ErrFatalRecovery             = errors.New("coordinator fatal recovery plan")
 )
 
 type AdmissionAuthority interface {
-	Accept(context.Context, AdmissionRequest) (AdmissionResult, error)
-	BindGroup(context.Context, model.JobID, model.AttemptRef, model.LaunchOrdinal, model.GroupRef) (StepResult, error)
-	CommitGrant(context.Context, model.JobID, model.AttemptRef, model.LaunchOrdinal, model.PermitNonce) (StepResult, error)
-	RecordRelease(context.Context, model.JobID, model.AttemptRef, model.LaunchOrdinal, model.ChildIdentity, model.Evidence) (StepResult, error)
 	RecordQuiescence(context.Context, model.JobID, model.LaunchOrdinal, custodian.VerifiedQuiescence) (StepResult, error)
 	RequestCancel(context.Context, model.JobID) (StepResult, error)
 	RecordOutcome(context.Context, model.JobID, model.AttemptRef, model.Outcome) (StepResult, error)
@@ -31,22 +26,8 @@ type AdmissionAuthority interface {
 	Finalize(context.Context, model.JobID, model.AttemptRef, model.TerminalIntent) (StepResult, error)
 	Snapshot(context.Context, model.JobID) (JobSnapshot, error)
 	RecoveryPlan(context.Context, model.JobID, model.RecoveryTrigger) (model.RecoveryPlan, error)
-	ClaimPending(context.Context, model.AttemptRef, model.OwnerID) error
 	HasOwnedWork(context.Context) (bool, error)
 	FailStop(context.Context, error) error
-}
-
-type AdmissionRequest struct {
-	RequestKey   model.RequestKey
-	TaskIdentity model.TaskIdentity
-	Mode         model.Mode
-	SessionID    string
-}
-
-type AdmissionResult struct {
-	Record     model.SafetyRecord
-	Projection model.JobProjection
-	Replayed   bool
 }
 
 type StepResult struct {
@@ -62,10 +43,8 @@ type JobSnapshot struct {
 
 type Coordinator struct {
 	authority         AdmissionAuthority
-	supervisor        Supervisor
 	launchContainment LaunchContainment
 	results           ResultPublisher
-	owner             model.OwnerID
 	shutdownPoll      time.Duration
 }
 
@@ -73,12 +52,9 @@ type LaunchContainment interface {
 	ContainAndVerify(context.Context, launch.LaunchContext, model.GroupRef, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error)
 }
 
-func New(authority AdmissionAuthority, supervisor Supervisor, launchContainment LaunchContainment, results ResultPublisher, owner model.OwnerID) (*Coordinator, error) {
+func New(authority AdmissionAuthority, launchContainment LaunchContainment, results ResultPublisher, owner model.OwnerID) (*Coordinator, error) {
 	if authority == nil {
 		return nil, ErrAuthorityRequired
-	}
-	if supervisor == nil {
-		return nil, ErrSupervisorRequired
 	}
 	if launchContainment == nil {
 		return nil, ErrLaunchContainmentRequired
@@ -88,29 +64,10 @@ func New(authority AdmissionAuthority, supervisor Supervisor, launchContainment 
 	}
 	return &Coordinator{
 		authority:         authority,
-		supervisor:        supervisor,
 		launchContainment: launchContainment,
 		results:           results,
-		owner:             owner,
 		shutdownPoll:      10 * time.Millisecond,
 	}, nil
-}
-
-func (c *Coordinator) Submit(ctx context.Context, request AdmissionRequest) (AdmissionResult, error) {
-	if err := c.ready(); err != nil {
-		return AdmissionResult{}, err
-	}
-	accepted, err := c.authority.Accept(ctx, request)
-	if err != nil {
-		return AdmissionResult{}, err
-	}
-	if accepted.Record.Terminal != nil {
-		return accepted, nil
-	}
-	if err := c.authority.ClaimPending(ctx, accepted.Record.Attempt.Ref, c.owner); err != nil {
-		return accepted, c.failStop(ctx, fmt.Errorf("claim accepted attempt %s: %w", accepted.Record.JobID, err))
-	}
-	return accepted, nil
 }
 
 func (c *Coordinator) Snapshot(ctx context.Context, jobID model.JobID) (JobSnapshot, error) {
@@ -118,152 +75,6 @@ func (c *Coordinator) Snapshot(ctx context.Context, jobID model.JobID) (JobSnaps
 		return JobSnapshot{}, err
 	}
 	return c.authority.Snapshot(ctx, jobID)
-}
-
-func (c *Coordinator) PrepareSupervisor(ctx context.Context, jobID model.JobID, injector *FailureInjector) error {
-	if err := c.ready(); err != nil {
-		return err
-	}
-	snapshot, err := c.authority.Snapshot(ctx, jobID)
-	if err != nil {
-		return err
-	}
-	if snapshot.Record.Terminal != nil {
-		return nil
-	}
-	if launch, ok := snapshot.Record.Attempt.Launches.Get(model.LaunchOrdinalOne); ok && launch.Group != nil {
-		return nil
-	}
-	if err := inject(injector, FailSupervisorPrepareBefore); err != nil {
-		return err
-	}
-	prepared, err := c.supervisor.Prepare(ctx, LaunchPlan{
-		JobID:        snapshot.Record.JobID,
-		Ref:          snapshot.Record.Attempt.Ref,
-		Ordinal:      model.LaunchOrdinalOne,
-		RequestKey:   snapshot.Record.RequestKey,
-		TaskIdentity: snapshot.Record.TaskIdentity,
-		SessionID:    snapshot.Projection.SessionID,
-	})
-	if err != nil {
-		return err
-	}
-	if err := prepared.ValidateFor(snapshot.Record.Attempt.Ref); err != nil {
-		return c.failStop(ctx, err)
-	}
-	if err := inject(injector, FailSupervisorPrepareAfter); err != nil {
-		return c.failStop(ctx, err)
-	}
-	_, err = c.authority.BindGroup(ctx, jobID, snapshot.Record.Attempt.Ref, model.LaunchOrdinalOne, prepared.Group)
-	if err != nil {
-		return c.failStop(ctx, fmt.Errorf("bind prepared supervisor: %w", err))
-	}
-	return nil
-}
-
-func (c *Coordinator) GrantPermit(ctx context.Context, jobID model.JobID, launchOrdinal uint8, nonce model.PermitNonce, injector *FailureInjector) error {
-	if err := c.ready(); err != nil {
-		return err
-	}
-	ordinal, err := model.NewLaunchOrdinal(launchOrdinal)
-	if err != nil {
-		return err
-	}
-	if err := model.LaunchNonce(nonce).Validate(); err != nil {
-		return err
-	}
-	snapshot, err := c.authority.Snapshot(ctx, jobID)
-	if err != nil {
-		return err
-	}
-	if launch, ok := snapshot.Record.Attempt.Launches.Get(ordinal); !ok || launch.Group == nil {
-		prepared, err := c.supervisor.Prepare(ctx, LaunchPlan{
-			JobID:        snapshot.Record.JobID,
-			Ref:          snapshot.Record.Attempt.Ref,
-			Ordinal:      ordinal,
-			RequestKey:   snapshot.Record.RequestKey,
-			TaskIdentity: snapshot.Record.TaskIdentity,
-			SessionID:    snapshot.Projection.SessionID,
-		})
-		if err != nil {
-			return err
-		}
-		if err := prepared.ValidateFor(snapshot.Record.Attempt.Ref); err != nil {
-			return c.failStop(ctx, err)
-		}
-		applied, err := c.authority.BindGroup(ctx, jobID, snapshot.Record.Attempt.Ref, ordinal, prepared.Group)
-		if err != nil {
-			return err
-		}
-		snapshot.Record = applied.Record
-	}
-	if err := inject(injector, FailGrantBeforeCommit); err != nil {
-		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
-	}
-	applied, err := c.authority.CommitGrant(ctx, jobID, snapshot.Record.Attempt.Ref, ordinal, nonce)
-	if err != nil {
-		return err
-	}
-	launch, ok := applied.Record.Attempt.Launches.Get(ordinal)
-	if !ok || launch.Grant == nil {
-		return c.failStop(ctx, fmt.Errorf("authority did not return launch grant %s for %s", ordinal, jobID))
-	}
-	prepared, err := preparedFromRecord(applied.Record, ordinal)
-	if err != nil {
-		return c.failStop(ctx, err)
-	}
-	if err := inject(injector, FailGrantAfterCommit); err != nil {
-		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
-	}
-	if err := inject(injector, FailPermitSendBefore); err != nil {
-		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
-	}
-	if err := c.supervisor.SendPermit(ctx, prepared, *launch.Grant); err != nil {
-		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
-	}
-	if err := inject(injector, FailPermitSendAfter); err != nil {
-		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
-	}
-	return nil
-}
-
-func (c *Coordinator) Start(ctx context.Context, jobID model.JobID, injector *FailureInjector) error {
-	if err := c.ready(); err != nil {
-		return err
-	}
-	snapshot, err := c.authority.Snapshot(ctx, jobID)
-	if err != nil {
-		return err
-	}
-	grant, err := nextUnconsumedGrant(snapshot.Record)
-	if err != nil {
-		return err
-	}
-	prepared, err := preparedFromRecord(snapshot.Record, grant.Ordinal)
-	if err != nil {
-		return err
-	}
-	if err := inject(injector, FailLaunchForked); err != nil {
-		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
-	}
-	if err := inject(injector, FailLaunchExeced); err != nil {
-		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
-	}
-	observation, err := c.supervisor.ObserveLaunch(ctx, prepared, grant)
-	if err != nil {
-		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
-	}
-	if observation.Ordinal == 0 {
-		observation.Ordinal = grant.Ordinal
-	}
-	if err := observation.ValidateFor(grant); err != nil {
-		return c.failStop(ctx, err)
-	}
-	_, err = c.authority.RecordRelease(ctx, jobID, snapshot.Record.Attempt.Ref, observation.Ordinal, observation.Child, observation.Evidence)
-	if err != nil {
-		return c.recover(ctx, jobID, model.RecoveryPostGrantFailure, err, injector)
-	}
-	return nil
 }
 
 func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome model.Outcome, result []byte, injector *FailureInjector) error {
@@ -277,12 +88,7 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 	if err != nil {
 		return err
 	}
-	applied, err := c.authority.RecordOutcome(ctx, jobID, snapshot.Record.Attempt.Ref, outcome)
-	if err != nil {
-		return err
-	}
-	record := applied.Record
-	if err := c.certifyQuiescence(ctx, &record, injector); err != nil {
+	if _, err := c.authority.RecordOutcome(ctx, jobID, snapshot.Record.Attempt.Ref, outcome); err != nil {
 		return err
 	}
 	if completionOutcome(outcome) {
@@ -312,13 +118,6 @@ func (c *Coordinator) Cancel(ctx context.Context, jobID model.JobID, injector *F
 		return err
 	}
 	return c.recover(ctx, jobID, model.RecoveryCancelAfterGrant, nil, injector)
-}
-
-func (c *Coordinator) LiveSupervisorLoss(ctx context.Context, jobID model.JobID, injector *FailureInjector) error {
-	if err := c.ready(); err != nil {
-		return err
-	}
-	return c.recover(ctx, jobID, model.RecoveryLiveLoss, nil, injector)
 }
 
 func (c *Coordinator) Recover(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, injector *FailureInjector) error {
@@ -359,32 +158,6 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
-}
-
-func (c *Coordinator) certifyQuiescence(ctx context.Context, record *model.SafetyRecord, injector *FailureInjector) error {
-	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
-		launch, ok := record.Attempt.Launches.Get(ordinal)
-		if !ok || launch.Released == nil || launch.Quiescence != nil {
-			continue
-		}
-		prepared, err := preparedFromRecord(*record, ordinal)
-		if err != nil {
-			return err
-		}
-		verified, err := c.supervisor.VerifyQuiescence(ctx, prepared, *launch.Released)
-		if err != nil {
-			return err
-		}
-		if err := inject(injector, FailLaunchQuiescent); err != nil {
-			return err
-		}
-		applied, err := c.authority.RecordQuiescence(ctx, record.JobID, ordinal, verified)
-		if err != nil {
-			return err
-		}
-		*record = applied.Record
-	}
-	return nil
 }
 
 func (c *Coordinator) publishResult(ctx context.Context, jobID model.JobID, payload []byte, injector *FailureInjector) error {
@@ -469,14 +242,14 @@ func (c *Coordinator) contain(ctx context.Context, record model.SafetyRecord, in
 		if !ok || launch.Quiescence != nil {
 			continue
 		}
-		prepared, err := preparedFromRecord(record, ordinal)
+		group, err := groupFromRecord(record, ordinal)
 		if err != nil {
 			return err
 		}
 		if err := inject(injector, FailContainSignal); err != nil {
 			return err
 		}
-		verified, err := c.launchContainment.ContainAndVerify(ctx, launchContext(record, ordinal), prepared.Group, custodian.QuiescenceCauseContain)
+		verified, err := c.launchContainment.ContainAndVerify(ctx, launchContext(record, ordinal), group, custodian.QuiescenceCauseContain)
 		if err != nil {
 			return err
 		}
@@ -498,14 +271,14 @@ func (c *Coordinator) retire(ctx context.Context, record model.SafetyRecord, inj
 		if !ok || launch.Quiescence != nil {
 			continue
 		}
-		prepared, err := preparedFromRecord(record, ordinal)
+		group, err := groupFromRecord(record, ordinal)
 		if err != nil {
 			return err
 		}
 		if err := inject(injector, FailRetireClose); err != nil {
 			return err
 		}
-		verified, err := c.launchContainment.ContainAndVerify(ctx, launchContext(record, ordinal), prepared.Group, custodian.QuiescenceCauseRecovery)
+		verified, err := c.launchContainment.ContainAndVerify(ctx, launchContext(record, ordinal), group, custodian.QuiescenceCauseRecovery)
 		if err != nil {
 			return err
 		}
@@ -535,16 +308,22 @@ func (c *Coordinator) failStop(ctx context.Context, err error) error {
 	return err
 }
 
-func preparedFromRecord(record model.SafetyRecord, ordinal model.LaunchOrdinal) (PreparedSupervisor, error) {
+func groupFromRecord(record model.SafetyRecord, ordinal model.LaunchOrdinal) (model.GroupRef, error) {
 	launch, ok := record.Attempt.Launches.Get(ordinal)
 	if !ok || launch.Group == nil {
-		return PreparedSupervisor{}, fmt.Errorf("group reference is not bound for %s ordinal %s", record.JobID, ordinal)
+		return model.GroupRef{}, fmt.Errorf("group reference is not bound for %s ordinal %s", record.JobID, ordinal)
 	}
-	prepared := PreparedSupervisor{Ref: record.Attempt.Ref, Ordinal: ordinal, Group: *launch.Group}
-	if err := prepared.ValidateFor(record.Attempt.Ref); err != nil {
-		return PreparedSupervisor{}, err
+	group := *launch.Group
+	if err := group.Validate(); err != nil {
+		return model.GroupRef{}, fmt.Errorf("group reference is invalid for %s ordinal %s: %w", record.JobID, ordinal, err)
 	}
-	return prepared, nil
+	if !group.Launch.Attempt.Equal(record.Attempt.Ref) {
+		return model.GroupRef{}, fmt.Errorf("group reference attempt mismatch for %s ordinal %s", record.JobID, ordinal)
+	}
+	if group.Launch.Ordinal != ordinal {
+		return model.GroupRef{}, fmt.Errorf("group reference ordinal mismatch for %s ordinal %s", record.JobID, ordinal)
+	}
+	return group, nil
 }
 
 func launchContext(record model.SafetyRecord, ordinal model.LaunchOrdinal) launch.LaunchContext {
@@ -553,19 +332,6 @@ func launchContext(record model.SafetyRecord, ordinal model.LaunchOrdinal) launc
 		Attempt: record.Attempt.Ref,
 		Ordinal: ordinal,
 	}
-}
-
-func nextUnconsumedGrant(record model.SafetyRecord) (model.LaunchGrant, error) {
-	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
-		launch, ok := record.Attempt.Launches.Get(ordinal)
-		if !ok || launch.Grant == nil {
-			continue
-		}
-		if launch.Released == nil {
-			return *launch.Grant, nil
-		}
-	}
-	return model.LaunchGrant{}, fmt.Errorf("no unconsumed launch grant for %s", record.JobID)
 }
 
 func terminalOutcome(outcome model.Outcome) bool {

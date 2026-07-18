@@ -5,51 +5,31 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/charlesnpx/agentbus/engine"
-	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
+	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 )
 
-func TestServedAdmissionSupervisorUsesUnavailableCustodian(t *testing.T) {
+func TestServedAdmissionRuntimeUsesUnavailableCustodian(t *testing.T) {
 	ctx := context.Background()
-	supervisor := newServedAdmissionSupervisor(nil)
-	support := supervisor.runtime.Support()
+	runtime := newServedAdmissionRuntime(nil)
+	support := runtime.runtime.Support()
 	if support.ParkedExec || support.VerifiedContainment || !errors.Is(support.Reason, custodian.ErrSupervisorUnavailable) {
 		t.Fatalf("runtime support = %#v, want parked_exec:false verified_containment:false supervisor_unavailable", support)
 	}
-	if err := supervisor.verifiedContainmentSupported(ctx); !errors.Is(err, custodian.ErrSupervisorUnavailable) {
+	if err := runtime.verifiedContainmentSupported(ctx); !errors.Is(err, custodian.ErrSupervisorUnavailable) {
 		t.Fatalf("verifiedContainmentSupported error = %v, want supervisor_unavailable", err)
 	}
 	jobID := model.JobID("job-served-unavailable")
 	ref := model.AttemptRef{JobID: jobID, AttemptID: "attempt-served-unavailable", Epoch: 1}
-	plan := coordinator.LaunchPlan{JobID: jobID, Ref: ref, Ordinal: model.LaunchOrdinalOne}
-	grant := model.LaunchGrant{Attempt: ref, Ordinal: model.LaunchOrdinalOne, Nonce: "nonce-served-unavailable", GrantedBy: model.BootRef{BootID: "boot-served-unavailable", OwnerID: "owner-served-unavailable"}}
-	prepared := coordinator.PreparedSupervisor{Ref: ref, Ordinal: model.LaunchOrdinalOne}
-	released := model.LaunchReleaseFact{Attempt: ref, Ordinal: model.LaunchOrdinalOne}
-
-	if err := supervisor.Register(jobID, newFakeBackend("fake"), engine.SessionOpts{CWD: t.TempDir()}); !errors.Is(err, custodian.ErrSupervisorUnavailable) {
-		t.Fatalf("Register error = %v, want supervisor_unavailable", err)
+	launchPort := runtime.launchPort()
+	if _, err := launchPort.Prepare(ctx, command.ExecSpec{Argv: []string{"/bin/fake-agent"}}, model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne}); !errors.Is(err, custodian.ErrSupervisorUnavailable) {
+		t.Fatalf("launchPort Prepare error = %v, want supervisor_unavailable", err)
 	}
-	if _, err := supervisor.Prepare(ctx, plan); !errors.Is(err, custodian.ErrSupervisorUnavailable) {
-		t.Fatalf("Prepare error = %v, want supervisor_unavailable", err)
+	if verified, err := launchPort.ContainAndVerify(ctx, model.GroupRef{}, custodian.QuiescenceCauseContain); !errors.Is(err, custodian.ErrSupervisorUnavailable) || verified != (custodian.VerifiedQuiescence{}) {
+		t.Fatalf("launchPort ContainAndVerify = verified:%#v err:%v, want unavailable zero attestation", verified, err)
 	}
-	if err := supervisor.SendPermit(ctx, prepared, grant); !errors.Is(err, custodian.ErrSupervisorUnavailable) {
-		t.Fatalf("SendPermit error = %v, want supervisor_unavailable", err)
-	}
-	if _, err := supervisor.ObserveLaunch(ctx, prepared, grant); !errors.Is(err, custodian.ErrSupervisorUnavailable) {
-		t.Fatalf("ObserveLaunch error = %v, want supervisor_unavailable", err)
-	}
-	if session, id, err := supervisor.Started(jobID, model.LaunchOrdinalOne); !errors.Is(err, custodian.ErrSupervisorUnavailable) || session != nil || id != "" {
-		t.Fatalf("Started = session:%v id:%q err:%v, want unavailable zero values", session, id, err)
-	}
-	if verified, err := supervisor.VerifyQuiescence(ctx, prepared, released); !errors.Is(err, custodian.ErrSupervisorUnavailable) || verified != (custodian.VerifiedQuiescence{}) {
-		t.Fatalf("VerifyQuiescence = verified:%#v err:%v, want unavailable zero attestation", verified, err)
-	}
-	if verified, err := supervisor.Contain(ctx, prepared); !errors.Is(err, custodian.ErrSupervisorUnavailable) || verified != (custodian.VerifiedQuiescence{}) {
-		t.Fatalf("Contain = verified:%#v err:%v, want unavailable zero attestation", verified, err)
-	}
-	if verified, err := supervisor.Retire(ctx, prepared); !errors.Is(err, custodian.ErrSupervisorUnavailable) || verified != (custodian.VerifiedQuiescence{}) {
-		t.Fatalf("Retire = verified:%#v err:%v, want unavailable zero attestation", verified, err)
+	if runtime.hasActiveCustodies() {
+		t.Fatal("hasActiveCustodies = true for unavailable runtime")
 	}
 }

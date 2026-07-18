@@ -134,7 +134,7 @@ type Server struct {
 	admissionCoordinator         *admissionCoordinator
 	admissionOwnedWorkChecker    admissionOwnedWorkChecker
 	admissionSubmission          *servedSubmissionCoordinator
-	admissionSupervisor          *servedAdmissionSupervisor
+	admissionRuntime             *servedAdmissionRuntime
 	admissionRepository          repository.Repository
 	admissionClose               io.Closer
 	admissionBootstrapperFactory admissionBootstrapperFactory
@@ -803,7 +803,7 @@ func (s *Server) activeWorkWithContext(ctx context.Context) bool {
 			return true
 		}
 	}
-	if s.admissionSupervisor != nil && s.admissionSupervisor.hasActiveCustodies() {
+	if s.admissionRuntime != nil && s.admissionRuntime.hasActiveCustodies() {
 		return true
 	}
 	// TODO(S4E-b): include pending recovery executor work once recovery execution lands.
