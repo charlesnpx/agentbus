@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -197,6 +198,76 @@ func TestSessionTurnInheritedStderrDoesNotHang(t *testing.T) {
 		}
 	}
 	t.Fatalf("events = %#v, want parsed event before inherited stderr closes", got)
+}
+
+func TestSessionTurnTimeoutKillsDescendantHoldingStdout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process group signal assertions are unix-only")
+	}
+	const script = `sleep 30 & printf '%s\n' '{"event":"ready","text":"READY"}'; exit 0`
+	backend := &Backend{
+		NameValue: "sh",
+		Binary:    "/bin/sh",
+		CachePath: filepath.Join(t.TempDir(), "missing-cache.json"),
+		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
+			return []string{"-c", script}, nil
+		},
+		Parse: func(obj map[string]any) ([]engine.Event, string, error) {
+			if obj["event"] != "ready" {
+				return nil, "", nil
+			}
+			text, _ := obj["text"].(string)
+			return []engine.Event{{Type: engine.EventAgentText, Text: text}}, "", nil
+		},
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	var processGroup int
+	started := time.Now()
+	events, err := session.Turn(ctx, engine.TurnInput{
+		Prompt: "go",
+		OnProcessStart: func(ref engine.ProcessRef, _ int) {
+			processGroup = ref.PGID
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if processGroup == 0 {
+			return
+		}
+		if ownGroup, err := syscall.Getpgid(os.Getpid()); err == nil && processGroup == ownGroup {
+			return
+		}
+		_ = syscall.Kill(-processGroup, syscall.SIGKILL)
+	})
+	got := collectEventsWithTimeout(t, events, 5*time.Second)
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("turn completed in %s, want under 5s", elapsed)
+	}
+	if ctx.Err() != context.DeadlineExceeded {
+		t.Fatalf("turn context error = %v, want %v", ctx.Err(), context.DeadlineExceeded)
+	}
+	var sawReady, sawTimeout bool
+	for _, ev := range got {
+		if ev.Type == engine.EventAgentText && ev.Text == "READY" {
+			sawReady = true
+		}
+		if ev.Type == engine.EventWarning && strings.Contains(ev.Text, "backend turn timed out") {
+			sawTimeout = true
+		}
+	}
+	if !sawReady {
+		t.Fatalf("events = %#v, want READY event before timeout completion", got)
+	}
+	if !sawTimeout {
+		t.Fatalf("events = %#v, want backend timeout warning", got)
+	}
 }
 
 func TestCopyAndCloseClosesSourceOnWriterFailure(t *testing.T) {
