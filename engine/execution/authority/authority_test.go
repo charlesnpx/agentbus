@@ -306,6 +306,52 @@ func TestFailStopRejectsLaterAuthorityOperations(t *testing.T) {
 	}
 }
 
+func TestReadyFailStopWithDeadCallerContextRecordsDurably(t *testing.T) {
+	tests := []struct {
+		name string
+		ctx  func() (context.Context, context.CancelFunc)
+	}{
+		{
+			name: "canceled",
+			ctx: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, cancel
+			},
+		},
+		{
+			name: "expired",
+			ctx: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithTimeout(context.Background(), 0)
+				<-ctx.Done()
+				return ctx, cancel
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := memory.NewRepository()
+			anchorStore := NewAnchorStore()
+			ready := newReadyWithAnchorStore(t, repo, anchorStore, "fail-stop-dead-"+tt.name)
+			ctx, cancel := tt.ctx()
+			defer cancel()
+			reason := "dead caller " + tt.name
+
+			if err := ready.FailStop(ctx, reason); err != nil {
+				t.Fatalf("Ready.FailStop with %s context error = %v", tt.name, err)
+			}
+			snapshot := anchorSnapshot(t, anchorStore)
+			if snapshot.Phase != "fail_stopped" || snapshot.Reason != reason {
+				t.Fatalf("anchor snapshot = %+v, want durable fail-stop reason %q", snapshot, reason)
+			}
+			if _, err := ready.Accept(context.Background(), acceptRequest(t, "fail-stop-after-"+tt.name)); !errors.Is(err, ErrFailStopped) {
+				t.Fatalf("Accept after %s fail-stop error = %v, want ErrFailStopped", tt.name, err)
+			}
+		})
+	}
+}
+
 func newReady(t *testing.T, repo repository.Repository, name string) *Ready {
 	t.Helper()
 	session := newRecoverySession(t, repo, name)

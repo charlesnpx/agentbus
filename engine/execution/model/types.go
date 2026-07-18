@@ -305,11 +305,12 @@ const (
 	ProofNeverPermittedAndRetired TerminalProof = iota + 1
 	ProofCleanQuiescentOutcomeAndRetired
 	ProofContained
+	ProofLegacyUnfencedOutcome
 )
 
 func (proof TerminalProof) Valid() bool {
 	switch proof {
-	case ProofNeverPermittedAndRetired, ProofCleanQuiescentOutcomeAndRetired, ProofContained:
+	case ProofNeverPermittedAndRetired, ProofCleanQuiescentOutcomeAndRetired, ProofContained, ProofLegacyUnfencedOutcome:
 		return true
 	default:
 		return false
@@ -331,6 +332,8 @@ func (proof TerminalProof) String() string {
 		return "CleanQuiescentOutcomeAndRetired"
 	case ProofContained:
 		return "Contained"
+	case ProofLegacyUnfencedOutcome:
+		return "LegacyUnfencedOutcome"
 	default:
 		return ""
 	}

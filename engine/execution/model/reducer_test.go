@@ -401,6 +401,12 @@ func TestDeriveTerminalCertificateSelectsProofs(t *testing.T) {
 			intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally},
 			want:   ProofCleanQuiescentOutcomeAndRetired,
 		},
+		{
+			name:   "legacy unfenced",
+			record: reducerLegacyUnfencedCompletedRecord(t),
+			intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally},
+			want:   ProofLegacyUnfencedOutcome,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -462,7 +468,7 @@ func TestOnlyTerminalGoSelectsProofKind(t *testing.T) {
 			t.Fatalf("read %s: %v", name, err)
 		}
 		text := string(data)
-		for _, proof := range []string{"ProofNeverPermittedAndRetired", "ProofCleanQuiescentOutcomeAndRetired", "ProofContained"} {
+		for _, proof := range []string{"ProofNeverPermittedAndRetired", "ProofCleanQuiescentOutcomeAndRetired", "ProofContained", "ProofLegacyUnfencedOutcome"} {
 			if strings.Contains(text, proof) {
 				t.Fatalf("%s contains terminal proof selection %s", name, proof)
 			}
@@ -603,6 +609,14 @@ func reducerCleanCompletedRecord(t *testing.T) SafetyRecord {
 	t.Helper()
 	record := reducerCompletedOutcomeRecord(t)
 	record = reducerMustApply(t, record, reducerQuiescenceCommand(t, record, LaunchOrdinalOne))
+	return reducerMustApply(t, record, reducerResultCommand(t, record))
+}
+
+func reducerLegacyUnfencedCompletedRecord(t *testing.T) SafetyRecord {
+	t.Helper()
+	record := reducerBaseRecord()
+	record.Mode = ModeLegacyUnfenced
+	record = reducerMustApply(t, record, ObserveOutcome{Ref: record.Attempt.Ref, Outcome: OutcomeCompleted})
 	return reducerMustApply(t, record, reducerResultCommand(t, record))
 }
 

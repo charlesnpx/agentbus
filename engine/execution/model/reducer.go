@@ -77,8 +77,8 @@ func apply(current SafetyRecord, command Command) (ApplyResult, error) {
 	if current.Terminal != nil {
 		return applyTerminalAbsorbing(current, normalized)
 	}
-	if current.Mode == ModeLegacyUnfenced {
-		return ApplyResult{}, precondition("legacy unfenced submissions are outside admission authority")
+	if current.Mode == ModeLegacyUnfenced && !legacyUnfencedCommand(normalized) {
+		return ApplyResult{}, precondition("legacy unfenced submissions cannot record fenced launch evidence")
 	}
 
 	next := cloneSafetyRecord(current)
@@ -141,8 +141,8 @@ func applyAcknowledge(next *SafetyRecord, current SafetyRecord, command Acknowle
 	if current.Mode != ModeLegacyFenced {
 		return false, precondition("acknowledgement is only required for legacy fenced records")
 	}
-	if current.Cancel != nil || current.Outcome != nil || hasAnyLaunchEvidence(current.Attempt) {
-		return false, precondition("acknowledgement requires an unmodified awaiting record")
+	if current.Cancel != nil || current.Outcome != nil || hasAnyPostAckLaunchEvidence(current.Attempt) {
+		return false, precondition("acknowledgement requires no cancellation, outcome, grant, release, or quiescence evidence")
 	}
 	return mergeFact(&next.Acknowledgement, fact, "acknowledgement")
 }
@@ -162,8 +162,8 @@ func applyBeginReject(next *SafetyRecord, current SafetyRecord, command BeginRej
 	if current.Mode != ModeLegacyFenced || current.Acknowledgement != nil {
 		return false, precondition("reject can only begin for an unacknowledged legacy fenced record")
 	}
-	if current.Outcome != nil || hasAnyLaunchEvidence(current.Attempt) {
-		return false, precondition("reject requires no launch, outcome, or terminal evidence")
+	if current.Outcome != nil || hasAnyPostAckLaunchEvidence(current.Attempt) {
+		return false, precondition("reject requires no grant, release, quiescence, outcome, or terminal evidence")
 	}
 	return mergeFact(&next.Cancel, fact, "cancel")
 }
@@ -192,8 +192,8 @@ func applyBindGroup(next *SafetyRecord, current SafetyRecord, command BindGroup)
 	} else if existing != nil {
 		return false, conflict("launch slot is inconsistent")
 	}
-	if !acceptedOrAcknowledged(current) {
-		return false, precondition("group binding requires accepted or acknowledged state")
+	if !groupBindingAllowed(current) {
+		return false, precondition("group binding requires accepted, acknowledged, or unacknowledged legacy fenced state")
 	}
 	if current.Cancel != nil || current.Outcome != nil {
 		return false, precondition("group binding must precede cancellation and outcome evidence")
@@ -365,7 +365,7 @@ func applyObserveOutcome(next *SafetyRecord, current SafetyRecord, command Obser
 	if current.Outcome != nil {
 		return mergeFact(&next.Outcome, fact, "outcome")
 	}
-	if completionOutcome(command.Outcome) && !hasAnyRelease(current.Attempt) {
+	if completionOutcome(command.Outcome) && current.Mode != ModeLegacyUnfenced && !hasAnyRelease(current.Attempt) {
 		return false, precondition("completed outcome requires release evidence")
 	}
 	if current.Cancel != nil && !hasAnyLaunchEvidence(current.Attempt) && command.Outcome != OutcomeCanceled {
@@ -509,6 +509,19 @@ func acceptedOrAcknowledged(record SafetyRecord) bool {
 	return record.Mode == ModeIdentifiedFenced || (record.Mode == ModeLegacyFenced && record.Acknowledgement != nil)
 }
 
+func groupBindingAllowed(record SafetyRecord) bool {
+	return acceptedOrAcknowledged(record) || record.Mode == ModeLegacyFenced
+}
+
+func legacyUnfencedCommand(command any) bool {
+	switch command.(type) {
+	case RequestCancel, ObserveOutcome, CertifyResult, Finalize:
+		return true
+	default:
+		return false
+	}
+}
+
 func ensureAttempt(record SafetyRecord, ref AttemptRef) error {
 	if err := ref.Validate(); err != nil {
 		return invalidCommand("attempt ref: %v", err)
@@ -575,6 +588,20 @@ func hasAnyRelease(proof AttemptProof) bool {
 		}
 	}
 	return false
+}
+
+func hasAnyQuiescence(proof AttemptProof) bool {
+	for _, ordinal := range proof.Launches.FilledOrdinals() {
+		launch, ok := proof.Launches.Get(ordinal)
+		if ok && launch.Quiescence != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyPostAckLaunchEvidence(proof AttemptProof) bool {
+	return hasAnyGrant(proof) || hasAnyRelease(proof) || hasAnyQuiescence(proof)
 }
 
 func allLaunchGroupsQuiescent(proof AttemptProof) bool {

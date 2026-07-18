@@ -42,6 +42,7 @@ type fakeBackend struct {
 	processRef      engine.ProcessRef
 	backendChildPID int
 	resumes         chan resumedSession
+	parkable        bool
 }
 
 type fakeTurn struct {
@@ -56,8 +57,9 @@ type resumedSession struct {
 
 func newFakeBackend(name string) *fakeBackend {
 	return &fakeBackend{
-		name:  name,
-		turns: make(chan fakeTurn, 32),
+		name:     name,
+		turns:    make(chan fakeTurn, 32),
+		parkable: true,
 		events: func(prompt string, write bool) []engine.Event {
 			return []engine.Event{{Type: engine.EventAgentText, Text: "PASS\n\n## Findings\nNone.\n"}}
 		},
@@ -65,6 +67,8 @@ func newFakeBackend(name string) *fakeBackend {
 }
 
 func (b *fakeBackend) Name() string { return b.name }
+
+func (b *fakeBackend) AdmissionParkable() bool { return b.parkable }
 
 func (b *fakeBackend) Preflight(context.Context) (engine.Health, error) {
 	return engine.Health{Backend: b.name}, nil
@@ -487,9 +491,270 @@ func TestIdentifiedFencedSubmitUsesLaunchControllerAndCompletes(t *testing.T) {
 		t.Fatalf("prepared ordinals = %v, want [1]", got)
 	}
 	record := loadAdmissionSafetyRecord(t, server, submitted.JobID)
+	if record.Mode != model.ModeIdentifiedFenced {
+		t.Fatalf("admission mode = %s, want IdentifiedFenced", record.Mode)
+	}
 	first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
 	if !ok || first.Group == nil || first.Grant == nil || first.Released == nil || first.Quiescence == nil {
 		t.Fatalf("ordinal 1 launch proof incomplete: %+v", first)
+	}
+}
+
+func TestIdentifiedSubmitRejectsBuiltInWhenFencedRuntimeUnavailableBeforeBackendStart(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmissionWithParkedExec(t, server, launcher, false)
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-built-in-unfenced",
+		RequestID:    "request-built-in-unfenced",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0 before incompatible pre-accept reject", got)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+}
+
+func TestLegacyFencedDeliveredAcknowledgesGrantsAndRunsOnce(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.parkable = false
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-legacy-fenced",
+		RequestID:    "request-legacy-fenced",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	waitBackendStarted(t, backend)
+	waitKnownRecordState(t, server, engine.StateCompleted)
+
+	if got := launcher.releaseCount(); got != 1 {
+		t.Fatalf("legacy fenced releases = %d, want exactly one", got)
+	}
+	if got := launcher.abortCount(); got != 0 {
+		t.Fatalf("legacy fenced aborts = %d, want 0 after delivered response", got)
+	}
+	record := loadAdmissionSafetyRecord(t, server, submitted.JobID)
+	if record.Mode != model.ModeLegacyFenced || record.Acknowledgement == nil {
+		t.Fatalf("legacy fenced record missing mode/ack: %+v", record)
+	}
+	first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || first.Group == nil || first.Grant == nil || first.Released == nil || first.Quiescence == nil {
+		t.Fatalf("legacy fenced launch proof incomplete: %+v", first)
+	}
+}
+
+func TestLegacyFencedDeliveryFailureRetiresWithoutGrantOrRun(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.parkable = false
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-legacy-fenced-loss",
+		RequestID:    "request-legacy-fenced-loss",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, errors.New("ack write failed"))
+
+	if got := launcher.releaseCount(); got != 0 {
+		t.Fatalf("legacy fenced releases = %d, want 0 after failed response", got)
+	}
+	if got := launcher.abortCount(); got != 1 {
+		t.Fatalf("legacy fenced aborts = %d, want one retired parked worker", got)
+	}
+	record := singleKnownRecord(t, server)
+	if record.State != engine.StateCanceled {
+		t.Fatalf("engine record state = %s, want canceled", record.State)
+	}
+	safety := loadAdmissionSafetyRecord(t, server, record.JobID)
+	if safety.Terminal == nil || safety.Terminal.Outcome != model.OutcomeCanceled || safety.Terminal.Cause != model.CauseResponseUndeliverable {
+		t.Fatalf("legacy fenced terminal = %+v, want response-undeliverable cancel", safety.Terminal)
+	}
+	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || first.Group == nil || first.Quiescence == nil || first.Grant != nil || first.Released != nil {
+		t.Fatalf("legacy fenced failed-response launch proof = %+v, want retired without grant/release", first)
+	}
+}
+
+func TestLegacyFencedDeliveryFailureRetiresWithDetachedContextWhenCanceled(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	cmd := prepareLegacyFencedCommandForTest(t, server, "request-legacy-fenced-canceled-context")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := server.admissionSubmission.rejectAndRetireLegacyFenced(ctx, cmd); err != nil {
+		t.Fatalf("rejectAndRetireLegacyFenced with canceled context error = %v", err)
+	}
+	assertLegacyFencedAbortUsedDetachedContext(t, launcher)
+	if got := launcher.releaseCount(); got != 0 {
+		t.Fatalf("legacy fenced releases = %d, want 0 after failed response", got)
+	}
+	safety := loadAdmissionSafetyRecord(t, server, string(cmd.launchContext.JobID))
+	assertLegacyFencedRejectedWithoutGrant(t, safety)
+}
+
+func TestLegacyFencedDeliveryFailureFailStopsWhenAbortCleanupDeadlineExpires(t *testing.T) {
+	oldTimeout := admissionDetachedCleanupTimeout
+	admissionDetachedCleanupTimeout = 5 * time.Millisecond
+	t.Cleanup(func() {
+		admissionDetachedCleanupTimeout = oldTimeout
+	})
+
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.abortWaitForContextDone = true
+	launcher.abortRespectContext = true
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+	cmd := prepareLegacyFencedCommandForTest(t, server, "request-legacy-fenced-abort-deadline")
+
+	err := server.admissionSubmission.rejectAndRetireLegacyFenced(context.Background(), cmd)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("rejectAndRetireLegacyFenced error = %v, want abort deadline exceeded", err)
+	}
+	if !errors.Is(err, launch.ErrFailClosed) {
+		t.Fatalf("rejectAndRetireLegacyFenced error = %v, want fail-closed", err)
+	}
+	if got := launcher.abortCount(); got != 1 {
+		t.Fatalf("legacy fenced aborts = %d, want one failed abort", got)
+	}
+	errs, deadlines := launcher.abortContextObservations()
+	if len(errs) != 1 || !errors.Is(errs[0], context.DeadlineExceeded) {
+		t.Fatalf("abort context errors = %+v, want deadline exceeded", errs)
+	}
+	if len(deadlines) != 1 || !deadlines[0] {
+		t.Fatalf("abort context deadlines = %+v, want bounded cleanup context", deadlines)
+	}
+	if got := launcher.releaseCount(); got != 0 {
+		t.Fatalf("legacy fenced releases = %d, want 0 after failed response", got)
+	}
+
+	snapshot := admissionAnchorSnapshot(t, anchorStore)
+	if snapshot.Phase != "fail_stopped" || !strings.Contains(snapshot.Reason, "retire legacy fenced prepared process") || !strings.Contains(snapshot.Reason, context.DeadlineExceeded.Error()) {
+		t.Fatalf("anchor snapshot = %+v, want durable fail-stop with abort deadline error", snapshot)
+	}
+	safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
+	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || first.Group == nil || first.Quiescence != nil || first.Grant != nil || first.Released != nil {
+		t.Fatalf("legacy fenced failed abort launch proof = %+v, want bound but unretired launch under fail-stop", first)
+	}
+}
+
+func TestLegacyFencedDeliveryFailureRetiresWhenBeginRejectFails(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+	cmd := prepareLegacyFencedCommandForTest(t, server, "request-legacy-fenced-begin-reject-fails")
+
+	beginRejectErr := errors.New("begin reject advance failed")
+	anchorStore.FailNextForTest(authority.AnchorAdvance, beginRejectErr)
+	err := server.admissionSubmission.rejectAndRetireLegacyFenced(context.Background(), cmd)
+	if !errors.Is(err, beginRejectErr) {
+		t.Fatalf("rejectAndRetireLegacyFenced error = %v, want begin reject failure", err)
+	}
+	if !errors.Is(err, launch.ErrFailClosed) {
+		t.Fatalf("rejectAndRetireLegacyFenced error = %v, want fail-closed", err)
+	}
+	assertLegacyFencedAbortUsedDetachedContext(t, launcher)
+	if got := launcher.releaseCount(); got != 0 {
+		t.Fatalf("legacy fenced releases = %d, want 0 after failed response", got)
+	}
+	snapshot := admissionAnchorSnapshot(t, anchorStore)
+	if snapshot.Phase != "fail_stopped" || !strings.Contains(snapshot.Reason, beginRejectErr.Error()) {
+		t.Fatalf("anchor snapshot = %+v, want durable fail-stop with injected error", snapshot)
+	}
+	safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
+	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || first.Group == nil || first.Grant != nil || first.Released != nil {
+		t.Fatalf("legacy fenced failed BeginReject launch proof = %+v, want no grant/release", first)
+	}
+}
+
+func TestLegacyUnfencedDeliveredRunsWithoutCustody(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.parkable = false
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmissionWithParkedExec(t, server, launcher, false)
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-legacy-unfenced",
+		RequestID:    "request-legacy-unfenced",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	waitBackendStarted(t, backend)
+	waitKnownRecordState(t, server, engine.StateCompleted)
+
+	if got := len(launcher.preparedOrdinals()); got != 0 {
+		t.Fatalf("legacy unfenced prepared launches = %d, want 0", got)
+	}
+	safety := loadAdmissionSafetyRecord(t, server, submitted.JobID)
+	if safety.Mode != model.ModeLegacyUnfenced {
+		t.Fatalf("admission mode = %s, want LegacyUnfenced", safety.Mode)
+	}
+	if safety.Attempt.Launches.Count() != 0 {
+		t.Fatalf("legacy unfenced launch proofs = %+v, want none", safety.Attempt.Launches)
+	}
+	if safety.Terminal == nil || safety.Terminal.Proof != model.ProofLegacyUnfencedOutcome {
+		t.Fatalf("legacy unfenced terminal = %+v, want legacy-unfenced proof", safety.Terminal)
+	}
+}
+
+func TestLegacyUnfencedDeliveryFailureRejectsBeforeBackendStart(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.parkable = false
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmissionWithParkedExec(t, server, launcher, false)
+
+	serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-legacy-unfenced-loss",
+		RequestID:    "request-legacy-unfenced-loss",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, errors.New("ack write failed"))
+
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0 after failed response", got)
+	}
+	if got := len(launcher.preparedOrdinals()); got != 0 {
+		t.Fatalf("legacy unfenced prepared launches = %d, want 0", got)
+	}
+	record := singleKnownRecord(t, server)
+	if record.State != engine.StateCanceled {
+		t.Fatalf("engine record state = %s, want canceled", record.State)
+	}
+	safety := loadAdmissionSafetyRecord(t, server, record.JobID)
+	if safety.Terminal == nil || safety.Terminal.Outcome != model.OutcomeCanceled || safety.Terminal.Proof != model.ProofLegacyUnfencedOutcome {
+		t.Fatalf("legacy unfenced terminal = %+v, want canceled legacy-unfenced proof", safety.Terminal)
 	}
 }
 
@@ -2203,13 +2468,18 @@ func newUnstartedTestServer(t *testing.T, backend engine.Backend) (*Server, stri
 
 func enableTestAdmission(t *testing.T, server *Server, launcher *admissionFakeLaunchCustodian) {
 	t.Helper()
+	enableTestAdmissionWithParkedExec(t, server, launcher, true)
+}
+
+func enableTestAdmissionWithParkedExec(t *testing.T, server *Server, launcher *admissionFakeLaunchCustodian, parkedExec bool) {
+	t.Helper()
 	support, err := custodian.NewSupport(custodian.Support{
-		ParkedExec:             true,
+		ParkedExec:             parkedExec,
 		VerifiedContainment:    true,
 		ImplementationCompiled: true,
 		RuntimeProbePassed:     true,
-		FeatureConfigured:      true,
-		FeatureAdvertised:      true,
+		FeatureConfigured:      parkedExec,
+		FeatureAdvertised:      parkedExec,
 		Platform:               "test",
 	})
 	if err != nil {
@@ -2239,6 +2509,51 @@ func enableTestAdmissionWithAuthorityStore(t *testing.T, server *Server, launche
 	enableTestAdmission(t, server, launcher)
 }
 
+func prepareLegacyFencedCommandForTest(t *testing.T, server *Server, requestID string) *legacyFencedCommand {
+	t.Helper()
+	preparation, err := server.admissionSubmission.PrepareLegacyFenced(context.Background(), authority.AcceptRequest{
+		RequestKey:   model.RequestKey{WorkspaceKey: model.WorkspaceKey("workspace/" + requestID), RequestID: model.RequestID(requestID)},
+		TaskIdentity: model.NewSHA256TaskIdentity([]byte(requestID)),
+		Mode:         model.ModeLegacyFenced,
+		SessionID:    "session-" + requestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, _, err := server.admissionSubmission.prepareLegacyFencedCommand(context.Background(), preparation.Admission, command.ExecSpec{
+		Argv: []string{"fake-parked"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cmd
+}
+
+func assertLegacyFencedAbortUsedDetachedContext(t *testing.T, launcher *admissionFakeLaunchCustodian) {
+	t.Helper()
+	if got := launcher.abortCount(); got != 1 {
+		t.Fatalf("legacy fenced aborts = %d, want one retired parked worker", got)
+	}
+	errs, deadlines := launcher.abortContextObservations()
+	if len(errs) != 1 || errs[0] != nil {
+		t.Fatalf("abort context errors = %+v, want one live context", errs)
+	}
+	if len(deadlines) != 1 || !deadlines[0] {
+		t.Fatalf("abort context deadlines = %+v, want bounded cleanup context", deadlines)
+	}
+}
+
+func assertLegacyFencedRejectedWithoutGrant(t *testing.T, safety model.SafetyRecord) {
+	t.Helper()
+	if safety.Terminal == nil || safety.Terminal.Outcome != model.OutcomeCanceled || safety.Terminal.Cause != model.CauseResponseUndeliverable {
+		t.Fatalf("legacy fenced terminal = %+v, want response-undeliverable cancel", safety.Terminal)
+	}
+	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || first.Group == nil || first.Quiescence == nil || first.Grant != nil || first.Released != nil {
+		t.Fatalf("legacy fenced failed-response launch proof = %+v, want retired without grant/release", first)
+	}
+}
+
 func admissionAnchorSnapshot(t *testing.T, anchorStore *authority.AnchorStore) authority.AnchorSnapshot {
 	t.Helper()
 	var snapshot authority.AnchorSnapshot
@@ -2260,6 +2575,14 @@ type admissionFakeLaunchCustodian struct {
 
 	mu       sync.Mutex
 	ordinals []model.LaunchOrdinal
+	releases int
+	aborts   int
+
+	abortCtxErrs      []error
+	abortCtxDeadlines []bool
+
+	abortRespectContext     bool
+	abortWaitForContextDone bool
 }
 
 func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.ExecSpec, key model.LaunchKey) (launch.PreparedProcess, error) {
@@ -2289,7 +2612,7 @@ func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.E
 	c.mu.Lock()
 	c.ordinals = append(c.ordinals, key.Ordinal)
 	c.mu.Unlock()
-	return &admissionFakePrepared{group: group, running: running, issuer: c.issuer}, nil
+	return &admissionFakePrepared{group: group, running: running, issuer: c.issuer, custodian: c}, nil
 }
 
 func (c *admissionFakeLaunchCustodian) ContainAndVerify(context.Context, model.GroupRef, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
@@ -2302,10 +2625,29 @@ func (c *admissionFakeLaunchCustodian) preparedOrdinals() []model.LaunchOrdinal 
 	return append([]model.LaunchOrdinal(nil), c.ordinals...)
 }
 
+func (c *admissionFakeLaunchCustodian) releaseCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.releases
+}
+
+func (c *admissionFakeLaunchCustodian) abortCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.aborts
+}
+
+func (c *admissionFakeLaunchCustodian) abortContextObservations() ([]error, []bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]error(nil), c.abortCtxErrs...), append([]bool(nil), c.abortCtxDeadlines...)
+}
+
 type admissionFakePrepared struct {
-	group   model.GroupRef
-	running *admissionFakeRunning
-	issuer  custodian.AttestationIssuer
+	group     model.GroupRef
+	running   *admissionFakeRunning
+	issuer    custodian.AttestationIssuer
+	custodian *admissionFakeLaunchCustodian
 }
 
 func (p *admissionFakePrepared) Ref() model.GroupRef {
@@ -2313,10 +2655,39 @@ func (p *admissionFakePrepared) Ref() model.GroupRef {
 }
 
 func (p *admissionFakePrepared) Release(context.Context, custodian.GrantToken) (launch.RunningProcess, error) {
+	if p.custodian != nil {
+		p.custodian.mu.Lock()
+		p.custodian.releases++
+		p.custodian.mu.Unlock()
+	}
 	return p.running, nil
 }
 
-func (p *admissionFakePrepared) AbortAndVerify(context.Context) (custodian.VerifiedQuiescence, error) {
+func (p *admissionFakePrepared) AbortAndVerify(ctx context.Context) (custodian.VerifiedQuiescence, error) {
+	respectContext := false
+	waitForContextDone := false
+	if p.custodian != nil {
+		p.custodian.mu.Lock()
+		respectContext = p.custodian.abortRespectContext
+		waitForContextDone = p.custodian.abortWaitForContextDone
+		p.custodian.mu.Unlock()
+	}
+	if waitForContextDone {
+		<-ctx.Done()
+	}
+	if p.custodian != nil {
+		_, hasDeadline := ctx.Deadline()
+		p.custodian.mu.Lock()
+		p.custodian.aborts++
+		p.custodian.abortCtxErrs = append(p.custodian.abortCtxErrs, ctx.Err())
+		p.custodian.abortCtxDeadlines = append(p.custodian.abortCtxDeadlines, hasDeadline)
+		p.custodian.mu.Unlock()
+	}
+	if respectContext {
+		if err := ctx.Err(); err != nil {
+			return custodian.VerifiedQuiescence{}, err
+		}
+	}
 	return p.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: p.group, Method: model.QuiescenceAlreadyAbsent})
 }
 
@@ -2462,6 +2833,20 @@ func waitAdmissionSafetyTerminal(t *testing.T, server *Server, jobID string) mod
 	}
 	t.Fatalf("admission safety record %s did not reach terminal state; last = %+v", jobID, last)
 	return model.SafetyRecord{}
+}
+
+func assertNoAcceptedJobsInAdmission(t *testing.T, server *Server) {
+	t.Helper()
+	if server.admissionReady == nil {
+		t.Fatal("admission authority is not ready")
+	}
+	snapshot, err := server.admissionReady.RuntimeSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Pending) != 0 || len(snapshot.Owned) != 0 {
+		t.Fatalf("runtime snapshot = %+v, want no accepted work", snapshot)
+	}
 }
 
 func addScriptedSession(t *testing.T, server *Server, backend *fakeBackend, cwd, sessionID string) {

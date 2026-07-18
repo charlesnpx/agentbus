@@ -207,6 +207,14 @@ func (r *Ready) BindGroup(ctx context.Context, jobID model.JobID, ref model.Atte
 	return r.apply(ctx, jobID, model.BindGroup{Ref: ref, Ordinal: ordinal, Group: group}, options...)
 }
 
+func (r *Ready) Acknowledge(ctx context.Context, jobID model.JobID, ref model.AttemptRef, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.Acknowledge{Ref: ref}, options...)
+}
+
+func (r *Ready) BeginReject(ctx context.Context, jobID model.JobID, ref model.AttemptRef, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.BeginReject{Ref: ref}, options...)
+}
+
 func (r *Ready) CommitGrant(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, nonce model.PermitNonce, options ...ApplyOption) (ApplyResult, error) {
 	return r.apply(ctx, jobID, model.CommitGrant{Ref: ref, Ordinal: ordinal, Nonce: nonce}, options...)
 }
@@ -383,9 +391,6 @@ func normalizeAcceptRequest(request AcceptRequest) (AcceptRequest, error) {
 	}
 	if err := request.Mode.Validate(); err != nil {
 		return AcceptRequest{}, fmt.Errorf("%w: mode: %v", ErrInvalidRequest, err)
-	}
-	if request.Mode != model.ModeIdentifiedFenced {
-		return AcceptRequest{}, fmt.Errorf("%w: mode %s is outside authority acceptance", ErrInvalidRequest, request.Mode)
 	}
 	if _, err := model.Project(model.SafetyRecord{
 		SchemaVersion: safetySchemaVersion,

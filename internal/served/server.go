@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
@@ -1280,6 +1281,9 @@ type jobRun struct {
 	jobID                   string
 	sessionID               string
 	backend                 string
+	cwd                     string
+	model                   string
+	effort                  string
 	store                   *engine.Store
 	session                 engine.Session
 	prompt                  string
@@ -1295,7 +1299,11 @@ type jobRun struct {
 	onDone                  func()
 	authoritativeCompletion bool
 	admissionControlled     bool
+	admissionMode           model.Mode
+	admissionAccepted       authority.AcceptResult
 	admissionLaunch         admissionLaunchBinding
+	prestartedEvents        <-chan engine.Event
+	legacyFencedCommand     *legacyFencedCommand
 }
 
 func (s *Server) runJob(ctx context.Context, run jobRun) {
@@ -1405,9 +1413,12 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 	}
 	var events <-chan engine.Event
 	var err error
-	if run.admissionControlled {
+	switch {
+	case run.prestartedEvents != nil && ordinal == model.LaunchOrdinalOne:
+		events = run.prestartedEvents
+	case run.admissionControlled && run.admissionMode != model.ModeLegacyUnfenced:
 		events, err = s.admissionTurnEvents(attemptCtx, run, input, ordinal)
-	} else {
+	default:
 		events, err = run.session.Turn(attemptCtx, input)
 	}
 	if err != nil {

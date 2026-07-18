@@ -61,6 +61,12 @@ func terminalResult(record SafetyRecord, outcome Outcome) (*ResultRef, error) {
 }
 
 func deriveTerminalProof(record SafetyRecord, intent TerminalIntent) (TerminalProof, error) {
+	if record.Mode == ModeLegacyUnfenced {
+		if hasAnyLaunchEvidence(record.Attempt) {
+			return 0, precondition("legacy unfenced terminal proof requires no launch evidence")
+		}
+		return ProofLegacyUnfencedOutcome, nil
+	}
 	if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
 		if !allLaunchGroupsQuiescent(record.Attempt) {
 			return 0, precondition("terminal derivation requires quiescence for every bound group")

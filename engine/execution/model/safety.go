@@ -321,6 +321,9 @@ func (record SafetyRecord) validateOptionalFacts() error {
 func (record SafetyRecord) validateTerminalProofSupport() error {
 	switch record.Terminal.Proof {
 	case ProofNeverPermittedAndRetired:
+		if !fencedMode(record.Mode) {
+			return invalid("terminal.proof", "fenced proof requires fenced mode")
+		}
 		if hasAnyGrant(record.Attempt) || hasAnyRelease(record.Attempt) {
 			return invalid("terminal.proof", "never-permitted proof cannot have grant or release evidence")
 		}
@@ -328,6 +331,9 @@ func (record SafetyRecord) validateTerminalProofSupport() error {
 			return invalid("terminal.proof", "never-permitted proof requires quiescence for every bound group")
 		}
 	case ProofCleanQuiescentOutcomeAndRetired:
+		if !fencedMode(record.Mode) {
+			return invalid("terminal.proof", "fenced proof requires fenced mode")
+		}
 		if !hasAnyGrant(record.Attempt) {
 			return invalid("terminal.proof", "clean proof requires launch grant evidence")
 		}
@@ -335,14 +341,28 @@ func (record SafetyRecord) validateTerminalProofSupport() error {
 			return invalid("terminal.proof", "clean proof requires every bound launch to be quiescent and every granted launch to be released")
 		}
 	case ProofContained:
+		if !fencedMode(record.Mode) {
+			return invalid("terminal.proof", "fenced proof requires fenced mode")
+		}
 		if !hasAnyLaunchEvidence(record.Attempt) {
 			return invalid("terminal.proof", "contained proof requires launch evidence")
 		}
 		if !allLaunchGroupsQuiescent(record.Attempt) {
 			return invalid("terminal.proof", "contained proof requires quiescence for every bound group")
 		}
+	case ProofLegacyUnfencedOutcome:
+		if record.Mode != ModeLegacyUnfenced {
+			return invalid("terminal.proof", "legacy-unfenced proof requires legacy-unfenced mode")
+		}
+		if hasAnyLaunchEvidence(record.Attempt) {
+			return invalid("terminal.proof", "legacy-unfenced proof cannot have launch evidence")
+		}
 	default:
 		return invalid("terminal.proof", "is unknown")
 	}
 	return nil
+}
+
+func fencedMode(mode Mode) bool {
+	return mode == ModeIdentifiedFenced || mode == ModeLegacyFenced
 }

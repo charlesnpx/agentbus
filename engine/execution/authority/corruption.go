@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 )
+
+const authorityFailStopTimeout = 30 * time.Second
 
 type JobRecoveryPlan struct {
 	JobID      model.JobID
@@ -132,18 +135,33 @@ func (r *Ready) FailStop(ctx context.Context, reason string) error {
 	if r == nil || r.core == nil {
 		return ErrNotReady
 	}
+	failStopCtx, cancel := detachedAuthorityFailStopContext(ctx)
+	defer cancel()
 	r.core.mu.Lock()
 	defer r.core.mu.Unlock()
-	if err := r.core.repo.View(ctx, func(tx repository.ReadTx) error {
+	if err := r.core.repo.View(failStopCtx, func(tx repository.ReadTx) error {
 		_, err := r.core.requireReadyTx(tx, r.token)
 		return err
 	}); err != nil {
 		return err
 	}
-	return r.core.failStopLocked(ctx, reason)
+	return r.core.failStopLockedWithContext(failStopCtx, reason)
 }
 
 func (core *authorityCore) failStopLocked(ctx context.Context, reason string) error {
+	failStopCtx, cancel := detachedAuthorityFailStopContext(ctx)
+	defer cancel()
+	return core.failStopLockedWithContext(failStopCtx, reason)
+}
+
+func detachedAuthorityFailStopContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), authorityFailStopTimeout)
+}
+
+func (core *authorityCore) failStopLockedWithContext(ctx context.Context, reason string) error {
 	err := core.anchor.FailStop(ctx, core.boot.ref, reason)
 	core.boot.phase = bootFailStopped
 	core.boot.reason = reason

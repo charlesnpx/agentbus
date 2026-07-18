@@ -263,6 +263,66 @@ func TestTerminalProofRequiresSupportingCertificates(t *testing.T) {
 	}
 }
 
+func TestValidateSafetyRecordRejectsTerminalProofFromWrongMode(t *testing.T) {
+	fencedRecords := []struct {
+		name   string
+		record SafetyRecord
+	}{
+		{
+			name: "never_permitted",
+			record: reducerMustApply(t, reducerCanceledRetiredRecord(t), Finalize{
+				Ref:    reducerRef(),
+				Intent: TerminalIntent{Outcome: OutcomeCanceled, Cause: CauseCanceledBeforeAuthorization},
+			}),
+		},
+		{
+			name: "clean_quiescent",
+			record: reducerMustApply(t, reducerCleanCompletedRecord(t), Finalize{
+				Ref:    reducerRef(),
+				Intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally},
+			}),
+		},
+		{
+			name: "contained",
+			record: reducerMustApply(t, reducerContainedRetiredRecord(t), Finalize{
+				Ref:    reducerRef(),
+				Intent: TerminalIntent{Outcome: OutcomeCanceled, Cause: CauseCanceledAfterAuthorization},
+			}),
+		},
+	}
+	for _, tt := range fencedRecords {
+		t.Run(tt.name+"_valid", func(t *testing.T) {
+			if err := ValidateSafetyRecord(tt.record); err != nil {
+				t.Fatalf("valid fenced terminal record rejected: %v", err)
+			}
+		})
+		t.Run(tt.name+"_legacy_unfenced_rejected", func(t *testing.T) {
+			record := tt.record
+			record.Mode = ModeLegacyUnfenced
+			if err := ValidateSafetyRecord(record); !errors.Is(err, ErrInvalidValue) {
+				t.Fatalf("legacy-unfenced record with %s error = %v, want ErrInvalidValue", tt.record.Terminal.Proof, err)
+			}
+		})
+	}
+
+	legacy := reducerMustApply(t, reducerLegacyUnfencedCompletedRecord(t), Finalize{
+		Ref:    reducerRef(),
+		Intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally},
+	})
+	if err := ValidateSafetyRecord(legacy); err != nil {
+		t.Fatalf("valid legacy-unfenced terminal record rejected: %v", err)
+	}
+	for _, mode := range []Mode{ModeIdentifiedFenced, ModeLegacyFenced} {
+		t.Run(mode.String()+"_legacy_proof_rejected", func(t *testing.T) {
+			record := legacy
+			record.Mode = mode
+			if err := ValidateSafetyRecord(record); !errors.Is(err, ErrInvalidValue) {
+				t.Fatalf("%s record with legacy-unfenced proof error = %v, want ErrInvalidValue", mode, err)
+			}
+		})
+	}
+}
+
 func validSafetyRecord() SafetyRecord {
 	boot := BootRef{BootID: "boot-1", OwnerID: "owner-1"}
 	attempt := AttemptRef{JobID: "job-0001", AttemptID: "attempt-1", Epoch: 1}
