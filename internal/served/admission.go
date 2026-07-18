@@ -111,6 +111,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	s.admissionCoordinator = coord
 	s.admissionSubmission = submission
 	s.admissionSupervisor = supervisor
+	s.admissionRepository = repo
 	s.admissionClose = closer
 	closeOnErr = false
 	return nil
@@ -1511,16 +1512,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 			attempt:     accepted.Record.Attempt.Ref,
 		},
 	}
-	if err := s.createQueuedRecord(store, jobID, admissionSessionID, spec.Backend, spec.Tags, policy.policy, policy.contract, false); err != nil {
-		s.handleAdmissionResponseOutcome(ctx, run, false)
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
-	}
 	if mode == model.ModeLegacyFenced {
-		record, err := store.Load(jobID)
-		if err != nil {
-			s.handleAdmissionResponseOutcome(ctx, run, false)
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
-		}
 		sessionWithRunner, ok := session.(ordinalBoundSession)
 		if !ok {
 			s.handleAdmissionResponseOutcome(ctx, run, false)
@@ -1531,13 +1523,9 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 			preparation: legacyFencedPreparation,
 		}
 		events, err := sessionWithRunner.TurnWithRunner(ctx, engine.TurnInput{
-			Prompt:   applyPrologue(policy.policy, spec.Prompt),
-			Write:    spec.Write,
-			Timeout:  timeout,
-			LogPaths: record.LogPaths,
-			OnProcessStart: func(ref engine.ProcessRef, backendChildPID int) {
-				_ = s.updateBackendProcess(store, jobID, ref, backendChildPID)
-			},
+			Prompt:  applyPrologue(policy.policy, spec.Prompt),
+			Write:   spec.Write,
+			Timeout: timeout,
 		}, prepareRunner)
 		if err != nil {
 			run.legacyFencedCommand = prepareRunner.command
@@ -1609,17 +1597,11 @@ func (s *Server) handleAdmissionResponseOutcome(ctx context.Context, run jobRun,
 		if err != nil && s.admissionReady != nil {
 			_ = s.admissionReady.FailStop(ctx, err.Error())
 		}
-		if run.store != nil {
-			_, _ = run.store.Cancel(run.jobID)
-		}
 	case model.RunLegacyUnfenced:
 		go s.launchLegacyUnfencedJob(ctx, run)
 	case model.RejectLegacyUnfencedBeforeRun:
 		if err := s.admissionSubmission.rejectLegacyUnfencedBeforeRun(ctx, run.admissionAccepted); err != nil && s.admissionReady != nil {
 			_ = s.admissionReady.FailStop(ctx, err.Error())
-		}
-		if run.store != nil {
-			_, _ = run.store.Cancel(run.jobID)
 		}
 	}
 }
@@ -1743,6 +1725,37 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 	}, true, nil
 }
 
+func (s *Server) listAuthorityStatuses() ([]protocol.JobStatus, *protocol.ErrorObject) {
+	if s.admissionRepository == nil {
+		return nil, nil
+	}
+	var statuses []protocol.JobStatus
+	var authorityListErr *protocol.ErrorObject
+	if err := s.admissionRepository.View(context.Background(), func(tx repository.ReadTx) error {
+		images, err := tx.ListJobs(repository.JobFilter{})
+		if err != nil {
+			return err
+		}
+		for _, image := range images {
+			status, ok, errObj := authorityStatusFromImage(image)
+			if errObj != nil {
+				authorityListErr = errObj
+				return errors.New(errObj.Message)
+			}
+			if ok {
+				statuses = append(statuses, status)
+			}
+		}
+		return nil
+	}); err != nil {
+		if authorityListErr != nil {
+			return nil, authorityListErr
+		}
+		return nil, admissionProtocolError(err)
+	}
+	return statuses, nil
+}
+
 func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *protocol.ErrorObject) {
 	record, projection, ok, errObj := s.authorityJobProjection(jobID)
 	if !ok || errObj != nil {
@@ -1784,6 +1797,30 @@ func (s *Server) authorityJobProjection(jobID string) (model.SafetyRecord, model
 		return model.SafetyRecord{}, model.JobProjection{}, false, protocol.NewError(protocol.ErrorInvalidTaskSpec, "authority projection is not valid", protocol.ErrorData{JobID: jobID})
 	}
 	return image.Safety.Value, image.Projection.Value, true, nil
+}
+
+func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bool, *protocol.ErrorObject) {
+	if image.Safety.State == repository.RecordMissing && image.Projection.State == repository.RecordMissing {
+		return protocol.JobStatus{}, false, nil
+	}
+	jobID := ""
+	if image.Safety.State == repository.RecordValid {
+		jobID = image.Safety.Value.JobID.String()
+	} else if image.Projection.State == repository.RecordValid {
+		jobID = image.Projection.Value.JobID.String()
+	}
+	if image.Safety.State != repository.RecordValid {
+		return protocol.JobStatus{}, false, protocol.NewError(protocol.ErrorInvalidTaskSpec, "authority safety record is not valid", protocol.ErrorData{JobID: jobID})
+	}
+	if image.Projection.State != repository.RecordValid {
+		return protocol.JobStatus{}, false, protocol.NewError(protocol.ErrorInvalidTaskSpec, "authority projection is not valid", protocol.ErrorData{JobID: jobID})
+	}
+	projection := image.Projection.Value
+	return protocol.JobStatus{
+		JobID:     projection.JobID.String(),
+		SessionID: projection.SessionID,
+		State:     admissionState(projection.Public),
+	}, true, nil
 }
 
 func authorityResultInfo(ref model.ResultRef) *engine.ResultInfo {

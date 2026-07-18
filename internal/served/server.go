@@ -24,6 +24,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -31,6 +32,8 @@ const (
 	defaultLeaseDuration = 5 * time.Minute
 	defaultHeartbeat     = 30 * time.Second
 )
+
+const duplicateAuthorityJSONWarning = "duplicate-job-id: authority record also has legacy JSON record; authority selected"
 
 // BinaryIdentity identifies the on-disk daemon executable by metadata that
 // changes when a replacement binary is installed.
@@ -122,6 +125,7 @@ type Server struct {
 	admissionCoordinator         *admissionCoordinator
 	admissionSubmission          *servedSubmissionCoordinator
 	admissionSupervisor          *servedAdmissionSupervisor
+	admissionRepository          repository.Repository
 	admissionClose               io.Closer
 	admissionBootstrapperFactory admissionBootstrapperFactory
 
@@ -1132,28 +1136,12 @@ func (s *Server) handleJobStatus(raw json.RawMessage) requestOutcome {
 		params.All = true
 	}
 	if params.JobID != "" {
-		store := s.storeForJob(params.JobID)
-		if store == nil {
-			if status, ok, errObj := s.authorityStatus(params.JobID); ok || errObj != nil {
-				return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{status}}, err: errObj}
-			}
-			return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{}}}
-		}
-		record, err := store.Load(params.JobID)
-		if err != nil {
-			if status, ok, errObj := s.authorityStatus(params.JobID); ok || errObj != nil {
-				return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{status}}, err: errObj}
-			}
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
-		}
-		return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{statusFromRecord(*record)}}}
+		return s.handleExactJobStatus(params.JobID)
 	}
-	records := s.listKnownRecords()
-	statuses := make([]protocol.JobStatus, 0, len(records))
-	for _, record := range records {
-		statuses = append(statuses, statusFromRecord(record))
+	statuses, errObj := s.listJobStatuses()
+	if errObj != nil {
+		return requestOutcome{err: errObj}
 	}
-	sort.Slice(statuses, func(i, j int) bool { return statuses[i].JobID < statuses[j].JobID })
 	return requestOutcome{result: protocol.JobStatusResult{Jobs: statuses}}
 }
 
@@ -1165,21 +1153,63 @@ func (s *Server) handleJobResult(raw json.RawMessage) requestOutcome {
 	if params.JobID == "" {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "jobId is required", protocol.ErrorData{})}
 	}
-	store := s.storeForJob(params.JobID)
+	return s.handleExactJobResult(params.JobID)
+}
+
+func (s *Server) handleExactJobStatus(jobID string) requestOutcome {
+	status, ok, authorityErr := s.authorityStatus(jobID)
+	if ok {
+		return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{status}}}
+	}
+	if record, ok, errObj := s.jsonJobRecord(jobID); ok || errObj != nil {
+		if errObj != nil {
+			return requestOutcome{err: errObj}
+		}
+		// During authority degradation, a fenced job with stale JSON can read the
+		// stale JSON fallback. S4E SafetyLatch handles that fault-state case.
+		return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{statusFromRecord(*record)}}}
+	}
+	if authorityErr != nil {
+		return requestOutcome{err: authorityErr}
+	}
+	return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{}}}
+}
+
+func (s *Server) handleExactJobResult(jobID string) requestOutcome {
+	result, ok, authorityErr := s.authorityResult(jobID)
+	if ok {
+		return requestOutcome{result: result}
+	}
+	if record, ok, errObj := s.jsonJobRecord(jobID); ok || errObj != nil {
+		if errObj != nil {
+			return requestOutcome{err: errObj}
+		}
+		// During authority degradation, a fenced job with stale JSON can read the
+		// stale JSON fallback. S4E SafetyLatch handles that fault-state case.
+		return requestOutcome{result: resultFromRecord(*record)}
+	}
+	if authorityErr != nil {
+		return requestOutcome{err: authorityErr}
+	}
+	return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: jobID})}
+}
+
+func (s *Server) jsonJobRecord(jobID string) (*engine.JobRecord, bool, *protocol.ErrorObject) {
+	store := s.storeForJob(jobID)
 	if store == nil {
-		if result, ok, errObj := s.authorityResult(params.JobID); ok || errObj != nil {
-			return requestOutcome{result: result, err: errObj}
-		}
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+		return nil, false, nil
 	}
-	record, err := store.Load(params.JobID)
+	record, err := store.Load(jobID)
 	if err != nil {
-		if result, ok, errObj := s.authorityResult(params.JobID); ok || errObj != nil {
-			return requestOutcome{result: result, err: errObj}
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
 		}
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
+		return nil, false, protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})
 	}
-	return requestOutcome{result: resultFromRecord(*record)}
+	if record == nil {
+		return nil, false, nil
+	}
+	return record, true, nil
 }
 
 func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
@@ -1327,9 +1357,11 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 		s.finalizeFailure(run, err)
 		return
 	}
-	heartbeatDone := make(chan struct{})
-	go s.heartbeat(run.store, run.jobID, heartbeatDone)
-	defer close(heartbeatDone)
+	if !run.admissionControlled {
+		heartbeatDone := make(chan struct{})
+		go s.heartbeat(run.store, run.jobID, heartbeatDone)
+		defer close(heartbeatDone)
+	}
 
 	attemptPrompt := applyPrologue(run.policy, run.prompt)
 	text, state, err := s.runAttempt(ctx, run, attemptPrompt, run.write, model.LaunchOrdinalOne)
@@ -1380,6 +1412,9 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 }
 
 func (s *Server) transitionRunRecord(run jobRun, state engine.JobState) error {
+	if run.admissionControlled {
+		return nil
+	}
 	if err := s.transitionRecord(run.store, run.jobID, state); err != nil && !run.admissionControlled {
 		return err
 	}
@@ -1395,21 +1430,23 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		attemptCtx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
-	record, _ := run.store.Load(run.jobID)
 	input := engine.TurnInput{
 		Prompt:   prompt,
 		Write:    write,
 		Timeout:  run.timeout,
 		LogPaths: engine.LogPaths{},
-		OnProcessStart: func(ref engine.ProcessRef, backendChildPID int) {
+	}
+	if !run.admissionControlled {
+		record, _ := run.store.Load(run.jobID)
+		input.OnProcessStart = func(ref engine.ProcessRef, backendChildPID int) {
 			_ = s.updateBackendProcess(run.store, run.jobID, ref, backendChildPID)
-		},
-	}
-	if record != nil {
-		input.LogPaths = record.LogPaths
-	}
-	if id := run.session.ID(); id != "" {
-		_ = s.updateBackendSessionID(run.store, run.jobID, id)
+		}
+		if record != nil {
+			input.LogPaths = record.LogPaths
+		}
+		if id := run.session.ID(); id != "" {
+			_ = s.updateBackendSessionID(run.store, run.jobID, id)
+		}
 	}
 	var events <-chan engine.Event
 	var err error
@@ -1443,16 +1480,18 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				if attemptCtx.Err() != nil {
 					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), stateForContext(attemptCtx.Err()), attemptCtx.Err()
 				}
-				if id := run.session.ID(); id != "" {
+				if !run.admissionControlled && run.session != nil && run.session.ID() != "" {
+					id := run.session.ID()
 					_ = s.updateBackendSessionID(run.store, run.jobID, id)
 				}
 				return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateCompleted, nil
 			}
-			if id := run.session.ID(); id != "" {
+			if !run.admissionControlled && run.session != nil && run.session.ID() != "" {
+				id := run.session.ID()
 				_ = s.updateBackendSessionID(run.store, run.jobID, id)
 			}
 			rawText := authoritativeText(event)
-			if event.ModelReported != "" {
+			if !run.admissionControlled && event.ModelReported != "" {
 				_ = s.updateModelReported(run.store, run.jobID, event.ModelReported)
 			}
 			switch event.Type {
@@ -1578,9 +1617,7 @@ func (s *Server) finalizeRequestedTerminal(run jobRun) {
 
 func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {
 	if run.admissionControlled {
-		if err := s.completeAdmissionRun(run, state, text); err != nil {
-			return err
-		}
+		return s.completeAdmissionRun(run, state, text)
 	}
 	backendSessionID := ""
 	if run.session != nil {
@@ -1921,6 +1958,32 @@ func (s *Server) listKnownRecords() []engine.JobRecord {
 	return records
 }
 
+func (s *Server) listJobStatuses() ([]protocol.JobStatus, *protocol.ErrorObject) {
+	statusesByID := make(map[string]protocol.JobStatus)
+	authorityStatuses, errObj := s.listAuthorityStatuses()
+	if errObj != nil {
+		return nil, errObj
+	}
+	for _, status := range authorityStatuses {
+		statusesByID[status.JobID] = status
+	}
+	for _, record := range s.listKnownRecords() {
+		status := statusFromRecord(record)
+		if existing, ok := statusesByID[status.JobID]; ok {
+			existing.Warnings = appendStatusWarning(existing.Warnings, duplicateAuthorityJSONWarning)
+			statusesByID[status.JobID] = existing
+			continue
+		}
+		statusesByID[status.JobID] = status
+	}
+	statuses := make([]protocol.JobStatus, 0, len(statusesByID))
+	for _, status := range statusesByID {
+		statuses = append(statuses, status)
+	}
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].JobID < statuses[j].JobID })
+	return statuses, nil
+}
+
 func (s *Server) findPersistedSession(sessionID string) (*engine.JobRecord, *engine.Store) {
 	stores, err := s.knownStores()
 	if err != nil {
@@ -2227,6 +2290,15 @@ func statusFromRecord(record engine.JobRecord) protocol.JobStatus {
 		ModelReported:         record.ModelReported,
 		Warnings:              append([]string(nil), record.Warnings...),
 	}
+}
+
+func appendStatusWarning(warnings []string, warning string) []string {
+	for _, existing := range warnings {
+		if existing == warning {
+			return warnings
+		}
+	}
+	return append(warnings, warning)
 }
 
 func resultFromRecord(record engine.JobRecord) protocol.JobResult {
