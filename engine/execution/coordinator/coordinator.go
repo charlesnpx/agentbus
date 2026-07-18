@@ -7,14 +7,16 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 )
 
 var (
-	ErrCoordinatorNotReady = errors.New("coordinator not ready")
-	ErrSupervisorRequired  = errors.New("coordinator supervisor is required")
-	ErrAuthorityRequired   = errors.New("coordinator authority is required")
-	ErrFatalRecovery       = errors.New("coordinator fatal recovery plan")
+	ErrCoordinatorNotReady       = errors.New("coordinator not ready")
+	ErrSupervisorRequired        = errors.New("coordinator supervisor is required")
+	ErrAuthorityRequired         = errors.New("coordinator authority is required")
+	ErrLaunchContainmentRequired = errors.New("coordinator launch containment is required")
+	ErrFatalRecovery             = errors.New("coordinator fatal recovery plan")
 )
 
 type AdmissionAuthority interface {
@@ -59,29 +61,38 @@ type JobSnapshot struct {
 }
 
 type Coordinator struct {
-	authority    AdmissionAuthority
-	supervisor   Supervisor
-	results      ResultPublisher
-	owner        model.OwnerID
-	shutdownPoll time.Duration
+	authority         AdmissionAuthority
+	supervisor        Supervisor
+	launchContainment LaunchContainment
+	results           ResultPublisher
+	owner             model.OwnerID
+	shutdownPoll      time.Duration
 }
 
-func New(authority AdmissionAuthority, supervisor Supervisor, results ResultPublisher, owner model.OwnerID) (*Coordinator, error) {
+type LaunchContainment interface {
+	ContainAndVerify(context.Context, launch.LaunchContext, model.GroupRef, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error)
+}
+
+func New(authority AdmissionAuthority, supervisor Supervisor, launchContainment LaunchContainment, results ResultPublisher, owner model.OwnerID) (*Coordinator, error) {
 	if authority == nil {
 		return nil, ErrAuthorityRequired
 	}
 	if supervisor == nil {
 		return nil, ErrSupervisorRequired
 	}
+	if launchContainment == nil {
+		return nil, ErrLaunchContainmentRequired
+	}
 	if err := owner.Validate(); err != nil {
 		return nil, fmt.Errorf("owner: %w", err)
 	}
 	return &Coordinator{
-		authority:    authority,
-		supervisor:   supervisor,
-		results:      results,
-		owner:        owner,
-		shutdownPoll: 10 * time.Millisecond,
+		authority:         authority,
+		supervisor:        supervisor,
+		launchContainment: launchContainment,
+		results:           results,
+		owner:             owner,
+		shutdownPoll:      10 * time.Millisecond,
 	}, nil
 }
 
@@ -465,7 +476,7 @@ func (c *Coordinator) contain(ctx context.Context, record model.SafetyRecord, in
 		if err := inject(injector, FailContainSignal); err != nil {
 			return err
 		}
-		verified, err := c.supervisor.Contain(ctx, prepared)
+		verified, err := c.launchContainment.ContainAndVerify(ctx, launchContext(record, ordinal), prepared.Group, custodian.QuiescenceCauseContain)
 		if err != nil {
 			return err
 		}
@@ -494,7 +505,7 @@ func (c *Coordinator) retire(ctx context.Context, record model.SafetyRecord, inj
 		if err := inject(injector, FailRetireClose); err != nil {
 			return err
 		}
-		verified, err := c.supervisor.Retire(ctx, prepared)
+		verified, err := c.launchContainment.ContainAndVerify(ctx, launchContext(record, ordinal), prepared.Group, custodian.QuiescenceCauseRecovery)
 		if err != nil {
 			return err
 		}
@@ -511,7 +522,7 @@ func (c *Coordinator) retire(ctx context.Context, record model.SafetyRecord, inj
 }
 
 func (c *Coordinator) ready() error {
-	if c == nil || c.authority == nil {
+	if c == nil || c.authority == nil || c.launchContainment == nil {
 		return ErrCoordinatorNotReady
 	}
 	return nil
@@ -534,6 +545,14 @@ func preparedFromRecord(record model.SafetyRecord, ordinal model.LaunchOrdinal) 
 		return PreparedSupervisor{}, err
 	}
 	return prepared, nil
+}
+
+func launchContext(record model.SafetyRecord, ordinal model.LaunchOrdinal) launch.LaunchContext {
+	return launch.LaunchContext{
+		JobID:   record.JobID,
+		Attempt: record.Attempt.Ref,
+		Ordinal: ordinal,
+	}
 }
 
 func nextUnconsumedGrant(record model.SafetyRecord) (model.LaunchGrant, error) {

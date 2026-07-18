@@ -285,6 +285,22 @@ func (controller *LaunchController) RecordQuiescence(ctx context.Context, launch
 	return controller.authority.RecordQuiescence(ctx, launch.JobID, launch.Ordinal, verified)
 }
 
+func (controller *LaunchController) ContainAndVerify(ctx context.Context, launch LaunchContext, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := controller.ready(); err != nil {
+		return custodian.VerifiedQuiescence{}, err
+	}
+	if err := launch.Validate(); err != nil {
+		return custodian.VerifiedQuiescence{}, err
+	}
+	if err := validatePreparedGroup(launch, group); err != nil {
+		return custodian.VerifiedQuiescence{}, err
+	}
+	return controller.custodian.ContainAndVerify(ctx, group, cause)
+}
+
 func (controller *LaunchController) ready() error {
 	if controller == nil || controller.authority == nil {
 		return ErrAuthorityRequired

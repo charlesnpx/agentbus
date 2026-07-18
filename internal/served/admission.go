@@ -96,7 +96,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	coord, err := coordinator.New(adapter, supervisor, servedResultPublisher{server: s}, owner)
+	coord, err := coordinator.New(adapter, supervisor, launchController, servedResultPublisher{server: s}, owner)
 	if err != nil {
 		return err
 	}

@@ -53,6 +53,36 @@ func TestLaunchControllerHappyPathOrdering(t *testing.T) {
 	}
 }
 
+func TestLaunchControllerContainAndVerifyUsesCustodianPort(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "contain-entrypoint")
+
+	verified, err := h.controller.ContainAndVerify(ctx, h.launch, h.group, custodian.QuiescenceCauseContain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if h.custodian.containCalls != 1 {
+		t.Fatalf("custodian contain calls = %d, want 1", h.custodian.containCalls)
+	}
+	if !h.custodian.containedGroup.Equal(h.group) {
+		t.Fatalf("contained group = %+v, want %+v", h.custodian.containedGroup, h.group)
+	}
+	if h.custodian.containCause != custodian.QuiescenceCauseContain {
+		t.Fatalf("contain cause = %q, want %q", h.custodian.containCause, custodian.QuiescenceCauseContain)
+	}
+	if h.authority.recordQuiescenceCalls != 0 {
+		t.Fatalf("record quiescence calls = %d, want 0", h.authority.recordQuiescenceCalls)
+	}
+	physical, err := h.verifier.VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !physical.Group.Equal(h.group) || physical.Method != model.QuiescenceTermKill {
+		t.Fatalf("verified quiescence = %+v, want term-kill for launch group", physical)
+	}
+}
+
 func TestLaunchControllerFailpointsFailClosed(t *testing.T) {
 	tests := []struct {
 		name                  string

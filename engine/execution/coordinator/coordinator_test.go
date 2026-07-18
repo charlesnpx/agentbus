@@ -14,6 +14,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
@@ -87,8 +88,11 @@ func TestCancelBeforePermitRetiresWithoutContainment(t *testing.T) {
 	if snapshot.Record.Terminal.Cause != model.CauseCanceledBeforeAuthorization {
 		t.Fatalf("cause = %s, want %s", snapshot.Record.Terminal.Cause, model.CauseCanceledBeforeAuthorization)
 	}
-	if h.supervisor.contained != 0 {
-		t.Fatalf("containment calls = %d, want 0", h.supervisor.contained)
+	if h.containment.contained != 0 || h.containment.retired != 1 {
+		t.Fatalf("launch containment contain=%d retire=%d, want 0/1", h.containment.contained, h.containment.retired)
+	}
+	if h.supervisor.contained != 0 || h.supervisor.retired != 0 {
+		t.Fatalf("legacy supervisor contain=%d retire=%d, want 0/0", h.supervisor.contained, h.supervisor.retired)
 	}
 	if h.supervisor.permits != 0 {
 		t.Fatalf("permit sends = %d, want 0", h.supervisor.permits)
@@ -117,8 +121,52 @@ func TestCancelAfterPermitContainsBeforeTerminal(t *testing.T) {
 	if snapshot.Record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
 		t.Fatalf("cause = %s, want %s", snapshot.Record.Terminal.Cause, model.CauseCanceledAfterAuthorization)
 	}
-	if h.supervisor.contained != 1 {
-		t.Fatalf("containment calls = %d, want 1", h.supervisor.contained)
+	if h.containment.contained != 1 {
+		t.Fatalf("launch containment calls = %d, want 1", h.containment.contained)
+	}
+	if h.supervisor.contained != 0 || h.supervisor.retired != 0 {
+		t.Fatalf("legacy supervisor contain=%d retire=%d, want 0/0", h.supervisor.contained, h.supervisor.retired)
+	}
+}
+
+func TestCancelAfterPermitFailsClosedWhenContainmentUnprovable(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "cancel-unprovable")
+	accepted := h.submitPreparedPermitted(t, ctx, "cancel-unprovable")
+	h.containment.failContain = true
+
+	err := h.coordinator.Cancel(ctx, accepted.Record.JobID, nil)
+	if err == nil {
+		t.Fatal("Cancel returned nil for unprovable containment")
+	}
+	if !h.authority.failStopped {
+		t.Fatal("authority was not fail-stopped after unprovable cancel containment")
+	}
+	if h.containment.contained != 1 || h.containment.retired != 0 {
+		t.Fatalf("launch containment contain=%d retire=%d, want 1/0 failed containment attempt", h.containment.contained, h.containment.retired)
+	}
+	if h.supervisor.contained != 0 || h.supervisor.retired != 0 {
+		t.Fatalf("legacy supervisor contain=%d retire=%d, want 0/0", h.supervisor.contained, h.supervisor.retired)
+	}
+	if err := h.repo.View(ctx, func(tx repository.ReadTx) error {
+		image := tx.LoadJob(accepted.Record.JobID)
+		if image.Safety.State != repository.RecordValid {
+			t.Fatalf("safety state = %s, want valid", image.Safety.State)
+		}
+		record := image.Safety.Value
+		if record.Cancel == nil {
+			t.Fatal("cancel intent was not durably recorded")
+		}
+		if record.Terminal != nil {
+			t.Fatalf("terminal = %+v, want none after unprovable containment", record.Terminal)
+		}
+		first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+		if !ok || first.Quiescence != nil {
+			t.Fatalf("launch proof = %+v, want no quiescence after failed containment", first)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -271,8 +319,11 @@ func TestPostGrantFailureRecoveryContainsAndRetires(t *testing.T) {
 	if snapshot.Record.Terminal.Proof != model.ProofContained {
 		t.Fatalf("proof = %s, want %s", snapshot.Record.Terminal.Proof, model.ProofContained)
 	}
-	if h.supervisor.contained != 1 || h.supervisor.retired != 0 {
-		t.Fatalf("recovery effects contain=%d retire=%d, want 1/0", h.supervisor.contained, h.supervisor.retired)
+	if h.containment.contained != 1 || h.containment.retired != 0 {
+		t.Fatalf("recovery effects contain=%d retire=%d, want 1/0", h.containment.contained, h.containment.retired)
+	}
+	if h.supervisor.contained != 0 || h.supervisor.retired != 0 {
+		t.Fatalf("legacy supervisor contain=%d retire=%d, want 0/0", h.supervisor.contained, h.supervisor.retired)
 	}
 }
 
@@ -284,7 +335,7 @@ func TestDoubleFaultDuringRecoveryFailStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.supervisor.failSend = true
-	h.supervisor.failContain = true
+	h.containment.failContain = true
 
 	err := h.coordinator.GrantPermit(ctx, accepted.Record.JobID, 1, model.PermitNonce("nonce-1"), nil)
 	if err == nil {
@@ -327,8 +378,11 @@ func TestGrantBeforeCommitFailpointRetiresBoundGroupWithoutPermit(t *testing.T) 
 	if h.supervisor.permits != 0 {
 		t.Fatalf("permit sends = %d, want 0", h.supervisor.permits)
 	}
-	if h.supervisor.retired != 1 {
-		t.Fatalf("retire calls = %d, want 1", h.supervisor.retired)
+	if h.containment.retired != 1 {
+		t.Fatalf("launch retire calls = %d, want 1", h.containment.retired)
+	}
+	if h.supervisor.contained != 0 || h.supervisor.retired != 0 {
+		t.Fatalf("legacy supervisor contain=%d retire=%d, want 0/0", h.supervisor.contained, h.supervisor.retired)
 	}
 }
 
@@ -383,7 +437,7 @@ func TestRegressionSeedPR28DoubleFaultNeverIssuesSecondGrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.supervisor.failSend = true
-	h.supervisor.failContain = true
+	h.containment.failContain = true
 
 	if err := h.coordinator.GrantPermit(ctx, accepted.Record.JobID, 1, model.PermitNonce("nonce-1"), nil); err == nil {
 		t.Fatal("GrantPermit returned nil for PR #28 double fault")
@@ -393,7 +447,7 @@ func TestRegressionSeedPR28DoubleFaultNeverIssuesSecondGrant(t *testing.T) {
 	}
 
 	h.supervisor.failSend = false
-	h.supervisor.failContain = false
+	h.containment.failContain = false
 	if err := h.coordinator.GrantPermit(ctx, accepted.Record.JobID, 2, model.PermitNonce("nonce-2"), nil); err == nil {
 		t.Fatal("second grant succeeded after PR #28 double fault")
 	}
@@ -462,6 +516,7 @@ type harness struct {
 	authority   *readyAuthority
 	coordinator *Coordinator
 	supervisor  *testSupervisor
+	containment *testLaunchContainment
 	results     *testResults
 	repo        *memory.Repository
 }
@@ -488,8 +543,9 @@ func newHarness(t *testing.T, name string) *harness {
 	}
 	auth := &readyAuthority{ready: ready}
 	supervisor := &testSupervisor{issuer: issuer, boot: boot}
+	containment := &testLaunchContainment{issuer: issuer}
 	results := &testResults{receipts: map[model.ResultRef]model.ResultReceipt{}}
-	coordinator, err := New(auth, supervisor, results, model.OwnerID("coordinator-"+name))
+	coordinator, err := New(auth, supervisor, containment, results, model.OwnerID("coordinator-"+name))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,6 +553,7 @@ func newHarness(t *testing.T, name string) *harness {
 		authority:   auth,
 		coordinator: coordinator,
 		supervisor:  supervisor,
+		containment: containment,
 		results:     results,
 		repo:        repo,
 	}
@@ -808,6 +865,43 @@ func (s *testSupervisor) Retire(ctx context.Context, prepared PreparedSupervisor
 func (s *testSupervisor) attest(prepared PreparedSupervisor, method model.QuiescenceMethod) (custodian.VerifiedQuiescence, error) {
 	return s.issuer.AttestQuiescence(custodian.PhysicalQuiescence{
 		Group:  prepared.Group,
+		Method: method,
+	})
+}
+
+type testLaunchContainment struct {
+	contained   int
+	retired     int
+	failContain bool
+	issuer      custodian.AttestationIssuer
+}
+
+func (c *testLaunchContainment) ContainAndVerify(ctx context.Context, launchCtx launch.LaunchContext, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	if err := ctx.Err(); err != nil {
+		return custodian.VerifiedQuiescence{}, err
+	}
+	if err := launchCtx.Validate(); err != nil {
+		return custodian.VerifiedQuiescence{}, err
+	}
+	if err := group.Validate(); err != nil {
+		return custodian.VerifiedQuiescence{}, err
+	}
+	if !group.Launch.Attempt.Equal(launchCtx.Attempt) || group.Launch.Ordinal != launchCtx.Ordinal {
+		return custodian.VerifiedQuiescence{}, errors.New("launch containment group mismatch")
+	}
+	method := model.QuiescenceTermKill
+	switch cause {
+	case custodian.QuiescenceCauseRecovery:
+		c.retired++
+		method = model.QuiescenceAlreadyAbsent
+	default:
+		c.contained++
+	}
+	if c.failContain {
+		return custodian.VerifiedQuiescence{}, errors.New("containment failed")
+	}
+	return c.issuer.AttestQuiescence(custodian.PhysicalQuiescence{
+		Group:  group,
 		Method: method,
 	})
 }

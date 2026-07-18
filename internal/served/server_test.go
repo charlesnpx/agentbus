@@ -21,6 +21,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -1097,6 +1098,7 @@ func TestIdentifiedFencedCancelUsesAuthorityWhenAdmissionMarkerCleared(t *testin
 	launcher := newAdmissionFakeLaunchCustodian(t)
 	launcher.waitAndVerify = holdNaturalExit
 	enableTestAdmission(t, server, launcher)
+	oldSupervisor := installOldSupervisorProbe(t, server)
 
 	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
 		WorkspaceKey: "workspace-authority-cancel",
@@ -1124,6 +1126,9 @@ func TestIdentifiedFencedCancelUsesAuthorityWhenAdmissionMarkerCleared(t *testin
 	}
 	if got := launcher.containCount(); got == 0 {
 		t.Fatalf("authority cancel contain calls = %d, want live containment", got)
+	}
+	if contained, retired := oldSupervisor.calls(); contained != 0 || retired != 0 {
+		t.Fatalf("old supervisor contain=%d retire=%d, want 0/0", contained, retired)
 	}
 	assertNoJSONJobRecord(t, server, submitted.JobID)
 }
@@ -3496,6 +3501,55 @@ func enableTestAdmissionWithAuthorityStore(t *testing.T, server *Server, launche
 		return bootstrapper, repo, io.NopCloser(bytes.NewReader(nil)), nil
 	}
 	enableTestAdmission(t, server, launcher)
+}
+
+func installOldSupervisorProbe(t *testing.T, server *Server) *admissionOldSupervisorProbe {
+	t.Helper()
+	if server.admissionReady == nil || server.admissionSubmission == nil || server.admissionSubmission.launch == nil || server.admissionSupervisor == nil {
+		t.Fatal("admission must be bootstrapped before installing old supervisor probe")
+	}
+	probe := &admissionOldSupervisorProbe{servedAdmissionSupervisor: server.admissionSupervisor}
+	coord, err := coordinator.New(
+		&servedAdmissionAuthority{ready: server.admissionReady, latch: server.safetyLatch},
+		probe,
+		server.admissionSubmission.launch,
+		servedResultPublisher{server: server},
+		server.admissionSubmission.owner,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.admissionCoordinator = coord
+	server.admissionOwnedWorkChecker = coord
+	return probe
+}
+
+type admissionOldSupervisorProbe struct {
+	*servedAdmissionSupervisor
+
+	mu        sync.Mutex
+	contained int
+	retired   int
+}
+
+func (p *admissionOldSupervisorProbe) Contain(context.Context, coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
+	p.mu.Lock()
+	p.contained++
+	p.mu.Unlock()
+	return custodian.VerifiedQuiescence{}, errors.New("old supervisor containment invoked")
+}
+
+func (p *admissionOldSupervisorProbe) Retire(context.Context, coordinator.PreparedSupervisor) (custodian.VerifiedQuiescence, error) {
+	p.mu.Lock()
+	p.retired++
+	p.mu.Unlock()
+	return custodian.VerifiedQuiescence{}, errors.New("old supervisor retirement invoked")
+}
+
+func (p *admissionOldSupervisorProbe) calls() (int, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.contained, p.retired
 }
 
 func newPriorBootAuthorityWork(t *testing.T, repo *memory.Repository, anchorStore *authority.AnchorStore, launcher *admissionFakeLaunchCustodian, name string) (*authority.Ready, authority.AcceptResult) {
