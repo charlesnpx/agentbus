@@ -4,6 +4,10 @@ package custodian
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +19,79 @@ import (
 func requireLinuxRetainedConformanceOrSkip(t *testing.T) {
 	t.Helper()
 	requireRealNativeContainmentOrSkip(t)
+}
+
+func TestNativeCgroupRuntimeProbeContainsLiveMember(t *testing.T) {
+	requireLinuxRetainedConformanceOrSkip(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var helperPID int
+	liveBeforeContainment := false
+
+	outcome, err := probeNativeCgroupRuntime(ctx, nativeCgroupProbeConfig{
+		startHelper: func(ctx context.Context) (*nativeCgroupProbeHelper, error) {
+			helper, err := startNativeCgroupProbeHelper(ctx)
+			if err != nil {
+				return nil, err
+			}
+			helperPID = helper.pid()
+			return helper, nil
+		},
+		beforeContainment: func(ctx context.Context, helper *nativeCgroupProbeHelper) error {
+			if err := helper.requireRunning(ctx); err != nil {
+				return err
+			}
+			liveBeforeContainment = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("probeNativeCgroupRuntime() error = %v", err)
+	}
+	if !liveBeforeContainment {
+		t.Fatal("probe helper liveness was not confirmed before containment")
+	}
+	if !outcome.Absent() {
+		t.Fatalf("probeNativeCgroupRuntime() outcome = %+v, want Absent", outcome)
+	}
+	waitPIDAbsent(t, helperPID, 5*time.Second)
+}
+
+func TestNativeCgroupRuntimeProbeFailsWhenHelperExitsBeforeContainment(t *testing.T) {
+	requireLinuxRetainedConformanceOrSkip(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	marker := filepath.Join(t.TempDir(), "exit-before-containment")
+	script := `trap '' TERM; while [ ! -f "$1" ]; do sleep 0.01; done; exit 23`
+
+	_, err := probeNativeCgroupRuntime(ctx, nativeCgroupProbeConfig{
+		startHelper: func(ctx context.Context) (*nativeCgroupProbeHelper, error) {
+			return startNativeCgroupProbeHelperCommand(ctx, "/bin/sh", "-c", script, "probe-helper", marker)
+		},
+		beforeContainment: func(ctx context.Context, helper *nativeCgroupProbeHelper) error {
+			if err := os.WriteFile(marker, []byte("exit\n"), 0600); err != nil {
+				return err
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				err := helper.requireRunning(ctx)
+				if err != nil {
+					if strings.Contains(err.Error(), "exited") {
+						return nil
+					}
+					return err
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			return fmt.Errorf("helper did not self-exit before containment")
+		},
+	})
+	if err == nil {
+		t.Fatal("probeNativeCgroupRuntime() error = nil, want fail-closed helper liveness error")
+	}
+	if !strings.Contains(err.Error(), "live membership") || !strings.Contains(err.Error(), "exited") {
+		t.Fatalf("probeNativeCgroupRuntime() error = %v, want live-membership helper-exited failure", err)
+	}
 }
 
 func TestNativeRetainedContainAndVerifyKillsTermIgnoringLeader(t *testing.T) {
@@ -43,37 +120,20 @@ func TestNativeRetainedContainAndVerifyKillsTermIgnoringLeader(t *testing.T) {
 		t.Fatalf("leader pid %d missing before containment: %v", result.PID, err)
 	}
 
-	const containAndVerifyAttempts = 5
-	var outcome PhysicalOutcome
-	absent := false
-	for attempt := 1; attempt <= containAndVerifyAttempts; attempt++ {
-		outcome = running.ContainAndVerify(ctx)
-		if outcome.Absent() {
-			absent = true
-			break
-		}
-		if !outcome.Unprovable() {
-			t.Fatalf("ContainAndVerify() attempt %d/%d = %+v, want Absent or retryable Unprovable; members=%s", attempt, containAndVerifyAttempts, outcome, debugGroupMembers(running.Ref()))
-		}
-		if attempt < containAndVerifyAttempts {
-			// Heavy cgroup contention can transiently fail closed as Unprovable;
-			// robust single-shot determinism is tracked for L3c.
-			select {
-			case <-ctx.Done():
-				t.Fatalf("context done between ContainAndVerify attempts after %+v: %v", outcome, ctx.Err())
-			case <-time.After(50 * time.Millisecond):
-			}
-		}
-	}
-	if !absent {
-		t.Fatalf("ContainAndVerify() did not return Absent within %d attempts; last=%+v; members=%s", containAndVerifyAttempts, outcome, debugGroupMembers(running.Ref()))
+	// Single-shot: a live TERM-ignoring member is placed in the target cgroup, so
+	// containment must prove Absent via a real TERM->grace->KILL. A fail-closed
+	// Unprovable surfaces loudly with its reason rather than being masked by retry;
+	// any rare transient must be root-caused (tracked: L3c real-cgroup transient).
+	outcome := running.ContainPhysical(ctx)
+	if !outcome.Absent() {
+		t.Fatalf("ContainPhysical() = %+v, want Absent; members=%s", outcome, debugGroupMembers(running.Ref()))
 	}
 	waitGroupAbsent(t, running.Ref(), 5*time.Second)
-	// Retained cgroup path reports the terminal observation's method (already_absent)
-	// after performing a real TERM->grace->KILL; distinguishing killed-vs-was-absent
-	// method fidelity for the retained path is tracked for S3B-B attestation.
-	if outcome.Method != model.QuiescenceAlreadyAbsent && outcome.Method != model.QuiescenceTermKill {
-		t.Fatalf("physical method = %s, want %s or %s", outcome.Method, model.QuiescenceAlreadyAbsent, model.QuiescenceTermKill)
+	// Retained terminal method fidelity (term_kill vs already_absent after a
+	// real kill) is tracked for L3c; H2 only requires live-before, Absent, and
+	// gone-after proof.
+	if outcome.Method != model.QuiescenceTermKill && outcome.Method != model.QuiescenceAlreadyAbsent {
+		t.Fatalf("physical method = %s, want %s or %s", outcome.Method, model.QuiescenceTermKill, model.QuiescenceAlreadyAbsent)
 	}
 }
 
@@ -115,7 +175,7 @@ func TestNativeRetainedMonitorDaemonEOFContainsTargetGroup(t *testing.T) {
 	}
 	waitPIDAbsent(t, result.GrandchildPID, 5*time.Second)
 
-	final := running.ContainAndVerify(ctx)
+	final := running.ContainPhysical(ctx)
 	if !final.Absent() {
 		t.Fatalf("final ContainAndVerify() = %+v, want Absent after monitor containment", final)
 	}

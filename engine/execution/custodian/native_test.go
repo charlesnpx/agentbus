@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -49,6 +50,16 @@ var (
 	nativeAgentbusBuildPath string
 	nativeAgentbusBuildErr  error
 )
+
+type countingQuiescenceIssuer struct {
+	inner AttestationIssuer
+	count atomic.Int32
+}
+
+func (issuer *countingQuiescenceIssuer) AttestQuiescence(quiescence PhysicalQuiescence) (VerifiedQuiescence, error) {
+	issuer.count.Add(1)
+	return issuer.inner.AttestQuiescence(quiescence)
+}
 
 func requireRealNativeContainmentOrSkip(t *testing.T) {
 	t.Helper()
@@ -238,7 +249,7 @@ func TestNativeWaitIgnoresCallerClosedStreamsAndSharesFinalizedOutcome(t *testin
 	}
 	canceled, cancelContain := context.WithCancel(context.Background())
 	cancelContain()
-	if got := running.ContainAndVerify(canceled); got != cached {
+	if got := running.ContainPhysical(canceled); got != cached {
 		t.Fatalf("ContainAndVerify(canceled) after Wait = %+v, want cached %+v", got, cached)
 	}
 }
@@ -264,7 +275,7 @@ func TestNativeContainAndVerifyKillsTermIgnoringGrandchild(t *testing.T) {
 		t.Fatalf("grandchild pgid = %d, want target group %d", result.GrandchildPGID, running.Ref().PGID)
 	}
 
-	outcome := running.ContainAndVerify(ctx)
+	outcome := running.ContainPhysical(ctx)
 	if !outcome.Absent() {
 		onlyLeader, onlyLeaderErr := groupHasNoMembersExceptLeader(running.Ref())
 		t.Fatalf("ContainAndVerify() = %+v, want Absent; unreaped=%t onlyLeader=%t onlyLeaderErr=%v members=%s", outcome, running.leader.unreapedFor(running.Ref()), onlyLeader, onlyLeaderErr, debugGroupMembers(running.Ref()))
@@ -297,7 +308,7 @@ func TestNativeContainAndVerifyIgnoresCallerClosedStreamsAndSharesFinalizedOutco
 	}
 	closeNativeExposedStreamsForTest(t, running)
 
-	outcome := running.ContainAndVerify(ctx)
+	outcome := running.ContainPhysical(ctx)
 	if !outcome.Absent() {
 		t.Fatalf("ContainAndVerify() = %+v, want Absent after caller-closed streams", outcome)
 	}
@@ -309,7 +320,7 @@ func TestNativeContainAndVerifyIgnoresCallerClosedStreamsAndSharesFinalizedOutco
 	}
 	canceled, cancelContain := context.WithCancel(context.Background())
 	cancelContain()
-	if got := running.ContainAndVerify(canceled); got != outcome {
+	if got := running.ContainPhysical(canceled); got != outcome {
 		t.Fatalf("ContainAndVerify(canceled) after finalization = %+v, want cached %+v", got, outcome)
 	}
 	waitGroupAbsent(t, running.Ref(), 5*time.Second)
@@ -347,7 +358,7 @@ func TestNativeZombieOnlyGroupIsUnprovableUntilOwnerReaps(t *testing.T) {
 	if outcome.Reason != containment.ReasonAbsenceDeadlineExceeded {
 		t.Fatalf("containPhysical zombie-only reason = %s, want %s", outcome.Reason, containment.ReasonAbsenceDeadlineExceeded)
 	}
-	final := running.ContainAndVerify(ctx)
+	final := running.ContainPhysical(ctx)
 	if !final.Absent() {
 		t.Fatalf("ContainAndVerify() after owner reap = %+v, want Absent", final)
 	}
@@ -359,6 +370,9 @@ func TestNativeWaitAndContainShareSerializedFinalization(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	native := newNativeCustodianForTest(t, defaultNativeTestParams())
+	issuer, verifier := NewAttestationChannel()
+	counting := &countingQuiescenceIssuer{inner: issuer}
+	native.issuer = counting
 	spec, resultPath := nativeTermGrandchildLaunchSpec(t)
 
 	running, err := native.Launch(ctx, spec)
@@ -379,29 +393,51 @@ func TestNativeWaitAndContainShareSerializedFinalization(t *testing.T) {
 	}
 
 	waitDone := make(chan command.ExitObservation, 1)
+	waitVerified := make(chan VerifiedQuiescence, 1)
 	waitErr := make(chan error, 1)
 	go func() {
 		waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer waitCancel()
-		exit, err := running.Wait(waitCtx)
+		exit, verified, err := running.WaitAndVerify(waitCtx)
 		waitDone <- exit
+		waitVerified <- verified
 		waitErr <- err
 	}()
 	time.Sleep(50 * time.Millisecond)
 	if running.handle.LeaderReaped() {
 		t.Fatal("Wait reaped leader while residual group members remained")
 	}
-	outcome := running.ContainAndVerify(ctx)
-	if !outcome.Absent() {
-		t.Fatalf("ContainAndVerify() = %+v, want Absent", outcome)
+	verified, err := running.ContainAndVerify(ctx, QuiescenceCauseContain)
+	if err != nil {
+		t.Fatalf("ContainAndVerify() error = %v", err)
+	}
+	payload, err := verifier.VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatalf("ContainAndVerify() verifier error = %v", err)
+	}
+	if !payload.Group.Equal(running.Ref()) || payload.Method != model.QuiescenceTermKill {
+		t.Fatalf("ContainAndVerify() payload = %+v, want term_kill for %+v", payload, running.Ref())
+	}
+	if !running.finalOutcome.Absent() {
+		t.Fatalf("final physical outcome = %+v, want Absent", running.finalOutcome)
 	}
 	exit := <-waitDone
+	waitPayload, err := verifier.VerifyQuiescence(<-waitVerified)
+	if err != nil {
+		t.Fatalf("WaitAndVerify() verifier error = %v", err)
+	}
+	if !waitPayload.Group.Equal(running.Ref()) || waitPayload.Method != model.QuiescenceTermKill {
+		t.Fatalf("WaitAndVerify() payload = %+v, want term_kill for %+v", waitPayload, running.Ref())
+	}
 	err = <-waitErr
 	if exit.Signal == "" && !exit.Exited {
 		t.Fatalf("Wait exit observation = %+v, want cached leader exit", exit)
 	}
 	if err != nil {
 		t.Fatalf("Wait() error = %v, want nil for TERM-handled helper", err)
+	}
+	if got := counting.count.Load(); got != 1 {
+		t.Fatalf("AttestQuiescence calls = %d, want 1", got)
 	}
 	waitGroupAbsent(t, running.Ref(), 5*time.Second)
 }
@@ -438,7 +474,7 @@ func TestNativeContainAndVerifyUnprovableWhenLeaderReapedOutOfBand(t *testing.T)
 	if !exit.Exited {
 		t.Fatalf("leader exit observation = %+v, want exited", exit)
 	}
-	outcome := running.ContainAndVerify(ctx)
+	outcome := running.ContainPhysical(ctx)
 	if !outcome.Unprovable() {
 		t.Fatalf("ContainAndVerify() = %+v, want Unprovable after reaping leader", outcome)
 	}
@@ -476,7 +512,7 @@ func TestNativeMonitorDaemonEOFContainsTermIgnoringGrandchild(t *testing.T) {
 	}
 	_ = running.handle.Monitor.Wait()
 	waitPIDAbsent(t, result.GrandchildPID, 5*time.Second)
-	final := running.ContainAndVerify(ctx)
+	final := running.ContainPhysical(ctx)
 	if !final.Absent() {
 		t.Fatalf("final ContainAndVerify() = %+v, want Absent after monitor containment", final)
 	}
@@ -641,7 +677,7 @@ func TestNativeCanceledWaitsDoNotLeakReapers(t *testing.T) {
 	if after > before+5 {
 		t.Fatalf("goroutines before=%d after=%d, want no repeated wait leak", before, after)
 	}
-	outcome := running.ContainAndVerify(ctx)
+	outcome := running.ContainPhysical(ctx)
 	if !outcome.Absent() {
 		t.Fatalf("ContainAndVerify() = %+v, want Absent after canceled waits", outcome)
 	}
@@ -665,7 +701,7 @@ func TestNativeContainAndVerifyUnprovableWhenBoundsExpire(t *testing.T) {
 
 	containCtx, containCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer containCancel()
-	outcome := running.ContainAndVerify(containCtx)
+	outcome := running.ContainPhysical(containCtx)
 	if !outcome.Unprovable() {
 		t.Fatalf("ContainAndVerify() = %+v, want Unprovable when bounds expire", outcome)
 	}
@@ -674,12 +710,191 @@ func TestNativeContainAndVerifyUnprovableWhenBoundsExpire(t *testing.T) {
 	}
 }
 
+func TestAttestationBridgeMintsOnlyFromProvenAbsentPhysicalOutcome(t *testing.T) {
+	issuer, verifier := NewAttestationChannel()
+	quiescence := testPhysicalQuiescence()
+	outcome := PhysicalOutcome{
+		Kind:     PhysicalOutcomeAbsent,
+		Group:    quiescence.Group,
+		Method:   model.QuiescenceTermKill,
+		Decision: model.SignalDirectly,
+	}
+
+	verified, err := attestPhysicalOutcome(issuer, outcome)
+	if err != nil {
+		t.Fatalf("attestPhysicalOutcome(absent) error = %v", err)
+	}
+	payload, err := verifier.VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatalf("paired VerifyQuiescence() error = %v", err)
+	}
+	if !payload.Group.Equal(outcome.Group) || payload.Method != outcome.Method {
+		t.Fatalf("verified payload = %+v, want group=%+v method=%s", payload, outcome.Group, outcome.Method)
+	}
+	_, differentVerifier := NewAttestationChannel()
+	if _, err := differentVerifier.VerifyQuiescence(verified); !errors.Is(err, ErrInvalidAttestation) {
+		t.Fatalf("different-channel VerifyQuiescence() error = %v, want ErrInvalidAttestation", err)
+	}
+
+	physicalErr := errors.New("physical proof unavailable")
+	unprovable := PhysicalOutcome{
+		Kind:     PhysicalOutcomeUnprovable,
+		Group:    quiescence.Group,
+		Reason:   containment.ReasonProbeUnprovable,
+		Decision: model.Unprovable,
+		Err:      physicalErr,
+	}
+	unverified, err := attestPhysicalOutcome(issuer, unprovable)
+	if !errors.Is(err, physicalErr) {
+		t.Fatalf("attestPhysicalOutcome(unprovable) error = %v, want physical error", err)
+	}
+	if unverified != (VerifiedQuiescence{}) {
+		t.Fatalf("attestPhysicalOutcome(unprovable) returned attestation %+v, want zero", unverified)
+	}
+	if _, err := verifier.VerifyQuiescence(unverified); !errors.Is(err, ErrInvalidAttestation) {
+		t.Fatalf("VerifyQuiescence(unprovable result) error = %v, want ErrInvalidAttestation", err)
+	}
+}
+
+func TestFinalAttestationSerializedOnce(t *testing.T) {
+	issuer, verifier := NewAttestationChannel()
+	counting := &countingQuiescenceIssuer{inner: issuer}
+	quiescence := testPhysicalQuiescence()
+	process := &NativeRunningProcess{
+		custodian: &NativeCustodian{issuer: counting},
+		finalized: true,
+		finalOutcome: PhysicalOutcome{
+			Kind:     PhysicalOutcomeAbsent,
+			Group:    quiescence.Group,
+			Method:   model.QuiescenceAlreadyAbsent,
+			Decision: model.AlreadyAbsent,
+		},
+	}
+
+	const callers = 32
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			process.lifecycleMu.Lock()
+			verified, err := process.finalAttestationLocked()
+			process.lifecycleMu.Unlock()
+			if err != nil {
+				errs <- err
+				return
+			}
+			payload, err := verifier.VerifyQuiescence(verified)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !payload.Group.Equal(quiescence.Group) || payload.Method != model.QuiescenceAlreadyAbsent {
+				errs <- fmt.Errorf("payload = %+v", payload)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := counting.count.Load(); got != 1 {
+		t.Fatalf("AttestQuiescence calls = %d, want 1", got)
+	}
+}
+
+func TestCustodianContainAndVerifyUsesFinalizedCacheAfterRunningEviction(t *testing.T) {
+	issuer, verifier := NewAttestationChannel()
+	counting := &countingQuiescenceIssuer{inner: issuer}
+	quiescence := testPhysicalQuiescence()
+	native := &NativeCustodian{
+		issuer:    counting,
+		running:   make(map[string]*NativeRunningProcess),
+		finalized: make(map[string]*NativeRunningProcess),
+	}
+	process := &NativeRunningProcess{
+		custodian: native,
+		group:     quiescence.Group,
+	}
+	native.running[groupKey(quiescence.Group)] = process
+	finalOutcome := PhysicalOutcome{
+		Kind:     PhysicalOutcomeAbsent,
+		Group:    quiescence.Group,
+		Method:   model.QuiescenceTermKill,
+		Decision: model.SignalDirectly,
+	}
+
+	process.lifecycleMu.Lock()
+	cached, err := process.cacheFinalLocked(context.Background(), finalOutcome, command.ExitObservation{}, nil)
+	if err != nil {
+		process.lifecycleMu.Unlock()
+		t.Fatalf("cacheFinalLocked() error = %v", err)
+	}
+	first, err := process.finalAttestationLocked()
+	process.lifecycleMu.Unlock()
+	if err != nil {
+		t.Fatalf("finalAttestationLocked() error = %v", err)
+	}
+	if cached != finalOutcome {
+		t.Fatalf("cached outcome = %+v, want %+v", cached, finalOutcome)
+	}
+	if native.lookup(quiescence.Group) != nil {
+		t.Fatal("running lookup returned process after finalization, want eviction")
+	}
+
+	second, err := native.ContainAndVerify(context.Background(), quiescence.Group, QuiescenceCauseContain)
+	if err != nil {
+		t.Fatalf("custodian ContainAndVerify() error = %v", err)
+	}
+	if second != first {
+		t.Fatalf("custodian ContainAndVerify() attestation = %+v, want cached %+v", second, first)
+	}
+	payload, err := verifier.VerifyQuiescence(second)
+	if err != nil {
+		t.Fatalf("VerifyQuiescence() error = %v", err)
+	}
+	if !payload.Group.Equal(quiescence.Group) || payload.Method != model.QuiescenceTermKill {
+		t.Fatalf("payload = %+v, want group=%+v method=%s", payload, quiescence.Group, model.QuiescenceTermKill)
+	}
+	if got := counting.count.Load(); got != 1 {
+		t.Fatalf("AttestQuiescence calls = %d, want 1", got)
+	}
+}
+
+func TestNativeCgroupProbeHelperWaitRequiresSIGKILL(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	early, err := startNativeCgroupProbeHelperCommand(ctx, "/bin/sh", "-c", "exit 7")
+	if err != nil {
+		t.Fatalf("start early helper: %v", err)
+	}
+	defer early.cleanup()
+	if err := early.wait(ctx, 2*time.Second); err == nil || !strings.Contains(err.Error(), "want signal") {
+		t.Fatalf("early helper wait error = %v, want signal requirement", err)
+	}
+
+	killed, err := startNativeCgroupProbeHelperCommand(ctx, "/bin/sleep", "30")
+	if err != nil {
+		t.Fatalf("start killed helper: %v", err)
+	}
+	defer killed.cleanup()
+	if err := syscall.Kill(killed.pid(), syscall.SIGKILL); err != nil {
+		t.Fatalf("kill helper: %v", err)
+	}
+	if err := killed.wait(ctx, 2*time.Second); err != nil {
+		t.Fatalf("killed helper wait error = %v, want nil", err)
+	}
+}
+
 func TestNativeCustodianDoesNotMintProofAndProductionUnavailable(t *testing.T) {
 	nativeType := fmt.Sprintf("%T", PhysicalOutcome{})
 	if strings.Contains(nativeType, "VerifiedQuiescence") {
 		t.Fatalf("physical outcome type = %s, must not be VerifiedQuiescence", nativeType)
 	}
-	assertNativeSourceDoesNotMintProof(t)
 
 	runtime := NewUnavailableRuntime(ErrSupervisorUnavailable)
 	if _, ok := runtime.Process().(UnavailableCustodian); !ok {
@@ -688,33 +903,70 @@ func TestNativeCustodianDoesNotMintProofAndProductionUnavailable(t *testing.T) {
 	if runtime.Support().VerifiedContainment || runtime.Support().AdvertisedAvailable() {
 		t.Fatalf("production runtime support = %+v, want unavailable", runtime.Support())
 	}
+	verified, err := runtime.Process().ContainAndVerify(context.Background(), testPhysicalQuiescence().Group, QuiescenceCauseContain)
+	if !errors.Is(err, ErrSupervisorUnavailable) {
+		t.Fatalf("production ContainAndVerify() error = %v, want ErrSupervisorUnavailable", err)
+	}
+	if verified != (VerifiedQuiescence{}) {
+		t.Fatalf("production ContainAndVerify() verified = %+v, want zero", verified)
+	}
+	if _, err := runtime.Verifier().VerifyQuiescence(verified); !errors.Is(err, ErrInvalidAttestation) {
+		t.Fatalf("production VerifyQuiescence() error = %v, want ErrInvalidAttestation", err)
+	}
 }
 
 func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing.T) {
-	if runtime.GOOS == "linux" {
-		t.Skip("probe cgroup self-test deferred to S3B-B")
+	if runtime.GOOS == "linux" && os.Getenv(nativeCgroupConformanceEnv) != "1" {
+		t.Skip("set AGENTBUS_CGROUP_CONFORMANCE=1 to run the real Linux cgroup native runtime probe")
 	}
 	requireRealNativeContainmentOrSkip(t)
 	exe := nativeTestBinaryPath(t)
-	native, support, err := NewNativeRuntime(NativeOptions{
+	options := NativeOptions{
 		AgentbusPath:      builtNativeAgentbusPath(t),
 		MonitorCommand:    nativeMonitorCommand(t),
 		ContainmentParams: defaultNativeTestParams(),
 		WorkerEnv:         append(os.Environ(), nativeHelperAgentbusGOCACHE, nativeHelperAgentbusMOD),
 		WorkerDir:         filepath.Dir(exe),
-	})
-	cleanupNativeCustodianForTest(t, native)
+	}
+
+	// Single-shot: the real cgroup self-test probe must pass on the first attempt.
+	// A fail-closed probe result (RuntimeProbePassed=false) surfaces loudly with its
+	// reason rather than being masked by retry; any rare transient must be
+	// root-caused (tracked: L3c real-cgroup transient investigation).
+	runtimeBundle, err := NewNativeRuntime(options)
+	support := runtimeBundle.Support()
+	if !support.RuntimeProbePassed || !support.VerifiedContainment || support.RuntimeProbeResult != nil {
+		t.Fatalf("native runtime support = %+v, want passed containment probe; NewNativeRuntime error = %v", support, err)
+	}
 	if err != nil {
 		t.Fatalf("NewNativeRuntime() error = %v", err)
 	}
-	if native == nil {
-		t.Fatal("NewNativeRuntime() native custodian is nil")
+	native, ok := runtimeBundle.Process().(*NativeCustodian)
+	if ok {
+		cleanupNativeCustodianForTest(t, native)
 	}
-	if !support.RuntimeProbePassed || !support.VerifiedContainment || support.RuntimeProbeResult != nil {
-		t.Fatalf("native runtime support = %+v, want passed containment probe", support)
+	if !ok || native == nil {
+		t.Fatalf("NewNativeRuntime() process = %T, want *NativeCustodian", runtimeBundle.Process())
 	}
 	if support.FeatureConfigured || support.FeatureAdvertised || support.AdvertisedAvailable() {
 		t.Fatalf("native runtime support = %+v, want capability off/not advertised", support)
+	}
+	quiescence := testPhysicalQuiescence()
+	verified, err := attestPhysicalOutcome(native.issuer, PhysicalOutcome{
+		Kind:     PhysicalOutcomeAbsent,
+		Group:    quiescence.Group,
+		Method:   model.QuiescenceAlreadyAbsent,
+		Decision: model.AlreadyAbsent,
+	})
+	if err != nil {
+		t.Fatalf("native runtime issuer attest error = %v", err)
+	}
+	payload, err := runtimeBundle.Verifier().VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatalf("native runtime verifier error = %v", err)
+	}
+	if !payload.Group.Equal(quiescence.Group) || payload.Method != model.QuiescenceAlreadyAbsent {
+		t.Fatalf("native runtime verified payload = %+v, want %+v", payload, quiescence)
 	}
 }
 
@@ -1346,35 +1598,6 @@ func waitLeaderNotMatching(t *testing.T, group model.GroupRef, timeout time.Dura
 			t.Fatalf("leader pid %d still matches after %s", group.Leader.PID, timeout)
 		}
 		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-func assertNativeSourceDoesNotMintProof(t *testing.T) {
-	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	dir := filepath.Dir(file)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasPrefix(name, "native") || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		text := string(raw)
-		for _, forbidden := range []string{"AttestQuiescence(", "VerifiedQuiescence", "QuiescenceCertificate"} {
-			if strings.Contains(text, forbidden) {
-				t.Fatalf("%s contains proof minting token %q", name, forbidden)
-			}
-		}
 	}
 }
 

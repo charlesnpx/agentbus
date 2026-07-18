@@ -30,6 +30,7 @@ import (
 var (
 	ErrNativeCustodianUnavailable = errors.New("native custodian unavailable")
 	ErrPhysicalContainment        = errors.New("physical containment failed")
+	ErrNativePreparedBoundary     = errors.New("native prepared custody requires launch-controller wiring")
 )
 
 type PhysicalOutcomeKind string
@@ -59,6 +60,10 @@ func (outcome PhysicalOutcome) Unprovable() bool {
 	return outcome.Kind == PhysicalOutcomeUnprovable
 }
 
+type quiescenceAttestationIssuer interface {
+	AttestQuiescence(PhysicalQuiescence) (VerifiedQuiescence, error)
+}
+
 type NativeOptions struct {
 	AgentbusPath      string
 	MonitorCommand    parklaunch.CommandSpec
@@ -80,10 +85,12 @@ type NativeLaunchSpec struct {
 
 type NativeCustodian struct {
 	options NativeOptions
+	issuer  quiescenceAttestationIssuer
 
-	mu      sync.Mutex
-	running map[string]*NativeRunningProcess
-	closed  bool
+	mu        sync.Mutex
+	running   map[string]*NativeRunningProcess
+	finalized map[string]*NativeRunningProcess
+	closed    bool
 
 	retainedMu    sync.Mutex
 	retainedGroup containment.RetainedGroupObject
@@ -107,16 +114,18 @@ func NewNativeCustodian(options NativeOptions) (*NativeCustodian, error) {
 		return nil, err
 	}
 	return &NativeCustodian{
-		options: options,
-		running: make(map[string]*NativeRunningProcess),
+		options:   options,
+		running:   make(map[string]*NativeRunningProcess),
+		finalized: make(map[string]*NativeRunningProcess),
 	}, nil
 }
 
-// NewNativeRuntime exposes only the physical S3B-A custodian plus support
-// state. It intentionally does not return a Runtime verifier bundle or any
-// proof issuer; S3B-B owns proof minting.
-func NewNativeRuntime(options NativeOptions) (*NativeCustodian, Support, error) {
+func NewNativeRuntime(options NativeOptions) (Runtime, error) {
+	issuer, verifier := NewAttestationChannel()
 	native, err := NewNativeCustodian(options)
+	if native != nil {
+		native.issuer = issuer
+	}
 	probeErr := err
 	if probeErr == nil {
 		probeErr = probeNativeRuntime(options)
@@ -136,9 +145,28 @@ func NewNativeRuntime(options NativeOptions) (*NativeCustodian, Support, error) 
 		support.RuntimeProbeResult = nil
 	}
 	if _, supportErr := NewSupport(support); supportErr != nil {
-		return nil, Support{}, supportErr
+		if native != nil {
+			_ = native.Close()
+		}
+		return Runtime{}, supportErr
 	}
-	return native, support, probeErr
+	process := ProcessCustodian(UnavailableCustodian{})
+	if probeErr == nil {
+		process = native
+	} else if native != nil {
+		_ = native.Close()
+	}
+	return Runtime{
+		process:  process,
+		verifier: verifier,
+		support:  support,
+	}, probeErr
+}
+
+func (custodian *NativeCustodian) processCustodian() {}
+
+func (custodian *NativeCustodian) Prepare(context.Context, command.ExecSpec, model.LaunchKey) (PreparedProcess, error) {
+	return nil, fmt.Errorf("%w: Prepare/Release is owned by S4 launch-controller wiring", ErrNativePreparedBoundary)
 }
 
 func (custodian *NativeCustodian) Launch(ctx context.Context, spec NativeLaunchSpec) (*NativeRunningProcess, error) {
@@ -201,7 +229,12 @@ func (custodian *NativeCustodian) Launch(ctx context.Context, spec NativeLaunchS
 		cleanupErr := cleanupLaunchedHandle(ctx, handle, custodian.options.ContainmentParams)
 		return nil, errors.Join(fmt.Errorf("%w: custodian is closed", ErrNativeCustodianUnavailable), cleanupErr, backend.close(ctx))
 	}
-	custodian.running[groupKey(handle.GroupRef)] = running
+	key := groupKey(handle.GroupRef)
+	if custodian.running == nil {
+		custodian.running = make(map[string]*NativeRunningProcess)
+	}
+	delete(custodian.finalized, key)
+	custodian.running[key] = running
 	custodian.mu.Unlock()
 	return running, nil
 }
@@ -258,7 +291,7 @@ func (custodian *NativeCustodian) sharedRetainedGroup(factory func() (containmen
 	return manager, nil
 }
 
-func (custodian *NativeCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef) PhysicalOutcome {
+func (custodian *NativeCustodian) ContainPhysical(ctx context.Context, group model.GroupRef) PhysicalOutcome {
 	if custodian == nil {
 		return unprovablePhysical(group, containment.ReasonInvalidInput, "", fmt.Errorf("%w: custodian is nil", ErrNativeCustodianUnavailable))
 	}
@@ -272,7 +305,33 @@ func (custodian *NativeCustodian) ContainAndVerify(ctx context.Context, group mo
 	if running != nil {
 		return running.containAndVerify(ctx)
 	}
+	finalized := custodian.lookupFinalized(group)
+	if finalized != nil {
+		return finalized.containAndVerify(ctx)
+	}
 	return containPhysical(ctx, group, custodian.options.ContainmentParams, nil, nil)
+}
+
+func (custodian *NativeCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, error) {
+	_ = cause
+	if custodian == nil {
+		return VerifiedQuiescence{}, fmt.Errorf("%w: custodian is nil", ErrNativeCustodianUnavailable)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := group.Validate(); err != nil {
+		return VerifiedQuiescence{}, err
+	}
+	running := custodian.lookup(group)
+	if running != nil {
+		return running.ContainAndVerify(ctx, cause)
+	}
+	finalized := custodian.lookupFinalized(group)
+	if finalized != nil {
+		return finalized.ContainAndVerify(ctx, cause)
+	}
+	return attestPhysicalOutcome(custodian.issuer, containPhysical(ctx, group, custodian.options.ContainmentParams, nil, nil))
 }
 
 func (custodian *NativeCustodian) lookup(group model.GroupRef) *NativeRunningProcess {
@@ -285,10 +344,36 @@ func (custodian *NativeCustodian) lookup(group model.GroupRef) *NativeRunningPro
 	return running
 }
 
+func (custodian *NativeCustodian) lookupFinalized(group model.GroupRef) *NativeRunningProcess {
+	custodian.mu.Lock()
+	defer custodian.mu.Unlock()
+	finalized := custodian.finalized[groupKey(group)]
+	if finalized == nil || !finalized.group.Equal(group) {
+		return nil
+	}
+	return finalized
+}
+
 func (custodian *NativeCustodian) forget(group model.GroupRef) {
 	custodian.mu.Lock()
 	defer custodian.mu.Unlock()
 	delete(custodian.running, groupKey(group))
+}
+
+func (custodian *NativeCustodian) cacheFinalized(process *NativeRunningProcess) {
+	if custodian == nil || process == nil {
+		return
+	}
+	custodian.mu.Lock()
+	defer custodian.mu.Unlock()
+	key := groupKey(process.group)
+	if custodian.finalized == nil {
+		custodian.finalized = make(map[string]*NativeRunningProcess)
+	}
+	custodian.finalized[key] = process
+	if custodian.running[key] == process {
+		delete(custodian.running, key)
+	}
 }
 
 func (custodian *NativeCustodian) parklaunchSpec(spec NativeLaunchSpec, launchContainment parklaunch.Containment, backend nativeContainmentBackend, syncLaunchContainment func()) (parklaunch.Spec, error) {
@@ -355,6 +440,10 @@ func validateNativeOptions(options NativeOptions) error {
 }
 
 func probeNativeRuntime(options NativeOptions) error {
+	return probeNativeRuntimePlatform(options)
+}
+
+func probeNativeLeaderContainment(options NativeOptions) error {
 	if err := probeNativeLeaderPlatform(); err != nil {
 		return fmt.Errorf("%w: leader continuity probe: %v", ErrNativeCustodianUnavailable, err)
 	}
@@ -520,7 +609,13 @@ type NativeRunningProcess struct {
 	finalExit    command.ExitObservation
 	finalWaitErr error
 	finalErr     error
+
+	finalAttestationAttempted bool
+	finalAttestation          VerifiedQuiescence
+	finalAttestationErr       error
 }
+
+func (process *NativeRunningProcess) runningProcess() {}
 
 func (process *NativeRunningProcess) Ref() model.GroupRef {
 	if process == nil {
@@ -648,6 +743,21 @@ func (process *NativeRunningProcess) Wait(ctx context.Context) (command.ExitObse
 	}
 }
 
+func (process *NativeRunningProcess) WaitAndVerify(ctx context.Context) (command.ExitObservation, VerifiedQuiescence, error) {
+	if process == nil {
+		return command.ExitObservation{}, VerifiedQuiescence{}, fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable)
+	}
+	exit, waitErr := process.Wait(ctx)
+	process.lifecycleMu.Lock()
+	if !process.finalized {
+		process.lifecycleMu.Unlock()
+		return exit, VerifiedQuiescence{}, waitErr
+	}
+	verified, attestErr := process.finalAttestationLocked()
+	process.lifecycleMu.Unlock()
+	return exit, verified, errors.Join(waitErr, attestErr)
+}
+
 func (process *NativeRunningProcess) finalizedWaitResultLocked() (command.ExitObservation, error) {
 	return process.finalExit, errors.Join(process.finalWaitErr, process.finalErr)
 }
@@ -661,11 +771,28 @@ func (process *NativeRunningProcess) finalizedWaitResultOrError(err error) (comm
 	return command.ExitObservation{}, err
 }
 
-func (process *NativeRunningProcess) ContainAndVerify(ctx context.Context) PhysicalOutcome {
+func (process *NativeRunningProcess) ContainPhysical(ctx context.Context) PhysicalOutcome {
 	if process == nil || process.custodian == nil {
 		return unprovablePhysical(model.GroupRef{}, containment.ReasonInvalidInput, "", fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable))
 	}
 	return process.containAndVerify(ctx)
+}
+
+func (process *NativeRunningProcess) ContainAndVerify(ctx context.Context, cause QuiescenceCause) (VerifiedQuiescence, error) {
+	_ = cause
+	if process == nil || process.custodian == nil {
+		return VerifiedQuiescence{}, fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable)
+	}
+	outcome := process.containAndVerify(ctx)
+	if !outcome.Absent() {
+		return VerifiedQuiescence{}, physicalOutcomeError(outcome)
+	}
+	process.lifecycleMu.Lock()
+	defer process.lifecycleMu.Unlock()
+	if process.finalized {
+		return process.finalAttestationLocked()
+	}
+	return attestPhysicalOutcome(process.custodian.issuer, outcome)
 }
 
 func (process *NativeRunningProcess) containAndVerify(ctx context.Context) PhysicalOutcome {
@@ -916,15 +1043,31 @@ func (process *NativeRunningProcess) cacheFinalLocked(ctx context.Context, outco
 	if process.containment != nil {
 		cleanupErr = errors.Join(cleanupErr, process.containment.close(ctx))
 	}
-	if process.custodian != nil {
-		process.custodian.forget(process.group)
-	}
 	process.finalized = true
 	process.finalOutcome = outcome
 	process.finalExit = exit
 	process.finalWaitErr = waitErr
 	process.finalErr = cleanupErr
+	if process.custodian != nil {
+		process.custodian.cacheFinalized(process)
+	}
 	return outcome, cleanupErr
+}
+
+func (process *NativeRunningProcess) finalAttestationLocked() (VerifiedQuiescence, error) {
+	if process == nil || !process.finalized {
+		return VerifiedQuiescence{}, fmt.Errorf("%w: process has no final physical outcome", ErrNativeCustodianUnavailable)
+	}
+	if process.finalAttestationAttempted {
+		return process.finalAttestation, process.finalAttestationErr
+	}
+	process.finalAttestationAttempted = true
+	if process.custodian == nil {
+		process.finalAttestationErr = fmt.Errorf("%w: running process has no custodian", ErrNativeCustodianUnavailable)
+		return process.finalAttestation, process.finalAttestationErr
+	}
+	process.finalAttestation, process.finalAttestationErr = attestPhysicalOutcome(process.custodian.issuer, process.finalOutcome)
+	return process.finalAttestation, process.finalAttestationErr
 }
 
 type RealContainment struct {
@@ -981,6 +1124,14 @@ func (native *nativeLaunchContainment) Contain(ctx context.Context, group model.
 }
 
 func containPhysical(ctx context.Context, group model.GroupRef, params containment.Params, witness containment.ContinuityWitness, retainedObject containment.RetainedGroupObject) PhysicalOutcome {
+	var retainedSignals *retainedSignalRecorder
+	if retainedObject != nil {
+		retainedSignals = &retainedSignalRecorder{}
+		retainedObject = retainedSignalTrackingObject{
+			inner:    retainedObject,
+			recorder: retainedSignals,
+		}
+	}
 	engine := containment.Engine{
 		Observer:       nativeObserverFor(witness),
 		Signaler:       nativeSignalerFor(witness),
@@ -1003,10 +1154,14 @@ func containPhysical(ctx context.Context, group model.GroupRef, params containme
 		return unprovablePhysical(group, containment.ReasonInvalidInput, outcome.Decision, err)
 	}
 	if requiresRetained {
+		method := methodForDecision(outcome.Decision)
+		if retainedSignals.termKillDelivered() {
+			method = model.QuiescenceTermKill
+		}
 		return PhysicalOutcome{
 			Kind:     PhysicalOutcomeAbsent,
 			Group:    group,
-			Method:   methodForDecision(outcome.Decision),
+			Method:   method,
 			Decision: outcome.Decision,
 		}
 	}
@@ -1023,6 +1178,84 @@ func containPhysical(ctx context.Context, group model.GroupRef, params containme
 		Method:   methodForDecision(outcome.Decision),
 		Decision: outcome.Decision,
 	}
+}
+
+type retainedSignalRecorder struct {
+	mu            sync.Mutex
+	termDelivered bool
+	killDelivered bool
+}
+
+func (recorder *retainedSignalRecorder) recordTerm(result containment.SignalResult, err error) {
+	if recorder == nil || err != nil || result != containment.SignalDelivered {
+		return
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	recorder.termDelivered = true
+}
+
+func (recorder *retainedSignalRecorder) recordKill(result containment.SignalResult, err error) {
+	if recorder == nil || err != nil || result != containment.SignalDelivered {
+		return
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	recorder.killDelivered = true
+}
+
+func (recorder *retainedSignalRecorder) termKillDelivered() bool {
+	if recorder == nil {
+		return false
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	return recorder.termDelivered && recorder.killDelivered
+}
+
+type retainedSignalTrackingObject struct {
+	inner    containment.RetainedGroupObject
+	recorder *retainedSignalRecorder
+}
+
+func (object retainedSignalTrackingObject) AcquireRetainedGroup(ctx context.Context, target model.GroupRef, acquiredAt time.Time) (containment.RetainedGroupCapability, error) {
+	if object.inner == nil {
+		return nil, fmt.Errorf("%w: retained object is nil", ErrNativeCustodianUnavailable)
+	}
+	capability, err := object.inner.AcquireRetainedGroup(ctx, target, acquiredAt)
+	if err != nil {
+		return nil, err
+	}
+	if capability == nil {
+		return nil, nil
+	}
+	return retainedSignalTrackingCapability{
+		RetainedGroupCapability: capability,
+		recorder:                object.recorder,
+	}, nil
+}
+
+type retainedSignalTrackingCapability struct {
+	containment.RetainedGroupCapability
+	recorder *retainedSignalRecorder
+}
+
+func (capability retainedSignalTrackingCapability) SignalTerm(ctx context.Context) (containment.SignalResult, error) {
+	if capability.RetainedGroupCapability == nil {
+		return containment.SignalUnprovable, fmt.Errorf("%w: retained capability is nil", ErrNativeCustodianUnavailable)
+	}
+	result, err := capability.RetainedGroupCapability.SignalTerm(ctx)
+	capability.recorder.recordTerm(result, err)
+	return result, err
+}
+
+func (capability retainedSignalTrackingCapability) Kill(ctx context.Context) (containment.SignalResult, error) {
+	if capability.RetainedGroupCapability == nil {
+		return containment.SignalUnprovable, fmt.Errorf("%w: retained capability is nil", ErrNativeCustodianUnavailable)
+	}
+	result, err := capability.RetainedGroupCapability.Kill(ctx)
+	capability.recorder.recordKill(result, err)
+	return result, err
 }
 
 func nativeObserverFor(witness containment.ContinuityWitness) containment.Observer {
@@ -1119,6 +1352,32 @@ func methodForDecision(decision model.ContainmentDecision) model.QuiescenceMetho
 		return model.QuiescenceAlreadyAbsent
 	}
 	return model.QuiescenceTermKill
+}
+
+func attestPhysicalOutcome(issuer quiescenceAttestationIssuer, outcome PhysicalOutcome) (VerifiedQuiescence, error) {
+	if !outcome.Absent() {
+		return VerifiedQuiescence{}, physicalOutcomeError(outcome)
+	}
+	if issuer == nil {
+		return VerifiedQuiescence{}, ErrInvalidAttestation
+	}
+	return issuer.AttestQuiescence(PhysicalQuiescence{
+		Group:  outcome.Group,
+		Method: outcome.Method,
+	})
+}
+
+func physicalOutcomeError(outcome PhysicalOutcome) error {
+	if outcome.Err != nil {
+		return outcome.Err
+	}
+	if outcome.Kind == "" {
+		return fmt.Errorf("%w: missing physical outcome", ErrPhysicalContainment)
+	}
+	if outcome.Reason != "" {
+		return fmt.Errorf("%w: outcome=%s reason=%s", ErrPhysicalContainment, outcome.Kind, outcome.Reason)
+	}
+	return fmt.Errorf("%w: outcome=%s", ErrPhysicalContainment, outcome.Kind)
 }
 
 func unprovablePhysical(group model.GroupRef, reason containment.UnprovableReason, decision model.ContainmentDecision, err error) PhysicalOutcome {

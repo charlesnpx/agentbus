@@ -94,3 +94,7 @@ func platformBindContainmentTarget(_ context.Context, real RealContainment, grou
 	}
 	return RealContainment{Params: real.Params, Witness: retention}, nil
 }
+
+func probeNativeRuntimePlatform(options NativeOptions) error {
+	return probeNativeLeaderContainment(options)
+}
