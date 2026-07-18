@@ -452,8 +452,17 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 		if stdoutLog != nil {
 			stdoutReader = io.TeeReader(stdout, stdoutLog)
 		}
-		parseErr := s.scan(stdoutReader, events)
-		_, waitErr := command.Wait(ctx)
+		parseDone := make(chan error, 1)
+		go func() {
+			parseDone <- s.scan(stdoutReader, events)
+		}()
+		waitDone := make(chan error, 1)
+		go func() {
+			_, err := command.Wait(ctx)
+			waitDone <- err
+		}()
+		parseErr := <-parseDone
+		waitErr := <-waitDone
 		stderrCopyErr := <-stderrDone
 		s.mu.Lock()
 		if s.active == command {

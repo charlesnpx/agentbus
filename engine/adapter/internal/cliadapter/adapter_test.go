@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -197,6 +198,41 @@ func TestSessionTurnInheritedStderrDoesNotHang(t *testing.T) {
 		}
 	}
 	t.Fatalf("events = %#v, want parsed event before inherited stderr closes", got)
+}
+
+func TestSessionTurnStartsWaitBeforeStdoutEOF(t *testing.T) {
+	runner := &waitBeforeStdoutEOFRunner{}
+	backend := &Backend{
+		NameValue: "fake",
+		Binary:    "fake-binary",
+		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
+			return []string{"run"}, nil
+		},
+		Parse: func(map[string]any) ([]engine.Event, string, error) {
+			return []engine.Event{{Type: engine.EventAgentText, Text: "ok"}}, "", nil
+		},
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cliSession := session.(*Session)
+	cliSession.suppressValidationWarning = true
+	events, err := cliSession.TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "go", Timeout: 0}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runner.closeStdout()
+
+	select {
+	case <-runner.waitStarted():
+	case <-time.After(time.Second):
+		t.Fatal("command wait did not start while stdout reader was blocked before EOF")
+	}
+	got := collectEventsWithTimeout(t, events, time.Second)
+	if len(got) != 1 || got[0].Type != engine.EventAgentText || got[0].Text != "ok" {
+		t.Fatalf("events = %#v, want parsed event after wait unblocked stdout", got)
+	}
 }
 
 func TestCopyAndCloseClosesSourceOnWriterFailure(t *testing.T) {
@@ -401,5 +437,99 @@ func (discardWriteCloser) Write(p []byte) (int, error) {
 }
 
 func (discardWriteCloser) Close() error {
+	return nil
+}
+
+type waitBeforeStdoutEOFRunner struct {
+	command *waitBeforeStdoutEOFCommand
+}
+
+func (r *waitBeforeStdoutEOFRunner) Start(_ context.Context, spec command.ExecSpec) (command.RunningCommand, error) {
+	command := &waitBeforeStdoutEOFCommand{
+		stdin:       discardWriteCloser{},
+		stdout:      newBlockingEOFReadCloser(`{"event":"ok"}` + "\n"),
+		stderr:      io.NopCloser(strings.NewReader("")),
+		waitStarted: make(chan struct{}),
+	}
+	r.command = command
+	return command, nil
+}
+
+func (r *waitBeforeStdoutEOFRunner) waitStarted() <-chan struct{} {
+	if r.command == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return r.command.waitStarted
+}
+
+func (r *waitBeforeStdoutEOFRunner) closeStdout() {
+	if r.command != nil {
+		_ = r.command.stdout.Close()
+	}
+}
+
+type waitBeforeStdoutEOFCommand struct {
+	stdin       io.WriteCloser
+	stdout      *blockingEOFReadCloser
+	stderr      io.ReadCloser
+	waitStarted chan struct{}
+	waitOnce    sync.Once
+}
+
+func (c *waitBeforeStdoutEOFCommand) Stdin() io.WriteCloser {
+	return c.stdin
+}
+
+func (c *waitBeforeStdoutEOFCommand) Stdout() io.ReadCloser {
+	return c.stdout
+}
+
+func (c *waitBeforeStdoutEOFCommand) Stderr() io.ReadCloser {
+	return c.stderr
+}
+
+func (c *waitBeforeStdoutEOFCommand) Wait(context.Context) (command.ExitObservation, error) {
+	c.waitOnce.Do(func() { close(c.waitStarted) })
+	_ = c.stdout.Close()
+	return command.ExitObservation{Exited: true, Code: 0}, nil
+}
+
+func (c *waitBeforeStdoutEOFCommand) Interrupt(context.Context) error {
+	_ = c.stdout.Close()
+	return nil
+}
+
+type blockingEOFReadCloser struct {
+	mu        sync.Mutex
+	payload   []byte
+	offset    int
+	unblocked chan struct{}
+	closeOnce sync.Once
+}
+
+func newBlockingEOFReadCloser(payload string) *blockingEOFReadCloser {
+	return &blockingEOFReadCloser{
+		payload:   []byte(payload),
+		unblocked: make(chan struct{}),
+	}
+}
+
+func (r *blockingEOFReadCloser) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	if r.offset < len(r.payload) {
+		n := copy(p, r.payload[r.offset:])
+		r.offset += n
+		r.mu.Unlock()
+		return n, nil
+	}
+	r.mu.Unlock()
+	<-r.unblocked
+	return 0, io.EOF
+}
+
+func (r *blockingEOFReadCloser) Close() error {
+	r.closeOnce.Do(func() { close(r.unblocked) })
 	return nil
 }

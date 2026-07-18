@@ -442,6 +442,56 @@ func TestNativeWaitAndContainShareSerializedFinalization(t *testing.T) {
 	waitGroupAbsent(t, running.Ref(), 5*time.Second)
 }
 
+func TestNativeWaitAndVerifyContainsResidualGroupAfterLeaderExit(t *testing.T) {
+	requireLeaderRetentionModelOrSkip(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	native := newNativeCustodianForTest(t, defaultNativeTestParams())
+	issuer, verifier := NewAttestationChannel()
+	counting := &countingQuiescenceIssuer{inner: issuer}
+	native.issuer = counting
+	spec, resultPath := nativeTermGrandchildLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	waitNativeReadyLine(t, running.Stdout(), "term-grandchild-ready")
+	result := readNativeBackendResult(t, resultPath)
+	if result.GrandchildPGID != running.Ref().PGID {
+		t.Fatalf("grandchild pgid = %d, want target group %d", result.GrandchildPGID, running.Ref().PGID)
+	}
+	if err := unix.Kill(running.Ref().Leader.PID, unix.SIGTERM); err != nil {
+		t.Fatalf("signal leader TERM: %v", err)
+	}
+	if err := running.leader.waitExited(ctx); err != nil {
+		t.Fatalf("wait leader exit notification: %v", err)
+	}
+
+	exit, verified, err := running.WaitAndVerify(ctx)
+	if err != nil {
+		t.Fatalf("WaitAndVerify() error = %v", err)
+	}
+	payload, err := verifier.VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatalf("WaitAndVerify() verifier error = %v", err)
+	}
+	if !payload.Group.Equal(running.Ref()) || payload.Method != model.QuiescenceTermKill {
+		t.Fatalf("WaitAndVerify() payload = %+v, want term_kill for %+v", payload, running.Ref())
+	}
+	if exit.Signal == "" && !exit.Exited {
+		t.Fatalf("WaitAndVerify() exit observation = %+v, want leader exit", exit)
+	}
+	if !running.WaitContained() {
+		t.Fatal("WaitContained() = false, want true after wait-driven containment")
+	}
+	if got := counting.count.Load(); got != 1 {
+		t.Fatalf("AttestQuiescence calls = %d, want 1", got)
+	}
+	waitGroupAbsent(t, running.Ref(), 5*time.Second)
+}
+
 func TestNativeContainAndVerifyUnprovableWhenLeaderReapedOutOfBand(t *testing.T) {
 	requireLeaderRetentionModelOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

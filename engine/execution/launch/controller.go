@@ -60,6 +60,10 @@ type RunningProcess interface {
 	ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error)
 }
 
+type waitContainmentReporter interface {
+	WaitContained() bool
+}
+
 type LaunchController struct {
 	authority AuthorityPort
 	custodian CustodianPort
@@ -644,7 +648,12 @@ func (process *Process) eagerWait(ctx context.Context) {
 		process.finalizeFromContain(process.controlCtx, cause, exit, priorErr, true)
 		return
 	}
-	process.finalizeWithVerified(process.controlCtx, exit, verified, false, true, nil)
+	process.finalizeWithVerified(process.controlCtx, exit, verified, waitReportedContainment(process.running), true, nil)
+}
+
+func waitReportedContainment(running RunningProcess) bool {
+	reporter, ok := running.(waitContainmentReporter)
+	return ok && reporter.WaitContained()
 }
 
 func (process *Process) finalizeFromContain(ctx context.Context, cause custodian.QuiescenceCause, priorExit command.ExitObservation, priorErr error, waitReturned bool) {

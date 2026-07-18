@@ -6,18 +6,24 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 )
 
 type servedAdmissionSupervisor struct {
-	runtime custodian.Runtime
+	runtime          custodian.Runtime
+	launchCustodian  launch.CustodianPort
+	supportOverride  *custodian.Support
+	verifierOverride custodian.AttestationVerifier
 }
 
 func newServedAdmissionSupervisor(_ *Server) *servedAdmissionSupervisor {
@@ -36,7 +42,7 @@ func (s *servedAdmissionSupervisor) verifiedContainmentSupported(ctx context.Con
 	if s == nil {
 		return fmt.Errorf("%w: admission supervisor is nil", custodian.ErrSupervisorUnavailable)
 	}
-	support := s.runtime.Support()
+	support := s.support()
 	if support.VerifiedContainment {
 		return nil
 	}
@@ -44,6 +50,131 @@ func (s *servedAdmissionSupervisor) verifiedContainmentSupported(ctx context.Con
 		return support.Reason
 	}
 	return fmt.Errorf("%w: verified containment unsupported", custodian.ErrSupervisorUnavailable)
+}
+
+func (s *servedAdmissionSupervisor) support() custodian.Support {
+	if s == nil {
+		return custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable).Support()
+	}
+	if s.supportOverride != nil {
+		return *s.supportOverride
+	}
+	return s.runtime.Support()
+}
+
+func (s *servedAdmissionSupervisor) quiescenceVerifier() custodian.AttestationVerifier {
+	if s == nil {
+		return custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable).Verifier()
+	}
+	if s.verifierOverride != (custodian.AttestationVerifier{}) {
+		return s.verifierOverride
+	}
+	return s.runtime.Verifier()
+}
+
+func (s *servedAdmissionSupervisor) launchPort() launch.CustodianPort {
+	if s == nil {
+		return runtimeLaunchCustodian{runtime: custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable)}
+	}
+	if s.launchCustodian != nil {
+		return s.launchCustodian
+	}
+	return runtimeLaunchCustodian{runtime: s.runtime}
+}
+
+type runtimeLaunchCustodian struct {
+	runtime custodian.Runtime
+}
+
+func (c runtimeLaunchCustodian) Prepare(ctx context.Context, spec command.ExecSpec, key model.LaunchKey) (launch.PreparedProcess, error) {
+	prepared, err := c.runtime.Process().Prepare(ctx, spec, key)
+	if err != nil {
+		return nil, err
+	}
+	return runtimePreparedProcess{prepared: prepared}, nil
+}
+
+func (c runtimeLaunchCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	return c.runtime.Process().ContainAndVerify(ctx, group, cause)
+}
+
+type runtimePreparedProcess struct {
+	prepared custodian.PreparedProcess
+}
+
+func (p runtimePreparedProcess) Ref() model.GroupRef {
+	if p.prepared == nil {
+		return model.GroupRef{}
+	}
+	return p.prepared.Ref()
+}
+
+func (p runtimePreparedProcess) Release(ctx context.Context, token custodian.GrantToken) (launch.RunningProcess, error) {
+	running, err := p.prepared.Release(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	streaming, ok := running.(interface {
+		Ref() model.GroupRef
+		Stdin() io.WriteCloser
+		Stdout() io.ReadCloser
+		Stderr() io.ReadCloser
+		WaitAndVerify(context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error)
+		ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("%w: running process does not expose command streams", custodian.ErrSupervisorUnavailable)
+	}
+	return runtimeRunningProcess{running: streaming}, nil
+}
+
+func (p runtimePreparedProcess) AbortAndVerify(ctx context.Context) (custodian.VerifiedQuiescence, error) {
+	if p.prepared == nil {
+		return custodian.VerifiedQuiescence{}, custodian.ErrSupervisorUnavailable
+	}
+	return p.prepared.AbortAndVerify(ctx)
+}
+
+type runtimeRunningProcess struct {
+	running interface {
+		Ref() model.GroupRef
+		Stdin() io.WriteCloser
+		Stdout() io.ReadCloser
+		Stderr() io.ReadCloser
+		WaitAndVerify(context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error)
+		ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error)
+	}
+}
+
+func (p runtimeRunningProcess) Ref() model.GroupRef {
+	return p.running.Ref()
+}
+
+func (p runtimeRunningProcess) Stdin() io.WriteCloser {
+	return p.running.Stdin()
+}
+
+func (p runtimeRunningProcess) Stdout() io.ReadCloser {
+	return p.running.Stdout()
+}
+
+func (p runtimeRunningProcess) Stderr() io.ReadCloser {
+	return p.running.Stderr()
+}
+
+func (p runtimeRunningProcess) WaitAndVerify(ctx context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error) {
+	return p.running.WaitAndVerify(ctx)
+}
+
+func (p runtimeRunningProcess) ContainAndVerify(ctx context.Context, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	return p.running.ContainAndVerify(ctx, cause)
+}
+
+func (p runtimeRunningProcess) WaitContained() bool {
+	reporter, ok := p.running.(interface {
+		WaitContained() bool
+	})
+	return ok && reporter.WaitContained()
 }
 
 func (s *servedAdmissionSupervisor) Register(model.JobID, engine.Backend, engine.SessionOpts) error {

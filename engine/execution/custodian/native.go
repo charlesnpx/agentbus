@@ -724,6 +724,7 @@ func (process *NativeRunningProcess) Wait(ctx context.Context) (command.ExitObse
 		}
 		var exit command.ExitObservation
 		var err error
+		containResidual := process.leader != nil
 		if process.leader != nil {
 			outcome, exit, err = process.finalizeIfSoleLeaderLocked(ctx, outcome, 0)
 		} else {
@@ -737,9 +738,17 @@ func (process *NativeRunningProcess) Wait(ctx context.Context) (command.ExitObse
 			return exit, err
 		}
 		process.lifecycleMu.Unlock()
-		if err := sleepContext(ctx, 20*time.Millisecond); err != nil {
-			return command.ExitObservation{}, err
+		if !containResidual {
+			if err := sleepContext(ctx, 20*time.Millisecond); err != nil {
+				return command.ExitObservation{}, err
+			}
+			continue
 		}
+		contained := process.containAndVerify(ctx)
+		if !contained.Absent() {
+			return process.finalizedWaitResultOrError(physicalOutcomeError(contained))
+		}
+		return process.finalizedWaitResultOrError(nil)
 	}
 }
 
@@ -756,6 +765,15 @@ func (process *NativeRunningProcess) WaitAndVerify(ctx context.Context) (command
 	verified, attestErr := process.finalAttestationLocked()
 	process.lifecycleMu.Unlock()
 	return exit, verified, errors.Join(waitErr, attestErr)
+}
+
+func (process *NativeRunningProcess) WaitContained() bool {
+	if process == nil {
+		return false
+	}
+	process.lifecycleMu.Lock()
+	defer process.lifecycleMu.Unlock()
+	return process.finalized && process.finalOutcome.Method == model.QuiescenceTermKill
 }
 
 func (process *NativeRunningProcess) finalizedWaitResultLocked() (command.ExitObservation, error) {

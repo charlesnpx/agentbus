@@ -244,6 +244,69 @@ func TestReadyApplySurfacesCommitOutcomeUnknownOnRealBboltCommitPhaseFault(t *te
 	}
 }
 
+func TestReadyAcceptAndClaimFailStopsOnRealBboltAmbiguousCommit(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "admission.bbolt")
+	inner, err := bboltrepo.NewRepository(path)
+	if err != nil {
+		t.Fatalf("NewRepository() error = %v", err)
+	}
+	innerClosed := false
+	t.Cleanup(func() {
+		if !innerClosed {
+			if err := inner.Close(); err != nil {
+				t.Fatalf("close bbolt repository: %v", err)
+			}
+		}
+	})
+	repo := &durabilityFaultingRepository{inner: inner}
+	anchorStore := NewAnchorStore()
+	ready := newReadyWithAnchorStore(t, repo, anchorStore, "accept-real-bbolt-ambiguous")
+	beforeGeneration := repositoryGeneration(t, repo)
+	request := acceptRequest(t, "accept-real-bbolt-ambiguous")
+	if err := repo.failCommitAfterCommitForTest(errors.New("commit fsync failed")); err != nil {
+		t.Fatal(err)
+	}
+
+	accepted, err := ready.AcceptAndClaim(ctx, request, model.OwnerID("owner-ambiguous"))
+	if !errors.Is(err, repository.ErrAmbiguousCommit) {
+		t.Fatalf("AcceptAndClaim error = %v, want ErrAmbiguousCommit", err)
+	}
+	if accepted.Record.JobID == "" || accepted.Binding.JobID != accepted.Record.JobID || accepted.Commit.Generation == 0 {
+		t.Fatalf("accepted result = %+v, want populated post-commit result", accepted)
+	}
+	if accepted.Commit.Generation <= beforeGeneration {
+		t.Fatalf("commit generation = %d, want > %d", accepted.Commit.Generation, beforeGeneration)
+	}
+	if accepted.Record.Cancel != nil {
+		t.Fatalf("accepted record has cancel after ambiguous commit: %+v", accepted.Record.Cancel)
+	}
+	assertAcceptedImage(t, repo, accepted)
+	assertAnchorFailStopped(t, anchorStore)
+
+	if err := inner.Close(); err != nil {
+		t.Fatalf("close bbolt repository before reopen: %v", err)
+	}
+	innerClosed = true
+	reopened, err := bboltrepo.NewRepository(path)
+	if err != nil {
+		t.Fatalf("reopen bbolt repository: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("close reopened bbolt repository: %v", err)
+		}
+	})
+	assertAcceptedImage(t, reopened, accepted)
+	persisted := loadSafetyRecordFromRepository(t, reopened, accepted.Record.JobID)
+	if persisted.Cancel != nil {
+		t.Fatalf("persisted record has cancel after ambiguous commit: %+v", persisted.Cancel)
+	}
+	if persisted.Terminal != nil {
+		t.Fatalf("persisted record terminal after ambiguous commit: %+v", persisted.Terminal)
+	}
+}
+
 func TestReadyDurabilityOutcomesAcrossMutationFailpoints(t *testing.T) {
 	ctx := context.Background()
 	mutations := []durabilityMutationKind{
@@ -684,6 +747,22 @@ func repositoryGeneration(t *testing.T, repo repository.Repository) uint64 {
 		t.Fatal(err)
 	}
 	return generation
+}
+
+func loadSafetyRecordFromRepository(t *testing.T, repo repository.Repository, jobID model.JobID) model.SafetyRecord {
+	t.Helper()
+	var record model.SafetyRecord
+	if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+		image := tx.LoadJob(jobID)
+		if image.Safety.State != repository.RecordValid {
+			t.Fatalf("safety state = %s, want valid", image.Safety.State)
+		}
+		record = image.Safety.Value
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return record
 }
 
 func anchorAdvancedToGeneration(t *testing.T, store *AnchorStore, generation uint64) bool {

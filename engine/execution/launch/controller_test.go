@@ -531,6 +531,56 @@ func TestLaunchProcessDoneAndFinalResultExposeTerminalResult(t *testing.T) {
 	}
 }
 
+func TestLaunchControllerEagerWaitReportsContainedAndNaturalResults(t *testing.T) {
+	tests := []struct {
+		name             string
+		waitContains     bool
+		wantContained    bool
+		wantContainCalls int
+		wantMethod       model.QuiescenceMethod
+	}{
+		{
+			name:             "residual group contained by wait",
+			waitContains:     true,
+			wantContained:    true,
+			wantContainCalls: 1,
+			wantMethod:       model.QuiescenceTermKill,
+		},
+		{
+			name:       "natural exit",
+			wantMethod: model.QuiescenceNaturalExit,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, "eager-wait-"+tt.name)
+			h.running.waitContains = tt.waitContains
+			h.authority.afterRecordRelease = h.running.allowWait
+
+			result, err := h.controller.Run(context.Background(), h.request(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Contained != tt.wantContained {
+				t.Fatalf("contained = %t, want %t", result.Contained, tt.wantContained)
+			}
+			if h.running.containCalls != tt.wantContainCalls {
+				t.Fatalf("running contain calls = %d, want %d", h.running.containCalls, tt.wantContainCalls)
+			}
+			if h.authority.failStops != 0 {
+				t.Fatalf("fail stops = %d, want 0", h.authority.failStops)
+			}
+			payload, err := h.verifier.VerifyQuiescence(result.Verified)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if payload.Method != tt.wantMethod {
+				t.Fatalf("quiescence method = %s, want %s", payload.Method, tt.wantMethod)
+			}
+		})
+	}
+}
+
 func TestLaunchControllerReleaseErrorContainsWithoutRetry(t *testing.T) {
 	h := newHarness(t, "release-error")
 	h.prepared.releaseErr = errors.New("release channel lost")
@@ -609,12 +659,13 @@ type harness struct {
 	group         model.GroupRef
 	grant         model.LaunchGrant
 	releaseSecret model.ReleaseSecret
+	verifier      custodian.AttestationVerifier
 }
 
 func newHarness(t *testing.T, name string) *harness {
 	t.Helper()
 	events := &eventLog{}
-	issuer, _ := custodian.NewAttestationChannel()
+	issuer, verifier := custodian.NewAttestationChannel()
 	launch := LaunchContext{
 		JobID:   model.JobID("job-" + sanitizeName(name)),
 		Attempt: model.AttemptRef{JobID: model.JobID("job-" + sanitizeName(name)), AttemptID: model.AttemptID("attempt-" + sanitizeName(name)), Epoch: 1},
@@ -662,6 +713,7 @@ func newHarness(t *testing.T, name string) *harness {
 		group:         group,
 		grant:         grant,
 		releaseSecret: model.ReleaseSecret("release-" + sanitizeName(name)),
+		verifier:      verifier,
 	}
 }
 
@@ -853,12 +905,14 @@ type fakeRunning struct {
 	stdout io.ReadCloser
 	stderr io.ReadCloser
 
-	mu           sync.Mutex
-	waitErr      error
-	containErr   error
-	containCalls int
-	attestations int
-	verified     custodian.VerifiedQuiescence
+	mu            sync.Mutex
+	waitErr       error
+	waitContains  bool
+	waitContained bool
+	containErr    error
+	containCalls  int
+	attestations  int
+	verified      custodian.VerifiedQuiescence
 }
 
 func (running *fakeRunning) Ref() model.GroupRef {
@@ -886,6 +940,10 @@ func (running *fakeRunning) WaitAndVerify(ctx context.Context) (command.ExitObse
 		if running.waitErr != nil {
 			return command.ExitObservation{}, custodian.VerifiedQuiescence{}, running.waitErr
 		}
+		if running.waitContains {
+			verified, err := running.ContainAndVerify(ctx, custodian.QuiescenceCauseWait)
+			return command.ExitObservation{Exited: true, Code: 0}, verified, err
+		}
 		verified, err := running.attest(model.QuiescenceNaturalExit)
 		return command.ExitObservation{Exited: true, Code: 0}, verified, err
 	case <-ctx.Done():
@@ -896,12 +954,19 @@ func (running *fakeRunning) WaitAndVerify(ctx context.Context) (command.ExitObse
 func (running *fakeRunning) ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
 	running.mu.Lock()
 	running.containCalls++
+	running.waitContained = true
 	running.mu.Unlock()
 	running.events.add("running_contain")
 	if running.containErr != nil {
 		return custodian.VerifiedQuiescence{}, running.containErr
 	}
 	return running.attest(model.QuiescenceTermKill)
+}
+
+func (running *fakeRunning) WaitContained() bool {
+	running.mu.Lock()
+	defer running.mu.Unlock()
+	return running.waitContained
 }
 
 func (running *fakeRunning) allowWait() {

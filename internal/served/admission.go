@@ -12,9 +12,11 @@ import (
 	"sync"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
@@ -85,14 +87,24 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	launchController, err := launch.New(servedLaunchAuthority{ready: ready}, supervisor.launchPort())
+	if err != nil {
+		return err
+	}
 	coord, err := coordinator.New(adapter, supervisor, servedResultPublisher{server: s}, owner)
 	if err != nil {
 		return err
+	}
+	submission := &servedSubmissionCoordinator{
+		ready:  ready,
+		owner:  owner,
+		launch: launchController,
 	}
 
 	s.admissionBootstrapper = bootstrapper
 	s.admissionReady = ready
 	s.admissionCoordinator = coord
+	s.admissionSubmission = submission
 	s.admissionSupervisor = supervisor
 	s.admissionClose = closer
 	closeOnErr = false
@@ -119,7 +131,7 @@ func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootst
 	}
 	options := []authority.BootstrapperOption{authority.WithAnchor(anchor)}
 	if s.admissionSupervisor != nil {
-		options = append(options, authority.WithQuiescenceVerifier(s.admissionSupervisor.runtime.Verifier()))
+		options = append(options, authority.WithQuiescenceVerifier(s.admissionSupervisor.quiescenceVerifier()))
 	}
 	bootstrapper, err := authority.NewBootstrapper(repo, options...)
 	if err != nil {
@@ -426,6 +438,140 @@ func (a *fileAuthorityAnchor) validateIdentity() error {
 	return nil
 }
 
+type servedSubmissionCoordinator struct {
+	ready  *authority.Ready
+	owner  model.OwnerID
+	launch *launch.LaunchController
+}
+
+var _ authority.SubmissionCoordinator = (*servedSubmissionCoordinator)(nil)
+
+type admissionLaunchBinding struct {
+	coordinator *servedSubmissionCoordinator
+	jobID       model.JobID
+	attempt     model.AttemptRef
+}
+
+type ordinalBoundSession interface {
+	TurnWithRunner(context.Context, engine.TurnInput, command.Runner) (<-chan engine.Event, error)
+}
+
+func (s *Server) admissionTurnEvents(ctx context.Context, run jobRun, input engine.TurnInput, ordinal model.LaunchOrdinal) (<-chan engine.Event, error) {
+	if err := ordinal.Validate(); err != nil {
+		return nil, err
+	}
+	if run.admissionLaunch.coordinator == nil {
+		return nil, custodian.ErrSupervisorUnavailable
+	}
+	session, ok := run.session.(ordinalBoundSession)
+	if !ok {
+		return nil, fmt.Errorf("%w: backend session does not support ordinal-bound runners", custodian.ErrSupervisorUnavailable)
+	}
+	runner, err := run.admissionLaunch.coordinator.LaunchRunner(run.admissionLaunch, ordinal)
+	if err != nil {
+		return nil, err
+	}
+	return session.TurnWithRunner(ctx, input, runner)
+}
+
+func (c *servedSubmissionCoordinator) SubmitRoutedIdentified(ctx context.Context, request authority.AcceptRequest, caps model.ExecutionCapabilities) (authority.AcceptResult, error) {
+	mode, err := model.RouteSubmissionMode(caps)
+	if err != nil {
+		return authority.AcceptResult{}, err
+	}
+	if mode != model.ModeIdentifiedFenced {
+		return authority.AcceptResult{}, fmt.Errorf("%w: routed mode %s is outside identified fenced submit", authority.ErrInvalidRequest, mode)
+	}
+	request.Mode = mode
+	return c.SubmitIdentified(ctx, request)
+}
+
+func (c *servedSubmissionCoordinator) SubmitIdentified(ctx context.Context, request authority.AcceptRequest) (authority.AcceptResult, error) {
+	if c == nil || c.ready == nil {
+		return authority.AcceptResult{}, authority.ErrNotReady
+	}
+	request.Mode = model.ModeIdentifiedFenced
+	accepted, err := c.ready.AcceptAndClaim(ctx, request, c.owner)
+	if err != nil {
+		return accepted, err
+	}
+	if accepted.Record.Terminal != nil || accepted.Replayed {
+		return accepted, nil
+	}
+	return accepted, nil
+}
+
+func (c *servedSubmissionCoordinator) PrepareLegacyFenced(context.Context, authority.AcceptRequest) (authority.LegacyFencedPreparation, error) {
+	return authority.LegacyFencedPreparation{}, fmt.Errorf("%w: LegacyFenced submission is deferred", authority.ErrInvalidRequest)
+}
+
+func (c *servedSubmissionCoordinator) SubmitLegacyUnfenced(context.Context, authority.AcceptRequest) (authority.AcceptResult, error) {
+	return authority.AcceptResult{}, fmt.Errorf("%w: LegacyUnfenced submission is deferred", authority.ErrInvalidRequest)
+}
+
+func (c *servedSubmissionCoordinator) LaunchRunner(binding admissionLaunchBinding, ordinal model.LaunchOrdinal) (command.Runner, error) {
+	if c == nil || c.launch == nil {
+		return nil, custodian.ErrSupervisorUnavailable
+	}
+	secret, err := model.NewReleaseSecret(fmt.Sprintf("release-%s-%s", binding.jobID, ordinal))
+	if err != nil {
+		return nil, err
+	}
+	return c.launch.Runner(launch.RunnerBinding{
+		Context: launch.LaunchContext{
+			JobID:   binding.jobID,
+			Attempt: binding.attempt,
+			Ordinal: ordinal,
+		},
+		ReleaseSecret: secret,
+	})
+}
+
+type servedLaunchAuthority struct {
+	ready *authority.Ready
+}
+
+func (a servedLaunchAuthority) BindGroup(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, group model.GroupRef) (launch.DurabilityOutcome, error) {
+	if a.ready == nil {
+		return launch.DefinitelyNotCommitted, authority.ErrNotReady
+	}
+	applied, err := a.ready.BindGroup(ctx, jobID, ref, ordinal, group)
+	return applied.Durability, err
+}
+
+func (a servedLaunchAuthority) AllocateGrant(ctx context.Context, ref model.AttemptRef, ordinal model.LaunchOrdinal) (model.LaunchGrant, launch.DurabilityOutcome, error) {
+	if a.ready == nil {
+		return model.LaunchGrant{}, launch.DefinitelyNotCommitted, authority.ErrNotReady
+	}
+	return a.ready.AllocateGrant(ctx, ref, ordinal)
+}
+
+func (a servedLaunchAuthority) RecordRelease(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, child model.ChildIdentity, evidence model.Evidence) (launch.DurabilityOutcome, error) {
+	if a.ready == nil {
+		return launch.DefinitelyNotCommitted, authority.ErrNotReady
+	}
+	applied, err := a.ready.RecordRelease(ctx, jobID, ref, ordinal, child, evidence)
+	return applied.Durability, err
+}
+
+func (a servedLaunchAuthority) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) (launch.DurabilityOutcome, error) {
+	if a.ready == nil {
+		return launch.DefinitelyNotCommitted, authority.ErrNotReady
+	}
+	applied, err := a.ready.RecordQuiescence(ctx, jobID, ordinal, verified)
+	return applied.Durability, err
+}
+
+func (a servedLaunchAuthority) FailStop(ctx context.Context, err error) error {
+	if a.ready == nil {
+		return authority.ErrNotReady
+	}
+	if err == nil {
+		return a.ready.FailStop(ctx, "")
+	}
+	return a.ready.FailStop(ctx, err.Error())
+}
+
 type servedAdmissionAuthority struct {
 	ready *authority.Ready
 }
@@ -616,8 +762,11 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	if !s.jobsRequestIDEnabled {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorCapabilityMissing, "jobs.requestId capability is disabled", protocol.ErrorData{})}
 	}
-	if s.admissionCoordinator == nil || s.admissionReady == nil || s.admissionSupervisor == nil {
+	if s.admissionCoordinator == nil || s.admissionReady == nil || s.admissionSubmission == nil || s.admissionSupervisor == nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorCapabilityMissing, "admission authority is not ready", protocol.ErrorData{})}
+	}
+	if err := s.admissionSupervisor.verifiedContainmentSupported(ctx); err != nil {
+		return requestOutcome{err: admissionProtocolError(err)}
 	}
 
 	requestKey, err := model.NewRequestKey(params.WorkspaceKey, params.RequestID)
@@ -683,14 +832,26 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 	}
 
-	admissionSessionID := s.nextID("ses")
-	accepted, err := s.admissionCoordinator.Submit(ctx, coordinator.AdmissionRequest{
+	session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
+	if err != nil {
+		return requestOutcome{err: backendError(err)}
+	}
+	admissionSessionID := session.ID()
+	if admissionSessionID == "" {
+		admissionSessionID = s.nextID("ses")
+	}
+	accepted, err := s.admissionSubmission.SubmitRoutedIdentified(ctx, authority.AcceptRequest{
 		RequestKey:   requestKey,
 		TaskIdentity: taskIdentity,
-		Mode:         model.ModeIdentifiedFenced,
 		SessionID:    admissionSessionID,
+	}, model.ExecutionCapabilities{
+		ExternalRunner: false,
+		FencedLaunch:   true,
 	})
 	if err != nil {
+		if admissionAcceptCommitted(accepted) {
+			return requestOutcome{err: admissionPostAcceptError(accepted, err)}
+		}
 		return requestOutcome{err: admissionProtocolError(err)}
 	}
 	jobID := accepted.Record.JobID.String()
@@ -702,27 +863,16 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		}}
 	}
 	jobModelID := accepted.Record.JobID
-	if err := s.admissionSupervisor.Register(jobModelID, backend, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout}); err != nil {
-		_ = s.admissionCoordinator.Cancel(context.Background(), jobModelID, nil)
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
-	}
-	if err := s.admissionCoordinator.PrepareSupervisor(ctx, jobModelID, nil); err != nil {
-		_ = s.admissionCoordinator.Cancel(context.Background(), jobModelID, nil)
-		return requestOutcome{err: admissionProtocolError(err)}
-	}
 	s.mu.Lock()
 	s.jobStores[jobID] = store
 	s.mu.Unlock()
-	if err := s.createQueuedRecord(store, jobID, admissionSessionID, spec.Backend, spec.Tags, policy.policy, policy.contract, false); err != nil {
-		_ = s.admissionCoordinator.Cancel(context.Background(), jobModelID, nil)
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
-	}
 	s.markAdmissionJob(jobID)
 	run := jobRun{
 		jobID:               jobID,
 		sessionID:           admissionSessionID,
 		backend:             spec.Backend,
 		store:               store,
+		session:             session,
 		prompt:              spec.Prompt,
 		write:               spec.Write,
 		policy:              policy.policy,
@@ -731,11 +881,20 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		contractHash:        policy.hash,
 		timeout:             timeout,
 		admissionControlled: true,
+		admissionLaunch: admissionLaunchBinding{
+			coordinator: s.admissionSubmission,
+			jobID:       jobModelID,
+			attempt:     accepted.Record.Attempt.Ref,
+		},
+	}
+	if err := s.createQueuedRecord(store, jobID, admissionSessionID, spec.Backend, spec.Tags, policy.policy, policy.contract, false); err != nil {
+		s.handleAdmissionResponseOutcome(ctx, run, false)
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
 	}
 	return requestOutcome{
 		result:       protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
-		after:        func() { go s.launchAdmittedJob(ctx, run) },
-		onAckFailure: func(error) { s.abortUndeliveredAdmissionRun(run) },
+		after:        func() { s.handleAdmissionResponseOutcome(ctx, run, true) },
+		onAckFailure: func(error) { s.handleAdmissionResponseOutcome(ctx, run, false) },
 	}
 }
 
@@ -773,8 +932,16 @@ func (s *Server) launchAdmittedJob(ctx context.Context, run jobRun) {
 	s.runJob(runCtx, launched)
 }
 
+func (s *Server) handleAdmissionResponseOutcome(ctx context.Context, run jobRun, delivered bool) {
+	action := model.OnResponseOutcome(model.ModeIdentifiedFenced, delivered)
+	switch action {
+	case model.RunAcceptedObligation, model.RetainObligationForReplay:
+		go s.launchAdmittedJob(ctx, run)
+	}
+}
+
 func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobRun, context.Context, bool, error) {
-	if s.admissionCoordinator == nil || s.admissionSupervisor == nil {
+	if s.admissionCoordinator == nil {
 		return run, nil, false, errors.New("admission authority is not ready")
 	}
 	jobID := model.JobID(run.jobID)
@@ -785,48 +952,20 @@ func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobR
 	if snapshot.Record.Terminal != nil || snapshot.Record.Cancel != nil {
 		return run, nil, false, nil
 	}
-	nonce := model.PermitNonce("permit-" + run.jobID + "-1")
-	if err := s.admissionCoordinator.GrantPermit(ctx, jobID, 1, nonce, nil); err != nil {
-		return run, nil, false, err
-	}
-	snapshot, err = s.admissionCoordinator.Snapshot(ctx, jobID)
-	if err != nil {
-		return run, nil, false, err
-	}
-	if snapshot.Record.Terminal != nil || snapshot.Record.Cancel != nil {
+	s.mu.Lock()
+	_, active := s.activeJobs[run.jobID]
+	s.mu.Unlock()
+	if active {
 		return run, nil, false, nil
 	}
-	if err := s.admissionCoordinator.Start(ctx, jobID, nil); err != nil {
-		return run, nil, false, err
+	if run.session == nil {
+		return run, nil, false, errors.New("admission session is not ready")
 	}
-	session, sessionID, err := s.admissionSupervisor.Started(jobID, model.LaunchOrdinalOne)
-	if err != nil {
-		return run, nil, false, err
-	}
-	if sessionID != "" {
-		run.sessionID = sessionID
-	}
-	run.session = session
 	runCtx, cancel := context.WithCancel(ctx)
-	active := &activeJob{jobID: run.jobID, sessionID: run.sessionID, session: session, cancel: cancel}
-	run.active = active
-	s.addActiveJob(active)
-	s.admissionSupervisor.AttachActive(jobID, active)
+	activeJob := &activeJob{jobID: run.jobID, sessionID: run.sessionID, session: run.session, cancel: cancel}
+	run.active = activeJob
+	s.addActiveJob(activeJob)
 	return run, runCtx, true, nil
-}
-
-func (s *Server) abortUndeliveredAdmissionRun(run jobRun) {
-	jobID := model.JobID(run.jobID)
-	if s.admissionCoordinator != nil {
-		_ = s.admissionCoordinator.Cancel(context.Background(), jobID, nil)
-	}
-	if run.store != nil {
-		_, _ = run.store.Cancel(run.jobID)
-	}
-	s.removeActiveJob(run.jobID)
-	if run.onDone != nil {
-		run.onDone()
-	}
 }
 
 func admissionProtocolError(err error) *protocol.ErrorObject {
@@ -835,6 +974,8 @@ func admissionProtocolError(err error) *protocol.ErrorObject {
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, authority.ErrRequestExpired):
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
+	case errors.Is(err, model.ErrIncompatibleExecutionCapabilities):
+		return protocol.NewError(protocol.ErrorCapabilityMissing, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, custodian.ErrSupervisorUnavailable):
 		return protocol.NewError(protocol.ErrorCapabilityMissing, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, authority.ErrNotReady), errors.Is(err, coordinator.ErrCoordinatorNotReady):
@@ -842,6 +983,17 @@ func admissionProtocolError(err error) *protocol.ErrorObject {
 	default:
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
 	}
+}
+
+func admissionAcceptCommitted(accepted authority.AcceptResult) bool {
+	return accepted.Record.JobID != "" && accepted.Binding.JobID == accepted.Record.JobID
+}
+
+func admissionPostAcceptError(accepted authority.AcceptResult, err error) *protocol.ErrorObject {
+	jobID := accepted.Record.JobID.String()
+	// S4E wires listener halt and recovery consumption; this path only reports
+	// that the obligation was durably accepted and the authority fail-stopped.
+	return protocol.NewError(protocol.ErrorBackendUnavailable, fmt.Sprintf("admission accepted job %s and fail-stopped before launch: %v", jobID, err), protocol.ErrorData{JobID: jobID})
 }
 
 func admissionState(state model.PublicState) engine.JobState {

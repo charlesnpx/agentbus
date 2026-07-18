@@ -75,6 +75,13 @@ func (registry *runtimeRegistry) claim(ref model.AttemptRef, owner model.OwnerID
 	return nil
 }
 
+func (registry *runtimeRegistry) registerAndClaimPending(ref model.AttemptRef, owner model.OwnerID) error {
+	if err := registry.registerPending(ref); err != nil {
+		return err
+	}
+	return registry.claim(ref, owner)
+}
+
 func (registry *runtimeRegistry) releaseTerminal(jobID model.JobID) {
 	delete(registry.pending, jobID)
 	delete(registry.owned, jobID)

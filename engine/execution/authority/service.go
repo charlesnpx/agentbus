@@ -21,6 +21,7 @@ var (
 	ErrRequestExpired  = errors.New("authority request expired")
 	ErrNotFound        = errors.New("authority record not found")
 	ErrRecoveryNeeded  = errors.New("authority recovery needed")
+	ErrFailStopRecord  = errors.New("authority fail-stop record failed")
 )
 
 const safetySchemaVersion = uint16(1)
@@ -130,6 +131,20 @@ func (r *Ready) Generation() uint64 {
 }
 
 func (r *Ready) Accept(ctx context.Context, request AcceptRequest) (AcceptResult, error) {
+	return r.accept(ctx, request, nil)
+}
+
+func (r *Ready) AcceptAndClaim(ctx context.Context, request AcceptRequest, owner model.OwnerID) (AcceptResult, error) {
+	if r == nil || r.core == nil {
+		return AcceptResult{}, ErrNotReady
+	}
+	if err := owner.Validate(); err != nil {
+		return AcceptResult{}, fmt.Errorf("%w: owner_id: %v", ErrInvalidRequest, err)
+	}
+	return r.accept(ctx, request, &owner)
+}
+
+func (r *Ready) accept(ctx context.Context, request AcceptRequest, claimOwner *model.OwnerID) (AcceptResult, error) {
 	if r == nil || r.core == nil {
 		return AcceptResult{}, ErrNotReady
 	}
@@ -154,17 +169,36 @@ func (r *Ready) Accept(ctx context.Context, request AcceptRequest) (AcceptResult
 		return nil
 	})
 	if err != nil {
-		return AcceptResult{}, err
-	}
-	if err := r.core.advanceReadyLocked(ctx, &r.token, commit.Generation); err != nil {
-		return AcceptResult{}, err
+		result.Commit = commit
+		if ClassifyDurableMutationOutcome(classifyRepositoryCommitError(err), false) == DefinitelyNotCommitted {
+			return AcceptResult{}, err
+		}
+		if stopErr := r.core.failStopLocked(ctx, fmt.Sprintf("accept durable outcome unknown: %v", err)); stopErr != nil {
+			return result, postDurableFailStopError("accept durable outcome unknown", err, stopErr)
+		}
+		return result, err
 	}
 	result.Commit = commit
-	if !result.Replayed {
-		if err := r.core.runtime.registerPending(result.Record.Attempt.Ref); err != nil {
-			r.core.failStopLocked(ctx, fmt.Sprintf("register pending: %v", err))
+	if err := r.core.advanceReadyLocked(ctx, &r.token, commit.Generation); err != nil {
+		return result, err
+	}
+	if result.Replayed {
+		return result, nil
+	}
+	if claimOwner != nil {
+		if err := r.core.runtime.registerAndClaimPending(result.Record.Attempt.Ref, *claimOwner); err != nil {
+			if stopErr := r.core.failStopLocked(ctx, fmt.Sprintf("claim accepted attempt %s: %v", result.Record.JobID, err)); stopErr != nil {
+				return result, postDurableFailStopError("claim accepted attempt", err, stopErr)
+			}
 			return result, err
 		}
+		return result, nil
+	}
+	if err := r.core.runtime.registerPending(result.Record.Attempt.Ref); err != nil {
+		if stopErr := r.core.failStopLocked(ctx, fmt.Sprintf("register pending: %v", err)); stopErr != nil {
+			return result, postDurableFailStopError("register pending", err, stopErr)
+		}
+		return result, err
 	}
 	return result, nil
 }
@@ -831,7 +865,9 @@ func (core *authorityCore) requireRecoveryTx(tx repository.ReadTx, token recover
 
 func (core *authorityCore) advanceReadyLocked(ctx context.Context, token *readyCapability, generation uint64) error {
 	if err := core.anchor.Advance(ctx, token.boot, generation); err != nil {
-		core.failStopLocked(ctx, fmt.Sprintf("anchor advance: %v", err))
+		if stopErr := core.failStopLocked(ctx, fmt.Sprintf("anchor advance: %v", err)); stopErr != nil {
+			return postDurableFailStopError("anchor advance", err, stopErr)
+		}
 		return err
 	}
 	token.generation = generation
@@ -841,7 +877,9 @@ func (core *authorityCore) advanceReadyLocked(ctx context.Context, token *readyC
 
 func (core *authorityCore) advanceRecoveryLocked(ctx context.Context, token *recoveryCapability, generation uint64) error {
 	if err := core.anchor.Advance(ctx, token.boot, generation); err != nil {
-		core.failStopLocked(ctx, fmt.Sprintf("anchor advance: %v", err))
+		if stopErr := core.failStopLocked(ctx, fmt.Sprintf("anchor advance: %v", err)); stopErr != nil {
+			return postDurableFailStopError("anchor advance", err, stopErr)
+		}
 		return err
 	}
 	token.generation = generation

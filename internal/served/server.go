@@ -119,6 +119,7 @@ type Server struct {
 	admissionBootstrapper        *admissionBootstrapper
 	admissionReady               *admissionReady
 	admissionCoordinator         *admissionCoordinator
+	admissionSubmission          *servedSubmissionCoordinator
 	admissionSupervisor          *servedAdmissionSupervisor
 	admissionClose               io.Closer
 	admissionBootstrapperFactory admissionBootstrapperFactory
@@ -1294,6 +1295,7 @@ type jobRun struct {
 	onDone                  func()
 	authoritativeCompletion bool
 	admissionControlled     bool
+	admissionLaunch         admissionLaunchBinding
 }
 
 func (s *Server) runJob(ctx context.Context, run jobRun) {
@@ -1309,11 +1311,11 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 		s.finalizeRequestedTerminal(run)
 		return
 	}
-	if err := s.transitionRecord(run.store, run.jobID, engine.StateStarting); err != nil {
+	if err := s.transitionRunRecord(run, engine.StateStarting); err != nil {
 		s.finalizeFailure(run, err)
 		return
 	}
-	if err := s.transitionRecord(run.store, run.jobID, engine.StateRunning); err != nil {
+	if err := s.transitionRunRecord(run, engine.StateRunning); err != nil {
 		s.finalizeFailure(run, err)
 		return
 	}
@@ -1322,7 +1324,7 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 	defer close(heartbeatDone)
 
 	attemptPrompt := applyPrologue(run.policy, run.prompt)
-	text, state, err := s.runAttempt(ctx, run, attemptPrompt, run.write)
+	text, state, err := s.runAttempt(ctx, run, attemptPrompt, run.write, model.LaunchOrdinalOne)
 	if requested := run.active.requestedTerminal(); requested != "" {
 		s.finalizeTerminal(run, requested, text, nil)
 		return
@@ -1345,11 +1347,11 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 		return
 	}
 	if retryPrompt != "" {
-		if err := s.transitionRecord(run.store, run.jobID, engine.StateRetrying); err != nil {
+		if err := s.transitionRunRecord(run, engine.StateRetrying); err != nil {
 			s.finalizeFailure(run, err)
 			return
 		}
-		retryText, retryState, retryErr := s.runAttempt(ctx, run, retryPrompt, false)
+		retryText, retryState, retryErr := s.runAttempt(ctx, run, retryPrompt, false, model.LaunchOrdinalTwo)
 		if requested := run.active.requestedTerminal(); requested != "" {
 			s.finalizeTerminal(run, requested, retryText, nil)
 			return
@@ -1369,7 +1371,14 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 	s.finalizeTerminal(run, compliantState, text, validation.Stamp)
 }
 
-func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, write bool) (string, engine.JobState, error) {
+func (s *Server) transitionRunRecord(run jobRun, state engine.JobState) error {
+	if err := s.transitionRecord(run.store, run.jobID, state); err != nil && !run.admissionControlled {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, write bool, ordinal model.LaunchOrdinal) (string, engine.JobState, error) {
 	attemptCtx := ctx
 	var cancel context.CancelFunc
 	if run.timeout > 0 {
@@ -1394,7 +1403,13 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 	if id := run.session.ID(); id != "" {
 		_ = s.updateBackendSessionID(run.store, run.jobID, id)
 	}
-	events, err := run.session.Turn(attemptCtx, input)
+	var events <-chan engine.Event
+	var err error
+	if run.admissionControlled {
+		events, err = s.admissionTurnEvents(attemptCtx, run, input, ordinal)
+	} else {
+		events, err = run.session.Turn(attemptCtx, input)
+	}
 	if err != nil {
 		if strings.Contains(err.Error(), protocol.ErrorSessionBusy) {
 			return "", engine.StateFailed, err

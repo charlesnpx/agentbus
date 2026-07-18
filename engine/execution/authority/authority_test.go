@@ -2,6 +2,7 @@ package authority
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -73,6 +74,109 @@ func TestAcceptWritesBindingSafetyProjectionAndReplays(t *testing.T) {
 	}
 	if len(snapshot.Pending) != 1 || !snapshot.Pending[0].Equal(accepted.Record.Attempt.Ref) {
 		t.Fatalf("pending snapshot = %#v, want accepted attempt", snapshot.Pending)
+	}
+}
+
+func TestAcceptAdvanceFailureReturnsAcceptedResultAndDurableFailStop(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := NewAnchorStore()
+	ready := newReadyWithAnchorStore(t, repo, anchorStore, "accept-advance-fail")
+	advanceErr := errors.New("advance fsync failed")
+	anchorStore.FailNextForTest(AnchorAdvance, advanceErr)
+
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "accept-advance-fail"))
+	if !errors.Is(err, advanceErr) {
+		t.Fatalf("Accept error = %v, want injected advance failure", err)
+	}
+	if accepted.Record.JobID == "" || accepted.Commit.Generation == 0 {
+		t.Fatalf("accepted result = %+v, want populated result with commit", accepted)
+	}
+	if accepted.Record.Cancel != nil {
+		t.Fatalf("accepted record has cancel after advance failure: %+v", accepted.Record.Cancel)
+	}
+	if accepted.Record.Terminal != nil {
+		t.Fatalf("accepted record terminal after advance failure: %+v", accepted.Record.Terminal)
+	}
+	assertAcceptedImage(t, repo, accepted)
+	assertAnchorFailStopped(t, anchorStore)
+	if _, err := ready.Accept(ctx, acceptRequest(t, "accept-after-advance-fail")); !errors.Is(err, ErrFailStopped) {
+		t.Fatalf("accept after fail-stop error = %v, want ErrFailStopped", err)
+	}
+}
+
+func TestAcceptAdvanceFailureReportsFailStopRecordFailure(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := NewAnchorStore()
+	ready := newReadyWithAnchorStore(t, repo, anchorStore, "accept-fail-stop-record")
+	advanceErr := errors.New("advance fsync failed")
+	failStopErr := errors.New("fail-stop fsync failed")
+	anchorStore.FailNextForTest(AnchorAdvance, advanceErr)
+	anchorStore.FailNextForTest(AnchorFailStop, failStopErr)
+
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "accept-fail-stop-record"))
+	if !errors.Is(err, ErrFailStopRecord) || !errors.Is(err, advanceErr) || !errors.Is(err, failStopErr) {
+		t.Fatalf("Accept error = %v, want ErrFailStopRecord wrapping advance and fail-stop failures", err)
+	}
+	if accepted.Record.JobID == "" || accepted.Commit.Generation == 0 {
+		t.Fatalf("accepted result = %+v, want populated result with commit", accepted)
+	}
+	assertAcceptedImage(t, repo, accepted)
+	if _, err := ready.Accept(ctx, acceptRequest(t, "accept-after-fail-stop-record")); !errors.Is(err, ErrFailStopped) {
+		t.Fatalf("accept after in-memory fail-stop error = %v, want ErrFailStopped", err)
+	}
+}
+
+func TestAcceptAndClaimConflictReturnsAcceptedResultAndDurableFailStop(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := NewAnchorStore()
+	ready := newReadyWithAnchorStore(t, repo, anchorStore, "accept-claim-fail")
+	futureJobID := model.JobID("job-00000000000000000001")
+	ready.core.runtime.owned[futureJobID] = OwnedAttempt{
+		Ref:   model.AttemptRef{JobID: futureJobID, AttemptID: "attempt-conflicting-owner", Epoch: 1},
+		Owner: model.OwnerID("owner-conflicting"),
+	}
+
+	accepted, err := ready.AcceptAndClaim(ctx, acceptRequest(t, "accept-claim-fail"), model.OwnerID("owner-claim"))
+	if !errors.Is(err, ErrRuntimeConflict) {
+		t.Fatalf("AcceptAndClaim error = %v, want ErrRuntimeConflict", err)
+	}
+	if accepted.Record.JobID == "" || accepted.Commit.Generation == 0 {
+		t.Fatalf("accepted result = %+v, want populated result with commit", accepted)
+	}
+	if accepted.Record.Cancel != nil {
+		t.Fatalf("accepted record has cancel after claim failure: %+v", accepted.Record.Cancel)
+	}
+	assertAcceptedImage(t, repo, accepted)
+	assertAnchorFailStopped(t, anchorStore)
+}
+
+func TestAcceptPreCommitFailureDoesNotFailStopOrPersistAcceptedJob(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := NewAnchorStore()
+	ready := newReadyWithAnchorStore(t, repo, anchorStore, "accept-pre-commit-fail")
+	request := acceptRequest(t, "accept-pre-commit-fail")
+	repo.InjectTombstoneForTest(repository.Tombstone{
+		RequestKey:        request.RequestKey,
+		JobID:             model.JobID("job-expired"),
+		TaskIdentity:      request.TaskIdentity,
+		ExpiredGeneration: 1,
+	})
+
+	accepted, err := ready.Accept(ctx, request)
+	if !errors.Is(err, ErrRequestExpired) {
+		t.Fatalf("Accept error = %v, want ErrRequestExpired", err)
+	}
+	if accepted.Record.JobID != "" || accepted.Commit.Generation != 0 {
+		t.Fatalf("accepted result = %+v, want empty pre-commit result", accepted)
+	}
+	assertNoAcceptedJobs(t, repo)
+	snapshot := anchorSnapshot(t, anchorStore)
+	if snapshot.Phase != "ready" {
+		t.Fatalf("anchor phase = %q, want ready", snapshot.Phase)
 	}
 }
 
@@ -264,6 +368,41 @@ func assertAcceptedImage(t *testing.T, repo repository.Repository, accepted Acce
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func assertNoAcceptedJobs(t *testing.T, repo repository.Repository) {
+	t.Helper()
+	if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+		images, err := tx.ListJobs(repository.JobFilter{})
+		if err != nil {
+			return err
+		}
+		for _, image := range images {
+			if image.Safety.State == repository.RecordValid {
+				t.Fatalf("unexpected accepted safety record after pre-commit failure: %+v", image.Safety.Value)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertAnchorFailStopped(t *testing.T, anchorStore *AnchorStore) {
+	t.Helper()
+	snapshot := anchorSnapshot(t, anchorStore)
+	if snapshot.Phase != "fail_stopped" {
+		t.Fatalf("anchor phase = %q, want fail_stopped", snapshot.Phase)
+	}
+}
+
+func anchorSnapshot(t *testing.T, anchorStore *AnchorStore) AnchorSnapshot {
+	t.Helper()
+	var snapshot AnchorSnapshot
+	if err := json.Unmarshal(anchorStore.SnapshotBytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
 }
 
 func groupRef(ref model.AttemptRef, ordinal model.LaunchOrdinal) model.GroupRef {

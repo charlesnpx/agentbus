@@ -140,14 +140,21 @@ func (r *Ready) FailStop(ctx context.Context, reason string) error {
 	}); err != nil {
 		return err
 	}
-	r.core.failStopLocked(ctx, reason)
-	return nil
+	return r.core.failStopLocked(ctx, reason)
 }
 
-func (core *authorityCore) failStopLocked(ctx context.Context, reason string) {
-	_ = core.anchor.FailStop(ctx, core.boot.ref, reason)
+func (core *authorityCore) failStopLocked(ctx context.Context, reason string) error {
+	err := core.anchor.FailStop(ctx, core.boot.ref, reason)
 	core.boot.phase = bootFailStopped
 	core.boot.reason = reason
+	return err
+}
+
+func postDurableFailStopError(operation string, err, stopErr error) error {
+	if stopErr == nil {
+		return err
+	}
+	return fmt.Errorf("%w: %s after durable commit: %w; durable fail-stop: %w", ErrFailStopRecord, operation, err, stopErr)
 }
 
 func recoveryPlansTx(tx repository.ReadTx, boot model.BootRef, trigger model.RecoveryTrigger, priorBootOnly bool) ([]JobRecoveryPlan, error) {
