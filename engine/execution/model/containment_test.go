@@ -189,6 +189,42 @@ func TestContainmentRetainedObjectEmptyProofProvesAbsentWithDifferentKernelDomai
 	}
 }
 
+func TestContainmentObservedUnknownMonitorIdentityIsIncoherent(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	monitor := ContainmentMonitorObservation{
+		Observed:       true,
+		KernelDomainID: ref.KernelDomain(),
+		Alive:          true,
+		Identity:       ProcessIdentityUnknown,
+	}
+	if monitor.coherent() {
+		t.Fatal("observed monitor with unknown identity is coherent, want incoherent")
+	}
+}
+
+func TestContainmentRetainedEmptyObservationCoherentIgnoresUnknownMonitorButRequiresMissingLeader(t *testing.T) {
+	ref := retainedReducerGroup(LaunchOrdinalOne)
+	observation := ContainmentObservation{
+		KernelDomainID: ref.KernelDomain(),
+		Group:          GroupLive,
+		Leader:         ProcessIdentityMissing,
+		Monitor: ContainmentMonitorObservation{
+			Observed:       true,
+			KernelDomainID: ref.KernelDomain(),
+			Alive:          true,
+			Identity:       ProcessIdentityUnknown,
+		},
+	}
+	if !retainedEmptyObservationCoherent(observation) {
+		t.Fatal("retained empty observation with unknown monitor and missing leader is incoherent, want coherent")
+	}
+
+	observation.Leader = ProcessIdentityMatching
+	if retainedEmptyObservationCoherent(observation) {
+		t.Fatal("retained empty observation with matching live leader is coherent, want incoherent")
+	}
+}
+
 func TestContainmentRetainedObjectUnknownProofDoesNotProveAbsentOrSignal(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
 	decision, err := DecideContainmentAuthorization(ContainmentAuthorization{
@@ -315,6 +351,30 @@ func TestContainmentAlreadyAbsentAfterIndependentObservation(t *testing.T) {
 	}
 }
 
+func TestContainmentNonRetainedObservedUnknownMonitorDoesNotProveAbsent(t *testing.T) {
+	ref := reducerGroup(LaunchOrdinalOne)
+	result, err := DecideContainmentAuthorizationWithBasis(ContainmentAuthorization{
+		Group: ref,
+		Observation: ContainmentObservation{
+			KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+			Group:          GroupAbsent,
+			Leader:         ProcessIdentityMissing,
+			Monitor: ContainmentMonitorObservation{
+				Observed:       true,
+				KernelDomainID: noPIDNamespaceDomain(ref.HostBootID),
+				Alive:          true,
+				Identity:       ProcessIdentityUnknown,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DecideContainmentAuthorizationWithBasis error = %v", err)
+	}
+	if result.Decision != Unprovable || result.Basis != ContainmentBasisNone {
+		t.Fatalf("authorization = %#v, want unprovable/no basis", result)
+	}
+}
+
 func TestContainmentNonRetainedDifferentKernelDomainRemainsAlreadyAbsent(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
 	differentDomain := noPIDNamespaceDomain("different-host-boot")
@@ -402,7 +462,7 @@ func TestContainmentAuthorizationTargetStateDecisionTable(t *testing.T) {
 								t.Fatalf("constructed relation = %v, want %v", actualRelation, relation.relation)
 							}
 
-							for _, monitor := range decisionTableMonitorCases(target, retainedState.state, proof.proof, group, leader) {
+							for _, monitor := range decisionTableMonitorCases(target, retainedState.state, proof.proof, relation.relation, group, leader) {
 								t.Run(monitor.name, func(t *testing.T) {
 									got, err := DecideContainmentAuthorizationWithBasis(ContainmentAuthorization{
 										Group: target,
@@ -430,8 +490,10 @@ func TestContainmentAuthorizationTargetStateDecisionTable(t *testing.T) {
 			}
 		}
 	}
-	if checked != 774 {
-		t.Fatalf("checked decision-table cells = %d, want 774", checked)
+	// 768 base cells plus monitor-axis coverage for retained empty
+	// incoherence/unknown monitors and the non-retained false-absence guard.
+	if checked != 781 {
+		t.Fatalf("checked decision-table cells = %d, want 781", checked)
 	}
 	if pruned != 96 {
 		t.Fatalf("pruned decision-table cells = %d, want 96", pruned)
@@ -581,7 +643,7 @@ type decisionTableMonitorCase struct {
 	observation ContainmentMonitorObservation
 }
 
-func decisionTableMonitorCases(target GroupRef, retainedState RetainedDomainState, proof RetainedObjectProof, group GroupExistenceObservation, leader ProcessIdentityObservation) []decisionTableMonitorCase {
+func decisionTableMonitorCases(target GroupRef, retainedState RetainedDomainState, proof RetainedObjectProof, relation kernelDomainRelation, group GroupExistenceObservation, leader ProcessIdentityObservation) []decisionTableMonitorCase {
 	cases := []decisionTableMonitorCase{{name: "coherent_monitor"}}
 	if retainedState == RetainedDomainKnown &&
 		proof == RetainedObjectProofEmpty &&
@@ -596,8 +658,31 @@ func decisionTableMonitorCases(target GroupRef, retainedState RetainedDomainStat
 				BoundToExactGroup: true,
 			},
 		})
+		cases = append(cases, decisionTableMonitorCase{
+			name:        "observed_unknown_monitor",
+			observation: decisionTableObservedUnknownMonitor(target),
+		})
+	}
+	if retainedState == RetainedDomainNotApplicable &&
+		proof == RetainedObjectProofNone &&
+		relation == kernelDomainSame &&
+		group == GroupAbsent &&
+		leader == ProcessIdentityMissing {
+		cases = append(cases, decisionTableMonitorCase{
+			name:        "observed_unknown_monitor",
+			observation: decisionTableObservedUnknownMonitor(target),
+		})
 	}
 	return cases
+}
+
+func decisionTableObservedUnknownMonitor(target GroupRef) ContainmentMonitorObservation {
+	return ContainmentMonitorObservation{
+		Observed:       true,
+		KernelDomainID: target.KernelDomain(),
+		Alive:          true,
+		Identity:       ProcessIdentityUnknown,
+	}
 }
 
 func decisionTableAuthorization(retainedState RetainedDomainState, proof RetainedObjectProof, relation kernelDomainRelation, group GroupExistenceObservation, leader ProcessIdentityObservation, monitor ContainmentMonitorObservation) ContainmentAuthorizationResult {
@@ -612,7 +697,7 @@ func decisionTableAuthorization(retainedState RetainedDomainState, proof Retaine
 			}
 			return containmentAuthorizationResult(SignalDirectly, ContainmentBasisRetainedObject)
 		case RetainedObjectProofEmpty:
-			if monitor.coherent() && (group == GroupLive || group == GroupAbsent) && leader == ProcessIdentityMissing {
+			if (group == GroupLive || group == GroupAbsent) && leader == ProcessIdentityMissing {
 				return containmentAuthorizationResult(AlreadyAbsent, ContainmentBasisRetainedObject)
 			}
 			return containmentAuthorizationResult(Unprovable, ContainmentBasisNone)
@@ -627,6 +712,9 @@ func decisionTableAuthorization(retainedState RetainedDomainState, proof Retaine
 		case kernelDomainDifferent:
 			return containmentAuthorizationResult(AlreadyAbsent, ContainmentBasisNone)
 		case kernelDomainUnprovable:
+			return containmentAuthorizationResult(Unprovable, ContainmentBasisNone)
+		}
+		if !monitor.coherent() {
 			return containmentAuthorizationResult(Unprovable, ContainmentBasisNone)
 		}
 		if group == GroupAbsent && leader == ProcessIdentityMissing {

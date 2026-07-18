@@ -45,12 +45,7 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 		return outcome
 	}
 	defer state.releaseRetainedObject()
-	observation, observedAt, outcome := engine.observe(ctx, target)
-	if outcome.Kind != 0 {
-		return outcome
-	}
-	state = engine.advanceSession(ctx, target, state, observation, observedAt)
-	authorization, outcome := engine.authorize(ctx, target, observation, state, false, observedAt)
+	observation, _, state, authorization, outcome := engine.observeAuthorizeWithCoherenceReread(ctx, target, params, state, false)
 	if outcome.Kind != 0 {
 		return outcome
 	}
@@ -105,12 +100,7 @@ func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef
 		return UnprovableOutcome(ReasonContextDone, authorization.Decision, err)
 	}
 
-	observation, observedAt, outcome := engine.observe(ctx, target)
-	if outcome.Kind != 0 {
-		return outcome
-	}
-	state = engine.advanceSession(ctx, target, state, observation, observedAt)
-	authorization, outcome = engine.authorize(ctx, target, observation, state, false, observedAt)
+	_, _, state, authorization, outcome := engine.observeAuthorizeWithCoherenceReread(ctx, target, params, state, false)
 	if outcome.Kind != 0 {
 		return outcome
 	}
@@ -176,8 +166,8 @@ func (engine Engine) pollUntilAbsent(ctx context.Context, target model.GroupRef,
 		if outcome.Kind != 0 {
 			return outcome
 		}
-		state = engine.advanceSession(ctx, target, state, observation, observedAt)
-		currentAuthorization, outcome := engine.authorize(ctx, target, observation, state, false, observedAt)
+		currentState := engine.advanceSession(ctx, target, state, observation, observedAt)
+		currentAuthorization, outcome := engine.authorize(ctx, target, observation, currentState, false, observedAt)
 		if outcome.Kind != 0 {
 			return outcome
 		}
@@ -185,8 +175,18 @@ func (engine Engine) pollUntilAbsent(ctx context.Context, target model.GroupRef,
 		case model.AlreadyAbsent:
 			return AbsentOutcome(currentAuthorization.Decision)
 		case model.SignalDirectly:
+			state = currentState
 		case model.WaitBoundedForTrustedMonitor, model.Unprovable:
-			return UnprovableOutcome(ReasonAuthorizationUnprovable, currentAuthorization.Decision, nil)
+			if !retryableTransientIncoherentUnprovable(observation, currentAuthorization) {
+				return UnprovableOutcome(ReasonAuthorizationUnprovable, currentAuthorization.Decision, nil)
+			}
+			if !engine.Clock.Now().Before(deadline) {
+				return UnprovableOutcome(ReasonAbsenceDeadlineExceeded, currentAuthorization.Decision, nil)
+			}
+			if err := engine.sleepUntil(ctx, params.PollInterval, deadline); err != nil {
+				return UnprovableOutcome(ReasonContextDone, currentAuthorization.Decision, err)
+			}
+			continue
 		default:
 			return UnprovableOutcome(ReasonUnexpectedDecision, currentAuthorization.Decision, nil)
 		}
@@ -213,6 +213,62 @@ func (engine Engine) pollUntilAbsent(ctx context.Context, target model.GroupRef,
 			return UnprovableOutcome(ReasonContextDone, authorization.Decision, err)
 		}
 	}
+}
+
+func (engine Engine) observeAuthorizeWithCoherenceReread(ctx context.Context, target model.GroupRef, params Params, state containmentState, deadlineExpired bool) (model.ContainmentObservation, time.Time, containmentState, model.ContainmentAuthorizationResult, Outcome) {
+	for rereads := 0; ; rereads++ {
+		observation, observedAt, outcome := engine.observe(ctx, target)
+		if outcome.Kind != 0 {
+			return model.ContainmentObservation{}, time.Time{}, state, model.ContainmentAuthorizationResult{}, outcome
+		}
+		currentState := engine.advanceSession(ctx, target, state, observation, observedAt)
+		authorization, outcome := engine.authorize(ctx, target, observation, currentState, deadlineExpired, observedAt)
+		if outcome.Kind != 0 {
+			return model.ContainmentObservation{}, time.Time{}, state, model.ContainmentAuthorizationResult{}, outcome
+		}
+		if !retryableTransientIncoherentUnprovable(observation, authorization) {
+			return observation, observedAt, currentState, authorization, Outcome{}
+		}
+		if rereads >= params.CoherenceRereadLimit {
+			return model.ContainmentObservation{}, time.Time{}, state, model.ContainmentAuthorizationResult{}, UnprovableOutcome(ReasonAuthorizationUnprovable, authorization.Decision, nil)
+		}
+		if err := engine.Clock.Sleep(ctx, params.CoherenceRereadInterval); err != nil {
+			return model.ContainmentObservation{}, time.Time{}, state, model.ContainmentAuthorizationResult{}, UnprovableOutcome(ReasonContextDone, authorization.Decision, err)
+		}
+	}
+}
+
+func retryableTransientIncoherentUnprovable(observation model.ContainmentObservation, authorization model.ContainmentAuthorizationResult) bool {
+	return authorization.Decision == model.Unprovable && !containmentObservationCoherent(observation)
+}
+
+func containmentObservationCoherent(observation model.ContainmentObservation) bool {
+	if observation.Group == model.GroupAbsent && observation.Leader != model.ProcessIdentityMissing {
+		return false
+	}
+	return containmentMonitorObservationCoherent(observation.Monitor)
+}
+
+func containmentMonitorObservationCoherent(observation model.ContainmentMonitorObservation) bool {
+	if !observation.Observed {
+		return !observation.Alive && observation.Identity == "" && !observation.BoundToExactGroup
+	}
+	switch observation.Identity {
+	case model.ProcessIdentityUnknown:
+		return false
+	case model.ProcessIdentityMatching, model.ProcessIdentityReused:
+		if !observation.Alive {
+			return false
+		}
+	case model.ProcessIdentityMissing:
+		if observation.Alive {
+			return false
+		}
+	}
+	if observation.BoundToExactGroup && (!observation.Alive || observation.Identity != model.ProcessIdentityMatching) {
+		return false
+	}
+	return true
 }
 
 func (engine Engine) signal(ctx context.Context, target model.GroupRef, state containmentState, authorization model.ContainmentAuthorizationResult, signal Signal) Outcome {

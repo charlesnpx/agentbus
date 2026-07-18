@@ -79,6 +79,55 @@ func TestContainmentNeverAbsentWithinBoundIsUnprovable(t *testing.T) {
 	assertSignals(t, signaler, SignalTerminate, SignalKill)
 }
 
+func TestContainmentPollTransientUnprovableRereadCanProveAbsent(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+		{signal: SignalKill, result: SignalDelivered},
+	}}
+
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
+
+	assertAbsent(t, outcome)
+	assertSignals(t, signaler, SignalTerminate, SignalKill)
+	if observer.calls != 4 {
+		t.Fatalf("observer calls = %d, want 4", observer.calls)
+	}
+	if signaler.probeCalls != 0 {
+		t.Fatalf("probe calls = %d, want 0", signaler.probeCalls)
+	}
+}
+
+func TestContainmentPollPersistentUnprovableFailsClosedAtDeadline(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMatching),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+		{signal: SignalKill, result: SignalDelivered},
+	}}
+
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAbsenceDeadlineExceeded)
+	assertSignals(t, signaler, SignalTerminate, SignalKill)
+	if observer.calls != 5 {
+		t.Fatalf("observer calls = %d, want 5", observer.calls)
+	}
+	if signaler.probeCalls != 0 {
+		t.Fatalf("probe calls = %d, want 0", signaler.probeCalls)
+	}
+}
+
 func TestContainmentSignalAmbiguousIsUnprovable(t *testing.T) {
 	target := testGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
@@ -117,7 +166,203 @@ func TestContainmentUnknownOrContradictoryObservationIsUnprovable(t *testing.T) 
 
 			assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
 			assertSignals(t, signaler)
+			if observer.calls != 1 {
+				t.Fatalf("observer calls = %d, want 1", observer.calls)
+			}
 		})
+	}
+}
+
+func TestContainmentObservedUnknownMonitorIdentityIsIncoherent(t *testing.T) {
+	target := testGroupRef(t)
+	tests := []struct {
+		name        string
+		observation model.ContainmentMonitorObservation
+		want        bool
+	}{
+		{
+			name: "not_observed_zero_value",
+			want: true,
+		},
+		{
+			name: "matching_alive",
+			observation: model.ContainmentMonitorObservation{
+				Observed:       true,
+				KernelDomainID: target.KernelDomain(),
+				Alive:          true,
+				Identity:       model.ProcessIdentityMatching,
+			},
+			want: true,
+		},
+		{
+			name: "reused_alive",
+			observation: model.ContainmentMonitorObservation{
+				Observed:       true,
+				KernelDomainID: target.KernelDomain(),
+				Alive:          true,
+				Identity:       model.ProcessIdentityReused,
+			},
+			want: true,
+		},
+		{
+			name: "missing_not_alive",
+			observation: model.ContainmentMonitorObservation{
+				Observed:       true,
+				KernelDomainID: target.KernelDomain(),
+				Identity:       model.ProcessIdentityMissing,
+			},
+			want: true,
+		},
+		{
+			name: "unknown_alive",
+			observation: model.ContainmentMonitorObservation{
+				Observed:       true,
+				KernelDomainID: target.KernelDomain(),
+				Alive:          true,
+				Identity:       model.ProcessIdentityUnknown,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := containmentMonitorObservationCoherent(tt.observation); got != tt.want {
+				t.Fatalf("containmentMonitorObservationCoherent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestContainmentInitialObservedUnknownMonitorIdentityRereadCanAuthorizeSignalDirectly(t *testing.T) {
+	target := testGroupRef(t)
+	unknownMonitor := observedMonitorIdentityObservation(target, model.GroupLive, model.ProcessIdentityMatching, model.ProcessIdentityUnknown)
+	unknownMonitor.KernelDomainID = unprovablePIDNamespaceDomain(target)
+	unknownMonitor.Monitor.KernelDomainID = unknownMonitor.KernelDomainID
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		unknownMonitor,
+		unknownMonitor,
+		observedMonitorIdentityObservation(target, model.GroupLive, model.ProcessIdentityMatching, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+	}}
+	clock := newFakeClock()
+	engine := Engine{Observer: observer, Signaler: signaler, Clock: clock}
+
+	outcome := engine.Contain(context.Background(), target, testParams())
+
+	assertAbsent(t, outcome)
+	assertSignals(t, signaler, SignalTerminate)
+	if observer.calls != defaultCoherenceRereadLimit+2 {
+		t.Fatalf("observer calls = %d, want %d", observer.calls, defaultCoherenceRereadLimit+2)
+	}
+	if len(clock.sleeps) < defaultCoherenceRereadLimit {
+		t.Fatalf("sleeps = %d, want at least %d", len(clock.sleeps), defaultCoherenceRereadLimit)
+	}
+	for i := 0; i < defaultCoherenceRereadLimit; i++ {
+		if clock.sleeps[i] != defaultCoherenceRereadInterval {
+			t.Fatalf("coherence sleep %d = %s, want %s", i, clock.sleeps[i], defaultCoherenceRereadInterval)
+		}
+	}
+}
+
+func TestContainmentInitialObservedUnknownMonitorIdentityPersistentFailsClosedAtRereadBound(t *testing.T) {
+	target := testGroupRef(t)
+	unknownMonitor := observedMonitorIdentityObservation(target, model.GroupLive, model.ProcessIdentityMatching, model.ProcessIdentityUnknown)
+	unknownMonitor.KernelDomainID = unprovablePIDNamespaceDomain(target)
+	unknownMonitor.Monitor.KernelDomainID = unknownMonitor.KernelDomainID
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		unknownMonitor,
+	}}
+	signaler := &fakeSignaler{}
+	clock := newFakeClock()
+	engine := Engine{Observer: observer, Signaler: signaler, Clock: clock}
+
+	outcome := engine.Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	assertSignals(t, signaler)
+	if observer.calls != defaultCoherenceRereadLimit+1 {
+		t.Fatalf("observer calls = %d, want %d", observer.calls, defaultCoherenceRereadLimit+1)
+	}
+	if len(clock.sleeps) != defaultCoherenceRereadLimit {
+		t.Fatalf("coherence sleeps = %d, want %d", len(clock.sleeps), defaultCoherenceRereadLimit)
+	}
+	for _, sleep := range clock.sleeps {
+		if sleep != defaultCoherenceRereadInterval {
+			t.Fatalf("coherence sleep = %s, want %s", sleep, defaultCoherenceRereadInterval)
+		}
+	}
+}
+
+func TestContainmentInitialTransientUnprovableRereadCanProveAbsent(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{}
+
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
+
+	assertAbsent(t, outcome)
+	assertSignals(t, signaler)
+	if observer.calls != 2 {
+		t.Fatalf("observer calls = %d, want 2", observer.calls)
+	}
+}
+
+func TestContainmentInitialPersistentUnprovableFailsClosedAtRereadBound(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMatching),
+	}}
+	signaler := &fakeSignaler{}
+	clock := newFakeClock()
+	engine := Engine{Observer: observer, Signaler: signaler, Clock: clock}
+
+	outcome := engine.Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	assertSignals(t, signaler)
+	if observer.calls != defaultCoherenceRereadLimit+1 {
+		t.Fatalf("observer calls = %d, want %d", observer.calls, defaultCoherenceRereadLimit+1)
+	}
+	if len(clock.sleeps) != defaultCoherenceRereadLimit {
+		t.Fatalf("coherence sleeps = %d, want %d", len(clock.sleeps), defaultCoherenceRereadLimit)
+	}
+	for _, sleep := range clock.sleeps {
+		if sleep != defaultCoherenceRereadInterval {
+			t.Fatalf("coherence sleep = %s, want %s", sleep, defaultCoherenceRereadInterval)
+		}
+	}
+}
+
+func TestContainmentCoherenceRereadContextCancelFailsClosedWithoutHang(t *testing.T) {
+	target := testGroupRef(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMissing),
+	}}
+	observer.onObserve = func() {
+		if observer.calls == 0 {
+			cancel()
+		}
+	}
+	signaler := &fakeSignaler{}
+
+	outcome := testEngine(observer, signaler).Contain(ctx, target, testParams())
+
+	assertUnprovable(t, outcome, ReasonContextDone)
+	if !errors.Is(outcome.Err, context.Canceled) {
+		t.Fatalf("outcome error = %v, want context canceled", outcome.Err)
+	}
+	assertSignals(t, signaler)
+	if observer.calls != 1 {
+		t.Fatalf("observer calls = %d, want 1", observer.calls)
 	}
 }
 
@@ -179,6 +424,53 @@ func TestContainmentLeaderMissingAfterGraceWithoutContinuityIsUnprovable(t *test
 
 	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
 	assertSignals(t, signaler, SignalTerminate)
+}
+
+func TestContainmentPostGraceTransientUnprovableRereadCanProveAbsent(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMatching),
+		testObservation(target, model.GroupAbsent, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+	}}
+
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
+
+	assertAbsent(t, outcome)
+	assertSignals(t, signaler, SignalTerminate)
+	if observer.calls != 3 {
+		t.Fatalf("observer calls = %d, want 3", observer.calls)
+	}
+}
+
+func TestContainmentPostGraceCoherentWaitBoundedFailsClosedWithoutKill(t *testing.T) {
+	target := testGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+		trustedMonitorObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+		testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+	}}
+	signaler := &fakeSignaler{script: []signalScript{
+		{signal: SignalTerminate, result: SignalDelivered},
+		{signal: SignalKill, result: SignalDelivered},
+	}}
+
+	outcome := testEngine(observer, signaler).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonAuthorizationUnprovable)
+	if outcome.Decision != model.WaitBoundedForTrustedMonitor {
+		t.Fatalf("outcome decision = %s, want %s", outcome.Decision, model.WaitBoundedForTrustedMonitor)
+	}
+	assertSignals(t, signaler, SignalTerminate)
+	if killCount := countSignals(signaler, SignalKill); killCount != 0 {
+		t.Fatalf("KILL signal count = %d, want 0", killCount)
+	}
+	if observer.calls != 2 {
+		t.Fatalf("observer calls = %d, want 2", observer.calls)
+	}
 }
 
 func TestContainmentContinuityWitnessAuthorizesKillAfterLeaderExit(t *testing.T) {
@@ -638,6 +930,23 @@ func trustedMonitorObservation(target model.GroupRef, group model.GroupExistence
 	return observation
 }
 
+func observedMonitorIdentityObservation(target model.GroupRef, group model.GroupExistenceObservation, leader model.ProcessIdentityObservation, identity model.ProcessIdentityObservation) model.ContainmentObservation {
+	observation := testObservation(target, group, leader)
+	observation.Monitor = model.ContainmentMonitorObservation{
+		Observed:       true,
+		KernelDomainID: target.KernelDomain(),
+		Alive:          identity != model.ProcessIdentityMissing,
+		Identity:       identity,
+	}
+	return observation
+}
+
+func unprovablePIDNamespaceDomain(target model.GroupRef) model.KernelDomainID {
+	domain := target.KernelDomain()
+	domain.PIDNamespaceState = model.PIDNamespaceUnknown
+	return domain
+}
+
 func testGroupRef(t *testing.T) model.GroupRef {
 	t.Helper()
 	ref := model.GroupRef{
@@ -703,6 +1012,16 @@ func assertSignals(t *testing.T, signaler *fakeSignaler, signals ...Signal) {
 	if !slices.Equal(got, signals) {
 		t.Fatalf("signals = %v, want %v", got, signals)
 	}
+}
+
+func countSignals(signaler *fakeSignaler, signal Signal) int {
+	count := 0
+	for _, call := range signaler.calls {
+		if call.signal == signal {
+			count++
+		}
+	}
+	return count
 }
 
 func assertRetainedSignals(t *testing.T, retained *fakeRetainedObject, signals ...Signal) {

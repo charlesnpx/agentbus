@@ -184,9 +184,6 @@ func decideRequiredRetainedContainment(input ContainmentAuthorization, relation 
 }
 
 func retainedEmptyObservationCoherent(observation ContainmentObservation) bool {
-	if !observation.Monitor.coherent() {
-		return false
-	}
 	switch observation.Group {
 	case GroupLive, GroupAbsent:
 		return observation.Leader == ProcessIdentityMissing
@@ -259,6 +256,8 @@ func (observation ContainmentMonitorObservation) coherent() bool {
 		return !observation.Alive && observation.Identity == "" && !observation.BoundToExactGroup
 	}
 	switch observation.Identity {
+	case ProcessIdentityUnknown:
+		return false
 	case ProcessIdentityMatching, ProcessIdentityReused:
 		if !observation.Alive {
 			return false

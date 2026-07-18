@@ -285,7 +285,14 @@ type Params struct {
 	PollTimeout                time.Duration
 	TrustedMonitorWait         time.Duration
 	TrustedMonitorPollInterval time.Duration
+	CoherenceRereadLimit       int
+	CoherenceRereadInterval    time.Duration
 }
+
+const (
+	defaultCoherenceRereadLimit    = 2
+	defaultCoherenceRereadInterval = 20 * time.Millisecond
+)
 
 func (params Params) Validate() error {
 	_, err := params.normalized()
@@ -308,11 +315,23 @@ func (params Params) normalized() (Params, error) {
 	if params.TrustedMonitorPollInterval < 0 {
 		return Params{}, fmt.Errorf("trusted monitor poll interval must be non-negative")
 	}
+	if params.CoherenceRereadLimit < 0 {
+		return Params{}, fmt.Errorf("coherence reread limit must be non-negative")
+	}
+	if params.CoherenceRereadInterval < 0 {
+		return Params{}, fmt.Errorf("coherence reread interval must be non-negative")
+	}
 	if params.PollInterval == 0 {
 		params.PollInterval = params.PollTimeout
 	}
 	if params.TrustedMonitorPollInterval == 0 {
 		params.TrustedMonitorPollInterval = params.TrustedMonitorWait
+	}
+	if params.CoherenceRereadLimit == 0 {
+		params.CoherenceRereadLimit = defaultCoherenceRereadLimit
+	}
+	if params.CoherenceRereadInterval == 0 {
+		params.CoherenceRereadInterval = defaultCoherenceRereadInterval
 	}
 	return params, nil
 }
