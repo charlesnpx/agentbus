@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -44,6 +45,12 @@ type cliVersionResult struct {
 	Version         string `json:"version"`
 	ProtocolVersion int    `json:"protocolVersion"`
 }
+
+var (
+	offlineModCacheOnce sync.Once
+	offlineModCachePath string
+	offlineModCacheErr  error
+)
 
 func TestInstallerPlanJSONWithoutGoOnPath(t *testing.T) {
 	root := repoRoot(t)
@@ -362,7 +369,7 @@ func offlineGoEnv(t *testing.T) []string {
 	t.Helper()
 	return commandEnv(t, map[string]string{
 		"GOCACHE":    privateTmpDir(t, "agentbus-gocache-*"),
-		"GOMODCACHE": privateTmpDir(t, "agentbus-gomodcache-*"),
+		"GOMODCACHE": offlineSeededModCache(t),
 		"GOPROXY":    "off",
 		"GOSUMDB":    "off",
 	})
@@ -372,7 +379,7 @@ func offlineInstallerEnv(t *testing.T, overrides map[string]string) []string {
 	t.Helper()
 	base := map[string]string{
 		"GOCACHE":    privateTmpDir(t, "agentbus-gocache-*"),
-		"GOMODCACHE": privateTmpDir(t, "agentbus-gomodcache-*"),
+		"GOMODCACHE": offlineSeededModCache(t),
 		"GOPROXY":    "off",
 		"GOSUMDB":    "off",
 	}
@@ -387,13 +394,50 @@ func releaseCheckEnv(t *testing.T, gitBin string, headTag string) []string {
 	env := map[string]string{
 		"FAKE_GIT_TAG": headTag,
 		"GOCACHE":      privateTmpDir(t, "agentbus-gocache-*"),
-		"GOMODCACHE":   privateTmpDir(t, "agentbus-gomodcache-*"),
+		"GOMODCACHE":   offlineSeededModCache(t),
 		"GOFLAGS":      "-buildvcs=false",
 		"GOPROXY":      "off",
 		"GOSUMDB":      "off",
 		"PATH":         gitBin + string(os.PathListSeparator) + os.Getenv("PATH"),
 	}
 	return commandEnv(t, env)
+}
+
+func offlineSeededModCache(t *testing.T) string {
+	t.Helper()
+	if cache := os.Getenv("AGENTBUS_OFFLINE_MODCACHE"); cache != "" {
+		return cache
+	}
+
+	offlineModCacheOnce.Do(func() {
+		root := repoRoot(t)
+		dir, err := os.MkdirTemp(os.TempDir(), "agentbus-offline-gomodcache-*")
+		if err != nil {
+			offlineModCacheErr = fmt.Errorf("create offline module cache: %w", err)
+			return
+		}
+
+		cmd := exec.Command("go", "mod", "download", "all")
+		cmd.Dir = root
+		cmd.Env = commandEnv(t, map[string]string{
+			"GOMODCACHE": dir,
+			"GOFLAGS":    "-mod=mod",
+		})
+		stdout, stderr, err := runCommand(cmd)
+		if err != nil {
+			_ = os.RemoveAll(dir)
+			offlineModCacheErr = fmt.Errorf("go mod download all failed: %w stderr=%s stdout=%s", err, stderr, stdout)
+			return
+		}
+		offlineModCachePath = dir
+	})
+	if offlineModCacheErr != nil {
+		t.Skipf("offline installer build test needs a network-seeded or AGENTBUS_OFFLINE_MODCACHE module cache; skipping: %v", offlineModCacheErr)
+	}
+	if offlineModCachePath == "" {
+		t.Skip("offline installer build test needs a network-seeded or AGENTBUS_OFFLINE_MODCACHE module cache; skipping")
+	}
+	return offlineModCachePath
 }
 
 func commandEnv(t *testing.T, overrides map[string]string) []string {
