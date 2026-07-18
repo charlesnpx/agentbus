@@ -33,6 +33,7 @@ type ProcessCustodian interface {
 	processCustodian()
 	Prepare(context.Context, command.ExecSpec, model.LaunchKey) (PreparedProcess, error)
 	ContainAndVerify(context.Context, model.GroupRef, QuiescenceCause) (VerifiedQuiescence, error)
+	ActiveCustodyCount() int
 }
 
 type PreparedProcess interface {
@@ -61,6 +62,10 @@ func (UnavailableCustodian) Prepare(context.Context, command.ExecSpec, model.Lau
 
 func (UnavailableCustodian) ContainAndVerify(context.Context, model.GroupRef, QuiescenceCause) (VerifiedQuiescence, error) {
 	return VerifiedQuiescence{}, ErrSupervisorUnavailable
+}
+
+func (UnavailableCustodian) ActiveCustodyCount() int {
+	return 0
 }
 
 // Support reports separate lifecycle facts: compiled-in implementation,
@@ -157,6 +162,13 @@ func NewUnavailableRuntime(reason error) Runtime {
 
 func (runtime Runtime) Process() ProcessCustodian {
 	return runtime.process
+}
+
+func (runtime Runtime) ActiveCustodyCount() int {
+	if runtime.process == nil {
+		return 0
+	}
+	return runtime.process.ActiveCustodyCount()
 }
 
 func (runtime Runtime) Verifier() AttestationVerifier {

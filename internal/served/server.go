@@ -32,6 +32,7 @@ import (
 const (
 	defaultLeaseDuration = 5 * time.Minute
 	defaultHeartbeat     = 30 * time.Second
+	defaultSafetyDrain   = 30 * time.Second
 )
 
 const duplicateAuthorityJSONWarning = "duplicate-job-id: authority record also has legacy JSON record; authority selected"
@@ -86,6 +87,10 @@ func newTickerSource(interval time.Duration) tickerSource {
 	return tickerSource{c: ticker.C, stop: ticker.Stop}
 }
 
+type admissionOwnedWorkChecker interface {
+	HasOwnedWork(context.Context) (bool, error)
+}
+
 // Server serves the protocol v1 socket API over engine backends.
 type Server struct {
 	stateRoot              string
@@ -118,12 +123,16 @@ type Server struct {
 	reapTickFactory        func(time.Duration) tickerSource
 	afterReapTickHook      func(error)
 	listenerFactory        func() (net.Listener, socketFileIdentity, error)
+	safetyLatch            *SafetyLatch
+	safetyDrainTimeout     time.Duration
 	jobsRequestIDEnabled   bool
 	admissionSubmitMu      sync.Mutex
+	resultPublications     atomic.Int64
 
 	admissionBootstrapper        *admissionBootstrapper
 	admissionReady               *admissionReady
 	admissionCoordinator         *admissionCoordinator
+	admissionOwnedWorkChecker    admissionOwnedWorkChecker
 	admissionSubmission          *servedSubmissionCoordinator
 	admissionSupervisor          *servedAdmissionSupervisor
 	admissionRepository          repository.Repository
@@ -319,6 +328,8 @@ func New(cfg Config) (*Server, error) {
 		gcInterval:          gcInterval,
 		reapTickInterval:    reapTickInterval,
 		reapTickFactory:     newTickerSource,
+		safetyLatch:         NewSafetyLatch(),
+		safetyDrainTimeout:  defaultSafetyDrain,
 		sessions:            make(map[string]*sessionState),
 		stores:              make(map[string]*engine.Store),
 		storesByKey:         make(map[string]*engine.Store),
@@ -356,11 +367,16 @@ func TokenPath(stateRoot string) (string, error) {
 
 // Serve listens on the configured Unix socket until ctx is canceled or idle shutdown fires.
 func (s *Server) Serve(ctx context.Context) error {
+	s.ensureSafetyLatch()
 	if err := s.captureBinaryIdentity(); err != nil {
 		return err
 	}
 	if s.jobsRequestIDEnabled {
 		if err := s.bootstrapAdmission(ctx); err != nil {
+			if errors.Is(err, authority.ErrFailStopped) {
+				s.safetyLatch.Trip(err)
+				return s.safetyFailStopErr()
+			}
 			return err
 		}
 		if s.admissionClose != nil {
@@ -393,6 +409,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	// pair a fresh channel with a spent sync.Once.
 	acceptSettled := make(chan struct{})
 	var settleOnce sync.Once
+	safetyDone := make(chan error, 1)
+	go s.safetyLoop(ctx, cancel, ln, socketIdentity, acceptSettled, safetyDone)
 	go s.idleLoop(ctx, cancel, ln, socketIdentity, acceptSettled)
 	for {
 		conn, err := ln.Accept()
@@ -402,6 +420,15 @@ func (s *Server) Serve(ctx context.Context) error {
 			// registration. Signal that so the stale drain can trust the
 			// client counter (closes the post-Accept pre-register window).
 			settleOnce.Do(func() { close(acceptSettled) })
+			failStopErr := s.safetyFailStopErr()
+			if failStopErr != nil {
+				select {
+				case drainedErr := <-safetyDone:
+					return drainedErr
+				case <-ctx.Done():
+					return failStopErr
+				}
+			}
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -409,7 +436,14 @@ func (s *Server) Serve(ctx context.Context) error {
 				// A stale daemon closes its listener before it cancels the
 				// context, so connections already accepted by this loop can
 				// register and drain without accepting any new connections.
-				<-ctx.Done()
+				select {
+				case failStopErr := <-safetyDone:
+					return failStopErr
+				case <-ctx.Done():
+					if failStopErr := s.safetyFailStopErr(); failStopErr != nil {
+						return failStopErr
+					}
+				}
 				return nil
 			}
 			return err
@@ -425,6 +459,13 @@ func (s *Server) Serve(ctx context.Context) error {
 			c.serve(ctx)
 		}()
 	}
+}
+
+func (s *Server) ensureSafetyLatch() {
+	if s.safetyLatch != nil {
+		return
+	}
+	s.safetyLatch = NewSafetyLatch()
 }
 
 func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
@@ -553,6 +594,96 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net
 	}
 }
 
+func (s *Server) safetyLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener, socketIdentity socketFileIdentity, acceptSettled <-chan struct{}, done chan<- error) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-s.safetyLatch.Done():
+	}
+
+	failStopErr := s.safetyFailStopErr()
+	log.Printf("agentbus daemon: safety latch tripped; closing listener: %v", failStopErr)
+	if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Printf("agentbus daemon: close fail-stopped listener: %v", err)
+	}
+	s.removeOwnedSocket(socketIdentity, "safety fail-stop")
+
+	drainTimeout := s.safetyDrainTimeout
+	if drainTimeout <= 0 {
+		drainTimeout = defaultSafetyDrain
+	}
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	probeResults := make(chan bool, 1)
+	probeRunning := false
+	startDrainProbe := func() {
+		if probeRunning {
+			return
+		}
+		settled := false
+		select {
+		case <-acceptSettled:
+			settled = true
+		default:
+		}
+		// The accept loop must first confirm that every connection returned
+		// before listener close has been registered in the client counters.
+		if !settled || s.clients.Load() != 0 || s.accepting.Load() != 0 {
+			return
+		}
+		probeRunning = true
+		probeCtx, probeCancel := context.WithTimeout(ctx, drainTimeout)
+		go func() {
+			defer probeCancel()
+			probeResults <- !s.activeWorkWithContext(probeCtx)
+		}()
+	}
+	startDrainProbe()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			err := fmt.Errorf("%w; safety drain timed out after %s", failStopErr, drainTimeout)
+			log.Printf("agentbus daemon: safety fail-stop drain timed out; exiting: %v", err)
+			select {
+			case done <- err:
+			default:
+			}
+			cancel()
+			return
+		case drained := <-probeResults:
+			probeRunning = false
+			if drained {
+				log.Printf("agentbus daemon: safety fail-stop drain complete; exiting: %v", failStopErr)
+				select {
+				case done <- failStopErr:
+				default:
+				}
+				cancel()
+				return
+			}
+			startDrainProbe()
+		case <-ticker.C:
+			startDrainProbe()
+		}
+	}
+}
+
+func (s *Server) safetyFailStopErr() error {
+	if s == nil || s.safetyLatch == nil {
+		return nil
+	}
+	reason := s.safetyLatch.Reason()
+	if reason == nil {
+		return nil
+	}
+	return SafetyFailStopError{Reason: reason}
+}
+
 func statSocketFileIdentity(path string) (socketFileIdentity, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -646,9 +777,37 @@ func (s *Server) checkBinaryStale() bool {
 }
 
 func (s *Server) activeWork() bool {
+	return s.activeWorkWithContext(context.Background())
+}
+
+func (s *Server) activeWorkWithContext(ctx context.Context) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.activeJobs) > 0
+	activeJobs := len(s.activeJobs)
+	s.mu.Unlock()
+	if activeJobs > 0 {
+		return true
+	}
+	if s.resultPublications.Load() > 0 {
+		return true
+	}
+	checker := s.admissionOwnedWorkChecker
+	if checker == nil && s.admissionCoordinator != nil {
+		checker = s.admissionCoordinator
+	}
+	if checker != nil {
+		owned, err := checker.HasOwnedWork(ctx)
+		if err != nil && s.safetyFailStopErr() == nil {
+			log.Printf("agentbus daemon: admission active-work check failed: %v", err)
+		}
+		if err != nil || owned {
+			return true
+		}
+	}
+	if s.admissionSupervisor != nil && s.admissionSupervisor.hasActiveCustodies() {
+		return true
+	}
+	// TODO(S4E-b): include pending recovery executor work once recovery execution lands.
+	return false
 }
 
 func (s *Server) touchActivity() {
@@ -665,6 +824,8 @@ type connection struct {
 }
 
 func (c *connection) serve(ctx context.Context) {
+	stopFailStopClose := c.closeOnFailStop()
+	defer stopFailStopClose()
 	defer c.conn.Close()
 	scanner := bufio.NewScanner(c.conn)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -704,6 +865,21 @@ func (c *connection) serve(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (c *connection) closeOnFailStop() func() {
+	if c == nil || c.server == nil || c.server.safetyLatch == nil || c.conn == nil {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	go func(done <-chan struct{}) {
+		select {
+		case <-done:
+			_ = c.conn.Close()
+		case <-stop:
+		}
+	}(c.server.safetyLatch.Done())
+	return func() { close(stop) }
 }
 
 func requiresRequestID(method string) bool {
@@ -758,6 +934,9 @@ func (s *Server) handle(ctx context.Context, c *connection, req protocol.Request
 	if c.hello && req.Method == protocol.MethodHello {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "protocol.hello has already been completed on this connection", protocol.ErrorData{})}
 	}
+	if errObj := s.failStoppedRequestError(req.Method); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
 	switch req.Method {
 	case protocol.MethodHello:
 		return s.handleHello(c, req.Params)
@@ -785,6 +964,30 @@ func (s *Server) handle(ctx context.Context, c *connection, req protocol.Request
 		return s.handlePolicyRegister(req.Params)
 	default:
 		return requestOutcome{err: protocol.NewError(protocol.ErrorCapabilityMissing, "unknown method", protocol.ErrorData{})}
+	}
+}
+
+func (s *Server) failStoppedRequestError(method string) *protocol.ErrorObject {
+	if failStoppedMethodAllowed(method) {
+		return nil
+	}
+	failStopErr := s.safetyFailStopErr()
+	if failStopErr == nil {
+		return nil
+	}
+	return protocol.NewError(protocol.ErrorBackendUnavailable, failStopErr.Error(), protocol.ErrorData{})
+}
+
+func failStoppedMethodAllowed(method string) bool {
+	switch method {
+	case protocol.MethodHello,
+		protocol.MethodSessionList,
+		protocol.MethodJobStatus,
+		protocol.MethodJobResult,
+		protocol.MethodPolicyValidate:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -824,6 +1027,9 @@ func (s *Server) backendMetadata() []protocol.BackendInfo {
 }
 
 func (s *Server) handleSessionStart(ctx context.Context, raw json.RawMessage) requestOutcome {
+	if errObj := s.failStoppedRequestError(protocol.MethodSessionStart); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
 	var params protocol.SessionStartParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
@@ -861,6 +1067,9 @@ func (s *Server) handleSessionStart(ctx context.Context, raw json.RawMessage) re
 }
 
 func (s *Server) handleSessionResume(ctx context.Context, raw json.RawMessage) requestOutcome {
+	if errObj := s.failStoppedRequestError(protocol.MethodSessionResume); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
 	var params protocol.SessionResumeParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
@@ -941,6 +1150,9 @@ func (s *Server) handleSessionList(raw json.RawMessage) requestOutcome {
 }
 
 func (s *Server) handleTurnStart(ctx context.Context, c *connection, raw json.RawMessage) requestOutcome {
+	if errObj := s.failStoppedRequestError(protocol.MethodTurnStart); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
 	var params protocol.TurnStartParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
@@ -1016,6 +1228,9 @@ func (s *Server) handleTurnStart(ctx context.Context, c *connection, raw json.Ra
 }
 
 func (s *Server) handleTurnInterrupt(raw json.RawMessage) requestOutcome {
+	if errObj := s.failStoppedRequestError(protocol.MethodTurnInterrupt); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
 	var params protocol.TurnInterruptParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
@@ -1054,6 +1269,9 @@ func (s *Server) handleTurnInterrupt(raw json.RawMessage) requestOutcome {
 }
 
 func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) requestOutcome {
+	if errObj := s.failStoppedRequestError(protocol.MethodJobSubmit); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
 	var params protocol.JobSubmitParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
@@ -1219,6 +1437,9 @@ func (s *Server) jsonJobRecord(jobID string) (*engine.JobRecord, bool, *protocol
 }
 
 func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
+	if errObj := s.failStoppedRequestError(protocol.MethodJobCancel); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
 	var params protocol.JobCancelParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
@@ -1342,6 +1563,9 @@ func (s *Server) handlePolicyValidate(raw json.RawMessage) requestOutcome {
 }
 
 func (s *Server) handlePolicyRegister(raw json.RawMessage) requestOutcome {
+	if errObj := s.failStoppedRequestError(protocol.MethodPolicyRegister); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
 	var params protocol.PolicyRegisterParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)

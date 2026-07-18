@@ -83,6 +83,23 @@ func (s *servedAdmissionSupervisor) launchPort() launch.CustodianPort {
 	return runtimeLaunchCustodian{runtime: s.runtime}
 }
 
+type admissionActiveCustodyReporter interface {
+	HasActiveCustodies() bool
+}
+
+func (s *servedAdmissionSupervisor) hasActiveCustodies() bool {
+	if s == nil {
+		return false
+	}
+	if s.runtime.ActiveCustodyCount() > 0 {
+		return true
+	}
+	if reporter, ok := s.launchCustodian.(admissionActiveCustodyReporter); ok && reporter.HasActiveCustodies() {
+		return true
+	}
+	return false
+}
+
 type runtimeLaunchCustodian struct {
 	runtime custodian.Runtime
 }
@@ -97,6 +114,10 @@ func (c runtimeLaunchCustodian) Prepare(ctx context.Context, spec command.ExecSp
 
 func (c runtimeLaunchCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
 	return c.runtime.Process().ContainAndVerify(ctx, group, cause)
+}
+
+func (c runtimeLaunchCustodian) HasActiveCustodies() bool {
+	return c.runtime.ActiveCustodyCount() > 0
 }
 
 type runtimePreparedProcess struct {
@@ -218,6 +239,10 @@ type servedResultPublisher struct {
 }
 
 func (p servedResultPublisher) Publish(ctx context.Context, jobID model.JobID, payload []byte) (model.ResultReceipt, error) {
+	if p.server != nil {
+		p.server.resultPublications.Add(1)
+		defer p.server.resultPublications.Add(-1)
+	}
 	if err := ctx.Err(); err != nil {
 		return model.ResultReceipt{}, err
 	}
@@ -274,6 +299,10 @@ func servedResultReceipt(jobID model.JobID, info engine.ResultInfo) model.Result
 }
 
 func (p servedResultPublisher) Verify(ctx context.Context, result model.ResultRef) (model.ResultReceipt, error) {
+	if p.server != nil {
+		p.server.resultPublications.Add(1)
+		defer p.server.resultPublications.Add(-1)
+	}
 	if err := ctx.Err(); err != nil {
 		return model.ResultReceipt{}, err
 	}

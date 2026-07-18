@@ -87,12 +87,12 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	adapter := &servedAdmissionAuthority{ready: ready}
+	adapter := &servedAdmissionAuthority{ready: ready, latch: s.safetyLatch}
 	owner, err := model.NewOwnerID(s.nextID("coordinator"))
 	if err != nil {
 		return err
 	}
-	launchController, err := launch.New(servedLaunchAuthority{ready: ready}, supervisor.launchPort())
+	launchController, err := launch.New(servedLaunchAuthority{ready: ready, latch: s.safetyLatch}, supervisor.launchPort())
 	if err != nil {
 		return err
 	}
@@ -104,11 +104,13 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		ready:  ready,
 		owner:  owner,
 		launch: launchController,
+		latch:  s.safetyLatch,
 	}
 
 	s.admissionBootstrapper = bootstrapper
 	s.admissionReady = ready
 	s.admissionCoordinator = coord
+	s.admissionOwnedWorkChecker = coord
 	s.admissionSubmission = submission
 	s.admissionSupervisor = supervisor
 	s.admissionRepository = repo
@@ -134,6 +136,7 @@ func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootst
 		path:        filepath.Join(s.stateRoot, admissionAnchorFile),
 		dbUUID:      dbUUID,
 		schemaMajor: schemaMajor,
+		latch:       s.safetyLatch,
 	}
 	options := []authority.BootstrapperOption{authority.WithAnchor(anchor)}
 	if s.admissionSupervisor != nil {
@@ -223,6 +226,7 @@ type fileAuthorityAnchor struct {
 	path        string
 	dbUUID      string
 	schemaMajor uint16
+	latch       *SafetyLatch
 }
 
 func (a *fileAuthorityAnchor) Begin(ctx context.Context, boot model.BootRef, generation uint64) (string, error) {
@@ -338,7 +342,11 @@ func (a *fileAuthorityAnchor) FailStop(ctx context.Context, boot model.BootRef, 
 	snapshot.Phase = "fail_stopped"
 	snapshot.Boot = boot
 	snapshot.Reason = reason
-	return a.save(snapshot)
+	if err := a.save(snapshot); err != nil {
+		return err
+	}
+	a.latch.Trip(safetyFailStopReason(reason))
+	return nil
 }
 
 func (a *fileAuthorityAnchor) VerifyReady(boot model.BootRef, token string, generation uint64) error {
@@ -448,6 +456,7 @@ type servedSubmissionCoordinator struct {
 	ready  *authority.Ready
 	owner  model.OwnerID
 	launch *launch.LaunchController
+	latch  *SafetyLatch
 }
 
 var _ authority.SubmissionCoordinator = (*servedSubmissionCoordinator)(nil)
@@ -724,10 +733,32 @@ func (c *servedSubmissionCoordinator) failStop(ctx context.Context, err error) e
 	}
 	failStopCtx, cancel := detachedAdmissionFailStopContext(ctx)
 	defer cancel()
+	var stopErr error
 	if err == nil {
-		return c.ready.FailStop(failStopCtx, "")
+		stopErr = c.ready.FailStop(failStopCtx, "")
+	} else {
+		stopErr = c.ready.FailStop(failStopCtx, err.Error())
 	}
-	return c.ready.FailStop(failStopCtx, err.Error())
+	if stopErr == nil {
+		c.latch.Trip(err)
+	}
+	return stopErr
+}
+
+func (s *Server) failStopAdmissionReady(ctx context.Context, err error) error {
+	if s == nil || s.admissionReady == nil {
+		return authority.ErrNotReady
+	}
+	var stopErr error
+	if err == nil {
+		stopErr = s.admissionReady.FailStop(ctx, "")
+	} else {
+		stopErr = s.admissionReady.FailStop(ctx, err.Error())
+	}
+	if stopErr == nil {
+		s.safetyLatch.Trip(err)
+	}
+	return stopErr
 }
 
 func detachedAdmissionFailStopContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -1130,6 +1161,7 @@ func admissionDurabilityError(step string, outcome launch.DurabilityOutcome, err
 
 type servedLaunchAuthority struct {
 	ready *authority.Ready
+	latch *SafetyLatch
 }
 
 func (a servedLaunchAuthority) BindGroup(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, group model.GroupRef) (launch.DurabilityOutcome, error) {
@@ -1167,14 +1199,21 @@ func (a servedLaunchAuthority) FailStop(ctx context.Context, err error) error {
 	if a.ready == nil {
 		return authority.ErrNotReady
 	}
+	var stopErr error
 	if err == nil {
-		return a.ready.FailStop(ctx, "")
+		stopErr = a.ready.FailStop(ctx, "")
+	} else {
+		stopErr = a.ready.FailStop(ctx, err.Error())
 	}
-	return a.ready.FailStop(ctx, err.Error())
+	if stopErr == nil {
+		a.latch.Trip(err)
+	}
+	return stopErr
 }
 
 type servedAdmissionAuthority struct {
 	ready *authority.Ready
+	latch *SafetyLatch
 }
 
 func (a *servedAdmissionAuthority) Accept(ctx context.Context, request coordinator.AdmissionRequest) (coordinator.AdmissionResult, error) {
@@ -1275,10 +1314,19 @@ func (a *servedAdmissionAuthority) HasOwnedWork(ctx context.Context) (bool, erro
 }
 
 func (a *servedAdmissionAuthority) FailStop(ctx context.Context, err error) error {
-	if err == nil {
-		return a.ready.FailStop(ctx, "")
+	if a == nil || a.ready == nil {
+		return authority.ErrNotReady
 	}
-	return a.ready.FailStop(ctx, err.Error())
+	var stopErr error
+	if err == nil {
+		stopErr = a.ready.FailStop(ctx, "")
+	} else {
+		stopErr = a.ready.FailStop(ctx, err.Error())
+	}
+	if stopErr == nil {
+		a.latch.Trip(err)
+	}
+	return stopErr
 }
 
 func admissionHasAuthorizationEvidence(record model.SafetyRecord) bool {
@@ -1601,13 +1649,13 @@ func (s *Server) handleAdmissionResponseOutcome(ctx context.Context, run jobRun,
 			err = s.admissionSubmission.rejectLegacyFencedBeforePrepare(ctx, run.admissionAccepted)
 		}
 		if err != nil && s.admissionReady != nil {
-			_ = s.admissionReady.FailStop(ctx, err.Error())
+			_ = s.failStopAdmissionReady(ctx, err)
 		}
 	case model.RunLegacyUnfenced:
 		go s.launchLegacyUnfencedJob(ctx, run)
 	case model.RejectLegacyUnfencedBeforeRun:
 		if err := s.admissionSubmission.rejectLegacyUnfencedBeforeRun(ctx, run.admissionAccepted); err != nil && s.admissionReady != nil {
-			_ = s.admissionReady.FailStop(ctx, err.Error())
+			_ = s.failStopAdmissionReady(ctx, err)
 		}
 	}
 }

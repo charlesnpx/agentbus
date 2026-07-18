@@ -165,6 +165,15 @@ func NewNativeRuntime(options NativeOptions) (Runtime, error) {
 
 func (custodian *NativeCustodian) processCustodian() {}
 
+func (custodian *NativeCustodian) ActiveCustodyCount() int {
+	if custodian == nil {
+		return 0
+	}
+	custodian.mu.Lock()
+	defer custodian.mu.Unlock()
+	return len(custodian.running)
+}
+
 func (custodian *NativeCustodian) Prepare(context.Context, command.ExecSpec, model.LaunchKey) (PreparedProcess, error) {
 	return nil, fmt.Errorf("%w: Prepare/Release is owned by S4 launch-controller wiring", ErrNativePreparedBoundary)
 }

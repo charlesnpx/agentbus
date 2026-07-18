@@ -24,6 +24,16 @@ func TestAttestationChannelsRejectCrossChannelQuiescence(t *testing.T) {
 	}
 }
 
+func TestUnavailableRuntimeActiveCustodyCountIsZero(t *testing.T) {
+	runtime := NewUnavailableRuntime(nil)
+	if got := runtime.ActiveCustodyCount(); got != 0 {
+		t.Fatalf("NewUnavailableRuntime ActiveCustodyCount() = %d, want 0", got)
+	}
+	if got := runtime.Process().ActiveCustodyCount(); got != 0 {
+		t.Fatalf("UnavailableCustodian ActiveCustodyCount() = %d, want 0", got)
+	}
+}
+
 func TestPhysicalQuiescenceCarriesOnlyPhysicalFields(t *testing.T) {
 	payloadType := reflect.TypeOf(PhysicalQuiescence{})
 	if payloadType.NumField() != 2 {

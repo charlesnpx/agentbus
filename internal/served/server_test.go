@@ -1438,6 +1438,258 @@ func TestIdentifiedFencedPostAcceptAdvanceFailureFailsClosedAndRetainsAuthorityR
 	}
 }
 
+func TestServeStopsOnDurableFailStopAndForceClosesConnections(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	var server *Server
+	h := startTestServerWithHooks(t, backend, Config{IdleTimeout: -1}, func(s *Server) {
+		server = s
+		s.safetyDrainTimeout = 100 * time.Millisecond
+		enableTestAdmission(t, s, launcher)
+	})
+
+	conn := dialRaw(t, h.socketPath)
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	reason := "test durable fail-stop closes listener"
+	if err := server.admissionReady.FailStop(context.Background(), reason); err != nil {
+		t.Fatal(err)
+	}
+	if got := server.safetyLatch.Reason(); got == nil || !strings.Contains(got.Error(), reason) {
+		t.Fatalf("safety latch reason = %v, want %q", got, reason)
+	}
+	waitForSocketRemoved(t, h.socketPath, h.done)
+
+	waitForConnClosed(t, conn, r, "safety fail-stop")
+
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-h.done:
+		if err == nil || !errors.Is(err, ErrSafetyFailStopped) || !strings.Contains(err.Error(), reason) || !strings.Contains(err.Error(), "safety drain timed out") {
+			t.Fatalf("Serve error = %v, want non-nil timed-out safety fail-stop with reason", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not exit after fail-stop drain bound")
+	}
+
+	server.safetyLatch.Trip(errors.New("second fail-stop reason"))
+	if got := server.safetyLatch.Reason(); got == nil || !strings.Contains(got.Error(), reason) {
+		t.Fatalf("safety latch reason after second trip = %v, want first reason", got)
+	}
+}
+
+func TestServerContextCancelDoesNotForceCloseEstablishedConnection(t *testing.T) {
+	t.Parallel()
+	h := startTestServer(t, newFakeBackend("fake"), Config{IdleTimeout: -1})
+	conn := dialRaw(t, h.socketPath)
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	h.cancel()
+	select {
+	case err := <-h.done:
+		if err != nil {
+			t.Fatalf("Serve error after context cancel = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop after context cancel")
+	}
+	assertConnRemainsOpenFor(t, conn, r, 80*time.Millisecond, "ordinary server context cancellation")
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestActiveWorkCountsAuthorityOwnedCustodyAndResultPublication(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	if server.activeWork() {
+		t.Fatal("fresh admission server reported active work")
+	}
+
+	accepted := acceptIdentifiedAuthorityWork(t, server, "active-work-owned")
+	if !server.activeWork() {
+		t.Fatal("authority-owned accepted work was not counted as active")
+	}
+	finalizeAcceptedAuthorityWork(t, server, accepted)
+	if server.activeWork() {
+		t.Fatal("terminal authority work was still counted as active")
+	}
+
+	server.resultPublications.Add(1)
+	if !server.activeWork() {
+		t.Fatal("in-flight result publication was not counted as active")
+	}
+	server.resultPublications.Add(-1)
+	if server.activeWork() {
+		t.Fatal("completed result publication was still counted as active")
+	}
+
+	launcher.activeCustodies.Store(true)
+	if !server.activeWork() {
+		t.Fatal("active custody was not counted as active")
+	}
+	launcher.activeCustodies.Store(false)
+	if server.activeWork() {
+		t.Fatal("cleared active custody was still counted as active")
+	}
+}
+
+func TestActiveWorkFailsClosedWhenAuthorityOwnershipCheckErrors(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	_ = acceptIdentifiedAuthorityWork(t, server, "active-work-fail-closed")
+
+	reason := "test fail-stop makes ownership read unavailable"
+	if err := server.admissionReady.FailStop(context.Background(), reason); err != nil {
+		t.Fatal(err)
+	}
+	if !server.activeWork() {
+		t.Fatal("activeWork returned idle after authority ownership check failed")
+	}
+}
+
+func TestSafetyFailStopDrainWaitsForBoundWhenAuthorityOwnershipCheckErrors(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	drainTimeout := 120 * time.Millisecond
+	var server *Server
+	h := startTestServerWithHooks(t, backend, Config{IdleTimeout: -1}, func(s *Server) {
+		server = s
+		s.safetyDrainTimeout = drainTimeout
+		enableTestAdmission(t, s, launcher)
+	})
+	_ = acceptIdentifiedAuthorityWork(t, server, "fail-stop-drain-owned")
+
+	reason := "test fail-stop drain waits for bounded timeout"
+	if err := server.admissionReady.FailStop(context.Background(), reason); err != nil {
+		t.Fatal(err)
+	}
+	assertServerStillRunning(t, h.done, "authority ownership check failed during fail-stop drain")
+	select {
+	case err := <-h.done:
+		if err == nil || !errors.Is(err, ErrSafetyFailStopped) || !strings.Contains(err.Error(), reason) || !strings.Contains(err.Error(), "safety drain timed out") {
+			t.Fatalf("Serve error = %v, want timed-out safety fail-stop with reason", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not exit at the safety drain bound")
+	}
+}
+
+func TestSafetyFailStopDrainDeadlineWinsOverStalledOwnershipProbe(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	drainTimeout := 80 * time.Millisecond
+	blocker := newBlockingOwnedWorkChecker()
+	t.Cleanup(blocker.releaseProbe)
+	var server *Server
+	h := startTestServerWithHooks(t, backend, Config{IdleTimeout: -1}, func(s *Server) {
+		server = s
+		s.safetyDrainTimeout = drainTimeout
+		enableTestAdmission(t, s, launcher)
+		s.admissionOwnedWorkChecker = blocker
+	})
+
+	reason := "test fail-stop drain deadline ignores stalled ownership probe"
+	trippedAt := time.Now()
+	if err := server.admissionReady.FailStop(context.Background(), reason); err != nil {
+		t.Fatal(err)
+	}
+	waitForSocketRemoved(t, h.socketPath, h.done)
+	select {
+	case <-blocker.started:
+	case <-time.After(time.Second):
+		t.Fatal("ownership probe was not started during fail-stop drain")
+	}
+	if conn, err := net.DialTimeout("unix", h.socketPath, 20*time.Millisecond); err == nil {
+		_ = conn.Close()
+		t.Fatal("new connection succeeded after safety fail-stop listener close")
+	}
+	if errObj := server.failStoppedRequestError(protocol.MethodJobSubmit); errObj == nil || errObj.Data.Code != protocol.ErrorBackendUnavailable {
+		t.Fatalf("job.submit rejection = %+v, want backend_unavailable after fail-stop", errObj)
+	}
+
+	select {
+	case err := <-h.done:
+		if err == nil || !errors.Is(err, ErrSafetyFailStopped) || !strings.Contains(err.Error(), reason) || !strings.Contains(err.Error(), "safety drain timed out") {
+			t.Fatalf("Serve error = %v, want timed-out safety fail-stop with reason", err)
+		}
+		if elapsed := time.Since(trippedAt); elapsed > 500*time.Millisecond {
+			t.Fatalf("Serve returned after %s, want bounded exit independent of stalled ownership probe", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("server did not exit while ownership probe was stalled")
+	}
+}
+
+func TestIdleShutdownFailsClosedOnAdmissionOwnershipReadError(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	var server *Server
+	h := startTestServerWithHooks(t, backend, Config{
+		IdleTimeout:       80 * time.Millisecond,
+		IdleCheckInterval: 20 * time.Millisecond,
+	}, func(s *Server) {
+		server = s
+		enableTestAdmission(t, s, launcher)
+	})
+	if server.admissionClose == nil {
+		t.Fatal("admission repository closer is nil")
+	}
+	if err := server.admissionClose.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-h.done:
+		t.Fatalf("server idle-shutdown after admission ownership read error: %v", err)
+	case <-time.After(180 * time.Millisecond):
+	}
+	stopTestServer(t, h)
+}
+
+func TestIdleShutdownWaitsForAuthorityOwnedWork(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	var server *Server
+	h := startTestServerWithHooks(t, backend, Config{
+		IdleTimeout:       120 * time.Millisecond,
+		IdleCheckInterval: 20 * time.Millisecond,
+	}, func(s *Server) {
+		server = s
+		enableTestAdmission(t, s, launcher)
+	})
+
+	accepted := acceptIdentifiedAuthorityWork(t, server, "idle-authority-owned")
+	select {
+	case err := <-h.done:
+		t.Fatalf("server stopped while authority work was active: %v", err)
+	case <-time.After(260 * time.Millisecond):
+	}
+
+	finalizeAcceptedAuthorityWork(t, server, accepted)
+	select {
+	case err := <-h.done:
+		if err != nil {
+			t.Fatalf("server idle-shutdown error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not idle-shutdown after authority work became quiet")
+	}
+}
+
 func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 	t.Parallel()
 	var turns atomic.Int64
@@ -2881,6 +3133,30 @@ func (p *binaryChangeProbe) probe(string) (BinaryIdentity, error) {
 	return BinaryIdentity{ModTime: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC), Size: size}, nil
 }
 
+type blockingOwnedWorkChecker struct {
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func newBlockingOwnedWorkChecker() *blockingOwnedWorkChecker {
+	return &blockingOwnedWorkChecker{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (c *blockingOwnedWorkChecker) HasOwnedWork(context.Context) (bool, error) {
+	c.startedOnce.Do(func() { close(c.started) })
+	<-c.release
+	return false, nil
+}
+
+func (c *blockingOwnedWorkChecker) releaseProbe() {
+	c.releaseOnce.Do(func() { close(c.release) })
+}
+
 func assertServerStillRunning(t *testing.T, done <-chan error, reason string) {
 	t.Helper()
 	select {
@@ -2967,6 +3243,70 @@ func waitForSocket(t *testing.T, socketPath string, done <-chan error) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("socket %s did not become ready", socketPath)
+}
+
+func waitForSocketRemoved(t *testing.T, socketPath string, done <-chan error) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Lstat(socketPath); errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("server exited before socket removal was observed: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("socket %s was not removed", socketPath)
+}
+
+func assertConnRemainsOpenFor(t *testing.T, conn net.Conn, r *bufio.Reader, duration time.Duration, reason string) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(duration)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Peek(1)
+	if resetErr := conn.SetReadDeadline(time.Time{}); resetErr != nil {
+		t.Fatal(resetErr)
+	}
+	if isNetTimeout(err) {
+		return
+	}
+	if err == nil {
+		t.Fatalf("connection produced unexpected data after %s", reason)
+	}
+	t.Fatalf("connection closed after %s: %v", reason, err)
+}
+
+func waitForConnClosed(t *testing.T, conn net.Conn, r *bufio.Reader, reason string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		_, err := r.Peek(1)
+		if err == nil {
+			t.Fatalf("connection produced unexpected data while waiting for close after %s", reason)
+		}
+		if !isNetTimeout(err) {
+			if resetErr := conn.SetReadDeadline(time.Time{}); resetErr != nil {
+				t.Fatal(resetErr)
+			}
+			return
+		}
+	}
+	if resetErr := conn.SetReadDeadline(time.Time{}); resetErr != nil {
+		t.Fatal(resetErr)
+	}
+	t.Fatalf("connection was not closed after %s", reason)
+}
+
+func isNetTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func dialRaw(t *testing.T, socketPath string) net.Conn {
@@ -3059,6 +3399,30 @@ func prepareLegacyFencedCommandForTest(t *testing.T, server *Server, requestID s
 	return cmd
 }
 
+func acceptIdentifiedAuthorityWork(t *testing.T, server *Server, requestID string) authority.AcceptResult {
+	t.Helper()
+	accepted, err := server.admissionSubmission.SubmitIdentified(context.Background(), authority.AcceptRequest{
+		RequestKey:   model.RequestKey{WorkspaceKey: model.WorkspaceKey("workspace/" + requestID), RequestID: model.RequestID(requestID)},
+		TaskIdentity: model.NewSHA256TaskIdentity([]byte(requestID)),
+		SessionID:    "session-" + requestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return accepted
+}
+
+func finalizeAcceptedAuthorityWork(t *testing.T, server *Server, accepted authority.AcceptResult) {
+	t.Helper()
+	_, err := server.admissionReady.Finalize(context.Background(), accepted.Record.JobID, accepted.Record.Attempt.Ref, model.TerminalIntent{
+		Outcome: model.OutcomeCanceled,
+		Cause:   model.CauseCanceledBeforeAuthorization,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func assertLegacyFencedAbortUsedDetachedContext(t *testing.T, launcher *admissionFakeLaunchCustodian) {
 	t.Helper()
 	if got := launcher.abortCount(); got != 1 {
@@ -3116,6 +3480,7 @@ type admissionFakeLaunchCustodian struct {
 	abortRespectContext     bool
 	abortWaitForContextDone bool
 	waitAndVerify           <-chan struct{}
+	activeCustodies         atomic.Bool
 }
 
 func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.ExecSpec, key model.LaunchKey) (launch.PreparedProcess, error) {
@@ -3191,6 +3556,10 @@ func (c *admissionFakeLaunchCustodian) containCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.contains
+}
+
+func (c *admissionFakeLaunchCustodian) HasActiveCustodies() bool {
+	return c != nil && c.activeCustodies.Load()
 }
 
 func (c *admissionFakeLaunchCustodian) abortContextObservations() ([]error, []bool) {

@@ -871,6 +871,13 @@ func TestCustodianContainAndVerifyUsesFinalizedCacheAfterRunningEviction(t *test
 		group:     quiescence.Group,
 	}
 	native.running[groupKey(quiescence.Group)] = process
+	if got := native.ActiveCustodyCount(); got != 1 {
+		t.Fatalf("ActiveCustodyCount() with running process = %d, want 1", got)
+	}
+	runtimeBundle := Runtime{process: native}
+	if got := runtimeBundle.ActiveCustodyCount(); got != 1 {
+		t.Fatalf("Runtime ActiveCustodyCount() with native process = %d, want 1", got)
+	}
 	finalOutcome := PhysicalOutcome{
 		Kind:     PhysicalOutcomeAbsent,
 		Group:    quiescence.Group,
@@ -894,6 +901,9 @@ func TestCustodianContainAndVerifyUsesFinalizedCacheAfterRunningEviction(t *test
 	}
 	if native.lookup(quiescence.Group) != nil {
 		t.Fatal("running lookup returned process after finalization, want eviction")
+	}
+	if got := native.ActiveCustodyCount(); got != 0 {
+		t.Fatalf("ActiveCustodyCount() after finalized eviction = %d, want 0", got)
 	}
 
 	second, err := native.ContainAndVerify(context.Background(), quiescence.Group, QuiescenceCauseContain)
