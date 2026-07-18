@@ -53,23 +53,23 @@ func TestRecoveryTokenRecordsQuiescenceAndRederivesNextAction(t *testing.T) {
 		t.Fatalf("replayed quiescence token error = %v, want ErrReplayConflict", err)
 	}
 
-	items, err := session.WorkItems(ctx)
+	next, err := session.AdvanceRecovery(ctx, item.Token)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("AdvanceRecovery after quiescence: %v", err)
 	}
-	if len(items) != 1 {
-		t.Fatalf("work items after quiescence = %d, want 1", len(items))
+	if len(next.Launches) != 0 {
+		t.Fatalf("finalize work launches = %d, want 0", len(next.Launches))
 	}
-	if len(items[0].Launches) != 0 {
-		t.Fatalf("finalize work launches = %d, want 0", len(items[0].Launches))
+	if next.Token.BasedOnRevision <= item.Token.BasedOnRevision {
+		t.Fatalf("next token revision = %d, want > %d", next.Token.BasedOnRevision, item.Token.BasedOnRevision)
 	}
-	if items[0].Token.BasedOnRevision <= item.Token.BasedOnRevision {
-		t.Fatalf("next token revision = %d, want > %d", items[0].Token.BasedOnRevision, item.Token.BasedOnRevision)
+	if _, err := session.AdvanceRecovery(ctx, item.Token); !errors.Is(err, ErrReplayConflict) {
+		t.Fatalf("replayed advance token error = %v, want ErrReplayConflict", err)
 	}
-	if err := session.FinalizePlanned(ctx, items[0].Token); err != nil {
+	if err := session.FinalizePlanned(ctx, next.Token); err != nil {
 		t.Fatalf("FinalizePlanned: %v", err)
 	}
-	items, err = session.WorkItems(ctx)
+	items, err := session.WorkItems(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,8 +107,20 @@ func recoveryTokenWorkItem(t *testing.T, name string) (*RecoverySession, Recover
 	if items[0].JobID != accepted.Record.JobID {
 		t.Fatalf("work item job = %s, want %s", items[0].JobID, accepted.Record.JobID)
 	}
+	if items[0].BasedOnRevision != accepted.Record.Revision+1 {
+		t.Fatalf("work item revision = %d, want %d", items[0].BasedOnRevision, accepted.Record.Revision+1)
+	}
+	if items[0].Trigger != model.RecoveryStartupLoss {
+		t.Fatalf("work item trigger = %v, want startup loss", items[0].Trigger)
+	}
+	if items[0].WorkspaceLayoutKey != accepted.Record.WorkspaceLayoutKey {
+		t.Fatalf("work item layout key = %q, want %q", items[0].WorkspaceLayoutKey, accepted.Record.WorkspaceLayoutKey)
+	}
 	if err := items[0].Token.Validate(); err != nil {
 		t.Fatalf("work item token invalid: %v", err)
+	}
+	if err := items[0].Validate(); err != nil {
+		t.Fatalf("work item invalid: %v", err)
 	}
 	return session, items[0]
 }

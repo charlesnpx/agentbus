@@ -46,6 +46,66 @@ type RecoveryPlan struct {
 	Next            RecoveryAction
 }
 
+type RecoveryLaunch struct {
+	Ordinal LaunchOrdinal
+	Group   GroupRef
+}
+
+func (launch RecoveryLaunch) Validate() error {
+	if err := launch.Ordinal.Validate(); err != nil {
+		return err
+	}
+	if err := launch.Group.Validate(); err != nil {
+		return err
+	}
+	if launch.Group.Launch.Ordinal != launch.Ordinal {
+		return invalid("recovery_launch.group.ordinal", "does not match launch ordinal")
+	}
+	return nil
+}
+
+type RecoveryWorkItem struct {
+	Token              RecoveryToken
+	JobID              JobID
+	BasedOnRevision    uint64
+	Trigger            RecoveryTrigger
+	Launches           []RecoveryLaunch
+	WorkspaceLayoutKey WorkspaceKey
+}
+
+func (item RecoveryWorkItem) Validate() error {
+	if err := item.Token.Validate(); err != nil {
+		return err
+	}
+	if err := item.JobID.Validate(); err != nil {
+		return err
+	}
+	if item.Token.JobID != item.JobID {
+		return invalid("recovery_work_item.token.job_id", "does not match work item job")
+	}
+	if err := validatePositiveUint64("recovery_work_item.based_on_revision", item.BasedOnRevision); err != nil {
+		return err
+	}
+	if item.Token.BasedOnRevision != item.BasedOnRevision {
+		return invalid("recovery_work_item.token.based_on_revision", "does not match work item revision")
+	}
+	if err := item.Trigger.Validate(); err != nil {
+		return err
+	}
+	if err := validateOptionalWorkspaceLayoutKey("recovery_work_item.workspace_layout_key", item.WorkspaceLayoutKey); err != nil {
+		return err
+	}
+	for _, launch := range item.Launches {
+		if err := launch.Validate(); err != nil {
+			return err
+		}
+		if launch.Group.Launch.Attempt.JobID != item.JobID {
+			return invalid("recovery_launch.group.job_id", "does not match work item job")
+		}
+	}
+	return nil
+}
+
 type RecoveryToken struct {
 	JobID           JobID
 	BasedOnRevision uint64

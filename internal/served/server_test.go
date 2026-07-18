@@ -442,6 +442,120 @@ func TestCapabilityOffStartupRunsLegacyReapBeforeListen(t *testing.T) {
 	}
 }
 
+func TestAdmissionRecoveryExecutorFinalizesPriorBootAcceptedWorkItem(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	_, accepted := newPriorBootAuthorityWork(t, repo, anchorStore, launcher, "recovery-finalize")
+
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+
+	image, err := server.admissionReady.LoadJob(ctx, accepted.Record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := image.Safety.Value
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeFailed || record.Terminal.Cause != model.CauseDaemonRestartedBeforeAuthorization {
+		t.Fatalf("terminal = %+v, want failed daemon-restarted-before-authorization", record.Terminal)
+	}
+	if record.Terminal.Proof != model.ProofNeverPermittedAndRetired {
+		t.Fatalf("terminal proof = %s, want %s", record.Terminal.Proof, model.ProofNeverPermittedAndRetired)
+	}
+	if got := launcher.containCount(); got != 0 {
+		t.Fatalf("containments = %d, want none for unlaunched finalization", got)
+	}
+	if reason := server.safetyLatch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+}
+
+func TestAdmissionRecoveryExecutorContainsResidualGroupBeforeSealReady(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	oldReady, accepted := newPriorBootAuthorityWork(t, repo, anchorStore, launcher, "recovery-contain")
+	ref := accepted.Record.Attempt.Ref
+	group := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne})
+	if _, err := oldReady.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := oldReady.AllocateGrant(ctx, ref, model.LaunchOrdinalOne); err != nil {
+		t.Fatal(err)
+	}
+
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+
+	image, err := server.admissionReady.LoadJob(ctx, accepted.Record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := image.Safety.Value
+	first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || first.Quiescence == nil {
+		t.Fatalf("recovered launch = %+v, want verified quiescence", first)
+	}
+	if first.Quiescence.Method != model.QuiescenceAlreadyAbsent {
+		t.Fatalf("quiescence method = %s, want %s", first.Quiescence.Method, model.QuiescenceAlreadyAbsent)
+	}
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeReaped || record.Terminal.Cause != model.CauseDaemonRestartedAfterAuthorization {
+		t.Fatalf("terminal = %+v, want reaped daemon-restarted-after-authorization", record.Terminal)
+	}
+	if record.Terminal.Proof != model.ProofContained {
+		t.Fatalf("terminal proof = %s, want %s", record.Terminal.Proof, model.ProofContained)
+	}
+	if got := launcher.containCount(); got != 1 {
+		t.Fatalf("containments = %d, want one residual group containment", got)
+	}
+	if reason := server.safetyLatch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+}
+
+func TestAdmissionRecoveryExecutorTripsLatchWhenContainmentUnprovable(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	oldReady, accepted := newPriorBootAuthorityWork(t, repo, anchorStore, launcher, "recovery-unprovable")
+	ref := accepted.Record.Attempt.Ref
+	group := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne})
+	if _, err := oldReady.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := oldReady.AllocateGrant(ctx, ref, model.LaunchOrdinalOne); err != nil {
+		t.Fatal(err)
+	}
+	launcher.containErr = errors.New("containment unprovable")
+
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	server.admissionBootstrapperFactory = func(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(s.admissionSupervisor.quiescenceVerifier()))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return bootstrapper, repo, io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	configureTestAdmissionSupervisor(t, server, launcher, true)
+
+	err := server.bootstrapAdmission(ctx)
+	if !errors.Is(err, ErrSafetyFailStopped) {
+		t.Fatalf("bootstrapAdmission error = %v, want safety fail-stop", err)
+	}
+	if server.admissionReady != nil {
+		t.Fatal("admission ready was sealed after unresolved recovery")
+	}
+	if reason := server.safetyLatch.Reason(); reason == nil || !strings.Contains(reason.Error(), "containment unprovable") {
+		t.Fatalf("safety latch reason = %v, want containment failure", reason)
+	}
+}
+
 func TestJobSubmitRequestIDCapabilityDisabledDoesNotStartBackend(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -3343,6 +3457,14 @@ func enableTestAdmission(t *testing.T, server *Server, launcher *admissionFakeLa
 
 func enableTestAdmissionWithParkedExec(t *testing.T, server *Server, launcher *admissionFakeLaunchCustodian, parkedExec bool) {
 	t.Helper()
+	configureTestAdmissionSupervisor(t, server, launcher, parkedExec)
+	if err := server.bootstrapAdmission(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func configureTestAdmissionSupervisor(t *testing.T, server *Server, launcher *admissionFakeLaunchCustodian, parkedExec bool) {
+	t.Helper()
 	support, err := custodian.NewSupport(custodian.Support{
 		ParkedExec:             parkedExec,
 		VerifiedContainment:    true,
@@ -3362,9 +3484,6 @@ func enableTestAdmissionWithParkedExec(t *testing.T, server *Server, launcher *a
 		supportOverride:  &support,
 		verifierOverride: launcher.verifier,
 	}
-	if err := server.bootstrapAdmission(context.Background()); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func enableTestAdmissionWithAuthorityStore(t *testing.T, server *Server, launcher *admissionFakeLaunchCustodian, repo *memory.Repository, anchorStore *authority.AnchorStore) {
@@ -3377,6 +3496,40 @@ func enableTestAdmissionWithAuthorityStore(t *testing.T, server *Server, launche
 		return bootstrapper, repo, io.NopCloser(bytes.NewReader(nil)), nil
 	}
 	enableTestAdmission(t, server, launcher)
+}
+
+func newPriorBootAuthorityWork(t *testing.T, repo *memory.Repository, anchorStore *authority.AnchorStore, launcher *admissionFakeLaunchCustodian, name string) (*authority.Ready, authority.AcceptResult) {
+	t.Helper()
+	bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(launcher.verifier))
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, err := model.NewBootRef("boot-"+name+"-old", "owner-"+name+"-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := bootstrapper.Begin(context.Background(), boot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := session.SealReady(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := ready.Accept(context.Background(), authority.AcceptRequest{
+		RequestKey: model.RequestKey{
+			WorkspaceKey: model.WorkspaceKey("workspace-" + name),
+			RequestID:    model.RequestID("request-" + name),
+		},
+		WorkspaceLayoutKey: model.WorkspaceKey(strings.Repeat("a", 64)),
+		TaskIdentity:       model.NewSHA256TaskIdentity([]byte("task-" + name)),
+		Mode:               model.ModeIdentifiedFenced,
+		SessionID:          "session-" + name,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ready, accepted
 }
 
 func prepareLegacyFencedCommandForTest(t *testing.T, server *Server, requestID string) *legacyFencedCommand {
@@ -3479,6 +3632,7 @@ type admissionFakeLaunchCustodian struct {
 
 	abortRespectContext     bool
 	abortWaitForContextDone bool
+	containErr              error
 	waitAndVerify           <-chan struct{}
 	activeCustodies         atomic.Bool
 }
@@ -3522,8 +3676,12 @@ func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.E
 func (c *admissionFakeLaunchCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
 	c.mu.Lock()
 	c.contains++
+	containErr := c.containErr
 	running := c.running[string(group.CustodyID)]
 	c.mu.Unlock()
+	if containErr != nil {
+		return custodian.VerifiedQuiescence{}, containErr
+	}
 	if running != nil {
 		return running.ContainAndVerify(ctx, cause)
 	}

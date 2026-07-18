@@ -9,22 +9,15 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 )
 
-type RecoveryLaunch struct {
-	Ordinal model.LaunchOrdinal
-	Group   model.GroupRef
-}
-
-type RecoveryWorkItem struct {
-	Token    model.RecoveryToken
-	JobID    model.JobID
-	Launches []RecoveryLaunch
-}
+type RecoveryLaunch = model.RecoveryLaunch
+type RecoveryWorkItem = model.RecoveryWorkItem
 
 type issuedRecoveryToken struct {
-	jobID    model.JobID
-	revision uint64
-	boot     model.BootRef
-	consumed bool
+	jobID        model.JobID
+	revision     uint64
+	boot         model.BootRef
+	factRevision uint64
+	consumed     bool
 }
 
 func (s *RecoverySession) WorkItems(ctx context.Context) ([]RecoveryWorkItem, error) {
@@ -49,7 +42,7 @@ func (s *RecoverySession) WorkItems(ctx context.Context) ([]RecoveryWorkItem, er
 		}
 		for _, plan := range plans {
 			if plan.JobID == "" {
-				continue
+				return fmt.Errorf("%w: startup recovery plan has no job identity", ErrRecoveryNeeded)
 			}
 			item, err := s.recoveryWorkItemForPlanLocked(tx, plan)
 			if err != nil {
@@ -80,7 +73,7 @@ func (s *RecoverySession) AdvanceRecovery(ctx context.Context, token model.Recov
 		if _, err := startupMatrixTx(tx); err != nil {
 			return err
 		}
-		record, err := s.validateRecoveryTokenTx(tx, token)
+		record, err := s.recoveryRecordAfterTokenTx(tx, token)
 		if err != nil {
 			return err
 		}
@@ -114,9 +107,15 @@ func (s *RecoverySession) FinalizePlanned(ctx context.Context, token model.Recov
 		if _, err := startupMatrixTx(tx); err != nil {
 			return err
 		}
-		record, err := s.validateRecoveryTokenTx(tx, token)
+		issued, record, err := s.validateRecoveryTokenTx(tx, token)
 		if err != nil {
 			return err
+		}
+		if issued.factRevision != 0 {
+			return ErrReplayConflict
+		}
+		if record.Revision != issued.revision {
+			return ErrStaleCapability
 		}
 		plan, err := model.PlanRecovery(record, model.RecoveryStartupLoss)
 		if err != nil {
@@ -159,6 +158,7 @@ func (s *RecoverySession) recordQuiescenceByToken(ctx context.Context, token mod
 	defer s.core.mu.Unlock()
 
 	terminalCommitted := false
+	recordedRevision := uint64(0)
 	commit, err := s.core.repo.Update(ctx, func(tx repository.WriteTx) error {
 		meta, err := s.core.requireRecoveryTx(tx, s.token)
 		if err != nil {
@@ -167,8 +167,15 @@ func (s *RecoverySession) recordQuiescenceByToken(ctx context.Context, token mod
 		if _, err := startupMatrixTx(tx); err != nil {
 			return err
 		}
-		if _, err := s.validateRecoveryTokenTx(tx, token); err != nil {
+		issued, record, err := s.validateRecoveryTokenTx(tx, token)
+		if err != nil {
 			return err
+		}
+		if issued.factRevision != 0 {
+			return ErrReplayConflict
+		}
+		if record.Revision != issued.revision {
+			return ErrStaleCapability
 		}
 		applied, err := applyRecoveryQuiescenceTx(tx, token.JobID, ordinal, s.core.verifier, verified, s.token.boot, meta.Generation+1)
 		if err != nil {
@@ -177,51 +184,75 @@ func (s *RecoverySession) recordQuiescenceByToken(ctx context.Context, token mod
 		if _, err := model.PlanRecovery(applied.Record, model.RecoveryStartupLoss); err != nil {
 			return err
 		}
+		recordedRevision = applied.Record.Revision
 		terminalCommitted = applied.Changed && applied.Record.Terminal != nil
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	s.consumeRecoveryTokenLocked(token)
 	if err := s.core.advanceRecoveryLocked(ctx, &s.token, commit.Generation); err != nil {
 		return err
 	}
+	s.markRecoveryTokenFactLocked(token, recordedRevision)
 	if terminalCommitted {
 		s.core.runtime.releaseTerminal(token.JobID)
 	}
 	return nil
 }
 
-func (s *RecoverySession) validateRecoveryTokenTx(tx repository.ReadTx, token model.RecoveryToken) (model.SafetyRecord, error) {
-	if err := token.Validate(); err != nil {
-		return model.SafetyRecord{}, fmt.Errorf("%w: recovery_token: %v", ErrInvalidRequest, err)
-	}
-	issued, ok := s.tokens[token.Opaque]
-	if !ok {
-		return model.SafetyRecord{}, ErrStaleCapability
-	}
-	if issued.consumed {
-		return model.SafetyRecord{}, ErrReplayConflict
-	}
-	if issued.jobID != token.JobID || issued.revision != token.BasedOnRevision || issued.boot != token.RecoveryBoot || token.RecoveryBoot != s.token.boot {
-		return model.SafetyRecord{}, ErrStaleCapability
-	}
-	image := tx.LoadJob(token.JobID)
-	if err := requireRecord("safety", image.Safety.State, image.Safety.Diagnostic); err != nil {
+func (s *RecoverySession) recoveryRecordAfterTokenTx(tx repository.ReadTx, token model.RecoveryToken) (model.SafetyRecord, error) {
+	issued, record, err := s.validateRecoveryTokenTx(tx, token)
+	if err != nil {
 		return model.SafetyRecord{}, err
 	}
-	record := image.Safety.Value
-	if err := model.ValidateSafetyRecord(record); err != nil {
-		return model.SafetyRecord{}, fatalStartup("safety %s is unsupported: %v", record.JobID, err)
+	expectedRevision := issued.revision
+	if issued.factRevision != 0 {
+		expectedRevision = issued.factRevision
 	}
-	if record.JobID != token.JobID {
-		return model.SafetyRecord{}, fmt.Errorf("%w: recovery token job mismatch", repository.ErrInvalidRecord)
-	}
-	if record.Revision != token.BasedOnRevision {
+	if record.Revision != expectedRevision {
 		return model.SafetyRecord{}, ErrStaleCapability
 	}
 	return record, nil
+}
+
+func (s *RecoverySession) validateRecoveryTokenForCurrentRevisionTx(tx repository.ReadTx, token model.RecoveryToken) (issuedRecoveryToken, model.SafetyRecord, error) {
+	issued, record, err := s.validateRecoveryTokenTx(tx, token)
+	if err != nil {
+		return issuedRecoveryToken{}, model.SafetyRecord{}, err
+	}
+	if record.Revision != issued.revision {
+		return issuedRecoveryToken{}, model.SafetyRecord{}, ErrStaleCapability
+	}
+	return issued, record, nil
+}
+
+func (s *RecoverySession) validateRecoveryTokenTx(tx repository.ReadTx, token model.RecoveryToken) (issuedRecoveryToken, model.SafetyRecord, error) {
+	if err := token.Validate(); err != nil {
+		return issuedRecoveryToken{}, model.SafetyRecord{}, fmt.Errorf("%w: recovery_token: %v", ErrInvalidRequest, err)
+	}
+	issued, ok := s.tokens[token.Opaque]
+	if !ok {
+		return issuedRecoveryToken{}, model.SafetyRecord{}, ErrStaleCapability
+	}
+	if issued.consumed {
+		return issuedRecoveryToken{}, model.SafetyRecord{}, ErrReplayConflict
+	}
+	if issued.jobID != token.JobID || issued.revision != token.BasedOnRevision || issued.boot != token.RecoveryBoot || token.RecoveryBoot != s.token.boot {
+		return issuedRecoveryToken{}, model.SafetyRecord{}, ErrStaleCapability
+	}
+	image := tx.LoadJob(token.JobID)
+	if err := requireRecord("safety", image.Safety.State, image.Safety.Diagnostic); err != nil {
+		return issuedRecoveryToken{}, model.SafetyRecord{}, err
+	}
+	record := image.Safety.Value
+	if err := model.ValidateSafetyRecord(record); err != nil {
+		return issuedRecoveryToken{}, model.SafetyRecord{}, fatalStartup("safety %s is unsupported: %v", record.JobID, err)
+	}
+	if record.JobID != token.JobID {
+		return issuedRecoveryToken{}, model.SafetyRecord{}, fmt.Errorf("%w: recovery token job mismatch", repository.ErrInvalidRecord)
+	}
+	return issued, record, nil
 }
 
 func (s *RecoverySession) recoveryWorkItemForPlanLocked(tx repository.ReadTx, plan JobRecoveryPlan) (RecoveryWorkItem, error) {
@@ -242,23 +273,29 @@ func (s *RecoverySession) recoveryWorkItemForRecordLocked(record model.SafetyRec
 		return RecoveryWorkItem{}, err
 	}
 	item := RecoveryWorkItem{
-		Token: token,
-		JobID: record.JobID,
+		Token:              token,
+		JobID:              record.JobID,
+		BasedOnRevision:    plan.BasedOnRevision,
+		Trigger:            model.RecoveryStartupLoss,
+		WorkspaceLayoutKey: record.WorkspaceLayoutKey,
 	}
 	switch plan.Next.Kind {
 	case model.RecoveryRetireThenFinalize, model.RecoveryContainThenFinalize:
 		item.Launches = recoveryLaunches(record.Attempt.Launches)
 	}
+	if err := item.Validate(); err != nil {
+		return RecoveryWorkItem{}, err
+	}
 	return item, nil
 }
 
-func recoveryLaunches(slots model.LaunchSlots[model.LaunchProof]) []RecoveryLaunch {
-	launches := make([]RecoveryLaunch, 0, slots.Count())
+func recoveryLaunches(slots model.LaunchSlots[model.LaunchProof]) []model.RecoveryLaunch {
+	launches := make([]model.RecoveryLaunch, 0, slots.Count())
 	if slots.First != nil && slots.First.Group != nil && slots.First.Quiescence == nil {
-		launches = append(launches, RecoveryLaunch{Ordinal: model.LaunchOrdinalOne, Group: *slots.First.Group})
+		launches = append(launches, model.RecoveryLaunch{Ordinal: model.LaunchOrdinalOne, Group: *slots.First.Group})
 	}
 	if slots.Second != nil && slots.Second.Group != nil && slots.Second.Quiescence == nil {
-		launches = append(launches, RecoveryLaunch{Ordinal: model.LaunchOrdinalTwo, Group: *slots.Second.Group})
+		launches = append(launches, model.RecoveryLaunch{Ordinal: model.LaunchOrdinalTwo, Group: *slots.Second.Group})
 	}
 	return launches
 }
@@ -291,5 +328,11 @@ func (s *RecoverySession) issueRecoveryTokenLocked(jobID model.JobID, revision u
 func (s *RecoverySession) consumeRecoveryTokenLocked(token model.RecoveryToken) {
 	issued := s.tokens[token.Opaque]
 	issued.consumed = true
+	s.tokens[token.Opaque] = issued
+}
+
+func (s *RecoverySession) markRecoveryTokenFactLocked(token model.RecoveryToken, revision uint64) {
+	issued := s.tokens[token.Opaque]
+	issued.factRevision = revision
 	s.tokens[token.Opaque] = issued
 }

@@ -77,7 +77,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := recoverAdmissionBeforeReady(ctx, session, repo, supervisor, boot); err != nil {
+	if err := recoverAdmissionBeforeReady(ctx, session, supervisor.launchPort(), s.safetyLatch); err != nil {
 		return err
 	}
 	if err := s.reapKnownStores(); err != nil {
@@ -150,75 +150,8 @@ func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootst
 	return bootstrapper, repo, repo, nil
 }
 
-func recoverAdmissionBeforeReady(ctx context.Context, session *authority.RecoverySession, repo repository.Repository, supervisor coordinator.Supervisor, boot model.BootRef) error {
-	const maxStartupRecoverySteps = 1024
-	for i := 0; i < maxStartupRecoverySteps; i++ {
-		plans, err := session.Plans(ctx)
-		if err != nil {
-			return err
-		}
-		if len(plans) == 0 {
-			return nil
-		}
-		progressed := false
-		jobs, err := admissionStartupRecoveryJobs(ctx, repo, boot)
-		if err != nil {
-			return err
-		}
-		if len(jobs) == 0 {
-			return fmt.Errorf("%w: startup recovery could not identify job for %d plan(s)", authority.ErrRecoveryNeeded, len(plans))
-		}
-		for _, job := range jobs {
-			switch job.plan.Next.Kind {
-			case model.RecoveryFinalizeCertified:
-				if job.plan.Next.Finalize == nil {
-					return fmt.Errorf("%w: startup recovery finalize action missing receipt", authority.ErrRecoveryNeeded)
-				}
-				if err := session.Finalize(ctx, job.plan.Next.Finalize.Ref, job.plan.Next.Finalize.Intent); err != nil {
-					return err
-				}
-				progressed = true
-			case model.RecoveryRetireThenFinalize:
-				for _, ordinal := range admissionUnquiescedOrdinals(job.record) {
-					prepared, err := admissionPreparedFromRecord(job.record, ordinal)
-					if err != nil {
-						return err
-					}
-					verified, err := supervisor.Retire(ctx, prepared)
-					if err != nil {
-						return err
-					}
-					if err := session.RecordQuiescence(ctx, job.record.JobID, ordinal, verified); err != nil {
-						return err
-					}
-				}
-				progressed = true
-			case model.RecoveryContainThenFinalize:
-				for _, ordinal := range admissionUnquiescedOrdinals(job.record) {
-					prepared, err := admissionPreparedFromRecord(job.record, ordinal)
-					if err != nil {
-						return err
-					}
-					verified, err := supervisor.Contain(ctx, prepared)
-					if err != nil {
-						return err
-					}
-					if err := session.RecordQuiescence(ctx, job.record.JobID, ordinal, verified); err != nil {
-						return err
-					}
-				}
-				progressed = true
-			case model.RecoveryFatalUnprovable:
-				return fmt.Errorf("%w: startup recovery action %d is fatal for %s", authority.ErrRecoveryNeeded, job.plan.Next.Kind, job.record.JobID)
-			default:
-				return fmt.Errorf("%w: startup recovery action %d is unknown", authority.ErrRecoveryNeeded, job.plan.Next.Kind)
-			}
-		}
-		if !progressed {
-			return fmt.Errorf("%w: startup recovery made no progress", authority.ErrRecoveryNeeded)
-		}
-	}
-	return fmt.Errorf("%w: startup recovery did not converge", authority.ErrRecoveryNeeded)
+func recoverAdmissionBeforeReady(ctx context.Context, session *authority.RecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) error {
+	return newAdmissionRecoveryExecutor(session, launchPort, latch).Recover(ctx)
 }
 
 type fileAuthorityAnchor struct {
