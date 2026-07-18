@@ -204,12 +204,12 @@ func (s *servedAdmissionSupervisor) VerifyQuiescence(context.Context, coordinato
 	return verified, custodian.ErrSupervisorUnavailable
 }
 
-func (s *servedAdmissionSupervisor) Contain(context.Context, coordinator.PreparedSupervisor) (verified custodian.VerifiedQuiescence, err error) {
-	return verified, custodian.ErrSupervisorUnavailable
+func (s *servedAdmissionSupervisor) Contain(ctx context.Context, prepared coordinator.PreparedSupervisor) (verified custodian.VerifiedQuiescence, err error) {
+	return s.launchPort().ContainAndVerify(ctx, prepared.Group, custodian.QuiescenceCauseContain)
 }
 
-func (s *servedAdmissionSupervisor) Retire(context.Context, coordinator.PreparedSupervisor) (verified custodian.VerifiedQuiescence, err error) {
-	return verified, custodian.ErrSupervisorUnavailable
+func (s *servedAdmissionSupervisor) Retire(ctx context.Context, prepared coordinator.PreparedSupervisor) (verified custodian.VerifiedQuiescence, err error) {
+	return s.launchPort().ContainAndVerify(ctx, prepared.Group, custodian.QuiescenceCauseRecovery)
 }
 
 type servedResultPublisher struct {

@@ -860,6 +860,345 @@ func TestIdentifiedFencedJobReadsAuthorityWithoutJSONRecordAndDiagnosesDuplicate
 	}
 }
 
+func TestIdentifiedFencedCancelUsesAuthorityWhenAdmissionMarkerCleared(t *testing.T) {
+	t.Parallel()
+	holdNaturalExit := make(chan struct{})
+	defer close(holdNaturalExit)
+	backend := newFakeBackend("fake")
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitAndVerify = holdNaturalExit
+	enableTestAdmission(t, server, launcher)
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-authority-cancel",
+		RequestID:    "request-authority-cancel",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	waitBackendStarted(t, backend)
+	assertNoJSONJobRecord(t, server, submitted.JobID)
+
+	clearAdmissionJobMarkersForTest(t, server)
+	canceled := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: submitted.JobID})
+	if canceled.JobID != submitted.JobID || canceled.State != engine.StateCanceled {
+		t.Fatalf("authority cancel = %+v, want canceled job %s", canceled, submitted.JobID)
+	}
+	record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+	if record.Cancel == nil {
+		t.Fatalf("authority cancel fact missing: %+v", record)
+	}
+	first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || first.Quiescence == nil || first.Quiescence.Method != model.QuiescenceTermKill {
+		t.Fatalf("authority launch proof = %+v, want contained quiescence", first)
+	}
+	if got := launcher.containCount(); got == 0 {
+		t.Fatalf("authority cancel contain calls = %d, want live containment", got)
+	}
+	assertNoJSONJobRecord(t, server, submitted.JobID)
+}
+
+func TestJobCancelUsesLegacyJSONWhenAuthorityCleanlyDisclaims(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyID := server.nextID("job")
+	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_cancel_authority_down", "fake", nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, errObj := server.authorityJobProjection(legacyID); ok || errObj != nil {
+		t.Fatalf("authority projection ok=%v err=%+v, want clean disclaimer", ok, errObj)
+	}
+
+	canceled := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: legacyID})
+	if canceled.JobID != legacyID || canceled.State != engine.StateCanceled {
+		t.Fatalf("legacy cancel = %+v, want JSON canceled", canceled)
+	}
+	record, err := store.Load(legacyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != engine.StateCanceled {
+		t.Fatalf("legacy record state = %s, want canceled", record.State)
+	}
+}
+
+func TestJobCancelFailsClosedWhenAuthorityDegradedWithStaleJSONDuplicate(t *testing.T) {
+	t.Parallel()
+	holdNaturalExit := make(chan struct{})
+	defer close(holdNaturalExit)
+	backend := newFakeBackend("fake")
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitAndVerify = holdNaturalExit
+	enableTestAdmission(t, server, launcher)
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-authority-cancel-degraded",
+		RequestID:    "request-authority-cancel-degraded",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	waitBackendStarted(t, backend)
+	_, projection, ok, errObj := server.authorityJobProjection(submitted.JobID)
+	if errObj != nil || !ok {
+		t.Fatalf("authority projection ok=%v err=%+v", ok, errObj)
+	}
+	store := server.storeForJob(submitted.JobID)
+	if store == nil {
+		t.Fatalf("job store missing for %s", submitted.JobID)
+	}
+	if err := server.createQueuedRecord(store, submitted.JobID, projection.SessionID, "fake", nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	server.removeActiveJob(submitted.JobID)
+	if err := server.admissionReady.FailStop(context.Background(), "test authority degraded during cancel"); err != nil {
+		t.Fatal(err)
+	}
+
+	outcome := server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: submitted.JobID}))
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorBackendUnavailable {
+		t.Fatalf("job.cancel outcome = %+v, want backend_unavailable fail-closed error", outcome)
+	}
+	if outcome.result != nil {
+		t.Fatalf("job.cancel result = %+v, want no canceled result", outcome.result)
+	}
+	record, err := store.Load(submitted.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State == engine.StateCanceled {
+		t.Fatalf("stale JSON record state = %s, want not canceled", record.State)
+	}
+	if got := launcher.containCount(); got != 0 {
+		t.Fatalf("authority cancel contain calls = %d, want none under degraded authority", got)
+	}
+}
+
+func TestReapKnownStoresSkipsAuthorityOwnedFencedJob(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	var clockNanos atomic.Int64
+	clockNanos.Store(base.UnixNano())
+	clock := engine.ClockFunc(func() time.Time { return time.Unix(0, clockNanos.Load()).UTC() })
+	holdNaturalExit := make(chan struct{})
+	defer close(holdNaturalExit)
+	backend := newFakeBackend("fake")
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	server.clock = clock
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitAndVerify = holdNaturalExit
+	enableTestAdmission(t, server, launcher)
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-authority-reap",
+		RequestID:    "request-authority-reap",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	var fenced protocol.JobSubmitResult
+	decodeResult(t, resp, &fenced)
+	waitBackendStarted(t, backend)
+	assertNoJSONJobRecord(t, server, fenced.JobID)
+	before := loadAdmissionSafetyRecord(t, server, fenced.JobID)
+
+	store := server.storeForJob(fenced.JobID)
+	if store == nil {
+		t.Fatalf("job store missing for %s", fenced.JobID)
+	}
+	legacyID := server.nextID("job")
+	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_reap_with_authority", "fake", nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.transitionRecord(store, legacyID, engine.StateStarting); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.transitionRecord(store, legacyID, engine.StateRunning); err != nil {
+		t.Fatal(err)
+	}
+
+	clockNanos.Store(base.Add(31 * time.Minute).UnixNano())
+	if err := server.reapKnownStores(); err != nil {
+		t.Fatal(err)
+	}
+	assertNoJSONJobRecord(t, server, fenced.JobID)
+	after := loadAdmissionSafetyRecord(t, server, fenced.JobID)
+	if after.Revision != before.Revision || after.Terminal != before.Terminal || after.Cancel != before.Cancel {
+		t.Fatalf("authority record changed across JSON reap: before=%+v after=%+v", before, after)
+	}
+	legacy, err := store.Load(legacyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.State != engine.StateOrphaned {
+		t.Fatalf("legacy reap state = %s, want orphaned", legacy.State)
+	}
+}
+
+func TestSessionResumeDoesNotCreateLegacySessionForAuthorityOwnedJob(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.resumes = make(chan resumedSession, 1)
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-authority-resume",
+		RequestID:    "request-authority-resume",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	waitBackendStarted(t, backend)
+	_, projection, ok, errObj := server.authorityJobProjection(submitted.JobID)
+	if errObj != nil || !ok {
+		t.Fatalf("authority projection ok=%v err=%+v", ok, errObj)
+	}
+	store := server.storeForJob(submitted.JobID)
+	if store == nil {
+		t.Fatalf("job store missing for %s", submitted.JobID)
+	}
+	if err := server.createQueuedRecord(store, submitted.JobID, projection.SessionID, "fake", nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.updateBackendSessionID(store, submitted.JobID, "stale-backend-session"); err != nil {
+		t.Fatal(err)
+	}
+
+	outcome := server.handleSessionResume(context.Background(), mustMarshal(t, protocol.SessionResumeParams{SessionID: projection.SessionID}))
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorBackendUnavailable {
+		t.Fatalf("resume outcome = %+v, want backend_unavailable", outcome)
+	}
+	select {
+	case got := <-backend.resumes:
+		t.Fatalf("backend resumed stale authority session: %+v", got)
+	default:
+	}
+}
+
+func TestSessionResumeFailsClosedWhenAuthorityDegradedWithStaleJSONDuplicate(t *testing.T) {
+	t.Parallel()
+	holdNaturalExit := make(chan struct{})
+	defer close(holdNaturalExit)
+	backend := newFakeBackend("fake")
+	backend.resumes = make(chan resumedSession, 1)
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitAndVerify = holdNaturalExit
+	enableTestAdmission(t, server, launcher)
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-authority-resume-degraded",
+		RequestID:    "request-authority-resume-degraded",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	waitBackendStarted(t, backend)
+	_, projection, ok, errObj := server.authorityJobProjection(submitted.JobID)
+	if errObj != nil || !ok {
+		t.Fatalf("authority projection ok=%v err=%+v", ok, errObj)
+	}
+	store := server.storeForJob(submitted.JobID)
+	if store == nil {
+		t.Fatalf("job store missing for %s", submitted.JobID)
+	}
+	if err := server.createQueuedRecord(store, submitted.JobID, projection.SessionID, "fake", nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.updateBackendSessionID(store, submitted.JobID, "stale-backend-session"); err != nil {
+		t.Fatal(err)
+	}
+	server.removeActiveJob(submitted.JobID)
+	if err := server.admissionReady.FailStop(context.Background(), "test authority degraded during resume"); err != nil {
+		t.Fatal(err)
+	}
+
+	outcome := server.handleSessionResume(context.Background(), mustMarshal(t, protocol.SessionResumeParams{SessionID: projection.SessionID}))
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorBackendUnavailable {
+		t.Fatalf("resume outcome = %+v, want backend_unavailable fail-closed error", outcome)
+	}
+	if outcome.result != nil {
+		t.Fatalf("resume result = %+v, want no legacy session result", outcome.result)
+	}
+	select {
+	case got := <-backend.resumes:
+		t.Fatalf("backend resumed stale authority session: %+v", got)
+	default:
+	}
+}
+
+func TestSessionResumeUsesLegacyJSONWhenAuthorityCleanlyDisclaims(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.resumes = make(chan resumedSession, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	canonicalCWD, err := engine.CanonicalWorkspace(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyID := server.nextID("job")
+	sessionID := "ses_legacy_resume_authority_clean"
+	backendSessionID := "backend-session-authority-clean"
+	if err := server.createQueuedRecord(store, legacyID, sessionID, "fake", nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.updateBackendSessionID(store, legacyID, backendSessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, errObj := server.authorityJobProjection(legacyID); ok || errObj != nil {
+		t.Fatalf("authority projection ok=%v err=%+v, want clean disclaimer", ok, errObj)
+	}
+
+	outcome := server.handleSessionResume(context.Background(), mustMarshal(t, protocol.SessionResumeParams{SessionID: sessionID}))
+	if outcome.err != nil {
+		t.Fatalf("resume error = %+v", outcome.err)
+	}
+	result, ok := outcome.result.(protocol.SessionStartResult)
+	if !ok {
+		t.Fatalf("resume result type = %T", outcome.result)
+	}
+	if result.SessionID != sessionID || result.Backend != "fake" {
+		t.Fatalf("resume result = %+v, want legacy session", result)
+	}
+	select {
+	case got := <-backend.resumes:
+		if got.ID != backendSessionID || got.Opts.CWD != canonicalCWD || got.Opts.Write {
+			t.Fatalf("backend resume = %+v, want id %q cwd %q read-only", got, backendSessionID, canonicalCWD)
+		}
+	default:
+		t.Fatal("backend resume was not called for cleanly disclaimed legacy session")
+	}
+}
+
 func TestExactReadsUseJSONForLegacyWhenAuthorityFailStopped(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -2655,12 +2994,15 @@ type admissionFakeLaunchCustodian struct {
 	ordinals []model.LaunchOrdinal
 	releases int
 	aborts   int
+	contains int
+	running  map[string]*admissionFakeRunning
 
 	abortCtxErrs      []error
 	abortCtxDeadlines []bool
 
 	abortRespectContext     bool
 	abortWaitForContextDone bool
+	waitAndVerify           <-chan struct{}
 }
 
 func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.ExecSpec, key model.LaunchKey) (launch.PreparedProcess, error) {
@@ -2686,15 +3028,32 @@ func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.E
 		stdoutWriter: stdoutWriter,
 		stderr:       stderrReader,
 		stderrWriter: stderrWriter,
+		contained:    make(chan struct{}),
+		wait:         c.waitAndVerify,
 	}
 	c.mu.Lock()
 	c.ordinals = append(c.ordinals, key.Ordinal)
+	if c.running == nil {
+		c.running = make(map[string]*admissionFakeRunning)
+	}
+	c.running[string(group.CustodyID)] = running
 	c.mu.Unlock()
 	return &admissionFakePrepared{group: group, running: running, issuer: c.issuer, custodian: c}, nil
 }
 
-func (c *admissionFakeLaunchCustodian) ContainAndVerify(context.Context, model.GroupRef, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
-	return custodian.VerifiedQuiescence{}, errors.New("unexpected custodian-level contain")
+func (c *admissionFakeLaunchCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	c.mu.Lock()
+	c.contains++
+	running := c.running[string(group.CustodyID)]
+	c.mu.Unlock()
+	if running != nil {
+		return running.ContainAndVerify(ctx, cause)
+	}
+	method := model.QuiescenceTermKill
+	if cause == custodian.QuiescenceCauseRecovery {
+		method = model.QuiescenceAlreadyAbsent
+	}
+	return c.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: group, Method: method})
 }
 
 func (c *admissionFakeLaunchCustodian) preparedOrdinals() []model.LaunchOrdinal {
@@ -2713,6 +3072,12 @@ func (c *admissionFakeLaunchCustodian) abortCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.aborts
+}
+
+func (c *admissionFakeLaunchCustodian) containCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.contains
 }
 
 func (c *admissionFakeLaunchCustodian) abortContextObservations() ([]error, []bool) {
@@ -2778,6 +3143,9 @@ type admissionFakeRunning struct {
 	stderr       *io.PipeReader
 	stderrWriter *io.PipeWriter
 	closeOnce    sync.Once
+	containOnce  sync.Once
+	contained    chan struct{}
+	wait         <-chan struct{}
 }
 
 func (r *admissionFakeRunning) Ref() model.GroupRef {
@@ -2796,15 +3164,44 @@ func (r *admissionFakeRunning) Stderr() io.ReadCloser {
 	return r.stderr
 }
 
-func (r *admissionFakeRunning) WaitAndVerify(context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error) {
-	r.closeStreams()
-	verified, err := r.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: r.group, Method: model.QuiescenceNaturalExit})
-	return command.ExitObservation{Exited: true, Code: 0}, verified, err
+func (r *admissionFakeRunning) WaitAndVerify(ctx context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error) {
+	if r.wait != nil {
+		select {
+		case <-r.wait:
+		case <-r.contained:
+			return r.finish(model.QuiescenceTermKill)
+		case <-ctx.Done():
+			return command.ExitObservation{}, custodian.VerifiedQuiescence{}, ctx.Err()
+		}
+	}
+	return r.finish(model.QuiescenceNaturalExit)
 }
 
 func (r *admissionFakeRunning) ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	r.markContained()
+	_, verified, err := r.finish(model.QuiescenceTermKill)
+	return verified, err
+}
+
+func (r *admissionFakeRunning) WaitContained() bool {
+	select {
+	case <-r.contained:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *admissionFakeRunning) markContained() {
+	r.containOnce.Do(func() {
+		close(r.contained)
+	})
+}
+
+func (r *admissionFakeRunning) finish(method model.QuiescenceMethod) (command.ExitObservation, custodian.VerifiedQuiescence, error) {
 	r.closeStreams()
-	return r.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: r.group, Method: model.QuiescenceTermKill})
+	verified, err := r.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: r.group, Method: method})
+	return command.ExitObservation{Exited: true, Code: 0}, verified, err
 }
 
 func (r *admissionFakeRunning) closeStreams() {
@@ -2996,6 +3393,19 @@ func jobResultViaHandler(t *testing.T, server *Server, params protocol.JobResult
 	result, ok := outcome.result.(protocol.JobResult)
 	if !ok {
 		t.Fatalf("job.result result type = %T", outcome.result)
+	}
+	return result
+}
+
+func jobCancelViaHandler(t *testing.T, server *Server, params protocol.JobCancelParams) protocol.JobCancelResult {
+	t.Helper()
+	outcome := server.handleJobCancel(mustMarshal(t, params))
+	if outcome.err != nil {
+		t.Fatalf("job.cancel error = %+v", outcome.err)
+	}
+	result, ok := outcome.result.(protocol.JobCancelResult)
+	if !ok {
+		t.Fatalf("job.cancel result type = %T", outcome.result)
 	}
 	return result
 }

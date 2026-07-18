@@ -23,6 +23,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/internal/protocol"
@@ -877,6 +878,11 @@ func (s *Server) handleSessionResume(ctx context.Context, raw json.RawMessage) r
 	if record == nil || store == nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "session is not known to this daemon", protocol.ErrorData{SessionID: params.SessionID})}
 	}
+	if _, _, ok, authorityErr := s.authorityJobProjection(record.JobID); authorityErr != nil {
+		return requestOutcome{err: authorityMutationIndeterminateError("session.resume", protocol.ErrorData{SessionID: params.SessionID, JobID: record.JobID}, authorityErr)}
+	} else if ok {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "session is owned by admission authority", protocol.ErrorData{SessionID: params.SessionID, JobID: record.JobID})}
+	}
 	backend, ok := s.backends[record.Backend]
 	if !ok {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{SessionID: params.SessionID})}
@@ -1220,12 +1226,56 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 	if params.JobID == "" {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "jobId is required", protocol.ErrorData{})}
 	}
-	if s.isAdmissionJob(params.JobID) && s.admissionCoordinator != nil {
+	if _, _, ok, authorityErr := s.authorityJobProjection(params.JobID); authorityErr != nil {
+		return requestOutcome{err: authorityMutationIndeterminateError("job.cancel", protocol.ErrorData{JobID: params.JobID}, authorityErr)}
+	} else if ok {
 		return s.withAdmissionJobEffect(params.JobID, func() requestOutcome {
-			return s.handleJobCancelLocked(params.JobID)
+			return s.handleAuthorityJobCancelLocked(params.JobID)
 		})
 	}
 	return s.handleJobCancelLocked(params.JobID)
+}
+
+func authorityMutationIndeterminateError(operation string, data protocol.ErrorData, authorityErr *protocol.ErrorObject) *protocol.ErrorObject {
+	message := fmt.Sprintf("%s refused because admission authority ownership is indeterminate", operation)
+	if authorityErr != nil && authorityErr.Message != "" {
+		message = fmt.Sprintf("%s: %s", message, authorityErr.Message)
+	}
+	return protocol.NewError(protocol.ErrorBackendUnavailable, message, data)
+}
+
+func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
+	active := s.lookupActiveJob(jobID)
+	if active != nil {
+		if active.foreground {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: jobID, TurnID: jobID})}
+		}
+		active.requestTerminal(engine.StateCanceled)
+	}
+	record, projection, ok, errObj := s.authorityJobProjection(jobID)
+	if errObj != nil {
+		return requestOutcome{err: errObj}
+	}
+	if !ok {
+		return s.handleJobCancelLocked(jobID)
+	}
+	if record.Terminal == nil {
+		if s.admissionCoordinator == nil {
+			return requestOutcome{err: admissionProtocolError(coordinator.ErrCoordinatorNotReady)}
+		}
+		if err := s.admissionCoordinator.Cancel(context.Background(), model.JobID(jobID), nil); err != nil {
+			return requestOutcome{err: admissionProtocolError(err)}
+		}
+		var reloadErr *protocol.ErrorObject
+		_, projection, ok, reloadErr = s.authorityJobProjection(jobID)
+		if reloadErr != nil {
+			return requestOutcome{err: reloadErr}
+		}
+		if !ok {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: jobID})}
+		}
+	}
+	return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
 }
 
 func (s *Server) handleJobCancelLocked(jobID string) requestOutcome {
