@@ -4,6 +4,7 @@ package custodian
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -14,13 +15,16 @@ import (
 )
 
 func newNativeContainmentBackend(ctx context.Context, custodian *NativeCustodian) (nativeContainmentBackend, error) {
-	factory := custodian.options.newRetainedGroup
-	if factory == nil {
-		factory = func() (containment.RetainedGroupObject, error) {
-			return cgroup.New("")
-		}
+	return newRetainedNativeContainmentBackend(ctx, custodian, platformRetainedGroupFactory(custodian.options.newRetainedGroup))
+}
+
+func platformRetainedGroupFactory(factory func() (containment.RetainedGroupObject, error)) func() (containment.RetainedGroupObject, error) {
+	if factory != nil {
+		return factory
 	}
-	return newRetainedNativeContainmentBackend(ctx, custodian, factory)
+	return func() (containment.RetainedGroupObject, error) {
+		return cgroup.New("")
+	}
 }
 
 func platformRealContainment(ctx context.Context, real RealContainment, group model.GroupRef) (RealContainment, error) {
@@ -41,7 +45,48 @@ func platformRealContainment(ctx context.Context, real RealContainment, group mo
 }
 
 func platformBindContainmentTarget(ctx context.Context, real RealContainment, group model.GroupRef) (parklaunch.Containment, error) {
-	return platformRealContainment(ctx, real, group)
+	required, err := model.ContainmentRequiresRetainedObject(group)
+	if err != nil {
+		return nil, err
+	}
+	if !required || real.RetainedObject != nil {
+		return real, nil
+	}
+	manager, err := cgroup.New("")
+	if err != nil {
+		return nil, err
+	}
+	capability, err := manager.AcquireRetainedGroupWithoutRootLease(ctx, group, time.Now())
+	if err != nil {
+		_ = manager.Close()
+		return nil, err
+	}
+	bound := RealContainment{
+		Params:         real.Params,
+		RetainedObject: boundRetainedGroupObject{capability: capability},
+	}
+	if witness, ok := capability.(containment.ContinuityWitness); ok {
+		bound.Witness = witness
+	}
+	return bound, nil
+}
+
+type boundRetainedGroupObject struct {
+	capability containment.RetainedGroupCapability
+}
+
+func (object boundRetainedGroupObject) AcquireRetainedGroup(_ context.Context, target model.GroupRef, _ time.Time) (containment.RetainedGroupCapability, error) {
+	if object.capability == nil {
+		return nil, fmt.Errorf("%w: bound retained capability is nil", ErrNativeCustodianUnavailable)
+	}
+	identity := object.capability.Identity()
+	if err := identity.KernelDomainID.Validate(); err != nil {
+		return nil, err
+	}
+	if identity.RetainedID != target.RetainedID || !identity.KernelDomainID.ProvablySame(target.KernelDomain()) {
+		return nil, fmt.Errorf("%w: bound retained capability identity mismatch", ErrNativeCustodianUnavailable)
+	}
+	return object.capability, nil
 }
 
 func probeNativeRuntimePlatform(options NativeOptions) error {
@@ -58,12 +103,16 @@ type nativeCgroupProbeConfig struct {
 	beforeContainment func(context.Context, *nativeCgroupProbeHelper) error
 }
 
-func probeNativeCgroupRuntime(ctx context.Context, config nativeCgroupProbeConfig) (PhysicalOutcome, error) {
+func probeNativeCgroupRuntime(ctx context.Context, config nativeCgroupProbeConfig) (outcome PhysicalOutcome, err error) {
 	manager, err := cgroup.New("")
 	if err != nil {
 		return PhysicalOutcome{}, fmt.Errorf("%w: cgroup manager probe: %v", ErrNativeCustodianUnavailable, err)
 	}
-	defer manager.Close()
+	defer func() {
+		if closeErr := manager.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("%w: close cgroup manager probe: %v", ErrNativeCustodianUnavailable, closeErr))
+		}
+	}()
 	if support := manager.Probe(ctx); !support.Strict() {
 		if support.Reason != nil {
 			return PhysicalOutcome{}, fmt.Errorf("%w: cgroup support probe: %v", ErrNativeCustodianUnavailable, support.Reason)
@@ -82,7 +131,11 @@ func probeNativeCgroupRuntime(ctx context.Context, config nativeCgroupProbeConfi
 	if err != nil {
 		return PhysicalOutcome{}, fmt.Errorf("%w: cgroup containment backend probe: %v", ErrNativeCustodianUnavailable, err)
 	}
-	defer backend.close(ctx)
+	defer func() {
+		if closeErr := backend.close(ctx); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("%w: close cgroup containment backend probe: %v", ErrNativeCustodianUnavailable, closeErr))
+		}
+	}()
 
 	startHelper := config.startHelper
 	if startHelper == nil {
@@ -118,7 +171,7 @@ func probeNativeCgroupRuntime(ctx context.Context, config nativeCgroupProbeConfi
 		return PhysicalOutcome{}, fmt.Errorf("%w: verify cgroup containment probe live membership: %v", ErrNativeCustodianUnavailable, err)
 	}
 
-	outcome := containPhysical(ctx, bound, nativeProbeContainmentParams(config.options.ContainmentParams), backend.witness(), backend.retainedObject())
+	outcome = containPhysical(ctx, bound, nativeProbeContainmentParams(config.options.ContainmentParams), backend.witness(), backend.retainedObject())
 	if !outcome.Absent() {
 		if outcome.Err != nil {
 			return outcome, fmt.Errorf("%w: cgroup containment probe %s: %v", ErrNativeCustodianUnavailable, outcome.Reason, outcome.Err)

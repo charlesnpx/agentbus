@@ -135,6 +135,10 @@ type Server struct {
 	admissionOwnedWorkChecker    admissionOwnedWorkChecker
 	admissionSubmission          *servedSubmissionCoordinator
 	admissionRuntime             *servedAdmissionRuntime
+	admissionRuntimeFactory      func(*Server) *servedAdmissionRuntime
+	admissionDaemonBootOnce      sync.Once
+	admissionDaemonBootRef       model.BootRef
+	admissionDaemonBootRefErr    error
 	admissionRepository          repository.Repository
 	admissionClose               io.Closer
 	admissionBootstrapperFactory admissionBootstrapperFactory

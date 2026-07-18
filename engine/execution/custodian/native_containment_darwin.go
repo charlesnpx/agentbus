@@ -17,13 +17,17 @@ type leaderNativeContainmentBackend struct {
 
 func newNativeContainmentBackend(ctx context.Context, custodian *NativeCustodian) (nativeContainmentBackend, error) {
 	if custodian.options.newRetainedGroup != nil {
-		return newRetainedNativeContainmentBackend(ctx, custodian, custodian.options.newRetainedGroup)
+		return newRetainedNativeContainmentBackend(ctx, custodian, platformRetainedGroupFactory(custodian.options.newRetainedGroup))
 	}
 	factory := custodian.options.newLeaderRetention
 	if factory == nil {
 		factory = newLeaderRetentionForGroup
 	}
 	return &leaderNativeContainmentBackend{factory: factory}, nil
+}
+
+func platformRetainedGroupFactory(factory func() (containment.RetainedGroupObject, error)) func() (containment.RetainedGroupObject, error) {
+	return factory
 }
 
 func (backend *leaderNativeContainmentBackend) retainedID() string {

@@ -32,10 +32,12 @@ func New(root string) (*Manager, error) {
 }
 
 type realFS struct {
-	root       string
-	mu         sync.Mutex
-	held       *realRoot
-	tombstones map[string]ObjectIdentity
+	root          string
+	mu            sync.Mutex
+	rootUsers     int
+	rootUsersCond *sync.Cond
+	held          *realRoot
+	tombstones    map[string]ObjectIdentity
 }
 
 type realRoot struct {
@@ -92,6 +94,12 @@ func (object *realObject) Close() error {
 	return err
 }
 
+func (object *realObject) releaseRootReference() {
+	if object != nil {
+		object.rootfd = -1
+	}
+}
+
 func (fs *realFS) RootIdentity(ctx context.Context) (RootIdentity, error) {
 	if err := ctx.Err(); err != nil {
 		return RootIdentity{}, err
@@ -107,18 +115,35 @@ func (fs *realFS) Close() error {
 	if fs == nil {
 		return nil
 	}
+	return fs.releaseRootLease()
+}
+
+func (fs *realFS) releaseRootLease() error {
+	if fs == nil {
+		return nil
+	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	for fs.rootUsers > 0 {
+		fs.rootUsersCondLocked().Wait()
+	}
 	if fs.held == nil {
 		return nil
 	}
-	fd := fs.held.fd
+	held := fs.held
 	fs.held = nil
-	var err error
-	if fd >= 0 {
-		err = errors.Join(err, unix.Flock(fd, unix.LOCK_UN))
-		err = errors.Join(err, unix.Close(fd))
+	return closeRootLease(held.fd, held.identity.Exclusive)
+}
+
+func closeRootLease(rootfd int, leased bool) error {
+	if rootfd < 0 {
+		return nil
 	}
+	var err error
+	if leased {
+		err = errors.Join(err, unix.Flock(rootfd, unix.LOCK_UN))
+	}
+	err = errors.Join(err, unix.Close(rootfd))
 	return err
 }
 
@@ -137,6 +162,51 @@ func (fs *realFS) heldRoot(ctx context.Context) (*realRoot, error) {
 	}
 	fs.held = held
 	return held, nil
+}
+
+func (fs *realFS) acquireRoot(ctx context.Context) (*realRoot, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.held == nil {
+		held, err := fs.openAndLeaseRoot()
+		if err != nil {
+			return nil, nil, err
+		}
+		fs.held = held
+	}
+	fs.rootUsers++
+	return fs.held, fs.releaseRootUse, nil
+}
+
+func (fs *realFS) acquireHeldRoot(expected ObjectIdentity) (*realRoot, func(), bool) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.held == nil || !expected.durableEqual(fs.held.identity.RootObject) {
+		return nil, nil, false
+	}
+	fs.rootUsers++
+	return fs.held, fs.releaseRootUse, true
+}
+
+func (fs *realFS) releaseRootUse() {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.rootUsers > 0 {
+		fs.rootUsers--
+	}
+	if fs.rootUsers == 0 && fs.rootUsersCond != nil {
+		fs.rootUsersCond.Broadcast()
+	}
+}
+
+func (fs *realFS) rootUsersCondLocked() *sync.Cond {
+	if fs.rootUsersCond == nil {
+		fs.rootUsersCond = sync.NewCond(&fs.mu)
+	}
+	return fs.rootUsersCond
 }
 
 func (fs *realFS) openAndLeaseRoot() (*realRoot, error) {
@@ -163,32 +233,32 @@ func (fs *realFS) openAndLeaseRoot() (*realRoot, error) {
 	}
 	selfCgroup, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
-		_ = unix.Close(rootfd)
+		_ = closeRootLease(rootfd, exclusive)
 		return nil, fmt.Errorf("%w: read /proc/self/cgroup: %v", ErrUnsupported, err)
 	}
 	mountData, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
-		_ = unix.Close(rootfd)
+		_ = closeRootLease(rootfd, exclusive)
 		return nil, fmt.Errorf("%w: read /proc/self/mountinfo: %v", ErrUnsupported, err)
 	}
 	mounts, err := parseMountInfo(string(mountData))
 	if err != nil {
-		_ = unix.Close(rootfd)
+		_ = closeRootLease(rootfd, exclusive)
 		return nil, err
 	}
 	mount, err := classifyUnifiedCgroupRoot(string(selfCgroup), mounts, fs.root)
 	if err != nil {
-		_ = unix.Close(rootfd)
+		_ = closeRootLease(rootfd, exclusive)
 		return nil, err
 	}
 	cgroupTypeData, err := readRootFile(rootfd, "cgroup.type")
 	if err != nil {
-		_ = unix.Close(rootfd)
+		_ = closeRootLease(rootfd, exclusive)
 		return nil, fmt.Errorf("%w: read cgroup.type: %v", ErrUnsupported, err)
 	}
 	cgroupType := strings.TrimSpace(string(cgroupTypeData))
 	if cgroupType != "domain" {
-		_ = unix.Close(rootfd)
+		_ = closeRootLease(rootfd, exclusive)
 		return nil, fmt.Errorf("%w: unsupported cgroup.type %q", ErrUnsupported, cgroupType)
 	}
 	readOnly := unix.Faccessat(rootfd, ".", unix.W_OK, 0) != nil
@@ -205,7 +275,7 @@ func (fs *realFS) openAndLeaseRoot() (*realRoot, error) {
 		RootObject:        rootObject,
 	}
 	if root.HostBootID == "" || root.PIDNamespaceID == "" || root.CgroupNamespaceID == "" || root.MountID == "" || root.HierarchyID == "" || !root.RootObject.durable() {
-		_ = unix.Close(rootfd)
+		_ = closeRootLease(rootfd, exclusive)
 		return nil, fmt.Errorf("%w: incomplete cgroup domain identity", ErrUnsupported)
 	}
 	return &realRoot{fd: rootfd, identity: root}, nil
@@ -218,10 +288,11 @@ func (fs *realFS) CreateChild(ctx context.Context, name string) (cgroupObject, e
 	if err := validateRetainedID(name); err != nil {
 		return nil, err
 	}
-	held, err := fs.heldRoot(ctx)
+	held, releaseRoot, err := fs.acquireRoot(ctx)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseRoot()
 	rootfd := held.fd
 	rootObject := held.identity.RootObject
 	if err := verifyRootHandle(rootfd, rootObject); err != nil {
@@ -268,10 +339,11 @@ func (fs *realFS) Open(ctx context.Context, name string) (cgroupObject, error) {
 	if err := validateRetainedID(name); err != nil {
 		return nil, err
 	}
-	held, err := fs.heldRoot(ctx)
+	held, releaseRoot, err := fs.acquireRoot(ctx)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseRoot()
 	rootfd := held.fd
 	rootObject := held.identity.RootObject
 	if err := verifyRootHandle(rootfd, rootObject); err != nil {
@@ -298,13 +370,6 @@ func (fs *realFS) Verify(ctx context.Context, object cgroupObject) (bool, error)
 	if err != nil {
 		return false, err
 	}
-	root, err := identityFromFD(realObject.rootfd)
-	if err != nil {
-		if errors.Is(err, unix.EBADF) || errors.Is(err, unix.ESTALE) {
-			return false, nil
-		}
-		return false, err
-	}
 	leaf, err := identityFromFD(realObject.leaffd)
 	if err != nil {
 		if errors.Is(err, unix.EBADF) || errors.Is(err, unix.ESTALE) {
@@ -312,7 +377,7 @@ func (fs *realFS) Verify(ctx context.Context, object cgroupObject) (bool, error)
 		}
 		return false, err
 	}
-	if !realObject.root.sameLiveObject(root) || !realObject.leaf.sameLiveObject(leaf) || !realObject.root.durableEqual(root) || !realObject.leaf.durableEqual(leaf) {
+	if !realObject.leaf.sameLiveObject(leaf) || !realObject.leaf.durableEqual(leaf) {
 		return false, nil
 	}
 	fd, err := unix.Openat(realObject.leaffd, "cgroup.events", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
@@ -427,15 +492,22 @@ func (fs *realFS) Remove(ctx context.Context, object cgroupObject) error {
 	if err != nil {
 		return err
 	}
-	current, err := identityAt(realObject.rootfd, realObject.leafName)
+	held, releaseRoot, ok := fs.acquireHeldRoot(realObject.root)
+	if !ok {
+		fs.recordTombstone(realObject.leafName, realObject.leaf)
+		return nil
+	}
+	defer releaseRoot()
+	rootfd := held.fd
+	current, err := identityAt(rootfd, realObject.leafName)
 	if err != nil || !realObject.leaf.durableEqual(current) {
 		fs.recordTombstone(realObject.leafName, realObject.leaf)
 		return nil
 	}
-	if err := verifyRootHandle(realObject.rootfd, realObject.root); err != nil {
+	if err := verifyRootHandle(rootfd, realObject.root); err != nil {
 		return err
 	}
-	if err := unix.Unlinkat(realObject.rootfd, realObject.leafName, unix.AT_REMOVEDIR); err != nil {
+	if err := unix.Unlinkat(rootfd, realObject.leafName, unix.AT_REMOVEDIR); err != nil {
 		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESTALE) {
 			fs.recordTombstone(realObject.leafName, realObject.leaf)
 			return nil
@@ -462,7 +534,7 @@ func (fs *realFS) realObject(ctx context.Context, object cgroupObject) (*realObj
 		return nil, err
 	}
 	realObject, ok := object.(*realObject)
-	if !ok || realObject == nil || realObject.closed || realObject.rootPath != fs.root || realObject.rootfd < 0 || realObject.leaffd < 0 {
+	if !ok || realObject == nil || realObject.closed || realObject.rootPath != fs.root || realObject.leaffd < 0 {
 		return nil, fmt.Errorf("%w: invalid cgroup object", ErrInvalid)
 	}
 	return realObject, nil
@@ -605,6 +677,7 @@ func (fs *realFS) establishExclusiveDelegation(rootfd int) (bool, error) {
 	}
 	entries, err := readDirAt(rootfd)
 	if err != nil {
+		_ = unix.Flock(rootfd, unix.LOCK_UN)
 		return false, fmt.Errorf("%w: inspect delegated cgroup root: %v", ErrUnsupported, err)
 	}
 	for _, entry := range entries {

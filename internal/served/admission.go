@@ -68,7 +68,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		}
 	}()
 
-	boot, err := model.NewBootRef(s.nextID("boot"), s.nextID("owner"))
+	boot, err := s.admissionDaemonBoot()
 	if err != nil {
 		return err
 	}
@@ -116,6 +116,31 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	s.admissionClose = closer
 	closeOnErr = false
 	return nil
+}
+
+func (s *Server) admissionDaemonBoot() (model.BootRef, error) {
+	s.admissionDaemonBootOnce.Do(func() {
+		bootID, err := s.admissionDaemonID("boot")
+		if err != nil {
+			s.admissionDaemonBootRefErr = err
+			return
+		}
+		ownerID, err := s.admissionDaemonID("owner")
+		if err != nil {
+			s.admissionDaemonBootRefErr = err
+			return
+		}
+		s.admissionDaemonBootRef, s.admissionDaemonBootRefErr = model.NewBootRef(bootID, ownerID)
+	})
+	return s.admissionDaemonBootRef, s.admissionDaemonBootRefErr
+}
+
+func (s *Server) admissionDaemonID(prefix string) (string, error) {
+	entropy, err := randomToken()
+	if err != nil {
+		return "", fmt.Errorf("generate %s admission daemon identity entropy: %w", prefix, err)
+	}
+	return s.nextID(prefix) + "_" + entropy, nil
 }
 
 func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {

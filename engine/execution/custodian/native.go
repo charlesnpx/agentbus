@@ -340,7 +340,89 @@ func (custodian *NativeCustodian) ContainAndVerify(ctx context.Context, group mo
 	if finalized != nil {
 		return finalized.ContainAndVerify(ctx, cause)
 	}
-	return attestPhysicalOutcome(custodian.issuer, containPhysical(ctx, group, custodian.options.ContainmentParams, nil, nil))
+	return attestPhysicalOutcome(custodian.issuer, custodian.containRecoveredPhysical(ctx, group))
+}
+
+func (custodian *NativeCustodian) containRecoveredPhysical(ctx context.Context, group model.GroupRef) PhysicalOutcome {
+	requiresRetained, err := model.ContainmentRequiresRetainedObject(group)
+	if err != nil {
+		return unprovablePhysical(group, containment.ReasonInvalidInput, "", err)
+	}
+	if !requiresRetained {
+		return containPhysical(ctx, group, custodian.options.ContainmentParams, nil, nil)
+	}
+	factory := platformRetainedGroupFactory(custodian.options.newRetainedGroup)
+	if factory == nil {
+		return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, fmt.Errorf("%w: required retained object acquisition provider is missing", ErrNativeCustodianUnavailable))
+	}
+	manager, err := custodian.sharedRetainedGroup(factory)
+	if err != nil {
+		return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, err)
+	}
+	capability, err := manager.AcquireRetainedGroup(ctx, group, time.Now())
+	if err != nil {
+		if retainedGroupMissing(err) {
+			if proofErr := proveRetainedGroupAbsent(ctx, manager, group); proofErr == nil {
+				return PhysicalOutcome{
+					Kind:     PhysicalOutcomeAbsent,
+					Group:    group,
+					Method:   model.QuiescenceAlreadyAbsent,
+					Decision: model.AlreadyAbsent,
+				}
+			} else {
+				return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, errors.Join(
+					fmt.Errorf("%w: retained group missing without same-domain absence proof", ErrNativeCustodianUnavailable),
+					err,
+					proofErr,
+				))
+			}
+		}
+		return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, err)
+	}
+	if capability == nil {
+		return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, fmt.Errorf("%w: retained object acquisition returned nil capability", ErrNativeCustodianUnavailable))
+	}
+	defer capability.Release()
+
+	var witness containment.ContinuityWitness
+	if continuity, ok := capability.(containment.ContinuityWitness); ok {
+		witness = continuity
+	}
+	return containPhysical(ctx, group, custodian.options.ContainmentParams, witness, recoveredRetainedObject{capability: capability})
+}
+
+func retainedGroupMissing(err error) bool {
+	return errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESTALE)
+}
+
+type retainedGroupAbsenceProver interface {
+	ProveRetainedGroupAbsent(ctx context.Context, target model.GroupRef) error
+}
+
+func proveRetainedGroupAbsent(ctx context.Context, manager containment.RetainedGroupObject, group model.GroupRef) error {
+	prover, ok := manager.(retainedGroupAbsenceProver)
+	if !ok || prover == nil {
+		return fmt.Errorf("%w: retained group manager cannot prove same-domain absence", ErrNativeCustodianUnavailable)
+	}
+	return prover.ProveRetainedGroupAbsent(ctx, group)
+}
+
+type recoveredRetainedObject struct {
+	capability containment.RetainedGroupCapability
+}
+
+func (object recoveredRetainedObject) AcquireRetainedGroup(_ context.Context, target model.GroupRef, _ time.Time) (containment.RetainedGroupCapability, error) {
+	if object.capability == nil {
+		return nil, fmt.Errorf("%w: recovered retained capability is nil", ErrNativeCustodianUnavailable)
+	}
+	identity := object.capability.Identity()
+	if err := identity.KernelDomainID.Validate(); err != nil {
+		return nil, err
+	}
+	if identity.RetainedID != target.RetainedID || !identity.KernelDomainID.ProvablySame(target.KernelDomain()) {
+		return nil, fmt.Errorf("%w: recovered retained capability identity mismatch", ErrNativeCustodianUnavailable)
+	}
+	return object.capability, nil
 }
 
 func (custodian *NativeCustodian) lookup(group model.GroupRef) *NativeRunningProcess {
@@ -679,6 +761,16 @@ func (process *NativeRunningProcess) retainedObject() containment.RetainedGroupO
 	return process.containment.retainedObject()
 }
 
+func (process *NativeRunningProcess) shouldContainResidualGroup() (bool, error) {
+	if process == nil {
+		return false, fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable)
+	}
+	if process.leader != nil {
+		return true, nil
+	}
+	return model.ContainmentRequiresRetainedObject(process.group)
+}
+
 func (process *NativeRunningProcess) Wait(ctx context.Context) (command.ExitObservation, error) {
 	if process == nil || process.handle == nil {
 		return command.ExitObservation{}, nil
@@ -733,7 +825,11 @@ func (process *NativeRunningProcess) Wait(ctx context.Context) (command.ExitObse
 		}
 		var exit command.ExitObservation
 		var err error
-		containResidual := process.leader != nil
+		containResidual, err := process.shouldContainResidualGroup()
+		if err != nil {
+			process.lifecycleMu.Unlock()
+			return command.ExitObservation{}, err
+		}
 		if process.leader != nil {
 			outcome, exit, err = process.finalizeIfSoleLeaderLocked(ctx, outcome, 0)
 		} else {

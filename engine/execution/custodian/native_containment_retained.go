@@ -4,6 +4,7 @@ package custodian
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -17,6 +18,10 @@ type retainedGroupPlacementCapability interface {
 	containment.ContinuityWitness
 	PlacePID(context.Context, int) error
 	Remove(context.Context) error
+}
+
+type retainedGroupRootLeaseReleaser interface {
+	ReleaseRootLease() error
 }
 
 type retainedNativeContainmentBackend struct {
@@ -87,6 +92,11 @@ func (backend *retainedNativeContainmentBackend) beforeMonitorBind(ctx context.C
 	if err := bound.Validate(); err != nil {
 		return model.GroupRef{}, err
 	}
+	if releaser, ok := backend.capability.(retainedGroupRootLeaseReleaser); ok {
+		if err := releaser.ReleaseRootLease(); err != nil {
+			return model.GroupRef{}, fmt.Errorf("release retained root lease: %w", err)
+		}
+	}
 	backend.bound = true
 	return bound, nil
 }
@@ -126,8 +136,11 @@ func (backend *retainedNativeContainmentBackend) close(ctx context.Context) erro
 	if backend == nil || backend.capability == nil {
 		return nil
 	}
+	var cleanupErr error
 	if membership, err := backend.capability.Membership(ctx); err == nil && membership == containment.RetainedMembershipEmpty {
-		_ = backend.capability.Remove(ctx)
+		if removeErr := backend.capability.Remove(ctx); removeErr != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove empty retained cgroup: %w", removeErr))
+		}
 	}
-	return backend.capability.Release()
+	return errors.Join(cleanupErr, backend.capability.Release())
 }

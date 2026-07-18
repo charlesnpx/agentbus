@@ -372,6 +372,53 @@ func TestCapabilityOffStartupSkipsAdmissionBootstrap(t *testing.T) {
 	}
 }
 
+func TestAdmissionDaemonBootIdentityCarriesPerServerEntropy(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	clock := engine.ClockFunc(func() time.Time { return base })
+	newServer := func() *Server {
+		t.Helper()
+		server, err := New(Config{
+			StateRoot:    shortTempDir(t),
+			CWD:          shortTempDir(t),
+			Token:        "test-token",
+			Backends:     []engine.Backend{newFakeBackend("fake")},
+			ProcessTable: fakeProcessTable{},
+			Clock:        clock,
+			IdleTimeout:  -1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return server
+	}
+
+	first := newServer()
+	second := newServer()
+	firstBoot, err := first.admissionDaemonBoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = first.nextID("job")
+	firstBootAgain, err := first.admissionDaemonBoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstBootAgain != firstBoot {
+		t.Fatalf("admission daemon boot ref changed within one server: first=%+v second=%+v", firstBoot, firstBootAgain)
+	}
+	secondBoot, err := second.admissionDaemonBoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondBoot.BootID == firstBoot.BootID {
+		t.Fatalf("same fixed-clock server boot ids collided: %q", firstBoot.BootID)
+	}
+	if secondBoot.OwnerID == firstBoot.OwnerID {
+		t.Fatalf("same fixed-clock server owner ids collided: %q", firstBoot.OwnerID)
+	}
+}
+
 func TestCapabilityOffStartupRunsLegacyReapBeforeListen(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)

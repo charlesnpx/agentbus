@@ -12,6 +12,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/containment"
+	"golang.org/x/sys/unix"
 )
 
 func TestAcquireCreatesUniqueLeaf(t *testing.T) {
@@ -180,6 +181,206 @@ func TestManagerCloseReleasesExclusiveRootLease(t *testing.T) {
 	}
 	if secondCapability == nil {
 		t.Fatalf("second AcquireRetainedGroup() after close capability is nil")
+	}
+}
+
+func TestAcquireWithoutRootLeaseKeepsGroupCapabilityAndAllowsRootReacquire(t *testing.T) {
+	ctx := context.Background()
+	lease := &fakeRootLease{}
+	daemonFS := newFakeCgroupFS()
+	daemonFS.lease = lease
+	daemon := newFakeManager(daemonFS, leafSequence("cg-daemon-held"))
+	daemonCapability := acquireCapability(t, daemon)
+	if err := daemonCapability.PlacePID(ctx, 100); err != nil {
+		t.Fatalf("daemon PlacePID() error = %v", err)
+	}
+	if err := daemonCapability.ReleaseRootLease(); err != nil {
+		t.Fatalf("daemon ReleaseRootLease() error = %v", err)
+	}
+	if lease.holder != nil {
+		t.Fatalf("lease holder after daemon ReleaseRootLease() = %p, want nil", lease.holder)
+	}
+	if object := daemonCapability.object.(*fakeCgroupObject); object.closed {
+		t.Fatalf("daemon retained object closed after root lease release")
+	}
+
+	monitorFS := newFakeCgroupFS()
+	monitorFS.lease = lease
+	monitorFS.root = daemonFS.root
+	monitorFS.leaves = daemonFS.leaves
+	monitor := newFakeManager(monitorFS, leafSequence("cg-monitor-unused"))
+	monitorRaw, err := monitor.AcquireRetainedGroupWithoutRootLease(ctx, model.GroupRef{RetainedID: daemonCapability.retainedID}, time.Now())
+	if err != nil {
+		t.Fatalf("monitor AcquireRetainedGroupWithoutRootLease() error = %v", err)
+	}
+	monitorCapability := monitorRaw.(*Capability)
+	if lease.holder != nil {
+		t.Fatalf("lease holder after monitor acquisition = %p, want nil", lease.holder)
+	}
+	if got := membership(t, monitorCapability); got != containment.RetainedMembershipPresent {
+		t.Fatalf("monitor membership after root lease release = %v, want present", got)
+	}
+
+	contenderFS := newFakeCgroupFS()
+	contenderFS.lease = lease
+	contenderFS.root = daemonFS.root
+	contenderFS.leaves = daemonFS.leaves
+	contender := newFakeManager(contenderFS, leafSequence("cg-contender"))
+	contenderCapability, err := contender.AcquireRetainedGroup(ctx, model.GroupRef{}, time.Now())
+	if err != nil {
+		t.Fatalf("contender AcquireRetainedGroup() error = %v", err)
+	}
+	defer contenderCapability.Release()
+	if lease.holder != contenderFS {
+		t.Fatalf("lease holder after contender acquisition = %p, want contender fs %p", lease.holder, contenderFS)
+	}
+
+	result, err := monitorCapability.Kill(ctx)
+	if err != nil || result != containment.SignalDelivered {
+		t.Fatalf("monitor Kill() after root reacquire = %v, %v; want delivered nil", result, err)
+	}
+	if got := membership(t, monitorCapability); got != containment.RetainedMembershipEmpty {
+		t.Fatalf("monitor membership after Kill() = %v, want empty", got)
+	}
+	if object := monitorCapability.object.(*fakeCgroupObject); object.closed {
+		t.Fatalf("monitor retained object closed before Release()")
+	}
+	if err := monitorCapability.Release(); err != nil {
+		t.Fatalf("monitor Release() error = %v", err)
+	}
+	if object := monitorCapability.object.(*fakeCgroupObject); !object.closed {
+		t.Fatalf("monitor retained object open after Release()")
+	}
+}
+
+func TestReleaseRootLeaseWaitsForConcurrentAcquireCreateChild(t *testing.T) {
+	ctx := context.Background()
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-held", "cg-concurrent"))
+	capability := acquireCapability(t, manager)
+
+	createEntered := make(chan struct{})
+	allowCreate := make(chan struct{})
+	releaseEntered := make(chan struct{}, 1)
+	fs.onCreateChild = func(name string) {
+		if name != "cg-concurrent" {
+			return
+		}
+		close(createEntered)
+		<-allowCreate
+	}
+	fs.onReleaseRootLease = func() {
+		releaseEntered <- struct{}{}
+	}
+
+	acquireDone := make(chan error, 1)
+	go func() {
+		acquired, err := manager.AcquireRetainedGroup(ctx, model.GroupRef{}, time.Now())
+		if acquired != nil {
+			_ = acquired.Release()
+		}
+		acquireDone <- err
+	}()
+	<-createEntered
+
+	releaseDone := make(chan error, 1)
+	go func() {
+		releaseDone <- capability.ReleaseRootLease()
+	}()
+	select {
+	case <-releaseEntered:
+		t.Fatalf("ReleaseRootLease entered fs.releaseRootLease while CreateChild was still using the shared root")
+	case err := <-releaseDone:
+		t.Fatalf("ReleaseRootLease completed while CreateChild was still using the shared root: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(allowCreate)
+	if err := <-acquireDone; err != nil {
+		t.Fatalf("concurrent AcquireRetainedGroup() error = %v", err)
+	}
+	if !fs.exists("cg-concurrent") {
+		t.Fatalf("concurrent AcquireRetainedGroup() did not leave created leaf")
+	}
+	if err := <-releaseDone; err != nil {
+		t.Fatalf("ReleaseRootLease() error = %v", err)
+	}
+	select {
+	case <-releaseEntered:
+	default:
+		t.Fatalf("releaseRootLease hook was not reached after CreateChild completed")
+	}
+}
+
+func TestReleaseRootLeaseWaitsForConcurrentRemove(t *testing.T) {
+	ctx := context.Background()
+	fs := newFakeCgroupFS()
+	fs.nameCleanupAllowed = true
+	fs.failRemoveAfterRootLeaseRelease = true
+	manager := newFakeManager(fs, leafSequence("cg-remove", "cg-releaser"))
+	removeCapability := acquireCapability(t, manager)
+	defer removeCapability.Release()
+	releaserCapability := acquireCapability(t, manager)
+	defer releaserCapability.Release()
+
+	removeEntered := make(chan struct{})
+	allowRemove := make(chan struct{})
+	releaseEntered := make(chan struct{}, 1)
+	fs.onAfterFinalVerify = func(name string) {
+		if name != "cg-remove" {
+			return
+		}
+		close(removeEntered)
+		<-allowRemove
+	}
+	fs.onReleaseRootLease = func() {
+		releaseEntered <- struct{}{}
+	}
+
+	removeDone := make(chan error, 1)
+	go func() {
+		removeDone <- removeCapability.Remove(ctx)
+	}()
+	select {
+	case <-removeEntered:
+	case err := <-removeDone:
+		t.Fatalf("Remove() completed before the fake remove hook was reached: %v", err)
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("Remove() did not reach the fake remove hook")
+	}
+
+	releaseDone := make(chan error, 1)
+	go func() {
+		releaseDone <- releaserCapability.ReleaseRootLease()
+	}()
+	select {
+	case <-releaseEntered:
+		t.Fatalf("ReleaseRootLease entered fs.releaseRootLease while Remove was still using the shared root")
+	case err := <-releaseDone:
+		t.Fatalf("ReleaseRootLease completed while Remove was still using the shared root: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(allowRemove)
+	if err := <-removeDone; err != nil {
+		if errors.Is(err, unix.EBADF) {
+			t.Fatalf("Remove() used the shared root after ReleaseRootLease closed it: %v", err)
+		}
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if fs.exists("cg-remove") {
+		t.Fatalf("empty leaf still exists after Remove()")
+	}
+	if fs.removeCalls != 1 {
+		t.Fatalf("remove calls = %d, want 1", fs.removeCalls)
+	}
+	if err := <-releaseDone; err != nil {
+		t.Fatalf("ReleaseRootLease() error = %v", err)
+	}
+	select {
+	case <-releaseEntered:
+	default:
+		t.Fatalf("releaseRootLease hook was not reached after Remove completed")
 	}
 }
 
@@ -354,6 +555,25 @@ func TestRemoveRetiresEmptyLeafWhenCurrentNameStillMatches(t *testing.T) {
 	}
 	if fs.removeCalls != 1 {
 		t.Fatalf("remove calls = %d, want 1", fs.removeCalls)
+	}
+}
+
+func TestRemoveSurfacesCleanupError(t *testing.T) {
+	fs := newFakeCgroupFS()
+	fs.nameCleanupAllowed = true
+	fs.removeErr = unix.EBADF
+	manager := newFakeManager(fs, leafSequence("cg-remove-error"))
+	capability := acquireCapability(t, manager)
+
+	err := capability.Remove(context.Background())
+	if !errors.Is(err, unix.EBADF) {
+		t.Fatalf("Remove() error = %v, want EBADF", err)
+	}
+	if capability.removed {
+		t.Fatalf("capability marked removed after failed cleanup")
+	}
+	if !fs.exists(capability.retainedID) {
+		t.Fatalf("leaf was removed after failed cleanup")
 	}
 }
 
@@ -868,29 +1088,34 @@ func (terminator *recordingTerminator) Close(handle processHandle) error {
 }
 
 type fakeCgroupFS struct {
-	root                RootIdentity
-	rootErr             error
-	lease               *fakeRootLease
-	leaves              map[string]*fakeLeaf
-	tombstones          map[string]ObjectIdentity
-	nextInode           uint64
-	nextGeneration      uint64
-	generationAvailable bool
-	nameCleanupAllowed  bool
-	onAfterRootIdentity func()
-	onPathStat          func(string)
-	onPathHandle        func(string)
-	onOpen              func(string)
-	onFinalVerify       func(string)
-	onAfterFinalVerify  func(string)
-	onUnlink            func(string)
-	onBeforeReadProcs   func(string)
-	onReadProcs         func(string, []int)
-	onBeforeWriteKill   func(string)
-	killWrites          int
-	removeCalls         int
-	tombstoneCalls      int
-	closeCalls          int
+	root                            RootIdentity
+	rootErr                         error
+	lease                           *fakeRootLease
+	leaves                          map[string]*fakeLeaf
+	tombstones                      map[string]ObjectIdentity
+	nextInode                       uint64
+	nextGeneration                  uint64
+	generationAvailable             bool
+	nameCleanupAllowed              bool
+	failRemoveAfterRootLeaseRelease bool
+	removeErr                       error
+	onAfterRootIdentity             func()
+	onPathStat                      func(string)
+	onPathHandle                    func(string)
+	onOpen                          func(string)
+	onCreateChild                   func(string)
+	onReleaseRootLease              func()
+	onFinalVerify                   func(string)
+	onAfterFinalVerify              func(string)
+	onUnlink                        func(string)
+	onBeforeReadProcs               func(string)
+	onReadProcs                     func(string, []int)
+	onBeforeWriteKill               func(string)
+	killWrites                      int
+	removeCalls                     int
+	tombstoneCalls                  int
+	rootLeaseReleases               int
+	closeCalls                      int
 }
 
 type fakeRootLease struct {
@@ -990,6 +1215,14 @@ func (fs *fakeCgroupFS) RootIdentity(context.Context) (RootIdentity, error) {
 
 func (fs *fakeCgroupFS) Close() error {
 	fs.closeCalls++
+	return fs.releaseRootLease()
+}
+
+func (fs *fakeCgroupFS) releaseRootLease() error {
+	if fs.onReleaseRootLease != nil {
+		fs.onReleaseRootLease()
+	}
+	fs.rootLeaseReleases++
 	if fs.lease != nil && fs.lease.holder == fs {
 		fs.lease.holder = nil
 	}
@@ -999,6 +1232,9 @@ func (fs *fakeCgroupFS) Close() error {
 func (fs *fakeCgroupFS) CreateChild(_ context.Context, id string) (cgroupObject, error) {
 	if err := validateRetainedID(id); err != nil {
 		return nil, err
+	}
+	if fs.onCreateChild != nil {
+		fs.onCreateChild(id)
 	}
 	if leaf, ok := fs.leaves[id]; ok && !leaf.removed {
 		return nil, fmt.Errorf("%w: %w", ErrUnsupported, errLeafCollision)
@@ -1162,12 +1398,18 @@ func (fs *fakeCgroupFS) Remove(_ context.Context, object cgroupObject) error {
 	if fs.onAfterFinalVerify != nil {
 		fs.onAfterFinalVerify(object.LeafName())
 	}
+	if fs.failRemoveAfterRootLeaseRelease && fs.lease != nil && fs.lease.holder != fs {
+		return unix.EBADF
+	}
 	if !fs.nameCleanupAllowed {
 		fs.recordTombstone(object.LeafName(), object.LeafObject())
 		return nil
 	}
 	if fs.onUnlink != nil {
 		fs.onUnlink(object.LeafName())
+	}
+	if fs.removeErr != nil {
+		return fs.removeErr
 	}
 	return fs.unlinkName(object.LeafName())
 }

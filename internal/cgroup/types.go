@@ -20,6 +20,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/containment"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -191,6 +192,7 @@ type cgroupFS interface {
 	RootIdentity(context.Context) (RootIdentity, error)
 	CreateChild(context.Context, string) (cgroupObject, error)
 	Open(context.Context, string) (cgroupObject, error)
+	releaseRootLease() error
 	// Verify validates the held root/leaf object handles only. The current leaf
 	// pathname is reserved for Open and guarded tombstone cleanup decisions.
 	Verify(context.Context, cgroupObject) (bool, error)
@@ -206,6 +208,10 @@ type cgroupFS interface {
 	// Remove is best-effort cleanup for a held object already proven empty by
 	// Membership. Absence must not depend on name-based directory removal.
 	Remove(context.Context, cgroupObject) error
+}
+
+type rootReferenceReleaser interface {
+	releaseRootReference()
 }
 
 type processTerminator interface {
@@ -284,7 +290,7 @@ func (manager *Manager) Probe(ctx context.Context) Support {
 			return
 		}
 		_, _ = capability.Kill(ctx)
-		_ = capability.Remove(ctx)
+		_ = capability.removeLocked(ctx)
 	}()
 
 	features, err := capability.ProbeFeatures(ctx)
@@ -329,7 +335,7 @@ func (manager *Manager) Probe(ctx context.Context) Support {
 	if membership, err := capability.Membership(ctx); err != nil || membership != containment.RetainedMembershipEmpty {
 		return unsupportedSupport(fmt.Errorf("%w: observe empty: membership=%v err=%v", ErrUnsupported, membership, err))
 	}
-	if err := capability.Remove(ctx); err != nil {
+	if err := capability.removeLocked(ctx); err != nil {
 		return unsupportedSupport(fmt.Errorf("%w: remove probe cgroup: %v", ErrUnsupported, err))
 	}
 	return Support{
@@ -466,6 +472,35 @@ func (manager *Manager) AcquireRetainedGroup(ctx context.Context, target model.G
 	return capability, nil
 }
 
+func (manager *Manager) AcquireRetainedGroupWithoutRootLease(ctx context.Context, target model.GroupRef, acquiredAt time.Time) (containment.RetainedGroupCapability, error) {
+	capability, err := manager.AcquireRetainedGroup(ctx, target, acquiredAt)
+	if err != nil {
+		return nil, err
+	}
+	typed, ok := capability.(*Capability)
+	if !ok {
+		_ = capability.Release()
+		return nil, fmt.Errorf("%w: retained capability cannot release cgroup root lease", ErrUnsupported)
+	}
+	if err := typed.ReleaseRootLease(); err != nil {
+		_ = typed.Release()
+		return nil, err
+	}
+	return typed, nil
+}
+
+func (manager *Manager) ProveRetainedGroupAbsent(ctx context.Context, target model.GroupRef) error {
+	if manager == nil || manager.fs == nil {
+		return fmt.Errorf("%w: manager is nil", ErrUnsupported)
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if manager.closed {
+		return fmt.Errorf("%w: manager is closed", ErrUnsupported)
+	}
+	return manager.proveRetainedGroupAbsent(ctx, target)
+}
+
 func (manager *Manager) Close() error {
 	if manager == nil {
 		return nil
@@ -481,6 +516,55 @@ func (manager *Manager) Close() error {
 		return nil
 	}
 	return closer.Close()
+}
+
+func (manager *Manager) proveRetainedGroupAbsent(ctx context.Context, target model.GroupRef) error {
+	if err := target.Validate(); err != nil {
+		return err
+	}
+	if target.RetainedID == "" {
+		return fmt.Errorf("%w: retained id is required for absence proof", ErrInvalid)
+	}
+	descriptor, err := parseRetainedID(target.RetainedID)
+	if err != nil {
+		return err
+	}
+	root, err := manager.fs.RootIdentity(ctx)
+	if err != nil {
+		return err
+	}
+	if err := strictSupportError(root); err != nil {
+		return err
+	}
+	if !root.RootObject.durableEqual(descriptor.root) {
+		return fmt.Errorf("%w: retained cgroup root identity mismatch", ErrUnsupported)
+	}
+	kernelDomain, err := root.kernelDomain()
+	if err != nil {
+		return err
+	}
+	if !kernelDomain.ProvablySame(target.KernelDomain()) {
+		return fmt.Errorf("%w: retained cgroup kernel domain mismatch", ErrUnsupported)
+	}
+	object, err := manager.fs.Open(ctx, descriptor.leafName)
+	if err != nil {
+		if retainedLeafMissing(err) {
+			return nil
+		}
+		return err
+	}
+	defer object.Close()
+	if !root.RootObject.durableEqual(object.RootObject()) {
+		return fmt.Errorf("%w: cgroup root changed during absence proof", ErrUnsupported)
+	}
+	if descriptor.matches(object) {
+		return fmt.Errorf("%w: retained cgroup object still exists", ErrUnsupported)
+	}
+	return fmt.Errorf("%w: retained cgroup object identity mismatch", ErrUnsupported)
+}
+
+func retainedLeafMissing(err error) bool {
+	return errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESTALE)
 }
 
 func (manager *Manager) create(ctx context.Context, root RootIdentity) (*Capability, error) {
@@ -516,6 +600,7 @@ func (manager *Manager) create(ctx context.Context, root RootIdentity) (*Capabil
 			return nil, err
 		}
 		return &Capability{
+			manager:      manager,
 			fs:           manager.fs,
 			terminator:   manager.terminator,
 			retainedID:   durableID,
@@ -549,6 +634,7 @@ func (manager *Manager) open(ctx context.Context, root RootIdentity, retainedID 
 		return nil, fmt.Errorf("%w: retained cgroup object identity mismatch", ErrUnsupported)
 	}
 	return &Capability{
+		manager:      manager,
 		fs:           manager.fs,
 		terminator:   manager.terminator,
 		retainedID:   retainedID,
@@ -559,6 +645,7 @@ func (manager *Manager) open(ctx context.Context, root RootIdentity, retainedID 
 }
 
 type Capability struct {
+	manager      *Manager
 	fs           cgroupFS
 	terminator   processTerminator
 	retainedID   string
@@ -771,6 +858,14 @@ func (capability *Capability) Kill(ctx context.Context) (containment.SignalResul
 }
 
 func (capability *Capability) Remove(ctx context.Context) error {
+	if capability != nil && capability.manager != nil {
+		capability.manager.mu.Lock()
+		defer capability.manager.mu.Unlock()
+	}
+	return capability.removeLocked(ctx)
+}
+
+func (capability *Capability) removeLocked(ctx context.Context) error {
 	if capability == nil || capability.released {
 		return fmt.Errorf("%w: cgroup capability is closed", ErrInvalid)
 	}
@@ -784,7 +879,9 @@ func (capability *Capability) Remove(ctx context.Context) error {
 	if membership != containment.RetainedMembershipEmpty {
 		return ErrPopulated
 	}
-	_ = capability.fs.Remove(ctx, capability.object)
+	if err := capability.fs.Remove(ctx, capability.object); err != nil {
+		return err
+	}
 	capability.removed = true
 	return nil
 }
@@ -801,6 +898,30 @@ func (capability *Capability) Release() error {
 		return nil
 	}
 	return capability.object.Close()
+}
+
+func (capability *Capability) ReleaseRootLease() error {
+	if capability != nil && capability.manager != nil {
+		capability.manager.mu.Lock()
+		defer capability.manager.mu.Unlock()
+	}
+	return capability.releaseRootLeaseLocked()
+}
+
+func (capability *Capability) releaseRootLeaseLocked() error {
+	if capability == nil || capability.released || capability.removed {
+		return fmt.Errorf("%w: cgroup capability is closed", ErrInvalid)
+	}
+	if capability.fs == nil {
+		return nil
+	}
+	if err := capability.fs.releaseRootLease(); err != nil {
+		return err
+	}
+	if object, ok := capability.object.(rootReferenceReleaser); ok {
+		object.releaseRootReference()
+	}
+	return nil
 }
 
 func (capability *Capability) requireHeld(ctx context.Context) error {

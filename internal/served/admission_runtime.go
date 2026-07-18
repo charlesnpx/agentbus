@@ -25,7 +25,12 @@ type servedAdmissionRuntime struct {
 	verifierOverride custodian.AttestationVerifier
 }
 
-func newServedAdmissionRuntime(_ *Server) *servedAdmissionRuntime {
+func newServedAdmissionRuntime(server *Server) *servedAdmissionRuntime {
+	if server != nil && server.admissionRuntimeFactory != nil {
+		if runtime := server.admissionRuntimeFactory(server); runtime != nil {
+			return runtime
+		}
+	}
 	return &servedAdmissionRuntime{
 		runtime: custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable),
 	}

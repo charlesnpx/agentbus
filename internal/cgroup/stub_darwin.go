@@ -25,6 +25,10 @@ func (unsupportedFS) Open(context.Context, string) (cgroupObject, error) {
 	return nil, fmt.Errorf("%w: cgroup v2 is unavailable on darwin", ErrUnsupported)
 }
 
+func (unsupportedFS) releaseRootLease() error {
+	return nil
+}
+
 func (unsupportedFS) Verify(context.Context, cgroupObject) (bool, error) {
 	return false, fmt.Errorf("%w: cgroup v2 is unavailable on darwin", ErrUnsupported)
 }

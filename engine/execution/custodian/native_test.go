@@ -39,8 +39,9 @@ const (
 	nativeHelperIgnoreTermLeader     = "ignore-term-leader"
 	nativeHelperGrandchild           = "grandchild"
 	nativeHelperMonitor              = "monitor"
-	nativeHelperAgentbusGOCACHE      = "GOCACHE=/tmp/abd-gocache"
-	nativeHelperAgentbusMOD          = "GOMODCACHE=/tmp/abd-gomodcache"
+	nativeHelperOfflineModcacheEnv   = "AGENTBUS_OFFLINE_MODCACHE"
+	nativeHelperAgentbusGOFLAGS      = "GOFLAGS=-mod=mod"
+	nativeHelperAgentbusGOPROXY      = "GOPROXY=off"
 	nativeHelperRetainedNoopMonitor  = "AGENTBUS_NATIVE_RETAINED_NOOP_MONITOR"
 	nativeCgroupConformanceEnv       = "AGENTBUS_CGROUP_CONFORMANCE"
 )
@@ -950,6 +951,32 @@ func TestNativeCgroupProbeHelperWaitRequiresSIGKILL(t *testing.T) {
 	}
 }
 
+func TestNativeCgroupProbeHelperIgnoresGraceSignals(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	helper, err := startNativeCgroupProbeHelper(ctx)
+	if err != nil {
+		t.Fatalf("start helper: %v", err)
+	}
+	defer helper.cleanup()
+
+	for _, signal := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT} {
+		if err := syscall.Kill(-helper.pid(), signal); err != nil {
+			t.Fatalf("signal helper group %s: %v", signal, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+		if err := helper.requireRunning(ctx); err != nil {
+			t.Fatalf("helper after %s = %v, want running", signal, err)
+		}
+	}
+	if err := syscall.Kill(-helper.pid(), syscall.SIGKILL); err != nil {
+		t.Fatalf("kill helper group: %v", err)
+	}
+	if err := helper.wait(ctx, 2*time.Second); err != nil {
+		t.Fatalf("helper wait after SIGKILL = %v, want nil", err)
+	}
+}
+
 func TestNativeCustodianDoesNotMintProofAndProductionUnavailable(t *testing.T) {
 	nativeType := fmt.Sprintf("%T", PhysicalOutcome{})
 	if strings.Contains(nativeType, "VerifiedQuiescence") {
@@ -985,7 +1012,7 @@ func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing
 		AgentbusPath:      builtNativeAgentbusPath(t),
 		MonitorCommand:    nativeMonitorCommand(t),
 		ContainmentParams: defaultNativeTestParams(),
-		WorkerEnv:         append(os.Environ(), nativeHelperAgentbusGOCACHE, nativeHelperAgentbusMOD),
+		WorkerEnv:         nativeAgentbusEnv(),
 		WorkerDir:         filepath.Dir(exe),
 	}
 
@@ -1061,12 +1088,18 @@ func TestNativeRetainedWaitCompletesWithoutLeaderRetention(t *testing.T) {
 	if leaf.removeCalls != 1 || !leaf.removed {
 		t.Fatalf("leaf remove calls/removed = %d/%t, want 1/true", leaf.removeCalls, leaf.removed)
 	}
+	if leaf.rootLeaseReleases != 1 {
+		t.Fatalf("root lease releases = %d, want 1", leaf.rootLeaseReleases)
+	}
+	if leaf.termCalls != 0 || leaf.killCalls != 0 {
+		t.Fatalf("retained signal calls term/kill = %d/%d, want 0/0", leaf.termCalls, leaf.killCalls)
+	}
 	if !running.finalOutcome.Absent() || running.finalOutcome.Method != model.QuiescenceAlreadyAbsent {
 		t.Fatalf("final outcome = %+v, want already-absent", running.finalOutcome)
 	}
 }
 
-func TestNativeRetainedWaitDoesNotFinalizeWhileRetainedObjectPopulated(t *testing.T) {
+func TestNativeRetainedWaitContainsResidualWithoutLeaderRetention(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	manager := newFakeNativeRetainedManager()
@@ -1081,24 +1114,133 @@ func TestNativeRetainedWaitDoesNotFinalizeWhileRetainedObjectPopulated(t *testin
 	if _, err := io.ReadAll(running.Stdout()); err != nil {
 		t.Fatalf("read stdout: %v", err)
 	}
+	manager.setTermIgnored(running.Ref().RetainedID, true)
 
-	waitCtx, waitCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	_, err = running.Wait(waitCtx)
-	waitCancel()
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Wait() while retained object populated error = %v, want deadline", err)
+	exit, err := running.Wait(ctx)
+	if err != nil {
+		t.Fatalf("Wait() with retained residual error = %v", err)
 	}
-	if running.finalized {
-		t.Fatalf("running finalized while retained object was still populated: %+v", running.finalOutcome)
+	if !exit.Exited || exit.Code != 0 || exit.Signal != "" {
+		t.Fatalf("exit observation = %+v, want clean retained worker exit", exit)
 	}
 	leaf := manager.leafForRetainedID(t, running.Ref().RetainedID)
-	if leaf.removeCalls != 0 || leaf.removed {
-		t.Fatalf("populated leaf remove calls/removed = %d/%t, want 0/false", leaf.removeCalls, leaf.removed)
+	if leaf.termCalls != 1 || leaf.killCalls != 1 {
+		t.Fatalf("retained signal calls term/kill = %d/%d, want 1/1", leaf.termCalls, leaf.killCalls)
 	}
+	if leaf.removeCalls != 1 || !leaf.removed {
+		t.Fatalf("leaf remove calls/removed = %d/%t, want 1/true", leaf.removeCalls, leaf.removed)
+	}
+	if !running.finalOutcome.Absent() || running.finalOutcome.Method != model.QuiescenceTermKill {
+		t.Fatalf("final outcome = %+v, want term-kill", running.finalOutcome)
+	}
+}
 
-	manager.setMembership(running.Ref().RetainedID, containment.RetainedMembershipEmpty)
-	if _, err := running.Wait(ctx); err != nil {
-		t.Fatalf("cleanup Wait() after retained object empty error = %v", err)
+func TestNativeContainAndVerifyRecoveryReattachesRetainedGroup(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	issuer, verifier := NewAttestationChannel()
+	manager := newFakeNativeRetainedManager()
+	native := newRecoveryNativeCustodianForTest(t, defaultNativeTestParams(), issuer, manager)
+	group := newRecoveryRetainedGroupRefForTest(t, manager)
+	manager.setMembership(group.RetainedID, containment.RetainedMembershipPresent)
+	manager.setTermIgnored(group.RetainedID, true)
+	before := manager.leafForRetainedID(t, group.RetainedID)
+
+	verified, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
+	if err != nil {
+		t.Fatalf("ContainAndVerify(recovery) error = %v", err)
+	}
+	payload, err := verifier.VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatalf("VerifyQuiescence(recovery) error = %v", err)
+	}
+	if !payload.Group.Equal(group) || payload.Method != model.QuiescenceTermKill {
+		t.Fatalf("payload = %+v, want term-kill for %+v", payload, group)
+	}
+	leaf := manager.leafForRetainedID(t, group.RetainedID)
+	if leaf.openCalls != before.openCalls+1 {
+		t.Fatalf("retained open calls = %d, want %d", leaf.openCalls, before.openCalls+1)
+	}
+	if leaf.termCalls != 1 || leaf.killCalls != 1 {
+		t.Fatalf("retained signal calls term/kill = %d/%d, want 1/1", leaf.termCalls, leaf.killCalls)
+	}
+	if leaf.membership != containment.RetainedMembershipEmpty {
+		t.Fatalf("retained membership = %v, want empty", leaf.membership)
+	}
+	if leaf.releases != before.releases+1 {
+		t.Fatalf("retained releases = %d, want %d", leaf.releases, before.releases+1)
+	}
+}
+
+func TestNativeContainAndVerifyRecoveryTreatsMissingRetainedGroupAsAlreadyAbsent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	issuer, verifier := NewAttestationChannel()
+	manager := newFakeNativeRetainedManager()
+	native := newRecoveryNativeCustodianForTest(t, defaultNativeTestParams(), issuer, manager)
+	group := newRecoveryRetainedGroupRefForTest(t, manager)
+	manager.setMembership(group.RetainedID, containment.RetainedMembershipPresent)
+	manager.removeLeaf(group.RetainedID)
+	before := manager.leafForRetainedID(t, group.RetainedID)
+
+	verified, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
+	if err != nil {
+		t.Fatalf("ContainAndVerify(recovery missing retained group) error = %v", err)
+	}
+	payload, err := verifier.VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatalf("VerifyQuiescence(recovery missing retained group) error = %v", err)
+	}
+	if !payload.Group.Equal(group) || payload.Method != model.QuiescenceAlreadyAbsent {
+		t.Fatalf("payload = %+v, want already-absent for %+v", payload, group)
+	}
+	leaf := manager.leafForRetainedID(t, group.RetainedID)
+	if leaf.openCalls != before.openCalls+1 {
+		t.Fatalf("retained open calls = %d, want %d", leaf.openCalls, before.openCalls+1)
+	}
+	if leaf.termCalls != 0 || leaf.killCalls != 0 {
+		t.Fatalf("retained signal calls term/kill = %d/%d, want 0/0", leaf.termCalls, leaf.killCalls)
+	}
+	if leaf.releases != before.releases {
+		t.Fatalf("retained releases = %d, want unchanged %d", leaf.releases, before.releases)
+	}
+}
+
+func TestNativeContainAndVerifyRecoveryMissingRetainedGroupMismatchedDomainIsUnprovable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	issuer, _ := NewAttestationChannel()
+	counting := &countingQuiescenceIssuer{inner: issuer}
+	manager := newFakeNativeRetainedManager()
+	native := newRecoveryNativeCustodianForTest(t, defaultNativeTestParams(), counting, manager)
+	group := newRecoveryRetainedGroupRefForTest(t, manager)
+	manager.setMembership(group.RetainedID, containment.RetainedMembershipPresent)
+	manager.removeLeaf(group.RetainedID)
+	manager.setCurrentDomain(t, differentKernelDomainForTest(t, group.KernelDomain()))
+	before := manager.leafForRetainedID(t, group.RetainedID)
+
+	verified, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
+	if err == nil {
+		t.Fatalf("ContainAndVerify(recovery missing retained group in mismatched domain) error = nil, want unprovable")
+	}
+	if verified != (VerifiedQuiescence{}) {
+		t.Fatalf("verified = %+v, want zero attestation", verified)
+	}
+	if !errors.Is(err, ErrNativeCustodianUnavailable) {
+		t.Fatalf("ContainAndVerify() error = %v, want ErrNativeCustodianUnavailable", err)
+	}
+	if counting.count.Load() != 0 {
+		t.Fatalf("quiescence attestations = %d, want 0", counting.count.Load())
+	}
+	leaf := manager.leafForRetainedID(t, group.RetainedID)
+	if leaf.openCalls != before.openCalls+1 {
+		t.Fatalf("retained open calls = %d, want %d", leaf.openCalls, before.openCalls+1)
+	}
+	if leaf.termCalls != 0 || leaf.killCalls != 0 {
+		t.Fatalf("retained signal calls term/kill = %d/%d, want 0/0", leaf.termCalls, leaf.killCalls)
+	}
+	if leaf.releases != before.releases {
+		t.Fatalf("retained releases = %d, want unchanged %d", leaf.releases, before.releases)
 	}
 }
 
@@ -1117,6 +1259,7 @@ func TestNativeRetainedCanceledWaitsDoNotLeakReapers(t *testing.T) {
 	if _, err := io.ReadAll(running.Stdout()); err != nil {
 		t.Fatalf("read stdout: %v", err)
 	}
+	manager.setTermIgnored(running.Ref().RetainedID, true)
 
 	before := runtime.NumGoroutine()
 	for i := 0; i < 20; i++ {
@@ -1265,13 +1408,30 @@ func newNativeCustodianWithRetainedFactoryForTest(t *testing.T, params containme
 		AgentbusPath:      builtNativeAgentbusPath(t),
 		MonitorCommand:    monitorCommand,
 		ContainmentParams: params,
-		WorkerEnv:         append(os.Environ(), nativeHelperAgentbusGOCACHE, nativeHelperAgentbusMOD),
+		WorkerEnv:         nativeAgentbusEnv(),
 		WorkerDir:         filepath.Dir(exe),
 		newRetainedGroup:  factory,
 	})
 	if err != nil {
 		t.Fatalf("NewNativeCustodian() error = %v", err)
 	}
+	return native
+}
+
+func newRecoveryNativeCustodianForTest(t *testing.T, params containment.Params, issuer quiescenceAttestationIssuer, manager *fakeNativeRetainedManager) *NativeCustodian {
+	t.Helper()
+	native := &NativeCustodian{
+		options: NativeOptions{
+			ContainmentParams: params,
+			newRetainedGroup: func() (containment.RetainedGroupObject, error) {
+				return manager, nil
+			},
+		},
+		issuer:    issuer,
+		running:   make(map[string]*NativeRunningProcess),
+		finalized: make(map[string]*NativeRunningProcess),
+	}
+	cleanupNativeCustodianForTest(t, native)
 	return native
 }
 
@@ -1300,6 +1460,86 @@ func launchAndWaitRetainedSimple(t *testing.T, ctx context.Context, native *Nati
 		t.Fatalf("Wait() error = %v", err)
 	}
 	return running.Ref()
+}
+
+func newRecoveryRetainedGroupRefForTest(t *testing.T, manager *fakeNativeRetainedManager) model.GroupRef {
+	t.Helper()
+	capability, err := manager.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now())
+	if err != nil {
+		t.Fatalf("AcquireRetainedGroup(create) error = %v", err)
+	}
+	if capability == nil {
+		t.Fatal("AcquireRetainedGroup(create) capability is nil")
+	}
+	identity := capability.Identity()
+	if err := capability.Release(); err != nil {
+		t.Fatalf("release created retained group: %v", err)
+	}
+	pgid := absentProcessGroupForDomain(t, identity.KernelDomainID)
+	attempt := model.AttemptRef{JobID: "job-native-recovery", AttemptID: "attempt-native-recovery", Epoch: 1}
+	group := model.GroupRef{
+		Version:   1,
+		CustodyID: "custody-native-recovery",
+		Launch: model.LaunchKey{
+			Attempt: attempt,
+			Ordinal: model.LaunchOrdinalOne,
+		},
+		HostBootID:          identity.KernelDomainID.HostBootID,
+		PIDNamespaceID:      identity.KernelDomainID.PIDNamespaceID,
+		PIDNamespaceState:   identity.KernelDomainID.PIDNamespaceState,
+		RetainedDomainID:    identity.KernelDomainID.RetainedDomainID,
+		RetainedDomainState: identity.KernelDomainID.RetainedDomainState,
+		PGID:                pgid,
+		Leader: model.ProcessIdentity{
+			PID:               pgid,
+			HighResStartToken: "leader-start-native-recovery",
+		},
+		Monitor: model.ProcessIdentity{
+			PID:               pgid - 1,
+			HighResStartToken: "monitor-start-native-recovery",
+		},
+		RetainedID: identity.RetainedID,
+	}
+	if err := group.Validate(); err != nil {
+		t.Fatalf("recovery group Validate() error = %v", err)
+	}
+	return group
+}
+
+func absentProcessGroupForDomain(t *testing.T, domain model.KernelDomainID) int {
+	t.Helper()
+	for pgid := 2147483647; pgid > 2147483547; pgid-- {
+		claim, err := procgroup.NewGroupClaim(pgid, domain)
+		if err != nil {
+			t.Fatalf("NewGroupClaim(%d) error = %v", pgid, err)
+		}
+		got := procgroup.ClassifyGroup(claim)
+		if got == model.GroupAbsent {
+			return pgid
+		}
+		if got == model.GroupExistenceUnknown {
+			t.Fatalf("ClassifyGroup(absent candidate %d) = %v", pgid, got)
+		}
+	}
+	t.Fatal("could not find an absent process group candidate")
+	return 0
+}
+
+func differentKernelDomainForTest(t *testing.T, domain model.KernelDomainID) model.KernelDomainID {
+	t.Helper()
+	different := domain
+	if different.PIDNamespaceState == model.PIDNamespaceKnown {
+		different.PIDNamespaceID = different.PIDNamespaceID + "-different"
+	} else {
+		different.HostBootID = different.HostBootID + "-different"
+	}
+	if err := different.Validate(); err != nil {
+		t.Fatalf("different kernel domain Validate() error = %v", err)
+	}
+	if different.ProvablySame(domain) {
+		t.Fatalf("different kernel domain %+v is provably same as %+v", different, domain)
+	}
+	return different
 }
 
 func defaultNativeTestParams() containment.Params {
@@ -1436,7 +1676,7 @@ func builtNativeAgentbusPath(t *testing.T) string {
 		nativeAgentbusBuildPath = filepath.Join(dir, "agentbus")
 		cmd := exec.Command("go", "build", "-o", nativeAgentbusBuildPath, "./cmd/agentbus")
 		cmd.Dir = nativeRepoRootFromCaller()
-		cmd.Env = append(os.Environ(), nativeHelperAgentbusGOCACHE, nativeHelperAgentbusMOD)
+		cmd.Env = nativeAgentbusEnv()
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			nativeAgentbusBuildErr = fmt.Errorf("go build ./cmd/agentbus: %w\n%s", err, output)
@@ -1446,6 +1686,21 @@ func builtNativeAgentbusPath(t *testing.T) string {
 		t.Fatal(nativeAgentbusBuildErr)
 	}
 	return nativeAgentbusBuildPath
+}
+
+func nativeAgentbusEnv() []string {
+	return append(os.Environ(), nativeAgentbusGoEnv()...)
+}
+
+func nativeAgentbusGoEnv() []string {
+	env := []string{
+		nativeHelperAgentbusGOFLAGS,
+		nativeHelperAgentbusGOPROXY,
+	}
+	if modcache := os.Getenv(nativeHelperOfflineModcacheEnv); modcache != "" {
+		env = append(env, "GOMODCACHE="+modcache)
+	}
+	return env
 }
 
 func nativeRepoRootFromCaller() string {
@@ -1662,21 +1917,27 @@ func waitLeaderNotMatching(t *testing.T, group model.GroupRef, timeout time.Dura
 }
 
 type fakeNativeRetainedManager struct {
-	mu         sync.Mutex
-	next       int
-	leaves     map[string]*fakeNativeRetainedLeaf
-	placeErr   error
-	closeCalls int
+	mu            sync.Mutex
+	next          int
+	leaves        map[string]*fakeNativeRetainedLeaf
+	currentDomain model.KernelDomainID
+	placeErr      error
+	closeCalls    int
 }
 
 type fakeNativeRetainedLeaf struct {
-	retainedID  string
-	domain      model.KernelDomainID
-	membership  containment.RetainedGroupMembership
-	placedPIDs  []int
-	removeCalls int
-	removed     bool
-	releases    int
+	retainedID        string
+	domain            model.KernelDomainID
+	membership        containment.RetainedGroupMembership
+	ignoreTerm        bool
+	placedPIDs        []int
+	openCalls         int
+	termCalls         int
+	killCalls         int
+	removeCalls       int
+	rootLeaseReleases int
+	removed           bool
+	releases          int
 }
 
 type fakeNativeRetainedCapability struct {
@@ -1701,10 +1962,16 @@ func (manager *fakeNativeRetainedManager) AcquireRetainedGroup(_ context.Context
 	if target.RetainedID == "" {
 		manager.next++
 		retainedID := fmt.Sprintf("retained-fake-%d", manager.next)
-		domain, err := model.NewKernelDomainIDWithRetainedDomain("host-fake", "pidns-fake", fmt.Sprintf("domain-fake-%d", manager.next))
+		domain, err := procgroup.CurrentKernelDomain()
 		if err != nil {
 			return nil, err
 		}
+		domain.RetainedDomainID = fmt.Sprintf("domain-fake-%d", manager.next)
+		domain.RetainedDomainState = model.RetainedDomainKnown
+		if err := domain.Validate(); err != nil {
+			return nil, err
+		}
+		manager.currentDomain = domain
 		leaf = &fakeNativeRetainedLeaf{
 			retainedID: retainedID,
 			domain:     domain,
@@ -1713,11 +1980,36 @@ func (manager *fakeNativeRetainedManager) AcquireRetainedGroup(_ context.Context
 		manager.leaves[retainedID] = leaf
 	} else {
 		leaf = manager.leaves[target.RetainedID]
-		if leaf == nil {
-			return nil, fmt.Errorf("unknown retained id %q", target.RetainedID)
+		if leaf != nil {
+			leaf.openCalls++
+		}
+		if leaf == nil || leaf.removed {
+			return nil, fmt.Errorf("%w: unknown retained id %q", unix.ENOENT, target.RetainedID)
 		}
 	}
 	return &fakeNativeRetainedCapability{manager: manager, leaf: leaf}, nil
+}
+
+func (manager *fakeNativeRetainedManager) ProveRetainedGroupAbsent(_ context.Context, target model.GroupRef) error {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if err := target.Validate(); err != nil {
+		return err
+	}
+	leaf := manager.leaves[target.RetainedID]
+	if leaf == nil {
+		return fmt.Errorf("%w: retained leaf identity is unknown", ErrNativeCustodianUnavailable)
+	}
+	if err := manager.currentDomain.Validate(); err != nil {
+		return fmt.Errorf("%w: current retained root domain is unverifiable: %v", ErrNativeCustodianUnavailable, err)
+	}
+	if !manager.currentDomain.ProvablySame(target.KernelDomain()) {
+		return fmt.Errorf("%w: current retained root domain does not match target", ErrNativeCustodianUnavailable)
+	}
+	if !leaf.removed {
+		return fmt.Errorf("%w: retained leaf still exists", ErrNativeCustodianUnavailable)
+	}
+	return nil
 }
 
 func (manager *fakeNativeRetainedManager) Close() error {
@@ -1734,6 +2026,34 @@ func (manager *fakeNativeRetainedManager) setMembership(retainedID string, membe
 	if leaf != nil {
 		leaf.membership = membership
 	}
+}
+
+func (manager *fakeNativeRetainedManager) setTermIgnored(retainedID string, ignored bool) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	leaf := manager.leaves[retainedID]
+	if leaf != nil {
+		leaf.ignoreTerm = ignored
+	}
+}
+
+func (manager *fakeNativeRetainedManager) removeLeaf(retainedID string) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	leaf := manager.leaves[retainedID]
+	if leaf != nil {
+		leaf.removed = true
+	}
+}
+
+func (manager *fakeNativeRetainedManager) setCurrentDomain(t *testing.T, domain model.KernelDomainID) {
+	t.Helper()
+	if err := domain.Validate(); err != nil {
+		t.Fatalf("current domain Validate() error = %v", err)
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	manager.currentDomain = domain
 }
 
 func (manager *fakeNativeRetainedManager) leafForRetainedID(t *testing.T, retainedID string) *fakeNativeRetainedLeaf {
@@ -1790,11 +2110,11 @@ func (capability *fakeNativeRetainedCapability) StillHeld(context.Context) (bool
 }
 
 func (capability *fakeNativeRetainedCapability) SignalTerm(context.Context) (containment.SignalResult, error) {
-	return capability.emptyBySignal()
+	return capability.signalRetained(true)
 }
 
 func (capability *fakeNativeRetainedCapability) Kill(context.Context) (containment.SignalResult, error) {
-	return capability.emptyBySignal()
+	return capability.signalRetained(false)
 }
 
 func (capability *fakeNativeRetainedCapability) PlacePID(_ context.Context, pid int) error {
@@ -1808,6 +2128,16 @@ func (capability *fakeNativeRetainedCapability) PlacePID(_ context.Context, pid 
 	defer capability.manager.mu.Unlock()
 	capability.leaf.placedPIDs = append(capability.leaf.placedPIDs, pid)
 	capability.leaf.membership = containment.RetainedMembershipPresent
+	return nil
+}
+
+func (capability *fakeNativeRetainedCapability) ReleaseRootLease() error {
+	if err := capability.usable(); err != nil {
+		return err
+	}
+	capability.manager.mu.Lock()
+	defer capability.manager.mu.Unlock()
+	capability.leaf.rootLeaseReleases++
 	return nil
 }
 
@@ -1865,14 +2195,22 @@ func (continuity fakeNativeRetainedContinuity) ConfirmContinuouslyLive(ctx conte
 	return evidence
 }
 
-func (capability *fakeNativeRetainedCapability) emptyBySignal() (containment.SignalResult, error) {
+func (capability *fakeNativeRetainedCapability) signalRetained(term bool) (containment.SignalResult, error) {
 	if err := capability.usable(); err != nil {
 		return containment.SignalUnprovable, err
 	}
 	capability.manager.mu.Lock()
 	defer capability.manager.mu.Unlock()
+	if term {
+		capability.leaf.termCalls++
+	} else {
+		capability.leaf.killCalls++
+	}
 	if capability.leaf.membership == containment.RetainedMembershipEmpty {
 		return containment.SignalTargetAbsent, nil
+	}
+	if term && capability.leaf.ignoreTerm {
+		return containment.SignalDelivered, nil
 	}
 	capability.leaf.membership = containment.RetainedMembershipEmpty
 	return containment.SignalDelivered, nil

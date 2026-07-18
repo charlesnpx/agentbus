@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 	"time"
@@ -17,7 +18,28 @@ type nativeCgroupProbeHelper struct {
 }
 
 func startNativeCgroupProbeHelper(ctx context.Context) (*nativeCgroupProbeHelper, error) {
-	return startNativeCgroupProbeHelperCommand(ctx, "/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done")
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	readyReader, readyWriter, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer readyReader.Close()
+	defer readyWriter.Close()
+
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", "trap '' TERM INT; printf . >&3; exec 3>&-; while :; do sleep 1; done")
+	cmd.ExtraFiles = []*os.File{readyWriter}
+	helper, err := startNativeCgroupProbeHelperExec(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
+	_ = readyWriter.Close()
+	if err := waitNativeCgroupProbeHelperReady(ctx, readyReader); err != nil {
+		helper.cleanup()
+		return nil, err
+	}
+	return helper, nil
 }
 
 func startNativeCgroupProbeHelperCommand(ctx context.Context, path string, args ...string) (*nativeCgroupProbeHelper, error) {
@@ -25,6 +47,13 @@ func startNativeCgroupProbeHelperCommand(ctx context.Context, path string, args 
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, path, args...)
+	return startNativeCgroupProbeHelperExec(ctx, cmd)
+}
+
+func startNativeCgroupProbeHelperExec(ctx context.Context, cmd *exec.Cmd) (*nativeCgroupProbeHelper, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		return nil, err
@@ -37,6 +66,31 @@ func startNativeCgroupProbeHelperCommand(ctx context.Context, path string, args 
 		helper.done <- cmd.Wait()
 	}()
 	return helper, nil
+}
+
+func waitNativeCgroupProbeHelperReady(ctx context.Context, ready *os.File) error {
+	done := make(chan error, 1)
+	go func() {
+		var buffer [1]byte
+		n, err := ready.Read(buffer[:])
+		if n == len(buffer) {
+			done <- nil
+			return
+		}
+		if err == nil {
+			err = fmt.Errorf("readiness pipe closed before probe helper signaled ready")
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("probe helper readiness: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (helper *nativeCgroupProbeHelper) pid() int {
