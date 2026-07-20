@@ -4,8 +4,8 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0=23275e1. R0T=2185af1 + sol-review FIX (honest sentinel strict_admission_unavailable),
-verified Linux cgroup-v2. Next: R1 (packet staged).
+STATUS: EXECUTING. R0=23275e1. R0T=2185af1(+fix 084f8d3). R1 committed (parkproto purity, Version 1->2),
+verified Linux cgroup-v2 full suite + R0T RED. sol review of R1 next. Then R2A.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -278,6 +278,15 @@ see the R4A contract block.)
   strict-E2E harness launched: worker job_20260720T151723000000000Z_000002 (codex gpt-5.5 xhigh, --write).
   Packet: ~/tmp/delegate-packets/abd-R0T-real-serve-harness.md. Expected sentinel
   strict_native_runtime_unavailable; opt-in gate abd_strict_e2e + AGENTBUS_RUN_STRICT_E2E=1.
+- 2026-07-20 R1 (this commit): parkproto logical purity. Version 1->2; LogicalGrant removed from
+  ReleaseBinding + validateExpectation/validateStatic/equal; parklaunch releaseExpectation grant-free; worker
+  bootstrap grant-free. Added tests: old/mixed-frame rejection (codec), durable release-secret absence
+  (authority), recovery no-frame-decode/no-replay guard (architecture), 2 upgrade scenarios (recovery_tokens).
+  DEFERRED to R4 (intentional): parklaunch.Spec.LogicalGrant + parent-side validation retained; model.ReleaseSecret
+  retained; LaunchController/NativeCustodian.Prepare untouched. Independent verify: macOS build/vet/gofmt=0,
+  go test ./...=0, race -count=3 (parklaunch/parkproto/custodian)=0, vet -tags=abd_strict_e2e=0; Docker
+  golang:1.26 --privileged --cgroupns=private -p 1 full suite=0, R0T gate RED (strict_admission_unavailable)=0.
+  sol review pending on the committed SHA.
 - 2026-07-20 R0T LEDGER: worker finished completed_noncompliant (report-SHAPE miss only: missing
   Criteria/Receipts/Verification/Scope sections; work itself in-scope — only internal/served/strict_e2e_test.go
   added, no forbidden files). Independent verification on tree @23275e1+file: CGO_ENABLED=0 go build ./...=0;

@@ -1,7 +1,9 @@
 package authority
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -81,6 +83,75 @@ func TestRecoveryTokenRecordsQuiescenceAndRederivesNextAction(t *testing.T) {
 	}
 }
 
+func TestPreUpgradeBoundRecoveryUsesDurableGroupContainmentOnly(t *testing.T) {
+	ctx := context.Background()
+	session, item := recoveryTokenWorkItem(t, "pre-upgrade-bound")
+	if len(item.Launches) != 1 {
+		t.Fatalf("work launches = %d, want 1", len(item.Launches))
+	}
+	assertRecoveryItemOmitsParkFramePayload(t, item)
+	launch := item.Launches[0]
+	verified := verifiedQuiescence(t, session.token.boot, launch.Group.Launch.Attempt, launch.Ordinal, launch.Group, model.QuiescenceAlreadyAbsent)
+
+	if err := session.RecordQuiescence(ctx, item.Token, launch.Ordinal, verified); err != nil {
+		t.Fatalf("RecordQuiescence token: %v", err)
+	}
+	next, err := session.AdvanceRecovery(ctx, item.Token)
+	if err != nil {
+		t.Fatalf("AdvanceRecovery after containment proof: %v", err)
+	}
+	if len(next.Launches) != 0 {
+		t.Fatalf("next launches = %d, want finalize-only recovery", len(next.Launches))
+	}
+	assertRecoveryItemOmitsParkFramePayload(t, next)
+	if err := session.FinalizePlanned(ctx, next.Token); err != nil {
+		t.Fatalf("FinalizePlanned after containment proof: %v", err)
+	}
+	items, err := session.WorkItems(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("work items after pre-upgrade containment recovery = %d, want 0", len(items))
+	}
+}
+
+func TestPreUpgradeUnboundRecoveryHasNoReleaseFrameToReplay(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	oldReady := newReady(t, repo, "pre-upgrade-unbound-old")
+	accepted, err := oldReady.Accept(ctx, acceptRequest(t, "pre-upgrade-unbound-old"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session := newRecoverySession(t, repo, "pre-upgrade-unbound-new")
+	items, err := session.WorkItems(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("work items = %d, want 1", len(items))
+	}
+	if items[0].JobID != accepted.Record.JobID {
+		t.Fatalf("work item job = %s, want %s", items[0].JobID, accepted.Record.JobID)
+	}
+	if len(items[0].Launches) != 0 {
+		t.Fatalf("unbound work launches = %d, want 0", len(items[0].Launches))
+	}
+	assertRecoveryItemOmitsParkFramePayload(t, items[0])
+	if err := session.FinalizePlanned(ctx, items[0].Token); err != nil {
+		t.Fatalf("FinalizePlanned unbound recovery: %v", err)
+	}
+	items, err = session.WorkItems(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("work items after unbound recovery = %d, want 0", len(items))
+	}
+}
+
 func recoveryTokenWorkItem(t *testing.T, name string) (*RecoverySession, RecoveryWorkItem) {
 	t.Helper()
 	ctx := context.Background()
@@ -123,4 +194,24 @@ func recoveryTokenWorkItem(t *testing.T, name string) (*RecoverySession, Recover
 		t.Fatalf("work item invalid: %v", err)
 	}
 	return session, items[0]
+}
+
+func assertRecoveryItemOmitsParkFramePayload(t *testing.T, item RecoveryWorkItem) {
+	t.Helper()
+	raw, err := json.Marshal(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		"ReleaseBinding",
+		"ReleaseExpectation",
+		"releaseSecret",
+		"logicalGrant",
+		"protocolVersion",
+		"execSpec",
+	} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("recovery work item contains frame payload token %q: %s", forbidden, raw)
+		}
+	}
 }

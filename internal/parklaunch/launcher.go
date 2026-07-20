@@ -499,7 +499,6 @@ func releaseExpectation(spec Spec, group model.GroupRef) (parkproto.ReleaseExpec
 		CustodyID:           spec.CustodyID,
 		LaunchKey:           spec.LaunchKey,
 		GroupRefDigest:      groupDigest,
-		LogicalGrant:        spec.LogicalGrant,
 		ReleaseSecret:       spec.ReleaseSecret,
 		ImmutableExecDigest: execDigest,
 	}}

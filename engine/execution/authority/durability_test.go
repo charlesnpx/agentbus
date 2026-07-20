@@ -1,10 +1,13 @@
 package authority
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -305,6 +308,70 @@ func TestReadyAcceptAndClaimFailStopsOnRealBboltAmbiguousCommit(t *testing.T) {
 	if persisted.Terminal != nil {
 		t.Fatalf("persisted record terminal after ambiguous commit: %+v", persisted.Terminal)
 	}
+}
+
+func TestDurableAuthorityRecordsDoNotPersistReleaseSecretBytes(t *testing.T) {
+	assertDurableTypeGraphOmitsReleaseSecret(t,
+		reflect.TypeOf(repository.AuthorityMeta{}),
+		reflect.TypeOf(model.Binding{}),
+		reflect.TypeOf(model.SafetyRecord{}),
+		reflect.TypeOf(model.JobProjection{}),
+		reflect.TypeOf(repository.Tombstone{}),
+		reflect.TypeOf(repository.QuarantineRecord{}),
+		reflect.TypeOf(AnchorSnapshot{}),
+	)
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "admission.bbolt")
+	repo, err := bboltrepo.NewRepository(path)
+	if err != nil {
+		t.Fatalf("NewRepository() error = %v", err)
+	}
+	repoClosed := false
+	t.Cleanup(func() {
+		if !repoClosed {
+			if err := repo.Close(); err != nil {
+				t.Fatalf("close bbolt repository: %v", err)
+			}
+		}
+	})
+	anchorStore := NewAnchorStore()
+	ready := newReadyWithAnchorStore(t, repo, anchorStore, "release-secret-omitted")
+	secret, err := model.NewReleaseSecret("release-secret-never-persist-abd-r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "release-secret-omitted"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := accepted.Record.Attempt.Ref
+	group := groupRef(ref, model.LaunchOrdinalOne)
+	if _, err := ready.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ready.CommitGrant(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, model.PermitNonce("nonce-release-secret-omitted")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ready.RecordRelease(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, model.ChildIdentity{
+		PID:               group.Leader.PID,
+		HighResStartToken: group.Leader.HighResStartToken,
+	}, evidence("release-secret-omitted")); err != nil {
+		t.Fatal(err)
+	}
+
+	assertBytesOmitReleaseSecret(t, "bbolt snapshot", repo.SnapshotBytes(), secret)
+	assertBytesOmitReleaseSecret(t, "anchor snapshot", anchorStore.SnapshotBytes(), secret)
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close bbolt repository before raw read: %v", err)
+	}
+	repoClosed = true
+	rawDB, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read bbolt file: %v", err)
+	}
+	assertBytesOmitReleaseSecret(t, "raw bbolt file", rawDB, secret)
 }
 
 func TestReadyDurabilityOutcomesAcrossMutationFailpoints(t *testing.T) {
@@ -770,4 +837,53 @@ func anchorAdvancedToGeneration(t *testing.T, store *AnchorStore, generation uin
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	return store.state.Generation == generation
+}
+
+func assertBytesOmitReleaseSecret(t *testing.T, label string, raw []byte, secret model.ReleaseSecret) {
+	t.Helper()
+	if bytes.Contains(raw, []byte(secret)) {
+		t.Fatalf("%s contains release secret bytes", label)
+	}
+	if bytes.Contains(raw, []byte("releaseSecret")) || bytes.Contains(raw, []byte("ReleaseSecret")) {
+		t.Fatalf("%s contains release secret field name", label)
+	}
+}
+
+func assertDurableTypeGraphOmitsReleaseSecret(t *testing.T, roots ...reflect.Type) {
+	t.Helper()
+	secretType := reflect.TypeOf(model.ReleaseSecret(""))
+	seen := map[reflect.Type]bool{}
+	for _, root := range roots {
+		assertTypeGraphOmitsReleaseSecret(t, root, root.String(), secretType, seen)
+	}
+}
+
+func assertTypeGraphOmitsReleaseSecret(t *testing.T, typ reflect.Type, path string, secretType reflect.Type, seen map[reflect.Type]bool) {
+	t.Helper()
+	if typ == secretType {
+		t.Fatalf("durable type graph contains model.ReleaseSecret at %s", path)
+	}
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+		path += ".*"
+		if typ == secretType {
+			t.Fatalf("durable type graph contains model.ReleaseSecret at %s", path)
+		}
+	}
+	if seen[typ] {
+		return
+	}
+	seen[typ] = true
+	switch typ.Kind() {
+	case reflect.Struct:
+		for i := 0; i < typ.NumField(); i++ {
+			field := typ.Field(i)
+			assertTypeGraphOmitsReleaseSecret(t, field.Type, path+"."+field.Name, secretType, seen)
+		}
+	case reflect.Slice, reflect.Array:
+		assertTypeGraphOmitsReleaseSecret(t, typ.Elem(), path+"[]", secretType, seen)
+	case reflect.Map:
+		assertTypeGraphOmitsReleaseSecret(t, typ.Key(), path+"{key}", secretType, seen)
+		assertTypeGraphOmitsReleaseSecret(t, typ.Elem(), path+"{value}", secretType, seen)
+	}
 }

@@ -272,6 +272,13 @@ func TestParkedWorkerRejectsInvalidProtocolFrames(t *testing.T) {
 			wantStderr: "park protocol version mismatch",
 		},
 		{
+			name: "old version",
+			frame: func(t *testing.T) []byte {
+				return mustParkedWorkerFrame(t, parkproto.Version-1, 1, dummyIdentityReport())
+			},
+			wantStderr: "park protocol version mismatch",
+		},
+		{
 			name: "malformed",
 			frame: func(t *testing.T) []byte {
 				return rawParkedWorkerPayload([]byte("{"))
@@ -317,6 +324,18 @@ func TestParkedWorkerRejectsInvalidProtocolFrames(t *testing.T) {
 			assertFileAbsent(t, harness.backend.MarkerPath)
 		})
 	}
+}
+
+func TestParkedWorkerUnboundControlChannelLossDoesNotStartBackend(t *testing.T) {
+	harness := startParkedWorkerHarness(t, newBackendFixtureSpec(t, backendFixtureOptions{
+		MarkerPath: t.TempDir() + "/backend-started",
+		ResultPath: t.TempDir() + "/backend-result.json",
+		ClosedFDs:  []int{workerControlReadFD, workerControlWriteFD},
+	}))
+	_ = harness.readIdentity(t)
+	_ = harness.controlIn.Close()
+	harness.waitFailure(t, "read release")
+	assertFileAbsent(t, harness.backend.MarkerPath)
 }
 
 func TestParkedWorkerHelperProcess(t *testing.T) {
@@ -734,13 +753,11 @@ func releaseExpectationTemplate(t *testing.T, execSpec parkproto.ExecSpec) parkp
 		t.Fatal(err)
 	}
 	attempt := model.AttemptRef{JobID: "job-parked-worker", AttemptID: "attempt-1", Epoch: 1}
-	boot := model.BootRef{BootID: "boot-1", OwnerID: "owner-1"}
 	return parkproto.ReleaseExpectation{Binding: parkproto.ReleaseBinding{
 		ProtocolVersion:     parkproto.Version,
 		Sequence:            1,
 		CustodyID:           "custody-1",
 		LaunchKey:           model.LaunchKey{Attempt: attempt, Ordinal: model.LaunchOrdinalOne},
-		LogicalGrant:        model.LaunchGrant{Attempt: attempt, Ordinal: model.LaunchOrdinalOne, Nonce: "nonce-1", GrantedBy: boot},
 		ReleaseSecret:       "release-secret-1",
 		ImmutableExecDigest: execDigest,
 	}}

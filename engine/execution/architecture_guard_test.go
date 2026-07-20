@@ -62,6 +62,28 @@ func TestServedStartupRecoveryDoesNotImportRepository(t *testing.T) {
 	)
 }
 
+func TestStartupRecoveryDoesNotDecodeOrReplayParkProtocolFrames(t *testing.T) {
+	root := repoRoot(t)
+	files := []string{
+		filepath.Join(root, "engine", "execution", "authority", "bootstrap.go"),
+		filepath.Join(root, "engine", "execution", "authority", "recovery_tokens.go"),
+		filepath.Join(root, "engine", "execution", "authority", "startup.go"),
+		filepath.Join(root, "internal", "served", "admission_recovery.go"),
+	}
+	for _, path := range files {
+		assertFileNoForbiddenImports(t, path, []forbiddenImport{
+			exactImport(modulePath + "/internal/parkproto"),
+		})
+	}
+	assertFilesDoNotContain(t, files, []string{
+		"parkproto.",
+		"ReleaseBinding",
+		"ReleaseExpectation",
+		"WriteRelease(",
+		"WriteFrame(",
+	})
+}
+
 func TestOnlyLaunchImportsAuthorityAndCustodianTogether(t *testing.T) {
 	root := filepath.Join(repoRoot(t), "engine", "execution")
 	importsByPackage := map[string]map[string]bool{}
@@ -181,6 +203,21 @@ func assertFileNoForbiddenImports(t *testing.T, path string, forbiddenImports []
 		for _, forbidden := range forbiddenImports {
 			if forbidden.match(importPath) {
 				t.Fatalf("%s imports forbidden package %q (matched %s)", path, importPath, forbidden.label)
+			}
+		}
+	}
+}
+
+func assertFilesDoNotContain(t *testing.T, paths []string, forbidden []string) {
+	t.Helper()
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		for _, text := range forbidden {
+			if strings.Contains(string(raw), text) {
+				t.Fatalf("%s contains forbidden recovery frame token %q", path, text)
 			}
 		}
 	}

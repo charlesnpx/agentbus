@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	Version      uint16 = 1
+	Version      uint16 = 2
 	MaxFrameSize        = 64 * 1024
 )
 
@@ -97,7 +97,6 @@ type ReleaseBinding struct {
 	CustodyID           model.CustodyID      `json:"custodyId"`
 	LaunchKey           model.LaunchKey      `json:"launchKey"`
 	GroupRefDigest      string               `json:"groupRefDigest"`
-	LogicalGrant        model.LaunchGrant    `json:"logicalGrant"`
 	ReleaseSecret       model.ReleaseSecret  `json:"releaseSecret"`
 	ImmutableExecDigest string               `json:"immutableExecDigest"`
 }
@@ -175,9 +174,6 @@ func (binding ReleaseBinding) validateExpectation() error {
 	if err := validateDigest("group ref digest", binding.GroupRefDigest); err != nil {
 		return err
 	}
-	if err := binding.LogicalGrant.Validate(); err != nil {
-		return err
-	}
 	if err := binding.ReleaseSecret.Validate(); err != nil {
 		return err
 	}
@@ -207,9 +203,6 @@ func (binding ReleaseBinding) validateStatic() error {
 	if err := binding.validateRelease(); err != nil {
 		return err
 	}
-	if err := binding.LogicalGrant.Validate(); err != nil {
-		return err
-	}
 	if err := binding.ReleaseSecret.Validate(); err != nil {
 		return err
 	}
@@ -227,10 +220,6 @@ func (binding ReleaseBinding) equal(other ReleaseBinding) bool {
 		binding.CustodyID == other.CustodyID &&
 		binding.LaunchKey.Equal(other.LaunchKey) &&
 		binding.GroupRefDigest == other.GroupRefDigest &&
-		binding.LogicalGrant.Attempt.Equal(other.LogicalGrant.Attempt) &&
-		binding.LogicalGrant.Ordinal == other.LogicalGrant.Ordinal &&
-		binding.LogicalGrant.Nonce == other.LogicalGrant.Nonce &&
-		binding.LogicalGrant.GrantedBy == other.LogicalGrant.GrantedBy &&
 		binding.ReleaseSecret == other.ReleaseSecret &&
 		binding.ImmutableExecDigest == other.ImmutableExecDigest
 }

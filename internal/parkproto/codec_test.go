@@ -261,6 +261,67 @@ func TestReadRawFrameRejectsOversizedDeclaredLengthBeforeBodyRead(t *testing.T) 
 	}
 }
 
+func TestReleaseRejectsOldAndMixedVersionFrames(t *testing.T) {
+	execSpec := ExecSpec{Path: "/bin/echo", Argv: []string{"/bin/echo", "ok"}, Env: []string{"A=B"}, Dir: "/tmp"}
+	execDigest, err := DigestExecSpec(execSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupRef := testGroupRef()
+	groupDigest, err := DigestGroupRef(groupRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := testReleaseBinding(execDigest)
+	binding.GroupRefDigest = groupDigest
+	release := Release{Binding: binding, ExpectedGroupRef: groupRef, ExecSpec: execSpec}
+	expectation := ReleaseExpectation{Binding: binding}
+
+	t.Run("old envelope version", func(t *testing.T) {
+		var raw bytes.Buffer
+		if err := WriteFrame(&raw, Version-1, 1, release); err != nil {
+			t.Fatal(err)
+		}
+		_, err := NewReader(&raw).Read()
+		if !errors.Is(err, ErrVersionMismatch) {
+			t.Fatalf("Read() error=%v, want %v", err, ErrVersionMismatch)
+		}
+	})
+
+	t.Run("old binding version in current envelope", func(t *testing.T) {
+		mixed := release
+		mixed.Binding.ProtocolVersion = Version - 1
+		var raw bytes.Buffer
+		if err := WriteFrame(&raw, Version, 1, mixed); err != nil {
+			t.Fatal(err)
+		}
+		received, err := NewReader(&raw).Read()
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		got, ok := received.Message.(Release)
+		if !ok {
+			t.Fatalf("message=%T, want Release", received.Message)
+		}
+		if err := got.ValidateFor(received.Sequence, expectation); !errors.Is(err, ErrBinding) {
+			t.Fatalf("ValidateFor() error=%v, want %v", err, ErrBinding)
+		}
+	})
+
+	t.Run("removed logical grant field", func(t *testing.T) {
+		payload := releasePayloadWithLogicalGrant(t, release)
+		raw := rawPayload([]byte(fmt.Sprintf(
+			`{"version":%d,"sequence":1,"type":"Release","payload":%s}`,
+			Version,
+			payload,
+		)))
+		_, err := NewReader(bytes.NewReader(raw)).Read()
+		if !errors.Is(err, ErrMalformed) {
+			t.Fatalf("Read() error=%v, want %v", err, ErrMalformed)
+		}
+	})
+}
+
 func TestReleaseBindingChecksPhysicalSecretGroupDigestAndExecDigest(t *testing.T) {
 	execSpec := ExecSpec{Path: "/bin/echo", Argv: []string{"/bin/echo", "ok"}, Env: []string{"A=B"}, Dir: "/tmp"}
 	execDigest, err := DigestExecSpec(execSpec)
@@ -527,7 +588,6 @@ func (reader *declaredLengthOnlyReader) Read(p []byte) (int, error) {
 
 func testReleaseBinding(execDigest string) ReleaseBinding {
 	attempt := model.AttemptRef{JobID: "job-1", AttemptID: "attempt-1", Epoch: 1}
-	boot := model.BootRef{BootID: "boot-1", OwnerID: "owner-1"}
 	return ReleaseBinding{
 		ProtocolVersion: Version,
 		Sequence:        1,
@@ -539,7 +599,6 @@ func testReleaseBinding(execDigest string) ReleaseBinding {
 			Ordinal: model.LaunchOrdinalOne,
 		},
 		GroupRefDigest:      "sha256:" + strings.Repeat("a", 64),
-		LogicalGrant:        model.LaunchGrant{Attempt: attempt, Ordinal: model.LaunchOrdinalOne, Nonce: "nonce-1", GrantedBy: boot},
 		ReleaseSecret:       "release-secret-1",
 		ImmutableExecDigest: execDigest,
 	}
@@ -578,6 +637,37 @@ func mustReleasePayload(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func releasePayloadWithLogicalGrant(t *testing.T, release Release) []byte {
+	t.Helper()
+	raw, err := json.Marshal(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	binding, ok := payload["binding"].(map[string]any)
+	if !ok {
+		t.Fatalf("release payload binding = %T, want object", payload["binding"])
+	}
+	binding["logicalGrant"] = map[string]any{
+		"Attempt": map[string]any{
+			"JobID":     "job-1",
+			"AttemptID": "attempt-1",
+			"Epoch":     1,
+		},
+		"Ordinal":   1,
+		"Nonce":     "nonce-pre-upgrade",
+		"GrantedBy": map[string]any{"BootID": "boot-1", "OwnerID": "owner-1"},
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
 }
 
 var _ io.Reader = (*bytes.Reader)(nil)
