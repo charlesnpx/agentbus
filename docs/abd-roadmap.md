@@ -4,7 +4,8 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0 committed 23275e1. R0T verified (Linux cgroup-v2 RED sentinel) — committing + sol review. Next: R1.
+STATUS: EXECUTING. R0=23275e1. R0T=2185af1 + sol-review FIX (honest sentinel strict_admission_unavailable),
+verified Linux cgroup-v2. Next: R1 (packet staged).
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -200,14 +201,18 @@ test reaches an unsafe later state, the command wasn't run, or the ledger omits 
 ## Unit sequence (dependency-ordered; production stays UnavailableRuntime until R7B)
 - **R0**  decisions & contracts (this doc + ~/tmp R0 record). No behavior change.
 - **R0T** real-Serve Docker-Linux harness + ledger protocol; opt-in gate expected-RED, sentinel
-  `strict_native_runtime_unavailable`. No production injection hooks.
+  `strict_admission_unavailable`. No production injection hooks. HONEST SCOPE (per sol review): pre-R4B the
+  rejection fires at the jobs.requestId capability gate, UPSTREAM of native-runtime construction — so the
+  gate proves "strict admission unavailable in the default composition", NOT anything about the native
+  runtime yet. R4B strengthens it (see R4B).
 - **R1**  park-protocol logical purity: remove LogicalGrant from release binding/frame/validation/equality/
   worker bootstrap expectation; bump `parkproto.Version`; reject old+mixed frames; keep release-secret
   threading (do NOT remove model.ReleaseSecret; do NOT touch LaunchController; do NOT implement
   NativeCustodian.Prepare). R1 gate: prove no bbolt/anchor record contains ReleaseSecret; no recovery path
   decodes parkproto frames; no restart path resends a release frame. Two upgrade tests: (a) pre-upgrade
   worker bound by GroupRef recovered solely via containment; (b) pre-upgrade unbound worker dies via
-  control-loss, no frame replay. Expected sentinel: `strict_native_runtime_unavailable`.
+  control-loss, no frame replay. Expected sentinel: `strict_admission_unavailable` (unchanged; production
+  still rejects strict submits at the jobs.requestId gate).
 - **R2A** held-launch contracts + race tests only (state machine, external-secret semantics, ReleaseOutcome,
   FD matrix, race table). No subprocess impl.
 - **R2B** held-launch impl in parklaunch: Prepare/Release(secret, validated)/AbortAndVerify; one-use;
@@ -238,7 +243,10 @@ test reaches an unsafe later state, the command wasn't run, or the ledger omits 
   DirectProbeRunner/DirectCommandRunner (unfenced, outside AB-D). Does NOT implement legacy-fenced admission.
 - **R4B** identified production composition: per-Serve admissionInstance; immutable ServeAdmissionPolicy;
   bootstrap independent of jobs.requestId; strict identified route; reject no-ID/unfenceable before mutation;
-  response-loss replay; no legacy fallback; default NOT auto-activated.
+  response-loss replay; no legacy fallback; default NOT auto-activated. R0T-GATE STRENGTHENING (owed here):
+  once admission is decoupled from jobs.requestId, upgrade the R0T gate to assert the strict-submit rejection
+  cause is the UNAVAILABLE NATIVE RUNTIME (not the jobs.requestId gate), and only then track a
+  native-runtime-specific sentinel. This retires the review's "different error masks the boundary" concern.
 - **R5**  sticky activation + administration: anchored activation metadata; no-downgrade rule; inspect;
   recovery-only; reset-empty-root; seal + start-new-authority-domain rotation; support-loss diagnostics.
 - **R6/R7A** mandatory production conformance: turn R0T GREEN under Linux cgroup-v2 with NO factory

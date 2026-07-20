@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -75,13 +76,34 @@ func TestProductionStrictServe(t *testing.T) {
 		}
 	})
 
-	if client.HelloResult().Capabilities["jobs.requestId"] {
-		t.Fatal("jobs.requestId capability is unexpectedly advertised")
+	hello := client.HelloResult()
+	// The default composition really does register the configured backend, so the
+	// rejection below cannot be an incidental "unknown backend" error masquerading
+	// as the admission gate.
+	if !slices.Contains(hello.Backends, "codex") {
+		t.Fatalf("default production Serve did not advertise the codex backend: %v", hello.Backends)
+	}
+	// Pre-R4B, admission bootstrap is coupled to jobs.requestId (server.go gates it
+	// on jobsRequestIDEnabled, which New leaves false by default). It must not be
+	// advertised in the default composition.
+	if hello.Capabilities["jobs.requestId"] {
+		t.Fatal("jobs.requestId capability is unexpectedly advertised by the default composition")
 	}
 
-	// Current RED baseline: production Serve does not advertise the strict
-	// request-id capability, so this identified submission is rejected before
-	// any backend launch or fixture runtime can be involved.
+	// RED baseline: the default production composition does NOT accept a strict
+	// identified submission.
+	//
+	// HONEST SCOPE (do not over-claim): at this tree state the rejection fires at
+	// the jobs.requestId capability gate (handleIdentifiedJobSubmit), which is
+	// UPSTREAM of native-runtime construction/probing. This gate therefore proves
+	// "strict admission is unavailable in the default composition" — it proves
+	// NOTHING about the native runtime yet, because that code never executes.
+	//
+	// TODO(R4B): once admission is decoupled from jobs.requestId, strengthen this
+	//   to assert the rejection cause is the UNAVAILABLE NATIVE RUNTIME (not the
+	//   request-id gate), and only then track a native-runtime-specific sentinel.
+	// TODO(R7B): flip to GREEN — assert the real strict identified job launches,
+	//   completes, and is independently proven contained.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err = client.JobSubmit(ctx, agentclient.JobSubmitParams{
@@ -95,12 +117,10 @@ func TestProductionStrictServe(t *testing.T) {
 		},
 	})
 	if err == nil {
-		// TODO(R7B): replace this RED assertion with a GREEN assertion that the
-		// real strict identified job launches, completes, and is contained.
-		t.Fatal("strict identified job unexpectedly submitted")
+		t.Fatal("strict identified job unexpectedly submitted by the default composition")
 	}
 	assertProductionStrictUnavailable(t, err)
-	t.Log("strict_native_runtime_unavailable")
+	t.Log("strict_admission_unavailable")
 }
 
 func connectProductionStrictClient(t *testing.T, stateRoot string, serveDone <-chan error) *agentclient.Client {
