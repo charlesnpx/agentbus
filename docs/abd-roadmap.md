@@ -4,9 +4,8 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0=23275e1. R0T(+084f8d3). R1=9560a47(CLOSED). R2A=b86de29(CLOSED). R2B=00b8a72(+fix this
-commit; BOTH reviews CLOSED; F-C/F-D deferred to R3B). All pushed. Next: R3A1 (additive private native
-prepared path).
+STATUS: EXECUTING. R0..R2B CLOSED (R2B=523239a). R3A1 committed (additive private native prepared path;
+crypto-random internal secret; not production-selected). All pushed. Next: R3A1 sol review, then R3A2.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -293,7 +292,16 @@ see the R4A contract block.)
   strict-E2E harness launched: worker job_20260720T151723000000000Z_000002 (codex gpt-5.5 xhigh, --write).
   Packet: ~/tmp/delegate-packets/abd-R0T-real-serve-harness.md. Expected sentinel
   strict_native_runtime_unavailable; opt-in gate abd_strict_e2e + AGENTBUS_RUN_STRICT_E2E=1.
-- 2026-07-20 R2B-fix (this commit): closed BOTH R2B reviews. F-A: Launch now does state-aware cleanup on
+- 2026-07-20 R3A1 (this commit): ADDITIVE private native prepared path (2 new files native_held_launch.go +
+  test, build-tag darwin||linux). Crypto/rand 32-byte channel-scoped internal secret (zeroized, not
+  identity-derived, caller secret ignored, one secret/launch); nativeHeldLaunchEffects implements R2A
+  HeldLaunchEffects over parklaunch.Prepare + native containment backend (witness-acquisition checked);
+  outcome map: chan-lost->DefinitelyNotSent, release-unknown->Unknown, default->Unknown (fail-closed);
+  Accepted adopts a real NativeRunningProcess into custodian.running. Package-private prepareNativeHeldLaunch;
+  public NativeCustodian.Prepare stub + Launch UNCHANGED; not production-selected. Verify: build/linux/gofmt/
+  vet=0; custodian -race -count=3 (macOS 188s)=0; macOS go test ./...=0; Docker -p 1 full=0 + custodian
+  -race=0 + R0T RED=0. sol review pending (protocol/concurrency + secret lens; dual review reserved for R3B).
+- 2026-07-20 R2B-fix (523239a): closed BOTH R2B reviews. F-A: Launch now does state-aware cleanup on
   release error (cleanupLaunchReleaseError: prepared->AbortAndVerify, releasing/unknown->ContainAndVerify,
   typed GroupRef error), and new PUBLIC Prepared.ContainAndVerify/containAndVerifyLocked gives release_unknown
   a terminal proof-of-absence cleanup. F-B: monitorArmed set at BindTarget success (not after WaitReady);
