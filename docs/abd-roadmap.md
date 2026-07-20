@@ -4,9 +4,9 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R3A2 CLOSED. R3B + R3B-fix committed (native monitor port + F-C/F-D + review fixes:
-reap-before-contain ordering, fail-closed retained-cgroup cleanup, Runtime injection via agentbusserve).
-All pushed. Next: sol fix-verification review of R3B-fix, then R3C (packet drafted).
+STATUS: EXECUTING. R0..R3A2 CLOSED. R3B + fix + fix2 committed (native monitor port + F-C/F-D + phase-aware
+Prepare cleanup ordering + attestation-cache cleanup-error preservation + Runtime injection). All pushed.
+Next: sol verification review of fix2, then R3C (packet drafted).
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -283,7 +283,21 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
-- 2026-07-20 R3B-fix (this commit): closed both R3B reviews (protocol FIX-REQUIRED 1 Medium; OS/cgroup
+- 2026-07-20 R3B-fix2 (this commit): closed the fix-verification review's 2 residual High. F1 unarmed
+  Prepare failures no longer contain-before-reap: phase-aware cleanup closures (failBeforeVerifiedIdentity/
+  failBeforeVerifiedPlacement/failAfterVerifiedPlacement) route every Prepare failure site; new
+  waitBeforeAbsenceProofContainment seam — waitBeforeProbeSignaler starts the parent Wait via sync.Once at
+  the FIRST ProbeGroup (identity fence preserved through the signaling phase, leader reapable exactly when
+  the ESRCH proof needs it); preIdentityAbort passes the wait into terminateStartedProcess. F2
+  finalAttestationLocked joins process.finalErr into the memoized finalAttestationErr (valid attestation
+  preserved alongside non-nil cleanup error; repeated calls consistent); CleanupErr maps into
+  PhysicalOutcome.Err so RealContainment surfaces cleanup failure on absent outcomes. 3 injected-failure
+  ordering tests + retained-Remove-failure attestation regression added. Worker job_...000054 ended
+  "orphaned" but wrote its FULL report first (report-before-final-acceptance mitigation worked). Verified:
+  build/linux-build/gofmt/vet=0; macOS full=0 (24 pkgs), race -count=2 parklaunch+custodian=0; Docker
+  cgroup-v2 full -p 1=0, race -count=2=0, R0T RED sentinel strict_admission_unavailable=0. sol
+  verification round next.
+- 2026-07-20 R3B-fix (8517171): closed both R3B reviews (protocol FIX-REQUIRED 1 Medium; OS/cgroup
   FIX-REQUIRED 2 High; F-C proof paths + F-D fence verified sound by reviewer). H1 prepared abort/EOF
   proof-vs-reaping cycle: startWaitBeforeContainment() (documented F-D-fence invariant) now precedes
   containment in containAndVerifyLocked/abortPreparedLocked/failArmedLocked + armed-failure path in

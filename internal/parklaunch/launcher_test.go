@@ -242,6 +242,110 @@ func TestPreparedAbortStartsWaitBeforeContainment(t *testing.T) {
 	}
 }
 
+func TestPrepareFailureBeforeIdentityReportStartsWaitBeforeAbsenceProof(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	containment := &waitBeforeProofContainment{}
+	fixture.spec.Containment = containment
+	fixture.spec.RetainLeaderUnreaped = true
+	bootstrapWriteFD := -1
+	fixture.spec.identity = &closeFDOnIdentityRead{
+		identityReader: nativeIdentityReader{},
+		closeAfter:     2,
+		fd:             &bootstrapWriteFD,
+	}
+	fixture.spec.hooks.afterWorkerWaitCreated = func(wait *processWait) {
+		containment.wait = wait
+	}
+	fixture.spec.hooks.afterPipesCreated = func(snapshot launchPipeSnapshot) error {
+		bootstrapWriteFD = snapshot.BootstrapWriteFD
+		return nil
+	}
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err == nil {
+		cleanupParkedHandle(t, handle)
+		t.Fatal("Launch() succeeded; want bootstrap write failure")
+	}
+	if !strings.Contains(err.Error(), "write release expectation bootstrap") {
+		t.Fatalf("Launch() error = %v, want bootstrap write failure", err)
+	}
+	if got := containment.CallCount(); got != 1 {
+		t.Fatalf("containment calls = %d, want 1", got)
+	}
+	if !containment.waitStartedAtProof {
+		t.Fatal("wait was not started before pre-identity absence proof")
+	}
+}
+
+func TestPrepareFailureAfterRetainedPlacementBeforeMonitorTargetBindStartsWaitBeforeContainment(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	containment := &waitBeforeProofContainment{}
+	fixture.spec.Containment = containment
+	fixture.spec.RetainLeaderUnreaped = true
+	fixture.spec.RetainedID = "retained-placement-ordering"
+	var launchedMonitor *MonitorProcess
+	fixture.spec.hooks.afterWorkerWaitCreated = func(wait *processWait) {
+		containment.wait = wait
+	}
+	fixture.spec.hooks.afterMonitorStarted = func(monitor *MonitorProcess) error {
+		launchedMonitor = monitor
+		return nil
+	}
+	fixture.spec.BeforeMonitorBind = func(_ context.Context, group model.GroupRef) (model.GroupRef, error) {
+		if err := closeMonitorTarget(launchedMonitor); err != nil {
+			return model.GroupRef{}, err
+		}
+		group.RetainedDomainID = "retained-domain-placement-ordering"
+		group.RetainedDomainState = model.RetainedDomainKnown
+		return group, nil
+	}
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err == nil {
+		cleanupParkedHandle(t, handle)
+		t.Fatal("Launch() succeeded; want monitor target bind failure")
+	}
+	if !errors.Is(err, ErrMonitorNotArmed) {
+		t.Fatalf("Launch() error = %v, want ErrMonitorNotArmed", err)
+	}
+	if got := containment.CallCount(); got != 1 {
+		t.Fatalf("containment calls = %d, want 1", got)
+	}
+	if !containment.waitStartedAtProof {
+		t.Fatal("wait was not started before post-placement containment")
+	}
+}
+
+func TestPrepareFailureDuringTargetBindingStartsWaitBeforeAbsenceProof(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	containment := &waitBeforeProofContainment{}
+	fixture.spec.Containment = containment
+	fixture.spec.RetainLeaderUnreaped = true
+	fixture.spec.RetainedID = "retained-binding-ordering"
+	fixture.spec.hooks.afterWorkerWaitCreated = func(wait *processWait) {
+		containment.wait = wait
+	}
+	bindErr := errors.New("injected target binding failure")
+	fixture.spec.BeforeMonitorBind = func(context.Context, model.GroupRef) (model.GroupRef, error) {
+		return model.GroupRef{}, bindErr
+	}
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err == nil {
+		cleanupParkedHandle(t, handle)
+		t.Fatal("Launch() succeeded; want target binding failure")
+	}
+	if !errors.Is(err, bindErr) {
+		t.Fatalf("Launch() error = %v, want target binding failure", err)
+	}
+	if got := containment.CallCount(); got != 1 {
+		t.Fatalf("containment calls = %d, want 1", got)
+	}
+	if !containment.waitStartedAtProof {
+		t.Fatal("wait was not started before target-binding absence proof")
+	}
+}
+
 func TestPreparedChannelLossBeforeReleaseContainsTarget(t *testing.T) {
 	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
 	fixture.spec.hooks.beforeRelease = func(snapshot launchControlSnapshot) error {
@@ -1474,6 +1578,41 @@ func (containment *waitOrderingContainment) Contain(_ context.Context, group mod
 	return nil
 }
 
+type waitBeforeProofContainment struct {
+	mu                 sync.Mutex
+	wait               *processWait
+	calls              int
+	waitStartedAtProof bool
+}
+
+func (containment *waitBeforeProofContainment) Contain(context.Context, model.GroupRef) error {
+	containment.recordProof()
+	return nil
+}
+
+func (containment *waitBeforeProofContainment) ContainWithWaitBeforeAbsenceProof(_ context.Context, _ model.GroupRef, startWait func()) error {
+	if startWait != nil {
+		startWait()
+	}
+	containment.recordProof()
+	return nil
+}
+
+func (containment *waitBeforeProofContainment) CallCount() int {
+	containment.mu.Lock()
+	defer containment.mu.Unlock()
+	return containment.calls
+}
+
+func (containment *waitBeforeProofContainment) recordProof() {
+	containment.mu.Lock()
+	defer containment.mu.Unlock()
+	containment.calls++
+	if containment.wait != nil {
+		containment.waitStartedAtProof = containment.wait.Started()
+	}
+}
+
 type workerOnlyIdentityReader struct {
 	identityReader
 	workerPID *int
@@ -1484,6 +1623,37 @@ func (reader workerOnlyIdentityReader) ReadProcessClaim(pid int) (procgroup.Proc
 		return reader.identityReader.ReadProcessClaim(pid)
 	}
 	return procgroup.ProcessClaim{}, fmt.Errorf("synthetic monitor identity failure for pid %d", pid)
+}
+
+type closeFDOnIdentityRead struct {
+	identityReader
+	mu         sync.Mutex
+	closeAfter int
+	reads      int
+	fd         *int
+}
+
+func (reader *closeFDOnIdentityRead) ReadProcessClaim(pid int) (procgroup.ProcessClaim, error) {
+	claim, err := reader.identityReader.ReadProcessClaim(pid)
+	if err != nil {
+		return claim, err
+	}
+	reader.mu.Lock()
+	reader.reads++
+	shouldClose := reader.closeAfter > 0 && reader.reads == reader.closeAfter && reader.fd != nil && *reader.fd >= 0
+	fd := -1
+	if shouldClose {
+		fd = *reader.fd
+		*reader.fd = -1
+	}
+	reader.mu.Unlock()
+	if shouldClose {
+		file := os.NewFile(uintptr(fd), "agentbus-test-close-on-identity-read")
+		if file != nil {
+			_ = file.Close()
+		}
+	}
+	return claim, nil
 }
 
 type markerContainment struct {

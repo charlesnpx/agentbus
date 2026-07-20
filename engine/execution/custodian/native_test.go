@@ -1080,6 +1080,54 @@ func TestRetainedNativeContainmentBackendClosePropagatesRemoveFailure(t *testing
 	}
 }
 
+func TestNativeRetainedContainAndVerifyPreservesCleanupFailureAfterFinalization(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	issuer, verifier := NewAttestationChannel()
+	manager := newFakeNativeRetainedManager()
+	native := newNativeCustodianWithRetainedManagerForTest(t, defaultNativeTestParams(), manager)
+	native.issuer = issuer
+	spec, _ := nativeSimpleLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	if _, err := io.ReadAll(running.Stdout()); err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	removeErr := errors.New("injected retained remove failure")
+	manager.setMembership(running.Ref().RetainedID, containment.RetainedMembershipEmpty)
+	manager.setRemoveErr(running.Ref().RetainedID, removeErr)
+
+	first, err := running.ContainAndVerify(ctx, QuiescenceCauseContain)
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("first ContainAndVerify() error = %v, want retained remove failure", err)
+	}
+	payload, err := verifier.VerifyQuiescence(first)
+	if err != nil {
+		t.Fatalf("first VerifyQuiescence() error = %v", err)
+	}
+	if !payload.Group.Equal(running.Ref()) || payload.Method != model.QuiescenceAlreadyAbsent {
+		t.Fatalf("first attestation payload = %+v, want already-absent for %+v", payload, running.Ref())
+	}
+	if !running.finalOutcome.Absent() || running.finalOutcome.Err != nil {
+		t.Fatalf("cached final outcome = %+v, want clean absence fact", running.finalOutcome)
+	}
+	if !errors.Is(running.finalErr, removeErr) {
+		t.Fatalf("cached final error = %v, want retained remove failure", running.finalErr)
+	}
+
+	second, err := running.ContainAndVerify(ctx, QuiescenceCauseContain)
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("second ContainAndVerify() error = %v, want retained remove failure", err)
+	}
+	if second != first {
+		t.Fatalf("second ContainAndVerify() attestation = %+v, want cached %+v", second, first)
+	}
+}
+
 func TestNativeRetainedWaitCompletesWithoutLeaderRetention(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -2156,6 +2204,15 @@ func (manager *fakeNativeRetainedManager) setTermIgnored(retainedID string, igno
 	leaf := manager.leaves[retainedID]
 	if leaf != nil {
 		leaf.ignoreTerm = ignored
+	}
+}
+
+func (manager *fakeNativeRetainedManager) setRemoveErr(retainedID string, err error) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	leaf := manager.leaves[retainedID]
+	if leaf != nil {
+		leaf.removeErr = err
 	}
 }
 

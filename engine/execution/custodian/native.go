@@ -1205,10 +1205,11 @@ func (process *NativeRunningProcess) finalAttestationLocked() (VerifiedQuiescenc
 	}
 	process.finalAttestationAttempted = true
 	if process.custodian == nil {
-		process.finalAttestationErr = fmt.Errorf("%w: running process has no custodian", ErrNativeCustodianUnavailable)
+		process.finalAttestationErr = errors.Join(fmt.Errorf("%w: running process has no custodian", ErrNativeCustodianUnavailable), process.finalErr)
 		return process.finalAttestation, process.finalAttestationErr
 	}
 	process.finalAttestation, process.finalAttestationErr = attestPhysicalOutcome(process.custodian.issuer, process.finalOutcome)
+	process.finalAttestationErr = errors.Join(process.finalAttestationErr, process.finalErr)
 	return process.finalAttestation, process.finalAttestationErr
 }
 
@@ -1219,11 +1220,19 @@ type RealContainment struct {
 }
 
 func (real RealContainment) Contain(ctx context.Context, group model.GroupRef) error {
+	return real.contain(ctx, group, nil)
+}
+
+func (real RealContainment) ContainWithWaitBeforeAbsenceProof(ctx context.Context, group model.GroupRef, startWait func()) error {
+	return real.contain(ctx, group, startWait)
+}
+
+func (real RealContainment) contain(ctx context.Context, group model.GroupRef, beforeProcessGroupProbe func()) error {
 	bound, err := platformRealContainment(ctx, real, group)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrPhysicalContainment, err)
 	}
-	outcome := containPhysicalWithRetainedCleanup(ctx, group, bound.Params, bound.Witness, bound.RetainedObject)
+	outcome := containPhysicalWithCleanup(ctx, group, bound.Params, bound.Witness, bound.RetainedObject, true, beforeProcessGroupProbe)
 	if outcome.Absent() {
 		if outcome.Err != nil {
 			return fmt.Errorf("%w: cleanup retained object after absence proof: %v", ErrPhysicalContainment, outcome.Err)
@@ -1268,15 +1277,24 @@ func (native *nativeLaunchContainment) Contain(ctx context.Context, group model.
 	return RealContainment{Params: params, Witness: witness, RetainedObject: retainedObject}.Contain(ctx, group)
 }
 
+func (native *nativeLaunchContainment) ContainWithWaitBeforeAbsenceProof(ctx context.Context, group model.GroupRef, startWait func()) error {
+	native.mu.RLock()
+	params := native.params
+	witness := native.witness
+	retainedObject := native.retainedObject
+	native.mu.RUnlock()
+	return RealContainment{Params: params, Witness: witness, RetainedObject: retainedObject}.ContainWithWaitBeforeAbsenceProof(ctx, group, startWait)
+}
+
 func containPhysical(ctx context.Context, group model.GroupRef, params containment.Params, witness containment.ContinuityWitness, retainedObject containment.RetainedGroupObject) PhysicalOutcome {
-	return containPhysicalWithCleanup(ctx, group, params, witness, retainedObject, false)
+	return containPhysicalWithCleanup(ctx, group, params, witness, retainedObject, false, nil)
 }
 
 func containPhysicalWithRetainedCleanup(ctx context.Context, group model.GroupRef, params containment.Params, witness containment.ContinuityWitness, retainedObject containment.RetainedGroupObject) PhysicalOutcome {
-	return containPhysicalWithCleanup(ctx, group, params, witness, retainedObject, true)
+	return containPhysicalWithCleanup(ctx, group, params, witness, retainedObject, true, nil)
 }
 
-func containPhysicalWithCleanup(ctx context.Context, group model.GroupRef, params containment.Params, witness containment.ContinuityWitness, retainedObject containment.RetainedGroupObject, cleanupRetained bool) PhysicalOutcome {
+func containPhysicalWithCleanup(ctx context.Context, group model.GroupRef, params containment.Params, witness containment.ContinuityWitness, retainedObject containment.RetainedGroupObject, cleanupRetained bool, beforeProcessGroupProbe func()) PhysicalOutcome {
 	var retainedSignals *retainedSignalRecorder
 	if retainedObject != nil {
 		retainedSignals = &retainedSignalRecorder{}
@@ -1285,9 +1303,16 @@ func containPhysicalWithCleanup(ctx context.Context, group model.GroupRef, param
 			recorder: retainedSignals,
 		}
 	}
+	signaler := nativeSignalerFor(witness)
+	if beforeProcessGroupProbe != nil {
+		signaler = &waitBeforeProbeSignaler{
+			inner:       signaler,
+			beforeProbe: beforeProcessGroupProbe,
+		}
+	}
 	engine := containment.Engine{
 		Observer:              nativeObserverFor(witness),
-		Signaler:              nativeSignalerFor(witness),
+		Signaler:              signaler,
 		Clock:                 containment.RealClock{},
 		Continuity:            witness,
 		RetainedObject:        retainedObject,
@@ -1494,6 +1519,31 @@ func nativeSignalerFor(witness containment.ContinuityWitness) containment.Signal
 
 type nativeContainmentSignaler struct {
 	retention *leaderRetention
+}
+
+type waitBeforeProbeSignaler struct {
+	inner       containment.Signaler
+	beforeProbe func()
+	once        sync.Once
+}
+
+func (signaler *waitBeforeProbeSignaler) SignalGroup(ctx context.Context, target model.GroupRef, signal containment.Signal) (containment.SignalResult, error) {
+	if signaler == nil || signaler.inner == nil {
+		return containment.SignalUnprovable, fmt.Errorf("%w: containment signaler is nil", ErrNativeCustodianUnavailable)
+	}
+	return signaler.inner.SignalGroup(ctx, target, signal)
+}
+
+func (signaler *waitBeforeProbeSignaler) ProbeGroup(ctx context.Context, target model.GroupRef) (containment.ProbeResult, error) {
+	if signaler == nil || signaler.inner == nil {
+		return containment.ProbeUnprovable, fmt.Errorf("%w: containment signaler is nil", ErrNativeCustodianUnavailable)
+	}
+	signaler.once.Do(func() {
+		if signaler.beforeProbe != nil {
+			signaler.beforeProbe()
+		}
+	})
+	return signaler.inner.ProbeGroup(ctx, target)
 }
 
 // nativeContainmentSignaler keeps shared containment fail-closed while smoothing

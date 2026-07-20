@@ -70,6 +70,10 @@ type Containment interface {
 	Contain(context.Context, model.GroupRef) error
 }
 
+type waitBeforeAbsenceProofContainment interface {
+	ContainWithWaitBeforeAbsenceProof(context.Context, model.GroupRef, func()) error
+}
+
 // TargetBindingContainment lets a monitor containment implementation acquire
 // target-scoped resources after the target has been decoded and before the
 // monitor reports readiness to the daemon.
@@ -134,6 +138,7 @@ type launchHooks struct {
 	afterPipesCreated      func(launchPipeSnapshot) error
 	afterMonitorStarted    func(*MonitorProcess) error
 	afterWorkerStarted     func(int) error
+	afterWorkerWaitCreated func(*processWait)
 	beforeMonitorWaitReady func(*MonitorProcess) error
 	beforeRelease          func(launchControlSnapshot) error
 	afterRelease           func(launchControlSnapshot) error
@@ -645,9 +650,31 @@ func Prepare(ctx context.Context, spec Spec) (*Prepared, error) {
 	} else {
 		wait = startProcessWait(cmd)
 	}
+	if spec.hooks.afterWorkerWaitCreated != nil {
+		spec.hooks.afterWorkerWaitCreated(wait)
+	}
 
 	started := true
 	released := false
+	failBeforeVerifiedIdentity := func(cause error) error {
+		// The worker's final identity report has not been verified yet. Keep the
+		// retained identity fence through containment's signaling phase, then start
+		// wait before any process-group absence proof runs.
+		return failClosedBeforeAbsenceProof(spec.Containment, group, wait.Start, cause)
+	}
+	failBeforeVerifiedPlacement := func(cause error) error {
+		// The worker identity report is verified, but the target placement/binding
+		// callback has not returned a validated GroupRef. Preserve the same
+		// signal-before-wait ordering, then reap before absence reproof.
+		return failClosedBeforeAbsenceProof(spec.Containment, group, wait.Start, cause)
+	}
+	failAfterVerifiedPlacement := func(cause error) error {
+		// Worker identity and any configured retained placement are verified. From
+		// this point the parent may start waiting before full containment so a
+		// killed retained leader can be reaped before the PGID absence proof.
+		wait.Start()
+		return failClosed(spec.Containment, group, cause)
+	}
 	failArmed := func(cause error) error {
 		monitorFailureCleaned = true
 		// Armed launch failures occur after identity verification and retained
@@ -658,10 +685,9 @@ func Prepare(ctx context.Context, spec Spec) (*Prepared, error) {
 		return failClosedArmed(spec.Containment, spec.identity, monitor, group, cause)
 	}
 	preIdentityAbort := func(cause error) error {
-		wait.Start()
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
-		if err := terminateStartedProcess(cleanupCtx, workerProcess, wait.Done()); err != nil {
+		if err := terminateStartedProcess(cleanupCtx, workerProcess, wait); err != nil {
 			return errors.Join(cause, fmt.Errorf("terminate parked worker before identity: %w", err))
 		}
 		return cause
@@ -704,10 +730,10 @@ func Prepare(ctx context.Context, spec Spec) (*Prepared, error) {
 	releaseGroup := group
 	expectation, err := releaseExpectation(spec, releaseGroup)
 	if err != nil {
-		return nil, failClosed(spec.Containment, group, err)
+		return nil, failBeforeVerifiedIdentity(err)
 	}
 	if err := writeReleaseExpectation(pipes.bootstrapWrite, expectation); err != nil {
-		return nil, failClosed(spec.Containment, group, fmt.Errorf("write release expectation bootstrap: %w", err))
+		return nil, failBeforeVerifiedIdentity(fmt.Errorf("write release expectation bootstrap: %w", err))
 	}
 	_ = pipes.bootstrapWrite.Close()
 	pipes.bootstrapWrite = nil
@@ -715,22 +741,22 @@ func Prepare(ctx context.Context, spec Spec) (*Prepared, error) {
 	reader := parkproto.NewReader(pipes.fromWorkerRead)
 	received, err := readParkFrame(ctx, reader)
 	if err != nil {
-		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: read identity report: %v", ErrChannelLostBeforeRelease, err))
+		return nil, failBeforeVerifiedIdentity(fmt.Errorf("%w: read identity report: %v", ErrChannelLostBeforeRelease, err))
 	}
 	report, ok := received.Message.(parkproto.IdentityReport)
 	if !ok {
-		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: first worker frame was %T", ErrIdentityMismatch, received.Message))
+		return nil, failBeforeVerifiedIdentity(fmt.Errorf("%w: first worker frame was %T", ErrIdentityMismatch, received.Message))
 	}
 	if err := verifyIdentityReport(spec.identity, report, workerClaim, releaseGroup); err != nil {
-		return nil, failClosed(spec.Containment, group, err)
+		return nil, failBeforeVerifiedIdentity(err)
 	}
 	if spec.BeforeMonitorBind != nil {
 		boundGroup, err := spec.BeforeMonitorBind(ctx, group)
 		if err != nil {
-			return nil, failClosed(spec.Containment, group, fmt.Errorf("before monitor bind: %w", err))
+			return nil, failBeforeVerifiedPlacement(fmt.Errorf("before monitor bind: %w", err))
 		}
 		if err := validateBoundMonitorGroup(releaseGroup, boundGroup); err != nil {
-			return nil, failClosed(spec.Containment, group, fmt.Errorf("before monitor bind: %w", err))
+			return nil, failBeforeVerifiedPlacement(fmt.Errorf("before monitor bind: %w", err))
 		}
 		group = boundGroup
 	}
@@ -739,7 +765,7 @@ func Prepare(ctx context.Context, spec Spec) (*Prepared, error) {
 		if _, _, _, armed := monitor.armedCleanupState(); armed {
 			return nil, failArmed(cause)
 		}
-		return nil, failClosed(spec.Containment, group, cause)
+		return nil, failAfterVerifiedPlacement(cause)
 	}
 	monitorArmed = true
 	if spec.hooks.beforeMonitorWaitReady != nil {
@@ -1054,6 +1080,13 @@ func failClosed(containment Containment, group model.GroupRef, cause error) erro
 	return cause
 }
 
+func failClosedBeforeAbsenceProof(containment Containment, group model.GroupRef, startWait func(), cause error) error {
+	if err := containTargetGroupStartingWaitBeforeAbsenceProof(containment, group, startWait); err != nil {
+		return errors.Join(cause, fmt.Errorf("contain target group: %w", err))
+	}
+	return cause
+}
+
 func failClosedArmed(containment Containment, reader identityReader, monitor *MonitorProcess, group model.GroupRef, cause error) error {
 	if err := cleanupArmedMonitorFailure(containment, reader, monitor, group); err != nil {
 		return errors.Join(cause, err)
@@ -1096,6 +1129,21 @@ func containTargetGroup(containment Containment, group model.GroupRef) error {
 	}
 	ctx, cancel := cleanupContext()
 	defer cancel()
+	return containment.Contain(ctx, group)
+}
+
+func containTargetGroupStartingWaitBeforeAbsenceProof(containment Containment, group model.GroupRef, startWait func()) error {
+	if group.Validate() != nil || containment == nil {
+		return nil
+	}
+	ctx, cancel := cleanupContext()
+	defer cancel()
+	if phased, ok := containment.(waitBeforeAbsenceProofContainment); ok {
+		return phased.ContainWithWaitBeforeAbsenceProof(ctx, group, startWait)
+	}
+	if startWait != nil {
+		startWait()
+	}
 	return containment.Contain(ctx, group)
 }
 
@@ -1268,29 +1316,31 @@ func waitMonitorExitAfterTargetAbsent(ctx context.Context, process *MonitorProce
 	}
 }
 
-func terminateStartedProcess(ctx context.Context, process *os.Process, done <-chan struct{}) error {
-	if process == nil || done == nil {
+func terminateStartedProcess(ctx context.Context, process *os.Process, wait *processWait) error {
+	if process == nil || wait == nil {
 		return nil
 	}
 	select {
-	case <-done:
+	case <-wait.Done():
 		return nil
 	default:
 	}
 	_ = process.Signal(syscall.SIGTERM)
 	timer := time.NewTimer(100 * time.Millisecond)
 	select {
-	case <-done:
+	case <-wait.Done():
 		timer.Stop()
 		return nil
 	case <-ctx.Done():
 		timer.Stop()
+		wait.Start()
 		return ctx.Err()
 	case <-timer.C:
 	}
 	_ = process.Kill()
+	wait.Start()
 	select {
-	case <-done:
+	case <-wait.Done():
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
