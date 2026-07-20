@@ -4,9 +4,9 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R3A2 CLOSED. R3B committed (native monitor port + shared defaults + F-C absence-proof
-+ F-D PID-reuse fence + agentbusserve dep-guard). All pushed. Next: TWO R3B reviews (protocol/monitor +
-OS/cgroup), then R3C.
+STATUS: EXECUTING. R0..R3A2 CLOSED. R3B + R3B-fix committed (native monitor port + F-C/F-D + review fixes:
+reap-before-contain ordering, fail-closed retained-cgroup cleanup, Runtime injection via agentbusserve).
+All pushed. Next: sol fix-verification review of R3B-fix, then R3C (packet drafted).
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -283,6 +283,23 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
+- 2026-07-20 R3B-fix (this commit): closed both R3B reviews (protocol FIX-REQUIRED 1 Medium; OS/cgroup
+  FIX-REQUIRED 2 High; F-C proof paths + F-D fence verified sound by reviewer). H1 prepared abort/EOF
+  proof-vs-reaping cycle: startWaitBeforeContainment() (documented F-D-fence invariant) now precedes
+  containment in containAndVerifyLocked/abortPreparedLocked/failArmedLocked + armed-failure path in
+  Prepare — killed retained leader is reapable so kill(-pgid,0) can reach ESRCH. H2 fail-closed retained
+  cleanup: Capability.Membership propagates ReadEvents errors; realFS.Remove requires held root lease
+  (typed ErrRootLeaseUnavailable) and tombstones only proven ENOENT/ESTALE or durable-identity mismatch;
+  backend close fail-closes on Unknown/Present membership (absence re-proof fallback); new
+  Outcome.CleanupErr keeps cleanup status separate from absence proof; recovery containment
+  (containPhysicalWithRetainedCleanup) removes leaked leaves under the root lease. H3 composition
+  boundary realized: agentbusserve.Config = served.Config (alias, no field mirror); agentbusserve
+  constructs NewUnavailableRuntime and injects via served.Config.Runtime; served uses injected runtime
+  with fail-closed nil check (nil Process → unavailable). Worker job_...000050 timed out mid-final-race
+  rerun (papercut pattern; prior full acceptance pass logged); orchestrator verified tree independently:
+  build/linux-build/gofmt/vet=0; macOS full=0; macOS race -count=2 (parklaunch/containment/agentbusserve
+  + earlier custodian/cgroup by worker)=0; Docker cgroup-v2 -p 1 full=0, race -count=2=0, R0T RED
+  sentinel strict_admission_unavailable=0. sol fix-verification review next.
 - 2026-07-20 Plan LOCKED after design dialogue. Branch reset abd-authority→4a8f59d (backup
   abd-s5b-inert-d957878). Awaiting user "go" before R0 launch.
 - 2026-07-20 R4A exec-guard sub-decision RESOLVED: GLOBAL structural no-hidden-exec guard (strict+legacy) +

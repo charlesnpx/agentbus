@@ -358,8 +358,8 @@ func (prepared *Prepared) containAndVerifyLocked(ctx context.Context) error {
 	if prepared.pipes != nil {
 		err = errors.Join(err, prepared.pipes.closeControl())
 	}
+	prepared.startWaitBeforeContainment()
 	err = errors.Join(err, abortArmedMonitorAndVerify(prepared.containment, prepared.identity, prepared.monitor, prepared.group))
-	prepared.startWait()
 	prepared.closeParentFiles()
 	prepared.setState(preparedStateFinalized)
 	return err
@@ -384,16 +384,16 @@ func (prepared *Prepared) abortPreparedLocked(ctx context.Context) error {
 	if prepared.pipes != nil {
 		err = errors.Join(err, prepared.pipes.closeControl())
 	}
+	prepared.startWaitBeforeContainment()
 	err = errors.Join(err, abortArmedMonitorAndVerify(prepared.containment, prepared.identity, prepared.monitor, prepared.group))
-	prepared.startWait()
 	prepared.closeParentFiles()
 	prepared.setState(preparedStateFinalized)
 	return err
 }
 
 func (prepared *Prepared) failArmedLocked(cause error) error {
+	prepared.startWaitBeforeContainment()
 	cleanupErr := cleanupArmedMonitorFailure(prepared.containment, prepared.identity, prepared.monitor, prepared.group)
-	prepared.startWait()
 	prepared.closeParentFiles()
 	prepared.setState(preparedStateFinalized)
 	if cleanupErr != nil {
@@ -423,6 +423,14 @@ func (prepared *Prepared) startWait() {
 	if prepared != nil && prepared.wait != nil {
 		prepared.wait.Start()
 	}
+}
+
+func (prepared *Prepared) startWaitBeforeContainment() {
+	// Prepared is only returned after worker identity, retained placement, and
+	// monitor binding have been verified. Once that F-D fence is complete, the
+	// parent must start waiting before containment so a killed retained leader can
+	// be reaped and the process group can become provably absent.
+	prepared.startWait()
 }
 
 func (prepared *Prepared) closeParentFiles() {
@@ -642,6 +650,11 @@ func Prepare(ctx context.Context, spec Spec) (*Prepared, error) {
 	released := false
 	failArmed := func(cause error) error {
 		monitorFailureCleaned = true
+		// Armed launch failures occur after identity verification and retained
+		// placement/binding, so the PID-reuse fence is complete before cleanup.
+		// Start waiting before containment to avoid an unreaped leader keeping the
+		// target process group observable.
+		wait.Start()
 		return failClosedArmed(spec.Containment, spec.identity, monitor, group, cause)
 	}
 	preIdentityAbort := func(cause error) error {

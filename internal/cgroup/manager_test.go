@@ -403,8 +403,8 @@ func TestMembershipMapsPopulatedEmptyAndUnknown(t *testing.T) {
 
 	fs.setEventsErr(capability.retainedID, errors.New("events unreadable"))
 	got, err := capability.Membership(context.Background())
-	if err != nil {
-		t.Fatalf("Membership() read error surfaced err = %v, want unknown without err", err)
+	if err == nil || !strings.Contains(err.Error(), "events unreadable") {
+		t.Fatalf("Membership() read error = %v, want events unreadable", err)
 	}
 	if got != containment.RetainedMembershipUnknown {
 		t.Fatalf("membership on events read error = %v, want unknown", got)
@@ -542,8 +542,8 @@ func TestDestroyedHeldObjectReportsUnknownMembershipAndUnheld(t *testing.T) {
 
 	fs.recreate(capability.retainedID)
 	membership, err := capability.Membership(context.Background())
-	if err != nil {
-		t.Fatalf("Membership() after destroy error = %v", err)
+	if err == nil {
+		t.Fatalf("Membership() after destroy error = nil, want stale object error")
 	}
 	if membership != containment.RetainedMembershipUnknown {
 		t.Fatalf("Membership() after destroy = %v, want unknown", membership)
@@ -557,8 +557,9 @@ func TestDestroyedHeldObjectReportsUnknownMembershipAndUnheld(t *testing.T) {
 	}
 }
 
-func TestKillEmptiesThenRemoveTombstonesAfterEmptyProof(t *testing.T) {
+func TestKillEmptiesThenRemoveRetiresLeafAfterEmptyProof(t *testing.T) {
 	fs := newFakeCgroupFS()
+	fs.nameCleanupAllowed = true
 	manager := newFakeManager(fs, leafSequence("cg-kill"))
 	capability := acquireCapability(t, manager)
 	fs.setProcs(capability.retainedID, 100, 101)
@@ -573,14 +574,34 @@ func TestKillEmptiesThenRemoveTombstonesAfterEmptyProof(t *testing.T) {
 	if err := capability.Remove(context.Background()); err != nil {
 		t.Fatalf("Remove() after empty error = %v", err)
 	}
-	if !fs.exists(capability.retainedID) {
-		t.Fatalf("empty leaf was unlinked; want tombstone left behind")
+	if fs.exists(capability.retainedID) {
+		t.Fatalf("empty leaf still exists after Remove()")
 	}
 	if !fs.tombstoned(capability.retainedID) {
 		t.Fatalf("empty leaf was not recorded as a tombstone")
 	}
-	if fs.removeCalls != 0 {
-		t.Fatalf("remove calls = %d, want 0", fs.removeCalls)
+	if fs.removeCalls != 1 {
+		t.Fatalf("remove calls = %d, want 1", fs.removeCalls)
+	}
+}
+
+func TestRemoveReacquiresRootLeaseAfterMonitorStyleAcquisition(t *testing.T) {
+	fs := newFakeCgroupFS()
+	fs.nameCleanupAllowed = true
+	manager := newFakeManager(fs, leafSequence("cg-monitor-cleanup"))
+	capability := acquireCapability(t, manager)
+	if err := capability.ReleaseRootLease(); err != nil {
+		t.Fatalf("ReleaseRootLease() error = %v", err)
+	}
+	if fs.lease.holder != nil {
+		t.Fatalf("lease holder after ReleaseRootLease() = %p, want nil", fs.lease.holder)
+	}
+
+	if err := capability.Remove(context.Background()); err != nil {
+		t.Fatalf("Remove() after root lease release error = %v", err)
+	}
+	if fs.exists(capability.retainedID) {
+		t.Fatal("retained leaf still exists after Remove() reacquired root lease")
 	}
 }
 
@@ -623,6 +644,62 @@ func TestRemoveSurfacesCleanupError(t *testing.T) {
 	}
 }
 
+func TestRemoveWithoutRootLeaseReturnsTypedError(t *testing.T) {
+	fs := newFakeCgroupFS()
+	fs.nameCleanupAllowed = true
+	manager := newFakeManager(fs, leafSequence("cg-no-root-lease"))
+	capability := acquireCapability(t, manager)
+	if err := capability.ReleaseRootLease(); err != nil {
+		t.Fatalf("ReleaseRootLease() error = %v", err)
+	}
+
+	err := fs.Remove(context.Background(), capability.object)
+	if !errors.Is(err, ErrRootLeaseUnavailable) {
+		t.Fatalf("fs.Remove() without root lease error = %v, want ErrRootLeaseUnavailable", err)
+	}
+	if !fs.exists(capability.retainedID) {
+		t.Fatalf("leaf was removed without root lease")
+	}
+	if fs.tombstoned(capability.retainedID) {
+		t.Fatalf("leaf was tombstoned without root lease")
+	}
+}
+
+func TestRemoveIdentityReadErrorFailsClosed(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-identity-eperm"))
+	capability := acquireCapability(t, manager)
+	fs.identityAtErr = unix.EPERM
+
+	err := capability.Remove(context.Background())
+	if !errors.Is(err, unix.EPERM) {
+		t.Fatalf("Remove() identity error = %v, want EPERM", err)
+	}
+	if !fs.exists(capability.retainedID) {
+		t.Fatalf("leaf was removed after identity error")
+	}
+	if fs.tombstoned(capability.retainedID) {
+		t.Fatalf("leaf was tombstoned after identity error")
+	}
+}
+
+func TestRemoveIdentityMissingTombstonesAlreadyGoneLeaf(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-identity-missing"))
+	capability := acquireCapability(t, manager)
+	fs.identityAtErr = unix.ENOENT
+
+	if err := capability.Remove(context.Background()); err != nil {
+		t.Fatalf("Remove() identity ENOENT error = %v", err)
+	}
+	if !fs.tombstoned(capability.retainedID) {
+		t.Fatalf("leaf was not tombstoned after identity ENOENT")
+	}
+	if fs.removeCalls != 0 {
+		t.Fatalf("remove calls = %d, want 0", fs.removeCalls)
+	}
+}
+
 func TestRemoveBeforeEmptyRefused(t *testing.T) {
 	fs := newFakeCgroupFS()
 	manager := newFakeManager(fs, leafSequence("cg-populated"))
@@ -638,11 +715,11 @@ func TestRemoveBeforeEmptyRefused(t *testing.T) {
 	}
 }
 
-func TestRemoveTombstonesWhenEmptyReplacementAppearsAfterFinalVerify(t *testing.T) {
+func TestRemoveFailsClosedWhenCleanupCapabilityUnavailableAfterFinalVerify(t *testing.T) {
 	fs := newFakeCgroupFS()
+	fs.nameCleanupAllowed = false
 	manager := newFakeManager(fs, leafSequence("cg-remove-race"))
 	capability := acquireCapability(t, manager)
-	heldIdentity := capability.object.LeafObject()
 	recreated := false
 	fs.onAfterFinalVerify = func(name string) {
 		if recreated {
@@ -653,29 +730,19 @@ func TestRemoveTombstonesWhenEmptyReplacementAppearsAfterFinalVerify(t *testing.
 	}
 
 	err := capability.Remove(context.Background())
-	if err != nil {
-		t.Fatalf("Remove() after empty replacement error = %v", err)
+	if !errors.Is(err, ErrRootLeaseUnavailable) {
+		t.Fatalf("Remove() after cleanup became unavailable error = %v, want ErrRootLeaseUnavailable", err)
 	}
 	if fs.removeCalls != 0 {
 		t.Fatalf("remove calls = %d, want 0", fs.removeCalls)
 	}
 	name := fs.leafName(capability.retainedID)
-	tombstone, ok := fs.tombstones[name]
-	if !ok {
-		t.Fatalf("held empty leaf was not recorded as a tombstone")
-	}
-	if tombstone != heldIdentity {
-		t.Fatalf("tombstone identity = %#v, want held identity %#v", tombstone, heldIdentity)
+	if _, ok := fs.tombstones[name]; ok {
+		t.Fatalf("leaf was tombstoned after cleanup became unavailable")
 	}
 	leaf, err := fs.leaf(capability.retainedID)
 	if err != nil {
 		t.Fatalf("replacement leaf missing: %v", err)
-	}
-	if leaf.object == heldIdentity {
-		t.Fatalf("replacement identity = held identity %#v", heldIdentity)
-	}
-	if tombstone == leaf.object {
-		t.Fatalf("tombstone identity = replacement identity %#v", tombstone)
 	}
 	if leaf.populated() {
 		t.Fatalf("replacement leaf populated = true, want empty")
@@ -972,8 +1039,8 @@ func TestProbeClassifiesStrictSupportAndUnsupportedConditions(t *testing.T) {
 		if !support.Strict() {
 			t.Fatalf("Probe() support = %#v, want strict supported", support)
 		}
-		if fs.killWrites != 2 || fs.removeCalls != 0 || fs.tombstoneCalls != 1 {
-			t.Fatalf("probe kill/remove/tombstone calls = %d/%d/%d, want 2/0/1", fs.killWrites, fs.removeCalls, fs.tombstoneCalls)
+		if fs.killWrites != 2 || fs.removeCalls != 1 || fs.tombstoneCalls != 1 {
+			t.Fatalf("probe kill/remove/tombstone calls = %d/%d/%d, want 2/1/1", fs.killWrites, fs.removeCalls, fs.tombstoneCalls)
 		}
 	})
 
@@ -1143,6 +1210,7 @@ type fakeCgroupFS struct {
 	nextGeneration                  uint64
 	generationAvailable             bool
 	nameCleanupAllowed              bool
+	identityAtErr                   error
 	failRemoveAfterRootLeaseRelease bool
 	removeErr                       error
 	onAfterRootIdentity             func()
@@ -1233,6 +1301,7 @@ func newFakeCgroupFS() *fakeCgroupFS {
 		nextInode:           10,
 		nextGeneration:      10,
 		generationAvailable: true,
+		nameCleanupAllowed:  true,
 	}
 	fs.lease = &fakeRootLease{}
 	return fs
@@ -1433,11 +1502,21 @@ func (fs *fakeCgroupFS) Remove(_ context.Context, object cgroupObject) error {
 	if leaf.populated() {
 		return ErrPopulated
 	}
+	if fs.lease != nil && fs.lease.holder != fs {
+		return fmt.Errorf("%w: retained cgroup root lease is not held", ErrRootLeaseUnavailable)
+	}
 	if fs.onFinalVerify != nil {
 		fs.onFinalVerify(object.LeafName())
 	}
 	currentIdentity, err := fs.identityAt(object.LeafName())
-	if err != nil || !object.LeafObject().durableEqual(currentIdentity) {
+	if err != nil {
+		if retainedLeafMissing(err) {
+			fs.recordTombstone(object.LeafName(), object.LeafObject())
+			return nil
+		}
+		return err
+	}
+	if !object.LeafObject().durableEqual(currentIdentity) {
 		fs.recordTombstone(object.LeafName(), object.LeafObject())
 		return nil
 	}
@@ -1448,8 +1527,7 @@ func (fs *fakeCgroupFS) Remove(_ context.Context, object cgroupObject) error {
 		return unix.EBADF
 	}
 	if !fs.nameCleanupAllowed {
-		fs.recordTombstone(object.LeafName(), object.LeafObject())
-		return nil
+		return fmt.Errorf("%w: fake name cleanup is disabled", ErrRootLeaseUnavailable)
 	}
 	if fs.onUnlink != nil {
 		fs.onUnlink(object.LeafName())
@@ -1457,7 +1535,11 @@ func (fs *fakeCgroupFS) Remove(_ context.Context, object cgroupObject) error {
 	if fs.removeErr != nil {
 		return fs.removeErr
 	}
-	return fs.unlinkName(object.LeafName())
+	if err := fs.unlinkName(object.LeafName()); err != nil {
+		return err
+	}
+	fs.recordTombstone(object.LeafName(), object.LeafObject())
+	return nil
 }
 
 func (fs *fakeCgroupFS) mustCreate(id string) {
@@ -1596,6 +1678,9 @@ func (fs *fakeCgroupFS) objectFor(name string, leaf *fakeLeaf) *fakeCgroupObject
 }
 
 func (fs *fakeCgroupFS) identityAt(name string) (ObjectIdentity, error) {
+	if fs.identityAtErr != nil {
+		return ObjectIdentity{}, fs.identityAtErr
+	}
 	if fs.onPathStat != nil {
 		fs.onPathStat(name)
 	}

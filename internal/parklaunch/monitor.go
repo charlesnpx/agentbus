@@ -483,12 +483,13 @@ func waitMonitorOrKill(process *MonitorProcess) error {
 }
 
 type processWait struct {
-	done  chan struct{}
-	once  sync.Once
-	cmd   *exec.Cmd
-	mu    sync.Mutex
-	err   error
-	state *os.ProcessState
+	done    chan struct{}
+	once    sync.Once
+	cmd     *exec.Cmd
+	mu      sync.Mutex
+	err     error
+	state   *os.ProcessState
+	started bool
 }
 
 func startProcessWait(cmd *exec.Cmd) *processWait {
@@ -508,6 +509,9 @@ func (wait *processWait) Start() {
 	if wait == nil {
 		return
 	}
+	wait.mu.Lock()
+	wait.started = true
+	wait.mu.Unlock()
 	go wait.waitOnce()
 }
 
@@ -573,6 +577,15 @@ func (wait *processWait) DoneClosed() bool {
 	default:
 		return false
 	}
+}
+
+func (wait *processWait) Started() bool {
+	if wait == nil {
+		return true
+	}
+	wait.mu.Lock()
+	defer wait.mu.Unlock()
+	return wait.started
 }
 
 func (wait *processWait) errLocked() error {

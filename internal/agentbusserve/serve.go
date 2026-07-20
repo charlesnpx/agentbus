@@ -3,30 +3,21 @@ package agentbusserve
 import (
 	"context"
 
-	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/internal/served"
 )
 
-type Config struct {
-	StateRoot    string
-	CWD          string
-	Backends     []engine.Backend
-	Registry     *engine.PolicyRegistry
-	Clock        engine.Clock
-	ProcessTable engine.ProcessTable
-}
+type Config = served.Config
 
 func Serve(ctx context.Context, cfg Config) error {
-	server, err := served.New(served.Config{
-		StateRoot:    cfg.StateRoot,
-		CWD:          cfg.CWD,
-		Backends:     cfg.Backends,
-		Registry:     cfg.Registry,
-		Clock:        cfg.Clock,
-		ProcessTable: cfg.ProcessTable,
-	})
+	server, err := served.New(productionServedConfig(cfg))
 	if err != nil {
 		return err
 	}
 	return server.Serve(ctx)
+}
+
+func productionServedConfig(cfg Config) served.Config {
+	cfg.Runtime = custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable)
+	return cfg
 }

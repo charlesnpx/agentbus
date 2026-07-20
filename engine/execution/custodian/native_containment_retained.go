@@ -33,6 +33,7 @@ type retainedNativeContainmentBackend struct {
 	manager    containment.RetainedGroupObject
 	capability retainedGroupPlacementCapability
 	identity   containment.RetainedGroupIdentity
+	group      model.GroupRef
 	bound      bool
 }
 
@@ -106,6 +107,7 @@ func (backend *retainedNativeContainmentBackend) beforeMonitorBind(ctx context.C
 	if err := bound.Validate(); err != nil {
 		return model.GroupRef{}, err
 	}
+	backend.group = bound
 	if releaser, ok := backend.capability.(retainedGroupRootLeaseReleaser); ok {
 		if err := releaser.ReleaseRootLease(); err != nil {
 			return model.GroupRef{}, fmt.Errorf("release retained root lease: %w", err)
@@ -182,10 +184,31 @@ func (backend *retainedNativeContainmentBackend) close(ctx context.Context) erro
 		return nil
 	}
 	var cleanupErr error
-	if membership, err := backend.capability.Membership(ctx); err == nil && membership == containment.RetainedMembershipEmpty {
+	membership, err := backend.capability.Membership(ctx)
+	if err != nil {
+		if goneErr := backend.proveRetainedGroupGone(ctx); goneErr == nil {
+			return backend.capability.Release()
+		} else {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("read retained cgroup membership before cleanup: %w", err), goneErr)
+		}
+	} else if membership == containment.RetainedMembershipEmpty {
 		if removeErr := backend.capability.Remove(ctx); removeErr != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove empty retained cgroup: %w", removeErr))
 		}
+	} else if membership == containment.RetainedMembershipUnknown {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("%w: retained cgroup membership is unknown during cleanup", ErrNativeCustodianUnavailable))
+	} else if membership == containment.RetainedMembershipPresent {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("%w: retained cgroup is still populated during cleanup", ErrNativeCustodianUnavailable))
 	}
 	return errors.Join(cleanupErr, backend.capability.Release())
+}
+
+func (backend *retainedNativeContainmentBackend) proveRetainedGroupGone(ctx context.Context) error {
+	if backend == nil || backend.manager == nil {
+		return fmt.Errorf("%w: retained cgroup manager is unavailable for gone proof", ErrNativeCustodianUnavailable)
+	}
+	if err := backend.group.Validate(); err != nil {
+		return fmt.Errorf("%w: retained cleanup group is invalid: %v", ErrNativeCustodianUnavailable, err)
+	}
+	return proveRetainedGroupAbsent(ctx, backend.manager, backend.group)
 }

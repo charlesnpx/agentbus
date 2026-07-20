@@ -33,3 +33,22 @@ func TestServedAdmissionRuntimeUsesUnavailableCustodian(t *testing.T) {
 		t.Fatal("hasActiveCustodies = true for unavailable runtime")
 	}
 }
+
+func TestServedAdmissionRuntimeUsesInjectedRuntime(t *testing.T) {
+	reason := errors.New("configured runtime unavailable")
+	server := &Server{admissionRuntimeConfig: custodian.NewUnavailableRuntime(reason)}
+
+	runtime := newServedAdmissionRuntime(server)
+	if support := runtime.support(); !errors.Is(support.Reason, reason) {
+		t.Fatalf("runtime support reason = %v, want injected reason", support.Reason)
+	}
+}
+
+func TestServedAdmissionRuntimeNilConfigFailsClosed(t *testing.T) {
+	server := &Server{}
+
+	runtime := newServedAdmissionRuntime(server)
+	if support := runtime.support(); !errors.Is(support.Reason, custodian.ErrSupervisorUnavailable) || support.VerifiedContainment || support.ParkedExec {
+		t.Fatalf("runtime support = %+v, want fail-closed unavailable runtime", support)
+	}
+}

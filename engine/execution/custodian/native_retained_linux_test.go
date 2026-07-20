@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/containment"
 	"golang.org/x/sys/unix"
 )
@@ -135,10 +136,36 @@ func TestNativeRetainedContainAndVerifyKillsTermIgnoringLeader(t *testing.T) {
 	if outcome.Method != model.QuiescenceTermKill && outcome.Method != model.QuiescenceAlreadyAbsent {
 		t.Fatalf("physical method = %s, want %s or %s", outcome.Method, model.QuiescenceTermKill, model.QuiescenceAlreadyAbsent)
 	}
+	requireRetainedLeafGone(t, ctx, running.Ref())
+}
+
+func TestNativeRetainedPreparedAbortReapsLeaderBeforeContainment(t *testing.T) {
+	requireLinuxRetainedConformanceOrSkip(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	native := newNativeCustodianForTest(t, defaultNativeTestParams())
+	spec, resultPath := nativeSimpleLaunchSpec(t)
+
+	prepared, err := native.Prepare(ctx, spec.Exec, spec.LaunchKey)
+	if err != nil {
+		t.Fatalf("NativeCustodian.Prepare() error = %v", err)
+	}
+	ref := prepared.Ref()
+	requireNativeFileAbsent(t, resultPath)
+	requireRetainedMembershipForRef(t, ctx, ref, containment.RetainedMembershipPresent)
+
+	verified, err := prepared.AbortAndVerify(ctx)
+	if err != nil {
+		t.Fatalf("prepared AbortAndVerify() error = %v", err)
+	}
+	if verified == (VerifiedQuiescence{}) {
+		t.Fatal("prepared AbortAndVerify() returned zero attestation")
+	}
+	waitGroupAbsent(t, ref, 5*time.Second)
+	requireRetainedLeafGone(t, ctx, ref)
 }
 
 func TestNativeRetainedMonitorDaemonEOFContainsTargetGroup(t *testing.T) {
-	t.Skip("monitor-side cgroup containment on daemon-EOF is deferred to L3c; the daemon custodian is the correctness authority (see TestNativeRetained* / ContainAndVerify) -- the monitor is an availability aid")
 	requireLinuxRetainedConformanceOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -174,14 +201,8 @@ func TestNativeRetainedMonitorDaemonEOFContainsTargetGroup(t *testing.T) {
 		t.Fatalf("monitor Wait() error = %v, want retained containment success", err)
 	}
 	waitPIDAbsent(t, result.GrandchildPID, 5*time.Second)
-
-	final := running.ContainPhysical(ctx)
-	if !final.Absent() {
-		t.Fatalf("final ContainAndVerify() = %+v, want Absent after monitor containment", final)
-	}
-	if final.Method != model.QuiescenceAlreadyAbsent {
-		t.Fatalf("final physical method = %s, want already_absent after monitor containment", final.Method)
-	}
+	waitGroupAbsent(t, running.Ref(), 5*time.Second)
+	requireRetainedLeafGone(t, ctx, running.Ref())
 }
 
 func requireRetainedBackendForTest(t *testing.T, running *NativeRunningProcess) {
@@ -224,5 +245,38 @@ func requireRunningRetainedMembership(t *testing.T, ctx context.Context, running
 	}
 	if got != want {
 		t.Fatalf("retained Membership() = %v, want %v", got, want)
+	}
+}
+
+func requireRetainedMembershipForRef(t *testing.T, ctx context.Context, ref model.GroupRef, want containment.RetainedGroupMembership) {
+	t.Helper()
+	manager, err := cgroup.New("")
+	if err != nil {
+		t.Fatalf("cgroup.New(\"\") error = %v", err)
+	}
+	defer manager.Close()
+	capability, err := manager.AcquireRetainedGroup(ctx, ref, time.Now())
+	if err != nil {
+		t.Fatalf("AcquireRetainedGroup(%s) error = %v", ref.RetainedID, err)
+	}
+	defer capability.Release()
+	got, err := capability.Membership(ctx)
+	if err != nil {
+		t.Fatalf("retained Membership() error = %v", err)
+	}
+	if got != want {
+		t.Fatalf("retained Membership() = %v, want %v", got, want)
+	}
+}
+
+func requireRetainedLeafGone(t *testing.T, ctx context.Context, ref model.GroupRef) {
+	t.Helper()
+	manager, err := cgroup.New("")
+	if err != nil {
+		t.Fatalf("cgroup.New(\"\") error = %v", err)
+	}
+	defer manager.Close()
+	if err := manager.ProveRetainedGroupAbsent(ctx, ref); err != nil {
+		t.Fatalf("retained leaf still exists or cannot be proven gone: %v", err)
 	}
 }

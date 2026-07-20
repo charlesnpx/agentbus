@@ -25,11 +25,12 @@ import (
 )
 
 var (
-	ErrUnsupported   = errors.New("cgroup unsupported")
-	ErrInvalid       = errors.New("cgroup invalid")
-	ErrPopulated     = errors.New("cgroup populated")
-	errLeafCollision = errors.New("cgroup leaf collision")
-	errProcessGone   = errors.New("process gone")
+	ErrUnsupported          = errors.New("cgroup unsupported")
+	ErrInvalid              = errors.New("cgroup invalid")
+	ErrPopulated            = errors.New("cgroup populated")
+	ErrRootLeaseUnavailable = errors.New("cgroup root lease unavailable")
+	errLeafCollision        = errors.New("cgroup leaf collision")
+	errProcessGone          = errors.New("process gone")
 )
 
 var readProcessClaimForPlacement = procgroup.ReadProcessClaim
@@ -678,7 +679,7 @@ func (capability *Capability) Membership(ctx context.Context) (containment.Retai
 	}
 	events, err := capability.fs.ReadEvents(ctx, capability.object)
 	if err != nil {
-		return containment.RetainedMembershipUnknown, nil
+		return containment.RetainedMembershipUnknown, err
 	}
 	if events.Populated {
 		return containment.RetainedMembershipPresent, nil
@@ -906,10 +907,27 @@ func (capability *Capability) removeLocked(ctx context.Context) error {
 	if membership != containment.RetainedMembershipEmpty {
 		return ErrPopulated
 	}
+	if err := capability.ensureRootLeaseForRemoveLocked(ctx); err != nil {
+		return err
+	}
 	if err := capability.fs.Remove(ctx, capability.object); err != nil {
 		return err
 	}
 	capability.removed = true
+	return nil
+}
+
+func (capability *Capability) ensureRootLeaseForRemoveLocked(ctx context.Context) error {
+	if capability == nil || capability.manager == nil || capability.fs == nil || capability.object == nil {
+		return nil
+	}
+	root, err := capability.fs.RootIdentity(ctx)
+	if err != nil {
+		return err
+	}
+	if !root.RootObject.durableEqual(capability.object.RootObject()) {
+		return fmt.Errorf("%w: cgroup root identity mismatch before remove", ErrUnsupported)
+	}
 	return nil
 }
 

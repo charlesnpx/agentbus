@@ -31,9 +31,17 @@ func newServedAdmissionRuntime(server *Server) *servedAdmissionRuntime {
 			return runtime
 		}
 	}
-	return &servedAdmissionRuntime{
-		runtime: custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable),
+	if server == nil {
+		return newServedAdmissionRuntimeFromRuntime(custodian.Runtime{})
 	}
+	return newServedAdmissionRuntimeFromRuntime(server.admissionRuntimeConfig)
+}
+
+func newServedAdmissionRuntimeFromRuntime(runtime custodian.Runtime) *servedAdmissionRuntime {
+	if runtime.Process() == nil {
+		runtime = custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable)
+	}
+	return &servedAdmissionRuntime{runtime: runtime}
 }
 
 func (s *servedAdmissionRuntime) verifiedContainmentSupported(ctx context.Context) error {

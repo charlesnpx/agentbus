@@ -4,11 +4,37 @@ package cgroup
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestRealFSRemoveWithoutRootLeaseFailsClosed(t *testing.T) {
+	rootPath := t.TempDir()
+	leaffd, err := unix.Open(rootPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("open leaf fd: %v", err)
+	}
+	defer unix.Close(leaffd)
+
+	root := ObjectIdentity{Device: 1, Inode: 2, Generation: "root"}
+	leaf := ObjectIdentity{Device: 1, Inode: 3, Generation: "leaf"}
+	fs := &realFS{root: rootPath}
+	object := &realObject{
+		rootPath: rootPath,
+		leafName: "cg-no-root-lease",
+		leaffd:   leaffd,
+		root:     root,
+		leaf:     leaf,
+	}
+
+	err = fs.Remove(context.Background(), object)
+	if !errors.Is(err, ErrRootLeaseUnavailable) {
+		t.Fatalf("Remove() without root lease error = %v, want ErrRootLeaseUnavailable", err)
+	}
+}
 
 func TestRealFSRemoveTombstonesMissingLeafWithoutReentrantLock(t *testing.T) {
 	rootPath := t.TempDir()

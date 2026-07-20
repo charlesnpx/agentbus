@@ -219,6 +219,29 @@ func TestPreparedAbortAndVerifyPreventsBackendExecAndProvesAbsent(t *testing.T) 
 	}
 }
 
+func TestPreparedAbortStartsWaitBeforeContainment(t *testing.T) {
+	wait := startHeldProcessWait(nil)
+	group := syntheticGroupRef(4242, 4243)
+	containment := &waitOrderingContainment{wait: wait, want: group}
+	prepared := &Prepared{
+		state:       preparedStatePrepared,
+		group:       group,
+		wait:        wait,
+		containment: containment,
+		identity:    absentIdentityReader{},
+	}
+
+	if err := prepared.AbortAndVerify(context.Background()); err != nil {
+		t.Fatalf("AbortAndVerify() error = %v", err)
+	}
+	if !containment.waitStartedAtContain {
+		t.Fatal("containment observed wait not started")
+	}
+	if got := containment.calls; got != 1 {
+		t.Fatalf("containment calls = %d, want 1", got)
+	}
+}
+
 func TestPreparedChannelLossBeforeReleaseContainsTarget(t *testing.T) {
 	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
 	fixture.spec.hooks.beforeRelease = func(snapshot launchControlSnapshot) error {
@@ -1419,6 +1442,36 @@ type mismatchClassifyingReader struct {
 
 func (reader mismatchClassifyingReader) ClassifyProcess(procgroup.ProcessClaim) model.ProcessIdentityObservation {
 	return model.ProcessIdentityReused
+}
+
+type absentIdentityReader struct{}
+
+func (absentIdentityReader) ReadProcessClaim(pid int) (procgroup.ProcessClaim, error) {
+	return procgroup.ProcessClaim{}, fmt.Errorf("unexpected process claim read for pid %d", pid)
+}
+
+func (absentIdentityReader) ClassifyProcess(procgroup.ProcessClaim) model.ProcessIdentityObservation {
+	return model.ProcessIdentityMissing
+}
+
+func (absentIdentityReader) ClassifyGroup(procgroup.GroupClaim) model.GroupExistenceObservation {
+	return model.GroupAbsent
+}
+
+type waitOrderingContainment struct {
+	wait                 *processWait
+	want                 model.GroupRef
+	calls                int
+	waitStartedAtContain bool
+}
+
+func (containment *waitOrderingContainment) Contain(_ context.Context, group model.GroupRef) error {
+	containment.calls++
+	containment.waitStartedAtContain = containment.wait.Started()
+	if !group.Equal(containment.want) {
+		return fmt.Errorf("containment group = %+v, want %+v", group, containment.want)
+	}
+	return nil
 }
 
 type workerOnlyIdentityReader struct {

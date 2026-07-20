@@ -494,13 +494,19 @@ func (fs *realFS) Remove(ctx context.Context, object cgroupObject) error {
 	}
 	held, releaseRoot, ok := fs.acquireHeldRoot(realObject.root)
 	if !ok {
-		fs.recordTombstone(realObject.leafName, realObject.leaf)
-		return nil
+		return fmt.Errorf("%w: retained cgroup root lease is not held", ErrRootLeaseUnavailable)
 	}
 	defer releaseRoot()
 	rootfd := held.fd
 	current, err := identityAt(rootfd, realObject.leafName)
-	if err != nil || !realObject.leaf.durableEqual(current) {
+	if err != nil {
+		if retainedLeafMissing(err) {
+			fs.recordTombstone(realObject.leafName, realObject.leaf)
+			return nil
+		}
+		return err
+	}
+	if !realObject.leaf.durableEqual(current) {
 		fs.recordTombstone(realObject.leafName, realObject.leaf)
 		return nil
 	}

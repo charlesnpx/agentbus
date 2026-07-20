@@ -47,9 +47,13 @@ func TestArchitectureImportGuards(t *testing.T) {
 			},
 		},
 		{
-			name: "agentbus command does not import served",
+			name: "agentbus command reaches served only through agentbusserve",
 			dir:  filepath.Join(root, "cmd", "agentbus"),
 			forbidden: []forbiddenImport{
+				// This guard is direct-import-only: cmd/agentbus composes through
+				// internal/agentbusserve, which constructs the completed custodian
+				// Runtime and passes it into served. Runtime handoff behavior is
+				// covered by served and agentbusserve tests.
 				exactImport(modulePath + "/internal/served"),
 			},
 		},

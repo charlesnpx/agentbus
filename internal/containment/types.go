@@ -36,6 +36,14 @@ type RetainedGroupCapability interface {
 	Release() error
 }
 
+// RetainedGroupCleanup is implemented by retained capabilities that can remove
+// their held object after absence has been proven. Cleanup status is separate
+// from absence proof, so callers must surface cleanup errors instead of treating
+// them as successful teardown.
+type RetainedGroupCleanup interface {
+	Remove(ctx context.Context) error
+}
+
 type RetainedGroupIdentity struct {
 	RetainedID     string
 	KernelDomainID model.KernelDomainID
@@ -362,10 +370,11 @@ const (
 
 // Outcome is deliberately not an attestation or quiescence certificate.
 type Outcome struct {
-	Kind     OutcomeKind
-	Reason   UnprovableReason
-	Decision model.ContainmentDecision
-	Err      error
+	Kind       OutcomeKind
+	Reason     UnprovableReason
+	Decision   model.ContainmentDecision
+	Err        error
+	CleanupErr error
 }
 
 func AbsentOutcome(decision model.ContainmentDecision) Outcome {

@@ -1057,6 +1057,29 @@ func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing
 	}
 }
 
+func TestRetainedNativeContainmentBackendClosePropagatesRemoveFailure(t *testing.T) {
+	manager := newFakeNativeRetainedManager()
+	capabilityRaw, err := manager.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now())
+	if err != nil {
+		t.Fatalf("AcquireRetainedGroup() error = %v", err)
+	}
+	capability := capabilityRaw.(*fakeNativeRetainedCapability)
+	removeErr := errors.New("injected retained remove failure")
+	capability.leaf.removeErr = removeErr
+	backend := &retainedNativeContainmentBackend{capability: capability}
+
+	err = backend.close(context.Background())
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("backend.close() error = %v, want remove failure", err)
+	}
+	if capability.leaf.releases != 1 {
+		t.Fatalf("capability releases = %d, want 1", capability.leaf.releases)
+	}
+	if capability.leaf.removeCalls != 1 {
+		t.Fatalf("remove calls = %d, want 1", capability.leaf.removeCalls)
+	}
+}
+
 func TestNativeRetainedWaitCompletesWithoutLeaderRetention(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -2028,6 +2051,7 @@ type fakeNativeRetainedLeaf struct {
 	domain            model.KernelDomainID
 	membership        containment.RetainedGroupMembership
 	ignoreTerm        bool
+	removeErr         error
 	placedPIDs        []int
 	openCalls         int
 	termCalls         int
@@ -2193,7 +2217,7 @@ func (capability *fakeNativeRetainedCapability) Membership(context.Context) (con
 	capability.manager.mu.Lock()
 	defer capability.manager.mu.Unlock()
 	if capability.leaf.removed {
-		return containment.RetainedMembershipUnknown, nil
+		return containment.RetainedMembershipUnknown, fmt.Errorf("%w: retained leaf was removed", ErrNativeCustodianUnavailable)
 	}
 	return capability.leaf.membership, nil
 }
@@ -2256,10 +2280,13 @@ func (capability *fakeNativeRetainedCapability) Remove(context.Context) error {
 	if capability.leaf.membership != containment.RetainedMembershipEmpty {
 		return fmt.Errorf("retained leaf still populated")
 	}
+	capability.leaf.removeCalls++
+	if capability.leaf.removeErr != nil {
+		return capability.leaf.removeErr
+	}
 	if capability.leaf.removed {
 		return nil
 	}
-	capability.leaf.removeCalls++
 	capability.leaf.removed = true
 	return nil
 }

@@ -14,6 +14,10 @@ type Engine struct {
 	Clock          Clock
 	Continuity     ContinuityWitness
 	RetainedObject RetainedGroupObject
+	// CleanupRetainedObject removes the retained object after an absent outcome
+	// has been proven. Cleanup errors are attached to the absent Outcome and do
+	// not substitute for absence proof.
+	CleanupRetainedObject bool
 }
 
 type containmentState struct {
@@ -25,7 +29,7 @@ type containmentState struct {
 	matchingLeaderObservedAt time.Time
 }
 
-func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params Params) Outcome {
+func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params Params) (outcome Outcome) {
 	if err := target.Validate(); err != nil {
 		return UnprovableOutcome(ReasonInvalidInput, "", err)
 	}
@@ -45,6 +49,11 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 		return outcome
 	}
 	defer state.releaseRetainedObject()
+	if engine.CleanupRetainedObject {
+		defer func() {
+			outcome = engine.cleanupRetainedObject(ctx, state, outcome)
+		}()
+	}
 	observation, _, state, authorization, outcome := engine.observeAuthorizeWithCoherenceReread(ctx, target, params, state, false)
 	if outcome.Kind != 0 {
 		return outcome
@@ -62,6 +71,21 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 	default:
 		return UnprovableOutcome(ReasonUnexpectedDecision, authorization.Decision, nil)
 	}
+}
+
+func (engine Engine) cleanupRetainedObject(ctx context.Context, state containmentState, outcome Outcome) Outcome {
+	if !outcome.Absent() || state.retainedObject == nil {
+		return outcome
+	}
+	cleanup, ok := state.retainedObject.(RetainedGroupCleanup)
+	if !ok || cleanup == nil {
+		outcome.CleanupErr = errors.Join(outcome.CleanupErr, errors.New("retained object cleanup is not supported"))
+		return outcome
+	}
+	if err := cleanup.Remove(ctx); err != nil {
+		outcome.CleanupErr = errors.Join(outcome.CleanupErr, err)
+	}
+	return outcome
 }
 
 func (engine Engine) acquireRetainedObject(ctx context.Context, target model.GroupRef) (containmentState, Outcome) {

@@ -137,6 +137,9 @@ func TestCgroupV2RetainedCapabilityLifecycleConformance(t *testing.T) {
 	if err := capOpen.Remove(ctx); err != nil {
 		t.Fatalf("RETIRE capOpen.Remove() error = %v", err)
 	}
+	if err := manager.ProveRetainedGroupAbsent(ctx, target); err != nil {
+		t.Fatalf("RETIRE retained leaf still exists after Remove(): %v", err)
+	}
 	if err := capOpen.Release(); err != nil {
 		t.Fatalf("RETIRE capOpen.Release() error = %v", err)
 	}

@@ -24,6 +24,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/internal/protocol"
@@ -75,6 +76,7 @@ type Config struct {
 	ReapInterval        time.Duration
 	GCInterval          time.Duration
 	ReapTickInterval    time.Duration
+	Runtime             custodian.Runtime
 }
 
 type tickerSource struct {
@@ -136,6 +138,7 @@ type Server struct {
 	admissionSubmission          *servedSubmissionCoordinator
 	admissionRuntime             *servedAdmissionRuntime
 	admissionRuntimeFactory      func(*Server) *servedAdmissionRuntime
+	admissionRuntimeConfig       custodian.Runtime
 	admissionDaemonBootOnce      sync.Once
 	admissionDaemonBootRef       model.BootRef
 	admissionDaemonBootRefErr    error
@@ -310,38 +313,39 @@ func New(cfg Config) (*Server, error) {
 		binaryIdentityProbe = statBinaryIdentity
 	}
 	return &Server{
-		stateRoot:           root,
-		cwd:                 cwd,
-		socketPath:          socketPath,
-		tokenPath:           tokenPath,
-		token:               token,
-		backends:            backends,
-		registry:            registry,
-		clock:               clock,
-		processes:           processes,
-		processGroups:       cfg.ProcessGroups,
-		cancelGrace:         cfg.CancelGrace,
-		cancelWaiter:        cfg.CancelWaiter,
-		idleTimeout:         idleTimeout,
-		idleCheckInterval:   idleCheck,
-		binaryIdentityProbe: binaryIdentityProbe,
-		inlineResultCap:     inlineResultCap,
-		leaseDuration:       leaseDuration,
-		heartbeatInterval:   heartbeatInterval,
-		reapInterval:        reapInterval,
-		gcInterval:          gcInterval,
-		reapTickInterval:    reapTickInterval,
-		reapTickFactory:     newTickerSource,
-		safetyLatch:         NewSafetyLatch(),
-		safetyDrainTimeout:  defaultSafetyDrain,
-		sessions:            make(map[string]*sessionState),
-		stores:              make(map[string]*engine.Store),
-		storesByKey:         make(map[string]*engine.Store),
-		jobStores:           make(map[string]*engine.Store),
-		admissionJobs:       make(map[string]struct{}),
-		admissionEffectMu:   make(map[string]*sync.Mutex),
-		activeJobs:          make(map[string]*activeJob),
-		lastActivity:        clock.Now().UTC(),
+		stateRoot:              root,
+		cwd:                    cwd,
+		socketPath:             socketPath,
+		tokenPath:              tokenPath,
+		token:                  token,
+		backends:               backends,
+		registry:               registry,
+		clock:                  clock,
+		processes:              processes,
+		processGroups:          cfg.ProcessGroups,
+		cancelGrace:            cfg.CancelGrace,
+		cancelWaiter:           cfg.CancelWaiter,
+		idleTimeout:            idleTimeout,
+		idleCheckInterval:      idleCheck,
+		binaryIdentityProbe:    binaryIdentityProbe,
+		inlineResultCap:        inlineResultCap,
+		leaseDuration:          leaseDuration,
+		heartbeatInterval:      heartbeatInterval,
+		reapInterval:           reapInterval,
+		gcInterval:             gcInterval,
+		reapTickInterval:       reapTickInterval,
+		reapTickFactory:        newTickerSource,
+		safetyLatch:            NewSafetyLatch(),
+		safetyDrainTimeout:     defaultSafetyDrain,
+		sessions:               make(map[string]*sessionState),
+		stores:                 make(map[string]*engine.Store),
+		storesByKey:            make(map[string]*engine.Store),
+		jobStores:              make(map[string]*engine.Store),
+		admissionJobs:          make(map[string]struct{}),
+		admissionEffectMu:      make(map[string]*sync.Mutex),
+		admissionRuntimeConfig: cfg.Runtime,
+		activeJobs:             make(map[string]*activeJob),
+		lastActivity:           clock.Now().UTC(),
 	}, nil
 }
 

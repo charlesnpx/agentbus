@@ -404,7 +404,7 @@ func (custodian *NativeCustodian) containRecoveredPhysical(ctx context.Context, 
 	if continuity, ok := capability.(containment.ContinuityWitness); ok {
 		witness = continuity
 	}
-	return containPhysical(ctx, group, custodian.options.ContainmentParams, witness, recoveredRetainedObject{capability: capability})
+	return containPhysicalWithRetainedCleanup(ctx, group, custodian.options.ContainmentParams, witness, recoveredRetainedObject{capability: capability})
 }
 
 func retainedGroupMissing(err error) bool {
@@ -956,8 +956,11 @@ func (process *NativeRunningProcess) containAndVerify(ctx context.Context) Physi
 		return outcome
 	}
 	finalOutcome, _, err := process.finalizeAbsentLocked(ctx, outcome)
-	if err != nil && !process.finalized {
-		return unprovablePhysical(process.group, containment.ReasonProbeUnprovable, outcome.Decision, err)
+	if err != nil {
+		if !process.finalized {
+			return unprovablePhysical(process.group, containment.ReasonProbeUnprovable, outcome.Decision, err)
+		}
+		finalOutcome.Err = errors.Join(finalOutcome.Err, err)
 	}
 	return finalOutcome
 }
@@ -1220,8 +1223,11 @@ func (real RealContainment) Contain(ctx context.Context, group model.GroupRef) e
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrPhysicalContainment, err)
 	}
-	outcome := containPhysical(ctx, group, bound.Params, bound.Witness, bound.RetainedObject)
+	outcome := containPhysicalWithRetainedCleanup(ctx, group, bound.Params, bound.Witness, bound.RetainedObject)
 	if outcome.Absent() {
+		if outcome.Err != nil {
+			return fmt.Errorf("%w: cleanup retained object after absence proof: %v", ErrPhysicalContainment, outcome.Err)
+		}
 		return nil
 	}
 	if outcome.Err != nil {
@@ -1263,6 +1269,14 @@ func (native *nativeLaunchContainment) Contain(ctx context.Context, group model.
 }
 
 func containPhysical(ctx context.Context, group model.GroupRef, params containment.Params, witness containment.ContinuityWitness, retainedObject containment.RetainedGroupObject) PhysicalOutcome {
+	return containPhysicalWithCleanup(ctx, group, params, witness, retainedObject, false)
+}
+
+func containPhysicalWithRetainedCleanup(ctx context.Context, group model.GroupRef, params containment.Params, witness containment.ContinuityWitness, retainedObject containment.RetainedGroupObject) PhysicalOutcome {
+	return containPhysicalWithCleanup(ctx, group, params, witness, retainedObject, true)
+}
+
+func containPhysicalWithCleanup(ctx context.Context, group model.GroupRef, params containment.Params, witness containment.ContinuityWitness, retainedObject containment.RetainedGroupObject, cleanupRetained bool) PhysicalOutcome {
 	var retainedSignals *retainedSignalRecorder
 	if retainedObject != nil {
 		retainedSignals = &retainedSignalRecorder{}
@@ -1272,11 +1286,12 @@ func containPhysical(ctx context.Context, group model.GroupRef, params containme
 		}
 	}
 	engine := containment.Engine{
-		Observer:       nativeObserverFor(witness),
-		Signaler:       nativeSignalerFor(witness),
-		Clock:          containment.RealClock{},
-		Continuity:     witness,
-		RetainedObject: retainedObject,
+		Observer:              nativeObserverFor(witness),
+		Signaler:              nativeSignalerFor(witness),
+		Clock:                 containment.RealClock{},
+		Continuity:            witness,
+		RetainedObject:        retainedObject,
+		CleanupRetainedObject: cleanupRetained,
 	}
 	outcome := engine.Contain(ctx, group, params)
 	if outcome.Unprovable() {
@@ -1309,6 +1324,7 @@ func containPhysical(ctx context.Context, group model.GroupRef, params containme
 			Group:    group,
 			Method:   method,
 			Decision: outcome.Decision,
+			Err:      outcome.CleanupErr,
 		}
 	}
 	absent, err := stableIndependentAbsent(ctx, group)
@@ -1323,6 +1339,7 @@ func containPhysical(ctx context.Context, group model.GroupRef, params containme
 		Group:    group,
 		Method:   methodForDecision(outcome.Decision),
 		Decision: outcome.Decision,
+		Err:      outcome.CleanupErr,
 	}
 }
 
@@ -1402,6 +1419,17 @@ func (capability retainedSignalTrackingCapability) Kill(ctx context.Context) (co
 	result, err := capability.RetainedGroupCapability.Kill(ctx)
 	capability.recorder.recordKill(result, err)
 	return result, err
+}
+
+func (capability retainedSignalTrackingCapability) Remove(ctx context.Context) error {
+	if capability.RetainedGroupCapability == nil {
+		return fmt.Errorf("%w: retained capability is nil", ErrNativeCustodianUnavailable)
+	}
+	cleanup, ok := capability.RetainedGroupCapability.(containment.RetainedGroupCleanup)
+	if !ok || cleanup == nil {
+		return fmt.Errorf("%w: retained capability does not support cleanup", ErrNativeCustodianUnavailable)
+	}
+	return cleanup.Remove(ctx)
 }
 
 func nativeObserverFor(witness containment.ContinuityWitness) containment.Observer {
@@ -1508,10 +1536,11 @@ func attestPhysicalOutcome(issuer quiescenceAttestationIssuer, outcome PhysicalO
 	if issuer == nil {
 		return VerifiedQuiescence{}, ErrInvalidAttestation
 	}
-	return issuer.AttestQuiescence(PhysicalQuiescence{
+	verified, err := issuer.AttestQuiescence(PhysicalQuiescence{
 		Group:  outcome.Group,
 		Method: outcome.Method,
 	})
+	return verified, errors.Join(err, outcome.Err)
 }
 
 func physicalOutcomeError(outcome PhysicalOutcome) error {
