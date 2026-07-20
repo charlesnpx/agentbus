@@ -236,6 +236,11 @@ test reaches an unsafe later state, the command wasn't run, or the ledger omits 
   tokenless; NativeCustodian.Prepare returns the new impl; migrate LaunchController/adapters/unavailable/
   fakes/tests; remove ReleaseSecret from model/launch/served/submission; delete old externally-credentialed
   path; secret lives ONLY in the native park protocol. Architecture test enforces the removals.
+- **R3B** MUST-ADDRESS (from R2B OS/cgroup review, deferred here as containment-engine scope): (F-C) the
+  retained-cgroup absence PROOF must be process-group emptiness `kill(-pgid,0)==ESRCH`, NOT cgroup-leaf-empty
+  alone; explicit cgroup-migration/`setsid` escape is out-of-scope per P0C#2 but the proof must be sound and
+  the boundary documented. (F-D) PID-reuse-before-cgroup-placement: place the worker into the retained cgroup
+  before it can be reaped / add a PID-reuse fence, so numeric-PID placement cannot bind the wrong process.
 - **R3B** native monitor + custody lifecycle: port hidden `internal-monitor` cmd + hidden parked-worker
   dispatch + native defaults at a LOWER package (`engine/execution/custodian/native_defaults_linux.go` or
   `internal/nativecustody/config.go`); monitor spawning + FD ownership + daemon-control-EOF; finish
