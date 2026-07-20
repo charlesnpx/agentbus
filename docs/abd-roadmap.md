@@ -4,8 +4,8 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0=23275e1. R0T=2185af1(+fix 084f8d3). R1=e360d8e(+roadmap 3137c94 +fix this commit;
-sol review CLOSED). All pushed to origin/abd-authority. Next: R2A (packet staged).
+STATUS: EXECUTING. R0=23275e1. R0T=2185af1(+084f8d3). R1=e360d8e(+3137c94+9560a47; review CLOSED). R2A
+committed (held-launch contracts+state machine+race tests; additive). All pushed. sol review of R2A next.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -287,7 +287,15 @@ see the R4A contract block.)
   strict-E2E harness launched: worker job_20260720T151723000000000Z_000002 (codex gpt-5.5 xhigh, --write).
   Packet: ~/tmp/delegate-packets/abd-R0T-real-serve-harness.md. Expected sentinel
   strict_native_runtime_unavailable; opt-in gate abd_strict_e2e + AGENTBUS_RUN_STRICT_E2E=1.
-- 2026-07-20 R1-fix (this commit): closed sol review of R1 (verdict was FIX-REQUIRED; core R1 confirmed
+- 2026-07-20 R2A (this commit): held-launch contracts + race tests, ADDITIVE (3 new files, no existing files
+  touched). engine/execution/custodian/held_launch.go: ReleaseOutcome{DefinitelyNotSent,Accepted,Unknown}
+  (C4, invalid->Unknown fail-closed); PrepareSpec{Exec,LaunchKey,ReleaseSecret}+HeldLaunch{Ref,Release(ctx)
+  tokenless,AbortAndVerify} (C2); HeldLaunchCore pure state machine over injected HeldLaunchEffects with
+  opMu-serialized one-use Release/Abort/Close + HandleControlLoss (C3 states + race table). held_launch_test.go
+  race table; docs/abd-fd-ownership.md (FD matrix + compile-time assertions). NativeCustodian.Prepare NOT
+  implemented; production unavailable. Verify: build/linux/gofmt/vet=0; custodian held_launch -race -count=3
+  (33 PASS, 0 races); macOS go test ./...=0; Docker cgroup-v2 -p 1 full=0 + R0T RED=0. sol review pending.
+- 2026-07-20 R1-fix (9560a47): closed sol review of R1 (verdict was FIX-REQUIRED; core R1 confirmed
   correct). F2 strict frame decode now requires explicit current GroupRef fields (pointers; nil->ErrMalformed)
   + Validate(); removed backward-compat defaulting (no legacy). F1 deleted vacuous upgrade tests; added
   behavioral served recovery tests: bound obligation => exactly one ContainAndVerify(cause=Recovery) on the
