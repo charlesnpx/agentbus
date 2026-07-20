@@ -1,6 +1,9 @@
 # AB-D FD Ownership Matrix
 
 R2A is contract-only. R2B/R3B enforce these with real descriptor operations.
+The `heldLaunch*FD` constants in `held_launch.go` are documentation
+placeholders only; they do not enforce runtime descriptor inheritance until the
+R2B/R3B allowlist and descriptor-building tests attach to real FD code.
 
 | State | Daemon | Monitor | Worker | Backend |
 | --- | --- | --- | --- | --- |

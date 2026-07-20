@@ -4,8 +4,8 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0=23275e1. R0T=2185af1(+084f8d3). R1=e360d8e(+3137c94+9560a47; review CLOSED). R2A
-committed (held-launch contracts+state machine+race tests; additive). All pushed. sol review of R2A next.
+STATUS: EXECUTING. R0=23275e1. R0T(+084f8d3). R1=9560a47(review CLOSED). R2A=ac3e880(+fix this commit; sol
+review CLOSED — 3 High concurrency-design flaws fixed). All pushed. Next: R2B (real parklaunch two-phase; TWO reviewers).
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -287,7 +287,17 @@ see the R4A contract block.)
   strict-E2E harness launched: worker job_20260720T151723000000000Z_000002 (codex gpt-5.5 xhigh, --write).
   Packet: ~/tmp/delegate-packets/abd-R0T-real-serve-harness.md. Expected sentinel
   strict_native_runtime_unavailable; opt-in gate abd_strict_e2e + AGENTBUS_RUN_STRICT_E2E=1.
-- 2026-07-20 R2A (this commit): held-launch contracts + race tests, ADDITIVE (3 new files, no existing files
+- 2026-07-20 R2A-fix (this commit): closed sol review of R2A (3 High concurrency-design flaws). H1
+  normalizeReleaseTuple: Accepted requires non-nil running + no err else contradiction->Unknown->contain; no
+  lost live handle. H2 control-loss preemption: Release no longer holds opMu across SendRelease; cancelable
+  releaseCtx stored; HandleControlLoss trips releaseCtrlLost + cancels ctx BEFORE opMu so a hung release-ack
+  unblocks and exactly one containment runs (state!=Releasing guard prevents double-contain; Abort/Close
+  refuse during Releasing). H3 failed ContainAndVerify stays retryable Containing (never false-finalize);
+  HandleControlLoss handles Containing->retry. M9 FD constants marked doc placeholders + TODO(R2B/R3B).
+  Verify: build/linux/gofmt/vet=0; custodian held_launch -race -count=5 (100 pass, 0 races, no hang); macOS
+  go test ./...=0; Docker -p 1 full=0 + R0T RED=0. Reviewed diff (both release/control-loss interleavings);
+  R2B dual review will further exercise. sol review CLOSED.
+- 2026-07-20 R2A (ac3e880): held-launch contracts + race tests, ADDITIVE (3 new files, no existing files
   touched). engine/execution/custodian/held_launch.go: ReleaseOutcome{DefinitelyNotSent,Accepted,Unknown}
   (C4, invalid->Unknown fail-closed); PrepareSpec{Exec,LaunchKey,ReleaseSecret}+HeldLaunch{Ref,Release(ctx)
   tokenless,AbortAndVerify} (C2); HeldLaunchCore pure state machine over injected HeldLaunchEffects with

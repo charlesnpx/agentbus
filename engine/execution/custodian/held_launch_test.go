@@ -16,6 +16,7 @@ import (
 var (
 	errHeldLaunchAckLost    = errors.New("release ack lost")
 	errHeldLaunchDaemonDied = errors.New("daemon died before release ack")
+	errHeldLaunchContain    = errors.New("contain failed")
 )
 
 func TestReleaseOutcomeStringAndValidity(t *testing.T) {
@@ -94,16 +95,17 @@ func TestHeldLaunchRaceReleaseVsReleaseExactlyOneSends(t *testing.T) {
 	launch := prepareHeldLaunchForTest(t, ctx, spec, effects)
 
 	results := make(chan releaseResult, 2)
-	go func() {
-		running, outcome, err := launch.Release(ctx)
-		results <- releaseResult{running: running, outcome: outcome, err: err}
-	}()
-	waitClosed(t, effects.sendStarted, "first release send start")
-	go func() {
-		running, outcome, err := launch.Release(ctx)
-		results <- releaseResult{running: running, outcome: outcome, err: err}
-	}()
+	start := newConcurrentStartGate(2)
+	for range 2 {
+		go func() {
+			start.wait()
+			running, outcome, err := launch.Release(ctx)
+			results <- releaseResult{running: running, outcome: outcome, err: err}
+		}()
+	}
 
+	start.release(t, "release contenders ready")
+	waitClosed(t, effects.sendStarted, "release send start")
 	close(allowSend)
 	first := <-results
 	second := <-results
@@ -113,44 +115,53 @@ func TestHeldLaunchRaceReleaseVsReleaseExactlyOneSends(t *testing.T) {
 	}
 }
 
-func TestHeldLaunchRaceReleaseVsAbortBeforeSendAbortWins(t *testing.T) {
+func TestHeldLaunchRaceReleaseVsAbortBeforeSendHasSingleWinner(t *testing.T) {
 	ctx := context.Background()
 	spec := heldLaunchTestSpec(t)
 	group := heldLaunchTestGroup(t, spec.LaunchKey)
-	allowAbort := make(chan struct{})
 	effects := newHeldLaunchFakeEffects(t, group)
-	effects.abortStarted = make(chan struct{})
-	effects.allowAbort = allowAbort
+	effects.releaseOutcome = ReleaseAccepted
+	effects.releaseRunning = newHeldFakeRunning(t, group, command.ExitObservation{Exited: true, Code: 0}, model.QuiescenceNaturalExit)
 	launch := prepareHeldLaunchForTest(t, ctx, spec, effects)
 
 	abortDone := make(chan abortResult, 1)
+	releaseDone := make(chan releaseResult, 1)
+	start := newConcurrentStartGate(2)
 	go func() {
+		start.wait()
 		verified, err := launch.AbortAndVerify(ctx)
 		abortDone <- abortResult{verified: verified, err: err}
 	}()
-	waitClosed(t, effects.abortStarted, "abort start")
-
-	releaseDone := make(chan releaseResult, 1)
 	go func() {
+		start.wait()
 		running, outcome, err := launch.Release(ctx)
 		releaseDone <- releaseResult{running: running, outcome: outcome, err: err}
 	}()
 
-	if got := effects.snapshot().frameWrites; got != 0 {
-		t.Fatalf("frame writes before abort finishes = %d, want 0", got)
-	}
-	close(allowAbort)
+	start.release(t, "release/abort contenders ready")
 	abort := <-abortDone
 	release := <-releaseDone
-	if abort.err != nil {
-		t.Fatalf("AbortAndVerify() error = %v, want nil", abort.err)
-	}
-	if release.outcome != ReleaseDefinitelyNotSent || !errors.Is(release.err, ErrHeldLaunchAlreadyConsumed) {
-		t.Fatalf("Release() after abort = (%s, %v), want definitely_not_sent already-consumed", release.outcome, release.err)
-	}
 	snapshot := effects.snapshot()
-	if snapshot.abortCalls != 1 || snapshot.sendCalls != 0 || snapshot.frameWrites != 0 {
-		t.Fatalf("calls = abort:%d send:%d writes:%d, want abort:1 send:0 writes:0", snapshot.abortCalls, snapshot.sendCalls, snapshot.frameWrites)
+	switch {
+	case snapshot.abortCalls == 1 && snapshot.sendCalls == 0 && snapshot.frameWrites == 0:
+		if abort.err != nil {
+			t.Fatalf("AbortAndVerify() winning race error = %v, want nil", abort.err)
+		}
+		if release.outcome != ReleaseDefinitelyNotSent || !errors.Is(release.err, ErrHeldLaunchAlreadyConsumed) {
+			t.Fatalf("Release() after abort wins = (%s, %v), want definitely_not_sent already-consumed", release.outcome, release.err)
+		}
+	case snapshot.abortCalls == 0 && snapshot.sendCalls == 1 && snapshot.frameWrites == 1:
+		if release.outcome != ReleaseAccepted || release.running == nil || release.err != nil {
+			t.Fatalf("Release() winning race = (%v, %s, %v), want running accepted nil", release.running, release.outcome, release.err)
+		}
+		if !errors.Is(abort.err, ErrHeldLaunchExecutionPossible) {
+			t.Fatalf("AbortAndVerify() after release wins error = %v, want execution-possible", abort.err)
+		}
+	default:
+		t.Fatalf("calls = abort:%d send:%d writes:%d contain:%d, want exactly one winner", snapshot.abortCalls, snapshot.sendCalls, snapshot.frameWrites, snapshot.containCalls)
+	}
+	if snapshot.containCalls != 0 {
+		t.Fatalf("contain calls = %d, want 0", snapshot.containCalls)
 	}
 }
 
@@ -177,19 +188,25 @@ func TestHeldLaunchRaceReleaseVsAbortAfterSendContains(t *testing.T) {
 	}
 
 	abortDone := make(chan abortResult, 1)
+	start := newConcurrentStartGate(2)
 	go func() {
+		start.wait()
+		close(allowSend)
+	}()
+	go func() {
+		start.wait()
 		verified, err := launch.AbortAndVerify(ctx)
 		abortDone <- abortResult{verified: verified, err: err}
 	}()
-	close(allowSend)
+	start.release(t, "send-unblock/abort contenders ready")
 
 	release := <-releaseDone
 	abort := <-abortDone
 	if release.outcome != ReleaseOutcomeUnknown || !errors.Is(release.err, errHeldLaunchAckLost) {
 		t.Fatalf("Release() = (%s, %v), want unknown ack-lost", release.outcome, release.err)
 	}
-	if !errors.Is(abort.err, ErrHeldLaunchAlreadyConsumed) {
-		t.Fatalf("AbortAndVerify() after unknown release error = %v, want already-consumed", abort.err)
+	if !errors.Is(abort.err, ErrHeldLaunchExecutionPossible) && !errors.Is(abort.err, ErrHeldLaunchAlreadyConsumed) {
+		t.Fatalf("AbortAndVerify() after release began error = %v, want execution-possible or already-consumed", abort.err)
 	}
 	snapshot := effects.snapshot()
 	if snapshot.frameWrites != 1 || snapshot.containCalls != 1 || snapshot.containCauses[0] != QuiescenceCauseContain {
@@ -217,18 +234,25 @@ func TestHeldLaunchRaceReleaseVsCloseAfterSendContains(t *testing.T) {
 	waitClosed(t, effects.sendStarted, "release frame write")
 
 	closeDone := make(chan error, 1)
+	start := newConcurrentStartGate(2)
 	go func() {
+		start.wait()
 		closeDone <- launch.Close(ctx)
 	}()
-	close(allowSend)
+	go func() {
+		start.wait()
+		close(allowSend)
+	}()
+	start.release(t, "send-unblock/close contenders ready")
 
 	release := <-releaseDone
 	closeErr := <-closeDone
 	if release.outcome != ReleaseOutcomeUnknown || !errors.Is(release.err, errHeldLaunchAckLost) {
 		t.Fatalf("Release() = (%s, %v), want unknown ack-lost", release.outcome, release.err)
 	}
-	if !errors.Is(closeErr, ErrHeldLaunchCloseRefused) || !errors.Is(closeErr, ErrHeldLaunchAlreadyConsumed) {
-		t.Fatalf("Close() after unknown release error = %v, want close-refused already-consumed", closeErr)
+	if !errors.Is(closeErr, ErrHeldLaunchCloseRefused) ||
+		(!errors.Is(closeErr, ErrHeldLaunchExecutionPossible) && !errors.Is(closeErr, ErrHeldLaunchAlreadyConsumed)) {
+		t.Fatalf("Close() after release began error = %v, want close-refused with execution-possible or already-consumed", closeErr)
 	}
 	snapshot := effects.snapshot()
 	if snapshot.frameWrites != 1 || snapshot.containCalls != 1 || snapshot.abortCalls != 0 {
@@ -281,6 +305,87 @@ func TestHeldLaunchFrameWriteBeganAckLostUnknownContainsAndNeverResends(t *testi
 	snapshot := effects.snapshot()
 	if snapshot.frameWrites != 1 || snapshot.containCalls != 1 || snapshot.sendCalls != 1 {
 		t.Fatalf("calls = writes:%d contains:%d sends:%d, want 1/1/1", snapshot.frameWrites, snapshot.containCalls, snapshot.sendCalls)
+	}
+}
+
+func TestHeldLaunchReleaseTupleContradictionsBecomeUnknownAndContain(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name                string
+		running             bool
+		outcome             ReleaseOutcome
+		releaseErr          error
+		wantOutcomeRequired bool
+	}{
+		{name: "accepted nil running", outcome: ReleaseAccepted},
+		{name: "accepted with error", running: true, outcome: ReleaseAccepted, releaseErr: errHeldLaunchAckLost},
+		{name: "not sent with running", running: true, outcome: ReleaseDefinitelyNotSent},
+		{name: "unknown with running", running: true, outcome: ReleaseOutcomeUnknown},
+		{name: "invalid outcome with running", running: true, outcome: ReleaseOutcome(99), wantOutcomeRequired: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := heldLaunchTestSpec(t)
+			group := heldLaunchTestGroup(t, spec.LaunchKey)
+			effects := newHeldLaunchFakeEffects(t, group)
+			effects.releaseOutcome = tt.outcome
+			effects.releaseErr = tt.releaseErr
+			if tt.running {
+				effects.releaseRunning = newHeldFakeRunning(t, group, command.ExitObservation{Exited: true, Code: 0}, model.QuiescenceNaturalExit)
+			}
+			launch := prepareHeldLaunchForTest(t, ctx, spec, effects)
+
+			running, outcome, err := launch.Release(ctx)
+			if running != nil || outcome != ReleaseOutcomeUnknown || !errors.Is(err, ErrHeldLaunchReleaseContradiction) {
+				t.Fatalf("Release() = (%v, %s, %v), want nil unknown contradiction", running, outcome, err)
+			}
+			if tt.releaseErr != nil && !errors.Is(err, tt.releaseErr) {
+				t.Fatalf("Release() error = %v, want joined release error %v", err, tt.releaseErr)
+			}
+			if tt.wantOutcomeRequired && !errors.Is(err, ErrHeldLaunchOutcomeRequired) {
+				t.Fatalf("Release() error = %v, want outcome-required", err)
+			}
+			snapshot := effects.snapshot()
+			if snapshot.sendCalls != 1 || snapshot.frameWrites != 1 || snapshot.containCalls != 1 || !snapshot.containRefs[0].Equal(group) {
+				t.Fatalf("calls = send:%d write:%d contain:%d refs:%#v, want one durable contain", snapshot.sendCalls, snapshot.frameWrites, snapshot.containCalls, snapshot.containRefs)
+			}
+			if got := launch.State(); got != HeldLaunchStateFinalized {
+				t.Fatalf("state after contradiction containment = %s, want %s", got, HeldLaunchStateFinalized)
+			}
+		})
+	}
+}
+
+func TestHeldLaunchContainFailureStaysActiveAndControlLossRetries(t *testing.T) {
+	ctx := context.Background()
+	spec := heldLaunchTestSpec(t)
+	group := heldLaunchTestGroup(t, spec.LaunchKey)
+	effects := newHeldLaunchFakeEffects(t, group)
+	effects.releaseOutcome = ReleaseOutcomeUnknown
+	effects.releaseErr = errHeldLaunchAckLost
+	effects.containErrs = []error{errHeldLaunchContain}
+	launch := prepareHeldLaunchForTest(t, ctx, spec, effects)
+
+	running, outcome, err := launch.Release(ctx)
+	if running != nil || outcome != ReleaseOutcomeUnknown || !errors.Is(err, errHeldLaunchAckLost) || !errors.Is(err, errHeldLaunchContain) {
+		t.Fatalf("Release() = (%v, %s, %v), want nil unknown ack-lost plus contain failure", running, outcome, err)
+	}
+	if got := launch.State(); got != HeldLaunchStateContaining {
+		t.Fatalf("state after failed containment = %s, want %s", got, HeldLaunchStateContaining)
+	}
+	if got := launch.ActiveCustodyCount(); got != 1 {
+		t.Fatalf("ActiveCustodyCount() after failed containment = %d, want 1", got)
+	}
+
+	if _, err := launch.HandleControlLoss(ctx, true); err != nil {
+		t.Fatalf("HandleControlLoss() retry error = %v, want nil", err)
+	}
+	snapshot := effects.snapshot()
+	if snapshot.containCalls != 2 || snapshot.containCauses[0] != QuiescenceCauseContain || snapshot.containCauses[1] != QuiescenceCauseRecovery {
+		t.Fatalf("contain retry = calls:%d causes:%#v, want contain then recovery retry", snapshot.containCalls, snapshot.containCauses)
+	}
+	if got := launch.State(); got != HeldLaunchStateFinalized {
+		t.Fatalf("state after containment retry = %s, want %s", got, HeldLaunchStateFinalized)
 	}
 }
 
@@ -363,6 +468,57 @@ func TestHeldLaunchDaemonDiesAfterGrantBeforeAckContainsAndNeverResends(t *testi
 	}
 }
 
+func TestHeldLaunchControlLossCancelsBlockedReleaseAndContainsBounded(t *testing.T) {
+	ctx := context.Background()
+	spec := heldLaunchTestSpec(t)
+	group := heldLaunchTestGroup(t, spec.LaunchKey)
+	allowSend := make(chan struct{})
+	effects := newHeldLaunchFakeEffects(t, group)
+	effects.releaseOutcome = ReleaseAccepted
+	effects.releaseRunning = newHeldFakeRunning(t, group, command.ExitObservation{Exited: true, Code: 0}, model.QuiescenceNaturalExit)
+	effects.sendStarted = make(chan struct{})
+	effects.allowSend = allowSend
+	effects.containStarted = make(chan struct{})
+	launch := prepareHeldLaunchForTest(t, ctx, spec, effects)
+
+	releaseDone := make(chan releaseResult, 1)
+	releaseStart := newConcurrentStartGate(1)
+	go func() {
+		releaseStart.wait()
+		running, outcome, err := launch.Release(ctx)
+		releaseDone <- releaseResult{running: running, outcome: outcome, err: err}
+	}()
+	releaseStart.release(t, "release contender ready")
+	waitClosed(t, effects.sendStarted, "blocked release frame write")
+
+	controlDone := make(chan controlLossResult, 1)
+	controlStart := newConcurrentStartGate(1)
+	go func() {
+		controlStart.wait()
+		verified, err := launch.HandleControlLoss(ctx, true)
+		controlDone <- controlLossResult{verified: verified, err: err}
+	}()
+	controlStart.release(t, "control-loss contender ready")
+	waitClosedWithin(t, effects.containStarted, "control-loss containment", time.Second)
+
+	release := waitForReleaseResult(t, releaseDone, "release after control-loss cancellation")
+	control := waitForControlLossResult(t, controlDone, "control loss")
+	if release.running != nil || release.outcome != ReleaseOutcomeUnknown ||
+		!errors.Is(release.err, context.Canceled) || !errors.Is(release.err, ErrHeldLaunchControlLost) {
+		t.Fatalf("Release() after control loss = (%v, %s, %v), want nil unknown canceled/control-lost", release.running, release.outcome, release.err)
+	}
+	if control.err != nil && !errors.Is(control.err, ErrHeldLaunchAlreadyConsumed) {
+		t.Fatalf("HandleControlLoss() error = %v, want nil or already-consumed after racing release cleanup", control.err)
+	}
+	snapshot := effects.snapshot()
+	if snapshot.sendCalls != 1 || snapshot.frameWrites != 1 || snapshot.containCalls != 1 || snapshot.containCauses[0] != QuiescenceCauseRecovery {
+		t.Fatalf("calls = send:%d writes:%d contain:%d causes:%#v, want one recovery containment", snapshot.sendCalls, snapshot.frameWrites, snapshot.containCalls, snapshot.containCauses)
+	}
+	if got := launch.State(); got != HeldLaunchStateFinalized {
+		t.Fatalf("state after control-loss containment = %s, want %s", got, HeldLaunchStateFinalized)
+	}
+}
+
 type releaseResult struct {
 	running RunningProcess
 	outcome ReleaseOutcome
@@ -370,6 +526,11 @@ type releaseResult struct {
 }
 
 type abortResult struct {
+	verified VerifiedQuiescence
+	err      error
+}
+
+type controlLossResult struct {
 	verified VerifiedQuiescence
 	err      error
 }
@@ -416,6 +577,11 @@ type heldLaunchFakeEffects struct {
 	abortStarted     chan struct{}
 	abortStartedOnce sync.Once
 	allowAbort       <-chan struct{}
+
+	containStarted     chan struct{}
+	containStartedOnce sync.Once
+	allowContain       <-chan struct{}
+	containErrs        []error
 
 	prepareCalls   int
 	sendCalls      int
@@ -480,7 +646,9 @@ func (effects *heldLaunchFakeEffects) SendRelease(ctx context.Context, spec Prep
 	effects.frameWrites++
 	effects.mu.Unlock()
 	signalOnce(effects.sendStarted, &effects.sendStartedOnce)
-	waitIfSet(ctx, effects.allowSend)
+	if err := waitIfSet(ctx, effects.allowSend); err != nil {
+		return effects.releaseRunning, ReleaseOutcomeUnknown, err
+	}
 	return effects.releaseRunning, effects.releaseOutcome, effects.releaseErr
 }
 
@@ -490,16 +658,30 @@ func (effects *heldLaunchFakeEffects) AbortAndVerify(ctx context.Context, ref mo
 	effects.abortRefs = append(effects.abortRefs, ref)
 	effects.mu.Unlock()
 	signalOnce(effects.abortStarted, &effects.abortStartedOnce)
-	waitIfSet(ctx, effects.allowAbort)
+	if err := waitIfSet(ctx, effects.allowAbort); err != nil {
+		return VerifiedQuiescence{}, err
+	}
 	return effects.issuer.AttestQuiescence(PhysicalQuiescence{Group: ref, Method: model.QuiescenceAlreadyAbsent})
 }
 
-func (effects *heldLaunchFakeEffects) ContainAndVerify(_ context.Context, ref model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, error) {
+func (effects *heldLaunchFakeEffects) ContainAndVerify(ctx context.Context, ref model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, error) {
 	effects.mu.Lock()
 	effects.containCalls++
 	effects.containRefs = append(effects.containRefs, ref)
 	effects.containCauses = append(effects.containCauses, cause)
+	var containErr error
+	if len(effects.containErrs) > 0 {
+		containErr = effects.containErrs[0]
+		effects.containErrs = effects.containErrs[1:]
+	}
 	effects.mu.Unlock()
+	signalOnce(effects.containStarted, &effects.containStartedOnce)
+	if err := waitIfSet(ctx, effects.allowContain); err != nil {
+		return VerifiedQuiescence{}, err
+	}
+	if containErr != nil {
+		return VerifiedQuiescence{}, containErr
+	}
 	return effects.issuer.AttestQuiescence(PhysicalQuiescence{Group: ref, Method: model.QuiescenceTermKill})
 }
 
@@ -617,21 +799,81 @@ func signalOnce(ch chan struct{}, once *sync.Once) {
 	}
 }
 
-func waitIfSet(ctx context.Context, ch <-chan struct{}) {
+func waitIfSet(ctx context.Context, ch <-chan struct{}) error {
 	if ch == nil {
-		return
+		return nil
 	}
 	select {
 	case <-ch:
+		return nil
 	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
 func waitClosed(t *testing.T, ch <-chan struct{}, label string) {
 	t.Helper()
+	waitClosedWithin(t, ch, label, 2*time.Second)
+}
+
+func waitClosedWithin(t *testing.T, ch <-chan struct{}, label string, timeout time.Duration) {
+	t.Helper()
 	select {
 	case <-ch:
+	case <-time.After(timeout):
+		t.Fatalf("timed out waiting for %s", label)
+	}
+}
+
+type concurrentStartGate struct {
+	count int
+	ready chan struct{}
+	start chan struct{}
+}
+
+func newConcurrentStartGate(count int) *concurrentStartGate {
+	return &concurrentStartGate{
+		count: count,
+		ready: make(chan struct{}, count),
+		start: make(chan struct{}),
+	}
+}
+
+func (gate *concurrentStartGate) wait() {
+	gate.ready <- struct{}{}
+	<-gate.start
+}
+
+func (gate *concurrentStartGate) release(t *testing.T, label string) {
+	t.Helper()
+	for range gate.count {
+		select {
+		case <-gate.ready:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s", label)
+		}
+	}
+	close(gate.start)
+}
+
+func waitForReleaseResult(t *testing.T, results <-chan releaseResult, label string) releaseResult {
+	t.Helper()
+	select {
+	case result := <-results:
+		return result
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for %s", label)
 	}
+	return releaseResult{}
+}
+
+func waitForControlLossResult(t *testing.T, results <-chan controlLossResult, label string) controlLossResult {
+	t.Helper()
+	select {
+	case result := <-results:
+		return result
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
+	}
+	return controlLossResult{}
 }

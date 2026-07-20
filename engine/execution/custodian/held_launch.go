@@ -89,7 +89,9 @@ type HeldLaunch interface {
 
 // HeldLaunchEffects are the only side effects used by HeldLaunchCore. R2A tests
 // inject fakes here; real process, fork, exec, pipe, and syscall work belongs to
-// later implementation units.
+// later implementation units. SendRelease must return promptly when ctx is
+// canceled. If it cannot prove the release frame was not sent, it must return
+// ReleaseOutcomeUnknown rather than ReleaseDefinitelyNotSent.
 type HeldLaunchEffects interface {
 	Prepare(context.Context, PrepareSpec) (model.GroupRef, error)
 	SendRelease(context.Context, PrepareSpec, model.GroupRef) (RunningProcess, ReleaseOutcome, error)
@@ -132,14 +134,20 @@ func (state HeldLaunchState) ActiveCustody() bool {
 }
 
 var (
-	ErrInvalidHeldLaunch           = errors.New("invalid held launch")
-	ErrHeldLaunchEffectsRequired   = errors.New("held launch effects are required")
-	ErrHeldLaunchAlreadyConsumed   = errors.New("held launch already consumed")
-	ErrHeldLaunchExecutionPossible = errors.New("held launch execution is possible")
-	ErrHeldLaunchCloseRefused      = errors.New("held launch close refused")
-	ErrHeldLaunchOutcomeRequired   = errors.New("held launch release outcome is required")
+	ErrInvalidHeldLaunch              = errors.New("invalid held launch")
+	ErrHeldLaunchEffectsRequired      = errors.New("held launch effects are required")
+	ErrHeldLaunchAlreadyConsumed      = errors.New("held launch already consumed")
+	ErrHeldLaunchExecutionPossible    = errors.New("held launch execution is possible")
+	ErrHeldLaunchCloseRefused         = errors.New("held launch close refused")
+	ErrHeldLaunchOutcomeRequired      = errors.New("held launch release outcome is required")
+	ErrHeldLaunchReleaseContradiction = errors.New("held launch release tuple is contradictory")
+	ErrHeldLaunchControlLost          = errors.New("held launch control lost during release")
 )
 
+// R2A has no real descriptor construction yet. These constants are documentation
+// placeholders that keep the held-launch FD ownership rule visible at compile
+// time; real allowlist and descriptor-building enforcement belongs in R2B/R3B.
+// TODO(R2B/R3B): attach these invariants to native FD inheritance tests.
 const (
 	heldLaunchBackendMayInheritControlWriteFD  = 0
 	heldLaunchBackendMayInheritControlMetadata = 0
@@ -169,6 +177,8 @@ type HeldLaunchCore struct {
 	releaseConsumed bool
 	abortConsumed   bool
 	closeConsumed   bool
+	releaseCancel   context.CancelFunc
+	releaseCtrlLost bool
 }
 
 var _ HeldLaunch = (*HeldLaunchCore)(nil)
@@ -246,17 +256,29 @@ func (launch *HeldLaunchCore) Release(ctx context.Context) (RunningProcess, Rele
 		return nil, ReleaseDefinitelyNotSent, ErrInvalidHeldLaunch
 	}
 	launch.opMu.Lock()
-	defer launch.opMu.Unlock()
-
-	ref, err := launch.beginRelease()
+	releaseCtx, ref, err := launch.beginRelease(ctx)
+	launch.opMu.Unlock()
 	if err != nil {
 		return nil, ReleaseDefinitelyNotSent, err
 	}
 
-	running, outcome, releaseErr := launch.effects.SendRelease(ctx, launch.spec, ref)
-	if !outcome.Valid() {
+	running, outcome, releaseErr := launch.effects.SendRelease(releaseCtx, launch.spec, ref)
+
+	launch.opMu.Lock()
+	defer launch.opMu.Unlock()
+	return launch.finishRelease(ctx, ref, running, outcome, releaseErr)
+}
+
+func (launch *HeldLaunchCore) finishRelease(ctx context.Context, ref model.GroupRef, running RunningProcess, outcome ReleaseOutcome, releaseErr error) (RunningProcess, ReleaseOutcome, error) {
+	running, outcome, releaseErr = normalizeReleaseTuple(running, outcome, releaseErr)
+	state, controlLost := launch.releaseCompletionState()
+	if controlLost {
+		running = nil
 		outcome = ReleaseOutcomeUnknown
-		releaseErr = errors.Join(releaseErr, ErrHeldLaunchOutcomeRequired)
+		releaseErr = errors.Join(releaseErr, ErrHeldLaunchControlLost)
+	}
+	if state != HeldLaunchStateReleasing {
+		return nil, ReleaseOutcomeUnknown, releaseErr
 	}
 
 	switch outcome {
@@ -269,7 +291,11 @@ func (launch *HeldLaunchCore) Release(ctx context.Context) (RunningProcess, Rele
 		return running, outcome, releaseErr
 	case ReleaseOutcomeUnknown:
 		launch.setState(HeldLaunchStateReleaseUnknown)
-		containErr := launch.containAfterUnknown(ctx, ref)
+		cause := QuiescenceCauseContain
+		if controlLost {
+			cause = QuiescenceCauseRecovery
+		}
+		containErr := launch.containAfterUnknown(ctx, ref, cause)
 		return nil, outcome, errors.Join(releaseErr, containErr)
 	default:
 		panic("unreachable release outcome")
@@ -329,6 +355,7 @@ func (launch *HeldLaunchCore) HandleControlLoss(ctx context.Context, groupDurabl
 	if launch == nil {
 		return VerifiedQuiescence{}, ErrInvalidHeldLaunch
 	}
+	launch.tripInFlightReleaseControlLoss()
 	launch.opMu.Lock()
 	defer launch.opMu.Unlock()
 
@@ -343,7 +370,7 @@ func (launch *HeldLaunchCore) HandleControlLoss(ctx context.Context, groupDurabl
 			return launch.containAndFinalize(ctx, ref, QuiescenceCauseRecovery)
 		}
 		return launch.abortPrepared(ctx)
-	case HeldLaunchStateReleasing, HeldLaunchStateReleaseUnknown:
+	case HeldLaunchStateReleasing, HeldLaunchStateReleaseUnknown, HeldLaunchStateContaining:
 		launch.markReleaseConsumed()
 		return launch.containAndFinalize(ctx, ref, QuiescenceCauseRecovery)
 	case HeldLaunchStateRunning, HeldLaunchStateReleaseAccepted:
@@ -355,21 +382,27 @@ func (launch *HeldLaunchCore) HandleControlLoss(ctx context.Context, groupDurabl
 	}
 }
 
-func (launch *HeldLaunchCore) beginRelease() (model.GroupRef, error) {
+func (launch *HeldLaunchCore) beginRelease(ctx context.Context) (context.Context, model.GroupRef, error) {
+	releaseCtx, cancel := context.WithCancel(ctx)
 	launch.mu.Lock()
 	defer launch.mu.Unlock()
 	if launch.releaseConsumed {
-		return model.GroupRef{}, ErrHeldLaunchAlreadyConsumed
+		cancel()
+		return nil, model.GroupRef{}, ErrHeldLaunchAlreadyConsumed
 	}
 	if launch.state != HeldLaunchStatePrepared {
-		return model.GroupRef{}, launch.refusalForStateLocked(launch.state)
+		cancel()
+		return nil, model.GroupRef{}, launch.refusalForStateLocked(launch.state)
 	}
 	if err := launch.spec.ReleaseSecret.Validate(); err != nil {
-		return model.GroupRef{}, fmt.Errorf("%w: release_secret: %v", ErrInvalidHeldLaunch, err)
+		cancel()
+		return nil, model.GroupRef{}, fmt.Errorf("%w: release_secret: %v", ErrInvalidHeldLaunch, err)
 	}
 	launch.releaseConsumed = true
+	launch.releaseCancel = cancel
+	launch.releaseCtrlLost = false
 	launch.state = HeldLaunchStateReleasing
-	return launch.ref, nil
+	return releaseCtx, launch.ref, nil
 }
 
 func (launch *HeldLaunchCore) abortPrepared(ctx context.Context) (VerifiedQuiescence, error) {
@@ -396,11 +429,14 @@ func (launch *HeldLaunchCore) abortPrepared(ctx context.Context) (VerifiedQuiesc
 	return verified, nil
 }
 
-func (launch *HeldLaunchCore) containAfterUnknown(ctx context.Context, ref model.GroupRef) error {
-	_, err := launch.containAndFinalize(ctx, ref, QuiescenceCauseContain)
+func (launch *HeldLaunchCore) containAfterUnknown(ctx context.Context, ref model.GroupRef, cause QuiescenceCause) error {
+	_, err := launch.containAndFinalize(ctx, ref, cause)
 	return err
 }
 
+// containAndFinalize is fail-closed: a failed containment leaves the launch in
+// Containing with active custody so HandleControlLoss can retry. The process-wide
+// fail-stop latch owns escalation while execution remains possible and unproven.
 func (launch *HeldLaunchCore) containAndFinalize(ctx context.Context, ref model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, error) {
 	launch.setState(HeldLaunchStateContaining)
 	verified, err := launch.effects.ContainAndVerify(ctx, ref, cause)
@@ -417,6 +453,58 @@ func (launch *HeldLaunchCore) markReleaseConsumed() {
 	launch.mu.Unlock()
 }
 
+func (launch *HeldLaunchCore) tripInFlightReleaseControlLoss() {
+	var cancel context.CancelFunc
+	launch.mu.Lock()
+	if launch.state == HeldLaunchStateReleasing {
+		launch.releaseCtrlLost = true
+		cancel = launch.releaseCancel
+	}
+	launch.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (launch *HeldLaunchCore) releaseCompletionState() (HeldLaunchState, bool) {
+	launch.mu.Lock()
+	state := launch.state
+	controlLost := launch.releaseCtrlLost
+	cancel := launch.releaseCancel
+	launch.releaseCancel = nil
+	launch.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return state, controlLost
+}
+
+func normalizeReleaseTuple(running RunningProcess, outcome ReleaseOutcome, releaseErr error) (RunningProcess, ReleaseOutcome, error) {
+	if !outcome.Valid() {
+		outcome = ReleaseOutcomeUnknown
+		releaseErr = errors.Join(releaseErr, ErrHeldLaunchOutcomeRequired)
+	}
+	switch outcome {
+	case ReleaseDefinitelyNotSent:
+		if running != nil {
+			return nil, ReleaseOutcomeUnknown, errors.Join(releaseErr, ErrHeldLaunchReleaseContradiction)
+		}
+		return nil, outcome, releaseErr
+	case ReleaseAccepted:
+		if running == nil || releaseErr != nil {
+			return nil, ReleaseOutcomeUnknown, errors.Join(releaseErr, ErrHeldLaunchReleaseContradiction)
+		}
+		return running, outcome, nil
+	case ReleaseOutcomeUnknown:
+		if running != nil {
+			releaseErr = errors.Join(releaseErr, ErrHeldLaunchReleaseContradiction)
+		}
+		return nil, outcome, releaseErr
+	default:
+		panic("unreachable release outcome")
+	}
+}
+
 func (launch *HeldLaunchCore) setState(state HeldLaunchState) {
 	launch.mu.Lock()
 	launch.state = state
@@ -427,7 +515,7 @@ func (launch *HeldLaunchCore) refusalForStateLocked(state HeldLaunchState) error
 	switch state {
 	case HeldLaunchStateRunning, HeldLaunchStateReleaseAccepted, HeldLaunchStateReleasing, HeldLaunchStateReleaseUnknown, HeldLaunchStateContaining:
 		return ErrHeldLaunchExecutionPossible
-	case HeldLaunchStateFinalized:
+	case HeldLaunchStateAborting, HeldLaunchStateFinalized:
 		return ErrHeldLaunchAlreadyConsumed
 	default:
 		return fmt.Errorf("%w: state %s", ErrInvalidHeldLaunch, state)
