@@ -4,7 +4,7 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: plan locked; awaiting explicit "go" from the user before any unit is launched.
+STATUS: EXECUTING. R0 committed 23275e1. R0T verified (Linux cgroup-v2 RED sentinel) — committing + sol review. Next: R1.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -265,3 +265,16 @@ see the R4A contract block.)
 - 2026-07-20 R4A exec-guard sub-decision RESOLVED: GLOBAL structural no-hidden-exec guard (strict+legacy) +
   STRICT-ONLY fail-closed admission ordering; legacy stays unfenced via explicit direct runners. Encoded.
   Still awaiting "go".
+- 2026-07-20 GO given (goal: implement ledger, delegate gpt-5.5 xhigh impl / gpt-5.6-sol high review,
+  continue until exhausted). R0 committed as 23275e1 (roadmap doc; no behavior change). R0T real-Serve
+  strict-E2E harness launched: worker job_20260720T151723000000000Z_000002 (codex gpt-5.5 xhigh, --write).
+  Packet: ~/tmp/delegate-packets/abd-R0T-real-serve-harness.md. Expected sentinel
+  strict_native_runtime_unavailable; opt-in gate abd_strict_e2e + AGENTBUS_RUN_STRICT_E2E=1.
+- 2026-07-20 R0T LEDGER: worker finished completed_noncompliant (report-SHAPE miss only: missing
+  Criteria/Receipts/Verification/Scope sections; work itself in-scope — only internal/served/strict_e2e_test.go
+  added, no forbidden files). Independent verification on tree @23275e1+file: CGO_ENABLED=0 go build ./...=0;
+  GOOS=linux go build ./...=0; gofmt -l cmd internal engine=empty; go vet ./...=0; go vet -tags=abd_strict_e2e
+  ./internal/served=0; macOS AGENTBUS_RUN_STRICT_E2E=1 go test -tags=abd_strict_e2e ...=SKIP(non-linux),PASS.
+  Docker golang:1.26 --privileged --cgroupns=private cgroup-v2 (controllers incl memory/pids): gate PASS,
+  sentinel strict_native_runtime_unavailable emitted, GATE_EXIT=0. Independent OS check n/a (no process
+  launched — RED baseline rejects at capability gate). Committing then sol review on the SHA.
