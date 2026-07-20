@@ -27,12 +27,16 @@ const (
 )
 
 var (
-	ErrInvalidSpec              = errors.New("invalid park launch spec")
-	ErrIdentityMismatch         = errors.New("parked worker identity mismatch")
-	ErrChannelLostBeforeRelease = errors.New("parked worker channel lost before release")
-	ErrReleaseAlreadySent       = errors.New("parked worker release already sent")
-	ErrReleaseAck               = errors.New("parked worker release ack failed")
-	ErrMonitorNotArmed          = errors.New("parklaunch monitor not armed")
+	ErrInvalidSpec               = errors.New("invalid park launch spec")
+	ErrIdentityMismatch          = errors.New("parked worker identity mismatch")
+	ErrChannelLostBeforeRelease  = errors.New("parked worker channel lost before release")
+	ErrReleaseAlreadySent        = errors.New("parked worker release already sent")
+	ErrReleaseAck                = errors.New("parked worker release ack failed")
+	ErrMonitorNotArmed           = errors.New("parklaunch monitor not armed")
+	ErrPreparedAlreadyConsumed   = errors.New("prepared launch already consumed")
+	ErrPreparedExecutionPossible = errors.New("prepared launch execution is possible")
+	ErrPreparedCloseRefused      = errors.New("prepared launch close refused")
+	ErrReleaseOutcomeUnknown     = errors.New("parked worker release outcome unknown")
 )
 
 var cleanupTimeout = 3 * time.Second
@@ -145,6 +149,238 @@ type launchControlSnapshot struct {
 	ControlRead  *os.File
 }
 
+type preparedState string
+
+const (
+	preparedStatePrepared       preparedState = "prepared"
+	preparedStateReleasing      preparedState = "releasing"
+	preparedStateReleased       preparedState = "released"
+	preparedStateAborting       preparedState = "aborting"
+	preparedStateFinalized      preparedState = "finalized"
+	preparedStateReleaseUnknown preparedState = "release_unknown"
+)
+
+// Prepared is a parked worker whose monitor is armed and whose target group is
+// bound, but whose physical release has not been sent.
+type Prepared struct {
+	opMu sync.Mutex
+	mu   sync.Mutex
+
+	state           preparedState
+	releaseConsumed bool
+	abortConsumed   bool
+	closeConsumed   bool
+
+	group       model.GroupRef
+	monitor     *MonitorProcess
+	wait        *processWait
+	pipes       *launchPipes
+	reader      *parkproto.Reader
+	writer      *parkproto.Writer
+	release     parkproto.Release
+	releaser    *releaseGate
+	containment Containment
+	identity    identityReader
+	hooks       launchHooks
+}
+
+func (prepared *Prepared) Ref() model.GroupRef {
+	if prepared == nil {
+		return model.GroupRef{}
+	}
+	prepared.mu.Lock()
+	defer prepared.mu.Unlock()
+	return prepared.group
+}
+
+func (prepared *Prepared) Release(ctx context.Context) (*ParkedHandle, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if prepared == nil {
+		return nil, ErrPreparedAlreadyConsumed
+	}
+	prepared.opMu.Lock()
+	defer prepared.opMu.Unlock()
+
+	if err := prepared.beginReleaseLocked(ctx); err != nil {
+		return nil, err
+	}
+	if err := prepared.releaser.send(prepared.writer, prepared.release); err != nil {
+		cause := fmt.Errorf("%w: %w", ErrChannelLostBeforeRelease, err)
+		return nil, prepared.failArmedLocked(cause)
+	}
+	if prepared.hooks.afterRelease != nil {
+		snapshot := launchControlSnapshot{}
+		if prepared.pipes != nil {
+			snapshot.ControlWrite = prepared.pipes.toWorkerWrite
+			snapshot.ControlRead = prepared.pipes.fromWorkerRead
+		}
+		if err := prepared.hooks.afterRelease(snapshot); err != nil {
+			return nil, prepared.failArmedLocked(err)
+		}
+	}
+	ackFrame, err := readParkFrame(ctx, prepared.reader)
+	if err != nil {
+		cause := fmt.Errorf("%w: %w", ErrReleaseAck, err)
+		if ctx.Err() != nil {
+			prepared.setState(preparedStateReleaseUnknown)
+			return nil, errors.Join(ErrReleaseOutcomeUnknown, cause)
+		}
+		return nil, prepared.failArmedLocked(cause)
+	}
+	ack, ok := ackFrame.Message.(parkproto.ReleaseAck)
+	if !ok {
+		return nil, prepared.failArmedLocked(fmt.Errorf("%w: got %T", ErrReleaseAck, ackFrame.Message))
+	}
+	if ackFrame.Sequence != 2 || ack.AcceptedSequence != prepared.release.Binding.Sequence {
+		return nil, prepared.failArmedLocked(fmt.Errorf("%w: sequence=%d accepted=%d", ErrReleaseAck, ackFrame.Sequence, ack.AcceptedSequence))
+	}
+
+	handle := &ParkedHandle{
+		GroupRef: prepared.group,
+		Stdin:    prepared.pipes.backendStdinWrite,
+		Stdout:   prepared.pipes.backendStdoutRead,
+		Stderr:   prepared.pipes.backendStderrRead,
+		Monitor:  prepared.monitor,
+		wait:     prepared.wait,
+		releaser: prepared.releaser,
+	}
+	prepared.pipes.closeWorkerControlInParent()
+	prepared.pipes.disownBackendParentFiles()
+	prepared.pipes = nil
+	prepared.setState(preparedStateReleased)
+	return handle, nil
+}
+
+func (prepared *Prepared) AbortAndVerify(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if prepared == nil {
+		return ErrPreparedAlreadyConsumed
+	}
+	prepared.opMu.Lock()
+	defer prepared.opMu.Unlock()
+	return prepared.abortPreparedLocked(ctx)
+}
+
+func (prepared *Prepared) Close(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if prepared == nil {
+		return nil
+	}
+	prepared.opMu.Lock()
+	defer prepared.opMu.Unlock()
+
+	prepared.mu.Lock()
+	if prepared.closeConsumed {
+		prepared.mu.Unlock()
+		return ErrPreparedAlreadyConsumed
+	}
+	prepared.closeConsumed = true
+	prepared.mu.Unlock()
+
+	err := prepared.abortPreparedLocked(ctx)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrPreparedExecutionPossible) || errors.Is(err, ErrPreparedAlreadyConsumed) {
+		return errors.Join(ErrPreparedCloseRefused, err)
+	}
+	return err
+}
+
+func (prepared *Prepared) beginReleaseLocked(ctx context.Context) error {
+	prepared.mu.Lock()
+	defer prepared.mu.Unlock()
+	if prepared.releaseConsumed {
+		return ErrPreparedAlreadyConsumed
+	}
+	if prepared.state != preparedStatePrepared {
+		return prepared.refusalForStateLocked(prepared.state)
+	}
+	prepared.releaseConsumed = true
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := prepared.release.Binding.ReleaseSecret.Validate(); err != nil {
+		return fmt.Errorf("%w: release secret: %v", ErrInvalidSpec, err)
+	}
+	prepared.state = preparedStateReleasing
+	return nil
+}
+
+func (prepared *Prepared) abortPreparedLocked(ctx context.Context) error {
+	prepared.mu.Lock()
+	if prepared.abortConsumed {
+		prepared.mu.Unlock()
+		return ErrPreparedAlreadyConsumed
+	}
+	state := prepared.state
+	if state != preparedStatePrepared {
+		prepared.mu.Unlock()
+		return prepared.refusalForStateLocked(state)
+	}
+	prepared.abortConsumed = true
+	prepared.state = preparedStateAborting
+	prepared.mu.Unlock()
+
+	var err error
+	if prepared.pipes != nil {
+		err = errors.Join(err, prepared.pipes.closeControl())
+	}
+	err = errors.Join(err, abortArmedMonitorAndVerify(prepared.containment, prepared.identity, prepared.monitor, prepared.group))
+	prepared.startWait()
+	prepared.closeParentFiles()
+	prepared.setState(preparedStateFinalized)
+	return err
+}
+
+func (prepared *Prepared) failArmedLocked(cause error) error {
+	cleanupErr := cleanupArmedMonitorFailure(prepared.containment, prepared.identity, prepared.monitor, prepared.group)
+	prepared.startWait()
+	prepared.closeParentFiles()
+	prepared.setState(preparedStateFinalized)
+	if cleanupErr != nil {
+		return errors.Join(cause, cleanupErr)
+	}
+	return cause
+}
+
+func (prepared *Prepared) refusalForStateLocked(state preparedState) error {
+	switch state {
+	case preparedStatePrepared:
+		return nil
+	case preparedStateReleasing, preparedStateReleased, preparedStateReleaseUnknown:
+		return ErrPreparedExecutionPossible
+	default:
+		return ErrPreparedAlreadyConsumed
+	}
+}
+
+func (prepared *Prepared) setState(state preparedState) {
+	prepared.mu.Lock()
+	prepared.state = state
+	prepared.mu.Unlock()
+}
+
+func (prepared *Prepared) startWait() {
+	if prepared != nil && prepared.wait != nil {
+		prepared.wait.Start()
+	}
+}
+
+func (prepared *Prepared) closeParentFiles() {
+	if prepared == nil || prepared.pipes == nil {
+		return
+	}
+	prepared.pipes.closeParentOnReturn()
+	prepared.pipes = nil
+}
+
 // ParkedHandle is returned after the worker has acknowledged the one release
 // and exec'd the backend with the same PID/group identity.
 type ParkedHandle struct {
@@ -225,6 +461,17 @@ func (gate *releaseGate) send(writer *parkproto.Writer, release parkproto.Releas
 // returns the backend stdio streams. It does not wait for, reconcile, or attest
 // backend completion.
 func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
+	prepared, err := Prepare(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	return prepared.Release(ctx)
+}
+
+// Prepare starts a parked worker in a fresh process group, verifies its kernel
+// identity independently, binds and arms the monitor, and returns before the
+// one physical release is sent.
+func Prepare(ctx context.Context, spec Spec) (*Prepared, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -238,11 +485,16 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 		return nil, err
 	}
 
+	launchSucceeded := false
 	pipes, err := openLaunchPipes()
 	if err != nil {
 		return nil, err
 	}
-	defer pipes.closeParentOnReturn()
+	defer func() {
+		if !launchSucceeded {
+			pipes.closeParentOnReturn()
+		}
+	}()
 	if spec.hooks.afterPipesCreated != nil {
 		snapshot := launchPipeSnapshot{
 			ControlWriteFD:   int(pipes.toWorkerWrite.Fd()),
@@ -259,7 +511,6 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	}
 	monitor.configureStopCleanup(spec.Containment, spec.identity)
 	var group model.GroupRef
-	launchSucceeded := false
 	monitorArmed := false
 	monitorFailureCleaned := false
 	defer func() {
@@ -414,43 +665,23 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 		}
 	}
 
-	writer := parkproto.NewWriter(pipes.toWorkerWrite)
-	release := releaseForReport(expectation, releaseGroup, spec.ExecSpec, report)
-	releaser := &releaseGate{}
-	if err := releaser.send(writer, release); err != nil {
-		return nil, failArmed(fmt.Errorf("%w: %v", ErrChannelLostBeforeRelease, err))
+	prepared := &Prepared{
+		state:       preparedStatePrepared,
+		group:       group,
+		monitor:     monitor,
+		wait:        wait,
+		pipes:       pipes,
+		reader:      reader,
+		writer:      parkproto.NewWriter(pipes.toWorkerWrite),
+		release:     releaseForReport(expectation, releaseGroup, spec.ExecSpec, report),
+		releaser:    &releaseGate{},
+		containment: spec.Containment,
+		identity:    spec.identity,
+		hooks:       spec.hooks,
 	}
-	if spec.hooks.afterRelease != nil {
-		if err := spec.hooks.afterRelease(launchControlSnapshot{ControlWrite: pipes.toWorkerWrite, ControlRead: pipes.fromWorkerRead}); err != nil {
-			return nil, failArmed(err)
-		}
-	}
-	ackFrame, err := readParkFrame(ctx, reader)
-	if err != nil {
-		return nil, failArmed(fmt.Errorf("%w: %v", ErrReleaseAck, err))
-	}
-	ack, ok := ackFrame.Message.(parkproto.ReleaseAck)
-	if !ok {
-		return nil, failArmed(fmt.Errorf("%w: got %T", ErrReleaseAck, ackFrame.Message))
-	}
-	if ackFrame.Sequence != 2 || ack.AcceptedSequence != release.Binding.Sequence {
-		return nil, failArmed(fmt.Errorf("%w: sequence=%d accepted=%d", ErrReleaseAck, ackFrame.Sequence, ack.AcceptedSequence))
-	}
-
 	released = true
-	pipes.closeWorkerControlInParent()
-	handle := &ParkedHandle{
-		GroupRef: group,
-		Stdin:    pipes.backendStdinWrite,
-		Stdout:   pipes.backendStdoutRead,
-		Stderr:   pipes.backendStderrRead,
-		Monitor:  monitor,
-		wait:     wait,
-		releaser: releaser,
-	}
-	pipes.disownBackendParentFiles()
 	launchSucceeded = true
-	return handle, nil
+	return prepared, nil
 }
 
 func validateSpec(spec Spec) error {
@@ -746,6 +977,21 @@ func cleanupArmedMonitorFailure(containment Containment, reader identityReader, 
 		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("contain target group: %w", err))
 	}
 	if err := waitArmedMonitorCleanup(containment, reader, monitor, group); err != nil {
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+	return cleanupErr
+}
+
+func abortArmedMonitorAndVerify(containment Containment, reader identityReader, monitor *MonitorProcess, group model.GroupRef) error {
+	var cleanupErr error
+	if err := closeMonitorDaemonControl(monitor); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("close monitor daemon control: %w", err))
+	}
+	containErr := containTargetGroup(containment, group)
+	if err := waitArmedMonitorCleanup(containment, reader, monitor, group); err != nil {
+		if containErr != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("contain target group: %w", containErr))
+		}
 		cleanupErr = errors.Join(cleanupErr, err)
 	}
 	return cleanupErr

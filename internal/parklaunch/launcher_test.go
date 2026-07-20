@@ -126,6 +126,251 @@ func TestLaunchReleaseIsOneUse(t *testing.T) {
 	}
 }
 
+func TestPrepareParksWorkerUntilRelease(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	prepared, err := Prepare(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	ref := prepared.Ref()
+	if err := ref.Validate(); err != nil {
+		cleanupPrepared(t, prepared)
+		t.Fatalf("Prepared.Ref() invalid: %v", err)
+	}
+	if ref.Monitor.PID == ref.PGID {
+		cleanupPrepared(t, prepared)
+		t.Fatalf("monitor pid %d is target group leader", ref.Monitor.PID)
+	}
+	assertProcessMatches(t, ref.Leader.PID, ref.Leader.HighResStartToken)
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+
+	handle, err := prepared.Release(fixture.ctx)
+	if err != nil {
+		cleanupPrepared(t, prepared)
+		t.Fatalf("Prepared.Release() error = %v", err)
+	}
+	defer stopMonitor(t, handle.Monitor)
+
+	stdout, err := io.ReadAll(handle.Stdout)
+	if err != nil {
+		t.Fatalf("read backend stdout: %v", err)
+	}
+	if !strings.Contains(string(stdout), "parklaunch-backend") {
+		t.Fatalf("backend stdout = %q", stdout)
+	}
+	if err := handle.Wait(); err != nil {
+		t.Fatalf("backend wait error = %v", err)
+	}
+	result := readBackendResult(t, fixture.backend.ResultPath)
+	if result.PID != ref.Leader.PID || result.PGID != ref.PGID {
+		t.Fatalf("backend identity = pid:%d pgid:%d, want pid:%d pgid:%d", result.PID, result.PGID, ref.Leader.PID, ref.PGID)
+	}
+}
+
+func TestPreparedReleaseIsOneUseAndAbortAfterReleaseRefuses(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	prepared, err := Prepare(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	handle, err := prepared.Release(fixture.ctx)
+	if err != nil {
+		cleanupPrepared(t, prepared)
+		t.Fatalf("Prepared.Release() error = %v", err)
+	}
+	defer cleanupParkedHandle(t, handle)
+
+	if again, err := prepared.Release(fixture.ctx); again != nil || !errors.Is(err, ErrPreparedAlreadyConsumed) {
+		t.Fatalf("second Prepared.Release() = (%v, %v), want nil ErrPreparedAlreadyConsumed", again, err)
+	}
+	if err := prepared.AbortAndVerify(fixture.ctx); !errors.Is(err, ErrPreparedExecutionPossible) {
+		t.Fatalf("AbortAndVerify() after release = %v, want ErrPreparedExecutionPossible", err)
+	}
+	if err := prepared.Close(fixture.ctx); !errors.Is(err, ErrPreparedCloseRefused) || !errors.Is(err, ErrPreparedExecutionPossible) {
+		t.Fatalf("Close() after release = %v, want close-refused/execution-possible", err)
+	}
+}
+
+func TestPreparedAbortAndVerifyPreventsBackendExecAndProvesAbsent(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	prepared, err := Prepare(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	ref := prepared.Ref()
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+
+	if err := prepared.AbortAndVerify(fixture.ctx); err != nil {
+		cleanupPrepared(t, prepared)
+		t.Fatalf("AbortAndVerify() error = %v", err)
+	}
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+	if err := waitGroupAbsent(context.Background(), ref); err != nil {
+		t.Fatalf("target group still present after AbortAndVerify: %v", err)
+	}
+	if got := fixture.containment.CallCount(); got != 1 {
+		t.Fatalf("containment calls = %d, want 1", got)
+	}
+	if err := prepared.AbortAndVerify(fixture.ctx); !errors.Is(err, ErrPreparedAlreadyConsumed) {
+		t.Fatalf("second AbortAndVerify() error = %v, want ErrPreparedAlreadyConsumed", err)
+	}
+	if handle, err := prepared.Release(fixture.ctx); handle != nil || !errors.Is(err, ErrPreparedAlreadyConsumed) {
+		t.Fatalf("Release() after abort = (%v, %v), want nil ErrPreparedAlreadyConsumed", handle, err)
+	}
+}
+
+func TestPreparedChannelLossBeforeReleaseContainsTarget(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	fixture.spec.hooks.beforeRelease = func(snapshot launchControlSnapshot) error {
+		return snapshot.ControlWrite.Close()
+	}
+	prepared, err := Prepare(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	handle, err := prepared.Release(fixture.ctx)
+	if err == nil {
+		cleanupParkedHandle(t, handle)
+		t.Fatal("Prepared.Release() succeeded; want channel-loss failure")
+	}
+	if !errors.Is(err, ErrChannelLostBeforeRelease) {
+		t.Fatalf("Prepared.Release() error = %v, want ErrChannelLostBeforeRelease", err)
+	}
+	if got := fixture.containment.CallCount(); got != 1 {
+		t.Fatalf("containment calls = %d, want 1", got)
+	}
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+	fixture.containment.WaitAbsent(t)
+}
+
+func TestPreparedReleaseContextCanceledDuringAckWaitReturnsUnknownAndNeverResends(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	releaseWritten := make(chan struct{})
+	fixture.spec.hooks.afterRelease = func(launchControlSnapshot) error {
+		close(releaseWritten)
+		return nil
+	}
+	prepared, err := Prepare(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	ref := prepared.Ref()
+	t.Cleanup(func() {
+		cleanupPrepared(t, prepared)
+	})
+	if err := unix.Kill(ref.Leader.PID, unix.SIGSTOP); err != nil {
+		t.Fatalf("stop parked worker %d: %v", ref.Leader.PID, err)
+	}
+
+	type releaseResult struct {
+		handle *ParkedHandle
+		err    error
+	}
+	releaseCtx, cancel := context.WithCancel(context.Background())
+	releaseDone := make(chan releaseResult, 1)
+	go func() {
+		handle, err := prepared.Release(releaseCtx)
+		releaseDone <- releaseResult{handle: handle, err: err}
+	}()
+	select {
+	case <-releaseWritten:
+	case result := <-releaseDone:
+		t.Fatalf("Prepared.Release() returned before afterRelease hook: (%v, %v)", result.handle, result.err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for release frame write")
+	}
+	start := time.Now()
+	cancel()
+	var result releaseResult
+	select {
+	case result = <-releaseDone:
+	case <-time.After(time.Second):
+		t.Fatal("Prepared.Release() did not return promptly after cancel")
+	}
+	elapsed := time.Since(start)
+	if result.handle != nil || !errors.Is(result.err, ErrReleaseOutcomeUnknown) || !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("Prepared.Release(canceled during ack) = (%v, %v), want nil unknown canceled", result.handle, result.err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Prepared.Release() returned after %s, want prompt cancellation", elapsed)
+	}
+	if again, err := prepared.Release(context.Background()); again != nil || !errors.Is(err, ErrPreparedAlreadyConsumed) {
+		t.Fatalf("second Prepared.Release() = (%v, %v), want nil ErrPreparedAlreadyConsumed", again, err)
+	}
+	if err := prepared.AbortAndVerify(context.Background()); !errors.Is(err, ErrPreparedExecutionPossible) {
+		t.Fatalf("AbortAndVerify() after ambiguous release = %v, want ErrPreparedExecutionPossible", err)
+	}
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+}
+
+func TestPreparedConcurrentReleaseAbortCloseSerialized(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}, Hold: 5 * time.Second})
+	prepared, err := Prepare(fixture.ctx, fixture.spec)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+
+	type preparedResult struct {
+		op     string
+		handle *ParkedHandle
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan preparedResult, 3)
+	go func() {
+		<-start
+		handle, err := prepared.Release(fixture.ctx)
+		results <- preparedResult{op: "release", handle: handle, err: err}
+	}()
+	go func() {
+		<-start
+		results <- preparedResult{op: "abort", err: prepared.AbortAndVerify(fixture.ctx)}
+	}()
+	go func() {
+		<-start
+		results <- preparedResult{op: "close", err: prepared.Close(fixture.ctx)}
+	}()
+	close(start)
+
+	var releaseHandle *ParkedHandle
+	releaseSuccess := 0
+	abortSuccess := 0
+	for i := 0; i < 3; i++ {
+		result := <-results
+		switch result.op {
+		case "release":
+			if result.err == nil {
+				releaseSuccess++
+				releaseHandle = result.handle
+			} else if !errors.Is(result.err, ErrPreparedAlreadyConsumed) && !errors.Is(result.err, ErrPreparedExecutionPossible) {
+				t.Fatalf("Release() race error = %v, want consumed/execution-possible", result.err)
+			}
+		case "abort":
+			if result.err == nil {
+				abortSuccess++
+			} else if !errors.Is(result.err, ErrPreparedAlreadyConsumed) && !errors.Is(result.err, ErrPreparedExecutionPossible) {
+				t.Fatalf("AbortAndVerify() race error = %v, want consumed/execution-possible", result.err)
+			}
+		case "close":
+			if result.err == nil {
+				abortSuccess++
+			} else if !errors.Is(result.err, ErrPreparedAlreadyConsumed) && !errors.Is(result.err, ErrPreparedCloseRefused) {
+				t.Fatalf("Close() race error = %v, want consumed/close-refused", result.err)
+			}
+		}
+	}
+	if releaseSuccess+abortSuccess != 1 {
+		t.Fatalf("successful physical actions = release:%d abort-or-close:%d, want exactly one", releaseSuccess, abortSuccess)
+	}
+	if releaseHandle != nil {
+		cleanupParkedHandle(t, releaseHandle)
+		return
+	}
+	defer cleanupPrepared(t, prepared)
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+	fixture.containment.WaitAbsent(t)
+}
+
 func TestLaunchBeforeMonitorBindRefinesReturnedTarget(t *testing.T) {
 	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
 	fixture.spec.RetainedID = "cgroup-retained-test"
@@ -1301,6 +1546,30 @@ func cleanupParkedHandle(t *testing.T, handle *ParkedHandle) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("backend pid %d did not exit", handle.GroupRef.Leader.PID)
 	}
+}
+
+func cleanupPrepared(t *testing.T, prepared *Prepared) {
+	t.Helper()
+	if prepared == nil {
+		return
+	}
+	ref := prepared.Ref()
+	prepared.closeParentFiles()
+	if ref.PGID > 0 {
+		err := unix.Kill(-ref.PGID, unix.SIGKILL)
+		if err != nil && !errors.Is(err, unix.ESRCH) {
+			t.Fatalf("kill prepared group %d: %v", ref.PGID, err)
+		}
+	}
+	prepared.startWait()
+	if prepared.wait != nil {
+		select {
+		case <-prepared.wait.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatalf("prepared worker pid %d did not exit", ref.Leader.PID)
+		}
+	}
+	stopMonitor(t, prepared.monitor)
 }
 
 func stopMonitor(t *testing.T, monitor *MonitorProcess) {
