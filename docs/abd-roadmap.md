@@ -4,9 +4,9 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0=23275e1. R0T(+084f8d3). R1=9560a47(CLOSED). R2A=b86de29(CLOSED). R2B committed (real
-parklaunch two-phase Prepare/Release/AbortAndVerify; Launch=wrapper). All pushed. Next: TWO R2B reviews
-(protocol/concurrency + OS/cgroup), then R3A1.
+STATUS: EXECUTING. R0=23275e1. R0T(+084f8d3). R1=9560a47(CLOSED). R2A=b86de29(CLOSED). R2B=00b8a72(+fix this
+commit; BOTH reviews CLOSED; F-C/F-D deferred to R3B). All pushed. Next: R3A1 (additive private native
+prepared path).
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -293,7 +293,17 @@ see the R4A contract block.)
   strict-E2E harness launched: worker job_20260720T151723000000000Z_000002 (codex gpt-5.5 xhigh, --write).
   Packet: ~/tmp/delegate-packets/abd-R0T-real-serve-harness.md. Expected sentinel
   strict_native_runtime_unavailable; opt-in gate abd_strict_e2e + AGENTBUS_RUN_STRICT_E2E=1.
-- 2026-07-20 R2B (this commit): real two-phase parklaunch primitive. Prepared{opMu-serialized one-use state
+- 2026-07-20 R2B-fix (this commit): closed BOTH R2B reviews. F-A: Launch now does state-aware cleanup on
+  release error (cleanupLaunchReleaseError: prepared->AbortAndVerify, releasing/unknown->ContainAndVerify,
+  typed GroupRef error), and new PUBLIC Prepared.ContainAndVerify/containAndVerifyLocked gives release_unknown
+  a terminal proof-of-absence cleanup. F-B: monitorArmed set at BindTarget success (not after WaitReady);
+  monitor.go recordBoundTarget sets stopArmed early; a WaitReady cancellation now routes to the VERIFYING
+  cleanupArmedMonitorFailure/waitArmedMonitorCleanup (never bare-kill an armed monitor). New beforeMonitorWaitReady
+  test hook forces readiness-before-cancel ordering. NOTE: worker ended in backend_error on a redundant final
+  patch (report lost, papercut filed); tree independently verified coherent+complete. Verify: gofmt/linux/vet=0;
+  parklaunch -race -count=3 (macOS 96s + Linux)=0; macOS go test ./...=0; Docker -p 1 full=0 + R0T RED=0.
+  F-C (cgroup absence-proof soundness) + F-D (PID-reuse fence) deferred to R3B. Both reviews CLOSED.
+- 2026-07-20 R2B (00b8a72): real two-phase parklaunch primitive. Prepared{opMu-serialized one-use state
   machine: prepared/releasing/released/aborting/finalized/release_unknown}; Prepare parks+verifies+arms+binds
   then blocks; Release sends once (secret validated at release), ctx-cancellation-aware (canceled ack ->
   ReleaseUnknown + ErrReleaseOutcomeUnknown), channel-loss -> failArmedLocked; AbortAndVerify/Close on

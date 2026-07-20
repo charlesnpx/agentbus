@@ -132,11 +132,12 @@ func (nativeIdentityReader) ClassifyGroup(claim procgroup.GroupClaim) model.Grou
 }
 
 type launchHooks struct {
-	afterPipesCreated   func(launchPipeSnapshot) error
-	afterMonitorStarted func(*MonitorProcess) error
-	afterWorkerStarted  func(int) error
-	beforeRelease       func(launchControlSnapshot) error
-	afterRelease        func(launchControlSnapshot) error
+	afterPipesCreated      func(launchPipeSnapshot) error
+	afterMonitorStarted    func(*MonitorProcess) error
+	afterWorkerStarted     func(int) error
+	beforeMonitorWaitReady func(*MonitorProcess) error
+	beforeRelease          func(launchControlSnapshot) error
+	afterRelease           func(launchControlSnapshot) error
 }
 
 type launchPipeSnapshot struct {
@@ -156,6 +157,7 @@ const (
 	preparedStateReleasing      preparedState = "releasing"
 	preparedStateReleased       preparedState = "released"
 	preparedStateAborting       preparedState = "aborting"
+	preparedStateContaining     preparedState = "containing"
 	preparedStateFinalized      preparedState = "finalized"
 	preparedStateReleaseUnknown preparedState = "release_unknown"
 )
@@ -265,6 +267,20 @@ func (prepared *Prepared) AbortAndVerify(ctx context.Context) error {
 	return prepared.abortPreparedLocked(ctx)
 }
 
+// ContainAndVerify terminates the prepared launch's target group through its
+// retained containment owner and proves the group absent before finalizing.
+func (prepared *Prepared) ContainAndVerify(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if prepared == nil {
+		return ErrPreparedAlreadyConsumed
+	}
+	prepared.opMu.Lock()
+	defer prepared.opMu.Unlock()
+	return prepared.containAndVerifyLocked(ctx)
+}
+
 func (prepared *Prepared) Close(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -293,6 +309,15 @@ func (prepared *Prepared) Close(ctx context.Context) error {
 	return err
 }
 
+func (prepared *Prepared) stateSnapshot() preparedState {
+	if prepared == nil {
+		return preparedStateFinalized
+	}
+	prepared.mu.Lock()
+	defer prepared.mu.Unlock()
+	return prepared.state
+}
+
 func (prepared *Prepared) beginReleaseLocked(ctx context.Context) error {
 	prepared.mu.Lock()
 	defer prepared.mu.Unlock()
@@ -311,6 +336,34 @@ func (prepared *Prepared) beginReleaseLocked(ctx context.Context) error {
 	}
 	prepared.state = preparedStateReleasing
 	return nil
+}
+
+func (prepared *Prepared) containAndVerifyLocked(ctx context.Context) error {
+	_ = ctx
+	prepared.mu.Lock()
+	state := prepared.state
+	switch state {
+	case preparedStatePrepared, preparedStateReleasing, preparedStateReleaseUnknown:
+		prepared.abortConsumed = true
+		prepared.state = preparedStateContaining
+	case preparedStateReleased:
+		prepared.mu.Unlock()
+		return ErrPreparedExecutionPossible
+	default:
+		prepared.mu.Unlock()
+		return ErrPreparedAlreadyConsumed
+	}
+	prepared.mu.Unlock()
+
+	var err error
+	if prepared.pipes != nil {
+		err = errors.Join(err, prepared.pipes.closeControl())
+	}
+	err = errors.Join(err, abortArmedMonitorAndVerify(prepared.containment, prepared.identity, prepared.monitor, prepared.group))
+	prepared.startWait()
+	prepared.closeParentFiles()
+	prepared.setState(preparedStateFinalized)
+	return err
 }
 
 func (prepared *Prepared) abortPreparedLocked(ctx context.Context) error {
@@ -465,7 +518,26 @@ func Launch(ctx context.Context, spec Spec) (*ParkedHandle, error) {
 	if err != nil {
 		return nil, err
 	}
-	return prepared.Release(ctx)
+	handle, err := prepared.Release(ctx)
+	if err == nil {
+		return handle, nil
+	}
+	return nil, cleanupLaunchReleaseError(prepared, err)
+}
+
+func cleanupLaunchReleaseError(prepared *Prepared, releaseErr error) error {
+	if prepared == nil {
+		return releaseErr
+	}
+	state := prepared.stateSnapshot()
+	switch {
+	case state == preparedStatePrepared:
+		return errors.Join(releaseErr, prepared.AbortAndVerify(context.Background()))
+	case state == preparedStateReleasing || state == preparedStateReleaseUnknown || errors.Is(releaseErr, ErrReleaseOutcomeUnknown):
+		return errors.Join(releaseErr, prepared.ContainAndVerify(context.Background()))
+	default:
+		return releaseErr
+	}
 }
 
 // Prepare starts a parked worker in a fresh process group, verifies its kernel
@@ -645,12 +717,21 @@ func Prepare(ctx context.Context, spec Spec) (*Prepared, error) {
 		group = boundGroup
 	}
 	if err := monitor.BindTarget(group); err != nil {
-		return nil, failClosed(spec.Containment, group, fmt.Errorf("%w: bind monitor target: %v", ErrMonitorNotArmed, err))
-	}
-	if err := monitor.WaitReady(ctx); err != nil {
-		return nil, failClosed(spec.Containment, group, err)
+		cause := fmt.Errorf("%w: bind monitor target: %v", ErrMonitorNotArmed, err)
+		if _, _, _, armed := monitor.armedCleanupState(); armed {
+			return nil, failArmed(cause)
+		}
+		return nil, failClosed(spec.Containment, group, cause)
 	}
 	monitorArmed = true
+	if spec.hooks.beforeMonitorWaitReady != nil {
+		if err := spec.hooks.beforeMonitorWaitReady(monitor); err != nil {
+			return nil, failArmed(err)
+		}
+	}
+	if err := monitor.WaitReady(ctx); err != nil {
+		return nil, failArmed(err)
+	}
 	if spec.hooks.beforeRelease != nil {
 		if err := spec.hooks.beforeRelease(launchControlSnapshot{ControlWrite: pipes.toWorkerWrite, ControlRead: pipes.fromWorkerRead}); err != nil {
 			return nil, failArmed(err)

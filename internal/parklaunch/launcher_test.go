@@ -300,6 +300,98 @@ func TestPreparedReleaseContextCanceledDuringAckWaitReturnsUnknownAndNeverResend
 	if err := prepared.AbortAndVerify(context.Background()); !errors.Is(err, ErrPreparedExecutionPossible) {
 		t.Fatalf("AbortAndVerify() after ambiguous release = %v, want ErrPreparedExecutionPossible", err)
 	}
+	if err := prepared.ContainAndVerify(context.Background()); err != nil {
+		t.Fatalf("ContainAndVerify() after ambiguous release error = %v", err)
+	}
+	if err := waitGroupAbsent(context.Background(), ref); err != nil {
+		t.Fatalf("target group still present after ContainAndVerify: %v", err)
+	}
+	if prepared.pipes != nil {
+		t.Fatal("prepared pipes were not released after ContainAndVerify")
+	}
+	if prepared.monitor.DaemonControlWrite != nil {
+		t.Fatal("monitor daemon-control writer was not released after ContainAndVerify")
+	}
+	if err := prepared.ContainAndVerify(context.Background()); !errors.Is(err, ErrPreparedAlreadyConsumed) {
+		t.Fatalf("second ContainAndVerify() error = %v, want ErrPreparedAlreadyConsumed", err)
+	}
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+}
+
+func TestLaunchPostSendCancellationContainsTargetAndReturnsUnknown(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fixture.ctx = ctx
+
+	var ref model.GroupRef
+	fixture.spec.BeforeRelease = func(_ context.Context, group model.GroupRef) error {
+		ref = group
+		if err := unix.Kill(group.Leader.PID, unix.SIGSTOP); err != nil {
+			return fmt.Errorf("stop parked worker %d: %w", group.Leader.PID, err)
+		}
+		return nil
+	}
+	fixture.spec.hooks.afterRelease = func(launchControlSnapshot) error {
+		cancel()
+		return nil
+	}
+
+	handle, err := Launch(ctx, fixture.spec)
+	if err == nil {
+		cleanupParkedHandle(t, handle)
+		t.Fatal("Launch() succeeded; want release outcome unknown")
+	}
+	if !errors.Is(err, ErrReleaseOutcomeUnknown) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Launch() error = %v, want release outcome unknown and context canceled", err)
+	}
+	if err := ref.Validate(); err != nil {
+		t.Fatalf("captured GroupRef invalid: %v", err)
+	}
+	if got := fixture.containment.CallCount(); got != 1 {
+		t.Fatalf("containment calls = %d, want 1", got)
+	}
+	fixture.containment.WaitAbsent(t)
+	if err := waitGroupAbsent(context.Background(), ref); err != nil {
+		t.Fatalf("target group still present after Launch cleanup: %v", err)
+	}
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+}
+
+func TestLaunchPreSendCancellationAbortsAndVerifiesTarget(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fixture.ctx = ctx
+
+	var ref model.GroupRef
+	fixture.spec.BeforeRelease = func(_ context.Context, group model.GroupRef) error {
+		ref = group
+		cancel()
+		return nil
+	}
+
+	handle, err := Launch(ctx, fixture.spec)
+	if err == nil {
+		cleanupParkedHandle(t, handle)
+		t.Fatal("Launch() succeeded; want pre-send cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Launch() error = %v, want context canceled", err)
+	}
+	if errors.Is(err, ErrReleaseOutcomeUnknown) {
+		t.Fatalf("Launch() error = %v, release should be definitely not sent", err)
+	}
+	if err := ref.Validate(); err != nil {
+		t.Fatalf("captured GroupRef invalid: %v", err)
+	}
+	if got := fixture.containment.CallCount(); got != 1 {
+		t.Fatalf("containment calls = %d, want 1", got)
+	}
+	fixture.containment.WaitAbsent(t)
+	if err := waitGroupAbsent(context.Background(), ref); err != nil {
+		t.Fatalf("target group still present after pre-send cleanup: %v", err)
+	}
 	assertFileAbsent(t, fixture.backend.MarkerPath)
 }
 
@@ -789,6 +881,82 @@ func TestLaunchMonitorExitBeforeReadyFailsClosedWithoutRelease(t *testing.T) {
 	fixture.containment.WaitAbsent(t)
 }
 
+func TestLaunchReadinessCancellationAfterMonitorReadyUsesArmedCleanup(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	readyMarker := filepath.Join(t.TempDir(), "monitor-ready")
+	fixture.spec.Monitor.Command = monitorCommandWithOptions(t, fixture.monitorMarker, monitorCommandOptions{
+		Kill:        true,
+		ReadyMarker: readyMarker,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fixture.ctx = ctx
+
+	parentContainment := &failingContainment{err: errors.New("synthetic parent containment failure")}
+	fixture.spec.Containment = parentContainment
+	var target model.GroupRef
+	var reader identityReader = nativeIdentityReader{}
+	var killCount atomic.Int32
+	var killedBeforeAbsent atomic.Bool
+	fixture.spec.hooks.afterMonitorStarted = func(monitor *MonitorProcess) error {
+		parentContainment.daemonClosed = func() bool {
+			return monitor.DaemonControlWrite == nil
+		}
+		monitor.killFunc = func(process *os.Process) error {
+			killCount.Add(1)
+			if target.Validate() != nil || targetGroupObservation(reader, target) != model.GroupAbsent {
+				killedBeforeAbsent.Store(true)
+			}
+			return process.Kill()
+		}
+		return nil
+	}
+	fixture.spec.hooks.beforeMonitorWaitReady = func(monitor *MonitorProcess) error {
+		var armed bool
+		target, _, reader, armed = monitor.armedCleanupState()
+		if !armed {
+			return errors.New("monitor target was not marked potentially armed after bind")
+		}
+		waitFile(t, readyMarker)
+		cancel()
+		return nil
+	}
+
+	handle, err := Launch(ctx, fixture.spec)
+	if err == nil {
+		cleanupParkedHandle(t, handle)
+		t.Fatal("Launch() succeeded; want readiness cancellation")
+	}
+	if !errors.Is(err, ErrMonitorNotArmed) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Launch() error = %v, want monitor-not-armed and context canceled", err)
+	}
+	if killedBeforeAbsent.Load() {
+		t.Fatal("potentially armed monitor was killed before target-group absence was observed")
+	}
+	if got := killCount.Load(); got != 0 {
+		t.Fatalf("monitor kill count = %d, want 0", got)
+	}
+	calls := parentContainment.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("parent containment calls = %d, want 1", len(calls))
+	}
+	if !calls[0].daemonControlClosed {
+		t.Fatal("parent containment ran before daemon-control writer was closed")
+	}
+	lines := readLines(t, fixture.monitorMarker)
+	if len(lines) != 1 {
+		t.Fatalf("monitor containment lines = %d (%v), want 1", len(lines), lines)
+	}
+	wantLine := fmt.Sprintf("contained pgid=%d leader=%d", target.PGID, target.Leader.PID)
+	if lines[0] != wantLine {
+		t.Fatalf("monitor containment line = %q, want %q", lines[0], wantLine)
+	}
+	if err := waitGroupAbsent(context.Background(), target); err != nil {
+		t.Fatalf("target group still present after readiness cancellation cleanup: %v", err)
+	}
+	assertFileAbsent(t, fixture.backend.MarkerPath)
+}
+
 func TestLaunchDaemonControlWriterNotInheritedByUnrelatedChild(t *testing.T) {
 	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
 	duringLaunchScan := filepath.Join(t.TempDir(), "during-launch-fds.json")
@@ -1027,8 +1195,9 @@ func monitorCommandWithKill(t *testing.T, marker string, kill bool) CommandSpec 
 }
 
 type monitorCommandOptions struct {
-	Kill  bool
-	Delay time.Duration
+	Kill        bool
+	Delay       time.Duration
+	ReadyMarker string
 }
 
 func monitorCommandWithOptions(t *testing.T, marker string, opts monitorCommandOptions) CommandSpec {
@@ -1046,6 +1215,7 @@ func monitorCommandWithOptions(t *testing.T, marker string, opts monitorCommandO
 			"--marker", marker,
 			"--kill=" + strconv.FormatBool(opts.Kill),
 			"--delay-ms", strconv.FormatInt(opts.Delay.Milliseconds(), 10),
+			"--ready-marker", opts.ReadyMarker,
 		},
 		Env: parklaunchTestEnv(os.Environ(), parklaunchHelperEnv+"="+parklaunchMonitorMode),
 		Dir: filepath.Dir(exe),
@@ -1342,17 +1512,74 @@ func runMonitorHelper(args []string) int {
 	marker := fs.String("marker", "", "containment marker")
 	kill := fs.Bool("kill", false, "kill target group")
 	delayMillis := fs.Int("delay-ms", 0, "delay before containment completes")
+	readyMarker := fs.String("ready-marker", "", "ready marker")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *daemonFD < 3 || *targetFD < 3 || *readyFD < 3 || *marker == "" {
 		return 2
 	}
-	if err := RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, *readyFD, markerContainment{path: *marker, kill: *kill, delay: time.Duration(*delayMillis) * time.Millisecond}); err != nil {
+	containment := markerContainment{path: *marker, kill: *kill, delay: time.Duration(*delayMillis) * time.Millisecond}
+	var err error
+	if *readyMarker == "" {
+		err = RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, *readyFD, containment)
+	} else {
+		err = runMonitorFromFDsWithReadyMarker(context.Background(), *daemonFD, *targetFD, *readyFD, *readyMarker, containment)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 3
 	}
 	return 0
+}
+
+func runMonitorFromFDsWithReadyMarker(ctx context.Context, daemonFD, targetFD, readyFD int, readyMarker string, containment Containment) error {
+	daemonFile := os.NewFile(uintptr(daemonFD), "agentbus-parklaunch-monitor-daemon")
+	if daemonFile == nil {
+		return fmt.Errorf("open daemon fd %d", daemonFD)
+	}
+	defer daemonFile.Close()
+	setCloseOnExec(daemonFile)
+	targetFile := os.NewFile(uintptr(targetFD), "agentbus-parklaunch-monitor-target")
+	if targetFile == nil {
+		return fmt.Errorf("open target fd %d", targetFD)
+	}
+	defer targetFile.Close()
+	setCloseOnExec(targetFile)
+	readyFile := os.NewFile(uintptr(readyFD), "agentbus-parklaunch-monitor-ready")
+	if readyFile == nil {
+		return fmt.Errorf("open ready fd %d", readyFD)
+	}
+	defer readyFile.Close()
+	setCloseOnExec(readyFile)
+	target, err := readMonitorTarget(targetFile)
+	if err != nil {
+		return err
+	}
+	return RunMonitor(ctx, MonitorRunSpec{
+		DaemonControl: daemonFile,
+		Ready:         readyMarkerWriter{Writer: readyFile, path: readyMarker},
+		Target:        target,
+		Containment:   containment,
+	})
+}
+
+type readyMarkerWriter struct {
+	io.Writer
+	path string
+}
+
+func (writer readyMarkerWriter) Write(raw []byte) (int, error) {
+	n, err := writer.Writer.Write(raw)
+	if err != nil {
+		return n, err
+	}
+	if writer.path != "" {
+		if err := os.WriteFile(writer.path, []byte("ready\n"), 0o600); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 func runMonitorNoAckHelper(args []string) int {
@@ -1514,6 +1741,23 @@ func waitBackendResult(t *testing.T, path string) backendResult {
 		lastErr = err
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for backend result %s: %v", path, lastErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func waitFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for {
+		if _, err := os.ReadFile(path); err == nil {
+			return
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for file %s: %v", path, lastErr)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

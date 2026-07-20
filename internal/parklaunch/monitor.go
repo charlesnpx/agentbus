@@ -118,14 +118,12 @@ func (process *MonitorProcess) BindTarget(group model.GroupRef) error {
 			process.bindErr = err
 			return
 		}
+		process.recordBoundTarget(group)
 		process.filesMu.Lock()
 		if process.targetWrite == targetWrite {
 			process.targetWrite = nil
 			process.filesMu.Unlock()
 			process.bindErr = targetWrite.Close()
-			if process.bindErr == nil {
-				process.recordBoundTarget(group)
-			}
 			return
 		}
 		process.filesMu.Unlock()
@@ -146,6 +144,7 @@ func (process *MonitorProcess) configureStopCleanup(containment Containment, rea
 func (process *MonitorProcess) recordBoundTarget(group model.GroupRef) {
 	process.stateMu.Lock()
 	process.stopTarget = group
+	process.stopArmed = true
 	process.stateMu.Unlock()
 }
 
@@ -275,6 +274,12 @@ func (process *MonitorProcess) WaitReady(ctx context.Context) error {
 	if readyRead == nil {
 		return nil
 	}
+	defer func() {
+		_ = closeMonitorReady(process)
+	}()
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %w", ErrMonitorNotArmed, err)
+	}
 	readDone := make(chan error, 1)
 	go func() {
 		var ack [1]byte
@@ -290,9 +295,6 @@ func (process *MonitorProcess) WaitReady(ctx context.Context) error {
 	}()
 	timer := time.NewTimer(2 * time.Second)
 	defer timer.Stop()
-	defer func() {
-		_ = closeMonitorReady(process)
-	}()
 	select {
 	case err := <-readDone:
 		if err != nil {
@@ -303,7 +305,7 @@ func (process *MonitorProcess) WaitReady(ctx context.Context) error {
 	case <-process.Done():
 		return fmt.Errorf("%w: monitor exited before readiness: %v", ErrMonitorNotArmed, process.Wait())
 	case <-ctx.Done():
-		return fmt.Errorf("%w: %v", ErrMonitorNotArmed, ctx.Err())
+		return fmt.Errorf("%w: %w", ErrMonitorNotArmed, ctx.Err())
 	case <-timer.C:
 		return fmt.Errorf("%w: timeout waiting for readiness ack", ErrMonitorNotArmed)
 	}
