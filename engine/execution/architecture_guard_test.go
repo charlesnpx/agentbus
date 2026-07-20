@@ -2,6 +2,7 @@ package execution_test
 
 import (
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
@@ -64,24 +65,17 @@ func TestServedStartupRecoveryDoesNotImportRepository(t *testing.T) {
 
 func TestStartupRecoveryDoesNotDecodeOrReplayParkProtocolFrames(t *testing.T) {
 	root := repoRoot(t)
-	files := []string{
-		filepath.Join(root, "engine", "execution", "authority", "bootstrap.go"),
-		filepath.Join(root, "engine", "execution", "authority", "recovery_tokens.go"),
-		filepath.Join(root, "engine", "execution", "authority", "startup.go"),
-		filepath.Join(root, "internal", "served", "admission_recovery.go"),
+	files := collectNonTestGoFiles(t, []string{
+		filepath.Join(root, "engine", "execution", "authority"),
+		filepath.Join(root, "internal", "served"),
+	})
+	forbiddenImports := []forbiddenImport{
+		exactImport(modulePath + "/internal/parkproto"),
 	}
 	for _, path := range files {
-		assertFileNoForbiddenImports(t, path, []forbiddenImport{
-			exactImport(modulePath + "/internal/parkproto"),
-		})
+		assertFileNoForbiddenImports(t, path, forbiddenImports)
+		assertFileNoParkProtocolFrameCalls(t, path)
 	}
-	assertFilesDoNotContain(t, files, []string{
-		"parkproto.",
-		"ReleaseBinding",
-		"ReleaseExpectation",
-		"WriteRelease(",
-		"WriteFrame(",
-	})
 }
 
 func TestOnlyLaunchImportsAuthorityAndCustodianTogether(t *testing.T) {
@@ -208,19 +202,84 @@ func assertFileNoForbiddenImports(t *testing.T, path string, forbiddenImports []
 	}
 }
 
-func assertFilesDoNotContain(t *testing.T, paths []string, forbidden []string) {
+func assertFileNoParkProtocolFrameCalls(t *testing.T, path string) {
 	t.Helper()
-	for _, path := range paths {
-		raw, err := os.ReadFile(path)
+	file := parseGoFile(t, path, 0)
+	parkprotoAliases := map[string]bool{}
+	for _, spec := range file.Imports {
+		importPath, err := strconv.Unquote(spec.Path.Value)
 		if err != nil {
-			t.Fatalf("read %s: %v", path, err)
+			t.Fatalf("unquote import in %s: %v", path, err)
 		}
-		for _, text := range forbidden {
-			if strings.Contains(string(raw), text) {
-				t.Fatalf("%s contains forbidden recovery frame token %q", path, text)
-			}
+		if importPath != modulePath+"/internal/parkproto" {
+			continue
+		}
+		switch {
+		case spec.Name == nil:
+			parkprotoAliases["parkproto"] = true
+		case spec.Name.Name == ".":
+			parkprotoAliases["."] = true
+		default:
+			parkprotoAliases[spec.Name.Name] = true
 		}
 	}
+	forbiddenSelectors := map[string]bool{
+		"NewReader":      true,
+		"Read":           true,
+		"ReadRawFrame":   true,
+		"WriteFrame":     true,
+		"WriteRelease":   true,
+		"Release":        true,
+		"ReleaseBinding": true,
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.SelectorExpr:
+			ident, ok := n.X.(*ast.Ident)
+			if ok && parkprotoAliases[ident.Name] && forbiddenSelectors[n.Sel.Name] {
+				t.Fatalf("%s calls or references forbidden parkproto recovery frame member %s.%s", path, ident.Name, n.Sel.Name)
+			}
+		case *ast.Ident:
+			if parkprotoAliases["."] && forbiddenSelectors[n.Name] {
+				t.Fatalf("%s calls or references forbidden parkproto recovery frame member %s", path, n.Name)
+			}
+		}
+		return true
+	})
+}
+
+func collectNonTestGoFiles(t *testing.T, dirs []string) []string {
+	t.Helper()
+	var files []string
+	for _, dir := range dirs {
+		if err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			if strings.HasSuffix(entry.Name(), ".go") && !strings.HasSuffix(entry.Name(), "_test.go") {
+				files = append(files, path)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(files) == 0 {
+		t.Fatalf("no non-test Go files found in %v", dirs)
+	}
+	return files
+}
+
+func parseGoFile(t *testing.T, path string, mode parser.Mode) *ast.File {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, mode)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	return file
 }
 
 func repoRoot(t *testing.T) string {

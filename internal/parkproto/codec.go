@@ -183,7 +183,11 @@ func decodePayload(messageType MessageType, payload json.RawMessage) (Message, e
 		if err := strictUnmarshalJSON(payload, &release); err != nil {
 			return nil, fmt.Errorf("%w: release: %v", ErrMalformed, err)
 		}
-		return release.toRelease(), nil
+		decoded, err := release.toRelease()
+		if err != nil {
+			return nil, fmt.Errorf("%w: release: %v", ErrMalformed, err)
+		}
+		return decoded, nil
 	case MessageReleaseAck:
 		var ack ReleaseAck
 		if err := strictUnmarshalJSON(payload, &ack); err != nil {
@@ -324,46 +328,80 @@ type strictReleaseJSON struct {
 	ExecSpec         ExecSpec           `json:"execSpec"`
 }
 
-func (release strictReleaseJSON) toRelease() Release {
+func (release strictReleaseJSON) toRelease() (Release, error) {
+	groupRef, err := release.ExpectedGroupRef.toGroupRef()
+	if err != nil {
+		return Release{}, err
+	}
 	return Release{
 		Binding:          release.Binding,
-		ExpectedGroupRef: release.ExpectedGroupRef.toGroupRef(),
+		ExpectedGroupRef: groupRef,
 		ExecSpec:         release.ExecSpec,
-	}
+	}, nil
 }
 
 type strictGroupRefJSON struct {
-	Version             uint16
-	CustodyID           model.CustodyID
-	Launch              model.LaunchKey
-	HostBootID          string
+	Version             *uint16
+	CustodyID           *model.CustodyID
+	Launch              *model.LaunchKey
+	HostBootID          *string
 	PIDNamespaceID      string `json:"PIDNamespaceID,omitempty"`
-	PIDNamespaceState   model.PIDNamespaceState
+	PIDNamespaceState   *model.PIDNamespaceState
 	RetainedDomainID    string `json:"RetainedDomainID,omitempty"`
 	RetainedDomainState *model.RetainedDomainState
-	PGID                int
-	Leader              model.ProcessIdentity
-	Monitor             model.ProcessIdentity
-	RetainedID          string
+	PGID                *int
+	Leader              *model.ProcessIdentity
+	Monitor             *model.ProcessIdentity
+	RetainedID          *string
 }
 
-func (ref strictGroupRefJSON) toGroupRef() model.GroupRef {
-	retainedDomainState := model.RetainedDomainUnknown
-	if ref.RetainedDomainState != nil {
-		retainedDomainState = *ref.RetainedDomainState
+func (ref strictGroupRefJSON) toGroupRef() (model.GroupRef, error) {
+	if ref.Version == nil {
+		return model.GroupRef{}, fmt.Errorf("expectedGroupRef.Version is required")
 	}
-	return model.GroupRef{
-		Version:             ref.Version,
-		CustodyID:           ref.CustodyID,
-		Launch:              ref.Launch,
-		HostBootID:          ref.HostBootID,
+	if ref.CustodyID == nil {
+		return model.GroupRef{}, fmt.Errorf("expectedGroupRef.CustodyID is required")
+	}
+	if ref.Launch == nil {
+		return model.GroupRef{}, fmt.Errorf("expectedGroupRef.Launch is required")
+	}
+	if ref.HostBootID == nil {
+		return model.GroupRef{}, fmt.Errorf("expectedGroupRef.HostBootID is required")
+	}
+	if ref.PIDNamespaceState == nil {
+		return model.GroupRef{}, fmt.Errorf("expectedGroupRef.PIDNamespaceState is required")
+	}
+	if ref.RetainedDomainState == nil {
+		return model.GroupRef{}, fmt.Errorf("expectedGroupRef.RetainedDomainState is required")
+	}
+	if ref.PGID == nil {
+		return model.GroupRef{}, fmt.Errorf("expectedGroupRef.PGID is required")
+	}
+	if ref.Leader == nil {
+		return model.GroupRef{}, fmt.Errorf("expectedGroupRef.Leader is required")
+	}
+	if ref.Monitor == nil {
+		return model.GroupRef{}, fmt.Errorf("expectedGroupRef.Monitor is required")
+	}
+	if ref.RetainedID == nil {
+		return model.GroupRef{}, fmt.Errorf("expectedGroupRef.RetainedID is required")
+	}
+	groupRef := model.GroupRef{
+		Version:             *ref.Version,
+		CustodyID:           *ref.CustodyID,
+		Launch:              *ref.Launch,
+		HostBootID:          *ref.HostBootID,
 		PIDNamespaceID:      ref.PIDNamespaceID,
-		PIDNamespaceState:   ref.PIDNamespaceState,
+		PIDNamespaceState:   *ref.PIDNamespaceState,
 		RetainedDomainID:    ref.RetainedDomainID,
-		RetainedDomainState: retainedDomainState,
-		PGID:                ref.PGID,
-		Leader:              ref.Leader,
-		Monitor:             ref.Monitor,
-		RetainedID:          ref.RetainedID,
+		RetainedDomainState: *ref.RetainedDomainState,
+		PGID:                *ref.PGID,
+		Leader:              *ref.Leader,
+		Monitor:             *ref.Monitor,
+		RetainedID:          *ref.RetainedID,
 	}
+	if err := groupRef.Validate(); err != nil {
+		return model.GroupRef{}, fmt.Errorf("expectedGroupRef: %v", err)
+	}
+	return groupRef, nil
 }

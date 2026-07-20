@@ -326,18 +326,6 @@ func TestParkedWorkerRejectsInvalidProtocolFrames(t *testing.T) {
 	}
 }
 
-func TestParkedWorkerUnboundControlChannelLossDoesNotStartBackend(t *testing.T) {
-	harness := startParkedWorkerHarness(t, newBackendFixtureSpec(t, backendFixtureOptions{
-		MarkerPath: t.TempDir() + "/backend-started",
-		ResultPath: t.TempDir() + "/backend-result.json",
-		ClosedFDs:  []int{workerControlReadFD, workerControlWriteFD},
-	}))
-	_ = harness.readIdentity(t)
-	_ = harness.controlIn.Close()
-	harness.waitFailure(t, "read release")
-	assertFileAbsent(t, harness.backend.MarkerPath)
-}
-
 func TestParkedWorkerHelperProcess(t *testing.T) {
 	if os.Getenv(parkedWorkerHelperEnv) != parkedWorkerHelperMode {
 		return

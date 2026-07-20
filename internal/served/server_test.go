@@ -489,7 +489,7 @@ func TestCapabilityOffStartupRunsLegacyReapBeforeListen(t *testing.T) {
 	}
 }
 
-func TestAdmissionRecoveryExecutorFinalizesPriorBootAcceptedWorkItem(t *testing.T) {
+func TestAdmissionRecoveryExecutorUnboundControlLossFinalizesWithoutBackendStart(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	repo := memory.NewRepository()
@@ -497,7 +497,8 @@ func TestAdmissionRecoveryExecutorFinalizesPriorBootAcceptedWorkItem(t *testing.
 	launcher := newAdmissionFakeLaunchCustodian(t)
 	_, accepted := newPriorBootAuthorityWork(t, repo, anchorStore, launcher, "recovery-finalize")
 
-	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	backend := newFakeBackend("fake")
+	server, _, _ := newUnstartedTestServer(t, backend)
 	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
 
 	image, err := server.admissionReady.LoadJob(ctx, accepted.Record.JobID)
@@ -514,12 +515,24 @@ func TestAdmissionRecoveryExecutorFinalizesPriorBootAcceptedWorkItem(t *testing.
 	if got := launcher.containCount(); got != 0 {
 		t.Fatalf("containments = %d, want none for unlaunched finalization", got)
 	}
+	if got := len(launcher.preparedOrdinals()); got != 0 {
+		t.Fatalf("prepared launches = %d, want 0", got)
+	}
+	if got := launcher.releaseCount(); got != 0 {
+		t.Fatalf("releases = %d, want 0", got)
+	}
+	if got := launcher.abortCount(); got != 0 {
+		t.Fatalf("aborts = %d, want 0", got)
+	}
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0", got)
+	}
 	if reason := server.safetyLatch.Reason(); reason != nil {
 		t.Fatalf("safety latch tripped: %v", reason)
 	}
 }
 
-func TestAdmissionRecoveryExecutorContainsResidualGroupBeforeSealReady(t *testing.T) {
+func TestAdmissionRecoveryExecutorBoundCurrentObligationContainsOnlyDurableGroup(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	repo := memory.NewRepository()
@@ -558,6 +571,25 @@ func TestAdmissionRecoveryExecutorContainsResidualGroupBeforeSealReady(t *testin
 	}
 	if got := launcher.containCount(); got != 1 {
 		t.Fatalf("containments = %d, want one residual group containment", got)
+	}
+	contains := launcher.containObservations()
+	if len(contains) != 1 {
+		t.Fatalf("contain observations = %d, want 1", len(contains))
+	}
+	if contains[0].cause != custodian.QuiescenceCauseRecovery {
+		t.Fatalf("contain cause = %s, want %s", contains[0].cause, custodian.QuiescenceCauseRecovery)
+	}
+	if !contains[0].group.Equal(group) {
+		t.Fatalf("contain group = %+v, want durable group %+v", contains[0].group, group)
+	}
+	if got := len(launcher.preparedOrdinals()); got != 0 {
+		t.Fatalf("prepared launches = %d, want 0", got)
+	}
+	if got := launcher.releaseCount(); got != 0 {
+		t.Fatalf("releases = %d, want 0", got)
+	}
+	if got := launcher.abortCount(); got != 0 {
+		t.Fatalf("aborts = %d, want 0", got)
 	}
 	if reason := server.safetyLatch.Reason(); reason != nil {
 		t.Fatalf("safety latch tripped: %v", reason)
@@ -3667,12 +3699,13 @@ type admissionFakeLaunchCustodian struct {
 	issuer   custodian.AttestationIssuer
 	verifier custodian.AttestationVerifier
 
-	mu       sync.Mutex
-	ordinals []model.LaunchOrdinal
-	releases int
-	aborts   int
-	contains int
-	running  map[string]*admissionFakeRunning
+	mu           sync.Mutex
+	ordinals     []model.LaunchOrdinal
+	releases     int
+	aborts       int
+	contains     int
+	containments []admissionContainObservation
+	running      map[string]*admissionFakeRunning
 
 	abortCtxErrs      []error
 	abortCtxDeadlines []bool
@@ -3723,6 +3756,7 @@ func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.E
 func (c *admissionFakeLaunchCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
 	c.mu.Lock()
 	c.contains++
+	c.containments = append(c.containments, admissionContainObservation{group: group, cause: cause})
 	containErr := c.containErr
 	running := c.running[string(group.CustodyID)]
 	c.mu.Unlock()
@@ -3763,6 +3797,12 @@ func (c *admissionFakeLaunchCustodian) containCount() int {
 	return c.contains
 }
 
+func (c *admissionFakeLaunchCustodian) containObservations() []admissionContainObservation {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]admissionContainObservation(nil), c.containments...)
+}
+
 func (c *admissionFakeLaunchCustodian) HasActiveCustodies() bool {
 	return c != nil && c.activeCustodies.Load()
 }
@@ -3778,6 +3818,11 @@ type admissionFakePrepared struct {
 	running   *admissionFakeRunning
 	issuer    custodian.AttestationIssuer
 	custodian *admissionFakeLaunchCustodian
+}
+
+type admissionContainObservation struct {
+	group model.GroupRef
+	cause custodian.QuiescenceCause
 }
 
 func (p *admissionFakePrepared) Ref() model.GroupRef {

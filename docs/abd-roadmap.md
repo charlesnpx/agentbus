@@ -4,8 +4,8 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0=23275e1. R0T=2185af1(+fix 084f8d3). R1 committed (parkproto purity, Version 1->2),
-verified Linux cgroup-v2 full suite + R0T RED. sol review of R1 next. Then R2A.
+STATUS: EXECUTING. R0=23275e1. R0T=2185af1(+fix 084f8d3). R1=e360d8e(+roadmap 3137c94 +fix this commit;
+sol review CLOSED). All pushed to origin/abd-authority. Next: R2A (packet staged).
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -287,7 +287,18 @@ see the R4A contract block.)
   strict-E2E harness launched: worker job_20260720T151723000000000Z_000002 (codex gpt-5.5 xhigh, --write).
   Packet: ~/tmp/delegate-packets/abd-R0T-real-serve-harness.md. Expected sentinel
   strict_native_runtime_unavailable; opt-in gate abd_strict_e2e + AGENTBUS_RUN_STRICT_E2E=1.
-- 2026-07-20 R1 (this commit): parkproto logical purity. Version 1->2; LogicalGrant removed from
+- 2026-07-20 R1-fix (this commit): closed sol review of R1 (verdict was FIX-REQUIRED; core R1 confirmed
+  correct). F2 strict frame decode now requires explicit current GroupRef fields (pointers; nil->ErrMalformed)
+  + Validate(); removed backward-compat defaulting (no legacy). F1 deleted vacuous upgrade tests; added
+  behavioral served recovery tests: bound obligation => exactly one ContainAndVerify(cause=Recovery) on the
+  durable group (no frame decode/replay/prepare/release/abort/backend-start), unbound => finalized w/ no
+  backend start. F3 arch guard now AST/import walk over all non-test authority+served recovery files. F4
+  durable-secret oracle threads a live sentinel ReleaseSecret through the release path and scans all durable
+  sinks (safety record/projection/binding/bbolt/anchor/raw file) for bytes+field names. Verified: macOS
+  build/vet/gofmt=0, go test ./...=0 (1 pre-existing served socket flake under full-suite parallelism, isolated
+  count=5/race=3 green, papercut filed), race -count=3=0; Docker cgroup-v2 -p 1 full suite=0 + R0T RED=0. sol
+  review CLOSED.
+- 2026-07-20 R1 (e360d8e): parkproto logical purity. Version 1->2; LogicalGrant removed from
   ReleaseBinding + validateExpectation/validateStatic/equal; parklaunch releaseExpectation grant-free; worker
   bootstrap grant-free. Added tests: old/mixed-frame rejection (codec), durable release-secret absence
   (authority), recovery no-frame-decode/no-replay guard (architecture), 2 upgrade scenarios (recovery_tokens).

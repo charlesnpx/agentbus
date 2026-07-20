@@ -261,7 +261,7 @@ func TestReadRawFrameRejectsOversizedDeclaredLengthBeforeBodyRead(t *testing.T) 
 	}
 }
 
-func TestReleaseRejectsOldAndMixedVersionFrames(t *testing.T) {
+func TestReleaseRejectsRemovedLogicalGrantField(t *testing.T) {
 	execSpec := ExecSpec{Path: "/bin/echo", Argv: []string{"/bin/echo", "ok"}, Env: []string{"A=B"}, Dir: "/tmp"}
 	execDigest, err := DigestExecSpec(execSpec)
 	if err != nil {
@@ -275,51 +275,17 @@ func TestReleaseRejectsOldAndMixedVersionFrames(t *testing.T) {
 	binding := testReleaseBinding(execDigest)
 	binding.GroupRefDigest = groupDigest
 	release := Release{Binding: binding, ExpectedGroupRef: groupRef, ExecSpec: execSpec}
-	expectation := ReleaseExpectation{Binding: binding}
 
-	t.Run("old envelope version", func(t *testing.T) {
-		var raw bytes.Buffer
-		if err := WriteFrame(&raw, Version-1, 1, release); err != nil {
-			t.Fatal(err)
-		}
-		_, err := NewReader(&raw).Read()
-		if !errors.Is(err, ErrVersionMismatch) {
-			t.Fatalf("Read() error=%v, want %v", err, ErrVersionMismatch)
-		}
-	})
-
-	t.Run("old binding version in current envelope", func(t *testing.T) {
-		mixed := release
-		mixed.Binding.ProtocolVersion = Version - 1
-		var raw bytes.Buffer
-		if err := WriteFrame(&raw, Version, 1, mixed); err != nil {
-			t.Fatal(err)
-		}
-		received, err := NewReader(&raw).Read()
-		if err != nil {
-			t.Fatalf("Read() error = %v", err)
-		}
-		got, ok := received.Message.(Release)
-		if !ok {
-			t.Fatalf("message=%T, want Release", received.Message)
-		}
-		if err := got.ValidateFor(received.Sequence, expectation); !errors.Is(err, ErrBinding) {
-			t.Fatalf("ValidateFor() error=%v, want %v", err, ErrBinding)
-		}
-	})
-
-	t.Run("removed logical grant field", func(t *testing.T) {
-		payload := releasePayloadWithLogicalGrant(t, release)
-		raw := rawPayload([]byte(fmt.Sprintf(
-			`{"version":%d,"sequence":1,"type":"Release","payload":%s}`,
-			Version,
-			payload,
-		)))
-		_, err := NewReader(bytes.NewReader(raw)).Read()
-		if !errors.Is(err, ErrMalformed) {
-			t.Fatalf("Read() error=%v, want %v", err, ErrMalformed)
-		}
-	})
+	payload := releasePayloadWithLogicalGrant(t, release)
+	raw := rawPayload([]byte(fmt.Sprintf(
+		`{"version":%d,"sequence":1,"type":"Release","payload":%s}`,
+		Version,
+		payload,
+	)))
+	_, err = NewReader(bytes.NewReader(raw)).Read()
+	if !errors.Is(err, ErrMalformed) {
+		t.Fatalf("Read() error=%v, want %v", err, ErrMalformed)
+	}
 }
 
 func TestReleaseBindingChecksPhysicalSecretGroupDigestAndExecDigest(t *testing.T) {
@@ -359,7 +325,7 @@ func TestReleaseBindingChecksPhysicalSecretGroupDigestAndExecDigest(t *testing.T
 	}
 }
 
-func TestReleaseGroupRefRetainedDomainRoundTripAndLegacyDecode(t *testing.T) {
+func TestReleaseGroupRefRetainedDomainRoundTripRequiresCurrentFields(t *testing.T) {
 	execSpec := ExecSpec{Path: "/bin/echo", Argv: []string{"/bin/echo", "ok"}, Env: []string{"A=B"}, Dir: "/tmp"}
 	execDigest, err := DigestExecSpec(execSpec)
 	if err != nil {
@@ -409,27 +375,56 @@ func TestReleaseGroupRefRetainedDomainRoundTripAndLegacyDecode(t *testing.T) {
 	if err := json.Unmarshal(fields["expectedGroupRef"], &groupFields); err != nil {
 		t.Fatalf("Unmarshal group fields error = %v", err)
 	}
-	delete(groupFields, "RetainedDomainID")
+	if _, ok := groupFields["RetainedDomainState"]; !ok {
+		t.Fatal("encoded release omitted required RetainedDomainState")
+	}
 	delete(groupFields, "RetainedDomainState")
-	legacyGroup, err := json.Marshal(groupFields)
+	missingRetainedDomainStateGroup, err := json.Marshal(groupFields)
 	if err != nil {
-		t.Fatalf("Marshal legacy group error = %v", err)
+		t.Fatalf("Marshal missing-field group error = %v", err)
 	}
-	fields["expectedGroupRef"] = legacyGroup
-	legacyPayload, err := json.Marshal(fields)
+	fields["expectedGroupRef"] = missingRetainedDomainStateGroup
+	missingFieldPayload, err := json.Marshal(fields)
 	if err != nil {
-		t.Fatalf("Marshal legacy payload error = %v", err)
+		t.Fatalf("Marshal missing-field payload error = %v", err)
 	}
-	legacyMessage, err := decodePayload(MessageRelease, legacyPayload)
+	raw := rawPayload([]byte(fmt.Sprintf(
+		`{"version":%d,"sequence":1,"type":"Release","payload":%s}`,
+		Version,
+		missingFieldPayload,
+	)))
+	if _, err := NewReader(bytes.NewReader(raw)).Read(); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("Read() missing RetainedDomainState error=%v, want %v", err, ErrMalformed)
+	}
+}
+
+func TestReleaseBindingRejectsDifferentlyShapedExpectedGroupRef(t *testing.T) {
+	execSpec := ExecSpec{Path: "/bin/echo", Argv: []string{"/bin/echo", "ok"}, Env: []string{"A=B"}, Dir: "/tmp"}
+	execDigest, err := DigestExecSpec(execSpec)
 	if err != nil {
-		t.Fatalf("decode legacy release error = %v", err)
+		t.Fatal(err)
 	}
-	legacyRelease := legacyMessage.(Release)
-	if legacyRelease.ExpectedGroupRef.RetainedDomainState != model.RetainedDomainUnknown {
-		t.Fatalf("legacy retained domain state = %v, want %v", legacyRelease.ExpectedGroupRef.RetainedDomainState, model.RetainedDomainUnknown)
+	expectedGroup := testGroupRef()
+	expectedDigest, err := DigestGroupRef(expectedGroup)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if legacyRelease.ExpectedGroupRef.KernelDomain().ProvablySame(groupRef.KernelDomain()) {
-		t.Fatalf("legacy missing retained domain was provably same as known retained domain")
+	expectedBinding := testReleaseBinding(execDigest)
+	expectedBinding.GroupRefDigest = expectedDigest
+
+	differentGroup := expectedGroup
+	differentGroup.RetainedDomainID = "retained-domain-different"
+	differentGroup.RetainedDomainState = model.RetainedDomainKnown
+	differentDigest, err := DigestGroupRef(differentGroup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseBinding := expectedBinding
+	releaseBinding.GroupRefDigest = differentDigest
+	release := Release{Binding: releaseBinding, ExpectedGroupRef: differentGroup, ExecSpec: execSpec}
+
+	if err := release.ValidateFor(1, ReleaseExpectation{Binding: expectedBinding}); !errors.Is(err, ErrBinding) {
+		t.Fatalf("different expected group binding error=%v, want %v", err, ErrBinding)
 	}
 }
 
@@ -660,7 +655,7 @@ func releasePayloadWithLogicalGrant(t *testing.T, release Release) []byte {
 			"Epoch":     1,
 		},
 		"Ordinal":   1,
-		"Nonce":     "nonce-pre-upgrade",
+		"Nonce":     "nonce-removed-field",
 		"GrantedBy": map[string]any{"BootID": "boot-1", "OwnerID": "owner-1"},
 	}
 	out, err := json.Marshal(payload)
