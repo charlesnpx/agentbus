@@ -453,6 +453,12 @@ func (handle *ParkedHandle) Done() <-chan struct{} {
 	return handle.wait.Done()
 }
 
+func (handle *ParkedHandle) StartWait() {
+	if handle != nil && handle.wait != nil {
+		handle.wait.Start()
+	}
+}
+
 func (handle *ParkedHandle) Wait() error {
 	if handle == nil || handle.wait == nil {
 		return nil

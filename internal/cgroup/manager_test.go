@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/containment"
+	"github.com/charlesnpx/agentbus/internal/procgroup"
 	"golang.org/x/sys/unix"
 )
 
@@ -450,6 +452,50 @@ func TestPlacePIDWritesHeldObjectAfterNameReplacement(t *testing.T) {
 	}
 	if _, ok := replacement.procs[4321]; ok {
 		t.Fatalf("replacement leaf received placed pid")
+	}
+}
+
+func TestPlaceProcessRejectsReusedPIDAfterCgroupWrite(t *testing.T) {
+	fs := newFakeCgroupFS()
+	manager := newFakeManager(fs, leafSequence("cg-place-reused-pid"))
+	capability := acquireCapability(t, manager)
+	domain, err := model.NewKernelDomainID("host-boot-place", "pidns-place")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := procgroup.NewProcessClaim(1234, 1234, "start-original", domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reused, err := procgroup.NewProcessClaim(1234, 1234, "start-reused", domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalReadProcessClaim := readProcessClaimForPlacement
+	t.Cleanup(func() {
+		readProcessClaimForPlacement = originalReadProcessClaim
+	})
+	calls := 0
+	readProcessClaimForPlacement = func(pid int) (procgroup.ProcessClaim, error) {
+		if pid != expected.PID {
+			t.Fatalf("read process pid = %d, want %d", pid, expected.PID)
+		}
+		calls++
+		if calls == 1 {
+			return expected, nil
+		}
+		return reused, nil
+	}
+
+	err = capability.PlaceProcess(context.Background(), expected)
+	if err == nil {
+		t.Fatal("PlaceProcess() error = nil, want PID reuse fence failure")
+	}
+	if !strings.Contains(err.Error(), "process identity changed during cgroup placement") {
+		t.Fatalf("PlaceProcess() error = %v, want identity changed", err)
+	}
+	if calls != 2 {
+		t.Fatalf("placement identity reads = %d, want 2", calls)
 	}
 }
 

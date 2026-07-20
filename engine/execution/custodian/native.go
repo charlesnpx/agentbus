@@ -368,12 +368,23 @@ func (custodian *NativeCustodian) containRecoveredPhysical(ctx context.Context, 
 	if err != nil {
 		if retainedGroupMissing(err) {
 			if proofErr := proveRetainedGroupAbsent(ctx, manager, group); proofErr == nil {
-				return PhysicalOutcome{
-					Kind:     PhysicalOutcomeAbsent,
-					Group:    group,
-					Method:   model.QuiescenceAlreadyAbsent,
-					Decision: model.AlreadyAbsent,
+				absent, absentErr := stableIndependentAbsent(ctx, group)
+				if absentErr == nil && absent {
+					return PhysicalOutcome{
+						Kind:     PhysicalOutcomeAbsent,
+						Group:    group,
+						Method:   model.QuiescenceAlreadyAbsent,
+						Decision: model.AlreadyAbsent,
+					}
 				}
+				if absentErr == nil {
+					absentErr = fmt.Errorf("target process group is not stably absent")
+				}
+				return unprovablePhysical(group, containment.ReasonProbeUnprovable, model.AlreadyAbsent, errors.Join(
+					fmt.Errorf("%w: retained group missing without process-group absence proof", ErrNativeCustodianUnavailable),
+					err,
+					absentErr,
+				))
 			} else {
 				return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, errors.Join(
 					fmt.Errorf("%w: retained group missing without same-domain absence proof", ErrNativeCustodianUnavailable),
@@ -1065,6 +1076,13 @@ func (process *NativeRunningProcess) finalizeAbsentLocked(ctx context.Context, o
 		if !empty {
 			return PhysicalOutcome{}, command.ExitObservation{}, fmt.Errorf("target retained group is not empty")
 		}
+		absent, err := stableIndependentAbsent(ctx, process.group)
+		if err != nil {
+			return PhysicalOutcome{}, command.ExitObservation{}, err
+		}
+		if !absent {
+			return PhysicalOutcome{}, command.ExitObservation{}, fmt.Errorf("target process group is not stably absent")
+		}
 	}
 	var exit command.ExitObservation
 	var waitErr error
@@ -1275,6 +1293,13 @@ func containPhysical(ctx context.Context, group model.GroupRef, params containme
 		return unprovablePhysical(group, containment.ReasonInvalidInput, outcome.Decision, err)
 	}
 	if requiresRetained {
+		absent, err := stableIndependentAbsent(ctx, group)
+		if err != nil {
+			return unprovablePhysical(group, containment.ReasonProbeUnprovable, outcome.Decision, err)
+		}
+		if !absent {
+			return unprovablePhysical(group, containment.ReasonProbeContradictedObserver, outcome.Decision, nil)
+		}
 		method := methodForDecision(outcome.Decision)
 		if retainedSignals.termKillDelivered() {
 			method = model.QuiescenceTermKill
@@ -1444,8 +1469,9 @@ type nativeContainmentSignaler struct {
 }
 
 // nativeContainmentSignaler keeps shared containment fail-closed while smoothing
-// native owner facts: kill(0) EPERM proves group existence, and a signal EPERM is
-// non-fatal only when the parent-held leader is the sole remaining group member.
+// native owner facts: EPERM proves liveness only while this parent holds the
+// exact leader unreaped, and a signal EPERM is non-fatal only when that leader
+// is the sole remaining group member.
 func (signaler nativeContainmentSignaler) SignalGroup(ctx context.Context, target model.GroupRef, signal containment.Signal) (containment.SignalResult, error) {
 	result, err := containment.RealSignaler{}.SignalGroup(ctx, target, signal)
 	if err == nil {
@@ -1460,9 +1486,9 @@ func (signaler nativeContainmentSignaler) SignalGroup(ctx context.Context, targe
 	return result, err
 }
 
-func (nativeContainmentSignaler) ProbeGroup(ctx context.Context, target model.GroupRef) (containment.ProbeResult, error) {
+func (signaler nativeContainmentSignaler) ProbeGroup(ctx context.Context, target model.GroupRef) (containment.ProbeResult, error) {
 	result, err := containment.RealSignaler{}.ProbeGroup(ctx, target)
-	if errors.Is(err, unix.EPERM) {
+	if errors.Is(err, unix.EPERM) && signaler.retention != nil && signaler.retention.unreapedFor(target) {
 		return containment.ProbeLive, nil
 	}
 	return result, err
@@ -1511,33 +1537,36 @@ func unprovablePhysical(group model.GroupRef, reason containment.UnprovableReaso
 	}
 }
 
-func independentlyAbsent(group model.GroupRef) (bool, error) {
+func independentlyAbsent(ctx context.Context, group model.GroupRef) (bool, error) {
 	if err := group.Validate(); err != nil {
 		return false, err
 	}
-	claim, err := procgroup.NewGroupClaim(group.PGID, group.KernelDomain())
+	result, err := containment.RealSignaler{}.ProbeGroup(ctx, group)
 	if err != nil {
 		return false, err
 	}
-	switch procgroup.ClassifyGroup(claim) {
-	case model.GroupAbsent:
+	switch result {
+	case containment.ProbeAbsent:
 		return true, nil
-	case model.GroupLive:
+	case containment.ProbeLive:
 		return false, nil
 	default:
-		return false, fmt.Errorf("independent group observation is %s", procgroup.ClassifyGroup(claim))
+		return false, fmt.Errorf("independent process-group probe is %v", result)
 	}
 }
 
 func stableIndependentAbsent(ctx context.Context, group model.GroupRef) (bool, error) {
-	absent, err := independentlyAbsent(group)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	absent, err := independentlyAbsent(ctx, group)
 	if err != nil || !absent {
 		return absent, err
 	}
 	if err := sleepContext(ctx, 20*time.Millisecond); err != nil {
 		return false, err
 	}
-	return independentlyAbsent(group)
+	return independentlyAbsent(ctx, group)
 }
 
 func sleepContext(ctx context.Context, duration time.Duration) error {

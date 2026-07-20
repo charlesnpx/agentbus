@@ -46,6 +46,13 @@ func TestArchitectureImportGuards(t *testing.T) {
 				exactImport(modulePath + "/internal/cgroup"),
 			},
 		},
+		{
+			name: "agentbus command does not import served",
+			dir:  filepath.Join(root, "cmd", "agentbus"),
+			forbidden: []forbiddenImport{
+				exactImport(modulePath + "/internal/served"),
+			},
+		},
 	}
 
 	for _, rule := range rules {

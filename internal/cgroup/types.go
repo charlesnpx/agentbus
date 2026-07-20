@@ -20,6 +20,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/containment"
+	"github.com/charlesnpx/agentbus/internal/procgroup"
 	"golang.org/x/sys/unix"
 )
 
@@ -30,6 +31,8 @@ var (
 	errLeafCollision = errors.New("cgroup leaf collision")
 	errProcessGone   = errors.New("process gone")
 )
+
+var readProcessClaimForPlacement = procgroup.ReadProcessClaim
 
 type Support struct {
 	Supported          bool
@@ -705,6 +708,30 @@ func (capability *Capability) PlacePID(ctx context.Context, pid int) error {
 	}
 	if !slices.Contains(pids, pid) {
 		return fmt.Errorf("%w: pid %d was not observed in retained cgroup after placement", ErrUnsupported, pid)
+	}
+	return nil
+}
+
+func (capability *Capability) PlaceProcess(ctx context.Context, expected procgroup.ProcessClaim) error {
+	if err := verifyPlacementProcessIdentity(expected); err != nil {
+		return err
+	}
+	if err := capability.PlacePID(ctx, expected.PID); err != nil {
+		return err
+	}
+	return verifyPlacementProcessIdentity(expected)
+}
+
+func verifyPlacementProcessIdentity(expected procgroup.ProcessClaim) error {
+	current, err := readProcessClaimForPlacement(expected.PID)
+	if err != nil {
+		return fmt.Errorf("%w: read process identity for cgroup placement: %v", ErrUnsupported, err)
+	}
+	if current.PID != expected.PID ||
+		current.PGID != expected.PGID ||
+		current.StartToken != expected.StartToken ||
+		!current.KernelDomainID.Equal(expected.KernelDomainID) {
+		return fmt.Errorf("%w: process identity changed during cgroup placement", ErrUnsupported)
 	}
 	return nil
 }

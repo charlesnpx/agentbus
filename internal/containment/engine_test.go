@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"golang.org/x/sys/unix"
 )
 
 func TestContainmentAlreadyAbsentDoesNotSignal(t *testing.T) {
@@ -547,6 +548,7 @@ func TestContainmentRetainedObjectProofAuthorizesKillWithMissingLeader(t *testin
 		{signal: SignalTerminate, result: SignalDelivered},
 		{signal: SignalKill, result: SignalDelivered},
 	}}
+	signaler.probes = []ProbeResult{ProbeAbsent}
 	retained := &fakeRetainedObject{memberships: []RetainedGroupMembership{
 		RetainedMembershipPresent,
 		RetainedMembershipPresent,
@@ -587,7 +589,7 @@ func TestContainmentRetainedSignalAbsentRequiresEmptyProof(t *testing.T) {
 			observer := &fakeObserver{observations: []model.ContainmentObservation{
 				testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
 			}}
-			signaler := &fakeSignaler{}
+			signaler := &fakeSignaler{probes: []ProbeResult{ProbeAbsent}}
 			retained := &fakeRetainedObject{
 				memberships: tt.memberships,
 				script: []signalScript{
@@ -660,7 +662,7 @@ func TestContainmentRetainedObjectEmptyProofProvesAbsent(t *testing.T) {
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
 	}}
-	signaler := &fakeSignaler{}
+	signaler := &fakeSignaler{probes: []ProbeResult{ProbeAbsent}}
 	retained := &fakeRetainedObject{membership: RetainedMembershipEmpty}
 
 	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
@@ -672,12 +674,46 @@ func TestContainmentRetainedObjectEmptyProofProvesAbsent(t *testing.T) {
 	}
 }
 
+func TestContainmentRetainedObjectEmptyProofRequiresProcessGroupAbsence(t *testing.T) {
+	target := testRetainedGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{probes: []ProbeResult{ProbeLive}}
+	retained := &fakeRetainedObject{membership: RetainedMembershipEmpty}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonProbeContradictedObserver)
+	assertSignals(t, signaler)
+	if signaler.probeCalls != 1 {
+		t.Fatalf("numeric PGID probes = %d, want 1", signaler.probeCalls)
+	}
+}
+
+func TestContainmentRetainedObjectEmptyProofEPERMIsUnprovable(t *testing.T) {
+	target := testRetainedGroupRef(t)
+	observer := &fakeObserver{observations: []model.ContainmentObservation{
+		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
+	}}
+	signaler := &fakeSignaler{probeErrors: []error{unix.EPERM}}
+	retained := &fakeRetainedObject{membership: RetainedMembershipEmpty}
+
+	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
+
+	assertUnprovable(t, outcome, ReasonProbeUnprovable)
+	assertSignals(t, signaler)
+	if !errors.Is(outcome.Err, unix.EPERM) {
+		t.Fatalf("outcome error = %v, want EPERM", outcome.Err)
+	}
+}
+
 func TestContainmentRetainedObjectMembersPresentDifferentKernelDomainIsUnprovable(t *testing.T) {
 	target := testRetainedGroupRef(t)
 	observation := testObservation(target, model.GroupLive, model.ProcessIdentityMissing)
 	observation.KernelDomainID.RetainedDomainID = "retained-domain-different"
 	observer := &fakeObserver{observations: []model.ContainmentObservation{observation}}
-	signaler := &fakeSignaler{}
+	signaler := &fakeSignaler{probes: []ProbeResult{ProbeAbsent}}
 	retained := &fakeRetainedObject{membership: RetainedMembershipPresent}
 
 	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
@@ -695,7 +731,7 @@ func TestContainmentRetainedObjectEmptyProofDifferentKernelDomainProvesAbsent(t 
 	observation := testObservation(target, model.GroupLive, model.ProcessIdentityMissing)
 	observation.KernelDomainID.RetainedDomainID = "retained-domain-different"
 	observer := &fakeObserver{observations: []model.ContainmentObservation{observation}}
-	signaler := &fakeSignaler{}
+	signaler := &fakeSignaler{probes: []ProbeResult{ProbeAbsent}}
 	retained := &fakeRetainedObject{membership: RetainedMembershipEmpty}
 
 	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
@@ -746,7 +782,7 @@ func TestContainmentRetainedAuthorityUsesRetainedTeardownForReusedPGID(t *testin
 		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
 		testObservation(target, model.GroupLive, model.ProcessIdentityMissing),
 	}}
-	signaler := &fakeSignaler{}
+	signaler := &fakeSignaler{probes: []ProbeResult{ProbeAbsent}}
 	retained := &fakeRetainedObject{
 		memberships: []RetainedGroupMembership{
 			RetainedMembershipPresent,
@@ -765,14 +801,14 @@ func TestContainmentRetainedAuthorityUsesRetainedTeardownForReusedPGID(t *testin
 	}
 }
 
-func TestContainmentRetainedProbeUsesRetainedCapabilityMembership(t *testing.T) {
+func TestContainmentRetainedProbeRequiresProcessGroupAbsenceAfterRetainedEmpty(t *testing.T) {
 	target := testRetainedGroupRef(t)
 	observer := &fakeObserver{observations: []model.ContainmentObservation{
 		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
 		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
 		testObservation(target, model.GroupLive, model.ProcessIdentityReused),
 	}}
-	signaler := &fakeSignaler{}
+	signaler := &fakeSignaler{probes: []ProbeResult{ProbeAbsent}}
 	retained := &fakeRetainedObject{
 		memberships: []RetainedGroupMembership{
 			RetainedMembershipPresent,
@@ -790,8 +826,8 @@ func TestContainmentRetainedProbeUsesRetainedCapabilityMembership(t *testing.T) 
 	if retained.membershipCalls != 4 {
 		t.Fatalf("retained membership calls = %d, want 4", retained.membershipCalls)
 	}
-	if signaler.probeCalls != 0 {
-		t.Fatalf("numeric PGID probes = %d, want 0", signaler.probeCalls)
+	if signaler.probeCalls != 1 {
+		t.Fatalf("numeric PGID probes = %d, want 1", signaler.probeCalls)
 	}
 }
 
@@ -806,7 +842,7 @@ func TestContainmentAcquiresRetainedCapabilityBeforeFirstObservation(t *testing.
 			t.Fatalf("retained capability was not acquired before first observation")
 		}
 	}
-	signaler := &fakeSignaler{}
+	signaler := &fakeSignaler{probes: []ProbeResult{ProbeAbsent}}
 
 	outcome := testEngineWithRetained(observer, signaler, retained).Contain(context.Background(), target, testParams())
 

@@ -4,9 +4,9 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R3A2 CLOSED (R3A2=ae4889a +fix this commit; BOTH reviews CLOSED — detached cleanup
-ctx + real durability oracle). Secret-seam (C1) fully realized. All pushed. Next: R3B (native monitor +
-custody lifecycle incl deferred F-C/F-D; TWO reviewers).
+STATUS: EXECUTING. R0..R3A2 CLOSED. R3B committed (native monitor port + shared defaults + F-C absence-proof
++ F-D PID-reuse fence + agentbusserve dep-guard). All pushed. Next: TWO R3B reviews (protocol/monitor +
+OS/cgroup), then R3C.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -293,7 +293,20 @@ see the R4A contract block.)
   strict-E2E harness launched: worker job_20260720T151723000000000Z_000002 (codex gpt-5.5 xhigh, --write).
   Packet: ~/tmp/delegate-packets/abd-R0T-real-serve-harness.md. Expected sentinel
   strict_native_runtime_unavailable; opt-in gate abd_strict_e2e + AGENTBUS_RUN_STRICT_E2E=1.
-- 2026-07-20 R3A2-fix (this commit): closed BOTH R3A2 reviews (cutover itself confirmed correct). HA
+- 2026-07-20 R3B (this commit): native monitor + custody lifecycle + F-C/F-D. Ported hidden internal-monitor
+  cmd (cmd/agentbus/monitor.go + main dispatch + parklaunch run-from-FDs); shared native defaults
+  (internal/nativecustody/config.go); F-C absence PROOF now process-group emptiness (containment engine:
+  RetainedObjectProofEmpty defers to processGroupProbe/Signaler.ProbeGroup; cgroup-empty only supplementary;
+  setsid/migration escape documented out-of-scope); F-D PID-reuse fence (verifyRetainedPlacementProcess checks
+  PID+HighResStartToken before/around retained-cgroup placement); dependency guard "cmd/agentbus does not
+  import served" via thin internal/agentbusserve facade. Worker TIMED OUT (redundant trailing patches; report
+  lost) but work landed coherent+complete; ORCH FIX: monitor_test spawned internal-monitor without Setpgid ->
+  PGID 1 in container PID-ns -> monitor never became group leader (Linux-only fail; macOS green) -> added
+  SysProcAttr{Setpgid:true} matching StartMonitorProcess. Verify: macOS linux-build/gofmt/race-count=3
+  (containment/custodian/parklaunch/cmd)=0 + full=0; Docker -p 1 full=0 (after clearing a low-freq custodian
+  real-cgroup full-suite flake, green in isolation/count=3/re-run; papercut) + race=0 + R0T RED=0. NOTE for
+  reviewers: agentbusserve is broader than "thin dispatch" — dep reviewer to assess. TWO reviews pending.
+- 2026-07-20 R3A2-fix (489ec9a): closed BOTH R3A2 reviews (cutover itself confirmed correct). HA
   (protocol, fail-closed): served failReleasedByGroup + failReleased passed the possibly-canceled caller ctx
   to ContainAndVerify/RecordQuiescence -> now use detachedAdmissionCleanupContext = WithTimeout(WithoutCancel(
   ctx), admissionDetachedCleanupTimeout) so containment of a possibly-live group can't be aborted by the same

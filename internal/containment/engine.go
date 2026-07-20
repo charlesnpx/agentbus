@@ -52,7 +52,7 @@ func (engine Engine) Contain(ctx context.Context, target model.GroupRef, params 
 
 	switch authorization.Decision {
 	case model.AlreadyAbsent:
-		return AbsentOutcome(authorization.Decision)
+		return engine.proveAlreadyAbsent(ctx, target, state, authorization)
 	case model.SignalDirectly:
 		return engine.signalAuthorized(ctx, target, params, state, authorization)
 	case model.WaitBoundedForTrustedMonitor:
@@ -106,7 +106,7 @@ func (engine Engine) signalAuthorized(ctx context.Context, target model.GroupRef
 	}
 	switch authorization.Decision {
 	case model.AlreadyAbsent:
-		return AbsentOutcome(authorization.Decision)
+		return engine.proveAlreadyAbsent(ctx, target, state, authorization)
 	case model.SignalDirectly:
 		if outcome := engine.signal(ctx, target, state, authorization, SignalKill); outcome.Kind != 0 {
 			return outcome
@@ -131,7 +131,7 @@ func (engine Engine) waitForTrustedMonitor(ctx context.Context, target model.Gro
 		}
 		switch authorization.Decision {
 		case model.AlreadyAbsent:
-			return AbsentOutcome(authorization.Decision)
+			return engine.proveAlreadyAbsent(ctx, target, state, authorization)
 		case model.SignalDirectly:
 			return engine.signalAuthorized(ctx, target, params, state, authorization)
 		case model.Unprovable:
@@ -173,7 +173,21 @@ func (engine Engine) pollUntilAbsent(ctx context.Context, target model.GroupRef,
 		}
 		switch currentAuthorization.Decision {
 		case model.AlreadyAbsent:
-			return AbsentOutcome(currentAuthorization.Decision)
+			outcome := engine.proveAlreadyAbsent(ctx, target, currentState, currentAuthorization)
+			if outcome.Absent() {
+				return outcome
+			}
+			if currentAuthorization.Basis != model.ContainmentBasisRetainedObject ||
+				outcome.Reason != ReasonProbeContradictedObserver ||
+				outcome.Err != nil ||
+				!engine.Clock.Now().Before(deadline) {
+				return outcome
+			}
+			state = currentState
+			if err := engine.sleepUntil(ctx, params.PollInterval, deadline); err != nil {
+				return UnprovableOutcome(ReasonContextDone, currentAuthorization.Decision, err)
+			}
+			continue
 		case model.SignalDirectly:
 			state = currentState
 		case model.WaitBoundedForTrustedMonitor, model.Unprovable:
@@ -242,6 +256,30 @@ func retryableTransientIncoherentUnprovable(observation model.ContainmentObserva
 	return authorization.Decision == model.Unprovable && !containmentObservationCoherent(observation)
 }
 
+func (engine Engine) proveAlreadyAbsent(ctx context.Context, target model.GroupRef, state containmentState, authorization model.ContainmentAuthorizationResult) Outcome {
+	if authorization.Basis != model.ContainmentBasisRetainedObject {
+		return AbsentOutcome(authorization.Decision)
+	}
+	proof, valid := engine.retainedObjectProof(ctx, target, state, engine.Clock.Now())
+	if !valid || proof != model.RetainedObjectProofEmpty {
+		return UnprovableOutcome(ReasonAuthorizationUnprovable, authorization.Decision, nil)
+	}
+	probe, err := engine.processGroupProbe(ctx, target)
+	if err != nil {
+		return UnprovableOutcome(ReasonProbeUnprovable, authorization.Decision, err)
+	}
+	switch probe {
+	case ProbeAbsent:
+		return AbsentOutcome(authorization.Decision)
+	case ProbeLive:
+		return UnprovableOutcome(ReasonProbeContradictedObserver, authorization.Decision, nil)
+	case ProbeUnprovable:
+		return UnprovableOutcome(ReasonProbeUnprovable, authorization.Decision, nil)
+	default:
+		return UnprovableOutcome(ReasonProbeUnprovable, authorization.Decision, nil)
+	}
+}
+
 func containmentObservationCoherent(observation model.ContainmentObservation) bool {
 	if observation.Group == model.GroupAbsent && observation.Leader != model.ProcessIdentityMissing {
 		return false
@@ -287,6 +325,10 @@ func (engine Engine) signal(ctx context.Context, target model.GroupRef, state co
 			proof, valid := engine.retainedObjectProof(ctx, target, state, engine.Clock.Now())
 			if !valid || proof != model.RetainedObjectProofEmpty {
 				return UnprovableOutcome(ReasonSignalUnprovable, authorization.Decision, nil)
+			}
+			probe, err := engine.processGroupProbe(ctx, target)
+			if err != nil || probe != ProbeAbsent {
+				return UnprovableOutcome(ReasonProbeUnprovable, authorization.Decision, err)
 			}
 		}
 		return AbsentOutcome(model.AlreadyAbsent)
@@ -334,13 +376,24 @@ func (engine Engine) probe(ctx context.Context, target model.GroupRef, state con
 		case model.RetainedObjectProofMembersPresent:
 			return ProbeLive, nil
 		case model.RetainedObjectProofEmpty:
-			return ProbeAbsent, nil
+			// Retained cgroup emptiness is only a supplementary signal. The
+			// authoritative absence proof is process-group emptiness via
+			// kill(-pgid, 0) == ESRCH. Explicit cgroup migration or setsid escape
+			// beyond the target process group is outside this guarantee.
+			return engine.processGroupProbe(ctx, target)
 		default:
 			return ProbeUnprovable, nil
 		}
 	default:
 		return ProbeUnprovable, errors.New("probe authority basis is missing")
 	}
+}
+
+func (engine Engine) processGroupProbe(ctx context.Context, target model.GroupRef) (ProbeResult, error) {
+	if engine.Signaler == nil {
+		return ProbeUnprovable, errors.New("signaler is required")
+	}
+	return engine.Signaler.ProbeGroup(ctx, target)
 }
 
 func (engine Engine) observe(ctx context.Context, target model.GroupRef) (model.ContainmentObservation, time.Time, Outcome) {

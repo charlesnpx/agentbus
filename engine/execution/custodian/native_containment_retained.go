@@ -11,6 +11,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/containment"
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
+	"github.com/charlesnpx/agentbus/internal/procgroup"
 )
 
 type retainedGroupPlacementCapability interface {
@@ -22,6 +23,10 @@ type retainedGroupPlacementCapability interface {
 
 type retainedGroupRootLeaseReleaser interface {
 	ReleaseRootLease() error
+}
+
+type retainedGroupProcessPlacementCapability interface {
+	PlaceProcess(context.Context, procgroup.ProcessClaim) error
 }
 
 type retainedNativeContainmentBackend struct {
@@ -69,7 +74,7 @@ func (backend *retainedNativeContainmentBackend) retainedID() string {
 }
 
 func (backend *retainedNativeContainmentBackend) retainLeaderUnreaped() bool {
-	return false
+	return true
 }
 
 func (backend *retainedNativeContainmentBackend) beforeMonitorBind(ctx context.Context, group model.GroupRef) (model.GroupRef, error) {
@@ -79,7 +84,16 @@ func (backend *retainedNativeContainmentBackend) beforeMonitorBind(ctx context.C
 	if group.RetainedID != backend.identity.RetainedID {
 		return model.GroupRef{}, fmt.Errorf("%w: launch retained id %q does not match retained id %q", ErrNativeCustodianUnavailable, group.RetainedID, backend.identity.RetainedID)
 	}
-	if err := backend.capability.PlacePID(ctx, group.Leader.PID); err != nil {
+	expected, err := procgroup.NewProcessClaim(
+		group.Leader.PID,
+		group.PGID,
+		procgroup.StartToken(group.Leader.HighResStartToken),
+		group.KernelDomain(),
+	)
+	if err != nil {
+		return model.GroupRef{}, err
+	}
+	if err := backend.placeProcess(ctx, expected); err != nil {
 		return model.GroupRef{}, fmt.Errorf("place parked worker in retained group: %w", err)
 	}
 	bound := group
@@ -126,9 +140,40 @@ func (backend *retainedNativeContainmentBackend) retainedObject() containment.Re
 	return backend.manager
 }
 
-func (backend *retainedNativeContainmentBackend) attachHandle(*parklaunch.ParkedHandle) {}
+func (backend *retainedNativeContainmentBackend) attachHandle(handle *parklaunch.ParkedHandle) {
+	if handle != nil {
+		handle.StartWait()
+	}
+}
 
 func (backend *retainedNativeContainmentBackend) leaderRetention() *leaderRetention {
+	return nil
+}
+
+func (backend *retainedNativeContainmentBackend) placeProcess(ctx context.Context, expected procgroup.ProcessClaim) error {
+	if placer, ok := backend.capability.(retainedGroupProcessPlacementCapability); ok {
+		return placer.PlaceProcess(ctx, expected)
+	}
+	if err := verifyRetainedPlacementProcess(expected); err != nil {
+		return err
+	}
+	if err := backend.capability.PlacePID(ctx, expected.PID); err != nil {
+		return err
+	}
+	return verifyRetainedPlacementProcess(expected)
+}
+
+func verifyRetainedPlacementProcess(expected procgroup.ProcessClaim) error {
+	current, err := procgroup.ReadProcessClaim(expected.PID)
+	if err != nil {
+		return fmt.Errorf("%w: read process identity for retained placement: %v", ErrNativeCustodianUnavailable, err)
+	}
+	if current.PID != expected.PID ||
+		current.PGID != expected.PGID ||
+		current.StartToken != expected.StartToken ||
+		!current.KernelDomainID.Equal(expected.KernelDomainID) {
+		return fmt.Errorf("%w: process identity changed during retained placement", ErrNativeCustodianUnavailable)
+	}
 	return nil
 }
 

@@ -1206,6 +1206,87 @@ func TestNativeContainAndVerifyRecoveryTreatsMissingRetainedGroupAsAlreadyAbsent
 	}
 }
 
+func TestNativeContainAndVerifyRecoveryMissingRetainedGroupRequiresProcessGroupAbsent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	issuer, _ := NewAttestationChannel()
+	counting := &countingQuiescenceIssuer{inner: issuer}
+	manager := newFakeNativeRetainedManager()
+	native := newRecoveryNativeCustodianForTest(t, defaultNativeTestParams(), counting, manager)
+	capability, err := manager.AcquireRetainedGroup(ctx, model.GroupRef{}, time.Now())
+	if err != nil {
+		t.Fatalf("AcquireRetainedGroup(create) error = %v", err)
+	}
+	identity := capability.Identity()
+	if err := capability.Release(); err != nil {
+		t.Fatalf("release created retained group: %v", err)
+	}
+	cmd := exec.Command("/bin/sh", "-c", "exec sleep 60")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start live process group: %v", err)
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- cmd.Wait()
+	}()
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
+		}
+		select {
+		case <-waitDone:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("live process group cleanup wait timed out")
+		}
+	})
+	leader := waitNativeProcessGroupLeaderClaim(t, ctx, cmd.Process.Pid)
+	monitor, err := procgroup.ReadProcessClaim(os.Getpid())
+	if err != nil {
+		t.Fatalf("read monitor identity: %v", err)
+	}
+	attempt := model.AttemptRef{JobID: "job-native-recovery-live", AttemptID: "attempt-native-recovery-live", Epoch: 1}
+	group := model.GroupRef{
+		Version:             1,
+		CustodyID:           "custody-native-recovery-live",
+		Launch:              model.LaunchKey{Attempt: attempt, Ordinal: model.LaunchOrdinalOne},
+		HostBootID:          identity.KernelDomainID.HostBootID,
+		PIDNamespaceID:      identity.KernelDomainID.PIDNamespaceID,
+		PIDNamespaceState:   identity.KernelDomainID.PIDNamespaceState,
+		RetainedDomainID:    identity.KernelDomainID.RetainedDomainID,
+		RetainedDomainState: identity.KernelDomainID.RetainedDomainState,
+		PGID:                leader.PGID,
+		Leader: model.ProcessIdentity{
+			PID:               leader.PID,
+			HighResStartToken: leader.StartToken.String(),
+		},
+		Monitor: model.ProcessIdentity{
+			PID:               monitor.PID,
+			HighResStartToken: monitor.StartToken.String(),
+		},
+		RetainedID: identity.RetainedID,
+	}
+	if err := group.Validate(); err != nil {
+		t.Fatalf("live recovery group Validate() error = %v", err)
+	}
+	manager.setMembership(group.RetainedID, containment.RetainedMembershipPresent)
+	manager.removeLeaf(group.RetainedID)
+
+	verified, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
+	if err == nil {
+		t.Fatal("ContainAndVerify(recovery live process group with missing retained leaf) error = nil, want unprovable")
+	}
+	if verified != (VerifiedQuiescence{}) {
+		t.Fatalf("verified = %+v, want zero attestation", verified)
+	}
+	if !errors.Is(err, ErrNativeCustodianUnavailable) {
+		t.Fatalf("ContainAndVerify() error = %v, want ErrNativeCustodianUnavailable", err)
+	}
+	if counting.count.Load() != 0 {
+		t.Fatalf("quiescence attestations = %d, want 0", counting.count.Load())
+	}
+}
+
 func TestNativeContainAndVerifyRecoveryMissingRetainedGroupMismatchedDomainIsUnprovable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1523,6 +1604,30 @@ func absentProcessGroupForDomain(t *testing.T, domain model.KernelDomainID) int 
 	}
 	t.Fatal("could not find an absent process group candidate")
 	return 0
+}
+
+func waitNativeProcessGroupLeaderClaim(t *testing.T, ctx context.Context, pid int) procgroup.ProcessClaim {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var last procgroup.ProcessClaim
+	var lastErr error
+	for {
+		claim, err := procgroup.ReadProcessClaim(pid)
+		if err == nil && claim.PID == pid && claim.PGID == pid {
+			return claim
+		}
+		if err == nil {
+			last = claim
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d did not become process-group leader: last=%+v err=%v", pid, last, lastErr)
+		}
+		if err := sleepContext(ctx, 10*time.Millisecond); err != nil {
+			t.Fatalf("wait process-group leader: %v", err)
+		}
+	}
 }
 
 func differentKernelDomainForTest(t *testing.T, domain model.KernelDomainID) model.KernelDomainID {
@@ -2122,6 +2227,14 @@ func (capability *fakeNativeRetainedCapability) PlacePID(_ context.Context, pid 
 	capability.leaf.placedPIDs = append(capability.leaf.placedPIDs, pid)
 	capability.leaf.membership = containment.RetainedMembershipPresent
 	return nil
+}
+
+func (capability *fakeNativeRetainedCapability) PlaceProcess(ctx context.Context, expected procgroup.ProcessClaim) error {
+	observation := procgroup.ObserveProcess(expected)
+	if observation.Identity != model.ProcessIdentityMatching || observation.RunState != procgroup.ProcessRunStateRunning {
+		return fmt.Errorf("fake retained placement identity observation = %+v, want matching running", observation)
+	}
+	return capability.PlacePID(ctx, expected.PID)
 }
 
 func (capability *fakeNativeRetainedCapability) ReleaseRootLease() error {

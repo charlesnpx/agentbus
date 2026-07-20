@@ -16,7 +16,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/claudecli"
 	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
-	"github.com/charlesnpx/agentbus/internal/served"
+	"github.com/charlesnpx/agentbus/internal/agentbusserve"
 )
 
 const (
@@ -104,6 +104,8 @@ func (a *app) run(ctx context.Context, args []string, in io.Reader, out, errOut 
 		return a.runValidate(args[1:], in, out, errOut)
 	case "internal-parked-worker":
 		return a.runInternalParkedWorker(args[1:], errOut)
+	case "internal-monitor":
+		return a.runInternalMonitor(args[1:], errOut)
 	default:
 		return usageError(errOut, "unknown command %q", args[0])
 	}
@@ -185,7 +187,7 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 			backends = append(backends, spec.backend)
 		}
 	}
-	server, err := served.New(served.Config{
+	err := agentbusserve.Serve(ctx, agentbusserve.Config{
 		StateRoot:    a.stateRoot,
 		CWD:          a.cwd,
 		Backends:     backends,
@@ -194,9 +196,6 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 		ProcessTable: a.processes,
 	})
 	if err != nil {
-		return commandError(errOut, err)
-	}
-	if err := server.Serve(ctx); err != nil {
 		return commandError(errOut, err)
 	}
 	return 0
