@@ -1637,13 +1637,6 @@ func nativeLaunchSpec(t *testing.T, exec command.ExecSpec) NativeLaunchSpec {
 		Exec:      exec,
 		CustodyID: model.CustodyID("custody-native-" + suffix),
 		LaunchKey: launchKey,
-		LogicalGrant: model.LaunchGrant{
-			Attempt:   attempt,
-			Ordinal:   model.LaunchOrdinalOne,
-			Nonce:     model.LaunchNonce("nonce-native-" + suffix),
-			GrantedBy: model.BootRef{BootID: model.BootID("boot-native-" + suffix), OwnerID: model.OwnerID("owner-native-" + suffix)},
-		},
-		ReleaseSecret: model.ReleaseSecret("release-native-" + suffix),
 	}
 }
 

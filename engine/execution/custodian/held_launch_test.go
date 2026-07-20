@@ -11,6 +11,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/internal/parkproto"
 )
 
 var (
@@ -588,7 +589,7 @@ type heldLaunchFakeEffects struct {
 	frameWrites    int
 	abortCalls     int
 	containCalls   int
-	releaseSecrets []model.ReleaseSecret
+	releaseSecrets []parkproto.ReleaseSecret
 	releaseRefs    []model.GroupRef
 	abortRefs      []model.GroupRef
 	containRefs    []model.GroupRef
@@ -601,7 +602,7 @@ type heldLaunchFakeSnapshot struct {
 	frameWrites    int
 	abortCalls     int
 	containCalls   int
-	releaseSecrets []model.ReleaseSecret
+	releaseSecrets []parkproto.ReleaseSecret
 	releaseRefs    []model.GroupRef
 	abortRefs      []model.GroupRef
 	containRefs    []model.GroupRef
@@ -694,7 +695,7 @@ func (effects *heldLaunchFakeEffects) snapshot() heldLaunchFakeSnapshot {
 		frameWrites:    effects.frameWrites,
 		abortCalls:     effects.abortCalls,
 		containCalls:   effects.containCalls,
-		releaseSecrets: append([]model.ReleaseSecret(nil), effects.releaseSecrets...),
+		releaseSecrets: append([]parkproto.ReleaseSecret(nil), effects.releaseSecrets...),
 		releaseRefs:    append([]model.GroupRef(nil), effects.releaseRefs...),
 		abortRefs:      append([]model.GroupRef(nil), effects.abortRefs...),
 		containRefs:    append([]model.GroupRef(nil), effects.containRefs...),
@@ -761,7 +762,7 @@ func heldLaunchTestSpec(t *testing.T) PrepareSpec {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secret, err := model.NewReleaseSecret("release-secret-held-launch")
+	secret, err := parkproto.NewReleaseSecret("release-secret-held-launch")
 	if err != nil {
 		t.Fatal(err)
 	}

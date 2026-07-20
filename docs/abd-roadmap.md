@@ -4,9 +4,9 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R2B CLOSED. R3A1=428a1ea(+fix this commit; sol review CLOSED — abort-strand, Close/
-prepared-registry, test de-secret; +orch Linux test-robustness fix). All pushed. Next: R3A2 (public cutover;
-packet staged; TWO reviewers).
+STATUS: EXECUTING. R0..R3A1 CLOSED (R3A1=93b8a9a). R3A2 committed (public cutover: tokenless Release; secret
+removed from logical layer, now only in native custodian + parkproto; arch test). All pushed. Next: TWO R3A2
+reviews (secret-removal + protocol), then R3B.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -293,7 +293,16 @@ see the R4A contract block.)
   strict-E2E harness launched: worker job_20260720T151723000000000Z_000002 (codex gpt-5.5 xhigh, --write).
   Packet: ~/tmp/delegate-packets/abd-R0T-real-serve-harness.md. Expected sentinel
   strict_native_runtime_unavailable; opt-in gate abd_strict_e2e + AGENTBUS_RUN_STRICT_E2E=1.
-- 2026-07-20 R3A1-fix (this commit): closed R3A1 sol review (3 High). F1 tests no longer print secret values
+- 2026-07-20 R3A2 (this commit): ATOMIC public cutover (19 files). PreparedProcess.Release now tokenless
+  Release(ctx)(RunningProcess,ReleaseOutcome,error) (custodian+launch); custodian.GrantToken + logical
+  model.ReleaseSecret DELETED (certificate.go -22); NativeCustodian.Prepare returns real *nativePreparedProcess
+  (integrated with heldPrepared registry); served release-<job>-<ordinal> minting removed; secret type moved
+  to internal/parkproto.ReleaseSecret (park-protocol-internal only). LaunchController.Release tokenless with
+  fail-closed outcome mapping (Unknown->contain no-retry, NotSent->abort, Accepted->record). architecture_guard
+  test enforces no ReleaseSecret/GrantToken in logical layer. Production still UnavailableRuntime; R0T RED.
+  Verify: build/linux/gofmt/vet=0; race -count=3 parklaunch/custodian/launch (macOS)=0; macOS suite=0; Docker
+  -p 1 full=0 + race=0 + R0T RED=0. TWO reviews pending (secret-removal completeness + protocol/concurrency).
+- 2026-07-20 R3A1-fix (93b8a9a): closed R3A1 sol review (3 High). F1 tests no longer print secret values
   (report properties only). F2 effects.AbortAndVerify always attempts custodian contain+close+delete after a
   parklaunch abort error (success if absence proven; else retryable via ContainAndVerify, no strand/false-
   finalize); held_launch.go HandleControlLoss now handles Aborting (contain-retry). F3 custodian tracks a

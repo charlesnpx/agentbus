@@ -13,15 +13,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/containment"
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
+	"github.com/charlesnpx/agentbus/internal/parkproto"
 	"github.com/charlesnpx/agentbus/internal/procgroup"
 )
 
 func TestGenerateNativeReleaseSecretRandomAndValid(t *testing.T) {
-	seen := map[model.ReleaseSecret]bool{}
+	seen := map[parkproto.ReleaseSecret]bool{}
 	for range 32 {
 		secret, err := generateNativeReleaseSecret()
 		if err != nil {
@@ -47,8 +47,6 @@ func TestNativeHeldLaunchGeneratesInternalSecretAndAbortPrepared(t *testing.T) {
 	native := newNativeCustodianWithRetainedManagerForTest(t, defaultNativeTestParams(), manager)
 	_, verifier := setNativeHeldIssuerForTest(native)
 	spec, resultPath := nativeSimpleLaunchSpec(t)
-	externalSecret := model.ReleaseSecret("release-external-native-held")
-	spec.ReleaseSecret = externalSecret
 
 	launch, err := prepareNativeHeldLaunch(ctx, native, spec)
 	if err != nil {
@@ -56,8 +54,8 @@ func TestNativeHeldLaunchGeneratesInternalSecretAndAbortPrepared(t *testing.T) {
 	}
 	core := requireNativeHeldCore(t, launch)
 	secret := core.spec.ReleaseSecret
-	if secret == "" || secret == externalSecret {
-		t.Fatalf("internal release secret provenance invalid: empty=%t caller_supplied=%t", secret == "", secret == externalSecret)
+	if secret == "" {
+		t.Fatal("internal release secret is empty")
 	}
 	if err := secret.Validate(); err != nil {
 		t.Fatalf("internal release secret Validate() error = %v", err)
@@ -66,7 +64,6 @@ func TestNativeHeldLaunchGeneratesInternalSecretAndAbortPrepared(t *testing.T) {
 		string(spec.CustodyID),
 		string(spec.LaunchKey.Attempt.JobID),
 		string(spec.LaunchKey.Attempt.AttemptID),
-		spec.LogicalGrant.Nonce.String(),
 	} {
 		if fragment != "" && strings.Contains(secret.String(), fragment) {
 			t.Fatalf("internal release secret contains logical identity fragment %q", fragment)
@@ -101,7 +98,6 @@ func TestNativeHeldLaunchPrivateReleaseExecsOnce(t *testing.T) {
 	native := newNativeCustodianWithRetainedManagerForTest(t, defaultNativeTestParams(), manager)
 	_, verifier := setNativeHeldIssuerForTest(native)
 	spec, resultPath := nativeSimpleLaunchSpec(t)
-	spec.ReleaseSecret = model.ReleaseSecret("release-external-native-held-ignored")
 
 	launch, err := prepareNativeHeldLaunch(ctx, native, spec)
 	if err != nil {
@@ -149,6 +145,71 @@ func TestNativeHeldLaunchPrivateReleaseExecsOnce(t *testing.T) {
 	again, againOutcome, againErr := launch.Release(ctx)
 	if again != nil || againOutcome != ReleaseDefinitelyNotSent || !errors.Is(againErr, ErrHeldLaunchAlreadyConsumed) {
 		t.Fatalf("second Release() = (%v, %s, %v), want nil definitely_not_sent already-consumed", again, againOutcome, againErr)
+	}
+	exit, verified, err := nativeRunning.WaitAndVerify(ctx)
+	if err != nil {
+		t.Fatalf("WaitAndVerify() error = %v", err)
+	}
+	if !exit.Exited || exit.Code != 0 || exit.Signal != "" {
+		t.Fatalf("exit observation = %+v, want clean exit", exit)
+	}
+	quiescence, err := verifier.VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatalf("VerifyQuiescence() error = %v", err)
+	}
+	if !quiescence.Group.Equal(nativeRunning.Ref()) {
+		t.Fatalf("quiescence group = %+v, want %+v", quiescence.Group, nativeRunning.Ref())
+	}
+	waitGroupAbsent(t, nativeRunning.Ref(), 5*time.Second)
+}
+
+func TestNativeCustodianPublicPrepareReleaseExecsOnceAndKeepsSecretPrivate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	manager := newFakeNativeRetainedManager()
+	native := newNativeCustodianWithRetainedManagerForTest(t, defaultNativeTestParams(), manager)
+	_, verifier := setNativeHeldIssuerForTest(native)
+	spec, resultPath := nativeSimpleLaunchSpec(t)
+
+	prepared, err := native.Prepare(ctx, spec.Exec, spec.LaunchKey)
+	if err != nil {
+		t.Fatalf("NativeCustodian.Prepare() error = %v", err)
+	}
+	nativePrepared, ok := prepared.(*nativePreparedProcess)
+	if !ok {
+		t.Fatalf("prepared type = %T, want *nativePreparedProcess", prepared)
+	}
+	secret := requireNativeHeldCore(t, nativePrepared.launch).spec.ReleaseSecret
+	if secret == "" {
+		t.Fatal("internal release secret is empty")
+	}
+	if strings.Contains(fmt.Sprintf("%+v", prepared.Ref()), secret.String()) {
+		t.Fatal("prepared group ref exposes internal release secret")
+	}
+	requireNativeFileAbsent(t, resultPath)
+
+	running, outcome, err := prepared.Release(ctx)
+	if err != nil || outcome != ReleaseAccepted || running == nil {
+		t.Fatalf("prepared Release() = (%v, %s, %v), want running accepted nil", running, outcome, err)
+	}
+	nativeRunning, ok := running.(*NativeRunningProcess)
+	if !ok {
+		t.Fatalf("running type = %T, want *NativeRunningProcess", running)
+	}
+	defer cleanupNativeRunning(t, nativeRunning)
+	stdout, err := io.ReadAll(nativeRunning.Stdout())
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	if !strings.Contains(string(stdout), "native-simple") {
+		t.Fatalf("stdout = %q, want native-simple marker", stdout)
+	}
+	rawResult, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read backend result: %v", err)
+	}
+	if strings.Contains(string(rawResult), secret.String()) {
+		t.Fatal("backend result exposes internal release secret")
 	}
 	exit, verified, err := nativeRunning.WaitAndVerify(ctx)
 	if err != nil {
@@ -486,12 +547,37 @@ func TestNativeReleaseOutcomeFromParklaunchMapping(t *testing.T) {
 	}
 }
 
-func TestNativeCustodianPublicPrepareRemainsBoundaryStub(t *testing.T) {
-	var native NativeCustodian
-	spec := heldLaunchTestSpec(t)
-	prepared, err := native.Prepare(context.Background(), command.ExecSpec{Argv: []string{"/bin/echo"}}, spec.LaunchKey)
-	if prepared != nil || !errors.Is(err, ErrNativePreparedBoundary) {
-		t.Fatalf("NativeCustodian.Prepare() = (%v, %v), want nil ErrNativePreparedBoundary", prepared, err)
+func TestNativeCustodianPublicPrepareReturnsHeldPreparedProcess(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	manager := newFakeNativeRetainedManager()
+	native := newNativeCustodianWithRetainedManagerForTest(t, defaultNativeTestParams(), manager)
+	setNativeHeldIssuerForTest(native)
+	spec, resultPath := nativeSimpleLaunchSpec(t)
+
+	prepared, err := native.Prepare(ctx, spec.Exec, spec.LaunchKey)
+	if err != nil {
+		t.Fatalf("NativeCustodian.Prepare() error = %v", err)
+	}
+	if prepared == nil {
+		t.Fatal("NativeCustodian.Prepare() returned nil prepared process")
+	}
+	if !prepared.Ref().Launch.Equal(spec.LaunchKey) {
+		t.Fatalf("prepared launch key = %+v, want %+v", prepared.Ref().Launch, spec.LaunchKey)
+	}
+	if got := native.ActiveCustodyCount(); got != 1 {
+		t.Fatalf("ActiveCustodyCount() after public Prepare = %d, want 1", got)
+	}
+	requireNativeFileAbsent(t, resultPath)
+	verified, err := prepared.AbortAndVerify(ctx)
+	if err != nil {
+		t.Fatalf("prepared AbortAndVerify() error = %v", err)
+	}
+	if verified == (VerifiedQuiescence{}) {
+		t.Fatal("prepared AbortAndVerify() returned zero attestation")
+	}
+	if got := native.ActiveCustodyCount(); got != 0 {
+		t.Fatalf("ActiveCustodyCount() after public abort = %d, want 0", got)
 	}
 }
 

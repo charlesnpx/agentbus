@@ -17,8 +17,6 @@ var (
 	ErrInvalidSupport        = errors.New("invalid custodian support")
 )
 
-type GrantToken string
-
 type QuiescenceCause string
 
 const (
@@ -42,7 +40,7 @@ type PreparedProcess interface {
 	Stdin() io.WriteCloser
 	Stdout() io.ReadCloser
 	Stderr() io.ReadCloser
-	Release(context.Context, GrantToken) (RunningProcess, error)
+	Release(context.Context) (RunningProcess, ReleaseOutcome, error)
 	AbortAndVerify(context.Context) (VerifiedQuiescence, error)
 }
 

@@ -5,11 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine/command"
@@ -21,8 +21,14 @@ import (
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
 )
 
-func TestDurableAuthorityRecordsDoNotPersistLiveReleaseSecretBytes(t *testing.T) {
-	assertDurableTypeGraphOmitsReleaseSecret(t,
+var legacyReleaseCredentialNames = []string{
+	"release" + "Secret",
+	"Release" + "Secret",
+	"Grant" + "Token",
+}
+
+func TestDurableAuthorityRecordsDoNotPersistLegacyReleaseCredentialBytes(t *testing.T) {
+	assertDurableTypeGraphOmitsLegacyReleaseCredentials(t,
 		reflect.TypeOf(repository.AuthorityMeta{}),
 		reflect.TypeOf(model.Binding{}),
 		reflect.TypeOf(model.SafetyRecord{}),
@@ -31,6 +37,7 @@ func TestDurableAuthorityRecordsDoNotPersistLiveReleaseSecretBytes(t *testing.T)
 		reflect.TypeOf(repository.QuarantineRecord{}),
 		reflect.TypeOf(authority.AnchorSnapshot{}),
 	)
+	sentinel := []byte("release-secret-sentinel-abd-r3a2-logical-layer")
 
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "admission.bbolt")
@@ -47,10 +54,6 @@ func TestDurableAuthorityRecordsDoNotPersistLiveReleaseSecretBytes(t *testing.T)
 		}
 	})
 
-	secret, err := model.NewReleaseSecret("release-secret-sentinel-abd-r1-live-flow")
-	if err != nil {
-		t.Fatal(err)
-	}
 	issuer, verifier := custodian.NewAttestationChannel()
 	anchorStore := authority.NewAnchorStore()
 	bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(verifier))
@@ -82,7 +85,7 @@ func TestDurableAuthorityRecordsDoNotPersistLiveReleaseSecretBytes(t *testing.T)
 		t.Fatalf("Accept() error = %v", err)
 	}
 
-	cust := &releaseSecretRecordingCustodian{issuer: issuer, want: secret}
+	cust := &releaseSecretRecordingCustodian{issuer: issuer}
 	controller, err := launch.New(liveSecretAuthorityPort{ready: ready}, cust)
 	if err != nil {
 		t.Fatalf("launch.New() error = %v", err)
@@ -93,8 +96,7 @@ func TestDurableAuthorityRecordsDoNotPersistLiveReleaseSecretBytes(t *testing.T)
 			Attempt: accepted.Record.Attempt.Ref,
 			Ordinal: model.LaunchOrdinalOne,
 		},
-		Exec:          command.ExecSpec{Argv: []string{"/bin/echo", "ok"}, Env: []string{"A=B"}, Dir: "/tmp"},
-		ReleaseSecret: secret,
+		Exec: command.ExecSpec{Argv: []string{"/bin/echo", "ok"}, Env: []string{"A=B"}, Dir: "/tmp"},
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -109,16 +111,13 @@ func TestDurableAuthorityRecordsDoNotPersistLiveReleaseSecretBytes(t *testing.T)
 	if !result.ReleaseRecorded {
 		t.Fatal("release was not durably recorded")
 	}
-	if got := cust.observedReleaseToken(); got != custodian.GrantToken(secret.String()) {
-		t.Fatalf("release token = %q, want sentinel %q", got, secret.String())
-	}
 
 	rawRecord, rawProjection, rawBinding := loadLiveSecretDurableJSON(t, repo, accepted)
-	assertBytesOmitReleaseSecret(t, "serialized safety record", rawRecord, secret)
-	assertBytesOmitReleaseSecret(t, "serialized projection", rawProjection, secret)
-	assertBytesOmitReleaseSecret(t, "serialized binding", rawBinding, secret)
-	assertBytesOmitReleaseSecret(t, "bbolt snapshot", repo.SnapshotBytes(), secret)
-	assertBytesOmitReleaseSecret(t, "anchor snapshot", anchorStore.SnapshotBytes(), secret)
+	assertBytesOmitLegacyReleaseCredential(t, "serialized safety record", rawRecord, sentinel)
+	assertBytesOmitLegacyReleaseCredential(t, "serialized projection", rawProjection, sentinel)
+	assertBytesOmitLegacyReleaseCredential(t, "serialized binding", rawBinding, sentinel)
+	assertBytesOmitLegacyReleaseCredential(t, "bbolt snapshot", repo.SnapshotBytes(), sentinel)
+	assertBytesOmitLegacyReleaseCredential(t, "anchor snapshot", anchorStore.SnapshotBytes(), sentinel)
 	if err := repo.Close(); err != nil {
 		t.Fatalf("close bbolt repository before raw read: %v", err)
 	}
@@ -127,7 +126,7 @@ func TestDurableAuthorityRecordsDoNotPersistLiveReleaseSecretBytes(t *testing.T)
 	if err != nil {
 		t.Fatalf("read bbolt file: %v", err)
 	}
-	assertBytesOmitReleaseSecret(t, "raw bbolt file", rawDB, secret)
+	assertBytesOmitLegacyReleaseCredential(t, "raw bbolt file", rawDB, sentinel)
 }
 
 type liveSecretAuthorityPort struct {
@@ -162,8 +161,6 @@ func (a liveSecretAuthorityPort) FailStop(ctx context.Context, reason error) err
 
 type releaseSecretRecordingCustodian struct {
 	issuer custodian.AttestationIssuer
-	want   model.ReleaseSecret
-	token  custodian.GrantToken
 }
 
 func (c *releaseSecretRecordingCustodian) Prepare(_ context.Context, spec command.ExecSpec, key model.LaunchKey) (launch.PreparedProcess, error) {
@@ -178,10 +175,6 @@ func (c *releaseSecretRecordingCustodian) ContainAndVerify(_ context.Context, gr
 	return c.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: group, Method: model.QuiescenceTermKill})
 }
 
-func (c *releaseSecretRecordingCustodian) observedReleaseToken() custodian.GrantToken {
-	return c.token
-}
-
 type releaseSecretPrepared struct {
 	custodian *releaseSecretRecordingCustodian
 	group     model.GroupRef
@@ -191,12 +184,8 @@ func (p *releaseSecretPrepared) Ref() model.GroupRef {
 	return p.group
 }
 
-func (p *releaseSecretPrepared) Release(_ context.Context, token custodian.GrantToken) (launch.RunningProcess, error) {
-	if token != custodian.GrantToken(p.custodian.want.String()) {
-		return nil, fmt.Errorf("release token %q does not match sentinel", token)
-	}
-	p.custodian.token = token
-	return &releaseSecretRunning{issuer: p.custodian.issuer, group: p.group}, nil
+func (p *releaseSecretPrepared) Release(context.Context) (launch.RunningProcess, custodian.ReleaseOutcome, error) {
+	return &releaseSecretRunning{issuer: p.custodian.issuer, group: p.group}, custodian.ReleaseAccepted, nil
 }
 
 func (p *releaseSecretPrepared) AbortAndVerify(context.Context) (custodian.VerifiedQuiescence, error) {
@@ -297,35 +286,36 @@ func loadLiveSecretDurableJSON(t *testing.T, repo repository.Repository, accepte
 	return rawRecord, rawProjection, rawBinding
 }
 
-func assertBytesOmitReleaseSecret(t *testing.T, label string, raw []byte, secret model.ReleaseSecret) {
+func assertBytesOmitLegacyReleaseCredential(t *testing.T, label string, raw []byte, sentinel []byte) {
 	t.Helper()
-	if bytes.Contains(raw, []byte(secret)) || bytes.Contains(raw, []byte(secret.String())) {
-		t.Fatalf("%s contains release secret bytes", label)
+	if bytes.Contains(raw, sentinel) {
+		t.Fatalf("%s contains legacy release credential bytes", label)
 	}
-	if bytes.Contains(raw, []byte("releaseSecret")) || bytes.Contains(raw, []byte("ReleaseSecret")) {
-		t.Fatalf("%s contains release secret field name", label)
+	for _, field := range legacyReleaseCredentialNames {
+		if bytes.Contains(raw, []byte(field)) {
+			t.Fatalf("%s contains legacy release credential field name %q", label, field)
+		}
 	}
 }
 
-func assertDurableTypeGraphOmitsReleaseSecret(t *testing.T, roots ...reflect.Type) {
+func assertDurableTypeGraphOmitsLegacyReleaseCredentials(t *testing.T, roots ...reflect.Type) {
 	t.Helper()
-	secretType := reflect.TypeOf(model.ReleaseSecret(""))
 	seen := map[reflect.Type]bool{}
 	for _, root := range roots {
-		assertTypeGraphOmitsReleaseSecret(t, root, root.String(), secretType, seen)
+		assertTypeGraphOmitsLegacyReleaseCredentials(t, root, root.String(), seen)
 	}
 }
 
-func assertTypeGraphOmitsReleaseSecret(t *testing.T, typ reflect.Type, path string, secretType reflect.Type, seen map[reflect.Type]bool) {
+func assertTypeGraphOmitsLegacyReleaseCredentials(t *testing.T, typ reflect.Type, path string, seen map[reflect.Type]bool) {
 	t.Helper()
-	if typ == secretType {
-		t.Fatalf("durable type graph contains model.ReleaseSecret at %s", path)
+	if containsLegacyReleaseCredentialName(typ.String()) {
+		t.Fatalf("durable type graph contains legacy release credential type %s at %s", typ, path)
 	}
 	for typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
 		path += ".*"
-		if typ == secretType {
-			t.Fatalf("durable type graph contains model.ReleaseSecret at %s", path)
+		if containsLegacyReleaseCredentialName(typ.String()) {
+			t.Fatalf("durable type graph contains legacy release credential type %s at %s", typ, path)
 		}
 	}
 	if seen[typ] {
@@ -336,12 +326,24 @@ func assertTypeGraphOmitsReleaseSecret(t *testing.T, typ reflect.Type, path stri
 	case reflect.Struct:
 		for i := 0; i < typ.NumField(); i++ {
 			field := typ.Field(i)
-			assertTypeGraphOmitsReleaseSecret(t, field.Type, path+"."+field.Name, secretType, seen)
+			if containsLegacyReleaseCredentialName(field.Name) {
+				t.Fatalf("durable type graph contains legacy release credential field %s.%s", path, field.Name)
+			}
+			assertTypeGraphOmitsLegacyReleaseCredentials(t, field.Type, path+"."+field.Name, seen)
 		}
 	case reflect.Slice, reflect.Array:
-		assertTypeGraphOmitsReleaseSecret(t, typ.Elem(), path+"[]", secretType, seen)
+		assertTypeGraphOmitsLegacyReleaseCredentials(t, typ.Elem(), path+"[]", seen)
 	case reflect.Map:
-		assertTypeGraphOmitsReleaseSecret(t, typ.Key(), path+"{key}", secretType, seen)
-		assertTypeGraphOmitsReleaseSecret(t, typ.Elem(), path+"{value}", secretType, seen)
+		assertTypeGraphOmitsLegacyReleaseCredentials(t, typ.Key(), path+"{key}", seen)
+		assertTypeGraphOmitsLegacyReleaseCredentials(t, typ.Elem(), path+"{value}", seen)
 	}
+}
+
+func containsLegacyReleaseCredentialName(value string) bool {
+	for _, name := range legacyReleaseCredentialNames {
+		if strings.Contains(value, name) {
+			return true
+		}
+	}
+	return false
 }

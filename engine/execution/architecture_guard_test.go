@@ -78,6 +78,30 @@ func TestStartupRecoveryDoesNotDecodeOrReplayParkProtocolFrames(t *testing.T) {
 	}
 }
 
+func TestLogicalLayerDoesNotReferenceReleaseCredentials(t *testing.T) {
+	root := repoRoot(t)
+	files := collectNonTestGoFiles(t, []string{
+		filepath.Join(root, "engine", "execution", "model"),
+		filepath.Join(root, "engine", "execution", "launch"),
+		filepath.Join(root, "internal", "served"),
+	})
+	forbidden := map[string]bool{
+		"ReleaseSecret": true,
+		"GrantToken":    true,
+	}
+	for _, path := range files {
+		file := parseGoFile(t, path, 0)
+		ast.Inspect(file, func(node ast.Node) bool {
+			ident, ok := node.(*ast.Ident)
+			if !ok || !forbidden[ident.Name] {
+				return true
+			}
+			t.Fatalf("%s references logical-layer release credential identifier %s", path, ident.Name)
+			return false
+		})
+	}
+}
+
 func TestOnlyLaunchImportsAuthorityAndCustodianTogether(t *testing.T) {
 	root := filepath.Join(repoRoot(t), "engine", "execution")
 	importsByPackage := map[string]map[string]bool{}

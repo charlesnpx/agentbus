@@ -526,17 +526,12 @@ func (c *servedSubmissionCoordinator) LaunchRunner(binding admissionLaunchBindin
 	if c == nil || c.launch == nil {
 		return nil, custodian.ErrSupervisorUnavailable
 	}
-	secret, err := model.NewReleaseSecret(fmt.Sprintf("release-%s-%s", binding.jobID, ordinal))
-	if err != nil {
-		return nil, err
-	}
 	return c.launch.Runner(launch.RunnerBinding{
 		Context: launch.LaunchContext{
 			JobID:   binding.jobID,
 			Attempt: binding.attempt,
 			Ordinal: ordinal,
 		},
-		ReleaseSecret: secret,
 	})
 }
 
@@ -567,19 +562,14 @@ func (c *servedSubmissionCoordinator) prepareLegacyFencedCommand(ctx context.Con
 		return nil, authority.LegacyFencedPreparation{}, fmt.Errorf("%w: LegacyFenced admission is empty", authority.ErrInvalidRequest)
 	}
 	ordinal := model.LaunchOrdinalOne
-	secret, err := model.NewReleaseSecret(fmt.Sprintf("release-%s-%s", accepted.Record.JobID, ordinal))
-	if err != nil {
-		return nil, authority.LegacyFencedPreparation{}, err
-	}
 	launchContext := launch.LaunchContext{
 		JobID:   accepted.Record.JobID,
 		Attempt: accepted.Record.Attempt.Ref,
 		Ordinal: ordinal,
 	}
 	request := launch.LaunchRequest{
-		Context:       launchContext,
-		Exec:          spec,
-		ReleaseSecret: secret,
+		Context: launchContext,
+		Exec:    spec,
 	}
 	if err := request.Validate(); err != nil {
 		return nil, authority.LegacyFencedPreparation{}, err
@@ -598,7 +588,7 @@ func (c *servedSubmissionCoordinator) prepareLegacyFencedCommand(ctx context.Con
 		Ordinal:   ordinal,
 		Group:     group,
 	}
-	return newLegacyFencedCommand(c, launchContext, group, prepared, secret), preparation, nil
+	return newLegacyFencedCommand(c, launchContext, group, prepared), preparation, nil
 }
 
 func (c *servedSubmissionCoordinator) handleLegacyPrepareDurability(ctx context.Context, step string, outcome launch.DurabilityOutcome, stepErr error, prepared launch.PreparedProcess, launchContext launch.LaunchContext) error {
@@ -737,7 +727,6 @@ type legacyFencedCommand struct {
 	launchContext launch.LaunchContext
 	group         model.GroupRef
 	prepared      launch.PreparedProcess
-	secret        model.ReleaseSecret
 	stdin         *legacyFencedStdin
 	stdoutReader  *io.PipeReader
 	stdoutWriter  *io.PipeWriter
@@ -756,7 +745,7 @@ type legacyFencedCommand struct {
 	err      error
 }
 
-func newLegacyFencedCommand(coordinator *servedSubmissionCoordinator, launchContext launch.LaunchContext, group model.GroupRef, prepared launch.PreparedProcess, secret model.ReleaseSecret) *legacyFencedCommand {
+func newLegacyFencedCommand(coordinator *servedSubmissionCoordinator, launchContext launch.LaunchContext, group model.GroupRef, prepared launch.PreparedProcess) *legacyFencedCommand {
 	stdoutReader, stdoutWriter := io.Pipe()
 	stderrReader, stderrWriter := io.Pipe()
 	return &legacyFencedCommand{
@@ -764,7 +753,6 @@ func newLegacyFencedCommand(coordinator *servedSubmissionCoordinator, launchCont
 		launchContext: launchContext,
 		group:         group,
 		prepared:      prepared,
-		secret:        secret,
 		stdin:         &legacyFencedStdin{},
 		stdoutReader:  stdoutReader,
 		stdoutWriter:  stdoutWriter,
@@ -860,20 +848,44 @@ func (cmd *legacyFencedCommand) grantAndRelease(ctx context.Context) error {
 		cmd.failPrepared(ctx, mapped)
 		return mapped
 	}
-	running, err := cmd.coordinator.launch.Release(ctx, cmd.prepared, cmd.secret)
-	if err != nil {
-		mapped := fmt.Errorf("%w: release: %v", launch.ErrReleaseUncertain, err)
+	running, physicalReleaseOutcome, err := cmd.coordinator.launch.Release(ctx, cmd.prepared)
+	switch physicalReleaseOutcome {
+	case custodian.ReleaseAccepted:
+		if err != nil {
+			mapped := fmt.Errorf("%w: release accepted with error: %v", launch.ErrReleaseUncertain, err)
+			cmd.failReleasedByGroup(ctx, mapped)
+			return mapped
+		}
+	case custodian.ReleaseDefinitelyNotSent:
+		mapped := launch.ErrReleaseUncertain
+		if err != nil {
+			mapped = fmt.Errorf("%w: release definitely not sent: %v", launch.ErrReleaseUncertain, err)
+		}
 		cmd.failPrepared(ctx, mapped)
+		return mapped
+	case custodian.ReleaseOutcomeUnknown:
+		mapped := launch.ErrReleaseUncertain
+		if err != nil {
+			mapped = fmt.Errorf("%w: release outcome unknown: %v", launch.ErrReleaseUncertain, err)
+		}
+		cmd.failReleasedByGroup(ctx, mapped)
+		return mapped
+	default:
+		mapped := fmt.Errorf("%w: invalid release outcome %d", launch.ErrReleaseUncertain, physicalReleaseOutcome)
+		if err != nil {
+			mapped = errors.Join(mapped, err)
+		}
+		cmd.failReleasedByGroup(ctx, mapped)
 		return mapped
 	}
 	if running == nil {
 		mapped := fmt.Errorf("%w: release returned nil running process", launch.ErrReleaseUncertain)
-		cmd.failPrepared(ctx, mapped)
+		cmd.failReleasedByGroup(ctx, mapped)
 		return mapped
 	}
 	if !running.Ref().Equal(cmd.group) {
 		mapped := fmt.Errorf("%w: released group mismatch", launch.ErrReleaseUncertain)
-		cmd.failPrepared(ctx, mapped)
+		cmd.failReleasedByGroup(ctx, mapped)
 		return mapped
 	}
 	child, evidence, err := admissionReleaseObservation(cmd.group)
@@ -958,6 +970,17 @@ func (cmd *legacyFencedCommand) rejectAuthority(ctx context.Context, cause model
 
 func (cmd *legacyFencedCommand) failPrepared(ctx context.Context, reason error) {
 	err := errors.Join(reason, cmd.coordinator.abortLegacyPrepared(ctx, cmd.prepared, true, cmd.launchContext))
+	cmd.closePipesWithError(err)
+	cmd.finish(command.ExitObservation{}, err)
+}
+
+func (cmd *legacyFencedCommand) failReleasedByGroup(ctx context.Context, reason error) {
+	verified, containErr := cmd.coordinator.launch.ContainAndVerify(ctx, cmd.launchContext, cmd.group, custodian.QuiescenceCauseContain)
+	if containErr == nil {
+		outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(ctx, cmd.launchContext, verified)
+		containErr = admissionDurabilityError("record_quiescence", outcome, recordErr)
+	}
+	err := errors.Join(reason, containErr, cmd.coordinator.failStop(ctx, errors.Join(reason, containErr)), launch.ErrFailClosed)
 	cmd.closePipesWithError(err)
 	cmd.finish(command.ExitObservation{}, err)
 }

@@ -47,7 +47,7 @@ type CustodianPort interface {
 
 type PreparedProcess interface {
 	Ref() model.GroupRef
-	Release(context.Context, custodian.GrantToken) (RunningProcess, error)
+	Release(context.Context) (RunningProcess, custodian.ReleaseOutcome, error)
 	AbortAndVerify(context.Context) (custodian.VerifiedQuiescence, error)
 }
 
@@ -106,10 +106,9 @@ func (launch LaunchContext) Key() model.LaunchKey {
 }
 
 type LaunchRequest struct {
-	Context       LaunchContext
-	Exec          command.ExecSpec
-	ReleaseSecret model.ReleaseSecret
-	Failures      *FailureInjector
+	Context  LaunchContext
+	Exec     command.ExecSpec
+	Failures *FailureInjector
 }
 
 func (request LaunchRequest) Validate() error {
@@ -119,24 +118,17 @@ func (request LaunchRequest) Validate() error {
 	if len(request.Exec.Argv) == 0 || request.Exec.Argv[0] == "" {
 		return fmt.Errorf("%w: exec argv is required", ErrInvalidLaunchRequest)
 	}
-	if err := request.ReleaseSecret.Validate(); err != nil {
-		return fmt.Errorf("%w: release_secret: %v", ErrInvalidLaunchRequest, err)
-	}
 	return nil
 }
 
 type RunnerBinding struct {
-	Context       LaunchContext
-	ReleaseSecret model.ReleaseSecret
-	Failures      *FailureInjector
+	Context  LaunchContext
+	Failures *FailureInjector
 }
 
 func (binding RunnerBinding) Validate() error {
 	if err := binding.Context.Validate(); err != nil {
 		return err
-	}
-	if err := binding.ReleaseSecret.Validate(); err != nil {
-		return fmt.Errorf("%w: release_secret: %v", ErrInvalidLaunchRequest, err)
 	}
 	return nil
 }
@@ -158,10 +150,9 @@ type boundRunner struct {
 
 func (runner boundRunner) Start(ctx context.Context, spec command.ExecSpec) (command.RunningCommand, error) {
 	return runner.controller.Start(ctx, LaunchRequest{
-		Context:       runner.binding.Context,
-		Exec:          spec,
-		ReleaseSecret: runner.binding.ReleaseSecret,
-		Failures:      runner.binding.Failures,
+		Context:  runner.binding.Context,
+		Exec:     spec,
+		Failures: runner.binding.Failures,
 	})
 }
 
@@ -204,10 +195,9 @@ func (controller *LaunchController) Start(ctx context.Context, request LaunchReq
 		return nil, controller.containGroupAndFailStop(containmentContext(ctx), group, err)
 	}
 
-	running, err := controller.Release(ctx, prepared, request.ReleaseSecret)
-	if err != nil {
-		reason := fmt.Errorf("%w: release: %v", ErrReleaseUncertain, err)
-		return nil, controller.containGroupAndFailStop(containmentContext(ctx), group, reason)
+	running, physicalReleaseOutcome, err := controller.Release(ctx, prepared)
+	if releaseErr := controller.handleReleaseOutcome(containmentContext(ctx), prepared, request.Context, group, physicalReleaseOutcome, err); releaseErr != nil {
+		return nil, releaseErr
 	}
 	if running == nil {
 		reason := fmt.Errorf("%w: release returned nil running process", ErrReleaseUncertain)
@@ -266,11 +256,40 @@ func (controller *LaunchController) AllocateGrant(ctx context.Context, launch La
 	return controller.authority.AllocateGrant(ctx, launch.Attempt, launch.Ordinal)
 }
 
-func (controller *LaunchController) Release(ctx context.Context, prepared PreparedProcess, secret model.ReleaseSecret) (RunningProcess, error) {
-	if err := secret.Validate(); err != nil {
-		return nil, err
+func (controller *LaunchController) Release(ctx context.Context, prepared PreparedProcess) (RunningProcess, custodian.ReleaseOutcome, error) {
+	if prepared == nil {
+		return nil, custodian.ReleaseDefinitelyNotSent, fmt.Errorf("%w: prepared process is nil", ErrInvalidLaunchRequest)
 	}
-	return prepared.Release(ctx, custodian.GrantToken(secret.String()))
+	return prepared.Release(ctx)
+}
+
+func (controller *LaunchController) handleReleaseOutcome(ctx context.Context, prepared PreparedProcess, launch LaunchContext, group model.GroupRef, outcome custodian.ReleaseOutcome, releaseErr error) error {
+	switch outcome {
+	case custodian.ReleaseAccepted:
+		if releaseErr != nil {
+			reason := fmt.Errorf("%w: release accepted with error: %v", ErrReleaseUncertain, releaseErr)
+			return controller.containGroupAndFailStop(ctx, group, reason)
+		}
+		return nil
+	case custodian.ReleaseDefinitelyNotSent:
+		reason := ErrReleaseUncertain
+		if releaseErr != nil {
+			reason = fmt.Errorf("%w: release definitely not sent: %v", ErrReleaseUncertain, releaseErr)
+		}
+		return errors.Join(reason, controller.abortPrepared(ctx, prepared, true, launch))
+	case custodian.ReleaseOutcomeUnknown:
+		reason := ErrReleaseUncertain
+		if releaseErr != nil {
+			reason = fmt.Errorf("%w: release outcome unknown: %v", ErrReleaseUncertain, releaseErr)
+		}
+		return controller.containGroupAndFailStop(ctx, group, reason)
+	default:
+		reason := fmt.Errorf("%w: invalid release outcome %d", ErrReleaseUncertain, outcome)
+		if releaseErr != nil {
+			reason = errors.Join(reason, releaseErr)
+		}
+		return controller.containGroupAndFailStop(ctx, group, reason)
+	}
 }
 
 func (controller *LaunchController) RecordRelease(ctx context.Context, launch LaunchContext, group model.GroupRef) (DurabilityOutcome, error) {

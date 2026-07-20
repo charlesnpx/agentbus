@@ -8,10 +8,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
+	"github.com/charlesnpx/agentbus/internal/parkproto"
 )
 
 const nativeReleaseSecretEntropyBytes = 32
@@ -34,8 +36,9 @@ type nativeHeldPreparedLaunch struct {
 }
 
 type nativeHeldLaunchEffects struct {
-	custodian *NativeCustodian
-	spec      NativeLaunchSpec
+	custodian     *NativeCustodian
+	spec          NativeLaunchSpec
+	releaseSecret parkproto.ReleaseSecret
 
 	mu       sync.Mutex
 	prepared map[string]*nativeHeldPreparedLaunch
@@ -49,11 +52,9 @@ type nativeHeldPreparedRegistration struct {
 
 var _ HeldLaunchEffects = (*nativeHeldLaunchEffects)(nil)
 
-// prepareNativeHeldLaunch is the package-private native bridge for R3A1 tests.
-// The caller-supplied NativeLaunchSpec.ReleaseSecret is ignored: this path
-// generates one custodian-owned secret here, copies it into the R2A PrepareSpec
-// because HeldLaunchCore still validates that field, and passes the same secret
-// into the R2B parklaunch.Spec. No production composition selects this path yet.
+// prepareNativeHeldLaunch is the native bridge from public prepared custody to
+// the private park protocol. It generates the physical release secret inside the
+// custodian and only passes it into HeldLaunchCore and parklaunch.
 func prepareNativeHeldLaunch(ctx context.Context, custodian *NativeCustodian, spec NativeLaunchSpec) (HeldLaunch, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -65,14 +66,14 @@ func prepareNativeHeldLaunch(ctx context.Context, custodian *NativeCustodian, sp
 	if err != nil {
 		return nil, err
 	}
-	spec.ReleaseSecret = secret
 	if err := spec.Validate(); err != nil {
 		return nil, err
 	}
 	effects := &nativeHeldLaunchEffects{
-		custodian: custodian,
-		spec:      spec,
-		prepared:  make(map[string]*nativeHeldPreparedLaunch),
+		custodian:     custodian,
+		spec:          spec,
+		releaseSecret: secret,
+		prepared:      make(map[string]*nativeHeldPreparedLaunch),
 	}
 	return PrepareHeldLaunch(ctx, PrepareSpec{
 		Exec:          spec.Exec,
@@ -81,7 +82,7 @@ func prepareNativeHeldLaunch(ctx context.Context, custodian *NativeCustodian, sp
 	}, effects)
 }
 
-func generateNativeReleaseSecret() (model.ReleaseSecret, error) {
+func generateNativeReleaseSecret() (parkproto.ReleaseSecret, error) {
 	var raw [nativeReleaseSecretEntropyBytes]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", fmt.Errorf("%w: generate release secret: %v", ErrNativeCustodianUnavailable, err)
@@ -91,11 +92,67 @@ func generateNativeReleaseSecret() (model.ReleaseSecret, error) {
 			raw[i] = 0
 		}
 	}()
-	secret, err := model.NewReleaseSecret("native-release-secret-v1-" + hex.EncodeToString(raw[:]))
+	secret, err := parkproto.NewReleaseSecret("native-release-secret-v1-" + hex.EncodeToString(raw[:]))
 	if err != nil {
 		return "", err
 	}
 	return secret, nil
+}
+
+func generateNativeCustodyID() (model.CustodyID, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("%w: generate custody id: %v", ErrNativeCustodianUnavailable, err)
+	}
+	defer func() {
+		for i := range raw {
+			raw[i] = 0
+		}
+	}()
+	id, err := model.NewCustodyID("native-custody-v1-" + hex.EncodeToString(raw[:]))
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+type nativePreparedProcess struct {
+	launch HeldLaunch
+}
+
+func (*nativePreparedProcess) preparedProcess() {}
+
+func (process *nativePreparedProcess) Ref() model.GroupRef {
+	if process == nil || process.launch == nil {
+		return model.GroupRef{}
+	}
+	return process.launch.Ref()
+}
+
+func (*nativePreparedProcess) Stdin() io.WriteCloser {
+	return nil
+}
+
+func (*nativePreparedProcess) Stdout() io.ReadCloser {
+	return nil
+}
+
+func (*nativePreparedProcess) Stderr() io.ReadCloser {
+	return nil
+}
+
+func (process *nativePreparedProcess) Release(ctx context.Context) (RunningProcess, ReleaseOutcome, error) {
+	if process == nil || process.launch == nil {
+		return nil, ReleaseDefinitelyNotSent, ErrInvalidHeldLaunch
+	}
+	return process.launch.Release(ctx)
+}
+
+func (process *nativePreparedProcess) AbortAndVerify(ctx context.Context) (VerifiedQuiescence, error) {
+	if process == nil || process.launch == nil {
+		return VerifiedQuiescence{}, ErrInvalidHeldLaunch
+	}
+	return process.launch.AbortAndVerify(ctx)
 }
 
 func (effects *nativeHeldLaunchEffects) Prepare(ctx context.Context, spec PrepareSpec) (model.GroupRef, error) {
@@ -105,13 +162,12 @@ func (effects *nativeHeldLaunchEffects) Prepare(ctx context.Context, spec Prepar
 	if effects == nil || effects.custodian == nil {
 		return model.GroupRef{}, fmt.Errorf("%w: native held launch effects are nil", ErrNativeCustodianUnavailable)
 	}
-	if spec.ReleaseSecret != effects.spec.ReleaseSecret {
+	if spec.ReleaseSecret != effects.releaseSecret {
 		return model.GroupRef{}, fmt.Errorf("%w: native held launch release secret mismatch", ErrInvalidHeldLaunch)
 	}
 	nativeSpec := effects.spec
 	nativeSpec.Exec = spec.Exec
 	nativeSpec.LaunchKey = spec.LaunchKey
-	nativeSpec.ReleaseSecret = spec.ReleaseSecret
 	if err := nativeSpec.Validate(); err != nil {
 		return model.GroupRef{}, err
 	}
@@ -139,7 +195,7 @@ func (effects *nativeHeldLaunchEffects) Prepare(ctx context.Context, spec Prepar
 			launchContainment.setRetainedObject(retainedObject)
 		}
 	}
-	parkSpec, err := effects.custodian.parklaunchSpec(nativeSpec, launchContainment, backend, syncLaunchContainment)
+	parkSpec, err := effects.custodian.parklaunchSpec(nativeSpec, spec.ReleaseSecret, launchContainment, backend, syncLaunchContainment)
 	if err != nil {
 		return model.GroupRef{}, errors.Join(err, backend.close(ctx))
 	}

@@ -30,7 +30,6 @@ import (
 var (
 	ErrNativeCustodianUnavailable = errors.New("native custodian unavailable")
 	ErrPhysicalContainment        = errors.New("physical containment failed")
-	ErrNativePreparedBoundary     = errors.New("native prepared custody requires launch-controller wiring")
 )
 
 type PhysicalOutcomeKind string
@@ -76,11 +75,9 @@ type NativeOptions struct {
 }
 
 type NativeLaunchSpec struct {
-	Exec          command.ExecSpec
-	CustodyID     model.CustodyID
-	LaunchKey     model.LaunchKey
-	LogicalGrant  model.LaunchGrant
-	ReleaseSecret model.ReleaseSecret
+	Exec      command.ExecSpec
+	CustodyID model.CustodyID
+	LaunchKey model.LaunchKey
 }
 
 type NativeCustodian struct {
@@ -186,78 +183,58 @@ func (custodian *NativeCustodian) ActiveCustodyCount() int {
 	return count
 }
 
-func (custodian *NativeCustodian) Prepare(context.Context, command.ExecSpec, model.LaunchKey) (PreparedProcess, error) {
-	return nil, fmt.Errorf("%w: Prepare/Release is owned by S4 launch-controller wiring", ErrNativePreparedBoundary)
+func (custodian *NativeCustodian) Prepare(ctx context.Context, execSpec command.ExecSpec, key model.LaunchKey) (PreparedProcess, error) {
+	custodyID, err := generateNativeCustodyID()
+	if err != nil {
+		return nil, err
+	}
+	held, err := prepareNativeHeldLaunch(ctx, custodian, NativeLaunchSpec{
+		Exec:      execSpec,
+		CustodyID: custodyID,
+		LaunchKey: key,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &nativePreparedProcess{launch: held}, nil
 }
 
 func (custodian *NativeCustodian) Launch(ctx context.Context, spec NativeLaunchSpec) (*NativeRunningProcess, error) {
-	if custodian == nil {
-		return nil, fmt.Errorf("%w: custodian is nil", ErrNativeCustodianUnavailable)
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := spec.Validate(); err != nil {
 		return nil, err
 	}
-	custodian.mu.Lock()
-	if custodian.closed {
-		custodian.mu.Unlock()
-		return nil, fmt.Errorf("%w: custodian is closed", ErrNativeCustodianUnavailable)
-	}
-	custodian.mu.Unlock()
-	backend, err := newNativeContainmentBackend(ctx, custodian)
+	held, err := prepareNativeHeldLaunch(ctx, custodian, spec)
 	if err != nil {
 		return nil, err
 	}
-	launchContainment := &nativeLaunchContainment{
-		params:         custodian.options.ContainmentParams,
-		retainedObject: backend.retainedObject(),
-	}
-	syncLaunchContainment := func() {
-		if witness := backend.witness(); witness != nil {
-			launchContainment.setWitness(witness)
+	running, outcome, err := held.Release(ctx)
+	switch outcome {
+	case ReleaseAccepted:
+		nativeRunning, ok := running.(*NativeRunningProcess)
+		if !ok || nativeRunning == nil {
+			return nil, fmt.Errorf("%w: native prepared release returned %T", ErrNativeCustodianUnavailable, running)
 		}
-		if retainedObject := backend.retainedObject(); retainedObject != nil {
-			launchContainment.setRetainedObject(retainedObject)
+		return nativeRunning, err
+	case ReleaseDefinitelyNotSent:
+		_, abortErr := held.AbortAndVerify(context.WithoutCancel(ctx))
+		if err == nil {
+			err = fmt.Errorf("%w: native prepared release was definitely not sent", ErrNativeCustodianUnavailable)
 		}
-	}
-	parkSpec, err := custodian.parklaunchSpec(spec, launchContainment, backend, syncLaunchContainment)
-	if err != nil {
-		_ = backend.close(ctx)
+		return nil, errors.Join(err, abortErr)
+	case ReleaseOutcomeUnknown:
+		if err == nil {
+			err = fmt.Errorf("%w: native prepared release outcome unknown", ErrNativeCustodianUnavailable)
+		}
+		return nil, err
+	default:
+		if err == nil {
+			err = fmt.Errorf("%w: invalid native prepared release outcome %d", ErrNativeCustodianUnavailable, outcome)
+		}
 		return nil, err
 	}
-	handle, err := parklaunch.Launch(ctx, parkSpec)
-	if err != nil {
-		return nil, errors.Join(err, backend.close(ctx))
-	}
-	if !backend.witnessAcquired() {
-		err := fmt.Errorf("%w: containment continuity witness was not acquired before release", ErrNativeCustodianUnavailable)
-		cleanupErr := cleanupLaunchedHandle(ctx, handle, custodian.options.ContainmentParams)
-		return nil, errors.Join(err, cleanupErr, backend.close(ctx))
-	}
-	backend.attachHandle(handle)
-	running := &NativeRunningProcess{
-		custodian:   custodian,
-		handle:      handle,
-		group:       handle.GroupRef,
-		leader:      backend.leaderRetention(),
-		containment: backend,
-	}
-	custodian.mu.Lock()
-	if custodian.closed {
-		custodian.mu.Unlock()
-		cleanupErr := cleanupLaunchedHandle(ctx, handle, custodian.options.ContainmentParams)
-		return nil, errors.Join(fmt.Errorf("%w: custodian is closed", ErrNativeCustodianUnavailable), cleanupErr, backend.close(ctx))
-	}
-	key := groupKey(handle.GroupRef)
-	if custodian.running == nil {
-		custodian.running = make(map[string]*NativeRunningProcess)
-	}
-	delete(custodian.finalized, key)
-	custodian.running[key] = running
-	custodian.mu.Unlock()
-	return running, nil
 }
 
 func (custodian *NativeCustodian) Close() error {
@@ -495,7 +472,7 @@ func (custodian *NativeCustodian) cacheFinalized(process *NativeRunningProcess) 
 	}
 }
 
-func (custodian *NativeCustodian) parklaunchSpec(spec NativeLaunchSpec, launchContainment parklaunch.Containment, backend nativeContainmentBackend, syncLaunchContainment func()) (parklaunch.Spec, error) {
+func (custodian *NativeCustodian) parklaunchSpec(spec NativeLaunchSpec, releaseSecret parkproto.ReleaseSecret, launchContainment parklaunch.Containment, backend nativeContainmentBackend, syncLaunchContainment func()) (parklaunch.Spec, error) {
 	execSpec, err := parkprotoExecSpec(spec.Exec)
 	if err != nil {
 		return parklaunch.Spec{}, err
@@ -509,8 +486,7 @@ func (custodian *NativeCustodian) parklaunchSpec(spec NativeLaunchSpec, launchCo
 		ExecSpec:             execSpec,
 		CustodyID:            spec.CustodyID,
 		LaunchKey:            spec.LaunchKey,
-		LogicalGrant:         spec.LogicalGrant,
-		ReleaseSecret:        spec.ReleaseSecret,
+		ReleaseSecret:        releaseSecret,
 		Containment:          launchContainment,
 		Monitor:              &parklaunch.MonitorProcessSpec{Command: custodian.options.MonitorCommand},
 		RetainedID:           backend.retainedID(),
@@ -689,13 +665,7 @@ func (spec NativeLaunchSpec) Validate() error {
 	if err := spec.LaunchKey.Validate(); err != nil {
 		return err
 	}
-	if err := spec.LogicalGrant.Validate(); err != nil {
-		return err
-	}
-	if !spec.LogicalGrant.Attempt.Equal(spec.LaunchKey.Attempt) || spec.LogicalGrant.Ordinal != spec.LaunchKey.Ordinal {
-		return fmt.Errorf("%w: logical grant does not match launch key", ErrInvalidSupport)
-	}
-	return spec.ReleaseSecret.Validate()
+	return nil
 }
 
 func parkprotoExecSpec(spec command.ExecSpec) (parkproto.ExecSpec, error) {

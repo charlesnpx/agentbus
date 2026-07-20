@@ -84,8 +84,7 @@ type Spec struct {
 	ExecSpec      parkproto.ExecSpec
 	CustodyID     model.CustodyID
 	LaunchKey     model.LaunchKey
-	LogicalGrant  model.LaunchGrant
-	ReleaseSecret model.ReleaseSecret
+	ReleaseSecret parkproto.ReleaseSecret
 	Containment   Containment
 	Monitor       *MonitorProcessSpec
 	RetainedID    string
@@ -783,12 +782,6 @@ func validateSpec(spec Spec) error {
 	}
 	if err := spec.LaunchKey.Validate(); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidSpec, err)
-	}
-	if err := spec.LogicalGrant.Validate(); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidSpec, err)
-	}
-	if !spec.LogicalGrant.Attempt.Equal(spec.LaunchKey.Attempt) || spec.LogicalGrant.Ordinal != spec.LaunchKey.Ordinal {
-		return fmt.Errorf("%w: logical grant does not match launch key", ErrInvalidSpec)
 	}
 	if err := spec.ReleaseSecret.Validate(); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidSpec, err)

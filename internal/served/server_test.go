@@ -3829,13 +3829,13 @@ func (p *admissionFakePrepared) Ref() model.GroupRef {
 	return p.group
 }
 
-func (p *admissionFakePrepared) Release(context.Context, custodian.GrantToken) (launch.RunningProcess, error) {
+func (p *admissionFakePrepared) Release(context.Context) (launch.RunningProcess, custodian.ReleaseOutcome, error) {
 	if p.custodian != nil {
 		p.custodian.mu.Lock()
 		p.custodian.releases++
 		p.custodian.mu.Unlock()
 	}
-	return p.running, nil
+	return p.running, custodian.ReleaseAccepted, nil
 }
 
 func (p *admissionFakePrepared) AbortAndVerify(ctx context.Context) (custodian.VerifiedQuiescence, error) {

@@ -131,10 +131,13 @@ func (p runtimePreparedProcess) Ref() model.GroupRef {
 	return p.prepared.Ref()
 }
 
-func (p runtimePreparedProcess) Release(ctx context.Context, token custodian.GrantToken) (launch.RunningProcess, error) {
-	running, err := p.prepared.Release(ctx, token)
-	if err != nil {
-		return nil, err
+func (p runtimePreparedProcess) Release(ctx context.Context) (launch.RunningProcess, custodian.ReleaseOutcome, error) {
+	if p.prepared == nil {
+		return nil, custodian.ReleaseDefinitelyNotSent, custodian.ErrSupervisorUnavailable
+	}
+	running, outcome, err := p.prepared.Release(ctx)
+	if err != nil || outcome != custodian.ReleaseAccepted {
+		return nil, outcome, err
 	}
 	streaming, ok := running.(interface {
 		Ref() model.GroupRef
@@ -145,9 +148,9 @@ func (p runtimePreparedProcess) Release(ctx context.Context, token custodian.Gra
 		ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error)
 	})
 	if !ok {
-		return nil, fmt.Errorf("%w: running process does not expose command streams", custodian.ErrSupervisorUnavailable)
+		return nil, custodian.ReleaseOutcomeUnknown, fmt.Errorf("%w: running process does not expose command streams", custodian.ErrSupervisorUnavailable)
 	}
-	return runtimeRunningProcess{running: streaming}, nil
+	return runtimeRunningProcess{running: streaming}, custodian.ReleaseAccepted, nil
 }
 
 func (p runtimePreparedProcess) AbortAndVerify(ctx context.Context) (custodian.VerifiedQuiescence, error) {

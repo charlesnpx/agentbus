@@ -1125,14 +1125,12 @@ func newLaunchFixture(t *testing.T, backendOpts backendFixtureOptions) launchFix
 	containment := &recordingContainment{kill: true}
 	attempt := model.AttemptRef{JobID: "job-parklaunch", AttemptID: "attempt-1", Epoch: 1}
 	launchKey := model.LaunchKey{Attempt: attempt, Ordinal: model.LaunchOrdinalOne}
-	boot := model.BootRef{BootID: "boot-parklaunch", OwnerID: "owner-parklaunch"}
 	monitorMarker := filepath.Join(dir, "monitor-containment.log")
 	spec := Spec{
 		AgentbusPath:  builtAgentbusPath(t),
 		ExecSpec:      backend.ExecSpec,
 		CustodyID:     "custody-parklaunch",
 		LaunchKey:     launchKey,
-		LogicalGrant:  model.LaunchGrant{Attempt: attempt, Ordinal: model.LaunchOrdinalOne, Nonce: "nonce-parklaunch", GrantedBy: boot},
 		ReleaseSecret: "release-secret-parklaunch",
 		Containment:   containment,
 		Monitor: &MonitorProcessSpec{

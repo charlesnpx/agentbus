@@ -20,28 +20,6 @@ func (nonce LaunchNonce) Validate() error {
 	return validateToken("launch_nonce", string(nonce))
 }
 
-// ReleaseSecret is the physical, channel-scoped secret used by a custodian to
-// authorize one parked worker release. It is intentionally distinct from
-// LaunchGrant.Nonce: the authority owns the logical grant nonce, while the
-// custodian verifies this physical release secret on its private channel.
-type ReleaseSecret string
-
-func NewReleaseSecret(value string) (ReleaseSecret, error) {
-	secret := ReleaseSecret(value)
-	if err := secret.Validate(); err != nil {
-		return "", err
-	}
-	return secret, nil
-}
-
-func (secret ReleaseSecret) String() string {
-	return string(secret)
-}
-
-func (secret ReleaseSecret) Validate() error {
-	return validateToken("release_secret", string(secret))
-}
-
 type Evidence struct {
 	Kind   string
 	Detail string

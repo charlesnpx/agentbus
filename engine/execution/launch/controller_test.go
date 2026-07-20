@@ -41,12 +41,6 @@ func TestLaunchControllerHappyPathOrdering(t *testing.T) {
 	if h.prepared.releaseCalls != 1 {
 		t.Fatalf("release calls = %d, want 1", h.prepared.releaseCalls)
 	}
-	if h.prepared.releaseToken != custodian.GrantToken(h.releaseSecret.String()) {
-		t.Fatalf("release token = %q, want physical release secret %q", h.prepared.releaseToken, h.releaseSecret)
-	}
-	if h.prepared.releaseToken == custodian.GrantToken(h.grant.Nonce.String()) {
-		t.Fatal("release token reused the logical grant nonce")
-	}
 	want := []string{"prepare", "bind_group", "allocate_grant", "release", "wait_start", "record_release", "wait_return", "record_quiescence"}
 	if got := h.events.snapshot(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("events = %#v, want %#v", got, want)
@@ -613,6 +607,7 @@ func TestLaunchControllerEagerWaitReportsContainedAndNaturalResults(t *testing.T
 
 func TestLaunchControllerReleaseErrorContainsWithoutRetry(t *testing.T) {
 	h := newHarness(t, "release-error")
+	h.prepared.releaseOutcome = custodian.ReleaseOutcomeUnknown
 	h.prepared.releaseErr = errors.New("release channel lost")
 
 	_, err := h.controller.Run(context.Background(), h.request(nil))
@@ -630,6 +625,35 @@ func TestLaunchControllerReleaseErrorContainsWithoutRetry(t *testing.T) {
 	}
 	if h.authority.failStops != 1 {
 		t.Fatalf("fail stops = %d, want 1", h.authority.failStops)
+	}
+}
+
+func TestLaunchControllerReleaseDefinitelyNotSentAbortsWithoutRetry(t *testing.T) {
+	h := newHarness(t, "release-not-sent")
+	h.prepared.releaseOutcome = custodian.ReleaseDefinitelyNotSent
+	h.prepared.releaseErr = errors.New("release pipe closed before write")
+
+	_, err := h.controller.Run(context.Background(), h.request(nil))
+	if err == nil {
+		t.Fatal("Run returned nil error for definitely-not-sent release")
+	}
+	if !errors.Is(err, ErrReleaseUncertain) {
+		t.Fatalf("Run error = %v, want ErrReleaseUncertain", err)
+	}
+	if h.prepared.releaseCalls != 1 {
+		t.Fatalf("release calls = %d, want 1", h.prepared.releaseCalls)
+	}
+	if h.prepared.abortCalls != 1 {
+		t.Fatalf("abort calls = %d, want 1", h.prepared.abortCalls)
+	}
+	if h.custodian.containCalls != 0 {
+		t.Fatalf("custodian contain calls = %d, want 0", h.custodian.containCalls)
+	}
+	if h.authority.recordQuiescenceCalls != 1 {
+		t.Fatalf("record quiescence calls = %d, want 1", h.authority.recordQuiescenceCalls)
+	}
+	if h.authority.failStops != 0 {
+		t.Fatalf("fail stops = %d, want 0", h.authority.failStops)
 	}
 }
 
@@ -679,17 +703,16 @@ func TestLaunchControllerConcurrentWaitAndCancelHasOneFinalAttestation(t *testin
 }
 
 type harness struct {
-	events        *eventLog
-	controller    *LaunchController
-	authority     *fakeAuthority
-	custodian     *fakeCustodian
-	prepared      *fakePrepared
-	running       *fakeRunning
-	launch        LaunchContext
-	group         model.GroupRef
-	grant         model.LaunchGrant
-	releaseSecret model.ReleaseSecret
-	verifier      custodian.AttestationVerifier
+	events     *eventLog
+	controller *LaunchController
+	authority  *fakeAuthority
+	custodian  *fakeCustodian
+	prepared   *fakePrepared
+	running    *fakeRunning
+	launch     LaunchContext
+	group      model.GroupRef
+	grant      model.LaunchGrant
+	verifier   custodian.AttestationVerifier
 }
 
 func newHarness(t *testing.T, name string) *harness {
@@ -733,26 +756,24 @@ func newHarness(t *testing.T, name string) *harness {
 		t.Fatal(err)
 	}
 	return &harness{
-		events:        events,
-		controller:    controller,
-		authority:     auth,
-		custodian:     cust,
-		prepared:      prepared,
-		running:       running,
-		launch:        launch,
-		group:         group,
-		grant:         grant,
-		releaseSecret: model.ReleaseSecret("release-" + sanitizeName(name)),
-		verifier:      verifier,
+		events:     events,
+		controller: controller,
+		authority:  auth,
+		custodian:  cust,
+		prepared:   prepared,
+		running:    running,
+		launch:     launch,
+		group:      group,
+		grant:      grant,
+		verifier:   verifier,
 	}
 }
 
 func (h *harness) request(injector *FailureInjector) LaunchRequest {
 	return LaunchRequest{
-		Context:       h.launch,
-		Exec:          command.ExecSpec{Argv: []string{"/bin/fake"}},
-		ReleaseSecret: h.releaseSecret,
-		Failures:      injector,
+		Context:  h.launch,
+		Exec:     command.ExecSpec{Argv: []string{"/bin/fake"}},
+		Failures: injector,
 	}
 }
 
@@ -886,30 +907,36 @@ func (cust *fakeCustodian) ContainAndVerify(_ context.Context, group model.Group
 }
 
 type fakePrepared struct {
-	events       *eventLog
-	group        model.GroupRef
-	running      *fakeRunning
-	issuer       custodian.AttestationIssuer
-	releaseErr   error
-	abortErr     error
-	releaseCalls int
-	releaseToken custodian.GrantToken
-	abortCalls   int
-	attestations int
+	events         *eventLog
+	group          model.GroupRef
+	running        *fakeRunning
+	issuer         custodian.AttestationIssuer
+	releaseErr     error
+	releaseOutcome custodian.ReleaseOutcome
+	abortErr       error
+	releaseCalls   int
+	abortCalls     int
+	attestations   int
 }
 
 func (prepared *fakePrepared) Ref() model.GroupRef {
 	return prepared.group
 }
 
-func (prepared *fakePrepared) Release(_ context.Context, token custodian.GrantToken) (RunningProcess, error) {
+func (prepared *fakePrepared) Release(context.Context) (RunningProcess, custodian.ReleaseOutcome, error) {
 	prepared.releaseCalls++
-	prepared.releaseToken = token
 	prepared.events.add("release")
-	if prepared.releaseErr != nil {
-		return nil, prepared.releaseErr
+	outcome := prepared.releaseOutcome
+	if outcome == 0 {
+		outcome = custodian.ReleaseAccepted
 	}
-	return prepared.running, nil
+	if prepared.releaseErr != nil {
+		return nil, outcome, prepared.releaseErr
+	}
+	if outcome != custodian.ReleaseAccepted {
+		return nil, outcome, nil
+	}
+	return prepared.running, outcome, nil
 }
 
 func (prepared *fakePrepared) AbortAndVerify(context.Context) (custodian.VerifiedQuiescence, error) {

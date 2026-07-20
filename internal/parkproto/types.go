@@ -97,8 +97,26 @@ type ReleaseBinding struct {
 	CustodyID           model.CustodyID      `json:"custodyId"`
 	LaunchKey           model.LaunchKey      `json:"launchKey"`
 	GroupRefDigest      string               `json:"groupRefDigest"`
-	ReleaseSecret       model.ReleaseSecret  `json:"releaseSecret"`
+	ReleaseSecret       ReleaseSecret        `json:"releaseSecret"`
 	ImmutableExecDigest string               `json:"immutableExecDigest"`
+}
+
+type ReleaseSecret string
+
+func NewReleaseSecret(value string) (ReleaseSecret, error) {
+	secret := ReleaseSecret(value)
+	if err := secret.Validate(); err != nil {
+		return "", err
+	}
+	return secret, nil
+}
+
+func (secret ReleaseSecret) String() string {
+	return string(secret)
+}
+
+func (secret ReleaseSecret) Validate() error {
+	return validateProtocolToken("release secret", string(secret))
 }
 
 type ReleaseExpectation struct {

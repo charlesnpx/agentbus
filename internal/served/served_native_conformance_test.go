@@ -27,7 +27,6 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
-	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/containment"
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
@@ -398,81 +397,9 @@ func enableServedNativeRuntime(server *Server, runtimeBundle custodian.Runtime) 
 	server.jobsRequestIDEnabled = true
 	server.admissionRuntimeFactory = func(*Server) *servedAdmissionRuntime {
 		return &servedAdmissionRuntime{
-			runtime:         runtimeBundle,
-			launchCustodian: servedNativeRuntimeLaunchCustodian{runtime: runtimeBundle},
+			runtime: runtimeBundle,
 		}
 	}
-}
-
-type servedNativeRuntimeLaunchCustodian struct {
-	runtime custodian.Runtime
-}
-
-func (c servedNativeRuntimeLaunchCustodian) Prepare(ctx context.Context, spec command.ExecSpec, key model.LaunchKey) (launch.PreparedProcess, error) {
-	native, ok := c.runtime.Process().(interface {
-		Launch(context.Context, custodian.NativeLaunchSpec) (*custodian.NativeRunningProcess, error)
-	})
-	if !ok {
-		return nil, fmt.Errorf("%w: native runtime process is %T", custodian.ErrSupervisorUnavailable, c.runtime.Process())
-	}
-	releaseSecret, err := model.NewReleaseSecret(fmt.Sprintf("release-%s-%s", key.Attempt.JobID, key.Ordinal))
-	if err != nil {
-		return nil, err
-	}
-	nonce, err := model.NewLaunchNonce(fmt.Sprintf("nonce-served-native-%s-%s", key.Attempt.JobID, key.Ordinal))
-	if err != nil {
-		return nil, err
-	}
-	running, err := native.Launch(ctx, custodian.NativeLaunchSpec{
-		Exec:      spec,
-		CustodyID: model.CustodyID(fmt.Sprintf("custody-served-native-%s-%s", key.Attempt.JobID, key.Ordinal)),
-		LaunchKey: key,
-		LogicalGrant: model.LaunchGrant{
-			Attempt:   key.Attempt,
-			Ordinal:   key.Ordinal,
-			Nonce:     nonce,
-			GrantedBy: model.BootRef{BootID: "boot-served-native", OwnerID: "owner-served-native"},
-		},
-		ReleaseSecret: releaseSecret,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return servedNativePreparedProcess{running: running, releaseSecret: releaseSecret}, nil
-}
-
-func (c servedNativeRuntimeLaunchCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
-	return c.runtime.Process().ContainAndVerify(ctx, group, cause)
-}
-
-func (c servedNativeRuntimeLaunchCustodian) HasActiveCustodies() bool {
-	return c.runtime.ActiveCustodyCount() > 0
-}
-
-type servedNativePreparedProcess struct {
-	running       *custodian.NativeRunningProcess
-	releaseSecret model.ReleaseSecret
-}
-
-func (p servedNativePreparedProcess) Ref() model.GroupRef {
-	if p.running == nil {
-		return model.GroupRef{}
-	}
-	return p.running.Ref()
-}
-
-func (p servedNativePreparedProcess) Release(_ context.Context, token custodian.GrantToken) (launch.RunningProcess, error) {
-	if model.ReleaseSecret(token) != p.releaseSecret {
-		return nil, fmt.Errorf("release token = %q, want %q", token, p.releaseSecret)
-	}
-	return p.running, nil
-}
-
-func (p servedNativePreparedProcess) AbortAndVerify(ctx context.Context) (custodian.VerifiedQuiescence, error) {
-	if p.running == nil {
-		return custodian.VerifiedQuiescence{}, custodian.ErrSupervisorUnavailable
-	}
-	return p.running.ContainAndVerify(ctx, custodian.QuiescenceCauseAbort)
 }
 
 type servedNativeFixtureBackend struct {

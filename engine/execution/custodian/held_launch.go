@@ -8,6 +8,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/internal/parkproto"
 )
 
 // ReleaseOutcome reports whether the physical release frame crossed the
@@ -55,14 +56,14 @@ func (outcome ReleaseOutcome) Valid() bool {
 }
 
 // PrepareSpec binds the logical launch identity to the custodian-owned
-// physical release secret. The release secret is supplied externally at prepare
-// time and revalidated when the one release is attempted; Release takes no
+// physical release secret. The release secret is generated before physical
+// prepare and revalidated when the one release is attempted; Release takes no
 // second secret so authority grant nonces cannot be confused with the physical
 // channel secret at call sites.
 type PrepareSpec struct {
 	Exec          command.ExecSpec
 	LaunchKey     model.LaunchKey
-	ReleaseSecret model.ReleaseSecret
+	ReleaseSecret parkproto.ReleaseSecret
 }
 
 func (spec PrepareSpec) Validate() error {
