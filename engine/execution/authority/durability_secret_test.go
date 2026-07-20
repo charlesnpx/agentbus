@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine/command"
@@ -19,11 +20,14 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
+	"github.com/charlesnpx/agentbus/internal/parkproto"
+	"github.com/charlesnpx/agentbus/internal/procgroup"
 )
 
 var legacyReleaseCredentialNames = []string{
 	"release" + "Secret",
 	"Release" + "Secret",
+	"grant" + "Token",
 	"Grant" + "Token",
 }
 
@@ -37,7 +41,11 @@ func TestDurableAuthorityRecordsDoNotPersistLegacyReleaseCredentialBytes(t *test
 		reflect.TypeOf(repository.QuarantineRecord{}),
 		reflect.TypeOf(authority.AnchorSnapshot{}),
 	)
-	sentinel := []byte("release-secret-sentinel-abd-r3a2-logical-layer")
+	sentinel, err := parkproto.NewReleaseSecret("release-secret-sentinel-abd-r3a2-durable-flow")
+	if err != nil {
+		t.Fatalf("NewReleaseSecret() error = %v", err)
+	}
+	sentinelBytes := []byte(sentinel.String())
 
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "admission.bbolt")
@@ -85,7 +93,7 @@ func TestDurableAuthorityRecordsDoNotPersistLegacyReleaseCredentialBytes(t *test
 		t.Fatalf("Accept() error = %v", err)
 	}
 
-	cust := &releaseSecretRecordingCustodian{issuer: issuer}
+	cust := &releaseSecretRecordingCustodian{issuer: issuer, secret: sentinel}
 	controller, err := launch.New(liveSecretAuthorityPort{ready: ready}, cust)
 	if err != nil {
 		t.Fatalf("launch.New() error = %v", err)
@@ -111,13 +119,14 @@ func TestDurableAuthorityRecordsDoNotPersistLegacyReleaseCredentialBytes(t *test
 	if !result.ReleaseRecorded {
 		t.Fatal("release was not durably recorded")
 	}
+	cust.assertReleaseSecretThreaded(t, sentinel)
 
 	rawRecord, rawProjection, rawBinding := loadLiveSecretDurableJSON(t, repo, accepted)
-	assertBytesOmitLegacyReleaseCredential(t, "serialized safety record", rawRecord, sentinel)
-	assertBytesOmitLegacyReleaseCredential(t, "serialized projection", rawProjection, sentinel)
-	assertBytesOmitLegacyReleaseCredential(t, "serialized binding", rawBinding, sentinel)
-	assertBytesOmitLegacyReleaseCredential(t, "bbolt snapshot", repo.SnapshotBytes(), sentinel)
-	assertBytesOmitLegacyReleaseCredential(t, "anchor snapshot", anchorStore.SnapshotBytes(), sentinel)
+	assertBytesOmitLegacyReleaseCredential(t, "serialized safety record", rawRecord, sentinelBytes)
+	assertBytesOmitLegacyReleaseCredential(t, "serialized projection", rawProjection, sentinelBytes)
+	assertBytesOmitLegacyReleaseCredential(t, "serialized binding", rawBinding, sentinelBytes)
+	assertBytesOmitLegacyReleaseCredential(t, "bbolt snapshot", repo.SnapshotBytes(), sentinelBytes)
+	assertBytesOmitLegacyReleaseCredential(t, "anchor snapshot", anchorStore.SnapshotBytes(), sentinelBytes)
 	if err := repo.Close(); err != nil {
 		t.Fatalf("close bbolt repository before raw read: %v", err)
 	}
@@ -126,7 +135,7 @@ func TestDurableAuthorityRecordsDoNotPersistLegacyReleaseCredentialBytes(t *test
 	if err != nil {
 		t.Fatalf("read bbolt file: %v", err)
 	}
-	assertBytesOmitLegacyReleaseCredential(t, "raw bbolt file", rawDB, sentinel)
+	assertBytesOmitLegacyReleaseCredential(t, "raw bbolt file", rawDB, sentinelBytes)
 }
 
 type liveSecretAuthorityPort struct {
@@ -161,23 +170,59 @@ func (a liveSecretAuthorityPort) FailStop(ctx context.Context, reason error) err
 
 type releaseSecretRecordingCustodian struct {
 	issuer custodian.AttestationIssuer
+	secret parkproto.ReleaseSecret
+
+	mu             sync.Mutex
+	prepareSecrets []parkproto.ReleaseSecret
+	releaseSecrets []parkproto.ReleaseSecret
 }
 
 func (c *releaseSecretRecordingCustodian) Prepare(_ context.Context, spec command.ExecSpec, key model.LaunchKey) (launch.PreparedProcess, error) {
 	if len(spec.Argv) == 0 || spec.Argv[0] == "" {
 		return nil, errors.New("exec argv is required")
 	}
+	if err := c.secret.Validate(); err != nil {
+		return nil, err
+	}
 	group := liveSecretGroupRef(key)
-	return &releaseSecretPrepared{custodian: c, group: group}, nil
+	release, err := liveSecretParkRelease(spec, key, group, c.secret)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.prepareSecrets = append(c.prepareSecrets, release.Binding.ReleaseSecret)
+	c.mu.Unlock()
+	return &releaseSecretPrepared{custodian: c, group: group, release: release}, nil
 }
 
 func (c *releaseSecretRecordingCustodian) ContainAndVerify(_ context.Context, group model.GroupRef, _ custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
 	return c.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: group, Method: model.QuiescenceTermKill})
 }
 
+func (c *releaseSecretRecordingCustodian) recordReleaseSecret(secret parkproto.ReleaseSecret) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.releaseSecrets = append(c.releaseSecrets, secret)
+}
+
+func (c *releaseSecretRecordingCustodian) assertReleaseSecretThreaded(t *testing.T, want parkproto.ReleaseSecret) {
+	t.Helper()
+	c.mu.Lock()
+	prepareSecrets := append([]parkproto.ReleaseSecret(nil), c.prepareSecrets...)
+	releaseSecrets := append([]parkproto.ReleaseSecret(nil), c.releaseSecrets...)
+	c.mu.Unlock()
+	if len(prepareSecrets) != 1 || prepareSecrets[0] != want {
+		t.Fatalf("prepare release secrets = %+v, want exactly %q", prepareSecrets, want)
+	}
+	if len(releaseSecrets) != 1 || releaseSecrets[0] != want {
+		t.Fatalf("release secrets = %+v, want exactly %q", releaseSecrets, want)
+	}
+}
+
 type releaseSecretPrepared struct {
 	custodian *releaseSecretRecordingCustodian
 	group     model.GroupRef
+	release   parkproto.Release
 }
 
 func (p *releaseSecretPrepared) Ref() model.GroupRef {
@@ -185,6 +230,10 @@ func (p *releaseSecretPrepared) Ref() model.GroupRef {
 }
 
 func (p *releaseSecretPrepared) Release(context.Context) (launch.RunningProcess, custodian.ReleaseOutcome, error) {
+	if err := p.release.ValidateFor(p.release.Binding.Sequence, parkproto.ReleaseExpectation{Binding: p.release.Binding}); err != nil {
+		return nil, custodian.ReleaseOutcomeUnknown, err
+	}
+	p.custodian.recordReleaseSecret(p.release.Binding.ReleaseSecret)
 	return &releaseSecretRunning{issuer: p.custodian.issuer, group: p.group}, custodian.ReleaseAccepted, nil
 }
 
@@ -245,6 +294,43 @@ func liveSecretGroupRef(key model.LaunchKey) model.GroupRef {
 		Monitor:           model.ProcessIdentity{PID: pgid + 1, HighResStartToken: "monitor-live-secret"},
 		RetainedID:        "retained-live-secret",
 	}
+}
+
+func liveSecretParkRelease(spec command.ExecSpec, key model.LaunchKey, group model.GroupRef, secret parkproto.ReleaseSecret) (parkproto.Release, error) {
+	parkSpec := parkproto.ExecSpec{
+		Path: spec.Argv[0],
+		Argv: append([]string(nil), spec.Argv...),
+		Env:  append([]string(nil), spec.Env...),
+		Dir:  spec.Dir,
+	}
+	execDigest, err := parkproto.DigestExecSpec(parkSpec)
+	if err != nil {
+		return parkproto.Release{}, err
+	}
+	groupDigest, err := parkproto.DigestGroupRef(group)
+	if err != nil {
+		return parkproto.Release{}, err
+	}
+	binding := parkproto.ReleaseBinding{
+		ProtocolVersion:     parkproto.Version,
+		Sequence:            1,
+		ParkInstanceID:      "park-live-secret",
+		StartToken:          procgroup.StartToken(group.Leader.HighResStartToken),
+		CustodyID:           group.CustodyID,
+		LaunchKey:           key,
+		GroupRefDigest:      groupDigest,
+		ReleaseSecret:       secret,
+		ImmutableExecDigest: execDigest,
+	}
+	release := parkproto.Release{
+		Binding:          binding,
+		ExpectedGroupRef: group,
+		ExecSpec:         parkSpec,
+	}
+	if err := release.ValidateFor(binding.Sequence, parkproto.ReleaseExpectation{Binding: binding}); err != nil {
+		return parkproto.Release{}, err
+	}
+	return release, nil
 }
 
 func loadLiveSecretDurableJSON(t *testing.T, repo repository.Repository, accepted authority.AcceptResult) ([]byte, []byte, []byte) {

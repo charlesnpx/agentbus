@@ -798,6 +798,67 @@ func TestLegacyFencedDeliveryFailureRetiresWithDetachedContextWhenCanceled(t *te
 	assertLegacyFencedRejectedWithoutGrant(t, safety)
 }
 
+func TestLegacyFencedReleaseUnknownContainsWithDetachedContextWhenCanceled(t *testing.T) {
+	t.Parallel()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.releaseOutcome = custodian.ReleaseOutcomeUnknown
+	launcher.releaseWaitForContextDone = true
+	launcher.releaseStarted = make(chan struct{}, 1)
+	repo, recorder, coordinator := newLegacyFencedCoordinatorWithRecordingAuthorityForTest(t, launcher)
+	cmd := prepareLegacyFencedCommandWithCoordinatorForTest(t, coordinator, "request-legacy-fenced-release-unknown-canceled")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.grantAndRelease(ctx)
+	}()
+	select {
+	case <-launcher.releaseStarted:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("legacy fenced fake release did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, launch.ErrReleaseUncertain) {
+			t.Fatalf("grantAndRelease error = %v, want release uncertainty", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("grantAndRelease did not return after release context cancellation")
+	}
+	if got := launcher.releaseCount(); got != 1 {
+		t.Fatalf("legacy fenced releases = %d, want 1", got)
+	}
+	if got := launcher.containCount(); got != 1 {
+		t.Fatalf("legacy fenced containments = %d, want exactly one", got)
+	}
+	containErrs, containDeadlines := launcher.containContextObservations()
+	if len(containErrs) != 1 || containErrs[0] != nil {
+		t.Fatalf("contain context errors = %+v, want one live context", containErrs)
+	}
+	if len(containDeadlines) != 1 || !containDeadlines[0] {
+		t.Fatalf("contain context deadlines = %+v, want bounded cleanup context", containDeadlines)
+	}
+	recordErrs, recordDeadlines := recorder.recordQuiescenceContextObservations()
+	if len(recordErrs) != 1 || recordErrs[0] != nil {
+		t.Fatalf("record quiescence context errors = %+v, want one live context", recordErrs)
+	}
+	if len(recordDeadlines) != 1 || !recordDeadlines[0] {
+		t.Fatalf("record quiescence context deadlines = %+v, want bounded cleanup context", recordDeadlines)
+	}
+	safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
+	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || first.Group == nil || first.Grant == nil || first.Quiescence == nil {
+		t.Fatalf("legacy fenced release-unknown launch proof = %+v, want grant and verified quiescence", first)
+	}
+	_, finalErr := cmd.result()
+	if !errors.Is(finalErr, launch.ErrFailClosed) {
+		t.Fatalf("legacy fenced command final error = %v, want fail-closed", finalErr)
+	}
+}
+
 func TestLegacyFencedDeliveryFailureFailStopsWhenAbortCleanupDeadlineExpires(t *testing.T) {
 	oldTimeout := admissionDetachedCleanupTimeout
 	admissionDetachedCleanupTimeout = 5 * time.Millisecond
@@ -3631,6 +3692,105 @@ func prepareLegacyFencedCommandForTest(t *testing.T, server *Server, requestID s
 	return cmd
 }
 
+func newLegacyFencedCoordinatorWithRecordingAuthorityForTest(t *testing.T, launcher *admissionFakeLaunchCustodian) (repository.Repository, *recordingLegacyLaunchAuthority, *servedSubmissionCoordinator) {
+	t.Helper()
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(launcher.verifier))
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, err := model.NewBootRef("boot-legacy-fenced-release-unknown", "owner-legacy-fenced-release-unknown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := bootstrapper.Begin(context.Background(), boot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := session.SealReady(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &recordingLegacyLaunchAuthority{ready: ready}
+	controller, err := launch.New(recorder, launcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator := &servedSubmissionCoordinator{
+		ready:  ready,
+		owner:  boot.OwnerID,
+		launch: controller,
+		latch:  NewSafetyLatch(),
+	}
+	return repo, recorder, coordinator
+}
+
+func prepareLegacyFencedCommandWithCoordinatorForTest(t *testing.T, coordinator *servedSubmissionCoordinator, requestID string) *legacyFencedCommand {
+	t.Helper()
+	preparation, err := coordinator.PrepareLegacyFenced(context.Background(), authority.AcceptRequest{
+		RequestKey:   model.RequestKey{WorkspaceKey: model.WorkspaceKey("workspace/" + requestID), RequestID: model.RequestID(requestID)},
+		TaskIdentity: model.NewSHA256TaskIdentity([]byte(requestID)),
+		Mode:         model.ModeLegacyFenced,
+		SessionID:    "session-" + requestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, _, err := coordinator.prepareLegacyFencedCommand(context.Background(), preparation.Admission, command.ExecSpec{
+		Argv: []string{"fake-parked"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cmd
+}
+
+type recordingLegacyLaunchAuthority struct {
+	ready *authority.Ready
+
+	mu                           sync.Mutex
+	recordQuiescenceCtxErrs      []error
+	recordQuiescenceCtxDeadlines []bool
+}
+
+func (a *recordingLegacyLaunchAuthority) BindGroup(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, group model.GroupRef) (launch.DurabilityOutcome, error) {
+	applied, err := a.ready.BindGroup(ctx, jobID, ref, ordinal, group)
+	return applied.Durability, err
+}
+
+func (a *recordingLegacyLaunchAuthority) AllocateGrant(ctx context.Context, ref model.AttemptRef, ordinal model.LaunchOrdinal) (model.LaunchGrant, launch.DurabilityOutcome, error) {
+	return a.ready.AllocateGrant(ctx, ref, ordinal)
+}
+
+func (a *recordingLegacyLaunchAuthority) RecordRelease(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, child model.ChildIdentity, evidence model.Evidence) (launch.DurabilityOutcome, error) {
+	applied, err := a.ready.RecordRelease(ctx, jobID, ref, ordinal, child, evidence)
+	return applied.Durability, err
+}
+
+func (a *recordingLegacyLaunchAuthority) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) (launch.DurabilityOutcome, error) {
+	_, hasDeadline := ctx.Deadline()
+	a.mu.Lock()
+	a.recordQuiescenceCtxErrs = append(a.recordQuiescenceCtxErrs, ctx.Err())
+	a.recordQuiescenceCtxDeadlines = append(a.recordQuiescenceCtxDeadlines, hasDeadline)
+	a.mu.Unlock()
+	applied, err := a.ready.RecordQuiescence(ctx, jobID, ordinal, verified)
+	return applied.Durability, err
+}
+
+func (a *recordingLegacyLaunchAuthority) FailStop(ctx context.Context, reason error) error {
+	if reason == nil {
+		reason = errors.New("launch fail-stop")
+	}
+	return a.ready.FailStop(ctx, reason.Error())
+}
+
+func (a *recordingLegacyLaunchAuthority) recordQuiescenceContextObservations() ([]error, []bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]error(nil), a.recordQuiescenceCtxErrs...), append([]bool(nil), a.recordQuiescenceCtxDeadlines...)
+}
+
 func acceptIdentifiedAuthorityWork(t *testing.T, server *Server, requestID string) authority.AcceptResult {
 	t.Helper()
 	accepted, err := server.admissionSubmission.SubmitIdentified(context.Background(), authority.AcceptRequest{
@@ -3707,14 +3867,20 @@ type admissionFakeLaunchCustodian struct {
 	containments []admissionContainObservation
 	running      map[string]*admissionFakeRunning
 
-	abortCtxErrs      []error
-	abortCtxDeadlines []bool
+	containCtxErrs      []error
+	containCtxDeadlines []bool
+	abortCtxErrs        []error
+	abortCtxDeadlines   []bool
 
-	abortRespectContext     bool
-	abortWaitForContextDone bool
-	containErr              error
-	waitAndVerify           <-chan struct{}
-	activeCustodies         atomic.Bool
+	abortRespectContext       bool
+	abortWaitForContextDone   bool
+	releaseWaitForContextDone bool
+	releaseOutcome            custodian.ReleaseOutcome
+	releaseErr                error
+	releaseStarted            chan struct{}
+	containErr                error
+	waitAndVerify             <-chan struct{}
+	activeCustodies           atomic.Bool
 }
 
 func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.ExecSpec, key model.LaunchKey) (launch.PreparedProcess, error) {
@@ -3754,9 +3920,15 @@ func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.E
 }
 
 func (c *admissionFakeLaunchCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.mu.Lock()
 	c.contains++
 	c.containments = append(c.containments, admissionContainObservation{group: group, cause: cause})
+	_, hasDeadline := ctx.Deadline()
+	c.containCtxErrs = append(c.containCtxErrs, ctx.Err())
+	c.containCtxDeadlines = append(c.containCtxDeadlines, hasDeadline)
 	containErr := c.containErr
 	running := c.running[string(group.CustodyID)]
 	c.mu.Unlock()
@@ -3813,6 +3985,12 @@ func (c *admissionFakeLaunchCustodian) abortContextObservations() ([]error, []bo
 	return append([]error(nil), c.abortCtxErrs...), append([]bool(nil), c.abortCtxDeadlines...)
 }
 
+func (c *admissionFakeLaunchCustodian) containContextObservations() ([]error, []bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]error(nil), c.containCtxErrs...), append([]bool(nil), c.containCtxDeadlines...)
+}
+
 type admissionFakePrepared struct {
 	group     model.GroupRef
 	running   *admissionFakeRunning
@@ -3829,13 +4007,41 @@ func (p *admissionFakePrepared) Ref() model.GroupRef {
 	return p.group
 }
 
-func (p *admissionFakePrepared) Release(context.Context) (launch.RunningProcess, custodian.ReleaseOutcome, error) {
+func (p *admissionFakePrepared) Release(ctx context.Context) (launch.RunningProcess, custodian.ReleaseOutcome, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	outcome := custodian.ReleaseAccepted
+	var releaseErr error
+	waitForContextDone := false
+	var releaseStarted chan struct{}
 	if p.custodian != nil {
 		p.custodian.mu.Lock()
 		p.custodian.releases++
+		if p.custodian.releaseOutcome != 0 {
+			outcome = p.custodian.releaseOutcome
+		}
+		releaseErr = p.custodian.releaseErr
+		waitForContextDone = p.custodian.releaseWaitForContextDone
+		releaseStarted = p.custodian.releaseStarted
 		p.custodian.mu.Unlock()
 	}
-	return p.running, custodian.ReleaseAccepted, nil
+	if releaseStarted != nil {
+		select {
+		case releaseStarted <- struct{}{}:
+		default:
+		}
+	}
+	if waitForContextDone {
+		<-ctx.Done()
+		if releaseErr == nil {
+			releaseErr = ctx.Err()
+		}
+	}
+	if outcome != custodian.ReleaseAccepted {
+		return nil, outcome, releaseErr
+	}
+	return p.running, outcome, releaseErr
 }
 
 func (p *admissionFakePrepared) AbortAndVerify(ctx context.Context) (custodian.VerifiedQuiescence, error) {

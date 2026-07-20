@@ -975,9 +975,12 @@ func (cmd *legacyFencedCommand) failPrepared(ctx context.Context, reason error) 
 }
 
 func (cmd *legacyFencedCommand) failReleasedByGroup(ctx context.Context, reason error) {
-	verified, containErr := cmd.coordinator.launch.ContainAndVerify(ctx, cmd.launchContext, cmd.group, custodian.QuiescenceCauseContain)
+	cleanupCtx, cancel := detachedAdmissionCleanupContext(ctx)
+	defer cancel()
+
+	verified, containErr := cmd.coordinator.launch.ContainAndVerify(cleanupCtx, cmd.launchContext, cmd.group, custodian.QuiescenceCauseContain)
 	if containErr == nil {
-		outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(ctx, cmd.launchContext, verified)
+		outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(cleanupCtx, cmd.launchContext, verified)
 		containErr = admissionDurabilityError("record_quiescence", outcome, recordErr)
 	}
 	err := errors.Join(reason, containErr, cmd.coordinator.failStop(ctx, errors.Join(reason, containErr)), launch.ErrFailClosed)
@@ -986,9 +989,12 @@ func (cmd *legacyFencedCommand) failReleasedByGroup(ctx context.Context, reason 
 }
 
 func (cmd *legacyFencedCommand) failReleased(ctx context.Context, running launch.RunningProcess, reason error) {
-	verified, containErr := running.ContainAndVerify(ctx, custodian.QuiescenceCauseContain)
+	cleanupCtx, cancel := detachedAdmissionCleanupContext(ctx)
+	defer cancel()
+
+	verified, containErr := running.ContainAndVerify(cleanupCtx, custodian.QuiescenceCauseContain)
 	if containErr == nil {
-		outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(ctx, cmd.launchContext, verified)
+		outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(cleanupCtx, cmd.launchContext, verified)
 		containErr = admissionDurabilityError("record_quiescence", outcome, recordErr)
 	}
 	err := errors.Join(reason, containErr, cmd.coordinator.failStop(ctx, errors.Join(reason, containErr)), launch.ErrFailClosed)

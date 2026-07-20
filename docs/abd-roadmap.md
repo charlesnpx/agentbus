@@ -4,9 +4,9 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R3A1 CLOSED (R3A1=93b8a9a). R3A2 committed (public cutover: tokenless Release; secret
-removed from logical layer, now only in native custodian + parkproto; arch test). All pushed. Next: TWO R3A2
-reviews (secret-removal + protocol), then R3B.
+STATUS: EXECUTING. R0..R3A2 CLOSED (R3A2=ae4889a +fix this commit; BOTH reviews CLOSED — detached cleanup
+ctx + real durability oracle). Secret-seam (C1) fully realized. All pushed. Next: R3B (native monitor +
+custody lifecycle incl deferred F-C/F-D; TWO reviewers).
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -293,7 +293,15 @@ see the R4A contract block.)
   strict-E2E harness launched: worker job_20260720T151723000000000Z_000002 (codex gpt-5.5 xhigh, --write).
   Packet: ~/tmp/delegate-packets/abd-R0T-real-serve-harness.md. Expected sentinel
   strict_native_runtime_unavailable; opt-in gate abd_strict_e2e + AGENTBUS_RUN_STRICT_E2E=1.
-- 2026-07-20 R3A2 (this commit): ATOMIC public cutover (19 files). PreparedProcess.Release now tokenless
+- 2026-07-20 R3A2-fix (this commit): closed BOTH R3A2 reviews (cutover itself confirmed correct). HA
+  (protocol, fail-closed): served failReleasedByGroup + failReleased passed the possibly-canceled caller ctx
+  to ContainAndVerify/RecordQuiescence -> now use detachedAdmissionCleanupContext = WithTimeout(WithoutCancel(
+  ctx), admissionDetachedCleanupTimeout) so containment of a possibly-live group can't be aborted by the same
+  cancellation that caused Unknown (matches controller.go:488 WithoutCancel). HB (secret, test): rewrote
+  durability_secret_test to thread a live parkproto.ReleaseSecret sentinel through the real flow + scan all
+  durable sinks (no longer vacuous). Verify: build/linux/gofmt/vet=0; race -count=3 served/authority/custodian/
+  launch (macOS)=0; macOS suite=0; Docker -p 1 full=0 + race=0 + R0T RED=0. Both reviews CLOSED.
+- 2026-07-20 R3A2 (ae4889a): ATOMIC public cutover (19 files). PreparedProcess.Release now tokenless
   Release(ctx)(RunningProcess,ReleaseOutcome,error) (custodian+launch); custodian.GrantToken + logical
   model.ReleaseSecret DELETED (certificate.go -22); NativeCustodian.Prepare returns real *nativePreparedProcess
   (integrated with heldPrepared registry); served release-<job>-<ordinal> minting removed; secret type moved
