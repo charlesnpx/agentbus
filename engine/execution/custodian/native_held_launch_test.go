@@ -31,10 +31,10 @@ func TestGenerateNativeReleaseSecretRandomAndValid(t *testing.T) {
 			t.Fatalf("generated secret Validate() error = %v", err)
 		}
 		if !strings.HasPrefix(secret.String(), "native-release-secret-v1-") {
-			t.Fatalf("generated secret prefix = %q, want native prefix", secret)
+			t.Fatalf("generated secret has native prefix = false, length=%d", len(secret.String()))
 		}
 		if seen[secret] {
-			t.Fatalf("generated duplicate release secret %q", secret)
+			t.Fatal("generated duplicate release secret")
 		}
 		seen[secret] = true
 	}
@@ -57,7 +57,7 @@ func TestNativeHeldLaunchGeneratesInternalSecretAndAbortPrepared(t *testing.T) {
 	core := requireNativeHeldCore(t, launch)
 	secret := core.spec.ReleaseSecret
 	if secret == "" || secret == externalSecret {
-		t.Fatalf("internal release secret = %q, want non-empty and not caller supplied %q", secret, externalSecret)
+		t.Fatalf("internal release secret provenance invalid: empty=%t caller_supplied=%t", secret == "", secret == externalSecret)
 	}
 	if err := secret.Validate(); err != nil {
 		t.Fatalf("internal release secret Validate() error = %v", err)
@@ -242,6 +242,227 @@ func TestNativeHeldLaunchCanceledReleaseMapsUnknownContainsAndDoesNotResend(t *t
 	waitGroupAbsent(t, ref, time.Second)
 }
 
+func TestNativeHeldLaunchAbortErrorStillContainsClosesAndDeletesOnProvenAbsence(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	native, issuer, verifier := newNativeHeldCountingAbsentCustodianForTest()
+	spec := heldLaunchTestSpec(t)
+	ref := nativeHeldAbsentGroupForTest(t, spec.LaunchKey)
+	abortErr := errors.New("injected parklaunch abort failure")
+	prepared := &fakeNativeParkPrepared{
+		ref: ref,
+		abort: func(context.Context) error {
+			return abortErr
+		},
+	}
+	backend := &fakeNativeHeldBackend{witnessAcquiredValue: true}
+	effects, _ := registerFakeNativeHeldPreparedForTest(t, native, ref, prepared, backend)
+
+	if got := native.ActiveCustodyCount(); got != 1 {
+		t.Fatalf("ActiveCustodyCount() with prepared held launch = %d, want 1", got)
+	}
+	verified, err := effects.AbortAndVerify(ctx, ref)
+	if err != nil {
+		t.Fatalf("AbortAndVerify() error = %v, want nil after proven containment", err)
+	}
+	quiescence, err := verifier.VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatalf("VerifyQuiescence() error = %v", err)
+	}
+	if !quiescence.Group.Equal(ref) || quiescence.Method == "" {
+		t.Fatalf("quiescence = %+v, want attested target group", quiescence)
+	}
+	preparedSnapshot := prepared.snapshot()
+	if preparedSnapshot.abortCalls != 1 || preparedSnapshot.containCalls != 0 {
+		t.Fatalf("prepared calls = abort:%d contain:%d, want 1/0", preparedSnapshot.abortCalls, preparedSnapshot.containCalls)
+	}
+	if backend.snapshotCloseCalls() != 1 {
+		t.Fatalf("backend close calls = %d, want 1", backend.snapshotCloseCalls())
+	}
+	if issuer.count.Load() != 1 {
+		t.Fatalf("quiescence attestation count = %d, want 1", issuer.count.Load())
+	}
+	if _, ok := effects.lookupPrepared(ref); ok {
+		t.Fatal("prepared entry retained after proven abort containment")
+	}
+	if got := native.ActiveCustodyCount(); got != 0 {
+		t.Fatalf("ActiveCustodyCount() after abort cleanup = %d, want 0", got)
+	}
+}
+
+func TestNativeHeldLaunchAbortUnprovableClosesBackendKeepsEntryAndContainRetryDeletes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	native, _, verifier := newNativeHeldCountingAbsentCustodianForTest()
+	spec := heldLaunchTestSpec(t)
+	ref := nativeHeldAbsentGroupForTest(t, spec.LaunchKey)
+	abortErr := errors.New("injected parklaunch abort failure")
+	prepared := &fakeNativeParkPrepared{
+		ref: ref,
+		abort: func(context.Context) error {
+			return abortErr
+		},
+	}
+	backend := &fakeNativeHeldBackend{witnessAcquiredValue: true}
+	effects, _ := registerFakeNativeHeldPreparedForTest(t, native, ref, prepared, backend)
+	canceledCtx, cancelAbort := context.WithCancel(context.Background())
+	cancelAbort()
+
+	verified, err := effects.AbortAndVerify(canceledCtx, ref)
+	if verified != (VerifiedQuiescence{}) || !errors.Is(err, abortErr) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("AbortAndVerify(canceled) = (%+v, %v), want zero attestation with abort+canceled errors", verified, err)
+	}
+	if backend.snapshotCloseCalls() != 1 {
+		t.Fatalf("backend close calls after unprovable abort = %d, want 1", backend.snapshotCloseCalls())
+	}
+	if _, ok := effects.lookupPrepared(ref); !ok {
+		t.Fatal("prepared entry deleted after unprovable abort containment")
+	}
+	if got := native.ActiveCustodyCount(); got != 1 {
+		t.Fatalf("ActiveCustodyCount() after unprovable abort = %d, want 1", got)
+	}
+
+	verified, err = effects.ContainAndVerify(ctx, ref, QuiescenceCauseRecovery)
+	if err != nil {
+		t.Fatalf("ContainAndVerify() retry error = %v, want nil", err)
+	}
+	quiescence, err := verifier.VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatalf("VerifyQuiescence() retry error = %v", err)
+	}
+	if !quiescence.Group.Equal(ref) {
+		t.Fatalf("retry quiescence group = %+v, want %+v", quiescence.Group, ref)
+	}
+	preparedSnapshot := prepared.snapshot()
+	if preparedSnapshot.abortCalls != 1 || preparedSnapshot.containCalls != 1 {
+		t.Fatalf("prepared calls = abort:%d contain:%d, want 1/1", preparedSnapshot.abortCalls, preparedSnapshot.containCalls)
+	}
+	if backend.snapshotCloseCalls() != 1 {
+		t.Fatalf("backend close calls after retry = %d, want still 1", backend.snapshotCloseCalls())
+	}
+	if _, ok := effects.lookupPrepared(ref); ok {
+		t.Fatal("prepared entry retained after successful containment retry")
+	}
+	if got := native.ActiveCustodyCount(); got != 0 {
+		t.Fatalf("ActiveCustodyCount() after retry cleanup = %d, want 0", got)
+	}
+}
+
+func TestNativeHeldLaunchControlLossFromAbortingRetriesContainment(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	native, _, verifier := newNativeHeldCountingAbsentCustodianForTest()
+	spec := heldLaunchTestSpec(t)
+	ref := nativeHeldAbsentGroupForTest(t, spec.LaunchKey)
+	prepared := &fakeNativeParkPrepared{ref: ref}
+	backend := &fakeNativeHeldBackend{witnessAcquiredValue: true}
+	effects, _ := registerFakeNativeHeldPreparedForTest(t, native, ref, prepared, backend)
+	launch := &HeldLaunchCore{
+		spec:    spec,
+		effects: effects,
+		ref:     ref,
+		state:   HeldLaunchStatePrepared,
+	}
+	canceledCtx, cancelAbort := context.WithCancel(context.Background())
+	cancelAbort()
+
+	if verified, err := launch.AbortAndVerify(canceledCtx); verified != (VerifiedQuiescence{}) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("AbortAndVerify(canceled) = (%+v, %v), want zero attestation with canceled error", verified, err)
+	}
+	if got := launch.State(); got != HeldLaunchStateAborting {
+		t.Fatalf("state after failed abort containment = %s, want %s", got, HeldLaunchStateAborting)
+	}
+	verified, err := launch.HandleControlLoss(ctx, true)
+	if err != nil {
+		t.Fatalf("HandleControlLoss(aborting) error = %v, want nil", err)
+	}
+	quiescence, err := verifier.VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatalf("VerifyQuiescence() error = %v", err)
+	}
+	if !quiescence.Group.Equal(ref) {
+		t.Fatalf("quiescence group = %+v, want %+v", quiescence.Group, ref)
+	}
+	preparedSnapshot := prepared.snapshot()
+	if preparedSnapshot.abortCalls != 1 || preparedSnapshot.containCalls != 1 {
+		t.Fatalf("prepared calls = abort:%d contain:%d, want 1/1", preparedSnapshot.abortCalls, preparedSnapshot.containCalls)
+	}
+	if got := launch.State(); got != HeldLaunchStateFinalized {
+		t.Fatalf("state after aborting containment retry = %s, want %s", got, HeldLaunchStateFinalized)
+	}
+	if got := native.ActiveCustodyCount(); got != 0 {
+		t.Fatalf("ActiveCustodyCount() after aborting containment retry = %d, want 0", got)
+	}
+}
+
+func TestNativeCustodianCloseAbortsPreparedHeldLaunchAndIsIdempotent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	manager := newFakeNativeRetainedManager()
+	native := newNativeCustodianWithRetainedManagerForTest(t, defaultNativeTestParams(), manager)
+	issuer, _ := NewAttestationChannel()
+	counting := &countingQuiescenceIssuer{inner: issuer}
+	native.issuer = counting
+	spec, resultPath := nativeSimpleLaunchSpec(t)
+
+	launch, err := prepareNativeHeldLaunch(ctx, native, spec)
+	if err != nil {
+		t.Fatalf("prepareNativeHeldLaunch() error = %v", err)
+	}
+	if got := native.ActiveCustodyCount(); got != 1 {
+		t.Fatalf("ActiveCustodyCount() with prepared held launch = %d, want 1", got)
+	}
+	requireNativeFileAbsent(t, resultPath)
+	if err := native.Close(); err != nil {
+		t.Fatalf("NativeCustodian.Close() with prepared held launch error = %v", err)
+	}
+	if got := native.ActiveCustodyCount(); got != 0 {
+		t.Fatalf("ActiveCustodyCount() after Close() = %d, want 0", got)
+	}
+	if counting.count.Load() != 1 {
+		t.Fatalf("quiescence attestation count after Close() = %d, want 1", counting.count.Load())
+	}
+	waitGroupAbsent(t, launch.Ref(), 5*time.Second)
+	requireNativeFileAbsent(t, resultPath)
+	if err := native.Close(); err != nil {
+		t.Fatalf("NativeCustodian.Close() second call error = %v", err)
+	}
+}
+
+func TestNativeCustodianCloseRefusesWhenPreparedHeldLaunchAbsenceUnprovable(t *testing.T) {
+	manager := newFakeNativeRetainedManager()
+	ref := newRecoveryRetainedGroupRefForTest(t, manager)
+	native, _, _ := newNativeHeldCountingAbsentCustodianForTest()
+	prepared := &fakeNativeParkPrepared{ref: ref}
+	backend := &fakeNativeHeldBackend{witnessAcquiredValue: true}
+	effects, _ := registerFakeNativeHeldPreparedForTest(t, native, ref, prepared, backend)
+
+	err := native.Close()
+	// Close must return the typed refusal (ErrHeldLaunchCloseRefused) when a
+	// prepared held launch cannot be proven absent. The inner containment cause is
+	// platform-dependent (Darwin returns native-unavailable; Linux cgroup-v2 returns
+	// a cgroup error on a fake ref), so assert only the contract-level typed refusal.
+	if !errors.Is(err, ErrHeldLaunchCloseRefused) {
+		t.Fatalf("NativeCustodian.Close() error = %v, want ErrHeldLaunchCloseRefused", err)
+	}
+	if backend.snapshotCloseCalls() != 1 {
+		t.Fatalf("backend close calls after refused Close() = %d, want 1", backend.snapshotCloseCalls())
+	}
+	if _, ok := effects.lookupPrepared(ref); !ok {
+		t.Fatal("prepared entry deleted after refused Close()")
+	}
+	if got := native.ActiveCustodyCount(); got != 1 {
+		t.Fatalf("ActiveCustodyCount() after refused Close() = %d, want 1", got)
+	}
+	err = native.Close()
+	if !errors.Is(err, ErrHeldLaunchCloseRefused) {
+		t.Fatalf("NativeCustodian.Close() second error = %v, want same typed refusal", err)
+	}
+	if backend.snapshotCloseCalls() != 1 {
+		t.Fatalf("backend close calls after second refused Close() = %d, want still 1", backend.snapshotCloseCalls())
+	}
+}
+
 func TestNativeReleaseOutcomeFromParklaunchMapping(t *testing.T) {
 	handle := &parklaunch.ParkedHandle{}
 	tests := []struct {
@@ -299,7 +520,12 @@ func requireNativeFileAbsent(t *testing.T, path string) {
 }
 
 func newNativeHeldAbsentCustodianForTest() (*NativeCustodian, *countingQuiescenceIssuer) {
-	issuer, _ := NewAttestationChannel()
+	native, issuer, _ := newNativeHeldCountingAbsentCustodianForTest()
+	return native, issuer
+}
+
+func newNativeHeldCountingAbsentCustodianForTest() (*NativeCustodian, *countingQuiescenceIssuer, AttestationVerifier) {
+	issuer, verifier := NewAttestationChannel()
 	counting := &countingQuiescenceIssuer{inner: issuer}
 	return &NativeCustodian{
 		options: NativeOptions{
@@ -308,7 +534,26 @@ func newNativeHeldAbsentCustodianForTest() (*NativeCustodian, *countingQuiescenc
 		issuer:    counting,
 		running:   make(map[string]*NativeRunningProcess),
 		finalized: make(map[string]*NativeRunningProcess),
-	}, counting
+	}, counting, verifier
+}
+
+func registerFakeNativeHeldPreparedForTest(t *testing.T, native *NativeCustodian, ref model.GroupRef, prepared *fakeNativeParkPrepared, backend *fakeNativeHeldBackend) (*nativeHeldLaunchEffects, *nativeHeldPreparedLaunch) {
+	t.Helper()
+	if prepared == nil {
+		prepared = &fakeNativeParkPrepared{ref: ref}
+	}
+	if backend == nil {
+		backend = &fakeNativeHeldBackend{witnessAcquiredValue: true}
+	}
+	effects := &nativeHeldLaunchEffects{
+		custodian: native,
+		prepared:  make(map[string]*nativeHeldPreparedLaunch),
+	}
+	entry := &nativeHeldPreparedLaunch{prepared: prepared, backend: backend}
+	if err := effects.registerPrepared(ref, entry); err != nil {
+		t.Fatalf("register native held prepared: %v", err)
+	}
+	return effects, entry
 }
 
 func nativeHeldAbsentGroupForTest(t *testing.T, key model.LaunchKey) model.GroupRef {

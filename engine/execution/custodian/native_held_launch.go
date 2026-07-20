@@ -41,6 +41,12 @@ type nativeHeldLaunchEffects struct {
 	prepared map[string]*nativeHeldPreparedLaunch
 }
 
+type nativeHeldPreparedRegistration struct {
+	ref     model.GroupRef
+	effects *nativeHeldLaunchEffects
+	entry   *nativeHeldPreparedLaunch
+}
+
 var _ HeldLaunchEffects = (*nativeHeldLaunchEffects)(nil)
 
 // prepareNativeHeldLaunch is the package-private native bridge for R3A1 tests.
@@ -151,18 +157,9 @@ func (effects *nativeHeldLaunchEffects) Prepare(ctx context.Context, spec Prepar
 	}
 
 	entry := &nativeHeldPreparedLaunch{prepared: prepared, backend: backend}
-	key := groupKey(ref)
-	effects.mu.Lock()
-	if effects.prepared == nil {
-		effects.prepared = make(map[string]*nativeHeldPreparedLaunch)
-	}
-	if effects.prepared[key] != nil {
-		effects.mu.Unlock()
-		err := fmt.Errorf("%w: duplicate native held launch group ref", ErrNativeCustodianUnavailable)
+	if err := effects.registerPrepared(ref, entry); err != nil {
 		return model.GroupRef{}, errors.Join(err, prepared.ContainAndVerify(ctx), backend.close(ctx))
 	}
-	effects.prepared[key] = entry
-	effects.mu.Unlock()
 	return ref, nil
 }
 
@@ -191,7 +188,7 @@ func (effects *nativeHeldLaunchEffects) SendRelease(ctx context.Context, _ Prepa
 		if adoptErr != nil {
 			return nil, ReleaseOutcomeUnknown, errors.Join(err, adoptErr)
 		}
-		effects.deletePrepared(ref)
+		effects.deletePrepared(ref, entry)
 		return running, ReleaseAccepted, nil
 	case ReleaseDefinitelyNotSent:
 		entry.releaseDefinitelyNotSent = true
@@ -226,25 +223,7 @@ func (effects *nativeHeldLaunchEffects) AbortAndVerify(ctx context.Context, ref 
 		return VerifiedQuiescence{}, fmt.Errorf("%w: native held launch prepared ref not found", ErrNativeCustodianUnavailable)
 	}
 
-	entry.mu.Lock()
-	var abortErr error
-	if !entry.releaseDefinitelyNotSent {
-		abortErr = entry.prepared.AbortAndVerify(ctx)
-	}
-	entry.mu.Unlock()
-	if abortErr != nil {
-		return VerifiedQuiescence{}, abortErr
-	}
-
-	verified, attestErr := effects.custodian.ContainAndVerify(ctx, ref, QuiescenceCauseAbort)
-	entry.mu.Lock()
-	closeErr := entry.closeBackendLocked(ctx)
-	entry.mu.Unlock()
-	if attestErr != nil || closeErr != nil {
-		return verified, errors.Join(attestErr, closeErr)
-	}
-	effects.deletePrepared(ref)
-	return verified, nil
+	return effects.abortPreparedEntryAndVerify(ctx, ref, entry, false)
 }
 
 func (effects *nativeHeldLaunchEffects) ContainAndVerify(ctx context.Context, ref model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, error) {
@@ -273,7 +252,7 @@ func (effects *nativeHeldLaunchEffects) ContainAndVerify(ctx context.Context, re
 		return verified, errors.Join(preparedErr, attestErr, closeErr)
 	}
 	if ok {
-		effects.deletePrepared(ref)
+		effects.deletePrepared(ref, entry)
 	}
 	return verified, nil
 }
@@ -339,19 +318,153 @@ func (effects *nativeHeldLaunchEffects) lookupPrepared(ref model.GroupRef) (*nat
 	return entry, entry != nil
 }
 
-func (effects *nativeHeldLaunchEffects) deletePrepared(ref model.GroupRef) {
+func (effects *nativeHeldLaunchEffects) abortPreparedEntryAndVerify(ctx context.Context, ref model.GroupRef, entry *nativeHeldPreparedLaunch, refuseRunning bool) (VerifiedQuiescence, error) {
+	if effects == nil || effects.custodian == nil {
+		return VerifiedQuiescence{}, fmt.Errorf("%w: native held launch effects are nil", ErrNativeCustodianUnavailable)
+	}
+	if entry == nil {
+		return VerifiedQuiescence{}, fmt.Errorf("%w: native held launch prepared entry is nil", ErrNativeCustodianUnavailable)
+	}
+	entry.mu.Lock()
+	if refuseRunning && effects.custodian.hasRunningPreparedRef(ref) {
+		entry.mu.Unlock()
+		return VerifiedQuiescence{}, ErrHeldLaunchExecutionPossible
+	}
+	var abortErr error
+	if !entry.releaseDefinitelyNotSent {
+		abortErr = entry.prepared.AbortAndVerify(ctx)
+	}
+	entry.mu.Unlock()
+
+	verified, attestErr := effects.custodian.ContainAndVerify(ctx, ref, QuiescenceCauseAbort)
+	entry.mu.Lock()
+	closeErr := entry.closeBackendLocked(ctx)
+	entry.mu.Unlock()
+	if attestErr != nil || closeErr != nil {
+		return verified, errors.Join(abortErr, attestErr, closeErr)
+	}
+	effects.deletePrepared(ref, entry)
+	return verified, nil
+}
+
+func (effects *nativeHeldLaunchEffects) registerPrepared(ref model.GroupRef, entry *nativeHeldPreparedLaunch) error {
+	if effects == nil || effects.custodian == nil || entry == nil {
+		return fmt.Errorf("%w: native held launch prepared registry input is nil", ErrNativeCustodianUnavailable)
+	}
+	key := groupKey(ref)
+	effects.custodian.mu.Lock()
+	if effects.custodian.closed {
+		effects.custodian.mu.Unlock()
+		return fmt.Errorf("%w: custodian is closed", ErrNativeCustodianUnavailable)
+	}
+	if effects.custodian.heldPrepared == nil {
+		effects.custodian.heldPrepared = make(map[string]nativeHeldPreparedRegistration)
+	}
+	if effects.custodian.heldPrepared[key].entry != nil {
+		effects.custodian.mu.Unlock()
+		return fmt.Errorf("%w: duplicate native held launch group ref", ErrNativeCustodianUnavailable)
+	}
+	effects.mu.Lock()
+	if effects.prepared == nil {
+		effects.prepared = make(map[string]*nativeHeldPreparedLaunch)
+	}
+	if effects.prepared[key] != nil {
+		effects.mu.Unlock()
+		effects.custodian.mu.Unlock()
+		return fmt.Errorf("%w: duplicate native held launch group ref", ErrNativeCustodianUnavailable)
+	}
+	effects.prepared[key] = entry
+	effects.custodian.heldPrepared[key] = nativeHeldPreparedRegistration{
+		ref:     ref,
+		effects: effects,
+		entry:   entry,
+	}
+	effects.mu.Unlock()
+	effects.custodian.mu.Unlock()
+	return nil
+}
+
+func (effects *nativeHeldLaunchEffects) deletePrepared(ref model.GroupRef, entry *nativeHeldPreparedLaunch) {
 	if effects == nil {
 		return
 	}
+	if effects.custodian != nil {
+		effects.custodian.unregisterNativeHeldPrepared(ref, entry)
+	}
 	effects.mu.Lock()
 	defer effects.mu.Unlock()
-	delete(effects.prepared, groupKey(ref))
+	key := groupKey(ref)
+	if current := effects.prepared[key]; current == entry || entry == nil {
+		delete(effects.prepared, key)
+	}
+}
+
+func (custodian *NativeCustodian) unregisterNativeHeldPrepared(ref model.GroupRef, entry *nativeHeldPreparedLaunch) {
+	if custodian == nil {
+		return
+	}
+	custodian.mu.Lock()
+	defer custodian.mu.Unlock()
+	key := groupKey(ref)
+	if current := custodian.heldPrepared[key]; current.entry == entry || entry == nil {
+		delete(custodian.heldPrepared, key)
+	}
+}
+
+func (custodian *NativeCustodian) snapshotNativeHeldPreparedLocked() []nativeHeldPreparedRegistration {
+	if custodian == nil || len(custodian.heldPrepared) == 0 {
+		return nil
+	}
+	prepared := make([]nativeHeldPreparedRegistration, 0, len(custodian.heldPrepared))
+	for _, registration := range custodian.heldPrepared {
+		prepared = append(prepared, registration)
+	}
+	return prepared
+}
+
+func (custodian *NativeCustodian) closeNativeHeldPrepared(ctx context.Context, prepared []nativeHeldPreparedRegistration) error {
+	for _, registration := range prepared {
+		if registration.effects == nil || registration.entry == nil {
+			return fmt.Errorf("%w: native held launch prepared registry is invalid", ErrHeldLaunchCloseRefused)
+		}
+		if !custodian.nativeHeldPreparedRegistered(registration.ref, registration.entry) {
+			continue
+		}
+		if _, err := registration.effects.abortPreparedEntryAndVerify(ctx, registration.ref, registration.entry, true); err != nil {
+			return errors.Join(
+				fmt.Errorf("%w: cannot close custodian with held prepared launch %s", ErrHeldLaunchCloseRefused, groupKey(registration.ref)),
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+func (custodian *NativeCustodian) nativeHeldPreparedRegistered(ref model.GroupRef, entry *nativeHeldPreparedLaunch) bool {
+	if custodian == nil {
+		return false
+	}
+	custodian.mu.Lock()
+	defer custodian.mu.Unlock()
+	return custodian.heldPrepared[groupKey(ref)].entry == entry
+}
+
+func (custodian *NativeCustodian) hasRunningPreparedRef(ref model.GroupRef) bool {
+	if custodian == nil {
+		return false
+	}
+	custodian.mu.Lock()
+	defer custodian.mu.Unlock()
+	return custodian.running[groupKey(ref)] != nil
 }
 
 func (entry *nativeHeldPreparedLaunch) closeBackendLocked(ctx context.Context) error {
 	if entry == nil || entry.backend == nil || entry.backendClosed {
 		return nil
 	}
+	if err := entry.backend.close(ctx); err != nil {
+		return err
+	}
 	entry.backendClosed = true
-	return entry.backend.close(ctx)
+	return nil
 }

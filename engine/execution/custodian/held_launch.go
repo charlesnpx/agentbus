@@ -370,7 +370,7 @@ func (launch *HeldLaunchCore) HandleControlLoss(ctx context.Context, groupDurabl
 			return launch.containAndFinalize(ctx, ref, QuiescenceCauseRecovery)
 		}
 		return launch.abortPrepared(ctx)
-	case HeldLaunchStateReleasing, HeldLaunchStateReleaseUnknown, HeldLaunchStateContaining:
+	case HeldLaunchStateReleasing, HeldLaunchStateAborting, HeldLaunchStateReleaseUnknown, HeldLaunchStateContaining:
 		launch.markReleaseConsumed()
 		return launch.containAndFinalize(ctx, ref, QuiescenceCauseRecovery)
 	case HeldLaunchStateRunning, HeldLaunchStateReleaseAccepted:

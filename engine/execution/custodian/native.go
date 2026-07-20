@@ -87,10 +87,16 @@ type NativeCustodian struct {
 	options NativeOptions
 	issuer  quiescenceAttestationIssuer
 
-	mu        sync.Mutex
-	running   map[string]*NativeRunningProcess
-	finalized map[string]*NativeRunningProcess
-	closed    bool
+	// mu protects running, finalized, heldPrepared, and closed. Lock order:
+	// custodian.mu may be held while publishing a prepared entry into effects.mu,
+	// but Close snapshots heldPrepared and releases custodian.mu before taking any
+	// nativeHeldPreparedLaunch entry lock. Terminal unregister takes custodian.mu
+	// without holding effects.mu or entry.mu.
+	mu           sync.Mutex
+	running      map[string]*NativeRunningProcess
+	finalized    map[string]*NativeRunningProcess
+	heldPrepared map[string]nativeHeldPreparedRegistration
+	closed       bool
 
 	retainedMu    sync.Mutex
 	retainedGroup containment.RetainedGroupObject
@@ -171,7 +177,13 @@ func (custodian *NativeCustodian) ActiveCustodyCount() int {
 	}
 	custodian.mu.Lock()
 	defer custodian.mu.Unlock()
-	return len(custodian.running)
+	count := len(custodian.running)
+	for key := range custodian.heldPrepared {
+		if custodian.running[key] == nil {
+			count++
+		}
+	}
+	return count
 }
 
 func (custodian *NativeCustodian) Prepare(context.Context, command.ExecSpec, model.LaunchKey) (PreparedProcess, error) {
@@ -252,14 +264,30 @@ func (custodian *NativeCustodian) Close() error {
 	if custodian == nil {
 		return nil
 	}
-	custodian.mu.Lock()
-	if len(custodian.running) != 0 {
+	ctx := context.Background()
+	for {
+		custodian.mu.Lock()
+		if len(custodian.running) != 0 {
+			custodian.mu.Unlock()
+			return fmt.Errorf("%w: cannot close custodian with running processes", ErrNativeCustodianUnavailable)
+		}
+		prepared := custodian.snapshotNativeHeldPreparedLocked()
+		if len(prepared) == 0 {
+			custodian.closed = true
+			custodian.mu.Unlock()
+			break
+		}
 		custodian.mu.Unlock()
-		return fmt.Errorf("%w: cannot close custodian with running processes", ErrNativeCustodianUnavailable)
-	}
-	custodian.closed = true
-	custodian.mu.Unlock()
 
+		if err := custodian.closeNativeHeldPrepared(ctx, prepared); err != nil {
+			return err
+		}
+	}
+
+	return custodian.closeRetainedGroup()
+}
+
+func (custodian *NativeCustodian) closeRetainedGroup() error {
 	custodian.retainedMu.Lock()
 	retainedGroup := custodian.retainedGroup
 	custodian.retainedGroup = nil

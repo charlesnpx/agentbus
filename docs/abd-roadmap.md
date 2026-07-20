@@ -4,8 +4,9 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R2B CLOSED (R2B=523239a). R3A1 committed (additive private native prepared path;
-crypto-random internal secret; not production-selected). All pushed. Next: R3A1 sol review, then R3A2.
+STATUS: EXECUTING. R0..R2B CLOSED. R3A1=428a1ea(+fix this commit; sol review CLOSED — abort-strand, Close/
+prepared-registry, test de-secret; +orch Linux test-robustness fix). All pushed. Next: R3A2 (public cutover;
+packet staged; TWO reviewers).
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -292,7 +293,18 @@ see the R4A contract block.)
   strict-E2E harness launched: worker job_20260720T151723000000000Z_000002 (codex gpt-5.5 xhigh, --write).
   Packet: ~/tmp/delegate-packets/abd-R0T-real-serve-harness.md. Expected sentinel
   strict_native_runtime_unavailable; opt-in gate abd_strict_e2e + AGENTBUS_RUN_STRICT_E2E=1.
-- 2026-07-20 R3A1 (this commit): ADDITIVE private native prepared path (2 new files native_held_launch.go +
+- 2026-07-20 R3A1-fix (this commit): closed R3A1 sol review (3 High). F1 tests no longer print secret values
+  (report properties only). F2 effects.AbortAndVerify always attempts custodian contain+close+delete after a
+  parklaunch abort error (success if absence proven; else retryable via ContainAndVerify, no strand/false-
+  finalize); held_launch.go HandleControlLoss now handles Aborting (contain-retry). F3 custodian tracks a
+  heldPrepared registry (documented lock order, no cycle); Close refuses with running procs, aborts-and-verifies
+  prepared held launches or returns typed ErrHeldLaunchCloseRefused, idempotent; ActiveCustodyCount includes
+  prepared. ORCH FIX: the new Close-refusal test asserted a platform-specific inner cause (ErrNativeCustodian
+  Unavailable) that holds on Darwin but not Linux cgroup-v2 — relaxed to the contract-level typed refusal
+  ErrHeldLaunchCloseRefused (Docker gate caught it; macOS was green). Verify: build/linux/gofmt/vet=0;
+  custodian -race -count=3 (macOS 192s)=0; macOS suite=0; Docker -p 1 full=0 + custodian -race=0 + R0T RED=0.
+  sol review CLOSED.
+- 2026-07-20 R3A1 (428a1ea): ADDITIVE private native prepared path (2 new files native_held_launch.go +
   test, build-tag darwin||linux). Crypto/rand 32-byte channel-scoped internal secret (zeroized, not
   identity-derived, caller secret ignored, one secret/launch); nativeHeldLaunchEffects implements R2A
   HeldLaunchEffects over parklaunch.Prepare + native containment backend (witness-acquisition checked);
