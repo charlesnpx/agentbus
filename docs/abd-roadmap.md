@@ -29,6 +29,13 @@ park-now/release-later custodian). Binding invariants:
 4. ACTIVATED STATE ROOT owns whether the daemon may downgrade.
 
 ## Product scope (first strict release)
+- **NO LEGACY / NO BACKWARD-COMPAT (binding, user-directed 2026-07-20).** There are no deployed users and no
+  old on-disk/on-wire artifacts. Do NOT preserve backward-compat decode paths, do NOT build
+  upgrade/migration/"old-worker-survives" scaffolding or tests, and do NOT default missing fields for
+  compatibility — require explicit current-version fields and fail closed on anything else. Version/old-frame
+  rejection is retained ONLY as cheap fail-closed defense (a single reject test), never as a compat feature.
+  This does not by itself delete the unactivated non-strict default runtime (that stays until strict is the
+  only path); it means: spend zero effort making anything compatible with a prior version.
 - The ONLY shipped AB-D submission mode is **IdentifiedFenced**.
 - No-ID and unfenceable/custom submissions are **rejected before any mutation** (before Backend.Start /
   session construction that can exec / bbolt accept / JSON job creation / parked prep). NO fallback from
@@ -209,10 +216,12 @@ test reaches an unsafe later state, the command wasn't run, or the ledger omits 
   worker bootstrap expectation; bump `parkproto.Version`; reject old+mixed frames; keep release-secret
   threading (do NOT remove model.ReleaseSecret; do NOT touch LaunchController; do NOT implement
   NativeCustodian.Prepare). R1 gate: prove no bbolt/anchor record contains ReleaseSecret; no recovery path
-  decodes parkproto frames; no restart path resends a release frame. Two upgrade tests: (a) pre-upgrade
-  worker bound by GroupRef recovered solely via containment; (b) pre-upgrade unbound worker dies via
-  control-loss, no frame replay. Expected sentinel: `strict_admission_unavailable` (unchanged; production
-  still rejects strict submits at the jobs.requestId gate).
+  decodes parkproto frames; no restart path resends a release frame. Tests (NO legacy/upgrade scaffolding —
+  see Product scope): (a) a restarted daemon recovering a BOUND current-version obligation performs ONLY
+  ContainAndVerify (no frame decode/replay) — behavioral, via a recording fake custodian; (b) a single
+  fail-closed test that a non-current/malformed frame is rejected. Strict frame decode requires EXPLICIT
+  current-version fields (no backward-compat defaulting). Expected sentinel: `strict_admission_unavailable`
+  (unchanged; production still rejects strict submits at the jobs.requestId gate).
 - **R2A** held-launch contracts + race tests only (state machine, external-secret semantics, ReleaseOutcome,
   FD matrix, race table). No subprocess impl.
 - **R2B** held-launch impl in parklaunch: Prepare/Release(secret, validated)/AbortAndVerify; one-use;
