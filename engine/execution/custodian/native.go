@@ -17,6 +17,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/containment"
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
 	"github.com/charlesnpx/agentbus/internal/parkproto"
@@ -1131,6 +1132,12 @@ type RealContainment struct {
 	Params         containment.Params
 	Witness        containment.ContinuityWitness
 	RetainedObject containment.RetainedGroupObject
+	// TolerateUnleasedCleanupSkip is set ONLY by the monitor composition
+	// (inherited-fd retained object): a typed root-lease-unavailable cleanup
+	// skip after a PROVEN absence is expected-normal there (a live leased
+	// owner reaps the leaf). Daemon-side containments must leave this false so
+	// a lease-lifetime regression surfaces instead of being tolerated.
+	TolerateUnleasedCleanupSkip bool
 }
 
 func (real RealContainment) Contain(ctx context.Context, group model.GroupRef) error {
@@ -1149,6 +1156,15 @@ func (real RealContainment) contain(ctx context.Context, group model.GroupRef, b
 	outcome := containPhysicalWithCleanup(ctx, group, bound.Params, bound.Witness, bound.RetainedObject, true, beforeProcessGroupProbe)
 	if outcome.Absent() {
 		if outcome.Err != nil {
+			if real.TolerateUnleasedCleanupSkip && errors.Is(outcome.Err, cgroup.ErrRootLeaseUnavailable) {
+				// Unleased (inherited-fd) cleanup was SKIPPED because a live
+				// owner holds the delegated-root flock. Absence is proven; the
+				// retained leaf belongs to that leased owner (or to restart
+				// recovery) to reap. This is expected-normal for a monitor
+				// containing while the daemon still lives and must not read as
+				// containment failure.
+				return nil
+			}
 			return fmt.Errorf("%w: cleanup retained object after absence proof: %v", ErrPhysicalContainment, outcome.Err)
 		}
 		return nil

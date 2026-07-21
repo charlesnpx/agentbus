@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -213,7 +214,7 @@ func TestRealFSUnleasedInheritedCleanupRemovesMatchingLeaf(t *testing.T) {
 	}
 }
 
-func TestRealFSUnleasedInheritedCleanupFailsClosedOnNameIdentityDrift(t *testing.T) {
+func TestRealFSUnleasedInheritedCleanupSkipsWhenRootLeaseHeld(t *testing.T) {
 	fs, object := newUnleasedInheritedCleanupFixture(t, "cg-inherited-contender")
 	defer object.Close()
 	path := filepath.Join(fs.root, object.leafName)
@@ -226,6 +227,29 @@ func TestRealFSUnleasedInheritedCleanupFailsClosedOnNameIdentityDrift(t *testing
 		t.Fatalf("contender flock root: %v", err)
 	}
 	defer unix.Flock(contenderRoot, unix.LOCK_UN)
+
+	err = fs.removeUnleasedInheritedLeaf(context.Background(), object)
+	if !errors.Is(err, ErrRootLeaseUnavailable) || errors.Is(err, ErrUnsupported) {
+		t.Fatalf("removeUnleasedInheritedLeaf() under contender flock error = %v, want ErrRootLeaseUnavailable only", err)
+	}
+	if !strings.Contains(err.Error(), "unleased cleanup skipped: root lease held by another owner") {
+		t.Fatalf("removeUnleasedInheritedLeaf() under contender flock error = %q, want cleanup skip reason", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("retained leaf stat after skipped cleanup = %v, want present", err)
+	}
+	fs.mu.Lock()
+	_, tombstoned := fs.tombstones[object.leafName]
+	fs.mu.Unlock()
+	if tombstoned {
+		t.Fatalf("unleased cleanup tombstoned leaf after skipped cleanup")
+	}
+}
+
+func TestRealFSUnleasedInheritedCleanupTombstonesStaleNameAtEntry(t *testing.T) {
+	fs, object := newUnleasedInheritedCleanupFixture(t, "cg-inherited-stale")
+	defer object.Close()
+	path := filepath.Join(fs.root, object.leafName)
 	if err := os.Remove(path); err != nil {
 		t.Fatalf("remove original leaf: %v", err)
 	}
@@ -237,18 +261,55 @@ func TestRealFSUnleasedInheritedCleanupFailsClosedOnNameIdentityDrift(t *testing
 		t.Fatalf("write contender marker: %v", err)
 	}
 
-	err = fs.removeUnleasedInheritedLeaf(context.Background(), object)
-	if !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("removeUnleasedInheritedLeaf() after identity drift error = %v, want ErrUnsupported", err)
+	err := fs.removeUnleasedInheritedLeaf(context.Background(), object)
+	if err != nil {
+		t.Fatalf("removeUnleasedInheritedLeaf() after identity drift error = %v, want nil", err)
 	}
+	requireUnleasedCleanupReplacementUntouched(t, marker)
+	requireUnleasedCleanupTombstone(t, fs, object)
+}
+
+func TestRealFSUnleasedInheritedCleanupRechecksNameAfterInheritedVerify(t *testing.T) {
+	fs, object := newUnleasedInheritedCleanupFixture(t, "cg-inherited-race")
+	defer object.Close()
+	path := filepath.Join(fs.root, object.leafName)
+	marker := filepath.Join(path, "contender-marker")
+
+	err := fs.removeUnleasedInheritedLeafAfterVerify(context.Background(), object, func() {
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove original leaf: %v", err)
+		}
+		if err := os.Mkdir(path, 0o755); err != nil {
+			t.Fatalf("recreate contender leaf: %v", err)
+		}
+		if err := os.WriteFile(marker, []byte("owned\n"), 0o600); err != nil {
+			t.Fatalf("write contender marker: %v", err)
+		}
+	})
+	if err != nil {
+		t.Fatalf("removeUnleasedInheritedLeaf() after verified identity drift error = %v, want nil", err)
+	}
+	requireUnleasedCleanupReplacementUntouched(t, marker)
+	requireUnleasedCleanupTombstone(t, fs, object)
+}
+
+func requireUnleasedCleanupReplacementUntouched(t *testing.T, marker string) {
+	t.Helper()
 	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("contender marker stat after failed cleanup = %v, want present", err)
+		t.Fatalf("contender marker stat after cleanup attempt = %v, want present", err)
 	}
+}
+
+func requireUnleasedCleanupTombstone(t *testing.T, fs *realFS, object *realObject) {
+	t.Helper()
 	fs.mu.Lock()
-	_, tombstoned := fs.tombstones[object.leafName]
+	tombstone, ok := fs.tombstones[object.leafName]
 	fs.mu.Unlock()
-	if tombstoned {
-		t.Fatalf("unleased cleanup tombstoned identity-drift leaf")
+	if !ok {
+		t.Fatalf("unleased cleanup did not tombstone replaced leaf")
+	}
+	if !object.leaf.durableEqual(tombstone) {
+		t.Fatalf("unleased cleanup tombstone = %+v, want %+v", tombstone, object.leaf)
 	}
 }
 

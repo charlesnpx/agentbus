@@ -2667,6 +2667,11 @@ func runNativeMonitorHelper(args []string) int {
 		containmentImpl = RealContainment{
 			Params:         defaultNativeTestParams(),
 			RetainedObject: cgroup.NewInheritedRetainedGroupObjectFromLeafFD(*leafFD),
+			// Mirror the production monitor composition
+			// (nativecustody.RunMonitorFromFDs): a typed unleased-cleanup skip
+			// after proven absence is expected while the daemon holds the
+			// lifetime root lease.
+			TolerateUnleasedCleanupSkip: true,
 		}
 	}
 	if delayPath := os.Getenv(nativeHelperMonitorDelayReady); delayPath != "" {

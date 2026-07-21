@@ -284,7 +284,24 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
-- 2026-07-21 R3C-fix3 (this commit): closed fix2-review's 2H+2M. F1 inherited monitor cleanup no
+- 2026-07-21 R3C-fix4 (this commit): closed the last High — the inherited-cleanup unlink TOCTOU.
+  Worker delivered the serialized design (scoped transient flock: acquire NB → re-verify identity
+  UNDER the flock → unlink → release; contender holds ⇒ typed skip); worker was Linux-blind, and the
+  orchestrator diagnosed + repaired four Linux integration bugs (each flagged for the closing review):
+  (1) inherited rootfd was O_PATH — flock(2) on O_PATH = EBADF ⇒ O_RDONLY; (2) inheritedLeafCapability.
+  Remove ran the held-verify membership gate BEFORE the flock, pre-empting typed-skip/tombstone ⇒
+  reordered, emptiness checked UNDER the flock via direct leaf-fd read (parsePopulatedEvents);
+  (3) RealContainment failed containment on ANY post-absence cleanup error ⇒ typed unleased-skip
+  tolerated ONLY behind TolerateUnleasedCleanupSkip, set solely by the monitor composition (daemon-side
+  lease regressions still surface) + propagated through platformBindContainmentTarget; (4) the test
+  helper monitor duplicates the production composition and needed the same flag (exit-3 root cause) —
+  drift between duplicated composition points noted for review. Monitor-EOF test now encodes the full
+  lifetime-lease contract: monitor proves absence + typed-skips the leaf; daemon-side leased
+  ContainAndVerify reaps; leaf gone after. Verified: macOS static/full/race=0; Docker cgroup-v2:
+  conformance=0 (serialized dead-owner removal, contender skip, replacement tombstone, monitor-EOF,
+  two-launch overlap all green), full -p 1=0, race=0, R0T RED sentinel=0. Closing sol review next —
+  SHIP closes R3C.
+- 2026-07-21 R3C-fix3 (50b357d): closed fix2-review's 2H+2M. F1 inherited monitor cleanup no
   longer encodes leased:false as held — explicit identity-guarded inheritedLeafCapability cleanup path
   distinct from lease-required realFS.Remove (acquireHeldRoot now requires leased; ENOENT/ESTALE
   proven-gone only; EPERM/EIO error). F2 two-launch overlap test uses a FIFO entered/release handshake

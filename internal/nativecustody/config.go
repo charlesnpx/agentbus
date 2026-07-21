@@ -69,7 +69,8 @@ func MonitorContainment() parklaunch.Containment {
 
 func RunMonitorFromFDs(ctx context.Context, daemonFD, targetFD, readyFD, leafFD int) error {
 	return parklaunch.RunMonitorFromFDs(ctx, daemonFD, targetFD, readyFD, custodian.RealContainment{
-		Params:         ProductionContainmentParams(),
-		RetainedObject: cgroup.NewInheritedRetainedGroupObjectFromLeafFD(leafFD),
+		Params:                      ProductionContainmentParams(),
+		RetainedObject:              cgroup.NewInheritedRetainedGroupObjectFromLeafFD(leafFD),
+		TolerateUnleasedCleanupSkip: true,
 	})
 }

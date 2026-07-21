@@ -447,6 +447,10 @@ func (fs *realFS) ReadEvents(ctx context.Context, object cgroupObject) (Events, 
 	if err != nil {
 		return Events{}, err
 	}
+	return parsePopulatedEvents(data)
+}
+
+func parsePopulatedEvents(data []byte) (Events, error) {
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) != 2 || fields[0] != "populated" {
@@ -535,6 +539,10 @@ func (fs *realFS) Remove(ctx context.Context, object cgroupObject) error {
 }
 
 func (fs *realFS) removeUnleasedInheritedLeaf(ctx context.Context, object cgroupObject) error {
+	return fs.removeUnleasedInheritedLeafAfterVerify(ctx, object, nil)
+}
+
+func (fs *realFS) removeUnleasedInheritedLeafAfterVerify(ctx context.Context, object cgroupObject, afterInheritedVerify func()) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -545,18 +553,24 @@ func (fs *realFS) removeUnleasedInheritedLeaf(ctx context.Context, object cgroup
 	if realObject.rootfd < 0 || realObject.leaffd < 0 {
 		return fmt.Errorf("%w: inherited cgroup cleanup requires open root and leaf fds", ErrInvalid)
 	}
-	current, err := identityAt(realObject.rootfd, realObject.leafName)
+	leaf, err := identityFromFD(realObject.leaffd)
 	if err != nil {
-		if retainedLeafMissing(err) {
-			fs.recordTombstone(realObject.leafName, realObject.leaf)
-			return nil
-		}
 		return err
 	}
-	if !realObject.leaf.durableEqual(current) {
-		return fmt.Errorf("%w: unleased-cleanup retained cgroup leaf name identity mismatch", ErrUnsupported)
+	if !realObject.leaf.durableEqual(leaf) {
+		return fmt.Errorf("%w: unleased-cleanup retained cgroup leaf fd identity mismatch", ErrUnsupported)
 	}
-	leaf, err := identityFromFD(realObject.leaffd)
+	if afterInheritedVerify != nil {
+		afterInheritedVerify()
+	}
+	releaseCleanupRoot, err := acquireUnleasedCleanupRootFlock(realObject.rootfd)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, releaseCleanupRoot())
+	}()
+	leaf, err = identityFromFD(realObject.leaffd)
 	if err != nil {
 		return err
 	}
@@ -565,6 +579,37 @@ func (fs *realFS) removeUnleasedInheritedLeaf(ctx context.Context, object cgroup
 	}
 	if err := verifyRootHandle(realObject.rootfd, realObject.root); err != nil {
 		return err
+	}
+	current, err := identityAt(realObject.rootfd, realObject.leafName)
+	if err != nil {
+		if retainedLeafMissing(err) {
+			fs.recordTombstone(realObject.leafName, realObject.leaf)
+			return nil
+		}
+		return err
+	}
+	if !realObject.leaf.durableEqual(current) || !leaf.durableEqual(current) {
+		fs.recordTombstone(realObject.leafName, realObject.leaf)
+		return nil
+	}
+	// Emptiness check UNDER the flock (a contender cannot repopulate while we
+	// hold it). Read cgroup.events via the verified leaf fd directly — the
+	// generic readFile held-verify gate is unusable on the unleased path.
+	eventsFD, err := unix.Openat(realObject.leaffd, "cgroup.events", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	eventsData, err := readAll(eventsFD)
+	_ = unix.Close(eventsFD)
+	if err != nil {
+		return err
+	}
+	events, err := parsePopulatedEvents(eventsData)
+	if err != nil {
+		return err
+	}
+	if events.Populated {
+		return ErrPopulated
 	}
 	if err := unix.Unlinkat(realObject.rootfd, realObject.leafName, unix.AT_REMOVEDIR); err != nil {
 		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESTALE) {
@@ -670,7 +715,9 @@ func (object inheritedLeafRetainedObject) AcquireRetainedGroup(ctx context.Conte
 		_ = unix.Close(leaffd)
 		return nil, fmt.Errorf("%w: inherited cgroup leaf identity mismatch", ErrUnsupported)
 	}
-	rootfd, err := unix.Openat(leaffd, "..", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	// O_RDONLY (NOT O_PATH): the unleased cleanup path must flock(2) this fd,
+	// and flock on an O_PATH descriptor fails with EBADF by definition.
+	rootfd, err := unix.Openat(leaffd, "..", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		_ = unix.Close(leaffd)
 		return nil, err
@@ -725,13 +772,12 @@ func (capability *inheritedLeafCapability) Remove(ctx context.Context) error {
 	if capability.removed {
 		return nil
 	}
-	membership, err := capability.Membership(ctx)
-	if err != nil {
-		return err
-	}
-	if membership != containment.RetainedMembershipEmpty {
-		return ErrPopulated
-	}
+	// NO membership pre-check here: it routes through the held-verify gate and
+	// errors "object is no longer held" when the leaf was legitimately replaced
+	// or removed — pre-empting the intended typed-skip (contender holds the
+	// flock) and proven-gone-tombstone results. Ordering is owned by the fs
+	// helper: flock first, identity re-verify and emptiness check UNDER the
+	// flock, then unlink.
 	fs, ok := capability.fs.(*realFS)
 	if !ok || fs == nil {
 		return fmt.Errorf("%w: unleased-cleanup requires real cgroup fs", ErrUnsupported)
@@ -924,6 +970,25 @@ func cgroupRootLeaseAcquireError(err error) error {
 		return fmt.Errorf("%w: acquire delegated cgroup root lease: %v", ErrRootLeaseUnavailable, err)
 	}
 	return fmt.Errorf("%w: acquire delegated cgroup root lease: %v", ErrUnsupported, err)
+}
+
+func acquireUnleasedCleanupRootFlock(rootfd int) (func() error, error) {
+	if err := flockRoot(rootfd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return nil, unleasedCleanupRootFlockError(err)
+	}
+	return func() error {
+		return flockRoot(rootfd, unix.LOCK_UN)
+	}, nil
+}
+
+func unleasedCleanupRootFlockError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+		return fmt.Errorf("%w: unleased cleanup skipped: root lease held by another owner", ErrRootLeaseUnavailable)
+	}
+	return cgroupRootLeaseAcquireError(err)
 }
 
 func retryableRootOpenError(err error) bool {

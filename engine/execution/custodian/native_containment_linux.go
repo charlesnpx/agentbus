@@ -60,9 +60,10 @@ func platformBindContainmentTarget(ctx context.Context, real RealContainment, gr
 		return nil, err
 	}
 	bound := RealContainment{
-		Params:         real.Params,
-		Witness:        real.Witness,
-		RetainedObject: boundRetainedGroupObject{capability: capability},
+		Params:                      real.Params,
+		Witness:                     real.Witness,
+		RetainedObject:              boundRetainedGroupObject{capability: capability},
+		TolerateUnleasedCleanupSkip: real.TolerateUnleasedCleanupSkip,
 	}
 	if witness, ok := capability.(containment.ContinuityWitness); ok {
 		bound.Witness = witness

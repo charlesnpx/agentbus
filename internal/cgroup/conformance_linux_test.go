@@ -5,6 +5,7 @@ package cgroup_test
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -257,11 +258,71 @@ func TestCgroupV2InheritedMonitorCleanupDoesNotRemoveContenderReplacement(t *tes
 	}
 	defer inherited.Release()
 
-	if err := inherited.Remove(ctx); err == nil {
-		t.Fatalf("inherited Remove() after contender replacement succeeded; want fail-closed error")
+	err = inherited.Remove(ctx)
+	if !errors.Is(err, cgroup.ErrRootLeaseUnavailable) {
+		t.Fatalf("inherited Remove() while contender holds root lease error = %v, want ErrRootLeaseUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "unleased cleanup skipped: root lease held by another owner") {
+		t.Fatalf("inherited Remove() while contender holds root lease error = %q, want cleanup skip reason", err)
 	}
 	if _, err := os.Stat(replacementPath); err != nil {
 		t.Fatalf("contender replacement stat after inherited cleanup attempt = %v, want present", err)
+	}
+}
+
+func TestCgroupV2InheritedMonitorCleanupDoesNotRemoveStaleReplacement(t *testing.T) {
+	if os.Getenv("AGENTBUS_CGROUP_CONFORMANCE") != "1" {
+		t.Skip("set AGENTBUS_CGROUP_CONFORMANCE=1 to run real cgroup-v2 conformance")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	manager := newStrictConformanceManager(t, ctx)
+	capability := acquireMonitorConformanceCapability(t, ctx, manager)
+	t.Cleanup(func() {
+		cleanupRetainedCapability(t, capability)
+	})
+	leafFile, err := capability.MonitorLeafFile(ctx)
+	if err != nil {
+		t.Fatalf("MonitorLeafFile() error = %v", err)
+	}
+	defer leafFile.Close()
+	target := retainedTargetFromIdentity(capability.Identity(), os.Getpid())
+	leafName, err := retainedLeafNameForConformance(target.RetainedID)
+	if err != nil {
+		t.Fatalf("parse retained leaf name: %v", err)
+	}
+	if err := capability.ReleaseRootLease(); err != nil {
+		t.Fatalf("ReleaseRootLease() before stale replacement error = %v", err)
+	}
+
+	replacementPath := "/sys/fs/cgroup/" + leafName
+	if err := os.Remove(replacementPath); err != nil {
+		t.Fatalf("remove original retained leaf for stale replacement: %v", err)
+	}
+	if err := os.Mkdir(replacementPath, 0o755); err != nil {
+		t.Fatalf("create stale replacement leaf: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(replacementPath)
+	})
+
+	inheritedRaw, err := cgroup.NewInheritedRetainedGroupObjectFromLeafFD(int(leafFile.Fd())).AcquireRetainedGroup(ctx, target, time.Now())
+	if err != nil {
+		t.Fatalf("inherited AcquireRetainedGroup() after stale replacement error = %v", err)
+	}
+	inherited, ok := inheritedRaw.(retainedConformanceCapability)
+	if !ok {
+		_ = inheritedRaw.Release()
+		t.Fatalf("inherited capability = %T, want retained cleanup capability", inheritedRaw)
+	}
+	defer inherited.Release()
+
+	if err := inherited.Remove(ctx); err != nil {
+		t.Fatalf("inherited Remove() after stale replacement error = %v, want nil", err)
+	}
+	if _, err := os.Stat(replacementPath); err != nil {
+		t.Fatalf("stale replacement stat after inherited cleanup attempt = %v, want present", err)
 	}
 }
 

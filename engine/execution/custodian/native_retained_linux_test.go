@@ -225,6 +225,22 @@ func TestNativeRetainedMonitorDaemonEOFContainsTargetGroup(t *testing.T) {
 	}
 	waitPIDAbsent(t, result.GrandchildPID, 5*time.Second)
 	waitGroupAbsent(t, running.Ref(), 5*time.Second)
+	// Lifetime-lease contract: the monitor SKIPS leaf removal while the daemon
+	// custodian holds the delegated-root flock (typed unleased-cleanup skip) —
+	// absence is proven, but the leaf is the LEASED owner's to reap. Verify the
+	// leaf survived the monitor, then run the daemon-side containment (leased
+	// cleanup) and prove the leaf gone.
+	requireRetainedMembershipForRef(t, ctx, native, running.Ref(), containment.RetainedMembershipEmpty)
+	verified, cleanup, err := running.ContainAndVerify(ctx, QuiescenceCauseContain)
+	if err != nil {
+		t.Fatalf("daemon-side ContainAndVerify() after monitor EOF error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("daemon-side leased cleanup error = %v, want nil", cleanup.Err)
+	}
+	if verified == (VerifiedQuiescence{}) {
+		t.Fatal("daemon-side ContainAndVerify() returned zero attestation")
+	}
 	requireRetainedLeafGone(t, ctx, native, running.Ref())
 }
 
