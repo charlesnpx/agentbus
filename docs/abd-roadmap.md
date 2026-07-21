@@ -4,10 +4,11 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R3B CLOSED. R3C committed (single-lease self-tested runtime, SupportClass,
-typed lease contention; real cgroup-v2 conformance tier fully green incl. monitor-EOF). TWO sol reviews
-launched on the committed SHA. Then R4A → R4B → R5 → R6/R7A → R7B. Production still UnavailableRuntime;
-R0T expected-RED green.
+STATUS: EXECUTING. R0..R3C CLOSED (R3C closed at c9470de: SHIP, 0 findings, after 2 worker rounds,
+2 domain reviews, 4 fix rounds + ship-confirm; landed the custodian-lifetime owner lease + inherited
+monitor leaf FD + serialized unleased cleanup + evidence-based SupportClass qualification). Next: R4A
+(worker launched) → R4B → R5 → R6/R7A → R7B. Production still UnavailableRuntime; R0T expected-RED
+green throughout.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -284,7 +285,15 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
-- 2026-07-21 R3C-fix4 (this commit): closed the last High — the inherited-cleanup unlink TOCTOU.
+- 2026-07-21 R3C CLOSED. Ship-confirmation on c9470de: SHIP, findings none, all acceptance criteria
+  MET (single composition point verified at both call sites; nothing else changed). R3C totals:
+  6 commits (f439151, 2bb9a1a, 50b357d, 9aff4be, c9470de + fix worker rounds), 2 domain reviews +
+  4 verification rounds, findings narrowed monotonically 4H+1M → 2H+2M → 1H → 1M → 0. Durable
+  outcomes: C9 single lease is now REAL (custodian-lifetime owner flock, construction-only contention),
+  monitor runs on an inherited leaf FD and never touches the root flock, unleased cleanup is
+  serialized + identity-guarded, self-test classification is evidence-based, and the Linux cgroup-v2
+  conformance tier (AGENTBUS_CGROUP_CONFORMANCE=1) proves all of it. Launching R4A.
+- 2026-07-21 R3C-fix4 (9aff4be): closed the last High — the inherited-cleanup unlink TOCTOU.
   Worker delivered the serialized design (scoped transient flock: acquire NB → re-verify identity
   UNDER the flock → unlink → release; contender holds ⇒ typed skip); worker was Linux-blind, and the
   orchestrator diagnosed + repaired four Linux integration bugs (each flagged for the closing review):
