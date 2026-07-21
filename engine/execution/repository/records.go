@@ -59,12 +59,42 @@ func (record Record[T]) Corrupt() bool {
 	return record.State == RecordCorrupt
 }
 
-const CurrentAuthorityMetaSchemaVersion = uint16(1)
+const (
+	CurrentAuthorityMetaSchemaVersion = uint16(1)
+	CurrentAdmissionContractVersion   = uint16(1)
+)
+
+type AdmissionRootMetadata struct {
+	Activated       bool   `json:"activated"`
+	ContractVersion uint16 `json:"contractVersion"`
+	ActivatedAtGen  uint64 `json:"activatedAtGen"`
+}
+
+func (metadata AdmissionRootMetadata) Validate() error {
+	if !metadata.Activated {
+		if metadata.ContractVersion != 0 {
+			return fmt.Errorf("%w: admission_root.contract_version must be zero before activation", ErrInvalidRecord)
+		}
+		if metadata.ActivatedAtGen != 0 {
+			return fmt.Errorf("%w: admission_root.activated_at_gen must be zero before activation", ErrInvalidRecord)
+		}
+		return nil
+	}
+	if metadata.ContractVersion == 0 {
+		return fmt.Errorf("%w: admission_root.contract_version is required after activation", ErrInvalidRecord)
+	}
+	if metadata.ActivatedAtGen == 0 {
+		return fmt.Errorf("%w: admission_root.activated_at_gen is required after activation", ErrInvalidRecord)
+	}
+	return nil
+}
 
 type AuthorityMeta struct {
 	SchemaVersion   uint16
 	Generation      uint64
 	NextJobSequence uint64
+	AdmissionRoot   AdmissionRootMetadata
+	Sealed          bool
 }
 
 func (meta AuthorityMeta) Validate() error {
@@ -77,7 +107,26 @@ func (meta AuthorityMeta) Validate() error {
 	if meta.NextJobSequence == 0 {
 		return fmt.Errorf("%w: meta.next_job_sequence is required", ErrInvalidRecord)
 	}
+	if err := meta.AdmissionRoot.Validate(); err != nil {
+		return err
+	}
 	return nil
+}
+
+type AuthorityRootStats struct {
+	Jobs                int `json:"jobs"`
+	Bindings            int `json:"bindings"`
+	Tombstones          int `json:"tombstones"`
+	LaunchRecords       int `json:"launchRecords"`
+	RecoveryObligations int `json:"recoveryObligations"`
+}
+
+func (stats AuthorityRootStats) Empty() bool {
+	return stats.Jobs == 0 &&
+		stats.Bindings == 0 &&
+		stats.Tombstones == 0 &&
+		stats.LaunchRecords == 0 &&
+		stats.RecoveryObligations == 0
 }
 
 type Tombstone struct {

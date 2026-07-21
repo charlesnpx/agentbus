@@ -147,6 +147,7 @@ type Server struct {
 	admissionRuntimeConfig       custodian.Runtime
 	admissionProbeRunner         command.ProbeRunner
 	admissionUnprobeableBackends map[string]error
+	admissionStartupHooks        admissionStartupHooks
 	admissionDaemonBootOnce      sync.Once
 	admissionDaemonBootRef       model.BootRef
 	admissionDaemonBootRefErr    error
@@ -1030,8 +1031,19 @@ func (s *Server) handleHello(c *connection, raw json.RawMessage) requestOutcome 
 		ProtocolVersion: protocol.Version,
 		Backends:        s.backendNames(),
 		BackendMetadata: s.backendMetadata(),
-		Capabilities:    protocol.DefaultCapabilities(),
+		Capabilities:    s.protocolCapabilities(),
 	}}
+}
+
+func (s *Server) protocolCapabilities() map[string]bool {
+	capabilities := protocol.DefaultCapabilities()
+	s.admissionStateMu.RLock()
+	instance := s.admissionInstance
+	if instance != nil && instance.policy.AdvertiseRequestID {
+		capabilities["jobs.requestId"] = true
+	}
+	s.admissionStateMu.RUnlock()
+	return capabilities
 }
 
 func (s *Server) backendMetadata() []protocol.BackendInfo {
@@ -1386,6 +1398,9 @@ func strictIdentityPrecheck(raw json.RawMessage) (bool, *protocol.ErrorObject) {
 }
 
 func (s *Server) handleLegacyJobSubmit(ctx context.Context, params protocol.JobSubmitParams) requestOutcome {
+	if errObj := s.legacyAdmissionDowngradePrecheck(); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
 	spec := params.TaskSpec
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{})}

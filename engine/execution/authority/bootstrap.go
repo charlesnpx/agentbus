@@ -121,6 +121,9 @@ func (b *Bootstrapper) Begin(ctx context.Context, boot model.BootRef) (*Recovery
 		if err != nil {
 			return err
 		}
+		if meta.Sealed {
+			return ErrRootSealed
+		}
 		if _, err := startupMatrixTx(tx); err != nil {
 			return err
 		}

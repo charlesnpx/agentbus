@@ -32,6 +32,7 @@ type Repository interface {
 
 type ReadTx interface {
 	Meta() Record[AuthorityMeta]
+	RootStats() (AuthorityRootStats, error)
 	LookupRequest(model.RequestKey) RequestImage
 	LoadJob(model.JobID) JobImage
 	ListJobs(JobFilter) ([]JobImage, error)

@@ -16,6 +16,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/claudecli"
 	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
+	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/internal/agentbusserve"
 )
 
@@ -92,6 +93,8 @@ func (a *app) run(ctx context.Context, args []string, in io.Reader, out, errOut 
 		return a.runSetup(ctx, args[1:], out, errOut)
 	case "serve":
 		return a.runServe(ctx, args[1:], errOut)
+	case "admission":
+		return a.runAdmission(ctx, args[1:], out, errOut)
 	case "sessions":
 		return a.runSessions(args[1:], out, errOut)
 	case "status":
@@ -200,6 +203,136 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 	if err != nil {
 		return commandError(errOut, err)
 	}
+	return 0
+}
+
+func (a *app) runAdmission(ctx context.Context, args []string, out, errOut io.Writer) int {
+	if len(args) == 0 {
+		printAdmissionHelp(errOut)
+		return 2
+	}
+	switch args[0] {
+	case "-h", "--help", "help":
+		printAdmissionHelp(out)
+		return 0
+	case "inspect":
+		return a.runAdmissionInspect(ctx, args[1:], out, errOut)
+	case "recover":
+		return a.runAdmissionRecover(ctx, args[1:], out, errOut)
+	case "reset-empty-root":
+		return a.runAdmissionResetEmptyRoot(ctx, args[1:], out, errOut)
+	case "seal":
+		return a.runAdmissionSeal(ctx, args[1:], out, errOut)
+	default:
+		fmt.Fprintf(errOut, "agentbus: unknown admission command %q\n\n", args[0])
+		printAdmissionHelp(errOut)
+		return 2
+	}
+}
+
+func (a *app) runAdmissionInspect(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newAdmissionFlagSet("inspect", errOut)
+	stateRoot := fs.String("state-root", "", "admission state root")
+	jsonOut := fs.Bool("json", false, "emit JSON admission root inspection")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return admissionUsageError(errOut, "inspect does not accept positional arguments")
+	}
+	if *stateRoot == "" {
+		return admissionUsageError(errOut, "inspect requires --state-root <path>")
+	}
+	inspection, err := authority.InspectAdmissionRoot(ctx, *stateRoot)
+	if err != nil {
+		return commandError(errOut, err)
+	}
+	if *jsonOut {
+		return writeOrError(out, errOut, inspection)
+	}
+	printAdmissionInspection(out, inspection)
+	return 0
+}
+
+func (a *app) runAdmissionRecover(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newAdmissionFlagSet("recover", errOut)
+	stateRoot := fs.String("state-root", "", "admission state root")
+	jsonOut := fs.Bool("json", false, "emit JSON recovery report")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return admissionUsageError(errOut, "recover does not accept positional arguments")
+	}
+	if *stateRoot == "" {
+		return admissionUsageError(errOut, "recover requires --state-root <path>")
+	}
+	report, err := agentbusserve.RecoverAdmissionRoot(ctx, agentbusserve.Config{
+		StateRoot: *stateRoot,
+		CWD:       a.cwd,
+	})
+	if err != nil {
+		return commandError(errOut, err)
+	}
+	if *jsonOut {
+		return writeOrError(out, errOut, report)
+	}
+	fmt.Fprintf(out, "mode=%s workItems=%d quiescedLaunches=%d finalizedJobs=%d recoveryPasses=%d\n", report.Mode, report.WorkItems, report.QuiescedLaunches, report.FinalizedJobs, report.RecoveryPasses)
+	return 0
+}
+
+func (a *app) runAdmissionResetEmptyRoot(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newAdmissionFlagSet("reset-empty-root", errOut)
+	stateRoot := fs.String("state-root", "", "admission state root")
+	jsonOut := fs.Bool("json", false, "emit JSON admission root inspection after reset")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return admissionUsageError(errOut, "reset-empty-root does not accept positional arguments")
+	}
+	if *stateRoot == "" {
+		return admissionUsageError(errOut, "reset-empty-root requires --state-root <path>")
+	}
+	inspection, err := authority.ResetEmptyAdmissionRoot(ctx, *stateRoot)
+	if err != nil {
+		return commandError(errOut, err)
+	}
+	if *jsonOut {
+		return writeOrError(out, errOut, inspection)
+	}
+	fmt.Fprintln(out, "reset-empty-root complete")
+	printAdmissionInspection(out, inspection)
+	return 0
+}
+
+func (a *app) runAdmissionSeal(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newAdmissionFlagSet("seal", errOut)
+	stateRoot := fs.String("state-root", "", "admission state root")
+	startNew := fs.Bool("start-new-authority-domain", false, "acknowledge service must continue on a new state root/authority domain")
+	ackReplayReset := fs.Bool("acknowledge-replay-history-reset", false, "acknowledge cross-root request replay history is reset")
+	jsonOut := fs.Bool("json", false, "emit JSON admission root inspection after seal")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return admissionUsageError(errOut, "seal does not accept positional arguments")
+	}
+	if *stateRoot == "" {
+		return admissionUsageError(errOut, "seal requires --state-root <path>")
+	}
+	inspection, err := authority.SealAdmissionRoot(ctx, *stateRoot, authority.SealOptions{
+		StartNewAuthorityDomain:       *startNew,
+		AcknowledgeReplayHistoryReset: *ackReplayReset,
+	})
+	if err != nil {
+		return commandError(errOut, err)
+	}
+	if *jsonOut {
+		return writeOrError(out, errOut, inspection)
+	}
+	fmt.Fprintln(out, "seal complete")
+	printAdmissionInspection(out, inspection)
 	return 0
 }
 
@@ -794,6 +927,13 @@ func newCommandFlagSet(name string, errOut io.Writer) *flag.FlagSet {
 	return fs
 }
 
+func newAdmissionFlagSet(name string, errOut io.Writer) *flag.FlagSet {
+	fs := flag.NewFlagSet("agentbus admission "+name, flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	fs.Usage = func() { printAdmissionHelp(errOut) }
+	return fs
+}
+
 func parseFlags(fs *flag.FlagSet, args []string) (int, bool) {
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -807,6 +947,12 @@ func parseFlags(fs *flag.FlagSet, args []string) (int, bool) {
 func usageError(errOut io.Writer, format string, args ...any) int {
 	fmt.Fprintf(errOut, "agentbus: "+format+"\n\n", args...)
 	printRootHelp(errOut)
+	return 2
+}
+
+func admissionUsageError(errOut io.Writer, format string, args ...any) int {
+	fmt.Fprintf(errOut, "agentbus admission: "+format+"\n\n", args...)
+	printAdmissionHelp(errOut)
 	return 2
 }
 
@@ -833,6 +979,7 @@ func printRootHelp(out io.Writer) {
   agentbus version [--json]
   agentbus setup [--json]
   agentbus serve [--foreground]
+  agentbus admission <inspect|recover|reset-empty-root|seal> --state-root <path>
   agentbus sessions [--tags k=v] [--json]
   agentbus status [--job <id>] [--json]
   agentbus result --job <id> [--json]
@@ -851,6 +998,36 @@ JSON shapes:
 Exit codes for single-job status/result/cancel:
   completed=0, non-terminal=2, completed_noncompliant=3, failed=4, timed_out=5, interrupted=6, canceled=7, reaped=8, quarantined=9
 `)
+}
+
+func printAdmissionHelp(out io.Writer) {
+	fmt.Fprint(out, `Usage:
+  agentbus admission inspect --state-root <path> [--json]
+  agentbus admission recover --state-root <path> [--json]
+  agentbus admission reset-empty-root --state-root <path> [--json]
+  agentbus admission seal --state-root <path> --start-new-authority-domain --acknowledge-replay-history-reset [--json]
+
+Admission administration:
+  inspect:          read activation metadata, contract version, counts, domain UUID, and sealed flag; never mutates
+  recover:          requires strict support; reconciles durable nonterminal obligations without opening a listener
+  reset-empty-root: reinitializes only when jobs, bindings, tombstones, launch records, and recovery obligations are all zero
+  seal:             marks the old domain permanently closed for audit and requires both explicit acknowledgement flags
+
+Multi-root read/cancel/result routing is out of scope in this first release.
+`)
+}
+
+func printAdmissionInspection(out io.Writer, inspection authority.RootInspection) {
+	metadata := inspection.ActivationMetadata
+	fmt.Fprintf(out, "domainUUID=%s sealed=%t generation=%d\n", inspection.DomainUUID, inspection.Sealed, inspection.Generation)
+	fmt.Fprintf(out, "activated=%t contractVersion=%d activatedAtGen=%d\n", metadata.Activated, metadata.ContractVersion, metadata.ActivatedAtGen)
+	fmt.Fprintf(out, "counts jobs=%d bindings=%d tombstones=%d launchRecords=%d recoveryObligations=%d\n",
+		inspection.Counts.Jobs,
+		inspection.Counts.Bindings,
+		inspection.Counts.Tombstones,
+		inspection.Counts.LaunchRecords,
+		inspection.Counts.RecoveryObligations,
+	)
 }
 
 type tagFilter map[string]string

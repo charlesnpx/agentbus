@@ -5685,7 +5685,8 @@ func waitBackendStarts(t *testing.T, backend *fakeBackend, count int) {
 	for i := 0; i < count; i++ {
 		select {
 		case <-backend.started:
-		case <-time.After(time.Second):
+		// Positive wait: generous under load (see waitJobState).
+		case <-time.After(5 * time.Second):
 			t.Fatalf("backend start %d did not happen", i+1)
 		}
 	}
@@ -6268,7 +6269,11 @@ func loadJobRecord(t *testing.T, root, cwd, jobID string, processes engine.Proce
 
 func waitJobState(t *testing.T, conn net.Conn, r *bufio.Reader, jobID string, want engine.JobState) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	// Positive wait: generous under load. A 1s deadline failed several tests
+	// at once during saturated multi-package race sweeps (a full job lifecycle
+	// can exceed 1s when custodian race tests peg every core); polling returns
+	// early on success, so a longer deadline costs passing runs nothing.
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		resp := rpc(t, conn, r, "status-"+jobID, protocol.MethodJobResult, protocol.JobResultParams{JobID: jobID})
 		var result protocol.JobResult

@@ -178,6 +178,10 @@ func (tx readTx) Meta() repository.Record[repository.AuthorityMeta] {
 	return tx.state.metaRecord()
 }
 
+func (tx readTx) RootStats() (repository.AuthorityRootStats, error) {
+	return tx.state.rootStats(), nil
+}
+
 func (tx readTx) LookupRequest(key model.RequestKey) repository.RequestImage {
 	return repository.RequestImage{
 		Binding:   recordFromMap(tx.state.bindings, key, cloneBinding),
@@ -261,10 +265,12 @@ func (tx *writeTx) PutMeta(meta repository.AuthorityMeta) error {
 	if meta.NextJobSequence < tx.state.nextJobSequence {
 		return fmt.Errorf("%w: meta.next_job_sequence cannot move backwards", repository.ErrInvalidRecord)
 	}
-	if tx.state.nextJobSequence == meta.NextJobSequence {
+	current := tx.state.metaRecord()
+	if current.State == repository.RecordValid && reflect.DeepEqual(current.Value, meta) {
 		return nil
 	}
 	tx.state.nextJobSequence = meta.NextJobSequence
+	tx.state.meta = validSlot(meta)
 	tx.state.syncMeta()
 	tx.changed = true
 	return nil
@@ -456,10 +462,18 @@ func (s storeState) clone() storeState {
 }
 
 func (s *storeState) syncMeta() {
+	var admissionRoot repository.AdmissionRootMetadata
+	var sealed bool
+	if s.meta.state == repository.RecordValid {
+		admissionRoot = s.meta.value.AdmissionRoot
+		sealed = s.meta.value.Sealed
+	}
 	s.meta = validSlot(repository.AuthorityMeta{
 		SchemaVersion:   repository.CurrentAuthorityMetaSchemaVersion,
 		Generation:      s.generation,
 		NextJobSequence: s.nextJobSequence,
+		AdmissionRoot:   admissionRoot,
+		Sealed:          sealed,
 	})
 }
 
@@ -515,6 +529,24 @@ func (s *storeState) jobIDs() []model.JobID {
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
+}
+
+func (s *storeState) rootStats() repository.AuthorityRootStats {
+	stats := repository.AuthorityRootStats{
+		Jobs:       len(s.jobIDs()),
+		Bindings:   len(s.bindings),
+		Tombstones: len(s.tombstones),
+	}
+	for _, slot := range s.safety {
+		if slot.state != repository.RecordValid {
+			continue
+		}
+		stats.LaunchRecords += slot.value.Attempt.Launches.Count()
+		if slot.value.Terminal == nil {
+			stats.RecoveryObligations++
+		}
+	}
+	return stats
 }
 
 func (s *storeState) validateForCommit() error {

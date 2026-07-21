@@ -49,6 +49,8 @@ const (
 	AdmissionRejectInvalidStrictConfig      = "invalid_strict_config"
 	AdmissionRejectUnavailableNativeRuntime = "unavailable_native_runtime"
 	AdmissionRejectStrictRouteDisabled      = "strict_route_disabled"
+	AdmissionRejectLegacyDowngrade          = "legacy_downgrade"
+	AdmissionRejectPermanentlySealed        = "permanently_sealed"
 )
 
 const (

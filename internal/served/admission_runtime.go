@@ -24,6 +24,7 @@ type servedAdmissionRuntime struct {
 	runtime          custodian.Runtime
 	launchCustodian  launch.CustodianPort
 	supportOverride  *custodian.Support
+	supportProbe     func(context.Context) custodian.Support
 	verifierOverride custodian.AttestationVerifier
 }
 
@@ -64,8 +65,15 @@ func (s *servedAdmissionRuntime) verifiedContainmentSupported(ctx context.Contex
 }
 
 func (s *servedAdmissionRuntime) support() custodian.Support {
+	return s.assessSupport(context.Background())
+}
+
+func (s *servedAdmissionRuntime) assessSupport(ctx context.Context) custodian.Support {
 	if s == nil {
 		return custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable).Support()
+	}
+	if s.supportProbe != nil {
+		return s.supportProbe(ctx)
 	}
 	if s.supportOverride != nil {
 		return *s.supportOverride

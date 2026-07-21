@@ -17,6 +17,10 @@ func Serve(ctx context.Context, cfg Config) error {
 	return server.Serve(ctx)
 }
 
+func RecoverAdmissionRoot(ctx context.Context, cfg Config) (served.AdmissionRecoveryReport, error) {
+	return served.RecoverAdmissionRoot(ctx, productionServedConfig(cfg))
+}
+
 func productionServedConfig(cfg Config) served.Config {
 	cfg.Runtime = custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable)
 	return cfg

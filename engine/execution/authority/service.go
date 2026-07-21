@@ -22,6 +22,7 @@ var (
 	ErrNotFound        = errors.New("authority record not found")
 	ErrRecoveryNeeded  = errors.New("authority recovery needed")
 	ErrFailStopRecord  = errors.New("authority fail-stop record failed")
+	ErrRootSealed      = errors.New("authority root permanently sealed")
 )
 
 const safetySchemaVersion = uint16(1)
@@ -833,6 +834,9 @@ func (core *authorityCore) requireReadyTx(tx repository.ReadTx, token readyCapab
 	if err != nil {
 		return repository.AuthorityMeta{}, err
 	}
+	if meta.Sealed {
+		return repository.AuthorityMeta{}, ErrRootSealed
+	}
 	if core.boot.phase == bootFailStopped {
 		return repository.AuthorityMeta{}, ErrFailStopped
 	}
@@ -857,6 +861,9 @@ func (core *authorityCore) requireRecoveryTx(tx repository.ReadTx, token recover
 	meta, err := core.requireMeta(tx)
 	if err != nil {
 		return repository.AuthorityMeta{}, err
+	}
+	if meta.Sealed {
+		return repository.AuthorityMeta{}, ErrRootSealed
 	}
 	if core.boot.phase == bootFailStopped {
 		return repository.AuthorityMeta{}, ErrFailStopped

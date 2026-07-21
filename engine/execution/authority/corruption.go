@@ -148,6 +148,23 @@ func (r *Ready) FailStop(ctx context.Context, reason string) error {
 	return r.core.failStopLockedWithContext(failStopCtx, reason)
 }
 
+func (s *RecoverySession) FailStop(ctx context.Context, reason string) error {
+	if s == nil || s.core == nil {
+		return ErrNotReady
+	}
+	failStopCtx, cancel := detachedAuthorityFailStopContext(ctx)
+	defer cancel()
+	s.core.mu.Lock()
+	defer s.core.mu.Unlock()
+	if err := s.core.repo.View(failStopCtx, func(tx repository.ReadTx) error {
+		_, err := s.core.requireRecoveryTx(tx, s.token)
+		return err
+	}); err != nil {
+		return err
+	}
+	return s.core.failStopLockedWithContext(failStopCtx, reason)
+}
+
 func (core *authorityCore) failStopLocked(ctx context.Context, reason string) error {
 	failStopCtx, cancel := detachedAuthorityFailStopContext(ctx)
 	defer cancel()

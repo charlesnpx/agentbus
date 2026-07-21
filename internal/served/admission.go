@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -100,9 +99,48 @@ func (e admissionBackendContractViolationError) Error() string {
 	return fmt.Sprintf("backend contract violation for %s: descriptor claimed controlled-runner but session lacks ordinal-bound runner capability", e.backend)
 }
 
+type AdmissionServeMode uint8
+
+const (
+	AdmissionLegacy AdmissionServeMode = iota
+	AdmissionStrictIdentified
+	AdmissionRecoveryOnly
+	AdmissionFatal
+)
+
+func (mode AdmissionServeMode) String() string {
+	switch mode {
+	case AdmissionLegacy:
+		return "legacy"
+	case AdmissionStrictIdentified:
+		return "strict_identified"
+	case AdmissionRecoveryOnly:
+		return "recovery_only"
+	case AdmissionFatal:
+		return "fatal"
+	default:
+		return "unknown"
+	}
+}
+
+type admissionStartupHooks struct {
+	AfterMetadataRead       func(authority.AdmissionRootMetadata)
+	BeforeRecovery          func()
+	AfterRecovery           func()
+	BeforeSupportAssessment func()
+	AfterSupportAssessment  func(custodian.Support)
+	BeforePolicyInstall     func()
+}
+
 // ServeAdmissionPolicy is the immutable strict-admission policy derived during
 // Serve bootstrap from the qualified runtime and probed backend descriptors.
 type ServeAdmissionPolicy struct {
+	Mode                      AdmissionServeMode
+	CrashDurableContainment   bool
+	AcceptIdentified          bool
+	AdvertiseRequestID        bool
+	RejectLegacySubmissions   bool
+	Reason                    error
 	strictRouteEnabled        bool
 	strictRouteDisabledReason string
 	runtimeSupport            custodian.Support
@@ -118,12 +156,34 @@ type ServeBackendFenceability struct {
 	Reason           string
 }
 
-func deriveServeAdmissionPolicy(runtimeSupport custodian.Support, descriptors map[string]admissionBackendDescriptor) ServeAdmissionPolicy {
+func deriveServeAdmissionPolicy(metadata authority.AdmissionRootMetadata, runtimeSupport custodian.Support, descriptors map[string]admissionBackendDescriptor) ServeAdmissionPolicy {
+	mode := AdmissionLegacy
+	if metadata.Activated {
+		mode = AdmissionFatal
+		if strictSupportAvailable(runtimeSupport) {
+			mode = AdmissionStrictIdentified
+		}
+	} else if strictSupportConfigured(runtimeSupport) && strictSupportAvailable(runtimeSupport) {
+		mode = AdmissionStrictIdentified
+	}
+	reason := error(nil)
+	if mode == AdmissionFatal {
+		reason = newAdmissionSupportDiagnostic(metadata, runtimeSupport.Assessment, true)
+	}
 	policy := ServeAdmissionPolicy{
-		strictRouteEnabled: true,
-		runtimeSupport:     runtimeSupport,
-		runtimeAssessment:  runtimeSupport.Assessment,
-		backends:           make(map[string]ServeBackendFenceability, len(descriptors)),
+		Mode:                    mode,
+		CrashDurableContainment: strictSupportAvailable(runtimeSupport),
+		AcceptIdentified:        mode == AdmissionStrictIdentified,
+		AdvertiseRequestID:      false,
+		RejectLegacySubmissions: metadata.Activated,
+		Reason:                  reason,
+		strictRouteEnabled:      mode != AdmissionFatal,
+		runtimeSupport:          runtimeSupport,
+		runtimeAssessment:       runtimeSupport.Assessment,
+		backends:                make(map[string]ServeBackendFenceability, len(descriptors)),
+	}
+	if mode == AdmissionFatal {
+		policy.strictRouteDisabledReason = reason.Error()
 	}
 	for name, descriptor := range descriptors {
 		policy.backends[name] = ServeBackendFenceability{
@@ -146,10 +206,172 @@ func (policy ServeAdmissionPolicy) backendFenceability(name string) (ServeBacken
 }
 
 func (policy ServeAdmissionPolicy) strictRuntimeAvailable() bool {
-	return policy.runtimeAssessment.Class == custodian.SupportAvailable &&
-		policy.runtimeSupport.RuntimeProbePassed &&
-		policy.runtimeSupport.ParkedExec &&
-		policy.runtimeSupport.VerifiedContainment
+	return strictSupportAvailable(policy.runtimeSupport)
+}
+
+const admissionSupportMaxAttempts = 3
+
+var ErrAdmissionStrictSupportUnavailable = errors.New("strict admission support unavailable")
+
+type AdmissionSupportDiagnostic struct {
+	Metadata       authority.AdmissionRootMetadata
+	Assessment     custodian.SupportAssessment
+	RetryExhausted bool
+	FailStopped    bool
+}
+
+func (e AdmissionSupportDiagnostic) Error() string {
+	state := "root"
+	if e.Metadata.Activated {
+		state = "activated root"
+	}
+	message := fmt.Sprintf("%s: %s support class=%s attempts=%d cleanup_safe=%t", ErrAdmissionStrictSupportUnavailable, state, e.Assessment.Class, e.Assessment.Attempts, e.Assessment.CleanupSafe)
+	if e.RetryExhausted {
+		message += " retry_exhausted=true"
+	}
+	if e.FailStopped {
+		message += " fail_stopped=true"
+	}
+	if e.Assessment.Cause != nil {
+		message += ": " + e.Assessment.Cause.Error()
+	}
+	return message
+}
+
+func (e AdmissionSupportDiagnostic) Unwrap() error {
+	if e.Assessment.Cause != nil {
+		return e.Assessment.Cause
+	}
+	return ErrAdmissionStrictSupportUnavailable
+}
+
+func (e AdmissionSupportDiagnostic) Is(target error) bool {
+	return target == ErrAdmissionStrictSupportUnavailable
+}
+
+func newAdmissionSupportDiagnostic(metadata authority.AdmissionRootMetadata, assessment custodian.SupportAssessment, retryExhausted bool) AdmissionSupportDiagnostic {
+	return AdmissionSupportDiagnostic{
+		Metadata:       metadata,
+		Assessment:     assessment,
+		RetryExhausted: retryExhausted,
+	}
+}
+
+func (s *Server) requireActivatedAdmissionSupport(ctx context.Context, session *authority.RecoverySession, runtime *servedAdmissionRuntime, metadata authority.AdmissionRootMetadata) (custodian.Support, error) {
+	if s.admissionStartupHooks.BeforeSupportAssessment != nil {
+		s.admissionStartupHooks.BeforeSupportAssessment()
+	}
+	support := s.assessAdmissionSupportWithRetry(ctx, runtime)
+	if s.admissionStartupHooks.AfterSupportAssessment != nil {
+		s.admissionStartupHooks.AfterSupportAssessment(support)
+	}
+	if strictSupportAvailable(support) {
+		return support, nil
+	}
+	diagnostic := newAdmissionSupportDiagnostic(metadata, support.Assessment, support.Assessment.Class == custodian.SupportRetryable)
+	if support.Assessment.Class == custodian.SupportUnsafe {
+		diagnostic.FailStopped = true
+		if session != nil {
+			_ = session.FailStop(ctx, diagnostic.Error())
+		}
+		if s.safetyLatch != nil {
+			s.safetyLatch.Trip(diagnostic)
+		}
+	}
+	logAdmissionSupportDiagnostic(diagnostic)
+	if diagnostic.FailStopped {
+		return support, errors.Join(SafetyFailStopError{Reason: diagnostic}, diagnostic)
+	}
+	return support, diagnostic
+}
+
+func (s *Server) assessAdmissionSupportWithRetry(ctx context.Context, runtime *servedAdmissionRuntime) custodian.Support {
+	support := runtime.assessSupport(ctx)
+	assessment := normalizeAdmissionSupportAssessment(support)
+	support.Assessment = assessment
+	totalAttempts := admissionSupportAttemptCost(assessment)
+	cleanupSafe := assessment.CleanupSafe
+	for assessment.Class == custodian.SupportRetryable && totalAttempts < admissionSupportMaxAttempts {
+		if err := ctx.Err(); err != nil {
+			assessment = custodian.SupportAssessment{
+				Class:       custodian.SupportRetryable,
+				Cause:       errors.Join(assessment.Cause, err),
+				Attempts:    totalAttempts,
+				CleanupSafe: cleanupSafe,
+			}
+			support.Assessment = assessment
+			support.RuntimeProbeResult = assessment.Cause
+			support.Reason = assessment.Cause
+			return support
+		}
+		next := runtime.assessSupport(ctx)
+		nextAssessment := normalizeAdmissionSupportAssessment(next)
+		totalAttempts += admissionSupportAttemptCost(nextAssessment)
+		cleanupSafe = cleanupSafe && nextAssessment.CleanupSafe
+		nextAssessment.Attempts = totalAttempts
+		nextAssessment.CleanupSafe = cleanupSafe
+		next.Assessment = nextAssessment
+		if nextAssessment.Class == custodian.SupportAvailable {
+			next.RuntimeProbeResult = nil
+			next.Reason = nil
+		} else {
+			next.RuntimeProbeResult = nextAssessment.Cause
+			next.Reason = nextAssessment.Cause
+		}
+		support = next
+		assessment = nextAssessment
+	}
+	if support.Assessment.Class == custodian.SupportRetryable {
+		support.Assessment.Attempts = totalAttempts
+	}
+	return support
+}
+
+func normalizeAdmissionSupportAssessment(support custodian.Support) custodian.SupportAssessment {
+	assessment := support.Assessment
+	if assessment != (custodian.SupportAssessment{}) {
+		if assessment.Attempts == 0 && assessment.Class != custodian.SupportAvailable {
+			assessment.Attempts = 1
+		}
+		return assessment
+	}
+	if support.RuntimeProbePassed {
+		return custodian.SupportAssessment{Class: custodian.SupportAvailable, Attempts: 1, CleanupSafe: true}
+	}
+	cause := support.RuntimeProbeResult
+	if cause == nil {
+		cause = custodian.ErrSupervisorUnavailable
+	}
+	return custodian.SupportAssessment{Class: custodian.SupportUnsupported, Cause: cause, Attempts: 1, CleanupSafe: true}
+}
+
+func admissionSupportAttemptCost(assessment custodian.SupportAssessment) int {
+	if assessment.Attempts > 0 {
+		return assessment.Attempts
+	}
+	return 1
+}
+
+func strictSupportConfigured(support custodian.Support) bool {
+	return support.FeatureConfigured || support.FeatureAdvertised
+}
+
+func strictSupportAvailable(support custodian.Support) bool {
+	return support.Assessment.Class == custodian.SupportAvailable &&
+		support.RuntimeProbePassed &&
+		support.ParkedExec &&
+		support.VerifiedContainment
+}
+
+func logAdmissionSupportDiagnostic(err error) {
+	var diagnostic AdmissionSupportDiagnostic
+	if errors.As(err, &diagnostic) {
+		log.Printf("agentbus daemon: strict admission support diagnostic: class=%s attempts=%d cleanup_safe=%t retry_exhausted=%t fail_stopped=%t cause=%v", diagnostic.Assessment.Class, diagnostic.Assessment.Attempts, diagnostic.Assessment.CleanupSafe, diagnostic.RetryExhausted, diagnostic.FailStopped, diagnostic.Assessment.Cause)
+		return
+	}
+	if err != nil {
+		log.Printf("agentbus daemon: strict admission support diagnostic: %v", err)
+	}
 }
 
 func (s *Server) bootstrapAdmission(ctx context.Context) error {
@@ -164,7 +386,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		runtime = newServedAdmissionRuntime(s)
 		s.admissionRuntime = runtime
 	}
-	descriptors, err := s.probeAdmissionBackends(ctx, runtime)
+	descriptors, err := s.probeAdmissionBackends(ctx)
 	if err != nil {
 		return err
 	}
@@ -192,7 +414,69 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := recoverAdmissionBeforeReady(ctx, session, runtime.launchPort(), s.safetyLatch); err != nil {
+	metadata, err := session.RootMetadata(ctx)
+	if err != nil {
+		return err
+	}
+	if err := authority.ValidateAdmissionRootContract(metadata); err != nil {
+		return err
+	}
+	if s.admissionStartupHooks.AfterMetadataRead != nil {
+		s.admissionStartupHooks.AfterMetadataRead(metadata)
+	}
+
+	var support custodian.Support
+	if metadata.Activated {
+		if s.admissionStartupHooks.BeforeRecovery != nil {
+			s.admissionStartupHooks.BeforeRecovery()
+		}
+		if err := recoverAdmissionBeforeReady(ctx, session, runtime.launchPort(), s.safetyLatch); err != nil {
+			return err
+		}
+		if s.admissionStartupHooks.AfterRecovery != nil {
+			s.admissionStartupHooks.AfterRecovery()
+		}
+		support, err = s.requireActivatedAdmissionSupport(ctx, session, runtime, metadata)
+		if err != nil {
+			return err
+		}
+	} else {
+		support = runtime.assessSupport(ctx)
+		if strictSupportConfigured(support) {
+			support = s.assessAdmissionSupportWithRetry(ctx, runtime)
+			if !strictSupportAvailable(support) {
+				err := newAdmissionSupportDiagnostic(metadata, support.Assessment, support.Assessment.Class == custodian.SupportRetryable)
+				logAdmissionSupportDiagnostic(err)
+				return err
+			}
+			activated, _, err := session.ActivateRoot(ctx)
+			if err != nil {
+				return err
+			}
+			metadata = activated
+		}
+		if s.admissionStartupHooks.BeforeRecovery != nil {
+			s.admissionStartupHooks.BeforeRecovery()
+		}
+		if err := recoverAdmissionBeforeReady(ctx, session, runtime.launchPort(), s.safetyLatch); err != nil {
+			return err
+		}
+		if s.admissionStartupHooks.AfterRecovery != nil {
+			s.admissionStartupHooks.AfterRecovery()
+		}
+	}
+	if s.admissionStartupHooks.BeforePolicyInstall != nil {
+		s.admissionStartupHooks.BeforePolicyInstall()
+	}
+	policy := deriveServeAdmissionPolicy(metadata, support, descriptors)
+	if policy.Mode == AdmissionFatal {
+		if policy.Reason != nil {
+			logAdmissionSupportDiagnostic(policy.Reason)
+			return policy.Reason
+		}
+		return errors.New("admission policy is fatal")
+	}
+	if err := authority.ValidateAdmissionRootContract(metadata); err != nil {
 		return err
 	}
 	if err := s.reapKnownStores(); err != nil {
@@ -236,7 +520,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		runtime:      runtime,
 		epoch:        epoch,
 		descriptors:  cloneAdmissionBackendDescriptors(descriptors),
-		policy:       deriveServeAdmissionPolicy(runtime.support(), descriptors),
+		policy:       policy,
 		bootstrapper: bootstrapper,
 		ready:        ready,
 		coordinator:  coord,
@@ -377,7 +661,7 @@ func (s *Server) withAdmissionSubmission(fn func(*servedSubmissionCoordinator) e
 	return fn(submissionRef)
 }
 
-func (s *Server) probeAdmissionBackends(ctx context.Context, runtime *servedAdmissionRuntime) (map[string]admissionBackendDescriptor, error) {
+func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissionBackendDescriptor, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -402,7 +686,7 @@ func (s *Server) probeAdmissionBackends(ctx context.Context, runtime *servedAdmi
 				s.admissionUnprobeableBackends = make(map[string]error)
 			}
 			s.admissionUnprobeableBackends[name] = probeErr
-			descriptors[name] = s.admissionBackendDescriptor(name, backend, runtime, probeErr)
+			descriptors[name] = s.admissionBackendDescriptor(name, backend, probeErr)
 			continue
 		}
 		probed, err := probeable.ProbeBackend(ctx, runner)
@@ -421,7 +705,7 @@ func (s *Server) probeAdmissionBackends(ctx context.Context, runtime *servedAdmi
 				s.admissionUnprobeableBackends = make(map[string]error)
 			}
 			s.admissionUnprobeableBackends[name] = probeErr
-			descriptors[name] = s.admissionBackendDescriptor(name, backend, runtime, probeErr)
+			descriptors[name] = s.admissionBackendDescriptor(name, backend, probeErr)
 			continue
 		}
 		if probed == nil {
@@ -434,7 +718,7 @@ func (s *Server) probeAdmissionBackends(ctx context.Context, runtime *servedAdmi
 		if s.admissionUnprobeableBackends != nil {
 			delete(s.admissionUnprobeableBackends, name)
 		}
-		descriptors[name] = s.admissionBackendDescriptor(name, probed, runtime, nil)
+		descriptors[name] = s.admissionBackendDescriptor(name, probed, nil)
 	}
 	return descriptors, nil
 }
@@ -471,10 +755,10 @@ func sanitizeAdmissionProbeReason(message string) string {
 	return string(runes[:keep]) + suffix
 }
 
-func (s *Server) admissionBackendDescriptor(name string, backend engine.Backend, runtime *servedAdmissionRuntime, probeErr error) admissionBackendDescriptor {
+func (s *Server) admissionBackendDescriptor(name string, backend engine.Backend, probeErr error) admissionBackendDescriptor {
 	caps := model.ExecutionCapabilities{
 		ExternalRunner: admissionBackendExternalRunner(backend),
-		FencedLaunch:   runtime != nil && runtime.support().ParkedExec,
+		FencedLaunch:   false,
 	}
 	controlled := admissionBackendControlledRunner(backend)
 	fenceable := !caps.ExternalRunner && controlled && probeErr == nil
@@ -558,12 +842,14 @@ func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootst
 		_ = repo.Close()
 		return nil, nil, nil, err
 	}
-	anchor := &fileAuthorityAnchor{
-		path:        filepath.Join(s.stateRoot, admissionAnchorFile),
-		dbUUID:      dbUUID,
-		schemaMajor: schemaMajor,
-		latch:       s.safetyLatch,
-	}
+	anchor := authority.NewFileAnchor(
+		filepath.Join(s.stateRoot, admissionAnchorFile),
+		dbUUID,
+		schemaMajor,
+		authority.WithFileAnchorFailStopHook(func(reason string) {
+			s.safetyLatch.Trip(safetyFailStopReason(reason))
+		}),
+	)
 	options := []authority.BootstrapperOption{authority.WithAnchor(anchor)}
 	if s.admissionRuntime != nil {
 		options = append(options, authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
@@ -580,235 +866,8 @@ func recoverAdmissionBeforeReady(ctx context.Context, session *authority.Recover
 	return newAdmissionRecoveryExecutor(session, launchPort, latch).Recover(ctx)
 }
 
-type fileAuthorityAnchor struct {
-	mu          sync.Mutex
-	path        string
-	dbUUID      string
-	schemaMajor uint16
-	latch       *SafetyLatch
-}
-
-func (a *fileAuthorityAnchor) Begin(ctx context.Context, boot model.BootRef, generation uint64) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	if err := boot.Validate(); err != nil {
-		return "", err
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	snapshot, err := a.load()
-	if err != nil {
-		return "", err
-	}
-	if err := a.ensureIdentity(&snapshot, generation); err != nil {
-		return "", err
-	}
-	if snapshot.Generation < generation {
-		snapshot.Generation = generation
-	}
-	token := fmt.Sprintf("recovery-%s-%s-%d", boot.BootID, boot.OwnerID, generation)
-	snapshot.Phase = "reconciling"
-	snapshot.Boot = boot
-	snapshot.Token = token
-	snapshot.Reason = ""
-	if err := a.save(snapshot); err != nil {
-		return "", err
-	}
-	return token, nil
-}
-
-func (a *fileAuthorityAnchor) SealReady(ctx context.Context, boot model.BootRef, generation uint64) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	if err := boot.Validate(); err != nil {
-		return "", err
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	snapshot, err := a.load()
-	if err != nil {
-		return "", err
-	}
-	if err := a.requireIdentity(snapshot); err != nil {
-		return "", err
-	}
-	if snapshot.Generation != generation {
-		return "", authority.ErrStaleCapability
-	}
-	if snapshot.Phase == "fail_stopped" {
-		return "", authority.ErrFailStopped
-	}
-	token := fmt.Sprintf("ready-%s-%s-%d", boot.BootID, boot.OwnerID, generation)
-	snapshot.Phase = "ready"
-	snapshot.Boot = boot
-	snapshot.Token = token
-	snapshot.Reason = ""
-	if err := a.save(snapshot); err != nil {
-		return "", err
-	}
-	return token, nil
-}
-
-func (a *fileAuthorityAnchor) Advance(ctx context.Context, boot model.BootRef, generation uint64) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := boot.Validate(); err != nil {
-		return err
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	snapshot, err := a.load()
-	if err != nil {
-		return err
-	}
-	if err := a.requireIdentity(snapshot); err != nil {
-		return err
-	}
-	if snapshot.Phase == "fail_stopped" {
-		return authority.ErrFailStopped
-	}
-	if snapshot.Generation > generation {
-		return fmt.Errorf("%w: anchor generation %d is ahead of db generation %d", authority.ErrAnchorInvariant, snapshot.Generation, generation)
-	}
-	snapshot.Generation = generation
-	snapshot.Boot = boot
-	return a.save(snapshot)
-}
-
-func (a *fileAuthorityAnchor) FailStop(ctx context.Context, boot model.BootRef, reason string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := boot.Validate(); err != nil {
-		return err
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	snapshot, err := a.load()
-	if err != nil {
-		return err
-	}
-	if err := a.requireIdentity(snapshot); err != nil {
-		return err
-	}
-	snapshot.Phase = "fail_stopped"
-	snapshot.Boot = boot
-	snapshot.Reason = reason
-	if err := a.save(snapshot); err != nil {
-		return err
-	}
-	a.latch.Trip(safetyFailStopReason(reason))
-	return nil
-}
-
-func (a *fileAuthorityAnchor) VerifyReady(boot model.BootRef, token string, generation uint64) error {
-	return a.verify("ready", boot, token, generation)
-}
-
-func (a *fileAuthorityAnchor) VerifyRecovery(boot model.BootRef, token string, generation uint64) error {
-	return a.verify("reconciling", boot, token, generation)
-}
-
-func (a *fileAuthorityAnchor) verify(phase string, boot model.BootRef, token string, generation uint64) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	snapshot, err := a.load()
-	if err != nil {
-		return err
-	}
-	if err := a.requireIdentity(snapshot); err != nil {
-		return err
-	}
-	if snapshot.Phase == "fail_stopped" {
-		return authority.ErrFailStopped
-	}
-	if snapshot.Phase != phase || snapshot.Boot != boot || snapshot.Token != token || snapshot.Generation != generation {
-		return authority.ErrStaleCapability
-	}
-	return nil
-}
-
-func (a *fileAuthorityAnchor) load() (authority.AnchorSnapshot, error) {
-	raw, err := os.ReadFile(a.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return authority.AnchorSnapshot{}, nil
-	}
-	if err != nil {
-		return authority.AnchorSnapshot{}, err
-	}
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return authority.AnchorSnapshot{}, fmt.Errorf("%w: anchor is empty", authority.ErrAnchorInvariant)
-	}
-	var snapshot authority.AnchorSnapshot
-	if err := json.Unmarshal(raw, &snapshot); err != nil {
-		return authority.AnchorSnapshot{}, fmt.Errorf("%w: anchor is corrupt: %v", authority.ErrAnchorInvariant, err)
-	}
-	return snapshot, nil
-}
-
-func (a *fileAuthorityAnchor) save(snapshot authority.AnchorSnapshot) error {
-	raw, err := json.Marshal(snapshot)
-	if err != nil {
-		return err
-	}
-	raw = append(raw, '\n')
-	return atomicWriteDurable(a.path, raw, 0o600)
-}
-
-func (a *fileAuthorityAnchor) ensureIdentity(snapshot *authority.AnchorSnapshot, generation uint64) error {
-	if err := a.validateIdentity(); err != nil {
-		return err
-	}
-	if !snapshot.Initialized {
-		if generation != 0 {
-			return fmt.Errorf("%w: missing anchor for initialized db generation %d", authority.ErrAnchorInvariant, generation)
-		}
-		*snapshot = authority.AnchorSnapshot{
-			Initialized: true,
-			DBUUID:      a.dbUUID,
-			SchemaMajor: a.schemaMajor,
-			Generation:  generation,
-		}
-		return nil
-	}
-	if err := a.requireIdentity(*snapshot); err != nil {
-		return err
-	}
-	if snapshot.Generation > generation {
-		return fmt.Errorf("%w: anchor generation %d is ahead of db generation %d", authority.ErrAnchorInvariant, snapshot.Generation, generation)
-	}
-	return nil
-}
-
-func (a *fileAuthorityAnchor) requireIdentity(snapshot authority.AnchorSnapshot) error {
-	if err := a.validateIdentity(); err != nil {
-		return err
-	}
-	if !snapshot.Initialized {
-		return fmt.Errorf("%w: anchor is missing", authority.ErrAnchorInvariant)
-	}
-	if snapshot.DBUUID != a.dbUUID {
-		return fmt.Errorf("%w: db uuid mismatch", authority.ErrAnchorInvariant)
-	}
-	if snapshot.SchemaMajor != a.schemaMajor {
-		return fmt.Errorf("%w: schema major mismatch", authority.ErrAnchorInvariant)
-	}
-	return nil
-}
-
-func (a *fileAuthorityAnchor) validateIdentity() error {
-	if a.dbUUID == "" || a.schemaMajor == 0 {
-		return fmt.Errorf("%w: invalid anchor identity", authority.ErrAnchorInvariant)
-	}
-	return nil
+func recoverAdmissionBeforeReadyReport(ctx context.Context, session *authority.RecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) (AdmissionRecoveryReport, error) {
+	return newAdmissionRecoveryExecutor(session, launchPort, latch).RecoverReport(ctx)
 }
 
 type servedSubmissionCoordinator struct {
@@ -2038,6 +2097,22 @@ func (s *Server) strictRouteDisabledPrecheck() *protocol.ErrorObject {
 	return nil
 }
 
+func (s *Server) legacyAdmissionDowngradePrecheck() *protocol.ErrorObject {
+	s.admissionStateMu.RLock()
+	defer s.admissionStateMu.RUnlock()
+	instance := s.admissionInstance
+	if instance == nil || !instance.policy.RejectLegacySubmissions {
+		return nil
+	}
+	message := "activated admission root rejects legacy submissions"
+	return strictAdmissionProtocolError(
+		protocol.ErrorCapabilityMissing,
+		protocol.AdmissionRejectLegacyDowngrade,
+		message,
+		protocol.ErrorData{},
+	)
+}
+
 func strictAdmissionRuntimeUnavailableError(assessment custodian.SupportAssessment, data protocol.ErrorData) *protocol.ErrorObject {
 	data.RuntimeSupport = runtimeSupportAssessmentData(assessment)
 	message := "strict native runtime is unavailable"
@@ -2223,6 +2298,13 @@ func admissionProtocolError(err error) *protocol.ErrorObject {
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, authority.ErrRequestExpired):
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
+	case errors.Is(err, authority.ErrRootSealed):
+		return strictAdmissionProtocolError(
+			protocol.ErrorCapabilityMissing,
+			protocol.AdmissionRejectPermanentlySealed,
+			err.Error(),
+			protocol.ErrorData{},
+		)
 	case errors.Is(err, authority.ErrInvalidRequest):
 		// Served validates backend session metadata before authority ingress; remaining invalid requests are client-owned.
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})

@@ -19,59 +19,81 @@ type admissionRecoveryExecutor struct {
 	latch   *SafetyLatch
 }
 
+type AdmissionRecoveryReport struct {
+	Mode             string `json:"mode,omitempty"`
+	WorkItems        int    `json:"workItems"`
+	QuiescedLaunches int    `json:"quiescedLaunches"`
+	FinalizedJobs    int    `json:"finalizedJobs"`
+	RecoveryPasses   int    `json:"recoveryPasses"`
+}
+
 func newAdmissionRecoveryExecutor(session *authority.RecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) *admissionRecoveryExecutor {
 	return &admissionRecoveryExecutor{session: session, launch: launchPort, latch: latch}
 }
 
 func (e *admissionRecoveryExecutor) Recover(ctx context.Context) error {
+	_, err := e.RecoverReport(ctx)
+	return err
+}
+
+func (e *admissionRecoveryExecutor) RecoverReport(ctx context.Context) (AdmissionRecoveryReport, error) {
+	var report AdmissionRecoveryReport
 	if e == nil || e.session == nil {
-		return authority.ErrNotReady
+		return report, authority.ErrNotReady
 	}
 	if e.launch == nil {
-		return e.failClosed(custodian.ErrSupervisorUnavailable)
+		return report, e.failClosed(custodian.ErrSupervisorUnavailable)
 	}
 	for step := 0; step < admissionRecoveryMaxSteps; step++ {
+		report.RecoveryPasses++
 		items, err := e.session.WorkItems(ctx)
 		if err != nil {
-			return e.failClosed(err)
+			return report, e.failClosed(err)
 		}
 		if len(items) == 0 {
-			return nil
+			return report, nil
 		}
 		progressed := false
 		for _, item := range items {
-			if err := e.recoverItem(ctx, item); err != nil {
-				return e.failClosed(err)
+			report.WorkItems++
+			itemReport, err := e.recoverItem(ctx, item)
+			if err != nil {
+				return report, e.failClosed(err)
 			}
+			report.QuiescedLaunches += itemReport.QuiescedLaunches
+			report.FinalizedJobs += itemReport.FinalizedJobs
 			progressed = true
 		}
 		if !progressed {
-			return e.failClosed(fmt.Errorf("%w: startup recovery made no progress", authority.ErrRecoveryNeeded))
+			return report, e.failClosed(fmt.Errorf("%w: startup recovery made no progress", authority.ErrRecoveryNeeded))
 		}
 	}
-	return e.failClosed(fmt.Errorf("%w: startup recovery did not converge", authority.ErrRecoveryNeeded))
+	return report, e.failClosed(fmt.Errorf("%w: startup recovery did not converge", authority.ErrRecoveryNeeded))
 }
 
-func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.RecoveryWorkItem) error {
+func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.RecoveryWorkItem) (AdmissionRecoveryReport, error) {
 	current := item
+	var report AdmissionRecoveryReport
 	for step := 0; step < admissionRecoveryMaxSteps; step++ {
 		if err := current.Validate(); err != nil {
-			return fmt.Errorf("%w: invalid recovery work item: %v", authority.ErrRecoveryNeeded, err)
+			return report, fmt.Errorf("%w: invalid recovery work item: %v", authority.ErrRecoveryNeeded, err)
 		}
 		if len(current.Launches) == 0 {
 			if err := e.session.FinalizePlanned(ctx, current.Token); err != nil {
-				return fmt.Errorf("%w: finalize planned recovery for %s: %v", authority.ErrRecoveryNeeded, current.JobID, err)
+				return report, fmt.Errorf("%w: finalize planned recovery for %s: %v", authority.ErrRecoveryNeeded, current.JobID, err)
 			}
-			return nil
+			report.FinalizedJobs++
+			return report, nil
 		}
 
 		next, err := e.recoverLaunch(ctx, current, current.Launches[0])
 		if err != nil {
-			return err
+			return report, err
 		}
+		report.QuiescedLaunches++
 		current = next
 	}
-	return fmt.Errorf("%w: recovery item %s did not converge", authority.ErrRecoveryNeeded, item.JobID)
+	return report, fmt.Errorf("%w: recovery item %s did not converge", authority.ErrRecoveryNeeded, item.JobID)
 }
 
 func (e *admissionRecoveryExecutor) recoverLaunch(ctx context.Context, item model.RecoveryWorkItem, recoveryLaunch model.RecoveryLaunch) (model.RecoveryWorkItem, error) {

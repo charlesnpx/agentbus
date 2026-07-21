@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/execution/authority"
 )
 
 type testClock struct{ now time.Time }
@@ -174,6 +175,45 @@ func TestSetupDriftDetectionFailsLoudly(t *testing.T) {
 	}
 	if !strings.Contains(stdout, drift) {
 		t.Fatalf("drift was not loud in JSON output: %s", stdout)
+	}
+}
+
+func TestAdmissionCLIInspectResetAndSealFlags(t *testing.T) {
+	t.Parallel()
+	a := testApp(t)
+	root := filepath.Join(t.TempDir(), "admission-root")
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"admission", "reset-empty-root", "--state-root", root, "--json"}, "")
+	if code != 0 {
+		t.Fatalf("reset-empty-root exit = %d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	var reset authority.RootInspection
+	decodeJSON(t, stdout, &reset)
+	if reset.DomainUUID == "" || reset.Sealed || !reset.Counts.Empty() || reset.ActivationMetadata.Activated {
+		t.Fatalf("reset inspection = %+v", reset)
+	}
+
+	code, stdout, stderr = runTestCLI(t, a, []string{"admission", "inspect", "--state-root", root, "--json"}, "")
+	if code != 0 {
+		t.Fatalf("inspect exit = %d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	var inspected authority.RootInspection
+	decodeJSON(t, stdout, &inspected)
+	if inspected.DomainUUID != reset.DomainUUID || !inspected.Counts.Empty() {
+		t.Fatalf("inspect = %+v, reset = %+v", inspected, reset)
+	}
+
+	code, _, stderr = runTestCLI(t, a, []string{"admission", "seal", "--state-root", root}, "")
+	if code != 1 || !strings.Contains(stderr, authority.ErrSealConfirmationRequired.Error()) {
+		t.Fatalf("seal without flags exit=%d stderr=%s", code, stderr)
+	}
+
+	code, stdout, stderr = runTestCLI(t, a, []string{"admission", "--help"}, "")
+	if code != 0 {
+		t.Fatalf("admission help exit=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "Multi-root read/cancel/result routing is out of scope in this first release.") {
+		t.Fatalf("admission help missing limitation sentence: %s", stdout)
 	}
 }
 
