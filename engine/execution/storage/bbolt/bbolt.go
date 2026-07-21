@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -81,9 +82,16 @@ func Open(path string, options *bolt.Options) (*Repository, error) {
 	return repo, nil
 }
 
+// defaultOpenTimeout bounds how long NewRepository waits for the database
+// file lock. bbolt with nil options blocks INDEFINITELY on the flock, which
+// would let a replacement daemon hang silently in admission bootstrap while a
+// draining predecessor still holds the database. Fail closed with a typed
+// timeout error instead; the normal uncontended open is unaffected.
+const defaultOpenTimeout = 10 * time.Second
+
 // NewRepository opens or initializes a root bbolt repository database at path.
 func NewRepository(path string) (*Repository, error) {
-	return Open(path, nil)
+	return Open(path, &bolt.Options{Timeout: defaultOpenTimeout})
 }
 
 func (r *Repository) Close() error {

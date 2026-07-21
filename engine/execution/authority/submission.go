@@ -20,10 +20,6 @@ type SubmissionCoordinator interface {
 	// acknowledgement. Response success may later acknowledge/grant/release; a
 	// response write failure rejects and retires without granting.
 	PrepareLegacyFenced(context.Context, AcceptRequest) (LegacyFencedPreparation, error)
-
-	// SubmitLegacyUnfenced admits work that intentionally has no fenced launch
-	// custody. Routing to this mode must be chosen before acceptance.
-	SubmitLegacyUnfenced(context.Context, AcceptRequest) (AcceptResult, error)
 }
 
 // LegacyFencedPreparation captures the contract fact that LegacyFenced launch

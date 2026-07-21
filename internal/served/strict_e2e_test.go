@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -34,6 +35,21 @@ func TestProductionStrictServe(t *testing.T) {
 	}
 	stateRoot := t.TempDir()
 	cwd := t.TempDir()
+
+	// Serve bootstrap probes strict backends before listening. Give the
+	// default composition a PROBEABLE codex (fixture on PATH answering
+	// --version at the minimum known-good version) so the strict submit
+	// below travels PAST backend fenceability and is rejected by the thing
+	// this gate exists to observe: the unavailable native runtime. Without
+	// a probeable binary the rejection cause would be unfenceable_backend —
+	// an environment artifact, not the boundary under test.
+	binDir := t.TempDir()
+	fakeCodex := filepath.Join(binDir, "codex")
+	script := "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"codex-cli " + codexcli.MinimumKnownGoodVersion + "\"; exit 0; fi\nif [ \"$1\" = \"--help\" ]; then echo \"codex help\"; exit 0; fi\nexit 0\n"
+	if err := os.WriteFile(fakeCodex, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	server, err := New(Config{
 		StateRoot: stateRoot,
@@ -83,9 +99,8 @@ func TestProductionStrictServe(t *testing.T) {
 	if !slices.Contains(hello.Backends, "codex") {
 		t.Fatalf("default production Serve did not advertise the codex backend: %v", hello.Backends)
 	}
-	// Pre-R4B, admission bootstrap is coupled to jobs.requestId (server.go gates it
-	// on jobsRequestIDEnabled, which New leaves false by default). It must not be
-	// advertised in the default composition.
+	// jobs.requestId stays unadvertised in the default composition; strict
+	// identified admission is no longer gated by this legacy capability flag.
 	if hello.Capabilities["jobs.requestId"] {
 		t.Fatal("jobs.requestId capability is unexpectedly advertised by the default composition")
 	}
@@ -93,15 +108,10 @@ func TestProductionStrictServe(t *testing.T) {
 	// RED baseline: the default production composition does NOT accept a strict
 	// identified submission.
 	//
-	// HONEST SCOPE (do not over-claim): at this tree state the rejection fires at
-	// the jobs.requestId capability gate (handleIdentifiedJobSubmit), which is
-	// UPSTREAM of native-runtime construction/probing. This gate therefore proves
-	// "strict admission is unavailable in the default composition" — it proves
-	// NOTHING about the native runtime yet, because that code never executes.
+	// Current meaning: the strict route exists; rejection is now caused by the
+	// unavailable native runtime in the real default Serve composition, not by
+	// the legacy jobs.requestId capability gate.
 	//
-	// TODO(R4B): once admission is decoupled from jobs.requestId, strengthen this
-	//   to assert the rejection cause is the UNAVAILABLE NATIVE RUNTIME (not the
-	//   request-id gate), and only then track a native-runtime-specific sentinel.
 	// TODO(R7B): flip to GREEN — assert the real strict identified job launches,
 	//   completes, and is independently proven contained.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -120,7 +130,7 @@ func TestProductionStrictServe(t *testing.T) {
 		t.Fatal("strict identified job unexpectedly submitted by the default composition")
 	}
 	assertProductionStrictUnavailable(t, err)
-	t.Log("strict_admission_unavailable")
+	t.Log("strict_admission_native_runtime_unavailable")
 }
 
 func connectProductionStrictClient(t *testing.T, stateRoot string, serveDone <-chan error) *agentclient.Client {
@@ -159,7 +169,16 @@ func assertProductionStrictUnavailable(t *testing.T, err error) {
 	if rpcErr.Object.Data.Code != protocol.ErrorCapabilityMissing {
 		t.Fatalf("strict identified submit code = %q message = %q, want %q", rpcErr.Object.Data.Code, rpcErr.Object.Message, protocol.ErrorCapabilityMissing)
 	}
-	if !strings.Contains(rpcErr.Object.Message, "jobs.requestId capability is disabled") {
-		t.Fatalf("strict identified submit message = %q, want production strict admission unavailable", rpcErr.Object.Message)
+	if rpcErr.Object.Data.AdmissionCause != protocol.AdmissionRejectUnavailableNativeRuntime {
+		t.Fatalf("strict identified submit admission cause = %q message = %q, want %q", rpcErr.Object.Data.AdmissionCause, rpcErr.Object.Message, protocol.AdmissionRejectUnavailableNativeRuntime)
+	}
+	if rpcErr.Object.Data.RuntimeSupport == nil {
+		t.Fatalf("strict identified submit runtime support = nil, want unavailable native runtime support assessment")
+	}
+	if rpcErr.Object.Data.RuntimeSupport.Class == "" || rpcErr.Object.Data.RuntimeSupport.Class == "available" {
+		t.Fatalf("strict identified submit runtime support = %+v, want non-available native runtime", rpcErr.Object.Data.RuntimeSupport)
+	}
+	if strings.Contains(rpcErr.Object.Message, "jobs.requestId capability is disabled") {
+		t.Fatalf("strict identified submit message = %q, want native-runtime rejection not jobs.requestId gate", rpcErr.Object.Message)
 	}
 }

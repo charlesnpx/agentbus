@@ -139,6 +139,7 @@ type Server struct {
 	admissionOwnedWorkChecker    admissionOwnedWorkChecker
 	admissionSubmission          *servedSubmissionCoordinator
 	admissionRuntime             *servedAdmissionRuntime
+	admissionInstance            *admissionInstance
 	admissionRuntimeFactory      func(*Server) *servedAdmissionRuntime
 	admissionRuntimeConfig       custodian.Runtime
 	admissionProbeRunner         command.ProbeRunner
@@ -388,21 +389,15 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err := s.captureBinaryIdentity(); err != nil {
 		return err
 	}
-	if s.jobsRequestIDEnabled {
-		if err := s.bootstrapAdmission(ctx); err != nil {
-			if errors.Is(err, authority.ErrFailStopped) {
-				s.safetyLatch.Trip(err)
-				return s.safetyFailStopErr()
-			}
-			return err
+	if err := s.bootstrapAdmission(ctx); err != nil {
+		if errors.Is(err, authority.ErrFailStopped) {
+			s.safetyLatch.Trip(err)
+			return s.safetyFailStopErr()
 		}
-		if s.admissionClose != nil {
-			defer s.admissionClose.Close()
-		}
-	} else {
-		if err := s.reapKnownStores(); err != nil {
-			return err
-		}
+		return err
+	}
+	if s.admissionClose != nil {
+		defer s.admissionClose.Close()
 	}
 	listen := s.listen
 	if s.listenerFactory != nil {
@@ -1289,6 +1284,17 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	if errObj := s.failStoppedRequestError(protocol.MethodJobSubmit); errObj != nil {
 		return requestOutcome{err: errObj}
 	}
+	strictByRaw, identityErr := strictIdentityPrecheck(raw)
+	if identityErr != nil {
+		return requestOutcome{err: identityErr}
+	}
+	if strictByRaw {
+		params, errObj := looseStrictJobSubmitParams(raw)
+		if errObj != nil {
+			return requestOutcome{err: errObj}
+		}
+		return s.handleIdentifiedJobSubmit(ctx, raw, params)
+	}
 	var params protocol.JobSubmitParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
@@ -1304,6 +1310,62 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 		return requestOutcome{err: errObj}
 	}
 	return s.handleLegacyJobSubmit(ctx, params)
+}
+
+func looseStrictJobSubmitParams(raw json.RawMessage) (protocol.JobSubmitParams, *protocol.ErrorObject) {
+	var params protocol.JobSubmitParams
+	if err := json.Unmarshal(raw, &params); err == nil {
+		return params, nil
+	}
+	var minimal struct {
+		WorkspaceKey string `json:"workspaceKey"`
+		RequestID    string `json:"requestId"`
+		TaskSpec     struct {
+			Backend string `json:"backend"`
+		} `json:"taskSpec"`
+	}
+	if err := json.Unmarshal(raw, &minimal); err != nil {
+		return protocol.JobSubmitParams{}, strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{})
+	}
+	params.WorkspaceKey = minimal.WorkspaceKey
+	params.RequestID = minimal.RequestID
+	params.TaskSpec.Backend = minimal.TaskSpec.Backend
+	return params, nil
+}
+
+func strictIdentityPrecheck(raw json.RawMessage) (bool, *protocol.ErrorObject) {
+	workspaceKeyPresent, err := jsonFieldPresent(raw, "workspaceKey")
+	if err != nil {
+		return false, protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
+	}
+	requestIDPresent, err := jsonFieldPresent(raw, "requestId")
+	if err != nil {
+		return false, protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
+	}
+	if !workspaceKeyPresent && !requestIDPresent {
+		return false, nil
+	}
+	var identity struct {
+		WorkspaceKey string `json:"workspaceKey"`
+		RequestID    string `json:"requestId"`
+	}
+	if err := json.Unmarshal(raw, &identity); err != nil {
+		return true, strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectMissingIdentity,
+			err.Error(),
+			protocol.ErrorData{},
+		)
+	}
+	if _, err := model.NewRequestKey(identity.WorkspaceKey, identity.RequestID); err != nil {
+		return true, strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectMissingIdentity,
+			err.Error(),
+			protocol.ErrorData{},
+		)
+	}
+	return true, nil
 }
 
 func (s *Server) handleLegacyJobSubmit(ctx context.Context, params protocol.JobSubmitParams) requestOutcome {

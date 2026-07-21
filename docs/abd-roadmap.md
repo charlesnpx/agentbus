@@ -284,6 +284,34 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
+- 2026-07-21 R4B LANDED (this commit): identified production composition + R0T gate strengthening.
+  Worker (codex runtime, 15min round): per-Serve `admissionInstance` (immutable, constructed at
+  bootstrap before listen: qualified runtime + probed descriptors + authority + coordinator/launch
+  ports); immutable `ServeAdmissionPolicy` derived once; admission bootstrap DECOUPLED from
+  jobs.requestId (flag stays unadvertised, no longer gates admission); strict identified route with
+  ordered typed rejection taxonomy — strict_route_disabled / missing_identity(invalid_task_spec) /
+  unsupported_backend(backend_unavailable) / unfenceable_backend(capability_missing) /
+  invalid_strict_config(invalid_task_spec) / unavailable_native_runtime(capability_missing +
+  RuntimeSupport assessment); reject-before-mutation proven by marker tests; response-loss replay
+  (accepted obligation survives failed response; same-request-key replay returns same job); legacy
+  fallback routing DELETED (SubmitLegacyUnfenced removed); default composition unchanged.
+  R0T GATE STRENGTHENED (retires the R0T review's "different error masks the boundary" concern):
+  strict E2E now asserts typed AdmissionCause == unavailable_native_runtime + non-available
+  RuntimeSupport in the error data + NEGATIVE assert that the old jobs.requestId message is gone;
+  NEW sentinel `strict_admission_native_runtime_unavailable` (old sentinel retired with the old
+  gate meaning). Gate harness installs a PROBEABLE fake codex on PATH (S5A masquerade precedent) so
+  rejection reaches the runtime boundary, not a missing-binary artifact.
+  Orchestrator repairs (flagged for review; Docker R0T tier caught #1-#2, solo-battery triage
+  #3-#5): (1) backend-specific probe failure is NOT Serve-fatal — recorded unfenceable + rejected
+  pre-accept (fix2 H1 semantics; one missing binary must not kill the daemon; ctx errors stay
+  fatal) + regression test TestServeBootstrapRecordsProbeFailureUnfenceableWithoutFailingClosed;
+  (2) the e2e fake-codex fixture above; (3) PRODUCTION: bboltrepo opens with a bounded 10s flock
+  timeout — nil options block indefinitely and a replacement daemon in the stale-binary handover
+  could hang silently in admission bootstrap while its predecessor drains; (4) stopTestServer join
+  1s→5s; (5) waitForSocket 1s→5s (Serve now bootstraps admission before listening; positive waits).
+  Verification: macOS build/vet/gofmt + 3x -race sweeps + full suite clean (solo battery; a
+  cross-load 6-failure cluster was proven to be concurrent-Docker artifacts); Docker conformance/
+  full/race green + NEW R0T sentinel held. Next: sol refute-first review bound to this commit.
 - 2026-07-21 R4A CLOSED. Re-review on 2a18d37: SHIP, findings NONE, closure table all-CLOSED
   (H1..L3 + orchestrator repairs R1..R3, each with file:line evidence). R4A totals: 2 commits
   (aea857e, 2a18d37), 2 worker rounds (1 stall caught by doom-signal sentinel at ~11min +

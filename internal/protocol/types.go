@@ -43,6 +43,15 @@ const (
 )
 
 const (
+	AdmissionRejectMissingIdentity          = "missing_identity"
+	AdmissionRejectUnsupportedBackend       = "unsupported_backend"
+	AdmissionRejectUnfenceableBackend       = "unfenceable_backend"
+	AdmissionRejectInvalidStrictConfig      = "invalid_strict_config"
+	AdmissionRejectUnavailableNativeRuntime = "unavailable_native_runtime"
+	AdmissionRejectStrictRouteDisabled      = "strict_route_disabled"
+)
+
+const (
 	DefaultTimeout = 30 * time.Minute
 	MaxTimeout     = 4 * time.Hour
 )
@@ -79,11 +88,23 @@ type ErrorObject struct {
 
 // ErrorData carries the stable protocol v1 error identifier and optional context.
 type ErrorData struct {
-	Code                  string `json:"code"`
-	SessionID             string `json:"sessionId,omitempty"`
-	JobID                 string `json:"jobId,omitempty"`
-	TurnID                string `json:"turnId,omitempty"`
-	ServerProtocolVersion int    `json:"serverProtocolVersion,omitempty"`
+	Code                  string                        `json:"code"`
+	SessionID             string                        `json:"sessionId,omitempty"`
+	JobID                 string                        `json:"jobId,omitempty"`
+	TurnID                string                        `json:"turnId,omitempty"`
+	Backend               string                        `json:"backend,omitempty"`
+	AdmissionCause        string                        `json:"admissionCause,omitempty"`
+	RuntimeSupport        *RuntimeSupportAssessmentData `json:"runtimeSupport,omitempty"`
+	ServerProtocolVersion int                           `json:"serverProtocolVersion,omitempty"`
+}
+
+// RuntimeSupportAssessmentData is the wire-safe form of the strict native
+// runtime support assessment carried on admission runtime rejections.
+type RuntimeSupportAssessmentData struct {
+	Class       string `json:"class"`
+	Cause       string `json:"cause,omitempty"`
+	Attempts    int    `json:"attempts"`
+	CleanupSafe bool   `json:"cleanupSafe"`
 }
 
 // RPCError is returned by typed clients when a JSON-RPC error response arrives.

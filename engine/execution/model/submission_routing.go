@@ -20,29 +20,11 @@ func (err IncompatibleExecutionCapabilitiesError) Is(target error) bool {
 	return target == ErrIncompatibleExecutionCapabilities
 }
 
-// ExecutionCapabilities are the pre-accept facts used to choose a submission
-// mode. External runners lack durable task identity in this contract; fenced
-// external runners therefore use LegacyFenced, while unfenced external runners
-// are explicitly LegacyUnfenced. A built-in backend without fenced launch is
-// rejected before acceptance because it must not create an identified job that
-// cannot be custodian-fenced.
+// ExecutionCapabilities are strict-admission pre-accept facts. They are derived
+// during Serve bootstrap and consumed together with backend controlled-runner
+// facts and runtime support; strict identified admission must reject incompatible
+// capabilities before acceptance rather than routing to a legacy mode.
 type ExecutionCapabilities struct {
 	ExternalRunner bool
 	FencedLaunch   bool
-}
-
-func RouteSubmissionMode(caps ExecutionCapabilities) (Mode, error) {
-	switch {
-	case !caps.ExternalRunner && caps.FencedLaunch:
-		return ModeIdentifiedFenced, nil
-	case caps.ExternalRunner && caps.FencedLaunch:
-		return ModeLegacyFenced, nil
-	case caps.ExternalRunner && !caps.FencedLaunch:
-		return ModeLegacyUnfenced, nil
-	default:
-		return 0, IncompatibleExecutionCapabilitiesError{
-			Capabilities: caps,
-			Reason:       "built-in identified admission requires fenced launch before acceptance",
-		}
-	}
 }

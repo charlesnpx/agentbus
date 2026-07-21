@@ -169,6 +169,12 @@ func TestServedNativeConformanceProductionDefaultsUnavailableAndGateOff(t *testi
 	if support.ParkedExec || support.VerifiedContainment || !errors.Is(support.Reason, custodian.ErrSupervisorUnavailable) {
 		t.Fatalf("production runtime support = %+v, want unavailable supervisor", support)
 	}
+	if err := server.bootstrapAdmission(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if server.jobsRequestIDEnabled {
+		t.Fatal("jobsRequestIDEnabled changed to true after default bootstrap")
+	}
 
 	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
 		WorkspaceKey: "workspace-production-gate-off",
@@ -182,6 +188,9 @@ func TestServedNativeConformanceProductionDefaultsUnavailableAndGateOff(t *testi
 	}))
 	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorCapabilityMissing {
 		t.Fatalf("identified submit with production gate off = result:%+v err:%+v, want capability_missing", outcome.result, outcome.err)
+	}
+	if outcome.err.Data.AdmissionCause != protocol.AdmissionRejectUnavailableNativeRuntime {
+		t.Fatalf("identified submit admission cause = %q, want %q", outcome.err.Data.AdmissionCause, protocol.AdmissionRejectUnavailableNativeRuntime)
 	}
 }
 
@@ -394,7 +403,6 @@ func servedNativeTestBinaryPath(t *testing.T) string {
 }
 
 func enableServedNativeRuntime(server *Server, runtimeBundle custodian.Runtime) {
-	server.jobsRequestIDEnabled = true
 	server.admissionRuntimeFactory = func(*Server) *servedAdmissionRuntime {
 		return &servedAdmissionRuntime{
 			runtime: runtimeBundle,

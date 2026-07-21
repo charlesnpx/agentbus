@@ -44,20 +44,100 @@ type admissionProbeableBackend interface {
 	ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error)
 }
 
+type admissionInstance struct {
+	runtime     *servedAdmissionRuntime
+	descriptors map[string]admissionBackendDescriptor
+	policy      ServeAdmissionPolicy
+
+	bootstrapper *admissionBootstrapper
+	ready        *admissionReady
+	coordinator  *admissionCoordinator
+	submission   *servedSubmissionCoordinator
+	repository   repository.Repository
+	close        io.Closer
+}
+
+func (instance *admissionInstance) descriptor(name string) (admissionBackendDescriptor, bool) {
+	if instance == nil || instance.descriptors == nil {
+		return admissionBackendDescriptor{}, false
+	}
+	descriptor, ok := instance.descriptors[name]
+	return descriptor, ok
+}
+
+type admissionBackendDescriptor struct {
+	name             string
+	backend          engine.Backend
+	probeError       error
+	capabilities     model.ExecutionCapabilities
+	controlledRunner bool
+	fenceable        bool
+	unfenceableCause string
+}
+
+// ServeAdmissionPolicy is the immutable strict-admission policy derived during
+// Serve bootstrap from the qualified runtime and probed backend descriptors.
+type ServeAdmissionPolicy struct {
+	strictRouteEnabled        bool
+	strictRouteDisabledReason string
+	runtimeSupport            custodian.Support
+	runtimeAssessment         custodian.SupportAssessment
+	backends                  map[string]ServeBackendFenceability
+}
+
+type ServeBackendFenceability struct {
+	Backend          string
+	Capabilities     model.ExecutionCapabilities
+	ControlledRunner bool
+	Fenceable        bool
+	Reason           string
+}
+
+func deriveServeAdmissionPolicy(runtimeSupport custodian.Support, descriptors map[string]admissionBackendDescriptor) ServeAdmissionPolicy {
+	policy := ServeAdmissionPolicy{
+		strictRouteEnabled: true,
+		runtimeSupport:     runtimeSupport,
+		runtimeAssessment:  runtimeSupport.Assessment,
+		backends:           make(map[string]ServeBackendFenceability, len(descriptors)),
+	}
+	for name, descriptor := range descriptors {
+		policy.backends[name] = ServeBackendFenceability{
+			Backend:          name,
+			Capabilities:     descriptor.capabilities,
+			ControlledRunner: descriptor.controlledRunner,
+			Fenceable:        descriptor.fenceable,
+			Reason:           descriptor.unfenceableCause,
+		}
+	}
+	return policy
+}
+
+func (policy ServeAdmissionPolicy) backendFenceability(name string) (ServeBackendFenceability, bool) {
+	if policy.backends == nil {
+		return ServeBackendFenceability{}, false
+	}
+	fenceability, ok := policy.backends[name]
+	return fenceability, ok
+}
+
+func (policy ServeAdmissionPolicy) strictRuntimeAvailable() bool {
+	return policy.runtimeAssessment.Class == custodian.SupportAvailable &&
+		policy.runtimeSupport.RuntimeProbePassed &&
+		policy.runtimeSupport.ParkedExec &&
+		policy.runtimeSupport.VerifiedContainment
+}
+
 func (s *Server) bootstrapAdmission(ctx context.Context) error {
+	if s.admissionInstance != nil {
+		return nil
+	}
 	runtime := s.admissionRuntime
 	if runtime == nil {
 		runtime = newServedAdmissionRuntime(s)
 		s.admissionRuntime = runtime
 	}
-	if err := runtime.verifiedContainmentSupported(ctx); err != nil {
-		s.jobsRequestIDEnabled = false
-		return err
-	}
-	if s.admissionReady != nil && s.admissionCoordinator != nil {
-		return nil
-	}
-	if err := s.probeAdmissionBackends(ctx); err != nil {
+	descriptors, err := s.probeAdmissionBackends(ctx, runtime)
+	if err != nil {
 		return err
 	}
 
@@ -122,13 +202,24 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	s.admissionRuntime = runtime
 	s.admissionRepository = repo
 	s.admissionClose = closer
+	s.admissionInstance = &admissionInstance{
+		runtime:      runtime,
+		descriptors:  cloneAdmissionBackendDescriptors(descriptors),
+		policy:       deriveServeAdmissionPolicy(runtime.support(), descriptors),
+		bootstrapper: bootstrapper,
+		ready:        ready,
+		coordinator:  coord,
+		submission:   submission,
+		repository:   repo,
+		close:        closer,
+	}
 	closeOnErr = false
 	return nil
 }
 
-func (s *Server) probeAdmissionBackends(ctx context.Context) error {
+func (s *Server) probeAdmissionBackends(ctx context.Context, runtime *servedAdmissionRuntime) (map[string]admissionBackendDescriptor, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	runner := s.admissionProbeRunner
 	if runner == nil {
@@ -139,34 +230,91 @@ func (s *Server) probeAdmissionBackends(ctx context.Context) error {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	descriptors := make(map[string]admissionBackendDescriptor, len(names))
 	for _, name := range names {
 		backend := s.backends[name]
 		probeable, ok := backend.(admissionProbeableBackend)
 		if !ok {
+			probeErr := model.IncompatibleExecutionCapabilitiesError{
+				Reason: "strict backend does not implement ProbeBackend; admission cannot verify command-runner capabilities",
+			}
 			if s.admissionUnprobeableBackends == nil {
 				s.admissionUnprobeableBackends = make(map[string]error)
 			}
-			s.admissionUnprobeableBackends[name] = model.IncompatibleExecutionCapabilitiesError{
-				Reason: "strict backend does not implement ProbeBackend; admission cannot verify command-runner capabilities",
-			}
+			s.admissionUnprobeableBackends[name] = probeErr
+			descriptors[name] = s.admissionBackendDescriptor(name, backend, runtime, probeErr)
 			continue
 		}
 		probed, err := probeable.ProbeBackend(ctx, runner)
 		if err != nil {
-			return fmt.Errorf("probe strict backend %s: %w", name, err)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("probe strict backend %s: %w", name, err)
+			}
+			// An environment-specific probe failure (missing binary,
+			// below-minimum version) must not kill the daemon: record the
+			// backend unfenceable so strict identified admission rejects it
+			// pre-accept — the same fail-closed treatment as a backend that
+			// does not implement ProbeBackend at all. Other backends and
+			// legacy traffic keep serving.
+			probeErr := fmt.Errorf("probe strict backend %s: %w", name, err)
+			if s.admissionUnprobeableBackends == nil {
+				s.admissionUnprobeableBackends = make(map[string]error)
+			}
+			s.admissionUnprobeableBackends[name] = probeErr
+			descriptors[name] = s.admissionBackendDescriptor(name, backend, runtime, probeErr)
+			continue
 		}
 		if probed == nil {
-			return fmt.Errorf("probe strict backend %s: nil probed backend", name)
+			return nil, fmt.Errorf("probe strict backend %s: nil probed backend", name)
 		}
 		if probed.Name() != name {
-			return fmt.Errorf("probe strict backend %s: probed backend changed name to %s", name, probed.Name())
+			return nil, fmt.Errorf("probe strict backend %s: probed backend changed name to %s", name, probed.Name())
 		}
 		s.backends[name] = probed
 		if s.admissionUnprobeableBackends != nil {
 			delete(s.admissionUnprobeableBackends, name)
 		}
+		descriptors[name] = s.admissionBackendDescriptor(name, probed, runtime, nil)
 	}
-	return nil
+	return descriptors, nil
+}
+
+func (s *Server) admissionBackendDescriptor(name string, backend engine.Backend, runtime *servedAdmissionRuntime, probeErr error) admissionBackendDescriptor {
+	caps := model.ExecutionCapabilities{
+		ExternalRunner: admissionBackendExternalRunner(backend),
+		FencedLaunch:   runtime != nil && runtime.support().ParkedExec,
+	}
+	controlled := admissionBackendControlledRunner(backend)
+	fenceable := !caps.ExternalRunner && controlled && probeErr == nil
+	reason := ""
+	switch {
+	case probeErr != nil:
+		reason = probeErr.Error()
+	case caps.ExternalRunner:
+		reason = "strict identified admission requires an in-process backend runner"
+	case !controlled:
+		reason = "identified fenced admission requires a controlled command runner before acceptance"
+	}
+	return admissionBackendDescriptor{
+		name:             name,
+		backend:          backend,
+		probeError:       probeErr,
+		capabilities:     caps,
+		controlledRunner: controlled,
+		fenceable:        fenceable,
+		unfenceableCause: reason,
+	}
+}
+
+func cloneAdmissionBackendDescriptors(src map[string]admissionBackendDescriptor) map[string]admissionBackendDescriptor {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]admissionBackendDescriptor, len(src))
+	for name, descriptor := range src {
+		dst[name] = descriptor
+	}
+	return dst
 }
 
 func (s *Server) admissionDaemonBoot() (model.BootRef, error) {
@@ -488,20 +636,6 @@ type admissionControlledRunnerBackend interface {
 	AdmissionControlledRunner() bool
 }
 
-func (s *Server) admissionExecutionCapabilities(backend engine.Backend) model.ExecutionCapabilities {
-	return model.ExecutionCapabilities{
-		ExternalRunner: admissionBackendExternalRunner(backend),
-		FencedLaunch:   s.admissionRuntime != nil && s.admissionRuntime.support().ParkedExec,
-	}
-}
-
-func (s *Server) admissionBackendProbeError(name string) error {
-	if s == nil || s.admissionUnprobeableBackends == nil {
-		return nil
-	}
-	return s.admissionUnprobeableBackends[name]
-}
-
 func admissionBackendExternalRunner(backend engine.Backend) bool {
 	if backend == nil {
 		return true
@@ -550,18 +684,6 @@ func (s *Server) admissionTurnEvents(ctx context.Context, run jobRun, input engi
 	return session.TurnWithRunner(ctx, input, runner)
 }
 
-func (c *servedSubmissionCoordinator) SubmitRoutedIdentified(ctx context.Context, request authority.AcceptRequest, caps model.ExecutionCapabilities) (authority.AcceptResult, error) {
-	mode, err := model.RouteSubmissionMode(caps)
-	if err != nil {
-		return authority.AcceptResult{}, err
-	}
-	if mode != model.ModeIdentifiedFenced {
-		return authority.AcceptResult{}, fmt.Errorf("%w: routed mode %s is outside identified fenced submit", authority.ErrInvalidRequest, mode)
-	}
-	request.Mode = mode
-	return c.SubmitIdentified(ctx, request)
-}
-
 func (c *servedSubmissionCoordinator) SubmitIdentified(ctx context.Context, request authority.AcceptRequest) (authority.AcceptResult, error) {
 	if c == nil || c.ready == nil {
 		return authority.AcceptResult{}, authority.ErrNotReady
@@ -590,14 +712,6 @@ func (c *servedSubmissionCoordinator) PrepareLegacyFenced(ctx context.Context, r
 		Admission: accepted,
 		Ordinal:   model.LaunchOrdinalOne,
 	}, nil
-}
-
-func (c *servedSubmissionCoordinator) SubmitLegacyUnfenced(ctx context.Context, request authority.AcceptRequest) (authority.AcceptResult, error) {
-	if c == nil || c.ready == nil {
-		return authority.AcceptResult{}, authority.ErrNotReady
-	}
-	request.Mode = model.ModeLegacyUnfenced
-	return c.ready.Accept(ctx, request)
 }
 
 func (c *servedSubmissionCoordinator) LaunchRunner(binding admissionLaunchBinding, ordinal model.LaunchOrdinal) (command.Runner, error) {
@@ -1442,84 +1556,106 @@ func jsonFieldPresent(raw json.RawMessage, field string) (bool, error) {
 }
 
 func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMessage, params protocol.JobSubmitParams) requestOutcome {
-	if !s.jobsRequestIDEnabled {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorCapabilityMissing, "jobs.requestId capability is disabled", protocol.ErrorData{})}
-	}
-	if s.admissionCoordinator == nil || s.admissionReady == nil || s.admissionSubmission == nil || s.admissionRuntime == nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorCapabilityMissing, "admission authority is not ready", protocol.ErrorData{})}
-	}
-	if err := s.admissionRuntime.verifiedContainmentSupported(ctx); err != nil {
-		return requestOutcome{err: admissionProtocolError(err)}
+	instance := s.admissionInstance
+	if instance == nil || !instance.policy.strictRouteEnabled || instance.ready == nil || instance.submission == nil {
+		reason := "admission authority is not ready"
+		if instance != nil && instance.policy.strictRouteDisabledReason != "" {
+			reason = instance.policy.strictRouteDisabledReason
+		}
+		return requestOutcome{err: strictAdmissionProtocolError(
+			protocol.ErrorCapabilityMissing,
+			protocol.AdmissionRejectStrictRouteDisabled,
+			reason,
+			protocol.ErrorData{},
+		)}
 	}
 
 	requestKey, err := model.NewRequestKey(params.WorkspaceKey, params.RequestID)
 	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
-	}
-	rawTaskSpec, err := rawTaskSpecFromSubmitParams(raw)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
-	}
-	taskIdentity, err := model.TaskIdentityFromRawTaskSpec(rawTaskSpec)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+		return requestOutcome{err: strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectMissingIdentity,
+			err.Error(),
+			protocol.ErrorData{},
+		)}
 	}
 
-	if errObj := validateTaskSpecEnvelope(raw); errObj != nil {
-		return requestOutcome{err: errObj}
-	}
 	spec := params.TaskSpec
+	var descriptor admissionBackendDescriptor
+	if spec.Backend != "" {
+		var ok bool
+		descriptor, ok = instance.descriptor(spec.Backend)
+		if !ok {
+			return requestOutcome{err: strictAdmissionProtocolError(
+				protocol.ErrorBackendUnavailable,
+				protocol.AdmissionRejectUnsupportedBackend,
+				"backend is unavailable",
+				protocol.ErrorData{Backend: spec.Backend},
+			)}
+		}
+		fenceability, _ := instance.policy.backendFenceability(spec.Backend)
+		if !fenceability.Fenceable {
+			message := fenceability.Reason
+			if message == "" {
+				message = "backend is not fenceable for strict identified admission"
+			}
+			return requestOutcome{err: strictAdmissionProtocolError(
+				protocol.ErrorCapabilityMissing,
+				protocol.AdmissionRejectUnfenceableBackend,
+				message,
+				protocol.ErrorData{Backend: spec.Backend},
+			)}
+		}
+	}
+
+	var strictParams protocol.JobSubmitParams
+	if err := decodeStrict(raw, &strictParams); err != nil {
+		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{Backend: spec.Backend})}
+	}
+	params = strictParams
+	spec = params.TaskSpec
+	if errObj := validateTaskSpecEnvelope(raw); errObj != nil {
+		return requestOutcome{err: strictAdmissionInvalidConfigError(errObj.Message, protocol.ErrorData{Backend: spec.Backend})}
+	}
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{})}
+		return requestOutcome{err: strictAdmissionInvalidConfigError("taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{Backend: spec.Backend})}
 	}
 	timeout, errObj := timeoutFromMillis(spec.TimeoutMs)
 	if errObj != nil {
-		return requestOutcome{err: errObj}
+		return requestOutcome{err: strictAdmissionInvalidConfigError(errObj.Message, protocol.ErrorData{Backend: spec.Backend})}
 	}
 	policy, err := s.resolvePolicy(spec.Policy)
 	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{Backend: spec.Backend})}
 	}
-	backend, ok := s.backends[spec.Backend]
-	if !ok {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{})}
-	}
-	if err := s.admissionBackendProbeError(spec.Backend); err != nil {
-		return requestOutcome{err: admissionProtocolError(err)}
-	}
-	caps := s.admissionExecutionCapabilities(backend)
-	mode, err := model.RouteSubmissionMode(caps)
+	rawTaskSpec, err := rawTaskSpecFromSubmitParams(raw)
 	if err != nil {
-		return requestOutcome{err: admissionProtocolError(err)}
+		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{Backend: spec.Backend})}
 	}
-	if mode == model.ModeIdentifiedFenced && !admissionBackendControlledRunner(backend) {
-		return requestOutcome{err: admissionProtocolError(model.IncompatibleExecutionCapabilitiesError{
-			Capabilities: caps,
-			Reason:       "identified fenced admission requires a controlled command runner before acceptance",
-		})}
+	taskIdentity, err := model.TaskIdentityFromRawTaskSpec(rawTaskSpec)
+	if err != nil {
+		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{Backend: spec.Backend})}
 	}
 	canonicalCWD, err := engine.CanonicalWorkspace(spec.CWD)
 	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{Backend: spec.Backend})}
 	}
 	workspaceLayoutKey := model.WorkspaceKey(engine.WorkspaceKey(canonicalCWD))
-	s.mu.Lock()
-	store, err := s.storeForCWDLocked(canonicalCWD)
-	s.mu.Unlock()
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+
+	if !instance.policy.strictRuntimeAvailable() {
+		return requestOutcome{err: strictAdmissionRuntimeUnavailableError(instance.policy.runtimeAssessment, protocol.ErrorData{Backend: spec.Backend})}
 	}
 
 	s.admissionSubmitMu.Lock()
 	defer s.admissionSubmitMu.Unlock()
 
-	replay, err := s.admissionReady.LookupReplay(ctx, requestKey)
+	replay, err := instance.ready.LookupReplay(ctx, requestKey)
 	if err != nil {
 		return requestOutcome{err: admissionProtocolError(err)}
 	}
 	switch replay.State {
 	case authority.ReplayLive:
-		if !replay.Binding.TaskIdentity.Equal(taskIdentity) || replay.Binding.Mode != mode {
+		if !replay.Binding.TaskIdentity.Equal(taskIdentity) || replay.Binding.Mode != model.ModeIdentifiedFenced {
 			return requestOutcome{err: admissionProtocolError(authority.ErrReplayConflict)}
 		}
 		return requestOutcome{result: protocol.JobSubmitResult{
@@ -1535,39 +1671,29 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	}
 
 	admissionSessionID := s.nextID("ses")
-	var session engine.Session
-	if mode != model.ModeLegacyUnfenced {
-		session, err = backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
-		if err != nil {
-			return requestOutcome{err: backendError(err)}
-		}
-		if _, ok := session.(ordinalBoundSession); !ok {
-			return requestOutcome{err: admissionProtocolError(custodian.ErrSupervisorUnavailable)}
-		}
-		if id := session.ID(); id != "" {
-			admissionSessionID = id
-		}
+	session, err := descriptor.backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
+	if err != nil {
+		return requestOutcome{err: backendError(err)}
+	}
+	if _, ok := session.(ordinalBoundSession); !ok {
+		return requestOutcome{err: strictAdmissionProtocolError(
+			protocol.ErrorCapabilityMissing,
+			protocol.AdmissionRejectUnfenceableBackend,
+			"backend session does not support ordinal-bound runners",
+			protocol.ErrorData{Backend: spec.Backend},
+		)}
+	}
+	if id := session.ID(); id != "" {
+		admissionSessionID = id
 	}
 	request := authority.AcceptRequest{
 		RequestKey:         requestKey,
 		WorkspaceLayoutKey: workspaceLayoutKey,
 		TaskIdentity:       taskIdentity,
-		Mode:               mode,
+		Mode:               model.ModeIdentifiedFenced,
 		SessionID:          admissionSessionID,
 	}
-	var accepted authority.AcceptResult
-	var legacyFencedPreparation authority.LegacyFencedPreparation
-	switch mode {
-	case model.ModeIdentifiedFenced:
-		accepted, err = s.admissionSubmission.SubmitIdentified(ctx, request)
-	case model.ModeLegacyFenced:
-		legacyFencedPreparation, err = s.admissionSubmission.PrepareLegacyFenced(ctx, request)
-		accepted = legacyFencedPreparation.Admission
-	case model.ModeLegacyUnfenced:
-		accepted, err = s.admissionSubmission.SubmitLegacyUnfenced(ctx, request)
-	default:
-		err = model.IncompatibleExecutionCapabilitiesError{Capabilities: caps}
-	}
+	accepted, err := instance.submission.SubmitIdentified(ctx, request)
 	if err != nil {
 		if admissionAcceptCommitted(accepted) {
 			return requestOutcome{err: admissionPostAcceptError(accepted, err)}
@@ -1583,8 +1709,12 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		}}
 	}
 	jobModelID := accepted.Record.JobID
+	var store *engine.Store
 	s.mu.Lock()
-	s.jobStores[jobID] = store
+	if opened, storeErr := s.storeForCWDLocked(canonicalCWD); storeErr == nil {
+		store = opened
+		s.jobStores[jobID] = opened
+	}
 	s.mu.Unlock()
 	s.markAdmissionJob(jobID)
 	run := jobRun{
@@ -1604,42 +1734,49 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		contractHash:        policy.hash,
 		timeout:             timeout,
 		admissionControlled: true,
-		admissionMode:       mode,
+		admissionMode:       model.ModeIdentifiedFenced,
 		admissionAccepted:   accepted,
 		admissionLaunch: admissionLaunchBinding{
-			coordinator: s.admissionSubmission,
+			coordinator: instance.submission,
 			jobID:       jobModelID,
 			attempt:     accepted.Record.Attempt.Ref,
 		},
-	}
-	if mode == model.ModeLegacyFenced {
-		sessionWithRunner, ok := session.(ordinalBoundSession)
-		if !ok {
-			s.handleAdmissionResponseOutcome(ctx, run, false)
-			return requestOutcome{err: admissionProtocolError(custodian.ErrSupervisorUnavailable)}
-		}
-		prepareRunner := &legacyFencedPrepareRunner{
-			coordinator: s.admissionSubmission,
-			preparation: legacyFencedPreparation,
-		}
-		events, err := sessionWithRunner.TurnWithRunner(ctx, engine.TurnInput{
-			Prompt:  applyPrologue(policy.policy, spec.Prompt),
-			Write:   spec.Write,
-			Timeout: timeout,
-		}, prepareRunner)
-		if err != nil {
-			run.legacyFencedCommand = prepareRunner.command
-			s.handleAdmissionResponseOutcome(ctx, run, false)
-			return requestOutcome{err: backendError(err)}
-		}
-		run.prestartedEvents = events
-		run.legacyFencedCommand = prepareRunner.command
 	}
 	return requestOutcome{
 		result:       protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
 		after:        func() { s.handleAdmissionResponseOutcome(ctx, run, true) },
 		onAckFailure: func(error) { s.handleAdmissionResponseOutcome(ctx, run, false) },
 	}
+}
+
+func strictAdmissionInvalidConfigError(message string, data protocol.ErrorData) *protocol.ErrorObject {
+	return strictAdmissionProtocolError(protocol.ErrorInvalidTaskSpec, protocol.AdmissionRejectInvalidStrictConfig, message, data)
+}
+
+func strictAdmissionRuntimeUnavailableError(assessment custodian.SupportAssessment, data protocol.ErrorData) *protocol.ErrorObject {
+	data.RuntimeSupport = runtimeSupportAssessmentData(assessment)
+	message := "strict native runtime is unavailable"
+	if assessment.Cause != nil {
+		message += ": " + assessment.Cause.Error()
+	}
+	return strictAdmissionProtocolError(protocol.ErrorCapabilityMissing, protocol.AdmissionRejectUnavailableNativeRuntime, message, data)
+}
+
+func strictAdmissionProtocolError(code, cause, message string, data protocol.ErrorData) *protocol.ErrorObject {
+	data.AdmissionCause = cause
+	return protocol.NewError(code, message, data)
+}
+
+func runtimeSupportAssessmentData(assessment custodian.SupportAssessment) *protocol.RuntimeSupportAssessmentData {
+	data := &protocol.RuntimeSupportAssessmentData{
+		Class:       assessment.Class.String(),
+		Attempts:    assessment.Attempts,
+		CleanupSafe: assessment.CleanupSafe,
+	}
+	if assessment.Cause != nil {
+		data.Cause = assessment.Cause.Error()
+	}
+	return data
 }
 
 func rawTaskSpecFromSubmitParams(raw json.RawMessage) (json.RawMessage, error) {

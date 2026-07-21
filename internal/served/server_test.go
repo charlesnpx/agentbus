@@ -370,75 +370,19 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	assertRPCCode(t, resp, protocol.ErrorVersionMismatch)
 }
 
-func TestServeRefusesAdmissionBeforeListenWhenCustodianUnavailable(t *testing.T) {
+func TestServeConstructsAdmissionInstanceBeforeListenWithRequestIDCapabilityDisabled(t *testing.T) {
 	t.Parallel()
 	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
-	server.jobsRequestIDEnabled = true
-	bootstrapCalled := false
-	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
-		bootstrapCalled = true
-		return nil, nil, nil, errors.New("bootstrap should not run")
-	}
-	listenCalled := false
+	listenErr := errors.New("listener reached after admission bootstrap")
 	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
-		listenCalled = true
-		return nil, socketFileIdentity{}, errors.New("listener should not be called")
-	}
-
-	err := server.Serve(context.Background())
-	if !errors.Is(err, custodian.ErrSupervisorUnavailable) {
-		t.Fatalf("Serve error = %v, want supervisor_unavailable", err)
-	}
-	if listenCalled {
-		t.Fatal("listener was called after unavailable custodian")
-	}
-	if bootstrapCalled {
-		t.Fatal("admission bootstrap ran before custodian support was verified")
-	}
-	if server.jobsRequestIDEnabled {
-		t.Fatal("jobs.requestId remained enabled after unavailable custodian")
-	}
-}
-
-func TestBootstrapAdmissionRefusesUnavailableCustodianBeforeRepositoryOpen(t *testing.T) {
-	t.Parallel()
-	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
-	server.jobsRequestIDEnabled = true
-	bootstrapCalled := false
-	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
-		bootstrapCalled = true
-		return nil, nil, nil, errors.New("bootstrap should not run")
-	}
-
-	err := server.bootstrapAdmission(context.Background())
-	if !errors.Is(err, custodian.ErrSupervisorUnavailable) {
-		t.Fatalf("bootstrapAdmission error = %v, want supervisor_unavailable", err)
-	}
-	if bootstrapCalled {
-		t.Fatal("admission bootstrap factory ran before custodian support was verified")
-	}
-	if server.jobsRequestIDEnabled {
-		t.Fatal("jobs.requestId remained enabled after unavailable custodian")
-	}
-	for _, name := range []string{admissionRepositoryFile, admissionAnchorFile} {
-		if _, err := os.Stat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("%s stat error = %v, want not exist", name, err)
+		if server.jobsRequestIDEnabled {
+			return nil, socketFileIdentity{}, errors.New("jobs.requestId was enabled during default admission bootstrap")
 		}
-	}
-}
-
-func TestCapabilityOffStartupSkipsAdmissionBootstrap(t *testing.T) {
-	t.Parallel()
-	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
-	bootstrapCalled := false
-	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
-		bootstrapCalled = true
-		return nil, nil, nil, errors.New("bootstrap should not run")
-	}
-	listenErr := errors.New("listener reached with capability off")
-	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
-		if server.admissionBootstrapper != nil || server.admissionReady != nil || server.admissionCoordinator != nil {
-			return nil, socketFileIdentity{}, errors.New("admission state initialized with capability off")
+		if server.admissionInstance == nil || server.admissionInstance.ready == nil || server.admissionInstance.coordinator == nil || server.admissionInstance.submission == nil {
+			return nil, socketFileIdentity{}, errors.New("admission instance was not ready before listen")
+		}
+		if server.admissionInstance.policy.runtimeAssessment.Class != custodian.SupportUnsupported {
+			return nil, socketFileIdentity{}, fmt.Errorf("runtime assessment = %s, want unsupported", server.admissionInstance.policy.runtimeAssessment.Class)
 		}
 		return nil, socketFileIdentity{}, listenErr
 	}
@@ -447,13 +391,52 @@ func TestCapabilityOffStartupSkipsAdmissionBootstrap(t *testing.T) {
 	if !errors.Is(err, listenErr) {
 		t.Fatalf("Serve error = %v, want %v", err, listenErr)
 	}
-	if bootstrapCalled {
-		t.Fatal("admission bootstrap ran while jobs.requestId was disabled")
+}
+
+func TestBootstrapAdmissionBuildsUnavailableRuntimePolicy(t *testing.T) {
+	t.Parallel()
+	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+
+	err := server.bootstrapAdmission(context.Background())
+	if err != nil {
+		t.Fatalf("bootstrapAdmission error = %v", err)
+	}
+	if server.admissionInstance == nil {
+		t.Fatal("admission instance was not constructed")
+	}
+	if server.jobsRequestIDEnabled {
+		t.Fatal("jobs.requestId was enabled by admission bootstrap")
+	}
+	support := server.admissionInstance.policy.runtimeSupport
+	if support.ParkedExec || support.VerifiedContainment || !errors.Is(support.Reason, custodian.ErrSupervisorUnavailable) {
+		t.Fatalf("runtime support = %+v, want unavailable supervisor", support)
 	}
 	for _, name := range []string{admissionRepositoryFile, admissionAnchorFile} {
-		if _, err := os.Stat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("%s stat error = %v, want not exist", name, err)
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Fatalf("%s stat error = %v, want exists", name, err)
 		}
+	}
+}
+
+func TestAdmissionBootstrapFailureFailsServeClosedBeforeListen(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	bootstrapErr := errors.New("admission bootstrap failed")
+	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		return nil, nil, nil, bootstrapErr
+	}
+	listenCalled := false
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		listenCalled = true
+		return nil, socketFileIdentity{}, errors.New("listener should not be reached")
+	}
+
+	err := server.Serve(context.Background())
+	if !errors.Is(err, bootstrapErr) {
+		t.Fatalf("Serve error = %v, want %v", err, bootstrapErr)
+	}
+	if listenCalled {
+		t.Fatal("listener was called after admission bootstrap failure")
 	}
 }
 
@@ -504,7 +487,7 @@ func TestAdmissionDaemonBootIdentityCarriesPerServerEntropy(t *testing.T) {
 	}
 }
 
-func TestCapabilityOffStartupRunsLegacyReapBeforeListen(t *testing.T) {
+func TestAdmissionStartupRunsLegacyReapBeforeListenWithRequestIDCapabilityDisabled(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
 	clock := engine.ClockFunc(func() time.Time { return base })
@@ -521,11 +504,6 @@ func TestCapabilityOffStartupRunsLegacyReapBeforeListen(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
-	}
-	bootstrapCalled := false
-	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
-		bootstrapCalled = true
-		return nil, nil, nil, errors.New("bootstrap should not run")
 	}
 	server.mu.Lock()
 	store, err := server.storeForCWDLocked(cwd)
@@ -546,6 +524,12 @@ func TestCapabilityOffStartupRunsLegacyReapBeforeListen(t *testing.T) {
 	statePath := filepath.Join(store.Layout().Jobs, jobID+".json")
 	listenErr := errors.New("listener reached after legacy reap")
 	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		if server.jobsRequestIDEnabled {
+			return nil, socketFileIdentity{}, errors.New("jobs.requestId was enabled by admission bootstrap")
+		}
+		if server.admissionInstance == nil {
+			return nil, socketFileIdentity{}, errors.New("admission instance was not constructed before listen")
+		}
 		raw, err := os.ReadFile(statePath)
 		if err != nil {
 			return nil, socketFileIdentity{}, err
@@ -564,12 +548,9 @@ func TestCapabilityOffStartupRunsLegacyReapBeforeListen(t *testing.T) {
 	if !errors.Is(err, listenErr) {
 		t.Fatalf("Serve error = %v, want %v", err, listenErr)
 	}
-	if bootstrapCalled {
-		t.Fatal("admission bootstrap ran while jobs.requestId was disabled")
-	}
 	for _, name := range []string{admissionRepositoryFile, admissionAnchorFile} {
-		if _, err := os.Stat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("%s stat error = %v, want not exist", name, err)
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Fatalf("%s stat error = %v, want exists", name, err)
 		}
 	}
 }
@@ -584,7 +565,13 @@ func TestAdmissionRecoveryExecutorUnboundControlLossFinalizesWithoutBackendStart
 
 	backend := newFakeBackend("fake")
 	server, _, _ := newUnstartedTestServer(t, backend)
+	if server.jobsRequestIDEnabled {
+		t.Fatal("jobs.requestId default = true before recovery bootstrap")
+	}
 	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+	if server.jobsRequestIDEnabled {
+		t.Fatal("jobs.requestId was enabled by recovery bootstrap")
+	}
 
 	image, err := server.admissionReady.LoadJob(ctx, accepted.Record.JobID)
 	if err != nil {
@@ -720,7 +707,7 @@ func TestAdmissionRecoveryExecutorTripsLatchWhenContainmentUnprovable(t *testing
 	}
 }
 
-func TestJobSubmitRequestIDCapabilityDisabledDoesNotStartBackend(t *testing.T) {
+func TestDefaultStrictIdentifiedSubmitRejectsUnavailableRuntimeWithoutStartingBackend(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
 	h := startTestServer(t, backend, Config{IdleTimeout: -1})
@@ -735,6 +722,10 @@ func TestJobSubmitRequestIDCapabilityDisabledDoesNotStartBackend(t *testing.T) {
 		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"},
 	})
 	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnavailableNativeRuntime)
+	if resp.Error.Data.RuntimeSupport == nil || resp.Error.Data.RuntimeSupport.Class != custodian.SupportUnsupported.String() {
+		t.Fatalf("runtime support data = %+v, want unsupported assessment", resp.Error.Data.RuntimeSupport)
+	}
 	if got := backend.count.Load(); got != 0 {
 		t.Fatalf("backend starts = %d, want 0", got)
 	}
@@ -761,6 +752,7 @@ func TestInvalidStrictSubmitDoesNotProbeBackendVersion(t *testing.T) {
 	}, nil)
 	resp := responseFromScriptedConn(t, conn)
 	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectMissingIdentity)
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("version probe marker after invalid submit stat err = %v, want not exist", err)
 	}
@@ -789,6 +781,203 @@ func TestBootstrapAdmissionProbesStrictBackendsWithConfiguredRunner(t *testing.T
 	if got := backend.count.Load(); got != 0 {
 		t.Fatalf("backend starts during bootstrap = %d, want 0", got)
 	}
+}
+
+func TestServeAdmissionPolicyImmutableAfterBootstrapInputMutation(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	unavailable := custodian.NewUnavailableRuntime(errors.New("mutated runtime after bootstrap")).Support()
+	server.admissionRuntime.supportOverride = &unavailable
+	backend.controlled = false
+	backend.parkable = false
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-policy-immutable",
+		RequestID:    "request-policy-immutable",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	if submitted.JobID == "" || submitted.Deduplicated {
+		t.Fatalf("submit result = %+v, want accepted non-replay", submitted)
+	}
+	waitBackendStarted(t, backend)
+}
+
+func TestStrictIdentifiedOrderedRejectionsBeforeMutationOrRequestProbe(t *testing.T) {
+	t.Parallel()
+	type testCase struct {
+		name             string
+		configureBackend func(*fakeBackend)
+		availableRuntime bool
+		params           func(cwd string) protocol.JobSubmitParams
+		wantCode         string
+		wantCause        string
+	}
+	cases := []testCase{
+		{
+			name:             "missing identity before backend",
+			availableRuntime: true,
+			params: func(cwd string) protocol.JobSubmitParams {
+				return protocol.JobSubmitParams{
+					WorkspaceKey: "workspace-missing-identity",
+					TaskSpec:     protocol.TaskSpec{Backend: "missing", CWD: cwd, Write: false},
+				}
+			},
+			wantCode:  protocol.ErrorInvalidTaskSpec,
+			wantCause: protocol.AdmissionRejectMissingIdentity,
+		},
+		{
+			name:             "unsupported backend before invalid config",
+			availableRuntime: true,
+			params: func(cwd string) protocol.JobSubmitParams {
+				return protocol.JobSubmitParams{
+					WorkspaceKey: "workspace-unsupported",
+					RequestID:    "request-unsupported",
+					TaskSpec:     protocol.TaskSpec{Backend: "missing", CWD: cwd, Write: false},
+				}
+			},
+			wantCode:  protocol.ErrorBackendUnavailable,
+			wantCause: protocol.AdmissionRejectUnsupportedBackend,
+		},
+		{
+			name: "unfenceable before invalid config",
+			configureBackend: func(backend *fakeBackend) {
+				backend.controlled = false
+			},
+			availableRuntime: true,
+			params: func(cwd string) protocol.JobSubmitParams {
+				return protocol.JobSubmitParams{
+					WorkspaceKey: "workspace-unfenceable",
+					RequestID:    "request-unfenceable",
+					TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false},
+				}
+			},
+			wantCode:  protocol.ErrorCapabilityMissing,
+			wantCause: protocol.AdmissionRejectUnfenceableBackend,
+		},
+		{
+			name:             "invalid config before unavailable runtime",
+			availableRuntime: false,
+			params: func(cwd string) protocol.JobSubmitParams {
+				return protocol.JobSubmitParams{
+					WorkspaceKey: "workspace-invalid-config",
+					RequestID:    "request-invalid-config",
+					TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false},
+				}
+			},
+			wantCode:  protocol.ErrorInvalidTaskSpec,
+			wantCause: protocol.AdmissionRejectInvalidStrictConfig,
+		},
+		{
+			name:             "unavailable runtime terminal cause",
+			availableRuntime: false,
+			params: func(cwd string) protocol.JobSubmitParams {
+				return protocol.JobSubmitParams{
+					WorkspaceKey: "workspace-runtime-unavailable",
+					RequestID:    "request-runtime-unavailable",
+					TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+				}
+			},
+			wantCode:  protocol.ErrorCapabilityMissing,
+			wantCause: protocol.AdmissionRejectUnavailableNativeRuntime,
+		},
+	}
+
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fake := newFakeBackend("fake")
+			if tt.configureBackend != nil {
+				tt.configureBackend(fake)
+			}
+			backend := &probeableFakeBackend{fakeBackend: fake}
+			server, root, cwd := newUnstartedTestServer(t, backend)
+			runner := &recordingProbeRunner{}
+			server.admissionProbeRunner = runner
+			launcher := newAdmissionFakeLaunchCustodian(t)
+			if tt.availableRuntime {
+				enableTestAdmission(t, server, launcher)
+			} else {
+				if err := server.bootstrapAdmission(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			probeLookups := runner.lookups.Load()
+			probeRuns := runner.runs.Load()
+
+			outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, tt.params(cwd)))
+			if outcome.err == nil {
+				t.Fatalf("submit result = %+v, want error", outcome.result)
+			}
+			resp := protocol.Response{Error: outcome.err}
+			assertRPCCode(t, resp, tt.wantCode)
+			assertRPCAdmissionCause(t, resp, tt.wantCause)
+			if tt.wantCause == protocol.AdmissionRejectUnavailableNativeRuntime && outcome.err.Data.RuntimeSupport == nil {
+				t.Fatal("runtime unavailable rejection did not carry runtime support assessment")
+			}
+			if got := backend.count.Load(); got != 0 {
+				t.Fatalf("backend starts = %d, want 0 before strict rejection", got)
+			}
+			if got := runner.lookups.Load(); got != probeLookups {
+				t.Fatalf("probe lookups after request = %d, want unchanged %d", got, probeLookups)
+			}
+			if got := runner.runs.Load(); got != probeRuns {
+				t.Fatalf("probe runs after request = %d, want unchanged %d", got, probeRuns)
+			}
+			assertNoAcceptedJobsInAdmission(t, server)
+			assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+		})
+	}
+}
+
+type failingProbeBackend struct {
+	*fakeBackend
+}
+
+func (b *failingProbeBackend) ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error) {
+	return nil, errors.New("codex binary not found: executable file not found in $PATH")
+}
+
+// A strict backend whose probe fails for environment reasons (missing binary,
+// bad version) must NOT fail Serve bootstrap: the daemon keeps serving and the
+// backend is recorded unfenceable so strict identified admission rejects it
+// pre-accept with the probe failure as the cause.
+func TestServeBootstrapRecordsProbeFailureUnfenceableWithoutFailingClosed(t *testing.T) {
+	t.Parallel()
+	backend := &failingProbeBackend{fakeBackend: newFakeBackend("fake")}
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	// Available runtime: proves the rejection below is about the BACKEND
+	// probe failure, not the runtime.
+	enableTestAdmission(t, server, launcher)
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-probe-failure",
+		RequestID:    "request-probe-failure",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want rejection", outcome.result)
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnfenceableBackend)
+	if !strings.Contains(outcome.err.Message, "probe strict backend") {
+		t.Fatalf("rejection message = %q, want probe failure cause", outcome.err.Message)
+	}
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0", got)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
 }
 
 func TestIdentifiedFencedSubmitUsesLaunchControllerAndCompletes(t *testing.T) {
@@ -842,6 +1031,7 @@ func TestIdentifiedSubmitRejectsBuiltInWhenFencedRuntimeUnavailableBeforeBackend
 	}, nil)
 	resp := responseFromScriptedConn(t, conn)
 	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnavailableNativeRuntime)
 	if got := backend.count.Load(); got != 0 {
 		t.Fatalf("backend starts = %d, want 0 before incompatible pre-accept reject", got)
 	}
@@ -863,6 +1053,7 @@ func TestIdentifiedSubmitRejectsNoControlledRunnerBeforeBackendStart(t *testing.
 	}, nil)
 	resp := responseFromScriptedConn(t, conn)
 	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnfenceableBackend)
 	if got := backend.count.Load(); got != 0 {
 		t.Fatalf("backend starts = %d, want 0 before controlled-runner pre-accept reject", got)
 	}
@@ -883,6 +1074,7 @@ func TestIdentifiedSubmitRejectsNamedBackendWithoutProbeOrRunnerCapabilitiesBefo
 	}, nil)
 	resp := responseFromScriptedConn(t, conn)
 	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnfenceableBackend)
 	if got := backend.starts.Load(); got != 0 {
 		t.Fatalf("backend starts = %d, want 0 before unfenceable pre-accept reject", got)
 	}
@@ -890,7 +1082,7 @@ func TestIdentifiedSubmitRejectsNamedBackendWithoutProbeOrRunnerCapabilitiesBefo
 	assertNoEngineJobRecordsForCWD(t, server, cwd)
 }
 
-func TestLegacyFencedDeliveredAcknowledgesGrantsAndRunsOnce(t *testing.T) {
+func TestStrictIdentifiedRejectsExternalRunnerWithoutLegacyFencedFallback(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
 	backend.parkable = false
@@ -905,24 +1097,23 @@ func TestLegacyFencedDeliveredAcknowledgesGrantsAndRunsOnce(t *testing.T) {
 		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
 	}, nil)
 	resp := responseFromScriptedConn(t, conn)
-	var submitted protocol.JobSubmitResult
-	decodeResult(t, resp, &submitted)
-	waitBackendStarted(t, backend)
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnfenceableBackend)
 
-	if got := launcher.releaseCount(); got != 1 {
-		t.Fatalf("legacy fenced releases = %d, want exactly one", got)
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0 before strict unfenceable reject", got)
+	}
+	if got := len(launcher.preparedOrdinals()); got != 0 {
+		t.Fatalf("prepared launches = %d, want 0 before strict unfenceable reject", got)
+	}
+	if got := launcher.releaseCount(); got != 0 {
+		t.Fatalf("legacy fenced releases = %d, want 0 after strict unfenceable reject", got)
 	}
 	if got := launcher.abortCount(); got != 0 {
-		t.Fatalf("legacy fenced aborts = %d, want 0 after delivered response", got)
+		t.Fatalf("legacy fenced aborts = %d, want 0 after strict unfenceable reject", got)
 	}
-	record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
-	if record.Mode != model.ModeLegacyFenced || record.Acknowledgement == nil {
-		t.Fatalf("legacy fenced record missing mode/ack: %+v", record)
-	}
-	first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
-	if !ok || first.Group == nil || first.Grant == nil || first.Released == nil || first.Quiescence == nil {
-		t.Fatalf("legacy fenced launch proof incomplete: %+v", first)
-	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoEngineJobRecordsForCWD(t, server, cwd)
 }
 
 func TestLegacyFencedWaitCleanupFailureRecordsQuiescenceBeforeError(t *testing.T) {
@@ -1012,7 +1203,7 @@ func TestLegacyFencedRejectCleanupFailureRecordsQuiescenceBeforeError(t *testing
 	assertLegacyFencedRejectedWithoutGrant(t, safety)
 }
 
-func TestLegacyFencedDeliveryFailureRetiresWithoutGrantOrRun(t *testing.T) {
+func TestStrictIdentifiedUnfenceableRejectionDoesNotCreateLegacyRecordWhenResponseLost(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
 	backend.parkable = false
@@ -1027,20 +1218,17 @@ func TestLegacyFencedDeliveryFailureRetiresWithoutGrantOrRun(t *testing.T) {
 		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
 	}, errors.New("ack write failed"))
 
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0 before strict unfenceable reject", got)
+	}
 	if got := launcher.releaseCount(); got != 0 {
-		t.Fatalf("legacy fenced releases = %d, want 0 after failed response", got)
+		t.Fatalf("legacy fenced releases = %d, want 0 after strict unfenceable reject", got)
 	}
-	if got := launcher.abortCount(); got != 1 {
-		t.Fatalf("legacy fenced aborts = %d, want one retired parked worker", got)
+	if got := launcher.abortCount(); got != 0 {
+		t.Fatalf("legacy fenced aborts = %d, want 0 after strict unfenceable reject", got)
 	}
-	safety := waitSingleAdmissionSafetyTerminal(t, server)
-	if safety.Terminal == nil || safety.Terminal.Outcome != model.OutcomeCanceled || safety.Terminal.Cause != model.CauseResponseUndeliverable {
-		t.Fatalf("legacy fenced terminal = %+v, want response-undeliverable cancel", safety.Terminal)
-	}
-	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
-	if !ok || first.Group == nil || first.Quiescence == nil || first.Grant != nil || first.Released != nil {
-		t.Fatalf("legacy fenced failed-response launch proof = %+v, want retired without grant/release", first)
-	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoEngineJobRecordsForCWD(t, server, cwd)
 }
 
 func TestLegacyFencedDeliveryFailureRetiresWithDetachedContextWhenCanceled(t *testing.T) {
@@ -1205,7 +1393,7 @@ func TestLegacyFencedDeliveryFailureRetiresWhenBeginRejectFails(t *testing.T) {
 	}
 }
 
-func TestLegacyUnfencedDeliveredRunsWithoutCustody(t *testing.T) {
+func TestStrictIdentifiedRejectsExternalRunnerWithoutLegacyUnfencedFallback(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
 	backend.parkable = false
@@ -1220,27 +1408,20 @@ func TestLegacyUnfencedDeliveredRunsWithoutCustody(t *testing.T) {
 		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
 	}, nil)
 	resp := responseFromScriptedConn(t, conn)
-	var submitted protocol.JobSubmitResult
-	decodeResult(t, resp, &submitted)
-	waitBackendStarted(t, backend)
-	waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnfenceableBackend)
 
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0 before strict unfenceable reject", got)
+	}
 	if got := len(launcher.preparedOrdinals()); got != 0 {
 		t.Fatalf("legacy unfenced prepared launches = %d, want 0", got)
 	}
-	safety := loadAdmissionSafetyRecord(t, server, submitted.JobID)
-	if safety.Mode != model.ModeLegacyUnfenced {
-		t.Fatalf("admission mode = %s, want LegacyUnfenced", safety.Mode)
-	}
-	if safety.Attempt.Launches.Count() != 0 {
-		t.Fatalf("legacy unfenced launch proofs = %+v, want none", safety.Attempt.Launches)
-	}
-	if safety.Terminal == nil || safety.Terminal.Proof != model.ProofLegacyUnfencedOutcome {
-		t.Fatalf("legacy unfenced terminal = %+v, want legacy-unfenced proof", safety.Terminal)
-	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoEngineJobRecordsForCWD(t, server, cwd)
 }
 
-func TestLegacyUnfencedDeliveryFailureRejectsBeforeBackendStart(t *testing.T) {
+func TestStrictIdentifiedUnfenceableDeliveryFailureDoesNotCreateLegacyUnfencedRecord(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
 	backend.parkable = false
@@ -1261,10 +1442,8 @@ func TestLegacyUnfencedDeliveryFailureRejectsBeforeBackendStart(t *testing.T) {
 	if got := len(launcher.preparedOrdinals()); got != 0 {
 		t.Fatalf("legacy unfenced prepared launches = %d, want 0", got)
 	}
-	safety := waitSingleAdmissionSafetyTerminal(t, server)
-	if safety.Terminal == nil || safety.Terminal.Outcome != model.OutcomeCanceled || safety.Terminal.Proof != model.ProofLegacyUnfencedOutcome {
-		t.Fatalf("legacy unfenced terminal = %+v, want canceled legacy-unfenced proof", safety.Terminal)
-	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoEngineJobRecordsForCWD(t, server, cwd)
 }
 
 func TestIdentifiedFencedResponseLossRetainsObligationAndReplayReturnsSameJob(t *testing.T) {
@@ -3756,14 +3935,20 @@ func stopTestServer(t *testing.T, h testServer) {
 	h.cancel()
 	select {
 	case <-h.done:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
+		// Positive wait: shutdown drains connections and closes the
+		// admission repository before done fires; under whole-repo -race
+		// sweep load a 1s deadline flaked.
 		t.Fatalf("server did not stop")
 	}
 }
 
 func waitForSocket(t *testing.T, socketPath string, done <-chan error) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	// Positive wait: Serve now bootstraps admission (bbolt open + recovery +
+	// backend probing) BEFORE listening; under whole-repo -race sweep load a
+	// 1s deadline flaked on restart-family tests.
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-done:
@@ -3901,7 +4086,6 @@ func configureTestAdmissionRuntime(t *testing.T, server *Server, launcher *admis
 	if err != nil {
 		t.Fatal(err)
 	}
-	server.jobsRequestIDEnabled = true
 	server.admissionRuntime = &servedAdmissionRuntime{
 		runtime:          custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable),
 		launchCustodian:  launcher,
@@ -4691,6 +4875,18 @@ func assertNoEngineJobRecordsForCWD(t *testing.T, server *Server, cwd string) {
 	}
 }
 
+func assertNoWorkspaceNamespaceForCWD(t *testing.T, root, cwd string) {
+	t.Helper()
+	canonicalCWD, err := engine.CanonicalWorkspace(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace := filepath.Join(root, "workspaces", engine.WorkspaceKey(canonicalCWD))
+	if _, err := os.Stat(namespace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("workspace namespace stat error = %v, want not exist for %s", err, namespace)
+	}
+}
+
 func addScriptedSession(t *testing.T, server *Server, backend *fakeBackend, cwd, sessionID string) {
 	t.Helper()
 	session, err := backend.Start(context.Background(), engine.SessionOpts{CWD: cwd})
@@ -5011,6 +5207,16 @@ func assertRPCCode(t *testing.T, resp protocol.Response, code string) {
 	}
 	if resp.Error.Data.Code != code {
 		t.Fatalf("error code = %s, want %s (%+v)", resp.Error.Data.Code, code, resp.Error)
+	}
+}
+
+func assertRPCAdmissionCause(t *testing.T, resp protocol.Response, cause string) {
+	t.Helper()
+	if resp.Error == nil {
+		t.Fatalf("expected admission cause %s, got result %+v", cause, resp.Result)
+	}
+	if resp.Error.Data.AdmissionCause != cause {
+		t.Fatalf("admission cause = %q, want %q (%+v)", resp.Error.Data.AdmissionCause, cause, resp.Error)
 	}
 }
 
