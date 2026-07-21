@@ -131,6 +131,7 @@ type Server struct {
 	safetyDrainTimeout     time.Duration
 	jobsRequestIDEnabled   bool
 	admissionSubmitMu      sync.Mutex
+	admissionStateMu       sync.RWMutex
 	resultPublications     atomic.Int64
 
 	admissionBootstrapper        *admissionBootstrapper
@@ -396,9 +397,11 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		return err
 	}
-	if s.admissionClose != nil {
-		defer s.admissionClose.Close()
-	}
+	defer func() {
+		if err := s.closeServeAdmission(); err != nil {
+			log.Printf("agentbus daemon: close admission authority: %v", err)
+		}
+	}()
 	listen := s.listen
 	if s.listenerFactory != nil {
 		listen = s.listenerFactory
@@ -802,10 +805,16 @@ func (s *Server) activeWorkWithContext(ctx context.Context) bool {
 	if s.resultPublications.Load() > 0 {
 		return true
 	}
+	// Snapshot-checkout: never hold admissionStateMu across HasOwnedWork —
+	// a stalled ownership probe must not block closeServeAdmission's write
+	// lock past the safety fail-stop drain deadline.
+	s.admissionStateMu.RLock()
 	checker := s.admissionOwnedWorkChecker
 	if checker == nil && s.admissionCoordinator != nil {
 		checker = s.admissionCoordinator
 	}
+	runtime := s.admissionRuntime
+	s.admissionStateMu.RUnlock()
 	if checker != nil {
 		owned, err := checker.HasOwnedWork(ctx)
 		if err != nil && s.safetyFailStopErr() == nil {
@@ -815,7 +824,7 @@ func (s *Server) activeWorkWithContext(ctx context.Context) bool {
 			return true
 		}
 	}
-	if s.admissionRuntime != nil && s.admissionRuntime.hasActiveCustodies() {
+	if runtime != nil && runtime.hasActiveCustodies() {
 		return true
 	}
 	// TODO(S4E-b): include pending recovery executor work once recovery execution lands.
@@ -1285,15 +1294,21 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 		return requestOutcome{err: errObj}
 	}
 	strictByRaw, identityErr := strictIdentityPrecheck(raw)
-	if identityErr != nil {
-		return requestOutcome{err: identityErr}
-	}
 	if strictByRaw {
+		if errObj := s.strictRouteDisabledPrecheck(); errObj != nil {
+			return requestOutcome{err: errObj}
+		}
+		if identityErr != nil {
+			return requestOutcome{err: identityErr}
+		}
 		params, errObj := looseStrictJobSubmitParams(raw)
 		if errObj != nil {
 			return requestOutcome{err: errObj}
 		}
 		return s.handleIdentifiedJobSubmit(ctx, raw, params)
+	}
+	if identityErr != nil {
+		return requestOutcome{err: identityErr}
 	}
 	var params protocol.JobSubmitParams
 	if err := decodeStrict(raw, &params); err != nil {
@@ -1560,10 +1575,10 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 		return s.handleJobCancelLocked(jobID)
 	}
 	if record.Terminal == nil {
-		if s.admissionCoordinator == nil {
-			return requestOutcome{err: admissionProtocolError(coordinator.ErrCoordinatorNotReady)}
-		}
-		if err := s.admissionCoordinator.Cancel(context.Background(), model.JobID(jobID), nil); err != nil {
+		err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
+			return coord.Cancel(context.Background(), model.JobID(jobID), nil)
+		})
+		if err != nil {
 			return requestOutcome{err: admissionProtocolError(err)}
 		}
 		var reloadErr *protocol.ErrorObject
@@ -1597,13 +1612,21 @@ func (s *Server) handleJobCancelLocked(jobID string) requestOutcome {
 	if record.Foreground {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: jobID, TurnID: jobID})}
 	}
-	if s.isAdmissionJob(jobID) && s.admissionCoordinator != nil {
-		snapshot, err := s.admissionCoordinator.Snapshot(context.Background(), model.JobID(jobID))
+	if s.isAdmissionJob(jobID) {
+		err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
+			snapshot, err := coord.Snapshot(context.Background(), model.JobID(jobID))
+			if err != nil {
+				return err
+			}
+			if snapshot.Record.Terminal == nil {
+				if err := coord.Cancel(context.Background(), model.JobID(jobID), nil); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 		if err != nil {
-			return requestOutcome{err: admissionProtocolError(err)}
-		}
-		if snapshot.Record.Terminal == nil {
-			if err := s.admissionCoordinator.Cancel(context.Background(), model.JobID(jobID), nil); err != nil {
+			if !errors.Is(err, authority.ErrNotReady) && !errors.Is(err, coordinator.ErrCoordinatorNotReady) {
 				return requestOutcome{err: admissionProtocolError(err)}
 			}
 		}

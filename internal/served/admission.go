@@ -30,6 +30,7 @@ const (
 	admissionAnchorFile     = "admission-anchor.json"
 
 	admissionFailStopTimeout = 30 * time.Second
+	admissionProbeReasonMax  = 240
 )
 
 var admissionDetachedCleanupTimeout = 30 * time.Second
@@ -73,6 +74,17 @@ type admissionBackendDescriptor struct {
 	controlledRunner bool
 	fenceable        bool
 	unfenceableCause string
+}
+
+type admissionBackendContractViolationError struct {
+	backend string
+}
+
+func (e admissionBackendContractViolationError) Error() string {
+	if e.backend == "" {
+		return "backend contract violation: descriptor claimed controlled-runner but session lacks ordinal-bound runner capability"
+	}
+	return fmt.Sprintf("backend contract violation for %s: descriptor claimed controlled-runner but session lacks ordinal-bound runner capability", e.backend)
 }
 
 // ServeAdmissionPolicy is the immutable strict-admission policy derived during
@@ -128,6 +140,9 @@ func (policy ServeAdmissionPolicy) strictRuntimeAvailable() bool {
 }
 
 func (s *Server) bootstrapAdmission(ctx context.Context) error {
+	s.admissionStateMu.Lock()
+	defer s.admissionStateMu.Unlock()
+
 	if s.admissionInstance != nil {
 		return nil
 	}
@@ -217,6 +232,59 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	return nil
 }
 
+func (s *Server) closeServeAdmission() error {
+	s.admissionStateMu.Lock()
+	defer s.admissionStateMu.Unlock()
+
+	closer := s.admissionClose
+	s.admissionBootstrapper = nil
+	s.admissionReady = nil
+	s.admissionCoordinator = nil
+	s.admissionOwnedWorkChecker = nil
+	s.admissionSubmission = nil
+	s.admissionRepository = nil
+	s.admissionClose = nil
+	s.admissionInstance = nil
+	s.admissionDaemonBootOnce = sync.Once{}
+	s.admissionDaemonBootRef = model.BootRef{}
+	s.admissionDaemonBootRefErr = nil
+
+	if closer != nil {
+		return closer.Close()
+	}
+	return nil
+}
+
+// The admission guards use snapshot-checkout, NOT lock-across-operation: the
+// read lock protects only the reference read. Holding it across fn would let
+// one stalled operation (e.g. a stuck ownership probe) block closeServeAdmission's
+// write lock past the safety fail-stop drain deadline — fail-stop MUST win over
+// stalled work. The trade-off is explicit: an operation checked out before the
+// close races it and receives typed errors from the cleared/closed objects
+// (never a hang, never corrupted state); new operations after close fail fast
+// on the nil-instance check.
+func (s *Server) withAdmissionCoordinator(fn func(*admissionCoordinator) error) error {
+	s.admissionStateMu.RLock()
+	coordinatorRef := s.admissionCoordinator
+	ready := s.admissionInstance != nil && coordinatorRef != nil
+	s.admissionStateMu.RUnlock()
+	if !ready {
+		return coordinator.ErrCoordinatorNotReady
+	}
+	return fn(coordinatorRef)
+}
+
+func (s *Server) withAdmissionSubmission(fn func(*servedSubmissionCoordinator) error) error {
+	s.admissionStateMu.RLock()
+	submissionRef := s.admissionSubmission
+	ready := s.admissionInstance != nil && submissionRef != nil
+	s.admissionStateMu.RUnlock()
+	if !ready {
+		return authority.ErrNotReady
+	}
+	return fn(submissionRef)
+}
+
 func (s *Server) probeAdmissionBackends(ctx context.Context, runtime *servedAdmissionRuntime) (map[string]admissionBackendDescriptor, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -248,15 +316,15 @@ func (s *Server) probeAdmissionBackends(ctx context.Context, runtime *servedAdmi
 		probed, err := probeable.ProbeBackend(ctx, runner)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, fmt.Errorf("probe strict backend %s: %w", name, err)
+				return nil, fmt.Errorf("probe strict backend %s canceled by serve context: %w", name, ctxErr)
 			}
-			// An environment-specific probe failure (missing binary,
-			// below-minimum version) must not kill the daemon: record the
-			// backend unfenceable so strict identified admission rejects it
-			// pre-accept — the same fail-closed treatment as a backend that
-			// does not implement ProbeBackend at all. Other backends and
-			// legacy traffic keep serving.
-			probeErr := fmt.Errorf("probe strict backend %s: %w", name, err)
+			// Probe cancellation is fatal only when the Serve parent context
+			// is canceled. A backend-returned context sentinel while that
+			// parent is still live is an environment-class probe failure:
+			// record the backend unfenceable so strict identified admission
+			// rejects it pre-accept, while other backends and legacy traffic
+			// keep serving.
+			probeErr := admissionProbeFailureError(name, err)
 			if s.admissionUnprobeableBackends == nil {
 				s.admissionUnprobeableBackends = make(map[string]error)
 			}
@@ -277,6 +345,17 @@ func (s *Server) probeAdmissionBackends(ctx context.Context, runtime *servedAdmi
 		descriptors[name] = s.admissionBackendDescriptor(name, probed, runtime, nil)
 	}
 	return descriptors, nil
+}
+
+func admissionProbeFailureError(name string, err error) error {
+	message := "unknown probe failure"
+	if err != nil {
+		message = err.Error()
+	}
+	if len(message) > admissionProbeReasonMax {
+		message = message[:admissionProbeReasonMax] + "..."
+	}
+	return fmt.Errorf("probe strict backend %s failed: %s", name, message)
 }
 
 func (s *Server) admissionBackendDescriptor(name string, backend engine.Backend, runtime *servedAdmissionRuntime, probeErr error) admissionBackendDescriptor {
@@ -670,6 +749,17 @@ func (s *Server) admissionTurnEvents(ctx context.Context, run jobRun, input engi
 	if err := ordinal.Validate(); err != nil {
 		return nil, err
 	}
+	// Snapshot-checkout: launch preparation and the turn must not hold
+	// admissionStateMu (see activeWork). The coordinator-identity comparison
+	// runs against the snapshot; a submission coordinator replaced by a
+	// sequential re-Serve fails the identity check exactly as before.
+	s.admissionStateMu.RLock()
+	submission := s.admissionSubmission
+	ready := s.admissionInstance != nil && submission != nil
+	s.admissionStateMu.RUnlock()
+	if !ready || run.admissionLaunch.coordinator != submission {
+		return nil, authority.ErrNotReady
+	}
 	if run.admissionLaunch.coordinator == nil {
 		return nil, custodian.ErrSupervisorUnavailable
 	}
@@ -885,14 +975,23 @@ func (c *servedSubmissionCoordinator) failStop(ctx context.Context, err error) e
 }
 
 func (s *Server) failStopAdmissionReady(ctx context.Context, err error) error {
-	if s == nil || s.admissionReady == nil {
+	if s == nil {
+		return authority.ErrNotReady
+	}
+	// Snapshot-checkout (see activeWork): FailStop must not hold the state
+	// lock — it is on the safety path that races closeServeAdmission.
+	s.admissionStateMu.RLock()
+	ready := s.admissionReady
+	ok := s.admissionInstance != nil && ready != nil
+	s.admissionStateMu.RUnlock()
+	if !ok {
 		return authority.ErrNotReady
 	}
 	var stopErr error
 	if err == nil {
-		stopErr = s.admissionReady.FailStop(ctx, "")
+		stopErr = ready.FailStop(ctx, "")
 	} else {
-		stopErr = s.admissionReady.FailStop(ctx, err.Error())
+		stopErr = ready.FailStop(ctx, err.Error())
 	}
 	if stopErr == nil {
 		s.safetyLatch.Trip(err)
@@ -1556,7 +1655,13 @@ func jsonFieldPresent(raw json.RawMessage, field string) (bool, error) {
 }
 
 func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMessage, params protocol.JobSubmitParams) requestOutcome {
+	// Snapshot-checkout: the whole submit (validation, session construction,
+	// durable acceptance) runs against the checked-out instance, never under
+	// admissionStateMu (see activeWork). A submit racing closeServeAdmission
+	// gets typed errors from the closing objects.
+	s.admissionStateMu.RLock()
 	instance := s.admissionInstance
+	s.admissionStateMu.RUnlock()
 	if instance == nil || !instance.policy.strictRouteEnabled || instance.ready == nil || instance.submission == nil {
 		reason := "admission authority is not ready"
 		if instance != nil && instance.policy.strictRouteDisabledReason != "" {
@@ -1570,6 +1675,12 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		)}
 	}
 
+	// Strict admission rejection order is policy/route, identity, static
+	// backend fenceability, strict config, native runtime, replay, then durable
+	// acceptance. Dynamic session capability verification is the ordering
+	// exception: a backend can violate its controlled-runner descriptor only
+	// when Start constructs a session, so that contract check runs immediately
+	// after Start and before any durable admission mutation.
 	requestKey, err := model.NewRequestKey(params.WorkspaceKey, params.RequestID)
 	if err != nil {
 		return requestOutcome{err: strictAdmissionProtocolError(
@@ -1676,10 +1787,11 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		return requestOutcome{err: backendError(err)}
 	}
 	if _, ok := session.(ordinalBoundSession); !ok {
+		err := admissionBackendContractViolationError{backend: spec.Backend}
 		return requestOutcome{err: strictAdmissionProtocolError(
 			protocol.ErrorCapabilityMissing,
 			protocol.AdmissionRejectUnfenceableBackend,
-			"backend session does not support ordinal-bound runners",
+			err.Error(),
 			protocol.ErrorData{Backend: spec.Backend},
 		)}
 	}
@@ -1753,6 +1865,26 @@ func strictAdmissionInvalidConfigError(message string, data protocol.ErrorData) 
 	return strictAdmissionProtocolError(protocol.ErrorInvalidTaskSpec, protocol.AdmissionRejectInvalidStrictConfig, message, data)
 }
 
+func (s *Server) strictRouteDisabledPrecheck() *protocol.ErrorObject {
+	s.admissionStateMu.RLock()
+	defer s.admissionStateMu.RUnlock()
+
+	instance := s.admissionInstance
+	if instance == nil || !instance.policy.strictRouteEnabled || instance.ready == nil || instance.submission == nil {
+		reason := "admission authority is not ready"
+		if instance != nil && instance.policy.strictRouteDisabledReason != "" {
+			reason = instance.policy.strictRouteDisabledReason
+		}
+		return strictAdmissionProtocolError(
+			protocol.ErrorCapabilityMissing,
+			protocol.AdmissionRejectStrictRouteDisabled,
+			reason,
+			protocol.ErrorData{},
+		)
+	}
+	return nil
+}
+
 func strictAdmissionRuntimeUnavailableError(assessment custodian.SupportAssessment, data protocol.ErrorData) *protocol.ErrorObject {
 	data.RuntimeSupport = runtimeSupportAssessmentData(assessment)
 	message := "strict native runtime is unavailable"
@@ -1819,25 +1951,29 @@ func (s *Server) handleAdmissionResponseOutcome(ctx context.Context, run jobRun,
 	case model.RunAcceptedObligation, model.RetainObligationForReplay:
 		go s.launchAdmittedJob(ctx, run)
 	case model.AcknowledgeGrantAndRelease:
-		if err := s.admissionSubmission.acknowledgeGrantAndReleaseLegacyFenced(ctx, run.legacyFencedCommand); err != nil {
+		if err := s.withAdmissionSubmission(func(submission *servedSubmissionCoordinator) error {
+			return submission.acknowledgeGrantAndReleaseLegacyFenced(ctx, run.legacyFencedCommand)
+		}); err != nil {
 			_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
 			return
 		}
 		go s.launchAdmittedJob(ctx, run)
 	case model.RejectAndRetireNoGrant:
-		var err error
-		if run.legacyFencedCommand != nil {
-			err = s.admissionSubmission.rejectAndRetireLegacyFenced(ctx, run.legacyFencedCommand)
-		} else {
-			err = s.admissionSubmission.rejectLegacyFencedBeforePrepare(ctx, run.admissionAccepted)
-		}
-		if err != nil && s.admissionReady != nil {
+		err := s.withAdmissionSubmission(func(submission *servedSubmissionCoordinator) error {
+			if run.legacyFencedCommand != nil {
+				return submission.rejectAndRetireLegacyFenced(ctx, run.legacyFencedCommand)
+			}
+			return submission.rejectLegacyFencedBeforePrepare(ctx, run.admissionAccepted)
+		})
+		if err != nil {
 			_ = s.failStopAdmissionReady(ctx, err)
 		}
 	case model.RunLegacyUnfenced:
 		go s.launchLegacyUnfencedJob(ctx, run)
 	case model.RejectLegacyUnfencedBeforeRun:
-		if err := s.admissionSubmission.rejectLegacyUnfencedBeforeRun(ctx, run.admissionAccepted); err != nil && s.admissionReady != nil {
+		if err := s.withAdmissionSubmission(func(submission *servedSubmissionCoordinator) error {
+			return submission.rejectLegacyUnfencedBeforeRun(ctx, run.admissionAccepted)
+		}); err != nil {
 			_ = s.failStopAdmissionReady(ctx, err)
 		}
 	}
@@ -1847,11 +1983,12 @@ func (s *Server) launchLegacyUnfencedJob(ctx context.Context, run jobRun) {
 	var launched jobRun
 	var runCtx context.Context
 	err := s.withAdmissionJobEffectErr(run.jobID, func() error {
-		if s.admissionCoordinator == nil {
-			return errors.New("admission authority is not ready")
-		}
-		snapshot, err := s.admissionCoordinator.Snapshot(ctx, model.JobID(run.jobID))
-		if err != nil {
+		var snapshot coordinator.JobSnapshot
+		if err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
+			var err error
+			snapshot, err = coord.Snapshot(ctx, model.JobID(run.jobID))
+			return err
+		}); err != nil {
 			return err
 		}
 		if snapshot.Record.Terminal != nil || snapshot.Record.Cancel != nil {
@@ -1891,12 +2028,13 @@ func (s *Server) launchLegacyUnfencedJob(ctx context.Context, run jobRun) {
 }
 
 func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobRun, context.Context, bool, error) {
-	if s.admissionCoordinator == nil {
-		return run, nil, false, errors.New("admission authority is not ready")
-	}
 	jobID := model.JobID(run.jobID)
-	snapshot, err := s.admissionCoordinator.Snapshot(ctx, jobID)
-	if err != nil {
+	var snapshot coordinator.JobSnapshot
+	if err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
+		var err error
+		snapshot, err = coord.Snapshot(ctx, jobID)
+		return err
+	}); err != nil {
 		return run, nil, false, err
 	}
 	if snapshot.Record.Terminal != nil || snapshot.Record.Cancel != nil {
@@ -1963,12 +2101,18 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 }
 
 func (s *Server) listAuthorityStatuses() ([]protocol.JobStatus, *protocol.ErrorObject) {
-	if s.admissionRepository == nil {
+	// Snapshot-checkout (see activeWork): repository reads must not hold
+	// admissionStateMu.
+	s.admissionStateMu.RLock()
+	repo := s.admissionRepository
+	ready := s.admissionInstance != nil && repo != nil
+	s.admissionStateMu.RUnlock()
+	if !ready {
 		return nil, nil
 	}
 	var statuses []protocol.JobStatus
 	var authorityListErr *protocol.ErrorObject
-	if err := s.admissionRepository.View(context.Background(), func(tx repository.ReadTx) error {
+	if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
 		images, err := tx.ListJobs(repository.JobFilter{})
 		if err != nil {
 			return err
@@ -2013,14 +2157,20 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 }
 
 func (s *Server) authorityJobProjection(jobID string) (model.SafetyRecord, model.JobProjection, bool, *protocol.ErrorObject) {
-	if s.admissionReady == nil {
+	// Snapshot-checkout (see activeWork): authority reads must not hold
+	// admissionStateMu.
+	s.admissionStateMu.RLock()
+	ready := s.admissionReady
+	ok := s.admissionInstance != nil && ready != nil
+	s.admissionStateMu.RUnlock()
+	if !ok {
 		return model.SafetyRecord{}, model.JobProjection{}, false, nil
 	}
 	modelJobID, err := model.NewJobID(jobID)
 	if err != nil {
 		return model.SafetyRecord{}, model.JobProjection{}, false, nil
 	}
-	image, err := s.admissionReady.LoadJob(context.Background(), modelJobID)
+	image, err := ready.LoadJob(context.Background(), modelJobID)
 	if err != nil {
 		return model.SafetyRecord{}, model.JobProjection{}, false, admissionProtocolError(err)
 	}

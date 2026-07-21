@@ -12,8 +12,13 @@ import (
 // must be prepared before the RPC acceptance response is written.
 type SubmissionCoordinator interface {
 	// SubmitIdentified accepts an identified fenced request. Once accepted, the
-	// obligation is durable and response loss is recovered by replaying the same
-	// request key.
+	// obligation is durable and response loss while the daemon lives never
+	// cancels it: the job runs exactly once, and replay returns the same job.
+	// A daemon crash after durable acceptance but before launch authorization is
+	// a distinct pre-authorization window. Startup recovery finalizes that job
+	// failed-with-cause deterministically under at-most-once semantics, and
+	// replay returns that terminal job: never a silent dangling acceptance,
+	// never a double execution.
 	SubmitIdentified(context.Context, AcceptRequest) (AcceptResult, error)
 
 	// PrepareLegacyFenced prepares the fenced legacy launch before the response

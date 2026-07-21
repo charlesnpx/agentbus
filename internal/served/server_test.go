@@ -251,6 +251,22 @@ func (s *fakeSession) TurnWithRunner(ctx context.Context, input engine.TurnInput
 	return ch, nil
 }
 
+type nonOrdinalSession struct {
+	id    string
+	turns atomic.Int64
+}
+
+func (s *nonOrdinalSession) ID() string { return s.id }
+
+func (s *nonOrdinalSession) Turn(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+	s.turns.Add(1)
+	ch := make(chan engine.Event)
+	close(ch)
+	return ch, nil
+}
+
+func (s *nonOrdinalSession) Interrupt(context.Context) error { return nil }
+
 func (s *fakeSession) Interrupt(context.Context) error {
 	s.backend.interrupts.Add(1)
 	return nil
@@ -555,6 +571,86 @@ func TestAdmissionStartupRunsLegacyReapBeforeListenWithRequestIDCapabilityDisabl
 	}
 }
 
+func TestServeClearsAdmissionStateAndSequentialReserveRecovers(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	start := func() (context.CancelFunc, chan error) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- server.Serve(ctx)
+			close(done)
+		}()
+		waitForSocket(t, server.socketPath, done)
+		return cancel, done
+	}
+	stop := func(cancel context.CancelFunc, done <-chan error) {
+		t.Helper()
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Serve stop error = %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Serve did not stop")
+		}
+	}
+
+	cancelFirst, doneFirst := start()
+	accepted := acceptIdentifiedAuthorityWork(t, server, "sequential-reserve")
+	server.admissionStateMu.RLock()
+	firstBoot := server.admissionReady.Boot()
+	server.admissionStateMu.RUnlock()
+	stop(cancelFirst, doneFirst)
+	if server.admissionInstance != nil || server.admissionReady != nil || server.admissionSubmission != nil || server.admissionCoordinator != nil || server.admissionRepository != nil || server.admissionClose != nil {
+		t.Fatalf("admission state after Serve#1 stop: instance=%p ready=%p submission=%p coordinator=%p repository=%v close=%v",
+			server.admissionInstance, server.admissionReady, server.admissionSubmission, server.admissionCoordinator, server.admissionRepository, server.admissionClose)
+	}
+
+	cancelSecond, doneSecond := start()
+	defer stop(cancelSecond, doneSecond)
+	server.admissionStateMu.RLock()
+	secondBoot := server.admissionReady.Boot()
+	server.admissionStateMu.RUnlock()
+	if secondBoot.BootID == firstBoot.BootID {
+		t.Fatalf("sequential Serve reused boot id %q", secondBoot.BootID)
+	}
+
+	jobID := accepted.Record.JobID.String()
+	record := loadAdmissionSafetyRecord(t, server, jobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeFailed || record.Terminal.Cause != model.CauseDaemonRestartedBeforeAuthorization {
+		t.Fatalf("sequential recovery terminal = %+v, want failed daemon-restarted-before-authorization", record.Terminal)
+	}
+
+	conn := dialRaw(t, server.socketPath)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	helloRaw(t, conn, reader, server.token)
+	resp := rpc(t, conn, reader, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-sequential-runtime",
+		RequestID:    "request-sequential-runtime",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	})
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnavailableNativeRuntime)
+	if resp.Error.Data.RuntimeSupport == nil || resp.Error.Data.RuntimeSupport.Class != custodian.SupportUnsupported.String() {
+		t.Fatalf("runtime support data = %+v, want unsupported assessment", resp.Error.Data.RuntimeSupport)
+	}
+
+	resp = rpc(t, conn, reader, "3", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: jobID})
+	var statuses protocol.JobStatusResult
+	decodeResult(t, resp, &statuses)
+	if len(statuses.Jobs) != 1 || statuses.Jobs[0].JobID != jobID || statuses.Jobs[0].State != engine.StateFailed {
+		t.Fatalf("job.status = %+v, want recovered failed authority job %s", statuses, jobID)
+	}
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0", got)
+	}
+}
+
 func TestAdmissionRecoveryExecutorUnboundControlLossFinalizesWithoutBackendStart(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -602,6 +698,77 @@ func TestAdmissionRecoveryExecutorUnboundControlLossFinalizesWithoutBackendStart
 	if reason := server.safetyLatch.Reason(); reason != nil {
 		t.Fatalf("safety latch tripped: %v", reason)
 	}
+}
+
+func TestIdentifiedSubmitReplayAfterRestartReturnsPreAuthorizationTerminal(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+
+	firstBackend := newFakeBackend("fake")
+	firstServer, _, cwd := newUnstartedTestServer(t, firstBackend)
+	firstLauncher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmissionWithAuthorityStore(t, firstServer, firstLauncher, repo, anchorStore)
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-preauth-crash",
+		RequestID:    "request-preauth-crash",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}
+	outcome := firstServer.handleJobSubmit(ctx, mustMarshal(t, params))
+	if outcome.err != nil {
+		t.Fatalf("initial submit error = %+v", outcome.err)
+	}
+	submitted, ok := outcome.result.(protocol.JobSubmitResult)
+	if !ok {
+		t.Fatalf("initial submit result type = %T", outcome.result)
+	}
+	if submitted.JobID == "" || submitted.Deduplicated {
+		t.Fatalf("initial submit result = %+v, want accepted non-replay", submitted)
+	}
+	if outcome.after == nil {
+		t.Fatal("initial submit did not return response hook")
+	}
+	if got := firstBackend.count.Load(); got != 1 {
+		t.Fatalf("first backend starts = %d, want construction before durable accept", got)
+	}
+	select {
+	case turn := <-firstBackend.turns:
+		t.Fatalf("backend turn = %+v, want none before response hook", turn)
+	default:
+	}
+
+	secondBackend := newFakeBackend("fake")
+	secondServer, _, _ := newUnstartedTestServer(t, secondBackend)
+	secondLauncher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmissionWithAuthorityStore(t, secondServer, secondLauncher, repo, anchorStore)
+
+	record := loadAdmissionSafetyRecord(t, secondServer, submitted.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeFailed || record.Terminal.Cause != model.CauseDaemonRestartedBeforeAuthorization {
+		t.Fatalf("recovered terminal = %+v, want failed daemon-restarted-before-authorization", record.Terminal)
+	}
+	if got := len(secondLauncher.preparedOrdinals()); got != 0 {
+		t.Fatalf("recovery prepared launches = %d, want 0", got)
+	}
+
+	replay := secondServer.handleJobSubmit(ctx, mustMarshal(t, params))
+	if replay.err != nil {
+		t.Fatalf("replay submit error = %+v", replay.err)
+	}
+	replayed, ok := replay.result.(protocol.JobSubmitResult)
+	if !ok {
+		t.Fatalf("replay submit result type = %T", replay.result)
+	}
+	if replayed.JobID != submitted.JobID || !replayed.Deduplicated || replayed.State != engine.StateFailed {
+		t.Fatalf("replay result = %+v, want same failed terminal job %s", replayed, submitted.JobID)
+	}
+	if replay.after != nil {
+		t.Fatal("replay returned a launch hook")
+	}
+	if got := secondBackend.count.Load(); got != 0 {
+		t.Fatalf("second backend starts = %d, want 0 for terminal replay", got)
+	}
+	assertAuthoritySafetyRecordCount(t, secondServer, 1)
 }
 
 func TestAdmissionRecoveryExecutorBoundCurrentObligationContainsOnlyDurableGroup(t *testing.T) {
@@ -815,6 +982,7 @@ func TestStrictIdentifiedOrderedRejectionsBeforeMutationOrRequestProbe(t *testin
 	type testCase struct {
 		name             string
 		configureBackend func(*fakeBackend)
+		configureServer  func(*Server)
 		availableRuntime bool
 		params           func(cwd string) protocol.JobSubmitParams
 		wantCode         string
@@ -861,6 +1029,22 @@ func TestStrictIdentifiedOrderedRejectionsBeforeMutationOrRequestProbe(t *testin
 			},
 			wantCode:  protocol.ErrorCapabilityMissing,
 			wantCause: protocol.AdmissionRejectUnfenceableBackend,
+		},
+		{
+			name:             "strict route disabled before missing identity",
+			availableRuntime: true,
+			configureServer: func(server *Server) {
+				server.admissionInstance.policy.strictRouteEnabled = false
+				server.admissionInstance.policy.strictRouteDisabledReason = "strict route disabled for test"
+			},
+			params: func(cwd string) protocol.JobSubmitParams {
+				return protocol.JobSubmitParams{
+					WorkspaceKey: "workspace-route-disabled",
+					TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+				}
+			},
+			wantCode:  protocol.ErrorCapabilityMissing,
+			wantCause: protocol.AdmissionRejectStrictRouteDisabled,
 		},
 		{
 			name:             "invalid config before unavailable runtime",
@@ -910,6 +1094,9 @@ func TestStrictIdentifiedOrderedRejectionsBeforeMutationOrRequestProbe(t *testin
 					t.Fatal(err)
 				}
 			}
+			if tt.configureServer != nil {
+				tt.configureServer(server)
+			}
 			probeLookups := runner.lookups.Load()
 			probeRuns := runner.runs.Load()
 
@@ -946,6 +1133,47 @@ func (b *failingProbeBackend) ProbeBackend(context.Context, command.ProbeRunner)
 	return nil, errors.New("codex binary not found: executable file not found in $PATH")
 }
 
+type probeErrorBackend struct {
+	*fakeBackend
+	err     error
+	started chan struct{}
+	probes  atomic.Int64
+}
+
+func (b *probeErrorBackend) ProbeBackend(ctx context.Context, _ command.ProbeRunner) (engine.Backend, error) {
+	b.probes.Add(1)
+	if b.started != nil {
+		select {
+		case b.started <- struct{}{}:
+		default:
+		}
+	}
+	if b.err != nil {
+		return nil, b.err
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+type lyingControlledBackend struct {
+	*fakeBackend
+	session *nonOrdinalSession
+	probes  atomic.Int64
+}
+
+func (b *lyingControlledBackend) ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error) {
+	b.probes.Add(1)
+	return b, nil
+}
+
+func (b *lyingControlledBackend) Start(context.Context, engine.SessionOpts) (engine.Session, error) {
+	n := b.count.Add(1)
+	if b.session == nil {
+		b.session = &nonOrdinalSession{id: b.Name() + "-non-ordinal-" + stringID(n)}
+	}
+	return b.session, nil
+}
+
 // A strict backend whose probe fails for environment reasons (missing binary,
 // bad version) must NOT fail Serve bootstrap: the daemon keeps serving and the
 // backend is recorded unfenceable so strict identified admission rejects it
@@ -977,6 +1205,120 @@ func TestServeBootstrapRecordsProbeFailureUnfenceableWithoutFailingClosed(t *tes
 		t.Fatalf("backend starts = %d, want 0", got)
 	}
 	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+}
+
+func TestServeBootstrapRecordsLiveParentContextProbeFailureUnfenceable(t *testing.T) {
+	t.Parallel()
+	backend := &probeErrorBackend{fakeBackend: newFakeBackend("fake"), err: context.DeadlineExceeded}
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-live-context-probe",
+		RequestID:    "request-live-context-probe",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want rejection", outcome.result)
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnfenceableBackend)
+	if !strings.Contains(outcome.err.Message, "probe strict backend fake failed: context deadline exceeded") {
+		t.Fatalf("rejection message = %q, want sanitized probe context failure", outcome.err.Message)
+	}
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0", got)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+}
+
+func TestServeBootstrapParentCanceledMidProbeFailsBootstrap(t *testing.T) {
+	t.Parallel()
+	backend := &probeErrorBackend{fakeBackend: newFakeBackend("fake"), started: make(chan struct{}, 1)}
+	server, _, _ := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	configureTestAdmissionRuntime(t, server, launcher, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- server.bootstrapAdmission(ctx)
+	}()
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("probe did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("bootstrapAdmission error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bootstrapAdmission did not return after parent cancellation")
+	}
+	if server.admissionInstance != nil {
+		t.Fatal("admission instance was published after canceled probe")
+	}
+}
+
+func TestIdentifiedSubmitRejectsSessionContractViolationBeforeDurableAccept(t *testing.T) {
+	t.Parallel()
+	session := &nonOrdinalSession{id: "lying-session"}
+	backend := &lyingControlledBackend{fakeBackend: newFakeBackend("fake"), session: session}
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	runner := &recordingProbeRunner{}
+	server.admissionProbeRunner = runner
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	if got := backend.probes.Load(); got != 1 {
+		t.Fatalf("bootstrap probes = %d, want 1", got)
+	}
+	probeLookups := runner.lookups.Load()
+	probeRuns := runner.runs.Load()
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-contract-violation",
+		RequestID:    "request-contract-violation",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want rejection", outcome.result)
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnfenceableBackend)
+	if !strings.Contains(outcome.err.Message, "backend contract violation") ||
+		!strings.Contains(outcome.err.Message, "descriptor claimed controlled-runner") ||
+		!strings.Contains(outcome.err.Message, "session lacks ordinal-bound runner capability") {
+		t.Fatalf("rejection message = %q, want backend contract violation reason", outcome.err.Message)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts = %d, want exactly one construction attempt", got)
+	}
+	if got := session.turns.Load(); got != 0 {
+		t.Fatalf("session turns = %d, want 0", got)
+	}
+	if got := len(launcher.preparedOrdinals()); got != 0 {
+		t.Fatalf("prepared launches = %d, want 0", got)
+	}
+	if got := runner.lookups.Load(); got != probeLookups {
+		t.Fatalf("probe lookups after request = %d, want unchanged %d", got, probeLookups)
+	}
+	if got := runner.runs.Load(); got != probeRuns {
+		t.Fatalf("probe runs after request = %d, want unchanged %d", got, probeRuns)
+	}
+	if got := backend.probes.Load(); got != 1 {
+		t.Fatalf("probe calls after request = %d, want bootstrap-only", got)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoAuthoritySafetyRecords(t, server)
 	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
 }
 
@@ -4261,6 +4603,11 @@ func (a *recordingLegacyLaunchAuthority) recordQuiescenceContextObservations() (
 
 func acceptIdentifiedAuthorityWork(t *testing.T, server *Server, requestID string) authority.AcceptResult {
 	t.Helper()
+	server.admissionStateMu.RLock()
+	defer server.admissionStateMu.RUnlock()
+	if server.admissionSubmission == nil {
+		t.Fatal("admission submission is not ready")
+	}
 	accepted, err := server.admissionSubmission.SubmitIdentified(context.Background(), authority.AcceptRequest{
 		RequestKey:   model.RequestKey{WorkspaceKey: model.WorkspaceKey("workspace/" + requestID), RequestID: model.RequestID(requestID)},
 		TaskIdentity: model.NewSHA256TaskIdentity([]byte(requestID)),
@@ -4274,6 +4621,11 @@ func acceptIdentifiedAuthorityWork(t *testing.T, server *Server, requestID strin
 
 func finalizeAcceptedAuthorityWork(t *testing.T, server *Server, accepted authority.AcceptResult) {
 	t.Helper()
+	server.admissionStateMu.RLock()
+	defer server.admissionStateMu.RUnlock()
+	if server.admissionReady == nil {
+		t.Fatal("admission ready is not ready")
+	}
 	_, err := server.admissionReady.Finalize(context.Background(), accepted.Record.JobID, accepted.Record.Attempt.Ref, model.TerminalIntent{
 		Outcome: model.OutcomeCanceled,
 		Cause:   model.CauseCanceledBeforeAuthorization,
@@ -4842,6 +5194,8 @@ func jobCancelViaHandler(t *testing.T, server *Server, params protocol.JobCancel
 
 func assertNoAcceptedJobsInAdmission(t *testing.T, server *Server) {
 	t.Helper()
+	server.admissionStateMu.RLock()
+	defer server.admissionStateMu.RUnlock()
 	if server.admissionReady == nil {
 		t.Fatal("admission authority is not ready")
 	}
@@ -4851,6 +5205,38 @@ func assertNoAcceptedJobsInAdmission(t *testing.T, server *Server) {
 	}
 	if len(snapshot.Pending) != 0 || len(snapshot.Owned) != 0 {
 		t.Fatalf("runtime snapshot = %+v, want no accepted work", snapshot)
+	}
+}
+
+func assertNoAuthoritySafetyRecords(t *testing.T, server *Server) {
+	t.Helper()
+	assertAuthoritySafetyRecordCount(t, server, 0)
+}
+
+func assertAuthoritySafetyRecordCount(t *testing.T, server *Server, want int) {
+	t.Helper()
+	server.admissionStateMu.RLock()
+	defer server.admissionStateMu.RUnlock()
+	if server.admissionRepository == nil {
+		t.Fatal("admission repository is not ready")
+	}
+	if err := server.admissionRepository.View(context.Background(), func(tx repository.ReadTx) error {
+		images, err := tx.ListJobs(repository.JobFilter{})
+		if err != nil {
+			return err
+		}
+		count := 0
+		for _, image := range images {
+			if image.Safety.State == repository.RecordValid {
+				count++
+			}
+		}
+		if count != want {
+			t.Fatalf("authority safety records = %d, want %d", count, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
