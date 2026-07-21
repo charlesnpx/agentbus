@@ -11,6 +11,17 @@ type ExecSpec struct {
 	Dir  string
 }
 
+type ProbeSpec struct {
+	Argv []string
+	Env  []string
+	Dir  string
+}
+
+type ProbeResult struct {
+	Stdout []byte
+	Stderr []byte
+}
+
 type ExitObservation struct {
 	Exited bool
 	Code   int
@@ -22,6 +33,11 @@ type Runner interface {
 }
 
 type CommandRunner = Runner
+
+type ProbeRunner interface {
+	LookPath(string) (string, error)
+	Run(context.Context, ProbeSpec) (ProbeResult, error)
+}
 
 type RunningCommand interface {
 	Stdin() io.WriteCloser

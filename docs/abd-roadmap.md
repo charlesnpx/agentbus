@@ -6,9 +6,10 @@ Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/
 
 STATUS: EXECUTING. R0..R3C CLOSED (R3C closed at c9470de: SHIP, 0 findings, after 2 worker rounds,
 2 domain reviews, 4 fix rounds + ship-confirm; landed the custodian-lifetime owner lease + inherited
-monitor leaf FD + serialized unleased cleanup + evidence-based SupportClass qualification). Next: R4A
-(worker launched) → R4B → R5 → R6/R7A → R7B. Production still UnavailableRuntime; R0T expected-RED
-green throughout.
+monitor leaf FD + serialized unleased cleanup + evidence-based SupportClass qualification). R4A
+IMPLEMENTATION LANDED (this tree: exec-seam boundary + runner-semantics fix; sol refute-first review
+next) → R4B → R5 → R6/R7A → R7B. Production still UnavailableRuntime; R0T expected-RED green
+throughout.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -285,6 +286,35 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
+- 2026-07-21 R4A LANDED (this commit): global no-hidden-exec structural guard + strict-only
+  fail-closed admission ordering + runner-semantics fix. Two worker rounds: R4A worker
+  (job ...000092, clean) delivered the unit — neutral seams `ProbeRunner`/`CommandRunner`, explicit
+  legacy `DirectProbeRunner`/`DirectCommandRunner`, pure `ValidateStaticOptions` + `ProbeBackend` as
+  the sole probing site, process-free `Backend.Start`/`Resume`/`NewSession`, Serve-bootstrap probing
+  (`probeAdmissionBackends`, before listen), os/exec AST/import allowlist guard with rationale
+  comments + unused-entry detection, 7 behavioral tests. R4A-fix worker (job ...000094) fixed the
+  race-sweep hang (P0C#14 class: StdoutPipe + io.Pipe stderr let TERM-ignoring grandchildren and
+  undrained callers block Wait to the 10m package timeout) — runner-owned os.Pipe pairs drained into
+  bounded ring buffers; exactly-once directTerminator (cancel ctx / Interrupt / Wait-ctx watcher)
+  closes runner read ends after group TERM→grace→KILL so Wait is bounded regardless of grandchildren
+  or non-reading callers; stdout is the stream boundary, stderr gets a bounded 200ms diagnostic
+  drain; cliadapter joins Wait in parallel with the stdout scan. The fix worker timed out at the
+  tail (apply_patch retried against a stale file view — 10th worker lifecycle failure; the fix was
+  already complete in-tree, receipts recovered from the rollout).
+  Orchestrator surgical repairs, ALL flagged for adversarial review: (1) codexcli/claudecli
+  Interrupt tests: blind 50ms sleep → deterministic trap-armed readiness (poll fixture stdin log,
+  written strictly after TERM trap install); (2) authority `defaultAnchorStoreFor` keyed by anchor
+  identity (dbUUID#schemaMajor) instead of repository POINTER (worker-diagnosed pointer-reuse
+  "db uuid mismatch" sweep flake; the anchor is a per-database fact); (3) served terminal-wait test
+  helpers 1s→10s positive-wait deadlines (record visibly mid-flight at 1s under sweep load).
+  Verification: macOS build/vet/gofmt + full suite green; `-race -count=20 TerminatesOnce` and
+  codexcli `-race -count=10` clean; full `-race -count=2 ./engine/... ./internal/served/...` sweeps
+  green on the final tree; Docker (golang:1.26, --privileged, --cgroupns=private): conformance=0,
+  linux_full=0, linux_race=0, R0T sentinel `strict_admission_unavailable` HELD (recipe pinned:
+  requires `-tags abd_strict_e2e` AND `AGENTBUS_RUN_STRICT_E2E=1`; without both, go prints a
+  deceptive bare PASS with "no tests to run"). Known divergence for review: Darwin
+  `NativeProcessTable` no longer shells out to `ps` (PID liveness without a Darwin start-time
+  token). Next: sol refute-first review bound to this commit.
 - 2026-07-21 R3C CLOSED. Ship-confirmation on c9470de: SHIP, findings none, all acceptance criteria
   MET (single composition point verified at both call sites; nothing else changed). R3C totals:
   6 commits (f439151, 2bb9a1a, 50b357d, 9aff4be, c9470de + fix worker rounds), 2 domain reviews +

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
@@ -43,6 +45,7 @@ type fakeBackend struct {
 	backendChildPID int
 	resumes         chan resumedSession
 	parkable        bool
+	controlled      bool
 }
 
 type fakeTurn struct {
@@ -55,11 +58,53 @@ type resumedSession struct {
 	Opts engine.SessionOpts
 }
 
+type probeableFakeBackend struct {
+	*fakeBackend
+	probes atomic.Int64
+}
+
+func (b *probeableFakeBackend) ProbeBackend(ctx context.Context, runner command.ProbeRunner) (engine.Backend, error) {
+	b.probes.Add(1)
+	if runner == nil {
+		return nil, errors.New("probe runner is required")
+	}
+	path, err := runner.LookPath(b.Name())
+	if err != nil {
+		return nil, err
+	}
+	if _, err := runner.Run(ctx, command.ProbeSpec{Argv: []string{path, "--version"}}); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+type recordingProbeRunner struct {
+	lookups atomic.Int64
+	runs    atomic.Int64
+}
+
+func (r *recordingProbeRunner) LookPath(file string) (string, error) {
+	r.lookups.Add(1)
+	if strings.TrimSpace(file) == "" {
+		return "", errors.New("missing probe path")
+	}
+	return "/probe/" + file, nil
+}
+
+func (r *recordingProbeRunner) Run(_ context.Context, spec command.ProbeSpec) (command.ProbeResult, error) {
+	r.runs.Add(1)
+	if len(spec.Argv) != 2 || spec.Argv[1] != "--version" {
+		return command.ProbeResult{}, fmt.Errorf("probe argv = %#v, want --version", spec.Argv)
+	}
+	return command.ProbeResult{Stdout: []byte("fake 1.0.0\n")}, nil
+}
+
 func newFakeBackend(name string) *fakeBackend {
 	return &fakeBackend{
-		name:     name,
-		turns:    make(chan fakeTurn, 32),
-		parkable: true,
+		name:       name,
+		turns:      make(chan fakeTurn, 32),
+		parkable:   true,
+		controlled: true,
 		events: func(prompt string, write bool) []engine.Event {
 			return []engine.Event{{Type: engine.EventAgentText, Text: "PASS\n\n## Findings\nNone.\n"}}
 		},
@@ -69,6 +114,8 @@ func newFakeBackend(name string) *fakeBackend {
 func (b *fakeBackend) Name() string { return b.name }
 
 func (b *fakeBackend) AdmissionParkable() bool { return b.parkable }
+
+func (b *fakeBackend) AdmissionControlledRunner() bool { return b.controlled }
 
 func (b *fakeBackend) Preflight(context.Context) (engine.Health, error) {
 	return engine.Health{Backend: b.name}, nil
@@ -655,6 +702,53 @@ func TestJobSubmitRequestIDCapabilityDisabledDoesNotStartBackend(t *testing.T) {
 	}
 }
 
+func TestInvalidStrictSubmitDoesNotProbeBackendVersion(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "version-probe-marker")
+	backend := codexcli.New(codexcli.Options{
+		Binary:    markerCodexCLI(t, marker),
+		CachePath: filepath.Join(dir, "setup-probes.json"),
+	})
+	h := startTestServer(t, backend, Config{IdleTimeout: -1})
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	helloRaw(t, conn, r, h.token)
+
+	resp := rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-missing-request-id",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: h.cwd, Write: false, Prompt: "hold"},
+	})
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("version probe marker stat err = %v, want not exist", err)
+	}
+}
+
+func TestBootstrapAdmissionProbesStrictBackendsWithConfiguredRunner(t *testing.T) {
+	t.Parallel()
+	backend := &probeableFakeBackend{fakeBackend: newFakeBackend("fake")}
+	server, _, _ := newUnstartedTestServer(t, backend)
+	runner := &recordingProbeRunner{}
+	server.admissionProbeRunner = runner
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	if got := backend.probes.Load(); got != 1 {
+		t.Fatalf("bootstrap probes = %d, want 1", got)
+	}
+	if got := runner.lookups.Load(); got != 1 {
+		t.Fatalf("probe runner lookups = %d, want 1", got)
+	}
+	if got := runner.runs.Load(); got != 1 {
+		t.Fatalf("probe runner runs = %d, want 1", got)
+	}
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts during bootstrap = %d, want 0", got)
+	}
+}
+
 func TestIdentifiedFencedSubmitUsesLaunchControllerAndCompletes(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -708,6 +802,27 @@ func TestIdentifiedSubmitRejectsBuiltInWhenFencedRuntimeUnavailableBeforeBackend
 	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
 	if got := backend.count.Load(); got != 0 {
 		t.Fatalf("backend starts = %d, want 0 before incompatible pre-accept reject", got)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+}
+
+func TestIdentifiedSubmitRejectsNoControlledRunnerBeforeBackendStart(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.controlled = false
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-no-controlled-runner",
+		RequestID:    "request-no-controlled-runner",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0 before controlled-runner pre-accept reject", got)
 	}
 	assertNoAcceptedJobsInAdmission(t, server)
 }
@@ -4339,7 +4454,12 @@ func loadAuthoritySafetyRecordFromRepository(t *testing.T, repo repository.Repos
 
 func waitAdmissionSafetyTerminal(t *testing.T, server *Server, jobID string) model.SafetyRecord {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	// Positive wait: generous under full-sweep race load (a passing run
+	// returns on the first poll after the terminal transition; only genuine
+	// failures pay the deadline). A 1s deadline flaked when the record was
+	// mid-flight (outcome+result recorded, terminal pending) under -race
+	// -count=2 whole-repo sweeps.
+	deadline := time.Now().Add(10 * time.Second)
 	var last model.SafetyRecord
 	for time.Now().Before(deadline) {
 		record := loadAdmissionSafetyRecord(t, server, jobID)
@@ -4355,7 +4475,8 @@ func waitAdmissionSafetyTerminal(t *testing.T, server *Server, jobID string) mod
 
 func waitSingleAdmissionSafetyTerminal(t *testing.T, server *Server) model.SafetyRecord {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	// Positive wait: see waitAdmissionSafetyTerminal for the deadline rationale.
+	deadline := time.Now().Add(10 * time.Second)
 	var last model.SafetyRecord
 	for time.Now().Before(deadline) {
 		record := singleAuthoritySafetyRecord(t, server)
@@ -4476,6 +4597,23 @@ func addScriptedSession(t *testing.T, server *Server, backend *fakeBackend, cwd,
 	server.mu.Lock()
 	server.sessions[sessionID] = &sessionState{id: sessionID, backend: backend.Name(), cwd: cwd, session: session}
 	server.mu.Unlock()
+}
+
+func markerCodexCLI(t *testing.T, marker string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "codex-marker")
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf probed > %q
+  printf 'codex-cli %s\n'
+  exit 0
+fi
+printf '{"type":"thread.started","thread_id":"codex-session"}\n{"type":"turn.completed","last_agent_message":"ok"}\n'
+`, marker, codexcli.MinimumKnownGoodVersion)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 type attemptResult struct {

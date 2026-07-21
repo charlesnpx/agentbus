@@ -66,6 +66,73 @@ func TestArchitectureImportGuards(t *testing.T) {
 	}
 }
 
+func TestCliAdapterImportsCommandBoundary(t *testing.T) {
+	root := repoRoot(t)
+	files := collectNonTestGoFiles(t, []string{filepath.Join(root, "engine", "adapter", "internal", "cliadapter")})
+	importsCommand := false
+	for _, path := range files {
+		file := parseGoFile(t, path, parser.ImportsOnly)
+		for _, spec := range file.Imports {
+			importPath, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				t.Fatalf("unquote import in %s: %v", path, err)
+			}
+			switch {
+			case importPath == "os/exec":
+				t.Fatalf("%s imports os/exec; cliadapter must use engine/command runners", path)
+			case importPath == modulePath+"/engine/command":
+				importsCommand = true
+			case strings.HasPrefix(importPath, modulePath+"/engine/execution/") || importPath == modulePath+"/engine/execution":
+				t.Fatalf("%s imports %s; cliadapter must not depend on execution internals", path, importPath)
+			}
+		}
+	}
+	if !importsCommand {
+		t.Fatal("cliadapter does not import engine/command")
+	}
+}
+
+func TestOnlyAllowedProductionFilesImportOSExec(t *testing.T) {
+	root := repoRoot(t)
+	allowed := map[string]string{
+		// Legacy unfenced command execution seam.
+		"engine/command/direct_command.go": "DirectCommandRunner is the explicit legacy process launcher",
+		// Legacy executable lookup/version/help probe seam.
+		"engine/command/direct_probe.go": "DirectProbeRunner is the explicit probe launcher",
+		// Native custody helper launches parked workers.
+		"internal/parklaunch/launcher.go": "parked worker process launcher for native custody",
+		// Native custody helper launches retained monitor processes.
+		"internal/parklaunch/monitor.go": "retained monitor process launcher for native custody",
+		// Native cgroup helper inspects host command availability for Linux support checks.
+		"internal/cgroup/types.go": "native cgroup support probes command availability",
+		// CLI daemonizer; not an adapter lifecycle/probe path.
+		"cmd/agentbus/main.go": "background daemon start helper",
+		// Client daemon autostart; not an adapter lifecycle/probe path.
+		"client/client.go": "client-side daemon autostart helper",
+	}
+	seen := map[string]bool{}
+	files := collectNonTestGoFiles(t, []string{root})
+	for _, path := range files {
+		if !fileImports(t, path, "os/exec") {
+			continue
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rel = filepath.ToSlash(rel)
+		if _, ok := allowed[rel]; !ok {
+			t.Fatalf("%s imports os/exec but is not in the architecture allowlist", rel)
+		}
+		seen[rel] = true
+	}
+	for rel := range allowed {
+		if !seen[rel] {
+			t.Fatalf("os/exec allowlist entry %s is stale; remove or update its rationale", rel)
+		}
+	}
+}
+
 func TestServedStartupRecoveryDoesNotImportRepository(t *testing.T) {
 	root := repoRoot(t)
 	assertFileNoForbiddenImports(t,
@@ -315,6 +382,21 @@ func parseGoFile(t *testing.T, path string, mode parser.Mode) *ast.File {
 		t.Fatalf("parse %s: %v", path, err)
 	}
 	return file
+}
+
+func fileImports(t *testing.T, path, want string) bool {
+	t.Helper()
+	file := parseGoFile(t, path, parser.ImportsOnly)
+	for _, spec := range file.Imports {
+		importPath, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			t.Fatalf("unquote import in %s: %v", path, err)
+		}
+		if importPath == want {
+			return true
+		}
+	}
+	return false
 }
 
 func repoRoot(t *testing.T) string {

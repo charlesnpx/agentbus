@@ -82,7 +82,7 @@ func NewBootstrapper(repo repository.Repository, options ...BootstrapperOption) 
 		}
 		anchorStore := config.anchorStore
 		if anchorStore == nil {
-			anchorStore = defaultAnchorStoreFor(repo)
+			anchorStore = defaultAnchorStoreFor(dbUUID, schemaMajor)
 		}
 		anchor = anchorStore.Adapter(dbUUID, schemaMajor)
 	}
@@ -357,8 +357,16 @@ func NewFakeAnchor() *FakeAnchor {
 	return &FakeAnchor{}
 }
 
-func defaultAnchorStoreFor(repo repository.Repository) *AnchorStore {
-	key := defaultAnchorKey(repo)
+// defaultAnchorStoreFor caches default anchor stores by the repository's
+// ANCHOR IDENTITY (db uuid + schema major), never by repository pointer.
+// The anchor is a per-database fact: two bootstrappers over the same database
+// must share one store, and a freshly allocated repository that happens to
+// reuse a freed repository's address must NOT inherit that repository's
+// anchor store (a pointer key did exactly that under load, tripping
+// "db uuid mismatch" when the recycled store was already bound to the old
+// database's uuid).
+func defaultAnchorStoreFor(dbUUID string, schemaMajor uint16) *AnchorStore {
+	key := fmt.Sprintf("%s#%d", dbUUID, schemaMajor)
 	if existing, ok := defaultAnchorStores.Load(key); ok {
 		return existing.(*AnchorStore)
 	}

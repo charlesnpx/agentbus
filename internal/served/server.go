@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
@@ -77,6 +78,7 @@ type Config struct {
 	GCInterval          time.Duration
 	ReapTickInterval    time.Duration
 	Runtime             custodian.Runtime
+	ProbeRunner         command.ProbeRunner
 }
 
 type tickerSource struct {
@@ -139,6 +141,7 @@ type Server struct {
 	admissionRuntime             *servedAdmissionRuntime
 	admissionRuntimeFactory      func(*Server) *servedAdmissionRuntime
 	admissionRuntimeConfig       custodian.Runtime
+	admissionProbeRunner         command.ProbeRunner
 	admissionDaemonBootOnce      sync.Once
 	admissionDaemonBootRef       model.BootRef
 	admissionDaemonBootRefErr    error
@@ -312,6 +315,10 @@ func New(cfg Config) (*Server, error) {
 	if binaryIdentityProbe == nil {
 		binaryIdentityProbe = statBinaryIdentity
 	}
+	probeRunner := cfg.ProbeRunner
+	if probeRunner == nil {
+		probeRunner = command.DirectProbeRunner{}
+	}
 	return &Server{
 		stateRoot:              root,
 		cwd:                    cwd,
@@ -344,6 +351,7 @@ func New(cfg Config) (*Server, error) {
 		admissionJobs:          make(map[string]struct{}),
 		admissionEffectMu:      make(map[string]*sync.Mutex),
 		admissionRuntimeConfig: cfg.Runtime,
+		admissionProbeRunner:   probeRunner,
 		activeJobs:             make(map[string]*activeJob),
 		lastActivity:           clock.Now().UTC(),
 	}, nil

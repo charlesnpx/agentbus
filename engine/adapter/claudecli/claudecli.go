@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/internal/cliadapter"
+	"github.com/charlesnpx/agentbus/engine/command"
 )
 
 const (
@@ -101,12 +101,15 @@ func New(opts Options) engine.Backend {
 	}
 }
 
-func discoverModels(ctx context.Context, binary string) (*engine.ModelDiscovery, error) {
-	out, err := exec.CommandContext(ctx, binary, "--help").CombinedOutput()
+func discoverModels(ctx context.Context, runner command.ProbeRunner, binary string) (*engine.ModelDiscovery, error) {
+	if runner == nil {
+		return nil, fmt.Errorf("probe runner is required")
+	}
+	result, err := runner.Run(ctx, command.ProbeSpec{Argv: []string{binary, "--help"}})
 	if err != nil {
 		return nil, err
 	}
-	text := string(out)
+	text := string(result.Stdout) + string(result.Stderr)
 	efforts := valuesFromGroup(text, `(?m)--effort[^\n]*\n?[^\n]*\(([^)]+)\)`)
 	models := valuesFromGroup(text, `(?m)--model[^\n]*\n(?:[^\n]*\n){0,4}?[^\n]*\((?:e\.g\.\s*)?([^)]+)\)`)
 	if len(models) == 0 && len(efforts) == 0 {

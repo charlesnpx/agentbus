@@ -4,13 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -45,42 +44,6 @@ func TestCapEventKeepsRawTextOutOfJSONMetadata(t *testing.T) {
 	if strings.Contains(string(wire), "agentbusRawText") || strings.Contains(string(wire), "SECRET_RAW_TAIL") {
 		t.Fatalf("wire event leaked raw text metadata: %s", wire)
 	}
-}
-
-func TestSessionInterruptUsesProtocolDefaultGrace(t *testing.T) {
-	original := terminateProcessGroup
-	defer func() { terminateProcessGroup = original }()
-	seen := make(chan time.Duration, 1)
-	terminateProcessGroup = func(_ *exec.Cmd, grace time.Duration) error {
-		seen <- grace
-		return nil
-	}
-	session := &Session{active: &directRunningCommand{
-		cmd:         &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}},
-		cancelGrace: engine.DefaultCancelGrace,
-	}}
-	if err := session.Interrupt(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case got := <-seen:
-		if got != engine.DefaultCancelGrace {
-			t.Fatalf("grace = %s, want %s", got, engine.DefaultCancelGrace)
-		}
-	default:
-		t.Fatal("interrupt did not terminate the active process group")
-	}
-}
-
-func TestDirectCommandRunnerTimeoutTerminatesOnce(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
-	defer cancel()
-	assertDirectCommandRunnerContextDoneTerminatesOnce(t, ctx, func() {})
-}
-
-func TestDirectCommandRunnerContextCancelTerminatesOnce(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	assertDirectCommandRunnerContextDoneTerminatesOnce(t, ctx, cancel)
 }
 
 func TestSessionTurnSurfacesMalformedStreamAsTerminalError(t *testing.T) {
@@ -200,6 +163,24 @@ func TestSessionTurnInheritedStderrDoesNotHang(t *testing.T) {
 	t.Fatalf("events = %#v, want parsed event before inherited stderr closes", got)
 }
 
+func TestBackendStartNeverExecsBinary(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "version-probe-marker")
+	backend := markerBackendForLifecycleTest(t, marker)
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	assertFileMissing(t, marker)
+}
+
+func TestBackendResumeNeverExecsBinary(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "version-probe-marker")
+	backend := markerBackendForLifecycleTest(t, marker)
+	if _, err := backend.Resume(context.Background(), "resume-id", engine.SessionOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	assertFileMissing(t, marker)
+}
+
 func TestSessionTurnTimeoutKillsDescendantHoldingStdout(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("process group signal assertions are unix-only")
@@ -284,9 +265,10 @@ func TestCopyAndCloseClosesSourceOnWriterFailure(t *testing.T) {
 
 func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 	runner := &fakeCommandRunner{}
+	marker := filepath.Join(t.TempDir(), "direct-exec-marker")
 	backend := &Backend{
 		NameValue: "fake",
-		Binary:    "fake-binary",
+		Binary:    markerCLI(t, marker),
 		CachePath: filepath.Join(t.TempDir(), "missing-cache.json"),
 		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
 			return []string{"run", "--json"}, nil
@@ -311,45 +293,13 @@ func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 	if session.ID() != "stream-session" {
 		t.Fatalf("session id = %q, want stream-session", session.ID())
 	}
-	if strings.Join(runner.spec.Argv, "\x00") != strings.Join([]string{"fake-binary", "run", "--json"}, "\x00") {
+	if strings.Join(runner.spec.Argv, "\x00") != strings.Join([]string{backend.Binary, "run", "--json"}, "\x00") {
 		t.Fatalf("argv = %#v", runner.spec.Argv)
 	}
 	if runner.spec.Dir != cwd {
 		t.Fatalf("dir = %q, want %q", runner.spec.Dir, cwd)
 	}
-}
-
-func assertDirectCommandRunnerContextDoneTerminatesOnce(t *testing.T, ctx context.Context, triggerCancel func()) {
-	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("process group signal assertions are unix-only")
-	}
-	original := terminateProcessGroup
-	var calls atomic.Int32
-	terminateProcessGroup = func(cmd *exec.Cmd, grace time.Duration) error {
-		calls.Add(1)
-		return original(cmd, grace)
-	}
-	t.Cleanup(func() { terminateProcessGroup = original })
-
-	running, err := (DirectCommandRunner{CancelGrace: 10 * time.Millisecond}).Start(ctx, command.ExecSpec{
-		Argv: []string{"/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = running.Stdin().Close() }()
-	defer func() { _ = running.Stdout().Close() }()
-	defer func() { _ = running.Stderr().Close() }()
-
-	triggerCancel()
-	_, err = running.Wait(context.Background())
-	if err == nil {
-		t.Fatal("Wait succeeded, want cancellation error")
-	}
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("terminateProcessGroup calls = %d, want 1", got)
-	}
+	assertFileMissing(t, marker)
 }
 
 func fakeTerminalErrorCLI(t *testing.T) string {
@@ -380,6 +330,44 @@ exit 0
 		t.Fatal(err)
 	}
 	return path
+}
+
+func markerBackendForLifecycleTest(t *testing.T, marker string) *Backend {
+	t.Helper()
+	return &Backend{
+		NameValue: "fake",
+		Binary:    markerCLI(t, marker),
+		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
+			return []string{"run"}, nil
+		},
+		Parse: func(map[string]any) ([]engine.Event, string, error) {
+			return []engine.Event{{Type: engine.EventAgentText, Text: "ok"}}, "", nil
+		},
+	}
+}
+
+func markerCLI(t *testing.T, marker string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "marker-cli")
+	script := fmt.Sprintf(`#!/bin/sh
+printf marker > %q
+if [ "$1" = "--version" ]; then
+  printf 'fake 1.0.0\n'
+  exit 0
+fi
+printf '{"event":"ok"}\n'
+`, marker)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func assertFileMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("%s stat err = %v, want not exist", path, err)
+	}
 }
 
 func collectEvents(ch <-chan engine.Event) []engine.Event {

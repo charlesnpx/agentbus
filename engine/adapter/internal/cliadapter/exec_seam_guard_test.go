@@ -11,33 +11,19 @@ import (
 	"testing"
 )
 
-func TestCliAdapterExecSeamCharacterizesOrchestrationExecSites(t *testing.T) {
+func TestCliAdapterHasNoExecCallSites(t *testing.T) {
 	sites, err := findExecCallSites(".")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	var orchestration []string
+	var got []string
 	for _, site := range sites {
-		if site.File == "direct_runner.go" {
-			continue
-		}
-		orchestration = append(orchestration, site.String())
+		got = append(got, site.String())
 	}
-	sort.Strings(orchestration)
-
-	// S4/#13 tightens this to zero orchestration os/exec calls. Until then,
-	// this pins the known setup/preflight/validation version-probe seams and
-	// fails if new os/exec call sites appear outside direct_runner.go.
-	want := []string{
-		"adapter.go:Backend.DiscoverModels:exec.LookPath",
-		"adapter.go:Backend.Preflight:exec.LookPath",
-		"adapter.go:Backend.SetupProbe:exec.LookPath",
-		"adapter.go:Backend.validationSets:exec.LookPath",
-		"adapter.go:commandOutput:exec.CommandContext",
-	}
-	if strings.Join(orchestration, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("orchestration os/exec call sites changed\n got:\n%s\nwant:\n%s", strings.Join(orchestration, "\n"), strings.Join(want, "\n"))
+	sort.Strings(got)
+	if len(got) != 0 {
+		t.Fatalf("cliadapter production os/exec call sites:\n%s", strings.Join(got, "\n"))
 	}
 }
 

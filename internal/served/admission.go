@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -39,6 +40,10 @@ type admissionCoordinator = coordinator.Coordinator
 
 type admissionBootstrapperFactory func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error)
 
+type admissionProbeableBackend interface {
+	ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error)
+}
+
 func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	runtime := s.admissionRuntime
 	if runtime == nil {
@@ -51,6 +56,9 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	}
 	if s.admissionReady != nil && s.admissionCoordinator != nil {
 		return nil
+	}
+	if err := s.probeAdmissionBackends(ctx); err != nil {
+		return err
 	}
 
 	factory := s.admissionBootstrapperFactory
@@ -115,6 +123,40 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	s.admissionRepository = repo
 	s.admissionClose = closer
 	closeOnErr = false
+	return nil
+}
+
+func (s *Server) probeAdmissionBackends(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	runner := s.admissionProbeRunner
+	if runner == nil {
+		runner = command.DirectProbeRunner{}
+	}
+	names := make([]string, 0, len(s.backends))
+	for name := range s.backends {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		backend := s.backends[name]
+		probeable, ok := backend.(admissionProbeableBackend)
+		if !ok {
+			continue
+		}
+		probed, err := probeable.ProbeBackend(ctx, runner)
+		if err != nil {
+			return fmt.Errorf("probe strict backend %s: %w", name, err)
+		}
+		if probed == nil {
+			return fmt.Errorf("probe strict backend %s: nil probed backend", name)
+		}
+		if probed.Name() != name {
+			return fmt.Errorf("probe strict backend %s: probed backend changed name to %s", name, probed.Name())
+		}
+		s.backends[name] = probed
+	}
 	return nil
 }
 
@@ -433,6 +475,10 @@ type admissionParkableBackend interface {
 	AdmissionParkable() bool
 }
 
+type admissionControlledRunnerBackend interface {
+	AdmissionControlledRunner() bool
+}
+
 func (s *Server) admissionExecutionCapabilities(backend engine.Backend) model.ExecutionCapabilities {
 	return model.ExecutionCapabilities{
 		ExternalRunner: admissionBackendExternalRunner(backend),
@@ -452,6 +498,21 @@ func admissionBackendExternalRunner(backend engine.Backend) bool {
 		return false
 	default:
 		return true
+	}
+}
+
+func admissionBackendControlledRunner(backend engine.Backend) bool {
+	if backend == nil {
+		return false
+	}
+	if controlled, ok := backend.(admissionControlledRunnerBackend); ok {
+		return controlled.AdmissionControlledRunner()
+	}
+	switch backend.Name() {
+	case "codex", "claude":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1421,6 +1482,12 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	mode, err := model.RouteSubmissionMode(caps)
 	if err != nil {
 		return requestOutcome{err: admissionProtocolError(err)}
+	}
+	if mode == model.ModeIdentifiedFenced && !admissionBackendControlledRunner(backend) {
+		return requestOutcome{err: admissionProtocolError(model.IncompatibleExecutionCapabilitiesError{
+			Capabilities: caps,
+			Reason:       "identified fenced admission requires a controlled command runner before acceptance",
+		})}
 	}
 	canonicalCWD, err := engine.CanonicalWorkspace(spec.CWD)
 	if err != nil {

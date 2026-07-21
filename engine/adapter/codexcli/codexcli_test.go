@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/command"
 )
 
 func TestCodexProfilesAndParsing(t *testing.T) {
@@ -217,7 +218,7 @@ func TestCodexDiscoveryReadsModelsCache(t *testing.T) {
     {"slug":"gpt-5.3","visibility":"list","supported_reasoning_levels":[{"effort":"none"},{"effort":"max"},{"effort":"turbo"},{"effort":"custom"}]}
   ]
 }`)
-	discovery, err := discoverModels(context.Background(), "unused")
+	discovery, err := discoverModels(context.Background(), command.DirectProbeRunner{}, "unused")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,15 +239,15 @@ func TestCodexDiscoveryReadsModelsCache(t *testing.T) {
 func TestCodexDiscoveryReportsMissingMalformedAndStaleCache(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", home)
-	if discovery, err := discoverModels(context.Background(), "unused"); discovery != nil || err == nil || !strings.Contains(err.Error(), "models cache") {
+	if discovery, err := discoverModels(context.Background(), command.DirectProbeRunner{}, "unused"); discovery != nil || err == nil || !strings.Contains(err.Error(), "models cache") {
 		t.Fatalf("missing discovery=%+v err=%v", discovery, err)
 	}
 	writeModelsCache(t, home, `{not-json`)
-	if discovery, err := discoverModels(context.Background(), "unused"); discovery != nil || err == nil || !strings.Contains(err.Error(), "parse models cache") {
+	if discovery, err := discoverModels(context.Background(), command.DirectProbeRunner{}, "unused"); discovery != nil || err == nil || !strings.Contains(err.Error(), "parse models cache") {
 		t.Fatalf("malformed discovery=%+v err=%v", discovery, err)
 	}
 	writeModelsCache(t, home, `{"fetched_at":"2020-01-01T00:00:00Z","models":[{"slug":"gpt-5.4","visibility":"list"}]}`)
-	discovery, err := discoverModels(context.Background(), "unused")
+	discovery, err := discoverModels(context.Background(), command.DirectProbeRunner{}, "unused")
 	if err != nil || !containsString(discovery.Warnings, "older than 7 days") {
 		t.Fatalf("stale discovery=%+v err=%v", discovery, err)
 	}
@@ -271,15 +272,17 @@ func TestCodexSetupProbeReportsModelsCacheFailuresWithoutFailing(t *testing.T) {
 
 func TestCodexDiscoveredCacheWinsAndLegacyFallsBack(t *testing.T) {
 	fake := fakeCodex(t)
-	cache := engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{Backend: "codex", BinaryPath: fake.bin, Version: MinimumKnownGoodVersion, StreamSchema: StreamSchema, DiscoveredModels: []string{"discovered"}, DiscoveredEfforts: []string{"turbo"}, DiscoverySource: "models_cache"}}}
-	if err := engine.WriteSetupProbeCache(fake.cache, cache); err != nil {
-		t.Fatal(err)
-	}
+	writeModelsCache(t, filepath.Dir(fake.bin), `{
+  "fetched_at": "2026-07-11T12:00:00Z",
+  "client_version": "0.143.0",
+  "models": [{"slug":"discovered","visibility":"list","supported_reasoning_levels":[{"effort":"turbo"}]}]
+}`)
 	backend := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"static"}, SupportedEfforts: []string{"low"}})
-	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "discovered", Effort: "turbo"}); err != nil {
+	probed := probeBackendForTest(t, backend)
+	if _, err := probed.Start(context.Background(), engine.SessionOpts{Model: "discovered", Effort: "turbo"}); err != nil {
 		t.Fatal(err)
 	}
-	session, err := backend.Start(context.Background(), engine.SessionOpts{Model: "static", Effort: "low"})
+	session, err := probed.Start(context.Background(), engine.SessionOpts{Model: "static", Effort: "low"})
 	if err != nil {
 		t.Fatalf("discovered mismatch should pass through: %v", err)
 	}
@@ -289,6 +292,9 @@ func TestCodexDiscoveredCacheWinsAndLegacyFallsBack(t *testing.T) {
 	}
 	if got := collect(events); !containsWarning(got, "not in the discovered") {
 		t.Fatalf("events=%#v, want discovered-catalog warning", got)
+	}
+	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "discovered"}); err == nil || !strings.Contains(err.Error(), "unsupported model") {
+		t.Fatalf("unprobed backend should use static validation, err=%v", err)
 	}
 	v1 := fmt.Sprintf(`{"version":1,"backends":[{"backend":"codex","binaryPath":%q,"version":%q,"streamSchema":%q,"jsonEventsProbed":true}]}`, fake.bin, MinimumKnownGoodVersion, StreamSchema)
 	if err := os.WriteFile(fake.cache, []byte(v1), 0o600); err != nil {
@@ -316,15 +322,13 @@ func TestCodexDiscoveredCacheWinsAndLegacyFallsBack(t *testing.T) {
 
 func TestCodexEmptyDiscoveredCatalogFallsBackToStaticEnforcement(t *testing.T) {
 	fake := fakeCodex(t)
-	cache := engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{Backend: "codex", BinaryPath: fake.bin, Version: MinimumKnownGoodVersion, StreamSchema: StreamSchema, DiscoverySource: "models_cache"}}}
-	if err := engine.WriteSetupProbeCache(fake.cache, cache); err != nil {
-		t.Fatal(err)
-	}
+	writeModelsCache(t, filepath.Dir(fake.bin), `{"fetched_at":"2026-07-11T12:00:00Z","client_version":"0.143.0","models":[]}`)
 	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
-	if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: "turbo"}); err == nil || !strings.Contains(err.Error(), "unsupported effort") {
+	probed := probeBackendForTest(t, backend)
+	if _, err := probed.Start(context.Background(), engine.SessionOpts{Effort: "turbo"}); err == nil || !strings.Contains(err.Error(), "unsupported effort") {
 		t.Fatalf("empty discovered catalog must fall back to static effort enforcement, err=%v", err)
 	}
-	if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: "xhigh"}); err != nil {
+	if _, err := probed.Start(context.Background(), engine.SessionOpts{Effort: "xhigh"}); err != nil {
 		t.Fatalf("static effort should pass: %v", err)
 	}
 }
@@ -366,13 +370,9 @@ func TestCodexSetupProbeCacheProvenanceRoundTripAndLegacyRequiresSetup(t *testin
 
 func TestCodexUpgradedVersionFallsBackAndWarnsOnTurn(t *testing.T) {
 	fake := fakeCodex(t)
-	cache := engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{Backend: "codex", BinaryPath: fake.bin, Version: "0.142.0", StreamSchema: StreamSchema, DiscoveredModels: []string{"old-discovered"}}}}
-	if err := engine.WriteSetupProbeCache(fake.cache, cache); err != nil {
-		t.Fatal(err)
-	}
 	backend := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"static"}})
 	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "old-discovered"}); err == nil {
-		t.Fatal("stale discovered model unexpectedly accepted")
+		t.Fatal("unprobed discovered model unexpectedly accepted")
 	}
 	session, err := backend.Start(context.Background(), engine.SessionOpts{Model: "static"})
 	if err != nil {
@@ -382,8 +382,8 @@ func TestCodexUpgradedVersionFallsBackAndWarnsOnTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := collect(events); !containsWarning(got, "stale") {
-		t.Fatalf("events=%#v, want stale discovery warning", got)
+	if got := collect(events); containsWarning(got, "stale") {
+		t.Fatalf("events=%#v, want no stale discovery warning from unprobed validation", got)
 	}
 }
 
@@ -478,11 +478,15 @@ func TestCodexTimeoutInterruptAndTruncation(t *testing.T) {
 		t.Fatalf("expected timeout warning, got %#v", got)
 	}
 
-	events, err = session.Turn(context.Background(), engine.TurnInput{Prompt: "sleep", Write: false})
+	events, err = session.Turn(context.Background(), engine.TurnInput{Prompt: "sleep interrupt-turn", Write: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond)
+	// The fixture writes this turn's prompt to the stdin log strictly AFTER
+	// installing its TERM trap, so observing the prompt proves the trap is
+	// armed. A blind sleep raced trap installation under full-sweep load and
+	// let SIGTERM kill the untrapped shell before it could record the signal.
+	waitForFileContains(t, fake.stdin, "interrupt-turn")
 	if err := session.Interrupt(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -498,6 +502,21 @@ type fakeCLI struct {
 	argv  string
 	stdin string
 	term  string
+}
+
+func probeBackendForTest(t *testing.T, backend engine.Backend) engine.Backend {
+	t.Helper()
+	probeable, ok := backend.(interface {
+		ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error)
+	})
+	if !ok {
+		t.Fatal("backend does not implement ProbeBackend")
+	}
+	probed, err := probeable.ProbeBackend(context.Background(), command.DirectProbeRunner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return probed
 }
 
 func fakeCodex(t *testing.T) fakeCLI {
@@ -543,6 +562,18 @@ func writeModelsCache(t *testing.T, home, content string) {
 	if err := os.WriteFile(filepath.Join(home, "models_cache.json"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func waitForFileContains(t *testing.T, path, want string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), want) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("fixture never wrote %q to %s", want, path)
 }
 
 func containsString(values []string, sub string) bool {
