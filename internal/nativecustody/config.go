@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
-	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/containment"
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
 )
@@ -68,9 +67,6 @@ func MonitorContainment() parklaunch.Containment {
 }
 
 func RunMonitorFromFDs(ctx context.Context, daemonFD, targetFD, readyFD, leafFD int) error {
-	return parklaunch.RunMonitorFromFDs(ctx, daemonFD, targetFD, readyFD, custodian.RealContainment{
-		Params:                      ProductionContainmentParams(),
-		RetainedObject:              cgroup.NewInheritedRetainedGroupObjectFromLeafFD(leafFD),
-		TolerateUnleasedCleanupSkip: true,
-	})
+	return parklaunch.RunMonitorFromFDs(ctx, daemonFD, targetFD, readyFD,
+		custodian.NewInheritedMonitorContainment(ProductionContainmentParams(), leafFD))
 }

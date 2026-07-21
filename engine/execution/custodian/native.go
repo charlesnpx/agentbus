@@ -1806,3 +1806,18 @@ func groupKey(group model.GroupRef) string {
 		group.Leader.HighResStartToken + "\x00" +
 		string(group.CustodyID)
 }
+
+// NewInheritedMonitorContainment is the SINGLE composition point for the
+// monitor process's containment: an inherited retained-leaf capability plus
+// tolerance for the typed unleased-cleanup skip (a live leased owner reaps the
+// leaf; absence proof is unaffected). Production (nativecustody) and the Linux
+// conformance helper monitor MUST both build through this function so the
+// safety-sensitive composition cannot drift (the tolerance flag was once lost
+// exactly this way).
+func NewInheritedMonitorContainment(params containment.Params, leafFD int) RealContainment {
+	return RealContainment{
+		Params:                      params,
+		RetainedObject:              cgroup.NewInheritedRetainedGroupObjectFromLeafFD(leafFD),
+		TolerateUnleasedCleanupSkip: true,
+	}
+}

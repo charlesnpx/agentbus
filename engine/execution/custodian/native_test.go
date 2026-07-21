@@ -26,7 +26,6 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
-	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/containment"
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
 	"github.com/charlesnpx/agentbus/internal/procgroup"
@@ -2664,15 +2663,9 @@ func runNativeMonitorHelper(args []string) int {
 		if *leafFD < 3 {
 			return 2
 		}
-		containmentImpl = RealContainment{
-			Params:         defaultNativeTestParams(),
-			RetainedObject: cgroup.NewInheritedRetainedGroupObjectFromLeafFD(*leafFD),
-			// Mirror the production monitor composition
-			// (nativecustody.RunMonitorFromFDs): a typed unleased-cleanup skip
-			// after proven absence is expected while the daemon holds the
-			// lifetime root lease.
-			TolerateUnleasedCleanupSkip: true,
-		}
+		// The SAME composition point production uses
+		// (nativecustody.RunMonitorFromFDs) — never a hand-mirrored copy.
+		containmentImpl = NewInheritedMonitorContainment(defaultNativeTestParams(), *leafFD)
 	}
 	if delayPath := os.Getenv(nativeHelperMonitorDelayReady); delayPath != "" {
 		containmentImpl = delayReadyNativeMonitorContainment{
