@@ -182,14 +182,6 @@ func runClassifiedNativeSelfTest(ctx context.Context, maxAttempts int, attempt n
 					CleanupSafe: false,
 				}
 			}
-			if nativeSelfTestLeaseContention(result.Cause) {
-				return SupportAssessment{
-					Class:       SupportRetryable,
-					Cause:       result.Cause,
-					Attempts:    i,
-					CleanupSafe: cleanupSafe,
-				}
-			}
 			if i == maxAttempts {
 				return SupportAssessment{
 					Class:       SupportRetryable,
@@ -243,13 +235,12 @@ func normalizeNativeSelfTestAttemptResult(result nativeSelfTestAttemptResult) na
 	return result
 }
 
-func nativeSelfTestLeaseContention(err error) bool {
-	return errors.Is(err, cgroup.ErrRootLeaseUnavailable)
-}
-
 func classifyNativeSelfTestPrepareFailure(err error) nativeSelfTestAttemptResult {
 	if nativeRuntimePlatformUnsupportedError(err) {
 		return unsupportedNativeSelfTest(fmt.Errorf("%w: %w", ErrNativeRuntimeUnsupported, err), true)
+	}
+	if errors.Is(err, cgroup.ErrRootLeaseUnavailable) {
+		return unsafeNativeSelfTest(fmt.Errorf("%w: post-construction root lease unavailable during self-test: %w", ErrNativeRuntimeSelfTestUnsafe, err), false)
 	}
 	created, cleanupVerified, ok := nativePrepareFailureEvidence(err)
 	if ok && (!created || cleanupVerified) {

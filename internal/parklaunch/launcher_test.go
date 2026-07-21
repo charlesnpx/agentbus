@@ -1203,6 +1203,71 @@ func TestStartMonitorProcessStartFailureDoesNotLeakFDs(t *testing.T) {
 	}
 }
 
+func TestStartMonitorProcessInvalidSpecClosesInheritedLeaf(t *testing.T) {
+	leaf := newOwnedMonitorLeafFile(t)
+
+	monitor, err := StartMonitorProcess(context.Background(), MonitorProcessSpec{InheritedLeaf: leaf})
+	if monitor != nil || !errors.Is(err, ErrInvalidSpec) {
+		t.Fatalf("StartMonitorProcess(invalid spec) = (%v, %v), want nil ErrInvalidSpec", monitor, err)
+	}
+	assertFileClosed(t, leaf)
+}
+
+func TestStartMonitorProcessCanceledContextClosesInheritedLeaf(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	leaf := newOwnedMonitorLeafFile(t)
+
+	monitor, err := StartMonitorProcess(ctx, MonitorProcessSpec{
+		Command:       CommandSpec{Path: os.Args[0]},
+		InheritedLeaf: leaf,
+	})
+	if monitor != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("StartMonitorProcess(canceled) = (%v, %v), want nil context.Canceled", monitor, err)
+	}
+	assertFileClosed(t, leaf)
+}
+
+func TestStartMonitorProcessPipeFailureClosesInheritedLeaf(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pipeErr := errors.New("injected monitor pipe failure")
+	calls := 0
+	withMonitorPipe(t, func() (*os.File, *os.File, error) {
+		calls++
+		if calls == 2 {
+			return nil, nil, pipeErr
+		}
+		return os.Pipe()
+	})
+	leaf := newOwnedMonitorLeafFile(t)
+
+	monitor, err := StartMonitorProcess(ctx, MonitorProcessSpec{
+		Command:       CommandSpec{Path: os.Args[0]},
+		InheritedLeaf: leaf,
+	})
+	if monitor != nil || !errors.Is(err, pipeErr) {
+		t.Fatalf("StartMonitorProcess(pipe failure) = (%v, %v), want nil pipeErr", monitor, err)
+	}
+	assertFileClosed(t, leaf)
+}
+
+func TestStartMonitorProcessStartFailureClosesInheritedLeaf(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	missing := filepath.Join(t.TempDir(), "missing-monitor")
+	leaf := newOwnedMonitorLeafFile(t)
+
+	monitor, err := StartMonitorProcess(ctx, MonitorProcessSpec{
+		Command:       CommandSpec{Path: missing},
+		InheritedLeaf: leaf,
+	})
+	if monitor != nil || err == nil {
+		t.Fatalf("StartMonitorProcess(start failure) = (%v, %v), want nil error", monitor, err)
+	}
+	assertFileClosed(t, leaf)
+}
+
 func TestParklaunchBackendHelperProcess(t *testing.T) {
 	if os.Getenv(parklaunchHelperEnv) != parklaunchBackendMode {
 		return
@@ -2303,6 +2368,38 @@ func waitOpenFDResult(t *testing.T, path string) []int {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func newOwnedMonitorLeafFile(t *testing.T) *os.File {
+	t.Helper()
+	file, err := os.CreateTemp(t.TempDir(), "monitor-leaf-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = file.Close()
+	})
+	return file
+}
+
+func assertFileClosed(t *testing.T, file *os.File) {
+	t.Helper()
+	if file == nil {
+		t.Fatal("file is nil")
+	}
+	_, err := file.Stat()
+	if !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("file Stat() after ownership return error = %v, want os.ErrClosed", err)
+	}
+}
+
+func withMonitorPipe(t *testing.T, pipe func() (*os.File, *os.File, error)) {
+	t.Helper()
+	previous := monitorPipe
+	monitorPipe = pipe
+	t.Cleanup(func() {
+		monitorPipe = previous
+	})
 }
 
 func fdRange(first, last int) []int {

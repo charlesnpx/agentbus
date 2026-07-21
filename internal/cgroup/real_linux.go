@@ -194,7 +194,7 @@ func (fs *realFS) acquireRoot(ctx context.Context) (*realRoot, func(), error) {
 func (fs *realFS) acquireHeldRoot(expected ObjectIdentity) (*realRoot, func(), bool) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	if fs.held == nil || !expected.durableEqual(fs.held.identity.RootObject) {
+	if fs.held == nil || !fs.held.leased || !expected.durableEqual(fs.held.identity.RootObject) {
 		return nil, nil, false
 	}
 	fs.rootUsers++
@@ -534,6 +534,49 @@ func (fs *realFS) Remove(ctx context.Context, object cgroupObject) error {
 	return nil
 }
 
+func (fs *realFS) removeUnleasedInheritedLeaf(ctx context.Context, object cgroupObject) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	realObject, err := fs.realObject(ctx, object)
+	if err != nil {
+		return err
+	}
+	if realObject.rootfd < 0 || realObject.leaffd < 0 {
+		return fmt.Errorf("%w: inherited cgroup cleanup requires open root and leaf fds", ErrInvalid)
+	}
+	current, err := identityAt(realObject.rootfd, realObject.leafName)
+	if err != nil {
+		if retainedLeafMissing(err) {
+			fs.recordTombstone(realObject.leafName, realObject.leaf)
+			return nil
+		}
+		return err
+	}
+	if !realObject.leaf.durableEqual(current) {
+		return fmt.Errorf("%w: unleased-cleanup retained cgroup leaf name identity mismatch", ErrUnsupported)
+	}
+	leaf, err := identityFromFD(realObject.leaffd)
+	if err != nil {
+		return err
+	}
+	if !realObject.leaf.durableEqual(leaf) {
+		return fmt.Errorf("%w: unleased-cleanup retained cgroup leaf fd identity mismatch", ErrUnsupported)
+	}
+	if err := verifyRootHandle(realObject.rootfd, realObject.root); err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(realObject.rootfd, realObject.leafName, unix.AT_REMOVEDIR); err != nil {
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESTALE) {
+			fs.recordTombstone(realObject.leafName, realObject.leaf)
+			return nil
+		}
+		return err
+	}
+	fs.recordTombstone(realObject.leafName, realObject.leaf)
+	return nil
+}
+
 func (fs *realFS) openRoot() (int, error) {
 	fd, err := unix.Open(fs.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
@@ -645,18 +688,8 @@ func (object inheritedLeafRetainedObject) AcquireRetainedGroup(ctx context.Conte
 	}
 
 	rootPath := "inherited-cgroup-root:" + descriptor.root.stableToken()
-	fs := &realFS{
-		root: rootPath,
-		held: &realRoot{
-			fd: rootfd,
-			identity: RootIdentity{
-				RootObject: rootObject,
-				Exclusive:  true,
-			},
-			leased: false,
-		},
-	}
-	return &Capability{
+	fs := &realFS{root: rootPath}
+	return &inheritedLeafCapability{Capability: &Capability{
 		fs:           fs,
 		terminator:   pidfdTerminator{},
 		retainedID:   target.RetainedID,
@@ -671,7 +704,43 @@ func (object inheritedLeafRetainedObject) AcquireRetainedGroup(ctx context.Conte
 			leaf:        leafObject,
 			closeRootFD: true,
 		},
-	}, nil
+	}}, nil
+}
+
+type inheritedLeafCapability struct {
+	*Capability
+}
+
+func (capability *inheritedLeafCapability) ReleaseRootLease() error {
+	return fmt.Errorf("%w: inherited cgroup cleanup does not hold the root lease", ErrRootLeaseUnavailable)
+}
+
+func (capability *inheritedLeafCapability) Remove(ctx context.Context) error {
+	if capability == nil || capability.Capability == nil {
+		return fmt.Errorf("%w: cgroup capability is closed", ErrInvalid)
+	}
+	if capability.released {
+		return fmt.Errorf("%w: cgroup capability is closed", ErrInvalid)
+	}
+	if capability.removed {
+		return nil
+	}
+	membership, err := capability.Membership(ctx)
+	if err != nil {
+		return err
+	}
+	if membership != containment.RetainedMembershipEmpty {
+		return ErrPopulated
+	}
+	fs, ok := capability.fs.(*realFS)
+	if !ok || fs == nil {
+		return fmt.Errorf("%w: unleased-cleanup requires real cgroup fs", ErrUnsupported)
+	}
+	if err := fs.removeUnleasedInheritedLeaf(ctx, capability.object); err != nil {
+		return fmt.Errorf("unleased-cleanup: %w", err)
+	}
+	capability.removed = true
+	return nil
 }
 
 func (fs *realFS) realObject(ctx context.Context, object cgroupObject) (*realObject, error) {

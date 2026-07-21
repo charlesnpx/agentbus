@@ -2717,6 +2717,9 @@ func (containment delayReadyNativeMonitorContainment) BindContainmentTarget(ctx 
 		}
 		bound = next
 	}
+	if nativeMonitorDelayUsesFIFO(containment.path) {
+		return bound, waitNativeMonitorDelayFIFO(ctx, containment.path)
+	}
 	if err := os.WriteFile(containment.path+".entered", []byte("1\n"), 0o600); err != nil {
 		return nil, err
 	}
@@ -2731,6 +2734,54 @@ func (containment delayReadyNativeMonitorContainment) BindContainmentTarget(ctx 
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func nativeMonitorDelayUsesFIFO(path string) bool {
+	return nativeMonitorDelayPathIsFIFO(path+".entered") && nativeMonitorDelayPathIsFIFO(path+".release")
+}
+
+func nativeMonitorDelayPathIsFIFO(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode()&os.ModeNamedPipe != 0
+}
+
+func waitNativeMonitorDelayFIFO(ctx context.Context, path string) error {
+	entered, err := os.OpenFile(path+".entered", os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	if _, err := entered.Write([]byte{'1'}); err != nil {
+		_ = entered.Close()
+		return err
+	}
+	if err := entered.Close(); err != nil {
+		return err
+	}
+	releaseFD, err := unix.Open(path+".release", unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(releaseFD)
+	var ack [1]byte
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		n, err := unix.Read(releaseFD, ack[:])
+		if n == 1 {
+			if ack[0] != '1' {
+				return fmt.Errorf("unexpected monitor delay release byte %q", ack[0])
+			}
+			return nil
+		}
+		if err != nil && !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EINTR) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-ticker.C:
 		}
 	}

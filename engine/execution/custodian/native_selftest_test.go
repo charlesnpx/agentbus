@@ -70,21 +70,6 @@ func TestNativeSelfTestClassificationTable(t *testing.T) {
 		}
 	})
 
-	t.Run("lease contention is retryable single-shot", func(t *testing.T) {
-		calls := 0
-		cause := fmt.Errorf("prepare: %w", cgroup.ErrRootLeaseUnavailable)
-		assessment := runClassifiedNativeSelfTest(context.Background(), 3, func(context.Context, int) nativeSelfTestAttemptResult {
-			calls++
-			return retryableNativeSelfTest(cause, true)
-		})
-		if calls != 1 {
-			t.Fatalf("attempt calls = %d, want 1", calls)
-		}
-		if assessment.Class != SupportRetryable || assessment.Attempts != 1 || !assessment.CleanupSafe || !errors.Is(assessment.Cause, cgroup.ErrRootLeaseUnavailable) {
-			t.Fatalf("assessment = %+v, want retryable attempts=1 cleanup-safe ErrRootLeaseUnavailable cause", assessment)
-		}
-	})
-
 	t.Run("cleanup unverifiable escalates unsafe and stops", func(t *testing.T) {
 		calls := 0
 		cause := errors.New("cleanup unverified")
@@ -117,6 +102,24 @@ func TestNativeSelfTestClassificationTable(t *testing.T) {
 			t.Fatalf("assessment = %+v, want unsupported attempts=1 cleanup-safe cause", assessment)
 		}
 	})
+}
+
+func TestNativeSelfTestPostConstructionRootLeaseLossIsUnsafe(t *testing.T) {
+	calls := 0
+	cause := nativePrepareFailure(fmt.Errorf("prepare: %w", cgroup.ErrRootLeaseUnavailable), false, true)
+	assessment := runClassifiedNativeSelfTest(context.Background(), 3, func(context.Context, int) nativeSelfTestAttemptResult {
+		calls++
+		return classifyNativeSelfTestPrepareFailure(cause)
+	})
+	if calls != 1 {
+		t.Fatalf("attempt calls = %d, want 1", calls)
+	}
+	if assessment.Class != SupportUnsafe || assessment.Attempts != 1 || assessment.CleanupSafe {
+		t.Fatalf("assessment = %+v, want unsafe attempts=1 cleanup unsafe", assessment)
+	}
+	if !errors.Is(assessment.Cause, ErrNativeRuntimeSelfTestUnsafe) || !errors.Is(assessment.Cause, cgroup.ErrRootLeaseUnavailable) {
+		t.Fatalf("assessment cause = %v, want unsafe wrapping ErrRootLeaseUnavailable", assessment.Cause)
+	}
 }
 
 func TestNativeSelfTestContradictoryAvailableIsUnsafe(t *testing.T) {

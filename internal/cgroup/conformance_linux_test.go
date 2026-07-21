@@ -4,11 +4,13 @@ package cgroup_test
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -22,6 +24,12 @@ type retainedConformanceCapability interface {
 	containment.RetainedGroupCapability
 	PlacePID(context.Context, int) error
 	Remove(context.Context) error
+}
+
+type retainedConformanceMonitorCapability interface {
+	retainedConformanceCapability
+	MonitorLeafFile(context.Context) (*os.File, error)
+	ReleaseRootLease() error
 }
 
 func TestCgroupV2RetainedCapabilityLifecycleConformance(t *testing.T) {
@@ -148,6 +156,115 @@ func TestCgroupV2RetainedCapabilityLifecycleConformance(t *testing.T) {
 	}
 }
 
+func TestCgroupV2InheritedMonitorCleanupConformance(t *testing.T) {
+	if os.Getenv("AGENTBUS_CGROUP_CONFORMANCE") != "1" {
+		t.Skip("set AGENTBUS_CGROUP_CONFORMANCE=1 to run real cgroup-v2 conformance")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	manager := newStrictConformanceManager(t, ctx)
+	capability := acquireMonitorConformanceCapability(t, ctx, manager)
+	t.Cleanup(func() {
+		cleanupRetainedCapability(t, capability)
+	})
+	leafFile, err := capability.MonitorLeafFile(ctx)
+	if err != nil {
+		t.Fatalf("MonitorLeafFile() error = %v", err)
+	}
+	defer leafFile.Close()
+	target := retainedTargetFromIdentity(capability.Identity(), os.Getpid())
+	if err := capability.ReleaseRootLease(); err != nil {
+		t.Fatalf("ReleaseRootLease() before inherited cleanup error = %v", err)
+	}
+
+	inheritedRaw, err := cgroup.NewInheritedRetainedGroupObjectFromLeafFD(int(leafFile.Fd())).AcquireRetainedGroup(ctx, target, time.Now())
+	if err != nil {
+		t.Fatalf("inherited AcquireRetainedGroup() error = %v", err)
+	}
+	inherited, ok := inheritedRaw.(retainedConformanceCapability)
+	if !ok {
+		_ = inheritedRaw.Release()
+		t.Fatalf("inherited capability = %T, want retained cleanup capability", inheritedRaw)
+	}
+	defer inherited.Release()
+
+	if err := inherited.Remove(ctx); err != nil {
+		t.Fatalf("inherited Remove() with owner flock absent error = %v", err)
+	}
+	if err := manager.ProveRetainedGroupAbsent(ctx, target); err != nil {
+		t.Fatalf("inherited cleanup did not retire retained leaf: %v", err)
+	}
+}
+
+func TestCgroupV2InheritedMonitorCleanupDoesNotRemoveContenderReplacement(t *testing.T) {
+	if os.Getenv("AGENTBUS_CGROUP_CONFORMANCE") != "1" {
+		t.Skip("set AGENTBUS_CGROUP_CONFORMANCE=1 to run real cgroup-v2 conformance")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	manager := newStrictConformanceManager(t, ctx)
+	capability := acquireMonitorConformanceCapability(t, ctx, manager)
+	t.Cleanup(func() {
+		cleanupRetainedCapability(t, capability)
+	})
+	leafFile, err := capability.MonitorLeafFile(ctx)
+	if err != nil {
+		t.Fatalf("MonitorLeafFile() error = %v", err)
+	}
+	defer leafFile.Close()
+	target := retainedTargetFromIdentity(capability.Identity(), os.Getpid())
+	leafName, err := retainedLeafNameForConformance(target.RetainedID)
+	if err != nil {
+		t.Fatalf("parse retained leaf name: %v", err)
+	}
+	if err := capability.ReleaseRootLease(); err != nil {
+		t.Fatalf("ReleaseRootLease() before contender error = %v", err)
+	}
+
+	contender, err := cgroup.New("")
+	if err != nil {
+		t.Fatalf("contender cgroup.New(\"\") error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := contender.Close(); err != nil {
+			t.Logf("contender Close() cleanup error = %v", err)
+		}
+	})
+	if err := contender.HoldRootLease(ctx); err != nil {
+		t.Fatalf("contender HoldRootLease() error = %v", err)
+	}
+	replacementPath := "/sys/fs/cgroup/" + leafName
+	if err := os.Remove(replacementPath); err != nil {
+		t.Fatalf("remove original retained leaf for contender replacement: %v", err)
+	}
+	if err := os.Mkdir(replacementPath, 0o755); err != nil {
+		t.Fatalf("create contender replacement leaf: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(replacementPath)
+	})
+
+	inheritedRaw, err := cgroup.NewInheritedRetainedGroupObjectFromLeafFD(int(leafFile.Fd())).AcquireRetainedGroup(ctx, target, time.Now())
+	if err != nil {
+		t.Fatalf("inherited AcquireRetainedGroup() after replacement error = %v", err)
+	}
+	inherited, ok := inheritedRaw.(retainedConformanceCapability)
+	if !ok {
+		_ = inheritedRaw.Release()
+		t.Fatalf("inherited capability = %T, want retained cleanup capability", inheritedRaw)
+	}
+	defer inherited.Release()
+
+	if err := inherited.Remove(ctx); err == nil {
+		t.Fatalf("inherited Remove() after contender replacement succeeded; want fail-closed error")
+	}
+	if _, err := os.Stat(replacementPath); err != nil {
+		t.Fatalf("contender replacement stat after inherited cleanup attempt = %v, want present", err)
+	}
+}
+
 func TestCgroupConformanceHelperProcess(t *testing.T) {
 	if os.Getenv("AGENTBUS_CGROUP_CONFORMANCE_HELPER") != "1" {
 		return
@@ -190,6 +307,54 @@ func retainedTargetFromIdentity(identity containment.RetainedGroupIdentity, pid 
 		},
 		RetainedID: identity.RetainedID,
 	}
+}
+
+func newStrictConformanceManager(t *testing.T, ctx context.Context) *cgroup.Manager {
+	t.Helper()
+	manager, err := cgroup.New("")
+	if err != nil {
+		t.Skipf("cgroup.New(\"\") unavailable: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Close(); err != nil {
+			t.Logf("cgroup manager Close() cleanup error = %v", err)
+		}
+	})
+	support := manager.Probe(ctx)
+	if !support.Strict() {
+		t.Skipf("strict cgroup-v2 support unavailable: supported=%t runtimeProbePassed=%t degraded=%t platform=%s reason=%v", support.Supported, support.RuntimeProbePassed, support.Degraded, support.Platform, support.Reason)
+	}
+	return manager
+}
+
+func acquireMonitorConformanceCapability(t *testing.T, ctx context.Context, manager *cgroup.Manager) retainedConformanceMonitorCapability {
+	t.Helper()
+	raw, err := manager.AcquireRetainedGroup(ctx, model.GroupRef{}, time.Now())
+	if err != nil {
+		t.Fatalf("AcquireRetainedGroup(empty) error = %v", err)
+	}
+	capability, ok := raw.(retainedConformanceMonitorCapability)
+	if !ok {
+		_ = raw.Release()
+		t.Fatalf("capability = %T, want retained monitor capability", raw)
+	}
+	return capability
+}
+
+func retainedLeafNameForConformance(retainedID string) (string, error) {
+	parts := strings.Split(retainedID, ".")
+	if len(parts) != 4 || parts[0] != "cg2a" {
+		return "", fmt.Errorf("retained id %q does not carry cgroup identity", retainedID)
+	}
+	leaf, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", err
+	}
+	name := string(leaf)
+	if name == "" || strings.Contains(name, "/") {
+		return "", fmt.Errorf("invalid retained leaf name %q", name)
+	}
+	return name, nil
 }
 
 func requireRetainedIdentityEqual(t *testing.T, label string, got, want containment.RetainedGroupIdentity) {

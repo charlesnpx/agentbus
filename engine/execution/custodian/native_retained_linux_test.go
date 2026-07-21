@@ -245,8 +245,13 @@ func TestNativeRetainedLaunchReadyWhilePriorLaunchCleanupRuns(t *testing.T) {
 	}
 
 	delayPath := filepath.Join(t.TempDir(), "hold-monitor-ready")
-	if err := os.WriteFile(delayPath, []byte("hold\n"), 0o600); err != nil {
-		t.Fatal(err)
+	enteredPath := delayPath + ".entered"
+	releasePath := delayPath + ".release"
+	if err := unix.Mkfifo(enteredPath, 0o600); err != nil {
+		t.Fatalf("create monitor entered fifo: %v", err)
+	}
+	if err := unix.Mkfifo(releasePath, 0o600); err != nil {
+		t.Fatalf("create monitor release fifo: %v", err)
 	}
 	native.options.MonitorCommand.Env = append(native.options.MonitorCommand.Env, nativeHelperMonitorDelayReady+"="+delayPath)
 	specB, _ := nativeSimpleLaunchSpec(t)
@@ -259,7 +264,7 @@ func TestNativeRetainedLaunchReadyWhilePriorLaunchCleanupRuns(t *testing.T) {
 		prepared, err := native.Prepare(ctx, specB.Exec, specB.LaunchKey)
 		preparedDone <- prepareResult{prepared: prepared, err: err}
 	}()
-	waitForFile(delayPath+".entered", 5*time.Second)
+	waitNativeMonitorDelayEntered(t, enteredPath)
 
 	select {
 	case result := <-preparedDone:
@@ -270,9 +275,7 @@ func TestNativeRetainedLaunchReadyWhilePriorLaunchCleanupRuns(t *testing.T) {
 		t.Fatalf("launch A Wait() during launch B bind-before-ready window error = %v", err)
 	}
 	requireRetainedLeafGone(t, ctx, native, runningA.Ref())
-	if err := os.Remove(delayPath); err != nil {
-		t.Fatal(err)
-	}
+	releaseNativeMonitorDelay(t, releasePath)
 
 	var result prepareResult
 	select {
@@ -301,6 +304,58 @@ func TestNativeRetainedLaunchReadyWhilePriorLaunchCleanupRuns(t *testing.T) {
 		t.Fatal("launch B AbortAndVerify() returned zero attestation")
 	}
 	requireRetainedLeafGone(t, ctx, native, refB)
+}
+
+func waitNativeMonitorDelayEntered(t *testing.T, path string) {
+	t.Helper()
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("open monitor entered fifo: %v", err)
+	}
+	defer unix.Close(fd)
+	deadline := time.Now().Add(5 * time.Second)
+	var buf [1]byte
+	for {
+		n, err := unix.Read(fd, buf[:])
+		if n == 1 {
+			if buf[0] != '1' {
+				t.Fatalf("monitor entered fifo byte = %q, want '1'", buf[0])
+			}
+			return
+		}
+		if err != nil && !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EINTR) {
+			t.Fatalf("read monitor entered fifo: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for monitor entered fifo %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func releaseNativeMonitorDelay(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for {
+		fd, err := unix.Open(path, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if err == nil {
+			_, writeErr := unix.Write(fd, []byte{'1'})
+			_ = unix.Close(fd)
+			if writeErr != nil {
+				t.Fatalf("write monitor release fifo: %v", writeErr)
+			}
+			return
+		}
+		lastErr = err
+		if !errors.Is(err, unix.ENXIO) && !errors.Is(err, unix.EINTR) {
+			t.Fatalf("open monitor release fifo: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out opening monitor release fifo %s: %v", path, lastErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func requireRetainedBackendForTest(t *testing.T, running *NativeRunningProcess) {

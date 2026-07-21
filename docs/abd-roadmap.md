@@ -284,7 +284,19 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
-- 2026-07-21 R3C-fix2 (this commit): closed both R3C reviews' 4 High + 1 Med. F1/F2 (lease design, per
+- 2026-07-21 R3C-fix3 (this commit): closed fix2-review's 2H+2M. F1 inherited monitor cleanup no
+  longer encodes leased:false as held — explicit identity-guarded inheritedLeafCapability cleanup path
+  distinct from lease-required realFS.Remove (acquireHeldRoot now requires leased; ENOENT/ESTALE
+  proven-gone only; EPERM/EIO error). F2 two-launch overlap test uses a FIFO entered/release handshake
+  asserting B blocked before A's cleanup (no discarded wait errors). F3 StartMonitorProcess owns
+  InheritedLeaf with defer-close on every non-transferred return + fault-injection tests. F4 dead
+  Prepare-contention branch deleted; post-construction ErrRootLeaseUnavailable ⇒ SupportUnsafe
+  invariant. Worker job_...000082 completed CLEANLY with report-first (first clean cycle). Verified:
+  macOS static/full/race=0 (one parklaunch JSON-read flake under full-suite parallelism, isolated x5
+  green, papercut); Docker cgroup-v2: conformance=0 (unleased-cleanup + contender fail-closed +
+  deterministic overlap all proven), full -p 1=0, race=0, R0T RED sentinel=0. sol verification next —
+  SHIP closes R3C.
+- 2026-07-21 R3C-fix2 (2bb9a1a): closed both R3C reviews' 4 High + 1 Med. F1/F2 (lease design, per
   OS reviewer's prescription): delegated-root flock is now a TRUE custodian-lifetime owner lease —
   ReleaseRootLease-at-bind DELETED; the monitor receives an INHERITED leaf-capability FD
   (MonitorLeafFD=6, arg-strict --leaf-fd, identity re-verified; FD-ownership contract updated;

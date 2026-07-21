@@ -5,11 +5,29 @@ package cgroup
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestRealFSAcquireHeldRootRejectsUnleasedRoot(t *testing.T) {
+	root := ObjectIdentity{Device: 1, Inode: 2, Generation: "root"}
+	fs := &realFS{
+		held: &realRoot{
+			fd:       -1,
+			identity: RootIdentity{RootObject: root},
+			leased:   false,
+		},
+	}
+
+	held, release, ok := fs.acquireHeldRoot(root)
+	if ok || held != nil || release != nil {
+		t.Fatalf("acquireHeldRoot() with leased=false = held:%v release-nil:%t ok:%t, want nil true false", held, release == nil, ok)
+	}
+}
 
 func TestRealFSRemoveWithoutRootLeaseFailsClosed(t *testing.T) {
 	rootPath := t.TempDir()
@@ -135,6 +153,7 @@ func TestRealFSRemoveTombstonesMissingLeafWithoutReentrantLock(t *testing.T) {
 			identity: RootIdentity{
 				RootObject: root,
 			},
+			leased: true,
 		},
 	}
 	defer fs.releaseRootLease()
@@ -171,4 +190,104 @@ func TestRealFSRemoveTombstonesMissingLeafWithoutReentrantLock(t *testing.T) {
 	if !leaf.durableEqual(tombstone) {
 		t.Fatalf("tombstone = %+v, want %+v", tombstone, leaf)
 	}
+}
+
+func TestRealFSUnleasedInheritedCleanupRemovesMatchingLeaf(t *testing.T) {
+	fs, object := newUnleasedInheritedCleanupFixture(t, "cg-inherited-cleanup")
+	defer object.Close()
+
+	if err := fs.removeUnleasedInheritedLeaf(context.Background(), object); err != nil {
+		t.Fatalf("removeUnleasedInheritedLeaf() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fs.root, object.leafName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retained leaf stat after unleased cleanup = %v, want not-exist", err)
+	}
+	fs.mu.Lock()
+	tombstone, ok := fs.tombstones[object.leafName]
+	fs.mu.Unlock()
+	if !ok {
+		t.Fatalf("unleased cleanup did not tombstone removed leaf")
+	}
+	if !object.leaf.durableEqual(tombstone) {
+		t.Fatalf("unleased cleanup tombstone = %+v, want %+v", tombstone, object.leaf)
+	}
+}
+
+func TestRealFSUnleasedInheritedCleanupFailsClosedOnNameIdentityDrift(t *testing.T) {
+	fs, object := newUnleasedInheritedCleanupFixture(t, "cg-inherited-contender")
+	defer object.Close()
+	path := filepath.Join(fs.root, object.leafName)
+	contenderRoot, err := unix.Open(fs.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("open contender root: %v", err)
+	}
+	defer unix.Close(contenderRoot)
+	if err := unix.Flock(contenderRoot, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatalf("contender flock root: %v", err)
+	}
+	defer unix.Flock(contenderRoot, unix.LOCK_UN)
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove original leaf: %v", err)
+	}
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatalf("recreate contender leaf: %v", err)
+	}
+	marker := filepath.Join(path, "contender-marker")
+	if err := os.WriteFile(marker, []byte("owned\n"), 0o600); err != nil {
+		t.Fatalf("write contender marker: %v", err)
+	}
+
+	err = fs.removeUnleasedInheritedLeaf(context.Background(), object)
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("removeUnleasedInheritedLeaf() after identity drift error = %v, want ErrUnsupported", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("contender marker stat after failed cleanup = %v, want present", err)
+	}
+	fs.mu.Lock()
+	_, tombstoned := fs.tombstones[object.leafName]
+	fs.mu.Unlock()
+	if tombstoned {
+		t.Fatalf("unleased cleanup tombstoned identity-drift leaf")
+	}
+}
+
+func newUnleasedInheritedCleanupFixture(t *testing.T, leafName string) (*realFS, *realObject) {
+	t.Helper()
+	rootPath := t.TempDir()
+	if err := os.Mkdir(filepath.Join(rootPath, leafName), 0o755); err != nil {
+		t.Fatalf("mkdir leaf: %v", err)
+	}
+	rootfd, err := unix.Open(rootPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("open root fd: %v", err)
+	}
+	leaffd, err := unix.Openat(rootfd, leafName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		_ = unix.Close(rootfd)
+		t.Fatalf("open leaf fd: %v", err)
+	}
+	root, err := identityFromFD(rootfd)
+	if err != nil {
+		_ = unix.Close(rootfd)
+		_ = unix.Close(leaffd)
+		t.Skipf("filesystem does not provide durable root handles: %v", err)
+	}
+	leaf, err := identityFromFD(leaffd)
+	if err != nil {
+		_ = unix.Close(rootfd)
+		_ = unix.Close(leaffd)
+		t.Skipf("filesystem does not provide durable leaf handles: %v", err)
+	}
+	fs := &realFS{root: rootPath}
+	object := &realObject{
+		rootPath:    rootPath,
+		leafName:    leafName,
+		rootfd:      rootfd,
+		leaffd:      leaffd,
+		root:        root,
+		leaf:        leaf,
+		closeRootFD: true,
+	}
+	return fs, object
 }
