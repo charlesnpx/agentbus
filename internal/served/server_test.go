@@ -731,6 +731,127 @@ func TestCompleteAdmissionRunLogsRecoveryObligationWhenAuthorityCleared(t *testi
 	}
 }
 
+func TestServeCloseReturnsWhenIdentifiedSubmitWedgedInStorage(t *testing.T) {
+	var logs bytes.Buffer
+	oldLogWriter := log.Writer()
+	oldLogFlags := log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(oldLogWriter)
+		log.SetFlags(oldLogFlags)
+	}()
+
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	blockingRepo := newBlockingUpdateRepository(repo)
+	anchorStore := authority.NewAnchorStore()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	server.admissionBootstrapperFactory = func(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		bootstrapper, err := authority.NewBootstrapper(blockingRepo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return bootstrapper, blockingRepo, io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	configureTestAdmissionRuntime(t, server, launcher, true)
+	cancel, done, _ := startTestServerWithBlockingListener(t, server)
+
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-wedged-submit",
+		RequestID:    "request-wedged-submit",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}
+	rawParams := mustMarshal(t, params)
+	blockingRepo.Arm()
+	submitDone := make(chan requestOutcome, 1)
+	go func() {
+		submitDone <- server.handleJobSubmit(ctx, rawParams)
+	}()
+	select {
+	case <-blockingRepo.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("submit did not wedge inside repository update")
+	}
+
+	closeStarted := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve close error = %v", err)
+		}
+		if elapsed := time.Since(closeStarted); elapsed > 2*admissionRepositoryCloseTimeout {
+			t.Fatalf("Serve close elapsed = %s, want bounded within %s", elapsed, 2*admissionRepositoryCloseTimeout)
+		}
+	case <-time.After(2*admissionRepositoryCloseTimeout + time.Second):
+		t.Fatal("Serve close did not return while submit was wedged")
+	}
+	if got := logs.String(); !strings.Contains(got, "submit is wedged") || !strings.Contains(got, "admission repository close skipped after submit serialization timeout") {
+		t.Fatalf("shutdown log = %q, want wedged-submit and repository-leak messages", got)
+	}
+
+	rejected := server.handleJobSubmit(ctx, mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-after-close",
+		RequestID:    "request-after-close",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if rejected.err == nil {
+		t.Fatalf("post-close submit result = %+v, want not-ready rejection", rejected.result)
+	}
+	resp := protocol.Response{Error: rejected.err}
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectStrictRouteDisabled)
+	if !strings.Contains(rejected.err.Message, "shutting down") {
+		t.Fatalf("post-close rejection message = %q, want shutting down", rejected.err.Message)
+	}
+
+	blockingRepo.Release()
+	select {
+	case outcome := <-submitDone:
+		if outcome.err == nil {
+			t.Fatalf("wedged submit result = %+v, want non-success after close", outcome.result)
+		}
+		if outcome.after != nil {
+			t.Fatal("wedged submit returned a launch hook after close")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("wedged submit did not return after storage release")
+	}
+
+	secondBackend := newFakeBackend("fake")
+	secondServer, _, _ := newUnstartedTestServer(t, secondBackend)
+	secondLauncher := newAdmissionFakeLaunchCustodian(t)
+	secondServer.admissionBootstrapperFactory = func(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		bootstrapper, err := authority.NewBootstrapper(blockingRepo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return bootstrapper, blockingRepo, io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	enableTestAdmission(t, secondServer, secondLauncher)
+	record := singleAuthoritySafetyRecord(t, secondServer)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeFailed || record.Terminal.Cause != model.CauseDaemonRestartedBeforeAuthorization {
+		t.Fatalf("recovered terminal = %+v, want failed daemon-restarted-before-authorization", record.Terminal)
+	}
+	replay := secondServer.handleJobSubmit(ctx, rawParams)
+	if replay.err != nil {
+		t.Fatalf("replay submit error = %+v", replay.err)
+	}
+	replayed, ok := replay.result.(protocol.JobSubmitResult)
+	if !ok {
+		t.Fatalf("replay result type = %T", replay.result)
+	}
+	if replayed.JobID != record.JobID.String() || !replayed.Deduplicated || replayed.State != engine.StateFailed {
+		t.Fatalf("replay result = %+v, want terminal replay for %s", replayed, record.JobID)
+	}
+	if got := secondBackend.count.Load(); got != 0 {
+		t.Fatalf("second backend starts = %d, want 0 for recovery replay", got)
+	}
+}
+
 func TestIdentifiedSubmitReplayAfterRestartReturnsPreAuthorizationTerminal(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1443,6 +1564,39 @@ func TestIdentifiedSubmitClosedAdmissionRepositoryReturnsStrictRouteNotReady(t *
 	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectStrictRouteDisabled)
 	if outcome.err.Data.Code == protocol.ErrorInvalidTaskSpec {
 		t.Fatalf("closed repository mapped to invalid_task_spec: %+v", outcome.err)
+	}
+}
+
+func TestIdentifiedSubmitStorageFailureReturnsBackendUnavailable(t *testing.T) {
+	t.Parallel()
+	repo := memory.NewRepository()
+	failingRepo := &failingUpdateRepository{inner: repo}
+	anchorStore := authority.NewAnchorStore()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	server.admissionBootstrapperFactory = func(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		bootstrapper, err := authority.NewBootstrapper(failingRepo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return bootstrapper, failingRepo, io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	enableTestAdmission(t, server, launcher)
+	failingRepo.err = fmt.Errorf("repository update failed: %w", syscall.EIO)
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-storage-failure",
+		RequestID:    "request-storage-failure",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want storage failure rejection", outcome.result)
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorBackendUnavailable)
+	if outcome.err.Data.Code == protocol.ErrorInvalidTaskSpec {
+		t.Fatalf("storage failure mapped to invalid_task_spec: %+v", outcome.err)
 	}
 }
 
@@ -4377,6 +4531,65 @@ func (c *blockingRepositoryOwnedWorkChecker) HasOwnedWork(context.Context) (bool
 		return nil
 	})
 	return false, err
+}
+
+type blockingUpdateRepository struct {
+	inner       repository.Repository
+	started     chan struct{}
+	release     chan struct{}
+	armed       atomic.Bool
+	startedOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func newBlockingUpdateRepository(inner repository.Repository) *blockingUpdateRepository {
+	return &blockingUpdateRepository{
+		inner:   inner,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (r *blockingUpdateRepository) Arm() {
+	r.armed.Store(true)
+}
+
+func (r *blockingUpdateRepository) Release() {
+	r.releaseOnce.Do(func() { close(r.release) })
+}
+
+func (r *blockingUpdateRepository) View(ctx context.Context, fn func(repository.ReadTx) error) error {
+	return r.inner.View(ctx, fn)
+}
+
+func (r *blockingUpdateRepository) Update(ctx context.Context, fn func(repository.WriteTx) error) (repository.Commit, error) {
+	return r.inner.Update(ctx, func(tx repository.WriteTx) error {
+		if r.armed.Load() {
+			r.startedOnce.Do(func() { close(r.started) })
+			select {
+			case <-r.release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return fn(tx)
+	})
+}
+
+type failingUpdateRepository struct {
+	inner repository.Repository
+	err   error
+}
+
+func (r *failingUpdateRepository) View(ctx context.Context, fn func(repository.ReadTx) error) error {
+	return r.inner.View(ctx, fn)
+}
+
+func (r *failingUpdateRepository) Update(ctx context.Context, fn func(repository.WriteTx) error) (repository.Commit, error) {
+	if r.err != nil {
+		return repository.Commit{}, r.err
+	}
+	return r.inner.Update(ctx, fn)
 }
 
 func assertServerStillRunning(t *testing.T, done <-chan error, reason string) {

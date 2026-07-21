@@ -131,6 +131,8 @@ type Server struct {
 	safetyDrainTimeout     time.Duration
 	jobsRequestIDEnabled   bool
 	admissionSubmitMu      sync.Mutex
+	admissionCloseEpoch    atomic.Uint64
+	admissionOpenEpoch     atomic.Uint64
 	admissionStateMu       sync.RWMutex
 	resultPublications     atomic.Int64
 

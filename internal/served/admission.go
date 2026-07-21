@@ -39,6 +39,14 @@ const (
 
 var admissionDetachedCleanupTimeout = 30 * time.Second
 
+type admissionClosingError struct{}
+
+func (admissionClosingError) Error() string { return "admission authority is shutting down" }
+
+func (admissionClosingError) Is(target error) bool { return target == authority.ErrNotReady }
+
+var errAdmissionClosing = admissionClosingError{}
+
 type admissionBootstrapper = authority.Bootstrapper
 type admissionReady = authority.Ready
 type admissionCoordinator = coordinator.Coordinator
@@ -51,6 +59,7 @@ type admissionProbeableBackend interface {
 
 type admissionInstance struct {
 	runtime     *servedAdmissionRuntime
+	epoch       uint64
 	descriptors map[string]admissionBackendDescriptor
 	policy      ServeAdmissionPolicy
 
@@ -213,6 +222,8 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		latch:  s.safetyLatch,
 	}
 
+	epoch := s.admissionCloseEpoch.Load()
+	s.admissionOpenEpoch.Store(epoch)
 	s.admissionBootstrapper = bootstrapper
 	s.admissionReady = ready
 	s.admissionCoordinator = coord
@@ -223,6 +234,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	s.admissionClose = closer
 	s.admissionInstance = &admissionInstance{
 		runtime:      runtime,
+		epoch:        epoch,
 		descriptors:  cloneAdmissionBackendDescriptors(descriptors),
 		policy:       deriveServeAdmissionPolicy(runtime.support(), descriptors),
 		bootstrapper: bootstrapper,
@@ -242,7 +254,24 @@ func (s *Server) closeServeAdmission() error {
 	// under stateMu, releases it, and re-checks publication under submitMu
 	// before durable acceptance. That gives close a single order to serialize
 	// acceptance and state clearing without a lock cycle.
-	s.admissionSubmitMu.Lock()
+	s.admissionCloseEpoch.Add(1)
+	deadline := time.Now().Add(admissionRepositoryCloseTimeout)
+	submitLocked := s.lockAdmissionSubmitUntil(deadline)
+	if !submitLocked {
+		log.Printf("agentbus daemon: admission shutdown timed out acquiring submit serialization; a submit is wedged; clearing published state and leaking stalled submit")
+		// Contract reconciliation: if close cannot acquire admissionSubmitMu
+		// before the shutdown deadline, a submit is wedged inside the durable
+		// path. We clear published admission state anyway and skip repository
+		// close because the leaked submit may own that repository. From this
+		// point the stronger "no durable accept lands after close begins"
+		// guarantee degrades to the SubmissionCoordinator graceful-exit ==
+		// crash-window contract: if the leaked submit later commits durably,
+		// the next Serve startup recovery finalizes it deterministically by
+		// recorded progress (at-most-once; replay returns the terminal job).
+		// The closing marker makes a leaked submit re-check fail instead of
+		// returning success after state was cleared; if a response write already
+		// raced out, that is the documented window.
+	}
 	s.admissionStateMu.Lock()
 
 	closer := s.admissionClose
@@ -258,26 +287,64 @@ func (s *Server) closeServeAdmission() error {
 	s.admissionDaemonBootRef = model.BootRef{}
 	s.admissionDaemonBootRefErr = nil
 	s.admissionStateMu.Unlock()
-	s.admissionSubmitMu.Unlock()
+	if submitLocked {
+		s.admissionSubmitMu.Unlock()
+	}
 
 	if closer != nil {
-		return closeAdmissionRepositoryWithTimeout(closer)
+		if !submitLocked {
+			log.Printf("agentbus daemon: admission repository close skipped after submit serialization timeout; submit is wedged and may own the repository; leaking handle at shutdown")
+			return nil
+		}
+		return closeAdmissionRepositoryBeforeDeadline(closer, deadline)
 	}
 	return nil
 }
 
-func closeAdmissionRepositoryWithTimeout(closer io.Closer) error {
+func (s *Server) lockAdmissionSubmitUntil(deadline time.Time) bool {
+	for {
+		if s.admissionSubmitMu.TryLock() {
+			return true
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		sleep := 10 * time.Millisecond
+		if remaining < sleep {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+	}
+}
+
+func closeAdmissionRepositoryBeforeDeadline(closer io.Closer, deadline time.Time) error {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		log.Printf("agentbus daemon: admission repository close timed out; leaking handle at shutdown")
+		return nil
+	}
 	done := make(chan error, 1)
 	go func() {
 		done <- closer.Close()
 	}()
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(admissionRepositoryCloseTimeout):
+	case <-timer.C:
 		log.Printf("agentbus daemon: admission repository close timed out; leaking handle at shutdown")
 		return nil
 	}
+}
+
+func (s *Server) admissionCurrentServeClosing() bool {
+	return s.admissionCloseEpoch.Load() != s.admissionOpenEpoch.Load()
+}
+
+func (s *Server) admissionInstanceClosing(instance *admissionInstance) bool {
+	return instance != nil && s.admissionCloseEpoch.Load() != instance.epoch
 }
 
 // The admission guards use snapshot-checkout, NOT lock-across-operation: the
@@ -1701,6 +1768,9 @@ func jsonFieldPresent(raw json.RawMessage, field string) (bool, error) {
 }
 
 func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMessage, params protocol.JobSubmitParams) requestOutcome {
+	if s.admissionCurrentServeClosing() {
+		return requestOutcome{err: admissionProtocolError(errAdmissionClosing)}
+	}
 	// Snapshot-checkout: the whole submit (validation, session construction,
 	// durable acceptance) runs against the checked-out instance, never under
 	// admissionStateMu (see activeWork). A submit racing closeServeAdmission
@@ -1708,6 +1778,9 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	s.admissionStateMu.RLock()
 	instance := s.admissionInstance
 	s.admissionStateMu.RUnlock()
+	if s.admissionInstanceClosing(instance) {
+		return requestOutcome{err: admissionProtocolError(errAdmissionClosing)}
+	}
 	if instance == nil || !instance.policy.strictRouteEnabled || instance.ready == nil || instance.submission == nil {
 		reason := "admission authority is not ready"
 		if instance != nil && instance.policy.strictRouteDisabledReason != "" {
@@ -1849,17 +1922,28 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		SessionID:          admissionSessionID,
 	}
 	s.admissionSubmitMu.Lock()
+	if s.admissionInstanceClosing(instance) {
+		s.admissionSubmitMu.Unlock()
+		return requestOutcome{err: admissionProtocolError(errAdmissionClosing)}
+	}
 	if !s.admissionInstanceStillReadyLocked(instance) {
 		s.admissionSubmitMu.Unlock()
 		return requestOutcome{err: admissionProtocolError(authority.ErrNotReady)}
 	}
 	accepted, err := instance.submission.SubmitIdentified(ctx, request)
+	closing := s.admissionInstanceClosing(instance)
 	s.admissionSubmitMu.Unlock()
 	if err != nil {
 		if admissionAcceptCommitted(accepted) {
 			return requestOutcome{err: admissionPostAcceptError(accepted, err)}
 		}
 		return requestOutcome{err: admissionProtocolError(err)}
+	}
+	if closing {
+		if admissionAcceptCommitted(accepted) {
+			return requestOutcome{err: admissionPostAcceptError(accepted, errAdmissionClosing)}
+		}
+		return requestOutcome{err: admissionProtocolError(errAdmissionClosing)}
 	}
 	jobID := accepted.Record.JobID.String()
 	if accepted.Replayed {
@@ -1924,6 +2008,9 @@ func strictAdmissionInvalidConfigError(message string, data protocol.ErrorData) 
 }
 
 func (s *Server) strictRouteDisabledPrecheck() *protocol.ErrorObject {
+	if s.admissionCurrentServeClosing() {
+		return admissionProtocolError(errAdmissionClosing)
+	}
 	s.admissionStateMu.RLock()
 	defer s.admissionStateMu.RUnlock()
 
@@ -2120,6 +2207,8 @@ func admissionProtocolError(err error) *protocol.ErrorObject {
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, authority.ErrRequestExpired):
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
+	case errors.Is(err, authority.ErrInvalidRequest):
+		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, model.ErrIncompatibleExecutionCapabilities):
 		return protocol.NewError(protocol.ErrorCapabilityMissing, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, custodian.ErrSupervisorUnavailable):
@@ -2132,8 +2221,15 @@ func admissionProtocolError(err error) *protocol.ErrorObject {
 			protocol.ErrorData{},
 		)
 	default:
-		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
+		return protocol.NewError(protocol.ErrorBackendUnavailable, admissionServerFailureMessage(err), protocol.ErrorData{})
 	}
+}
+
+func admissionServerFailureMessage(err error) string {
+	if err == nil || err.Error() == "" {
+		return "admission authority failed"
+	}
+	return "admission authority failed: " + err.Error()
 }
 
 func admissionAuthorityNotReadyError(err error) bool {
