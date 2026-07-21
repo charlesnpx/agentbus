@@ -747,6 +747,40 @@ func TestLegacyFencedDeliveredAcknowledgesGrantsAndRunsOnce(t *testing.T) {
 	}
 }
 
+func TestLegacyFencedWaitCleanupFailureRecordsQuiescenceBeforeError(t *testing.T) {
+	t.Parallel()
+	cleanupErr := errors.New("retained remove failed")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.cleanupErr = cleanupErr
+	repo, recorder, coordinator := newLegacyFencedCoordinatorWithRecordingAuthorityForTest(t, launcher)
+	cmd := prepareLegacyFencedCommandWithCoordinatorForTest(t, coordinator, "request-legacy-fenced-cleanup-failure")
+
+	if err := cmd.grantAndRelease(context.Background()); err != nil {
+		t.Fatalf("grantAndRelease error = %v", err)
+	}
+	select {
+	case <-cmd.done:
+	case <-time.After(time.Second):
+		t.Fatal("legacy fenced command did not finish")
+	}
+	_, finalErr := cmd.result()
+	if !errors.Is(finalErr, cleanupErr) {
+		t.Fatalf("legacy fenced command final error = %v, want cleanup failure", finalErr)
+	}
+	recordErrs, _ := recorder.recordQuiescenceContextObservations()
+	if len(recordErrs) != 1 {
+		t.Fatalf("record quiescence calls = %d, want 1", len(recordErrs))
+	}
+	if got := launcher.containCount(); got != 0 {
+		t.Fatalf("legacy fenced containments = %d, want 0 cleanup retry", got)
+	}
+	safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
+	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || first.Group == nil || first.Grant == nil || first.Released == nil || first.Quiescence == nil {
+		t.Fatalf("legacy fenced cleanup-failure launch proof = %+v, want grant/release/quiescence recorded", first)
+	}
+}
+
 func TestLegacyFencedDeliveryFailureRetiresWithoutGrantOrRun(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -3879,6 +3913,7 @@ type admissionFakeLaunchCustodian struct {
 	releaseErr                error
 	releaseStarted            chan struct{}
 	containErr                error
+	cleanupErr                error
 	waitAndVerify             <-chan struct{}
 	activeCustodies           atomic.Bool
 }
@@ -3908,6 +3943,7 @@ func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.E
 		stderrWriter: stderrWriter,
 		contained:    make(chan struct{}),
 		wait:         c.waitAndVerify,
+		cleanupErr:   c.cleanupErr,
 	}
 	c.mu.Lock()
 	c.ordinals = append(c.ordinals, key.Ordinal)
@@ -3920,6 +3956,11 @@ func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.E
 }
 
 func (c *admissionFakeLaunchCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	verified, cleanup, err := c.ContainAndVerifyWithCleanup(ctx, group, cause)
+	return verified, errors.Join(err, cleanup.Err)
+}
+
+func (c *admissionFakeLaunchCustodian) ContainAndVerifyWithCleanup(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -3931,18 +3972,23 @@ func (c *admissionFakeLaunchCustodian) ContainAndVerify(ctx context.Context, gro
 	c.containCtxDeadlines = append(c.containCtxDeadlines, hasDeadline)
 	containErr := c.containErr
 	running := c.running[string(group.CustodyID)]
+	cleanupErr := c.cleanupErr
 	c.mu.Unlock()
 	if containErr != nil {
-		return custodian.VerifiedQuiescence{}, containErr
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, containErr
 	}
 	if running != nil {
-		return running.ContainAndVerify(ctx, cause)
+		return running.ContainAndVerifyWithCleanup(ctx, cause)
 	}
 	method := model.QuiescenceTermKill
 	if cause == custodian.QuiescenceCauseRecovery {
 		method = model.QuiescenceAlreadyAbsent
 	}
-	return c.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: group, Method: method})
+	verified, err := c.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: group, Method: method})
+	if err != nil {
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
+	}
+	return verified, custodian.CleanupStatus{Err: cleanupErr}, nil
 }
 
 func (c *admissionFakeLaunchCustodian) preparedOrdinals() []model.LaunchOrdinal {
@@ -4084,6 +4130,7 @@ type admissionFakeRunning struct {
 	containOnce  sync.Once
 	contained    chan struct{}
 	wait         <-chan struct{}
+	cleanupErr   error
 }
 
 func (r *admissionFakeRunning) Ref() model.GroupRef {
@@ -4103,22 +4150,32 @@ func (r *admissionFakeRunning) Stderr() io.ReadCloser {
 }
 
 func (r *admissionFakeRunning) WaitAndVerify(ctx context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error) {
+	exit, verified, cleanup, err := r.WaitAndVerifyWithCleanup(ctx)
+	return exit, verified, errors.Join(err, cleanup.Err)
+}
+
+func (r *admissionFakeRunning) WaitAndVerifyWithCleanup(ctx context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	if r.wait != nil {
 		select {
 		case <-r.wait:
 		case <-r.contained:
 			return r.finish(model.QuiescenceTermKill)
 		case <-ctx.Done():
-			return command.ExitObservation{}, custodian.VerifiedQuiescence{}, ctx.Err()
+			return command.ExitObservation{}, custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, ctx.Err()
 		}
 	}
 	return r.finish(model.QuiescenceNaturalExit)
 }
 
-func (r *admissionFakeRunning) ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+func (r *admissionFakeRunning) ContainAndVerify(ctx context.Context, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	verified, cleanup, err := r.ContainAndVerifyWithCleanup(ctx, cause)
+	return verified, errors.Join(err, cleanup.Err)
+}
+
+func (r *admissionFakeRunning) ContainAndVerifyWithCleanup(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	r.markContained()
-	_, verified, err := r.finish(model.QuiescenceTermKill)
-	return verified, err
+	_, verified, cleanup, err := r.finish(model.QuiescenceTermKill)
+	return verified, cleanup, err
 }
 
 func (r *admissionFakeRunning) WaitContained() bool {
@@ -4136,10 +4193,13 @@ func (r *admissionFakeRunning) markContained() {
 	})
 }
 
-func (r *admissionFakeRunning) finish(method model.QuiescenceMethod) (command.ExitObservation, custodian.VerifiedQuiescence, error) {
+func (r *admissionFakeRunning) finish(method model.QuiescenceMethod) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	r.closeStreams()
 	verified, err := r.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: r.group, Method: method})
-	return command.ExitObservation{Exited: true, Code: 0}, verified, err
+	if err != nil {
+		return command.ExitObservation{}, custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
+	}
+	return command.ExitObservation{Exited: true, Code: 0}, verified, custodian.CleanupStatus{Err: r.cleanupErr}, nil
 }
 
 func (r *admissionFakeRunning) closeStreams() {

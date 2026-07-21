@@ -282,7 +282,7 @@ func (effects *nativeHeldLaunchEffects) AbortAndVerify(ctx context.Context, ref 
 	return effects.abortPreparedEntryAndVerify(ctx, ref, entry, false)
 }
 
-func (effects *nativeHeldLaunchEffects) ContainAndVerify(ctx context.Context, ref model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, error) {
+func (effects *nativeHeldLaunchEffects) ContainAndVerify(ctx context.Context, ref model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, CleanupStatus, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -297,20 +297,20 @@ func (effects *nativeHeldLaunchEffects) ContainAndVerify(ctx context.Context, re
 		entry.mu.Unlock()
 	}
 
-	verified, attestErr := effects.custodian.ContainAndVerify(ctx, ref, cause)
+	verified, cleanup, attestErr := effects.custodian.ContainAndVerify(ctx, ref, cause)
 	var closeErr error
 	if ok {
 		entry.mu.Lock()
 		closeErr = entry.closeBackendLocked(ctx)
 		entry.mu.Unlock()
 	}
-	if preparedErr != nil || attestErr != nil || closeErr != nil {
-		return verified, errors.Join(preparedErr, attestErr, closeErr)
+	if attestErr != nil {
+		return verified, CleanupStatus{}, errors.Join(preparedErr, attestErr, closeErr)
 	}
 	if ok {
 		effects.deletePrepared(ref, entry)
 	}
-	return verified, nil
+	return verified, CleanupStatus{Err: errors.Join(preparedErr, cleanup.Err, closeErr)}, nil
 }
 
 func (effects *nativeHeldLaunchEffects) adoptReleasedHandleLocked(ctx context.Context, ref model.GroupRef, handle *parklaunch.ParkedHandle, entry *nativeHeldPreparedLaunch) (*NativeRunningProcess, error) {
@@ -392,15 +392,15 @@ func (effects *nativeHeldLaunchEffects) abortPreparedEntryAndVerify(ctx context.
 	}
 	entry.mu.Unlock()
 
-	verified, attestErr := effects.custodian.ContainAndVerify(ctx, ref, QuiescenceCauseAbort)
+	verified, cleanup, attestErr := effects.custodian.ContainAndVerify(ctx, ref, QuiescenceCauseAbort)
 	entry.mu.Lock()
 	closeErr := entry.closeBackendLocked(ctx)
 	entry.mu.Unlock()
-	if attestErr != nil || closeErr != nil {
+	if attestErr != nil {
 		return verified, errors.Join(abortErr, attestErr, closeErr)
 	}
 	effects.deletePrepared(ref, entry)
-	return verified, nil
+	return verified, errors.Join(cleanup.Err, closeErr)
 }
 
 func (effects *nativeHeldLaunchEffects) registerPrepared(ref model.GroupRef, entry *nativeHeldPreparedLaunch) error {

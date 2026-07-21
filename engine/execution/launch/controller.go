@@ -45,6 +45,10 @@ type CustodianPort interface {
 	ContainAndVerify(context.Context, model.GroupRef, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error)
 }
 
+type CleanupAwareCustodianPort interface {
+	ContainAndVerifyWithCleanup(context.Context, model.GroupRef, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error)
+}
+
 type PreparedProcess interface {
 	Ref() model.GroupRef
 	Release(context.Context) (RunningProcess, custodian.ReleaseOutcome, error)
@@ -58,6 +62,11 @@ type RunningProcess interface {
 	Stderr() io.ReadCloser
 	WaitAndVerify(context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error)
 	ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error)
+}
+
+type CleanupAwareRunningProcess interface {
+	WaitAndVerifyWithCleanup(context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error)
+	ContainAndVerifyWithCleanup(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error)
 }
 
 type waitContainmentReporter interface {
@@ -305,19 +314,24 @@ func (controller *LaunchController) RecordQuiescence(ctx context.Context, launch
 }
 
 func (controller *LaunchController) ContainAndVerify(ctx context.Context, launch LaunchContext, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	verified, cleanup, err := controller.ContainAndVerifyWithCleanup(ctx, launch, group, cause)
+	return verified, errors.Join(err, cleanup.Err)
+}
+
+func (controller *LaunchController) ContainAndVerifyWithCleanup(ctx context.Context, launch LaunchContext, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := controller.ready(); err != nil {
-		return custodian.VerifiedQuiescence{}, err
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
 	}
 	if err := launch.Validate(); err != nil {
-		return custodian.VerifiedQuiescence{}, err
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
 	}
 	if err := validatePreparedGroup(launch, group); err != nil {
-		return custodian.VerifiedQuiescence{}, err
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
 	}
-	return controller.custodian.ContainAndVerify(ctx, group, cause)
+	return containCustodianWithCleanup(ctx, controller.custodian, group, cause)
 }
 
 func (controller *LaunchController) ready() error {
@@ -335,11 +349,13 @@ func (controller *LaunchController) abortPrepared(ctx context.Context, prepared 
 	var abortErr error
 	if err != nil {
 		abortErr = fmt.Errorf("abort prepared process: %w", err)
-		verified, err = controller.custodian.ContainAndVerify(ctx, prepared.Ref(), custodian.QuiescenceCauseContain)
+		var cleanup custodian.CleanupStatus
+		verified, cleanup, err = containCustodianWithCleanup(ctx, controller.custodian, prepared.Ref(), custodian.QuiescenceCauseContain)
 		if err != nil {
 			reason := errors.Join(abortErr, fmt.Errorf("contain prepared group: %w", err))
 			return errors.Join(reason, controller.failStop(ctx, reason), ErrFailClosed)
 		}
+		abortErr = errors.Join(abortErr, cleanup.Err)
 	}
 	if !groupDurable {
 		return abortErr
@@ -387,7 +403,7 @@ func (controller *LaunchController) handleGrantDurability(ctx context.Context, s
 }
 
 func (controller *LaunchController) containGroupAndFailStop(ctx context.Context, group model.GroupRef, reason error) error {
-	_, containErr := controller.custodian.ContainAndVerify(ctx, group, custodian.QuiescenceCauseContain)
+	_, _, containErr := containCustodianWithCleanup(ctx, controller.custodian, group, custodian.QuiescenceCauseContain)
 	return errors.Join(reason, containErr, controller.failStop(ctx, errors.Join(reason, containErr)), ErrFailClosed)
 }
 
@@ -669,7 +685,7 @@ func (process *Process) handlePostReleaseDurability(ctx context.Context, step st
 }
 
 func (process *Process) eagerWait(ctx context.Context) {
-	exit, verified, err := process.running.WaitAndVerify(ctx)
+	exit, verified, cleanup, err := waitRunningWithCleanup(ctx, process.running)
 	close(process.waitReturned)
 	if err != nil {
 		cause := custodian.QuiescenceCauseWait
@@ -683,12 +699,36 @@ func (process *Process) eagerWait(ctx context.Context) {
 		process.finalizeFromContain(process.controlCtx, cause, exit, priorErr, true)
 		return
 	}
-	process.finalizeWithVerified(process.controlCtx, exit, verified, waitReportedContainment(process.running), true, nil)
+	process.finalizeWithVerified(process.controlCtx, exit, verified, waitReportedContainment(process.running), true, cleanup.Err)
 }
 
 func waitReportedContainment(running RunningProcess) bool {
 	reporter, ok := running.(waitContainmentReporter)
 	return ok && reporter.WaitContained()
+}
+
+func containCustodianWithCleanup(ctx context.Context, custodianPort CustodianPort, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+	if cleanupAware, ok := custodianPort.(CleanupAwareCustodianPort); ok {
+		return cleanupAware.ContainAndVerifyWithCleanup(ctx, group, cause)
+	}
+	verified, err := custodianPort.ContainAndVerify(ctx, group, cause)
+	return verified, custodian.CleanupStatus{}, err
+}
+
+func waitRunningWithCleanup(ctx context.Context, running RunningProcess) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+	if cleanupAware, ok := running.(CleanupAwareRunningProcess); ok {
+		return cleanupAware.WaitAndVerifyWithCleanup(ctx)
+	}
+	exit, verified, err := running.WaitAndVerify(ctx)
+	return exit, verified, custodian.CleanupStatus{}, err
+}
+
+func containRunningWithCleanup(ctx context.Context, running RunningProcess, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+	if cleanupAware, ok := running.(CleanupAwareRunningProcess); ok {
+		return cleanupAware.ContainAndVerifyWithCleanup(ctx, cause)
+	}
+	verified, err := running.ContainAndVerify(ctx, cause)
+	return verified, custodian.CleanupStatus{}, err
 }
 
 func (process *Process) finalizeFromContain(ctx context.Context, cause custodian.QuiescenceCause, priorExit command.ExitObservation, priorErr error, waitReturned bool) {
@@ -703,8 +743,8 @@ func (process *Process) finalizeFromContain(ctx context.Context, cause custodian
 		}
 	}
 	process.finalOnce.Do(func() {
-		verified, containErr := process.running.ContainAndVerify(ctx, cause)
-		process.finish(ctx, priorExit, verified, containErr == nil, containErr == nil, errors.Join(priorErr, containErr))
+		verified, cleanup, containErr := containRunningWithCleanup(ctx, process.running, cause)
+		process.finish(ctx, priorExit, verified, containErr == nil, containErr == nil, errors.Join(priorErr, containErr, cleanup.Err))
 	})
 }
 
@@ -755,7 +795,7 @@ func (process *Process) finish(ctx context.Context, exit command.ExitObservation
 }
 
 func (process *Process) containFinalResult(ctx context.Context, result *Result, finalErr *error) bool {
-	verified, containErr := process.running.ContainAndVerify(ctx, custodian.QuiescenceCauseContain)
+	verified, cleanup, containErr := containRunningWithCleanup(ctx, process.running, custodian.QuiescenceCauseContain)
 	if containErr != nil {
 		result.Contained = false
 		*finalErr = errors.Join(*finalErr, containErr)
@@ -763,6 +803,7 @@ func (process *Process) containFinalResult(ctx context.Context, result *Result, 
 	}
 	result.Verified = verified
 	result.Contained = true
+	*finalErr = errors.Join(*finalErr, cleanup.Err)
 	return true
 }
 

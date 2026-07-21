@@ -405,9 +405,12 @@ func TestHeldLaunchWorkerAckedThenExecFailedAcceptedWaitsAndVerifies(t *testing.
 	if err != nil || outcome != ReleaseAccepted || gotRunning == nil {
 		t.Fatalf("Release() = (%v, %s, %v), want running accepted nil", gotRunning, outcome, err)
 	}
-	gotExit, verified, err := gotRunning.WaitAndVerify(ctx)
+	gotExit, verified, cleanup, err := gotRunning.WaitAndVerify(ctx)
 	if err != nil {
 		t.Fatalf("WaitAndVerify() error = %v, want nil", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("WaitAndVerify() cleanup error = %v, want nil", cleanup.Err)
 	}
 	if gotExit != exit {
 		t.Fatalf("exit = %#v, want %#v", gotExit, exit)
@@ -665,7 +668,7 @@ func (effects *heldLaunchFakeEffects) AbortAndVerify(ctx context.Context, ref mo
 	return effects.issuer.AttestQuiescence(PhysicalQuiescence{Group: ref, Method: model.QuiescenceAlreadyAbsent})
 }
 
-func (effects *heldLaunchFakeEffects) ContainAndVerify(ctx context.Context, ref model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, error) {
+func (effects *heldLaunchFakeEffects) ContainAndVerify(ctx context.Context, ref model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, CleanupStatus, error) {
 	effects.mu.Lock()
 	effects.containCalls++
 	effects.containRefs = append(effects.containRefs, ref)
@@ -678,12 +681,16 @@ func (effects *heldLaunchFakeEffects) ContainAndVerify(ctx context.Context, ref 
 	effects.mu.Unlock()
 	signalOnce(effects.containStarted, &effects.containStartedOnce)
 	if err := waitIfSet(ctx, effects.allowContain); err != nil {
-		return VerifiedQuiescence{}, err
+		return VerifiedQuiescence{}, CleanupStatus{}, err
 	}
 	if containErr != nil {
-		return VerifiedQuiescence{}, containErr
+		return VerifiedQuiescence{}, CleanupStatus{}, containErr
 	}
-	return effects.issuer.AttestQuiescence(PhysicalQuiescence{Group: ref, Method: model.QuiescenceTermKill})
+	verified, err := effects.issuer.AttestQuiescence(PhysicalQuiescence{Group: ref, Method: model.QuiescenceTermKill})
+	if err != nil {
+		return VerifiedQuiescence{}, CleanupStatus{}, err
+	}
+	return verified, CleanupStatus{}, nil
 }
 
 func (effects *heldLaunchFakeEffects) snapshot() heldLaunchFakeSnapshot {
@@ -738,12 +745,12 @@ func (running *heldFakeRunning) Stderr() io.ReadCloser {
 	return io.NopCloser(strings.NewReader(""))
 }
 
-func (running *heldFakeRunning) WaitAndVerify(context.Context) (command.ExitObservation, VerifiedQuiescence, error) {
-	return running.exit, running.verified, nil
+func (running *heldFakeRunning) WaitAndVerify(context.Context) (command.ExitObservation, VerifiedQuiescence, CleanupStatus, error) {
+	return running.exit, running.verified, CleanupStatus{}, nil
 }
 
-func (running *heldFakeRunning) ContainAndVerify(context.Context, QuiescenceCause) (VerifiedQuiescence, error) {
-	return running.verified, nil
+func (running *heldFakeRunning) ContainAndVerify(context.Context, QuiescenceCause) (VerifiedQuiescence, CleanupStatus, error) {
+	return running.verified, CleanupStatus{}, nil
 }
 
 type nopWriteCloser struct{}

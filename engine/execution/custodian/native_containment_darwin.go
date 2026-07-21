@@ -4,6 +4,7 @@ package custodian
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/containment"
@@ -39,20 +40,30 @@ func (backend *leaderNativeContainmentBackend) retainLeaderUnreaped() bool {
 }
 
 func (backend *leaderNativeContainmentBackend) beforeMonitorBind(_ context.Context, group model.GroupRef) (model.GroupRef, error) {
+	if backend == nil || backend.factory == nil {
+		return model.GroupRef{}, fmt.Errorf("%w: leader containment backend is nil", ErrNativeCustodianUnavailable)
+	}
+	backend.retention = nil
+	retention, err := backend.factory(group)
+	if err != nil {
+		return model.GroupRef{}, err
+	}
+	backend.retention = retention
 	return group, nil
 }
 
 func (backend *leaderNativeContainmentBackend) beforeRelease(_ context.Context, group model.GroupRef) error {
-	retention, err := backend.factory(group)
-	if err != nil {
-		return err
+	if backend == nil || backend.retention == nil {
+		return fmt.Errorf("%w: leader retention was not acquired before release", ErrNativeCustodianUnavailable)
 	}
-	backend.retention = retention
+	if !backend.retention.group.Equal(group) {
+		return fmt.Errorf("%w: leader retention group mismatch before release", ErrNativeCustodianUnavailable)
+	}
 	return nil
 }
 
 func (backend *leaderNativeContainmentBackend) witness() containment.ContinuityWitness {
-	if backend == nil {
+	if backend == nil || backend.retention == nil {
 		return nil
 	}
 	return backend.retention

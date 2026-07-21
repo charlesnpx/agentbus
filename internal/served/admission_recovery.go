@@ -75,7 +75,7 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 }
 
 func (e *admissionRecoveryExecutor) recoverLaunch(ctx context.Context, item model.RecoveryWorkItem, recoveryLaunch model.RecoveryLaunch) (model.RecoveryWorkItem, error) {
-	verified, err := e.launch.ContainAndVerify(ctx, recoveryLaunch.Group, custodian.QuiescenceCauseRecovery)
+	verified, cleanup, err := containLaunchPortWithCleanup(ctx, e.launch, recoveryLaunch.Group, custodian.QuiescenceCauseRecovery)
 	if err != nil {
 		return model.RecoveryWorkItem{}, fmt.Errorf("%w: contain recovery launch %s ordinal %s: %v", authority.ErrRecoveryNeeded, item.JobID, recoveryLaunch.Ordinal, err)
 	}
@@ -84,6 +84,9 @@ func (e *admissionRecoveryExecutor) recoverLaunch(ctx context.Context, item mode
 	}
 	if err := e.session.RecordQuiescence(ctx, item.Token, recoveryLaunch.Ordinal, verified); err != nil {
 		return model.RecoveryWorkItem{}, fmt.Errorf("%w: record recovery quiescence for %s ordinal %s: %v", authority.ErrRecoveryNeeded, item.JobID, recoveryLaunch.Ordinal, err)
+	}
+	if cleanup.Err != nil {
+		return model.RecoveryWorkItem{}, fmt.Errorf("%w: cleanup recovery launch %s ordinal %s: %v", authority.ErrRecoveryNeeded, item.JobID, recoveryLaunch.Ordinal, cleanup.Err)
 	}
 	next, err := e.session.AdvanceRecovery(ctx, item.Token)
 	if err != nil {

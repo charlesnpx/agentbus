@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -395,22 +396,27 @@ func TestNativeWaitAndContainShareSerializedFinalization(t *testing.T) {
 
 	waitDone := make(chan command.ExitObservation, 1)
 	waitVerified := make(chan VerifiedQuiescence, 1)
+	waitCleanup := make(chan CleanupStatus, 1)
 	waitErr := make(chan error, 1)
 	go func() {
 		waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer waitCancel()
-		exit, verified, err := running.WaitAndVerify(waitCtx)
+		exit, verified, cleanup, err := running.WaitAndVerify(waitCtx)
 		waitDone <- exit
 		waitVerified <- verified
+		waitCleanup <- cleanup
 		waitErr <- err
 	}()
 	time.Sleep(50 * time.Millisecond)
 	if running.handle.LeaderReaped() {
 		t.Fatal("Wait reaped leader while residual group members remained")
 	}
-	verified, err := running.ContainAndVerify(ctx, QuiescenceCauseContain)
+	verified, cleanup, err := running.ContainAndVerify(ctx, QuiescenceCauseContain)
 	if err != nil {
 		t.Fatalf("ContainAndVerify() error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("ContainAndVerify() cleanup error = %v, want nil", cleanup.Err)
 	}
 	payload, err := verifier.VerifyQuiescence(verified)
 	if err != nil {
@@ -423,6 +429,9 @@ func TestNativeWaitAndContainShareSerializedFinalization(t *testing.T) {
 		t.Fatalf("final physical outcome = %+v, want Absent", running.finalOutcome)
 	}
 	exit := <-waitDone
+	if cleanup := <-waitCleanup; cleanup.Err != nil {
+		t.Fatalf("WaitAndVerify() cleanup error = %v, want nil", cleanup.Err)
+	}
 	waitPayload, err := verifier.VerifyQuiescence(<-waitVerified)
 	if err != nil {
 		t.Fatalf("WaitAndVerify() verifier error = %v", err)
@@ -470,9 +479,12 @@ func TestNativeWaitAndVerifyContainsResidualGroupAfterLeaderExit(t *testing.T) {
 		t.Fatalf("wait leader exit notification: %v", err)
 	}
 
-	exit, verified, err := running.WaitAndVerify(ctx)
+	exit, verified, cleanup, err := running.WaitAndVerify(ctx)
 	if err != nil {
 		t.Fatalf("WaitAndVerify() error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("WaitAndVerify() cleanup error = %v, want nil", cleanup.Err)
 	}
 	payload, err := verifier.VerifyQuiescence(verified)
 	if err != nil {
@@ -771,9 +783,12 @@ func TestAttestationBridgeMintsOnlyFromProvenAbsentPhysicalOutcome(t *testing.T)
 		Decision: model.SignalDirectly,
 	}
 
-	verified, err := attestPhysicalOutcome(issuer, outcome)
+	verified, cleanup, err := attestPhysicalOutcome(issuer, outcome)
 	if err != nil {
 		t.Fatalf("attestPhysicalOutcome(absent) error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("attestPhysicalOutcome(absent) cleanup error = %v, want nil", cleanup.Err)
 	}
 	payload, err := verifier.VerifyQuiescence(verified)
 	if err != nil {
@@ -795,9 +810,12 @@ func TestAttestationBridgeMintsOnlyFromProvenAbsentPhysicalOutcome(t *testing.T)
 		Decision: model.Unprovable,
 		Err:      physicalErr,
 	}
-	unverified, err := attestPhysicalOutcome(issuer, unprovable)
+	unverified, cleanup, err := attestPhysicalOutcome(issuer, unprovable)
 	if !errors.Is(err, physicalErr) {
 		t.Fatalf("attestPhysicalOutcome(unprovable) error = %v, want physical error", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("attestPhysicalOutcome(unprovable) cleanup error = %v, want nil", cleanup.Err)
 	}
 	if unverified != (VerifiedQuiescence{}) {
 		t.Fatalf("attestPhysicalOutcome(unprovable) returned attestation %+v, want zero", unverified)
@@ -805,6 +823,51 @@ func TestAttestationBridgeMintsOnlyFromProvenAbsentPhysicalOutcome(t *testing.T)
 	if _, err := verifier.VerifyQuiescence(unverified); !errors.Is(err, ErrInvalidAttestation) {
 		t.Fatalf("VerifyQuiescence(unprovable result) error = %v, want ErrInvalidAttestation", err)
 	}
+}
+
+func TestWaitBeforeProbeSignalerStartsWaitExactlyAtFirstProbeAfterSignal(t *testing.T) {
+	target := testPhysicalQuiescence().Group
+	events := make([]string, 0, 4)
+	inner := &recordingWaitBeforeProbeSignaler{events: &events}
+	signaler := &waitBeforeProbeSignaler{
+		inner: inner,
+		beforeProbe: func() {
+			events = append(events, "start_wait")
+		},
+	}
+
+	if _, err := signaler.SignalGroup(context.Background(), target, containment.SignalTerminate); err != nil {
+		t.Fatalf("SignalGroup() error = %v", err)
+	}
+	if !reflect.DeepEqual(events, []string{"signal"}) {
+		t.Fatalf("events after SignalGroup = %#v, want signal only", events)
+	}
+	if _, err := signaler.ProbeGroup(context.Background(), target); err != nil {
+		t.Fatalf("ProbeGroup() error = %v", err)
+	}
+	if !reflect.DeepEqual(events, []string{"signal", "start_wait", "probe"}) {
+		t.Fatalf("events after first ProbeGroup = %#v, want signal/start_wait/probe", events)
+	}
+	if _, err := signaler.ProbeGroup(context.Background(), target); err != nil {
+		t.Fatalf("second ProbeGroup() error = %v", err)
+	}
+	if !reflect.DeepEqual(events, []string{"signal", "start_wait", "probe", "probe"}) {
+		t.Fatalf("events after second ProbeGroup = %#v, want start_wait exactly once", events)
+	}
+}
+
+type recordingWaitBeforeProbeSignaler struct {
+	events *[]string
+}
+
+func (signaler *recordingWaitBeforeProbeSignaler) SignalGroup(context.Context, model.GroupRef, containment.Signal) (containment.SignalResult, error) {
+	*signaler.events = append(*signaler.events, "signal")
+	return containment.SignalDelivered, nil
+}
+
+func (signaler *recordingWaitBeforeProbeSignaler) ProbeGroup(context.Context, model.GroupRef) (containment.ProbeResult, error) {
+	*signaler.events = append(*signaler.events, "probe")
+	return containment.ProbeAbsent, nil
 }
 
 func TestFinalAttestationSerializedOnce(t *testing.T) {
@@ -830,10 +893,14 @@ func TestFinalAttestationSerializedOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			process.lifecycleMu.Lock()
-			verified, err := process.finalAttestationLocked()
+			verified, cleanup, err := process.finalAttestationLocked()
 			process.lifecycleMu.Unlock()
 			if err != nil {
 				errs <- err
+				return
+			}
+			if cleanup.Err != nil {
+				errs <- fmt.Errorf("cleanup error = %v", cleanup.Err)
 				return
 			}
 			payload, err := verifier.VerifyQuiescence(verified)
@@ -892,10 +959,13 @@ func TestCustodianContainAndVerifyUsesFinalizedCacheAfterRunningEviction(t *test
 		process.lifecycleMu.Unlock()
 		t.Fatalf("cacheFinalLocked() error = %v", err)
 	}
-	first, err := process.finalAttestationLocked()
+	first, cleanup, err := process.finalAttestationLocked()
 	process.lifecycleMu.Unlock()
 	if err != nil {
 		t.Fatalf("finalAttestationLocked() error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("finalAttestationLocked() cleanup error = %v, want nil", cleanup.Err)
 	}
 	if cached != finalOutcome {
 		t.Fatalf("cached outcome = %+v, want %+v", cached, finalOutcome)
@@ -907,9 +977,12 @@ func TestCustodianContainAndVerifyUsesFinalizedCacheAfterRunningEviction(t *test
 		t.Fatalf("ActiveCustodyCount() after finalized eviction = %d, want 0", got)
 	}
 
-	second, err := native.ContainAndVerify(context.Background(), quiescence.Group, QuiescenceCauseContain)
+	second, cleanup, err := native.ContainAndVerify(context.Background(), quiescence.Group, QuiescenceCauseContain)
 	if err != nil {
 		t.Fatalf("custodian ContainAndVerify() error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("custodian ContainAndVerify() cleanup error = %v, want nil", cleanup.Err)
 	}
 	if second != first {
 		t.Fatalf("custodian ContainAndVerify() attestation = %+v, want cached %+v", second, first)
@@ -990,9 +1063,12 @@ func TestNativeCustodianDoesNotMintProofAndProductionUnavailable(t *testing.T) {
 	if runtime.Support().VerifiedContainment || runtime.Support().AdvertisedAvailable() {
 		t.Fatalf("production runtime support = %+v, want unavailable", runtime.Support())
 	}
-	verified, err := runtime.Process().ContainAndVerify(context.Background(), testPhysicalQuiescence().Group, QuiescenceCauseContain)
+	verified, cleanup, err := runtime.Process().ContainAndVerify(context.Background(), testPhysicalQuiescence().Group, QuiescenceCauseContain)
 	if !errors.Is(err, ErrSupervisorUnavailable) {
 		t.Fatalf("production ContainAndVerify() error = %v, want ErrSupervisorUnavailable", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("production ContainAndVerify() cleanup error = %v, want nil", cleanup.Err)
 	}
 	if verified != (VerifiedQuiescence{}) {
 		t.Fatalf("production ContainAndVerify() verified = %+v, want zero", verified)
@@ -1039,7 +1115,7 @@ func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing
 		t.Fatalf("native runtime support = %+v, want capability off/not advertised", support)
 	}
 	quiescence := testPhysicalQuiescence()
-	verified, err := attestPhysicalOutcome(native.issuer, PhysicalOutcome{
+	verified, cleanup, err := attestPhysicalOutcome(native.issuer, PhysicalOutcome{
 		Kind:     PhysicalOutcomeAbsent,
 		Group:    quiescence.Group,
 		Method:   model.QuiescenceAlreadyAbsent,
@@ -1047,6 +1123,9 @@ func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing
 	})
 	if err != nil {
 		t.Fatalf("native runtime issuer attest error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("native runtime issuer cleanup error = %v, want nil", cleanup.Err)
 	}
 	payload, err := runtimeBundle.Verifier().VerifyQuiescence(verified)
 	if err != nil {
@@ -1101,9 +1180,12 @@ func TestNativeRetainedContainAndVerifyPreservesCleanupFailureAfterFinalization(
 	manager.setMembership(running.Ref().RetainedID, containment.RetainedMembershipEmpty)
 	manager.setRemoveErr(running.Ref().RetainedID, removeErr)
 
-	first, err := running.ContainAndVerify(ctx, QuiescenceCauseContain)
-	if !errors.Is(err, removeErr) {
-		t.Fatalf("first ContainAndVerify() error = %v, want retained remove failure", err)
+	first, cleanup, err := running.ContainAndVerify(ctx, QuiescenceCauseContain)
+	if err != nil {
+		t.Fatalf("first ContainAndVerify() error = %v, want nil", err)
+	}
+	if !errors.Is(cleanup.Err, removeErr) {
+		t.Fatalf("first ContainAndVerify() cleanup error = %v, want retained remove failure", cleanup.Err)
 	}
 	payload, err := verifier.VerifyQuiescence(first)
 	if err != nil {
@@ -1119,9 +1201,12 @@ func TestNativeRetainedContainAndVerifyPreservesCleanupFailureAfterFinalization(
 		t.Fatalf("cached final error = %v, want retained remove failure", running.finalErr)
 	}
 
-	second, err := running.ContainAndVerify(ctx, QuiescenceCauseContain)
-	if !errors.Is(err, removeErr) {
-		t.Fatalf("second ContainAndVerify() error = %v, want retained remove failure", err)
+	second, cleanup, err := running.ContainAndVerify(ctx, QuiescenceCauseContain)
+	if err != nil {
+		t.Fatalf("second ContainAndVerify() error = %v, want nil", err)
+	}
+	if !errors.Is(cleanup.Err, removeErr) {
+		t.Fatalf("second ContainAndVerify() cleanup error = %v, want retained remove failure", cleanup.Err)
 	}
 	if second != first {
 		t.Fatalf("second ContainAndVerify() attestation = %+v, want cached %+v", second, first)
@@ -1217,9 +1302,12 @@ func TestNativeContainAndVerifyRecoveryReattachesRetainedGroup(t *testing.T) {
 	manager.setTermIgnored(group.RetainedID, true)
 	before := manager.leafForRetainedID(t, group.RetainedID)
 
-	verified, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
+	verified, cleanup, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
 	if err != nil {
 		t.Fatalf("ContainAndVerify(recovery) error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("ContainAndVerify(recovery) cleanup error = %v, want nil", cleanup.Err)
 	}
 	payload, err := verifier.VerifyQuiescence(verified)
 	if err != nil {
@@ -1254,9 +1342,12 @@ func TestNativeContainAndVerifyRecoveryTreatsMissingRetainedGroupAsAlreadyAbsent
 	manager.removeLeaf(group.RetainedID)
 	before := manager.leafForRetainedID(t, group.RetainedID)
 
-	verified, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
+	verified, cleanup, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
 	if err != nil {
 		t.Fatalf("ContainAndVerify(recovery missing retained group) error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("ContainAndVerify(recovery missing retained group) cleanup error = %v, want nil", cleanup.Err)
 	}
 	payload, err := verifier.VerifyQuiescence(verified)
 	if err != nil {
@@ -1343,9 +1434,12 @@ func TestNativeContainAndVerifyRecoveryMissingRetainedGroupRequiresProcessGroupA
 	manager.setMembership(group.RetainedID, containment.RetainedMembershipPresent)
 	manager.removeLeaf(group.RetainedID)
 
-	verified, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
+	verified, cleanup, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
 	if err == nil {
 		t.Fatal("ContainAndVerify(recovery live process group with missing retained leaf) error = nil, want unprovable")
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("ContainAndVerify() cleanup error = %v, want nil", cleanup.Err)
 	}
 	if verified != (VerifiedQuiescence{}) {
 		t.Fatalf("verified = %+v, want zero attestation", verified)
@@ -1371,9 +1465,12 @@ func TestNativeContainAndVerifyRecoveryMissingRetainedGroupMismatchedDomainIsUnp
 	manager.setCurrentDomain(t, differentKernelDomainForTest(t, group.KernelDomain()))
 	before := manager.leafForRetainedID(t, group.RetainedID)
 
-	verified, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
+	verified, cleanup, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
 	if err == nil {
 		t.Fatalf("ContainAndVerify(recovery missing retained group in mismatched domain) error = nil, want unprovable")
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("ContainAndVerify() cleanup error = %v, want nil", cleanup.Err)
 	}
 	if verified != (VerifiedQuiescence{}) {
 		t.Fatalf("verified = %+v, want zero attestation", verified)

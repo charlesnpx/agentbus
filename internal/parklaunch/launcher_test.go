@@ -316,6 +316,47 @@ func TestPrepareFailureAfterRetainedPlacementBeforeMonitorTargetBindStartsWaitBe
 	}
 }
 
+func TestPrepareArmedFailureStartsWaitOnlyAfterFenceAcquired(t *testing.T) {
+	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}, Hold: 5 * time.Second})
+	fixture.spec.Monitor.Command = monitorCommandWithKill(t, fixture.monitorMarker, true)
+	fenceHeld := atomic.Bool{}
+	containment := &fencedWaitContainment{fenceHeld: &fenceHeld}
+	fixture.spec.Containment = containment
+	fixture.spec.RetainLeaderUnreaped = true
+	fixture.spec.RetainedID = "retained-armed-fence-ordering"
+	fixture.spec.hooks.afterWorkerWaitCreated = func(wait *processWait) {
+		containment.wait = wait
+	}
+	fixture.spec.BeforeMonitorBind = func(_ context.Context, group model.GroupRef) (model.GroupRef, error) {
+		group.RetainedDomainID = "retained-domain-armed-fence-ordering"
+		group.RetainedDomainState = model.RetainedDomainKnown
+		fenceHeld.Store(true)
+		return group, nil
+	}
+	readyErr := errors.New("injected monitor readiness failure")
+	fixture.spec.hooks.beforeMonitorWaitReady = func(*MonitorProcess) error {
+		return readyErr
+	}
+
+	handle, err := Launch(fixture.ctx, fixture.spec)
+	if err == nil {
+		cleanupParkedHandle(t, handle)
+		t.Fatal("Launch() succeeded; want monitor readiness failure")
+	}
+	if !errors.Is(err, readyErr) {
+		t.Fatalf("Launch() error = %v, want readiness failure", err)
+	}
+	if got := containment.CallCount(); got != 1 {
+		t.Fatalf("containment calls = %d, want 1", got)
+	}
+	if !containment.waitStartedAtContain {
+		t.Fatal("containment observed wait not started")
+	}
+	if !containment.fenceHeldAtContain {
+		t.Fatal("containment ran after wait without acquired fence")
+	}
+}
+
 func TestPrepareFailureDuringTargetBindingStartsWaitBeforeAbsenceProof(t *testing.T) {
 	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
 	containment := &waitBeforeProofContainment{}
@@ -1576,6 +1617,34 @@ func (containment *waitOrderingContainment) Contain(_ context.Context, group mod
 		return fmt.Errorf("containment group = %+v, want %+v", group, containment.want)
 	}
 	return nil
+}
+
+type fencedWaitContainment struct {
+	mu                   sync.Mutex
+	wait                 *processWait
+	fenceHeld            *atomic.Bool
+	calls                int
+	waitStartedAtContain bool
+	fenceHeldAtContain   bool
+}
+
+func (containment *fencedWaitContainment) Contain(context.Context, model.GroupRef) error {
+	containment.mu.Lock()
+	defer containment.mu.Unlock()
+	containment.calls++
+	if containment.wait != nil {
+		containment.waitStartedAtContain = containment.wait.Started()
+	}
+	if containment.fenceHeld != nil {
+		containment.fenceHeldAtContain = containment.fenceHeld.Load()
+	}
+	return nil
+}
+
+func (containment *fencedWaitContainment) CallCount() int {
+	containment.mu.Lock()
+	defer containment.mu.Unlock()
+	return containment.calls
 }
 
 type waitBeforeProofContainment struct {

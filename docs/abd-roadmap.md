@@ -4,9 +4,9 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R3A2 CLOSED. R3B + fix + fix2 committed (native monitor port + F-C/F-D + phase-aware
-Prepare cleanup ordering + attestation-cache cleanup-error preservation + Runtime injection). All pushed.
-Next: sol verification review of fix2, then R3C (packet drafted).
+STATUS: EXECUTING. R0..R3A2 CLOSED. R3B + fix/fix2/fix3 committed (native monitor port + F-C/F-D +
+phase-aware cleanup ordering + Darwin retention fence at bind + CleanupStatus contract through custody/
+launch/served). All pushed. Next: sol verification of fix3, then R3C (packet drafted).
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -283,7 +283,23 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
-- 2026-07-20 R3B-fix2 (this commit): closed the fix-verification review's 2 residual High. F1 unarmed
+- 2026-07-20 R3B-fix3 (this commit): closed fix2-review's 2 High. F1 Darwin PID/PGID reuse window:
+  leaderRetention now acquired at beforeMonitorBind (matching Linux fence-acquisition phase);
+  beforeRelease only verifies the exact retained group; witness nil until acquired — post-placement
+  failure paths are fenced on both platforms; ordering regression extended through the REAL
+  waitBeforeProbeSignaler. F2 attestation/cleanup separation made STRUCTURAL: custody interfaces
+  (ProcessCustodian/RunningProcess) now return (VerifiedQuiescence, CleanupStatus, error) — error means
+  NO valid proof, CleanupStatus.Err carries post-proof cleanup failure beside a VALID attestation.
+  Launch controller records the proven quiescence exactly once then surfaces cleanup.Err
+  (eagerWait/finalizeWithVerified/containFinalResult); served coordinator containment records the
+  attestation and trips the SafetyLatch on cleanup failure (fail-stop visible, proof not lost);
+  recovery path consistent. launch.CustodianPort kept its 2-value shape with CleanupAware* extension
+  interfaces (fakes unaffected) — flagged for reviewer assessment vs no-legacy. Worker job_...000058
+  timed out 1 message before its report (3rd occurrence; acceptance green in its log); orchestrator
+  audited all diffs + verified independently: build/linux/gofmt/vet=0; macOS full=0, race -count=2
+  parklaunch/custodian/launch/served=0; Docker cgroup-v2 full -p 1=0, race=0, R0T RED sentinel
+  strict_admission_unavailable=0. 17 files +622/-133. sol verification next.
+- 2026-07-20 R3B-fix2 (3434063): closed the fix-verification review's 2 residual High. F1 unarmed
   Prepare failures no longer contain-before-reap: phase-aware cleanup closures (failBeforeVerifiedIdentity/
   failBeforeVerifiedPlacement/failAfterVerifiedPlacement) route every Prepare failure site; new
   waitBeforeAbsenceProofContainment seam — waitBeforeProbeSignaler starts the parent Wait via sync.Once at

@@ -30,7 +30,7 @@ const (
 type ProcessCustodian interface {
 	processCustodian()
 	Prepare(context.Context, command.ExecSpec, model.LaunchKey) (PreparedProcess, error)
-	ContainAndVerify(context.Context, model.GroupRef, QuiescenceCause) (VerifiedQuiescence, error)
+	ContainAndVerify(context.Context, model.GroupRef, QuiescenceCause) (VerifiedQuiescence, CleanupStatus, error)
 	ActiveCustodyCount() int
 }
 
@@ -46,8 +46,8 @@ type PreparedProcess interface {
 
 type RunningProcess interface {
 	runningProcess()
-	WaitAndVerify(context.Context) (command.ExitObservation, VerifiedQuiescence, error)
-	ContainAndVerify(context.Context, QuiescenceCause) (VerifiedQuiescence, error)
+	WaitAndVerify(context.Context) (command.ExitObservation, VerifiedQuiescence, CleanupStatus, error)
+	ContainAndVerify(context.Context, QuiescenceCause) (VerifiedQuiescence, CleanupStatus, error)
 }
 
 type UnavailableCustodian struct{}
@@ -58,8 +58,8 @@ func (UnavailableCustodian) Prepare(context.Context, command.ExecSpec, model.Lau
 	return nil, ErrSupervisorUnavailable
 }
 
-func (UnavailableCustodian) ContainAndVerify(context.Context, model.GroupRef, QuiescenceCause) (VerifiedQuiescence, error) {
-	return VerifiedQuiescence{}, ErrSupervisorUnavailable
+func (UnavailableCustodian) ContainAndVerify(context.Context, model.GroupRef, QuiescenceCause) (VerifiedQuiescence, CleanupStatus, error) {
+	return VerifiedQuiescence{}, CleanupStatus{}, ErrSupervisorUnavailable
 }
 
 func (UnavailableCustodian) ActiveCustodyCount() int {
@@ -188,6 +188,12 @@ type AttestationVerifier struct {
 type VerifiedQuiescence struct {
 	token   *attestationToken
 	payload PhysicalQuiescence
+}
+
+// CleanupStatus carries post-proof cleanup failures separately from attestation
+// errors. A non-nil proof error means the VerifiedQuiescence must not be used.
+type CleanupStatus struct {
+	Err error
 }
 
 type PhysicalQuiescence struct {

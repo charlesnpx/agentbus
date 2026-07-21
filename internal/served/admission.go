@@ -95,7 +95,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	coord, err := coordinator.New(adapter, launchController, servedResultPublisher{server: s}, owner)
+	coord, err := coordinator.New(adapter, servedCoordinatorLaunchContainment{controller: launchController, latch: s.safetyLatch}, servedResultPublisher{server: s}, owner)
 	if err != nil {
 		return err
 	}
@@ -141,6 +141,25 @@ func (s *Server) admissionDaemonID(prefix string) (string, error) {
 		return "", fmt.Errorf("generate %s admission daemon identity entropy: %w", prefix, err)
 	}
 	return s.nextID(prefix) + "_" + entropy, nil
+}
+
+type servedCoordinatorLaunchContainment struct {
+	controller *launch.LaunchController
+	latch      *SafetyLatch
+}
+
+func (c servedCoordinatorLaunchContainment) ContainAndVerify(ctx context.Context, launchContext launch.LaunchContext, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	if c.controller == nil {
+		return custodian.VerifiedQuiescence{}, launch.ErrCustodianRequired
+	}
+	verified, cleanup, err := c.controller.ContainAndVerifyWithCleanup(ctx, launchContext, group, cause)
+	if err != nil {
+		return custodian.VerifiedQuiescence{}, err
+	}
+	if cleanup.Err != nil && c.latch != nil {
+		c.latch.Trip(cleanup.Err)
+	}
+	return verified, nil
 }
 
 func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
@@ -722,6 +741,30 @@ func detachedAdmissionCleanupContext(ctx context.Context) (context.Context, cont
 	return context.WithTimeout(context.WithoutCancel(ctx), admissionDetachedCleanupTimeout)
 }
 
+func containLaunchPortWithCleanup(ctx context.Context, port launch.CustodianPort, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+	if cleanupAware, ok := port.(launch.CleanupAwareCustodianPort); ok {
+		return cleanupAware.ContainAndVerifyWithCleanup(ctx, group, cause)
+	}
+	verified, err := port.ContainAndVerify(ctx, group, cause)
+	return verified, custodian.CleanupStatus{}, err
+}
+
+func waitLaunchRunningWithCleanup(ctx context.Context, running launch.RunningProcess) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+	if cleanupAware, ok := running.(launch.CleanupAwareRunningProcess); ok {
+		return cleanupAware.WaitAndVerifyWithCleanup(ctx)
+	}
+	exit, verified, err := running.WaitAndVerify(ctx)
+	return exit, verified, custodian.CleanupStatus{}, err
+}
+
+func containLaunchRunningWithCleanup(ctx context.Context, running launch.RunningProcess, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+	if cleanupAware, ok := running.(launch.CleanupAwareRunningProcess); ok {
+		return cleanupAware.ContainAndVerifyWithCleanup(ctx, cause)
+	}
+	verified, err := running.ContainAndVerify(ctx, cause)
+	return verified, custodian.CleanupStatus{}, err
+}
+
 type legacyFencedCommand struct {
 	coordinator   *servedSubmissionCoordinator
 	launchContext launch.LaunchContext
@@ -803,7 +846,7 @@ func (cmd *legacyFencedCommand) Interrupt(ctx context.Context) error {
 	if !released || running == nil {
 		return cmd.reject(ctx, model.CauseCanceledBeforeAuthorization)
 	}
-	verified, err := running.ContainAndVerify(ctx, custodian.QuiescenceCauseContain)
+	verified, cleanup, err := containLaunchRunningWithCleanup(ctx, running, custodian.QuiescenceCauseContain)
 	if err != nil {
 		return err
 	}
@@ -811,8 +854,8 @@ func (cmd *legacyFencedCommand) Interrupt(ctx context.Context) error {
 	if mapped := admissionDurabilityError("record_quiescence", outcome, recordErr); mapped != nil {
 		return mapped
 	}
-	cmd.finish(command.ExitObservation{}, nil)
-	return nil
+	cmd.finish(command.ExitObservation{}, cleanup.Err)
+	return cleanup.Err
 }
 
 func (cmd *legacyFencedCommand) ProcessRef() (engine.ProcessRef, int) {
@@ -978,10 +1021,10 @@ func (cmd *legacyFencedCommand) failReleasedByGroup(ctx context.Context, reason 
 	cleanupCtx, cancel := detachedAdmissionCleanupContext(ctx)
 	defer cancel()
 
-	verified, containErr := cmd.coordinator.launch.ContainAndVerify(cleanupCtx, cmd.launchContext, cmd.group, custodian.QuiescenceCauseContain)
+	verified, cleanup, containErr := cmd.coordinator.launch.ContainAndVerifyWithCleanup(cleanupCtx, cmd.launchContext, cmd.group, custodian.QuiescenceCauseContain)
 	if containErr == nil {
 		outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(cleanupCtx, cmd.launchContext, verified)
-		containErr = admissionDurabilityError("record_quiescence", outcome, recordErr)
+		containErr = errors.Join(cleanup.Err, admissionDurabilityError("record_quiescence", outcome, recordErr))
 	}
 	err := errors.Join(reason, containErr, cmd.coordinator.failStop(ctx, errors.Join(reason, containErr)), launch.ErrFailClosed)
 	cmd.closePipesWithError(err)
@@ -992,10 +1035,10 @@ func (cmd *legacyFencedCommand) failReleased(ctx context.Context, running launch
 	cleanupCtx, cancel := detachedAdmissionCleanupContext(ctx)
 	defer cancel()
 
-	verified, containErr := running.ContainAndVerify(cleanupCtx, custodian.QuiescenceCauseContain)
+	verified, cleanup, containErr := containLaunchRunningWithCleanup(cleanupCtx, running, custodian.QuiescenceCauseContain)
 	if containErr == nil {
 		outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(cleanupCtx, cmd.launchContext, verified)
-		containErr = admissionDurabilityError("record_quiescence", outcome, recordErr)
+		containErr = errors.Join(cleanup.Err, admissionDurabilityError("record_quiescence", outcome, recordErr))
 	}
 	err := errors.Join(reason, containErr, cmd.coordinator.failStop(ctx, errors.Join(reason, containErr)), launch.ErrFailClosed)
 	cmd.closePipesWithError(err)
@@ -1003,10 +1046,10 @@ func (cmd *legacyFencedCommand) failReleased(ctx context.Context, running launch
 }
 
 func (cmd *legacyFencedCommand) waitAndRecordQuiescence(ctx context.Context, running launch.RunningProcess) {
-	exit, verified, err := running.WaitAndVerify(ctx)
+	exit, verified, cleanup, err := waitLaunchRunningWithCleanup(ctx, running)
 	if err == nil {
 		outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(ctx, cmd.launchContext, verified)
-		err = admissionDurabilityError("record_quiescence", outcome, recordErr)
+		err = errors.Join(cleanup.Err, admissionDurabilityError("record_quiescence", outcome, recordErr))
 	}
 	cmd.finish(exit, err)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -121,6 +122,11 @@ func (c runtimeLaunchCustodian) Prepare(ctx context.Context, spec command.ExecSp
 }
 
 func (c runtimeLaunchCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	verified, cleanup, err := c.ContainAndVerifyWithCleanup(ctx, group, cause)
+	return verified, errors.Join(err, cleanup.Err)
+}
+
+func (c runtimeLaunchCustodian) ContainAndVerifyWithCleanup(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	return c.runtime.Process().ContainAndVerify(ctx, group, cause)
 }
 
@@ -152,8 +158,8 @@ func (p runtimePreparedProcess) Release(ctx context.Context) (launch.RunningProc
 		Stdin() io.WriteCloser
 		Stdout() io.ReadCloser
 		Stderr() io.ReadCloser
-		WaitAndVerify(context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error)
-		ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error)
+		WaitAndVerify(context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error)
+		ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error)
 	})
 	if !ok {
 		return nil, custodian.ReleaseOutcomeUnknown, fmt.Errorf("%w: running process does not expose command streams", custodian.ErrSupervisorUnavailable)
@@ -174,8 +180,8 @@ type runtimeRunningProcess struct {
 		Stdin() io.WriteCloser
 		Stdout() io.ReadCloser
 		Stderr() io.ReadCloser
-		WaitAndVerify(context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error)
-		ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error)
+		WaitAndVerify(context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error)
+		ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error)
 	}
 }
 
@@ -196,10 +202,20 @@ func (p runtimeRunningProcess) Stderr() io.ReadCloser {
 }
 
 func (p runtimeRunningProcess) WaitAndVerify(ctx context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error) {
+	exit, verified, cleanup, err := p.WaitAndVerifyWithCleanup(ctx)
+	return exit, verified, errors.Join(err, cleanup.Err)
+}
+
+func (p runtimeRunningProcess) WaitAndVerifyWithCleanup(ctx context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	return p.running.WaitAndVerify(ctx)
 }
 
 func (p runtimeRunningProcess) ContainAndVerify(ctx context.Context, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+	verified, cleanup, err := p.ContainAndVerifyWithCleanup(ctx, cause)
+	return verified, errors.Join(err, cleanup.Err)
+}
+
+func (p runtimeRunningProcess) ContainAndVerifyWithCleanup(ctx context.Context, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	return p.running.ContainAndVerify(ctx, cause)
 }
 

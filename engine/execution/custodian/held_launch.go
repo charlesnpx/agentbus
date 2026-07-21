@@ -97,7 +97,7 @@ type HeldLaunchEffects interface {
 	Prepare(context.Context, PrepareSpec) (model.GroupRef, error)
 	SendRelease(context.Context, PrepareSpec, model.GroupRef) (RunningProcess, ReleaseOutcome, error)
 	AbortAndVerify(context.Context, model.GroupRef) (VerifiedQuiescence, error)
-	ContainAndVerify(context.Context, model.GroupRef, QuiescenceCause) (VerifiedQuiescence, error)
+	ContainAndVerify(context.Context, model.GroupRef, QuiescenceCause) (VerifiedQuiescence, CleanupStatus, error)
 }
 
 type HeldLaunchState string
@@ -440,12 +440,12 @@ func (launch *HeldLaunchCore) containAfterUnknown(ctx context.Context, ref model
 // fail-stop latch owns escalation while execution remains possible and unproven.
 func (launch *HeldLaunchCore) containAndFinalize(ctx context.Context, ref model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, error) {
 	launch.setState(HeldLaunchStateContaining)
-	verified, err := launch.effects.ContainAndVerify(ctx, ref, cause)
+	verified, cleanup, err := launch.effects.ContainAndVerify(ctx, ref, cause)
 	if err != nil {
 		return verified, err
 	}
 	launch.setState(HeldLaunchStateFinalized)
-	return verified, nil
+	return verified, cleanup.Err
 }
 
 func (launch *HeldLaunchCore) markReleaseConsumed() {

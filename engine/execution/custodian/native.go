@@ -326,16 +326,16 @@ func (custodian *NativeCustodian) ContainPhysical(ctx context.Context, group mod
 	return containPhysical(ctx, group, custodian.options.ContainmentParams, nil, nil)
 }
 
-func (custodian *NativeCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, error) {
+func (custodian *NativeCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, CleanupStatus, error) {
 	_ = cause
 	if custodian == nil {
-		return VerifiedQuiescence{}, fmt.Errorf("%w: custodian is nil", ErrNativeCustodianUnavailable)
+		return VerifiedQuiescence{}, CleanupStatus{}, fmt.Errorf("%w: custodian is nil", ErrNativeCustodianUnavailable)
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := group.Validate(); err != nil {
-		return VerifiedQuiescence{}, err
+		return VerifiedQuiescence{}, CleanupStatus{}, err
 	}
 	running := custodian.lookup(group)
 	if running != nil {
@@ -866,19 +866,20 @@ func (process *NativeRunningProcess) Wait(ctx context.Context) (command.ExitObse
 	}
 }
 
-func (process *NativeRunningProcess) WaitAndVerify(ctx context.Context) (command.ExitObservation, VerifiedQuiescence, error) {
+func (process *NativeRunningProcess) WaitAndVerify(ctx context.Context) (command.ExitObservation, VerifiedQuiescence, CleanupStatus, error) {
 	if process == nil {
-		return command.ExitObservation{}, VerifiedQuiescence{}, fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable)
+		return command.ExitObservation{}, VerifiedQuiescence{}, CleanupStatus{}, fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable)
 	}
 	exit, waitErr := process.Wait(ctx)
 	process.lifecycleMu.Lock()
 	if !process.finalized {
 		process.lifecycleMu.Unlock()
-		return exit, VerifiedQuiescence{}, waitErr
+		return exit, VerifiedQuiescence{}, CleanupStatus{}, waitErr
 	}
-	verified, attestErr := process.finalAttestationLocked()
+	finalWaitErr := process.finalWaitErr
+	verified, cleanup, attestErr := process.finalAttestationLocked()
 	process.lifecycleMu.Unlock()
-	return exit, verified, errors.Join(waitErr, attestErr)
+	return exit, verified, cleanup, errors.Join(finalWaitErr, attestErr)
 }
 
 func (process *NativeRunningProcess) WaitContained() bool {
@@ -910,14 +911,14 @@ func (process *NativeRunningProcess) ContainPhysical(ctx context.Context) Physic
 	return process.containAndVerify(ctx)
 }
 
-func (process *NativeRunningProcess) ContainAndVerify(ctx context.Context, cause QuiescenceCause) (VerifiedQuiescence, error) {
+func (process *NativeRunningProcess) ContainAndVerify(ctx context.Context, cause QuiescenceCause) (VerifiedQuiescence, CleanupStatus, error) {
 	_ = cause
 	if process == nil || process.custodian == nil {
-		return VerifiedQuiescence{}, fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable)
+		return VerifiedQuiescence{}, CleanupStatus{}, fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable)
 	}
 	outcome := process.containAndVerify(ctx)
 	if !outcome.Absent() {
-		return VerifiedQuiescence{}, physicalOutcomeError(outcome)
+		return VerifiedQuiescence{}, CleanupStatus{}, physicalOutcomeError(outcome)
 	}
 	process.lifecycleMu.Lock()
 	defer process.lifecycleMu.Unlock()
@@ -1196,21 +1197,20 @@ func (process *NativeRunningProcess) cacheFinalLocked(ctx context.Context, outco
 	return outcome, cleanupErr
 }
 
-func (process *NativeRunningProcess) finalAttestationLocked() (VerifiedQuiescence, error) {
+func (process *NativeRunningProcess) finalAttestationLocked() (VerifiedQuiescence, CleanupStatus, error) {
 	if process == nil || !process.finalized {
-		return VerifiedQuiescence{}, fmt.Errorf("%w: process has no final physical outcome", ErrNativeCustodianUnavailable)
+		return VerifiedQuiescence{}, CleanupStatus{}, fmt.Errorf("%w: process has no final physical outcome", ErrNativeCustodianUnavailable)
 	}
 	if process.finalAttestationAttempted {
-		return process.finalAttestation, process.finalAttestationErr
+		return process.finalAttestation, CleanupStatus{Err: process.finalErr}, process.finalAttestationErr
 	}
 	process.finalAttestationAttempted = true
 	if process.custodian == nil {
-		process.finalAttestationErr = errors.Join(fmt.Errorf("%w: running process has no custodian", ErrNativeCustodianUnavailable), process.finalErr)
-		return process.finalAttestation, process.finalAttestationErr
+		process.finalAttestationErr = fmt.Errorf("%w: running process has no custodian", ErrNativeCustodianUnavailable)
+		return process.finalAttestation, CleanupStatus{Err: process.finalErr}, process.finalAttestationErr
 	}
-	process.finalAttestation, process.finalAttestationErr = attestPhysicalOutcome(process.custodian.issuer, process.finalOutcome)
-	process.finalAttestationErr = errors.Join(process.finalAttestationErr, process.finalErr)
-	return process.finalAttestation, process.finalAttestationErr
+	process.finalAttestation, _, process.finalAttestationErr = attestPhysicalOutcome(process.custodian.issuer, process.finalOutcome)
+	return process.finalAttestation, CleanupStatus{Err: process.finalErr}, process.finalAttestationErr
 }
 
 type RealContainment struct {
@@ -1579,18 +1579,21 @@ func methodForDecision(decision model.ContainmentDecision) model.QuiescenceMetho
 	return model.QuiescenceTermKill
 }
 
-func attestPhysicalOutcome(issuer quiescenceAttestationIssuer, outcome PhysicalOutcome) (VerifiedQuiescence, error) {
+func attestPhysicalOutcome(issuer quiescenceAttestationIssuer, outcome PhysicalOutcome) (VerifiedQuiescence, CleanupStatus, error) {
 	if !outcome.Absent() {
-		return VerifiedQuiescence{}, physicalOutcomeError(outcome)
+		return VerifiedQuiescence{}, CleanupStatus{}, physicalOutcomeError(outcome)
 	}
 	if issuer == nil {
-		return VerifiedQuiescence{}, ErrInvalidAttestation
+		return VerifiedQuiescence{}, CleanupStatus{}, ErrInvalidAttestation
 	}
 	verified, err := issuer.AttestQuiescence(PhysicalQuiescence{
 		Group:  outcome.Group,
 		Method: outcome.Method,
 	})
-	return verified, errors.Join(err, outcome.Err)
+	if err != nil {
+		return verified, CleanupStatus{}, err
+	}
+	return verified, CleanupStatus{Err: outcome.Err}, nil
 }
 
 func physicalOutcomeError(outcome PhysicalOutcome) error {

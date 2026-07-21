@@ -26,8 +26,8 @@ func TestServedAdmissionRuntimeUsesUnavailableCustodian(t *testing.T) {
 	if _, err := launchPort.Prepare(ctx, command.ExecSpec{Argv: []string{"/bin/fake-agent"}}, model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne}); !errors.Is(err, custodian.ErrSupervisorUnavailable) {
 		t.Fatalf("launchPort Prepare error = %v, want supervisor_unavailable", err)
 	}
-	if verified, err := launchPort.ContainAndVerify(ctx, model.GroupRef{}, custodian.QuiescenceCauseContain); !errors.Is(err, custodian.ErrSupervisorUnavailable) || verified != (custodian.VerifiedQuiescence{}) {
-		t.Fatalf("launchPort ContainAndVerify = verified:%#v err:%v, want unavailable zero attestation", verified, err)
+	if verified, cleanup, err := containLaunchPortWithCleanup(ctx, launchPort, model.GroupRef{}, custodian.QuiescenceCauseContain); !errors.Is(err, custodian.ErrSupervisorUnavailable) || verified != (custodian.VerifiedQuiescence{}) || cleanup.Err != nil {
+		t.Fatalf("launchPort ContainAndVerify = verified:%#v cleanup:%v err:%v, want unavailable zero attestation", verified, cleanup.Err, err)
 	}
 	if runtime.hasActiveCustodies() {
 		t.Fatal("hasActiveCustodies = true for unavailable runtime")

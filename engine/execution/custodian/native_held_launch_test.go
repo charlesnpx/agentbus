@@ -146,9 +146,12 @@ func TestNativeHeldLaunchPrivateReleaseExecsOnce(t *testing.T) {
 	if again != nil || againOutcome != ReleaseDefinitelyNotSent || !errors.Is(againErr, ErrHeldLaunchAlreadyConsumed) {
 		t.Fatalf("second Release() = (%v, %s, %v), want nil definitely_not_sent already-consumed", again, againOutcome, againErr)
 	}
-	exit, verified, err := nativeRunning.WaitAndVerify(ctx)
+	exit, verified, cleanup, err := nativeRunning.WaitAndVerify(ctx)
 	if err != nil {
 		t.Fatalf("WaitAndVerify() error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("WaitAndVerify() cleanup error = %v, want nil", cleanup.Err)
 	}
 	if !exit.Exited || exit.Code != 0 || exit.Signal != "" {
 		t.Fatalf("exit observation = %+v, want clean exit", exit)
@@ -211,9 +214,12 @@ func TestNativeCustodianPublicPrepareReleaseExecsOnceAndKeepsSecretPrivate(t *te
 	if strings.Contains(string(rawResult), secret.String()) {
 		t.Fatal("backend result exposes internal release secret")
 	}
-	exit, verified, err := nativeRunning.WaitAndVerify(ctx)
+	exit, verified, cleanup, err := nativeRunning.WaitAndVerify(ctx)
 	if err != nil {
 		t.Fatalf("WaitAndVerify() error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("WaitAndVerify() cleanup error = %v, want nil", cleanup.Err)
 	}
 	if !exit.Exited || exit.Code != 0 || exit.Signal != "" {
 		t.Fatalf("exit observation = %+v, want clean exit", exit)
@@ -383,9 +389,12 @@ func TestNativeHeldLaunchAbortUnprovableClosesBackendKeepsEntryAndContainRetryDe
 		t.Fatalf("ActiveCustodyCount() after unprovable abort = %d, want 1", got)
 	}
 
-	verified, err = effects.ContainAndVerify(ctx, ref, QuiescenceCauseRecovery)
+	verified, cleanup, err := effects.ContainAndVerify(ctx, ref, QuiescenceCauseRecovery)
 	if err != nil {
 		t.Fatalf("ContainAndVerify() retry error = %v, want nil", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("ContainAndVerify() retry cleanup error = %v, want nil", cleanup.Err)
 	}
 	quiescence, err := verifier.VerifyQuiescence(verified)
 	if err != nil {
