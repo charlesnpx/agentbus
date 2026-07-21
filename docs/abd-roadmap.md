@@ -4,10 +4,12 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R4A CLOSED (R4A closed at 2a18d37: SHIP, 0 findings — exec-seam boundary,
-bounded runner semantics, fail-closed admission classification + process identity; 1 worker round +
-1 fix round + 2 sol reviews, findings 3H+2M+3L → 0). Next: R4B (launching) → R5 → R6/R7A → R7B.
-Production still UnavailableRuntime; R0T expected-RED green throughout.
+STATUS: EXECUTING. R0..R4B CLOSED (R4B closed at 9726222: SHIP, 0 findings — durable identified
+acceptance + immutable per-Serve policy + ordered strict taxonomy + bounded fail-closed shutdown +
+finalize-by-recorded-progress recovery; 6 commits, 6 sol review rounds, findings
+2H+3M → 3H+3M → 1H+2M → 0H+2M → 1M+1L → 0). Next: R5 (launching) → R6/R7A → R7B.
+Production still UnavailableRuntime; R0T sentinel `strict_admission_native_runtime_unavailable`
+green throughout.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -284,6 +286,23 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
+- 2026-07-21 R4B CLOSED (SHIP, 0 findings at 9726222). Arc: 6b3f2cb (landed) → 03ab8f2 (fix: five
+  findings — fail-stop outruns stalled admission work; snapshot-checkout guards) → 499c6c3 (fix3:
+  bounded 5s repository close, clear-state-first, leak-on-timeout; close takes admissionSubmitMu —
+  no acceptance lands after close begins; bbolt 10s open timeout) → 4b2df13 (fix4: the close bound
+  covers submit serialization — close-epoch marker first, bounded TryLock under ONE deadline,
+  wedged-submit leak with crash-window-equivalence contract; storage failures => backend_unavailable
+  not invalid_task_spec) → a264773 (fix5: backend session metadata validated BEFORE authority via
+  exported ValidateSessionID, nonempty-invalid => backend_unavailable pre-acceptance; recovery
+  PRESERVES durably recorded outcomes — a completed job no longer fail-stops FatalUnprovable on
+  restart; Reaped only for authorized-without-recorded-outcome; physical gates unchanged;
+  orchestrator repair: empty session id at Start is the NORMAL cliadapter contract — served
+  fallback restored, mutation-checked pin test) → 9726222 (fix6: pin test asserts durable
+  ses_-prefixed projection id; seam doc scoped to provable cases). Review trajectory 2H+3M → 3H+3M
+  → 1H+2M → 0H+2M → 1M+1L → 0 across 6 refute-first sol rounds; three orchestrator repairs audited
+  (one packet error caught by orchestrator, two doc/test residues caught by review). Gate v2
+  landed mid-unit (user-directed): Docker 20-30min → ~1-2min (persistent cache volumes, single
+  partitioned conformance-superset pass, targeted -p1), tiered race sweeps — landing gate ~6min.
 - 2026-07-21 R4B LANDED (this commit): identified production composition + R0T gate strengthening.
   Worker (codex runtime, 15min round): per-Serve `admissionInstance` (immutable, constructed at
   bootstrap before listen: qualified runtime + probed descriptors + authority + coordinator/launch
