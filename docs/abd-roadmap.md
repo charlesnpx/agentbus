@@ -4,12 +4,10 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R3C CLOSED (R3C closed at c9470de: SHIP, 0 findings, after 2 worker rounds,
-2 domain reviews, 4 fix rounds + ship-confirm; landed the custodian-lifetime owner lease + inherited
-monitor leaf FD + serialized unleased cleanup + evidence-based SupportClass qualification). R4A
-IMPLEMENTATION LANDED (this tree: exec-seam boundary + runner-semantics fix; sol refute-first review
-next) → R4B → R5 → R6/R7A → R7B. Production still UnavailableRuntime; R0T expected-RED green
-throughout.
+STATUS: EXECUTING. R0..R4A CLOSED (R4A closed at 2a18d37: SHIP, 0 findings — exec-seam boundary,
+bounded runner semantics, fail-closed admission classification + process identity; 1 worker round +
+1 fix round + 2 sol reviews, findings 3H+2M+3L → 0). Next: R4B (launching) → R5 → R6/R7A → R7B.
+Production still UnavailableRuntime; R0T expected-RED green throughout.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -286,7 +284,18 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
-- 2026-07-21 R4A-fix2 (this commit): closed ALL 8 findings from the sol review of aea857e
+- 2026-07-21 R4A CLOSED. Re-review on 2a18d37: SHIP, findings NONE, closure table all-CLOSED
+  (H1..L3 + orchestrator repairs R1..R3, each with file:line evidence). R4A totals: 2 commits
+  (aea857e, 2a18d37), 2 worker rounds (1 stall caught by doom-signal sentinel at ~11min +
+  same-thread resume), 2 sol reviews (3H+2M+3L → 0). Durable outcomes: no adapter lifecycle or
+  validation method can launch a subprocess (neutral seams + AST/import allowlist guard); strict
+  admission rejects fail-closed BEFORE any probe/session/durable write with capability-interface
+  classification only; DirectCommandRunner.Wait is bounded in every path; process identity is
+  token-verified fail-closed on all platforms (Darwin via sysctl, no subprocess); stream overflow
+  and identity ambiguity are typed errors, never silent. Reviewer settled the worker-receipt
+  mystery: stale checkout / misattributed receipt, not test caching (H3 changed the engine build
+  ID). Launching R4B.
+- 2026-07-21 R4A-fix2 (2a18d37): closed ALL 8 findings from the sol review of aea857e
   (DO-NOT-SHIP → re-review pending). Worker (codex-plugin runtime, thread 019f84b8-f6b5; one
   mid-run stall caught by the new doom-signal sentinel at ~11min and recovered via cancel +
   resume-last on the same thread): H1 name-based fail-open admission removed (unprobeable strict
