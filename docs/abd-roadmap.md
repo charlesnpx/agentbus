@@ -286,7 +286,31 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
-- 2026-07-21 R4A LANDED (this commit): global no-hidden-exec structural guard + strict-only
+- 2026-07-21 R4A-fix2 (this commit): closed ALL 8 findings from the sol review of aea857e
+  (DO-NOT-SHIP → re-review pending). Worker (codex-plugin runtime, thread 019f84b8-f6b5; one
+  mid-run stall caught by the new doom-signal sentinel at ~11min and recovered via cancel +
+  resume-last on the same thread): H1 name-based fail-open admission removed (unprobeable strict
+  backends recorded unfenceable; "codex"/"claude" name fallbacks deleted — capability interfaces
+  only; TurnWithRunner verified pre-accept); H2 post-leader stdout drain bounded by cancelGrace +
+  idempotent pipe close (Wait bounded even with Background ctx and timeoutMs=0); H3 empty process
+  identity tokens fail closed (typed ErrProcessIdentityUnverifiable, never signal) + REAL Darwin
+  start token via unix.SysctlKinfoProc (no subprocess); M1 ring overflow returns typed
+  command.ErrOutputTruncated (turn fails, never silent splice); M2 DiscoverModels takes
+  caller-supplied ProbeRunner; L1 invalid-strict marker test runs against enabled admission;
+  L2 dead layers deleted (direct_runner.go, BackendOptions, CommandRunner aliases); L3 cgroup
+  guard rationale corrected.
+  Orchestrator repairs (flagged for review): fixture daemon PIDs get real start-time tokens
+  (3 sites — H3 fail-closed supervisor identity orphaned running test jobs whose fixture daemon
+  was unverifiable; two tests at aea857e passed only BECAUSE of the empty-token bug class);
+  reap test now models a genuinely departed supervisor (stronger, deterministic); idle-shutdown
+  positive wait 1s→5s (known pre-existing sweep-load flake; negative assertion untouched).
+  WORKER RECEIPT DISCREPANCY flagged: worker reported go test ./...=0 but the cancel test failed
+  deterministically on its tree — receipts now independently re-verified per gate, always.
+  Verification: Docker (golang:1.26 privileged cgroupns=private) conformance=0, linux_full=0,
+  linux_race=0, R0T sentinel strict_admission_unavailable HELD; macOS build/vet/gofmt + full suite
+  + 3x -race -count=2 sweeps green on final tree. Production composition unchanged
+  (UnavailableRuntime). Next: sol re-review bound to this commit.
+- 2026-07-21 R4A LANDED (aea857e): global no-hidden-exec structural guard + strict-only
   fail-closed admission ordering + runner-semantics fix. Two worker rounds: R4A worker
   (job ...000092, clean) delivered the unit — neutral seams `ProbeRunner`/`CommandRunner`, explicit
   legacy `DirectProbeRunner`/`DirectCommandRunner`, pure `ValidateStaticOptions` + `ProbeBackend` as

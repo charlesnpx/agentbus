@@ -117,6 +117,10 @@ func (b *fakeBackend) AdmissionParkable() bool { return b.parkable }
 
 func (b *fakeBackend) AdmissionControlledRunner() bool { return b.controlled }
 
+func (b *fakeBackend) ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error) {
+	return b, nil
+}
+
 func (b *fakeBackend) Preflight(context.Context) (engine.Health, error) {
 	return engine.Health{Backend: b.name}, nil
 }
@@ -251,6 +255,40 @@ func (s *fakeSession) Interrupt(context.Context) error {
 	s.backend.interrupts.Add(1)
 	return nil
 }
+
+type unsafeNamedBackend struct {
+	name   string
+	starts atomic.Int64
+}
+
+func (b *unsafeNamedBackend) Name() string { return b.name }
+
+func (b *unsafeNamedBackend) Preflight(context.Context) (engine.Health, error) {
+	return engine.Health{Backend: b.name}, nil
+}
+
+func (b *unsafeNamedBackend) Start(context.Context, engine.SessionOpts) (engine.Session, error) {
+	b.starts.Add(1)
+	return unsafeNamedSession{id: b.name + "-session"}, nil
+}
+
+func (b *unsafeNamedBackend) Resume(context.Context, string, engine.SessionOpts) (engine.Session, error) {
+	return unsafeNamedSession{id: b.name + "-resumed"}, nil
+}
+
+type unsafeNamedSession struct {
+	id string
+}
+
+func (s unsafeNamedSession) ID() string { return s.id }
+
+func (s unsafeNamedSession) Turn(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+	ch := make(chan engine.Event)
+	close(ch)
+	return ch, nil
+}
+
+func (s unsafeNamedSession) Interrupt(context.Context) error { return nil }
 
 type controlledSession struct {
 	id         string
@@ -710,20 +748,24 @@ func TestInvalidStrictSubmitDoesNotProbeBackendVersion(t *testing.T) {
 		Binary:    markerCodexCLI(t, marker),
 		CachePath: filepath.Join(dir, "setup-probes.json"),
 	})
-	h := startTestServer(t, backend, Config{IdleTimeout: -1})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-
-	resp := rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
-		WorkspaceKey: "workspace-missing-request-id",
-		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: h.cwd, Write: false, Prompt: "hold"},
-	})
-	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
-	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("version probe marker stat err = %v, want not exist", err)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	if err := os.Remove(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
 	}
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-missing-request-id",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("version probe marker after invalid submit stat err = %v, want not exist", err)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoEngineJobRecordsForCWD(t, server, cwd)
 }
 
 func TestBootstrapAdmissionProbesStrictBackendsWithConfiguredRunner(t *testing.T) {
@@ -825,6 +867,27 @@ func TestIdentifiedSubmitRejectsNoControlledRunnerBeforeBackendStart(t *testing.
 		t.Fatalf("backend starts = %d, want 0 before controlled-runner pre-accept reject", got)
 	}
 	assertNoAcceptedJobsInAdmission(t, server)
+}
+
+func TestIdentifiedSubmitRejectsNamedBackendWithoutProbeOrRunnerCapabilitiesBeforeStart(t *testing.T) {
+	t.Parallel()
+	backend := &unsafeNamedBackend{name: "codex"}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-codex-no-capabilities",
+		RequestID:    "request-codex-no-capabilities",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	if got := backend.starts.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0 before unfenceable pre-accept reject", got)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoEngineJobRecordsForCWD(t, server, cwd)
 }
 
 func TestLegacyFencedDeliveredAcknowledgesGrantsAndRunsOnce(t *testing.T) {
@@ -1600,6 +1663,16 @@ func TestReapKnownStoresSkipsAuthorityOwnedFencedJob(t *testing.T) {
 	if err := server.transitionRecord(store, legacyID, engine.StateRunning); err != nil {
 		t.Fatal(err)
 	}
+	// A running record whose supervisor identity CONFIRMS renews its lease
+	// instead of orphaning (fail-closed identity cuts both ways). The orphan
+	// scenario this test needs is a legacy job whose owning daemon departed:
+	// point the record at a supervisor that no longer exists.
+	if _, err := store.Update(legacyID, func(record *engine.JobRecord) (bool, error) {
+		record.Supervisor = engine.ProcessRef{PID: 4999999, StartTime: "departed-daemon"}
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	clockNanos.Store(base.Add(31 * time.Minute).UnixNano())
 	if err := server.reapKnownStores(); err != nil {
@@ -2141,7 +2214,11 @@ func TestIdleShutdownWaitsForAuthorityOwnedWork(t *testing.T) {
 		if err != nil {
 			t.Fatalf("server idle-shutdown error = %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
+		// Positive wait: idle shutdown needs a quiet IdleTimeout window plus
+		// check-interval scheduling; under whole-repo -race sweep load a 1s
+		// deadline flaked. The negative assertion above (no shutdown while
+		// work is active) is unchanged.
 		t.Fatal("server did not idle-shutdown after authority work became quiet")
 	}
 }
@@ -2468,8 +2545,11 @@ func TestBackendProcessUpdatesWorkerIdentity(t *testing.T) {
 	backend.started = make(chan struct{}, 1)
 	backend.processRef = engine.ProcessRef{PID: 4242, PGID: 4242, StartTime: "backend-start"}
 	backend.backendChildPID = 4243
+	// The daemon's own entry needs a start-time token: supervisor identity
+	// is fail-closed (an empty token reads as gone/reused and orphans the
+	// job before the assertions run).
 	processes := mapProcessTable{entries: map[int]engine.ProcessInfo{
-		os.Getpid(): {PID: os.Getpid()},
+		os.Getpid(): {PID: os.Getpid(), StartTime: "daemon-start"},
 		4242:        {PID: 4242, StartTime: "backend-start"},
 		4243:        {PID: 4243, StartTime: "child-start"},
 	}}
@@ -2514,8 +2594,10 @@ func TestJobCancelUsesStoreGraceAndDoesNotInterruptSession(t *testing.T) {
 	backend.started = make(chan struct{}, 1)
 	backend.processRef = engine.ProcessRef{PID: 5252, PGID: 5250, StartTime: "worker-start"}
 	backend.backendChildPID = 5253
+	// See TestJobStatusReportsWorkerIdentity: empty daemon start-time would
+	// orphan the running job under fail-closed supervisor identity.
 	processes := mapProcessTable{entries: map[int]engine.ProcessInfo{
-		os.Getpid(): {PID: os.Getpid()},
+		os.Getpid(): {PID: os.Getpid(), StartTime: "daemon-start"},
 		5252:        {PID: 5252, StartTime: "worker-start"},
 		5253:        {PID: 5253, StartTime: "child-start"},
 	}}
@@ -3783,7 +3865,7 @@ func newUnstartedTestServer(t *testing.T, backend engine.Backend) (*Server, stri
 		CWD:          cwd,
 		Token:        "test-token",
 		Backends:     []engine.Backend{backend},
-		ProcessTable: mapProcessTable{entries: map[int]engine.ProcessInfo{os.Getpid(): {PID: os.Getpid()}}},
+		ProcessTable: mapProcessTable{entries: map[int]engine.ProcessInfo{os.Getpid(): {PID: os.Getpid(), StartTime: "daemon-start"}}},
 		IdleTimeout:  -1,
 	})
 	if err != nil {
@@ -4585,6 +4667,27 @@ func assertNoAcceptedJobsInAdmission(t *testing.T, server *Server) {
 	}
 	if len(snapshot.Pending) != 0 || len(snapshot.Owned) != 0 {
 		t.Fatalf("runtime snapshot = %+v, want no accepted work", snapshot)
+	}
+}
+
+func assertNoEngineJobRecordsForCWD(t *testing.T, server *Server, cwd string) {
+	t.Helper()
+	canonicalCWD, err := engine.CanonicalWorkspace(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(canonicalCWD)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("engine job records = %+v, want none", records)
 	}
 }
 

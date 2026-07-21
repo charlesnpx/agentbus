@@ -103,8 +103,8 @@ func TestOnlyAllowedProductionFilesImportOSExec(t *testing.T) {
 		"internal/parklaunch/launcher.go": "parked worker process launcher for native custody",
 		// Native custody helper launches retained monitor processes.
 		"internal/parklaunch/monitor.go": "retained monitor process launcher for native custody",
-		// Native cgroup helper inspects host command availability for Linux support checks.
-		"internal/cgroup/types.go": "native cgroup support probes command availability",
+		// Native cgroup helper launches the live self-test process and must verify cleanup.
+		"internal/cgroup/types.go": "native cgroup support self-test launcher and cleanup verifier",
 		// CLI daemonizer; not an adapter lifecycle/probe path.
 		"cmd/agentbus/main.go": "background daemon start helper",
 		// Client daemon autostart; not an adapter lifecycle/probe path.

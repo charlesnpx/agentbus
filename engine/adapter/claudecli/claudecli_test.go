@@ -152,7 +152,9 @@ func TestClaudeDiscoveryParsesFakeHelp(t *testing.T) {
 	if err := os.WriteFile(fake.bin, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(engine.ModelDiscoverer).DiscoverModels(context.Background())
+	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(interface {
+		DiscoverModels(context.Context, command.ProbeRunner) (*engine.ModelDiscovery, error)
+	}).DiscoverModels(context.Background(), command.DirectProbeRunner{})
 	if err != nil || discovery == nil || strings.Join(discovery.Models, ",") != "fable,opus,sonnet" || strings.Join(discovery.Efforts, ",") != "high,low,max,medium,xhigh" {
 		t.Fatalf("discovery=%+v err=%v", discovery, err)
 	}

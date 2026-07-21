@@ -35,8 +35,6 @@ type Backend struct {
 	probed           *ProbedBackendDescriptor
 }
 
-type BackendOptions = engine.SessionOpts
-
 type StaticBackendDescriptor struct {
 	NameValue              string
 	Binary                 string
@@ -61,6 +59,8 @@ type ProbedBackendDescriptor struct {
 }
 
 func (b *Backend) Name() string { return b.NameValue }
+
+func (b *Backend) AdmissionParkable() bool { return true }
 
 func (b *Backend) AdmissionControlledRunner() bool { return true }
 
@@ -89,11 +89,22 @@ func (b *Backend) Preflight(ctx context.Context) (engine.Health, error) {
 	}, nil
 }
 
-func (b *Backend) DiscoverModels(ctx context.Context) (*engine.ModelDiscovery, error) {
-	runner := command.DirectProbeRunner{}
-	binary, err := runner.LookPath(b.binary())
-	if err != nil || b.Discover == nil {
-		return nil, err
+func (b *Backend) DiscoverModels(ctx context.Context, runner command.ProbeRunner) (*engine.ModelDiscovery, error) {
+	if runner == nil {
+		return nil, errors.New("probe runner is required")
+	}
+	if b.Discover == nil {
+		return nil, nil
+	}
+	binary := b.binary()
+	if b.probed != nil && b.probed.BinaryPath != "" {
+		binary = b.probed.BinaryPath
+	} else {
+		resolved, err := runner.LookPath(binary)
+		if err != nil {
+			return nil, err
+		}
+		binary = resolved
 	}
 	return b.Discover(ctx, runner, binary)
 }
@@ -311,7 +322,7 @@ func (b *Backend) validateOptions(opts engine.SessionOpts) (string, error) {
 	return ValidateStaticOptions(b.validationDescriptor(), opts)
 }
 
-func ValidateStaticOptions(descriptor StaticBackendDescriptor, opts BackendOptions) (string, error) {
+func ValidateStaticOptions(descriptor StaticBackendDescriptor, opts engine.SessionOpts) (string, error) {
 	models, efforts, modelsDiscovered, effortsDiscovered, warning := validationSets(descriptor)
 	if opts.Model != "" {
 		if _, ok := models[opts.Model]; !ok {

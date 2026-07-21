@@ -32,8 +32,6 @@ type Runner interface {
 	Start(context.Context, ExecSpec) (RunningCommand, error)
 }
 
-type CommandRunner = Runner
-
 type ProbeRunner interface {
 	LookPath(string) (string, error)
 	Run(context.Context, ProbeSpec) (ProbeResult, error)

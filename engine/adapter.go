@@ -103,10 +103,6 @@ type ModelDiscovery struct {
 	Warnings      []string
 }
 
-type ModelDiscoverer interface {
-	DiscoverModels(context.Context) (*ModelDiscovery, error)
-}
-
 type BackendMetadataProvider interface {
 	BackendMetadata(context.Context) BackendMetadata
 }

@@ -302,6 +302,37 @@ func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 	assertFileMissing(t, marker)
 }
 
+func TestSessionTurnSurfacesOutputTruncationAsTerminalError(t *testing.T) {
+	runner := &fakeCommandRunner{
+		stdout: &errorAfterReader{
+			reader: strings.NewReader(`{"event":"ok"}` + "\n"),
+			err:    command.ErrOutputTruncated,
+		},
+	}
+	backend := &Backend{
+		NameValue: "fake",
+		Binary:    "/bin/fake",
+		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
+			return []string{"run"}, nil
+		},
+		Parse: func(map[string]any) ([]engine.Event, string, error) {
+			return []engine.Event{{Type: engine.EventAgentText, Text: "ok"}}, "", nil
+		},
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEvents(events)
+	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[1].Type != engine.EventTerminalError || !strings.Contains(got[1].Text, command.ErrOutputTruncated.Error()) {
+		t.Fatalf("events = %#v, want parsed event followed by truncation terminal error", got)
+	}
+}
+
 func fakeTerminalErrorCLI(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fakecli")
@@ -415,14 +446,19 @@ func (r *recordingReadCloser) Close() error {
 }
 
 type fakeCommandRunner struct {
-	spec command.ExecSpec
+	spec   command.ExecSpec
+	stdout io.ReadCloser
 }
 
 func (r *fakeCommandRunner) Start(_ context.Context, spec command.ExecSpec) (command.RunningCommand, error) {
 	r.spec = spec
+	stdout := r.stdout
+	if stdout == nil {
+		stdout = io.NopCloser(strings.NewReader(`{"event":"ok"}` + "\n"))
+	}
 	return &fakeRunningCommand{
 		stdin:  discardWriteCloser{},
-		stdout: io.NopCloser(strings.NewReader(`{"event":"ok"}` + "\n")),
+		stdout: stdout,
 		stderr: io.NopCloser(strings.NewReader("")),
 	}, nil
 }
@@ -460,5 +496,22 @@ func (discardWriteCloser) Write(p []byte) (int, error) {
 }
 
 func (discardWriteCloser) Close() error {
+	return nil
+}
+
+type errorAfterReader struct {
+	reader io.Reader
+	err    error
+}
+
+func (r *errorAfterReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if err == io.EOF {
+		return 0, r.err
+	}
+	return n, err
+}
+
+func (r *errorAfterReader) Close() error {
 	return nil
 }

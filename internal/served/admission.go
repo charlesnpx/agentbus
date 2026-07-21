@@ -143,6 +143,12 @@ func (s *Server) probeAdmissionBackends(ctx context.Context) error {
 		backend := s.backends[name]
 		probeable, ok := backend.(admissionProbeableBackend)
 		if !ok {
+			if s.admissionUnprobeableBackends == nil {
+				s.admissionUnprobeableBackends = make(map[string]error)
+			}
+			s.admissionUnprobeableBackends[name] = model.IncompatibleExecutionCapabilitiesError{
+				Reason: "strict backend does not implement ProbeBackend; admission cannot verify command-runner capabilities",
+			}
 			continue
 		}
 		probed, err := probeable.ProbeBackend(ctx, runner)
@@ -156,6 +162,9 @@ func (s *Server) probeAdmissionBackends(ctx context.Context) error {
 			return fmt.Errorf("probe strict backend %s: probed backend changed name to %s", name, probed.Name())
 		}
 		s.backends[name] = probed
+		if s.admissionUnprobeableBackends != nil {
+			delete(s.admissionUnprobeableBackends, name)
+		}
 	}
 	return nil
 }
@@ -486,6 +495,13 @@ func (s *Server) admissionExecutionCapabilities(backend engine.Backend) model.Ex
 	}
 }
 
+func (s *Server) admissionBackendProbeError(name string) error {
+	if s == nil || s.admissionUnprobeableBackends == nil {
+		return nil
+	}
+	return s.admissionUnprobeableBackends[name]
+}
+
 func admissionBackendExternalRunner(backend engine.Backend) bool {
 	if backend == nil {
 		return true
@@ -493,12 +509,7 @@ func admissionBackendExternalRunner(backend engine.Backend) bool {
 	if parkable, ok := backend.(admissionParkableBackend); ok {
 		return !parkable.AdmissionParkable()
 	}
-	switch backend.Name() {
-	case "codex", "claude":
-		return false
-	default:
-		return true
-	}
+	return true
 }
 
 func admissionBackendControlledRunner(backend engine.Backend) bool {
@@ -508,12 +519,7 @@ func admissionBackendControlledRunner(backend engine.Backend) bool {
 	if controlled, ok := backend.(admissionControlledRunnerBackend); ok {
 		return controlled.AdmissionControlledRunner()
 	}
-	switch backend.Name() {
-	case "codex", "claude":
-		return true
-	default:
-		return false
-	}
+	return false
 }
 
 type admissionLaunchBinding struct {
@@ -1478,6 +1484,9 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	if !ok {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{})}
 	}
+	if err := s.admissionBackendProbeError(spec.Backend); err != nil {
+		return requestOutcome{err: admissionProtocolError(err)}
+	}
 	caps := s.admissionExecutionCapabilities(backend)
 	mode, err := model.RouteSubmissionMode(caps)
 	if err != nil {
@@ -1531,6 +1540,9 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		session, err = backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
 		if err != nil {
 			return requestOutcome{err: backendError(err)}
+		}
+		if _, ok := session.(ordinalBoundSession); !ok {
+			return requestOutcome{err: admissionProtocolError(custodian.ErrSupervisorUnavailable)}
 		}
 		if id := session.ID(); id != "" {
 			admissionSessionID = id

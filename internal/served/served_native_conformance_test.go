@@ -425,6 +425,12 @@ func (b *servedNativeFixtureBackend) Name() string { return servedNativeBackendN
 
 func (b *servedNativeFixtureBackend) AdmissionParkable() bool { return true }
 
+func (b *servedNativeFixtureBackend) AdmissionControlledRunner() bool { return true }
+
+func (b *servedNativeFixtureBackend) ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error) {
+	return b, nil
+}
+
 func (b *servedNativeFixtureBackend) Preflight(context.Context) (engine.Health, error) {
 	return engine.Health{Backend: b.Name()}, nil
 }

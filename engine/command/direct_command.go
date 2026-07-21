@@ -20,6 +20,8 @@ type DirectCommandRunner struct {
 	CancelGrace time.Duration
 }
 
+var ErrOutputTruncated = errors.New("command output truncated")
+
 const (
 	directOutputBufferLimit = 16 << 20
 	directStderrDrainGrace  = 200 * time.Millisecond
@@ -92,6 +94,7 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 		terminator:  terminator,
 		stdoutDrain: stdoutDrain,
 		stderrDrain: stderrDrain,
+		stdoutPipe:  stdoutReader,
 		stderrPipe:  stderrReader,
 	}, nil
 }
@@ -105,6 +108,7 @@ type directRunningCommand struct {
 	terminator  *directTerminator
 	stdoutDrain <-chan struct{}
 	stderrDrain <-chan struct{}
+	stdoutPipe  *os.File
 	stderrPipe  *os.File
 	waitOnce    sync.Once
 	waitExit    ExitObservation
@@ -132,11 +136,17 @@ func (r *directRunningCommand) Wait(ctx context.Context) (ExitObservation, error
 			err = nil
 		}
 		if r.stdoutDrain != nil {
+			// Stdout is the live-leader stream boundary. Once the leader has
+			// exited, descendants retaining stdout get only the runner cancel
+			// grace before the local read end is closed.
+			if !waitDirectDrain(r.stdoutDrain, r.cancelGrace) && r.stdoutPipe != nil {
+				r.closeOutputPipes()
+			}
 			<-r.stdoutDrain
 		}
 		if r.stderrDrain != nil {
 			if !waitDirectDrain(r.stderrDrain, directStderrDrainGrace) && r.stderrPipe != nil {
-				_ = r.stderrPipe.Close()
+				r.closeOutputPipes()
 			}
 			<-r.stderrDrain
 		}
@@ -146,6 +156,19 @@ func (r *directRunningCommand) Wait(ctx context.Context) (ExitObservation, error
 		r.waitErr = err
 	})
 	return r.waitExit, r.waitErr
+}
+
+func (r *directRunningCommand) closeOutputPipes() {
+	if r.terminator != nil {
+		r.terminator.closePipes()
+		return
+	}
+	if r.stdoutPipe != nil {
+		_ = r.stdoutPipe.Close()
+	}
+	if r.stderrPipe != nil {
+		_ = r.stderrPipe.Close()
+	}
 }
 
 func (r *directRunningCommand) watchWaitContext(ctx context.Context) func() {
@@ -220,11 +243,12 @@ func exitObservationForCmd(cmd *exec.Cmd) ExitObservation {
 }
 
 type directTerminator struct {
-	cmd   *exec.Cmd
-	grace time.Duration
-	pipes []*os.File
-	once  sync.Once
-	err   error
+	cmd       *exec.Cmd
+	grace     time.Duration
+	pipes     []*os.File
+	once      sync.Once
+	pipesOnce sync.Once
+	err       error
 }
 
 func (t *directTerminator) terminate() error {
@@ -233,11 +257,20 @@ func (t *directTerminator) terminate() error {
 	}
 	t.once.Do(func() {
 		t.err = terminateProcessGroup(t.cmd, t.grace)
+		t.closePipes()
+	})
+	return t.err
+}
+
+func (t *directTerminator) closePipes() {
+	if t == nil {
+		return
+	}
+	t.pipesOnce.Do(func() {
 		for _, pipe := range t.pipes {
 			_ = pipe.Close()
 		}
 	})
-	return t.err
 }
 
 func drainDirectOutput(src *os.File, dst *directOutputBuffer) <-chan struct{} {
@@ -280,6 +313,7 @@ type directOutputBuffer struct {
 	limit        int
 	writerClosed bool
 	readerClosed bool
+	truncated    bool
 	err          error
 }
 
@@ -299,6 +333,7 @@ func (b *directOutputBuffer) Write(p []byte) (int, error) {
 	if overflow := len(b.buf) - b.limit; overflow > 0 {
 		copy(b.buf, b.buf[overflow:])
 		b.buf = b.buf[:b.limit]
+		b.truncated = true
 	}
 	b.cond.Broadcast()
 	return len(p), nil
@@ -308,6 +343,9 @@ func (b *directOutputBuffer) Read(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for len(b.buf) == 0 && !b.writerClosed && !b.readerClosed {
+		if b.truncated {
+			return 0, ErrOutputTruncated
+		}
 		b.cond.Wait()
 	}
 	if b.readerClosed {
@@ -318,6 +356,9 @@ func (b *directOutputBuffer) Read(p []byte) (int, error) {
 		copy(b.buf, b.buf[n:])
 		b.buf = b.buf[:len(b.buf)-n]
 		return n, nil
+	}
+	if b.truncated {
+		return 0, ErrOutputTruncated
 	}
 	if b.err != nil {
 		return 0, b.err

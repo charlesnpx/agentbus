@@ -671,12 +671,13 @@ func TestCancelRunningLiveBackendChildSignalsEvenWhenWorkerGone(t *testing.T) {
 		cancelGrace:   500 * time.Millisecond,
 	})
 	record := &JobRecord{
-		JobID:           "job_cancel_child",
-		State:           StateRunning,
-		UpdatedAt:       base,
-		Lease:           Lease{ExpiresAt: base.Add(time.Minute)},
-		Worker:          ProcessRef{PID: 203, PGID: 303, StartTime: "worker-start"},
-		BackendChildPID: 204,
+		JobID:                 "job_cancel_child",
+		State:                 StateRunning,
+		UpdatedAt:             base,
+		Lease:                 Lease{ExpiresAt: base.Add(time.Minute)},
+		Worker:                ProcessRef{PID: 203, PGID: 303, StartTime: "worker-start"},
+		BackendChildPID:       204,
+		BackendChildStartTime: "child-start",
 	}
 	if err := store.Save(record); err != nil {
 		t.Fatal(err)

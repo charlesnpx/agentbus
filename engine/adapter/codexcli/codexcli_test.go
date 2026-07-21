@@ -197,7 +197,9 @@ func TestCodexDiscoveryUsesModelsCacheRatherThanHelpText(t *testing.T) {
 	if err := os.WriteFile(fake.bin, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(engine.ModelDiscoverer).DiscoverModels(context.Background())
+	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(interface {
+		DiscoverModels(context.Context, command.ProbeRunner) (*engine.ModelDiscovery, error)
+	}).DiscoverModels(context.Background(), command.DirectProbeRunner{})
 	if discovery != nil || err == nil || !strings.Contains(err.Error(), "models cache") {
 		t.Fatalf("discovery=%+v err=%v", discovery, err)
 	}

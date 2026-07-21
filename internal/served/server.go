@@ -142,6 +142,7 @@ type Server struct {
 	admissionRuntimeFactory      func(*Server) *servedAdmissionRuntime
 	admissionRuntimeConfig       custodian.Runtime
 	admissionProbeRunner         command.ProbeRunner
+	admissionUnprobeableBackends map[string]error
 	admissionDaemonBootOnce      sync.Once
 	admissionDaemonBootRef       model.BootRef
 	admissionDaemonBootRefErr    error
