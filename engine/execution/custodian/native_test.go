@@ -1050,20 +1050,25 @@ func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing
 	// reason rather than being masked by retry; any rare transient must be
 	// root-caused (tracked: L3c real-cgroup transient investigation).
 	runtimeBundle, err := NewNativeRuntime(options)
-	support := runtimeBundle.Support()
-	if support.Assessment.Class != SupportAvailable || !support.RuntimeProbePassed || !support.VerifiedContainment || support.RuntimeProbeResult != nil {
-		t.Fatalf("native runtime support = %+v, want passed containment probe; NewNativeRuntime error = %v", support, err)
-	}
 	if err != nil {
 		t.Fatalf("NewNativeRuntime() error = %v", err)
 	}
-	native, ok := runtimeBundle.Process().(*NativeCustodian)
-	if ok {
-		cleanupNativeCustodianForTest(t, native)
+	if initial := runtimeBundle.Support(); !errors.Is(initial.Reason, ErrNativeRuntimeSelfTestRequired) || initial.RuntimeProbePassed {
+		t.Fatalf("initial native runtime support = %+v, want explicit self-test required", initial)
 	}
+	support := runtimeBundle.SelfTest(context.Background())
+	if support.Assessment.Class != SupportAvailable || !support.RuntimeProbePassed || !support.VerifiedContainment || support.RuntimeProbeResult != nil {
+		t.Fatalf("native runtime support = %+v, want passed containment probe; NewNativeRuntime error = %v", support, err)
+	}
+	native, ok := runtimeBundle.Process().(*NativeCustodian)
 	if !ok || native == nil {
 		t.Fatalf("NewNativeRuntime() process = %T, want *NativeCustodian", runtimeBundle.Process())
 	}
+	defer func() {
+		if err := runtimeBundle.Close(); err != nil {
+			t.Fatalf("native runtime Close() error = %v", err)
+		}
+	}()
 	if support.FeatureConfigured || support.FeatureAdvertised || support.AdvertisedAvailable() {
 		t.Fatalf("native runtime support = %+v, want capability off/not advertised", support)
 	}

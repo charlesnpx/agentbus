@@ -3,6 +3,7 @@ package authority
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
@@ -258,7 +259,7 @@ func TestAnchorStoreStartupBarrierFromSnapshots(t *testing.T) {
 		}
 	})
 
-	t.Run("db ahead of anchor after commit catches up on restart", func(t *testing.T) {
+	t.Run("db ahead with persisted fail-stop refuses restart", func(t *testing.T) {
 		repo := memory.NewRepository()
 		anchorStore := NewAnchorStore()
 		ready := newReadyWithAnchorStore(t, repo, anchorStore, "anchor-advance-old")
@@ -269,11 +270,8 @@ func TestAnchorStoreStartupBarrierFromSnapshots(t *testing.T) {
 		}
 
 		restartRepo, restartAnchor := restoreAuthoritySnapshot(t, repo.SnapshotBytes(), anchorStore.SnapshotBytes())
-		session := newRecoverySessionWithAnchorStore(t, restartRepo, restartAnchor, "anchor-advance-new")
-		record := firstValidSafetyRecord(t, restartRepo)
-		terminalizeRecovery(t, ctx, session, record.Attempt.Ref)
-		if _, err := session.SealReady(ctx); err != nil {
-			t.Fatal(err)
+		if _, err := beginRecoveryWithAnchorStore(t, restartRepo, restartAnchor, "anchor-advance-new"); !errors.Is(err, ErrFailStopped) || !strings.Contains(err.Error(), "anchor advance") {
+			t.Fatalf("restart Begin error = %v, want retained fail-stop reason", err)
 		}
 	})
 

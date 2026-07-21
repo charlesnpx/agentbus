@@ -270,10 +270,15 @@ func (s *Server) requireActivatedAdmissionSupport(ctx context.Context, session *
 	}
 	diagnostic := newAdmissionSupportDiagnostic(metadata, support.Assessment, support.Assessment.Class == custodian.SupportRetryable)
 	if support.Assessment.Class == custodian.SupportUnsafe {
-		diagnostic.FailStopped = true
 		if session != nil {
-			_ = session.FailStop(ctx, diagnostic.Error())
+			stopErr := session.FailStop(ctx, diagnostic.Error())
+			if stopErr != nil {
+				err := fmt.Errorf("%w: unsafe strict admission support: %w; fail-stop persistence: %w", authority.ErrFailStopRecord, diagnostic, stopErr)
+				logAdmissionSupportDiagnostic(diagnostic)
+				return support, err
+			}
 		}
+		diagnostic.FailStopped = true
 		if s.safetyLatch != nil {
 			s.safetyLatch.Trip(diagnostic)
 		}
@@ -287,6 +292,10 @@ func (s *Server) requireActivatedAdmissionSupport(ctx context.Context, session *
 
 func (s *Server) assessAdmissionSupportWithRetry(ctx context.Context, runtime *servedAdmissionRuntime) custodian.Support {
 	support := runtime.assessSupport(ctx)
+	return s.assessAdmissionSupportWithRetryFrom(ctx, runtime, support)
+}
+
+func (s *Server) assessAdmissionSupportWithRetryFrom(ctx context.Context, runtime *servedAdmissionRuntime, support custodian.Support) custodian.Support {
 	assessment := normalizeAdmissionSupportAssessment(support)
 	support.Assessment = assessment
 	totalAttempts := admissionSupportAttemptCost(assessment)
@@ -384,8 +393,8 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	runtime := s.admissionRuntime
 	if runtime == nil {
 		runtime = newServedAdmissionRuntime(s)
-		s.admissionRuntime = runtime
 	}
+	s.admissionRuntime = runtime
 	descriptors, err := s.probeAdmissionBackends(ctx)
 	if err != nil {
 		return err
@@ -401,8 +410,12 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	}
 	closeOnErr := true
 	defer func() {
-		if closeOnErr && closer != nil {
-			_ = closer.Close()
+		if closeOnErr {
+			if closer != nil {
+				_ = closer.Close()
+			}
+			_ = runtime.close()
+			s.admissionRuntime = nil
 		}
 	}()
 
@@ -443,7 +456,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	} else {
 		support = runtime.assessSupport(ctx)
 		if strictSupportConfigured(support) {
-			support = s.assessAdmissionSupportWithRetry(ctx, runtime)
+			support = s.assessAdmissionSupportWithRetryFrom(ctx, runtime, support)
 			if !strictSupportAvailable(support) {
 				err := newAdmissionSupportDiagnostic(metadata, support.Assessment, support.Assessment.Class == custodian.SupportRetryable)
 				logAdmissionSupportDiagnostic(err)
@@ -559,11 +572,13 @@ func (s *Server) closeServeAdmission() error {
 	s.admissionStateMu.Lock()
 
 	closer := s.admissionClose
+	runtime := s.admissionRuntime
 	s.admissionBootstrapper = nil
 	s.admissionReady = nil
 	s.admissionCoordinator = nil
 	s.admissionOwnedWorkChecker = nil
 	s.admissionSubmission = nil
+	s.admissionRuntime = nil
 	s.admissionRepository = nil
 	s.admissionClose = nil
 	s.admissionInstance = nil
@@ -578,9 +593,23 @@ func (s *Server) closeServeAdmission() error {
 	if closer != nil {
 		if !submitLocked {
 			log.Printf("agentbus daemon: admission repository close skipped after submit serialization timeout; submit is wedged and may own the repository; leaking handle at shutdown")
+			if runtime != nil {
+				log.Printf("agentbus daemon: admission runtime close skipped after submit serialization timeout; submit is wedged and may own the runtime; leaking runtime at shutdown")
+			}
 			return nil
 		}
-		return closeAdmissionRepositoryBeforeDeadline(closer, deadline)
+		err := closeAdmissionResourceBeforeDeadline("repository", closer, deadline)
+		if runtime != nil {
+			err = errors.Join(err, closeAdmissionResourceBeforeDeadline("runtime", runtimeCloser{runtime: runtime}, deadline))
+		}
+		return err
+	}
+	if runtime != nil {
+		if !submitLocked {
+			log.Printf("agentbus daemon: admission runtime close skipped after submit serialization timeout; submit is wedged and may own the runtime; leaking runtime at shutdown")
+			return nil
+		}
+		return closeAdmissionResourceBeforeDeadline("runtime", runtimeCloser{runtime: runtime}, deadline)
 	}
 	return nil
 }
@@ -602,10 +631,18 @@ func (s *Server) lockAdmissionSubmitUntil(deadline time.Time) bool {
 	}
 }
 
-func closeAdmissionRepositoryBeforeDeadline(closer io.Closer, deadline time.Time) error {
+type runtimeCloser struct {
+	runtime *servedAdmissionRuntime
+}
+
+func (c runtimeCloser) Close() error {
+	return c.runtime.close()
+}
+
+func closeAdmissionResourceBeforeDeadline(name string, closer io.Closer, deadline time.Time) error {
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
-		log.Printf("agentbus daemon: admission repository close timed out; leaking handle at shutdown")
+		log.Printf("agentbus daemon: admission %s close timed out; leaking handle at shutdown", name)
 		return nil
 	}
 	done := make(chan error, 1)
@@ -618,7 +655,7 @@ func closeAdmissionRepositoryBeforeDeadline(closer io.Closer, deadline time.Time
 	case err := <-done:
 		return err
 	case <-timer.C:
-		log.Printf("agentbus daemon: admission repository close timed out; leaking handle at shutdown")
+		log.Printf("agentbus daemon: admission %s close timed out; leaking handle at shutdown", name)
 		return nil
 	}
 }

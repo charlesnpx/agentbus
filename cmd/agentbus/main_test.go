@@ -207,6 +207,16 @@ func TestAdmissionCLIInspectResetAndSealFlags(t *testing.T) {
 	if code != 1 || !strings.Contains(stderr, authority.ErrSealConfirmationRequired.Error()) {
 		t.Fatalf("seal without flags exit=%d stderr=%s", code, stderr)
 	}
+	newRoot := filepath.Join(t.TempDir(), "new-admission-root")
+	code, stdout, stderr = runTestCLI(t, a, []string{"admission", "seal", "--state-root", root, "--new-state-root", newRoot, "--start-new-authority-domain", "--acknowledge-replay-history-reset", "--json"}, "")
+	if code != 0 {
+		t.Fatalf("seal exit=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	var sealed authority.SealReport
+	decodeJSON(t, stdout, &sealed)
+	if !sealed.OldRootSealed || sealed.NewRoot != newRoot || sealed.NewDomainUUID == "" {
+		t.Fatalf("seal report = %+v", sealed)
+	}
 
 	code, stdout, stderr = runTestCLI(t, a, []string{"admission", "--help"}, "")
 	if code != 0 {

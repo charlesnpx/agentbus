@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,6 +27,7 @@ type servedAdmissionRuntime struct {
 	supportOverride  *custodian.Support
 	supportProbe     func(context.Context) custodian.Support
 	verifierOverride custodian.AttestationVerifier
+	closeHook        func() error
 }
 
 func newServedAdmissionRuntime(server *Server) *servedAdmissionRuntime {
@@ -65,7 +67,13 @@ func (s *servedAdmissionRuntime) verifiedContainmentSupported(ctx context.Contex
 }
 
 func (s *servedAdmissionRuntime) support() custodian.Support {
-	return s.assessSupport(context.Background())
+	if s == nil {
+		return custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable).Support()
+	}
+	if s.supportOverride != nil {
+		return *s.supportOverride
+	}
+	return s.runtime.Support()
 }
 
 func (s *servedAdmissionRuntime) assessSupport(ctx context.Context) custodian.Support {
@@ -78,7 +86,7 @@ func (s *servedAdmissionRuntime) assessSupport(ctx context.Context) custodian.Su
 	if s.supportOverride != nil {
 		return *s.supportOverride
 	}
-	return s.runtime.Support()
+	return s.runtime.SelfTest(ctx)
 }
 
 func (s *servedAdmissionRuntime) quiescenceVerifier() custodian.AttestationVerifier {
@@ -116,6 +124,17 @@ func (s *servedAdmissionRuntime) hasActiveCustodies() bool {
 		return true
 	}
 	return false
+}
+
+func (s *servedAdmissionRuntime) close() error {
+	if s == nil {
+		return nil
+	}
+	var err error
+	if s.closeHook != nil {
+		err = errors.Join(err, s.closeHook())
+	}
+	return errors.Join(err, s.runtime.Close())
 }
 
 type runtimeLaunchCustodian struct {

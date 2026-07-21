@@ -36,9 +36,14 @@ func TestNewNativeRuntimeSelfTestUsesReturnedSingleLeaseInstance(t *testing.T) {
 	if !ok || native == nil {
 		t.Fatalf("NewNativeRuntime() process = %T, want *NativeCustodian", runtimeBundle.Process())
 	}
-	defer cleanupNativeCustodianForTest(t, native)
+	defer func() {
+		if err := runtimeBundle.Close(); err != nil {
+			t.Fatalf("native runtime Close() error = %v", err)
+		}
+	}()
 
-	assessment := runtimeBundle.SupportAssessment()
+	support := runtimeBundle.SelfTest(ctx)
+	assessment := support.Assessment
 	if assessment.Class != SupportAvailable || assessment.Attempts != 1 || !assessment.CleanupSafe {
 		t.Fatalf("SupportAssessment() = %+v, want available attempts=1 cleanup-safe", assessment)
 	}
@@ -86,17 +91,15 @@ func TestNewNativeRuntimeSelfTestUsesReturnedSingleLeaseInstance(t *testing.T) {
 		t.Fatalf("second NewNativeRuntime() process = %T, want UnavailableCustodian", second.Process())
 	}
 
-	if err := native.Close(); err != nil {
-		t.Fatalf("first native Close() error = %v", err)
+	if err := runtimeBundle.Close(); err != nil {
+		t.Fatalf("first native runtime Close() error = %v", err)
 	}
 	third, err := NewNativeRuntime(options)
 	if err != nil {
 		t.Fatalf("third NewNativeRuntime() after Close error = %v support=%+v", err, third.Support())
 	}
-	if closer, ok := third.Process().(interface{ Close() error }); ok {
-		if err := closer.Close(); err != nil {
-			t.Fatalf("third native Close() error = %v", err)
-		}
+	if err := third.Close(); err != nil {
+		t.Fatalf("third native runtime Close() error = %v", err)
 	}
 }
 

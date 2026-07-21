@@ -3,9 +3,11 @@ package authority
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -144,6 +146,62 @@ func TestResetEmptyRootRefusesEveryNonzeroCategory(t *testing.T) {
 	}
 }
 
+func TestResetEmptyRootReinitializesWholeDomainAndAnchor(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	initial, err := ResetEmptyAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, session := beginBboltAdmissionRoot(t, root, "reset-activated-empty")
+	activated, _, err := session.ActivateRoot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !activated.Activated {
+		t.Fatal("test root was not activated before reset")
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reset, err := ResetEmptyAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reset.DomainUUID == "" || reset.DomainUUID == initial.DomainUUID {
+		t.Fatalf("reset domain UUID = %q, initial %q; want fresh UUID", reset.DomainUUID, initial.DomainUUID)
+	}
+	if reset.ActivationMetadata.Activated || reset.ActivationMetadata.ActivatedAtGen != 0 {
+		t.Fatalf("reset activation metadata = %+v, want unactivated fresh root", reset.ActivationMetadata)
+	}
+	anchor, err := LoadFileAnchorSnapshot(filepath.Join(root, AdmissionAnchorFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !anchor.Initialized || anchor.DBUUID != reset.DomainUUID || anchor.Generation != reset.Generation {
+		t.Fatalf("reset anchor = %+v, inspection = %+v", anchor, reset)
+	}
+}
+
+func TestResetEmptyRootRefusesBusyRoot(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, err := bboltrepo.NewRepository(filepath.Join(root, AdmissionRepositoryFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+
+	oldTimeout := adminOpenTimeout
+	adminOpenTimeout = 20 * time.Millisecond
+	defer func() { adminOpenTimeout = oldTimeout }()
+
+	if _, err := ResetEmptyAdmissionRoot(ctx, root); !errors.Is(err, ErrRootBusy) {
+		t.Fatalf("reset busy root error = %v, want ErrRootBusy", err)
+	}
+}
+
 func TestAdmissionInspectAndSeal(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -179,12 +237,23 @@ func TestAdmissionInspectAndSeal(t *testing.T) {
 	if _, err := SealAdmissionRoot(ctx, root, SealOptions{}); !errors.Is(err, ErrSealConfirmationRequired) {
 		t.Fatalf("seal without flags error = %v, want ErrSealConfirmationRequired", err)
 	}
-	sealed, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true})
+	newRoot := filepath.Join(t.TempDir(), "new-domain")
+	sealedReport, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
 	if err != nil {
 		t.Fatal(err)
 	}
+	sealed := sealedReport.OldInspection
 	if !sealed.Sealed || sealed.ActivationMetadata != metadata {
 		t.Fatalf("sealed inspection = %+v", sealed)
+	}
+	if !sealedReport.OldRootSealed || sealedReport.OldRoot != root || sealedReport.NewRoot != newRoot || sealedReport.NewDomainUUID == "" {
+		t.Fatalf("sealed report = %+v", sealedReport)
+	}
+	if sealedReport.NewInspection.DomainUUID != sealedReport.NewDomainUUID || sealedReport.NewDomainUUID == inspection.DomainUUID {
+		t.Fatalf("new domain identity = report:%+v old:%s", sealedReport, inspection.DomainUUID)
+	}
+	if sealedReport.NewInspection.ActivationMetadata.Activated || sealedReport.NewInspection.ActivationMetadata.ContractVersion != metadata.ContractVersion {
+		t.Fatalf("new root activation metadata = %+v, want unactivated contract version %d", sealedReport.NewInspection.ActivationMetadata, metadata.ContractVersion)
 	}
 	if sealedSession, sealedRepo, err := beginBboltAdmissionRootAllowError(ctx, root, "sealed-serve"); !errors.Is(err, ErrRootSealed) {
 		if sealedRepo != nil {
@@ -198,7 +267,6 @@ func TestAdmissionInspectAndSeal(t *testing.T) {
 
 	// Rotation intentionally resets cross-root replay history: the same request
 	// key is accepted as new work in the new authority domain.
-	newRoot := t.TempDir()
 	newRepo, newSession := beginBboltAdmissionRoot(t, newRoot, "new-domain")
 	newReady, err := newSession.SealReady(ctx)
 	if err != nil {
@@ -212,6 +280,32 @@ func TestAdmissionInspectAndSeal(t *testing.T) {
 		t.Fatal("old-domain request key replayed in new domain; want accepted as new work")
 	}
 	_ = newRepo.Close()
+}
+
+func TestSealRefusesNonemptyDestination(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-destination")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(newRoot, "existing"), []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot}); !errors.Is(err, ErrNewStateRootNotEmpty) {
+		t.Fatalf("seal nonempty destination error = %v, want ErrNewStateRootNotEmpty", err)
+	}
+	inspection, err := InspectAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Sealed {
+		t.Fatal("old root was sealed after destination refusal")
+	}
 }
 
 func TestSealRefusesNonterminalObligations(t *testing.T) {
@@ -231,7 +325,7 @@ func TestSealRefusesNonterminalObligations(t *testing.T) {
 	if err := repo.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true}); !errors.Is(err, ErrRootHasRecoveryObligations) {
+	if _, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: filepath.Join(t.TempDir(), "new-domain")}); !errors.Is(err, ErrRootHasRecoveryObligations) {
 		t.Fatalf("seal nonterminal error = %v, want ErrRootHasRecoveryObligations", err)
 	}
 }

@@ -256,16 +256,10 @@ func (tx *writeTx) PutMeta(meta repository.AuthorityMeta) error {
 	if err := tx.state.rejectCorrupt(); err != nil {
 		return err
 	}
-	if err := meta.Validate(); err != nil {
+	current := tx.state.metaRecord()
+	if err := repository.ValidateAuthorityMetaPut(current, meta, tx.state.generation, tx.state.nextJobSequence); err != nil {
 		return err
 	}
-	if meta.Generation != tx.state.generation {
-		return fmt.Errorf("%w: meta generation %d does not match current generation %d", repository.ErrInvalidRecord, meta.Generation, tx.state.generation)
-	}
-	if meta.NextJobSequence < tx.state.nextJobSequence {
-		return fmt.Errorf("%w: meta.next_job_sequence cannot move backwards", repository.ErrInvalidRecord)
-	}
-	current := tx.state.metaRecord()
 	if current.State == repository.RecordValid && reflect.DeepEqual(current.Value, meta) {
 		return nil
 	}

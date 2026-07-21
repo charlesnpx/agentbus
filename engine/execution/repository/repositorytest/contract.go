@@ -398,6 +398,96 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 			t.Fatal(err)
 		}
 	})
+
+	t.Run("activation and seal metadata are one way", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			mutate func(repository.AuthorityMeta) repository.AuthorityMeta
+		}{
+			{
+				name: "clear activated",
+				mutate: func(meta repository.AuthorityMeta) repository.AuthorityMeta {
+					meta.AdmissionRoot.Activated = false
+					meta.AdmissionRoot.ContractVersion = 0
+					meta.AdmissionRoot.ActivatedAtGen = 0
+					return meta
+				},
+			},
+			{
+				name: "clear sealed",
+				mutate: func(meta repository.AuthorityMeta) repository.AuthorityMeta {
+					meta.Sealed = false
+					return meta
+				},
+			},
+			{
+				name: "forge activated at generation",
+				mutate: func(meta repository.AuthorityMeta) repository.AuthorityMeta {
+					meta.AdmissionRoot.ActivatedAtGen++
+					return meta
+				},
+			},
+			{
+				name: "change activated contract",
+				mutate: func(meta repository.AuthorityMeta) repository.AuthorityMeta {
+					meta.AdmissionRoot.ContractVersion++
+					return meta
+				},
+			},
+		}
+		for _, tt := range cases {
+			tt := tt
+			t.Run(tt.name, func(t *testing.T) {
+				repo := factory.New(t)
+				activated, sealed := activateAndSealMetaForTest(t, repo)
+				before := factory.Snapshot(t, repo)
+
+				_, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+					meta := tt.mutate(sealed)
+					return tx.PutMeta(meta)
+				})
+				if !errors.Is(err, repository.ErrInvalidRecord) {
+					t.Fatalf("forbidden PutMeta error = %v, want ErrInvalidRecord", err)
+				}
+				assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
+				assertMetaForTest(t, repo, sealed)
+
+				commit, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+					meta := loadMetaForTest(t, tx)
+					meta.NextJobSequence++
+					return tx.PutMeta(meta)
+				})
+				if err != nil {
+					t.Fatalf("later valid PutMeta error = %v", err)
+				}
+				after := sealed
+				after.Generation = commit.Generation
+				after.NextJobSequence++
+				assertMetaForTest(t, repo, after)
+				if after.AdmissionRoot != activated.AdmissionRoot || !after.Sealed {
+					t.Fatalf("later PutMeta metadata = %+v, want activated metadata %+v sealed=true", after, activated.AdmissionRoot)
+				}
+			})
+		}
+	})
+
+	t.Run("activation generation must be commit generation", func(t *testing.T) {
+		repo := factory.New(t)
+		before := factory.Snapshot(t, repo)
+		_, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+			meta := loadMetaForTest(t, tx)
+			meta.AdmissionRoot = repository.AdmissionRootMetadata{
+				Activated:       true,
+				ContractVersion: repository.CurrentAdmissionContractVersion,
+				ActivatedAtGen:  meta.Generation + 2,
+			}
+			return tx.PutMeta(meta)
+		})
+		if !errors.Is(err, repository.ErrInvalidRecord) {
+			t.Fatalf("forged activation generation error = %v, want ErrInvalidRecord", err)
+		}
+		assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
+	})
 }
 
 type fixture struct {
@@ -541,6 +631,60 @@ func putAcceptance(tx repository.WriteTx, fixture fixture) error {
 		return err
 	}
 	return tx.PutProjection(fixture.Projection)
+}
+
+func activateAndSealMetaForTest(t *testing.T, repo repository.Repository) (repository.AuthorityMeta, repository.AuthorityMeta) {
+	t.Helper()
+	var activated repository.AuthorityMeta
+	commit, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+		meta := loadMetaForTest(t, tx)
+		meta.AdmissionRoot = repository.AdmissionRootMetadata{
+			Activated:       true,
+			ContractVersion: repository.CurrentAdmissionContractVersion,
+			ActivatedAtGen:  meta.Generation + 1,
+		}
+		activated = meta
+		return tx.PutMeta(meta)
+	})
+	if err != nil {
+		t.Fatalf("activate PutMeta error = %v", err)
+	}
+	activated.Generation = commit.Generation
+
+	var sealed repository.AuthorityMeta
+	commit, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
+		meta := loadMetaForTest(t, tx)
+		meta.Sealed = true
+		sealed = meta
+		return tx.PutMeta(meta)
+	})
+	if err != nil {
+		t.Fatalf("seal PutMeta error = %v", err)
+	}
+	sealed.Generation = commit.Generation
+	return activated, sealed
+}
+
+func loadMetaForTest(t *testing.T, tx repository.ReadTx) repository.AuthorityMeta {
+	t.Helper()
+	record := tx.Meta()
+	if record.State != repository.RecordValid {
+		t.Fatalf("meta state = %s, want valid", record.State)
+	}
+	return record.Value
+}
+
+func assertMetaForTest(t *testing.T, repo repository.Repository, want repository.AuthorityMeta) {
+	t.Helper()
+	if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+		got := loadMetaForTest(t, tx)
+		if !reflect.DeepEqual(got, want) {
+			return fmt.Errorf("meta = %#v, want %#v", got, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func assertRequestBinding(t *testing.T, repo repository.Repository, binding model.Binding) {

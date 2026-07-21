@@ -58,6 +58,11 @@ func (a *fileAnchor) Begin(ctx context.Context, boot model.BootRef, generation u
 	if err := a.ensureIdentity(&snapshot, generation); err != nil {
 		return "", err
 	}
+	// A persisted fail-stop is sticky: Begin must not convert it back to
+	// reconciling. Only the explicit clear-fail-stop admin verb may clear it.
+	if snapshot.Phase == "fail_stopped" {
+		return "", FailStoppedError{Reason: snapshot.Reason}
+	}
 	if snapshot.Generation < generation {
 		snapshot.Generation = generation
 	}
@@ -90,7 +95,7 @@ func (a *fileAnchor) SealReady(ctx context.Context, boot model.BootRef, generati
 		return "", ErrStaleCapability
 	}
 	if snapshot.Phase == "fail_stopped" {
-		return "", ErrFailStopped
+		return "", FailStoppedError{Reason: snapshot.Reason}
 	}
 	token := fmt.Sprintf("ready-%s-%s-%d", boot.BootID, boot.OwnerID, generation)
 	snapshot.Phase = "ready"
@@ -118,7 +123,7 @@ func (a *fileAnchor) Advance(ctx context.Context, boot model.BootRef, generation
 		return err
 	}
 	if snapshot.Phase == "fail_stopped" {
-		return ErrFailStopped
+		return FailStoppedError{Reason: snapshot.Reason}
 	}
 	if snapshot.Generation > generation {
 		return fmt.Errorf("%w: anchor generation %d is ahead of db generation %d", ErrAnchorInvariant, snapshot.Generation, generation)
@@ -171,7 +176,7 @@ func (a *fileAnchor) verify(phase string, boot model.BootRef, token string, gene
 		return err
 	}
 	if snapshot.Phase == "fail_stopped" {
-		return ErrFailStopped
+		return FailStoppedError{Reason: snapshot.Reason}
 	}
 	if snapshot.Phase != phase || snapshot.Boot != boot || snapshot.Token != token || snapshot.Generation != generation {
 		return ErrStaleCapability

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -24,6 +25,21 @@ var (
 	ErrFailStopRecord  = errors.New("authority fail-stop record failed")
 	ErrRootSealed      = errors.New("authority root permanently sealed")
 )
+
+type FailStoppedError struct {
+	Reason string
+}
+
+func (e FailStoppedError) Error() string {
+	if strings.TrimSpace(e.Reason) == "" {
+		return ErrFailStopped.Error()
+	}
+	return fmt.Sprintf("%s: %s", ErrFailStopped, e.Reason)
+}
+
+func (e FailStoppedError) Is(target error) bool {
+	return target == ErrFailStopped
+}
 
 const safetySchemaVersion = uint16(1)
 

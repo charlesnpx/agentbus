@@ -26,8 +26,9 @@ import (
 )
 
 var (
-	ErrNativeCustodianUnavailable = errors.New("native custodian unavailable")
-	ErrPhysicalContainment        = errors.New("physical containment failed")
+	ErrNativeCustodianUnavailable    = errors.New("native custodian unavailable")
+	ErrPhysicalContainment           = errors.New("physical containment failed")
+	ErrNativeRuntimeSelfTestRequired = errors.New("native runtime self-test required")
 )
 
 type PhysicalOutcomeKind string
@@ -138,9 +139,6 @@ func NewNativeRuntime(options NativeOptions) (Runtime, error) {
 			CleanupSafe: true,
 		}
 	}
-	if assessment.Class == SupportAvailable {
-		assessment = native.SelfTest(context.Background(), verifier)
-	}
 
 	if assessment.Class != SupportAvailable {
 		if native != nil {
@@ -175,15 +173,56 @@ func NewNativeRuntime(options NativeOptions) (Runtime, error) {
 		}
 		return Runtime{}, supportErr
 	}
-	process := ProcessCustodian(UnavailableCustodian{})
-	if assessment.Class == SupportAvailable {
-		process = native
+	if assessment.Class != SupportAvailable {
+		return Runtime{
+			process:  ProcessCustodian(UnavailableCustodian{}),
+			verifier: verifier,
+			state: &runtimeState{
+				support:  support,
+				platform: runtime.GOOS,
+				selfTest: func(context.Context, AttestationVerifier) SupportAssessment {
+					return support.Assessment
+				},
+			},
+		}, assessment.Cause
+	}
+
+	initial := SupportAssessment{
+		Class:       SupportUnsupported,
+		Cause:       ErrNativeRuntimeSelfTestRequired,
+		CleanupSafe: true,
+	}
+	support, supportErr = newSupportFromAssessment(initial, runtime.GOOS, false, false)
+	if supportErr != nil {
+		if native != nil {
+			_ = native.Close()
+		}
+		if releasePlatform != nil {
+			_ = releasePlatform()
+		}
+		return Runtime{}, supportErr
 	}
 	return Runtime{
-		process:  process,
+		process:  native,
 		verifier: verifier,
-		support:  support,
-	}, assessment.Cause
+		state: &runtimeState{
+			support:  support,
+			platform: runtime.GOOS,
+			selfTest: func(ctx context.Context, verifier AttestationVerifier) SupportAssessment {
+				return native.SelfTest(ctx, verifier)
+			},
+			close: func() error {
+				return errors.Join(native.Close(), closeNativeRuntimePlatform(releasePlatform))
+			},
+		},
+	}, nil
+}
+
+func closeNativeRuntimePlatform(release func() error) error {
+	if release == nil {
+		return nil
+	}
+	return release()
 }
 
 func (custodian *NativeCustodian) processCustodian() {}

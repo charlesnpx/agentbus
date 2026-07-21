@@ -275,15 +275,13 @@ func requireServedNativeRuntime(t *testing.T) custodian.Runtime {
 	}
 	options := servedNativeRuntimeOptions(t)
 	runtimeBundle, err := custodian.NewNativeRuntime(options)
-	support := runtimeBundle.Support()
+	support := runtimeBundle.SelfTest(context.Background())
 	if err != nil || !support.ParkedExec || !support.VerifiedContainment {
 		t.Skipf("native runtime support unavailable: support=%+v err=%v", support, err)
 	}
 	t.Cleanup(func() {
-		if closer, ok := runtimeBundle.Process().(interface{ Close() error }); ok {
-			if err := closer.Close(); err != nil {
-				t.Fatalf("native runtime Close() error = %v", err)
-			}
+		if err := runtimeBundle.Close(); err != nil {
+			t.Fatalf("native runtime Close() error = %v", err)
 		}
 	})
 	return runtimeBundle
@@ -302,10 +300,8 @@ func requireServedNativeSupport(t *testing.T) {
 	}
 	options := servedNativeRuntimeOptions(t)
 	runtimeBundle, err := custodian.NewNativeRuntime(options)
-	support := runtimeBundle.Support()
-	if closer, ok := runtimeBundle.Process().(interface{ Close() error }); ok {
-		_ = closer.Close()
-	}
+	support := runtimeBundle.SelfTest(context.Background())
+	_ = runtimeBundle.Close()
 	if err != nil || !support.ParkedExec || !support.VerifiedContainment {
 		t.Skipf("native runtime support unavailable: support=%+v err=%v", support, err)
 	}

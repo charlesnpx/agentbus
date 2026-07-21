@@ -114,6 +114,11 @@ func (a anchorAdapter) Begin(ctx context.Context, boot model.BootRef, generation
 	if err := a.store.ensureIdentityLocked(a.dbUUID, a.schemaMajor, generation); err != nil {
 		return "", err
 	}
+	// A persisted fail-stop is sticky: Begin must not convert it back to
+	// reconciling. Only the explicit clear-fail-stop admin verb may clear it.
+	if a.store.state.Phase == "fail_stopped" {
+		return "", FailStoppedError{Reason: a.store.state.Reason}
+	}
 	if a.store.state.Generation < generation {
 		if err := a.store.failLocked(AnchorAdvance); err != nil {
 			return "", err
@@ -150,7 +155,7 @@ func (a anchorAdapter) SealReady(ctx context.Context, boot model.BootRef, genera
 		return "", ErrStaleCapability
 	}
 	if a.store.state.Phase == "fail_stopped" {
-		return "", ErrFailStopped
+		return "", FailStoppedError{Reason: a.store.state.Reason}
 	}
 	token := fmt.Sprintf("ready-%s-%s-%d", boot.BootID, boot.OwnerID, generation)
 	a.store.state.Phase = "ready"
@@ -179,7 +184,7 @@ func (a anchorAdapter) Advance(ctx context.Context, boot model.BootRef, generati
 		return err
 	}
 	if a.store.state.Phase == "fail_stopped" {
-		return ErrFailStopped
+		return FailStoppedError{Reason: a.store.state.Reason}
 	}
 	if a.store.state.Generation > generation {
 		return fmt.Errorf("%w: anchor generation %d is ahead of db generation %d", ErrAnchorInvariant, a.store.state.Generation, generation)
@@ -231,7 +236,7 @@ func (a anchorAdapter) verify(phase string, boot model.BootRef, token string, ge
 		return err
 	}
 	if a.store.state.Phase == "fail_stopped" {
-		return ErrFailStopped
+		return FailStoppedError{Reason: a.store.state.Reason}
 	}
 	if a.store.state.Phase != phase || a.store.state.Boot != boot || a.store.state.Token != token || a.store.state.Generation != generation {
 		return ErrStaleCapability

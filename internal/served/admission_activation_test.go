@@ -2,12 +2,15 @@ package served
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -16,7 +19,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
-	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
+	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -85,7 +88,81 @@ func TestActivatedRootSupportLossFailsStartupWithoutDowngrade(t *testing.T) {
 			if after.ActivationMetadata != before.ActivationMetadata {
 				t.Fatalf("activation metadata after failed startup = %+v, want %+v", after.ActivationMetadata, before.ActivationMetadata)
 			}
+			if tt.wantFailStop {
+				if !after.FailStopped || !strings.Contains(after.FailStopReason, "support class=unsafe") {
+					t.Fatalf("fail-stop inspection = %+v, want retained unsafe reason", after)
+				}
+				blockedRestart := newTestServerAtRoot(t, root, cwd, newFakeBackend("fake"))
+				configureAdmissionSupport(t, blockedRestart, newAdmissionFakeLaunchCustodian(t), custodian.SupportAvailable, true, false)
+				blockedRestart.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+					return nil, socketFileIdentity{}, errors.New("listener must not open before fail-stop diagnosis")
+				}
+				err = blockedRestart.Serve(ctx)
+				if !errors.Is(err, ErrSafetyFailStopped) || !strings.Contains(err.Error(), after.FailStopReason) {
+					t.Fatalf("restart after fail-stop error = %v, want retained safety fail-stop reason %q", err, after.FailStopReason)
+				}
+				if _, err := authority.ClearAdmissionFailStop(ctx, root, authority.ClearFailStopOptions{}); !errors.Is(err, authority.ErrClearFailStopConfirmationRequired) {
+					t.Fatalf("clear fail-stop without acknowledgement error = %v, want ErrClearFailStopConfirmationRequired", err)
+				}
+				report, err := authority.ClearAdmissionFailStop(ctx, root, authority.ClearFailStopOptions{AcknowledgeUnsafeDiagnosis: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !report.Cleared || report.ClearedReason != after.FailStopReason || report.Inspection.FailStopped {
+					t.Fatalf("clear fail-stop report = %+v, want cleared retained reason", report)
+				}
+				clearedRestart := newTestServerAtRoot(t, root, cwd, newFakeBackend("fake"))
+				configureAdmissionSupport(t, clearedRestart, newAdmissionFakeLaunchCustodian(t), custodian.SupportAvailable, true, false)
+				listenErr := errors.New("listener reached after fail-stop clear")
+				clearedRestart.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+					return nil, socketFileIdentity{}, listenErr
+				}
+				err = clearedRestart.Serve(ctx)
+				if !errors.Is(err, listenErr) {
+					t.Fatalf("restart after clear error = %v, want listener reached", err)
+				}
+			}
 		})
+	}
+}
+
+func TestUnsafeSupportFailStopPersistenceFailureReportsBothCauses(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	server, _, cwd := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+	if err := server.closeServeAdmission(); err != nil {
+		t.Fatal(err)
+	}
+
+	persistErr := errors.New("anchor write failed")
+	anchorStore.FailNextForTest(authority.AnchorFailStop, persistErr)
+	restart := newTestServerAtRoot(t, server.stateRoot, cwd, newFakeBackend("fake"))
+	restart.admissionBootstrapperFactory = func(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return bootstrapper, repo, io.NopCloser(strings.NewReader("")), nil
+	}
+	configureAdmissionSupport(t, restart, newAdmissionFakeLaunchCustodian(t), custodian.SupportUnsafe, false, false)
+
+	err := restart.Serve(ctx)
+	if !errors.Is(err, authority.ErrFailStopRecord) || !errors.Is(err, persistErr) || !errors.Is(err, ErrAdmissionStrictSupportUnavailable) {
+		t.Fatalf("Serve error = %v, want unsafe support and fail-stop persistence failure", err)
+	}
+	var diagnostic AdmissionSupportDiagnostic
+	if !errors.As(err, &diagnostic) {
+		t.Fatalf("Serve error = %v, want AdmissionSupportDiagnostic", err)
+	}
+	if diagnostic.FailStopped {
+		t.Fatalf("diagnostic FailStopped = true after failed persistence: %+v", diagnostic)
+	}
+	snapshot := admissionAnchorSnapshot(t, anchorStore)
+	if snapshot.Phase == "fail_stopped" {
+		t.Fatalf("anchor snapshot = %+v, want fail-stop not persisted", snapshot)
 	}
 }
 
@@ -110,40 +187,61 @@ func TestActivatedRootRejectsLegacySubmitBeforeBackendStart(t *testing.T) {
 
 func TestActivatedRootContractVersionMismatchFailsStartup(t *testing.T) {
 	ctx := context.Background()
-	server, root, cwd := newUnstartedTestServer(t, newFakeBackend("fake"))
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	server, _, cwd := newUnstartedTestServer(t, newFakeBackend("fake"))
 	launcher := newAdmissionFakeLaunchCustodian(t)
-	enableTestAdmission(t, server, launcher)
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
 	if err := server.closeServeAdmission(); err != nil {
 		t.Fatal(err)
 	}
-	repo, err := bboltrepo.NewRepository(filepath.Join(root, authority.AdmissionRepositoryFile))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repo.Update(ctx, func(tx repository.WriteTx) error {
-		metaRecord := tx.Meta()
-		if metaRecord.State != repository.RecordValid {
-			t.Fatalf("meta state = %s", metaRecord.State)
-		}
-		meta := metaRecord.Value
-		meta.AdmissionRoot.ContractVersion = authority.CurrentAdmissionContractVersion + 1
-		return tx.PutMeta(meta)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.Close(); err != nil {
-		t.Fatal(err)
-	}
 
-	restart := newTestServerAtRoot(t, root, cwd, newFakeBackend("fake"))
+	badRepo := repositoryWithForgedContractVersion(t, repo, authority.CurrentAdmissionContractVersion+1)
+	restart := newTestServerAtRoot(t, server.stateRoot, cwd, newFakeBackend("fake"))
+	restart.admissionBootstrapperFactory = func(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		bootstrapper, err := authority.NewBootstrapper(badRepo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return bootstrapper, badRepo, io.NopCloser(strings.NewReader("")), nil
+	}
 	configureTestAdmissionRuntime(t, restart, newAdmissionFakeLaunchCustodian(t), true)
 	restart.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
 		return nil, socketFileIdentity{}, errors.New("listener must not open for contract mismatch")
 	}
-	err = restart.Serve(ctx)
+	err := restart.Serve(ctx)
 	if !errors.Is(err, authority.ErrAdmissionContractMismatch) {
 		t.Fatalf("Serve contract mismatch error = %v, want ErrAdmissionContractMismatch", err)
 	}
+}
+
+func repositoryWithForgedContractVersion(t *testing.T, repo *memory.Repository, version uint16) *memory.Repository {
+	t.Helper()
+	type memorySnapshot struct {
+		DBUUID          string                                      `json:"dbUUID"`
+		Generation      uint64                                      `json:"generation"`
+		NextJobSequence uint64                                      `json:"nextJobSequence"`
+		Meta            repository.Record[repository.AuthorityMeta] `json:"meta"`
+		Bindings        json.RawMessage                             `json:"bindings"`
+		Tombstones      json.RawMessage                             `json:"tombstones"`
+		Safety          json.RawMessage                             `json:"safety"`
+		Projections     json.RawMessage                             `json:"projections"`
+		Quarantines     json.RawMessage                             `json:"quarantines"`
+	}
+	var snapshot memorySnapshot
+	if err := json.Unmarshal(repo.SnapshotBytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Meta.Value.AdmissionRoot.ContractVersion = version
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badRepo, err := memory.NewRepositoryFromSnapshotBytes(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return badRepo
 }
 
 func TestRecoveryOnlyFinalizesActivatedObligationsWithoutSocket(t *testing.T) {
@@ -239,6 +337,68 @@ func TestActivatedStartupRecoversBeforeSupportPolicyAndListen(t *testing.T) {
 	}
 }
 
+func TestSequentialServeReprobesSupportAndClosesRuntimePerServe(t *testing.T) {
+	ctx := context.Background()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	available := admissionSupportForClass(t, custodian.SupportAvailable, true, 1)
+	unsupported := admissionSupportForClass(t, custodian.SupportUnsupported, true, 1)
+
+	var factoryCalls atomic.Int64
+	var selfTests atomic.Int64
+	var closes atomic.Int64
+	server.admissionRuntimeFactory = func(*Server) *servedAdmissionRuntime {
+		factoryCalls.Add(1)
+		launcher := newAdmissionFakeLaunchCustodian(t)
+		return &servedAdmissionRuntime{
+			runtime:         custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable),
+			launchCustodian: launcher,
+			supportProbe: func(context.Context) custodian.Support {
+				if selfTests.Add(1) == 1 {
+					return available
+				}
+				return unsupported
+			},
+			verifierOverride: launcher.verifier,
+			closeHook: func() error {
+				closes.Add(1)
+				return nil
+			},
+		}
+	}
+
+	listenErr := errors.New("first listen reached")
+	var listenCalls atomic.Int64
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		if listenCalls.Add(1) == 1 {
+			return nil, socketFileIdentity{}, listenErr
+		}
+		return nil, socketFileIdentity{}, errors.New("listener must not open after support loss")
+	}
+
+	if err := server.Serve(ctx); !errors.Is(err, listenErr) {
+		t.Fatalf("first Serve error = %v, want %v", err, listenErr)
+	}
+	if server.admissionRuntime != nil {
+		t.Fatal("admissionRuntime retained after first Serve close")
+	}
+	err := server.Serve(ctx)
+	if !errors.Is(err, ErrAdmissionStrictSupportUnavailable) {
+		t.Fatalf("second Serve error = %v, want ErrAdmissionStrictSupportUnavailable", err)
+	}
+	if got := factoryCalls.Load(); got != 2 {
+		t.Fatalf("runtime factory calls = %d, want 2", got)
+	}
+	if got := selfTests.Load(); got != 2 {
+		t.Fatalf("self-test calls = %d, want 2", got)
+	}
+	if got := closes.Load(); got != 2 {
+		t.Fatalf("runtime closes = %d, want 2", got)
+	}
+	if got := listenCalls.Load(); got != 1 {
+		t.Fatalf("listener calls = %d, want only first Serve to listen", got)
+	}
+}
+
 func TestSealedRootServeFailsTypedBeforeListen(t *testing.T) {
 	ctx := context.Background()
 	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
@@ -247,7 +407,7 @@ func TestSealedRootServeFailsTypedBeforeListen(t *testing.T) {
 	if err := server.closeServeAdmission(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := authority.SealAdmissionRoot(ctx, root, authority.SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true}); err != nil {
+	if _, err := authority.SealAdmissionRoot(ctx, root, authority.SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: filepath.Join(t.TempDir(), "new-domain")}); err != nil {
 		t.Fatal(err)
 	}
 

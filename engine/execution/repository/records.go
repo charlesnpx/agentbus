@@ -72,9 +72,6 @@ type AdmissionRootMetadata struct {
 
 func (metadata AdmissionRootMetadata) Validate() error {
 	if !metadata.Activated {
-		if metadata.ContractVersion != 0 {
-			return fmt.Errorf("%w: admission_root.contract_version must be zero before activation", ErrInvalidRecord)
-		}
 		if metadata.ActivatedAtGen != 0 {
 			return fmt.Errorf("%w: admission_root.activated_at_gen must be zero before activation", ErrInvalidRecord)
 		}
@@ -109,6 +106,50 @@ func (meta AuthorityMeta) Validate() error {
 	}
 	if err := meta.AdmissionRoot.Validate(); err != nil {
 		return err
+	}
+	return nil
+}
+
+func ValidateAuthorityMetaPut(current Record[AuthorityMeta], next AuthorityMeta, currentGeneration, currentNextJobSequence uint64) error {
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	if next.Generation != currentGeneration {
+		return fmt.Errorf("%w: meta generation %d does not match current generation %d", ErrInvalidRecord, next.Generation, currentGeneration)
+	}
+	if next.NextJobSequence < currentNextJobSequence {
+		return fmt.Errorf("%w: meta.next_job_sequence cannot move backwards", ErrInvalidRecord)
+	}
+	if current.State != RecordValid {
+		return nil
+	}
+	// Admission-root metadata is one-way inside a live authority domain:
+	// activation and sealing never clear, ActivatedAtGen never changes once set,
+	// and a declared/activated ContractVersion cannot be forged by later PutMeta.
+	return validateAuthorityMetaTransition(current.Value, next, currentGeneration)
+}
+
+func validateAuthorityMetaTransition(current, next AuthorityMeta, currentGeneration uint64) error {
+	if current.AdmissionRoot.Activated && !next.AdmissionRoot.Activated {
+		return fmt.Errorf("%w: admission_root.activated is one-way and cannot be cleared", ErrInvalidRecord)
+	}
+	if current.Sealed && !next.Sealed {
+		return fmt.Errorf("%w: meta.sealed is one-way and cannot be cleared", ErrInvalidRecord)
+	}
+	if current.AdmissionRoot.ActivatedAtGen != 0 && next.AdmissionRoot.ActivatedAtGen != current.AdmissionRoot.ActivatedAtGen {
+		return fmt.Errorf("%w: admission_root.activated_at_gen is immutable once set", ErrInvalidRecord)
+	}
+	if current.AdmissionRoot.Activated && next.AdmissionRoot.ContractVersion != current.AdmissionRoot.ContractVersion {
+		return fmt.Errorf("%w: admission_root.contract_version is immutable once activated", ErrInvalidRecord)
+	}
+	if !current.AdmissionRoot.Activated && next.AdmissionRoot.Activated {
+		if current.AdmissionRoot.ContractVersion != 0 && next.AdmissionRoot.ContractVersion != current.AdmissionRoot.ContractVersion {
+			return fmt.Errorf("%w: admission_root.contract_version is immutable once declared", ErrInvalidRecord)
+		}
+		committedGeneration := currentGeneration + 1
+		if next.AdmissionRoot.ActivatedAtGen != committedGeneration {
+			return fmt.Errorf("%w: admission_root.activated_at_gen %d does not match activation commit generation %d", ErrInvalidRecord, next.AdmissionRoot.ActivatedAtGen, committedGeneration)
+		}
 	}
 	return nil
 }

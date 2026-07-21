@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"sync"
 
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -250,7 +251,18 @@ func newSupportFromAssessment(assessment SupportAssessment, platform string, con
 type Runtime struct {
 	process  ProcessCustodian
 	verifier AttestationVerifier
+	state    *runtimeState
+}
+
+type runtimeState struct {
+	mu       sync.Mutex
 	support  Support
+	platform string
+	selfTest func(context.Context, AttestationVerifier) SupportAssessment
+	close    func() error
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func NewUnavailableRuntime(reason error) Runtime {
@@ -280,7 +292,13 @@ func NewUnavailableRuntime(reason error) Runtime {
 	return Runtime{
 		process:  UnavailableCustodian{},
 		verifier: verifier,
-		support:  support,
+		state: &runtimeState{
+			support:  support,
+			platform: runtime.GOOS,
+			selfTest: func(context.Context, AttestationVerifier) SupportAssessment {
+				return support.Assessment
+			},
+		},
 	}
 }
 
@@ -300,11 +318,43 @@ func (runtime Runtime) Verifier() AttestationVerifier {
 }
 
 func (runtime Runtime) Support() Support {
-	return runtime.support
+	if runtime.state == nil {
+		return Support{}
+	}
+	runtime.state.mu.Lock()
+	defer runtime.state.mu.Unlock()
+	return runtime.state.support
 }
 
 func (runtime Runtime) SupportAssessment() SupportAssessment {
-	return runtime.support.Assessment
+	return runtime.Support().Assessment
+}
+
+func (runtime Runtime) SelfTest(ctx context.Context) Support {
+	if runtime.state == nil || runtime.state.selfTest == nil {
+		return runtime.Support()
+	}
+	assessment := runtime.state.selfTest(ctx, runtime.verifier)
+	support, err := newSupportFromAssessment(assessment, runtime.state.platform, false, false)
+	if err != nil {
+		support = NewUnavailableRuntime(err).Support()
+	}
+	runtime.state.mu.Lock()
+	runtime.state.support = support
+	runtime.state.mu.Unlock()
+	return support
+}
+
+func (runtime Runtime) Close() error {
+	if runtime.state == nil {
+		return nil
+	}
+	runtime.state.closeOnce.Do(func() {
+		if runtime.state.close != nil {
+			runtime.state.closeErr = runtime.state.close()
+		}
+	})
+	return runtime.state.closeErr
 }
 
 type AttestationIssuer struct {
