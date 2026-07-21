@@ -525,7 +525,11 @@ func (fs *realFS) Remove(ctx context.Context, object cgroupObject) error {
 }
 
 func (fs *realFS) openRoot() (int, error) {
-	return unix.Open(fs.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Open(fs.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, cgroupRootOpenError(err)
+	}
+	return fd, nil
 }
 
 func (fs *realFS) openLeaf(rootfd int, name string) (int, error) {
@@ -679,7 +683,7 @@ func (fs *realFS) establishExclusiveDelegation(rootfd int) (bool, error) {
 		return false, nil
 	}
 	if err := unix.Flock(rootfd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		return false, fmt.Errorf("%w: acquire delegated cgroup root lease: %v", ErrUnsupported, err)
+		return false, cgroupRootLeaseAcquireError(err)
 	}
 	entries, err := readDirAt(rootfd)
 	if err != nil {
@@ -696,6 +700,23 @@ func (fs *realFS) establishExclusiveDelegation(rootfd int) (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+func cgroupRootOpenError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: open delegated cgroup root: %v", ErrUnsupported, err)
+}
+
+func cgroupRootLeaseAcquireError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+		return fmt.Errorf("%w: acquire delegated cgroup root lease: %v", ErrRootLeaseUnavailable, err)
+	}
+	return fmt.Errorf("%w: acquire delegated cgroup root lease: %v", ErrUnsupported, err)
 }
 
 func verifyRootHandle(rootfd int, expected ObjectIdentity) error {

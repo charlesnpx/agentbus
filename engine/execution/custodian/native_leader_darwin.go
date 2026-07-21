@@ -5,7 +5,6 @@ package custodian
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -117,12 +116,4 @@ func (handle *nativeLeaderPlatformHandle) close() error {
 	handle.kq = -1
 	handle.closed = true
 	return unix.Close(kq)
-}
-
-func probeNativeLeaderPlatform() error {
-	handle, err := openNativeLeaderPlatformHandle(os.Getpid())
-	if err != nil {
-		return err
-	}
-	return handle.close()
 }

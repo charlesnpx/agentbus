@@ -5,6 +5,7 @@ package custodian
 import (
 	"context"
 	"fmt"
+	"runtime"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/containment"
@@ -110,6 +111,18 @@ func platformBindContainmentTarget(_ context.Context, real RealContainment, grou
 	return RealContainment{Params: real.Params, Witness: retention}, nil
 }
 
-func probeNativeRuntimePlatform(options NativeOptions) error {
-	return probeNativeLeaderContainment(options)
+func prepareNativeRuntimePlatformOptions(options NativeOptions) (NativeOptions, func() error, error) {
+	return options, nil, nil
+}
+
+func nativeRuntimePlatformSelfTestEnabled() bool {
+	return false
+}
+
+func nativeRuntimePlatformUnsupportedCause() error {
+	return fmt.Errorf("%w: strict unavailable on %s", ErrNativeRuntimeUnsupported, runtime.GOOS)
+}
+
+func nativeRuntimePlatformUnsupportedError(error) bool {
+	return false
 }

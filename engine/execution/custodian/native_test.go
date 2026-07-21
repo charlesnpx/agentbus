@@ -999,57 +999,6 @@ func TestCustodianContainAndVerifyUsesFinalizedCacheAfterRunningEviction(t *test
 	}
 }
 
-func TestNativeCgroupProbeHelperWaitRequiresSIGKILL(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	early, err := startNativeCgroupProbeHelperCommand(ctx, "/bin/sh", "-c", "exit 7")
-	if err != nil {
-		t.Fatalf("start early helper: %v", err)
-	}
-	defer early.cleanup()
-	if err := early.wait(ctx, 2*time.Second); err == nil || !strings.Contains(err.Error(), "want signal") {
-		t.Fatalf("early helper wait error = %v, want signal requirement", err)
-	}
-
-	killed, err := startNativeCgroupProbeHelperCommand(ctx, "/bin/sleep", "30")
-	if err != nil {
-		t.Fatalf("start killed helper: %v", err)
-	}
-	defer killed.cleanup()
-	if err := syscall.Kill(killed.pid(), syscall.SIGKILL); err != nil {
-		t.Fatalf("kill helper: %v", err)
-	}
-	if err := killed.wait(ctx, 2*time.Second); err != nil {
-		t.Fatalf("killed helper wait error = %v, want nil", err)
-	}
-}
-
-func TestNativeCgroupProbeHelperIgnoresGraceSignals(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	helper, err := startNativeCgroupProbeHelper(ctx)
-	if err != nil {
-		t.Fatalf("start helper: %v", err)
-	}
-	defer helper.cleanup()
-
-	for _, signal := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT} {
-		if err := syscall.Kill(-helper.pid(), signal); err != nil {
-			t.Fatalf("signal helper group %s: %v", signal, err)
-		}
-		time.Sleep(50 * time.Millisecond)
-		if err := helper.requireRunning(ctx); err != nil {
-			t.Fatalf("helper after %s = %v, want running", signal, err)
-		}
-	}
-	if err := syscall.Kill(-helper.pid(), syscall.SIGKILL); err != nil {
-		t.Fatalf("kill helper group: %v", err)
-	}
-	if err := helper.wait(ctx, 2*time.Second); err != nil {
-		t.Fatalf("helper wait after SIGKILL = %v, want nil", err)
-	}
-}
-
 func TestNativeCustodianDoesNotMintProofAndProductionUnavailable(t *testing.T) {
 	nativeType := fmt.Sprintf("%T", PhysicalOutcome{})
 	if strings.Contains(nativeType, "VerifiedQuiescence") {
@@ -1079,6 +1028,9 @@ func TestNativeCustodianDoesNotMintProofAndProductionUnavailable(t *testing.T) {
 }
 
 func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("C6 native runtime availability is Linux cgroup-v2 only")
+	}
 	if runtime.GOOS == "linux" && os.Getenv(nativeCgroupConformanceEnv) != "1" {
 		t.Skip("set AGENTBUS_CGROUP_CONFORMANCE=1 to run the real Linux cgroup native runtime probe")
 	}
@@ -1098,7 +1050,7 @@ func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing
 	// root-caused (tracked: L3c real-cgroup transient investigation).
 	runtimeBundle, err := NewNativeRuntime(options)
 	support := runtimeBundle.Support()
-	if !support.RuntimeProbePassed || !support.VerifiedContainment || support.RuntimeProbeResult != nil {
+	if support.Assessment.Class != SupportAvailable || !support.RuntimeProbePassed || !support.VerifiedContainment || support.RuntimeProbeResult != nil {
 		t.Fatalf("native runtime support = %+v, want passed containment probe; NewNativeRuntime error = %v", support, err)
 	}
 	if err != nil {
@@ -1664,6 +1616,11 @@ func newNativeCustodianWithRetainedFactoryForTest(t *testing.T, params containme
 	if err != nil {
 		t.Fatalf("NewNativeCustodian() error = %v", err)
 	}
+	// NewNativeCustodian no longer wires an attestation issuer (R3C moved that
+	// to NewNativeRuntime, whose self-tested instance owns the channel). Bare
+	// test custodians must attach one or every mint fails ErrInvalidAttestation.
+	issuer, _ := NewAttestationChannel()
+	native.issuer = issuer
 	return native
 }
 

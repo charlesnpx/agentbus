@@ -40,11 +40,11 @@ type retainedNativeContainmentBackend struct {
 func newRetainedNativeContainmentBackend(ctx context.Context, custodian *NativeCustodian, factory func() (containment.RetainedGroupObject, error)) (nativeContainmentBackend, error) {
 	manager, err := custodian.sharedRetainedGroup(factory)
 	if err != nil {
-		return nil, fmt.Errorf("%w: create retained-object manager: %v", ErrNativeCustodianUnavailable, err)
+		return nil, fmt.Errorf("%w: create retained-object manager: %w", ErrNativeCustodianUnavailable, err)
 	}
 	capability, err := manager.AcquireRetainedGroup(ctx, model.GroupRef{}, time.Now())
 	if err != nil {
-		return nil, fmt.Errorf("%w: acquire retained object: %v", ErrNativeCustodianUnavailable, err)
+		return nil, fmt.Errorf("%w: acquire retained object: %w", ErrNativeCustodianUnavailable, err)
 	}
 	placement, ok := capability.(retainedGroupPlacementCapability)
 	if !ok {

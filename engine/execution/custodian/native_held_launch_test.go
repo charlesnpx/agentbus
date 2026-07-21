@@ -634,6 +634,14 @@ func newNativeHeldCountingAbsentCustodianForTest() (*NativeCustodian, *countingQ
 	return &NativeCustodian{
 		options: NativeOptions{
 			ContainmentParams: defaultNativeTestParams(),
+			// Fake-based tests must NEVER fall through to the real platform
+			// retained manager: a refused/unprovable containment path would
+			// otherwise construct it, acquire the real delegated-root flock,
+			// and (per C9 lifetime custody) leak it for the remainder of the
+			// test process, poisoning every later real-cgroup test.
+			newRetainedGroup: func() (containment.RetainedGroupObject, error) {
+				return newFakeNativeRetainedManager(), nil
+			},
 		},
 		issuer:    counting,
 		running:   make(map[string]*NativeRunningProcess),

@@ -147,8 +147,8 @@ func TestExclusiveLeaseAllowsOnlyOneManager(t *testing.T) {
 		t.Fatalf("first AcquireRetainedGroup() capability is nil")
 	}
 	capability, err := second.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now())
-	if capability != nil || !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("second AcquireRetainedGroup() with held lease = %T, %v; want nil ErrUnsupported", capability, err)
+	if capability != nil || !errors.Is(err, ErrRootLeaseUnavailable) {
+		t.Fatalf("second AcquireRetainedGroup() with held lease = %T, %v; want nil ErrRootLeaseUnavailable", capability, err)
 	}
 }
 
@@ -162,8 +162,8 @@ func TestManagerCloseReleasesExclusiveRootLease(t *testing.T) {
 	second := newFakeManager(secondFS, leafSequence("cg-second"))
 
 	capability := acquireCapability(t, first)
-	if _, err := second.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now()); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("second AcquireRetainedGroup() before close error = %v, want ErrUnsupported", err)
+	if _, err := second.AcquireRetainedGroup(context.Background(), model.GroupRef{}, time.Now()); !errors.Is(err, ErrRootLeaseUnavailable) {
+		t.Fatalf("second AcquireRetainedGroup() before close error = %v, want ErrRootLeaseUnavailable", err)
 	}
 	if err := capability.Release(); err != nil {
 		t.Fatalf("Release() error = %v", err)
@@ -1315,7 +1315,7 @@ func (fs *fakeCgroupFS) RootIdentity(context.Context) (RootIdentity, error) {
 		if fs.lease.holder == nil {
 			fs.lease.holder = fs
 		} else if fs.lease.holder != fs {
-			return RootIdentity{}, fmt.Errorf("%w: exclusive delegation already leased", ErrUnsupported)
+			return RootIdentity{}, fmt.Errorf("%w: exclusive delegation already leased", ErrRootLeaseUnavailable)
 		}
 	}
 	root := fs.root

@@ -4,9 +4,10 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R3B CLOSED (R3B closed at 69f6dab after 4 fix rounds; final sol verdict SHIP,
-0 findings, all 12 criteria PASS). Next: R3C single-lease runtime qualification (worker launched), then
-R4A → R4B → R5 → R6/R7A → R7B. Production still UnavailableRuntime; R0T expected-RED green.
+STATUS: EXECUTING. R0..R3B CLOSED. R3C committed (single-lease self-tested runtime, SupportClass,
+typed lease contention; real cgroup-v2 conformance tier fully green incl. monitor-EOF). TWO sol reviews
+launched on the committed SHA. Then R4A → R4B → R5 → R6/R7A → R7B. Production still UnavailableRuntime;
+R0T expected-RED green.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -283,6 +284,33 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
+- 2026-07-21 R3C (this commit): single-lease runtime qualification per C9/C6. NewNativeRuntime
+  constructs ONE custodian, runs SelfTest on that instance through the PUBLIC path (Prepare hidden
+  same-binary fixture internal-native-self-test-fixture via os.Executable → marker-absence not-exec'd
+  proof → AbortAndVerify → attestation verify → verifySelfTestClean pgid+leaf absence), and the SAME
+  instance becomes production; failure closes it + releases the platform lease → UnavailableCustodian.
+  SupportClass{Available,Retryable,Unsupported,Unsafe} + SupportAssessment{Class,Cause,Attempts,
+  CleanupSafe}; classified bounded retry (max 3; unverified cleanup ⇒ Unsafe escalation + stop; valid
+  proof + CleanupStatus.Err only retryable if leftover proven removed). Lease contention: flock
+  EAGAIN/EWOULDBLOCK ⇒ typed cgroup.ErrRootLeaseUnavailable ⇒ Retryable Attempts=1 stop-on-contention
+  (fix worker round). Darwin ⇒ SupportUnsupported typed. DELETED ad-hoc probes (probeNativeRuntime/
+  probeNativeCgroupRuntime/probeNativeLeaderContainment/native_cgroup_probe_unix.go). Delivery: R3C
+  worker orphaned WITH full report (report-first worked); R3C-fix worker clean; orchestrator made FOUR
+  Linux-test-only repairs the workers could not run (documented in-code, flagged to both reviews):
+  (a) verification helpers via custodian's own manager — second in-process cgroup.New managers EAGAIN
+  by C9 design; (b) bare test custodians attach an attestation channel (issuer wiring moved to
+  NewNativeRuntime); (c) fake-based CloseRefuses test injects a fake retained factory — its refused-
+  close containment previously fell through to the REAL platform manager and leaked the real root
+  flock process-wide (the conformance-run poisoner); (d) monitor-EOF test drops the mid-test membership
+  assertion that re-established the root flock beforeMonitorBind releases (production lease shape:
+  daemon holds no root flock between monitor readiness and EOF containment). Discovered + recorded for
+  review: the delegated-root flock lifecycle TOGGLES (held at manager use → released at bind → re-held
+  at cleanup) — contention-window questions assigned to the OS/cgroup reviewer. Verified: macOS
+  static/full/race=0; Docker cgroup-v2: conformance tier (AGENTBUS_CGROUP_CONFORMANCE=1)=0 — flagship
+  single-lease self-test GREEN on real cgroup-v2 (Available, Attempts=1, CleanupSafe, typed contention
+  on second acquisition, reacquire after Close), monitor-EOF containment GREEN — full -p 1=0, race=0,
+  R0T RED sentinel=0. Gate harness note: conformance tier requires module pre-cache (go test sets
+  GOPROXY=off for subprocess builds).
 - 2026-07-21 R3B CLOSED. Final sol verification of fix4 (69f6dab): SHIP, 0 findings, criteria 1a-1d,
   2a-2c, 3a-3c, 4, 5 all PASS. Reviewer proved: abort-path proof/cleanup separation (attestation failure
   = proof error; post-proof failures = CleanupStatus only); fail-stop ownership chain intact after the

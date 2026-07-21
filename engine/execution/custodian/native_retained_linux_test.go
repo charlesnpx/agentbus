@@ -4,10 +4,9 @@ package custodian
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -22,76 +21,93 @@ func requireLinuxRetainedConformanceOrSkip(t *testing.T) {
 	requireRealNativeContainmentOrSkip(t)
 }
 
-func TestNativeCgroupRuntimeProbeContainsLiveMember(t *testing.T) {
+func TestNewNativeRuntimeSelfTestUsesReturnedSingleLeaseInstance(t *testing.T) {
 	requireLinuxRetainedConformanceOrSkip(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	var helperPID int
-	liveBeforeContainment := false
+	options := nativeRuntimeOptionsForRetainedTest(t)
 
-	outcome, err := probeNativeCgroupRuntime(ctx, nativeCgroupProbeConfig{
-		startHelper: func(ctx context.Context) (*nativeCgroupProbeHelper, error) {
-			helper, err := startNativeCgroupProbeHelper(ctx)
-			if err != nil {
-				return nil, err
-			}
-			helperPID = helper.pid()
-			return helper, nil
-		},
-		beforeContainment: func(ctx context.Context, helper *nativeCgroupProbeHelper) error {
-			if err := helper.requireRunning(ctx); err != nil {
-				return err
-			}
-			liveBeforeContainment = true
-			return nil
-		},
-	})
+	runtimeBundle, err := NewNativeRuntime(options)
 	if err != nil {
-		t.Fatalf("probeNativeCgroupRuntime() error = %v", err)
+		t.Fatalf("NewNativeRuntime() error = %v support=%+v", err, runtimeBundle.Support())
 	}
-	if !liveBeforeContainment {
-		t.Fatal("probe helper liveness was not confirmed before containment")
+	native, ok := runtimeBundle.Process().(*NativeCustodian)
+	if !ok || native == nil {
+		t.Fatalf("NewNativeRuntime() process = %T, want *NativeCustodian", runtimeBundle.Process())
 	}
-	if !outcome.Absent() {
-		t.Fatalf("probeNativeCgroupRuntime() outcome = %+v, want Absent", outcome)
+	defer cleanupNativeCustodianForTest(t, native)
+
+	assessment := runtimeBundle.SupportAssessment()
+	if assessment.Class != SupportAvailable || assessment.Attempts != 1 || !assessment.CleanupSafe {
+		t.Fatalf("SupportAssessment() = %+v, want available attempts=1 cleanup-safe", assessment)
 	}
-	waitPIDAbsent(t, helperPID, 5*time.Second)
+	record := native.selfTest
+	if !record.CleanupVerified || record.Ref == (model.GroupRef{}) {
+		t.Fatalf("self-test record = %+v, want verified cleanup and retained ref", record)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err = filepath.Abs(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.ExecPath != exe {
+		t.Fatalf("self-test exec path = %s, want current executable %s", record.ExecPath, exe)
+	}
+	absent, err := stableIndependentAbsent(ctx, record.Ref)
+	if err != nil {
+		t.Fatalf("stableIndependentAbsent(self-test ref) error = %v", err)
+	}
+	if !absent {
+		t.Fatalf("self-test process group %d is still live", record.Ref.PGID)
+	}
+	if err := native.verifySelfTestRetainedAbsent(ctx, record.Ref); err != nil {
+		t.Fatalf("self-test retained cgroup cleanup proof error = %v", err)
+	}
+
+	second, secondErr := NewNativeRuntime(options)
+	if secondErr == nil {
+		if closer, ok := second.Process().(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+		t.Fatal("second NewNativeRuntime() while first is open error = nil, want typed single-lease failure")
+	}
+	secondAssessment := second.SupportAssessment()
+	if secondAssessment.Class != SupportRetryable || secondAssessment.Attempts != 1 || !secondAssessment.CleanupSafe || !errors.Is(secondAssessment.Cause, cgroup.ErrRootLeaseUnavailable) {
+		t.Fatalf("second SupportAssessment() = %+v err=%v, want retryable attempts=1 cleanup-safe ErrRootLeaseUnavailable cause", secondAssessment, secondErr)
+	}
+	if !errors.Is(secondErr, cgroup.ErrRootLeaseUnavailable) {
+		t.Fatalf("second NewNativeRuntime() error = %v, want ErrRootLeaseUnavailable", secondErr)
+	}
+	if _, ok := second.Process().(UnavailableCustodian); !ok {
+		t.Fatalf("second NewNativeRuntime() process = %T, want UnavailableCustodian", second.Process())
+	}
+
+	if err := native.Close(); err != nil {
+		t.Fatalf("first native Close() error = %v", err)
+	}
+	third, err := NewNativeRuntime(options)
+	if err != nil {
+		t.Fatalf("third NewNativeRuntime() after Close error = %v support=%+v", err, third.Support())
+	}
+	if closer, ok := third.Process().(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			t.Fatalf("third native Close() error = %v", err)
+		}
+	}
 }
 
-func TestNativeCgroupRuntimeProbeFailsWhenHelperExitsBeforeContainment(t *testing.T) {
-	requireLinuxRetainedConformanceOrSkip(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	marker := filepath.Join(t.TempDir(), "exit-before-containment")
-	script := `trap '' TERM; while [ ! -f "$1" ]; do sleep 0.01; done; exit 23`
-
-	_, err := probeNativeCgroupRuntime(ctx, nativeCgroupProbeConfig{
-		startHelper: func(ctx context.Context) (*nativeCgroupProbeHelper, error) {
-			return startNativeCgroupProbeHelperCommand(ctx, "/bin/sh", "-c", script, "probe-helper", marker)
-		},
-		beforeContainment: func(ctx context.Context, helper *nativeCgroupProbeHelper) error {
-			if err := os.WriteFile(marker, []byte("exit\n"), 0600); err != nil {
-				return err
-			}
-			deadline := time.Now().Add(2 * time.Second)
-			for time.Now().Before(deadline) {
-				err := helper.requireRunning(ctx)
-				if err != nil {
-					if strings.Contains(err.Error(), "exited") {
-						return nil
-					}
-					return err
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-			return fmt.Errorf("helper did not self-exit before containment")
-		},
-	})
-	if err == nil {
-		t.Fatal("probeNativeCgroupRuntime() error = nil, want fail-closed helper liveness error")
-	}
-	if !strings.Contains(err.Error(), "live membership") || !strings.Contains(err.Error(), "exited") {
-		t.Fatalf("probeNativeCgroupRuntime() error = %v, want live-membership helper-exited failure", err)
+func nativeRuntimeOptionsForRetainedTest(t *testing.T) NativeOptions {
+	t.Helper()
+	exe := nativeTestBinaryPath(t)
+	return NativeOptions{
+		AgentbusPath:      builtNativeAgentbusPath(t),
+		MonitorCommand:    nativeMonitorCommand(t),
+		ContainmentParams: defaultNativeTestParams(),
+		WorkerEnv:         nativeAgentbusEnv(),
+		WorkerDir:         filepath.Dir(exe),
 	}
 }
 
@@ -136,7 +152,7 @@ func TestNativeRetainedContainAndVerifyKillsTermIgnoringLeader(t *testing.T) {
 	if outcome.Method != model.QuiescenceTermKill && outcome.Method != model.QuiescenceAlreadyAbsent {
 		t.Fatalf("physical method = %s, want %s or %s", outcome.Method, model.QuiescenceTermKill, model.QuiescenceAlreadyAbsent)
 	}
-	requireRetainedLeafGone(t, ctx, running.Ref())
+	requireRetainedLeafGone(t, ctx, native, running.Ref())
 }
 
 func TestNativeRetainedPreparedAbortReapsLeaderBeforeContainment(t *testing.T) {
@@ -152,7 +168,7 @@ func TestNativeRetainedPreparedAbortReapsLeaderBeforeContainment(t *testing.T) {
 	}
 	ref := prepared.Ref()
 	requireNativeFileAbsent(t, resultPath)
-	requireRetainedMembershipForRef(t, ctx, ref, containment.RetainedMembershipPresent)
+	requireRetainedMembershipForRef(t, ctx, native, ref, containment.RetainedMembershipPresent)
 
 	verified, cleanup, err := prepared.AbortAndVerify(ctx)
 	if err != nil {
@@ -165,7 +181,7 @@ func TestNativeRetainedPreparedAbortReapsLeaderBeforeContainment(t *testing.T) {
 		t.Fatal("prepared AbortAndVerify() returned zero attestation")
 	}
 	waitGroupAbsent(t, ref, 5*time.Second)
-	requireRetainedLeafGone(t, ctx, ref)
+	requireRetainedLeafGone(t, ctx, native, ref)
 }
 
 func TestNativeRetainedMonitorDaemonEOFContainsTargetGroup(t *testing.T) {
@@ -189,7 +205,13 @@ func TestNativeRetainedMonitorDaemonEOFContainsTargetGroup(t *testing.T) {
 	if result.GrandchildPGID != running.Ref().PGID {
 		t.Fatalf("grandchild pgid = %d, want target group %d", result.GrandchildPGID, running.Ref().PGID)
 	}
-	requireRunningRetainedMembership(t, ctx, running, containment.RetainedMembershipPresent)
+	// Deliberately NO retained-membership assertion here: acquiring through the
+	// daemon-side shared manager would re-establish the delegated-root flock
+	// that beforeMonitorBind released, and the monitor subprocess's containment
+	// acquisition on daemon EOF would then fail EAGAIN. The production lease
+	// shape between monitor readiness and EOF containment is "daemon holds no
+	// root flock" — the test must preserve it. Group membership is already
+	// proven by the backend result file (PGID match above).
 
 	if err := running.handle.Monitor.DaemonControlWrite.Close(); err != nil {
 		t.Fatalf("close daemon control: %v", err)
@@ -205,7 +227,7 @@ func TestNativeRetainedMonitorDaemonEOFContainsTargetGroup(t *testing.T) {
 	}
 	waitPIDAbsent(t, result.GrandchildPID, 5*time.Second)
 	waitGroupAbsent(t, running.Ref(), 5*time.Second)
-	requireRetainedLeafGone(t, ctx, running.Ref())
+	requireRetainedLeafGone(t, ctx, native, running.Ref())
 }
 
 func requireRetainedBackendForTest(t *testing.T, running *NativeRunningProcess) {
@@ -251,13 +273,19 @@ func requireRunningRetainedMembership(t *testing.T, ctx context.Context, running
 	}
 }
 
-func requireRetainedMembershipForRef(t *testing.T, ctx context.Context, ref model.GroupRef, want containment.RetainedGroupMembership) {
+// requireRetainedMembershipForRef verifies leaf membership through the
+// custodian's OWN shared retained manager. A fresh cgroup.New manager can
+// NEVER verify while the custodian lives: per C9 the custodian holds the one
+// exclusive delegated-root lease for its lifetime, so a second in-process
+// manager's acquisition would always fail typed with ErrRootLeaseUnavailable.
+// Process-group absence stays independently verified via kill(-pgid,0) in
+// waitGroupAbsent; a fully lease-free independent leaf oracle is R6/R7A scope.
+func requireRetainedMembershipForRef(t *testing.T, ctx context.Context, native *NativeCustodian, ref model.GroupRef, want containment.RetainedGroupMembership) {
 	t.Helper()
-	manager, err := cgroup.New("")
-	if err != nil {
-		t.Fatalf("cgroup.New(\"\") error = %v", err)
+	manager := native.retainedGroupSnapshot()
+	if manager == nil {
+		t.Fatal("custodian shared retained manager is nil")
 	}
-	defer manager.Close()
 	capability, err := manager.AcquireRetainedGroup(ctx, ref, time.Now())
 	if err != nil {
 		t.Fatalf("AcquireRetainedGroup(%s) error = %v", ref.RetainedID, err)
@@ -272,14 +300,15 @@ func requireRetainedMembershipForRef(t *testing.T, ctx context.Context, ref mode
 	}
 }
 
-func requireRetainedLeafGone(t *testing.T, ctx context.Context, ref model.GroupRef) {
+// requireRetainedLeafGone proves leaf absence through the custodian's own
+// shared retained manager (same C9 single-lease rationale as above).
+func requireRetainedLeafGone(t *testing.T, ctx context.Context, native *NativeCustodian, ref model.GroupRef) {
 	t.Helper()
-	manager, err := cgroup.New("")
-	if err != nil {
-		t.Fatalf("cgroup.New(\"\") error = %v", err)
+	manager := native.retainedGroupSnapshot()
+	if manager == nil {
+		t.Fatal("custodian shared retained manager is nil")
 	}
-	defer manager.Close()
-	if err := manager.ProveRetainedGroupAbsent(ctx, ref); err != nil {
+	if err := proveRetainedGroupAbsent(ctx, manager, ref); err != nil {
 		t.Fatalf("retained leaf still exists or cannot be proven gone: %v", err)
 	}
 }

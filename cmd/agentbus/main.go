@@ -106,6 +106,8 @@ func (a *app) run(ctx context.Context, args []string, in io.Reader, out, errOut 
 		return a.runInternalParkedWorker(args[1:], errOut)
 	case "internal-monitor":
 		return a.runInternalMonitor(args[1:], errOut)
+	case "internal-native-self-test-fixture":
+		return a.runInternalNativeSelfTestFixture(args[1:], errOut)
 	default:
 		return usageError(errOut, "unknown command %q", args[0])
 	}

@@ -4,13 +4,10 @@ package custodian
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -81,8 +78,9 @@ type NativeLaunchSpec struct {
 }
 
 type NativeCustodian struct {
-	options NativeOptions
-	issuer  quiescenceAttestationIssuer
+	options  NativeOptions
+	issuer   quiescenceAttestationIssuer
+	selfTest nativeRuntimeSelfTestRecord
 
 	// mu protects running, finalized, heldPrepared, and closed. Lock order:
 	// custodian.mu may be held while publishing a prepared entry into effects.mu,
@@ -125,45 +123,65 @@ func NewNativeCustodian(options NativeOptions) (*NativeCustodian, error) {
 
 func NewNativeRuntime(options NativeOptions) (Runtime, error) {
 	issuer, verifier := NewAttestationChannel()
+	options, releasePlatform, platformErr := prepareNativeRuntimePlatformOptions(options)
 	native, err := NewNativeCustodian(options)
 	if native != nil {
 		native.issuer = issuer
 	}
-	probeErr := err
-	if probeErr == nil {
-		probeErr = probeNativeRuntime(options)
+	assessment := nativeRuntimeConstructionAssessment(errors.Join(platformErr, err))
+	if assessment.Class == SupportAvailable && !nativeRuntimePlatformSelfTestEnabled() {
+		assessment = SupportAssessment{
+			Class:       SupportUnsupported,
+			Cause:       nativeRuntimePlatformUnsupportedCause(),
+			CleanupSafe: true,
+		}
 	}
-	support := Support{
-		ParkedExec:             err == nil,
-		VerifiedContainment:    probeErr == nil,
-		ImplementationCompiled: true,
-		RuntimeProbePassed:     probeErr == nil,
-		FeatureConfigured:      false,
-		FeatureAdvertised:      false,
-		RuntimeProbeResult:     probeErr,
-		Platform:               runtime.GOOS,
-		Reason:                 probeErr,
+	if assessment.Class == SupportAvailable {
+		assessment = native.SelfTest(context.Background(), verifier)
 	}
-	if probeErr == nil {
-		support.RuntimeProbeResult = nil
+
+	if assessment.Class != SupportAvailable {
+		if native != nil {
+			if closeErr := native.Close(); closeErr != nil {
+				assessment = SupportAssessment{
+					Class:       SupportUnsafe,
+					Cause:       errors.Join(assessment.Cause, closeErr),
+					Attempts:    assessment.Attempts,
+					CleanupSafe: false,
+				}
+			}
+		}
+		if releasePlatform != nil {
+			if closeErr := releasePlatform(); closeErr != nil {
+				assessment = SupportAssessment{
+					Class:       SupportUnsafe,
+					Cause:       errors.Join(assessment.Cause, closeErr),
+					Attempts:    assessment.Attempts,
+					CleanupSafe: false,
+				}
+			}
+		}
 	}
-	if _, supportErr := NewSupport(support); supportErr != nil {
+
+	support, supportErr := newSupportFromAssessment(assessment, runtime.GOOS, false, false)
+	if supportErr != nil {
 		if native != nil {
 			_ = native.Close()
+		}
+		if releasePlatform != nil {
+			_ = releasePlatform()
 		}
 		return Runtime{}, supportErr
 	}
 	process := ProcessCustodian(UnavailableCustodian{})
-	if probeErr == nil {
+	if assessment.Class == SupportAvailable {
 		process = native
-	} else if native != nil {
-		_ = native.Close()
 	}
 	return Runtime{
 		process:  process,
 		verifier: verifier,
 		support:  support,
-	}, probeErr
+	}, assessment.Cause
 }
 
 func (custodian *NativeCustodian) processCustodian() {}
@@ -303,6 +321,15 @@ func (custodian *NativeCustodian) sharedRetainedGroup(factory func() (containmen
 	}
 	custodian.retainedGroup = manager
 	return manager, nil
+}
+
+func (custodian *NativeCustodian) retainedGroupSnapshot() containment.RetainedGroupObject {
+	if custodian == nil {
+		return nil
+	}
+	custodian.retainedMu.Lock()
+	defer custodian.retainedMu.Unlock()
+	return custodian.retainedGroup
 }
 
 func (custodian *NativeCustodian) ContainPhysical(ctx context.Context, group model.GroupRef) PhysicalOutcome {
@@ -543,124 +570,6 @@ func validateNativeOptions(options NativeOptions) error {
 		return err
 	}
 	return nil
-}
-
-func probeNativeRuntime(options NativeOptions) error {
-	return probeNativeRuntimePlatform(options)
-}
-
-func probeNativeLeaderContainment(options NativeOptions) error {
-	if err := probeNativeLeaderPlatform(); err != nil {
-		return fmt.Errorf("%w: leader continuity probe: %v", ErrNativeCustodianUnavailable, err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.Command("/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("%w: start containment probe: %v", ErrNativeCustodianUnavailable, err)
-	}
-	waitDone := make(chan error, 1)
-	go func() {
-		waitDone <- cmd.Wait()
-	}()
-	group, err := probeGroupRef(ctx, cmd.Process.Pid)
-	if err != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		<-waitDone
-		return err
-	}
-	retention, err := newLeaderRetentionForGroup(group)
-	if err != nil {
-		_ = syscall.Kill(-group.PGID, syscall.SIGKILL)
-		<-waitDone
-		return err
-	}
-	defer retention.close()
-
-	params := options.ContainmentParams
-	if params.GracePeriod == 0 {
-		params.GracePeriod = 20 * time.Millisecond
-	}
-	if params.PollInterval == 0 {
-		params.PollInterval = 20 * time.Millisecond
-	}
-	if params.PollTimeout == 0 {
-		params.PollTimeout = 2 * time.Second
-	}
-	outcome := containPhysical(ctx, group, params, retention, nil)
-	if !outcome.Absent() {
-		_ = syscall.Kill(-group.PGID, syscall.SIGKILL)
-		<-waitDone
-		if outcome.Err != nil {
-			return fmt.Errorf("%w: containment probe %s: %v", ErrNativeCustodianUnavailable, outcome.Reason, outcome.Err)
-		}
-		return fmt.Errorf("%w: containment probe outcome=%s reason=%s", ErrNativeCustodianUnavailable, outcome.Kind, outcome.Reason)
-	}
-	<-waitDone
-	return nil
-}
-
-func probeGroupRef(ctx context.Context, leaderPID int) (model.GroupRef, error) {
-	var leader procgroup.ProcessClaim
-	var err error
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		leader, err = procgroup.ReadProcessClaim(leaderPID)
-		if err == nil && leader.PGID == leader.PID {
-			break
-		}
-		if !time.Now().Before(deadline) {
-			if err != nil {
-				return model.GroupRef{}, err
-			}
-			return model.GroupRef{}, fmt.Errorf("probe leader pgid=%d pid=%d", leader.PGID, leader.PID)
-		}
-		if sleepErr := sleepContext(ctx, 10*time.Millisecond); sleepErr != nil {
-			return model.GroupRef{}, sleepErr
-		}
-	}
-	monitor, err := procgroup.ReadProcessClaim(os.Getpid())
-	if err != nil {
-		return model.GroupRef{}, err
-	}
-	attempt := model.AttemptRef{JobID: "job-native-probe", AttemptID: "attempt-native-probe", Epoch: 1}
-	return model.GroupRef{
-		Version:   1,
-		CustodyID: "custody-native-probe",
-		Launch: model.LaunchKey{
-			Attempt: attempt,
-			Ordinal: model.LaunchOrdinalOne,
-		},
-		HostBootID:          leader.KernelDomainID.HostBootID,
-		PIDNamespaceID:      leader.KernelDomainID.PIDNamespaceID,
-		PIDNamespaceState:   leader.KernelDomainID.PIDNamespaceState,
-		RetainedDomainID:    leader.KernelDomainID.RetainedDomainID,
-		RetainedDomainState: leader.KernelDomainID.RetainedDomainState,
-		PGID:                leader.PGID,
-		Leader: model.ProcessIdentity{
-			PID:               leader.PID,
-			HighResStartToken: leader.StartToken.String(),
-		},
-		Monitor: model.ProcessIdentity{
-			PID:               monitor.PID,
-			HighResStartToken: monitor.StartToken.String(),
-		},
-		RetainedID: nativeProbeRetainedID(leader, monitor),
-	}, nil
-}
-
-func nativeProbeRetainedID(leader, monitor procgroup.ProcessClaim) string {
-	hash := sha256.New()
-	fmt.Fprintf(hash, "native-probe-retained-v1\x00%d\x00%s\x00%s\x00%s\x00%d\x00%s",
-		leader.PID,
-		leader.StartToken,
-		leader.KernelDomainID.HostBootID,
-		leader.KernelDomainID.PIDNamespaceID,
-		monitor.PID,
-		monitor.StartToken,
-	)
-	return "native-probe-retained-sha256-" + hex.EncodeToString(hash.Sum(nil))
 }
 
 func (spec NativeLaunchSpec) Validate() error {
