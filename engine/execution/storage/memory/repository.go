@@ -257,7 +257,7 @@ func (tx *writeTx) PutMeta(meta repository.AuthorityMeta) error {
 		return err
 	}
 	current := tx.state.metaRecord()
-	if err := repository.ValidateAuthorityMetaPut(current, meta, tx.state.generation, tx.state.nextJobSequence); err != nil {
+	if err := repository.ValidateAuthorityMetaPut(current, meta, tx.state.generation, tx.state.nextJobSequence, tx.state.rootStats()); err != nil {
 		return err
 	}
 	if current.State == repository.RecordValid && reflect.DeepEqual(current.Value, meta) {

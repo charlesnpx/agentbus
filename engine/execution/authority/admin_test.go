@@ -308,6 +308,136 @@ func TestSealRefusesNonemptyDestination(t *testing.T) {
 	}
 }
 
+func TestSealCrashAfterNewInitLeavesOldServiceableAndRetryRequiresDelete(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-crash-after-new-init")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := filepath.Join(t.TempDir(), "new-domain")
+	crash := errors.New("crash after new-root init")
+	setSealAdmissionRootAfterNewInitForTest(t, func() error { return crash })
+
+	report, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if !errors.Is(err, crash) {
+		t.Fatalf("seal crash error = %v, want injected crash", err)
+	}
+	if report.OldRootSealed || report.NewDomainUUID == "" {
+		t.Fatalf("crash report = %+v, want unsealed old and initialized new", report)
+	}
+	inspection, err := InspectAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Sealed {
+		t.Fatal("old root was sealed before injected crash")
+	}
+	serviceSession, serviceRepo, err := beginBboltAdmissionRootAllowError(ctx, root, "seal-crash-old-serviceable")
+	if err != nil {
+		t.Fatalf("old root begin after injected crash: %v", err)
+	}
+	if _, err := serviceSession.SealReady(ctx); err != nil {
+		t.Fatalf("old root ready after injected crash: %v", err)
+	}
+	if err := serviceRepo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	setSealAdmissionRootAfterNewInitForTest(t, nil)
+	_, retryErr := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	var pristineErr PristineNewStateRootError
+	if !errors.As(retryErr, &pristineErr) || !strings.Contains(retryErr.Error(), newRoot) {
+		t.Fatalf("retry error = %v, want PristineNewStateRootError naming %s", retryErr, newRoot)
+	}
+	if err := os.RemoveAll(newRoot); err != nil {
+		t.Fatal(err)
+	}
+	retryReport, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if err != nil {
+		t.Fatalf("retry after deleting pristine destination: %v", err)
+	}
+	if !retryReport.OldRootSealed || retryReport.NewDomainUUID == "" {
+		t.Fatalf("retry report = %+v, want sealed old and fresh new", retryReport)
+	}
+}
+
+func TestSealNewInitFailureCleansPartialDestinationAndLeavesOldServiceable(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-new-init-fail")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := filepath.Join(t.TempDir(), "new-domain")
+	initErr := errors.New("new-root init failed")
+	setInitializeAdmissionRootAfterOpenForTest(t, func() error { return initErr })
+
+	_, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if !errors.Is(err, initErr) {
+		t.Fatalf("seal init error = %v, want injected init error", err)
+	}
+	if _, statErr := os.Stat(newRoot); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("partial destination stat error = %v, want not exist", statErr)
+	}
+	inspection, err := InspectAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Sealed {
+		t.Fatal("old root was sealed after new-root init failure")
+	}
+	serviceSession, serviceRepo, err := beginBboltAdmissionRootAllowError(ctx, root, "seal-new-init-fail-serviceable")
+	if err != nil {
+		t.Fatalf("old root begin after new-root init failure: %v", err)
+	}
+	if _, err := serviceSession.SealReady(ctx); err != nil {
+		t.Fatalf("old root ready after new-root init failure: %v", err)
+	}
+	if err := serviceRepo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	setInitializeAdmissionRootAfterOpenForTest(t, nil)
+	retryReport, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if err != nil {
+		t.Fatalf("retry after cleaned init failure: %v", err)
+	}
+	if !retryReport.OldRootSealed || retryReport.NewDomainUUID == "" {
+		t.Fatalf("retry report = %+v, want sealed old and fresh new", retryReport)
+	}
+}
+
+func TestSealAlreadySealedRootReusesExistingFreshDestination(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-idempotent")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := filepath.Join(t.TempDir(), "new-domain")
+	first, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if err != nil {
+		t.Fatalf("sealed idempotent replay error = %v", err)
+	}
+	if !second.OldRootSealed || second.NewDomainUUID != first.NewDomainUUID {
+		t.Fatalf("idempotent replay = %+v, want same new domain %s", second, first.NewDomainUUID)
+	}
+}
+
 func TestSealRefusesNonterminalObligations(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -367,4 +497,22 @@ func beginBboltAdmissionRootAllowError(ctx context.Context, root, name string) (
 		return nil, repo, err
 	}
 	return session, repo, nil
+}
+
+func setInitializeAdmissionRootAfterOpenForTest(t *testing.T, hook func() error) {
+	t.Helper()
+	previous := initializeAdmissionRootAfterOpenForTest
+	initializeAdmissionRootAfterOpenForTest = hook
+	t.Cleanup(func() {
+		initializeAdmissionRootAfterOpenForTest = previous
+	})
+}
+
+func setSealAdmissionRootAfterNewInitForTest(t *testing.T, hook func() error) {
+	t.Helper()
+	previous := sealAdmissionRootAfterNewInitForTest
+	sealAdmissionRootAfterNewInitForTest = hook
+	t.Cleanup(func() {
+		sealAdmissionRootAfterNewInitForTest = previous
+	})
 }

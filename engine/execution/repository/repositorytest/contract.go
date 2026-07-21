@@ -16,6 +16,7 @@ type Factory struct {
 	New           func(*testing.T) repository.Repository
 	Snapshot      func(*testing.T, repository.Repository) []byte
 	CorruptSafety func(*testing.T, repository.Repository, model.JobID, string)
+	MissingMeta   func(*testing.T, repository.Repository)
 }
 
 func RunRepositoryContract(t *testing.T, factory Factory) {
@@ -28,6 +29,9 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 	}
 	if factory.CorruptSafety == nil {
 		t.Fatal("repositorytest.Factory.CorruptSafety is required")
+	}
+	if factory.MissingMeta == nil {
+		t.Fatal("repositorytest.Factory.MissingMeta is required")
 	}
 
 	t.Run("atomic acceptance", func(t *testing.T) {
@@ -397,6 +401,87 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 		}); err != nil {
 			t.Fatal(err)
 		}
+	})
+
+	t.Run("missing meta is allowed only on a fresh root", func(t *testing.T) {
+		t.Run("populated root rejects silent reconstruction", func(t *testing.T) {
+			repo := factory.New(t)
+			fixture := newFixture(t, "missing-meta-populated")
+			acceptFixture(t, repo, fixture)
+			factory.MissingMeta(t, repo)
+			before := factory.Snapshot(t, repo)
+
+			_, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+				return tx.PutMeta(repository.AuthorityMeta{
+					SchemaVersion:   repository.CurrentAuthorityMetaSchemaVersion,
+					Generation:      0,
+					NextJobSequence: 1,
+				})
+			})
+			if !errors.Is(err, repository.ErrCorruptRecord) {
+				t.Fatalf("missing populated meta PutMeta error = %v, want ErrCorruptRecord", err)
+			}
+			assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
+		})
+
+		t.Run("fresh root may declare metadata", func(t *testing.T) {
+			repo := factory.New(t)
+			factory.MissingMeta(t, repo)
+			commit, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+				return tx.PutMeta(repository.AuthorityMeta{
+					SchemaVersion:   repository.CurrentAuthorityMetaSchemaVersion,
+					Generation:      0,
+					NextJobSequence: 1,
+					AdmissionRoot: repository.AdmissionRootMetadata{
+						ContractVersion: repository.CurrentAdmissionContractVersion,
+					},
+				})
+			})
+			if err != nil {
+				t.Fatalf("missing fresh meta PutMeta error = %v", err)
+			}
+			assertMetaForTest(t, repo, repository.AuthorityMeta{
+				SchemaVersion:   repository.CurrentAuthorityMetaSchemaVersion,
+				Generation:      commit.Generation,
+				NextJobSequence: 1,
+				AdmissionRoot: repository.AdmissionRootMetadata{
+					ContractVersion: repository.CurrentAdmissionContractVersion,
+				},
+			})
+		})
+	})
+
+	t.Run("contract version is declare once", func(t *testing.T) {
+		repo := factory.New(t)
+		commit, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+			meta := loadMetaForTest(t, tx)
+			meta.AdmissionRoot.ContractVersion = repository.CurrentAdmissionContractVersion
+			return tx.PutMeta(meta)
+		})
+		if err != nil {
+			t.Fatalf("fresh contract declaration error = %v", err)
+		}
+		declared := repository.AuthorityMeta{
+			SchemaVersion:   repository.CurrentAuthorityMetaSchemaVersion,
+			Generation:      commit.Generation,
+			NextJobSequence: 1,
+			AdmissionRoot: repository.AdmissionRootMetadata{
+				ContractVersion: repository.CurrentAdmissionContractVersion,
+			},
+		}
+		assertMetaForTest(t, repo, declared)
+		before := factory.Snapshot(t, repo)
+
+		_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
+			meta := loadMetaForTest(t, tx)
+			meta.AdmissionRoot.ContractVersion++
+			return tx.PutMeta(meta)
+		})
+		if !errors.Is(err, repository.ErrInvalidRecord) {
+			t.Fatalf("unactivated contract mutation error = %v, want ErrInvalidRecord", err)
+		}
+		assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
+		assertMetaForTest(t, repo, declared)
 	})
 
 	t.Run("activation and seal metadata are one way", func(t *testing.T) {

@@ -77,8 +77,13 @@ type Config struct {
 	ReapInterval        time.Duration
 	GCInterval          time.Duration
 	ReapTickInterval    time.Duration
-	Runtime             custodian.Runtime
-	ProbeRunner         command.ProbeRunner
+	// Runtime is an injected strict-admission runtime owned by Serve. A runtime
+	// with real close semantics is single-use: once a Serve or recovery-only
+	// admin run closes it, a later Serve on the same Server/config is rejected
+	// with ErrRuntimeConsumed. custodian.UnavailableRuntime has a no-op close and
+	// is reusable for repeated fail-closed Serves.
+	Runtime     custodian.Runtime
+	ProbeRunner command.ProbeRunner
 }
 
 type tickerSource struct {

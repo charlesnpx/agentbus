@@ -178,8 +178,9 @@ func NewNativeRuntime(options NativeOptions) (Runtime, error) {
 			process:  ProcessCustodian(UnavailableCustodian{}),
 			verifier: verifier,
 			state: &runtimeState{
-				support:  support,
-				platform: runtime.GOOS,
+				support:            support,
+				platform:           runtime.GOOS,
+				reusableAfterClose: true,
 				selfTest: func(context.Context, AttestationVerifier) SupportAssessment {
 					return support.Assessment
 				},

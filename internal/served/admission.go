@@ -38,6 +38,8 @@ const (
 
 var admissionDetachedCleanupTimeout = 30 * time.Second
 
+var ErrRuntimeConsumed = errors.New("admission runtime consumed")
+
 type admissionClosingError struct{}
 
 func (admissionClosingError) Error() string { return "admission authority is shutting down" }
@@ -394,7 +396,21 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if runtime == nil {
 		runtime = newServedAdmissionRuntime(s)
 	}
+	if runtime.consumed() {
+		return ErrRuntimeConsumed
+	}
 	s.admissionRuntime = runtime
+	var closer io.Closer
+	closeOnErr := true
+	defer func() {
+		if closeOnErr {
+			if closer != nil {
+				_ = closer.Close()
+			}
+			_ = runtime.close()
+			s.admissionRuntime = nil
+		}
+	}()
 	descriptors, err := s.probeAdmissionBackends(ctx)
 	if err != nil {
 		return err
@@ -408,16 +424,6 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	closeOnErr := true
-	defer func() {
-		if closeOnErr {
-			if closer != nil {
-				_ = closer.Close()
-			}
-			_ = runtime.close()
-			s.admissionRuntime = nil
-		}
-	}()
 
 	boot, err := s.admissionDaemonBoot()
 	if err != nil {

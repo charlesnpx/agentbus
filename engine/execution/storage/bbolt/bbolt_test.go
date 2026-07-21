@@ -37,6 +37,16 @@ func TestRepositoryContract(t *testing.T) {
 			}
 			bboltRepo.InjectCorruptSafetyForTest(jobID, diagnostic)
 		},
+		MissingMeta: func(t *testing.T, repo repository.Repository) {
+			t.Helper()
+			bboltRepo, ok := repo.(interface {
+				InjectMissingMetaForTest()
+			})
+			if !ok {
+				t.Fatalf("repo type = %T, want InjectMissingMetaForTest", repo)
+			}
+			bboltRepo.InjectMissingMetaForTest()
+		},
 	})
 }
 
@@ -79,6 +89,11 @@ func (r *reopeningRepository) SnapshotBytes() []byte {
 
 func (r *reopeningRepository) InjectCorruptSafetyForTest(jobID model.JobID, diagnostic string) {
 	r.repo.InjectCorruptSafetyForTest(jobID, diagnostic)
+	r.reopen()
+}
+
+func (r *reopeningRepository) InjectMissingMetaForTest() {
+	r.repo.InjectMissingMetaForTest()
 	r.reopen()
 }
 

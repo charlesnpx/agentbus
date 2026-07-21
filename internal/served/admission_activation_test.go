@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -399,6 +400,134 @@ func TestSequentialServeReprobesSupportAndClosesRuntimePerServe(t *testing.T) {
 	}
 }
 
+func TestBootstrapAdmissionProbeFailureClosesRuntime(t *testing.T) {
+	ctx := context.Background()
+	server, _, _ := newUnstartedTestServer(t, &nilProbeBackend{fakeBackend: newFakeBackend("fake")})
+	var closes atomic.Int64
+	server.admissionRuntime = closeCountingServedAdmissionRuntime(t, &closes, admissionSupportForClass(t, custodian.SupportAvailable, true, 1))
+
+	err := server.bootstrapAdmission(ctx)
+	if err == nil || !strings.Contains(err.Error(), "nil probed backend") {
+		t.Fatalf("bootstrapAdmission error = %v, want nil probed backend", err)
+	}
+	if got := closes.Load(); got != 1 {
+		t.Fatalf("runtime closes = %d, want 1", got)
+	}
+	if server.admissionRuntime != nil {
+		t.Fatal("admissionRuntime retained after probe failure")
+	}
+}
+
+func TestBootstrapAdmissionFactoryFailureClosesRuntime(t *testing.T) {
+	ctx := context.Background()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	var closes atomic.Int64
+	server.admissionRuntime = closeCountingServedAdmissionRuntime(t, &closes, admissionSupportForClass(t, custodian.SupportAvailable, true, 1))
+	factoryErr := errors.New("bootstrapper factory failed")
+	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		return nil, nil, nil, factoryErr
+	}
+
+	err := server.bootstrapAdmission(ctx)
+	if !errors.Is(err, factoryErr) {
+		t.Fatalf("bootstrapAdmission error = %v, want factory error", err)
+	}
+	if got := closes.Load(); got != 1 {
+		t.Fatalf("runtime closes = %d, want 1", got)
+	}
+	if server.admissionRuntime != nil {
+		t.Fatal("admissionRuntime retained after factory failure")
+	}
+}
+
+func TestRecoveryOnlyClosesRuntimeOnSuccessAndFailure(t *testing.T) {
+	ctx := context.Background()
+
+	successServer, successRoot, successCWD := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmission(t, successServer, newAdmissionFakeLaunchCustodian(t))
+	if err := successServer.closeServeAdmission(); err != nil {
+		t.Fatal(err)
+	}
+	successRecovery := newTestServerAtRoot(t, successRoot, successCWD, newFakeBackend("fake"))
+	var successCloses atomic.Int64
+	successRecovery.admissionRuntime = closeCountingServedAdmissionRuntime(t, &successCloses, admissionSupportForClass(t, custodian.SupportAvailable, true, 1))
+	if _, err := successRecovery.recoverAdmissionRoot(ctx); err != nil {
+		t.Fatalf("recovery-only success error = %v", err)
+	}
+	if got := successCloses.Load(); got != 1 {
+		t.Fatalf("success runtime closes = %d, want 1", got)
+	}
+	if successRecovery.admissionRuntime != nil {
+		t.Fatal("admissionRuntime retained after recovery-only success")
+	}
+
+	failureServer, failureRoot, failureCWD := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmission(t, failureServer, newAdmissionFakeLaunchCustodian(t))
+	if err := failureServer.closeServeAdmission(); err != nil {
+		t.Fatal(err)
+	}
+	failureRecovery := newTestServerAtRoot(t, failureRoot, failureCWD, newFakeBackend("fake"))
+	var failureCloses atomic.Int64
+	failureRecovery.admissionRuntime = closeCountingServedAdmissionRuntime(t, &failureCloses, admissionSupportForClass(t, custodian.SupportUnsupported, true, 1))
+	_, err := failureRecovery.recoverAdmissionRoot(ctx)
+	if !errors.Is(err, ErrAdmissionStrictSupportUnavailable) {
+		t.Fatalf("recovery-only failure error = %v, want ErrAdmissionStrictSupportUnavailable", err)
+	}
+	if got := failureCloses.Load(); got != 1 {
+		t.Fatalf("failure runtime closes = %d, want 1", got)
+	}
+	if failureRecovery.admissionRuntime != nil {
+		t.Fatal("admissionRuntime retained after recovery-only failure")
+	}
+}
+
+func TestServeRejectsConsumedInjectedRuntime(t *testing.T) {
+	ctx := context.Background()
+	var closes atomic.Int64
+	runtime := custodian.NewUnavailableRuntimeForTest(custodian.ErrSupervisorUnavailable, func() error {
+		closes.Add(1)
+		return nil
+	})
+	server := newUnstartedTestServerWithRuntime(t, runtime)
+	listenErr := errors.New("listen reached")
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		return nil, socketFileIdentity{}, listenErr
+	}
+
+	if err := server.Serve(ctx); !errors.Is(err, listenErr) {
+		t.Fatalf("first Serve error = %v, want listen error", err)
+	}
+	if !runtime.Consumed() {
+		t.Fatal("runtime was not marked consumed after first Serve close")
+	}
+	err := server.Serve(ctx)
+	if !errors.Is(err, ErrRuntimeConsumed) {
+		t.Fatalf("second Serve error = %v, want ErrRuntimeConsumed", err)
+	}
+	if got := closes.Load(); got != 1 {
+		t.Fatalf("runtime closes = %d, want 1", got)
+	}
+}
+
+func TestServeAllowsRepeatedUnavailableRuntime(t *testing.T) {
+	ctx := context.Background()
+	server := newUnstartedTestServerWithRuntime(t, custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable))
+	var calls atomic.Int64
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		return nil, socketFileIdentity{}, fmt.Errorf("listen reached %d", calls.Add(1))
+	}
+
+	if err := server.Serve(ctx); err == nil || !strings.Contains(err.Error(), "listen reached 1") {
+		t.Fatalf("first Serve error = %v, want first listen error", err)
+	}
+	if err := server.Serve(ctx); err == nil || !strings.Contains(err.Error(), "listen reached 2") {
+		t.Fatalf("second Serve error = %v, want second listen error", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("listener calls = %d, want 2", got)
+	}
+}
+
 func TestSealedRootServeFailsTypedBeforeListen(t *testing.T) {
 	ctx := context.Background()
 	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
@@ -419,6 +548,45 @@ func TestSealedRootServeFailsTypedBeforeListen(t *testing.T) {
 	if !errors.Is(err, authority.ErrRootSealed) {
 		t.Fatalf("Serve sealed root error = %v, want ErrRootSealed", err)
 	}
+}
+
+type nilProbeBackend struct {
+	*fakeBackend
+}
+
+func (b *nilProbeBackend) ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error) {
+	return nil, nil
+}
+
+func closeCountingServedAdmissionRuntime(t *testing.T, closes *atomic.Int64, support custodian.Support) *servedAdmissionRuntime {
+	t.Helper()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	return &servedAdmissionRuntime{
+		runtime: custodian.NewUnavailableRuntimeForTest(custodian.ErrSupervisorUnavailable, func() error {
+			closes.Add(1)
+			return nil
+		}),
+		launchCustodian:  launcher,
+		supportOverride:  &support,
+		verifierOverride: launcher.verifier,
+	}
+}
+
+func newUnstartedTestServerWithRuntime(t *testing.T, runtime custodian.Runtime) *Server {
+	t.Helper()
+	server, err := New(Config{
+		StateRoot:    shortTempDir(t),
+		CWD:          shortTempDir(t),
+		Token:        "test-token",
+		Backends:     []engine.Backend{newFakeBackend("fake")},
+		ProcessTable: mapProcessTable{entries: map[int]engine.ProcessInfo{os.Getpid(): {PID: os.Getpid(), StartTime: "daemon-start"}}},
+		IdleTimeout:  -1,
+		Runtime:      runtime,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server
 }
 
 func configureAdmissionSupport(t *testing.T, server *Server, launcher *admissionFakeLaunchCustodian, class custodian.SupportClass, cleanupSafe bool, retryProbe bool) {

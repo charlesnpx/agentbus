@@ -294,6 +294,19 @@ func (r *Repository) InjectCorruptSafetyForTest(jobID model.JobID, diagnostic st
 	}
 }
 
+func (r *Repository) InjectMissingMetaForTest() {
+	err := r.db.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists(bucketMeta)
+		if err != nil {
+			return err
+		}
+		return bucket.Delete(keyMeta)
+	})
+	if err != nil {
+		panic(err)
+	}
+}
+
 func (r *Repository) initialize() error {
 	return r.db.Update(func(tx *bolt.Tx) error {
 		for _, name := range bucketNames {
@@ -643,7 +656,7 @@ func (tx *writeTx) PutMeta(meta repository.AuthorityMeta) error {
 		return err
 	}
 	current := tx.state.metaRecord()
-	if err := repository.ValidateAuthorityMetaPut(current, meta, tx.state.generation, tx.state.nextJobSequence); err != nil {
+	if err := repository.ValidateAuthorityMetaPut(current, meta, tx.state.generation, tx.state.nextJobSequence, tx.state.rootStats()); err != nil {
 		return err
 	}
 	if current.State == repository.RecordValid && reflect.DeepEqual(current.Value, meta) {

@@ -261,8 +261,10 @@ type runtimeState struct {
 	selfTest func(context.Context, AttestationVerifier) SupportAssessment
 	close    func() error
 
-	closeOnce sync.Once
-	closeErr  error
+	reusableAfterClose bool
+	closed             bool
+	closeOnce          sync.Once
+	closeErr           error
 }
 
 func NewUnavailableRuntime(reason error) Runtime {
@@ -293,13 +295,18 @@ func NewUnavailableRuntime(reason error) Runtime {
 		process:  UnavailableCustodian{},
 		verifier: verifier,
 		state: &runtimeState{
-			support:  support,
-			platform: runtime.GOOS,
-			selfTest: func(context.Context, AttestationVerifier) SupportAssessment {
-				return support.Assessment
-			},
+			support:            support,
+			platform:           runtime.GOOS,
+			reusableAfterClose: true,
 		},
 	}
+}
+
+func NewUnavailableRuntimeForTest(reason error, close func() error) Runtime {
+	runtime := NewUnavailableRuntime(reason)
+	runtime.state.close = close
+	runtime.state.reusableAfterClose = false
+	return runtime
 }
 
 func (runtime Runtime) Process() ProcessCustodian {
@@ -345,6 +352,28 @@ func (runtime Runtime) SelfTest(ctx context.Context) Support {
 	return support
 }
 
+func (runtime Runtime) Closed() bool {
+	if runtime.state == nil {
+		return false
+	}
+	runtime.state.mu.Lock()
+	defer runtime.state.mu.Unlock()
+	return runtime.state.closed
+}
+
+func (runtime Runtime) ReusableAfterClose() bool {
+	if runtime.state == nil {
+		return true
+	}
+	runtime.state.mu.Lock()
+	defer runtime.state.mu.Unlock()
+	return runtime.state.reusableAfterClose
+}
+
+func (runtime Runtime) Consumed() bool {
+	return runtime.Closed() && !runtime.ReusableAfterClose()
+}
+
 func (runtime Runtime) Close() error {
 	if runtime.state == nil {
 		return nil
@@ -353,6 +382,11 @@ func (runtime Runtime) Close() error {
 		if runtime.state.close != nil {
 			runtime.state.closeErr = runtime.state.close()
 		}
+		runtime.state.mu.Lock()
+		if !runtime.state.reusableAfterClose {
+			runtime.state.closed = true
+		}
+		runtime.state.mu.Unlock()
 	})
 	return runtime.state.closeErr
 }

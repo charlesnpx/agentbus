@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -23,12 +24,19 @@ const (
 var adminOpenTimeout = 10 * time.Second
 
 var (
+	initializeAdmissionRootAfterOpenForTest func() error
+	sealAdmissionRootAfterNewInitForTest    func() error
+)
+
+var (
 	ErrRootNotEmpty                      = errors.New("authority root is not empty")
 	ErrRootBusy                          = errors.New("authority root busy")
 	ErrSealConfirmationRequired          = errors.New("authority seal confirmation required")
 	ErrClearFailStopConfirmationRequired = errors.New("authority clear fail-stop confirmation required")
 	ErrRootHasRecoveryObligations        = errors.New("authority root has recovery obligations")
 	ErrNewStateRootNotEmpty              = errors.New("authority new state root is not empty")
+	ErrNewStateRootPristineRetry         = errors.New("authority new state root pristine destination requires deletion before retry")
+	ErrNewStateRootPartialCleanup        = errors.New("authority new state root partial cleanup failed")
 )
 
 type RootInspection struct {
@@ -53,6 +61,44 @@ func (e RootNotEmptyError) Error() string {
 
 func (e RootNotEmptyError) Is(target error) bool {
 	return target == ErrRootNotEmpty
+}
+
+type PristineNewStateRootError struct {
+	StateRoot  string
+	Inspection RootInspection
+}
+
+func (e PristineNewStateRootError) Error() string {
+	return fmt.Sprintf("%s: %s (delete this pristine destination and retry)", ErrNewStateRootPristineRetry, e.StateRoot)
+}
+
+func (e PristineNewStateRootError) Is(target error) bool {
+	return target == ErrNewStateRootPristineRetry
+}
+
+type PartialNewStateRootCleanupError struct {
+	StateRoot string
+	Leftover  []string
+	Cause     error
+}
+
+func (e PartialNewStateRootCleanupError) Error() string {
+	message := fmt.Sprintf("%s: %s", ErrNewStateRootPartialCleanup, e.StateRoot)
+	if len(e.Leftover) != 0 {
+		message += ": leftover paths: " + strings.Join(e.Leftover, ", ")
+	}
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e PartialNewStateRootCleanupError) Is(target error) bool {
+	return target == ErrNewStateRootPartialCleanup
+}
+
+func (e PartialNewStateRootCleanupError) Unwrap() error {
+	return e.Cause
 }
 
 type SealOptions struct {
@@ -248,9 +294,6 @@ func SealAdmissionRoot(ctx context.Context, stateRoot string, options SealOption
 		return SealReport{}, ErrSealConfirmationRequired
 	}
 	newStateRoot := filepath.Clean(options.NewStateRoot)
-	if err := requireEmptyStateRoot(newStateRoot); err != nil {
-		return SealReport{}, err
-	}
 	repo, err := openWritableAdmissionRepository(stateRoot)
 	if err != nil {
 		return SealReport{}, err
@@ -265,7 +308,7 @@ func SealAdmissionRoot(ctx context.Context, stateRoot string, options SealOption
 		return SealReport{OldRoot: stateRoot, OldInspection: before}, fmt.Errorf("%w: %d", ErrRootHasRecoveryObligations, before.Counts.RecoveryObligations)
 	}
 	if before.Sealed {
-		newInspection, err := initializeAdmissionRoot(ctx, newStateRoot, AdmissionRootMetadata{ContractVersion: before.ActivationMetadata.ContractVersion})
+		newInspection, err := initializeOrReuseFreshSealDestination(ctx, newStateRoot, before.ActivationMetadata.ContractVersion)
 		if err != nil {
 			return SealReport{}, err
 		}
@@ -277,6 +320,32 @@ func SealAdmissionRoot(ctx context.Context, stateRoot string, options SealOption
 			NewDomainUUID: newInspection.DomainUUID,
 			NewInspection: newInspection,
 		}, nil
+	}
+	// Retry policy after a crash between durable new-root initialization and
+	// old-root seal: the old root is still unsealed and serviceable, so a
+	// pristine fresh destination is not reused implicitly. Delete the named
+	// pristine destination and retry; already-sealed old-root replays accept
+	// that same valid destination as an idempotent success.
+	if err := requireEmptySealDestination(ctx, newStateRoot, before.ActivationMetadata.ContractVersion); err != nil {
+		return SealReport{OldRoot: stateRoot, OldInspection: before}, err
+	}
+	newInspection, err := initializeAdmissionRoot(ctx, newStateRoot, AdmissionRootMetadata{ContractVersion: before.ActivationMetadata.ContractVersion})
+	if err != nil {
+		if cleanupErr := cleanupPartialAdmissionRoot(newStateRoot); cleanupErr != nil {
+			return SealReport{}, errors.Join(err, cleanupErr)
+		}
+		return SealReport{}, err
+	}
+	if sealAdmissionRootAfterNewInitForTest != nil {
+		if err := sealAdmissionRootAfterNewInitForTest(); err != nil {
+			return SealReport{
+				OldRoot:       stateRoot,
+				OldInspection: before,
+				NewRoot:       newStateRoot,
+				NewDomainUUID: newInspection.DomainUUID,
+				NewInspection: newInspection,
+			}, err
+		}
 	}
 	_, anchorPath, err := admissionRootPaths(stateRoot)
 	if err != nil {
@@ -320,10 +389,6 @@ func SealAdmissionRoot(ctx context.Context, stateRoot string, options SealOption
 		return SealReport{}, err
 	}
 	oldInspection, err = attachAnchorInspection(oldInspection, anchorPath, schemaMajor)
-	if err != nil {
-		return SealReport{}, err
-	}
-	newInspection, err := initializeAdmissionRoot(ctx, newStateRoot, AdmissionRootMetadata{ContractVersion: before.ActivationMetadata.ContractVersion})
 	if err != nil {
 		return SealReport{}, err
 	}
@@ -376,6 +441,11 @@ func initializeAdmissionRoot(ctx context.Context, stateRoot string, metadata Adm
 		return RootInspection{}, err
 	}
 	defer repo.Close()
+	if initializeAdmissionRootAfterOpenForTest != nil {
+		if err := initializeAdmissionRootAfterOpenForTest(); err != nil {
+			return RootInspection{}, err
+		}
+	}
 	if metadata != (AdmissionRootMetadata{}) {
 		if _, err := repo.Update(ctx, func(tx repository.WriteTx) error {
 			metaRecord := tx.Meta()
@@ -406,6 +476,134 @@ func initializeAdmissionRoot(ctx context.Context, stateRoot string, metadata Adm
 		return RootInspection{}, err
 	}
 	return attachAnchorInspection(inspection, anchorPath, schemaMajor)
+}
+
+func initializeOrReuseFreshSealDestination(ctx context.Context, stateRoot string, contractVersion uint16) (RootInspection, error) {
+	if err := requireEmptyStateRoot(stateRoot); err == nil {
+		return initializeAdmissionRoot(ctx, stateRoot, AdmissionRootMetadata{ContractVersion: contractVersion})
+	} else if !errors.Is(err, ErrNewStateRootNotEmpty) {
+		return RootInspection{}, err
+	}
+	inspection, err := inspectPristineFreshSealDestination(ctx, stateRoot, contractVersion)
+	if err != nil {
+		return RootInspection{}, fmt.Errorf("%w: %s", ErrNewStateRootNotEmpty, stateRoot)
+	}
+	return inspection, nil
+}
+
+func requireEmptySealDestination(ctx context.Context, stateRoot string, contractVersion uint16) error {
+	if err := requireEmptyStateRoot(stateRoot); err == nil {
+		return nil
+	} else if !errors.Is(err, ErrNewStateRootNotEmpty) {
+		return err
+	}
+	inspection, err := inspectPristineFreshSealDestination(ctx, stateRoot, contractVersion)
+	if err == nil {
+		return PristineNewStateRootError{StateRoot: stateRoot, Inspection: inspection}
+	}
+	return fmt.Errorf("%w: %s", ErrNewStateRootNotEmpty, stateRoot)
+}
+
+func inspectPristineFreshSealDestination(ctx context.Context, stateRoot string, contractVersion uint16) (RootInspection, error) {
+	inspection, err := InspectAdmissionRoot(ctx, stateRoot)
+	if err != nil {
+		return RootInspection{}, err
+	}
+	if !inspection.Counts.Empty() {
+		return RootInspection{}, RootNotEmptyError{Counts: inspection.Counts}
+	}
+	if inspection.Sealed {
+		return RootInspection{}, fmt.Errorf("%w: destination is sealed", ErrNewStateRootNotEmpty)
+	}
+	if inspection.ActivationMetadata.Activated || inspection.ActivationMetadata.ActivatedAtGen != 0 {
+		return RootInspection{}, fmt.Errorf("%w: destination is activated", ErrNewStateRootNotEmpty)
+	}
+	if inspection.ActivationMetadata.ContractVersion != contractVersion {
+		return RootInspection{}, fmt.Errorf("%w: destination contract version %d does not match %d", ErrNewStateRootNotEmpty, inspection.ActivationMetadata.ContractVersion, contractVersion)
+	}
+	if inspection.AnchorPhase != "" || inspection.FailStopped {
+		return RootInspection{}, fmt.Errorf("%w: destination anchor phase %q is not pristine", ErrNewStateRootNotEmpty, inspection.AnchorPhase)
+	}
+	if err := requireOnlyAdmissionRootFiles(stateRoot); err != nil {
+		return RootInspection{}, err
+	}
+	return inspection, nil
+}
+
+func requireOnlyAdmissionRootFiles(stateRoot string) error {
+	entries, err := os.ReadDir(stateRoot)
+	if err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		name := entry.Name()
+		switch name {
+		case AdmissionRepositoryFile, AdmissionAnchorFile:
+			seen[name] = true
+		default:
+			return fmt.Errorf("%w: unexpected destination entry %s", ErrNewStateRootNotEmpty, filepath.Join(stateRoot, name))
+		}
+	}
+	if !seen[AdmissionRepositoryFile] || !seen[AdmissionAnchorFile] {
+		return fmt.Errorf("%w: destination is missing pristine admission files", ErrNewStateRootNotEmpty)
+	}
+	return nil
+}
+
+func cleanupPartialAdmissionRoot(stateRoot string) error {
+	repoPath, anchorPath, err := admissionRootPaths(stateRoot)
+	if err != nil {
+		return err
+	}
+	candidates := []string{repoPath, anchorPath}
+	if matches, err := filepath.Glob(anchorPath + ".tmp-*"); err == nil {
+		candidates = append(candidates, matches...)
+	}
+	var cause error
+	seen := make(map[string]struct{}, len(candidates))
+	for _, path := range candidates {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cause = errors.Join(cause, fmt.Errorf("%s: %w", path, err))
+		}
+	}
+	if err := os.Remove(stateRoot); err != nil && !errors.Is(err, os.ErrNotExist) {
+		cause = errors.Join(cause, fmt.Errorf("%s: %w", stateRoot, err))
+	}
+	leftovers, leftoverErr := stateRootLeftovers(stateRoot)
+	if leftoverErr != nil {
+		cause = errors.Join(cause, leftoverErr)
+	}
+	if cause != nil || len(leftovers) != 0 {
+		return PartialNewStateRootCleanupError{StateRoot: stateRoot, Leftover: leftovers, Cause: cause}
+	}
+	return nil
+}
+
+func stateRootLeftovers(stateRoot string) ([]string, error) {
+	var leftovers []string
+	err := filepath.WalkDir(stateRoot, func(path string, d os.DirEntry, err error) error {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			leftovers = append(leftovers, path)
+			return nil
+		}
+		if path != stateRoot {
+			leftovers = append(leftovers, path)
+		}
+		return nil
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	sort.Strings(leftovers)
+	return leftovers, err
 }
 
 func requireEmptyStateRoot(stateRoot string) error {

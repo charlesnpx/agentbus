@@ -21,11 +21,25 @@ func (server *Server) recoverAdmissionRoot(ctx context.Context) (AdmissionRecove
 		return AdmissionRecoveryReport{}, authority.ErrNotReady
 	}
 	server.ensureSafetyLatch()
+	server.admissionStateMu.Lock()
 	runtime := server.admissionRuntime
 	if runtime == nil {
 		runtime = newServedAdmissionRuntime(server)
 		server.admissionRuntime = runtime
 	}
+	if runtime.consumed() {
+		server.admissionStateMu.Unlock()
+		return AdmissionRecoveryReport{}, ErrRuntimeConsumed
+	}
+	server.admissionStateMu.Unlock()
+	defer func() {
+		_ = runtime.close()
+		server.admissionStateMu.Lock()
+		if server.admissionRuntime == runtime {
+			server.admissionRuntime = nil
+		}
+		server.admissionStateMu.Unlock()
+	}()
 
 	factory := server.admissionBootstrapperFactory
 	if factory == nil {

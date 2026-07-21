@@ -1028,6 +1028,22 @@ func TestNativeCustodianDoesNotMintProofAndProductionUnavailable(t *testing.T) {
 	}
 }
 
+func TestUnavailableRuntimeSelfTestReturnsOriginalSupport(t *testing.T) {
+	reason := errors.New("sentinel unavailable runtime")
+	runtime := NewUnavailableRuntime(reason)
+	before := runtime.Support()
+	after := runtime.SelfTest(context.Background())
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("SelfTest support = %+v, want original %+v", after, before)
+	}
+	if current := runtime.Support(); !reflect.DeepEqual(current, before) {
+		t.Fatalf("Support after SelfTest = %+v, want original %+v", current, before)
+	}
+	if before.ImplementationCompiled {
+		t.Fatalf("ImplementationCompiled = true, want unavailable sentinel to remain uncompiled")
+	}
+}
+
 func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("C6 native runtime availability is Linux cgroup-v2 only")

@@ -30,5 +30,13 @@ func TestRepositoryContract(t *testing.T) {
 			}
 			memoryRepo.InjectCorruptSafetyForTest(jobID, diagnostic)
 		},
+		MissingMeta: func(t *testing.T, repo repository.Repository) {
+			t.Helper()
+			memoryRepo, ok := repo.(*Repository)
+			if !ok {
+				t.Fatalf("repo type = %T, want *memory.Repository", repo)
+			}
+			memoryRepo.InjectMissingMetaForTest()
+		},
 	})
 }

@@ -137,6 +137,10 @@ func (s *servedAdmissionRuntime) close() error {
 	return errors.Join(err, s.runtime.Close())
 }
 
+func (s *servedAdmissionRuntime) consumed() bool {
+	return s != nil && s.runtime.Consumed()
+}
+
 type runtimeLaunchCustodian struct {
 	runtime custodian.Runtime
 }

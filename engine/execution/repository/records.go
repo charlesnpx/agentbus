@@ -110,9 +110,15 @@ func (meta AuthorityMeta) Validate() error {
 	return nil
 }
 
-func ValidateAuthorityMetaPut(current Record[AuthorityMeta], next AuthorityMeta, currentGeneration, currentNextJobSequence uint64) error {
+func ValidateAuthorityMetaPut(current Record[AuthorityMeta], next AuthorityMeta, currentGeneration, currentNextJobSequence uint64, stats AuthorityRootStats) error {
 	if err := next.Validate(); err != nil {
 		return err
+	}
+	if current.State == RecordCorrupt {
+		return fmt.Errorf("%w: meta is corrupt: %s", ErrCorruptRecord, current.Diagnostic)
+	}
+	if current.State != RecordValid && !stats.Empty() {
+		return fmt.Errorf("%w: meta is %s on non-empty authority root: %s", ErrCorruptRecord, current.State, strings.Join(nonzeroAuthorityRootStats(stats), ", "))
 	}
 	if next.Generation != currentGeneration {
 		return fmt.Errorf("%w: meta generation %d does not match current generation %d", ErrInvalidRecord, next.Generation, currentGeneration)
@@ -139,13 +145,10 @@ func validateAuthorityMetaTransition(current, next AuthorityMeta, currentGenerat
 	if current.AdmissionRoot.ActivatedAtGen != 0 && next.AdmissionRoot.ActivatedAtGen != current.AdmissionRoot.ActivatedAtGen {
 		return fmt.Errorf("%w: admission_root.activated_at_gen is immutable once set", ErrInvalidRecord)
 	}
-	if current.AdmissionRoot.Activated && next.AdmissionRoot.ContractVersion != current.AdmissionRoot.ContractVersion {
-		return fmt.Errorf("%w: admission_root.contract_version is immutable once activated", ErrInvalidRecord)
+	if current.AdmissionRoot.ContractVersion != 0 && next.AdmissionRoot.ContractVersion != current.AdmissionRoot.ContractVersion {
+		return fmt.Errorf("%w: admission_root.contract_version is immutable once declared", ErrInvalidRecord)
 	}
 	if !current.AdmissionRoot.Activated && next.AdmissionRoot.Activated {
-		if current.AdmissionRoot.ContractVersion != 0 && next.AdmissionRoot.ContractVersion != current.AdmissionRoot.ContractVersion {
-			return fmt.Errorf("%w: admission_root.contract_version is immutable once declared", ErrInvalidRecord)
-		}
 		committedGeneration := currentGeneration + 1
 		if next.AdmissionRoot.ActivatedAtGen != committedGeneration {
 			return fmt.Errorf("%w: admission_root.activated_at_gen %d does not match activation commit generation %d", ErrInvalidRecord, next.AdmissionRoot.ActivatedAtGen, committedGeneration)
@@ -168,6 +171,29 @@ func (stats AuthorityRootStats) Empty() bool {
 		stats.Tombstones == 0 &&
 		stats.LaunchRecords == 0 &&
 		stats.RecoveryObligations == 0
+}
+
+func nonzeroAuthorityRootStats(stats AuthorityRootStats) []string {
+	var parts []string
+	if stats.Jobs != 0 {
+		parts = append(parts, fmt.Sprintf("jobs=%d", stats.Jobs))
+	}
+	if stats.Bindings != 0 {
+		parts = append(parts, fmt.Sprintf("bindings=%d", stats.Bindings))
+	}
+	if stats.Tombstones != 0 {
+		parts = append(parts, fmt.Sprintf("tombstones=%d", stats.Tombstones))
+	}
+	if stats.LaunchRecords != 0 {
+		parts = append(parts, fmt.Sprintf("launch_records=%d", stats.LaunchRecords))
+	}
+	if stats.RecoveryObligations != 0 {
+		parts = append(parts, fmt.Sprintf("recovery_obligations=%d", stats.RecoveryObligations))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "empty")
+	}
+	return parts
 }
 
 type Tombstone struct {
