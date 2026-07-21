@@ -1736,9 +1736,11 @@ func TestIdentifiedSubmitRejectsInvalidBackendSessionIDBeforeDurableAccept(t *te
 // Pins the REAL controlled-backend contract: CLI-adapter sessions have no id
 // at Start time (the backend stream assigns it during the first turn), so an
 // empty Session.ID() at submit MUST be accepted with a served-generated
-// admission session id — never rejected as a backend metadata defect. Success
-// also proves the fallback engaged: the authority's normalizeAcceptRequest
-// rejects empty session ids, so acceptance implies a valid id was supplied.
+// admission session id — never rejected as a backend metadata defect.
+// Acceptance alone does NOT prove the fallback engaged (projection metadata
+// treats the session id as an optional token, so an empty id would persist
+// silently); the durable projection is asserted to carry the generated
+// ses_-form id explicitly.
 func TestIdentifiedSubmitAcceptsEmptyBackendSessionIDWithGeneratedID(t *testing.T) {
 	t.Parallel()
 	backend := &invalidSessionIDBackend{fakeBackend: newFakeBackend("fake"), sessionID: ""}
@@ -1766,6 +1768,19 @@ func TestIdentifiedSubmitAcceptsEmptyBackendSessionIDWithGeneratedID(t *testing.
 	}
 	if got := backend.count.Load(); got != 1 {
 		t.Fatalf("backend starts = %d, want one", got)
+	}
+	// The proving assertion: the durable authority projection must carry the
+	// served-GENERATED session id — an empty id would validate (optional token)
+	// and persist silently if the fallback were removed.
+	_, projection, ok, errObj := server.authorityJobProjection(result.JobID)
+	if errObj != nil || !ok {
+		t.Fatalf("authority projection ok=%v err=%+v", ok, errObj)
+	}
+	if projection.SessionID == "" {
+		t.Fatal("projection session id empty: generated-id fallback did not engage")
+	}
+	if !strings.HasPrefix(projection.SessionID, "ses_") {
+		t.Fatalf("projection session id = %q, want served-generated ses_ form", projection.SessionID)
 	}
 }
 

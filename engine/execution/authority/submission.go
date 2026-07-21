@@ -23,8 +23,9 @@ type SubmissionCoordinator interface {
 	// recorded progress, preserving recorded outcomes, failing pre-authorization
 	// acceptances before authorization, and reaping authorized launches with no
 	// recorded outcome; contradictory or unverifiable physical evidence
-	// fail-stops instead of finalizing. In every case at-most-once holds and
-	// replay returns the terminal job.
+	// fail-stops instead of finalizing. At-most-once holds unconditionally;
+	// in every provable case replay returns the terminal job (a fail-stopped
+	// job has no terminal certificate to return until proven).
 	SubmitIdentified(context.Context, AcceptRequest) (AcceptResult, error)
 
 	// PrepareLegacyFenced prepares the fenced legacy launch before the response
