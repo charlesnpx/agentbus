@@ -49,20 +49,19 @@ func platformBindContainmentTarget(ctx context.Context, real RealContainment, gr
 	if err != nil {
 		return nil, err
 	}
-	if !required || real.RetainedObject != nil {
+	if !required {
 		return real, nil
 	}
-	manager, err := cgroup.New("")
-	if err != nil {
-		return nil, err
+	if real.RetainedObject == nil {
+		return nil, fmt.Errorf("%w: retained monitor leaf capability is missing", ErrNativeCustodianUnavailable)
 	}
-	capability, err := manager.AcquireRetainedGroupWithoutRootLease(ctx, group, time.Now())
+	capability, err := real.RetainedObject.AcquireRetainedGroup(ctx, group, time.Now())
 	if err != nil {
-		_ = manager.Close()
 		return nil, err
 	}
 	bound := RealContainment{
 		Params:         real.Params,
+		Witness:        real.Witness,
 		RetainedObject: boundRetainedGroupObject{capability: capability},
 	}
 	if witness, ok := capability.(containment.ContinuityWitness); ok {
@@ -78,6 +77,10 @@ func prepareNativeRuntimePlatformOptions(options NativeOptions) (NativeOptions, 
 	manager, err := cgroup.New("")
 	if err != nil {
 		return options, nil, err
+	}
+	if err := manager.HoldRootLease(context.Background()); err != nil {
+		closeErr := manager.Close()
+		return options, nil, errors.Join(err, closeErr)
 	}
 	options.newRetainedGroup = func() (containment.RetainedGroupObject, error) {
 		return manager, nil

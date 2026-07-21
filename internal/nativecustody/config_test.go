@@ -37,6 +37,7 @@ func TestProductionContainmentDefaultsMatchRuntimeOptions(t *testing.T) {
 		"--daemon-fd", strconv.Itoa(parklaunch.MonitorDaemonControlFD),
 		"--target-fd", strconv.Itoa(parklaunch.MonitorTargetFD),
 		"--ready-fd", strconv.Itoa(parklaunch.MonitorReadyFD),
+		"--leaf-fd", strconv.Itoa(parklaunch.MonitorLeafFD),
 	}
 	if !slices.Equal(options.MonitorCommand.Args, wantArgs) {
 		t.Fatalf("monitor args = %v, want %v", options.MonitorCommand.Args, wantArgs)

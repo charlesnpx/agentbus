@@ -26,6 +26,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/containment"
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
 	"github.com/charlesnpx/agentbus/internal/procgroup"
@@ -44,6 +45,7 @@ const (
 	nativeHelperAgentbusGOFLAGS      = "GOFLAGS=-mod=mod"
 	nativeHelperAgentbusGOPROXY      = "GOPROXY=off"
 	nativeHelperRetainedNoopMonitor  = "AGENTBUS_NATIVE_RETAINED_NOOP_MONITOR"
+	nativeHelperMonitorDelayReady    = "AGENTBUS_NATIVE_MONITOR_DELAY_READY_PATH"
 	nativeCgroupConformanceEnv       = "AGENTBUS_CGROUP_CONFORMANCE"
 )
 
@@ -1196,8 +1198,8 @@ func TestNativeRetainedWaitCompletesWithoutLeaderRetention(t *testing.T) {
 	if leaf.removeCalls != 1 || !leaf.removed {
 		t.Fatalf("leaf remove calls/removed = %d/%t, want 1/true", leaf.removeCalls, leaf.removed)
 	}
-	if leaf.rootLeaseReleases != 1 {
-		t.Fatalf("root lease releases = %d, want 1", leaf.rootLeaseReleases)
+	if leaf.rootLeaseReleases != 0 {
+		t.Fatalf("root lease releases = %d, want 0", leaf.rootLeaseReleases)
 	}
 	if leaf.termCalls != 0 || leaf.killCalls != 0 {
 		t.Fatalf("retained signal calls term/kill = %d/%d, want 0/0", leaf.termCalls, leaf.killCalls)
@@ -1882,6 +1884,7 @@ func nativeMonitorCommand(t *testing.T) parklaunch.CommandSpec {
 			"--daemon-fd", strconv.Itoa(parklaunch.MonitorDaemonControlFD),
 			"--target-fd", strconv.Itoa(parklaunch.MonitorTargetFD),
 			"--ready-fd", strconv.Itoa(parklaunch.MonitorReadyFD),
+			"--leaf-fd", strconv.Itoa(parklaunch.MonitorLeafFD),
 		},
 		Env: append(os.Environ(), nativeHelperEnv+"="+nativeHelperMonitor),
 		Dir: filepath.Dir(exe),
@@ -2647,6 +2650,7 @@ func runNativeMonitorHelper(args []string) int {
 	daemonFD := fs.Int("daemon-fd", -1, "daemon fd")
 	targetFD := fs.Int("target-fd", -1, "target fd")
 	readyFD := fs.Int("ready-fd", -1, "ready fd")
+	leafFD := fs.Int("leaf-fd", -1, "leaf fd")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -2656,6 +2660,20 @@ func runNativeMonitorHelper(args []string) int {
 	var containmentImpl parklaunch.Containment = RealContainment{Params: defaultNativeTestParams()}
 	if os.Getenv(nativeHelperRetainedNoopMonitor) == "1" {
 		containmentImpl = noopNativeMonitorContainment{}
+	} else {
+		if *leafFD < 3 {
+			return 2
+		}
+		containmentImpl = RealContainment{
+			Params:         defaultNativeTestParams(),
+			RetainedObject: cgroup.NewInheritedRetainedGroupObjectFromLeafFD(*leafFD),
+		}
+	}
+	if delayPath := os.Getenv(nativeHelperMonitorDelayReady); delayPath != "" {
+		containmentImpl = delayReadyNativeMonitorContainment{
+			inner: containmentImpl,
+			path:  delayPath,
+		}
 	}
 	err := parklaunch.RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, *readyFD, containmentImpl)
 	if err != nil {
@@ -2673,6 +2691,49 @@ func (noopNativeMonitorContainment) Contain(context.Context, model.GroupRef) err
 
 func (containment noopNativeMonitorContainment) BindContainmentTarget(context.Context, model.GroupRef) (parklaunch.Containment, error) {
 	return containment, nil
+}
+
+type delayReadyNativeMonitorContainment struct {
+	inner parklaunch.Containment
+	path  string
+}
+
+func (containment delayReadyNativeMonitorContainment) Contain(ctx context.Context, group model.GroupRef) error {
+	if containment.inner == nil {
+		return nil
+	}
+	return containment.inner.Contain(ctx, group)
+}
+
+func (containment delayReadyNativeMonitorContainment) BindContainmentTarget(ctx context.Context, group model.GroupRef) (parklaunch.Containment, error) {
+	bound := containment.inner
+	if binder, ok := bound.(parklaunch.TargetBindingContainment); ok {
+		next, err := binder.BindContainmentTarget(ctx, group)
+		if err != nil {
+			return nil, err
+		}
+		if next == nil {
+			return nil, fmt.Errorf("delayed monitor target binding returned nil")
+		}
+		bound = next
+	}
+	if err := os.WriteFile(containment.path+".entered", []byte("1\n"), 0o600); err != nil {
+		return nil, err
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(containment.path); errors.Is(err, os.ErrNotExist) {
+			return bound, nil
+		} else if err != nil {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func writeNativeBackendResult(path string, result nativeBackendResult) int {

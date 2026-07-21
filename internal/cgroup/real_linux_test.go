@@ -66,17 +66,50 @@ func TestRealFSRootLeaseFlockContentionIsTypedUnavailable(t *testing.T) {
 }
 
 func TestRealFSCgroupRootOpenAndLeaseErrorsStayTyped(t *testing.T) {
-	openErr := cgroupRootOpenError(unix.ENOENT)
-	if !errors.Is(openErr, ErrUnsupported) {
-		t.Fatalf("cgroupRootOpenError(ENOENT) = %v, want ErrUnsupported", openErr)
+	openTests := []struct {
+		err         error
+		retryable   bool
+		unsupported bool
+	}{
+		{err: unix.EMFILE, retryable: true},
+		{err: unix.ENFILE, retryable: true},
+		{err: unix.ENOMEM, retryable: true},
+		{err: unix.EINTR, retryable: true},
+		{err: unix.ENOLCK, unsupported: true},
+		{err: unix.ENOENT, unsupported: true},
+		{err: unix.EACCES, unsupported: true},
+		{err: unix.EPERM, unsupported: true},
 	}
-	openErr = cgroupRootOpenError(unix.EPERM)
-	if !errors.Is(openErr, ErrUnsupported) {
-		t.Fatalf("cgroupRootOpenError(EPERM) = %v, want ErrUnsupported", openErr)
+	for _, tt := range openTests {
+		openErr := cgroupRootOpenError(tt.err)
+		if got := errors.Is(openErr, ErrRootLeaseUnavailable); got != tt.retryable {
+			t.Fatalf("cgroupRootOpenError(%v) retryable = %t error=%v, want %t", tt.err, got, openErr, tt.retryable)
+		}
+		if got := errors.Is(openErr, ErrUnsupported); got != tt.unsupported {
+			t.Fatalf("cgroupRootOpenError(%v) unsupported = %t error=%v, want %t", tt.err, got, openErr, tt.unsupported)
+		}
 	}
-	leaseErr := cgroupRootLeaseAcquireError(unix.EPERM)
-	if !errors.Is(leaseErr, ErrUnsupported) || errors.Is(leaseErr, ErrRootLeaseUnavailable) {
-		t.Fatalf("cgroupRootLeaseAcquireError(EPERM) = %v, want ErrUnsupported only", leaseErr)
+
+	leaseTests := []struct {
+		err         error
+		retryable   bool
+		unsupported bool
+	}{
+		{err: unix.EAGAIN, retryable: true},
+		{err: unix.EWOULDBLOCK, retryable: true},
+		{err: unix.EINTR, retryable: true},
+		{err: unix.ENOLCK, unsupported: true},
+		{err: unix.EACCES, unsupported: true},
+		{err: unix.EPERM, unsupported: true},
+	}
+	for _, tt := range leaseTests {
+		leaseErr := cgroupRootLeaseAcquireError(tt.err)
+		if got := errors.Is(leaseErr, ErrRootLeaseUnavailable); got != tt.retryable {
+			t.Fatalf("cgroupRootLeaseAcquireError(%v) retryable = %t error=%v, want %t", tt.err, got, leaseErr, tt.retryable)
+		}
+		if got := errors.Is(leaseErr, ErrUnsupported); got != tt.unsupported {
+			t.Fatalf("cgroupRootLeaseAcquireError(%v) unsupported = %t error=%v, want %t", tt.err, got, leaseErr, tt.unsupported)
+		}
 	}
 }
 

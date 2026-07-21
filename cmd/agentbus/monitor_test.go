@@ -44,11 +44,13 @@ func TestParseInternalMonitorOptionsRejectsMalformedFDs(t *testing.T) {
 		want string
 	}{
 		{name: "missing", args: nil, want: "daemon fd must be >= 3"},
-		{name: "daemon low", args: []string{"--daemon-fd", "2", "--target-fd", "4", "--ready-fd", "5"}, want: "daemon fd must be >= 3"},
-		{name: "target low", args: []string{"--daemon-fd", "3", "--target-fd", "2", "--ready-fd", "5"}, want: "target fd must be >= 3"},
-		{name: "ready low", args: []string{"--daemon-fd", "3", "--target-fd", "4", "--ready-fd", "2"}, want: "ready fd must be >= 3"},
-		{name: "duplicate", args: []string{"--daemon-fd", "3", "--target-fd", "3", "--ready-fd", "5"}, want: "monitor fds must be distinct"},
-		{name: "positional", args: []string{"--daemon-fd", "3", "--target-fd", "4", "--ready-fd", "5", "extra"}, want: "internal-monitor does not accept positional arguments"},
+		{name: "daemon low", args: []string{"--daemon-fd", "2", "--target-fd", "4", "--ready-fd", "5", "--leaf-fd", "6"}, want: "daemon fd must be >= 3"},
+		{name: "target low", args: []string{"--daemon-fd", "3", "--target-fd", "2", "--ready-fd", "5", "--leaf-fd", "6"}, want: "target fd must be >= 3"},
+		{name: "ready low", args: []string{"--daemon-fd", "3", "--target-fd", "4", "--ready-fd", "2", "--leaf-fd", "6"}, want: "ready fd must be >= 3"},
+		{name: "leaf low", args: []string{"--daemon-fd", "3", "--target-fd", "4", "--ready-fd", "5", "--leaf-fd", "2"}, want: "leaf fd must be >= 3"},
+		{name: "duplicate", args: []string{"--daemon-fd", "3", "--target-fd", "3", "--ready-fd", "5", "--leaf-fd", "6"}, want: "monitor fds must be distinct"},
+		{name: "duplicate leaf", args: []string{"--daemon-fd", "3", "--target-fd", "4", "--ready-fd", "5", "--leaf-fd", "5"}, want: "monitor fds must be distinct"},
+		{name: "positional", args: []string{"--daemon-fd", "3", "--target-fd", "4", "--ready-fd", "5", "--leaf-fd", "6", "extra"}, want: "internal-monitor does not accept positional arguments"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -106,19 +108,25 @@ func TestInternalMonitorCommandContainsTargetOnDaemonEOF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	leafRead, leafWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer daemonWrite.Close()
 	defer targetWrite.Close()
 	defer readyRead.Close()
+	defer leafWrite.Close()
 
 	monitor := exec.CommandContext(ctx, agentbus,
 		internalMonitorCommand,
 		"--daemon-fd", strconv.Itoa(parklaunch.MonitorDaemonControlFD),
 		"--target-fd", strconv.Itoa(parklaunch.MonitorTargetFD),
 		"--ready-fd", strconv.Itoa(parklaunch.MonitorReadyFD),
+		"--leaf-fd", strconv.Itoa(parklaunch.MonitorLeafFD),
 	)
 	var stderr bytes.Buffer
 	monitor.Stderr = &stderr
-	monitor.ExtraFiles = []*os.File{daemonRead, targetRead, readyWrite}
+	monitor.ExtraFiles = []*os.File{daemonRead, targetRead, readyWrite, leafRead}
 	// Spawn the monitor as its own process-group leader, matching how
 	// parklaunch.StartMonitorProcess spawns it. Without this the monitor inherits
 	// the test process's group (PGID 1 inside a container PID namespace) and never
@@ -130,6 +138,7 @@ func TestInternalMonitorCommandContainsTargetOnDaemonEOF(t *testing.T) {
 	_ = daemonRead.Close()
 	_ = targetRead.Close()
 	_ = readyWrite.Close()
+	_ = leafRead.Close()
 	monitorDone := make(chan error, 1)
 	go func() {
 		monitorDone <- monitor.Wait()

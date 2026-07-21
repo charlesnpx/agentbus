@@ -152,6 +152,36 @@ func TestExclusiveLeaseAllowsOnlyOneManager(t *testing.T) {
 	}
 }
 
+func TestHoldRootLeaseOwnsLeaseUntilManagerClose(t *testing.T) {
+	lease := &fakeRootLease{}
+	firstFS := newFakeCgroupFS()
+	firstFS.lease = lease
+	secondFS := newFakeCgroupFS()
+	secondFS.lease = lease
+	first := newFakeManager(firstFS, leafSequence("cg-first"))
+	second := newFakeManager(secondFS, leafSequence("cg-second"))
+
+	if err := first.HoldRootLease(context.Background()); err != nil {
+		t.Fatalf("first HoldRootLease() error = %v", err)
+	}
+	if lease.holder != firstFS {
+		t.Fatalf("lease holder after first HoldRootLease() = %p, want first fs %p", lease.holder, firstFS)
+	}
+	err := second.HoldRootLease(context.Background())
+	if !errors.Is(err, ErrRootLeaseUnavailable) {
+		t.Fatalf("second HoldRootLease() error = %v, want ErrRootLeaseUnavailable", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if lease.holder != nil {
+		t.Fatalf("lease holder after first Close() = %p, want nil", lease.holder)
+	}
+	if err := second.HoldRootLease(context.Background()); err != nil {
+		t.Fatalf("second HoldRootLease() after close error = %v", err)
+	}
+}
+
 func TestManagerCloseReleasesExclusiveRootLease(t *testing.T) {
 	lease := &fakeRootLease{}
 	firstFS := newFakeCgroupFS()
@@ -585,7 +615,7 @@ func TestKillEmptiesThenRemoveRetiresLeafAfterEmptyProof(t *testing.T) {
 	}
 }
 
-func TestRemoveReacquiresRootLeaseAfterMonitorStyleAcquisition(t *testing.T) {
+func TestRemoveRequiresHeldRootLeaseAfterMonitorStyleAcquisition(t *testing.T) {
 	fs := newFakeCgroupFS()
 	fs.nameCleanupAllowed = true
 	manager := newFakeManager(fs, leafSequence("cg-monitor-cleanup"))
@@ -597,11 +627,12 @@ func TestRemoveReacquiresRootLeaseAfterMonitorStyleAcquisition(t *testing.T) {
 		t.Fatalf("lease holder after ReleaseRootLease() = %p, want nil", fs.lease.holder)
 	}
 
-	if err := capability.Remove(context.Background()); err != nil {
-		t.Fatalf("Remove() after root lease release error = %v", err)
+	err := capability.Remove(context.Background())
+	if !errors.Is(err, ErrRootLeaseUnavailable) {
+		t.Fatalf("Remove() after root lease release error = %v, want ErrRootLeaseUnavailable", err)
 	}
-	if fs.exists(capability.retainedID) {
-		t.Fatal("retained leaf still exists after Remove() reacquired root lease")
+	if !fs.exists(capability.retainedID) {
+		t.Fatal("retained leaf was removed without the held root lease")
 	}
 }
 

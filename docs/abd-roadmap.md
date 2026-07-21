@@ -284,7 +284,23 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
-- 2026-07-21 R3C (this commit): single-lease runtime qualification per C9/C6. NewNativeRuntime
+- 2026-07-21 R3C-fix2 (this commit): closed both R3C reviews' 4 High + 1 Med. F1/F2 (lease design, per
+  OS reviewer's prescription): delegated-root flock is now a TRUE custodian-lifetime owner lease —
+  ReleaseRootLease-at-bind DELETED; the monitor receives an INHERITED leaf-capability FD
+  (MonitorLeafFD=6, arg-strict --leaf-fd, identity re-verified; FD-ownership contract updated;
+  ExtraFiles); the monitor never touches the root flock; Remove no longer re-acquires (custodian
+  asserts its held root); contention is construction-time-only. Second-daemon qualification beside a
+  live launch is now impossible by construction, and cleanup can no longer defeat another launch's
+  monitor bind (deterministic two-launch conformance test added). F3: evidence-based self-test
+  classification (nativePrepareFailureEvidence — Prepare failures retry ONLY with proof of
+  no-creation-or-verified-cleanup, else SupportUnsafe). F4: contradictory Available (non-nil cause or
+  CleanupSafe=false) ⇒ SupportUnsafe with evidence joined. F5: flockRoot bounded EINTR retry;
+  EMFILE/ENFILE/ENOMEM/EINTR on root open classify retryable (typed), not permanent Unsupported.
+  Worker job_...000078 timed out at its final race rerun (acceptance green in its own log);
+  orchestrator audited all diffs + verified independently: macOS static/full/race=0; Docker cgroup-v2
+  conformance tier=0 (incl. two-launch handoff determinism + flagship self-test + monitor-EOF under
+  lifetime lease), full -p 1=0, race=0, R0T RED sentinel=0. 20 files +712/-103. sol verification next.
+- 2026-07-21 R3C (f439151): single-lease runtime qualification per C9/C6. NewNativeRuntime
   constructs ONE custodian, runs SelfTest on that instance through the PUBLIC path (Prepare hidden
   same-binary fixture internal-native-self-test-fixture via os.Executable → marker-absence not-exec'd
   proof → AbortAndVerify → attestation verify → verifySelfTestClean pgid+leaf absence), and the SAME

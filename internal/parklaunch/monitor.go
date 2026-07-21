@@ -20,14 +20,16 @@ const (
 	MonitorDaemonControlFD = 3
 	MonitorTargetFD        = 4
 	MonitorReadyFD         = 5
+	MonitorLeafFD          = 6
 )
 
 // MonitorProcessSpec describes a one-shot monitor process. The command must
 // call RunMonitorFromFDs with MonitorDaemonControlFD, MonitorTargetFD, and
-// MonitorReadyFD.
+// MonitorReadyFD. Native retained monitors also receive MonitorLeafFD.
 type MonitorProcessSpec struct {
-	Command CommandSpec
-	Stderr  io.Writer
+	Command       CommandSpec
+	Stderr        io.Writer
+	InheritedLeaf *os.File
 }
 
 type CommandSpec struct {
@@ -184,8 +186,14 @@ func (process *MonitorProcess) stopShared() error {
 }
 
 // StartMonitorProcess starts a one-shot monitor helper in its own process
-// group. It creates the daemon control pipe itself, gives only the read end to
-// the monitor, and returns the CLOEXEC writer to the daemon owner.
+// group. FD ownership across exec:
+//   - fd 3 daemon control read: child owned, CLOEXEC cleared for child only.
+//   - fd 4 target read: child owned, CLOEXEC cleared for child only.
+//   - fd 5 ready write: child owned, CLOEXEC cleared for child only.
+//   - fd 6 inherited leaf: child owned when provided, duplicate of daemon leaf
+//     capability, CLOEXEC cleared for this child only.
+//
+// Parent writers/readers remain CLOEXEC and are closed by MonitorProcess.
 func StartMonitorProcess(ctx context.Context, spec MonitorProcessSpec) (*MonitorProcess, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -220,6 +228,9 @@ func StartMonitorProcess(ctx context.Context, spec MonitorProcessSpec) (*Monitor
 	setCloseOnExec(targetWrite)
 	setCloseOnExec(readyRead)
 	setCloseOnExec(readyWrite)
+	if spec.InheritedLeaf != nil {
+		setCloseOnExec(spec.InheritedLeaf)
+	}
 
 	args := spec.Command.Args
 	if len(args) == 0 {
@@ -235,6 +246,9 @@ func StartMonitorProcess(ctx context.Context, spec MonitorProcessSpec) (*Monitor
 	cmd.Dir = spec.Command.Dir
 	cmd.Stderr = spec.Stderr
 	cmd.ExtraFiles = []*os.File{daemonRead, targetRead, readyWrite}
+	if spec.InheritedLeaf != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, spec.InheritedLeaf)
+	}
 	cmd.SysProcAttr = newProcessGroupSysProcAttr()
 	if err := cmd.Start(); err != nil {
 		_ = daemonRead.Close()
@@ -243,11 +257,17 @@ func StartMonitorProcess(ctx context.Context, spec MonitorProcessSpec) (*Monitor
 		_ = targetWrite.Close()
 		_ = readyRead.Close()
 		_ = readyWrite.Close()
+		if spec.InheritedLeaf != nil {
+			_ = spec.InheritedLeaf.Close()
+		}
 		return nil, err
 	}
 	_ = daemonRead.Close()
 	_ = targetRead.Close()
 	_ = readyWrite.Close()
+	if spec.InheritedLeaf != nil {
+		_ = spec.InheritedLeaf.Close()
+	}
 
 	startedProcess := cmd.Process
 	wait := startProcessWait(cmd)

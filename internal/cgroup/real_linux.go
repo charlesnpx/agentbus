@@ -12,7 +12,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/internal/containment"
 	"golang.org/x/sys/unix"
 )
 
@@ -43,16 +46,18 @@ type realFS struct {
 type realRoot struct {
 	fd       int
 	identity RootIdentity
+	leased   bool
 }
 
 type realObject struct {
-	rootPath string
-	leafName string
-	rootfd   int
-	leaffd   int
-	root     ObjectIdentity
-	leaf     ObjectIdentity
-	closed   bool
+	rootPath    string
+	leafName    string
+	rootfd      int
+	leaffd      int
+	root        ObjectIdentity
+	leaf        ObjectIdentity
+	closeRootFD bool
+	closed      bool
 }
 
 func (object *realObject) LeafName() string {
@@ -89,6 +94,11 @@ func (object *realObject) Close() error {
 		object.leaffd = -1
 	}
 	if object.rootfd >= 0 {
+		if object.closeRootFD {
+			if closeErr := unix.Close(object.rootfd); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+		}
 		object.rootfd = -1
 	}
 	return err
@@ -132,7 +142,7 @@ func (fs *realFS) releaseRootLease() error {
 	}
 	held := fs.held
 	fs.held = nil
-	return closeRootLease(held.fd, held.identity.Exclusive)
+	return closeRootLease(held.fd, held.leased)
 }
 
 func closeRootLease(rootfd int, leased bool) error {
@@ -278,7 +288,7 @@ func (fs *realFS) openAndLeaseRoot() (*realRoot, error) {
 		_ = closeRootLease(rootfd, exclusive)
 		return nil, fmt.Errorf("%w: incomplete cgroup domain identity", ErrUnsupported)
 	}
-	return &realRoot{fd: rootfd, identity: root}, nil
+	return &realRoot{fd: rootfd, identity: root, leased: exclusive}, nil
 }
 
 func (fs *realFS) CreateChild(ctx context.Context, name string) (cgroupObject, error) {
@@ -539,6 +549,131 @@ func (fs *realFS) openLeaf(rootfd int, name string) (int, error) {
 	return unix.Openat(rootfd, name, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 }
 
+func (capability *Capability) MonitorLeafFile(ctx context.Context) (*os.File, error) {
+	if capability == nil || capability.released || capability.removed {
+		return nil, fmt.Errorf("%w: cgroup capability is closed", ErrInvalid)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	realObject, ok := capability.object.(*realObject)
+	if !ok || realObject == nil || realObject.closed || realObject.leaffd < 0 {
+		return nil, fmt.Errorf("%w: cgroup capability is not backed by a real leaf fd", ErrUnsupported)
+	}
+	if err := capability.requireHeld(ctx); err != nil {
+		return nil, err
+	}
+	dupfd, err := unix.Dup(realObject.leaffd)
+	if err != nil {
+		return nil, err
+	}
+	unix.CloseOnExec(dupfd)
+	current, err := identityFromFD(dupfd)
+	if err != nil {
+		_ = unix.Close(dupfd)
+		return nil, err
+	}
+	if !realObject.leaf.durableEqual(current) {
+		_ = unix.Close(dupfd)
+		return nil, fmt.Errorf("%w: retained cgroup leaf identity changed before monitor inheritance", ErrUnsupported)
+	}
+	file := os.NewFile(uintptr(dupfd), "agentbus-retained-cgroup-leaf")
+	if file == nil {
+		_ = unix.Close(dupfd)
+		return nil, fmt.Errorf("%w: wrap retained cgroup leaf fd", ErrUnsupported)
+	}
+	return file, nil
+}
+
+type inheritedLeafRetainedObject struct {
+	leafFD int
+}
+
+func NewInheritedRetainedGroupObjectFromLeafFD(leafFD int) containment.RetainedGroupObject {
+	return inheritedLeafRetainedObject{leafFD: leafFD}
+}
+
+func (object inheritedLeafRetainedObject) AcquireRetainedGroup(ctx context.Context, target model.GroupRef, _ time.Time) (containment.RetainedGroupCapability, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if object.leafFD < 3 {
+		return nil, fmt.Errorf("%w: inherited cgroup leaf fd must be >= 3", ErrInvalid)
+	}
+	if err := target.Validate(); err != nil {
+		return nil, err
+	}
+	unix.CloseOnExec(object.leafFD)
+	descriptor, err := parseRetainedID(target.RetainedID)
+	if err != nil {
+		return nil, err
+	}
+	kernelDomain := target.KernelDomain()
+	if err := kernelDomain.Validate(); err != nil {
+		return nil, err
+	}
+
+	leaffd, err := unix.Dup(object.leafFD)
+	if err != nil {
+		return nil, err
+	}
+	unix.CloseOnExec(leaffd)
+	leafObject, err := identityFromFD(leaffd)
+	if err != nil {
+		_ = unix.Close(leaffd)
+		return nil, err
+	}
+	if !descriptor.leaf.durableEqual(leafObject) {
+		_ = unix.Close(leaffd)
+		return nil, fmt.Errorf("%w: inherited cgroup leaf identity mismatch", ErrUnsupported)
+	}
+	rootfd, err := unix.Openat(leaffd, "..", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		_ = unix.Close(leaffd)
+		return nil, err
+	}
+	rootObject, err := identityFromFD(rootfd)
+	if err != nil {
+		_ = unix.Close(rootfd)
+		_ = unix.Close(leaffd)
+		return nil, err
+	}
+	if !descriptor.root.durableEqual(rootObject) {
+		_ = unix.Close(rootfd)
+		_ = unix.Close(leaffd)
+		return nil, fmt.Errorf("%w: inherited cgroup root identity mismatch", ErrUnsupported)
+	}
+
+	rootPath := "inherited-cgroup-root:" + descriptor.root.stableToken()
+	fs := &realFS{
+		root: rootPath,
+		held: &realRoot{
+			fd: rootfd,
+			identity: RootIdentity{
+				RootObject: rootObject,
+				Exclusive:  true,
+			},
+			leased: false,
+		},
+	}
+	return &Capability{
+		fs:           fs,
+		terminator:   pidfdTerminator{},
+		retainedID:   target.RetainedID,
+		leafName:     descriptor.leafName,
+		kernelDomain: kernelDomain,
+		object: &realObject{
+			rootPath:    rootPath,
+			leafName:    descriptor.leafName,
+			rootfd:      rootfd,
+			leaffd:      leaffd,
+			root:        rootObject,
+			leaf:        leafObject,
+			closeRootFD: true,
+		},
+	}, nil
+}
+
 func (fs *realFS) realObject(ctx context.Context, object cgroupObject) (*realObject, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -682,7 +817,7 @@ func (fs *realFS) establishExclusiveDelegation(rootfd int) (bool, error) {
 	if stat.Uid != uint32(os.Geteuid()) || stat.Mode&0o022 != 0 {
 		return false, nil
 	}
-	if err := unix.Flock(rootfd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+	if err := flockRoot(rootfd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return false, cgroupRootLeaseAcquireError(err)
 	}
 	entries, err := readDirAt(rootfd)
@@ -706,6 +841,9 @@ func cgroupRootOpenError(err error) error {
 	if err == nil {
 		return nil
 	}
+	if retryableRootOpenError(err) {
+		return fmt.Errorf("%w: open delegated cgroup root temporarily unavailable: %v", ErrRootLeaseUnavailable, err)
+	}
 	return fmt.Errorf("%w: open delegated cgroup root: %v", ErrUnsupported, err)
 }
 
@@ -713,10 +851,28 @@ func cgroupRootLeaseAcquireError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+	if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EINTR) {
 		return fmt.Errorf("%w: acquire delegated cgroup root lease: %v", ErrRootLeaseUnavailable, err)
 	}
 	return fmt.Errorf("%w: acquire delegated cgroup root lease: %v", ErrUnsupported, err)
+}
+
+func retryableRootOpenError(err error) bool {
+	return errors.Is(err, unix.EMFILE) ||
+		errors.Is(err, unix.ENFILE) ||
+		errors.Is(err, unix.ENOMEM) ||
+		errors.Is(err, unix.EINTR)
+}
+
+func flockRoot(fd int, op int) error {
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		err = unix.Flock(fd, op)
+		if !errors.Is(err, unix.EINTR) {
+			return err
+		}
+	}
+	return err
 }
 
 func verifyRootHandle(rootfd int, expected ObjectIdentity) error {

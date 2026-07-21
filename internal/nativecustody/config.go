@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/containment"
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
 )
@@ -39,6 +40,7 @@ func MonitorCommand(exe string, env []string, dir string) parklaunch.CommandSpec
 			"--daemon-fd", strconv.Itoa(parklaunch.MonitorDaemonControlFD),
 			"--target-fd", strconv.Itoa(parklaunch.MonitorTargetFD),
 			"--ready-fd", strconv.Itoa(parklaunch.MonitorReadyFD),
+			"--leaf-fd", strconv.Itoa(parklaunch.MonitorLeafFD),
 		},
 		Env: append([]string(nil), env...),
 		Dir: dir,
@@ -65,6 +67,9 @@ func MonitorContainment() parklaunch.Containment {
 	return custodian.RealContainment{Params: ProductionContainmentParams()}
 }
 
-func RunMonitorFromFDs(ctx context.Context, daemonFD, targetFD, readyFD int) error {
-	return parklaunch.RunMonitorFromFDs(ctx, daemonFD, targetFD, readyFD, MonitorContainment())
+func RunMonitorFromFDs(ctx context.Context, daemonFD, targetFD, readyFD, leafFD int) error {
+	return parklaunch.RunMonitorFromFDs(ctx, daemonFD, targetFD, readyFD, custodian.RealContainment{
+		Params:         ProductionContainmentParams(),
+		RetainedObject: cgroup.NewInheritedRetainedGroupObjectFromLeafFD(leafFD),
+	})
 }

@@ -804,6 +804,10 @@ func (backend *fakeNativeHeldBackend) retainedObject() containment.RetainedGroup
 	return nil
 }
 
+func (backend *fakeNativeHeldBackend) monitorLeafFile(context.Context) (*os.File, error) {
+	return nil, nil
+}
+
 func (backend *fakeNativeHeldBackend) attachHandle(*parklaunch.ParkedHandle) {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()

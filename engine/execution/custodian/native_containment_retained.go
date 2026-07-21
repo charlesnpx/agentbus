@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -21,12 +22,12 @@ type retainedGroupPlacementCapability interface {
 	Remove(context.Context) error
 }
 
-type retainedGroupRootLeaseReleaser interface {
-	ReleaseRootLease() error
-}
-
 type retainedGroupProcessPlacementCapability interface {
 	PlaceProcess(context.Context, procgroup.ProcessClaim) error
+}
+
+type retainedGroupMonitorLeafFile interface {
+	MonitorLeafFile(context.Context) (*os.File, error)
 }
 
 type retainedNativeContainmentBackend struct {
@@ -108,11 +109,6 @@ func (backend *retainedNativeContainmentBackend) beforeMonitorBind(ctx context.C
 		return model.GroupRef{}, err
 	}
 	backend.group = bound
-	if releaser, ok := backend.capability.(retainedGroupRootLeaseReleaser); ok {
-		if err := releaser.ReleaseRootLease(); err != nil {
-			return model.GroupRef{}, fmt.Errorf("release retained root lease: %w", err)
-		}
-	}
 	backend.bound = true
 	return bound, nil
 }
@@ -140,6 +136,17 @@ func (backend *retainedNativeContainmentBackend) retainedObject() containment.Re
 		return nil
 	}
 	return backend.manager
+}
+
+func (backend *retainedNativeContainmentBackend) monitorLeafFile(ctx context.Context) (*os.File, error) {
+	if backend == nil || backend.capability == nil {
+		return nil, fmt.Errorf("%w: retained containment backend is nil", ErrNativeCustodianUnavailable)
+	}
+	provider, ok := backend.capability.(retainedGroupMonitorLeafFile)
+	if !ok || provider == nil {
+		return nil, nil
+	}
+	return provider.MonitorLeafFile(ctx)
 }
 
 func (backend *retainedNativeContainmentBackend) attachHandle(handle *parklaunch.ParkedHandle) {

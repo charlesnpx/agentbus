@@ -5,6 +5,7 @@ package custodian
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -76,6 +77,10 @@ func (backend *leaderNativeContainmentBackend) witnessAcquired() bool {
 
 func (backend *leaderNativeContainmentBackend) retainedObject() containment.RetainedGroupObject {
 	return nil
+}
+
+func (backend *leaderNativeContainmentBackend) monitorLeafFile(context.Context) (*os.File, error) {
+	return nil, nil
 }
 
 func (backend *leaderNativeContainmentBackend) attachHandle(handle *parklaunch.ParkedHandle) {

@@ -105,6 +105,7 @@ type nativeContainmentBackend interface {
 	witness() containment.ContinuityWitness
 	witnessAcquired() bool
 	retainedObject() containment.RetainedGroupObject
+	monitorLeafFile(context.Context) (*os.File, error)
 	attachHandle(*parklaunch.ParkedHandle)
 	leaderRetention() *leaderRetention
 	close(context.Context) error
@@ -510,7 +511,7 @@ func (custodian *NativeCustodian) cacheFinalized(process *NativeRunningProcess) 
 	}
 }
 
-func (custodian *NativeCustodian) parklaunchSpec(spec NativeLaunchSpec, releaseSecret parkproto.ReleaseSecret, launchContainment parklaunch.Containment, backend nativeContainmentBackend, syncLaunchContainment func()) (parklaunch.Spec, error) {
+func (custodian *NativeCustodian) parklaunchSpec(ctx context.Context, spec NativeLaunchSpec, releaseSecret parkproto.ReleaseSecret, launchContainment parklaunch.Containment, backend nativeContainmentBackend, syncLaunchContainment func()) (parklaunch.Spec, error) {
 	execSpec, err := parkprotoExecSpec(spec.Exec)
 	if err != nil {
 		return parklaunch.Spec{}, err
@@ -519,6 +520,10 @@ func (custodian *NativeCustodian) parklaunchSpec(spec NativeLaunchSpec, releaseS
 	if workerEnv == nil {
 		workerEnv = os.Environ()
 	}
+	monitorLeaf, err := backend.monitorLeafFile(ctx)
+	if err != nil {
+		return parklaunch.Spec{}, err
+	}
 	return parklaunch.Spec{
 		AgentbusPath:         custodian.options.AgentbusPath,
 		ExecSpec:             execSpec,
@@ -526,7 +531,7 @@ func (custodian *NativeCustodian) parklaunchSpec(spec NativeLaunchSpec, releaseS
 		LaunchKey:            spec.LaunchKey,
 		ReleaseSecret:        releaseSecret,
 		Containment:          launchContainment,
-		Monitor:              &parklaunch.MonitorProcessSpec{Command: custodian.options.MonitorCommand},
+		Monitor:              &parklaunch.MonitorProcessSpec{Command: custodian.options.MonitorCommand, InheritedLeaf: monitorLeaf},
 		RetainedID:           backend.retainedID(),
 		RetainLeaderUnreaped: backend.retainLeaderUnreaped(),
 		BeforeMonitorBind: func(ctx context.Context, group model.GroupRef) (model.GroupRef, error) {

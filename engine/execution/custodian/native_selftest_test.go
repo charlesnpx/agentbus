@@ -119,6 +119,111 @@ func TestNativeSelfTestClassificationTable(t *testing.T) {
 	})
 }
 
+func TestNativeSelfTestContradictoryAvailableIsUnsafe(t *testing.T) {
+	cause := errors.New("available result carried cause")
+	tests := []struct {
+		name   string
+		result nativeSelfTestAttemptResult
+	}{
+		{
+			name: "available with cause",
+			result: nativeSelfTestAttemptResult{
+				Class:       SupportAvailable,
+				Cause:       cause,
+				CleanupSafe: true,
+			},
+		},
+		{
+			name: "available with unsafe cleanup",
+			result: nativeSelfTestAttemptResult{
+				Class:       SupportAvailable,
+				CleanupSafe: false,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assessment := runClassifiedNativeSelfTest(context.Background(), 3, func(context.Context, int) nativeSelfTestAttemptResult {
+				return tt.result
+			})
+			if assessment.Class != SupportUnsafe || assessment.Attempts != 1 || assessment.CleanupSafe {
+				t.Fatalf("assessment = %+v, want unsafe attempts=1 cleanup unsafe", assessment)
+			}
+			if !errors.Is(assessment.Cause, ErrNativeRuntimeSelfTestUnsafe) {
+				t.Fatalf("assessment cause = %v, want ErrNativeRuntimeSelfTestUnsafe", assessment.Cause)
+			}
+			if tt.result.Cause != nil && !errors.Is(assessment.Cause, tt.result.Cause) {
+				t.Fatalf("assessment cause = %v, want preserved cause %v", assessment.Cause, tt.result.Cause)
+			}
+		})
+	}
+}
+
+func TestNativeSelfTestPrepareFailureEvidenceClassification(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		wantClass   SupportClass
+		cleanupSafe bool
+	}{
+		{
+			name:        "no creation is retryable",
+			err:         nativePrepareFailure(errors.New("process never created"), false, true),
+			wantClass:   SupportRetryable,
+			cleanupSafe: true,
+		},
+		{
+			name:        "created and cleanup verified is retryable",
+			err:         nativePrepareFailure(errors.New("created then cleaned"), true, true),
+			wantClass:   SupportRetryable,
+			cleanupSafe: true,
+		},
+		{
+			name:        "worker created then cleanup failure is unsafe",
+			err:         nativePrepareFailure(errors.New("worker created cleanup failed"), true, false),
+			wantClass:   SupportUnsafe,
+			cleanupSafe: false,
+		},
+		{
+			name:        "identity contradiction without evidence is unsafe",
+			err:         errors.New("identity contradiction after retained creation"),
+			wantClass:   SupportUnsafe,
+			cleanupSafe: false,
+		},
+		{
+			name:        "armed monitor cleanup failure is unsafe",
+			err:         nativePrepareFailure(errors.New("armed monitor cleanup failed"), true, false),
+			wantClass:   SupportUnsafe,
+			cleanupSafe: false,
+		},
+		{
+			name:        "cancellation mid prepare without cleanup proof is unsafe",
+			err:         errors.Join(context.Canceled, errors.New("prepare canceled after worker start")),
+			wantClass:   SupportUnsafe,
+			cleanupSafe: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := classifyNativeSelfTestPrepareFailure(tt.err)
+			if result.Class != tt.wantClass || result.CleanupSafe != tt.cleanupSafe {
+				t.Fatalf("classifyNativeSelfTestPrepareFailure() = %+v, want class=%s cleanupSafe=%t", result, tt.wantClass, tt.cleanupSafe)
+			}
+			if result.Cause == nil || !errors.Is(result.Cause, tt.err) {
+				t.Fatalf("classification cause = %v, want wrapped %v", result.Cause, tt.err)
+			}
+		})
+	}
+}
+
+func TestNativeRuntimeConstructionContentionIsSingleShotRetryable(t *testing.T) {
+	cause := fmt.Errorf("hold root lease: %w", cgroup.ErrRootLeaseUnavailable)
+	assessment := nativeRuntimeConstructionAssessment(cause)
+	if assessment.Class != SupportRetryable || assessment.Attempts != 1 || !assessment.CleanupSafe || !errors.Is(assessment.Cause, cgroup.ErrRootLeaseUnavailable) {
+		t.Fatalf("nativeRuntimeConstructionAssessment() = %+v, want retryable attempts=1 cleanup-safe ErrRootLeaseUnavailable", assessment)
+	}
+}
+
 func TestNativeSelfTestExecSpecUsesCurrentExecutable(t *testing.T) {
 	spec, markerPath, cleanup, err := nativeSelfTestExecSpec()
 	if err != nil {

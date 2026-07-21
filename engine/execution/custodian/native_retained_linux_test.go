@@ -5,6 +5,7 @@ package custodian
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -205,13 +206,10 @@ func TestNativeRetainedMonitorDaemonEOFContainsTargetGroup(t *testing.T) {
 	if result.GrandchildPGID != running.Ref().PGID {
 		t.Fatalf("grandchild pgid = %d, want target group %d", result.GrandchildPGID, running.Ref().PGID)
 	}
-	// Deliberately NO retained-membership assertion here: acquiring through the
-	// daemon-side shared manager would re-establish the delegated-root flock
-	// that beforeMonitorBind released, and the monitor subprocess's containment
-	// acquisition on daemon EOF would then fail EAGAIN. The production lease
-	// shape between monitor readiness and EOF containment is "daemon holds no
-	// root flock" — the test must preserve it. Group membership is already
-	// proven by the backend result file (PGID match above).
+	// The daemon may still hold the delegated-root flock here. The monitor must
+	// not acquire that flock on EOF containment; it already received an inherited
+	// retained leaf capability at spawn. Group membership is proven by the backend
+	// result file (PGID match above).
 
 	if err := running.handle.Monitor.DaemonControlWrite.Close(); err != nil {
 		t.Fatalf("close daemon control: %v", err)
@@ -228,6 +226,81 @@ func TestNativeRetainedMonitorDaemonEOFContainsTargetGroup(t *testing.T) {
 	waitPIDAbsent(t, result.GrandchildPID, 5*time.Second)
 	waitGroupAbsent(t, running.Ref(), 5*time.Second)
 	requireRetainedLeafGone(t, ctx, native, running.Ref())
+}
+
+func TestNativeRetainedLaunchReadyWhilePriorLaunchCleanupRuns(t *testing.T) {
+	requireLinuxRetainedConformanceOrSkip(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	native := newNativeCustodianForTest(t, defaultNativeTestParams())
+	specA, _ := nativeSimpleLaunchSpec(t)
+
+	runningA, err := native.Launch(ctx, specA)
+	if err != nil {
+		t.Fatalf("launch A error = %v", err)
+	}
+	defer cleanupNativeRunning(t, runningA)
+	if _, err := io.ReadAll(runningA.Stdout()); err != nil {
+		t.Fatalf("read launch A stdout: %v", err)
+	}
+
+	delayPath := filepath.Join(t.TempDir(), "hold-monitor-ready")
+	if err := os.WriteFile(delayPath, []byte("hold\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	native.options.MonitorCommand.Env = append(native.options.MonitorCommand.Env, nativeHelperMonitorDelayReady+"="+delayPath)
+	specB, _ := nativeSimpleLaunchSpec(t)
+	type prepareResult struct {
+		prepared PreparedProcess
+		err      error
+	}
+	preparedDone := make(chan prepareResult, 1)
+	go func() {
+		prepared, err := native.Prepare(ctx, specB.Exec, specB.LaunchKey)
+		preparedDone <- prepareResult{prepared: prepared, err: err}
+	}()
+	waitForFile(delayPath+".entered", 5*time.Second)
+
+	select {
+	case result := <-preparedDone:
+		t.Fatalf("launch B prepare completed before readiness delay released: prepared=%T err=%v", result.prepared, result.err)
+	default:
+	}
+	if _, err := runningA.Wait(ctx); err != nil {
+		t.Fatalf("launch A Wait() during launch B bind-before-ready window error = %v", err)
+	}
+	requireRetainedLeafGone(t, ctx, native, runningA.Ref())
+	if err := os.Remove(delayPath); err != nil {
+		t.Fatal(err)
+	}
+
+	var result prepareResult
+	select {
+	case result = <-preparedDone:
+	case <-ctx.Done():
+		t.Fatalf("launch B prepare did not complete after readiness delay released: %v", ctx.Err())
+	}
+	if result.err != nil {
+		t.Fatalf("launch B prepare error = %v", result.err)
+	}
+	if result.prepared == nil {
+		t.Fatal("launch B prepare returned nil prepared process")
+	}
+	refB := result.prepared.Ref()
+	if err := refB.Validate(); err != nil {
+		t.Fatalf("launch B prepared ref invalid: %v", err)
+	}
+	verified, cleanup, err := result.prepared.AbortAndVerify(ctx)
+	if err != nil {
+		t.Fatalf("launch B AbortAndVerify() error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("launch B AbortAndVerify() cleanup error = %v", cleanup.Err)
+	}
+	if verified == (VerifiedQuiescence{}) {
+		t.Fatal("launch B AbortAndVerify() returned zero attestation")
+	}
+	requireRetainedLeafGone(t, ctx, native, refB)
 }
 
 func requireRetainedBackendForTest(t *testing.T, running *NativeRunningProcess) {

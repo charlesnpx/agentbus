@@ -493,6 +493,24 @@ func (manager *Manager) AcquireRetainedGroupWithoutRootLease(ctx context.Context
 	return typed, nil
 }
 
+// HoldRootLease forces construction-time acquisition of the delegated cgroup
+// root. Retained capabilities share this owner lease until Manager.Close.
+func (manager *Manager) HoldRootLease(ctx context.Context) error {
+	if manager == nil || manager.fs == nil {
+		return fmt.Errorf("%w: manager is nil", ErrUnsupported)
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if manager.closed {
+		return fmt.Errorf("%w: manager is closed", ErrUnsupported)
+	}
+	root, err := manager.fs.RootIdentity(ctx)
+	if err != nil {
+		return err
+	}
+	return strictSupportError(root)
+}
+
 func (manager *Manager) ProveRetainedGroupAbsent(ctx context.Context, target model.GroupRef) error {
 	if manager == nil || manager.fs == nil {
 		return fmt.Errorf("%w: manager is nil", ErrUnsupported)
@@ -907,27 +925,10 @@ func (capability *Capability) removeLocked(ctx context.Context) error {
 	if membership != containment.RetainedMembershipEmpty {
 		return ErrPopulated
 	}
-	if err := capability.ensureRootLeaseForRemoveLocked(ctx); err != nil {
-		return err
-	}
 	if err := capability.fs.Remove(ctx, capability.object); err != nil {
 		return err
 	}
 	capability.removed = true
-	return nil
-}
-
-func (capability *Capability) ensureRootLeaseForRemoveLocked(ctx context.Context) error {
-	if capability == nil || capability.manager == nil || capability.fs == nil || capability.object == nil {
-		return nil
-	}
-	root, err := capability.fs.RootIdentity(ctx)
-	if err != nil {
-		return err
-	}
-	if !root.RootObject.durableEqual(capability.object.RootObject()) {
-		return fmt.Errorf("%w: cgroup root identity mismatch before remove", ErrUnsupported)
-	}
 	return nil
 }
 

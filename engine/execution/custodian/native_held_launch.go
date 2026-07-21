@@ -60,14 +60,15 @@ func prepareNativeHeldLaunch(ctx context.Context, custodian *NativeCustodian, sp
 		ctx = context.Background()
 	}
 	if custodian == nil {
-		return nil, fmt.Errorf("%w: custodian is nil", ErrNativeCustodianUnavailable)
+		err := fmt.Errorf("%w: custodian is nil", ErrNativeCustodianUnavailable)
+		return nil, nativePrepareFailure(err, false, true)
 	}
 	secret, err := generateNativeReleaseSecret()
 	if err != nil {
-		return nil, err
+		return nil, nativePrepareFailure(err, false, true)
 	}
 	if err := spec.Validate(); err != nil {
-		return nil, err
+		return nil, nativePrepareFailure(err, false, true)
 	}
 	effects := &nativeHeldLaunchEffects{
 		custodian:     custodian,
@@ -160,23 +161,26 @@ func (effects *nativeHeldLaunchEffects) Prepare(ctx context.Context, spec Prepar
 		ctx = context.Background()
 	}
 	if effects == nil || effects.custodian == nil {
-		return model.GroupRef{}, fmt.Errorf("%w: native held launch effects are nil", ErrNativeCustodianUnavailable)
+		err := fmt.Errorf("%w: native held launch effects are nil", ErrNativeCustodianUnavailable)
+		return model.GroupRef{}, nativePrepareFailure(err, false, true)
 	}
 	if spec.ReleaseSecret != effects.releaseSecret {
-		return model.GroupRef{}, fmt.Errorf("%w: native held launch release secret mismatch", ErrInvalidHeldLaunch)
+		err := fmt.Errorf("%w: native held launch release secret mismatch", ErrInvalidHeldLaunch)
+		return model.GroupRef{}, nativePrepareFailure(err, false, true)
 	}
 	nativeSpec := effects.spec
 	nativeSpec.Exec = spec.Exec
 	nativeSpec.LaunchKey = spec.LaunchKey
 	if err := nativeSpec.Validate(); err != nil {
-		return model.GroupRef{}, err
+		return model.GroupRef{}, nativePrepareFailure(err, false, true)
 	}
 
 	effects.custodian.mu.Lock()
 	closed := effects.custodian.closed
 	effects.custodian.mu.Unlock()
 	if closed {
-		return model.GroupRef{}, fmt.Errorf("%w: custodian is closed", ErrNativeCustodianUnavailable)
+		err := fmt.Errorf("%w: custodian is closed", ErrNativeCustodianUnavailable)
+		return model.GroupRef{}, nativePrepareFailure(err, false, true)
 	}
 
 	backend, err := newNativeContainmentBackend(ctx, effects.custodian)
@@ -195,26 +199,31 @@ func (effects *nativeHeldLaunchEffects) Prepare(ctx context.Context, spec Prepar
 			launchContainment.setRetainedObject(retainedObject)
 		}
 	}
-	parkSpec, err := effects.custodian.parklaunchSpec(nativeSpec, spec.ReleaseSecret, launchContainment, backend, syncLaunchContainment)
+	parkSpec, err := effects.custodian.parklaunchSpec(ctx, nativeSpec, spec.ReleaseSecret, launchContainment, backend, syncLaunchContainment)
 	if err != nil {
-		return model.GroupRef{}, errors.Join(err, backend.close(ctx))
+		closeErr := backend.close(ctx)
+		return model.GroupRef{}, nativePrepareFailure(errors.Join(err, closeErr), true, closeErr == nil)
 	}
 	prepared, err := parklaunch.Prepare(ctx, parkSpec)
 	if err != nil {
-		return model.GroupRef{}, errors.Join(err, backend.close(ctx))
+		closeErr := backend.close(context.WithoutCancel(ctx))
+		return model.GroupRef{}, nativePrepareFailure(errors.Join(err, closeErr), true, false)
 	}
 	if !backend.witnessAcquired() {
 		err := fmt.Errorf("%w: containment continuity witness was not acquired before native held prepare returned", ErrNativeCustodianUnavailable)
-		return model.GroupRef{}, errors.Join(err, prepared.ContainAndVerify(ctx), backend.close(ctx))
+		cleanupErr := errors.Join(prepared.ContainAndVerify(context.WithoutCancel(ctx)), backend.close(context.WithoutCancel(ctx)))
+		return model.GroupRef{}, nativePrepareFailure(errors.Join(err, cleanupErr), true, cleanupErr == nil)
 	}
 	ref := prepared.Ref()
 	if err := ref.Validate(); err != nil {
-		return model.GroupRef{}, errors.Join(err, prepared.ContainAndVerify(ctx), backend.close(ctx))
+		cleanupErr := errors.Join(prepared.ContainAndVerify(context.WithoutCancel(ctx)), backend.close(context.WithoutCancel(ctx)))
+		return model.GroupRef{}, nativePrepareFailure(errors.Join(err, cleanupErr), true, cleanupErr == nil)
 	}
 
 	entry := &nativeHeldPreparedLaunch{prepared: prepared, backend: backend}
 	if err := effects.registerPrepared(ref, entry); err != nil {
-		return model.GroupRef{}, errors.Join(err, prepared.ContainAndVerify(ctx), backend.close(ctx))
+		cleanupErr := errors.Join(prepared.ContainAndVerify(context.WithoutCancel(ctx)), backend.close(context.WithoutCancel(ctx)))
+		return model.GroupRef{}, nativePrepareFailure(errors.Join(err, cleanupErr), true, cleanupErr == nil)
 	}
 	return ref, nil
 }

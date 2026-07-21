@@ -44,11 +44,58 @@ type nativeSelfTestAttemptResult struct {
 
 type nativeSelfTestAttemptFunc func(context.Context, int) nativeSelfTestAttemptResult
 
+type nativePrepareFailureError struct {
+	cause           error
+	created         bool
+	cleanupVerified bool
+}
+
+func (err *nativePrepareFailureError) Error() string {
+	if err == nil || err.cause == nil {
+		return "native prepare failed"
+	}
+	return err.cause.Error()
+}
+
+func (err *nativePrepareFailureError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.cause
+}
+
+func nativePrepareFailure(cause error, created, cleanupVerified bool) error {
+	if cause == nil {
+		return nil
+	}
+	return &nativePrepareFailureError{
+		cause:           cause,
+		created:         created,
+		cleanupVerified: cleanupVerified,
+	}
+}
+
+func nativePrepareFailureEvidence(err error) (created bool, cleanupVerified bool, ok bool) {
+	var prepared *nativePrepareFailureError
+	if !errors.As(err, &prepared) || prepared == nil {
+		return false, false, false
+	}
+	return prepared.created, prepared.cleanupVerified, true
+}
+
 func nativeRuntimeConstructionAssessment(cause error) SupportAssessment {
 	if cause == nil {
 		return SupportAssessment{
 			Class:       SupportAvailable,
 			Attempts:    0,
+			CleanupSafe: true,
+		}
+	}
+	if errors.Is(cause, cgroup.ErrRootLeaseUnavailable) {
+		return SupportAssessment{
+			Class:       SupportRetryable,
+			Cause:       cause,
+			Attempts:    1,
 			CleanupSafe: true,
 		}
 	}
@@ -174,8 +221,14 @@ func runClassifiedNativeSelfTest(ctx context.Context, maxAttempts int, attempt n
 func normalizeNativeSelfTestAttemptResult(result nativeSelfTestAttemptResult) nativeSelfTestAttemptResult {
 	switch result.Class {
 	case SupportAvailable:
-		result.Cause = nil
-		result.CleanupSafe = true
+		if result.Cause != nil || !result.CleanupSafe {
+			result.Cause = errors.Join(
+				fmt.Errorf("%w: contradictory available self-test result", ErrNativeRuntimeSelfTestUnsafe),
+				result.Cause,
+			)
+			result.Class = SupportUnsafe
+			result.CleanupSafe = false
+		}
 	case SupportRetryable, SupportUnsupported, SupportUnsafe:
 		if result.Cause == nil {
 			result.Cause = fmt.Errorf("%w: missing self-test cause", ErrNativeRuntimeSelfTestUnsafe)
@@ -194,6 +247,17 @@ func nativeSelfTestLeaseContention(err error) bool {
 	return errors.Is(err, cgroup.ErrRootLeaseUnavailable)
 }
 
+func classifyNativeSelfTestPrepareFailure(err error) nativeSelfTestAttemptResult {
+	if nativeRuntimePlatformUnsupportedError(err) {
+		return unsupportedNativeSelfTest(fmt.Errorf("%w: %w", ErrNativeRuntimeUnsupported, err), true)
+	}
+	created, cleanupVerified, ok := nativePrepareFailureEvidence(err)
+	if ok && (!created || cleanupVerified) {
+		return retryableNativeSelfTest(fmt.Errorf("%w: prepare: %w", ErrNativeRuntimeSelfTestRetry, err), true)
+	}
+	return unsafeNativeSelfTest(fmt.Errorf("%w: prepare failed without verified cleanup: %w", ErrNativeRuntimeSelfTestUnsafe, err), false)
+}
+
 func (custodian *NativeCustodian) selfTestAttempt(ctx context.Context, verifier AttestationVerifier, attempt int) nativeSelfTestAttemptResult {
 	if custodian == nil {
 		return unsafeNativeSelfTest(fmt.Errorf("%w: custodian is nil", ErrNativeRuntimeSelfTestUnsafe), false)
@@ -206,10 +270,7 @@ func (custodian *NativeCustodian) selfTestAttempt(ctx context.Context, verifier 
 
 	prepared, err := custodian.Prepare(ctx, execSpec, nativeSelfTestLaunchKey(attempt))
 	if err != nil {
-		if nativeRuntimePlatformUnsupportedError(err) {
-			return unsupportedNativeSelfTest(fmt.Errorf("%w: %w", ErrNativeRuntimeUnsupported, err), true)
-		}
-		return retryableNativeSelfTest(fmt.Errorf("%w: prepare: %w", ErrNativeRuntimeSelfTestRetry, err), true)
+		return classifyNativeSelfTestPrepareFailure(err)
 	}
 	ref := prepared.Ref()
 	if err := ref.Validate(); err != nil {
