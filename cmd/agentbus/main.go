@@ -311,7 +311,7 @@ func (a *app) runAdmissionResetEmptyRoot(ctx context.Context, args []string, out
 func (a *app) runAdmissionSeal(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newAdmissionFlagSet("seal", errOut)
 	stateRoot := fs.String("state-root", "", "admission state root")
-	newStateRoot := fs.String("new-state-root", "", "new admission state root")
+	newStateRoot := fs.String("new-state-root", "", "new admission state root; parent directory must already exist")
 	startNew := fs.Bool("start-new-authority-domain", false, "acknowledge service must continue on a new state root/authority domain")
 	ackReplayReset := fs.Bool("acknowledge-replay-history-reset", false, "acknowledge cross-root request replay history is reset")
 	jsonOut := fs.Bool("json", false, "emit JSON admission seal report")
@@ -1046,7 +1046,7 @@ Admission administration:
   inspect:          read activation metadata, contract version, counts, domain UUID, and sealed flag; never mutates
   recover:          requires strict support; reconciles durable nonterminal obligations without opening a listener
   reset-empty-root: reinitializes only when jobs, bindings, tombstones, launch records, and recovery obligations are all zero
-  seal:             marks the old domain permanently closed for audit and requires both explicit acknowledgement flags
+  seal:             marks the old domain permanently closed for audit; --new-state-root must be a new leaf whose parent directory already exists
   clear-fail-stop:  clears a persisted unsafe fail-stop only after explicit operator diagnosis acknowledgement
 
 Multi-root read/cancel/result routing is out of scope in this first release.

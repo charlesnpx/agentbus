@@ -203,12 +203,44 @@ func loadFileAnchorSnapshot(path string) (AnchorSnapshot, error) {
 }
 
 func saveFileAnchorSnapshot(path string, snapshot AnchorSnapshot) error {
-	raw, err := json.Marshal(snapshot)
+	raw, err := marshalFileAnchorSnapshot(snapshot)
 	if err != nil {
 		return err
 	}
-	raw = append(raw, '\n')
 	return atomicWriteDurable(path, raw, 0o600)
+}
+
+func saveNewFileAnchorSnapshotExclusive(path string, snapshot AnchorSnapshot) (bool, error) {
+	raw, err := marshalFileAnchorSnapshot(snapshot)
+	if err != nil {
+		return false, err
+	}
+	return atomicWriteDurableExclusive(path, raw, 0o600)
+}
+
+func marshalFileAnchorSnapshot(snapshot AnchorSnapshot) ([]byte, error) {
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	raw = append(raw, '\n')
+	return raw, nil
+}
+
+func requireStartableFileAnchor(path, dbUUID string, schemaMajor uint16, generation uint64) (AnchorSnapshot, error) {
+	snapshot, err := loadFileAnchorSnapshot(path)
+	if err != nil {
+		return AnchorSnapshot{}, err
+	}
+	anchor := &fileAnchor{
+		path:        path,
+		dbUUID:      dbUUID,
+		schemaMajor: schemaMajor,
+	}
+	if err := anchor.requireStartable(snapshot, generation); err != nil {
+		return AnchorSnapshot{}, err
+	}
+	return snapshot, nil
 }
 
 func (a *fileAnchor) ensureIdentity(snapshot *AnchorSnapshot, generation uint64) error {
@@ -227,7 +259,23 @@ func (a *fileAnchor) ensureIdentity(snapshot *AnchorSnapshot, generation uint64)
 		}
 		return nil
 	}
-	if err := a.requireIdentity(*snapshot); err != nil {
+	if err := a.requireStartable(*snapshot, generation); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *fileAnchor) requireStartable(snapshot AnchorSnapshot, generation uint64) error {
+	if !snapshot.Initialized {
+		if err := a.validateIdentity(); err != nil {
+			return err
+		}
+		if generation != 0 {
+			return fmt.Errorf("%w: missing anchor for initialized db generation %d", ErrAnchorInvariant, generation)
+		}
+		return fmt.Errorf("%w: anchor is missing", ErrAnchorInvariant)
+	}
+	if err := a.requireIdentity(snapshot); err != nil {
 		return err
 	}
 	if snapshot.Generation > generation {
@@ -266,6 +314,14 @@ func atomicWriteDurable(path string, data []byte, mode os.FileMode) error {
 	return syncFileAndParent(path)
 }
 
+func atomicWriteDurableExclusive(path string, data []byte, mode os.FileMode) (bool, error) {
+	created, err := atomicWriteExclusive(path, data, mode)
+	if err != nil {
+		return created, err
+	}
+	return created, syncFileAndParent(path)
+}
+
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -295,6 +351,42 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	return os.Chmod(path, mode)
+}
+
+func atomicWriteExclusive(path string, data []byte, mode os.FileMode) (bool, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return false, err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return false, err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return false, err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return false, err
+	}
+	if err := tmp.Close(); err != nil {
+		return false, err
+	}
+	if _, err := os.Stat(path); err == nil {
+		return false, fmt.Errorf("%w: %s already exists", os.ErrExist, path)
+	} else if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+	// os.Link publishes the completed temp inode with O_EXCL-equivalent create
+	// semantics: a pre-existing anchor path fails with EEXIST instead of being
+	// overwritten, and the deferred temp removal leaves any foreign file intact.
+	if err := os.Link(tmpPath, path); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func syncFileAndParent(path string) error {

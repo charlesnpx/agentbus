@@ -25,8 +25,10 @@ const (
 var adminOpenTimeout = 10 * time.Second
 
 var (
-	initializeAdmissionRootAfterOpenForTest func() error
-	sealAdmissionRootAfterNewInitForTest    func() error
+	initializeAdmissionRootBeforeRepositoryCreateForTest func() error
+	initializeAdmissionRootAfterOpenForTest              func() error
+	initializeAdmissionRootBeforeAnchorCreateForTest     func() error
+	sealAdmissionRootAfterNewInitForTest                 func() error
 )
 
 var (
@@ -36,6 +38,7 @@ var (
 	ErrClearFailStopConfirmationRequired = errors.New("authority clear fail-stop confirmation required")
 	ErrRootHasRecoveryObligations        = errors.New("authority root has recovery obligations")
 	ErrNewStateRootNotEmpty              = errors.New("authority new state root is not empty")
+	ErrNewStateRootParentMissing         = errors.New("authority new state root parent missing")
 	ErrNewStateRootPristineRetry         = errors.New("authority new state root pristine destination requires deletion before retry")
 	ErrNewStateRootPartialCleanup        = errors.New("authority new state root partial cleanup failed")
 	ErrSealedSuccessorMismatch           = errors.New("authority sealed successor mismatch")
@@ -102,6 +105,31 @@ func (e PartialNewStateRootCleanupError) Is(target error) bool {
 }
 
 func (e PartialNewStateRootCleanupError) Unwrap() error {
+	return e.Cause
+}
+
+type NewStateRootParentMissingError struct {
+	StateRoot string
+	Parent    string
+	Cause     error
+}
+
+func (e NewStateRootParentMissingError) Error() string {
+	message := fmt.Sprintf("%s: parent directory of --new-state-root must already exist: %s", ErrNewStateRootParentMissing, e.Parent)
+	if e.StateRoot != "" {
+		message += fmt.Sprintf(" (new state root %s)", e.StateRoot)
+	}
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e NewStateRootParentMissingError) Is(target error) bool {
+	return target == ErrNewStateRootParentMissing
+}
+
+func (e NewStateRootParentMissingError) Unwrap() error {
 	return e.Cause
 }
 
@@ -510,7 +538,16 @@ func inspectSealedSuccessorDestination(ctx context.Context, stateRoot, expectedD
 			Cause:              fmt.Errorf("sealed root has no persisted successor domain UUID"),
 		}
 	}
-	inspection, err := InspectAdmissionRoot(ctx, stateRoot)
+	repo, err := openReadOnlyAdmissionRepository(stateRoot)
+	if err != nil {
+		return RootInspection{}, SealedSuccessorMismatchError{
+			StateRoot:          stateRoot,
+			ExpectedDomainUUID: expectedDomainUUID,
+			Cause:              err,
+		}
+	}
+	defer repo.Close()
+	inspection, err := InspectAdmissionRepository(ctx, repo)
 	if err != nil {
 		return RootInspection{}, SealedSuccessorMismatchError{
 			StateRoot:          stateRoot,
@@ -524,6 +561,36 @@ func inspectSealedSuccessorDestination(ctx context.Context, stateRoot, expectedD
 			ExpectedDomainUUID: expectedDomainUUID,
 			ActualDomainUUID:   inspection.DomainUUID,
 		}
+	}
+	_, anchorPath, err := admissionRootPaths(stateRoot)
+	if err != nil {
+		return RootInspection{}, SealedSuccessorMismatchError{
+			StateRoot:          stateRoot,
+			ExpectedDomainUUID: expectedDomainUUID,
+			Cause:              err,
+		}
+	}
+	_, schemaMajor, err := repo.AnchorIdentity()
+	if err != nil {
+		return RootInspection{}, SealedSuccessorMismatchError{
+			StateRoot:          stateRoot,
+			ExpectedDomainUUID: expectedDomainUUID,
+			Cause:              err,
+		}
+	}
+	snapshot, err := requireStartableFileAnchor(anchorPath, inspection.DomainUUID, schemaMajor, inspection.Generation)
+	if err != nil {
+		return RootInspection{}, SealedSuccessorMismatchError{
+			StateRoot:          stateRoot,
+			ExpectedDomainUUID: expectedDomainUUID,
+			ActualDomainUUID:   inspection.DomainUUID,
+			Cause:              err,
+		}
+	}
+	inspection.AnchorPhase = snapshot.Phase
+	if snapshot.Phase == "fail_stopped" {
+		inspection.FailStopped = true
+		inspection.FailStopReason = snapshot.Reason
 	}
 	return inspection, nil
 }
@@ -561,6 +628,13 @@ func reserveSealDestination(stateRoot string) (*admissionRootReservation, error)
 	if err := os.Mkdir(stateRoot, 0o700); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return nil, fmt.Errorf("%w: %s already exists; fresh rotation destination must not exist", ErrNewStateRootNotEmpty, stateRoot)
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, NewStateRootParentMissingError{
+				StateRoot: stateRoot,
+				Parent:    filepath.Dir(stateRoot),
+				Cause:     err,
+			}
 		}
 		return nil, err
 	}
@@ -615,11 +689,26 @@ func initializeAdmissionRootWithReservation(ctx context.Context, stateRoot strin
 	if err != nil {
 		return RootInspection{}, err
 	}
-	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+	if reservation != nil {
+		info, err := os.Stat(stateRoot)
+		if err != nil {
+			return RootInspection{}, err
+		}
+		if !info.IsDir() {
+			return RootInspection{}, fmt.Errorf("%w: reserved destination is not a directory: %s", ErrNewStateRootNotEmpty, stateRoot)
+		}
+	} else if err := os.MkdirAll(stateRoot, 0o700); err != nil {
 		return RootInspection{}, err
 	}
 	if reservation != nil {
-		reservation.addOwned(repoPath)
+		if initializeAdmissionRootBeforeRepositoryCreateForTest != nil {
+			if err := initializeAdmissionRootBeforeRepositoryCreateForTest(); err != nil {
+				return RootInspection{}, err
+			}
+		}
+		if err := createReservedAdmissionRepositoryFile(reservation, repoPath); err != nil {
+			return RootInspection{}, err
+		}
 	}
 	repo, err := bboltrepo.NewRepository(repoPath)
 	if err != nil {
@@ -659,14 +748,23 @@ func initializeAdmissionRootWithReservation(ctx context.Context, stateRoot strin
 		if err := reservation.requireOnlyOwnedEntries(); err != nil {
 			return RootInspection{}, err
 		}
-		reservation.addOwned(anchorPath)
+		if initializeAdmissionRootBeforeAnchorCreateForTest != nil {
+			if err := initializeAdmissionRootBeforeAnchorCreateForTest(); err != nil {
+				return RootInspection{}, err
+			}
+		}
 	}
-	if err := saveFileAnchorSnapshot(anchorPath, AnchorSnapshot{
+	snapshot := AnchorSnapshot{
 		Initialized: true,
 		DBUUID:      inspection.DomainUUID,
 		SchemaMajor: schemaMajor,
 		Generation:  inspection.Generation,
-	}); err != nil {
+	}
+	if reservation != nil {
+		if err := saveReservedFileAnchorSnapshot(reservation, anchorPath, snapshot); err != nil {
+			return RootInspection{}, err
+		}
+	} else if err := saveFileAnchorSnapshot(anchorPath, snapshot); err != nil {
 		return RootInspection{}, err
 	}
 	if reservation != nil {
@@ -675,6 +773,58 @@ func initializeAdmissionRootWithReservation(ctx context.Context, stateRoot strin
 		}
 	}
 	return attachAnchorInspection(inspection, anchorPath, schemaMajor)
+}
+
+func createReservedAdmissionRepositoryFile(reservation *admissionRootReservation, repoPath string) error {
+	if reservation == nil {
+		return errors.New("admission root reservation is required")
+	}
+	if err := requireReservedDestinationPathAbsent(repoPath); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(repoPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return foreignDestinationPathError(repoPath)
+		}
+		return err
+	}
+	reservation.addOwned(repoPath)
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func saveReservedFileAnchorSnapshot(reservation *admissionRootReservation, anchorPath string, snapshot AnchorSnapshot) error {
+	if reservation == nil {
+		return errors.New("admission root reservation is required")
+	}
+	created, err := saveNewFileAnchorSnapshotExclusive(anchorPath, snapshot)
+	if created {
+		reservation.addOwned(anchorPath)
+	}
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return foreignDestinationPathError(anchorPath)
+		}
+		return err
+	}
+	return nil
+}
+
+func requireReservedDestinationPathAbsent(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return foreignDestinationPathError(path)
+	} else if errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else {
+		return err
+	}
+}
+
+func foreignDestinationPathError(path string) error {
+	return fmt.Errorf("%w: foreign destination path already exists: %s", ErrNewStateRootNotEmpty, path)
 }
 
 func cleanupPartialAdmissionRoot(reservation *admissionRootReservation) error {

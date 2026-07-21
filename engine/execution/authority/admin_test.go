@@ -1,6 +1,7 @@
 package authority
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -476,6 +477,73 @@ func TestSealDestinationInjectionCleansOnlyOwnedPaths(t *testing.T) {
 	}
 }
 
+func TestSealRepositoryPathCollisionIsForeignAndSurvivesCleanup(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-repo-collision")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := filepath.Join(t.TempDir(), "new-domain")
+	repoPath := filepath.Join(newRoot, AdmissionRepositoryFile)
+	setInitializeAdmissionRootBeforeRepositoryCreateForTest(t, func() error {
+		return os.WriteFile(repoPath, []byte("foreign repo"), 0o600)
+	})
+
+	_, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if !errors.Is(err, ErrNewStateRootNotEmpty) || !strings.Contains(err.Error(), "foreign destination path") || !strings.Contains(err.Error(), AdmissionRepositoryFile) {
+		t.Fatalf("seal repository collision error = %v, want typed foreign repository path", err)
+	}
+	if raw, readErr := os.ReadFile(repoPath); readErr != nil || string(raw) != "foreign repo" {
+		t.Fatalf("foreign repository file after cleanup = %q err=%v, want untouched", string(raw), readErr)
+	}
+	inspection, err := InspectAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Sealed {
+		t.Fatal("old root was sealed after repository collision")
+	}
+}
+
+func TestSealAnchorPathCollisionIsForeignAndSurvivesCleanup(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-anchor-collision")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := filepath.Join(t.TempDir(), "new-domain")
+	anchorPath := filepath.Join(newRoot, AdmissionAnchorFile)
+	setInitializeAdmissionRootBeforeAnchorCreateForTest(t, func() error {
+		return os.WriteFile(anchorPath, []byte("foreign anchor"), 0o600)
+	})
+
+	_, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if !errors.Is(err, ErrNewStateRootNotEmpty) || !strings.Contains(err.Error(), "foreign destination path") || !strings.Contains(err.Error(), AdmissionAnchorFile) {
+		t.Fatalf("seal anchor collision error = %v, want typed foreign anchor path", err)
+	}
+	if raw, readErr := os.ReadFile(anchorPath); readErr != nil || string(raw) != "foreign anchor" {
+		t.Fatalf("foreign anchor file after cleanup = %q err=%v, want untouched", string(raw), readErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(newRoot, AdmissionRepositoryFile)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("owned repository path after anchor collision stat error = %v, want removed", statErr)
+	}
+	inspection, err := InspectAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Sealed {
+		t.Fatal("old root was sealed after anchor collision")
+	}
+}
+
 func TestSealAlreadySealedRootReusesExistingFreshDestination(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -497,6 +565,69 @@ func TestSealAlreadySealedRootReusesExistingFreshDestination(t *testing.T) {
 	}
 	if !second.OldRootSealed || second.NewDomainUUID != first.NewDomainUUID {
 		t.Fatalf("idempotent replay = %+v, want same new domain %s", second, first.NewDomainUUID)
+	}
+}
+
+func TestSealSealedReplayRequiresStartableSuccessorAnchor(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-startable-successor")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := filepath.Join(t.TempDir(), "new-domain")
+	first, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	copyOnlyRoot := filepath.Join(t.TempDir(), "copy-only-domain")
+	if err := os.Mkdir(copyOnlyRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	copyOnlyRepoPath := filepath.Join(copyOnlyRoot, AdmissionRepositoryFile)
+	if err := copyFile(copyOnlyRepoPath, filepath.Join(newRoot, AdmissionRepositoryFile)); err != nil {
+		t.Fatal(err)
+	}
+	beforeCopyBytes, err := os.ReadFile(copyOnlyRepoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: copyOnlyRoot})
+	var mismatch SealedSuccessorMismatchError
+	if !errors.As(err, &mismatch) || !errors.Is(err, ErrSealedSuccessorMismatch) || mismatch.ExpectedDomainUUID != first.NewDomainUUID {
+		t.Fatalf("copy-only sealed replay error = %#v %v, want typed successor mismatch", mismatch, err)
+	}
+	if !strings.Contains(err.Error(), "anchor") || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("copy-only sealed replay error = %v, want missing anchor message", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(copyOnlyRoot, AdmissionAnchorFile)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("copy-only replay anchor stat error = %v, want not created", statErr)
+	}
+	afterCopyBytes, err := os.ReadFile(copyOnlyRepoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterCopyBytes, beforeCopyBytes) {
+		t.Fatal("copy-only replay mutated destination repository")
+	}
+
+	if err := os.Remove(filepath.Join(newRoot, AdmissionAnchorFile)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	mismatch = SealedSuccessorMismatchError{}
+	if !errors.As(err, &mismatch) || !errors.Is(err, ErrSealedSuccessorMismatch) || mismatch.ExpectedDomainUUID != first.NewDomainUUID {
+		t.Fatalf("deleted-anchor sealed replay error = %#v %v, want typed successor mismatch", mismatch, err)
+	}
+	if !strings.Contains(err.Error(), "anchor") || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("deleted-anchor sealed replay error = %v, want missing anchor message", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(newRoot, AdmissionAnchorFile)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("deleted-anchor replay anchor stat error = %v, want not repaired", statErr)
 	}
 }
 
@@ -558,6 +689,38 @@ func TestSealSealedReplayRequiresPersistedSuccessorIdentity(t *testing.T) {
 	}
 	if !oldInspection.Sealed || oldInspection.SuccessorDomainUUID != first.NewDomainUUID {
 		t.Fatalf("sealed old root inspection = %+v, want successor %s", oldInspection, first.NewDomainUUID)
+	}
+}
+
+func TestSealMissingNewStateRootParentIsTypedContractError(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-missing-parent")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := filepath.Join(t.TempDir(), "missing-parent", "new-domain")
+
+	_, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	var parentErr NewStateRootParentMissingError
+	if !errors.As(err, &parentErr) || !errors.Is(err, ErrNewStateRootParentMissing) || parentErr.Parent != filepath.Dir(newRoot) {
+		t.Fatalf("seal missing parent error = %#v %v, want typed parent contract error", parentErr, err)
+	}
+	if !strings.Contains(err.Error(), "parent directory of --new-state-root must already exist") {
+		t.Fatalf("seal missing parent error = %v, want parent contract message", err)
+	}
+	if _, statErr := os.Stat(filepath.Dir(newRoot)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("missing parent stat error = %v, want not created", statErr)
+	}
+	inspection, err := InspectAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Sealed {
+		t.Fatal("old root was sealed after missing parent refusal")
 	}
 }
 
@@ -673,6 +836,24 @@ func setInitializeAdmissionRootAfterOpenForTest(t *testing.T, hook func() error)
 	})
 }
 
+func setInitializeAdmissionRootBeforeRepositoryCreateForTest(t *testing.T, hook func() error) {
+	t.Helper()
+	previous := initializeAdmissionRootBeforeRepositoryCreateForTest
+	initializeAdmissionRootBeforeRepositoryCreateForTest = hook
+	t.Cleanup(func() {
+		initializeAdmissionRootBeforeRepositoryCreateForTest = previous
+	})
+}
+
+func setInitializeAdmissionRootBeforeAnchorCreateForTest(t *testing.T, hook func() error) {
+	t.Helper()
+	previous := initializeAdmissionRootBeforeAnchorCreateForTest
+	initializeAdmissionRootBeforeAnchorCreateForTest = hook
+	t.Cleanup(func() {
+		initializeAdmissionRootBeforeAnchorCreateForTest = previous
+	})
+}
+
 func setSealAdmissionRootAfterNewInitForTest(t *testing.T, hook func() error) {
 	t.Helper()
 	previous := sealAdmissionRootAfterNewInitForTest
@@ -680,4 +861,12 @@ func setSealAdmissionRootAfterNewInitForTest(t *testing.T, hook func() error) {
 	t.Cleanup(func() {
 		sealAdmissionRootAfterNewInitForTest = previous
 	})
+}
+
+func copyFile(dst, src string) error {
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, raw, 0o600)
 }
