@@ -4,10 +4,9 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R3A2 CLOSED. R3B + fix/fix2/fix3/fix4 committed (native monitor + F-C/F-D +
-phase-aware cleanup ordering + Darwin fence at bind + structural CleanupStatus through custody/launch/
-coordinator/served with record-before-fail-stop). All pushed. Next: sol verification of fix4 → close
-R3B → launch R3C (packet drafted).
+STATUS: EXECUTING. R0..R3B CLOSED (R3B closed at 69f6dab after 4 fix rounds; final sol verdict SHIP,
+0 findings, all 12 criteria PASS). Next: R3C single-lease runtime qualification (worker launched), then
+R4A → R4B → R5 → R6/R7A → R7B. Production still UnavailableRuntime; R0T expected-RED green.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -284,7 +283,16 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
-- 2026-07-21 R3B-fix4 (this commit): closed fix3-review's 1 High + 2 Medium. F1 PreparedProcess.
+- 2026-07-21 R3B CLOSED. Final sol verification of fix4 (69f6dab): SHIP, 0 findings, criteria 1a-1d,
+  2a-2c, 3a-3c, 4, 5 all PASS. Reviewer proved: abort-path proof/cleanup separation (attestation failure
+  = proof error; post-proof failures = CleanupStatus only); fail-stop ownership chain intact after the
+  contain/retire refactor (outer recover → c.failStop → servedAdmissionAuthority.FailStop anchors then
+  trips SafetyLatch; startup recovery records → failClosed latch); zero shim survivors; 2-value wrapper
+  has zero call sites; hand-finished authority fake consistent; macOS idle-shutdown race flake not
+  plausibly caused by fix4 (no semantic path; known flake class). R3B totals: 5 commits (39c2315 R3B,
+  8517171 fix, 3434063 fix2, 8102773 fix3, 69f6dab fix4), 4 refute-first review rounds, every round's
+  findings strictly downstream of the prior fix. Launching R3C.
+- 2026-07-21 R3B-fix4 (69f6dab): closed fix3-review's 1 High + 2 Medium. F1 PreparedProcess.
   AbortAndVerify now structurally (VerifiedQuiescence, CleanupStatus, error) through custodian + launch
   + all implementers/fakes; served abortLegacyPrepared/rejectAuthority record proven quiescence exactly
   once then surface cleanup.Err (no more discarded absence proof on cleanup failure). F2 coordinator
