@@ -219,11 +219,11 @@ func (custodian *NativeCustodian) Launch(ctx context.Context, spec NativeLaunchS
 		}
 		return nativeRunning, err
 	case ReleaseDefinitelyNotSent:
-		_, abortErr := held.AbortAndVerify(context.WithoutCancel(ctx))
+		_, cleanup, abortErr := held.AbortAndVerify(context.WithoutCancel(ctx))
 		if err == nil {
 			err = fmt.Errorf("%w: native prepared release was definitely not sent", ErrNativeCustodianUnavailable)
 		}
-		return nil, errors.Join(err, abortErr)
+		return nil, errors.Join(err, abortErr, cleanup.Err)
 	case ReleaseOutcomeUnknown:
 		if err == nil {
 			err = fmt.Errorf("%w: native prepared release outcome unknown", ErrNativeCustodianUnavailable)

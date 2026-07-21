@@ -926,12 +926,7 @@ func (cust *fakeCustodian) Prepare(context.Context, command.ExecSpec, model.Laun
 	return cust.prepared, nil
 }
 
-func (cust *fakeCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
-	verified, cleanup, err := cust.ContainAndVerifyWithCleanup(ctx, group, cause)
-	return verified, errors.Join(err, cleanup.Err)
-}
-
-func (cust *fakeCustodian) ContainAndVerifyWithCleanup(_ context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+func (cust *fakeCustodian) ContainAndVerify(_ context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	cust.containCalls++
 	cust.containedGroup = group
 	cust.containCause = cause
@@ -955,6 +950,7 @@ type fakePrepared struct {
 	releaseErr     error
 	releaseOutcome custodian.ReleaseOutcome
 	abortErr       error
+	abortCleanup   error
 	releaseCalls   int
 	abortCalls     int
 	attestations   int
@@ -980,14 +976,18 @@ func (prepared *fakePrepared) Release(context.Context) (RunningProcess, custodia
 	return prepared.running, outcome, nil
 }
 
-func (prepared *fakePrepared) AbortAndVerify(context.Context) (custodian.VerifiedQuiescence, error) {
+func (prepared *fakePrepared) AbortAndVerify(context.Context) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	prepared.abortCalls++
 	prepared.events.add("abort")
 	if prepared.abortErr != nil {
-		return custodian.VerifiedQuiescence{}, prepared.abortErr
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, prepared.abortErr
 	}
 	prepared.attestations++
-	return prepared.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: prepared.group, Method: model.QuiescenceAlreadyAbsent})
+	verified, err := prepared.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: prepared.group, Method: model.QuiescenceAlreadyAbsent})
+	if err != nil {
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
+	}
+	return verified, custodian.CleanupStatus{Err: prepared.abortCleanup}, nil
 }
 
 type fakeRunning struct {
@@ -1031,12 +1031,7 @@ func (running *fakeRunning) Stderr() io.ReadCloser {
 	return running.stderr
 }
 
-func (running *fakeRunning) WaitAndVerify(ctx context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error) {
-	exit, verified, cleanup, err := running.WaitAndVerifyWithCleanup(ctx)
-	return exit, verified, errors.Join(err, cleanup.Err)
-}
-
-func (running *fakeRunning) WaitAndVerifyWithCleanup(ctx context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+func (running *fakeRunning) WaitAndVerify(ctx context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	running.events.add("wait_start")
 	running.waitOnce.Do(func() { close(running.waitStarted) })
 	select {
@@ -1046,7 +1041,7 @@ func (running *fakeRunning) WaitAndVerifyWithCleanup(ctx context.Context) (comma
 			return command.ExitObservation{}, custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, running.waitErr
 		}
 		if running.waitContains {
-			verified, cleanup, err := running.ContainAndVerifyWithCleanup(ctx, custodian.QuiescenceCauseWait)
+			verified, cleanup, err := running.ContainAndVerify(ctx, custodian.QuiescenceCauseWait)
 			return command.ExitObservation{Exited: true, Code: 0}, verified, cleanup, err
 		}
 		verified, err := running.attest(model.QuiescenceNaturalExit)
@@ -1059,12 +1054,7 @@ func (running *fakeRunning) WaitAndVerifyWithCleanup(ctx context.Context) (comma
 	}
 }
 
-func (running *fakeRunning) ContainAndVerify(ctx context.Context, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
-	verified, cleanup, err := running.ContainAndVerifyWithCleanup(ctx, cause)
-	return verified, errors.Join(err, cleanup.Err)
-}
-
-func (running *fakeRunning) ContainAndVerifyWithCleanup(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+func (running *fakeRunning) ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	running.mu.Lock()
 	running.containCalls++
 	running.waitContained = true

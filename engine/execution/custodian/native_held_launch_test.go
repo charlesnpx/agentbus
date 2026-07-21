@@ -76,9 +76,12 @@ func TestNativeHeldLaunchGeneratesInternalSecretAndAbortPrepared(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	requireNativeFileAbsent(t, resultPath)
 
-	verified, err := launch.AbortAndVerify(ctx)
+	verified, cleanup, err := launch.AbortAndVerify(ctx)
 	if err != nil {
 		t.Fatalf("AbortAndVerify() error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("AbortAndVerify() cleanup error = %v, want nil", cleanup.Err)
 	}
 	quiescence, err := verifier.VerifyQuiescence(verified)
 	if err != nil {
@@ -303,7 +306,7 @@ func TestNativeHeldLaunchCanceledReleaseMapsUnknownContainsAndDoesNotResend(t *t
 	if again != nil || againOutcome != ReleaseDefinitelyNotSent || !errors.Is(againErr, ErrHeldLaunchAlreadyConsumed) {
 		t.Fatalf("second Release() = (%v, %s, %v), want nil definitely_not_sent already-consumed", again, againOutcome, againErr)
 	}
-	if _, abortErr := launch.AbortAndVerify(ctx); !errors.Is(abortErr, ErrHeldLaunchAlreadyConsumed) {
+	if _, cleanup, abortErr := launch.AbortAndVerify(ctx); !errors.Is(abortErr, ErrHeldLaunchAlreadyConsumed) || cleanup.Err != nil {
 		t.Fatalf("AbortAndVerify() after canceled release error = %v, want already-consumed", abortErr)
 	}
 	waitGroupAbsent(t, ref, time.Second)
@@ -328,9 +331,12 @@ func TestNativeHeldLaunchAbortErrorStillContainsClosesAndDeletesOnProvenAbsence(
 	if got := native.ActiveCustodyCount(); got != 1 {
 		t.Fatalf("ActiveCustodyCount() with prepared held launch = %d, want 1", got)
 	}
-	verified, err := effects.AbortAndVerify(ctx, ref)
+	verified, cleanup, err := effects.AbortAndVerify(ctx, ref)
 	if err != nil {
 		t.Fatalf("AbortAndVerify() error = %v, want nil after proven containment", err)
+	}
+	if !errors.Is(cleanup.Err, abortErr) {
+		t.Fatalf("AbortAndVerify() cleanup error = %v, want injected abort failure", cleanup.Err)
 	}
 	quiescence, err := verifier.VerifyQuiescence(verified)
 	if err != nil {
@@ -375,9 +381,9 @@ func TestNativeHeldLaunchAbortUnprovableClosesBackendKeepsEntryAndContainRetryDe
 	canceledCtx, cancelAbort := context.WithCancel(context.Background())
 	cancelAbort()
 
-	verified, err := effects.AbortAndVerify(canceledCtx, ref)
-	if verified != (VerifiedQuiescence{}) || !errors.Is(err, abortErr) || !errors.Is(err, context.Canceled) {
-		t.Fatalf("AbortAndVerify(canceled) = (%+v, %v), want zero attestation with abort+canceled errors", verified, err)
+	verified, cleanup, err := effects.AbortAndVerify(canceledCtx, ref)
+	if verified != (VerifiedQuiescence{}) || cleanup.Err != nil || !errors.Is(err, abortErr) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("AbortAndVerify(canceled) = (%+v, cleanup:%v, %v), want zero attestation with abort+canceled errors", verified, cleanup.Err, err)
 	}
 	if backend.snapshotCloseCalls() != 1 {
 		t.Fatalf("backend close calls after unprovable abort = %d, want 1", backend.snapshotCloseCalls())
@@ -389,7 +395,7 @@ func TestNativeHeldLaunchAbortUnprovableClosesBackendKeepsEntryAndContainRetryDe
 		t.Fatalf("ActiveCustodyCount() after unprovable abort = %d, want 1", got)
 	}
 
-	verified, cleanup, err := effects.ContainAndVerify(ctx, ref, QuiescenceCauseRecovery)
+	verified, cleanup, err = effects.ContainAndVerify(ctx, ref, QuiescenceCauseRecovery)
 	if err != nil {
 		t.Fatalf("ContainAndVerify() retry error = %v, want nil", err)
 	}
@@ -436,8 +442,8 @@ func TestNativeHeldLaunchControlLossFromAbortingRetriesContainment(t *testing.T)
 	canceledCtx, cancelAbort := context.WithCancel(context.Background())
 	cancelAbort()
 
-	if verified, err := launch.AbortAndVerify(canceledCtx); verified != (VerifiedQuiescence{}) || !errors.Is(err, context.Canceled) {
-		t.Fatalf("AbortAndVerify(canceled) = (%+v, %v), want zero attestation with canceled error", verified, err)
+	if verified, cleanup, err := launch.AbortAndVerify(canceledCtx); verified != (VerifiedQuiescence{}) || cleanup.Err != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("AbortAndVerify(canceled) = (%+v, cleanup:%v, %v), want zero attestation with canceled error", verified, cleanup.Err, err)
 	}
 	if got := launch.State(); got != HeldLaunchStateAborting {
 		t.Fatalf("state after failed abort containment = %s, want %s", got, HeldLaunchStateAborting)
@@ -578,9 +584,12 @@ func TestNativeCustodianPublicPrepareReturnsHeldPreparedProcess(t *testing.T) {
 		t.Fatalf("ActiveCustodyCount() after public Prepare = %d, want 1", got)
 	}
 	requireNativeFileAbsent(t, resultPath)
-	verified, err := prepared.AbortAndVerify(ctx)
+	verified, cleanup, err := prepared.AbortAndVerify(ctx)
 	if err != nil {
 		t.Fatalf("prepared AbortAndVerify() error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("prepared AbortAndVerify() cleanup error = %v, want nil", cleanup.Err)
 	}
 	if verified == (VerifiedQuiescence{}) {
 		t.Fatal("prepared AbortAndVerify() returned zero attestation")

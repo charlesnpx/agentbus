@@ -75,7 +75,7 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 }
 
 func (e *admissionRecoveryExecutor) recoverLaunch(ctx context.Context, item model.RecoveryWorkItem, recoveryLaunch model.RecoveryLaunch) (model.RecoveryWorkItem, error) {
-	verified, cleanup, err := containLaunchPortWithCleanup(ctx, e.launch, recoveryLaunch.Group, custodian.QuiescenceCauseRecovery)
+	verified, cleanup, err := e.launch.ContainAndVerify(ctx, recoveryLaunch.Group, custodian.QuiescenceCauseRecovery)
 	if err != nil {
 		return model.RecoveryWorkItem{}, fmt.Errorf("%w: contain recovery launch %s ordinal %s: %v", authority.ErrRecoveryNeeded, item.JobID, recoveryLaunch.Ordinal, err)
 	}

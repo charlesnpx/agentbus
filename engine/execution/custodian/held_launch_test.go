@@ -130,8 +130,8 @@ func TestHeldLaunchRaceReleaseVsAbortBeforeSendHasSingleWinner(t *testing.T) {
 	start := newConcurrentStartGate(2)
 	go func() {
 		start.wait()
-		verified, err := launch.AbortAndVerify(ctx)
-		abortDone <- abortResult{verified: verified, err: err}
+		verified, cleanup, err := launch.AbortAndVerify(ctx)
+		abortDone <- abortResult{verified: verified, err: errors.Join(err, cleanup.Err)}
 	}()
 	go func() {
 		start.wait()
@@ -196,8 +196,8 @@ func TestHeldLaunchRaceReleaseVsAbortAfterSendContains(t *testing.T) {
 	}()
 	go func() {
 		start.wait()
-		verified, err := launch.AbortAndVerify(ctx)
-		abortDone <- abortResult{verified: verified, err: err}
+		verified, cleanup, err := launch.AbortAndVerify(ctx)
+		abortDone <- abortResult{verified: verified, err: errors.Join(err, cleanup.Err)}
 	}()
 	start.release(t, "send-unblock/abort contenders ready")
 
@@ -278,8 +278,8 @@ func TestHeldLaunchReleaseContextCanceledBeforeFrameWritePermitsAbort(t *testing
 	if got := effects.snapshot().frameWrites; got != 0 {
 		t.Fatalf("frame writes after canceled release = %d, want 0", got)
 	}
-	if _, err := launch.AbortAndVerify(context.Background()); err != nil {
-		t.Fatalf("AbortAndVerify() after definitely_not_sent = %v, want nil", err)
+	if _, cleanup, err := launch.AbortAndVerify(context.Background()); errors.Join(err, cleanup.Err) != nil {
+		t.Fatalf("AbortAndVerify() after definitely_not_sent = %v, want nil", errors.Join(err, cleanup.Err))
 	}
 	if got := launch.State(); got != HeldLaunchStateFinalized {
 		t.Fatalf("state after abort = %s, want %s", got, HeldLaunchStateFinalized)
@@ -656,16 +656,20 @@ func (effects *heldLaunchFakeEffects) SendRelease(ctx context.Context, spec Prep
 	return effects.releaseRunning, effects.releaseOutcome, effects.releaseErr
 }
 
-func (effects *heldLaunchFakeEffects) AbortAndVerify(ctx context.Context, ref model.GroupRef) (VerifiedQuiescence, error) {
+func (effects *heldLaunchFakeEffects) AbortAndVerify(ctx context.Context, ref model.GroupRef) (VerifiedQuiescence, CleanupStatus, error) {
 	effects.mu.Lock()
 	effects.abortCalls++
 	effects.abortRefs = append(effects.abortRefs, ref)
 	effects.mu.Unlock()
 	signalOnce(effects.abortStarted, &effects.abortStartedOnce)
 	if err := waitIfSet(ctx, effects.allowAbort); err != nil {
-		return VerifiedQuiescence{}, err
+		return VerifiedQuiescence{}, CleanupStatus{}, err
 	}
-	return effects.issuer.AttestQuiescence(PhysicalQuiescence{Group: ref, Method: model.QuiescenceAlreadyAbsent})
+	verified, err := effects.issuer.AttestQuiescence(PhysicalQuiescence{Group: ref, Method: model.QuiescenceAlreadyAbsent})
+	if err != nil {
+		return VerifiedQuiescence{}, CleanupStatus{}, err
+	}
+	return verified, CleanupStatus{}, nil
 }
 
 func (effects *heldLaunchFakeEffects) ContainAndVerify(ctx context.Context, ref model.GroupRef, cause QuiescenceCause) (VerifiedQuiescence, CleanupStatus, error) {

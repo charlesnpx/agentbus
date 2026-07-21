@@ -195,8 +195,9 @@ func (c *releaseSecretRecordingCustodian) Prepare(_ context.Context, spec comman
 	return &releaseSecretPrepared{custodian: c, group: group, release: release}, nil
 }
 
-func (c *releaseSecretRecordingCustodian) ContainAndVerify(_ context.Context, group model.GroupRef, _ custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
-	return c.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: group, Method: model.QuiescenceTermKill})
+func (c *releaseSecretRecordingCustodian) ContainAndVerify(_ context.Context, group model.GroupRef, _ custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+	verified, err := c.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: group, Method: model.QuiescenceTermKill})
+	return verified, custodian.CleanupStatus{}, err
 }
 
 func (c *releaseSecretRecordingCustodian) recordReleaseSecret(secret parkproto.ReleaseSecret) {
@@ -237,8 +238,9 @@ func (p *releaseSecretPrepared) Release(context.Context) (launch.RunningProcess,
 	return &releaseSecretRunning{issuer: p.custodian.issuer, group: p.group}, custodian.ReleaseAccepted, nil
 }
 
-func (p *releaseSecretPrepared) AbortAndVerify(context.Context) (custodian.VerifiedQuiescence, error) {
-	return p.custodian.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: p.group, Method: model.QuiescenceAlreadyAbsent})
+func (p *releaseSecretPrepared) AbortAndVerify(context.Context) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+	verified, err := p.custodian.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: p.group, Method: model.QuiescenceAlreadyAbsent})
+	return verified, custodian.CleanupStatus{}, err
 }
 
 type releaseSecretRunning struct {
@@ -262,13 +264,14 @@ func (r *releaseSecretRunning) Stderr() io.ReadCloser {
 	return io.NopCloser(bytes.NewReader(nil))
 }
 
-func (r *releaseSecretRunning) WaitAndVerify(context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error) {
+func (r *releaseSecretRunning) WaitAndVerify(context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	verified, err := r.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: r.group, Method: model.QuiescenceNaturalExit})
-	return command.ExitObservation{Exited: true, Code: 0}, verified, err
+	return command.ExitObservation{Exited: true, Code: 0}, verified, custodian.CleanupStatus{}, err
 }
 
-func (r *releaseSecretRunning) ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
-	return r.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: r.group, Method: model.QuiescenceTermKill})
+func (r *releaseSecretRunning) ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+	verified, err := r.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: r.group, Method: model.QuiescenceTermKill})
+	return verified, custodian.CleanupStatus{}, err
 }
 
 type nopWriteCloser struct{}

@@ -781,6 +781,59 @@ func TestLegacyFencedWaitCleanupFailureRecordsQuiescenceBeforeError(t *testing.T
 	}
 }
 
+func TestLegacyFencedPreparedAbortCleanupFailureRecordsQuiescenceBeforeError(t *testing.T) {
+	t.Parallel()
+	cleanupErr := errors.New("prepared abort backend close failed")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.abortCleanupErr = cleanupErr
+	repo, recorder, coordinator := newLegacyFencedCoordinatorWithRecordingAuthorityForTest(t, launcher)
+	cmd := prepareLegacyFencedCommandWithCoordinatorForTest(t, coordinator, "request-legacy-fenced-abort-cleanup-failure")
+
+	err := coordinator.abortLegacyPrepared(context.Background(), cmd.prepared, true, cmd.launchContext)
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("abortLegacyPrepared error = %v, want cleanup failure", err)
+	}
+	if got := launcher.abortCount(); got != 1 {
+		t.Fatalf("legacy fenced aborts = %d, want 1", got)
+	}
+	recordErrs, _ := recorder.recordQuiescenceContextObservations()
+	if len(recordErrs) != 1 {
+		t.Fatalf("record quiescence calls = %d, want 1", len(recordErrs))
+	}
+	safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
+	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || first.Group == nil || first.Quiescence == nil || first.Grant != nil || first.Released != nil {
+		t.Fatalf("legacy fenced abort-cleanup launch proof = %+v, want retired without grant/release", first)
+	}
+}
+
+func TestLegacyFencedRejectCleanupFailureRecordsQuiescenceBeforeError(t *testing.T) {
+	t.Parallel()
+	cleanupErr := errors.New("prepared reject backend close failed")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.abortCleanupErr = cleanupErr
+	repo, recorder, coordinator := newLegacyFencedCoordinatorWithRecordingAuthorityForTest(t, launcher)
+	cmd := prepareLegacyFencedCommandWithCoordinatorForTest(t, coordinator, "request-legacy-fenced-reject-cleanup-failure")
+
+	err := coordinator.rejectAndRetireLegacyFenced(context.Background(), cmd)
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("rejectAndRetireLegacyFenced error = %v, want cleanup failure", err)
+	}
+	if got := launcher.abortCount(); got != 1 {
+		t.Fatalf("legacy fenced aborts = %d, want 1", got)
+	}
+	recordErrs, _ := recorder.recordQuiescenceContextObservations()
+	if len(recordErrs) != 1 {
+		t.Fatalf("record quiescence calls = %d, want 1", len(recordErrs))
+	}
+	_, finalErr := cmd.result()
+	if !errors.Is(finalErr, cleanupErr) {
+		t.Fatalf("legacy fenced command final error = %v, want cleanup failure", finalErr)
+	}
+	safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
+	assertLegacyFencedRejectedWithoutGrant(t, safety)
+}
+
 func TestLegacyFencedDeliveryFailureRetiresWithoutGrantOrRun(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -3914,6 +3967,7 @@ type admissionFakeLaunchCustodian struct {
 	releaseStarted            chan struct{}
 	containErr                error
 	cleanupErr                error
+	abortCleanupErr           error
 	waitAndVerify             <-chan struct{}
 	activeCustodies           atomic.Bool
 }
@@ -3955,12 +4009,7 @@ func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.E
 	return &admissionFakePrepared{group: group, running: running, issuer: c.issuer, custodian: c}, nil
 }
 
-func (c *admissionFakeLaunchCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
-	verified, cleanup, err := c.ContainAndVerifyWithCleanup(ctx, group, cause)
-	return verified, errors.Join(err, cleanup.Err)
-}
-
-func (c *admissionFakeLaunchCustodian) ContainAndVerifyWithCleanup(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+func (c *admissionFakeLaunchCustodian) ContainAndVerify(ctx context.Context, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -3978,7 +4027,7 @@ func (c *admissionFakeLaunchCustodian) ContainAndVerifyWithCleanup(ctx context.C
 		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, containErr
 	}
 	if running != nil {
-		return running.ContainAndVerifyWithCleanup(ctx, cause)
+		return running.ContainAndVerify(ctx, cause)
 	}
 	method := model.QuiescenceTermKill
 	if cause == custodian.QuiescenceCauseRecovery {
@@ -4090,13 +4139,15 @@ func (p *admissionFakePrepared) Release(ctx context.Context) (launch.RunningProc
 	return p.running, outcome, releaseErr
 }
 
-func (p *admissionFakePrepared) AbortAndVerify(ctx context.Context) (custodian.VerifiedQuiescence, error) {
+func (p *admissionFakePrepared) AbortAndVerify(ctx context.Context) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	respectContext := false
 	waitForContextDone := false
+	var cleanupErr error
 	if p.custodian != nil {
 		p.custodian.mu.Lock()
 		respectContext = p.custodian.abortRespectContext
 		waitForContextDone = p.custodian.abortWaitForContextDone
+		cleanupErr = p.custodian.abortCleanupErr
 		p.custodian.mu.Unlock()
 	}
 	if waitForContextDone {
@@ -4112,10 +4163,14 @@ func (p *admissionFakePrepared) AbortAndVerify(ctx context.Context) (custodian.V
 	}
 	if respectContext {
 		if err := ctx.Err(); err != nil {
-			return custodian.VerifiedQuiescence{}, err
+			return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
 		}
 	}
-	return p.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: p.group, Method: model.QuiescenceAlreadyAbsent})
+	verified, err := p.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: p.group, Method: model.QuiescenceAlreadyAbsent})
+	if err != nil {
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
+	}
+	return verified, custodian.CleanupStatus{Err: cleanupErr}, nil
 }
 
 type admissionFakeRunning struct {
@@ -4149,12 +4204,7 @@ func (r *admissionFakeRunning) Stderr() io.ReadCloser {
 	return r.stderr
 }
 
-func (r *admissionFakeRunning) WaitAndVerify(ctx context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, error) {
-	exit, verified, cleanup, err := r.WaitAndVerifyWithCleanup(ctx)
-	return exit, verified, errors.Join(err, cleanup.Err)
-}
-
-func (r *admissionFakeRunning) WaitAndVerifyWithCleanup(ctx context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+func (r *admissionFakeRunning) WaitAndVerify(ctx context.Context) (command.ExitObservation, custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	if r.wait != nil {
 		select {
 		case <-r.wait:
@@ -4167,12 +4217,7 @@ func (r *admissionFakeRunning) WaitAndVerifyWithCleanup(ctx context.Context) (co
 	return r.finish(model.QuiescenceNaturalExit)
 }
 
-func (r *admissionFakeRunning) ContainAndVerify(ctx context.Context, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
-	verified, cleanup, err := r.ContainAndVerifyWithCleanup(ctx, cause)
-	return verified, errors.Join(err, cleanup.Err)
-}
-
-func (r *admissionFakeRunning) ContainAndVerifyWithCleanup(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+func (r *admissionFakeRunning) ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	r.markContained()
 	_, verified, cleanup, err := r.finish(model.QuiescenceTermKill)
 	return verified, cleanup, err

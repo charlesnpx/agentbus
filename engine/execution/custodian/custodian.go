@@ -41,7 +41,7 @@ type PreparedProcess interface {
 	Stdout() io.ReadCloser
 	Stderr() io.ReadCloser
 	Release(context.Context) (RunningProcess, ReleaseOutcome, error)
-	AbortAndVerify(context.Context) (VerifiedQuiescence, error)
+	AbortAndVerify(context.Context) (VerifiedQuiescence, CleanupStatus, error)
 }
 
 type RunningProcess interface {

@@ -85,7 +85,7 @@ func (spec PrepareSpec) Validate() error {
 type HeldLaunch interface {
 	Ref() model.GroupRef
 	Release(context.Context) (RunningProcess, ReleaseOutcome, error)
-	AbortAndVerify(context.Context) (VerifiedQuiescence, error)
+	AbortAndVerify(context.Context) (VerifiedQuiescence, CleanupStatus, error)
 }
 
 // HeldLaunchEffects are the only side effects used by HeldLaunchCore. R2A tests
@@ -96,7 +96,7 @@ type HeldLaunch interface {
 type HeldLaunchEffects interface {
 	Prepare(context.Context, PrepareSpec) (model.GroupRef, error)
 	SendRelease(context.Context, PrepareSpec, model.GroupRef) (RunningProcess, ReleaseOutcome, error)
-	AbortAndVerify(context.Context, model.GroupRef) (VerifiedQuiescence, error)
+	AbortAndVerify(context.Context, model.GroupRef) (VerifiedQuiescence, CleanupStatus, error)
 	ContainAndVerify(context.Context, model.GroupRef, QuiescenceCause) (VerifiedQuiescence, CleanupStatus, error)
 }
 
@@ -303,12 +303,12 @@ func (launch *HeldLaunchCore) finishRelease(ctx context.Context, ref model.Group
 	}
 }
 
-func (launch *HeldLaunchCore) AbortAndVerify(ctx context.Context) (VerifiedQuiescence, error) {
+func (launch *HeldLaunchCore) AbortAndVerify(ctx context.Context) (VerifiedQuiescence, CleanupStatus, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if launch == nil {
-		return VerifiedQuiescence{}, ErrInvalidHeldLaunch
+		return VerifiedQuiescence{}, CleanupStatus{}, ErrInvalidHeldLaunch
 	}
 	launch.opMu.Lock()
 	defer launch.opMu.Unlock()
@@ -335,7 +335,8 @@ func (launch *HeldLaunchCore) Close(ctx context.Context) error {
 	launch.closeConsumed = true
 	launch.mu.Unlock()
 
-	_, err := launch.abortPrepared(ctx)
+	_, cleanup, err := launch.abortPrepared(ctx)
+	err = errors.Join(err, cleanup.Err)
 	if err == nil {
 		return nil
 	}
@@ -370,7 +371,8 @@ func (launch *HeldLaunchCore) HandleControlLoss(ctx context.Context, groupDurabl
 		if groupDurablyBound {
 			return launch.containAndFinalize(ctx, ref, QuiescenceCauseRecovery)
 		}
-		return launch.abortPrepared(ctx)
+		verified, cleanup, err := launch.abortPrepared(ctx)
+		return verified, errors.Join(err, cleanup.Err)
 	case HeldLaunchStateReleasing, HeldLaunchStateAborting, HeldLaunchStateReleaseUnknown, HeldLaunchStateContaining:
 		launch.markReleaseConsumed()
 		return launch.containAndFinalize(ctx, ref, QuiescenceCauseRecovery)
@@ -406,28 +408,28 @@ func (launch *HeldLaunchCore) beginRelease(ctx context.Context) (context.Context
 	return releaseCtx, launch.ref, nil
 }
 
-func (launch *HeldLaunchCore) abortPrepared(ctx context.Context) (VerifiedQuiescence, error) {
+func (launch *HeldLaunchCore) abortPrepared(ctx context.Context) (VerifiedQuiescence, CleanupStatus, error) {
 	launch.mu.Lock()
 	if launch.abortConsumed {
 		launch.mu.Unlock()
-		return VerifiedQuiescence{}, ErrHeldLaunchAlreadyConsumed
+		return VerifiedQuiescence{}, CleanupStatus{}, ErrHeldLaunchAlreadyConsumed
 	}
 	state := launch.state
 	ref := launch.ref
 	if state != HeldLaunchStatePrepared {
 		launch.mu.Unlock()
-		return VerifiedQuiescence{}, launch.refusalForStateLocked(state)
+		return VerifiedQuiescence{}, CleanupStatus{}, launch.refusalForStateLocked(state)
 	}
 	launch.abortConsumed = true
 	launch.state = HeldLaunchStateAborting
 	launch.mu.Unlock()
 
-	verified, err := launch.effects.AbortAndVerify(ctx, ref)
+	verified, cleanup, err := launch.effects.AbortAndVerify(ctx, ref)
 	if err != nil {
-		return verified, err
+		return verified, cleanup, err
 	}
 	launch.setState(HeldLaunchStateFinalized)
-	return verified, nil
+	return verified, cleanup, nil
 }
 
 func (launch *HeldLaunchCore) containAfterUnknown(ctx context.Context, ref model.GroupRef, cause QuiescenceCause) error {

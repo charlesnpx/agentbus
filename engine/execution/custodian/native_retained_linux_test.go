@@ -154,9 +154,12 @@ func TestNativeRetainedPreparedAbortReapsLeaderBeforeContainment(t *testing.T) {
 	requireNativeFileAbsent(t, resultPath)
 	requireRetainedMembershipForRef(t, ctx, ref, containment.RetainedMembershipPresent)
 
-	verified, err := prepared.AbortAndVerify(ctx)
+	verified, cleanup, err := prepared.AbortAndVerify(ctx)
 	if err != nil {
 		t.Fatalf("prepared AbortAndVerify() error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("prepared AbortAndVerify() cleanup error = %v, want nil", cleanup.Err)
 	}
 	if verified == (VerifiedQuiescence{}) {
 		t.Fatal("prepared AbortAndVerify() returned zero attestation")

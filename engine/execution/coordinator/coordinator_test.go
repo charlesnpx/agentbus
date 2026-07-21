@@ -138,6 +138,45 @@ func TestCancelAfterPermitContainsBeforeTerminal(t *testing.T) {
 	}
 }
 
+func TestCancelAfterPermitRecordsQuiescenceBeforeCleanupFailStop(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "cancel-cleanup-order")
+	events := &coordinatorEventLog{}
+	h.authority.events = events
+	h.containment.events = events
+	cleanupErr := errors.New("cleanup failed after valid containment proof")
+	h.containment.cleanupErr = cleanupErr
+	accepted := h.submit(t, ctx, "cancel-cleanup-order")
+	h.bindGrant(t, ctx, accepted, model.LaunchOrdinalOne)
+
+	err := h.coordinator.Cancel(ctx, accepted.Record.JobID, nil)
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("Cancel error = %v, want cleanup failure", err)
+	}
+	if !h.authority.failStopped {
+		t.Fatal("authority was not fail-stopped after containment cleanup failure")
+	}
+	wantEvents := "contain,record_quiescence,fail_stop"
+	if got := strings.Join(events.snapshot(), ","); got != wantEvents {
+		t.Fatalf("events = %s, want %s", got, wantEvents)
+	}
+	var record model.SafetyRecord
+	if err := h.repo.View(ctx, func(tx repository.ReadTx) error {
+		image := tx.LoadJob(accepted.Record.JobID)
+		if image.Safety.State != repository.RecordValid {
+			t.Fatalf("safety state = %s, want valid", image.Safety.State)
+		}
+		record = image.Safety.Value
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || first.Quiescence == nil {
+		t.Fatalf("launch quiescence = %+v, want recorded before cleanup fail-stop", first)
+	}
+}
+
 func TestCancelAfterPermitFailsClosedWhenContainmentUnprovable(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, "cancel-unprovable")
@@ -288,6 +327,18 @@ type harness struct {
 	nextGroup   int
 }
 
+type coordinatorEventLog struct {
+	events []string
+}
+
+func (log *coordinatorEventLog) add(event string) {
+	log.events = append(log.events, event)
+}
+
+func (log *coordinatorEventLog) snapshot() []string {
+	return append([]string(nil), log.events...)
+}
+
 func newHarness(t *testing.T, name string) *harness {
 	t.Helper()
 	repo := memory.NewRepository()
@@ -436,9 +487,13 @@ type readyAuthority struct {
 	ready       *authority.Ready
 	failStopped bool
 	failReason  error
+	events      *coordinatorEventLog
 }
 
 func (a *readyAuthority) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) (StepResult, error) {
+	if a.events != nil {
+		a.events.add("record_quiescence")
+	}
 	applied, err := a.ready.RecordQuiescence(ctx, jobID, ordinal, verified)
 	return stepResult(applied, err)
 }
@@ -504,6 +559,9 @@ func (a *readyAuthority) HasOwnedWork(ctx context.Context) (bool, error) {
 }
 
 func (a *readyAuthority) FailStop(ctx context.Context, err error) error {
+	if a.events != nil {
+		a.events.add("fail_stop")
+	}
 	a.failStopped = true
 	a.failReason = err
 	if err == nil {
@@ -559,21 +617,26 @@ type testLaunchContainment struct {
 	contained   int
 	retired     int
 	failContain bool
+	cleanupErr  error
 	issuer      custodian.AttestationIssuer
+	events      *coordinatorEventLog
 }
 
-func (c *testLaunchContainment) ContainAndVerify(ctx context.Context, launchCtx launch.LaunchContext, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
+func (c *testLaunchContainment) ContainAndVerify(ctx context.Context, launchCtx launch.LaunchContext, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
+	if c.events != nil {
+		c.events.add("contain")
+	}
 	if err := ctx.Err(); err != nil {
-		return custodian.VerifiedQuiescence{}, err
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
 	}
 	if err := launchCtx.Validate(); err != nil {
-		return custodian.VerifiedQuiescence{}, err
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
 	}
 	if err := group.Validate(); err != nil {
-		return custodian.VerifiedQuiescence{}, err
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
 	}
 	if !group.Launch.Attempt.Equal(launchCtx.Attempt) || group.Launch.Ordinal != launchCtx.Ordinal {
-		return custodian.VerifiedQuiescence{}, errors.New("launch containment group mismatch")
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, errors.New("launch containment group mismatch")
 	}
 	method := model.QuiescenceTermKill
 	switch cause {
@@ -584,12 +647,16 @@ func (c *testLaunchContainment) ContainAndVerify(ctx context.Context, launchCtx 
 		c.contained++
 	}
 	if c.failContain {
-		return custodian.VerifiedQuiescence{}, errors.New("containment failed")
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, errors.New("containment failed")
 	}
-	return c.issuer.AttestQuiescence(custodian.PhysicalQuiescence{
+	verified, err := c.issuer.AttestQuiescence(custodian.PhysicalQuiescence{
 		Group:  group,
 		Method: method,
 	})
+	if err != nil {
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
+	}
+	return verified, custodian.CleanupStatus{Err: c.cleanupErr}, nil
 }
 
 type testResults struct {

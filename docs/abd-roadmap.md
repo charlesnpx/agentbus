@@ -4,9 +4,10 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R3A2 CLOSED. R3B + fix/fix2/fix3 committed (native monitor port + F-C/F-D +
-phase-aware cleanup ordering + Darwin retention fence at bind + CleanupStatus contract through custody/
-launch/served). All pushed. Next: sol verification of fix3, then R3C (packet drafted).
+STATUS: EXECUTING. R0..R3A2 CLOSED. R3B + fix/fix2/fix3/fix4 committed (native monitor + F-C/F-D +
+phase-aware cleanup ordering + Darwin fence at bind + structural CleanupStatus through custody/launch/
+coordinator/served with record-before-fail-stop). All pushed. Next: sol verification of fix4 → close
+R3B → launch R3C (packet drafted).
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -283,7 +284,23 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
-- 2026-07-20 R3B-fix3 (this commit): closed fix2-review's 2 High. F1 Darwin PID/PGID reuse window:
+- 2026-07-21 R3B-fix4 (this commit): closed fix3-review's 1 High + 2 Medium. F1 PreparedProcess.
+  AbortAndVerify now structurally (VerifiedQuiescence, CleanupStatus, error) through custodian + launch
+  + all implementers/fakes; served abortLegacyPrepared/rejectAuthority record proven quiescence exactly
+  once then surface cleanup.Err (no more discarded absence proof on cleanup failure). F2 coordinator
+  LaunchContainment contract carries CleanupStatus; RecordQuiescence happens BEFORE cleanup failure
+  surfaces/fail-stops; latch trip moved out of the pre-record wrapper; event-order test asserts
+  contain→record_quiescence→fail_stop. F3 CleanupAware* extension interfaces + type-assert adapters
+  DELETED (launch + served mirrors); primary launch interfaces 3-value structural. Delivery: worker
+  attempt 1 backend_error apply_patch (partial tree stashed), attempt 2 empty completion in 61s,
+  attempt 3 (job_...000066) completed 95% then timed out on a hung acceptance run — orchestrator
+  finished the one unmigrated authority test fake (3 signatures, mechanical) and verified all findings
+  present in the diff. Verified: build/linux-build/gofmt/vet=0; macOS full=0; macOS race: one
+  TestIdleShutdownWaitsForAuthorityOwnedWork timing flake under multi-package race parallelism
+  (isolated -race -count=5 green, package rerun green — known served-shutdown flake class, papercut);
+  Docker cgroup-v2 full -p 1=0, race -count=2=0, R0T RED sentinel strict_admission_unavailable=0.
+  sol verification (final R3B round) next.
+- 2026-07-20 R3B-fix3 (8102773): closed fix2-review's 2 High. F1 Darwin PID/PGID reuse window:
   leaderRetention now acquired at beforeMonitorBind (matching Linux fence-acquisition phase);
   beforeRelease only verifies the exact retained group; witness nil until acquired — post-placement
   failure paths are fenced on both platforms; ordering regression extended through the REAL

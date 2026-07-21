@@ -148,9 +148,9 @@ func (process *nativePreparedProcess) Release(ctx context.Context) (RunningProce
 	return process.launch.Release(ctx)
 }
 
-func (process *nativePreparedProcess) AbortAndVerify(ctx context.Context) (VerifiedQuiescence, error) {
+func (process *nativePreparedProcess) AbortAndVerify(ctx context.Context) (VerifiedQuiescence, CleanupStatus, error) {
 	if process == nil || process.launch == nil {
-		return VerifiedQuiescence{}, ErrInvalidHeldLaunch
+		return VerifiedQuiescence{}, CleanupStatus{}, ErrInvalidHeldLaunch
 	}
 	return process.launch.AbortAndVerify(ctx)
 }
@@ -270,13 +270,13 @@ func nativeReleaseOutcomeFromParklaunch(handle *parklaunch.ParkedHandle, err err
 	}
 }
 
-func (effects *nativeHeldLaunchEffects) AbortAndVerify(ctx context.Context, ref model.GroupRef) (VerifiedQuiescence, error) {
+func (effects *nativeHeldLaunchEffects) AbortAndVerify(ctx context.Context, ref model.GroupRef) (VerifiedQuiescence, CleanupStatus, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	entry, ok := effects.lookupPrepared(ref)
 	if !ok {
-		return VerifiedQuiescence{}, fmt.Errorf("%w: native held launch prepared ref not found", ErrNativeCustodianUnavailable)
+		return VerifiedQuiescence{}, CleanupStatus{}, fmt.Errorf("%w: native held launch prepared ref not found", ErrNativeCustodianUnavailable)
 	}
 
 	return effects.abortPreparedEntryAndVerify(ctx, ref, entry, false)
@@ -374,17 +374,17 @@ func (effects *nativeHeldLaunchEffects) lookupPrepared(ref model.GroupRef) (*nat
 	return entry, entry != nil
 }
 
-func (effects *nativeHeldLaunchEffects) abortPreparedEntryAndVerify(ctx context.Context, ref model.GroupRef, entry *nativeHeldPreparedLaunch, refuseRunning bool) (VerifiedQuiescence, error) {
+func (effects *nativeHeldLaunchEffects) abortPreparedEntryAndVerify(ctx context.Context, ref model.GroupRef, entry *nativeHeldPreparedLaunch, refuseRunning bool) (VerifiedQuiescence, CleanupStatus, error) {
 	if effects == nil || effects.custodian == nil {
-		return VerifiedQuiescence{}, fmt.Errorf("%w: native held launch effects are nil", ErrNativeCustodianUnavailable)
+		return VerifiedQuiescence{}, CleanupStatus{}, fmt.Errorf("%w: native held launch effects are nil", ErrNativeCustodianUnavailable)
 	}
 	if entry == nil {
-		return VerifiedQuiescence{}, fmt.Errorf("%w: native held launch prepared entry is nil", ErrNativeCustodianUnavailable)
+		return VerifiedQuiescence{}, CleanupStatus{}, fmt.Errorf("%w: native held launch prepared entry is nil", ErrNativeCustodianUnavailable)
 	}
 	entry.mu.Lock()
 	if refuseRunning && effects.custodian.hasRunningPreparedRef(ref) {
 		entry.mu.Unlock()
-		return VerifiedQuiescence{}, ErrHeldLaunchExecutionPossible
+		return VerifiedQuiescence{}, CleanupStatus{}, ErrHeldLaunchExecutionPossible
 	}
 	var abortErr error
 	if !entry.releaseDefinitelyNotSent {
@@ -397,10 +397,10 @@ func (effects *nativeHeldLaunchEffects) abortPreparedEntryAndVerify(ctx context.
 	closeErr := entry.closeBackendLocked(ctx)
 	entry.mu.Unlock()
 	if attestErr != nil {
-		return verified, errors.Join(abortErr, attestErr, closeErr)
+		return verified, CleanupStatus{}, errors.Join(abortErr, attestErr, closeErr)
 	}
 	effects.deletePrepared(ref, entry)
-	return verified, errors.Join(cleanup.Err, closeErr)
+	return verified, CleanupStatus{Err: errors.Join(abortErr, cleanup.Err, closeErr)}, nil
 }
 
 func (effects *nativeHeldLaunchEffects) registerPrepared(ref model.GroupRef, entry *nativeHeldPreparedLaunch) error {
@@ -486,10 +486,11 @@ func (custodian *NativeCustodian) closeNativeHeldPrepared(ctx context.Context, p
 		if !custodian.nativeHeldPreparedRegistered(registration.ref, registration.entry) {
 			continue
 		}
-		if _, err := registration.effects.abortPreparedEntryAndVerify(ctx, registration.ref, registration.entry, true); err != nil {
+		if _, cleanup, err := registration.effects.abortPreparedEntryAndVerify(ctx, registration.ref, registration.entry, true); errors.Join(err, cleanup.Err) != nil {
 			return errors.Join(
 				fmt.Errorf("%w: cannot close custodian with held prepared launch %s", ErrHeldLaunchCloseRefused, groupKey(registration.ref)),
 				err,
+				cleanup.Err,
 			)
 		}
 	}

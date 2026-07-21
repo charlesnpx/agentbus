@@ -49,7 +49,7 @@ type Coordinator struct {
 }
 
 type LaunchContainment interface {
-	ContainAndVerify(context.Context, launch.LaunchContext, model.GroupRef, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error)
+	ContainAndVerify(context.Context, launch.LaunchContext, model.GroupRef, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error)
 }
 
 func New(authority AdmissionAuthority, launchContainment LaunchContainment, results ResultPublisher, owner model.OwnerID) (*Coordinator, error) {
@@ -249,7 +249,7 @@ func (c *Coordinator) contain(ctx context.Context, record model.SafetyRecord, in
 		if err := inject(injector, FailContainSignal); err != nil {
 			return err
 		}
-		verified, err := c.launchContainment.ContainAndVerify(ctx, launchContext(record, ordinal), group, custodian.QuiescenceCauseContain)
+		verified, cleanup, err := c.launchContainment.ContainAndVerify(ctx, launchContext(record, ordinal), group, custodian.QuiescenceCauseContain)
 		if err != nil {
 			return err
 		}
@@ -258,9 +258,12 @@ func (c *Coordinator) contain(ctx context.Context, record model.SafetyRecord, in
 		}
 		applied, err := c.authority.RecordQuiescence(ctx, record.JobID, ordinal, verified)
 		if err != nil {
-			return c.failStop(ctx, fmt.Errorf("record containment quiescence: %w", err))
+			return fmt.Errorf("record containment quiescence: %w", err)
 		}
 		record = applied.Record
+		if cleanup.Err != nil {
+			return fmt.Errorf("containment cleanup after quiescence record: %w", cleanup.Err)
+		}
 	}
 	return nil
 }
@@ -278,7 +281,7 @@ func (c *Coordinator) retire(ctx context.Context, record model.SafetyRecord, inj
 		if err := inject(injector, FailRetireClose); err != nil {
 			return err
 		}
-		verified, err := c.launchContainment.ContainAndVerify(ctx, launchContext(record, ordinal), group, custodian.QuiescenceCauseRecovery)
+		verified, cleanup, err := c.launchContainment.ContainAndVerify(ctx, launchContext(record, ordinal), group, custodian.QuiescenceCauseRecovery)
 		if err != nil {
 			return err
 		}
@@ -287,9 +290,12 @@ func (c *Coordinator) retire(ctx context.Context, record model.SafetyRecord, inj
 		}
 		applied, err := c.authority.RecordQuiescence(ctx, record.JobID, ordinal, verified)
 		if err != nil {
-			return c.failStop(ctx, fmt.Errorf("record retirement quiescence: %w", err))
+			return fmt.Errorf("record retirement quiescence: %w", err)
 		}
 		record = applied.Record
+		if cleanup.Err != nil {
+			return fmt.Errorf("retirement cleanup after quiescence record: %w", cleanup.Err)
+		}
 	}
 	return nil
 }
