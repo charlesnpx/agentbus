@@ -579,6 +579,9 @@ func (s *Server) closeServeAdmission() error {
 
 	closer := s.admissionClose
 	runtime := s.admissionRuntime
+	if runtime != nil && s.admissionInstance != nil {
+		runtime.markConsumed()
+	}
 	s.admissionBootstrapper = nil
 	s.admissionReady = nil
 	s.admissionCoordinator = nil

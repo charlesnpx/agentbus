@@ -11,6 +11,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
 )
 
@@ -308,6 +309,29 @@ func TestSealRefusesNonemptyDestination(t *testing.T) {
 	}
 }
 
+func TestSealFreshDestinationRequiresAbsentDirectory(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-empty-destination")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := t.TempDir()
+	if _, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot}); !errors.Is(err, ErrNewStateRootNotEmpty) {
+		t.Fatalf("seal existing empty destination error = %v, want ErrNewStateRootNotEmpty", err)
+	}
+	inspection, err := InspectAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Sealed {
+		t.Fatal("old root was sealed after existing empty destination refusal")
+	}
+}
+
 func TestSealCrashAfterNewInitLeavesOldServiceableAndRetryRequiresDelete(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -414,6 +438,44 @@ func TestSealNewInitFailureCleansPartialDestinationAndLeavesOldServiceable(t *te
 	}
 }
 
+func TestSealDestinationInjectionCleansOnlyOwnedPaths(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-destination-injection")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := filepath.Join(t.TempDir(), "new-domain")
+	foreignPath := filepath.Join(newRoot, "foreign")
+	setInitializeAdmissionRootAfterOpenForTest(t, func() error {
+		return os.WriteFile(foreignPath, []byte("concurrent"), 0o600)
+	})
+
+	_, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if !errors.Is(err, ErrNewStateRootNotEmpty) {
+		t.Fatalf("seal injected destination error = %v, want ErrNewStateRootNotEmpty", err)
+	}
+	if raw, readErr := os.ReadFile(foreignPath); readErr != nil || string(raw) != "concurrent" {
+		t.Fatalf("foreign file after cleanup = %q err=%v, want untouched", string(raw), readErr)
+	}
+	for _, name := range []string{AdmissionRepositoryFile, AdmissionAnchorFile} {
+		path := filepath.Join(newRoot, name)
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("owned path %s stat error = %v, want removed", path, statErr)
+		}
+	}
+	inspection, err := InspectAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Sealed {
+		t.Fatal("old root was sealed after injected destination refusal")
+	}
+}
+
 func TestSealAlreadySealedRootReusesExistingFreshDestination(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -435,6 +497,109 @@ func TestSealAlreadySealedRootReusesExistingFreshDestination(t *testing.T) {
 	}
 	if !second.OldRootSealed || second.NewDomainUUID != first.NewDomainUUID {
 		t.Fatalf("idempotent replay = %+v, want same new domain %s", second, first.NewDomainUUID)
+	}
+}
+
+func TestSealSealedReplayRequiresPersistedSuccessorIdentity(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-successor-identity")
+	metadata, _, err := session.ActivateRoot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := filepath.Join(t.TempDir(), "new-domain")
+	first, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.OldInspection.SuccessorDomainUUID != first.NewDomainUUID || first.OldInspection.SuccessorStateRoot != newRoot {
+		t.Fatalf("sealed old inspection successor = %+v, report UUID %s root %s", first.OldInspection, first.NewDomainUUID, newRoot)
+	}
+
+	replay, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if err != nil {
+		t.Fatalf("sealed replay to true successor error = %v", err)
+	}
+	if replay.NewDomainUUID != first.NewDomainUUID {
+		t.Fatalf("sealed replay UUID = %s, want %s", replay.NewDomainUUID, first.NewDomainUUID)
+	}
+
+	absentRoot := filepath.Join(t.TempDir(), "absent-domain")
+	_, err = SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: absentRoot})
+	var mismatch SealedSuccessorMismatchError
+	if !errors.As(err, &mismatch) || !errors.Is(err, ErrSealedSuccessorMismatch) || mismatch.ExpectedDomainUUID != first.NewDomainUUID || !strings.Contains(err.Error(), first.NewDomainUUID) {
+		t.Fatalf("sealed replay absent destination error = %#v %v, want successor mismatch naming %s", mismatch, err, first.NewDomainUUID)
+	}
+	if _, statErr := os.Stat(absentRoot); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("absent replay destination stat error = %v, want not created", statErr)
+	}
+
+	lookalikeRoot := filepath.Join(t.TempDir(), "lookalike-domain")
+	lookalike, err := initializeAdmissionRoot(ctx, lookalikeRoot, AdmissionRootMetadata{ContractVersion: metadata.ContractVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lookalike.DomainUUID == first.NewDomainUUID {
+		t.Fatalf("lookalike UUID unexpectedly matched successor UUID %s", first.NewDomainUUID)
+	}
+	_, err = SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: lookalikeRoot})
+	mismatch = SealedSuccessorMismatchError{}
+	if !errors.As(err, &mismatch) || mismatch.ExpectedDomainUUID != first.NewDomainUUID || mismatch.ActualDomainUUID != lookalike.DomainUUID {
+		t.Fatalf("sealed replay lookalike error = %#v %v, want expected %s actual %s", mismatch, err, first.NewDomainUUID, lookalike.DomainUUID)
+	}
+
+	oldInspection, err := InspectAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatalf("sealed old root inspect after refused replays: %v", err)
+	}
+	if !oldInspection.Sealed || oldInspection.SuccessorDomainUUID != first.NewDomainUUID {
+		t.Fatalf("sealed old root inspection = %+v, want successor %s", oldInspection, first.NewDomainUUID)
+	}
+}
+
+func TestSealSuccessorDomainUUIDIsImmutableViaPutMeta(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-successor-immutable")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := filepath.Join(t.TempDir(), "new-domain")
+	report, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writable, err := bboltrepo.NewRepository(filepath.Join(root, AdmissionRepositoryFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writable.Close()
+	_, err = writable.Update(ctx, func(tx repository.WriteTx) error {
+		metaRecord := tx.Meta()
+		if metaRecord.State != repository.RecordValid {
+			t.Fatalf("meta state = %s, want valid", metaRecord.State)
+		}
+		meta := metaRecord.Value
+		meta.SuccessorDomainUUID = "mutated-successor-domain"
+		return tx.PutMeta(meta)
+	})
+	if !errors.Is(err, repository.ErrInvalidRecord) {
+		t.Fatalf("successor UUID mutation error = %v, want ErrInvalidRecord", err)
+	}
+	inspection, err := InspectAdmissionRepository(ctx, writable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.SuccessorDomainUUID != report.NewDomainUUID {
+		t.Fatalf("successor UUID after failed mutation = %s, want %s", inspection.SuccessorDomainUUID, report.NewDomainUUID)
 	}
 }
 

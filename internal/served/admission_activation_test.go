@@ -11,8 +11,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
@@ -506,6 +508,67 @@ func TestServeRejectsConsumedInjectedRuntime(t *testing.T) {
 	}
 	if got := closes.Load(); got != 1 {
 		t.Fatalf("runtime closes = %d, want 1", got)
+	}
+}
+
+func TestServeRejectsConsumedRuntimeWhileCloseStillPending(t *testing.T) {
+	ctx := context.Background()
+	closeStarted := make(chan struct{})
+	closeReturned := make(chan struct{})
+	releaseClose := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseClose) })
+	})
+	var closes atomic.Int64
+	runtime := custodian.NewUnavailableRuntimeForTest(custodian.ErrSupervisorUnavailable, func() error {
+		closes.Add(1)
+		close(closeStarted)
+		defer close(closeReturned)
+		<-releaseClose
+		return nil
+	})
+	server := newUnstartedTestServerWithRuntime(t, runtime)
+	listenErr := errors.New("listen reached")
+	var listenCalls atomic.Int64
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		if listenCalls.Add(1) > 1 {
+			return nil, socketFileIdentity{}, errors.New("listener must not open after runtime consumption")
+		}
+		return nil, socketFileIdentity{}, listenErr
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ctx)
+	}()
+	select {
+	case <-closeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime close did not start")
+	}
+	if !runtime.Consumed() {
+		t.Fatal("runtime was not marked consumed while close was still pending")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, listenErr) {
+			t.Fatalf("first Serve error = %v, want %v", err, listenErr)
+		}
+	case <-time.After(admissionRepositoryCloseTimeout + 2*time.Second):
+		t.Fatal("first Serve did not return after bounded runtime close timeout")
+	}
+	if err := server.Serve(ctx); !errors.Is(err, ErrRuntimeConsumed) {
+		t.Fatalf("second Serve error = %v, want ErrRuntimeConsumed", err)
+	}
+	if got := closes.Load(); got != 1 {
+		t.Fatalf("runtime closes = %d, want 1", got)
+	}
+	releaseOnce.Do(func() { close(releaseClose) })
+	select {
+	case <-closeReturned:
+	case <-time.After(time.Second):
+		t.Fatal("runtime close did not return after release")
 	}
 }
 

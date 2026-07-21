@@ -519,6 +519,13 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 					return meta
 				},
 			},
+			{
+				name: "change sealed successor uuid",
+				mutate: func(meta repository.AuthorityMeta) repository.AuthorityMeta {
+					meta.SuccessorDomainUUID = "successor-domain-mutated"
+					return meta
+				},
+			},
 		}
 		for _, tt := range cases {
 			tt := tt
@@ -740,6 +747,8 @@ func activateAndSealMetaForTest(t *testing.T, repo repository.Repository) (repos
 	commit, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
 		meta := loadMetaForTest(t, tx)
 		meta.Sealed = true
+		meta.SuccessorDomainUUID = "successor-domain-0001"
+		meta.SuccessorStateRoot = "/tmp/successor-domain-0001"
 		sealed = meta
 		return tx.PutMeta(meta)
 	})

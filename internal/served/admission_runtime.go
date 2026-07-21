@@ -137,6 +137,13 @@ func (s *servedAdmissionRuntime) close() error {
 	return errors.Join(err, s.runtime.Close())
 }
 
+func (s *servedAdmissionRuntime) markConsumed() {
+	if s == nil {
+		return
+	}
+	s.runtime.MarkConsumed()
+}
+
 func (s *servedAdmissionRuntime) consumed() bool {
 	return s != nil && s.runtime.Consumed()
 }

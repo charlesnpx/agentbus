@@ -263,6 +263,7 @@ type runtimeState struct {
 
 	reusableAfterClose bool
 	closed             bool
+	consumed           bool
 	closeOnce          sync.Once
 	closeErr           error
 }
@@ -371,7 +372,28 @@ func (runtime Runtime) ReusableAfterClose() bool {
 }
 
 func (runtime Runtime) Consumed() bool {
-	return runtime.Closed() && !runtime.ReusableAfterClose()
+	if runtime.state == nil {
+		return false
+	}
+	runtime.state.mu.Lock()
+	defer runtime.state.mu.Unlock()
+	return runtime.state.consumed && !runtime.state.reusableAfterClose
+}
+
+// MarkConsumed records that ownership disposal has begun. It is deliberately
+// earlier than Closed(): a close-capable runtime is spent once Serve commits to
+// disposing it, even if repository close consumes the shutdown budget, runtime
+// close blocks, or the handle is intentionally leaked; reusable no-op runtimes
+// remain reusable.
+func (runtime Runtime) MarkConsumed() {
+	if runtime.state == nil {
+		return
+	}
+	runtime.state.mu.Lock()
+	if !runtime.state.reusableAfterClose {
+		runtime.state.consumed = true
+	}
+	runtime.state.mu.Unlock()
 }
 
 func (runtime Runtime) Close() error {
@@ -379,6 +401,7 @@ func (runtime Runtime) Close() error {
 		return nil
 	}
 	runtime.state.closeOnce.Do(func() {
+		runtime.MarkConsumed()
 		if runtime.state.close != nil {
 			runtime.state.closeErr = runtime.state.close()
 		}

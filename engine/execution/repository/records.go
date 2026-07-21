@@ -87,11 +87,13 @@ func (metadata AdmissionRootMetadata) Validate() error {
 }
 
 type AuthorityMeta struct {
-	SchemaVersion   uint16
-	Generation      uint64
-	NextJobSequence uint64
-	AdmissionRoot   AdmissionRootMetadata
-	Sealed          bool
+	SchemaVersion       uint16
+	Generation          uint64
+	NextJobSequence     uint64
+	AdmissionRoot       AdmissionRootMetadata
+	Sealed              bool
+	SuccessorDomainUUID string
+	SuccessorStateRoot  string
 }
 
 func (meta AuthorityMeta) Validate() error {
@@ -106,6 +108,18 @@ func (meta AuthorityMeta) Validate() error {
 	}
 	if err := meta.AdmissionRoot.Validate(); err != nil {
 		return err
+	}
+	if !meta.Sealed {
+		if strings.TrimSpace(meta.SuccessorDomainUUID) != "" {
+			return fmt.Errorf("%w: meta.successor_domain_uuid requires sealed root", ErrInvalidRecord)
+		}
+		if strings.TrimSpace(meta.SuccessorStateRoot) != "" {
+			return fmt.Errorf("%w: meta.successor_state_root requires sealed root", ErrInvalidRecord)
+		}
+		return nil
+	}
+	if strings.TrimSpace(meta.SuccessorDomainUUID) == "" {
+		return fmt.Errorf("%w: meta.successor_domain_uuid is required when sealed", ErrInvalidRecord)
 	}
 	return nil
 }
@@ -131,7 +145,8 @@ func ValidateAuthorityMetaPut(current Record[AuthorityMeta], next AuthorityMeta,
 	}
 	// Admission-root metadata is one-way inside a live authority domain:
 	// activation and sealing never clear, ActivatedAtGen never changes once set,
-	// and a declared/activated ContractVersion cannot be forged by later PutMeta.
+	// a declared/activated ContractVersion cannot be forged by later PutMeta,
+	// and sealed successor identity is pinned forever once set.
 	return validateAuthorityMetaTransition(current.Value, next, currentGeneration)
 }
 
@@ -141,6 +156,12 @@ func validateAuthorityMetaTransition(current, next AuthorityMeta, currentGenerat
 	}
 	if current.Sealed && !next.Sealed {
 		return fmt.Errorf("%w: meta.sealed is one-way and cannot be cleared", ErrInvalidRecord)
+	}
+	if current.Sealed && current.SuccessorDomainUUID != "" && next.SuccessorDomainUUID != current.SuccessorDomainUUID {
+		return fmt.Errorf("%w: meta.successor_domain_uuid is immutable once set", ErrInvalidRecord)
+	}
+	if current.Sealed && current.SuccessorStateRoot != "" && next.SuccessorStateRoot != current.SuccessorStateRoot {
+		return fmt.Errorf("%w: meta.successor_state_root is immutable once set", ErrInvalidRecord)
 	}
 	if current.AdmissionRoot.ActivatedAtGen != 0 && next.AdmissionRoot.ActivatedAtGen != current.AdmissionRoot.ActivatedAtGen {
 		return fmt.Errorf("%w: admission_root.activated_at_gen is immutable once set", ErrInvalidRecord)

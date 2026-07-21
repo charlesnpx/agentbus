@@ -3182,7 +3182,22 @@ func TestSafetyFailStopDrainDeadlineWinsOverStalledOwnershipProbe(t *testing.T) 
 	})
 	server, _, _ := newUnstartedTestServer(t, backend)
 	server.safetyDrainTimeout = drainTimeout
-	configureTestAdmissionRuntime(t, server, launcher, true)
+	available := admissionSupportForClass(t, custodian.SupportAvailable, true, 1)
+	var runtimeCloses atomic.Int64
+	closeCapableRuntime := custodian.NewUnavailableRuntimeForTest(custodian.ErrSupervisorUnavailable, func() error {
+		runtimeCloses.Add(1)
+		return nil
+	})
+	servedRuntime := &servedAdmissionRuntime{
+		runtime:          closeCapableRuntime,
+		launchCustodian:  launcher,
+		supportOverride:  &available,
+		verifierOverride: launcher.verifier,
+	}
+	server.admissionRuntime = servedRuntime
+	server.admissionRuntimeFactory = func(*Server) *servedAdmissionRuntime {
+		return servedRuntime
+	}
 	if err := server.bootstrapAdmission(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -3219,6 +3234,15 @@ func TestSafetyFailStopDrainDeadlineWinsOverStalledOwnershipProbe(t *testing.T) 
 	}
 	if got := logs.String(); !strings.Contains(got, "admission repository close timed out; leaking handle at shutdown") {
 		t.Fatalf("shutdown log = %q, want admission repository close timeout", got)
+	}
+	if got := runtimeCloses.Load(); got != 0 {
+		t.Fatalf("runtime closes = %d, want skipped after repository close consumed deadline", got)
+	}
+	if !closeCapableRuntime.Consumed() {
+		t.Fatal("runtime was not marked consumed when repository close consumed the deadline")
+	}
+	if err := server.Serve(context.Background()); !errors.Is(err, ErrRuntimeConsumed) {
+		t.Fatalf("second Serve error = %v, want ErrRuntimeConsumed", err)
 	}
 }
 

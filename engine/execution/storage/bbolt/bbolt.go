@@ -862,16 +862,22 @@ func (s storeState) clone() storeState {
 func (s *storeState) syncMeta() {
 	var admissionRoot repository.AdmissionRootMetadata
 	var sealed bool
+	var successorDomainUUID string
+	var successorStateRoot string
 	if s.meta.state == repository.RecordValid {
 		admissionRoot = s.meta.value.AdmissionRoot
 		sealed = s.meta.value.Sealed
+		successorDomainUUID = s.meta.value.SuccessorDomainUUID
+		successorStateRoot = s.meta.value.SuccessorStateRoot
 	}
 	s.meta = validSlot(repository.AuthorityMeta{
-		SchemaVersion:   repository.CurrentAuthorityMetaSchemaVersion,
-		Generation:      s.generation,
-		NextJobSequence: s.nextJobSequence,
-		AdmissionRoot:   admissionRoot,
-		Sealed:          sealed,
+		SchemaVersion:       repository.CurrentAuthorityMetaSchemaVersion,
+		Generation:          s.generation,
+		NextJobSequence:     s.nextJobSequence,
+		AdmissionRoot:       admissionRoot,
+		Sealed:              sealed,
+		SuccessorDomainUUID: successorDomainUUID,
+		SuccessorStateRoot:  successorStateRoot,
 	})
 }
 
