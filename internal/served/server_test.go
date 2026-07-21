@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
@@ -700,16 +702,45 @@ func TestAdmissionRecoveryExecutorUnboundControlLossFinalizesWithoutBackendStart
 	}
 }
 
+func TestCompleteAdmissionRunLogsRecoveryObligationWhenAuthorityCleared(t *testing.T) {
+	var logs bytes.Buffer
+	oldLogWriter := log.Writer()
+	oldLogFlags := log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(oldLogWriter)
+		log.SetFlags(oldLogFlags)
+	}()
+
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	accepted := acceptIdentifiedAuthorityWork(t, server, "complete-after-close")
+	jobID := accepted.Record.JobID.String()
+	if err := server.closeServeAdmission(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := server.completeAdmissionRun(jobRun{jobID: jobID}, engine.StateCompleted, "done"); err != nil {
+		t.Fatal(err)
+	}
+	got := logs.String()
+	if !strings.Contains(got, jobID) || !strings.Contains(got, "startup recovery must finalize the durably accepted obligation") {
+		t.Fatalf("completion log = %q, want job id and recovery obligation", got)
+	}
+}
+
 func TestIdentifiedSubmitReplayAfterRestartReturnsPreAuthorizationTerminal(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	repo := memory.NewRepository()
-	anchorStore := authority.NewAnchorStore()
-
+	root := shortTempDir(t)
+	cwd := shortTempDir(t)
 	firstBackend := newFakeBackend("fake")
-	firstServer, _, cwd := newUnstartedTestServer(t, firstBackend)
 	firstLauncher := newAdmissionFakeLaunchCustodian(t)
-	enableTestAdmissionWithAuthorityStore(t, firstServer, firstLauncher, repo, anchorStore)
+	firstServer := newTestServerWithRoot(t, root, cwd, firstBackend, Config{IdleTimeout: -1})
+	configureTestAdmissionRuntime(t, firstServer, firstLauncher, true)
+	firstCancel, firstDone, _ := startTestServerWithBlockingListener(t, firstServer)
 	params := protocol.JobSubmitParams{
 		WorkspaceKey: "workspace-preauth-crash",
 		RequestID:    "request-preauth-crash",
@@ -737,11 +768,34 @@ func TestIdentifiedSubmitReplayAfterRestartReturnsPreAuthorizationTerminal(t *te
 		t.Fatalf("backend turn = %+v, want none before response hook", turn)
 	default:
 	}
+	firstCancel()
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first Serve stop error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first Serve did not stop")
+	}
+	for _, name := range []string{admissionRepositoryFile, admissionAnchorFile} {
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Fatalf("%s stat error = %v, want persistent production state", name, err)
+		}
+	}
 
 	secondBackend := newFakeBackend("fake")
-	secondServer, _, _ := newUnstartedTestServer(t, secondBackend)
 	secondLauncher := newAdmissionFakeLaunchCustodian(t)
-	enableTestAdmissionWithAuthorityStore(t, secondServer, secondLauncher, repo, anchorStore)
+	secondServer := newTestServerWithRoot(t, root, cwd, secondBackend, Config{IdleTimeout: -1})
+	configureTestAdmissionRuntime(t, secondServer, secondLauncher, true)
+	secondCancel, secondDone, _ := startTestServerWithBlockingListener(t, secondServer)
+	defer func() {
+		secondCancel()
+		select {
+		case <-secondDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("second Serve did not stop")
+		}
+	}()
 
 	record := loadAdmissionSafetyRecord(t, secondServer, submitted.JobID)
 	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeFailed || record.Terminal.Cause != model.CauseDaemonRestartedBeforeAuthorization {
@@ -1236,6 +1290,46 @@ func TestServeBootstrapRecordsLiveParentContextProbeFailureUnfenceable(t *testin
 	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
 }
 
+func TestServeBootstrapSanitizesProbeFailureReason(t *testing.T) {
+	t.Parallel()
+	hostile := "line1\nline2\t" + strings.Repeat("界", admissionProbeReasonMaxRunes) + "\x00tail"
+	backend := &probeErrorBackend{fakeBackend: newFakeBackend("fake"), err: errors.New(hostile)}
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-hostile-probe",
+		RequestID:    "request-hostile-probe",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want rejection", outcome.result)
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnfenceableBackend)
+	prefix := "probe strict backend fake failed: "
+	reason, ok := strings.CutPrefix(outcome.err.Message, prefix)
+	if !ok {
+		t.Fatalf("rejection message = %q, want probe failure prefix", outcome.err.Message)
+	}
+	if strings.ContainsAny(reason, "\x00\n\r\t") {
+		t.Fatalf("sanitized probe reason contains control characters: %q", reason)
+	}
+	if !utf8.ValidString(reason) {
+		t.Fatalf("sanitized probe reason is not valid UTF-8: %q", reason)
+	}
+	if got := utf8.RuneCountInString(reason); got > admissionProbeReasonMaxRunes {
+		t.Fatalf("sanitized probe reason runes = %d, want <= %d", got, admissionProbeReasonMaxRunes)
+	}
+	if !strings.HasSuffix(reason, "...") {
+		t.Fatalf("sanitized probe reason = %q, want truncation suffix", reason)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+}
+
 func TestServeBootstrapParentCanceledMidProbeFailsBootstrap(t *testing.T) {
 	t.Parallel()
 	backend := &probeErrorBackend{fakeBackend: newFakeBackend("fake"), started: make(chan struct{}, 1)}
@@ -1320,6 +1414,36 @@ func TestIdentifiedSubmitRejectsSessionContractViolationBeforeDurableAccept(t *t
 	assertNoAcceptedJobsInAdmission(t, server)
 	assertNoAuthoritySafetyRecords(t, server)
 	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+}
+
+func TestIdentifiedSubmitClosedAdmissionRepositoryReturnsStrictRouteNotReady(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	if server.admissionClose == nil {
+		t.Fatal("admission repository closer is nil")
+	}
+	if err := server.admissionClose.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.closeServeAdmission() })
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-closed-repo",
+		RequestID:    "request-closed-repo",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want closed-repository rejection", outcome.result)
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectStrictRouteDisabled)
+	if outcome.err.Data.Code == protocol.ErrorInvalidTaskSpec {
+		t.Fatalf("closed repository mapped to invalid_task_spec: %+v", outcome.err)
+	}
 }
 
 func TestIdentifiedFencedSubmitUsesLaunchControllerAndCompletes(t *testing.T) {
@@ -2636,49 +2760,64 @@ func TestSafetyFailStopDrainWaitsForBoundWhenAuthorityOwnershipCheckErrors(t *te
 }
 
 func TestSafetyFailStopDrainDeadlineWinsOverStalledOwnershipProbe(t *testing.T) {
-	t.Parallel()
+	var logs bytes.Buffer
+	oldLogWriter := log.Writer()
+	oldLogFlags := log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(oldLogWriter)
+		log.SetFlags(oldLogFlags)
+	}()
+
 	backend := newFakeBackend("fake")
 	launcher := newAdmissionFakeLaunchCustodian(t)
 	drainTimeout := 80 * time.Millisecond
-	blocker := newBlockingOwnedWorkChecker()
-	t.Cleanup(blocker.releaseProbe)
-	var server *Server
-	h := startTestServerWithHooks(t, backend, Config{IdleTimeout: -1}, func(s *Server) {
-		server = s
-		s.safetyDrainTimeout = drainTimeout
-		enableTestAdmission(t, s, launcher)
-		s.admissionOwnedWorkChecker = blocker
+	var blocker *blockingRepositoryOwnedWorkChecker
+	t.Cleanup(func() {
+		if blocker != nil {
+			blocker.releaseProbe()
+		}
 	})
+	server, _, _ := newUnstartedTestServer(t, backend)
+	server.safetyDrainTimeout = drainTimeout
+	configureTestAdmissionRuntime(t, server, launcher, true)
+	if err := server.bootstrapAdmission(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	blocker = newBlockingRepositoryOwnedWorkChecker(server.admissionRepository)
+	server.admissionOwnedWorkChecker = blocker
+	cancel, done, listener := startTestServerWithBlockingListener(t, server)
+	defer cancel()
 
 	reason := "test fail-stop drain deadline ignores stalled ownership probe"
 	trippedAt := time.Now()
 	if err := server.admissionReady.FailStop(context.Background(), reason); err != nil {
 		t.Fatal(err)
 	}
-	waitForSocketRemoved(t, h.socketPath, h.done)
+	listener.waitClosed(t)
 	select {
 	case <-blocker.started:
 	case <-time.After(time.Second):
 		t.Fatal("ownership probe was not started during fail-stop drain")
-	}
-	if conn, err := net.DialTimeout("unix", h.socketPath, 20*time.Millisecond); err == nil {
-		_ = conn.Close()
-		t.Fatal("new connection succeeded after safety fail-stop listener close")
 	}
 	if errObj := server.failStoppedRequestError(protocol.MethodJobSubmit); errObj == nil || errObj.Data.Code != protocol.ErrorBackendUnavailable {
 		t.Fatalf("job.submit rejection = %+v, want backend_unavailable after fail-stop", errObj)
 	}
 
 	select {
-	case err := <-h.done:
+	case err := <-done:
 		if err == nil || !errors.Is(err, ErrSafetyFailStopped) || !strings.Contains(err.Error(), reason) || !strings.Contains(err.Error(), "safety drain timed out") {
 			t.Fatalf("Serve error = %v, want timed-out safety fail-stop with reason", err)
 		}
-		if elapsed := time.Since(trippedAt); elapsed > 500*time.Millisecond {
-			t.Fatalf("Serve returned after %s, want bounded exit independent of stalled ownership probe", elapsed)
+		if elapsed := time.Since(trippedAt); elapsed > admissionRepositoryCloseTimeout+2*time.Second {
+			t.Fatalf("Serve returned after %s, want bounded exit within admission repository close timeout", elapsed)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(admissionRepositoryCloseTimeout + 3*time.Second):
 		t.Fatal("server did not exit while ownership probe was stalled")
+	}
+	if got := logs.String(); !strings.Contains(got, "admission repository close timed out; leaking handle at shutdown") {
+		t.Fatalf("shutdown log = %q, want admission repository close timeout", got)
 	}
 }
 
@@ -4216,6 +4355,30 @@ func (c *blockingOwnedWorkChecker) releaseProbe() {
 	c.releaseOnce.Do(func() { close(c.release) })
 }
 
+type blockingRepositoryOwnedWorkChecker struct {
+	*blockingOwnedWorkChecker
+	repo repository.Repository
+}
+
+func newBlockingRepositoryOwnedWorkChecker(repo repository.Repository) *blockingRepositoryOwnedWorkChecker {
+	return &blockingRepositoryOwnedWorkChecker{
+		blockingOwnedWorkChecker: newBlockingOwnedWorkChecker(),
+		repo:                     repo,
+	}
+}
+
+func (c *blockingRepositoryOwnedWorkChecker) HasOwnedWork(context.Context) (bool, error) {
+	if c == nil || c.repo == nil {
+		return false, errors.New("admission repository is not ready")
+	}
+	err := c.repo.View(context.Background(), func(repository.ReadTx) error {
+		c.startedOnce.Do(func() { close(c.started) })
+		<-c.release
+		return nil
+	})
+	return false, err
+}
+
 func assertServerStillRunning(t *testing.T, done <-chan error, reason string) {
 	t.Helper()
 	select {
@@ -4240,7 +4403,7 @@ func startTestServerWithRoot(t *testing.T, root, cwd string, backend engine.Back
 	return startTestServerWithRootAndHooks(t, root, cwd, backend, cfg, nil)
 }
 
-func startTestServerWithRootAndHooks(t *testing.T, root, cwd string, backend engine.Backend, cfg Config, configure func(*Server)) testServer {
+func newTestServerWithRoot(t *testing.T, root, cwd string, backend engine.Backend, cfg Config) *Server {
 	t.Helper()
 	cfg.StateRoot = root
 	cfg.CWD = cwd
@@ -4250,6 +4413,12 @@ func startTestServerWithRootAndHooks(t *testing.T, root, cwd string, backend eng
 	if err != nil {
 		t.Fatal(err)
 	}
+	return server
+}
+
+func startTestServerWithRootAndHooks(t *testing.T, root, cwd string, backend engine.Backend, cfg Config, configure func(*Server)) testServer {
+	t.Helper()
+	server := newTestServerWithRoot(t, root, cwd, backend, cfg)
 	if configure != nil {
 		configure(server)
 	}
@@ -4270,6 +4439,46 @@ func startTestServerWithRootAndHooks(t *testing.T, root, cwd string, backend eng
 		}
 	})
 	return h
+}
+
+func startTestServerWithBlockingListener(t *testing.T, server *Server) (context.CancelFunc, <-chan error, *blockingTestListener) {
+	t.Helper()
+	listener := newBlockingTestListener()
+	listening := make(chan struct{})
+	var listenOnce sync.Once
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		listenOnce.Do(func() { close(listening) })
+		if err := os.WriteFile(server.socketPath, []byte("blocking-listener"), 0o600); err != nil {
+			return nil, socketFileIdentity{}, err
+		}
+		identity, err := statSocketFileIdentity(server.socketPath)
+		if err != nil {
+			return nil, socketFileIdentity{}, err
+		}
+		return listener, identity, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ctx)
+		close(done)
+	}()
+	select {
+	case <-listening:
+	case err := <-done:
+		t.Fatalf("server exited before listener was ready: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking listener did not become ready")
+	}
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("server did not stop")
+		}
+	})
+	return cancel, done, listener
 }
 
 func stopTestServer(t *testing.T, h testServer) {
@@ -5435,6 +5644,44 @@ func (c *scriptedConn) writesString() string {
 	defer c.mu.Unlock()
 	return c.writes.String()
 }
+
+type blockingTestListener struct {
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newBlockingTestListener() *blockingTestListener {
+	return &blockingTestListener{closed: make(chan struct{})}
+}
+
+func (l *blockingTestListener) Accept() (net.Conn, error) {
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *blockingTestListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *blockingTestListener) Addr() net.Addr {
+	return testNetAddr("blocking-listener")
+}
+
+func (l *blockingTestListener) waitClosed(t *testing.T) {
+	t.Helper()
+	select {
+	case <-l.closed:
+	case <-time.After(time.Second):
+		t.Fatal("blocking listener did not close")
+	}
+}
+
+type testNetAddr string
+
+func (a testNetAddr) Network() string { return "test" }
+
+func (a testNetAddr) String() string { return string(a) }
 
 func singleKnownRecord(t *testing.T, server *Server) engine.JobRecord {
 	t.Helper()

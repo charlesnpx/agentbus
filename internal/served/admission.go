@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
@@ -23,14 +25,16 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
 	"github.com/charlesnpx/agentbus/internal/protocol"
+	bolt "go.etcd.io/bbolt"
 )
 
 const (
 	admissionRepositoryFile = "admission.bbolt"
 	admissionAnchorFile     = "admission-anchor.json"
 
-	admissionFailStopTimeout = 30 * time.Second
-	admissionProbeReasonMax  = 240
+	admissionFailStopTimeout        = 30 * time.Second
+	admissionRepositoryCloseTimeout = 5 * time.Second
+	admissionProbeReasonMaxRunes    = 512
 )
 
 var admissionDetachedCleanupTimeout = 30 * time.Second
@@ -233,8 +237,13 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 }
 
 func (s *Server) closeServeAdmission() error {
+	// Lock order for the admission shutdown path is submitMu -> stateMu.
+	// Identified submit never takes submitMu while holding stateMu; it snapshots
+	// under stateMu, releases it, and re-checks publication under submitMu
+	// before durable acceptance. That gives close a single order to serialize
+	// acceptance and state clearing without a lock cycle.
+	s.admissionSubmitMu.Lock()
 	s.admissionStateMu.Lock()
-	defer s.admissionStateMu.Unlock()
 
 	closer := s.admissionClose
 	s.admissionBootstrapper = nil
@@ -248,11 +257,27 @@ func (s *Server) closeServeAdmission() error {
 	s.admissionDaemonBootOnce = sync.Once{}
 	s.admissionDaemonBootRef = model.BootRef{}
 	s.admissionDaemonBootRefErr = nil
+	s.admissionStateMu.Unlock()
+	s.admissionSubmitMu.Unlock()
 
 	if closer != nil {
-		return closer.Close()
+		return closeAdmissionRepositoryWithTimeout(closer)
 	}
 	return nil
+}
+
+func closeAdmissionRepositoryWithTimeout(closer io.Closer) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- closer.Close()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(admissionRepositoryCloseTimeout):
+		log.Printf("agentbus daemon: admission repository close timed out; leaking handle at shutdown")
+		return nil
+	}
 }
 
 // The admission guards use snapshot-checkout, NOT lock-across-operation: the
@@ -352,10 +377,31 @@ func admissionProbeFailureError(name string, err error) error {
 	if err != nil {
 		message = err.Error()
 	}
-	if len(message) > admissionProbeReasonMax {
-		message = message[:admissionProbeReasonMax] + "..."
-	}
+	message = sanitizeAdmissionProbeReason(message)
 	return fmt.Errorf("probe strict backend %s failed: %s", name, message)
+}
+
+func sanitizeAdmissionProbeReason(message string) string {
+	const suffix = "..."
+	runes := make([]rune, 0, admissionProbeReasonMaxRunes)
+	for _, r := range message {
+		if unicode.IsPrint(r) || r == ' ' {
+			runes = append(runes, r)
+		} else {
+			runes = append(runes, ' ')
+		}
+		if len(runes) > admissionProbeReasonMaxRunes {
+			break
+		}
+	}
+	if len(runes) <= admissionProbeReasonMaxRunes {
+		return string(runes)
+	}
+	keep := admissionProbeReasonMaxRunes - len(suffix)
+	if keep < 0 {
+		keep = 0
+	}
+	return string(runes[:keep]) + suffix
 }
 
 func (s *Server) admissionBackendDescriptor(name string, backend engine.Backend, runtime *servedAdmissionRuntime, probeErr error) admissionBackendDescriptor {
@@ -1757,9 +1803,6 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		return requestOutcome{err: strictAdmissionRuntimeUnavailableError(instance.policy.runtimeAssessment, protocol.ErrorData{Backend: spec.Backend})}
 	}
 
-	s.admissionSubmitMu.Lock()
-	defer s.admissionSubmitMu.Unlock()
-
 	replay, err := instance.ready.LookupReplay(ctx, requestKey)
 	if err != nil {
 		return requestOutcome{err: admissionProtocolError(err)}
@@ -1805,7 +1848,13 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		Mode:               model.ModeIdentifiedFenced,
 		SessionID:          admissionSessionID,
 	}
+	s.admissionSubmitMu.Lock()
+	if !s.admissionInstanceStillReadyLocked(instance) {
+		s.admissionSubmitMu.Unlock()
+		return requestOutcome{err: admissionProtocolError(authority.ErrNotReady)}
+	}
 	accepted, err := instance.submission.SubmitIdentified(ctx, request)
+	s.admissionSubmitMu.Unlock()
 	if err != nil {
 		if admissionAcceptCommitted(accepted) {
 			return requestOutcome{err: admissionPostAcceptError(accepted, err)}
@@ -1859,6 +1908,15 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		after:        func() { s.handleAdmissionResponseOutcome(ctx, run, true) },
 		onAckFailure: func(error) { s.handleAdmissionResponseOutcome(ctx, run, false) },
 	}
+}
+
+func (s *Server) admissionInstanceStillReadyLocked(instance *admissionInstance) bool {
+	s.admissionStateMu.RLock()
+	defer s.admissionStateMu.RUnlock()
+	return instance != nil &&
+		s.admissionInstance == instance &&
+		instance.ready != nil &&
+		instance.submission != nil
 }
 
 func strictAdmissionInvalidConfigError(message string, data protocol.ErrorData) *protocol.ErrorObject {
@@ -2066,11 +2124,29 @@ func admissionProtocolError(err error) *protocol.ErrorObject {
 		return protocol.NewError(protocol.ErrorCapabilityMissing, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, custodian.ErrSupervisorUnavailable):
 		return protocol.NewError(protocol.ErrorCapabilityMissing, err.Error(), protocol.ErrorData{})
-	case errors.Is(err, authority.ErrNotReady), errors.Is(err, coordinator.ErrCoordinatorNotReady):
-		return protocol.NewError(protocol.ErrorCapabilityMissing, err.Error(), protocol.ErrorData{})
+	case admissionAuthorityNotReadyError(err):
+		return strictAdmissionProtocolError(
+			protocol.ErrorCapabilityMissing,
+			protocol.AdmissionRejectStrictRouteDisabled,
+			admissionNotReadyMessage(err),
+			protocol.ErrorData{},
+		)
 	default:
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
 	}
+}
+
+func admissionAuthorityNotReadyError(err error) bool {
+	return errors.Is(err, authority.ErrNotReady) ||
+		errors.Is(err, coordinator.ErrCoordinatorNotReady) ||
+		errors.Is(err, bolt.ErrDatabaseNotOpen)
+}
+
+func admissionNotReadyMessage(err error) string {
+	if err == nil || err.Error() == "" {
+		return "admission authority is not ready"
+	}
+	return "admission authority is not ready: " + err.Error()
 }
 
 func admissionAcceptCommitted(accepted authority.AcceptResult) bool {

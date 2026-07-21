@@ -6,12 +6,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
+	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -320,14 +322,21 @@ func (p servedResultPublisher) authorityRecord(ctx context.Context, jobID model.
 	if p.server == nil {
 		return model.SafetyRecord{}, false, nil
 	}
-	if p.server.admissionInstance == nil || p.server.admissionRepository == nil {
-		return model.SafetyRecord{}, false, nil
+	p.server.admissionStateMu.RLock()
+	repo := p.server.admissionRepository
+	ready := p.server.admissionInstance != nil && repo != nil
+	p.server.admissionStateMu.RUnlock()
+	if !ready {
+		return model.SafetyRecord{}, false, authority.ErrNotReady
 	}
 	var image repository.JobImage
-	if err := p.server.admissionRepository.View(ctx, func(tx repository.ReadTx) error {
+	if err := repo.View(ctx, func(tx repository.ReadTx) error {
 		image = tx.LoadJob(jobID)
 		return nil
 	}); err != nil {
+		if admissionAuthorityNotReadyError(err) {
+			return model.SafetyRecord{}, false, authority.ErrNotReady
+		}
 		return model.SafetyRecord{}, false, err
 	}
 	if image.Safety.State == repository.RecordValid {
@@ -409,6 +418,10 @@ func (s *Server) isAdmissionJob(jobID string) bool {
 }
 
 func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text string) error {
+	jobID, err := model.NewJobID(run.jobID)
+	if err != nil {
+		return err
+	}
 	// Snapshot-checkout: Snapshot/Complete are authority operations that must
 	// not hold admissionStateMu (a stalled op would block closeServeAdmission
 	// past the safety fail-stop drain deadline).
@@ -417,11 +430,11 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 	ready := s.admissionInstance != nil && coord != nil
 	s.admissionStateMu.RUnlock()
 	if !ready {
+		// Graceful Serve exit is equivalent to a daemon crash for this
+		// post-accept/pre-completion window: restart recovery owns the
+		// durably accepted obligation and replay returns that terminal job.
+		log.Printf("agentbus daemon: admission job %s completed while authority was not ready; startup recovery must finalize the durably accepted obligation", jobID)
 		return nil
-	}
-	jobID, err := model.NewJobID(run.jobID)
-	if err != nil {
-		return err
 	}
 	snapshot, err := coord.Snapshot(context.Background(), jobID)
 	if err == nil && snapshot.Record.Terminal != nil {

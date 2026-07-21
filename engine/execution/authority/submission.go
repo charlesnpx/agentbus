@@ -18,7 +18,10 @@ type SubmissionCoordinator interface {
 	// a distinct pre-authorization window. Startup recovery finalizes that job
 	// failed-with-cause deterministically under at-most-once semantics, and
 	// replay returns that terminal job: never a silent dangling acceptance,
-	// never a double execution.
+	// never a double execution. A GRACEFUL Serve exit racing an acceptance is
+	// equivalent to that crash window: shutdown refuses new durable accepts
+	// once it begins, and any acceptance whose response or turn raced the exit
+	// is finalized by the next Serve's recovery exactly as above.
 	SubmitIdentified(context.Context, AcceptRequest) (AcceptResult, error)
 
 	// PrepareLegacyFenced prepares the fenced legacy launch before the response
