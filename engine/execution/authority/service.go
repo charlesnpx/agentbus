@@ -90,6 +90,10 @@ type AcceptResult struct {
 	Replayed   bool
 }
 
+func ValidateSessionID(sessionID string) error {
+	return model.ProjectionMetadata{SessionID: sessionID}.Validate()
+}
+
 type ApplyResult struct {
 	Record     model.SafetyRecord
 	Projection model.JobProjection
@@ -392,6 +396,9 @@ func normalizeAcceptRequest(request AcceptRequest) (AcceptRequest, error) {
 	}
 	if err := request.Mode.Validate(); err != nil {
 		return AcceptRequest{}, fmt.Errorf("%w: mode: %v", ErrInvalidRequest, err)
+	}
+	if err := ValidateSessionID(request.SessionID); err != nil {
+		return AcceptRequest{}, fmt.Errorf("%w: projection metadata: %v", ErrInvalidRequest, err)
 	}
 	if _, err := model.Project(model.SafetyRecord{
 		SchemaVersion:      safetySchemaVersion,

@@ -282,6 +282,10 @@ func PlanRecovery(record SafetyRecord, trigger RecoveryTrigger) (RecoveryPlan, e
 		plan.Next = RecoveryAction{Kind: RecoveryRetireThenFinalize}
 		return plan, nil
 	}
+	// Fatal-unprovable remains for structurally invalid/corrupt safety records,
+	// legacy-unfenced open recovery, launch evidence with no durable group,
+	// missing physical quiescence proof, missing required result certificates,
+	// and contradictory recorded outcome/release/quiescence predicates.
 	plan.Next = RecoveryAction{Kind: RecoveryFatalUnprovable}
 	return plan, nil
 }
@@ -298,6 +302,13 @@ func needsContainment(record SafetyRecord, _ RecoveryTrigger) bool {
 func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger) TerminalIntent {
 	afterAuthorization := hasAnyGrant(record.Attempt) || hasAnyRelease(record.Attempt)
 	intent := TerminalIntent{DerivedBy: record.AdmittedBy}
+	if record.Outcome != nil {
+		intent.Outcome = record.Outcome.Outcome
+		intent.Cause = recordedOutcomeRecoveryCause(record.Outcome.Outcome, trigger, afterAuthorization)
+		return intent
+	}
+	// Without recorded outcome progress, recovery synthesizes OutcomeReaped only
+	// for launches with grant/release evidence.
 	switch trigger {
 	case RecoveryCancelAfterGrant:
 		intent.Outcome = OutcomeCanceled
@@ -327,4 +338,37 @@ func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger) Termin
 		}
 	}
 	return intent
+}
+
+func recordedOutcomeRecoveryCause(outcome Outcome, trigger RecoveryTrigger, afterAuthorization bool) TerminalCause {
+	switch outcome {
+	case OutcomeCompleted, OutcomeCompletedNoncompliant, OutcomeFailed, OutcomeTimedOut, OutcomeInterrupted:
+		if afterAuthorization {
+			return CauseCompletedNormally
+		}
+		if trigger == RecoveryLiveLoss {
+			return CauseSupervisorLostBeforeAuthorization
+		}
+		return CauseDaemonRestartedBeforeAuthorization
+	case OutcomeCanceled:
+		if afterAuthorization {
+			return CauseCanceledAfterAuthorization
+		}
+		return CauseCanceledBeforeAuthorization
+	case OutcomeQuarantined:
+		return CauseCorruptProjection
+	case OutcomeReaped:
+		if afterAuthorization && trigger == RecoveryLiveLoss {
+			return CauseSupervisorLostAfterAuthorization
+		}
+		if afterAuthorization {
+			return CauseDaemonRestartedAfterAuthorization
+		}
+		return CauseDaemonRestartedBeforeAuthorization
+	default:
+		if afterAuthorization {
+			return CauseDaemonRestartedAfterAuthorization
+		}
+		return CauseDaemonRestartedBeforeAuthorization
+	}
 }

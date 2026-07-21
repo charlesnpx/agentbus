@@ -20,9 +20,11 @@ type SubmissionCoordinator interface {
 	// replay returns that terminal job: never a silent dangling acceptance,
 	// never a double execution. A GRACEFUL Serve exit racing an acceptance is
 	// equivalent to the daemon-crash windows generally: recovery finalizes by
-	// recorded progress, with pre-authorization acceptances failed before
-	// authorization and already-authorized launches reaped after authorization.
-	// In every case at-most-once holds and replay returns the terminal job.
+	// recorded progress, preserving recorded outcomes, failing pre-authorization
+	// acceptances before authorization, and reaping authorized launches with no
+	// recorded outcome; contradictory or unverifiable physical evidence
+	// fail-stops instead of finalizing. In every case at-most-once holds and
+	// replay returns the terminal job.
 	SubmitIdentified(context.Context, AcceptRequest) (AcceptResult, error)
 
 	// PrepareLegacyFenced prepares the fenced legacy launch before the response

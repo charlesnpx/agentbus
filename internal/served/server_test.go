@@ -946,6 +946,127 @@ func TestIdentifiedSubmitReplayAfterRestartReturnsPreAuthorizationTerminal(t *te
 	assertAuthoritySafetyRecordCount(t, secondServer, 1)
 }
 
+func TestIdentifiedSubmitReplayAfterRestartPreservesRecordedOutcome(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := shortTempDir(t)
+	cwd := shortTempDir(t)
+	firstBackend := newFakeBackend("fake")
+	firstLauncher := newAdmissionFakeLaunchCustodian(t)
+	firstServer := newTestServerWithRoot(t, root, cwd, firstBackend, Config{IdleTimeout: -1})
+	configureTestAdmissionRuntime(t, firstServer, firstLauncher, true)
+	firstCancel, firstDone, _ := startTestServerWithBlockingListener(t, firstServer)
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-recorded-outcome-crash",
+		RequestID:    "request-recorded-outcome-crash",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}
+	outcome := firstServer.handleJobSubmit(ctx, mustMarshal(t, params))
+	if outcome.err != nil {
+		t.Fatalf("initial submit error = %+v", outcome.err)
+	}
+	submitted, ok := outcome.result.(protocol.JobSubmitResult)
+	if !ok {
+		t.Fatalf("initial submit result type = %T", outcome.result)
+	}
+	if submitted.JobID == "" || submitted.Deduplicated || outcome.after == nil {
+		t.Fatalf("initial submit result = %+v hasHook=%t, want accepted non-replay with response hook", submitted, outcome.after != nil)
+	}
+	if got := firstBackend.count.Load(); got != 1 {
+		t.Fatalf("first backend starts = %d, want construction before durable accept", got)
+	}
+	select {
+	case turn := <-firstBackend.turns:
+		t.Fatalf("backend turn = %+v, want none before response hook", turn)
+	default:
+	}
+
+	record := loadAdmissionSafetyRecord(t, firstServer, submitted.JobID)
+	ref := record.Attempt.Ref
+	group := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne})
+	if _, err := firstServer.admissionReady.BindGroup(ctx, record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := firstServer.admissionReady.AllocateGrant(ctx, ref, model.LaunchOrdinalOne); err != nil {
+		t.Fatal(err)
+	}
+	child, err := model.NewChildIdentity(5201, "recorded-outcome-child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := model.NewEvidence("released", "recorded outcome release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstServer.admissionReady.RecordRelease(ctx, record.JobID, ref, model.LaunchOrdinalOne, child, evidence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstServer.admissionReady.RecordOutcome(ctx, record.JobID, ref, model.OutcomeFailed); err != nil {
+		t.Fatal(err)
+	}
+	record = loadAdmissionSafetyRecord(t, firstServer, submitted.JobID)
+	if record.Outcome == nil || record.Outcome.Outcome != model.OutcomeFailed || record.Terminal != nil {
+		t.Fatalf("crash-window safety = %+v, want recorded failed outcome without terminal", record)
+	}
+
+	firstCancel()
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first Serve stop error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first Serve did not stop")
+	}
+
+	secondBackend := newFakeBackend("fake")
+	secondLauncher := newAdmissionFakeLaunchCustodian(t)
+	secondServer := newTestServerWithRoot(t, root, cwd, secondBackend, Config{IdleTimeout: -1})
+	configureTestAdmissionRuntime(t, secondServer, secondLauncher, true)
+	secondCancel, secondDone, _ := startTestServerWithBlockingListener(t, secondServer)
+	defer func() {
+		secondCancel()
+		select {
+		case <-secondDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("second Serve did not stop")
+		}
+	}()
+
+	record = loadAdmissionSafetyRecord(t, secondServer, submitted.JobID)
+	if record.Terminal == nil ||
+		record.Terminal.Outcome != model.OutcomeFailed ||
+		record.Terminal.Cause != model.CauseCompletedNormally ||
+		record.Terminal.Proof != model.ProofCleanQuiescentOutcomeAndRetired {
+		t.Fatalf("recovered terminal = %+v, want recorded failed clean terminal", record.Terminal)
+	}
+	if got := secondLauncher.containCount(); got != 1 {
+		t.Fatalf("recovery containments = %d, want 1", got)
+	}
+	if reason := secondServer.safetyLatch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+
+	replay := secondServer.handleJobSubmit(ctx, mustMarshal(t, params))
+	if replay.err != nil {
+		t.Fatalf("replay submit error = %+v", replay.err)
+	}
+	replayed, ok := replay.result.(protocol.JobSubmitResult)
+	if !ok {
+		t.Fatalf("replay submit result type = %T", replay.result)
+	}
+	if replayed.JobID != submitted.JobID || !replayed.Deduplicated || replayed.State != engine.StateFailed {
+		t.Fatalf("replay result = %+v, want same failed terminal job %s", replayed, submitted.JobID)
+	}
+	if replay.after != nil {
+		t.Fatal("replay returned a launch hook")
+	}
+	if got := secondBackend.count.Load(); got != 0 {
+		t.Fatalf("second backend starts = %d, want 0 for terminal replay", got)
+	}
+	assertAuthoritySafetyRecordCount(t, secondServer, 1)
+}
+
 func TestAdmissionRecoveryExecutorBoundCurrentObligationContainsOnlyDurableGroup(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1349,6 +1470,23 @@ func (b *lyingControlledBackend) Start(context.Context, engine.SessionOpts) (eng
 	return b.session, nil
 }
 
+type invalidSessionIDBackend struct {
+	*fakeBackend
+	sessionID string
+}
+
+func (b *invalidSessionIDBackend) ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error) {
+	return b, nil
+}
+
+func (b *invalidSessionIDBackend) Start(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
+	b.count.Add(1)
+	if b.startHook != nil {
+		b.startHook(opts)
+	}
+	return &fakeSession{id: b.sessionID, backend: b.fakeBackend}, nil
+}
+
 // A strict backend whose probe fails for environment reasons (missing binary,
 // bad version) must NOT fail Serve bootstrap: the daemon keeps serving and the
 // backend is recorded unfenceable so strict identified admission rejects it
@@ -1535,6 +1673,100 @@ func TestIdentifiedSubmitRejectsSessionContractViolationBeforeDurableAccept(t *t
 	assertNoAcceptedJobsInAdmission(t, server)
 	assertNoAuthoritySafetyRecords(t, server)
 	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+}
+
+func TestIdentifiedSubmitRejectsInvalidBackendSessionIDBeforeDurableAccept(t *testing.T) {
+	t.Parallel()
+	backend := &invalidSessionIDBackend{fakeBackend: newFakeBackend("fake"), sessionID: "bad id"}
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-invalid-backend-session",
+		RequestID:    "request-invalid-backend-session",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want backend metadata rejection", outcome.result)
+	}
+	if outcome.after != nil {
+		t.Fatal("invalid backend session returned a launch hook")
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorBackendUnavailable)
+	if resp.Error.Data.AdmissionCause != "" {
+		t.Fatalf("admission cause = %q, want none for backend metadata failure", resp.Error.Data.AdmissionCause)
+	}
+	if resp.Error.Data.Backend != "fake" || resp.Error.Data.SessionID != "bad id" {
+		t.Fatalf("error data = %+v, want backend fake session bad id", resp.Error.Data)
+	}
+	if !strings.Contains(outcome.err.Message, "backend returned invalid session id") {
+		t.Fatalf("error message = %q, want backend session id defect", outcome.err.Message)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts = %d, want one construction attempt", got)
+	}
+	select {
+	case turn := <-backend.turns:
+		t.Fatalf("backend turn = %+v, want none before durable accept", turn)
+	default:
+	}
+	if reason := server.safetyLatch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoAuthoritySafetyRecords(t, server)
+	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+
+	malformed := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-malformed-client",
+		RequestID:    "request-malformed-client",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false},
+	}))
+	if malformed.err == nil {
+		t.Fatalf("malformed client submit result = %+v, want invalid_task_spec", malformed.result)
+	}
+	malformedResp := protocol.Response{Error: malformed.err}
+	assertRPCCode(t, malformedResp, protocol.ErrorInvalidTaskSpec)
+	assertRPCAdmissionCause(t, malformedResp, protocol.AdmissionRejectInvalidStrictConfig)
+	assertNoAuthoritySafetyRecords(t, server)
+}
+
+// Pins the REAL controlled-backend contract: CLI-adapter sessions have no id
+// at Start time (the backend stream assigns it during the first turn), so an
+// empty Session.ID() at submit MUST be accepted with a served-generated
+// admission session id — never rejected as a backend metadata defect. Success
+// also proves the fallback engaged: the authority's normalizeAcceptRequest
+// rejects empty session ids, so acceptance implies a valid id was supplied.
+func TestIdentifiedSubmitAcceptsEmptyBackendSessionIDWithGeneratedID(t *testing.T) {
+	t.Parallel()
+	backend := &invalidSessionIDBackend{fakeBackend: newFakeBackend("fake"), sessionID: ""}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-empty-backend-session",
+		RequestID:    "request-empty-backend-session",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err != nil {
+		t.Fatalf("submit with empty backend session id rejected: %+v", outcome.err)
+	}
+	if outcome.result == nil {
+		t.Fatal("submit result missing")
+	}
+	result, ok := outcome.result.(protocol.JobSubmitResult)
+	if !ok {
+		t.Fatalf("submit result type = %T, want JobSubmitResult", outcome.result)
+	}
+	if result.JobID == "" {
+		t.Fatal("accepted job id empty")
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts = %d, want one", got)
+	}
 }
 
 func TestIdentifiedSubmitClosedAdmissionRepositoryReturnsStrictRouteNotReady(t *testing.T) {

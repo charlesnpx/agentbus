@@ -456,6 +456,89 @@ func TestPostGrantRecoveryTerminalizesFromAnyVerifiedQuiescenceMethod(t *testing
 	}
 }
 
+func TestPlanRecoveryPreservesRecordedOutcomeAfterAuthorization(t *testing.T) {
+	tests := []struct {
+		name   string
+		record SafetyRecord
+		want   Outcome
+	}{
+		{
+			name:   "failed",
+			record: reducerMustApply(t, reducerQuiescentRecord(t), ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeFailed}),
+			want:   OutcomeFailed,
+		},
+		{
+			name:   "completed",
+			record: reducerCleanCompletedRecord(t),
+			want:   OutcomeCompleted,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan, err := PlanRecovery(tt.record, RecoveryStartupLoss)
+			if err != nil {
+				t.Fatalf("PlanRecovery error = %v", err)
+			}
+			if plan.Next.Kind != RecoveryFinalizeCertified || plan.Next.Finalize == nil {
+				t.Fatalf("plan = %#v, want finalize-certified action", plan.Next)
+			}
+			if plan.Next.Finalize.Intent.Outcome != tt.want {
+				t.Fatalf("finalize outcome = %s, want recorded %s", plan.Next.Finalize.Intent.Outcome, tt.want)
+			}
+			finalized, err := apply(tt.record, *plan.Next.Finalize)
+			if err != nil {
+				t.Fatalf("Finalize recorded outcome error = %v", err)
+			}
+			if finalized.Record.Terminal == nil || finalized.Record.Terminal.Outcome != tt.want {
+				t.Fatalf("terminal = %#v, want outcome %s", finalized.Record.Terminal, tt.want)
+			}
+			if finalized.Record.Terminal.Cause != CauseCompletedNormally {
+				t.Fatalf("terminal cause = %s, want %s", finalized.Record.Terminal.Cause, CauseCompletedNormally)
+			}
+		})
+	}
+}
+
+func TestPlanRecoveryAuthorizedWithoutRecordedOutcomeStillReaps(t *testing.T) {
+	record := reducerGrantRecord(t)
+	record = reducerMustApply(t, record, reducerQuiescenceCommand(t, record, LaunchOrdinalOne))
+
+	plan, err := PlanRecovery(record, RecoveryStartupLoss)
+	if err != nil {
+		t.Fatalf("PlanRecovery error = %v", err)
+	}
+	if plan.Next.Kind != RecoveryFinalizeCertified || plan.Next.Finalize == nil {
+		t.Fatalf("plan = %#v, want finalize-certified action", plan.Next)
+	}
+	if plan.Next.Finalize.Intent.Outcome != OutcomeReaped || plan.Next.Finalize.Intent.Cause != CauseDaemonRestartedAfterAuthorization {
+		t.Fatalf("finalize intent = %+v, want reaped daemon-restarted-after-authorization", plan.Next.Finalize.Intent)
+	}
+	finalized, err := apply(record, *plan.Next.Finalize)
+	if err != nil {
+		t.Fatalf("Finalize authorized no-outcome recovery error = %v", err)
+	}
+	if finalized.Record.Terminal == nil ||
+		finalized.Record.Terminal.Outcome != OutcomeReaped ||
+		finalized.Record.Terminal.Cause != CauseDaemonRestartedAfterAuthorization {
+		t.Fatalf("terminal = %#v, want reaped daemon-restarted-after-authorization", finalized.Record.Terminal)
+	}
+}
+
+func TestPlanRecoveryContradictoryRecordedOutcomeMissingReleaseStaysFatalUnprovable(t *testing.T) {
+	record := reducerGrantRecord(t)
+	record = reducerMustApply(t, record, reducerContainmentCommand(t, record))
+	record = reducerMustApply(t, record, ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeFailed})
+
+	plan, err := PlanRecovery(record, RecoveryStartupLoss)
+	if err != nil {
+		t.Fatalf("PlanRecovery error = %v", err)
+	}
+	if plan.Next.Kind != RecoveryFatalUnprovable {
+		t.Fatalf("plan = %#v, want fatal-unprovable", plan.Next)
+	}
+}
+
 func TestOnlyTerminalGoSelectsProofKind(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {

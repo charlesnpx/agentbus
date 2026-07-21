@@ -1897,7 +1897,6 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		return requestOutcome{err: admissionProtocolError(authority.ErrRequestExpired)}
 	}
 
-	admissionSessionID := s.nextID("ses")
 	session, err := descriptor.backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
 	if err != nil {
 		return requestOutcome{err: backendError(err)}
@@ -1911,8 +1910,17 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 			protocol.ErrorData{Backend: spec.Backend},
 		)}
 	}
-	if id := session.ID(); id != "" {
-		admissionSessionID = id
+	// CLI-adapter sessions have NO id at Start time: the backend stream assigns
+	// it during the first turn (cliadapter Session.id is set from stream parse).
+	// An empty id here is therefore the NORMAL controlled-backend contract, and
+	// served supplies the admission session id — the pre-existing behavior. Only
+	// a NONEMPTY id that fails the authority's own validation is a backend
+	// metadata defect (backend_unavailable, pre-acceptance, no durable mutation).
+	admissionSessionID := session.ID()
+	if admissionSessionID == "" {
+		admissionSessionID = s.nextID("ses")
+	} else if err := authority.ValidateSessionID(admissionSessionID); err != nil {
+		return requestOutcome{err: backendSessionMetadataError(spec.Backend, admissionSessionID, err)}
 	}
 	request := authority.AcceptRequest{
 		RequestKey:         requestKey,
@@ -2037,6 +2045,14 @@ func strictAdmissionRuntimeUnavailableError(assessment custodian.SupportAssessme
 		message += ": " + assessment.Cause.Error()
 	}
 	return strictAdmissionProtocolError(protocol.ErrorCapabilityMissing, protocol.AdmissionRejectUnavailableNativeRuntime, message, data)
+}
+
+func backendSessionMetadataError(backend, sessionID string, err error) *protocol.ErrorObject {
+	message := "backend returned invalid session id"
+	if err != nil && err.Error() != "" {
+		message += ": " + err.Error()
+	}
+	return protocol.NewError(protocol.ErrorBackendUnavailable, message, protocol.ErrorData{Backend: backend, SessionID: sessionID})
 }
 
 func strictAdmissionProtocolError(code, cause, message string, data protocol.ErrorData) *protocol.ErrorObject {
@@ -2208,6 +2224,7 @@ func admissionProtocolError(err error) *protocol.ErrorObject {
 	case errors.Is(err, authority.ErrRequestExpired):
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, authority.ErrInvalidRequest):
+		// Served validates backend session metadata before authority ingress; remaining invalid requests are client-owned.
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
 	case errors.Is(err, model.ErrIncompatibleExecutionCapabilities):
 		return protocol.NewError(protocol.ErrorCapabilityMissing, err.Error(), protocol.ErrorData{})
