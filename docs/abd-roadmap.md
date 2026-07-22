@@ -4,12 +4,12 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R4B CLOSED (R4B closed at 9726222: SHIP, 0 findings — durable identified
-acceptance + immutable per-Serve policy + ordered strict taxonomy + bounded fail-closed shutdown +
-finalize-by-recorded-progress recovery; 6 commits, 6 sol review rounds, findings
-2H+3M → 3H+3M → 1H+2M → 0H+2M → 1M+1L → 0). Next: R5 (launching) → R6/R7A → R7B.
-Production still UnavailableRuntime; R0T sentinel `strict_admission_native_runtime_unavailable`
-green throughout.
+STATUS: EXECUTING. R0..R5 CLOSED (R5 closed at 3bed997: SHIP, 0 findings — sticky one-way
+activation enforced at the repository, no-downgrade + C9 support-loss table, admin verbs with
+rotation identity/exclusive creation/sticky fail-stop, Begin-composed startability probe;
+6 commits, 6 sol review rounds, findings 6H → 3H+1M → 2H+1M → 1H+1M+1L → 1H → 0).
+Next: R6/R7A (launching) → R7B. Production still UnavailableRuntime; R0T sentinel
+`strict_admission_native_runtime_unavailable` green throughout.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -286,6 +286,23 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
+- 2026-07-21 R5 CLOSED (SHIP, 0 findings at 3bed997). Arc: 2f00fb0 (landed: anchored one-way
+  AdmissionRootMetadata; no-downgrade policy; C9 support-loss table + AdmissionSupportDiagnostic;
+  admin verbs inspect/recover/reset-empty-root/seal; legacy_downgrade + permanently_sealed causes)
+  → 5019111 (fix: repo-level one-way invariants via shared ValidateAuthorityMetaPut; SelfTest split
+  from construction, probe at the C9 point per Serve; bounded runtime close; sticky fail_stopped +
+  clear-fail-stop verb; seal rotation with --new-state-root; flock-held reset with ErrRootBusy)
+  → 37c8716 (fix2: seal init-new-first — sealed-without-replacement unreachable; runtime cleanup on
+  every pre-publication path + Config.Runtime single-use ErrRuntimeConsumed; meta reconstruction
+  only on provably-fresh store; ContractVersion declare-once; UnavailableRuntime self-test support
+  verbatim) → 7347d0e (fix3: SuccessorDomainUUID pinned in the seal record, immutable; consumed at
+  disposal-COMMIT across all five disposal shapes; mkdir reservation + ownership-manifest cleanup)
+  → b37093b (fix4: startable-successor replay; verify-absent + O_EXCL + os.Link exclusive
+  publication; typed parent-must-exist) → 3bed997 (fix5: probeBeginStartability factored FROM and
+  composed BY Begin — replay/startup divergence impossible; equivalence pin drives real Begin
+  outcomes). Review trajectory 6H → 3H+1M → 2H+1M → 1H+1M+1L → 1H → 0 across 6 refute-first sol
+  rounds. Landing gates: five consecutive zero-flake closure batteries after the shared-helper
+  deadline repair (waitJobState/waitBackendStarts 1s→5s, papercut'd audit of residual 1s waits).
 - 2026-07-21 R4B CLOSED (SHIP, 0 findings at 9726222). Arc: 6b3f2cb (landed) → 03ab8f2 (fix: five
   findings — fail-stop outruns stalled admission work; snapshot-checkout guards) → 499c6c3 (fix3:
   bounded 5s repository close, clear-state-first, leak-on-timeout; close takes admissionSubmitMu —
