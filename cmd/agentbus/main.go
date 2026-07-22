@@ -23,6 +23,9 @@ import (
 const (
 	protocolMajor = 1
 	cliJSONSchema = 1
+
+	admissionModeLegacy = "legacy"
+	admissionModeStrict = "strict"
 )
 
 var version = "dev"
@@ -68,9 +71,17 @@ func newDefaultApp() *app {
 
 func defaultBackendSpecs(cachePath string) []backendSpec {
 	return []backendSpec{
-		newBackendSpec(codexcli.New(codexcli.Options{CachePath: cachePath})),
-		newBackendSpec(claudecli.New(claudecli.Options{CachePath: cachePath})),
+		newBackendSpec(codexcli.New(codexcli.Options{Binary: resolvedDefaultBackendBinary("codex"), CachePath: cachePath})),
+		newBackendSpec(claudecli.New(claudecli.Options{Binary: resolvedDefaultBackendBinary("claude"), CachePath: cachePath})),
 	}
+}
+
+func resolvedDefaultBackendBinary(name string) string {
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return ""
+	}
+	return path
 }
 
 func newBackendSpec(backend engine.Backend) backendSpec {
@@ -174,14 +185,19 @@ func (a *app) runSetup(ctx context.Context, args []string, out, errOut io.Writer
 func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int {
 	fs := newCommandFlagSet("serve", errOut)
 	foreground := fs.Bool("foreground", false, "run daemon in foreground")
+	admissionModeRaw := fs.String("admission", admissionModeLegacy, "admission mode: legacy or strict; strict requires Linux cgroup-v2")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
 	if fs.NArg() != 0 {
 		return usageError(errOut, "serve does not accept positional arguments")
 	}
+	admissionMode, err := normalizeServeAdmissionMode(*admissionModeRaw)
+	if err != nil {
+		return usageError(errOut, err.Error())
+	}
 	if !*foreground {
-		if err := a.startBackgroundDaemon(ctx); err != nil {
+		if err := a.startBackgroundDaemon(ctx, admissionMode); err != nil {
 			return commandError(errOut, err)
 		}
 		return 0
@@ -192,18 +208,31 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 			backends = append(backends, spec.backend)
 		}
 	}
-	err := agentbusserve.Serve(ctx, agentbusserve.Config{
-		StateRoot:    a.stateRoot,
-		CWD:          a.cwd,
-		Backends:     backends,
-		Registry:     a.registryOrDefault(),
-		Clock:        a.clock,
-		ProcessTable: a.processes,
+	err = agentbusserve.Serve(ctx, agentbusserve.Config{
+		StateRoot:                a.stateRoot,
+		CWD:                      a.cwd,
+		Backends:                 backends,
+		Registry:                 a.registryOrDefault(),
+		Clock:                    a.clock,
+		ProcessTable:             a.processes,
+		StrictAdmissionRequested: admissionMode == admissionModeStrict,
 	})
 	if err != nil {
 		return commandError(errOut, err)
 	}
 	return 0
+}
+
+func normalizeServeAdmissionMode(raw string) (string, error) {
+	mode := strings.TrimSpace(raw)
+	switch mode {
+	case "", admissionModeLegacy:
+		return admissionModeLegacy, nil
+	case admissionModeStrict:
+		return admissionModeStrict, nil
+	default:
+		return "", fmt.Errorf("serve --admission must be %q or %q", admissionModeLegacy, admissionModeStrict)
+	}
 }
 
 func (a *app) runAdmission(ctx context.Context, args []string, out, errOut io.Writer) int {
@@ -370,12 +399,16 @@ func (a *app) runAdmissionClearFailStop(ctx context.Context, args []string, out,
 	return 0
 }
 
-func (a *app) startBackgroundDaemon(ctx context.Context) error {
+func (a *app) startBackgroundDaemon(ctx context.Context, admissionMode string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, exe, "serve", "--foreground")
+	cmdArgs := []string{"serve", "--foreground"}
+	if admissionMode == admissionModeStrict {
+		cmdArgs = append(cmdArgs, "--admission="+admissionModeStrict)
+	}
+	cmd := exec.CommandContext(ctx, exe, cmdArgs...)
 	cmd.Env = os.Environ()
 	if a.stateRoot != "" {
 		cmd.Env = append(cmd.Env, "AGENTBUS_STATE_ROOT="+a.stateRoot)
@@ -1012,7 +1045,7 @@ func printRootHelp(out io.Writer) {
 	fmt.Fprint(out, `Usage:
   agentbus version [--json]
   agentbus setup [--json]
-  agentbus serve [--foreground]
+  agentbus serve [--foreground] [--admission=legacy|strict]
   agentbus admission <inspect|recover|reset-empty-root|seal|clear-fail-stop> --state-root <path>
   agentbus sessions [--tags k=v] [--json]
   agentbus status [--job <id>] [--json]
@@ -1031,6 +1064,9 @@ JSON shapes:
 
 Exit codes for single-job status/result/cancel:
   completed=0, non-terminal=2, completed_noncompliant=3, failed=4, timed_out=5, interrupted=6, canceled=7, reaped=8, quarantined=9
+
+Serve admission:
+  --admission=legacy is the default. --admission=strict explicitly activates strict identified admission on Linux cgroup-v2; unsupported hosts fail closed at startup. Strict activation is one-way for a state root; use admission recover, seal, or reset-empty-root for the admin escape hatches. The first strict release supports one active state root.
 `)
 }
 

@@ -65,9 +65,18 @@ func TestVersionAndServeCommands(t *testing.T) {
 		t.Fatalf("version output = %+v", version)
 	}
 
-	code, _, stderr = runTestCLI(t, a, []string{"serve", "--help"}, "")
+	code, stdout, stderr = runTestCLI(t, a, []string{"serve", "--help"}, "")
 	if code != 0 {
 		t.Fatalf("serve help exit = %d stderr=%s", code, stderr)
+	}
+	help := stdout + stderr
+	if !strings.Contains(help, "--admission") || !strings.Contains(help, "strict") {
+		t.Fatalf("serve help missing admission flag: stdout=%s stderr=%s", stdout, stderr)
+	}
+
+	code, _, stderr = runTestCLI(t, a, []string{"serve", "--foreground", "--admission=permissive"}, "")
+	if code == 0 || !strings.Contains(stderr, `serve --admission must be "legacy" or "strict"`) {
+		t.Fatalf("invalid admission mode exit=%d stderr=%s", code, stderr)
 	}
 }
 

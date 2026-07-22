@@ -356,6 +356,10 @@ Version mismatch error example:
 `backends` is the list of backend names accepted by `session.start` and
 `job.submit`. `capabilities` is a string-keyed object. Clients MUST gate optional
 behavior on explicit capabilities rather than protocol major version alone.
+When strict identified admission is active for the current `agentbus serve`
+instance and the installed policy has crash-durable containment,
+`capabilities` also includes `"admission.strictContainment": true`. It is
+omitted otherwise. `jobs.requestId` remains unadvertised in this release.
 
 ### `session.start`
 

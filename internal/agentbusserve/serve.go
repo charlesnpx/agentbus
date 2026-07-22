@@ -23,6 +23,10 @@ func RecoverAdmissionRoot(ctx context.Context, cfg Config) (served.AdmissionReco
 }
 
 func productionServedConfig(cfg Config) served.Config {
+	if cfg.StrictAdmissionRequested {
+		strictCfg, _ := strictAdmissionServedConfig(cfg, StrictAdmissionOptions{})
+		return strictCfg
+	}
 	cfg.Runtime = custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable)
 	cfg.StrictAdmissionRequested = false
 	return cfg

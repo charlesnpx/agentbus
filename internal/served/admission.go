@@ -3,11 +3,14 @@ package served
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -2582,9 +2585,9 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 	}
 	var result *engine.ResultInfo
 	if record.Terminal != nil && record.Terminal.Result != nil {
-		result = authorityResultInfo(*record.Terminal.Result)
+		result = s.authorityResultInfo(*record.Terminal.Result)
 	} else if record.Result != nil {
-		result = authorityResultInfo(record.Result.Result)
+		result = s.authorityResultInfo(record.Result.Result)
 	}
 	return protocol.JobResult{
 		JobID:     projection.JobID.String(),
@@ -2648,10 +2651,26 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 	}, true, nil
 }
 
-func authorityResultInfo(ref model.ResultRef) *engine.ResultInfo {
-	return &engine.ResultInfo{
+func (s *Server) authorityResultInfo(ref model.ResultRef) *engine.ResultInfo {
+	info := &engine.ResultInfo{
 		ResultPath: ref.Path,
 		SHA256:     ref.Digest,
 		Bytes:      ref.Bytes,
 	}
+	inlineCap := s.inlineResultCap
+	if inlineCap <= 0 {
+		inlineCap = engine.DefaultInlineResultCap
+	}
+	if ref.Bytes >= int64(inlineCap) {
+		return info
+	}
+	raw, err := os.ReadFile(ref.Path)
+	if err != nil || int64(len(raw)) != ref.Bytes {
+		return info
+	}
+	sum := sha256.Sum256(raw)
+	if hex.EncodeToString(sum[:]) == ref.Digest {
+		info.Text = string(raw)
+	}
+	return info
 }

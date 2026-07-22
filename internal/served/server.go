@@ -1085,6 +1085,12 @@ func (s *Server) protocolCapabilities() map[string]bool {
 	if instance != nil && instance.policy.AdvertiseRequestID {
 		capabilities["jobs.requestId"] = true
 	}
+	if instance != nil &&
+		instance.policy.Mode == AdmissionStrictIdentified &&
+		instance.policy.AcceptIdentified &&
+		instance.policy.CrashDurableContainment {
+		capabilities[protocol.CapabilityAdmissionStrictContainment] = true
+	}
 	s.admissionStateMu.RUnlock()
 	return capabilities
 }

@@ -64,7 +64,7 @@ For local installer checks:
 ```sh
 agentbus version [--json]
 agentbus setup [--json]
-agentbus serve [--foreground]
+agentbus serve [--foreground] [--admission=legacy|strict]
 agentbus sessions [--tags k=v] [--json]
 agentbus status [--job <id>] [--json]
 agentbus result --job <id> [--json]
@@ -79,6 +79,18 @@ from that cache.
 `agentbus serve --foreground` runs the JSON-RPC daemon in the current process.
 `agentbus serve` starts it in the background. `AGENTBUS_STATE_ROOT` may be set
 to isolate daemon state for tests or local development.
+
+`agentbus serve --admission=strict` explicitly enables strict identified
+admission and crash-durable containment. The default is `--admission=legacy`;
+a passing support probe never auto-enables strict mode. Strict activation is
+sticky and one-way for a state root: an activated root must keep serving with
+strict support or be handled with `agentbus admission recover`, `seal`, or
+`reset-empty-root`. The first release supports one active state root; seal
+rotation starts a new root and does not route read, cancel, result, or replay
+requests across old and new roots. Strict mode currently requires Linux
+cgroup-v2 with a delegated writable cgroup root. Darwin and unsupported or
+restricted Linux hosts fail closed at startup instead of advertising a weaker
+strict capability.
 
 The status/result/cancel commands map terminal job states to the exit codes
 defined in [docs/protocol.md](docs/protocol.md).

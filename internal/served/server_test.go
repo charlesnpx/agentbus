@@ -386,6 +386,9 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	if _, ok := hello.Capabilities["jobs.requestId"]; ok {
 		t.Fatalf("jobs.requestId capability is advertised in hello: %+v", hello.Capabilities)
 	}
+	if _, ok := hello.Capabilities[protocol.CapabilityAdmissionStrictContainment]; ok {
+		t.Fatalf("strict containment capability is advertised in default hello: %+v", hello.Capabilities)
+	}
 	resp = rpc(t, conn, r, "dup", protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: h.token})
 	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
 
@@ -400,6 +403,30 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	mismatchReader := bufio.NewReader(mismatch)
 	resp = rpc(t, mismatch, mismatchReader, "1", protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version + 1, Token: h.token})
 	assertRPCCode(t, resp, protocol.ErrorVersionMismatch)
+}
+
+func TestHelloAdvertisesStrictContainmentOnlyWhenPolicyServesStrict(t *testing.T) {
+	t.Parallel()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	h := startTestServerWithHooks(t, newFakeBackend("fake"), Config{IdleTimeout: -1}, func(server *Server) {
+		configureTestAdmissionRuntime(t, server, launcher, true)
+	})
+
+	conn := dialRaw(t, h.socketPath)
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	resp := rpc(t, conn, r, "1", protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: h.token})
+	if resp.Error != nil {
+		t.Fatalf("hello error = %+v", resp.Error)
+	}
+	var hello protocol.HelloResult
+	decodeResult(t, resp, &hello)
+	if !hello.Capabilities[protocol.CapabilityAdmissionStrictContainment] {
+		t.Fatalf("strict containment capability absent in strict-active hello: %+v", hello.Capabilities)
+	}
+	if _, ok := hello.Capabilities["jobs.requestId"]; ok {
+		t.Fatalf("jobs.requestId capability is advertised in strict-active hello: %+v", hello.Capabilities)
+	}
 }
 
 func TestServeConstructsAdmissionInstanceBeforeListenWithRequestIDCapabilityDisabled(t *testing.T) {
@@ -1205,6 +1232,31 @@ func TestDefaultStrictIdentifiedSubmitRejectsUnavailableRuntimeWithoutStartingBa
 	}
 	if got := backend.count.Load(); got != 0 {
 		t.Fatalf("backend starts = %d, want 0", got)
+	}
+}
+
+func TestStrictRequestedUnavailableRuntimeFailsStartupWithSupportDiagnostic(t *testing.T) {
+	t.Parallel()
+	server, err := New(Config{
+		StateRoot:                shortTempDir(t),
+		CWD:                      shortTempDir(t),
+		Runtime:                  custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable),
+		StrictAdmissionRequested: true,
+		IdleTimeout:              -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = server.Serve(context.Background())
+	var diagnostic AdmissionSupportDiagnostic
+	if !errors.As(err, &diagnostic) {
+		t.Fatalf("Serve error = %T %v, want AdmissionSupportDiagnostic", err, err)
+	}
+	if !errors.Is(err, ErrAdmissionStrictSupportUnavailable) {
+		t.Fatalf("Serve error = %v, want ErrAdmissionStrictSupportUnavailable", err)
+	}
+	if diagnostic.Assessment.Class != custodian.SupportUnsupported {
+		t.Fatalf("diagnostic assessment = %+v, want unsupported", diagnostic.Assessment)
 	}
 }
 
@@ -2609,15 +2661,15 @@ func TestIdentifiedFencedResultPublishUsesDurableWorkspaceLayoutKeyWithoutJobSto
 	}
 
 	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: submitted.JobID})
-	if result.JobID != submitted.JobID || result.State != engine.StateCompleted || result.Result == nil || result.Result.ResultPath != expectedPath {
-		t.Fatalf("authority result = %+v, want completed result at %q", result, expectedPath)
+	if result.JobID != submitted.JobID || result.State != engine.StateCompleted || result.Result == nil || result.Result.ResultPath != expectedPath || result.Result.Text != "PASS\n\n## Findings\nNone.\n" {
+		t.Fatalf("authority result = %+v, want completed result at %q with inline backend final text", result, expectedPath)
 	}
 	server.mu.Lock()
 	server.jobStores = make(map[string]*engine.Store)
 	server.mu.Unlock()
 	again := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: submitted.JobID})
-	if again.Result == nil || again.Result.ResultPath != expectedPath {
-		t.Fatalf("authority result after clearing jobStores again = %+v, want path %q", again, expectedPath)
+	if again.Result == nil || again.Result.ResultPath != expectedPath || again.Result.Text != "PASS\n\n## Findings\nNone.\n" {
+		t.Fatalf("authority result after clearing jobStores again = %+v, want path %q with inline backend final text", again, expectedPath)
 	}
 
 	outsidePath := filepath.Join(root, "outside-results", submitted.JobID+".txt")

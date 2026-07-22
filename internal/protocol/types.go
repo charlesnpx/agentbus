@@ -26,6 +26,8 @@ const (
 	MethodPolicyValidate = "policy.validate"
 	MethodPolicyRegister = "policy.register"
 
+	CapabilityAdmissionStrictContainment = "admission.strictContainment"
+
 	NotificationTurnEvent  = "turn.event"
 	NotificationTurnResult = "turn.result"
 
