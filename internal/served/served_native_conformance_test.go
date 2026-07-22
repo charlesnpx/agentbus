@@ -53,6 +53,8 @@ const (
 	servedNativeCodexReadyDirEnv         = "AGENTBUS_SERVED_NATIVE_CODEX_READY_DIR"
 	servedNativeGrandchildEnv            = "AGENTBUS_SERVED_NATIVE_GRANDCHILD"
 	servedNativeDaemonEnv                = "AGENTBUS_SERVED_NATIVE_DAEMON"
+	servedNativeStartedPathTag           = "SERVED_NATIVE_STARTED_PATH"
+	servedNativeModeTag                  = "SERVED_NATIVE_MODE"
 	servedNativeCgroupConformanceEnv     = "AGENTBUS_CGROUP_CONFORMANCE"
 	servedNativeOfflineModcacheEnv       = "AGENTBUS_OFFLINE_MODCACHE"
 	servedNativeFixtureModeClean         = "clean"
@@ -296,10 +298,14 @@ func TestServedStrictCompositionNoExecBeforeGrantConformance(t *testing.T) {
 			return errors.New("served native pre-grant hold timed out")
 		}
 	})
-	server, h, fixture := startServedNativeStrictServer(t, shortTempDir(t), shortTempDir(t), nil)
+	root := shortTempDir(t)
+	cwd := shortTempDir(t)
+	startedPath := filepath.Join(root, "no-exec-before-grant-started")
+	fixture := installServedNativeCodexFixture(t, root)
+	fixture.env = servedNativeFixtureEntryEnv(fixture.env, servedNativeFixtureModeHold, servedNativeStartedTags(startedPath))
+	server, h, fixture := startServedNativeStrictServerWithFixture(t, root, cwd, fixture, nil)
 	conn, reader := servedNativeRPC(t, h)
 	defer conn.Close()
-	startedPath := filepath.Join(h.root, "no-exec-before-grant-started")
 	assertServedNativeCodexExecutionCount(t, fixture, 0)
 	submitted := submitServedNativeJobOnConn(t, conn, reader, "no-exec-before-grant", h.cwd, servedNativeFixtureModeHold, servedNativeStartedTags(startedPath))
 	select {
@@ -859,7 +865,19 @@ func servedNativeSubmitParams(requestSuffix, cwd, prompt string, tags map[string
 }
 
 func servedNativeStartedTags(path string) map[string]string {
-	return map[string]string{"SERVED_NATIVE_STARTED_PATH": path}
+	return map[string]string{servedNativeStartedPathTag: path}
+}
+
+func servedNativeFixtureEntryEnv(env []string, mode string, tags map[string]string) []string {
+	if mode != "" {
+		env = upsertEnv(env, servedNativeModeTag+"="+mode)
+	}
+	for key, value := range tags {
+		if strings.HasPrefix(key, "SERVED_NATIVE_") && strings.TrimSpace(value) != "" {
+			env = upsertEnv(env, key+"="+value)
+		}
+	}
+	return env
 }
 
 func servedNativePromptWithTags(prompt string, tags map[string]string) string {
@@ -989,6 +1007,36 @@ func runServedNativeCodexFixture(args []string) int {
 			return 0
 		}
 	}
+	envTags := servedNativeEnvTags()
+	entryRecorded := false
+	entryPGID := 0
+	if path := envTags[servedNativeStartedPathTag]; path != "" {
+		pgid, err := unix.Getpgid(0)
+		if err != nil {
+			return 3
+		}
+		entryPGID = pgid
+		mode := envTags[servedNativeModeTag]
+		if mode == "" {
+			mode = "entry"
+		}
+		execution := servedNativeCodexExecution{
+			PID:  os.Getpid(),
+			PGID: pgid,
+			Mode: mode,
+			Args: append([]string(nil), args...),
+			Tags: envTags,
+		}
+		if err := appendServedNativeCodexExecution(execution); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 4
+		}
+		if err := writeServedNativeStartedMarker(path, "exec-started\n"); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 4
+		}
+		entryRecorded = true
+	}
 	promptRaw, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return 2
@@ -1001,34 +1049,43 @@ func runServedNativeCodexFixture(args []string) int {
 	case strings.Contains(prompt, servedNativeFixtureModeHold):
 		mode = servedNativeFixtureModeHold
 	}
-	pgid, err := unix.Getpgid(0)
-	if err != nil {
-		return 3
+	pgid := entryPGID
+	if pgid == 0 {
+		var err error
+		pgid, err = unix.Getpgid(0)
+		if err != nil {
+			return 3
+		}
 	}
+	tags := mergeServedNativeTags(envTags, parseServedNativePromptTags(prompt))
 	execution := servedNativeCodexExecution{
 		PID:    os.Getpid(),
 		PGID:   pgid,
 		Mode:   mode,
 		Prompt: prompt,
 		Args:   append([]string(nil), args...),
-		Tags:   parseServedNativePromptTags(prompt),
+		Tags:   tags,
 	}
 	switch mode {
 	case servedNativeFixtureModeClean:
-		if err := appendServedNativeCodexExecution(execution); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 4
+		if !entryRecorded {
+			if err := appendServedNativeCodexExecution(execution); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
 		}
 		writeServedNativeCodexResult()
 		return 0
 	case servedNativeFixtureModeHold:
 		signal.Ignore(syscall.SIGTERM)
-		if err := appendServedNativeCodexExecution(execution); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 4
+		if !entryRecorded {
+			if err := appendServedNativeCodexExecution(execution); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
 		}
-		if path := execution.Tags["SERVED_NATIVE_STARTED_PATH"]; path != "" {
-			_ = os.WriteFile(path, []byte("release-recorded\n"), 0o600)
+		if path := execution.Tags[servedNativeStartedPathTag]; path != "" {
+			_ = writeServedNativeStartedMarker(path, "release-recorded\n")
 		}
 		for {
 			time.Sleep(time.Hour)
@@ -1061,16 +1118,56 @@ func runServedNativeCodexFixture(args []string) int {
 		}
 		execution.GrandchildPID = cmd.Process.Pid
 		execution.GrandchildPGID = childPGID
-		if err := appendServedNativeCodexExecution(execution); err != nil {
-			_ = cmd.Process.Kill()
-			fmt.Fprintln(os.Stderr, err)
-			return 4
+		if !entryRecorded {
+			if err := appendServedNativeCodexExecution(execution); err != nil {
+				_ = cmd.Process.Kill()
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
 		}
 		writeServedNativeCodexResult()
 		return 0
 	default:
 		return 2
 	}
+}
+
+func servedNativeEnvTags() map[string]string {
+	tags := make(map[string]string)
+	for _, item := range os.Environ() {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if strings.HasPrefix(key, "SERVED_NATIVE_") && value != "" {
+			tags[key] = value
+		}
+	}
+	return tags
+}
+
+func mergeServedNativeTags(tags ...map[string]string) map[string]string {
+	merged := make(map[string]string)
+	for _, tagSet := range tags {
+		for key, value := range tagSet {
+			if strings.HasPrefix(key, "SERVED_NATIVE_") && strings.TrimSpace(value) != "" {
+				merged[key] = value
+			}
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+func writeServedNativeStartedMarker(path, value string) error {
+	if path == "" {
+		return nil
+	}
+	return os.WriteFile(path, []byte(value), 0o600)
 }
 
 func parseServedNativePromptTags(prompt string) map[string]string {

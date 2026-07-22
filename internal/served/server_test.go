@@ -25,6 +25,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -48,6 +49,7 @@ type fakeBackend struct {
 	resumes         chan resumedSession
 	parkable        bool
 	controlled      bool
+	startPathDone   chan struct{}
 }
 
 type fakeTurn struct {
@@ -127,6 +129,16 @@ func (b *fakeBackend) Preflight(context.Context) (engine.Health, error) {
 	return engine.Health{Backend: b.name}, nil
 }
 
+func (b *fakeBackend) signalStartPathDone() {
+	if b.startPathDone == nil {
+		return
+	}
+	select {
+	case b.startPathDone <- struct{}{}:
+	default:
+	}
+}
+
 func (b *fakeBackend) Start(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
 	n := b.count.Add(1)
 	if b.startHook != nil {
@@ -191,6 +203,7 @@ func (s *fakeSession) TurnWithRunner(ctx context.Context, input engine.TurnInput
 	}
 	running, err := runner.Start(ctx, command.ExecSpec{Argv: []string{"/bin/fake-agent"}})
 	if err != nil {
+		s.backend.signalStartPathDone()
 		return nil, err
 	}
 	ch := make(chan engine.Event, 8)
@@ -206,6 +219,7 @@ func (s *fakeSession) TurnWithRunner(ctx context.Context, input engine.TurnInput
 	if s.backend.started != nil {
 		s.backend.started <- struct{}{}
 	}
+	s.backend.signalStartPathDone()
 	go func() {
 		defer close(ch)
 		if stdin := running.Stdin(); stdin != nil {
@@ -2183,6 +2197,87 @@ func TestLegacyFencedReleaseUnknownContainsWithDetachedContextWhenCanceled(t *te
 	}
 }
 
+func TestLegacyFencedReleaseDefinitelyNotSentFailStopsWhenReleaseOutcomeFactCannotPersist(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		durability launch.DurabilityOutcome
+		err        error
+		wantErr    error
+	}{
+		{
+			name:       "definitely-not-committed",
+			durability: launch.DefinitelyNotCommitted,
+			err:        errors.New("injected release outcome not committed"),
+			wantErr:    launch.ErrDurabilityNotCommitted,
+		},
+		{
+			name:       "unknown-mutation",
+			durability: launch.CommitOutcomeUnknown,
+			err:        errors.New("injected release outcome commit unknown"),
+			wantErr:    launch.ErrDurabilityUnknown,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			launcher := newAdmissionFakeLaunchCustodian(t)
+			launcher.releaseOutcome = custodian.ReleaseDefinitelyNotSent
+			launcher.releaseErr = errors.New("release frame not written")
+			repo, recorder, submission := newLegacyFencedCoordinatorWithRecordingAuthorityForTest(t, launcher)
+			recorder.recordReleaseOutcomeDurability = tt.durability
+			recorder.recordReleaseOutcomeErr = tt.err
+			cmd := prepareLegacyFencedCommandWithCoordinatorForTest(t, submission, "request-legacy-fenced-release-not-sent-"+tt.name)
+
+			err := cmd.grantAndRelease(context.Background())
+			if !errors.Is(err, launch.ErrFailClosed) {
+				t.Fatalf("grantAndRelease error = %v, want fail-closed", err)
+			}
+			if !errors.Is(err, launch.ErrReleaseUncertain) {
+				t.Fatalf("grantAndRelease error = %v, want release uncertainty", err)
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("grantAndRelease error = %v, want %v", err, tt.wantErr)
+			}
+			reason := submission.latch.Reason()
+			if reason == nil {
+				t.Fatal("safety latch was not tripped")
+			}
+			if text := reason.Error(); !strings.Contains(text, "LaunchReleaseNotSent") || !strings.Contains(text, "record_release_outcome") {
+				t.Fatalf("fail-stop reason = %q, want unpersisted LaunchReleaseNotSent record_release_outcome fact", text)
+			}
+			_, finalErr := cmd.result()
+			if !errors.Is(finalErr, launch.ErrFailClosed) {
+				t.Fatalf("legacy fenced command final error = %v, want fail-closed", finalErr)
+			}
+			if got := launcher.abortCount(); got != 1 {
+				t.Fatalf("legacy fenced aborts = %d, want one retired parked worker", got)
+			}
+			safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
+			first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
+			if !ok || first.Group == nil || first.Grant == nil || first.Quiescence == nil {
+				t.Fatalf("legacy fenced release-not-sent launch proof = %+v, want grant and verified abort quiescence", first)
+			}
+			if first.ReleaseOutcome != nil || first.Released != nil {
+				t.Fatalf("legacy fenced release-not-sent launch proof = %+v, want no release outcome/release facts", first)
+			}
+			if safety.Terminal != nil {
+				t.Fatalf("legacy fenced release-not-sent terminal = %+v, want no terminal without release outcome fact", safety.Terminal)
+			}
+			if intent, ok := admissionRecordedReleaseFailureIntent(safety); ok {
+				t.Fatalf("derived release-failure terminal intent without release outcome fact: %+v", intent)
+			}
+			outcomes, errs := recorder.recordReleaseOutcomeObservations()
+			if len(outcomes) != 1 || outcomes[0] != model.LaunchReleaseNotSent {
+				t.Fatalf("recorded release outcome attempts = %+v, want one LaunchReleaseNotSent attempt", outcomes)
+			}
+			if len(errs) != 1 || !errors.Is(errs[0], tt.err) {
+				t.Fatalf("recorded release outcome errors = %+v, want %v", errs, tt.err)
+			}
+		})
+	}
+}
+
 func TestLegacyFencedDeliveryFailureFailStopsWhenAbortCleanupDeadlineExpires(t *testing.T) {
 	oldTimeout := admissionDetachedCleanupTimeout
 	admissionDetachedCleanupTimeout = 5 * time.Millisecond
@@ -2588,10 +2683,12 @@ func TestIdentifiedFencedCancelUsesAuthorityWhenAdmissionMarkerCleared(t *testin
 
 func TestAuthorityJobCancelHeldStartPostReleasePreRegistration(t *testing.T) {
 	backend := newFakeBackend("fake")
+	backend.startPathDone = make(chan struct{}, 1)
 	launcher := newAdmissionFakeLaunchCustodian(t)
 	launcher.waitAndVerify = make(chan struct{})
 	server, _, cwd := newUnstartedTestServer(t, backend)
 	enableTestAdmission(t, server, launcher)
+	finalizes := installRecordingAdmissionAuthorityForTest(t, server)
 
 	recordReleaseEntered := make(chan struct{})
 	allowRecordRelease := make(chan struct{})
@@ -2626,6 +2723,8 @@ func TestAuthorityJobCancelHeldStartPostReleasePreRegistration(t *testing.T) {
 		t.Fatalf("authority cancel = %+v, want canceled job %s", canceled, submitted.JobID)
 	}
 	close(allowRecordRelease)
+	waitBackendRunnerStartPathDone(t, backend)
+	waitActiveJobGone(t, server, submitted.JobID)
 
 	record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
 	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
@@ -2638,8 +2737,10 @@ func TestAuthorityJobCancelHeldStartPostReleasePreRegistration(t *testing.T) {
 	if !ok || first.Quiescence == nil || first.Quiescence.Method != model.QuiescenceTermKill {
 		t.Fatalf("authority launch proof = %+v, want contained quiescence", first)
 	}
-
-	time.Sleep(50 * time.Millisecond)
+	intents := finalizes.finalizeIntents()
+	if len(intents) != 1 || intents[0].Outcome != model.OutcomeCanceled || intents[0].Cause != model.CauseCanceledAfterAuthorization {
+		t.Fatalf("authority finalize intents = %+v, want exactly one canceled-after-authorization terminal", intents)
+	}
 	after := loadAdmissionSafetyRecord(t, server, submitted.JobID)
 	if after.Terminal == nil || after.Terminal.Outcome != model.OutcomeCanceled || after.Terminal.Cause != model.CauseCanceledAfterAuthorization {
 		t.Fatalf("authority terminal after held Start resumed = %+v, want unchanged canceled terminal", after.Terminal)
@@ -5370,11 +5471,13 @@ func prepareLegacyFencedCommandWithCoordinatorForTest(t *testing.T, coordinator 
 type recordingLegacyLaunchAuthority struct {
 	ready *authority.Ready
 
-	mu                           sync.Mutex
-	recordQuiescenceCtxErrs      []error
-	recordQuiescenceCtxDeadlines []bool
-	recordReleaseOutcomes        []model.LaunchReleaseOutcome
-	recordReleaseOutcomeErrs     []error
+	mu                             sync.Mutex
+	recordQuiescenceCtxErrs        []error
+	recordQuiescenceCtxDeadlines   []bool
+	recordReleaseOutcomes          []model.LaunchReleaseOutcome
+	recordReleaseOutcomeErrs       []error
+	recordReleaseOutcomeDurability launch.DurabilityOutcome
+	recordReleaseOutcomeErr        error
 }
 
 func (a *recordingLegacyLaunchAuthority) BindGroup(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, group model.GroupRef) (launch.DurabilityOutcome, error) {
@@ -5387,6 +5490,20 @@ func (a *recordingLegacyLaunchAuthority) AllocateGrant(ctx context.Context, ref 
 }
 
 func (a *recordingLegacyLaunchAuthority) RecordReleaseOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, outcome model.LaunchReleaseOutcome) (launch.DurabilityOutcome, error) {
+	a.mu.Lock()
+	injectedDurability := a.recordReleaseOutcomeDurability
+	injectedErr := a.recordReleaseOutcomeErr
+	a.mu.Unlock()
+	if injectedDurability != 0 || injectedErr != nil {
+		if injectedDurability == 0 {
+			injectedDurability = launch.DefinitelyNotCommitted
+		}
+		a.mu.Lock()
+		a.recordReleaseOutcomes = append(a.recordReleaseOutcomes, outcome)
+		a.recordReleaseOutcomeErrs = append(a.recordReleaseOutcomeErrs, injectedErr)
+		a.mu.Unlock()
+		return injectedDurability, injectedErr
+	}
 	applied, err := a.ready.RecordReleaseOutcome(ctx, jobID, ref, ordinal, outcome)
 	a.mu.Lock()
 	a.recordReleaseOutcomes = append(a.recordReleaseOutcomes, outcome)
@@ -5427,6 +5544,54 @@ func (a *recordingLegacyLaunchAuthority) recordReleaseOutcomeObservations() ([]m
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]model.LaunchReleaseOutcome(nil), a.recordReleaseOutcomes...), append([]error(nil), a.recordReleaseOutcomeErrs...)
+}
+
+type recordingAdmissionAuthority struct {
+	*servedAdmissionAuthority
+
+	mu              sync.Mutex
+	finalizeRecords []model.TerminalIntent
+}
+
+func (a *recordingAdmissionAuthority) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent) (coordinator.StepResult, error) {
+	a.mu.Lock()
+	a.finalizeRecords = append(a.finalizeRecords, intent)
+	a.mu.Unlock()
+	return a.servedAdmissionAuthority.Finalize(ctx, jobID, ref, intent)
+}
+
+func (a *recordingAdmissionAuthority) finalizeIntents() []model.TerminalIntent {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]model.TerminalIntent(nil), a.finalizeRecords...)
+}
+
+func installRecordingAdmissionAuthorityForTest(t *testing.T, server *Server) *recordingAdmissionAuthority {
+	t.Helper()
+	server.admissionStateMu.Lock()
+	defer server.admissionStateMu.Unlock()
+	if server.admissionReady == nil || server.admissionSubmission == nil || server.admissionSubmission.launch == nil || server.admissionInstance == nil {
+		t.Fatal("admission runtime is not ready")
+	}
+	recorder := &recordingAdmissionAuthority{
+		servedAdmissionAuthority: &servedAdmissionAuthority{
+			ready: server.admissionReady,
+			latch: server.safetyLatch,
+		},
+	}
+	coord, err := coordinator.New(
+		recorder,
+		servedCoordinatorLaunchContainment{controller: server.admissionSubmission.launch},
+		servedResultPublisher{server: server},
+		server.admissionSubmission.owner,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.admissionCoordinator = coord
+	server.admissionOwnedWorkChecker = coord
+	server.admissionInstance.coordinator = coord
+	return recorder
 }
 
 func acceptIdentifiedAuthorityWork(t *testing.T, server *Server, requestID string) authority.AcceptResult {
@@ -5925,6 +6090,30 @@ func waitAdmissionSafetyTerminal(t *testing.T, server *Server, jobID string) mod
 	}
 	t.Fatalf("admission safety record %s did not reach terminal state; last = %+v", jobID, last)
 	return model.SafetyRecord{}
+}
+
+func waitBackendRunnerStartPathDone(t *testing.T, backend *fakeBackend) {
+	t.Helper()
+	if backend == nil || backend.startPathDone == nil {
+		t.Fatal("backend start-path completion channel is nil")
+	}
+	select {
+	case <-backend.startPathDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("held runner Start path did not complete after release")
+	}
+}
+
+func waitActiveJobGone(t *testing.T, server *Server, jobID string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if server.lookupActiveJob(jobID) == nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("active job %s did not finish after held Start resumed", jobID)
 }
 
 func waitSingleAdmissionSafetyTerminal(t *testing.T, server *Server) model.SafetyRecord {

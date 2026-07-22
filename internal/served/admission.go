@@ -1421,7 +1421,9 @@ func (cmd *legacyFencedCommand) grantAndRelease(ctx context.Context) error {
 		outcome, recordErr := cmd.coordinator.launch.RecordReleaseOutcome(cleanupCtx, cmd.launchContext, model.LaunchReleaseNotSent)
 		cleanupCancel()
 		if releaseOutcomeErr := admissionDurabilityError("record_release_outcome", outcome, recordErr); releaseOutcomeErr != nil {
+			releaseOutcomeErr = fmt.Errorf("persist LaunchReleaseNotSent release outcome: %w", releaseOutcomeErr)
 			mapped = errors.Join(mapped, releaseOutcomeErr)
+			return cmd.failPreparedFailClosed(ctx, mapped)
 		}
 		cmd.failPrepared(ctx, mapped)
 		return mapped
@@ -1543,6 +1545,14 @@ func (cmd *legacyFencedCommand) failPrepared(ctx context.Context, reason error) 
 	err := errors.Join(reason, cmd.coordinator.abortLegacyPrepared(ctx, cmd.prepared, true, cmd.launchContext))
 	cmd.closePipesWithError(err)
 	cmd.finish(command.ExitObservation{}, err)
+}
+
+func (cmd *legacyFencedCommand) failPreparedFailClosed(ctx context.Context, reason error) error {
+	failReason := errors.Join(reason, cmd.coordinator.abortLegacyPrepared(ctx, cmd.prepared, true, cmd.launchContext))
+	err := errors.Join(failReason, cmd.coordinator.failStop(ctx, failReason), launch.ErrFailClosed)
+	cmd.closePipesWithError(err)
+	cmd.finish(command.ExitObservation{}, err)
+	return err
 }
 
 func (cmd *legacyFencedCommand) failReleasedByGroup(ctx context.Context, reason error) {
