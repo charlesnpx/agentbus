@@ -442,6 +442,39 @@ func TestBootstrapAdmissionFactoryFailureClosesRuntime(t *testing.T) {
 	}
 }
 
+func TestBootstrapAdmissionStrictRuntimeFailurePrecedesRepositoryOpen(t *testing.T) {
+	ctx := context.Background()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	var closes atomic.Int64
+	server.admissionStrictRequested = true
+	server.admissionRuntime = &servedAdmissionRuntime{
+		runtime: custodian.NewUnavailableRuntimeForTest(custodian.ErrSupervisorUnavailable, func() error {
+			closes.Add(1)
+			return nil
+		}),
+		strictRequested: true,
+	}
+	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		t.Fatal("repository factory called before strict runtime diagnostic")
+		return nil, nil, nil, nil
+	}
+
+	err := server.bootstrapAdmission(ctx)
+	var diagnostic AdmissionSupportDiagnostic
+	if !errors.As(err, &diagnostic) {
+		t.Fatalf("bootstrapAdmission error = %T %v, want AdmissionSupportDiagnostic", err, err)
+	}
+	if !errors.Is(diagnostic, ErrAdmissionStrictSupportUnavailable) {
+		t.Fatalf("diagnostic = %v, want strict support unavailable", diagnostic)
+	}
+	if got := closes.Load(); got != 1 {
+		t.Fatalf("runtime closes = %d, want 1", got)
+	}
+	if server.admissionRuntime != nil {
+		t.Fatal("admissionRuntime retained after strict runtime diagnostic")
+	}
+}
+
 func TestRecoveryOnlyClosesRuntimeOnSuccessAndFailure(t *testing.T) {
 	ctx := context.Background()
 

@@ -282,7 +282,7 @@ func (controller *LaunchController) handleReleaseOutcome(ctx context.Context, pr
 		if releaseErr != nil {
 			reason = fmt.Errorf("%w: release outcome unknown: %v", ErrReleaseUncertain, releaseErr)
 		}
-		return controller.containGroupAndFailStop(ctx, group, reason)
+		return controller.containRecordQuiescenceOrFailStop(ctx, launch, group, reason)
 	default:
 		reason := fmt.Errorf("%w: invalid release outcome %d", ErrReleaseUncertain, outcome)
 		if releaseErr != nil {
@@ -396,6 +396,23 @@ func (controller *LaunchController) containGroupAndFailStop(ctx context.Context,
 	_, cleanup, containErr := controller.custodian.ContainAndVerify(ctx, group, custodian.QuiescenceCauseContain)
 	containErr = errors.Join(containErr, cleanup.Err)
 	return errors.Join(reason, containErr, controller.failStop(ctx, errors.Join(reason, containErr)), ErrFailClosed)
+}
+
+func (controller *LaunchController) containRecordQuiescenceOrFailStop(ctx context.Context, launch LaunchContext, group model.GroupRef, reason error) error {
+	verified, cleanup, containErr := controller.custodian.ContainAndVerify(ctx, group, custodian.QuiescenceCauseContain)
+	if containErr != nil {
+		failReason := errors.Join(reason, containErr)
+		return errors.Join(failReason, controller.failStop(ctx, failReason), ErrFailClosed)
+	}
+	// C4 closes the release-unknown gap by contain-and-verify: once quiescence
+	// is durably recorded, execution is possible but absent, so fail-stop is
+	// reserved for unprovable containment or unknown quiescence durability.
+	outcome, err := controller.RecordQuiescence(ctx, launch, verified)
+	if mapped := durableMutationError("record_quiescence", outcome, err); mapped != nil {
+		failReason := errors.Join(reason, mapped)
+		return errors.Join(failReason, controller.failStop(ctx, failReason), ErrFailClosed)
+	}
+	return errors.Join(reason, cleanup.Err)
 }
 
 func (controller *LaunchController) failStop(ctx context.Context, reason error) error {
@@ -536,6 +553,8 @@ type Process struct {
 	failClosedErr error
 	failStopOnce  sync.Once
 	failStopErr   error
+	containmentMu sync.Mutex
+	containing    bool
 
 	mu       sync.Mutex
 	result   Result
@@ -586,9 +605,14 @@ func (process *Process) Wait(ctx context.Context) (command.ExitObservation, erro
 		result, err := process.final()
 		return result.Exit, err
 	case <-ctx.Done():
-		err := process.ContainAndFailStop(containmentContext(ctx), ctx.Err())
+		process.markContaining()
+		process.finalizeFromContain(containmentContext(ctx), custodian.QuiescenceCauseContain, command.ExitObservation{}, nil, false)
 		result, finalErr := process.final()
-		return result.Exit, errors.Join(err, finalErr)
+		if !result.Contained {
+			reason := errors.Join(ctx.Err(), finalErr)
+			return result.Exit, errors.Join(reason, process.failStop(containmentContext(ctx), reason), ErrFailClosed)
+		}
+		return result.Exit, errors.Join(ctx.Err(), finalErr)
 	}
 }
 
@@ -596,6 +620,7 @@ func (process *Process) Interrupt(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	process.markContaining()
 	process.finalizeFromContain(ctx, custodian.QuiescenceCauseContain, command.ExitObservation{}, nil, false)
 	_, err := process.Result(ctx)
 	return err
@@ -626,6 +651,7 @@ func (process *Process) ContainAndFailStop(ctx context.Context, reason error) er
 }
 
 func (process *Process) containAndFailStop(ctx context.Context, reason error) error {
+	process.markContaining()
 	process.finalizeFromContain(ctx, custodian.QuiescenceCauseContain, command.ExitObservation{}, reason, false)
 	_, finalErr := process.FinalResult(ctx)
 	if !errors.Is(finalErr, ErrFailClosed) {
@@ -681,7 +707,7 @@ func (process *Process) eagerWait(ctx context.Context) {
 	if err != nil {
 		cause := custodian.QuiescenceCauseWait
 		priorErr := err
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || process.containmentRequested() {
 			cause = custodian.QuiescenceCauseContain
 			priorErr = nil
 		} else {
@@ -702,6 +728,7 @@ func (process *Process) finalizeFromContain(ctx context.Context, cause custodian
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	process.markContaining()
 	if !waitReturned {
 		process.waitCancel()
 		select {
@@ -713,6 +740,18 @@ func (process *Process) finalizeFromContain(ctx context.Context, cause custodian
 		verified, cleanup, containErr := process.running.ContainAndVerify(ctx, cause)
 		process.finish(ctx, priorExit, verified, containErr == nil, containErr == nil, errors.Join(priorErr, containErr, cleanup.Err))
 	})
+}
+
+func (process *Process) markContaining() {
+	process.containmentMu.Lock()
+	process.containing = true
+	process.containmentMu.Unlock()
+}
+
+func (process *Process) containmentRequested() bool {
+	process.containmentMu.Lock()
+	defer process.containmentMu.Unlock()
+	return process.containing
 }
 
 func (process *Process) finalizeWithVerified(ctx context.Context, exit command.ExitObservation, verified custodian.VerifiedQuiescence, contained bool, verifiedOK bool, reconcileErr error) {

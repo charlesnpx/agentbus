@@ -23,6 +23,7 @@ import (
 
 type servedAdmissionRuntime struct {
 	runtime          custodian.Runtime
+	strictRequested  bool
 	launchCustodian  launch.CustodianPort
 	supportOverride  *custodian.Support
 	supportProbe     func(context.Context) custodian.Support
@@ -39,7 +40,9 @@ func newServedAdmissionRuntime(server *Server) *servedAdmissionRuntime {
 	if server == nil {
 		return newServedAdmissionRuntimeFromRuntime(custodian.Runtime{})
 	}
-	return newServedAdmissionRuntimeFromRuntime(server.admissionRuntimeConfig)
+	runtime := newServedAdmissionRuntimeFromRuntime(server.admissionRuntimeConfig)
+	runtime.strictRequested = server.admissionStrictRequested
+	return runtime
 }
 
 func newServedAdmissionRuntimeFromRuntime(runtime custodian.Runtime) *servedAdmissionRuntime {
@@ -87,6 +90,18 @@ func (s *servedAdmissionRuntime) assessSupport(ctx context.Context) custodian.Su
 		return *s.supportOverride
 	}
 	return s.runtime.SelfTest(ctx)
+}
+
+func (s *servedAdmissionRuntime) strictAdmissionRequested() bool {
+	return s != nil && s.strictRequested
+}
+
+func (s *servedAdmissionRuntime) unavailableProcess() bool {
+	if s == nil {
+		return true
+	}
+	_, ok := s.runtime.Process().(custodian.UnavailableCustodian)
+	return ok
 }
 
 func (s *servedAdmissionRuntime) quiescenceVerifier() custodian.AttestationVerifier {
@@ -482,7 +497,29 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 	if !ok {
 		return fmt.Errorf("cannot complete admission job %s with state %s", run.jobID, state)
 	}
+	if outcome == model.OutcomeFailed && admissionReleaseUnknownProved(snapshot.Record) {
+		return coord.Finalize(context.Background(), jobID, model.TerminalIntent{
+			Outcome: model.OutcomeFailed,
+			Cause:   model.CauseReleaseOutcomeUnknown,
+		})
+	}
 	return coord.Complete(context.Background(), jobID, outcome, []byte(text), nil)
+}
+
+func admissionReleaseUnknownProved(record model.SafetyRecord) bool {
+	if record.Terminal != nil {
+		return false
+	}
+	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launch, ok := record.Attempt.Launches.Get(ordinal)
+		if !ok {
+			continue
+		}
+		if launch.Group != nil && launch.Grant != nil && launch.Released == nil && launch.Quiescence != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func admissionOutcomeForState(state engine.JobState) (model.Outcome, bool) {

@@ -6,16 +6,19 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	goruntime "runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,34 +26,41 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	_ "unsafe"
 
 	"github.com/charlesnpx/agentbus/engine"
-	"github.com/charlesnpx/agentbus/engine/command"
+	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
+	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/engine/execution/repository"
+	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/containment"
-	"github.com/charlesnpx/agentbus/internal/parklaunch"
 	"github.com/charlesnpx/agentbus/internal/procgroup"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 	"golang.org/x/sys/unix"
 )
 
+//go:linkname parklaunchReleaseAfterSendBeforeAckForTest github.com/charlesnpx/agentbus/internal/parklaunch.releaseAfterSendBeforeAckForTest
+var parklaunchReleaseAfterSendBeforeAckForTest func(func() error) error
+
 const (
-	servedNativeBackendName             = "codex"
-	servedNativeFixtureEnv              = "AGENTBUS_SERVED_NATIVE_FIXTURE"
-	servedNativeGrandchildEnv           = "AGENTBUS_SERVED_NATIVE_GRANDCHILD"
-	servedNativeMonitorEnv              = "AGENTBUS_SERVED_NATIVE_MONITOR"
-	servedNativeDaemonEnv               = "AGENTBUS_SERVED_NATIVE_DAEMON"
-	servedNativeDaemonStartedPathEnv    = "AGENTBUS_SERVED_NATIVE_STARTED_PATH"
-	servedNativeCgroupConformanceEnv    = "AGENTBUS_CGROUP_CONFORMANCE"
-	servedNativeOfflineModcacheEnv      = "AGENTBUS_OFFLINE_MODCACHE"
-	servedNativeFixtureModeClean        = "clean"
-	servedNativeFixtureModeGrandchild   = "grandchild"
-	servedNativeFixtureModeHold         = "hold"
-	servedNativeAgentbusGOFLAGS         = "GOFLAGS=-mod=mod"
-	servedNativeAgentbusGOPROXY         = "GOPROXY=off"
-	servedNativeResultText              = "PASS\n\n## Findings\nNone.\n"
-	servedNativeConformancePollInterval = 20 * time.Millisecond
+	servedNativeBackendName              = "codex"
+	servedNativeCodexFixtureEnv          = "AGENTBUS_SERVED_NATIVE_CODEX_FIXTURE"
+	servedNativeCodexExecLogEnv          = "AGENTBUS_SERVED_NATIVE_CODEX_EXEC_LOG"
+	servedNativeCodexReadyDirEnv         = "AGENTBUS_SERVED_NATIVE_CODEX_READY_DIR"
+	servedNativeGrandchildEnv            = "AGENTBUS_SERVED_NATIVE_GRANDCHILD"
+	servedNativeDaemonEnv                = "AGENTBUS_SERVED_NATIVE_DAEMON"
+	servedNativeCgroupConformanceEnv     = "AGENTBUS_CGROUP_CONFORMANCE"
+	servedNativeOfflineModcacheEnv       = "AGENTBUS_OFFLINE_MODCACHE"
+	servedNativeFixtureModeClean         = "clean"
+	servedNativeFixtureModeGrandchild    = "grandchild"
+	servedNativeFixtureModeHold          = "hold"
+	servedNativeAgentbusGOFLAGS          = "GOFLAGS=-mod=mod"
+	servedNativeAgentbusGOPROXY          = "GOPROXY=off"
+	servedNativeResultText               = "PASS\n\n## Findings\nNone.\n"
+	servedNativeConformancePollInterval  = 20 * time.Millisecond
+	servedNativeDaemonHelperReadyTimeout = 60 * time.Second
 )
 
 var (
@@ -59,15 +69,15 @@ var (
 	servedNativeAgentbusBuildErr  error
 )
 
-func TestServedNativeConformanceFixtureProcess(t *testing.T) {
-	if os.Getenv(servedNativeFixtureEnv) != "1" {
+func TestServedNativeConformanceCodexFixtureProcess(t *testing.T) {
+	if os.Getenv(servedNativeCodexFixtureEnv) != "1" {
 		return
 	}
 	args, ok := servedNativeHelperArgs()
 	if !ok {
 		os.Exit(97)
 	}
-	os.Exit(runServedNativeFixture(args))
+	os.Exit(runServedNativeCodexFixture(args))
 }
 
 func TestServedNativeConformanceGrandchildProcess(t *testing.T) {
@@ -79,17 +89,6 @@ func TestServedNativeConformanceGrandchildProcess(t *testing.T) {
 		os.Exit(97)
 	}
 	os.Exit(runServedNativeGrandchild(args))
-}
-
-func TestServedNativeConformanceMonitorProcess(t *testing.T) {
-	if os.Getenv(servedNativeMonitorEnv) != "1" {
-		return
-	}
-	args, ok := servedNativeHelperArgs()
-	if !ok {
-		os.Exit(97)
-	}
-	os.Exit(runServedNativeMonitor(args))
 }
 
 func TestServedNativeConformanceDaemonProcess(t *testing.T) {
@@ -104,62 +103,69 @@ func TestServedNativeConformanceDaemonProcess(t *testing.T) {
 	fs.SetOutput(io.Discard)
 	root := fs.String("root", "", "state root")
 	cwd := fs.String("cwd", "", "daemon cwd")
+	agentbus := fs.String("agentbus", "", "agentbus helper binary")
 	startedPath := fs.String("started", "", "post-release marker path")
 	jobPath := fs.String("job", "", "submitted job path")
+	paramsPath := fs.String("params", "", "submitted params path")
 	if err := fs.Parse(args); err != nil {
 		t.Fatal(err)
 	}
-	if *root == "" || *cwd == "" || *startedPath == "" || *jobPath == "" {
-		t.Fatalf("root, cwd, started path, and job path are required")
+	if *root == "" || *cwd == "" || *agentbus == "" || *startedPath == "" || *jobPath == "" || *paramsPath == "" {
+		t.Fatalf("root, cwd, agentbus, started path, job path, and params path are required")
 	}
 
-	runtimeBundle := requireServedNativeRuntime(t)
-	backend := newServedNativeFixtureBackend(servedNativeFixtureModeHold, filepath.Join(*root, "served-native-fixture"), *startedPath)
-	server, err := New(Config{
-		StateRoot:   *root,
-		CWD:         *cwd,
-		Token:       "test-token",
-		Backends:    []engine.Backend{backend},
-		IdleTimeout: -1,
-	})
+	codexPath, err := exec.LookPath(servedNativeBackendName)
 	if err != nil {
 		t.Fatal(err)
 	}
-	enableServedNativeRuntime(server, runtimeBundle)
-	if err := server.bootstrapAdmission(context.Background()); err != nil {
+	cfg, err := StrictAdmissionConfig(Config{
+		StateRoot:   *root,
+		CWD:         *cwd,
+		Token:       "test-token",
+		Backends:    []engine.Backend{codexcli.New(codexcli.Options{Binary: codexPath})},
+		IdleTimeout: -1,
+	}, servedNativeStrictOptions(*agentbus, os.Environ()))
+	if err != nil {
 		t.Fatal(err)
 	}
-	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
-		WorkspaceKey: "workspace-served-native-restart",
-		RequestID:    "request-served-native-restart",
-		TaskSpec: protocol.TaskSpec{
-			Backend: servedNativeBackendName,
-			CWD:     *cwd,
-			Write:   false,
-			Prompt:  servedNativeFixtureModeHold,
-		},
-	}))
-	if outcome.err != nil {
-		t.Fatalf("helper job.submit error = %+v", outcome.err)
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
-	submitted, ok := outcome.result.(protocol.JobSubmitResult)
-	if !ok || submitted.JobID == "" {
-		t.Fatalf("helper job.submit result = %T %+v", outcome.result, outcome.result)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ctx)
+		close(done)
+	}()
+	socketPath := filepath.Join(*root, protocol.SocketName)
+	waitForSocket(t, socketPath, done)
+	conn := dialRaw(t, socketPath)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	helloRaw(t, conn, reader, "test-token")
+	params := servedNativeSubmitParams("restart", *cwd, servedNativeFixtureModeHold, servedNativeStartedTags(*startedPath))
+	rawParams := mustMarshal(t, params)
+	if err := os.WriteFile(*paramsPath, rawParams, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resp := rpcRawParams(t, conn, reader, "submit-restart", protocol.MethodJobSubmit, rawParams)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	if submitted.JobID == "" || submitted.Deduplicated {
+		t.Fatalf("submit result = %+v, want new job", submitted)
 	}
 	if err := os.WriteFile(*jobPath, []byte(submitted.JobID+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if outcome.after == nil {
-		t.Fatal("helper job.submit returned no response-delivery action")
-	}
-	outcome.after()
-	if err := waitServedNativeFile(*startedPath, 10*time.Second); err != nil {
+	if err := waitServedNativeFile(*startedPath, servedNativeDaemonHelperReadyTimeout); err != nil {
 		t.Fatal(err)
 	}
 	select {}
 }
 
-func TestServedNativeConformanceProductionDefaultsUnavailableAndGateOff(t *testing.T) {
+func TestServedNativeProductionDefaultsUnavailableAndGateOff(t *testing.T) {
 	server, _, cwd := newUnstartedTestServer(t, newFakeBackend(servedNativeBackendName))
 	if server.jobsRequestIDEnabled {
 		t.Fatal("jobsRequestIDEnabled default = true, want false")
@@ -194,156 +200,685 @@ func TestServedNativeConformanceProductionDefaultsUnavailableAndGateOff(t *testi
 	}
 }
 
-func TestServedNativeConformanceIdentifiedFencedHappyPath(t *testing.T) {
-	runtimeBundle := requireServedNativeRuntime(t)
+func TestServedStrictCompositionDefaultConstructionConformance(t *testing.T) {
+	requireServedNativeConformance(t)
 	root := shortTempDir(t)
 	cwd := shortTempDir(t)
-	backend := newServedNativeFixtureBackend(servedNativeFixtureModeClean, filepath.Join(root, "served-native-fixture"), "")
-	server := newServedNativeBootstrappedServer(t, root, cwd, backend, runtimeBundle)
-
-	submitted := submitServedNativeScriptedJob(t, server, "happy", cwd, servedNativeFixtureModeClean)
-	waitServedNativeBackendStarted(t, backend)
-	record := waitServedNativeAdmissionTerminal(t, server, submitted.JobID, 10*time.Second)
-	launchProof := assertServedNativeIdentifiedTerminal(t, record, model.OutcomeCompleted)
-	if launchProof.Quiescence.Method == model.QuiescenceTermKill {
-		t.Fatalf("happy-path quiescence method = %s, want natural/absent completion", launchProof.Quiescence.Method)
+	fixture := installServedNativeCodexFixture(t, root)
+	cfg, err := StrictAdmissionConfig(Config{
+		StateRoot:   root,
+		CWD:         cwd,
+		Token:       "test-token",
+		Backends:    []engine.Backend{servedNativeCodexBackend(fixture)},
+		IdleTimeout: -1,
+	}, servedNativeStrictOptions(builtServedNativeAgentbusPath(t), fixture.env))
+	if err != nil {
+		t.Fatalf("StrictAdmissionConfig() error = %v", err)
 	}
-	assertServedNativeFixtureMetadata(t, backend, *launchProof.Group, false)
-	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.bootstrapAdmission(context.Background()); err != nil {
+		t.Fatalf("bootstrapAdmission() error = %v", err)
+	}
+	defer closeServedNativeAdmission(t, server)
+	if server.admissionInstance == nil {
+		t.Fatal("admission instance missing")
+	}
+	policy := server.admissionInstance.policy
+	if policy.Mode != AdmissionStrictIdentified || !policy.strictRuntimeAvailable() {
+		t.Fatalf("policy = %+v support=%+v, want strict available", policy, policy.runtimeSupport)
+	}
+	inspection, err := authority.InspectAdmissionRepository(context.Background(), server.admissionRepository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.ActivationMetadata.Activated {
+		t.Fatal("strict composition did not activate the admission root")
+	}
+
+	_, restrictedErr := StrictAdmissionConfig(Config{
+		StateRoot:   shortTempDir(t),
+		CWD:         cwd,
+		Token:       "test-token",
+		Backends:    []engine.Backend{servedNativeCodexBackend(fixture)},
+		IdleTimeout: -1,
+	}, servedNativeStrictOptions(builtServedNativeAgentbusPath(t), fixture.env))
+	if !errors.Is(restrictedErr, cgroup.ErrRootLeaseUnavailable) {
+		t.Fatalf("restricted composition error = %v, want typed cgroup root lease contention", restrictedErr)
+	}
 }
 
-func TestServedNativeConformanceGrandchildSurvivalContained(t *testing.T) {
-	runtimeBundle := requireServedNativeRuntime(t)
-	root := shortTempDir(t)
-	cwd := shortTempDir(t)
-	backend := newServedNativeFixtureBackend(servedNativeFixtureModeGrandchild, filepath.Join(root, "served-native-fixture"), "")
-	server := newServedNativeBootstrappedServer(t, root, cwd, backend, runtimeBundle)
+func TestServedStrictCompositionIdentifiedSubmitReplayConformance(t *testing.T) {
+	server, h, fixture := startServedNativeStrictServer(t, shortTempDir(t), shortTempDir(t), nil)
+	conn, reader := servedNativeRPC(t, h)
+	defer conn.Close()
 
-	submitted := submitServedNativeScriptedJob(t, server, "grandchild", cwd, servedNativeFixtureModeGrandchild)
-	waitServedNativeBackendStarted(t, backend)
+	params := servedNativeSubmitParams("identified-submit", h.cwd, servedNativeFixtureModeClean, nil)
+	resp := rpc(t, conn, reader, "submit-1", protocol.MethodJobSubmit, params)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	if submitted.JobID == "" || submitted.Deduplicated {
+		t.Fatalf("submit result = %+v, want new job", submitted)
+	}
+	execution := waitServedNativeCodexExecutions(t, fixture, 1, 10*time.Second)[0]
+	record := waitServedNativeAdmissionTerminal(t, server, submitted.JobID, 10*time.Second)
+	launchProof := assertServedNativeIdentifiedTerminal(t, record, model.OutcomeCompleted)
+	assertServedNativeExecutionMetadata(t, execution, *launchProof.Group, false)
+	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
+
+	resp = rpc(t, conn, reader, "submit-replay", protocol.MethodJobSubmit, params)
+	var replay protocol.JobSubmitResult
+	decodeResult(t, resp, &replay)
+	if replay.JobID != submitted.JobID || !replay.Deduplicated || replay.State != engine.StateCompleted {
+		t.Fatalf("replay submit = %+v, want same completed terminal job %s", replay, submitted.JobID)
+	}
+	assertServedNativeCodexExecutionCount(t, fixture, 1)
+}
+
+func TestServedStrictCompositionNoExecBeforeGrantConformance(t *testing.T) {
+	server, h, fixture := startServedNativeStrictServer(t, shortTempDir(t), shortTempDir(t), nil)
+	conn, reader := servedNativeRPC(t, h)
+	defer conn.Close()
+	startedPath := filepath.Join(h.root, "no-exec-before-grant-started")
+	assertServedNativeCodexExecutionCount(t, fixture, 0)
+	submitted := submitServedNativeJobOnConn(t, conn, reader, "no-exec-before-grant", h.cwd, servedNativeFixtureModeHold, servedNativeStartedTags(startedPath))
+	assertServedNativeExecWaitsForGrantRelease(t, server, submitted.JobID, startedPath, 10*time.Second)
+	executions := waitServedNativeCodexExecutions(t, fixture, 1, 10*time.Second)
+	resp := rpc(t, conn, reader, "cancel-no-exec", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: submitted.JobID})
+	var canceled protocol.JobCancelResult
+	decodeResult(t, resp, &canceled)
+	if canceled.JobID != submitted.JobID {
+		t.Fatalf("cancel result = %+v, want job %s", canceled, submitted.JobID)
+	}
+	record := waitServedNativeAdmissionTerminal(t, server, submitted.JobID, 10*time.Second)
+	launchProof := assertServedNativeIdentifiedTerminal(t, record, model.OutcomeCanceled)
+	if launchProof.Grant == nil || launchProof.Released == nil {
+		t.Fatalf("launch proof = %+v, want grant and release before terminal execution proof", launchProof)
+	}
+	assertServedNativeExecutionMetadata(t, executions[0], *launchProof.Group, false)
+	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
+	assertServedNativeCodexExecutionCount(t, fixture, 1)
+}
+
+func TestServedStrictCompositionReleaseAckLossConformance(t *testing.T) {
+	var hookCalls atomic.Int32
+	setServedNativeReleaseAfterSendBeforeAckHook(t, func(dropAck func() error) error {
+		call := hookCalls.Add(1)
+		if call != 1 {
+			return nil
+		}
+		if dropAck == nil {
+			return errors.New("served native release ack loss hook missing drop function")
+		}
+		if err := dropAck(); err != nil {
+			return fmt.Errorf("drop release ack: %w", err)
+		}
+		return errors.New("served native release ack lost after release send")
+	})
+
+	server, h, fixture := startServedNativeStrictServer(t, shortTempDir(t), shortTempDir(t), nil)
+	conn, reader := servedNativeRPC(t, h)
+	defer conn.Close()
+
+	params := servedNativeSubmitParams("release-ack-loss", h.cwd, servedNativeFixtureModeClean, nil)
+	resp := rpc(t, conn, reader, "submit-release-ack-loss", protocol.MethodJobSubmit, params)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	if submitted.JobID == "" || submitted.Deduplicated {
+		t.Fatalf("submit result = %+v, want new job", submitted)
+	}
+
+	record := waitServedNativeAdmissionTerminal(t, server, submitted.JobID, 10*time.Second)
+	launchProof := assertServedNativeReleaseAckLossTerminal(t, record)
+	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
+	executions := readServedNativeCodexExecutions(t, fixture)
+	if len(executions) > 1 {
+		t.Fatalf("codex execution count = %d (%+v), want at most 1 after release ack loss", len(executions), executions)
+	}
+	if len(executions) == 1 {
+		assertServedNativeExecutionMetadata(t, executions[0], *launchProof.Group, false)
+	}
+	if got := hookCalls.Load(); got != 1 {
+		t.Fatalf("release ack loss hook calls = %d, want 1", got)
+	}
+
+	resp = rpc(t, conn, reader, "replay-release-ack-loss", protocol.MethodJobSubmit, params)
+	var replay protocol.JobSubmitResult
+	decodeResult(t, resp, &replay)
+	if replay.JobID != submitted.JobID || !replay.Deduplicated || replay.State != engine.StateFailed {
+		t.Fatalf("replay after release ack loss = %+v, want same failed terminal job %s", replay, submitted.JobID)
+	}
+	afterReplay := readServedNativeCodexExecutions(t, fixture)
+	if len(afterReplay) != len(executions) {
+		t.Fatalf("codex execution count after replay = %d (%+v), want unchanged %d", len(afterReplay), afterReplay, len(executions))
+	}
+	if got := hookCalls.Load(); got != 1 {
+		t.Fatalf("release ack loss hook calls after replay = %d, want 1", got)
+	}
+
+	newJob := submitServedNativeJobOnConn(t, conn, reader, "post-release-ack-loss", h.cwd, servedNativeFixtureModeClean, nil)
+	newRecord := waitServedNativeAdmissionTerminal(t, server, newJob.JobID, 10*time.Second)
+	newLaunchProof := assertServedNativeIdentifiedTerminal(t, newRecord, model.OutcomeCompleted)
+	assertServedNativeIndependentGroupAbsent(t, *newLaunchProof.Group, 5*time.Second)
+}
+
+func TestServedStrictCompositionCancellationConformance(t *testing.T) {
+	server, h, fixture := startServedNativeStrictServer(t, shortTempDir(t), shortTempDir(t), nil)
+	conn, reader := servedNativeRPC(t, h)
+	defer conn.Close()
+	submitted := submitServedNativeJobOnConn(t, conn, reader, "cancel", h.cwd, servedNativeFixtureModeHold, servedNativeStartedTags(filepath.Join(h.root, "hold-started")))
+	execution := waitServedNativeCodexExecutions(t, fixture, 1, 10*time.Second)[0]
+	resp := rpc(t, conn, reader, "cancel", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: submitted.JobID})
+	var canceled protocol.JobCancelResult
+	decodeResult(t, resp, &canceled)
+	if canceled.JobID != submitted.JobID {
+		t.Fatalf("cancel result = %+v, want job %s", canceled, submitted.JobID)
+	}
+	record := waitServedNativeAdmissionTerminal(t, server, submitted.JobID, 10*time.Second)
+	launchProof := assertServedNativeIdentifiedTerminal(t, record, model.OutcomeCanceled)
+	if launchProof.Quiescence.Method != model.QuiescenceTermKill {
+		t.Fatalf("cancel quiescence method = %s, want term_kill", launchProof.Quiescence.Method)
+	}
+	assertServedNativeExecutionMetadata(t, execution, *launchProof.Group, false)
+	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
+
+	newJob := submitServedNativeJobOnConn(t, conn, reader, "post-cancel", h.cwd, servedNativeFixtureModeClean, nil)
+	newRecord := waitServedNativeAdmissionTerminal(t, server, newJob.JobID, 10*time.Second)
+	newLaunchProof := assertServedNativeIdentifiedTerminal(t, newRecord, model.OutcomeCompleted)
+	assertServedNativeIndependentGroupAbsent(t, *newLaunchProof.Group, 5*time.Second)
+}
+
+func TestServedStrictCompositionDescendantContainmentConformance(t *testing.T) {
+	server, h, fixture := startServedNativeStrictServer(t, shortTempDir(t), shortTempDir(t), nil)
+	conn, reader := servedNativeRPC(t, h)
+	defer conn.Close()
+	submitted := submitServedNativeJobOnConn(t, conn, reader, "grandchild", h.cwd, servedNativeFixtureModeGrandchild, nil)
+	execution := waitServedNativeCodexExecutions(t, fixture, 1, 10*time.Second)[0]
 	record := waitServedNativeAdmissionTerminal(t, server, submitted.JobID, 10*time.Second)
 	launchProof := assertServedNativeIdentifiedTerminal(t, record, model.OutcomeCompleted)
 	if launchProof.Quiescence.Method != model.QuiescenceTermKill {
-		t.Fatalf("grandchild quiescence method = %s, want term_kill containment", launchProof.Quiescence.Method)
+		t.Fatalf("grandchild quiescence method = %s, want term_kill residual containment", launchProof.Quiescence.Method)
 	}
-	assertServedNativeFixtureMetadata(t, backend, *launchProof.Group, true)
+	assertServedNativeExecutionMetadata(t, execution, *launchProof.Group, true)
 	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
+	if execution.GrandchildPID <= 0 {
+		t.Fatalf("execution metadata = %+v, want grandchild pid", execution)
+	}
+	assertServedNativePIDAbsent(t, execution.GrandchildPID, 5*time.Second)
 }
 
-func TestServedNativeConformanceDaemonKillRestartRecovery(t *testing.T) {
-	if goruntime.GOOS == "darwin" {
-		t.Skip("macOS leader-retention custody cannot prove recovery containment after daemon SIGKILL; run this scenario in the Linux cgroup-v2 conformance harness")
-	}
-	requireServedNativeSupport(t)
+func TestServedStrictCompositionDaemonSIGKILLRestartRecoveryConformance(t *testing.T) {
+	requireServedNativeConformance(t)
 	root := shortTempDir(t)
 	cwd := shortTempDir(t)
+	fixture := installServedNativeCodexFixture(t, root)
 	startedPath := filepath.Join(root, "served-native-release-recorded")
 	jobPath := filepath.Join(root, "served-native-job-id")
-	helper := startServedNativeDaemonHelper(t, root, cwd, startedPath, jobPath)
-	if err := waitServedNativeFile(startedPath, 10*time.Second); err != nil {
-		t.Fatal(err)
+	paramsPath := filepath.Join(root, "served-native-submit-params.json")
+	helper := startServedNativeDaemonHelper(t, root, cwd, builtServedNativeAgentbusPath(t), fixture.env, startedPath, jobPath, paramsPath)
+	if err := waitServedNativeFile(startedPath, servedNativeDaemonHelperReadyTimeout); err != nil {
+		t.Fatalf("daemon helper release marker did not become ready: %v\n%s\noutput:\n%s", err, helper.diagnostics([]string{startedPath}, nil), helper.output.String())
 	}
 	submittedJobID := readServedNativeJobID(t, jobPath)
+	submitParams := readServedNativeSubmitParams(t, paramsPath)
+	firstExecution := waitServedNativeCodexExecutions(t, fixture, 1, 10*time.Second)[0]
 	helper.killAndWait(t)
 
-	recoveryRuntime := requireServedNativeRuntime(t)
-	backend := newServedNativeFixtureBackend(servedNativeFixtureModeClean, filepath.Join(root, "served-native-fixture-recovery"), "")
-	server, h := startServedNativeServer(t, root, cwd, backend, recoveryRuntime)
-	recoveryConn := dialRaw(t, h.socketPath)
+	recoveryServer, h, _ := startServedNativeStrictServerWithFixture(t, root, cwd, fixture, nil)
+	recoveryConn, recoveryReader := servedNativeRPC(t, h)
 	defer recoveryConn.Close()
-	recoveryReader := bufio.NewReader(recoveryConn)
-	helloRaw(t, recoveryConn, recoveryReader, h.token)
-
-	record := waitServedNativeAdmissionTerminal(t, server, submittedJobID, 10*time.Second)
+	record := waitServedNativeAdmissionTerminal(t, recoveryServer, submittedJobID, 10*time.Second)
 	launchProof := assertServedNativeIdentifiedTerminal(t, record, model.OutcomeReaped)
 	if record.Terminal.Cause != model.CauseDaemonRestartedAfterAuthorization {
 		t.Fatalf("recovery terminal cause = %s, want daemon_restart_after_authorization", record.Terminal.Cause)
 	}
+	assertServedNativeExecutionMetadata(t, firstExecution, *launchProof.Group, false)
 	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
 
-	var status protocol.JobStatusResult
-	decodeResult(t, rpc(t, recoveryConn, recoveryReader, "status-recovered", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: submittedJobID}), &status)
-	if len(status.Jobs) != 1 || status.Jobs[0].State != engine.StateReaped {
-		t.Fatalf("recovered status = %+v, want one reaped job", status)
+	resp := rpcRawParams(t, recoveryConn, recoveryReader, "replay", protocol.MethodJobSubmit, submitParams)
+	var replay protocol.JobSubmitResult
+	decodeResult(t, resp, &replay)
+	if replay.JobID != submittedJobID || !replay.Deduplicated || replay.State != engine.StateReaped {
+		t.Fatalf("replay after recovery = %+v, want reaped job %s", replay, submittedJobID)
+	}
+
+	newJob := submitServedNativeJobOnConn(t, recoveryConn, recoveryReader, "post-recovery", cwd, servedNativeFixtureModeClean, nil)
+	secondExecution := waitServedNativeCodexExecutions(t, fixture, 2, 10*time.Second)[1]
+	newRecord := waitServedNativeAdmissionTerminal(t, recoveryServer, newJob.JobID, 10*time.Second)
+	newLaunchProof := assertServedNativeIdentifiedTerminal(t, newRecord, model.OutcomeCompleted)
+	assertServedNativeExecutionMetadata(t, secondExecution, *newLaunchProof.Group, false)
+	assertServedNativeIndependentGroupAbsent(t, *newLaunchProof.Group, 5*time.Second)
+}
+
+func TestServedStrictCompositionActivatedRootSupportLossConformance(t *testing.T) {
+	requireServedNativeConformance(t)
+	root := shortTempDir(t)
+	cwd := shortTempDir(t)
+	fixture := installServedNativeCodexFixture(t, root)
+	server, h, _ := startServedNativeStrictServerWithFixture(t, root, cwd, fixture, nil)
+	stopServedNativeServer(t, h)
+	closeServedNativeAdmission(t, server)
+	inspection, err := authority.InspectAdmissionRoot(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.ActivationMetadata.Activated {
+		t.Fatal("root was not activated before support-loss scenario")
+	}
+
+	blockerCfg, err := StrictAdmissionConfig(Config{
+		StateRoot:   shortTempDir(t),
+		CWD:         cwd,
+		Token:       "test-token",
+		Backends:    []engine.Backend{servedNativeCodexBackend(fixture)},
+		IdleTimeout: -1,
+	}, servedNativeStrictOptions(builtServedNativeAgentbusPath(t), fixture.env))
+	if err != nil {
+		t.Fatalf("blocker StrictAdmissionConfig() error = %v", err)
+	}
+	blockerServer, err := New(blockerCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockerServer.bootstrapAdmission(context.Background()); err != nil {
+		t.Fatalf("blocker bootstrapAdmission() error = %v", err)
+	}
+	defer closeServedNativeAdmission(t, blockerServer)
+
+	lossCfg, lossErr := StrictAdmissionConfig(Config{
+		StateRoot:   root,
+		CWD:         cwd,
+		Token:       "test-token",
+		Backends:    []engine.Backend{servedNativeCodexBackend(fixture)},
+		IdleTimeout: -1,
+	}, servedNativeStrictOptions(builtServedNativeAgentbusPath(t), fixture.env))
+	if !errors.Is(lossErr, cgroup.ErrRootLeaseUnavailable) {
+		t.Fatalf("support-loss construction error = %v, want ErrRootLeaseUnavailable", lossErr)
+	}
+	lossServer, err := New(lossCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = lossServer.Serve(context.Background())
+	var diagnostic AdmissionSupportDiagnostic
+	if !errors.As(err, &diagnostic) {
+		t.Fatalf("Serve support-loss error = %T %v, want AdmissionSupportDiagnostic", err, err)
+	}
+	after, err := authority.InspectAdmissionRoot(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ActivationMetadata.Activated {
+		t.Fatal("support-loss startup cleared activation")
+	}
+	if _, statErr := os.Stat(filepath.Join(root, protocol.SocketName)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("support-loss socket stat = %v, want not exist", statErr)
 	}
 }
 
-func requireServedNativeRuntime(t *testing.T) custodian.Runtime {
+func TestServedStrictCompositionRuntimeLeaseReuseConformance(t *testing.T) {
+	requireServedNativeConformance(t)
+	root := shortTempDir(t)
+	cwd := shortTempDir(t)
+	fixture := installServedNativeCodexFixture(t, root)
+	server, h, _ := startServedNativeStrictServerWithFixture(t, root, cwd, fixture, nil)
+
+	concurrentCfg, concurrentErr := StrictAdmissionConfig(Config{
+		StateRoot:   root,
+		CWD:         cwd,
+		Token:       "test-token",
+		Backends:    []engine.Backend{servedNativeCodexBackend(fixture)},
+		IdleTimeout: -1,
+	}, servedNativeStrictOptions(builtServedNativeAgentbusPath(t), fixture.env))
+	if !errors.Is(concurrentErr, cgroup.ErrRootLeaseUnavailable) {
+		t.Fatalf("concurrent strict composition error = %v, want ErrRootLeaseUnavailable", concurrentErr)
+	}
+	concurrentServer, err := New(concurrentCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = concurrentServer.Serve(context.Background())
+	var diagnostic AdmissionSupportDiagnostic
+	if !errors.As(err, &diagnostic) {
+		t.Fatalf("concurrent Serve error = %T %v, want AdmissionSupportDiagnostic", err, err)
+	}
+
+	stopServedNativeServer(t, h)
+	err = server.Serve(context.Background())
+	if !errors.Is(err, ErrRuntimeConsumed) {
+		t.Fatalf("same server second Serve error = %v, want ErrRuntimeConsumed", err)
+	}
+	closeServedNativeAdmission(t, server)
+
+	freshServer, freshH, _ := startServedNativeStrictServerWithFixture(t, root, cwd, fixture, nil)
+	conn, reader := servedNativeRPC(t, freshH)
+	defer conn.Close()
+	submitted := submitServedNativeJobOnConn(t, conn, reader, "fresh-second-serve", cwd, servedNativeFixtureModeClean, nil)
+	record := waitServedNativeAdmissionTerminal(t, freshServer, submitted.JobID, 10*time.Second)
+	launchProof := assertServedNativeIdentifiedTerminal(t, record, model.OutcomeCompleted)
+	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
+}
+
+func TestServedStrictCompositionRejectionsConformance(t *testing.T) {
+	unfenceable := newFakeBackend("fake")
+	unfenceable.controlled = false
+	server, h, fixture := startServedNativeStrictServer(t, shortTempDir(t), shortTempDir(t), []engine.Backend{unfenceable})
+	conn, reader := servedNativeRPC(t, h)
+	defer conn.Close()
+
+	missingIdentityRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":"","requestId":"","taskSpec":{"backend":"%s","cwd":%q,"write":false,"prompt":"%s"}}`, servedNativeBackendName, h.cwd, servedNativeFixtureModeClean))
+	resp := rpcRawParams(t, conn, reader, "missing-identity", protocol.MethodJobSubmit, missingIdentityRaw)
+	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
+	if resp.Error.Data.AdmissionCause != protocol.AdmissionRejectMissingIdentity {
+		t.Fatalf("missing identity cause = %q, want %q", resp.Error.Data.AdmissionCause, protocol.AdmissionRejectMissingIdentity)
+	}
+	assertServedNativeNoAuthorityJobs(t, server)
+	assertServedNativeCodexExecutionCount(t, fixture, 0)
+
+	resp = rpc(t, conn, reader, "unfenceable", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-unfenceable",
+		RequestID:    "request-unfenceable",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     h.cwd,
+			Write:   false,
+			Prompt:  "unfenceable",
+		},
+	})
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	if resp.Error.Data.AdmissionCause != protocol.AdmissionRejectUnfenceableBackend {
+		t.Fatalf("unfenceable cause = %q, want %q", resp.Error.Data.AdmissionCause, protocol.AdmissionRejectUnfenceableBackend)
+	}
+	assertServedNativeNoAuthorityJobs(t, server)
+	assertNoEngineJobRecordsForCWD(t, server, h.cwd)
+	assertServedNativeCodexExecutionCount(t, fixture, 0)
+
+	ok := submitServedNativeJobOnConn(t, conn, reader, "healthy-after-reject", h.cwd, servedNativeFixtureModeClean, nil)
+	record := waitServedNativeAdmissionTerminal(t, server, ok.JobID, 10*time.Second)
+	launchProof := assertServedNativeIdentifiedTerminal(t, record, model.OutcomeCompleted)
+	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
+}
+
+func requireServedNativeConformance(t *testing.T) {
 	t.Helper()
-	if goruntime.GOOS == "linux" && os.Getenv(servedNativeCgroupConformanceEnv) != "1" {
+	if goruntime.GOOS != "linux" {
+		t.Skip("served native strict conformance requires linux cgroup-v2")
+	}
+	if os.Getenv(servedNativeCgroupConformanceEnv) != "1" {
 		t.Skip("set AGENTBUS_CGROUP_CONFORMANCE=1 to run served native cgroup-v2 conformance")
 	}
-	options := servedNativeRuntimeOptions(t)
-	runtimeBundle, err := custodian.NewNativeRuntime(options)
-	support := runtimeBundle.SelfTest(context.Background())
-	if err != nil || !support.ParkedExec || !support.VerifiedContainment {
-		t.Skipf("native runtime support unavailable: support=%+v err=%v", support, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	manager, err := cgroup.New("")
+	if err != nil {
+		t.Skipf("cgroup.New(\"\") unavailable: %v", err)
 	}
+	support := manager.Probe(ctx)
+	if closeErr := manager.Close(); closeErr != nil {
+		t.Fatalf("close cgroup conformance probe manager: %v", closeErr)
+	}
+	if !support.Strict() {
+		t.Skipf("strict cgroup-v2 support unavailable: supported=%t runtimeProbePassed=%t degraded=%t platform=%s reason=%v", support.Supported, support.RuntimeProbePassed, support.Degraded, support.Platform, support.Reason)
+	}
+}
+
+func servedNativeStrictOptions(agentbusPath string, env []string) StrictAdmissionOptions {
+	return StrictAdmissionOptions{
+		AgentbusPath: agentbusPath,
+		WorkerEnv:    append([]string(nil), env...),
+		MonitorEnv:   append([]string(nil), env...),
+		ContainmentParams: containment.Params{
+			GracePeriod:                100 * time.Millisecond,
+			PollInterval:               20 * time.Millisecond,
+			PollTimeout:                3 * time.Second,
+			TrustedMonitorWait:         100 * time.Millisecond,
+			TrustedMonitorPollInterval: 20 * time.Millisecond,
+		},
+	}
+}
+
+type servedNativeCodexFixture struct {
+	binDir    string
+	codexPath string
+	execLog   string
+	readyDir  string
+	env       []string
+}
+
+type servedNativeStrictHandle struct {
+	root       string
+	cwd        string
+	socketPath string
+	token      string
+	done       chan error
+	cancel     context.CancelFunc
+	stopOnce   sync.Once
+}
+
+func installServedNativeCodexFixture(t *testing.T, root string) servedNativeCodexFixture {
+	t.Helper()
+	binDir := filepath.Join(root, "fixture-bin")
+	readyDir := filepath.Join(root, "fixture-ready")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(readyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	exe := servedNativeTestBinaryPath(t)
+	script := fmt.Sprintf("#!/bin/sh\nexec %s -test.run=^TestServedNativeConformanceCodexFixtureProcess$ -- \"$@\"\n", shellQuote(exe))
+	codexPath := filepath.Join(binDir, "codex")
+	if err := os.WriteFile(codexPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	execLog := filepath.Join(root, "codex-executions.jsonl")
+	env := append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		servedNativeCodexFixtureEnv+"=1",
+		servedNativeCodexExecLogEnv+"="+execLog,
+		servedNativeCodexReadyDirEnv+"="+readyDir,
+	)
+	for _, kv := range servedNativeAgentbusGoEnv() {
+		env = upsertEnv(env, kv)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(servedNativeCodexFixtureEnv, "1")
+	t.Setenv(servedNativeCodexExecLogEnv, execLog)
+	t.Setenv(servedNativeCodexReadyDirEnv, readyDir)
+	return servedNativeCodexFixture{binDir: binDir, codexPath: codexPath, execLog: execLog, readyDir: readyDir, env: env}
+}
+
+func servedNativeCodexBackend(fixture servedNativeCodexFixture) engine.Backend {
+	return codexcli.New(codexcli.Options{Binary: fixture.codexPath})
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func upsertEnv(env []string, kv string) []string {
+	name, _, ok := strings.Cut(kv, "=")
+	if !ok {
+		return env
+	}
+	prefix := name + "="
+	for i, existing := range env {
+		if strings.HasPrefix(existing, prefix) {
+			env[i] = kv
+			return env
+		}
+	}
+	return append(env, kv)
+}
+
+func startServedNativeStrictServer(t *testing.T, root, cwd string, extraBackends []engine.Backend) (*Server, *servedNativeStrictHandle, servedNativeCodexFixture) {
+	t.Helper()
+	fixture := installServedNativeCodexFixture(t, root)
+	server, h, fixture := startServedNativeStrictServerWithFixture(t, root, cwd, fixture, extraBackends)
+	return server, h, fixture
+}
+
+func startServedNativeStrictServerWithFixture(t *testing.T, root, cwd string, fixture servedNativeCodexFixture, extraBackends []engine.Backend) (*Server, *servedNativeStrictHandle, servedNativeCodexFixture) {
+	t.Helper()
+	requireServedNativeConformance(t)
+	backends := append([]engine.Backend{servedNativeCodexBackend(fixture)}, extraBackends...)
+	cfg, err := StrictAdmissionConfig(Config{
+		StateRoot:   root,
+		CWD:         cwd,
+		Token:       "test-token",
+		Backends:    backends,
+		IdleTimeout: -1,
+	}, servedNativeStrictOptions(builtServedNativeAgentbusPath(t), fixture.env))
+	if err != nil {
+		t.Fatalf("StrictAdmissionConfig() error = %v", err)
+	}
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ctx)
+		close(done)
+	}()
+	h := &servedNativeStrictHandle{root: root, cwd: cwd, socketPath: filepath.Join(root, protocol.SocketName), token: "test-token", done: done, cancel: cancel}
+	waitForSocket(t, h.socketPath, done)
 	t.Cleanup(func() {
-		if err := runtimeBundle.Close(); err != nil {
-			t.Fatalf("native runtime Close() error = %v", err)
+		stopServedNativeServer(t, h)
+	})
+	return server, h, fixture
+}
+
+func stopServedNativeServer(t *testing.T, h *servedNativeStrictHandle) {
+	t.Helper()
+	if h == nil || h.cancel == nil || h.done == nil {
+		return
+	}
+	h.stopOnce.Do(func() {
+		h.cancel()
+		select {
+		case err := <-h.done:
+			if err != nil {
+				t.Fatalf("server shutdown error = %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("server did not stop")
 		}
 	})
-	return runtimeBundle
 }
 
-// requireServedNativeSupport gates a test on native-runtime availability WITHOUT
-// retaining the exclusive cgroup root lease for the test's lifetime. It creates a
-// runtime, records support, and CLOSES it immediately (releasing the root lease) so a
-// later runtime in the same test (e.g. a restarted daemon) can acquire it. Using
-// requireServedNativeRuntime here instead would hold the lease until test end and make a
-// subsequent runtime acquisition fail with EAGAIN.
-func requireServedNativeSupport(t *testing.T) {
+func closeServedNativeAdmission(t *testing.T, server *Server) {
 	t.Helper()
-	if goruntime.GOOS == "linux" && os.Getenv(servedNativeCgroupConformanceEnv) != "1" {
-		t.Skip("set AGENTBUS_CGROUP_CONFORMANCE=1 to run served native cgroup-v2 conformance")
+	if server == nil {
+		return
 	}
-	options := servedNativeRuntimeOptions(t)
-	runtimeBundle, err := custodian.NewNativeRuntime(options)
-	support := runtimeBundle.SelfTest(context.Background())
-	_ = runtimeBundle.Close()
-	if err != nil || !support.ParkedExec || !support.VerifiedContainment {
-		t.Skipf("native runtime support unavailable: support=%+v err=%v", support, err)
+	if server.admissionClose != nil || server.admissionRuntime != nil || server.admissionInstance != nil {
+		if err := server.closeServeAdmission(); err != nil {
+			t.Fatalf("admission close error = %v", err)
+		}
 	}
 }
 
-func servedNativeRuntimeOptions(t *testing.T) custodian.NativeOptions {
+func servedNativeRPC(t *testing.T, h *servedNativeStrictHandle) (net.Conn, *bufio.Reader) {
 	t.Helper()
-	exe := servedNativeTestBinaryPath(t)
-	return custodian.NativeOptions{
-		AgentbusPath:      builtServedNativeAgentbusPath(t),
-		MonitorCommand:    servedNativeMonitorCommand(t),
-		ContainmentParams: servedNativeContainmentParams(),
-		WorkerEnv:         append(os.Environ(), servedNativeAgentbusGoEnv()...),
-		WorkerDir:         filepath.Dir(exe),
-	}
+	conn := dialRaw(t, h.socketPath)
+	reader := bufio.NewReader(conn)
+	helloRaw(t, conn, reader, h.token)
+	return conn, reader
 }
 
-func servedNativeContainmentParams() containment.Params {
-	return containment.Params{
-		GracePeriod:                100 * time.Millisecond,
-		PollInterval:               20 * time.Millisecond,
-		PollTimeout:                3 * time.Second,
-		TrustedMonitorWait:         100 * time.Millisecond,
-		TrustedMonitorPollInterval: 20 * time.Millisecond,
-	}
-}
-
-func servedNativeMonitorCommand(t *testing.T) parklaunch.CommandSpec {
+func setServedNativeReleaseAfterSendBeforeAckHook(t *testing.T, hook func(func() error) error) {
 	t.Helper()
-	exe := servedNativeTestBinaryPath(t)
-	return parklaunch.CommandSpec{
-		Path: exe,
-		Args: []string{
-			exe,
-			"-test.run=^TestServedNativeConformanceMonitorProcess$",
-			"--",
-			"--daemon-fd", strconv.Itoa(parklaunch.MonitorDaemonControlFD),
-			"--target-fd", strconv.Itoa(parklaunch.MonitorTargetFD),
-			"--ready-fd", strconv.Itoa(parklaunch.MonitorReadyFD),
+	previous := parklaunchReleaseAfterSendBeforeAckForTest
+	parklaunchReleaseAfterSendBeforeAckForTest = hook
+	t.Cleanup(func() {
+		parklaunchReleaseAfterSendBeforeAckForTest = previous
+	})
+}
+
+func submitServedNativeJobOnConn(t *testing.T, conn net.Conn, reader *bufio.Reader, requestSuffix, cwd, prompt string, tags map[string]string) protocol.JobSubmitResult {
+	t.Helper()
+	resp := rpc(t, conn, reader, "submit-"+requestSuffix, protocol.MethodJobSubmit, servedNativeSubmitParams(requestSuffix, cwd, prompt, tags))
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	if submitted.JobID == "" || submitted.Deduplicated {
+		t.Fatalf("submit result = %+v, want new job", submitted)
+	}
+	return submitted
+}
+
+func servedNativeSubmitParams(requestSuffix, cwd, prompt string, tags map[string]string) protocol.JobSubmitParams {
+	return protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-served-native-" + requestSuffix,
+		RequestID:    "request-served-native-" + requestSuffix,
+		TaskSpec: protocol.TaskSpec{
+			Backend: servedNativeBackendName,
+			CWD:     cwd,
+			Write:   false,
+			Prompt:  servedNativePromptWithTags(prompt, tags),
+			Tags:    tags,
 		},
-		Env: append(os.Environ(), servedNativeMonitorEnv+"=1"),
-		Dir: filepath.Dir(exe),
+	}
+}
+
+func servedNativeStartedTags(path string) map[string]string {
+	return map[string]string{"SERVED_NATIVE_STARTED_PATH": path}
+}
+
+func servedNativePromptWithTags(prompt string, tags map[string]string) string {
+	if len(tags) == 0 {
+		return prompt
+	}
+	keys := make([]string, 0, len(tags))
+	for key, value := range tags {
+		if strings.HasPrefix(key, "SERVED_NATIVE_") && strings.TrimSpace(value) != "" {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return prompt
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(prompt)
+	if !strings.HasSuffix(prompt, "\n") {
+		b.WriteByte('\n')
+	}
+	for _, key := range keys {
+		fmt.Fprintf(&b, "%s=%s\n", key, tags[key])
+	}
+	return b.String()
+}
+
+func rpcRawParams(t *testing.T, conn net.Conn, r *bufio.Reader, id, method string, params json.RawMessage) protocol.Response {
+	t.Helper()
+	req := protocol.Request{JSONRPC: "2.0", ID: json.RawMessage(strconvQuote(id)), Method: method, Params: params}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(append(raw, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		line, err := r.ReadBytes('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		var head struct {
+			ID     json.RawMessage `json:"id,omitempty"`
+			Method string          `json:"method,omitempty"`
+		}
+		mustUnmarshal(t, line, &head)
+		if head.Method != "" {
+			continue
+		}
+		var resp protocol.Response
+		mustUnmarshal(t, line, &resp)
+		return resp
 	}
 }
 
@@ -398,254 +933,148 @@ func servedNativeTestBinaryPath(t *testing.T) string {
 	return exe
 }
 
-func enableServedNativeRuntime(server *Server, runtimeBundle custodian.Runtime) {
-	server.admissionRuntimeFactory = func(*Server) *servedAdmissionRuntime {
-		return &servedAdmissionRuntime{
-			runtime: runtimeBundle,
+type servedNativeCodexExecution struct {
+	PID            int               `json:"pid"`
+	PGID           int               `json:"pgid"`
+	Mode           string            `json:"mode"`
+	Prompt         string            `json:"prompt,omitempty"`
+	Args           []string          `json:"args,omitempty"`
+	Tags           map[string]string `json:"tags,omitempty"`
+	GrandchildPID  int               `json:"grandchildPid,omitempty"`
+	GrandchildPGID int               `json:"grandchildPgid,omitempty"`
+}
+
+func runServedNativeCodexFixture(args []string) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "--version":
+			fmt.Println("codex-cli " + codexcli.MinimumKnownGoodVersion)
+			return 0
+		case "--help", "help":
+			fmt.Println("codex fixture")
+			return 0
 		}
 	}
-}
-
-type servedNativeFixtureBackend struct {
-	mode        string
-	dir         string
-	startedPath string
-	started     chan struct{}
-	metadata    chan servedNativeFixtureMetadata
-	count       atomic.Int64
-}
-
-func newServedNativeFixtureBackend(mode, dir, startedPath string) *servedNativeFixtureBackend {
-	return &servedNativeFixtureBackend{
-		mode:        mode,
-		dir:         dir,
-		startedPath: startedPath,
-		started:     make(chan struct{}, 4),
-		metadata:    make(chan servedNativeFixtureMetadata, 4),
+	promptRaw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return 2
 	}
-}
-
-func (b *servedNativeFixtureBackend) Name() string { return servedNativeBackendName }
-
-func (b *servedNativeFixtureBackend) AdmissionParkable() bool { return true }
-
-func (b *servedNativeFixtureBackend) AdmissionControlledRunner() bool { return true }
-
-func (b *servedNativeFixtureBackend) ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error) {
-	return b, nil
-}
-
-func (b *servedNativeFixtureBackend) Preflight(context.Context) (engine.Health, error) {
-	return engine.Health{Backend: b.Name()}, nil
-}
-
-func (b *servedNativeFixtureBackend) Start(_ context.Context, _ engine.SessionOpts) (engine.Session, error) {
-	n := b.count.Add(1)
-	return &servedNativeFixtureSession{id: fmt.Sprintf("%s-session-%d", b.Name(), n), backend: b}, nil
-}
-
-func (b *servedNativeFixtureBackend) Resume(_ context.Context, id string, _ engine.SessionOpts) (engine.Session, error) {
-	if id == "" {
-		id = fmt.Sprintf("%s-session-resumed", b.Name())
-	}
-	return &servedNativeFixtureSession{id: id, backend: b}, nil
-}
-
-func (b *servedNativeFixtureBackend) fixturePaths(mode string) (resultPath, grandchildReadyPath string, err error) {
-	if err := os.MkdirAll(b.dir, 0o700); err != nil {
-		return "", "", err
-	}
-	n := b.count.Load()
-	resultPath = filepath.Join(b.dir, fmt.Sprintf("%s-%d-result.json", mode, n))
-	if mode == servedNativeFixtureModeGrandchild {
-		grandchildReadyPath = filepath.Join(b.dir, fmt.Sprintf("%s-%d-grandchild-ready", mode, n))
-	}
-	return resultPath, grandchildReadyPath, nil
-}
-
-func (b *servedNativeFixtureBackend) markStarted() {
-	select {
-	case b.started <- struct{}{}:
-	default:
-	}
-	if b.startedPath != "" {
-		_ = os.WriteFile(b.startedPath, []byte("release-recorded\n"), 0o600)
-	}
-}
-
-type servedNativeFixtureSession struct {
-	id      string
-	backend *servedNativeFixtureBackend
-}
-
-func (s *servedNativeFixtureSession) ID() string { return s.id }
-
-func (s *servedNativeFixtureSession) Turn(ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
-	return nil, fmt.Errorf("served native fixture requires ordinal-bound runner: %w", custodian.ErrSupervisorUnavailable)
-}
-
-func (s *servedNativeFixtureSession) TurnWithRunner(ctx context.Context, input engine.TurnInput, runner command.Runner) (<-chan engine.Event, error) {
-	if runner == nil {
-		return nil, errors.New("command runner is required")
-	}
-	mode := s.backend.mode
-	if strings.Contains(input.Prompt, servedNativeFixtureModeGrandchild) {
+	prompt := string(promptRaw)
+	mode := servedNativeFixtureModeClean
+	switch {
+	case strings.Contains(prompt, servedNativeFixtureModeGrandchild):
 		mode = servedNativeFixtureModeGrandchild
-	} else if strings.Contains(input.Prompt, servedNativeFixtureModeHold) {
+	case strings.Contains(prompt, servedNativeFixtureModeHold):
 		mode = servedNativeFixtureModeHold
-	}
-	resultPath, grandchildReadyPath, err := s.backend.fixturePaths(mode)
-	if err != nil {
-		return nil, err
-	}
-	exe := servedNativeTestBinaryPathForBackend()
-	args := []string{
-		exe,
-		"-test.run=^TestServedNativeConformanceFixtureProcess$",
-		"--",
-		"--mode", mode,
-		"--result", resultPath,
-	}
-	if grandchildReadyPath != "" {
-		args = append(args, "--grandchild-ready", grandchildReadyPath)
-	}
-	running, err := runner.Start(ctx, command.ExecSpec{
-		Argv: args,
-		Env:  append(os.Environ(), servedNativeFixtureEnv+"=1"),
-		Dir:  filepath.Dir(exe),
-	})
-	if err != nil {
-		return nil, err
-	}
-	s.backend.markStarted()
-
-	ch := make(chan engine.Event, 4)
-	go func() {
-		defer close(ch)
-		if stdin := running.Stdin(); stdin != nil {
-			_ = stdin.Close()
-		}
-		stdoutDone := discardReadCloser(running.Stdout())
-		stderrDone := discardReadCloser(running.Stderr())
-		exit, waitErr := running.Wait(ctx)
-		<-stdoutDone
-		<-stderrDone
-		if waitErr != nil {
-			ch <- engine.Event{Type: engine.EventTerminalError, Text: waitErr.Error()}
-			return
-		}
-		if !exit.Exited || exit.Code != 0 || exit.Signal != "" {
-			ch <- engine.Event{Type: engine.EventTerminalError, Text: fmt.Sprintf("fixture exit = %+v", exit)}
-			return
-		}
-		if metadata, err := readServedNativeFixtureMetadata(resultPath); err == nil {
-			select {
-			case s.backend.metadata <- metadata:
-			default:
-			}
-		}
-		ch <- engine.Event{Type: engine.EventAgentText, Text: servedNativeResultText}
-	}()
-	return ch, nil
-}
-
-func (s *servedNativeFixtureSession) Interrupt(context.Context) error { return nil }
-
-func servedNativeTestBinaryPathForBackend() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return os.Args[0]
-	}
-	return exe
-}
-
-func discardReadCloser(reader io.ReadCloser) <-chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		if reader != nil {
-			_, _ = io.Copy(io.Discard, reader)
-			_ = reader.Close()
-		}
-		close(done)
-	}()
-	return done
-}
-
-type servedNativeFixtureMetadata struct {
-	PID            int `json:"pid"`
-	PGID           int `json:"pgid"`
-	GrandchildPID  int `json:"grandchildPid,omitempty"`
-	GrandchildPGID int `json:"grandchildPgid,omitempty"`
-}
-
-func runServedNativeFixture(args []string) int {
-	fs := flag.NewFlagSet("served-native-fixture", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	mode := fs.String("mode", "", "fixture mode")
-	resultPath := fs.String("result", "", "result path")
-	grandchildReadyPath := fs.String("grandchild-ready", "", "grandchild ready path")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	if *mode == "" || *resultPath == "" {
-		return 2
 	}
 	pgid, err := unix.Getpgid(0)
 	if err != nil {
 		return 3
 	}
-	metadata := servedNativeFixtureMetadata{PID: os.Getpid(), PGID: pgid}
-	switch *mode {
+	execution := servedNativeCodexExecution{
+		PID:    os.Getpid(),
+		PGID:   pgid,
+		Mode:   mode,
+		Prompt: prompt,
+		Args:   append([]string(nil), args...),
+		Tags:   parseServedNativePromptTags(prompt),
+	}
+	switch mode {
 	case servedNativeFixtureModeClean:
-		fmt.Printf("served-native-clean pid=%d pgid=%d\n", os.Getpid(), pgid)
-		return writeServedNativeFixtureMetadata(*resultPath, metadata)
-	case servedNativeFixtureModeGrandchild:
-		if *grandchildReadyPath == "" {
-			return 2
+		if err := appendServedNativeCodexExecution(execution); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 4
 		}
+		writeServedNativeCodexResult()
+		return 0
+	case servedNativeFixtureModeHold:
+		signal.Ignore(syscall.SIGTERM)
+		if err := appendServedNativeCodexExecution(execution); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 4
+		}
+		if path := execution.Tags["SERVED_NATIVE_STARTED_PATH"]; path != "" {
+			_ = os.WriteFile(path, []byte("release-recorded\n"), 0o600)
+		}
+		for {
+			time.Sleep(time.Hour)
+		}
+	case servedNativeFixtureModeGrandchild:
+		readyPath := filepath.Join(os.Getenv(servedNativeCodexReadyDirEnv), fmt.Sprintf("grandchild-%d-ready", os.Getpid()))
 		exe, err := os.Executable()
 		if err != nil {
-			return 4
+			return 5
 		}
 		cmd := exec.Command(exe,
 			"-test.run=^TestServedNativeConformanceGrandchildProcess$",
 			"--",
-			"--ready", *grandchildReadyPath,
+			"--ready", readyPath,
 		)
 		cmd.Env = append(os.Environ(), servedNativeGrandchildEnv+"=1")
-		cmd.Dir = filepath.Dir(exe)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 		if err := cmd.Start(); err != nil {
-			return 5
-		}
-		if err := waitServedNativeFile(*grandchildReadyPath, 5*time.Second); err != nil {
-			_ = cmd.Process.Kill()
 			return 6
 		}
-		childPGID, err := readServedNativeGrandchildPGID(*grandchildReadyPath)
-		if err != nil {
+		if err := waitServedNativeFile(readyPath, 5*time.Second); err != nil {
 			_ = cmd.Process.Kill()
 			return 7
 		}
-		metadata.GrandchildPID = cmd.Process.Pid
-		metadata.GrandchildPGID = childPGID
-		if code := writeServedNativeFixtureMetadata(*resultPath, metadata); code != 0 {
+		childPGID, err := readServedNativeGrandchildPGID(readyPath)
+		if err != nil {
 			_ = cmd.Process.Kill()
-			return code
+			return 8
 		}
-		fmt.Printf("served-native-grandchild-ready pid=%d pgid=%d child=%d\n", os.Getpid(), pgid, cmd.Process.Pid)
+		execution.GrandchildPID = cmd.Process.Pid
+		execution.GrandchildPGID = childPGID
+		if err := appendServedNativeCodexExecution(execution); err != nil {
+			_ = cmd.Process.Kill()
+			fmt.Fprintln(os.Stderr, err)
+			return 4
+		}
+		writeServedNativeCodexResult()
 		return 0
-	case servedNativeFixtureModeHold:
-		signal.Ignore(syscall.SIGTERM)
-		if code := writeServedNativeFixtureMetadata(*resultPath, metadata); code != 0 {
-			return code
-		}
-		fmt.Printf("served-native-hold-ready pid=%d pgid=%d\n", os.Getpid(), pgid)
-		for {
-			time.Sleep(time.Hour)
-		}
 	default:
 		return 2
 	}
+}
+
+func parseServedNativePromptTags(prompt string) map[string]string {
+	tags := make(map[string]string)
+	for _, line := range strings.Split(prompt, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if strings.HasPrefix(key, "SERVED_NATIVE_") && value != "" {
+			tags[key] = value
+		}
+	}
+	return tags
+}
+
+func writeServedNativeCodexResult() {
+	enc := json.NewEncoder(os.Stdout)
+	_ = enc.Encode(map[string]any{"type": "agent_message", "text": servedNativeResultText, "thread_id": "served-native-session"})
+	_ = enc.Encode(map[string]any{"type": "turn.completed", "last_agent_message": servedNativeResultText, "thread_id": "served-native-session"})
+}
+
+func appendServedNativeCodexExecution(execution servedNativeCodexExecution) error {
+	path := os.Getenv(servedNativeCodexExecLogEnv)
+	if path == "" {
+		return errors.New("codex execution log path is required")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return json.NewEncoder(file).Encode(execution)
 }
 
 func runServedNativeGrandchild(args []string) int {
@@ -671,25 +1100,6 @@ func runServedNativeGrandchild(args []string) int {
 	}
 }
 
-func runServedNativeMonitor(args []string) int {
-	fs := flag.NewFlagSet("served-native-monitor", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	daemonFD := fs.Int("daemon-fd", -1, "daemon fd")
-	targetFD := fs.Int("target-fd", -1, "target fd")
-	readyFD := fs.Int("ready-fd", -1, "ready fd")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	if *daemonFD < 3 || *targetFD < 3 || *readyFD < 3 {
-		return 2
-	}
-	if err := parklaunch.RunMonitorFromFDs(context.Background(), *daemonFD, *targetFD, *readyFD, custodian.RealContainment{Params: servedNativeContainmentParams()}); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 3
-	}
-	return 0
-}
-
 func servedNativeHelperArgs() ([]string, bool) {
 	for i, arg := range os.Args {
 		if arg == "--" && i+1 <= len(os.Args) {
@@ -697,35 +1107,6 @@ func servedNativeHelperArgs() ([]string, bool) {
 		}
 	}
 	return nil, false
-}
-
-func writeServedNativeFixtureMetadata(path string, metadata servedNativeFixtureMetadata) int {
-	if path == "" {
-		return 2
-	}
-	raw, err := json.Marshal(metadata)
-	if err != nil {
-		return 8
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return 8
-	}
-	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
-		return 8
-	}
-	return 0
-}
-
-func readServedNativeFixtureMetadata(path string) (servedNativeFixtureMetadata, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return servedNativeFixtureMetadata{}, err
-	}
-	var metadata servedNativeFixtureMetadata
-	if err := json.Unmarshal(raw, &metadata); err != nil {
-		return servedNativeFixtureMetadata{}, err
-	}
-	return metadata, nil
 }
 
 func readServedNativeGrandchildPGID(path string) (int, error) {
@@ -757,91 +1138,49 @@ func waitServedNativeFile(path string, timeout time.Duration) error {
 	return fmt.Errorf("timeout waiting for %s: %v", path, lastErr)
 }
 
-func startServedNativeServer(t *testing.T, root, cwd string, backend engine.Backend, runtimeBundle custodian.Runtime) (*Server, testServer) {
+func readServedNativeCodexExecutions(t *testing.T, fixture servedNativeCodexFixture) []servedNativeCodexExecution {
 	t.Helper()
-	server, err := New(Config{
-		StateRoot:   root,
-		CWD:         cwd,
-		Token:       "test-token",
-		Backends:    []engine.Backend{backend},
-		IdleTimeout: -1,
-	})
+	raw, err := os.ReadFile(fixture.execLog)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	enableServedNativeRuntime(server, runtimeBundle)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- server.Serve(ctx)
-		close(done)
-	}()
-	h := testServer{root: root, cwd: cwd, socketPath: filepath.Join(root, protocol.SocketName), token: "test-token", done: done, cancel: cancel}
-	waitForSocket(t, h.socketPath, done)
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("server did not stop")
+	var out []servedNativeCodexExecution
+	for _, line := range bytes.Split(bytes.TrimSpace(raw), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
 		}
-	})
-	return server, h
-}
-
-func newServedNativeBootstrappedServer(t *testing.T, root, cwd string, backend engine.Backend, runtimeBundle custodian.Runtime) *Server {
-	t.Helper()
-	server, err := New(Config{
-		StateRoot:   root,
-		CWD:         cwd,
-		Token:       "test-token",
-		Backends:    []engine.Backend{backend},
-		IdleTimeout: -1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	enableServedNativeRuntime(server, runtimeBundle)
-	if err := server.bootstrapAdmission(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if server.admissionClose != nil {
-			if err := server.admissionClose.Close(); err != nil {
-				t.Fatalf("admission close error = %v", err)
-			}
+		var execution servedNativeCodexExecution
+		if err := json.Unmarshal(line, &execution); err != nil {
+			t.Fatalf("decode execution log %s: %v", fixture.execLog, err)
 		}
-	})
-	return server
-}
-
-func submitServedNativeScriptedJob(t *testing.T, server *Server, requestSuffix, cwd, prompt string) protocol.JobSubmitResult {
-	t.Helper()
-	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
-		WorkspaceKey: "workspace-served-native-" + requestSuffix,
-		RequestID:    "request-served-native-" + requestSuffix,
-		TaskSpec: protocol.TaskSpec{
-			Backend: servedNativeBackendName,
-			CWD:     cwd,
-			Write:   false,
-			Prompt:  prompt,
-		},
-	}, nil)
-	resp := responseFromScriptedConn(t, conn)
-	var submitted protocol.JobSubmitResult
-	decodeResult(t, resp, &submitted)
-	if submitted.JobID == "" || submitted.Deduplicated {
-		t.Fatalf("submit result = %+v, want new job", submitted)
+		out = append(out, execution)
 	}
-	return submitted
+	return out
 }
 
-func waitServedNativeBackendStarted(t *testing.T, backend *servedNativeFixtureBackend) {
+func waitServedNativeCodexExecutions(t *testing.T, fixture servedNativeCodexFixture, want int, timeout time.Duration) []servedNativeCodexExecution {
 	t.Helper()
-	select {
-	case <-backend.started:
-	case <-time.After(10 * time.Second):
-		t.Fatal("served native fixture backend did not start")
+	deadline := time.Now().Add(timeout)
+	var got []servedNativeCodexExecution
+	for time.Now().Before(deadline) {
+		got = readServedNativeCodexExecutions(t, fixture)
+		if len(got) >= want {
+			return got
+		}
+		time.Sleep(servedNativeConformancePollInterval)
+	}
+	t.Fatalf("codex executions = %d, want at least %d", len(got), want)
+	return nil
+}
+
+func assertServedNativeCodexExecutionCount(t *testing.T, fixture servedNativeCodexFixture, want int) {
+	t.Helper()
+	got := readServedNativeCodexExecutions(t, fixture)
+	if len(got) != want {
+		t.Fatalf("codex execution count = %d (%+v), want %d", len(got), got, want)
 	}
 }
 
@@ -861,6 +1200,28 @@ func waitServedNativeAdmissionTerminal(t *testing.T, server *Server, jobID strin
 	return model.SafetyRecord{}
 }
 
+func assertServedNativeExecWaitsForGrantRelease(t *testing.T, server *Server, jobID, markerPath string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last model.SafetyRecord
+	for time.Now().Before(deadline) {
+		record := loadAdmissionSafetyRecord(t, server, jobID)
+		last = record
+		launchProof, launchBound := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+		grantedAndReleased := launchBound && launchProof.Grant != nil && launchProof.Released != nil
+		if _, err := os.Stat(markerPath); err == nil {
+			if !grantedAndReleased {
+				t.Fatalf("backend marker %s exists before durable grant/release; record=%+v launch=%+v", markerPath, record, launchProof)
+			}
+			return
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat backend marker %s: %v", markerPath, err)
+		}
+		time.Sleep(servedNativeConformancePollInterval)
+	}
+	t.Fatalf("backend marker %s did not appear after %s; last record=%+v", markerPath, timeout, last)
+}
+
 func assertServedNativeIdentifiedTerminal(t *testing.T, record model.SafetyRecord, outcome model.Outcome) *model.LaunchProof {
 	t.Helper()
 	if record.Mode != model.ModeIdentifiedFenced {
@@ -876,24 +1237,61 @@ func assertServedNativeIdentifiedTerminal(t *testing.T, record model.SafetyRecor
 	return launchProof
 }
 
-func assertServedNativeFixtureMetadata(t *testing.T, backend *servedNativeFixtureBackend, group model.GroupRef, wantGrandchild bool) {
+func assertServedNativeReleaseAckLossTerminal(t *testing.T, record model.SafetyRecord) *model.LaunchProof {
 	t.Helper()
-	select {
-	case metadata := <-backend.metadata:
-		if metadata.PID != group.Leader.PID || metadata.PGID != group.PGID {
-			t.Fatalf("fixture metadata = %+v, want leader pid %d pgid %d", metadata, group.Leader.PID, group.PGID)
+	if record.Mode != model.ModeIdentifiedFenced {
+		t.Fatalf("admission mode = %s, want IdentifiedFenced", record.Mode)
+	}
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeFailed {
+		t.Fatalf("terminal = %+v, want failed release-ack-loss terminal", record.Terminal)
+	}
+	if record.Terminal.Cause != model.CauseReleaseOutcomeUnknown {
+		t.Fatalf("terminal cause = %s, want release_outcome_unknown", record.Terminal.Cause)
+	}
+	launchProof, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || launchProof.Group == nil || launchProof.Grant == nil || launchProof.Quiescence == nil {
+		t.Fatalf("release-ack-loss launch proof incomplete: %+v", launchProof)
+	}
+	if launchProof.Released != nil {
+		t.Fatalf("release-ack-loss launch release = %+v, want nil release record", launchProof.Released)
+	}
+	return launchProof
+}
+
+func assertServedNativeExecutionMetadata(t *testing.T, execution servedNativeCodexExecution, group model.GroupRef, wantGrandchild bool) {
+	t.Helper()
+	if execution.PID != group.Leader.PID || execution.PGID != group.PGID {
+		t.Fatalf("execution metadata = %+v, want leader pid %d pgid %d", execution, group.Leader.PID, group.PGID)
+	}
+	if wantGrandchild {
+		if execution.GrandchildPID <= 0 || execution.GrandchildPGID != group.PGID {
+			t.Fatalf("execution metadata = %+v, want grandchild in group %d", execution, group.PGID)
 		}
-		if wantGrandchild {
-			if metadata.GrandchildPID <= 0 || metadata.GrandchildPGID != group.PGID {
-				t.Fatalf("fixture metadata = %+v, want grandchild in group %d", metadata, group.PGID)
-			}
-			return
+		return
+	}
+	if execution.GrandchildPID != 0 || execution.GrandchildPGID != 0 {
+		t.Fatalf("execution metadata = %+v, want no grandchild", execution)
+	}
+}
+
+func assertServedNativeNoAuthorityJobs(t *testing.T, server *Server) {
+	t.Helper()
+	if server == nil || server.admissionRepository == nil {
+		t.Fatal("admission repository is not ready")
+	}
+	var count int
+	if err := server.admissionRepository.View(context.Background(), func(tx repository.ReadTx) error {
+		jobs, err := tx.ListJobs(repository.JobFilter{})
+		if err != nil {
+			return err
 		}
-		if metadata.GrandchildPID != 0 || metadata.GrandchildPGID != 0 {
-			t.Fatalf("fixture metadata = %+v, want no grandchild", metadata)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("fixture metadata was not recorded")
+		count = len(jobs)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("authority jobs = %d, want 0", count)
 	}
 }
 
@@ -937,15 +1335,109 @@ func servedNativeIndependentGroupAbsent(group model.GroupRef) (bool, string, err
 		return false, "", err
 	}
 	classified := procgroup.ClassifyGroup(claim)
-	detail := fmt.Sprintf("kill0=%v procgroup=%s", killErr, classified)
-	return killAbsent && classified == model.GroupAbsent, detail, nil
+	leaderAbsent := servedNativeExactPIDAbsent(group.Leader)
+	cgroupPIDs, cgroupDetail, err := servedNativeRetainedCgroupPIDs(group.RetainedID)
+	if err != nil {
+		return false, "", err
+	}
+	detail := fmt.Sprintf("kill0=%v procgroup=%s leader_absent=%t cgroup=%s", killErr, classified, leaderAbsent, cgroupDetail)
+	return killAbsent && classified == model.GroupAbsent && leaderAbsent && len(cgroupPIDs) == 0, detail, nil
+}
+
+func servedNativeExactPIDAbsent(identity model.ProcessIdentity) bool {
+	if identity.PID <= 0 {
+		return true
+	}
+	claim, err := procgroup.ReadProcessClaim(identity.PID)
+	if err != nil {
+		return true
+	}
+	return claim.StartToken.String() != identity.HighResStartToken
+}
+
+func servedNativeRetainedCgroupPIDs(retainedID string) ([]int, string, error) {
+	if retainedID == "" {
+		return nil, "retained_id=empty", nil
+	}
+	leaf, err := servedNativeRetainedLeafName(retainedID)
+	if err != nil {
+		return nil, "", err
+	}
+	path := filepath.Join("/sys/fs/cgroup", leaf, "cgroup.procs")
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, "cgroup.procs=missing", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	var pids []int
+	for _, field := range strings.Fields(string(raw)) {
+		pid, err := strconv.Atoi(field)
+		if err != nil {
+			return nil, "", err
+		}
+		pids = append(pids, pid)
+	}
+	return pids, fmt.Sprintf("%s pids=%v", path, pids), nil
+}
+
+func servedNativeRetainedLeafName(retainedID string) (string, error) {
+	parts := strings.Split(retainedID, ".")
+	if len(parts) != 4 || parts[0] != "cg2a" {
+		return "", fmt.Errorf("retained id %q does not carry cgroup identity", retainedID)
+	}
+	leaf, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", err
+	}
+	name := string(leaf)
+	if name == "" || strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
+		return "", fmt.Errorf("invalid retained leaf name %q", name)
+	}
+	return name, nil
+}
+
+func assertServedNativePIDAbsent(t *testing.T, pid int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := unix.Kill(pid, 0); errors.Is(err, unix.ESRCH) {
+			return
+		}
+		time.Sleep(servedNativeConformancePollInterval)
+	}
+	t.Fatalf("pid %d still exists after %s", pid, timeout)
 }
 
 type servedNativeDaemonHelper struct {
-	cmd    *exec.Cmd
-	done   chan error
-	output *bytes.Buffer
-	killed atomic.Bool
+	cmd          *exec.Cmd
+	done         chan error
+	output       *servedNativeLockedBuffer
+	killed       atomic.Bool
+	root         string
+	cwd          string
+	agentbusPath string
+	startedPath  string
+	jobPath      string
+	paramsPath   string
+}
+
+type servedNativeLockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *servedNativeLockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *servedNativeLockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func readServedNativeJobID(t *testing.T, path string) string {
@@ -961,30 +1453,57 @@ func readServedNativeJobID(t *testing.T, path string) string {
 	return jobID
 }
 
-func startServedNativeDaemonHelper(t *testing.T, root, cwd, startedPath, jobPath string) *servedNativeDaemonHelper {
+func readServedNativeSubmitParams(t *testing.T, path string) json.RawMessage {
 	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		t.Fatalf("submit params file %s was empty", path)
+	}
+	if !json.Valid(raw) {
+		t.Fatalf("submit params file %s was not valid JSON: %s", path, string(raw))
+	}
+	return json.RawMessage(raw)
+}
+
+func startServedNativeDaemonHelper(t *testing.T, root, cwd, agentbusPath string, env []string, startedPath, jobPath, paramsPath string) *servedNativeDaemonHelper {
+	t.Helper()
+	assertServedNativeDaemonHelperEnv(t, env)
 	exe := servedNativeTestBinaryPath(t)
 	cmd := exec.Command(exe,
 		"-test.run=^TestServedNativeConformanceDaemonProcess$",
 		"--",
 		"--root", root,
 		"--cwd", cwd,
+		"--agentbus", agentbusPath,
 		"--started", startedPath,
 		"--job", jobPath,
+		"--params", paramsPath,
 	)
-	cmd.Env = append(os.Environ(), servedNativeDaemonEnv+"=1", servedNativeDaemonStartedPathEnv+"="+startedPath)
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
+	cmd.Env = append(env, servedNativeDaemonEnv+"=1")
+	output := &servedNativeLockedBuffer{}
+	cmd.Stdout = output
+	cmd.Stderr = output
+	helper := &servedNativeDaemonHelper{
+		cmd:          cmd,
+		done:         make(chan error, 1),
+		output:       output,
+		root:         root,
+		cwd:          cwd,
+		agentbusPath: agentbusPath,
+		startedPath:  startedPath,
+		jobPath:      jobPath,
+		paramsPath:   paramsPath,
 	}
-	helper := &servedNativeDaemonHelper{cmd: cmd, done: make(chan error, 1), output: &output}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start daemon helper: %v\n%s\noutput:\n%s", err, helper.diagnostics([]string{jobPath, startedPath, paramsPath}, err), output.String())
+	}
 	go func() {
 		helper.done <- cmd.Wait()
 		close(helper.done)
 	}()
-	waitServedNativeHelperFiles(t, []string{jobPath, startedPath}, helper.done, &output)
 	t.Cleanup(func() {
 		if helper.killed.Load() {
 			return
@@ -993,19 +1512,51 @@ func startServedNativeDaemonHelper(t *testing.T, root, cwd, startedPath, jobPath
 		select {
 		case <-helper.done:
 		case <-time.After(2 * time.Second):
-			t.Fatalf("daemon helper cleanup wait timed out; output:\n%s", helper.output.String())
+			t.Fatalf("daemon helper cleanup wait timed out\n%s\noutput:\n%s", helper.diagnostics([]string{jobPath, startedPath, paramsPath}, nil), helper.output.String())
 		}
 	})
+	waitServedNativeHelperFiles(t, []string{jobPath, startedPath, paramsPath}, helper)
 	return helper
 }
 
-func waitServedNativeHelperFiles(t *testing.T, paths []string, done <-chan error, output *bytes.Buffer) {
+func assertServedNativeDaemonHelperEnv(t *testing.T, env []string) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	required := []string{
+		"PATH",
+		servedNativeCodexFixtureEnv,
+		servedNativeCodexExecLogEnv,
+		servedNativeCodexReadyDirEnv,
+	}
+	if os.Getenv(servedNativeCgroupConformanceEnv) != "" {
+		required = append(required, servedNativeCgroupConformanceEnv)
+	}
+	for _, name := range required {
+		if envValue(env, name) == "" {
+			t.Fatalf("daemon helper env missing %s", name)
+		}
+	}
+	if envValue(env, servedNativeCodexFixtureEnv) != "1" {
+		t.Fatalf("daemon helper env %s = %q, want 1", servedNativeCodexFixtureEnv, envValue(env, servedNativeCodexFixtureEnv))
+	}
+}
+
+func envValue(env []string, name string) string {
+	prefix := name + "="
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			return strings.TrimPrefix(kv, prefix)
+		}
+	}
+	return ""
+}
+
+func waitServedNativeHelperFiles(t *testing.T, paths []string, helper *servedNativeDaemonHelper) {
+	t.Helper()
+	deadline := time.Now().Add(servedNativeDaemonHelperReadyTimeout)
 	for time.Now().Before(deadline) {
 		select {
-		case err := <-done:
-			t.Fatalf("daemon helper exited before markers were ready: %v\n%s", err, output.String())
+		case err := <-helper.done:
+			t.Fatalf("daemon helper exited before markers were ready: %v\n%s\noutput:\n%s", err, helper.diagnostics(paths, err), helper.output.String())
 		default:
 		}
 		allReady := true
@@ -1020,7 +1571,99 @@ func waitServedNativeHelperFiles(t *testing.T, paths []string, done <-chan error
 		}
 		time.Sleep(servedNativeConformancePollInterval)
 	}
-	t.Fatalf("daemon helper markers %v did not become ready; output:\n%s", paths, output.String())
+	t.Fatalf("daemon helper markers %v did not become ready after %s\n%s\noutput:\n%s", paths, servedNativeDaemonHelperReadyTimeout, helper.diagnostics(paths, nil), helper.output.String())
+}
+
+func (helper *servedNativeDaemonHelper) diagnostics(paths []string, waitErr error) string {
+	if helper == nil || helper.cmd == nil {
+		return "daemon helper: <nil>"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "daemon helper argv: %q\n", helper.cmd.Args)
+	fmt.Fprintf(&b, "daemon helper env: %s\n", servedNativeEnvSummary(helper.cmd.Env))
+	fmt.Fprintf(&b, "daemon helper process: %s\n", servedNativeDaemonProcessState(helper.cmd, waitErr))
+	fmt.Fprintf(&b, "daemon helper root: %s (%s)\n", helper.root, servedNativePathStatus(helper.root))
+	fmt.Fprintf(&b, "daemon helper cwd: %s (%s)\n", helper.cwd, servedNativePathStatus(helper.cwd))
+	exe := ""
+	if len(helper.cmd.Args) > 0 {
+		exe = helper.cmd.Args[0]
+	}
+	fmt.Fprintf(&b, "daemon helper test binary: %s (%s)\n", exe, servedNativePathStatus(exe))
+	fmt.Fprintf(&b, "daemon helper agentbus binary: %s (%s)\n", helper.agentbusPath, servedNativePathStatus(helper.agentbusPath))
+	if len(paths) == 0 {
+		paths = []string{helper.jobPath, helper.startedPath, helper.paramsPath}
+	}
+	for _, path := range paths {
+		fmt.Fprintf(&b, "daemon helper marker: %s (%s)\n", path, servedNativePathStatus(path))
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func servedNativeEnvSummary(env []string) string {
+	names := []string{
+		"PATH",
+		servedNativeCodexFixtureEnv,
+		servedNativeCodexExecLogEnv,
+		servedNativeCodexReadyDirEnv,
+		servedNativeCgroupConformanceEnv,
+		servedNativeOfflineModcacheEnv,
+		servedNativeDaemonEnv,
+		"GOFLAGS",
+		"GOPROXY",
+		"GOMODCACHE",
+		"GOCACHE",
+	}
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		value := envValue(env, name)
+		if value == "" {
+			value = "<unset>"
+		}
+		parts = append(parts, fmt.Sprintf("%s=%q", name, value))
+	}
+	return strings.Join(parts, " ")
+}
+
+func servedNativeDaemonProcessState(cmd *exec.Cmd, waitErr error) string {
+	if cmd == nil {
+		return "<nil command>"
+	}
+	if cmd.ProcessState == nil {
+		if cmd.Process != nil {
+			return fmt.Sprintf("running pid=%d waitErr=%v", cmd.Process.Pid, waitErr)
+		}
+		return fmt.Sprintf("not-started waitErr=%v", waitErr)
+	}
+	state := cmd.ProcessState
+	parts := []string{
+		fmt.Sprintf("pid=%d", state.Pid()),
+		fmt.Sprintf("exited=%t", state.Exited()),
+		fmt.Sprintf("success=%t", state.Success()),
+		fmt.Sprintf("exitCode=%d", state.ExitCode()),
+	}
+	if status, ok := state.Sys().(syscall.WaitStatus); ok {
+		parts = append(parts, fmt.Sprintf("waitStatus=%d", int(status)))
+		if status.Signaled() {
+			parts = append(parts, fmt.Sprintf("signal=%s", status.Signal()))
+		} else {
+			parts = append(parts, fmt.Sprintf("exitStatus=%d", status.ExitStatus()))
+		}
+	}
+	if waitErr != nil {
+		parts = append(parts, fmt.Sprintf("waitErr=%v", waitErr))
+	}
+	return strings.Join(parts, " ")
+}
+
+func servedNativePathStatus(path string) string {
+	if path == "" {
+		return "<empty>"
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err.Error()
+	}
+	return fmt.Sprintf("mode=%s size=%d", info.Mode(), info.Size())
 }
 
 func (helper *servedNativeDaemonHelper) killAndWait(t *testing.T) {

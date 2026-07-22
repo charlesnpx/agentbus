@@ -39,6 +39,8 @@ var (
 	ErrReleaseOutcomeUnknown     = errors.New("parked worker release outcome unknown")
 )
 
+var releaseAfterSendBeforeAckForTest func(dropAck func() error) error
+
 var cleanupTimeout = 3 * time.Second
 
 type ErrUncontainedTargetGroup struct {
@@ -215,6 +217,18 @@ func (prepared *Prepared) Release(ctx context.Context) (*ParkedHandle, error) {
 	if err := prepared.releaser.send(prepared.writer, prepared.release); err != nil {
 		cause := fmt.Errorf("%w: %w", ErrChannelLostBeforeRelease, err)
 		return nil, prepared.failArmedLocked(cause)
+	}
+	if releaseAfterSendBeforeAckForTest != nil {
+		dropAck := func() error {
+			if prepared.pipes == nil {
+				return nil
+			}
+			return closeFileErr(&prepared.pipes.fromWorkerRead)
+		}
+		if err := releaseAfterSendBeforeAckForTest(dropAck); err != nil {
+			prepared.setState(preparedStateReleaseUnknown)
+			return nil, errors.Join(ErrReleaseOutcomeUnknown, err)
+		}
 	}
 	if prepared.hooks.afterRelease != nil {
 		snapshot := launchControlSnapshot{}

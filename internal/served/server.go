@@ -82,8 +82,9 @@ type Config struct {
 	// admin run closes it, a later Serve on the same Server/config is rejected
 	// with ErrRuntimeConsumed. custodian.UnavailableRuntime has a no-op close and
 	// is reusable for repeated fail-closed Serves.
-	Runtime     custodian.Runtime
-	ProbeRunner command.ProbeRunner
+	Runtime                  custodian.Runtime
+	StrictAdmissionRequested bool
+	ProbeRunner              command.ProbeRunner
 }
 
 type tickerSource struct {
@@ -150,6 +151,7 @@ type Server struct {
 	admissionInstance            *admissionInstance
 	admissionRuntimeFactory      func(*Server) *servedAdmissionRuntime
 	admissionRuntimeConfig       custodian.Runtime
+	admissionStrictRequested     bool
 	admissionProbeRunner         command.ProbeRunner
 	admissionUnprobeableBackends map[string]error
 	admissionStartupHooks        admissionStartupHooks
@@ -193,8 +195,9 @@ type activeJob struct {
 	session    engine.Session
 	cancel     context.CancelFunc
 
-	mu       sync.Mutex
-	terminal engine.JobState
+	mu               sync.Mutex
+	terminal         engine.JobState
+	admissionCommand command.RunningCommand
 }
 
 func (j *activeJob) requestTerminal(state engine.JobState) {
@@ -209,6 +212,30 @@ func (j *activeJob) requestedTerminal() engine.JobState {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.terminal
+}
+
+func (j *activeJob) recordAdmissionCommand(cmd command.RunningCommand) bool {
+	if j == nil || cmd == nil {
+		return false
+	}
+	j.mu.Lock()
+	j.admissionCommand = cmd
+	shouldInterrupt := j.terminal == engine.StateCanceled
+	j.mu.Unlock()
+	return shouldInterrupt
+}
+
+func (j *activeJob) interruptAdmissionCommand(ctx context.Context) error {
+	if j == nil {
+		return nil
+	}
+	j.mu.Lock()
+	cmd := j.admissionCommand
+	j.mu.Unlock()
+	if cmd == nil {
+		return nil
+	}
+	return cmd.Interrupt(ctx)
 }
 
 type requestOutcome struct {
@@ -331,40 +358,41 @@ func New(cfg Config) (*Server, error) {
 		probeRunner = command.DirectProbeRunner{}
 	}
 	return &Server{
-		stateRoot:              root,
-		cwd:                    cwd,
-		socketPath:             socketPath,
-		tokenPath:              tokenPath,
-		token:                  token,
-		backends:               backends,
-		registry:               registry,
-		clock:                  clock,
-		processes:              processes,
-		processGroups:          cfg.ProcessGroups,
-		cancelGrace:            cfg.CancelGrace,
-		cancelWaiter:           cfg.CancelWaiter,
-		idleTimeout:            idleTimeout,
-		idleCheckInterval:      idleCheck,
-		binaryIdentityProbe:    binaryIdentityProbe,
-		inlineResultCap:        inlineResultCap,
-		leaseDuration:          leaseDuration,
-		heartbeatInterval:      heartbeatInterval,
-		reapInterval:           reapInterval,
-		gcInterval:             gcInterval,
-		reapTickInterval:       reapTickInterval,
-		reapTickFactory:        newTickerSource,
-		safetyLatch:            NewSafetyLatch(),
-		safetyDrainTimeout:     defaultSafetyDrain,
-		sessions:               make(map[string]*sessionState),
-		stores:                 make(map[string]*engine.Store),
-		storesByKey:            make(map[string]*engine.Store),
-		jobStores:              make(map[string]*engine.Store),
-		admissionJobs:          make(map[string]struct{}),
-		admissionEffectMu:      make(map[string]*sync.Mutex),
-		admissionRuntimeConfig: cfg.Runtime,
-		admissionProbeRunner:   probeRunner,
-		activeJobs:             make(map[string]*activeJob),
-		lastActivity:           clock.Now().UTC(),
+		stateRoot:                root,
+		cwd:                      cwd,
+		socketPath:               socketPath,
+		tokenPath:                tokenPath,
+		token:                    token,
+		backends:                 backends,
+		registry:                 registry,
+		clock:                    clock,
+		processes:                processes,
+		processGroups:            cfg.ProcessGroups,
+		cancelGrace:              cfg.CancelGrace,
+		cancelWaiter:             cfg.CancelWaiter,
+		idleTimeout:              idleTimeout,
+		idleCheckInterval:        idleCheck,
+		binaryIdentityProbe:      binaryIdentityProbe,
+		inlineResultCap:          inlineResultCap,
+		leaseDuration:            leaseDuration,
+		heartbeatInterval:        heartbeatInterval,
+		reapInterval:             reapInterval,
+		gcInterval:               gcInterval,
+		reapTickInterval:         reapTickInterval,
+		reapTickFactory:          newTickerSource,
+		safetyLatch:              NewSafetyLatch(),
+		safetyDrainTimeout:       defaultSafetyDrain,
+		sessions:                 make(map[string]*sessionState),
+		stores:                   make(map[string]*engine.Store),
+		storesByKey:              make(map[string]*engine.Store),
+		jobStores:                make(map[string]*engine.Store),
+		admissionJobs:            make(map[string]struct{}),
+		admissionEffectMu:        make(map[string]*sync.Mutex),
+		admissionRuntimeConfig:   cfg.Runtime,
+		admissionStrictRequested: cfg.StrictAdmissionRequested,
+		admissionProbeRunner:     probeRunner,
+		activeJobs:               make(map[string]*activeJob),
+		lastActivity:             clock.Now().UTC(),
 	}, nil
 }
 
@@ -1588,6 +1616,15 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: jobID, TurnID: jobID})}
 		}
 		active.requestTerminal(engine.StateCanceled)
+		// Admission cancel is intentional containment. Mark the active launch
+		// before coordinator containment so a killed process is the cancel
+		// terminal path, not an unprovable safety event.
+		interruptCtx, interruptCancel := context.WithTimeout(context.Background(), admissionDetachedCleanupTimeout)
+		err := active.interruptAdmissionCommand(interruptCtx)
+		interruptCancel()
+		if err != nil {
+			return requestOutcome{err: admissionProtocolError(err)}
+		}
 	}
 	record, projection, ok, errObj := s.authorityJobProjection(jobID)
 	if errObj != nil {

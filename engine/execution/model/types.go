@@ -351,6 +351,7 @@ const (
 	CauseSupervisorLostAfterAuthorization
 	CauseCorruptProjection
 	CauseResponseUndeliverable
+	CauseReleaseOutcomeUnknown
 )
 
 func AllTerminalCauses() []TerminalCause {
@@ -364,12 +365,13 @@ func AllTerminalCauses() []TerminalCause {
 		CauseSupervisorLostAfterAuthorization,
 		CauseCorruptProjection,
 		CauseResponseUndeliverable,
+		CauseReleaseOutcomeUnknown,
 	}
 }
 
 func (cause TerminalCause) Valid() bool {
 	switch cause {
-	case CauseCompletedNormally, CauseCanceledBeforeAuthorization, CauseCanceledAfterAuthorization, CauseDaemonRestartedBeforeAuthorization, CauseDaemonRestartedAfterAuthorization, CauseSupervisorLostBeforeAuthorization, CauseSupervisorLostAfterAuthorization, CauseCorruptProjection, CauseResponseUndeliverable:
+	case CauseCompletedNormally, CauseCanceledBeforeAuthorization, CauseCanceledAfterAuthorization, CauseDaemonRestartedBeforeAuthorization, CauseDaemonRestartedAfterAuthorization, CauseSupervisorLostBeforeAuthorization, CauseSupervisorLostAfterAuthorization, CauseCorruptProjection, CauseResponseUndeliverable, CauseReleaseOutcomeUnknown:
 		return true
 	default:
 		return false
@@ -403,6 +405,8 @@ func (cause TerminalCause) String() string {
 		return "corrupt_projection"
 	case CauseResponseUndeliverable:
 		return "response_undeliverable"
+	case CauseReleaseOutcomeUnknown:
+		return "release_outcome_unknown"
 	default:
 		return ""
 	}

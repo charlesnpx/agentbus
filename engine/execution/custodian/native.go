@@ -304,18 +304,21 @@ func (custodian *NativeCustodian) Close() error {
 	ctx := context.Background()
 	for {
 		custodian.mu.Lock()
-		if len(custodian.running) != 0 {
-			custodian.mu.Unlock()
-			return fmt.Errorf("%w: cannot close custodian with running processes", ErrNativeCustodianUnavailable)
-		}
 		prepared := custodian.snapshotNativeHeldPreparedLocked()
 		if len(prepared) == 0 {
+			if len(custodian.running) != 0 {
+				custodian.mu.Unlock()
+				return fmt.Errorf("%w: cannot close custodian with running processes", ErrNativeCustodianUnavailable)
+			}
 			custodian.closed = true
 			custodian.mu.Unlock()
 			break
 		}
 		custodian.mu.Unlock()
 
+		// Park protocol guarantee: an unreleased prepared worker has not
+		// executed, so shutdown may abort-and-verify it before refusing only
+		// groups whose release/running state makes execution possible.
 		if err := custodian.closeNativeHeldPrepared(ctx, prepared); err != nil {
 			return err
 		}

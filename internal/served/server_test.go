@@ -2173,9 +2173,12 @@ func TestLegacyFencedReleaseUnknownContainsWithDetachedContextWhenCanceled(t *te
 	if !ok || first.Group == nil || first.Grant == nil || first.Quiescence == nil {
 		t.Fatalf("legacy fenced release-unknown launch proof = %+v, want grant and verified quiescence", first)
 	}
+	if safety.Terminal == nil || safety.Terminal.Outcome != model.OutcomeFailed || safety.Terminal.Cause != model.CauseReleaseOutcomeUnknown {
+		t.Fatalf("legacy fenced release-unknown terminal = %+v, want failed release_outcome_unknown", safety.Terminal)
+	}
 	_, finalErr := cmd.result()
-	if !errors.Is(finalErr, launch.ErrFailClosed) {
-		t.Fatalf("legacy fenced command final error = %v, want fail-closed", finalErr)
+	if !errors.Is(finalErr, launch.ErrReleaseUncertain) || errors.Is(finalErr, launch.ErrFailClosed) {
+		t.Fatalf("legacy fenced command final error = %v, want release uncertainty without fail-closed", finalErr)
 	}
 }
 
@@ -2570,13 +2573,64 @@ func TestIdentifiedFencedCancelUsesAuthorityWhenAdmissionMarkerCleared(t *testin
 		t.Fatalf("authority cancel fact missing: %+v", record)
 	}
 	first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
-	if !ok || first.Quiescence == nil || first.Quiescence.Method != model.QuiescenceTermKill {
+	if !ok || first.Group == nil || first.Quiescence == nil || first.Quiescence.Method != model.QuiescenceTermKill {
 		t.Fatalf("authority launch proof = %+v, want contained quiescence", first)
 	}
-	if got := launcher.containCount(); got == 0 {
-		t.Fatalf("authority cancel contain calls = %d, want live containment", got)
+	if got := launcher.containCount(); got != 0 {
+		t.Fatalf("authority cancel coordinator contain calls = %d, want command-level containment", got)
+	}
+	if !launcher.runningContained(first.Group.CustodyID) {
+		t.Fatalf("authority launch %s was not contained by active command interrupt", first.Group.CustodyID)
 	}
 	assertNoJSONJobRecord(t, server, submitted.JobID)
+}
+
+func TestAdmissionActiveRunnerInterruptsCommandForAuthorityCancel(t *testing.T) {
+	t.Parallel()
+	t.Run("later cancel", func(t *testing.T) {
+		t.Parallel()
+		active := &activeJob{jobID: "job-recorded"}
+		running := &recordingRunningCommand{}
+		runner := admissionActiveRunner{inner: recordingCommandRunner{running: running}, active: active}
+		got, err := runner.Start(context.Background(), command.ExecSpec{Argv: []string{"/bin/fake-agent"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != running {
+			t.Fatalf("running command = %T, want recording command", got)
+		}
+		if got := running.interrupts.Load(); got != 0 {
+			t.Fatalf("interrupts before cancel = %d, want 0", got)
+		}
+		active.requestTerminal(engine.StateCanceled)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := active.interruptAdmissionCommand(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := running.interrupts.Load(); got != 1 {
+			t.Fatalf("interrupts after cancel = %d, want 1", got)
+		}
+		if !running.interruptHadDeadline.Load() {
+			t.Fatal("interrupt context had no deadline")
+		}
+	})
+	t.Run("already canceled", func(t *testing.T) {
+		t.Parallel()
+		active := &activeJob{jobID: "job-already-canceled"}
+		active.requestTerminal(engine.StateCanceled)
+		running := &recordingRunningCommand{}
+		runner := admissionActiveRunner{inner: recordingCommandRunner{running: running}, active: active}
+		if _, err := runner.Start(context.Background(), command.ExecSpec{Argv: []string{"/bin/fake-agent"}}); err != nil {
+			t.Fatal(err)
+		}
+		if got := running.interrupts.Load(); got != 1 {
+			t.Fatalf("interrupts after start = %d, want 1", got)
+		}
+		if !running.interruptHadDeadline.Load() {
+			t.Fatal("interrupt context had no deadline")
+		}
+	})
 }
 
 func TestJobCancelUsesLegacyJSONWhenAuthorityCleanlyDisclaims(t *testing.T) {
@@ -5496,6 +5550,13 @@ func (c *admissionFakeLaunchCustodian) containObservations() []admissionContainO
 	return append([]admissionContainObservation(nil), c.containments...)
 }
 
+func (c *admissionFakeLaunchCustodian) runningContained(custodyID model.CustodyID) bool {
+	c.mu.Lock()
+	running := c.running[string(custodyID)]
+	c.mu.Unlock()
+	return running != nil && running.WaitContained()
+}
+
 func (c *admissionFakeLaunchCustodian) HasActiveCustodies() bool {
 	return c != nil && c.activeCustodies.Load()
 }
@@ -5999,6 +6060,32 @@ type attemptResult struct {
 	text  string
 	state engine.JobState
 	err   error
+}
+
+type recordingCommandRunner struct {
+	running command.RunningCommand
+}
+
+func (r recordingCommandRunner) Start(context.Context, command.ExecSpec) (command.RunningCommand, error) {
+	return r.running, nil
+}
+
+type recordingRunningCommand struct {
+	interrupts           atomic.Int64
+	interruptHadDeadline atomic.Bool
+}
+
+func (c *recordingRunningCommand) Stdin() io.WriteCloser { return nil }
+func (c *recordingRunningCommand) Stdout() io.ReadCloser { return nil }
+func (c *recordingRunningCommand) Stderr() io.ReadCloser { return nil }
+func (c *recordingRunningCommand) Wait(context.Context) (command.ExitObservation, error) {
+	return command.ExitObservation{}, nil
+}
+func (c *recordingRunningCommand) Interrupt(ctx context.Context) error {
+	c.interrupts.Add(1)
+	_, hasDeadline := ctx.Deadline()
+	c.interruptHadDeadline.Store(hasDeadline)
+	return nil
 }
 
 func newControlledBackgroundRun(t *testing.T) (*Server, jobRun, *controlledSession, context.Context, context.CancelFunc) {

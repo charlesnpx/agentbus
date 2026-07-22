@@ -110,6 +110,18 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 	return err
 }
 
+func (c *Coordinator) Finalize(ctx context.Context, jobID model.JobID, intent model.TerminalIntent) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	snapshot, err := c.authority.Snapshot(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	_, err = c.authority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, intent)
+	return err
+}
+
 func (c *Coordinator) Cancel(ctx context.Context, jobID model.JobID, injector *FailureInjector) error {
 	if err := c.ready(); err != nil {
 		return err

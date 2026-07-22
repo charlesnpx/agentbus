@@ -411,6 +411,9 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 			s.admissionRuntime = nil
 		}
 	}()
+	if err := s.failUnavailableStrictRuntimeBeforeRepository(ctx, runtime); err != nil {
+		return err
+	}
 	descriptors, err := s.probeAdmissionBackends(ctx)
 	if err != nil {
 		return err
@@ -461,7 +464,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		}
 	} else {
 		support = runtime.assessSupport(ctx)
-		if strictSupportConfigured(support) {
+		if runtime.strictAdmissionRequested() || strictSupportConfigured(support) {
 			support = s.assessAdmissionSupportWithRetryFrom(ctx, runtime, support)
 			if !strictSupportAvailable(support) {
 				err := newAdmissionSupportDiagnostic(metadata, support.Assessment, support.Assessment.Class == custodian.SupportRetryable)
@@ -549,6 +552,22 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	}
 	closeOnErr = false
 	return nil
+}
+
+func (s *Server) failUnavailableStrictRuntimeBeforeRepository(ctx context.Context, runtime *servedAdmissionRuntime) error {
+	if runtime == nil || !runtime.strictAdmissionRequested() || !runtime.unavailableProcess() {
+		return nil
+	}
+	support := s.assessAdmissionSupportWithRetry(ctx, runtime)
+	if strictSupportAvailable(support) {
+		return nil
+	}
+	// C9 startup order requires the strict runtime/lease outcome before the
+	// admission repository is opened; lease contention must surface as the typed
+	// support diagnostic instead of blocking behind bbolt's file lock.
+	diagnostic := newAdmissionSupportDiagnostic(authority.AdmissionRootMetadata{}, support.Assessment, support.Assessment.Class == custodian.SupportRetryable)
+	logAdmissionSupportDiagnostic(diagnostic)
+	return diagnostic
 }
 
 func (s *Server) closeServeAdmission() error {
@@ -989,7 +1008,31 @@ func (s *Server) admissionTurnEvents(ctx context.Context, run jobRun, input engi
 	if err != nil {
 		return nil, err
 	}
+	if run.active != nil {
+		runner = admissionActiveRunner{inner: runner, active: run.active}
+	}
 	return session.TurnWithRunner(ctx, input, runner)
+}
+
+type admissionActiveRunner struct {
+	inner  command.Runner
+	active *activeJob
+}
+
+func (r admissionActiveRunner) Start(ctx context.Context, spec command.ExecSpec) (command.RunningCommand, error) {
+	running, err := r.inner.Start(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	if r.active.recordAdmissionCommand(running) {
+		interruptCtx, cancel := context.WithTimeout(context.Background(), admissionDetachedCleanupTimeout)
+		err = running.Interrupt(interruptCtx)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return running, nil
 }
 
 func (c *servedSubmissionCoordinator) SubmitIdentified(ctx context.Context, request authority.AcceptRequest) (authority.AcceptResult, error) {
@@ -1377,7 +1420,7 @@ func (cmd *legacyFencedCommand) grantAndRelease(ctx context.Context) error {
 		if err != nil {
 			mapped = fmt.Errorf("%w: release outcome unknown: %v", launch.ErrReleaseUncertain, err)
 		}
-		cmd.failReleasedByGroup(ctx, mapped)
+		cmd.finalizeReleaseUnknown(ctx, mapped)
 		return mapped
 	default:
 		mapped := fmt.Errorf("%w: invalid release outcome %d", launch.ErrReleaseUncertain, physicalReleaseOutcome)
@@ -1495,6 +1538,42 @@ func (cmd *legacyFencedCommand) failReleasedByGroup(ctx context.Context, reason 
 		containErr = errors.Join(cleanup.Err, admissionDurabilityError("record_quiescence", outcome, recordErr))
 	}
 	err := errors.Join(reason, containErr, cmd.coordinator.failStop(ctx, errors.Join(reason, containErr)), launch.ErrFailClosed)
+	cmd.closePipesWithError(err)
+	cmd.finish(command.ExitObservation{}, err)
+}
+
+func (cmd *legacyFencedCommand) finalizeReleaseUnknown(ctx context.Context, reason error) {
+	cleanupCtx, cancel := detachedAdmissionCleanupContext(ctx)
+	defer cancel()
+
+	verified, cleanup, containErr := cmd.coordinator.launch.ContainAndVerifyWithCleanup(cleanupCtx, cmd.launchContext, cmd.group, custodian.QuiescenceCauseContain)
+	if containErr != nil {
+		err := errors.Join(reason, containErr, cmd.coordinator.failStop(ctx, errors.Join(reason, containErr)), launch.ErrFailClosed)
+		cmd.closePipesWithError(err)
+		cmd.finish(command.ExitObservation{}, err)
+		return
+	}
+	outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(cleanupCtx, cmd.launchContext, verified)
+	if mapped := admissionDurabilityError("record_quiescence", outcome, recordErr); mapped != nil {
+		err := errors.Join(reason, mapped, cmd.coordinator.failStop(ctx, errors.Join(reason, mapped)), launch.ErrFailClosed)
+		cmd.closePipesWithError(err)
+		cmd.finish(command.ExitObservation{}, err)
+		return
+	}
+	// C4 release ambiguity is closed by durable quiescence proof: never resend,
+	// finalize failed with a typed cause, and reserve fail-stop for unprovable
+	// containment or unknown durability.
+	_, finalizeErr := cmd.coordinator.ready.Finalize(cleanupCtx, cmd.launchContext.JobID, cmd.launchContext.Attempt, model.TerminalIntent{
+		Outcome: model.OutcomeFailed,
+		Cause:   model.CauseReleaseOutcomeUnknown,
+	})
+	if finalizeErr != nil {
+		err := errors.Join(reason, finalizeErr, cleanup.Err, cmd.coordinator.failStop(ctx, errors.Join(reason, finalizeErr, cleanup.Err)), launch.ErrFailClosed)
+		cmd.closePipesWithError(err)
+		cmd.finish(command.ExitObservation{}, err)
+		return
+	}
+	err := errors.Join(reason, cleanup.Err)
 	cmd.closePipesWithError(err)
 	cmd.finish(command.ExitObservation{}, err)
 }

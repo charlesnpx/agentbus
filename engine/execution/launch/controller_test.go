@@ -654,8 +654,11 @@ func TestLaunchControllerReleaseErrorContainsWithoutRetry(t *testing.T) {
 	if h.custodian.containCalls != 1 {
 		t.Fatalf("custodian contain calls = %d, want 1", h.custodian.containCalls)
 	}
-	if h.authority.failStops != 1 {
-		t.Fatalf("fail stops = %d, want 1", h.authority.failStops)
+	if h.authority.recordQuiescenceCalls != 1 {
+		t.Fatalf("record quiescence calls = %d, want 1", h.authority.recordQuiescenceCalls)
+	}
+	if h.authority.failStops != 0 {
+		t.Fatalf("fail stops = %d, want 0", h.authority.failStops)
 	}
 }
 

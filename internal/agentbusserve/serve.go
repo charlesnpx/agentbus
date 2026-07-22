@@ -8,6 +8,7 @@ import (
 )
 
 type Config = served.Config
+type StrictAdmissionOptions = served.StrictAdmissionOptions
 
 func Serve(ctx context.Context, cfg Config) error {
 	server, err := served.New(productionServedConfig(cfg))
@@ -23,5 +24,10 @@ func RecoverAdmissionRoot(ctx context.Context, cfg Config) (served.AdmissionReco
 
 func productionServedConfig(cfg Config) served.Config {
 	cfg.Runtime = custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable)
+	cfg.StrictAdmissionRequested = false
 	return cfg
+}
+
+func strictAdmissionServedConfig(cfg Config, opts StrictAdmissionOptions) (served.Config, error) {
+	return served.StrictAdmissionConfig(cfg, opts)
 }
