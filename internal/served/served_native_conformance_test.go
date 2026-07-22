@@ -60,6 +60,10 @@ const (
 	servedNativeFixtureModeClean         = "clean"
 	servedNativeFixtureModeGrandchild    = "grandchild"
 	servedNativeFixtureModeHold          = "hold"
+	servedNativeExecModeEntry            = "entry"
+	servedNativeExecModeStdin            = "stdin"
+	servedNativeEntryStartedMarker       = "exec-entry\n"
+	servedNativeStdinStartedMarker       = "exec-stdin\n"
 	servedNativeAgentbusGOFLAGS          = "GOFLAGS=-mod=mod"
 	servedNativeAgentbusGOPROXY          = "GOPROXY=off"
 	servedNativeResultText               = "PASS\n\n## Findings\nNone.\n"
@@ -301,22 +305,22 @@ func TestServedStrictCompositionNoExecBeforeGrantConformance(t *testing.T) {
 	root := shortTempDir(t)
 	cwd := shortTempDir(t)
 	startedPath := filepath.Join(root, "no-exec-before-grant-started")
+	t.Setenv(servedNativeModeTag, servedNativeFixtureModeHold)
+	t.Setenv(servedNativeStartedPathTag, startedPath)
 	fixture := installServedNativeCodexFixture(t, root)
-	fixture.env = servedNativeFixtureEntryEnv(fixture.env, servedNativeFixtureModeHold, servedNativeStartedTags(startedPath))
 	server, h, fixture := startServedNativeStrictServerWithFixture(t, root, cwd, fixture, nil)
 	conn, reader := servedNativeRPC(t, h)
 	defer conn.Close()
 	assertServedNativeCodexExecutionCount(t, fixture, 0)
-	submitted := submitServedNativeJobOnConn(t, conn, reader, "no-exec-before-grant", h.cwd, servedNativeFixtureModeHold, servedNativeStartedTags(startedPath))
+	submitted := submitServedNativeJobOnConn(t, conn, reader, "no-exec-before-grant", h.cwd, servedNativeFixtureModeHold, nil)
 	select {
 	case <-grantHoldEntered:
 	case <-time.After(10 * time.Second):
 		t.Fatal("authority grant commit hook did not fire")
 	}
-	assertServedNativePathAbsentFor(t, startedPath, 200*time.Millisecond)
+	assertServedNativeEntryEvidenceAbsentFor(t, fixture, startedPath, 200*time.Millisecond)
 	close(releaseGrant)
-	assertServedNativeExecWaitsForGrantRelease(t, server, submitted.JobID, startedPath, 10*time.Second)
-	executions := waitServedNativeCodexExecutions(t, fixture, 1, 10*time.Second)
+	execution := assertServedNativeExecWaitsForGrantRelease(t, server, fixture, submitted.JobID, startedPath, 10*time.Second)
 	resp := rpc(t, conn, reader, "cancel-no-exec", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: submitted.JobID})
 	var canceled protocol.JobCancelResult
 	decodeResult(t, resp, &canceled)
@@ -328,7 +332,7 @@ func TestServedStrictCompositionNoExecBeforeGrantConformance(t *testing.T) {
 	if launchProof.Grant == nil || launchProof.Released == nil {
 		t.Fatalf("launch proof = %+v, want grant and release before terminal execution proof", launchProof)
 	}
-	assertServedNativeExecutionMetadata(t, executions[0], *launchProof.Group, false)
+	assertServedNativeExecutionMetadata(t, execution, *launchProof.Group, false)
 	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
 	assertServedNativeCodexExecutionCount(t, fixture, 1)
 }
@@ -1016,14 +1020,10 @@ func runServedNativeCodexFixture(args []string) int {
 			return 3
 		}
 		entryPGID = pgid
-		mode := envTags[servedNativeModeTag]
-		if mode == "" {
-			mode = "entry"
-		}
 		execution := servedNativeCodexExecution{
 			PID:  os.Getpid(),
 			PGID: pgid,
-			Mode: mode,
+			Mode: servedNativeExecModeEntry,
 			Args: append([]string(nil), args...),
 			Tags: envTags,
 		}
@@ -1031,7 +1031,7 @@ func runServedNativeCodexFixture(args []string) int {
 			fmt.Fprintln(os.Stderr, err)
 			return 4
 		}
-		if err := writeServedNativeStartedMarker(path, "exec-started\n"); err != nil {
+		if err := writeServedNativeStartedMarker(path, servedNativeEntryStartedMarker); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 4
 		}
@@ -1066,6 +1066,9 @@ func runServedNativeCodexFixture(args []string) int {
 		Args:   append([]string(nil), args...),
 		Tags:   tags,
 	}
+	if !entryRecorded && tags[servedNativeStartedPathTag] != "" {
+		execution.Mode = servedNativeExecModeStdin
+	}
 	switch mode {
 	case servedNativeFixtureModeClean:
 		if !entryRecorded {
@@ -1084,8 +1087,8 @@ func runServedNativeCodexFixture(args []string) int {
 				return 4
 			}
 		}
-		if path := execution.Tags[servedNativeStartedPathTag]; path != "" {
-			_ = writeServedNativeStartedMarker(path, "release-recorded\n")
+		if path := execution.Tags[servedNativeStartedPathTag]; path != "" && !entryRecorded {
+			_ = writeServedNativeStartedMarker(path, servedNativeStdinStartedMarker)
 		}
 		for {
 			time.Sleep(time.Hour)
@@ -1315,17 +1318,33 @@ func assertServedNativeCodexExecutionCount(t *testing.T, fixture servedNativeCod
 	}
 }
 
-func assertServedNativePathAbsentFor(t *testing.T, path string, interval time.Duration) {
+func assertServedNativeEntryEvidenceAbsentFor(t *testing.T, fixture servedNativeCodexFixture, markerPath string, interval time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(interval)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			t.Fatalf("path %s exists while pre-grant commit is held", path)
+		if raw, err := os.ReadFile(markerPath); err == nil {
+			t.Fatalf("backend marker %s exists while pre-grant commit is held: %q", markerPath, string(raw))
 		} else if !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("stat path %s: %v", path, err)
+			t.Fatalf("read backend marker %s: %v", markerPath, err)
+		}
+		executions := readServedNativeCodexExecutions(t, fixture)
+		if execution, ok := servedNativeEntryExecution(executions, markerPath); ok {
+			t.Fatalf("entry-mode execution exists while pre-grant commit is held: %+v", execution)
+		}
+		if len(executions) > 0 {
+			t.Fatalf("backend executions exist while pre-grant commit is held: %+v", executions)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func servedNativeEntryExecution(executions []servedNativeCodexExecution, markerPath string) (servedNativeCodexExecution, bool) {
+	for _, execution := range executions {
+		if execution.Mode == servedNativeExecModeEntry && execution.Tags[servedNativeStartedPathTag] == markerPath {
+			return execution, true
+		}
+	}
+	return servedNativeCodexExecution{}, false
 }
 
 func waitServedNativeAdmissionTerminal(t *testing.T, server *Server, jobID string, timeout time.Duration) model.SafetyRecord {
@@ -1344,26 +1363,48 @@ func waitServedNativeAdmissionTerminal(t *testing.T, server *Server, jobID strin
 	return model.SafetyRecord{}
 }
 
-func assertServedNativeExecWaitsForGrantRelease(t *testing.T, server *Server, jobID, markerPath string, timeout time.Duration) {
+func assertServedNativeExecWaitsForGrantRelease(t *testing.T, server *Server, fixture servedNativeCodexFixture, jobID, markerPath string, timeout time.Duration) servedNativeCodexExecution {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var last model.SafetyRecord
+	var lastExecutions []servedNativeCodexExecution
+	lastMarker := "<missing>"
 	for time.Now().Before(deadline) {
 		record := loadAdmissionSafetyRecord(t, server, jobID)
 		last = record
 		launchProof, launchBound := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
 		grantedAndReleased := launchBound && launchProof.Grant != nil && launchProof.Released != nil
-		if _, err := os.Stat(markerPath); err == nil {
+		rawMarker, markerErr := os.ReadFile(markerPath)
+		markerSeen := markerErr == nil
+		if markerSeen {
+			lastMarker = strconv.Quote(string(rawMarker))
+		} else if !errors.Is(markerErr, os.ErrNotExist) {
+			t.Fatalf("read backend marker %s: %v", markerPath, markerErr)
+		}
+		executions := readServedNativeCodexExecutions(t, fixture)
+		lastExecutions = executions
+		entryExecution, entrySeen := servedNativeEntryExecution(executions, markerPath)
+		if len(executions) > 0 && !entrySeen {
+			t.Fatalf("backend executions reached log without entry-mode evidence for %s; marker=%s executions=%+v record=%+v launch=%+v", markerPath, lastMarker, executions, record, launchProof)
+		}
+		if markerSeen || entrySeen {
 			if !grantedAndReleased {
-				t.Fatalf("backend marker %s exists before durable grant/release; record=%+v launch=%+v", markerPath, record, launchProof)
+				t.Fatalf("entry evidence for %s exists before durable grant/release; marker=%s executions=%+v record=%+v launch=%+v", markerPath, lastMarker, executions, record, launchProof)
 			}
-			return
-		} else if !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("stat backend marker %s: %v", markerPath, err)
+		}
+		if markerSeen {
+			if got := string(rawMarker); got != servedNativeEntryStartedMarker {
+				t.Fatalf("backend marker %s = %q, want %q; executions=%+v", markerPath, got, servedNativeEntryStartedMarker, executions)
+			}
+			if !entrySeen {
+				t.Fatalf("backend marker %s is entry content but entry-mode execution log is absent; executions=%+v", markerPath, executions)
+			}
+			return entryExecution
 		}
 		time.Sleep(servedNativeConformancePollInterval)
 	}
-	t.Fatalf("backend marker %s did not appear after %s; last record=%+v", markerPath, timeout, last)
+	t.Fatalf("entry-mode backend marker %s did not appear after %s; last marker=%s last executions=%+v last record=%+v", markerPath, timeout, lastMarker, lastExecutions, last)
+	return servedNativeCodexExecution{}
 }
 
 func assertServedNativeIdentifiedTerminal(t *testing.T, record model.SafetyRecord, outcome model.Outcome) *model.LaunchProof {
