@@ -4,7 +4,10 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: COMPLETE (2026-07-22). ALL 14 UNITS CLOSED. R7B closed at e42aa5f (SHIP, no blocking
+STATUS (AB-E): IN PROGRESS (2026-07-22). See "AB-E hardening roadmap" section below — 11 sequential
+units (E0→E8) from the post-completion external evaluation. AB-D itself remains COMPLETE as recorded.
+
+STATUS (AB-D): COMPLETE (2026-07-22). ALL 14 UNITS CLOSED. R7B closed at e42aa5f (SHIP, no blocking
 findings): `agentbus serve --admission=strict` is live — explicit, sticky, fail-closed; the R0T
 gate runs a REAL identified job end-to-end through the production binary on Linux cgroup-v2
 (sentinel `strict_admission_real_job_end_to_end`), with byte-identical replay, exactly-once
@@ -17,7 +20,7 @@ default (no flag) behavior is byte-compatible legacy.
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
 - Inert S5B `d957878` preserved on `abd-s5b-inert-d957878` (salvage: hidden monitor cmd + production
   containment params — port in R3B, NOT retained as semantic base).
-- `main` untouched. Nothing pushed.
+- `main` untouched. All AB-D work pushed to `origin/abd-authority` (PR #29); tip at AB-D close: 4e0bd50.
 
 ## Delegation discipline
 - Implement: gpt-5.5 xhigh (`delegate task --backend codex --model gpt-5.5 --effort xhigh --write`).
@@ -733,3 +736,61 @@ see the R4A contract block.)
   Docker golang:1.26 --privileged --cgroupns=private cgroup-v2 (controllers incl memory/pids): gate PASS,
   sentinel strict_native_runtime_unavailable emitted, GATE_EXIT=0. Independent OS check n/a (no process
   launched — RED baseline rejects at capability gate). Committing then sol review on the SHA.
+
+---
+
+# AB-E hardening roadmap (LOCKED 2026-07-22, REV 3)
+
+Post-completion external evaluation of `abd-authority @ 4e0bd50` (all findings independently verified
+CONFIRMED) → 11 sequential units. Full plan: `~/.claude/plans/moonlit-imagining-wadler.md` (REV 3,
+user-approved). Same delegation discipline as AB-D. Sequence is FULLY SEQUENTIAL, no parallel units:
+
+E0 → E1 → E2A → E2B → E3 → E4 → E5A → E5B → E6 → E7 → E8
+
+## Binding directives (user)
+- No legacy path, no backwards compat; explicit breaks: protocol v2, storage schema v2; nothing
+  translates or migrates (v1 handshake → version mismatch; removed methods → method-not-found;
+  old storage → incompatible-schema).
+- Fail closed everywhere: strict authority-owned execution is the ONLY path; unsupported platforms
+  fail typed at serve BEFORE creating any root state. Linux-cgroup-v2-only production.
+- DELETE the foreground surface (session.*/turn.*): product = identified job.submit only.
+- Persistence redesign behind the existing `engine/execution/repository` contract (sqlite-ready),
+  no persistence framework.
+
+## Non-goals (binding)
+AB-E does NOT include: interactive/foreground session redesign; protocol-v1 or schema-v1
+compatibility; storage migration; a sqlite implementation; authority mutex redesign; public
+terminal-proof serialization; a generalized daemon logging system; online backup or compaction;
+relocation of execution packages under `internal/` (E9 deferred to a later cleanup roadmap).
+
+## Units
+| Unit | Scope | Status |
+|---|---|---|
+| E0 | Contract freeze: ADR-12, protocol.Version=2, storage schema v2, stable rejection causes, root-existence matrix, normative ADR-0B replay ordering, shutdown contract, result semantics (derived from authority terminal record, no public proof) | PENDING |
+| E1 | Delete foreground surface + unidentified submit + --admission plumbing; reimplement handleIdentifiedJobSubmit per E0 replay ordering (LookupReplay before backend/filesystem validation, recorded fingerprint version); negative + replay test battery; architecture guard: no path reaches session.Turn outside an authority launch | PENDING |
+| E2A | Shared daemon launcher: readiness pipe (ready{protocolVersion,pid,canonicalStateRoot,socketPath} / failed{code,message}), PID-after-ready, Setsid, kill+reap on parent failure, stderr preserved to handshake, concurrent-start winner verification | PENDING |
+| E2B | Autostart: typed diagnostic on unsupported host, restart-after-exit restores service, race convergence; `admission recover` gets a dedicated strict-native recovery constructor; compiled-CLI recovery in Docker gate | PENDING |
+| E3 | Authority-only RPC handlers (no JSON merge/fallback); CLI status/result/cancel/list become protocol clients; delete `sessions` cmd; stable exit codes; compiled-binary E2E across restart+recovery | PENDING |
+| E4 | Graceful shutdown: signal.NotifyContext (daemon serving only) + Shutdown(ctx) reusing existing durable cancellation; successful graceful shutdown ⇒ no live custody, no recovery obligation; forced-timeout path remains recoverable fail-closed | PENDING |
+| E5A | Record-level bbolt behind repository contract; Auditor + AnchorIdentified; binding_index as derived locator; dirty-closure validation sharing invariant helpers with full audit; operation-count tests (bbolt pkg) prove O(touched); 1k/10k/100k benchmarks | PENDING |
+| E5B | Create/OpenExisting/OpenExistingReadOnly split (no ambiguous open-or-create); AuditIntegrity (Tx.Check drained + envelope + cross-record + index) at every existing entry point; root-existence matrix test per cell; unsupported first serve non-mutating; corruption fixtures fatal pre-bind, file untouched | PENDING |
+| E6 | docs/protocol.md v2 reconciliation (hand-written; full job.submit identity schema, replay tables, rejection-cause table verified vs implementation) | PENDING |
+| E7 | CI lanes: committed gate scripts (scripts/ci/), full -race, strict-tag compile, privileged cgroup lane, product black-box lane, fail-closed lanes, govulncheck; release-check runs tests + strict smoke. Merge needs remote-green on candidate SHA (billing must be restored). `.github/**` edits need explicit user approval | PENDING |
+| E8 | Docs: ADR index (+11,+12), operations runbook, offline-only backup policy, install caveat; PR #29 body update (needs user approval); FINAL holistic review of the complete candidate SHA | PENDING |
+
+## Verified defects driving AB-E (evidence at 4e0bd50)
+1. Foreground session/turn executes outside the authority (server.go:1113/1153/1236; runAttempt non-admission branch).
+2. Replay ordering violates ADR-0B (admission.go:1990-2110 validates backend/schema/fingerprint/workspace/runtime BEFORE LookupReplay).
+3. Client autostart hardcodes legacy `serve --foreground`, no diagnostics channel (client.go:307).
+4. `admission recover` composes UnavailableRuntime — can never succeed (main.go:305-308).
+5. CLI sessions/status/result/cancel bypass the authority via the legacy JSON store (main.go:476-617).
+6. Background serve: PID pre-readiness, no Setsid, orphan on post-Start error (main.go:406-442); no signal handling (main.go:54-55).
+7. bbolt whole-store rewrite per mutation (loadState/persistState, DeleteBucket+CreateBucket).
+8. ADR-1A unimplemented: no Tx.Check(); zero-length DB silently re-initialized (bbolt.go:310-341); ambiguous NewRepository everywhere.
+9. protocol.md omits the strict identity contract; rejection causes collapse to invalid_task_spec (admission.go:2465-2470).
+10. CI: no strict lane, race excludes client/+cmd/, gate scripts unversioned; tip red = GitHub Actions BILLING block (jobs die ~4s pre-step), not code.
+
+## AB-E Log
+- 2026-07-22: AB-E locked at REV 3 after two external assessment rounds (foreground deletion decided
+  by user; E9 deferred; no public proof; outcome-based shutdown; sequential-only). Tasks #4-#14
+  created in the session ledger with dependency chain. Starting E0.
