@@ -4,11 +4,14 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R6/R7A CLOSED (R6/R7A closed at 6faedf5: SHIP, 0 findings — 12/12
-real-Linux cgroup-v2 conformance through the production strict composition with zero injection;
-four production defects found AND fixed by conformance itself; 4 commits, 4 sol review rounds,
-findings 2H+2M → 1H+2M → 1H → 0). Next: R7B (launching — the FINAL unit: tiny enablement).
-Production still UnavailableRuntime until R7B lands; R0T sentinel flips to GREEN in R7B.
+STATUS: COMPLETE (2026-07-22). ALL 14 UNITS CLOSED. R7B closed at e42aa5f (SHIP, no blocking
+findings): `agentbus serve --admission=strict` is live — explicit, sticky, fail-closed; the R0T
+gate runs a REAL identified job end-to-end through the production binary on Linux cgroup-v2
+(sentinel `strict_admission_real_job_end_to_end`), with byte-identical replay, exactly-once
+execution, persisted IdentifiedFenced proof, protocol-correct inline results, and
+independent-oracle containment. Version 0.6.0. The R6/R7A+R7B gate arc found and fixed FIVE
+production defects that no unit test caught. Darwin/unsupported platforms fail closed typed;
+default (no flag) behavior is byte-compatible legacy.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -285,6 +288,25 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
+- 2026-07-22 R7B CLOSED (SHIP at e42aa5f) — ROADMAP COMPLETE (14/14). Arc: 8ed727a (landed:
+  --admission=legacy|strict flag, default byte-compatible legacy, strict explicit per C5;
+  native runtime via the R6/R7A-proven served.StrictAdmissionConfig; dynamic
+  admission.strictContainment Hello capability (jobs.requestId stays frozen); R0T gate rebuilt to
+  run the REAL cmd/agentbus binary end-to-end — new sentinel strict_admission_real_job_end_to_end;
+  unavailable-branch defense retained as a unit test; VERSION 0.6.0 + docs. The gate found two
+  more production defects before going green: CLI default backends used bare names where strict
+  native exec requires absolute ExecSpec.Path (now resolved from PATH up front), and strict
+  job.result omitted protocol-mandated inline text for small results (now hydrated from the
+  certified artifact under the inline cap with digest verification)) → e42aa5f (fix, orchestrator
+  repairs audited SHIP: explicit empty/whitespace --admission fails closed with the usage error;
+  hydration reads bounded at inlineCap+1 before exact-length+digest verification). Unit total:
+  3 worker turns on one thread + 2 orchestrator repairs, 2 review rounds, 3 Docker gates. NO
+  lifecycle code, NO engine/** changes — the earlier units held. Five production defects were
+  found by the R6/R7A+R7B real-kernel gate arc overall: quiescence-before-fail-stop;
+  release-unknown over-fail-stop after proven containment; cancel-kill latch misclassification;
+  C9 lease-order preflight; inline-result protocol violation (plus the absolute-path composition
+  gap). Production posture at completion: strict admission opt-in, one-way activation, durable
+  fail-closed custody, R0T GREEN.
 - 2026-07-22 R6/R7A CLOSED (SHIP, 0 findings at 6faedf5). Arc: 6ef6ada (landed: ONE production
   strict composition — served.StrictAdmissionConfig, the exact function R7B wires to
   --admission=strict — driving 12 real-subprocess Linux cgroup-v2 conformance scenarios with zero
