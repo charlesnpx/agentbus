@@ -2664,7 +2664,17 @@ func (s *Server) authorityResultInfo(ref model.ResultRef) *engine.ResultInfo {
 	if ref.Bytes >= int64(inlineCap) {
 		return info
 	}
-	raw, err := os.ReadFile(ref.Path)
+	// Bounded read: the certified byte count gates hydration, but the file on
+	// disk could have been replaced or grown since certification — never read
+	// more than inlineCap+1 bytes, then require the exact certified length and
+	// digest before serving inline text. Any mismatch or I/O failure omits the
+	// text (the path/digest metadata remains authoritative).
+	f, err := os.Open(ref.Path)
+	if err != nil {
+		return info
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, int64(inlineCap)+1))
 	if err != nil || int64(len(raw)) != ref.Bytes {
 		return info
 	}

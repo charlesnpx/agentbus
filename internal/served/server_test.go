@@ -2687,6 +2687,37 @@ func TestIdentifiedFencedResultPublishUsesDurableWorkspaceLayoutKeyWithoutJobSto
 	if err == nil || !strings.Contains(err.Error(), "escapes results root") {
 		t.Fatalf("Verify outside results root error = %v, want path escape rejection", err)
 	}
+
+	// Negative hydration cases: post-certification tampering must omit inline
+	// text (path/digest metadata stays authoritative) and must never read more
+	// than the inline cap allows.
+	// 1. Digest mismatch: same length, different content.
+	tampered := []byte(strings.Repeat("x", len(raw)))
+	if err := os.WriteFile(expectedPath, tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mismatch := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: submitted.JobID})
+	if mismatch.Result == nil || mismatch.Result.Text != "" || mismatch.Result.ResultPath != expectedPath {
+		t.Fatalf("digest-mismatch result = %+v, want omitted inline text with authoritative path", mismatch)
+	}
+	// 2. Oversized replacement: certified-small artifact replaced by a huge
+	// file — hydration must omit text (and its read is bounded by inlineCap+1).
+	oversized := make([]byte, engine.DefaultInlineResultCap+4096)
+	if err := os.WriteFile(expectedPath, oversized, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	grown := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: submitted.JobID})
+	if grown.Result == nil || grown.Result.Text != "" {
+		t.Fatalf("oversized-replacement result = %+v, want omitted inline text", grown)
+	}
+	// 3. Read failure: artifact removed — text omitted, metadata retained.
+	if err := os.Remove(expectedPath); err != nil {
+		t.Fatal(err)
+	}
+	missing := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: submitted.JobID})
+	if missing.Result == nil || missing.Result.Text != "" || missing.Result.ResultPath != expectedPath {
+		t.Fatalf("missing-artifact result = %+v, want omitted inline text with authoritative path", missing)
+	}
 }
 
 func TestIdentifiedFencedCancelUsesAuthorityWhenAdmissionMarkerCleared(t *testing.T) {

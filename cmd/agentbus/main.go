@@ -224,9 +224,13 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 }
 
 func normalizeServeAdmissionMode(raw string) (string, error) {
+	// The flag default already supplies "legacy" when --admission is absent,
+	// so an empty or whitespace-only value here is always an EXPLICIT
+	// malformed configuration (e.g. --admission="$UNSET_VAR"). Fail closed
+	// with a usage error rather than silently selecting legacy.
 	mode := strings.TrimSpace(raw)
 	switch mode {
-	case "", admissionModeLegacy:
+	case admissionModeLegacy:
 		return admissionModeLegacy, nil
 	case admissionModeStrict:
 		return admissionModeStrict, nil

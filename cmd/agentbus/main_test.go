@@ -78,6 +78,17 @@ func TestVersionAndServeCommands(t *testing.T) {
 	if code == 0 || !strings.Contains(stderr, `serve --admission must be "legacy" or "strict"`) {
 		t.Fatalf("invalid admission mode exit=%d stderr=%s", code, stderr)
 	}
+
+	// Explicit empty/whitespace values are malformed configuration (e.g.
+	// --admission="$UNSET_VAR") and must fail closed with a usage error —
+	// never silently select legacy. The flag DEFAULT (absent) supplies
+	// "legacy"; only explicit values reach this validation.
+	for _, malformed := range []string{"--admission=", "--admission=   ", "--admission=\t"} {
+		code, _, stderr = runTestCLI(t, a, []string{"serve", "--foreground", malformed}, "")
+		if code == 0 || !strings.Contains(stderr, `serve --admission must be "legacy" or "strict"`) {
+			t.Fatalf("explicit empty admission mode %q exit=%d stderr=%s, want usage error", malformed, code, stderr)
+		}
+	}
 }
 
 func TestSetupCachesProbeAndReportsJSON(t *testing.T) {
