@@ -578,7 +578,13 @@ func inspectSealedSuccessorDestination(ctx context.Context, stateRoot, expectedD
 			Cause:              err,
 		}
 	}
-	snapshot, err := requireStartableFileAnchor(anchorPath, inspection.DomainUUID, schemaMajor, inspection.Generation)
+	anchor := &fileAnchor{
+		path:               anchorPath,
+		dbUUID:             inspection.DomainUUID,
+		schemaMajor:        schemaMajor,
+		requireInitialized: true,
+	}
+	probe, err := probeBeginStartability(ctx, repo, anchor)
 	if err != nil {
 		return RootInspection{}, SealedSuccessorMismatchError{
 			StateRoot:          stateRoot,
@@ -587,10 +593,10 @@ func inspectSealedSuccessorDestination(ctx context.Context, stateRoot, expectedD
 			Cause:              err,
 		}
 	}
-	inspection.AnchorPhase = snapshot.Phase
-	if snapshot.Phase == "fail_stopped" {
+	inspection.AnchorPhase = probe.Anchor.Phase
+	if probe.Anchor.Phase == "fail_stopped" {
 		inspection.FailStopped = true
-		inspection.FailStopReason = snapshot.Reason
+		inspection.FailStopReason = probe.Anchor.Reason
 	}
 	return inspection, nil
 }

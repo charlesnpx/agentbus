@@ -692,6 +692,135 @@ func TestSealSealedReplayRequiresPersistedSuccessorIdentity(t *testing.T) {
 	}
 }
 
+func TestSealSealedReplayRejectsFailStoppedSuccessorUntilCleared(t *testing.T) {
+	ctx := context.Background()
+	root, newRoot, first := sealedSuccessorForTest(t, ctx, "seal-replay-fail-stopped")
+	persistAdmissionFailStopForTest(t, ctx, newRoot, "persisted successor fail-stop")
+
+	_, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	requireSealedSuccessorMismatch(t, err, first.NewDomainUUID, "fail_stopped")
+	if !errors.Is(err, ErrFailStopped) {
+		t.Fatalf("fail-stopped successor replay error = %v, want ErrFailStopped", err)
+	}
+
+	clear, err := ClearAdmissionFailStop(ctx, newRoot, ClearFailStopOptions{AcknowledgeUnsafeDiagnosis: true})
+	if err != nil {
+		t.Fatalf("clear fail-stop successor: %v", err)
+	}
+	if !clear.Cleared || clear.ClearedReason != "persisted successor fail-stop" {
+		t.Fatalf("clear fail-stop report = %+v, want cleared persisted reason", clear)
+	}
+	replay, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if err != nil {
+		t.Fatalf("sealed replay after clear-fail-stop error = %v", err)
+	}
+	if replay.NewDomainUUID != first.NewDomainUUID {
+		t.Fatalf("sealed replay after clear UUID = %s, want %s", replay.NewDomainUUID, first.NewDomainUUID)
+	}
+}
+
+func TestSealSealedReplayRejectsSuccessorSealedOnward(t *testing.T) {
+	ctx := context.Background()
+	root, newRoot, first := sealedSuccessorForTest(t, ctx, "seal-replay-sealed-onward")
+	thirdRoot := filepath.Join(t.TempDir(), "third-domain")
+	if _, err := SealAdmissionRoot(ctx, newRoot, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: thirdRoot}); err != nil {
+		t.Fatalf("seal successor onward: %v", err)
+	}
+
+	_, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	requireSealedSuccessorMismatch(t, err, first.NewDomainUUID, "sealed")
+	if !errors.Is(err, ErrRootSealed) {
+		t.Fatalf("sealed-onward successor replay error = %v, want ErrRootSealed", err)
+	}
+}
+
+func TestSealSealedReplayRejectsMatrixInvalidSuccessor(t *testing.T) {
+	ctx := context.Background()
+	root, newRoot, first := sealedSuccessorForTest(t, ctx, "seal-replay-matrix-invalid")
+	jobID := addPendingAdmissionJobForTest(t, ctx, newRoot, "seal-replay-matrix-invalid-successor")
+	corruptAdmissionSafetyForTest(t, newRoot, jobID, "safety checksum")
+
+	_, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	requireSealedSuccessorMismatch(t, err, first.NewDomainUUID, "matrix-invalid")
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("matrix-invalid successor replay error = %v, want ErrCorruptRecord", err)
+	}
+}
+
+func TestSealSealedReplayAcceptsStartableSuccessorWithPendingRecovery(t *testing.T) {
+	ctx := context.Background()
+	root, newRoot, first := sealedSuccessorForTest(t, ctx, "seal-replay-pending-recovery")
+	addPendingAdmissionJobForTest(t, ctx, newRoot, "seal-replay-pending-recovery-successor")
+
+	replay, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if err != nil {
+		t.Fatalf("sealed replay to successor with pending recovery error = %v", err)
+	}
+	if replay.NewDomainUUID != first.NewDomainUUID {
+		t.Fatalf("pending successor replay UUID = %s, want %s", replay.NewDomainUUID, first.NewDomainUUID)
+	}
+	if replay.NewInspection.Counts.RecoveryObligations == 0 {
+		t.Fatalf("pending successor replay inspection = %+v, want recovery obligation retained", replay.NewInspection)
+	}
+}
+
+func TestBeginStartabilityProbeMatchesBeginOutcomes(t *testing.T) {
+	ctx := context.Background()
+	_, genuineRoot, _ := sealedSuccessorForTest(t, ctx, "probe-equivalence-genuine")
+
+	_, pendingRoot, _ := sealedSuccessorForTest(t, ctx, "probe-equivalence-pending")
+	addPendingAdmissionJobForTest(t, ctx, pendingRoot, "probe-equivalence-pending-successor")
+
+	_, failStoppedRoot, _ := sealedSuccessorForTest(t, ctx, "probe-equivalence-fail-stopped")
+	persistAdmissionFailStopForTest(t, ctx, failStoppedRoot, "equivalence fail-stop")
+
+	_, sealedRoot, _ := sealedSuccessorForTest(t, ctx, "probe-equivalence-sealed")
+	if _, err := SealAdmissionRoot(ctx, sealedRoot, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: filepath.Join(t.TempDir(), "third-domain")}); err != nil {
+		t.Fatalf("seal equivalence successor onward: %v", err)
+	}
+
+	_, matrixRoot, _ := sealedSuccessorForTest(t, ctx, "probe-equivalence-matrix")
+	matrixJobID := addPendingAdmissionJobForTest(t, ctx, matrixRoot, "probe-equivalence-matrix-successor")
+	corruptAdmissionSafetyForTest(t, matrixRoot, matrixJobID, "safety checksum")
+
+	tests := []struct {
+		name    string
+		root    string
+		want    error
+		barrier string
+	}{
+		{name: "genuine successor", root: genuineRoot},
+		{name: "pending recovery obligations", root: pendingRoot},
+		{name: "persisted fail_stopped", root: failStoppedRoot, want: ErrFailStopped, barrier: "fail_stopped"},
+		{name: "sealed onward", root: sealedRoot, want: ErrRootSealed, barrier: "sealed"},
+		{name: "matrix invalid", root: matrixRoot, want: repository.ErrCorruptRecord, barrier: "matrix-invalid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			probeRoot := cloneAdmissionRootForTest(t, tt.root, "probe")
+			beginRoot := cloneAdmissionRootForTest(t, tt.root, "begin")
+
+			_, probeErr := probeAdmissionStartabilityForTest(t, ctx, probeRoot)
+			beginErr := beginAdmissionRootForTest(t, ctx, beginRoot, strings.ReplaceAll(tt.name, " ", "-"))
+			if (probeErr == nil) != (beginErr == nil) {
+				t.Fatalf("probe error = %v, Begin error = %v; want matching accept/reject", probeErr, beginErr)
+			}
+			if tt.want == nil {
+				if probeErr != nil || beginErr != nil {
+					t.Fatalf("probe error = %v, Begin error = %v; want both accepted", probeErr, beginErr)
+				}
+				return
+			}
+			if !errors.Is(probeErr, tt.want) || !errors.Is(beginErr, tt.want) {
+				t.Fatalf("probe error = %v, Begin error = %v; want both wrapping %v", probeErr, beginErr, tt.want)
+			}
+			if !strings.Contains(probeErr.Error(), tt.barrier) || !strings.Contains(beginErr.Error(), tt.barrier) {
+				t.Fatalf("probe error = %v, Begin error = %v; want barrier %q", probeErr, beginErr, tt.barrier)
+			}
+		})
+	}
+}
+
 func TestSealMissingNewStateRootParentIsTypedContractError(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -861,6 +990,186 @@ func setSealAdmissionRootAfterNewInitForTest(t *testing.T, hook func() error) {
 	t.Cleanup(func() {
 		sealAdmissionRootAfterNewInitForTest = previous
 	})
+}
+
+func sealedSuccessorForTest(t *testing.T, ctx context.Context, name string) (string, string, SealReport) {
+	t.Helper()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, name)
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRoot := filepath.Join(t.TempDir(), "new-domain")
+	report, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root, newRoot, report
+}
+
+func persistAdmissionFailStopForTest(t *testing.T, ctx context.Context, root, reason string) {
+	t.Helper()
+	repo, err := openReadOnlyAdmissionRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbUUID, schemaMajor, err := repo.AnchorIdentity()
+	if closeErr := repo.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, anchorPath, err := admissionRootPaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, err := adminBootRef("test-fail-stop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := NewFileAnchor(anchorPath, dbUUID, schemaMajor).FailStop(ctx, boot, reason); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func addPendingAdmissionJobForTest(t *testing.T, ctx context.Context, root, name string) model.JobID {
+	t.Helper()
+	repo, session := beginBboltAdmissionRoot(t, root, name)
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := session.SealReady(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := ready.Accept(ctx, acceptRequest(t, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return accepted.Record.JobID
+}
+
+func corruptAdmissionSafetyForTest(t *testing.T, root string, jobID model.JobID, diagnostic string) {
+	t.Helper()
+	repo, err := bboltrepo.NewRepository(filepath.Join(root, AdmissionRepositoryFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.InjectCorruptSafetyForTest(jobID, diagnostic)
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func requireSealedSuccessorMismatch(t *testing.T, err error, expectedDomainUUID, barrier string) SealedSuccessorMismatchError {
+	t.Helper()
+	var mismatch SealedSuccessorMismatchError
+	if !errors.As(err, &mismatch) || !errors.Is(err, ErrSealedSuccessorMismatch) || mismatch.ExpectedDomainUUID != expectedDomainUUID {
+		t.Fatalf("sealed replay error = %#v %v, want typed successor mismatch for %s", mismatch, err, expectedDomainUUID)
+	}
+	if !strings.Contains(err.Error(), barrier) {
+		t.Fatalf("sealed replay error = %v, want barrier %q", err, barrier)
+	}
+	return mismatch
+}
+
+func cloneAdmissionRootForTest(t *testing.T, srcRoot, name string) string {
+	t.Helper()
+	dstRoot := filepath.Join(t.TempDir(), name)
+	if err := os.Mkdir(dstRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{AdmissionRepositoryFile, AdmissionAnchorFile} {
+		if err := copyFile(filepath.Join(dstRoot, file), filepath.Join(srcRoot, file)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dstRoot
+}
+
+func probeAdmissionStartabilityForTest(t *testing.T, ctx context.Context, root string) (beginStartabilityProbe, error) {
+	t.Helper()
+	repoPath, anchorPath, err := admissionRootPaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeRepoBytes, err := os.ReadFile(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeAnchorBytes, err := os.ReadFile(anchorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := openReadOnlyAdmissionRepository(root)
+	if err != nil {
+		return beginStartabilityProbe{}, err
+	}
+	dbUUID, schemaMajor, err := repo.AnchorIdentity()
+	if err != nil {
+		if closeErr := repo.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		return beginStartabilityProbe{}, err
+	}
+	probe, err := probeBeginStartability(ctx, repo, &fileAnchor{
+		path:               anchorPath,
+		dbUUID:             dbUUID,
+		schemaMajor:        schemaMajor,
+		requireInitialized: true,
+	})
+	if closeErr := repo.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	afterRepoBytes, readErr := os.ReadFile(repoPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	afterAnchorBytes, readErr := os.ReadFile(anchorPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(afterRepoBytes, beforeRepoBytes) {
+		t.Fatal("startability probe mutated destination repository")
+	}
+	if !bytes.Equal(afterAnchorBytes, beforeAnchorBytes) {
+		t.Fatal("startability probe mutated destination anchor")
+	}
+	return probe, err
+}
+
+func beginAdmissionRootForTest(t *testing.T, ctx context.Context, root, name string) error {
+	t.Helper()
+	repo, err := bboltrepo.NewRepository(filepath.Join(root, AdmissionRepositoryFile))
+	if err != nil {
+		return err
+	}
+	defer repo.Close()
+	dbUUID, schemaMajor, err := repo.AnchorIdentity()
+	if err != nil {
+		return err
+	}
+	_, anchorPath, err := admissionRootPaths(root)
+	if err != nil {
+		return err
+	}
+	boot, err := model.NewBootRef("boot-probe-"+name, "owner-probe-"+name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrapper, err := NewBootstrapper(repo, WithAnchor(NewFileAnchor(anchorPath, dbUUID, schemaMajor)))
+	if err != nil {
+		return err
+	}
+	_, err = bootstrapper.Begin(ctx, boot)
+	return err
 }
 
 func copyFile(dst, src string) error {

@@ -38,30 +38,20 @@ func LoadFileAnchorSnapshot(path string) (AnchorSnapshot, error) {
 }
 
 type fileAnchor struct {
-	path         string
-	dbUUID       string
-	schemaMajor  uint16
-	failStopHook func(string)
+	path               string
+	dbUUID             string
+	schemaMajor        uint16
+	requireInitialized bool
+	failStopHook       func(string)
 }
 
 func (a *fileAnchor) Begin(ctx context.Context, boot model.BootRef, generation uint64) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
 	if err := boot.Validate(); err != nil {
 		return "", err
 	}
-	snapshot, err := loadFileAnchorSnapshot(a.path)
+	snapshot, err := a.probeBeginStartable(ctx, generation)
 	if err != nil {
 		return "", err
-	}
-	if err := a.ensureIdentity(&snapshot, generation); err != nil {
-		return "", err
-	}
-	// A persisted fail-stop is sticky: Begin must not convert it back to
-	// reconciling. Only the explicit clear-fail-stop admin verb may clear it.
-	if snapshot.Phase == "fail_stopped" {
-		return "", FailStoppedError{Reason: snapshot.Reason}
 	}
 	if snapshot.Generation < generation {
 		snapshot.Generation = generation
@@ -75,6 +65,20 @@ func (a *fileAnchor) Begin(ctx context.Context, boot model.BootRef, generation u
 		return "", err
 	}
 	return token, nil
+}
+
+func (a *fileAnchor) probeBeginStartable(ctx context.Context, generation uint64) (AnchorSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return AnchorSnapshot{}, err
+	}
+	snapshot, err := loadFileAnchorSnapshot(a.path)
+	if err != nil {
+		return AnchorSnapshot{}, err
+	}
+	if err := a.ensureIdentity(&snapshot, generation); err != nil {
+		return AnchorSnapshot{}, err
+	}
+	return snapshot, nil
 }
 
 func (a *fileAnchor) SealReady(ctx context.Context, boot model.BootRef, generation uint64) (string, error) {
@@ -233,9 +237,10 @@ func requireStartableFileAnchor(path, dbUUID string, schemaMajor uint16, generat
 		return AnchorSnapshot{}, err
 	}
 	anchor := &fileAnchor{
-		path:        path,
-		dbUUID:      dbUUID,
-		schemaMajor: schemaMajor,
+		path:               path,
+		dbUUID:             dbUUID,
+		schemaMajor:        schemaMajor,
+		requireInitialized: true,
 	}
 	if err := anchor.requireStartable(snapshot, generation); err != nil {
 		return AnchorSnapshot{}, err
@@ -248,6 +253,15 @@ func (a *fileAnchor) ensureIdentity(snapshot *AnchorSnapshot, generation uint64)
 		return err
 	}
 	if !snapshot.Initialized {
+		if a.requireInitialized {
+			if err := a.validateIdentity(); err != nil {
+				return err
+			}
+			if generation != 0 {
+				return fmt.Errorf("%w: missing anchor for initialized db generation %d", ErrAnchorInvariant, generation)
+			}
+			return fmt.Errorf("%w: anchor is missing", ErrAnchorInvariant)
+		}
 		if generation != 0 {
 			return fmt.Errorf("%w: missing anchor for initialized db generation %d", ErrAnchorInvariant, generation)
 		}
@@ -280,6 +294,11 @@ func (a *fileAnchor) requireStartable(snapshot AnchorSnapshot, generation uint64
 	}
 	if snapshot.Generation > generation {
 		return fmt.Errorf("%w: anchor generation %d is ahead of db generation %d", ErrAnchorInvariant, snapshot.Generation, generation)
+	}
+	// A persisted fail-stop is sticky: Begin must not convert it back to
+	// reconciling. Only the explicit clear-fail-stop admin verb may clear it.
+	if snapshot.Phase == "fail_stopped" {
+		return FailStoppedError{Reason: snapshot.Reason}
 	}
 	return nil
 }

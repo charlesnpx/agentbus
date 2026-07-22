@@ -26,6 +26,29 @@ type anchorVerifier interface {
 	VerifyRecovery(model.BootRef, string, uint64) error
 }
 
+type beginStartabilityAnchor interface {
+	probeBeginStartable(context.Context, uint64) (AnchorSnapshot, error)
+}
+
+type beginStartabilityProbe struct {
+	Generation uint64
+	Anchor     AnchorSnapshot
+	HasAnchor  bool
+}
+
+type beginStartabilityError struct {
+	Barrier string
+	Cause   error
+}
+
+func (e beginStartabilityError) Error() string {
+	return fmt.Sprintf("%s: %v", e.Barrier, e.Cause)
+}
+
+func (e beginStartabilityError) Unwrap() error {
+	return e.Cause
+}
+
 type Bootstrapper struct {
 	core *authorityCore
 }
@@ -115,23 +138,11 @@ func (b *Bootstrapper) Begin(ctx context.Context, boot model.BootRef) (*Recovery
 		return nil, ErrBootActive
 	}
 
-	var generation uint64
-	if err := b.core.repo.View(ctx, func(tx repository.ReadTx) error {
-		meta, err := b.core.requireMeta(tx)
-		if err != nil {
-			return err
-		}
-		if meta.Sealed {
-			return ErrRootSealed
-		}
-		if _, err := startupMatrixTx(tx); err != nil {
-			return err
-		}
-		generation = meta.Generation
-		return nil
-	}); err != nil {
+	probe, err := probeBeginStartability(ctx, b.core.repo, b.core.anchor)
+	if err != nil {
 		return nil, err
 	}
+	generation := probe.Generation
 	token, err := b.core.anchor.Begin(ctx, boot, generation)
 	if err != nil {
 		return nil, err
@@ -151,6 +162,74 @@ func (b *Bootstrapper) Begin(ctx context.Context, boot model.BootRef) (*Recovery
 			generation: generation,
 		},
 	}, nil
+}
+
+func probeBeginStartability(ctx context.Context, repo repository.Repository, anchor Anchor) (beginStartabilityProbe, error) {
+	var probe beginStartabilityProbe
+	// probeBeginStartability is the read-only equivalent of Bootstrapper.Begin's startability gate: it accepts exactly the roots Begin can begin, and rejects the same sealed metadata, startup-matrix, anchor identity/generation, and persisted fail-stop barriers without repair.
+	if err := repo.View(ctx, func(tx repository.ReadTx) error {
+		core := authorityCore{}
+		meta, err := core.requireMeta(tx)
+		if err != nil {
+			return err
+		}
+		if meta.Sealed {
+			return beginStartabilityError{Barrier: "sealed", Cause: ErrRootSealed}
+		}
+		if _, err := startupMatrixTx(tx); err != nil {
+			return beginStartabilityError{Barrier: "matrix-invalid", Cause: err}
+		}
+		probe.Generation = meta.Generation
+		return nil
+	}); err != nil {
+		return beginStartabilityProbe{}, err
+	}
+	if anchorProbe, ok := anchor.(beginStartabilityAnchor); ok {
+		snapshot, err := anchorProbe.probeBeginStartable(ctx, probe.Generation)
+		if err != nil {
+			barrier := "anchor"
+			if errors.Is(err, ErrFailStopped) {
+				barrier = "fail_stopped"
+			}
+			return beginStartabilityProbe{}, beginStartabilityError{Barrier: barrier, Cause: err}
+		}
+		probe.Anchor = snapshot
+		probe.HasAnchor = true
+	}
+	return probe, nil
+}
+
+func (a anchorAdapter) probeBeginStartable(ctx context.Context, generation uint64) (AnchorSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return AnchorSnapshot{}, err
+	}
+	if err := validateAnchorIdentity(a.dbUUID, a.schemaMajor); err != nil {
+		return AnchorSnapshot{}, err
+	}
+	a.store.mu.Lock()
+	defer a.store.mu.Unlock()
+	snapshot := a.store.state
+	if !snapshot.Initialized {
+		if generation != 0 {
+			return AnchorSnapshot{}, fmt.Errorf("%w: missing anchor for initialized db generation %d", ErrAnchorInvariant, generation)
+		}
+		return AnchorSnapshot{
+			Initialized: true,
+			DBUUID:      a.dbUUID,
+			SchemaMajor: a.schemaMajor,
+			Generation:  generation,
+		}, nil
+	}
+	if err := a.store.requireIdentityLocked(a.dbUUID, a.schemaMajor); err != nil {
+		return AnchorSnapshot{}, err
+	}
+	if snapshot.Generation > generation {
+		return AnchorSnapshot{}, fmt.Errorf("%w: anchor generation %d is ahead of db generation %d", ErrAnchorInvariant, snapshot.Generation, generation)
+	}
+	if snapshot.Phase == "fail_stopped" {
+		return AnchorSnapshot{}, FailStoppedError{Reason: snapshot.Reason}
+	}
+	return snapshot, nil
 }
 
 func (s *RecoverySession) Plans(ctx context.Context) ([]model.RecoveryPlan, error) {
