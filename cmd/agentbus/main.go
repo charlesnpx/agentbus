@@ -1058,7 +1058,7 @@ func printRootHelp(out io.Writer) {
   agentbus validate --contract <file|name> [--text-file <f>] [--json]
 
 JSON shapes:
-  version:  {"schema":1,"version":"dev","protocolVersion":1}
+  version:  {"schema":1,"version":"dev","protocolVersion":2}
   setup:    {"schema":1,"backends":[{"backend":"codex","binaryPath":"...","version":"...","configMode":{"write":"user","readOnly":"hermetic"},"sandboxModes":["workspace-write","read-only"],"jsonEventsProbe":{"ran":true,"version":"...","streamSchema":"codex-json-v1"}}]}
   sessions: {"sessions":[{"sessionId":"...","backend":"codex","cwd":"...","tags":{},"activeTurnId":null}]}
   status:   {"jobs":[{"jobId":"...","state":"running","lease":{"expiresAt":"...","expired":false}}]}

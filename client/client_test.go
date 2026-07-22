@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charlesnpx/agentbus/internal/protocol"
 	"github.com/charlesnpx/agentbus/internal/served"
 )
 
@@ -175,7 +176,7 @@ func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 	}
 	close(clients)
 	for c := range clients {
-		if c.HelloResult().ProtocolVersion != 1 {
+		if c.HelloResult().ProtocolVersion != protocol.Version {
 			t.Fatalf("hello = %+v", c.HelloResult())
 		}
 		_ = c.Close()

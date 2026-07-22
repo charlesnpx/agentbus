@@ -61,7 +61,10 @@ func (record Record[T]) Corrupt() bool {
 
 const (
 	CurrentAuthorityMetaSchemaVersion = uint16(1)
-	CurrentAdmissionContractVersion   = uint16(1)
+	// StrictAuthorityMetaSchemaVersion is the ADR-12 storage schema version
+	// adopted by E5A/E5B once schema-v2 open validation is implemented.
+	StrictAuthorityMetaSchemaVersion = uint16(2)
+	CurrentAdmissionContractVersion  = uint16(1)
 )
 
 type AdmissionRootMetadata struct {

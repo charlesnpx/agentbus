@@ -9,7 +9,8 @@ import (
 )
 
 const (
-	Version       = 1
+	// Version is the strict-only protocol major version frozen by ADR-12.
+	Version       = 2
 	SocketName    = "agentbus.sock"
 	TokenFileName = "token"
 
@@ -45,14 +46,38 @@ const (
 )
 
 const (
-	AdmissionRejectMissingIdentity          = "missing_identity"
-	AdmissionRejectUnsupportedBackend       = "unsupported_backend"
-	AdmissionRejectUnfenceableBackend       = "unfenceable_backend"
-	AdmissionRejectInvalidStrictConfig      = "invalid_strict_config"
-	AdmissionRejectUnavailableNativeRuntime = "unavailable_native_runtime"
-	AdmissionRejectStrictRouteDisabled      = "strict_route_disabled"
-	AdmissionRejectLegacyDowngrade          = "legacy_downgrade"
-	AdmissionRejectPermanentlySealed        = "permanently_sealed"
+	// AdmissionRejectMissingIdentity means strict admission did not receive a workspaceKey and requestId identity.
+	AdmissionRejectMissingIdentity string = "missing_identity"
+	// AdmissionRejectReplayConflict means the request key is already bound or tombstoned to a different task identity.
+	AdmissionRejectReplayConflict string = "replay_conflict"
+	// AdmissionRejectRequestExpired means the request key matches an expired tombstone.
+	AdmissionRejectRequestExpired string = "request_expired"
+	// AdmissionRejectRequestFingerprintUnsupported means the recorded fingerprint algorithm or version cannot be compared.
+	AdmissionRejectRequestFingerprintUnsupported string = "request_fingerprint_unsupported"
+	// AdmissionRejectUnsupportedBackend means the requested backend is unavailable to strict admission.
+	AdmissionRejectUnsupportedBackend string = "unsupported_backend"
+	// AdmissionRejectUnfenceableBackend means the requested backend cannot satisfy strict fencing or containment.
+	AdmissionRejectUnfenceableBackend string = "unfenceable_backend"
+	// AdmissionRejectInvalidStrictConfig means the strict task configuration is malformed or incompatible with strict admission.
+	AdmissionRejectInvalidStrictConfig string = "invalid_strict_config"
+	// AdmissionRejectUnavailableNativeRuntime means the native runtime support probe failed strict runtime requirements.
+	AdmissionRejectUnavailableNativeRuntime string = "unavailable_native_runtime"
+	// AdmissionRejectRootCorrupt means the authority root has detected repository, anchor, or integrity corruption.
+	AdmissionRejectRootCorrupt string = "root_corrupt"
+	// AdmissionRejectRootIdentityMismatch means repository and anchor identities disagree.
+	AdmissionRejectRootIdentityMismatch string = "root_identity_mismatch"
+	// AdmissionRejectRootFailStopped means the authority root has tripped fail-stop and rejects admission.
+	AdmissionRejectRootFailStopped string = "root_fail_stopped"
+	// AdmissionRejectRootSealed means the authority root is sealed against service or admission.
+	AdmissionRejectRootSealed string = "root_sealed"
+	// AdmissionRejectAdmissionClosing means the daemon is closing and rejects new admission.
+	AdmissionRejectAdmissionClosing string = "admission_closing"
+	// AdmissionRejectStrictRouteDisabled is a pre-ADR-12 cause retained for existing handlers until E1 removes the route.
+	AdmissionRejectStrictRouteDisabled string = "strict_route_disabled"
+	// AdmissionRejectLegacyDowngrade is a pre-ADR-12 cause retained for existing handlers until E1 removes legacy downgrade paths.
+	AdmissionRejectLegacyDowngrade string = "legacy_downgrade"
+	// AdmissionRejectPermanentlySealed is a pre-ADR-12 cause retained for existing handlers until root_sealed is wired.
+	AdmissionRejectPermanentlySealed string = "permanently_sealed"
 )
 
 const (
