@@ -4,12 +4,11 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS: EXECUTING. R0..R5 CLOSED (R5 closed at 3bed997: SHIP, 0 findings — sticky one-way
-activation enforced at the repository, no-downgrade + C9 support-loss table, admin verbs with
-rotation identity/exclusive creation/sticky fail-stop, Begin-composed startability probe;
-6 commits, 6 sol review rounds, findings 6H → 3H+1M → 2H+1M → 1H+1M+1L → 1H → 0).
-Next: R6/R7A (launching) → R7B. Production still UnavailableRuntime; R0T sentinel
-`strict_admission_native_runtime_unavailable` green throughout.
+STATUS: EXECUTING. R0..R6/R7A CLOSED (R6/R7A closed at 6faedf5: SHIP, 0 findings — 12/12
+real-Linux cgroup-v2 conformance through the production strict composition with zero injection;
+four production defects found AND fixed by conformance itself; 4 commits, 4 sol review rounds,
+findings 2H+2M → 1H+2M → 1H → 0). Next: R7B (launching — the FINAL unit: tiny enablement).
+Production still UnavailableRuntime until R7B lands; R0T sentinel flips to GREEN in R7B.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -286,6 +285,28 @@ Linux cgroup-v2 privileged Docker `-p 1` + the opt-in strict E2E (expected senti
 see the R4A contract block.)
 
 ## Log
+- 2026-07-22 R6/R7A CLOSED (SHIP, 0 findings at 6faedf5). Arc: 6ef6ada (landed: ONE production
+  strict composition — served.StrictAdmissionConfig, the exact function R7B wires to
+  --admission=strict — driving 12 real-subprocess Linux cgroup-v2 conformance scenarios with zero
+  injection and an independent OS oracle; conformance found+fixed FOUR production defects:
+  release-unknown recorded no quiescence before fail-stop; release-unknown fail-stopped the daemon
+  even after PROVEN containment (C4: fail-stop is for the unprovable — contained+proven now
+  finalizes typed and the daemon keeps serving); our own cancel TERM->KILL tripped the safety
+  latch; a second Serve blocked on the bbolt flock before surfacing lease unavailability (C9
+  preflight); plus NativeCustodian.Close aborts provably-unexecuted prepared launches) → 872e413
+  (fix: ContainmentIntent marked before signals travels on LaunchRequest/RunnerBinding — the
+  cancel-vs-registration race can no longer spuriously fail-stop; deterministic pre-grant-hold
+  ordering proof; LaunchReleaseOutcomeFact durable write-once not_sent/sent_unknown/acked with
+  causes derived from record never shape; test-local /proc oracle) → bf6f233 (fix2: fixture exec
+  evidence at first instruction; unpersistable release facts fail-stop on the legacy path too;
+  barriered cancel proof) → 6faedf5 (fix3: entry tags via t.Setenv genuinely reach the backend
+  exec env; entry-vs-stdin evidence distinguishable; propagation regressions fail loudly). Review
+  trajectory 2H+2M → 1H+2M → 1H → 0 across 4 refute-first sol rounds (one reviewer backend failure
+  resumed on-thread). Unit total: 6 worker rounds, 9 Docker gates. 12/12 scenarios: default
+  construction+self-test; identified submit/replay; no-exec-before-grant (deterministically
+  proven); release-ack loss (at-most-once); cancellation; descendant containment; daemon SIGKILL;
+  restart+recovery (byte-identical replay); activated-root support-loss; lease reuse/exclusivity;
+  no-ID + unfenceable rejections; independent OS absence oracle.
 - 2026-07-21 R5 CLOSED (SHIP, 0 findings at 3bed997). Arc: 2f00fb0 (landed: anchored one-way
   AdmissionRootMetadata; no-downgrade policy; C9 support-loss table + AdmissionSupportDiagnostic;
   admin verbs inspect/recover/reset-empty-root/seal; legacy_downgrade + permanently_sealed causes)
