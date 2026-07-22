@@ -7,8 +7,10 @@ the following implementation units. This ADR is NORMATIVE.
 
 ### Protocol surface v2
 
-`protocol.Version` is 2. The protocol v2 surface contains `server.hello`, identified `job.submit`,
-`job.status`, `job.result`, `job.cancel`, job listing, and the existing admission admin verbs.
+`protocol.Version` is 2. The protocol v2 surface contains `protocol.hello`, identified
+`job.submit`, `job.status`, `job.result`, `job.cancel`, `policy.validate`, and `policy.register`.
+`policy.validate` and `policy.register` REMAIN in v2 as non-execution admin/policy surface. Job
+listing means `job.status {all:true}`; there is no separate list method.
 
 E1 removes `session.start`, `session.resume`, `session.list`, `turn.start`, `turn.interrupt`,
 `turn.event`, `turn.result`, and unidentified `job.submit`.
@@ -46,6 +48,13 @@ semantics.
 Opening an older schema is a typed incompatible-schema fatal error. Existing databases are not
 silently repaired during normal startup: no silent bucket creation, no silent index rebuild, and no
 normal-startup repair of missing records or indexes.
+
+Root existence classification is evaluated in this normative order: structural corruption checks,
+zero-length check, schema version check, bucket/index presence, anchor presence/match, then the
+remaining existence rows. The FIRST matching row classifies the typed error. Explicit reset-empty
+eligibility is decided only after classification, and is eligible only for the
+`present | missing anchor` row after proving the root empty. Each classified row has one
+unambiguous typed error.
 
 | DB | Anchor | Result |
 | --- | --- | --- |
@@ -87,6 +96,8 @@ corruption. Projection-only corruption retains the existing quarantine and recon
 ### Stable rejection causes
 
 Strict rejection error payloads carry stable machine-readable cause strings.
+
+This ADR amends ADR-0: the cause formerly named request_conflict is normatively replay_conflict.
 
 | Cause | Meaning |
 | --- | --- |

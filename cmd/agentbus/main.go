@@ -18,10 +18,10 @@ import (
 	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/internal/agentbusserve"
+	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
 const (
-	protocolMajor = 1
 	cliJSONSchema = 1
 
 	admissionModeLegacy = "legacy"
@@ -129,7 +129,7 @@ func (a *app) run(ctx context.Context, args []string, in io.Reader, out, errOut 
 
 func (a *app) runVersion(args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("version", errOut)
-	jsonOut := fs.Bool("json", false, "emit JSON: {\"schema\":1,\"version\":\"...\",\"protocolVersion\":1}")
+	jsonOut := fs.Bool("json", false, fmt.Sprintf("emit JSON: {\"schema\":%d,\"version\":\"...\",\"protocolVersion\":%d}", cliJSONSchema, protocol.Version))
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
@@ -137,7 +137,7 @@ func (a *app) runVersion(args []string, out, errOut io.Writer) int {
 		return usageError(errOut, "version does not accept positional arguments")
 	}
 	if *jsonOut {
-		return writeOrError(out, errOut, versionOutput{Schema: cliJSONSchema, Version: a.version, ProtocolVersion: protocolMajor})
+		return writeOrError(out, errOut, versionOutput{Schema: cliJSONSchema, Version: a.version, ProtocolVersion: protocol.Version})
 	}
 	fmt.Fprintf(out, "agentbus %s\n", a.version)
 	return 0

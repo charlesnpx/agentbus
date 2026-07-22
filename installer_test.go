@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
 type installerResult struct {
@@ -132,7 +134,7 @@ func TestInstallerInstallAndUninstallStagedTools(t *testing.T) {
 	if err := json.Unmarshal([]byte(versionOut), &cli); err != nil {
 		t.Fatalf("decode version JSON: %v: %s", err, versionOut)
 	}
-	if cli.Version != version || cli.Schema != 1 || cli.ProtocolVersion != 1 {
+	if cli.Version != version || cli.Schema != 1 || cli.ProtocolVersion != protocol.Version {
 		t.Fatalf("CLI version = %+v", cli)
 	}
 

@@ -6,6 +6,7 @@ AB-D's target contract is exactly-once admission for `(workspaceKey, requestId)`
 execution. A request key binds indefinitely to one `jobID` and one fingerprint. Replays are observational only:
 matching bindings return the existing job, mismatches return `request_conflict`, matching tombstones
 return `request_expired`, and mismatched tombstones return `request_conflict`.
+Amendment: ADR-12 makes `replay_conflict` the normative name for the former `request_conflict` cause.
 
 S1 implementation status: production keeps `jobs.requestId` disabled and unadvertised. The current
 process custodian is `UnavailableCustodian`, so no production path claims completed fail-closed

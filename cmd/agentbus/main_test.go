@@ -13,6 +13,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
 type testClock struct{ now time.Time }
@@ -61,7 +62,7 @@ func TestVersionAndServeCommands(t *testing.T) {
 	}
 	var version versionOutput
 	decodeJSON(t, stdout, &version)
-	if version.Version != "test" || version.ProtocolVersion != protocolMajor || version.Schema != cliJSONSchema {
+	if version.Version != "test" || version.ProtocolVersion != protocol.Version || version.Schema != cliJSONSchema {
 		t.Fatalf("version output = %+v", version)
 	}
 
