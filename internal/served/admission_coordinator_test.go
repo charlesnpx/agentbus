@@ -221,6 +221,10 @@ func (servedCoordinatorOrderLaunchAuthority) AllocateGrant(context.Context, mode
 	return model.LaunchGrant{}, launch.CommittedAndAnchored, nil
 }
 
+func (servedCoordinatorOrderLaunchAuthority) RecordReleaseOutcome(context.Context, model.JobID, model.AttemptRef, model.LaunchOrdinal, model.LaunchReleaseOutcome) (launch.DurabilityOutcome, error) {
+	return launch.CommittedAndAnchored, nil
+}
+
 func (servedCoordinatorOrderLaunchAuthority) RecordRelease(context.Context, model.JobID, model.AttemptRef, model.LaunchOrdinal, model.ChildIdentity, model.Evidence) (launch.DurabilityOutcome, error) {
 	return launch.CommittedAndAnchored, nil
 }

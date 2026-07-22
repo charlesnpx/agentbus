@@ -7,7 +7,7 @@ func TestProjectionEnumsMatchProtocolStrings(t *testing.T) {
 	assertStrings(t, "Dispatch", dispatchesToStrings(AllDispatches()), []string{"none", "scheduled", "supervisor_prepared", "permit_granted", "active", "reconciling", "contained", "result_publishing", "done"})
 	assertStrings(t, "Outcome", outcomesToStrings(AllOutcomes()), []string{"none", "completed", "completed_noncompliant", "failed", "timed_out", "canceled", "reaped", "interrupted", "quarantined"})
 	assertStrings(t, "PublicState", publicsToStrings(AllPublicStates()), []string{"queued", "starting", "running", "retrying", "completed", "completed_noncompliant", "interrupted", "quarantined", "failed", "timed_out", "canceled", "reaped", "orphaned"})
-	assertStrings(t, "TerminalCause", causesToStrings(AllTerminalCauses()), []string{"completed_normally", "canceled_before_authorization", "canceled_after_authorization", "daemon_restarted_before_authorization", "daemon_restarted_after_authorization", "supervisor_lost_before_authorization", "supervisor_lost_after_authorization", "corrupt_projection", "response_undeliverable", "release_outcome_unknown"})
+	assertStrings(t, "TerminalCause", causesToStrings(AllTerminalCauses()), []string{"completed_normally", "canceled_before_authorization", "canceled_after_authorization", "daemon_restarted_before_authorization", "daemon_restarted_after_authorization", "supervisor_lost_before_authorization", "supervisor_lost_after_authorization", "corrupt_projection", "response_undeliverable", "release_outcome_unknown", "release_definitely_not_sent"})
 }
 
 func TestPublicProjectionIsDefinedForReachableTuples(t *testing.T) {

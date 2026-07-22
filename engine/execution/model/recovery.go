@@ -307,6 +307,11 @@ func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger) Termin
 		intent.Cause = recordedOutcomeRecoveryCause(record.Outcome.Outcome, trigger, afterAuthorization)
 		return intent
 	}
+	if cause, ok := recordedReleaseFailureCause(record.Attempt); ok {
+		intent.Outcome = OutcomeFailed
+		intent.Cause = cause
+		return intent
+	}
 	// Without recorded outcome progress, recovery synthesizes OutcomeReaped only
 	// for launches with grant/release evidence.
 	switch trigger {
@@ -338,6 +343,22 @@ func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger) Termin
 		}
 	}
 	return intent
+}
+
+func recordedReleaseFailureCause(proof AttemptProof) (TerminalCause, bool) {
+	for _, ordinal := range proof.Launches.FilledOrdinals() {
+		launch, ok := proof.Launches.Get(ordinal)
+		if !ok || launch.ReleaseOutcome == nil {
+			continue
+		}
+		switch launch.ReleaseOutcome.Outcome {
+		case LaunchReleaseSentUnknown:
+			return CauseReleaseOutcomeUnknown, true
+		case LaunchReleaseNotSent:
+			return CauseReleaseDefinitelyNotSent, true
+		}
+	}
+	return 0, false
 }
 
 func recordedOutcomeRecoveryCause(outcome Outcome, trigger RecoveryTrigger, afterAuthorization bool) TerminalCause {

@@ -47,6 +47,98 @@ func TestLaunchControllerHappyPathOrdering(t *testing.T) {
 	}
 }
 
+func TestLaunchControllerHeldStartCancelIntentPreventsFailClosedWait(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "held-start-cancel")
+	intent := &ContainmentIntent{}
+	postRelease := make(chan struct{})
+	allowRecordRelease := make(chan struct{})
+	h.authority.beforeRecordRelease = func() error {
+		close(postRelease)
+		select {
+		case <-allowRecordRelease:
+			return nil
+		case <-time.After(time.Second):
+			return errors.New("record release hold timed out")
+		}
+	}
+	h.running.waitErr = errors.New("signal: killed")
+
+	type startResult struct {
+		process *Process
+		err     error
+	}
+	started := make(chan startResult, 1)
+	go func() {
+		request := h.request(nil)
+		request.ContainmentIntent = intent
+		process, err := h.controller.Start(ctx, request)
+		started <- startResult{process: process, err: err}
+	}()
+
+	select {
+	case <-postRelease:
+	case <-time.After(time.Second):
+		t.Fatal("Start did not reach post-release hold")
+	}
+	select {
+	case <-h.running.waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("eager wait did not start")
+	}
+
+	intent.MarkContaining()
+	h.running.allowWait()
+	select {
+	case result := <-started:
+		t.Fatalf("Start returned before registration hold was released: process=%v err=%v", result.process, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowRecordRelease)
+
+	var result startResult
+	select {
+	case result = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return after registration hold release")
+	}
+	if result.err != nil {
+		t.Fatalf("Start error = %v", result.err)
+	}
+	final, err := result.process.FinalResult(ctx)
+	if err != nil {
+		t.Fatalf("FinalResult error = %v, want cancel containment without fail-closed", err)
+	}
+	if !final.Contained {
+		t.Fatalf("final result contained = false, want true")
+	}
+	if h.authority.failStops != 0 {
+		t.Fatalf("fail stops = %d, want 0", h.authority.failStops)
+	}
+	if h.authority.recordQuiescenceCalls != 1 {
+		t.Fatalf("record quiescence calls = %d, want 1", h.authority.recordQuiescenceCalls)
+	}
+}
+
+func TestLaunchControllerWaitErrorWithoutContainmentIntentFailCloses(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "external-wait-error")
+	h.running.waitErr = errors.New("signal: killed")
+	h.authority.afterRecordRelease = h.running.allowWait
+
+	process, err := h.controller.Start(ctx, h.request(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = process.FinalResult(ctx)
+	if !errors.Is(err, ErrFailClosed) {
+		t.Fatalf("FinalResult error = %v, want ErrFailClosed", err)
+	}
+	if h.authority.failStops != 1 {
+		t.Fatalf("fail stops = %d, want 1", h.authority.failStops)
+	}
+}
+
 func TestLaunchControllerContainAndVerifyUsesCustodianPort(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, "contain-entrypoint")
@@ -863,6 +955,8 @@ type fakeAuthority struct {
 	bindErr                 error
 	grantOutcome            DurabilityOutcome
 	grantErr                error
+	recordReleaseOutcomeErr error
+	releaseOutcomeFact      model.LaunchReleaseOutcome
 	recordReleaseOutcome    DurabilityOutcome
 	recordReleaseErr        error
 	recordQuiescenceOutcome DurabilityOutcome
@@ -884,6 +978,12 @@ func (authority *fakeAuthority) BindGroup(context.Context, model.JobID, model.At
 func (authority *fakeAuthority) AllocateGrant(context.Context, model.AttemptRef, model.LaunchOrdinal) (model.LaunchGrant, DurabilityOutcome, error) {
 	authority.events.add("allocate_grant")
 	return authority.grant, authority.grantOutcome, authority.grantErr
+}
+
+func (authority *fakeAuthority) RecordReleaseOutcome(_ context.Context, _ model.JobID, _ model.AttemptRef, _ model.LaunchOrdinal, outcome model.LaunchReleaseOutcome) (DurabilityOutcome, error) {
+	authority.releaseOutcomeFact = outcome
+	authority.events.add("record_release_outcome")
+	return authority.recordReleaseOutcome, authority.recordReleaseOutcomeErr
 }
 
 func (authority *fakeAuthority) RecordRelease(context.Context, model.JobID, model.AttemptRef, model.LaunchOrdinal, model.ChildIdentity, model.Evidence) (DurabilityOutcome, error) {

@@ -1197,6 +1197,7 @@ func cloneLaunchProof(launch *model.LaunchProof) *model.LaunchProof {
 	copied := *launch
 	copied.Group = clonePtr(launch.Group)
 	copied.Grant = clonePtr(launch.Grant)
+	copied.ReleaseOutcome = clonePtr(launch.ReleaseOutcome)
 	copied.Released = clonePtr(launch.Released)
 	copied.Quiescence = clonePtr(launch.Quiescence)
 	return &copied

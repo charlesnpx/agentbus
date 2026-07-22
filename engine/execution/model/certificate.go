@@ -325,6 +325,50 @@ func (grant LaunchGrant) Validate() error {
 	return grant.GrantedBy.Validate()
 }
 
+type LaunchReleaseOutcome string
+
+const (
+	LaunchReleaseNotSent     LaunchReleaseOutcome = "not_sent"
+	LaunchReleaseSentUnknown LaunchReleaseOutcome = "sent_unknown"
+	LaunchReleaseAcked       LaunchReleaseOutcome = "acked"
+)
+
+func (outcome LaunchReleaseOutcome) Valid() bool {
+	switch outcome {
+	case LaunchReleaseNotSent, LaunchReleaseSentUnknown, LaunchReleaseAcked:
+		return true
+	default:
+		return false
+	}
+}
+
+func (outcome LaunchReleaseOutcome) Validate() error {
+	if !outcome.Valid() {
+		return invalid("launch_release_outcome", "is unknown")
+	}
+	return nil
+}
+
+type LaunchReleaseOutcomeFact struct {
+	Attempt    AttemptRef
+	Ordinal    LaunchOrdinal
+	Outcome    LaunchReleaseOutcome
+	RecordedBy BootRef
+}
+
+func (fact LaunchReleaseOutcomeFact) Validate() error {
+	if err := fact.Attempt.Validate(); err != nil {
+		return err
+	}
+	if err := fact.Ordinal.Validate(); err != nil {
+		return err
+	}
+	if err := fact.Outcome.Validate(); err != nil {
+		return err
+	}
+	return fact.RecordedBy.Validate()
+}
+
 type LaunchReleaseFact struct {
 	Attempt     AttemptRef
 	Ordinal     LaunchOrdinal

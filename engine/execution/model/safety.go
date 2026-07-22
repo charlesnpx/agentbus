@@ -76,11 +76,12 @@ func (slots LaunchSlots[T]) FilledOrdinals() []LaunchOrdinal {
 }
 
 type LaunchProof struct {
-	Ordinal    LaunchOrdinal
-	Group      *GroupRef
-	Grant      *LaunchGrant
-	Released   *LaunchReleaseFact
-	Quiescence *QuiescenceCertificate
+	Ordinal        LaunchOrdinal
+	Group          *GroupRef
+	Grant          *LaunchGrant
+	ReleaseOutcome *LaunchReleaseOutcomeFact
+	Released       *LaunchReleaseFact
+	Quiescence     *QuiescenceCertificate
 }
 
 type AttemptProof struct {
@@ -130,6 +131,17 @@ func (launch LaunchProof) Validate() error {
 			return invalid("launch_grant.ordinal", "does not match launch ordinal")
 		}
 	}
+	if launch.ReleaseOutcome != nil {
+		if err := launch.ReleaseOutcome.Validate(); err != nil {
+			return err
+		}
+		if launch.ReleaseOutcome.Ordinal != launch.Ordinal {
+			return invalid("launch_release_outcome.ordinal", "does not match launch ordinal")
+		}
+		if launch.Grant == nil {
+			return invalid("launch_release_outcome.grant", "matching grant is required")
+		}
+	}
 	if launch.Released != nil {
 		if err := launch.Released.Validate(); err != nil {
 			return err
@@ -143,6 +155,12 @@ func (launch LaunchProof) Validate() error {
 		if launch.Released.Nonce != launch.Grant.Nonce {
 			return invalid("launch_release.nonce", "does not match grant nonce")
 		}
+	}
+	if launch.ReleaseOutcome != nil && launch.Released != nil && launch.ReleaseOutcome.Outcome != LaunchReleaseAcked {
+		return invalid("launch_release_outcome.outcome", "released launch must be acked")
+	}
+	if launch.ReleaseOutcome != nil && launch.ReleaseOutcome.Outcome == LaunchReleaseAcked && launch.Released == nil {
+		return invalid("launch_release_outcome.outcome", "acked release requires release evidence")
 	}
 	if launch.Quiescence != nil {
 		if err := launch.Quiescence.Validate(); err != nil {
@@ -166,6 +184,11 @@ func validateLaunchProofAttempt(ref AttemptRef, launch LaunchProof) error {
 	}
 	if launch.Grant != nil {
 		if err := validateAttemptField("launch_grant.attempt", launch.Grant.Attempt, ref); err != nil {
+			return err
+		}
+	}
+	if launch.ReleaseOutcome != nil {
+		if err := validateAttemptField("launch_release_outcome.attempt", launch.ReleaseOutcome.Attempt, ref); err != nil {
 			return err
 		}
 	}

@@ -31,6 +31,13 @@ type CommitGrant struct {
 	GrantedBy BootRef
 }
 
+type RecordReleaseOutcome struct {
+	Ref        AttemptRef
+	Ordinal    LaunchOrdinal
+	Outcome    LaunchReleaseOutcome
+	RecordedBy BootRef
+}
+
 type RecordRelease struct {
 	Ref         AttemptRef
 	Ordinal     LaunchOrdinal
@@ -70,13 +77,14 @@ type Finalize struct {
 	Intent TerminalIntent
 }
 
-func (Acknowledge) isCommand()      {}
-func (BeginReject) isCommand()      {}
-func (BindGroup) isCommand()        {}
-func (CommitGrant) isCommand()      {}
-func (RecordRelease) isCommand()    {}
-func (RecordQuiescence) isCommand() {}
-func (RequestCancel) isCommand()    {}
-func (ObserveOutcome) isCommand()   {}
-func (CertifyResult) isCommand()    {}
-func (Finalize) isCommand()         {}
+func (Acknowledge) isCommand()          {}
+func (BeginReject) isCommand()          {}
+func (BindGroup) isCommand()            {}
+func (CommitGrant) isCommand()          {}
+func (RecordReleaseOutcome) isCommand() {}
+func (RecordRelease) isCommand()        {}
+func (RecordQuiescence) isCommand()     {}
+func (RequestCancel) isCommand()        {}
+func (ObserveOutcome) isCommand()       {}
+func (CertifyResult) isCommand()        {}
+func (Finalize) isCommand()             {}

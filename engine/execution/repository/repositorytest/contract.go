@@ -654,6 +654,18 @@ func newQuiescentFixture(t *testing.T, name string) fixture {
 	t.Helper()
 	fixture := newFixture(t, name)
 	group := fixtureGroupRef(fixture, model.LaunchOrdinalOne)
+	grant := model.LaunchGrant{
+		Attempt:   fixture.Record.Attempt.Ref,
+		Ordinal:   model.LaunchOrdinalOne,
+		Nonce:     model.LaunchNonce("nonce-" + name),
+		GrantedBy: fixture.Boot,
+	}
+	releaseOutcome := model.LaunchReleaseOutcomeFact{
+		Attempt:    fixture.Record.Attempt.Ref,
+		Ordinal:    model.LaunchOrdinalOne,
+		Outcome:    model.LaunchReleaseNotSent,
+		RecordedBy: fixture.Boot,
+	}
 	quiescence := model.QuiescenceCertificate{
 		Attempt:     fixture.Record.Attempt.Ref,
 		Ordinal:     model.LaunchOrdinalOne,
@@ -662,9 +674,11 @@ func newQuiescentFixture(t *testing.T, name string) fixture {
 		CertifiedBy: fixture.Boot,
 	}
 	fixture.Record.Attempt.Launches.First = &model.LaunchProof{
-		Ordinal:    model.LaunchOrdinalOne,
-		Group:      &group,
-		Quiescence: &quiescence,
+		Ordinal:        model.LaunchOrdinalOne,
+		Group:          &group,
+		Grant:          &grant,
+		ReleaseOutcome: &releaseOutcome,
+		Quiescence:     &quiescence,
 	}
 	if err := model.ValidateSafetyRecord(fixture.Record); err != nil {
 		t.Fatalf("quiescent fixture safety record is invalid: %v", err)
@@ -869,6 +883,7 @@ func mutateLaunchPhysicalFactForTest(t *testing.T, record *model.SafetyRecord, o
 	launch.Group.Monitor.PID += 1000
 	launch.Group.Monitor.HighResStartToken = "forged-monitor"
 	launch.Group.RetainedID = "forged-retained-" + record.JobID.String()
+	launch.ReleaseOutcome.Outcome = model.LaunchReleaseSentUnknown
 	launch.Quiescence.Group = *launch.Group
 }
 
@@ -893,6 +908,7 @@ func cloneLaunchProofForTest(launch *model.LaunchProof) *model.LaunchProof {
 	copied := *launch
 	copied.Group = clonePtrForTest(launch.Group)
 	copied.Grant = clonePtrForTest(launch.Grant)
+	copied.ReleaseOutcome = clonePtrForTest(launch.ReleaseOutcome)
 	copied.Released = clonePtrForTest(launch.Released)
 	copied.Quiescence = clonePtrForTest(launch.Quiescence)
 	return &copied

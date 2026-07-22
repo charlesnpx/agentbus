@@ -35,6 +35,7 @@ var (
 type AuthorityPort interface {
 	BindGroup(context.Context, model.JobID, model.AttemptRef, model.LaunchOrdinal, model.GroupRef) (DurabilityOutcome, error)
 	AllocateGrant(context.Context, model.AttemptRef, model.LaunchOrdinal) (model.LaunchGrant, DurabilityOutcome, error)
+	RecordReleaseOutcome(context.Context, model.JobID, model.AttemptRef, model.LaunchOrdinal, model.LaunchReleaseOutcome) (DurabilityOutcome, error)
 	RecordRelease(context.Context, model.JobID, model.AttemptRef, model.LaunchOrdinal, model.ChildIdentity, model.Evidence) (DurabilityOutcome, error)
 	RecordQuiescence(context.Context, model.JobID, model.LaunchOrdinal, custodian.VerifiedQuiescence) (DurabilityOutcome, error)
 	FailStop(context.Context, error) error
@@ -62,6 +63,29 @@ type RunningProcess interface {
 
 type waitContainmentReporter interface {
 	WaitContained() bool
+}
+
+type ContainmentIntent struct {
+	mu        sync.Mutex
+	requested bool
+}
+
+func (intent *ContainmentIntent) MarkContaining() {
+	if intent == nil {
+		return
+	}
+	intent.mu.Lock()
+	intent.requested = true
+	intent.mu.Unlock()
+}
+
+func (intent *ContainmentIntent) Requested() bool {
+	if intent == nil {
+		return false
+	}
+	intent.mu.Lock()
+	defer intent.mu.Unlock()
+	return intent.requested
 }
 
 type LaunchController struct {
@@ -106,9 +130,10 @@ func (launch LaunchContext) Key() model.LaunchKey {
 }
 
 type LaunchRequest struct {
-	Context  LaunchContext
-	Exec     command.ExecSpec
-	Failures *FailureInjector
+	Context           LaunchContext
+	Exec              command.ExecSpec
+	Failures          *FailureInjector
+	ContainmentIntent *ContainmentIntent
 }
 
 func (request LaunchRequest) Validate() error {
@@ -122,8 +147,9 @@ func (request LaunchRequest) Validate() error {
 }
 
 type RunnerBinding struct {
-	Context  LaunchContext
-	Failures *FailureInjector
+	Context           LaunchContext
+	Failures          *FailureInjector
+	ContainmentIntent *ContainmentIntent
 }
 
 func (binding RunnerBinding) Validate() error {
@@ -150,9 +176,10 @@ type boundRunner struct {
 
 func (runner boundRunner) Start(ctx context.Context, spec command.ExecSpec) (command.RunningCommand, error) {
 	return runner.controller.Start(ctx, LaunchRequest{
-		Context:  runner.binding.Context,
-		Exec:     spec,
-		Failures: runner.binding.Failures,
+		Context:           runner.binding.Context,
+		Exec:              spec,
+		Failures:          runner.binding.Failures,
+		ContainmentIntent: runner.binding.ContainmentIntent,
 	})
 }
 
@@ -208,7 +235,7 @@ func (controller *LaunchController) Start(ctx context.Context, request LaunchReq
 		return nil, controller.containGroupAndFailStop(containmentContext(ctx), group, reason)
 	}
 
-	process := newProcess(controller, containmentContext(ctx), request.Context, group, grant, running, request.Failures)
+	process := newProcess(controller, containmentContext(ctx), request.Context, group, grant, running, request.Failures, request.ContainmentIntent)
 	if err := inject(request.Failures, FailAfterRelease); err != nil {
 		return nil, process.failClosedBeforeReleaseRecord(containmentContext(ctx), err)
 	}
@@ -276,11 +303,21 @@ func (controller *LaunchController) handleReleaseOutcome(ctx context.Context, pr
 		if releaseErr != nil {
 			reason = fmt.Errorf("%w: release definitely not sent: %v", ErrReleaseUncertain, releaseErr)
 		}
+		outcome, err := controller.RecordReleaseOutcome(ctx, launch, model.LaunchReleaseNotSent)
+		if mapped := durableMutationError("record_release_outcome", outcome, err); mapped != nil {
+			abortErr := controller.abortPrepared(ctx, prepared, true, launch)
+			failReason := errors.Join(reason, mapped, abortErr)
+			return errors.Join(failReason, controller.failStop(ctx, failReason), ErrFailClosed)
+		}
 		return errors.Join(reason, controller.abortPrepared(ctx, prepared, true, launch))
 	case custodian.ReleaseOutcomeUnknown:
 		reason := ErrReleaseUncertain
 		if releaseErr != nil {
 			reason = fmt.Errorf("%w: release outcome unknown: %v", ErrReleaseUncertain, releaseErr)
+		}
+		outcome, err := controller.RecordReleaseOutcome(ctx, launch, model.LaunchReleaseSentUnknown)
+		if mapped := durableMutationError("record_release_outcome", outcome, err); mapped != nil {
+			return controller.containGroupAndFailStop(ctx, group, errors.Join(reason, mapped))
 		}
 		return controller.containRecordQuiescenceOrFailStop(ctx, launch, group, reason)
 	default:
@@ -298,6 +335,10 @@ func (controller *LaunchController) RecordRelease(ctx context.Context, launch La
 		return DefinitelyNotCommitted, err
 	}
 	return controller.authority.RecordRelease(ctx, launch.JobID, launch.Attempt, launch.Ordinal, child, evidence)
+}
+
+func (controller *LaunchController) RecordReleaseOutcome(ctx context.Context, launch LaunchContext, outcome model.LaunchReleaseOutcome) (DurabilityOutcome, error) {
+	return controller.authority.RecordReleaseOutcome(ctx, launch.JobID, launch.Attempt, launch.Ordinal, outcome)
 }
 
 func (controller *LaunchController) RecordQuiescence(ctx context.Context, launch LaunchContext, verified custodian.VerifiedQuiescence) (DurabilityOutcome, error) {
@@ -539,6 +580,7 @@ type Process struct {
 	grant      model.LaunchGrant
 	running    RunningProcess
 	failures   *FailureInjector
+	intent     *ContainmentIntent
 
 	releaseOnce  sync.Once
 	releaseState chan releaseRecordState
@@ -561,7 +603,7 @@ type Process struct {
 	finalErr error
 }
 
-func newProcess(controller *LaunchController, controlCtx context.Context, launch LaunchContext, group model.GroupRef, grant model.LaunchGrant, running RunningProcess, failures *FailureInjector) *Process {
+func newProcess(controller *LaunchController, controlCtx context.Context, launch LaunchContext, group model.GroupRef, grant model.LaunchGrant, running RunningProcess, failures *FailureInjector, intent *ContainmentIntent) *Process {
 	waitCtx, waitCancel := context.WithCancel(controlCtx)
 	process := &Process{
 		controller:   controller,
@@ -571,6 +613,7 @@ func newProcess(controller *LaunchController, controlCtx context.Context, launch
 		grant:        grant,
 		running:      running,
 		failures:     failures,
+		intent:       intent,
 		releaseState: make(chan releaseRecordState, 1),
 		waitCancel:   waitCancel,
 		waitReturned: make(chan struct{}),
@@ -686,6 +729,10 @@ func (process *Process) failClosedAfterReleaseRecord(ctx context.Context, reason
 
 func (process *Process) handlePostReleaseDurability(ctx context.Context, step string, outcome DurabilityOutcome, stepErr error) error {
 	mapped := durableMutationError(step, outcome, stepErr)
+	if step == "record_release" && mapped != nil && process.containmentRequested() && durabilityDecision(outcome) == durabilityNotCommitted && errors.Is(stepErr, model.ErrCommandPrecondition) {
+		process.disableReleaseRecord(mapped)
+		return mapped
+	}
 	switch durabilityDecision(outcome) {
 	case durabilityCommitted:
 		if mapped == nil {
@@ -743,6 +790,7 @@ func (process *Process) finalizeFromContain(ctx context.Context, cause custodian
 }
 
 func (process *Process) markContaining() {
+	process.intent.MarkContaining()
 	process.containmentMu.Lock()
 	process.containing = true
 	process.containmentMu.Unlock()
@@ -750,8 +798,9 @@ func (process *Process) markContaining() {
 
 func (process *Process) containmentRequested() bool {
 	process.containmentMu.Lock()
-	defer process.containmentMu.Unlock()
-	return process.containing
+	containing := process.containing
+	process.containmentMu.Unlock()
+	return containing || process.intent.Requested()
 }
 
 func (process *Process) finalizeWithVerified(ctx context.Context, exit command.ExitObservation, verified custodian.VerifiedQuiescence, contained bool, verifiedOK bool, reconcileErr error) {

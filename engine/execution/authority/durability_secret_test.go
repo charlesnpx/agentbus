@@ -151,6 +151,11 @@ func (a liveSecretAuthorityPort) AllocateGrant(ctx context.Context, ref model.At
 	return a.ready.AllocateGrant(ctx, ref, ordinal)
 }
 
+func (a liveSecretAuthorityPort) RecordReleaseOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, outcome model.LaunchReleaseOutcome) (launch.DurabilityOutcome, error) {
+	applied, err := a.ready.RecordReleaseOutcome(ctx, jobID, ref, ordinal, outcome)
+	return applied.Durability, err
+}
+
 func (a liveSecretAuthorityPort) RecordRelease(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, child model.ChildIdentity, evidence model.Evidence) (launch.DurabilityOutcome, error) {
 	applied, err := a.ready.RecordRelease(ctx, jobID, ref, ordinal, child, evidence)
 	return applied.Durability, err

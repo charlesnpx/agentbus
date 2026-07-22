@@ -48,6 +48,12 @@ func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
 			command: RecordRelease{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Child: reducerChild(21)},
 		},
 		{
+			name:    "record release outcome",
+			valid:   reducerGrantRecord(t),
+			invalid: reducerSupervisorRecord(),
+			command: RecordReleaseOutcome{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Outcome: LaunchReleaseNotSent},
+		},
+		{
 			name:    "record quiescence",
 			valid:   reducerConsumedRecord(t),
 			invalid: reducerBaseRecord(),
@@ -142,6 +148,12 @@ func TestApplyRejectsConflictingDuplicates(t *testing.T) {
 			record:   reducerSupervisorRecord(),
 			first:    CommitGrant{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Nonce: "nonce-1"},
 			conflict: CommitGrant{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Nonce: "nonce-other"},
+		},
+		{
+			name:     "release outcome",
+			record:   reducerGrantRecord(t),
+			first:    RecordReleaseOutcome{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Outcome: LaunchReleaseNotSent},
+			conflict: RecordReleaseOutcome{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Outcome: LaunchReleaseSentUnknown},
 		},
 		{
 			name:     "outcome",
@@ -279,14 +291,29 @@ func TestStaleActionReceiptCannotCertifyDifferentAttemptOrGroup(t *testing.T) {
 	}
 }
 
+func TestRecordReleaseStampsAckedReleaseOutcome(t *testing.T) {
+	record := reducerConsumedRecord(t)
+	launch, ok := record.Attempt.Launches.Get(LaunchOrdinalOne)
+	if !ok || launch.ReleaseOutcome == nil {
+		t.Fatal("release outcome was not recorded")
+	}
+	if launch.ReleaseOutcome.Outcome != LaunchReleaseAcked {
+		t.Fatalf("release outcome = %s, want %s", launch.ReleaseOutcome.Outcome, LaunchReleaseAcked)
+	}
+	if launch.ReleaseOutcome.RecordedBy != record.AdmittedBy {
+		t.Fatalf("release outcome recorded_by = %+v, want admitted_by %+v", launch.ReleaseOutcome.RecordedBy, record.AdmittedBy)
+	}
+}
+
 func TestApplyDeepClonesLaunchProofPointers(t *testing.T) {
 	record := reducerConsumedRecord(t)
 	inputLaunch, ok := record.Attempt.Launches.Get(LaunchOrdinalOne)
-	if !ok || inputLaunch.Group == nil || inputLaunch.Grant == nil || inputLaunch.Released == nil {
+	if !ok || inputLaunch.Group == nil || inputLaunch.Grant == nil || inputLaunch.ReleaseOutcome == nil || inputLaunch.Released == nil {
 		t.Fatal("input launch proof is incomplete")
 	}
 	beforeGroup := *inputLaunch.Group
 	beforeGrant := *inputLaunch.Grant
+	beforeReleaseOutcome := *inputLaunch.ReleaseOutcome
 	beforeRelease := *inputLaunch.Released
 
 	result, err := apply(record, reducerQuiescenceCommand(t, record, LaunchOrdinalOne))
@@ -294,13 +321,14 @@ func TestApplyDeepClonesLaunchProofPointers(t *testing.T) {
 		t.Fatalf("record quiescence error = %v", err)
 	}
 	outputLaunch, ok := result.Record.Attempt.Launches.Get(LaunchOrdinalOne)
-	if !ok || outputLaunch.Group == nil || outputLaunch.Grant == nil || outputLaunch.Released == nil || outputLaunch.Quiescence == nil {
+	if !ok || outputLaunch.Group == nil || outputLaunch.Grant == nil || outputLaunch.ReleaseOutcome == nil || outputLaunch.Released == nil || outputLaunch.Quiescence == nil {
 		t.Fatal("output launch proof is incomplete")
 	}
 	outputLaunch.Group.PGID++
 	outputLaunch.Group.Leader.PID++
 	outputLaunch.Group.Leader.HighResStartToken = "forged-leader"
 	outputLaunch.Grant.Nonce = "forged-nonce"
+	outputLaunch.ReleaseOutcome.Outcome = LaunchReleaseSentUnknown
 	outputLaunch.Released.Child.PID++
 	outputLaunch.Released.Child.HighResStartToken = "forged-child"
 	outputLaunch.Quiescence.Group = *outputLaunch.Group
@@ -310,6 +338,9 @@ func TestApplyDeepClonesLaunchProofPointers(t *testing.T) {
 	}
 	if *inputLaunch.Grant != beforeGrant {
 		t.Fatalf("input grant mutated through output alias: %#v, want %#v", *inputLaunch.Grant, beforeGrant)
+	}
+	if *inputLaunch.ReleaseOutcome != beforeReleaseOutcome {
+		t.Fatalf("input release outcome mutated through output alias: %#v, want %#v", *inputLaunch.ReleaseOutcome, beforeReleaseOutcome)
 	}
 	if *inputLaunch.Released != beforeRelease {
 		t.Fatalf("input release mutated through output alias: %#v, want %#v", *inputLaunch.Released, beforeRelease)
@@ -424,6 +455,32 @@ func TestDeriveTerminalCertificateSelectsProofs(t *testing.T) {
 	}
 }
 
+func TestRecordedReleaseOutcomeSelectsContainedFailureCause(t *testing.T) {
+	tests := []struct {
+		name           string
+		releaseOutcome LaunchReleaseOutcome
+		cause          TerminalCause
+	}{
+		{name: "not sent", releaseOutcome: LaunchReleaseNotSent, cause: CauseReleaseDefinitelyNotSent},
+		{name: "sent unknown", releaseOutcome: LaunchReleaseSentUnknown, cause: CauseReleaseOutcomeUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			record := reducerGrantRecord(t)
+			record = reducerMustApply(t, record, RecordReleaseOutcome{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Outcome: tt.releaseOutcome})
+			record = reducerMustApply(t, record, reducerContainmentCommand(t, record))
+
+			finalized, err := apply(record, Finalize{Ref: reducerRef(), Intent: TerminalIntent{Outcome: OutcomeFailed, Cause: tt.cause}})
+			if err != nil {
+				t.Fatalf("Finalize error = %v", err)
+			}
+			if finalized.Record.Terminal == nil || finalized.Record.Terminal.Cause != tt.cause {
+				t.Fatalf("terminal = %#v, want cause %s", finalized.Record.Terminal, tt.cause)
+			}
+		})
+	}
+}
+
 func TestPostGrantRecoveryTerminalizesFromAnyVerifiedQuiescenceMethod(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -451,6 +508,35 @@ func TestPostGrantRecoveryTerminalizesFromAnyVerifiedQuiescenceMethod(t *testing
 			}
 			if finalized.Record.Terminal == nil || finalized.Record.Terminal.Proof != ProofContained {
 				t.Fatalf("terminal = %#v, want contained proof", finalized.Record.Terminal)
+			}
+		})
+	}
+}
+
+func TestPlanRecoveryUsesRecordedReleaseOutcomeCause(t *testing.T) {
+	tests := []struct {
+		name           string
+		releaseOutcome LaunchReleaseOutcome
+		cause          TerminalCause
+	}{
+		{name: "not sent", releaseOutcome: LaunchReleaseNotSent, cause: CauseReleaseDefinitelyNotSent},
+		{name: "sent unknown", releaseOutcome: LaunchReleaseSentUnknown, cause: CauseReleaseOutcomeUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			record := reducerGrantRecord(t)
+			record = reducerMustApply(t, record, RecordReleaseOutcome{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Outcome: tt.releaseOutcome})
+			record = reducerMustApply(t, record, reducerContainmentCommand(t, record))
+
+			plan, err := PlanRecovery(record, RecoveryStartupLoss)
+			if err != nil {
+				t.Fatalf("PlanRecovery error = %v", err)
+			}
+			if plan.Next.Kind != RecoveryFinalizeCertified || plan.Next.Finalize == nil {
+				t.Fatalf("plan = %#v, want finalize-certified action", plan.Next)
+			}
+			if plan.Next.Finalize.Intent.Outcome != OutcomeFailed || plan.Next.Finalize.Intent.Cause != tt.cause {
+				t.Fatalf("finalize intent = %+v, want failed/%s", plan.Next.Finalize.Intent, tt.cause)
 			}
 		})
 	}

@@ -497,29 +497,31 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 	if !ok {
 		return fmt.Errorf("cannot complete admission job %s with state %s", run.jobID, state)
 	}
-	if outcome == model.OutcomeFailed && admissionReleaseUnknownProved(snapshot.Record) {
-		return coord.Finalize(context.Background(), jobID, model.TerminalIntent{
-			Outcome: model.OutcomeFailed,
-			Cause:   model.CauseReleaseOutcomeUnknown,
-		})
+	if outcome == model.OutcomeFailed {
+		if intent, ok := admissionRecordedReleaseFailureIntent(snapshot.Record); ok {
+			return coord.Finalize(context.Background(), jobID, intent)
+		}
 	}
 	return coord.Complete(context.Background(), jobID, outcome, []byte(text), nil)
 }
 
-func admissionReleaseUnknownProved(record model.SafetyRecord) bool {
+func admissionRecordedReleaseFailureIntent(record model.SafetyRecord) (model.TerminalIntent, bool) {
 	if record.Terminal != nil {
-		return false
+		return model.TerminalIntent{}, false
 	}
 	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
 		launch, ok := record.Attempt.Launches.Get(ordinal)
-		if !ok {
+		if !ok || launch.ReleaseOutcome == nil {
 			continue
 		}
-		if launch.Group != nil && launch.Grant != nil && launch.Released == nil && launch.Quiescence != nil {
-			return true
+		switch launch.ReleaseOutcome.Outcome {
+		case model.LaunchReleaseSentUnknown:
+			return model.TerminalIntent{Outcome: model.OutcomeFailed, Cause: model.CauseReleaseOutcomeUnknown}, true
+		case model.LaunchReleaseNotSent:
+			return model.TerminalIntent{Outcome: model.OutcomeFailed, Cause: model.CauseReleaseDefinitelyNotSent}, true
 		}
 	}
-	return false
+	return model.TerminalIntent{}, false
 }
 
 func admissionOutcomeForState(state engine.JobState) (model.Outcome, bool) {

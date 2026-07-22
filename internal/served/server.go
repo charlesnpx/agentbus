@@ -26,6 +26,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/internal/protocol"
@@ -195,16 +196,21 @@ type activeJob struct {
 	session    engine.Session
 	cancel     context.CancelFunc
 
-	mu               sync.Mutex
-	terminal         engine.JobState
-	admissionCommand command.RunningCommand
+	mu                sync.Mutex
+	terminal          engine.JobState
+	admissionCommand  command.RunningCommand
+	containmentIntent *launch.ContainmentIntent
 }
 
 func (j *activeJob) requestTerminal(state engine.JobState) {
 	j.mu.Lock()
-	defer j.mu.Unlock()
 	if j.terminal == "" {
 		j.terminal = state
+	}
+	intent := j.containmentIntent
+	j.mu.Unlock()
+	if state == engine.StateCanceled {
+		intent.MarkContaining()
 	}
 }
 
@@ -221,7 +227,11 @@ func (j *activeJob) recordAdmissionCommand(cmd command.RunningCommand) bool {
 	j.mu.Lock()
 	j.admissionCommand = cmd
 	shouldInterrupt := j.terminal == engine.StateCanceled
+	intent := j.containmentIntent
 	j.mu.Unlock()
+	if shouldInterrupt {
+		intent.MarkContaining()
+	}
 	return shouldInterrupt
 }
 

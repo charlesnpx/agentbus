@@ -40,6 +40,8 @@ var admissionDetachedCleanupTimeout = 30 * time.Second
 
 var ErrRuntimeConsumed = errors.New("admission runtime consumed")
 
+var admissionRecordReleaseBeforeCommitForTest func() error
+
 type admissionClosingError struct{}
 
 func (admissionClosingError) Error() string { return "admission authority is shutting down" }
@@ -973,9 +975,10 @@ func admissionBackendControlledRunner(backend engine.Backend) bool {
 }
 
 type admissionLaunchBinding struct {
-	coordinator *servedSubmissionCoordinator
-	jobID       model.JobID
-	attempt     model.AttemptRef
+	coordinator       *servedSubmissionCoordinator
+	jobID             model.JobID
+	attempt           model.AttemptRef
+	containmentIntent *launch.ContainmentIntent
 }
 
 type ordinalBoundSession interface {
@@ -1075,6 +1078,7 @@ func (c *servedSubmissionCoordinator) LaunchRunner(binding admissionLaunchBindin
 			Attempt: binding.attempt,
 			Ordinal: ordinal,
 		},
+		ContainmentIntent: binding.containmentIntent,
 	})
 }
 
@@ -1413,12 +1417,25 @@ func (cmd *legacyFencedCommand) grantAndRelease(ctx context.Context) error {
 		if err != nil {
 			mapped = fmt.Errorf("%w: release definitely not sent: %v", launch.ErrReleaseUncertain, err)
 		}
+		cleanupCtx, cleanupCancel := detachedAdmissionCleanupContext(ctx)
+		outcome, recordErr := cmd.coordinator.launch.RecordReleaseOutcome(cleanupCtx, cmd.launchContext, model.LaunchReleaseNotSent)
+		cleanupCancel()
+		if releaseOutcomeErr := admissionDurabilityError("record_release_outcome", outcome, recordErr); releaseOutcomeErr != nil {
+			mapped = errors.Join(mapped, releaseOutcomeErr)
+		}
 		cmd.failPrepared(ctx, mapped)
 		return mapped
 	case custodian.ReleaseOutcomeUnknown:
 		mapped := launch.ErrReleaseUncertain
 		if err != nil {
 			mapped = fmt.Errorf("%w: release outcome unknown: %v", launch.ErrReleaseUncertain, err)
+		}
+		cleanupCtx, cleanupCancel := detachedAdmissionCleanupContext(ctx)
+		outcome, recordErr := cmd.coordinator.launch.RecordReleaseOutcome(cleanupCtx, cmd.launchContext, model.LaunchReleaseSentUnknown)
+		cleanupCancel()
+		if releaseOutcomeErr := admissionDurabilityError("record_release_outcome", outcome, recordErr); releaseOutcomeErr != nil {
+			cmd.failReleasedByGroup(ctx, errors.Join(mapped, releaseOutcomeErr))
+			return errors.Join(mapped, releaseOutcomeErr)
 		}
 		cmd.finalizeReleaseUnknown(ctx, mapped)
 		return mapped
@@ -1755,9 +1772,22 @@ func (a servedLaunchAuthority) AllocateGrant(ctx context.Context, ref model.Atte
 	return a.ready.AllocateGrant(ctx, ref, ordinal)
 }
 
+func (a servedLaunchAuthority) RecordReleaseOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, outcome model.LaunchReleaseOutcome) (launch.DurabilityOutcome, error) {
+	if a.ready == nil {
+		return launch.DefinitelyNotCommitted, authority.ErrNotReady
+	}
+	applied, err := a.ready.RecordReleaseOutcome(ctx, jobID, ref, ordinal, outcome)
+	return applied.Durability, err
+}
+
 func (a servedLaunchAuthority) RecordRelease(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, child model.ChildIdentity, evidence model.Evidence) (launch.DurabilityOutcome, error) {
 	if a.ready == nil {
 		return launch.DefinitelyNotCommitted, authority.ErrNotReady
+	}
+	if admissionRecordReleaseBeforeCommitForTest != nil {
+		if err := admissionRecordReleaseBeforeCommitForTest(); err != nil {
+			return launch.DefinitelyNotCommitted, err
+		}
 	}
 	applied, err := a.ready.RecordRelease(ctx, jobID, ref, ordinal, child, evidence)
 	return applied.Durability, err
@@ -2154,6 +2184,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	}
 	s.mu.Unlock()
 	s.markAdmissionJob(jobID)
+	containmentIntent := &launch.ContainmentIntent{}
 	run := jobRun{
 		jobID:               jobID,
 		sessionID:           admissionSessionID,
@@ -2174,9 +2205,10 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		admissionMode:       model.ModeIdentifiedFenced,
 		admissionAccepted:   accepted,
 		admissionLaunch: admissionLaunchBinding{
-			coordinator: instance.submission,
-			jobID:       jobModelID,
-			attempt:     accepted.Record.Attempt.Ref,
+			coordinator:       instance.submission,
+			jobID:             jobModelID,
+			attempt:           accepted.Record.Attempt.Ref,
+			containmentIntent: containmentIntent,
 		},
 	}
 	return requestOutcome{
@@ -2411,7 +2443,7 @@ func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobR
 		return run, nil, false, errors.New("admission session is not ready")
 	}
 	runCtx, cancel := context.WithCancel(ctx)
-	activeJob := &activeJob{jobID: run.jobID, sessionID: run.sessionID, session: run.session, cancel: cancel}
+	activeJob := &activeJob{jobID: run.jobID, sessionID: run.sessionID, session: run.session, cancel: cancel, containmentIntent: run.admissionLaunch.containmentIntent}
 	run.active = activeJob
 	s.addActiveJob(activeJob)
 	return run, runCtx, true, nil

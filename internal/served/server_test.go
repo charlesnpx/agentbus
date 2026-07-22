@@ -2174,7 +2174,8 @@ func TestLegacyFencedReleaseUnknownContainsWithDetachedContextWhenCanceled(t *te
 		t.Fatalf("legacy fenced release-unknown launch proof = %+v, want grant and verified quiescence", first)
 	}
 	if safety.Terminal == nil || safety.Terminal.Outcome != model.OutcomeFailed || safety.Terminal.Cause != model.CauseReleaseOutcomeUnknown {
-		t.Fatalf("legacy fenced release-unknown terminal = %+v, want failed release_outcome_unknown", safety.Terminal)
+		outcomes, errs := recorder.recordReleaseOutcomeObservations()
+		t.Fatalf("legacy fenced release-unknown terminal = %+v launch=%+v release_outcomes=%+v release_outcome_errs=%+v, want failed release_outcome_unknown", safety.Terminal, first, outcomes, errs)
 	}
 	_, finalErr := cmd.result()
 	if !errors.Is(finalErr, launch.ErrReleaseUncertain) || errors.Is(finalErr, launch.ErrFailClosed) {
@@ -2583,6 +2584,69 @@ func TestIdentifiedFencedCancelUsesAuthorityWhenAdmissionMarkerCleared(t *testin
 		t.Fatalf("authority launch %s was not contained by active command interrupt", first.Group.CustodyID)
 	}
 	assertNoJSONJobRecord(t, server, submitted.JobID)
+}
+
+func TestAuthorityJobCancelHeldStartPostReleasePreRegistration(t *testing.T) {
+	backend := newFakeBackend("fake")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitAndVerify = make(chan struct{})
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, launcher)
+
+	recordReleaseEntered := make(chan struct{})
+	allowRecordRelease := make(chan struct{})
+	var enteredOnce sync.Once
+	setAdmissionRecordReleaseBeforeCommitHookForTest(t, func() error {
+		enteredOnce.Do(func() { close(recordReleaseEntered) })
+		select {
+		case <-allowRecordRelease:
+			return nil
+		case <-time.After(time.Second):
+			return errors.New("held record release timed out")
+		}
+	})
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-authority-cancel-held-start",
+		RequestID:    "request-authority-cancel-held-start",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+
+	select {
+	case <-recordReleaseEntered:
+	case <-time.After(time.Second):
+		t.Fatal("launch Start did not reach post-release/pre-registration hold")
+	}
+
+	canceled := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: submitted.JobID})
+	if canceled.JobID != submitted.JobID || canceled.State != engine.StateCanceled {
+		t.Fatalf("authority cancel = %+v, want canceled job %s", canceled, submitted.JobID)
+	}
+	close(allowRecordRelease)
+
+	record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+		t.Fatalf("authority terminal = %+v, want canceled after authorization", record.Terminal)
+	}
+	if reason := server.safetyLatch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+	first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || first.Quiescence == nil || first.Quiescence.Method != model.QuiescenceTermKill {
+		t.Fatalf("authority launch proof = %+v, want contained quiescence", first)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	after := loadAdmissionSafetyRecord(t, server, submitted.JobID)
+	if after.Terminal == nil || after.Terminal.Outcome != model.OutcomeCanceled || after.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+		t.Fatalf("authority terminal after held Start resumed = %+v, want unchanged canceled terminal", after.Terminal)
+	}
+	if reason := server.safetyLatch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped after held Start resumed: %v", reason)
+	}
 }
 
 func TestAdmissionActiveRunnerInterruptsCommandForAuthorityCancel(t *testing.T) {
@@ -5309,6 +5373,8 @@ type recordingLegacyLaunchAuthority struct {
 	mu                           sync.Mutex
 	recordQuiescenceCtxErrs      []error
 	recordQuiescenceCtxDeadlines []bool
+	recordReleaseOutcomes        []model.LaunchReleaseOutcome
+	recordReleaseOutcomeErrs     []error
 }
 
 func (a *recordingLegacyLaunchAuthority) BindGroup(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, group model.GroupRef) (launch.DurabilityOutcome, error) {
@@ -5318,6 +5384,15 @@ func (a *recordingLegacyLaunchAuthority) BindGroup(ctx context.Context, jobID mo
 
 func (a *recordingLegacyLaunchAuthority) AllocateGrant(ctx context.Context, ref model.AttemptRef, ordinal model.LaunchOrdinal) (model.LaunchGrant, launch.DurabilityOutcome, error) {
 	return a.ready.AllocateGrant(ctx, ref, ordinal)
+}
+
+func (a *recordingLegacyLaunchAuthority) RecordReleaseOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, outcome model.LaunchReleaseOutcome) (launch.DurabilityOutcome, error) {
+	applied, err := a.ready.RecordReleaseOutcome(ctx, jobID, ref, ordinal, outcome)
+	a.mu.Lock()
+	a.recordReleaseOutcomes = append(a.recordReleaseOutcomes, outcome)
+	a.recordReleaseOutcomeErrs = append(a.recordReleaseOutcomeErrs, err)
+	a.mu.Unlock()
+	return applied.Durability, err
 }
 
 func (a *recordingLegacyLaunchAuthority) RecordRelease(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, child model.ChildIdentity, evidence model.Evidence) (launch.DurabilityOutcome, error) {
@@ -5346,6 +5421,12 @@ func (a *recordingLegacyLaunchAuthority) recordQuiescenceContextObservations() (
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]error(nil), a.recordQuiescenceCtxErrs...), append([]bool(nil), a.recordQuiescenceCtxDeadlines...)
+}
+
+func (a *recordingLegacyLaunchAuthority) recordReleaseOutcomeObservations() ([]model.LaunchReleaseOutcome, []error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]model.LaunchReleaseOutcome(nil), a.recordReleaseOutcomes...), append([]error(nil), a.recordReleaseOutcomeErrs...)
 }
 
 func acceptIdentifiedAuthorityWork(t *testing.T, server *Server, requestID string) authority.AcceptResult {
@@ -5906,6 +5987,15 @@ func clearAdmissionJobMarkersForTest(t *testing.T, server *Server) {
 	server.mu.Lock()
 	server.admissionJobs = make(map[string]struct{})
 	server.mu.Unlock()
+}
+
+func setAdmissionRecordReleaseBeforeCommitHookForTest(t *testing.T, hook func() error) {
+	t.Helper()
+	previous := admissionRecordReleaseBeforeCommitForTest
+	admissionRecordReleaseBeforeCommitForTest = hook
+	t.Cleanup(func() {
+		admissionRecordReleaseBeforeCommitForTest = previous
+	})
 }
 
 func jobStatusViaHandler(t *testing.T, server *Server, params protocol.JobStatusParams) protocol.JobStatusResult {

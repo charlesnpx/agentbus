@@ -131,7 +131,7 @@ func validContainedIntent(intent TerminalIntent) bool {
 		return intent.Outcome == OutcomeReaped
 	case CauseCorruptProjection:
 		return intent.Outcome == OutcomeQuarantined
-	case CauseReleaseOutcomeUnknown:
+	case CauseReleaseOutcomeUnknown, CauseReleaseDefinitelyNotSent:
 		return intent.Outcome == OutcomeFailed
 	default:
 		return false

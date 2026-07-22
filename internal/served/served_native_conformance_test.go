@@ -36,13 +36,15 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/containment"
-	"github.com/charlesnpx/agentbus/internal/procgroup"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 	"golang.org/x/sys/unix"
 )
 
 //go:linkname parklaunchReleaseAfterSendBeforeAckForTest github.com/charlesnpx/agentbus/internal/parklaunch.releaseAfterSendBeforeAckForTest
 var parklaunchReleaseAfterSendBeforeAckForTest func(func() error) error
+
+//go:linkname authorityAllocateGrantBeforeCommitForTest github.com/charlesnpx/agentbus/engine/execution/authority.allocateGrantBeforeCommitForTest
+var authorityAllocateGrantBeforeCommitForTest func() error
 
 const (
 	servedNativeBackendName              = "codex"
@@ -278,12 +280,35 @@ func TestServedStrictCompositionIdentifiedSubmitReplayConformance(t *testing.T) 
 }
 
 func TestServedStrictCompositionNoExecBeforeGrantConformance(t *testing.T) {
+	grantHoldEntered := make(chan struct{})
+	releaseGrant := make(chan struct{})
+	var hookCalls atomic.Int32
+	setServedNativeAllocateGrantBeforeCommitHook(t, func() error {
+		call := hookCalls.Add(1)
+		if call != 1 {
+			return nil
+		}
+		close(grantHoldEntered)
+		select {
+		case <-releaseGrant:
+			return nil
+		case <-time.After(10 * time.Second):
+			return errors.New("served native pre-grant hold timed out")
+		}
+	})
 	server, h, fixture := startServedNativeStrictServer(t, shortTempDir(t), shortTempDir(t), nil)
 	conn, reader := servedNativeRPC(t, h)
 	defer conn.Close()
 	startedPath := filepath.Join(h.root, "no-exec-before-grant-started")
 	assertServedNativeCodexExecutionCount(t, fixture, 0)
 	submitted := submitServedNativeJobOnConn(t, conn, reader, "no-exec-before-grant", h.cwd, servedNativeFixtureModeHold, servedNativeStartedTags(startedPath))
+	select {
+	case <-grantHoldEntered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("authority grant commit hook did not fire")
+	}
+	assertServedNativePathAbsentFor(t, startedPath, 200*time.Millisecond)
+	close(releaseGrant)
 	assertServedNativeExecWaitsForGrantRelease(t, server, submitted.JobID, startedPath, 10*time.Second)
 	executions := waitServedNativeCodexExecutions(t, fixture, 1, 10*time.Second)
 	resp := rpc(t, conn, reader, "cancel-no-exec", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: submitted.JobID})
@@ -799,6 +824,15 @@ func setServedNativeReleaseAfterSendBeforeAckHook(t *testing.T, hook func(func()
 	})
 }
 
+func setServedNativeAllocateGrantBeforeCommitHook(t *testing.T, hook func() error) {
+	t.Helper()
+	previous := authorityAllocateGrantBeforeCommitForTest
+	authorityAllocateGrantBeforeCommitForTest = hook
+	t.Cleanup(func() {
+		authorityAllocateGrantBeforeCommitForTest = previous
+	})
+}
+
 func submitServedNativeJobOnConn(t *testing.T, conn net.Conn, reader *bufio.Reader, requestSuffix, cwd, prompt string, tags map[string]string) protocol.JobSubmitResult {
 	t.Helper()
 	resp := rpc(t, conn, reader, "submit-"+requestSuffix, protocol.MethodJobSubmit, servedNativeSubmitParams(requestSuffix, cwd, prompt, tags))
@@ -1184,6 +1218,19 @@ func assertServedNativeCodexExecutionCount(t *testing.T, fixture servedNativeCod
 	}
 }
 
+func assertServedNativePathAbsentFor(t *testing.T, path string, interval time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(interval)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			t.Fatalf("path %s exists while pre-grant commit is held", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat path %s: %v", path, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func waitServedNativeAdmissionTerminal(t *testing.T, server *Server, jobID string, timeout time.Duration) model.SafetyRecord {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -1330,29 +1377,76 @@ func servedNativeIndependentGroupAbsent(group model.GroupRef) (bool, string, err
 	if killErr != nil && !killAbsent && !errors.Is(killErr, unix.EPERM) {
 		return false, "", killErr
 	}
-	claim, err := procgroup.NewGroupClaim(group.PGID, group.KernelDomain())
+	leaderAbsent, leaderDetail, err := servedNativeExactLeaderAbsent(group)
 	if err != nil {
 		return false, "", err
 	}
-	classified := procgroup.ClassifyGroup(claim)
-	leaderAbsent := servedNativeExactPIDAbsent(group.Leader)
 	cgroupPIDs, cgroupDetail, err := servedNativeRetainedCgroupPIDs(group.RetainedID)
 	if err != nil {
 		return false, "", err
 	}
-	detail := fmt.Sprintf("kill0=%v procgroup=%s leader_absent=%t cgroup=%s", killErr, classified, leaderAbsent, cgroupDetail)
-	return killAbsent && classified == model.GroupAbsent && leaderAbsent && len(cgroupPIDs) == 0, detail, nil
+	detail := fmt.Sprintf("kill0=%v leader=%s cgroup=%s", killErr, leaderDetail, cgroupDetail)
+	return killAbsent && leaderAbsent && len(cgroupPIDs) == 0, detail, nil
 }
 
-func servedNativeExactPIDAbsent(identity model.ProcessIdentity) bool {
+func servedNativeExactLeaderAbsent(group model.GroupRef) (bool, string, error) {
+	identity := group.Leader
 	if identity.PID <= 0 {
-		return true
+		return true, "leader=invalid", nil
 	}
-	claim, err := procgroup.ReadProcessClaim(identity.PID)
+	snapshot, err := readServedNativeProcStat(identity.PID)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, "leader_stat=missing", nil
+	}
 	if err != nil {
-		return true
+		return false, "", err
 	}
-	return claim.StartToken.String() != identity.HighResStartToken
+	matches := snapshot.PID == identity.PID && snapshot.PGID == group.PGID && snapshot.StartTime == identity.HighResStartToken
+	return !matches, fmt.Sprintf("leader_pid=%d pgid=%d starttime=%s matches=%t", snapshot.PID, snapshot.PGID, snapshot.StartTime, matches), nil
+}
+
+type servedNativeProcStat struct {
+	PID       int
+	PGID      int
+	StartTime string
+}
+
+func readServedNativeProcStat(pid int) (servedNativeProcStat, error) {
+	raw, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return servedNativeProcStat{}, err
+	}
+	return parseServedNativeProcStat(string(raw))
+}
+
+func parseServedNativeProcStat(stat string) (servedNativeProcStat, error) {
+	stat = strings.TrimSpace(stat)
+	rightParen := strings.LastIndex(stat, ")")
+	if rightParen < 0 {
+		return servedNativeProcStat{}, errors.New("proc stat missing command terminator")
+	}
+	leftParen := strings.Index(stat[:rightParen+1], "(")
+	if leftParen < 0 {
+		return servedNativeProcStat{}, errors.New("proc stat missing command start")
+	}
+	pidField := strings.TrimSpace(stat[:leftParen])
+	pid, err := strconv.Atoi(pidField)
+	if err != nil || pid <= 0 {
+		return servedNativeProcStat{}, fmt.Errorf("proc stat invalid pid %q", pidField)
+	}
+	fields := strings.Fields(stat[rightParen+1:])
+	if len(fields) < 20 {
+		return servedNativeProcStat{}, fmt.Errorf("proc stat too short: got %d fields after command", len(fields))
+	}
+	pgid, err := strconv.Atoi(fields[2])
+	if err != nil || pgid <= 0 {
+		return servedNativeProcStat{}, fmt.Errorf("proc stat invalid pgid %q", fields[2])
+	}
+	startTime := fields[19]
+	if _, err := strconv.ParseUint(startTime, 10, 64); err != nil {
+		return servedNativeProcStat{}, fmt.Errorf("proc stat invalid starttime %q", startTime)
+	}
+	return servedNativeProcStat{PID: pid, PGID: pgid, StartTime: startTime}, nil
 }
 
 func servedNativeRetainedCgroupPIDs(retainedID string) ([]int, string, error) {

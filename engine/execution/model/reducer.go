@@ -46,6 +46,10 @@ func ApplyCommitGrant(current SafetyRecord, command CommitGrant) (ApplyResult, e
 	return apply(current, command)
 }
 
+func ApplyRecordReleaseOutcome(current SafetyRecord, command RecordReleaseOutcome) (ApplyResult, error) {
+	return apply(current, command)
+}
+
 func ApplyRecordRelease(current SafetyRecord, command RecordRelease) (ApplyResult, error) {
 	return apply(current, command)
 }
@@ -109,6 +113,8 @@ func applyOpen(next *SafetyRecord, current SafetyRecord, command any) (bool, err
 		return applyBindGroup(next, current, c)
 	case CommitGrant:
 		return applyCommitGrant(next, current, c)
+	case RecordReleaseOutcome:
+		return applyRecordReleaseOutcome(next, current, c)
 	case RecordRelease:
 		return applyRecordRelease(next, current, c)
 	case RecordQuiescence:
@@ -263,6 +269,47 @@ func applyCommitGrant(next *SafetyRecord, current SafetyRecord, command CommitGr
 	return replaceLaunchSlot(&next.Attempt.Launches, command.Ordinal, nextLaunch)
 }
 
+func applyRecordReleaseOutcome(next *SafetyRecord, current SafetyRecord, command RecordReleaseOutcome) (bool, error) {
+	if err := ensureAttempt(current, command.Ref); err != nil {
+		return false, err
+	}
+	if err := command.Ordinal.Validate(); err != nil {
+		return false, invalidCommand("launch ordinal: %v", err)
+	}
+	if err := command.Outcome.Validate(); err != nil {
+		return false, invalidCommand("launch release outcome: %v", err)
+	}
+	recordedBy, err := resolveBootRef(command.RecordedBy, current.AdmittedBy, "launch_release_outcome.recorded_by")
+	if err != nil {
+		return false, err
+	}
+	launch, ok := current.Attempt.Launches.Get(command.Ordinal)
+	if !ok || launch.Grant == nil {
+		return false, precondition("launch release outcome requires matching grant")
+	}
+	if command.Outcome == LaunchReleaseAcked && launch.Released == nil {
+		return false, precondition("acked launch release outcome requires release evidence")
+	}
+	if command.Outcome != LaunchReleaseAcked && launch.Released != nil {
+		return false, conflict("launch release outcome contradicts release evidence")
+	}
+	fact := LaunchReleaseOutcomeFact{
+		Attempt:    current.Attempt.Ref,
+		Ordinal:    command.Ordinal,
+		Outcome:    command.Outcome,
+		RecordedBy: recordedBy,
+	}
+	if launch.ReleaseOutcome != nil {
+		if *launch.ReleaseOutcome == fact {
+			return false, nil
+		}
+		return false, conflict("launch release outcome already recorded with different evidence")
+	}
+	nextLaunch := *cloneLaunchProof(launch)
+	nextLaunch.ReleaseOutcome = &fact
+	return replaceLaunchSlot(&next.Attempt.Launches, command.Ordinal, nextLaunch)
+}
+
 func applyRecordRelease(next *SafetyRecord, current SafetyRecord, command RecordRelease) (bool, error) {
 	if err := ensureAttempt(current, command.Ref); err != nil {
 		return false, err
@@ -302,8 +349,22 @@ func applyRecordRelease(next *SafetyRecord, current SafetyRecord, command Record
 	if launch.Quiescence != nil {
 		return false, precondition("new launch release cannot follow quiescence")
 	}
+	releaseOutcome := LaunchReleaseOutcomeFact{
+		Attempt:    current.Attempt.Ref,
+		Ordinal:    command.Ordinal,
+		Outcome:    LaunchReleaseAcked,
+		RecordedBy: releasedBy,
+	}
+	if launch.ReleaseOutcome != nil {
+		if *launch.ReleaseOutcome != releaseOutcome {
+			return false, conflict("launch release outcome already recorded with different evidence")
+		}
+	} else if err := releaseOutcome.Validate(); err != nil {
+		return false, invalidCommand("launch release outcome: %v", err)
+	}
 	nextLaunch := *cloneLaunchProof(launch)
 	nextLaunch.Released = &release
+	nextLaunch.ReleaseOutcome = &releaseOutcome
 	return replaceLaunchSlot(&next.Attempt.Launches, command.Ordinal, nextLaunch)
 }
 
@@ -454,6 +515,13 @@ func normalizeCommand(command Command) (any, error) {
 	case CommitGrant:
 		return c, nil
 	case *CommitGrant:
+		if c == nil {
+			return nil, invalidCommand("command is nil")
+		}
+		return *c, nil
+	case RecordReleaseOutcome:
+		return c, nil
+	case *RecordReleaseOutcome:
 		if c == nil {
 			return nil, invalidCommand("command is nil")
 		}
@@ -756,6 +824,7 @@ func cloneLaunchProof(launch *LaunchProof) *LaunchProof {
 	copied := *launch
 	copied.Group = clonePtr(launch.Group)
 	copied.Grant = clonePtr(launch.Grant)
+	copied.ReleaseOutcome = clonePtr(launch.ReleaseOutcome)
 	copied.Released = clonePtr(launch.Released)
 	copied.Quiescence = clonePtr(launch.Quiescence)
 	return &copied

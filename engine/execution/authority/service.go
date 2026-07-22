@@ -241,6 +241,10 @@ func (r *Ready) CommitGrant(ctx context.Context, jobID model.JobID, ref model.At
 	return r.apply(ctx, jobID, model.CommitGrant{Ref: ref, Ordinal: ordinal, Nonce: nonce}, options...)
 }
 
+func (r *Ready) RecordReleaseOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, outcome model.LaunchReleaseOutcome, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.RecordReleaseOutcome{Ref: ref, Ordinal: ordinal, Outcome: outcome}, options...)
+}
+
 func (r *Ready) RecordRelease(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, child model.ChildIdentity, observation model.Evidence, options ...ApplyOption) (ApplyResult, error) {
 	return r.apply(ctx, jobID, model.RecordRelease{Ref: ref, Ordinal: ordinal, Child: child, Observation: observation}, options...)
 }
@@ -724,6 +728,13 @@ func applyLogicalCommand(record model.SafetyRecord, command model.Command) (mode
 			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
 		}
 		return model.ApplyCommitGrant(record, *c)
+	case model.RecordReleaseOutcome:
+		return model.ApplyRecordReleaseOutcome(record, c)
+	case *model.RecordReleaseOutcome:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyRecordReleaseOutcome(record, *c)
 	case model.RecordRelease:
 		return model.ApplyRecordRelease(record, c)
 	case *model.RecordRelease:

@@ -11,6 +11,8 @@ import (
 
 const authorityRandomTokenBytes = 32
 
+var allocateGrantBeforeCommitForTest func() error
+
 func (r *Ready) AllocateGrant(ctx context.Context, ref model.AttemptRef, ordinal model.LaunchOrdinal, options ...ApplyOption) (model.LaunchGrant, DurabilityOutcome, error) {
 	if r == nil || r.core == nil {
 		return model.LaunchGrant{}, DefinitelyNotCommitted, ErrNotReady
@@ -30,6 +32,11 @@ func (r *Ready) AllocateGrant(ctx context.Context, ref model.AttemptRef, ordinal
 		Ordinal:   ordinal,
 		Nonce:     nonce,
 		GrantedBy: r.token.boot,
+	}
+	if allocateGrantBeforeCommitForTest != nil {
+		if err := allocateGrantBeforeCommitForTest(); err != nil {
+			return grant, DefinitelyNotCommitted, err
+		}
 	}
 	result, err := r.apply(ctx, ref.JobID, model.CommitGrant{
 		Ref:       ref,
