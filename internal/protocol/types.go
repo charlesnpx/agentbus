@@ -15,11 +15,6 @@ const (
 	TokenFileName = "token"
 
 	MethodHello          = "protocol.hello"
-	MethodSessionStart   = "session.start"
-	MethodSessionResume  = "session.resume"
-	MethodSessionList    = "session.list"
-	MethodTurnStart      = "turn.start"
-	MethodTurnInterrupt  = "turn.interrupt"
 	MethodJobSubmit      = "job.submit"
 	MethodJobStatus      = "job.status"
 	MethodJobResult      = "job.result"
@@ -29,13 +24,10 @@ const (
 
 	CapabilityAdmissionStrictContainment = "admission.strictContainment"
 
-	NotificationTurnEvent  = "turn.event"
-	NotificationTurnResult = "turn.result"
-
 	ErrorUnauthorized       = "unauthorized"
-	ErrorSessionBusy        = "session_busy"
 	ErrorNameConflict       = "name_conflict"
-	ErrorVersionMismatch    = "version_mismatch"
+	ErrorVersionMismatch    = "protocol_version_mismatch"
+	ErrorMethodNotFound     = "method_not_found"
 	ErrorCapabilityMissing  = "capability_missing"
 	ErrorBackendUnavailable = "backend_unavailable"
 	ErrorTimeout            = "timeout"
@@ -72,12 +64,6 @@ const (
 	AdmissionRejectRootSealed string = "root_sealed"
 	// AdmissionRejectAdmissionClosing means the daemon is closing and rejects new admission.
 	AdmissionRejectAdmissionClosing string = "admission_closing"
-	// AdmissionRejectStrictRouteDisabled is a pre-ADR-12 cause retained for existing handlers until E1 removes the route.
-	AdmissionRejectStrictRouteDisabled string = "strict_route_disabled"
-	// AdmissionRejectLegacyDowngrade is a pre-ADR-12 cause retained for existing handlers until E1 removes legacy downgrade paths.
-	AdmissionRejectLegacyDowngrade string = "legacy_downgrade"
-	// AdmissionRejectPermanentlySealed is a pre-ADR-12 cause retained for existing handlers until root_sealed is wired.
-	AdmissionRejectPermanentlySealed string = "permanently_sealed"
 )
 
 const (
@@ -155,7 +141,11 @@ func (e *RPCError) Error() string {
 // NewError constructs a protocol error using the implementation-defined JSON-RPC code.
 func NewError(stableCode, message string, data ErrorData) *ErrorObject {
 	data.Code = stableCode
-	return &ErrorObject{Code: -32000, Message: message, Data: data}
+	code := -32000
+	if stableCode == ErrorMethodNotFound {
+		code = -32601
+	}
+	return &ErrorObject{Code: code, Message: message, Data: data}
 }
 
 func DefaultCapabilities() map[string]bool {
@@ -187,83 +177,6 @@ type BackendInfo struct {
 	Backend string   `json:"backend"`
 	Models  []string `json:"models"`
 	Efforts []string `json:"efforts"`
-}
-
-type SessionStartParams struct {
-	Backend string            `json:"backend"`
-	CWD     string            `json:"cwd"`
-	Write   bool              `json:"write"`
-	Model   string            `json:"model,omitempty"`
-	Effort  string            `json:"effort,omitempty"`
-	Tags    map[string]string `json:"tags,omitempty"`
-}
-
-type SessionStartResult struct {
-	SessionID string `json:"sessionId"`
-	Backend   string `json:"backend"`
-}
-
-type SessionResumeParams struct {
-	SessionID string `json:"sessionId"`
-}
-
-type SessionListParams struct {
-	Tags map[string]string `json:"tags,omitempty"`
-}
-
-type SessionListResult struct {
-	Sessions []SessionInfo `json:"sessions"`
-}
-
-type SessionInfo struct {
-	SessionID    string            `json:"sessionId"`
-	Backend      string            `json:"backend"`
-	CWD          string            `json:"cwd"`
-	Write        bool              `json:"write"`
-	Tags         map[string]string `json:"tags,omitempty"`
-	ActiveTurnID *string           `json:"activeTurnId"`
-}
-
-type TurnStartParams struct {
-	SessionID string             `json:"sessionId"`
-	Prompt    string             `json:"prompt"`
-	Write     *bool              `json:"write,omitempty"`
-	Policy    *engine.TurnPolicy `json:"policy,omitempty"`
-	TimeoutMs *int64             `json:"timeoutMs,omitempty"`
-}
-
-type TurnStartResult struct {
-	TurnID    string `json:"turnId"`
-	JobID     string `json:"jobId"`
-	SessionID string `json:"sessionId"`
-}
-
-type TurnEventParams struct {
-	SessionID string       `json:"sessionId"`
-	TurnID    string       `json:"turnId"`
-	JobID     string       `json:"jobId"`
-	Sequence  int          `json:"sequence"`
-	Event     engine.Event `json:"event"`
-}
-
-type TurnResultParams struct {
-	SessionID     string                `json:"sessionId"`
-	TurnID        string                `json:"turnId"`
-	JobID         string                `json:"jobId"`
-	State         engine.JobState       `json:"state"`
-	Result        *engine.ResultInfo    `json:"result,omitempty"`
-	ModelReported string                `json:"modelReported,omitempty"`
-	Contract      *engine.ContractStamp `json:"contract,omitempty"`
-}
-
-type TurnInterruptParams struct {
-	TurnID string `json:"turnId"`
-}
-
-type TurnInterruptResult struct {
-	TurnID string          `json:"turnId"`
-	JobID  string          `json:"jobId"`
-	State  engine.JobState `json:"state"`
 }
 
 type TaskSpec struct {

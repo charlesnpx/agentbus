@@ -83,9 +83,8 @@ type Config struct {
 	// admin run closes it, a later Serve on the same Server/config is rejected
 	// with ErrRuntimeConsumed. custodian.UnavailableRuntime has a no-op close and
 	// is reusable for repeated fail-closed Serves.
-	Runtime                  custodian.Runtime
-	StrictAdmissionRequested bool
-	ProbeRunner              command.ProbeRunner
+	Runtime     custodian.Runtime
+	ProbeRunner command.ProbeRunner
 }
 
 type tickerSource struct {
@@ -152,7 +151,6 @@ type Server struct {
 	admissionInstance            *admissionInstance
 	admissionRuntimeFactory      func(*Server) *servedAdmissionRuntime
 	admissionRuntimeConfig       custodian.Runtime
-	admissionStrictRequested     bool
 	admissionProbeRunner         command.ProbeRunner
 	admissionUnprobeableBackends map[string]error
 	admissionStartupHooks        admissionStartupHooks
@@ -164,7 +162,6 @@ type Server struct {
 	admissionBootstrapperFactory admissionBootstrapperFactory
 
 	mu                 sync.Mutex
-	sessions           map[string]*sessionState
 	stores             map[string]*engine.Store
 	storesByKey        map[string]*engine.Store
 	jobStores          map[string]*engine.Store
@@ -177,24 +174,11 @@ type Server struct {
 	binaryStale        bool
 }
 
-type sessionState struct {
-	id           string
-	backend      string
-	cwd          string
-	writeDefault bool
-	model        string
-	effort       string
-	tags         map[string]string
-	session      engine.Session
-	activeTurnID string
-}
-
 type activeJob struct {
-	jobID      string
-	sessionID  string
-	foreground bool
-	session    engine.Session
-	cancel     context.CancelFunc
+	jobID     string
+	sessionID string
+	session   engine.Session
+	cancel    context.CancelFunc
 
 	mu                sync.Mutex
 	terminal          engine.JobState
@@ -368,41 +352,39 @@ func New(cfg Config) (*Server, error) {
 		probeRunner = command.DirectProbeRunner{}
 	}
 	return &Server{
-		stateRoot:                root,
-		cwd:                      cwd,
-		socketPath:               socketPath,
-		tokenPath:                tokenPath,
-		token:                    token,
-		backends:                 backends,
-		registry:                 registry,
-		clock:                    clock,
-		processes:                processes,
-		processGroups:            cfg.ProcessGroups,
-		cancelGrace:              cfg.CancelGrace,
-		cancelWaiter:             cfg.CancelWaiter,
-		idleTimeout:              idleTimeout,
-		idleCheckInterval:        idleCheck,
-		binaryIdentityProbe:      binaryIdentityProbe,
-		inlineResultCap:          inlineResultCap,
-		leaseDuration:            leaseDuration,
-		heartbeatInterval:        heartbeatInterval,
-		reapInterval:             reapInterval,
-		gcInterval:               gcInterval,
-		reapTickInterval:         reapTickInterval,
-		reapTickFactory:          newTickerSource,
-		safetyLatch:              NewSafetyLatch(),
-		safetyDrainTimeout:       defaultSafetyDrain,
-		sessions:                 make(map[string]*sessionState),
-		stores:                   make(map[string]*engine.Store),
-		storesByKey:              make(map[string]*engine.Store),
-		jobStores:                make(map[string]*engine.Store),
-		admissionJobs:            make(map[string]struct{}),
-		admissionEffectMu:        make(map[string]*sync.Mutex),
-		admissionRuntimeConfig:   cfg.Runtime,
-		admissionStrictRequested: cfg.StrictAdmissionRequested,
-		admissionProbeRunner:     probeRunner,
-		activeJobs:               make(map[string]*activeJob),
-		lastActivity:             clock.Now().UTC(),
+		stateRoot:              root,
+		cwd:                    cwd,
+		socketPath:             socketPath,
+		tokenPath:              tokenPath,
+		token:                  token,
+		backends:               backends,
+		registry:               registry,
+		clock:                  clock,
+		processes:              processes,
+		processGroups:          cfg.ProcessGroups,
+		cancelGrace:            cfg.CancelGrace,
+		cancelWaiter:           cfg.CancelWaiter,
+		idleTimeout:            idleTimeout,
+		idleCheckInterval:      idleCheck,
+		binaryIdentityProbe:    binaryIdentityProbe,
+		inlineResultCap:        inlineResultCap,
+		leaseDuration:          leaseDuration,
+		heartbeatInterval:      heartbeatInterval,
+		reapInterval:           reapInterval,
+		gcInterval:             gcInterval,
+		reapTickInterval:       reapTickInterval,
+		reapTickFactory:        newTickerSource,
+		safetyLatch:            NewSafetyLatch(),
+		safetyDrainTimeout:     defaultSafetyDrain,
+		stores:                 make(map[string]*engine.Store),
+		storesByKey:            make(map[string]*engine.Store),
+		jobStores:              make(map[string]*engine.Store),
+		admissionJobs:          make(map[string]struct{}),
+		admissionEffectMu:      make(map[string]*sync.Mutex),
+		admissionRuntimeConfig: cfg.Runtime,
+		admissionProbeRunner:   probeRunner,
+		activeJobs:             make(map[string]*activeJob),
+		lastActivity:           clock.Now().UTC(),
 	}, nil
 }
 
@@ -952,11 +934,6 @@ func (c *connection) closeOnFailStop() func() {
 func requiresRequestID(method string) bool {
 	switch method {
 	case protocol.MethodHello,
-		protocol.MethodSessionStart,
-		protocol.MethodSessionResume,
-		protocol.MethodSessionList,
-		protocol.MethodTurnStart,
-		protocol.MethodTurnInterrupt,
 		protocol.MethodJobSubmit,
 		protocol.MethodJobStatus,
 		protocol.MethodJobResult,
@@ -1007,16 +984,6 @@ func (s *Server) handle(ctx context.Context, c *connection, req protocol.Request
 	switch req.Method {
 	case protocol.MethodHello:
 		return s.handleHello(c, req.Params)
-	case protocol.MethodSessionStart:
-		return s.handleSessionStart(ctx, req.Params)
-	case protocol.MethodSessionResume:
-		return s.handleSessionResume(ctx, req.Params)
-	case protocol.MethodSessionList:
-		return s.handleSessionList(req.Params)
-	case protocol.MethodTurnStart:
-		return s.handleTurnStart(ctx, c, req.Params)
-	case protocol.MethodTurnInterrupt:
-		return s.handleTurnInterrupt(req.Params)
 	case protocol.MethodJobSubmit:
 		return s.handleJobSubmit(ctx, req.Params)
 	case protocol.MethodJobStatus:
@@ -1030,7 +997,7 @@ func (s *Server) handle(ctx context.Context, c *connection, req protocol.Request
 	case protocol.MethodPolicyRegister:
 		return s.handlePolicyRegister(req.Params)
 	default:
-		return requestOutcome{err: protocol.NewError(protocol.ErrorCapabilityMissing, "unknown method", protocol.ErrorData{})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorMethodNotFound, "method not found", protocol.ErrorData{})}
 	}
 }
 
@@ -1048,7 +1015,6 @@ func (s *Server) failStoppedRequestError(method string) *protocol.ErrorObject {
 func failStoppedMethodAllowed(method string) bool {
 	switch method {
 	case protocol.MethodHello,
-		protocol.MethodSessionList,
 		protocol.MethodJobStatus,
 		protocol.MethodJobResult,
 		protocol.MethodPolicyValidate:
@@ -1110,284 +1076,30 @@ func (s *Server) backendMetadata() []protocol.BackendInfo {
 	return result
 }
 
-func (s *Server) handleSessionStart(ctx context.Context, raw json.RawMessage) requestOutcome {
-	if errObj := s.failStoppedRequestError(protocol.MethodSessionStart); errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-	var params protocol.SessionStartParams
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
-	}
-	if params.Backend == "" || params.CWD == "" || !filepath.IsAbs(params.CWD) {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "session.start requires backend and absolute cwd", protocol.ErrorData{})}
-	}
-	backend, ok := s.backends[params.Backend]
-	if !ok {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{})}
-	}
-	session, err := backend.Start(ctx, engine.SessionOpts{CWD: params.CWD, Write: params.Write, Model: params.Model, Effort: params.Effort, Timeout: protocol.DefaultTimeout})
-	if err != nil {
-		return requestOutcome{err: backendError(err)}
-	}
-	sessionID := session.ID()
-	if sessionID == "" {
-		sessionID = s.nextID("ses")
-	}
-	state := &sessionState{
-		id:           sessionID,
-		backend:      params.Backend,
-		cwd:          params.CWD,
-		writeDefault: params.Write,
-		model:        params.Model,
-		effort:       params.Effort,
-		tags:         cloneTags(params.Tags),
-		session:      session,
-	}
-	s.mu.Lock()
-	s.sessions[sessionID] = state
-	s.mu.Unlock()
-	s.touchActivity()
-	return requestOutcome{result: protocol.SessionStartResult{SessionID: sessionID, Backend: params.Backend}}
-}
-
-func (s *Server) handleSessionResume(ctx context.Context, raw json.RawMessage) requestOutcome {
-	if errObj := s.failStoppedRequestError(protocol.MethodSessionResume); errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-	var params protocol.SessionResumeParams
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
-	}
-	if params.SessionID == "" {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "sessionId is required", protocol.ErrorData{})}
-	}
-	s.mu.Lock()
-	existing := s.sessions[params.SessionID]
-	s.mu.Unlock()
-	if existing != nil {
-		return requestOutcome{result: protocol.SessionStartResult{SessionID: existing.id, Backend: existing.backend}}
-	}
-	record, store := s.findPersistedSession(params.SessionID)
-	if record == nil || store == nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "session is not known to this daemon", protocol.ErrorData{SessionID: params.SessionID})}
-	}
-	if _, _, ok, authorityErr := s.authorityJobProjection(record.JobID); authorityErr != nil {
-		return requestOutcome{err: authorityMutationIndeterminateError("session.resume", protocol.ErrorData{SessionID: params.SessionID, JobID: record.JobID}, authorityErr)}
-	} else if ok {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "session is owned by admission authority", protocol.ErrorData{SessionID: params.SessionID, JobID: record.JobID})}
-	}
-	backend, ok := s.backends[record.Backend]
-	if !ok {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{SessionID: params.SessionID})}
-	}
-	session, err := backend.Resume(ctx, record.BackendSessionID, engine.SessionOpts{
-		CWD:     store.Layout().Workspace,
-		Write:   false,
-		Timeout: protocol.DefaultTimeout,
-	})
-	if err != nil {
-		return requestOutcome{err: backendError(err)}
-	}
-	state := &sessionState{
-		id:           params.SessionID,
-		backend:      record.Backend,
-		cwd:          store.Layout().Workspace,
-		writeDefault: false,
-		tags:         cloneTags(record.Tags),
-		session:      session,
-	}
-	s.mu.Lock()
-	s.sessions[params.SessionID] = state
-	s.mu.Unlock()
-	s.touchActivity()
-	return requestOutcome{result: protocol.SessionStartResult{SessionID: params.SessionID, Backend: record.Backend}}
-}
-
-func (s *Server) handleSessionList(raw json.RawMessage) requestOutcome {
-	var params protocol.SessionListParams
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
-	}
-	s.mu.Lock()
-	sessions := make([]protocol.SessionInfo, 0, len(s.sessions))
-	for _, state := range s.sessions {
-		if !tagsMatch(state.tags, params.Tags) {
-			continue
-		}
-		var active *string
-		if state.activeTurnID != "" {
-			id := state.activeTurnID
-			active = &id
-		}
-		sessions = append(sessions, protocol.SessionInfo{
-			SessionID:    state.id,
-			Backend:      state.backend,
-			CWD:          state.cwd,
-			Write:        state.writeDefault,
-			Tags:         cloneTags(state.tags),
-			ActiveTurnID: active,
-		})
-	}
-	s.mu.Unlock()
-	sort.Slice(sessions, func(i, j int) bool { return sessions[i].SessionID < sessions[j].SessionID })
-	return requestOutcome{result: protocol.SessionListResult{Sessions: sessions}}
-}
-
-func (s *Server) handleTurnStart(ctx context.Context, c *connection, raw json.RawMessage) requestOutcome {
-	if errObj := s.failStoppedRequestError(protocol.MethodTurnStart); errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-	var params protocol.TurnStartParams
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
-	}
-	if params.SessionID == "" || params.Prompt == "" {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turn.start requires sessionId and prompt", protocol.ErrorData{SessionID: params.SessionID})}
-	}
-	timeout, errObj := timeoutFromMillis(params.TimeoutMs)
-	if errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-	policy, err := s.resolvePolicy(params.Policy)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{SessionID: params.SessionID})}
-	}
-	s.mu.Lock()
-	session := s.sessions[params.SessionID]
-	if session == nil {
-		s.mu.Unlock()
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "session is not known", protocol.ErrorData{SessionID: params.SessionID})}
-	}
-	if session.activeTurnID != "" {
-		active := session.activeTurnID
-		s.mu.Unlock()
-		return requestOutcome{err: protocol.NewError(protocol.ErrorSessionBusy, "session already has an active turn", protocol.ErrorData{SessionID: params.SessionID, TurnID: active, JobID: active})}
-	}
-	write := session.writeDefault
-	if params.Write != nil {
-		write = *params.Write
-	}
-	jobID := s.nextID("job")
-	session.activeTurnID = jobID
-	store, err := s.storeForCWDLocked(session.cwd)
-	if err != nil {
-		session.activeTurnID = ""
-		s.mu.Unlock()
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{SessionID: params.SessionID})}
-	}
-	s.jobStores[jobID] = store
-	s.mu.Unlock()
-	if err := s.createQueuedRecord(store, jobID, session.id, session.backend, session.tags, policy.policy, policy.contract, true); err != nil {
-		s.clearActiveTurn(session.id, jobID)
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{SessionID: params.SessionID, JobID: jobID, TurnID: jobID})}
-	}
-	runCtx, cancel := context.WithCancel(ctx)
-	active := &activeJob{jobID: jobID, sessionID: session.id, foreground: true, session: session.session, cancel: cancel}
-	s.addActiveJob(active)
-	run := jobRun{
-		jobID:        jobID,
-		sessionID:    session.id,
-		backend:      session.backend,
-		store:        store,
-		session:      session.session,
-		prompt:       params.Prompt,
-		write:        write,
-		policy:       policy.policy,
-		contract:     policy.contract,
-		contractName: policy.name,
-		contractHash: policy.hash,
-		timeout:      timeout,
-		foreground:   true,
-		conn:         c,
-		active:       active,
-		onDone: func() {
-			s.clearActiveTurn(session.id, jobID)
-		},
-	}
-	return requestOutcome{
-		result:       protocol.TurnStartResult{TurnID: jobID, JobID: jobID, SessionID: session.id},
-		after:        func() { go s.runJob(runCtx, run) },
-		onAckFailure: func(error) { s.abortUndeliveredRun(run, engine.StateInterrupted) },
-	}
-}
-
-func (s *Server) handleTurnInterrupt(raw json.RawMessage) requestOutcome {
-	if errObj := s.failStoppedRequestError(protocol.MethodTurnInterrupt); errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-	var params protocol.TurnInterruptParams
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
-	}
-	if params.TurnID == "" {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turnId is required", protocol.ErrorData{})}
-	}
-	active := s.lookupActiveJob(params.TurnID)
-	if active != nil {
-		if !active.foreground {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turn.interrupt only applies to foreground turns", protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
-		}
-		active.requestTerminal(engine.StateInterrupted)
-	}
-	store := s.storeForJob(params.TurnID)
-	if store == nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turn is not known", protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
-	}
-	if active == nil {
-		record, err := store.Load(params.TurnID)
-		if err != nil {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
-		}
-		if !record.Foreground {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turn.interrupt only applies to foreground turns", protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
-		}
-	}
-	record, err := store.Interrupt(params.TurnID)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
-	}
-	if active != nil && active.cancel != nil {
-		active.cancel()
-	}
-	return requestOutcome{result: protocol.TurnInterruptResult{TurnID: params.TurnID, JobID: params.TurnID, State: record.State}}
-}
-
 func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) requestOutcome {
 	if errObj := s.failStoppedRequestError(protocol.MethodJobSubmit); errObj != nil {
 		return requestOutcome{err: errObj}
 	}
 	strictByRaw, identityErr := strictIdentityPrecheck(raw)
-	if strictByRaw {
-		if errObj := s.strictRouteDisabledPrecheck(); errObj != nil {
-			return requestOutcome{err: errObj}
-		}
-		if identityErr != nil {
-			return requestOutcome{err: identityErr}
-		}
-		params, errObj := looseStrictJobSubmitParams(raw)
-		if errObj != nil {
-			return requestOutcome{err: errObj}
-		}
-		return s.handleIdentifiedJobSubmit(ctx, raw, params)
+	if errObj := s.strictRouteDisabledPrecheck(); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
+	if !strictByRaw {
+		return requestOutcome{err: strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectMissingIdentity,
+			"job.submit requires workspaceKey and requestId",
+			protocol.ErrorData{},
+		)}
 	}
 	if identityErr != nil {
 		return requestOutcome{err: identityErr}
 	}
-	var params protocol.JobSubmitParams
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
-	}
-	identified, err := jobSubmitIdentified(raw, params)
-	if err != nil {
-		return invalidParams(err)
-	}
-	if identified {
-		return s.handleIdentifiedJobSubmit(ctx, raw, params)
-	}
-	if errObj := validateTaskSpecEnvelope(raw); errObj != nil {
+	params, errObj := looseStrictJobSubmitParams(raw)
+	if errObj != nil {
 		return requestOutcome{err: errObj}
 	}
-	return s.handleLegacyJobSubmit(ctx, params)
+	return s.handleIdentifiedJobSubmit(ctx, raw, params)
 }
 
 func looseStrictJobSubmitParams(raw json.RawMessage) (protocol.JobSubmitParams, *protocol.ErrorObject) {
@@ -1444,71 +1156,6 @@ func strictIdentityPrecheck(raw json.RawMessage) (bool, *protocol.ErrorObject) {
 		)
 	}
 	return true, nil
-}
-
-func (s *Server) handleLegacyJobSubmit(ctx context.Context, params protocol.JobSubmitParams) requestOutcome {
-	if errObj := s.legacyAdmissionDowngradePrecheck(); errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-	spec := params.TaskSpec
-	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{})}
-	}
-	timeout, errObj := timeoutFromMillis(spec.TimeoutMs)
-	if errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-	policy, err := s.resolvePolicy(spec.Policy)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
-	}
-	backend, ok := s.backends[spec.Backend]
-	if !ok {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{})}
-	}
-	session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
-	if err != nil {
-		return requestOutcome{err: backendError(err)}
-	}
-	sessionID := session.ID()
-	if sessionID == "" {
-		sessionID = s.nextID("ses")
-	}
-	s.mu.Lock()
-	store, err := s.storeForCWDLocked(spec.CWD)
-	if err != nil {
-		s.mu.Unlock()
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
-	}
-	jobID := s.nextID("job")
-	s.jobStores[jobID] = store
-	s.mu.Unlock()
-	if err := s.createQueuedRecord(store, jobID, sessionID, spec.Backend, spec.Tags, policy.policy, policy.contract, false); err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
-	}
-	runCtx, cancel := context.WithCancel(ctx)
-	active := &activeJob{jobID: jobID, sessionID: sessionID, session: session, cancel: cancel}
-	s.addActiveJob(active)
-	run := jobRun{
-		jobID:        jobID,
-		sessionID:    sessionID,
-		backend:      spec.Backend,
-		store:        store,
-		session:      session,
-		prompt:       spec.Prompt,
-		write:        spec.Write,
-		policy:       policy.policy,
-		contract:     policy.contract,
-		contractName: policy.name,
-		contractHash: policy.hash,
-		timeout:      timeout,
-		active:       active,
-	}
-	return requestOutcome{
-		result:       protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
-		after:        func() { go s.runJob(runCtx, run) },
-		onAckFailure: func(error) { s.abortUndeliveredRun(run, engine.StateCanceled) },
-	}
 }
 
 func (s *Server) handleJobStatus(raw json.RawMessage) requestOutcome {
@@ -1628,9 +1275,6 @@ func authorityMutationIndeterminateError(operation string, data protocol.ErrorDa
 func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	active := s.lookupActiveJob(jobID)
 	if active != nil {
-		if active.foreground {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: jobID, TurnID: jobID})}
-		}
 		active.requestTerminal(engine.StateCanceled)
 		// Admission cancel is intentional containment. Mark the active launch
 		// before coordinator containment so a killed process is the cancel
@@ -1671,9 +1315,6 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 func (s *Server) handleJobCancelLocked(jobID string) requestOutcome {
 	active := s.lookupActiveJob(jobID)
 	if active != nil {
-		if active.foreground {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: jobID, TurnID: jobID})}
-		}
 		active.requestTerminal(engine.StateCanceled)
 	}
 	store := s.storeForJob(jobID)
@@ -1683,9 +1324,6 @@ func (s *Server) handleJobCancelLocked(jobID string) requestOutcome {
 	record, err := store.Load(jobID)
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
-	}
-	if record.Foreground {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: jobID, TurnID: jobID})}
 	}
 	if s.isAdmissionJob(jobID) {
 		err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
@@ -1774,8 +1412,6 @@ type jobRun struct {
 	contractName            string
 	contractHash            string
 	timeout                 time.Duration
-	foreground              bool
-	conn                    *connection
 	active                  *activeJob
 	onDone                  func()
 	authoritativeCompletion bool
@@ -1784,7 +1420,6 @@ type jobRun struct {
 	admissionAccepted       authority.AcceptResult
 	admissionLaunch         admissionLaunchBinding
 	prestartedEvents        <-chan engine.Event
-	legacyFencedCommand     *legacyFencedCommand
 }
 
 func (s *Server) runJob(ctx context.Context, run jobRun) {
@@ -1904,21 +1539,17 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 	switch {
 	case run.prestartedEvents != nil && ordinal == model.LaunchOrdinalOne:
 		events = run.prestartedEvents
-	case run.admissionControlled && run.admissionMode != model.ModeLegacyUnfenced:
+	case run.admissionControlled:
 		events, err = s.admissionTurnEvents(attemptCtx, run, input, ordinal)
 	default:
-		events, err = run.session.Turn(attemptCtx, input)
+		return "", engine.StateFailed, errors.New("non-authority execution is disabled")
 	}
 	if err != nil {
-		if strings.Contains(err.Error(), protocol.ErrorSessionBusy) {
-			return "", engine.StateFailed, err
-		}
 		return "", engine.StateFailed, err
 	}
 	var assistantText strings.Builder
 	var resultText string
 	hasResultMessage := false
-	sequence := 0
 	for {
 		select {
 		case <-attemptCtx.Done():
@@ -1957,17 +1588,6 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				}
 				return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, errors.New(rawText)
 			}
-			if run.foreground && run.conn != nil && event.Type != engine.EventResultMessage && event.Type != engine.EventTerminalError && event.Type != engine.EventModelReported {
-				sequence++
-				wireEvent := prepareWireEvent(event)
-				_ = run.conn.notify(protocol.NotificationTurnEvent, protocol.TurnEventParams{
-					SessionID: run.sessionID,
-					TurnID:    run.jobID,
-					JobID:     run.jobID,
-					Sequence:  sequence,
-					Event:     wireEvent,
-				})
-			}
 		}
 	}
 }
@@ -1980,7 +1600,7 @@ func attemptFinalText(hasResultMessage bool, resultText, assistantText string) s
 }
 
 func shouldInterruptSessionOnAttemptCancel(run jobRun, err error) bool {
-	if errors.Is(err, context.Canceled) && !run.foreground && run.active != nil && run.active.requestedTerminal() == engine.StateCanceled {
+	if errors.Is(err, context.Canceled) && run.active != nil && run.active.requestedTerminal() == engine.StateCanceled {
 		return false
 	}
 	return true
@@ -2074,7 +1694,7 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 	if run.session != nil {
 		backendSessionID = run.session.ID()
 	}
-	record, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
+	_, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
 		salvageReaped := run.authoritativeCompletion && record.State == engine.StateReaped && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant)
 		if engine.IsTerminal(record.State) && !salvageReaped {
 			return false, nil
@@ -2117,9 +1737,6 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 	})
 	if err != nil {
 		return err
-	}
-	if run.foreground && run.conn != nil {
-		_ = run.conn.notify(protocol.NotificationTurnResult, turnResultFromRecord(*record))
 	}
 	return nil
 }
@@ -2386,14 +2003,6 @@ func (s *Server) lookupActiveJob(jobID string) *activeJob {
 	return s.activeJobs[jobID]
 }
 
-func (s *Server) clearActiveTurn(sessionID, jobID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if session := s.sessions[sessionID]; session != nil && session.activeTurnID == jobID {
-		session.activeTurnID = ""
-	}
-}
-
 func (s *Server) listKnownRecords() []engine.JobRecord {
 	stores, err := s.knownStores()
 	if err != nil {
@@ -2433,33 +2042,6 @@ func (s *Server) listJobStatuses() ([]protocol.JobStatus, *protocol.ErrorObject)
 	}
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].JobID < statuses[j].JobID })
 	return statuses, nil
-}
-
-func (s *Server) findPersistedSession(sessionID string) (*engine.JobRecord, *engine.Store) {
-	stores, err := s.knownStores()
-	if err != nil {
-		return nil, nil
-	}
-	var newest *engine.JobRecord
-	var newestStore *engine.Store
-	for _, store := range stores {
-		records, err := store.List()
-		if err != nil {
-			continue
-		}
-		for i := range records {
-			record := records[i]
-			if record.SessionID != sessionID || record.Backend == "" || record.BackendSessionID == "" {
-				continue
-			}
-			if newest == nil || record.UpdatedAt.After(newest.UpdatedAt) {
-				copy := record
-				newest = &copy
-				newestStore = store
-			}
-		}
-	}
-	return newest, newestStore
 }
 
 func (s *Server) reapKnownStores() error {
@@ -2676,9 +2258,6 @@ func backendError(err error) *protocol.ErrorObject {
 	if err == nil {
 		return nil
 	}
-	if strings.Contains(err.Error(), protocol.ErrorSessionBusy) {
-		return protocol.NewError(protocol.ErrorSessionBusy, "session already has an active turn", protocol.ErrorData{})
-	}
 	return protocol.NewError(protocol.ErrorBackendUnavailable, err.Error(), protocol.ErrorData{})
 }
 
@@ -2764,18 +2343,6 @@ func resultFromRecord(record engine.JobRecord) protocol.JobResult {
 	}
 }
 
-func turnResultFromRecord(record engine.JobRecord) protocol.TurnResultParams {
-	return protocol.TurnResultParams{
-		SessionID:     record.SessionID,
-		TurnID:        record.JobID,
-		JobID:         record.JobID,
-		State:         record.State,
-		Result:        record.Result,
-		ModelReported: record.ModelReported,
-		Contract:      record.Contract,
-	}
-}
-
 func timePtr(t time.Time) *time.Time {
 	if t.IsZero() {
 		return nil
@@ -2816,16 +2383,6 @@ func applyPrologue(policy *engine.TurnPolicy, prompt string) string {
 		return prompt
 	}
 	return policy.Prologue + "\n\n" + prompt
-}
-
-func prepareWireEvent(event engine.Event) engine.Event {
-	wireEvent := event
-	truncated := engine.TruncateEventText([]byte(wireEvent.Text), engine.DefaultEventTextCap)
-	wireEvent.Text = truncated.Text
-	wireEvent.Truncated = wireEvent.Truncated || truncated.Truncated
-	wireEvent.RawText = ""
-	wireEvent.Metadata = engine.SanitizeEventMetadata(wireEvent.Metadata)
-	return wireEvent
 }
 
 func authoritativeText(event engine.Event) string {

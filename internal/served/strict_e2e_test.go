@@ -47,7 +47,7 @@ func TestProductionStrictServe(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	cmd := exec.Command(agentbusPath, "serve", "--foreground", "--admission=strict")
+	cmd := exec.Command(agentbusPath, "serve", "--foreground")
 	cmd.Dir = cwd
 	cmd.Env = upsertEnv(fixture.env, "AGENTBUS_STATE_ROOT="+stateRoot)
 	cmd.Stdout = &stdout

@@ -24,6 +24,28 @@ import (
 
 const defaultStartTimeout = 10 * time.Second
 
+// ErrProtocolVersionMismatch identifies a hello result whose protocolVersion
+// does not match the client protocol version.
+var ErrProtocolVersionMismatch = errors.New("protocol version mismatch")
+
+// ProtocolVersionMismatchError reports the expected and received protocol
+// versions from a failed hello exchange.
+type ProtocolVersionMismatchError struct {
+	Expected int
+	Received int
+}
+
+func (e *ProtocolVersionMismatchError) Error() string {
+	if e == nil {
+		return ErrProtocolVersionMismatch.Error()
+	}
+	return fmt.Sprintf("%s: expected %d received %d", ErrProtocolVersionMismatch, e.Expected, e.Received)
+}
+
+func (e *ProtocolVersionMismatchError) Is(target error) bool {
+	return target == ErrProtocolVersionMismatch
+}
+
 // Options configures a protocol client.
 type Options struct {
 	StateRoot        string
@@ -68,8 +90,6 @@ type Client struct {
 	conn    net.Conn
 	reader  *bufio.Reader
 	pending map[string]chan protocol.Response
-	subs    map[string]chan TurnNotification
-	backlog map[string][]TurnNotification
 	closed  bool
 	ids     atomic.Uint64
 }
@@ -110,8 +130,6 @@ func newClient(opts Options) (*Client, error) {
 		socketPath: socketPath,
 		tokenPath:  filepath.Join(root, protocol.TokenFileName),
 		pending:    make(map[string]chan protocol.Response),
-		subs:       make(map[string]chan TurnNotification),
-		backlog:    make(map[string][]TurnNotification),
 	}, nil
 }
 
@@ -179,7 +197,9 @@ func clientHello(ctx context.Context, conn net.Conn, reader *bufio.Reader, token
 	if err := json.Unmarshal(raw, &hello); err != nil {
 		return HelloResult{}, err
 	}
-	// TODO(AB-E E1): return ErrProtocolVersionMismatch when protocolVersion != protocol.Version per ADR-12.
+	if hello.ProtocolVersion != protocol.Version {
+		return HelloResult{}, &ProtocolVersionMismatchError{Expected: protocol.Version, Received: hello.ProtocolVersion}
+	}
 	return hello, nil
 }
 
@@ -352,7 +372,6 @@ func (c *Client) readLoop(conn net.Conn, reader *bufio.Reader) {
 			continue
 		}
 		if head.Method != "" && len(head.ID) == 0 {
-			c.dispatchNotification(head.Method, line)
 			continue
 		}
 		var resp protocol.Response
@@ -379,75 +398,6 @@ func (c *Client) failPending(err error) {
 		ch <- protocol.Response{JSONRPC: "2.0", ID: json.RawMessage(strconv.Quote(id)), Error: protocol.NewError(protocol.ErrorBackendUnavailable, err.Error(), protocol.ErrorData{})}
 		close(ch)
 	}
-	for jobID, ch := range c.subs {
-		delete(c.subs, jobID)
-		close(ch)
-	}
-}
-
-func (c *Client) dispatchNotification(method string, line []byte) {
-	var env struct {
-		Params json.RawMessage `json:"params"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(line), &env); err != nil {
-		return
-	}
-	n := TurnNotification{Method: method}
-	var jobID string
-	switch method {
-	case protocol.NotificationTurnEvent:
-		var params TurnEventParams
-		if err := json.Unmarshal(env.Params, &params); err != nil {
-			return
-		}
-		jobID = params.JobID
-		n.Event = &params
-	case protocol.NotificationTurnResult:
-		var params TurnResultParams
-		if err := json.Unmarshal(env.Params, &params); err != nil {
-			return
-		}
-		jobID = params.JobID
-		n.Result = &params
-	default:
-		return
-	}
-	c.mu.Lock()
-	ch := c.subs[jobID]
-	if ch == nil {
-		c.backlog[jobID] = append(c.backlog[jobID], n)
-		if len(c.backlog[jobID]) > 128 {
-			c.backlog[jobID] = c.backlog[jobID][len(c.backlog[jobID])-128:]
-		}
-		c.mu.Unlock()
-		return
-	}
-	if n.Result != nil {
-		delete(c.subs, jobID)
-	}
-	ch <- n
-	if n.Result != nil {
-		close(ch)
-	}
-	c.mu.Unlock()
-}
-
-func (c *Client) subscribe(jobID string) <-chan TurnNotification {
-	ch := make(chan TurnNotification, 256)
-	c.mu.Lock()
-	c.subs[jobID] = ch
-	backlog := c.backlog[jobID]
-	delete(c.backlog, jobID)
-	for _, n := range backlog {
-		ch <- n
-		if n.Result != nil {
-			close(ch)
-			delete(c.subs, jobID)
-			break
-		}
-	}
-	c.mu.Unlock()
-	return ch
 }
 
 func (c *Client) do(ctx context.Context, method string, params any, result any) error {
@@ -550,38 +500,6 @@ func (c *Client) Hello(ctx context.Context) (HelloResult, error) {
 	}
 	var out HelloResult
 	err = c.do(ctx, protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: token}, &out)
-	return out, err
-}
-
-func (c *Client) SessionStart(ctx context.Context, params SessionStartParams) (SessionStartResult, error) {
-	var out SessionStartResult
-	err := c.do(ctx, protocol.MethodSessionStart, params, &out)
-	return out, err
-}
-
-func (c *Client) SessionResume(ctx context.Context, params SessionResumeParams) (SessionStartResult, error) {
-	var out SessionStartResult
-	err := c.do(ctx, protocol.MethodSessionResume, params, &out)
-	return out, err
-}
-
-func (c *Client) SessionList(ctx context.Context, params SessionListParams) (SessionListResult, error) {
-	var out SessionListResult
-	err := c.do(ctx, protocol.MethodSessionList, params, &out)
-	return out, err
-}
-
-func (c *Client) TurnStart(ctx context.Context, params TurnStartParams) (TurnStartResult, <-chan TurnNotification, error) {
-	var out TurnStartResult
-	if err := c.do(ctx, protocol.MethodTurnStart, params, &out); err != nil {
-		return TurnStartResult{}, nil, err
-	}
-	return out, c.subscribe(out.JobID), nil
-}
-
-func (c *Client) TurnInterrupt(ctx context.Context, params TurnInterruptParams) (TurnInterruptResult, error) {
-	var out TurnInterruptResult
-	err := c.do(ctx, protocol.MethodTurnInterrupt, params, &out)
 	return out, err
 }
 

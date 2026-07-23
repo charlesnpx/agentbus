@@ -169,7 +169,7 @@ func TestUnsafeSupportFailStopPersistenceFailureReportsBothCauses(t *testing.T) 
 	}
 }
 
-func TestActivatedRootRejectsLegacySubmitBeforeBackendStart(t *testing.T) {
+func TestActivatedRootRejectsUnidentifiedSubmitBeforeBackendStart(t *testing.T) {
 	backend := newFakeBackend("fake")
 	server, _, cwd := newUnstartedTestServer(t, backend)
 	launcher := newAdmissionFakeLaunchCustodian(t)
@@ -182,9 +182,9 @@ func TestActivatedRootRejectsLegacySubmitBeforeBackendStart(t *testing.T) {
 		t.Fatalf("legacy submit result = %+v, want rejection", outcome.result)
 	}
 	resp := protocol.Response{Error: outcome.err}
-	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectLegacyDowngrade)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectMissingIdentity)
 	if got := backend.count.Load(); got != 0 {
-		t.Fatalf("backend starts = %d, want 0 before legacy downgrade rejection", got)
+		t.Fatalf("backend starts = %d, want 0 before missing identity rejection", got)
 	}
 }
 
@@ -305,28 +305,28 @@ func TestActivatedStartupRecoversBeforeSupportPolicyAndListen(t *testing.T) {
 	restart := newTestServerAtRoot(t, root, cwd, newFakeBackend("fake"))
 	restartLauncher := newAdmissionFakeLaunchCustodian(t)
 	available := admissionSupportForClass(t, custodian.SupportAvailable, true, 1)
+	events := &startupEventRecorder{}
 	restart.admissionRuntime = &servedAdmissionRuntime{
-		runtime:         custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable),
 		launchCustodian: restartLauncher,
 		supportProbe: func(context.Context) custodian.Support {
-			restart.recordStartupEvent("support")
+			events.record("support")
 			return available
 		},
 		verifierOverride: restartLauncher.verifier,
 	}
 	restart.admissionStartupHooks = admissionStartupHooks{
-		AfterMetadataRead: func(authority.AdmissionRootMetadata) { restart.recordStartupEvent("metadata") },
-		BeforeRecovery:    func() { restart.recordStartupEvent("before-recovery") },
-		AfterRecovery:     func() { restart.recordStartupEvent("after-recovery") },
+		AfterMetadataRead: func(authority.AdmissionRootMetadata) { events.record("metadata") },
+		BeforeRecovery:    func() { events.record("before-recovery") },
+		AfterRecovery:     func() { events.record("after-recovery") },
 		BeforeSupportAssessment: func() {
-			restart.recordStartupEvent("before-support")
+			events.record("before-support")
 		},
-		AfterSupportAssessment: func(custodian.Support) { restart.recordStartupEvent("after-support") },
-		BeforePolicyInstall:    func() { restart.recordStartupEvent("policy") },
+		AfterSupportAssessment: func(custodian.Support) { events.record("after-support") },
+		BeforePolicyInstall:    func() { events.record("policy") },
 	}
 	listenErr := errors.New("listener reached")
 	restart.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
-		restart.recordStartupEvent("listen")
+		events.record("listen")
 		return nil, socketFileIdentity{}, listenErr
 	}
 
@@ -335,7 +335,7 @@ func TestActivatedStartupRecoversBeforeSupportPolicyAndListen(t *testing.T) {
 		t.Fatalf("Serve error = %v, want %v", err, listenErr)
 	}
 	want := []string{"metadata", "before-recovery", "after-recovery", "before-support", "support", "after-support", "policy", "listen"}
-	if got := restart.startupEvents(); !reflect.DeepEqual(got, want) {
+	if got := events.snapshot(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("startup order = %v, want %v", got, want)
 	}
 }
@@ -353,7 +353,6 @@ func TestSequentialServeReprobesSupportAndClosesRuntimePerServe(t *testing.T) {
 		factoryCalls.Add(1)
 		launcher := newAdmissionFakeLaunchCustodian(t)
 		return &servedAdmissionRuntime{
-			runtime:         custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable),
 			launchCustodian: launcher,
 			supportProbe: func(context.Context) custodian.Support {
 				if selfTests.Add(1) == 1 {
@@ -446,13 +445,11 @@ func TestBootstrapAdmissionStrictRuntimeFailurePrecedesRepositoryOpen(t *testing
 	ctx := context.Background()
 	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
 	var closes atomic.Int64
-	server.admissionStrictRequested = true
 	server.admissionRuntime = &servedAdmissionRuntime{
 		runtime: custodian.NewUnavailableRuntimeForTest(custodian.ErrSupervisorUnavailable, func() error {
 			closes.Add(1)
 			return nil
 		}),
-		strictRequested: true,
 	}
 	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
 		t.Fatal("repository factory called before strict runtime diagnostic")
@@ -524,6 +521,7 @@ func TestServeRejectsConsumedInjectedRuntime(t *testing.T) {
 		return nil
 	})
 	server := newUnstartedTestServerWithRuntime(t, runtime)
+	configureAvailableServedRuntime(t, server, runtime)
 	listenErr := errors.New("listen reached")
 	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
 		return nil, socketFileIdentity{}, listenErr
@@ -562,6 +560,7 @@ func TestServeRejectsConsumedRuntimeWhileCloseStillPending(t *testing.T) {
 		return nil
 	})
 	server := newUnstartedTestServerWithRuntime(t, runtime)
+	configureAvailableServedRuntime(t, server, runtime)
 	listenErr := errors.New("listen reached")
 	var listenCalls atomic.Int64
 	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
@@ -613,14 +612,18 @@ func TestServeAllowsRepeatedUnavailableRuntime(t *testing.T) {
 		return nil, socketFileIdentity{}, fmt.Errorf("listen reached %d", calls.Add(1))
 	}
 
-	if err := server.Serve(ctx); err == nil || !strings.Contains(err.Error(), "listen reached 1") {
-		t.Fatalf("first Serve error = %v, want first listen error", err)
+	for i := 1; i <= 2; i++ {
+		err := server.Serve(ctx)
+		var diagnostic AdmissionSupportDiagnostic
+		if !errors.As(err, &diagnostic) {
+			t.Fatalf("Serve #%d error = %T %v, want AdmissionSupportDiagnostic", i, err, err)
+		}
+		if !errors.Is(err, ErrAdmissionStrictSupportUnavailable) {
+			t.Fatalf("Serve #%d error = %v, want ErrAdmissionStrictSupportUnavailable", i, err)
+		}
 	}
-	if err := server.Serve(ctx); err == nil || !strings.Contains(err.Error(), "listen reached 2") {
-		t.Fatalf("second Serve error = %v, want second listen error", err)
-	}
-	if got := calls.Load(); got != 2 {
-		t.Fatalf("listener calls = %d, want 2", got)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("listener calls = %d, want 0", got)
 	}
 }
 
@@ -637,6 +640,7 @@ func TestSealedRootServeFailsTypedBeforeListen(t *testing.T) {
 	}
 
 	restart := newTestServerAtRoot(t, root, shortTempDir(t), newFakeBackend("fake"))
+	configureTestAdmissionRuntime(t, restart, newAdmissionFakeLaunchCustodian(t), true)
 	restart.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
 		return nil, socketFileIdentity{}, errors.New("listener must not open for sealed root")
 	}
@@ -689,7 +693,6 @@ func configureAdmissionSupport(t *testing.T, server *Server, launcher *admission
 	t.Helper()
 	support := admissionSupportForClass(t, class, cleanupSafe, 1)
 	runtime := &servedAdmissionRuntime{
-		runtime:          custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable),
 		launchCustodian:  launcher,
 		supportOverride:  &support,
 		verifierOverride: launcher.verifier,
@@ -703,6 +706,18 @@ func configureAdmissionSupport(t *testing.T, server *Server, launcher *admission
 		}
 	}
 	server.admissionRuntime = runtime
+}
+
+func configureAvailableServedRuntime(t *testing.T, server *Server, runtime custodian.Runtime) {
+	t.Helper()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	support := admissionSupportForClass(t, custodian.SupportAvailable, true, 1)
+	server.admissionRuntime = &servedAdmissionRuntime{
+		runtime:          runtime,
+		launchCustodian:  launcher,
+		supportOverride:  &support,
+		verifierOverride: launcher.verifier,
+	}
 }
 
 func admissionSupportForClass(t *testing.T, class custodian.SupportClass, cleanupSafe bool, attempts int) custodian.Support {
@@ -763,24 +778,19 @@ func newTestServerAtRoot(t *testing.T, root, cwd string, backend engine.Backend)
 	return server
 }
 
-func (s *Server) recordStartupEvent(event string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.sessions == nil {
-		s.sessions = map[string]*sessionState{}
-	}
-	s.sessions["startup-event-"+fmt.Sprintf("%03d", len(s.sessions))] = &sessionState{id: event}
+type startupEventRecorder struct {
+	mu     sync.Mutex
+	events []string
 }
 
-func (s *Server) startupEvents() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	events := make([]string, 0)
-	for i := 0; ; i++ {
-		state := s.sessions[fmt.Sprintf("startup-event-%03d", i)]
-		if state == nil {
-			return events
-		}
-		events = append(events, state.id)
-	}
+func (r *startupEventRecorder) record(event string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, event)
+}
+
+func (r *startupEventRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.events...)
 }

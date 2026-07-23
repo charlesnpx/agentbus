@@ -156,6 +156,26 @@ func TestStartupRecoveryDoesNotDecodeOrReplayParkProtocolFrames(t *testing.T) {
 	}
 }
 
+func TestServedDoesNotCallBackendTurnOutsideAuthorityLaunch(t *testing.T) {
+	root := repoRoot(t)
+	files := collectNonTestGoFiles(t, []string{filepath.Join(root, "internal", "served")})
+	for _, path := range files {
+		file := parseGoFile(t, path, 0)
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != "Turn" {
+				return true
+			}
+			t.Fatalf("%s calls Session.Turn directly; strict execution must go through authority-controlled launch", path)
+			return false
+		})
+	}
+}
+
 func TestLogicalLayerDoesNotReferenceReleaseCredentials(t *testing.T) {
 	root := repoRoot(t)
 	files := collectNonTestGoFiles(t, []string{

@@ -23,9 +23,6 @@ import (
 
 const (
 	cliJSONSchema = 1
-
-	admissionModeLegacy = "legacy"
-	admissionModeStrict = "strict"
 )
 
 var version = "dev"
@@ -106,8 +103,6 @@ func (a *app) run(ctx context.Context, args []string, in io.Reader, out, errOut 
 		return a.runServe(ctx, args[1:], errOut)
 	case "admission":
 		return a.runAdmission(ctx, args[1:], out, errOut)
-	case "sessions":
-		return a.runSessions(args[1:], out, errOut)
 	case "status":
 		return a.runStatus(args[1:], out, errOut)
 	case "result":
@@ -185,19 +180,14 @@ func (a *app) runSetup(ctx context.Context, args []string, out, errOut io.Writer
 func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int {
 	fs := newCommandFlagSet("serve", errOut)
 	foreground := fs.Bool("foreground", false, "run daemon in foreground")
-	admissionModeRaw := fs.String("admission", admissionModeLegacy, "admission mode: legacy or strict; strict requires Linux cgroup-v2")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
 	if fs.NArg() != 0 {
 		return usageError(errOut, "serve does not accept positional arguments")
 	}
-	admissionMode, err := normalizeServeAdmissionMode(*admissionModeRaw)
-	if err != nil {
-		return usageError(errOut, err.Error())
-	}
 	if !*foreground {
-		if err := a.startBackgroundDaemon(ctx, admissionMode); err != nil {
+		if err := a.startBackgroundDaemon(ctx); err != nil {
 			return commandError(errOut, err)
 		}
 		return 0
@@ -208,35 +198,18 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 			backends = append(backends, spec.backend)
 		}
 	}
-	err = agentbusserve.Serve(ctx, agentbusserve.Config{
-		StateRoot:                a.stateRoot,
-		CWD:                      a.cwd,
-		Backends:                 backends,
-		Registry:                 a.registryOrDefault(),
-		Clock:                    a.clock,
-		ProcessTable:             a.processes,
-		StrictAdmissionRequested: admissionMode == admissionModeStrict,
+	err := agentbusserve.Serve(ctx, agentbusserve.Config{
+		StateRoot:    a.stateRoot,
+		CWD:          a.cwd,
+		Backends:     backends,
+		Registry:     a.registryOrDefault(),
+		Clock:        a.clock,
+		ProcessTable: a.processes,
 	})
 	if err != nil {
 		return commandError(errOut, err)
 	}
 	return 0
-}
-
-func normalizeServeAdmissionMode(raw string) (string, error) {
-	// The flag default already supplies "legacy" when --admission is absent,
-	// so an empty or whitespace-only value here is always an EXPLICIT
-	// malformed configuration (e.g. --admission="$UNSET_VAR"). Fail closed
-	// with a usage error rather than silently selecting legacy.
-	mode := strings.TrimSpace(raw)
-	switch mode {
-	case admissionModeLegacy:
-		return admissionModeLegacy, nil
-	case admissionModeStrict:
-		return admissionModeStrict, nil
-	default:
-		return "", fmt.Errorf("serve --admission must be %q or %q", admissionModeLegacy, admissionModeStrict)
-	}
 }
 
 func (a *app) runAdmission(ctx context.Context, args []string, out, errOut io.Writer) int {
@@ -403,15 +376,12 @@ func (a *app) runAdmissionClearFailStop(ctx context.Context, args []string, out,
 	return 0
 }
 
-func (a *app) startBackgroundDaemon(ctx context.Context, admissionMode string) error {
+func (a *app) startBackgroundDaemon(ctx context.Context) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
 	cmdArgs := []string{"serve", "--foreground"}
-	if admissionMode == admissionModeStrict {
-		cmdArgs = append(cmdArgs, "--admission="+admissionModeStrict)
-	}
 	cmd := exec.CommandContext(ctx, exe, cmdArgs...)
 	cmd.Env = os.Environ()
 	if a.stateRoot != "" {
@@ -471,40 +441,6 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	return os.Chmod(path, mode)
-}
-
-func (a *app) runSessions(args []string, out, errOut io.Writer) int {
-	fs := newCommandFlagSet("sessions", errOut)
-	jsonOut := fs.Bool("json", false, "emit JSON: {\"sessions\":[{\"sessionId\":\"...\",\"backend\":\"codex\",\"cwd\":\"...\",\"tags\":{},\"activeTurnId\":null}]}")
-	tags := tagFilter{}
-	fs.Var(&tags, "tags", "exact tag filter k=v; repeat for multiple tags")
-	if code, ok := parseFlags(fs, args); !ok {
-		return code
-	}
-	if fs.NArg() != 0 {
-		return usageError(errOut, "sessions does not accept positional arguments")
-	}
-	store, err := a.newStore()
-	if err != nil {
-		return commandError(errOut, err)
-	}
-	records, err := store.List()
-	if err != nil {
-		return commandError(errOut, err)
-	}
-	sessions := sessionsFromRecords(records, store.Layout().Workspace, tags)
-	result := sessionsOutput{Sessions: sessions}
-	if *jsonOut {
-		return writeOrError(out, errOut, result)
-	}
-	for _, session := range sessions {
-		active := "-"
-		if session.ActiveTurnID != nil {
-			active = *session.ActiveTurnID
-		}
-		fmt.Fprintf(out, "%s\t%s\t%s\tactive=%s\n", session.SessionID, session.Backend, session.CWD, active)
-	}
-	return 0
 }
 
 func (a *app) runStatus(args []string, out, errOut io.Writer) int {
@@ -858,41 +794,6 @@ func readValidationText(path string, in io.Reader) (string, error) {
 	return string(raw), nil
 }
 
-func sessionsFromRecords(records []engine.JobRecord, cwd string, tags map[string]string) []sessionInfo {
-	byID := make(map[string]*sessionInfo)
-	for _, record := range records {
-		if record.SessionID == "" || !tagsMatch(record.Tags, tags) {
-			continue
-		}
-		session := byID[record.SessionID]
-		if session == nil {
-			session = &sessionInfo{
-				SessionID: record.SessionID,
-				Backend:   record.Backend,
-				CWD:       cwd,
-				Tags:      cloneTags(record.Tags),
-			}
-			byID[record.SessionID] = session
-		}
-		if session.Backend == "" {
-			session.Backend = record.Backend
-		}
-		if len(session.Tags) == 0 {
-			session.Tags = cloneTags(record.Tags)
-		}
-		if !engine.IsTerminal(record.State) {
-			active := record.JobID
-			session.ActiveTurnID = &active
-		}
-	}
-	sessions := make([]sessionInfo, 0, len(byID))
-	for _, session := range byID {
-		sessions = append(sessions, *session)
-	}
-	sort.Slice(sessions, func(i, j int) bool { return sessions[i].SessionID < sessions[j].SessionID })
-	return sessions
-}
-
 func tagsMatch(actual map[string]string, want map[string]string) bool {
 	for key, value := range want {
 		if actual[key] != value {
@@ -1049,9 +950,8 @@ func printRootHelp(out io.Writer) {
 	fmt.Fprint(out, `Usage:
   agentbus version [--json]
   agentbus setup [--json]
-  agentbus serve [--foreground] [--admission=legacy|strict]
+  agentbus serve [--foreground]
   agentbus admission <inspect|recover|reset-empty-root|seal|clear-fail-stop> --state-root <path>
-  agentbus sessions [--tags k=v] [--json]
   agentbus status [--job <id>] [--json]
   agentbus result --job <id> [--json]
   agentbus cancel --job <id> [--json]
@@ -1060,7 +960,6 @@ func printRootHelp(out io.Writer) {
 JSON shapes:
   version:  {"schema":1,"version":"dev","protocolVersion":2}
   setup:    {"schema":1,"backends":[{"backend":"codex","binaryPath":"...","version":"...","configMode":{"write":"user","readOnly":"hermetic"},"sandboxModes":["workspace-write","read-only"],"jsonEventsProbe":{"ran":true,"version":"...","streamSchema":"codex-json-v1"}}]}
-  sessions: {"sessions":[{"sessionId":"...","backend":"codex","cwd":"...","tags":{},"activeTurnId":null}]}
   status:   {"jobs":[{"jobId":"...","state":"running","lease":{"expiresAt":"...","expired":false}}]}
   result:   {"jobId":"...","state":"completed","result":{"text":"...","resultPath":"...","sha256":"...","bytes":1},"contract":{...}}
   cancel:   {"jobId":"...","state":"canceled"}
@@ -1070,7 +969,7 @@ Exit codes for single-job status/result/cancel:
   completed=0, non-terminal=2, completed_noncompliant=3, failed=4, timed_out=5, interrupted=6, canceled=7, reaped=8, quarantined=9
 
 Serve admission:
-  --admission=legacy is the default. --admission=strict explicitly activates strict identified admission on Linux cgroup-v2; unsupported hosts fail closed at startup. Strict activation is one-way for a state root; use admission recover, seal, or reset-empty-root for the admin escape hatches. The first strict release supports one active state root.
+  serve always starts the strict identified admission runtime. Unsupported hosts fail closed at startup. Strict activation is one-way for a state root; use admission recover, seal, or reset-empty-root for the admin escape hatches. The first strict release supports one active state root.
 `)
 }
 
@@ -1176,18 +1075,6 @@ type setupJSONEventsProbe struct {
 	Ran          bool   `json:"ran"`
 	Version      string `json:"version,omitempty"`
 	StreamSchema string `json:"streamSchema,omitempty"`
-}
-
-type sessionsOutput struct {
-	Sessions []sessionInfo `json:"sessions"`
-}
-
-type sessionInfo struct {
-	SessionID    string            `json:"sessionId"`
-	Backend      string            `json:"backend,omitempty"`
-	CWD          string            `json:"cwd,omitempty"`
-	Tags         map[string]string `json:"tags,omitempty"`
-	ActiveTurnID *string           `json:"activeTurnId"`
 }
 
 type statusOutput struct {

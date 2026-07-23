@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"unicode"
@@ -109,16 +110,13 @@ func (e admissionBackendContractViolationError) Error() string {
 type AdmissionServeMode uint8
 
 const (
-	AdmissionLegacy AdmissionServeMode = iota
-	AdmissionStrictIdentified
+	AdmissionStrictIdentified AdmissionServeMode = iota + 1
 	AdmissionRecoveryOnly
 	AdmissionFatal
 )
 
 func (mode AdmissionServeMode) String() string {
 	switch mode {
-	case AdmissionLegacy:
-		return "legacy"
 	case AdmissionStrictIdentified:
 		return "strict_identified"
 	case AdmissionRecoveryOnly:
@@ -146,7 +144,6 @@ type ServeAdmissionPolicy struct {
 	CrashDurableContainment   bool
 	AcceptIdentified          bool
 	AdvertiseRequestID        bool
-	RejectLegacySubmissions   bool
 	Reason                    error
 	strictRouteEnabled        bool
 	strictRouteDisabledReason string
@@ -164,13 +161,8 @@ type ServeBackendFenceability struct {
 }
 
 func deriveServeAdmissionPolicy(metadata authority.AdmissionRootMetadata, runtimeSupport custodian.Support, descriptors map[string]admissionBackendDescriptor) ServeAdmissionPolicy {
-	mode := AdmissionLegacy
-	if metadata.Activated {
-		mode = AdmissionFatal
-		if strictSupportAvailable(runtimeSupport) {
-			mode = AdmissionStrictIdentified
-		}
-	} else if strictSupportConfigured(runtimeSupport) && strictSupportAvailable(runtimeSupport) {
+	mode := AdmissionFatal
+	if strictSupportAvailable(runtimeSupport) {
 		mode = AdmissionStrictIdentified
 	}
 	reason := error(nil)
@@ -182,7 +174,6 @@ func deriveServeAdmissionPolicy(metadata authority.AdmissionRootMetadata, runtim
 		CrashDurableContainment: strictSupportAvailable(runtimeSupport),
 		AcceptIdentified:        mode == AdmissionStrictIdentified,
 		AdvertiseRequestID:      false,
-		RejectLegacySubmissions: metadata.Activated,
 		Reason:                  reason,
 		strictRouteEnabled:      mode != AdmissionFatal,
 		runtimeSupport:          runtimeSupport,
@@ -368,10 +359,6 @@ func admissionSupportAttemptCost(assessment custodian.SupportAssessment) int {
 	return 1
 }
 
-func strictSupportConfigured(support custodian.Support) bool {
-	return support.FeatureConfigured || support.FeatureAdvertised
-}
-
 func strictSupportAvailable(support custodian.Support) bool {
 	return support.Assessment.Class == custodian.SupportAvailable &&
 		support.RuntimeProbePassed &&
@@ -468,20 +455,17 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 			return err
 		}
 	} else {
-		support = runtime.assessSupport(ctx)
-		if runtime.strictAdmissionRequested() || strictSupportConfigured(support) {
-			support = s.assessAdmissionSupportWithRetryFrom(ctx, runtime, support)
-			if !strictSupportAvailable(support) {
-				err := newAdmissionSupportDiagnostic(metadata, support.Assessment, support.Assessment.Class == custodian.SupportRetryable)
-				logAdmissionSupportDiagnostic(err)
-				return err
-			}
-			activated, _, err := session.ActivateRoot(ctx)
-			if err != nil {
-				return err
-			}
-			metadata = activated
+		support = s.assessAdmissionSupportWithRetry(ctx, runtime)
+		if !strictSupportAvailable(support) {
+			err := newAdmissionSupportDiagnostic(metadata, support.Assessment, support.Assessment.Class == custodian.SupportRetryable)
+			logAdmissionSupportDiagnostic(err)
+			return err
 		}
+		activated, _, err := session.ActivateRoot(ctx)
+		if err != nil {
+			return err
+		}
+		metadata = activated
 		if s.admissionStartupHooks.BeforeRecovery != nil {
 			s.admissionStartupHooks.BeforeRecovery()
 		}
@@ -560,7 +544,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 }
 
 func (s *Server) failUnavailableStrictRuntimeBeforeRepository(ctx context.Context, runtime *servedAdmissionRuntime) error {
-	if runtime == nil || !runtime.strictAdmissionRequested() || !runtime.unavailableProcess() {
+	if runtime == nil || !runtime.unavailableProcess() {
 		return nil
 	}
 	support := s.assessAdmissionSupportWithRetry(ctx, runtime)
@@ -947,8 +931,6 @@ type servedSubmissionCoordinator struct {
 	latch  *SafetyLatch
 }
 
-var _ authority.SubmissionCoordinator = (*servedSubmissionCoordinator)(nil)
-
 type admissionParkableBackend interface {
 	AdmissionParkable() bool
 }
@@ -1056,21 +1038,6 @@ func (c *servedSubmissionCoordinator) SubmitIdentified(ctx context.Context, requ
 	return accepted, nil
 }
 
-func (c *servedSubmissionCoordinator) PrepareLegacyFenced(ctx context.Context, request authority.AcceptRequest) (authority.LegacyFencedPreparation, error) {
-	if c == nil || c.ready == nil {
-		return authority.LegacyFencedPreparation{}, authority.ErrNotReady
-	}
-	request.Mode = model.ModeLegacyFenced
-	accepted, err := c.ready.Accept(ctx, request)
-	if err != nil {
-		return authority.LegacyFencedPreparation{Admission: accepted}, err
-	}
-	return authority.LegacyFencedPreparation{
-		Admission: accepted,
-		Ordinal:   model.LaunchOrdinalOne,
-	}, nil
-}
-
 func (c *servedSubmissionCoordinator) LaunchRunner(binding admissionLaunchBinding, ordinal model.LaunchOrdinal) (command.Runner, error) {
 	if c == nil || c.launch == nil {
 		return nil, custodian.ErrSupervisorUnavailable
@@ -1083,145 +1050,6 @@ func (c *servedSubmissionCoordinator) LaunchRunner(binding admissionLaunchBindin
 		},
 		ContainmentIntent: binding.containmentIntent,
 	})
-}
-
-type legacyFencedPrepareRunner struct {
-	coordinator *servedSubmissionCoordinator
-	preparation authority.LegacyFencedPreparation
-	command     *legacyFencedCommand
-}
-
-func (r *legacyFencedPrepareRunner) Start(ctx context.Context, spec command.ExecSpec) (command.RunningCommand, error) {
-	if r == nil || r.coordinator == nil {
-		return nil, authority.ErrNotReady
-	}
-	cmd, preparation, err := r.coordinator.prepareLegacyFencedCommand(ctx, r.preparation.Admission, spec)
-	if err != nil {
-		return nil, err
-	}
-	r.preparation = preparation
-	r.command = cmd
-	return cmd, nil
-}
-
-func (c *servedSubmissionCoordinator) prepareLegacyFencedCommand(ctx context.Context, accepted authority.AcceptResult, spec command.ExecSpec) (*legacyFencedCommand, authority.LegacyFencedPreparation, error) {
-	if c == nil || c.launch == nil || c.ready == nil {
-		return nil, authority.LegacyFencedPreparation{}, authority.ErrNotReady
-	}
-	if accepted.Record.JobID == "" {
-		return nil, authority.LegacyFencedPreparation{}, fmt.Errorf("%w: LegacyFenced admission is empty", authority.ErrInvalidRequest)
-	}
-	ordinal := model.LaunchOrdinalOne
-	launchContext := launch.LaunchContext{
-		JobID:   accepted.Record.JobID,
-		Attempt: accepted.Record.Attempt.Ref,
-		Ordinal: ordinal,
-	}
-	request := launch.LaunchRequest{
-		Context: launchContext,
-		Exec:    spec,
-	}
-	if err := request.Validate(); err != nil {
-		return nil, authority.LegacyFencedPreparation{}, err
-	}
-	prepared, err := c.launch.Prepare(ctx, request)
-	if err != nil {
-		return nil, authority.LegacyFencedPreparation{}, err
-	}
-	group := prepared.Ref()
-	outcome, bindErr := c.launch.BindGroup(ctx, launchContext, group)
-	if err := c.handleLegacyPrepareDurability(ctx, "bind_group", outcome, bindErr, prepared, launchContext); err != nil {
-		return nil, authority.LegacyFencedPreparation{}, err
-	}
-	preparation := authority.LegacyFencedPreparation{
-		Admission: accepted,
-		Ordinal:   ordinal,
-		Group:     group,
-	}
-	return newLegacyFencedCommand(c, launchContext, group, prepared), preparation, nil
-}
-
-func (c *servedSubmissionCoordinator) handleLegacyPrepareDurability(ctx context.Context, step string, outcome launch.DurabilityOutcome, stepErr error, prepared launch.PreparedProcess, launchContext launch.LaunchContext) error {
-	mapped := admissionDurabilityError(step, outcome, stepErr)
-	switch outcome {
-	case launch.CommittedAndAnchored:
-		if mapped == nil {
-			return nil
-		}
-		return errors.Join(mapped, c.abortLegacyPrepared(ctx, prepared, true, launchContext))
-	case launch.DefinitelyNotCommitted:
-		return errors.Join(mapped, c.abortLegacyPrepared(ctx, prepared, false, launchContext))
-	default:
-		reason := errors.Join(mapped, c.abortLegacyPrepared(ctx, prepared, false, launchContext))
-		return errors.Join(reason, c.failStop(ctx, reason), launch.ErrFailClosed)
-	}
-}
-
-func (c *servedSubmissionCoordinator) abortLegacyPrepared(ctx context.Context, prepared launch.PreparedProcess, groupDurable bool, launchContext launch.LaunchContext) error {
-	if prepared == nil {
-		return nil
-	}
-	verified, cleanup, abortErr := prepared.AbortAndVerify(ctx)
-	if abortErr != nil {
-		reason := fmt.Errorf("abort legacy fenced prepared process: %w", abortErr)
-		return errors.Join(reason, c.failStop(ctx, reason), launch.ErrFailClosed)
-	}
-	if !groupDurable {
-		return cleanup.Err
-	}
-	outcome, err := c.launch.RecordQuiescence(ctx, launchContext, verified)
-	if mapped := admissionDurabilityError("record_quiescence", outcome, err); mapped != nil {
-		return errors.Join(mapped, c.failStop(ctx, mapped), launch.ErrFailClosed)
-	}
-	return cleanup.Err
-}
-
-func (c *servedSubmissionCoordinator) acknowledgeGrantAndReleaseLegacyFenced(ctx context.Context, cmd *legacyFencedCommand) error {
-	if cmd == nil {
-		return fmt.Errorf("%w: legacy fenced command is missing", authority.ErrInvalidRequest)
-	}
-	return cmd.grantAndRelease(ctx)
-}
-
-func (c *servedSubmissionCoordinator) rejectAndRetireLegacyFenced(ctx context.Context, cmd *legacyFencedCommand) error {
-	if cmd == nil {
-		return fmt.Errorf("%w: legacy fenced command is missing", authority.ErrInvalidRequest)
-	}
-	return cmd.reject(ctx, model.CauseResponseUndeliverable)
-}
-
-func (c *servedSubmissionCoordinator) rejectLegacyFencedBeforePrepare(ctx context.Context, accepted authority.AcceptResult) error {
-	if c == nil || c.ready == nil {
-		return authority.ErrNotReady
-	}
-	if accepted.Record.JobID == "" {
-		return fmt.Errorf("%w: LegacyFenced admission is empty", authority.ErrInvalidRequest)
-	}
-	if _, err := c.ready.BeginReject(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref); err != nil {
-		return err
-	}
-	_, err := c.ready.Finalize(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.TerminalIntent{
-		Outcome: model.OutcomeCanceled,
-		Cause:   model.CauseResponseUndeliverable,
-	})
-	return err
-}
-
-func (c *servedSubmissionCoordinator) rejectLegacyUnfencedBeforeRun(ctx context.Context, accepted authority.AcceptResult) error {
-	if c == nil || c.ready == nil {
-		return authority.ErrNotReady
-	}
-	if accepted.Record.JobID == "" {
-		return fmt.Errorf("%w: LegacyUnfenced admission is empty", authority.ErrInvalidRequest)
-	}
-	if _, err := c.ready.RequestCancel(ctx, accepted.Record.JobID); err != nil {
-		return err
-	}
-	_, err := c.ready.Finalize(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.TerminalIntent{
-		Outcome: model.OutcomeCanceled,
-		Cause:   model.CauseResponseUndeliverable,
-	})
-	return err
 }
 
 func (c *servedSubmissionCoordinator) failStop(ctx context.Context, err error) error {
@@ -1279,470 +1107,6 @@ func detachedAdmissionCleanupContext(ctx context.Context) (context.Context, cont
 		ctx = context.Background()
 	}
 	return context.WithTimeout(context.WithoutCancel(ctx), admissionDetachedCleanupTimeout)
-}
-
-type legacyFencedCommand struct {
-	coordinator   *servedSubmissionCoordinator
-	launchContext launch.LaunchContext
-	group         model.GroupRef
-	prepared      launch.PreparedProcess
-	stdin         *legacyFencedStdin
-	stdoutReader  *io.PipeReader
-	stdoutWriter  *io.PipeWriter
-	stderrReader  *io.PipeReader
-	stderrWriter  *io.PipeWriter
-
-	mu       sync.Mutex
-	running  launch.RunningProcess
-	released bool
-	rejected bool
-	grant    model.LaunchGrant
-
-	doneOnce sync.Once
-	done     chan struct{}
-	exit     command.ExitObservation
-	err      error
-}
-
-func newLegacyFencedCommand(coordinator *servedSubmissionCoordinator, launchContext launch.LaunchContext, group model.GroupRef, prepared launch.PreparedProcess) *legacyFencedCommand {
-	stdoutReader, stdoutWriter := io.Pipe()
-	stderrReader, stderrWriter := io.Pipe()
-	return &legacyFencedCommand{
-		coordinator:   coordinator,
-		launchContext: launchContext,
-		group:         group,
-		prepared:      prepared,
-		stdin:         &legacyFencedStdin{},
-		stdoutReader:  stdoutReader,
-		stdoutWriter:  stdoutWriter,
-		stderrReader:  stderrReader,
-		stderrWriter:  stderrWriter,
-		done:          make(chan struct{}),
-	}
-}
-
-func (cmd *legacyFencedCommand) Stdin() io.WriteCloser {
-	return cmd.stdin
-}
-
-func (cmd *legacyFencedCommand) Stdout() io.ReadCloser {
-	return cmd.stdoutReader
-}
-
-func (cmd *legacyFencedCommand) Stderr() io.ReadCloser {
-	return cmd.stderrReader
-}
-
-func (cmd *legacyFencedCommand) Wait(ctx context.Context) (command.ExitObservation, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	select {
-	case <-cmd.done:
-		return cmd.result()
-	case <-ctx.Done():
-		if err := cmd.Interrupt(context.Background()); err != nil {
-			exit, finalErr := cmd.result()
-			return exit, errors.Join(ctx.Err(), err, finalErr)
-		}
-		exit, finalErr := cmd.result()
-		return exit, errors.Join(ctx.Err(), finalErr)
-	}
-}
-
-func (cmd *legacyFencedCommand) Interrupt(ctx context.Context) error {
-	cmd.mu.Lock()
-	running := cmd.running
-	released := cmd.released
-	rejected := cmd.rejected
-	cmd.mu.Unlock()
-	if rejected {
-		return nil
-	}
-	if !released || running == nil {
-		return cmd.reject(ctx, model.CauseCanceledBeforeAuthorization)
-	}
-	verified, cleanup, err := running.ContainAndVerify(ctx, custodian.QuiescenceCauseContain)
-	if err != nil {
-		return err
-	}
-	outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(ctx, cmd.launchContext, verified)
-	if mapped := admissionDurabilityError("record_quiescence", outcome, recordErr); mapped != nil {
-		return mapped
-	}
-	cmd.finish(command.ExitObservation{}, cleanup.Err)
-	return cleanup.Err
-}
-
-func (cmd *legacyFencedCommand) ProcessRef() (engine.ProcessRef, int) {
-	return engine.ProcessRef{
-		PID:       cmd.group.Leader.PID,
-		PGID:      cmd.group.PGID,
-		StartTime: cmd.group.Leader.HighResStartToken,
-	}, cmd.group.Leader.PID
-}
-
-func (cmd *legacyFencedCommand) grantAndRelease(ctx context.Context) error {
-	cmd.mu.Lock()
-	if cmd.rejected {
-		err := cmd.err
-		cmd.mu.Unlock()
-		if err == nil {
-			err = fmt.Errorf("%w: legacy fenced command was rejected", authority.ErrInvalidRequest)
-		}
-		return err
-	}
-	if cmd.released {
-		cmd.mu.Unlock()
-		return nil
-	}
-	cmd.mu.Unlock()
-
-	if _, err := cmd.coordinator.ready.Acknowledge(ctx, cmd.launchContext.JobID, cmd.launchContext.Attempt); err != nil {
-		cmd.failPrepared(ctx, err)
-		return err
-	}
-	grant, outcome, err := cmd.coordinator.launch.AllocateGrant(ctx, cmd.launchContext)
-	if mapped := admissionDurabilityError("allocate_grant", outcome, err); mapped != nil {
-		cmd.failPrepared(ctx, mapped)
-		return mapped
-	}
-	running, physicalReleaseOutcome, err := cmd.coordinator.launch.Release(ctx, cmd.prepared)
-	switch physicalReleaseOutcome {
-	case custodian.ReleaseAccepted:
-		if err != nil {
-			mapped := fmt.Errorf("%w: release accepted with error: %v", launch.ErrReleaseUncertain, err)
-			cmd.failReleasedByGroup(ctx, mapped)
-			return mapped
-		}
-	case custodian.ReleaseDefinitelyNotSent:
-		mapped := launch.ErrReleaseUncertain
-		if err != nil {
-			mapped = fmt.Errorf("%w: release definitely not sent: %v", launch.ErrReleaseUncertain, err)
-		}
-		cleanupCtx, cleanupCancel := detachedAdmissionCleanupContext(ctx)
-		outcome, recordErr := cmd.coordinator.launch.RecordReleaseOutcome(cleanupCtx, cmd.launchContext, model.LaunchReleaseNotSent)
-		cleanupCancel()
-		if releaseOutcomeErr := admissionDurabilityError("record_release_outcome", outcome, recordErr); releaseOutcomeErr != nil {
-			releaseOutcomeErr = fmt.Errorf("persist LaunchReleaseNotSent release outcome: %w", releaseOutcomeErr)
-			mapped = errors.Join(mapped, releaseOutcomeErr)
-			return cmd.failPreparedFailClosed(ctx, mapped)
-		}
-		cmd.failPrepared(ctx, mapped)
-		return mapped
-	case custodian.ReleaseOutcomeUnknown:
-		mapped := launch.ErrReleaseUncertain
-		if err != nil {
-			mapped = fmt.Errorf("%w: release outcome unknown: %v", launch.ErrReleaseUncertain, err)
-		}
-		cleanupCtx, cleanupCancel := detachedAdmissionCleanupContext(ctx)
-		outcome, recordErr := cmd.coordinator.launch.RecordReleaseOutcome(cleanupCtx, cmd.launchContext, model.LaunchReleaseSentUnknown)
-		cleanupCancel()
-		if releaseOutcomeErr := admissionDurabilityError("record_release_outcome", outcome, recordErr); releaseOutcomeErr != nil {
-			cmd.failReleasedByGroup(ctx, errors.Join(mapped, releaseOutcomeErr))
-			return errors.Join(mapped, releaseOutcomeErr)
-		}
-		cmd.finalizeReleaseUnknown(ctx, mapped)
-		return mapped
-	default:
-		mapped := fmt.Errorf("%w: invalid release outcome %d", launch.ErrReleaseUncertain, physicalReleaseOutcome)
-		if err != nil {
-			mapped = errors.Join(mapped, err)
-		}
-		cmd.failReleasedByGroup(ctx, mapped)
-		return mapped
-	}
-	if running == nil {
-		mapped := fmt.Errorf("%w: release returned nil running process", launch.ErrReleaseUncertain)
-		cmd.failReleasedByGroup(ctx, mapped)
-		return mapped
-	}
-	if !running.Ref().Equal(cmd.group) {
-		mapped := fmt.Errorf("%w: released group mismatch", launch.ErrReleaseUncertain)
-		cmd.failReleasedByGroup(ctx, mapped)
-		return mapped
-	}
-	child, evidence, err := admissionReleaseObservation(cmd.group)
-	if err != nil {
-		cmd.failReleased(ctx, running, err)
-		return err
-	}
-	releaseOutcome, releaseErr := cmd.coordinator.launch.RecordRelease(ctx, cmd.launchContext, cmd.group)
-	if mapped := admissionDurabilityError("record_release", releaseOutcome, releaseErr); mapped != nil {
-		cmd.failReleased(ctx, running, mapped)
-		return mapped
-	}
-	_ = child
-	_ = evidence
-
-	cmd.mu.Lock()
-	cmd.running = running
-	cmd.released = true
-	cmd.grant = grant
-	cmd.mu.Unlock()
-
-	if err := cmd.stdin.attach(running.Stdin()); err != nil {
-		cmd.failReleased(ctx, running, err)
-		return err
-	}
-	go copyAndClosePipe(cmd.stdoutWriter, running.Stdout())
-	go copyAndClosePipe(cmd.stderrWriter, running.Stderr())
-	go cmd.waitAndRecordQuiescence(context.WithoutCancel(ctx), running)
-	return nil
-}
-
-func (cmd *legacyFencedCommand) reject(ctx context.Context, cause model.TerminalCause) error {
-	cmd.mu.Lock()
-	if cmd.rejected {
-		err := cmd.err
-		cmd.mu.Unlock()
-		return err
-	}
-	if cmd.released {
-		cmd.mu.Unlock()
-		return fmt.Errorf("%w: legacy fenced command already released", authority.ErrInvalidRequest)
-	}
-	cmd.rejected = true
-	cmd.mu.Unlock()
-
-	err := cmd.rejectAuthority(ctx, cause)
-	cmd.closePipesWithError(err)
-	cmd.finish(command.ExitObservation{}, err)
-	return err
-}
-
-func (cmd *legacyFencedCommand) rejectAuthority(ctx context.Context, cause model.TerminalCause) error {
-	cleanupCtx, cancel := detachedAdmissionCleanupContext(ctx)
-	defer cancel()
-
-	var rejectErr error
-	if _, err := cmd.coordinator.ready.BeginReject(cleanupCtx, cmd.launchContext.JobID, cmd.launchContext.Attempt); err != nil {
-		rejectErr = fmt.Errorf("begin legacy fenced reject: %w", err)
-	}
-	verified, cleanup, err := cmd.prepared.AbortAndVerify(cleanupCtx)
-	if err != nil {
-		reason := fmt.Errorf("retire legacy fenced prepared process: %w", err)
-		return errors.Join(rejectErr, reason, cmd.coordinator.failStop(ctx, errors.Join(rejectErr, reason)), launch.ErrFailClosed)
-	}
-	outcome, err := cmd.coordinator.launch.RecordQuiescence(cleanupCtx, cmd.launchContext, verified)
-	if mapped := admissionDurabilityError("record_quiescence", outcome, err); mapped != nil {
-		reason := errors.Join(rejectErr, mapped)
-		return errors.Join(reason, cmd.coordinator.failStop(ctx, reason), launch.ErrFailClosed)
-	}
-	if rejectErr != nil {
-		reason := errors.Join(rejectErr, cleanup.Err)
-		return errors.Join(reason, cmd.coordinator.failStop(ctx, reason), launch.ErrFailClosed)
-	}
-	_, err = cmd.coordinator.ready.Finalize(cleanupCtx, cmd.launchContext.JobID, cmd.launchContext.Attempt, model.TerminalIntent{
-		Outcome: model.OutcomeCanceled,
-		Cause:   cause,
-	})
-	if err != nil {
-		reason := errors.Join(err, cleanup.Err)
-		return errors.Join(reason, cmd.coordinator.failStop(ctx, reason), launch.ErrFailClosed)
-	}
-	return cleanup.Err
-}
-
-func (cmd *legacyFencedCommand) failPrepared(ctx context.Context, reason error) {
-	err := errors.Join(reason, cmd.coordinator.abortLegacyPrepared(ctx, cmd.prepared, true, cmd.launchContext))
-	cmd.closePipesWithError(err)
-	cmd.finish(command.ExitObservation{}, err)
-}
-
-func (cmd *legacyFencedCommand) failPreparedFailClosed(ctx context.Context, reason error) error {
-	failReason := errors.Join(reason, cmd.coordinator.abortLegacyPrepared(ctx, cmd.prepared, true, cmd.launchContext))
-	err := errors.Join(failReason, cmd.coordinator.failStop(ctx, failReason), launch.ErrFailClosed)
-	cmd.closePipesWithError(err)
-	cmd.finish(command.ExitObservation{}, err)
-	return err
-}
-
-func (cmd *legacyFencedCommand) failReleasedByGroup(ctx context.Context, reason error) {
-	cleanupCtx, cancel := detachedAdmissionCleanupContext(ctx)
-	defer cancel()
-
-	verified, cleanup, containErr := cmd.coordinator.launch.ContainAndVerifyWithCleanup(cleanupCtx, cmd.launchContext, cmd.group, custodian.QuiescenceCauseContain)
-	if containErr == nil {
-		outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(cleanupCtx, cmd.launchContext, verified)
-		containErr = errors.Join(cleanup.Err, admissionDurabilityError("record_quiescence", outcome, recordErr))
-	}
-	err := errors.Join(reason, containErr, cmd.coordinator.failStop(ctx, errors.Join(reason, containErr)), launch.ErrFailClosed)
-	cmd.closePipesWithError(err)
-	cmd.finish(command.ExitObservation{}, err)
-}
-
-func (cmd *legacyFencedCommand) finalizeReleaseUnknown(ctx context.Context, reason error) {
-	cleanupCtx, cancel := detachedAdmissionCleanupContext(ctx)
-	defer cancel()
-
-	verified, cleanup, containErr := cmd.coordinator.launch.ContainAndVerifyWithCleanup(cleanupCtx, cmd.launchContext, cmd.group, custodian.QuiescenceCauseContain)
-	if containErr != nil {
-		err := errors.Join(reason, containErr, cmd.coordinator.failStop(ctx, errors.Join(reason, containErr)), launch.ErrFailClosed)
-		cmd.closePipesWithError(err)
-		cmd.finish(command.ExitObservation{}, err)
-		return
-	}
-	outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(cleanupCtx, cmd.launchContext, verified)
-	if mapped := admissionDurabilityError("record_quiescence", outcome, recordErr); mapped != nil {
-		err := errors.Join(reason, mapped, cmd.coordinator.failStop(ctx, errors.Join(reason, mapped)), launch.ErrFailClosed)
-		cmd.closePipesWithError(err)
-		cmd.finish(command.ExitObservation{}, err)
-		return
-	}
-	// C4 release ambiguity is closed by durable quiescence proof: never resend,
-	// finalize failed with a typed cause, and reserve fail-stop for unprovable
-	// containment or unknown durability.
-	_, finalizeErr := cmd.coordinator.ready.Finalize(cleanupCtx, cmd.launchContext.JobID, cmd.launchContext.Attempt, model.TerminalIntent{
-		Outcome: model.OutcomeFailed,
-		Cause:   model.CauseReleaseOutcomeUnknown,
-	})
-	if finalizeErr != nil {
-		err := errors.Join(reason, finalizeErr, cleanup.Err, cmd.coordinator.failStop(ctx, errors.Join(reason, finalizeErr, cleanup.Err)), launch.ErrFailClosed)
-		cmd.closePipesWithError(err)
-		cmd.finish(command.ExitObservation{}, err)
-		return
-	}
-	err := errors.Join(reason, cleanup.Err)
-	cmd.closePipesWithError(err)
-	cmd.finish(command.ExitObservation{}, err)
-}
-
-func (cmd *legacyFencedCommand) failReleased(ctx context.Context, running launch.RunningProcess, reason error) {
-	cleanupCtx, cancel := detachedAdmissionCleanupContext(ctx)
-	defer cancel()
-
-	verified, cleanup, containErr := running.ContainAndVerify(cleanupCtx, custodian.QuiescenceCauseContain)
-	if containErr == nil {
-		outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(cleanupCtx, cmd.launchContext, verified)
-		containErr = errors.Join(cleanup.Err, admissionDurabilityError("record_quiescence", outcome, recordErr))
-	}
-	err := errors.Join(reason, containErr, cmd.coordinator.failStop(ctx, errors.Join(reason, containErr)), launch.ErrFailClosed)
-	cmd.closePipesWithError(err)
-	cmd.finish(command.ExitObservation{}, err)
-}
-
-func (cmd *legacyFencedCommand) waitAndRecordQuiescence(ctx context.Context, running launch.RunningProcess) {
-	exit, verified, cleanup, err := running.WaitAndVerify(ctx)
-	if err == nil {
-		outcome, recordErr := cmd.coordinator.launch.RecordQuiescence(ctx, cmd.launchContext, verified)
-		err = errors.Join(cleanup.Err, admissionDurabilityError("record_quiescence", outcome, recordErr))
-	}
-	cmd.finish(exit, err)
-}
-
-func (cmd *legacyFencedCommand) closePipesWithError(err error) {
-	_ = cmd.stdin.Close()
-	_ = cmd.stdoutWriter.CloseWithError(err)
-	_ = cmd.stderrWriter.CloseWithError(err)
-}
-
-func (cmd *legacyFencedCommand) finish(exit command.ExitObservation, err error) {
-	cmd.doneOnce.Do(func() {
-		cmd.mu.Lock()
-		cmd.exit = exit
-		cmd.err = err
-		cmd.mu.Unlock()
-		close(cmd.done)
-	})
-}
-
-func (cmd *legacyFencedCommand) result() (command.ExitObservation, error) {
-	cmd.mu.Lock()
-	defer cmd.mu.Unlock()
-	return cmd.exit, cmd.err
-}
-
-type legacyFencedStdin struct {
-	mu     sync.Mutex
-	buffer bytes.Buffer
-	target io.WriteCloser
-	closed bool
-}
-
-func (s *legacyFencedStdin) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return 0, io.ErrClosedPipe
-	}
-	if s.target == nil {
-		n, err := s.buffer.Write(p)
-		s.mu.Unlock()
-		return n, err
-	}
-	target := s.target
-	s.mu.Unlock()
-	return target.Write(p)
-}
-
-func (s *legacyFencedStdin) Close() error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil
-	}
-	s.closed = true
-	target := s.target
-	s.mu.Unlock()
-	if target != nil {
-		return target.Close()
-	}
-	return nil
-}
-
-func (s *legacyFencedStdin) attach(target io.WriteCloser) error {
-	if target == nil {
-		return nil
-	}
-	s.mu.Lock()
-	if s.target != nil {
-		s.mu.Unlock()
-		return nil
-	}
-	data := append([]byte(nil), s.buffer.Bytes()...)
-	closed := s.closed
-	s.buffer.Reset()
-	s.target = target
-	s.mu.Unlock()
-	if len(data) != 0 {
-		if _, err := target.Write(data); err != nil {
-			return err
-		}
-	}
-	if closed {
-		return target.Close()
-	}
-	return nil
-}
-
-func copyAndClosePipe(dst *io.PipeWriter, src io.ReadCloser) {
-	if src == nil {
-		_ = dst.Close()
-		return
-	}
-	_, err := io.Copy(dst, src)
-	_ = src.Close()
-	if err != nil {
-		_ = dst.CloseWithError(err)
-		return
-	}
-	_ = dst.Close()
-}
-
-func admissionReleaseObservation(group model.GroupRef) (model.ChildIdentity, model.Evidence, error) {
-	child := model.ChildIdentity{
-		PID:               group.Leader.PID,
-		HighResStartToken: group.Leader.HighResStartToken,
-	}
-	if err := child.Validate(); err != nil {
-		return model.ChildIdentity{}, model.Evidence{}, err
-	}
-	evidence, err := model.NewEvidence("custodian_release", fmt.Sprintf("release acknowledged for custody %s ordinal %s", group.CustodyID, group.Launch.Ordinal))
-	if err != nil {
-		return model.ChildIdentity{}, model.Evidence{}, err
-	}
-	return child, evidence, nil
 }
 
 func admissionDurabilityError(step string, outcome launch.DurabilityOutcome, err error) error {
@@ -1970,18 +1334,6 @@ func admissionUnquiescedOrdinals(record model.SafetyRecord) []model.LaunchOrdina
 	return ordinals
 }
 
-func jobSubmitIdentified(raw json.RawMessage, params protocol.JobSubmitParams) (bool, error) {
-	workspaceKeyPresent, err := jsonFieldPresent(raw, "workspaceKey")
-	if err != nil {
-		return false, err
-	}
-	requestIDPresent, err := jsonFieldPresent(raw, "requestId")
-	if err != nil {
-		return false, err
-	}
-	return workspaceKeyPresent || requestIDPresent || params.WorkspaceKey != "" || params.RequestID != "", nil
-}
-
 func jsonFieldPresent(raw json.RawMessage, field string) (bool, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return false, nil
@@ -2015,18 +1367,12 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		}
 		return requestOutcome{err: strictAdmissionProtocolError(
 			protocol.ErrorCapabilityMissing,
-			protocol.AdmissionRejectStrictRouteDisabled,
+			protocol.AdmissionRejectUnavailableNativeRuntime,
 			reason,
 			protocol.ErrorData{},
 		)}
 	}
 
-	// Strict admission rejection order is policy/route, identity, static
-	// backend fenceability, strict config, native runtime, replay, then durable
-	// acceptance. Dynamic session capability verification is the ordering
-	// exception: a backend can violate its controlled-runner descriptor only
-	// when Start constructs a session, so that contract check runs immediately
-	// after Start and before any durable admission mutation.
 	requestKey, err := model.NewRequestKey(params.WorkspaceKey, params.RequestID)
 	if err != nil {
 		return requestOutcome{err: strictAdmissionProtocolError(
@@ -2035,6 +1381,35 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 			err.Error(),
 			protocol.ErrorData{},
 		)}
+	}
+
+	rawTaskSpec, err := rawTaskSpecFromSubmitParams(raw)
+	if err != nil {
+		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{})}
+	}
+
+	replay, err := instance.ready.LookupReplay(ctx, requestKey)
+	if err != nil {
+		return requestOutcome{err: admissionProtocolError(err)}
+	}
+	switch replay.State {
+	case authority.ReplayLive:
+		if replay.Binding.Mode != model.ModeIdentifiedFenced {
+			return requestOutcome{err: strictAdmissionReplayConflictError("request is already bound to a different admission mode")}
+		}
+		if errObj := strictAdmissionReplayIdentityError(replay.Binding.TaskIdentity, rawTaskSpec); errObj != nil {
+			return requestOutcome{err: errObj}
+		}
+		return requestOutcome{result: protocol.JobSubmitResult{
+			JobID:        replay.Record.JobID.String(),
+			State:        admissionState(replay.Projection.Public),
+			Deduplicated: true,
+		}}
+	case authority.ReplayExpired:
+		if errObj := strictAdmissionReplayIdentityError(replay.Tombstone.TaskIdentity, rawTaskSpec); errObj != nil {
+			return requestOutcome{err: errObj}
+		}
+		return requestOutcome{err: admissionProtocolError(authority.ErrRequestExpired)}
 	}
 
 	spec := params.TaskSpec
@@ -2064,7 +1439,6 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 			)}
 		}
 	}
-
 	var strictParams protocol.JobSubmitParams
 	if err := decodeStrict(raw, &strictParams); err != nil {
 		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{Backend: spec.Backend})}
@@ -2085,43 +1459,29 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	if err != nil {
 		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{Backend: spec.Backend})}
 	}
-	rawTaskSpec, err := rawTaskSpecFromSubmitParams(raw)
-	if err != nil {
-		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{Backend: spec.Backend})}
-	}
-	taskIdentity, err := model.TaskIdentityFromRawTaskSpec(rawTaskSpec)
-	if err != nil {
-		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{Backend: spec.Backend})}
+	if descriptor.backend == nil {
+		var ok bool
+		descriptor, ok = instance.descriptor(spec.Backend)
+		if !ok {
+			return requestOutcome{err: strictAdmissionProtocolError(
+				protocol.ErrorBackendUnavailable,
+				protocol.AdmissionRejectUnsupportedBackend,
+				"backend is unavailable",
+				protocol.ErrorData{Backend: spec.Backend},
+			)}
+		}
 	}
 	canonicalCWD, err := engine.CanonicalWorkspace(spec.CWD)
 	if err != nil {
 		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{Backend: spec.Backend})}
 	}
 	workspaceLayoutKey := model.WorkspaceKey(engine.WorkspaceKey(canonicalCWD))
-
+	taskIdentity, err := model.TaskIdentityFromRawTaskSpec(rawTaskSpec)
+	if err != nil {
+		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{Backend: spec.Backend})}
+	}
 	if !instance.policy.strictRuntimeAvailable() {
 		return requestOutcome{err: strictAdmissionRuntimeUnavailableError(instance.policy.runtimeAssessment, protocol.ErrorData{Backend: spec.Backend})}
-	}
-
-	replay, err := instance.ready.LookupReplay(ctx, requestKey)
-	if err != nil {
-		return requestOutcome{err: admissionProtocolError(err)}
-	}
-	switch replay.State {
-	case authority.ReplayLive:
-		if !replay.Binding.TaskIdentity.Equal(taskIdentity) || replay.Binding.Mode != model.ModeIdentifiedFenced {
-			return requestOutcome{err: admissionProtocolError(authority.ErrReplayConflict)}
-		}
-		return requestOutcome{result: protocol.JobSubmitResult{
-			JobID:        replay.Record.JobID.String(),
-			State:        admissionState(replay.Projection.Public),
-			Deduplicated: true,
-		}}
-	case authority.ReplayExpired:
-		if !replay.Tombstone.TaskIdentity.Equal(taskIdentity) {
-			return requestOutcome{err: admissionProtocolError(authority.ErrReplayConflict)}
-		}
-		return requestOutcome{err: admissionProtocolError(authority.ErrRequestExpired)}
 	}
 
 	session, err := descriptor.backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
@@ -2244,6 +1604,33 @@ func strictAdmissionInvalidConfigError(message string, data protocol.ErrorData) 
 	return strictAdmissionProtocolError(protocol.ErrorInvalidTaskSpec, protocol.AdmissionRejectInvalidStrictConfig, message, data)
 }
 
+func strictAdmissionReplayIdentityError(recorded model.TaskIdentity, rawTaskSpec json.RawMessage) *protocol.ErrorObject {
+	if err := model.TaskIdentityMatchesRawTaskSpec(recorded, rawTaskSpec); err != nil {
+		if recorded.Algorithm != model.TaskIdentityAlgorithmSHA256 || recorded.Version != model.CurrentTaskIdentityVersion {
+			return strictAdmissionProtocolError(
+				protocol.ErrorInvalidTaskSpec,
+				protocol.AdmissionRejectRequestFingerprintUnsupported,
+				err.Error(),
+				protocol.ErrorData{},
+			)
+		}
+		return strictAdmissionReplayConflictError(err.Error())
+	}
+	return nil
+}
+
+func strictAdmissionReplayConflictError(message string) *protocol.ErrorObject {
+	if strings.TrimSpace(message) == "" {
+		message = authority.ErrReplayConflict.Error()
+	}
+	return strictAdmissionProtocolError(
+		protocol.ErrorInvalidTaskSpec,
+		protocol.AdmissionRejectReplayConflict,
+		message,
+		protocol.ErrorData{},
+	)
+}
+
 func (s *Server) strictRouteDisabledPrecheck() *protocol.ErrorObject {
 	if s.admissionCurrentServeClosing() {
 		return admissionProtocolError(errAdmissionClosing)
@@ -2259,28 +1646,12 @@ func (s *Server) strictRouteDisabledPrecheck() *protocol.ErrorObject {
 		}
 		return strictAdmissionProtocolError(
 			protocol.ErrorCapabilityMissing,
-			protocol.AdmissionRejectStrictRouteDisabled,
+			protocol.AdmissionRejectUnavailableNativeRuntime,
 			reason,
 			protocol.ErrorData{},
 		)
 	}
 	return nil
-}
-
-func (s *Server) legacyAdmissionDowngradePrecheck() *protocol.ErrorObject {
-	s.admissionStateMu.RLock()
-	defer s.admissionStateMu.RUnlock()
-	instance := s.admissionInstance
-	if instance == nil || !instance.policy.RejectLegacySubmissions {
-		return nil
-	}
-	message := "activated admission root rejects legacy submissions"
-	return strictAdmissionProtocolError(
-		protocol.ErrorCapabilityMissing,
-		protocol.AdmissionRejectLegacyDowngrade,
-		message,
-		protocol.ErrorData{},
-	)
 }
 
 func strictAdmissionRuntimeUnavailableError(assessment custodian.SupportAssessment, data protocol.ErrorData) *protocol.ErrorObject {
@@ -2356,81 +1727,9 @@ func (s *Server) handleAdmissionResponseOutcome(ctx context.Context, run jobRun,
 	switch action {
 	case model.RunAcceptedObligation, model.RetainObligationForReplay:
 		go s.launchAdmittedJob(ctx, run)
-	case model.AcknowledgeGrantAndRelease:
-		if err := s.withAdmissionSubmission(func(submission *servedSubmissionCoordinator) error {
-			return submission.acknowledgeGrantAndReleaseLegacyFenced(ctx, run.legacyFencedCommand)
-		}); err != nil {
-			_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
-			return
-		}
-		go s.launchAdmittedJob(ctx, run)
-	case model.RejectAndRetireNoGrant:
-		err := s.withAdmissionSubmission(func(submission *servedSubmissionCoordinator) error {
-			if run.legacyFencedCommand != nil {
-				return submission.rejectAndRetireLegacyFenced(ctx, run.legacyFencedCommand)
-			}
-			return submission.rejectLegacyFencedBeforePrepare(ctx, run.admissionAccepted)
-		})
-		if err != nil {
-			_ = s.failStopAdmissionReady(ctx, err)
-		}
-	case model.RunLegacyUnfenced:
-		go s.launchLegacyUnfencedJob(ctx, run)
-	case model.RejectLegacyUnfencedBeforeRun:
-		if err := s.withAdmissionSubmission(func(submission *servedSubmissionCoordinator) error {
-			return submission.rejectLegacyUnfencedBeforeRun(ctx, run.admissionAccepted)
-		}); err != nil {
-			_ = s.failStopAdmissionReady(ctx, err)
-		}
+	default:
+		_ = s.failStopAdmissionReady(ctx, fmt.Errorf("unsupported strict admission response action %s for mode %s", action, run.admissionMode))
 	}
-}
-
-func (s *Server) launchLegacyUnfencedJob(ctx context.Context, run jobRun) {
-	var launched jobRun
-	var runCtx context.Context
-	err := s.withAdmissionJobEffectErr(run.jobID, func() error {
-		var snapshot coordinator.JobSnapshot
-		if err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
-			var err error
-			snapshot, err = coord.Snapshot(ctx, model.JobID(run.jobID))
-			return err
-		}); err != nil {
-			return err
-		}
-		if snapshot.Record.Terminal != nil || snapshot.Record.Cancel != nil {
-			return nil
-		}
-		s.mu.Lock()
-		_, active := s.activeJobs[run.jobID]
-		backend := s.backends[run.backend]
-		s.mu.Unlock()
-		if active {
-			return nil
-		}
-		if backend == nil {
-			return errors.New("backend is unavailable")
-		}
-		session, err := backend.Start(ctx, engine.SessionOpts{CWD: run.cwd, Write: run.write, Model: run.model, Effort: run.effort, Timeout: run.timeout})
-		if err != nil {
-			return err
-		}
-		run.session = session
-		var cancel context.CancelFunc
-		runCtx, cancel = context.WithCancel(ctx)
-		activeJob := &activeJob{jobID: run.jobID, sessionID: run.sessionID, session: session, cancel: cancel}
-		run.active = activeJob
-		launched = run
-		s.addActiveJob(activeJob)
-		return nil
-	})
-	if err != nil {
-		_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
-		return
-	}
-	if launched.active == nil {
-		return
-	}
-	s.runJob(runCtx, launched)
 }
 
 func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobRun, context.Context, bool, error) {
@@ -2464,14 +1763,31 @@ func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobR
 
 func admissionProtocolError(err error) *protocol.ErrorObject {
 	switch {
+	case errors.Is(err, errAdmissionClosing):
+		return strictAdmissionProtocolError(
+			protocol.ErrorCapabilityMissing,
+			protocol.AdmissionRejectAdmissionClosing,
+			err.Error(),
+			protocol.ErrorData{},
+		)
 	case errors.Is(err, authority.ErrReplayConflict):
-		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
+		return strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectReplayConflict,
+			err.Error(),
+			protocol.ErrorData{},
+		)
 	case errors.Is(err, authority.ErrRequestExpired):
-		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
+		return strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectRequestExpired,
+			err.Error(),
+			protocol.ErrorData{},
+		)
 	case errors.Is(err, authority.ErrRootSealed):
 		return strictAdmissionProtocolError(
 			protocol.ErrorCapabilityMissing,
-			protocol.AdmissionRejectPermanentlySealed,
+			protocol.AdmissionRejectRootSealed,
 			err.Error(),
 			protocol.ErrorData{},
 		)
@@ -2485,7 +1801,7 @@ func admissionProtocolError(err error) *protocol.ErrorObject {
 	case admissionAuthorityNotReadyError(err):
 		return strictAdmissionProtocolError(
 			protocol.ErrorCapabilityMissing,
-			protocol.AdmissionRejectStrictRouteDisabled,
+			protocol.AdmissionRejectUnavailableNativeRuntime,
 			admissionNotReadyMessage(err),
 			protocol.ErrorData{},
 		)

@@ -23,7 +23,6 @@ import (
 
 type servedAdmissionRuntime struct {
 	runtime          custodian.Runtime
-	strictRequested  bool
 	launchCustodian  launch.CustodianPort
 	supportOverride  *custodian.Support
 	supportProbe     func(context.Context) custodian.Support
@@ -40,9 +39,7 @@ func newServedAdmissionRuntime(server *Server) *servedAdmissionRuntime {
 	if server == nil {
 		return newServedAdmissionRuntimeFromRuntime(custodian.Runtime{})
 	}
-	runtime := newServedAdmissionRuntimeFromRuntime(server.admissionRuntimeConfig)
-	runtime.strictRequested = server.admissionStrictRequested
-	return runtime
+	return newServedAdmissionRuntimeFromRuntime(server.admissionRuntimeConfig)
 }
 
 func newServedAdmissionRuntimeFromRuntime(runtime custodian.Runtime) *servedAdmissionRuntime {
@@ -90,10 +87,6 @@ func (s *servedAdmissionRuntime) assessSupport(ctx context.Context) custodian.Su
 		return *s.supportOverride
 	}
 	return s.runtime.SelfTest(ctx)
-}
-
-func (s *servedAdmissionRuntime) strictAdmissionRequested() bool {
-	return s != nil && s.strictRequested
 }
 
 func (s *servedAdmissionRuntime) unavailableProcess() bool {

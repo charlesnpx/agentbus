@@ -386,8 +386,8 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	if _, ok := hello.Capabilities["jobs.requestId"]; ok {
 		t.Fatalf("jobs.requestId capability is advertised in hello: %+v", hello.Capabilities)
 	}
-	if _, ok := hello.Capabilities[protocol.CapabilityAdmissionStrictContainment]; ok {
-		t.Fatalf("strict containment capability is advertised in default hello: %+v", hello.Capabilities)
+	if !hello.Capabilities[protocol.CapabilityAdmissionStrictContainment] {
+		t.Fatalf("strict containment capability absent in default strict hello: %+v", hello.Capabilities)
 	}
 	resp = rpc(t, conn, r, "dup", protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: h.token})
 	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
@@ -403,6 +403,12 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	mismatchReader := bufio.NewReader(mismatch)
 	resp = rpc(t, mismatch, mismatchReader, "1", protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version + 1, Token: h.token})
 	assertRPCCode(t, resp, protocol.ErrorVersionMismatch)
+	if resp.Error.Data.Code != "protocol_version_mismatch" {
+		t.Fatalf("version mismatch data code = %q", resp.Error.Data.Code)
+	}
+	if resp.Error.Data.ServerProtocolVersion != protocol.Version {
+		t.Fatalf("server protocol version = %d", resp.Error.Data.ServerProtocolVersion)
+	}
 }
 
 func TestHelloAdvertisesStrictContainmentOnlyWhenPolicyServesStrict(t *testing.T) {
@@ -432,6 +438,7 @@ func TestHelloAdvertisesStrictContainmentOnlyWhenPolicyServesStrict(t *testing.T
 func TestServeConstructsAdmissionInstanceBeforeListenWithRequestIDCapabilityDisabled(t *testing.T) {
 	t.Parallel()
 	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	configureTestAdmissionRuntime(t, server, newAdmissionFakeLaunchCustodian(t), true)
 	listenErr := errors.New("listener reached after admission bootstrap")
 	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
 		if server.jobsRequestIDEnabled {
@@ -440,8 +447,8 @@ func TestServeConstructsAdmissionInstanceBeforeListenWithRequestIDCapabilityDisa
 		if server.admissionInstance == nil || server.admissionInstance.ready == nil || server.admissionInstance.coordinator == nil || server.admissionInstance.submission == nil {
 			return nil, socketFileIdentity{}, errors.New("admission instance was not ready before listen")
 		}
-		if server.admissionInstance.policy.runtimeAssessment.Class != custodian.SupportUnsupported {
-			return nil, socketFileIdentity{}, fmt.Errorf("runtime assessment = %s, want unsupported", server.admissionInstance.policy.runtimeAssessment.Class)
+		if server.admissionInstance.policy.runtimeAssessment.Class != custodian.SupportAvailable {
+			return nil, socketFileIdentity{}, fmt.Errorf("runtime assessment = %s, want available", server.admissionInstance.policy.runtimeAssessment.Class)
 		}
 		return nil, socketFileIdentity{}, listenErr
 	}
@@ -457,22 +464,19 @@ func TestBootstrapAdmissionBuildsUnavailableRuntimePolicy(t *testing.T) {
 	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
 
 	err := server.bootstrapAdmission(context.Background())
-	if err != nil {
-		t.Fatalf("bootstrapAdmission error = %v", err)
+	var diagnostic AdmissionSupportDiagnostic
+	if !errors.As(err, &diagnostic) {
+		t.Fatalf("bootstrapAdmission error = %T %v, want AdmissionSupportDiagnostic", err, err)
 	}
-	if server.admissionInstance == nil {
-		t.Fatal("admission instance was not constructed")
+	if !errors.Is(err, ErrAdmissionStrictSupportUnavailable) {
+		t.Fatalf("bootstrapAdmission error = %v, want ErrAdmissionStrictSupportUnavailable", err)
 	}
-	if server.jobsRequestIDEnabled {
-		t.Fatal("jobs.requestId was enabled by admission bootstrap")
-	}
-	support := server.admissionInstance.policy.runtimeSupport
-	if support.ParkedExec || support.VerifiedContainment || !errors.Is(support.Reason, custodian.ErrSupervisorUnavailable) {
-		t.Fatalf("runtime support = %+v, want unavailable supervisor", support)
+	if server.admissionInstance != nil {
+		t.Fatal("admission instance was constructed for unavailable runtime")
 	}
 	for _, name := range []string{admissionRepositoryFile, admissionAnchorFile} {
-		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
-			t.Fatalf("%s stat error = %v, want exists", name, err)
+		if _, err := os.Stat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s stat error = %v, want not exist", name, err)
 		}
 	}
 }
@@ -480,6 +484,7 @@ func TestBootstrapAdmissionBuildsUnavailableRuntimePolicy(t *testing.T) {
 func TestAdmissionBootstrapFailureFailsServeClosedBeforeListen(t *testing.T) {
 	t.Parallel()
 	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	configureTestAdmissionRuntime(t, server, newAdmissionFakeLaunchCustodian(t), true)
 	bootstrapErr := errors.New("admission bootstrap failed")
 	server.admissionBootstrapperFactory = func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
 		return nil, nil, nil, bootstrapErr
@@ -546,80 +551,13 @@ func TestAdmissionDaemonBootIdentityCarriesPerServerEntropy(t *testing.T) {
 	}
 }
 
-func TestAdmissionStartupRunsLegacyReapBeforeListenWithRequestIDCapabilityDisabled(t *testing.T) {
-	t.Parallel()
-	base := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
-	clock := engine.ClockFunc(func() time.Time { return base })
-	root := shortTempDir(t)
-	cwd := shortTempDir(t)
-	server, err := New(Config{
-		StateRoot:    root,
-		CWD:          cwd,
-		Token:        "test-token",
-		Backends:     []engine.Backend{newFakeBackend("fake")},
-		ProcessTable: fakeProcessTable{},
-		Clock:        clock,
-		IdleTimeout:  -1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	server.mu.Lock()
-	store, err := server.storeForCWDLocked(cwd)
-	server.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	jobID := server.nextID("job")
-	if err := server.createQueuedRecord(store, jobID, "ses_legacy_reap", "fake", nil, nil, nil, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.transitionRecord(store, jobID, engine.StateStarting); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.transitionRecord(store, jobID, engine.StateRunning); err != nil {
-		t.Fatal(err)
-	}
-	statePath := filepath.Join(store.Layout().Jobs, jobID+".json")
-	listenErr := errors.New("listener reached after legacy reap")
-	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
-		if server.jobsRequestIDEnabled {
-			return nil, socketFileIdentity{}, errors.New("jobs.requestId was enabled by admission bootstrap")
-		}
-		if server.admissionInstance == nil {
-			return nil, socketFileIdentity{}, errors.New("admission instance was not constructed before listen")
-		}
-		raw, err := os.ReadFile(statePath)
-		if err != nil {
-			return nil, socketFileIdentity{}, err
-		}
-		var record engine.JobRecord
-		if err := json.Unmarshal(raw, &record); err != nil {
-			return nil, socketFileIdentity{}, err
-		}
-		if record.State != engine.StateOrphaned {
-			return nil, socketFileIdentity{}, errors.New("legacy job was not reaped before listen")
-		}
-		return nil, socketFileIdentity{}, listenErr
-	}
-
-	err = server.Serve(context.Background())
-	if !errors.Is(err, listenErr) {
-		t.Fatalf("Serve error = %v, want %v", err, listenErr)
-	}
-	for _, name := range []string{admissionRepositoryFile, admissionAnchorFile} {
-		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
-			t.Fatalf("%s stat error = %v, want exists", name, err)
-		}
-	}
-}
-
 func TestServeClearsAdmissionStateAndSequentialReserveRecovers(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
 	server, _, cwd := newUnstartedTestServer(t, backend)
 	start := func() (context.CancelFunc, chan error) {
 		t.Helper()
+		configureTestAdmissionRuntime(t, server, newAdmissionFakeLaunchCustodian(t), true)
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() {
@@ -677,10 +615,10 @@ func TestServeClearsAdmissionStateAndSequentialReserveRecovers(t *testing.T) {
 		RequestID:    "request-sequential-runtime",
 		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
 	})
-	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
-	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnavailableNativeRuntime)
-	if resp.Error.Data.RuntimeSupport == nil || resp.Error.Data.RuntimeSupport.Class != custodian.SupportUnsupported.String() {
-		t.Fatalf("runtime support data = %+v, want unsupported assessment", resp.Error.Data.RuntimeSupport)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	if submitted.JobID == "" || submitted.Deduplicated {
+		t.Fatalf("job.submit = %+v, want new strict job", submitted)
 	}
 
 	resp = rpc(t, conn, reader, "3", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: jobID})
@@ -688,9 +626,6 @@ func TestServeClearsAdmissionStateAndSequentialReserveRecovers(t *testing.T) {
 	decodeResult(t, resp, &statuses)
 	if len(statuses.Jobs) != 1 || statuses.Jobs[0].JobID != jobID || statuses.Jobs[0].State != engine.StateFailed {
 		t.Fatalf("job.status = %+v, want recovered failed authority job %s", statuses, jobID)
-	}
-	if got := backend.count.Load(); got != 0 {
-		t.Fatalf("backend starts = %d, want 0", got)
 	}
 }
 
@@ -844,7 +779,7 @@ func TestServeCloseReturnsWhenIdentifiedSubmitWedgedInStorage(t *testing.T) {
 	}
 	resp := protocol.Response{Error: rejected.err}
 	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
-	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectStrictRouteDisabled)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectAdmissionClosing)
 	if !strings.Contains(rejected.err.Message, "shutting down") {
 		t.Fatalf("post-close rejection message = %q, want shutting down", rejected.err.Message)
 	}
@@ -1108,6 +1043,213 @@ func TestIdentifiedSubmitReplayAfterRestartPreservesRecordedOutcome(t *testing.T
 	assertAuthoritySafetyRecordCount(t, secondServer, 1)
 }
 
+func TestIdentifiedSubmitReplayIgnoresDeletedWorkspace(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-replay-deleted",
+		RequestID:    "request-replay-deleted",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}
+
+	submitted := submitIdentifiedForReplayTest(t, server, params)
+	if err := os.RemoveAll(cwd); err != nil {
+		t.Fatal(err)
+	}
+	replayed := replayIdentifiedSubmit(t, server, params)
+	if replayed.JobID != submitted.JobID || !replayed.Deduplicated {
+		t.Fatalf("replay result = %+v, want same job %s deduplicated", replayed, submitted.JobID)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts = %d, want only initial accept", got)
+	}
+}
+
+func TestIdentifiedSubmitReplayIgnoresBrokenSymlinkedWorkspace(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, _ := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	target := shortTempDir(t)
+	link := filepath.Join(t.TempDir(), "workspace-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-replay-symlink",
+		RequestID:    "request-replay-symlink",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: link, Write: false, Prompt: "hold"},
+	}
+
+	submitted := submitIdentifiedForReplayTest(t, server, params)
+	if err := os.RemoveAll(target); err != nil {
+		t.Fatal(err)
+	}
+	replayed := replayIdentifiedSubmit(t, server, params)
+	if replayed.JobID != submitted.JobID || !replayed.Deduplicated {
+		t.Fatalf("replay result = %+v, want same job %s deduplicated", replayed, submitted.JobID)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts = %d, want only initial accept", got)
+	}
+}
+
+func TestIdentifiedSubmitReplayIgnoresRemovedBackendComposition(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-replay-backend",
+		RequestID:    "request-replay-backend",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}
+
+	submitted := submitIdentifiedForReplayTest(t, server, params)
+	server.admissionStateMu.Lock()
+	delete(server.admissionInstance.descriptors, "fake")
+	delete(server.admissionInstance.policy.backends, "fake")
+	server.admissionStateMu.Unlock()
+	server.mu.Lock()
+	delete(server.backends, "fake")
+	server.mu.Unlock()
+
+	replayed := replayIdentifiedSubmit(t, server, params)
+	if replayed.JobID != submitted.JobID || !replayed.Deduplicated {
+		t.Fatalf("replay result = %+v, want same job %s deduplicated", replayed, submitted.JobID)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts = %d, want only initial accept", got)
+	}
+}
+
+func TestIdentifiedSubmitReplayConflictIgnoresDeletedWorkspace(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-replay-conflict",
+		RequestID:    "request-replay-conflict",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}
+	submitIdentifiedForReplayTest(t, server, params)
+	if err := os.RemoveAll(cwd); err != nil {
+		t.Fatal(err)
+	}
+	changed := params
+	changed.TaskSpec.Prompt = "changed task"
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, changed))
+	if outcome.err == nil {
+		t.Fatalf("changed replay result = %+v, want replay conflict", outcome.result)
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectReplayConflict)
+	if strings.Contains(outcome.err.Message, "no such file") || strings.Contains(outcome.err.Message, "stat ") {
+		t.Fatalf("changed replay error = %q, want replay conflict before path validation", outcome.err.Message)
+	}
+}
+
+func TestIdentifiedSubmitReplayRejectsUnknownRecordedFingerprintVersion(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-replay-fingerprint",
+		RequestID:    "request-replay-fingerprint",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}
+	raw := mustMarshal(t, params)
+	rawTaskSpec, err := rawTaskSpecFromSubmitParams(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := model.TaskIdentityFromRawTaskSpec(rawTaskSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity.Version = model.CurrentTaskIdentityVersion + 1
+	requestKey, err := model.NewRequestKey(params.WorkspaceKey, params.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.admissionStateMu.RLock()
+	_, err = server.admissionSubmission.SubmitIdentified(context.Background(), authority.AcceptRequest{
+		RequestKey:   requestKey,
+		TaskIdentity: identity,
+		Mode:         model.ModeIdentifiedFenced,
+		SessionID:    "session-future-fingerprint",
+	})
+	server.admissionStateMu.RUnlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outcome := server.handleJobSubmit(context.Background(), raw)
+	if outcome.err == nil {
+		t.Fatalf("future fingerprint replay result = %+v, want unsupported fingerprint", outcome.result)
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectRequestFingerprintUnsupported)
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want none for replay rejection", got)
+	}
+}
+
+func TestIdentifiedSubmitTombstoneReplayIgnoresDeletedWorkspace(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-replay-tombstone",
+		RequestID:    "request-replay-tombstone",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}
+	submitted := submitIdentifiedForReplayTest(t, server, params)
+	record := loadAdmissionSafetyRecord(t, server, submitted.JobID)
+	if _, err := server.admissionReady.Finalize(ctx, record.JobID, record.Attempt.Ref, model.TerminalIntent{
+		Outcome: model.OutcomeCanceled,
+		Cause:   model.CauseCanceledBeforeAuthorization,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	requestKey, err := model.NewRequestKey(params.WorkspaceKey, params.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.admissionReady.Expire(ctx, requestKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(cwd); err != nil {
+		t.Fatal(err)
+	}
+
+	outcome := server.handleJobSubmit(ctx, mustMarshal(t, params))
+	if outcome.err == nil {
+		t.Fatalf("tombstone replay result = %+v, want request expired", outcome.result)
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectRequestExpired)
+	if strings.Contains(outcome.err.Message, "no such file") || strings.Contains(outcome.err.Message, "stat ") {
+		t.Fatalf("tombstone replay error = %q, want request_expired before path validation", outcome.err.Message)
+	}
+}
+
 func TestAdmissionRecoveryExecutorBoundCurrentObligationContainsOnlyDurableGroup(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1211,7 +1353,36 @@ func TestAdmissionRecoveryExecutorTripsLatchWhenContainmentUnprovable(t *testing
 	}
 }
 
-func TestDefaultStrictIdentifiedSubmitRejectsUnavailableRuntimeWithoutStartingBackend(t *testing.T) {
+func TestDefaultStrictServeRejectsUnavailableRuntimeBeforeListen(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, _ := newUnstartedTestServer(t, backend)
+	var listened atomic.Bool
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		listened.Store(true)
+		return nil, socketFileIdentity{}, errors.New("listener should not start without strict admission support")
+	}
+
+	err := server.Serve(context.Background())
+	var diagnostic AdmissionSupportDiagnostic
+	if !errors.As(err, &diagnostic) {
+		t.Fatalf("Serve error = %T %v, want AdmissionSupportDiagnostic", err, err)
+	}
+	if !errors.Is(err, ErrAdmissionStrictSupportUnavailable) {
+		t.Fatalf("Serve error = %v, want ErrAdmissionStrictSupportUnavailable", err)
+	}
+	if diagnostic.Assessment.Class != custodian.SupportUnsupported {
+		t.Fatalf("diagnostic assessment = %+v, want unsupported", diagnostic.Assessment)
+	}
+	if listened.Load() {
+		t.Fatal("listener started before strict admission support was available")
+	}
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0", got)
+	}
+}
+
+func TestJobSubmitWithoutIdentityRejectedMissingIdentity(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
 	h := startTestServer(t, backend, Config{IdleTimeout: -1})
@@ -1221,15 +1392,10 @@ func TestDefaultStrictIdentifiedSubmitRejectsUnavailableRuntimeWithoutStartingBa
 	helloRaw(t, conn, r, h.token)
 
 	resp := rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
-		WorkspaceKey: "workspace-disabled",
-		RequestID:    "request-disabled",
-		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"},
+		TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"},
 	})
-	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
-	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnavailableNativeRuntime)
-	if resp.Error.Data.RuntimeSupport == nil || resp.Error.Data.RuntimeSupport.Class != custodian.SupportUnsupported.String() {
-		t.Fatalf("runtime support data = %+v, want unsupported assessment", resp.Error.Data.RuntimeSupport)
-	}
+	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectMissingIdentity)
 	if got := backend.count.Load(); got != 0 {
 		t.Fatalf("backend starts = %d, want 0", got)
 	}
@@ -1238,11 +1404,10 @@ func TestDefaultStrictIdentifiedSubmitRejectsUnavailableRuntimeWithoutStartingBa
 func TestStrictRequestedUnavailableRuntimeFailsStartupWithSupportDiagnostic(t *testing.T) {
 	t.Parallel()
 	server, err := New(Config{
-		StateRoot:                shortTempDir(t),
-		CWD:                      shortTempDir(t),
-		Runtime:                  custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable),
-		StrictAdmissionRequested: true,
-		IdleTimeout:              -1,
+		StateRoot:   shortTempDir(t),
+		CWD:         shortTempDir(t),
+		Runtime:     custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable),
+		IdleTimeout: -1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1345,15 +1510,13 @@ func TestStrictIdentifiedOrderedRejectionsBeforeMutationOrRequestProbe(t *testin
 		name             string
 		configureBackend func(*fakeBackend)
 		configureServer  func(*Server)
-		availableRuntime bool
 		params           func(cwd string) protocol.JobSubmitParams
 		wantCode         string
 		wantCause        string
 	}
 	cases := []testCase{
 		{
-			name:             "missing identity before backend",
-			availableRuntime: true,
+			name: "missing identity before backend",
 			params: func(cwd string) protocol.JobSubmitParams {
 				return protocol.JobSubmitParams{
 					WorkspaceKey: "workspace-missing-identity",
@@ -1364,8 +1527,7 @@ func TestStrictIdentifiedOrderedRejectionsBeforeMutationOrRequestProbe(t *testin
 			wantCause: protocol.AdmissionRejectMissingIdentity,
 		},
 		{
-			name:             "unsupported backend before invalid config",
-			availableRuntime: true,
+			name: "unsupported backend before invalid config",
 			params: func(cwd string) protocol.JobSubmitParams {
 				return protocol.JobSubmitParams{
 					WorkspaceKey: "workspace-unsupported",
@@ -1381,7 +1543,6 @@ func TestStrictIdentifiedOrderedRejectionsBeforeMutationOrRequestProbe(t *testin
 			configureBackend: func(backend *fakeBackend) {
 				backend.controlled = false
 			},
-			availableRuntime: true,
 			params: func(cwd string) protocol.JobSubmitParams {
 				return protocol.JobSubmitParams{
 					WorkspaceKey: "workspace-unfenceable",
@@ -1393,8 +1554,7 @@ func TestStrictIdentifiedOrderedRejectionsBeforeMutationOrRequestProbe(t *testin
 			wantCause: protocol.AdmissionRejectUnfenceableBackend,
 		},
 		{
-			name:             "strict route disabled before missing identity",
-			availableRuntime: true,
+			name: "admission unavailable before missing identity",
 			configureServer: func(server *Server) {
 				server.admissionInstance.policy.strictRouteEnabled = false
 				server.admissionInstance.policy.strictRouteDisabledReason = "strict route disabled for test"
@@ -1402,32 +1562,6 @@ func TestStrictIdentifiedOrderedRejectionsBeforeMutationOrRequestProbe(t *testin
 			params: func(cwd string) protocol.JobSubmitParams {
 				return protocol.JobSubmitParams{
 					WorkspaceKey: "workspace-route-disabled",
-					TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
-				}
-			},
-			wantCode:  protocol.ErrorCapabilityMissing,
-			wantCause: protocol.AdmissionRejectStrictRouteDisabled,
-		},
-		{
-			name:             "invalid config before unavailable runtime",
-			availableRuntime: false,
-			params: func(cwd string) protocol.JobSubmitParams {
-				return protocol.JobSubmitParams{
-					WorkspaceKey: "workspace-invalid-config",
-					RequestID:    "request-invalid-config",
-					TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false},
-				}
-			},
-			wantCode:  protocol.ErrorInvalidTaskSpec,
-			wantCause: protocol.AdmissionRejectInvalidStrictConfig,
-		},
-		{
-			name:             "unavailable runtime terminal cause",
-			availableRuntime: false,
-			params: func(cwd string) protocol.JobSubmitParams {
-				return protocol.JobSubmitParams{
-					WorkspaceKey: "workspace-runtime-unavailable",
-					RequestID:    "request-runtime-unavailable",
 					TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
 				}
 			},
@@ -1449,13 +1583,7 @@ func TestStrictIdentifiedOrderedRejectionsBeforeMutationOrRequestProbe(t *testin
 			runner := &recordingProbeRunner{}
 			server.admissionProbeRunner = runner
 			launcher := newAdmissionFakeLaunchCustodian(t)
-			if tt.availableRuntime {
-				enableTestAdmission(t, server, launcher)
-			} else {
-				if err := server.bootstrapAdmission(context.Background()); err != nil {
-					t.Fatal(err)
-				}
-			}
+			enableTestAdmission(t, server, launcher)
 			if tt.configureServer != nil {
 				tt.configureServer(server)
 			}
@@ -1469,9 +1597,6 @@ func TestStrictIdentifiedOrderedRejectionsBeforeMutationOrRequestProbe(t *testin
 			resp := protocol.Response{Error: outcome.err}
 			assertRPCCode(t, resp, tt.wantCode)
 			assertRPCAdmissionCause(t, resp, tt.wantCause)
-			if tt.wantCause == protocol.AdmissionRejectUnavailableNativeRuntime && outcome.err.Data.RuntimeSupport == nil {
-				t.Fatal("runtime unavailable rejection did not carry runtime support assessment")
-			}
 			if got := backend.count.Load(); got != 0 {
 				t.Fatalf("backend starts = %d, want 0 before strict rejection", got)
 			}
@@ -1874,7 +1999,7 @@ func TestIdentifiedSubmitClosedAdmissionRepositoryReturnsStrictRouteNotReady(t *
 	}
 	resp := protocol.Response{Error: outcome.err}
 	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
-	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectStrictRouteDisabled)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnavailableNativeRuntime)
 	if outcome.err.Data.Code == protocol.ErrorInvalidTaskSpec {
 		t.Fatalf("closed repository mapped to invalid_task_spec: %+v", outcome.err)
 	}
@@ -1948,27 +2073,6 @@ func TestIdentifiedFencedSubmitUsesLaunchControllerAndCompletes(t *testing.T) {
 	if !ok || first.Group == nil || first.Grant == nil || first.Released == nil || first.Quiescence == nil {
 		t.Fatalf("ordinal 1 launch proof incomplete: %+v", first)
 	}
-}
-
-func TestIdentifiedSubmitRejectsBuiltInWhenFencedRuntimeUnavailableBeforeBackendStart(t *testing.T) {
-	t.Parallel()
-	backend := newFakeBackend("fake")
-	server, _, cwd := newUnstartedTestServer(t, backend)
-	launcher := newAdmissionFakeLaunchCustodian(t)
-	enableTestAdmissionWithParkedExec(t, server, launcher, false)
-
-	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
-		WorkspaceKey: "workspace-built-in-unfenced",
-		RequestID:    "request-built-in-unfenced",
-		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
-	}, nil)
-	resp := responseFromScriptedConn(t, conn)
-	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
-	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnavailableNativeRuntime)
-	if got := backend.count.Load(); got != 0 {
-		t.Fatalf("backend starts = %d, want 0 before incompatible pre-accept reject", got)
-	}
-	assertNoAcceptedJobsInAdmission(t, server)
 }
 
 func TestIdentifiedSubmitRejectsNoControlledRunnerBeforeBackendStart(t *testing.T) {
@@ -2049,93 +2153,6 @@ func TestStrictIdentifiedRejectsExternalRunnerWithoutLegacyFencedFallback(t *tes
 	assertNoEngineJobRecordsForCWD(t, server, cwd)
 }
 
-func TestLegacyFencedWaitCleanupFailureRecordsQuiescenceBeforeError(t *testing.T) {
-	t.Parallel()
-	cleanupErr := errors.New("retained remove failed")
-	launcher := newAdmissionFakeLaunchCustodian(t)
-	launcher.cleanupErr = cleanupErr
-	repo, recorder, coordinator := newLegacyFencedCoordinatorWithRecordingAuthorityForTest(t, launcher)
-	cmd := prepareLegacyFencedCommandWithCoordinatorForTest(t, coordinator, "request-legacy-fenced-cleanup-failure")
-
-	if err := cmd.grantAndRelease(context.Background()); err != nil {
-		t.Fatalf("grantAndRelease error = %v", err)
-	}
-	select {
-	case <-cmd.done:
-	case <-time.After(time.Second):
-		t.Fatal("legacy fenced command did not finish")
-	}
-	_, finalErr := cmd.result()
-	if !errors.Is(finalErr, cleanupErr) {
-		t.Fatalf("legacy fenced command final error = %v, want cleanup failure", finalErr)
-	}
-	recordErrs, _ := recorder.recordQuiescenceContextObservations()
-	if len(recordErrs) != 1 {
-		t.Fatalf("record quiescence calls = %d, want 1", len(recordErrs))
-	}
-	if got := launcher.containCount(); got != 0 {
-		t.Fatalf("legacy fenced containments = %d, want 0 cleanup retry", got)
-	}
-	safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
-	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
-	if !ok || first.Group == nil || first.Grant == nil || first.Released == nil || first.Quiescence == nil {
-		t.Fatalf("legacy fenced cleanup-failure launch proof = %+v, want grant/release/quiescence recorded", first)
-	}
-}
-
-func TestLegacyFencedPreparedAbortCleanupFailureRecordsQuiescenceBeforeError(t *testing.T) {
-	t.Parallel()
-	cleanupErr := errors.New("prepared abort backend close failed")
-	launcher := newAdmissionFakeLaunchCustodian(t)
-	launcher.abortCleanupErr = cleanupErr
-	repo, recorder, coordinator := newLegacyFencedCoordinatorWithRecordingAuthorityForTest(t, launcher)
-	cmd := prepareLegacyFencedCommandWithCoordinatorForTest(t, coordinator, "request-legacy-fenced-abort-cleanup-failure")
-
-	err := coordinator.abortLegacyPrepared(context.Background(), cmd.prepared, true, cmd.launchContext)
-	if !errors.Is(err, cleanupErr) {
-		t.Fatalf("abortLegacyPrepared error = %v, want cleanup failure", err)
-	}
-	if got := launcher.abortCount(); got != 1 {
-		t.Fatalf("legacy fenced aborts = %d, want 1", got)
-	}
-	recordErrs, _ := recorder.recordQuiescenceContextObservations()
-	if len(recordErrs) != 1 {
-		t.Fatalf("record quiescence calls = %d, want 1", len(recordErrs))
-	}
-	safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
-	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
-	if !ok || first.Group == nil || first.Quiescence == nil || first.Grant != nil || first.Released != nil {
-		t.Fatalf("legacy fenced abort-cleanup launch proof = %+v, want retired without grant/release", first)
-	}
-}
-
-func TestLegacyFencedRejectCleanupFailureRecordsQuiescenceBeforeError(t *testing.T) {
-	t.Parallel()
-	cleanupErr := errors.New("prepared reject backend close failed")
-	launcher := newAdmissionFakeLaunchCustodian(t)
-	launcher.abortCleanupErr = cleanupErr
-	repo, recorder, coordinator := newLegacyFencedCoordinatorWithRecordingAuthorityForTest(t, launcher)
-	cmd := prepareLegacyFencedCommandWithCoordinatorForTest(t, coordinator, "request-legacy-fenced-reject-cleanup-failure")
-
-	err := coordinator.rejectAndRetireLegacyFenced(context.Background(), cmd)
-	if !errors.Is(err, cleanupErr) {
-		t.Fatalf("rejectAndRetireLegacyFenced error = %v, want cleanup failure", err)
-	}
-	if got := launcher.abortCount(); got != 1 {
-		t.Fatalf("legacy fenced aborts = %d, want 1", got)
-	}
-	recordErrs, _ := recorder.recordQuiescenceContextObservations()
-	if len(recordErrs) != 1 {
-		t.Fatalf("record quiescence calls = %d, want 1", len(recordErrs))
-	}
-	_, finalErr := cmd.result()
-	if !errors.Is(finalErr, cleanupErr) {
-		t.Fatalf("legacy fenced command final error = %v, want cleanup failure", finalErr)
-	}
-	safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
-	assertLegacyFencedRejectedWithoutGrant(t, safety)
-}
-
 func TestStrictIdentifiedUnfenceableRejectionDoesNotCreateLegacyRecordWhenResponseLost(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -2164,253 +2181,6 @@ func TestStrictIdentifiedUnfenceableRejectionDoesNotCreateLegacyRecordWhenRespon
 	assertNoEngineJobRecordsForCWD(t, server, cwd)
 }
 
-func TestLegacyFencedDeliveryFailureRetiresWithDetachedContextWhenCanceled(t *testing.T) {
-	t.Parallel()
-	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
-	launcher := newAdmissionFakeLaunchCustodian(t)
-	enableTestAdmission(t, server, launcher)
-	cmd := prepareLegacyFencedCommandForTest(t, server, "request-legacy-fenced-canceled-context")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := server.admissionSubmission.rejectAndRetireLegacyFenced(ctx, cmd); err != nil {
-		t.Fatalf("rejectAndRetireLegacyFenced with canceled context error = %v", err)
-	}
-	assertLegacyFencedAbortUsedDetachedContext(t, launcher)
-	if got := launcher.releaseCount(); got != 0 {
-		t.Fatalf("legacy fenced releases = %d, want 0 after failed response", got)
-	}
-	safety := loadAdmissionSafetyRecord(t, server, string(cmd.launchContext.JobID))
-	assertLegacyFencedRejectedWithoutGrant(t, safety)
-}
-
-func TestLegacyFencedReleaseUnknownContainsWithDetachedContextWhenCanceled(t *testing.T) {
-	t.Parallel()
-	launcher := newAdmissionFakeLaunchCustodian(t)
-	launcher.releaseOutcome = custodian.ReleaseOutcomeUnknown
-	launcher.releaseWaitForContextDone = true
-	launcher.releaseStarted = make(chan struct{}, 1)
-	repo, recorder, coordinator := newLegacyFencedCoordinatorWithRecordingAuthorityForTest(t, launcher)
-	cmd := prepareLegacyFencedCommandWithCoordinatorForTest(t, coordinator, "request-legacy-fenced-release-unknown-canceled")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.grantAndRelease(ctx)
-	}()
-	select {
-	case <-launcher.releaseStarted:
-	case <-time.After(time.Second):
-		cancel()
-		t.Fatal("legacy fenced fake release did not start")
-	}
-	cancel()
-
-	select {
-	case err := <-done:
-		if !errors.Is(err, launch.ErrReleaseUncertain) {
-			t.Fatalf("grantAndRelease error = %v, want release uncertainty", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("grantAndRelease did not return after release context cancellation")
-	}
-	if got := launcher.releaseCount(); got != 1 {
-		t.Fatalf("legacy fenced releases = %d, want 1", got)
-	}
-	if got := launcher.containCount(); got != 1 {
-		t.Fatalf("legacy fenced containments = %d, want exactly one", got)
-	}
-	containErrs, containDeadlines := launcher.containContextObservations()
-	if len(containErrs) != 1 || containErrs[0] != nil {
-		t.Fatalf("contain context errors = %+v, want one live context", containErrs)
-	}
-	if len(containDeadlines) != 1 || !containDeadlines[0] {
-		t.Fatalf("contain context deadlines = %+v, want bounded cleanup context", containDeadlines)
-	}
-	recordErrs, recordDeadlines := recorder.recordQuiescenceContextObservations()
-	if len(recordErrs) != 1 || recordErrs[0] != nil {
-		t.Fatalf("record quiescence context errors = %+v, want one live context", recordErrs)
-	}
-	if len(recordDeadlines) != 1 || !recordDeadlines[0] {
-		t.Fatalf("record quiescence context deadlines = %+v, want bounded cleanup context", recordDeadlines)
-	}
-	safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
-	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
-	if !ok || first.Group == nil || first.Grant == nil || first.Quiescence == nil {
-		t.Fatalf("legacy fenced release-unknown launch proof = %+v, want grant and verified quiescence", first)
-	}
-	if safety.Terminal == nil || safety.Terminal.Outcome != model.OutcomeFailed || safety.Terminal.Cause != model.CauseReleaseOutcomeUnknown {
-		outcomes, errs := recorder.recordReleaseOutcomeObservations()
-		t.Fatalf("legacy fenced release-unknown terminal = %+v launch=%+v release_outcomes=%+v release_outcome_errs=%+v, want failed release_outcome_unknown", safety.Terminal, first, outcomes, errs)
-	}
-	_, finalErr := cmd.result()
-	if !errors.Is(finalErr, launch.ErrReleaseUncertain) || errors.Is(finalErr, launch.ErrFailClosed) {
-		t.Fatalf("legacy fenced command final error = %v, want release uncertainty without fail-closed", finalErr)
-	}
-}
-
-func TestLegacyFencedReleaseDefinitelyNotSentFailStopsWhenReleaseOutcomeFactCannotPersist(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name       string
-		durability launch.DurabilityOutcome
-		err        error
-		wantErr    error
-	}{
-		{
-			name:       "definitely-not-committed",
-			durability: launch.DefinitelyNotCommitted,
-			err:        errors.New("injected release outcome not committed"),
-			wantErr:    launch.ErrDurabilityNotCommitted,
-		},
-		{
-			name:       "unknown-mutation",
-			durability: launch.CommitOutcomeUnknown,
-			err:        errors.New("injected release outcome commit unknown"),
-			wantErr:    launch.ErrDurabilityUnknown,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			launcher := newAdmissionFakeLaunchCustodian(t)
-			launcher.releaseOutcome = custodian.ReleaseDefinitelyNotSent
-			launcher.releaseErr = errors.New("release frame not written")
-			repo, recorder, submission := newLegacyFencedCoordinatorWithRecordingAuthorityForTest(t, launcher)
-			recorder.recordReleaseOutcomeDurability = tt.durability
-			recorder.recordReleaseOutcomeErr = tt.err
-			cmd := prepareLegacyFencedCommandWithCoordinatorForTest(t, submission, "request-legacy-fenced-release-not-sent-"+tt.name)
-
-			err := cmd.grantAndRelease(context.Background())
-			if !errors.Is(err, launch.ErrFailClosed) {
-				t.Fatalf("grantAndRelease error = %v, want fail-closed", err)
-			}
-			if !errors.Is(err, launch.ErrReleaseUncertain) {
-				t.Fatalf("grantAndRelease error = %v, want release uncertainty", err)
-			}
-			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("grantAndRelease error = %v, want %v", err, tt.wantErr)
-			}
-			reason := submission.latch.Reason()
-			if reason == nil {
-				t.Fatal("safety latch was not tripped")
-			}
-			if text := reason.Error(); !strings.Contains(text, "LaunchReleaseNotSent") || !strings.Contains(text, "record_release_outcome") {
-				t.Fatalf("fail-stop reason = %q, want unpersisted LaunchReleaseNotSent record_release_outcome fact", text)
-			}
-			_, finalErr := cmd.result()
-			if !errors.Is(finalErr, launch.ErrFailClosed) {
-				t.Fatalf("legacy fenced command final error = %v, want fail-closed", finalErr)
-			}
-			if got := launcher.abortCount(); got != 1 {
-				t.Fatalf("legacy fenced aborts = %d, want one retired parked worker", got)
-			}
-			safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
-			first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
-			if !ok || first.Group == nil || first.Grant == nil || first.Quiescence == nil {
-				t.Fatalf("legacy fenced release-not-sent launch proof = %+v, want grant and verified abort quiescence", first)
-			}
-			if first.ReleaseOutcome != nil || first.Released != nil {
-				t.Fatalf("legacy fenced release-not-sent launch proof = %+v, want no release outcome/release facts", first)
-			}
-			if safety.Terminal != nil {
-				t.Fatalf("legacy fenced release-not-sent terminal = %+v, want no terminal without release outcome fact", safety.Terminal)
-			}
-			if intent, ok := admissionRecordedReleaseFailureIntent(safety); ok {
-				t.Fatalf("derived release-failure terminal intent without release outcome fact: %+v", intent)
-			}
-			outcomes, errs := recorder.recordReleaseOutcomeObservations()
-			if len(outcomes) != 1 || outcomes[0] != model.LaunchReleaseNotSent {
-				t.Fatalf("recorded release outcome attempts = %+v, want one LaunchReleaseNotSent attempt", outcomes)
-			}
-			if len(errs) != 1 || !errors.Is(errs[0], tt.err) {
-				t.Fatalf("recorded release outcome errors = %+v, want %v", errs, tt.err)
-			}
-		})
-	}
-}
-
-func TestLegacyFencedDeliveryFailureFailStopsWhenAbortCleanupDeadlineExpires(t *testing.T) {
-	oldTimeout := admissionDetachedCleanupTimeout
-	admissionDetachedCleanupTimeout = 5 * time.Millisecond
-	t.Cleanup(func() {
-		admissionDetachedCleanupTimeout = oldTimeout
-	})
-
-	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
-	launcher := newAdmissionFakeLaunchCustodian(t)
-	launcher.abortWaitForContextDone = true
-	launcher.abortRespectContext = true
-	repo := memory.NewRepository()
-	anchorStore := authority.NewAnchorStore()
-	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
-	cmd := prepareLegacyFencedCommandForTest(t, server, "request-legacy-fenced-abort-deadline")
-
-	err := server.admissionSubmission.rejectAndRetireLegacyFenced(context.Background(), cmd)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("rejectAndRetireLegacyFenced error = %v, want abort deadline exceeded", err)
-	}
-	if !errors.Is(err, launch.ErrFailClosed) {
-		t.Fatalf("rejectAndRetireLegacyFenced error = %v, want fail-closed", err)
-	}
-	if got := launcher.abortCount(); got != 1 {
-		t.Fatalf("legacy fenced aborts = %d, want one failed abort", got)
-	}
-	errs, deadlines := launcher.abortContextObservations()
-	if len(errs) != 1 || !errors.Is(errs[0], context.DeadlineExceeded) {
-		t.Fatalf("abort context errors = %+v, want deadline exceeded", errs)
-	}
-	if len(deadlines) != 1 || !deadlines[0] {
-		t.Fatalf("abort context deadlines = %+v, want bounded cleanup context", deadlines)
-	}
-	if got := launcher.releaseCount(); got != 0 {
-		t.Fatalf("legacy fenced releases = %d, want 0 after failed response", got)
-	}
-
-	snapshot := admissionAnchorSnapshot(t, anchorStore)
-	if snapshot.Phase != "fail_stopped" || !strings.Contains(snapshot.Reason, "retire legacy fenced prepared process") || !strings.Contains(snapshot.Reason, context.DeadlineExceeded.Error()) {
-		t.Fatalf("anchor snapshot = %+v, want durable fail-stop with abort deadline error", snapshot)
-	}
-	safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
-	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
-	if !ok || first.Group == nil || first.Quiescence != nil || first.Grant != nil || first.Released != nil {
-		t.Fatalf("legacy fenced failed abort launch proof = %+v, want bound but unretired launch under fail-stop", first)
-	}
-}
-
-func TestLegacyFencedDeliveryFailureRetiresWhenBeginRejectFails(t *testing.T) {
-	t.Parallel()
-	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
-	launcher := newAdmissionFakeLaunchCustodian(t)
-	repo := memory.NewRepository()
-	anchorStore := authority.NewAnchorStore()
-	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
-	cmd := prepareLegacyFencedCommandForTest(t, server, "request-legacy-fenced-begin-reject-fails")
-
-	beginRejectErr := errors.New("begin reject advance failed")
-	anchorStore.FailNextForTest(authority.AnchorAdvance, beginRejectErr)
-	err := server.admissionSubmission.rejectAndRetireLegacyFenced(context.Background(), cmd)
-	if !errors.Is(err, beginRejectErr) {
-		t.Fatalf("rejectAndRetireLegacyFenced error = %v, want begin reject failure", err)
-	}
-	if !errors.Is(err, launch.ErrFailClosed) {
-		t.Fatalf("rejectAndRetireLegacyFenced error = %v, want fail-closed", err)
-	}
-	assertLegacyFencedAbortUsedDetachedContext(t, launcher)
-	if got := launcher.releaseCount(); got != 0 {
-		t.Fatalf("legacy fenced releases = %d, want 0 after failed response", got)
-	}
-	snapshot := admissionAnchorSnapshot(t, anchorStore)
-	if snapshot.Phase != "fail_stopped" || !strings.Contains(snapshot.Reason, beginRejectErr.Error()) {
-		t.Fatalf("anchor snapshot = %+v, want durable fail-stop with injected error", snapshot)
-	}
-	safety := loadAuthoritySafetyRecordFromRepository(t, repo, string(cmd.launchContext.JobID))
-	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
-	if !ok || first.Group == nil || first.Grant != nil || first.Released != nil {
-		t.Fatalf("legacy fenced failed BeginReject launch proof = %+v, want no grant/release", first)
-	}
-}
-
 func TestStrictIdentifiedRejectsExternalRunnerWithoutLegacyUnfencedFallback(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -2418,7 +2188,7 @@ func TestStrictIdentifiedRejectsExternalRunnerWithoutLegacyUnfencedFallback(t *t
 	backend.started = make(chan struct{}, 1)
 	server, _, cwd := newUnstartedTestServer(t, backend)
 	launcher := newAdmissionFakeLaunchCustodian(t)
-	enableTestAdmissionWithParkedExec(t, server, launcher, false)
+	enableTestAdmission(t, server, launcher)
 
 	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
 		WorkspaceKey: "workspace-legacy-unfenced",
@@ -2446,7 +2216,7 @@ func TestStrictIdentifiedUnfenceableDeliveryFailureDoesNotCreateLegacyUnfencedRe
 	backend.started = make(chan struct{}, 1)
 	server, _, cwd := newUnstartedTestServer(t, backend)
 	launcher := newAdmissionFakeLaunchCustodian(t)
-	enableTestAdmissionWithParkedExec(t, server, launcher, false)
+	enableTestAdmission(t, server, launcher)
 
 	serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
 		WorkspaceKey: "workspace-legacy-unfenced-loss",
@@ -3040,155 +2810,6 @@ func TestReapKnownStoresSkipsAuthorityOwnedFencedJob(t *testing.T) {
 	}
 }
 
-func TestSessionResumeDoesNotCreateLegacySessionForAuthorityOwnedJob(t *testing.T) {
-	t.Parallel()
-	backend := newFakeBackend("fake")
-	backend.resumes = make(chan resumedSession, 1)
-	backend.started = make(chan struct{}, 1)
-	server, _, cwd := newUnstartedTestServer(t, backend)
-	launcher := newAdmissionFakeLaunchCustodian(t)
-	enableTestAdmission(t, server, launcher)
-
-	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
-		WorkspaceKey: "workspace-authority-resume",
-		RequestID:    "request-authority-resume",
-		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
-	}, nil)
-	resp := responseFromScriptedConn(t, conn)
-	var submitted protocol.JobSubmitResult
-	decodeResult(t, resp, &submitted)
-	waitBackendStarted(t, backend)
-	_, projection, ok, errObj := server.authorityJobProjection(submitted.JobID)
-	if errObj != nil || !ok {
-		t.Fatalf("authority projection ok=%v err=%+v", ok, errObj)
-	}
-	store := server.storeForJob(submitted.JobID)
-	if store == nil {
-		t.Fatalf("job store missing for %s", submitted.JobID)
-	}
-	if err := server.createQueuedRecord(store, submitted.JobID, projection.SessionID, "fake", nil, nil, nil, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.updateBackendSessionID(store, submitted.JobID, "stale-backend-session"); err != nil {
-		t.Fatal(err)
-	}
-
-	outcome := server.handleSessionResume(context.Background(), mustMarshal(t, protocol.SessionResumeParams{SessionID: projection.SessionID}))
-	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorBackendUnavailable {
-		t.Fatalf("resume outcome = %+v, want backend_unavailable", outcome)
-	}
-	select {
-	case got := <-backend.resumes:
-		t.Fatalf("backend resumed stale authority session: %+v", got)
-	default:
-	}
-}
-
-func TestSessionResumeFailsClosedWhenAuthorityDegradedWithStaleJSONDuplicate(t *testing.T) {
-	t.Parallel()
-	holdNaturalExit := make(chan struct{})
-	defer close(holdNaturalExit)
-	backend := newFakeBackend("fake")
-	backend.resumes = make(chan resumedSession, 1)
-	backend.started = make(chan struct{}, 1)
-	server, _, cwd := newUnstartedTestServer(t, backend)
-	launcher := newAdmissionFakeLaunchCustodian(t)
-	launcher.waitAndVerify = holdNaturalExit
-	enableTestAdmission(t, server, launcher)
-
-	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
-		WorkspaceKey: "workspace-authority-resume-degraded",
-		RequestID:    "request-authority-resume-degraded",
-		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
-	}, nil)
-	resp := responseFromScriptedConn(t, conn)
-	var submitted protocol.JobSubmitResult
-	decodeResult(t, resp, &submitted)
-	waitBackendStarted(t, backend)
-	_, projection, ok, errObj := server.authorityJobProjection(submitted.JobID)
-	if errObj != nil || !ok {
-		t.Fatalf("authority projection ok=%v err=%+v", ok, errObj)
-	}
-	store := server.storeForJob(submitted.JobID)
-	if store == nil {
-		t.Fatalf("job store missing for %s", submitted.JobID)
-	}
-	if err := server.createQueuedRecord(store, submitted.JobID, projection.SessionID, "fake", nil, nil, nil, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.updateBackendSessionID(store, submitted.JobID, "stale-backend-session"); err != nil {
-		t.Fatal(err)
-	}
-	server.removeActiveJob(submitted.JobID)
-	if err := server.admissionReady.FailStop(context.Background(), "test authority degraded during resume"); err != nil {
-		t.Fatal(err)
-	}
-
-	outcome := server.handleSessionResume(context.Background(), mustMarshal(t, protocol.SessionResumeParams{SessionID: projection.SessionID}))
-	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorBackendUnavailable {
-		t.Fatalf("resume outcome = %+v, want backend_unavailable fail-closed error", outcome)
-	}
-	if outcome.result != nil {
-		t.Fatalf("resume result = %+v, want no legacy session result", outcome.result)
-	}
-	select {
-	case got := <-backend.resumes:
-		t.Fatalf("backend resumed stale authority session: %+v", got)
-	default:
-	}
-}
-
-func TestSessionResumeUsesLegacyJSONWhenAuthorityCleanlyDisclaims(t *testing.T) {
-	t.Parallel()
-	backend := newFakeBackend("fake")
-	backend.resumes = make(chan resumedSession, 1)
-	server, _, cwd := newUnstartedTestServer(t, backend)
-	canonicalCWD, err := engine.CanonicalWorkspace(cwd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	launcher := newAdmissionFakeLaunchCustodian(t)
-	enableTestAdmission(t, server, launcher)
-	server.mu.Lock()
-	store, err := server.storeForCWDLocked(cwd)
-	server.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacyID := server.nextID("job")
-	sessionID := "ses_legacy_resume_authority_clean"
-	backendSessionID := "backend-session-authority-clean"
-	if err := server.createQueuedRecord(store, legacyID, sessionID, "fake", nil, nil, nil, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.updateBackendSessionID(store, legacyID, backendSessionID); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, ok, errObj := server.authorityJobProjection(legacyID); ok || errObj != nil {
-		t.Fatalf("authority projection ok=%v err=%+v, want clean disclaimer", ok, errObj)
-	}
-
-	outcome := server.handleSessionResume(context.Background(), mustMarshal(t, protocol.SessionResumeParams{SessionID: sessionID}))
-	if outcome.err != nil {
-		t.Fatalf("resume error = %+v", outcome.err)
-	}
-	result, ok := outcome.result.(protocol.SessionStartResult)
-	if !ok {
-		t.Fatalf("resume result type = %T", outcome.result)
-	}
-	if result.SessionID != sessionID || result.Backend != "fake" {
-		t.Fatalf("resume result = %+v, want legacy session", result)
-	}
-	select {
-	case got := <-backend.resumes:
-		if got.ID != backendSessionID || got.Opts.CWD != canonicalCWD || got.Opts.Write {
-			t.Fatalf("backend resume = %+v, want id %q cwd %q read-only", got, backendSessionID, canonicalCWD)
-		}
-	default:
-		t.Fatal("backend resume was not called for cleanly disclaimed legacy session")
-	}
-}
-
 func TestExactReadsUseJSONForLegacyWhenAuthorityFailStopped(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -3672,126 +3293,34 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 	}
 }
 
-func TestTurnNotificationsCorrelationPolicyStampAndJobResult(t *testing.T) {
+func TestRemovedAndUnknownMethodsReturnMethodNotFound(t *testing.T) {
 	t.Parallel()
-	backend := newFakeBackend("fake")
-	h := startTestServer(t, backend, Config{IdleTimeout: -1})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-
-	start := rpc(t, conn, r, "2", protocol.MethodSessionStart, protocol.SessionStartParams{
-		Backend: "fake",
-		CWD:     h.cwd,
-		Write:   true,
-		Tags:    map[string]string{"client": "test"},
-	})
-	var session protocol.SessionStartResult
-	decodeResult(t, start, &session)
-
-	write := false
-	turnResp := rpc(t, conn, r, "3", protocol.MethodTurnStart, protocol.TurnStartParams{
-		SessionID: session.SessionID,
-		Prompt:    "inspect",
-		Write:     &write,
-		Policy: &engine.TurnPolicy{Contract: &engine.ContractSpec{Shape: &engine.ShapeSpec{
-			FirstLineEnum:    []string{"PASS"},
-			RequiredSections: []string{"Findings"},
-		}}},
-	})
-	var turn protocol.TurnStartResult
-	decodeResult(t, turnResp, &turn)
-	if turn.TurnID != turn.JobID {
-		t.Fatalf("turnId %q != jobId %q", turn.TurnID, turn.JobID)
-	}
-
-	event := readNotification(t, r)
-	if event.Method != protocol.NotificationTurnEvent {
-		t.Fatalf("method = %s", event.Method)
-	}
-	var eventParams protocol.TurnEventParams
-	mustUnmarshal(t, event.Params, &eventParams)
-	if eventParams.SessionID != session.SessionID || eventParams.TurnID != turn.TurnID || eventParams.JobID != turn.JobID {
-		t.Fatalf("event correlation = %+v", eventParams)
-	}
-
-	resultNotice := readNotification(t, r)
-	if resultNotice.Method != protocol.NotificationTurnResult {
-		t.Fatalf("method = %s", resultNotice.Method)
-	}
-	var turnResult protocol.TurnResultParams
-	mustUnmarshal(t, resultNotice.Params, &turnResult)
-	if turnResult.Contract == nil || turnResult.Contract.Status != engine.ContractCompliant {
-		t.Fatalf("contract stamp = %+v", turnResult.Contract)
-	}
-	if turnResult.Result == nil || turnResult.Result.Text == "" || turnResult.Result.ResultPath == "" {
-		t.Fatalf("turn result = %+v", turnResult.Result)
-	}
-
-	jobResp := rpc(t, conn, r, "4", protocol.MethodJobResult, protocol.JobResultParams{JobID: turn.JobID})
-	var jobResult protocol.JobResult
-	decodeResult(t, jobResp, &jobResult)
-	if jobResult.JobID != turn.JobID || jobResult.Contract == nil || jobResult.Contract.Status != engine.ContractCompliant {
-		t.Fatalf("job.result = %+v", jobResult)
-	}
-	gotTurn := <-backend.turns
-	if gotTurn.Write {
-		t.Fatalf("turn write = true, want per-turn downgrade to false")
-	}
-}
-
-func TestReportedModelPersistsToJobRecordAndWireResults(t *testing.T) {
-	t.Parallel()
-	backend := newFakeBackend("fake")
-	backend.events = func(string, bool) []engine.Event {
-		return []engine.Event{
-			{Type: engine.EventModelReported, ModelReported: "gpt-5.4"},
-			{Type: engine.EventModelReported},
-			{Type: engine.EventAgentText, Text: "hello"},
-			{Type: engine.EventResultMessage, Text: "hello"},
-		}
-	}
-	h := startTestServer(t, backend, Config{IdleTimeout: -1})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-
-	var session protocol.SessionStartResult
-	decodeResult(t, rpc(t, conn, r, "1", protocol.MethodSessionStart, protocol.SessionStartParams{Backend: "fake", CWD: h.cwd}), &session)
-	var turn protocol.TurnStartResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodTurnStart, protocol.TurnStartParams{SessionID: session.SessionID, Prompt: "hello"}), &turn)
-
-	event := readNotification(t, r)
-	if event.Method != protocol.NotificationTurnEvent {
-		t.Fatalf("first notification = %s, want turn.event", event.Method)
-	}
-	var eventParams protocol.TurnEventParams
-	mustUnmarshal(t, event.Params, &eventParams)
-	if eventParams.Event.Type != engine.EventAgentText {
-		t.Fatalf("model event leaked as turn event: %+v", eventParams.Event)
-	}
-	resultNotice := readNotification(t, r)
-	var turnResult protocol.TurnResultParams
-	mustUnmarshal(t, resultNotice.Params, &turnResult)
-	if turnResult.ModelReported != "gpt-5.4" || turnResult.Result == nil || turnResult.Result.ModelReported != "gpt-5.4" {
-		t.Fatalf("turn result model = %+v", turnResult)
-	}
-
-	var status protocol.JobStatusResult
-	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: turn.JobID}), &status)
-	if len(status.Jobs) != 1 || status.Jobs[0].ModelReported != "gpt-5.4" {
-		t.Fatalf("job status = %+v", status)
-	}
-	var result protocol.JobResult
-	decodeResult(t, rpc(t, conn, r, "4", protocol.MethodJobResult, protocol.JobResultParams{JobID: turn.JobID}), &result)
-	if result.ModelReported != "gpt-5.4" || result.Result == nil || result.Result.ModelReported != "gpt-5.4" {
-		t.Fatalf("job result = %+v", result)
-	}
-	record := loadJobRecord(t, h.root, h.cwd, turn.JobID, engine.NativeProcessTable{})
-	if record.ModelReported != "gpt-5.4" || record.Result == nil || record.Result.ModelReported != "gpt-5.4" {
-		t.Fatalf("job record = %+v", record)
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	conn := &connection{server: server, hello: true}
+	for _, method := range []string{
+		"session.start",
+		"session.resume",
+		"session.list",
+		"turn.start",
+		"turn.interrupt",
+		"turn.event",
+		"turn.result",
+		"unknown.method",
+	} {
+		method := method
+		t.Run(method, func(t *testing.T) {
+			outcome := server.handle(context.Background(), conn, protocol.Request{
+				JSONRPC: "2.0",
+				ID:      json.RawMessage(`"removed"`),
+				Method:  method,
+			})
+			if outcome.err == nil {
+				t.Fatalf("%s result = %+v, want method_not_found", method, outcome.result)
+			}
+			if outcome.err.Code != -32601 || outcome.err.Data.Code != protocol.ErrorMethodNotFound {
+				t.Fatalf("%s error = %+v, want -32601/%s", method, outcome.err, protocol.ErrorMethodNotFound)
+			}
+		})
 	}
 }
 
@@ -3804,19 +3333,16 @@ func TestTerminalErrorEventFailsJob(t *testing.T) {
 			{Type: engine.EventTerminalError, Text: "backend exploded"},
 		}
 	}
-	h := startTestServer(t, backend, Config{IdleTimeout: -1})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-
-	var job protocol.JobSubmitResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
-		TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "fail"},
-	}), &job)
-	waitJobState(t, conn, r, job.JobID, engine.StateFailed)
-	var result protocol.JobResult
-	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobResult, protocol.JobResultParams{JobID: job.JobID}), &result)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-terminal-error",
+		RequestID:    "request-terminal-error",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "fail"},
+	})
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
 	if result.State != engine.StateFailed || result.Result != nil {
 		t.Fatalf("terminal error result = %+v", result)
 	}
@@ -3831,70 +3357,19 @@ func TestResultMessageWinsOverAssistantTextWithoutDuplication(t *testing.T) {
 			{Type: engine.EventResultMessage, Text: "hello"},
 		}
 	}
-	h := startTestServer(t, backend, Config{IdleTimeout: -1})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-
-	var job protocol.JobSubmitResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
-		TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "dedupe"},
-	}), &job)
-	waitJobState(t, conn, r, job.JobID, engine.StateCompleted)
-	var result protocol.JobResult
-	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobResult, protocol.JobResultParams{JobID: job.JobID}), &result)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-result-message",
+		RequestID:    "request-result-message",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "dedupe"},
+	})
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
 	if result.Result == nil || result.Result.Text != "hello" {
 		t.Fatalf("result = %+v, want single authoritative hello", result.Result)
 	}
-}
-
-func TestPrepareWireEventStripsRawTextMetadata(t *testing.T) {
-	t.Parallel()
-	raw := strings.Repeat("x", engine.DefaultEventTextCap) + "SECRET_RAW_TAIL"
-	event := engine.Event{
-		Type:    engine.EventAgentText,
-		Text:    raw,
-		RawText: raw,
-		Metadata: map[string]any{
-			"agentbusRawText": raw,
-			"text":            raw,
-		},
-	}
-	if authoritativeText(event) != raw {
-		t.Fatal("authoritative text did not use internal raw text")
-	}
-	wire := prepareWireEvent(event)
-	if wire.RawText != "" || !wire.Truncated || strings.Contains(wire.Text, "SECRET_RAW_TAIL") {
-		t.Fatalf("wire event did not cap raw fields: %+v", wire)
-	}
-	encoded, err := json.Marshal(wire)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(encoded), "agentbusRawText") || strings.Contains(string(encoded), "SECRET_RAW_TAIL") {
-		t.Fatalf("wire event leaked raw text: %s", encoded)
-	}
-}
-
-func TestSessionBusy(t *testing.T) {
-	t.Parallel()
-	release := make(chan struct{})
-	backend := newFakeBackend("fake")
-	backend.block = release
-	h := startTestServer(t, backend, Config{IdleTimeout: -1})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-	var session protocol.SessionStartResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodSessionStart, protocol.SessionStartParams{Backend: "fake", CWD: h.cwd}), &session)
-	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodTurnStart, protocol.TurnStartParams{SessionID: session.SessionID, Prompt: "first"}), &protocol.TurnStartResult{})
-	resp := rpc(t, conn, r, "4", protocol.MethodTurnStart, protocol.TurnStartParams{SessionID: session.SessionID, Prompt: "second"})
-	assertRPCCode(t, resp, protocol.ErrorSessionBusy)
-	close(release)
-	_ = readNotification(t, r)
-	_ = readNotification(t, r)
 }
 
 func TestConcurrentBackgroundJobs(t *testing.T) {
@@ -3910,8 +3385,16 @@ func TestConcurrentBackgroundJobs(t *testing.T) {
 	helloRaw(t, conn, r, h.token)
 
 	var one, two protocol.JobSubmitResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "one"}}), &one)
-	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "two"}}), &two)
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-concurrent-one",
+		RequestID:    "request-concurrent-one",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "one"},
+	}), &one)
+	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-concurrent-two",
+		RequestID:    "request-concurrent-two",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "two"},
+	}), &two)
 	for i := 0; i < 2; i++ {
 		select {
 		case <-backend.started:
@@ -3924,171 +3407,6 @@ func TestConcurrentBackgroundJobs(t *testing.T) {
 	waitJobState(t, conn, r, two.JobID, engine.StateCompleted)
 }
 
-func TestBackendProcessUpdatesWorkerIdentity(t *testing.T) {
-	t.Parallel()
-	release := make(chan struct{})
-	backend := newFakeBackend("fake")
-	backend.block = release
-	backend.started = make(chan struct{}, 1)
-	backend.processRef = engine.ProcessRef{PID: 4242, PGID: 4242, StartTime: "backend-start"}
-	backend.backendChildPID = 4243
-	// The daemon's own entry needs a start-time token: supervisor identity
-	// is fail-closed (an empty token reads as gone/reused and orphans the
-	// job before the assertions run).
-	processes := mapProcessTable{entries: map[int]engine.ProcessInfo{
-		os.Getpid(): {PID: os.Getpid(), StartTime: "daemon-start"},
-		4242:        {PID: 4242, StartTime: "backend-start"},
-		4243:        {PID: 4243, StartTime: "child-start"},
-	}}
-	h := startTestServer(t, backend, Config{IdleTimeout: -1, ProcessTable: processes})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-
-	var job protocol.JobSubmitResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"}}), &job)
-	select {
-	case <-backend.started:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for job to start")
-	}
-	var status protocol.JobStatusResult
-	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: job.JobID}), &status)
-	if len(status.Jobs) != 1 ||
-		status.Jobs[0].WorkerPID != 4242 ||
-		status.Jobs[0].WorkerStartTime != "backend-start" ||
-		status.Jobs[0].BackendChildPID != 4243 ||
-		status.Jobs[0].BackendChildStartTime != "child-start" {
-		t.Fatalf("status worker identity = %+v", status)
-	}
-	record := loadJobRecord(t, h.root, h.cwd, job.JobID, processes)
-	if record.Worker.PID != 4242 || record.Worker.PGID != 4242 || record.Worker.StartTime != "backend-start" {
-		t.Fatalf("record worker = %+v", record.Worker)
-	}
-	if record.BackendChildPID != 4243 || record.BackendChildStartTime != "child-start" {
-		t.Fatalf("record backend child identity = pid=%d startTime=%q", record.BackendChildPID, record.BackendChildStartTime)
-	}
-	close(release)
-	waitJobState(t, conn, r, job.JobID, engine.StateCompleted)
-}
-
-func TestJobCancelUsesStoreGraceAndDoesNotInterruptSession(t *testing.T) {
-	t.Parallel()
-	release := make(chan struct{})
-	backend := newFakeBackend("fake")
-	backend.block = release
-	backend.started = make(chan struct{}, 1)
-	backend.processRef = engine.ProcessRef{PID: 5252, PGID: 5250, StartTime: "worker-start"}
-	backend.backendChildPID = 5253
-	// See TestJobStatusReportsWorkerIdentity: empty daemon start-time would
-	// orphan the running job under fail-closed supervisor identity.
-	processes := mapProcessTable{entries: map[int]engine.ProcessInfo{
-		os.Getpid(): {PID: os.Getpid(), StartTime: "daemon-start"},
-		5252:        {PID: 5252, StartTime: "worker-start"},
-		5253:        {PID: 5253, StartTime: "child-start"},
-	}}
-	groups := &recordingProcessGroups{}
-	waiter := newRecordingWaiter()
-	h := startTestServer(t, backend, Config{IdleTimeout: -1, ProcessTable: processes, ProcessGroups: groups, CancelWaiter: waiter})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-
-	var job protocol.JobSubmitResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"}}), &job)
-	select {
-	case <-backend.started:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for job to start")
-	}
-	defer waiter.Release()
-	cancelResp := make(chan protocol.Response, 1)
-	go func() {
-		cancelResp <- rpc(t, conn, r, "3", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: job.JobID})
-	}()
-	select {
-	case got := <-waiter.durations:
-		if got != engine.DefaultCancelGrace {
-			t.Fatalf("cancel grace = %s, want %s", got, engine.DefaultCancelGrace)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("store cancellation did not enter the protocol grace wait")
-	}
-	signals := groups.snapshot()
-	if len(signals) != 1 || signals[0].Signal != syscall.SIGTERM || signals[0].PGID != 5250 {
-		t.Fatalf("signals before grace release = %+v", signals)
-	}
-	waiter.Release()
-	var canceled protocol.JobCancelResult
-	select {
-	case resp := <-cancelResp:
-		decodeResult(t, resp, &canceled)
-	case <-time.After(time.Second):
-		t.Fatal("cancel RPC did not return after grace release")
-	}
-	if canceled.State != engine.StateCanceled {
-		t.Fatalf("cancel result = %+v", canceled)
-	}
-	signals = groups.snapshot()
-	if len(signals) != 2 || signals[1].Signal != syscall.SIGKILL || signals[1].PGID != 5250 {
-		t.Fatalf("signals after grace release = %+v", signals)
-	}
-	if got := backend.interrupts.Load(); got != 0 {
-		t.Fatalf("session interrupts = %d, want 0", got)
-	}
-	close(release)
-	waitJobState(t, conn, r, job.JobID, engine.StateCanceled)
-}
-
-func TestBackgroundJobCancelDoesNotInterruptSessionAttemptInterleavings(t *testing.T) {
-	t.Parallel()
-	t.Run("attempt context cancellation wins", func(t *testing.T) {
-		t.Parallel()
-		server, run, sess, ctx, cancel := newControlledBackgroundRun(t)
-		defer cancel()
-		done := make(chan attemptResult, 1)
-		go func() {
-			text, state, err := server.runAttempt(ctx, run, "hold", false, model.LaunchOrdinalOne)
-			done <- attemptResult{text: text, state: state, err: err}
-		}()
-		waitControlledSessionStarted(t, sess)
-
-		run.active.requestTerminal(engine.StateCanceled)
-		cancel()
-		result := waitAttemptResult(t, done)
-		if !errors.Is(result.err, context.Canceled) {
-			t.Fatalf("runAttempt err = %v, want context.Canceled", result.err)
-		}
-		if got := sess.interrupts.Load(); got != 0 {
-			t.Fatalf("session interrupts = %d, want 0", got)
-		}
-	})
-	t.Run("backend event stream closes before context cancellation", func(t *testing.T) {
-		t.Parallel()
-		server, run, sess, ctx, cancel := newControlledBackgroundRun(t)
-		defer cancel()
-		done := make(chan attemptResult, 1)
-		go func() {
-			text, state, err := server.runAttempt(ctx, run, "hold", false, model.LaunchOrdinalOne)
-			done <- attemptResult{text: text, state: state, err: err}
-		}()
-		waitControlledSessionStarted(t, sess)
-
-		run.active.requestTerminal(engine.StateCanceled)
-		close(sess.events)
-		result := waitAttemptResult(t, done)
-		if result.err != nil || result.state != engine.StateCompleted {
-			t.Fatalf("runAttempt result = %+v, want completed without error", result)
-		}
-		cancel()
-		if got := sess.interrupts.Load(); got != 0 {
-			t.Fatalf("session interrupts = %d, want 0", got)
-		}
-	})
-}
-
 func TestDeferredLaunchRunsOnlyAfterSuccessfulAck(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
@@ -4096,87 +3414,26 @@ func TestDeferredLaunchRunsOnlyAfterSuccessfulAck(t *testing.T) {
 	backend.block = release
 	backend.started = make(chan struct{}, 1)
 	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
 
 	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
-		TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+		WorkspaceKey: "workspace-deferred-launch",
+		RequestID:    "request-deferred-launch",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
 	}, nil)
 	if got := conn.writesString(); !strings.Contains(got, `"result"`) {
 		t.Fatalf("response was not written before launch: %s", got)
 	}
+	resp := responseFromScriptedConn(t, conn)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
 	select {
 	case <-backend.started:
 	case <-time.After(time.Second):
 		t.Fatal("job did not launch after successful ack")
 	}
 	close(release)
-	waitKnownRecordState(t, server, engine.StateCompleted)
-}
-
-func TestDeferredLaunchAbortsWhenAckWriteFails(t *testing.T) {
-	t.Parallel()
-	errAck := errors.New("ack write failed")
-	tests := []struct {
-		name      string
-		method    string
-		params    func(cwd string) any
-		sessionID string
-		want      engine.JobState
-	}{
-		{
-			name:   "job submit",
-			method: protocol.MethodJobSubmit,
-			params: func(cwd string) any {
-				return protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"}}
-			},
-			want: engine.StateCanceled,
-		},
-		{
-			name:      "turn start",
-			method:    protocol.MethodTurnStart,
-			sessionID: "ses_ack_failure",
-			params: func(string) any {
-				return protocol.TurnStartParams{SessionID: "ses_ack_failure", Prompt: "hold"}
-			},
-			want: engine.StateInterrupted,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			backend := newFakeBackend("fake")
-			backend.started = make(chan struct{}, 1)
-			server, _, cwd := newUnstartedTestServer(t, backend)
-			if tt.sessionID != "" {
-				addScriptedSession(t, server, backend, cwd, tt.sessionID)
-			}
-
-			serveScriptedRequest(t, server, tt.method, tt.params(cwd), errAck)
-			select {
-			case <-backend.started:
-				t.Fatal("backend launched after failed ack")
-			default:
-			}
-			select {
-			case turn := <-backend.turns:
-				t.Fatalf("backend received turn after failed ack: %+v", turn)
-			default:
-			}
-			record := singleKnownRecord(t, server)
-			if record.State != tt.want {
-				t.Fatalf("record state = %s, want %s", record.State, tt.want)
-			}
-			if server.activeWork() {
-				t.Fatal("failed ack left active work registered")
-			}
-			if tt.sessionID != "" {
-				server.mu.Lock()
-				active := server.sessions[tt.sessionID].activeTurnID
-				server.mu.Unlock()
-				if active != "" {
-					t.Fatalf("failed ack left active turn %q", active)
-				}
-			}
-		})
-	}
+	waitAdmissionSafetyTerminal(t, server, submitted.JobID)
 }
 
 func TestHeartbeatRacingCompletionDoesNotResurrectTerminalRecord(t *testing.T) {
@@ -4424,135 +3681,6 @@ func TestHeartbeatDoesNotBlockOnJobLock(t *testing.T) {
 	}
 }
 
-func TestTurnInterruptRejectsBackgroundJob(t *testing.T) {
-	t.Parallel()
-	release := make(chan struct{})
-	backend := newFakeBackend("fake")
-	backend.block = release
-	backend.started = make(chan struct{}, 1)
-	h := startTestServer(t, backend, Config{IdleTimeout: -1})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-
-	var job protocol.JobSubmitResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"}}), &job)
-	select {
-	case <-backend.started:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for job to start")
-	}
-	resp := rpc(t, conn, r, "3", protocol.MethodTurnInterrupt, protocol.TurnInterruptParams{TurnID: job.JobID})
-	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
-	var status protocol.JobStatusResult
-	decodeResult(t, rpc(t, conn, r, "4", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: job.JobID}), &status)
-	if len(status.Jobs) != 1 || status.Jobs[0].State != engine.StateRunning {
-		t.Fatalf("background job state changed after turn.interrupt: %+v", status)
-	}
-	close(release)
-	waitJobState(t, conn, r, job.JobID, engine.StateCompleted)
-}
-
-func TestJobCancelRejectsForegroundTurn(t *testing.T) {
-	t.Parallel()
-	release := make(chan struct{})
-	backend := newFakeBackend("fake")
-	backend.block = release
-	backend.started = make(chan struct{}, 1)
-	h := startTestServer(t, backend, Config{IdleTimeout: -1})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-	var session protocol.SessionStartResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodSessionStart, protocol.SessionStartParams{Backend: "fake", CWD: h.cwd}), &session)
-	var turn protocol.TurnStartResult
-	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodTurnStart, protocol.TurnStartParams{SessionID: session.SessionID, Prompt: "hold"}), &turn)
-	select {
-	case <-backend.started:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for turn to start")
-	}
-	resp := rpc(t, conn, r, "4", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: turn.JobID})
-	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
-	var sessions protocol.SessionListResult
-	decodeResult(t, rpc(t, conn, r, "5", protocol.MethodSessionList, protocol.SessionListParams{}), &sessions)
-	if len(sessions.Sessions) != 1 || sessions.Sessions[0].ActiveTurnID == nil || *sessions.Sessions[0].ActiveTurnID != turn.TurnID {
-		t.Fatalf("foreground turn was not left active: %+v", sessions)
-	}
-	close(release)
-	_ = readNotification(t, r)
-	_ = readNotification(t, r)
-}
-
-func TestSideEffectingNotificationsAreRejectedBeforeMutation(t *testing.T) {
-	t.Parallel()
-	backend := newFakeBackend("fake")
-	h := startTestServer(t, backend, Config{IdleTimeout: -1})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-	var session protocol.SessionStartResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodSessionStart, protocol.SessionStartParams{Backend: "fake", CWD: h.cwd}), &session)
-
-	notifyRPC(t, conn, protocol.MethodTurnStart, protocol.TurnStartParams{SessionID: session.SessionID, Prompt: "notification"})
-	assertRPCCode(t, readResponse(t, r), protocol.ErrorInvalidTaskSpec)
-	notifyRPC(t, conn, protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "notification"}})
-	assertRPCCode(t, readResponse(t, r), protocol.ErrorInvalidTaskSpec)
-
-	var sessions protocol.SessionListResult
-	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodSessionList, protocol.SessionListParams{}), &sessions)
-	if len(sessions.Sessions) != 1 || sessions.Sessions[0].ActiveTurnID != nil {
-		t.Fatalf("notification mutated session state: %+v", sessions)
-	}
-	var status protocol.JobStatusResult
-	decodeResult(t, rpc(t, conn, r, "4", protocol.MethodJobStatus, protocol.JobStatusParams{All: true}), &status)
-	if len(status.Jobs) != 0 {
-		t.Fatalf("notification created jobs: %+v", status)
-	}
-	if got := backend.count.Load(); got != 1 {
-		t.Fatalf("backend starts = %d, want only session.start", got)
-	}
-}
-
-func TestNamedPolicyResolvedAtSubmitTime(t *testing.T) {
-	t.Parallel()
-	release := make(chan struct{})
-	backend := newFakeBackend("fake")
-	backend.block = release
-	backend.started = make(chan struct{}, 1)
-	registry := engine.NewPolicyRegistry()
-	spec := engine.ContractSpec{Shape: &engine.ShapeSpec{FirstLineEnum: []string{"PASS"}, RequiredSections: []string{"Findings"}}}
-	if _, err := registry.Register("delegate/report@1", spec); err != nil {
-		t.Fatal(err)
-	}
-	h := startTestServer(t, backend, Config{IdleTimeout: -1, Registry: registry})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-
-	var job protocol.JobSubmitResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{
-		Backend: "fake",
-		CWD:     h.cwd,
-		Write:   false,
-		Prompt:  "hold",
-		Policy:  &engine.TurnPolicy{Contract: &engine.ContractSpec{Named: "delegate/report@1"}},
-	}}), &job)
-	record := loadJobRecord(t, h.root, h.cwd, job.JobID, nil)
-	if record.ResolvedContract == nil || record.ResolvedContract.Shape == nil || record.ResolvedContract.Named != "" {
-		t.Fatalf("resolved contract was not persisted at submit time: %+v", record.ResolvedContract)
-	}
-	if record.Policy == nil || record.Policy.Contract == nil || record.Policy.Contract.Named != "delegate/report@1" {
-		t.Fatalf("submitted policy name was not retained: %+v", record.Policy)
-	}
-	close(release)
-	waitJobState(t, conn, r, job.JobID, engine.StateCompleted)
-}
-
 func TestIdleShutdownWaitsForActiveJobs(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
@@ -4564,7 +3692,11 @@ func TestIdleShutdownWaitsForActiveJobs(t *testing.T) {
 	r := bufio.NewReader(conn)
 	helloRaw(t, conn, r, h.token)
 	var job protocol.JobSubmitResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"}}), &job)
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-idle-shutdown",
+		RequestID:    "request-idle-shutdown",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"},
+	}), &job)
 	<-backend.started
 	_ = conn.Close()
 
@@ -4690,12 +3822,16 @@ func TestBinaryChangeWaitsForConnectionsAndActiveJobs(t *testing.T) {
 	r := bufio.NewReader(conn)
 	helloRaw(t, conn, r, h.token)
 	var job protocol.JobSubmitResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{TaskSpec: protocol.TaskSpec{
-		Backend: "fake",
-		CWD:     h.cwd,
-		Write:   false,
-		Prompt:  "hold",
-	}}), &job)
+	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-binary-change",
+		RequestID:    "request-binary-change",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     h.cwd,
+			Write:   false,
+			Prompt:  "hold",
+		},
+	}), &job)
 	<-backend.started
 	changed.changed.Store(true)
 
@@ -4896,7 +4032,9 @@ func TestJobLookupSurvivesRestartForNonStartupWorkspace(t *testing.T) {
 	helloRaw(t, conn, r, first.token)
 	var submitted protocol.JobSubmitResult
 	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
-		TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: jobCWD, Write: false, Prompt: "complete"},
+		WorkspaceKey: "workspace-restart-lookup",
+		RequestID:    "request-restart-lookup",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: jobCWD, Write: false, Prompt: "complete"},
 	}), &submitted)
 	waitJobState(t, conn, r, submitted.JobID, engine.StateCompleted)
 	_ = conn.Close()
@@ -4924,55 +4062,6 @@ func TestJobLookupSurvivesRestartForNonStartupWorkspace(t *testing.T) {
 	decodeResult(t, rpc(t, conn, r, "5", protocol.MethodJobCancel, protocol.JobCancelParams{JobID: submitted.JobID}), &canceled)
 	if canceled.JobID != submitted.JobID || canceled.State != engine.StateCompleted {
 		t.Fatalf("cancel after restart = %+v", canceled)
-	}
-}
-
-func TestBackendSessionIDPersistsAndSessionResumeUsesRecordAfterRestart(t *testing.T) {
-	t.Parallel()
-	root := shortTempDir(t)
-	jobCWD := shortTempDir(t)
-	canonicalJobCWD, err := engine.CanonicalWorkspace(jobCWD)
-	if err != nil {
-		t.Fatal(err)
-	}
-	daemonCWD := shortTempDir(t)
-
-	first := startTestServerWithRoot(t, root, daemonCWD, newFakeBackend("fake"), Config{IdleTimeout: -1})
-	conn := dialRaw(t, first.socketPath)
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, first.token)
-	var submitted protocol.JobSubmitResult
-	decodeResult(t, rpc(t, conn, r, "2", protocol.MethodJobSubmit, protocol.JobSubmitParams{
-		TaskSpec: protocol.TaskSpec{Backend: "fake", CWD: jobCWD, Write: false, Prompt: "complete", Tags: map[string]string{"client": "resume-test"}},
-	}), &submitted)
-	waitJobState(t, conn, r, submitted.JobID, engine.StateCompleted)
-	record := loadJobRecord(t, root, jobCWD, submitted.JobID, fakeProcessTable{})
-	if record.BackendSessionID == "" {
-		t.Fatalf("backend session id was not persisted: %+v", record)
-	}
-	_ = conn.Close()
-	stopTestServer(t, first)
-
-	secondBackend := newFakeBackend("fake")
-	secondBackend.resumes = make(chan resumedSession, 1)
-	second := startTestServerWithRoot(t, root, daemonCWD, secondBackend, Config{IdleTimeout: -1})
-	conn = dialRaw(t, second.socketPath)
-	defer conn.Close()
-	r = bufio.NewReader(conn)
-	helloRaw(t, conn, r, second.token)
-
-	var resumed protocol.SessionStartResult
-	decodeResult(t, rpc(t, conn, r, "3", protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: record.SessionID}), &resumed)
-	if resumed.SessionID != record.SessionID || resumed.Backend != "fake" {
-		t.Fatalf("resume result = %+v", resumed)
-	}
-	select {
-	case got := <-secondBackend.resumes:
-		if got.ID != record.BackendSessionID || got.Opts.CWD != canonicalJobCWD || got.Opts.Write {
-			t.Fatalf("backend resume = %+v, want id %q cwd %q read-only", got, record.BackendSessionID, canonicalJobCWD)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("backend.Resume was not called from persisted record")
 	}
 }
 
@@ -5207,6 +4296,9 @@ func startTestServerWithRootAndHooks(t *testing.T, root, cwd string, backend eng
 	server := newTestServerWithRoot(t, root, cwd, backend, cfg)
 	if configure != nil {
 		configure(server)
+	}
+	if server.admissionRuntime == nil && server.admissionRuntimeConfig.Process() == nil {
+		configureTestAdmissionRuntime(t, server, newAdmissionFakeLaunchCustodian(t), true)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -5477,158 +4569,6 @@ func newPriorBootAuthorityWork(t *testing.T, repo *memory.Repository, anchorStor
 	return ready, accepted
 }
 
-func prepareLegacyFencedCommandForTest(t *testing.T, server *Server, requestID string) *legacyFencedCommand {
-	t.Helper()
-	preparation, err := server.admissionSubmission.PrepareLegacyFenced(context.Background(), authority.AcceptRequest{
-		RequestKey:   model.RequestKey{WorkspaceKey: model.WorkspaceKey("workspace/" + requestID), RequestID: model.RequestID(requestID)},
-		TaskIdentity: model.NewSHA256TaskIdentity([]byte(requestID)),
-		Mode:         model.ModeLegacyFenced,
-		SessionID:    "session-" + requestID,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd, _, err := server.admissionSubmission.prepareLegacyFencedCommand(context.Background(), preparation.Admission, command.ExecSpec{
-		Argv: []string{"fake-parked"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return cmd
-}
-
-func newLegacyFencedCoordinatorWithRecordingAuthorityForTest(t *testing.T, launcher *admissionFakeLaunchCustodian) (repository.Repository, *recordingLegacyLaunchAuthority, *servedSubmissionCoordinator) {
-	t.Helper()
-	repo := memory.NewRepository()
-	anchorStore := authority.NewAnchorStore()
-	bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(launcher.verifier))
-	if err != nil {
-		t.Fatal(err)
-	}
-	boot, err := model.NewBootRef("boot-legacy-fenced-release-unknown", "owner-legacy-fenced-release-unknown")
-	if err != nil {
-		t.Fatal(err)
-	}
-	session, err := bootstrapper.Begin(context.Background(), boot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ready, err := session.SealReady(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	recorder := &recordingLegacyLaunchAuthority{ready: ready}
-	controller, err := launch.New(recorder, launcher)
-	if err != nil {
-		t.Fatal(err)
-	}
-	coordinator := &servedSubmissionCoordinator{
-		ready:  ready,
-		owner:  boot.OwnerID,
-		launch: controller,
-		latch:  NewSafetyLatch(),
-	}
-	return repo, recorder, coordinator
-}
-
-func prepareLegacyFencedCommandWithCoordinatorForTest(t *testing.T, coordinator *servedSubmissionCoordinator, requestID string) *legacyFencedCommand {
-	t.Helper()
-	preparation, err := coordinator.PrepareLegacyFenced(context.Background(), authority.AcceptRequest{
-		RequestKey:   model.RequestKey{WorkspaceKey: model.WorkspaceKey("workspace/" + requestID), RequestID: model.RequestID(requestID)},
-		TaskIdentity: model.NewSHA256TaskIdentity([]byte(requestID)),
-		Mode:         model.ModeLegacyFenced,
-		SessionID:    "session-" + requestID,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd, _, err := coordinator.prepareLegacyFencedCommand(context.Background(), preparation.Admission, command.ExecSpec{
-		Argv: []string{"fake-parked"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return cmd
-}
-
-type recordingLegacyLaunchAuthority struct {
-	ready *authority.Ready
-
-	mu                             sync.Mutex
-	recordQuiescenceCtxErrs        []error
-	recordQuiescenceCtxDeadlines   []bool
-	recordReleaseOutcomes          []model.LaunchReleaseOutcome
-	recordReleaseOutcomeErrs       []error
-	recordReleaseOutcomeDurability launch.DurabilityOutcome
-	recordReleaseOutcomeErr        error
-}
-
-func (a *recordingLegacyLaunchAuthority) BindGroup(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, group model.GroupRef) (launch.DurabilityOutcome, error) {
-	applied, err := a.ready.BindGroup(ctx, jobID, ref, ordinal, group)
-	return applied.Durability, err
-}
-
-func (a *recordingLegacyLaunchAuthority) AllocateGrant(ctx context.Context, ref model.AttemptRef, ordinal model.LaunchOrdinal) (model.LaunchGrant, launch.DurabilityOutcome, error) {
-	return a.ready.AllocateGrant(ctx, ref, ordinal)
-}
-
-func (a *recordingLegacyLaunchAuthority) RecordReleaseOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, outcome model.LaunchReleaseOutcome) (launch.DurabilityOutcome, error) {
-	a.mu.Lock()
-	injectedDurability := a.recordReleaseOutcomeDurability
-	injectedErr := a.recordReleaseOutcomeErr
-	a.mu.Unlock()
-	if injectedDurability != 0 || injectedErr != nil {
-		if injectedDurability == 0 {
-			injectedDurability = launch.DefinitelyNotCommitted
-		}
-		a.mu.Lock()
-		a.recordReleaseOutcomes = append(a.recordReleaseOutcomes, outcome)
-		a.recordReleaseOutcomeErrs = append(a.recordReleaseOutcomeErrs, injectedErr)
-		a.mu.Unlock()
-		return injectedDurability, injectedErr
-	}
-	applied, err := a.ready.RecordReleaseOutcome(ctx, jobID, ref, ordinal, outcome)
-	a.mu.Lock()
-	a.recordReleaseOutcomes = append(a.recordReleaseOutcomes, outcome)
-	a.recordReleaseOutcomeErrs = append(a.recordReleaseOutcomeErrs, err)
-	a.mu.Unlock()
-	return applied.Durability, err
-}
-
-func (a *recordingLegacyLaunchAuthority) RecordRelease(ctx context.Context, jobID model.JobID, ref model.AttemptRef, ordinal model.LaunchOrdinal, child model.ChildIdentity, evidence model.Evidence) (launch.DurabilityOutcome, error) {
-	applied, err := a.ready.RecordRelease(ctx, jobID, ref, ordinal, child, evidence)
-	return applied.Durability, err
-}
-
-func (a *recordingLegacyLaunchAuthority) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) (launch.DurabilityOutcome, error) {
-	_, hasDeadline := ctx.Deadline()
-	a.mu.Lock()
-	a.recordQuiescenceCtxErrs = append(a.recordQuiescenceCtxErrs, ctx.Err())
-	a.recordQuiescenceCtxDeadlines = append(a.recordQuiescenceCtxDeadlines, hasDeadline)
-	a.mu.Unlock()
-	applied, err := a.ready.RecordQuiescence(ctx, jobID, ordinal, verified)
-	return applied.Durability, err
-}
-
-func (a *recordingLegacyLaunchAuthority) FailStop(ctx context.Context, reason error) error {
-	if reason == nil {
-		reason = errors.New("launch fail-stop")
-	}
-	return a.ready.FailStop(ctx, reason.Error())
-}
-
-func (a *recordingLegacyLaunchAuthority) recordQuiescenceContextObservations() ([]error, []bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return append([]error(nil), a.recordQuiescenceCtxErrs...), append([]bool(nil), a.recordQuiescenceCtxDeadlines...)
-}
-
-func (a *recordingLegacyLaunchAuthority) recordReleaseOutcomeObservations() ([]model.LaunchReleaseOutcome, []error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return append([]model.LaunchReleaseOutcome(nil), a.recordReleaseOutcomes...), append([]error(nil), a.recordReleaseOutcomeErrs...)
-}
-
 type recordingAdmissionAuthority struct {
 	*servedAdmissionAuthority
 
@@ -5708,31 +4648,6 @@ func finalizeAcceptedAuthorityWork(t *testing.T, server *Server, accepted author
 	})
 	if err != nil {
 		t.Fatal(err)
-	}
-}
-
-func assertLegacyFencedAbortUsedDetachedContext(t *testing.T, launcher *admissionFakeLaunchCustodian) {
-	t.Helper()
-	if got := launcher.abortCount(); got != 1 {
-		t.Fatalf("legacy fenced aborts = %d, want one retired parked worker", got)
-	}
-	errs, deadlines := launcher.abortContextObservations()
-	if len(errs) != 1 || errs[0] != nil {
-		t.Fatalf("abort context errors = %+v, want one live context", errs)
-	}
-	if len(deadlines) != 1 || !deadlines[0] {
-		t.Fatalf("abort context deadlines = %+v, want bounded cleanup context", deadlines)
-	}
-}
-
-func assertLegacyFencedRejectedWithoutGrant(t *testing.T, safety model.SafetyRecord) {
-	t.Helper()
-	if safety.Terminal == nil || safety.Terminal.Outcome != model.OutcomeCanceled || safety.Terminal.Cause != model.CauseResponseUndeliverable {
-		t.Fatalf("legacy fenced terminal = %+v, want response-undeliverable cancel", safety.Terminal)
-	}
-	first, ok := safety.Attempt.Launches.Get(model.LaunchOrdinalOne)
-	if !ok || first.Group == nil || first.Quiescence == nil || first.Grant != nil || first.Released != nil {
-		t.Fatalf("legacy fenced failed-response launch proof = %+v, want retired without grant/release", first)
 	}
 }
 
@@ -6254,6 +5169,53 @@ func assertNoJSONJobRecord(t *testing.T, server *Server, jobID string) {
 	}
 }
 
+func submitIdentifiedForReplayTest(t *testing.T, server *Server, params protocol.JobSubmitParams) protocol.JobSubmitResult {
+	t.Helper()
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, params))
+	if outcome.err != nil {
+		t.Fatalf("initial submit error = %+v", outcome.err)
+	}
+	submitted, ok := outcome.result.(protocol.JobSubmitResult)
+	if !ok {
+		t.Fatalf("initial submit result type = %T", outcome.result)
+	}
+	if submitted.JobID == "" || submitted.Deduplicated {
+		t.Fatalf("initial submit result = %+v, want accepted non-replay", submitted)
+	}
+	if outcome.after == nil {
+		t.Fatal("initial submit did not return response hook")
+	}
+	return submitted
+}
+
+func replayIdentifiedSubmit(t *testing.T, server *Server, params protocol.JobSubmitParams) protocol.JobSubmitResult {
+	t.Helper()
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, params))
+	if outcome.err != nil {
+		t.Fatalf("replay submit error = %+v", outcome.err)
+	}
+	replayed, ok := outcome.result.(protocol.JobSubmitResult)
+	if !ok {
+		t.Fatalf("replay submit result type = %T", outcome.result)
+	}
+	if outcome.after != nil {
+		t.Fatal("replay returned a launch hook")
+	}
+	return replayed
+}
+
+func submitIdentifiedViaScriptedRequest(t *testing.T, server *Server, params protocol.JobSubmitParams) protocol.JobSubmitResult {
+	t.Helper()
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, params, nil)
+	resp := responseFromScriptedConn(t, conn)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	if submitted.JobID == "" || submitted.Deduplicated {
+		t.Fatalf("submit result = %+v, want accepted non-replay", submitted)
+	}
+	return submitted
+}
+
 func clearAdmissionJobMarkersForTest(t *testing.T, server *Server) {
 	t.Helper()
 	server.mu.Lock()
@@ -6388,17 +5350,6 @@ func assertNoWorkspaceNamespaceForCWD(t *testing.T, root, cwd string) {
 	if _, err := os.Stat(namespace); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("workspace namespace stat error = %v, want not exist for %s", err, namespace)
 	}
-}
-
-func addScriptedSession(t *testing.T, server *Server, backend *fakeBackend, cwd, sessionID string) {
-	t.Helper()
-	session, err := backend.Start(context.Background(), engine.SessionOpts{CWD: cwd})
-	if err != nil {
-		t.Fatal(err)
-	}
-	server.mu.Lock()
-	server.sessions[sessionID] = &sessionState{id: sessionID, backend: backend.Name(), cwd: cwd, session: session}
-	server.mu.Unlock()
 }
 
 func markerCodexCLI(t *testing.T, marker string) string {

@@ -3,7 +3,6 @@ package agentbusserve
 import (
 	"context"
 
-	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/internal/served"
 )
 
@@ -23,13 +22,8 @@ func RecoverAdmissionRoot(ctx context.Context, cfg Config) (served.AdmissionReco
 }
 
 func productionServedConfig(cfg Config) served.Config {
-	if cfg.StrictAdmissionRequested {
-		strictCfg, _ := strictAdmissionServedConfig(cfg, StrictAdmissionOptions{})
-		return strictCfg
-	}
-	cfg.Runtime = custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable)
-	cfg.StrictAdmissionRequested = false
-	return cfg
+	strictCfg, _ := strictAdmissionServedConfig(cfg, StrictAdmissionOptions{})
+	return strictCfg
 }
 
 func strictAdmissionServedConfig(cfg Config, opts StrictAdmissionOptions) (served.Config, error) {

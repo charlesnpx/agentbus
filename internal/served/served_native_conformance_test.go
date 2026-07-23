@@ -174,7 +174,7 @@ func TestServedNativeConformanceDaemonProcess(t *testing.T) {
 }
 
 func TestServedNativeProductionDefaultsUnavailableAndGateOff(t *testing.T) {
-	server, _, cwd := newUnstartedTestServer(t, newFakeBackend(servedNativeBackendName))
+	server, root, _ := newUnstartedTestServer(t, newFakeBackend(servedNativeBackendName))
 	if server.jobsRequestIDEnabled {
 		t.Fatal("jobsRequestIDEnabled default = true, want false")
 	}
@@ -183,28 +183,24 @@ func TestServedNativeProductionDefaultsUnavailableAndGateOff(t *testing.T) {
 	if support.ParkedExec || support.VerifiedContainment || !errors.Is(support.Reason, custodian.ErrSupervisorUnavailable) {
 		t.Fatalf("production runtime support = %+v, want unavailable supervisor", support)
 	}
-	if err := server.bootstrapAdmission(context.Background()); err != nil {
-		t.Fatal(err)
+	err := server.bootstrapAdmission(context.Background())
+	var diagnostic AdmissionSupportDiagnostic
+	if !errors.As(err, &diagnostic) {
+		t.Fatalf("bootstrapAdmission() error = %T %v, want AdmissionSupportDiagnostic", err, err)
+	}
+	if !errors.Is(err, ErrAdmissionStrictSupportUnavailable) {
+		t.Fatalf("bootstrapAdmission() error = %v, want ErrAdmissionStrictSupportUnavailable", err)
 	}
 	if server.jobsRequestIDEnabled {
 		t.Fatal("jobsRequestIDEnabled changed to true after default bootstrap")
 	}
-
-	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
-		WorkspaceKey: "workspace-production-gate-off",
-		RequestID:    "request-production-gate-off",
-		TaskSpec: protocol.TaskSpec{
-			Backend: servedNativeBackendName,
-			CWD:     cwd,
-			Write:   false,
-			Prompt:  servedNativeFixtureModeClean,
-		},
-	}))
-	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorCapabilityMissing {
-		t.Fatalf("identified submit with production gate off = result:%+v err:%+v, want capability_missing", outcome.result, outcome.err)
+	if server.admissionInstance != nil {
+		t.Fatal("admission instance was constructed for unavailable runtime")
 	}
-	if outcome.err.Data.AdmissionCause != protocol.AdmissionRejectUnavailableNativeRuntime {
-		t.Fatalf("identified submit admission cause = %q, want %q", outcome.err.Data.AdmissionCause, protocol.AdmissionRejectUnavailableNativeRuntime)
+	for _, name := range []string{admissionRepositoryFile, admissionAnchorFile} {
+		if _, statErr := os.Stat(filepath.Join(root, name)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("%s stat error = %v, want not exist", name, statErr)
+		}
 	}
 }
 

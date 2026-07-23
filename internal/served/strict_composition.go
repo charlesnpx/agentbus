@@ -32,7 +32,6 @@ type StrictAdmissionOptions struct {
 func StrictAdmissionConfig(cfg Config, opts StrictAdmissionOptions) (Config, error) {
 	runtime, err := NewStrictAdmissionRuntime(opts)
 	cfg.Runtime = runtime
-	cfg.StrictAdmissionRequested = true
 	return cfg, err
 }
 

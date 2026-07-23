@@ -520,9 +520,6 @@ func (identity TaskIdentity) Validate() error {
 	if identity.Algorithm != TaskIdentityAlgorithmSHA256 {
 		return invalid("task_identity.algorithm", "is unsupported")
 	}
-	if identity.Version != CurrentTaskIdentityVersion {
-		return invalid("task_identity.version", "is unsupported")
-	}
 	if len(identity.Value) != sha256.Size*2 {
 		return invalid("task_identity.value", "must be a sha256 hex digest")
 	}

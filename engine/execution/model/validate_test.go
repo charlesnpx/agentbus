@@ -60,10 +60,6 @@ func TestTaskIdentityValidation(t *testing.T) {
 			in.Algorithm = "md5"
 			return in
 		}, wantText: "unsupported"},
-		{name: "unsupported version", mutate: func(in TaskIdentity) TaskIdentity {
-			in.Version = 2
-			return in
-		}, wantText: "unsupported"},
 		{name: "bad length", mutate: func(in TaskIdentity) TaskIdentity {
 			in.Value = "abc"
 			return in
@@ -87,6 +83,15 @@ func TestTaskIdentityValidation(t *testing.T) {
 				t.Fatalf("error = %q, want text %q", err, tt.wantText)
 			}
 		})
+	}
+
+	futureVersion := identity
+	futureVersion.Version = CurrentTaskIdentityVersion + 1
+	if err := futureVersion.Validate(); err != nil {
+		t.Fatalf("future sha256 identity version rejected as record shape: %v", err)
+	}
+	if _, err := TaskIdentityCodecFor(futureVersion.Algorithm, futureVersion.Version); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("future sha256 codec error = %v, want ErrInvalidValue", err)
 	}
 }
 

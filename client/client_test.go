@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/internal/protocol"
-	"github.com/charlesnpx/agentbus/internal/served"
 )
 
 func TestMain(m *testing.M) {
@@ -31,20 +30,15 @@ func TestMain(m *testing.M) {
 }
 
 func runAutostartDetachDaemon() int {
-	server, err := served.New(served.Config{
-		StateRoot:   os.Getenv("AGENTBUS_STATE_ROOT"),
-		Token:       os.Getenv("AGENTBUS_AUTOSTART_DETACH_TOKEN"),
-		IdleTimeout: -1,
-	})
-	if err != nil {
+	root := os.Getenv("AGENTBUS_STATE_ROOT")
+	if root == "" {
+		root = os.Getenv("AGENTBUS_AUTOSTART_DETACH_ROOT")
+	}
+	if _, err := startClientTestDaemon(context.Background(), root, os.Getenv("AGENTBUS_AUTOSTART_DETACH_TOKEN")); err != nil {
 		recordAutostartDetachDaemonError(err)
 		return 1
 	}
-	if err := server.Serve(context.Background()); err != nil {
-		recordAutostartDetachDaemonError(err)
-		return 1
-	}
-	return 0
+	select {}
 }
 
 func recordAutostartDetachDaemonError(err error) {
@@ -79,7 +73,35 @@ func TestClientHelloParsesCapabilitiesWithoutBackendMetadata(t *testing.T) {
 	}
 }
 
+func TestClientHelloRejectsProtocolVersionMismatch(t *testing.T) {
+	err := runClientHelloError(t, `{"protocolVersion":1,"backends":["codex"],"capabilities":{}}`)
+	if !errors.Is(err, ErrProtocolVersionMismatch) {
+		t.Fatalf("clientHello error = %v, want ErrProtocolVersionMismatch", err)
+	}
+	if !strings.Contains(err.Error(), "expected 2") || !strings.Contains(err.Error(), "received 1") {
+		t.Fatalf("clientHello error message = %q, want expected and received versions", err.Error())
+	}
+}
+
 func runClientHello(t *testing.T, result string) HelloResult {
+	t.Helper()
+	hello, err := runClientHelloResult(t, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hello
+}
+
+func runClientHelloError(t *testing.T, result string) error {
+	t.Helper()
+	_, err := runClientHelloResult(t, result)
+	if err == nil {
+		t.Fatal("clientHello succeeded, want error")
+	}
+	return err
+}
+
+func runClientHelloResult(t *testing.T, result string) (HelloResult, error) {
 	t.Helper()
 	clientConn, serverConn := net.Pipe()
 	t.Cleanup(func() {
@@ -107,13 +129,10 @@ func runClientHello(t *testing.T, result string) HelloResult {
 	}()
 
 	hello, err := clientHello(context.Background(), clientConn, bufio.NewReader(clientConn), "token")
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := <-errCh; err != nil {
 		t.Fatal(err)
 	}
-	return hello
+	return hello, err
 }
 
 func TestAutostartRaceStartsOneDaemon(t *testing.T) {
@@ -124,24 +143,14 @@ func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 	var starts atomic.Int64
 	starter := StartFunc(func(ctx context.Context, opts StartOptions) (int, error) {
 		starts.Add(1)
-		server, err := served.New(served.Config{
-			StateRoot:   root,
-			Token:       "race-token",
-			IdleTimeout: -1,
-		})
+		_, err := startClientTestDaemon(serverCtx, root, "race-token")
 		if err != nil {
 			return 0, err
 		}
-		errCh := make(chan error, 1)
-		go func() { errCh <- server.Serve(serverCtx) }()
-		select {
-		case err := <-errCh:
-			return 0, err
-		case <-ctx.Done():
+		if err := ctx.Err(); err != nil {
 			return 0, ctx.Err()
-		case <-time.After(50 * time.Millisecond):
-			return os.Getpid(), nil
 		}
+		return os.Getpid(), nil
 	})
 
 	opts := Options{
@@ -231,23 +240,15 @@ func TestAutostartReplacesRefusedSocket(t *testing.T) {
 	var starts atomic.Int64
 	starter := StartFunc(func(ctx context.Context, opts StartOptions) (int, error) {
 		starts.Add(1)
-		server, err := served.New(served.Config{
-			StateRoot:   root,
-			Token:       "refused-token",
-			IdleTimeout: -1,
-		})
+		done, err := startClientTestDaemon(serverCtx, root, "refused-token")
 		if err != nil {
 			return 0, err
 		}
-		go func() { serverDone <- server.Serve(serverCtx) }()
-		select {
-		case err := <-serverDone:
-			return 0, err
-		case <-ctx.Done():
+		go func() { serverDone <- <-done }()
+		if err := ctx.Err(); err != nil {
 			return 0, ctx.Err()
-		case <-time.After(50 * time.Millisecond):
-			return os.Getpid(), nil
 		}
+		return os.Getpid(), nil
 	})
 	t.Cleanup(func() {
 		cancelServer()
@@ -412,6 +413,95 @@ func TestAutostartDetachHelper(t *testing.T) {
 	}
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func startClientTestDaemon(ctx context.Context, root, token string) (<-chan error, error) {
+	if root == "" {
+		return nil, errors.New("state root is required")
+	}
+	if token == "" {
+		token = "test-token"
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, err
+	}
+	if err := atomicWrite(filepath.Join(root, protocol.TokenFileName), []byte(token+"\n"), 0o600); err != nil {
+		return nil, err
+	}
+	socketPath := filepath.Join(root, protocol.SocketName)
+	_ = os.Remove(socketPath)
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return nil, err
+	}
+	done := make(chan error, 1)
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
+	go func() {
+		defer close(done)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+					done <- nil
+					return
+				}
+				done <- err
+				return
+			}
+			go serveClientTestConn(conn, token)
+		}
+	}()
+	return done, nil
+}
+
+func serveClientTestConn(conn net.Conn, token string) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	encoder := json.NewEncoder(conn)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		var req protocol.Request
+		if err := json.Unmarshal([]byte(strings.TrimSpace(string(line))), &req); err != nil {
+			continue
+		}
+		resp := protocol.Response{JSONRPC: "2.0", ID: req.ID}
+		switch req.Method {
+		case protocol.MethodHello:
+			var params protocol.HelloParams
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				resp.Error = protocol.NewError(protocol.ErrorInvalidTaskSpec, "invalid hello params", protocol.ErrorData{})
+				break
+			}
+			if params.Token != token {
+				resp.Error = protocol.NewError(protocol.ErrorUnauthorized, "unauthorized", protocol.ErrorData{})
+				break
+			}
+			if params.ClientProtocolVersion != protocol.Version {
+				resp.Error = protocol.NewError(
+					protocol.ErrorVersionMismatch,
+					"protocol version mismatch",
+					protocol.ErrorData{ServerProtocolVersion: protocol.Version},
+				)
+				break
+			}
+			resp.Result = protocol.HelloResult{
+				ProtocolVersion: protocol.Version,
+				Backends:        []string{},
+				Capabilities:    protocol.DefaultCapabilities(),
+			}
+		default:
+			resp.Error = protocol.NewError(protocol.ErrorMethodNotFound, "method not found", protocol.ErrorData{})
+		}
+		if err := encoder.Encode(resp); err != nil {
+			return
+		}
 	}
 }
 
