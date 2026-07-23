@@ -101,7 +101,7 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 		return nil, err
 	}
 	if err := c.connect(ctx); err != nil {
-		if opts.DisableAutoStart {
+		if opts.DisableAutoStart || !autostartableConnectError(err) {
 			return nil, err
 		}
 		if err := c.autostart(ctx); err != nil {
@@ -140,13 +140,14 @@ func (c *Client) connect(ctx context.Context) error {
 		return errors.New("agentbus client is closed")
 	}
 	c.mu.Unlock()
-	token, err := c.readToken()
-	if err != nil {
-		return err
-	}
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "unix", c.socketPath)
 	if err != nil {
+		return &dialConnectError{err: err}
+	}
+	token, err := c.readToken()
+	if err != nil {
+		_ = conn.Close()
 		return err
 	}
 	reader := bufio.NewReader(conn)
@@ -257,6 +258,8 @@ func (c *Client) autostart(ctx context.Context) error {
 
 	if err := c.connect(ctx); err == nil {
 		return nil
+	} else if !autostartableConnectError(err) {
+		return err
 	}
 	starter := c.opts.Starter
 	if starter == nil {
@@ -283,6 +286,8 @@ func (c *Client) autostart(ctx context.Context) error {
 	for time.Now().Before(deadline) {
 		if err := c.connect(ctx); err == nil {
 			return nil
+		} else if !autostartableConnectError(err) {
+			return err
 		} else {
 			last = err
 		}
@@ -467,8 +472,42 @@ func (c *Client) reconnect(ctx context.Context) error {
 	}
 	if err := c.connect(ctx); err == nil {
 		return nil
+	} else if !autostartableConnectError(err) {
+		return err
 	}
 	return c.autostart(ctx)
+}
+
+func autostartableConnectError(err error) bool {
+	var dialErr *dialConnectError
+	if !errors.As(err, &dialErr) || dialErr.err == nil {
+		return false
+	}
+	if errors.Is(dialErr.err, os.ErrNotExist) ||
+		errors.Is(dialErr.err, syscall.ENOENT) ||
+		errors.Is(dialErr.err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(dialErr.err, &netErr) && netErr.Timeout()
+}
+
+type dialConnectError struct {
+	err error
+}
+
+func (e *dialConnectError) Error() string {
+	if e == nil || e.err == nil {
+		return "dial failed"
+	}
+	return e.err.Error()
+}
+
+func (e *dialConnectError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
 }
 
 // Close closes the client connection.

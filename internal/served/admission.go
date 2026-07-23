@@ -1346,7 +1346,7 @@ func jsonFieldPresent(raw json.RawMessage, field string) (bool, error) {
 	return ok, nil
 }
 
-func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMessage, params protocol.JobSubmitParams) requestOutcome {
+func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMessage, precheck strictJobSubmitPrecheck) requestOutcome {
 	if s.admissionCurrentServeClosing() {
 		return requestOutcome{err: admissionProtocolError(errAdmissionClosing)}
 	}
@@ -1373,7 +1373,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		)}
 	}
 
-	requestKey, err := model.NewRequestKey(params.WorkspaceKey, params.RequestID)
+	requestKey, err := model.NewRequestKey(precheck.WorkspaceKey, precheck.RequestID)
 	if err != nil {
 		return requestOutcome{err: strictAdmissionProtocolError(
 			protocol.ErrorInvalidTaskSpec,
@@ -1383,10 +1383,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		)}
 	}
 
-	rawTaskSpec, err := rawTaskSpecFromSubmitParams(raw)
-	if err != nil {
-		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{})}
-	}
+	rawTaskSpec := precheck.RawTaskSpec
 
 	replay, err := instance.ready.LookupReplay(ctx, requestKey)
 	if err != nil {
@@ -1412,6 +1409,10 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		return requestOutcome{err: admissionProtocolError(authority.ErrRequestExpired)}
 	}
 
+	var params protocol.JobSubmitParams
+	if err := decodeStrict(raw, &params); err != nil {
+		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{})}
+	}
 	spec := params.TaskSpec
 	var descriptor admissionBackendDescriptor
 	if spec.Backend != "" {
@@ -1439,12 +1440,6 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 			)}
 		}
 	}
-	var strictParams protocol.JobSubmitParams
-	if err := decodeStrict(raw, &strictParams); err != nil {
-		return requestOutcome{err: strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{Backend: spec.Backend})}
-	}
-	params = strictParams
-	spec = params.TaskSpec
 	if errObj := validateTaskSpecEnvelope(raw); errObj != nil {
 		return requestOutcome{err: strictAdmissionInvalidConfigError(errObj.Message, protocol.ErrorData{Backend: spec.Backend})}
 	}

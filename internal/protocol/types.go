@@ -87,13 +87,6 @@ type Response struct {
 	Error   *ErrorObject    `json:"error,omitempty"`
 }
 
-// Notification is one JSON-RPC 2.0 server notification frame.
-type Notification struct {
-	JSONRPC string `json:"jsonrpc"`
-	Method  string `json:"method"`
-	Params  any    `json:"params,omitempty"`
-}
-
 // ErrorObject is the JSON-RPC error object. Code remains numeric; Data.Code is stable.
 type ErrorObject struct {
 	Code    int       `json:"code"`
@@ -107,7 +100,6 @@ type ErrorData struct {
 	Code                  string                        `json:"code"`
 	SessionID             string                        `json:"sessionId,omitempty"`
 	JobID                 string                        `json:"jobId,omitempty"`
-	TurnID                string                        `json:"turnId,omitempty"`
 	Backend               string                        `json:"backend,omitempty"`
 	AdmissionCause        string                        `json:"admissionCause,omitempty"`
 	RuntimeSupport        *RuntimeSupportAssessmentData `json:"runtimeSupport,omitempty"`

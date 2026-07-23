@@ -1158,6 +1158,42 @@ func TestIdentifiedSubmitReplayConflictIgnoresDeletedWorkspace(t *testing.T) {
 	}
 }
 
+func TestIdentifiedSubmitReplayConflictWithMalformedTypedTaskSpec(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-replay-malformed-typed-task",
+		RequestID:    "request-replay-malformed-typed-task",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}
+	submitIdentifiedForReplayTest(t, server, params)
+
+	raw := json.RawMessage(fmt.Sprintf(
+		`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":123}}`,
+		params.WorkspaceKey,
+		params.RequestID,
+	))
+	outcome := server.handleJobSubmit(context.Background(), raw)
+	if outcome.err == nil {
+		t.Fatalf("malformed typed replay result = %+v, want replay conflict", outcome.result)
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectReplayConflict)
+	if resp.Error.Data.AdmissionCause == protocol.AdmissionRejectInvalidStrictConfig {
+		t.Fatalf("admission cause = %q, want replay_conflict before typed taskSpec decode", resp.Error.Data.AdmissionCause)
+	}
+	if strings.Contains(outcome.err.Message, "cannot unmarshal") {
+		t.Fatalf("malformed typed replay error = %q, want replay conflict before typed taskSpec decode", outcome.err.Message)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend starts = %d, want only initial accept", got)
+	}
+}
+
 func TestIdentifiedSubmitReplayRejectsUnknownRecordedFingerprintVersion(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -3140,7 +3176,7 @@ func TestSafetyFailStopDrainDeadlineWinsOverStalledOwnershipProbe(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("ownership probe was not started during fail-stop drain")
 	}
-	if errObj := server.failStoppedRequestError(protocol.MethodJobSubmit); errObj == nil || errObj.Data.Code != protocol.ErrorBackendUnavailable {
+	if errObj := server.failStoppedRequestError(protocol.MethodJobSubmit); errObj == nil || errObj.Data.Code != protocol.ErrorBackendUnavailable || errObj.Data.AdmissionCause != protocol.AdmissionRejectRootFailStopped {
 		t.Fatalf("job.submit rejection = %+v, want backend_unavailable after fail-stop", errObj)
 	}
 
@@ -3295,8 +3331,6 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 
 func TestRemovedAndUnknownMethodsReturnMethodNotFound(t *testing.T) {
 	t.Parallel()
-	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
-	conn := &connection{server: server, hello: true}
 	for _, method := range []string{
 		"session.start",
 		"session.resume",
@@ -3308,19 +3342,27 @@ func TestRemovedAndUnknownMethodsReturnMethodNotFound(t *testing.T) {
 		"unknown.method",
 	} {
 		method := method
-		t.Run(method, func(t *testing.T) {
-			outcome := server.handle(context.Background(), conn, protocol.Request{
-				JSONRPC: "2.0",
-				ID:      json.RawMessage(`"removed"`),
-				Method:  method,
+		for _, failStopped := range []bool{false, true} {
+			failStopped := failStopped
+			t.Run(fmt.Sprintf("%s/failStopped=%t", method, failStopped), func(t *testing.T) {
+				server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+				if failStopped {
+					server.safetyLatch.Trip(errors.New("test fail-stop"))
+				}
+				conn := &connection{server: server, hello: true}
+				outcome := server.handle(context.Background(), conn, protocol.Request{
+					JSONRPC: "2.0",
+					ID:      json.RawMessage(`"removed"`),
+					Method:  method,
+				})
+				if outcome.err == nil {
+					t.Fatalf("%s result = %+v, want method_not_found", method, outcome.result)
+				}
+				if outcome.err.Code != -32601 || outcome.err.Data.Code != protocol.ErrorMethodNotFound {
+					t.Fatalf("%s error = %+v, want -32601/%s", method, outcome.err, protocol.ErrorMethodNotFound)
+				}
 			})
-			if outcome.err == nil {
-				t.Fatalf("%s result = %+v, want method_not_found", method, outcome.result)
-			}
-			if outcome.err.Code != -32601 || outcome.err.Data.Code != protocol.ErrorMethodNotFound {
-				t.Fatalf("%s error = %+v, want -32601/%s", method, outcome.err, protocol.ErrorMethodNotFound)
-			}
-		})
+		}
 	}
 }
 
@@ -5592,13 +5634,6 @@ func waitKnownRecordState(t *testing.T, server *Server, want engine.JobState) {
 	t.Fatalf("known record did not reach %s; last = %+v", want, last)
 }
 
-type rawNotification struct {
-	JSONRPC string          `json:"jsonrpc"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-	ID      json.RawMessage `json:"id,omitempty"`
-}
-
 func helloRaw(t *testing.T, conn net.Conn, r *bufio.Reader, token string) {
 	t.Helper()
 	resp := rpc(t, conn, r, "hello", protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: token})
@@ -5636,18 +5671,6 @@ func rpc(t *testing.T, conn net.Conn, r *bufio.Reader, id, method string, params
 	}
 }
 
-func notifyRPC(t *testing.T, conn net.Conn, method string, params any) {
-	t.Helper()
-	req := protocol.Request{JSONRPC: "2.0", Method: method, Params: mustMarshal(t, params)}
-	raw, err := json.Marshal(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := conn.Write(append(raw, '\n')); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func readResponse(t *testing.T, r *bufio.Reader) protocol.Response {
 	t.Helper()
 	line, err := r.ReadBytes('\n')
@@ -5657,20 +5680,6 @@ func readResponse(t *testing.T, r *bufio.Reader) protocol.Response {
 	var resp protocol.Response
 	mustUnmarshal(t, line, &resp)
 	return resp
-}
-
-func readNotification(t *testing.T, r *bufio.Reader) rawNotification {
-	t.Helper()
-	line, err := r.ReadBytes('\n')
-	if err != nil {
-		t.Fatal(err)
-	}
-	var notice rawNotification
-	mustUnmarshal(t, line, &notice)
-	if len(notice.ID) != 0 {
-		t.Fatalf("notification included id: %s", notice.ID)
-	}
-	return notice
 }
 
 func loadJobRecord(t *testing.T, root, cwd, jobID string, processes engine.ProcessTable) *engine.JobRecord {

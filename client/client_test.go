@@ -83,6 +83,72 @@ func TestClientHelloRejectsProtocolVersionMismatch(t *testing.T) {
 	}
 }
 
+func TestConnectProtocolVersionMismatchDoesNotAutostart(t *testing.T) {
+	t.Parallel()
+	root := shortClientTempDir(t)
+	socketPath := filepath.Join(root, protocol.SocketName)
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		if strings.Contains(err.Error(), "bind: operation not permitted") {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	done := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				done <- nil
+				return
+			}
+			done <- err
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadBytes('\n'); err != nil {
+			done <- err
+			return
+		}
+		done <- json.NewEncoder(conn).Encode(protocol.Response{
+			JSONRPC: "2.0",
+			ID:      json.RawMessage(`"hello"`),
+			Result: protocol.HelloResult{
+				ProtocolVersion: 1,
+				Backends:        []string{"codex"},
+				Capabilities:    protocol.DefaultCapabilities(),
+			},
+		})
+	}()
+
+	var starts atomic.Int64
+	starter := StartFunc(func(context.Context, StartOptions) (int, error) {
+		starts.Add(1)
+		return 0, errors.New("starter should not be invoked for protocol mismatch")
+	})
+	client, err := Connect(context.Background(), Options{
+		StateRoot:    root,
+		Token:        "token",
+		StartTimeout: 100 * time.Millisecond,
+		Starter:      starter,
+	})
+	if client != nil {
+		_ = client.Close()
+	}
+	if !errors.Is(err, ErrProtocolVersionMismatch) {
+		t.Fatalf("Connect error = %v, want ErrProtocolVersionMismatch", err)
+	}
+	if got := starts.Load(); got != 0 {
+		t.Fatalf("starter calls = %d, want 0", got)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func runClientHello(t *testing.T, result string) HelloResult {
 	t.Helper()
 	hello, err := runClientHelloResult(t, result)

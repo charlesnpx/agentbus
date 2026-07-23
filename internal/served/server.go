@@ -952,12 +952,6 @@ func (c *connection) writeResponse(resp protocol.Response) error {
 	return writeFrame(c.conn, resp)
 }
 
-func (c *connection) notify(method string, params any) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return writeFrame(c.conn, protocol.Notification{JSONRPC: "2.0", Method: method, Params: params})
-}
-
 func writeFrame(w io.Writer, v any) error {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -977,9 +971,6 @@ func (s *Server) handle(ctx context.Context, c *connection, req protocol.Request
 	}
 	if c.hello && req.Method == protocol.MethodHello {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "protocol.hello has already been completed on this connection", protocol.ErrorData{})}
-	}
-	if errObj := s.failStoppedRequestError(req.Method); errObj != nil {
-		return requestOutcome{err: errObj}
 	}
 	switch req.Method {
 	case protocol.MethodHello:
@@ -1009,7 +1000,12 @@ func (s *Server) failStoppedRequestError(method string) *protocol.ErrorObject {
 	if failStopErr == nil {
 		return nil
 	}
-	return protocol.NewError(protocol.ErrorBackendUnavailable, failStopErr.Error(), protocol.ErrorData{})
+	return strictAdmissionProtocolError(
+		protocol.ErrorBackendUnavailable,
+		protocol.AdmissionRejectRootFailStopped,
+		failStopErr.Error(),
+		protocol.ErrorData{},
+	)
 }
 
 func failStoppedMethodAllowed(method string) bool {
@@ -1095,32 +1091,63 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	if identityErr != nil {
 		return requestOutcome{err: identityErr}
 	}
-	params, errObj := looseStrictJobSubmitParams(raw)
+	precheck, errObj := strictJobSubmitReplayPrecheck(raw)
 	if errObj != nil {
 		return requestOutcome{err: errObj}
 	}
-	return s.handleIdentifiedJobSubmit(ctx, raw, params)
+	return s.handleIdentifiedJobSubmit(ctx, raw, precheck)
 }
 
-func looseStrictJobSubmitParams(raw json.RawMessage) (protocol.JobSubmitParams, *protocol.ErrorObject) {
-	var params protocol.JobSubmitParams
-	if err := json.Unmarshal(raw, &params); err == nil {
-		return params, nil
+type strictJobSubmitPrecheck struct {
+	WorkspaceKey string
+	RequestID    string
+	RawTaskSpec  json.RawMessage
+}
+
+func strictJobSubmitReplayPrecheck(raw json.RawMessage) (strictJobSubmitPrecheck, *protocol.ErrorObject) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return strictJobSubmitPrecheck{}, strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{})
 	}
-	var minimal struct {
-		WorkspaceKey string `json:"workspaceKey"`
-		RequestID    string `json:"requestId"`
-		TaskSpec     struct {
-			Backend string `json:"backend"`
-		} `json:"taskSpec"`
+	workspaceKey, err := requiredRawString(envelope, "workspaceKey")
+	if err != nil {
+		return strictJobSubmitPrecheck{}, strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectMissingIdentity,
+			err.Error(),
+			protocol.ErrorData{},
+		)
 	}
-	if err := json.Unmarshal(raw, &minimal); err != nil {
-		return protocol.JobSubmitParams{}, strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{})
+	requestID, err := requiredRawString(envelope, "requestId")
+	if err != nil {
+		return strictJobSubmitPrecheck{}, strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectMissingIdentity,
+			err.Error(),
+			protocol.ErrorData{},
+		)
 	}
-	params.WorkspaceKey = minimal.WorkspaceKey
-	params.RequestID = minimal.RequestID
-	params.TaskSpec.Backend = minimal.TaskSpec.Backend
-	return params, nil
+	rawTaskSpec, ok := envelope["taskSpec"]
+	if !ok {
+		return strictJobSubmitPrecheck{}, strictAdmissionInvalidConfigError("taskSpec is required", protocol.ErrorData{})
+	}
+	return strictJobSubmitPrecheck{
+		WorkspaceKey: workspaceKey,
+		RequestID:    requestID,
+		RawTaskSpec:  append(json.RawMessage(nil), rawTaskSpec...),
+	}, nil
+}
+
+func requiredRawString(envelope map[string]json.RawMessage, field string) (string, error) {
+	raw, ok := envelope[field]
+	if !ok {
+		return "", fmt.Errorf("%s is required", field)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("%s: %w", field, err)
+	}
+	return value, nil
 }
 
 func strictIdentityPrecheck(raw json.RawMessage) (bool, *protocol.ErrorObject) {
@@ -1419,7 +1446,6 @@ type jobRun struct {
 	admissionMode           model.Mode
 	admissionAccepted       authority.AcceptResult
 	admissionLaunch         admissionLaunchBinding
-	prestartedEvents        <-chan engine.Event
 }
 
 func (s *Server) runJob(ctx context.Context, run jobRun) {
@@ -1435,20 +1461,6 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 		s.finalizeRequestedTerminal(run)
 		return
 	}
-	if err := s.transitionRunRecord(run, engine.StateStarting); err != nil {
-		s.finalizeFailure(run, err)
-		return
-	}
-	if err := s.transitionRunRecord(run, engine.StateRunning); err != nil {
-		s.finalizeFailure(run, err)
-		return
-	}
-	if !run.admissionControlled {
-		heartbeatDone := make(chan struct{})
-		go s.heartbeat(run.store, run.jobID, heartbeatDone)
-		defer close(heartbeatDone)
-	}
-
 	attemptPrompt := applyPrologue(run.policy, run.prompt)
 	text, state, err := s.runAttempt(ctx, run, attemptPrompt, run.write, model.LaunchOrdinalOne)
 	if requested := run.active.requestedTerminal(); requested != "" {
@@ -1473,10 +1485,6 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 		return
 	}
 	if retryPrompt != "" {
-		if err := s.transitionRunRecord(run, engine.StateRetrying); err != nil {
-			s.finalizeFailure(run, err)
-			return
-		}
 		retryText, retryState, retryErr := s.runAttempt(ctx, run, retryPrompt, false, model.LaunchOrdinalTwo)
 		if requested := run.active.requestedTerminal(); requested != "" {
 			s.finalizeTerminal(run, requested, retryText, nil)
@@ -1497,16 +1505,6 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 	s.finalizeTerminal(run, compliantState, text, validation.Stamp)
 }
 
-func (s *Server) transitionRunRecord(run jobRun, state engine.JobState) error {
-	if run.admissionControlled {
-		return nil
-	}
-	if err := s.transitionRecord(run.store, run.jobID, state); err != nil && !run.admissionControlled {
-		return err
-	}
-	return nil
-}
-
 func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, write bool, ordinal model.LaunchOrdinal) (string, engine.JobState, error) {
 	attemptCtx := ctx
 	var cancel context.CancelFunc
@@ -1522,28 +1520,7 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		Timeout:  run.timeout,
 		LogPaths: engine.LogPaths{},
 	}
-	if !run.admissionControlled {
-		record, _ := run.store.Load(run.jobID)
-		input.OnProcessStart = func(ref engine.ProcessRef, backendChildPID int) {
-			_ = s.updateBackendProcess(run.store, run.jobID, ref, backendChildPID)
-		}
-		if record != nil {
-			input.LogPaths = record.LogPaths
-		}
-		if id := run.session.ID(); id != "" {
-			_ = s.updateBackendSessionID(run.store, run.jobID, id)
-		}
-	}
-	var events <-chan engine.Event
-	var err error
-	switch {
-	case run.prestartedEvents != nil && ordinal == model.LaunchOrdinalOne:
-		events = run.prestartedEvents
-	case run.admissionControlled:
-		events, err = s.admissionTurnEvents(attemptCtx, run, input, ordinal)
-	default:
-		return "", engine.StateFailed, errors.New("non-authority execution is disabled")
-	}
+	events, err := s.admissionTurnEvents(attemptCtx, run, input, ordinal)
 	if err != nil {
 		return "", engine.StateFailed, err
 	}
@@ -1562,20 +1539,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				if attemptCtx.Err() != nil {
 					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), stateForContext(attemptCtx.Err()), attemptCtx.Err()
 				}
-				if !run.admissionControlled && run.session != nil && run.session.ID() != "" {
-					id := run.session.ID()
-					_ = s.updateBackendSessionID(run.store, run.jobID, id)
-				}
 				return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateCompleted, nil
 			}
-			if !run.admissionControlled && run.session != nil && run.session.ID() != "" {
-				id := run.session.ID()
-				_ = s.updateBackendSessionID(run.store, run.jobID, id)
-			}
 			rawText := authoritativeText(event)
-			if !run.admissionControlled && event.ModelReported != "" {
-				_ = s.updateModelReported(run.store, run.jobID, event.ModelReported)
-			}
 			switch event.Type {
 			case engine.EventAgentText:
 				assistantText.WriteString(rawText)
@@ -1777,52 +1743,6 @@ func (s *Server) abortUndeliveredRun(run jobRun, state engine.JobState) {
 	if run.onDone != nil {
 		run.onDone()
 	}
-}
-
-func (s *Server) updateBackendProcess(store *engine.Store, jobID string, ref engine.ProcessRef, backendChildPID int) error {
-	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
-		if engine.IsTerminal(record.State) {
-			return false, nil
-		}
-		record.BackendChildPID = backendChildPID
-		record.BackendChildStartTime = ""
-		if info, alive, err := s.processes.Lookup(backendChildPID); err == nil && alive {
-			record.BackendChildStartTime = info.StartTime
-		}
-		if ref.PID > 0 || ref.PGID > 0 || ref.StartTime != "" {
-			record.Worker = ref
-		}
-		return true, nil
-	})
-	return err
-}
-
-func (s *Server) updateBackendSessionID(store *engine.Store, jobID, backendSessionID string) error {
-	if backendSessionID == "" {
-		return nil
-	}
-	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
-		if record.BackendSessionID == backendSessionID {
-			return false, nil
-		}
-		record.BackendSessionID = backendSessionID
-		return true, nil
-	})
-	return err
-}
-
-func (s *Server) updateModelReported(store *engine.Store, jobID, modelReported string) error {
-	if modelReported == "" {
-		return nil
-	}
-	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
-		if record.ModelReported == modelReported {
-			return false, nil
-		}
-		record.ModelReported = modelReported
-		return true, nil
-	})
-	return err
 }
 
 func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backend string, tags map[string]string, policy *engine.TurnPolicy, resolved *engine.ContractSpec, foreground bool) error {
