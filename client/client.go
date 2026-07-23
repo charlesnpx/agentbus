@@ -262,21 +262,16 @@ func (c *Client) readToken() (string, error) {
 }
 
 func (c *Client) autostart(ctx context.Context) error {
-	if err := os.MkdirAll(c.stateRoot, 0o700); err != nil {
-		return err
-	}
-	lockPath := filepath.Join(c.stateRoot, "agentbus.start.lock")
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	autoCtx, cancel := context.WithTimeout(ctx, c.startTimeout())
+	defer cancel()
+
+	unlock, err := c.lockExistingStateRoot(autoCtx)
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
-		return err
-	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	defer unlock()
 
-	if err := c.connect(ctx); err == nil {
+	if err := c.connect(autoCtx); err == nil {
 		return nil
 	} else if !autostartableConnectError(err) {
 		return err
@@ -285,14 +280,12 @@ func (c *Client) autostart(ctx context.Context) error {
 	if starter == nil {
 		starter = defaultStarter{}
 	}
-	startCtx, cancel := context.WithTimeout(ctx, c.startTimeout())
-	defer cancel()
-	started, err := starter.StartDaemon(startCtx, StartOptions{
+	started, err := starter.StartDaemon(autoCtx, StartOptions{
 		StateRoot:   c.stateRoot,
 		SocketPath:  c.socketPath,
 		TokenPath:   c.tokenPath,
 		CommandPath: c.opts.CommandPath,
-		Timeout:     c.startTimeout(),
+		Timeout:     remainingTimeout(autoCtx),
 	})
 	if err != nil {
 		return err
@@ -320,10 +313,9 @@ func (c *Client) autostart(ctx context.Context) error {
 		}
 		pidWritten = true
 	}
-	deadline := time.Now().Add(c.startTimeout())
 	var last error
-	for time.Now().Before(deadline) {
-		if err := c.connect(ctx); err == nil {
+	for autoCtx.Err() == nil {
+		if err := c.connect(autoCtx); err == nil {
 			return nil
 		} else if !autostartableConnectError(err) {
 			return cleanupStarted(err)
@@ -331,15 +323,15 @@ func (c *Client) autostart(ctx context.Context) error {
 			last = err
 		}
 		select {
-		case <-ctx.Done():
-			return cleanupStarted(ctx.Err())
+		case <-autoCtx.Done():
+			return cleanupStarted(autoCtx.Err())
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
 	if last == nil {
 		last = errors.New("daemon did not become ready")
 	}
-	return cleanupStarted(last)
+	return cleanupStarted(errors.Join(autoCtx.Err(), last))
 }
 
 func (c *Client) startTimeout() time.Duration {
@@ -347,6 +339,58 @@ func (c *Client) startTimeout() time.Duration {
 		return c.opts.StartTimeout
 	}
 	return defaultStartTimeout
+}
+
+func (c *Client) lockExistingStateRoot(ctx context.Context) (func(), error) {
+	info, err := os.Stat(c.stateRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return func() {}, nil
+		}
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("agentbus state root %q is not a directory", c.stateRoot)
+	}
+	lockPath := filepath.Join(c.stateRoot, "agentbus.start.lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	locked := false
+	unlock := func() {
+		if locked {
+			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		}
+		_ = lock.Close()
+	}
+	for {
+		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			locked = true
+			return unlock, nil
+		} else if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			unlock()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			unlock()
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func remainingTimeout(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return time.Nanosecond
+	}
+	return remaining
 }
 
 type defaultStarter struct{}

@@ -21,7 +21,16 @@ func Serve(ctx context.Context, cfg Config) error {
 	if hasReporter {
 		defer reporter.Close()
 	}
-	servedCfg := productionServedConfig(cfg)
+	servedCfg, configErr := productionServedConfig(cfg)
+	if configErr != nil {
+		err := configErr
+		if preflightErr := served.StrictAdmissionSupportPreflight(ctx, servedCfg); preflightErr != nil {
+			err = errors.Join(preflightErr, configErr)
+		}
+		_ = servedCfg.Runtime.Close()
+		reportStartupFailure(reporter, err)
+		return err
+	}
 	if hasReporter {
 		previousHook := servedCfg.ReadyHook
 		servedCfg.ReadyHook = func(info served.ServeReadyInfo) error {
@@ -41,8 +50,9 @@ func Serve(ctx context.Context, cfg Config) error {
 			return nil
 		}
 	}
-	server, err := served.New(servedCfg)
+	server, err := served.NewAfterStrictAdmissionSupportPreflight(ctx, servedCfg)
 	if err != nil {
+		_ = servedCfg.Runtime.Close()
 		reportStartupFailure(reporter, err)
 		return err
 	}
@@ -54,12 +64,15 @@ func Serve(ctx context.Context, cfg Config) error {
 }
 
 func RecoverAdmissionRoot(ctx context.Context, cfg Config) (served.AdmissionRecoveryReport, error) {
-	return served.RecoverAdmissionRoot(ctx, productionServedConfig(cfg))
+	servedCfg, err := productionServedConfig(cfg)
+	if err != nil {
+		return served.AdmissionRecoveryReport{}, err
+	}
+	return served.RecoverAdmissionRoot(ctx, servedCfg)
 }
 
-func productionServedConfig(cfg Config) served.Config {
-	strictCfg, _ := strictAdmissionServedConfig(cfg, StrictAdmissionOptions{})
-	return strictCfg
+func productionServedConfig(cfg Config) (served.Config, error) {
+	return strictAdmissionServedConfig(cfg, StrictAdmissionOptions{})
 }
 
 func strictAdmissionServedConfig(cfg Config, opts StrictAdmissionOptions) (served.Config, error) {

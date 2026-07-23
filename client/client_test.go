@@ -585,6 +585,95 @@ func TestConnectAutostartSurfacesLauncherFailureOnce(t *testing.T) {
 	}
 }
 
+func TestConnectAutostartHelloHangUsesSingleStartTimeout(t *testing.T) {
+	t.Parallel()
+	root := shortClientTempDir(t)
+	socketPath := filepath.Join(root, protocol.SocketName)
+	const timeout = 200 * time.Millisecond
+	listenerReady := make(chan struct{})
+	listenerDone := make(chan error, 1)
+	stopListener := make(chan struct{})
+	var listenerStarted atomic.Bool
+	var listenerMu sync.Mutex
+	var hungListener net.Listener
+	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
+		listener, err := net.Listen("unix", socketPath)
+		if err != nil {
+			return StartResult{}, err
+		}
+		listenerMu.Lock()
+		hungListener = listener
+		listenerMu.Unlock()
+		listenerStarted.Store(true)
+		close(listenerReady)
+		go func() {
+			defer listener.Close()
+			conn, err := listener.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					listenerDone <- nil
+					return
+				}
+				listenerDone <- err
+				return
+			}
+			defer conn.Close()
+			_, _ = bufio.NewReader(conn).ReadBytes('\n')
+			<-stopListener
+			listenerDone <- nil
+		}()
+		return StartResult{ExistingDaemon: true}, nil
+	})
+	t.Cleanup(func() {
+		if !listenerStarted.Load() {
+			return
+		}
+		close(stopListener)
+		listenerMu.Lock()
+		if hungListener != nil {
+			_ = hungListener.Close()
+		}
+		listenerMu.Unlock()
+		select {
+		case err := <-listenerDone:
+			if err != nil {
+				t.Errorf("hung listener exited with error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("hung listener did not stop")
+		}
+	})
+	start := time.Now()
+	client, err := Connect(context.Background(), Options{
+		StateRoot:    root,
+		SocketPath:   socketPath,
+		Token:        "hung-token",
+		StartTimeout: timeout,
+		Starter:      starter,
+	})
+	elapsed := time.Since(start)
+	if client != nil {
+		_ = client.Close()
+	}
+	if err == nil {
+		t.Fatal("Connect succeeded, want hello timeout")
+	}
+	if strings.Contains(err.Error(), "bind: operation not permitted") {
+		t.Skipf("Unix socket bind denied by sandbox: %v", err)
+	}
+	select {
+	case <-listenerReady:
+	default:
+		t.Fatal("starter did not create hung listener")
+	}
+	if elapsed > 600*time.Millisecond {
+		t.Fatalf("Connect elapsed = %s, want within one StartTimeout budget", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "i/o timeout") {
+		t.Fatalf("Connect error = %v, want deadline/timeout", err)
+	}
+}
+
 func TestDefaultStarterDoesNotCancelDaemonAfterStartupContextEnds(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix process signaling test")

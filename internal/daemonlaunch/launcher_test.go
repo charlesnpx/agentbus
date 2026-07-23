@@ -88,6 +88,31 @@ func TestLaunchTimeoutKillsAndReaps(t *testing.T) {
 	assertPIDGone(t, readPIDFile(t, pidPath))
 }
 
+func TestLaunchTimeoutKillsChattyChildAndBoundsStderr(t *testing.T) {
+	root := shortLaunchTempDir(t)
+	pidPath := filepath.Join(root, "helper.pid")
+	start := time.Now()
+	_, err := Launch(context.Background(), helperLaunchOptions(t, root, "chatty-hang", pidPath, 100*time.Millisecond))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Launch succeeded, want timeout")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Launch timeout took %s, want bounded cleanup", elapsed)
+	}
+	var startup *StartupError
+	if !errors.As(err, &startup) || !errors.Is(err, ErrReadinessTimeout) {
+		t.Fatalf("Launch error = %T %v, want ErrReadinessTimeout", err, err)
+	}
+	if len(startup.StderrTail) > DefaultStderrTailBytes {
+		t.Fatalf("stderr tail length = %d, want <= %d", len(startup.StderrTail), DefaultStderrTailBytes)
+	}
+	if !strings.Contains(startup.StderrTail, "helper chatty stderr") {
+		t.Fatalf("stderr tail = %q, want chatty stderr", startup.StderrTail)
+	}
+	assertPIDGone(t, readPIDFile(t, pidPath))
+}
+
 func TestLaunchRootMismatchKillsAndReaps(t *testing.T) {
 	root := shortLaunchTempDir(t)
 	pidPath := filepath.Join(root, "helper.pid")
@@ -134,6 +159,58 @@ func TestLaunchAlreadyListeningVerifiesWinner(t *testing.T) {
 	}
 }
 
+func TestLaunchFailedRecordSurfacesReapError(t *testing.T) {
+	reapErr := errors.New("wait failed for test")
+	capture, err := newStderrCapture(DefaultStderrTailBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := capture.closeWriter(); err != nil {
+		t.Fatal(err)
+	}
+	capture.start()
+	handle := newHandle(stubProcess{pid: 123, waitErr: reapErr})
+	_, err = handleFrame(context.Background(), handle, handshakeResult{
+		frame: readinessFrame{Failed: &failedRecord{Code: "strict admission support unavailable", Message: "boom"}},
+	}, "/tmp/root", "/tmp/root/agentbus.sock", "/tmp/root/token", capture)
+	var startup *StartupError
+	if !errors.As(err, &startup) || !errors.Is(err, ErrStartupFailed) {
+		t.Fatalf("handleFrame error = %T %v, want ErrStartupFailed", err, err)
+	}
+	if !errors.Is(err, reapErr) {
+		t.Fatalf("handleFrame error = %v, want reap error in chain", err)
+	}
+}
+
+func TestInheritedReporterClearsEnvAndMarksCloseOnExec(t *testing.T) {
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readEnd.Close()
+	defer writeEnd.Close()
+	t.Setenv(ReadyFDEnv, strconv.Itoa(int(writeEnd.Fd())))
+
+	reporter, hasReporter, err := InheritedReporterFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasReporter || reporter == nil {
+		t.Fatal("InheritedReporterFromEnv did not return reporter")
+	}
+	defer reporter.Close()
+	if got := os.Getenv(ReadyFDEnv); got != "" {
+		t.Fatalf("%s = %q, want unset", ReadyFDEnv, got)
+	}
+	closeOnExec, err := readyFDCloseOnExec(int(writeEnd.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !closeOnExec {
+		t.Fatal("readiness fd is not marked close-on-exec")
+	}
+}
+
 func TestLaunchSetsid(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("process group assertion is Unix-specific")
@@ -169,6 +246,7 @@ func runLaunchHelper() int {
 		fmt.Fprintln(os.Stderr, "missing readiness reporter")
 		return 2
 	}
+	defer reporter.Close()
 	socketPath := filepath.Join(root, protocol.SocketName)
 	switch mode {
 	case "failed":
@@ -181,6 +259,10 @@ func runLaunchHelper() int {
 	case "hang":
 		fmt.Fprintln(os.Stderr, "helper hang stderr")
 		sleepForever()
+	case "chatty-hang":
+		for i := 0; ; i++ {
+			fmt.Fprintf(os.Stderr, "helper chatty stderr %06d %s\n", i, strings.Repeat("x", 1024))
+		}
 	case "mismatch":
 		fmt.Fprintln(os.Stderr, "helper mismatch stderr")
 		_ = reporter.Ready("/definitely/not-the-expected-root", socketPath)
@@ -231,6 +313,23 @@ func helperLaunchOptions(t *testing.T, root, mode, pidPath string, timeout time.
 
 type testProcess struct {
 	cmd *exec.Cmd
+}
+
+type stubProcess struct {
+	pid     int
+	waitErr error
+}
+
+func (process stubProcess) PID() int {
+	return process.pid
+}
+
+func (process stubProcess) Kill() error {
+	return nil
+}
+
+func (process stubProcess) Wait() error {
+	return process.waitErr
 }
 
 func testProcessStarter(config ProcessConfig) (Process, error) {

@@ -157,6 +157,7 @@ type Server struct {
 	readyHook              func(ServeReadyInfo) error
 	afterReapTickHook      func(error)
 	listenerFactory        func() (net.Listener, socketFileIdentity, error)
+	beforeListenBindHook   func()
 	safetyLatch            *SafetyLatch
 	safetyDrainTimeout     time.Duration
 	jobsRequestIDEnabled   bool
@@ -270,20 +271,29 @@ type resolvedPolicy struct {
 	hash     string
 }
 
-// New creates a daemon server and ensures state root and token file exist.
-func New(cfg Config) (*Server, error) {
-	root := cfg.StateRoot
+func ensureStateRoot(root string) (string, error) {
 	var err error
 	if root == "" {
 		root, err = engine.ResolveStateRoot()
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
-		return nil, err
+		return "", err
 	}
 	if err := os.Chmod(root, 0o700); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
+// New creates a daemon server and ensures state root and token file exist.
+func New(cfg Config) (*Server, error) {
+	root := cfg.StateRoot
+	var err error
+	root, err = ensureStateRoot(root)
+	if err != nil {
 		return nil, err
 	}
 	cwd := cfg.CWD
@@ -559,8 +569,14 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	} else if !os.IsNotExist(err) {
 		return nil, socketFileIdentity{}, err
 	}
+	if s.beforeListenBindHook != nil {
+		s.beforeListenBindHook()
+	}
 	ln, err := net.Listen("unix", s.socketPath)
 	if err != nil {
+		if isAddrInUse(err) {
+			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
+		}
 		return nil, socketFileIdentity{}, err
 	}
 	// net.UnixListener normally removes its path on Close. Disable that BEFORE
@@ -2085,33 +2101,28 @@ func (s *Server) backendNames() []string {
 }
 
 func ensureToken(path, configured string) (string, error) {
-	if configured != "" {
-		if err := atomicWrite(path, []byte(configured+"\n"), 0o600); err != nil {
-			return "", err
-		}
-		return configured, nil
-	}
-	raw, err := os.ReadFile(path)
+	token, err := readExistingToken(path)
 	if err == nil {
-		if err := os.Chmod(path, 0o600); err != nil {
-			return "", err
-		}
-		token := strings.TrimSpace(string(raw))
-		if token != "" {
-			return token, nil
-		}
+		return token, nil
 	}
 	if err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
-	token, err := randomToken()
-	if err != nil {
-		return "", err
+	token = configured
+	if token == "" {
+		token, err = randomToken()
+		if err != nil {
+			return "", err
+		}
 	}
-	if err := atomicWrite(path, []byte(token+"\n"), 0o600); err != nil {
-		return "", err
+	created, err := createTokenExclusive(path, token)
+	if err == nil {
+		return created, nil
 	}
-	return token, nil
+	if errors.Is(err, os.ErrExist) {
+		return waitForExistingToken(path)
+	}
+	return "", err
 }
 
 func randomToken() (string, error) {
@@ -2120,6 +2131,70 @@ func randomToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+func readExistingToken(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return "", errors.New("agentbus token file is empty")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func waitForExistingToken(path string) (string, error) {
+	deadline := time.Now().Add(time.Second)
+	var last error
+	for {
+		token, err := readExistingToken(path)
+		if err == nil {
+			return token, nil
+		}
+		last = err
+		if !os.IsNotExist(err) && !strings.Contains(err.Error(), "token file is empty") {
+			return "", err
+		}
+		if time.Now().After(deadline) {
+			return "", last
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func createTokenExclusive(path, token string) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+	if _, err := file.Write([]byte(token + "\n")); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE)
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {

@@ -31,6 +31,7 @@ const (
 	existingVerifyRetryPeriod = 50 * time.Millisecond
 	failedExitGrace           = 500 * time.Millisecond
 	killWaitTimeout           = 5 * time.Second
+	stderrDrainGrace          = 100 * time.Millisecond
 )
 
 var (
@@ -77,6 +78,12 @@ func InheritedReporterFromEnv() (*Reporter, bool, error) {
 	fd, err := strconv.Atoi(raw)
 	if err != nil || fd < readinessFDChildNumber {
 		return nil, true, fmt.Errorf("%s must name an inherited fd >= %d: %q", ReadyFDEnv, readinessFDChildNumber, raw)
+	}
+	if err := markReadyFDCloseOnExec(fd); err != nil {
+		return nil, true, err
+	}
+	if err := os.Unsetenv(ReadyFDEnv); err != nil {
+		return nil, true, err
 	}
 	return &Reporter{file: os.NewFile(uintptr(fd), "agentbus-ready")}, true, nil
 }
@@ -220,13 +227,7 @@ func (handle *Handle) KillAndWait() error {
 	}
 	waitErr := handle.waitTimeout(killWaitTimeout)
 	if waitErr != nil {
-		if strings.Contains(waitErr.Error(), "timed out") {
-			return errors.Join(killErr, waitErr)
-		}
-		if killErr != nil {
-			return errors.Join(killErr, waitErr)
-		}
-		return nil
+		return errors.Join(killErr, waitErr)
 	}
 	return killErr
 }
@@ -364,13 +365,14 @@ func Launch(ctx context.Context, opts Options) (Result, error) {
 	stderrCapture, err := newStderrCapture(DefaultStderrTailBytes)
 	if err != nil {
 		_ = readyWrite.Close()
+		stderrCapture.cleanup()
 		return Result{}, err
 	}
-	defer stderrCapture.cleanup()
 
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
 		_ = readyWrite.Close()
+		stderrCapture.cleanup()
 		return Result{}, err
 	}
 	defer devNull.Close()
@@ -387,6 +389,7 @@ func Launch(ctx context.Context, opts Options) (Result, error) {
 	})
 	if err != nil {
 		_ = readyWrite.Close()
+		stderrCapture.cleanup()
 		return Result{}, err
 	}
 	_ = readyWrite.Close()
@@ -404,8 +407,8 @@ func Launch(ctx context.Context, opts Options) (Result, error) {
 	case got := <-frameCh:
 		return handleFrame(launchCtx, handle, got, canonicalRoot, socketPath, tokenPath, stderrCapture)
 	case <-launchCtx.Done():
-		tail := stderrCapture.stopAndTail()
 		killErr := handle.KillAndWait()
+		tail := stderrCapture.stopAndTail()
 		kind := ErrReadinessCanceled
 		if errors.Is(launchCtx.Err(), context.DeadlineExceeded) {
 			kind = ErrReadinessTimeout
@@ -421,8 +424,8 @@ type handshakeResult struct {
 
 func handleFrame(ctx context.Context, handle *Handle, got handshakeResult, expectedRoot, socketPath, tokenPath string, stderrCapture *stderrCapture) (Result, error) {
 	if got.err != nil {
-		tail := stderrCapture.stopAndTail()
 		killErr := handle.KillAndWait()
+		tail := stderrCapture.stopAndTail()
 		kind := ErrReadinessProtocol
 		if errors.Is(got.err, io.EOF) {
 			kind = ErrReadinessEOF
@@ -434,18 +437,18 @@ func handleFrame(ctx context.Context, handle *Handle, got handshakeResult, expec
 	case frame.Ready != nil && frame.Failed == nil:
 		ready := frame.Ready
 		if ready.ProtocolVersion != ReadinessProtocolVersion {
-			tail := stderrCapture.stopAndTail()
 			killErr := handle.KillAndWait()
+			tail := stderrCapture.stopAndTail()
 			return Result{}, &StartupError{Kind: ErrReadinessProtocol, Message: fmt.Sprintf("protocolVersion=%d", ready.ProtocolVersion), StderrTail: tail, Cause: killErr}
 		}
 		if ready.PID != handle.pid {
-			tail := stderrCapture.stopAndTail()
 			killErr := handle.KillAndWait()
+			tail := stderrCapture.stopAndTail()
 			return Result{}, &StartupError{Kind: ErrReadinessProtocol, Message: fmt.Sprintf("pid=%d want %d", ready.PID, handle.pid), StderrTail: tail, Cause: killErr}
 		}
 		if ready.CanonicalStateRoot != expectedRoot {
-			tail := stderrCapture.stopAndTail()
 			killErr := handle.KillAndWait()
+			tail := stderrCapture.stopAndTail()
 			return Result{}, &StartupError{
 				Kind:                       ErrCanonicalStateRootMismatch,
 				ExpectedCanonicalStateRoot: expectedRoot,
@@ -454,7 +457,6 @@ func handleFrame(ctx context.Context, handle *Handle, got handshakeResult, expec
 				Cause:                      killErr,
 			}
 		}
-		stderrCapture.stopAndTail()
 		return Result{
 			PID:                ready.PID,
 			CanonicalStateRoot: ready.CanonicalStateRoot,
@@ -465,32 +467,42 @@ func handleFrame(ctx context.Context, handle *Handle, got handshakeResult, expec
 		failed := frame.Failed
 		if failed.Code == CodeAlreadyListening {
 			if verifyErr := verifyExistingDaemonWithRetry(ctx, socketPath, tokenPath); verifyErr == nil {
-				_ = handle.waitGraceOrKill(failedExitGrace)
-				stderrCapture.stopAndTail()
+				waitErr := handle.waitGraceOrKill(failedExitGrace)
+				tail := stderrCapture.stopAndTail()
+				if isWaitTimeout(waitErr) {
+					return Result{}, &StartupError{
+						Kind:       ErrStartupFailed,
+						Code:       failed.Code,
+						Message:    failed.Message,
+						StderrTail: tail,
+						Cause:      waitErr,
+					}
+				}
 				return Result{CanonicalStateRoot: expectedRoot, SocketPath: socketPath, ExistingDaemon: true}, nil
 			} else {
+				waitErr := handle.waitGraceOrKill(failedExitGrace)
 				tail := stderrCapture.stopAndTail()
-				_ = handle.waitGraceOrKill(failedExitGrace)
 				return Result{}, &StartupError{
 					Kind:       ErrExistingDaemonVerification,
 					Code:       failed.Code,
 					Message:    failed.Message,
 					StderrTail: tail,
-					Cause:      verifyErr,
+					Cause:      errors.Join(verifyErr, waitErr),
 				}
 			}
 		}
+		waitErr := handle.waitGraceOrKill(failedExitGrace)
 		tail := stderrCapture.stopAndTail()
-		_ = handle.waitGraceOrKill(failedExitGrace)
 		return Result{}, &StartupError{
 			Kind:       ErrStartupFailed,
 			Code:       failed.Code,
 			Message:    failed.Message,
 			StderrTail: tail,
+			Cause:      waitErr,
 		}
 	default:
-		tail := stderrCapture.stopAndTail()
 		killErr := handle.KillAndWait()
+		tail := stderrCapture.stopAndTail()
 		return Result{}, &StartupError{Kind: ErrReadinessProtocol, Message: "frame must contain exactly one of ready or failed", StderrTail: tail, Cause: killErr}
 	}
 }
@@ -510,13 +522,7 @@ func prepareStateRoot(root string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	if err := os.MkdirAll(resolved, 0o700); err != nil {
-		return "", "", err
-	}
-	if err := os.Chmod(resolved, 0o700); err != nil {
-		return "", "", err
-	}
-	canonical, err := CanonicalStateRoot(resolved)
+	canonical, err := canonicalStateRootForLaunch(resolved)
 	if err != nil {
 		return "", "", err
 	}
@@ -540,6 +546,42 @@ func CanonicalStateRoot(root string) (string, error) {
 		return "", err
 	}
 	return filepath.EvalSymlinks(abs)
+}
+
+func canonicalStateRootForLaunch(root string) (string, error) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	canonical, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return canonical, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	return canonicalMissingPath(abs)
+}
+
+func canonicalMissingPath(abs string) (string, error) {
+	current := filepath.Clean(abs)
+	var missing []string
+	for {
+		canonical, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			parts := append([]string{canonical}, missing...)
+			return filepath.Join(parts...), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		missing = append([]string{filepath.Base(current)}, missing...)
+		current = parent
+	}
 }
 
 func launchEnv(base []string, root string) []string {
@@ -671,30 +713,21 @@ func mustMarshal(v any) json.RawMessage {
 type stderrCapture struct {
 	writer  *os.File
 	reader  *os.File
-	path    string
 	tail    *tailBuffer
-	stop    chan struct{}
 	stopped chan struct{}
 	once    sync.Once
+	mu      sync.Mutex
 }
 
 func newStderrCapture(limit int) (*stderrCapture, error) {
-	writer, err := os.CreateTemp("", "agentbus-daemon-stderr-*")
+	reader, writer, err := os.Pipe()
 	if err != nil {
-		return nil, err
-	}
-	reader, err := os.Open(writer.Name())
-	if err != nil {
-		_ = writer.Close()
-		_ = os.Remove(writer.Name())
 		return nil, err
 	}
 	return &stderrCapture{
 		writer:  writer,
 		reader:  reader,
-		path:    writer.Name(),
 		tail:    newTailBuffer(limit),
-		stop:    make(chan struct{}),
 		stopped: make(chan struct{}),
 	}, nil
 }
@@ -705,10 +738,6 @@ func (capture *stderrCapture) closeWriter() error {
 	}
 	err := capture.writer.Close()
 	capture.writer = nil
-	if capture.path != "" {
-		_ = os.Remove(capture.path)
-		capture.path = ""
-	}
 	return err
 }
 
@@ -716,33 +745,20 @@ func (capture *stderrCapture) start() {
 	if capture == nil || capture.reader == nil {
 		return
 	}
+	reader := capture.reader
 	go func() {
 		defer close(capture.stopped)
+		defer capture.closeReader()
 		buf := make([]byte, 4096)
 		for {
-			n, err := capture.reader.Read(buf)
+			n, err := reader.Read(buf)
 			if n > 0 {
 				capture.tail.Write(buf[:n])
 			}
 			if err == nil {
 				continue
 			}
-			if !errors.Is(err, io.EOF) {
-				return
-			}
-			select {
-			case <-capture.stop:
-				for {
-					n, err := capture.reader.Read(buf)
-					if n > 0 {
-						capture.tail.Write(buf[:n])
-					}
-					if err != nil {
-						return
-					}
-				}
-			case <-time.After(10 * time.Millisecond):
-			}
+			return
 		}
 	}()
 }
@@ -752,8 +768,14 @@ func (capture *stderrCapture) stopAndTail() string {
 		return ""
 	}
 	capture.once.Do(func() {
-		close(capture.stop)
-		<-capture.stopped
+		timer := time.NewTimer(stderrDrainGrace)
+		defer timer.Stop()
+		select {
+		case <-capture.stopped:
+		case <-timer.C:
+			capture.closeReader()
+			<-capture.stopped
+		}
 	})
 	return capture.tail.String()
 }
@@ -763,17 +785,24 @@ func (capture *stderrCapture) cleanup() {
 		return
 	}
 	_ = capture.closeWriter()
-	if capture.reader != nil {
-		_ = capture.reader.Close()
-		capture.reader = nil
+	capture.closeReader()
+}
+
+func (capture *stderrCapture) closeReader() {
+	if capture == nil {
+		return
 	}
-	if capture.path != "" {
-		_ = os.Remove(capture.path)
-		capture.path = ""
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if capture.reader == nil {
+		return
 	}
+	_ = capture.reader.Close()
+	capture.reader = nil
 }
 
 type tailBuffer struct {
+	mu    sync.Mutex
 	limit int
 	buf   []byte
 }
@@ -789,6 +818,8 @@ func (tail *tailBuffer) Write(p []byte) {
 	if tail == nil || len(p) == 0 {
 		return
 	}
+	tail.mu.Lock()
+	defer tail.mu.Unlock()
 	if len(p) >= tail.limit {
 		tail.buf = append(tail.buf[:0], p[len(p)-tail.limit:]...)
 		return
@@ -804,5 +835,11 @@ func (tail *tailBuffer) String() string {
 	if tail == nil {
 		return ""
 	}
+	tail.mu.Lock()
+	defer tail.mu.Unlock()
 	return string(tail.buf)
+}
+
+func isWaitTimeout(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "timed out")
 }

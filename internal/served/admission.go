@@ -36,6 +36,7 @@ const (
 	admissionAnchorFile     = "admission-anchor.json"
 
 	admissionFailStopTimeout        = 30 * time.Second
+	admissionRepositoryOpenTimeout  = 100 * time.Millisecond
 	admissionRepositoryCloseTimeout = 5 * time.Second
 	admissionProbeReasonMaxRunes    = 512
 )
@@ -253,6 +254,50 @@ func newAdmissionSupportDiagnostic(metadata authority.AdmissionRootMetadata, ass
 		Assessment:     assessment,
 		RetryExhausted: retryExhausted,
 	}
+}
+
+func StrictAdmissionSupportPreflight(ctx context.Context, cfg Config) error {
+	_, err := strictAdmissionSupportPreflight(ctx, cfg)
+	return err
+}
+
+func strictAdmissionSupportPreflight(ctx context.Context, cfg Config) (custodian.Support, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	runtime := newServedAdmissionRuntimeFromRuntime(cfg.Runtime)
+	server := &Server{}
+	support := server.assessAdmissionSupportWithRetry(ctx, runtime)
+	if strictSupportAvailable(support) {
+		return support, nil
+	}
+	diagnostic := newAdmissionSupportDiagnostic(authority.AdmissionRootMetadata{}, support.Assessment, support.Assessment.Class == custodian.SupportRetryable)
+	logAdmissionSupportDiagnostic(diagnostic)
+	return support, diagnostic
+}
+
+// NewAfterStrictAdmissionSupportPreflight runs the strict support probe before
+// mutating daemon state, then creates the state root and token through New.
+// On success the returned server reuses the preflight support assessment during
+// admission bootstrap so startup does not run the same support probe twice.
+func NewAfterStrictAdmissionSupportPreflight(ctx context.Context, cfg Config) (*Server, error) {
+	support, err := strictAdmissionSupportPreflight(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	root, err := ensureStateRoot(cfg.StateRoot)
+	if err != nil {
+		return nil, err
+	}
+	cfg.StateRoot = root
+	server, err := New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	runtime := newServedAdmissionRuntimeFromRuntime(cfg.Runtime)
+	runtime.supportOverride = &support
+	server.admissionRuntime = runtime
+	return server, nil
 }
 
 func (s *Server) requireActivatedAdmissionSupport(ctx context.Context, session *authority.RecoverySession, runtime *servedAdmissionRuntime, metadata authority.AdmissionRootMetadata) (custodian.Support, error) {
@@ -887,8 +932,11 @@ func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootst
 	if err := ctx.Err(); err != nil {
 		return nil, nil, nil, err
 	}
-	repo, err := bboltrepo.NewRepository(filepath.Join(s.stateRoot, admissionRepositoryFile))
+	repo, err := bboltrepo.Open(filepath.Join(s.stateRoot, admissionRepositoryFile), &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
 	if err != nil {
+		if errors.Is(err, bolt.ErrTimeout) {
+			return nil, nil, nil, DaemonAlreadyListeningError{SocketPath: s.socketPath}
+		}
 		return nil, nil, nil, err
 	}
 	dbUUID, schemaMajor, err := repo.AnchorIdentity()
