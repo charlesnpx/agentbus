@@ -791,6 +791,16 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 10. CI: no strict lane, race excludes client/+cmd/, gate scripts unversioned; tip red = GitHub Actions BILLING block (jobs die ~4s pre-step), not code.
 
 ## AB-E Log
+- 2026-07-23: E1 CLOSED at 005a8ae (SHIP, zero blocking). Arc: worker 54d52e5 (+1 on-thread resume
+  after orchestrator gates caught 5 real failures its receipt missed — masking test helper
+  strictIdentifiedTestParams removed; 4th false receipt of campaign) -> review1 FIX(2H+2M+2L) ->
+  fix1 6c61f12 (L1 named-policy coverage deferred to E3, judged SOUND) -> review2 FIX(1M residual)
+  -> fix2 005a8ae (helloTransportError autostart classification) -> review3 SHIP. Delivered:
+  foreground surface deleted (-3400 lines), unidentified submit structurally rejected, --admission/
+  StrictAdmissionRequested gone (strict-only composition, typed pre-listener failure on unsupported
+  platforms), ADR-0B replay ordering (LookupReplay before ANY typed decode), -32601 method_not_found
+  incl. fail-stopped, protocol_version_mismatch + client.ErrProtocolVersionMismatch, root_fail_stopped
+  cause wired, architecture guard, replay battery. Closure gates: 3-sweep battery + Docker + R0T green.
 - 2026-07-23: E0 CLOSED at 64031ca (SHIP, zero blocking). Arc: worker c89aecc -> review1 FIX(2H+2M)
   -> fix1 9899db5 -> review2 FIX(1H+2M+1L, M2 reopened) -> fix2 d16d431 -> review3 FIX(2 residual)
   -> fix3 64031ca -> review4 SHIP. Deliverables: ADR-12 (protocol.hello surface, replay ordering,
