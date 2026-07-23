@@ -179,7 +179,7 @@ func clientHello(ctx context.Context, conn net.Conn, reader *bufio.Reader, token
 	if err := json.Unmarshal(raw, &hello); err != nil {
 		return HelloResult{}, err
 	}
-	// TODO(AB-E E1): client must reject protocolVersion != protocol.Version per ADR-12
+	// TODO(AB-E E1): return ErrProtocolVersionMismatch when protocolVersion != protocol.Version per ADR-12.
 	return hello, nil
 }
 

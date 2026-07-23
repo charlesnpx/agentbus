@@ -19,8 +19,12 @@ There is no protocol-v1 compatibility layer. A v1 hello (`protocolVersion` misma
 typed version-mismatch error with stable `error.data.code = "protocol_version_mismatch"`. Removed
 or unknown methods return JSON-RPC `error.code = -32601` and stable
 `error.data.code = "method_not_found"`. The v2 client rejects a hello result whose
-`protocolVersion` differs from `protocol.Version` with a typed error. No request or response is
-translated, migrated, or accepted through a v1 compatibility path.
+`protocolVersion` differs from `protocol.Version` by returning a distinct exported sentinel/typed
+error in package `client` named `ErrProtocolVersionMismatch`. The returned error MUST match
+`ErrProtocolVersionMismatch` via `errors.Is`, report both the expected version (`protocol.Version`)
+and the received version in its message, and be returned from `Connect`/`clientHello` during the
+hello exchange before any caller request is sent. No request or response is translated, migrated, or
+accepted through a v1 compatibility path.
 
 ### Replay ordering
 
@@ -111,21 +115,23 @@ When multiple causes apply, exactly ONE cause is emitted, chosen by this normati
 
 This ADR amends ADR-0: the cause formerly named request_conflict is normatively replay_conflict.
 
-| Cause | Meaning |
-| --- | --- |
-| `missing_identity` | The request lacks the strict `(workspaceKey, requestId)` identity required for identified admission. |
-| `replay_conflict` | The request key is already bound or tombstoned to a different raw task identity. |
-| `request_expired` | The request key matches a tombstone whose original job is no longer replayable. |
-| `request_fingerprint_unsupported` | The recorded binding or tombstone uses a fingerprint algorithm or version the daemon cannot compare. |
-| `unsupported_backend` | The requested backend is not available to strict admission. |
-| `unfenceable_backend` | The requested backend exists but cannot provide the required strict fencing or containment contract. |
-| `invalid_strict_config` | The strict task configuration is malformed or incompatible with strict admission. |
-| `unavailable_native_runtime` | The native runtime support probe cannot satisfy the strict runtime requirements. |
-| `root_corrupt` | The authority root has detected repository, anchor, or integrity corruption. |
-| `root_identity_mismatch` | The repository identity and anchor identity do not match. |
-| `root_fail_stopped` | The authority root has entered fail-stop and rejects admission. |
-| `root_sealed` | The authority root is sealed and cannot accept service or admission. |
-| `admission_closing` | The daemon is closing and rejects new admission. |
+Each rejection cause MUST carry exactly the `error.data.code` listed below.
+
+| Cause | `error.data.code` | Meaning |
+| --- | --- | --- |
+| `missing_identity` | `invalid_task_spec` | The request lacks the strict `(workspaceKey, requestId)` identity required for identified admission. |
+| `replay_conflict` | `invalid_task_spec` | The request key is already bound or tombstoned to a different raw task identity. |
+| `request_expired` | `invalid_task_spec` | The request key matches a tombstone whose original job is no longer replayable. |
+| `request_fingerprint_unsupported` | `invalid_task_spec` | The recorded binding or tombstone uses a fingerprint algorithm or version the daemon cannot compare. |
+| `unsupported_backend` | `backend_unavailable` | The requested backend is not available to strict admission. |
+| `unfenceable_backend` | `capability_missing` | The requested backend exists but cannot provide the required strict fencing or containment contract. |
+| `invalid_strict_config` | `invalid_task_spec` | The strict task configuration is malformed or incompatible with strict admission. |
+| `unavailable_native_runtime` | `capability_missing` | The native runtime support probe cannot satisfy the strict runtime requirements. |
+| `root_corrupt` | `backend_unavailable` | The authority root has detected repository, anchor, or integrity corruption. |
+| `root_identity_mismatch` | `backend_unavailable` | The repository identity and anchor identity do not match. |
+| `root_fail_stopped` | `backend_unavailable` | The authority root has entered fail-stop and rejects admission. |
+| `root_sealed` | `capability_missing` | The authority root is sealed and cannot accept service or admission. |
+| `admission_closing` | `capability_missing` | The daemon is closing and rejects new admission. |
 
 E1 and E3 wire these causes into strict rejection responses. E6 documents them in the public protocol
 reference.
