@@ -27,6 +27,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
+	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 	bolt "go.etcd.io/bbolt"
 )
@@ -274,8 +275,42 @@ func strictAdmissionSupportPreflight(ctx context.Context, cfg Config) (custodian
 		return support, nil
 	}
 	diagnostic := newAdmissionSupportDiagnostic(authority.AdmissionRootMetadata{}, support.Assessment, support.Assessment.Class == custodian.SupportRetryable)
+	if err := alreadyListeningAfterRetryableSupportContention(ctx, cfg, support); err != nil {
+		return support, err
+	}
 	logAdmissionSupportDiagnostic(diagnostic)
 	return support, diagnostic
+}
+
+func alreadyListeningAfterRetryableSupportContention(ctx context.Context, cfg Config, support custodian.Support) error {
+	if !retryableCgroupRootLeaseContention(support) {
+		return nil
+	}
+	socketPath := cfg.SocketPath
+	if socketPath == "" {
+		var err error
+		socketPath, err = SocketPath(cfg.StateRoot)
+		if err != nil {
+			return nil
+		}
+	}
+	contentionCtx, cancel := admissionContentionContext(ctx)
+	defer cancel()
+	for {
+		if admissionSocketDialable(socketPath) {
+			return DaemonAlreadyListeningError{SocketPath: socketPath}
+		}
+		select {
+		case <-contentionCtx.Done():
+			return nil
+		case <-time.After(admissionContentionRetryDelay):
+		}
+	}
+}
+
+func retryableCgroupRootLeaseContention(support custodian.Support) bool {
+	return support.Assessment.Class == custodian.SupportRetryable &&
+		errors.Is(support.Assessment.Cause, cgroup.ErrRootLeaseUnavailable)
 }
 
 // NewAfterStrictAdmissionSupportPreflight runs the strict support probe before

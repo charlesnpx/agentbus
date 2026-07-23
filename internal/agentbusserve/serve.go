@@ -75,15 +75,22 @@ func Serve(ctx context.Context, cfg Config) error {
 }
 
 func RecoverAdmissionRoot(ctx context.Context, cfg Config) (served.AdmissionRecoveryReport, error) {
-	servedCfg, err := productionServedConfig(cfg)
+	servedCfg, configErr := recoveryServedConfig(cfg)
+	report, err := served.RecoverAdmissionRoot(ctx, servedCfg)
 	if err != nil {
-		return served.AdmissionRecoveryReport{}, err
+		return report, err
 	}
-	return served.RecoverAdmissionRoot(ctx, servedCfg)
+	return report, configErr
 }
 
 func productionServedConfig(cfg Config) (served.Config, error) {
 	return strictAdmissionServedConfig(cfg, StrictAdmissionOptions{})
+}
+
+func recoveryServedConfig(cfg Config) (served.Config, error) {
+	runtime, err := served.NewStrictAdmissionRuntime(StrictAdmissionOptions{})
+	cfg.Runtime = runtime
+	return cfg, err
 }
 
 func strictAdmissionServedConfig(cfg Config, opts StrictAdmissionOptions) (served.Config, error) {

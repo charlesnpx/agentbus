@@ -1,6 +1,7 @@
 package agentbusserve
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -113,6 +114,41 @@ func TestProductionServeLauncherUnsupportedLeavesExistingRootPermissionsOnDarwin
 		if _, statErr := os.Stat(filepath.Join(root, name)); !errors.Is(statErr, os.ErrNotExist) {
 			t.Fatalf("%s stat error = %v, want not exist", name, statErr)
 		}
+	}
+}
+
+func TestProductionRecoverCLIUnsupportedLeavesExistingRootEmptyOnDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin unsupported-platform recovery diagnostic")
+	}
+	root := t.TempDir()
+	bin := buildAgentbusServeRealBinary(t)
+	cmd := exec.Command(bin, "admission", "recover", "--state-root", root)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("recover succeeded, want unsupported diagnostic; stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() == 0 {
+		t.Fatalf("recover error = %T %v, want non-zero exit", err, err)
+	}
+	if !strings.Contains(stderr.String(), served.ErrAdmissionStrictSupportUnavailable.Error()) {
+		t.Fatalf("recover stderr = %q, want strict support diagnostic", stderr.String())
+	}
+	entries, readErr := os.ReadDir(root)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Fatalf("state root entries after recover = %v, want empty root", names)
 	}
 }
 

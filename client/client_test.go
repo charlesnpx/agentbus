@@ -21,6 +21,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
+	"github.com/charlesnpx/agentbus/internal/served"
 )
 
 func TestMain(m *testing.M) {
@@ -680,6 +681,55 @@ func TestConnectAutostartSurfacesLauncherFailureOnce(t *testing.T) {
 	}
 }
 
+func TestConnectAutostartRealUnsupportedHostSurfacesLauncherDiagnosticOnDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("real unsupported-host autostart diagnostic is macOS-only")
+	}
+	root := shortClientTempDir(t)
+	bin := buildClientRealAgentbusBinary(t)
+
+	var starts atomic.Int64
+	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
+		starts.Add(1)
+		return (defaultStarter{}).StartDaemon(ctx, opts)
+	})
+	client, err := Connect(context.Background(), Options{
+		StateRoot:    root,
+		Token:        "token",
+		CommandPath:  bin,
+		StartTimeout: 2 * time.Second,
+		Starter:      starter,
+	})
+	if client != nil {
+		_ = client.Close()
+	}
+	var startup *daemonlaunch.StartupError
+	if !errors.As(err, &startup) || !errors.Is(err, daemonlaunch.ErrStartupFailed) {
+		t.Fatalf("Connect error = %T %v, want daemon launch startup failure", err, err)
+	}
+	if errors.Is(err, daemonlaunch.ErrReadinessTimeout) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Connect error = %v, want launcher failure code, not timeout", err)
+	}
+	if startup.Code != served.ErrAdmissionStrictSupportUnavailable.Error() ||
+		!strings.Contains(startup.Message, served.ErrAdmissionStrictSupportUnavailable.Error()) {
+		t.Fatalf("startup error = %+v, want strict support diagnostic", startup)
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("starter calls = %d, want 1", got)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Fatalf("state root entries after unsupported autostart = %v, want empty root", names)
+	}
+}
+
 func TestConnectAutostartHelloHangUsesSingleStartTimeout(t *testing.T) {
 	t.Parallel()
 	root := shortClientTempDir(t)
@@ -1011,4 +1061,26 @@ func shortClientTempDir(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return dir
+}
+
+func buildClientRealAgentbusBinary(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "agentbus")
+	cmd := exec.Command("go", "build", "-o", path, "./cmd/agentbus")
+	cmd.Dir = clientRepoRootFromCaller(t)
+	cmd.Env = os.Environ()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go build ./cmd/agentbus: %v\n%s", err, output)
+	}
+	return path
+}
+
+func clientRepoRootFromCaller(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(file), ".."))
 }
