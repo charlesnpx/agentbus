@@ -21,10 +21,21 @@ func Serve(ctx context.Context, cfg Config) error {
 	if hasReporter {
 		defer reporter.Close()
 	}
+	startupCtx := ctx
+	cancelStartup := func() {}
+	if hasReporter {
+		var startupErr error
+		startupCtx, cancelStartup, startupErr = daemonlaunch.InheritedStartupContext(ctx)
+		if startupErr != nil {
+			reportStartupFailure(reporter, startupErr)
+			return startupErr
+		}
+	}
+	defer cancelStartup()
 	servedCfg, configErr := productionServedConfig(cfg)
 	if configErr != nil {
 		err := configErr
-		if preflightErr := served.StrictAdmissionSupportPreflight(ctx, servedCfg); preflightErr != nil {
+		if preflightErr := served.StrictAdmissionSupportPreflight(startupCtx, servedCfg); preflightErr != nil {
 			err = errors.Join(preflightErr, configErr)
 		}
 		_ = servedCfg.Runtime.Close()
@@ -50,13 +61,13 @@ func Serve(ctx context.Context, cfg Config) error {
 			return nil
 		}
 	}
-	server, err := served.NewAfterStrictAdmissionSupportPreflight(ctx, servedCfg)
+	server, err := served.NewAfterStrictAdmissionSupportPreflight(startupCtx, servedCfg)
 	if err != nil {
 		_ = servedCfg.Runtime.Close()
 		reportStartupFailure(reporter, err)
 		return err
 	}
-	err = server.Serve(ctx)
+	err = server.Serve(startupCtx)
 	if err != nil {
 		reportStartupFailure(reporter, err)
 	}
@@ -105,6 +116,8 @@ func startupFailureCode(err error) string {
 		return served.ErrAdmissionStrictSupportUnavailable.Error()
 	case errors.Is(err, served.ErrDaemonAlreadyListening):
 		return daemonlaunch.CodeAlreadyListening
+	case errors.Is(err, served.ErrAdmissionRootBusy):
+		return daemonlaunch.CodeAdmissionRootBusy
 	case errors.Is(err, served.ErrRuntimeConsumed):
 		return served.ErrRuntimeConsumed.Error()
 	case errors.Is(err, served.ErrSafetyFailStopped):

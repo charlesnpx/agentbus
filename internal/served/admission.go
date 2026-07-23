@@ -38,6 +38,8 @@ const (
 	admissionFailStopTimeout        = 30 * time.Second
 	admissionRepositoryOpenTimeout  = 100 * time.Millisecond
 	admissionRepositoryCloseTimeout = 5 * time.Second
+	admissionContentionRetryDelay   = 50 * time.Millisecond
+	admissionContentionFallback     = 10 * time.Second
 	admissionProbeReasonMaxRunes    = 512
 )
 
@@ -933,14 +935,8 @@ func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootst
 		return nil, nil, nil, err
 	}
 	repoPath := filepath.Join(s.stateRoot, admissionRepositoryFile)
-	repo, err := bboltrepo.Open(repoPath, &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
+	repo, err := openAdmissionRepositoryWithContentionRetry(ctx, repoPath, s.socketPath)
 	if err != nil {
-		if errors.Is(err, bolt.ErrTimeout) {
-			if admissionAlreadyListeningCorroborated(ctx, s.socketPath) {
-				return nil, nil, nil, DaemonAlreadyListeningError{SocketPath: s.socketPath}
-			}
-			return nil, nil, nil, AdmissionRootBusyError{Path: repoPath, SocketPath: s.socketPath, Cause: err}
-		}
 		return nil, nil, nil, err
 	}
 	dbUUID, schemaMajor, err := repo.AnchorIdentity()
@@ -966,6 +962,54 @@ func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootst
 		return nil, nil, nil, err
 	}
 	return bootstrapper, repo, repo, nil
+}
+
+func openAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, socketPath string) (*bboltrepo.Repository, error) {
+	repo, err := bboltrepo.Open(repoPath, &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
+	if err == nil || !errors.Is(err, bolt.ErrTimeout) {
+		return repo, err
+	}
+	contentionCtx, cancel := admissionContentionContext(ctx)
+	defer cancel()
+	last := err
+	for {
+		if admissionSocketDialable(socketPath) {
+			return nil, DaemonAlreadyListeningError{SocketPath: socketPath}
+		}
+		if err := contentionCtx.Err(); err != nil {
+			return nil, admissionContentionExpiredError(ctx, repoPath, socketPath, last, err)
+		}
+		repo, err = bboltrepo.Open(repoPath, &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
+		if err == nil {
+			return repo, nil
+		}
+		if !errors.Is(err, bolt.ErrTimeout) {
+			return nil, err
+		}
+		last = err
+		select {
+		case <-contentionCtx.Done():
+			return nil, admissionContentionExpiredError(ctx, repoPath, socketPath, last, contentionCtx.Err())
+		case <-time.After(admissionContentionRetryDelay):
+		}
+	}
+}
+
+func admissionContentionContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, admissionContentionFallback)
+}
+
+func admissionContentionExpiredError(parent context.Context, repoPath, socketPath string, cause, expiration error) error {
+	if errors.Is(expiration, context.DeadlineExceeded) {
+		return AdmissionRootBusyError{Path: repoPath, SocketPath: socketPath, Cause: cause}
+	}
+	if parentErr := parent.Err(); parentErr != nil {
+		return parentErr
+	}
+	return expiration
 }
 
 func recoverAdmissionBeforeReady(ctx context.Context, session *authority.RecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) error {

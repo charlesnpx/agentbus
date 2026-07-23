@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,9 +28,47 @@ import (
 
 const defaultStartTimeout = 10 * time.Second
 
+var (
+	autostartUserCacheDir = os.UserCacheDir
+	autostartTempDir      = os.TempDir
+)
+
 // ErrProtocolVersionMismatch identifies a hello result whose protocolVersion
 // does not match the client protocol version.
 var ErrProtocolVersionMismatch = errors.New("protocol version mismatch")
+
+// ErrAutostartLockUnsafe identifies an autostart lock path that failed the
+// ownership, type, or permission checks required before using a shared tmp
+// fallback.
+var ErrAutostartLockUnsafe = errors.New("agentbus autostart lock path unsafe")
+
+type AutostartLockUnsafeError struct {
+	Path   string
+	Reason string
+	Cause  error
+}
+
+func (e AutostartLockUnsafeError) Error() string {
+	message := ErrAutostartLockUnsafe.Error()
+	if e.Path != "" {
+		message = fmt.Sprintf("%s: %s", message, e.Path)
+	}
+	if e.Reason != "" {
+		message = fmt.Sprintf("%s: %s", message, e.Reason)
+	}
+	if e.Cause != nil {
+		message = fmt.Sprintf("%s: %v", message, e.Cause)
+	}
+	return message
+}
+
+func (e AutostartLockUnsafeError) Is(target error) bool {
+	return target == ErrAutostartLockUnsafe
+}
+
+func (e AutostartLockUnsafeError) Unwrap() error {
+	return e.Cause
+}
 
 // ProtocolVersionMismatchError reports the expected and received protocol
 // versions from a failed hello exchange.
@@ -344,15 +383,15 @@ func (c *Client) startTimeout() time.Duration {
 }
 
 func (c *Client) lockAutostartStateRoot(ctx context.Context) (func(), error) {
-	canonicalRoot, err := canonicalStateRootForAutostartLock(c.stateRoot)
+	lockKey, err := stateRootAutostartLockKey(c.stateRoot)
 	if err != nil {
 		return nil, err
 	}
-	lockPath, err := autostartLockPath(canonicalRoot)
+	lockPath, err := autostartLockPath(lockKey)
 	if err != nil {
 		return nil, err
 	}
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	lock, err := openAutostartLockFile(lockPath)
 	if err != nil {
 		return nil, err
 	}
@@ -380,29 +419,44 @@ func (c *Client) lockAutostartStateRoot(ctx context.Context) (func(), error) {
 	}
 }
 
-func canonicalStateRootForAutostartLock(root string) (string, error) {
+func stateRootAutostartLockKey(root string) (string, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return "", err
 	}
 	canonical, err := filepath.EvalSymlinks(abs)
 	if err == nil {
-		return canonical, nil
+		if identity, ok, err := pathFileIdentity(canonical); err != nil {
+			return "", err
+		} else if ok {
+			// Invariant: every spelling that resolves to the same existing
+			// state-root inode maps to the same autostart lock. Missing roots
+			// key by nearest existing ancestor inode plus the unresolved suffix,
+			// case-folded on case-insensitive platforms.
+			return fmt.Sprintf("existing:%x:%x", identity.dev, identity.ino), nil
+		}
+		return "path:" + canonical, nil
 	}
 	if !os.IsNotExist(err) {
 		return "", err
 	}
-	return canonicalMissingAutostartLockPath(abs)
+	return missingStateRootAutostartLockKey(abs)
 }
 
-func canonicalMissingAutostartLockPath(abs string) (string, error) {
+func missingStateRootAutostartLockKey(abs string) (string, error) {
 	current := filepath.Clean(abs)
 	var missing []string
 	for {
 		canonical, err := filepath.EvalSymlinks(current)
 		if err == nil {
-			parts := append([]string{canonical}, missing...)
-			return filepath.Join(parts...), nil
+			remainder := filepath.Join(missing...)
+			remainder = caseFoldAutostartLockRemainder(remainder)
+			if identity, ok, err := pathFileIdentity(canonical); err != nil {
+				return "", err
+			} else if ok {
+				return fmt.Sprintf("missing:%x:%x:%s", identity.dev, identity.ino, remainder), nil
+			}
+			return "missing-path:" + filepath.Join(canonical, remainder), nil
 		}
 		if !os.IsNotExist(err) {
 			return "", err
@@ -416,16 +470,130 @@ func canonicalMissingAutostartLockPath(abs string) (string, error) {
 	}
 }
 
-func autostartLockPath(canonicalRoot string) (string, error) {
-	sum := sha256.Sum256([]byte(canonicalRoot))
-	lockDir := filepath.Join(os.TempDir(), fmt.Sprintf("agentbus-start-locks-%d", os.Getuid()))
-	if err := os.MkdirAll(lockDir, 0o700); err != nil {
-		return "", err
+type autostartFileIdentity struct {
+	dev uint64
+	ino uint64
+}
+
+func pathFileIdentity(path string) (autostartFileIdentity, bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return autostartFileIdentity{}, false, err
 	}
-	if err := os.Chmod(lockDir, 0o700); err != nil {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return autostartFileIdentity{}, false, nil
+	}
+	return autostartFileIdentity{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}, true, nil
+}
+
+func caseFoldAutostartLockRemainder(path string) string {
+	switch runtime.GOOS {
+	case "darwin", "windows":
+		return strings.ToLower(path)
+	default:
+		return path
+	}
+}
+
+func autostartLockPath(lockKey string) (string, error) {
+	sum := sha256.Sum256([]byte(lockKey))
+	lockDir, err := autostartLockDir()
+	if err != nil {
 		return "", err
 	}
 	return filepath.Join(lockDir, "start-"+hex.EncodeToString(sum[:])+".lock"), nil
+}
+
+func autostartLockDir() (string, error) {
+	cacheDir, err := autostartUserCacheDir()
+	if err == nil && strings.TrimSpace(cacheDir) != "" {
+		lockDir := filepath.Join(cacheDir, "agentbus", "start-locks")
+		if err := os.MkdirAll(lockDir, 0o700); err != nil {
+			return "", err
+		}
+		return lockDir, nil
+	}
+	lockDir := filepath.Join(autostartTempDir(), fmt.Sprintf("agentbus-start-locks-%d", os.Getuid()))
+	if err := os.Mkdir(lockDir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", err
+	}
+	if err := verifyAutostartTempLockDir(lockDir); err != nil {
+		return "", err
+	}
+	return lockDir, nil
+}
+
+func verifyAutostartTempLockDir(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return AutostartLockUnsafeError{Path: path, Reason: "stat lock directory", Cause: err}
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return AutostartLockUnsafeError{Path: path, Reason: "lock directory is a symlink"}
+	}
+	if !info.IsDir() {
+		return AutostartLockUnsafeError{Path: path, Reason: "lock path is not a directory"}
+	}
+	if info.Mode().Perm() != 0o700 {
+		return AutostartLockUnsafeError{Path: path, Reason: fmt.Sprintf("lock directory mode is %o, want 700", info.Mode().Perm())}
+	}
+	lstat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return AutostartLockUnsafeError{Path: path, Reason: "lock directory identity unavailable"}
+	}
+	if lstat.Uid != uint32(os.Getuid()) {
+		return AutostartLockUnsafeError{Path: path, Reason: fmt.Sprintf("lock directory owner is %d, want %d", lstat.Uid, os.Getuid())}
+	}
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return AutostartLockUnsafeError{Path: path, Reason: "open verified lock directory", Cause: err}
+	}
+	defer syscall.Close(fd)
+	var opened syscall.Stat_t
+	if err := syscall.Fstat(fd, &opened); err != nil {
+		return AutostartLockUnsafeError{Path: path, Reason: "stat opened lock directory", Cause: err}
+	}
+	if uint64(opened.Dev) != uint64(lstat.Dev) || uint64(opened.Ino) != uint64(lstat.Ino) {
+		return AutostartLockUnsafeError{Path: path, Reason: "lock directory changed during verification"}
+	}
+	if opened.Uid != uint32(os.Getuid()) || os.FileMode(opened.Mode).Perm() != 0o700 || opened.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+		return AutostartLockUnsafeError{Path: path, Reason: "opened lock directory failed ownership, mode, or type verification"}
+	}
+	return nil
+}
+
+func openAutostartLockFile(path string) (*os.File, error) {
+	lock, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyAutostartLockFile(lock); err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	return lock, nil
+}
+
+func verifyAutostartLockFile(file *os.File) error {
+	info, err := file.Stat()
+	if err != nil {
+		return AutostartLockUnsafeError{Path: file.Name(), Reason: "stat lock file", Cause: err}
+	}
+	if !info.Mode().IsRegular() {
+		return AutostartLockUnsafeError{Path: file.Name(), Reason: "lock file is not regular"}
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return AutostartLockUnsafeError{Path: file.Name(), Reason: fmt.Sprintf("lock file mode is %o, want owner-only", info.Mode().Perm())}
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return AutostartLockUnsafeError{Path: file.Name(), Reason: "lock file identity unavailable"}
+	}
+	if stat.Uid != uint32(os.Getuid()) {
+		return AutostartLockUnsafeError{Path: file.Name(), Reason: fmt.Sprintf("lock file owner is %d, want %d", stat.Uid, os.Getuid())}
+	}
+	return nil
 }
 
 func remainingTimeout(ctx context.Context) time.Duration {

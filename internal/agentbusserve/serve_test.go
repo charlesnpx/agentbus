@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	agentbusServeHelperEnv    = "AGENTBUS_AGENTBUSSERVE_HELPER"
-	agentbusServeHelperCWDEnv = "AGENTBUS_AGENTBUSSERVE_HELPER_CWD"
+	agentbusServeHelperEnv     = "AGENTBUS_AGENTBUSSERVE_HELPER"
+	agentbusServeHelperCWDEnv  = "AGENTBUS_AGENTBUSSERVE_HELPER_CWD"
+	agentbusServeHelperModeEnv = "AGENTBUS_AGENTBUSSERVE_HELPER_MODE"
 )
 
 func TestMain(m *testing.M) {
@@ -113,6 +114,24 @@ func TestProductionServeLauncherUnsupportedLeavesExistingRootPermissionsOnDarwin
 	}
 }
 
+func TestServeLauncherReportsAdmissionRootBusyCode(t *testing.T) {
+	root := t.TempDir()
+	_, err := daemonlaunch.Launch(context.Background(), agentbusServeLaunchOptionsWithMode(t, root, t.TempDir(), "root-busy-report"))
+	if err == nil {
+		t.Fatal("Launch succeeded, want root-busy startup failure")
+	}
+	var startup *daemonlaunch.StartupError
+	if !errors.As(err, &startup) || !errors.Is(startup, daemonlaunch.ErrStartupFailed) {
+		t.Fatalf("Launch error = %T %v, want startup failure", err, err)
+	}
+	if startup.Code != daemonlaunch.CodeAdmissionRootBusy {
+		t.Fatalf("startup code = %q, want %q", startup.Code, daemonlaunch.CodeAdmissionRootBusy)
+	}
+	if !strings.Contains(startup.Message, served.ErrAdmissionRootBusy.Error()) {
+		t.Fatalf("startup message = %q, want root busy diagnostic", startup.Message)
+	}
+}
+
 func runAgentbusServeHelper() int {
 	cwd := os.Getenv(agentbusServeHelperCWDEnv)
 	if cwd == "" {
@@ -121,6 +140,21 @@ func runAgentbusServeHelper() int {
 		if err != nil {
 			return 2
 		}
+	}
+	if os.Getenv(agentbusServeHelperModeEnv) == "root-busy-report" {
+		reporter, hasReporter, err := daemonlaunch.InheritedReporterFromEnv()
+		if err != nil {
+			return 2
+		}
+		if !hasReporter {
+			return 2
+		}
+		defer reporter.Close()
+		reportStartupFailure(reporter, served.AdmissionRootBusyError{
+			Path:       filepath.Join(os.Getenv("AGENTBUS_STATE_ROOT"), "admission.bbolt"),
+			SocketPath: filepath.Join(os.Getenv("AGENTBUS_STATE_ROOT"), protocol.SocketName),
+		})
+		return 1
 	}
 	if err := Serve(context.Background(), Config{
 		StateRoot:   os.Getenv("AGENTBUS_STATE_ROOT"),
@@ -134,16 +168,25 @@ func runAgentbusServeHelper() int {
 
 func agentbusServeLaunchOptions(t *testing.T, root, cwd string) daemonlaunch.Options {
 	t.Helper()
+	return agentbusServeLaunchOptionsWithMode(t, root, cwd, "")
+}
+
+func agentbusServeLaunchOptionsWithMode(t *testing.T, root, cwd, mode string) daemonlaunch.Options {
+	t.Helper()
+	env := append(os.Environ(),
+		agentbusServeHelperEnv+"=1",
+		agentbusServeHelperCWDEnv+"="+cwd,
+	)
+	if mode != "" {
+		env = append(env, agentbusServeHelperModeEnv+"="+mode)
+	}
 	return daemonlaunch.Options{
 		CommandPath: os.Args[0],
 		Args:        []string{"serve", "--foreground"},
 		StateRoot:   root,
 		Timeout:     2 * time.Second,
 		Starter:     agentbusServeProcessStarter,
-		Env: append(os.Environ(),
-			agentbusServeHelperEnv+"=1",
-			agentbusServeHelperCWDEnv+"="+cwd,
-		),
+		Env:         env,
 	}
 }
 

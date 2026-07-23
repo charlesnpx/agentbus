@@ -185,7 +185,7 @@ func TestLaunchAdmissionReadOnlyLockWithoutSocketReportsRootBusy(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, err = daemonlaunch.Launch(context.Background(), servedLaunchOptions(t, root, cwd, "serve", ""))
+	_, err = daemonlaunch.Launch(context.Background(), servedLaunchOptionsWithTimeout(t, root, cwd, "serve", "", 1500*time.Millisecond))
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("Launch succeeded, want root busy startup failure")
@@ -203,12 +203,65 @@ func TestLaunchAdmissionReadOnlyLockWithoutSocketReportsRootBusy(t *testing.T) {
 	if !strings.Contains(startup.Message, ErrAdmissionRootBusy.Error()) {
 		t.Fatalf("startup message = %q, want root busy diagnostic", startup.Message)
 	}
-	if elapsed > 2*time.Second {
-		t.Fatalf("Launch elapsed = %s, want quick root busy failure", elapsed)
+	if elapsed < 900*time.Millisecond || elapsed > 3*time.Second {
+		t.Fatalf("Launch elapsed = %s, want root busy at child startup deadline", elapsed)
 	}
 	if _, err := os.Lstat(socketPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("socket stat after launch = %v, want not exist", err)
 	}
+}
+
+func TestLaunchAdmissionLockPreBindDelayVerifiesWinner(t *testing.T) {
+	parent := shortTempDir(t)
+	root := filepath.Join(parent, "state")
+	cwd := shortTempDir(t)
+	marker := filepath.Join(parent, "pre-bind-delay-marker")
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	type launchOutcome struct {
+		result daemonlaunch.Result
+		err    error
+	}
+	winnerOptions := servedLaunchOptionsWithTimeout(t, root, cwd, "pre-bind-delay", "", 6*time.Second)
+	winnerDone := make(chan launchOutcome, 1)
+	go func() {
+		result, err := daemonlaunch.Launch(ctx, winnerOptions)
+		winnerDone <- launchOutcome{result: result, err: err}
+	}()
+	if err := waitForServedLaunchPath(marker, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	result, err := daemonlaunch.Launch(ctx, servedLaunchOptionsWithTimeout(t, root, cwd, "serve", "", 6*time.Second))
+	if err != nil {
+		if launchRaceSocketDenied(err) {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatalf("Launch during pre-bind delay error: %v", err)
+	}
+	if !result.ExistingDaemon || result.PID != 0 {
+		t.Fatalf("loser result = %+v, want verified existing daemon", result)
+	}
+
+	var winner daemonlaunch.Result
+	select {
+	case outcome := <-winnerDone:
+		if outcome.err != nil {
+			if launchRaceSocketDenied(outcome.err) {
+				t.Skipf("Unix socket bind denied by sandbox: %v", outcome.err)
+			}
+			t.Fatalf("winner launch error: %v", outcome.err)
+		}
+		winner = outcome.result
+	case <-time.After(2 * time.Second):
+		t.Fatal("winner did not report ready after pre-bind delay")
+	}
+	if winner.PID <= 0 || winner.ExistingDaemon {
+		t.Fatalf("winner result = %+v, want launched daemon pid", winner)
+	}
+	t.Cleanup(func() { _ = winner.KillAndWait() })
+	token := readServedLaunchToken(t, filepath.Join(root, protocol.TokenFileName))
+	helloServedLaunchDaemon(t, filepath.Join(root, protocol.SocketName), token)
 }
 
 func TestLaunchAdmissionLockWithDialableWinnerVerifiesExistingDaemon(t *testing.T) {
@@ -297,6 +350,12 @@ func runServedLaunchHelper() int {
 		return 2
 	}
 	defer reporter.Close()
+	serveCtx, cancelStartup, err := daemonlaunch.InheritedStartupContext(context.Background())
+	if err != nil {
+		_ = reporter.Failed("error", err.Error())
+		return 1
+	}
+	defer cancelStartup()
 	if barrier := os.Getenv(servedLaunchHelperBarrierEnv); barrier != "" {
 		if err := waitAtServedLaunchBarrier(barrier, 2, 2*time.Second); err != nil {
 			_ = reporter.Failed("error", err.Error())
@@ -330,7 +389,14 @@ func runServedLaunchHelper() int {
 			_ = waitForServedLaunchPath(ready, 2*time.Second)
 		}
 	}
-	if err := server.Serve(context.Background()); err != nil {
+	if os.Getenv(servedLaunchHelperModeEnv) == "pre-bind-delay" {
+		marker := os.Getenv(servedLaunchHelperMarkerEnv)
+		server.admissionStartupHooks.BeforePolicyInstall = func() {
+			_ = os.WriteFile(marker, []byte("pre-bind-delay\n"), 0o600)
+			time.Sleep(1500 * time.Millisecond)
+		}
+	}
+	if err := server.Serve(serveCtx); err != nil {
 		_ = reporter.Failed(startupFailureCodeForServedLaunch(err), err.Error())
 		return 1
 	}
@@ -375,6 +441,11 @@ func startupFailureCodeForServedLaunch(err error) string {
 
 func servedLaunchOptions(t *testing.T, root, cwd, mode, barrier string) daemonlaunch.Options {
 	t.Helper()
+	return servedLaunchOptionsWithTimeout(t, root, cwd, mode, barrier, 5*time.Second)
+}
+
+func servedLaunchOptionsWithTimeout(t *testing.T, root, cwd, mode, barrier string, timeout time.Duration) daemonlaunch.Options {
+	t.Helper()
 	env := append(os.Environ(),
 		servedLaunchHelperEnv+"=1",
 		servedLaunchHelperModeEnv+"="+mode,
@@ -390,11 +461,16 @@ func servedLaunchOptions(t *testing.T, root, cwd, mode, barrier string) daemonla
 			servedLaunchHelperReadyEnv+"="+filepath.Join(parent, "winner-ready"),
 		)
 	}
+	if mode == "pre-bind-delay" {
+		env = append(env,
+			servedLaunchHelperMarkerEnv+"="+filepath.Join(filepath.Dir(root), "pre-bind-delay-marker"),
+		)
+	}
 	return daemonlaunch.Options{
 		CommandPath: os.Args[0],
 		Args:        []string{"serve", "--foreground"},
 		StateRoot:   root,
-		Timeout:     5 * time.Second,
+		Timeout:     timeout,
 		Starter:     servedLaunchProcessStarter,
 		Env:         env,
 	}

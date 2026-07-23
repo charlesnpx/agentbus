@@ -36,8 +36,6 @@ const (
 	defaultLeaseDuration = 5 * time.Minute
 	defaultHeartbeat     = 30 * time.Second
 	defaultSafetyDrain   = 30 * time.Second
-
-	admissionAlreadyListeningCorroborationTimeout = time.Second
 )
 
 const duplicateAuthorityJSONWarning = "duplicate-job-id: authority record also has legacy JSON record; authority selected"
@@ -84,26 +82,6 @@ func (e AdmissionRootBusyError) Is(target error) bool {
 
 func (e AdmissionRootBusyError) Unwrap() error {
 	return e.Cause
-}
-
-func admissionAlreadyListeningCorroborated(ctx context.Context, socketPath string) bool {
-	if strings.TrimSpace(socketPath) == "" {
-		return false
-	}
-	deadline := time.Now().Add(admissionAlreadyListeningCorroborationTimeout)
-	for {
-		if admissionSocketDialable(socketPath) {
-			return true
-		}
-		if !time.Now().Before(deadline) {
-			return false
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(25 * time.Millisecond):
-		}
-	}
 }
 
 func admissionSocketDialable(socketPath string) bool {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -31,7 +32,17 @@ func TestMain(m *testing.M) {
 		len(os.Args) == 3 && os.Args[1] == "serve" && os.Args[2] == "--foreground" {
 		os.Exit(runAutostartDetachDaemon())
 	}
-	os.Exit(m.Run())
+	cacheDir, err := os.MkdirTemp(os.TempDir(), "ab-client-cache-")
+	if err == nil {
+		autostartUserCacheDir = func() (string, error) {
+			return cacheDir, nil
+		}
+	}
+	code := m.Run()
+	if cacheDir != "" {
+		_ = os.RemoveAll(cacheDir)
+	}
+	os.Exit(code)
 }
 
 func runAutostartFailureDaemon() int {
@@ -340,6 +351,30 @@ func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 	}
 	if got := starts.Load(); got != 1 {
 		t.Fatalf("starts = %d, want 1", got)
+	}
+}
+
+func TestAutostartTempFallbackRejectsUnsafeLockDir(t *testing.T) {
+	originalUserCacheDir := autostartUserCacheDir
+	originalTempDir := autostartTempDir
+	t.Cleanup(func() {
+		autostartUserCacheDir = originalUserCacheDir
+		autostartTempDir = originalTempDir
+	})
+	tmp := t.TempDir()
+	autostartUserCacheDir = func() (string, error) {
+		return "", errors.New("no user cache for test")
+	}
+	autostartTempDir = func() string {
+		return tmp
+	}
+	lockDir := filepath.Join(tmp, fmt.Sprintf("agentbus-start-locks-%d", os.Getuid()))
+	if err := os.Mkdir(lockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := autostartLockPath("unsafe-temp-dir-test")
+	if !errors.Is(err, ErrAutostartLockUnsafe) {
+		t.Fatalf("autostartLockPath error = %v, want ErrAutostartLockUnsafe", err)
 	}
 }
 

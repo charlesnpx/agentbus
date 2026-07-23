@@ -22,17 +22,19 @@ import (
 )
 
 const (
-	ReadyFDEnv                = "AGENTBUS_READY_FD"
-	ReadinessProtocolVersion  = 1
-	DefaultTimeout            = 10 * time.Second
-	DefaultStderrTailBytes    = 64 * 1024
-	CodeAlreadyListening      = "agentbus daemon already listening"
-	CodeAdmissionRootBusy     = "agentbus admission root busy"
-	readinessFDChildNumber    = 3
-	existingVerifyRetryPeriod = 50 * time.Millisecond
-	failedExitGrace           = 500 * time.Millisecond
-	killWaitTimeout           = 5 * time.Second
-	stderrDrainGrace          = 100 * time.Millisecond
+	ReadyFDEnv                 = "AGENTBUS_READY_FD"
+	StartupDeadlineEnv         = "AGENTBUS_STARTUP_DEADLINE_UNIX_NANO"
+	ReadinessProtocolVersion   = 1
+	DefaultTimeout             = 10 * time.Second
+	DefaultStderrTailBytes     = 64 * 1024
+	CodeAlreadyListening       = "agentbus daemon already listening"
+	CodeAdmissionRootBusy      = "agentbus admission root busy"
+	readinessFDChildNumber     = 3
+	existingVerifyRetryPeriod  = 50 * time.Millisecond
+	failedExitGrace            = 500 * time.Millisecond
+	killWaitTimeout            = 5 * time.Second
+	startupDeadlineReportGrace = 250 * time.Millisecond
+	stderrDrainGrace           = 100 * time.Millisecond
 )
 
 var (
@@ -87,6 +89,25 @@ func InheritedReporterFromEnv() (*Reporter, bool, error) {
 		return nil, true, err
 	}
 	return &Reporter{file: os.NewFile(uintptr(fd), "agentbus-ready")}, true, nil
+}
+
+func InheritedStartupContext(parent context.Context) (context.Context, context.CancelFunc, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	raw := strings.TrimSpace(os.Getenv(StartupDeadlineEnv))
+	if raw == "" {
+		return parent, func() {}, nil
+	}
+	if err := os.Unsetenv(StartupDeadlineEnv); err != nil {
+		return nil, nil, err
+	}
+	deadlineUnixNano, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s must be a Unix nanosecond deadline: %q", StartupDeadlineEnv, raw)
+	}
+	deadlineCtx, cancel := context.WithDeadline(parent, time.Unix(0, deadlineUnixNano))
+	return deadlineCtx, cancel, nil
 }
 
 func (reporter *Reporter) Sent() bool {
@@ -381,7 +402,7 @@ func Launch(ctx context.Context, opts Options) (Result, error) {
 	process, err := opts.Starter(ProcessConfig{
 		CommandPath: opts.CommandPath,
 		Args:        args,
-		Env:         launchEnv(opts.Env, root),
+		Env:         launchEnv(opts.Env, root, launchCtx),
 		ExtraFiles:  []*os.File{readyWrite},
 		Stdin:       devNull,
 		Stdout:      devNull,
@@ -585,13 +606,19 @@ func canonicalMissingPath(abs string) (string, error) {
 	}
 }
 
-func launchEnv(base []string, root string) []string {
+func launchEnv(base []string, root string, ctx context.Context) []string {
 	if base == nil {
 		base = os.Environ()
 	}
 	env := append([]string(nil), base...)
 	env = upsertEnv(env, "AGENTBUS_STATE_ROOT="+root)
 	env = upsertEnv(env, ReadyFDEnv+"="+strconv.Itoa(readinessFDChildNumber))
+	if deadline, ok := ctx.Deadline(); ok {
+		if time.Until(deadline) > startupDeadlineReportGrace {
+			deadline = deadline.Add(-startupDeadlineReportGrace)
+		}
+		env = upsertEnv(env, StartupDeadlineEnv+"="+strconv.FormatInt(deadline.UnixNano(), 10))
+	}
 	return env
 }
 
