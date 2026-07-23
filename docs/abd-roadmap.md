@@ -766,7 +766,7 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 ## Units
 | Unit | Scope | Status |
 |---|---|---|
-| E0 | Contract freeze: ADR-12, protocol.Version=2, storage schema v2, stable rejection causes, root-existence matrix, normative ADR-0B replay ordering, shutdown contract, result semantics (derived from authority terminal record, no public proof) | PENDING |
+| E0 | Contract freeze: ADR-12, protocol.Version=2, storage schema v2, stable rejection causes, root-existence matrix, normative ADR-0B replay ordering, shutdown contract, result semantics (derived from authority terminal record, no public proof) | CLOSED 64031ca |
 | E1 | Delete foreground surface + unidentified submit + --admission plumbing; reimplement handleIdentifiedJobSubmit per E0 replay ordering (LookupReplay before backend/filesystem validation, recorded fingerprint version); negative + replay test battery; architecture guard: no path reaches session.Turn outside an authority launch | PENDING |
 | E2A | Shared daemon launcher: readiness pipe (ready{protocolVersion,pid,canonicalStateRoot,socketPath} / failed{code,message}), PID-after-ready, Setsid, kill+reap on parent failure, stderr preserved to handshake, concurrent-start winner verification | PENDING |
 | E2B | Autostart: typed diagnostic on unsupported host, restart-after-exit restores service, race convergence; `admission recover` gets a dedicated strict-native recovery constructor; compiled-CLI recovery in Docker gate | PENDING |
@@ -791,6 +791,14 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 10. CI: no strict lane, race excludes client/+cmd/, gate scripts unversioned; tip red = GitHub Actions BILLING block (jobs die ~4s pre-step), not code.
 
 ## AB-E Log
+- 2026-07-23: E0 CLOSED at 64031ca (SHIP, zero blocking). Arc: worker c89aecc -> review1 FIX(2H+2M)
+  -> fix1 9899db5 -> review2 FIX(1H+2M+1L, M2 reopened) -> fix2 d16d431 -> review3 FIX(2 residual)
+  -> fix3 64031ca -> review4 SHIP. Deliverables: ADR-12 (protocol.hello surface, replay ordering,
+  root matrix + evaluation order, corruption classes, 13 causes + admissionCause wire contract +
+  precedence + error.data.code column, method_not_found -32601 / protocol_version_mismatch /
+  ErrProtocolVersionMismatch client contract, shutdown, result semantics, non-goals);
+  protocol.Version=2; StrictAuthorityMetaSchemaVersion=2; cause constants. Orchestrator repair #1
+  (autostart hello pin + usage text) audited CLOSED in review1.
 - 2026-07-22: AB-E locked at REV 3 after two external assessment rounds (foreground deletion decided
   by user; E9 deferred; no public proof; outcome-based shutdown; sequential-only). Tasks #4-#14
   created in the session ledger with dependency chain. Starting E0.
