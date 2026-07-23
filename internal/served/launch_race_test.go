@@ -19,6 +19,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
@@ -158,6 +159,123 @@ func TestLaunchBindRaceAlreadyListeningVerifiesWinner(t *testing.T) {
 	}
 }
 
+func TestLaunchAdmissionReadOnlyLockWithoutSocketReportsRootBusy(t *testing.T) {
+	parent := shortTempDir(t)
+	root := filepath.Join(parent, "state")
+	cwd := shortTempDir(t)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repoPath := filepath.Join(root, admissionRepositoryFile)
+	repo, err := bboltrepo.NewRepository(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := bboltrepo.OpenReadOnly(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	socketPath := filepath.Join(root, protocol.SocketName)
+	if _, err := os.Lstat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("socket stat before launch = %v, want not exist", err)
+	}
+
+	start := time.Now()
+	_, err = daemonlaunch.Launch(context.Background(), servedLaunchOptions(t, root, cwd, "serve", ""))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Launch succeeded, want root busy startup failure")
+	}
+	if errors.Is(err, daemonlaunch.ErrExistingDaemonVerification) {
+		t.Fatalf("Launch error = %v, want root busy without existing-daemon verification", err)
+	}
+	var startup *daemonlaunch.StartupError
+	if !errors.As(err, &startup) || !errors.Is(startup, daemonlaunch.ErrStartupFailed) {
+		t.Fatalf("Launch error = %T %v, want startup failure", err, err)
+	}
+	if startup.Code != daemonlaunch.CodeAdmissionRootBusy {
+		t.Fatalf("startup code = %q, want %q", startup.Code, daemonlaunch.CodeAdmissionRootBusy)
+	}
+	if !strings.Contains(startup.Message, ErrAdmissionRootBusy.Error()) {
+		t.Fatalf("startup message = %q, want root busy diagnostic", startup.Message)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Launch elapsed = %s, want quick root busy failure", elapsed)
+	}
+	if _, err := os.Lstat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("socket stat after launch = %v, want not exist", err)
+	}
+}
+
+func TestLaunchAdmissionLockWithDialableWinnerVerifiesExistingDaemon(t *testing.T) {
+	parent := shortTempDir(t)
+	root := filepath.Join(parent, "state")
+	cwd := shortTempDir(t)
+	ready := make(chan ServeReadyInfo, 1)
+	server, err := New(Config{
+		StateRoot:    root,
+		CWD:          cwd,
+		Backends:     []engine.Backend{newFakeBackend("fake")},
+		ProcessTable: mapProcessTable{entries: map[int]engine.ProcessInfo{os.Getpid(): {PID: os.Getpid(), StartTime: "daemon-start"}}},
+		IdleTimeout:  -1,
+		ReadyHook: func(info ServeReadyInfo) error {
+			ready <- info
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configureServedLaunchAdmission(server)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ctx)
+	}()
+
+	var info ServeReadyInfo
+	select {
+	case info = <-ready:
+	case err := <-done:
+		cancel()
+		if launchRaceSocketDenied(err) {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatalf("winner server exited before ready: %v", err)
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for winner server readiness")
+	}
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("winner server exited with error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("winner server did not stop")
+		}
+	})
+	token := readServedLaunchToken(t, filepath.Join(root, protocol.TokenFileName))
+	helloServedLaunchDaemon(t, info.SocketPath, token)
+
+	result, err := daemonlaunch.Launch(context.Background(), servedLaunchOptions(t, root, cwd, "serve", ""))
+	if err != nil {
+		if launchRaceSocketDenied(err) {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatalf("Launch with dialable winner error: %v", err)
+	}
+	if !result.ExistingDaemon || result.PID != 0 {
+		t.Fatalf("result = %+v, want verified existing daemon", result)
+	}
+}
+
 func runServedLaunchHelper() int {
 	root := os.Getenv("AGENTBUS_STATE_ROOT")
 	cwd := os.Getenv(servedLaunchHelperCWDEnv)
@@ -246,6 +364,8 @@ func startupFailureCodeForServedLaunch(err error) string {
 	switch {
 	case errors.Is(err, ErrDaemonAlreadyListening):
 		return daemonlaunch.CodeAlreadyListening
+	case errors.Is(err, ErrAdmissionRootBusy):
+		return daemonlaunch.CodeAdmissionRootBusy
 	case errors.Is(err, ErrAdmissionStrictSupportUnavailable):
 		return ErrAdmissionStrictSupportUnavailable.Error()
 	default:

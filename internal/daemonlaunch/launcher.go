@@ -27,6 +27,7 @@ const (
 	DefaultTimeout            = 10 * time.Second
 	DefaultStderrTailBytes    = 64 * 1024
 	CodeAlreadyListening      = "agentbus daemon already listening"
+	CodeAdmissionRootBusy     = "agentbus admission root busy"
 	readinessFDChildNumber    = 3
 	existingVerifyRetryPeriod = 50 * time.Millisecond
 	failedExitGrace           = 500 * time.Millisecond

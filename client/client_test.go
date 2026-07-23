@@ -580,8 +580,16 @@ func TestConnectAutostartSurfacesLauncherFailureOnce(t *testing.T) {
 	if got := starts.Load(); got != 1 {
 		t.Fatalf("starter calls = %d, want 1", got)
 	}
-	if _, err := os.Stat(filepath.Join(root, "agentbus.pid")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("pid file stat error = %v, want not exist", err)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Fatalf("state root entries after unsupported autostart = %v, want empty root", names)
 	}
 }
 

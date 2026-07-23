@@ -36,6 +36,8 @@ const (
 	defaultLeaseDuration = 5 * time.Minute
 	defaultHeartbeat     = 30 * time.Second
 	defaultSafetyDrain   = 30 * time.Second
+
+	admissionAlreadyListeningCorroborationTimeout = time.Second
 )
 
 const duplicateAuthorityJSONWarning = "duplicate-job-id: authority record also has legacy JSON record; authority selected"
@@ -55,6 +57,65 @@ func (e DaemonAlreadyListeningError) Error() string {
 
 func (e DaemonAlreadyListeningError) Is(target error) bool {
 	return target == ErrDaemonAlreadyListening
+}
+
+var ErrAdmissionRootBusy = errors.New("agentbus admission root busy")
+
+type AdmissionRootBusyError struct {
+	Path       string
+	SocketPath string
+	Cause      error
+}
+
+func (e AdmissionRootBusyError) Error() string {
+	message := ErrAdmissionRootBusy.Error()
+	if e.Path != "" {
+		message = fmt.Sprintf("%s: %s", message, e.Path)
+	}
+	if e.SocketPath != "" {
+		message = fmt.Sprintf("%s; no listening daemon at %s", message, e.SocketPath)
+	}
+	return message
+}
+
+func (e AdmissionRootBusyError) Is(target error) bool {
+	return target == ErrAdmissionRootBusy
+}
+
+func (e AdmissionRootBusyError) Unwrap() error {
+	return e.Cause
+}
+
+func admissionAlreadyListeningCorroborated(ctx context.Context, socketPath string) bool {
+	if strings.TrimSpace(socketPath) == "" {
+		return false
+	}
+	deadline := time.Now().Add(admissionAlreadyListeningCorroborationTimeout)
+	for {
+		if admissionSocketDialable(socketPath) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func admissionSocketDialable(socketPath string) bool {
+	if _, err := os.Lstat(socketPath); err != nil {
+		return false
+	}
+	conn, err := net.DialTimeout("unix", socketPath, 100*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // BinaryIdentity identifies the on-disk daemon executable by metadata that

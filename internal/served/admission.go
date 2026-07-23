@@ -932,10 +932,14 @@ func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootst
 	if err := ctx.Err(); err != nil {
 		return nil, nil, nil, err
 	}
-	repo, err := bboltrepo.Open(filepath.Join(s.stateRoot, admissionRepositoryFile), &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
+	repoPath := filepath.Join(s.stateRoot, admissionRepositoryFile)
+	repo, err := bboltrepo.Open(repoPath, &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
 	if err != nil {
 		if errors.Is(err, bolt.ErrTimeout) {
-			return nil, nil, nil, DaemonAlreadyListeningError{SocketPath: s.socketPath}
+			if admissionAlreadyListeningCorroborated(ctx, s.socketPath) {
+				return nil, nil, nil, DaemonAlreadyListeningError{SocketPath: s.socketPath}
+			}
+			return nil, nil, nil, AdmissionRootBusyError{Path: repoPath, SocketPath: s.socketPath, Cause: err}
 		}
 		return nil, nil, nil, err
 	}

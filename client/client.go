@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -265,7 +267,7 @@ func (c *Client) autostart(ctx context.Context) error {
 	autoCtx, cancel := context.WithTimeout(ctx, c.startTimeout())
 	defer cancel()
 
-	unlock, err := c.lockExistingStateRoot(autoCtx)
+	unlock, err := c.lockAutostartStateRoot(autoCtx)
 	if err != nil {
 		return err
 	}
@@ -341,18 +343,15 @@ func (c *Client) startTimeout() time.Duration {
 	return defaultStartTimeout
 }
 
-func (c *Client) lockExistingStateRoot(ctx context.Context) (func(), error) {
-	info, err := os.Stat(c.stateRoot)
+func (c *Client) lockAutostartStateRoot(ctx context.Context) (func(), error) {
+	canonicalRoot, err := canonicalStateRootForAutostartLock(c.stateRoot)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return func() {}, nil
-		}
 		return nil, err
 	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("agentbus state root %q is not a directory", c.stateRoot)
+	lockPath, err := autostartLockPath(canonicalRoot)
+	if err != nil {
+		return nil, err
 	}
-	lockPath := filepath.Join(c.stateRoot, "agentbus.start.lock")
 	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -379,6 +378,54 @@ func (c *Client) lockExistingStateRoot(ctx context.Context) (func(), error) {
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+}
+
+func canonicalStateRootForAutostartLock(root string) (string, error) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	canonical, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return canonical, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	return canonicalMissingAutostartLockPath(abs)
+}
+
+func canonicalMissingAutostartLockPath(abs string) (string, error) {
+	current := filepath.Clean(abs)
+	var missing []string
+	for {
+		canonical, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			parts := append([]string{canonical}, missing...)
+			return filepath.Join(parts...), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		missing = append([]string{filepath.Base(current)}, missing...)
+		current = parent
+	}
+}
+
+func autostartLockPath(canonicalRoot string) (string, error) {
+	sum := sha256.Sum256([]byte(canonicalRoot))
+	lockDir := filepath.Join(os.TempDir(), fmt.Sprintf("agentbus-start-locks-%d", os.Getuid()))
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(lockDir, 0o700); err != nil {
+		return "", err
+	}
+	return filepath.Join(lockDir, "start-"+hex.EncodeToString(sum[:])+".lock"), nil
 }
 
 func remainingTimeout(ctx context.Context) time.Duration {
