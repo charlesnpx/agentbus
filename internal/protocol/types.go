@@ -115,7 +115,8 @@ type ErrorObject struct {
 	Data    ErrorData `json:"data"`
 }
 
-// ErrorData carries the stable protocol v1 error identifier and optional context.
+// ErrorData carries the stable protocol error identifier and optional context.
+// AdmissionCause carries ADR-12 strict rejection causes.
 type ErrorData struct {
 	Code                  string                        `json:"code"`
 	SessionID             string                        `json:"sessionId,omitempty"`

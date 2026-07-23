@@ -15,9 +15,12 @@ listing means `job.status {all:true}`; there is no separate list method.
 E1 removes `session.start`, `session.resume`, `session.list`, `turn.start`, `turn.interrupt`,
 `turn.event`, `turn.result`, and unidentified `job.submit`.
 
-There is no protocol-v1 compatibility layer. A v1 handshake receives a deterministic version
-mismatch. Removed methods receive method-not-found. No request or response is translated, migrated,
-or accepted through a v1 compatibility path.
+There is no protocol-v1 compatibility layer. A v1 hello (`protocolVersion` mismatch) receives a
+typed version-mismatch error with stable `error.data.code = "protocol_version_mismatch"`. Removed
+or unknown methods return JSON-RPC `error.code = -32601` and stable
+`error.data.code = "method_not_found"`. The v2 client rejects a hello result whose
+`protocolVersion` differs from `protocol.Version` with a typed error. No request or response is
+translated, migrated, or accepted through a v1 compatibility path.
 
 ### Replay ordering
 
@@ -49,24 +52,24 @@ Opening an older schema is a typed incompatible-schema fatal error. Existing dat
 silently repaired during normal startup: no silent bucket creation, no silent index rebuild, and no
 normal-startup repair of missing records or indexes.
 
-Root existence classification is evaluated in this normative order: structural corruption checks,
-zero-length check, schema version check, bucket/index presence, anchor presence/match, then the
-remaining existence rows. The FIRST matching row classifies the typed error. Explicit reset-empty
-eligibility is decided only after classification, and is eligible only for the
-`present | missing anchor` row after proving the root empty. Each classified row has one
-unambiguous typed error.
+Root existence classification is evaluated in this normative order: existence checks, zero-length
+check, structural corruption check, schema version check, bucket/index presence, anchor
+presence/match, then the remaining existence rows. Structural corruption applies only to an existing
+non-zero-length file. The FIRST matching row classifies the typed error. Explicit reset-empty
+eligibility is decided only after classification, and is eligible only for the `present | missing
+anchor` row after proving the root empty. Each classified row has one unambiguous typed error.
 
 | DB | Anchor | Result |
 | --- | --- | --- |
 | missing | missing | fresh creation only through an explicit create path |
-| valid | matching | open, audit, verify identity |
 | missing | present | fatal; never recreate |
 | zero-length | any | fatal; never initialize implicitly |
-| present | missing | fatal by default; explicit reset-empty may repair after proving root empty |
-| present | mismatched | fatal |
+| structurally corrupt | any | fatal before socket bind; file untouched |
 | old schema | any | typed incompatible-schema fatal |
 | missing buckets/index | any | fatal; no normal-startup repair |
-| structurally corrupt | any | fatal before socket bind; file untouched |
+| present | missing | fatal by default; explicit reset-empty may repair after proving root empty |
+| present | mismatched | fatal |
+| valid | matching | open, audit, verify identity |
 
 Unsupported-platform first serve is NON-MUTATING. The support probe runs before creating the DB,
 anchor, token, socket, or PID file. A failed support probe leaves nothing behind.
@@ -95,7 +98,16 @@ corruption. Projection-only corruption retains the existing quarantine and recon
 
 ### Stable rejection causes
 
-Strict rejection error payloads carry stable machine-readable cause strings.
+Strict rejection error payloads carry stable machine-readable cause strings in
+`error.data.admissionCause`. `error.data.code` remains the stable protocol error identifier, such as
+`invalid_task_spec` or `capability_missing`; it is NOT replaced by the cause. Clients classify
+admission rejections by `error.data.admissionCause` first, falling back to `error.data.code`.
+
+When multiple causes apply, exactly ONE cause is emitted, chosen by this normative order
+(fail-stop/root states before request states): `root_corrupt` > `root_identity_mismatch` >
+`root_fail_stopped` > `root_sealed` > `admission_closing` > `unavailable_native_runtime` >
+`missing_identity` > `request_fingerprint_unsupported` > `replay_conflict` > `request_expired` >
+`unsupported_backend` > `unfenceable_backend` > `invalid_strict_config`.
 
 This ADR amends ADR-0: the cause formerly named request_conflict is normatively replay_conflict.
 

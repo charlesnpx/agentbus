@@ -54,9 +54,9 @@ func recordAutostartDetachDaemonError(err error) {
 }
 
 func TestClientHelloParsesBackendMetadata(t *testing.T) {
-	hello := runClientHello(t, `{"protocolVersion":1,"backends":["codex"],"backendMetadata":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}],"capabilities":{"models.discovery":true}}`)
+	hello := runClientHello(t, `{"protocolVersion":2,"backends":["codex"],"backendMetadata":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}],"capabilities":{"models.discovery":true}}`)
 
-	if hello.ProtocolVersion != 1 || len(hello.Backends) != 1 || hello.Backends[0] != "codex" || !hello.Capabilities["models.discovery"] {
+	if hello.ProtocolVersion != protocol.Version || len(hello.Backends) != 1 || hello.Backends[0] != "codex" || !hello.Capabilities["models.discovery"] {
 		t.Fatalf("hello = %+v", hello)
 	}
 	if len(hello.BackendMetadata) != 1 {
@@ -68,10 +68,10 @@ func TestClientHelloParsesBackendMetadata(t *testing.T) {
 	}
 }
 
-func TestClientHelloParsesOldServerWithoutBackendMetadata(t *testing.T) {
-	hello := runClientHello(t, `{"protocolVersion":1,"backends":["codex"],"capabilities":{"models.discovery":false}}`)
+func TestClientHelloParsesCapabilitiesWithoutBackendMetadata(t *testing.T) {
+	hello := runClientHello(t, `{"protocolVersion":2,"backends":["codex"],"capabilities":{"models.discovery":false}}`)
 
-	if hello.ProtocolVersion != 1 || len(hello.Backends) != 1 || hello.Backends[0] != "codex" {
+	if hello.ProtocolVersion != protocol.Version || len(hello.Backends) != 1 || hello.Backends[0] != "codex" || hello.Capabilities["models.discovery"] {
 		t.Fatalf("hello = %+v", hello)
 	}
 	if hello.BackendMetadata != nil {
