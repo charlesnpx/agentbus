@@ -768,7 +768,7 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 |---|---|---|
 | E0 | Contract freeze: ADR-12, protocol.Version=2, storage schema v2, stable rejection causes, root-existence matrix, normative ADR-0B replay ordering, shutdown contract, result semantics (derived from authority terminal record, no public proof) | CLOSED 64031ca |
 | E1 | Delete foreground surface + unidentified submit + --admission plumbing; reimplement handleIdentifiedJobSubmit per E0 replay ordering (LookupReplay before backend/filesystem validation, recorded fingerprint version); negative + replay test battery; architecture guard: no path reaches session.Turn outside an authority launch | PENDING |
-| E2A | Shared daemon launcher: readiness pipe (ready{protocolVersion,pid,canonicalStateRoot,socketPath} / failed{code,message}), PID-after-ready, Setsid, kill+reap on parent failure, stderr preserved to handshake, concurrent-start winner verification | PENDING |
+| E2A | Shared daemon launcher: readiness pipe (ready{protocolVersion,pid,canonicalStateRoot,socketPath} / failed{code,message}), PID-after-ready, Setsid, kill+reap on parent failure, stderr preserved to handshake, concurrent-start winner verification | CLOSED c69c83c |
 | E2B | Autostart: typed diagnostic on unsupported host, restart-after-exit restores service, race convergence; `admission recover` gets a dedicated strict-native recovery constructor; compiled-CLI recovery in Docker gate | PENDING |
 | E3 | Authority-only RPC handlers (no JSON merge/fallback); CLI status/result/cancel/list become protocol clients; delete `sessions` cmd; stable exit codes; compiled-binary E2E across restart+recovery | PENDING |
 | E4 | Graceful shutdown: signal.NotifyContext (daemon serving only) + Shutdown(ctx) reusing existing durable cancellation; successful graceful shutdown ⇒ no live custody, no recovery obligation; forced-timeout path remains recoverable fail-closed | PENDING |
@@ -791,6 +791,17 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 10. CI: no strict lane, race excludes client/+cmd/, gate scripts unversioned; tip red = GitHub Actions BILLING block (jobs die ~4s pre-step), not code.
 
 ## AB-E Log
+- 2026-07-23: E2A CLOSED at c69c83c (SHIP, zero blocking). Arc: worker 716a1eb (+resume: linux/arm64
+  Dup2 break caught by Docker gate; AGENTBUS_READY_FD stripped from worker/monitor envs) -> review1
+  FIX(4H+1M) -> fix1 8cab55b (+resume: loser blocked on bbolt lock pre-bind -> typed already-listening;
+  probe-first non-mutating startup) -> review2 FIX(H2 residual in-root start lock + M bbolt blanket
+  mapping) -> fix2 aedcc1b (+resume: lock relocated to tmp... then) -> review3 FIX(1H tmp TOCTOU + 3M)
+  -> fix3 493fb16 (user-cache namespace, dev:ino key, deadline-long convergence, root-busy code) ->
+  review4 FIX(2H: STARTUP DEADLINE BECAME DAEMON LIFETIME — every launched daemon exited ~9.75s
+  post-ready — and lock-dir fd-trust gap) -> fix4 c69c83c (+resume: Linux real-binary
+  survive-past-deadline test; bootstrap/service context split; Openat fd-relative locks; 2s
+  foreground bound) -> review5 SHIP. Docker gate hardened to fail-closed exit aggregation (worst=N)
+  mid-unit after it passed a red run. Two load-flakes papercut-logged.
 - 2026-07-23: E1 CLOSED at 005a8ae (SHIP, zero blocking). Arc: worker 54d52e5 (+1 on-thread resume
   after orchestrator gates caught 5 real failures its receipt missed — masking test helper
   strictIdentifiedTestParams removed; 4th false receipt of campaign) -> review1 FIX(2H+2M+2L) ->
