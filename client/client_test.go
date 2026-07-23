@@ -149,6 +149,52 @@ func TestConnectProtocolVersionMismatchDoesNotAutostart(t *testing.T) {
 	}
 }
 
+func TestConnectBadTokenDoesNotAutostart(t *testing.T) {
+	t.Parallel()
+	root := shortClientTempDir(t)
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	done, err := startClientTestDaemon(serverCtx, root, "server-token")
+	if err != nil {
+		if strings.Contains(err.Error(), "bind: operation not permitted") {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cancelServer()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("server exited with error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("server did not stop")
+		}
+	})
+
+	var starts atomic.Int64
+	starter := StartFunc(func(context.Context, StartOptions) (int, error) {
+		starts.Add(1)
+		return 0, errors.New("starter should not be invoked for bad token")
+	})
+	client, err := Connect(context.Background(), Options{
+		StateRoot:    root,
+		Token:        "client-token",
+		StartTimeout: 100 * time.Millisecond,
+		Starter:      starter,
+	})
+	if client != nil {
+		_ = client.Close()
+	}
+	var rpcErr *protocol.RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Object.Data.Code != protocol.ErrorUnauthorized {
+		t.Fatalf("Connect error = %v, want unauthorized RPC error", err)
+	}
+	if got := starts.Load(); got != 0 {
+		t.Fatalf("starter calls = %d, want 0", got)
+	}
+}
+
 func runClientHello(t *testing.T, result string) HelloResult {
 	t.Helper()
 	hello, err := runClientHelloResult(t, result)
@@ -259,6 +305,126 @@ func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 	if got := starts.Load(); got != 1 {
 		t.Fatalf("starts = %d, want 1", got)
 	}
+}
+
+func TestConnectHelloEOFAutostartsReplacement(t *testing.T) {
+	t.Parallel()
+	testConnectHelloTransportFailureAutostartsReplacement(t, "eof-token", nil)
+}
+
+func TestConnectHelloGarbageAutostartsReplacement(t *testing.T) {
+	t.Parallel()
+	testConnectHelloTransportFailureAutostartsReplacement(t, "garbage-token", func(conn net.Conn) error {
+		_, err := conn.Write([]byte("not json\n"))
+		return err
+	})
+}
+
+func testConnectHelloTransportFailureAutostartsReplacement(t *testing.T, token string, write func(net.Conn) error) {
+	t.Helper()
+	root := shortClientTempDir(t)
+	socketPath := filepath.Join(root, protocol.SocketName)
+	startHelloTransportFailureDaemon(t, socketPath, write)
+
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	var starts atomic.Int64
+	var serverStarted atomic.Bool
+	starter := StartFunc(func(ctx context.Context, opts StartOptions) (int, error) {
+		starts.Add(1)
+		done, err := startClientTestDaemon(serverCtx, root, token)
+		if err != nil {
+			return 0, err
+		}
+		serverStarted.Store(true)
+		go func() { serverDone <- <-done }()
+		if err := ctx.Err(); err != nil {
+			return 0, ctx.Err()
+		}
+		return os.Getpid(), nil
+	})
+	t.Cleanup(func() {
+		cancelServer()
+		if !serverStarted.Load() {
+			return
+		}
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Errorf("autostarted server exited with error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("autostarted server did not stop")
+		}
+	})
+
+	client, err := Connect(context.Background(), Options{
+		StateRoot:    root,
+		Token:        token,
+		StartTimeout: 2 * time.Second,
+		Starter:      starter,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "bind: operation not permitted") {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("starts = %d, want 1", got)
+	}
+	if client.HelloResult().ProtocolVersion != protocol.Version {
+		t.Fatalf("hello = %+v", client.HelloResult())
+	}
+}
+
+func startHelloTransportFailureDaemon(t *testing.T, socketPath string, write func(net.Conn) error) {
+	t.Helper()
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		if strings.Contains(err.Error(), "bind: operation not permitted") {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatal(err)
+	}
+	unixListener, ok := listener.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("listener type = %T, want *net.UnixListener", listener)
+	}
+	unixListener.SetUnlinkOnClose(false)
+	done := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				done <- nil
+				return
+			}
+			done <- err
+			return
+		}
+		_ = listener.Close()
+		if write != nil {
+			if err := write(conn); err != nil {
+				_ = conn.Close()
+				done <- err
+				return
+			}
+		}
+		done <- conn.Close()
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("hello failure daemon exited with error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("hello failure daemon did not stop")
+		}
+	})
 }
 
 func TestAutostartReplacesRefusedSocket(t *testing.T) {

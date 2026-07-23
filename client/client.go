@@ -177,14 +177,18 @@ func clientHello(ctx context.Context, conn net.Conn, reader *bufio.Reader, token
 		Params:  mustMarshal(protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: token}),
 	}
 	if err := writeDeadline(ctx, conn, req); err != nil {
-		return HelloResult{}, err
+		return HelloResult{}, &helloTransportError{err: err}
 	}
 	line, err := readLineContext(ctx, conn, reader)
 	if err != nil {
-		return HelloResult{}, err
+		return HelloResult{}, &helloTransportError{err: err}
 	}
 	var resp protocol.Response
 	if err := json.Unmarshal(bytes.TrimSpace(line), &resp); err != nil {
+		var syntaxErr *json.SyntaxError
+		if errors.As(err, &syntaxErr) {
+			return HelloResult{}, &helloTransportError{err: err}
+		}
 		return HelloResult{}, err
 	}
 	if resp.Error != nil {
@@ -479,6 +483,10 @@ func (c *Client) reconnect(ctx context.Context) error {
 }
 
 func autostartableConnectError(err error) bool {
+	var helloErr *helloTransportError
+	if errors.As(err, &helloErr) {
+		return true
+	}
 	var dialErr *dialConnectError
 	if !errors.As(err, &dialErr) || dialErr.err == nil {
 		return false
@@ -490,6 +498,24 @@ func autostartableConnectError(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(dialErr.err, &netErr) && netErr.Timeout()
+}
+
+type helloTransportError struct {
+	err error
+}
+
+func (e *helloTransportError) Error() string {
+	if e == nil || e.err == nil {
+		return "hello transport failed"
+	}
+	return e.err.Error()
+}
+
+func (e *helloTransportError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
 }
 
 type dialConnectError struct {
