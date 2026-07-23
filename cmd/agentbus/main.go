@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
@@ -18,6 +20,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/internal/agentbusserve"
+	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -46,6 +49,7 @@ type app struct {
 	registry       *engine.PolicyRegistry
 	processes      engine.ProcessTable
 	clock          engine.Clock
+	daemonLauncher func(context.Context, daemonlaunch.Options) (daemonlaunch.Result, error)
 }
 
 func main() {
@@ -381,35 +385,80 @@ func (a *app) startBackgroundDaemon(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	cmdArgs := []string{"serve", "--foreground"}
-	cmd := exec.CommandContext(ctx, exe, cmdArgs...)
-	cmd.Env = os.Environ()
-	if a.stateRoot != "" {
-		cmd.Env = append(cmd.Env, "AGENTBUS_STATE_ROOT="+a.stateRoot)
+	launcher := daemonlaunch.Launch
+	if a.daemonLauncher != nil {
+		launcher = a.daemonLauncher
 	}
-	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	result, err := launcher(ctx, daemonlaunch.Options{
+		CommandPath: exe,
+		Args:        []string{"serve", "--foreground"},
+		StateRoot:   a.stateRoot,
+		Timeout:     daemonlaunch.DefaultTimeout,
+		Starter:     startDaemonProcess,
+	})
 	if err != nil {
 		return err
 	}
-	defer devNull.Close()
-	cmd.Stdin = devNull
-	cmd.Stdout = devNull
-	cmd.Stderr = devNull
-	if err := cmd.Start(); err != nil {
-		return err
+	if result.ExistingDaemon {
+		return nil
 	}
-	root := a.stateRoot
+	if result.PID <= 0 {
+		killErr := result.KillAndWait()
+		return errors.Join(fmt.Errorf("daemon launcher returned invalid pid %d", result.PID), killErr)
+	}
+	root := result.CanonicalStateRoot
+	if root == "" {
+		root = a.stateRoot
+	}
 	if root == "" {
 		root, err = engine.ResolveStateRoot()
 		if err != nil {
-			return err
+			killErr := result.KillAndWait()
+			return errors.Join(err, killErr)
 		}
 	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return err
-	}
 	pidPath := filepath.Join(root, "agentbus.pid")
-	return atomicWriteFile(pidPath, []byte(fmt.Sprintf("%d\n", cmd.Process.Pid)), 0o600)
+	if err := atomicWriteFile(pidPath, []byte(fmt.Sprintf("%d\n", result.PID)), 0o600); err != nil {
+		removeErr := os.Remove(pidPath)
+		if errors.Is(removeErr, os.ErrNotExist) {
+			removeErr = nil
+		}
+		killErr := result.KillAndWait()
+		return errors.Join(err, removeErr, killErr)
+	}
+	return nil
+}
+
+type daemonProcess struct {
+	cmd *exec.Cmd
+}
+
+func startDaemonProcess(config daemonlaunch.ProcessConfig) (daemonlaunch.Process, error) {
+	cmd := exec.Command(config.CommandPath, config.Args...)
+	cmd.Env = config.Env
+	cmd.ExtraFiles = config.ExtraFiles
+	cmd.Stdin = config.Stdin
+	cmd.Stdout = config.Stdout
+	cmd.Stderr = config.Stderr
+	if config.Setsid {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return daemonProcess{cmd: cmd}, nil
+}
+
+func (process daemonProcess) PID() int {
+	return process.cmd.Process.Pid
+}
+
+func (process daemonProcess) Kill() error {
+	return process.cmd.Process.Kill()
+}
+
+func (process daemonProcess) Wait() error {
+	return process.cmd.Wait()
 }
 
 func atomicWriteFile(path string, data []byte, mode os.FileMode) error {

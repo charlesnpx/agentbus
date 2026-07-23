@@ -18,15 +18,35 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("AGENTBUS_AUTOSTART_FAILURE_HELPER") == "1" &&
+		len(os.Args) == 3 && os.Args[1] == "serve" && os.Args[2] == "--foreground" {
+		os.Exit(runAutostartFailureDaemon())
+	}
 	if os.Getenv("AGENTBUS_AUTOSTART_DETACH_HELPER") == "1" &&
 		len(os.Args) == 3 && os.Args[1] == "serve" && os.Args[2] == "--foreground" {
 		os.Exit(runAutostartDetachDaemon())
 	}
 	os.Exit(m.Run())
+}
+
+func runAutostartFailureDaemon() int {
+	_, _ = os.Stderr.WriteString("autostart helper startup stderr\n")
+	reporter, hasReporter, err := daemonlaunch.InheritedReporterFromEnv()
+	if err != nil {
+		_, _ = os.Stderr.WriteString(err.Error() + "\n")
+		return 2
+	}
+	if !hasReporter {
+		_, _ = os.Stderr.WriteString("missing readiness reporter\n")
+		return 2
+	}
+	_ = reporter.Failed("strict admission support unavailable", "strict diagnostic from autostart helper")
+	return 1
 }
 
 func runAutostartDetachDaemon() int {
@@ -37,6 +57,22 @@ func runAutostartDetachDaemon() int {
 	if _, err := startClientTestDaemon(context.Background(), root, os.Getenv("AGENTBUS_AUTOSTART_DETACH_TOKEN")); err != nil {
 		recordAutostartDetachDaemonError(err)
 		return 1
+	}
+	reporter, hasReporter, err := daemonlaunch.InheritedReporterFromEnv()
+	if err != nil {
+		recordAutostartDetachDaemonError(err)
+		return 1
+	}
+	if hasReporter {
+		canonicalRoot, err := daemonlaunch.CanonicalStateRoot(root)
+		if err != nil {
+			recordAutostartDetachDaemonError(err)
+			return 1
+		}
+		if err := reporter.Ready(canonicalRoot, filepath.Join(root, protocol.SocketName)); err != nil {
+			recordAutostartDetachDaemonError(err)
+			return 1
+		}
 	}
 	select {}
 }
@@ -125,9 +161,9 @@ func TestConnectProtocolVersionMismatchDoesNotAutostart(t *testing.T) {
 	}()
 
 	var starts atomic.Int64
-	starter := StartFunc(func(context.Context, StartOptions) (int, error) {
+	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
 		starts.Add(1)
-		return 0, errors.New("starter should not be invoked for protocol mismatch")
+		return StartResult{}, errors.New("starter should not be invoked for protocol mismatch")
 	})
 	client, err := Connect(context.Background(), Options{
 		StateRoot:    root,
@@ -173,9 +209,9 @@ func TestConnectBadTokenDoesNotAutostart(t *testing.T) {
 	})
 
 	var starts atomic.Int64
-	starter := StartFunc(func(context.Context, StartOptions) (int, error) {
+	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
 		starts.Add(1)
-		return 0, errors.New("starter should not be invoked for bad token")
+		return StartResult{}, errors.New("starter should not be invoked for bad token")
 	})
 	client, err := Connect(context.Background(), Options{
 		StateRoot:    root,
@@ -253,16 +289,16 @@ func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	defer cancelServer()
 	var starts atomic.Int64
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (int, error) {
+	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
 		starts.Add(1)
 		_, err := startClientTestDaemon(serverCtx, root, "race-token")
 		if err != nil {
-			return 0, err
+			return StartResult{}, err
 		}
 		if err := ctx.Err(); err != nil {
-			return 0, ctx.Err()
+			return StartResult{}, ctx.Err()
 		}
-		return os.Getpid(), nil
+		return StartResult{PID: os.Getpid()}, nil
 	})
 
 	opts := Options{
@@ -330,18 +366,18 @@ func testConnectHelloTransportFailureAutostartsReplacement(t *testing.T, token s
 	serverDone := make(chan error, 1)
 	var starts atomic.Int64
 	var serverStarted atomic.Bool
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (int, error) {
+	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
 		starts.Add(1)
 		done, err := startClientTestDaemon(serverCtx, root, token)
 		if err != nil {
-			return 0, err
+			return StartResult{}, err
 		}
 		serverStarted.Store(true)
 		go func() { serverDone <- <-done }()
 		if err := ctx.Err(); err != nil {
-			return 0, ctx.Err()
+			return StartResult{}, ctx.Err()
 		}
-		return os.Getpid(), nil
+		return StartResult{PID: os.Getpid()}, nil
 	})
 	t.Cleanup(func() {
 		cancelServer()
@@ -470,17 +506,17 @@ func TestAutostartReplacesRefusedSocket(t *testing.T) {
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
 	var starts atomic.Int64
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (int, error) {
+	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
 		starts.Add(1)
 		done, err := startClientTestDaemon(serverCtx, root, "refused-token")
 		if err != nil {
-			return 0, err
+			return StartResult{}, err
 		}
 		go func() { serverDone <- <-done }()
 		if err := ctx.Err(); err != nil {
-			return 0, ctx.Err()
+			return StartResult{}, ctx.Err()
 		}
-		return os.Getpid(), nil
+		return StartResult{PID: os.Getpid()}, nil
 	})
 	t.Cleanup(func() {
 		cancelServer()
@@ -509,38 +545,80 @@ func TestAutostartReplacesRefusedSocket(t *testing.T) {
 	}
 }
 
+func TestConnectAutostartSurfacesLauncherFailureOnce(t *testing.T) {
+	root := shortClientTempDir(t)
+	bin, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTBUS_AUTOSTART_FAILURE_HELPER", "1")
+
+	var starts atomic.Int64
+	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
+		starts.Add(1)
+		return (defaultStarter{}).StartDaemon(ctx, opts)
+	})
+	client, err := Connect(context.Background(), Options{
+		StateRoot:    root,
+		Token:        "token",
+		CommandPath:  bin,
+		StartTimeout: 2 * time.Second,
+		Starter:      starter,
+	})
+	if client != nil {
+		_ = client.Close()
+	}
+	var startup *daemonlaunch.StartupError
+	if !errors.As(err, &startup) || !errors.Is(err, daemonlaunch.ErrStartupFailed) {
+		t.Fatalf("Connect error = %T %v, want daemon launch startup failure", err, err)
+	}
+	if startup.Code != "strict admission support unavailable" ||
+		!strings.Contains(startup.Message, "strict diagnostic from autostart helper") ||
+		!strings.Contains(startup.StderrTail, "autostart helper startup stderr") {
+		t.Fatalf("startup error = %+v, want typed diagnostic and stderr", startup)
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("starter calls = %d, want 1", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "agentbus.pid")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pid file stat error = %v, want not exist", err)
+	}
+}
+
 func TestDefaultStarterDoesNotCancelDaemonAfterStartupContextEnds(t *testing.T) {
-	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix process signaling test")
 	}
 	dir := shortClientTempDir(t)
-	bin := filepath.Join(dir, "agentbus")
-	script := "#!/bin/sh\nwhile :; do sleep 1; done\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+	bin, err := filepath.Abs(os.Args[0])
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("AGENTBUS_AUTOSTART_DETACH_HELPER", "1")
+	t.Setenv("AGENTBUS_AUTOSTART_DETACH_ROOT", dir)
+	t.Setenv("AGENTBUS_AUTOSTART_DETACH_TOKEN", "default-starter-token")
+	errorPath := filepath.Join(dir, "default-starter-helper-error")
+	t.Setenv("AGENTBUS_AUTOSTART_DETACH_ERROR_PATH", errorPath)
 	ctx, cancel := context.WithCancel(context.Background())
-	pid, err := (defaultStarter{}).StartDaemon(ctx, StartOptions{
+	started, err := (defaultStarter{}).StartDaemon(ctx, StartOptions{
 		StateRoot:   dir,
 		SocketPath:  filepath.Join(dir, "agentbus.sock"),
 		TokenPath:   filepath.Join(dir, "token"),
 		CommandPath: bin,
 	})
 	if err != nil {
+		if helperErr, readErr := os.ReadFile(errorPath); readErr == nil {
+			if strings.Contains(string(helperErr), "operation not permitted") {
+				t.Skipf("Unix socket bind denied by sandbox: %s", helperErr)
+			}
+			t.Fatalf("%v; helper error: %s", err, helperErr)
+		}
 		t.Fatal(err)
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = proc.Kill()
-		_, _ = proc.Wait()
-	})
+	t.Cleanup(func() { _ = started.KillAndWait() })
 	cancel()
 	time.Sleep(100 * time.Millisecond)
-	if err := syscall.Kill(pid, 0); err != nil {
+	if err := syscall.Kill(started.PID, 0); err != nil {
 		t.Fatalf("autostarted daemon exited after startup context cancel: %v", err)
 	}
 }

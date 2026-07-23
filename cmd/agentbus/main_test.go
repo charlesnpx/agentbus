@@ -13,6 +13,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -79,6 +80,52 @@ func TestVersionAndServeCommands(t *testing.T) {
 	code, _, stderr = runTestCLI(t, a, []string{"serve", "--foreground", removedServeFlag + "=strict"}, "")
 	if code == 0 || !strings.Contains(stderr, "flag provided but not defined") {
 		t.Fatalf("removed admission flag exit=%d stderr=%s", code, stderr)
+	}
+}
+
+func TestStartBackgroundDaemonWritesPIDAfterLauncherReady(t *testing.T) {
+	a := testApp(t)
+	launched := make(chan struct{})
+	releaseReady := make(chan struct{})
+	a.daemonLauncher = func(ctx context.Context, opts daemonlaunch.Options) (daemonlaunch.Result, error) {
+		if opts.StateRoot != a.stateRoot {
+			t.Errorf("launcher state root = %q, want %q", opts.StateRoot, a.stateRoot)
+		}
+		close(launched)
+		select {
+		case <-releaseReady:
+		case <-ctx.Done():
+			return daemonlaunch.Result{}, ctx.Err()
+		}
+		return daemonlaunch.Result{PID: 4242, CanonicalStateRoot: a.stateRoot}, nil
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- a.startBackgroundDaemon(context.Background()) }()
+	select {
+	case <-launched:
+	case <-time.After(time.Second):
+		t.Fatal("launcher was not invoked")
+	}
+	pidPath := filepath.Join(a.stateRoot, "agentbus.pid")
+	if _, err := os.Stat(pidPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pid file before readiness stat error = %v, want not exist", err)
+	}
+	close(releaseReady)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("startBackgroundDaemon did not return after readiness")
+	}
+	raw, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(raw)) != "4242" {
+		t.Fatalf("pid file = %q, want 4242", raw)
 	}
 }
 

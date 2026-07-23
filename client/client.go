@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -63,17 +64,32 @@ type StartOptions struct {
 	SocketPath  string
 	TokenPath   string
 	CommandPath string
+	Timeout     time.Duration
+}
+
+type StartResult struct {
+	PID            int
+	ExistingDaemon bool
+
+	killAndWait func() error
+}
+
+func (result StartResult) KillAndWait() error {
+	if result.killAndWait == nil {
+		return nil
+	}
+	return result.killAndWait()
 }
 
 // DaemonStarter starts an agentbus foreground daemon process.
 type DaemonStarter interface {
-	StartDaemon(context.Context, StartOptions) (int, error)
+	StartDaemon(context.Context, StartOptions) (StartResult, error)
 }
 
 // StartFunc adapts a function to DaemonStarter.
-type StartFunc func(context.Context, StartOptions) (int, error)
+type StartFunc func(context.Context, StartOptions) (StartResult, error)
 
-func (f StartFunc) StartDaemon(ctx context.Context, opts StartOptions) (int, error) {
+func (f StartFunc) StartDaemon(ctx context.Context, opts StartOptions) (StartResult, error) {
 	return f(ctx, opts)
 }
 
@@ -271,19 +287,38 @@ func (c *Client) autostart(ctx context.Context) error {
 	}
 	startCtx, cancel := context.WithTimeout(ctx, c.startTimeout())
 	defer cancel()
-	pid, err := starter.StartDaemon(startCtx, StartOptions{
+	started, err := starter.StartDaemon(startCtx, StartOptions{
 		StateRoot:   c.stateRoot,
 		SocketPath:  c.socketPath,
 		TokenPath:   c.tokenPath,
 		CommandPath: c.opts.CommandPath,
+		Timeout:     c.startTimeout(),
 	})
 	if err != nil {
 		return err
 	}
-	if pid > 0 {
-		if err := atomicWrite(filepath.Join(c.stateRoot, "agentbus.pid"), []byte(strconv.Itoa(pid)+"\n"), 0o600); err != nil {
-			return err
+	pidPath := filepath.Join(c.stateRoot, "agentbus.pid")
+	pidWritten := false
+	cleanupStarted := func(err error) error {
+		var cleanupErr error
+		if pidWritten {
+			if removeErr := os.Remove(pidPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				cleanupErr = errors.Join(cleanupErr, removeErr)
+			}
 		}
+		if started.ExistingDaemon || started.PID <= 0 {
+			return errors.Join(err, cleanupErr)
+		}
+		if killErr := started.KillAndWait(); killErr != nil {
+			cleanupErr = errors.Join(cleanupErr, killErr)
+		}
+		return errors.Join(err, cleanupErr)
+	}
+	if started.PID > 0 && !started.ExistingDaemon {
+		if err := atomicWrite(pidPath, []byte(strconv.Itoa(started.PID)+"\n"), 0o600); err != nil {
+			return cleanupStarted(err)
+		}
+		pidWritten = true
 	}
 	deadline := time.Now().Add(c.startTimeout())
 	var last error
@@ -291,20 +326,20 @@ func (c *Client) autostart(ctx context.Context) error {
 		if err := c.connect(ctx); err == nil {
 			return nil
 		} else if !autostartableConnectError(err) {
-			return err
+			return cleanupStarted(err)
 		} else {
 			last = err
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return cleanupStarted(ctx.Err())
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
 	if last == nil {
 		last = errors.New("daemon did not become ready")
 	}
-	return last
+	return cleanupStarted(last)
 }
 
 func (c *Client) startTimeout() time.Duration {
@@ -316,7 +351,7 @@ func (c *Client) startTimeout() time.Duration {
 
 type defaultStarter struct{}
 
-func (defaultStarter) StartDaemon(ctx context.Context, opts StartOptions) (int, error) {
+func (defaultStarter) StartDaemon(ctx context.Context, opts StartOptions) (StartResult, error) {
 	command := opts.CommandPath
 	if command == "" {
 		var err error
@@ -325,39 +360,60 @@ func (defaultStarter) StartDaemon(ctx context.Context, opts StartOptions) (int, 
 			if exe, exeErr := os.Executable(); exeErr == nil && filepath.Base(exe) == "agentbus" {
 				command = exe
 			} else {
-				return 0, fmt.Errorf("agentbus binary not found for autostart: %w", err)
+				return StartResult{}, fmt.Errorf("agentbus binary not found for autostart: %w", err)
 			}
 		}
 	}
 	select {
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return StartResult{}, ctx.Err()
 	default:
 	}
-	cmd := exec.Command(command, "serve", "--foreground")
-	// The client often runs under a process-group-scoped tool invocation. Give
-	// the daemon its own session so ending that invocation cannot terminate the
-	// daemon along with its launcher.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	cmd.Env = append(os.Environ(), "AGENTBUS_STATE_ROOT="+opts.StateRoot)
-	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	result, err := daemonlaunch.Launch(ctx, daemonlaunch.Options{
+		CommandPath: command,
+		Args:        []string{"serve", "--foreground"},
+		StateRoot:   opts.StateRoot,
+		SocketPath:  opts.SocketPath,
+		TokenPath:   opts.TokenPath,
+		Timeout:     opts.Timeout,
+		Starter:     startDaemonProcess,
+	})
 	if err != nil {
-		return 0, err
+		return StartResult{}, err
 	}
-	cmd.Stdin = devNull
-	cmd.Stdout = devNull
-	cmd.Stderr = devNull
+	return StartResult{PID: result.PID, ExistingDaemon: result.ExistingDaemon, killAndWait: result.KillAndWait}, nil
+}
+
+type daemonProcess struct {
+	cmd *exec.Cmd
+}
+
+func startDaemonProcess(config daemonlaunch.ProcessConfig) (daemonlaunch.Process, error) {
+	cmd := exec.Command(config.CommandPath, config.Args...)
+	cmd.Env = config.Env
+	cmd.ExtraFiles = config.ExtraFiles
+	cmd.Stdin = config.Stdin
+	cmd.Stdout = config.Stdout
+	cmd.Stderr = config.Stderr
+	if config.Setsid {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	}
 	if err := cmd.Start(); err != nil {
-		_ = devNull.Close()
-		return 0, err
+		return nil, err
 	}
-	_ = devNull.Close()
-	pid := cmd.Process.Pid
-	// Reap the daemon if it ever exits. Waiting asynchronously preserves
-	// autostart's non-blocking behavior while preventing a long-lived client
-	// process from retaining a zombie child.
-	go func() { _ = cmd.Wait() }()
-	return pid, nil
+	return daemonProcess{cmd: cmd}, nil
+}
+
+func (process daemonProcess) PID() int {
+	return process.cmd.Process.Pid
+}
+
+func (process daemonProcess) Kill() error {
+	return process.cmd.Process.Kill()
+}
+
+func (process daemonProcess) Wait() error {
+	return process.cmd.Wait()
 }
 
 func (c *Client) readLoop(conn net.Conn, reader *bufio.Reader) {

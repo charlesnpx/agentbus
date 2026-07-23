@@ -6,12 +6,15 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/internal/containment"
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
 )
+
+const daemonReadinessFDEnvName = "AGENTBUS_READY_FD"
 
 // StrictAdmissionOptions configures the production strict admission
 // composition. R7B can call StrictAdmissionConfig from the serve flag wiring;
@@ -60,10 +63,12 @@ func strictAdmissionNativeOptions(opts StrictAdmissionOptions) (custodian.Native
 	if workerEnv == nil {
 		workerEnv = os.Environ()
 	}
+	workerEnv = stripDaemonReadinessEnv(workerEnv)
 	monitorEnv := opts.MonitorEnv
 	if monitorEnv == nil {
 		monitorEnv = workerEnv
 	}
+	monitorEnv = stripDaemonReadinessEnv(monitorEnv)
 	workerDir := opts.WorkerDir
 	if workerDir == "" {
 		workerDir = filepath.Dir(agentbusPath)
@@ -95,6 +100,21 @@ func strictAdmissionNativeOptions(opts StrictAdmissionOptions) (custodian.Native
 		WorkerEnv:         append([]string(nil), workerEnv...),
 		WorkerDir:         workerDir,
 	}, nil
+}
+
+func stripDaemonReadinessEnv(env []string) []string {
+	if env == nil {
+		return nil
+	}
+	out := make([]string, 0, len(env))
+	for _, item := range env {
+		name, _, _ := strings.Cut(item, "=")
+		if name == daemonReadinessFDEnvName {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func DefaultStrictAdmissionContainmentParams() containment.Params {

@@ -40,6 +40,23 @@ const (
 
 const duplicateAuthorityJSONWarning = "duplicate-job-id: authority record also has legacy JSON record; authority selected"
 
+var ErrDaemonAlreadyListening = errors.New("agentbus daemon already listening")
+
+type DaemonAlreadyListeningError struct {
+	SocketPath string
+}
+
+func (e DaemonAlreadyListeningError) Error() string {
+	if e.SocketPath == "" {
+		return ErrDaemonAlreadyListening.Error()
+	}
+	return fmt.Sprintf("%s at %s", ErrDaemonAlreadyListening, e.SocketPath)
+}
+
+func (e DaemonAlreadyListeningError) Is(target error) bool {
+	return target == ErrDaemonAlreadyListening
+}
+
 // BinaryIdentity identifies the on-disk daemon executable by metadata that
 // changes when a replacement binary is installed.
 type BinaryIdentity struct {
@@ -78,6 +95,7 @@ type Config struct {
 	ReapInterval        time.Duration
 	GCInterval          time.Duration
 	ReapTickInterval    time.Duration
+	ReadyHook           func(ServeReadyInfo) error
 	// Runtime is an injected strict-admission runtime owned by Serve. A runtime
 	// with real close semantics is single-use: once a Serve or recovery-only
 	// admin run closes it, a later Serve on the same Server/config is rejected
@@ -85,6 +103,11 @@ type Config struct {
 	// is reusable for repeated fail-closed Serves.
 	Runtime     custodian.Runtime
 	ProbeRunner command.ProbeRunner
+}
+
+type ServeReadyInfo struct {
+	StateRoot  string
+	SocketPath string
 }
 
 type tickerSource struct {
@@ -131,6 +154,7 @@ type Server struct {
 	gcInterval             time.Duration
 	reapTickInterval       time.Duration
 	reapTickFactory        func(time.Duration) tickerSource
+	readyHook              func(ServeReadyInfo) error
 	afterReapTickHook      func(error)
 	listenerFactory        func() (net.Listener, socketFileIdentity, error)
 	safetyLatch            *SafetyLatch
@@ -374,6 +398,7 @@ func New(cfg Config) (*Server, error) {
 		gcInterval:             gcInterval,
 		reapTickInterval:       reapTickInterval,
 		reapTickFactory:        newTickerSource,
+		readyHook:              cfg.ReadyHook,
 		safetyLatch:            NewSafetyLatch(),
 		safetyDrainTimeout:     defaultSafetyDrain,
 		stores:                 make(map[string]*engine.Store),
@@ -442,6 +467,11 @@ func (s *Server) Serve(ctx context.Context) error {
 		_ = ln.Close()
 		s.removeOwnedSocket(socketIdentity, "server shutdown")
 	}()
+	if s.readyHook != nil {
+		if err := s.readyHook(ServeReadyInfo{StateRoot: s.stateRoot, SocketPath: s.socketPath}); err != nil {
+			return err
+		}
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() {
@@ -521,7 +551,7 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	if _, err := os.Lstat(s.socketPath); err == nil {
 		if conn, dialErr := net.DialTimeout("unix", s.socketPath, 100*time.Millisecond); dialErr == nil {
 			_ = conn.Close()
-			return nil, socketFileIdentity{}, fmt.Errorf("agentbus daemon already listening at %s", s.socketPath)
+			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
 		}
 		if err := os.Remove(s.socketPath); err != nil {
 			return nil, socketFileIdentity{}, err
