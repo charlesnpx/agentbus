@@ -39,7 +39,7 @@ const (
 	admissionRepositoryOpenTimeout  = 100 * time.Millisecond
 	admissionRepositoryCloseTimeout = 5 * time.Second
 	admissionContentionRetryDelay   = 50 * time.Millisecond
-	admissionContentionFallback     = 10 * time.Second
+	admissionContentionFallback     = 2 * time.Second
 	admissionProbeReasonMaxRunes    = 512
 )
 

@@ -24,6 +24,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
+	"golang.org/x/sys/unix"
 )
 
 const defaultStartTimeout = 10 * time.Second
@@ -387,11 +388,7 @@ func (c *Client) lockAutostartStateRoot(ctx context.Context) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	lockPath, err := autostartLockPath(lockKey)
-	if err != nil {
-		return nil, err
-	}
-	lock, err := openAutostartLockFile(lockPath)
+	lock, err := openAutostartLockFileForKey(lockKey)
 	if err != nil {
 		return nil, err
 	}
@@ -497,77 +494,125 @@ func caseFoldAutostartLockRemainder(path string) string {
 }
 
 func autostartLockPath(lockKey string) (string, error) {
-	sum := sha256.Sum256([]byte(lockKey))
-	lockDir, err := autostartLockDir()
+	lockDir, err := openAutostartLockDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(lockDir, "start-"+hex.EncodeToString(sum[:])+".lock"), nil
+	defer lockDir.close()
+	return filepath.Join(lockDir.path, autostartLockFileName(lockKey)), nil
 }
 
-func autostartLockDir() (string, error) {
+func autostartLockFileName(lockKey string) string {
+	sum := sha256.Sum256([]byte(lockKey))
+	return "start-" + hex.EncodeToString(sum[:]) + ".lock"
+}
+
+type autostartLockDirectory struct {
+	path string
+	fd   int
+}
+
+func (dir *autostartLockDirectory) close() error {
+	if dir == nil || dir.fd < 0 {
+		return nil
+	}
+	err := unix.Close(dir.fd)
+	dir.fd = -1
+	return err
+}
+
+func openAutostartLockDir() (*autostartLockDirectory, error) {
 	cacheDir, err := autostartUserCacheDir()
 	if err == nil && strings.TrimSpace(cacheDir) != "" {
 		lockDir := filepath.Join(cacheDir, "agentbus", "start-locks")
 		if err := os.MkdirAll(lockDir, 0o700); err != nil {
-			return "", err
+			return nil, err
 		}
-		return lockDir, nil
+		return openVerifiedAutostartLockDir(lockDir, autostartPrimaryLockDir)
 	}
 	lockDir := filepath.Join(autostartTempDir(), fmt.Sprintf("agentbus-start-locks-%d", os.Getuid()))
 	if err := os.Mkdir(lockDir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-		return "", err
+		return nil, err
 	}
-	if err := verifyAutostartTempLockDir(lockDir); err != nil {
-		return "", err
-	}
-	return lockDir, nil
+	return openVerifiedAutostartLockDir(lockDir, autostartTempLockDir)
 }
 
-func verifyAutostartTempLockDir(path string) error {
-	info, err := os.Lstat(path)
+type autostartLockDirKind uint8
+
+const (
+	autostartPrimaryLockDir autostartLockDirKind = iota + 1
+	autostartTempLockDir
+)
+
+func openVerifiedAutostartLockDir(path string, kind autostartLockDirKind) (*autostartLockDirectory, error) {
+	flags := unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC
+	if kind == autostartTempLockDir {
+		flags |= unix.O_NOFOLLOW
+	}
+	fd, err := unix.Open(path, flags, 0)
 	if err != nil {
-		return AutostartLockUnsafeError{Path: path, Reason: "stat lock directory", Cause: err}
+		return nil, AutostartLockUnsafeError{Path: path, Reason: "open lock directory", Cause: err}
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return AutostartLockUnsafeError{Path: path, Reason: "lock directory is a symlink"}
+	dir := &autostartLockDirectory{path: path, fd: fd}
+	if err := verifyAutostartLockDirFD(path, fd, kind); err != nil {
+		_ = dir.close()
+		return nil, err
 	}
-	if !info.IsDir() {
-		return AutostartLockUnsafeError{Path: path, Reason: "lock path is not a directory"}
-	}
-	if info.Mode().Perm() != 0o700 {
-		return AutostartLockUnsafeError{Path: path, Reason: fmt.Sprintf("lock directory mode is %o, want 700", info.Mode().Perm())}
-	}
-	lstat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return AutostartLockUnsafeError{Path: path, Reason: "lock directory identity unavailable"}
-	}
-	if lstat.Uid != uint32(os.Getuid()) {
-		return AutostartLockUnsafeError{Path: path, Reason: fmt.Sprintf("lock directory owner is %d, want %d", lstat.Uid, os.Getuid())}
-	}
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return AutostartLockUnsafeError{Path: path, Reason: "open verified lock directory", Cause: err}
-	}
-	defer syscall.Close(fd)
-	var opened syscall.Stat_t
-	if err := syscall.Fstat(fd, &opened); err != nil {
+	return dir, nil
+}
+
+func verifyAutostartLockDirFD(path string, fd int, kind autostartLockDirKind) error {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
 		return AutostartLockUnsafeError{Path: path, Reason: "stat opened lock directory", Cause: err}
 	}
-	if uint64(opened.Dev) != uint64(lstat.Dev) || uint64(opened.Ino) != uint64(lstat.Ino) {
-		return AutostartLockUnsafeError{Path: path, Reason: "lock directory changed during verification"}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return AutostartLockUnsafeError{Path: path, Reason: "lock path is not a directory"}
 	}
-	if opened.Uid != uint32(os.Getuid()) || os.FileMode(opened.Mode).Perm() != 0o700 || opened.Mode&syscall.S_IFMT != syscall.S_IFDIR {
-		return AutostartLockUnsafeError{Path: path, Reason: "opened lock directory failed ownership, mode, or type verification"}
+	if stat.Uid != uint32(os.Getuid()) {
+		return AutostartLockUnsafeError{Path: path, Reason: fmt.Sprintf("lock directory owner is %d, want %d", stat.Uid, os.Getuid())}
+	}
+	mode := os.FileMode(stat.Mode).Perm()
+	switch kind {
+	case autostartPrimaryLockDir:
+		if mode&0o002 != 0 {
+			return AutostartLockUnsafeError{Path: path, Reason: fmt.Sprintf("lock directory mode is %o, want not world-writable", mode)}
+		}
+	case autostartTempLockDir:
+		if mode != 0o700 {
+			return AutostartLockUnsafeError{Path: path, Reason: fmt.Sprintf("lock directory mode is %o, want 700", mode)}
+		}
+	default:
+		return AutostartLockUnsafeError{Path: path, Reason: "lock directory verification policy unavailable"}
 	}
 	return nil
 }
 
-func openAutostartLockFile(path string) (*os.File, error) {
-	lock, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+func openAutostartLockFileForKey(lockKey string) (*os.File, error) {
+	lockDir, err := openAutostartLockDir()
 	if err != nil {
 		return nil, err
 	}
+	defer lockDir.close()
+	return openAutostartLockFileAt(lockDir, autostartLockFileName(lockKey))
+}
+
+func openAutostartLockFileAt(lockDir *autostartLockDirectory, name string) (*os.File, error) {
+	if lockDir == nil || lockDir.fd < 0 {
+		return nil, AutostartLockUnsafeError{Reason: "lock directory is not open"}
+	}
+	if name == "" || filepath.Base(name) != name {
+		return nil, AutostartLockUnsafeError{Path: lockDir.path, Reason: "lock file name is invalid"}
+	}
+	path := filepath.Join(lockDir.path, name)
+	fd, err := unix.Openat(lockDir.fd, name, unix.O_CREAT|unix.O_EXCL|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	if errors.Is(err, unix.EEXIST) {
+		fd, err = unix.Openat(lockDir.fd, name, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	}
+	if err != nil {
+		return nil, AutostartLockUnsafeError{Path: path, Reason: "open lock file", Cause: err}
+	}
+	lock := os.NewFile(uintptr(fd), path)
 	if err := verifyAutostartLockFile(lock); err != nil {
 		_ = lock.Close()
 		return nil, err

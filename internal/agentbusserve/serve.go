@@ -67,7 +67,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		reportStartupFailure(reporter, err)
 		return err
 	}
-	err = server.Serve(startupCtx)
+	err = server.ServeWithStartupContext(ctx, startupCtx)
 	if err != nil {
 		reportStartupFailure(reporter, err)
 	}

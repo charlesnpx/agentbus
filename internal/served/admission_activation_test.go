@@ -26,6 +26,38 @@ import (
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
+func TestAdmissionContentionContextBoundsNoDeadlineFallback(t *testing.T) {
+	start := time.Now()
+	ctx, cancel := admissionContentionContext(context.Background())
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("admissionContentionContext returned no deadline for no-deadline parent")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > admissionContentionFallback {
+		t.Fatalf("contention fallback remaining = %s, want within %s", remaining, admissionContentionFallback)
+	}
+	if elapsed := deadline.Sub(start); elapsed < admissionContentionFallback-100*time.Millisecond || elapsed > admissionContentionFallback+100*time.Millisecond {
+		t.Fatalf("contention fallback deadline delta = %s, want about %s", elapsed, admissionContentionFallback)
+	}
+}
+
+func TestAdmissionContentionContextPreservesParentDeadline(t *testing.T) {
+	parentDeadline := time.Now().Add(750 * time.Millisecond)
+	parent, parentCancel := context.WithDeadline(context.Background(), parentDeadline)
+	defer parentCancel()
+	ctx, cancel := admissionContentionContext(parent)
+	defer cancel()
+	gotDeadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("admissionContentionContext dropped parent deadline")
+	}
+	if !gotDeadline.Equal(parentDeadline) {
+		t.Fatalf("contention deadline = %s, want parent deadline %s", gotDeadline, parentDeadline)
+	}
+}
+
 func TestActivatedRootSupportLossFailsStartupWithoutDowngrade(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {

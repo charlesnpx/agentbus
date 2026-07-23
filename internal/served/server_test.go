@@ -3755,6 +3755,65 @@ func TestIdleShutdownWaitsForActiveJobs(t *testing.T) {
 	}
 }
 
+func TestServeWithStartupContextUsesServiceContextAfterReady(t *testing.T) {
+	t.Parallel()
+	const startupTimeout = 500 * time.Millisecond
+	root := shortTempDir(t)
+	cwd := shortTempDir(t)
+	server := newTestServerWithRoot(t, root, cwd, newFakeBackend("fake"), Config{IdleTimeout: -1})
+	configureTestAdmissionRuntime(t, server, newAdmissionFakeLaunchCustodian(t), true)
+	listener := newPipeTestListener()
+	listening := make(chan struct{})
+	var listenOnce sync.Once
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		listenOnce.Do(func() { close(listening) })
+		return listener, socketFileIdentity{}, nil
+	}
+	serviceCtx, cancelService := context.WithCancel(context.Background())
+	defer cancelService()
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), startupTimeout)
+	defer cancelStartup()
+	done := make(chan error, 1)
+	go func() {
+		done <- server.ServeWithStartupContext(serviceCtx, startupCtx)
+		close(done)
+	}()
+	select {
+	case <-listening:
+	case err := <-done:
+		t.Fatalf("server exited before listener was ready: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("server did not become ready")
+	}
+	if deadline, ok := startupCtx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 {
+			time.Sleep(remaining + 100*time.Millisecond)
+		}
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("server stopped after bootstrap deadline instead of service context cancellation: %v", err)
+	default:
+	}
+	conn, err := listener.Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	helloRaw(t, conn, reader, "test-token")
+	_ = conn.Close()
+
+	cancelService()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("server stopped after service context cancellation with error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop after service context cancellation")
+	}
+}
+
 func TestBinaryChangeExitsPromptlyWhenQuiet(t *testing.T) {
 	t.Parallel()
 	changed := newBinaryChangeProbe()
@@ -5601,6 +5660,49 @@ func (l *blockingTestListener) waitClosed(t *testing.T) {
 	case <-l.closed:
 	case <-time.After(time.Second):
 		t.Fatal("blocking listener did not close")
+	}
+}
+
+type pipeTestListener struct {
+	conns     chan net.Conn
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newPipeTestListener() *pipeTestListener {
+	return &pipeTestListener{
+		conns:  make(chan net.Conn),
+		closed: make(chan struct{}),
+	}
+}
+
+func (l *pipeTestListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conns:
+		return conn, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *pipeTestListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *pipeTestListener) Addr() net.Addr {
+	return testNetAddr("pipe-listener")
+}
+
+func (l *pipeTestListener) Dial() (net.Conn, error) {
+	client, server := net.Pipe()
+	select {
+	case l.conns <- server:
+		return client, nil
+	case <-l.closed:
+		_ = client.Close()
+		_ = server.Close()
+		return nil, net.ErrClosed
 	}
 }
 

@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	busclient "github.com/charlesnpx/agentbus/client"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 	"github.com/charlesnpx/agentbus/internal/served"
@@ -132,6 +134,99 @@ func TestServeLauncherReportsAdmissionRootBusyCode(t *testing.T) {
 	}
 }
 
+func TestServeLauncherDaemonSurvivesStartupDeadline(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real production daemon deadline variant runs on linux; split-context coverage runs in internal/served")
+	}
+	requireAgentbusServeStrictCgroup(t)
+	root := t.TempDir()
+	const timeout = 3 * time.Second
+	result, err := daemonlaunch.Launch(context.Background(), daemonlaunch.Options{
+		CommandPath: buildAgentbusServeRealBinary(t),
+		Args:        []string{"serve", "--foreground"},
+		StateRoot:   root,
+		Timeout:     timeout,
+		Starter:     agentbusServeProcessStarter,
+		Env:         os.Environ(),
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "bind: operation not permitted") {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatalf("Launch error = %v", err)
+	}
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			_ = result.KillAndWait()
+		}
+	})
+
+	time.Sleep(2 * timeout)
+	assertAgentbusServeProcessAlive(t, result.PID, "after startup deadline")
+	clientCtx, cancelClient := context.WithTimeout(context.Background(), time.Second)
+	defer cancelClient()
+	client, err := busclient.Connect(clientCtx, busclient.Options{
+		StateRoot:        root,
+		DisableAutoStart: true,
+	})
+	if err != nil {
+		t.Fatalf("connect after startup deadline: %v", err)
+	}
+	defer client.Close()
+	hello, err := client.Hello(clientCtx)
+	if err != nil {
+		t.Fatalf("hello after startup deadline: %v", err)
+	}
+	if hello.ProtocolVersion != protocol.Version {
+		t.Fatalf("hello protocolVersion = %d, want %d", hello.ProtocolVersion, protocol.Version)
+	}
+	assertAgentbusServeProcessAlive(t, result.PID, "after hello past startup deadline")
+
+	_ = result.KillAndWait()
+	stopped = true
+	assertAgentbusServeProcessGone(t, result.PID)
+}
+
+func requireAgentbusServeStrictCgroup(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	manager, err := cgroup.New("")
+	if err != nil {
+		t.Skipf("cgroup strict support unavailable: %v", err)
+	}
+	support := manager.Probe(ctx)
+	if closeErr := manager.Close(); closeErr != nil {
+		t.Fatalf("close cgroup probe manager: %v", closeErr)
+	}
+	if !support.Strict() {
+		t.Skipf("strict cgroup-v2 support unavailable: supported=%t runtimeProbePassed=%t degraded=%t platform=%s reason=%v", support.Supported, support.RuntimeProbePassed, support.Degraded, support.Platform, support.Reason)
+	}
+}
+
+func buildAgentbusServeRealBinary(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "agentbus")
+	cmd := exec.Command("go", "build", "-o", path, "./cmd/agentbus")
+	cmd.Dir = agentbusServeRepoRootFromCaller(t)
+	cmd.Env = os.Environ()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go build ./cmd/agentbus: %v\n%s", err, output)
+	}
+	return path
+}
+
+func agentbusServeRepoRootFromCaller(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+}
+
 func runAgentbusServeHelper() int {
 	cwd := os.Getenv(agentbusServeHelperCWDEnv)
 	if cwd == "" {
@@ -173,6 +268,11 @@ func agentbusServeLaunchOptions(t *testing.T, root, cwd string) daemonlaunch.Opt
 
 func agentbusServeLaunchOptionsWithMode(t *testing.T, root, cwd, mode string) daemonlaunch.Options {
 	t.Helper()
+	return agentbusServeLaunchOptionsWithModeAndTimeout(t, root, cwd, mode, 2*time.Second)
+}
+
+func agentbusServeLaunchOptionsWithModeAndTimeout(t *testing.T, root, cwd, mode string, timeout time.Duration) daemonlaunch.Options {
+	t.Helper()
 	env := append(os.Environ(),
 		agentbusServeHelperEnv+"=1",
 		agentbusServeHelperCWDEnv+"="+cwd,
@@ -184,7 +284,7 @@ func agentbusServeLaunchOptionsWithMode(t *testing.T, root, cwd, mode string) da
 		CommandPath: os.Args[0],
 		Args:        []string{"serve", "--foreground"},
 		StateRoot:   root,
-		Timeout:     2 * time.Second,
+		Timeout:     timeout,
 		Starter:     agentbusServeProcessStarter,
 		Env:         env,
 	}
@@ -237,4 +337,25 @@ func (process agentbusServeProcess) Kill() error {
 
 func (process agentbusServeProcess) Wait() error {
 	return process.cmd.Wait()
+}
+
+func assertAgentbusServeProcessAlive(t *testing.T, pid int, reason string) {
+	t.Helper()
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("daemon process %d is not alive %s: %v", pid, reason, err)
+	}
+}
+
+func assertAgentbusServeProcessGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon process %d still exists after shutdown", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

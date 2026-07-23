@@ -488,11 +488,24 @@ func TokenPath(stateRoot string) (string, error) {
 
 // Serve listens on the configured Unix socket until ctx is canceled or idle shutdown fires.
 func (s *Server) Serve(ctx context.Context) error {
+	return s.serve(ctx, ctx)
+}
+
+// ServeWithStartupContext uses startupCtx for pre-ready bootstrap and ctx for
+// the daemon lifetime after readiness is reported.
+func (s *Server) ServeWithStartupContext(ctx, startupCtx context.Context) error {
+	return s.serve(ctx, startupCtx)
+}
+
+func (s *Server) serve(ctx, startupCtx context.Context) error {
 	s.ensureSafetyLatch()
 	if err := s.captureBinaryIdentity(); err != nil {
 		return err
 	}
-	if err := s.bootstrapAdmission(ctx); err != nil {
+	if startupCtx == nil {
+		startupCtx = ctx
+	}
+	if err := s.bootstrapAdmission(startupCtx); err != nil {
 		if errors.Is(err, authority.ErrFailStopped) {
 			s.safetyLatch.Trip(err)
 			return s.safetyFailStopErr()

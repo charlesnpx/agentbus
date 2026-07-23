@@ -378,6 +378,58 @@ func TestAutostartTempFallbackRejectsUnsafeLockDir(t *testing.T) {
 	}
 }
 
+func TestAutostartPrimaryRejectsWorldWritableLockDir(t *testing.T) {
+	originalUserCacheDir := autostartUserCacheDir
+	t.Cleanup(func() { autostartUserCacheDir = originalUserCacheDir })
+	cacheDir := t.TempDir()
+	autostartUserCacheDir = func() (string, error) {
+		return cacheDir, nil
+	}
+	lockDir := filepath.Join(cacheDir, "agentbus", "start-locks")
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(lockDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(lockDir, 0o700) })
+
+	_, err := autostartLockPath("unsafe-primary-dir-test")
+	if !errors.Is(err, ErrAutostartLockUnsafe) {
+		t.Fatalf("autostartLockPath error = %v, want ErrAutostartLockUnsafe", err)
+	}
+}
+
+func TestAutostartLockOpenRejectsSymlinkLockFile(t *testing.T) {
+	originalUserCacheDir := autostartUserCacheDir
+	t.Cleanup(func() { autostartUserCacheDir = originalUserCacheDir })
+	cacheDir := t.TempDir()
+	autostartUserCacheDir = func() (string, error) {
+		return cacheDir, nil
+	}
+	lockKey := "symlink-lock-file-test"
+	lockPath, err := autostartLockPath(lockKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, lockPath); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	lock, err := openAutostartLockFileForKey(lockKey)
+	if err == nil {
+		_ = lock.Close()
+		t.Fatal("openAutostartLockFileForKey succeeded for symlink lock file")
+	}
+	if !errors.Is(err, ErrAutostartLockUnsafe) {
+		t.Fatalf("openAutostartLockFileForKey error = %v, want ErrAutostartLockUnsafe", err)
+	}
+}
+
 func TestConnectHelloEOFAutostartsReplacement(t *testing.T) {
 	t.Parallel()
 	testConnectHelloTransportFailureAutostartsReplacement(t, "eof-token", nil)
