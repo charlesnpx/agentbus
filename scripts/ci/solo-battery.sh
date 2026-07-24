@@ -9,6 +9,10 @@ export GOCACHE="${GOCACHE:-${TMPDIR:-/tmp}/agentbus-go-cache}"
 export GOMODCACHE="${GOMODCACHE:-${TMPDIR:-/tmp}/agentbus-gomod-cache}"
 mkdir -p -- "$GOCACHE" "$GOMODCACHE"
 
+# Several tests build helper binaries hermetically (GOPROXY=off), so the
+# module cache must be warm before any test phase runs.
+go mod download
+
 cpu_count() {
   local count
   if command -v nproc >/dev/null 2>&1; then

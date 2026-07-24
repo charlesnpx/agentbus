@@ -86,9 +86,17 @@ printf 'docker-cgroup-v2: package_parallel=%s test_parallel=%s race_package_para
 run_partition build-client-cmd go build ./client ./cmd/agentbus
 run_partition build-engine go build ./engine/...
 run_partition build-internal go build ./internal/...
+# Lease-sensitive packages take the delegated cgroup root lease and must not
+# run concurrently with each other or with other packages inside one
+# container: they get the serial partition (plus strict-e2e for served) and
+# are excluded from the parallel and race partitions.
+lease_sensitive='(internal/cgroup|engine/execution/custodian|internal/served)$'
+mapfile -t rest_pkgs < <(go list ./... | grep -Ev "$lease_sensitive")
+
 run_partition serial-conformance env AGENTBUS_CGROUP_CONFORMANCE=1 go test ./internal/cgroup ./engine/execution/custodian ./internal/served -count=1 -p 1 -parallel 1
-run_partition parallel-rest go test ./... -count=1 -p "$pkg_parallel" -parallel "$test_parallel"
-run_partition race env CGO_ENABLED=1 go test -race ./... -count=1 -p "$race_pkg_parallel" -parallel "$test_parallel"
+run_partition serial-race env CGO_ENABLED=1 go test -race ./internal/cgroup ./engine/execution/custodian ./internal/served -count=1 -p 1 -parallel 1
+run_partition parallel-rest go test "${rest_pkgs[@]}" -count=1 -p "$pkg_parallel" -parallel "$test_parallel"
+run_partition race env CGO_ENABLED=1 go test -race "${rest_pkgs[@]}" -count=1 -p "$race_pkg_parallel" -parallel "$test_parallel"
 run_partition strict-e2e env AGENTBUS_RUN_STRICT_E2E=1 go test -tags abd_strict_e2e ./internal/served -run TestProductionStrict -count=1 -p 1 -parallel 1
 
 printf '\ndocker-cgroup-v2: worst=%d\n' "$worst"
