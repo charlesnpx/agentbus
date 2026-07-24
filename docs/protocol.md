@@ -11,7 +11,13 @@ turn streams, orchestration, delegation, review, or rescue workflows.
 ## Transport and framing
 
 The daemon listens on a Unix domain socket named `agentbus.sock` under the
-agentbus state root. The state root is:
+agentbus state root. The CLI uses `AGENTBUS_STATE_ROOT` as the state-root
+override when it is set. Go clients can pass `client.Options.StateRoot` to use a
+specific state root, or `client.Options.SocketPath` to connect to a specific
+socket path. When `SocketPath` is absent, the socket path is
+`<state root>/agentbus.sock`.
+
+When no state-root override is provided, the default state root resolution is:
 
 | Environment | State root |
 | --- | --- |
@@ -292,6 +298,10 @@ Result:
 | `state` | string | Current public state. New non-replay submissions return `queued`. |
 | `deduplicated` | boolean | Present and `true` only when replay returns an existing live job. Omitted otherwise. |
 
+Clients MUST treat `jobId` as opaque. Current strict authority allocation emits
+IDs in the form `job-%020d`, but clients must not parse sequence numbers or
+depend on that spelling.
+
 ### Request keys and workspace keys
 
 The replay key is the pair `(workspaceKey, requestId)`. The daemon treats
@@ -325,11 +335,16 @@ Fingerprint v1 is derived from the raw `taskSpec`, not from typed defaults:
 1. The raw `taskSpec` must be one JSON object.
 2. JSON must be valid UTF-8 and contain one top-level value.
 3. Duplicate object keys are rejected by the fingerprint parser.
-4. Object keys are sorted for canonical rendering.
-5. Array order is preserved.
-6. Omitted fields, explicit `null`, empty objects, and numeric zero remain
+4. Whitespace outside strings is removed by canonical rendering.
+5. Object keys and string values are decoded by the JSON parser, then rendered
+   with Go `encoding/json` escaping.
+6. Number lexemes are preserved verbatim; for example, `1`, `1.0`, and `1e0`
+   fingerprint differently.
+7. Object keys are sorted for canonical rendering.
+8. Array order is preserved.
+9. Omitted fields, explicit `null`, empty objects, and numeric zero remain
    distinct inputs.
-7. The hash input is the domain prefix `agentbus/task-spec/sha256/v1\0`
+10. The hash input is the domain prefix `agentbus/task-spec/sha256/v1\0`
    followed by the canonical JSON bytes.
 
 Replay comparison uses the recorded fingerprint algorithm and version. A
@@ -404,8 +419,10 @@ Result:
 
 The served v2 path is authority-only. It does not fall back to legacy JSON job
 records. Listing reads authority jobs and sorts returned statuses by `jobId`.
-Unknown or malformed job IDs that do not resolve to an authority job return
-`unknown_job` with `jobId` in `error.data`.
+While authority lookup is healthy, unknown or malformed job IDs that do not
+resolve to an authority job return `unknown_job` with `jobId` in `error.data`.
+During fail-stop, a syntactically valid absent ID can return
+`root_fail_stopped` before absence can be established.
 
 ## `job.result`
 
@@ -442,7 +459,9 @@ and a bounded read verifies both byte count and digest. If verification fails,
 the path and digest metadata remain, and `text` is omitted.
 
 Non-completion terminal states and non-terminal states return no `result`.
-Unknown jobs return `unknown_job` with `jobId` in `error.data`.
+While authority lookup is healthy, unknown jobs return `unknown_job` with
+`jobId` in `error.data`. During fail-stop, a syntactically valid absent ID can
+return `root_fail_stopped` before absence can be established.
 
 ## `job.cancel`
 
@@ -500,7 +519,8 @@ reaped
 quarantined
 ```
 
-The CLI maps single-job `status`, `result`, and `cancel` outcomes as follows:
+The CLI maps single-job `status`, `result`, and `cancel` outcomes as follows.
+In-band JSON-RPC errors from a running daemon are included where noted:
 
 | Condition | Exit code |
 | --- | ---: |
@@ -514,13 +534,43 @@ The CLI maps single-job `status`, `result`, and `cancel` outcomes as follows:
 | `reaped` | 8 |
 | `quarantined` | 9 |
 | `unknown_job` | 10 |
-| daemon startup failure, including `unavailable_native_runtime` | 11 |
-| authority fail-stop, `root_fail_stopped`, `root_corrupt`, or `root_identity_mismatch` | 12 |
+| in-band `unavailable_native_runtime` admission cause | 11 |
+| in-band authority root condition: `root_fail_stopped`, `root_corrupt`, or `root_identity_mismatch` | 12 |
+
+Launcher, startup, and local shutdown failures use a separate classification:
+
+| Condition | Exit code |
+| --- | ---: |
+| daemon startup failure, including launcher-side root corruption, launcher-side `root_identity_mismatch`, and `unavailable_native_runtime` | 11 |
+| launcher-side authority fail-stop, including `root_fail_stopped` and served safety fail-stop | 12 |
 | graceful shutdown deadline exceeded | 13 |
 
 ## Policy methods
 
 `policy.validate` params:
+
+```json
+{
+  "text": "## Findings\nNo issues found.",
+  "contract": {
+    "shape": {
+      "requiredSections": ["Findings"]
+    }
+  }
+}
+```
+
+Result:
+
+```json
+{"valid":true,"missing":null,"contractSha256":"sha256:<elided>"}
+```
+
+`contractSha256` is the concrete `sha256:<64 lowercase hex>` contract digest;
+examples elide the digest value. On the current valid path, the missing list is
+nil and serializes as `null`.
+
+Invalid result example:
 
 ```json
 {
@@ -533,10 +583,8 @@ The CLI maps single-job `status`, `result`, and `cancel` outcomes as follows:
 }
 ```
 
-Result:
-
 ```json
-{"valid":true,"missing":[],"contractSha256":"sha256:..."}
+{"valid":false,"missing":["section:Findings"],"contractSha256":"sha256:<elided>"}
 ```
 
 `policy.register` params:
@@ -665,7 +713,7 @@ Request:
 Response:
 
 ```json
-{"jsonrpc":"2.0","id":"submit-1","result":{"jobId":"job_20260724T120000000000000Z_000001","state":"queued"}}
+{"jsonrpc":"2.0","id":"submit-1","result":{"jobId":"job-00000000000000000001","state":"queued"}}
 ```
 
 ### Submit deduplicated replay
@@ -679,7 +727,7 @@ Request:
 Response:
 
 ```json
-{"jsonrpc":"2.0","id":"submit-replay","result":{"jobId":"job_20260724T120000000000000Z_000001","state":"completed","deduplicated":true}}
+{"jsonrpc":"2.0","id":"submit-replay","result":{"jobId":"job-00000000000000000001","state":"completed","deduplicated":true}}
 ```
 
 ### Replay conflict
