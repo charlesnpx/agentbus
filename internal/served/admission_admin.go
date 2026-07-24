@@ -106,7 +106,7 @@ func newAdmissionRecoveryServer(cfg Config) (*Server, error) {
 		stores:                       make(map[string]*engine.Store),
 		storesByKey:                  make(map[string]*engine.Store),
 		jobStores:                    make(map[string]*engine.Store),
-		admissionJobs:                make(map[string]struct{}),
+		admissionJobs:                make(map[string]*admissionInstance),
 		admissionEffectMu:            make(map[string]*sync.Mutex),
 		admissionRuntimeConfig:       cfg.Runtime,
 		admissionProbeRunner:         cfg.ProbeRunner,

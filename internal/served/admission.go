@@ -798,9 +798,21 @@ func admissionCloseDeadline(ctx context.Context, cap time.Duration) time.Time {
 	return deadline
 }
 
-func (s *Server) beginAdmissionClosing(ctx context.Context) error {
+func (s *Server) beginAdmissionClosing(ctx context.Context, snapshot *serveAdmissionSnapshot) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if snapshot == nil || snapshot.instance == nil {
+		return nil
+	}
+	s.admissionStateMu.RLock()
+	current := s.admissionInstance == snapshot.instance
+	s.admissionStateMu.RUnlock()
+	if !current {
+		return nil
 	}
 	s.admissionCloseEpoch.Add(1)
 	if err := s.lockAdmissionSubmitContext(ctx); err != nil {
@@ -1969,7 +1981,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		s.jobStores[jobID] = opened
 	}
 	s.mu.Unlock()
-	s.markAdmissionJob(jobID)
+	s.markAdmissionJob(jobID, instance)
 	containmentIntent := &launch.ContainmentIntent{}
 	run := jobRun{
 		jobID:               jobID,

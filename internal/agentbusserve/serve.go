@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
@@ -23,9 +24,39 @@ type servedServer interface {
 }
 
 var productionServedConfigFunc = productionServedConfig
+var canonicalStateRootFunc = daemonlaunch.CanonicalStateRoot
 
 var newProductionServerAfterStrictAdmissionSupportPreflight = func(ctx context.Context, cfg served.Config) (servedServer, error) {
 	return served.NewAfterStrictAdmissionSupportPreflight(ctx, cfg)
+}
+
+type readinessPublicationGuard struct {
+	mu         sync.Mutex
+	terminated error
+}
+
+func (guard *readinessPublicationGuard) Terminate(err error) {
+	if err == nil {
+		err = context.Canceled
+	}
+	guard.mu.Lock()
+	if guard.terminated == nil {
+		guard.terminated = err
+	}
+	guard.mu.Unlock()
+}
+
+func (guard *readinessPublicationGuard) Ready(ctx context.Context, reporter *daemonlaunch.Reporter, canonicalRoot, socketPath string) error {
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	if guard.terminated != nil {
+		return guard.terminated
+	}
+	if err := ctx.Err(); err != nil {
+		guard.terminated = err
+		return err
+	}
+	return reporter.Ready(canonicalRoot, socketPath)
 }
 
 func Serve(ctx context.Context, cfg Config) error {
@@ -38,6 +69,14 @@ func Serve(ctx context.Context, cfg Config) error {
 	}
 	if hasReporter {
 		defer reporter.Close()
+	}
+	readinessGuard := &readinessPublicationGuard{}
+	stopReadinessCancel := func() bool { return true }
+	if hasReporter {
+		stopReadinessCancel = context.AfterFunc(ctx, func() {
+			readinessGuard.Terminate(ctx.Err())
+		})
+		defer stopReadinessCancel()
 	}
 	startupCtx := ctx
 	cancelStartup := func() {}
@@ -74,11 +113,11 @@ func Serve(ctx context.Context, cfg Config) error {
 			if err := startupCtx.Err(); err != nil {
 				return err
 			}
-			canonicalRoot, err := daemonlaunch.CanonicalStateRoot(info.StateRoot)
+			canonicalRoot, err := canonicalStateRootFunc(info.StateRoot)
 			if err != nil {
 				return err
 			}
-			if err := reporter.Ready(canonicalRoot, info.SocketPath); err != nil {
+			if err := readinessGuard.Ready(startupCtx, reporter, canonicalRoot, info.SocketPath); err != nil {
 				return err
 			}
 			redirectStderrToDevNull()
@@ -99,11 +138,15 @@ func Serve(ctx context.Context, cfg Config) error {
 	}()
 	select {
 	case err = <-done:
+		if cleanServeTerminationAfterCancel(ctx, err) {
+			return nil
+		}
 		if err != nil {
 			reportStartupFailure(reporter, err)
 		}
 		return err
 	case <-ctx.Done():
+		readinessGuard.Terminate(ctx.Err())
 		shutdownCtx := context.WithoutCancel(ctx)
 		var cancelShutdown context.CancelFunc
 		if timeout := server.ShutdownTimeout(); timeout > 0 {
@@ -118,11 +161,18 @@ func Serve(ctx context.Context, cfg Config) error {
 		if shutdownErr != nil && !errors.Is(shutdownErr, served.ErrShutdownNotServing) {
 			return shutdownErr
 		}
-		if shutdownErr != nil && errors.Is(shutdownErr, served.ErrShutdownNotServing) && ctx.Err() != nil && serveErr == context.Canceled {
+		if shutdownErr != nil && errors.Is(shutdownErr, served.ErrShutdownNotServing) && cleanServeTerminationAfterCancel(ctx, serveErr) {
+			return nil
+		}
+		if cleanServeTerminationAfterCancel(ctx, serveErr) {
 			return nil
 		}
 		return serveErr
 	}
+}
+
+func cleanServeTerminationAfterCancel(ctx context.Context, err error) bool {
+	return ctx != nil && ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, served.ErrShutdownNotServing))
 }
 
 func RecoverAdmissionRoot(ctx context.Context, cfg Config) (served.AdmissionRecoveryReport, error) {

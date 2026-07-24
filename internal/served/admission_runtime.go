@@ -450,17 +450,16 @@ func jobIDFromResultPath(path string) (model.JobID, error) {
 	return model.NewJobID(base)
 }
 
-func (s *Server) markAdmissionJob(jobID string) {
+func (s *Server) markAdmissionJob(jobID string, instance *admissionInstance) {
 	s.mu.Lock()
-	s.admissionJobs[jobID] = struct{}{}
+	s.admissionJobs[jobID] = instance
 	s.mu.Unlock()
 }
 
 func (s *Server) isAdmissionJob(jobID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, ok := s.admissionJobs[jobID]
-	return ok
+	return s.admissionJobs[jobID] != nil
 }
 
 func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text string) error {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -303,6 +304,124 @@ func TestServeCancellationBeforeRegistrationReturnsCleanWithoutReadyFrame(t *tes
 		if _, err := os.Stat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s stat error = %v, want absent", name, err)
 		}
+	}
+}
+
+func TestServeCancellationImmediateContextCanceledReturnsClean(t *testing.T) {
+	root := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveStarted := make(chan struct{})
+	fake := &fakeServedServer{
+		shutdownTimeout: time.Second,
+		serve: func(context.Context, context.Context) error {
+			close(serveStarted)
+			<-ctx.Done()
+			return fmt.Errorf("serve stopped: %w", context.Canceled)
+		},
+		shutdown: func(context.Context) error {
+			return served.ErrShutdownNotServing
+		},
+	}
+	stubProductionServe(t, fake)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(ctx, Config{StateRoot: root, CWD: t.TempDir(), IdleTimeout: -1})
+	}()
+	select {
+	case <-serveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("fake serve did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve error = %v, want clean cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not return after cancellation")
+	}
+}
+
+func TestServeReadinessAfterCancellationDoesNotEmitReadyFrame(t *testing.T) {
+	root := t.TempDir()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	t.Setenv(daemonlaunch.ReadyFDEnv, strconv.Itoa(int(writer.Fd())))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	canonicalStarted := make(chan struct{})
+	releaseCanonical := make(chan struct{})
+	previousCanonical := canonicalStateRootFunc
+	canonicalStateRootFunc = func(path string) (string, error) {
+		close(canonicalStarted)
+		<-releaseCanonical
+		return filepath.Clean(path), nil
+	}
+	t.Cleanup(func() {
+		canonicalStateRootFunc = previousCanonical
+	})
+
+	var readyHook func(served.ServeReadyInfo) error
+	previousConfig := productionServedConfigFunc
+	previousNewServer := newProductionServerAfterStrictAdmissionSupportPreflight
+	productionServedConfigFunc = func(cfg Config) (served.Config, error) {
+		return cfg, nil
+	}
+	newProductionServerAfterStrictAdmissionSupportPreflight = func(_ context.Context, cfg served.Config) (servedServer, error) {
+		readyHook = cfg.ReadyHook
+		return &fakeServedServer{
+			shutdownTimeout: time.Second,
+			serve: func(context.Context, context.Context) error {
+				if readyHook == nil {
+					return errors.New("ready hook was not installed")
+				}
+				return readyHook(served.ServeReadyInfo{StateRoot: root, SocketPath: filepath.Join(root, protocol.SocketName)})
+			},
+			shutdown: func(context.Context) error {
+				return served.ErrShutdownNotServing
+			},
+		}, nil
+	}
+	t.Cleanup(func() {
+		productionServedConfigFunc = previousConfig
+		newProductionServerAfterStrictAdmissionSupportPreflight = previousNewServer
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(ctx, Config{StateRoot: root, CWD: t.TempDir(), IdleTimeout: -1})
+	}()
+	select {
+	case <-canonicalStarted:
+	case err := <-done:
+		t.Fatalf("Serve returned before canonical root resolution stalled: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("canonical root resolution did not start")
+	}
+	cancel()
+	close(releaseCanonical)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve error = %v, want clean cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not return after cancellation")
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 0 {
+		t.Fatalf("readiness frame = %q, want none", raw)
 	}
 }
 
