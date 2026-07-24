@@ -66,6 +66,7 @@ type bootstrapConfig struct {
 	anchorStore           *AnchorStore
 	quiescenceVerifier    custodian.AttestationVerifier
 	hasQuiescenceVerifier bool
+	safetyLatch           *SafetyLatch
 }
 
 func WithAnchor(anchor Anchor) BootstrapperOption {
@@ -84,6 +85,12 @@ func WithQuiescenceVerifier(verifier custodian.AttestationVerifier) Bootstrapper
 	return func(config *bootstrapConfig) {
 		config.quiescenceVerifier = verifier
 		config.hasQuiescenceVerifier = true
+	}
+}
+
+func WithSafetyLatch(latch *SafetyLatch) BootstrapperOption {
+	return func(config *bootstrapConfig) {
+		config.safetyLatch = latch
 	}
 }
 
@@ -120,6 +127,7 @@ func NewBootstrapper(repo repository.Repository, options ...BootstrapperOption) 
 			anchor:   anchor,
 			runtime:  newRuntimeRegistry(),
 			verifier: verifier,
+			latch:    config.safetyLatch,
 		},
 	}, nil
 }
@@ -140,6 +148,7 @@ func (b *Bootstrapper) Begin(ctx context.Context, boot model.BootRef) (*Recovery
 
 	probe, err := probeBeginStartability(ctx, b.core.repo, b.core.anchor)
 	if err != nil {
+		b.core.tripSafetyLatchOnRepositoryCorruption(err)
 		return nil, err
 	}
 	generation := probe.Generation
@@ -466,7 +475,7 @@ func defaultAnchorKey(repo repository.Repository) string {
 }
 
 func repositoryAnchorIdentity(repo repository.Repository) (string, uint16, error) {
-	if identified, ok := repo.(anchorIdentityRepository); ok {
+	if identified, ok := repo.(repository.AnchorIdentified); ok {
 		return identified.AnchorIdentity()
 	}
 	return defaultAnchorKey(repo), repository.CurrentAuthorityMetaSchemaVersion, nil

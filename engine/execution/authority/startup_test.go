@@ -185,6 +185,42 @@ func TestStartupCorruptionMatrixFromSnapshots(t *testing.T) {
 	})
 }
 
+func TestSafetyLatchTripsOnStartupRepositoryCorruption(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := NewAnchorStore()
+	ready := newReadyWithAnchorStore(t, repo, anchorStore, "latch-corruption-old")
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "latch-corruption"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.InjectCorruptSafetyForTest(accepted.Record.JobID, "safety checksum")
+	repo, anchorStore = restoreAuthoritySnapshot(t, repo.SnapshotBytes(), anchorStore.SnapshotBytes())
+
+	boot, err := model.NewBootRef("boot-latch-corruption-new", "owner-latch-corruption-new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	latch := NewSafetyLatch()
+	_, verifier := custodian.NewAttestationChannel()
+	bootstrapper, err := NewBootstrapper(repo, WithAnchorStore(anchorStore), WithQuiescenceVerifier(verifier), WithSafetyLatch(latch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = bootstrapper.Begin(ctx, boot)
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("Begin error = %v, want ErrCorruptRecord", err)
+	}
+	select {
+	case <-latch.Done():
+	default:
+		t.Fatal("SafetyLatch was not tripped")
+	}
+	if reason := latch.Reason(); !errors.Is(reason, repository.ErrCorruptRecord) {
+		t.Fatalf("SafetyLatch reason = %v, want ErrCorruptRecord", reason)
+	}
+}
+
 func TestProjectionCorruptionNeverSuppliesGrantCertainty(t *testing.T) {
 	ctx := context.Background()
 	repo := memory.NewRepository()

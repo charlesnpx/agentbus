@@ -46,10 +46,6 @@ type anchorAdapter struct {
 	schemaMajor uint16
 }
 
-type anchorIdentityRepository interface {
-	AnchorIdentity() (string, uint16, error)
-}
-
 func NewAnchorStore() *AnchorStore {
 	return &AnchorStore{failNext: map[AnchorOperation]error{}}
 }

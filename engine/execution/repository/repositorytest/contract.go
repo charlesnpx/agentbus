@@ -13,10 +13,14 @@ import (
 )
 
 type Factory struct {
-	New           func(*testing.T) repository.Repository
-	Snapshot      func(*testing.T, repository.Repository) []byte
-	CorruptSafety func(*testing.T, repository.Repository, model.JobID, string)
-	MissingMeta   func(*testing.T, repository.Repository)
+	New                   func(*testing.T) repository.Repository
+	Snapshot              func(*testing.T, repository.Repository) []byte
+	CorruptSafety         func(*testing.T, repository.Repository, model.JobID, string)
+	CorruptBinding        func(*testing.T, repository.Repository, model.RequestKey, string)
+	CorruptTombstone      func(*testing.T, repository.Repository, model.RequestKey, string)
+	MissingMeta           func(*testing.T, repository.Repository)
+	FailCommitAfterCommit func(*testing.T, repository.Repository, error)
+	Audit                 func(*testing.T, repository.Repository) error
 }
 
 func RunRepositoryContract(t *testing.T, factory Factory) {
@@ -30,8 +34,20 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 	if factory.CorruptSafety == nil {
 		t.Fatal("repositorytest.Factory.CorruptSafety is required")
 	}
+	if factory.CorruptBinding == nil {
+		t.Fatal("repositorytest.Factory.CorruptBinding is required")
+	}
+	if factory.CorruptTombstone == nil {
+		t.Fatal("repositorytest.Factory.CorruptTombstone is required")
+	}
 	if factory.MissingMeta == nil {
 		t.Fatal("repositorytest.Factory.MissingMeta is required")
+	}
+	if factory.FailCommitAfterCommit == nil {
+		t.Fatal("repositorytest.Factory.FailCommitAfterCommit is required")
+	}
+	if factory.Audit == nil {
+		t.Fatal("repositorytest.Factory.Audit is required")
 	}
 
 	t.Run("atomic acceptance", func(t *testing.T) {
@@ -352,7 +368,7 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 		}
 	})
 
-	t.Run("corruption state is explicit and failed policy write rolls back", func(t *testing.T) {
+	t.Run("corruption state is explicit and touched safety write rolls back", func(t *testing.T) {
 		repo := factory.New(t)
 		fixture := newFixture(t, "corrupt")
 		acceptFixture(t, repo, fixture)
@@ -372,17 +388,146 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 		}
 
 		before := factory.Snapshot(t, repo)
-		other := newFixture(t, "after-corrupt")
 		_, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+			next := fixture.Record
+			next.Revision++
+			next.Cancel = &model.CancelFact{JobID: fixture.JobID, RequestedBy: fixture.Boot}
+			return tx.PutSafety(next, fixture.Record.Revision)
+		})
+		if !errors.Is(err, repository.ErrCorruptRecord) || !errors.Is(err, repository.ErrDefinitelyNotCommitted) {
+			t.Fatalf("touched corrupt safety error = %v, want ErrDefinitelyNotCommitted wrapping ErrCorruptRecord", err)
+		}
+		assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
+	})
+
+	t.Run("unrelated corrupt safety is preserved and does not block new acceptance", func(t *testing.T) {
+		repo := factory.New(t)
+		corrupt := newFixture(t, "unrelated-corrupt")
+		acceptFixture(t, repo, corrupt)
+		factory.CorruptSafety(t, repo, corrupt.JobID, "checksum mismatch")
+
+		other := newFixture(t, "after-unrelated-corrupt")
+		commit, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
 			if _, err := tx.AllocateJobID(); err != nil {
 				return err
 			}
 			return putAcceptance(tx, other)
 		})
-		if !errors.Is(err, repository.ErrCorruptRecord) {
-			t.Fatalf("corrupt policy error = %v, want ErrCorruptRecord", err)
+		if err != nil {
+			t.Fatalf("unrelated corrupt acceptance error = %v", err)
 		}
-		assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
+		if commit.Generation != 2 {
+			t.Fatalf("unrelated corrupt acceptance generation = %d, want 2", commit.Generation)
+		}
+		if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+			corruptImage := tx.LoadJob(corrupt.JobID)
+			if corruptImage.Safety.State != repository.RecordCorrupt {
+				return fmt.Errorf("corrupt safety state = %s, want corrupt", corruptImage.Safety.State)
+			}
+			otherImage := tx.LoadJob(other.JobID)
+			if otherImage.Safety.State != repository.RecordValid || otherImage.Binding.State != repository.RecordValid || otherImage.Projection.State != repository.RecordValid {
+				return fmt.Errorf("other image states = binding:%s safety:%s projection:%s, want all valid", otherImage.Binding.State, otherImage.Safety.State, otherImage.Projection.State)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("touched corrupt binding and tombstone gate request operations", func(t *testing.T) {
+		t.Run("binding", func(t *testing.T) {
+			repo := factory.New(t)
+			fixture := newFixture(t, "corrupt-binding")
+			acceptFixture(t, repo, fixture)
+			factory.CorruptBinding(t, repo, fixture.RequestKey, "binding checksum")
+			before := factory.Snapshot(t, repo)
+
+			_, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+				return tx.PutBinding(fixture.Binding)
+			})
+			if !errors.Is(err, repository.ErrCorruptRecord) || !errors.Is(err, repository.ErrDefinitelyNotCommitted) {
+				t.Fatalf("touched corrupt binding error = %v, want ErrDefinitelyNotCommitted wrapping ErrCorruptRecord", err)
+			}
+			assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
+		})
+
+		t.Run("tombstone", func(t *testing.T) {
+			repo := factory.New(t)
+			fixture := newFixture(t, "corrupt-tombstone")
+			acceptFixture(t, repo, fixture)
+			if _, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+				if err := tx.DeleteLiveJob(fixture.JobID); err != nil {
+					return err
+				}
+				return tx.PutTombstone(repository.Tombstone{
+					RequestKey:        fixture.RequestKey,
+					JobID:             fixture.JobID,
+					TaskIdentity:      fixture.Identity,
+					ExpiredGeneration: 2,
+				})
+			}); err != nil {
+				t.Fatalf("create tombstone error = %v", err)
+			}
+			factory.CorruptTombstone(t, repo, fixture.RequestKey, "tombstone checksum")
+			before := factory.Snapshot(t, repo)
+
+			_, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+				return tx.PutBinding(fixture.Binding)
+			})
+			if !errors.Is(err, repository.ErrCorruptRecord) || !errors.Is(err, repository.ErrDefinitelyNotCommitted) {
+				t.Fatalf("touched corrupt tombstone error = %v, want ErrDefinitelyNotCommitted wrapping ErrCorruptRecord", err)
+			}
+			assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
+		})
+	})
+
+	t.Run("audit returns typed aggregate retaining all findings", func(t *testing.T) {
+		repo := factory.New(t)
+		first := newFixture(t, "audit-first")
+		second := newFixture(t, "audit-second")
+		acceptFixture(t, repo, first)
+		acceptFixture(t, repo, second)
+		if err := factory.Audit(t, repo); err != nil {
+			t.Fatalf("valid audit error = %v", err)
+		}
+		factory.CorruptSafety(t, repo, first.JobID, "safety checksum")
+		factory.CorruptBinding(t, repo, second.RequestKey, "binding checksum")
+
+		err := factory.Audit(t, repo)
+		if !errors.Is(err, repository.ErrCorruptRecord) {
+			t.Fatalf("audit error = %v, want ErrCorruptRecord", err)
+		}
+		var aggregate interface{ Unwrap() []error }
+		if !errors.As(err, &aggregate) {
+			t.Fatalf("audit error type = %T, want aggregate with Unwrap() []error", err)
+		}
+		if findings := aggregate.Unwrap(); len(findings) < 2 {
+			t.Fatalf("audit findings = %d, want at least 2", len(findings))
+		}
+	})
+
+	t.Run("after-commit failure preserves multi-record atomicity and is ambiguous", func(t *testing.T) {
+		repo := factory.New(t)
+		fixture := newFixture(t, "ambiguous-commit")
+		factory.FailCommitAfterCommit(t, repo, errors.New("after commit fault"))
+
+		commit, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+			if _, err := tx.AllocateJobID(); err != nil {
+				return err
+			}
+			return putAcceptance(tx, fixture)
+		})
+		if !errors.Is(err, repository.ErrAmbiguousCommit) {
+			t.Fatalf("after-commit failure error = %v, want ErrAmbiguousCommit", err)
+		}
+		if errors.Is(err, repository.ErrDefinitelyNotCommitted) {
+			t.Fatalf("after-commit failure error = %v, must not be ErrDefinitelyNotCommitted", err)
+		}
+		if commit.Generation != 1 {
+			t.Fatalf("ambiguous commit generation = %d, want 1", commit.Generation)
+		}
+		assertRequestBinding(t, repo, fixture.Binding)
+		assertJobImage(t, repo, fixture)
 	})
 
 	t.Run("list nonterminal by boot", func(t *testing.T) {

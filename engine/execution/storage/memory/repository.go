@@ -17,8 +17,9 @@ import (
 var nextMemoryDBUUID uint64
 
 type Repository struct {
-	mu    sync.Mutex
-	state storeState
+	mu                           sync.Mutex
+	state                        storeState
+	failCommitAfterCommitForTest error
 }
 
 func NewRepository() *Repository {
@@ -60,7 +61,10 @@ func (r *Repository) Update(ctx context.Context, fn func(repository.WriteTx) err
 	}
 
 	next := r.state.clone()
-	tx := &writeTx{readTx: readTx{state: &next}}
+	tx := &writeTx{
+		readTx: readTx{state: &next},
+		dirty:  newDirtySet(),
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			commit = repository.Commit{Generation: r.state.generation}
@@ -74,12 +78,16 @@ func (r *Repository) Update(ctx context.Context, fn func(repository.WriteTx) err
 	if !tx.changed {
 		return repository.Commit{Generation: r.state.generation}, nil
 	}
-	if err := next.validateForCommit(); err != nil {
+	if err := next.validateDirtyForCommit(tx.dirty); err != nil {
 		return repository.Commit{Generation: r.state.generation}, fmt.Errorf("%w: %w", repository.ErrDefinitelyNotCommitted, err)
 	}
 	next.advanceGeneration()
 	r.state = next
-	return repository.Commit{Generation: r.state.generation}, nil
+	commit = repository.Commit{Generation: r.state.generation}
+	if err := r.consumeCommitAfterCommitFaultForTest(); err != nil {
+		return commit, fmt.Errorf("%w: %w", repository.ErrAmbiguousCommit, err)
+	}
+	return commit, nil
 }
 
 func (r *Repository) SnapshotBytes() []byte {
@@ -102,6 +110,33 @@ func (r *Repository) AnchorIdentity() (string, uint16, error) {
 		return "", 0, fmt.Errorf("%w: meta is %s", repository.ErrInvalidRecord, r.state.meta.state)
 	}
 	return r.state.dbUUID, r.state.meta.value.SchemaVersion, nil
+}
+
+func (r *Repository) AuditIntegrity(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return r.state.auditIntegrity()
+}
+
+func (r *Repository) FailCommitAfterCommitForTest(err error) {
+	if err == nil {
+		err = fmt.Errorf("injected memory commit-phase failure")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failCommitAfterCommitForTest = err
+}
+
+func (r *Repository) consumeCommitAfterCommitFaultForTest() error {
+	err := r.failCommitAfterCommitForTest
+	r.failCommitAfterCommitForTest = nil
+	return err
 }
 
 func (r *Repository) InjectCorruptSafetyForTest(jobID model.JobID, diagnostic string) {
@@ -132,6 +167,12 @@ func (r *Repository) InjectCorruptBindingForTest(key model.RequestKey, diagnosti
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.state.bindings[key] = corruptSlot[model.Binding](diagnostic)
+}
+
+func (r *Repository) InjectCorruptTombstoneForTest(key model.RequestKey, diagnostic string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.tombstones[key] = corruptSlot[repository.Tombstone](diagnostic)
 }
 
 func (r *Repository) InjectMissingBindingForTest(key model.RequestKey) {
@@ -183,10 +224,7 @@ func (tx readTx) RootStats() (repository.AuthorityRootStats, error) {
 }
 
 func (tx readTx) LookupRequest(key model.RequestKey) repository.RequestImage {
-	return repository.RequestImage{
-		Binding:   recordFromMap(tx.state.bindings, key, cloneBinding),
-		Tombstone: recordFromMap(tx.state.tombstones, key, cloneTombstone),
-	}
+	return tx.state.requestImage(key)
 }
 
 func (tx readTx) LoadJob(jobID model.JobID) repository.JobImage {
@@ -229,13 +267,15 @@ func (tx readTx) ListNonterminalByBoot(bootID model.BootID) ([]repository.JobIma
 type writeTx struct {
 	readTx
 	changed bool
+	dirty   dirtySet
 }
 
 func (tx *writeTx) AllocateJobID() (model.JobID, error) {
-	if err := tx.state.rejectCorrupt(); err != nil {
-		return "", err
-	}
-	if tx.state.meta.state != repository.RecordValid {
+	switch tx.state.meta.state {
+	case repository.RecordCorrupt:
+		return "", repository.CorruptRecordError("meta", "authority", tx.state.meta.diagnostic)
+	case repository.RecordValid:
+	default:
 		return "", fmt.Errorf("%w: meta is %s", repository.ErrInvalidRecord, tx.state.meta.state)
 	}
 	seq := tx.state.nextJobSequence
@@ -249,13 +289,11 @@ func (tx *writeTx) AllocateJobID() (model.JobID, error) {
 	tx.state.nextJobSequence++
 	tx.state.syncMeta()
 	tx.changed = true
+	tx.dirty.markMeta()
 	return id, nil
 }
 
 func (tx *writeTx) PutMeta(meta repository.AuthorityMeta) error {
-	if err := tx.state.rejectCorrupt(); err != nil {
-		return err
-	}
 	current := tx.state.metaRecord()
 	if err := repository.ValidateAuthorityMetaPut(current, meta, tx.state.generation, tx.state.nextJobSequence, tx.state.rootStats()); err != nil {
 		return err
@@ -267,6 +305,7 @@ func (tx *writeTx) PutMeta(meta repository.AuthorityMeta) error {
 	tx.state.meta = validSlot(meta)
 	tx.state.syncMeta()
 	tx.changed = true
+	tx.dirty.markMeta()
 	return nil
 }
 
@@ -292,6 +331,8 @@ func (tx *writeTx) PutBinding(binding model.Binding) error {
 	}
 	tx.state.bindings[binding.RequestKey] = validSlot(cloneBinding(binding))
 	tx.changed = true
+	tx.dirty.markRequest(binding.RequestKey)
+	tx.dirty.markJob(binding.JobID)
 	return nil
 }
 
@@ -312,6 +353,8 @@ func (tx *writeTx) PutSafety(record model.SafetyRecord, expectedRevision uint64)
 		}
 		tx.state.safety[record.JobID] = validSlot(cloneSafetyRecord(record))
 		tx.changed = true
+		tx.dirty.markJob(record.JobID)
+		tx.dirty.markRequest(record.RequestKey)
 		return nil
 	}
 	if expectedRevision != slot.value.Revision {
@@ -325,6 +368,8 @@ func (tx *writeTx) PutSafety(record model.SafetyRecord, expectedRevision uint64)
 	}
 	tx.state.safety[record.JobID] = validSlot(cloneSafetyRecord(record))
 	tx.changed = true
+	tx.dirty.markJob(record.JobID)
+	tx.dirty.markRequest(record.RequestKey)
 	return nil
 }
 
@@ -344,6 +389,8 @@ func (tx *writeTx) PutProjection(projection model.JobProjection) error {
 	}
 	tx.state.projections[projection.JobID] = validSlot(cloneProjection(projection))
 	tx.changed = true
+	tx.dirty.markJob(projection.JobID)
+	tx.dirty.markRequest(projection.RequestKey)
 	return nil
 }
 
@@ -360,6 +407,7 @@ func (tx *writeTx) PutQuarantine(record repository.QuarantineRecord) error {
 	}
 	tx.state.quarantines[record.JobID] = validSlot(cloneQuarantine(record))
 	tx.changed = true
+	tx.dirty.markJob(record.JobID)
 	return nil
 }
 
@@ -379,6 +427,8 @@ func (tx *writeTx) PutTombstone(tombstone repository.Tombstone) error {
 	}
 	tx.state.tombstones[tombstone.RequestKey] = validSlot(cloneTombstone(tombstone))
 	tx.changed = true
+	tx.dirty.markRequest(tombstone.RequestKey)
+	tx.dirty.markJob(tombstone.JobID)
 	return nil
 }
 
@@ -386,19 +436,25 @@ func (tx *writeTx) DeleteLiveJob(jobID model.JobID) error {
 	if err := jobID.Validate(); err != nil {
 		return fmt.Errorf("%w: job_id: %v", repository.ErrInvalidRecord, err)
 	}
-	if err := tx.state.rejectCorrupt(); err != nil {
-		return err
-	}
 	deleted := false
-	if _, ok := tx.state.safety[jobID]; ok {
+	if slot, ok := tx.state.safety[jobID]; ok {
+		if slot.state == repository.RecordCorrupt {
+			return repository.CorruptRecordError("safety", jobID.String(), slot.diagnostic)
+		}
 		delete(tx.state.safety, jobID)
 		deleted = true
 	}
-	if _, ok := tx.state.projections[jobID]; ok {
+	if slot, ok := tx.state.projections[jobID]; ok {
+		if slot.state == repository.RecordCorrupt {
+			return repository.CorruptRecordError("projection", jobID.String(), slot.diagnostic)
+		}
 		delete(tx.state.projections, jobID)
 		deleted = true
 	}
-	if _, ok := tx.state.quarantines[jobID]; ok {
+	if slot, ok := tx.state.quarantines[jobID]; ok {
+		if slot.state == repository.RecordCorrupt {
+			return repository.CorruptRecordError("quarantine", jobID.String(), slot.diagnostic)
+		}
 		delete(tx.state.quarantines, jobID)
 		deleted = true
 	}
@@ -406,12 +462,97 @@ func (tx *writeTx) DeleteLiveJob(jobID model.JobID) error {
 		if slot.state == repository.RecordValid && slot.value.JobID == jobID {
 			delete(tx.state.bindings, key)
 			deleted = true
+			tx.dirty.markRequest(key)
 		}
 	}
 	if deleted {
 		tx.changed = true
+		tx.dirty.markJob(jobID)
 	}
 	return nil
+}
+
+type dirtySet struct {
+	meta     bool
+	requests map[model.RequestKey]struct{}
+	jobs     map[model.JobID]struct{}
+}
+
+func newDirtySet() dirtySet {
+	return dirtySet{
+		requests: map[model.RequestKey]struct{}{},
+		jobs:     map[model.JobID]struct{}{},
+	}
+}
+
+func (d *dirtySet) markMeta() {
+	d.meta = true
+}
+
+func (d *dirtySet) markRequest(key model.RequestKey) {
+	if d.requests == nil {
+		d.requests = map[model.RequestKey]struct{}{}
+	}
+	d.requests[key] = struct{}{}
+}
+
+func (d *dirtySet) markJob(jobID model.JobID) {
+	if d.jobs == nil {
+		d.jobs = map[model.JobID]struct{}{}
+	}
+	d.jobs[jobID] = struct{}{}
+}
+
+func (d dirtySet) expand(state *storeState) dirtySet {
+	closure := newDirtySet()
+	closure.meta = d.meta
+	for key := range d.requests {
+		closure.markRequest(key)
+	}
+	for jobID := range d.jobs {
+		closure.markJob(jobID)
+	}
+	changed := true
+	for changed {
+		changed = false
+		for key := range closure.requests {
+			image := state.requestImage(key)
+			if image.Binding.State == repository.RecordValid {
+				if _, ok := closure.jobs[image.Binding.Value.JobID]; !ok {
+					closure.markJob(image.Binding.Value.JobID)
+					changed = true
+				}
+			}
+			if image.Tombstone.State == repository.RecordValid {
+				if _, ok := closure.jobs[image.Tombstone.Value.JobID]; !ok {
+					closure.markJob(image.Tombstone.Value.JobID)
+					changed = true
+				}
+			}
+		}
+		for jobID := range closure.jobs {
+			image := state.jobImage(jobID)
+			if image.Binding.State == repository.RecordValid {
+				if _, ok := closure.requests[image.Binding.Value.RequestKey]; !ok {
+					closure.markRequest(image.Binding.Value.RequestKey)
+					changed = true
+				}
+			}
+			if image.Safety.State == repository.RecordValid {
+				if _, ok := closure.requests[image.Safety.Value.RequestKey]; !ok {
+					closure.markRequest(image.Safety.Value.RequestKey)
+					changed = true
+				}
+			}
+			if image.Projection.State == repository.RecordValid {
+				if _, ok := closure.requests[image.Projection.Value.RequestKey]; !ok {
+					closure.markRequest(image.Projection.Value.RequestKey)
+					changed = true
+				}
+			}
+		}
+	}
+	return closure
 }
 
 type storeState struct {
@@ -507,6 +648,13 @@ func (s *storeState) jobImage(jobID model.JobID) repository.JobImage {
 	return image
 }
 
+func (s *storeState) requestImage(key model.RequestKey) repository.RequestImage {
+	return repository.RequestImage{
+		Binding:   recordFromMap(s.bindings, key, cloneBinding),
+		Tombstone: recordFromMap(s.tombstones, key, cloneTombstone),
+	}
+}
+
 func (s *storeState) jobIDs() []model.JobID {
 	seen := map[model.JobID]struct{}{}
 	for id := range s.safety {
@@ -531,6 +679,51 @@ func (s *storeState) jobIDs() []model.JobID {
 	return ids
 }
 
+func (s *storeState) jobIDSet() map[model.JobID]struct{} {
+	seen := map[model.JobID]struct{}{}
+	for id := range s.safety {
+		seen[id] = struct{}{}
+	}
+	for id := range s.projections {
+		seen[id] = struct{}{}
+	}
+	for id := range s.quarantines {
+		seen[id] = struct{}{}
+	}
+	for _, slot := range s.bindings {
+		if slot.state == repository.RecordValid {
+			seen[slot.value.JobID] = struct{}{}
+		}
+	}
+	for _, slot := range s.tombstones {
+		if slot.state == repository.RecordValid {
+			seen[slot.value.JobID] = struct{}{}
+		}
+	}
+	return seen
+}
+
+func (s *storeState) requestKeys() map[model.RequestKey]struct{} {
+	seen := map[model.RequestKey]struct{}{}
+	for key := range s.bindings {
+		seen[key] = struct{}{}
+	}
+	for key := range s.tombstones {
+		seen[key] = struct{}{}
+	}
+	for _, slot := range s.safety {
+		if slot.state == repository.RecordValid {
+			seen[slot.value.RequestKey] = struct{}{}
+		}
+	}
+	for _, slot := range s.projections {
+		if slot.state == repository.RecordValid {
+			seen[slot.value.RequestKey] = struct{}{}
+		}
+	}
+	return seen
+}
+
 func (s *storeState) rootStats() repository.AuthorityRootStats {
 	stats := repository.AuthorityRootStats{
 		Jobs:       len(s.jobIDs()),
@@ -547,6 +740,65 @@ func (s *storeState) rootStats() repository.AuthorityRootStats {
 		}
 	}
 	return stats
+}
+
+func (s *storeState) validateDirtyForCommit(dirty dirtySet) error {
+	if dirty.meta {
+		if s.meta.state == repository.RecordCorrupt {
+			return repository.CorruptRecordError("meta", "authority", s.meta.diagnostic)
+		}
+		if s.meta.state != repository.RecordValid {
+			return fmt.Errorf("%w: meta is %s", repository.ErrInvalidRecord, s.meta.state)
+		}
+		meta := s.meta.value
+		meta.Generation = s.generation
+		meta.NextJobSequence = s.nextJobSequence
+		if err := meta.Validate(); err != nil {
+			return err
+		}
+	}
+	closure := dirty.expand(s)
+	for key := range closure.requests {
+		if err := repository.ValidateRequestClosure(key, s.requestImage(key), s.jobImage); err != nil {
+			return err
+		}
+	}
+	for jobID := range closure.jobs {
+		if err := repository.ValidateJobClosure(jobID, s.jobImage(jobID), s.requestImage); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *storeState) auditIntegrity() error {
+	var findings []error
+	if strings.TrimSpace(s.dbUUID) == "" {
+		findings = append(findings, repository.NewIntegrityFinding("db_uuid", "authority", fmt.Errorf("%w: db_uuid is missing", repository.ErrInvalidRecord)))
+	}
+	if s.meta.state == repository.RecordCorrupt {
+		findings = append(findings, repository.NewIntegrityFinding("meta", "authority", repository.CorruptRecordError("meta", "authority", s.meta.diagnostic)))
+	} else if s.meta.state == repository.RecordValid {
+		meta := s.meta.value
+		meta.Generation = s.generation
+		meta.NextJobSequence = s.nextJobSequence
+		if err := meta.Validate(); err != nil {
+			findings = append(findings, repository.NewIntegrityFinding("meta", "authority", err))
+		}
+	} else if !s.rootStats().Empty() {
+		findings = append(findings, repository.NewIntegrityFinding("meta", "authority", fmt.Errorf("%w: meta is %s on non-empty authority root", repository.ErrCorruptRecord, s.meta.state)))
+	}
+	for key := range s.requestKeys() {
+		if err := repository.ValidateRequestClosure(key, s.requestImage(key), s.jobImage); err != nil {
+			findings = append(findings, repository.NewIntegrityFinding("request", key.String(), err))
+		}
+	}
+	for jobID := range s.jobIDSet() {
+		if err := repository.ValidateJobClosure(jobID, s.jobImage(jobID), s.requestImage); err != nil {
+			findings = append(findings, repository.NewIntegrityFinding("job", jobID.String(), err))
+		}
+	}
+	return repository.NewIntegrityError(findings)
 }
 
 func (s *storeState) validateForCommit() error {

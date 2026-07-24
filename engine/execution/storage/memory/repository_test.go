@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"context"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -30,6 +31,22 @@ func TestRepositoryContract(t *testing.T) {
 			}
 			memoryRepo.InjectCorruptSafetyForTest(jobID, diagnostic)
 		},
+		CorruptBinding: func(t *testing.T, repo repository.Repository, key model.RequestKey, diagnostic string) {
+			t.Helper()
+			memoryRepo, ok := repo.(*Repository)
+			if !ok {
+				t.Fatalf("repo type = %T, want *memory.Repository", repo)
+			}
+			memoryRepo.InjectCorruptBindingForTest(key, diagnostic)
+		},
+		CorruptTombstone: func(t *testing.T, repo repository.Repository, key model.RequestKey, diagnostic string) {
+			t.Helper()
+			memoryRepo, ok := repo.(*Repository)
+			if !ok {
+				t.Fatalf("repo type = %T, want *memory.Repository", repo)
+			}
+			memoryRepo.InjectCorruptTombstoneForTest(key, diagnostic)
+		},
 		MissingMeta: func(t *testing.T, repo repository.Repository) {
 			t.Helper()
 			memoryRepo, ok := repo.(*Repository)
@@ -37,6 +54,22 @@ func TestRepositoryContract(t *testing.T) {
 				t.Fatalf("repo type = %T, want *memory.Repository", repo)
 			}
 			memoryRepo.InjectMissingMetaForTest()
+		},
+		FailCommitAfterCommit: func(t *testing.T, repo repository.Repository, err error) {
+			t.Helper()
+			memoryRepo, ok := repo.(*Repository)
+			if !ok {
+				t.Fatalf("repo type = %T, want *memory.Repository", repo)
+			}
+			memoryRepo.FailCommitAfterCommitForTest(err)
+		},
+		Audit: func(t *testing.T, repo repository.Repository) error {
+			t.Helper()
+			memoryRepo, ok := repo.(*Repository)
+			if !ok {
+				t.Fatalf("repo type = %T, want *memory.Repository", repo)
+			}
+			return memoryRepo.AuditIntegrity(context.Background())
 		},
 	})
 }

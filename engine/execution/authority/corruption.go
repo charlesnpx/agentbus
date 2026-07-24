@@ -193,6 +193,15 @@ func postDurableFailStopError(operation string, err, stopErr error) error {
 	return fmt.Errorf("%w: %s after durable commit: %w; durable fail-stop: %w", ErrFailStopRecord, operation, err, stopErr)
 }
 
+func (core *authorityCore) tripSafetyLatchOnRepositoryCorruption(err error) {
+	if core == nil || core.latch == nil || err == nil {
+		return
+	}
+	if errors.Is(err, repository.ErrCorruptRecord) {
+		core.latch.Trip(err)
+	}
+}
+
 func recoveryPlansTx(tx repository.ReadTx, boot model.BootRef, trigger model.RecoveryTrigger, priorBootOnly bool) ([]JobRecoveryPlan, error) {
 	images, err := tx.ListJobs(repository.JobFilter{})
 	if err != nil {

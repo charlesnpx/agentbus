@@ -30,6 +30,14 @@ type Repository interface {
 	Update(context.Context, func(WriteTx) error) (Commit, error)
 }
 
+type Auditor interface {
+	AuditIntegrity(context.Context) error
+}
+
+type AnchorIdentified interface {
+	AnchorIdentity() (string, uint16, error)
+}
+
 type ReadTx interface {
 	Meta() Record[AuthorityMeta]
 	RootStats() (AuthorityRootStats, error)

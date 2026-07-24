@@ -59,6 +59,7 @@ type authorityCore struct {
 	runtime  *runtimeRegistry
 	verifier custodian.AttestationVerifier
 	boot     bootStatus
+	latch    *SafetyLatch
 }
 
 type syncMutex interface {
