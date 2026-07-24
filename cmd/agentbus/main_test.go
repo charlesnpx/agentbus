@@ -435,6 +435,86 @@ func TestStatusResultCancelProtocolErrorExitCodes(t *testing.T) {
 	}
 }
 
+func TestProtocolCommandErrorStartupErrorExitCodes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		err        error
+		wantCode   int
+		wantStderr []string
+	}{
+		{
+			name: "authority fail stop code",
+			err: &daemonlaunch.StartupError{
+				Kind:    daemonlaunch.ErrStartupFailed,
+				Code:    authority.ErrFailStopped.Error(),
+				Message: "authority fail-stopped: persisted unsafe stop",
+			},
+			wantCode:   cliExitAuthorityFailStop,
+			wantStderr: []string{"code=backend_unavailable", "admissionCause=root_fail_stopped", "authority fail-stopped"},
+		},
+		{
+			name: "served safety fail stop code",
+			err: &daemonlaunch.StartupError{
+				Kind:    daemonlaunch.ErrStartupFailed,
+				Code:    cliStartupCodeServedSafetyFailStopped,
+				Message: "served safety fail-stop: authority fail-stopped: persisted unsafe stop",
+			},
+			wantCode:   cliExitAuthorityFailStop,
+			wantStderr: []string{"code=backend_unavailable", "admissionCause=root_fail_stopped", "served safety fail-stop"},
+		},
+		{
+			name:       "readiness timeout",
+			err:        &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessTimeout, Message: "deadline exceeded"},
+			wantCode:   cliExitDaemonStartupFailure,
+			wantStderr: []string{"daemon readiness timed out"},
+		},
+		{
+			name:       "readiness protocol",
+			err:        &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessProtocol, Message: "bad frame"},
+			wantCode:   cliExitDaemonStartupFailure,
+			wantStderr: []string{"daemon readiness protocol error"},
+		},
+		{
+			name:       "readiness eof",
+			err:        &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessEOF},
+			wantCode:   cliExitDaemonStartupFailure,
+			wantStderr: []string{"daemon exited before readiness"},
+		},
+		{
+			name:       "other startup kind",
+			err:        &daemonlaunch.StartupError{Kind: errors.New("daemon spawn failed"), Message: "exec failed"},
+			wantCode:   cliExitDaemonStartupFailure,
+			wantStderr: []string{"daemon spawn failed", "exec failed"},
+		},
+		{
+			name: "unknown startup code",
+			err: &daemonlaunch.StartupError{
+				Kind:    daemonlaunch.ErrStartupFailed,
+				Code:    "strict admission support unavailable",
+				Message: "unsupported host",
+			},
+			wantCode:   cliExitDaemonStartupFailure,
+			wantStderr: []string{"daemon startup failed", "strict admission support unavailable"},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			code := protocolCommandError(&stderr, "status", tt.err)
+			if code != tt.wantCode {
+				t.Fatalf("exit=%d want=%d stderr=%s", code, tt.wantCode, stderr.String())
+			}
+			for _, want := range tt.wantStderr {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("stderr=%q, want %q", stderr.String(), want)
+				}
+			}
+		})
+	}
+}
+
 func TestStatusResultCancelDaemonStartupFailureLeavesRootEmpty(t *testing.T) {
 	t.Parallel()
 	for _, args := range [][]string{

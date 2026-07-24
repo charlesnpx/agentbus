@@ -23,6 +23,7 @@ import (
 	agentclient "github.com/charlesnpx/agentbus/client"
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
@@ -320,6 +321,34 @@ func TestProductionStrictCLIStatusFailStopExitE2B(t *testing.T) {
 	}
 }
 
+func TestProductionStrictCLIStatusPersistedFailStopAutostartExitE2B(t *testing.T) {
+	requireProductionStrictE2BGate(t)
+	agentbusPath := builtServedNativeAgentbusPath(t)
+	stateRoot := shortTempDir(t)
+	fixture := installServedNativeCodexFixture(t, stateRoot)
+
+	first := launchProductionStrictDaemonE2B(t, agentbusPath, stateRoot, fixture.env)
+	killProductionStrictDaemonE2B(t, first, "daemon before persisted fail-stop autostart")
+	assertProductionStrictPIDAbsentE2B(t, first.PID, 5*time.Second)
+
+	persistProductionStrictFailStopE2B(t, stateRoot, "production strict E2B persisted fail-stop")
+	result := runProductionStrictJobCLI(t, agentbusPath, stateRoot, fixture.env, 12, "status", "--job", "job_persisted_failstop", "--json")
+	if result.stdout != "" {
+		t.Fatalf("persisted fail-stop stdout = %q, want empty", result.stdout)
+	}
+	for _, want := range []string{
+		"code=backend_unavailable",
+		"admissionCause=root_fail_stopped",
+		ErrSafetyFailStopped.Error(),
+		authority.ErrFailStopped.Error(),
+	} {
+		if !strings.Contains(result.stderr, want) {
+			t.Fatalf("persisted fail-stop stderr = %q, want %q", result.stderr, want)
+		}
+	}
+	assertProductionStrictDaemonCountE2B(t, agentbusPath, 0)
+}
+
 func TestProductionStrictAutostartRaceConvergesOneDaemonE2B(t *testing.T) {
 	requireProductionStrictE2BGate(t)
 	stateRoot := shortTempDir(t)
@@ -596,6 +625,39 @@ func startFailStoppedProtocolDaemonE2B(t *testing.T, stateRoot string) <-chan er
 		done <- nil
 	}()
 	return done
+}
+
+func persistProductionStrictFailStopE2B(t *testing.T, stateRoot, reason string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	repo, err := openReadOnlyAdmissionRepositoryWithContentionRetry(ctx, filepath.Join(stateRoot, admissionRepositoryFile), filepath.Join(stateRoot, protocol.SocketName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbUUID, schemaMajor, identityErr := repo.AnchorIdentity()
+	closeErr := repo.Close()
+	if identityErr != nil {
+		t.Fatal(identityErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	boot, err := model.NewBootRef("boot-production-strict-fail-stop-e2b", "owner-production-strict-fail-stop-e2b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor := authority.NewFileAnchor(filepath.Join(stateRoot, admissionAnchorFile), dbUUID, schemaMajor)
+	if err := anchor.FailStop(ctx, boot, reason); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := authority.InspectAdmissionRoot(ctx, stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.FailStopped || !strings.Contains(inspection.FailStopReason, reason) {
+		t.Fatalf("inspection after fail-stop = %+v, want reason %q", inspection, reason)
+	}
 }
 
 type productionStrictClientStarterE2B struct {

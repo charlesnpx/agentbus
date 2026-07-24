@@ -30,6 +30,9 @@ const (
 	cliExitUnknownJob           = 10
 	cliExitDaemonStartupFailure = 11
 	cliExitAuthorityFailStop    = 12
+
+	// Keep this local so cmd/agentbus reaches served only through agentbusserve.
+	cliStartupCodeServedSafetyFailStopped = "served safety fail-stop"
 )
 
 var version = "dev"
@@ -962,10 +965,16 @@ func protocolCommandError(errOut io.Writer, operation string, err error) int {
 		}
 		return cliExitCodeForProtocolError(rpcErr)
 	}
-	fmt.Fprintf(errOut, "agentbus: %s failed: %v\n", operation, err)
-	if errors.Is(err, daemonlaunch.ErrStartupFailed) {
+	var startupErr *daemonlaunch.StartupError
+	if errors.As(err, &startupErr) {
+		if startupErrorIsAuthorityFailStop(startupErr) {
+			fmt.Fprintf(errOut, "agentbus: %s failed (code=%s admissionCause=%s): %v\n", operation, protocol.ErrorBackendUnavailable, protocol.AdmissionRejectRootFailStopped, err)
+			return cliExitAuthorityFailStop
+		}
+		fmt.Fprintf(errOut, "agentbus: %s failed: %v\n", operation, err)
 		return cliExitDaemonStartupFailure
 	}
+	fmt.Fprintf(errOut, "agentbus: %s failed: %v\n", operation, err)
 	return 1
 }
 
@@ -991,6 +1000,18 @@ func cliExitCodeForProtocolError(err *protocol.RPCError) int {
 		return cliExitUnknownJob
 	}
 	return 1
+}
+
+func startupErrorIsAuthorityFailStop(err *daemonlaunch.StartupError) bool {
+	if err == nil {
+		return false
+	}
+	switch strings.TrimSpace(err.Code) {
+	case authority.ErrFailStopped.Error(), cliStartupCodeServedSafetyFailStopped:
+		return true
+	default:
+		return false
+	}
 }
 
 func cliExitCodeForState(state engine.JobState) int {
