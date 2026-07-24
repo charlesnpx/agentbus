@@ -931,6 +931,18 @@ func TestSealAndInspectSurfaceCorruptSafetyStats(t *testing.T) {
 	}
 }
 
+func TestSealAndInspectSurfaceCorruptBindingIndexStats(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	jobID := addPendingAdmissionJobForTest(t, ctx, root, "seal-corrupt-binding-index")
+	corruptAdmissionBindingIndexForTest(t, root, jobID, mustRequestKey(t, "workspace-seal-corrupt-binding-index-other", "request-seal-corrupt-binding-index-other"))
+
+	_, err := InspectAdmissionRoot(ctx, root)
+	requireCorruptRecordKind(t, err, "binding_index")
+	_, err = SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: filepath.Join(t.TempDir(), "new-domain")})
+	requireCorruptRecordKind(t, err, "binding_index")
+}
+
 func beginBboltAdmissionRoot(t *testing.T, root, name string) (*bboltrepo.Repository, *RecoverySession) {
 	t.Helper()
 	session, repo, err := beginBboltAdmissionRootAllowError(context.Background(), root, name)
@@ -1079,6 +1091,38 @@ func corruptAdmissionSafetyForTest(t *testing.T, root string, jobID model.JobID,
 	repo.InjectCorruptSafetyForTest(jobID, diagnostic)
 	if err := repo.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func corruptAdmissionBindingIndexForTest(t *testing.T, root string, jobID model.JobID, key model.RequestKey) {
+	t.Helper()
+	repo, err := bboltrepo.NewRepository(filepath.Join(root, AdmissionRepositoryFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.InjectCorruptBindingIndexValueForTest(jobID, key)
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustRequestKey(t *testing.T, workspace, request string) model.RequestKey {
+	t.Helper()
+	key, err := model.NewRequestKey(workspace, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func requireCorruptRecordKind(t *testing.T, err error, kind string) {
+	t.Helper()
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("error = %v, want ErrCorruptRecord", err)
+	}
+	var corrupt repository.CorruptRecordKindError
+	if !errors.As(err, &corrupt) || corrupt.Kind != kind {
+		t.Fatalf("error = %T %v, want corrupt kind %s", err, err, kind)
 	}
 }
 

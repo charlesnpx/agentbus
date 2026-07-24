@@ -1531,6 +1531,23 @@ func (s *Server) failStopAdmissionReady(ctx context.Context, err error) error {
 	return stopErr
 }
 
+func (s *Server) failStopAdmissionRepositoryCorruption(ctx context.Context, operation string, err error) error {
+	if s == nil {
+		return err
+	}
+	s.admissionStateMu.RLock()
+	ready := s.admissionReady
+	ok := s.admissionInstance != nil && ready != nil
+	s.admissionStateMu.RUnlock()
+	if !ok {
+		if s.safetyLatch != nil && errors.Is(err, repository.ErrCorruptRecord) {
+			s.safetyLatch.Trip(err)
+		}
+		return err
+	}
+	return ready.FailStopRepositoryCorruption(ctx, operation, err)
+}
+
 func detachedAdmissionFailStopContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -2222,6 +2239,13 @@ func admissionProtocolError(err error) *protocol.ErrorObject {
 			err.Error(),
 			protocol.ErrorData{},
 		)
+	case errors.Is(err, repository.ErrCorruptRecord):
+		return strictAdmissionProtocolError(
+			protocol.ErrorBackendUnavailable,
+			protocol.AdmissionRejectRootCorrupt,
+			err.Error(),
+			protocol.ErrorData{},
+		)
 	case errors.Is(err, authority.ErrFailStopped):
 		return strictAdmissionProtocolError(
 			protocol.ErrorBackendUnavailable,
@@ -2308,23 +2332,22 @@ func (s *Server) listAuthorityStatuses() ([]protocol.JobStatus, *protocol.ErrorO
 	// admissionStateMu.
 	s.admissionStateMu.RLock()
 	repo := s.admissionRepository
-	ready := s.admissionInstance != nil && repo != nil
+	ready := s.admissionReady
+	ok := s.admissionInstance != nil && repo != nil && ready != nil
 	s.admissionStateMu.RUnlock()
-	if !ready {
+	if !ok {
 		return nil, nil
 	}
 	var statuses []protocol.JobStatus
-	var authorityListErr *protocol.ErrorObject
 	if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
 		images, err := tx.ListJobs(repository.JobFilter{})
 		if err != nil {
 			return err
 		}
 		for _, image := range images {
-			status, ok, errObj := authorityStatusFromImage(image)
-			if errObj != nil {
-				authorityListErr = errObj
-				return errors.New(errObj.Message)
+			status, ok, err := authorityStatusFromImage(image)
+			if err != nil {
+				return err
 			}
 			if ok {
 				statuses = append(statuses, status)
@@ -2332,8 +2355,8 @@ func (s *Server) listAuthorityStatuses() ([]protocol.JobStatus, *protocol.ErrorO
 		}
 		return nil
 	}); err != nil {
-		if authorityListErr != nil {
-			return nil, authorityListErr
+		if errors.Is(err, repository.ErrCorruptRecord) {
+			err = s.failStopAdmissionRepositoryCorruption(context.Background(), "list authority statuses", err)
 		}
 		return nil, admissionProtocolError(err)
 	}
@@ -2375,8 +2398,11 @@ func (s *Server) authorityJobProjection(jobID string) (model.SafetyRecord, model
 	if err != nil {
 		return model.SafetyRecord{}, model.JobProjection{}, false, admissionProtocolError(err)
 	}
-	if image.Safety.State == repository.RecordMissing && image.Projection.State == repository.RecordMissing {
+	if authorityImageEmpty(image) {
 		return model.SafetyRecord{}, model.JobProjection{}, false, nil
+	}
+	if err := authorityImageSafetyCorruption(image); err != nil {
+		return model.SafetyRecord{}, model.JobProjection{}, false, admissionProtocolError(s.failStopAdmissionRepositoryCorruption(context.Background(), "authority job projection", err))
 	}
 	if image.Safety.State != repository.RecordValid {
 		return model.SafetyRecord{}, model.JobProjection{}, false, protocol.NewError(protocol.ErrorInvalidTaskSpec, "authority safety record is not valid", protocol.ErrorData{JobID: jobID})
@@ -2387,8 +2413,8 @@ func (s *Server) authorityJobProjection(jobID string) (model.SafetyRecord, model
 	return image.Safety.Value, image.Projection.Value, true, nil
 }
 
-func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bool, *protocol.ErrorObject) {
-	if image.Safety.State == repository.RecordMissing && image.Projection.State == repository.RecordMissing {
+func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bool, error) {
+	if authorityImageEmpty(image) {
 		return protocol.JobStatus{}, false, nil
 	}
 	jobID := ""
@@ -2397,11 +2423,14 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 	} else if image.Projection.State == repository.RecordValid {
 		jobID = image.Projection.Value.JobID.String()
 	}
+	if err := authorityImageSafetyCorruption(image); err != nil {
+		return protocol.JobStatus{}, false, err
+	}
 	if image.Safety.State != repository.RecordValid {
-		return protocol.JobStatus{}, false, protocol.NewError(protocol.ErrorInvalidTaskSpec, "authority safety record is not valid", protocol.ErrorData{JobID: jobID})
+		return protocol.JobStatus{}, false, fmt.Errorf("%w: authority safety record is not valid for %s", authority.ErrInvalidRequest, jobID)
 	}
 	if image.Projection.State != repository.RecordValid {
-		return protocol.JobStatus{}, false, protocol.NewError(protocol.ErrorInvalidTaskSpec, "authority projection is not valid", protocol.ErrorData{JobID: jobID})
+		return protocol.JobStatus{}, false, fmt.Errorf("%w: authority projection is not valid for %s", authority.ErrInvalidRequest, jobID)
 	}
 	projection := image.Projection.Value
 	return protocol.JobStatus{
@@ -2409,6 +2438,54 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 		SessionID: projection.SessionID,
 		State:     admissionState(projection.Public),
 	}, true, nil
+}
+
+func authorityImageEmpty(image repository.JobImage) bool {
+	return image.Binding.State == repository.RecordMissing &&
+		image.Safety.State == repository.RecordMissing &&
+		image.Projection.State == repository.RecordMissing &&
+		image.Quarantine.State == repository.RecordMissing
+}
+
+func authorityImageSafetyCorruption(image repository.JobImage) error {
+	jobID := authorityImageJobID(image)
+	if image.Binding.State == repository.RecordCorrupt {
+		return repository.CorruptRecordError(authorityBindingCorruptionKind(image.Binding.Diagnostic), jobID, image.Binding.Diagnostic)
+	}
+	if image.Safety.State == repository.RecordCorrupt {
+		return repository.CorruptRecordError("safety", jobID, image.Safety.Diagnostic)
+	}
+	if image.Safety.State == repository.RecordValid && image.Binding.State == repository.RecordMissing {
+		return repository.CorruptRecordError("binding", jobID, "missing binding")
+	}
+	if image.Safety.State == repository.RecordMissing && (image.Binding.State == repository.RecordValid || image.Projection.State == repository.RecordValid) {
+		return repository.CorruptRecordError("safety", jobID, "missing safety record")
+	}
+	return nil
+}
+
+func authorityBindingCorruptionKind(diagnostic string) string {
+	diagnostic = strings.ToLower(diagnostic)
+	if strings.Contains(diagnostic, "binding_index") || strings.Contains(diagnostic, "binding index") {
+		return "binding_index"
+	}
+	return "binding"
+}
+
+func authorityImageJobID(image repository.JobImage) string {
+	if image.Safety.State == repository.RecordValid {
+		return image.Safety.Value.JobID.String()
+	}
+	if image.Binding.State == repository.RecordValid {
+		return image.Binding.Value.JobID.String()
+	}
+	if image.Projection.State == repository.RecordValid {
+		return image.Projection.Value.JobID.String()
+	}
+	if image.Quarantine.State == repository.RecordValid {
+		return image.Quarantine.Value.JobID.String()
+	}
+	return ""
 }
 
 func (s *Server) authorityResultInfo(ref model.ResultRef) *engine.ResultInfo {

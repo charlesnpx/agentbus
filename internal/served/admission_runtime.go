@@ -369,37 +369,27 @@ func (p servedResultPublisher) authorityRecord(ctx context.Context, jobID model.
 		return model.SafetyRecord{}, false, nil
 	}
 	p.server.admissionStateMu.RLock()
-	repo := p.server.admissionRepository
-	ready := p.server.admissionInstance != nil && repo != nil
+	ready := p.server.admissionReady
+	ok := p.server.admissionInstance != nil && ready != nil
 	p.server.admissionStateMu.RUnlock()
-	if !ready {
+	if !ok {
 		return model.SafetyRecord{}, false, authority.ErrNotReady
 	}
-	var image repository.JobImage
-	if err := repo.View(ctx, func(tx repository.ReadTx) error {
-		image = tx.LoadJob(jobID)
-		return nil
-	}); err != nil {
+	image, err := ready.LoadJob(ctx, jobID)
+	if err != nil {
 		if admissionAuthorityNotReadyError(err) {
 			return model.SafetyRecord{}, false, authority.ErrNotReady
 		}
 		return model.SafetyRecord{}, false, err
 	}
+	if err := authorityImageSafetyCorruption(image); err != nil {
+		return model.SafetyRecord{}, false, p.server.failStopAdmissionRepositoryCorruption(ctx, "served result authority record", err)
+	}
 	if image.Safety.State == repository.RecordValid {
 		return image.Safety.Value, true, nil
 	}
-	if image.Safety.State == repository.RecordMissing &&
-		image.Binding.State == repository.RecordMissing &&
-		image.Projection.State == repository.RecordMissing &&
-		image.Quarantine.State == repository.RecordMissing {
+	if authorityImageEmpty(image) {
 		return model.SafetyRecord{}, false, nil
-	}
-	if image.Safety.State == repository.RecordCorrupt {
-		diagnostic := image.Safety.Diagnostic
-		if diagnostic == "" {
-			diagnostic = "corrupt"
-		}
-		return model.SafetyRecord{}, false, fmt.Errorf("%w: safety: %s", repository.ErrCorruptRecord, diagnostic)
 	}
 	return model.SafetyRecord{}, false, fmt.Errorf("authority safety state = %s for %s", image.Safety.State, jobID)
 }

@@ -265,6 +265,39 @@ func TestBindingIndexMismatchIsCorruptionAndAuditFinding(t *testing.T) {
 	}
 }
 
+func TestBindingIndexValueCorruptionFailsProductionReads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	fixture := newBboltFixture(t, "index-value-corrupt")
+	acceptBboltFixture(t, repo, fixture)
+	repo.InjectCorruptBindingIndexValueForTest(fixture.JobID, mustRequestKeyForTest(t, "workspace-index-value-other", "request-index-value-other"))
+
+	err = repo.View(context.Background(), func(tx repository.ReadTx) error {
+		_, err := tx.ListJobs(repository.JobFilter{})
+		return err
+	})
+	requireCorruptKind(t, err, "binding_index")
+
+	err = repo.View(context.Background(), func(tx repository.ReadTx) error {
+		_, err := tx.RootStats()
+		return err
+	})
+	requireCorruptKind(t, err, "binding_index")
+
+	err = repo.View(context.Background(), func(tx repository.ReadTx) error {
+		image := tx.LoadJob(fixture.JobID)
+		if image.Binding.State != repository.RecordCorrupt {
+			return fmt.Errorf("binding state = %s, want corrupt", image.Binding.State)
+		}
+		return repository.ValidateJobClosure(fixture.JobID, image, tx.LookupRequest)
+	})
+	requireCorruptKind(t, err, "binding_index")
+}
+
 func TestAuditIntegrityMissingBindingIndexReturnsTypedFinding(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
 	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
@@ -359,6 +392,17 @@ func TestRootStatsFailsOnCorruptSafetyBindingAndTombstoneRecords(t *testing.T) {
 				t.Fatalf("RootStats error = %v, want %s diagnostic", err, tt.name)
 			}
 		})
+	}
+}
+
+func requireCorruptKind(t *testing.T, err error, kind string) {
+	t.Helper()
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("error = %v, want ErrCorruptRecord", err)
+	}
+	var corrupt repository.CorruptRecordKindError
+	if !errors.As(err, &corrupt) || corrupt.Kind != kind {
+		t.Fatalf("error = %T %v, want corrupt kind %s", err, err, kind)
 	}
 }
 

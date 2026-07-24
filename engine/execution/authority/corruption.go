@@ -66,10 +66,7 @@ func (r *Ready) CorruptionPlans(ctx context.Context) ([]JobRecoveryPlan, error) 
 		for _, image := range images {
 			switch image.Safety.State {
 			case repository.RecordCorrupt:
-				plans = append(plans, JobRecoveryPlan{
-					Plan:       model.RecoveryPlan{Next: model.RecoveryAction{Kind: model.RecoveryFatalUnprovable}},
-					Diagnostic: image.Safety.Diagnostic,
-				})
+				return repository.CorruptRecordError("safety", imageJobIDString(image), image.Safety.Diagnostic)
 			case repository.RecordValid:
 				if image.Safety.Value.Terminal != nil || image.Projection.State != repository.RecordCorrupt {
 					continue
@@ -147,6 +144,15 @@ func (r *Ready) FailStop(ctx context.Context, reason string) error {
 		return err
 	}
 	return r.core.failStopLockedWithContext(failStopCtx, reason)
+}
+
+func (r *Ready) FailStopRepositoryCorruption(ctx context.Context, operation string, err error) error {
+	if r == nil || r.core == nil {
+		return ErrNotReady
+	}
+	r.core.mu.Lock()
+	defer r.core.mu.Unlock()
+	return r.core.failStopOnRepositoryCorruptionLocked(ctx, operation, err)
 }
 
 func (s *RecoverySession) FailStop(ctx context.Context, reason string) error {
@@ -259,9 +265,6 @@ func safetySignificantRepositoryCorruption(err error) bool {
 			return true
 		}
 	}
-	if strings.Contains(message, "projection") || strings.Contains(message, "quarantine") {
-		return false
-	}
 	return true
 }
 
@@ -285,10 +288,7 @@ func recoveryPlansTx(tx repository.ReadTx, boot model.BootRef, trigger model.Rec
 	for _, image := range images {
 		switch image.Safety.State {
 		case repository.RecordCorrupt:
-			plans = append(plans, JobRecoveryPlan{
-				Plan:       model.RecoveryPlan{Next: model.RecoveryAction{Kind: model.RecoveryFatalUnprovable}},
-				Diagnostic: image.Safety.Diagnostic,
-			})
+			return nil, repository.CorruptRecordError("safety", imageJobIDString(image), image.Safety.Diagnostic)
 		case repository.RecordValid:
 			record := image.Safety.Value
 			if record.Terminal != nil {
@@ -305,4 +305,20 @@ func recoveryPlansTx(tx repository.ReadTx, boot model.BootRef, trigger model.Rec
 		}
 	}
 	return plans, nil
+}
+
+func imageJobIDString(image repository.JobImage) string {
+	if image.Safety.State == repository.RecordValid {
+		return image.Safety.Value.JobID.String()
+	}
+	if image.Binding.State == repository.RecordValid {
+		return image.Binding.Value.JobID.String()
+	}
+	if image.Projection.State == repository.RecordValid {
+		return image.Projection.Value.JobID.String()
+	}
+	if image.Quarantine.State == repository.RecordValid {
+		return image.Quarantine.Value.JobID.String()
+	}
+	return ""
 }

@@ -547,6 +547,61 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 		})
 	})
 
+	t.Run("RootStats fails on corrupt safety binding and tombstone records", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			corrupt func(repository.Repository, fixture)
+		}{
+			{
+				name: "safety",
+				corrupt: func(repo repository.Repository, fixture fixture) {
+					factory.CorruptSafety(t, repo, fixture.JobID, "safety checksum")
+				},
+			},
+			{
+				name: "binding",
+				corrupt: func(repo repository.Repository, fixture fixture) {
+					factory.CorruptBinding(t, repo, fixture.RequestKey, "binding checksum")
+				},
+			},
+			{
+				name: "tombstone",
+				corrupt: func(repo repository.Repository, fixture fixture) {
+					if _, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+						if err := tx.DeleteLiveJob(fixture.JobID); err != nil {
+							return err
+						}
+						return tx.PutTombstone(repository.Tombstone{
+							RequestKey:        fixture.RequestKey,
+							JobID:             fixture.JobID,
+							TaskIdentity:      fixture.Identity,
+							ExpiredGeneration: 2,
+						})
+					}); err != nil {
+						t.Fatalf("create tombstone: %v", err)
+					}
+					factory.CorruptTombstone(t, repo, fixture.RequestKey, "tombstone checksum")
+				},
+			},
+		}
+		for _, tt := range cases {
+			tt := tt
+			t.Run(tt.name, func(t *testing.T) {
+				repo := factory.New(t)
+				fixture := newFixture(t, "rootstats-corrupt-"+tt.name)
+				acceptFixture(t, repo, fixture)
+				tt.corrupt(repo, fixture)
+				err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+					_, err := tx.RootStats()
+					return err
+				})
+				if !errors.Is(err, repository.ErrCorruptRecord) {
+					t.Fatalf("RootStats error = %v, want ErrCorruptRecord", err)
+				}
+			})
+		}
+	})
+
 	t.Run("audit returns typed aggregate retaining all findings", func(t *testing.T) {
 		repo := factory.New(t)
 		first := newFixture(t, "audit-first")

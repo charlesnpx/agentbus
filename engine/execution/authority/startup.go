@@ -42,6 +42,9 @@ func startupMatrixJobTx(tx repository.ReadTx, image repository.JobImage) (startu
 		if err := model.ValidateSafetyRecord(record); err != nil {
 			return startupProjectionRepair{}, false, fatalStartup("safety %s is unsupported: %v", record.JobID, err)
 		}
+		if err := requireStartupImageBinding(image, record); err != nil {
+			return startupProjectionRepair{}, false, err
+		}
 		if err := requireStartupBindingTx(tx, record); err != nil {
 			return startupProjectionRepair{}, false, err
 		}
@@ -72,6 +75,25 @@ func startupMatrixJobTx(tx repository.ReadTx, image repository.JobImage) (startu
 		return startupProjectionRepair{}, false, nil
 	default:
 		return startupProjectionRepair{}, false, fatalStartup("safety has unknown state")
+	}
+}
+
+func requireStartupImageBinding(image repository.JobImage, record model.SafetyRecord) error {
+	switch image.Binding.State {
+	case repository.RecordValid:
+		if image.Binding.Value.JobID != record.JobID {
+			return fatalCorruptStartup("binding index for safety %s points to binding for job %s", record.JobID, image.Binding.Value.JobID)
+		}
+		if err := image.Binding.Value.Matches(record); err != nil {
+			return fatalStartup("binding index for safety %s does not match safety: %v", record.JobID, err)
+		}
+		return nil
+	case repository.RecordCorrupt:
+		return fatalCorruptStartup("binding %s: %s", record.JobID, diagnosticOrDefault(image.Binding.Diagnostic))
+	case repository.RecordMissing:
+		return nil
+	default:
+		return fatalStartup("binding %s has unknown state", record.RequestKey)
 	}
 }
 

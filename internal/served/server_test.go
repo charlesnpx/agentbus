@@ -30,6 +30,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
+	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
@@ -3292,6 +3293,202 @@ func TestSubmitReplaySafetyCorruptionTripsFailStopAndPersists(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStatusAllSafetyCorruptionTripsFailStopAndPersists(t *testing.T) {
+	cases := []struct {
+		name    string
+		corrupt func(*testing.T, *Server, model.RequestKey, model.JobID)
+	}{
+		{
+			name: "binding",
+			corrupt: func(t *testing.T, server *Server, key model.RequestKey, _ model.JobID) {
+				t.Helper()
+				corruptor, ok := server.admissionRepository.(interface {
+					InjectCorruptBindingForTest(model.RequestKey, string)
+				})
+				if !ok {
+					t.Fatalf("admission repository type = %T, want InjectCorruptBindingForTest", server.admissionRepository)
+				}
+				corruptor.InjectCorruptBindingForTest(key, "binding checksum")
+			},
+		},
+		{
+			name: "safety",
+			corrupt: func(t *testing.T, server *Server, _ model.RequestKey, jobID model.JobID) {
+				t.Helper()
+				corruptor, ok := server.admissionRepository.(interface {
+					InjectCorruptSafetyForTest(model.JobID, string)
+				})
+				if !ok {
+					t.Fatalf("admission repository type = %T, want InjectCorruptSafetyForTest", server.admissionRepository)
+				}
+				corruptor.InjectCorruptSafetyForTest(jobID, "safety checksum")
+			},
+		},
+		{
+			name: "binding_index",
+			corrupt: func(t *testing.T, server *Server, _ model.RequestKey, jobID model.JobID) {
+				t.Helper()
+				corruptor, ok := server.admissionRepository.(interface {
+					InjectCorruptBindingIndexValueForTest(model.JobID, model.RequestKey)
+				})
+				if !ok {
+					t.Fatalf("admission repository type = %T, want InjectCorruptBindingIndexValueForTest", server.admissionRepository)
+				}
+				corruptor.InjectCorruptBindingIndexValueForTest(jobID, mustServedRequestKey(t, "workspace-status-corrupt-index-other", "request-status-corrupt-index-other"))
+			},
+		},
+	}
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			backend := newFakeBackend("fake")
+			releaseBackend := make(chan struct{})
+			backend.block = releaseBackend
+			launcher := newAdmissionFakeLaunchCustodian(t)
+			var server *Server
+			h := startTestServerWithHooks(t, backend, Config{IdleTimeout: -1}, func(s *Server) {
+				server = s
+				s.safetyDrainTimeout = 100 * time.Millisecond
+				enableTestAdmission(t, s, launcher)
+			})
+
+			conn := dialRaw(t, h.socketPath)
+			reader := bufio.NewReader(conn)
+			helloRaw(t, conn, reader, h.token)
+			requestKey := mustServedRequestKey(t, "workspace-status-corrupt-"+tt.name, "request-status-corrupt-"+tt.name)
+			params := protocol.JobSubmitParams{
+				WorkspaceKey: requestKey.WorkspaceKey.String(),
+				RequestID:    requestKey.RequestID.String(),
+				TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"},
+			}
+			resp := rpc(t, conn, reader, "submit", protocol.MethodJobSubmit, params)
+			var submitted protocol.JobSubmitResult
+			decodeResult(t, resp, &submitted)
+			if submitted.JobID == "" || submitted.Deduplicated {
+				t.Fatalf("submit result = %+v, want accepted non-replay", submitted)
+			}
+			jobID := model.JobID(submitted.JobID)
+			tt.corrupt(t, server, requestKey, jobID)
+			dbPath := filepath.Join(h.root, admissionRepositoryFile)
+			corruptDB, err := os.ReadFile(dbPath)
+			if err != nil {
+				t.Fatalf("read corrupt admission DB: %v", err)
+			}
+
+			outcome := server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{All: true}))
+			assertJobHandlerError(t, outcome, protocol.ErrorBackendUnavailable, protocol.AdmissionRejectRootCorrupt, "")
+			if reason := server.safetyLatch.Reason(); reason == nil || !errors.Is(reason, repository.ErrCorruptRecord) {
+				t.Fatalf("safety latch reason = %v, want corrupt record trip reason", reason)
+			}
+			next := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+				WorkspaceKey: "workspace-status-after-failstop-" + tt.name,
+				RequestID:    "request-status-after-failstop-" + tt.name,
+				TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "after"},
+			}))
+			assertJobHandlerError(t, next, protocol.ErrorBackendUnavailable, protocol.AdmissionRejectRootFailStopped, "")
+
+			waitForSocketRemoved(t, h.socketPath, h.done)
+			if retry, err := net.DialTimeout("unix", h.socketPath, 50*time.Millisecond); err == nil {
+				_ = retry.Close()
+				t.Fatal("dial after fail-stop succeeded, want closed listener")
+			}
+			close(releaseBackend)
+			waitForConnClosed(t, conn, reader, "safety corruption fail-stop")
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-h.done:
+				if err == nil || !errors.Is(err, ErrSafetyFailStopped) {
+					t.Fatalf("Serve error = %v, want safety fail-stop", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("server did not exit after safety corruption fail-stop")
+			}
+
+			snapshot, err := authority.LoadFileAnchorSnapshot(filepath.Join(h.root, admissionAnchorFile))
+			if err != nil {
+				t.Fatalf("load admission anchor snapshot: %v", err)
+			}
+			if snapshot.Phase != "fail_stopped" {
+				t.Fatalf("anchor phase = %q, want fail_stopped", snapshot.Phase)
+			}
+			afterDB, err := os.ReadFile(dbPath)
+			if err != nil {
+				t.Fatalf("read preserved admission DB: %v", err)
+			}
+			if !bytes.Equal(afterDB, corruptDB) {
+				t.Fatal("admission DB changed after safety fail-stop, want preserved corrupt file")
+			}
+		})
+	}
+}
+
+func TestServeFailsPreListenerOnStartupCorruptBindingIndexValue(t *testing.T) {
+	backend := newFakeBackend("fake")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	var server *Server
+	h := startTestServerWithHooks(t, backend, Config{IdleTimeout: -1}, func(s *Server) {
+		server = s
+		enableTestAdmission(t, s, launcher)
+	})
+
+	conn := dialRaw(t, h.socketPath)
+	reader := bufio.NewReader(conn)
+	helloRaw(t, conn, reader, h.token)
+	requestKey := mustServedRequestKey(t, "workspace-startup-corrupt-index", "request-startup-corrupt-index")
+	resp := rpc(t, conn, reader, "submit", protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: requestKey.WorkspaceKey.String(),
+		RequestID:    requestKey.RequestID.String(),
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "complete"},
+	})
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	h.cancel()
+	select {
+	case <-h.done:
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop before startup corruption test")
+	}
+
+	dbPath := filepath.Join(h.root, admissionRepositoryFile)
+	repo, err := bboltrepo.NewRepository(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.InjectCorruptBindingIndexValueForTest(model.JobID(submitted.JobID), mustServedRequestKey(t, "workspace-startup-corrupt-index-other", "request-startup-corrupt-index-other"))
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restart := newTestServerAtRoot(t, h.root, h.cwd, newFakeBackend("fake"))
+	configureTestAdmissionRuntime(t, restart, newAdmissionFakeLaunchCustodian(t), true)
+	restart.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		return nil, socketFileIdentity{}, errors.New("listener must not open for corrupt binding index")
+	}
+	err = restart.Serve(context.Background())
+	requireServedCorruptKind(t, err, "binding_index")
+	// Record-level corruption is detected after the boot claim commits, so
+	// whole-file byte identity is not the contract here (that applies to
+	// structural open-time corruption). The contract: the corrupt record is
+	// never repaired or deleted — a second startup attempt must detect the
+	// same corruption and refuse to serve.
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("admission DB missing after startup corruption failure: %v", err)
+	}
+	second := newTestServerAtRoot(t, h.root, h.cwd, newFakeBackend("fake"))
+	configureTestAdmissionRuntime(t, second, newAdmissionFakeLaunchCustodian(t), true)
+	second.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		return nil, socketFileIdentity{}, errors.New("listener must not open for corrupt binding index")
+	}
+	err = second.Serve(context.Background())
+	requireServedCorruptKind(t, err, "binding_index")
 }
 
 func TestServerContextCancelDoesNotForceCloseEstablishedConnection(t *testing.T) {
@@ -6935,6 +7132,26 @@ func assertRPCAdmissionCause(t *testing.T, resp protocol.Response, cause string)
 	}
 	if resp.Error.Data.AdmissionCause != cause {
 		t.Fatalf("admission cause = %q, want %q (%+v)", resp.Error.Data.AdmissionCause, cause, resp.Error)
+	}
+}
+
+func mustServedRequestKey(t *testing.T, workspace, request string) model.RequestKey {
+	t.Helper()
+	key, err := model.NewRequestKey(workspace, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func requireServedCorruptKind(t *testing.T, err error, kind string) {
+	t.Helper()
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("error = %v, want ErrCorruptRecord", err)
+	}
+	var corrupt repository.CorruptRecordKindError
+	if !errors.As(err, &corrupt) || corrupt.Kind != kind {
+		t.Fatalf("error = %T %v, want corrupt kind %s", err, err, kind)
 	}
 }
 

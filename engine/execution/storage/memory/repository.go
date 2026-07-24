@@ -223,7 +223,7 @@ func (tx readTx) Meta() repository.Record[repository.AuthorityMeta] {
 }
 
 func (tx readTx) RootStats() (repository.AuthorityRootStats, error) {
-	return tx.state.rootStats(), nil
+	return tx.state.rootStats()
 }
 
 func (tx readTx) LookupRequest(key model.RequestKey) repository.RequestImage {
@@ -298,7 +298,11 @@ func (tx *writeTx) AllocateJobID() (model.JobID, error) {
 
 func (tx *writeTx) PutMeta(meta repository.AuthorityMeta) error {
 	current := tx.state.metaRecord()
-	if err := repository.ValidateAuthorityMetaPut(current, meta, tx.state.generation, tx.state.nextJobSequence, tx.state.rootStats()); err != nil {
+	stats, err := tx.state.rootStats()
+	if err != nil {
+		return err
+	}
+	if err := repository.ValidateAuthorityMetaPut(current, meta, tx.state.generation, tx.state.nextJobSequence, stats); err != nil {
 		return err
 	}
 	if current.State == repository.RecordValid && reflect.DeepEqual(current.Value, meta) {
@@ -727,14 +731,30 @@ func (s *storeState) requestKeys() map[model.RequestKey]struct{} {
 	return seen
 }
 
-func (s *storeState) rootStats() repository.AuthorityRootStats {
+func (s *storeState) rootStats() (repository.AuthorityRootStats, error) {
 	stats := repository.AuthorityRootStats{
 		Jobs:       len(s.jobIDs()),
 		Bindings:   len(s.bindings),
 		Tombstones: len(s.tombstones),
 	}
-	for _, slot := range s.safety {
-		if slot.state != repository.RecordValid {
+	var findings []error
+	for key, slot := range s.bindings {
+		if slot.state == repository.RecordCorrupt {
+			findings = append(findings, repository.CorruptRecordError("binding", key.String(), slot.diagnostic))
+		}
+	}
+	for key, slot := range s.tombstones {
+		if slot.state == repository.RecordCorrupt {
+			findings = append(findings, repository.CorruptRecordError("tombstone", key.String(), slot.diagnostic))
+		}
+	}
+	for jobID, slot := range s.safety {
+		switch slot.state {
+		case repository.RecordValid:
+		case repository.RecordCorrupt:
+			findings = append(findings, repository.CorruptRecordError("safety", jobID.String(), slot.diagnostic))
+			continue
+		default:
 			continue
 		}
 		stats.LaunchRecords += slot.value.Attempt.Launches.Count()
@@ -742,7 +762,10 @@ func (s *storeState) rootStats() repository.AuthorityRootStats {
 			stats.RecoveryObligations++
 		}
 	}
-	return stats
+	if err := repository.NewIntegrityError(findings); err != nil {
+		return repository.AuthorityRootStats{}, err
+	}
+	return stats, nil
 }
 
 func (s *storeState) validateDirtyForCommit(dirty dirtySet) error {
@@ -788,7 +811,9 @@ func (s *storeState) auditIntegrity() error {
 		if err := meta.Validate(); err != nil {
 			findings = append(findings, repository.NewIntegrityFinding("meta", "authority", err))
 		}
-	} else if !s.rootStats().Empty() {
+	} else if stats, err := s.rootStats(); err != nil {
+		findings = append(findings, repository.NewIntegrityFinding("root_stats", "authority", err))
+	} else if !stats.Empty() {
 		findings = append(findings, repository.NewIntegrityFinding("meta", "authority", fmt.Errorf("%w: meta is %s on non-empty authority root", repository.ErrCorruptRecord, s.meta.state)))
 	}
 	for key := range s.requestKeys() {

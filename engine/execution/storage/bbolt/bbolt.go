@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -690,6 +691,25 @@ func (r *Repository) InjectCorruptTombstoneForTest(key model.RequestKey, diagnos
 	r.injectCorruptRecordForTest(bucketTombstones, requestKeyBytes(key), "tombstone", diagnostic)
 }
 
+func (r *Repository) InjectCorruptBindingIndexValueForTest(jobID model.JobID, key model.RequestKey) {
+	if err := jobID.Validate(); err != nil {
+		panic(err)
+	}
+	if err := key.Validate(); err != nil {
+		panic(err)
+	}
+	err := r.db.Update(func(tx *bolt.Tx) error {
+		index := tx.Bucket(bucketBindingIndex)
+		if index == nil {
+			return fmt.Errorf("binding_index bucket missing")
+		}
+		return index.Put(jobIDKey(jobID), requestKeyBytes(key))
+	})
+	if err != nil {
+		panic(err)
+	}
+}
+
 func (r *Repository) injectCorruptRecordForTest(bucketName, key []byte, kind, diagnostic string) {
 	if diagnostic == "" {
 		diagnostic = "corrupt"
@@ -923,6 +943,14 @@ func (tx readTx) RootStats() (repository.AuthorityRootStats, error) {
 				findings = append(findings, fmt.Errorf("%w: %s key %q: %v", repository.ErrCorruptRecord, string(bucketName), string(key), err))
 				return nil
 			}
+			if bytes.Equal(bucketName, bucketBindingIndex) {
+				if err := tx.validateBindingIndexEntry(jobID, raw); err != nil {
+					if !corruptRecordKind(err, "binding") {
+						findings = append(findings, err)
+					}
+					return nil
+				}
+			}
 			if bytes.Equal(bucketName, bucketSafety) {
 				record, diagnostic := decodeEnvelope(kindSafety, key, raw, validateSafety, revisionSafety)
 				if diagnostic != "" {
@@ -941,6 +969,10 @@ func (tx readTx) RootStats() (repository.AuthorityRootStats, error) {
 		}
 	}
 	stats.Bindings = countValidRequestRecords(tx, bucketBindings, kindBinding, validateBinding, revisionBinding, func(binding model.Binding) {
+		if err := tx.validateBindingIndexForRequest(binding.RequestKey); err != nil {
+			findings = append(findings, err)
+			return
+		}
 		liveJobs[binding.JobID] = struct{}{}
 	}, &findings)
 	stats.Tombstones = countValidRequestRecords(tx, bucketTombstones, kindTombstone, validateTombstone, revisionTombstone, nil, &findings)
@@ -1013,17 +1045,17 @@ func (tx readTx) bindingByJobID(jobID model.JobID) repository.Record[model.Bindi
 	}
 	requestKey, err := parseRequestKey(rawKey)
 	if err != nil {
-		return repository.CorruptRecord[model.Binding](fmt.Sprintf("binding index key: %v", err))
+		return repository.CorruptRecord[model.Binding](fmt.Sprintf("binding_index: %v", err))
 	}
 	binding := tx.LookupRequest(requestKey).Binding
 	if binding.State != repository.RecordValid {
 		if binding.State == repository.RecordCorrupt {
 			return binding
 		}
-		return repository.CorruptRecord[model.Binding]("binding index references missing binding")
+		return repository.CorruptRecord[model.Binding]("binding_index references missing binding")
 	}
 	if binding.Value.JobID != jobID {
-		return repository.CorruptRecord[model.Binding](fmt.Sprintf("binding index points to job %s", binding.Value.JobID))
+		return repository.CorruptRecord[model.Binding](fmt.Sprintf("binding_index points to job %s", binding.Value.JobID))
 	}
 	return binding
 }
@@ -1077,10 +1109,15 @@ func (tx readTx) liveJobIDSet() (map[model.JobID]struct{}, error) {
 			continue
 		}
 		tx.count("foreach:" + string(bucketName))
-		if err := bucket.ForEach(func(key, _ []byte) error {
+		if err := bucket.ForEach(func(key, raw []byte) error {
 			jobID, err := model.NewJobID(string(key))
 			if err != nil {
 				return fmt.Errorf("%w: %s key %q: %v", repository.ErrCorruptRecord, string(bucketName), string(key), err)
+			}
+			if bytes.Equal(bucketName, bucketBindingIndex) {
+				if err := tx.validateBindingIndexEntry(jobID, raw); err != nil {
+					return err
+				}
 			}
 			seen[jobID] = struct{}{}
 			return nil
@@ -1094,6 +1131,9 @@ func (tx readTx) liveJobIDSet() (map[model.JobID]struct{}, error) {
 		if err := bindings.ForEach(func(key, raw []byte) error {
 			binding, diagnostic := decodeEnvelope(kindBinding, key, raw, validateBinding, revisionBinding)
 			if diagnostic == "" {
+				if err := tx.validateBindingIndexForRequest(binding.RequestKey); err != nil {
+					return err
+				}
 				seen[binding.JobID] = struct{}{}
 			}
 			return nil
@@ -1153,6 +1193,11 @@ func (tx readTx) validateBindingIndexForRequest(key model.RequestKey) error {
 	return nil
 }
 
+func corruptRecordKind(err error, kind string) bool {
+	var corrupt repository.CorruptRecordKindError
+	return errors.As(err, &corrupt) && corrupt.Kind == kind
+}
+
 func (tx readTx) auditBindingIndexEntries() error {
 	index := tx.tx.Bucket(bucketBindingIndex)
 	if index == nil {
@@ -1166,28 +1211,32 @@ func (tx readTx) auditBindingIndexEntries() error {
 			findings = append(findings, fmt.Errorf("%w: binding_index key %q: %v", repository.ErrCorruptRecord, string(jobKey), err))
 			return nil
 		}
-		requestKey, err := parseRequestKey(requestKeyBytes)
-		if err != nil {
-			findings = append(findings, repository.CorruptRecordError("binding_index", jobID.String(), err.Error()))
-			return nil
-		}
-		binding := tx.LookupRequest(requestKey).Binding
-		if binding.State == repository.RecordCorrupt {
-			findings = append(findings, repository.CorruptRecordError("binding", requestKey.String(), binding.Diagnostic))
-			return nil
-		}
-		if binding.State != repository.RecordValid {
-			findings = append(findings, repository.CorruptRecordError("binding_index", jobID.String(), "references missing binding"))
-			return nil
-		}
-		if binding.Value.JobID != jobID {
-			findings = append(findings, repository.CorruptRecordError("binding_index", jobID.String(), fmt.Sprintf("points to binding for job %s", binding.Value.JobID)))
+		if err := tx.validateBindingIndexEntry(jobID, requestKeyBytes); err != nil {
+			findings = append(findings, err)
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
 	return repository.NewIntegrityError(findings)
+}
+
+func (tx readTx) validateBindingIndexEntry(jobID model.JobID, rawRequestKey []byte) error {
+	requestKey, err := parseRequestKey(rawRequestKey)
+	if err != nil {
+		return repository.CorruptRecordError("binding_index", jobID.String(), err.Error())
+	}
+	binding := tx.LookupRequest(requestKey).Binding
+	if binding.State == repository.RecordCorrupt {
+		return repository.CorruptRecordError("binding", requestKey.String(), binding.Diagnostic)
+	}
+	if binding.State != repository.RecordValid {
+		return repository.CorruptRecordError("binding_index", jobID.String(), "references missing binding")
+	}
+	if binding.Value.JobID != jobID {
+		return repository.CorruptRecordError("binding_index", jobID.String(), fmt.Sprintf("points to binding for job %s", binding.Value.JobID))
+	}
+	return nil
 }
 
 func auditKeysTx(tx readTx) (map[model.RequestKey]struct{}, map[model.JobID]struct{}, error) {

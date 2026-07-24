@@ -143,7 +143,7 @@ func ValidateJobClosure(jobID model.JobID, image JobImage, lookupRequest func(mo
 		return fmt.Errorf("%w: job_id: %v", ErrInvalidRecord, err)
 	}
 	if image.Binding.State == RecordCorrupt {
-		return corruptRecordError("binding", jobID.String(), image.Binding.Diagnostic)
+		return corruptRecordError(bindingImageCorruptionKind(image.Binding.Diagnostic), jobID.String(), image.Binding.Diagnostic)
 	}
 	if image.Binding.State == RecordValid && image.Binding.Value.JobID != jobID {
 		return fmt.Errorf("%w: binding index for job %s points to binding for job %s", ErrCorruptRecord, jobID, image.Binding.Value.JobID)
@@ -220,6 +220,14 @@ func ValidateJobClosure(jobID model.JobID, image JobImage, lookupRequest func(mo
 	default:
 		return fmt.Errorf("%w: projection %s has unknown state", ErrInvalidRecord, jobID)
 	}
+}
+
+func bindingImageCorruptionKind(diagnostic string) string {
+	diagnostic = strings.ToLower(diagnostic)
+	if strings.Contains(diagnostic, "binding_index") || strings.Contains(diagnostic, "binding index") {
+		return "binding_index"
+	}
+	return "binding"
 }
 
 func ValidateRequestClosure(key model.RequestKey, image RequestImage, loadJob func(model.JobID) JobImage) error {

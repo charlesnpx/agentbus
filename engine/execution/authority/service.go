@@ -806,10 +806,7 @@ func rejectBadRequestImage(image repository.RequestImage) error {
 
 func rejectRequestRecord(kind string, state repository.RecordState, diagnostic string) error {
 	if state == repository.RecordCorrupt {
-		if diagnostic == "" {
-			diagnostic = "corrupt"
-		}
-		return fmt.Errorf("%w: %s: %s", repository.ErrCorruptRecord, kind, diagnostic)
+		return repository.CorruptRecordError(kind, "", diagnostic)
 	}
 	return nil
 }
@@ -819,10 +816,7 @@ func requireRecord(kind string, state repository.RecordState, diagnostic string)
 	case repository.RecordValid:
 		return nil
 	case repository.RecordCorrupt:
-		if diagnostic == "" {
-			diagnostic = "corrupt"
-		}
-		return fmt.Errorf("%w: %s: %s", repository.ErrCorruptRecord, kind, diagnostic)
+		return repository.CorruptRecordError(kind, "", diagnostic)
 	case repository.RecordMissing:
 		return fmt.Errorf("%w: %s is missing", ErrNotFound, kind)
 	default:
