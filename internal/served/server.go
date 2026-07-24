@@ -166,9 +166,30 @@ type admissionOwnedWorkChecker interface {
 
 type serveShutdownState struct {
 	generation uint64
+	lifecycle  serveLifecycleSnapshot
 	done       chan struct{}
 	err        error
 	complete   bool
+}
+
+type serveLifecycleSnapshot struct {
+	generation uint64
+	listener   net.Listener
+	socket     socketFileIdentity
+	cancel     context.CancelFunc
+	admission  *serveAdmissionSnapshot
+	bound      bool
+}
+
+type serveAdmissionSnapshot struct {
+	instance     *admissionInstance
+	ready        *admissionReady
+	coordinator  *admissionCoordinator
+	checker      admissionOwnedWorkChecker
+	runtime      *servedAdmissionRuntime
+	closer       io.Closer
+	closeStarted atomic.Bool
+	closeErr     error
 }
 
 // Server serves the protocol v1 socket API over engine backends.
@@ -511,7 +532,11 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 		}
 		return err
 	}
+	registeredLifecycle := false
 	defer func() {
+		if registeredLifecycle {
+			return
+		}
 		if err := s.closeServeAdmission(); err != nil {
 			log.Printf("agentbus daemon: close admission authority: %v", err)
 		}
@@ -529,9 +554,23 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 		s.removeOwnedSocket(socketIdentity, "server shutdown")
 	}()
 	ctx, cancel := context.WithCancel(ctx)
-	generation := s.registerServeLifecycle(ln, socketIdentity, cancel)
+	if err := startupCtx.Err(); err != nil {
+		cancel()
+		return err
+	}
+	lifecycle := s.registerServeLifecycle(ln, socketIdentity, cancel)
+	registeredLifecycle = true
+	generation := lifecycle.generation
 	defer s.clearServeLifecycle(generation)
+	defer func() {
+		if err := s.closeServeAdmissionSnapshot(context.Background(), lifecycle.admission); err != nil {
+			log.Printf("agentbus daemon: close admission authority: %v", err)
+		}
+	}()
 	defer cancel()
+	if err := startupCtx.Err(); err != nil {
+		return err
+	}
 	if s.readyHook != nil {
 		if err := s.readyHook(ServeReadyInfo{StateRoot: s.stateRoot, SocketPath: s.socketPath}); err != nil {
 			return err
@@ -607,18 +646,26 @@ func normalizeShutdownTimeout(timeout time.Duration) time.Duration {
 	return timeout
 }
 
-func (s *Server) registerServeLifecycle(ln net.Listener, socketIdentity socketFileIdentity, cancel context.CancelFunc) uint64 {
+func (s *Server) registerServeLifecycle(ln net.Listener, socketIdentity socketFileIdentity, cancel context.CancelFunc) serveLifecycleSnapshot {
 	s.shutdownMu.Lock()
 	defer s.shutdownMu.Unlock()
 	s.serveStateMu.Lock()
 	defer s.serveStateMu.Unlock()
 	s.serveGeneration++
 	generation := s.serveGeneration
+	lifecycle := serveLifecycleSnapshot{
+		generation: generation,
+		listener:   ln,
+		socket:     socketIdentity,
+		cancel:     cancel,
+		admission:  s.currentServeAdmissionSnapshot(),
+		bound:      true,
+	}
 	s.serveListener = ln
 	s.serveSocket = socketIdentity
 	s.serveCancel = cancel
-	s.shutdownState = &serveShutdownState{generation: generation}
-	return generation
+	s.shutdownState = &serveShutdownState{generation: generation, lifecycle: lifecycle}
+	return lifecycle
 }
 
 func (s *Server) clearServeLifecycle(generation uint64) {
@@ -638,10 +685,33 @@ func (s *Server) clearServeLifecycle(generation uint64) {
 	}
 }
 
-func (s *Server) serveLifecycleSnapshot() (net.Listener, socketFileIdentity, context.CancelFunc) {
+func (s *Server) currentServeAdmissionSnapshot() *serveAdmissionSnapshot {
+	s.admissionStateMu.RLock()
+	defer s.admissionStateMu.RUnlock()
+	if s.admissionInstance == nil && s.admissionRuntime == nil && s.admissionClose == nil {
+		return nil
+	}
+	checker := s.admissionOwnedWorkChecker
+	if checker == nil && s.admissionCoordinator != nil {
+		checker = s.admissionCoordinator
+	}
+	return &serveAdmissionSnapshot{
+		instance:    s.admissionInstance,
+		ready:       s.admissionReady,
+		coordinator: s.admissionCoordinator,
+		checker:     checker,
+		runtime:     s.admissionRuntime,
+		closer:      s.admissionClose,
+	}
+}
+
+func (s *Server) serveLifecycleCurrent(lifecycle serveLifecycleSnapshot) bool {
+	if !lifecycle.bound {
+		return true
+	}
 	s.serveStateMu.Lock()
 	defer s.serveStateMu.Unlock()
-	return s.serveListener, s.serveSocket, s.serveCancel
+	return s.serveGeneration == lifecycle.generation && s.serveListener == lifecycle.listener
 }
 
 func (s *Server) ShutdownTimeout() time.Duration {
@@ -726,7 +796,7 @@ func (s *Server) runShutdownState(ctx context.Context, state *serveShutdownState
 		s.shutdownMu.Unlock()
 		return err
 	}
-	err := s.shutdown(ctx)
+	err := s.shutdownLifecycle(ctx, state.lifecycle)
 	s.shutdownRunMu.Unlock()
 	s.shutdownMu.Lock()
 	state.err = err
@@ -764,32 +834,47 @@ func (s *Server) serveGenerationServingLocked(generation uint64) bool {
 }
 
 func (s *Server) shutdown(ctx context.Context) error {
+	return s.shutdownLifecycle(ctx, serveLifecycleSnapshot{
+		admission: s.currentServeAdmissionSnapshot(),
+	})
+}
+
+func (s *Server) shutdownLifecycle(ctx context.Context, lifecycle serveLifecycleSnapshot) error {
+	if !s.serveLifecycleCurrent(lifecycle) {
+		return nil
+	}
 	if err := s.beginAdmissionClosing(ctx); err != nil {
-		s.forceStopServe()
+		lifecycle.forceStopServe()
 		return shutdownError(err)
 	}
-	s.closeServeListener("graceful shutdown")
-	if err := s.cancelAdmissionWorkForShutdown(ctx); err != nil {
-		s.forceStopServe()
+	lifecycle.closeServeListener(s, "graceful shutdown")
+	if !s.serveLifecycleCurrent(lifecycle) {
+		return nil
+	}
+	if err := s.cancelAdmissionWorkForShutdown(ctx, lifecycle.admission); err != nil {
+		lifecycle.forceStopServe()
 		return shutdownError(err)
 	}
-	if err := s.waitShutdownDrained(ctx); err != nil {
-		s.forceStopServe()
+	if err := s.waitShutdownDrained(ctx, lifecycle); err != nil {
+		lifecycle.forceStopServe()
 		return shutdownError(err)
 	}
-	if err := s.closeServeAdmissionContext(ctx); err != nil {
-		s.forceStopServe()
+	if err := s.closeServeAdmissionSnapshot(ctx, lifecycle.admission); err != nil {
+		lifecycle.forceStopServe()
 		return shutdownError(err)
 	}
 	if err := ctx.Err(); err != nil {
-		s.forceStopServe()
+		lifecycle.forceStopServe()
 		return shutdownError(err)
+	}
+	if !s.serveLifecycleCurrent(lifecycle) {
+		return nil
 	}
 	if err := s.removeOwnedPIDFile(ctx, "graceful shutdown"); err != nil {
-		s.forceStopServe()
+		lifecycle.forceStopServe()
 		return shutdownError(err)
 	}
-	s.forceStopServe()
+	lifecycle.forceStopServe()
 	if err := ctx.Err(); err != nil {
 		return shutdownError(err)
 	}
@@ -806,26 +891,24 @@ func shutdownError(err error) error {
 	return err
 }
 
-func (s *Server) closeServeListener(phase string) {
-	ln, socketIdentity, _ := s.serveLifecycleSnapshot()
-	if ln == nil {
+func (lifecycle serveLifecycleSnapshot) closeServeListener(s *Server, phase string) {
+	if lifecycle.listener == nil {
 		return
 	}
-	if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+	if err := lifecycle.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		log.Printf("agentbus daemon: close listener during %s: %v", phase, err)
 	}
-	s.removeOwnedSocket(socketIdentity, phase)
+	s.removeOwnedSocket(lifecycle.socket, phase)
 }
 
-func (s *Server) forceStopServe() {
-	_, _, cancel := s.serveLifecycleSnapshot()
-	if cancel != nil {
-		cancel()
+func (lifecycle serveLifecycleSnapshot) forceStopServe() {
+	if lifecycle.cancel != nil {
+		lifecycle.cancel()
 	}
 }
 
-func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context) error {
-	coord, jobIDs, err := s.shutdownAdmissionJobs(ctx)
+func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context, admission *serveAdmissionSnapshot) error {
+	coord, jobIDs, err := s.shutdownAdmissionJobs(ctx, admission)
 	if err != nil || coord == nil {
 		return err
 	}
@@ -847,16 +930,11 @@ func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) shutdownAdmissionJobs(ctx context.Context) (*admissionCoordinator, []model.JobID, error) {
-	s.admissionStateMu.RLock()
-	ready := s.admissionReady
-	coord := s.admissionCoordinator
-	ok := s.admissionInstance != nil && ready != nil && coord != nil
-	s.admissionStateMu.RUnlock()
-	if !ok {
+func (s *Server) shutdownAdmissionJobs(ctx context.Context, admission *serveAdmissionSnapshot) (*admissionCoordinator, []model.JobID, error) {
+	if admission == nil || admission.ready == nil || admission.coordinator == nil {
 		return nil, nil, nil
 	}
-	snapshot, err := ready.RuntimeSnapshot(ctx)
+	snapshot, err := admission.ready.RuntimeSnapshot(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -879,7 +957,7 @@ func (s *Server) shutdownAdmissionJobs(ctx context.Context) (*admissionCoordinat
 		jobIDs = append(jobIDs, jobID)
 	}
 	sort.Slice(jobIDs, func(i, j int) bool { return jobIDs[i] < jobIDs[j] })
-	return coord, jobIDs, nil
+	return admission.coordinator, jobIDs, nil
 }
 
 func (s *Server) activeAdmissionJobIDs() []string {
@@ -910,14 +988,20 @@ func (s *Server) requestActiveJobShutdownCancel(ctx context.Context, jobID strin
 	return nil
 }
 
-func (s *Server) waitShutdownDrained(ctx context.Context) error {
+func (s *Server) waitShutdownDrained(ctx context.Context, lifecycle serveLifecycleSnapshot) error {
 	poll := 10 * time.Millisecond
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if !s.activeWorkWithContext(ctx) {
+		if !s.serveLifecycleCurrent(lifecycle) {
+			return nil
+		}
+		if !s.activeWorkWithAdmissionSnapshot(ctx, lifecycle.admission) {
 			break
+		}
+		if !s.serveLifecycleCurrent(lifecycle) {
+			return nil
 		}
 		timer := time.NewTimer(poll)
 		select {
@@ -927,14 +1011,42 @@ func (s *Server) waitShutdownDrained(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
-	s.admissionStateMu.RLock()
-	coord := s.admissionCoordinator
-	ready := s.admissionInstance != nil && coord != nil
-	s.admissionStateMu.RUnlock()
-	if ready {
-		return coord.Shutdown(ctx)
+	if lifecycle.admission != nil && lifecycle.admission.coordinator != nil {
+		return lifecycle.admission.coordinator.Shutdown(ctx)
 	}
 	return nil
+}
+
+func (s *Server) activeWorkWithAdmissionSnapshot(ctx context.Context, admission *serveAdmissionSnapshot) bool {
+	s.mu.Lock()
+	activeJobs := len(s.activeJobs)
+	s.mu.Unlock()
+	if activeJobs > 0 {
+		return true
+	}
+	if s.resultPublications.Load() > 0 {
+		return true
+	}
+	if admission == nil {
+		return false
+	}
+	checker := admission.checker
+	if checker == nil && admission.coordinator != nil {
+		checker = admission.coordinator
+	}
+	if checker != nil {
+		owned, err := checker.HasOwnedWork(ctx)
+		if err != nil && s.safetyFailStopErr() == nil {
+			log.Printf("agentbus daemon: admission active-work check failed: %v", err)
+		}
+		if err != nil || owned {
+			return true
+		}
+	}
+	if admission.runtime != nil && admission.runtime.hasActiveCustodies() {
+		return true
+	}
+	return false
 }
 
 func (s *Server) ensureSafetyLatch() {
@@ -1293,9 +1405,7 @@ func (s *Server) removeOwnedPIDFile(ctx context.Context, phase string) error {
 		)
 	}
 	if err := ctx.Err(); err != nil {
-		if restoreErr := restoreOwnedPIDFileRaw(pidPath, quarantinedRaw, phase); restoreErr != nil {
-			return errors.Join(err, wrapPIDRestoreError(restoreErr))
-		}
+		log.Printf("agentbus daemon: abandoning owned pid restore during %s after context cancellation; canonical=%s quarantine=%s already removed: %v", phase, pidPath, quarantinePath, err)
 		return err
 	}
 	log.Printf("agentbus daemon: removed owned pid during %s", phase)
@@ -1338,9 +1448,9 @@ func createPIDFileQuarantine(stateRoot string) (string, string, error) {
 
 func abortQuarantinedPIDFileIfContextDone(ctx context.Context, pidPath, quarantinePath, phase string, cleanupQuarantineDir *bool) error {
 	if err := ctx.Err(); err != nil {
-		cleanup, restoreErr := restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
-		*cleanupQuarantineDir = cleanup
-		return errors.Join(err, wrapPIDRestoreError(restoreErr))
+		*cleanupQuarantineDir = false
+		log.Printf("agentbus daemon: abandoning quarantined pid restore during %s after context cancellation; canonical=%s quarantine=%s: %v", phase, pidPath, quarantinePath, err)
+		return err
 	}
 	return nil
 }
@@ -1362,29 +1472,6 @@ func restoreQuarantinedPIDFile(pidPath, quarantinePath, phase string) (bool, err
 		log.Printf("agentbus daemon: could not restore replacement pid during %s from %s to %s: %v", phase, quarantinePath, pidPath, err)
 		return false, err
 	}
-}
-
-func restoreOwnedPIDFileRaw(pidPath string, raw []byte, phase string) error {
-	file, err := os.OpenFile(pidPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return nil
-		}
-		log.Printf("agentbus daemon: could not restore owned pid during %s to %s: %v", phase, pidPath, err)
-		return err
-	}
-	written, writeErr := file.Write(raw)
-	if writeErr == nil && written != len(raw) {
-		writeErr = io.ErrShortWrite
-	}
-	closeErr := file.Close()
-	if writeErr != nil || closeErr != nil {
-		_ = os.Remove(pidPath)
-		err := errors.Join(writeErr, closeErr)
-		log.Printf("agentbus daemon: could not restore owned pid during %s to %s: %v", phase, pidPath, err)
-		return err
-	}
-	return nil
 }
 
 func wrapPIDRestoreError(err error) error {

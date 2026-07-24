@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
@@ -14,6 +15,18 @@ type Config = served.Config
 type StrictAdmissionOptions = served.StrictAdmissionOptions
 
 var ErrShutdownDeadlineExceeded = served.ErrShutdownDeadlineExceeded
+
+type servedServer interface {
+	ServeWithStartupContext(context.Context, context.Context) error
+	Shutdown(context.Context) error
+	ShutdownTimeout() time.Duration
+}
+
+var productionServedConfigFunc = productionServedConfig
+
+var newProductionServerAfterStrictAdmissionSupportPreflight = func(ctx context.Context, cfg served.Config) (servedServer, error) {
+	return served.NewAfterStrictAdmissionSupportPreflight(ctx, cfg)
+}
 
 func Serve(ctx context.Context, cfg Config) error {
 	if ctx == nil {
@@ -37,7 +50,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		}
 	}
 	defer cancelStartup()
-	servedCfg, configErr := productionServedConfig(cfg)
+	servedCfg, configErr := productionServedConfigFunc(cfg)
 	if configErr != nil {
 		err := configErr
 		if preflightErr := served.StrictAdmissionSupportPreflight(startupCtx, servedCfg); preflightErr != nil {
@@ -50,10 +63,16 @@ func Serve(ctx context.Context, cfg Config) error {
 	if hasReporter {
 		previousHook := servedCfg.ReadyHook
 		servedCfg.ReadyHook = func(info served.ServeReadyInfo) error {
+			if err := startupCtx.Err(); err != nil {
+				return err
+			}
 			if previousHook != nil {
 				if err := previousHook(info); err != nil {
 					return err
 				}
+			}
+			if err := startupCtx.Err(); err != nil {
+				return err
 			}
 			canonicalRoot, err := daemonlaunch.CanonicalStateRoot(info.StateRoot)
 			if err != nil {
@@ -66,7 +85,7 @@ func Serve(ctx context.Context, cfg Config) error {
 			return nil
 		}
 	}
-	server, err := served.NewAfterStrictAdmissionSupportPreflight(startupCtx, servedCfg)
+	server, err := newProductionServerAfterStrictAdmissionSupportPreflight(startupCtx, servedCfg)
 	if err != nil {
 		_ = servedCfg.Runtime.Close()
 		reportStartupFailure(reporter, err)
@@ -96,8 +115,11 @@ func Serve(ctx context.Context, cfg Config) error {
 		cancelShutdown()
 		stopService()
 		serveErr := <-done
-		if shutdownErr != nil {
+		if shutdownErr != nil && !errors.Is(shutdownErr, served.ErrShutdownNotServing) {
 			return shutdownErr
+		}
+		if shutdownErr != nil && errors.Is(shutdownErr, served.ErrShutdownNotServing) && ctx.Err() != nil && serveErr == context.Canceled {
+			return nil
 		}
 		return serveErr
 	}

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -236,6 +238,119 @@ func TestServeLauncherReportsAdmissionRootBusyCode(t *testing.T) {
 	}
 }
 
+func TestServeCancellationBeforeRegistrationReturnsCleanWithoutReadyFrame(t *testing.T) {
+	root := t.TempDir()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	t.Setenv(daemonlaunch.ReadyFDEnv, strconv.Itoa(int(writer.Fd())))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveStarted := make(chan struct{})
+	allowServeReturn := make(chan struct{})
+	shutdownCalled := make(chan struct{})
+	fake := &fakeServedServer{
+		shutdownTimeout: time.Second,
+		serve: func(_ context.Context, startupCtx context.Context) error {
+			close(serveStarted)
+			<-startupCtx.Done()
+			<-allowServeReturn
+			return context.Canceled
+		},
+		shutdown: func(context.Context) error {
+			close(shutdownCalled)
+			close(allowServeReturn)
+			return served.ErrShutdownNotServing
+		},
+	}
+	stubProductionServe(t, fake)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(ctx, Config{StateRoot: root, CWD: t.TempDir(), IdleTimeout: -1})
+	}()
+	select {
+	case <-serveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("fake serve did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve error = %v, want clean cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not return after cancellation")
+	}
+	select {
+	case <-shutdownCalled:
+	default:
+		t.Fatal("Shutdown was not called after cancellation")
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 0 {
+		t.Fatalf("readiness frame = %q, want none", raw)
+	}
+	for _, name := range []string{protocol.SocketName, "agentbus.pid"} {
+		if _, err := os.Stat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s stat error = %v, want absent", name, err)
+		}
+	}
+}
+
+func TestServeCancellationAfterRegistrationRunsGracefulShutdown(t *testing.T) {
+	root := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	readyCalled := make(chan struct{})
+	shutdownCalled := make(chan struct{})
+	fake := &fakeServedServer{
+		shutdownTimeout: time.Second,
+		serve: func(serviceCtx context.Context, _ context.Context) error {
+			close(readyCalled)
+			<-serviceCtx.Done()
+			return nil
+		},
+		shutdown: func(context.Context) error {
+			close(shutdownCalled)
+			return nil
+		},
+	}
+	stubProductionServe(t, fake)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(ctx, Config{StateRoot: root, CWD: t.TempDir(), IdleTimeout: -1})
+	}()
+	select {
+	case <-readyCalled:
+	case <-time.After(time.Second):
+		t.Fatal("fake serve did not reach registered lifetime")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve error = %v, want graceful shutdown", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not return after cancellation")
+	}
+	select {
+	case <-shutdownCalled:
+	default:
+		t.Fatal("Shutdown was not called for registered serve")
+	}
+}
+
 func closeCountingRecoveryRuntime() (custodian.Runtime, *atomic.Int64) {
 	closes := &atomic.Int64{}
 	runtime := custodian.NewUnavailableRuntimeForTest(custodian.ErrSupervisorUnavailable, func() error {
@@ -243,6 +358,46 @@ func closeCountingRecoveryRuntime() (custodian.Runtime, *atomic.Int64) {
 		return nil
 	})
 	return runtime, closes
+}
+
+type fakeServedServer struct {
+	shutdownTimeout time.Duration
+	serve           func(context.Context, context.Context) error
+	shutdown        func(context.Context) error
+}
+
+func (server *fakeServedServer) ServeWithStartupContext(ctx, startupCtx context.Context) error {
+	if server.serve == nil {
+		return nil
+	}
+	return server.serve(ctx, startupCtx)
+}
+
+func (server *fakeServedServer) Shutdown(ctx context.Context) error {
+	if server.shutdown == nil {
+		return nil
+	}
+	return server.shutdown(ctx)
+}
+
+func (server *fakeServedServer) ShutdownTimeout() time.Duration {
+	return server.shutdownTimeout
+}
+
+func stubProductionServe(t *testing.T, server servedServer) {
+	t.Helper()
+	previousConfig := productionServedConfigFunc
+	previousNewServer := newProductionServerAfterStrictAdmissionSupportPreflight
+	productionServedConfigFunc = func(cfg Config) (served.Config, error) {
+		return cfg, nil
+	}
+	newProductionServerAfterStrictAdmissionSupportPreflight = func(context.Context, served.Config) (servedServer, error) {
+		return server, nil
+	}
+	t.Cleanup(func() {
+		productionServedConfigFunc = previousConfig
+		newProductionServerAfterStrictAdmissionSupportPreflight = previousNewServer
+	})
 }
 
 func stubRecoveryStrictRuntime(t *testing.T, runtime custodian.Runtime, err error) {

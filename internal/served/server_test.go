@@ -3310,6 +3310,42 @@ func TestShutdownDeadlineDuringPIDTeardownReturnsTypedErrorAndRetainsPID(t *test
 	}
 }
 
+func TestShutdownDeadlineAfterPIDQuarantineAbandonsRestore(t *testing.T) {
+	t.Parallel()
+	root := shortTempDir(t)
+	pidPath := filepath.Join(root, "agentbus.pid")
+	quarantineDir, quarantinePath, err := createPIDFileQuarantine(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(quarantineDir) })
+	if err := os.WriteFile(quarantinePath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadlineCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	defer cancel()
+	cleanupQuarantineDir := true
+
+	start := time.Now()
+	err = abortQuarantinedPIDFileIfContextDone(deadlineCtx, pidPath, quarantinePath, "test deadline", &cleanupQuarantineDir)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("abort error = %v, want context deadline", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("abort elapsed = %s, want bounded abandonment", elapsed)
+	}
+	if cleanupQuarantineDir {
+		t.Fatal("cleanupQuarantineDir = true, want orphaned quarantine retained")
+	}
+	if _, err := os.Stat(pidPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canonical pid stat = %v, want absent", err)
+	}
+	if _, err := os.Stat(quarantinePath); err != nil {
+		t.Fatalf("quarantine pid stat = %v, want retained", err)
+	}
+}
+
 func TestConcurrentShutdownWaitingCallerHonorsContext(t *testing.T) {
 	t.Parallel()
 	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
@@ -3493,6 +3529,109 @@ func TestShutdownLateWaiterReceivesServeGenerationResultAcrossReserve(t *testing
 	case <-time.After(time.Second):
 		t.Fatal("second Shutdown did not complete after close release")
 	}
+	select {
+	case err := <-secondServeDone:
+		if err != nil {
+			t.Fatalf("second Serve after Shutdown = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second Serve did not stop after shutdown")
+	}
+}
+
+func TestShutdownGenerationDoesNotStopNextServe(t *testing.T) {
+	t.Parallel()
+	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	releaseFirstClose := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	firstCloseStarted := make(chan struct{})
+	firstCloseReturned := make(chan struct{})
+	configureServeAdmissionCloser(t, server, newAdmissionFakeLaunchCustodian(t), memory.NewRepository(), authority.NewAnchorStore(), blockingCloser{
+		started:  firstCloseStarted,
+		release:  releaseFirstClose,
+		returned: firstCloseReturned,
+	})
+	cancelFirstServe, firstServeDone, _ := startTestServerWithBlockingListener(t, server)
+	t.Cleanup(func() {
+		cancelFirstServe()
+		releaseFirstOnce.Do(func() { close(releaseFirstClose) })
+		select {
+		case <-firstCloseReturned:
+		case <-time.After(time.Second):
+			t.Fatal("first admission close did not return after release")
+		}
+	})
+
+	pidPath := filepath.Join(root, "agentbus.pid")
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- server.Shutdown(context.Background())
+	}()
+	select {
+	case <-firstCloseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first shutdown did not enter admission close")
+	}
+
+	cancelFirstServe()
+	select {
+	case err := <-firstServeDone:
+		if err != nil {
+			t.Fatalf("first Serve after external cancel = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Serve did not stop after external cancel")
+	}
+
+	secondClose := newNotifyCloser()
+	configureServeAdmissionCloser(t, server, newAdmissionFakeLaunchCustodian(t), memory.NewRepository(), authority.NewAnchorStore(), secondClose)
+	secondListener := newPipeTestListener()
+	cancelSecondServe, secondServeDone := startTestServerWithPipeListener(t, server, secondListener)
+	t.Cleanup(func() {
+		cancelSecondServe()
+		select {
+		case <-secondServeDone:
+		case <-time.After(time.Second):
+			t.Fatal("second Serve did not stop")
+		}
+	})
+	replacementPath := filepath.Join(root, "agentbus.pid.next")
+	if err := os.WriteFile(replacementPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacementPath, pidPath); err != nil {
+		t.Fatal(err)
+	}
+	_, wantPIDIdentity, err := readPIDFileNoFollow(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	releaseFirstOnce.Do(func() { close(releaseFirstClose) })
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first Shutdown error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Shutdown did not complete after close release")
+	}
+	assertPipeListenerAccepts(t, secondListener, "after first generation shutdown completed")
+	_, gotPIDIdentity, err := readPIDFileNoFollow(pidPath)
+	if err != nil {
+		t.Fatalf("second generation pid was removed: %v", err)
+	}
+	if gotPIDIdentity != wantPIDIdentity {
+		t.Fatalf("second generation pid identity = %+v, want %+v", gotPIDIdentity, wantPIDIdentity)
+	}
+
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second Shutdown error = %v", err)
+	}
+	secondClose.waitClosed(t)
 	select {
 	case err := <-secondServeDone:
 		if err != nil {
@@ -4366,6 +4505,43 @@ func TestServeWithStartupContextUsesServiceContextAfterReady(t *testing.T) {
 	}
 }
 
+func TestServeWithStartupContextCanceledBeforeRegistrationSkipsReady(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	configureTestAdmissionRuntime(t, server, newAdmissionFakeLaunchCustodian(t), true)
+	listener := newBlockingTestListener()
+	startupCtx, cancelStartup := context.WithCancel(context.Background())
+	defer cancelStartup()
+	serviceCtx, cancelService := context.WithCancel(context.Background())
+	defer cancelService()
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		cancelStartup()
+		return listener, socketFileIdentity{}, nil
+	}
+	readyCalled := make(chan struct{})
+	server.readyHook = func(ServeReadyInfo) error {
+		close(readyCalled)
+		return nil
+	}
+
+	err := server.ServeWithStartupContext(serviceCtx, startupCtx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ServeWithStartupContext error = %v, want context canceled", err)
+	}
+	select {
+	case <-readyCalled:
+		t.Fatal("ready hook ran after startup cancellation")
+	default:
+	}
+	server.serveStateMu.Lock()
+	registered := server.serveListener != nil
+	server.serveStateMu.Unlock()
+	if registered {
+		t.Fatal("serve lifecycle registered after startup cancellation")
+	}
+	listener.waitClosed(t)
+}
+
 func TestBinaryChangeExitsPromptlyWhenQuiet(t *testing.T) {
 	t.Parallel()
 	changed := newBinaryChangeProbe()
@@ -4871,6 +5047,17 @@ func startTestServerWithRootAndHooks(t *testing.T, root, cwd string, backend eng
 func startTestServerWithBlockingListener(t *testing.T, server *Server) (context.CancelFunc, <-chan error, *blockingTestListener) {
 	t.Helper()
 	listener := newBlockingTestListener()
+	cancel, done := startTestServerWithProvidedListener(t, server, listener)
+	return cancel, done, listener
+}
+
+func startTestServerWithPipeListener(t *testing.T, server *Server, listener *pipeTestListener) (context.CancelFunc, <-chan error) {
+	t.Helper()
+	return startTestServerWithProvidedListener(t, server, listener)
+}
+
+func startTestServerWithProvidedListener(t *testing.T, server *Server, listener net.Listener) (context.CancelFunc, <-chan error) {
+	t.Helper()
 	listening := make(chan struct{})
 	var listenOnce sync.Once
 	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
@@ -4906,7 +5093,7 @@ func startTestServerWithBlockingListener(t *testing.T, server *Server) (context.
 			t.Fatalf("server did not stop")
 		}
 	})
-	return cancel, done, listener
+	return cancel, done
 }
 
 func waitForServeLifecycle(t *testing.T, server *Server, listener net.Listener, done <-chan error) {
@@ -6200,6 +6387,31 @@ func (l *pipeTestListener) Dial() (net.Conn, error) {
 		_ = client.Close()
 		_ = server.Close()
 		return nil, net.ErrClosed
+	}
+}
+
+func assertPipeListenerAccepts(t *testing.T, listener *pipeTestListener, reason string) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		conn, err := listener.Dial()
+		if err == nil {
+			_ = conn.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("pipe listener did not accept %s: %v", reason, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("pipe listener did not accept %s", reason)
+	}
+	select {
+	case <-listener.closed:
+		t.Fatalf("pipe listener was closed %s", reason)
+	default:
 	}
 }
 

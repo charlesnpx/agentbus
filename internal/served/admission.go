@@ -654,8 +654,29 @@ func (s *Server) closeServeAdmission() error {
 }
 
 func (s *Server) closeServeAdmissionContext(ctx context.Context) error {
+	return s.closeServeAdmissionSnapshot(ctx, s.currentServeAdmissionSnapshot())
+}
+
+func (s *Server) closeServeAdmissionSnapshot(ctx context.Context, snapshot *serveAdmissionSnapshot) error {
+	if snapshot == nil {
+		return nil
+	}
+	if !snapshot.closeStarted.CompareAndSwap(false, true) {
+		return nil
+	}
+	snapshot.closeErr = s.closeServeAdmissionSnapshotOnce(ctx, snapshot)
+	return snapshot.closeErr
+}
+
+func (s *Server) closeServeAdmissionSnapshotOnce(ctx context.Context, snapshot *serveAdmissionSnapshot) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	s.admissionStateMu.RLock()
+	current := s.admissionInstance == snapshot.instance
+	s.admissionStateMu.RUnlock()
+	if !current {
+		return closeServeAdmissionSnapshotResources(ctx, snapshot, false, nil, time.Now().Add(admissionRepositoryCloseTimeout))
 	}
 	// Lock order for the admission shutdown path is submitMu -> stateMu.
 	// Identified submit never takes submitMu while holding stateMu; it snapshots
@@ -686,26 +707,37 @@ func (s *Server) closeServeAdmissionContext(ctx context.Context) error {
 	}
 	s.admissionStateMu.Lock()
 
-	closer := s.admissionClose
-	runtime := s.admissionRuntime
-	if runtime != nil && s.admissionInstance != nil {
+	current = s.admissionInstance == snapshot.instance
+	closer := snapshot.closer
+	runtime := snapshot.runtime
+	if current {
+		closer = s.admissionClose
+		runtime = s.admissionRuntime
+	}
+	if runtime != nil && snapshot.instance != nil {
 		runtime.markConsumed()
 	}
-	s.admissionBootstrapper = nil
-	s.admissionReady = nil
-	s.admissionCoordinator = nil
-	s.admissionOwnedWorkChecker = nil
-	s.admissionSubmission = nil
-	s.admissionRuntime = nil
-	s.admissionRepository = nil
-	s.admissionClose = nil
-	s.admissionInstance = nil
-	s.admissionDaemonBootOnce = sync.Once{}
-	s.admissionDaemonBootRef = model.BootRef{}
-	s.admissionDaemonBootRefErr = nil
+	if current {
+		s.admissionBootstrapper = nil
+		s.admissionReady = nil
+		s.admissionCoordinator = nil
+		s.admissionOwnedWorkChecker = nil
+		s.admissionSubmission = nil
+		s.admissionRuntime = nil
+		s.admissionRepository = nil
+		s.admissionClose = nil
+		s.admissionInstance = nil
+		s.admissionDaemonBootOnce = sync.Once{}
+		s.admissionDaemonBootRef = model.BootRef{}
+		s.admissionDaemonBootRefErr = nil
+	}
 	s.admissionStateMu.Unlock()
 	if submitLocked {
 		s.admissionSubmitMu.Unlock()
+	}
+
+	if !current {
+		return closeServeAdmissionSnapshotResources(ctx, snapshot, false, nil, deadline)
 	}
 
 	if closer != nil {
@@ -728,6 +760,29 @@ func (s *Server) closeServeAdmissionContext(ctx context.Context) error {
 			return submitLockErr
 		}
 		return closeAdmissionResourceBeforeDeadline(ctx, "runtime", runtimeCloser{runtime: runtime}, deadline)
+	}
+	if !submitLocked {
+		return submitLockErr
+	}
+	return nil
+}
+
+func closeServeAdmissionSnapshotResources(ctx context.Context, snapshot *serveAdmissionSnapshot, submitLocked bool, submitLockErr error, deadline time.Time) error {
+	if snapshot == nil {
+		return nil
+	}
+	if snapshot.runtime != nil && snapshot.instance != nil {
+		snapshot.runtime.markConsumed()
+	}
+	if snapshot.closer != nil {
+		err := closeAdmissionResourceBeforeDeadline(ctx, "repository", snapshot.closer, deadline)
+		if snapshot.runtime != nil {
+			err = errors.Join(err, closeAdmissionResourceBeforeDeadline(ctx, "runtime", runtimeCloser{runtime: snapshot.runtime}, deadline))
+		}
+		return err
+	}
+	if snapshot.runtime != nil {
+		return closeAdmissionResourceBeforeDeadline(ctx, "runtime", runtimeCloser{runtime: snapshot.runtime}, deadline)
 	}
 	if !submitLocked {
 		return submitLockErr
