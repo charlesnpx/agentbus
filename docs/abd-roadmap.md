@@ -4,7 +4,7 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS (AB-E): E0-E7 CLOSED; E8 documentation in final review (2026-07-24). AB-E completes when the E8 review returns SHIP; criterion 13 (candidate-SHA remote green) stays deferred pending Actions billing and the approved .github/workflows installation. See "AB-E hardening
+STATUS (AB-E): COMPLETE (2026-07-24). ALL 11 UNITS CLOSED, E8 at df8ffe8 (SHIP, holistic review: acceptance criteria 1-12 PASS). Criterion 13 (candidate-SHA remote green) deferred pending Actions billing and the user-approved installation of scripts/ci/github-workflows-proposed/ into .github/workflows/. See "AB-E hardening
 roadmap" section below — 11 sequential units (E0→E8) from the post-completion external evaluation.
 AB-D itself remains COMPLETE as recorded.
 
@@ -783,7 +783,7 @@ unless a later roadmap explicitly promotes a narrower execution API.
 | E5B | Create/OpenExisting/OpenExistingReadOnly split (no ambiguous open-or-create); AuditIntegrity (Tx.Check drained + envelope + cross-record + index) at every existing entry point; root-existence matrix test per cell; unsupported first serve non-mutating; corruption fixtures fatal pre-bind, file untouched | CLOSED c8d50df |
 | E6 | docs/protocol.md v2 reconciliation (hand-written; full job.submit identity schema, replay tables, rejection-cause table verified vs implementation) | CLOSED d1ef34b |
 | E7 | CI lanes: committed gate scripts (scripts/ci/), full -race, strict-tag compile, privileged cgroup lane, product black-box lane, fail-closed lanes, govulncheck; release-check runs tests + strict smoke. Merge needs remote-green on candidate SHA (billing must be restored). `.github/**` edits need explicit user approval | CLOSED 22b6a77 |
-| E8 | Docs: ADR index (+11,+12), operations runbook, offline-only backup policy, install caveat; FINAL holistic review of the complete candidate SHA. Deferred pending explicit user approval: install `scripts/ci/github-workflows-proposed/` into `.github/workflows/`; update PR #29 title/body. | IN FINAL REVIEW (doc fixes applied; closes on SHIP) |
+| E8 | Docs: ADR index (+11,+12), operations runbook, offline-only backup policy, install caveat; FINAL holistic review of the complete candidate SHA. Deferred pending explicit user approval: install `scripts/ci/github-workflows-proposed/` into `.github/workflows/`; update PR #29 title/body. | CLOSED df8ffe8 |
 
 ## Verified defects driving AB-E (evidence at 4e0bd50)
 1. Foreground session/turn executes outside the authority (server.go:1113/1153/1236; runAttempt non-admission branch).
@@ -798,6 +798,17 @@ unless a later roadmap explicitly promotes a narrower execution API.
 10. CI: no strict lane, race excludes client/+cmd/, gate scripts unversioned; tip red = GitHub Actions BILLING block (jobs die ~4s pre-step), not code.
 
 ## AB-E Log
+- 2026-07-24: E8 CLOSED at df8ffe8 — AB-E COMPLETE. Arc: worker 2dfb136 (operations runbook with
+  per-claim code receipts incl. an empirical v1-binary-vs-v2-store probe; ADR index +11/+12;
+  roadmap/README hygiene) -> review1 FIX(2H+2M+2L doc accuracy: SocketPath misdocumented as
+  state-root source; exit 11 overstated to serve paths; superseded ADRs presented as current;
+  README turn.start dependency; reset-empty anchor wording; premature completion claims) PLUS the
+  FINAL HOLISTIC REVIEW of 4e0bd50..2dfb136 (78 files, +18302/-6650): acceptance criteria 1-12
+  PASS with enforcement + gate evidence cited per criterion, 13 DEFERRED (billing + .github
+  approval), 14 performed -> fix1 256618a (orchestrator-applied corrections) -> review2 FIX(1H
+  residual: exit-13 subject error) -> fix2 df8ffe8 (reviewer wording verbatim) -> review3 SHIP,
+  zero findings. Deferred pending explicit user approval: install
+  scripts/ci/github-workflows-proposed/ into .github/workflows/; update PR #29 title/body.
 - 2026-07-24: E7 CLOSED at 22b6a77 (SHIP on review round 2 + apply pass). Arc: worker 89fea16
   (gate scripts committed to scripts/ci/ — solo-battery, docker-cgroup-v2, product-e2e,
   release-check, fail-closed, vuln; five Actions workflows STAGED in
