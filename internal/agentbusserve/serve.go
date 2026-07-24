@@ -13,7 +13,12 @@ import (
 type Config = served.Config
 type StrictAdmissionOptions = served.StrictAdmissionOptions
 
+var ErrShutdownDeadlineExceeded = served.ErrShutdownDeadlineExceeded
+
 func Serve(ctx context.Context, cfg Config) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	reporter, hasReporter, err := daemonlaunch.InheritedReporterFromEnv()
 	if err != nil {
 		return err
@@ -67,11 +72,35 @@ func Serve(ctx context.Context, cfg Config) error {
 		reportStartupFailure(reporter, err)
 		return err
 	}
-	err = server.ServeWithStartupContext(ctx, startupCtx)
-	if err != nil {
-		reportStartupFailure(reporter, err)
+	serviceCtx, stopService := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopService()
+	done := make(chan error, 1)
+	go func() {
+		done <- server.ServeWithStartupContext(serviceCtx, startupCtx)
+	}()
+	select {
+	case err = <-done:
+		if err != nil {
+			reportStartupFailure(reporter, err)
+		}
+		return err
+	case <-ctx.Done():
+		shutdownCtx := context.WithoutCancel(ctx)
+		var cancelShutdown context.CancelFunc
+		if timeout := server.ShutdownTimeout(); timeout > 0 {
+			shutdownCtx, cancelShutdown = context.WithTimeout(shutdownCtx, timeout)
+		} else {
+			shutdownCtx, cancelShutdown = context.WithCancel(shutdownCtx)
+		}
+		shutdownErr := server.Shutdown(shutdownCtx)
+		cancelShutdown()
+		stopService()
+		serveErr := <-done
+		if shutdownErr != nil {
+			return shutdownErr
+		}
+		return serveErr
 	}
-	return err
 }
 
 func RecoverAdmissionRoot(ctx context.Context, cfg Config) (served.AdmissionRecoveryReport, error) {

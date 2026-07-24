@@ -3085,6 +3085,130 @@ func TestServerContextCancelDoesNotForceCloseEstablishedConnection(t *testing.T)
 	}
 }
 
+func TestShutdownRejectsAdmissionBeforeListenerClose(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	configureTestAdmissionRuntime(t, server, newAdmissionFakeLaunchCustodian(t), true)
+	listener := newBlockingTestListener()
+	ready := make(chan struct{})
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		return listener, socketFileIdentity{}, nil
+	}
+	server.readyHook = func(ServeReadyInfo) error {
+		close(ready)
+		return nil
+	}
+	listener.onClose = func() {
+		if !server.admissionCurrentServeClosing() {
+			t.Error("listener closed before admission close epoch was marked")
+		}
+		outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+			WorkspaceKey: "workspace-shutdown-order",
+			RequestID:    "request-shutdown-order",
+			TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+		}))
+		assertJobHandlerError(t, outcome, protocol.ErrorCapabilityMissing, protocol.AdmissionRejectAdmissionClosing, "")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(context.Background()) }()
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("Serve returned before ready: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("server did not become ready")
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown error = %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve after Shutdown = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not return after Shutdown")
+	}
+}
+
+func TestShutdownCancelsPendingAuthorityWorkBeforeClose(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, _ := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+	accepted := acceptIdentifiedAuthorityWork(t, server, "shutdown-pending")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown error = %v", err)
+	}
+	record := loadAuthoritySafetyRecordFromRepository(t, repo, accepted.Record.JobID.String())
+	if record.Terminal == nil {
+		t.Fatal("shutdown left pending authority work nonterminal")
+	}
+	if record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Cause != model.CauseCanceledBeforeAuthorization {
+		t.Fatalf("terminal = %+v, want canceled before authorization", record.Terminal)
+	}
+	if server.admissionInstance != nil || server.admissionReady != nil || server.admissionCoordinator != nil || server.admissionRuntime != nil || server.admissionRepository != nil {
+		t.Fatalf("admission state after Shutdown: instance=%p ready=%p coord=%p runtime=%p repo=%v",
+			server.admissionInstance, server.admissionReady, server.admissionCoordinator, server.admissionRuntime, server.admissionRepository)
+	}
+}
+
+func TestShutdownDeadlineExceededLeavesForcedRecoveryPath(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	launcher.activeCustodies.Store(true)
+	t.Cleanup(func() {
+		launcher.activeCustodies.Store(false)
+		_ = server.closeServeAdmission()
+	})
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	err := server.Shutdown(shutdownCtx)
+	if !errors.Is(err, ErrShutdownDeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want ErrShutdownDeadlineExceeded", err)
+	}
+	if server.admissionInstance == nil || server.admissionRuntime == nil {
+		t.Fatalf("forced shutdown closed admission state; instance=%p runtime=%p", server.admissionInstance, server.admissionRuntime)
+	}
+}
+
+func TestShutdownRemovesOnlyOwnedPIDFile(t *testing.T) {
+	t.Parallel()
+	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	pidPath := filepath.Join(root, "agentbus.pid")
+	if err := os.WriteFile(pidPath, []byte("999999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server.removeOwnedPIDFile("test mismatch")
+	raw, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(raw)) != "999999" {
+		t.Fatalf("pid file after mismatch removal = %q", raw)
+	}
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server.removeOwnedPIDFile("test owner")
+	if _, err := os.Stat(pidPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pid file stat after owner removal = %v, want not exist", err)
+	}
+}
+
 func TestActiveWorkCountsAuthorityOwnedCustodyAndResultPublication(t *testing.T) {
 	t.Parallel()
 	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
@@ -5577,6 +5701,7 @@ func (c *scriptedConn) writesString() string {
 type blockingTestListener struct {
 	closed    chan struct{}
 	closeOnce sync.Once
+	onClose   func()
 }
 
 func newBlockingTestListener() *blockingTestListener {
@@ -5589,7 +5714,12 @@ func (l *blockingTestListener) Accept() (net.Conn, error) {
 }
 
 func (l *blockingTestListener) Close() error {
-	l.closeOnce.Do(func() { close(l.closed) })
+	l.closeOnce.Do(func() {
+		if l.onClose != nil {
+			l.onClose()
+		}
+		close(l.closed)
+	})
 	return nil
 }
 

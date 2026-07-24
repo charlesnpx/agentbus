@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -30,6 +31,7 @@ const (
 	cliExitUnknownJob           = 10
 	cliExitDaemonStartupFailure = 11
 	cliExitAuthorityFailStop    = 12
+	cliExitShutdownForced       = 13
 
 	// Keep this local so cmd/agentbus reaches served only through agentbusserve.
 	cliStartupCodeServedSafetyFailStopped = "served safety fail-stop"
@@ -217,7 +219,9 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 			backends = append(backends, spec.backend)
 		}
 	}
-	err := agentbusserve.Serve(ctx, agentbusserve.Config{
+	serveCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
+	defer stopSignals()
+	err := agentbusserve.Serve(serveCtx, agentbusserve.Config{
 		StateRoot:    a.stateRoot,
 		CWD:          a.cwd,
 		Backends:     backends,
@@ -941,6 +945,9 @@ func admissionUsageError(errOut io.Writer, format string, args ...any) int {
 
 func commandError(errOut io.Writer, err error) int {
 	fmt.Fprintf(errOut, "agentbus: %v\n", err)
+	if errors.Is(err, agentbusserve.ErrShutdownDeadlineExceeded) {
+		return cliExitShutdownForced
+	}
 	return 1
 }
 

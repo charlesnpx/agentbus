@@ -273,6 +273,90 @@ func TestProductionStrictJobCLIStatusResultCancelE2B(t *testing.T) {
 	}
 }
 
+func TestProductionStrictSIGTERMMidJobGracefulShutdownE2B(t *testing.T) {
+	requireProductionStrictE2BGate(t)
+	stateRoot := shortTempDir(t)
+	cwd := shortTempDir(t)
+	fixture := installServedNativeCodexFixture(t, stateRoot)
+	agentbusPath := builtServedNativeAgentbusPath(t)
+	daemon := startProductionStrictForegroundCommandE2B(t, agentbusPath, stateRoot, cwd, fixture.env)
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			stopProductionStrictCommand(t, daemon.cmd, daemon.done, &daemon.stdout, &daemon.stderr)
+		}
+	})
+	client := connectProductionStrictClient(t, stateRoot, daemon.done)
+	defer client.Close()
+	writeProductionStrictOwnerPIDFileE2B(t, stateRoot, daemon.cmd.Process.Pid)
+
+	startedPath := filepath.Join(stateRoot, "sigterm-hold-started")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	submitted, err := client.JobSubmit(ctx, agentclient.JobSubmitParams(servedNativeSubmitParams("sigterm-shutdown-e2b", cwd, servedNativeFixtureModeHold, servedNativeStartedTags(startedPath))))
+	if err != nil {
+		t.Fatalf("submit hold job: %v", err)
+	}
+	if err := waitServedNativeFile(startedPath, 10*time.Second); err != nil {
+		t.Fatalf("hold job did not start: %v", err)
+	}
+	if err := syscall.Kill(daemon.cmd.Process.Pid, syscall.SIGTERM); err != nil {
+		t.Fatalf("SIGTERM daemon: %v", err)
+	}
+	waitForSocketRemoved(t, filepath.Join(stateRoot, protocol.SocketName), daemon.done)
+	_, err = client.JobSubmit(ctx, agentclient.JobSubmitParams(servedNativeSubmitParams("sigterm-reject-e2b", cwd, servedNativeFixtureModeClean, nil)))
+	assertProductionStrictAdmissionClosingE2B(t, err)
+	waitProductionStrictForegroundExitE2B(t, daemon)
+	stopped = true
+	assertProductionStrictSocketPIDRemovedE2B(t, stateRoot)
+	assertProductionStrictPIDAbsentE2B(t, daemon.cmd.Process.Pid, 5*time.Second)
+
+	record := waitProductionStrictAdmissionTerminalFromRepository(t, stateRoot, submitted.JobID, 10*time.Second)
+	launchProof := assertServedNativeIdentifiedTerminal(t, record, model.OutcomeCanceled)
+	if record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+		t.Fatalf("shutdown terminal cause = %s, want %s", record.Terminal.Cause, model.CauseCanceledAfterAuthorization)
+	}
+	if launchProof.Quiescence.Method != model.QuiescenceTermKill {
+		t.Fatalf("shutdown quiescence method = %s, want term_kill", launchProof.Quiescence.Method)
+	}
+	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
+	report := runProductionStrictRecoverCLI(t, agentbusPath, stateRoot)
+	if report.WorkItems != 0 {
+		t.Fatalf("recover after graceful SIGTERM = %+v, want zero work items", report)
+	}
+}
+
+func TestProductionStrictSIGINTIdleGracefulShutdownE2B(t *testing.T) {
+	requireProductionStrictE2BGate(t)
+	stateRoot := shortTempDir(t)
+	cwd := shortTempDir(t)
+	fixture := installServedNativeCodexFixture(t, stateRoot)
+	agentbusPath := builtServedNativeAgentbusPath(t)
+	daemon := startProductionStrictForegroundCommandE2B(t, agentbusPath, stateRoot, cwd, fixture.env)
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			stopProductionStrictCommand(t, daemon.cmd, daemon.done, &daemon.stdout, &daemon.stderr)
+		}
+	})
+	client := connectProductionStrictClient(t, stateRoot, daemon.done)
+	writeProductionStrictOwnerPIDFileE2B(t, stateRoot, daemon.cmd.Process.Pid)
+	if err := client.Close(); err != nil {
+		t.Fatalf("client close: %v", err)
+	}
+	if err := syscall.Kill(daemon.cmd.Process.Pid, syscall.SIGINT); err != nil {
+		t.Fatalf("SIGINT daemon: %v", err)
+	}
+	waitProductionStrictForegroundExitE2B(t, daemon)
+	stopped = true
+	assertProductionStrictSocketPIDRemovedE2B(t, stateRoot)
+	assertProductionStrictPIDAbsentE2B(t, daemon.cmd.Process.Pid, 5*time.Second)
+	report := runProductionStrictRecoverCLI(t, agentbusPath, stateRoot)
+	if report.WorkItems != 0 {
+		t.Fatalf("recover after graceful SIGINT = %+v, want zero work items", report)
+	}
+}
+
 func TestProductionStrictCLINoDaemonUnsupportedHostDarwinE2B(t *testing.T) {
 	if strings.TrimSpace(os.Getenv(strictE2ERunEnv)) != "1" {
 		t.Skipf("set %s=1 to run strict cli e2e", strictE2ERunEnv)
@@ -479,6 +563,74 @@ func launchProductionStrictDaemonE2B(t *testing.T, agentbusPath, stateRoot strin
 		t.Fatalf("launch result = %+v, want new daemon pid", result)
 	}
 	return result
+}
+
+type productionStrictForegroundCommandE2B struct {
+	cmd    *exec.Cmd
+	done   chan error
+	stdout bytes.Buffer
+	stderr bytes.Buffer
+}
+
+func startProductionStrictForegroundCommandE2B(t *testing.T, agentbusPath, stateRoot, cwd string, env []string) *productionStrictForegroundCommandE2B {
+	t.Helper()
+	daemon := &productionStrictForegroundCommandE2B{}
+	daemon.cmd = exec.Command(agentbusPath, "serve", "--foreground")
+	daemon.cmd.Dir = cwd
+	daemon.cmd.Env = upsertEnv(env, "AGENTBUS_STATE_ROOT="+stateRoot)
+	daemon.cmd.Stdout = &daemon.stdout
+	daemon.cmd.Stderr = &daemon.stderr
+	if err := daemon.cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	daemon.done = make(chan error, 1)
+	go func() {
+		daemon.done <- daemon.cmd.Wait()
+		close(daemon.done)
+	}()
+	return daemon
+}
+
+func writeProductionStrictOwnerPIDFileE2B(t *testing.T, stateRoot string, pid int) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(stateRoot, "agentbus.pid"), []byte(fmt.Sprintf("%d\n", pid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitProductionStrictForegroundExitE2B(t *testing.T, daemon *productionStrictForegroundCommandE2B) {
+	t.Helper()
+	select {
+	case err := <-daemon.done:
+		if err != nil {
+			t.Fatalf("foreground daemon exited with error: %v\nstdout=%s\nstderr=%s", err, daemon.stdout.String(), daemon.stderr.String())
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("foreground daemon did not exit\nstdout=%s\nstderr=%s", daemon.stdout.String(), daemon.stderr.String())
+	}
+}
+
+func assertProductionStrictAdmissionClosingE2B(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("submit during shutdown succeeded, want admission_closing")
+	}
+	var rpcErr *protocol.RPCError
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("submit during shutdown error = %T %v, want RPC admission_closing", err, err)
+	}
+	if rpcErr.Object.Data.AdmissionCause != protocol.AdmissionRejectAdmissionClosing {
+		t.Fatalf("submit during shutdown error = %+v, want admission_closing", rpcErr.Object)
+	}
+}
+
+func assertProductionStrictSocketPIDRemovedE2B(t *testing.T, stateRoot string) {
+	t.Helper()
+	for _, path := range []string{filepath.Join(stateRoot, protocol.SocketName), filepath.Join(stateRoot, "agentbus.pid")} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s stat = %v, want not exist", path, err)
+		}
+	}
 }
 
 func killProductionStrictDaemonE2B(t *testing.T, result daemonlaunch.Result, description string) {

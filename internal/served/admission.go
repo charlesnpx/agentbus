@@ -721,6 +721,36 @@ func (s *Server) closeServeAdmission() error {
 	return nil
 }
 
+func (s *Server) beginAdmissionClosing(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.admissionCloseEpoch.Add(1)
+	if err := s.lockAdmissionSubmitContext(ctx); err != nil {
+		return err
+	}
+	s.admissionSubmitMu.Unlock()
+	return nil
+}
+
+func (s *Server) lockAdmissionSubmitContext(ctx context.Context) error {
+	for {
+		if s.admissionSubmitMu.TryLock() {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 func (s *Server) lockAdmissionSubmitUntil(deadline time.Time) bool {
 	for {
 		if s.admissionSubmitMu.TryLock() {
@@ -2133,6 +2163,14 @@ func admissionAcceptCommitted(accepted authority.AcceptResult) bool {
 
 func admissionPostAcceptError(accepted authority.AcceptResult, err error) *protocol.ErrorObject {
 	jobID := accepted.Record.JobID.String()
+	if errors.Is(err, errAdmissionClosing) {
+		return strictAdmissionProtocolError(
+			protocol.ErrorCapabilityMissing,
+			protocol.AdmissionRejectAdmissionClosing,
+			err.Error(),
+			protocol.ErrorData{JobID: jobID},
+		)
+	}
 	// S4E wires listener halt and recovery consumption; this path only reports
 	// that the obligation was durably accepted and the authority fail-stopped.
 	return protocol.NewError(protocol.ErrorBackendUnavailable, fmt.Sprintf("admission accepted job %s and fail-stopped before launch: %v", jobID, err), protocol.ErrorData{JobID: jobID})
