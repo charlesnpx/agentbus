@@ -771,7 +771,7 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 | E2A | Shared daemon launcher: readiness pipe (ready{protocolVersion,pid,canonicalStateRoot,socketPath} / failed{code,message}), PID-after-ready, Setsid, kill+reap on parent failure, stderr preserved to handshake, concurrent-start winner verification | CLOSED c69c83c |
 | E2B | Autostart: typed diagnostic on unsupported host, restart-after-exit restores service, race convergence; `admission recover` gets a dedicated strict-native recovery constructor; compiled-CLI recovery in Docker gate | CLOSED 86a5c31 |
 | E3 | Authority-only RPC handlers (no JSON merge/fallback); CLI status/result/cancel/list become protocol clients; delete `sessions` cmd; stable exit codes; compiled-binary E2E across restart+recovery | CLOSED 67be1d5 |
-| E4 | Graceful shutdown: signal.NotifyContext (daemon serving only) + Shutdown(ctx) reusing existing durable cancellation; successful graceful shutdown ⇒ no live custody, no recovery obligation; forced-timeout path remains recoverable fail-closed | PENDING |
+| E4 | Graceful shutdown: signal.NotifyContext (daemon serving only) + Shutdown(ctx) reusing existing durable cancellation; successful graceful shutdown ⇒ no live custody, no recovery obligation; forced-timeout path remains recoverable fail-closed | CLOSED d74288c |
 | E5A | Record-level bbolt behind repository contract; Auditor + AnchorIdentified; binding_index as derived locator; dirty-closure validation sharing invariant helpers with full audit; operation-count tests (bbolt pkg) prove O(touched); 1k/10k/100k benchmarks | PENDING |
 | E5B | Create/OpenExisting/OpenExistingReadOnly split (no ambiguous open-or-create); AuditIntegrity (Tx.Check drained + envelope + cross-record + index) at every existing entry point; root-existence matrix test per cell; unsupported first serve non-mutating; corruption fixtures fatal pre-bind, file untouched | PENDING |
 | E6 | docs/protocol.md v2 reconciliation (hand-written; full job.submit identity schema, replay tables, rejection-cause table verified vs implementation) | PENDING |
@@ -791,6 +791,30 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 10. CI: no strict lane, race excludes client/+cmd/, gate scripts unversioned; tip red = GitHub Actions BILLING block (jobs die ~4s pre-step), not code.
 
 ## AB-E Log
+- 2026-07-24: E4 CLOSED at d74288c (SHIP, zero findings, round 7). Hardest unit of the campaign —
+  6 fix rounds. Arc: worker 4a19fb0 (Shutdown(ctx) orchestration, foreground-only signals, SIGTERM/
+  SIGINT E2Es green in Docker) -> review1 FIX(3M: close phase discarded caller deadline + logged-
+  success on close timeout; concurrent Shutdown ignored own ctx; PID removal replacement race) ->
+  fix1 3f56b2a (min-deadline close + typed errors, ctx-aware single-flight, O_NOFOLLOW+quarantine
+  PID teardown) -> review2 FIX(2M residual: post-close teardown unbounded + success cacheable past
+  deadline; single-flight state survived re-Serve generations) -> fix2 accbef2 (ctx rechecks, per-
+  generation shutdown state, ErrShutdownNotServing) -> review3 FIX(3M: restore-on-expiry unbounded;
+  check-then-act generation gate; bootstrap signal exited nonzero) -> fix3 09b2c93 (bounded abandon,
+  generation snapshots, bootstrap-cancel mapping; gate flake of the E2A context-split test dismissed
+  after isolated -race -count=3 + full gate rerun green) -> review4 FIX(4: error/deferred-path fs ops
+  post-cancel; Server-global mutations between generation checks; select-order cancel classification;
+  ready frame emittable post-cancel; +Low timing-marginal test) -> fix4 cb0fc89 (post-cancel fs
+  abstinence, serialized generation registration + instance-aware mutations + PID inode identity,
+  errors.Is done-branch, guarded linearized readiness, ReadyHook test sync) -> review5 FIX(1M:
+  classification wrong both directions — preflight cancel exited 1; joined SafetyFailStopError+
+  Canceled masked to 0) -> fix5 1563331 (pre-select pure-cancel clean; typed-failure precedence,
+  21-type gate list) -> review6 FIX(2M: DNC+cancel reverse-masked to 1; persisted fail-stop returned
+  as bare Canceled by postDurableFailStopError -> exit 0/EOF while root durably fail-stopped) ->
+  fix6 d74288c (fail-stop sentinel joined at authority source, four bypassing callers fixed with
+  call-site audit; DNC dropped from gate, ErrAmbiguousCommit deliberately kept fatal; deterministic
+  quarantine test) -> review7 SHIP zero findings. Best catch: review6's persisted-fail-stop-as-exit-0
+  masking. Non-blocking Lows accepted under calibration: exceptional PID-restore sub-step race,
+  close-epoch check-then-act under direct Server reuse (both fail-closed).
 - 2026-07-24: E3 CLOSED at 67be1d5 (SHIP, 1 advisory Low). Arc: worker (authority-only handlers;
   CLI status/result/cancel/list as protocol-v2 clients via launcher autostart; sessions deleted;
   exit-code table 0/2-12) -> Docker gate caught TestStartReaperRecoversCrashedJob (legacy
