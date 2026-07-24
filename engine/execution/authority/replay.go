@@ -36,7 +36,7 @@ func (r *Ready) LookupReplay(ctx context.Context, key model.RequestKey) (ReplayR
 	defer r.core.mu.Unlock()
 
 	var result ReplayResult
-	if err := r.core.repo.View(ctx, func(tx repository.ReadTx) error {
+	if err := r.core.view(ctx, "lookup replay", func(tx repository.ReadTx) error {
 		if _, err := r.core.requireReadyTx(tx, r.token); err != nil {
 			return err
 		}
@@ -64,7 +64,7 @@ func (r *Ready) Expire(ctx context.Context, key model.RequestKey) (repository.To
 	defer r.core.mu.Unlock()
 
 	var tombstone repository.Tombstone
-	commit, err := r.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+	commit, err := r.core.update(ctx, "expire request", func(tx repository.WriteTx) error {
 		meta, err := r.core.requireReadyTx(tx, r.token)
 		if err != nil {
 			return err

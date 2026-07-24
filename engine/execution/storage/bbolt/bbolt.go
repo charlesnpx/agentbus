@@ -218,7 +218,12 @@ func OpenReadOnly(path string, options ...*bolt.Options) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Repository{db: db, fileIdentity: identity}, nil
+	repo := &Repository{db: db, fileIdentity: identity}
+	if err := repo.verifyReadOnlyCompatibleSchema(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return repo, nil
 }
 
 func (r *Repository) Close() error {
@@ -264,6 +269,22 @@ func (r *Repository) verifyExistingNoInitInitializedStructure() error {
 			return UnsupportedAuthorityMetaSchemaVersionError{Path: r.db.Path(), SchemaVersion: schemaVersion}
 		}
 		return verifyInitializedStructureTx(tx, r.db.Path())
+	})
+}
+
+func (r *Repository) verifyReadOnlyCompatibleSchema() error {
+	if r == nil || r.db == nil {
+		return fmt.Errorf("%w: bbolt repository is not open", repository.ErrInvalidRecord)
+	}
+	return r.db.View(func(tx *bolt.Tx) error {
+		schemaVersion, err := authorityMetaSchemaVersionTx(tx, r.db.Path())
+		if err != nil {
+			return err
+		}
+		if schemaVersion != repository.StrictAuthorityMetaSchemaVersion {
+			return UnsupportedAuthorityMetaSchemaVersionError{Path: r.db.Path(), SchemaVersion: schemaVersion}
+		}
+		return nil
 	})
 }
 
@@ -430,6 +451,11 @@ func (r *Repository) operationCounterForTest() *operationCounterForTest {
 	return r.operationCounter
 }
 
+func (r *Repository) countOperationForTest(name string) {
+	counter := r.operationCounterForTest()
+	counter.count(name)
+}
+
 func (counter *operationCounterForTest) count(name string) {
 	if counter == nil {
 		return
@@ -564,6 +590,9 @@ func (r *Repository) AnchorIdentity() (string, uint16, error) {
 			return fmt.Errorf("%w: db_uuid is %s", repository.ErrInvalidRecord, uuidRecord.State)
 		}
 		meta := readTx{tx: tx}.Meta()
+		if meta.State == repository.RecordCorrupt {
+			return repository.CorruptRecordError("meta", "authority", meta.Diagnostic)
+		}
 		if meta.State != repository.RecordValid {
 			return fmt.Errorf("%w: meta is %s", repository.ErrInvalidRecord, meta.State)
 		}
@@ -666,6 +695,7 @@ func (r *Repository) injectCorruptRecordForTest(bucketName, key []byte, kind, di
 		diagnostic = "corrupt"
 	}
 	err := r.db.Update(func(tx *bolt.Tx) error {
+		r.countOperationForTest("create_bucket")
 		bucket, err := tx.CreateBucketIfNotExists(bucketName)
 		if err != nil {
 			return err
@@ -692,6 +722,7 @@ func (r *Repository) injectCorruptRecordForTest(bucketName, key []byte, kind, di
 
 func (r *Repository) InjectMissingMetaForTest() {
 	err := r.db.Update(func(tx *bolt.Tx) error {
+		r.countOperationForTest("create_bucket")
 		bucket, err := tx.CreateBucketIfNotExists(bucketMeta)
 		if err != nil {
 			return err
@@ -716,6 +747,7 @@ func (r *Repository) initialize() error {
 			return verifyInitializedStructureTx(tx, r.db.Path())
 		}
 		for _, name := range bucketNames {
+			r.countOperationForTest("create_bucket")
 			if _, err := tx.CreateBucket(name); err != nil {
 				return err
 			}
@@ -876,32 +908,74 @@ func (tx readTx) Meta() repository.Record[repository.AuthorityMeta] {
 }
 
 func (tx readTx) RootStats() (repository.AuthorityRootStats, error) {
-	ids, err := tx.jobIDSet()
-	if err != nil {
+	liveJobs := map[model.JobID]struct{}{}
+	var findings []error
+	stats := repository.AuthorityRootStats{}
+	for _, bucketName := range [][]byte{bucketSafety, bucketProjections, bucketQuarantine, bucketBindingIndex} {
+		bucket := tx.tx.Bucket(bucketName)
+		if bucket == nil {
+			continue
+		}
+		tx.count("foreach:" + string(bucketName))
+		if err := bucket.ForEach(func(key, raw []byte) error {
+			jobID, err := model.NewJobID(string(key))
+			if err != nil {
+				findings = append(findings, fmt.Errorf("%w: %s key %q: %v", repository.ErrCorruptRecord, string(bucketName), string(key), err))
+				return nil
+			}
+			if bytes.Equal(bucketName, bucketSafety) {
+				record, diagnostic := decodeEnvelope(kindSafety, key, raw, validateSafety, revisionSafety)
+				if diagnostic != "" {
+					findings = append(findings, repository.CorruptRecordError("safety", jobID.String(), diagnostic))
+					return nil
+				}
+				stats.LaunchRecords += record.Attempt.Launches.Count()
+				if record.Terminal == nil {
+					stats.RecoveryObligations++
+				}
+			}
+			liveJobs[jobID] = struct{}{}
+			return nil
+		}); err != nil {
+			return repository.AuthorityRootStats{}, err
+		}
+	}
+	stats.Bindings = countValidRequestRecords(tx, bucketBindings, kindBinding, validateBinding, revisionBinding, func(binding model.Binding) {
+		liveJobs[binding.JobID] = struct{}{}
+	}, &findings)
+	stats.Tombstones = countValidRequestRecords(tx, bucketTombstones, kindTombstone, validateTombstone, revisionTombstone, nil, &findings)
+	if err := repository.NewIntegrityError(findings); err != nil {
 		return repository.AuthorityRootStats{}, err
 	}
-	stats := repository.AuthorityRootStats{
-		Jobs:       len(ids),
-		Bindings:   bucketKeyCount(tx.tx.Bucket(bucketBindings)),
-		Tombstones: bucketKeyCount(tx.tx.Bucket(bucketTombstones)),
-	}
-	bucket := tx.tx.Bucket(bucketSafety)
+	stats.Jobs = len(liveJobs)
+	return stats, nil
+}
+
+func countValidRequestRecords[T any](tx readTx, bucketName []byte, kind recordKind, validate func(T) error, revision func(T) uint64, onValid func(T), findings *[]error) int {
+	bucket := tx.tx.Bucket(bucketName)
 	if bucket == nil {
-		return stats, nil
+		return 0
 	}
-	tx.count("foreach:safety")
-	err = bucket.ForEach(func(key, raw []byte) error {
-		record, diagnostic := decodeEnvelope(kindSafety, key, raw, validateSafety, revisionSafety)
-		if diagnostic != "" {
+	count := 0
+	tx.count("foreach:" + string(bucketName))
+	_ = bucket.ForEach(func(key, raw []byte) error {
+		requestKey, err := parseRequestKey(key)
+		if err != nil {
+			*findings = append(*findings, fmt.Errorf("%w: %s key %q: %v", repository.ErrCorruptRecord, kind, string(key), err))
 			return nil
 		}
-		stats.LaunchRecords += record.Attempt.Launches.Count()
-		if record.Terminal == nil {
-			stats.RecoveryObligations++
+		value, diagnostic := decodeEnvelope(kind, key, raw, validate, revision)
+		if diagnostic != "" {
+			*findings = append(*findings, repository.CorruptRecordError(string(kind), requestKey.String(), diagnostic))
+			return nil
+		}
+		count++
+		if onValid != nil {
+			onValid(value)
 		}
 		return nil
 	})
-	return stats, err
+	return count
 }
 
 func (tx readTx) LookupRequest(key model.RequestKey) repository.RequestImage {
@@ -960,7 +1034,7 @@ func (tx readTx) ListJobs(filter repository.JobFilter) ([]repository.JobImage, e
 			return nil, fmt.Errorf("%w: job_filter.boot_id: %v", repository.ErrInvalidRecord, err)
 		}
 	}
-	ids, err := tx.jobIDSet()
+	ids, err := tx.liveJobIDSet()
 	if err != nil {
 		return nil, err
 	}
@@ -995,7 +1069,7 @@ func (tx readTx) ListNonterminalByBoot(bootID model.BootID) ([]repository.JobIma
 	return tx.ListJobs(repository.JobFilter{BootID: bootID, NonterminalOnly: true})
 }
 
-func (tx readTx) jobIDSet() (map[model.JobID]struct{}, error) {
+func (tx readTx) liveJobIDSet() (map[model.JobID]struct{}, error) {
 	seen := map[model.JobID]struct{}{}
 	for _, bucketName := range [][]byte{bucketSafety, bucketProjections, bucketQuarantine, bucketBindingIndex} {
 		bucket := tx.tx.Bucket(bucketName)
@@ -1027,6 +1101,14 @@ func (tx readTx) jobIDSet() (map[model.JobID]struct{}, error) {
 			return nil, err
 		}
 	}
+	return seen, nil
+}
+
+func (tx readTx) auditJobIDSet() (map[model.JobID]struct{}, error) {
+	seen, err := tx.liveJobIDSet()
+	if err != nil {
+		return nil, err
+	}
 	tombstones := tx.tx.Bucket(bucketTombstones)
 	if tombstones != nil {
 		tx.count("foreach:tombstones")
@@ -1052,7 +1134,11 @@ func (tx readTx) validateBindingIndexForRequest(key model.RequestKey) error {
 		return nil
 	}
 	binding := request.Binding.Value
-	raw := tx.tx.Bucket(bucketBindingIndex).Get(jobIDKey(binding.JobID))
+	index := tx.tx.Bucket(bucketBindingIndex)
+	if index == nil {
+		return repository.CorruptRecordError("binding_index", binding.JobID.String(), "bucket is missing")
+	}
+	raw := index.Get(jobIDKey(binding.JobID))
 	tx.count("get:binding_index")
 	if raw == nil {
 		return repository.CorruptRecordError("binding_index", binding.JobID.String(), "missing index entry")
@@ -1106,7 +1192,7 @@ func (tx readTx) auditBindingIndexEntries() error {
 
 func auditKeysTx(tx readTx) (map[model.RequestKey]struct{}, map[model.JobID]struct{}, error) {
 	requests := map[model.RequestKey]struct{}{}
-	jobs, err := tx.jobIDSet()
+	jobs, err := tx.auditJobIDSet()
 	if err != nil {
 		return requests, jobs, err
 	}
@@ -1184,9 +1270,13 @@ func (tx *writeTx) AllocateJobID() (model.JobID, error) {
 
 func (tx *writeTx) PutMeta(meta repository.AuthorityMeta) error {
 	current := tx.Meta()
-	stats, err := tx.RootStats()
-	if err != nil {
-		return err
+	stats := repository.AuthorityRootStats{}
+	if current.State != repository.RecordValid {
+		var err error
+		stats, err = tx.RootStats()
+		if err != nil {
+			return err
+		}
 	}
 	currentGeneration := uint64(0)
 	currentNextJobSequence := uint64(0)
@@ -1878,16 +1968,4 @@ func scanJobSnapshot[T any](bucket *bolt.Bucket, kind recordKind, validate func(
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out, nil
-}
-
-func bucketKeyCount(bucket *bolt.Bucket) int {
-	if bucket == nil {
-		return 0
-	}
-	count := 0
-	_ = bucket.ForEach(func(_, _ []byte) error {
-		count++
-		return nil
-	})
-	return count
 }

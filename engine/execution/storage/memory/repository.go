@@ -106,6 +106,9 @@ func (r *Repository) AnchorIdentity() (string, uint16, error) {
 	if r.state.dbUUID == "" {
 		return "", 0, fmt.Errorf("%w: db_uuid is missing", repository.ErrInvalidRecord)
 	}
+	if r.state.meta.state == repository.RecordCorrupt {
+		return "", 0, repository.CorruptRecordError("meta", "authority", r.state.meta.diagnostic)
+	}
 	if r.state.meta.state != repository.RecordValid {
 		return "", 0, fmt.Errorf("%w: meta is %s", repository.ErrInvalidRecord, r.state.meta.state)
 	}

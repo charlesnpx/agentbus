@@ -67,6 +67,26 @@ func NewIntegrityFinding(kind, key string, err error) error {
 	return IntegrityFinding{Kind: kind, Key: key, Err: err}
 }
 
+type CorruptRecordKindError struct {
+	Kind       string
+	Key        string
+	Diagnostic string
+}
+
+func (err CorruptRecordKindError) Error() string {
+	if strings.TrimSpace(err.Diagnostic) == "" {
+		err.Diagnostic = "corrupt"
+	}
+	if err.Key == "" {
+		return fmt.Sprintf("%s: %s: %s", ErrCorruptRecord, err.Kind, err.Diagnostic)
+	}
+	return fmt.Sprintf("%s: %s %s: %s", ErrCorruptRecord, err.Kind, err.Key, err.Diagnostic)
+}
+
+func (err CorruptRecordKindError) Is(target error) bool {
+	return target == ErrCorruptRecord
+}
+
 func ValidateProjectionShape(projection model.JobProjection) error {
 	if projection.SchemaVersion == 0 {
 		return fmt.Errorf("%w: projection.schema_version is required", ErrInvalidRecord)
@@ -267,8 +287,5 @@ func corruptRecordError(kind, key, diagnostic string) error {
 	if strings.TrimSpace(diagnostic) == "" {
 		diagnostic = "corrupt"
 	}
-	if key == "" {
-		return fmt.Errorf("%w: %s: %s", ErrCorruptRecord, kind, diagnostic)
-	}
-	return fmt.Errorf("%w: %s %s: %s", ErrCorruptRecord, kind, key, diagnostic)
+	return CorruptRecordKindError{Kind: kind, Key: key, Diagnostic: diagnostic}
 }

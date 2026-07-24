@@ -1392,7 +1392,7 @@ func TestAdmissionRecoveryExecutorTripsLatchWhenContainmentUnprovable(t *testing
 
 	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
 	server.admissionBootstrapperFactory = func(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
-		bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
+		bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()), authority.WithSafetyLatch(s.safetyLatch))
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -3150,6 +3150,147 @@ func TestServeStopsOnDurableFailStopAndForceClosesConnections(t *testing.T) {
 	server.safetyLatch.Trip(errors.New("second fail-stop reason"))
 	if got := server.safetyLatch.Reason(); got == nil || !strings.Contains(got.Error(), reason) {
 		t.Fatalf("safety latch reason after second trip = %v, want first reason", got)
+	}
+}
+
+func TestSubmitReplaySafetyCorruptionTripsFailStopAndPersists(t *testing.T) {
+	cases := []struct {
+		name    string
+		corrupt func(*testing.T, *Server, model.RequestKey, model.JobID)
+	}{
+		{
+			name: "binding",
+			corrupt: func(t *testing.T, server *Server, key model.RequestKey, _ model.JobID) {
+				t.Helper()
+				corruptor, ok := server.admissionRepository.(interface {
+					InjectCorruptBindingForTest(model.RequestKey, string)
+				})
+				if !ok {
+					t.Fatalf("admission repository type = %T, want InjectCorruptBindingForTest", server.admissionRepository)
+				}
+				corruptor.InjectCorruptBindingForTest(key, "binding checksum")
+			},
+		},
+		{
+			name: "safety",
+			corrupt: func(t *testing.T, server *Server, _ model.RequestKey, jobID model.JobID) {
+				t.Helper()
+				corruptor, ok := server.admissionRepository.(interface {
+					InjectCorruptSafetyForTest(model.JobID, string)
+				})
+				if !ok {
+					t.Fatalf("admission repository type = %T, want InjectCorruptSafetyForTest", server.admissionRepository)
+				}
+				corruptor.InjectCorruptSafetyForTest(jobID, "safety checksum")
+			},
+		},
+	}
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			backend := newFakeBackend("fake")
+			releaseBackend := make(chan struct{})
+			backend.block = releaseBackend
+			launcher := newAdmissionFakeLaunchCustodian(t)
+			var server *Server
+			h := startTestServerWithHooks(t, backend, Config{IdleTimeout: -1}, func(s *Server) {
+				server = s
+				s.safetyDrainTimeout = 100 * time.Millisecond
+				enableTestAdmission(t, s, launcher)
+			})
+
+			conn := dialRaw(t, h.socketPath)
+			reader := bufio.NewReader(conn)
+			helloRaw(t, conn, reader, h.token)
+			requestKey, err := model.NewRequestKey("workspace-replay-corrupt-"+tt.name, "request-replay-corrupt-"+tt.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			params := protocol.JobSubmitParams{
+				WorkspaceKey: requestKey.WorkspaceKey.String(),
+				RequestID:    requestKey.RequestID.String(),
+				TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "hold"},
+			}
+			resp := rpc(t, conn, reader, "submit", protocol.MethodJobSubmit, params)
+			var submitted protocol.JobSubmitResult
+			decodeResult(t, resp, &submitted)
+			if submitted.JobID == "" || submitted.Deduplicated {
+				t.Fatalf("submit result = %+v, want accepted non-replay", submitted)
+			}
+			jobID := model.JobID(submitted.JobID)
+			tt.corrupt(t, server, requestKey, jobID)
+			dbPath := filepath.Join(h.root, admissionRepositoryFile)
+			corruptDB, err := os.ReadFile(dbPath)
+			if err != nil {
+				t.Fatalf("read corrupt admission DB: %v", err)
+			}
+
+			replay, err := rpcResponseOrClose(t, conn, reader, "replay", protocol.MethodJobSubmit, params)
+			if err == nil {
+				assertRPCCode(t, replay, protocol.ErrorBackendUnavailable)
+				assertRPCAdmissionCause(t, replay, protocol.AdmissionRejectRootFailStopped)
+			} else if !isExpectedFailStopClose(err) {
+				t.Fatalf("replay error = %v, want root fail-stop response or connection close", err)
+			}
+			if reason := server.safetyLatch.Reason(); reason == nil || !errors.Is(reason, repository.ErrCorruptRecord) {
+				t.Fatalf("safety latch reason = %v, want corrupt record trip reason", reason)
+			}
+			next := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+				WorkspaceKey: "workspace-after-failstop-" + tt.name,
+				RequestID:    "request-after-failstop-" + tt.name,
+				TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: h.cwd, Write: false, Prompt: "after"},
+			}))
+			assertJobHandlerError(t, next, protocol.ErrorBackendUnavailable, protocol.AdmissionRejectRootFailStopped, "")
+
+			waitForSocketRemoved(t, h.socketPath, h.done)
+			if retry, err := net.DialTimeout("unix", h.socketPath, 50*time.Millisecond); err == nil {
+				_ = retry.Close()
+				t.Fatal("dial after fail-stop succeeded, want closed listener")
+			}
+			close(releaseBackend)
+			waitForConnClosed(t, conn, reader, "safety corruption fail-stop")
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-h.done:
+				if err == nil || !errors.Is(err, ErrSafetyFailStopped) {
+					t.Fatalf("Serve error = %v, want safety fail-stop", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("server did not exit after safety corruption fail-stop")
+			}
+
+			snapshot, err := authority.LoadFileAnchorSnapshot(filepath.Join(h.root, admissionAnchorFile))
+			if err != nil {
+				t.Fatalf("load admission anchor snapshot: %v", err)
+			}
+			if snapshot.Phase != "fail_stopped" {
+				t.Fatalf("anchor phase = %q, want fail_stopped", snapshot.Phase)
+			}
+			afterDB, err := os.ReadFile(dbPath)
+			if err != nil {
+				t.Fatalf("read preserved admission DB: %v", err)
+			}
+			if !bytes.Equal(afterDB, corruptDB) {
+				t.Fatal("admission DB changed after safety fail-stop, want preserved corrupt file")
+			}
+
+			restart := newTestServerAtRoot(t, h.root, h.cwd, newFakeBackend("fake"))
+			configureTestAdmissionRuntime(t, restart, newAdmissionFakeLaunchCustodian(t), true)
+			restart.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+				return nil, socketFileIdentity{}, errors.New("listener must not open for persisted safety corruption fail-stop")
+			}
+			// Restart must fail closed pre-listener: either the startup
+			// corruption matrix fires on the still-corrupt record, or the
+			// persisted fail-stop is surfaced — both typed, neither serving.
+			err = restart.Serve(context.Background())
+			persistedFailStop := errors.Is(err, ErrSafetyFailStopped) || errors.Is(err, authority.ErrFailStopped)
+			startupCorruption := errors.Is(err, repository.ErrCorruptRecord)
+			if err == nil || (!persistedFailStop && !startupCorruption) {
+				t.Fatalf("restart Serve error = %v, want persisted fail-stop or typed startup corruption", err)
+			}
+		})
 	}
 }
 
@@ -6670,18 +6811,27 @@ func helloRaw(t *testing.T, conn net.Conn, r *bufio.Reader, token string) {
 
 func rpc(t *testing.T, conn net.Conn, r *bufio.Reader, id, method string, params any) protocol.Response {
 	t.Helper()
+	resp, err := rpcResponseOrClose(t, conn, r, id, method, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func rpcResponseOrClose(t *testing.T, conn net.Conn, r *bufio.Reader, id, method string, params any) (protocol.Response, error) {
+	t.Helper()
 	req := protocol.Request{JSONRPC: "2.0", ID: json.RawMessage(strconvQuote(id)), Method: method, Params: mustMarshal(t, params)}
 	raw, err := json.Marshal(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := conn.Write(append(raw, '\n')); err != nil {
-		t.Fatal(err)
+		return protocol.Response{}, err
 	}
 	for {
 		line, err := r.ReadBytes('\n')
 		if err != nil {
-			t.Fatal(err)
+			return protocol.Response{}, err
 		}
 		var head struct {
 			ID     json.RawMessage `json:"id,omitempty"`
@@ -6693,8 +6843,19 @@ func rpc(t *testing.T, conn net.Conn, r *bufio.Reader, id, method string, params
 		}
 		var resp protocol.Response
 		mustUnmarshal(t, line, &resp)
-		return resp
+		return resp, nil
 	}
+}
+
+func isExpectedFailStopClose(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection reset by peer") || strings.Contains(msg, "use of closed network connection") || strings.Contains(msg, "broken pipe")
 }
 
 func readResponse(t *testing.T, r *bufio.Reader) protocol.Response {

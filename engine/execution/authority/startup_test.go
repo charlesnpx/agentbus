@@ -179,8 +179,8 @@ func TestStartupCorruptionMatrixFromSnapshots(t *testing.T) {
 		repo.InjectCorruptMetaForTest("meta checksum")
 		repo, anchorStore = restoreAuthoritySnapshot(t, repo.SnapshotBytes(), anchorStore.SnapshotBytes())
 		_, err := newBootstrapperWithAnchorStore(repo, anchorStore)
-		if !errors.Is(err, repository.ErrInvalidRecord) {
-			t.Fatalf("NewBootstrapper error = %v, want ErrInvalidRecord", err)
+		if !errors.Is(err, repository.ErrCorruptRecord) {
+			t.Fatalf("NewBootstrapper error = %v, want ErrCorruptRecord", err)
 		}
 	})
 }
@@ -210,6 +210,71 @@ func TestSafetyLatchTripsOnStartupRepositoryCorruption(t *testing.T) {
 	_, err = bootstrapper.Begin(ctx, boot)
 	if !errors.Is(err, repository.ErrCorruptRecord) {
 		t.Fatalf("Begin error = %v, want ErrCorruptRecord", err)
+	}
+	select {
+	case <-latch.Done():
+	default:
+		t.Fatal("SafetyLatch was not tripped")
+	}
+	if reason := latch.Reason(); !errors.Is(reason, repository.ErrCorruptRecord) {
+		t.Fatalf("SafetyLatch reason = %v, want ErrCorruptRecord", reason)
+	}
+}
+
+func TestProjectionCorruptionQuarantinesWithoutSafetyLatch(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := NewAnchorStore()
+	ready := newReadyWithAnchorStore(t, repo, anchorStore, "latch-projection-old")
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "latch-projection"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.InjectCorruptProjectionForTest(accepted.Record.JobID, "projection checksum")
+	repo, anchorStore = restoreAuthoritySnapshot(t, repo.SnapshotBytes(), anchorStore.SnapshotBytes())
+
+	boot, err := model.NewBootRef("boot-latch-projection-new", "owner-latch-projection-new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	latch := NewSafetyLatch()
+	issuer, verifier := custodian.NewAttestationChannel()
+	testAttestationIssuers.Store(boot, issuer)
+	bootstrapper, err := NewBootstrapper(repo, WithAnchorStore(anchorStore), WithQuiescenceVerifier(verifier), WithSafetyLatch(latch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := bootstrapper.Begin(ctx, boot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalizeRecovery(t, ctx, session, accepted.Record.Attempt.Ref)
+	recovered, err := session.SealReady(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image, err := recovered.LoadJob(ctx, accepted.Record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image.Quarantine.State != repository.RecordValid {
+		t.Fatalf("quarantine state = %s, want valid", image.Quarantine.State)
+	}
+	select {
+	case <-latch.Done():
+		t.Fatalf("SafetyLatch tripped for projection-only corruption: %v", latch.Reason())
+	default:
+	}
+}
+
+func TestSafetyLatchTripsOnAnchorIdentityCorruption(t *testing.T) {
+	repo := memory.NewRepository()
+	repo.InjectCorruptMetaForTest("meta checksum")
+	latch := NewSafetyLatch()
+	_, verifier := custodian.NewAttestationChannel()
+	_, err := NewBootstrapper(repo, WithQuiescenceVerifier(verifier), WithSafetyLatch(latch))
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("NewBootstrapper error = %v, want ErrCorruptRecord", err)
 	}
 	select {
 	case <-latch.Done():

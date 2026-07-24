@@ -61,12 +61,16 @@ type RecoverySession struct {
 
 type BootstrapperOption func(*bootstrapConfig)
 
+type safetyLatch interface {
+	Trip(error)
+}
+
 type bootstrapConfig struct {
 	anchor                Anchor
 	anchorStore           *AnchorStore
 	quiescenceVerifier    custodian.AttestationVerifier
 	hasQuiescenceVerifier bool
-	safetyLatch           *SafetyLatch
+	safetyLatch           safetyLatch
 }
 
 func WithAnchor(anchor Anchor) BootstrapperOption {
@@ -88,7 +92,7 @@ func WithQuiescenceVerifier(verifier custodian.AttestationVerifier) Bootstrapper
 	}
 }
 
-func WithSafetyLatch(latch *SafetyLatch) BootstrapperOption {
+func WithSafetyLatch(latch interface{ Trip(error) }) BootstrapperOption {
 	return func(config *bootstrapConfig) {
 		config.safetyLatch = latch
 	}
@@ -108,6 +112,7 @@ func NewBootstrapper(repo repository.Repository, options ...BootstrapperOption) 
 	if anchor == nil {
 		dbUUID, schemaMajor, err := repositoryAnchorIdentity(repo)
 		if err != nil {
+			tripSafetyLatchOnRepositoryCorruption(config.safetyLatch, err)
 			return nil, err
 		}
 		anchorStore := config.anchorStore
@@ -249,7 +254,7 @@ func (s *RecoverySession) Plans(ctx context.Context) ([]model.RecoveryPlan, erro
 	defer s.core.mu.Unlock()
 
 	var plans []model.RecoveryPlan
-	if err := s.core.repo.View(ctx, func(tx repository.ReadTx) error {
+	if err := s.core.view(ctx, "recovery plans", func(tx repository.ReadTx) error {
 		if _, err := s.core.requireRecoveryTx(tx, s.token); err != nil {
 			return err
 		}
@@ -301,7 +306,7 @@ func (s *RecoverySession) recordQuiescenceByJobID(ctx context.Context, jobID mod
 	defer s.core.mu.Unlock()
 
 	terminalCommitted := false
-	commit, err := s.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+	commit, err := s.core.update(ctx, "recovery quiescence", func(tx repository.WriteTx) error {
 		meta, err := s.core.requireRecoveryTx(tx, s.token)
 		if err != nil {
 			return err
@@ -342,7 +347,7 @@ func (s *RecoverySession) applyReceipt(ctx context.Context, command model.Comman
 
 	boundCommand := commandWithBoot(command, s.token.boot)
 	terminalCommitted := false
-	commit, err := s.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+	commit, err := s.core.update(ctx, "recovery receipt", func(tx repository.WriteTx) error {
 		meta, err := s.core.requireRecoveryTx(tx, s.token)
 		if err != nil {
 			return err
@@ -377,7 +382,7 @@ func (s *RecoverySession) SealReady(ctx context.Context) (*Ready, error) {
 	defer s.core.mu.Unlock()
 
 	var recoveredRuntime *runtimeRegistry
-	commit, err := s.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+	commit, err := s.core.update(ctx, "seal ready", func(tx repository.WriteTx) error {
 		meta, err := s.core.requireRecoveryTx(tx, s.token)
 		if err != nil {
 			return err

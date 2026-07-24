@@ -112,7 +112,7 @@ func (r *Ready) ClaimPending(ctx context.Context, ref model.AttemptRef, owner mo
 	}
 	r.core.mu.Lock()
 	defer r.core.mu.Unlock()
-	if err := r.core.repo.View(ctx, func(tx repository.ReadTx) error {
+	if err := r.core.view(ctx, "claim pending preflight", func(tx repository.ReadTx) error {
 		_, err := r.core.requireReadyTx(tx, r.token)
 		return err
 	}); err != nil {
@@ -127,7 +127,7 @@ func (r *Ready) RuntimeSnapshot(ctx context.Context) (RuntimeSnapshot, error) {
 	}
 	r.core.mu.Lock()
 	defer r.core.mu.Unlock()
-	if err := r.core.repo.View(ctx, func(tx repository.ReadTx) error {
+	if err := r.core.view(ctx, "runtime snapshot", func(tx repository.ReadTx) error {
 		_, err := r.core.requireReadyTx(tx, r.token)
 		return err
 	}); err != nil {

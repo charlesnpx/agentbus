@@ -1153,6 +1153,9 @@ func openAdmissionBootstrapperWithOptions(ctx context.Context, s *Server, openOp
 	dbUUID, schemaMajor, err := repo.AnchorIdentity()
 	if err != nil {
 		_ = repo.Close()
+		if errors.Is(err, repository.ErrCorruptRecord) {
+			s.safetyLatch.Trip(err)
+		}
 		return nil, nil, nil, err
 	}
 	anchorOptions := []authority.FileAnchorOption{
@@ -1169,7 +1172,7 @@ func openAdmissionBootstrapperWithOptions(ctx context.Context, s *Server, openOp
 		schemaMajor,
 		anchorOptions...,
 	)
-	options := []authority.BootstrapperOption{authority.WithAnchor(anchor)}
+	options := []authority.BootstrapperOption{authority.WithAnchor(anchor), authority.WithSafetyLatch(s.safetyLatch)}
 	if s.admissionRuntime != nil {
 		options = append(options, authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
 	}
@@ -1249,8 +1252,11 @@ func openReadOnlyAdmissionRepositoryWithContentionRetry(ctx context.Context, rep
 		return nil, err
 	}
 	repo, err := bboltrepo.OpenReadOnly(repoPath, &bolt.Options{Timeout: timeout})
-	if err == nil || !errors.Is(err, bolt.ErrTimeout) {
-		return repo, err
+	if err == nil {
+		return repo, nil
+	}
+	if !errors.Is(err, bolt.ErrTimeout) {
+		return nil, translateAdmissionRepositoryOpenError(repoPath, err)
 	}
 	err = retryAdmissionRepositoryContention(ctx, repoPath, socketPath, err, func(timeout time.Duration) (bool, error) {
 		repo, err = bboltrepo.OpenReadOnly(repoPath, &bolt.Options{Timeout: timeout})
@@ -1263,7 +1269,7 @@ func openReadOnlyAdmissionRepositoryWithContentionRetry(ctx context.Context, rep
 		return false, err
 	})
 	if err != nil {
-		return nil, err
+		return nil, translateAdmissionRepositoryOpenError(repoPath, err)
 	}
 	return repo, nil
 }

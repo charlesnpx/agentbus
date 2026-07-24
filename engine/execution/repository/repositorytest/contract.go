@@ -368,6 +368,72 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 		}
 	})
 
+	t.Run("expired terminal jobs are not live jobs", func(t *testing.T) {
+		repo := factory.New(t)
+		fixture := newFixture(t, "expired-live-list")
+		acceptFixture(t, repo, fixture)
+
+		terminal, err := model.ApplyFinalize(fixture.Record, model.Finalize{
+			Ref: fixture.Record.Attempt.Ref,
+			Intent: model.TerminalIntent{
+				Outcome: model.OutcomeFailed,
+				Cause:   model.CauseDaemonRestartedBeforeAuthorization,
+			},
+		})
+		if err != nil {
+			t.Fatalf("terminalize fixture: %v", err)
+		}
+		projection, err := model.Project(terminal.Record, model.ProjectionMetadata{SessionID: fixture.Projection.SessionID})
+		if err != nil {
+			t.Fatalf("project terminal fixture: %v", err)
+		}
+		_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
+			if err := tx.PutSafety(terminal.Record, fixture.Record.Revision); err != nil {
+				return err
+			}
+			return tx.PutProjection(projection)
+		})
+		if err != nil {
+			t.Fatalf("terminal Update error = %v", err)
+		}
+
+		_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
+			meta := loadMetaForTest(t, tx)
+			if err := tx.DeleteLiveJob(fixture.JobID); err != nil {
+				return err
+			}
+			return tx.PutTombstone(repository.Tombstone{
+				RequestKey:        fixture.RequestKey,
+				JobID:             fixture.JobID,
+				TaskIdentity:      fixture.Identity,
+				ExpiredGeneration: meta.Generation + 1,
+			})
+		})
+		if err != nil {
+			t.Fatalf("expiry Update error = %v", err)
+		}
+
+		if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+			jobs, err := tx.ListJobs(repository.JobFilter{})
+			if err != nil {
+				return err
+			}
+			if len(jobs) != 0 {
+				return fmt.Errorf("ListJobs returned %d job(s), want none", len(jobs))
+			}
+			stats, err := tx.RootStats()
+			if err != nil {
+				return err
+			}
+			if stats.Jobs != 0 || stats.RecoveryObligations != 0 || stats.Tombstones != 1 {
+				return fmt.Errorf("RootStats = %+v, want jobs=0 recovery_obligations=0 tombstones=1", stats)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	t.Run("corruption state is explicit and touched safety write rolls back", func(t *testing.T) {
 		repo := factory.New(t)
 		fixture := newFixture(t, "corrupt")

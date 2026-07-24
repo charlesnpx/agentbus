@@ -741,7 +741,7 @@ func TestSealSealedReplayRejectsMatrixInvalidSuccessor(t *testing.T) {
 	corruptAdmissionSafetyForTest(t, newRoot, jobID, "safety checksum")
 
 	_, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
-	requireSealedSuccessorMismatch(t, err, first.NewDomainUUID, "matrix-invalid")
+	requireSealedSuccessorMismatch(t, err, first.NewDomainUUID, "safety")
 	if !errors.Is(err, repository.ErrCorruptRecord) {
 		t.Fatalf("matrix-invalid successor replay error = %v, want ErrCorruptRecord", err)
 	}
@@ -914,6 +914,20 @@ func TestSealRefusesNonterminalObligations(t *testing.T) {
 	}
 	if _, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: filepath.Join(t.TempDir(), "new-domain")}); !errors.Is(err, ErrRootHasRecoveryObligations) {
 		t.Fatalf("seal nonterminal error = %v, want ErrRootHasRecoveryObligations", err)
+	}
+}
+
+func TestSealAndInspectSurfaceCorruptSafetyStats(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	jobID := addPendingAdmissionJobForTest(t, ctx, root, "seal-corrupt-rootstats")
+	corruptAdmissionSafetyForTest(t, root, jobID, "safety checksum")
+
+	if _, err := InspectAdmissionRoot(ctx, root); !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("InspectAdmissionRoot error = %v, want ErrCorruptRecord", err)
+	}
+	if _, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: filepath.Join(t.TempDir(), "new-domain")}); !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("SealAdmissionRoot error = %v, want ErrCorruptRecord", err)
 	}
 }
 

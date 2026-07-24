@@ -197,6 +197,16 @@ func TestOpenExistingNoInitRequiresStrictSchemaV2(t *testing.T) {
 	if !bytes.Equal(before, after) {
 		t.Fatal("failed old-schema open mutated database bytes")
 	}
+
+	repo, err = OpenReadOnly(path, &bolt.Options{Timeout: time.Second})
+	if err == nil {
+		repo.Close()
+		t.Fatal("OpenReadOnly succeeded for schema v1, want incompatible schema error")
+	}
+	var readOnlySchemaErr UnsupportedAuthorityMetaSchemaVersionError
+	if !errors.As(err, &readOnlySchemaErr) {
+		t.Fatalf("OpenReadOnly error = %T %v, want UnsupportedAuthorityMetaSchemaVersionError", err, err)
+	}
 }
 
 func TestOpenInitializesStrictSchemaV2AndBindingIndex(t *testing.T) {
@@ -252,6 +262,103 @@ func TestBindingIndexMismatchIsCorruptionAndAuditFinding(t *testing.T) {
 	}
 	if err := repo.AuditIntegrity(context.Background()); !errors.Is(err, repository.ErrCorruptRecord) {
 		t.Fatalf("AuditIntegrity error = %v, want ErrCorruptRecord", err)
+	}
+}
+
+func TestAuditIntegrityMissingBindingIndexReturnsTypedFinding(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	fixture := newBboltFixture(t, "missing-index-audit")
+	acceptBboltFixture(t, repo, fixture)
+	if err := repo.db.Update(func(tx *bolt.Tx) error {
+		return tx.DeleteBucket(bucketBindingIndex)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = repo.AuditIntegrity(context.Background())
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("AuditIntegrity error = %v, want ErrCorruptRecord", err)
+	}
+	var aggregate interface{ Unwrap() []error }
+	if !errors.As(err, &aggregate) {
+		t.Fatalf("AuditIntegrity error = %T %v, want aggregate", err, err)
+	}
+	found := false
+	for _, finding := range aggregate.Unwrap() {
+		if strings.Contains(finding.Error(), "binding_index") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("AuditIntegrity error = %v, want binding_index finding", err)
+	}
+}
+
+func TestRootStatsFailsOnCorruptSafetyBindingAndTombstoneRecords(t *testing.T) {
+	cases := []struct {
+		name    string
+		corrupt func(*Repository, bboltFixture)
+	}{
+		{
+			name: "safety",
+			corrupt: func(repo *Repository, fixture bboltFixture) {
+				repo.InjectCorruptSafetyForTest(fixture.JobID, "safety checksum")
+			},
+		},
+		{
+			name: "binding",
+			corrupt: func(repo *Repository, fixture bboltFixture) {
+				repo.InjectCorruptBindingForTest(fixture.RequestKey, "binding checksum")
+			},
+		},
+		{
+			name: "tombstone",
+			corrupt: func(repo *Repository, fixture bboltFixture) {
+				if _, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+					if err := tx.DeleteLiveJob(fixture.JobID); err != nil {
+						return err
+					}
+					return tx.PutTombstone(repository.Tombstone{
+						RequestKey:        fixture.RequestKey,
+						JobID:             fixture.JobID,
+						TaskIdentity:      fixture.Identity,
+						ExpiredGeneration: 2,
+					})
+				}); err != nil {
+					t.Fatalf("create tombstone: %v", err)
+				}
+				repo.InjectCorruptTombstoneForTest(fixture.RequestKey, "tombstone checksum")
+			},
+		},
+	}
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "admission.db")
+			repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer repo.Close()
+			fixture := newBboltFixture(t, "rootstats-corrupt-"+tt.name)
+			acceptBboltFixture(t, repo, fixture)
+			tt.corrupt(repo, fixture)
+			err = repo.View(context.Background(), func(tx repository.ReadTx) error {
+				_, err := tx.RootStats()
+				return err
+			})
+			if !errors.Is(err, repository.ErrCorruptRecord) {
+				t.Fatalf("RootStats error = %v, want ErrCorruptRecord", err)
+			}
+			if !strings.Contains(err.Error(), tt.name) {
+				t.Fatalf("RootStats error = %v, want %s diagnostic", err, tt.name)
+			}
+		})
 	}
 }
 
@@ -321,6 +428,36 @@ func TestOneRecordUpdateTouchesBoundedKeysAndDoesNotRecreateBuckets(t *testing.T
 	}
 	if total > 60 {
 		t.Fatalf("operation count = %d, want bounded <= 60; counts=%v", total, counts)
+	}
+}
+
+func TestPutMetaTouchesBoundedKeysIndependentOfHistory(t *testing.T) {
+	repo := newSeededBboltRepository(t, 1500)
+	repo.ResetOperationCountsForTest()
+	_, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+		meta := tx.Meta()
+		if meta.State != repository.RecordValid {
+			return fmt.Errorf("meta state = %s, want valid", meta.State)
+		}
+		next := meta.Value
+		next.NextJobSequence++
+		return tx.PutMeta(next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := repo.OperationCountsForTest()
+	for key, count := range counts {
+		if strings.HasPrefix(key, "foreach:") {
+			t.Fatalf("PutMeta used %s %d time(s), want no history scans; counts=%v", key, count, counts)
+		}
+	}
+	total := 0
+	for _, count := range counts {
+		total += count
+	}
+	if total > 12 {
+		t.Fatalf("PutMeta operation count = %d, want bounded <= 12; counts=%v", total, counts)
 	}
 }
 

@@ -31,7 +31,7 @@ func (r *Ready) RecoveryPlans(ctx context.Context, trigger model.RecoveryTrigger
 	defer r.core.mu.Unlock()
 
 	var plans []JobRecoveryPlan
-	if err := r.core.repo.View(ctx, func(tx repository.ReadTx) error {
+	if err := r.core.view(ctx, "ready recovery plans", func(tx repository.ReadTx) error {
 		if _, err := r.core.requireReadyTx(tx, r.token); err != nil {
 			return err
 		}
@@ -55,7 +55,7 @@ func (r *Ready) CorruptionPlans(ctx context.Context) ([]JobRecoveryPlan, error) 
 	defer r.core.mu.Unlock()
 
 	var plans []JobRecoveryPlan
-	if err := r.core.repo.View(ctx, func(tx repository.ReadTx) error {
+	if err := r.core.view(ctx, "corruption plans", func(tx repository.ReadTx) error {
 		if _, err := r.core.requireReadyTx(tx, r.token); err != nil {
 			return err
 		}
@@ -107,7 +107,7 @@ func (r *Ready) QuarantineProjection(ctx context.Context, jobID model.JobID, dia
 	defer r.core.mu.Unlock()
 
 	var record repository.QuarantineRecord
-	commit, err := r.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+	commit, err := r.core.update(ctx, "quarantine projection", func(tx repository.WriteTx) error {
 		meta, err := r.core.requireReadyTx(tx, r.token)
 		if err != nil {
 			return err
@@ -140,7 +140,7 @@ func (r *Ready) FailStop(ctx context.Context, reason string) error {
 	defer cancel()
 	r.core.mu.Lock()
 	defer r.core.mu.Unlock()
-	if err := r.core.repo.View(failStopCtx, func(tx repository.ReadTx) error {
+	if err := r.core.view(failStopCtx, "ready fail-stop preflight", func(tx repository.ReadTx) error {
 		_, err := r.core.requireReadyTx(tx, r.token)
 		return err
 	}); err != nil {
@@ -157,7 +157,7 @@ func (s *RecoverySession) FailStop(ctx context.Context, reason string) error {
 	defer cancel()
 	s.core.mu.Lock()
 	defer s.core.mu.Unlock()
-	if err := s.core.repo.View(failStopCtx, func(tx repository.ReadTx) error {
+	if err := s.core.view(failStopCtx, "recovery fail-stop preflight", func(tx repository.ReadTx) error {
 		_, err := s.core.requireRecoveryTx(tx, s.token)
 		return err
 	}); err != nil {
@@ -194,11 +194,85 @@ func postDurableFailStopError(operation string, err, stopErr error) error {
 }
 
 func (core *authorityCore) tripSafetyLatchOnRepositoryCorruption(err error) {
-	if core == nil || core.latch == nil || err == nil {
+	if core == nil {
 		return
 	}
-	if errors.Is(err, repository.ErrCorruptRecord) {
-		core.latch.Trip(err)
+	tripSafetyLatchOnRepositoryCorruption(core.latch, err)
+}
+
+func tripSafetyLatchOnRepositoryCorruption(latch safetyLatch, err error) {
+	if latch == nil || err == nil {
+		return
+	}
+	if safetySignificantRepositoryCorruption(err) {
+		latch.Trip(err)
+	}
+}
+
+func (core *authorityCore) failStopOnRepositoryCorruptionLocked(ctx context.Context, operation string, err error) error {
+	if core == nil || err == nil || !safetySignificantRepositoryCorruption(err) {
+		return err
+	}
+	if core.boot.phase != bootReady && core.boot.phase != bootReconciling {
+		core.tripSafetyLatchOnRepositoryCorruption(err)
+		return err
+	}
+	failStopCtx, cancel := detachedAuthorityFailStopContext(ctx)
+	defer cancel()
+	// Trip with the typed corruption error before persistence: the file-anchor
+	// fail-stop hook fires mid-persistence with a stringified reason, and the
+	// latch keeps only the first trip.
+	core.tripSafetyLatchOnRepositoryCorruption(err)
+	failStopErr := postDurableFailStopError(operation, err, core.failStopLockedWithContext(failStopCtx, fmt.Sprintf("%s: %v", operation, err)))
+	core.tripSafetyLatchOnRepositoryCorruption(failStopErr)
+	return failStopErr
+}
+
+func (core *authorityCore) view(ctx context.Context, operation string, fn func(repository.ReadTx) error) error {
+	err := core.repo.View(ctx, fn)
+	if err != nil {
+		return core.failStopOnRepositoryCorruptionLocked(ctx, operation, err)
+	}
+	return nil
+}
+
+func (core *authorityCore) update(ctx context.Context, operation string, fn func(repository.WriteTx) error) (repository.Commit, error) {
+	commit, err := core.repo.Update(ctx, fn)
+	if err != nil {
+		return commit, core.failStopOnRepositoryCorruptionLocked(ctx, operation, err)
+	}
+	return commit, nil
+}
+
+func safetySignificantRepositoryCorruption(err error) bool {
+	if err == nil || !errors.Is(err, repository.ErrCorruptRecord) {
+		return false
+	}
+	var corrupt repository.CorruptRecordKindError
+	if errors.As(err, &corrupt) {
+		return safetySignificantCorruptionKind(corrupt.Kind)
+	}
+	message := strings.ToLower(err.Error())
+	safetyKinds := []string{"db_uuid", "meta", "safety", "binding_index", "binding", "tombstone"}
+	for _, kind := range safetyKinds {
+		if strings.Contains(message, kind) {
+			return true
+		}
+	}
+	if strings.Contains(message, "projection") || strings.Contains(message, "quarantine") {
+		return false
+	}
+	return true
+}
+
+func safetySignificantCorruptionKind(kind string) bool {
+	switch kind {
+	case "db_uuid", "meta", "safety", "binding_index", "binding", "tombstone":
+		return true
+	case "projection", "quarantine":
+		return false
+	default:
+		return true
 	}
 }
 

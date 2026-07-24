@@ -28,8 +28,11 @@ func (b *Bootstrapper) RootMetadata(ctx context.Context) (AdmissionRootMetadata,
 	if b == nil || b.core == nil {
 		return AdmissionRootMetadata{}, ErrNotReady
 	}
+	b.core.mu.Lock()
+	defer b.core.mu.Unlock()
+
 	var metadata AdmissionRootMetadata
-	if err := b.core.repo.View(ctx, func(tx repository.ReadTx) error {
+	if err := b.core.view(ctx, "root metadata", func(tx repository.ReadTx) error {
 		meta, err := b.core.requireMeta(tx)
 		if err != nil {
 			return err
@@ -50,7 +53,7 @@ func (s *RecoverySession) RootMetadata(ctx context.Context) (AdmissionRootMetada
 	defer s.core.mu.Unlock()
 
 	var metadata AdmissionRootMetadata
-	if err := s.core.repo.View(ctx, func(tx repository.ReadTx) error {
+	if err := s.core.view(ctx, "recovery root metadata", func(tx repository.ReadTx) error {
 		meta, err := s.core.requireRecoveryTx(tx, s.token)
 		if err != nil {
 			return err
@@ -72,7 +75,7 @@ func (s *RecoverySession) ActivateRoot(ctx context.Context) (AdmissionRootMetada
 
 	var metadata AdmissionRootMetadata
 	changed := false
-	commit, err := s.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+	commit, err := s.core.update(ctx, "activate root", func(tx repository.WriteTx) error {
 		meta, err := s.core.requireRecoveryTx(tx, s.token)
 		if err != nil {
 			return err

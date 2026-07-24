@@ -29,7 +29,7 @@ func (s *RecoverySession) WorkItems(ctx context.Context) ([]RecoveryWorkItem, er
 	defer s.core.mu.Unlock()
 
 	items := []RecoveryWorkItem{}
-	if err := s.core.repo.View(ctx, func(tx repository.ReadTx) error {
+	if err := s.core.view(ctx, "recovery work items", func(tx repository.ReadTx) error {
 		if _, err := s.core.requireRecoveryTx(tx, s.token); err != nil {
 			return err
 		}
@@ -66,7 +66,7 @@ func (s *RecoverySession) AdvanceRecovery(ctx context.Context, token model.Recov
 	defer s.core.mu.Unlock()
 
 	var item RecoveryWorkItem
-	if err := s.core.repo.View(ctx, func(tx repository.ReadTx) error {
+	if err := s.core.view(ctx, "advance recovery", func(tx repository.ReadTx) error {
 		if _, err := s.core.requireRecoveryTx(tx, s.token); err != nil {
 			return err
 		}
@@ -99,7 +99,7 @@ func (s *RecoverySession) FinalizePlanned(ctx context.Context, token model.Recov
 	defer s.core.mu.Unlock()
 
 	terminalCommitted := false
-	commit, err := s.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+	commit, err := s.core.update(ctx, "finalize planned recovery", func(tx repository.WriteTx) error {
 		meta, err := s.core.requireRecoveryTx(tx, s.token)
 		if err != nil {
 			return err
@@ -159,7 +159,7 @@ func (s *RecoverySession) recordQuiescenceByToken(ctx context.Context, token mod
 
 	terminalCommitted := false
 	recordedRevision := uint64(0)
-	commit, err := s.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+	commit, err := s.core.update(ctx, "recovery token quiescence", func(tx repository.WriteTx) error {
 		meta, err := s.core.requireRecoveryTx(tx, s.token)
 		if err != nil {
 			return err

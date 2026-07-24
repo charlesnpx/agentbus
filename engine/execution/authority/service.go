@@ -59,7 +59,7 @@ type authorityCore struct {
 	runtime  *runtimeRegistry
 	verifier custodian.AttestationVerifier
 	boot     bootStatus
-	latch    *SafetyLatch
+	latch    safetyLatch
 }
 
 type syncMutex interface {
@@ -180,7 +180,7 @@ func (r *Ready) accept(ctx context.Context, request AcceptRequest, claimOwner *m
 	defer r.core.mu.Unlock()
 
 	var result AcceptResult
-	commit, err := r.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+	commit, err := r.core.update(ctx, "accept", func(tx repository.WriteTx) error {
 		if _, err := r.core.requireReadyTx(tx, r.token); err != nil {
 			return err
 		}
@@ -282,7 +282,7 @@ func (r *Ready) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal
 
 	var result ApplyResult
 	terminalCommitted := false
-	commit, err := r.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+	commit, err := r.core.update(ctx, "record quiescence", func(tx repository.WriteTx) error {
 		if _, err := r.core.requireReadyTx(tx, r.token); err != nil {
 			return err
 		}
@@ -334,7 +334,7 @@ func (r *Ready) apply(ctx context.Context, jobID model.JobID, command model.Comm
 	var result ApplyResult
 	terminalCommitted := false
 	boundCommand := commandWithBoot(command, r.token.boot)
-	commit, err := r.core.repo.Update(ctx, func(tx repository.WriteTx) error {
+	commit, err := r.core.update(ctx, "apply command", func(tx repository.WriteTx) error {
 		if _, err := r.core.requireReadyTx(tx, r.token); err != nil {
 			return err
 		}
@@ -388,7 +388,7 @@ func (r *Ready) LoadJob(ctx context.Context, jobID model.JobID) (repository.JobI
 	defer r.core.mu.Unlock()
 
 	var image repository.JobImage
-	if err := r.core.repo.View(ctx, func(tx repository.ReadTx) error {
+	if err := r.core.view(ctx, "load job", func(tx repository.ReadTx) error {
 		if _, err := r.core.requireReadyTx(tx, r.token); err != nil {
 			return err
 		}
