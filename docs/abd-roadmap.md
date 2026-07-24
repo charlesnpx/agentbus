@@ -770,7 +770,7 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 | E1 | Delete foreground surface + unidentified submit + --admission plumbing; reimplement handleIdentifiedJobSubmit per E0 replay ordering (LookupReplay before backend/filesystem validation, recorded fingerprint version); negative + replay test battery; architecture guard: no path reaches session.Turn outside an authority launch | PENDING |
 | E2A | Shared daemon launcher: readiness pipe (ready{protocolVersion,pid,canonicalStateRoot,socketPath} / failed{code,message}), PID-after-ready, Setsid, kill+reap on parent failure, stderr preserved to handshake, concurrent-start winner verification | CLOSED c69c83c |
 | E2B | Autostart: typed diagnostic on unsupported host, restart-after-exit restores service, race convergence; `admission recover` gets a dedicated strict-native recovery constructor; compiled-CLI recovery in Docker gate | CLOSED 86a5c31 |
-| E3 | Authority-only RPC handlers (no JSON merge/fallback); CLI status/result/cancel/list become protocol clients; delete `sessions` cmd; stable exit codes; compiled-binary E2E across restart+recovery | PENDING |
+| E3 | Authority-only RPC handlers (no JSON merge/fallback); CLI status/result/cancel/list become protocol clients; delete `sessions` cmd; stable exit codes; compiled-binary E2E across restart+recovery | CLOSED 67be1d5 |
 | E4 | Graceful shutdown: signal.NotifyContext (daemon serving only) + Shutdown(ctx) reusing existing durable cancellation; successful graceful shutdown ⇒ no live custody, no recovery obligation; forced-timeout path remains recoverable fail-closed | PENDING |
 | E5A | Record-level bbolt behind repository contract; Auditor + AnchorIdentified; binding_index as derived locator; dirty-closure validation sharing invariant helpers with full audit; operation-count tests (bbolt pkg) prove O(touched); 1k/10k/100k benchmarks | PENDING |
 | E5B | Create/OpenExisting/OpenExistingReadOnly split (no ambiguous open-or-create); AuditIntegrity (Tx.Check drained + envelope + cross-record + index) at every existing entry point; root-existence matrix test per cell; unsupported first serve non-mutating; corruption fixtures fatal pre-bind, file untouched | PENDING |
@@ -791,6 +791,21 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 10. CI: no strict lane, race excludes client/+cmd/, gate scripts unversioned; tip red = GitHub Actions BILLING block (jobs die ~4s pre-step), not code.
 
 ## AB-E Log
+- 2026-07-24: E3 CLOSED at 67be1d5 (SHIP, 1 advisory Low). Arc: worker (authority-only handlers;
+  CLI status/result/cancel/list as protocol-v2 clients via launcher autostart; sessions deleted;
+  exit-code table 0/2-12) -> Docker gate caught TestStartReaperRecoversCrashedJob (legacy
+  engine.Store reaper test invisible to macOS receipts) -> fix1 35b0ed5 (served background reaper
+  DELETED — legacy-JSON-store-only walker: config fields, idle tick, startup reapKnownStores,
+  recovery defaults; storeForJob narrowed to in-memory authority mapping) -> review1 FIX(1M:
+  persisted fail-stop reached CLI as daemonlaunch.StartupError and exited 11 not 12; non-
+  ErrStartupFailed kinds fell to exit 1) -> fix2 67be1d5 (classifier inspects StartupError.Code:
+  fail-stop readiness codes -> 12, all other StartupError -> 11; new Linux E2E
+  TestProductionStrictCLIStatusPersistedFailStopAutostartExitE2B on the real autostart path) ->
+  review2 SHIP. Reviewer confirmed authority recovery subsumes the deleted reaper for authority
+  jobs; invalid_task_spec for unknown-job accepted for E3 with distinct unknown_job code
+  recommended for E6; named-policy L1 deferral judged honest (no policy field on SafetyRecord).
+  First unit under the calibrated review policy (realistic-precondition weighting): 4 findings
+  self-classified non-blocking Low.
 - 2026-07-23: E2B CLOSED at 86a5c31 (SHIP, zero findings). Arc: worker 3df1d4d-pre (recovery
   composition + 4-test real-process battery; Docker gate — widened mid-unit from
   -run TestProductionStrictServe to the whole TestProductionStrict family, which the old pin would
