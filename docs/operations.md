@@ -65,15 +65,12 @@ A persisted fail-stop is an anchor record with phase `fail_stopped`, a boot
 reference, and a reason. It is sticky: normal Begin, SealReady, Advance, and
 VerifyReady paths refuse to move it back to ready or reconciling.
 
-Exit codes `11` and `12` apply to CLIENT commands (`status`, `result`,
-`cancel`, and other protocol clients) whose launcher-based autostart fails:
-`11` for startup failures such as unsupported strict runtime or launcher-side
-root corruption. Direct `agentbus serve` / `serve --foreground` invocations
-report startup errors with exit code `1` (shutdown-deadline overrun is `13`).
-Client commands see exit code `12` for in-band
-root fail-stop, root corruption, or root identity mismatch reported by a running
-daemon, and for launcher-side authority fail-stop; and exit code `13` when
-graceful shutdown exceeds its deadline.
+Protocol client commands (`status`, `result`, `cancel`, and other protocol
+clients) return `11` for launcher-based daemon startup failures, except
+launcher-side authority fail-stop, which returns `12`. In-band root fail-stop,
+corruption, and identity-mismatch conditions also return `12`. Direct
+`agentbus serve` and `serve --foreground` startup errors return `1`; a serve
+shutdown-deadline overrun returns `13`.
 
 `agentbus admission clear-fail-stop --state-root <root>` requires
 `--acknowledge-unsafe-diagnosis`. It opens the repository writable, audits it,
