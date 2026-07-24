@@ -13,6 +13,7 @@ env:
   CGO_ENABLED: "0"
   GOCACHE: ${{ runner.temp }}/go-cache
   GOMODCACHE: ${{ runner.temp }}/go-mod-cache
+  DOCKER_IMAGE: golang:1.26-trixie@sha256:4ee9ffa999b4583ce281939cdff828763083610292f252279a0cee77473bd9a7
 
 jobs:
   product-e2e:

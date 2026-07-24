@@ -56,6 +56,7 @@ const (
 	servedNativeStartedPathTag           = "SERVED_NATIVE_STARTED_PATH"
 	servedNativeModeTag                  = "SERVED_NATIVE_MODE"
 	servedNativeCgroupConformanceEnv     = "AGENTBUS_CGROUP_CONFORMANCE"
+	servedNativePrebuiltBinaryEnv        = "AGENTBUS_E2E_PREBUILT_BINARY"
 	servedNativeOfflineModcacheEnv       = "AGENTBUS_OFFLINE_MODCACHE"
 	servedNativeFixtureModeClean         = "clean"
 	servedNativeFixtureModeGrandchild    = "grandchild"
@@ -936,6 +937,23 @@ func rpcRawParams(t *testing.T, conn net.Conn, r *bufio.Reader, id, method strin
 
 func builtServedNativeAgentbusPath(t *testing.T) string {
 	t.Helper()
+	if override := strings.TrimSpace(os.Getenv(servedNativePrebuiltBinaryEnv)); override != "" {
+		if !filepath.IsAbs(override) {
+			abs, err := filepath.Abs(override)
+			if err != nil {
+				t.Fatalf("%s=%q cannot be made absolute: %v", servedNativePrebuiltBinaryEnv, override, err)
+			}
+			override = abs
+		}
+		info, err := os.Stat(override)
+		if err != nil {
+			t.Fatalf("%s=%q stat: %v", servedNativePrebuiltBinaryEnv, override, err)
+		}
+		if info.IsDir() || info.Mode()&0o111 == 0 {
+			t.Fatalf("%s=%q must be an executable file, mode=%s", servedNativePrebuiltBinaryEnv, override, info.Mode())
+		}
+		return override
+	}
 	servedNativeAgentbusBuildOnce.Do(func() {
 		dir, err := os.MkdirTemp("", "agentbus-served-native-bin-")
 		if err != nil {

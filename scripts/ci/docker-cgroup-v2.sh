@@ -2,7 +2,9 @@
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
-IMAGE="${DOCKER_IMAGE:-golang:1.26}"
+# Pinned multi-arch manifest-list digest for golang:1.26-trixie (Go 1.26.1, Debian trixie);
+# runs natively on both amd64 and arm64 (no --platform: emulation breaks pidfd syscalls).
+IMAGE="${DOCKER_IMAGE:-golang:1.26-trixie@sha256:4ee9ffa999b4583ce281939cdff828763083610292f252279a0cee77473bd9a7}"
 CONTAINER_GOCACHE="${CONTAINER_GOCACHE:-${GOCACHE:-/tmp/agentbus-go-cache}}"
 CONTAINER_GOMODCACHE="${CONTAINER_GOMODCACHE:-${GOMODCACHE:-/tmp/agentbus-gomod-cache}}"
 
@@ -67,9 +69,15 @@ run_partition() {
   fi
 }
 
+run_required() {
+  printf '\n==> [required] %s\n' "$*"
+  "$@"
+}
+
 # The strict E2E builds the CLI hermetically (GOPROXY=off), so the module
 # cache must be warm before any partition runs.
 go mod download
+run_required go run ./scripts/ci/strict-cgroup-preflight
 
 printf 'docker-cgroup-v2: go=%s\n' "$(go version)"
 printf 'docker-cgroup-v2: CGO_ENABLED=%s GOCACHE=%s GOMODCACHE=%s\n' "${CGO_ENABLED:-}" "$GOCACHE" "$GOMODCACHE"
@@ -78,7 +86,7 @@ printf 'docker-cgroup-v2: package_parallel=%s test_parallel=%s race_package_para
 run_partition build-client-cmd go build ./client ./cmd/agentbus
 run_partition build-engine go build ./engine/...
 run_partition build-internal go build ./internal/...
-run_partition serial-conformance env AGENTBUS_CGROUP_CONFORMANCE=1 go test ./internal/served -run TestServedStrictComposition -count=1 -p 1 -parallel 1
+run_partition serial-conformance env AGENTBUS_CGROUP_CONFORMANCE=1 go test ./internal/cgroup ./engine/execution/custodian ./internal/served -count=1 -p 1 -parallel 1
 run_partition parallel-rest go test ./... -count=1 -p "$pkg_parallel" -parallel "$test_parallel"
 run_partition race env CGO_ENABLED=1 go test -race ./... -count=1 -p "$race_pkg_parallel" -parallel "$test_parallel"
 run_partition strict-e2e env AGENTBUS_RUN_STRICT_E2E=1 go test -tags abd_strict_e2e ./internal/served -run TestProductionStrict -count=1 -p 1 -parallel 1
