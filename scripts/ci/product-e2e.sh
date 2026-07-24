@@ -102,6 +102,6 @@ run go mod download
 run go run ./scripts/ci/strict-cgroup-preflight
 run go build -trimpath -ldflags "-X main.version=$VERSION" -o "$BIN" ./cmd/agentbus
 run smoke_compiled_binary
-run env AGENTBUS_E2E_PREBUILT_BINARY="$BIN" AGENTBUS_RUN_STRICT_E2E=1 go test -tags abd_strict_e2e ./internal/served -run 'TestProductionStrict(CLIRecover|AutostartRestoresAfterDaemonExit|JobCLIStatusResultCancel|SIGTERM|SIGINT|CLIStatusFailStop|CLIStatusPersistedFailStopAutostartExit|AutostartRaceConvergesOneDaemon)' -count=1
+run env AGENTBUS_E2E_PREBUILT_BINARY="$BIN" AGENTBUS_RUN_STRICT_E2E=1 go test -tags abd_strict_e2e ./internal/served -run '^TestProductionStrict.*E2B$' -count=1
 
 printf '\nproduct-e2e: ok binary=%s\n' "$BIN"

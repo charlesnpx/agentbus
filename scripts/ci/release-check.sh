@@ -169,11 +169,20 @@ strict_startup_smoke() {
   pid=$!
   attempts=0
   while kill -0 "$pid" >/dev/null 2>&1 && ((attempts < 100)); do
+    # Wait for the foreground daemon's own socket before probing: `status`
+    # autostarts by default, and probing pre-socket could launch a second
+    # daemon that satisfies readiness while the original PID is wedged.
+    if [[ ! -S "$state_root/agentbus.sock" ]]; then
+      sleep 0.1
+      attempts=$((attempts + 1))
+      continue
+    fi
     set +e
-    status_json=$(PATH="$bin_dir:$PATH" HOME="$home" CODEX_HOME="$codex_home" AGENTBUS_STATE_ROOT="$state_root" "$BIN" status --json 2>/dev/null)
+    status_json=$(PATH="$bin_dir:$PATH" HOME="$home" CODEX_HOME="$codex_home" AGENTBUS_STATE_ROOT="$state_root" \
+      timeout 10 "$BIN" status --json 2>/dev/null)
     code=$?
     set -e
-    if [[ "$code" -eq 0 ]] && [[ "$status_json" == *'"jobs"'* ]] && [[ -S "$state_root/agentbus.sock" ]]; then
+    if [[ "$code" -eq 0 ]] && [[ "$status_json" == *'"jobs"'* ]] && kill -0 "$pid" >/dev/null 2>&1; then
       kill -TERM "$pid" >/dev/null 2>&1 || true
       wait "$pid" >/dev/null 2>&1 || true
       printf 'release-check: exact binary strict startup smoke ready via status round-trip\n'
