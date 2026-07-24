@@ -120,6 +120,22 @@ func (e FileIdentityMismatchError) Is(target error) bool {
 	return target == repository.ErrInvalidRecord
 }
 
+// UnsupportedAuthorityMetaSchemaVersionError reports that the authority meta
+// payload is structurally readable but declares a schema this binary does not
+// support.
+type UnsupportedAuthorityMetaSchemaVersionError struct {
+	Path          string
+	SchemaVersion uint16
+}
+
+func (e UnsupportedAuthorityMetaSchemaVersionError) Error() string {
+	return fmt.Sprintf("%s: meta.schema_version %d is unsupported: %s", repository.ErrInvalidRecord, e.SchemaVersion, e.Path)
+}
+
+func (e UnsupportedAuthorityMetaSchemaVersionError) Is(target error) bool {
+	return target == repository.ErrInvalidRecord
+}
+
 // Open opens or initializes a root bbolt repository database at path. The file
 // is created with owner-only permissions.
 func Open(path string, options *bolt.Options) (*Repository, error) {
@@ -156,7 +172,7 @@ func OpenExistingNoInit(path string, expectedIdentity *FileIdentity, options *bo
 		return nil, err
 	}
 	repo := &Repository{db: db, fileIdentity: identity}
-	if err := repo.VerifyInitializedStructure(); err != nil {
+	if err := repo.verifyExistingNoInitInitializedStructure(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -225,6 +241,22 @@ func (r *Repository) VerifyInitializedStructure() error {
 	})
 }
 
+func (r *Repository) verifyExistingNoInitInitializedStructure() error {
+	if r == nil || r.db == nil {
+		return fmt.Errorf("%w: bbolt repository is not open", repository.ErrInvalidRecord)
+	}
+	return r.db.View(func(tx *bolt.Tx) error {
+		schemaVersion, err := authorityMetaSchemaVersionTx(tx, r.db.Path())
+		if err != nil {
+			return err
+		}
+		if schemaVersion != repository.CurrentAuthorityMetaSchemaVersion {
+			return UnsupportedAuthorityMetaSchemaVersionError{Path: r.db.Path(), SchemaVersion: schemaVersion}
+		}
+		return verifyInitializedStructureTx(tx, r.db.Path())
+	})
+}
+
 // AuthorityMetaSchemaVersion reads the authority meta payload schema after
 // validating the enclosing envelope, but before full meta validation rejects
 // unsupported schema versions as corrupt slots.
@@ -234,39 +266,47 @@ func (r *Repository) AuthorityMetaSchemaVersion() (uint16, error) {
 	}
 	var schemaVersion uint16
 	if err := r.db.View(func(tx *bolt.Tx) error {
-		meta := tx.Bucket(bucketMeta)
-		if meta == nil {
-			return fmt.Errorf("%w: admission repository missing bucket %q: %s", repository.ErrCorruptRecord, string(bucketMeta), r.db.Path())
+		var err error
+		schemaVersion, err = authorityMetaSchemaVersionTx(tx, r.db.Path())
+		if err != nil {
+			return err
 		}
-		raw := meta.Get(keyMeta)
-		if raw == nil {
-			return fmt.Errorf("%w: admission repository missing meta key %q: %s", repository.ErrInvalidRecord, string(keyMeta), r.db.Path())
-		}
-		var env envelope
-		if err := json.Unmarshal(raw, &env); err != nil {
-			return fmt.Errorf("%w: meta envelope json: %v", repository.ErrCorruptRecord, err)
-		}
-		if env.Kind != kindMeta {
-			return fmt.Errorf("%w: meta envelope kind %q, want %q", repository.ErrCorruptRecord, env.Kind, kindMeta)
-		}
-		if env.SchemaVersion != envelopeSchemaVersion {
-			return fmt.Errorf("%w: meta envelope schema %d, want %d", repository.ErrCorruptRecord, env.SchemaVersion, envelopeSchemaVersion)
-		}
-		if env.Checksum != checksumEnvelope(env.Kind, env.SchemaVersion, env.Revision, keyMeta, env.Payload) {
-			return fmt.Errorf("%w: meta envelope checksum mismatch", repository.ErrCorruptRecord)
-		}
-		var payload struct {
-			SchemaVersion uint16
-		}
-		if err := json.Unmarshal(env.Payload, &payload); err != nil {
-			return fmt.Errorf("%w: meta payload json: %v", repository.ErrCorruptRecord, err)
-		}
-		schemaVersion = payload.SchemaVersion
 		return nil
 	}); err != nil {
 		return 0, err
 	}
 	return schemaVersion, nil
+}
+
+func authorityMetaSchemaVersionTx(tx *bolt.Tx, path string) (uint16, error) {
+	meta := tx.Bucket(bucketMeta)
+	if meta == nil {
+		return 0, fmt.Errorf("%w: admission repository missing bucket %q: %s", repository.ErrCorruptRecord, string(bucketMeta), path)
+	}
+	raw := meta.Get(keyMeta)
+	if raw == nil {
+		return 0, fmt.Errorf("%w: admission repository missing meta key %q: %s", repository.ErrInvalidRecord, string(keyMeta), path)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return 0, fmt.Errorf("%w: meta envelope json: %v", repository.ErrCorruptRecord, err)
+	}
+	if env.Kind != kindMeta {
+		return 0, fmt.Errorf("%w: meta envelope kind %q, want %q", repository.ErrCorruptRecord, env.Kind, kindMeta)
+	}
+	if env.SchemaVersion != envelopeSchemaVersion {
+		return 0, fmt.Errorf("%w: meta envelope schema %d, want %d", repository.ErrCorruptRecord, env.SchemaVersion, envelopeSchemaVersion)
+	}
+	if env.Checksum != checksumEnvelope(env.Kind, env.SchemaVersion, env.Revision, keyMeta, env.Payload) {
+		return 0, fmt.Errorf("%w: meta envelope checksum mismatch", repository.ErrCorruptRecord)
+	}
+	var payload struct {
+		SchemaVersion uint16
+	}
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		return 0, fmt.Errorf("%w: meta payload json: %v", repository.ErrCorruptRecord, err)
+	}
+	return payload.SchemaVersion, nil
 }
 
 func optionsWithFileIdentity(options *bolt.Options, identity *FileIdentity) *bolt.Options {

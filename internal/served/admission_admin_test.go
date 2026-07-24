@@ -308,6 +308,47 @@ func TestRecoverAdmissionRootSchemaPrecedesMissingBucket(t *testing.T) {
 	}
 }
 
+func TestRecoverAdmissionRootSchemaPrecedesMissingBucketAfterPreflight(t *testing.T) {
+	root := initializedGenerationZeroAdmissionRoot(t)
+	repoPath := filepath.Join(root, admissionRepositoryFile)
+	beforeInfo, err := os.Stat(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mutatedHash string
+	setAdmissionRecoveryAfterPreflightHookForTest(t, func() error {
+		setAdmissionRepositoryMetaSchemaVersion(t, repoPath, repository.CurrentAuthorityMetaSchemaVersion+1)
+		deleteAdmissionRepositoryBucket(t, repoPath, "safety")
+		afterInfo, err := os.Stat(repoPath)
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(beforeInfo, afterInfo) {
+			t.Fatalf("admission repository identity changed after mutation")
+		}
+		mutatedHash = hashRootFiles(t, root)[admissionRepositoryFile]
+		return nil
+	})
+
+	err = recoverAdmissionRootWithAvailableRuntimeNoHash(t, root)
+	var schemaErr AdmissionRootIncompatibleSchemaError
+	if !errors.As(err, &schemaErr) {
+		t.Fatalf("RecoverAdmissionRoot error = %T %v, want AdmissionRootIncompatibleSchemaError", err, err)
+	}
+	if schemaErr.SchemaVersion != repository.CurrentAuthorityMetaSchemaVersion+1 {
+		t.Fatalf("schema version = %d, want %d", schemaErr.SchemaVersion, repository.CurrentAuthorityMetaSchemaVersion+1)
+	}
+	if errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("RecoverAdmissionRoot error = %v, want schema precedence over corrupt bucket", err)
+	}
+	if mutatedHash == "" {
+		t.Fatal("test hook did not capture post-mutation repository hash")
+	}
+	if got := hashRootFiles(t, root)[admissionRepositoryFile]; got != mutatedHash {
+		t.Fatalf("admission repository hash after rejected recovery = %s, want post-mutation hash %s", got, mutatedHash)
+	}
+}
+
 func TestRecoverAdmissionRootClosesRuntimeOnEarlyServerConstructionErrors(t *testing.T) {
 	tests := []struct {
 		name string

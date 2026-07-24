@@ -1054,6 +1054,10 @@ func translateAdmissionRepositoryOpenError(repoPath string, err error) error {
 	if errors.As(err, &mismatch) {
 		return admissionRootRepositoryIdentityMismatchError(repoPath, mismatch.Expected, mismatch.Opened)
 	}
+	var unsupportedSchema bboltrepo.UnsupportedAuthorityMetaSchemaVersionError
+	if errors.As(err, &unsupportedSchema) {
+		return unsupportedAdmissionRootSchemaError(repoPath, unsupportedSchema.SchemaVersion, err)
+	}
 	return err
 }
 

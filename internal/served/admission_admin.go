@@ -198,6 +198,13 @@ func (e AdmissionRootIncompatibleSchemaError) Unwrap() error {
 	return e.Cause
 }
 
+func unsupportedAdmissionRootSchemaError(repoPath string, schemaVersion uint16, cause error) error {
+	if cause == nil {
+		cause = fmt.Errorf("%w: meta.schema_version %d is unsupported", repository.ErrInvalidRecord, schemaVersion)
+	}
+	return AdmissionRootIncompatibleSchemaError{Path: repoPath, SchemaVersion: schemaVersion, Cause: cause}
+}
+
 type AdmissionRootAnchorError struct {
 	Path  string
 	Cause error
@@ -271,8 +278,7 @@ func verifyOpenedAdmissionRepositoryInitialized(ctx context.Context, repoPath st
 		return err
 	}
 	if schemaVersion != repository.CurrentAuthorityMetaSchemaVersion {
-		cause := fmt.Errorf("%w: meta.schema_version %d is unsupported", repository.ErrInvalidRecord, schemaVersion)
-		return AdmissionRootIncompatibleSchemaError{Path: repoPath, SchemaVersion: schemaVersion, Cause: cause}
+		return unsupportedAdmissionRootSchemaError(repoPath, schemaVersion, nil)
 	}
 	if err := repo.VerifyInitializedStructure(); err != nil {
 		return err
@@ -291,8 +297,7 @@ func verifyAdmissionRepositoryMetaForRecovery(repoPath string, meta repository.R
 		return fmt.Errorf("%w: meta is %s", repository.ErrInvalidRecord, meta.State)
 	}
 	if meta.Value.SchemaVersion != repository.CurrentAuthorityMetaSchemaVersion {
-		cause := fmt.Errorf("%w: meta.schema_version %d is unsupported", repository.ErrInvalidRecord, meta.Value.SchemaVersion)
-		return AdmissionRootIncompatibleSchemaError{Path: repoPath, SchemaVersion: meta.Value.SchemaVersion, Cause: cause}
+		return unsupportedAdmissionRootSchemaError(repoPath, meta.Value.SchemaVersion, nil)
 	}
 	return meta.Value.Validate()
 }
