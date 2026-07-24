@@ -1153,11 +1153,13 @@ func openAdmissionBootstrapperWithOptions(ctx context.Context, s *Server, openOp
 		}
 	}
 	if err := auditOpenedAdmissionRepository(ctx, repo); err != nil {
-		_ = repo.Close()
-		if errors.Is(err, repository.ErrCorruptRecord) {
-			s.safetyLatch.Trip(err)
+		if !admissionAuditFindingsRepairableAtStartup(err) {
+			_ = repo.Close()
+			if errors.Is(err, repository.ErrCorruptRecord) {
+				s.safetyLatch.Trip(err)
+			}
+			return nil, nil, nil, err
 		}
-		return nil, nil, nil, err
 	}
 	dbUUID, schemaMajor, err := repo.AnchorIdentity()
 	if err != nil {
@@ -1249,12 +1251,27 @@ func openAdmissionRepositoryOnce(repoPath, anchorPath string, timeout time.Durat
 }
 
 func requireAdmissionAnchorAbsentForCreate(anchorPath string) error {
-	if _, err := os.Stat(anchorPath); err == nil {
+	if _, err := os.Lstat(anchorPath); err == nil {
 		return fmt.Errorf("%w: anchor exists without admission repository: %s", authority.ErrAnchorInvariant, anchorPath)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
+}
+
+func admissionAuditFindingsRepairableAtStartup(err error) bool {
+	kinds := repository.IntegrityFindingKinds(err)
+	if len(kinds) == 0 {
+		return false
+	}
+	for _, kind := range kinds {
+		switch kind {
+		case "projection", "quarantine":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func openExistingAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, socketPath string) (*bboltrepo.Repository, error) {

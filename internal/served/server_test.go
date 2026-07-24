@@ -3593,6 +3593,86 @@ func TestServeFailsPreListenerOnStartupCorruptBindingIndexValue(t *testing.T) {
 	requireServedCorruptKind(t, err, "binding_index")
 }
 
+func TestServeRepairsProjectionOnlyStartupAuditBeforeListen(t *testing.T) {
+	server, root, cwd := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	accepted := acceptIdentifiedAuthorityWork(t, server, "startup-projection-repair")
+	finalizeAcceptedAuthorityWork(t, server, accepted)
+	if err := server.closeServeAdmission(); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := bboltrepo.OpenExisting(filepath.Join(root, admissionRepositoryFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.InjectCorruptProjectionForTest(accepted.Record.JobID, "projection checksum")
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restart := newTestServerAtRoot(t, root, cwd, newFakeBackend("fake"))
+	configureTestAdmissionRuntime(t, restart, newAdmissionFakeLaunchCustodian(t), true)
+	listenErr := errors.New("listener reached after projection repair")
+	listenCalled := false
+	restart.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		listenCalled = true
+		image, err := restart.admissionReady.LoadJob(context.Background(), accepted.Record.JobID)
+		if err != nil {
+			return nil, socketFileIdentity{}, err
+		}
+		if image.Projection.State != repository.RecordValid {
+			return nil, socketFileIdentity{}, fmt.Errorf("projection state = %s, want valid", image.Projection.State)
+		}
+		if image.Quarantine.State != repository.RecordValid {
+			return nil, socketFileIdentity{}, fmt.Errorf("quarantine state = %s, want valid", image.Quarantine.State)
+		}
+		return nil, socketFileIdentity{}, listenErr
+	}
+
+	err = restart.Serve(context.Background())
+	if !errors.Is(err, listenErr) {
+		t.Fatalf("Serve error = %v, want listener sentinel", err)
+	}
+	if !listenCalled {
+		t.Fatal("listener was not reached after projection-only repair")
+	}
+}
+
+func TestServeFailsPreListenerWhenProjectionAndBindingCorrupt(t *testing.T) {
+	server, root, cwd := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	accepted := acceptIdentifiedAuthorityWork(t, server, "startup-projection-binding-corrupt")
+	finalizeAcceptedAuthorityWork(t, server, accepted)
+	if err := server.closeServeAdmission(); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := bboltrepo.OpenExisting(filepath.Join(root, admissionRepositoryFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.InjectCorruptProjectionForTest(accepted.Record.JobID, "projection checksum")
+	repo.InjectCorruptBindingForTest(accepted.Binding.RequestKey, "binding checksum")
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restart := newTestServerAtRoot(t, root, cwd, newFakeBackend("fake"))
+	configureTestAdmissionRuntime(t, restart, newAdmissionFakeLaunchCustodian(t), true)
+	listenCalled := false
+	restart.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		listenCalled = true
+		return nil, socketFileIdentity{}, errors.New("listener must not open for binding corruption")
+	}
+
+	err = restart.Serve(context.Background())
+	if !errors.Is(err, repository.ErrCorruptRecord) || !servedErrorTreeHasCorruptKind(err, "binding") {
+		t.Fatalf("Serve error = %T %v, want binding corruption", err, err)
+	}
+	if listenCalled {
+		t.Fatal("listener was called despite authoritative binding corruption")
+	}
+}
+
 func TestServeBootstrapRootExistenceMatrix(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -3639,6 +3719,27 @@ func TestServeBootstrapRootExistenceMatrix(t *testing.T) {
 				t.Helper()
 				assertPathMissing(t, filepath.Join(root, admissionRepositoryFile))
 				assertPathExists(t, filepath.Join(root, admissionAnchorFile))
+			},
+		},
+		{
+			name: "missing db dangling anchor symlink rejects without recreate",
+			arrange: func(t *testing.T, root string) {
+				t.Helper()
+				if err := os.Symlink(filepath.Join(root, "missing-anchor-target"), filepath.Join(root, admissionAnchorFile)); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: authority.ErrAnchorInvariant,
+			assertion: func(t *testing.T, root string, err error) {
+				t.Helper()
+				assertPathMissing(t, filepath.Join(root, admissionRepositoryFile))
+				info, statErr := os.Lstat(filepath.Join(root, admissionAnchorFile))
+				if statErr != nil {
+					t.Fatalf("anchor lstat = %v, want dangling symlink present", statErr)
+				}
+				if info.Mode()&os.ModeSymlink == 0 {
+					t.Fatalf("anchor mode = %v, want symlink", info.Mode())
+				}
 			},
 		},
 		{
@@ -7515,6 +7616,27 @@ func requireServedCorruptKind(t *testing.T, err error, kind string) {
 	var corrupt repository.CorruptRecordKindError
 	if !errors.As(err, &corrupt) || corrupt.Kind != kind {
 		t.Fatalf("error = %T %v, want corrupt kind %s", err, err, kind)
+	}
+}
+
+func servedErrorTreeHasCorruptKind(err error, kind string) bool {
+	if err == nil {
+		return false
+	}
+	switch typed := err.(type) {
+	case repository.CorruptRecordKindError:
+		return typed.Kind == kind
+	case interface{ Unwrap() []error }:
+		for _, child := range typed.Unwrap() {
+			if servedErrorTreeHasCorruptKind(child, kind) {
+				return true
+			}
+		}
+		return false
+	case interface{ Unwrap() error }:
+		return servedErrorTreeHasCorruptKind(typed.Unwrap(), kind)
+	default:
+		return false
 	}
 }
 

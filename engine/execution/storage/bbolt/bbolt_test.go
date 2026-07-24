@@ -219,6 +219,40 @@ func TestCreateInitializesStrictSchemaV2AndBindingIndex(t *testing.T) {
 	}
 }
 
+func TestCreateRemovesPartialDatabaseAfterInitializeFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	initializeErr := errors.New("initialize fresh failed")
+	previous := initializeFreshForTest
+	initializeFreshForTest = func() error {
+		return initializeErr
+	}
+	t.Cleanup(func() {
+		initializeFreshForTest = previous
+	})
+
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if repo != nil {
+		_ = repo.Close()
+		t.Fatal("Create returned repository after injected initialize failure")
+	}
+	if !errors.Is(err, initializeErr) {
+		t.Fatalf("Create error = %v, want initialize failure", err)
+	}
+	if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("partial database stat = %v, want missing", statErr)
+	}
+
+	initializeFreshForTest = nil
+	repo, err = Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("retry Create error = %v", err)
+	}
+	defer repo.Close()
+	if _, statErr := os.Lstat(path); statErr != nil {
+		t.Fatalf("retry database stat = %v", statErr)
+	}
+}
+
 func TestBindingIndexMismatchIsCorruptionAndAuditFinding(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
 	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
@@ -323,6 +357,73 @@ func TestAuditIntegrityReportsBindingIndexAndSafetyFindings(t *testing.T) {
 		if !errorTreeHasCorruptKind(err, kind) {
 			t.Fatalf("AuditIntegrity error = %v, want %s finding", err, kind)
 		}
+	}
+}
+
+func TestAuditIntegrityClassifiesProjectionOnlyFindings(t *testing.T) {
+	tests := []struct {
+		name    string
+		arrange func(*testing.T, *Repository, bboltFixture)
+	}{
+		{
+			name: "missing",
+			arrange: func(t *testing.T, repo *Repository, fixture bboltFixture) {
+				t.Helper()
+				if err := repo.db.Update(func(tx *bolt.Tx) error {
+					return tx.Bucket(bucketProjections).Delete(jobIDKey(fixture.JobID))
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "corrupt",
+			arrange: func(t *testing.T, repo *Repository, fixture bboltFixture) {
+				t.Helper()
+				repo.InjectCorruptProjectionForTest(fixture.JobID, "projection checksum")
+			},
+		},
+		{
+			name: "mismatch",
+			arrange: func(t *testing.T, repo *Repository, fixture bboltFixture) {
+				t.Helper()
+				mismatched := fixture.Projection
+				mismatched.Public = model.PublicStarting
+				if err := repo.db.Update(func(tx *bolt.Tx) error {
+					return putEnvelope(tx.Bucket(bucketProjections), kindProjection, jobIDKey(fixture.JobID), mismatched, revisionProjection(mismatched))
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "admission.db")
+			repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer repo.Close()
+			fixture := newBboltFixture(t, "audit-projection-"+tt.name)
+			acceptBboltFixture(t, repo, fixture)
+			tt.arrange(t, repo, fixture)
+
+			err = repo.AuditIntegrity(context.Background())
+			if err == nil {
+				t.Fatal("AuditIntegrity error = nil, want projection finding")
+			}
+			kinds := repository.IntegrityFindingKinds(err)
+			if len(kinds) == 0 {
+				t.Fatalf("AuditIntegrity error = %v, want classified findings", err)
+			}
+			for _, kind := range kinds {
+				if kind != "projection" {
+					t.Fatalf("AuditIntegrity kinds = %v, want only projection", kinds)
+				}
+			}
+		})
 	}
 }
 

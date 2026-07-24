@@ -214,6 +214,30 @@ func TestResetEmptyRootRepairsMissingAnchorOnlyAfterEmptyProof(t *testing.T) {
 	}
 }
 
+func TestResetEmptyRootRefusesDanglingAnchorSymlinkWithoutRepository(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	anchorPath := filepath.Join(root, AdmissionAnchorFile)
+	if err := os.Symlink(filepath.Join(root, "missing-anchor-target"), anchorPath); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ResetEmptyAdmissionRoot(ctx, root)
+	if !errors.Is(err, ErrAnchorInvariant) {
+		t.Fatalf("ResetEmptyAdmissionRoot error = %v, want ErrAnchorInvariant", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, AdmissionRepositoryFile)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("repository lstat = %v, want missing", statErr)
+	}
+	info, statErr := os.Lstat(anchorPath)
+	if statErr != nil {
+		t.Fatalf("anchor lstat = %v, want dangling symlink present", statErr)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("anchor mode = %v, want symlink", info.Mode())
+	}
+}
+
 func TestResetEmptyRootRefusesBusyRoot(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

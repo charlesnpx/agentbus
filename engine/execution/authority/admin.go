@@ -293,7 +293,7 @@ func ResetEmptyAdmissionRoot(ctx context.Context, stateRoot string) (RootInspect
 			return RootInspection{}, err
 		}
 	} else if errors.Is(err, os.ErrNotExist) {
-		if _, anchorErr := os.Stat(anchorPath); anchorErr == nil {
+		if _, anchorErr := os.Lstat(anchorPath); anchorErr == nil {
 			return RootInspection{}, fmt.Errorf("%w: anchor exists without admission repository: %s", ErrAnchorInvariant, anchorPath)
 		} else if !errors.Is(anchorErr, os.ErrNotExist) {
 			return RootInspection{}, anchorErr

@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -65,6 +66,70 @@ func NewIntegrityFinding(kind, key string, err error) error {
 		return nil
 	}
 	return IntegrityFinding{Kind: kind, Key: key, Err: err}
+}
+
+func IntegrityFindingKinds(err error) []string {
+	var kinds []string
+	collectIntegrityFindingKinds(err, &kinds)
+	return kinds
+}
+
+func collectIntegrityFindingKinds(err error, kinds *[]string) (bool, bool) {
+	if err == nil {
+		return false, false
+	}
+	switch typed := err.(type) {
+	case IntegrityError:
+		return collectIntegrityErrorFindingKinds(typed.Findings, kinds)
+	case IntegrityFinding:
+		classified, unclassified := collectIntegrityFindingKinds(typed.Err, kinds)
+		if !classified || unclassified {
+			*kinds = append(*kinds, integrityFindingKind(typed.Kind, typed.Err))
+		}
+		return true, false
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		return collectIntegrityErrorFindingKinds(multi.Unwrap(), kinds)
+	}
+	if single, ok := err.(interface{ Unwrap() error }); ok {
+		classified, unclassified := collectIntegrityFindingKinds(single.Unwrap(), kinds)
+		if classified || unclassified {
+			return classified, unclassified
+		}
+	}
+	if kind := integrityFindingKind("", err); kind != "" {
+		*kinds = append(*kinds, kind)
+		return true, false
+	}
+	if errors.Is(err, ErrCorruptRecord) || errors.Is(err, ErrInvalidRecord) || errors.Is(err, ErrConflict) {
+		return false, true
+	}
+	return false, false
+}
+
+func collectIntegrityErrorFindingKinds(findings []error, kinds *[]string) (bool, bool) {
+	classified := false
+	unclassified := false
+	for _, finding := range findings {
+		findingClassified, findingUnclassified := collectIntegrityFindingKinds(finding, kinds)
+		classified = classified || findingClassified
+		unclassified = unclassified || findingUnclassified
+	}
+	return classified, unclassified
+}
+
+func integrityFindingKind(kind string, err error) string {
+	if kind != "" {
+		return kind
+	}
+	var corrupt CorruptRecordKindError
+	if errors.As(err, &corrupt) {
+		return corrupt.Kind
+	}
+	if errors.Is(err, ErrProjectionMismatch) {
+		return "projection"
+	}
+	return kind
 }
 
 type CorruptRecordKindError struct {

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"reflect"
 	"runtime/debug"
@@ -25,6 +26,8 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bolt "go.etcd.io/bbolt"
 )
+
+var initializeFreshForTest func() error
 
 const envelopeSchemaVersion uint16 = 1
 
@@ -189,10 +192,35 @@ func Create(path string, options ...*bolt.Options) (*Repository, error) {
 	}
 	repo := &Repository{db: db, fileIdentity: identity}
 	if err := repo.initializeFresh(); err != nil {
-		_ = db.Close()
-		return nil, err
+		closeErr := db.Close()
+		removeErr := removeFailedCreate(path, identity)
+		if removeErr != nil {
+			log.Printf("agentbus bbolt: remove failed create %s: %v", path, removeErr)
+		}
+		return nil, errors.Join(err, closeErr, removeErr)
 	}
 	return repo, nil
+}
+
+func removeFailedCreate(path string, identity FileIdentity) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%w: failed create path is not a regular file: %s", repository.ErrInvalidRecord, path)
+	}
+	current, err := fileIdentityFromFileInfo(info)
+	if err != nil {
+		return err
+	}
+	if current != identity {
+		return FileIdentityMismatchError{Path: path, Expected: identity, Opened: current}
+	}
+	return os.Remove(path)
 }
 
 // OpenExisting opens an existing root bbolt repository without creating,
@@ -468,6 +496,10 @@ func fileIdentityFromFile(file *os.File) (FileIdentity, error) {
 	if err != nil {
 		return FileIdentity{}, err
 	}
+	return fileIdentityFromFileInfo(info)
+}
+
+func fileIdentityFromFileInfo(info os.FileInfo) (FileIdentity, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return FileIdentity{}, fmt.Errorf("unexpected bbolt stat type %T", info.Sys())
@@ -727,14 +759,49 @@ func auditIntegrityTx(tx *bolt.Tx) error {
 		}
 	}
 	for jobID := range jobs {
-		if err := repository.ValidateJobClosure(jobID, read.LoadJob(jobID), read.LookupRequest); err != nil {
-			findings = append(findings, repository.NewIntegrityFinding("job", jobID.String(), err))
+		image := read.LoadJob(jobID)
+		if err := repository.ValidateJobClosure(jobID, image, read.LookupRequest); err != nil {
+			findings = append(findings, repository.NewIntegrityFinding(auditJobIntegrityFindingKind(image, err), jobID.String(), err))
 		}
 	}
 	if err := read.auditBindingIndexEntries(); err != nil {
 		findings = append(findings, repository.NewIntegrityFinding("binding_index", "", err))
 	}
 	return repository.NewIntegrityError(findings)
+}
+
+func auditJobIntegrityFindingKind(image repository.JobImage, err error) string {
+	if auditJobProjectionRepairableFinding(image, err) {
+		return "projection"
+	}
+	return "job"
+}
+
+func auditJobProjectionRepairableFinding(image repository.JobImage, err error) bool {
+	if err == nil || image.Safety.State != repository.RecordValid {
+		return false
+	}
+	record := image.Safety.Value
+	if image.Binding.State != repository.RecordValid || image.Binding.Value.JobID != record.JobID {
+		return false
+	}
+	if err := image.Binding.Value.Matches(record); err != nil {
+		return false
+	}
+	switch image.Projection.State {
+	case repository.RecordMissing:
+		return strings.Contains(err.Error(), "has no projection")
+	case repository.RecordCorrupt:
+		var corrupt repository.CorruptRecordKindError
+		return errors.As(err, &corrupt) && corrupt.Kind == "projection"
+	case repository.RecordValid:
+		if image.Projection.Value.JobID != record.JobID {
+			return strings.Contains(err.Error(), "projection key mismatch")
+		}
+		return errors.Is(err, repository.ErrProjectionMismatch)
+	default:
+		return false
+	}
 }
 
 func checkStructuralIntegrityTx(tx *bolt.Tx) error {
@@ -759,6 +826,13 @@ func (r *Repository) InjectCorruptBindingForTest(key model.RequestKey, diagnosti
 		panic(err)
 	}
 	r.injectCorruptRecordForTest(bucketBindings, requestKeyBytes(key), "binding", diagnostic)
+}
+
+func (r *Repository) InjectCorruptProjectionForTest(jobID model.JobID, diagnostic string) {
+	if err := jobID.Validate(); err != nil {
+		panic(err)
+	}
+	r.injectCorruptRecordForTest(bucketProjections, jobIDKey(jobID), "projection", diagnostic)
 }
 
 func (r *Repository) InjectCorruptTombstoneForTest(key model.RequestKey, diagnostic string) {
@@ -839,6 +913,11 @@ func (r *Repository) initializeFresh() error {
 		for _, name := range bucketNames {
 			r.countOperationForTest("create_bucket")
 			if _, err := tx.CreateBucket(name); err != nil {
+				return err
+			}
+		}
+		if initializeFreshForTest != nil {
+			if err := initializeFreshForTest(); err != nil {
 				return err
 			}
 		}
