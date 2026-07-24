@@ -404,8 +404,8 @@ func (s *RecoverySession) SealReady(ctx context.Context) (*Ready, error) {
 	}
 	token, err := s.core.anchor.SealReady(ctx, s.token.boot, s.token.generation)
 	if err != nil {
-		s.core.failStopLocked(ctx, fmt.Sprintf("anchor seal ready: %v", err))
-		return nil, err
+		stopErr := s.core.failStopLocked(ctx, fmt.Sprintf("anchor seal ready: %v", err))
+		return nil, postDurableFailStopError("anchor seal ready", err, stopErr)
 	}
 	s.core.runtime = recoveredRuntime
 	s.core.boot = bootStatus{

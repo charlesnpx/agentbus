@@ -89,6 +89,9 @@ func TestAcceptAdvanceFailureReturnsAcceptedResultAndDurableFailStop(t *testing.
 	if !errors.Is(err, advanceErr) {
 		t.Fatalf("Accept error = %v, want injected advance failure", err)
 	}
+	if !errors.Is(err, ErrFailStopped) {
+		t.Fatalf("Accept error = %v, want ErrFailStopped after durable fail-stop", err)
+	}
 	if accepted.Record.JobID == "" || accepted.Commit.Generation == 0 {
 		t.Fatalf("accepted result = %+v, want populated result with commit", accepted)
 	}
@@ -142,6 +145,9 @@ func TestAcceptAndClaimConflictReturnsAcceptedResultAndDurableFailStop(t *testin
 	accepted, err := ready.AcceptAndClaim(ctx, acceptRequest(t, "accept-claim-fail"), model.OwnerID("owner-claim"))
 	if !errors.Is(err, ErrRuntimeConflict) {
 		t.Fatalf("AcceptAndClaim error = %v, want ErrRuntimeConflict", err)
+	}
+	if !errors.Is(err, ErrFailStopped) {
+		t.Fatalf("AcceptAndClaim error = %v, want ErrFailStopped after durable fail-stop", err)
 	}
 	if accepted.Record.JobID == "" || accepted.Commit.Generation == 0 {
 		t.Fatalf("accepted result = %+v, want populated result with commit", accepted)

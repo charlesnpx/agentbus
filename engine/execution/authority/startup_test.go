@@ -257,6 +257,9 @@ func TestAnchorStoreStartupBarrierFromSnapshots(t *testing.T) {
 		if err == nil || ready != nil {
 			t.Fatalf("SealReady = (%#v, %v), want failure before Ready", ready, err)
 		}
+		if !errors.Is(err, ErrFailStopped) {
+			t.Fatalf("SealReady error = %v, want ErrFailStopped after durable fail-stop", err)
+		}
 	})
 
 	t.Run("db ahead with persisted fail-stop refuses restart", func(t *testing.T) {

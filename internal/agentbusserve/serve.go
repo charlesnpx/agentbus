@@ -232,8 +232,7 @@ func cancellationContainsBootstrapFailure(err error) bool {
 	case errors.Is(err, repository.ErrInvalidRecord),
 		errors.Is(err, repository.ErrCorruptRecord),
 		errors.Is(err, repository.ErrProjectionMismatch),
-		errors.Is(err, repository.ErrAmbiguousCommit),
-		errors.Is(err, repository.ErrDefinitelyNotCommitted):
+		errors.Is(err, repository.ErrAmbiguousCommit):
 		return true
 	default:
 		return false

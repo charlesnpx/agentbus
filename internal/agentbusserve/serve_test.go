@@ -19,7 +19,9 @@ import (
 	"time"
 
 	busclient "github.com/charlesnpx/agentbus/client"
+	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
@@ -399,6 +401,48 @@ func TestServeCancellationJoinedSafetyFailStopReturnsFailure(t *testing.T) {
 	}
 }
 
+func TestServeCancellationDefinitelyNotCommittedContextCanceledReturnsClean(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	fake := &fakeServedServer{
+		shutdownTimeout: time.Second,
+		serve: func(context.Context, context.Context) error {
+			return errors.Join(repository.ErrDefinitelyNotCommitted, context.Canceled)
+		},
+		shutdown: func(context.Context) error {
+			return served.ErrShutdownNotServing
+		},
+	}
+	stubProductionServe(t, fake)
+
+	if err := Serve(ctx, Config{StateRoot: t.TempDir(), CWD: t.TempDir(), IdleTimeout: -1}); err != nil {
+		t.Fatalf("Serve error = %v, want clean cancellation", err)
+	}
+}
+
+func TestServeCancellationAmbiguousCommitContextCanceledReturnsFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	fake := &fakeServedServer{
+		shutdownTimeout: time.Second,
+		serve: func(context.Context, context.Context) error {
+			return errors.Join(repository.ErrAmbiguousCommit, context.Canceled)
+		},
+		shutdown: func(context.Context) error {
+			return served.ErrShutdownNotServing
+		},
+	}
+	stubProductionServe(t, fake)
+
+	err := Serve(ctx, Config{StateRoot: t.TempDir(), CWD: t.TempDir(), IdleTimeout: -1})
+	if !errors.Is(err, repository.ErrAmbiguousCommit) {
+		t.Fatalf("Serve error = %v, want ambiguous commit failure", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Serve error = %v, want joined context.Canceled preserved", err)
+	}
+}
+
 func TestServeLauncherReportsJoinedSafetyFailStopDuringCancellation(t *testing.T) {
 	root := t.TempDir()
 	_, err := daemonlaunch.Launch(context.Background(), agentbusServeLaunchOptionsWithMode(t, root, t.TempDir(), "joined-fail-stop-canceled-report"))
@@ -414,6 +458,24 @@ func TestServeLauncherReportsJoinedSafetyFailStopDuringCancellation(t *testing.T
 	}
 	if !strings.Contains(startup.Message, served.ErrSafetyFailStopped.Error()) {
 		t.Fatalf("startup message = %q, want safety fail-stop", startup.Message)
+	}
+}
+
+func TestServeLauncherReportsAuthorityFailStopDuringCancellation(t *testing.T) {
+	root := t.TempDir()
+	_, err := daemonlaunch.Launch(context.Background(), agentbusServeLaunchOptionsWithMode(t, root, t.TempDir(), "authority-fail-stop-canceled-report"))
+	if err == nil {
+		t.Fatal("Launch succeeded, want reported authority fail-stop startup failure")
+	}
+	var startup *daemonlaunch.StartupError
+	if !errors.As(err, &startup) || !errors.Is(startup, daemonlaunch.ErrStartupFailed) {
+		t.Fatalf("Launch error = %T %v, want startup failure", err, err)
+	}
+	if startup.Code != served.ErrSafetyFailStopped.Error() {
+		t.Fatalf("startup code = %q, want %q", startup.Code, served.ErrSafetyFailStopped)
+	}
+	if !strings.Contains(startup.Message, authority.ErrFailStopped.Error()) {
+		t.Fatalf("startup message = %q, want authority fail-stop", startup.Message)
 	}
 }
 
@@ -747,6 +809,8 @@ func runAgentbusServeHelper() int {
 		return runAgentbusServePreflightStallSignalHelper(cwd)
 	case "joined-fail-stop-canceled-report":
 		return runAgentbusServeJoinedFailStopCanceledReportHelper(cwd)
+	case "authority-fail-stop-canceled-report":
+		return runAgentbusServeAuthorityFailStopCanceledReportHelper(cwd)
 	case "root-busy-report":
 		reporter, hasReporter, err := daemonlaunch.InheritedReporterFromEnv()
 		if err != nil {
@@ -808,6 +872,35 @@ func runAgentbusServeJoinedFailStopCanceledReportHelper(cwd string) int {
 			shutdownTimeout: time.Second,
 			serve: func(context.Context, context.Context) error {
 				return errors.Join(served.SafetyFailStopError{Reason: context.Canceled}, context.Canceled)
+			},
+			shutdown: func(context.Context) error {
+				return served.ErrShutdownNotServing
+			},
+		}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := Serve(ctx, Config{
+		StateRoot:   os.Getenv("AGENTBUS_STATE_ROOT"),
+		CWD:         cwd,
+		IdleTimeout: -1,
+	}); err != nil {
+		return 1
+	}
+	return 0
+}
+
+func runAgentbusServeAuthorityFailStopCanceledReportHelper(cwd string) int {
+	productionServedConfigFunc = func(cfg Config) (served.Config, error) {
+		cfg.Runtime = custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable)
+		return cfg, nil
+	}
+	newProductionServerAfterStrictAdmissionSupportPreflight = func(context.Context, served.Config) (servedServer, error) {
+		return &fakeServedServer{
+			shutdownTimeout: time.Second,
+			serve: func(context.Context, context.Context) error {
+				failStopped := errors.Join(authority.FailStoppedError{Reason: "anchor advance: context canceled"}, context.Canceled)
+				return errors.Join(served.SafetyFailStopError{Reason: failStopped}, context.Canceled)
 			},
 			shutdown: func(context.Context) error {
 				return served.ErrShutdownNotServing

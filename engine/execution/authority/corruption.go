@@ -2,6 +2,7 @@ package authority
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -187,7 +188,7 @@ func (core *authorityCore) failStopLockedWithContext(ctx context.Context, reason
 
 func postDurableFailStopError(operation string, err, stopErr error) error {
 	if stopErr == nil {
-		return err
+		return errors.Join(FailStoppedError{Reason: fmt.Sprintf("%s: %v", operation, err)}, err)
 	}
 	return fmt.Errorf("%w: %s after durable commit: %w; durable fail-stop: %w", ErrFailStopRecord, operation, err, stopErr)
 }

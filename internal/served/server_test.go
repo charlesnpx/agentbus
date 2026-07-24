@@ -62,6 +62,29 @@ type resumedSession struct {
 	Opts engine.SessionOpts
 }
 
+type cancelOnAdvanceAnchor struct {
+	authority.Anchor
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (a *cancelOnAdvanceAnchor) Advance(ctx context.Context, boot model.BootRef, generation uint64) error {
+	a.once.Do(func() {
+		if a.cancel != nil {
+			a.cancel()
+		}
+	})
+	return a.Anchor.Advance(ctx, boot, generation)
+}
+
+type causeErrContext struct {
+	context.Context
+}
+
+func (ctx causeErrContext) Err() error {
+	return context.Cause(ctx.Context)
+}
+
 type probeableFakeBackend struct {
 	*fakeBackend
 	probes atomic.Int64
@@ -1848,6 +1871,73 @@ func TestServeBootstrapParentCanceledMidProbeFailsBootstrap(t *testing.T) {
 	}
 }
 
+func TestServeCancelDuringBootstrapAnchorAdvanceReportsFailStop(t *testing.T) {
+	t.Parallel()
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	server, _, cwd := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dbUUID, schemaMajor, err := repo.AnchorIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor := &cancelOnAdvanceAnchor{
+		Anchor: anchorStore.Adapter(dbUUID, schemaMajor),
+		cancel: cancel,
+	}
+	server.admissionBootstrapperFactory = func(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchor(anchor), authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return bootstrapper, repo, io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	configureTestAdmissionRuntime(t, server, launcher, true)
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		return nil, socketFileIdentity{}, errors.New("listener must not open after bootstrap fail-stop")
+	}
+
+	err = server.Serve(ctx)
+	if !errors.Is(err, ErrSafetyFailStopped) {
+		t.Fatalf("Serve error = %v, want safety fail-stop", err)
+	}
+	if !errors.Is(err, authority.ErrFailStopped) {
+		t.Fatalf("Serve error = %v, want authority fail-stop", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Serve error = %v, want original cancellation preserved", err)
+	}
+	snapshot := admissionAnchorSnapshot(t, anchorStore)
+	if snapshot.Phase != "fail_stopped" {
+		t.Fatalf("anchor phase = %q, want fail_stopped", snapshot.Phase)
+	}
+	if !strings.Contains(snapshot.Reason, "anchor advance") || !strings.Contains(snapshot.Reason, context.Canceled.Error()) {
+		t.Fatalf("anchor fail-stop reason = %q, want anchor advance cancellation", snapshot.Reason)
+	}
+
+	restart := newTestServerAtRoot(t, server.stateRoot, cwd, newFakeBackend("fake"))
+	restart.admissionBootstrapperFactory = func(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+		bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return bootstrapper, repo, io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	configureTestAdmissionRuntime(t, restart, newAdmissionFakeLaunchCustodian(t), true)
+	restart.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		return nil, socketFileIdentity{}, errors.New("listener must not open for persisted fail-stop")
+	}
+	restartErr := restart.Serve(context.Background())
+	if !errors.Is(restartErr, ErrSafetyFailStopped) {
+		t.Fatalf("restart Serve error = %v, want safety fail-stop", restartErr)
+	}
+	if !errors.Is(restartErr, authority.ErrFailStopped) {
+		t.Fatalf("restart Serve error = %v, want persisted authority fail-stop", restartErr)
+	}
+}
+
 func TestIdentifiedSubmitRejectsSessionContractViolationBeforeDurableAccept(t *testing.T) {
 	t.Parallel()
 	session := &nonOrdinalSession{id: "lying-session"}
@@ -3355,11 +3445,14 @@ func TestShutdownPIDQuarantineReadErrorAfterDeadlineAbandonsRestore(t *testing.T
 	}
 	readStarted := make(chan struct{})
 	var readOnce sync.Once
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-	defer cancel()
+	shutdownBase, expire := context.WithCancelCause(context.Background())
+	shutdownCtx := causeErrContext{Context: shutdownBase}
 	server.readPIDFileNoFollowHook = func(path string) ([]byte, socketFileIdentity, error) {
 		if filepath.Base(filepath.Dir(path)) != "." && strings.HasPrefix(filepath.Base(filepath.Dir(path)), "agentbus.pid.quarantine.") {
-			readOnce.Do(func() { close(readStarted) })
+			readOnce.Do(func() {
+				close(readStarted)
+				expire(context.DeadlineExceeded)
+			})
 			<-shutdownCtx.Done()
 			return nil, socketFileIdentity{}, errors.New("forced quarantined pid read failure")
 		}
