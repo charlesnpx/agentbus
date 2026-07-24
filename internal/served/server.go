@@ -2813,7 +2813,7 @@ func invalidParams(err error) requestOutcome {
 }
 
 func unknownAuthorityJobError(jobID string) *protocol.ErrorObject {
-	return protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: jobID})
+	return protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: jobID})
 }
 
 func backendError(err error) *protocol.ErrorObject {

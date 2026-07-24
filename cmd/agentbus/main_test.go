@@ -393,9 +393,16 @@ func TestStatusResultCancelProtocolErrorExitCodes(t *testing.T) {
 		{
 			name:       "unknown job",
 			args:       []string{"status", "--job", "job_missing"},
-			err:        &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: "job_missing"})},
+			err:        &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: "job_missing"})},
 			wantCode:   cliExitUnknownJob,
-			wantStderr: []string{"code=invalid_task_spec", "jobId=job_missing"},
+			wantStderr: []string{"code=unknown_job", "jobId=job_missing"},
+		},
+		{
+			name:       "unknown job classifies by code",
+			args:       []string{"result", "--job", "job_missing"},
+			err:        &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "authority does not have this job", protocol.ErrorData{JobID: "job_missing"})},
+			wantCode:   cliExitUnknownJob,
+			wantStderr: []string{"code=unknown_job", "jobId=job_missing"},
 		},
 		{
 			name:       "fail stop",
@@ -634,7 +641,7 @@ func (c *fakeProtocolClient) JobStatus(_ context.Context, params agentclient.Job
 	if params.JobID != "" {
 		status, ok := c.statuses[params.JobID]
 		if !ok {
-			return agentclient.JobStatusResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+			return agentclient.JobStatusResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: params.JobID})}
 		}
 		return agentclient.JobStatusResult{Jobs: []agentclient.JobStatus{status}}, nil
 	}
@@ -650,7 +657,7 @@ func (c *fakeProtocolClient) JobResult(_ context.Context, params agentclient.Job
 	}
 	result, ok := c.results[params.JobID]
 	if !ok {
-		return agentclient.JobResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+		return agentclient.JobResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: params.JobID})}
 	}
 	return result, nil
 }
@@ -661,7 +668,7 @@ func (c *fakeProtocolClient) JobCancel(_ context.Context, params agentclient.Job
 	}
 	result, ok := c.cancels[params.JobID]
 	if !ok {
-		return agentclient.JobCancelResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+		return agentclient.JobCancelResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: params.JobID})}
 	}
 	return result, nil
 }

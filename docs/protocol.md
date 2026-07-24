@@ -1,960 +1,511 @@
-# agentbus wire protocol v1
+# agentbus wire protocol v2
 
-This document is the published wire contract for agentbus protocol major
-version 1. Independent clients and servers MUST treat this document as
-authoritative for v1 behavior.
+This document is the public wire contract for agentbus protocol major version
+2. ADR-12 is normative for the strict-only contract, and this document is
+written to match the served implementation.
 
-agentbus is an agent-agnostic execution service. It exposes sessions, turns,
-background jobs, and generic structural policy validation. It does not define
-workflow semantics such as delegation, review, rescue, or orchestration.
+agentbus is a local, same-user execution daemon. Protocol v2 exposes identified
+background jobs plus policy validation. It does not expose foreground sessions,
+turn streams, orchestration, delegation, review, or rescue workflows.
 
 ## Transport and framing
 
-The daemon listens on the Unix domain socket:
+The daemon listens on a Unix domain socket named `agentbus.sock` under the
+agentbus state root. The state root is:
 
-```text
-$XDG_STATE_HOME/agentbus/agentbus.sock
-```
+| Environment | State root |
+| --- | --- |
+| `XDG_STATE_HOME` set | `$XDG_STATE_HOME/agentbus` |
+| `XDG_STATE_HOME` unset | `~/.local/state/agentbus` |
 
-If `XDG_STATE_HOME` is unset, the state root is
-`~/.local/state/agentbus`. The state directory MUST be mode `0700`. The socket
-path MUST be created with mode `0600` where the platform supports socket file
-modes.
+The daemon also maintains a token file named `token` in the same state root.
+State directories are created with mode `0700`; the socket and token file are
+created or adjusted to mode `0600` where supported.
 
 The wire protocol is JSON-RPC 2.0 over newline-delimited JSON:
 
-- Each frame MUST be exactly one UTF-8 encoded JSON object followed by `\n`.
-- A frame MUST NOT contain embedded unescaped newlines outside JSON strings.
-- A client request MUST use JSON-RPC 2.0 request shape.
-- A server response MUST use JSON-RPC 2.0 response shape.
-- A server notification MUST use JSON-RPC 2.0 notification shape and MUST NOT
-  include `id`.
+- Each frame is one UTF-8 JSON object followed by `\n`.
+- Request and response IDs are JSON-RPC `id` values.
+- Every supported protocol method requires an `id`.
+- JSON-RPC numeric `error.code` remains numeric. Stable protocol identifiers
+  are carried in `error.data.code`.
 
-Example request frame:
-
-```json
-{"jsonrpc":"2.0","id":"1","method":"protocol.hello","params":{"clientProtocolVersion":1,"token":"..."}}
-```
-
-Example response frame:
-
-```json
-{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":1,"backends":["codex","claude"],"backendMetadata":[{"backend":"codex","models":["gpt-5.4"],"efforts":["low","medium","high","xhigh"]},{"backend":"claude","models":["sonnet","opus"],"efforts":["low","medium","high","xhigh","max"]}],"capabilities":{"policy.shape":true,"policy.jsonSchema":true,"models.discovery":true}}}
-```
-
-`protocol.hello` MUST be the first request sent on a connection. A server MUST
-reject all other methods before a successful hello. A protocol major-version
-mismatch MUST return a structured JSON-RPC error whose stable identifier is
-`error.data.code: "version_mismatch"`. The JSON-RPC `error.code` field MUST
-remain numeric and is implementation-defined.
+Protocol v2 does not define server notifications.
 
 ## Trust model
 
-agentbus trusts all processes running as the same OS user. The socket mode and
-state-file modes prevent accidental access by other users on the same machine,
-but they are not a security boundary between same-user clients.
+agentbus trusts code running as the same OS user. Socket permissions and the
+hello token prevent accidental cross-user access; they are not a security
+boundary against same-user code that can read the token or state files.
 
-State files contain sensitive data: prompts, diffs, tool output, backend logs,
-and final model output. Clients MUST treat paths returned by agentbus as private
-same-user state.
+State files can contain prompts, tool output, backend logs, and model output.
+Clients should treat all paths returned by agentbus as private same-user state.
 
-The daemon MUST maintain a token file with mode `0600` and check the supplied
-token during `protocol.hello`. That token is accident-prevention only. It is
-explicitly NOT a security boundary because same-user code can read it.
+## Method surface
 
-## Daemon, jobs, and state
+The protocol v2 socket methods are:
 
-Implementations MUST provide `agentbus serve [--foreground]`. Client packages
-MUST autostart the daemon when a connection is requested and no live daemon is
-available.
-
-The daemon MUST support idle shutdown. The default idle shutdown threshold is
-30 minutes, and the daemon MUST shut down only when there are no client
-connections and no active or queued jobs or turns. A running background job
-always counts as activity. The daemon MUST support concurrent multi-job
-execution; the one-active-turn rule is per session, not per daemon.
-
-This is also an operational upgrade behavior, not a protocol change. At startup
-the daemon records its resolved executable's modification time and size. If a
-later housekeeping check finds that binary replaced or unavailable, the daemon
-continues serving active connections and work, then exits at the first quiet
-check without waiting for the normal 30-minute timeout. A later client
-connection autostarts the upgraded binary.
-
-Operationally, autostarted daemons detach into their own session, so ending the
-launching process group (or pressing Ctrl-C in the launching terminal) no longer
-stops them. A detached daemon exits on its own via the idle timeout, or at the
-first quiet moment after a binary upgrade. To stop one immediately, send SIGTERM
-to the PID recorded in `<state root>/agentbus.pid`.
-
-State storage requirements:
-
-| Item | Requirement |
+| Method | Purpose |
 | --- | --- |
-| State root | `$XDG_STATE_HOME/agentbus`, falling back to `~/.local/state/agentbus` when `XDG_STATE_HOME` is unset. |
-| Directory modes | State directories MUST be created with mode `0700`. |
-| File and log modes | State files and logs MUST be created with mode `0600`. |
-| Workspace namespace | Per-workspace state MUST be keyed by the full 64-hex SHA-256 of the canonicalized absolute `cwd`. The digest MUST NOT be truncated. |
+| `protocol.hello` | Authenticate the connection and negotiate protocol v2. |
+| `job.submit` | Submit an identified strict job. |
+| `job.status` | Read one job or list jobs with `{"all":true}`. |
+| `job.result` | Read one job result from authority state. |
+| `job.cancel` | Request authority cancellation for one job. |
+| `policy.validate` | Validate text against a contract without execution. |
+| `policy.register` | Register an immutable daemon-local named contract. |
 
-Every foreground turn and background job MUST have a job record. A job record
-MUST include, when applicable:
+Job listing is `job.status` with `{"all":true}`. There is no separate list
+method.
 
-- supervisor PID, PGID, and process start time
-- worker PID, PGID, and process start time
-- heartbeat lease
-- backend session id
-- backend child PID
-
-`job.status`, `job.result`, `job.cancel`, and equivalent CLI status operations
-MUST detect expired heartbeat leases, stale queued jobs, foreground crashes,
-orphaned records, and PID reuse. PID reuse detection MUST compare the observed
-process start time with the start time recorded for that PID. Corrupted job
-records MUST be moved to a quarantine directory with diagnostics describing the
-record path and validation or parse failure. A single-job status or result read
-MUST reconcile only the requested record while holding that record's lock. Full
-workspace reconciliation runs independently on daemon start and on a periodic
-per-workspace daemon tick; enumerating all jobs also requests a full pass. Full
-passes are debounced and single-flighted per workspace (the default minimum
-interval is two seconds), so concurrent readers do not stampede the store.
-
-Job-record writes MUST be atomic: write a temporary file in the same directory,
-fsync that file, rename it over the target, then fsync the containing
-directory. Each backend invocation MUST run in a new process group. Canceling a
-running job or interrupting a foreground turn MUST send `SIGTERM` to the
-process group, wait a grace period whose default is 10 seconds, then send
-`SIGKILL` to remaining processes in that group.
-
-Implementations MUST read process start time portably. On Linux this can use
-`/proc/<pid>/stat` field 22; on macOS this can use `ps -o lstart=` or `sysctl`.
-Backend stdout and stderr MUST be captured to state log files from process
-start. Log files MUST be size-capped, with a default cap of 10 MB, and capped
-logs MUST include a truncation marker.
-
-Terminal job records and logs MUST be retained for a default of 14 days.
-Spilled result files MUST be retained for a default of 14 days. Orphaned
-job-input files MUST be swept when their job is terminal. Garbage collection
-MUST piggyback on full reaper passes, reuse the records already read by that
-pass, and be throttled per workspace (the default minimum interval is 30
-seconds). Retention settings MUST be configurable.
-
-## Identity model
-
-In protocol v1, every foreground turn is also a job record:
+Removed or unknown requests with a JSON-RPC `id` return
+`error.code = -32601` and `error.data.code = "method_not_found"` after a
+successful hello. This includes the v1 session and turn surface:
 
 ```text
-turnId == jobId
+session.start
+session.resume
+session.list
+turn.start
+turn.interrupt
+turn.event
+turn.result
 ```
 
-`turn.start` returns both identifiers for clarity and forward compatibility:
+Other `session.*` and `turn.*` request names are also outside v2 and receive
+the same `method_not_found` error. This remains true while the daemon is
+fail-stopped: unknown methods are rejected by dispatch before fail-stop
+admission checks.
+
+Unidentified `job.submit` is also removed. Because it uses the still-supported
+`job.submit` method name, it is rejected as an admission error rather than as
+`method_not_found`: a serving strict daemon returns `missing_identity` unless a
+higher-priority root or shutdown condition applies first.
+
+## Hello
+
+`protocol.hello` must be the first request on a connection. Any other method
+before hello returns:
+
+```json
+{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"protocol.hello is required before other methods","data":{"code":"unauthorized"}}}
+```
+
+Hello params:
+
+| Field | Required | Type | Meaning |
+| --- | --- | --- | --- |
+| `clientProtocolVersion` | yes | integer | Must equal `2`. |
+| `token` | yes | string | Must match the state-root `token` file. |
+
+If the token is absent or wrong, the server returns `unauthorized`. If the
+version is not `2`, the server returns `protocol_version_mismatch` and includes
+`serverProtocolVersion: 2` in `error.data`.
+
+A successful hello result has this shape:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `protocolVersion` | integer | Always `2`. |
+| `backends` | string array | Backend names known to the daemon, sorted by name. |
+| `backendMetadata` | array | Optional backend model and effort metadata. |
+| `capabilities` | object | Boolean feature flags advertised by the daemon. |
+
+The Go client sends `clientProtocolVersion = protocol.Version`. If a server
+returns a successful hello result whose `protocolVersion` is not `2`, the client
+returns `client.ErrProtocolVersionMismatch`; the error matches that sentinel
+with `errors.Is` and includes the expected and received versions.
+
+Calling `protocol.hello` a second time on the same connection returns
+`invalid_task_spec`.
+
+## Error envelope
+
+All protocol errors use the JSON-RPC error object:
 
 ```json
 {
-  "turnId": "job_01J00000000000000000000001",
-  "jobId": "job_01J00000000000000000000001",
-  "sessionId": "ses_01J00000000000000000000001"
-}
-```
-
-If a client disconnects during a foreground turn, the turn continues as its job.
-The client recovers the outcome with `job.result` using the returned `jobId`.
-
-## Correlation and streams
-
-Every server notification about a turn or job MUST carry:
-
-- `sessionId`
-- `turnId`
-- `jobId`
-
-For v1 turn notifications, `turnId` and `jobId` MUST be equal.
-
-The response to `turn.start` is not the event stream. It only acknowledges that
-the turn job exists. Runtime output arrives as `turn.event` notifications. The
-terminal foreground notification is `turn.result`, which is distinct from the
-`job.result` request method used to fetch persisted outcomes.
-
-Example event notification:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "turn.event",
-  "params": {
-    "sessionId": "ses_01J00000000000000000000001",
-    "turnId": "job_01J00000000000000000000001",
-    "jobId": "job_01J00000000000000000000001",
-    "sequence": 3,
-    "event": {
-      "type": "AgentText",
-      "text": "Working through the patch.",
-      "truncated": false
-    }
+  "code": -32000,
+  "message": "human-readable detail",
+  "data": {
+    "code": "stable_protocol_code"
   }
 }
 ```
 
-Example terminal notification:
+`method_not_found` is the only current stable code that maps to JSON-RPC
+numeric `-32601`. Other stable codes map to `-32000`.
+
+`error.data` fields:
+
+| Field | Meaning |
+| --- | --- |
+| `code` | Stable protocol error code. Always present. |
+| `jobId` | Job ID related to the error, when known. |
+| `sessionId` | Backend/admission session ID related to the error, when known. |
+| `backend` | Backend name related to the error, when known. |
+| `admissionCause` | ADR-12 strict rejection cause. |
+| `runtimeSupport` | Native runtime diagnostic for strict runtime failures. |
+| `serverProtocolVersion` | Server protocol version on hello mismatch. |
+
+`runtimeSupport`, when present, has:
 
 ```json
-{
-  "jsonrpc": "2.0",
-  "method": "turn.result",
-  "params": {
-    "sessionId": "ses_01J00000000000000000000001",
-    "turnId": "job_01J00000000000000000000001",
-    "jobId": "job_01J00000000000000000000001",
-    "state": "completed",
-    "result": {
-      "text": "Done.",
-      "resultPath": "/home/me/.local/state/agentbus/results/job_01J00000000000000000000001.txt",
-      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "bytes": 5
-    }
-  }
-}
+{"class":"unsupported","cause":"...","attempts":1,"cleanupSafe":true}
 ```
 
-## Error-code namespace
-
-JSON-RPC numeric error codes are implementation-defined and MUST remain
-numeric. Structured errors MUST put the stable v1 error identifier in
-`error.data.code`, using this namespace:
+Stable `error.data.code` values in v2 include:
 
 | Code | Meaning |
 | --- | --- |
-| `unauthorized` | The required `protocol.hello` token was missing or invalid. |
-| `session_busy` | A session already has an active turn. |
-| `name_conflict` | A policy name was re-registered with a different spec. |
-| `version_mismatch` | The client and server protocol major versions differ. |
-| `capability_missing` | A requested capability is not available. |
-| `backend_unavailable` | The requested backend is not installed, unhealthy, or disabled. |
-| `timeout` | A turn or job exceeded its timeout. |
-| `interrupted` | A foreground turn was interrupted. |
-| `quarantined` | A corrupt record was quarantined and cannot produce a normal result. |
-| `result_too_large` | A requested inline result exceeds the supported inline limit. |
-| `invalid_task_spec` | A `taskSpec` is malformed or contains unsupported fields. |
+| `unauthorized` | Missing or invalid hello token, or method sent before hello. |
+| `name_conflict` | A policy name was registered with a different spec. |
+| `protocol_version_mismatch` | Client and server protocol major versions differ. |
+| `method_not_found` | Unknown or removed method. |
+| `capability_missing` | Required daemon, backend, or admission capability is unavailable. |
+| `backend_unavailable` | Backend or authority root is unavailable. |
+| `timeout` | A job timed out. |
+| `interrupted` | A job was interrupted. |
+| `quarantined` | Corruption prevents a normal result. |
+| `result_too_large` | Inline result text exceeds the inline cap. |
+| `invalid_task_spec` | Submitted params or task spec are malformed or incompatible. |
+| `unknown_job` | The authority has no job for the requested `jobId`. |
 
-Example:
+## Strict rejection causes
 
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "8",
-  "error": {
-    "code": -32000,
-    "message": "session already has an active turn",
-    "data": {
-      "code": "session_busy",
-      "sessionId": "ses_01J00000000000000000000001"
-    }
-  }
-}
+Admission rejections carry the stable cause in `error.data.admissionCause`.
+The protocol error code remains in `error.data.code`; clients should classify
+admission errors by `admissionCause` first, then by `code`.
+
+ADR-12 defines this priority when multiple causes apply:
+
+```text
+root_corrupt > root_identity_mismatch > root_fail_stopped > root_sealed >
+admission_closing > unavailable_native_runtime > missing_identity >
+request_fingerprint_unsupported > replay_conflict > request_expired >
+unsupported_backend > unfenceable_backend > invalid_strict_config
 ```
 
-## Methods
+The served mapper checks repository corruption before fail-stop, so an error
+that still carries both corruption and fail-stop identity is reported as
+`root_corrupt`. After the safety latch is tripped, later admission attempts
+normally see `root_fail_stopped`.
 
-All method examples are JSON-RPC objects before newline framing.
-
-### `protocol.hello`
-
-`protocol.hello` negotiates protocol major version and advertises backends and
-capabilities. It MUST be the first request on a connection.
-
-Request params:
-
-```json
-{
-  "clientProtocolVersion": 1,
-  "token": "accident-prevention-token"
-}
-```
-
-`token` is REQUIRED. The server MUST check it against the daemon token file
-before advertising capabilities. The token check is accident-prevention only;
-it is not a security boundary. If the token is missing or invalid, the server
-MUST fail `protocol.hello` with `error.data.code` set to `unauthorized`.
-
-Result:
-
-```json
-{
-  "protocolVersion": 1,
-  "backends": ["codex", "claude"],
-  "backendMetadata": [
-    {"backend": "codex", "models": ["gpt-5.4"], "efforts": ["low", "medium", "high", "xhigh"]},
-    {"backend": "claude", "models": ["sonnet", "opus"], "efforts": ["low", "medium", "high", "xhigh", "max"]}
-  ],
-  "capabilities": {
-    "policy.shape": true,
-    "policy.jsonSchema": true,
-    "policy.named": true,
-    "policy.retry": true,
-    "nativeStructuredOutput.codex": false,
-    "nativeStructuredOutput.claude": false,
-    "models.discovery": true,
-    "models.reported": true
-  }
-}
-```
-
-`backendMetadata`, `models.discovery`, and `models.reported` are additive
-protocol-v1 fields. Older clients may ignore them and continue using the stable
-`backends` string array. Clients that need backend-confirmed model identity MUST
-gate on `models.reported`.
-
-### Model discovery, validation, and reporting
-
-Runtime model and effort catalogs are best-effort discovery data, not an
-entitlement guarantee. If a requested model or effort is absent from a current
-discovered catalog, agentbus MUST emit a `Warning` event and pass the request to
-the backend; the backend remains authoritative for rejecting an invalid value.
-Only an adapter's explicitly configured static allow-list may cause agentbus to
-reject a model or effort before starting the backend.
-
-`modelReported`, when present on `turn.result`, `job.status`, or `job.result`,
-is the non-empty model value reported by the backend while executing the turn.
-It is best-effort and MAY be absent. It is also repeated in `result` when a
-persisted final result exists. An empty backend event MUST NOT erase a model
-reported earlier in the same job. When a backend reports more than one non-empty
-model in the same job, the most recent value wins: later configuration events
-(for example codex `session_configured` after `thread.started`) and later
-attempts refine earlier ones.
-
-Unauthorized error example:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "1",
-  "error": {
-    "code": -32000,
-    "message": "missing or invalid hello token",
-    "data": {
-      "code": "unauthorized"
-    }
-  }
-}
-```
-
-Version mismatch error example:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "1",
-  "error": {
-    "code": -32000,
-    "message": "protocol major version mismatch",
-    "data": {
-      "code": "version_mismatch",
-      "serverProtocolVersion": 1
-    }
-  }
-}
-```
-
-`backends` is the list of backend names accepted by `session.start` and
-`job.submit`. `capabilities` is a string-keyed object. Clients MUST gate optional
-behavior on explicit capabilities rather than protocol major version alone.
-When strict identified admission is active for the current `agentbus serve`
-instance and the installed policy has crash-durable containment,
-`capabilities` also includes `"admission.strictContainment": true`. It is
-omitted otherwise. `jobs.requestId` remains unadvertised in this release.
-
-### `session.start`
-
-Starts a backend session.
-
-Request params:
-
-```json
-{
-  "backend": "codex",
-  "cwd": "/absolute/workspace/path",
-  "write": false,
-  "model": "gpt-5",
-  "effort": "medium",
-  "tags": {
-    "client": "convo-relay",
-    "slot": "codex-a"
-  }
-}
-```
-
-Result:
-
-```json
-{
-  "sessionId": "ses_01J00000000000000000000001",
-  "backend": "codex"
-}
-```
-
-`write` on `session.start` is the session default only. Effective write
-permission is a per-turn property. If `turn.start.write` is absent, the turn
-uses the session default.
-
-### `session.resume`
-
-Resumes a known backend session by id.
-
-Request params:
-
-```json
-{
-  "sessionId": "ses_01J00000000000000000000001"
-}
-```
-
-Result:
-
-```json
-{
-  "sessionId": "ses_01J00000000000000000000001",
-  "backend": "codex"
-}
-```
-
-### `session.list`
-
-Lists known sessions, optionally filtered by exact tag matches.
-
-Request params:
-
-```json
-{
-  "tags": {
-    "client": "convo-relay"
-  }
-}
-```
-
-Result:
-
-```json
-{
-  "sessions": [
-    {
-      "sessionId": "ses_01J00000000000000000000001",
-      "backend": "codex",
-      "cwd": "/absolute/workspace/path",
-      "write": false,
-      "tags": {
-        "client": "convo-relay",
-        "slot": "codex-a"
-      },
-      "activeTurnId": null
-    }
-  ]
-}
-```
-
-### `turn.start`
-
-Starts one foreground turn on an existing session.
-
-Request params:
-
-```json
-{
-  "sessionId": "ses_01J00000000000000000000001",
-  "prompt": "Inspect the working tree and report findings.",
-  "write": false,
-  "policy": {
-    "prologue": "Return a structured report.",
-    "contract": {
-      "shape": {
-        "firstLineEnum": ["PASS", "FAIL"],
-        "requiredSections": ["Findings", "Tests"],
-        "requiredAttestations": ["I inspected the diff."],
-        "evidenceHeuristic": true
-      }
-    },
-    "retry": {
-      "max": 1,
-      "template": "Your response missed: {{missing}}. Emit the corrected report only; make no further changes."
-    }
-  },
-  "timeoutMs": 1800000
-}
-```
-
-Result:
-
-```json
-{
-  "turnId": "job_01J00000000000000000000001",
-  "jobId": "job_01J00000000000000000000001",
-  "sessionId": "ses_01J00000000000000000000001"
-}
-```
-
-`write` is optional and defaults to the session default. A server MUST allow a
-turn to downgrade a write-enabled session to `write:false`.
-
-`timeoutMs` is optional and uses the same timeout semantics as
-`taskSpec.timeoutMs`.
-
-There is exactly one active turn per session. If `turn.start` is called while
-the session has an active turn, the server MUST return `session_busy`. The
-server MUST NOT queue or interleave turns on a session in v1.
-
-There is no re-attach stream in v1. If the client disconnects mid-turn, events
-are dropped and are not replayed. The outcome remains available through
-`job.result`.
-
-#### `turn.event` notification
-
-`turn.event` notifications use this outer shape:
-
-```json
-{
-  "sessionId": "ses_01J00000000000000000000001",
-  "turnId": "job_01J00000000000000000000001",
-  "jobId": "job_01J00000000000000000000001",
-  "sequence": 1,
-  "event": {
-    "type": "ToolUse",
-    "name": "shell",
-    "input": "git status --short",
-    "text": "git status --short",
-    "truncated": false
-  }
-}
-```
-
-The `event.type` enum is:
-
-| Type | Required fields | Meaning |
+| Cause | `error.data.code` | Meaning |
 | --- | --- | --- |
-| `AgentText` | `text`, `truncated` | Assistant text emitted during the turn. |
-| `ToolUse` | `name`, `text`, `truncated` | Tool invocation or equivalent backend action. |
-| `Warning` | `text`, `truncated` | Non-terminal warning from agentbus or the backend adapter. |
+| `missing_identity` | `invalid_task_spec` | `job.submit` lacks a valid top-level `workspaceKey` and `requestId`. |
+| `replay_conflict` | `invalid_task_spec` | A live binding or tombstone exists for the key but the raw task identity differs, or the live binding is for a different admission mode. |
+| `request_expired` | `invalid_task_spec` | The key matches a tombstone whose raw task identity matches the request. |
+| `request_fingerprint_unsupported` | `invalid_task_spec` | The recorded binding or tombstone uses a fingerprint algorithm or version the daemon cannot compare. |
+| `unsupported_backend` | `backend_unavailable` | The requested backend name is not available in strict admission. |
+| `unfenceable_backend` | `capability_missing` | The backend exists but cannot satisfy strict fencing or containment. |
+| `invalid_strict_config` | `invalid_task_spec` | The strict task configuration is malformed or incompatible. |
+| `unavailable_native_runtime` | `capability_missing` | Native strict runtime support is unavailable, route-disabled, or not ready. |
+| `root_corrupt` | `backend_unavailable` | The authority root has detected repository, anchor, or integrity corruption. |
+| `root_identity_mismatch` | `backend_unavailable` | Repository and anchor identities disagree. In current served startup this is a pre-socket failure surfaced through the launcher, not a normal JSON-RPC response. |
+| `root_fail_stopped` | `backend_unavailable` | The authority root or served safety latch is fail-stopped. |
+| `root_sealed` | `capability_missing` | The authority root is sealed and cannot serve admission. Current production startup normally reports this before socket readiness. |
+| `admission_closing` | `capability_missing` | The daemon is gracefully shutting down and no longer accepts admission. |
 
-Adapters MAY include backend-specific metadata on events, but v1 clients MUST
-only depend on the fields above.
+## `job.submit`
 
-#### `turn.result` notification
+Protocol v2 accepts only identified strict submissions.
 
-Terminal foreground notification:
-
-```json
-{
-  "sessionId": "ses_01J00000000000000000000001",
-  "turnId": "job_01J00000000000000000000001",
-  "jobId": "job_01J00000000000000000000001",
-  "state": "completed",
-  "modelReported": "gpt-5.4",
-  "result": {
-    "text": "PASS\n\n## Findings\nNone.",
-    "resultPath": "/home/me/.local/state/agentbus/results/job_01J00000000000000000000001.txt",
-    "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
-    "bytes": 24,
-    "modelReported": "gpt-5.4"
-  },
-  "contract": {
-    "status": "compliant",
-    "missing": [],
-    "reason": "",
-    "contractName": "delegate/delegate-report@1",
-    "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3aabbccddeeff001122334455",
-    "attempts": 1,
-    "retryUsed": false,
-    "validatedAt": "2026-07-09T12:00:00Z"
-  }
-}
-```
-
-### `turn.interrupt`
-
-Interrupts a foreground turn. In v1 this kills the backend process group.
-
-Request params:
+Params:
 
 ```json
 {
-  "turnId": "job_01J00000000000000000000001"
-}
-```
-
-Result:
-
-```json
-{
-  "turnId": "job_01J00000000000000000000001",
-  "jobId": "job_01J00000000000000000000001",
-  "state": "interrupted"
-}
-```
-
-### `job.submit`
-
-Submits a background job.
-
-Request params:
-
-```json
-{
+  "workspaceKey": "workspace-opaque-token",
+  "requestId": "request-opaque-token",
   "taskSpec": {
-    "backend": "claude",
+    "backend": "codex",
     "cwd": "/absolute/workspace/path",
     "write": false,
-    "model": "sonnet",
+    "model": "gpt-5",
     "effort": "medium",
-    "prompt": "Summarize the current diff.",
+    "prompt": "Do the work.",
     "policy": {
+      "prologue": "Optional text prepended to the backend prompt.",
       "contract": {
-        "named": "delegate/delegate-report@1"
+        "shape": {
+          "firstLineEnum": ["PASS", "FAIL"],
+          "requiredSections": ["Findings", "Tests"],
+          "requiredAttestations": ["I inspected the diff."],
+          "evidenceHeuristic": true
+        }
       },
       "retry": {
-        "max": 0,
+        "max": 1,
         "template": "Your response missed: {{missing}}. Emit the corrected report only; make no further changes."
       }
     },
     "tags": {
-      "client": "delegate",
-      "kind": "task"
+      "suite": "architecture"
     },
     "timeoutMs": 1800000
   }
 }
 ```
 
-Result:
+Top-level fields:
 
-```json
-{
-  "jobId": "job_01J00000000000000000000002",
-  "state": "queued"
-}
-```
-
-### `job.status`
-
-Fetches one job status or all job statuses.
-
-Each job entry MUST include `heartbeatAt`, `lease`, `workerPid`,
-`workerStartTime`, `backendChildPid`, `backendChildStartTime`, `statePath`, and
-`logPaths` when those fields are known for the current record.
-`workerStartTime` and `backendChildStartTime` are opaque platform process
-start-time tokens. Clients MUST compare them only for exact equality when
-verifying that a PID has not been reused. `lease.expired` MUST be computed at
-status-read time from `lease.expiresAt`. A running job whose heartbeat lease
-has expired MUST still report its recorded `state` as `running` until the
-reaper transitions it, and MUST report `lease.expired: true`. The daemon's
-default lease duration is five minutes and its default heartbeat interval is
-30 seconds. On an expired lease, the reaper MAY renew the lease and append a
-stale-heartbeat warning only when every persisted process identity with both a
-PID and start-time token still matches the observed process. If any required
-identity is missing, dead, or reused, the reaper MUST move the record to
-`orphaned`.
-
-A backend child may legitimately exit at every turn boundary, before the worker
-persists its authoritative `turn.result`. Its absence alone MUST NOT orphan a
-`running` or `retrying` record. Outside the lease-expiry branch, reaping moves
-such a record to `orphaned` only when the worker or supervisor is missing or
-has been reused; an identity-confirmed worker owns reporting the turn result.
-
-`lateFinalization` is an optional boolean on `job.status` and `job.result`.
-When `true`, an authoritative terminal result arrived after the record had
-entered `orphaned`; it is an informational lifecycle annotation, not a warning
-condition or a different terminal state. It is additive and requires no
-capability negotiation; an omitted value is false.
-
-An orphaned record MUST remain non-terminal for an orphan grace period measured
-from the transition to `orphaned`. The default orphan grace is the configured
-lease duration and MUST NOT be shorter than that duration. After the grace
-expires, the reaper MAY transition the record to `reaped`. This reconciliation
-window permits an in-process backend completion already held by the supervising
-daemon to persist its authoritative result.
-
-Request params for one job:
-
-```json
-{
-  "jobId": "job_01J00000000000000000000002"
-}
-```
-
-Request params for all jobs:
-
-```json
-{
-  "all": true
-}
-```
-
-Result:
-
-```json
-{
-  "jobs": [
-    {
-      "jobId": "job_01J00000000000000000000002",
-      "sessionId": "ses_01J00000000000000000000002",
-      "backend": "claude",
-      "state": "running",
-      "modelReported": "claude-opus-4",
-      "tags": {
-        "client": "delegate",
-        "kind": "task"
-      },
-      "startedAt": "2026-07-09T12:00:00Z",
-      "updatedAt": "2026-07-09T12:01:00Z",
-      "heartbeatAt": "2026-07-09T12:01:00Z",
-      "lease": {
-        "expiresAt": "2026-07-09T12:02:00Z",
-        "expired": true
-      },
-      "workerPid": 12345,
-      "workerStartTime": "2026-07-09 12:00:00",
-      "backendChildPid": 12346,
-      "backendChildStartTime": "2026-07-09 12:00:00",
-      "statePath": "/home/me/.local/state/agentbus/jobs/job_01J00000000000000000000002.json",
-      "logPaths": {
-        "stdout": "/home/me/.local/state/agentbus/logs/job_01J00000000000000000000002.stdout.log",
-        "stderr": "/home/me/.local/state/agentbus/logs/job_01J00000000000000000000002.stderr.log"
-      }
-    }
-  ]
-}
-```
-
-### `job.result`
-
-Fetches a persisted terminal result. `job.result` is a request method. It is not
-the `turn.result` notification.
-
-Request params:
-
-```json
-{
-  "jobId": "job_01J00000000000000000000002"
-}
-```
-
-Result:
-
-```json
-{
-  "jobId": "job_01J00000000000000000000002",
-  "sessionId": "ses_01J00000000000000000000002",
-  "state": "completed_noncompliant",
-  "lateFinalization": true,
-  "modelReported": "claude-opus-4",
-  "result": {
-    "resultPath": "/home/me/.local/state/agentbus/results/job_01J00000000000000000000002.txt",
-    "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
-    "bytes": 327680,
-    "modelReported": "claude-opus-4"
-  },
-  "contract": {
-    "status": "noncompliant",
-    "missing": ["section: Tests"],
-    "reason": "missing required section",
-    "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3aabbccddeeff001122334455",
-    "attempts": 1,
-    "retryUsed": false,
-    "validatedAt": "2026-07-09T12:00:00Z"
-  }
-}
-```
-
-### `job.cancel`
-
-Cancels a queued or running background job.
-
-Request params:
-
-```json
-{
-  "jobId": "job_01J00000000000000000000002"
-}
-```
-
-Result:
-
-```json
-{
-  "jobId": "job_01J00000000000000000000002",
-  "state": "canceled"
-}
-```
-
-### `policy.validate`
-
-Validates text against a contract without starting a backend turn.
-
-Request params:
-
-```json
-{
-  "text": "PASS\n\n## Findings\nNone.\n\nI inspected the diff.",
-  "contract": {
-    "shape": {
-      "firstLineEnum": ["PASS", "FAIL"],
-      "requiredSections": ["Findings"],
-      "requiredAttestations": ["I inspected the diff."],
-      "evidenceHeuristic": false
-    }
-  }
-}
-```
-
-Result:
-
-```json
-{
-  "valid": true,
-  "missing": [],
-  "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3aabbccddeeff001122334455"
-}
-```
-
-### `policy.register`
-
-Registers an optional named policy spec cache entry.
-
-Request params:
-
-```json
-{
-  "name": "delegate/delegate-report@1",
-  "spec": {
-    "shape": {
-      "firstLineEnum": ["PASS", "FAIL"],
-      "requiredSections": ["Findings", "Tests"],
-      "requiredAttestations": ["I inspected the diff."],
-      "evidenceHeuristic": true
-    }
-  }
-}
-```
-
-Result:
-
-```json
-{
-  "name": "delegate/delegate-report@1",
-  "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3aabbccddeeff001122334455",
-  "registered": true
-}
-```
-
-If the same name is registered again with an identical spec, the operation is
-idempotent and MUST succeed. If the same name is registered with a different
-spec, the server MUST return `name_conflict`.
-
-## `taskSpec`
-
-`taskSpec` is exactly a "run one backend turn" object:
-
-```json
-{
-  "backend": "codex",
-  "cwd": "/absolute/workspace/path",
-  "write": false,
-  "model": "gpt-5",
-  "effort": "medium",
-  "prompt": "Do the task.",
-  "policy": {
-    "contract": {
-      "shape": {
-        "requiredSections": ["Summary"]
-      }
-    }
-  },
-  "tags": {
-    "client": "delegate"
-  },
-  "timeoutMs": 1800000
-}
-```
-
-Allowed fields:
-
-| Field | Required | Type | Meaning |
+| Field | Required | Type | Rules |
 | --- | --- | --- | --- |
-| `backend` | yes | string | Backend name from `protocol.hello.backends`. |
-| `cwd` | yes | string | Absolute working directory. |
-| `write` | yes | boolean | Effective write permission for this job turn. |
-| `model` | no | string | Backend model selector. |
-| `effort` | no | string | Backend effort selector. |
-| `prompt` | yes | string | User prompt. |
-| `policy` | no | TurnPolicy | Generic structural policy. |
-| `tags` | no | object | Client-supplied string tags for discovery. |
-| `timeoutMs` | no | integer | Timeout in milliseconds. See timeout rules below. |
+| `workspaceKey` | yes | string | Opaque client/delegate token. Non-empty, at most 256 bytes, valid UTF-8, no whitespace or control characters. |
+| `requestId` | yes | string | Opaque request token with the same token rules. Stable across retries of the same logical request. |
+| `taskSpec` | yes | object | Raw task object used for fingerprinting and later typed validation. |
 
-No other fields are permitted in v1. An implementation MUST reject unknown
-fields with `invalid_task_spec`. A future protocol version MAY add a `kind`
-discriminator. v1 intentionally does not include open-ended extensibility:
-workflow composition belongs to clients, not agentbus.
+`taskSpec` fields:
 
-When `timeoutMs` is omitted, the timeout defaults to 1800000 milliseconds
-(30 minutes). Non-zero timeout values MUST NOT exceed 14400000 milliseconds
-(4 hours). The explicit value `0` means unbounded. Unbounded timeout is allowed
-only when `timeoutMs` is explicitly set to `0`; implementations MUST NOT infer
-an unbounded timeout from an omitted field. These rules apply to foreground
-turns and background jobs alike.
+| Field | Required | Type | Rules |
+| --- | --- | --- | --- |
+| `backend` | yes | string | Must be non-empty and available to strict admission. |
+| `cwd` | yes | string | Must be non-empty, absolute, and resolvable by `filepath.EvalSymlinks` for a new admission. |
+| `write` | yes | boolean | Effective write permission for the backend execution. `false` is valid. |
+| `prompt` | yes | string | Must be non-empty. |
+| `model` | no | string | Passed to the backend session when present. |
+| `effort` | no | string | Passed to the backend session when present. |
+| `policy` | no | object | Optional structural policy for the final backend text. |
+| `tags` | no | object | Optional string-to-string metadata. |
+| `timeoutMs` | no | integer | Omitted means 30 minutes. `0` disables the timeout. Negative values are invalid. Values above 4 hours are invalid. |
 
-## State machine
+Unknown fields in `job.submit` params or `taskSpec` are rejected during typed
+decode after replay lookup.
 
-Foreground turns and background jobs share the same job state machine.
+`policy.contract` must contain exactly one of:
+
+| Contract field | Meaning |
+| --- | --- |
+| `jsonSchema` | JSON Schema used to validate final text as JSON. |
+| `shape` | Built-in shape contract with `firstLineEnum`, `requiredSections`, `requiredAttestations`, and `evidenceHeuristic`. |
+| `named` | Name registered with `policy.register`. |
+
+If `policy.retry.max` is `1`, `policy.retry.template` must include
+`{{missing}}` and must instruct the backend to emit the corrected report only
+and make no further changes. Other non-zero retry counts are invalid.
+
+Result:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `jobId` | string | Authority job ID. |
+| `state` | string | Current public state. New non-replay submissions return `queued`. |
+| `deduplicated` | boolean | Present and `true` only when replay returns an existing live job. Omitted otherwise. |
+
+### Request keys and workspace keys
+
+The replay key is the pair `(workspaceKey, requestId)`. The daemon treats
+`workspaceKey` as an opaque request namespace token. It does not recompute it
+from `taskSpec.cwd` and does not require it to equal the storage workspace
+layout key.
+
+For new admissions only, the daemon separately derives the storage layout key
+from `taskSpec.cwd` as:
 
 ```text
-queued -> starting -> running -> [retrying ->] completed
-                                      |          completed_noncompliant
-                                      |          failed
-                                      |          timed_out
-                                      |          interrupted
-                                      |          canceled
+sha256(filepath.EvalSymlinks(filepath.Abs(taskSpec.cwd)))
 ```
 
-Supervision states:
+Clients that derive `workspaceKey` from a workspace identity must compute and
+persist it before the first send, then reuse the persisted value on every retry.
+Do not derive a different `workspaceKey` from the current filesystem state when
+retrying.
+
+`requestId` is stable for one logical request. Reusing the same
+`(workspaceKey, requestId)` with a different raw `taskSpec` is a protocol
+conflict. New logical work must use a new `requestId`.
+
+### Task fingerprints
+
+Bindings and tombstones record a task fingerprint with algorithm `sha256` and
+version `1`.
+
+Fingerprint v1 is derived from the raw `taskSpec`, not from typed defaults:
+
+1. The raw `taskSpec` must be one JSON object.
+2. JSON must be valid UTF-8 and contain one top-level value.
+3. Duplicate object keys are rejected by the fingerprint parser.
+4. Object keys are sorted for canonical rendering.
+5. Array order is preserved.
+6. Omitted fields, explicit `null`, empty objects, and numeric zero remain
+   distinct inputs.
+7. The hash input is the domain prefix `agentbus/task-spec/sha256/v1\0`
+   followed by the canonical JSON bytes.
+
+Replay comparison uses the recorded fingerprint algorithm and version. A
+recorded algorithm or version that cannot be compared returns
+`request_fingerprint_unsupported`; the daemon does not rehash the old request
+with the current algorithm.
+
+## Replay semantics
+
+For a serving strict route, `job.submit` processing is ordered as follows:
+
+1. Decode enough top-level JSON to validate `workspaceKey` and `requestId` and
+   extract raw `taskSpec`.
+2. Run `LookupReplay(workspaceKey, requestId)`.
+3. For a live binding, compare the current raw `taskSpec` with the recorded
+   fingerprint.
+4. For a tombstone, compare the current raw `taskSpec` with the recorded
+   fingerprint.
+5. Only when no live binding or tombstone exists, perform typed task validation,
+   backend validation, workspace resolution, current fingerprinting, durable
+   acceptance, and launch.
+
+Replay lookup and recorded-version comparison happen before backend validation,
+filesystem validation, workspace resolution, current-version fingerprinting, or
+typed `taskSpec` decode. That means replay is independent of current filesystem
+state, current symlink targets, and current backend composition.
+
+| Existing authority record | Raw `taskSpec` comparison | Result |
+| --- | --- | --- |
+| none | not applicable | Validate and admit as a new job. |
+| live binding, identified fenced | matches recorded fingerprint | Return the same `jobId`, current public state, and `deduplicated:true`. |
+| live binding, different mode | not applicable | `replay_conflict`. |
+| live binding | does not match | `replay_conflict`. |
+| live binding | recorded fingerprint unsupported | `request_fingerprint_unsupported`. |
+| tombstone | matches recorded fingerprint | `request_expired`. |
+| tombstone | does not match | `replay_conflict`. |
+| tombstone | recorded fingerprint unsupported | `request_fingerprint_unsupported`. |
+
+Malformed typed fields inside `taskSpec` do not preempt replay for an existing
+key. For example, if the original raw task differs from a retry whose
+`taskSpec.backend` is a number, the response is `replay_conflict`, not a typed
+decode error.
+
+If the initial `job.submit` response is lost after durable acceptance, the
+identified fenced obligation is retained and runs at most once. Replaying the
+same `(workspaceKey, requestId, taskSpec)` returns the same job with
+`deduplicated:true`.
+
+## `job.status`
+
+Params:
+
+```json
+{"jobId":"job_..."}
+```
+
+or:
+
+```json
+{"all":true}
+```
+
+If both `jobId` and `all` are omitted, the server treats the request as
+`{"all":true}`. If `jobId` is present, the request is an exact authority lookup
+and `all` is ignored.
+
+Result:
+
+```json
+{"jobs":[{"jobId":"job_...","sessionId":"ses_...","state":"running"}]}
+```
+
+The served v2 path is authority-only. It does not fall back to legacy JSON job
+records. Listing reads authority jobs and sorts returned statuses by `jobId`.
+Unknown or malformed job IDs that do not resolve to an authority job return
+`unknown_job` with `jobId` in `error.data`.
+
+## `job.result`
+
+Params:
+
+```json
+{"jobId":"job_..."}
+```
+
+Result:
+
+```json
+{
+  "jobId": "job_...",
+  "sessionId": "ses_...",
+  "state": "completed",
+  "result": {
+    "text": "final text",
+    "resultPath": "/home/me/.local/state/agentbus/workspaces/.../results/job_....txt",
+    "sha256": "64 lowercase hex characters",
+    "bytes": 10
+  }
+}
+```
+
+`job.result` is authority-only. The public state and result metadata are derived
+from the authority terminal record. Physical terminal proof serialization is
+not exposed in protocol v2.
+
+For completed terminal outcomes, the authority terminal record contains a
+certified result reference. The server returns `resultPath`, `sha256`, and
+`bytes`. It includes inline `text` only when the result is below the inline cap
+and a bounded read verifies both byte count and digest. If verification fails,
+the path and digest metadata remain, and `text` is omitted.
+
+Non-completion terminal states and non-terminal states return no `result`.
+Unknown jobs return `unknown_job` with `jobId` in `error.data`.
+
+## `job.cancel`
+
+Params:
+
+```json
+{"jobId":"job_..."}
+```
+
+Result:
+
+```json
+{"jobId":"job_...","state":"canceled"}
+```
+
+`job.cancel` is authority-only. If the job is already terminal, cancel returns
+the existing authority terminal state and does not mutate the authority record.
+If the job is active, served requests command interruption and records authority
+cancellation through the coordinator. If the authority has no job for the ID,
+the server returns `unknown_job`.
+
+`job.cancel` is not allowed while the served safety latch is fail-stopped; in
+that state it returns `root_fail_stopped`.
+
+## Public states and CLI exit codes
+
+Public job states:
 
 ```text
-orphaned -> completed | completed_noncompliant | failed | reaped
-reaped --authoritative in-process completion--> completed | completed_noncompliant
+queued
+starting
+running
+retrying
+completed
+completed_noncompliant
+interrupted
+quarantined
+failed
+timed_out
+canceled
+reaped
+orphaned
+```
+
+Terminal states are:
+
+```text
+completed
+completed_noncompliant
+failed
+timed_out
+interrupted
+canceled
+reaped
 quarantined
 ```
 
-An authoritative completion may normally transition an `orphaned` record to
-`completed`, `completed_noncompliant`, or `failed`; a `lateFinalization: true`
-annotation records that ordering. The `reaped` completion amendments are
-intentionally narrow: only the daemon
-instance that already holds the authoritative backend completion may salvage a
-`reaped` record. Status clients, restarted daemons, and unauthenticated or
-out-of-process writers MUST treat `reaped` as terminal and MUST NOT synthesize a
-result. This exception closes the `running -> orphaned -> reaped -> finalize`
-race without reopening arbitrary terminal records.
+The CLI maps single-job `status`, `result`, and `cancel` outcomes as follows:
 
-`retrying` is entered only from `running` when policy validation fails and
-`retry.max == 1`. It may be entered at most once for a job.
-
-Terminal states:
-
-| State | Terminal | Meaning |
-| --- | --- | --- |
-| `queued` | no | Job record exists but execution has not started. |
-| `starting` | no | Supervisor is launching the backend process. |
-| `running` | no | Backend process is active. |
-| `retrying` | no | One corrective resume is being launched after policy failure. |
-| `completed` | yes | Backend completed and policy, if any, is compliant or skipped without noncompliance. |
-| `completed_noncompliant` | yes | Backend produced a final result but structural policy validation failed after allowed retry. |
-| `failed` | yes | Backend or agentbus failed before a successful final result. |
-| `timed_out` | yes | Timeout expired. |
-| `interrupted` | yes | Foreground turn was interrupted. |
-| `canceled` | yes | Background job was canceled. |
-| `orphaned` | no | Reaper found missing, stale, or identity-mismatched supervision; the orphan grace is still reconciling possible in-process completion. |
-| `reaped` | yes | Reaper finalized an orphan after its grace elapsed; only an authoritative in-process completion already held by the daemon may amend it to a completed state. |
-| `quarantined` | yes | Corrupt record was moved aside with diagnostics. |
-
-CLI commands that surface a single job result MUST map terminal states to exit
-codes as follows:
-
-| State | Exit code |
+| Condition | Exit code |
 | --- | ---: |
 | `completed` | 0 |
+| any non-terminal state, including `queued`, `starting`, `running`, `retrying`, and `orphaned` | 2 |
 | `completed_noncompliant` | 3 |
 | `failed` | 4 |
 | `timed_out` | 5 |
@@ -962,275 +513,195 @@ codes as follows:
 | `canceled` | 7 |
 | `reaped` | 8 |
 | `quarantined` | 9 |
+| `unknown_job` | 10 |
+| daemon startup failure, including `unavailable_native_runtime` | 11 |
+| authority fail-stop, `root_fail_stopped`, `root_corrupt`, or `root_identity_mismatch` | 12 |
+| graceful shutdown deadline exceeded | 13 |
 
-Non-terminal states returned by polling commands MUST use exit code `2` when
-the command cannot return a terminal result yet.
+## Policy methods
 
-## Result-size semantics
-
-Each `turn.event` payload field containing backend text is subject to a
-per-event truncation cap. The default cap is 64 KiB. When truncation occurs, the
-event MUST set `truncated: true`. Event text is a streaming convenience and MUST
-NOT be treated as the authoritative final result.
-
-The terminal final assistant message is always spilled to a state file. The
-spilled file is the authoritative final result. The SHA-256 hash is computed
-over the raw final assistant message bytes exactly as written to the result
-file. No JSON encoding, newline normalization, ANSI stripping, or Unicode
-normalization is applied before hashing.
-
-`turn.result` and `job.result` include inline text only when the final result is
-under the inline cap. The default inline cap is 256 KiB.
-
-Inline result shape:
+`policy.validate` params:
 
 ```json
 {
-  "text": "Final answer.",
-  "resultPath": "/home/me/.local/state/agentbus/results/job_01J00000000000000000000001.txt",
-  "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
-  "bytes": 13,
-  "modelReported": "gpt-5.4"
-}
-```
-
-Spilled-only result shape:
-
-```json
-{
-  "resultPath": "/home/me/.local/state/agentbus/results/job_01J00000000000000000000001.txt",
-  "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
-  "bytes": 327680,
-  "modelReported": "gpt-5.4"
-}
-```
-
-`resultPath` is stable within a protocol major version. Its contents are the
-authoritative API. The directory layout is not guaranteed across major
-versions.
-
-## TurnPolicy
-
-TurnPolicy is a generic mechanism. It has no built-in policy opinions.
-
-```json
-{
-  "prologue": "Optional text prepended before the user prompt.",
+  "text": "candidate output",
   "contract": {
     "shape": {
-      "firstLineEnum": ["PASS", "FAIL"],
-      "requiredSections": ["Findings", "Tests"],
-      "requiredAttestations": ["I inspected the diff."],
-      "evidenceHeuristic": true
+      "requiredSections": ["Findings"]
     }
-  },
-  "retry": {
-    "max": 1,
-    "template": "Your response missed: {{missing}}. Emit the corrected report only; make no further changes."
   }
 }
 ```
 
-Fields:
-
-| Field | Required | Meaning |
-| --- | --- | --- |
-| `prologue` | no | Text prepended to the backend prompt before execution. |
-| `contract` | no | Contract spec: `jsonSchema`, `shape`, or `named`. |
-| `retry` | no | Bounded corrective resume settings. |
-
-Contract variants:
+Result:
 
 ```json
-{ "jsonSchema": { "type": "object" } }
+{"valid":true,"missing":[],"contractSha256":"sha256:..."}
 ```
+
+`policy.register` params:
 
 ```json
 {
-  "shape": {
-    "firstLineEnum": ["PASS", "FAIL"],
-    "requiredSections": ["Findings"],
-    "requiredAttestations": ["I inspected the diff."],
-    "evidenceHeuristic": true
+  "name": "delegate/delegate-report@1",
+  "spec": {
+    "shape": {
+      "requiredSections": ["Findings"]
+    }
   }
 }
 ```
 
-```json
-{ "named": "delegate/delegate-report@1" }
-```
-
-`jsonSchema` contracts validate the final assistant message parsed as JSON. If
-the final assistant message is not valid JSON, validation fails. The v1 schema
-dialect is JSON Schema Draft 2020-12. Schema failures in `ContractStamp.missing`
-and `{{missing}}` are leaf violations formatted as `<json-pointer>: <message>`.
-The root uses the empty RFC 6901 pointer, so a root-level violation renders as
-`: <message>`; `/` instead addresses an empty-named property. Entries are sorted
-and de-duplicated. They include at most 20 entries, with a final
-`+N more schema violations` summary line when needed (not a violation location).
-Parser and schema-compilation failures are single `json: ...` and
-`jsonSchema: ...` entries.
-Individual messages and rendered retry violation text are bounded to keep retry
-prompts safe.
-
-`retry.max` MUST be `0` or `1`. `retry.template` MUST include the literal token
-`{{missing}}` when `max == 1`. A corrective retry template MUST instruct the
-backend to emit the corrected report only and make no further changes. The
-corrective retry turn MUST run with `write:false`, even if the original session
-or turn allowed writes.
-
-No policy means no-op passthrough and no contract stamp. A disabled policy is a
-client-level convention; if a client sends no policy, agentbus does not stamp.
-
-### Registry semantics
-
-Inline contracts are the primary v1 path. The registry is off the critical path.
-`policy.register` is an optional cache and convenience mechanism.
-
-Names MUST be either:
-
-- namespaced version names: `<client>/<name>@<ver>`
-- content-addressed names: `sha256:<hash>`
-
-Specs are immutable per name. A changed spec MUST ship under a new versioned
-name such as `@2`. Re-registering a different spec under an existing name MUST
-fail with `name_conflict`. Re-registering an identical spec under the same name
-MUST be idempotent.
-
-Named references are resolved to concrete specs at submit time. The resolved
-spec MUST be persisted in the job record. Daemon restarts and reaper-side
-validation MUST NOT depend on resolving a name again later.
-
-`agentbus validate --contract` MUST accept spec files. Names are best-effort for
-that command and are resolvable only if registered in the current daemon
-lifetime.
-
-### Shape-spec validator semantics
-
-The shape validator runs over raw result text after ANSI escape stripping. It
-performs no other normalization.
-
-Fenced code blocks are excluded entirely from section matching and attestation
-matching. Fence detection follows CommonMark fence pairing for backtick and
-tilde fences:
-
-- An opening fence line begins with zero to three spaces, followed by a run of
-  at least three backticks or at least three tildes.
-- The opening fence character and run length are remembered.
-- A closing fence line begins with zero to three spaces, uses the same fence
-  character, and has a run length greater than or equal to the opening run.
-- Lines indented four or more spaces do not open or close fences.
-- Text after the opening fence run is treated as an info string and is ignored
-  by the validator.
-
-Text inside a fence MUST NOT satisfy a required section, attestation, or
-evidence pattern except for the fenced-command evidence pattern defined below.
-
-Section matching:
-
-- Matching is case-insensitive.
-- Required sections match Markdown headings from `#` through `####`.
-- Required sections also match line-initial `Label:` labels.
-- Duplicates are allowed; the first matching heading or label wins.
-- An empty section satisfies presence. Content quality is out of scope.
-
-Attestation matching:
-
-- Each required attestation string MUST appear outside fenced code blocks.
-- Matching is on the ANSI-stripped raw text with no other normalization.
-
-`firstLineEnum`:
-
-- The first line of ANSI-stripped raw text MUST exactly equal one of the listed
-  strings.
-- No trimming is performed beyond removing the line terminator.
-
-`evidenceHeuristic`:
-
-When `evidenceHeuristic` is true, evidence is required only when the message
-claims findings. In v1, "claims findings" is a structural trigger: after ANSI
-stripping and fenced-code exclusion, the message has a `Findings` section or
-`Findings:` label whose body contains at least one non-empty line other than
-`none`, `no findings`, `n/a`, or `not applicable`, matched case-insensitively.
-The frozen v1 evidence pattern list is:
-
-| Pattern | Definition |
-| --- | --- |
-| `path:line` occurrence | A non-whitespace path-like token followed by `:` and a decimal line number, for example `engine/run.go:42`. |
-| fenced command with adjacent exit-code mention | A fenced command block with an adjacent line before or after the fence mentioning an exit code, such as `exit code 0` or `exit 1`. |
-| diff hunk header | A unified diff hunk header beginning with `@@`. |
-
-The validator MUST NOT infer correctness from these patterns. They only satisfy
-the structural evidence requirement.
-
-### Engine validation behavior
-
-For a turn with policy, the engine behavior is:
-
-1. Prepend `policy.prologue` to the backend prompt when present.
-2. Run the turn.
-3. Persist the complete final assistant message to the spilled result file.
-4. Validate the contract, if present, against the complete persisted final
-   result. The engine MUST NOT validate against wire-truncated `turn.event`
-   text.
-5. If validation fails and `retry.max == 1`, run one corrective resume with the
-   rendered retry template.
-6. Force the corrective resume to `write:false`.
-7. Persist the retry final message and validate it.
-8. Stamp the terminal result.
-
-If validation is skipped because no usable final result exists, the stamp status
-MUST be `skipped` with one of the documented skipped reasons.
-
-TurnPolicy records structural compliance only. It does not verify correctness,
-task completion, repository cleanliness, or instruction-following.
-
-### Contract stamp
-
-`turn.result.contract` and `job.result.contract`, when present, use this shape:
+Result:
 
 ```json
-{
-  "status": "retried",
-  "missing": [],
-  "reason": "initial response missed required section; retry satisfied contract",
-  "contractName": "delegate/delegate-report@1",
-  "contractSha256": "sha256:7f83b1657ff1fc53b92dc18148a1d65dfa1352f3aabbccddeeff001122334455",
-  "attempts": 2,
-  "retryUsed": true,
-  "validatedAt": "2026-07-09T12:00:00Z"
-}
+{"name":"delegate/delegate-report@1","contractSha256":"sha256:...","registered":true}
 ```
 
-Stamp fields:
+Registered policy names are daemon-local and immutable. Re-registering the same
+name with an identical spec is idempotent. Re-registering the same name with a
+different spec returns `name_conflict`.
 
-| Field | Required | Meaning |
+## Admission admin CLI
+
+Admission admin commands are not JSON-RPC socket methods. They are local CLI
+operations under:
+
+```text
+agentbus admission <inspect|recover|reset-empty-root|seal|clear-fail-stop>
+```
+
+Daemonless admin is intentionally outside the socket protocol.
+
+Admin commands:
+
+| Command | Mutates | Purpose |
 | --- | --- | --- |
-| `status` | yes | Compliance status. |
-| `missing` | yes | Machine-readable missing structural requirements. Empty when none. |
-| `reason` | yes | Human-readable reason or empty string. |
-| `contractName` | no | Name used by the client, when any. |
-| `contractSha256` | yes when validation ran | SHA-256 identifier of the resolved contract spec. |
-| `attempts` | yes | Number of backend attempts whose final results were considered. |
-| `retryUsed` | yes | Whether corrective retry ran. |
-| `validatedAt` | yes when validation ran | RFC 3339 timestamp. |
+| `inspect --state-root <path> [--json]` | no | Reads activation metadata, contract version, generation, root counts, domain UUID, sealed state, successor fields, anchor phase, and fail-stop fields. |
+| `recover --state-root <path> [--json]` | yes | Runs recovery-only strict admission without opening the protocol listener; reconciles durable nonterminal obligations. |
+| `reset-empty-root --state-root <path> [--json]` | yes | Reinitializes only an empty root. It refuses non-empty jobs, bindings, tombstones, launch records, or recovery obligations. |
+| `seal --state-root <path> --new-state-root <path> --start-new-authority-domain --acknowledge-replay-history-reset [--json]` | yes | Permanently seals the old root and initializes or verifies a successor authority domain. |
+| `clear-fail-stop --state-root <path> --acknowledge-unsafe-diagnosis [--json]` | yes | Clears a persisted fail-stop only after explicit operator acknowledgement. |
 
-Status enum:
+`inspect` returns `RootInspection`. `seal` returns `SealReport`.
+`clear-fail-stop` returns `ClearFailStopReport`. `recover` returns
+`AdmissionRecoveryReport`.
 
-| Status | Meaning |
-| --- | --- |
-| `compliant` | First attempt satisfied the contract. |
-| `retried` | First attempt failed; one corrective retry satisfied the contract. |
-| `noncompliant` | Contract remained invalid after allowed attempts. |
-| `skipped` | Validation could not run for an allowed skipped reason. |
-| `disabled` | Client explicitly disabled enforcement and chose to stamp that fact. |
+## Startup, autostart, and shutdown
 
-Skipped reasons:
+Production `agentbus serve` starts strict identified admission. Unsupported
+strict runtime support fails closed at startup.
 
-| Reason |
-| --- |
-| `timeout` |
-| `interrupt` |
-| `no_final_message` |
-| `backend_error` |
-| `result_unavailable` |
+Autostart is a client and launcher behavior, not a JSON-RPC method. The Go
+client connects to the configured socket, sends hello, and only autostarts when
+the connection error is autostartable. Protocol mismatch and bad-token hello
+failures do not trigger autostart. During autostart, the client serializes
+state-root startup attempts with an autostart lock, rechecks the daemon after
+acquiring the lock, then launches `agentbus serve --foreground` if needed.
+
+The launcher uses a private readiness pipe. Its `protocolVersion` is the
+launcher-readiness protocol version, currently `1`; it is not the JSON-RPC wire
+protocol version. A child reports either:
+
+```json
+{"ready":{"protocolVersion":1,"pid":1234,"canonicalStateRoot":"/...","socketPath":"/.../agentbus.sock"}}
+```
+
+or:
+
+```json
+{"failed":{"code":"strict admission support unavailable","message":"..."}}
+```
+
+Readiness failures surface to CLI/client code as `daemonlaunch.StartupError`
+with a typed `Kind`, `Code`, `Message`, optional stderr tail, and optional
+canonical state-root mismatch fields. These are not JSON-RPC error responses.
+If a launched daemon reports `agentbus daemon already listening`, the launcher
+verifies the existing socket with hello and converges to that daemon instead of
+starting another one.
+
+Graceful shutdown first marks admission closing. New `job.submit` requests on a
+connection that reaches the handler during that phase receive:
+
+```json
+{"jsonrpc":"2.0","id":"submit","error":{"code":-32000,"message":"admission authority is shutting down","data":{"code":"capability_missing","admissionCause":"admission_closing"}}}
+```
+
+The server then closes the listener, removes its owned socket path, cancels
+authority-owned jobs, waits for active work and result publication to drain,
+shuts down the coordinator, closes runtime and repository resources, removes
+its owned PID file, and stops the serve context. Connections already accepted
+may drain during this sequence; fail-stop closes accepted connections through
+the served safety latch.
+
+If graceful shutdown exceeds its deadline, the CLI reports exit code `13`.
+Recovery on the next startup is fail-closed and driven by the durable authority
+records.
+
+## Examples
+
+### Hello
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":"hello","method":"protocol.hello","params":{"clientProtocolVersion":2,"token":"0123456789abcdef"}}
+```
+
+Response:
+
+```json
+{"jsonrpc":"2.0","id":"hello","result":{"protocolVersion":2,"backends":["codex"],"backendMetadata":[{"backend":"codex","models":["gpt-5"],"efforts":["low","medium","high"]}],"capabilities":{"policy.shape":true,"policy.jsonSchema":true,"policy.named":true,"policy.retry":true,"nativeStructuredOutput.codex":false,"nativeStructuredOutput.claude":false,"models.discovery":true,"models.reported":true,"admission.strictContainment":true}}}
+```
+
+### Submit accept
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":"submit-1","method":"job.submit","params":{"workspaceKey":"workspace-a","requestId":"request-1","taskSpec":{"backend":"codex","cwd":"/home/me/project","write":false,"model":"gpt-5","effort":"medium","prompt":"Run the requested task.","tags":{"suite":"protocol"},"timeoutMs":1800000}}}
+```
+
+Response:
+
+```json
+{"jsonrpc":"2.0","id":"submit-1","result":{"jobId":"job_20260724T120000000000000Z_000001","state":"queued"}}
+```
+
+### Submit deduplicated replay
+
+Request:
+
+```json
+{"jsonrpc":"2.0","id":"submit-replay","method":"job.submit","params":{"workspaceKey":"workspace-a","requestId":"request-1","taskSpec":{"backend":"codex","cwd":"/home/me/project","write":false,"model":"gpt-5","effort":"medium","prompt":"Run the requested task.","tags":{"suite":"protocol"},"timeoutMs":1800000}}}
+```
+
+Response:
+
+```json
+{"jsonrpc":"2.0","id":"submit-replay","result":{"jobId":"job_20260724T120000000000000Z_000001","state":"completed","deduplicated":true}}
+```
+
+### Replay conflict
+
+```json
+{"jsonrpc":"2.0","id":"submit-conflict","error":{"code":-32000,"message":"task_identity.value: does not match raw taskSpec","data":{"code":"invalid_task_spec","admissionCause":"replay_conflict"}}}
+```
+
+### Unknown job
+
+```json
+{"jsonrpc":"2.0","id":"status-missing","error":{"code":-32000,"message":"job is not known","data":{"code":"unknown_job","jobId":"job_missing"}}}
+```
+
+### Root fail-stopped
+
+```json
+{"jsonrpc":"2.0","id":"submit-failstop","error":{"code":-32000,"message":"served safety fail-stop: authority fail-stopped: persisted unsafe stop","data":{"code":"backend_unavailable","admissionCause":"root_fail_stopped"}}}
+```
+
+### Admission closing
+
+```json
+{"jsonrpc":"2.0","id":"submit-closing","error":{"code":-32000,"message":"admission authority is shutting down","data":{"code":"capability_missing","admissionCause":"admission_closing"}}}
+```

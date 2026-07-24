@@ -986,7 +986,7 @@ func protocolCommandError(errOut io.Writer, operation string, err error) int {
 }
 
 func unknownJobCommandError(errOut io.Writer, operation, jobID string) int {
-	fmt.Fprintf(errOut, "agentbus: %s failed (code=%s jobId=%s): job is not known\n", operation, protocol.ErrorInvalidTaskSpec, jobID)
+	fmt.Fprintf(errOut, "agentbus: %s failed (code=%s jobId=%s): job is not known\n", operation, protocol.ErrorUnknownJob, jobID)
 	return cliExitUnknownJob
 }
 
@@ -1003,7 +1003,7 @@ func cliExitCodeForProtocolError(err *protocol.RPCError) int {
 	case protocol.AdmissionRejectUnavailableNativeRuntime:
 		return cliExitDaemonStartupFailure
 	}
-	if data.JobID != "" && data.Code == protocol.ErrorInvalidTaskSpec && strings.Contains(err.Object.Message, "job is not known") {
+	if data.JobID != "" && data.Code == protocol.ErrorUnknownJob {
 		return cliExitUnknownJob
 	}
 	return 1
@@ -1058,7 +1058,7 @@ JSON shapes:
   validate: {"valid":true,"missing":[],"contractName":"...","contractSha256":"sha256:..."}
 
 Exit codes for single-job status/result/cancel:
-  completed=0, running/non-terminal=2, completed_noncompliant=3, failed=4, timed_out=5, interrupted=6, canceled=7, reaped=8, quarantined=9, unknown-job=10, daemon-startup-failure=11, fail-stop=12
+  completed=0, running/non-terminal=2, completed_noncompliant=3, failed=4, timed_out=5, interrupted=6, canceled=7, reaped=8, quarantined=9, unknown-job=10, daemon-startup-failure=11, fail-stop=12, shutdown-deadline=13
 
 Status/result/cancel are protocol-v2 daemon clients. Offline authority diagnosis stays under admission inspect/recover/admin commands.
 

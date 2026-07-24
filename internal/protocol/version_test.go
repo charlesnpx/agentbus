@@ -13,6 +13,7 @@ func TestVersionAndStrictRejectionCauseConstants(t *testing.T) {
 		got  string
 		want string
 	}{
+		"ErrorUnknownJob":                              {got: ErrorUnknownJob, want: "unknown_job"},
 		"AdmissionRejectMissingIdentity":               {got: AdmissionRejectMissingIdentity, want: "missing_identity"},
 		"AdmissionRejectReplayConflict":                {got: AdmissionRejectReplayConflict, want: "replay_conflict"},
 		"AdmissionRejectRequestExpired":                {got: AdmissionRejectRequestExpired, want: "request_expired"},

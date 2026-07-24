@@ -35,6 +35,7 @@ const (
 	ErrorQuarantined        = "quarantined"
 	ErrorResultTooLarge     = "result_too_large"
 	ErrorInvalidTaskSpec    = "invalid_task_spec"
+	ErrorUnknownJob         = "unknown_job"
 )
 
 const (

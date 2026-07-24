@@ -1566,6 +1566,17 @@ func TestJobSubmitWithoutIdentityRejectedMissingIdentity(t *testing.T) {
 	}
 }
 
+func TestUnknownAuthorityJobReturnsStableUnknownJobCode(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	jobID := "job_missing"
+
+	assertJobHandlerError(t, server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{JobID: jobID})), protocol.ErrorUnknownJob, "", jobID)
+	assertJobHandlerError(t, server.handleJobResult(mustMarshal(t, protocol.JobResultParams{JobID: jobID})), protocol.ErrorUnknownJob, "", jobID)
+	assertJobHandlerError(t, server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: jobID})), protocol.ErrorUnknownJob, "", jobID)
+}
+
 func TestStrictRequestedUnavailableRuntimeFailsStartupWithSupportDiagnostic(t *testing.T) {
 	t.Parallel()
 	server, err := New(Config{
@@ -2557,8 +2568,8 @@ func TestIdentifiedFencedJobReadsAuthorityOnlyWithoutJSONFallback(t *testing.T) 
 	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_json", "fake", nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	assertJobHandlerError(t, server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{JobID: legacyID})), protocol.ErrorInvalidTaskSpec, "", legacyID)
-	assertJobHandlerError(t, server.handleJobResult(mustMarshal(t, protocol.JobResultParams{JobID: legacyID})), protocol.ErrorInvalidTaskSpec, "", legacyID)
+	assertJobHandlerError(t, server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{JobID: legacyID})), protocol.ErrorUnknownJob, "", legacyID)
+	assertJobHandlerError(t, server.handleJobResult(mustMarshal(t, protocol.JobResultParams{JobID: legacyID})), protocol.ErrorUnknownJob, "", legacyID)
 
 	all := jobStatusViaHandler(t, server, protocol.JobStatusParams{All: true})
 	byID := map[string]protocol.JobStatus{}
@@ -3041,7 +3052,7 @@ func TestJobCancelUnknownWhenAuthorityCleanlyDisclaims(t *testing.T) {
 		t.Fatalf("authority projection ok=%v err=%+v, want clean disclaimer", ok, errObj)
 	}
 
-	assertJobHandlerError(t, server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: legacyID})), protocol.ErrorInvalidTaskSpec, "", legacyID)
+	assertJobHandlerError(t, server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: legacyID})), protocol.ErrorUnknownJob, "", legacyID)
 	record, err := store.Load(legacyID)
 	if err != nil {
 		t.Fatal(err)
@@ -5299,8 +5310,8 @@ func TestFinalizeCompletedSalvagesOrphanedJob(t *testing.T) {
 	if record.State != engine.StateCompleted || record.Result == nil || !record.LateFinalization || len(record.Warnings) != 0 {
 		t.Fatalf("salvaged record = %+v", record)
 	}
-	assertJobHandlerError(t, server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{JobID: jobID})), protocol.ErrorInvalidTaskSpec, "", jobID)
-	assertJobHandlerError(t, server.handleJobResult(mustMarshal(t, protocol.JobResultParams{JobID: jobID})), protocol.ErrorInvalidTaskSpec, "", jobID)
+	assertJobHandlerError(t, server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{JobID: jobID})), protocol.ErrorUnknownJob, "", jobID)
+	assertJobHandlerError(t, server.handleJobResult(mustMarshal(t, protocol.JobResultParams{JobID: jobID})), protocol.ErrorUnknownJob, "", jobID)
 }
 
 func TestFinalizeCompletedSalvagesReapedJobOnlyWithAuthoritativeCompletion(t *testing.T) {
