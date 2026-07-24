@@ -3147,7 +3147,7 @@ func TestShutdownCancelsPendingAuthorityWorkBeforeClose(t *testing.T) {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
+	if err := server.shutdown(shutdownCtx); err != nil {
 		t.Fatalf("Shutdown error = %v", err)
 	}
 	record := loadAuthoritySafetyRecordFromRepository(t, repo, accepted.Record.JobID.String())
@@ -3176,7 +3176,7 @@ func TestShutdownDeadlineExceededLeavesForcedRecoveryPath(t *testing.T) {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
-	err := server.Shutdown(shutdownCtx)
+	err := server.shutdown(shutdownCtx)
 	if !errors.Is(err, ErrShutdownDeadlineExceeded) {
 		t.Fatalf("Shutdown error = %v, want ErrShutdownDeadlineExceeded", err)
 	}
@@ -3196,6 +3196,29 @@ func (c blockingCloser) Close() error {
 	defer close(c.returned)
 	<-c.release
 	return nil
+}
+
+type notifyCloser struct {
+	once   sync.Once
+	closed chan struct{}
+}
+
+func newNotifyCloser() *notifyCloser {
+	return &notifyCloser{closed: make(chan struct{})}
+}
+
+func (c *notifyCloser) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *notifyCloser) waitClosed(t *testing.T) {
+	t.Helper()
+	select {
+	case <-c.closed:
+	case <-time.After(time.Second):
+		t.Fatal("admission closer did not close")
+	}
 }
 
 func TestShutdownAdmissionCloseDeadlineExceededReturnsTypedError(t *testing.T) {
@@ -3227,7 +3250,7 @@ func TestShutdownAdmissionCloseDeadlineExceededReturnsTypedError(t *testing.T) {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	err := server.Shutdown(shutdownCtx)
+	err := server.shutdown(shutdownCtx)
 	elapsed := time.Since(start)
 	if !errors.Is(err, ErrShutdownDeadlineExceeded) {
 		t.Fatalf("Shutdown error = %v, want ErrShutdownDeadlineExceeded", err)
@@ -3250,6 +3273,43 @@ func TestShutdownAdmissionCloseDeadlineExceededReturnsTypedError(t *testing.T) {
 	releaseOnce.Do(func() { close(releaseClose) })
 }
 
+func TestShutdownDeadlineDuringPIDTeardownReturnsTypedErrorAndRetainsPID(t *testing.T) {
+	t.Parallel()
+	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	configureTestAdmissionRuntime(t, server, newAdmissionFakeLaunchCustodian(t), true)
+	_, serveDone, _ := startTestServerWithBlockingListener(t, server)
+	pidPath := filepath.Join(root, "agentbus.pid")
+	ownPID := strconv.Itoa(os.Getpid())
+	if err := os.WriteFile(pidPath, []byte(ownPID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	server.beforePIDFileQuarantineHook = func() {
+		<-shutdownCtx.Done()
+	}
+	err := server.Shutdown(shutdownCtx)
+	if !errors.Is(err, ErrShutdownDeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want ErrShutdownDeadlineExceeded", err)
+	}
+	raw, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(raw)) != ownPID {
+		t.Fatalf("pid file after pid teardown deadline = %q, want owned pid retained", raw)
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve after Shutdown = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not stop after shutdown deadline")
+	}
+}
+
 func TestConcurrentShutdownWaitingCallerHonorsContext(t *testing.T) {
 	t.Parallel()
 	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
@@ -3257,12 +3317,14 @@ func TestConcurrentShutdownWaitingCallerHonorsContext(t *testing.T) {
 	var releaseOnce sync.Once
 	closeStarted := make(chan struct{})
 	closeReturned := make(chan struct{})
-	server.admissionClose = blockingCloser{
+	configureServeAdmissionCloser(t, server, newAdmissionFakeLaunchCustodian(t), memory.NewRepository(), authority.NewAnchorStore(), blockingCloser{
 		started:  closeStarted,
 		release:  releaseClose,
 		returned: closeReturned,
-	}
+	})
+	cancelServe, serveDone, _ := startTestServerWithBlockingListener(t, server)
 	t.Cleanup(func() {
+		cancelServe()
 		releaseOnce.Do(func() { close(releaseClose) })
 		select {
 		case <-closeReturned:
@@ -3305,8 +3367,184 @@ func TestConcurrentShutdownWaitingCallerHonorsContext(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first Shutdown did not complete after close release")
 	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve after Shutdown = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not stop after shutdown")
+	}
+	if err := server.Shutdown(context.Background()); !errors.Is(err, ErrShutdownNotServing) {
+		t.Fatalf("terminal Shutdown error = %v, want ErrShutdownNotServing", err)
+	}
+}
+
+func TestShutdownLateWaiterReceivesServeGenerationResultAcrossReserve(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	releaseFirstClose := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	firstCloseStarted := make(chan struct{})
+	firstCloseReturned := make(chan struct{})
+	configureServeAdmissionCloser(t, server, newAdmissionFakeLaunchCustodian(t), memory.NewRepository(), authority.NewAnchorStore(), blockingCloser{
+		started:  firstCloseStarted,
+		release:  releaseFirstClose,
+		returned: firstCloseReturned,
+	})
+	cancelFirstServe, firstServeDone, _ := startTestServerWithBlockingListener(t, server)
+	t.Cleanup(func() {
+		cancelFirstServe()
+		releaseFirstOnce.Do(func() { close(releaseFirstClose) })
+		select {
+		case <-firstCloseReturned:
+		case <-time.After(time.Second):
+			t.Fatal("first admission close did not return after release")
+		}
+	})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- server.Shutdown(context.Background())
+	}()
+	select {
+	case <-firstCloseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first shutdown did not enter admission close")
+	}
+
+	lateDone := make(chan error, 1)
+	go func() {
+		lateDone <- server.Shutdown(context.Background())
+	}()
+	select {
+	case err := <-lateDone:
+		t.Fatalf("late Shutdown returned before generation result was available: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	cancelFirstServe()
+	select {
+	case err := <-firstServeDone:
+		if err != nil {
+			t.Fatalf("first Serve after external cancel = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Serve did not stop after external cancel")
+	}
+
+	releaseSecondClose := make(chan struct{})
+	var releaseSecondOnce sync.Once
+	secondCloseStarted := make(chan struct{})
+	secondCloseReturned := make(chan struct{})
+	configureServeAdmissionCloser(t, server, newAdmissionFakeLaunchCustodian(t), memory.NewRepository(), authority.NewAnchorStore(), blockingCloser{
+		started:  secondCloseStarted,
+		release:  releaseSecondClose,
+		returned: secondCloseReturned,
+	})
+	cancelSecondServe, secondServeDone, _ := startTestServerWithBlockingListener(t, server)
+	t.Cleanup(func() {
+		cancelSecondServe()
+		releaseSecondOnce.Do(func() { close(releaseSecondClose) })
+		select {
+		case <-secondCloseReturned:
+		case <-time.After(time.Second):
+			t.Fatal("second admission close did not return after release")
+		}
+	})
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- server.Shutdown(context.Background())
+	}()
+	select {
+	case <-secondCloseStarted:
+		t.Fatal("second generation shutdown overlapped first generation teardown")
+	case <-time.After(40 * time.Millisecond):
+	}
+
+	releaseFirstOnce.Do(func() { close(releaseFirstClose) })
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first Shutdown error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Shutdown did not complete after close release")
+	}
+	select {
+	case err := <-lateDone:
+		if err != nil {
+			t.Fatalf("late Shutdown error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late Shutdown did not receive generation result")
+	}
+	select {
+	case <-secondCloseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second generation shutdown did not enter teardown after first completed")
+	}
+	releaseSecondOnce.Do(func() { close(releaseSecondClose) })
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second Shutdown error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second Shutdown did not complete after close release")
+	}
+	select {
+	case err := <-secondServeDone:
+		if err != nil {
+			t.Fatalf("second Serve after Shutdown = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second Serve did not stop after shutdown")
+	}
+}
+
+func TestShutdownStateScopedToSequentialServeGeneration(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	if err := server.Shutdown(context.Background()); !errors.Is(err, ErrShutdownNotServing) {
+		t.Fatalf("pre-Serve Shutdown error = %v, want ErrShutdownNotServing", err)
+	}
+
+	firstClose := newNotifyCloser()
+	configureServeAdmissionCloser(t, server, newAdmissionFakeLaunchCustodian(t), memory.NewRepository(), authority.NewAnchorStore(), firstClose)
+	_, firstDone, firstListener := startTestServerWithBlockingListener(t, server)
 	if err := server.Shutdown(context.Background()); err != nil {
-		t.Fatalf("terminal Shutdown error = %v, want first result", err)
+		t.Fatalf("first Shutdown error = %v", err)
+	}
+	firstListener.waitClosed(t)
+	firstClose.waitClosed(t)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first Serve after Shutdown = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Serve did not stop after shutdown")
+	}
+	if err := server.Shutdown(context.Background()); !errors.Is(err, ErrShutdownNotServing) {
+		t.Fatalf("between-Serve Shutdown error = %v, want ErrShutdownNotServing", err)
+	}
+
+	secondClose := newNotifyCloser()
+	configureServeAdmissionCloser(t, server, newAdmissionFakeLaunchCustodian(t), memory.NewRepository(), authority.NewAnchorStore(), secondClose)
+	_, secondDone, secondListener := startTestServerWithBlockingListener(t, server)
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second Shutdown error = %v", err)
+	}
+	secondListener.waitClosed(t)
+	secondClose.waitClosed(t)
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second Serve after Shutdown = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second Serve did not stop after shutdown")
 	}
 }
 
@@ -3317,7 +3555,9 @@ func TestShutdownRemovesOnlyOwnedPIDFile(t *testing.T) {
 	if err := os.WriteFile(pidPath, []byte("999999\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	server.removeOwnedPIDFile("test mismatch")
+	if err := server.removeOwnedPIDFile(context.Background(), "test mismatch"); err != nil {
+		t.Fatalf("remove mismatched pid file error = %v", err)
+	}
 	raw, err := os.ReadFile(pidPath)
 	if err != nil {
 		t.Fatal(err)
@@ -3328,7 +3568,9 @@ func TestShutdownRemovesOnlyOwnedPIDFile(t *testing.T) {
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	server.removeOwnedPIDFile("test owner")
+	if err := server.removeOwnedPIDFile(context.Background(), "test owner"); err != nil {
+		t.Fatalf("remove owned pid file error = %v", err)
+	}
 	if _, err := os.Stat(pidPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("pid file stat after owner removal = %v, want not exist", err)
 	}
@@ -3352,7 +3594,7 @@ func TestShutdownPreservesReplacementPIDFile(t *testing.T) {
 		}
 	}
 
-	if err := server.Shutdown(context.Background()); err != nil {
+	if err := server.shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown error = %v", err)
 	}
 	raw, err := os.ReadFile(pidPath)
@@ -4655,6 +4897,7 @@ func startTestServerWithBlockingListener(t *testing.T, server *Server) (context.
 	case <-time.After(5 * time.Second):
 		t.Fatal("blocking listener did not become ready")
 	}
+	waitForServeLifecycle(t, server, listener, done)
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -4664,6 +4907,26 @@ func startTestServerWithBlockingListener(t *testing.T, server *Server) (context.
 		}
 	})
 	return cancel, done, listener
+}
+
+func waitForServeLifecycle(t *testing.T, server *Server, listener net.Listener, done <-chan error) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		server.serveStateMu.Lock()
+		ready := server.serveListener == listener
+		server.serveStateMu.Unlock()
+		if ready {
+			return
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("server exited before lifecycle was ready: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("server lifecycle was not registered")
 }
 
 func stopTestServer(t *testing.T, h testServer) {
@@ -4832,14 +5095,20 @@ func configureTestAdmissionRuntime(t *testing.T, server *Server, launcher *admis
 
 func enableTestAdmissionWithAuthorityStore(t *testing.T, server *Server, launcher *admissionFakeLaunchCustodian, repo *memory.Repository, anchorStore *authority.AnchorStore) {
 	t.Helper()
+	configureServeAdmissionCloser(t, server, launcher, repo, anchorStore, io.NopCloser(bytes.NewReader(nil)))
+	enableTestAdmission(t, server, launcher)
+}
+
+func configureServeAdmissionCloser(t *testing.T, server *Server, launcher *admissionFakeLaunchCustodian, repo *memory.Repository, anchorStore *authority.AnchorStore, closer io.Closer) {
+	t.Helper()
 	server.admissionBootstrapperFactory = func(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
 		bootstrapper, err := authority.NewBootstrapper(repo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		return bootstrapper, repo, io.NopCloser(bytes.NewReader(nil)), nil
+		return bootstrapper, repo, closer, nil
 	}
-	enableTestAdmission(t, server, launcher)
+	configureTestAdmissionRuntime(t, server, launcher, true)
 }
 
 func newPriorBootAuthorityWork(t *testing.T, repo *memory.Repository, anchorStore *authority.AnchorStore, launcher *admissionFakeLaunchCustodian, name string) (*authority.Ready, authority.AcceptResult) {

@@ -43,6 +43,10 @@ var ErrDaemonAlreadyListening = errors.New("agentbus daemon already listening")
 
 var ErrShutdownDeadlineExceeded = errors.New("agentbus graceful shutdown deadline exceeded")
 
+var ErrShutdownNotServing = errors.New("agentbus daemon is not serving")
+
+var ErrShutdownPIDTeardownFailed = errors.New("agentbus graceful shutdown pid teardown failed")
+
 type DaemonAlreadyListeningError struct {
 	SocketPath string
 }
@@ -160,6 +164,13 @@ type admissionOwnedWorkChecker interface {
 	HasOwnedWork(context.Context) (bool, error)
 }
 
+type serveShutdownState struct {
+	generation uint64
+	done       chan struct{}
+	err        error
+	complete   bool
+}
+
 // Server serves the protocol v1 socket API over engine backends.
 type Server struct {
 	stateRoot                   string
@@ -220,15 +231,14 @@ type Server struct {
 	admissionClose               io.Closer
 	admissionBootstrapperFactory admissionBootstrapperFactory
 
-	serveStateMu     sync.Mutex
-	serveListener    net.Listener
-	serveSocket      socketFileIdentity
-	serveCancel      context.CancelFunc
-	serveGeneration  uint64
-	shutdownMu       sync.Mutex
-	shutdownDone     chan struct{}
-	shutdownErr      error
-	shutdownComplete bool
+	serveStateMu    sync.Mutex
+	serveListener   net.Listener
+	serveSocket     socketFileIdentity
+	serveCancel     context.CancelFunc
+	serveGeneration uint64
+	shutdownMu      sync.Mutex
+	shutdownRunMu   sync.Mutex
+	shutdownState   *serveShutdownState
 
 	mu                 sync.Mutex
 	stores             map[string]*engine.Store
@@ -598,6 +608,8 @@ func normalizeShutdownTimeout(timeout time.Duration) time.Duration {
 }
 
 func (s *Server) registerServeLifecycle(ln net.Listener, socketIdentity socketFileIdentity, cancel context.CancelFunc) uint64 {
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
 	s.serveStateMu.Lock()
 	defer s.serveStateMu.Unlock()
 	s.serveGeneration++
@@ -605,18 +617,25 @@ func (s *Server) registerServeLifecycle(ln net.Listener, socketIdentity socketFi
 	s.serveListener = ln
 	s.serveSocket = socketIdentity
 	s.serveCancel = cancel
+	s.shutdownState = &serveShutdownState{generation: generation}
 	return generation
 }
 
 func (s *Server) clearServeLifecycle(generation uint64) {
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
 	s.serveStateMu.Lock()
-	defer s.serveStateMu.Unlock()
 	if s.serveGeneration != generation {
+		s.serveStateMu.Unlock()
 		return
 	}
 	s.serveListener = nil
 	s.serveSocket = socketFileIdentity{}
 	s.serveCancel = nil
+	s.serveStateMu.Unlock()
+	if s.shutdownState != nil && s.shutdownState.generation == generation && (s.shutdownState.done == nil || s.shutdownState.complete) {
+		s.shutdownState = nil
+	}
 }
 
 func (s *Server) serveLifecycleSnapshot() (net.Listener, socketFileIdentity, context.CancelFunc) {
@@ -636,45 +655,112 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	s.shutdownMu.Lock()
-	if s.shutdownDone != nil {
-		done := s.shutdownDone
-		if s.shutdownComplete {
-			err := s.shutdownErr
-			s.shutdownMu.Unlock()
+	for {
+		state, done, run, err := s.beginShutdownState()
+		if err != nil {
 			return err
 		}
+		if run {
+			return s.runShutdownState(ctx, state, done)
+		}
+		retry, err := s.waitShutdownState(ctx, state, done)
+		if !retry {
+			return err
+		}
+	}
+}
+
+func (s *Server) beginShutdownState() (*serveShutdownState, chan struct{}, bool, error) {
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
+	state := s.shutdownState
+	if state == nil {
+		return nil, nil, false, ErrShutdownNotServing
+	}
+	if state.complete {
+		return state, nil, false, state.err
+	}
+	if state.done != nil {
+		return state, state.done, false, nil
+	}
+	done := make(chan struct{})
+	state.done = done
+	return state, done, true, nil
+}
+
+func (s *Server) waitShutdownState(ctx context.Context, state *serveShutdownState, done <-chan struct{}) (bool, error) {
+	select {
+	case <-done:
+		s.shutdownMu.Lock()
+		complete := state.complete
+		err := state.err
 		s.shutdownMu.Unlock()
+		if !complete {
+			return true, nil
+		}
+		return false, err
+	case <-ctx.Done():
 		select {
 		case <-done:
 			s.shutdownMu.Lock()
-			err := s.shutdownErr
+			complete := state.complete
+			err := state.err
 			s.shutdownMu.Unlock()
-			return err
-		case <-ctx.Done():
-			select {
-			case <-done:
-				s.shutdownMu.Lock()
-				err := s.shutdownErr
-				s.shutdownMu.Unlock()
-				return err
-			default:
+			if !complete {
+				return true, nil
 			}
-			return ctx.Err()
+			return false, err
+		default:
 		}
+		return false, ctx.Err()
 	}
-	done := make(chan struct{})
-	s.shutdownDone = done
-	s.shutdownMu.Unlock()
+}
 
+func (s *Server) runShutdownState(ctx context.Context, state *serveShutdownState, done chan struct{}) error {
+	if err := s.lockShutdownRunContext(ctx); err != nil {
+		s.shutdownMu.Lock()
+		if state.done == done && !state.complete {
+			state.done = nil
+			close(done)
+		}
+		s.shutdownMu.Unlock()
+		return err
+	}
 	err := s.shutdown(ctx)
-
+	s.shutdownRunMu.Unlock()
 	s.shutdownMu.Lock()
-	s.shutdownErr = err
-	s.shutdownComplete = true
+	state.err = err
+	state.complete = true
 	close(done)
+	if s.shutdownState == state && !s.serveGenerationServingLocked(state.generation) {
+		s.shutdownState = nil
+	}
 	s.shutdownMu.Unlock()
 	return err
+}
+
+func (s *Server) lockShutdownRunContext(ctx context.Context) error {
+	for {
+		if s.shutdownRunMu.TryLock() {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *Server) serveGenerationServingLocked(generation uint64) bool {
+	s.serveStateMu.Lock()
+	defer s.serveStateMu.Unlock()
+	return s.serveGeneration == generation && s.serveListener != nil
 }
 
 func (s *Server) shutdown(ctx context.Context) error {
@@ -695,8 +781,18 @@ func (s *Server) shutdown(ctx context.Context) error {
 		s.forceStopServe()
 		return shutdownError(err)
 	}
-	s.removeOwnedPIDFile("graceful shutdown")
+	if err := ctx.Err(); err != nil {
+		s.forceStopServe()
+		return shutdownError(err)
+	}
+	if err := s.removeOwnedPIDFile(ctx, "graceful shutdown"); err != nil {
+		s.forceStopServe()
+		return shutdownError(err)
+	}
 	s.forceStopServe()
+	if err := ctx.Err(); err != nil {
+		return shutdownError(err)
+	}
 	return nil
 }
 
@@ -1100,31 +1196,44 @@ func (s *Server) removeOwnedSocket(owned socketFileIdentity, phase string) {
 	log.Printf("agentbus daemon: removed owned socket during %s", phase)
 }
 
-func (s *Server) removeOwnedPIDFile(phase string) {
+func (s *Server) removeOwnedPIDFile(ctx context.Context, phase string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	pidPath := filepath.Join(s.stateRoot, "agentbus.pid")
 	raw, owned, err := readPIDFileNoFollow(pidPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("agentbus daemon: skipping pid removal during %s: read %s: %v", phase, pidPath, err)
+			return fmt.Errorf("%w: read %s: %w", ErrShutdownPIDTeardownFailed, pidPath, err)
 		}
-		return
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
 	if err != nil {
 		log.Printf("agentbus daemon: skipping pid removal during %s: invalid pid file %s", phase, pidPath)
-		return
+		return nil
 	}
 	if pid != os.Getpid() {
 		log.Printf("agentbus daemon: skipping pid removal during %s: %s belongs to pid %d", phase, pidPath, pid)
-		return
+		return nil
 	}
 	if s.beforePIDFileQuarantineHook != nil {
 		s.beforePIDFileQuarantineHook()
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	quarantineDir, quarantinePath, err := createPIDFileQuarantine(s.stateRoot)
 	if err != nil {
 		log.Printf("agentbus daemon: skipping pid removal during %s: create pid quarantine: %v", phase, err)
-		return
+		return fmt.Errorf("%w: create pid quarantine: %w", ErrShutdownPIDTeardownFailed, err)
 	}
 	cleanupQuarantineDir := true
 	defer func() {
@@ -1132,35 +1241,65 @@ func (s *Server) removeOwnedPIDFile(phase string) {
 			_ = os.Remove(quarantineDir)
 		}
 	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.Rename(pidPath, quarantinePath); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("agentbus daemon: skipping pid removal during %s: quarantine %s: %v", phase, pidPath, err)
+			return fmt.Errorf("%w: quarantine %s: %w", ErrShutdownPIDTeardownFailed, pidPath, err)
 		}
-		return
+		return nil
+	}
+	if err := abortQuarantinedPIDFileIfContextDone(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir); err != nil {
+		return err
 	}
 	quarantinedRaw, quarantined, err := readPIDFileNoFollow(quarantinePath)
 	if err != nil {
 		log.Printf("agentbus daemon: skipping pid removal during %s: validate quarantined pid %s: %v", phase, quarantinePath, err)
-		cleanupQuarantineDir = restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
-		return
+		cleanup, restoreErr := restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
+		cleanupQuarantineDir = cleanup
+		return errors.Join(
+			fmt.Errorf("%w: validate quarantined pid %s: %w", ErrShutdownPIDTeardownFailed, quarantinePath, err),
+			wrapPIDRestoreError(restoreErr),
+		)
+	}
+	if err := abortQuarantinedPIDFileIfContextDone(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir); err != nil {
+		return err
 	}
 	quarantinedPID, err := strconv.Atoi(strings.TrimSpace(string(quarantinedRaw)))
 	if err != nil {
 		log.Printf("agentbus daemon: skipping pid removal during %s: invalid quarantined pid file %s", phase, quarantinePath)
-		cleanupQuarantineDir = restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
-		return
+		cleanup, restoreErr := restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
+		cleanupQuarantineDir = cleanup
+		return wrapPIDRestoreError(restoreErr)
 	}
 	if quarantined != owned || quarantinedPID != os.Getpid() {
 		log.Printf("agentbus daemon: skipping pid removal during %s: replacement daemon owns %s", phase, pidPath)
-		cleanupQuarantineDir = restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
-		return
+		cleanup, restoreErr := restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
+		cleanupQuarantineDir = cleanup
+		return wrapPIDRestoreError(restoreErr)
+	}
+	if err := abortQuarantinedPIDFileIfContextDone(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir); err != nil {
+		return err
 	}
 	if err := os.Remove(quarantinePath); err != nil {
 		log.Printf("agentbus daemon: remove owned pid during %s: %v", phase, err)
-		cleanupQuarantineDir = false
-		return
+		cleanup, restoreErr := restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
+		cleanupQuarantineDir = cleanup
+		return errors.Join(
+			fmt.Errorf("%w: remove owned pid during %s: %w", ErrShutdownPIDTeardownFailed, phase, err),
+			wrapPIDRestoreError(restoreErr),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		if restoreErr := restoreOwnedPIDFileRaw(pidPath, quarantinedRaw, phase); restoreErr != nil {
+			return errors.Join(err, wrapPIDRestoreError(restoreErr))
+		}
+		return err
 	}
 	log.Printf("agentbus daemon: removed owned pid during %s", phase)
+	return nil
 }
 
 func readPIDFileNoFollow(path string) ([]byte, socketFileIdentity, error) {
@@ -1197,23 +1336,62 @@ func createPIDFileQuarantine(stateRoot string) (string, string, error) {
 	return "", "", fmt.Errorf("could not allocate unique pid quarantine path in %s", stateRoot)
 }
 
-func restoreQuarantinedPIDFile(pidPath, quarantinePath, phase string) bool {
+func abortQuarantinedPIDFileIfContextDone(ctx context.Context, pidPath, quarantinePath, phase string, cleanupQuarantineDir *bool) error {
+	if err := ctx.Err(); err != nil {
+		cleanup, restoreErr := restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
+		*cleanupQuarantineDir = cleanup
+		return errors.Join(err, wrapPIDRestoreError(restoreErr))
+	}
+	return nil
+}
+
+func restoreQuarantinedPIDFile(pidPath, quarantinePath, phase string) (bool, error) {
 	if err := os.Link(quarantinePath, pidPath); err == nil {
 		if removeErr := os.Remove(quarantinePath); removeErr != nil {
 			log.Printf("agentbus daemon: restored pid during %s but could not remove quarantine %s: %v", phase, quarantinePath, removeErr)
-			return false
+			return false, removeErr
 		}
-		return true
+		return true, nil
 	} else if errors.Is(err, os.ErrExist) {
 		if removeErr := os.Remove(quarantinePath); removeErr != nil {
 			log.Printf("agentbus daemon: canonical pid exists during %s and quarantine %s remains: %v", phase, quarantinePath, removeErr)
-			return false
+			return false, removeErr
 		}
-		return true
+		return true, nil
 	} else {
 		log.Printf("agentbus daemon: could not restore replacement pid during %s from %s to %s: %v", phase, quarantinePath, pidPath, err)
-		return false
+		return false, err
 	}
+}
+
+func restoreOwnedPIDFileRaw(pidPath string, raw []byte, phase string) error {
+	file, err := os.OpenFile(pidPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil
+		}
+		log.Printf("agentbus daemon: could not restore owned pid during %s to %s: %v", phase, pidPath, err)
+		return err
+	}
+	written, writeErr := file.Write(raw)
+	if writeErr == nil && written != len(raw) {
+		writeErr = io.ErrShortWrite
+	}
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		_ = os.Remove(pidPath)
+		err := errors.Join(writeErr, closeErr)
+		log.Printf("agentbus daemon: could not restore owned pid during %s to %s: %v", phase, pidPath, err)
+		return err
+	}
+	return nil
+}
+
+func wrapPIDRestoreError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: restore pid ownership signal: %w", ErrShutdownPIDTeardownFailed, err)
 }
 
 func statBinaryIdentity(path string) (BinaryIdentity, error) {
