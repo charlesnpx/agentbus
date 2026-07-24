@@ -773,7 +773,7 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 | E3 | Authority-only RPC handlers (no JSON merge/fallback); CLI status/result/cancel/list become protocol clients; delete `sessions` cmd; stable exit codes; compiled-binary E2E across restart+recovery | CLOSED 67be1d5 |
 | E4 | Graceful shutdown: signal.NotifyContext (daemon serving only) + Shutdown(ctx) reusing existing durable cancellation; successful graceful shutdown ⇒ no live custody, no recovery obligation; forced-timeout path remains recoverable fail-closed | CLOSED d74288c |
 | E5A | Record-level bbolt behind repository contract; Auditor + AnchorIdentified; binding_index as derived locator; dirty-closure validation sharing invariant helpers with full audit; operation-count tests (bbolt pkg) prove O(touched); 1k/10k/100k benchmarks | CLOSED 7fb6153 |
-| E5B | Create/OpenExisting/OpenExistingReadOnly split (no ambiguous open-or-create); AuditIntegrity (Tx.Check drained + envelope + cross-record + index) at every existing entry point; root-existence matrix test per cell; unsupported first serve non-mutating; corruption fixtures fatal pre-bind, file untouched | PENDING |
+| E5B | Create/OpenExisting/OpenExistingReadOnly split (no ambiguous open-or-create); AuditIntegrity (Tx.Check drained + envelope + cross-record + index) at every existing entry point; root-existence matrix test per cell; unsupported first serve non-mutating; corruption fixtures fatal pre-bind, file untouched | CLOSED c8d50df |
 | E6 | docs/protocol.md v2 reconciliation (hand-written; full job.submit identity schema, replay tables, rejection-cause table verified vs implementation) | PENDING |
 | E7 | CI lanes: committed gate scripts (scripts/ci/), full -race, strict-tag compile, privileged cgroup lane, product black-box lane, fail-closed lanes, govulncheck; release-check runs tests + strict smoke. Merge needs remote-green on candidate SHA (billing must be restored). `.github/**` edits need explicit user approval | PENDING |
 | E8 | Docs: ADR index (+11,+12), operations runbook, offline-only backup policy, install caveat; PR #29 body update (needs user approval); FINAL holistic review of the complete candidate SHA | PENDING |
@@ -791,6 +791,21 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 10. CI: no strict lane, race excludes client/+cmd/, gate scripts unversioned; tip red = GitHub Actions BILLING block (jobs die ~4s pre-step), not code.
 
 ## AB-E Log
+- 2026-07-24: E5B CLOSED at c8d50df (SHIP on review round 1 — first unit closed in a single review
+  round; the new loop policy's apply-without-re-review pass used for the first time). Arc: worker
+  3f00a4b (Create/OpenExisting/OpenExistingReadOnly replacing ambiguous NewRepository, folding in
+  the E2B no-init opener as planned; existing call sites rewired only — recovery/clear-fail-stop/
+  seal-source always OpenExisting, reset+new-root the only Create callers; AuditIntegrity with
+  structural Tx.Check wired pre-serve/pre-mutation at every entry point; root-existence matrix
+  test per ADR-12 cell incl. structural byte-identity fixtures and record-level repeat-detection;
+  darwin unsupported-first-serve non-mutating E2E; both gates green FIRST PASS) -> review1 SHIP
+  (1M+2L, no High/Critical; reviewer verified: no residual open-or-create path, O_EXCL enforced,
+  read-only truly read-only, reset-empty proves emptiness via audit+RootStats under exclusive
+  flock, audits run writer-free, matrix ordering correct) -> apply pass c8d50df (M1 failed-Create
+  inode cleanup; L2 projection/quarantine-only audit findings proceed into the normative bootstrap
+  repair path, authoritative findings stay fatal; L3 Lstat anchor presence — dangling symlink =
+  present, refused non-mutating). E2B's OpenExistingNoInit groundwork paid off: fastest unit of
+  the campaign (~1.5h).
 - 2026-07-24: E5A CLOSED at 7fb6153 (SHIP, zero findings, round 4 of the new max-4 loop policy).
   Arc: worker b429b7c (full rewrite in one pass: point txs replacing whole-store-rewrite-per-
   mutation, binding_index derived locator with canonical verification, dirty-closure commit
