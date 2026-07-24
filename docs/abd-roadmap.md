@@ -769,7 +769,7 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 | E0 | Contract freeze: ADR-12, protocol.Version=2, storage schema v2, stable rejection causes, root-existence matrix, normative ADR-0B replay ordering, shutdown contract, result semantics (derived from authority terminal record, no public proof) | CLOSED 64031ca |
 | E1 | Delete foreground surface + unidentified submit + --admission plumbing; reimplement handleIdentifiedJobSubmit per E0 replay ordering (LookupReplay before backend/filesystem validation, recorded fingerprint version); negative + replay test battery; architecture guard: no path reaches session.Turn outside an authority launch | PENDING |
 | E2A | Shared daemon launcher: readiness pipe (ready{protocolVersion,pid,canonicalStateRoot,socketPath} / failed{code,message}), PID-after-ready, Setsid, kill+reap on parent failure, stderr preserved to handshake, concurrent-start winner verification | CLOSED c69c83c |
-| E2B | Autostart: typed diagnostic on unsupported host, restart-after-exit restores service, race convergence; `admission recover` gets a dedicated strict-native recovery constructor; compiled-CLI recovery in Docker gate | PENDING |
+| E2B | Autostart: typed diagnostic on unsupported host, restart-after-exit restores service, race convergence; `admission recover` gets a dedicated strict-native recovery constructor; compiled-CLI recovery in Docker gate | CLOSED 86a5c31 |
 | E3 | Authority-only RPC handlers (no JSON merge/fallback); CLI status/result/cancel/list become protocol clients; delete `sessions` cmd; stable exit codes; compiled-binary E2E across restart+recovery | PENDING |
 | E4 | Graceful shutdown: signal.NotifyContext (daemon serving only) + Shutdown(ctx) reusing existing durable cancellation; successful graceful shutdown ⇒ no live custody, no recovery obligation; forced-timeout path remains recoverable fail-closed | PENDING |
 | E5A | Record-level bbolt behind repository contract; Auditor + AnchorIdentified; binding_index as derived locator; dirty-closure validation sharing invariant helpers with full audit; operation-count tests (bbolt pkg) prove O(touched); 1k/10k/100k benchmarks | PENDING |
@@ -791,6 +791,26 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 10. CI: no strict lane, race excludes client/+cmd/, gate scripts unversioned; tip red = GitHub Actions BILLING block (jobs die ~4s pre-step), not code.
 
 ## AB-E Log
+- 2026-07-23: E2B CLOSED at 86a5c31 (SHIP, zero findings). Arc: worker 3df1d4d-pre (recovery
+  composition + 4-test real-process battery; Docker gate — widened mid-unit from
+  -run TestProductionStrictServe to the whole TestProductionStrict family, which the old pin would
+  have silently skipped — caught 3/4 battery tests red on real Linux) -> fix1 (+1 orchestrator
+  repair, SIGKILL-tolerance second site): race losers now corroborate a dialable winner on
+  retryable cgroup-root-lease contention -> typed already-listening convergence; 3df1d4d ->
+  review1 FIX(1H+2M: recovery could initialize/repair via normal bootstrapper) -> fix2 d26eb26
+  (read-only no-create preflight, runtime close on error paths, before/after root hashing tests) ->
+  review2 FIX(H1 TOCTOU + 3M) -> fix3 b6cbe6a (dev+ino handle identity, require-initialized anchor,
+  typed lock-contention corroboration, canonical bucket/meta exports) -> review3 FIX(H1 residual:
+  initialize() ran before the gate) -> fix4 3c9128f (bbolt.OpenExistingNoInit: no-create/no-init/
+  NoFreelistSync-bounded open, same-inode bucket-deletion killer test) -> review4 FIX(1M schema-vs-
+  bucket precedence under TOCTOU) -> fix5 86a5c31 (schema-first verification inside the no-init
+  opener, typed UnsupportedAuthorityMetaSchemaVersionError) -> review5 SHIP. Delivered: strict-native
+  recovery composition that structurally cannot create/repair root state; launcher-level race
+  convergence under cgroup-lease contention; Linux real-process conformance battery (compiled-CLI
+  recover of activated root, recover-missing-root typed + nothing created, autostart restores after
+  SIGKILL, 3-way race -> one daemon) + macOS typed unsupported-host tests. OpenExistingNoInit is
+  deliberate groundwork for E5B's OpenExisting split. Closure gates: battery + Docker green at
+  86a5c31 (known cliadapter load-flake verified -count=3 isolated).
 - 2026-07-23: E2A CLOSED at c69c83c (SHIP, zero blocking). Arc: worker 716a1eb (+resume: linux/arm64
   Dup2 break caught by Docker gate; AGENTBUS_READY_FD stripped from worker/monitor envs) -> review1
   FIX(4H+1M) -> fix1 8cab55b (+resume: loser blocked on bbolt lock pre-bind -> typed already-listening;
