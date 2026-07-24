@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -131,6 +132,20 @@ func (e FileIdentityMismatchError) Is(target error) bool {
 	return target == repository.ErrInvalidRecord
 }
 
+// RepositoryAlreadyExistsError reports that an explicit repository creation
+// found any existing path at the target location.
+type RepositoryAlreadyExistsError struct {
+	Path string
+}
+
+func (e RepositoryAlreadyExistsError) Error() string {
+	return fmt.Sprintf("%s: bbolt repository already exists: %s", repository.ErrInvalidRecord, e.Path)
+}
+
+func (e RepositoryAlreadyExistsError) Is(target error) bool {
+	return target == repository.ErrInvalidRecord
+}
+
 // UnsupportedAuthorityMetaSchemaVersionError reports that the authority meta
 // payload is structurally readable but declares a schema this binary does not
 // support.
@@ -147,43 +162,59 @@ func (e UnsupportedAuthorityMetaSchemaVersionError) Is(target error) bool {
 	return target == repository.ErrInvalidRecord
 }
 
-// Open opens or initializes a root bbolt repository database at path. The file
-// is created with owner-only permissions.
-func Open(path string, options *bolt.Options) (*Repository, error) {
+// defaultOpenTimeout bounds how long repository opens wait for the database
+// file lock. bbolt with nil options blocks indefinitely on the flock, which
+// would let a replacement daemon hang silently in admission bootstrap while a
+// draining predecessor still holds the database.
+const defaultOpenTimeout = 10 * time.Second
+
+// Create exclusively creates a fresh root bbolt repository database at path.
+// It never opens, repairs, or reinitializes an existing file.
+func Create(path string, options ...*bolt.Options) (*Repository, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("%w: bbolt path is required", repository.ErrInvalidRecord)
 	}
+	if _, err := os.Lstat(path); err == nil {
+		return nil, RepositoryAlreadyExistsError{Path: path}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	var identity FileIdentity
-	db, err := bolt.Open(path, 0o600, optionsWithFileIdentity(options, &identity))
+	db, err := openBoltSafely(path, 0o600, optionsForCreate(firstOpenOption(options), &identity))
 	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, RepositoryAlreadyExistsError{Path: path}
+		}
 		return nil, err
 	}
 	repo := &Repository{db: db, fileIdentity: identity}
-	if err := repo.initialize(); err != nil {
+	if err := repo.initializeFresh(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return repo, nil
 }
 
-// OpenExistingNoInit opens an existing root bbolt repository without creating,
-// initializing, or repairing admission buckets or meta keys. It verifies the
-// canonical initialized structure in a read transaction before returning.
-func OpenExistingNoInit(path string, expectedIdentity *FileIdentity, options *bolt.Options) (*Repository, error) {
+// OpenExisting opens an existing root bbolt repository without creating,
+// initializing, or repairing admission buckets or meta keys.
+func OpenExisting(path string, options ...*bolt.Options) (*Repository, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("%w: bbolt path is required", repository.ErrInvalidRecord)
 	}
-	restoreNoFreelistSync := false
-	if options != nil {
-		restoreNoFreelistSync = options.NoFreelistSync
-	}
-	var identity FileIdentity
-	db, err := bolt.Open(path, 0o600, optionsForExistingNoInit(options, &identity, expectedIdentity))
-	if err != nil {
+	if err := requireExistingRegularNonEmptyFile(path); err != nil {
 		return nil, err
 	}
+	restoreNoFreelistSync := false
+	if option := firstOpenOption(options); option != nil {
+		restoreNoFreelistSync = option.NoFreelistSync
+	}
+	var identity FileIdentity
+	db, err := openBoltSafely(path, 0o600, optionsForExistingNoInit(firstOpenOption(options), &identity))
+	if err != nil {
+		return nil, existingOpenError(path, err)
+	}
 	repo := &Repository{db: db, fileIdentity: identity}
-	if err := repo.verifyExistingNoInitInitializedStructure(); err != nil {
+	if err := repo.verifyExistingInitializedStructure(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -191,23 +222,14 @@ func OpenExistingNoInit(path string, expectedIdentity *FileIdentity, options *bo
 	return repo, nil
 }
 
-// defaultOpenTimeout bounds how long NewRepository waits for the database
-// file lock. bbolt with nil options blocks INDEFINITELY on the flock, which
-// would let a replacement daemon hang silently in admission bootstrap while a
-// draining predecessor still holds the database. Fail closed with a typed
-// timeout error instead; the normal uncontended open is unaffected.
-const defaultOpenTimeout = 10 * time.Second
-
-// NewRepository opens or initializes a root bbolt repository database at path.
-func NewRepository(path string) (*Repository, error) {
-	return Open(path, &bolt.Options{Timeout: defaultOpenTimeout})
-}
-
-// OpenReadOnly opens an existing root bbolt repository database for inspection.
-// It never initializes or mutates the file.
-func OpenReadOnly(path string, options ...*bolt.Options) (*Repository, error) {
+// OpenExistingReadOnly opens an existing root bbolt repository database for
+// inspection. It never initializes or mutates the file.
+func OpenExistingReadOnly(path string, options ...*bolt.Options) (*Repository, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("%w: bbolt path is required", repository.ErrInvalidRecord)
+	}
+	if err := requireExistingRegularNonEmptyFile(path); err != nil {
+		return nil, err
 	}
 	readOnlyOptions := bolt.Options{ReadOnly: true, Timeout: defaultOpenTimeout}
 	if len(options) > 0 && options[0] != nil {
@@ -215,12 +237,12 @@ func OpenReadOnly(path string, options ...*bolt.Options) (*Repository, error) {
 		readOnlyOptions.ReadOnly = true
 	}
 	var identity FileIdentity
-	db, err := bolt.Open(path, 0o600, optionsWithFileIdentity(&readOnlyOptions, &identity))
+	db, err := openBoltSafely(path, 0o600, optionsForExistingReadOnly(&readOnlyOptions, &identity))
 	if err != nil {
-		return nil, err
+		return nil, existingOpenError(path, err)
 	}
 	repo := &Repository{db: db, fileIdentity: identity}
-	if err := repo.verifyReadOnlyCompatibleSchema(); err != nil {
+	if err := repo.verifyExistingInitializedStructure(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -257,11 +279,14 @@ func (r *Repository) VerifyInitializedStructure() error {
 	})
 }
 
-func (r *Repository) verifyExistingNoInitInitializedStructure() error {
+func (r *Repository) verifyExistingInitializedStructure() error {
 	if r == nil || r.db == nil {
 		return fmt.Errorf("%w: bbolt repository is not open", repository.ErrInvalidRecord)
 	}
 	return r.db.View(func(tx *bolt.Tx) error {
+		if err := checkStructuralIntegrityTx(tx); err != nil {
+			return err
+		}
 		schemaVersion, err := authorityMetaSchemaVersionTx(tx, r.db.Path())
 		if err != nil {
 			return err
@@ -270,22 +295,6 @@ func (r *Repository) verifyExistingNoInitInitializedStructure() error {
 			return UnsupportedAuthorityMetaSchemaVersionError{Path: r.db.Path(), SchemaVersion: schemaVersion}
 		}
 		return verifyInitializedStructureTx(tx, r.db.Path())
-	})
-}
-
-func (r *Repository) verifyReadOnlyCompatibleSchema() error {
-	if r == nil || r.db == nil {
-		return fmt.Errorf("%w: bbolt repository is not open", repository.ErrInvalidRecord)
-	}
-	return r.db.View(func(tx *bolt.Tx) error {
-		schemaVersion, err := authorityMetaSchemaVersionTx(tx, r.db.Path())
-		if err != nil {
-			return err
-		}
-		if schemaVersion != repository.StrictAuthorityMetaSchemaVersion {
-			return UnsupportedAuthorityMetaSchemaVersionError{Path: r.db.Path(), SchemaVersion: schemaVersion}
-		}
-		return nil
 	})
 }
 
@@ -341,17 +350,28 @@ func authorityMetaSchemaVersionTx(tx *bolt.Tx, path string) (uint16, error) {
 	return payload.SchemaVersion, nil
 }
 
-func optionsWithFileIdentity(options *bolt.Options, identity *FileIdentity) *bolt.Options {
-	return optionsWithFileIdentityChecks(options, identity, nil, false, false)
+func firstOpenOption(options []*bolt.Options) *bolt.Options {
+	if len(options) == 0 {
+		return nil
+	}
+	return options[0]
 }
 
-func optionsForExistingNoInit(options *bolt.Options, identity, expectedIdentity *FileIdentity) *bolt.Options {
-	cloned := optionsWithFileIdentityChecks(options, identity, expectedIdentity, true, true)
+func optionsForCreate(options *bolt.Options, identity *FileIdentity) *bolt.Options {
+	return optionsWithFileIdentityChecks(options, identity, true, false, false)
+}
+
+func optionsForExistingNoInit(options *bolt.Options, identity *FileIdentity) *bolt.Options {
+	cloned := optionsWithFileIdentityChecks(options, identity, false, true, true)
 	cloned.NoFreelistSync = true
 	return cloned
 }
 
-func optionsWithFileIdentityChecks(options *bolt.Options, identity, expectedIdentity *FileIdentity, existingOnly, rejectEmpty bool) *bolt.Options {
+func optionsForExistingReadOnly(options *bolt.Options, identity *FileIdentity) *bolt.Options {
+	return optionsWithFileIdentityChecks(options, identity, false, true, true)
+}
+
+func optionsWithFileIdentityChecks(options *bolt.Options, identity *FileIdentity, createExclusive, existingOnly, rejectEmpty bool) *bolt.Options {
 	var cloned bolt.Options
 	if options == nil {
 		cloned = *bolt.DefaultOptions
@@ -364,6 +384,9 @@ func optionsWithFileIdentityChecks(options *bolt.Options, identity, expectedIden
 	}
 	cloned.OpenFile = func(path string, flag int, perm os.FileMode) (*os.File, error) {
 		openFlag := flag
+		if createExclusive {
+			openFlag |= os.O_CREATE | os.O_EXCL
+		}
 		if existingOnly {
 			openFlag &^= os.O_CREATE
 		}
@@ -382,14 +405,19 @@ func optionsWithFileIdentityChecks(options *bolt.Options, identity, expectedIden
 				return nil, fmt.Errorf("%w: admission repository is zero-length: %s", repository.ErrInvalidRecord, path)
 			}
 		}
-		fileIdentity, err := fileIdentityFromFile(file)
+		info, err := file.Stat()
 		if err != nil {
 			_ = file.Close()
 			return nil, err
 		}
-		if expectedIdentity != nil && fileIdentity != *expectedIdentity {
+		if !info.Mode().IsRegular() {
 			_ = file.Close()
-			return nil, FileIdentityMismatchError{Path: path, Expected: *expectedIdentity, Opened: fileIdentity}
+			return nil, fmt.Errorf("%w: admission repository is not a regular file: %s", repository.ErrInvalidRecord, path)
+		}
+		fileIdentity, err := fileIdentityFromFile(file)
+		if err != nil {
+			_ = file.Close()
+			return nil, err
 		}
 		if identity != nil {
 			*identity = fileIdentity
@@ -397,6 +425,42 @@ func optionsWithFileIdentityChecks(options *bolt.Options, identity, expectedIden
 		return file, nil
 	}
 	return &cloned
+}
+
+func requireExistingRegularNonEmptyFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%w: admission repository is not a regular file: %s", repository.ErrInvalidRecord, path)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("%w: admission repository is zero-length: %s", repository.ErrInvalidRecord, path)
+	}
+	return nil
+}
+
+func openBoltSafely(path string, mode os.FileMode, options *bolt.Options) (db *bolt.DB, err error) {
+	previous := debug.SetPanicOnFault(true)
+	defer debug.SetPanicOnFault(previous)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if db != nil {
+				_ = db.Close()
+				db = nil
+			}
+			err = fmt.Errorf("%w: bbolt open fault for %s: %v", repository.ErrCorruptRecord, path, recovered)
+		}
+	}()
+	return bolt.Open(path, mode, options)
+}
+
+func existingOpenError(path string, err error) error {
+	if err == nil || errors.Is(err, os.ErrNotExist) || errors.Is(err, bolt.ErrTimeout) || errors.Is(err, repository.ErrInvalidRecord) || errors.Is(err, repository.ErrCorruptRecord) {
+		return err
+	}
+	return fmt.Errorf("%w: structural bbolt open failed for %s: %v", repository.ErrCorruptRecord, path, err)
 }
 
 func fileIdentityFromFile(file *os.File) (FileIdentity, error) {
@@ -624,6 +688,9 @@ func (r *Repository) AuditIntegrity(ctx context.Context) error {
 func auditIntegrityTx(tx *bolt.Tx) error {
 	read := readTx{tx: tx}
 	var findings []error
+	if err := checkStructuralIntegrityTx(tx); err != nil {
+		findings = append(findings, repository.NewIntegrityFinding("structure", "", err))
+	}
 	if err := verifyInitializedStructureTx(tx, "audit"); err != nil {
 		findings = append(findings, repository.NewIntegrityFinding("structure", "", err))
 	}
@@ -666,6 +733,16 @@ func auditIntegrityTx(tx *bolt.Tx) error {
 	}
 	if err := read.auditBindingIndexEntries(); err != nil {
 		findings = append(findings, repository.NewIntegrityFinding("binding_index", "", err))
+	}
+	return repository.NewIntegrityError(findings)
+}
+
+func checkStructuralIntegrityTx(tx *bolt.Tx) error {
+	var findings []error
+	for err := range tx.Check() {
+		if err != nil {
+			findings = append(findings, fmt.Errorf("%w: bbolt structural check: %v", repository.ErrCorruptRecord, err))
+		}
 	}
 	return repository.NewIntegrityError(findings)
 }
@@ -754,17 +831,10 @@ func (r *Repository) InjectMissingMetaForTest() {
 	}
 }
 
-func (r *Repository) initialize() error {
+func (r *Repository) initializeFresh() error {
 	return r.db.Update(func(tx *bolt.Tx) error {
 		if !databaseEmpty(tx) {
-			schemaVersion, err := authorityMetaSchemaVersionTx(tx, r.db.Path())
-			if err != nil {
-				return err
-			}
-			if schemaVersion != repository.StrictAuthorityMetaSchemaVersion {
-				return UnsupportedAuthorityMetaSchemaVersionError{Path: r.db.Path(), SchemaVersion: schemaVersion}
-			}
-			return verifyInitializedStructureTx(tx, r.db.Path())
+			return fmt.Errorf("%w: admission repository create target is not fresh: %s", repository.ErrInvalidRecord, r.db.Path())
 		}
 		for _, name := range bucketNames {
 			r.countOperationForTest("create_bucket")

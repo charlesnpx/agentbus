@@ -167,14 +167,14 @@ func TestLaunchAdmissionReadOnlyLockWithoutSocketReportsRootBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	repoPath := filepath.Join(root, admissionRepositoryFile)
-	repo, err := bboltrepo.NewRepository(repoPath)
+	repo, err := bboltrepo.Create(repoPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := repo.Close(); err != nil {
 		t.Fatal(err)
 	}
-	holder, err := bboltrepo.OpenReadOnly(repoPath)
+	holder, err := bboltrepo.OpenExistingReadOnly(repoPath)
 	if err != nil {
 		t.Fatal(err)
 	}

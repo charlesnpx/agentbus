@@ -1117,16 +1117,18 @@ func openAdmissionBootstrapperWithOptions(ctx context.Context, s *Server, openOp
 		return nil, nil, nil, err
 	}
 	repoPath := filepath.Join(s.stateRoot, admissionRepositoryFile)
+	anchorPath := filepath.Join(s.stateRoot, admissionAnchorFile)
 	var openedIdentity bboltrepo.FileIdentity
 	var repo *bboltrepo.Repository
+	repoCreated := false
 	var err error
 	if openOptions.openExistingNoInitialize {
 		if openOptions.expectedRepositoryIdentity == nil {
 			return nil, nil, nil, fmt.Errorf("%w: expected admission repository identity is required for no-init recovery open", repository.ErrInvalidRecord)
 		}
-		repo, err = openExistingAdmissionRepositoryWithContentionRetry(ctx, repoPath, s.socketPath, openOptions.expectedRepositoryIdentity)
+		repo, err = openExistingAdmissionRepositoryWithContentionRetry(ctx, repoPath, s.socketPath)
 	} else {
-		repo, err = openAdmissionRepositoryWithContentionRetry(ctx, repoPath, s.socketPath)
+		repo, repoCreated, err = openAdmissionRepositoryWithContentionRetry(ctx, repoPath, anchorPath, s.socketPath)
 	}
 	if err != nil {
 		return nil, nil, nil, translateAdmissionRepositoryOpenError(repoPath, err)
@@ -1150,6 +1152,13 @@ func openAdmissionBootstrapperWithOptions(ctx context.Context, s *Server, openOp
 			return nil, nil, nil, err
 		}
 	}
+	if err := auditOpenedAdmissionRepository(ctx, repo); err != nil {
+		_ = repo.Close()
+		if errors.Is(err, repository.ErrCorruptRecord) {
+			s.safetyLatch.Trip(err)
+		}
+		return nil, nil, nil, err
+	}
 	dbUUID, schemaMajor, err := repo.AnchorIdentity()
 	if err != nil {
 		_ = repo.Close()
@@ -1166,8 +1175,11 @@ func openAdmissionBootstrapperWithOptions(ctx context.Context, s *Server, openOp
 	if openOptions.requireInitializedAnchor {
 		anchorOptions = append(anchorOptions, authority.WithFileAnchorRequireInitialized())
 	}
+	if !repoCreated {
+		anchorOptions = append(anchorOptions, authority.WithFileAnchorRequireInitialized())
+	}
 	anchor := authority.NewFileAnchor(
-		filepath.Join(s.stateRoot, admissionAnchorFile),
+		anchorPath,
 		dbUUID,
 		schemaMajor,
 		anchorOptions...,
@@ -1196,17 +1208,17 @@ func translateAdmissionRepositoryOpenError(repoPath string, err error) error {
 	return err
 }
 
-func openAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, socketPath string) (*bboltrepo.Repository, error) {
+func openAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, anchorPath, socketPath string) (*bboltrepo.Repository, bool, error) {
 	timeout, err := admissionContentionAttemptTimeout(ctx, admissionRepositoryOpenTimeout)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	repo, err := bboltrepo.Open(repoPath, &bolt.Options{Timeout: timeout})
+	repo, created, err := openAdmissionRepositoryOnce(repoPath, anchorPath, timeout)
 	if err == nil || !errors.Is(err, bolt.ErrTimeout) {
-		return repo, err
+		return repo, created, err
 	}
 	err = retryAdmissionRepositoryContention(ctx, repoPath, socketPath, err, func(timeout time.Duration) (bool, error) {
-		repo, err = bboltrepo.Open(repoPath, &bolt.Options{Timeout: timeout})
+		repo, created, err = openAdmissionRepositoryOnce(repoPath, anchorPath, timeout)
 		if err == nil {
 			return true, nil
 		}
@@ -1216,22 +1228,46 @@ func openAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, s
 		return false, err
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return repo, nil
+	return repo, created, nil
 }
 
-func openExistingAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, socketPath string, expectedIdentity *bboltrepo.FileIdentity) (*bboltrepo.Repository, error) {
+func openAdmissionRepositoryOnce(repoPath, anchorPath string, timeout time.Duration) (*bboltrepo.Repository, bool, error) {
+	if _, err := os.Stat(repoPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, false, err
+		}
+		if err := requireAdmissionAnchorAbsentForCreate(anchorPath); err != nil {
+			return nil, false, err
+		}
+		repo, createErr := bboltrepo.Create(repoPath, &bolt.Options{Timeout: timeout})
+		return repo, true, createErr
+	}
+	repo, err := bboltrepo.OpenExisting(repoPath, &bolt.Options{Timeout: timeout})
+	return repo, false, err
+}
+
+func requireAdmissionAnchorAbsentForCreate(anchorPath string) error {
+	if _, err := os.Stat(anchorPath); err == nil {
+		return fmt.Errorf("%w: anchor exists without admission repository: %s", authority.ErrAnchorInvariant, anchorPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func openExistingAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, socketPath string) (*bboltrepo.Repository, error) {
 	timeout, err := admissionContentionAttemptTimeout(ctx, admissionRepositoryOpenTimeout)
 	if err != nil {
 		return nil, err
 	}
-	repo, err := bboltrepo.OpenExistingNoInit(repoPath, expectedIdentity, &bolt.Options{Timeout: timeout})
+	repo, err := bboltrepo.OpenExisting(repoPath, &bolt.Options{Timeout: timeout})
 	if err == nil || !errors.Is(err, bolt.ErrTimeout) {
 		return repo, err
 	}
 	err = retryAdmissionRepositoryContention(ctx, repoPath, socketPath, err, func(timeout time.Duration) (bool, error) {
-		repo, err = bboltrepo.OpenExistingNoInit(repoPath, expectedIdentity, &bolt.Options{Timeout: timeout})
+		repo, err = bboltrepo.OpenExisting(repoPath, &bolt.Options{Timeout: timeout})
 		if err == nil {
 			return true, nil
 		}
@@ -1251,7 +1287,7 @@ func openReadOnlyAdmissionRepositoryWithContentionRetry(ctx context.Context, rep
 	if err != nil {
 		return nil, err
 	}
-	repo, err := bboltrepo.OpenReadOnly(repoPath, &bolt.Options{Timeout: timeout})
+	repo, err := bboltrepo.OpenExistingReadOnly(repoPath, &bolt.Options{Timeout: timeout})
 	if err == nil {
 		return repo, nil
 	}
@@ -1259,7 +1295,7 @@ func openReadOnlyAdmissionRepositoryWithContentionRetry(ctx context.Context, rep
 		return nil, translateAdmissionRepositoryOpenError(repoPath, err)
 	}
 	err = retryAdmissionRepositoryContention(ctx, repoPath, socketPath, err, func(timeout time.Duration) (bool, error) {
-		repo, err = bboltrepo.OpenReadOnly(repoPath, &bolt.Options{Timeout: timeout})
+		repo, err = bboltrepo.OpenExistingReadOnly(repoPath, &bolt.Options{Timeout: timeout})
 		if err == nil {
 			return true, nil
 		}
@@ -1272,6 +1308,13 @@ func openReadOnlyAdmissionRepositoryWithContentionRetry(ctx context.Context, rep
 		return nil, translateAdmissionRepositoryOpenError(repoPath, err)
 	}
 	return repo, nil
+}
+
+func auditOpenedAdmissionRepository(ctx context.Context, repo *bboltrepo.Repository) error {
+	if repo == nil {
+		return fmt.Errorf("%w: admission repository is required", repository.ErrInvalidRecord)
+	}
+	return repo.AuditIntegrity(ctx)
 }
 
 func retryAdmissionRepositoryContention(ctx context.Context, repoPath, socketPath string, cause error, retry func(time.Duration) (bool, error)) error {

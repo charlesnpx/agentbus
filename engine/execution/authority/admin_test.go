@@ -186,10 +186,38 @@ func TestResetEmptyRootReinitializesWholeDomainAndAnchor(t *testing.T) {
 	}
 }
 
+func TestResetEmptyRootRepairsMissingAnchorOnlyAfterEmptyProof(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	initial, err := ResetEmptyAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorPath := filepath.Join(root, AdmissionAnchorFile)
+	if err := os.Remove(anchorPath); err != nil {
+		t.Fatal(err)
+	}
+
+	reset, err := ResetEmptyAdmissionRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reset.DomainUUID == "" || reset.DomainUUID == initial.DomainUUID {
+		t.Fatalf("reset domain UUID = %q, initial %q; want fresh UUID", reset.DomainUUID, initial.DomainUUID)
+	}
+	anchor, err := LoadFileAnchorSnapshot(anchorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !anchor.Initialized || anchor.DBUUID != reset.DomainUUID || anchor.Generation != reset.Generation {
+		t.Fatalf("reset anchor = %+v, inspection = %+v", anchor, reset)
+	}
+}
+
 func TestResetEmptyRootRefusesBusyRoot(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	repo, err := bboltrepo.NewRepository(filepath.Join(root, AdmissionRepositoryFile))
+	repo, err := bboltrepo.Create(filepath.Join(root, AdmissionRepositoryFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -741,7 +769,7 @@ func TestSealSealedReplayRejectsMatrixInvalidSuccessor(t *testing.T) {
 	corruptAdmissionSafetyForTest(t, newRoot, jobID, "safety checksum")
 
 	_, err := SealAdmissionRoot(ctx, root, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: newRoot})
-	requireSealedSuccessorMismatch(t, err, first.NewDomainUUID, "safety")
+	requireSealedSuccessorMismatch(t, err, first.NewDomainUUID, "repository integrity")
 	if !errors.Is(err, repository.ErrCorruptRecord) {
 		t.Fatalf("matrix-invalid successor replay error = %v, want ErrCorruptRecord", err)
 	}
@@ -869,7 +897,7 @@ func TestSealSuccessorDomainUUIDIsImmutableViaPutMeta(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	writable, err := bboltrepo.NewRepository(filepath.Join(root, AdmissionRepositoryFile))
+	writable, err := bboltrepo.OpenExisting(filepath.Join(root, AdmissionRepositoryFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -953,7 +981,7 @@ func beginBboltAdmissionRoot(t *testing.T, root, name string) (*bboltrepo.Reposi
 }
 
 func beginBboltAdmissionRootAllowError(ctx context.Context, root, name string) (*RecoverySession, *bboltrepo.Repository, error) {
-	repo, err := bboltrepo.NewRepository(filepath.Join(root, AdmissionRepositoryFile))
+	repo, err := openOrCreateBboltAdmissionRepositoryForTest(filepath.Join(root, AdmissionRepositoryFile))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1038,7 +1066,7 @@ func sealedSuccessorForTest(t *testing.T, ctx context.Context, name string) (str
 
 func persistAdmissionFailStopForTest(t *testing.T, ctx context.Context, root, reason string) {
 	t.Helper()
-	repo, err := openReadOnlyAdmissionRepository(root)
+	repo, err := openReadOnlyAdmissionRepository(ctx, root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1084,7 +1112,7 @@ func addPendingAdmissionJobForTest(t *testing.T, ctx context.Context, root, name
 
 func corruptAdmissionSafetyForTest(t *testing.T, root string, jobID model.JobID, diagnostic string) {
 	t.Helper()
-	repo, err := bboltrepo.NewRepository(filepath.Join(root, AdmissionRepositoryFile))
+	repo, err := bboltrepo.OpenExisting(filepath.Join(root, AdmissionRepositoryFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1096,7 +1124,7 @@ func corruptAdmissionSafetyForTest(t *testing.T, root string, jobID model.JobID,
 
 func corruptAdmissionBindingIndexForTest(t *testing.T, root string, jobID model.JobID, key model.RequestKey) {
 	t.Helper()
-	repo, err := bboltrepo.NewRepository(filepath.Join(root, AdmissionRepositoryFile))
+	repo, err := bboltrepo.OpenExisting(filepath.Join(root, AdmissionRepositoryFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1166,7 +1194,7 @@ func probeAdmissionStartabilityForTest(t *testing.T, ctx context.Context, root s
 	if err != nil {
 		t.Fatal(err)
 	}
-	repo, err := openReadOnlyAdmissionRepository(root)
+	repo, err := bboltrepo.OpenExistingReadOnly(repoPath)
 	if err != nil {
 		return beginStartabilityProbe{}, err
 	}
@@ -1205,7 +1233,7 @@ func probeAdmissionStartabilityForTest(t *testing.T, ctx context.Context, root s
 
 func beginAdmissionRootForTest(t *testing.T, ctx context.Context, root, name string) error {
 	t.Helper()
-	repo, err := bboltrepo.NewRepository(filepath.Join(root, AdmissionRepositoryFile))
+	repo, err := openOrCreateBboltAdmissionRepositoryForTest(filepath.Join(root, AdmissionRepositoryFile))
 	if err != nil {
 		return err
 	}
@@ -1228,6 +1256,15 @@ func beginAdmissionRootForTest(t *testing.T, ctx context.Context, root, name str
 	}
 	_, err = bootstrapper.Begin(ctx, boot)
 	return err
+}
+
+func openOrCreateBboltAdmissionRepositoryForTest(path string) (*bboltrepo.Repository, error) {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return bboltrepo.Create(path)
+	} else if err != nil {
+		return nil, err
+	}
+	return bboltrepo.OpenExisting(path)
 }
 
 func copyFile(dst, src string) error {

@@ -269,7 +269,7 @@ func productionStrictSafetyRecord(stateRoot, jobID string) (model.SafetyRecord, 
 	if stateRoot == "" || jobID == "" {
 		return model.SafetyRecord{}, false, nil
 	}
-	repo, err := bboltrepo.OpenReadOnly(filepath.Join(stateRoot, admissionRepositoryFile))
+	repo, err := bboltrepo.OpenExistingReadOnly(filepath.Join(stateRoot, admissionRepositoryFile))
 	if err != nil {
 		return model.SafetyRecord{}, false, err
 	}
@@ -309,7 +309,7 @@ func waitProductionStrictAdmissionTerminalFromRepository(t *testing.T, stateRoot
 	deadline := time.Now().Add(timeout)
 	var last model.SafetyRecord
 	for time.Now().Before(deadline) {
-		repo, err := bboltrepo.OpenReadOnly(filepath.Join(stateRoot, admissionRepositoryFile))
+		repo, err := bboltrepo.OpenExistingReadOnly(filepath.Join(stateRoot, admissionRepositoryFile))
 		if err == nil {
 			record := loadAuthoritySafetyRecordFromRepository(t, repo, jobID)
 			if closeErr := repo.Close(); closeErr != nil {

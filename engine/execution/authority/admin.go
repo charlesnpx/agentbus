@@ -188,7 +188,7 @@ type ClearFailStopReport struct {
 }
 
 func InspectAdmissionRoot(ctx context.Context, stateRoot string) (RootInspection, error) {
-	repo, err := openReadOnlyAdmissionRepository(stateRoot)
+	repo, err := openReadOnlyAdmissionRepository(ctx, stateRoot)
 	if err != nil {
 		return RootInspection{}, err
 	}
@@ -205,12 +205,15 @@ func InspectAdmissionRoot(ctx context.Context, stateRoot string) (RootInspection
 	if err != nil {
 		return RootInspection{}, err
 	}
-	return attachAnchorInspection(inspection, anchorPath, schemaMajor)
+	return attachRequiredAnchorInspection(inspection, anchorPath, schemaMajor)
 }
 
 func InspectAdmissionRepository(ctx context.Context, repo repository.Repository) (RootInspection, error) {
 	if repo == nil {
 		return RootInspection{}, errors.New("authority repository is required")
+	}
+	if err := auditAdmissionRepository(ctx, repo); err != nil {
+		return RootInspection{}, err
 	}
 	domainUUID, _, err := repositoryAnchorIdentity(repo)
 	if err != nil {
@@ -257,7 +260,7 @@ func ResetEmptyAdmissionRoot(ctx context.Context, stateRoot string) (RootInspect
 		return RootInspection{}, err
 	}
 	if _, err := os.Stat(repoPath); err == nil {
-		oldRepo, err := bboltrepo.Open(repoPath, &bolt.Options{Timeout: adminOpenTimeout})
+		oldRepo, err := bboltrepo.OpenExisting(repoPath, &bolt.Options{Timeout: adminOpenTimeout})
 		if err != nil {
 			if errors.Is(err, bolt.ErrTimeout) {
 				return RootInspection{}, fmt.Errorf("%w: %w", ErrRootBusy, err)
@@ -265,6 +268,13 @@ func ResetEmptyAdmissionRoot(ctx context.Context, stateRoot string) (RootInspect
 			return RootInspection{}, err
 		}
 		defer oldRepo.Close()
+		dbUUID, schemaMajor, err := oldRepo.AnchorIdentity()
+		if err != nil {
+			return RootInspection{}, err
+		}
+		if err := requireOptionalResetAnchorMatch(anchorPath, dbUUID, schemaMajor); err != nil {
+			return RootInspection{}, err
+		}
 		inspection, err := InspectAdmissionRepository(ctx, oldRepo)
 		if err != nil {
 			return RootInspection{}, err
@@ -283,8 +293,10 @@ func ResetEmptyAdmissionRoot(ctx context.Context, stateRoot string) (RootInspect
 			return RootInspection{}, err
 		}
 	} else if errors.Is(err, os.ErrNotExist) {
-		if err := os.Remove(anchorPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return RootInspection{}, err
+		if _, anchorErr := os.Stat(anchorPath); anchorErr == nil {
+			return RootInspection{}, fmt.Errorf("%w: anchor exists without admission repository: %s", ErrAnchorInvariant, anchorPath)
+		} else if !errors.Is(anchorErr, os.ErrNotExist) {
+			return RootInspection{}, anchorErr
 		}
 	} else {
 		return RootInspection{}, err
@@ -296,7 +308,7 @@ func ClearAdmissionFailStop(ctx context.Context, stateRoot string, options Clear
 	if !options.AcknowledgeUnsafeDiagnosis {
 		return ClearFailStopReport{}, ErrClearFailStopConfirmationRequired
 	}
-	repo, err := openWritableAdmissionRepository(stateRoot)
+	repo, err := openWritableAdmissionRepository(ctx, stateRoot)
 	if err != nil {
 		return ClearFailStopReport{}, err
 	}
@@ -313,14 +325,9 @@ func ClearAdmissionFailStop(ctx context.Context, stateRoot string, options Clear
 	if err != nil {
 		return ClearFailStopReport{}, err
 	}
-	snapshot, err := loadFileAnchorSnapshot(anchorPath)
+	snapshot, err := loadRequiredFileAnchorSnapshot(anchorPath, inspection.DomainUUID, schemaMajor)
 	if err != nil {
 		return ClearFailStopReport{}, err
-	}
-	if snapshot.Initialized {
-		if snapshot.DBUUID != inspection.DomainUUID || snapshot.SchemaMajor != schemaMajor {
-			return ClearFailStopReport{}, fmt.Errorf("%w: anchor identity does not match repository", ErrAnchorInvariant)
-		}
 	}
 	report := ClearFailStopReport{
 		Cleared:           snapshot.Phase == "fail_stopped",
@@ -342,7 +349,7 @@ func ClearAdmissionFailStop(ctx context.Context, stateRoot string, options Clear
 	if err != nil {
 		return ClearFailStopReport{}, err
 	}
-	report.Inspection, err = attachAnchorInspection(report.Inspection, anchorPath, schemaMajor)
+	report.Inspection, err = attachRequiredAnchorInspection(report.Inspection, anchorPath, schemaMajor)
 	if err != nil {
 		return ClearFailStopReport{}, err
 	}
@@ -354,7 +361,7 @@ func SealAdmissionRoot(ctx context.Context, stateRoot string, options SealOption
 		return SealReport{}, ErrSealConfirmationRequired
 	}
 	newStateRoot := filepath.Clean(options.NewStateRoot)
-	repo, err := openWritableAdmissionRepository(stateRoot)
+	repo, err := openWritableAdmissionRepository(ctx, stateRoot)
 	if err != nil {
 		return SealReport{}, err
 	}
@@ -425,7 +432,7 @@ func SealAdmissionRoot(ctx context.Context, stateRoot string, options SealOption
 	if err != nil {
 		return SealReport{}, err
 	}
-	anchor := NewFileAnchor(anchorPath, before.DomainUUID, schemaMajor)
+	anchor := NewFileAnchor(anchorPath, before.DomainUUID, schemaMajor, WithFileAnchorRequireInitialized())
 	if _, err := anchor.Begin(ctx, boot, before.Generation); err != nil {
 		return SealReport{}, err
 	}
@@ -463,7 +470,7 @@ func SealAdmissionRoot(ctx context.Context, stateRoot string, options SealOption
 	if err != nil {
 		return SealReport{}, err
 	}
-	oldInspection, err = attachAnchorInspection(oldInspection, anchorPath, schemaMajor)
+	oldInspection, err = attachRequiredAnchorInspection(oldInspection, anchorPath, schemaMajor)
 	if err != nil {
 		return SealReport{}, err
 	}
@@ -477,20 +484,39 @@ func SealAdmissionRoot(ctx context.Context, stateRoot string, options SealOption
 	}, nil
 }
 
-func openReadOnlyAdmissionRepository(stateRoot string) (*bboltrepo.Repository, error) {
+func openReadOnlyAdmissionRepository(ctx context.Context, stateRoot string) (*bboltrepo.Repository, error) {
 	repoPath, _, err := admissionRootPaths(stateRoot)
 	if err != nil {
 		return nil, err
 	}
-	return bboltrepo.OpenReadOnly(repoPath)
+	repo, err := bboltrepo.OpenExistingReadOnly(repoPath, &bolt.Options{Timeout: adminOpenTimeout})
+	if err != nil {
+		return nil, err
+	}
+	if err := auditAdmissionRepository(ctx, repo); err != nil {
+		_ = repo.Close()
+		return nil, err
+	}
+	return repo, nil
 }
 
-func openWritableAdmissionRepository(stateRoot string) (*bboltrepo.Repository, error) {
+func openWritableAdmissionRepository(ctx context.Context, stateRoot string) (*bboltrepo.Repository, error) {
 	repoPath, _, err := admissionRootPaths(stateRoot)
 	if err != nil {
 		return nil, err
 	}
-	return bboltrepo.NewRepository(repoPath)
+	repo, err := bboltrepo.OpenExisting(repoPath, &bolt.Options{Timeout: adminOpenTimeout})
+	if err != nil {
+		if errors.Is(err, bolt.ErrTimeout) {
+			return nil, fmt.Errorf("%w: %w", ErrRootBusy, err)
+		}
+		return nil, err
+	}
+	if err := auditAdmissionRepository(ctx, repo); err != nil {
+		_ = repo.Close()
+		return nil, err
+	}
+	return repo, nil
 }
 
 func admissionRootPaths(stateRoot string) (string, string, error) {
@@ -538,7 +564,7 @@ func inspectSealedSuccessorDestination(ctx context.Context, stateRoot, expectedD
 			Cause:              fmt.Errorf("sealed root has no persisted successor domain UUID"),
 		}
 	}
-	repo, err := openReadOnlyAdmissionRepository(stateRoot)
+	repo, err := openReadOnlyAdmissionRepository(ctx, stateRoot)
 	if err != nil {
 		return RootInspection{}, SealedSuccessorMismatchError{
 			StateRoot:          stateRoot,
@@ -712,18 +738,25 @@ func initializeAdmissionRootWithReservation(ctx context.Context, stateRoot strin
 				return RootInspection{}, err
 			}
 		}
-		if err := createReservedAdmissionRepositoryFile(reservation, repoPath); err != nil {
-			return RootInspection{}, err
-		}
 	}
-	repo, err := bboltrepo.NewRepository(repoPath)
+	repo, err := bboltrepo.Create(repoPath, &bolt.Options{Timeout: adminOpenTimeout})
 	if err != nil {
 		if errors.Is(err, bolt.ErrTimeout) {
 			return RootInspection{}, fmt.Errorf("%w: %w", ErrRootBusy, err)
 		}
+		var exists bboltrepo.RepositoryAlreadyExistsError
+		if reservation != nil && errors.As(err, &exists) {
+			return RootInspection{}, foreignDestinationPathError(repoPath)
+		}
 		return RootInspection{}, err
 	}
+	if reservation != nil {
+		reservation.addOwned(repoPath)
+	}
 	defer repo.Close()
+	if err := auditAdmissionRepository(ctx, repo); err != nil {
+		return RootInspection{}, err
+	}
 	if initializeAdmissionRootAfterOpenForTest != nil {
 		if err := initializeAdmissionRootAfterOpenForTest(); err != nil {
 			return RootInspection{}, err
@@ -778,28 +811,7 @@ func initializeAdmissionRootWithReservation(ctx context.Context, stateRoot strin
 			return RootInspection{}, err
 		}
 	}
-	return attachAnchorInspection(inspection, anchorPath, schemaMajor)
-}
-
-func createReservedAdmissionRepositoryFile(reservation *admissionRootReservation, repoPath string) error {
-	if reservation == nil {
-		return errors.New("admission root reservation is required")
-	}
-	if err := requireReservedDestinationPathAbsent(repoPath); err != nil {
-		return err
-	}
-	file, err := os.OpenFile(repoPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return foreignDestinationPathError(repoPath)
-		}
-		return err
-	}
-	reservation.addOwned(repoPath)
-	if err := file.Close(); err != nil {
-		return err
-	}
-	return nil
+	return attachRequiredAnchorInspection(inspection, anchorPath, schemaMajor)
 }
 
 func saveReservedFileAnchorSnapshot(reservation *admissionRootReservation, anchorPath string, snapshot AnchorSnapshot) error {
@@ -817,16 +829,6 @@ func saveReservedFileAnchorSnapshot(reservation *admissionRootReservation, ancho
 		return err
 	}
 	return nil
-}
-
-func requireReservedDestinationPathAbsent(path string) error {
-	if _, err := os.Stat(path); err == nil {
-		return foreignDestinationPathError(path)
-	} else if errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else {
-		return err
-	}
 }
 
 func foreignDestinationPathError(path string) error {
@@ -881,26 +883,57 @@ func ownedStateRootLeftovers(reservation *admissionRootReservation) []string {
 	return leftovers
 }
 
-func attachAnchorInspection(inspection RootInspection, anchorPath string, schemaMajor uint16) (RootInspection, error) {
-	snapshot, err := loadFileAnchorSnapshot(anchorPath)
-	if os.IsNotExist(err) {
-		return inspection, nil
-	}
+func attachRequiredAnchorInspection(inspection RootInspection, anchorPath string, schemaMajor uint16) (RootInspection, error) {
+	snapshot, err := loadRequiredFileAnchorSnapshot(anchorPath, inspection.DomainUUID, schemaMajor)
 	if err != nil {
 		return RootInspection{}, err
 	}
+	return attachAnchorSnapshot(inspection, snapshot), nil
+}
+
+func loadRequiredFileAnchorSnapshot(anchorPath, dbUUID string, schemaMajor uint16) (AnchorSnapshot, error) {
+	snapshot, err := loadFileAnchorSnapshot(anchorPath)
+	if err != nil {
+		return AnchorSnapshot{}, err
+	}
 	if !snapshot.Initialized {
-		return inspection, nil
+		return AnchorSnapshot{}, fmt.Errorf("%w: anchor is missing: %s", ErrAnchorInvariant, anchorPath)
 	}
-	if snapshot.DBUUID != inspection.DomainUUID || snapshot.SchemaMajor != schemaMajor {
-		return RootInspection{}, fmt.Errorf("%w: anchor identity does not match repository", ErrAnchorInvariant)
+	if snapshot.DBUUID != dbUUID || snapshot.SchemaMajor != schemaMajor {
+		return AnchorSnapshot{}, fmt.Errorf("%w: anchor identity does not match repository", ErrAnchorInvariant)
 	}
+	return snapshot, nil
+}
+
+func requireOptionalResetAnchorMatch(anchorPath, dbUUID string, schemaMajor uint16) error {
+	snapshot, err := loadFileAnchorSnapshot(anchorPath)
+	if err != nil {
+		return err
+	}
+	if !snapshot.Initialized {
+		return nil
+	}
+	if snapshot.DBUUID != dbUUID || snapshot.SchemaMajor != schemaMajor {
+		return fmt.Errorf("%w: anchor identity does not match repository", ErrAnchorInvariant)
+	}
+	return nil
+}
+
+func attachAnchorSnapshot(inspection RootInspection, snapshot AnchorSnapshot) RootInspection {
 	inspection.AnchorPhase = snapshot.Phase
 	if snapshot.Phase == "fail_stopped" {
 		inspection.FailStopped = true
 		inspection.FailStopReason = snapshot.Reason
 	}
-	return inspection, nil
+	return inspection
+}
+
+func auditAdmissionRepository(ctx context.Context, repo repository.Repository) error {
+	auditor, ok := repo.(repository.Auditor)
+	if !ok {
+		return nil
+	}
+	return auditor.AuditIntegrity(ctx)
 }
 
 func adminBootRef(operation string) (model.BootRef, error) {

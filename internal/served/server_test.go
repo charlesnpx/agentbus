@@ -3564,7 +3564,7 @@ func TestServeFailsPreListenerOnStartupCorruptBindingIndexValue(t *testing.T) {
 	}
 
 	dbPath := filepath.Join(h.root, admissionRepositoryFile)
-	repo, err := bboltrepo.NewRepository(dbPath)
+	repo, err := bboltrepo.OpenExisting(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3579,11 +3579,8 @@ func TestServeFailsPreListenerOnStartupCorruptBindingIndexValue(t *testing.T) {
 	}
 	err = restart.Serve(context.Background())
 	requireServedCorruptKind(t, err, "binding_index")
-	// Record-level corruption is detected after the boot claim commits, so
-	// whole-file byte identity is not the contract here (that applies to
-	// structural open-time corruption). The contract: the corrupt record is
-	// never repaired or deleted — a second startup attempt must detect the
-	// same corruption and refuse to serve.
+	// Record-level corruption is never repaired or deleted: a second startup
+	// attempt must detect the same corruption and refuse to serve.
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatalf("admission DB missing after startup corruption failure: %v", err)
 	}
@@ -3594,6 +3591,267 @@ func TestServeFailsPreListenerOnStartupCorruptBindingIndexValue(t *testing.T) {
 	}
 	err = second.Serve(context.Background())
 	requireServedCorruptKind(t, err, "binding_index")
+}
+
+func TestServeBootstrapRootExistenceMatrix(t *testing.T) {
+	tests := []struct {
+		name      string
+		arrange   func(*testing.T, string)
+		want      error
+		assertion func(*testing.T, string, error)
+	}{
+		{
+			name: "missing db missing anchor creates",
+			assertion: func(t *testing.T, root string, err error) {
+				t.Helper()
+				if err != nil {
+					t.Fatalf("bootstrapAdmission error = %v, want nil", err)
+				}
+				assertAdmissionRootFilesExist(t, root)
+			},
+		},
+		{
+			name: "valid db matching anchor opens",
+			arrange: func(t *testing.T, root string) {
+				t.Helper()
+				if _, err := authority.ResetEmptyAdmissionRoot(context.Background(), root); err != nil {
+					t.Fatal(err)
+				}
+			},
+			assertion: func(t *testing.T, root string, err error) {
+				t.Helper()
+				if err != nil {
+					t.Fatalf("bootstrapAdmission error = %v, want nil", err)
+				}
+				assertAdmissionRootFilesExist(t, root)
+			},
+		},
+		{
+			name: "missing db present anchor rejects without recreate",
+			arrange: func(t *testing.T, root string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(root, admissionAnchorFile), []byte("{}\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: authority.ErrAnchorInvariant,
+			assertion: func(t *testing.T, root string, err error) {
+				t.Helper()
+				assertPathMissing(t, filepath.Join(root, admissionRepositoryFile))
+				assertPathExists(t, filepath.Join(root, admissionAnchorFile))
+			},
+		},
+		{
+			name: "zero length db rejects without initialize",
+			arrange: func(t *testing.T, root string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(root, admissionRepositoryFile), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: repository.ErrInvalidRecord,
+			assertion: func(t *testing.T, root string, err error) {
+				t.Helper()
+				info, statErr := os.Stat(filepath.Join(root, admissionRepositoryFile))
+				if statErr != nil {
+					t.Fatal(statErr)
+				}
+				if info.Size() != 0 {
+					t.Fatalf("zero-length db size = %d, want 0", info.Size())
+				}
+				assertPathMissing(t, filepath.Join(root, admissionAnchorFile))
+			},
+		},
+		{
+			name: "present db missing anchor rejects",
+			arrange: func(t *testing.T, root string) {
+				t.Helper()
+				if _, err := authority.ResetEmptyAdmissionRoot(context.Background(), root); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(filepath.Join(root, admissionAnchorFile)); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: authority.ErrAnchorInvariant,
+			assertion: func(t *testing.T, root string, err error) {
+				t.Helper()
+				assertPathExists(t, filepath.Join(root, admissionRepositoryFile))
+				assertPathMissing(t, filepath.Join(root, admissionAnchorFile))
+			},
+		},
+		{
+			name: "anchor mismatch rejects",
+			arrange: func(t *testing.T, root string) {
+				t.Helper()
+				if _, err := authority.ResetEmptyAdmissionRoot(context.Background(), root); err != nil {
+					t.Fatal(err)
+				}
+				anchorPath := filepath.Join(root, admissionAnchorFile)
+				snapshot, err := authority.LoadFileAnchorSnapshot(anchorPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				snapshot.DBUUID = "bbolt-db-mismatched"
+				raw, err := json.Marshal(snapshot)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(anchorPath, append(raw, '\n'), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: authority.ErrAnchorInvariant,
+		},
+		{
+			name: "old schema precedes missing bucket",
+			arrange: func(t *testing.T, root string) {
+				t.Helper()
+				if _, err := authority.ResetEmptyAdmissionRoot(context.Background(), root); err != nil {
+					t.Fatal(err)
+				}
+				repoPath := filepath.Join(root, admissionRepositoryFile)
+				setAdmissionRepositoryMetaSchemaVersion(t, repoPath, 1)
+				deleteAdmissionRepositoryBucket(t, repoPath, "binding_index")
+			},
+			want: repository.ErrInvalidRecord,
+			assertion: func(t *testing.T, _ string, err error) {
+				t.Helper()
+				var schemaErr AdmissionRootIncompatibleSchemaError
+				if !errors.As(err, &schemaErr) {
+					t.Fatalf("bootstrapAdmission error = %T %v, want AdmissionRootIncompatibleSchemaError", err, err)
+				}
+				if errors.Is(err, repository.ErrCorruptRecord) {
+					t.Fatalf("bootstrapAdmission error = %v, want schema before missing bucket", err)
+				}
+			},
+		},
+		{
+			name: "missing binding index rejects",
+			arrange: func(t *testing.T, root string) {
+				t.Helper()
+				if _, err := authority.ResetEmptyAdmissionRoot(context.Background(), root); err != nil {
+					t.Fatal(err)
+				}
+				deleteAdmissionRepositoryBucket(t, filepath.Join(root, admissionRepositoryFile), "binding_index")
+			},
+			want: repository.ErrCorruptRecord,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			root := shortTempDir(t)
+			if tt.arrange != nil {
+				tt.arrange(t, root)
+			}
+			server, err := bootstrapAdmissionRootForTest(t, root)
+			if tt.want == nil {
+				if tt.assertion != nil {
+					tt.assertion(t, root, err)
+				}
+				if err == nil {
+					if closeErr := server.closeServeAdmission(); closeErr != nil {
+						t.Fatal(closeErr)
+					}
+				}
+				return
+			}
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("bootstrapAdmission error = %v, want %v", err, tt.want)
+			}
+			assertNoServeAdmissionPublished(t, server)
+			if tt.assertion != nil {
+				tt.assertion(t, root, err)
+			}
+		})
+	}
+}
+
+func TestServeBootstrapStructuralCorruptionFixturesAreFatalAndUntouched(t *testing.T) {
+	tests := []struct {
+		name    string
+		arrange func(*testing.T, string)
+		want    error
+	}{
+		{
+			name: "truncated file",
+			arrange: func(t *testing.T, root string) {
+				t.Helper()
+				truncateAdmissionRepository(t, filepath.Join(root, admissionRepositoryFile))
+			},
+			want: repository.ErrCorruptRecord,
+		},
+		{
+			name: "page header flip",
+			arrange: func(t *testing.T, root string) {
+				t.Helper()
+				flipPageHeaderContaining(t, filepath.Join(root, admissionRepositoryFile), []byte("binding_index"))
+			},
+			want: repository.ErrCorruptRecord,
+		},
+		{
+			name: "leaf page damage",
+			arrange: func(t *testing.T, root string) {
+				t.Helper()
+				_, jobID := initializedServedRootWithPendingJobForTest(t, root, "leaf-page-damage")
+				flipPageHeaderContaining(t, filepath.Join(root, admissionRepositoryFile), []byte(jobID))
+			},
+			want: repository.ErrCorruptRecord,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			root := shortTempDir(t)
+			if _, err := authority.ResetEmptyAdmissionRoot(context.Background(), root); err != nil {
+				t.Fatal(err)
+			}
+			tt.arrange(t, root)
+			repoPath := filepath.Join(root, admissionRepositoryFile)
+			before := readFileBytes(t, repoPath)
+			server, err := bootstrapAdmissionRootForTest(t, root)
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("bootstrapAdmission error = %v, want %v", err, tt.want)
+			}
+			assertNoServeAdmissionPublished(t, server)
+			after := readFileBytes(t, repoPath)
+			if !bytes.Equal(before, after) {
+				t.Fatal("structural startup failure mutated admission repository")
+			}
+		})
+	}
+}
+
+func TestServeBootstrapCorruptEnvelopeRepeatsWithoutRepair(t *testing.T) {
+	root := shortTempDir(t)
+	_, jobID := initializedServedRootWithPendingJobForTest(t, root, "corrupt-envelope")
+	repoPath := filepath.Join(root, admissionRepositoryFile)
+	repo, err := bboltrepo.OpenExisting(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.InjectCorruptSafetyForTest(model.JobID(jobID), "safety checksum")
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := readFileBytes(t, repoPath)
+
+	server, err := bootstrapAdmissionRootForTest(t, root)
+	requireServedCorruptKind(t, err, "safety")
+	assertNoServeAdmissionPublished(t, server)
+	afterFirst := readFileBytes(t, repoPath)
+	if !bytes.Equal(before, afterFirst) {
+		t.Fatal("corrupt envelope startup failure repaired or rewrote repository")
+	}
+
+	second, err := bootstrapAdmissionRootForTest(t, root)
+	requireServedCorruptKind(t, err, "safety")
+	assertNoServeAdmissionPublished(t, second)
+	afterSecond := readFileBytes(t, repoPath)
+	if !bytes.Equal(before, afterSecond) {
+		t.Fatal("second corrupt envelope startup failure repaired or rewrote repository")
+	}
 }
 
 func TestServerContextCancelDoesNotForceCloseEstablishedConnection(t *testing.T) {
@@ -7294,6 +7552,108 @@ func assertAdmissionSnapshotFailStopTrip(t *testing.T, server *Server, root stri
 	if snapshot.Phase != "fail_stopped" {
 		t.Fatalf("anchor phase = %q, want fail_stopped after %v", snapshot.Phase, err)
 	}
+}
+
+func bootstrapAdmissionRootForTest(t *testing.T, root string) (*Server, error) {
+	t.Helper()
+	server := newTestServerAtRoot(t, root, shortTempDir(t), newFakeBackend("fake"))
+	configureTestAdmissionRuntime(t, server, newAdmissionFakeLaunchCustodian(t), true)
+	return server, server.bootstrapAdmission(context.Background())
+}
+
+func assertNoServeAdmissionPublished(t *testing.T, server *Server) {
+	t.Helper()
+	server.admissionStateMu.RLock()
+	defer server.admissionStateMu.RUnlock()
+	if server.admissionInstance != nil || server.admissionReady != nil || server.admissionRepository != nil || server.admissionClose != nil {
+		t.Fatalf("admission state published after failed bootstrap: instance=%v ready=%v repo=%T close=%T", server.admissionInstance, server.admissionReady, server.admissionRepository, server.admissionClose)
+	}
+}
+
+func assertAdmissionRootFilesExist(t *testing.T, root string) {
+	t.Helper()
+	assertPathExists(t, filepath.Join(root, admissionRepositoryFile))
+	assertPathExists(t, filepath.Join(root, admissionAnchorFile))
+}
+
+func assertPathExists(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("%s stat = %v, want exists", path, err)
+	}
+}
+
+func assertPathMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("%s stat = %v, want missing", path, err)
+	}
+}
+
+func readFileBytes(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func truncateAdmissionRepository(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() < 2 {
+		t.Fatalf("repository size = %d, want truncatable file", info.Size())
+	}
+	if err := os.Truncate(path, info.Size()/2); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func flipPageHeaderContaining(t *testing.T, path string, needle []byte) {
+	t.Helper()
+	data := readFileBytes(t, path)
+	offset := bytes.Index(data, needle)
+	if offset < 0 {
+		t.Fatalf("needle %q not found in %s", string(needle), path)
+	}
+	pageSize := os.Getpagesize()
+	pageStart := offset - offset%pageSize
+	if pageStart+9 >= len(data) {
+		t.Fatalf("page header for %q starts outside file bounds", string(needle))
+	}
+	data[pageStart+8] ^= 0xff
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func initializedServedRootWithPendingJobForTest(t *testing.T, root, name string) (*Server, string) {
+	t.Helper()
+	server, err := bootstrapAdmissionRootForTest(t, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := server.admissionReady.Accept(context.Background(), authority.AcceptRequest{
+		RequestKey: model.RequestKey{
+			WorkspaceKey: model.WorkspaceKey("workspace-" + name),
+			RequestID:    model.RequestID("request-" + name),
+		},
+		WorkspaceLayoutKey: model.WorkspaceKey(strings.Repeat("b", 64)),
+		TaskIdentity:       model.NewSHA256TaskIdentity([]byte("task-" + name)),
+		Mode:               model.ModeIdentifiedFenced,
+		SessionID:          "session-" + name,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.closeServeAdmission(); err != nil {
+		t.Fatal(err)
+	}
+	return server, accepted.Record.JobID.String()
 }
 
 func mustMarshal(t *testing.T, v any) json.RawMessage {

@@ -368,13 +368,14 @@ func TestProductionStrictCLINoDaemonUnsupportedHostDarwinE2B(t *testing.T) {
 		t.Skip("unsupported-host no-daemon check is darwin-only")
 	}
 	agentbusPath := builtServedNativeAgentbusPath(t)
-	root := filepath.Join(t.TempDir(), "state")
+	root := shortTempDir(t)
+	env := upsertEnv(os.Environ(), "HOME="+shortTempDir(t))
 	for _, args := range [][]string{
 		{"status", "--job", "job_darwin_unsupported"},
 		{"result", "--job", "job_darwin_unsupported"},
 		{"cancel", "--job", "job_darwin_unsupported"},
 	} {
-		result := runProductionStrictJobCLI(t, agentbusPath, root, os.Environ(), 11, args...)
+		result := runProductionStrictJobCLI(t, agentbusPath, root, env, 11, args...)
 		if !strings.Contains(result.stderr, "daemon startup failed") {
 			t.Fatalf("agentbus %s stderr=%q, want daemon startup failure", strings.Join(args, " "), result.stderr)
 		}

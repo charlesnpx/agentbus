@@ -97,9 +97,9 @@ func TestRepositoryContract(t *testing.T) {
 
 func TestAdmissionRepositoryRequiredBucketsMatchInitializedRepository(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
-		t.Fatalf("Open() error = %v", err)
+		t.Fatalf("Create() error = %v", err)
 	}
 	defer repo.Close()
 
@@ -160,32 +160,18 @@ func TestAdmissionRepositoryRequiredAccessorsReturnCopies(t *testing.T) {
 	}
 }
 
-func TestOpenExistingNoInitRequiresStrictSchemaV2(t *testing.T) {
+func TestOpenExistingRequiresStrictSchemaV2(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
 	before := createSchemaV1RepositoryForTest(t, path)
 
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
 	if err == nil {
 		repo.Close()
-		t.Fatal("Open succeeded for schema v1, want incompatible schema error")
-	}
-	var openSchemaErr UnsupportedAuthorityMetaSchemaVersionError
-	if !errors.As(err, &openSchemaErr) {
-		t.Fatalf("Open error = %T %v, want UnsupportedAuthorityMetaSchemaVersionError", err, err)
-	}
-	afterOpen := readFileBytesForTest(t, path)
-	if !bytes.Equal(before, afterOpen) {
-		t.Fatal("failed old-schema Open mutated database bytes")
-	}
-
-	repo, err = OpenExistingNoInit(path, nil, &bolt.Options{Timeout: time.Second})
-	if err == nil {
-		repo.Close()
-		t.Fatal("OpenExistingNoInit succeeded for schema v1, want incompatible schema error")
+		t.Fatal("OpenExisting succeeded for schema v1, want incompatible schema error")
 	}
 	var schemaErr UnsupportedAuthorityMetaSchemaVersionError
 	if !errors.As(err, &schemaErr) {
-		t.Fatalf("OpenExistingNoInit error = %T %v, want UnsupportedAuthorityMetaSchemaVersionError", err, err)
+		t.Fatalf("OpenExisting error = %T %v, want UnsupportedAuthorityMetaSchemaVersionError", err, err)
 	}
 	if schemaErr.SchemaVersion != 1 {
 		t.Fatalf("schema version = %d, want 1", schemaErr.SchemaVersion)
@@ -198,20 +184,20 @@ func TestOpenExistingNoInitRequiresStrictSchemaV2(t *testing.T) {
 		t.Fatal("failed old-schema open mutated database bytes")
 	}
 
-	repo, err = OpenReadOnly(path, &bolt.Options{Timeout: time.Second})
+	repo, err = OpenExistingReadOnly(path, &bolt.Options{Timeout: time.Second})
 	if err == nil {
 		repo.Close()
-		t.Fatal("OpenReadOnly succeeded for schema v1, want incompatible schema error")
+		t.Fatal("OpenExistingReadOnly succeeded for schema v1, want incompatible schema error")
 	}
 	var readOnlySchemaErr UnsupportedAuthorityMetaSchemaVersionError
 	if !errors.As(err, &readOnlySchemaErr) {
-		t.Fatalf("OpenReadOnly error = %T %v, want UnsupportedAuthorityMetaSchemaVersionError", err, err)
+		t.Fatalf("OpenExistingReadOnly error = %T %v, want UnsupportedAuthorityMetaSchemaVersionError", err, err)
 	}
 }
 
-func TestOpenInitializesStrictSchemaV2AndBindingIndex(t *testing.T) {
+func TestCreateInitializesStrictSchemaV2AndBindingIndex(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +221,7 @@ func TestOpenInitializesStrictSchemaV2AndBindingIndex(t *testing.T) {
 
 func TestBindingIndexMismatchIsCorruptionAndAuditFinding(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +253,7 @@ func TestBindingIndexMismatchIsCorruptionAndAuditFinding(t *testing.T) {
 
 func TestBindingIndexValueCorruptionFailsProductionReads(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +286,7 @@ func TestBindingIndexValueCorruptionFailsProductionReads(t *testing.T) {
 
 func TestPutBindingRejectsOrphanBindingIndexEntry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +305,7 @@ func TestPutBindingRejectsOrphanBindingIndexEntry(t *testing.T) {
 
 func TestAuditIntegrityReportsBindingIndexAndSafetyFindings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +328,7 @@ func TestAuditIntegrityReportsBindingIndexAndSafetyFindings(t *testing.T) {
 
 func TestAuditIntegrityMissingBindingIndexReturnsTypedFinding(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +401,7 @@ func TestRootStatsFailsOnCorruptSafetyBindingAndTombstoneRecords(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "admission.db")
-			repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+			repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -570,7 +556,7 @@ func TestPutMetaTouchesBoundedKeysIndependentOfHistory(t *testing.T) {
 
 func TestDefinitelyNotCommittedUpdateLeavesDatabaseBytesUnchanged(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -602,7 +588,7 @@ func TestDefinitelyNotCommittedUpdateLeavesDatabaseBytesUnchanged(t *testing.T) 
 
 func TestAuditDoesNotMutateDatabaseBytes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -620,7 +606,7 @@ func TestAuditDoesNotMutateDatabaseBytes(t *testing.T) {
 
 func TestUnrelatedCorruptRecordRawBytesPreservedAcrossSuccessfulCommit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -732,7 +718,15 @@ func (r *reopeningRepository) reopen() {
 			r.t.Fatalf("close bbolt repository before reopen: %v", err)
 		}
 	}
-	repo, err := Open(r.path, &bolt.Options{Timeout: time.Second})
+	var repo *Repository
+	var err error
+	if _, statErr := os.Stat(r.path); errors.Is(statErr, os.ErrNotExist) {
+		repo, err = Create(r.path, &bolt.Options{Timeout: time.Second})
+	} else if statErr != nil {
+		r.t.Fatalf("stat bbolt repository: %v", statErr)
+	} else {
+		repo, err = OpenExisting(r.path, &bolt.Options{Timeout: time.Second})
+	}
 	if err != nil {
 		r.t.Fatalf("open bbolt repository: %v", err)
 	}
@@ -787,7 +781,7 @@ func createSchemaV1RepositoryForTest(t *testing.T, path string) []byte {
 func newSeededBboltRepository(t *testing.T, count int) *Repository {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -820,7 +814,7 @@ func newSeededBboltRepository(t *testing.T, count int) *Repository {
 func newDirectSeededBboltRepositoryForBenchmark(b *testing.B, count int) *Repository {
 	b.Helper()
 	path := filepath.Join(b.TempDir(), "admission.db")
-	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -189,7 +189,7 @@ func TestRecoverAdmissionRootRejectsMetaRemovedAfterPreflightWithoutMutation(t *
 func TestRecoverAdmissionRootPreflightLockContentionReportsRootBusyWithoutMutation(t *testing.T) {
 	root := initializedGenerationZeroAdmissionRoot(t)
 	repoPath := filepath.Join(root, admissionRepositoryFile)
-	holder, err := bboltrepo.Open(repoPath, &bolt.Options{Timeout: time.Second})
+	holder, err := bboltrepo.OpenExisting(repoPath, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		t.Fatalf("hold repository lock: %v", err)
 	}

@@ -247,9 +247,9 @@ func TestReadyApplySurfacesCommitOutcomeUnknownOnRealBboltCommitPhaseFault(t *te
 func TestReadyAcceptAndClaimFailStopsOnRealBboltAmbiguousCommit(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "admission.bbolt")
-	inner, err := bboltrepo.NewRepository(path)
+	inner, err := bboltrepo.Create(path)
 	if err != nil {
-		t.Fatalf("NewRepository() error = %v", err)
+		t.Fatalf("Create() error = %v", err)
 	}
 	innerClosed := false
 	t.Cleanup(func() {
@@ -288,7 +288,7 @@ func TestReadyAcceptAndClaimFailStopsOnRealBboltAmbiguousCommit(t *testing.T) {
 		t.Fatalf("close bbolt repository before reopen: %v", err)
 	}
 	innerClosed = true
-	reopened, err := bboltrepo.NewRepository(path)
+	reopened, err := bboltrepo.OpenExisting(path)
 	if err != nil {
 		t.Fatalf("reopen bbolt repository: %v", err)
 	}
@@ -543,9 +543,9 @@ func (a *durabilityFaultingAnchor) VerifyRecovery(boot model.BootRef, token stri
 
 func newBboltDurabilityReady(t *testing.T, name string) (*Ready, *durabilityFaultingRepository, *AnchorStore) {
 	t.Helper()
-	inner, err := bboltrepo.NewRepository(filepath.Join(t.TempDir(), "admission.bbolt"))
+	inner, err := bboltrepo.Create(filepath.Join(t.TempDir(), "admission.bbolt"))
 	if err != nil {
-		t.Fatalf("NewRepository() error = %v", err)
+		t.Fatalf("Create() error = %v", err)
 	}
 	t.Cleanup(func() {
 		if err := inner.Close(); err != nil {

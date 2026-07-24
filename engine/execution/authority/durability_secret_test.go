@@ -49,9 +49,9 @@ func TestDurableAuthorityRecordsDoNotPersistLegacyReleaseCredentialBytes(t *test
 
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "admission.bbolt")
-	repo, err := bboltrepo.NewRepository(path)
+	repo, err := bboltrepo.Create(path)
 	if err != nil {
-		t.Fatalf("NewRepository() error = %v", err)
+		t.Fatalf("Create() error = %v", err)
 	}
 	repoClosed := false
 	t.Cleanup(func() {
