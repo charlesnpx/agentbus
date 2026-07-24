@@ -14,7 +14,9 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
+	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
 	"github.com/charlesnpx/agentbus/internal/protocol"
+	bolt "go.etcd.io/bbolt"
 )
 
 var ErrAdmissionRootMissing = errors.New("agentbus admission root missing")
@@ -136,10 +138,56 @@ func existingAdmissionStateRoot(root string) (string, error) {
 
 func openExistingAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
 	repoPath := filepath.Join(s.stateRoot, admissionRepositoryFile)
-	if err := requireExistingAdmissionRepositoryFile(repoPath); err != nil {
+	anchorPath := filepath.Join(s.stateRoot, admissionAnchorFile)
+	if err := requireExistingInitializedAdmissionRoot(ctx, repoPath, anchorPath); err != nil {
 		return nil, nil, nil, err
 	}
 	return openAdmissionBootstrapper(ctx, s)
+}
+
+var admissionRepositoryRequiredBuckets = []string{
+	"meta",
+	"bindings",
+	"safety",
+	"projections",
+	"tombstones",
+	"quarantine",
+}
+
+var admissionRepositoryRequiredMetaKeys = []string{
+	"db_uuid",
+	"authority",
+}
+
+func requireExistingInitializedAdmissionRoot(ctx context.Context, repoPath, anchorPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := requireExistingAdmissionRepositoryFile(repoPath); err != nil {
+		return err
+	}
+	if err := requireInitializedAdmissionRepositoryStructure(repoPath); err != nil {
+		return err
+	}
+	repo, err := bboltrepo.OpenReadOnly(repoPath)
+	if err != nil {
+		return err
+	}
+	defer closeRecoveryOnlyRepository(repo)
+	dbUUID, schemaMajor, err := repo.AnchorIdentity()
+	if err != nil {
+		return err
+	}
+	if err := repo.View(ctx, func(tx repository.ReadTx) error {
+		meta := tx.Meta()
+		if meta.State != repository.RecordValid {
+			return fmt.Errorf("%w: meta is %s", repository.ErrInvalidRecord, meta.State)
+		}
+		return meta.Value.Validate()
+	}); err != nil {
+		return err
+	}
+	return requireExistingAdmissionAnchorFile(anchorPath, dbUUID, schemaMajor)
 }
 
 func requireExistingAdmissionRepositoryFile(repoPath string) error {
@@ -155,6 +203,52 @@ func requireExistingAdmissionRepositoryFile(repoPath string) error {
 	}
 	if info.Size() == 0 {
 		return fmt.Errorf("%w: admission repository is zero-length: %s", repository.ErrInvalidRecord, repoPath)
+	}
+	return nil
+}
+
+func requireInitializedAdmissionRepositoryStructure(repoPath string) error {
+	db, err := bolt.Open(repoPath, 0o600, &bolt.Options{ReadOnly: true, Timeout: admissionRepositoryOpenTimeout})
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return db.View(func(tx *bolt.Tx) error {
+		for _, name := range admissionRepositoryRequiredBuckets {
+			if tx.Bucket([]byte(name)) == nil {
+				return fmt.Errorf("%w: admission repository missing bucket %q: %s", repository.ErrCorruptRecord, name, repoPath)
+			}
+		}
+		meta := tx.Bucket([]byte("meta"))
+		for _, key := range admissionRepositoryRequiredMetaKeys {
+			if meta.Get([]byte(key)) == nil {
+				return fmt.Errorf("%w: admission repository missing meta key %q: %s", repository.ErrInvalidRecord, key, repoPath)
+			}
+		}
+		return nil
+	})
+}
+
+func requireExistingAdmissionAnchorFile(anchorPath, dbUUID string, schemaMajor uint16) error {
+	info, err := os.Stat(anchorPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: anchor is missing: %s", authority.ErrAnchorInvariant, anchorPath)
+		}
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%w: anchor is not a regular file: %s", authority.ErrAnchorInvariant, anchorPath)
+	}
+	snapshot, err := authority.LoadFileAnchorSnapshot(anchorPath)
+	if err != nil {
+		return err
+	}
+	if !snapshot.Initialized {
+		return fmt.Errorf("%w: anchor is missing: %s", authority.ErrAnchorInvariant, anchorPath)
+	}
+	if snapshot.DBUUID != dbUUID || snapshot.SchemaMajor != schemaMajor {
+		return fmt.Errorf("%w: anchor identity does not match repository", authority.ErrAnchorInvariant)
 	}
 	return nil
 }

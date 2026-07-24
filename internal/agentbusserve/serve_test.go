@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -152,6 +153,71 @@ func TestProductionRecoverCLIUnsupportedLeavesExistingRootEmptyOnDarwin(t *testi
 	}
 }
 
+func TestRecoverAdmissionRootClosesRuntimeOnEarlyRootErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		root func(t *testing.T) string
+	}{
+		{
+			name: "missing root",
+			root: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "missing")
+			},
+		},
+		{
+			name: "root is file",
+			root: func(t *testing.T) string {
+				path := filepath.Join(t.TempDir(), "state")
+				if err := os.WriteFile(path, []byte("not a directory"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime, closes := closeCountingRecoveryRuntime()
+			stubRecoveryStrictRuntime(t, runtime, nil)
+
+			_, err := RecoverAdmissionRoot(context.Background(), Config{
+				StateRoot: tt.root(t),
+				CWD:       t.TempDir(),
+			})
+			if !errors.Is(err, served.ErrAdmissionRootMissing) {
+				t.Fatalf("RecoverAdmissionRoot error = %v, want ErrAdmissionRootMissing", err)
+			}
+			if got := closes.Load(); got != 1 {
+				t.Fatalf("runtime closes = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestRecoverAdmissionRootConfigErrorReturnsBeforeRootValidationAndClosesRuntime(t *testing.T) {
+	runtime, closes := closeCountingRecoveryRuntime()
+	configErr := errors.New("strict runtime compose failed")
+	stubRecoveryStrictRuntime(t, runtime, configErr)
+
+	_, err := RecoverAdmissionRoot(context.Background(), Config{
+		StateRoot: filepath.Join(t.TempDir(), "missing"),
+		CWD:       t.TempDir(),
+	})
+	if !errors.Is(err, configErr) {
+		t.Fatalf("RecoverAdmissionRoot error = %v, want config error", err)
+	}
+	if !errors.Is(err, served.ErrAdmissionStrictSupportUnavailable) {
+		t.Fatalf("RecoverAdmissionRoot error = %v, want ErrAdmissionStrictSupportUnavailable", err)
+	}
+	if errors.Is(err, served.ErrAdmissionRootMissing) {
+		t.Fatalf("RecoverAdmissionRoot error = %v, recovery ran root validation before returning config error", err)
+	}
+	if got := closes.Load(); got != 1 {
+		t.Fatalf("runtime closes = %d, want 1", got)
+	}
+}
+
 func TestServeLauncherReportsAdmissionRootBusyCode(t *testing.T) {
 	root := t.TempDir()
 	_, err := daemonlaunch.Launch(context.Background(), agentbusServeLaunchOptionsWithMode(t, root, t.TempDir(), "root-busy-report"))
@@ -168,6 +234,26 @@ func TestServeLauncherReportsAdmissionRootBusyCode(t *testing.T) {
 	if !strings.Contains(startup.Message, served.ErrAdmissionRootBusy.Error()) {
 		t.Fatalf("startup message = %q, want root busy diagnostic", startup.Message)
 	}
+}
+
+func closeCountingRecoveryRuntime() (custodian.Runtime, *atomic.Int64) {
+	closes := &atomic.Int64{}
+	runtime := custodian.NewUnavailableRuntimeForTest(custodian.ErrSupervisorUnavailable, func() error {
+		closes.Add(1)
+		return nil
+	})
+	return runtime, closes
+}
+
+func stubRecoveryStrictRuntime(t *testing.T, runtime custodian.Runtime, err error) {
+	t.Helper()
+	previous := newRecoveryStrictAdmissionRuntime
+	newRecoveryStrictAdmissionRuntime = func(StrictAdmissionOptions) (custodian.Runtime, error) {
+		return runtime, err
+	}
+	t.Cleanup(func() {
+		newRecoveryStrictAdmissionRuntime = previous
+	})
 }
 
 func TestServeLauncherDaemonSurvivesStartupDeadline(t *testing.T) {
