@@ -1689,6 +1689,9 @@ func (a *servedAdmissionAuthority) Snapshot(ctx context.Context, jobID model.Job
 	if err != nil {
 		return coordinator.JobSnapshot{}, err
 	}
+	if err := authorityImageSafetyCorruption(image); err != nil {
+		return coordinator.JobSnapshot{}, a.ready.FailStopRepositoryCorruption(ctx, "admission snapshot", err)
+	}
 	if image.Safety.State != repository.RecordValid {
 		return coordinator.JobSnapshot{}, fmt.Errorf("safety state = %s", image.Safety.State)
 	}

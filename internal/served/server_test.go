@@ -731,6 +731,111 @@ func TestCompleteAdmissionRunLogsRecoveryObligationWhenAuthorityCleared(t *testi
 	}
 }
 
+func TestAdmissionSnapshotCorruptionTripsFailStopDuringLaunchPreparation(t *testing.T) {
+	cases := []struct {
+		name    string
+		kind    string
+		corrupt func(*testing.T, *Server, model.RequestKey, model.JobID)
+	}{
+		{
+			name: "binding",
+			kind: "binding",
+			corrupt: func(t *testing.T, server *Server, key model.RequestKey, _ model.JobID) {
+				t.Helper()
+				corruptAdmissionBindingForTest(t, server, key, "binding checksum")
+			},
+		},
+		{
+			name: "safety",
+			kind: "safety",
+			corrupt: func(t *testing.T, server *Server, _ model.RequestKey, jobID model.JobID) {
+				t.Helper()
+				corruptAdmissionSafetyForTest(t, server, jobID, "safety checksum")
+			},
+		},
+	}
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			backend := newFakeBackend("fake")
+			server, root, _ := newUnstartedTestServer(t, backend)
+			enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+			accepted := acceptIdentifiedAuthorityWork(t, server, "snapshot-launch-"+tt.name)
+			tt.corrupt(t, server, accepted.Binding.RequestKey, accepted.Record.JobID)
+
+			run := jobRun{
+				jobID:     accepted.Record.JobID.String(),
+				sessionID: accepted.Projection.SessionID,
+				session:   &fakeSession{id: accepted.Projection.SessionID, backend: backend},
+			}
+			_, _, ok, err := server.prepareAdmittedJobLaunch(context.Background(), run)
+			if ok {
+				t.Fatal("prepareAdmittedJobLaunch ok = true, want corruption rejection")
+			}
+			requireServedCorruptKind(t, err, tt.kind)
+			if !errors.Is(err, authority.ErrFailStopped) {
+				t.Fatalf("prepareAdmittedJobLaunch error = %v, want durable fail-stop", err)
+			}
+			assertAdmissionSnapshotFailStopTrip(t, server, root, err)
+
+			next := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+				WorkspaceKey: "workspace-after-snapshot-launch-" + tt.name,
+				RequestID:    "request-after-snapshot-launch-" + tt.name,
+				TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: root, Write: false, Prompt: "after"},
+			}))
+			assertJobHandlerError(t, next, protocol.ErrorBackendUnavailable, protocol.AdmissionRejectRootFailStopped, "")
+		})
+	}
+}
+
+func TestAdmissionSnapshotCorruptionTripsFailStopDuringCompletion(t *testing.T) {
+	cases := []struct {
+		name    string
+		kind    string
+		corrupt func(*testing.T, *Server, model.RequestKey, model.JobID)
+	}{
+		{
+			name: "binding",
+			kind: "binding",
+			corrupt: func(t *testing.T, server *Server, key model.RequestKey, _ model.JobID) {
+				t.Helper()
+				corruptAdmissionBindingForTest(t, server, key, "binding checksum")
+			},
+		},
+		{
+			name: "safety",
+			kind: "safety",
+			corrupt: func(t *testing.T, server *Server, _ model.RequestKey, jobID model.JobID) {
+				t.Helper()
+				corruptAdmissionSafetyForTest(t, server, jobID, "safety checksum")
+			},
+		},
+	}
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+			enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+			accepted := acceptIdentifiedAuthorityWork(t, server, "snapshot-complete-"+tt.name)
+			tt.corrupt(t, server, accepted.Binding.RequestKey, accepted.Record.JobID)
+
+			err := server.completeAdmissionRun(jobRun{jobID: accepted.Record.JobID.String()}, engine.StateCompleted, "done")
+			requireServedCorruptKind(t, err, tt.kind)
+			if !errors.Is(err, authority.ErrFailStopped) {
+				t.Fatalf("completeAdmissionRun error = %v, want durable fail-stop", err)
+			}
+			assertAdmissionSnapshotFailStopTrip(t, server, root, err)
+
+			next := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+				WorkspaceKey: "workspace-after-snapshot-complete-" + tt.name,
+				RequestID:    "request-after-snapshot-complete-" + tt.name,
+				TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: root, Write: false, Prompt: "after"},
+			}))
+			assertJobHandlerError(t, next, protocol.ErrorBackendUnavailable, protocol.AdmissionRejectRootFailStopped, "")
+		})
+	}
+}
+
 func TestServeCloseReturnsWhenIdentifiedSubmitWedgedInStorage(t *testing.T) {
 	var logs bytes.Buffer
 	oldLogWriter := log.Writer()
@@ -7152,6 +7257,42 @@ func requireServedCorruptKind(t *testing.T, err error, kind string) {
 	var corrupt repository.CorruptRecordKindError
 	if !errors.As(err, &corrupt) || corrupt.Kind != kind {
 		t.Fatalf("error = %T %v, want corrupt kind %s", err, err, kind)
+	}
+}
+
+func corruptAdmissionBindingForTest(t *testing.T, server *Server, key model.RequestKey, diagnostic string) {
+	t.Helper()
+	corruptor, ok := server.admissionRepository.(interface {
+		InjectCorruptBindingForTest(model.RequestKey, string)
+	})
+	if !ok {
+		t.Fatalf("admission repository type = %T, want InjectCorruptBindingForTest", server.admissionRepository)
+	}
+	corruptor.InjectCorruptBindingForTest(key, diagnostic)
+}
+
+func corruptAdmissionSafetyForTest(t *testing.T, server *Server, jobID model.JobID, diagnostic string) {
+	t.Helper()
+	corruptor, ok := server.admissionRepository.(interface {
+		InjectCorruptSafetyForTest(model.JobID, string)
+	})
+	if !ok {
+		t.Fatalf("admission repository type = %T, want InjectCorruptSafetyForTest", server.admissionRepository)
+	}
+	corruptor.InjectCorruptSafetyForTest(jobID, diagnostic)
+}
+
+func assertAdmissionSnapshotFailStopTrip(t *testing.T, server *Server, root string, err error) {
+	t.Helper()
+	if reason := server.safetyLatch.Reason(); reason == nil || !errors.Is(reason, repository.ErrCorruptRecord) {
+		t.Fatalf("safety latch reason = %v, want corrupt record trip reason", reason)
+	}
+	snapshot, loadErr := authority.LoadFileAnchorSnapshot(filepath.Join(root, admissionAnchorFile))
+	if loadErr != nil {
+		t.Fatalf("load admission anchor snapshot: %v", loadErr)
+	}
+	if snapshot.Phase != "fail_stopped" {
+		t.Fatalf("anchor phase = %q, want fail_stopped after %v", snapshot.Phase, err)
 	}
 }
 

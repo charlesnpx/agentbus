@@ -298,6 +298,48 @@ func TestBindingIndexValueCorruptionFailsProductionReads(t *testing.T) {
 	requireCorruptKind(t, err, "binding_index")
 }
 
+func TestPutBindingRejectsOrphanBindingIndexEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	fixture := newBboltFixture(t, "orphan-index-put")
+	repo.InjectCorruptBindingIndexValueForTest(fixture.JobID, fixture.RequestKey)
+
+	_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
+		return tx.PutBinding(fixture.Binding)
+	})
+	if !errors.Is(err, repository.ErrDefinitelyNotCommitted) {
+		t.Fatalf("PutBinding error = %v, want ErrDefinitelyNotCommitted", err)
+	}
+	requireCorruptKind(t, err, "binding_index")
+}
+
+func TestAuditIntegrityReportsBindingIndexAndSafetyFindings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	fixture := newBboltFixture(t, "audit-index-and-safety")
+	acceptBboltFixture(t, repo, fixture)
+	repo.InjectCorruptBindingIndexValueForTest(fixture.JobID, mustRequestKeyForTest(t, "workspace-audit-index-other", "request-audit-index-other"))
+	repo.InjectCorruptSafetyForTest(fixture.JobID, "safety checksum")
+
+	err = repo.AuditIntegrity(context.Background())
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("AuditIntegrity error = %v, want ErrCorruptRecord", err)
+	}
+	for _, kind := range []string{"binding_index", "safety"} {
+		if !errorTreeHasCorruptKind(err, kind) {
+			t.Fatalf("AuditIntegrity error = %v, want %s finding", err, kind)
+		}
+	}
+}
+
 func TestAuditIntegrityMissingBindingIndexReturnsTypedFinding(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
 	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
@@ -403,6 +445,27 @@ func requireCorruptKind(t *testing.T, err error, kind string) {
 	var corrupt repository.CorruptRecordKindError
 	if !errors.As(err, &corrupt) || corrupt.Kind != kind {
 		t.Fatalf("error = %T %v, want corrupt kind %s", err, err, kind)
+	}
+}
+
+func errorTreeHasCorruptKind(err error, kind string) bool {
+	if err == nil {
+		return false
+	}
+	switch typed := err.(type) {
+	case repository.CorruptRecordKindError:
+		return typed.Kind == kind
+	case interface{ Unwrap() []error }:
+		for _, child := range typed.Unwrap() {
+			if errorTreeHasCorruptKind(child, kind) {
+				return true
+			}
+		}
+		return false
+	case interface{ Unwrap() error }:
+		return errorTreeHasCorruptKind(typed.Unwrap(), kind)
+	default:
+		return false
 	}
 }
 

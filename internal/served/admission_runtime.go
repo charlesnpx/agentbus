@@ -472,7 +472,10 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		return nil
 	}
 	snapshot, err := coord.Snapshot(context.Background(), jobID)
-	if err == nil && snapshot.Record.Terminal != nil {
+	if err != nil {
+		return err
+	}
+	if snapshot.Record.Terminal != nil {
 		return nil
 	}
 	outcome, ok := admissionOutcomeForState(state)

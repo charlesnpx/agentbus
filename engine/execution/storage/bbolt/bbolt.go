@@ -1145,9 +1145,10 @@ func (tx readTx) liveJobIDSet() (map[model.JobID]struct{}, error) {
 }
 
 func (tx readTx) auditJobIDSet() (map[model.JobID]struct{}, error) {
-	seen, err := tx.liveJobIDSet()
+	seen, err := tx.auditLiveJobIDSet()
+	var findings []error
 	if err != nil {
-		return nil, err
+		findings = append(findings, err)
 	}
 	tombstones := tx.tx.Bucket(bucketTombstones)
 	if tombstones != nil {
@@ -1159,10 +1160,76 @@ func (tx readTx) auditJobIDSet() (map[model.JobID]struct{}, error) {
 			}
 			return nil
 		}); err != nil {
-			return nil, err
+			findings = append(findings, err)
 		}
 	}
-	return seen, nil
+	return seen, repository.NewIntegrityError(findings)
+}
+
+func (tx readTx) auditLiveJobIDSet() (map[model.JobID]struct{}, error) {
+	seen := map[model.JobID]struct{}{}
+	var findings []error
+	for _, bucketName := range [][]byte{bucketSafety, bucketProjections, bucketQuarantine, bucketBindingIndex} {
+		bucket := tx.tx.Bucket(bucketName)
+		if bucket == nil {
+			continue
+		}
+		tx.count("foreach:" + string(bucketName))
+		if err := bucket.ForEach(func(key, raw []byte) error {
+			jobID, err := model.NewJobID(string(key))
+			if err != nil {
+				findings = append(findings, fmt.Errorf("%w: %s key %q: %v", repository.ErrCorruptRecord, string(bucketName), string(key), err))
+				return nil
+			}
+			switch string(bucketName) {
+			case string(bucketSafety):
+				if _, diagnostic := decodeEnvelope(kindSafety, key, raw, validateSafety, revisionSafety); diagnostic != "" {
+					findings = append(findings, repository.CorruptRecordError("safety", jobID.String(), diagnostic))
+					seen[jobID] = struct{}{}
+					return nil
+				}
+			case string(bucketProjections):
+				if _, diagnostic := decodeEnvelope(kindProjection, key, raw, validateProjectionForLoad, revisionProjection); diagnostic != "" {
+					findings = append(findings, repository.CorruptRecordError("projection", jobID.String(), diagnostic))
+					seen[jobID] = struct{}{}
+					return nil
+				}
+			case string(bucketQuarantine):
+				if _, diagnostic := decodeEnvelope(kindQuarantine, key, raw, validateQuarantine, revisionQuarantine); diagnostic != "" {
+					findings = append(findings, repository.CorruptRecordError("quarantine", jobID.String(), diagnostic))
+					seen[jobID] = struct{}{}
+					return nil
+				}
+			}
+			if bytes.Equal(bucketName, bucketBindingIndex) {
+				if err := tx.validateBindingIndexEntry(jobID, raw); err != nil {
+					findings = append(findings, err)
+					return nil
+				}
+			}
+			seen[jobID] = struct{}{}
+			return nil
+		}); err != nil {
+			return seen, err
+		}
+	}
+	bindings := tx.tx.Bucket(bucketBindings)
+	if bindings != nil {
+		tx.count("foreach:bindings")
+		if err := bindings.ForEach(func(key, raw []byte) error {
+			binding, diagnostic := decodeEnvelope(kindBinding, key, raw, validateBinding, revisionBinding)
+			if diagnostic == "" {
+				if err := tx.validateBindingIndexForRequest(binding.RequestKey); err != nil {
+					findings = append(findings, err)
+				}
+				seen[binding.JobID] = struct{}{}
+			}
+			return nil
+		}); err != nil {
+			return seen, err
+		}
+	}
+	return seen, repository.NewIntegrityError(findings)
 }
 
 func (tx readTx) validateBindingIndexForRequest(key model.RequestKey) error {
@@ -1242,8 +1309,9 @@ func (tx readTx) validateBindingIndexEntry(jobID model.JobID, rawRequestKey []by
 func auditKeysTx(tx readTx) (map[model.RequestKey]struct{}, map[model.JobID]struct{}, error) {
 	requests := map[model.RequestKey]struct{}{}
 	jobs, err := tx.auditJobIDSet()
+	var findings []error
 	if err != nil {
-		return requests, jobs, err
+		findings = append(findings, err)
 	}
 	for _, bucketName := range [][]byte{bucketBindings, bucketTombstones} {
 		bucket := tx.tx.Bucket(bucketName)
@@ -1259,7 +1327,7 @@ func auditKeysTx(tx readTx) (map[model.RequestKey]struct{}, map[model.JobID]stru
 			requests[requestKey] = struct{}{}
 			return nil
 		}); err != nil {
-			return requests, jobs, err
+			findings = append(findings, err)
 		}
 	}
 	for jobID := range jobs {
@@ -1283,7 +1351,7 @@ func auditKeysTx(tx readTx) (map[model.RequestKey]struct{}, map[model.JobID]stru
 			jobs[request.Tombstone.Value.JobID] = struct{}{}
 		}
 	}
-	return requests, jobs, nil
+	return requests, jobs, repository.NewIntegrityError(findings)
 }
 
 type writeTx struct {
@@ -1563,6 +1631,16 @@ func (tx *writeTx) validateNoConflictingBindingIndex(binding model.Binding) erro
 	}
 	if indexedKey != binding.RequestKey {
 		return repository.CorruptRecordError("binding_index", binding.JobID.String(), fmt.Sprintf("points to %s, want %s", indexedKey, binding.RequestKey))
+	}
+	canonical := tx.LookupRequest(indexedKey).Binding
+	if canonical.State == repository.RecordCorrupt {
+		return repository.CorruptRecordError("binding", indexedKey.String(), canonical.Diagnostic)
+	}
+	if canonical.State != repository.RecordValid {
+		return repository.CorruptRecordError("binding_index", binding.JobID.String(), "references missing binding")
+	}
+	if !reflect.DeepEqual(canonical.Value, binding) {
+		return repository.CorruptRecordError("binding_index", binding.JobID.String(), "index entry does not match canonical binding")
 	}
 	return nil
 }
