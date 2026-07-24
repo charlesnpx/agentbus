@@ -16,10 +16,14 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
 	"github.com/charlesnpx/agentbus/internal/protocol"
-	bolt "go.etcd.io/bbolt"
 )
 
 var ErrAdmissionRootMissing = errors.New("agentbus admission root missing")
+
+var (
+	admissionRecoveryAfterPreflightForTest func() error
+	admissionRecoveryBeforeBeginForTest    func() error
+)
 
 type AdmissionRootMissingError struct {
 	Path  string
@@ -47,7 +51,7 @@ func (e AdmissionRootMissingError) Unwrap() error {
 func RecoverAdmissionRoot(ctx context.Context, cfg Config) (AdmissionRecoveryReport, error) {
 	server, err := newAdmissionRecoveryServer(cfg)
 	if err != nil {
-		return AdmissionRecoveryReport{}, err
+		return AdmissionRecoveryReport{}, errors.Join(err, cfg.Runtime.Close())
 	}
 	return server.recoverAdmissionRoot(ctx)
 }
@@ -139,55 +143,108 @@ func existingAdmissionStateRoot(root string) (string, error) {
 func openExistingAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
 	repoPath := filepath.Join(s.stateRoot, admissionRepositoryFile)
 	anchorPath := filepath.Join(s.stateRoot, admissionAnchorFile)
-	if err := requireExistingInitializedAdmissionRoot(ctx, repoPath, anchorPath); err != nil {
+	preflight, err := requireExistingInitializedAdmissionRoot(ctx, repoPath, anchorPath, s.socketPath)
+	if err != nil {
 		return nil, nil, nil, err
 	}
-	return openAdmissionBootstrapper(ctx, s)
+	if admissionRecoveryAfterPreflightForTest != nil {
+		if err := admissionRecoveryAfterPreflightForTest(); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return openAdmissionBootstrapperWithOptions(ctx, s, admissionBootstrapperOpenOptions{
+		expectedRepositoryIdentity: &preflight.repositoryIdentity,
+		requireInitializedAnchor:   true,
+		verifyInitializedStructure: true,
+	})
 }
 
-var admissionRepositoryRequiredBuckets = []string{
-	"meta",
-	"bindings",
-	"safety",
-	"projections",
-	"tombstones",
-	"quarantine",
+type initializedAdmissionRootPreflight struct {
+	repositoryIdentity bboltrepo.FileIdentity
+	dbUUID             string
+	schemaMajor        uint16
 }
 
-var admissionRepositoryRequiredMetaKeys = []string{
-	"db_uuid",
-	"authority",
+type AdmissionRootIdentityMismatchError struct {
+	Path      string
+	Preflight bboltrepo.FileIdentity
+	Opened    bboltrepo.FileIdentity
 }
 
-func requireExistingInitializedAdmissionRoot(ctx context.Context, repoPath, anchorPath string) error {
+func (e AdmissionRootIdentityMismatchError) Error() string {
+	return fmt.Sprintf("%s: admission repository identity changed after preflight: %s (preflight dev=%d ino=%d, opened dev=%d ino=%d)", authority.ErrAnchorInvariant, e.Path, e.Preflight.Dev, e.Preflight.Ino, e.Opened.Dev, e.Opened.Ino)
+}
+
+func (e AdmissionRootIdentityMismatchError) Is(target error) bool {
+	return target == authority.ErrAnchorInvariant
+}
+
+type AdmissionRootIncompatibleSchemaError struct {
+	Path          string
+	SchemaVersion uint16
+	Cause         error
+}
+
+func (e AdmissionRootIncompatibleSchemaError) Error() string {
+	return fmt.Sprintf("admission repository incompatible schema: %s: schema_version=%d: %v", e.Path, e.SchemaVersion, e.Cause)
+}
+
+func (e AdmissionRootIncompatibleSchemaError) Is(target error) bool {
+	return target == repository.ErrInvalidRecord
+}
+
+func (e AdmissionRootIncompatibleSchemaError) Unwrap() error {
+	return e.Cause
+}
+
+type AdmissionRootAnchorError struct {
+	Path  string
+	Cause error
+}
+
+func (e AdmissionRootAnchorError) Error() string {
+	return fmt.Sprintf("%s: anchor %s: %v", authority.ErrAnchorInvariant, e.Path, e.Cause)
+}
+
+func (e AdmissionRootAnchorError) Is(target error) bool {
+	return target == authority.ErrAnchorInvariant
+}
+
+func (e AdmissionRootAnchorError) Unwrap() error {
+	return e.Cause
+}
+
+func admissionRootRepositoryIdentityMismatchError(repoPath string, preflight, opened bboltrepo.FileIdentity) error {
+	return AdmissionRootIdentityMismatchError{Path: repoPath, Preflight: preflight, Opened: opened}
+}
+
+func requireExistingInitializedAdmissionRoot(ctx context.Context, repoPath, anchorPath, socketPath string) (initializedAdmissionRootPreflight, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return initializedAdmissionRootPreflight{}, err
 	}
 	if err := requireExistingAdmissionRepositoryFile(repoPath); err != nil {
-		return err
+		return initializedAdmissionRootPreflight{}, err
 	}
-	if err := requireInitializedAdmissionRepositoryStructure(repoPath); err != nil {
-		return err
-	}
-	repo, err := bboltrepo.OpenReadOnly(repoPath)
+	repo, err := openReadOnlyAdmissionRepositoryWithContentionRetry(ctx, repoPath, socketPath)
 	if err != nil {
-		return err
+		return initializedAdmissionRootPreflight{}, err
 	}
 	defer closeRecoveryOnlyRepository(repo)
+	identity, err := repo.OpenedFileIdentity()
+	if err != nil {
+		return initializedAdmissionRootPreflight{}, err
+	}
+	if err := verifyOpenedAdmissionRepositoryInitialized(ctx, repoPath, repo); err != nil {
+		return initializedAdmissionRootPreflight{}, err
+	}
 	dbUUID, schemaMajor, err := repo.AnchorIdentity()
 	if err != nil {
-		return err
+		return initializedAdmissionRootPreflight{}, err
 	}
-	if err := repo.View(ctx, func(tx repository.ReadTx) error {
-		meta := tx.Meta()
-		if meta.State != repository.RecordValid {
-			return fmt.Errorf("%w: meta is %s", repository.ErrInvalidRecord, meta.State)
-		}
-		return meta.Value.Validate()
-	}); err != nil {
-		return err
+	if err := requireExistingAdmissionAnchorFile(anchorPath, dbUUID, schemaMajor); err != nil {
+		return initializedAdmissionRootPreflight{}, err
 	}
-	return requireExistingAdmissionAnchorFile(anchorPath, dbUUID, schemaMajor)
+	return initializedAdmissionRootPreflight{repositoryIdentity: identity, dbUUID: dbUUID, schemaMajor: schemaMajor}, nil
 }
 
 func requireExistingAdmissionRepositoryFile(repoPath string) error {
@@ -207,26 +264,36 @@ func requireExistingAdmissionRepositoryFile(repoPath string) error {
 	return nil
 }
 
-func requireInitializedAdmissionRepositoryStructure(repoPath string) error {
-	db, err := bolt.Open(repoPath, 0o600, &bolt.Options{ReadOnly: true, Timeout: admissionRepositoryOpenTimeout})
+func verifyOpenedAdmissionRepositoryInitialized(ctx context.Context, repoPath string, repo *bboltrepo.Repository) error {
+	if err := repo.VerifyInitializedStructure(); err != nil {
+		return err
+	}
+	schemaVersion, err := repo.AuthorityMetaSchemaVersion()
 	if err != nil {
 		return err
 	}
-	defer db.Close()
-	return db.View(func(tx *bolt.Tx) error {
-		for _, name := range admissionRepositoryRequiredBuckets {
-			if tx.Bucket([]byte(name)) == nil {
-				return fmt.Errorf("%w: admission repository missing bucket %q: %s", repository.ErrCorruptRecord, name, repoPath)
-			}
-		}
-		meta := tx.Bucket([]byte("meta"))
-		for _, key := range admissionRepositoryRequiredMetaKeys {
-			if meta.Get([]byte(key)) == nil {
-				return fmt.Errorf("%w: admission repository missing meta key %q: %s", repository.ErrInvalidRecord, key, repoPath)
-			}
-		}
-		return nil
+	if schemaVersion != repository.CurrentAuthorityMetaSchemaVersion {
+		cause := fmt.Errorf("%w: meta.schema_version %d is unsupported", repository.ErrInvalidRecord, schemaVersion)
+		return AdmissionRootIncompatibleSchemaError{Path: repoPath, SchemaVersion: schemaVersion, Cause: cause}
+	}
+	return repo.View(ctx, func(tx repository.ReadTx) error {
+		return verifyAdmissionRepositoryMetaForRecovery(repoPath, tx.Meta())
 	})
+}
+
+func verifyAdmissionRepositoryMetaForRecovery(repoPath string, meta repository.Record[repository.AuthorityMeta]) error {
+	switch meta.State {
+	case repository.RecordValid:
+	case repository.RecordCorrupt:
+		return fmt.Errorf("%w: meta: %s", repository.ErrCorruptRecord, meta.Diagnostic)
+	default:
+		return fmt.Errorf("%w: meta is %s", repository.ErrInvalidRecord, meta.State)
+	}
+	if meta.Value.SchemaVersion != repository.CurrentAuthorityMetaSchemaVersion {
+		cause := fmt.Errorf("%w: meta.schema_version %d is unsupported", repository.ErrInvalidRecord, meta.Value.SchemaVersion)
+		return AdmissionRootIncompatibleSchemaError{Path: repoPath, SchemaVersion: meta.Value.SchemaVersion, Cause: cause}
+	}
+	return meta.Value.Validate()
 }
 
 func requireExistingAdmissionAnchorFile(anchorPath, dbUUID string, schemaMajor uint16) error {
@@ -242,7 +309,7 @@ func requireExistingAdmissionAnchorFile(anchorPath, dbUUID string, schemaMajor u
 	}
 	snapshot, err := authority.LoadFileAnchorSnapshot(anchorPath)
 	if err != nil {
-		return err
+		return AdmissionRootAnchorError{Path: anchorPath, Cause: err}
 	}
 	if !snapshot.Initialized {
 		return fmt.Errorf("%w: anchor is missing: %s", authority.ErrAnchorInvariant, anchorPath)
@@ -294,6 +361,11 @@ func (server *Server) recoverAdmissionRoot(ctx context.Context) (AdmissionRecove
 	boot, err := server.admissionDaemonBoot()
 	if err != nil {
 		return AdmissionRecoveryReport{}, err
+	}
+	if admissionRecoveryBeforeBeginForTest != nil {
+		if err := admissionRecoveryBeforeBeginForTest(); err != nil {
+			return AdmissionRecoveryReport{}, err
+		}
 	}
 	session, err := bootstrapper.Begin(ctx, boot)
 	if err != nil {

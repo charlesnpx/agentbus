@@ -19,6 +19,14 @@ func WithFileAnchorFailStopHook(hook func(string)) FileAnchorOption {
 	}
 }
 
+// WithFileAnchorRequireInitialized makes Begin fail when the anchor file is
+// absent instead of creating the generation-zero anchor snapshot.
+func WithFileAnchorRequireInitialized() FileAnchorOption {
+	return func(anchor *fileAnchor) {
+		anchor.requireInitialized = true
+	}
+}
+
 func NewFileAnchor(path, dbUUID string, schemaMajor uint16, options ...FileAnchorOption) Anchor {
 	anchor := &fileAnchor{
 		path:        path,

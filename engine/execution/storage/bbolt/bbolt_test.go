@@ -3,6 +3,8 @@ package bbolt
 import (
 	"context"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -48,6 +50,33 @@ func TestRepositoryContract(t *testing.T) {
 			bboltRepo.InjectMissingMetaForTest()
 		},
 	})
+}
+
+func TestAdmissionRepositoryRequiredBucketsMatchInitializedRepository(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Open(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	var got []string
+	if err := repo.db.View(func(tx *bolt.Tx) error {
+		return tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
+			got = append(got, string(name))
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("list buckets: %v", err)
+	}
+	want := append([]string(nil), AdmissionRepositoryRequiredBuckets...)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("initialized buckets = %v, want %v", got, want)
+	}
+	if err := repo.VerifyInitializedStructure(); err != nil {
+		t.Fatalf("VerifyInitializedStructure() error = %v", err)
+	}
 }
 
 type reopeningRepository struct {

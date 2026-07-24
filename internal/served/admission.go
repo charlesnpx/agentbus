@@ -64,6 +64,12 @@ type admissionCoordinator = coordinator.Coordinator
 
 type admissionBootstrapperFactory func(context.Context, *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error)
 
+type admissionBootstrapperOpenOptions struct {
+	expectedRepositoryIdentity *bboltrepo.FileIdentity
+	requireInitializedAnchor   bool
+	verifyInitializedStructure bool
+}
+
 type admissionProbeableBackend interface {
 	ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error)
 }
@@ -966,26 +972,57 @@ func (c servedCoordinatorLaunchContainment) ContainAndVerify(ctx context.Context
 }
 
 func openAdmissionBootstrapper(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
+	return openAdmissionBootstrapperWithOptions(ctx, s, admissionBootstrapperOpenOptions{})
+}
+
+func openAdmissionBootstrapperWithOptions(ctx context.Context, s *Server, openOptions admissionBootstrapperOpenOptions) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, nil, err
 	}
 	repoPath := filepath.Join(s.stateRoot, admissionRepositoryFile)
+	var openedIdentity bboltrepo.FileIdentity
 	repo, err := openAdmissionRepositoryWithContentionRetry(ctx, repoPath, s.socketPath)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	openedIdentity, err = repo.OpenedFileIdentity()
+	if err != nil {
+		_ = repo.Close()
+		return nil, nil, nil, err
+	}
+	if openOptions.expectedRepositoryIdentity != nil && openedIdentity != *openOptions.expectedRepositoryIdentity {
+		_ = repo.Close()
+		return nil, nil, nil, admissionRootRepositoryIdentityMismatchError(repoPath, *openOptions.expectedRepositoryIdentity, openedIdentity)
+	}
+	if openOptions.verifyInitializedStructure {
+		// Recovery preflight already proved this same dev+ino had the required
+		// buckets, meta keys, valid meta, and matching anchor. The normal bbolt
+		// open still calls initialize(), but on this same inode it cannot repair a
+		// previously verified-good initialized root; if the pathname was swapped,
+		// the opened-file identity check above rejects it before Begin can run.
+		if err := verifyOpenedAdmissionRepositoryInitialized(ctx, repoPath, repo); err != nil {
+			_ = repo.Close()
+			return nil, nil, nil, err
+		}
 	}
 	dbUUID, schemaMajor, err := repo.AnchorIdentity()
 	if err != nil {
 		_ = repo.Close()
 		return nil, nil, nil, err
 	}
+	anchorOptions := []authority.FileAnchorOption{
+		authority.WithFileAnchorFailStopHook(func(reason string) {
+			s.safetyLatch.Trip(safetyFailStopReason(reason))
+		}),
+	}
+	if openOptions.requireInitializedAnchor {
+		anchorOptions = append(anchorOptions, authority.WithFileAnchorRequireInitialized())
+	}
 	anchor := authority.NewFileAnchor(
 		filepath.Join(s.stateRoot, admissionAnchorFile),
 		dbUUID,
 		schemaMajor,
-		authority.WithFileAnchorFailStopHook(func(reason string) {
-			s.safetyLatch.Trip(safetyFailStopReason(reason))
-		}),
+		anchorOptions...,
 	)
 	options := []authority.BootstrapperOption{authority.WithAnchor(anchor)}
 	if s.admissionRuntime != nil {
@@ -1004,27 +1041,64 @@ func openAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, s
 	if err == nil || !errors.Is(err, bolt.ErrTimeout) {
 		return repo, err
 	}
-	contentionCtx, cancel := admissionContentionContext(ctx)
-	defer cancel()
-	last := err
-	for {
-		if admissionSocketDialable(socketPath) {
-			return nil, DaemonAlreadyListeningError{SocketPath: socketPath}
-		}
-		if err := contentionCtx.Err(); err != nil {
-			return nil, admissionContentionExpiredError(ctx, repoPath, socketPath, last, err)
-		}
+	err = retryAdmissionRepositoryContention(ctx, repoPath, socketPath, err, func() (bool, error) {
 		repo, err = bboltrepo.Open(repoPath, &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
 		if err == nil {
-			return repo, nil
+			return true, nil
 		}
 		if !errors.Is(err, bolt.ErrTimeout) {
-			return nil, err
+			return true, err
 		}
-		last = err
+		return false, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return repo, nil
+}
+
+func openReadOnlyAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, socketPath string) (*bboltrepo.Repository, error) {
+	repo, err := bboltrepo.OpenReadOnly(repoPath, &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
+	if err == nil || !errors.Is(err, bolt.ErrTimeout) {
+		return repo, err
+	}
+	err = retryAdmissionRepositoryContention(ctx, repoPath, socketPath, err, func() (bool, error) {
+		repo, err = bboltrepo.OpenReadOnly(repoPath, &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, bolt.ErrTimeout) {
+			return true, err
+		}
+		return false, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return repo, nil
+}
+
+func retryAdmissionRepositoryContention(ctx context.Context, repoPath, socketPath string, cause error, retry func() (bool, error)) error {
+	contentionCtx, cancel := admissionContentionContext(ctx)
+	defer cancel()
+	last := cause
+	for {
+		if admissionSocketDialable(socketPath) {
+			return DaemonAlreadyListeningError{SocketPath: socketPath}
+		}
+		if err := contentionCtx.Err(); err != nil {
+			return admissionContentionExpiredError(ctx, repoPath, socketPath, last, err)
+		}
+		done, err := retry()
+		if done {
+			return err
+		}
+		if err != nil {
+			last = err
+		}
 		select {
 		case <-contentionCtx.Done():
-			return nil, admissionContentionExpiredError(ctx, repoPath, socketPath, last, contentionCtx.Err())
+			return admissionContentionExpiredError(ctx, repoPath, socketPath, last, contentionCtx.Err())
 		case <-time.After(admissionContentionRetryDelay):
 		}
 	}

@@ -9,11 +9,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -25,15 +27,33 @@ import (
 const envelopeSchemaVersion uint16 = 1
 
 var (
-	bucketMeta        = []byte("meta")
-	bucketBindings    = []byte("bindings")
-	bucketSafety      = []byte("safety")
-	bucketProjections = []byte("projections")
-	bucketTombstones  = []byte("tombstones")
-	bucketQuarantine  = []byte("quarantine")
+	// AdmissionRepositoryRequiredBuckets is the canonical top-level bucket set
+	// created by initialize and required by existing-root preflight checks.
+	AdmissionRepositoryRequiredBuckets = []string{
+		"meta",
+		"bindings",
+		"safety",
+		"projections",
+		"tombstones",
+		"quarantine",
+	}
 
-	keyDBUUID = []byte("db_uuid")
-	keyMeta   = []byte("authority")
+	// AdmissionRepositoryRequiredMetaKeys is the canonical meta bucket key set
+	// required before an existing admission root may be recovered.
+	AdmissionRepositoryRequiredMetaKeys = []string{
+		"db_uuid",
+		"authority",
+	}
+
+	bucketMeta        = []byte(AdmissionRepositoryRequiredBuckets[0])
+	bucketBindings    = []byte(AdmissionRepositoryRequiredBuckets[1])
+	bucketSafety      = []byte(AdmissionRepositoryRequiredBuckets[2])
+	bucketProjections = []byte(AdmissionRepositoryRequiredBuckets[3])
+	bucketTombstones  = []byte(AdmissionRepositoryRequiredBuckets[4])
+	bucketQuarantine  = []byte(AdmissionRepositoryRequiredBuckets[5])
+
+	keyDBUUID = []byte(AdmissionRepositoryRequiredMetaKeys[0])
+	keyMeta   = []byte(AdmissionRepositoryRequiredMetaKeys[1])
 
 	bucketNames = [][]byte{
 		bucketMeta,
@@ -60,8 +80,16 @@ const (
 // Repository is a single-file bbolt implementation of repository.Repository.
 type Repository struct {
 	db                           *bolt.DB
+	fileIdentity                 FileIdentity
 	testMu                       sync.Mutex
 	failCommitAfterCommitForTest error
+}
+
+// FileIdentity is the device/inode identity of the database file handle bbolt
+// opened.
+type FileIdentity struct {
+	Dev uint64
+	Ino uint64
 }
 
 // Open opens or initializes a root bbolt repository database at path. The file
@@ -70,11 +98,12 @@ func Open(path string, options *bolt.Options) (*Repository, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("%w: bbolt path is required", repository.ErrInvalidRecord)
 	}
-	db, err := bolt.Open(path, 0o600, options)
+	var identity FileIdentity
+	db, err := bolt.Open(path, 0o600, optionsWithFileIdentity(options, &identity))
 	if err != nil {
 		return nil, err
 	}
-	repo := &Repository{db: db}
+	repo := &Repository{db: db, fileIdentity: identity}
 	if err := repo.initialize(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -96,15 +125,21 @@ func NewRepository(path string) (*Repository, error) {
 
 // OpenReadOnly opens an existing root bbolt repository database for inspection.
 // It never initializes or mutates the file.
-func OpenReadOnly(path string) (*Repository, error) {
+func OpenReadOnly(path string, options ...*bolt.Options) (*Repository, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("%w: bbolt path is required", repository.ErrInvalidRecord)
 	}
-	db, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: defaultOpenTimeout})
+	readOnlyOptions := bolt.Options{ReadOnly: true, Timeout: defaultOpenTimeout}
+	if len(options) > 0 && options[0] != nil {
+		readOnlyOptions = *options[0]
+		readOnlyOptions.ReadOnly = true
+	}
+	var identity FileIdentity
+	db, err := bolt.Open(path, 0o600, optionsWithFileIdentity(&readOnlyOptions, &identity))
 	if err != nil {
 		return nil, err
 	}
-	return &Repository{db: db}, nil
+	return &Repository{db: db, fileIdentity: identity}, nil
 }
 
 func (r *Repository) Close() error {
@@ -112,6 +147,114 @@ func (r *Repository) Close() error {
 		return nil
 	}
 	return r.db.Close()
+}
+
+// OpenedFileIdentity returns the identity captured from bbolt's opened
+// database file handle.
+func (r *Repository) OpenedFileIdentity() (FileIdentity, error) {
+	if r == nil || r.db == nil {
+		return FileIdentity{}, fmt.Errorf("%w: bbolt repository is not open", repository.ErrInvalidRecord)
+	}
+	if r.fileIdentity == (FileIdentity{}) {
+		return FileIdentity{}, fmt.Errorf("%w: bbolt repository file identity is unavailable", repository.ErrInvalidRecord)
+	}
+	return r.fileIdentity, nil
+}
+
+// VerifyInitializedStructure checks the required bbolt buckets and meta keys
+// through this repository's open database handle.
+func (r *Repository) VerifyInitializedStructure() error {
+	if r == nil || r.db == nil {
+		return fmt.Errorf("%w: bbolt repository is not open", repository.ErrInvalidRecord)
+	}
+	return r.db.View(func(tx *bolt.Tx) error {
+		return verifyInitializedStructureTx(tx, r.db.Path())
+	})
+}
+
+// AuthorityMetaSchemaVersion reads the authority meta payload schema after
+// validating the enclosing envelope, but before full meta validation rejects
+// unsupported schema versions as corrupt slots.
+func (r *Repository) AuthorityMetaSchemaVersion() (uint16, error) {
+	if r == nil || r.db == nil {
+		return 0, fmt.Errorf("%w: bbolt repository is not open", repository.ErrInvalidRecord)
+	}
+	var schemaVersion uint16
+	if err := r.db.View(func(tx *bolt.Tx) error {
+		meta := tx.Bucket(bucketMeta)
+		if meta == nil {
+			return fmt.Errorf("%w: admission repository missing bucket %q: %s", repository.ErrCorruptRecord, string(bucketMeta), r.db.Path())
+		}
+		raw := meta.Get(keyMeta)
+		if raw == nil {
+			return fmt.Errorf("%w: admission repository missing meta key %q: %s", repository.ErrInvalidRecord, string(keyMeta), r.db.Path())
+		}
+		var env envelope
+		if err := json.Unmarshal(raw, &env); err != nil {
+			return fmt.Errorf("%w: meta envelope json: %v", repository.ErrCorruptRecord, err)
+		}
+		if env.Kind != kindMeta {
+			return fmt.Errorf("%w: meta envelope kind %q, want %q", repository.ErrCorruptRecord, env.Kind, kindMeta)
+		}
+		if env.SchemaVersion != envelopeSchemaVersion {
+			return fmt.Errorf("%w: meta envelope schema %d, want %d", repository.ErrCorruptRecord, env.SchemaVersion, envelopeSchemaVersion)
+		}
+		if env.Checksum != checksumEnvelope(env.Kind, env.SchemaVersion, env.Revision, keyMeta, env.Payload) {
+			return fmt.Errorf("%w: meta envelope checksum mismatch", repository.ErrCorruptRecord)
+		}
+		var payload struct {
+			SchemaVersion uint16
+		}
+		if err := json.Unmarshal(env.Payload, &payload); err != nil {
+			return fmt.Errorf("%w: meta payload json: %v", repository.ErrCorruptRecord, err)
+		}
+		schemaVersion = payload.SchemaVersion
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return schemaVersion, nil
+}
+
+func optionsWithFileIdentity(options *bolt.Options, identity *FileIdentity) *bolt.Options {
+	var cloned bolt.Options
+	if options == nil {
+		cloned = *bolt.DefaultOptions
+	} else {
+		cloned = *options
+	}
+	openFile := cloned.OpenFile
+	if openFile == nil {
+		openFile = os.OpenFile
+	}
+	cloned.OpenFile = func(path string, flag int, perm os.FileMode) (*os.File, error) {
+		file, err := openFile(path, flag, perm)
+		if err != nil {
+			return nil, err
+		}
+		fileIdentity, err := fileIdentityFromFile(file)
+		if err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		if identity != nil {
+			*identity = fileIdentity
+		}
+		return file, nil
+	}
+	return &cloned
+}
+
+func fileIdentityFromFile(file *os.File) (FileIdentity, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return FileIdentity{}, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return FileIdentity{}, fmt.Errorf("unexpected bbolt stat type %T", info.Sys())
+	}
+	return FileIdentity{Dev: uint64(stat.Dev), Ino: uint64(stat.Ino)}, nil
 }
 
 func (r *Repository) FailCommitAfterCallbackForTest(err error) {
@@ -324,6 +467,21 @@ func (r *Repository) initialize() error {
 		state := newStoreState(dbUUID)
 		return persistState(tx, state)
 	})
+}
+
+func verifyInitializedStructureTx(tx *bolt.Tx, path string) error {
+	for _, name := range AdmissionRepositoryRequiredBuckets {
+		if tx.Bucket([]byte(name)) == nil {
+			return fmt.Errorf("%w: admission repository missing bucket %q: %s", repository.ErrCorruptRecord, name, path)
+		}
+	}
+	meta := tx.Bucket(bucketMeta)
+	for _, key := range AdmissionRepositoryRequiredMetaKeys {
+		if meta.Get([]byte(key)) == nil {
+			return fmt.Errorf("%w: admission repository missing meta key %q: %s", repository.ErrInvalidRecord, key, path)
+		}
+	}
+	return nil
 }
 
 func databaseEmpty(tx *bolt.Tx) bool {
