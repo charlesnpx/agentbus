@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -173,6 +174,152 @@ func TestProductionStrictAutostartRestoresAfterDaemonExitE2B(t *testing.T) {
 	assertProductionStrictDaemonCountE2B(t, agentbusPath, 1)
 }
 
+func TestProductionStrictJobCLIStatusResultCancelE2B(t *testing.T) {
+	requireProductionStrictE2BGate(t)
+	stateRoot := shortTempDir(t)
+	cwd := shortTempDir(t)
+	fixture := installServedNativeCodexFixture(t, stateRoot)
+	agentbusPath := builtServedNativeAgentbusPath(t)
+
+	first := launchProductionStrictDaemonE2B(t, agentbusPath, stateRoot, fixture.env)
+	firstStopped := false
+	t.Cleanup(func() {
+		if !firstStopped {
+			_ = first.KillAndWait()
+		}
+	})
+	client := connectProductionStrictClient(t, stateRoot, make(chan error))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	completed, err := client.JobSubmit(ctx, agentclient.JobSubmitParams(servedNativeSubmitParams("cli-status-result-cancel-e2b", cwd, servedNativeFixtureModeClean, nil)))
+	if err != nil {
+		t.Fatalf("submit completed job: %v", err)
+	}
+	status := waitProductionStrictClientTerminal(t, client, completed.JobID, 15*time.Second, productionStrictDiagnostics{stateRoot: stateRoot, fixture: fixture})
+	if status.State != engine.StateCompleted {
+		t.Fatalf("completed job status = %+v", status)
+	}
+
+	statusOut := runProductionStrictJobCLI(t, agentbusPath, stateRoot, fixture.env, 0, "status", "--job", completed.JobID, "--json")
+	var cliStatus protocol.JobStatusResult
+	mustUnmarshal(t, bytes.TrimSpace([]byte(statusOut.stdout)), &cliStatus)
+	if len(cliStatus.Jobs) != 1 || cliStatus.Jobs[0].JobID != completed.JobID || cliStatus.Jobs[0].State != engine.StateCompleted {
+		t.Fatalf("cli status = %+v", cliStatus)
+	}
+	resultOut := runProductionStrictJobCLI(t, agentbusPath, stateRoot, fixture.env, 0, "result", "--job", completed.JobID, "--json")
+	var cliResult protocol.JobResult
+	mustUnmarshal(t, bytes.TrimSpace([]byte(resultOut.stdout)), &cliResult)
+	if cliResult.JobID != completed.JobID || cliResult.State != engine.StateCompleted || cliResult.Result == nil || cliResult.Result.Text != servedNativeResultText {
+		t.Fatalf("cli result = %+v", cliResult)
+	}
+	cancelOut := runProductionStrictJobCLI(t, agentbusPath, stateRoot, fixture.env, 0, "cancel", "--job", completed.JobID, "--json")
+	var terminalCancel protocol.JobCancelResult
+	mustUnmarshal(t, bytes.TrimSpace([]byte(cancelOut.stdout)), &terminalCancel)
+	if terminalCancel.JobID != completed.JobID || terminalCancel.State != engine.StateCompleted {
+		t.Fatalf("terminal cli cancel = %+v", terminalCancel)
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("client close: %v", err)
+	}
+	killProductionStrictDaemonE2B(t, first, "first daemon before cli autostart")
+	firstStopped = true
+	assertProductionStrictPIDAbsentE2B(t, first.PID, 5*time.Second)
+
+	statusOut = runProductionStrictJobCLI(t, agentbusPath, stateRoot, fixture.env, 0, "status", "--job", completed.JobID, "--json")
+	mustUnmarshal(t, bytes.TrimSpace([]byte(statusOut.stdout)), &cliStatus)
+	if len(cliStatus.Jobs) != 1 || cliStatus.Jobs[0].State != engine.StateCompleted {
+		t.Fatalf("cli status after autostart = %+v", cliStatus)
+	}
+	autostartPID := readProductionStrictPIDFileE2B(t, stateRoot)
+	t.Cleanup(func() {
+		_ = syscall.Kill(autostartPID, syscall.SIGKILL)
+		assertProductionStrictPIDAbsentE2B(t, autostartPID, 5*time.Second)
+	})
+	resultOut = runProductionStrictJobCLI(t, agentbusPath, stateRoot, fixture.env, 0, "result", "--job", completed.JobID, "--json")
+	mustUnmarshal(t, bytes.TrimSpace([]byte(resultOut.stdout)), &cliResult)
+	if cliResult.JobID != completed.JobID || cliResult.State != engine.StateCompleted || cliResult.Result == nil || cliResult.Result.Text != servedNativeResultText {
+		t.Fatalf("cli result after autostart = %+v", cliResult)
+	}
+
+	secondClient := connectProductionStrictClient(t, stateRoot, make(chan error))
+	defer secondClient.Close()
+	startedPath := filepath.Join(stateRoot, "cli-cancel-started")
+	running, err := secondClient.JobSubmit(ctx, agentclient.JobSubmitParams(servedNativeSubmitParams("cli-running-cancel-e2b", cwd, servedNativeFixtureModeHold, servedNativeStartedTags(startedPath))))
+	if err != nil {
+		t.Fatalf("submit running job: %v", err)
+	}
+	if err := waitServedNativeFile(startedPath, 10*time.Second); err != nil {
+		t.Fatalf("running job did not start: %v", err)
+	}
+	runningStatusOut := runProductionStrictJobCLI(t, agentbusPath, stateRoot, fixture.env, 2, "status", "--job", running.JobID, "--json")
+	var runningStatus protocol.JobStatusResult
+	mustUnmarshal(t, bytes.TrimSpace([]byte(runningStatusOut.stdout)), &runningStatus)
+	if len(runningStatus.Jobs) != 1 || runningStatus.Jobs[0].JobID != running.JobID || runningStatus.Jobs[0].State != engine.StateRunning {
+		t.Fatalf("running cli status = %+v", runningStatus)
+	}
+	runningCancelOut := runProductionStrictJobCLI(t, agentbusPath, stateRoot, fixture.env, 7, "cancel", "--job", running.JobID, "--json")
+	var runningCancel protocol.JobCancelResult
+	mustUnmarshal(t, bytes.TrimSpace([]byte(runningCancelOut.stdout)), &runningCancel)
+	if runningCancel.JobID != running.JobID || runningCancel.State != engine.StateCanceled {
+		t.Fatalf("running cli cancel = %+v", runningCancel)
+	}
+	canceledResultOut := runProductionStrictJobCLI(t, agentbusPath, stateRoot, fixture.env, 7, "result", "--job", running.JobID, "--json")
+	var canceledResult protocol.JobResult
+	mustUnmarshal(t, bytes.TrimSpace([]byte(canceledResultOut.stdout)), &canceledResult)
+	if canceledResult.JobID != running.JobID || canceledResult.State != engine.StateCanceled || canceledResult.Result != nil {
+		t.Fatalf("canceled cli result = %+v", canceledResult)
+	}
+}
+
+func TestProductionStrictCLINoDaemonUnsupportedHostDarwinE2B(t *testing.T) {
+	if strings.TrimSpace(os.Getenv(strictE2ERunEnv)) != "1" {
+		t.Skipf("set %s=1 to run strict cli e2e", strictE2ERunEnv)
+	}
+	if testing.Short() {
+		t.Skip("strict cli e2e is not run in short mode")
+	}
+	if runtime.GOOS != "darwin" {
+		t.Skip("unsupported-host no-daemon check is darwin-only")
+	}
+	agentbusPath := builtServedNativeAgentbusPath(t)
+	root := filepath.Join(t.TempDir(), "state")
+	for _, args := range [][]string{
+		{"status", "--job", "job_darwin_unsupported"},
+		{"result", "--job", "job_darwin_unsupported"},
+		{"cancel", "--job", "job_darwin_unsupported"},
+	} {
+		result := runProductionStrictJobCLI(t, agentbusPath, root, os.Environ(), 11, args...)
+		if !strings.Contains(result.stderr, "daemon startup failed") {
+			t.Fatalf("agentbus %s stderr=%q, want daemon startup failure", strings.Join(args, " "), result.stderr)
+		}
+		if entries, err := os.ReadDir(root); err == nil && len(entries) != 0 {
+			t.Fatalf("state root entries after %s = %v, want empty", strings.Join(args, " "), entries)
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("state root read after %s: %v", strings.Join(args, " "), err)
+		}
+	}
+}
+
+func TestProductionStrictCLIStatusFailStopExitE2B(t *testing.T) {
+	requireProductionStrictE2BGate(t)
+	agentbusPath := builtServedNativeAgentbusPath(t)
+	stateRoot := shortTempDir(t)
+	done := startFailStoppedProtocolDaemonE2B(t, stateRoot)
+	result := runProductionStrictJobCLI(t, agentbusPath, stateRoot, os.Environ(), 12, "status", "--job", "job_failstop", "--json")
+	if !strings.Contains(result.stderr, "code=backend_unavailable") || !strings.Contains(result.stderr, "admissionCause=root_fail_stopped") {
+		t.Fatalf("fail-stop stderr = %q, want typed code and admission cause", result.stderr)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fail-stop protocol daemon did not finish")
+	}
+}
+
 func TestProductionStrictAutostartRaceConvergesOneDaemonE2B(t *testing.T) {
 	requireProductionStrictE2BGate(t)
 	stateRoot := shortTempDir(t)
@@ -336,6 +483,119 @@ func runProductionStrictRecoverCLI(t *testing.T, agentbusPath, stateRoot string)
 		t.Fatalf("decode recovery report %q: %v", stdout.String(), err)
 	}
 	return report
+}
+
+type productionStrictCLIResultE2B struct {
+	code   int
+	stdout string
+	stderr string
+}
+
+func runProductionStrictJobCLI(t *testing.T, agentbusPath, stateRoot string, env []string, wantCode int, args ...string) productionStrictCLIResultE2B {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, agentbusPath, args...)
+	cmd.Env = upsertEnv(env, "AGENTBUS_STATE_ROOT="+stateRoot)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	code := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			code = exitErr.ExitCode()
+		} else {
+			t.Fatalf("agentbus %s failed to run: %v\nstdout=%s\nstderr=%s", strings.Join(args, " "), err, stdout.String(), stderr.String())
+		}
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("agentbus %s timed out: %v\nstdout=%s\nstderr=%s", strings.Join(args, " "), ctx.Err(), stdout.String(), stderr.String())
+	}
+	result := productionStrictCLIResultE2B{code: code, stdout: stdout.String(), stderr: stderr.String()}
+	if result.code != wantCode {
+		t.Fatalf("agentbus %s exit=%d want=%d\nstdout=%s\nstderr=%s", strings.Join(args, " "), result.code, wantCode, result.stdout, result.stderr)
+	}
+	return result
+}
+
+func readProductionStrictPIDFileE2B(t *testing.T, stateRoot string) int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(stateRoot, "agentbus.pid"))
+	if err != nil {
+		t.Fatalf("read agentbus.pid: %v", err)
+	}
+	return parsePositivePIDE2B(t, strings.TrimSpace(string(raw)))
+}
+
+func startFailStoppedProtocolDaemonE2B(t *testing.T, stateRoot string) <-chan error {
+	t.Helper()
+	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateRoot, protocol.TokenFileName), []byte("test-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(stateRoot, protocol.SocketName)
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = ln.Close()
+		_ = os.Remove(socketPath)
+	})
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		dec := json.NewDecoder(conn)
+		enc := json.NewEncoder(conn)
+		var hello protocol.Request
+		if err := dec.Decode(&hello); err != nil {
+			done <- err
+			return
+		}
+		if hello.Method != protocol.MethodHello {
+			done <- fmt.Errorf("first method = %s, want hello", hello.Method)
+			return
+		}
+		if err := enc.Encode(protocol.Response{
+			JSONRPC: "2.0",
+			ID:      hello.ID,
+			Result: protocol.HelloResult{
+				ProtocolVersion: protocol.Version,
+				Backends:        []string{"codex"},
+				Capabilities:    protocol.DefaultCapabilities(),
+			},
+		}); err != nil {
+			done <- err
+			return
+		}
+		var status protocol.Request
+		if err := dec.Decode(&status); err != nil {
+			done <- err
+			return
+		}
+		if status.Method != protocol.MethodJobStatus {
+			done <- fmt.Errorf("second method = %s, want job.status", status.Method)
+			return
+		}
+		errObj := protocol.NewError(protocol.ErrorBackendUnavailable, "authority fail-stopped", protocol.ErrorData{AdmissionCause: protocol.AdmissionRejectRootFailStopped})
+		if err := enc.Encode(protocol.Response{JSONRPC: "2.0", ID: status.ID, Error: errObj}); err != nil {
+			done <- err
+			return
+		}
+		done <- nil
+	}()
+	return done
 }
 
 type productionStrictClientStarterE2B struct {

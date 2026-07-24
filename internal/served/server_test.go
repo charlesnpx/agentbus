@@ -2305,7 +2305,7 @@ func TestIdentifiedFencedResponseLossRetainsObligationAndReplayReturnsSameJob(t 
 	}
 }
 
-func TestIdentifiedFencedJobReadsAuthorityWithoutJSONRecordAndDiagnosesDuplicate(t *testing.T) {
+func TestIdentifiedFencedJobReadsAuthorityOnlyWithoutJSONFallback(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
 	backend.started = make(chan struct{}, 1)
@@ -2361,10 +2361,8 @@ func TestIdentifiedFencedJobReadsAuthorityWithoutJSONRecordAndDiagnosesDuplicate
 	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_json", "fake", nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	legacyExactStatus := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: legacyID})
-	if len(legacyExactStatus.Jobs) != 1 || legacyExactStatus.Jobs[0].JobID != legacyID || legacyExactStatus.Jobs[0].State != engine.StateQueued {
-		t.Fatalf("legacy exact status = %+v, want JSON queued", legacyExactStatus)
-	}
+	assertJobHandlerError(t, server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{JobID: legacyID})), protocol.ErrorInvalidTaskSpec, "", legacyID)
+	assertJobHandlerError(t, server.handleJobResult(mustMarshal(t, protocol.JobResultParams{JobID: legacyID})), protocol.ErrorInvalidTaskSpec, "", legacyID)
 
 	all := jobStatusViaHandler(t, server, protocol.JobStatusParams{All: true})
 	byID := map[string]protocol.JobStatus{}
@@ -2374,11 +2372,94 @@ func TestIdentifiedFencedJobReadsAuthorityWithoutJSONRecordAndDiagnosesDuplicate
 		}
 		byID[job.JobID] = job
 	}
-	if got := byID[submitted.JobID]; got.State != engine.StateCompleted || !containsString(got.Warnings, duplicateAuthorityJSONWarning) {
-		t.Fatalf("duplicate authority status = %+v, want completed with duplicate warning", got)
+	if got, ok := byID[submitted.JobID]; !ok || got.State != engine.StateCompleted || len(got.Warnings) != 0 {
+		t.Fatalf("authority status = %+v ok=%t, want completed without JSON duplicate warning", got, ok)
 	}
-	if got := byID[legacyID]; got.State != engine.StateQueued {
-		t.Fatalf("legacy all-status row = %+v, want queued", got)
+	if got, ok := byID[legacyID]; ok {
+		t.Fatalf("legacy JSON all-status row = %+v, want omitted", got)
+	}
+}
+
+// TODO(E5A/E5B): Add submit-time named-policy authority-record coverage once
+// model.SafetyRecord carries policy/contract fields; today it only records the
+// task identity, so there is no authority-owned named-policy field to assert.
+
+func TestAuthorityResultHidesCertifiedResultUntilTerminalRecord(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	backend := newFakeBackend("fake")
+	server, _, _ := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	accepted := acceptIdentifiedAuthorityWork(t, server, "authority-result-terminal-only")
+	jobID := accepted.Record.JobID
+	ref := accepted.Record.Attempt.Ref
+	ordinal := model.LaunchOrdinalOne
+	group := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: ordinal})
+	if _, err := server.admissionReady.BindGroup(ctx, jobID, ref, ordinal, group); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := server.admissionReady.AllocateGrant(ctx, ref, ordinal); err != nil {
+		t.Fatal(err)
+	}
+	child, err := model.NewChildIdentity(5202, "terminal-only-result-child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseEvidence, err := model.NewEvidence("released", "terminal-only result release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.admissionReady.RecordRelease(ctx, jobID, ref, ordinal, child, releaseEvidence); err != nil {
+		t.Fatal(err)
+	}
+	verified, err := launcher.issuer.AttestQuiescence(custodian.PhysicalQuiescence{Group: group, Method: model.QuiescenceAlreadyAbsent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.admissionReady.RecordQuiescence(ctx, jobID, ordinal, verified); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.admissionReady.RecordOutcome(ctx, jobID, ref, model.OutcomeCompleted); err != nil {
+		t.Fatal(err)
+	}
+	dirSynced, err := model.NewEvidence("dir_synced", "terminal-only result directory fsynced")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultPath := filepath.Join(server.stateRoot, "results", jobID.String()+".txt")
+	receipt := model.ResultReceipt{
+		JobID: jobID,
+		Result: model.ResultRef{
+			Path:   resultPath,
+			Digest: "terminalonlydigest",
+			Bytes:  4,
+		},
+		DirSynced:   dirSynced,
+		CertifiedBy: accepted.Record.AdmittedBy,
+	}
+	if _, err := server.admissionReady.RecordResult(ctx, jobID, ref, receipt); err != nil {
+		t.Fatal(err)
+	}
+	preTerminal := loadAdmissionSafetyRecord(t, server, jobID.String())
+	if preTerminal.Result == nil || preTerminal.Terminal != nil {
+		t.Fatalf("pre-terminal authority record = %+v, want result certificate without terminal", preTerminal)
+	}
+	publicPreTerminal := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: jobID.String()})
+	if publicPreTerminal.Result != nil {
+		t.Fatalf("pre-terminal job.result = %+v, want no public result content", publicPreTerminal)
+	}
+
+	if _, err := server.admissionReady.Finalize(ctx, jobID, ref, model.TerminalIntent{
+		Outcome: model.OutcomeCompleted,
+		Cause:   model.CauseCompletedNormally,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	publicTerminal := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: jobID.String()})
+	if publicTerminal.Result == nil || publicTerminal.Result.ResultPath != resultPath || publicTerminal.Result.SHA256 != receipt.Result.Digest || publicTerminal.Result.Bytes != receipt.Result.Bytes {
+		t.Fatalf("terminal job.result = %+v, want terminal-derived result metadata", publicTerminal)
 	}
 }
 
@@ -2523,6 +2604,63 @@ func TestIdentifiedFencedResultPublishUsesDurableWorkspaceLayoutKeyWithoutJobSto
 	missing := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: submitted.JobID})
 	if missing.Result == nil || missing.Result.Text != "" || missing.Result.ResultPath != expectedPath {
 		t.Fatalf("missing-artifact result = %+v, want omitted inline text with authoritative path", missing)
+	}
+}
+
+func TestAuthorityJobCancelQueuedBeforeLaunch(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, _ := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	accepted := acceptIdentifiedAuthorityWork(t, server, "authority-cancel-queued")
+	jobID := accepted.Record.JobID.String()
+
+	canceled := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: jobID})
+	if canceled.JobID != jobID || canceled.State != engine.StateCanceled {
+		t.Fatalf("authority queued cancel = %+v, want canceled job %s", canceled, jobID)
+	}
+	record := waitAdmissionSafetyTerminal(t, server, jobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Cause != model.CauseCanceledBeforeAuthorization {
+		t.Fatalf("queued cancel terminal = %+v, want canceled before authorization", record.Terminal)
+	}
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want none for queued cancel", got)
+	}
+	if got := launcher.releaseCount(); got != 0 {
+		t.Fatalf("launch releases = %d, want none for queued cancel", got)
+	}
+}
+
+func TestAuthorityJobCancelTerminalReturnsAuthorityState(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-authority-cancel-terminal",
+		RequestID:    "request-authority-cancel-terminal",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "done"},
+	}, nil)
+	resp := responseFromScriptedConn(t, conn)
+	var submitted protocol.JobSubmitResult
+	decodeResult(t, resp, &submitted)
+	record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCompleted {
+		t.Fatalf("terminal = %+v, want completed", record.Terminal)
+	}
+
+	canceled := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: submitted.JobID})
+	if canceled.JobID != submitted.JobID || canceled.State != engine.StateCompleted {
+		t.Fatalf("terminal cancel = %+v, want completed state for %s", canceled, submitted.JobID)
+	}
+	after := loadAdmissionSafetyRecord(t, server, submitted.JobID)
+	if after.Cancel != record.Cancel || after.Terminal.Outcome != record.Terminal.Outcome {
+		t.Fatalf("terminal cancel mutated authority record: before=%+v after=%+v", record, after)
 	}
 }
 
@@ -2687,7 +2825,7 @@ func TestAdmissionActiveRunnerInterruptsCommandForAuthorityCancel(t *testing.T) 
 	})
 }
 
-func TestJobCancelUsesLegacyJSONWhenAuthorityCleanlyDisclaims(t *testing.T) {
+func TestJobCancelUnknownWhenAuthorityCleanlyDisclaims(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
 	server, _, cwd := newUnstartedTestServer(t, backend)
@@ -2707,16 +2845,13 @@ func TestJobCancelUsesLegacyJSONWhenAuthorityCleanlyDisclaims(t *testing.T) {
 		t.Fatalf("authority projection ok=%v err=%+v, want clean disclaimer", ok, errObj)
 	}
 
-	canceled := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: legacyID})
-	if canceled.JobID != legacyID || canceled.State != engine.StateCanceled {
-		t.Fatalf("legacy cancel = %+v, want JSON canceled", canceled)
-	}
+	assertJobHandlerError(t, server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: legacyID})), protocol.ErrorInvalidTaskSpec, "", legacyID)
 	record, err := store.Load(legacyID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.State != engine.StateCanceled {
-		t.Fatalf("legacy record state = %s, want canceled", record.State)
+	if record.State == engine.StateCanceled {
+		t.Fatalf("legacy record state = %s, want not canceled", record.State)
 	}
 }
 
@@ -2757,9 +2892,7 @@ func TestJobCancelFailsClosedWhenAuthorityDegradedWithStaleJSONDuplicate(t *test
 	}
 
 	outcome := server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: submitted.JobID}))
-	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorBackendUnavailable {
-		t.Fatalf("job.cancel outcome = %+v, want backend_unavailable fail-closed error", outcome)
-	}
+	assertJobHandlerError(t, outcome, protocol.ErrorBackendUnavailable, protocol.AdmissionRejectRootFailStopped, "")
 	if outcome.result != nil {
 		t.Fatalf("job.cancel result = %+v, want no canceled result", outcome.result)
 	}
@@ -2775,78 +2908,7 @@ func TestJobCancelFailsClosedWhenAuthorityDegradedWithStaleJSONDuplicate(t *test
 	}
 }
 
-func TestReapKnownStoresSkipsAuthorityOwnedFencedJob(t *testing.T) {
-	t.Parallel()
-	base := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
-	var clockNanos atomic.Int64
-	clockNanos.Store(base.UnixNano())
-	clock := engine.ClockFunc(func() time.Time { return time.Unix(0, clockNanos.Load()).UTC() })
-	holdNaturalExit := make(chan struct{})
-	defer close(holdNaturalExit)
-	backend := newFakeBackend("fake")
-	backend.started = make(chan struct{}, 1)
-	server, _, cwd := newUnstartedTestServer(t, backend)
-	server.clock = clock
-	launcher := newAdmissionFakeLaunchCustodian(t)
-	launcher.waitAndVerify = holdNaturalExit
-	enableTestAdmission(t, server, launcher)
-
-	conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
-		WorkspaceKey: "workspace-authority-reap",
-		RequestID:    "request-authority-reap",
-		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
-	}, nil)
-	resp := responseFromScriptedConn(t, conn)
-	var fenced protocol.JobSubmitResult
-	decodeResult(t, resp, &fenced)
-	waitBackendStarted(t, backend)
-	assertNoJSONJobRecord(t, server, fenced.JobID)
-	before := loadAdmissionSafetyRecord(t, server, fenced.JobID)
-
-	store := server.storeForJob(fenced.JobID)
-	if store == nil {
-		t.Fatalf("job store missing for %s", fenced.JobID)
-	}
-	legacyID := server.nextID("job")
-	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_reap_with_authority", "fake", nil, nil, nil, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.transitionRecord(store, legacyID, engine.StateStarting); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.transitionRecord(store, legacyID, engine.StateRunning); err != nil {
-		t.Fatal(err)
-	}
-	// A running record whose supervisor identity CONFIRMS renews its lease
-	// instead of orphaning (fail-closed identity cuts both ways). The orphan
-	// scenario this test needs is a legacy job whose owning daemon departed:
-	// point the record at a supervisor that no longer exists.
-	if _, err := store.Update(legacyID, func(record *engine.JobRecord) (bool, error) {
-		record.Supervisor = engine.ProcessRef{PID: 4999999, StartTime: "departed-daemon"}
-		return true, nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	clockNanos.Store(base.Add(31 * time.Minute).UnixNano())
-	if err := server.reapKnownStores(); err != nil {
-		t.Fatal(err)
-	}
-	assertNoJSONJobRecord(t, server, fenced.JobID)
-	after := loadAdmissionSafetyRecord(t, server, fenced.JobID)
-	if after.Revision != before.Revision || after.Terminal != before.Terminal || after.Cancel != before.Cancel {
-		t.Fatalf("authority record changed across JSON reap: before=%+v after=%+v", before, after)
-	}
-	legacy, err := store.Load(legacyID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if legacy.State != engine.StateOrphaned {
-		t.Fatalf("legacy reap state = %s, want orphaned", legacy.State)
-	}
-}
-
-func TestExactReadsUseJSONForLegacyWhenAuthorityFailStopped(t *testing.T) {
+func TestExactReadsReturnTypedFailStopWithoutJSONFallback(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
 	backend.started = make(chan struct{}, 1)
@@ -2899,23 +2961,10 @@ func TestExactReadsUseJSONForLegacyWhenAuthorityFailStopped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	legacyStatus := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: legacyID})
-	if len(legacyStatus.Jobs) != 1 || legacyStatus.Jobs[0].JobID != legacyID || legacyStatus.Jobs[0].State != engine.StateCompleted {
-		t.Fatalf("legacy exact status = %+v, want JSON completed despite fail-stopped authority", legacyStatus)
-	}
-	legacyResult := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: legacyID})
-	if legacyResult.JobID != legacyID || legacyResult.State != engine.StateCompleted || legacyResult.Result == nil || legacyResult.Result.Text != "legacy result" {
-		t.Fatalf("legacy exact result = %+v, want JSON result despite fail-stopped authority", legacyResult)
-	}
-
-	fencedStatus := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: fenced.JobID})
-	if len(fencedStatus.Jobs) != 1 || fencedStatus.Jobs[0].JobID != fenced.JobID || fencedStatus.Jobs[0].State != engine.StateQueued || fencedStatus.Jobs[0].SessionID != "ses_stale_json_authority_down" {
-		t.Fatalf("fenced job.status = %+v, want stale JSON fallback while authority fail-stopped", fencedStatus)
-	}
-	fencedResult := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: fenced.JobID})
-	if fencedResult.JobID != fenced.JobID || fencedResult.State != engine.StateQueued || fencedResult.Result != nil {
-		t.Fatalf("fenced job.result = %+v, want stale JSON fallback while authority fail-stopped", fencedResult)
-	}
+	assertJobHandlerError(t, server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{JobID: legacyID})), protocol.ErrorBackendUnavailable, protocol.AdmissionRejectRootFailStopped, "")
+	assertJobHandlerError(t, server.handleJobResult(mustMarshal(t, protocol.JobResultParams{JobID: legacyID})), protocol.ErrorBackendUnavailable, protocol.AdmissionRejectRootFailStopped, "")
+	assertJobHandlerError(t, server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{JobID: fenced.JobID})), protocol.ErrorBackendUnavailable, protocol.AdmissionRejectRootFailStopped, "")
+	assertJobHandlerError(t, server.handleJobResult(mustMarshal(t, protocol.JobResultParams{JobID: fenced.JobID})), protocol.ErrorBackendUnavailable, protocol.AdmissionRejectRootFailStopped, "")
 }
 
 func TestIdentifiedFencedPostAcceptAdvanceFailureFailsClosedAndRetainsAuthorityRecord(t *testing.T) {
@@ -2959,9 +3008,7 @@ func TestIdentifiedFencedPostAcceptAdvanceFailureFailsClosedAndRetainsAuthorityR
 	if snapshot := admissionAnchorSnapshot(t, anchorStore); snapshot.Phase != "fail_stopped" {
 		t.Fatalf("anchor phase = %q, want fail_stopped", snapshot.Phase)
 	}
-	if got := len(server.listKnownRecords()); got != 0 {
-		t.Fatalf("known engine records = %d, want 0 after fail-closed authority submit", got)
-	}
+	assertNoEngineJobRecordsForCWD(t, server, cwd)
 	if got := len(launcher.preparedOrdinals()); got != 0 {
 		t.Fatalf("launch prepare calls = %d, want 0 after fail-closed authority submit", got)
 	}
@@ -3563,24 +3610,8 @@ func TestFinalizeCompletedSalvagesOrphanedJob(t *testing.T) {
 	if record.State != engine.StateCompleted || record.Result == nil || !record.LateFinalization || len(record.Warnings) != 0 {
 		t.Fatalf("salvaged record = %+v", record)
 	}
-	statusRaw, err := json.Marshal(protocol.JobStatusParams{JobID: jobID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	statusOutcome := server.handleJobStatus(statusRaw)
-	status, ok := statusOutcome.result.(protocol.JobStatusResult)
-	if statusOutcome.err != nil || !ok || len(status.Jobs) != 1 || !status.Jobs[0].LateFinalization {
-		t.Fatalf("job.status outcome = %+v", statusOutcome)
-	}
-	resultRaw, err := json.Marshal(protocol.JobResultParams{JobID: jobID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	resultOutcome := server.handleJobResult(resultRaw)
-	result, ok := resultOutcome.result.(protocol.JobResult)
-	if resultOutcome.err != nil || !ok || !result.LateFinalization {
-		t.Fatalf("job.result outcome = %+v", resultOutcome)
-	}
+	assertJobHandlerError(t, server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{JobID: jobID})), protocol.ErrorInvalidTaskSpec, "", jobID)
+	assertJobHandlerError(t, server.handleJobResult(mustMarshal(t, protocol.JobResultParams{JobID: jobID})), protocol.ErrorInvalidTaskSpec, "", jobID)
 }
 
 func TestFinalizeCompletedSalvagesReapedJobOnlyWithAuthoritativeCompletion(t *testing.T) {
@@ -4014,110 +4045,6 @@ func TestBinaryChangeDoesNotUnlinkReplacementSocket(t *testing.T) {
 	}
 	if gotIdentity != wantIdentity {
 		t.Fatalf("replacement socket identity = %+v, want %+v", gotIdentity, wantIdentity)
-	}
-}
-
-func TestStartReaperRecoversCrashedJob(t *testing.T) {
-	t.Parallel()
-	base := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
-	var clockNanos atomic.Int64
-	clockNanos.Store(base.UnixNano())
-	clock := engine.ClockFunc(func() time.Time { return time.Unix(0, clockNanos.Load()).UTC() })
-	root := shortTempDir(t)
-	jobCWD := shortTempDir(t)
-	daemonCWD := shortTempDir(t)
-	store, err := engine.NewStore(engine.StoreConfig{
-		Root:      root,
-		CWD:       jobCWD,
-		Clock:     clock,
-		Processes: fakeProcessTable{},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Save(&engine.JobRecord{
-		JobID:     "job_crashed",
-		SessionID: "ses_crashed",
-		Backend:   "fake",
-		State:     engine.StateRunning,
-		Worker:    engine.ProcessRef{PID: 999999, StartTime: "old"},
-		Lease:     engine.Lease{ExpiresAt: base.Add(time.Minute)},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	backend := newFakeBackend("fake")
-	h := startTestServerWithRoot(t, root, daemonCWD, backend, Config{IdleTimeout: -1, ProcessTable: fakeProcessTable{}, Clock: clock})
-	conn := dialRaw(t, h.socketPath)
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-	helloRaw(t, conn, r, h.token)
-	status := rpc(t, conn, r, "2", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: "job_crashed"})
-	var out protocol.JobStatusResult
-	decodeResult(t, status, &out)
-	if len(out.Jobs) != 1 || out.Jobs[0].State != engine.StateOrphaned {
-		t.Fatalf("status = %+v", out)
-	}
-	clockNanos.Store(base.Add(engine.DefaultLeaseDuration).UnixNano())
-	status = rpc(t, conn, r, "3", protocol.MethodJobStatus, protocol.JobStatusParams{JobID: "job_crashed"})
-	decodeResult(t, status, &out)
-	if len(out.Jobs) != 1 || out.Jobs[0].State != engine.StateReaped {
-		t.Fatalf("status after orphan grace = %+v", out)
-	}
-}
-
-func TestBackgroundReapTickReapsWithoutClientRead(t *testing.T) {
-	base := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
-	clock := engine.ClockFunc(func() time.Time { return base })
-	root := shortTempDir(t)
-	jobCWD := shortTempDir(t)
-	daemonCWD := shortTempDir(t)
-	ticks := make(chan time.Time)
-	ticked := make(chan error, 1)
-	h := startTestServerWithRootAndHooks(t, root, daemonCWD, newFakeBackend("fake"), Config{
-		IdleTimeout:      -1,
-		Clock:            clock,
-		ProcessTable:     fakeProcessTable{},
-		ReapTickInterval: time.Hour,
-	}, func(server *Server) {
-		server.reapTickFactory = func(time.Duration) tickerSource {
-			return tickerSource{c: ticks, stop: func() {}}
-		}
-		server.afterReapTickHook = func(err error) { ticked <- err }
-	})
-	_ = h
-
-	store, err := engine.NewStore(engine.StoreConfig{
-		Root:      root,
-		CWD:       jobCWD,
-		Clock:     clock,
-		Processes: fakeProcessTable{},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	record := &engine.JobRecord{
-		JobID:     "job_background_reap",
-		State:     engine.StateQueued,
-		UpdatedAt: base.Add(-time.Hour),
-	}
-	if err := store.Save(record); err != nil {
-		t.Fatal(err)
-	}
-
-	ticks <- base
-	if err := <-ticked; err != nil {
-		t.Fatal(err)
-	}
-	raw, err := os.ReadFile(record.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var persisted engine.JobRecord
-	if err := json.Unmarshal(raw, &persisted); err != nil {
-		t.Fatal(err)
-	}
-	if persisted.State != engine.StateOrphaned {
-		t.Fatalf("background reap state = %s, want orphaned", persisted.State)
 	}
 }
 
@@ -5346,6 +5273,22 @@ func jobStatusViaHandler(t *testing.T, server *Server, params protocol.JobStatus
 	return status
 }
 
+func assertJobHandlerError(t *testing.T, outcome requestOutcome, code, admissionCause, jobID string) {
+	t.Helper()
+	if outcome.err == nil {
+		t.Fatalf("handler result = %+v, want error code=%s cause=%s job=%s", outcome.result, code, admissionCause, jobID)
+	}
+	if outcome.err.Data.Code != code {
+		t.Fatalf("handler error = %+v, want code %s", outcome.err, code)
+	}
+	if admissionCause != "" && outcome.err.Data.AdmissionCause != admissionCause {
+		t.Fatalf("handler error = %+v, want admissionCause %s", outcome.err, admissionCause)
+	}
+	if jobID != "" && outcome.err.Data.JobID != jobID {
+		t.Fatalf("handler error = %+v, want jobId %s", outcome.err, jobID)
+	}
+}
+
 func jobResultViaHandler(t *testing.T, server *Server, params protocol.JobResultParams) protocol.JobResult {
 	t.Helper()
 	outcome := server.handleJobResult(mustMarshal(t, params))
@@ -5712,30 +5655,6 @@ func (a testNetAddr) Network() string { return "test" }
 
 func (a testNetAddr) String() string { return string(a) }
 
-func singleKnownRecord(t *testing.T, server *Server) engine.JobRecord {
-	t.Helper()
-	records := server.listKnownRecords()
-	if len(records) != 1 {
-		t.Fatalf("known records = %+v, want exactly one", records)
-	}
-	return records[0]
-}
-
-func waitKnownRecordState(t *testing.T, server *Server, want engine.JobState) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	var last engine.JobRecord
-	for time.Now().Before(deadline) {
-		record := singleKnownRecord(t, server)
-		last = record
-		if record.State == want {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("known record did not reach %s; last = %+v", want, last)
-}
-
 func helloRaw(t *testing.T, conn net.Conn, r *bufio.Reader, token string) {
 	t.Helper()
 	resp := rpc(t, conn, r, "hello", protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: token})
@@ -5876,15 +5795,6 @@ func strconvQuote(s string) json.RawMessage {
 
 func stringID(n int64) string {
 	return strconv.FormatInt(n, 10)
-}
-
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }
 
 func shortTempDir(t *testing.T) string {

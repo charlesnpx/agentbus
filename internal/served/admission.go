@@ -583,9 +583,6 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err := authority.ValidateAdmissionRootContract(metadata); err != nil {
 		return err
 	}
-	if err := s.reapKnownStores(); err != nil {
-		return err
-	}
 	ready, err := session.SealReady(ctx)
 	if err != nil {
 		return err
@@ -2084,6 +2081,13 @@ func admissionProtocolError(err error) *protocol.ErrorObject {
 			err.Error(),
 			protocol.ErrorData{},
 		)
+	case errors.Is(err, authority.ErrFailStopped):
+		return strictAdmissionProtocolError(
+			protocol.ErrorBackendUnavailable,
+			protocol.AdmissionRejectRootFailStopped,
+			err.Error(),
+			protocol.ErrorData{},
+		)
 	case errors.Is(err, authority.ErrInvalidRequest):
 		// Served validates backend session metadata before authority ingress; remaining invalid requests are client-owned.
 		return protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
@@ -2195,8 +2199,6 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 	var result *engine.ResultInfo
 	if record.Terminal != nil && record.Terminal.Result != nil {
 		result = s.authorityResultInfo(*record.Terminal.Result)
-	} else if record.Result != nil {
-		result = s.authorityResultInfo(record.Result.Result)
 	}
 	return protocol.JobResult{
 		JobID:     projection.JobID.String(),

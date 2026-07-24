@@ -24,7 +24,6 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
-	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -37,8 +36,6 @@ const (
 	defaultHeartbeat     = 30 * time.Second
 	defaultSafetyDrain   = 30 * time.Second
 )
-
-const duplicateAuthorityJSONWarning = "duplicate-job-id: authority record also has legacy JSON record; authority selected"
 
 var ErrDaemonAlreadyListening = errors.New("agentbus daemon already listening")
 
@@ -138,9 +135,7 @@ type Config struct {
 	InlineResultCap     int
 	LeaseDuration       time.Duration
 	HeartbeatInterval   time.Duration
-	ReapInterval        time.Duration
 	GCInterval          time.Duration
-	ReapTickInterval    time.Duration
 	ReadyHook           func(ServeReadyInfo) error
 	// Runtime is an injected strict-admission runtime owned by Serve. A runtime
 	// with real close semantics is single-use: once a Serve or recovery-only
@@ -154,16 +149,6 @@ type Config struct {
 type ServeReadyInfo struct {
 	StateRoot  string
 	SocketPath string
-}
-
-type tickerSource struct {
-	c    <-chan time.Time
-	stop func()
-}
-
-func newTickerSource(interval time.Duration) tickerSource {
-	ticker := time.NewTicker(interval)
-	return tickerSource{c: ticker.C, stop: ticker.Stop}
 }
 
 type admissionOwnedWorkChecker interface {
@@ -196,12 +181,8 @@ type Server struct {
 	inlineResultCap        int
 	leaseDuration          time.Duration
 	heartbeatInterval      time.Duration
-	reapInterval           time.Duration
 	gcInterval             time.Duration
-	reapTickInterval       time.Duration
-	reapTickFactory        func(time.Duration) tickerSource
 	readyHook              func(ServeReadyInfo) error
-	afterReapTickHook      func(error)
 	listenerFactory        func() (net.Listener, socketFileIdentity, error)
 	beforeListenBindHook   func()
 	safetyLatch            *SafetyLatch
@@ -402,26 +383,12 @@ func New(cfg Config) (*Server, error) {
 	if heartbeatInterval <= 0 {
 		heartbeatInterval = defaultHeartbeat
 	}
-	reapInterval := cfg.ReapInterval
-	if reapInterval < 0 {
-		return nil, errors.New("reap interval cannot be negative")
-	}
-	if reapInterval == 0 {
-		reapInterval = engine.DefaultReapInterval
-	}
 	gcInterval := cfg.GCInterval
 	if gcInterval < 0 {
 		return nil, errors.New("gc interval cannot be negative")
 	}
 	if gcInterval == 0 {
 		gcInterval = engine.DefaultGCInterval
-	}
-	reapTickInterval := cfg.ReapTickInterval
-	if reapTickInterval < 0 {
-		return nil, errors.New("reap tick interval cannot be negative")
-	}
-	if reapTickInterval == 0 {
-		reapTickInterval = reapInterval
 	}
 	binaryIdentityProbe := cfg.BinaryIdentityProbe
 	if binaryIdentityProbe == nil {
@@ -450,10 +417,7 @@ func New(cfg Config) (*Server, error) {
 		inlineResultCap:        inlineResultCap,
 		leaseDuration:          leaseDuration,
 		heartbeatInterval:      heartbeatInterval,
-		reapInterval:           reapInterval,
 		gcInterval:             gcInterval,
-		reapTickInterval:       reapTickInterval,
-		reapTickFactory:        newTickerSource,
 		readyHook:              cfg.ReadyHook,
 		safetyLatch:            NewSafetyLatch(),
 		safetyDrainTimeout:     defaultSafetyDrain,
@@ -664,22 +628,12 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener, socketIdentity socketFileIdentity, acceptSettled <-chan struct{}) {
 	ticker := time.NewTicker(s.idleCheckInterval)
 	defer ticker.Stop()
-	reapTicker := s.reapTickFactory(s.reapTickInterval)
-	defer reapTicker.stop()
 	staleDraining := false
 	drainLogged := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-reapTicker.c:
-			err := s.reapKnownStores()
-			if s.afterReapTickHook != nil {
-				s.afterReapTickHook(err)
-			}
-			if err != nil {
-				log.Printf("agentbus daemon: periodic reap: %v", err)
-			}
 		case <-ticker.C:
 			stale := s.checkBinaryStale()
 			quiet := s.clients.Load() == 0 && s.accepting.Load() == 0 && !s.activeWork()
@@ -1324,18 +1278,10 @@ func (s *Server) handleExactJobStatus(jobID string) requestOutcome {
 	if ok {
 		return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{status}}}
 	}
-	if record, ok, errObj := s.jsonJobRecord(jobID); ok || errObj != nil {
-		if errObj != nil {
-			return requestOutcome{err: errObj}
-		}
-		// During authority degradation, a fenced job with stale JSON can read the
-		// stale JSON fallback. S4E SafetyLatch handles that fault-state case.
-		return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{statusFromRecord(*record)}}}
-	}
 	if authorityErr != nil {
 		return requestOutcome{err: authorityErr}
 	}
-	return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{}}}
+	return requestOutcome{err: unknownAuthorityJobError(jobID)}
 }
 
 func (s *Server) handleExactJobResult(jobID string) requestOutcome {
@@ -1343,36 +1289,10 @@ func (s *Server) handleExactJobResult(jobID string) requestOutcome {
 	if ok {
 		return requestOutcome{result: result}
 	}
-	if record, ok, errObj := s.jsonJobRecord(jobID); ok || errObj != nil {
-		if errObj != nil {
-			return requestOutcome{err: errObj}
-		}
-		// During authority degradation, a fenced job with stale JSON can read the
-		// stale JSON fallback. S4E SafetyLatch handles that fault-state case.
-		return requestOutcome{result: resultFromRecord(*record)}
-	}
 	if authorityErr != nil {
 		return requestOutcome{err: authorityErr}
 	}
-	return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: jobID})}
-}
-
-func (s *Server) jsonJobRecord(jobID string) (*engine.JobRecord, bool, *protocol.ErrorObject) {
-	store := s.storeForJob(jobID)
-	if store == nil {
-		return nil, false, nil
-	}
-	record, err := store.Load(jobID)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, false, nil
-		}
-		return nil, false, protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})
-	}
-	if record == nil {
-		return nil, false, nil
-	}
-	return record, true, nil
+	return requestOutcome{err: unknownAuthorityJobError(jobID)}
 }
 
 func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
@@ -1387,21 +1307,13 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "jobId is required", protocol.ErrorData{})}
 	}
 	if _, _, ok, authorityErr := s.authorityJobProjection(params.JobID); authorityErr != nil {
-		return requestOutcome{err: authorityMutationIndeterminateError("job.cancel", protocol.ErrorData{JobID: params.JobID}, authorityErr)}
+		return requestOutcome{err: authorityErr}
 	} else if ok {
 		return s.withAdmissionJobEffect(params.JobID, func() requestOutcome {
 			return s.handleAuthorityJobCancelLocked(params.JobID)
 		})
 	}
-	return s.handleJobCancelLocked(params.JobID)
-}
-
-func authorityMutationIndeterminateError(operation string, data protocol.ErrorData, authorityErr *protocol.ErrorObject) *protocol.ErrorObject {
-	message := fmt.Sprintf("%s refused because admission authority ownership is indeterminate", operation)
-	if authorityErr != nil && authorityErr.Message != "" {
-		message = fmt.Sprintf("%s: %s", message, authorityErr.Message)
-	}
-	return protocol.NewError(protocol.ErrorBackendUnavailable, message, data)
+	return requestOutcome{err: unknownAuthorityJobError(params.JobID)}
 }
 
 func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
@@ -1423,7 +1335,7 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 		return requestOutcome{err: errObj}
 	}
 	if !ok {
-		return s.handleJobCancelLocked(jobID)
+		return requestOutcome{err: unknownAuthorityJobError(jobID)}
 	}
 	if record.Terminal == nil {
 		err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
@@ -1438,52 +1350,10 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 			return requestOutcome{err: reloadErr}
 		}
 		if !ok {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: jobID})}
+			return requestOutcome{err: unknownAuthorityJobError(jobID)}
 		}
 	}
 	return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
-}
-
-func (s *Server) handleJobCancelLocked(jobID string) requestOutcome {
-	active := s.lookupActiveJob(jobID)
-	if active != nil {
-		active.requestTerminal(engine.StateCanceled)
-	}
-	store := s.storeForJob(jobID)
-	if store == nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: jobID})}
-	}
-	record, err := store.Load(jobID)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
-	}
-	if s.isAdmissionJob(jobID) {
-		err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
-			snapshot, err := coord.Snapshot(context.Background(), model.JobID(jobID))
-			if err != nil {
-				return err
-			}
-			if snapshot.Record.Terminal == nil {
-				if err := coord.Cancel(context.Background(), model.JobID(jobID), nil); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			if !errors.Is(err, authority.ErrNotReady) && !errors.Is(err, coordinator.ErrCoordinatorNotReady) {
-				return requestOutcome{err: admissionProtocolError(err)}
-			}
-		}
-	}
-	record, err = store.Cancel(jobID)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
-	}
-	if active != nil && active.cancel != nil {
-		active.cancel()
-	}
-	return requestOutcome{result: protocol.JobCancelResult{JobID: record.JobID, State: record.State}}
 }
 
 func (s *Server) handlePolicyValidate(raw json.RawMessage) requestOutcome {
@@ -1930,7 +1800,6 @@ func (s *Server) storeForCWDLocked(cwd string) (*engine.Store, error) {
 		CancelGrace:   s.cancelGrace,
 		CancelWaiter:  s.cancelWaiter,
 		LeaseDuration: s.leaseDuration,
-		ReapInterval:  s.reapInterval,
 		GCInterval:    s.gcInterval,
 	})
 	if err != nil {
@@ -1941,43 +1810,8 @@ func (s *Server) storeForCWDLocked(cwd string) (*engine.Store, error) {
 
 func (s *Server) storeForJob(jobID string) *engine.Store {
 	s.mu.Lock()
-	if store := s.jobStores[jobID]; store != nil {
-		s.mu.Unlock()
-		return store
-	}
-	s.mu.Unlock()
-
-	stores, err := s.knownStores()
-	if err != nil {
-		return nil
-	}
-	if len(stores) == 0 {
-		s.mu.Lock()
-		store, err := s.storeForCWDLocked(s.cwd)
-		s.mu.Unlock()
-		if err != nil {
-			return nil
-		}
-		stores = []*engine.Store{store}
-	}
-	for _, store := range stores {
-		ok, err := store.HasJob(jobID)
-		if err != nil {
-			return store
-		}
-		if !ok {
-			continue
-		}
-		s.mu.Lock()
-		if existing := s.jobStores[jobID]; existing != nil {
-			s.mu.Unlock()
-			return existing
-		}
-		s.jobStores[jobID] = store
-		s.mu.Unlock()
-		return store
-	}
-	return nil
+	defer s.mu.Unlock()
+	return s.jobStores[jobID]
 }
 
 func (s *Server) addActiveJob(job *activeJob) {
@@ -2028,85 +1862,13 @@ func (s *Server) lookupActiveJob(jobID string) *activeJob {
 	return s.activeJobs[jobID]
 }
 
-func (s *Server) listKnownRecords() []engine.JobRecord {
-	stores, err := s.knownStores()
-	if err != nil {
-		return nil
-	}
-	var records []engine.JobRecord
-	for _, store := range stores {
-		list, err := store.List()
-		if err == nil {
-			records = append(records, list...)
-		}
-	}
-	return records
-}
-
 func (s *Server) listJobStatuses() ([]protocol.JobStatus, *protocol.ErrorObject) {
-	statusesByID := make(map[string]protocol.JobStatus)
-	authorityStatuses, errObj := s.listAuthorityStatuses()
+	statuses, errObj := s.listAuthorityStatuses()
 	if errObj != nil {
 		return nil, errObj
 	}
-	for _, status := range authorityStatuses {
-		statusesByID[status.JobID] = status
-	}
-	for _, record := range s.listKnownRecords() {
-		status := statusFromRecord(record)
-		if existing, ok := statusesByID[status.JobID]; ok {
-			existing.Warnings = appendStatusWarning(existing.Warnings, duplicateAuthorityJSONWarning)
-			statusesByID[status.JobID] = existing
-			continue
-		}
-		statusesByID[status.JobID] = status
-	}
-	statuses := make([]protocol.JobStatus, 0, len(statusesByID))
-	for _, status := range statusesByID {
-		statuses = append(statuses, status)
-	}
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].JobID < statuses[j].JobID })
 	return statuses, nil
-}
-
-func (s *Server) reapKnownStores() error {
-	stores, err := s.knownStores()
-	if err != nil {
-		return err
-	}
-	for _, store := range stores {
-		if err := store.Reap(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Server) knownStores() ([]*engine.Store, error) {
-	discovered, err := engine.OpenWorkspaceStores(s.storeConfig())
-	if err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, store := range discovered {
-		s.rememberStoreLocked(store)
-	}
-	return s.storeSnapshotLocked(), nil
-}
-
-func (s *Server) storeConfig() engine.StoreConfig {
-	return engine.StoreConfig{
-		Root:          s.stateRoot,
-		Clock:         s.clock,
-		Processes:     s.processes,
-		ProcessGroups: s.processGroups,
-		CancelGrace:   s.cancelGrace,
-		CancelWaiter:  s.cancelWaiter,
-		LeaseDuration: s.leaseDuration,
-		ReapInterval:  s.reapInterval,
-		GCInterval:    s.gcInterval,
-	}
 }
 
 func (s *Server) rememberStoreLocked(store *engine.Store) *engine.Store {
@@ -2122,17 +1884,6 @@ func (s *Server) rememberStoreLocked(store *engine.Store) *engine.Store {
 		s.stores[workspace] = store
 	}
 	return store
-}
-
-func (s *Server) storeSnapshotLocked() []*engine.Store {
-	stores := make([]*engine.Store, 0, len(s.storesByKey))
-	for _, store := range s.storesByKey {
-		stores = append(stores, store)
-	}
-	sort.Slice(stores, func(i, j int) bool {
-		return stores[i].Layout().Key < stores[j].Layout().Key
-	})
-	return stores
 }
 
 func (s *Server) currentProcessRef() engine.ProcessRef {
@@ -2338,6 +2089,10 @@ func invalidParams(err error) requestOutcome {
 	return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 }
 
+func unknownAuthorityJobError(jobID string) *protocol.ErrorObject {
+	return protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: jobID})
+}
+
 func backendError(err error) *protocol.ErrorObject {
 	if err == nil {
 		return nil
@@ -2381,65 +2136,6 @@ func validateTaskSpecEnvelope(raw json.RawMessage) *protocol.ErrorObject {
 		}
 	}
 	return nil
-}
-
-func statusFromRecord(record engine.JobRecord) protocol.JobStatus {
-	return protocol.JobStatus{
-		JobID:                 record.JobID,
-		SessionID:             record.SessionID,
-		Backend:               record.Backend,
-		State:                 record.State,
-		LateFinalization:      record.LateFinalization,
-		Tags:                  cloneTags(record.Tags),
-		StartedAt:             timePtr(record.StartedAt),
-		UpdatedAt:             timePtr(record.UpdatedAt),
-		HeartbeatAt:           timePtr(record.HeartbeatAt),
-		Lease:                 leasePtr(record.Lease),
-		WorkerPID:             record.Worker.PID,
-		WorkerStartTime:       record.Worker.StartTime,
-		BackendChildPID:       record.BackendChildPID,
-		BackendChildStartTime: record.BackendChildStartTime,
-		StatePath:             record.StatePath,
-		LogPaths:              record.LogPaths,
-		ModelReported:         record.ModelReported,
-		Warnings:              append([]string(nil), record.Warnings...),
-	}
-}
-
-func appendStatusWarning(warnings []string, warning string) []string {
-	for _, existing := range warnings {
-		if existing == warning {
-			return warnings
-		}
-	}
-	return append(warnings, warning)
-}
-
-func resultFromRecord(record engine.JobRecord) protocol.JobResult {
-	return protocol.JobResult{
-		JobID:            record.JobID,
-		SessionID:        record.SessionID,
-		State:            record.State,
-		LateFinalization: record.LateFinalization,
-		Result:           record.Result,
-		ModelReported:    record.ModelReported,
-		Contract:         record.Contract,
-	}
-}
-
-func timePtr(t time.Time) *time.Time {
-	if t.IsZero() {
-		return nil
-	}
-	u := t.UTC()
-	return &u
-}
-
-func leasePtr(lease engine.Lease) *engine.Lease {
-	if lease.ExpiresAt.IsZero() {
-		return nil
-	}
-	return &lease
 }
 
 func cloneTags(in map[string]string) map[string]string {

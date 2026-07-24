@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	agentclient "github.com/charlesnpx/agentbus/client"
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
@@ -287,33 +288,28 @@ func TestAdmissionCLIInspectResetAndSealFlags(t *testing.T) {
 
 func TestStatusResultAndCancelExitCodes(t *testing.T) {
 	t.Parallel()
-	a, store := testAppAndStore(t)
-	info, err := store.WriteResult("job_done", []byte("done"), engine.DefaultInlineResultCap)
-	if err != nil {
-		t.Fatal(err)
+	a := testApp(t)
+	client := &fakeProtocolClient{
+		statuses: map[string]agentclient.JobStatus{
+			"job_done":    {JobID: "job_done", SessionID: "ses_done", State: engine.StateCompleted},
+			"job_running": {JobID: "job_running", SessionID: "ses_running", State: engine.StateRunning},
+		},
+		results: map[string]agentclient.JobResult{
+			"job_done":    {JobID: "job_done", SessionID: "ses_done", State: engine.StateCompleted, Result: &engine.ResultInfo{Text: "done", Bytes: 4}},
+			"job_running": {JobID: "job_running", SessionID: "ses_running", State: engine.StateRunning},
+		},
+		cancels: map[string]agentclient.JobCancelResult{
+			"job_cancel_me": {JobID: "job_cancel_me", State: engine.StateCanceled},
+		},
 	}
-	if err := store.Save(&engine.JobRecord{
-		JobID:     "job_done",
-		SessionID: "ses_done",
-		Backend:   "codex",
-		State:     engine.StateCompleted,
-		Result:    &info,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Save(&engine.JobRecord{
-		JobID:     "job_running",
-		SessionID: "ses_running",
-		Backend:   "claude",
-		State:     engine.StateRunning,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Save(&engine.JobRecord{
-		JobID: "job_cancel_me",
-		State: engine.StateQueued,
-	}); err != nil {
-		t.Fatal(err)
+	a.clientConnect = func(ctx context.Context, opts agentclient.Options) (protocolClient, error) {
+		if opts.StateRoot != a.stateRoot {
+			t.Errorf("client state root = %q, want %q", opts.StateRoot, a.stateRoot)
+		}
+		if opts.CommandPath == "" {
+			t.Error("client command path is empty")
+		}
+		return client, nil
 	}
 
 	tests := []struct {
@@ -336,7 +332,7 @@ func TestStatusResultAndCancelExitCodes(t *testing.T) {
 				t.Fatalf("exit = %d want %d stderr=%s stdout=%s", code, tt.wantCode, stderr, stdout)
 			}
 			if tt.args[0] == "status" {
-				var output statusOutput
+				var output protocol.JobStatusResult
 				decodeJSON(t, stdout, &output)
 				if len(output.Jobs) != 1 || output.Jobs[0].State != tt.wantState {
 					t.Fatalf("status output = %+v", output)
@@ -344,7 +340,7 @@ func TestStatusResultAndCancelExitCodes(t *testing.T) {
 				return
 			}
 			if tt.args[0] == "result" {
-				var output jobResult
+				var output protocol.JobResult
 				decodeJSON(t, stdout, &output)
 				if output.State != tt.wantState {
 					t.Fatalf("result output = %+v", output)
@@ -354,19 +350,121 @@ func TestStatusResultAndCancelExitCodes(t *testing.T) {
 				}
 				return
 			}
-			var output cancelOutput
+			var output protocol.JobCancelResult
 			decodeJSON(t, stdout, &output)
 			if output.State != tt.wantState {
 				t.Fatalf("cancel output = %+v", output)
 			}
-			loaded, err := store.Load("job_cancel_me")
-			if err != nil {
-				t.Fatal(err)
+		})
+	}
+}
+
+func TestStatusListsViaProtocolClient(t *testing.T) {
+	t.Parallel()
+	a := testApp(t)
+	a.clientConnect = func(context.Context, agentclient.Options) (protocolClient, error) {
+		return &fakeProtocolClient{
+			list: []agentclient.JobStatus{
+				{JobID: "job_a", State: engine.StateRunning},
+				{JobID: "job_b", State: engine.StateCompleted},
+			},
+		}, nil
+	}
+	code, stdout, stderr := runTestCLI(t, a, []string{"status", "--json"}, "")
+	if code != 0 {
+		t.Fatalf("status list exit=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	var output protocol.JobStatusResult
+	decodeJSON(t, stdout, &output)
+	if len(output.Jobs) != 2 || output.Jobs[0].JobID != "job_a" || output.Jobs[1].JobID != "job_b" {
+		t.Fatalf("status list output = %+v", output)
+	}
+}
+
+func TestStatusResultCancelProtocolErrorExitCodes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		args       []string
+		err        error
+		wantCode   int
+		wantStderr []string
+	}{
+		{
+			name:       "unknown job",
+			args:       []string{"status", "--job", "job_missing"},
+			err:        &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: "job_missing"})},
+			wantCode:   cliExitUnknownJob,
+			wantStderr: []string{"code=invalid_task_spec", "jobId=job_missing"},
+		},
+		{
+			name:       "fail stop",
+			args:       []string{"status", "--job", "job_failstop"},
+			err:        &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorBackendUnavailable, "authority fail-stopped", protocol.ErrorData{AdmissionCause: protocol.AdmissionRejectRootFailStopped})},
+			wantCode:   cliExitAuthorityFailStop,
+			wantStderr: []string{"code=backend_unavailable", "admissionCause=root_fail_stopped"},
+		},
+		{
+			name:       "daemon startup failure",
+			args:       []string{"result", "--job", "job_any"},
+			err:        &daemonlaunch.StartupError{Kind: daemonlaunch.ErrStartupFailed, Code: "strict admission support unavailable", Message: "unsupported host"},
+			wantCode:   cliExitDaemonStartupFailure,
+			wantStderr: []string{"daemon startup failed", "unsupported host"},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			a := testApp(t)
+			a.clientConnect = func(context.Context, agentclient.Options) (protocolClient, error) {
+				return &fakeProtocolClient{err: tt.err}, nil
 			}
-			if loaded.State != engine.StateCanceled {
-				t.Fatalf("persisted cancel state = %s", loaded.State)
+			code, stdout, stderr := runTestCLI(t, a, tt.args, "")
+			if code != tt.wantCode {
+				t.Fatalf("exit=%d want=%d stdout=%s stderr=%s", code, tt.wantCode, stdout, stderr)
+			}
+			if stdout != "" {
+				t.Fatalf("stdout=%q, want empty", stdout)
+			}
+			for _, want := range tt.wantStderr {
+				if !strings.Contains(stderr, want) {
+					t.Fatalf("stderr=%q, want %q", stderr, want)
+				}
 			}
 		})
+	}
+}
+
+func TestStatusResultCancelDaemonStartupFailureLeavesRootEmpty(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{
+		{"status", "--job", "job_any"},
+		{"result", "--job", "job_any"},
+		{"cancel", "--job", "job_any"},
+	} {
+		args := args
+		t.Run(args[0], func(t *testing.T) {
+			a := testApp(t)
+			a.clientConnect = func(context.Context, agentclient.Options) (protocolClient, error) {
+				return nil, &daemonlaunch.StartupError{Kind: daemonlaunch.ErrStartupFailed, Code: "strict admission support unavailable", Message: "unsupported host"}
+			}
+			code, stdout, stderr := runTestCLI(t, a, args, "")
+			if code != cliExitDaemonStartupFailure {
+				t.Fatalf("exit=%d want=%d stdout=%s stderr=%s", code, cliExitDaemonStartupFailure, stdout, stderr)
+			}
+			if _, err := os.Stat(a.stateRoot); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("state root stat = %v, want not exist", err)
+			}
+		})
+	}
+}
+
+func TestSessionsCommandIsUnknown(t *testing.T) {
+	t.Parallel()
+	a := testApp(t)
+	code, _, stderr := runTestCLI(t, a, []string{"sessions"}, "")
+	if code != 2 || !strings.Contains(stderr, "unknown command") {
+		t.Fatalf("sessions exit=%d stderr=%s", code, stderr)
 	}
 }
 
@@ -434,25 +532,70 @@ func testApp(t *testing.T) *app {
 	}
 }
 
-func testAppAndStore(t *testing.T) (*app, *engine.Store) {
-	t.Helper()
-	a := testApp(t)
-	store, err := engine.NewStore(engine.StoreConfig{
-		Root:  a.stateRoot,
-		CWD:   a.cwd,
-		Clock: a.clock,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return a, store
-}
-
 func runTestCLI(t *testing.T, a *app, args []string, stdin string) (int, string, string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	code := a.run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr)
 	return code, stdout.String(), stderr.String()
+}
+
+type fakeProtocolClient struct {
+	list     []agentclient.JobStatus
+	statuses map[string]agentclient.JobStatus
+	results  map[string]agentclient.JobResult
+	cancels  map[string]agentclient.JobCancelResult
+	err      error
+}
+
+func (c *fakeProtocolClient) JobStatus(_ context.Context, params agentclient.JobStatusParams) (agentclient.JobStatusResult, error) {
+	if c.err != nil {
+		return agentclient.JobStatusResult{}, c.err
+	}
+	if params.JobID != "" {
+		status, ok := c.statuses[params.JobID]
+		if !ok {
+			return agentclient.JobStatusResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+		}
+		return agentclient.JobStatusResult{Jobs: []agentclient.JobStatus{status}}, nil
+	}
+	if len(c.list) > 0 {
+		return agentclient.JobStatusResult{Jobs: append([]agentclient.JobStatus(nil), c.list...)}, nil
+	}
+	return agentclient.JobStatusResult{Jobs: mapValues(c.statuses)}, nil
+}
+
+func (c *fakeProtocolClient) JobResult(_ context.Context, params agentclient.JobResultParams) (agentclient.JobResult, error) {
+	if c.err != nil {
+		return agentclient.JobResult{}, c.err
+	}
+	result, ok := c.results[params.JobID]
+	if !ok {
+		return agentclient.JobResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+	}
+	return result, nil
+}
+
+func (c *fakeProtocolClient) JobCancel(_ context.Context, params agentclient.JobCancelParams) (agentclient.JobCancelResult, error) {
+	if c.err != nil {
+		return agentclient.JobCancelResult{}, c.err
+	}
+	result, ok := c.cancels[params.JobID]
+	if !ok {
+		return agentclient.JobCancelResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+	}
+	return result, nil
+}
+
+func (c *fakeProtocolClient) Close() error {
+	return nil
+}
+
+func mapValues(in map[string]agentclient.JobStatus) []agentclient.JobStatus {
+	out := make([]agentclient.JobStatus, 0, len(in))
+	for _, value := range in {
+		out = append(out, value)
+	}
+	return out
 }
 
 func decodeJSON(t *testing.T, raw string, target any) {

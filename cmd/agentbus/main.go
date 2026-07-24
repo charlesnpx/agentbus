@@ -13,8 +13,8 @@ import (
 	"sort"
 	"strings"
 	"syscall"
-	"time"
 
+	agentclient "github.com/charlesnpx/agentbus/client"
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/claudecli"
 	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
@@ -26,6 +26,10 @@ import (
 
 const (
 	cliJSONSchema = 1
+
+	cliExitUnknownJob           = 10
+	cliExitDaemonStartupFailure = 11
+	cliExitAuthorityFailStop    = 12
 )
 
 var version = "dev"
@@ -50,6 +54,14 @@ type app struct {
 	processes      engine.ProcessTable
 	clock          engine.Clock
 	daemonLauncher func(context.Context, daemonlaunch.Options) (daemonlaunch.Result, error)
+	clientConnect  func(context.Context, agentclient.Options) (protocolClient, error)
+}
+
+type protocolClient interface {
+	JobStatus(context.Context, agentclient.JobStatusParams) (agentclient.JobStatusResult, error)
+	JobResult(context.Context, agentclient.JobResultParams) (agentclient.JobResult, error)
+	JobCancel(context.Context, agentclient.JobCancelParams) (agentclient.JobCancelResult, error)
+	Close() error
 }
 
 func main() {
@@ -108,11 +120,11 @@ func (a *app) run(ctx context.Context, args []string, in io.Reader, out, errOut 
 	case "admission":
 		return a.runAdmission(ctx, args[1:], out, errOut)
 	case "status":
-		return a.runStatus(args[1:], out, errOut)
+		return a.runStatus(ctx, args[1:], out, errOut)
 	case "result":
-		return a.runResult(args[1:], out, errOut)
+		return a.runResult(ctx, args[1:], out, errOut)
 	case "cancel":
-		return a.runCancel(args[1:], out, errOut)
+		return a.runCancel(ctx, args[1:], out, errOut)
 	case "validate":
 		return a.runValidate(args[1:], in, out, errOut)
 	case "internal-parked-worker":
@@ -492,9 +504,9 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 	return os.Chmod(path, mode)
 }
 
-func (a *app) runStatus(args []string, out, errOut io.Writer) int {
+func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("status", errOut)
-	jsonOut := fs.Bool("json", false, "emit JSON: {\"jobs\":[{\"jobId\":\"...\",\"state\":\"running\",\"lease\":{\"expiresAt\":\"...\",\"expired\":false}}]}")
+	jsonOut := fs.Bool("json", false, "emit protocol-v2 authority JSON: {\"jobs\":[{\"jobId\":\"...\",\"sessionId\":\"...\",\"state\":\"running\"}]}")
 	jobID := fs.String("job", "", "job id")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
@@ -502,45 +514,45 @@ func (a *app) runStatus(args []string, out, errOut io.Writer) int {
 	if fs.NArg() != 0 {
 		return usageError(errOut, "status does not accept positional arguments")
 	}
-	store, err := a.newStore()
+	client, err := a.connectProtocolClient(ctx)
 	if err != nil {
-		return commandError(errOut, err)
+		return protocolCommandError(errOut, "status", err)
+	}
+	defer client.Close()
+	params := agentclient.JobStatusParams{All: true}
+	if *jobID != "" {
+		params = agentclient.JobStatusParams{JobID: *jobID}
+	}
+	statuses, err := client.JobStatus(ctx, params)
+	if err != nil {
+		return protocolCommandError(errOut, "status", err)
 	}
 	if *jobID != "" {
-		record, err := store.Load(*jobID)
-		if err != nil {
-			return commandError(errOut, err)
+		if len(statuses.Jobs) == 0 {
+			return unknownJobCommandError(errOut, "status", *jobID)
 		}
-		status := statusFromRecord(*record)
-		if *jsonOut {
-			if code := writeOrError(out, errOut, statusOutput{Jobs: []jobStatus{status}}); code != 0 {
-				return code
-			}
-		} else {
-			printJobStatus(out, status)
+		if len(statuses.Jobs) != 1 || statuses.Jobs[0].JobID != *jobID {
+			return commandError(errOut, fmt.Errorf("status returned unexpected jobs for %s", *jobID))
 		}
-		return engine.ExitCodeForState(record.State)
-	}
-	records, err := store.List()
-	if err != nil {
-		return commandError(errOut, err)
-	}
-	statuses := make([]jobStatus, 0, len(records))
-	for _, record := range records {
-		statuses = append(statuses, statusFromRecord(record))
 	}
 	if *jsonOut {
-		return writeOrError(out, errOut, statusOutput{Jobs: statuses})
+		if code := writeOrError(out, errOut, statuses); code != 0 {
+			return code
+		}
+	} else {
+		for _, status := range statuses.Jobs {
+			printJobStatus(out, status)
+		}
 	}
-	for _, status := range statuses {
-		printJobStatus(out, status)
+	if *jobID == "" {
+		return 0
 	}
-	return 0
+	return cliExitCodeForState(statuses.Jobs[0].State)
 }
 
-func (a *app) runResult(args []string, out, errOut io.Writer) int {
+func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("result", errOut)
-	jsonOut := fs.Bool("json", false, "emit JSON: {\"jobId\":\"...\",\"state\":\"completed\",\"result\":{\"text\":\"...\",\"resultPath\":\"...\",\"sha256\":\"...\",\"bytes\":1},\"contract\":{...}}")
+	jsonOut := fs.Bool("json", false, "emit protocol-v2 authority JSON: {\"jobId\":\"...\",\"state\":\"completed\",\"result\":{\"text\":\"...\",\"resultPath\":\"...\",\"sha256\":\"...\",\"bytes\":1}}")
 	jobID := fs.String("job", "", "job id")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
@@ -551,15 +563,15 @@ func (a *app) runResult(args []string, out, errOut io.Writer) int {
 	if *jobID == "" {
 		return usageError(errOut, "result requires --job <id>")
 	}
-	store, err := a.newStore()
+	client, err := a.connectProtocolClient(ctx)
 	if err != nil {
-		return commandError(errOut, err)
+		return protocolCommandError(errOut, "result", err)
 	}
-	record, err := store.Load(*jobID)
+	defer client.Close()
+	result, err := client.JobResult(ctx, agentclient.JobResultParams{JobID: *jobID})
 	if err != nil {
-		return commandError(errOut, err)
+		return protocolCommandError(errOut, "result", err)
 	}
-	result := resultFromRecord(*record)
 	if *jsonOut {
 		if code := writeOrError(out, errOut, result); code != 0 {
 			return code
@@ -567,12 +579,12 @@ func (a *app) runResult(args []string, out, errOut io.Writer) int {
 	} else {
 		printJobResult(out, result)
 	}
-	return engine.ExitCodeForState(record.State)
+	return cliExitCodeForState(result.State)
 }
 
-func (a *app) runCancel(args []string, out, errOut io.Writer) int {
+func (a *app) runCancel(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("cancel", errOut)
-	jsonOut := fs.Bool("json", false, "emit JSON: {\"jobId\":\"...\",\"state\":\"canceled\"}")
+	jsonOut := fs.Bool("json", false, "emit protocol-v2 authority JSON: {\"jobId\":\"...\",\"state\":\"canceled\"}")
 	jobID := fs.String("job", "", "job id")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
@@ -583,15 +595,15 @@ func (a *app) runCancel(args []string, out, errOut io.Writer) int {
 	if *jobID == "" {
 		return usageError(errOut, "cancel requires --job <id>")
 	}
-	store, err := a.newStore()
+	client, err := a.connectProtocolClient(ctx)
 	if err != nil {
-		return commandError(errOut, err)
+		return protocolCommandError(errOut, "cancel", err)
 	}
-	record, err := store.Cancel(*jobID)
+	defer client.Close()
+	result, err := client.JobCancel(ctx, agentclient.JobCancelParams{JobID: *jobID})
 	if err != nil {
-		return commandError(errOut, err)
+		return protocolCommandError(errOut, "cancel", err)
 	}
-	result := cancelOutput{JobID: record.JobID, State: record.State}
 	if *jsonOut {
 		if code := writeOrError(out, errOut, result); code != 0 {
 			return code
@@ -599,7 +611,7 @@ func (a *app) runCancel(args []string, out, errOut io.Writer) int {
 	} else {
 		fmt.Fprintf(out, "%s\t%s\n", result.JobID, result.State)
 	}
-	return engine.ExitCodeForState(record.State)
+	return cliExitCodeForState(result.State)
 }
 
 func (a *app) runValidate(args []string, in io.Reader, out, errOut io.Writer) int {
@@ -756,15 +768,6 @@ func setupReportFromProbe(probe engine.BackendSetupProbe) setupBackendReport {
 	}
 }
 
-func (a *app) newStore() (*engine.Store, error) {
-	return engine.NewStore(engine.StoreConfig{
-		Root:      a.stateRoot,
-		CWD:       a.cwd,
-		Clock:     a.clock,
-		Processes: a.processes,
-	})
-}
-
 func (a *app) cachePath() (string, error) {
 	if a.setupCachePath != "" {
 		return a.setupCachePath, nil
@@ -852,66 +855,22 @@ func tagsMatch(actual map[string]string, want map[string]string) bool {
 	return true
 }
 
-func cloneTags(in map[string]string) map[string]string {
-	if len(in) == 0 {
-		return nil
+func (a *app) connectProtocolClient(ctx context.Context) (protocolClient, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, err
 	}
-	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
+	opts := agentclient.Options{
+		StateRoot:   a.stateRoot,
+		CommandPath: exe,
 	}
-	return out
+	if a.clientConnect != nil {
+		return a.clientConnect(ctx, opts)
+	}
+	return agentclient.Connect(ctx, opts)
 }
 
-func statusFromRecord(record engine.JobRecord) jobStatus {
-	return jobStatus{
-		JobID:                 record.JobID,
-		SessionID:             record.SessionID,
-		Backend:               record.Backend,
-		State:                 record.State,
-		LateFinalization:      record.LateFinalization,
-		Tags:                  cloneTags(record.Tags),
-		CreatedAt:             timePtr(record.CreatedAt),
-		StartedAt:             timePtr(record.StartedAt),
-		UpdatedAt:             timePtr(record.UpdatedAt),
-		HeartbeatAt:           timePtr(record.HeartbeatAt),
-		Lease:                 leasePtr(record.Lease),
-		WorkerPID:             record.Worker.PID,
-		WorkerStartTime:       record.Worker.StartTime,
-		BackendChildPID:       record.BackendChildPID,
-		BackendChildStartTime: record.BackendChildStartTime,
-		StatePath:             record.StatePath,
-		LogPaths:              record.LogPaths,
-	}
-}
-
-func resultFromRecord(record engine.JobRecord) jobResult {
-	return jobResult{
-		JobID:            record.JobID,
-		SessionID:        record.SessionID,
-		State:            record.State,
-		LateFinalization: record.LateFinalization,
-		Result:           record.Result,
-		Contract:         record.Contract,
-	}
-}
-
-func timePtr(t time.Time) *time.Time {
-	if t.IsZero() {
-		return nil
-	}
-	u := t.UTC()
-	return &u
-}
-
-func leasePtr(lease engine.Lease) *engine.Lease {
-	if lease.ExpiresAt.IsZero() {
-		return nil
-	}
-	return &lease
-}
-
-func printJobStatus(out io.Writer, status jobStatus) {
+func printJobStatus(out io.Writer, status agentclient.JobStatus) {
 	fmt.Fprintf(out, "%s\t%s", status.JobID, status.State)
 	if status.Backend != "" {
 		fmt.Fprintf(out, "\t%s", status.Backend)
@@ -922,7 +881,7 @@ func printJobStatus(out io.Writer, status jobStatus) {
 	fmt.Fprintln(out)
 }
 
-func printJobResult(out io.Writer, result jobResult) {
+func printJobResult(out io.Writer, result agentclient.JobResult) {
 	if !engine.IsTerminal(result.State) {
 		fmt.Fprintf(out, "%s\t%s\n", result.JobID, result.State)
 		return
@@ -982,6 +941,62 @@ func commandError(errOut io.Writer, err error) int {
 	return 1
 }
 
+func protocolCommandError(errOut io.Writer, operation string, err error) int {
+	var rpcErr *protocol.RPCError
+	if errors.As(err, &rpcErr) {
+		data := rpcErr.Object.Data
+		fields := []string{}
+		if data.Code != "" {
+			fields = append(fields, "code="+data.Code)
+		}
+		if data.JobID != "" {
+			fields = append(fields, "jobId="+data.JobID)
+		}
+		if data.AdmissionCause != "" {
+			fields = append(fields, "admissionCause="+data.AdmissionCause)
+		}
+		if len(fields) > 0 {
+			fmt.Fprintf(errOut, "agentbus: %s failed (%s): %s\n", operation, strings.Join(fields, " "), rpcErr.Object.Message)
+		} else {
+			fmt.Fprintf(errOut, "agentbus: %s failed: %s\n", operation, rpcErr.Object.Message)
+		}
+		return cliExitCodeForProtocolError(rpcErr)
+	}
+	fmt.Fprintf(errOut, "agentbus: %s failed: %v\n", operation, err)
+	if errors.Is(err, daemonlaunch.ErrStartupFailed) {
+		return cliExitDaemonStartupFailure
+	}
+	return 1
+}
+
+func unknownJobCommandError(errOut io.Writer, operation, jobID string) int {
+	fmt.Fprintf(errOut, "agentbus: %s failed (code=%s jobId=%s): job is not known\n", operation, protocol.ErrorInvalidTaskSpec, jobID)
+	return cliExitUnknownJob
+}
+
+func cliExitCodeForProtocolError(err *protocol.RPCError) int {
+	if err == nil {
+		return 1
+	}
+	data := err.Object.Data
+	switch data.AdmissionCause {
+	case protocol.AdmissionRejectRootFailStopped,
+		protocol.AdmissionRejectRootCorrupt,
+		protocol.AdmissionRejectRootIdentityMismatch:
+		return cliExitAuthorityFailStop
+	case protocol.AdmissionRejectUnavailableNativeRuntime:
+		return cliExitDaemonStartupFailure
+	}
+	if data.JobID != "" && data.Code == protocol.ErrorInvalidTaskSpec && strings.Contains(err.Object.Message, "job is not known") {
+		return cliExitUnknownJob
+	}
+	return 1
+}
+
+func cliExitCodeForState(state engine.JobState) int {
+	return engine.ExitCodeForState(state)
+}
+
 func writeOrError(out, errOut io.Writer, v any) int {
 	if err := writeJSON(out, v); err != nil {
 		return commandError(errOut, err)
@@ -1009,13 +1024,15 @@ func printRootHelp(out io.Writer) {
 JSON shapes:
   version:  {"schema":1,"version":"dev","protocolVersion":2}
   setup:    {"schema":1,"backends":[{"backend":"codex","binaryPath":"...","version":"...","configMode":{"write":"user","readOnly":"hermetic"},"sandboxModes":["workspace-write","read-only"],"jsonEventsProbe":{"ran":true,"version":"...","streamSchema":"codex-json-v1"}}]}
-  status:   {"jobs":[{"jobId":"...","state":"running","lease":{"expiresAt":"...","expired":false}}]}
-  result:   {"jobId":"...","state":"completed","result":{"text":"...","resultPath":"...","sha256":"...","bytes":1},"contract":{...}}
+  status:   {"jobs":[{"jobId":"...","sessionId":"...","state":"running"}]}
+  result:   {"jobId":"...","sessionId":"...","state":"completed","result":{"text":"...","resultPath":"...","sha256":"...","bytes":1}}
   cancel:   {"jobId":"...","state":"canceled"}
   validate: {"valid":true,"missing":[],"contractName":"...","contractSha256":"sha256:..."}
 
 Exit codes for single-job status/result/cancel:
-  completed=0, non-terminal=2, completed_noncompliant=3, failed=4, timed_out=5, interrupted=6, canceled=7, reaped=8, quarantined=9
+  completed=0, running/non-terminal=2, completed_noncompliant=3, failed=4, timed_out=5, interrupted=6, canceled=7, reaped=8, quarantined=9, unknown-job=10, daemon-startup-failure=11, fail-stop=12
+
+Status/result/cancel are protocol-v2 daemon clients. Offline authority diagnosis stays under admission inspect/recover/admin commands.
 
 Serve admission:
   serve always starts the strict identified admission runtime. Unsupported hosts fail closed at startup. Strict activation is one-way for a state root; use admission recover, seal, or reset-empty-root for the admin escape hatches. The first strict release supports one active state root.
@@ -1124,42 +1141,4 @@ type setupJSONEventsProbe struct {
 	Ran          bool   `json:"ran"`
 	Version      string `json:"version,omitempty"`
 	StreamSchema string `json:"streamSchema,omitempty"`
-}
-
-type statusOutput struct {
-	Jobs []jobStatus `json:"jobs"`
-}
-
-type jobStatus struct {
-	JobID                 string            `json:"jobId"`
-	SessionID             string            `json:"sessionId,omitempty"`
-	Backend               string            `json:"backend,omitempty"`
-	State                 engine.JobState   `json:"state"`
-	LateFinalization      bool              `json:"lateFinalization,omitempty"`
-	Tags                  map[string]string `json:"tags,omitempty"`
-	CreatedAt             *time.Time        `json:"createdAt,omitempty"`
-	StartedAt             *time.Time        `json:"startedAt,omitempty"`
-	UpdatedAt             *time.Time        `json:"updatedAt,omitempty"`
-	HeartbeatAt           *time.Time        `json:"heartbeatAt,omitempty"`
-	Lease                 *engine.Lease     `json:"lease,omitempty"`
-	WorkerPID             int               `json:"workerPid,omitempty"`
-	WorkerStartTime       string            `json:"workerStartTime,omitempty"`
-	BackendChildPID       int               `json:"backendChildPid,omitempty"`
-	BackendChildStartTime string            `json:"backendChildStartTime,omitempty"`
-	StatePath             string            `json:"statePath,omitempty"`
-	LogPaths              engine.LogPaths   `json:"logPaths,omitempty"`
-}
-
-type jobResult struct {
-	JobID            string                `json:"jobId"`
-	SessionID        string                `json:"sessionId,omitempty"`
-	State            engine.JobState       `json:"state"`
-	LateFinalization bool                  `json:"lateFinalization,omitempty"`
-	Result           *engine.ResultInfo    `json:"result,omitempty"`
-	Contract         *engine.ContractStamp `json:"contract,omitempty"`
-}
-
-type cancelOutput struct {
-	JobID string          `json:"jobId"`
-	State engine.JobState `json:"state"`
 }
