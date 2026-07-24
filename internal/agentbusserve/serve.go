@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/served"
 )
@@ -84,6 +85,9 @@ func Serve(ctx context.Context, cfg Config) error {
 		var startupErr error
 		startupCtx, cancelStartup, startupErr = daemonlaunch.InheritedStartupContext(ctx)
 		if startupErr != nil {
+			if cleanServeTerminationAfterCancel(ctx, startupErr) {
+				return nil
+			}
 			reportStartupFailure(reporter, startupErr)
 			return startupErr
 		}
@@ -96,6 +100,9 @@ func Serve(ctx context.Context, cfg Config) error {
 			err = errors.Join(preflightErr, configErr)
 		}
 		_ = servedCfg.Runtime.Close()
+		if cleanServeTerminationAfterCancel(ctx, err) {
+			return nil
+		}
 		reportStartupFailure(reporter, err)
 		return err
 	}
@@ -127,6 +134,9 @@ func Serve(ctx context.Context, cfg Config) error {
 	server, err := newProductionServerAfterStrictAdmissionSupportPreflight(startupCtx, servedCfg)
 	if err != nil {
 		_ = servedCfg.Runtime.Close()
+		if cleanServeTerminationAfterCancel(ctx, err) {
+			return nil
+		}
 		reportStartupFailure(reporter, err)
 		return err
 	}
@@ -159,6 +169,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		stopService()
 		serveErr := <-done
 		if shutdownErr != nil && !errors.Is(shutdownErr, served.ErrShutdownNotServing) {
+			reportStartupFailure(reporter, shutdownErr)
 			return shutdownErr
 		}
 		if shutdownErr != nil && errors.Is(shutdownErr, served.ErrShutdownNotServing) && cleanServeTerminationAfterCancel(ctx, serveErr) {
@@ -167,12 +178,66 @@ func Serve(ctx context.Context, cfg Config) error {
 		if cleanServeTerminationAfterCancel(ctx, serveErr) {
 			return nil
 		}
+		if serveErr != nil {
+			reportStartupFailure(reporter, serveErr)
+		}
 		return serveErr
 	}
 }
 
 func cleanServeTerminationAfterCancel(ctx context.Context, err error) bool {
-	return ctx != nil && ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, served.ErrShutdownNotServing))
+	return ctx != nil &&
+		ctx.Err() != nil &&
+		!cancellationContainsBootstrapFailure(err) &&
+		(errors.Is(err, context.Canceled) || errors.Is(err, served.ErrShutdownNotServing))
+}
+
+func cancellationContainsBootstrapFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var startup *daemonlaunch.StartupError
+	var safety served.SafetyFailStopError
+	var diagnostic served.AdmissionSupportDiagnostic
+	var alreadyListening served.DaemonAlreadyListeningError
+	var rootBusy served.AdmissionRootBusyError
+	var rootMissing served.AdmissionRootMissingError
+	var rootIdentity served.AdmissionRootIdentityMismatchError
+	var rootSchema served.AdmissionRootIncompatibleSchemaError
+	var rootAnchor served.AdmissionRootAnchorError
+	switch {
+	case errors.As(err, &startup):
+		return true
+	case errors.As(err, &safety), errors.Is(err, served.ErrSafetyFailStopped):
+		return true
+	case errors.As(err, &diagnostic), errors.Is(err, served.ErrAdmissionStrictSupportUnavailable):
+		return true
+	case errors.As(err, &alreadyListening), errors.Is(err, served.ErrDaemonAlreadyListening):
+		return true
+	case errors.As(err, &rootBusy), errors.Is(err, served.ErrAdmissionRootBusy):
+		return true
+	case errors.As(err, &rootMissing), errors.Is(err, served.ErrAdmissionRootMissing):
+		return true
+	case errors.As(err, &rootIdentity), errors.As(err, &rootSchema), errors.As(err, &rootAnchor):
+		return true
+	case errors.Is(err, served.ErrRuntimeConsumed):
+		return true
+	case errors.Is(err, authority.ErrRootSealed),
+		errors.Is(err, authority.ErrAdmissionContractMismatch),
+		errors.Is(err, authority.ErrAnchorInvariant),
+		errors.Is(err, authority.ErrFailStopped),
+		errors.Is(err, authority.ErrFailStopRecord),
+		errors.Is(err, authority.ErrRecoveryNeeded):
+		return true
+	case errors.Is(err, repository.ErrInvalidRecord),
+		errors.Is(err, repository.ErrCorruptRecord),
+		errors.Is(err, repository.ErrProjectionMismatch),
+		errors.Is(err, repository.ErrAmbiguousCommit),
+		errors.Is(err, repository.ErrDefinitelyNotCommitted):
+		return true
+	default:
+		return false
+	}
 }
 
 func RecoverAdmissionRoot(ctx context.Context, cfg Config) (served.AdmissionRecoveryReport, error) {

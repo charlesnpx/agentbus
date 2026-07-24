@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -29,6 +30,7 @@ const (
 	agentbusServeHelperEnv     = "AGENTBUS_AGENTBUSSERVE_HELPER"
 	agentbusServeHelperCWDEnv  = "AGENTBUS_AGENTBUSSERVE_HELPER_CWD"
 	agentbusServeHelperModeEnv = "AGENTBUS_AGENTBUSSERVE_HELPER_MODE"
+	agentbusServeHelperMarkEnv = "AGENTBUS_AGENTBUSSERVE_HELPER_MARK"
 )
 
 func TestMain(m *testing.M) {
@@ -239,6 +241,65 @@ func TestServeLauncherReportsAdmissionRootBusyCode(t *testing.T) {
 	}
 }
 
+func TestServeSIGTERMDuringSynchronousPreflightReturnsClean(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "state")
+	marker := filepath.Join(parent, "preflight-started")
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(),
+		agentbusServeHelperEnv+"=1",
+		agentbusServeHelperCWDEnv+"="+t.TempDir(),
+		agentbusServeHelperModeEnv+"=preflight-stall-signal",
+		agentbusServeHelperMarkEnv+"="+marker,
+		"AGENTBUS_STATE_ROOT="+root,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("preflight marker stat error = %v", err)
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("helper exited before synchronous preflight stalled: %v stderr=%s", err, stderr.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			t.Fatalf("helper did not enter synchronous preflight; stderr=%s", stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("SIGTERM helper: %v stderr=%s", err, stderr.String())
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("helper exit after SIGTERM = %v, want clean exit; stderr=%s", err, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("helper did not exit after SIGTERM; stderr=%s", stderr.String())
+	}
+	for _, path := range []string{root, filepath.Join(root, protocol.SocketName), filepath.Join(root, "agentbus.pid")} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s stat error = %v, want absent", path, err)
+		}
+	}
+}
+
 func TestServeCancellationBeforeRegistrationReturnsCleanWithoutReadyFrame(t *testing.T) {
 	root := t.TempDir()
 	reader, writer, err := os.Pipe()
@@ -304,6 +365,55 @@ func TestServeCancellationBeforeRegistrationReturnsCleanWithoutReadyFrame(t *tes
 		if _, err := os.Stat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s stat error = %v, want absent", name, err)
 		}
+	}
+}
+
+func TestServeCancellationJoinedSafetyFailStopReturnsFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	failStopErr := errors.Join(served.SafetyFailStopError{Reason: context.Canceled}, context.Canceled)
+	fake := &fakeServedServer{
+		shutdownTimeout: time.Second,
+		serve: func(context.Context, context.Context) error {
+			return failStopErr
+		},
+		shutdown: func(context.Context) error {
+			return served.ErrShutdownNotServing
+		},
+	}
+	stubProductionServe(t, fake)
+
+	err := Serve(ctx, Config{StateRoot: t.TempDir(), CWD: t.TempDir(), IdleTimeout: -1})
+	if err == nil {
+		t.Fatal("Serve error = nil, want joined safety fail-stop failure")
+	}
+	var safety served.SafetyFailStopError
+	if !errors.As(err, &safety) {
+		t.Fatalf("Serve error = %T %v, want SafetyFailStopError", err, err)
+	}
+	if !errors.Is(err, served.ErrSafetyFailStopped) {
+		t.Fatalf("Serve error = %v, want ErrSafetyFailStopped", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Serve error = %v, want joined context.Canceled preserved", err)
+	}
+}
+
+func TestServeLauncherReportsJoinedSafetyFailStopDuringCancellation(t *testing.T) {
+	root := t.TempDir()
+	_, err := daemonlaunch.Launch(context.Background(), agentbusServeLaunchOptionsWithMode(t, root, t.TempDir(), "joined-fail-stop-canceled-report"))
+	if err == nil {
+		t.Fatal("Launch succeeded, want reported safety fail-stop startup failure")
+	}
+	var startup *daemonlaunch.StartupError
+	if !errors.As(err, &startup) || !errors.Is(startup, daemonlaunch.ErrStartupFailed) {
+		t.Fatalf("Launch error = %T %v, want startup failure", err, err)
+	}
+	if startup.Code != served.ErrSafetyFailStopped.Error() {
+		t.Fatalf("startup code = %q, want %q", startup.Code, served.ErrSafetyFailStopped)
+	}
+	if !strings.Contains(startup.Message, served.ErrSafetyFailStopped.Error()) {
+		t.Fatalf("startup message = %q, want safety fail-stop", startup.Message)
 	}
 }
 
@@ -632,7 +742,12 @@ func runAgentbusServeHelper() int {
 			return 2
 		}
 	}
-	if os.Getenv(agentbusServeHelperModeEnv) == "root-busy-report" {
+	switch os.Getenv(agentbusServeHelperModeEnv) {
+	case "preflight-stall-signal":
+		return runAgentbusServePreflightStallSignalHelper(cwd)
+	case "joined-fail-stop-canceled-report":
+		return runAgentbusServeJoinedFailStopCanceledReportHelper(cwd)
+	case "root-busy-report":
 		reporter, hasReporter, err := daemonlaunch.InheritedReporterFromEnv()
 		if err != nil {
 			return 2
@@ -648,6 +763,60 @@ func runAgentbusServeHelper() int {
 		return 1
 	}
 	if err := Serve(context.Background(), Config{
+		StateRoot:   os.Getenv("AGENTBUS_STATE_ROOT"),
+		CWD:         cwd,
+		IdleTimeout: -1,
+	}); err != nil {
+		return 1
+	}
+	return 0
+}
+
+func runAgentbusServePreflightStallSignalHelper(cwd string) int {
+	productionServedConfigFunc = func(cfg Config) (served.Config, error) {
+		cfg.Runtime = custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable)
+		return cfg, nil
+	}
+	newProductionServerAfterStrictAdmissionSupportPreflight = func(ctx context.Context, _ served.Config) (servedServer, error) {
+		if marker := os.Getenv(agentbusServeHelperMarkEnv); marker != "" {
+			if err := os.WriteFile(marker, []byte("started\n"), 0o600); err != nil {
+				return nil, err
+			}
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	ctx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stopSignals()
+	if err := Serve(ctx, Config{
+		StateRoot:   os.Getenv("AGENTBUS_STATE_ROOT"),
+		CWD:         cwd,
+		IdleTimeout: -1,
+	}); err != nil {
+		return 1
+	}
+	return 0
+}
+
+func runAgentbusServeJoinedFailStopCanceledReportHelper(cwd string) int {
+	productionServedConfigFunc = func(cfg Config) (served.Config, error) {
+		cfg.Runtime = custodian.NewUnavailableRuntime(custodian.ErrSupervisorUnavailable)
+		return cfg, nil
+	}
+	newProductionServerAfterStrictAdmissionSupportPreflight = func(context.Context, served.Config) (servedServer, error) {
+		return &fakeServedServer{
+			shutdownTimeout: time.Second,
+			serve: func(context.Context, context.Context) error {
+				return errors.Join(served.SafetyFailStopError{Reason: context.Canceled}, context.Canceled)
+			},
+			shutdown: func(context.Context) error {
+				return served.ErrShutdownNotServing
+			},
+		}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := Serve(ctx, Config{
 		StateRoot:   os.Getenv("AGENTBUS_STATE_ROOT"),
 		CWD:         cwd,
 		IdleTimeout: -1,
