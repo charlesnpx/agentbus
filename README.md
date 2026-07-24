@@ -129,7 +129,8 @@ inside restricted sandboxes.
 ## Roadmap / v0.2
 
 - `stop-review-gate`: a Claude Code Stop-hook client of agentbus that gates a
-  turn via `turn.start` with an ALLOW/BLOCK shape contract plus
+  review run submitted as an identified `job.submit` (protocol v2 removed the
+  session/turn surface) with an ALLOW/BLOCK shape contract plus
   `policy.validate`, replacing the vendor `openai-codex` plugin's stop-review
   gate. Until this lands, `delegate setup` reports
   `stop-review-gate: not available (planned v0.2)`.

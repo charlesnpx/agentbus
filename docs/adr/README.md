@@ -1,8 +1,10 @@
 # Agentbus ADR Index
 
-These records summarize the frozen reliable-admission decisions from the
-implementation spec and later AB-E hardening units. They are constraints for the
-executable lifecycle model and production strict admission.
+These records summarize the evolution of the reliable-admission decisions from
+the implementation spec through the AB-E hardening units. Entries marked
+superseded are historical: ADR-12 (strict-only contract, protocol v2) is
+normative for production strict admission and overrides earlier
+legacy-surface decisions.
 
 | ADR | Decision |
 | --- | --- |
@@ -15,9 +17,9 @@ executable lifecycle model and production strict admission.
 | [ADR-1D](ADR-1D.md) | AdmissionStore contains durable state transitions; coordinator-only phase tracking stays outside it. |
 | [ADR-2](ADR-2.md) | The current-boot coordinator owns OS effects; the store owns durable CAS transitions. |
 | [ADR-2A](ADR-2A.md) | Coordinator obligations are linearized before commit and the coordinator is fail-stop. |
-| [ADR-2B](ADR-2B.md) | Submission modes are IdentifiedFenced, LegacyFenced, and LegacyUnfenced. |
+| [ADR-2B](ADR-2B.md) | Superseded by ADR-12: only identified fenced submission exists in v2. Historically defined IdentifiedFenced, LegacyFenced, and LegacyUnfenced modes. |
 | [ADR-3](ADR-3.md) | After acceptance, failures become durable job states, not application-level rejection. |
-| [ADR-4](ADR-4.md) | Reads route through bbolt first with historical JSON dual-read during migration. |
+| [ADR-4](ADR-4.md) | Superseded by ADR-12: reads are authority-only; the historical JSON dual-read migration path was deleted. |
 | [ADR-5](ADR-5.md) | Fenced attempts run through a parked exec worker and monitor. |
 | [ADR-5A](ADR-5A.md) | Live supervisor loss is reconciled by the daemon before terminalization. |
 | [ADR-5B](ADR-5B.md) | GroupRef identity and containment proof fence PID reuse and death races. |
@@ -27,7 +29,7 @@ executable lifecycle model and production strict admission.
 | [ADR-7](ADR-7.md) | Startup reconciliation is a hard socket barrier. |
 | [ADR-8](ADR-8.md) | Result publication has durable ordering and no historical result migration. |
 | [ADR-8A](ADR-8A.md) | Result cleanup excludes live, publishing, and nonterminal jobs. |
-| [ADR-9](ADR-9.md) | Legacy job.status returns to global listing. |
+| [ADR-9](ADR-9.md) | Superseded by ADR-12: job.status{all:true} lists authority jobs only; the legacy global listing was deleted. |
 | [ADR-10](ADR-10.md) | Coordinator ownership blocks idle shutdown and binary replacement. |
 | [ADR-11](ADR-11-admission-authority.md) | AdmissionAuthority is the single public policy boundary; repositories stay internal and policy-free. |
 | [ADR-12](ADR-12-strict-only-contract.md) | Strict-only protocol v2, replay, storage, rejection, shutdown, and result semantics are normative. |

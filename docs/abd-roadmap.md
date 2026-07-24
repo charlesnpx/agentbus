@@ -4,7 +4,7 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS (AB-E): COMPLETE with the E8 documentation close commit (2026-07-24). See "AB-E hardening
+STATUS (AB-E): E0-E7 CLOSED; E8 documentation in final review (2026-07-24). AB-E completes when the E8 review returns SHIP; criterion 13 (candidate-SHA remote green) stays deferred pending Actions billing and the approved .github/workflows installation. See "AB-E hardening
 roadmap" section below — 11 sequential units (E0→E8) from the post-completion external evaluation.
 AB-D itself remains COMPLETE as recorded.
 
@@ -783,7 +783,7 @@ unless a later roadmap explicitly promotes a narrower execution API.
 | E5B | Create/OpenExisting/OpenExistingReadOnly split (no ambiguous open-or-create); AuditIntegrity (Tx.Check drained + envelope + cross-record + index) at every existing entry point; root-existence matrix test per cell; unsupported first serve non-mutating; corruption fixtures fatal pre-bind, file untouched | CLOSED c8d50df |
 | E6 | docs/protocol.md v2 reconciliation (hand-written; full job.submit identity schema, replay tables, rejection-cause table verified vs implementation) | CLOSED d1ef34b |
 | E7 | CI lanes: committed gate scripts (scripts/ci/), full -race, strict-tag compile, privileged cgroup lane, product black-box lane, fail-closed lanes, govulncheck; release-check runs tests + strict smoke. Merge needs remote-green on candidate SHA (billing must be restored). `.github/**` edits need explicit user approval | CLOSED 22b6a77 |
-| E8 | Docs: ADR index (+11,+12), operations runbook, offline-only backup policy, install caveat; FINAL holistic review of the complete candidate SHA. Deferred pending explicit user approval: install `scripts/ci/github-workflows-proposed/` into `.github/workflows/`; update PR #29 title/body. | CLOSED with this commit |
+| E8 | Docs: ADR index (+11,+12), operations runbook, offline-only backup policy, install caveat; FINAL holistic review of the complete candidate SHA. Deferred pending explicit user approval: install `scripts/ci/github-workflows-proposed/` into `.github/workflows/`; update PR #29 title/body. | IN FINAL REVIEW (doc fixes applied; closes on SHIP) |
 
 ## Verified defects driving AB-E (evidence at 4e0bd50)
 1. Foreground session/turn executes outside the authority (server.go:1113/1153/1236; runAttempt non-admission branch).

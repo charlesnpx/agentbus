@@ -15,8 +15,12 @@ starts strict identified admission; there is no `--admission` mode switch.
 State root resolution is:
 
 1. The CLI uses `AGENTBUS_STATE_ROOT` when it is set.
-2. Go clients use `client.Options.StateRoot`, or `client.Options.SocketPath`
-   when a literal socket path is supplied.
+2. Go clients use `client.Options.StateRoot`, which controls token lookup,
+   PID/autostart coordination, and launcher state, and defaults independently
+   through the standard resolution below. `client.Options.SocketPath` overrides
+   only the Unix socket endpoint — it does not change the state root, so a
+   socket in another root still authenticates and coordinates under
+   `StateRoot`.
 3. Otherwise the default root is `$XDG_STATE_HOME/agentbus`, or
    `~/.local/state/agentbus` when `XDG_STATE_HOME` is unset.
 
@@ -61,8 +65,12 @@ A persisted fail-stop is an anchor record with phase `fail_stopped`, a boot
 reference, and a reason. It is sticky: normal Begin, SealReady, Advance, and
 VerifyReady paths refuse to move it back to ready or reconciling.
 
-Operators see exit code `11` for daemon startup failures such as unsupported
-strict runtime or launcher-side root corruption; exit code `12` for in-band
+Exit codes `11` and `12` apply to CLIENT commands (`status`, `result`,
+`cancel`, and other protocol clients) whose launcher-based autostart fails:
+`11` for startup failures such as unsupported strict runtime or launcher-side
+root corruption. Direct `agentbus serve` / `serve --foreground` invocations
+report startup errors with exit code `1` (shutdown-deadline overrun is `13`).
+Client commands see exit code `12` for in-band
 root fail-stop, root corruption, or root identity mismatch reported by a running
 daemon, and for launcher-side authority fail-stop; and exit code `13` when
 graceful shutdown exceeds its deadline.
@@ -83,9 +91,10 @@ and replay are not routed across old and new roots.
 
 `reset-empty-root` is only for an empty authority root. The empty proof is the
 authority count set: jobs, bindings, tombstones, launch records, and recovery
-obligations must all be zero. If a DB exists, reset opens it, verifies the
-anchor identity, inspects counts, and refuses non-empty roots. If the anchor
-exists without the DB, reset refuses instead of creating a new root over it.
+obligations must all be zero. If a DB exists, reset opens it, verifies any
+existing initialized anchor's identity (an absent anchor is permitted for an
+empty DB), inspects counts, and refuses non-empty roots. If the anchor exists
+without the DB, reset refuses instead of creating a new root over it.
 
 ## 5. Unsupported Environments
 
