@@ -650,15 +650,23 @@ func (s *Server) failUnavailableStrictRuntimeBeforeRepository(ctx context.Contex
 }
 
 func (s *Server) closeServeAdmission() error {
+	return s.closeServeAdmissionContext(context.Background())
+}
+
+func (s *Server) closeServeAdmissionContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Lock order for the admission shutdown path is submitMu -> stateMu.
 	// Identified submit never takes submitMu while holding stateMu; it snapshots
 	// under stateMu, releases it, and re-checks publication under submitMu
 	// before durable acceptance. That gives close a single order to serialize
 	// acceptance and state clearing without a lock cycle.
 	s.admissionCloseEpoch.Add(1)
-	deadline := time.Now().Add(admissionRepositoryCloseTimeout)
-	submitLocked := s.lockAdmissionSubmitUntil(deadline)
-	if !submitLocked {
+	deadline := admissionCloseDeadline(ctx, admissionRepositoryCloseTimeout)
+	submitLockErr := s.lockAdmissionSubmitUntilContext(ctx, deadline)
+	submitLocked := submitLockErr == nil
+	if !submitLocked && errors.Is(submitLockErr, ErrShutdownDeadlineExceeded) {
 		log.Printf("agentbus daemon: admission shutdown timed out acquiring submit serialization; a submit is wedged; clearing published state and leaking stalled submit")
 		// Contract reconciliation: if close cannot acquire admissionSubmitMu
 		// before the shutdown deadline, a submit is wedged inside the durable
@@ -672,6 +680,9 @@ func (s *Server) closeServeAdmission() error {
 		// The closing marker makes a leaked submit re-check fail instead of
 		// returning success after state was cleared; if a response write already
 		// raced out, that is the documented window.
+	}
+	if !submitLocked && !errors.Is(submitLockErr, ErrShutdownDeadlineExceeded) {
+		return submitLockErr
 	}
 	s.admissionStateMu.Lock()
 
@@ -703,22 +714,33 @@ func (s *Server) closeServeAdmission() error {
 			if runtime != nil {
 				log.Printf("agentbus daemon: admission runtime close skipped after submit serialization timeout; submit is wedged and may own the runtime; leaking runtime at shutdown")
 			}
-			return nil
+			return submitLockErr
 		}
-		err := closeAdmissionResourceBeforeDeadline("repository", closer, deadline)
+		err := closeAdmissionResourceBeforeDeadline(ctx, "repository", closer, deadline)
 		if runtime != nil {
-			err = errors.Join(err, closeAdmissionResourceBeforeDeadline("runtime", runtimeCloser{runtime: runtime}, deadline))
+			err = errors.Join(err, closeAdmissionResourceBeforeDeadline(ctx, "runtime", runtimeCloser{runtime: runtime}, deadline))
 		}
 		return err
 	}
 	if runtime != nil {
 		if !submitLocked {
 			log.Printf("agentbus daemon: admission runtime close skipped after submit serialization timeout; submit is wedged and may own the runtime; leaking runtime at shutdown")
-			return nil
+			return submitLockErr
 		}
-		return closeAdmissionResourceBeforeDeadline("runtime", runtimeCloser{runtime: runtime}, deadline)
+		return closeAdmissionResourceBeforeDeadline(ctx, "runtime", runtimeCloser{runtime: runtime}, deadline)
+	}
+	if !submitLocked {
+		return submitLockErr
 	}
 	return nil
+}
+
+func admissionCloseDeadline(ctx context.Context, cap time.Duration) time.Time {
+	deadline := time.Now().Add(cap)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		return ctxDeadline
+	}
+	return deadline
 }
 
 func (s *Server) beginAdmissionClosing(ctx context.Context) error {
@@ -751,20 +773,29 @@ func (s *Server) lockAdmissionSubmitContext(ctx context.Context) error {
 	}
 }
 
-func (s *Server) lockAdmissionSubmitUntil(deadline time.Time) bool {
+func (s *Server) lockAdmissionSubmitUntilContext(ctx context.Context, deadline time.Time) error {
 	for {
 		if s.admissionSubmitMu.TryLock() {
-			return true
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return false
+			return ErrShutdownDeadlineExceeded
 		}
 		sleep := 10 * time.Millisecond
 		if remaining < sleep {
 			sleep = remaining
 		}
-		time.Sleep(sleep)
+		timer := time.NewTimer(sleep)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 }
 
@@ -776,11 +807,11 @@ func (c runtimeCloser) Close() error {
 	return c.runtime.close()
 }
 
-func closeAdmissionResourceBeforeDeadline(name string, closer io.Closer, deadline time.Time) error {
+func closeAdmissionResourceBeforeDeadline(ctx context.Context, name string, closer io.Closer, deadline time.Time) error {
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		log.Printf("agentbus daemon: admission %s close timed out; leaking handle at shutdown", name)
-		return nil
+		return fmt.Errorf("%w: admission %s close timed out", ErrShutdownDeadlineExceeded, name)
 	}
 	done := make(chan error, 1)
 	go func() {
@@ -791,9 +822,16 @@ func closeAdmissionResourceBeforeDeadline(name string, closer io.Closer, deadlin
 	select {
 	case err := <-done:
 		return err
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			log.Printf("agentbus daemon: admission %s close timed out; leaking handle at shutdown", name)
+		} else {
+			log.Printf("agentbus daemon: admission %s close canceled; leaking handle at shutdown", name)
+		}
+		return ctx.Err()
 	case <-timer.C:
 		log.Printf("agentbus daemon: admission %s close timed out; leaking handle at shutdown", name)
-		return nil
+		return fmt.Errorf("%w: admission %s close timed out", ErrShutdownDeadlineExceeded, name)
 	}
 }
 

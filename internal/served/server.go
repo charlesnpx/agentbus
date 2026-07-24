@@ -162,43 +162,44 @@ type admissionOwnedWorkChecker interface {
 
 // Server serves the protocol v1 socket API over engine backends.
 type Server struct {
-	stateRoot              string
-	cwd                    string
-	socketPath             string
-	tokenPath              string
-	token                  string
-	backends               map[string]engine.Backend
-	registry               *engine.PolicyRegistry
-	clock                  engine.Clock
-	processes              engine.ProcessTable
-	processGroups          engine.ProcessGroupSignaler
-	cancelGrace            time.Duration
-	cancelWaiter           engine.Waiter
-	id                     atomic.Uint64
-	clients                atomic.Int64
-	accepting              atomic.Int64
-	idleTimeout            time.Duration
-	idleCheckInterval      time.Duration
-	binaryIdentityProbe    BinaryIdentityProbe
-	beforeStaleCloseHook   func()
-	staleListenerHook      func()
-	staleSocketRemovedHook func()
-	inlineResultCap        int
-	leaseDuration          time.Duration
-	heartbeatInterval      time.Duration
-	gcInterval             time.Duration
-	readyHook              func(ServeReadyInfo) error
-	listenerFactory        func() (net.Listener, socketFileIdentity, error)
-	beforeListenBindHook   func()
-	safetyLatch            *SafetyLatch
-	safetyDrainTimeout     time.Duration
-	shutdownTimeout        time.Duration
-	jobsRequestIDEnabled   bool
-	admissionSubmitMu      sync.Mutex
-	admissionCloseEpoch    atomic.Uint64
-	admissionOpenEpoch     atomic.Uint64
-	admissionStateMu       sync.RWMutex
-	resultPublications     atomic.Int64
+	stateRoot                   string
+	cwd                         string
+	socketPath                  string
+	tokenPath                   string
+	token                       string
+	backends                    map[string]engine.Backend
+	registry                    *engine.PolicyRegistry
+	clock                       engine.Clock
+	processes                   engine.ProcessTable
+	processGroups               engine.ProcessGroupSignaler
+	cancelGrace                 time.Duration
+	cancelWaiter                engine.Waiter
+	id                          atomic.Uint64
+	clients                     atomic.Int64
+	accepting                   atomic.Int64
+	idleTimeout                 time.Duration
+	idleCheckInterval           time.Duration
+	binaryIdentityProbe         BinaryIdentityProbe
+	beforeStaleCloseHook        func()
+	staleListenerHook           func()
+	staleSocketRemovedHook      func()
+	beforePIDFileQuarantineHook func()
+	inlineResultCap             int
+	leaseDuration               time.Duration
+	heartbeatInterval           time.Duration
+	gcInterval                  time.Duration
+	readyHook                   func(ServeReadyInfo) error
+	listenerFactory             func() (net.Listener, socketFileIdentity, error)
+	beforeListenBindHook        func()
+	safetyLatch                 *SafetyLatch
+	safetyDrainTimeout          time.Duration
+	shutdownTimeout             time.Duration
+	jobsRequestIDEnabled        bool
+	admissionSubmitMu           sync.Mutex
+	admissionCloseEpoch         atomic.Uint64
+	admissionOpenEpoch          atomic.Uint64
+	admissionStateMu            sync.RWMutex
+	resultPublications          atomic.Int64
 
 	admissionBootstrapper        *admissionBootstrapper
 	admissionReady               *admissionReady
@@ -219,12 +220,15 @@ type Server struct {
 	admissionClose               io.Closer
 	admissionBootstrapperFactory admissionBootstrapperFactory
 
-	serveStateMu    sync.Mutex
-	serveListener   net.Listener
-	serveSocket     socketFileIdentity
-	serveCancel     context.CancelFunc
-	serveGeneration uint64
-	shutdownMu      sync.Mutex
+	serveStateMu     sync.Mutex
+	serveListener    net.Listener
+	serveSocket      socketFileIdentity
+	serveCancel      context.CancelFunc
+	serveGeneration  uint64
+	shutdownMu       sync.Mutex
+	shutdownDone     chan struct{}
+	shutdownErr      error
+	shutdownComplete bool
 
 	mu                 sync.Mutex
 	stores             map[string]*engine.Store
@@ -633,8 +637,47 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	s.shutdownMu.Lock()
-	defer s.shutdownMu.Unlock()
+	if s.shutdownDone != nil {
+		done := s.shutdownDone
+		if s.shutdownComplete {
+			err := s.shutdownErr
+			s.shutdownMu.Unlock()
+			return err
+		}
+		s.shutdownMu.Unlock()
+		select {
+		case <-done:
+			s.shutdownMu.Lock()
+			err := s.shutdownErr
+			s.shutdownMu.Unlock()
+			return err
+		case <-ctx.Done():
+			select {
+			case <-done:
+				s.shutdownMu.Lock()
+				err := s.shutdownErr
+				s.shutdownMu.Unlock()
+				return err
+			default:
+			}
+			return ctx.Err()
+		}
+	}
+	done := make(chan struct{})
+	s.shutdownDone = done
+	s.shutdownMu.Unlock()
 
+	err := s.shutdown(ctx)
+
+	s.shutdownMu.Lock()
+	s.shutdownErr = err
+	s.shutdownComplete = true
+	close(done)
+	s.shutdownMu.Unlock()
+	return err
+}
+
+func (s *Server) shutdown(ctx context.Context) error {
 	if err := s.beginAdmissionClosing(ctx); err != nil {
 		s.forceStopServe()
 		return shutdownError(err)
@@ -648,9 +691,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.forceStopServe()
 		return shutdownError(err)
 	}
-	if err := s.closeServeAdmission(); err != nil {
+	if err := s.closeServeAdmissionContext(ctx); err != nil {
 		s.forceStopServe()
-		return err
+		return shutdownError(err)
 	}
 	s.removeOwnedPIDFile("graceful shutdown")
 	s.forceStopServe()
@@ -1059,7 +1102,7 @@ func (s *Server) removeOwnedSocket(owned socketFileIdentity, phase string) {
 
 func (s *Server) removeOwnedPIDFile(phase string) {
 	pidPath := filepath.Join(s.stateRoot, "agentbus.pid")
-	raw, err := os.ReadFile(pidPath)
+	raw, owned, err := readPIDFileNoFollow(pidPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("agentbus daemon: skipping pid removal during %s: read %s: %v", phase, pidPath, err)
@@ -1075,11 +1118,102 @@ func (s *Server) removeOwnedPIDFile(phase string) {
 		log.Printf("agentbus daemon: skipping pid removal during %s: %s belongs to pid %d", phase, pidPath, pid)
 		return
 	}
-	if err := os.Remove(pidPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if s.beforePIDFileQuarantineHook != nil {
+		s.beforePIDFileQuarantineHook()
+	}
+	quarantineDir, quarantinePath, err := createPIDFileQuarantine(s.stateRoot)
+	if err != nil {
+		log.Printf("agentbus daemon: skipping pid removal during %s: create pid quarantine: %v", phase, err)
+		return
+	}
+	cleanupQuarantineDir := true
+	defer func() {
+		if cleanupQuarantineDir {
+			_ = os.Remove(quarantineDir)
+		}
+	}()
+	if err := os.Rename(pidPath, quarantinePath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("agentbus daemon: skipping pid removal during %s: quarantine %s: %v", phase, pidPath, err)
+		}
+		return
+	}
+	quarantinedRaw, quarantined, err := readPIDFileNoFollow(quarantinePath)
+	if err != nil {
+		log.Printf("agentbus daemon: skipping pid removal during %s: validate quarantined pid %s: %v", phase, quarantinePath, err)
+		cleanupQuarantineDir = restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
+		return
+	}
+	quarantinedPID, err := strconv.Atoi(strings.TrimSpace(string(quarantinedRaw)))
+	if err != nil {
+		log.Printf("agentbus daemon: skipping pid removal during %s: invalid quarantined pid file %s", phase, quarantinePath)
+		cleanupQuarantineDir = restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
+		return
+	}
+	if quarantined != owned || quarantinedPID != os.Getpid() {
+		log.Printf("agentbus daemon: skipping pid removal during %s: replacement daemon owns %s", phase, pidPath)
+		cleanupQuarantineDir = restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
+		return
+	}
+	if err := os.Remove(quarantinePath); err != nil {
 		log.Printf("agentbus daemon: remove owned pid during %s: %v", phase, err)
+		cleanupQuarantineDir = false
 		return
 	}
 	log.Printf("agentbus daemon: removed owned pid during %s", phase)
+}
+
+func readPIDFileNoFollow(path string) ([]byte, socketFileIdentity, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, socketFileIdentity{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, socketFileIdentity{}, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, socketFileIdentity{}, fmt.Errorf("unexpected pid stat type %T", info.Sys())
+	}
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return nil, socketFileIdentity{}, err
+	}
+	return raw, socketFileIdentity{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}, nil
+}
+
+func createPIDFileQuarantine(stateRoot string) (string, string, error) {
+	base := fmt.Sprintf("agentbus.pid.quarantine.%d.%d", os.Getpid(), time.Now().UnixNano())
+	for i := 0; i < 10; i++ {
+		dir := filepath.Join(stateRoot, fmt.Sprintf("%s.%d", base, i))
+		if err := os.Mkdir(dir, 0o700); err == nil {
+			return dir, filepath.Join(dir, "agentbus.pid"), nil
+		} else if !errors.Is(err, os.ErrExist) {
+			return "", "", err
+		}
+	}
+	return "", "", fmt.Errorf("could not allocate unique pid quarantine path in %s", stateRoot)
+}
+
+func restoreQuarantinedPIDFile(pidPath, quarantinePath, phase string) bool {
+	if err := os.Link(quarantinePath, pidPath); err == nil {
+		if removeErr := os.Remove(quarantinePath); removeErr != nil {
+			log.Printf("agentbus daemon: restored pid during %s but could not remove quarantine %s: %v", phase, quarantinePath, removeErr)
+			return false
+		}
+		return true
+	} else if errors.Is(err, os.ErrExist) {
+		if removeErr := os.Remove(quarantinePath); removeErr != nil {
+			log.Printf("agentbus daemon: canonical pid exists during %s and quarantine %s remains: %v", phase, quarantinePath, removeErr)
+			return false
+		}
+		return true
+	} else {
+		log.Printf("agentbus daemon: could not restore replacement pid during %s from %s to %s: %v", phase, quarantinePath, pidPath, err)
+		return false
+	}
 }
 
 func statBinaryIdentity(path string) (BinaryIdentity, error) {

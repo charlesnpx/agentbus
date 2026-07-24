@@ -3185,6 +3185,131 @@ func TestShutdownDeadlineExceededLeavesForcedRecoveryPath(t *testing.T) {
 	}
 }
 
+type blockingCloser struct {
+	started  chan<- struct{}
+	release  <-chan struct{}
+	returned chan<- struct{}
+}
+
+func (c blockingCloser) Close() error {
+	close(c.started)
+	defer close(c.returned)
+	<-c.release
+	return nil
+}
+
+func TestShutdownAdmissionCloseDeadlineExceededReturnsTypedError(t *testing.T) {
+	t.Parallel()
+	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	releaseClose := make(chan struct{})
+	var releaseOnce sync.Once
+	closeStarted := make(chan struct{})
+	closeReturned := make(chan struct{})
+	server.admissionClose = blockingCloser{
+		started:  closeStarted,
+		release:  releaseClose,
+		returned: closeReturned,
+	}
+	pidPath := filepath.Join(root, "agentbus.pid")
+	ownPID := strconv.Itoa(os.Getpid())
+	if err := os.WriteFile(pidPath, []byte(ownPID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseClose) })
+		select {
+		case <-closeReturned:
+		case <-time.After(time.Second):
+			t.Fatal("admission close did not return after release")
+		}
+	})
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := server.Shutdown(shutdownCtx)
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrShutdownDeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want ErrShutdownDeadlineExceeded", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Shutdown elapsed = %s, want caller deadline shorter than close cap honored", elapsed)
+	}
+	select {
+	case <-closeStarted:
+	default:
+		t.Fatal("admission close did not start before deadline error")
+	}
+	raw, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(raw)) != ownPID {
+		t.Fatalf("pid file after failed close = %q, want owned pid retained", raw)
+	}
+	releaseOnce.Do(func() { close(releaseClose) })
+}
+
+func TestConcurrentShutdownWaitingCallerHonorsContext(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	releaseClose := make(chan struct{})
+	var releaseOnce sync.Once
+	closeStarted := make(chan struct{})
+	closeReturned := make(chan struct{})
+	server.admissionClose = blockingCloser{
+		started:  closeStarted,
+		release:  releaseClose,
+		returned: closeReturned,
+	}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseClose) })
+		select {
+		case <-closeReturned:
+		case <-time.After(time.Second):
+			t.Fatal("admission close did not return after release")
+		}
+	})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- server.Shutdown(context.Background())
+	}()
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first shutdown did not enter admission close")
+	}
+
+	secondCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := server.Shutdown(secondCtx)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second Shutdown error = %v, want context deadline", err)
+	}
+	if errors.Is(err, ErrShutdownDeadlineExceeded) {
+		t.Fatalf("second Shutdown error = %v, want raw waiting caller context error", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("second Shutdown elapsed = %s, want prompt context return", elapsed)
+	}
+
+	releaseOnce.Do(func() { close(releaseClose) })
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first Shutdown error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Shutdown did not complete after close release")
+	}
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatalf("terminal Shutdown error = %v, want first result", err)
+	}
+}
+
 func TestShutdownRemovesOnlyOwnedPIDFile(t *testing.T) {
 	t.Parallel()
 	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
@@ -3206,6 +3331,36 @@ func TestShutdownRemovesOnlyOwnedPIDFile(t *testing.T) {
 	server.removeOwnedPIDFile("test owner")
 	if _, err := os.Stat(pidPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("pid file stat after owner removal = %v, want not exist", err)
+	}
+}
+
+func TestShutdownPreservesReplacementPIDFile(t *testing.T) {
+	t.Parallel()
+	server, root, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	pidPath := filepath.Join(root, "agentbus.pid")
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replacementPID := strconv.Itoa(os.Getpid() + 100000)
+	server.beforePIDFileQuarantineHook = func() {
+		replacementPath := filepath.Join(root, "agentbus.pid.replacement")
+		if err := os.WriteFile(replacementPath, []byte(replacementPID+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(replacementPath, pidPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown error = %v", err)
+	}
+	raw, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(raw)) != replacementPID {
+		t.Fatalf("pid file after replacement race = %q, want replacement pid %s", raw, replacementPID)
 	}
 }
 
