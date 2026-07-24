@@ -772,7 +772,7 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 | E2B | Autostart: typed diagnostic on unsupported host, restart-after-exit restores service, race convergence; `admission recover` gets a dedicated strict-native recovery constructor; compiled-CLI recovery in Docker gate | CLOSED 86a5c31 |
 | E3 | Authority-only RPC handlers (no JSON merge/fallback); CLI status/result/cancel/list become protocol clients; delete `sessions` cmd; stable exit codes; compiled-binary E2E across restart+recovery | CLOSED 67be1d5 |
 | E4 | Graceful shutdown: signal.NotifyContext (daemon serving only) + Shutdown(ctx) reusing existing durable cancellation; successful graceful shutdown ⇒ no live custody, no recovery obligation; forced-timeout path remains recoverable fail-closed | CLOSED d74288c |
-| E5A | Record-level bbolt behind repository contract; Auditor + AnchorIdentified; binding_index as derived locator; dirty-closure validation sharing invariant helpers with full audit; operation-count tests (bbolt pkg) prove O(touched); 1k/10k/100k benchmarks | PENDING |
+| E5A | Record-level bbolt behind repository contract; Auditor + AnchorIdentified; binding_index as derived locator; dirty-closure validation sharing invariant helpers with full audit; operation-count tests (bbolt pkg) prove O(touched); 1k/10k/100k benchmarks | CLOSED 7fb6153 |
 | E5B | Create/OpenExisting/OpenExistingReadOnly split (no ambiguous open-or-create); AuditIntegrity (Tx.Check drained + envelope + cross-record + index) at every existing entry point; root-existence matrix test per cell; unsupported first serve non-mutating; corruption fixtures fatal pre-bind, file untouched | PENDING |
 | E6 | docs/protocol.md v2 reconciliation (hand-written; full job.submit identity schema, replay tables, rejection-cause table verified vs implementation) | PENDING |
 | E7 | CI lanes: committed gate scripts (scripts/ci/), full -race, strict-tag compile, privileged cgroup lane, product black-box lane, fail-closed lanes, govulncheck; release-check runs tests + strict smoke. Merge needs remote-green on candidate SHA (billing must be restored). `.github/**` edits need explicit user approval | PENDING |
@@ -791,6 +791,29 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 10. CI: no strict lane, race excludes client/+cmd/, gate scripts unversioned; tip red = GitHub Actions BILLING block (jobs die ~4s pre-step), not code.
 
 ## AB-E Log
+- 2026-07-24: E5A CLOSED at 7fb6153 (SHIP, zero findings, round 4 of the new max-4 loop policy).
+  Arc: worker b429b7c (full rewrite in one pass: point txs replacing whole-store-rewrite-per-
+  mutation, binding_index derived locator with canonical verification, dirty-closure commit
+  validation sharing helpers with the audit, schema v2, Auditor+AnchorIdentified, complexity
+  proofs + 1k/10k/100k benchmarks) -> review1 FIX(2H+3M: SafetyLatch optional/unwired in
+  production — ready-state corruption left listener open; RootStats silently discarded corrupt
+  safety records enabling fail-open seal; audit nil-deref on missing binding_index; PutMeta
+  O(total records) + dead instrumentation counters; tombstones counted as live jobs) -> fix1
+  f597b52 (+2 orchestrator repairs: latch trips with TYPED corruption error before persistence —
+  string-typed anchor hook was claiming the once-only trip; test semantics for fail-stop transport
+  close EOF/EPIPE and record-level-corruption restart contract) -> review2 FIX(2H residual:
+  read-side job.status/runtime/recovery-plan paths observed corruption without tripping;
+  binding_index VALUES never validated anywhere in production) -> fix2 09c194a (read-side
+  corruption routed to fail-stop with root_corrupt before root_fail_stopped; index values
+  verified at every consultation; startup matrix checks image binding; memory RootStats typed;
+  string-fallback classifier tightened; + orchestrator repair: startup index-corruption test
+  asserts never-repaired + repeat-detection, byte identity reserved for structural open-time
+  corruption — reviewer confirmed this ADR-12 reading) -> review3 FIX(1H: coordinator Snapshot
+  path consumed images unrouted, ignored binding state; +2 Lows) -> fix3 7fb6153 (Snapshot routes
+  binding+safety corruption to durable fail-stop, both callers propagate; orphan same-pair index
+  entry = typed corruption; audit aggregates past index corruption) -> review4 SHIP zero findings,
+  H1 exploit trace refuted end-to-end. Reviewer refutations held across rounds: binding_index can
+  never return a wrong binding; dirty-closure complete; single-tx atomicity; DNC byte-stability.
 - 2026-07-24: E4 CLOSED at d74288c (SHIP, zero findings, round 7). Hardest unit of the campaign —
   6 fix rounds. Arc: worker 4a19fb0 (Shutdown(ctx) orchestration, foreground-only signals, SIGTERM/
   SIGINT E2Es green in Docker) -> review1 FIX(3M: close phase discarded caller deadline + logged-
