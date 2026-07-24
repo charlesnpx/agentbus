@@ -4,17 +4,18 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS (AB-E): IN PROGRESS (2026-07-22). See "AB-E hardening roadmap" section below — 11 sequential
-units (E0→E8) from the post-completion external evaluation. AB-D itself remains COMPLETE as recorded.
+STATUS (AB-E): COMPLETE with the E8 documentation close commit (2026-07-24). See "AB-E hardening
+roadmap" section below — 11 sequential units (E0→E8) from the post-completion external evaluation.
+AB-D itself remains COMPLETE as recorded.
 
 STATUS (AB-D): COMPLETE (2026-07-22). ALL 14 UNITS CLOSED. R7B closed at e42aa5f (SHIP, no blocking
-findings): `agentbus serve --admission=strict` is live — explicit, sticky, fail-closed; the R0T
+findings): strict admission became live — explicit, sticky, fail-closed; the R0T
 gate runs a REAL identified job end-to-end through the production binary on Linux cgroup-v2
 (sentinel `strict_admission_real_job_end_to_end`), with byte-identical replay, exactly-once
 execution, persisted IdentifiedFenced proof, protocol-correct inline results, and
 independent-oracle containment. Version 0.6.0. The R6/R7A+R7B gate arc found and fixed FIVE
-production defects that no unit test caught. Darwin/unsupported platforms fail closed typed;
-default (no flag) behavior is byte-compatible legacy.
+production defects that no unit test caught. Darwin/unsupported platforms fail closed typed. AB-E
+later removed the legacy/default admission split; current production `agentbus serve` is strict-only.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).
@@ -763,11 +764,17 @@ compatibility; storage migration; a sqlite implementation; authority mutex redes
 terminal-proof serialization; a generalized daemon logging system; online backup or compaction;
 relocation of execution packages under `internal/` (E9 deferred to a later cleanup roadmap).
 
+Because E9 relocation was deferred, packages under `engine/execution/*` remain unstable
+implementation APIs. They are public Go package paths only as a repository-layout artifact, not an
+import-stability promise; external callers should treat `github.com/charlesnpx/agentbus/client`,
+`github.com/charlesnpx/agentbus/engine`, and documented adapter contracts as the stable surfaces
+unless a later roadmap explicitly promotes a narrower execution API.
+
 ## Units
 | Unit | Scope | Status |
 |---|---|---|
 | E0 | Contract freeze: ADR-12, protocol.Version=2, storage schema v2, stable rejection causes, root-existence matrix, normative ADR-0B replay ordering, shutdown contract, result semantics (derived from authority terminal record, no public proof) | CLOSED 64031ca |
-| E1 | Delete foreground surface + unidentified submit + --admission plumbing; reimplement handleIdentifiedJobSubmit per E0 replay ordering (LookupReplay before backend/filesystem validation, recorded fingerprint version); negative + replay test battery; architecture guard: no path reaches session.Turn outside an authority launch | PENDING |
+| E1 | Delete foreground surface + unidentified submit + --admission plumbing; reimplement handleIdentifiedJobSubmit per E0 replay ordering (LookupReplay before backend/filesystem validation, recorded fingerprint version); negative + replay test battery; architecture guard: no path reaches session.Turn outside an authority launch | CLOSED 005a8ae |
 | E2A | Shared daemon launcher: readiness pipe (ready{protocolVersion,pid,canonicalStateRoot,socketPath} / failed{code,message}), PID-after-ready, Setsid, kill+reap on parent failure, stderr preserved to handshake, concurrent-start winner verification | CLOSED c69c83c |
 | E2B | Autostart: typed diagnostic on unsupported host, restart-after-exit restores service, race convergence; `admission recover` gets a dedicated strict-native recovery constructor; compiled-CLI recovery in Docker gate | CLOSED 86a5c31 |
 | E3 | Authority-only RPC handlers (no JSON merge/fallback); CLI status/result/cancel/list become protocol clients; delete `sessions` cmd; stable exit codes; compiled-binary E2E across restart+recovery | CLOSED 67be1d5 |
@@ -776,7 +783,7 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 | E5B | Create/OpenExisting/OpenExistingReadOnly split (no ambiguous open-or-create); AuditIntegrity (Tx.Check drained + envelope + cross-record + index) at every existing entry point; root-existence matrix test per cell; unsupported first serve non-mutating; corruption fixtures fatal pre-bind, file untouched | CLOSED c8d50df |
 | E6 | docs/protocol.md v2 reconciliation (hand-written; full job.submit identity schema, replay tables, rejection-cause table verified vs implementation) | CLOSED d1ef34b |
 | E7 | CI lanes: committed gate scripts (scripts/ci/), full -race, strict-tag compile, privileged cgroup lane, product black-box lane, fail-closed lanes, govulncheck; release-check runs tests + strict smoke. Merge needs remote-green on candidate SHA (billing must be restored). `.github/**` edits need explicit user approval | CLOSED 22b6a77 |
-| E8 | Docs: ADR index (+11,+12), operations runbook, offline-only backup policy, install caveat; PR #29 body update (needs user approval); FINAL holistic review of the complete candidate SHA | PENDING |
+| E8 | Docs: ADR index (+11,+12), operations runbook, offline-only backup policy, install caveat; FINAL holistic review of the complete candidate SHA. Deferred pending explicit user approval: install `scripts/ci/github-workflows-proposed/` into `.github/workflows/`; update PR #29 title/body. | CLOSED with this commit |
 
 ## Verified defects driving AB-E (evidence at 4e0bd50)
 1. Foreground session/turn executes outside the authority (server.go:1113/1153/1236; runAttempt non-admission branch).

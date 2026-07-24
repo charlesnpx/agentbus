@@ -1,8 +1,8 @@
 # agentbus
 
-agentbus is a local agent-execution service. One daemon multiplexes concurrent
-sessions, turns, and jobs across backend CLIs such as Claude Code and Codex,
-while the same core engine remains importable for embedded use.
+agentbus is a local agent-execution service. One daemon runs strict identified
+background jobs across backend CLIs such as Claude Code and Codex, while the
+same core engine remains importable for embedded use.
 
 agentbus is deliberately agent-agnostic. It owns process supervision, state,
 leases, JSON-RPC framing, result storage, and policy enforcement hooks; clients
@@ -64,8 +64,8 @@ For local installer checks:
 ```sh
 agentbus version [--json]
 agentbus setup [--json]
-agentbus serve [--foreground] [--admission=legacy|strict]
-agentbus sessions [--tags k=v] [--json]
+agentbus serve [--foreground]
+agentbus admission <inspect|recover|reset-empty-root|seal|clear-fail-stop> --state-root <path>
 agentbus status [--job <id>] [--json]
 agentbus result --job <id> [--json]
 agentbus cancel --job <id> [--json]
@@ -80,17 +80,15 @@ from that cache.
 `agentbus serve` starts it in the background. `AGENTBUS_STATE_ROOT` may be set
 to isolate daemon state for tests or local development.
 
-`agentbus serve --admission=strict` explicitly enables strict identified
-admission and crash-durable containment. The default is `--admission=legacy`;
-a passing support probe never auto-enables strict mode. Strict activation is
-sticky and one-way for a state root: an activated root must keep serving with
-strict support or be handled with `agentbus admission recover`, `seal`, or
-`reset-empty-root`. The first release supports one active state root; seal
-rotation starts a new root and does not route read, cancel, result, or replay
-requests across old and new roots. Strict mode currently requires Linux
-cgroup-v2 with a delegated writable cgroup root. Darwin and unsupported or
-restricted Linux hosts fail closed at startup instead of advertising a weaker
-strict capability.
+`agentbus serve` always starts strict identified admission and crash-durable
+containment. Strict activation is sticky and one-way for a state root: an
+activated root must keep serving with strict support or be handled with
+`agentbus admission recover`, `seal`, or `reset-empty-root`. The first strict
+release supports one active state root; seal rotation starts a new root and does
+not route read, cancel, result, or replay requests across old and new roots.
+Strict mode currently requires Linux cgroup-v2 with a delegated writable cgroup
+root. Darwin and unsupported or restricted Linux hosts fail closed at startup
+instead of advertising a weaker strict capability.
 
 The status/result/cancel commands map terminal job states to the exit codes
 defined in [docs/protocol.md](docs/protocol.md).
@@ -114,13 +112,15 @@ Backend adapters live under `github.com/charlesnpx/agentbus/engine/adapter`.
 The Claude Code and Codex CLI adapters implement the argv profiles and setup
 drift checks described in [docs/adapters.md](docs/adapters.md).
 Backend authors can follow the normative adding-a-backend recipe in that guide.
+Packages under `github.com/charlesnpx/agentbus/engine/execution/...` are
+unstable implementation APIs for AB-E and are not an import-stability promise.
 
 ## Development
 
 ```sh
 go test ./...
 go test -race ./...
-scripts/release-check.sh v0.2.0
+scripts/ci/release-check.sh
 ```
 
 Set `GOCACHE` under `/private/tmp` or another writable cache root when running

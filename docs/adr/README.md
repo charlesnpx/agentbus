@@ -1,7 +1,8 @@
-# Agentbus AB-D ADR Index
+# Agentbus ADR Index
 
-These records summarize the frozen AB-D reliable-admission decisions from the implementation spec.
-They are constraints for the executable lifecycle model and later production units.
+These records summarize the frozen reliable-admission decisions from the
+implementation spec and later AB-E hardening units. They are constraints for the
+executable lifecycle model and production strict admission.
 
 | ADR | Decision |
 | --- | --- |
@@ -28,3 +29,5 @@ They are constraints for the executable lifecycle model and later production uni
 | [ADR-8A](ADR-8A.md) | Result cleanup excludes live, publishing, and nonterminal jobs. |
 | [ADR-9](ADR-9.md) | Legacy job.status returns to global listing. |
 | [ADR-10](ADR-10.md) | Coordinator ownership blocks idle shutdown and binary replacement. |
+| [ADR-11](ADR-11-admission-authority.md) | AdmissionAuthority is the single public policy boundary; repositories stay internal and policy-free. |
+| [ADR-12](ADR-12-strict-only-contract.md) | Strict-only protocol v2, replay, storage, rejection, shutdown, and result semantics are normative. |
