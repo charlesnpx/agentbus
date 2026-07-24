@@ -775,7 +775,7 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 | E5A | Record-level bbolt behind repository contract; Auditor + AnchorIdentified; binding_index as derived locator; dirty-closure validation sharing invariant helpers with full audit; operation-count tests (bbolt pkg) prove O(touched); 1k/10k/100k benchmarks | CLOSED 7fb6153 |
 | E5B | Create/OpenExisting/OpenExistingReadOnly split (no ambiguous open-or-create); AuditIntegrity (Tx.Check drained + envelope + cross-record + index) at every existing entry point; root-existence matrix test per cell; unsupported first serve non-mutating; corruption fixtures fatal pre-bind, file untouched | CLOSED c8d50df |
 | E6 | docs/protocol.md v2 reconciliation (hand-written; full job.submit identity schema, replay tables, rejection-cause table verified vs implementation) | CLOSED d1ef34b |
-| E7 | CI lanes: committed gate scripts (scripts/ci/), full -race, strict-tag compile, privileged cgroup lane, product black-box lane, fail-closed lanes, govulncheck; release-check runs tests + strict smoke. Merge needs remote-green on candidate SHA (billing must be restored). `.github/**` edits need explicit user approval | PENDING |
+| E7 | CI lanes: committed gate scripts (scripts/ci/), full -race, strict-tag compile, privileged cgroup lane, product black-box lane, fail-closed lanes, govulncheck; release-check runs tests + strict smoke. Merge needs remote-green on candidate SHA (billing must be restored). `.github/**` edits need explicit user approval | CLOSED 22b6a77 |
 | E8 | Docs: ADR index (+11,+12), operations runbook, offline-only backup policy, install caveat; PR #29 body update (needs user approval); FINAL holistic review of the complete candidate SHA | PENDING |
 
 ## Verified defects driving AB-E (evidence at 4e0bd50)
@@ -791,6 +791,27 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 10. CI: no strict lane, race excludes client/+cmd/, gate scripts unversioned; tip red = GitHub Actions BILLING block (jobs die ~4s pre-step), not code.
 
 ## AB-E Log
+- 2026-07-24: E7 CLOSED at 22b6a77 (SHIP on review round 2 + apply pass). Arc: worker 89fea16
+  (gate scripts committed to scripts/ci/ — solo-battery, docker-cgroup-v2, product-e2e,
+  release-check, fail-closed, vuln; five Actions workflows STAGED in
+  scripts/ci/github-workflows-proposed/ with README, .github/ untouched pending user approval;
+  actions SHA-pinned) -> orchestrator caught by EXECUTING the gates (worker sandbox had no Docker):
+  docker run missing -i so the heredoc payload never reached the container — the gate exited 0 in
+  0.27s having run NOTHING (fail-open); + go mod download for hermetic GOPROXY=off builds; + race
+  partition needs CGO_ENABLED=1 -> review1 FIX(7H fail-open defects + 3M: workflow race under
+  CGO=0; conformance partition missing packages; skip-on-unsupported = vacuous green privileged
+  gate; product lane never testing its own artifact; release-check accepting 5s-alive and testing
+  a different binary; fail-closed not checking residue; skippable required check merging
+  unverified SHAs) -> fix1 d6afd2d (non-skippable strict-cgroup-preflight; full conformance set;
+  AGENTBUS_E2E_PREBUILT_BINARY override so lanes test the exact artifact; status round-trip
+  readiness; residue assertion via find; strict-lane push+dispatch only with evidence artifact;
+  digest pin; + orchestrator repairs: MULTI-ARCH manifest-list digest with no --platform — amd64
+  emulation on arm64 broke pidfd syscalls; release-check module-cache warm-up + serialized -p 1
+  full-test phase against cgroup-root-lease contention; ALL lanes executed locally to green) ->
+  review2 SHIP (2 worthwhile M) -> apply pass 22b6a77 (anchored ^TestProductionStrict.*E2B$;
+  socket-first, timeout-bounded, PID-verified readiness probe; both lanes re-verified green).
+  The fail-open docker gate is the campaign thesis in miniature: the CI layer itself needed the
+  same refute-first treatment as the product.
 - 2026-07-24: E6 CLOSED at d1ef34b (SHIP on review round 2, zero findings). Arc: worker aa982ec
   (protocol.md rewritten for v2 with per-section code verification — hello/version, full submit
   identity schema, E1 replay tables, 13-cause table + error.data shape + root_corrupt precedence,
