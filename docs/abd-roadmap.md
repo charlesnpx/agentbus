@@ -774,7 +774,7 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 | E4 | Graceful shutdown: signal.NotifyContext (daemon serving only) + Shutdown(ctx) reusing existing durable cancellation; successful graceful shutdown ⇒ no live custody, no recovery obligation; forced-timeout path remains recoverable fail-closed | CLOSED d74288c |
 | E5A | Record-level bbolt behind repository contract; Auditor + AnchorIdentified; binding_index as derived locator; dirty-closure validation sharing invariant helpers with full audit; operation-count tests (bbolt pkg) prove O(touched); 1k/10k/100k benchmarks | CLOSED 7fb6153 |
 | E5B | Create/OpenExisting/OpenExistingReadOnly split (no ambiguous open-or-create); AuditIntegrity (Tx.Check drained + envelope + cross-record + index) at every existing entry point; root-existence matrix test per cell; unsupported first serve non-mutating; corruption fixtures fatal pre-bind, file untouched | CLOSED c8d50df |
-| E6 | docs/protocol.md v2 reconciliation (hand-written; full job.submit identity schema, replay tables, rejection-cause table verified vs implementation) | PENDING |
+| E6 | docs/protocol.md v2 reconciliation (hand-written; full job.submit identity schema, replay tables, rejection-cause table verified vs implementation) | CLOSED d1ef34b |
 | E7 | CI lanes: committed gate scripts (scripts/ci/), full -race, strict-tag compile, privileged cgroup lane, product black-box lane, fail-closed lanes, govulncheck; release-check runs tests + strict smoke. Merge needs remote-green on candidate SHA (billing must be restored). `.github/**` edits need explicit user approval | PENDING |
 | E8 | Docs: ADR index (+11,+12), operations runbook, offline-only backup policy, install caveat; PR #29 body update (needs user approval); FINAL holistic review of the complete candidate SHA | PENDING |
 
@@ -791,6 +791,22 @@ relocation of execution packages under `internal/` (E9 deferred to a later clean
 10. CI: no strict lane, race excludes client/+cmd/, gate scripts unversioned; tip red = GitHub Actions BILLING block (jobs die ~4s pre-step), not code.
 
 ## AB-E Log
+- 2026-07-24: E6 CLOSED at d1ef34b (SHIP on review round 2, zero findings). Arc: worker aa982ec
+  (protocol.md rewritten for v2 with per-section code verification — hello/version, full submit
+  identity schema, E1 replay tables, 13-cause table + error.data shape + root_corrupt precedence,
+  removed methods, authority-only status/result/cancel + exit codes, admin = daemonless CLI,
+  shutdown/autostart semantics; -1018 lines of stale v1 doc; PLUS the carried E3 decision
+  implemented: unknown_job protocol code emitted by all three unknown-job handler paths, CLI
+  classifier keyed on code not substring, exit 10 unchanged) -> review1 FIX(2H+4M, all doc
+  falsehoods: impossible policy.validate example; exit-code table claiming 12 for launcher-side
+  root_corrupt/root_identity_mismatch which exit 11; legacy job_<ts> example IDs vs job-%020d;
+  unconditional unknown_job claims ignoring fail-stop precedence; fingerprint v1 canonicalization
+  under-specified; state-root overrides missing) -> fix1 d1ef34b (doc-only, truth-over-aspiration:
+  exit-code table split by in-band vs launcher surface; validating example; opaque jobId note;
+  healthy-lookup qualification; full canonicalization rules incl. verbatim number lexemes;
+  AGENTBUS_STATE_ROOT + client Options overrides) -> review2 SHIP zero findings, every correction
+  re-verified against code. Reviewer confirmed round 1: all 13 causes correctly paired, replay
+  tables match E1, no unknown-job path emits invalid_task_spec anymore.
 - 2026-07-24: E5B CLOSED at c8d50df (SHIP on review round 1 — first unit closed in a single review
   round; the new loop policy's apply-without-re-review pass used for the first time). Arc: worker
   3f00a4b (Create/OpenExisting/OpenExistingReadOnly replacing ambiguous NewRepository, folding in
