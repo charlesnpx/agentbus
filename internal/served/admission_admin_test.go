@@ -91,6 +91,28 @@ func TestRecoverAdmissionRootRejectsMissingBucketWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestRecoverAdmissionRootRejectsBucketDeletedAfterPreflightWithoutRepair(t *testing.T) {
+	root := initializedGenerationZeroAdmissionRoot(t)
+	repoPath := filepath.Join(root, admissionRepositoryFile)
+	var deletedHash string
+	setAdmissionRecoveryAfterPreflightHookForTest(t, func() error {
+		deleteAdmissionRepositoryBucket(t, repoPath, "safety")
+		deletedHash = hashRootFiles(t, root)[admissionRepositoryFile]
+		return nil
+	})
+
+	err := recoverAdmissionRootWithAvailableRuntimeNoHash(t, root)
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("RecoverAdmissionRoot error = %v, want ErrCorruptRecord", err)
+	}
+	if deletedHash == "" {
+		t.Fatal("test hook did not capture post-delete repository hash")
+	}
+	if got := hashRootFiles(t, root)[admissionRepositoryFile]; got != deletedHash {
+		t.Fatalf("admission repository hash after rejected recovery = %s, want post-delete hash %s", got, deletedHash)
+	}
+}
+
 func TestRecoverAdmissionRootRejectsGenerationZeroMissingAnchorWithoutMutation(t *testing.T) {
 	root := initializedGenerationZeroAdmissionRoot(t)
 	anchorPath := filepath.Join(root, admissionAnchorFile)
@@ -210,6 +232,52 @@ func TestRecoverAdmissionRootWrapsUnreadableAnchorAsTypedRootError(t *testing.T)
 	}
 }
 
+func TestRecoverAdmissionRootWrapsAnchorStatFailureAsTypedRootError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can stat through owner-denied directories")
+	}
+	root := initializedGenerationZeroAdmissionRoot(t)
+	anchorPath := filepath.Join(root, admissionAnchorFile)
+	sealedDir := filepath.Join(t.TempDir(), "sealed")
+	if err := os.Mkdir(sealedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(sealedDir, "admission-anchor.json")
+	if err := os.WriteFile(target, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(anchorPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, anchorPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sealedDir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(sealedDir, 0o700)
+	})
+	if _, err := os.Stat(anchorPath); err == nil {
+		t.Skip("anchor stat failure fixture did not fail")
+	} else if errors.Is(err, os.ErrNotExist) {
+		t.Skipf("anchor stat fixture returned not-exist instead of permission failure: %v", err)
+	}
+
+	err := recoverAdmissionRootWithAvailableRuntimeNoHash(t, root)
+	var anchorErr AdmissionRootAnchorError
+	if !errors.As(err, &anchorErr) {
+		t.Fatalf("RecoverAdmissionRoot error = %T %v, want AdmissionRootAnchorError", err, err)
+	}
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) {
+		t.Fatalf("RecoverAdmissionRoot error = %T %v, want *os.PathError in chain", err, err)
+	}
+	if !errors.Is(err, authority.ErrAnchorInvariant) {
+		t.Fatalf("RecoverAdmissionRoot error = %v, want ErrAnchorInvariant", err)
+	}
+}
+
 func TestRecoverAdmissionRootWrapsUnsupportedMetaSchemaAsTypedRootError(t *testing.T) {
 	root := initializedGenerationZeroAdmissionRoot(t)
 	setAdmissionRepositoryMetaSchemaVersion(t, filepath.Join(root, admissionRepositoryFile), repository.CurrentAuthorityMetaSchemaVersion+1)
@@ -221,6 +289,22 @@ func TestRecoverAdmissionRootWrapsUnsupportedMetaSchemaAsTypedRootError(t *testi
 	}
 	if !errors.Is(err, repository.ErrInvalidRecord) {
 		t.Fatalf("RecoverAdmissionRoot error = %v, want ErrInvalidRecord", err)
+	}
+}
+
+func TestRecoverAdmissionRootSchemaPrecedesMissingBucket(t *testing.T) {
+	root := initializedGenerationZeroAdmissionRoot(t)
+	repoPath := filepath.Join(root, admissionRepositoryFile)
+	setAdmissionRepositoryMetaSchemaVersion(t, repoPath, repository.CurrentAuthorityMetaSchemaVersion+1)
+	deleteAdmissionRepositoryBucket(t, repoPath, "safety")
+
+	err := recoverAdmissionRootWithAvailableRuntime(t, root)
+	var schemaErr AdmissionRootIncompatibleSchemaError
+	if !errors.As(err, &schemaErr) {
+		t.Fatalf("RecoverAdmissionRoot error = %T %v, want AdmissionRootIncompatibleSchemaError", err, err)
+	}
+	if errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("RecoverAdmissionRoot error = %v, want schema precedence over corrupt bucket", err)
 	}
 }
 

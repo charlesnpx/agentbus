@@ -58,6 +58,26 @@ func TestAdmissionContentionContextPreservesParentDeadline(t *testing.T) {
 	}
 }
 
+func TestAdmissionContentionAttemptTimeoutUsesRemainingDeadline(t *testing.T) {
+	timeout, err := admissionContentionAttemptTimeout(context.Background(), admissionRepositoryOpenTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timeout != admissionRepositoryOpenTimeout {
+		t.Fatalf("attempt timeout without deadline = %s, want %s", timeout, admissionRepositoryOpenTimeout)
+	}
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(admissionRepositoryOpenTimeout/2))
+	defer cancel()
+	timeout, err = admissionContentionAttemptTimeout(ctx, admissionRepositoryOpenTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timeout <= 0 || timeout >= admissionRepositoryOpenTimeout {
+		t.Fatalf("attempt timeout with near deadline = %s, want positive timeout below %s", timeout, admissionRepositoryOpenTimeout)
+	}
+}
+
 func TestActivatedRootSupportLossFailsStartupWithoutDowngrade(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
@@ -545,6 +565,45 @@ func TestRecoveryOnlyClosesRuntimeOnSuccessAndFailure(t *testing.T) {
 	}
 }
 
+func TestRecoveryOnlyPropagatesRuntimeCloseErrorsOnSuccessAndFailure(t *testing.T) {
+	ctx := context.Background()
+	closeErr := errors.New("runtime close failed")
+
+	successServer, successRoot, successCWD := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmission(t, successServer, newAdmissionFakeLaunchCustodian(t))
+	if err := successServer.closeServeAdmission(); err != nil {
+		t.Fatal(err)
+	}
+	successRecovery := newTestServerAtRoot(t, successRoot, successCWD, newFakeBackend("fake"))
+	var successCloses atomic.Int64
+	successRecovery.admissionRuntime = closeCountingServedAdmissionRuntimeWithCloseError(t, &successCloses, admissionSupportForClass(t, custodian.SupportAvailable, true, 1), closeErr)
+	if _, err := successRecovery.recoverAdmissionRoot(ctx); !errors.Is(err, closeErr) {
+		t.Fatalf("recovery-only success error = %v, want runtime close error", err)
+	}
+	if got := successCloses.Load(); got != 1 {
+		t.Fatalf("success runtime closes = %d, want 1", got)
+	}
+
+	failureServer, failureRoot, failureCWD := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmission(t, failureServer, newAdmissionFakeLaunchCustodian(t))
+	if err := failureServer.closeServeAdmission(); err != nil {
+		t.Fatal(err)
+	}
+	failureRecovery := newTestServerAtRoot(t, failureRoot, failureCWD, newFakeBackend("fake"))
+	var failureCloses atomic.Int64
+	failureRecovery.admissionRuntime = closeCountingServedAdmissionRuntimeWithCloseError(t, &failureCloses, admissionSupportForClass(t, custodian.SupportUnsupported, true, 1), closeErr)
+	_, err := failureRecovery.recoverAdmissionRoot(ctx)
+	if !errors.Is(err, ErrAdmissionStrictSupportUnavailable) {
+		t.Fatalf("recovery-only failure error = %v, want ErrAdmissionStrictSupportUnavailable", err)
+	}
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("recovery-only failure error = %v, want runtime close error", err)
+	}
+	if got := failureCloses.Load(); got != 1 {
+		t.Fatalf("failure runtime closes = %d, want 1", got)
+	}
+}
+
 func TestServeRejectsConsumedInjectedRuntime(t *testing.T) {
 	ctx := context.Background()
 	var closes atomic.Int64
@@ -692,11 +751,16 @@ func (b *nilProbeBackend) ProbeBackend(context.Context, command.ProbeRunner) (en
 
 func closeCountingServedAdmissionRuntime(t *testing.T, closes *atomic.Int64, support custodian.Support) *servedAdmissionRuntime {
 	t.Helper()
+	return closeCountingServedAdmissionRuntimeWithCloseError(t, closes, support, nil)
+}
+
+func closeCountingServedAdmissionRuntimeWithCloseError(t *testing.T, closes *atomic.Int64, support custodian.Support, closeErr error) *servedAdmissionRuntime {
+	t.Helper()
 	launcher := newAdmissionFakeLaunchCustodian(t)
 	return &servedAdmissionRuntime{
 		runtime: custodian.NewUnavailableRuntimeForTest(custodian.ErrSupervisorUnavailable, func() error {
 			closes.Add(1)
-			return nil
+			return closeErr
 		}),
 		launchCustodian:  launcher,
 		supportOverride:  &support,

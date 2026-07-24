@@ -2,6 +2,7 @@ package bbolt
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -60,22 +61,60 @@ func TestAdmissionRepositoryRequiredBucketsMatchInitializedRepository(t *testing
 	}
 	defer repo.Close()
 
-	var got []string
+	var gotBuckets []string
+	var gotMetaKeys []string
 	if err := repo.db.View(func(tx *bolt.Tx) error {
-		return tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
-			got = append(got, string(name))
+		if err := tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
+			gotBuckets = append(gotBuckets, string(name))
+			return nil
+		}); err != nil {
+			return err
+		}
+		meta := tx.Bucket(bucketMeta)
+		if meta == nil {
+			return errors.New("meta bucket is missing")
+		}
+		return meta.ForEach(func(key, _ []byte) error {
+			gotMetaKeys = append(gotMetaKeys, string(key))
 			return nil
 		})
 	}); err != nil {
-		t.Fatalf("list buckets: %v", err)
+		t.Fatalf("list initialized structure: %v", err)
 	}
-	want := append([]string(nil), AdmissionRepositoryRequiredBuckets...)
-	sort.Strings(want)
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("initialized buckets = %v, want %v", got, want)
+	sort.Strings(gotBuckets)
+	wantBuckets := AdmissionRepositoryRequiredBuckets()
+	sort.Strings(wantBuckets)
+	if !reflect.DeepEqual(gotBuckets, wantBuckets) {
+		t.Fatalf("initialized buckets = %v, want %v", gotBuckets, wantBuckets)
+	}
+	sort.Strings(gotMetaKeys)
+	wantMetaKeys := AdmissionRepositoryRequiredMetaKeys()
+	sort.Strings(wantMetaKeys)
+	if !reflect.DeepEqual(gotMetaKeys, wantMetaKeys) {
+		t.Fatalf("initialized meta keys = %v, want %v", gotMetaKeys, wantMetaKeys)
 	}
 	if err := repo.VerifyInitializedStructure(); err != nil {
 		t.Fatalf("VerifyInitializedStructure() error = %v", err)
+	}
+}
+
+func TestAdmissionRepositoryRequiredAccessorsReturnCopies(t *testing.T) {
+	buckets := AdmissionRepositoryRequiredBuckets()
+	if len(buckets) == 0 {
+		t.Fatal("AdmissionRepositoryRequiredBuckets returned empty list")
+	}
+	buckets[0] = "mutated"
+	if got := AdmissionRepositoryRequiredBuckets()[0]; got == "mutated" {
+		t.Fatal("AdmissionRepositoryRequiredBuckets returned mutable backing storage")
+	}
+
+	metaKeys := AdmissionRepositoryRequiredMetaKeys()
+	if len(metaKeys) == 0 {
+		t.Fatal("AdmissionRepositoryRequiredMetaKeys returned empty list")
+	}
+	metaKeys[0] = "mutated"
+	if got := AdmissionRepositoryRequiredMetaKeys()[0]; got == "mutated" {
+		t.Fatal("AdmissionRepositoryRequiredMetaKeys returned mutable backing storage")
 	}
 }
 

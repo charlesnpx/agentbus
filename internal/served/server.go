@@ -85,10 +85,17 @@ func (e AdmissionRootBusyError) Unwrap() error {
 }
 
 func admissionSocketDialable(socketPath string) bool {
+	return admissionSocketDialableWithin(socketPath, 100*time.Millisecond)
+}
+
+func admissionSocketDialableWithin(socketPath string, timeout time.Duration) bool {
+	if timeout <= 0 {
+		return false
+	}
 	if _, err := os.Lstat(socketPath); err != nil {
 		return false
 	}
-	conn, err := net.DialTimeout("unix", socketPath, 100*time.Millisecond)
+	conn, err := net.DialTimeout("unix", socketPath, timeout)
 	if err != nil {
 		return false
 	}

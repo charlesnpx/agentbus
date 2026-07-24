@@ -66,6 +66,7 @@ type admissionBootstrapperFactory func(context.Context, *Server) (*admissionBoot
 
 type admissionBootstrapperOpenOptions struct {
 	expectedRepositoryIdentity *bboltrepo.FileIdentity
+	openExistingNoInitialize   bool
 	requireInitializedAnchor   bool
 	verifyInitializedStructure bool
 }
@@ -303,7 +304,11 @@ func alreadyListeningAfterRetryableSupportContention(ctx context.Context, cfg Co
 	contentionCtx, cancel := admissionContentionContext(ctx)
 	defer cancel()
 	for {
-		if admissionSocketDialable(socketPath) {
+		dialTimeout, err := admissionContentionAttemptTimeout(contentionCtx, admissionRepositoryOpenTimeout)
+		if err != nil {
+			return nil
+		}
+		if admissionSocketDialableWithin(socketPath, dialTimeout) {
 			return DaemonAlreadyListeningError{SocketPath: socketPath}
 		}
 		select {
@@ -981,9 +986,18 @@ func openAdmissionBootstrapperWithOptions(ctx context.Context, s *Server, openOp
 	}
 	repoPath := filepath.Join(s.stateRoot, admissionRepositoryFile)
 	var openedIdentity bboltrepo.FileIdentity
-	repo, err := openAdmissionRepositoryWithContentionRetry(ctx, repoPath, s.socketPath)
+	var repo *bboltrepo.Repository
+	var err error
+	if openOptions.openExistingNoInitialize {
+		if openOptions.expectedRepositoryIdentity == nil {
+			return nil, nil, nil, fmt.Errorf("%w: expected admission repository identity is required for no-init recovery open", repository.ErrInvalidRecord)
+		}
+		repo, err = openExistingAdmissionRepositoryWithContentionRetry(ctx, repoPath, s.socketPath, openOptions.expectedRepositoryIdentity)
+	} else {
+		repo, err = openAdmissionRepositoryWithContentionRetry(ctx, repoPath, s.socketPath)
+	}
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, translateAdmissionRepositoryOpenError(repoPath, err)
 	}
 	openedIdentity, err = repo.OpenedFileIdentity()
 	if err != nil {
@@ -995,11 +1009,10 @@ func openAdmissionBootstrapperWithOptions(ctx context.Context, s *Server, openOp
 		return nil, nil, nil, admissionRootRepositoryIdentityMismatchError(repoPath, *openOptions.expectedRepositoryIdentity, openedIdentity)
 	}
 	if openOptions.verifyInitializedStructure {
-		// Recovery preflight already proved this same dev+ino had the required
-		// buckets, meta keys, valid meta, and matching anchor. The normal bbolt
-		// open still calls initialize(), but on this same inode it cannot repair a
-		// previously verified-good initialized root; if the pathname was swapped,
-		// the opened-file identity check above rejects it before Begin can run.
+		// Recovery preflight already proved this dev+ino had the required schema,
+		// buckets, meta keys, valid meta, and matching anchor. The no-init open
+		// rechecks the same inode without creating or repairing buckets before
+		// Begin can run.
 		if err := verifyOpenedAdmissionRepositoryInitialized(ctx, repoPath, repo); err != nil {
 			_ = repo.Close()
 			return nil, nil, nil, err
@@ -1036,13 +1049,50 @@ func openAdmissionBootstrapperWithOptions(ctx context.Context, s *Server, openOp
 	return bootstrapper, repo, repo, nil
 }
 
+func translateAdmissionRepositoryOpenError(repoPath string, err error) error {
+	var mismatch bboltrepo.FileIdentityMismatchError
+	if errors.As(err, &mismatch) {
+		return admissionRootRepositoryIdentityMismatchError(repoPath, mismatch.Expected, mismatch.Opened)
+	}
+	return err
+}
+
 func openAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, socketPath string) (*bboltrepo.Repository, error) {
-	repo, err := bboltrepo.Open(repoPath, &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
+	timeout, err := admissionContentionAttemptTimeout(ctx, admissionRepositoryOpenTimeout)
+	if err != nil {
+		return nil, err
+	}
+	repo, err := bboltrepo.Open(repoPath, &bolt.Options{Timeout: timeout})
 	if err == nil || !errors.Is(err, bolt.ErrTimeout) {
 		return repo, err
 	}
-	err = retryAdmissionRepositoryContention(ctx, repoPath, socketPath, err, func() (bool, error) {
-		repo, err = bboltrepo.Open(repoPath, &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
+	err = retryAdmissionRepositoryContention(ctx, repoPath, socketPath, err, func(timeout time.Duration) (bool, error) {
+		repo, err = bboltrepo.Open(repoPath, &bolt.Options{Timeout: timeout})
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, bolt.ErrTimeout) {
+			return true, err
+		}
+		return false, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return repo, nil
+}
+
+func openExistingAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, socketPath string, expectedIdentity *bboltrepo.FileIdentity) (*bboltrepo.Repository, error) {
+	timeout, err := admissionContentionAttemptTimeout(ctx, admissionRepositoryOpenTimeout)
+	if err != nil {
+		return nil, err
+	}
+	repo, err := bboltrepo.OpenExistingNoInit(repoPath, expectedIdentity, &bolt.Options{Timeout: timeout})
+	if err == nil || !errors.Is(err, bolt.ErrTimeout) {
+		return repo, err
+	}
+	err = retryAdmissionRepositoryContention(ctx, repoPath, socketPath, err, func(timeout time.Duration) (bool, error) {
+		repo, err = bboltrepo.OpenExistingNoInit(repoPath, expectedIdentity, &bolt.Options{Timeout: timeout})
 		if err == nil {
 			return true, nil
 		}
@@ -1058,12 +1108,16 @@ func openAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, s
 }
 
 func openReadOnlyAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, socketPath string) (*bboltrepo.Repository, error) {
-	repo, err := bboltrepo.OpenReadOnly(repoPath, &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
+	timeout, err := admissionContentionAttemptTimeout(ctx, admissionRepositoryOpenTimeout)
+	if err != nil {
+		return nil, err
+	}
+	repo, err := bboltrepo.OpenReadOnly(repoPath, &bolt.Options{Timeout: timeout})
 	if err == nil || !errors.Is(err, bolt.ErrTimeout) {
 		return repo, err
 	}
-	err = retryAdmissionRepositoryContention(ctx, repoPath, socketPath, err, func() (bool, error) {
-		repo, err = bboltrepo.OpenReadOnly(repoPath, &bolt.Options{Timeout: admissionRepositoryOpenTimeout})
+	err = retryAdmissionRepositoryContention(ctx, repoPath, socketPath, err, func(timeout time.Duration) (bool, error) {
+		repo, err = bboltrepo.OpenReadOnly(repoPath, &bolt.Options{Timeout: timeout})
 		if err == nil {
 			return true, nil
 		}
@@ -1078,18 +1132,29 @@ func openReadOnlyAdmissionRepositoryWithContentionRetry(ctx context.Context, rep
 	return repo, nil
 }
 
-func retryAdmissionRepositoryContention(ctx context.Context, repoPath, socketPath string, cause error, retry func() (bool, error)) error {
+func retryAdmissionRepositoryContention(ctx context.Context, repoPath, socketPath string, cause error, retry func(time.Duration) (bool, error)) error {
 	contentionCtx, cancel := admissionContentionContext(ctx)
 	defer cancel()
 	last := cause
 	for {
-		if admissionSocketDialable(socketPath) {
+		if err := contentionCtx.Err(); err != nil {
+			return admissionContentionExpiredError(ctx, repoPath, socketPath, last, err)
+		}
+		dialTimeout, err := admissionContentionAttemptTimeout(contentionCtx, admissionRepositoryOpenTimeout)
+		if err != nil {
+			return admissionContentionExpiredError(ctx, repoPath, socketPath, last, err)
+		}
+		if admissionSocketDialableWithin(socketPath, dialTimeout) {
 			return DaemonAlreadyListeningError{SocketPath: socketPath}
 		}
 		if err := contentionCtx.Err(); err != nil {
 			return admissionContentionExpiredError(ctx, repoPath, socketPath, last, err)
 		}
-		done, err := retry()
+		openTimeout, err := admissionContentionAttemptTimeout(contentionCtx, admissionRepositoryOpenTimeout)
+		if err != nil {
+			return admissionContentionExpiredError(ctx, repoPath, socketPath, last, err)
+		}
+		done, err := retry(openTimeout)
 		if done {
 			return err
 		}
@@ -1102,6 +1167,30 @@ func retryAdmissionRepositoryContention(ctx context.Context, repoPath, socketPat
 		case <-time.After(admissionContentionRetryDelay):
 		}
 	}
+}
+
+func admissionContentionAttemptTimeout(ctx context.Context, max time.Duration) (time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if max <= 0 {
+		return 0, nil
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return max, nil
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		return 0, context.DeadlineExceeded
+	}
+	if remaining < max {
+		return remaining, nil
+	}
+	return max, nil
 }
 
 func admissionContentionContext(ctx context.Context) (context.Context, context.CancelFunc) {

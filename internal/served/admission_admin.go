@@ -154,6 +154,7 @@ func openExistingAdmissionBootstrapper(ctx context.Context, s *Server) (*admissi
 	}
 	return openAdmissionBootstrapperWithOptions(ctx, s, admissionBootstrapperOpenOptions{
 		expectedRepositoryIdentity: &preflight.repositoryIdentity,
+		openExistingNoInitialize:   true,
 		requireInitializedAnchor:   true,
 		verifyInitializedStructure: true,
 	})
@@ -265,9 +266,6 @@ func requireExistingAdmissionRepositoryFile(repoPath string) error {
 }
 
 func verifyOpenedAdmissionRepositoryInitialized(ctx context.Context, repoPath string, repo *bboltrepo.Repository) error {
-	if err := repo.VerifyInitializedStructure(); err != nil {
-		return err
-	}
 	schemaVersion, err := repo.AuthorityMetaSchemaVersion()
 	if err != nil {
 		return err
@@ -275,6 +273,9 @@ func verifyOpenedAdmissionRepositoryInitialized(ctx context.Context, repoPath st
 	if schemaVersion != repository.CurrentAuthorityMetaSchemaVersion {
 		cause := fmt.Errorf("%w: meta.schema_version %d is unsupported", repository.ErrInvalidRecord, schemaVersion)
 		return AdmissionRootIncompatibleSchemaError{Path: repoPath, SchemaVersion: schemaVersion, Cause: cause}
+	}
+	if err := repo.VerifyInitializedStructure(); err != nil {
+		return err
 	}
 	return repo.View(ctx, func(tx repository.ReadTx) error {
 		return verifyAdmissionRepositoryMetaForRecovery(repoPath, tx.Meta())
@@ -302,7 +303,7 @@ func requireExistingAdmissionAnchorFile(anchorPath, dbUUID string, schemaMajor u
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("%w: anchor is missing: %s", authority.ErrAnchorInvariant, anchorPath)
 		}
-		return err
+		return AdmissionRootAnchorError{Path: anchorPath, Cause: err}
 	}
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("%w: anchor is not a regular file: %s", authority.ErrAnchorInvariant, anchorPath)
@@ -320,7 +321,7 @@ func requireExistingAdmissionAnchorFile(anchorPath, dbUUID string, schemaMajor u
 	return nil
 }
 
-func (server *Server) recoverAdmissionRoot(ctx context.Context) (AdmissionRecoveryReport, error) {
+func (server *Server) recoverAdmissionRoot(ctx context.Context) (report AdmissionRecoveryReport, err error) {
 	if server == nil {
 		return AdmissionRecoveryReport{}, authority.ErrNotReady
 	}
@@ -337,12 +338,13 @@ func (server *Server) recoverAdmissionRoot(ctx context.Context) (AdmissionRecove
 	}
 	server.admissionStateMu.Unlock()
 	defer func() {
-		_ = runtime.close()
+		closeErr := runtime.close()
 		server.admissionStateMu.Lock()
 		if server.admissionRuntime == runtime {
 			server.admissionRuntime = nil
 		}
 		server.admissionStateMu.Unlock()
+		err = errors.Join(err, closeErr)
 	}()
 	if err := server.failUnavailableStrictRuntimeBeforeRepository(ctx, runtime); err != nil {
 		return AdmissionRecoveryReport{}, err
@@ -384,7 +386,7 @@ func (server *Server) recoverAdmissionRoot(ctx context.Context) (AdmissionRecove
 		logAdmissionSupportDiagnostic(diagnostic)
 		return AdmissionRecoveryReport{}, diagnostic
 	}
-	report, err := recoverAdmissionBeforeReadyReport(ctx, session, runtime.launchPort(), server.safetyLatch)
+	report, err = recoverAdmissionBeforeReadyReport(ctx, session, runtime.launchPort(), server.safetyLatch)
 	if err != nil {
 		return report, err
 	}
