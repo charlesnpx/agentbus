@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
+	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
@@ -264,6 +266,99 @@ func TestLaunchAdmissionLockPreBindDelayVerifiesWinner(t *testing.T) {
 	helloServedLaunchDaemon(t, filepath.Join(root, protocol.SocketName), token)
 }
 
+func TestServeStartupLockRejectsConcurrentDirectServeBeforeBind(t *testing.T) {
+	parent := shortTempDir(t)
+	root := filepath.Join(parent, "state")
+	cwd := shortTempDir(t)
+	lease := &testAdmissionStartupLease{}
+	preBind := make(chan struct{})
+	releaseBind := make(chan struct{})
+	var releaseBindOnce sync.Once
+	release := func() { releaseBindOnce.Do(func() { close(releaseBind) }) }
+	t.Cleanup(release)
+
+	winnerReady := make(chan struct{}, 1)
+	winner := newTestServerAtRoot(t, root, cwd, newFakeBackend("fake"))
+	winner.readyHook = func(ServeReadyInfo) error {
+		select {
+		case winnerReady <- struct{}{}:
+		default:
+		}
+		return nil
+	}
+	configureServeAdmissionStartupLease(t, winner, lease)
+	winner.beforeListenBindHook = func() {
+		close(preBind)
+		<-releaseBind
+	}
+
+	winnerCtx, cancelWinner := context.WithCancel(context.Background())
+	defer cancelWinner()
+	winnerDone := make(chan error, 1)
+	go func() {
+		winnerDone <- winner.Serve(winnerCtx)
+	}()
+	select {
+	case <-preBind:
+	case err := <-winnerDone:
+		if launchRaceSocketDenied(err) {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatalf("winner exited before pre-bind window: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("winner did not reach pre-bind window")
+	}
+	if !lease.Held() {
+		t.Fatal("winner reached pre-bind without holding startup lease")
+	}
+
+	contender := newTestServerAtRoot(t, root, cwd, newFakeBackend("fake"))
+	configureServeAdmissionStartupLease(t, contender, lease)
+	var contenderListenCalls atomic.Int64
+	contender.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		contenderListenCalls.Add(1)
+		return nil, socketFileIdentity{}, errors.New("contender listener path must not run while startup lease is held")
+	}
+	err := contender.Serve(context.Background())
+	if err == nil {
+		t.Fatal("contender Serve succeeded, want startup-lock support failure")
+	}
+	if !errors.Is(err, ErrAdmissionStrictSupportUnavailable) {
+		t.Fatalf("contender Serve error = %T %v, want ErrAdmissionStrictSupportUnavailable", err, err)
+	}
+	var diagnostic AdmissionSupportDiagnostic
+	if !errors.As(err, &diagnostic) || !errors.Is(diagnostic.Assessment.Cause, cgroup.ErrRootLeaseUnavailable) {
+		t.Fatalf("contender Serve diagnostic = %T %v, want cgroup root lease contention", err, err)
+	}
+	if got := contenderListenCalls.Load(); got != 0 {
+		t.Fatalf("contender listener calls = %d, want 0", got)
+	}
+
+	release()
+	select {
+	case <-winnerReady:
+	case err := <-winnerDone:
+		if launchRaceSocketDenied(err) {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatalf("winner exited before ready: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("winner did not report ready after pre-bind release")
+	}
+	cancelWinner()
+	select {
+	case err := <-winnerDone:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("winner Serve after cancel = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("winner did not stop after cancel")
+	}
+	if lease.Held() {
+		t.Fatal("startup lease remained held after winner stopped")
+	}
+}
+
 func TestLaunchAdmissionLockWithDialableWinnerVerifiesExistingDaemon(t *testing.T) {
 	parent := shortTempDir(t)
 	root := filepath.Join(parent, "state")
@@ -424,6 +519,86 @@ func configureServedLaunchAdmission(server *Server) {
 		supportOverride:  &support,
 		verifierOverride: launcher.verifier,
 	}
+}
+
+type testAdmissionStartupLease struct {
+	mu   sync.Mutex
+	held bool
+}
+
+func (lease *testAdmissionStartupLease) TryAcquire() bool {
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	if lease.held {
+		return false
+	}
+	lease.held = true
+	return true
+}
+
+func (lease *testAdmissionStartupLease) Release() {
+	lease.mu.Lock()
+	lease.held = false
+	lease.mu.Unlock()
+}
+
+func (lease *testAdmissionStartupLease) Held() bool {
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	return lease.held
+}
+
+func configureServeAdmissionStartupLease(t *testing.T, server *Server, lease *testAdmissionStartupLease) {
+	t.Helper()
+	issuer, verifier := custodian.NewAttestationChannel()
+	launcher := &admissionFakeLaunchCustodian{issuer: issuer, verifier: verifier}
+	available := admissionSupportForClass(t, custodian.SupportAvailable, true, 1)
+	contention := retryableStartupLeaseContentionSupport(t)
+	acquired := false
+	runtime := custodian.NewUnavailableRuntimeForTest(custodian.ErrSupervisorUnavailable, func() error {
+		if acquired {
+			lease.Release()
+			acquired = false
+		}
+		return nil
+	})
+	server.admissionRuntime = &servedAdmissionRuntime{
+		runtime:         runtime,
+		launchCustodian: launcher,
+		supportProbe: func(context.Context) custodian.Support {
+			if acquired {
+				return available
+			}
+			if lease.TryAcquire() {
+				acquired = true
+				return available
+			}
+			return contention
+		},
+		verifierOverride: launcher.verifier,
+	}
+}
+
+func retryableStartupLeaseContentionSupport(t *testing.T) custodian.Support {
+	t.Helper()
+	cause := fmt.Errorf("%w: test startup lease held", cgroup.ErrRootLeaseUnavailable)
+	support, err := custodian.NewSupport(custodian.Support{
+		Assessment: custodian.SupportAssessment{
+			Class:       custodian.SupportRetryable,
+			Cause:       cause,
+			Attempts:    1,
+			CleanupSafe: true,
+		},
+		ImplementationCompiled: true,
+		RuntimeProbePassed:     false,
+		RuntimeProbeResult:     cause,
+		Platform:               "test",
+		Reason:                 cause,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return support
 }
 
 func startupFailureCodeForServedLaunch(err error) string {

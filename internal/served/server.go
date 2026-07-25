@@ -1092,6 +1092,12 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 			_ = conn.Close()
 			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
 		}
+		// Production Serve reaches this cleanup only while holding the strict
+		// admission startup lease for the delegated root. A concurrent
+		// direct/autostart daemon that cannot take the same lease fails or
+		// converges before listen(), so a non-dialable path here cannot be a
+		// concurrent winner's newly listening socket unless that startup-lease
+		// invariant is already broken.
 		if err := os.Remove(s.socketPath); err != nil {
 			return nil, socketFileIdentity{}, err
 		}
