@@ -389,12 +389,34 @@ func TestPrepareFailureDuringTargetBindingStartsWaitBeforeAbsenceProof(t *testin
 
 func TestPreparedChannelLossBeforeReleaseContainsTarget(t *testing.T) {
 	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	var controlWrite *os.File
 	fixture.spec.hooks.beforeRelease = func(snapshot launchControlSnapshot) error {
-		return snapshot.ControlWrite.Close()
+		controlWrite = snapshot.ControlWrite
+		return nil
+	}
+	var ref model.GroupRef
+	fixture.spec.BeforeRelease = func(_ context.Context, group model.GroupRef) error {
+		ref = group
+		if err := unix.Kill(group.Leader.PID, unix.SIGSTOP); err != nil {
+			return fmt.Errorf("stop parked worker %d: %w", group.Leader.PID, err)
+		}
+		return nil
 	}
 	prepared, err := Prepare(fixture.ctx, fixture.spec)
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
+	}
+	if controlWrite == nil {
+		cleanupPrepared(t, prepared)
+		t.Fatal("beforeRelease hook did not capture control writer")
+	}
+	if err := ref.Validate(); err != nil {
+		cleanupPrepared(t, prepared)
+		t.Fatalf("captured GroupRef invalid: %v", err)
+	}
+	if err := controlWrite.Close(); err != nil {
+		cleanupPrepared(t, prepared)
+		t.Fatalf("close control writer before release: %v", err)
 	}
 	handle, err := prepared.Release(fixture.ctx)
 	if err == nil {
@@ -409,6 +431,9 @@ func TestPreparedChannelLossBeforeReleaseContainsTarget(t *testing.T) {
 	}
 	assertFileAbsent(t, fixture.backend.MarkerPath)
 	fixture.containment.WaitAbsent(t)
+	if err := waitGroupAbsent(context.Background(), ref); err != nil {
+		t.Fatalf("target group still present after containment: %v", err)
+	}
 }
 
 func TestPreparedReleaseContextCanceledDuringAckWaitReturnsUnknownAndNeverResends(t *testing.T) {
