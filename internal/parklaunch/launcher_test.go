@@ -693,8 +693,24 @@ func TestLaunchBeforeMonitorBindRefinesReturnedTarget(t *testing.T) {
 
 func TestLaunchChannelLossBeforeReleaseContainsTarget(t *testing.T) {
 	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
+	var controlWrite *os.File
 	fixture.spec.hooks.beforeRelease = func(snapshot launchControlSnapshot) error {
-		return snapshot.ControlWrite.Close()
+		controlWrite = snapshot.ControlWrite
+		return nil
+	}
+	var ref model.GroupRef
+	fixture.spec.BeforeRelease = func(_ context.Context, group model.GroupRef) error {
+		ref = group
+		if err := unix.Kill(group.Leader.PID, unix.SIGSTOP); err != nil {
+			return fmt.Errorf("stop parked worker %d: %w", group.Leader.PID, err)
+		}
+		if controlWrite == nil {
+			return errors.New("beforeRelease hook did not capture control writer")
+		}
+		if err := controlWrite.Close(); err != nil {
+			return fmt.Errorf("close control writer before launch release: %w", err)
+		}
+		return nil
 	}
 
 	handle, err := Launch(fixture.ctx, fixture.spec)
@@ -708,8 +724,14 @@ func TestLaunchChannelLossBeforeReleaseContainsTarget(t *testing.T) {
 	if got := fixture.containment.CallCount(); got != 1 {
 		t.Fatalf("containment calls = %d, want 1", got)
 	}
+	if err := ref.Validate(); err != nil {
+		t.Fatalf("captured GroupRef invalid: %v", err)
+	}
 	assertFileAbsent(t, fixture.backend.MarkerPath)
 	fixture.containment.WaitAbsent(t)
+	if err := waitGroupAbsent(context.Background(), ref); err != nil {
+		t.Fatalf("target group still present after Launch cleanup: %v", err)
+	}
 }
 
 func TestLaunchAckReadFailureAfterReleaseLetsArmedMonitorContainWhenParentContainmentFails(t *testing.T) {
@@ -1292,6 +1314,41 @@ func TestStartMonitorProcessStartFailureClosesInheritedLeaf(t *testing.T) {
 		t.Fatalf("StartMonitorProcess(start failure) = (%v, %v), want nil error", monitor, err)
 	}
 	assertFileClosed(t, leaf)
+}
+
+func TestReadBackendResultRejectsTrailingGarbage(t *testing.T) {
+	frame, err := json.Marshal(backendResult{PID: 123, PGID: 456})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		suffix  string
+		wantErr bool
+	}{
+		{name: "whitespace", suffix: "\n \t\n"},
+		{name: "garbage", suffix: "\ngarbage\n", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "backend-result.json")
+			if err := os.WriteFile(path, append(frame, []byte(tc.suffix)...), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := readCompletedBackendResult(path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("readCompletedBackendResult succeeded; want trailing-data error")
+				}
+				if !strings.Contains(err.Error(), "trailing data") {
+					t.Fatalf("readCompletedBackendResult error = %v, want trailing-data error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readCompletedBackendResult error = %v", err)
+			}
+		})
+	}
 }
 
 func TestParklaunchBackendHelperProcess(t *testing.T) {
@@ -2095,18 +2152,29 @@ func startFDHoldHelper(t *testing.T, fds []int, result string, hold time.Duratio
 
 func readBackendResult(t *testing.T, path string) backendResult {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	result, err := readCompletedBackendResult(path)
 	if err != nil {
 		t.Fatal(err)
-	}
-	result, complete, err := parseBackendResultFrame(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !complete {
-		t.Fatalf("backend result %s was incomplete", path)
 	}
 	return result
+}
+
+func readCompletedBackendResult(path string) (backendResult, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return backendResult{}, err
+	}
+	result, complete, remainder, err := parseBackendResultFrameWithRemainder(raw)
+	if err != nil {
+		return backendResult{}, err
+	}
+	if !complete {
+		return backendResult{}, fmt.Errorf("backend result %s was incomplete", path)
+	}
+	if len(bytes.TrimSpace(remainder)) != 0 {
+		return backendResult{}, fmt.Errorf("backend result %s has trailing data after first frame", path)
+	}
+	return result, nil
 }
 
 func waitBackendResult(t *testing.T, path string) backendResult {
@@ -2133,15 +2201,20 @@ func waitBackendResult(t *testing.T, path string) backendResult {
 }
 
 func parseBackendResultFrame(raw []byte) (backendResult, bool, error) {
+	result, complete, _, err := parseBackendResultFrameWithRemainder(raw)
+	return result, complete, err
+}
+
+func parseBackendResultFrameWithRemainder(raw []byte) (backendResult, bool, []byte, error) {
 	end := bytes.IndexByte(raw, '\n')
 	if end < 0 {
-		return backendResult{}, false, nil
+		return backendResult{}, false, nil, nil
 	}
 	var result backendResult
 	if err := json.Unmarshal(raw[:end], &result); err != nil {
-		return backendResult{}, true, err
+		return backendResult{}, true, raw[end+1:], err
 	}
-	return result, true, nil
+	return result, true, raw[end+1:], nil
 }
 
 func waitFile(t *testing.T, path string) {

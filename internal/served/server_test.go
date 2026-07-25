@@ -435,6 +435,63 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	}
 }
 
+func TestListenUnixSocketPrivateChmodsBeforeListen(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(shortTempDir(t), protocol.SocketName)
+	var beforeListenIdentity socketFileIdentity
+	beforeListenCalled := false
+
+	ln, err := listenUnixSocketPrivateWithHooks(path, unixSocketPrivateListenHooks{
+		beforeListen: func(identity socketFileIdentity) error {
+			beforeListenCalled = true
+			beforeListenIdentity = identity
+			info, err := os.Stat(path)
+			if err != nil {
+				return err
+			}
+			if got := info.Mode().Perm(); got != 0o600 {
+				return fmt.Errorf("socket mode before listen = %o, want 600", got)
+			}
+			gotIdentity, err := statSocketFileIdentity(path)
+			if err != nil {
+				return err
+			}
+			if gotIdentity != identity {
+				return fmt.Errorf("socket identity before listen = %+v, want %+v", gotIdentity, identity)
+			}
+			if conn, err := net.DialTimeout("unix", path, 20*time.Millisecond); err == nil {
+				_ = conn.Close()
+				return errors.New("socket accepted a connection before listen")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "bind: operation not permitted") {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if !beforeListenCalled {
+		t.Fatal("before-listen hook was not called")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("socket mode after listen helper = %o, want 600", got)
+	}
+	afterListenIdentity, err := statSocketFileIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterListenIdentity != beforeListenIdentity {
+		t.Fatalf("socket identity after listen = %+v, want %+v", afterListenIdentity, beforeListenIdentity)
+	}
+}
+
 func TestHelloAdvertisesStrictContainmentOnlyWhenPolicyServesStrict(t *testing.T) {
 	t.Parallel()
 	launcher := newAdmissionFakeLaunchCustodian(t)

@@ -47,8 +47,6 @@ var ErrShutdownNotServing = errors.New("agentbus daemon is not serving")
 
 var ErrShutdownPIDTeardownFailed = errors.New("agentbus graceful shutdown pid teardown failed")
 
-var unixSocketBindUmaskMu sync.Mutex
-
 type DaemonAlreadyListeningError struct {
 	SocketPath string
 }
@@ -1133,11 +1131,94 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 }
 
 func listenUnixSocketPrivate(path string) (net.Listener, error) {
-	unixSocketBindUmaskMu.Lock()
-	defer unixSocketBindUmaskMu.Unlock()
-	previous := syscall.Umask(0o177)
-	defer syscall.Umask(previous)
-	return net.Listen("unix", path)
+	return listenUnixSocketPrivateWithHooks(path, unixSocketPrivateListenHooks{})
+}
+
+type unixSocketPrivateListenHooks struct {
+	beforeListen func(socketFileIdentity) error
+}
+
+func listenUnixSocketPrivateWithHooks(path string, hooks unixSocketPrivateListenHooks) (net.Listener, error) {
+	fd, err := openUnixSocketFD()
+	if err != nil {
+		return nil, err
+	}
+	fdOpen := true
+	closeFD := func() {
+		if fdOpen {
+			_ = syscall.Close(fd)
+			fdOpen = false
+		}
+	}
+	failBound := func(identity socketFileIdentity, phase string, err error) (net.Listener, error) {
+		closeFD()
+		removeSocketPathIfIdentity(path, identity, phase)
+		return nil, err
+	}
+
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		closeFD()
+		return nil, os.NewSyscallError("setsockopt", err)
+	}
+	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: path}); err != nil {
+		closeFD()
+		return nil, os.NewSyscallError("bind", err)
+	}
+	identity, err := statSocketFileIdentity(path)
+	if err != nil {
+		closeFD()
+		return nil, fmt.Errorf("stat daemon socket %q after bind: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return failBound(identity, "listener setup failure", err)
+	}
+	if hooks.beforeListen != nil {
+		if err := hooks.beforeListen(identity); err != nil {
+			return failBound(identity, "listener setup failure", err)
+		}
+	}
+	if err := syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
+		return failBound(identity, "listener setup failure", os.NewSyscallError("listen", err))
+	}
+
+	file := os.NewFile(uintptr(fd), "agentbus-daemon-listener")
+	if file == nil {
+		return failBound(identity, "listener setup failure", fmt.Errorf("wrap daemon listener fd %d", fd))
+	}
+	fdOpen = false
+	ln, err := net.FileListener(file)
+	if err != nil {
+		_ = file.Close()
+		removeSocketPathIfIdentity(path, identity, "listener setup failure")
+		return nil, err
+	}
+	if err := file.Close(); err != nil {
+		_ = ln.Close()
+		removeSocketPathIfIdentity(path, identity, "listener setup failure")
+		return nil, err
+	}
+	return ln, nil
+}
+
+func openUnixSocketFD() (int, error) {
+	socketType, closeOnExecInSocket := unixSocketStreamType()
+	if !closeOnExecInSocket {
+		syscall.ForkLock.RLock()
+	}
+	fd, err := syscall.Socket(syscall.AF_UNIX, socketType, 0)
+	if err == nil && !closeOnExecInSocket {
+		syscall.CloseOnExec(fd)
+	}
+	if !closeOnExecInSocket {
+		syscall.ForkLock.RUnlock()
+	}
+	if err != nil {
+		return -1, os.NewSyscallError("socket", err)
+	}
+	if closeOnExecInSocket {
+		syscall.CloseOnExec(fd)
+	}
+	return fd, nil
 }
 
 func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener, socketIdentity socketFileIdentity, acceptSettled <-chan struct{}) {
@@ -1314,13 +1395,17 @@ func statSocketFileIdentity(path string) (socketFileIdentity, error) {
 }
 
 func (s *Server) removeOwnedSocket(owned socketFileIdentity, phase string) {
-	actual, err := statSocketFileIdentity(s.socketPath)
+	removeSocketPathIfIdentity(s.socketPath, owned, phase)
+}
+
+func removeSocketPathIfIdentity(path string, owned socketFileIdentity, phase string) {
+	actual, err := statSocketFileIdentity(path)
 	if err != nil {
-		log.Printf("agentbus daemon: skipping socket removal during %s: cannot stat %s (%v); a replacement daemon may own the path", phase, s.socketPath, err)
+		log.Printf("agentbus daemon: skipping socket removal during %s: cannot stat %s (%v); a replacement daemon may own the path", phase, path, err)
 		return
 	}
 	if actual != owned {
-		log.Printf("agentbus daemon: skipping socket removal during %s: replacement daemon owns %s", phase, s.socketPath)
+		log.Printf("agentbus daemon: skipping socket removal during %s: replacement daemon owns %s", phase, path)
 		return
 	}
 	// dev+inode alone cannot prove ownership: tmpfs (Linux /tmp) reuses inodes
@@ -1329,12 +1414,12 @@ func (s *Server) removeOwnedSocket(owned socketFileIdentity, phase string) {
 	// listener is already closed, so a successful dial proves a LIVE listener —
 	// necessarily a replacement — and skipping is always fail-safe (daemon
 	// startup dials and clears genuinely stale files itself).
-	if conn, dialErr := net.DialTimeout("unix", s.socketPath, 250*time.Millisecond); dialErr == nil {
+	if conn, dialErr := net.DialTimeout("unix", path, 250*time.Millisecond); dialErr == nil {
 		_ = conn.Close()
-		log.Printf("agentbus daemon: skipping socket removal during %s: %s accepts connections; a replacement daemon owns it", phase, s.socketPath)
+		log.Printf("agentbus daemon: skipping socket removal during %s: %s accepts connections; a replacement daemon owns it", phase, path)
 		return
 	}
-	if err := os.Remove(s.socketPath); err != nil {
+	if err := os.Remove(path); err != nil {
 		log.Printf("agentbus daemon: remove owned socket during %s: %v", phase, err)
 		return
 	}
