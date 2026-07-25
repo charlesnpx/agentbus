@@ -200,45 +200,46 @@ type serveAdmissionSnapshot struct {
 
 // Server serves the protocol v1 socket API over engine backends.
 type Server struct {
-	stateRoot                   string
-	cwd                         string
-	socketPath                  string
-	tokenPath                   string
-	token                       string
-	backends                    map[string]engine.Backend
-	registry                    *engine.PolicyRegistry
-	clock                       engine.Clock
-	processes                   engine.ProcessTable
-	processGroups               engine.ProcessGroupSignaler
-	cancelGrace                 time.Duration
-	cancelWaiter                engine.Waiter
-	id                          atomic.Uint64
-	clients                     atomic.Int64
-	accepting                   atomic.Int64
-	idleTimeout                 time.Duration
-	idleCheckInterval           time.Duration
-	binaryIdentityProbe         BinaryIdentityProbe
-	beforeStaleCloseHook        func()
-	staleListenerHook           func()
-	staleSocketRemovedHook      func()
-	beforePIDFileQuarantineHook func()
-	readPIDFileNoFollowHook     func(string) ([]byte, socketFileIdentity, error)
-	inlineResultCap             int
-	leaseDuration               time.Duration
-	heartbeatInterval           time.Duration
-	gcInterval                  time.Duration
-	readyHook                   func(ServeReadyInfo) error
-	listenerFactory             func() (net.Listener, socketFileIdentity, error)
-	beforeListenBindHook        func()
-	safetyLatch                 *SafetyLatch
-	safetyDrainTimeout          time.Duration
-	shutdownTimeout             time.Duration
-	jobsRequestIDEnabled        bool
-	admissionSubmitMu           sync.Mutex
-	admissionCloseEpoch         atomic.Uint64
-	admissionOpenEpoch          atomic.Uint64
-	admissionStateMu            sync.RWMutex
-	resultPublications          atomic.Int64
+	stateRoot                    string
+	cwd                          string
+	socketPath                   string
+	tokenPath                    string
+	token                        string
+	backends                     map[string]engine.Backend
+	registry                     *engine.PolicyRegistry
+	clock                        engine.Clock
+	processes                    engine.ProcessTable
+	processGroups                engine.ProcessGroupSignaler
+	cancelGrace                  time.Duration
+	cancelWaiter                 engine.Waiter
+	id                           atomic.Uint64
+	clients                      atomic.Int64
+	accepting                    atomic.Int64
+	idleTimeout                  time.Duration
+	idleCheckInterval            time.Duration
+	binaryIdentityProbe          BinaryIdentityProbe
+	beforeStaleCloseHook         func()
+	staleListenerHook            func()
+	staleSocketRemovedHook       func()
+	beforePIDFileQuarantineHook  func()
+	readPIDFileNoFollowHook      func(string) ([]byte, socketFileIdentity, error)
+	inlineResultCap              int
+	leaseDuration                time.Duration
+	heartbeatInterval            time.Duration
+	gcInterval                   time.Duration
+	readyHook                    func(ServeReadyInfo) error
+	listenerFactory              func() (net.Listener, socketFileIdentity, error)
+	unixSocketPrivateListenHooks unixSocketPrivateListenHooks
+	beforeListenBindHook         func()
+	safetyLatch                  *SafetyLatch
+	safetyDrainTimeout           time.Duration
+	shutdownTimeout              time.Duration
+	jobsRequestIDEnabled         bool
+	admissionSubmitMu            sync.Mutex
+	admissionCloseEpoch          atomic.Uint64
+	admissionOpenEpoch           atomic.Uint64
+	admissionStateMu             sync.RWMutex
+	resultPublications           atomic.Int64
 
 	admissionBootstrapper        *admissionBootstrapper
 	admissionReady               *admissionReady
@@ -1100,7 +1101,7 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	if s.beforeListenBindHook != nil {
 		s.beforeListenBindHook()
 	}
-	ln, err := listenUnixSocketPrivate(s.socketPath)
+	ln, identity, err := listenUnixSocketPrivate(s.socketPath, s.unixSocketPrivateListenHooks)
 	if err != nil {
 		if isAddrInUse(err) {
 			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
@@ -1117,31 +1118,34 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 		return nil, socketFileIdentity{}, fmt.Errorf("daemon listener for %s is not a Unix listener", s.socketPath)
 	}
 	unixListener.SetUnlinkOnClose(false)
-	identity, err := statSocketFileIdentity(s.socketPath)
-	if err != nil {
+	if !socketPathMatchesIdentity(s.socketPath, identity) {
 		_ = ln.Close()
-		return nil, socketFileIdentity{}, fmt.Errorf("stat daemon socket %q: %w", s.socketPath, err)
+		return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
 	}
 	if err := os.Chmod(s.socketPath, 0o600); err != nil {
 		_ = ln.Close()
 		s.removeOwnedSocket(identity, "listener setup failure")
 		return nil, socketFileIdentity{}, err
 	}
+	if !socketPathMatchesIdentity(s.socketPath, identity) {
+		_ = ln.Close()
+		return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
+	}
 	return ln, identity, nil
 }
 
-func listenUnixSocketPrivate(path string) (net.Listener, error) {
-	return listenUnixSocketPrivateWithHooks(path, unixSocketPrivateListenHooks{})
+func listenUnixSocketPrivate(path string, hooks unixSocketPrivateListenHooks) (net.Listener, socketFileIdentity, error) {
+	return listenUnixSocketPrivateWithHooks(path, hooks)
 }
 
 type unixSocketPrivateListenHooks struct {
 	beforeListen func(socketFileIdentity) error
 }
 
-func listenUnixSocketPrivateWithHooks(path string, hooks unixSocketPrivateListenHooks) (net.Listener, error) {
+func listenUnixSocketPrivateWithHooks(path string, hooks unixSocketPrivateListenHooks) (net.Listener, socketFileIdentity, error) {
 	fd, err := openUnixSocketFD()
 	if err != nil {
-		return nil, err
+		return nil, socketFileIdentity{}, err
 	}
 	fdOpen := true
 	closeFD := func() {
@@ -1150,24 +1154,24 @@ func listenUnixSocketPrivateWithHooks(path string, hooks unixSocketPrivateListen
 			fdOpen = false
 		}
 	}
-	failBound := func(identity socketFileIdentity, phase string, err error) (net.Listener, error) {
+	failBound := func(identity socketFileIdentity, phase string, err error) (net.Listener, socketFileIdentity, error) {
 		closeFD()
 		removeSocketPathIfIdentity(path, identity, phase)
-		return nil, err
+		return nil, socketFileIdentity{}, err
 	}
 
 	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
 		closeFD()
-		return nil, os.NewSyscallError("setsockopt", err)
+		return nil, socketFileIdentity{}, os.NewSyscallError("setsockopt", err)
 	}
 	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: path}); err != nil {
 		closeFD()
-		return nil, os.NewSyscallError("bind", err)
+		return nil, socketFileIdentity{}, os.NewSyscallError("bind", err)
 	}
 	identity, err := statSocketFileIdentity(path)
 	if err != nil {
 		closeFD()
-		return nil, fmt.Errorf("stat daemon socket %q after bind: %w", path, err)
+		return nil, socketFileIdentity{}, fmt.Errorf("lstat daemon socket %q after bind: %w", path, err)
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		return failBound(identity, "listener setup failure", err)
@@ -1180,6 +1184,10 @@ func listenUnixSocketPrivateWithHooks(path string, hooks unixSocketPrivateListen
 	if err := syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
 		return failBound(identity, "listener setup failure", os.NewSyscallError("listen", err))
 	}
+	if !socketPathMatchesIdentity(path, identity) {
+		closeFD()
+		return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: path}
+	}
 
 	file := os.NewFile(uintptr(fd), "agentbus-daemon-listener")
 	if file == nil {
@@ -1190,14 +1198,14 @@ func listenUnixSocketPrivateWithHooks(path string, hooks unixSocketPrivateListen
 	if err != nil {
 		_ = file.Close()
 		removeSocketPathIfIdentity(path, identity, "listener setup failure")
-		return nil, err
+		return nil, socketFileIdentity{}, err
 	}
 	if err := file.Close(); err != nil {
 		_ = ln.Close()
 		removeSocketPathIfIdentity(path, identity, "listener setup failure")
-		return nil, err
+		return nil, socketFileIdentity{}, err
 	}
-	return ln, nil
+	return ln, identity, nil
 }
 
 func openUnixSocketFD() (int, error) {
@@ -1383,15 +1391,24 @@ func (s *Server) safetyFailStopErr() error {
 }
 
 func statSocketFileIdentity(path string) (socketFileIdentity, error) {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return socketFileIdentity{}, err
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
+	return socketFileIdentityFromStat(info.Sys())
+}
+
+func socketFileIdentityFromStat(sys any) (socketFileIdentity, error) {
+	stat, ok := sys.(*syscall.Stat_t)
 	if !ok {
-		return socketFileIdentity{}, fmt.Errorf("unexpected socket stat type %T", info.Sys())
+		return socketFileIdentity{}, fmt.Errorf("unexpected socket stat type %T", sys)
 	}
 	return socketFileIdentity{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}, nil
+}
+
+func socketPathMatchesIdentity(path string, owned socketFileIdentity) bool {
+	actual, err := statSocketFileIdentity(path)
+	return err == nil && actual == owned
 }
 
 func (s *Server) removeOwnedSocket(owned socketFileIdentity, phase string) {

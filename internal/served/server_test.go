@@ -437,59 +437,130 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 
 func TestListenUnixSocketPrivateChmodsBeforeListen(t *testing.T) {
 	t.Parallel()
-	path := filepath.Join(shortTempDir(t), protocol.SocketName)
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
 	var beforeListenIdentity socketFileIdentity
 	beforeListenCalled := false
 
-	ln, err := listenUnixSocketPrivateWithHooks(path, unixSocketPrivateListenHooks{
+	server.unixSocketPrivateListenHooks = unixSocketPrivateListenHooks{
 		beforeListen: func(identity socketFileIdentity) error {
 			beforeListenCalled = true
 			beforeListenIdentity = identity
-			info, err := os.Stat(path)
+			info, err := os.Stat(server.socketPath)
 			if err != nil {
 				return err
 			}
 			if got := info.Mode().Perm(); got != 0o600 {
 				return fmt.Errorf("socket mode before listen = %o, want 600", got)
 			}
-			gotIdentity, err := statSocketFileIdentity(path)
+			gotIdentity, err := statSocketFileIdentity(server.socketPath)
 			if err != nil {
 				return err
 			}
 			if gotIdentity != identity {
 				return fmt.Errorf("socket identity before listen = %+v, want %+v", gotIdentity, identity)
 			}
-			if conn, err := net.DialTimeout("unix", path, 20*time.Millisecond); err == nil {
+			if conn, err := net.DialTimeout("unix", server.socketPath, 20*time.Millisecond); err == nil {
 				_ = conn.Close()
 				return errors.New("socket accepted a connection before listen")
 			}
 			return nil
 		},
-	})
+	}
+
+	ln, identity, err := server.listen()
 	if err != nil {
 		if strings.Contains(err.Error(), "bind: operation not permitted") {
 			t.Skipf("Unix socket bind denied by sandbox: %v", err)
 		}
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() {
+		_ = ln.Close()
+		server.removeOwnedSocket(identity, "test cleanup")
+	}()
 	if !beforeListenCalled {
 		t.Fatal("before-listen hook was not called")
 	}
-	info, err := os.Stat(path)
+	if identity != beforeListenIdentity {
+		t.Fatalf("listen identity = %+v, want before-listen identity %+v", identity, beforeListenIdentity)
+	}
+	info, err := os.Stat(server.socketPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("socket mode after listen helper = %o, want 600", got)
 	}
-	afterListenIdentity, err := statSocketFileIdentity(path)
+	afterListenIdentity, err := statSocketFileIdentity(server.socketPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if afterListenIdentity != beforeListenIdentity {
 		t.Fatalf("socket identity after listen = %+v, want %+v", afterListenIdentity, beforeListenIdentity)
 	}
+}
+
+func TestListenUnixSocketPrivateDetectsPreListenPathReplacement(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	var replacement net.Listener
+	hookCalled := false
+	server.unixSocketPrivateListenHooks = unixSocketPrivateListenHooks{
+		beforeListen: func(identity socketFileIdentity) error {
+			hookCalled = true
+			gotIdentity, err := statSocketFileIdentity(server.socketPath)
+			if err != nil {
+				return err
+			}
+			if gotIdentity != identity {
+				return fmt.Errorf("socket identity before replacement = %+v, want %+v", gotIdentity, identity)
+			}
+			if err := os.Remove(server.socketPath); err != nil {
+				return err
+			}
+			ln, err := net.Listen("unix", server.socketPath)
+			if err != nil {
+				return err
+			}
+			replacement = ln
+			return nil
+		},
+	}
+	defer func() {
+		if replacement != nil {
+			_ = replacement.Close()
+		}
+	}()
+
+	ln, _, err := server.listen()
+	if err == nil {
+		_ = ln.Close()
+		t.Fatal("listen succeeded after pre-listen socket replacement")
+	}
+	if strings.Contains(err.Error(), "bind: operation not permitted") {
+		t.Skipf("Unix socket bind denied by sandbox: %v", err)
+	}
+	if !hookCalled {
+		t.Fatal("before-listen hook was not called")
+	}
+	if !errors.Is(err, ErrDaemonAlreadyListening) {
+		t.Fatalf("listen error = %v, want ErrDaemonAlreadyListening", err)
+	}
+	var alreadyListening DaemonAlreadyListeningError
+	if !errors.As(err, &alreadyListening) {
+		t.Fatalf("listen error = %T, want DaemonAlreadyListeningError", err)
+	}
+	if alreadyListening.SocketPath != server.socketPath {
+		t.Fatalf("already-listening socket path = %q, want %q", alreadyListening.SocketPath, server.socketPath)
+	}
+	if replacement == nil {
+		t.Fatal("replacement listener was not created")
+	}
+	conn, dialErr := net.DialTimeout("unix", server.socketPath, time.Second)
+	if dialErr != nil {
+		t.Fatalf("replacement socket is not dialable after failed listen: %v", dialErr)
+	}
+	_ = conn.Close()
 }
 
 func TestHelloAdvertisesStrictContainmentOnlyWhenPolicyServesStrict(t *testing.T) {
