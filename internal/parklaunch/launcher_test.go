@@ -3,6 +3,7 @@
 package parklaunch
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -2098,9 +2099,12 @@ func readBackendResult(t *testing.T, path string) backendResult {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var result backendResult
-	if err := json.Unmarshal(raw, &result); err != nil {
+	result, complete, err := parseBackendResultFrame(raw)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !complete {
+		t.Fatalf("backend result %s was incomplete", path)
 	}
 	return result
 }
@@ -2112,11 +2116,13 @@ func waitBackendResult(t *testing.T, path string) backendResult {
 	for {
 		raw, err := os.ReadFile(path)
 		if err == nil {
-			var result backendResult
-			if err := json.Unmarshal(raw, &result); err != nil {
+			result, complete, err := parseBackendResultFrame(raw)
+			if err != nil {
 				t.Fatal(err)
 			}
-			return result
+			if complete {
+				return result
+			}
 		}
 		lastErr = err
 		if time.Now().After(deadline) {
@@ -2124,6 +2130,18 @@ func waitBackendResult(t *testing.T, path string) backendResult {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func parseBackendResultFrame(raw []byte) (backendResult, bool, error) {
+	end := bytes.IndexByte(raw, '\n')
+	if end < 0 {
+		return backendResult{}, false, nil
+	}
+	var result backendResult
+	if err := json.Unmarshal(raw[:end], &result); err != nil {
+		return backendResult{}, true, err
+	}
+	return result, true, nil
 }
 
 func waitFile(t *testing.T, path string) {

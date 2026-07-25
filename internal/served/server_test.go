@@ -6068,6 +6068,18 @@ func startTestServerWithRootAndHooks(t *testing.T, root, cwd string, backend eng
 	if configure != nil {
 		configure(server)
 	}
+	ready := make(chan struct{})
+	var readyOnce sync.Once
+	readyHook := server.readyHook
+	server.readyHook = func(info ServeReadyInfo) error {
+		if readyHook != nil {
+			if err := readyHook(info); err != nil {
+				return err
+			}
+		}
+		readyOnce.Do(func() { close(ready) })
+		return nil
+	}
 	if server.admissionRuntime == nil && server.admissionRuntimeConfig.Process() == nil {
 		configureTestAdmissionRuntime(t, server, newAdmissionFakeLaunchCustodian(t), true)
 	}
@@ -6078,6 +6090,7 @@ func startTestServerWithRootAndHooks(t *testing.T, root, cwd string, backend eng
 		close(done)
 	}()
 	h := testServer{root: root, cwd: cwd, socketPath: filepath.Join(root, protocol.SocketName), token: "test-token", done: done, cancel: cancel}
+	waitForServerReady(t, ready, done)
 	waitForSocket(t, h.socketPath, done)
 	t.Cleanup(func() {
 		cancel()
@@ -6088,6 +6101,20 @@ func startTestServerWithRootAndHooks(t *testing.T, root, cwd string, backend eng
 		}
 	})
 	return h
+}
+
+func waitForServerReady(t *testing.T, ready <-chan struct{}, done <-chan error) {
+	t.Helper()
+	select {
+	case <-ready:
+	case err := <-done:
+		if err != nil && strings.Contains(err.Error(), "bind: operation not permitted") {
+			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		}
+		t.Fatalf("server exited before ready hook: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not report ready")
+	}
 }
 
 func startTestServerWithBlockingListener(t *testing.T, server *Server) (context.CancelFunc, <-chan error, *blockingTestListener) {
@@ -6213,12 +6240,12 @@ func waitForSocketRemoved(t *testing.T, socketPath string, done <-chan error) {
 		if _, err := os.Lstat(socketPath); errors.Is(err, os.ErrNotExist) {
 			return
 		}
-		select {
-		case err := <-done:
-			t.Fatalf("server exited before socket removal was observed: %v", err)
-		default:
-		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("socket %s was not removed after server exit: %v", socketPath, err)
+	default:
 	}
 	t.Fatalf("socket %s was not removed", socketPath)
 }

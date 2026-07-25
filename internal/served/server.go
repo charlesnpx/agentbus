@@ -47,6 +47,8 @@ var ErrShutdownNotServing = errors.New("agentbus daemon is not serving")
 
 var ErrShutdownPIDTeardownFailed = errors.New("agentbus graceful shutdown pid teardown failed")
 
+var unixSocketBindUmaskMu sync.Mutex
+
 type DaemonAlreadyListeningError struct {
 	SocketPath string
 }
@@ -1100,7 +1102,7 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	if s.beforeListenBindHook != nil {
 		s.beforeListenBindHook()
 	}
-	ln, err := net.Listen("unix", s.socketPath)
+	ln, err := listenUnixSocketPrivate(s.socketPath)
 	if err != nil {
 		if isAddrInUse(err) {
 			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
@@ -1128,6 +1130,14 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 		return nil, socketFileIdentity{}, err
 	}
 	return ln, identity, nil
+}
+
+func listenUnixSocketPrivate(path string) (net.Listener, error) {
+	unixSocketBindUmaskMu.Lock()
+	defer unixSocketBindUmaskMu.Unlock()
+	previous := syscall.Umask(0o177)
+	defer syscall.Umask(previous)
+	return net.Listen("unix", path)
 }
 
 func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener, socketIdentity socketFileIdentity, acceptSettled <-chan struct{}) {
