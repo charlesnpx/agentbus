@@ -550,23 +550,18 @@ func preflightBoltPageHeaders(path string) error {
 	if meta.pageSize == 0 || uint64(size)/meta.pageSize < meta.pgid {
 		return fmt.Errorf("%w: bbolt file is truncated: pages=%d page_size=%d size=%d: %s", repository.ErrCorruptRecord, meta.pgid, meta.pageSize, size, path)
 	}
-	for pageID := uint64(0); pageID < meta.pgid; {
-		page, err := readBoltPreflightPage(file, pageID, meta.pageSize)
-		if err != nil {
-			return fmt.Errorf("%w: bbolt page %d header read failed: %v", repository.ErrCorruptRecord, pageID, err)
-		}
-		if page.id != pageID {
-			return fmt.Errorf("%w: bbolt page %d self-identifies as %d: %s", repository.ErrCorruptRecord, pageID, page.id, path)
-		}
-		if !validBoltPageFlag(page.flags) {
-			return fmt.Errorf("%w: bbolt page %d has invalid flags 0x%x: %s", repository.ErrCorruptRecord, pageID, page.flags, path)
-		}
-		span := uint64(page.overflow) + 1
-		if pageID+span > meta.pgid {
-			return fmt.Errorf("%w: bbolt page %d overflow %d exceeds high water mark %d: %s", repository.ErrCorruptRecord, pageID, page.overflow, meta.pgid, path)
-		}
-		pageID += span
-	}
+	// Deliberately NOT a linear physical scan asserting page.id == pageID for every
+	// page. bbolt does not guarantee that: overflow-continuation pages carry raw
+	// payload with no self-identifying header, and freed pages retain stale
+	// overflow/flags/id from a prior allocation. A physical linear scan therefore
+	// spuriously rejects VALID databases — especially with small OS page sizes (e.g.
+	// 4KiB on Linux), where the same data needs overflow spans that are absent on a
+	// 16KiB darwin page. Sound structural validation is reachability-based and lives
+	// elsewhere: meta pages are validated above and the freelist in
+	// preflightBoltFreelist (both before open); openBoltSafely wraps bolt.Open in
+	// fault recovery; and verifyExistingInitializedStructure -> checkStructuralIntegrityTx
+	// -> preflightBoltBTreeGraphTx walks the live b-tree (correctly following overflow
+	// spans) and cross-checks the freelist against reachable pages.
 	return nil
 }
 
