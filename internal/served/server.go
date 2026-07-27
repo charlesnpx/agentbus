@@ -25,6 +25,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -2185,8 +2186,16 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 		if err != nil {
 			var reloadErr *protocol.ErrorObject
 			record, projection, ok, reloadErr = s.authorityJobProjection(jobID)
-			if reloadErr == nil && ok && admissionRecordTerminalCanceledByRequest(record) {
-				return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
+			if reloadErr == nil && ok {
+				if errors.Is(err, coordinator.ErrAlreadyFinalized) {
+					if validErr := admissionValidTerminalRecord(record); validErr != nil {
+						return requestOutcome{err: s.failStopAdmissionFinalizationReconcile(jobID, errors.Join(err, validErr))}
+					}
+					return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
+				}
+				if admissionRecordTerminalCanceledByRequest(record) {
+					return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
+				}
 			}
 			return requestOutcome{err: admissionProtocolError(err)}
 		}
@@ -2508,6 +2517,15 @@ func (s *Server) handleRunFinalizationError(run jobRun, err error) {
 	if stopErr := s.failStopAdmissionReady(failStopCtx, err); stopErr != nil {
 		log.Printf("agentbus daemon: job %s finalization fail-stop failed: %v", run.jobID, stopErr)
 	}
+}
+
+func (s *Server) failStopAdmissionFinalizationReconcile(jobID string, err error) *protocol.ErrorObject {
+	failStopCtx, cancel := detachedAdmissionFailStopContext(context.Background())
+	defer cancel()
+	if stopErr := s.failStopAdmissionReady(failStopCtx, err); stopErr != nil {
+		log.Printf("agentbus daemon: job %s finalization reconcile fail-stop failed: %v", jobID, stopErr)
+	}
+	return admissionProtocolError(err)
 }
 
 func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {

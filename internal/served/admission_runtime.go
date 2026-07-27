@@ -15,6 +15,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -480,11 +481,7 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 	}
 	if admissionRunHasRequestedCancel(run, state) {
 		if err := coord.Cancel(context.Background(), jobID, nil); err != nil {
-			snapshot, snapshotErr := coord.Snapshot(context.Background(), jobID)
-			if snapshotErr == nil && admissionRecordTerminalCanceledByRequest(snapshot.Record) {
-				return nil
-			}
-			return err
+			return reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err)
 		}
 		return nil
 	}
@@ -496,9 +493,39 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		if err != nil {
 			return err
 		}
-		return coord.Finalize(context.Background(), jobID, intent)
+		if err := coord.Finalize(context.Background(), jobID, intent); err != nil {
+			return reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err)
+		}
+		return nil
 	}
-	return coord.Complete(context.Background(), jobID, outcome, []byte(text), nil)
+	if err := coord.Complete(context.Background(), jobID, outcome, []byte(text), nil); err != nil {
+		return reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err)
+	}
+	return nil
+}
+
+func reconcileAdmissionFinalizationContention(ctx context.Context, coord *admissionCoordinator, jobID model.JobID, err error) error {
+	if err == nil || !errors.Is(err, coordinator.ErrAlreadyFinalized) {
+		return err
+	}
+	snapshot, snapshotErr := coord.Snapshot(ctx, jobID)
+	if snapshotErr != nil {
+		return errors.Join(err, snapshotErr)
+	}
+	if validErr := admissionValidTerminalRecord(snapshot.Record); validErr != nil {
+		return errors.Join(err, validErr)
+	}
+	return nil
+}
+
+func admissionValidTerminalRecord(record model.SafetyRecord) error {
+	if record.Terminal == nil {
+		return errors.New("existing admission terminal record is missing")
+	}
+	if err := model.ValidateSafetyRecord(record); err != nil {
+		return fmt.Errorf("existing admission terminal record is invalid: %w", err)
+	}
+	return nil
 }
 
 func admissionRunHasRequestedCancel(run jobRun, state engine.JobState) bool {

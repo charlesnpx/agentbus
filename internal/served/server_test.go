@@ -3506,6 +3506,107 @@ func TestAuthorityJobCancelInterruptRaceTerminalizesCanceled(t *testing.T) {
 			t.Fatalf("safety latch tripped after runner resumed: %v", reason)
 		}
 	})
+
+	t.Run("late completed sample reconciles already canceled terminal", func(t *testing.T) {
+		backend := newFakeBackend("fake")
+		backend.started = make(chan struct{}, 1)
+		server, _, cwd := newUnstartedTestServer(t, backend)
+		launcher := newAdmissionFakeLaunchCustodian(t)
+		enableTestAdmission(t, server, launcher)
+		finalizes := installRecordingAdmissionAuthorityForTest(t, server)
+
+		runnerRecordOutcome := make(chan struct{})
+		allowRunnerRecordOutcome := make(chan struct{})
+		var enteredOutcomeOnce sync.Once
+		var releaseOutcomeOnce sync.Once
+		releaseRunnerOutcome := func() {
+			releaseOutcomeOnce.Do(func() { close(allowRunnerRecordOutcome) })
+		}
+		defer releaseRunnerOutcome()
+		finalizes.beforeRecordOutcome = func(ctx context.Context, _ model.JobID, _ model.AttemptRef, outcome model.Outcome) error {
+			if outcome != model.OutcomeCompleted {
+				return nil
+			}
+			enteredOutcomeOnce.Do(func() { close(runnerRecordOutcome) })
+			select {
+			case <-allowRunnerRecordOutcome:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+				return errors.New("held runner RecordOutcome timed out")
+			}
+		}
+
+		conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+			WorkspaceKey: "workspace-authority-cancel-late-completed-sample",
+			RequestID:    "request-authority-cancel-late-completed-sample",
+			TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "done"},
+		}, nil)
+		resp := responseFromScriptedConn(t, conn)
+		var submitted protocol.JobSubmitResult
+		decodeResult(t, resp, &submitted)
+		waitBackendStarted(t, backend)
+
+		select {
+		case <-runnerRecordOutcome:
+		case <-time.After(5 * time.Second):
+			t.Fatal("runner completion did not enter RecordOutcome")
+		}
+
+		canceled := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: submitted.JobID})
+		if canceled.JobID != submitted.JobID || canceled.State != engine.StateCanceled {
+			t.Fatalf("job.cancel result = %+v, want canceled job %s", canceled, submitted.JobID)
+		}
+		record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+		if err := model.ValidateSafetyRecord(record); err != nil {
+			t.Fatalf("canceled terminal record is invalid: %v", err)
+		}
+		if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority terminal = %+v, want canceled after authorization", record.Terminal)
+		}
+		if reason := server.safetyLatch.Reason(); reason != nil {
+			t.Fatalf("safety latch tripped before runner resumed: %v", reason)
+		}
+
+		releaseRunnerOutcome()
+		waitActiveJobGone(t, server, submitted.JobID)
+		after := loadAdmissionSafetyRecord(t, server, submitted.JobID)
+		if err := model.ValidateSafetyRecord(after); err != nil {
+			t.Fatalf("terminal record after runner resumed is invalid: %v", err)
+		}
+		if after.Terminal == nil || after.Terminal.Outcome != model.OutcomeCanceled || after.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority terminal after runner resumed = %+v, want unchanged canceled terminal", after.Terminal)
+		}
+		intents := finalizes.finalizeIntents()
+		if len(intents) != 1 || intents[0].Outcome != model.OutcomeCanceled || intents[0].Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority finalize intents = %+v, want exactly one canceled-after-authorization terminal", intents)
+		}
+		if reason := server.safetyLatch.Reason(); reason != nil {
+			t.Fatalf("safety latch tripped after runner reconciled: %v", reason)
+		}
+	})
+}
+
+func TestAdmissionFinalizationUnexpectedFailureStillFailStops(t *testing.T) {
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	accepted := acceptIdentifiedAuthorityWork(t, server, "unexpected-finalization-failure")
+	jobID := accepted.Record.JobID.String()
+
+	server.completeRunTerminal(jobRun{jobID: jobID, admissionControlled: true}, engine.StateCompleted, "done", nil)
+
+	reason := server.safetyLatch.Reason()
+	if reason == nil {
+		t.Fatal("safety latch did not trip after unexpected finalization failure")
+	}
+	if errors.Is(reason, coordinator.ErrAlreadyFinalized) {
+		t.Fatalf("safety latch reason = %v, want non-reconciled finalization failure", reason)
+	}
+	record := loadAuthoritySafetyRecordFromRepository(t, server.admissionRepository, jobID)
+	if record.Terminal != nil {
+		t.Fatalf("unexpected finalization terminalized record: %+v", record.Terminal)
+	}
 }
 
 func TestAdmissionActiveRunnerInterruptsCommandForAuthorityCancel(t *testing.T) {
@@ -7004,6 +7105,7 @@ type recordingAdmissionAuthority struct {
 	*servedAdmissionAuthority
 
 	beforeRequestCancel func(context.Context, model.JobID) error
+	beforeRecordOutcome func(context.Context, model.JobID, model.AttemptRef, model.Outcome) error
 
 	mu              sync.Mutex
 	finalizeRecords []model.TerminalIntent
@@ -7016,6 +7118,15 @@ func (a *recordingAdmissionAuthority) RequestCancel(ctx context.Context, jobID m
 		}
 	}
 	return a.servedAdmissionAuthority.RequestCancel(ctx, jobID)
+}
+
+func (a *recordingAdmissionAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) (coordinator.StepResult, error) {
+	if a.beforeRecordOutcome != nil {
+		if err := a.beforeRecordOutcome(ctx, jobID, ref, outcome); err != nil {
+			return coordinator.StepResult{}, err
+		}
+	}
+	return a.servedAdmissionAuthority.RecordOutcome(ctx, jobID, ref, outcome)
 }
 
 func (a *recordingAdmissionAuthority) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent) (coordinator.StepResult, error) {
