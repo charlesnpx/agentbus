@@ -273,7 +273,9 @@ func authoritativeLaunch(proof AttemptProof) (*LaunchProof, bool) {
 	ordinals := proof.Launches.FilledOrdinals()
 	for i := len(ordinals) - 1; i >= 0; i-- {
 		if launch, ok := proof.Launches.Get(ordinals[i]); ok {
-			return launch, true
+			if launch.Grant != nil {
+				return launch, true
+			}
 		}
 	}
 	return nil, false

@@ -153,6 +153,33 @@ func TestSafetyRecordValidationRequiresMatchingProofIdentities(t *testing.T) {
 	}
 }
 
+func TestAttemptProofValidationRejectsLaunchSlotTopologyGap(t *testing.T) {
+	record := validSafetyRecord()
+	group := *record.Attempt.Launches.First.Group
+	group.CustodyID = "custody-2"
+	group.Launch.Ordinal = LaunchOrdinalTwo
+	group.PGID = 20
+	group.Leader = ProcessIdentity{PID: 20, HighResStartToken: "leader-start-20"}
+	group.Monitor = ProcessIdentity{PID: 22, HighResStartToken: "monitor-start-20"}
+	group.RetainedID = "retained-2"
+	grant := *record.Attempt.Launches.First.Grant
+	grant.Ordinal = LaunchOrdinalTwo
+
+	record.Attempt.Launches.First = nil
+	record.Attempt.Launches.Second = &LaunchProof{
+		Ordinal: LaunchOrdinalTwo,
+		Group:   &group,
+		Grant:   &grant,
+	}
+
+	if err := record.Attempt.Validate(); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("attempt proof topology gap error = %v, want ErrInvalidValue", err)
+	}
+	if err := ValidateSafetyRecord(record); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("safety record topology gap error = %v, want ErrInvalidValue", err)
+	}
+}
+
 func TestBindingMustMatchSafetyRecordIdentity(t *testing.T) {
 	record := validSafetyRecord()
 	binding := Binding{

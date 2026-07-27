@@ -93,6 +93,9 @@ func (proof AttemptProof) Validate() error {
 	if err := proof.Ref.Validate(); err != nil {
 		return err
 	}
+	if err := validateLaunchSlotTopology(proof.Launches); err != nil {
+		return err
+	}
 	if err := forEachLaunchSlot(proof.Launches, func(ordinal LaunchOrdinal, launch LaunchProof) error {
 		if err := launch.Validate(); err != nil {
 			return err
@@ -108,6 +111,13 @@ func (proof AttemptProof) Validate() error {
 		return err
 	}
 	return validateLaunchGroupsDistinct(proof.Launches)
+}
+
+func validateLaunchSlotTopology[T any](slots LaunchSlots[T]) error {
+	if slots.Second != nil && slots.First == nil {
+		return invalid("launch_slots.topology", "launch slots must be contiguous from ordinal 1")
+	}
+	return nil
 }
 
 func (launch LaunchProof) Validate() error {

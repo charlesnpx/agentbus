@@ -624,6 +624,52 @@ func TestReleaseDefinitelyNotSentRequiresAuthoritativeAttemptWideEvidence(t *tes
 	}
 }
 
+func TestReleaseDefinitelyNotSentIgnoresBoundOnlyTrailingLaunch(t *testing.T) {
+	record := reducerGrantRecord(t)
+	record = reducerMustApply(t, record, RecordReleaseOutcome{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Outcome: LaunchReleaseNotSent})
+	record = reducerMustApply(t, record, reducerQuiescenceCommandWithMethod(t, record, LaunchOrdinalOne, QuiescenceAlreadyAbsent))
+
+	secondGroup := reducerGroup(LaunchOrdinalTwo)
+	record.Attempt.Launches.Second = &LaunchProof{Ordinal: LaunchOrdinalTwo, Group: &secondGroup}
+	record.Revision++
+	record = reducerMustApply(t, record, reducerQuiescenceCommandWithMethod(t, record, LaunchOrdinalTwo, QuiescenceAlreadyAbsent))
+
+	second, ok := record.Attempt.Launches.Get(LaunchOrdinalTwo)
+	if !ok || second.Grant != nil {
+		t.Fatalf("ordinal 2 launch = %#v, want bound-only without grant", second)
+	}
+
+	intent, err := RecoveryTerminalIntent(record, RecoveryStartupLoss, true)
+	if err != nil {
+		t.Fatalf("RecoveryTerminalIntent error = %v", err)
+	}
+	if intent.Outcome != OutcomeFailed || intent.Cause != CauseReleaseDefinitelyNotSent {
+		t.Fatalf("recovery intent = %+v, want failed/release-definitely-not-sent", intent)
+	}
+	if intent.Outcome == OutcomeReaped || intent.Outcome == OutcomeOrphaned ||
+		intent.Cause == CauseDaemonRestartedAfterAuthorization ||
+		intent.Cause == CauseSupervisorLostAfterAuthorization {
+		t.Fatalf("recovery intent = %+v, want no restart-after-authorization reaped/orphaned classification", intent)
+	}
+
+	finalized, err := apply(record, Finalize{Ref: reducerRef(), Intent: intent})
+	if err != nil {
+		t.Fatalf("Finalize recovery intent error = %v", err)
+	}
+	if finalized.Record.Terminal == nil ||
+		finalized.Record.Terminal.Outcome != OutcomeFailed ||
+		finalized.Record.Terminal.Cause != CauseReleaseDefinitelyNotSent ||
+		finalized.Record.Terminal.Proof != ProofContained {
+		t.Fatalf("terminal = %#v, want failed/release-definitely-not-sent/contained", finalized.Record.Terminal)
+	}
+	if err := ValidateSafetyRecord(finalized.Record); err != nil {
+		t.Fatalf("ValidateSafetyRecord finalized bound-only trailing launch error = %v", err)
+	}
+	if got := DeriveCleanupDisposition(finalized.Record); got != CleanupDispositionNoExecutionPossible {
+		t.Fatalf("cleanup = %s, want %s", got, CleanupDispositionNoExecutionPossible)
+	}
+}
+
 func TestReleaseOutcomeUnknownRequiresAuthoritativeLaunchWithoutRecordedOutcome(t *testing.T) {
 	record := reducerOrdinalOneReleasedOrdinalTwoReleaseOutcomeRecord(t, LaunchReleaseSentUnknown)
 	certificate, err := DeriveTerminalCertificate(record, TerminalIntent{
