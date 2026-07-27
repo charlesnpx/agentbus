@@ -12,19 +12,31 @@ storage schema v2 and the root-existence table, and stable rejection cause codes
 Agentbus durably deduplicates identified requests and never automatically relaunches an
 execution whose launch may already have occurred. During normal operation it terminates
 and waits for the supervised process group on cancel, timeout, and graceful shutdown.
-After abrupt daemon loss it performs bounded, identity-checked cleanup; if absence
-cannot be established the job becomes terminal `orphaned` and is never relaunched, and
-the daemon continues serving. Cleanup uncertainty is job-local, not authority
-corruption.
+After abrupt daemon loss it performs bounded, identity-checked cleanup. If the execution
+outcome is UNKNOWN and absence cannot be established, the job becomes terminal `orphaned`;
+a job with a recorded execution outcome KEEPS that outcome and its result, with cleanup
+marked `unresolved` (never rewritten to `orphaned`). Such jobs are never relaunched. The
+daemon continues serving in this case because physical cleanup uncertainty is job-local;
+genuine authority-integrity or ownership-ambiguity failures (below) remain global
+fail-stop and are NOT covered by "continues serving".
 
 This contract is identical on macOS and Linux.
 
 ### Outcome and cleanup axes
 
 Execution outcome and cleanup disposition are INDEPENDENT axes. A known execution
-outcome (`completed`, `failed`, `timed_out`, `interrupted`, or `canceled`) MUST NEVER be
-overwritten because cleanup is uncertain. `OutcomeOrphaned` is reserved for an UNKNOWN
-execution outcome only.
+outcome (`OutcomeCompleted`, `OutcomeCompletedNoncompliant`, `OutcomeFailed`,
+`OutcomeTimedOut`, `OutcomeInterrupted`, or `OutcomeCanceled`) MUST NEVER be overwritten
+because cleanup is uncertain. `OutcomeOrphaned` is reserved for an UNKNOWN execution
+outcome only.
+
+`OutcomeReaped` is the terminal representation of "execution may have occurred, no
+outcome was recorded, and absence was VERIFIED" (matrix row 2); it always carries cleanup
+`verified_absent`. `OutcomeQuarantined` belongs to the projection-corruption recovery
+path (ADR-11 / ADR-12 projection-only corruption) and is out of scope for the crash-
+custody axes here; its cleanup disposition is derived from its own proof records like any
+other terminal outcome. Only `OutcomeOrphaned` carries the `unresolved`-absence terminal
+basis for an unknown outcome.
 
 The following outcome and cleanup matrix is NORMATIVE.
 
@@ -35,6 +47,30 @@ The following outcome and cleanup matrix is NORMATIVE.
 | May have occurred; no execution outcome recorded | absence unresolved | `OutcomeOrphaned`; cleanup `unresolved` |
 | Any execution outcome recorded (completed/failed/timed_out/interrupted/canceled) | absence verified | keep the recorded outcome; cleanup `verified_absent` |
 | Any execution outcome recorded (completed/failed/timed_out/interrupted/canceled) | absence unresolved | keep the recorded outcome AND its result; cleanup `unresolved` |
+
+### Cause and outcome compatibility
+
+The durable `TerminalCause` (engine/execution/model/types.go) determines which terminal
+outcome and cleanup basis are permitted. This table is NORMATIVE and closes the
+"which causes authorize a no-quiescence terminal" gap. "No-quiescence terminal" means a
+terminal certificate derived with the `ProofUnresolvedAbsence` basis (no quiescence
+evidence). It is permitted ONLY for the rows marked so below; every other terminal
+certificate retains the existing proven-quiescence requirement.
+
+| TerminalCause | Execution possibility | Permitted terminal representation |
+| --- | --- | --- |
+| `CauseCompletedNormally` | outcome recorded | keep recorded outcome; requires proven quiescence in the normal path; if absence is unprovable at shutdown, keep the outcome with cleanup `unresolved` |
+| `CauseResponseUndeliverable` | outcome recorded | keep recorded outcome; cleanup per proof |
+| `CauseCanceledBeforeAuthorization`, `CauseDaemonRestartedBeforeAuthorization`, `CauseSupervisorLostBeforeAuthorization`, `CauseReleaseDefinitelyNotSent` | execution was impossible (pre-authorization / release never sent) | clean terminal (canceled/never-permitted); cleanup `no_execution_possible`; NEVER `OutcomeOrphaned` |
+| `CauseCanceledAfterAuthorization` | canceled after authorization | `OutcomeCanceled`; quiescence required normally; unprovable absence -> keep `OutcomeCanceled` with cleanup `unresolved` |
+| `CauseDaemonRestartedAfterAuthorization`, `CauseSupervisorLostAfterAuthorization`, `CauseReleaseOutcomeUnknown` | execution MAY have occurred | if a real outcome was recorded, keep it (cleanup `verified_absent` or `unresolved`); else absence verified -> `OutcomeReaped` (`verified_absent`); else **`OutcomeOrphaned` with `ProofUnresolvedAbsence` (`unresolved`)** |
+| `CauseCorruptProjection` | integrity path | projection reconstructed from proof (ADR-11); not a crash-custody orphan path |
+
+`OutcomeOrphaned` is therefore reachable ONLY from `CauseDaemonRestartedAfterAuthorization`,
+`CauseSupervisorLostAfterAuthorization`, or `CauseReleaseOutcomeUnknown`, and ONLY when no
+execution outcome was recorded and absence could not be verified. The `BeforeAuthorization`
+causes and `CauseReleaseDefinitelyNotSent` are execution-impossible and MUST NOT produce
+`OutcomeOrphaned`.
 
 ### Cleanup disposition
 
@@ -54,16 +90,29 @@ MUST NOT be buried only in logs.
 Only TYPED PHYSICAL uncertainty becomes job-local `unresolved`. Anything that could
 threaten deduplication or ownership integrity remains FATAL and fail-stop.
 
+The decisive line is between DURABLE containment identity and RUNTIME physical
+observation. A valid, trustworthy durable group identity (the recorded `GroupRef`) must
+FIRST be established; only then is inconclusive runtime observation job-local. A missing,
+corrupt, or otherwise untrustworthy durable containment identity remains FATAL and is NOT
+amended by this ADR (see the ADR-11 note below).
+
 | Condition | Handling |
 | --- | --- |
-| PID/PGID identity cannot be safely established | job-local `unresolved` |
+| physical observation cannot resolve absence AFTER a valid, trustworthy durable `GroupRef` was established (identity established, runtime state inconclusive) | job-local `unresolved` |
 | signal/probe cannot establish absence after the bounded attempt | job-local `unresolved` |
-| absence deadline expires with identity still ambiguous | job-local `unresolved` |
+| absence deadline expires while runtime state (not durable identity) is still inconclusive | job-local `unresolved` |
 | caller/startup context is canceled | abort recovery and retry later; do NOT terminalize |
+| durable `GroupRef`/containment identity missing, corrupt, or untrustworthy | authority-integrity FATAL (ADR-11, unchanged) |
 | group record malformed or contradicts its job/ordinal | authority-integrity FATAL |
 | durable binding or grant commit outcome unknown | FAIL-STOP (ownership/duplicate-launch risk) |
 | repository mutation or finalization ambiguous | FAIL-STOP |
 | cgroup directory cleanup fails AFTER absence already proven | record `verified_absent`; emit a cleanup WARNING, not an orphan or global failure |
+
+**ADR-11 note.** ADR-11 (lines 30-32) holds that missing/corrupt proof records or
+untrustworthy containment identity are FATAL because permit certainty cannot be derived.
+ADR-13 does NOT amend that rule. ADR-13 only reclassifies the DISTINCT case of a trustworthy
+durable identity whose live process state cannot be physically observed after daemon loss:
+that becomes job-local `unresolved`, not global fail-stop.
 
 ### Graceful shutdown
 
@@ -94,7 +143,14 @@ permitted ONLY for supervisor-loss or orphan causes. Normal outcomes and success
 recovered outcomes MUST still carry proven quiescence.
 
 The public `job.result` still MUST NOT serialize physical proof. The additive
-`cleanupDisposition` field is the only new public surface.
+`cleanupDisposition` field is the only new public data surface.
+
+Terminal `orphaned` is a TERMINAL job state and MUST carry its OWN CLI exit code, distinct
+from the generic nonterminal `2` a client reads as "still running". The frozen exit code
+for terminal `orphaned` is **10** (`ExitCodeForState` in engine/job.go); code `2` is
+retired from meaning "orphaned". `IsTerminal` MUST report `StateOrphaned` as terminal and
+client terminal-wait MUST stop on it. The public protocol reference (docs/protocol.md,
+updated in U7) MUST reflect terminal `orphaned` and exit code 10.
 
 ### Corruption and fail-stop scope
 
@@ -131,13 +187,29 @@ required.
 
 ### Contract version
 
-The admission contract version increments from 1 to 2 to mark this deliberate normative
-change. Implementations MUST NOT silently reuse contract version 1. Root activation
-itself is RETAINED.
+The daemon's current admission contract version becomes 2 to mark this deliberate
+normative change. Activation stamps the daemon's current contract version. Root activation
+itself is RETAINED, and `admission_root.contract_version` remains immutable once declared
+(engine/execution/repository/records.go). A "candidate root" is an initialized root that
+is not yet activated (`AdmissionRoot.Activated == false`).
 
-Given the project's no-migration posture, old candidate roots recorded at contract
-version 1 MUST fail typed and require reset or sealing. This ADR does NOT introduce any
-storage-schema migration.
+Handling of a version-1 root, given the no-migration posture and the immutability rule:
+
+- **Activated v1 root.** Opening it under a v2 daemon fails with a stable typed
+  incompatible-contract-version fatal error (analogous to ADR-12's incompatible-schema
+  fatal), fail-closed before socket bind, file untouched. There is NO in-place migration.
+  Recovery is operator-driven `seal`, then serve the successor.
+- **Seal successor stamping.** When a v2 daemon performs `seal`, the newly initialized
+  successor root MUST be stamped at the DAEMON'S CURRENT contract version (2), NOT copied
+  from the sealed root's version. This overrides the prior behavior where the seal
+  successor inherited the old root's `ContractVersion` (engine/execution/authority/admin.go
+  `initializeReservedAdmissionRoot`); implemented in U5.
+- **Candidate (unactivated) v1 root.** Activation is refused typed; the root is eligible
+  for `reset-empty` per the ADR-12 root-existence matrix (after proving it empty) or for
+  `seal`. A freshly created root is stamped version 2.
+
+This ADR does NOT introduce any storage-schema migration; only the activation contract
+version and the seal-successor stamping change.
 
 ## Invariant(s)
 
