@@ -22,12 +22,19 @@ import (
 const (
 	darwinPlatformSelfTestTimeout = 5 * time.Second
 	darwinPlatformProbeSleep      = "/bin/sleep"
+	darwinPlatformProbeSleepArg   = "2"
+	darwinPlatformProbeCleanup    = 3 * time.Second
 )
 
 var darwinPlatformSelfTest = struct {
 	once sync.Once
 	err  error
 }{}
+
+var (
+	darwinPlatformProbeCommand = exec.Command
+	darwinPlatformProbeKill    = unix.Kill
+)
 
 type leaderNativeContainmentBackend struct {
 	factory   func(model.GroupRef) (*leaderRetention, error)
@@ -174,7 +181,7 @@ func probeDarwinPlatformProcessGroup(ctx context.Context, name string, attr *sys
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cmd := exec.Command(darwinPlatformProbeSleep, "60")
+	cmd := darwinPlatformProbeCommand(darwinPlatformProbeSleep, darwinPlatformProbeSleepArg)
 	cmd.SysProcAttr = attr
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s probe: %w", name, err)
@@ -185,19 +192,21 @@ func probeDarwinPlatformProcessGroup(ctx context.Context, name string, attr *sys
 		close(waitDone)
 	}()
 
-	pgid := cmd.Process.Pid
+	childPID := cmd.Process.Pid
+	pgid := childPID
 	waited := false
 	defer func() {
 		if waited {
 			return
 		}
-		err = errors.Join(err, cleanupDarwinPlatformProbeProcess(pgid, waitDone))
+		err = errors.Join(err, cleanupDarwinPlatformProbeProcess(childPID, pgid, waitDone))
 	}()
 
-	leaderClaim, err := waitDarwinPlatformProbeLeaderClaim(ctx, cmd.Process.Pid)
+	leaderClaim, err := waitDarwinPlatformProbeLeaderClaim(ctx, childPID)
 	if err != nil {
 		return err
 	}
+	pgid = leaderClaim.PGID
 	if leaderClaim.PGID != leaderClaim.PID {
 		return fmt.Errorf("%s probe pgid=%d pid=%d, want process-group leader", name, leaderClaim.PGID, leaderClaim.PID)
 	}
@@ -213,8 +222,8 @@ func probeDarwinPlatformProcessGroup(ctx context.Context, name string, attr *sys
 		err = errors.Join(err, retention.close())
 	}()
 
-	if err := unix.Kill(-group.PGID, signal); err != nil && !errors.Is(err, unix.ESRCH) {
-		return fmt.Errorf("signal %s probe group %s: %w", name, signal, err)
+	if err := signalDarwinPlatformProbeGroup(name, group, childPID, signal); err != nil {
+		return err
 	}
 	if err := retention.waitExited(ctx); err != nil {
 		return fmt.Errorf("wait %s probe kqueue NOTE_EXIT: %w", name, err)
@@ -232,6 +241,32 @@ func probeDarwinPlatformProcessGroup(ctx context.Context, name string, attr *sys
 		return fmt.Errorf("%s probe group is not stably absent after %s and wait", name, signal)
 	}
 	return nil
+}
+
+func signalDarwinPlatformProbeGroup(name string, group model.GroupRef, childPID int, signal syscall.Signal) error {
+	err := darwinPlatformProbeKill(-group.PGID, signal)
+	if err == nil || errors.Is(err, unix.ESRCH) {
+		return nil
+	}
+	childErr := signalDarwinPlatformProbeChild(childPID, signal)
+	if childErr != nil {
+		return errors.Join(
+			fmt.Errorf("signal %s probe group %s: %w", name, signal, err),
+			fmt.Errorf("signal %s probe child pid %d %s after group failure: %w", name, childPID, signal, childErr),
+		)
+	}
+	return fmt.Errorf("signal %s probe group %s: %w", name, signal, err)
+}
+
+func signalDarwinPlatformProbeChild(pid int, signal syscall.Signal) error {
+	if pid <= 1 {
+		return fmt.Errorf("refuse to signal invalid probe child pid %d", pid)
+	}
+	err := darwinPlatformProbeKill(pid, signal)
+	if errors.Is(err, unix.ESRCH) {
+		return nil
+	}
+	return err
 }
 
 func waitDarwinPlatformProbeLeaderClaim(ctx context.Context, pid int) (procgroup.ProcessClaim, error) {
@@ -318,15 +353,34 @@ func waitDarwinPlatformProbeProcess(ctx context.Context, waitDone <-chan error) 
 	}
 }
 
-func cleanupDarwinPlatformProbeProcess(pgid int, waitDone <-chan error) error {
-	if pgid <= 1 {
+func cleanupDarwinPlatformProbeProcess(childPID, pgid int, waitDone <-chan error) error {
+	if childPID <= 1 {
 		return nil
 	}
-	killErr := unix.Kill(-pgid, unix.SIGKILL)
-	if errors.Is(killErr, unix.ESRCH) {
-		killErr = nil
+	var cleanupErr error
+	if pgid > 1 {
+		killErr := darwinPlatformProbeKill(-pgid, unix.SIGKILL)
+		if errors.Is(killErr, unix.ESRCH) {
+			killErr = nil
+		}
+		if killErr != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("kill probe group pgid %d: %w", pgid, killErr))
+		}
+		if killErr != nil || pgid != childPID {
+			cleanupErr = errors.Join(cleanupErr, signalDarwinPlatformProbeChild(childPID, unix.SIGKILL))
+		}
+	} else {
+		cleanupErr = errors.Join(cleanupErr, signalDarwinPlatformProbeChild(childPID, unix.SIGKILL))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), darwinPlatformProbeCleanup)
+	waitErr := waitDarwinPlatformProbeProcess(ctx, waitDone)
 	defer cancel()
-	return errors.Join(killErr, waitDarwinPlatformProbeProcess(ctx, waitDone))
+	if waitErr == nil {
+		return cleanupErr
+	}
+
+	cleanupErr = errors.Join(cleanupErr, fmt.Errorf("wait probe child pid %d after SIGKILL cleanup: %w", childPID, waitErr))
+	cleanupErr = errors.Join(cleanupErr, signalDarwinPlatformProbeChild(childPID, unix.SIGKILL))
+	return errors.Join(cleanupErr, waitDarwinPlatformProbeProcess(context.Background(), waitDone))
 }

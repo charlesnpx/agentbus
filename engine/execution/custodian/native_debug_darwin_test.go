@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -71,6 +73,82 @@ func TestDarwinLeaderRetentionFailureStopsBeforeMonitorBind(t *testing.T) {
 	}
 	if err := backend.beforeRelease(context.Background(), testPhysicalQuiescence().Group); !errors.Is(err, ErrNativeCustodianUnavailable) {
 		t.Fatalf("beforeRelease() after failed bind error = %v, want unavailable assertion", err)
+	}
+}
+
+func TestDarwinPlatformProbeGroupSignalFailureReapsChild(t *testing.T) {
+	originalCommand := darwinPlatformProbeCommand
+	originalKill := darwinPlatformProbeKill
+	defer func() {
+		darwinPlatformProbeCommand = originalCommand
+		darwinPlatformProbeKill = originalKill
+	}()
+
+	var probeCmd *exec.Cmd
+	darwinPlatformProbeCommand = func(name string, arg ...string) *exec.Cmd {
+		probeCmd = originalCommand(name, arg...)
+		return probeCmd
+	}
+	groupSignals := 0
+	childSignals := 0
+	darwinPlatformProbeKill = func(pid int, signal syscall.Signal) error {
+		if pid < 0 {
+			groupSignals++
+			return unix.EPERM
+		}
+		childSignals++
+		return originalKill(pid, signal)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := probeDarwinPlatformProcessGroup(ctx, "direct-pid-fallback-test", &syscall.SysProcAttr{Setpgid: true}, unix.SIGTERM)
+	if !errors.Is(err, unix.EPERM) {
+		t.Fatalf("probe error = %v, want group signaling EPERM", err)
+	}
+	if probeCmd == nil || probeCmd.Process == nil {
+		t.Fatal("probe command was not started")
+	}
+	if groupSignals == 0 {
+		t.Fatal("probe did not attempt process-group signaling")
+	}
+	if childSignals == 0 {
+		t.Fatal("probe did not fall back to direct child PID signaling")
+	}
+	if probeCmd.ProcessState == nil {
+		t.Fatal("probe returned before the child process was waited/reaped")
+	}
+}
+
+func TestDarwinPlatformProbeCleanupPGIDMismatchSignalsChildAndWaits(t *testing.T) {
+	originalKill := darwinPlatformProbeKill
+	defer func() {
+		darwinPlatformProbeKill = originalKill
+	}()
+
+	var signals []int
+	darwinPlatformProbeKill = func(pid int, _ syscall.Signal) error {
+		signals = append(signals, pid)
+		return nil
+	}
+	waitDone := make(chan error, 1)
+	cleanupDone := make(chan error, 1)
+	go func() {
+		cleanupDone <- cleanupDarwinPlatformProbeProcess(12345, 23456, waitDone)
+		close(cleanupDone)
+	}()
+	select {
+	case err := <-cleanupDone:
+		t.Fatalf("cleanup returned before wait completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	waitDone <- nil
+	close(waitDone)
+	if err := <-cleanupDone; err != nil {
+		t.Fatalf("cleanup error = %v", err)
+	}
+	if len(signals) != 2 || signals[0] != -23456 || signals[1] != 12345 {
+		t.Fatalf("cleanup signals = %+v, want group kill then direct child kill", signals)
 	}
 }
 

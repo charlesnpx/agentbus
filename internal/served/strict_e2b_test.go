@@ -274,7 +274,7 @@ func TestProductionStrictJobCLIStatusResultCancelE2B(t *testing.T) {
 }
 
 func TestProductionStrictSIGTERMMidJobGracefulShutdownE2B(t *testing.T) {
-	requireProductionStrictE2BGate(t)
+	requireProductionStrictSIGTERMGracefulShutdownE2BGate(t)
 	stateRoot := shortTempDir(t)
 	cwd := shortTempDir(t)
 	fixture := installServedNativeCodexFixture(t, stateRoot)
@@ -286,7 +286,7 @@ func TestProductionStrictSIGTERMMidJobGracefulShutdownE2B(t *testing.T) {
 			stopProductionStrictCommand(t, daemon.cmd, daemon.done, &daemon.stdout, &daemon.stderr)
 		}
 	})
-	client := connectProductionStrictClient(t, stateRoot, daemon.done)
+	client := connectProductionStrictForegroundClientE2B(t, stateRoot, daemon)
 	defer client.Close()
 	writeProductionStrictOwnerPIDFileE2B(t, stateRoot, daemon.cmd.Process.Pid)
 
@@ -300,6 +300,7 @@ func TestProductionStrictSIGTERMMidJobGracefulShutdownE2B(t *testing.T) {
 	if err := waitServedNativeFile(startedPath, 10*time.Second); err != nil {
 		t.Fatalf("hold job did not start: %v", err)
 	}
+	execution := waitServedNativeCodexExecutions(t, fixture, 1, time.Second)[0]
 	if err := syscall.Kill(daemon.cmd.Process.Pid, syscall.SIGTERM); err != nil {
 		t.Fatalf("SIGTERM daemon: %v", err)
 	}
@@ -311,19 +312,9 @@ func TestProductionStrictSIGTERMMidJobGracefulShutdownE2B(t *testing.T) {
 	assertProductionStrictSocketPIDRemovedE2B(t, stateRoot)
 	assertProductionStrictPIDAbsentE2B(t, daemon.cmd.Process.Pid, 5*time.Second)
 
-	record := waitProductionStrictAdmissionTerminalFromRepository(t, stateRoot, submitted.JobID, 10*time.Second)
-	launchProof := assertServedNativeIdentifiedTerminal(t, record, model.OutcomeCanceled)
-	if record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
-		t.Fatalf("shutdown terminal cause = %s, want %s", record.Terminal.Cause, model.CauseCanceledAfterAuthorization)
-	}
-	if launchProof.Quiescence.Method != model.QuiescenceTermKill {
-		t.Fatalf("shutdown quiescence method = %s, want term_kill", launchProof.Quiescence.Method)
-	}
-	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
 	report := runProductionStrictRecoverCLI(t, agentbusPath, stateRoot)
-	if report.WorkItems != 0 {
-		t.Fatalf("recover after graceful SIGTERM = %+v, want zero work items", report)
-	}
+	record := waitProductionStrictAdmissionTerminalFromRepository(t, stateRoot, submitted.JobID, 10*time.Second)
+	assertProductionStrictSIGTERMGracefulShutdownTerminalE2B(t, record, execution, report)
 }
 
 func TestProductionStrictSIGINTIdleGracefulShutdownE2B(t *testing.T) {
@@ -542,6 +533,24 @@ func requireProductionStrictE2BGate(t *testing.T) {
 	requireProductionStrictCgroup(t)
 }
 
+func requireProductionStrictSIGTERMGracefulShutdownE2BGate(t *testing.T) {
+	t.Helper()
+	if strings.TrimSpace(os.Getenv(strictE2ERunEnv)) != "1" {
+		t.Skipf("set %s=1 to run E2B strict e2e", strictE2ERunEnv)
+	}
+	if testing.Short() {
+		t.Skip("strict E2B e2e is not run in short mode")
+	}
+	switch runtime.GOOS {
+	case "linux":
+		requireProductionStrictCgroup(t)
+	case "darwin":
+		requireServedNativeConformance(t)
+	default:
+		t.Skip("strict E2B SIGTERM graceful shutdown requires darwin process groups or linux cgroup-v2")
+	}
+}
+
 func launchProductionStrictDaemonE2B(t *testing.T, agentbusPath, stateRoot string, env []string) daemonlaunch.Result {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -589,6 +598,42 @@ func startProductionStrictForegroundCommandE2B(t *testing.T, agentbusPath, state
 	return daemon
 }
 
+func connectProductionStrictForegroundClientE2B(t *testing.T, stateRoot string, daemon *productionStrictForegroundCommandE2B) *agentclient.Client {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-daemon.done:
+			if productionStrictBindDeniedE2B(daemon.stderr.String()) {
+				t.Skipf("Unix socket bind denied by sandbox in foreground daemon: %v", err)
+			}
+			t.Fatalf("Serve exited before client connection: %v\nstdout=%s\nstderr=%s", err, daemon.stdout.String(), daemon.stderr.String())
+		default:
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		client, err := agentclient.Connect(ctx, agentclient.Options{
+			StateRoot:        stateRoot,
+			DisableAutoStart: true,
+		})
+		cancel()
+		if err == nil {
+			return client
+		}
+		lastErr = err
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("client did not connect to production strict server: %v\nstdout=%s\nstderr=%s", lastErr, daemon.stdout.String(), daemon.stderr.String())
+	return nil
+}
+
+func productionStrictBindDeniedE2B(output string) bool {
+	return strings.Contains(output, "bind: operation not permitted") ||
+		strings.Contains(output, "bind: permission denied") ||
+		strings.Contains(output, "Unix socket bind denied by sandbox")
+}
+
 func writeProductionStrictOwnerPIDFileE2B(t *testing.T, stateRoot string, pid int) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(stateRoot, "agentbus.pid"), []byte(fmt.Sprintf("%d\n", pid)), 0o600); err != nil {
@@ -628,6 +673,55 @@ func assertProductionStrictSocketPIDRemovedE2B(t *testing.T, stateRoot string) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s stat = %v, want not exist", path, err)
 		}
+	}
+}
+
+func assertProductionStrictSIGTERMGracefulShutdownTerminalE2B(t *testing.T, record model.SafetyRecord, execution servedNativeCodexExecution, report AdmissionRecoveryReport) {
+	t.Helper()
+	if record.Terminal == nil {
+		t.Fatal("shutdown terminal is nil")
+	}
+	launchProof, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || launchProof.Group == nil || launchProof.Grant == nil {
+		t.Fatalf("shutdown launch proof incomplete: %+v", launchProof)
+	}
+	assertServedNativeExecutionMetadata(t, execution, *launchProof.Group, false)
+	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
+	switch record.Terminal.Outcome {
+	case model.OutcomeCanceled:
+		if report.WorkItems != 0 {
+			t.Fatalf("recover after contained graceful SIGTERM = %+v, want zero work items", report)
+		}
+		if record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("shutdown terminal cause = %s, want %s", record.Terminal.Cause, model.CauseCanceledAfterAuthorization)
+		}
+		if launchProof.Quiescence == nil || launchProof.Quiescence.Method != model.QuiescenceTermKill {
+			t.Fatalf("shutdown quiescence = %+v, want term_kill", launchProof.Quiescence)
+		}
+		if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionVerifiedAbsent {
+			t.Fatalf("contained shutdown cleanup disposition = %s, want %s", got, model.CleanupDispositionVerifiedAbsent)
+		}
+	case model.OutcomeOrphaned:
+		if runtime.GOOS != "darwin" {
+			t.Fatalf("shutdown terminal outcome = %s on %s, want canceled", record.Terminal.Outcome, runtime.GOOS)
+		}
+		if report.WorkItems == 0 {
+			t.Fatalf("recover after unresolved graceful SIGTERM = %+v, want shutdown recovery work", report)
+		}
+		if report.QuiescedLaunches != 0 {
+			t.Fatalf("recover after unresolved graceful SIGTERM = %+v, want no quiesced launch count", report)
+		}
+		if record.Terminal.Proof != model.ProofUnresolvedAbsence {
+			t.Fatalf("orphaned shutdown proof = %s, want %s", record.Terminal.Proof, model.ProofUnresolvedAbsence)
+		}
+		if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionUnresolved {
+			t.Fatalf("orphaned shutdown cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
+		}
+		if launchProof.Quiescence != nil {
+			t.Fatalf("orphaned shutdown recorded quiescence %+v, want unresolved absence without stronger cleanup proof", launchProof.Quiescence)
+		}
+	default:
+		t.Fatalf("shutdown terminal outcome = %s, want canceled or darwin orphaned", record.Terminal.Outcome)
 	}
 }
 

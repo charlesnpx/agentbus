@@ -1486,6 +1486,9 @@ func assertServedNativeRestartRecoveryTerminal(t *testing.T, record model.Safety
 			t.Fatalf("reaped recovery cleanup disposition = %s, want %s", got, model.CleanupDispositionVerifiedAbsent)
 		}
 	case model.OutcomeOrphaned:
+		if goruntime.GOOS != "darwin" {
+			t.Fatalf("recovery terminal outcome = %s on %s, want reaped", record.Terminal.Outcome, goruntime.GOOS)
+		}
 		if record.Terminal.Proof != model.ProofUnresolvedAbsence {
 			t.Fatalf("orphaned recovery proof = %s, want unresolved_absence", record.Terminal.Proof)
 		}
@@ -1493,7 +1496,11 @@ func assertServedNativeRestartRecoveryTerminal(t *testing.T, record model.Safety
 			t.Fatalf("orphaned recovery cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
 		}
 	default:
-		t.Fatalf("recovery terminal outcome = %s, want reaped or orphaned", record.Terminal.Outcome)
+		want := "reaped"
+		if goruntime.GOOS == "darwin" {
+			want = "reaped or orphaned"
+		}
+		t.Fatalf("recovery terminal outcome = %s, want %s", record.Terminal.Outcome, want)
 	}
 	launchProof, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
 	if !ok || launchProof.Group == nil || launchProof.Grant == nil {
