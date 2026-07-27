@@ -94,6 +94,7 @@ type Spec struct {
 	Containment   Containment
 	Monitor       *MonitorProcessSpec
 	RetainedID    string
+	NoRetainedID  bool
 
 	// RetainLeaderUnreaped leaves the target group leader as an unreaped child
 	// until ParkedHandle.Wait or ParkedHandle.WaitState is called. Native
@@ -740,7 +741,7 @@ func Prepare(ctx context.Context, spec Spec) (*Prepared, error) {
 		return nil, preIdentityAbort(fmt.Errorf("monitor joined target process group %d", workerClaim.PGID))
 	}
 
-	group = groupRefFromClaims(workerClaim, monitorClaim, spec.CustodyID, spec.LaunchKey, spec.RetainedID)
+	group = groupRefFromClaims(workerClaim, monitorClaim, spec.CustodyID, spec.LaunchKey, spec.RetainedID, spec.NoRetainedID)
 	releaseGroup := group
 	expectation, err := releaseExpectation(spec, releaseGroup)
 	if err != nil {
@@ -844,6 +845,9 @@ func validateSpec(spec Spec) error {
 	}
 	if err := spec.ReleaseSecret.Validate(); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidSpec, err)
+	}
+	if spec.NoRetainedID && spec.RetainedID != "" {
+		return fmt.Errorf("%w: retained id cannot be set when retained identity is disabled", ErrInvalidSpec)
 	}
 	return nil
 }
@@ -997,8 +1001,8 @@ func verifyMonitorReadyIdentity(reader identityReader, monitor *MonitorProcess, 
 	return nil
 }
 
-func groupRefFromClaims(worker, monitor procgroup.ProcessClaim, custodyID model.CustodyID, launchKey model.LaunchKey, retainedID string) model.GroupRef {
-	if retainedID == "" {
+func groupRefFromClaims(worker, monitor procgroup.ProcessClaim, custodyID model.CustodyID, launchKey model.LaunchKey, retainedID string, noRetainedID bool) model.GroupRef {
+	if retainedID == "" && !noRetainedID {
 		retainedID = defaultRetainedID(worker, monitor, custodyID, launchKey)
 	}
 	return model.GroupRef{

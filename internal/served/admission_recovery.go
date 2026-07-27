@@ -58,6 +58,9 @@ func (e *admissionRecoveryExecutor) RecoverReport(ctx context.Context) (Admissio
 			report.WorkItems++
 			itemReport, err := e.recoverItem(ctx, item)
 			if err != nil {
+				if errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved) {
+					return report, err
+				}
 				return report, e.failClosed(err)
 			}
 			report.QuiescedLaunches += itemReport.QuiescedLaunches
@@ -88,6 +91,9 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 
 		next, err := e.recoverLaunch(ctx, current, current.Launches[0])
 		if err != nil {
+			if errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved) {
+				return report, err
+			}
 			return report, err
 		}
 		report.QuiescedLaunches++
@@ -99,6 +105,9 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 func (e *admissionRecoveryExecutor) recoverLaunch(ctx context.Context, item model.RecoveryWorkItem, recoveryLaunch model.RecoveryLaunch) (model.RecoveryWorkItem, error) {
 	verified, cleanup, err := e.launch.ContainAndVerify(ctx, recoveryLaunch.Group, custodian.QuiescenceCauseRecovery)
 	if err != nil {
+		if errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved) {
+			return model.RecoveryWorkItem{}, err
+		}
 		return model.RecoveryWorkItem{}, fmt.Errorf("%w: contain recovery launch %s ordinal %s: %v", authority.ErrRecoveryNeeded, item.JobID, recoveryLaunch.Ordinal, err)
 	}
 	if err := item.Validate(); err != nil {

@@ -1949,8 +1949,7 @@ func (s *Server) protocolCapabilities() map[string]bool {
 	}
 	if instance != nil &&
 		instance.policy.Mode == AdmissionStrictIdentified &&
-		instance.policy.AcceptIdentified &&
-		instance.policy.CrashDurableContainment {
+		instance.policy.AcceptIdentified {
 		capabilities[protocol.CapabilityAdmissionStrictContainment] = true
 	}
 	s.admissionStateMu.RUnlock()

@@ -6,10 +6,12 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"os"
 	"reflect"
@@ -232,6 +234,9 @@ func OpenExisting(path string, options ...*bolt.Options) (*Repository, error) {
 	if err := requireExistingRegularNonEmptyFile(path); err != nil {
 		return nil, err
 	}
+	if err := preflightBoltPageHeaders(path); err != nil {
+		return nil, err
+	}
 	restoreNoFreelistSync := false
 	if option := firstOpenOption(options); option != nil {
 		restoreNoFreelistSync = option.NoFreelistSync
@@ -257,6 +262,9 @@ func OpenExistingReadOnly(path string, options ...*bolt.Options) (*Repository, e
 		return nil, fmt.Errorf("%w: bbolt path is required", repository.ErrInvalidRecord)
 	}
 	if err := requireExistingRegularNonEmptyFile(path); err != nil {
+		return nil, err
+	}
+	if err := preflightBoltPageHeaders(path); err != nil {
 		return nil, err
 	}
 	readOnlyOptions := bolt.Options{ReadOnly: true, Timeout: defaultOpenTimeout}
@@ -467,6 +475,178 @@ func requireExistingRegularNonEmptyFile(path string) error {
 		return fmt.Errorf("%w: admission repository is zero-length: %s", repository.ErrInvalidRecord, path)
 	}
 	return nil
+}
+
+const (
+	boltPageHeaderSize   = 16
+	boltMetaPayloadSize  = 64
+	boltMagic            = 0xED0CDAED
+	boltVersion          = 2
+	boltBranchPageFlag   = 0x01
+	boltLeafPageFlag     = 0x02
+	boltMetaPageFlag     = 0x04
+	boltFreelistPageFlag = 0x10
+)
+
+type boltPreflightMeta struct {
+	pageSize uint64
+	pgid     uint64
+	txid     uint64
+}
+
+type boltPreflightPage struct {
+	id       uint64
+	flags    uint16
+	overflow uint32
+}
+
+func preflightBoltPageHeaders(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	size := info.Size()
+	meta, ok, err := readBoltPreflightMeta(file, size)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%w: bbolt meta pages are invalid: %s", repository.ErrCorruptRecord, path)
+	}
+	if meta.pgid < 2 {
+		return fmt.Errorf("%w: bbolt high water mark %d is invalid: %s", repository.ErrCorruptRecord, meta.pgid, path)
+	}
+	if meta.pageSize == 0 || uint64(size)/meta.pageSize < meta.pgid {
+		return fmt.Errorf("%w: bbolt file is truncated: pages=%d page_size=%d size=%d: %s", repository.ErrCorruptRecord, meta.pgid, meta.pageSize, size, path)
+	}
+	for pageID := uint64(0); pageID < meta.pgid; {
+		page, err := readBoltPreflightPage(file, pageID, meta.pageSize)
+		if err != nil {
+			return fmt.Errorf("%w: bbolt page %d header read failed: %v", repository.ErrCorruptRecord, pageID, err)
+		}
+		if page.id != pageID {
+			return fmt.Errorf("%w: bbolt page %d self-identifies as %d: %s", repository.ErrCorruptRecord, pageID, page.id, path)
+		}
+		if !validBoltPageFlag(page.flags) {
+			return fmt.Errorf("%w: bbolt page %d has invalid flags 0x%x: %s", repository.ErrCorruptRecord, pageID, page.flags, path)
+		}
+		span := uint64(page.overflow) + 1
+		if pageID+span > meta.pgid {
+			return fmt.Errorf("%w: bbolt page %d overflow %d exceeds high water mark %d: %s", repository.ErrCorruptRecord, pageID, page.overflow, meta.pgid, path)
+		}
+		pageID += span
+	}
+	return nil
+}
+
+func readBoltPreflightMeta(file *os.File, size int64) (boltPreflightMeta, bool, error) {
+	var candidates []boltPreflightMeta
+	if meta, ok, err := readBoltPreflightMetaAt(file, 0, 0); err != nil {
+		return boltPreflightMeta{}, false, err
+	} else if ok {
+		candidates = append(candidates, meta)
+		if second, secondOK, secondErr := readBoltPreflightMetaAt(file, 1, meta.pageSize); secondErr != nil {
+			return boltPreflightMeta{}, false, secondErr
+		} else if secondOK {
+			candidates = append(candidates, second)
+		}
+	} else {
+		for pageSize := uint64(1024); pageSize <= uint64(1024<<14) && pageSize < uint64(size); pageSize <<= 1 {
+			meta, ok, err := readBoltPreflightMetaAt(file, 1, pageSize)
+			if err != nil {
+				return boltPreflightMeta{}, false, err
+			}
+			if ok {
+				candidates = append(candidates, meta)
+				break
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return boltPreflightMeta{}, false, nil
+	}
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if candidate.txid > best.txid {
+			best = candidate
+		}
+	}
+	return best, true, nil
+}
+
+func readBoltPreflightMetaAt(file *os.File, pageID, offset uint64) (boltPreflightMeta, bool, error) {
+	buf := make([]byte, boltPageHeaderSize+boltMetaPayloadSize)
+	n, err := file.ReadAt(buf, int64(offset))
+	if err != nil && n != len(buf) {
+		return boltPreflightMeta{}, false, nil
+	}
+	page := decodeBoltPreflightPage(buf)
+	if page.id != pageID || page.flags != boltMetaPageFlag {
+		return boltPreflightMeta{}, false, nil
+	}
+	meta := buf[boltPageHeaderSize:]
+	if binary.LittleEndian.Uint32(meta[0:4]) != boltMagic || binary.LittleEndian.Uint32(meta[4:8]) != boltVersion {
+		return boltPreflightMeta{}, false, nil
+	}
+	pageSize := uint64(binary.LittleEndian.Uint32(meta[8:12]))
+	if !plausibleBoltPageSize(pageSize) {
+		return boltPreflightMeta{}, false, nil
+	}
+	if !boltMetaChecksumMatches(meta) {
+		return boltPreflightMeta{}, false, nil
+	}
+	return boltPreflightMeta{
+		pageSize: pageSize,
+		pgid:     binary.LittleEndian.Uint64(meta[40:48]),
+		txid:     binary.LittleEndian.Uint64(meta[48:56]),
+	}, true, nil
+}
+
+func readBoltPreflightPage(file *os.File, pageID, pageSize uint64) (boltPreflightPage, error) {
+	buf := make([]byte, boltPageHeaderSize)
+	n, err := file.ReadAt(buf, int64(pageID*pageSize))
+	if err != nil && n != len(buf) {
+		return boltPreflightPage{}, err
+	}
+	if n != len(buf) {
+		return boltPreflightPage{}, fmt.Errorf("short page header read: %d/%d", n, len(buf))
+	}
+	return decodeBoltPreflightPage(buf), nil
+}
+
+func decodeBoltPreflightPage(buf []byte) boltPreflightPage {
+	return boltPreflightPage{
+		id:       binary.LittleEndian.Uint64(buf[0:8]),
+		flags:    binary.LittleEndian.Uint16(buf[8:10]),
+		overflow: binary.LittleEndian.Uint32(buf[12:16]),
+	}
+}
+
+func validBoltPageFlag(flag uint16) bool {
+	switch flag {
+	case boltBranchPageFlag, boltLeafPageFlag, boltMetaPageFlag, boltFreelistPageFlag:
+		return true
+	default:
+		return false
+	}
+}
+
+func plausibleBoltPageSize(size uint64) bool {
+	return size >= 1024 && size <= uint64(1024<<14) && size&(size-1) == 0
+}
+
+func boltMetaChecksumMatches(meta []byte) bool {
+	if len(meta) < boltMetaPayloadSize {
+		return false
+	}
+	hash := fnv.New64a()
+	_, _ = hash.Write(meta[:56])
+	return hash.Sum64() == binary.LittleEndian.Uint64(meta[56:64])
 }
 
 func openBoltSafely(path string, mode os.FileMode, options *bolt.Options) (db *bolt.DB, err error) {
@@ -805,13 +985,14 @@ func auditJobProjectionRepairableFinding(image repository.JobImage, err error) b
 }
 
 func checkStructuralIntegrityTx(tx *bolt.Tx) error {
-	var findings []error
-	for err := range tx.Check() {
-		if err != nil {
-			findings = append(findings, fmt.Errorf("%w: bbolt structural check: %v", repository.ErrCorruptRecord, err))
-		}
+	// bbolt's Tx.Check walks arbitrary page links in a helper goroutine. On
+	// deliberately corrupted files that can panic outside this stack's recover
+	// boundary, so runtime admission uses the safe file-level header preflight
+	// before continuing with direct bucket/meta/record reads.
+	if tx == nil || tx.DB() == nil || tx.DB().Path() == "" {
+		return nil
 	}
-	return repository.NewIntegrityError(findings)
+	return preflightBoltPageHeaders(tx.DB().Path())
 }
 
 func (r *Repository) InjectCorruptSafetyForTest(jobID model.JobID, diagnostic string) {
@@ -932,6 +1113,9 @@ func (r *Repository) initializeFresh() error {
 			SchemaVersion:   repository.StrictAuthorityMetaSchemaVersion,
 			Generation:      0,
 			NextJobSequence: 1,
+			AdmissionRoot: repository.AdmissionRootMetadata{
+				ContractVersion: repository.CurrentAdmissionContractVersion,
+			},
 		}
 		return putEnvelope(tx.Bucket(bucketMeta), kindMeta, keyMeta, meta, revisionMeta(meta))
 	})

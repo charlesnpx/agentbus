@@ -41,31 +41,38 @@ type retainedNativeContainmentBackend struct {
 func newRetainedNativeContainmentBackend(ctx context.Context, custodian *NativeCustodian, factory func() (containment.RetainedGroupObject, error)) (nativeContainmentBackend, error) {
 	manager, err := custodian.sharedRetainedGroup(factory)
 	if err != nil {
-		return nil, fmt.Errorf("%w: create retained-object manager: %w", ErrNativeCustodianUnavailable, err)
+		return nil, retainedContainmentSetupError("create retained-object manager", err)
 	}
 	capability, err := manager.AcquireRetainedGroup(ctx, model.GroupRef{}, time.Now())
 	if err != nil {
-		return nil, fmt.Errorf("%w: acquire retained object: %w", ErrNativeCustodianUnavailable, err)
+		return nil, retainedContainmentSetupError("acquire retained object", err)
 	}
 	placement, ok := capability.(retainedGroupPlacementCapability)
 	if !ok {
 		_ = capability.Release()
-		return nil, fmt.Errorf("%w: retained object does not support launch placement", ErrNativeCustodianUnavailable)
+		return nil, retainedContainmentSetupError("retained object does not support launch placement", nil)
 	}
 	identity := placement.Identity()
 	if err := identity.KernelDomainID.Validate(); err != nil {
 		_ = placement.Release()
-		return nil, fmt.Errorf("%w: retained identity: %v", ErrNativeCustodianUnavailable, err)
+		return nil, retainedContainmentSetupError("retained identity", err)
 	}
 	if identity.RetainedID == "" || identity.KernelDomainID.RetainedDomainState != model.RetainedDomainKnown {
 		_ = placement.Release()
-		return nil, fmt.Errorf("%w: retained identity is incomplete", ErrNativeCustodianUnavailable)
+		return nil, retainedContainmentSetupError("retained identity is incomplete", nil)
 	}
 	return &retainedNativeContainmentBackend{
 		manager:    manager,
 		capability: placement,
 		identity:   identity,
 	}, nil
+}
+
+func retainedContainmentSetupError(message string, cause error) error {
+	if cause == nil {
+		return fmt.Errorf("%w: %w: %s", ErrNativeCustodianUnavailable, ErrRetainedContainmentUnavailable, message)
+	}
+	return fmt.Errorf("%w: %w: %s: %w", ErrNativeCustodianUnavailable, ErrRetainedContainmentUnavailable, message, cause)
 }
 
 func (backend *retainedNativeContainmentBackend) retainedID() string {
