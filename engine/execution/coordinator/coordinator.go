@@ -323,6 +323,9 @@ func (c *Coordinator) awaitResultCertificateProgress(ctx context.Context, jobID 
 }
 
 func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, unresolved error) error {
+	if err := recoveryAbortedBeforeOperation(ctx); err != nil {
+		return err
+	}
 	snapshot, err := c.authority.Snapshot(ctx, jobID)
 	if err != nil {
 		return c.failStopUnlessRecoveryAborted(ctx, errors.Join(unresolved, err))
@@ -330,6 +333,9 @@ func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID,
 	intent, err := model.RecoveryTerminalIntent(snapshot.Record, trigger, false)
 	if err != nil {
 		return c.failStopUnlessRecoveryAborted(ctx, errors.Join(unresolved, err))
+	}
+	if err := recoveryAbortedBeforeOperation(ctx); err != nil {
+		return err
 	}
 	if _, err := c.authority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, intent); err != nil {
 		err = c.alreadyFinalizedError(ctx, jobID, err)
@@ -437,6 +443,16 @@ func recoveryAborted(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
+func recoveryAbortedBeforeOperation(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	if err := ctx.Err(); recoveryAborted(err) {
+		return err
+	}
+	return nil
+}
+
 func physicalCleanupUnresolved(err error) bool {
 	return custodian.IsCleanupUnresolved(err) || errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved)
 }
@@ -444,11 +460,6 @@ func physicalCleanupUnresolved(err error) bool {
 func (c *Coordinator) failStopUnlessRecoveryAborted(ctx context.Context, err error) error {
 	if recoveryAborted(err) {
 		return err
-	}
-	if ctx != nil {
-		if ctxErr := ctx.Err(); recoveryAborted(ctxErr) {
-			return ctxErr
-		}
 	}
 	return c.failStop(ctx, err)
 }

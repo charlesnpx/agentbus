@@ -199,20 +199,20 @@ func (controller *LaunchController) Start(ctx context.Context, request LaunchReq
 		return nil, err
 	}
 	if err := inject(request.Failures, FailAfterPrepare); err != nil {
-		return nil, errors.Join(err, controller.abortPrepared(containmentContext(ctx), prepared, false, request.Context))
+		return nil, errors.Join(err, controller.abortPrepared(containmentContext(ctx), prepared, nil, request.Context))
 	}
 
 	group := prepared.Ref()
 	bindOutcome, bindErr := controller.BindGroup(ctx, request.Context, group)
-	if err := controller.handlePreGrantDurability(containmentContext(ctx), "bind_group", bindOutcome, bindErr, prepared, false, request.Context); err != nil {
+	if err := controller.handlePreGrantDurability(containmentContext(ctx), "bind_group", bindOutcome, bindErr, prepared, group, false, request.Context); err != nil {
 		return nil, err
 	}
 	if err := inject(request.Failures, FailAfterBindGroup); err != nil {
-		return nil, errors.Join(err, controller.abortPrepared(containmentContext(ctx), prepared, true, request.Context))
+		return nil, errors.Join(err, controller.abortPrepared(containmentContext(ctx), prepared, &group, request.Context))
 	}
 
 	grant, grantOutcome, grantErr := controller.AllocateGrant(ctx, request.Context)
-	if err := controller.handleGrantDurability(containmentContext(ctx), "allocate_grant", grantOutcome, grantErr, prepared, request.Context); err != nil {
+	if err := controller.handleGrantDurability(containmentContext(ctx), "allocate_grant", grantOutcome, grantErr, prepared, group, request.Context); err != nil {
 		return nil, err
 	}
 	if err := validateGrant(request.Context, grant); err != nil {
@@ -305,11 +305,11 @@ func (controller *LaunchController) handleReleaseOutcome(ctx context.Context, pr
 		}
 		outcome, err := controller.RecordReleaseOutcome(ctx, launch, model.LaunchReleaseNotSent)
 		if mapped := durableMutationError("record_release_outcome", outcome, err); mapped != nil {
-			abortErr := controller.abortPrepared(ctx, prepared, true, launch)
+			abortErr := controller.abortPrepared(ctx, prepared, &group, launch)
 			failReason := errors.Join(reason, mapped, abortErr)
 			return errors.Join(failReason, controller.failStop(ctx, failReason), ErrFailClosed)
 		}
-		return errors.Join(reason, controller.abortPrepared(ctx, prepared, true, launch))
+		return errors.Join(reason, controller.abortPrepared(ctx, prepared, &group, launch))
 	case custodian.ReleaseOutcomeUnknown:
 		reason := ErrReleaseUncertain
 		if releaseErr != nil {
@@ -376,16 +376,21 @@ func (controller *LaunchController) ready() error {
 	return nil
 }
 
-func (controller *LaunchController) abortPrepared(ctx context.Context, prepared PreparedProcess, groupDurable bool, launch LaunchContext) error {
+func (controller *LaunchController) abortPrepared(ctx context.Context, prepared PreparedProcess, boundGroup *model.GroupRef, launch LaunchContext) error {
+	preparedGroup := prepared.Ref()
 	verified, cleanup, err := prepared.AbortAndVerify(ctx)
 	abortErr := cleanup.Err
 	if err != nil {
 		abortErr = fmt.Errorf("abort prepared process: %w", err)
-		verified, cleanup, err = controller.custodian.ContainAndVerify(ctx, prepared.Ref(), custodian.QuiescenceCauseContain)
+		containGroup := preparedGroup
+		if boundGroup != nil {
+			containGroup = *boundGroup
+		}
+		verified, cleanup, err = controller.custodian.ContainAndVerify(ctx, containGroup, custodian.QuiescenceCauseContain)
 		if err != nil {
 			reason := errors.Join(abortErr, fmt.Errorf("contain prepared group: %w", err))
-			if groupDurable && physicalCleanupUnresolved(abortErr) && physicalCleanupUnresolved(err) {
-				if groupErr := validatePreparedGroup(launch, prepared.Ref()); groupErr != nil {
+			if boundGroup != nil && physicalCleanupUnresolved(abortErr) && physicalCleanupUnresolved(err) {
+				if groupErr := validateJobLocalPreparedAbortGroup(launch, *boundGroup, preparedGroup, abortErr, err); groupErr != nil {
 					return errors.Join(reason, groupErr, controller.failStop(ctx, errors.Join(reason, groupErr)), ErrFailClosed)
 				}
 				return reason
@@ -394,7 +399,7 @@ func (controller *LaunchController) abortPrepared(ctx context.Context, prepared 
 		}
 		abortErr = errors.Join(abortErr, cleanup.Err)
 	}
-	if !groupDurable {
+	if boundGroup == nil {
 		return abortErr
 	}
 	outcome, err := controller.RecordQuiescence(ctx, launch, verified)
@@ -405,38 +410,89 @@ func (controller *LaunchController) abortPrepared(ctx context.Context, prepared 
 	return abortErr
 }
 
-func (controller *LaunchController) handlePreGrantDurability(ctx context.Context, step string, outcome DurabilityOutcome, stepErr error, prepared PreparedProcess, groupDurable bool, launch LaunchContext) error {
+func (controller *LaunchController) handlePreGrantDurability(ctx context.Context, step string, outcome DurabilityOutcome, stepErr error, prepared PreparedProcess, boundGroup model.GroupRef, groupDurable bool, launch LaunchContext) error {
 	recordDurable := groupDurable || durabilityDecision(outcome) == durabilityCommitted
 	switch durabilityDecision(outcome) {
 	case durabilityCommitted:
 		if stepErr == nil {
 			return nil
 		}
-		return errors.Join(durableMutationError(step, outcome, stepErr), controller.abortPrepared(ctx, prepared, recordDurable, launch))
+		return errors.Join(durableMutationError(step, outcome, stepErr), controller.abortPrepared(ctx, prepared, durableGroup(boundGroup, recordDurable), launch))
 	case durabilityNotCommitted:
-		return errors.Join(durableMutationError(step, outcome, stepErr), controller.abortPrepared(ctx, prepared, groupDurable, launch))
+		return errors.Join(durableMutationError(step, outcome, stepErr), controller.abortPrepared(ctx, prepared, durableGroup(boundGroup, groupDurable), launch))
 	case durabilityUnknown:
-		return controller.containGroupAndFailStop(ctx, prepared.Ref(), durableMutationError(step, outcome, stepErr))
+		return controller.containGroupAndFailStop(ctx, boundGroup, durableMutationError(step, outcome, stepErr))
 	default:
-		return controller.containGroupAndFailStop(ctx, prepared.Ref(), durableMutationError(step, outcome, stepErr))
+		return controller.containGroupAndFailStop(ctx, boundGroup, durableMutationError(step, outcome, stepErr))
 	}
 }
 
-func (controller *LaunchController) handleGrantDurability(ctx context.Context, step string, outcome DurabilityOutcome, stepErr error, prepared PreparedProcess, launch LaunchContext) error {
-	group := prepared.Ref()
+func (controller *LaunchController) handleGrantDurability(ctx context.Context, step string, outcome DurabilityOutcome, stepErr error, prepared PreparedProcess, boundGroup model.GroupRef, launch LaunchContext) error {
 	switch durabilityDecision(outcome) {
 	case durabilityCommitted:
 		if stepErr == nil {
 			return nil
 		}
-		return controller.containGroupAndFailStop(ctx, group, durableMutationError(step, outcome, stepErr))
+		return controller.containGroupAndFailStop(ctx, boundGroup, durableMutationError(step, outcome, stepErr))
 	case durabilityNotCommitted:
-		return errors.Join(durableMutationError(step, outcome, stepErr), controller.abortPrepared(ctx, prepared, true, launch))
+		return errors.Join(durableMutationError(step, outcome, stepErr), controller.abortPrepared(ctx, prepared, &boundGroup, launch))
 	case durabilityUnknown:
-		return controller.containGroupAndFailStop(ctx, group, durableMutationError(step, outcome, stepErr))
+		return controller.containGroupAndFailStop(ctx, boundGroup, durableMutationError(step, outcome, stepErr))
 	default:
-		return controller.containGroupAndFailStop(ctx, group, durableMutationError(step, outcome, stepErr))
+		return controller.containGroupAndFailStop(ctx, boundGroup, durableMutationError(step, outcome, stepErr))
 	}
+}
+
+func durableGroup(group model.GroupRef, durable bool) *model.GroupRef {
+	if !durable {
+		return nil
+	}
+	return &group
+}
+
+func validateJobLocalPreparedAbortGroup(launch LaunchContext, boundGroup, preparedGroup model.GroupRef, abortErr, containErr error) error {
+	if err := validatePreparedGroup(launch, boundGroup); err != nil {
+		return fmt.Errorf("bound group identity is invalid: %w", err)
+	}
+	if err := validatePreparedGroup(launch, preparedGroup); err != nil {
+		return fmt.Errorf("prepared group identity is invalid: %w", err)
+	}
+	if !preparedGroup.Equal(boundGroup) {
+		return fmt.Errorf("prepared group identity changed after durable bind")
+	}
+	if err := validateRetainedObjectUnresolvedGroup("abort prepared process", abortErr, boundGroup); err != nil {
+		return err
+	}
+	if err := validateRetainedObjectUnresolvedGroup("contain prepared group", containErr, boundGroup); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateRetainedObjectUnresolvedGroup(step string, err error, boundGroup model.GroupRef) error {
+	if err == nil {
+		return nil
+	}
+	group, ok := retainedObjectUnresolvedGroup(err)
+	if !ok {
+		return nil
+	}
+	if !group.Equal(boundGroup) {
+		return fmt.Errorf("%s retained-object unresolved group does not match durable bound group", step)
+	}
+	return nil
+}
+
+func retainedObjectUnresolvedGroup(err error) (model.GroupRef, bool) {
+	var retained custodian.RetainedObjectReacquireUnresolvedError
+	if errors.As(err, &retained) {
+		return retained.Group, true
+	}
+	var retainedPtr *custodian.RetainedObjectReacquireUnresolvedError
+	if errors.As(err, &retainedPtr) && retainedPtr != nil {
+		return retainedPtr.Group, true
+	}
+	return model.GroupRef{}, false
 }
 
 func (controller *LaunchController) containGroupAndFailStop(ctx context.Context, group model.GroupRef, reason error) error {

@@ -661,6 +661,70 @@ func TestLaunchControllerPreGrantAbortUnresolvedAfterDurableBindDoesNotFailStop(
 	}
 }
 
+func TestLaunchControllerPreGrantAbortUnresolvedRequiresExactBoundGroup(t *testing.T) {
+	tests := []struct {
+		name        string
+		changeGroup bool
+		retainedErr func(bound, changed model.GroupRef) error
+	}{
+		{
+			name:        "prepared group changed",
+			changeGroup: true,
+			retainedErr: func(_ model.GroupRef, changed model.GroupRef) error {
+				return custodian.RetainedObjectReacquireUnresolvedError{
+					Group: changed,
+					Cause: errors.New("retained object disappeared before absence proof"),
+				}
+			},
+		},
+		{
+			name: "retained error group changed",
+			retainedErr: func(_ model.GroupRef, changed model.GroupRef) error {
+				return custodian.RetainedObjectReacquireUnresolvedError{
+					Group: changed,
+					Cause: errors.New("retained object disappeared before absence proof"),
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, "pre-grant-abort-exact-group-"+tt.name)
+			bound := h.group
+			changed := changedGroup(bound)
+			unresolved := tt.retainedErr(bound, changed)
+			h.authority.grantOutcome = DefinitelyNotCommitted
+			h.authority.afterBind = func(group model.GroupRef) {
+				if !group.Equal(bound) {
+					t.Fatalf("bound group = %+v, want %+v", group, bound)
+				}
+				if tt.changeGroup {
+					h.prepared.group = changed
+				}
+			}
+			h.prepared.abortErr = unresolved
+			h.custodian.containErr = unresolved
+
+			_, err := h.controller.Run(context.Background(), h.request(nil))
+			if err == nil {
+				t.Fatal("Run returned nil error for contradictory unresolved pre-grant abort")
+			}
+			if !physicalCleanupUnresolved(err) {
+				t.Fatalf("Run error = %v, want typed physical cleanup uncertainty", err)
+			}
+			if !errors.Is(err, ErrFailClosed) {
+				t.Fatalf("Run error = %v, want ErrFailClosed", err)
+			}
+			if h.authority.failStops != 1 {
+				t.Fatalf("fail stops = %d, want 1", h.authority.failStops)
+			}
+			if h.authority.recordQuiescenceCalls != 0 {
+				t.Fatalf("record quiescence calls = %d, want 0", h.authority.recordQuiescenceCalls)
+			}
+		})
+	}
+}
+
 func TestLaunchControllerPreGrantRecordQuiescenceFailuresFailStop(t *testing.T) {
 	committedErr := errors.New("quiescence observer failed")
 	tests := []struct {
@@ -1118,6 +1182,17 @@ func testGroup(launch LaunchContext, name string) model.GroupRef {
 	}
 }
 
+func changedGroup(group model.GroupRef) model.GroupRef {
+	group.CustodyID = group.CustodyID + "-changed"
+	group.PGID++
+	group.Leader.PID = group.PGID
+	group.Leader.HighResStartToken += "-changed"
+	group.Monitor.PID++
+	group.Monitor.HighResStartToken += "-changed"
+	group.RetainedID += "-changed"
+	return group
+}
+
 func sanitizeName(name string) string {
 	out := make([]byte, 0, len(name))
 	for i := 0; i < len(name); i++ {
@@ -1169,10 +1244,15 @@ type fakeAuthority struct {
 	recordReleaseCalls    int
 	recordQuiescenceCalls int
 	failStops             int
+
+	afterBind func(model.GroupRef)
 }
 
-func (authority *fakeAuthority) BindGroup(context.Context, model.JobID, model.AttemptRef, model.LaunchOrdinal, model.GroupRef) (DurabilityOutcome, error) {
+func (authority *fakeAuthority) BindGroup(_ context.Context, _ model.JobID, _ model.AttemptRef, _ model.LaunchOrdinal, group model.GroupRef) (DurabilityOutcome, error) {
 	authority.events.add("bind_group")
+	if authority.afterBind != nil {
+		authority.afterBind(group)
+	}
 	return authority.bindOutcome, authority.bindErr
 }
 

@@ -578,6 +578,46 @@ func TestExecutionImpossibleTerminalDoesNotRequireQuiescence(t *testing.T) {
 	}
 }
 
+func TestCorruptProjectionTerminalRequiresRetiredPreparedGroup(t *testing.T) {
+	record := reducerSupervisorRecord()
+	if _, err := DeriveTerminalCertificate(record, TerminalIntent{
+		Outcome: OutcomeQuarantined,
+		Cause:   CauseCorruptProjection,
+	}); !errors.Is(err, ErrCommandPrecondition) {
+		t.Fatalf("DeriveTerminalCertificate corrupt projection without retirement error = %v, want ErrCommandPrecondition", err)
+	}
+
+	forged := record
+	forged.Terminal = &TerminalCertificate{
+		JobID:               forged.JobID,
+		Attempt:             forged.Attempt.Ref,
+		Outcome:             OutcomeQuarantined,
+		Proof:               ProofNeverPermittedAndRetired,
+		Cause:               CauseCorruptProjection,
+		DerivedFromRevision: forged.Revision,
+		DerivedBy:           forged.AdmittedBy,
+	}
+	if err := ValidateSafetyRecord(forged); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("forged corrupt projection no-quiescence terminal error = %v, want ErrInvalidValue", err)
+	}
+
+	retired := reducerRetiredRecord(t, record)
+	certificate, err := DeriveTerminalCertificate(retired, TerminalIntent{
+		Outcome: OutcomeQuarantined,
+		Cause:   CauseCorruptProjection,
+	})
+	if err != nil {
+		t.Fatalf("DeriveTerminalCertificate corrupt projection after retirement error = %v", err)
+	}
+	if certificate.Proof != ProofContained {
+		t.Fatalf("corrupt projection proof = %s, want %s", certificate.Proof, ProofContained)
+	}
+	retired.Terminal = &certificate
+	if err := ValidateSafetyRecord(retired); err != nil {
+		t.Fatalf("ValidateSafetyRecord retired corrupt projection error = %v", err)
+	}
+}
+
 func TestReleaseTerminalCausesRequireDurableLaunchFact(t *testing.T) {
 	ackedQuiescent := reducerQuiescentRecord(t)
 	if _, err := DeriveTerminalCertificate(ackedQuiescent, TerminalIntent{

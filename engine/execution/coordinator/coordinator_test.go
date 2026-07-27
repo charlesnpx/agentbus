@@ -551,6 +551,49 @@ func TestRecoverUnresolvedFinalizeFailureStillFailStops(t *testing.T) {
 	}
 }
 
+func TestRecoverUnresolvedFinalizeFailureDuringCancellationStillFailStops(t *testing.T) {
+	parent := context.Background()
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	h := newHarness(t, "unresolved-finalize-failure-during-cancel")
+	accepted := h.submit(t, parent, "unresolved-finalize-failure-during-cancel")
+	h.bindGrantRelease(t, parent, accepted, model.LaunchOrdinalOne)
+	h.containment.unresolvedOrdinals = map[model.LaunchOrdinal]bool{model.LaunchOrdinalOne: true}
+	finalizeErr := errors.New("finalize commit failed")
+	auth := &cancelingFinalizeErrAuthority{
+		readyAuthority: h.authority,
+		cancel:         cancel,
+		err:            finalizeErr,
+	}
+	coord, err := New(auth, h.containment, h.results, model.OwnerID("coordinator-unresolved-finalize-failure-during-cancel"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = coord.Recover(ctx, accepted.Record.JobID, model.RecoveryLiveLoss, nil)
+	if !errors.Is(err, finalizeErr) {
+		t.Fatalf("Recover error = %v, want finalize error", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("Recover error = %v, want genuine finalize error not cancellation abort", err)
+	}
+	if !h.authority.failStopped {
+		t.Fatal("authority was not fail-stopped after non-cancellation finalization failure during cancellation")
+	}
+	if err := h.repo.View(parent, func(tx repository.ReadTx) error {
+		image := tx.LoadJob(accepted.Record.JobID)
+		if image.Safety.State != repository.RecordValid {
+			t.Fatalf("safety state = %s, want valid", image.Safety.State)
+		}
+		if image.Safety.Value.Terminal != nil {
+			t.Fatalf("terminal = %+v, want none after failed finalization", image.Safety.Value.Terminal)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCompleteContradictoryOpenOutcomeConflictIsNotReconciledByLaterTerminal(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, "open-outcome-conflict")
@@ -991,6 +1034,17 @@ type finalizeErrAuthority struct {
 }
 
 func (a *finalizeErrAuthority) Finalize(context.Context, model.JobID, model.AttemptRef, model.TerminalIntent) (StepResult, error) {
+	return StepResult{}, a.err
+}
+
+type cancelingFinalizeErrAuthority struct {
+	*readyAuthority
+	cancel func()
+	err    error
+}
+
+func (a *cancelingFinalizeErrAuthority) Finalize(context.Context, model.JobID, model.AttemptRef, model.TerminalIntent) (StepResult, error) {
+	a.cancel()
 	return StepResult{}, a.err
 }
 

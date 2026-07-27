@@ -73,13 +73,10 @@ func deriveTerminalProof(record SafetyRecord, intent TerminalIntent) (TerminalPr
 		}
 		return ProofLegacyUnfencedOutcome, nil
 	}
-	if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
-		if !validNeverPermittedIntent(intent) {
-			return 0, precondition("terminal intent is incompatible with never-permitted proof")
-		}
+	if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) && validNeverPermittedIntent(intent) {
 		return ProofNeverPermittedAndRetired, nil
 	}
-	if allLaunchGroupsQuiescent(record.Attempt) && validContainedIntent(record, intent) {
+	if hasAnyLaunchEvidence(record.Attempt) && allLaunchGroupsQuiescent(record.Attempt) && validContainedIntent(record, intent) {
 		return ProofContained, nil
 	}
 	if cleanQuiescentOutcomeAndRetired(record, intent) {
@@ -125,8 +122,6 @@ func validNeverPermittedIntent(intent TerminalIntent) bool {
 		return intent.Outcome == OutcomeCanceled
 	case CauseDaemonRestartedBeforeAuthorization, CauseSupervisorLostBeforeAuthorization:
 		return intent.Outcome == OutcomeFailed
-	case CauseCorruptProjection:
-		return intent.Outcome == OutcomeQuarantined
 	default:
 		return false
 	}
@@ -140,8 +135,6 @@ func validExecutionImpossibleIntent(record SafetyRecord, intent TerminalIntent) 
 	case CauseCanceledBeforeAuthorization,
 		CauseDaemonRestartedBeforeAuthorization,
 		CauseSupervisorLostBeforeAuthorization:
-		return !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) && validNeverPermittedIntent(intent)
-	case CauseCorruptProjection:
 		return !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) && validNeverPermittedIntent(intent)
 	case CauseReleaseDefinitelyNotSent:
 		return intent.Outcome == OutcomeFailed
