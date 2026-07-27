@@ -478,6 +478,16 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 	if snapshot.Record.Terminal != nil {
 		return nil
 	}
+	if admissionRunHasRequestedCancel(run, state) {
+		if err := coord.Cancel(context.Background(), jobID, nil); err != nil {
+			snapshot, snapshotErr := coord.Snapshot(context.Background(), jobID)
+			if snapshotErr == nil && admissionRecordTerminalCanceledByRequest(snapshot.Record) {
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
 	outcome, ok := admissionOutcomeForState(state)
 	if !ok {
 		return fmt.Errorf("cannot complete admission job %s with state %s", run.jobID, state)
@@ -489,6 +499,12 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		return coord.Finalize(context.Background(), jobID, intent)
 	}
 	return coord.Complete(context.Background(), jobID, outcome, []byte(text), nil)
+}
+
+func admissionRunHasRequestedCancel(run jobRun, state engine.JobState) bool {
+	return state == engine.StateCanceled &&
+		run.active != nil &&
+		run.active.requestedTerminal() == engine.StateCanceled
 }
 
 func admissionRecordedReleaseTerminalIntent(record model.SafetyRecord) (model.TerminalIntent, bool, error) {

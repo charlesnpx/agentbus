@@ -3341,6 +3341,173 @@ func TestAuthorityJobCancelHeldStartPostReleasePreRegistration(t *testing.T) {
 	}
 }
 
+func TestAuthorityJobCancelInterruptRaceTerminalizesCanceled(t *testing.T) {
+	t.Run("runner finalizes before handler cancel completes", func(t *testing.T) {
+		holdNaturalExit := make(chan struct{})
+		defer close(holdNaturalExit)
+		releaseRunner := make(chan struct{})
+		var releaseRunnerOnce sync.Once
+		releaseRun := func() { releaseRunnerOnce.Do(func() { close(releaseRunner) }) }
+		defer releaseRun()
+
+		backend := newFakeBackend("fake")
+		backend.started = make(chan struct{}, 1)
+		backend.block = releaseRunner
+		server, _, cwd := newUnstartedTestServer(t, backend)
+		launcher := newAdmissionFakeLaunchCustodian(t)
+		launcher.waitAndVerify = holdNaturalExit
+		enableTestAdmission(t, server, launcher)
+		finalizes := installRecordingAdmissionAuthorityForTest(t, server)
+
+		firstRequestCancel := make(chan struct{})
+		secondRequestCancel := make(chan struct{})
+		allowFirstRequestCancel := make(chan struct{})
+		var requestCancels atomic.Int32
+		var releaseFirstOnce sync.Once
+		releaseFirstRequestCancel := func() {
+			releaseFirstOnce.Do(func() { close(allowFirstRequestCancel) })
+		}
+		defer releaseFirstRequestCancel()
+		finalizes.beforeRequestCancel = func(ctx context.Context, jobID model.JobID) error {
+			switch requestCancels.Add(1) {
+			case 1:
+				close(firstRequestCancel)
+				select {
+				case <-allowFirstRequestCancel:
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(5 * time.Second):
+					return errors.New("held first request cancel timed out")
+				}
+			case 2:
+				close(secondRequestCancel)
+			}
+			return nil
+		}
+
+		conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+			WorkspaceKey: "workspace-authority-cancel-interrupt-race",
+			RequestID:    "request-authority-cancel-interrupt-race",
+			TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+		}, nil)
+		resp := responseFromScriptedConn(t, conn)
+		var submitted protocol.JobSubmitResult
+		decodeResult(t, resp, &submitted)
+		waitBackendStarted(t, backend)
+
+		cancelDone := make(chan requestOutcome, 1)
+		go func() {
+			cancelDone <- server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: submitted.JobID}))
+		}()
+
+		select {
+		case <-firstRequestCancel:
+		case <-time.After(time.Second):
+			t.Fatal("handler cancel did not enter RequestCancel")
+		}
+		releaseRun()
+		select {
+		case <-secondRequestCancel:
+		case <-time.After(time.Second):
+			t.Fatal("runner finalization did not enter cancel-derived RequestCancel")
+		}
+
+		record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+		if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority terminal = %+v, want canceled after authorization", record.Terminal)
+		}
+		if record.Cancel == nil {
+			t.Fatalf("cancel fact missing after runner finalization: %+v", record)
+		}
+		if reason := server.safetyLatch.Reason(); reason != nil {
+			t.Fatalf("safety latch tripped: %v", reason)
+		}
+		select {
+		case outcome := <-cancelDone:
+			t.Fatalf("handler cancel completed before its held RequestCancel was released: %+v", outcome)
+		default:
+		}
+
+		releaseFirstRequestCancel()
+		select {
+		case outcome := <-cancelDone:
+			if outcome.err != nil {
+				t.Fatalf("job.cancel error = %+v", outcome.err)
+			}
+			canceled, ok := outcome.result.(protocol.JobCancelResult)
+			if !ok {
+				t.Fatalf("job.cancel result type = %T", outcome.result)
+			}
+			if canceled.JobID != submitted.JobID || canceled.State != engine.StateCanceled {
+				t.Fatalf("job.cancel result = %+v, want canceled job %s", canceled, submitted.JobID)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("handler cancel did not finish after held RequestCancel was released")
+		}
+		waitActiveJobGone(t, server, submitted.JobID)
+		intents := finalizes.finalizeIntents()
+		if len(intents) != 1 || intents[0].Outcome != model.OutcomeCanceled || intents[0].Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority finalize intents = %+v, want exactly one canceled-after-authorization terminal", intents)
+		}
+		if reason := server.safetyLatch.Reason(); reason != nil {
+			t.Fatalf("safety latch tripped after handler cancel completed: %v", reason)
+		}
+	})
+
+	t.Run("handler cancel finalizes before runner", func(t *testing.T) {
+		holdNaturalExit := make(chan struct{})
+		defer close(holdNaturalExit)
+		releaseRunner := make(chan struct{})
+		var releaseRunnerOnce sync.Once
+		releaseRun := func() { releaseRunnerOnce.Do(func() { close(releaseRunner) }) }
+		defer releaseRun()
+
+		backend := newFakeBackend("fake")
+		backend.started = make(chan struct{}, 1)
+		backend.block = releaseRunner
+		server, _, cwd := newUnstartedTestServer(t, backend)
+		launcher := newAdmissionFakeLaunchCustodian(t)
+		launcher.waitAndVerify = holdNaturalExit
+		enableTestAdmission(t, server, launcher)
+		finalizes := installRecordingAdmissionAuthorityForTest(t, server)
+
+		conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+			WorkspaceKey: "workspace-authority-cancel-handler-first",
+			RequestID:    "request-authority-cancel-handler-first",
+			TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+		}, nil)
+		resp := responseFromScriptedConn(t, conn)
+		var submitted protocol.JobSubmitResult
+		decodeResult(t, resp, &submitted)
+		waitBackendStarted(t, backend)
+
+		canceled := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: submitted.JobID})
+		if canceled.JobID != submitted.JobID || canceled.State != engine.StateCanceled {
+			t.Fatalf("job.cancel result = %+v, want canceled job %s", canceled, submitted.JobID)
+		}
+		record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+		if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority terminal = %+v, want canceled after authorization", record.Terminal)
+		}
+		if reason := server.safetyLatch.Reason(); reason != nil {
+			t.Fatalf("safety latch tripped: %v", reason)
+		}
+		releaseRun()
+		waitActiveJobGone(t, server, submitted.JobID)
+		after := loadAdmissionSafetyRecord(t, server, submitted.JobID)
+		if after.Terminal == nil || after.Terminal.Outcome != model.OutcomeCanceled || after.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority terminal after runner resumed = %+v, want unchanged canceled terminal", after.Terminal)
+		}
+		intents := finalizes.finalizeIntents()
+		if len(intents) != 1 || intents[0].Outcome != model.OutcomeCanceled || intents[0].Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority finalize intents = %+v, want exactly one canceled-after-authorization terminal", intents)
+		}
+		if reason := server.safetyLatch.Reason(); reason != nil {
+			t.Fatalf("safety latch tripped after runner resumed: %v", reason)
+		}
+	})
+}
+
 func TestAdmissionActiveRunnerInterruptsCommandForAuthorityCancel(t *testing.T) {
 	t.Parallel()
 	t.Run("later cancel", func(t *testing.T) {
@@ -6836,8 +7003,19 @@ func newPriorBootAuthorityWork(t *testing.T, repo *memory.Repository, anchorStor
 type recordingAdmissionAuthority struct {
 	*servedAdmissionAuthority
 
+	beforeRequestCancel func(context.Context, model.JobID) error
+
 	mu              sync.Mutex
 	finalizeRecords []model.TerminalIntent
+}
+
+func (a *recordingAdmissionAuthority) RequestCancel(ctx context.Context, jobID model.JobID) (coordinator.StepResult, error) {
+	if a.beforeRequestCancel != nil {
+		if err := a.beforeRequestCancel(ctx, jobID); err != nil {
+			return coordinator.StepResult{}, err
+		}
+	}
+	return a.servedAdmissionAuthority.RequestCancel(ctx, jobID)
 }
 
 func (a *recordingAdmissionAuthority) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent) (coordinator.StepResult, error) {

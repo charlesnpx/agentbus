@@ -2183,6 +2183,11 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 			return coord.Cancel(context.Background(), model.JobID(jobID), nil)
 		})
 		if err != nil {
+			var reloadErr *protocol.ErrorObject
+			record, projection, ok, reloadErr = s.authorityJobProjection(jobID)
+			if reloadErr == nil && ok && admissionRecordTerminalCanceledByRequest(record) {
+				return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
+			}
 			return requestOutcome{err: admissionProtocolError(err)}
 		}
 		var reloadErr *protocol.ErrorObject
@@ -2195,6 +2200,18 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 		}
 	}
 	return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
+}
+
+func admissionRecordTerminalCanceledByRequest(record model.SafetyRecord) bool {
+	if record.Cancel == nil || record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled {
+		return false
+	}
+	switch record.Terminal.Cause {
+	case model.CauseCanceledBeforeAuthorization, model.CauseCanceledAfterAuthorization:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) handlePolicyValidate(raw json.RawMessage) requestOutcome {
