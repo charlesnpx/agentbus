@@ -259,6 +259,14 @@ func PlanRecovery(record SafetyRecord, trigger RecoveryTrigger) (RecoveryPlan, e
 	}
 
 	intent := recoveryTerminalIntent(record, trigger)
+	if trigger != RecoveryShutdown && needsContainment(record, trigger) && !allLaunchGroupsQuiescent(record.Attempt) {
+		if !hasPreparedLaunch(record.Attempt) {
+			plan.Next = RecoveryAction{Kind: RecoveryFatalUnprovable}
+			return plan, nil
+		}
+		plan.Next = RecoveryAction{Kind: RecoveryContainThenFinalize}
+		return plan, nil
+	}
 	if finalizable(record, intent) {
 		finalize := Finalize{Ref: record.Attempt.Ref, Intent: intent}
 		plan.Next = RecoveryAction{Kind: RecoveryFinalizeCertified, Finalize: &finalize}
@@ -308,8 +316,12 @@ func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger) Termin
 		return intent
 	}
 	if cause, ok := recordedReleaseFailureCause(record.Attempt); ok {
-		intent.Outcome = OutcomeFailed
 		intent.Cause = cause
+		if cause == CauseReleaseOutcomeUnknown {
+			intent.Outcome = OutcomeReaped
+		} else {
+			intent.Outcome = OutcomeFailed
+		}
 		return intent
 	}
 	// Without recorded outcome progress, recovery synthesizes OutcomeReaped only

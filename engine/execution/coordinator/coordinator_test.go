@@ -59,22 +59,30 @@ func TestAuthorityLifecycleCompletesFromLiveLaunchFacts(t *testing.T) {
 	}
 }
 
-func TestCompleteDoesNotCertifyQuiescence(t *testing.T) {
+func TestCompleteWithoutQuiescenceTerminalizesUnresolved(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, "complete-no-certify")
 	accepted := h.submit(t, ctx, "complete-no-certify")
 	h.bindGrantRelease(t, ctx, accepted, model.LaunchOrdinalOne)
 
-	err := h.coordinator.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil)
-	if err == nil {
-		t.Fatal("Complete succeeded without live quiescence")
+	if err := h.coordinator.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil); err != nil {
+		t.Fatal(err)
 	}
 	if h.containment.contained != 0 || h.containment.retired != 0 {
 		t.Fatalf("launch containment calls = contain:%d retire:%d, want 0/0", h.containment.contained, h.containment.retired)
 	}
 	snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
-	if snapshot.Record.Terminal != nil {
-		t.Fatalf("terminal = %+v, want none without quiescence", snapshot.Record.Terminal)
+	if snapshot.Record.Terminal == nil {
+		t.Fatal("terminal certificate missing")
+	}
+	if snapshot.Record.Terminal.Outcome != model.OutcomeCompleted {
+		t.Fatalf("outcome = %s, want %s", snapshot.Record.Terminal.Outcome, model.OutcomeCompleted)
+	}
+	if snapshot.Record.Terminal.Proof != model.ProofUnresolvedAbsence {
+		t.Fatalf("proof = %s, want %s", snapshot.Record.Terminal.Proof, model.ProofUnresolvedAbsence)
+	}
+	if got := model.DeriveCleanupDisposition(snapshot.Record); got != model.CleanupDispositionUnresolved {
+		t.Fatalf("cleanup = %s, want %s", got, model.CleanupDispositionUnresolved)
 	}
 	first, ok := snapshot.Record.Attempt.Launches.Get(model.LaunchOrdinalOne)
 	if !ok || first.Quiescence != nil {

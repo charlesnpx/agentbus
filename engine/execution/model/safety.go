@@ -341,6 +341,9 @@ func (record SafetyRecord) validateOptionalFacts() error {
 		if err := record.validateTerminalProofSupport(); err != nil {
 			return err
 		}
+		if err := record.validateTerminalCompatibility(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -388,26 +391,39 @@ func (record SafetyRecord) validateTerminalProofSupport() error {
 		if !fencedMode(record.Mode) {
 			return invalid("terminal.proof", "unresolved proof requires fenced mode")
 		}
-		if !unresolvedAbsenceCause(record.Terminal.Cause) {
-			return invalid("terminal.proof", "unresolved proof requires post-authorization orphan cause")
-		}
 		if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
 			return invalid("terminal.proof", "unresolved proof requires authorization evidence")
 		}
 		if allLaunchGroupsQuiescent(record.Attempt) {
 			return invalid("terminal.proof", "unresolved proof requires absence not proven")
 		}
-		if record.Outcome == nil {
-			if record.Terminal.Outcome != OutcomeOrphaned {
-				return invalid("terminal.outcome", "unresolved proof without observed outcome requires orphaned outcome")
-			}
-			break
-		}
-		if !unresolvedPreservedOutcome(record.Terminal.Outcome) {
-			return invalid("terminal.outcome", "unresolved proof cannot use this observed outcome")
-		}
 	default:
 		return invalid("terminal.proof", "is unknown")
+	}
+	return nil
+}
+
+func (record SafetyRecord) validateTerminalCompatibility() error {
+	if record.Terminal == nil {
+		return nil
+	}
+	intent := TerminalIntent{
+		Outcome: record.Terminal.Outcome,
+		Cause:   record.Terminal.Cause,
+	}
+	if record.Terminal.Outcome == OutcomeOrphaned {
+		if record.Outcome != nil {
+			return invalid("terminal.outcome", "orphaned requires no observed outcome")
+		}
+		if record.Terminal.Proof != ProofUnresolvedAbsence {
+			return invalid("terminal.proof", "orphaned requires unresolved absence proof")
+		}
+		if !orphanedOutcomeCause(record.Terminal.Cause) {
+			return invalid("terminal.cause", "orphaned requires after-authorization or unknown-release cause")
+		}
+	}
+	if !validTerminalCompatibility(record, intent, record.Terminal.Proof) {
+		return invalid("terminal.cause_outcome_basis", "is not permitted")
 	}
 	return nil
 }

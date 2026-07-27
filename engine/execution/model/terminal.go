@@ -22,6 +22,9 @@ func DeriveTerminalCertificate(record SafetyRecord, intent TerminalIntent) (Term
 	if err != nil {
 		return TerminalCertificate{}, err
 	}
+	if !validTerminalCompatibility(record, intent, proof) {
+		return TerminalCertificate{}, precondition("terminal intent is incompatible with cause/outcome/proof table")
+	}
 	return TerminalCertificate{
 		JobID:               record.JobID,
 		Attempt:             record.Attempt.Ref,
@@ -65,6 +68,9 @@ func deriveTerminalProof(record SafetyRecord, intent TerminalIntent) (TerminalPr
 		if hasAnyLaunchEvidence(record.Attempt) {
 			return 0, precondition("legacy unfenced terminal proof requires no launch evidence")
 		}
+		if !validLegacyUnfencedIntent(record, intent) {
+			return 0, precondition("terminal intent is incompatible with legacy-unfenced proof")
+		}
 		return ProofLegacyUnfencedOutcome, nil
 	}
 	if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
@@ -76,7 +82,7 @@ func deriveTerminalProof(record SafetyRecord, intent TerminalIntent) (TerminalPr
 		}
 		return ProofNeverPermittedAndRetired, nil
 	}
-	if allLaunchGroupsQuiescent(record.Attempt) && validContainedIntent(intent) {
+	if allLaunchGroupsQuiescent(record.Attempt) && validContainedIntent(record, intent) {
 		return ProofContained, nil
 	}
 	if cleanQuiescentOutcomeAndRetired(record, intent) {
@@ -115,7 +121,7 @@ func cleanTerminalOutcome(outcome Outcome) bool {
 
 func validNeverPermittedIntent(intent TerminalIntent) bool {
 	switch intent.Cause {
-	case CauseCanceledBeforeAuthorization, CauseResponseUndeliverable:
+	case CauseCanceledBeforeAuthorization:
 		return intent.Outcome == OutcomeCanceled
 	case CauseDaemonRestartedBeforeAuthorization, CauseSupervisorLostBeforeAuthorization:
 		return intent.Outcome == OutcomeFailed
@@ -126,7 +132,20 @@ func validNeverPermittedIntent(intent TerminalIntent) bool {
 	}
 }
 
-func validContainedIntent(intent TerminalIntent) bool {
+func validContainedIntent(record SafetyRecord, intent TerminalIntent) bool {
+	if record.Outcome != nil &&
+		record.Outcome.Outcome == intent.Outcome &&
+		recordedOutcomeCausePermitsIntent(intent.Cause, intent.Outcome) {
+		switch intent.Cause {
+		case CauseResponseUndeliverable,
+			CauseCanceledAfterAuthorization,
+			CauseDaemonRestartedAfterAuthorization,
+			CauseSupervisorLostAfterAuthorization,
+			CauseReleaseOutcomeUnknown,
+			CauseCorruptProjection:
+			return true
+		}
+	}
 	switch intent.Cause {
 	case CauseCanceledAfterAuthorization:
 		return intent.Outcome == OutcomeCanceled
@@ -134,7 +153,9 @@ func validContainedIntent(intent TerminalIntent) bool {
 		return intent.Outcome == OutcomeReaped
 	case CauseCorruptProjection:
 		return intent.Outcome == OutcomeQuarantined
-	case CauseReleaseOutcomeUnknown, CauseReleaseDefinitelyNotSent:
+	case CauseReleaseOutcomeUnknown:
+		return intent.Outcome == OutcomeReaped
+	case CauseReleaseDefinitelyNotSent:
 		return intent.Outcome == OutcomeFailed
 	default:
 		return false
@@ -142,9 +163,6 @@ func validContainedIntent(intent TerminalIntent) bool {
 }
 
 func validUnresolvedAbsenceIntent(record SafetyRecord, intent TerminalIntent) bool {
-	if !unresolvedAbsenceCause(intent.Cause) {
-		return false
-	}
 	if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
 		return false
 	}
@@ -152,26 +170,87 @@ func validUnresolvedAbsenceIntent(record SafetyRecord, intent TerminalIntent) bo
 		return false
 	}
 	if intent.Outcome == OutcomeOrphaned {
-		return record.Outcome == nil
+		return record.Outcome == nil && orphanedOutcomeCause(intent.Cause)
 	}
-	if record.Outcome == nil || record.Outcome.Outcome != intent.Outcome {
+	if intent.Outcome == OutcomeReaped {
 		return false
 	}
-	return unresolvedPreservedOutcome(intent.Outcome)
+	if record.Outcome != nil {
+		return record.Outcome.Outcome == intent.Outcome &&
+			recordedOutcomeCausePermitsIntent(intent.Cause, intent.Outcome)
+	}
+	return intent.Cause == CauseCanceledAfterAuthorization && intent.Outcome == OutcomeCanceled
 }
 
-func unresolvedAbsenceCause(cause TerminalCause) bool {
+func orphanedOutcomeCause(cause TerminalCause) bool {
 	switch cause {
-	case CauseDaemonRestartedAfterAuthorization, CauseSupervisorLostAfterAuthorization:
+	case CauseDaemonRestartedAfterAuthorization, CauseSupervisorLostAfterAuthorization, CauseReleaseOutcomeUnknown:
 		return true
 	default:
 		return false
 	}
 }
 
-func unresolvedPreservedOutcome(outcome Outcome) bool {
+func validLegacyUnfencedIntent(record SafetyRecord, intent TerminalIntent) bool {
+	if intent.Outcome == OutcomeOrphaned || intent.Outcome == OutcomeReaped {
+		return false
+	}
+	if record.Outcome != nil {
+		return record.Outcome.Outcome == intent.Outcome &&
+			recordedOutcomeCausePermitsIntent(intent.Cause, intent.Outcome)
+	}
+	return validNeverPermittedIntent(intent)
+}
+
+func validTerminalCompatibility(record SafetyRecord, intent TerminalIntent, proof TerminalProof) bool {
+	switch proof {
+	case ProofNeverPermittedAndRetired:
+		return validNeverPermittedIntent(intent)
+	case ProofCleanQuiescentOutcomeAndRetired:
+		return cleanQuiescentOutcomeAndRetired(record, intent)
+	case ProofContained:
+		return validContainedIntent(record, intent)
+	case ProofLegacyUnfencedOutcome:
+		return validLegacyUnfencedIntent(record, intent)
+	case ProofUnresolvedAbsence:
+		return validUnresolvedAbsenceIntent(record, intent)
+	default:
+		return false
+	}
+}
+
+func recordedOutcomeCausePermitsIntent(cause TerminalCause, outcome Outcome) bool {
+	switch cause {
+	case CauseCompletedNormally:
+		return cleanTerminalOutcome(outcome)
+	case CauseResponseUndeliverable:
+		return recordedExecutionOutcome(outcome)
+	case CauseCanceledAfterAuthorization:
+		return outcome == OutcomeCanceled
+	case CauseDaemonRestartedAfterAuthorization, CauseSupervisorLostAfterAuthorization, CauseReleaseOutcomeUnknown:
+		return recordedExecutionOutcome(outcome)
+	case CauseCorruptProjection:
+		return outcome == OutcomeQuarantined
+	default:
+		return false
+	}
+}
+
+func recordedExecutionOutcome(outcome Outcome) bool {
 	switch outcome {
 	case OutcomeCompleted, OutcomeCompletedNoncompliant, OutcomeFailed, OutcomeTimedOut, OutcomeInterrupted, OutcomeCanceled:
+		return true
+	default:
+		return false
+	}
+}
+
+func executionImpossibleCause(cause TerminalCause) bool {
+	switch cause {
+	case CauseReleaseDefinitelyNotSent,
+		CauseCanceledBeforeAuthorization,
+		CauseDaemonRestartedBeforeAuthorization,
+		CauseSupervisorLostBeforeAuthorization:
 		return true
 	default:
 		return false

@@ -25,14 +25,25 @@ func DeriveCleanupDisposition(record SafetyRecord) CleanupDisposition {
 	if record.Terminal == nil {
 		return ""
 	}
+	if executionImpossibleCause(record.Terminal.Cause) {
+		return CleanupDispositionNoExecutionPossible
+	}
 	switch record.Terminal.Proof {
 	case ProofUnresolvedAbsence:
 		return CleanupDispositionUnresolved
-	case ProofNeverPermittedAndRetired:
+	case ProofLegacyUnfencedOutcome, ProofNeverPermittedAndRetired:
 		return CleanupDispositionNoExecutionPossible
-	}
-	if allLaunchGroupsQuiescent(record.Attempt) {
-		return CleanupDispositionVerifiedAbsent
+	case ProofCleanQuiescentOutcomeAndRetired:
+		if cleanQuiescentOutcomeAndRetired(record, TerminalIntent{
+			Outcome: record.Terminal.Outcome,
+			Cause:   record.Terminal.Cause,
+		}) {
+			return CleanupDispositionVerifiedAbsent
+		}
+	case ProofContained:
+		if hasAnyLaunchEvidence(record.Attempt) && hasAnyQuiescence(record.Attempt) && allLaunchGroupsQuiescent(record.Attempt) {
+			return CleanupDispositionVerifiedAbsent
+		}
 	}
 	return CleanupDispositionUnresolved
 }
