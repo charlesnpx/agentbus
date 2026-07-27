@@ -2477,11 +2477,10 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		backendSessionID = run.session.ID()
 	}
 	_, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
-		salvageReaped := run.authoritativeCompletion && record.State == engine.StateReaped && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant)
-		if engine.IsTerminal(record.State) && !salvageReaped {
+		lateFinalization := run.authoritativeCompletion && canLateFinalize(record.State, state)
+		if engine.IsTerminal(record.State) && !lateFinalization {
 			return false, nil
 		}
-		lateFinalization := run.authoritativeCompletion && record.State == engine.StateOrphaned && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant || state == engine.StateFailed) || salvageReaped
 		var result *engine.ResultInfo
 		if state == engine.StateCompleted || state == engine.StateCompletedNoncompliant {
 			if text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
@@ -2494,7 +2493,7 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 			info.ModelReported = record.ModelReported
 			result = &info
 		}
-		if salvageReaped {
+		if lateFinalization && record.State == engine.StateReaped {
 			if err := record.Transition(state, s.clock.Now().UTC()); err != nil {
 				return false, err
 			}
@@ -2521,6 +2520,17 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		return err
 	}
 	return nil
+}
+
+func canLateFinalize(from, to engine.JobState) bool {
+	switch from {
+	case engine.StateOrphaned:
+		return to == engine.StateCompleted || to == engine.StateCompletedNoncompliant || to == engine.StateFailed
+	case engine.StateReaped:
+		return to == engine.StateCompleted || to == engine.StateCompletedNoncompliant
+	default:
+		return false
+	}
 }
 
 func (s *Server) heartbeat(store *engine.Store, jobID string, done <-chan struct{}) {

@@ -2378,15 +2378,23 @@ func admissionState(state model.PublicState) engine.JobState {
 	return engine.JobState(state.String())
 }
 
+func admissionCleanupDisposition(record model.SafetyRecord) string {
+	if record.Terminal == nil {
+		return ""
+	}
+	return model.DeriveCleanupDisposition(record).String()
+}
+
 func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *protocol.ErrorObject) {
-	_, projection, ok, errObj := s.authorityJobProjection(jobID)
+	record, projection, ok, errObj := s.authorityJobProjection(jobID)
 	if !ok || errObj != nil {
 		return protocol.JobStatus{}, ok, errObj
 	}
 	return protocol.JobStatus{
-		JobID:     projection.JobID.String(),
-		SessionID: projection.SessionID,
-		State:     admissionState(projection.Public),
+		JobID:              projection.JobID.String(),
+		SessionID:          projection.SessionID,
+		State:              admissionState(projection.Public),
+		CleanupDisposition: admissionCleanupDisposition(record),
 	}, true, nil
 }
 
@@ -2436,10 +2444,11 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 		result = s.authorityResultInfo(*record.Terminal.Result)
 	}
 	return protocol.JobResult{
-		JobID:     projection.JobID.String(),
-		SessionID: projection.SessionID,
-		State:     admissionState(projection.Public),
-		Result:    result,
+		JobID:              projection.JobID.String(),
+		SessionID:          projection.SessionID,
+		State:              admissionState(projection.Public),
+		CleanupDisposition: admissionCleanupDisposition(record),
+		Result:             result,
 	}, true, nil
 }
 
@@ -2497,9 +2506,10 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 	}
 	projection := image.Projection.Value
 	return protocol.JobStatus{
-		JobID:     projection.JobID.String(),
-		SessionID: projection.SessionID,
-		State:     admissionState(projection.Public),
+		JobID:              projection.JobID.String(),
+		SessionID:          projection.SessionID,
+		State:              admissionState(projection.Public),
+		CleanupDisposition: admissionCleanupDisposition(image.Safety.Value),
 	}, true, nil
 }
 

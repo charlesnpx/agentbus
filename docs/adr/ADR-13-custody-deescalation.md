@@ -168,10 +168,14 @@ The public `job.result` still MUST NOT serialize physical proof. The additive
 
 Terminal `orphaned` is a TERMINAL job state and MUST carry its OWN CLI exit code, distinct
 from the generic nonterminal `2` a client reads as "still running". The frozen exit code
-for terminal `orphaned` is **10** (`ExitCodeForState` in engine/job.go); code `2` is
-retired from meaning "orphaned". `IsTerminal` MUST report `StateOrphaned` as terminal and
-client terminal-wait MUST stop on it. The public protocol reference (docs/protocol.md,
-updated in U7) MUST reflect terminal `orphaned` and exit code 10.
+for terminal `orphaned` is **14** (`ExitCodeForState` in engine/job.go). Codes 10-13 are
+already assigned (unknown-job=10, daemon-startup-failure=11, fail-stop=12,
+shutdown-deadline=13), so 14 is the next unused code; code `2` is retired from meaning
+"orphaned". The full terminal map is: completed=0, completed_noncompliant=3, failed=4,
+timed_out=5, interrupted=6, canceled=7, reaped=8, quarantined=9, orphaned=14. `IsTerminal`
+MUST report `StateOrphaned` as terminal and client terminal-wait MUST stop on it. The
+public protocol reference (docs/protocol.md, updated in U7) MUST reflect terminal
+`orphaned` and exit code 14.
 
 ### Corruption and fail-stop scope
 

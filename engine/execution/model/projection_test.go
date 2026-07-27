@@ -5,7 +5,7 @@ import "testing"
 func TestProjectionEnumsMatchProtocolStrings(t *testing.T) {
 	assertStrings(t, "Decision", decisionsToStrings(AllDecisions()), []string{"accepted", "awaiting_ack", "cancel_requested", "terminal"})
 	assertStrings(t, "Dispatch", dispatchesToStrings(AllDispatches()), []string{"none", "scheduled", "supervisor_prepared", "permit_granted", "active", "reconciling", "contained", "result_publishing", "done"})
-	assertStrings(t, "Outcome", outcomesToStrings(AllOutcomes()), []string{"none", "completed", "completed_noncompliant", "failed", "timed_out", "canceled", "reaped", "interrupted", "quarantined"})
+	assertStrings(t, "Outcome", outcomesToStrings(AllOutcomes()), []string{"none", "completed", "completed_noncompliant", "failed", "timed_out", "canceled", "reaped", "interrupted", "quarantined", "orphaned"})
 	assertStrings(t, "PublicState", publicsToStrings(AllPublicStates()), []string{"queued", "starting", "running", "retrying", "completed", "completed_noncompliant", "interrupted", "quarantined", "failed", "timed_out", "canceled", "reaped", "orphaned"})
 	assertStrings(t, "TerminalCause", causesToStrings(AllTerminalCauses()), []string{"completed_normally", "canceled_before_authorization", "canceled_after_authorization", "daemon_restarted_before_authorization", "daemon_restarted_after_authorization", "supervisor_lost_before_authorization", "supervisor_lost_after_authorization", "corrupt_projection", "response_undeliverable", "release_outcome_unknown", "release_definitely_not_sent"})
 }
@@ -46,6 +46,7 @@ func TestTerminalOutcomesProjectToTerminalPublicStates(t *testing.T) {
 		OutcomeReaped:                PublicReaped,
 		OutcomeInterrupted:           PublicInterrupted,
 		OutcomeQuarantined:           PublicQuarantined,
+		OutcomeOrphaned:              PublicOrphaned,
 	}
 	for outcome, want := range tests {
 		got := PublicProjection(DecisionTerminal, DispatchDone, outcome)
@@ -113,6 +114,39 @@ func TestProjectDerivesReadModelFromSafetyRecordOnly(t *testing.T) {
 	}
 	if projection.Decision != DecisionTerminal || projection.Dispatch != DispatchDone || projection.Outcome != OutcomeCompleted || projection.Public != PublicCompleted || projection.TerminalCause != CauseCompletedNormally {
 		t.Fatalf("terminal projection = decision:%s dispatch:%s outcome:%s public:%s cause:%s", projection.Decision, projection.Dispatch, projection.Outcome, projection.Public, projection.TerminalCause)
+	}
+}
+
+func TestProjectKeepsCompletedOutcomeWhenCleanupUnresolved(t *testing.T) {
+	record := reducerConsumedRecord(t)
+	record = reducerMustApply(t, record, ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeCompleted})
+	record = reducerMustApply(t, record, reducerResultCommand(t, record))
+	finalized := reducerMustApply(t, record, Finalize{
+		Ref:    reducerRef(),
+		Intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseDaemonRestartedAfterAuthorization},
+	})
+	if finalized.Terminal == nil {
+		t.Fatal("terminal certificate missing")
+	}
+	if finalized.Terminal.Proof != ProofUnresolvedAbsence {
+		t.Fatalf("terminal proof = %s, want %s", finalized.Terminal.Proof, ProofUnresolvedAbsence)
+	}
+	if finalized.Terminal.Result == nil {
+		t.Fatal("completed unresolved terminal lost result")
+	}
+	if got := DeriveCleanupDisposition(finalized); got != CleanupDispositionUnresolved {
+		t.Fatalf("cleanup disposition = %s, want %s", got, CleanupDispositionUnresolved)
+	}
+
+	projection, err := Project(finalized, ProjectionMetadata{})
+	if err != nil {
+		t.Fatalf("Project completed unresolved terminal: %v", err)
+	}
+	if projection.Outcome != OutcomeCompleted || projection.Public != PublicCompleted {
+		t.Fatalf("projection outcome/public = %s/%s, want completed/completed", projection.Outcome, projection.Public)
+	}
+	if projection.Public == PublicOrphaned {
+		t.Fatal("completed unresolved cleanup projected as orphaned")
 	}
 }
 

@@ -354,7 +354,7 @@ func launchContext(record model.SafetyRecord, ordinal model.LaunchOrdinal) launc
 
 func terminalOutcome(outcome model.Outcome) bool {
 	switch outcome {
-	case model.OutcomeCompleted, model.OutcomeCompletedNoncompliant, model.OutcomeFailed, model.OutcomeTimedOut, model.OutcomeCanceled, model.OutcomeReaped, model.OutcomeInterrupted, model.OutcomeQuarantined:
+	case model.OutcomeCompleted, model.OutcomeCompletedNoncompliant, model.OutcomeFailed, model.OutcomeTimedOut, model.OutcomeCanceled, model.OutcomeReaped, model.OutcomeInterrupted, model.OutcomeQuarantined, model.OutcomeOrphaned:
 		return true
 	default:
 		return false

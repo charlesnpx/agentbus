@@ -82,6 +82,9 @@ func deriveTerminalProof(record SafetyRecord, intent TerminalIntent) (TerminalPr
 	if cleanQuiescentOutcomeAndRetired(record, intent) {
 		return ProofCleanQuiescentOutcomeAndRetired, nil
 	}
+	if validUnresolvedAbsenceIntent(record, intent) {
+		return ProofUnresolvedAbsence, nil
+	}
 	return 0, precondition("terminal proof predicates are not satisfied")
 }
 
@@ -133,6 +136,43 @@ func validContainedIntent(intent TerminalIntent) bool {
 		return intent.Outcome == OutcomeQuarantined
 	case CauseReleaseOutcomeUnknown, CauseReleaseDefinitelyNotSent:
 		return intent.Outcome == OutcomeFailed
+	default:
+		return false
+	}
+}
+
+func validUnresolvedAbsenceIntent(record SafetyRecord, intent TerminalIntent) bool {
+	if !unresolvedAbsenceCause(intent.Cause) {
+		return false
+	}
+	if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
+		return false
+	}
+	if allLaunchGroupsQuiescent(record.Attempt) {
+		return false
+	}
+	if intent.Outcome == OutcomeOrphaned {
+		return record.Outcome == nil
+	}
+	if record.Outcome == nil || record.Outcome.Outcome != intent.Outcome {
+		return false
+	}
+	return unresolvedPreservedOutcome(intent.Outcome)
+}
+
+func unresolvedAbsenceCause(cause TerminalCause) bool {
+	switch cause {
+	case CauseDaemonRestartedAfterAuthorization, CauseSupervisorLostAfterAuthorization:
+		return true
+	default:
+		return false
+	}
+}
+
+func unresolvedPreservedOutcome(outcome Outcome) bool {
+	switch outcome {
+	case OutcomeCompleted, OutcomeCompletedNoncompliant, OutcomeFailed, OutcomeTimedOut, OutcomeInterrupted, OutcomeCanceled:
+		return true
 	default:
 		return false
 	}

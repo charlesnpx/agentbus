@@ -455,6 +455,94 @@ func TestDeriveTerminalCertificateSelectsProofs(t *testing.T) {
 	}
 }
 
+func TestDeriveTerminalCertificateAllowsUnresolvedAbsenceOnlyForOrphanCauses(t *testing.T) {
+	record := reducerGrantRecord(t)
+	certificate, err := DeriveTerminalCertificate(record, TerminalIntent{
+		Outcome: OutcomeOrphaned,
+		Cause:   CauseDaemonRestartedAfterAuthorization,
+	})
+	if err != nil {
+		t.Fatalf("DeriveTerminalCertificate unresolved daemon-loss error = %v", err)
+	}
+	if certificate.Proof != ProofUnresolvedAbsence {
+		t.Fatalf("proof = %s, want %s", certificate.Proof, ProofUnresolvedAbsence)
+	}
+
+	if _, err := DeriveTerminalCertificate(record, TerminalIntent{
+		Outcome: OutcomeOrphaned,
+		Cause:   CauseSupervisorLostAfterAuthorization,
+	}); err != nil {
+		t.Fatalf("DeriveTerminalCertificate unresolved supervisor-loss error = %v", err)
+	}
+
+	if _, err := DeriveTerminalCertificate(record, TerminalIntent{
+		Outcome: OutcomeCanceled,
+		Cause:   CauseCanceledAfterAuthorization,
+	}); !errors.Is(err, ErrCommandPrecondition) {
+		t.Fatalf("canceled without quiescence error = %v, want ErrCommandPrecondition", err)
+	}
+	if _, err := DeriveTerminalCertificate(record, TerminalIntent{
+		Outcome: OutcomeReaped,
+		Cause:   CauseDaemonRestartedAfterAuthorization,
+	}); !errors.Is(err, ErrCommandPrecondition) {
+		t.Fatalf("reaped without quiescence error = %v, want ErrCommandPrecondition", err)
+	}
+
+	recorded := reducerMustApply(t, reducerConsumedRecord(t), ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeFailed})
+	if _, err := DeriveTerminalCertificate(recorded, TerminalIntent{
+		Outcome: OutcomeFailed,
+		Cause:   CauseCompletedNormally,
+	}); !errors.Is(err, ErrCommandPrecondition) {
+		t.Fatalf("normal failed outcome without quiescence error = %v, want ErrCommandPrecondition", err)
+	}
+}
+
+func TestObserveOutcomeRejectsOrphaned(t *testing.T) {
+	if _, err := apply(reducerGrantRecord(t), ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeOrphaned}); !errors.Is(err, ErrInvalidCommand) {
+		t.Fatalf("ObserveOutcome orphaned error = %v, want ErrInvalidCommand", err)
+	}
+}
+
+func TestCleanupDispositionDerivation(t *testing.T) {
+	tests := []struct {
+		name   string
+		record SafetyRecord
+		want   CleanupDisposition
+	}{
+		{
+			name: "no execution possible",
+			record: reducerMustApply(t, reducerCanceledRetiredRecord(t), Finalize{
+				Ref:    reducerRef(),
+				Intent: TerminalIntent{Outcome: OutcomeCanceled, Cause: CauseCanceledBeforeAuthorization},
+			}),
+			want: CleanupDispositionNoExecutionPossible,
+		},
+		{
+			name: "verified absent",
+			record: reducerMustApply(t, reducerContainedRetiredRecord(t), Finalize{
+				Ref:    reducerRef(),
+				Intent: TerminalIntent{Outcome: OutcomeCanceled, Cause: CauseCanceledAfterAuthorization},
+			}),
+			want: CleanupDispositionVerifiedAbsent,
+		},
+		{
+			name: "unresolved",
+			record: reducerMustApply(t, reducerGrantRecord(t), Finalize{
+				Ref:    reducerRef(),
+				Intent: TerminalIntent{Outcome: OutcomeOrphaned, Cause: CauseDaemonRestartedAfterAuthorization},
+			}),
+			want: CleanupDispositionUnresolved,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := DeriveCleanupDisposition(tt.record); got != tt.want {
+				t.Fatalf("DeriveCleanupDisposition() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRecordedReleaseOutcomeSelectsContainedFailureCause(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -637,7 +725,7 @@ func TestOnlyTerminalGoSelectsProofKind(t *testing.T) {
 			t.Fatalf("read %s: %v", name, err)
 		}
 		text := string(data)
-		for _, proof := range []string{"ProofNeverPermittedAndRetired", "ProofCleanQuiescentOutcomeAndRetired", "ProofContained", "ProofLegacyUnfencedOutcome"} {
+		for _, proof := range []string{"ProofNeverPermittedAndRetired", "ProofCleanQuiescentOutcomeAndRetired", "ProofContained", "ProofLegacyUnfencedOutcome", "ProofUnresolvedAbsence"} {
 			if strings.Contains(text, proof) {
 				t.Fatalf("%s contains terminal proof selection %s", name, proof)
 			}

@@ -293,10 +293,12 @@ func TestStatusResultAndCancelExitCodes(t *testing.T) {
 		statuses: map[string]agentclient.JobStatus{
 			"job_done":    {JobID: "job_done", SessionID: "ses_done", State: engine.StateCompleted},
 			"job_running": {JobID: "job_running", SessionID: "ses_running", State: engine.StateRunning},
+			"job_orphan":  {JobID: "job_orphan", SessionID: "ses_orphan", State: engine.StateOrphaned},
 		},
 		results: map[string]agentclient.JobResult{
 			"job_done":    {JobID: "job_done", SessionID: "ses_done", State: engine.StateCompleted, Result: &engine.ResultInfo{Text: "done", Bytes: 4}},
 			"job_running": {JobID: "job_running", SessionID: "ses_running", State: engine.StateRunning},
+			"job_orphan":  {JobID: "job_orphan", SessionID: "ses_orphan", State: engine.StateOrphaned},
 		},
 		cancels: map[string]agentclient.JobCancelResult{
 			"job_cancel_me": {JobID: "job_cancel_me", State: engine.StateCanceled},
@@ -320,8 +322,10 @@ func TestStatusResultAndCancelExitCodes(t *testing.T) {
 	}{
 		{name: "status completed", args: []string{"status", "--job", "job_done", "--json"}, wantCode: 0, wantState: engine.StateCompleted},
 		{name: "status nonterminal", args: []string{"status", "--job", "job_running", "--json"}, wantCode: 2, wantState: engine.StateRunning},
+		{name: "status orphaned", args: []string{"status", "--job", "job_orphan", "--json"}, wantCode: 14, wantState: engine.StateOrphaned},
 		{name: "result completed", args: []string{"result", "--job", "job_done", "--json"}, wantCode: 0, wantState: engine.StateCompleted},
 		{name: "result nonterminal", args: []string{"result", "--job", "job_running", "--json"}, wantCode: 2, wantState: engine.StateRunning},
+		{name: "result orphaned", args: []string{"result", "--job", "job_orphan", "--json"}, wantCode: 14, wantState: engine.StateOrphaned},
 		{name: "cancel queued", args: []string{"cancel", "--job", "job_cancel_me", "--json"}, wantCode: 7, wantState: engine.StateCanceled},
 	}
 	for _, tt := range tests {

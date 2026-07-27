@@ -1058,7 +1058,7 @@ JSON shapes:
   validate: {"valid":true,"missing":[],"contractName":"...","contractSha256":"sha256:..."}
 
 Exit codes for single-job status/result/cancel:
-  completed=0, running/non-terminal=2, completed_noncompliant=3, failed=4, timed_out=5, interrupted=6, canceled=7, reaped=8, quarantined=9, unknown-job=10, daemon-startup-failure=11, fail-stop=12, shutdown-deadline=13
+  completed=0, running/non-terminal=2, completed_noncompliant=3, failed=4, timed_out=5, interrupted=6, canceled=7, reaped=8, quarantined=9, unknown-job=10, daemon-startup-failure=11, fail-stop=12, shutdown-deadline=13, orphaned=14
 
 Status/result/cancel are protocol-v2 daemon clients. Offline authority diagnosis stays under admission inspect/recover/admin commands.
 

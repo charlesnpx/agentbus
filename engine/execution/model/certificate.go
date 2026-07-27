@@ -302,6 +302,9 @@ func (fact OutcomeFact) Validate() error {
 	if err := fact.Attempt.Validate(); err != nil {
 		return err
 	}
+	if fact.Outcome == OutcomeOrphaned {
+		return invalid("outcome", "orphaned cannot be observed")
+	}
 	return fact.Outcome.ValidateTerminal()
 }
 

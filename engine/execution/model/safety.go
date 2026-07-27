@@ -384,6 +384,28 @@ func (record SafetyRecord) validateTerminalProofSupport() error {
 		if hasAnyLaunchEvidence(record.Attempt) {
 			return invalid("terminal.proof", "legacy-unfenced proof cannot have launch evidence")
 		}
+	case ProofUnresolvedAbsence:
+		if !fencedMode(record.Mode) {
+			return invalid("terminal.proof", "unresolved proof requires fenced mode")
+		}
+		if !unresolvedAbsenceCause(record.Terminal.Cause) {
+			return invalid("terminal.proof", "unresolved proof requires post-authorization orphan cause")
+		}
+		if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
+			return invalid("terminal.proof", "unresolved proof requires authorization evidence")
+		}
+		if allLaunchGroupsQuiescent(record.Attempt) {
+			return invalid("terminal.proof", "unresolved proof requires absence not proven")
+		}
+		if record.Outcome == nil {
+			if record.Terminal.Outcome != OutcomeOrphaned {
+				return invalid("terminal.outcome", "unresolved proof without observed outcome requires orphaned outcome")
+			}
+			break
+		}
+		if !unresolvedPreservedOutcome(record.Terminal.Outcome) {
+			return invalid("terminal.outcome", "unresolved proof cannot use this observed outcome")
+		}
 	default:
 		return invalid("terminal.proof", "is unknown")
 	}

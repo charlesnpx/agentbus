@@ -5456,10 +5456,18 @@ func TestFinalizeCompletedSalvagesReapedJobOnlyWithAuthoritativeCompletion(t *te
 	if err := server.createQueuedRecord(store, jobID, "ses_reaped", "fake", nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning, engine.StateOrphaned, engine.StateReaped} {
+	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning, engine.StateOrphaned} {
 		if err := server.transitionRecord(store, jobID, state); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
+		if err := record.Transition(engine.StateReaped, server.clock.Now().UTC()); err != nil {
+			return false, err
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if err := server.finalizeTerminal(jobRun{jobID: jobID, store: store}, engine.StateCompleted, "ignored", nil); err != nil {
 		t.Fatal(err)

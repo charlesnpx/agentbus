@@ -422,6 +422,9 @@ func applyObserveOutcome(next *SafetyRecord, current SafetyRecord, command Obser
 	if err := command.Outcome.ValidateTerminal(); err != nil {
 		return false, invalidCommand("outcome: %v", err)
 	}
+	if command.Outcome == OutcomeOrphaned {
+		return false, invalidCommand("outcome: orphaned cannot be observed")
+	}
 	fact := OutcomeFact{Attempt: current.Attempt.Ref, Outcome: command.Outcome}
 	if current.Outcome != nil {
 		return mergeFact(&next.Outcome, fact, "outcome")

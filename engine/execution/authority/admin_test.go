@@ -120,6 +120,18 @@ func TestResetEmptyRootRefusesEveryNonzeroCategory(t *testing.T) {
 			},
 			wantFragment: "recovery_obligations=1",
 		},
+		{
+			name: "terminal orphaned unresolved",
+			populate: func(t *testing.T, ready *Ready) {
+				t.Helper()
+				accepted, err := ready.Accept(ctx, acceptRequest(t, "reset-terminal-orphaned"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				terminalizeOrphanedUnresolvedForTest(t, ctx, ready, accepted)
+			},
+			wantFragment: "jobs=1",
+		},
 	}
 	for _, tt := range cases {
 		tt := tt
