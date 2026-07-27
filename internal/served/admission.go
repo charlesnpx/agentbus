@@ -1416,7 +1416,7 @@ func recoverAdmissionBeforeReady(ctx context.Context, session *authority.Recover
 	return newAdmissionRecoveryExecutor(session, launchPort, latch).Recover(ctx)
 }
 
-func recoverAdmissionBeforeReadyReport(ctx context.Context, session *authority.RecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) (AdmissionRecoveryReport, error) {
+func recoverAdmissionBeforeReadyReport(ctx context.Context, session admissionRecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) (AdmissionRecoveryReport, error) {
 	return newAdmissionRecoveryExecutor(session, launchPort, latch).RecoverReport(ctx)
 }
 

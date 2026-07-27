@@ -1570,6 +1570,9 @@ func attestPhysicalOutcome(issuer quiescenceAttestationIssuer, outcome PhysicalO
 }
 
 func physicalOutcomeError(outcome PhysicalOutcome) error {
+	if unresolved := cleanupUnresolvedFromPhysicalOutcome(outcome); unresolved != nil {
+		return unresolved
+	}
 	if outcome.Err != nil {
 		return outcome.Err
 	}

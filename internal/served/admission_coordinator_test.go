@@ -18,7 +18,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
 )
 
-func TestServedCoordinatorRecordsQuiescenceBeforeLatchTripOnCleanupFailure(t *testing.T) {
+func TestServedCoordinatorRecordsQuiescenceWithoutLatchTripOnCleanupWarning(t *testing.T) {
 	ctx := context.Background()
 	cleanupErr := errors.New("served containment cleanup failed")
 	events := &servedCoordinatorEventLog{}
@@ -76,15 +76,15 @@ func TestServedCoordinatorRecordsQuiescenceBeforeLatchTripOnCleanupFailure(t *te
 	}
 
 	err = coord.Cancel(ctx, accepted.Record.JobID, nil)
-	if !errors.Is(err, cleanupErr) {
-		t.Fatalf("Cancel error = %v, want cleanup failure", err)
+	if err != nil {
+		t.Fatalf("Cancel error = %v, want nil cleanup warning", err)
 	}
 	select {
 	case <-latch.Done():
+		t.Fatal("safety latch was tripped after post-proof cleanup warning")
 	default:
-		t.Fatal("safety latch was not tripped")
 	}
-	wantEvents := "contain,record_quiescence,latch_trip"
+	wantEvents := "contain,record_quiescence"
 	if got := strings.Join(events.snapshot(), ","); got != wantEvents {
 		t.Fatalf("events = %s, want %s", got, wantEvents)
 	}
@@ -101,7 +101,7 @@ func TestServedCoordinatorRecordsQuiescenceBeforeLatchTripOnCleanupFailure(t *te
 	}
 	first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
 	if !ok || first.Quiescence == nil {
-		t.Fatalf("launch quiescence = %+v, want recorded before latch trip", first)
+		t.Fatalf("launch quiescence = %+v, want recorded despite cleanup warning", first)
 	}
 }
 

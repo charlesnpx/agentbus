@@ -13,6 +13,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/internal/containment"
 )
 
 func TestLaunchControllerHappyPathOrdering(t *testing.T) {
@@ -372,6 +373,37 @@ func TestLaunchControllerWaitAndVerifyErrorReportsContainmentFailure(t *testing.
 	}
 	if got := h.running.attestations + h.prepared.attestations + h.custodian.attestations; got > 1 {
 		t.Fatalf("attestations = %d, want at most one", got)
+	}
+}
+
+func TestLaunchControllerWaitCleanupUnresolvedDoesNotFailStop(t *testing.T) {
+	unresolved := &custodian.CleanupUnresolvedError{
+		Reason:   containment.ReasonAbsenceDeadlineExceeded,
+		Decision: model.SignalDirectly,
+	}
+	h := newHarness(t, "wait-unresolved")
+	h.running.waitErr = unresolved
+	h.running.containErr = unresolved
+	h.authority.afterRecordRelease = h.running.allowWait
+
+	result, err := h.controller.Run(context.Background(), h.request(nil))
+	if err == nil {
+		t.Fatal("Run returned nil error for wait unresolved cleanup")
+	}
+	if !custodian.IsCleanupUnresolved(err) {
+		t.Fatalf("Run error = %v, want CleanupUnresolvedError", err)
+	}
+	if errors.Is(err, ErrFailClosed) {
+		t.Fatalf("Run error = %v, want no fail-closed marker", err)
+	}
+	if result.Contained {
+		t.Fatal("unresolved containment was reported as contained")
+	}
+	if h.authority.failStops != 0 {
+		t.Fatalf("fail stops = %d, want 0", h.authority.failStops)
+	}
+	if h.authority.recordQuiescenceCalls != 0 {
+		t.Fatalf("record quiescence calls = %d, want 0", h.authority.recordQuiescenceCalls)
 	}
 }
 
@@ -751,6 +783,36 @@ func TestLaunchControllerReleaseErrorContainsWithoutRetry(t *testing.T) {
 	}
 	if h.authority.failStops != 0 {
 		t.Fatalf("fail stops = %d, want 0", h.authority.failStops)
+	}
+}
+
+func TestLaunchControllerReleaseUnknownCleanupUnresolvedDoesNotFailStop(t *testing.T) {
+	h := newHarness(t, "release-unknown-unresolved")
+	h.prepared.releaseOutcome = custodian.ReleaseOutcomeUnknown
+	h.prepared.releaseErr = errors.New("release channel lost")
+	h.custodian.containErr = &custodian.CleanupUnresolvedError{
+		Reason:   containment.ReasonProbeUnprovable,
+		Decision: model.Unprovable,
+	}
+
+	_, err := h.controller.Run(context.Background(), h.request(nil))
+	if err == nil {
+		t.Fatal("Run returned nil error for release-unknown unresolved cleanup")
+	}
+	if !errors.Is(err, ErrReleaseUncertain) {
+		t.Fatalf("Run error = %v, want ErrReleaseUncertain", err)
+	}
+	if !custodian.IsCleanupUnresolved(err) {
+		t.Fatalf("Run error = %v, want CleanupUnresolvedError", err)
+	}
+	if h.authority.failStops != 0 {
+		t.Fatalf("fail stops = %d, want 0", h.authority.failStops)
+	}
+	if h.authority.releaseOutcomeFact != model.LaunchReleaseSentUnknown {
+		t.Fatalf("release outcome fact = %s, want %s", h.authority.releaseOutcomeFact, model.LaunchReleaseSentUnknown)
+	}
+	if h.authority.recordQuiescenceCalls != 0 {
+		t.Fatalf("record quiescence calls = %d, want 0", h.authority.recordQuiescenceCalls)
 	}
 }
 

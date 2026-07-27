@@ -32,6 +32,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
+	"github.com/charlesnpx/agentbus/internal/containment"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -1605,6 +1606,156 @@ func TestAdmissionRecoveryExecutorBoundCurrentObligationContainsOnlyDurableGroup
 	if reason := server.safetyLatch.Reason(); reason != nil {
 		t.Fatalf("safety latch tripped: %v", reason)
 	}
+}
+
+func TestAdmissionRecoveryExecutorAttemptsAllLaunchesBeforeUnresolvedFinalization(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	jobID := model.JobID("job-recovery-all-ordinals")
+	ref := model.AttemptRef{JobID: jobID, AttemptID: "attempt-recovery-all-ordinals", Epoch: 1}
+	firstGroup := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne})
+	secondGroup := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalTwo})
+	boot, err := model.NewBootRef("boot-recovery-all-ordinals-new", "owner-recovery-all-ordinals-new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := model.RecoveryToken{JobID: jobID, BasedOnRevision: 3, RecoveryBoot: boot, Opaque: "recovery-all-ordinals-token"}
+	item := model.RecoveryWorkItem{
+		Token:           token,
+		JobID:           jobID,
+		BasedOnRevision: token.BasedOnRevision,
+		Trigger:         model.RecoveryStartupLoss,
+		Launches: []model.RecoveryLaunch{
+			{Ordinal: model.LaunchOrdinalOne, Group: firstGroup},
+			{Ordinal: model.LaunchOrdinalTwo, Group: secondGroup},
+		},
+	}
+	session := &admissionRecoveryFakeSession{
+		items: []model.RecoveryWorkItem{item},
+		afterAdvance: model.RecoveryWorkItem{
+			Token:           token,
+			JobID:           jobID,
+			BasedOnRevision: token.BasedOnRevision,
+			Trigger:         model.RecoveryStartupLoss,
+			Launches:        []model.RecoveryLaunch{{Ordinal: model.LaunchOrdinalTwo, Group: secondGroup}},
+		},
+		finalized: model.SafetyRecord{
+			JobID: jobID,
+			Terminal: &model.TerminalCertificate{
+				Outcome: model.OutcomeOrphaned,
+				Proof:   model.ProofUnresolvedAbsence,
+				Cause:   model.CauseDaemonRestartedAfterAuthorization,
+			},
+		},
+	}
+	launcher.containErrByOrdinal = map[model.LaunchOrdinal]error{
+		model.LaunchOrdinalTwo: &custodian.CleanupUnresolvedError{Reason: containment.ReasonProbeUnprovable, Decision: model.Unprovable},
+	}
+
+	latch := NewSafetyLatch()
+	report, err := recoverAdmissionBeforeReadyReport(ctx, session, launcher, latch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.QuiescedLaunches != 1 || report.UnresolvedLaunches != 1 || report.FinalizedJobs != 1 || report.OrphanedJobs != 1 {
+		t.Fatalf("recovery report = %+v, want one quiesced launch, one unresolved launch, one orphaned job", report)
+	}
+	if session.finalizeUnresolvedCalls != 1 {
+		t.Fatalf("FinalizeUnresolved calls = %d, want 1", session.finalizeUnresolvedCalls)
+	}
+	if len(session.recordedOrdinals) != 1 || session.recordedOrdinals[0] != model.LaunchOrdinalOne {
+		t.Fatalf("recorded ordinals = %v, want only ordinal 1", session.recordedOrdinals)
+	}
+	contains := launcher.containObservations()
+	if len(contains) != 2 {
+		t.Fatalf("contain attempts = %d, want both launch ordinals attempted", len(contains))
+	}
+	if contains[0].group.Launch.Ordinal != model.LaunchOrdinalOne || contains[1].group.Launch.Ordinal != model.LaunchOrdinalTwo {
+		t.Fatalf("contain ordinals = %s,%s; want 1,2", contains[0].group.Launch.Ordinal, contains[1].group.Launch.Ordinal)
+	}
+	if reason := latch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+}
+
+func TestAdmissionRecoveryExecutorTypedUnresolvedContinuesStartupWithoutRelaunch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	oldReady, accepted := newPriorBootAuthorityWork(t, repo, anchorStore, launcher, "recovery-orphan-continues")
+	ref := accepted.Record.Attempt.Ref
+	group := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne})
+	if _, err := oldReady.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := oldReady.AllocateGrant(ctx, ref, model.LaunchOrdinalOne); err != nil {
+		t.Fatal(err)
+	}
+	launcher.containErrByOrdinal = map[model.LaunchOrdinal]error{
+		model.LaunchOrdinalOne: &custodian.CleanupUnresolvedError{Reason: containment.ReasonAbsenceDeadlineExceeded, Decision: model.SignalDirectly},
+	}
+
+	backend := newFakeBackend("fake")
+	server, _, _ := newUnstartedTestServer(t, backend)
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+
+	if server.admissionReady == nil {
+		t.Fatal("admission did not seal ready after typed unresolved recovery")
+	}
+	if reason := server.safetyLatch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want no recovery relaunch", got)
+	}
+	image, err := server.admissionReady.LoadJob(ctx, accepted.Record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := image.Safety.Value
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeOrphaned || record.Terminal.Proof != model.ProofUnresolvedAbsence {
+		t.Fatalf("terminal = %+v, want orphaned unresolved", record.Terminal)
+	}
+	if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionUnresolved {
+		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
+	}
+}
+
+type admissionRecoveryFakeSession struct {
+	items                   []model.RecoveryWorkItem
+	afterAdvance            model.RecoveryWorkItem
+	finalized               model.SafetyRecord
+	recordedOrdinals        []model.LaunchOrdinal
+	finalizePlannedCalls    int
+	finalizeUnresolvedCalls int
+}
+
+func (s *admissionRecoveryFakeSession) WorkItems(context.Context) ([]model.RecoveryWorkItem, error) {
+	return append([]model.RecoveryWorkItem(nil), s.items...), nil
+}
+
+func (s *admissionRecoveryFakeSession) AdvanceRecovery(context.Context, model.RecoveryToken) (model.RecoveryWorkItem, error) {
+	return s.afterAdvance, nil
+}
+
+func (s *admissionRecoveryFakeSession) FinalizePlanned(context.Context, model.RecoveryToken) error {
+	s.finalizePlannedCalls++
+	s.items = nil
+	return nil
+}
+
+func (s *admissionRecoveryFakeSession) FinalizeUnresolved(context.Context, model.RecoveryToken) (model.SafetyRecord, error) {
+	s.finalizeUnresolvedCalls++
+	s.items = nil
+	return s.finalized, nil
+}
+
+func (s *admissionRecoveryFakeSession) RecordQuiescence(_ context.Context, _ any, ordinal model.LaunchOrdinal, _ custodian.VerifiedQuiescence) error {
+	s.recordedOrdinals = append(s.recordedOrdinals, ordinal)
+	return nil
 }
 
 func TestAdmissionRecoveryExecutorTripsLatchWhenContainmentUnprovable(t *testing.T) {
@@ -6668,6 +6819,7 @@ type admissionFakeLaunchCustodian struct {
 	releaseErr                error
 	releaseStarted            chan struct{}
 	containErr                error
+	containErrByOrdinal       map[model.LaunchOrdinal]error
 	cleanupErr                error
 	abortCleanupErr           error
 	waitAndVerify             <-chan struct{}
@@ -6722,6 +6874,11 @@ func (c *admissionFakeLaunchCustodian) ContainAndVerify(ctx context.Context, gro
 	c.containCtxErrs = append(c.containCtxErrs, ctx.Err())
 	c.containCtxDeadlines = append(c.containCtxDeadlines, hasDeadline)
 	containErr := c.containErr
+	if c.containErrByOrdinal != nil {
+		if ordinalErr := c.containErrByOrdinal[group.Launch.Ordinal]; ordinalErr != nil {
+			containErr = ordinalErr
+		}
+	}
 	running := c.running[string(group.CustodyID)]
 	cleanupErr := c.cleanupErr
 	c.mu.Unlock()

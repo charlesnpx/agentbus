@@ -146,6 +146,54 @@ func (s *RecoverySession) FinalizePlanned(ctx context.Context, token model.Recov
 	return nil
 }
 
+func (s *RecoverySession) FinalizeUnresolved(ctx context.Context, token model.RecoveryToken) (model.SafetyRecord, error) {
+	if s == nil || s.core == nil {
+		return model.SafetyRecord{}, ErrNotReady
+	}
+
+	s.core.mu.Lock()
+	defer s.core.mu.Unlock()
+
+	var finalized model.SafetyRecord
+	terminalCommitted := false
+	commit, err := s.core.update(ctx, "finalize unresolved recovery", func(tx repository.WriteTx) error {
+		meta, err := s.core.requireRecoveryTx(tx, s.token)
+		if err != nil {
+			return err
+		}
+		if _, err := startupMatrixTx(tx); err != nil {
+			return err
+		}
+		record, err := s.recoveryRecordAfterTokenTx(tx, token)
+		if err != nil {
+			return err
+		}
+		intent, err := model.RecoveryTerminalIntent(record, model.RecoveryStartupLoss, false)
+		if err != nil {
+			return err
+		}
+		intent.DerivedBy = s.token.boot
+		applied, err := applyRecoveryCommandTx(tx, token.JobID, model.Finalize{Ref: record.Attempt.Ref, Intent: intent}, meta.Generation+1)
+		if err != nil {
+			return err
+		}
+		finalized = applied.Record
+		terminalCommitted = applied.Changed && applied.Record.Terminal != nil
+		return nil
+	})
+	if err != nil {
+		return model.SafetyRecord{}, err
+	}
+	s.consumeRecoveryTokenLocked(token)
+	if err := s.core.advanceRecoveryLocked(ctx, &s.token, commit.Generation); err != nil {
+		return model.SafetyRecord{}, err
+	}
+	if terminalCommitted {
+		s.core.runtime.releaseTerminal(token.JobID)
+	}
+	return finalized, nil
+}
+
 func (s *RecoverySession) recordQuiescenceByToken(ctx context.Context, token model.RecoveryToken, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) error {
 	if s == nil || s.core == nil {
 		return ErrNotReady

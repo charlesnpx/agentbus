@@ -346,8 +346,8 @@ func (controller *LaunchController) RecordQuiescence(ctx context.Context, launch
 }
 
 func (controller *LaunchController) ContainAndVerify(ctx context.Context, launch LaunchContext, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
-	verified, cleanup, err := controller.ContainAndVerifyWithCleanup(ctx, launch, group, cause)
-	return verified, errors.Join(err, cleanup.Err)
+	verified, _, err := controller.ContainAndVerifyWithCleanup(ctx, launch, group, cause)
+	return verified, err
 }
 
 func (controller *LaunchController) ContainAndVerifyWithCleanup(ctx context.Context, launch LaunchContext, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
@@ -442,6 +442,9 @@ func (controller *LaunchController) containGroupAndFailStop(ctx context.Context,
 func (controller *LaunchController) containRecordQuiescenceOrFailStop(ctx context.Context, launch LaunchContext, group model.GroupRef, reason error) error {
 	verified, cleanup, containErr := controller.custodian.ContainAndVerify(ctx, group, custodian.QuiescenceCauseContain)
 	if containErr != nil {
+		if custodian.IsCleanupUnresolved(containErr) {
+			return errors.Join(reason, containErr)
+		}
 		failReason := errors.Join(reason, containErr)
 		return errors.Join(failReason, controller.failStop(ctx, failReason), ErrFailClosed)
 	}
@@ -653,6 +656,9 @@ func (process *Process) Wait(ctx context.Context) (command.ExitObservation, erro
 		result, finalErr := process.final()
 		if !result.Contained {
 			reason := errors.Join(ctx.Err(), finalErr)
+			if custodian.IsCleanupUnresolved(finalErr) {
+				return result.Exit, reason
+			}
 			return result.Exit, errors.Join(reason, process.failStop(containmentContext(ctx), reason), ErrFailClosed)
 		}
 		return result.Exit, errors.Join(ctx.Err(), finalErr)
@@ -754,7 +760,10 @@ func (process *Process) eagerWait(ctx context.Context) {
 	if err != nil {
 		cause := custodian.QuiescenceCauseWait
 		priorErr := err
-		if ctx.Err() != nil || process.containmentRequested() {
+		if custodian.IsCleanupUnresolved(err) {
+			cause = custodian.QuiescenceCauseContain
+			priorErr = nil
+		} else if ctx.Err() != nil || process.containmentRequested() {
 			cause = custodian.QuiescenceCauseContain
 			priorErr = nil
 		} else {

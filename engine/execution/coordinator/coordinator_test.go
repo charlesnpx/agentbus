@@ -18,6 +18,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
+	"github.com/charlesnpx/agentbus/internal/containment"
 )
 
 func TestAuthorityLifecycleCompletesFromLiveLaunchFacts(t *testing.T) {
@@ -146,7 +147,7 @@ func TestCancelAfterPermitContainsBeforeTerminal(t *testing.T) {
 	}
 }
 
-func TestCancelAfterPermitRecordsQuiescenceBeforeCleanupFailStop(t *testing.T) {
+func TestCancelAfterPermitRecordsQuiescenceBeforeCleanupWarning(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, "cancel-cleanup-order")
 	events := &coordinatorEventLog{}
@@ -158,13 +159,13 @@ func TestCancelAfterPermitRecordsQuiescenceBeforeCleanupFailStop(t *testing.T) {
 	h.bindGrant(t, ctx, accepted, model.LaunchOrdinalOne)
 
 	err := h.coordinator.Cancel(ctx, accepted.Record.JobID, nil)
-	if !errors.Is(err, cleanupErr) {
-		t.Fatalf("Cancel error = %v, want cleanup failure", err)
+	if err != nil {
+		t.Fatalf("Cancel error = %v, want nil cleanup warning", err)
 	}
-	if !h.authority.failStopped {
-		t.Fatal("authority was not fail-stopped after containment cleanup failure")
+	if h.authority.failStopped {
+		t.Fatalf("authority fail-stopped after post-proof cleanup warning: %v", h.authority.failReason)
 	}
-	wantEvents := "contain,record_quiescence,fail_stop"
+	wantEvents := "contain,record_quiescence"
 	if got := strings.Join(events.snapshot(), ","); got != wantEvents {
 		t.Fatalf("events = %s, want %s", got, wantEvents)
 	}
@@ -181,7 +182,44 @@ func TestCancelAfterPermitRecordsQuiescenceBeforeCleanupFailStop(t *testing.T) {
 	}
 	first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
 	if !ok || first.Quiescence == nil {
-		t.Fatalf("launch quiescence = %+v, want recorded before cleanup fail-stop", first)
+		t.Fatalf("launch quiescence = %+v, want recorded despite cleanup warning", first)
+	}
+	if record.Terminal == nil || record.Terminal.Proof != model.ProofContained {
+		t.Fatalf("terminal = %+v, want contained proof", record.Terminal)
+	}
+	if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionVerifiedAbsent {
+		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionVerifiedAbsent)
+	}
+}
+
+func TestCancelAfterPermitTypedUnresolvedTerminalizesCanceled(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "cancel-unresolved-terminal")
+	accepted := h.submit(t, ctx, "cancel-unresolved-terminal")
+	h.bindGrant(t, ctx, accepted, model.LaunchOrdinalOne)
+	h.containment.unresolvedOrdinals = map[model.LaunchOrdinal]bool{model.LaunchOrdinalOne: true}
+
+	if err := h.coordinator.Cancel(ctx, accepted.Record.JobID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if h.authority.failStopped {
+		t.Fatalf("authority fail-stopped after typed unresolved cleanup: %v", h.authority.failReason)
+	}
+	snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
+	if snapshot.Record.Terminal == nil {
+		t.Fatal("terminal certificate missing")
+	}
+	if snapshot.Record.Terminal.Outcome != model.OutcomeCanceled {
+		t.Fatalf("outcome = %s, want %s", snapshot.Record.Terminal.Outcome, model.OutcomeCanceled)
+	}
+	if snapshot.Record.Terminal.Proof != model.ProofUnresolvedAbsence {
+		t.Fatalf("proof = %s, want %s", snapshot.Record.Terminal.Proof, model.ProofUnresolvedAbsence)
+	}
+	if snapshot.Record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+		t.Fatalf("cause = %s, want %s", snapshot.Record.Terminal.Cause, model.CauseCanceledAfterAuthorization)
+	}
+	if got := model.DeriveCleanupDisposition(snapshot.Record); got != model.CleanupDispositionUnresolved {
+		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
 	}
 }
 
@@ -246,6 +284,78 @@ func TestRecoverLiveLossContainsAndReaps(t *testing.T) {
 	}
 	if snapshot.Record.Terminal.Cause != model.CauseSupervisorLostAfterAuthorization {
 		t.Fatalf("cause = %s, want %s", snapshot.Record.Terminal.Cause, model.CauseSupervisorLostAfterAuthorization)
+	}
+}
+
+func TestRecoverLiveLossTypedUnresolvedOrphans(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "live-loss-unresolved")
+	accepted := h.submit(t, ctx, "live-loss-unresolved")
+	h.bindGrantRelease(t, ctx, accepted, model.LaunchOrdinalOne)
+	h.containment.unresolvedOrdinals = map[model.LaunchOrdinal]bool{model.LaunchOrdinalOne: true}
+
+	if err := h.coordinator.Recover(ctx, accepted.Record.JobID, model.RecoveryLiveLoss, nil); err != nil {
+		t.Fatal(err)
+	}
+	if h.authority.failStopped {
+		t.Fatalf("authority fail-stopped after live unresolved cleanup: %v", h.authority.failReason)
+	}
+
+	snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
+	if snapshot.Record.Terminal == nil {
+		t.Fatal("terminal certificate missing")
+	}
+	if snapshot.Record.Terminal.Outcome != model.OutcomeOrphaned {
+		t.Fatalf("outcome = %s, want %s", snapshot.Record.Terminal.Outcome, model.OutcomeOrphaned)
+	}
+	if snapshot.Record.Terminal.Proof != model.ProofUnresolvedAbsence {
+		t.Fatalf("proof = %s, want %s", snapshot.Record.Terminal.Proof, model.ProofUnresolvedAbsence)
+	}
+	if snapshot.Record.Terminal.Cause != model.CauseSupervisorLostAfterAuthorization {
+		t.Fatalf("cause = %s, want %s", snapshot.Record.Terminal.Cause, model.CauseSupervisorLostAfterAuthorization)
+	}
+	if got := model.DeriveCleanupDisposition(snapshot.Record); got != model.CleanupDispositionUnresolved {
+		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
+	}
+}
+
+func TestRecoverRecordedCompletedTypedUnresolvedKeepsResult(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "completed-unresolved")
+	accepted := h.submit(t, ctx, "completed-unresolved")
+	h.bindGrantRelease(t, ctx, accepted, model.LaunchOrdinalOne)
+	if _, err := h.authority.RecordOutcome(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.OutcomeCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.coordinator.publishResult(ctx, accepted.Record.JobID, []byte("completed-result"), nil); err != nil {
+		t.Fatal(err)
+	}
+	h.containment.unresolvedOrdinals = map[model.LaunchOrdinal]bool{model.LaunchOrdinalOne: true}
+
+	if err := h.coordinator.Recover(ctx, accepted.Record.JobID, model.RecoveryLiveLoss, nil); err != nil {
+		t.Fatal(err)
+	}
+	if h.authority.failStopped {
+		t.Fatalf("authority fail-stopped after completed unresolved cleanup: %v", h.authority.failReason)
+	}
+	snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
+	if snapshot.Record.Terminal == nil {
+		t.Fatal("terminal certificate missing")
+	}
+	if snapshot.Record.Terminal.Outcome != model.OutcomeCompleted {
+		t.Fatalf("outcome = %s, want %s", snapshot.Record.Terminal.Outcome, model.OutcomeCompleted)
+	}
+	if snapshot.Record.Terminal.Proof != model.ProofUnresolvedAbsence {
+		t.Fatalf("proof = %s, want %s", snapshot.Record.Terminal.Proof, model.ProofUnresolvedAbsence)
+	}
+	if snapshot.Record.Terminal.Result == nil || snapshot.Record.Result == nil {
+		t.Fatalf("result was not preserved: terminal=%+v record=%+v", snapshot.Record.Terminal.Result, snapshot.Record.Result)
+	}
+	if got := model.DeriveCleanupDisposition(snapshot.Record); got != model.CleanupDispositionUnresolved {
+		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
+	}
+	if h.containment.contained != 1 {
+		t.Fatalf("containments = %d, want no relaunch and one containment", h.containment.contained)
 	}
 }
 
@@ -622,12 +732,13 @@ func hasPreparedUnquiescedGroup(record model.SafetyRecord) bool {
 }
 
 type testLaunchContainment struct {
-	contained   int
-	retired     int
-	failContain bool
-	cleanupErr  error
-	issuer      custodian.AttestationIssuer
-	events      *coordinatorEventLog
+	contained          int
+	retired            int
+	failContain        bool
+	cleanupErr         error
+	unresolvedOrdinals map[model.LaunchOrdinal]bool
+	issuer             custodian.AttestationIssuer
+	events             *coordinatorEventLog
 }
 
 func (c *testLaunchContainment) ContainAndVerify(ctx context.Context, launchCtx launch.LaunchContext, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
@@ -656,6 +767,12 @@ func (c *testLaunchContainment) ContainAndVerify(ctx context.Context, launchCtx 
 	}
 	if c.failContain {
 		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, errors.New("containment failed")
+	}
+	if c.unresolvedOrdinals[launchCtx.Ordinal] {
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, &custodian.CleanupUnresolvedError{
+			Reason:   containment.ReasonProbeUnprovable,
+			Decision: model.Unprovable,
+		}
 	}
 	verified, err := c.issuer.AttestQuiescence(custodian.PhysicalQuiescence{
 		Group:  group,
