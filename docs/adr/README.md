@@ -4,7 +4,10 @@ These records summarize the evolution of the reliable-admission decisions from
 the implementation spec through the AB-E hardening units. Entries marked
 superseded are historical: ADR-12 (strict-only contract, protocol v2) is
 normative for production strict admission and overrides earlier
-legacy-surface decisions.
+legacy-surface decisions. ADR-13 (custody de-escalation) normatively amends
+the daemon-crash custody portions of ADR-12 (corruption safety-scope, shutdown
+contract, result semantics, and the meaning of `unavailable_native_runtime`);
+all other ADR-12 provisions remain in force.
 
 | ADR | Decision |
 | --- | --- |
@@ -33,3 +36,4 @@ legacy-surface decisions.
 | [ADR-10](ADR-10.md) | Coordinator ownership blocks idle shutdown and binary replacement. |
 | [ADR-11](ADR-11-admission-authority.md) | AdmissionAuthority is the single public policy boundary; repositories stay internal and policy-free. |
 | [ADR-12](ADR-12-strict-only-contract.md) | Strict-only protocol v2, replay, storage, rejection, shutdown, and result semantics are normative. |
+| [ADR-13](ADR-13-custody-deescalation.md) | One weaker cross-platform custody contract: never auto-relaunch, terminal `orphaned`, job-local cleanup uncertainty; cgroups become a Linux enhancement, not a serving prerequisite. |

@@ -4,6 +4,15 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
+STATUS (AB-F): IN PROGRESS (started 2026-07-27). Custody de-escalation — one weaker cross-platform
+contract; delete the universal proof obligation, retain the Linux cgroup mechanism as an
+implementation detail. 7 sequential units U1->U7 (session tasks #17-#23). U1 (normative contract,
+ADR-13) IN PROGRESS. Plan: ~/.claude/plans/modular-splashing-falcon.md. Binding invariants: (1)
+outcome and cleanup are independent axes — OutcomeOrphaned only for UNKNOWN outcome; (2) only typed
+physical uncertainty -> job-local `unresolved`, integrity/ownership stays fatal; (3) root activation
+kept, contract version 1->2; (4) containment selected per launch, cgroups optional, baseline verified
+normal-op supervision mandatory. ADR-13 supersedes ADR-12 crash-custody portions only.
+
 STATUS (AB-E): COMPLETE (2026-07-24). ALL 11 UNITS CLOSED, E8 at df8ffe8 (SHIP, holistic review: acceptance criteria 1-12 PASS). Criterion 13 (candidate-SHA remote green) deferred pending Actions billing and the user-approved installation of scripts/ci/github-workflows-proposed/ into .github/workflows/. See "AB-E hardening
 roadmap" section below — 11 sequential units (E0→E8) from the post-completion external evaluation.
 AB-D itself remains COMPLETE as recorded.
