@@ -415,6 +415,9 @@ func (record SafetyRecord) validateTerminalCompatibility() error {
 		if record.Outcome != nil {
 			return invalid("terminal.outcome", "orphaned requires no observed outcome")
 		}
+		if record.Result != nil || record.Terminal.Result != nil {
+			return invalid("terminal.result", "orphaned requires no result")
+		}
 		if record.Terminal.Proof != ProofUnresolvedAbsence {
 			return invalid("terminal.proof", "orphaned requires unresolved absence proof")
 		}

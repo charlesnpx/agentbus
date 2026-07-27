@@ -31,7 +31,7 @@ func DeriveCleanupDisposition(record SafetyRecord) CleanupDisposition {
 	switch record.Terminal.Proof {
 	case ProofUnresolvedAbsence:
 		return CleanupDispositionUnresolved
-	case ProofLegacyUnfencedOutcome, ProofNeverPermittedAndRetired:
+	case ProofNeverPermittedAndRetired:
 		return CleanupDispositionNoExecutionPossible
 	case ProofCleanQuiescentOutcomeAndRetired:
 		if cleanQuiescentOutcomeAndRetired(record, TerminalIntent{

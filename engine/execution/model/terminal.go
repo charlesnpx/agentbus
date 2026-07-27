@@ -133,6 +133,9 @@ func validNeverPermittedIntent(intent TerminalIntent) bool {
 }
 
 func validContainedIntent(record SafetyRecord, intent TerminalIntent) bool {
+	if !terminalCauseBackedByDurableFact(record, intent.Cause) {
+		return false
+	}
 	if record.Outcome != nil &&
 		record.Outcome.Outcome == intent.Outcome &&
 		recordedOutcomeCausePermitsIntent(intent.Cause, intent.Outcome) {
@@ -163,6 +166,9 @@ func validContainedIntent(record SafetyRecord, intent TerminalIntent) bool {
 }
 
 func validUnresolvedAbsenceIntent(record SafetyRecord, intent TerminalIntent) bool {
+	if !terminalCauseBackedByDurableFact(record, intent.Cause) {
+		return false
+	}
 	if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
 		return false
 	}
@@ -192,6 +198,9 @@ func orphanedOutcomeCause(cause TerminalCause) bool {
 }
 
 func validLegacyUnfencedIntent(record SafetyRecord, intent TerminalIntent) bool {
+	if !terminalCauseBackedByDurableFact(record, intent.Cause) {
+		return false
+	}
 	if intent.Outcome == OutcomeOrphaned || intent.Outcome == OutcomeReaped {
 		return false
 	}
@@ -203,6 +212,12 @@ func validLegacyUnfencedIntent(record SafetyRecord, intent TerminalIntent) bool 
 }
 
 func validTerminalCompatibility(record SafetyRecord, intent TerminalIntent, proof TerminalProof) bool {
+	if !terminalCauseBackedByDurableFact(record, intent.Cause) {
+		return false
+	}
+	if intent.Outcome == OutcomeOrphaned && record.Result != nil {
+		return false
+	}
 	switch proof {
 	case ProofNeverPermittedAndRetired:
 		return validNeverPermittedIntent(intent)
@@ -224,7 +239,7 @@ func recordedOutcomeCausePermitsIntent(cause TerminalCause, outcome Outcome) boo
 	case CauseCompletedNormally:
 		return cleanTerminalOutcome(outcome)
 	case CauseResponseUndeliverable:
-		return recordedExecutionOutcome(outcome)
+		return cleanTerminalOutcome(outcome)
 	case CauseCanceledAfterAuthorization:
 		return outcome == OutcomeCanceled
 	case CauseDaemonRestartedAfterAuthorization, CauseSupervisorLostAfterAuthorization, CauseReleaseOutcomeUnknown:
@@ -234,6 +249,27 @@ func recordedOutcomeCausePermitsIntent(cause TerminalCause, outcome Outcome) boo
 	default:
 		return false
 	}
+}
+
+func terminalCauseBackedByDurableFact(record SafetyRecord, cause TerminalCause) bool {
+	switch cause {
+	case CauseReleaseDefinitelyNotSent:
+		return hasLaunchReleaseOutcome(record.Attempt, LaunchReleaseNotSent)
+	case CauseReleaseOutcomeUnknown:
+		return hasLaunchReleaseOutcome(record.Attempt, LaunchReleaseSentUnknown)
+	default:
+		return true
+	}
+}
+
+func hasLaunchReleaseOutcome(proof AttemptProof, outcome LaunchReleaseOutcome) bool {
+	for _, ordinal := range proof.Launches.FilledOrdinals() {
+		launch, ok := proof.Launches.Get(ordinal)
+		if ok && launch.ReleaseOutcome != nil && launch.ReleaseOutcome.Outcome == outcome {
+			return true
+		}
+	}
+	return false
 }
 
 func recordedExecutionOutcome(outcome Outcome) bool {

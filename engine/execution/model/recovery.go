@@ -258,7 +258,8 @@ func PlanRecovery(record SafetyRecord, trigger RecoveryTrigger) (RecoveryPlan, e
 		return plan, nil
 	}
 
-	intent := recoveryTerminalIntent(record, trigger)
+	absenceProven := allLaunchGroupsQuiescent(record.Attempt)
+	intent := recoveryTerminalIntent(record, trigger, absenceProven)
 	if trigger != RecoveryShutdown && needsContainment(record, trigger) && !allLaunchGroupsQuiescent(record.Attempt) {
 		if !hasPreparedLaunch(record.Attempt) {
 			plan.Next = RecoveryAction{Kind: RecoveryFatalUnprovable}
@@ -307,7 +308,19 @@ func needsContainment(record SafetyRecord, _ RecoveryTrigger) bool {
 	return hasAnyGrant(record.Attempt) || hasAnyRelease(record.Attempt)
 }
 
-func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger) TerminalIntent {
+// RecoveryTerminalIntent derives the recovery terminal intent after the caller
+// has resolved whether physical absence was proven.
+func RecoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger, absenceProven bool) (TerminalIntent, error) {
+	if err := trigger.Validate(); err != nil {
+		return TerminalIntent{}, err
+	}
+	if err := ValidateSafetyRecord(record); err != nil {
+		return TerminalIntent{}, err
+	}
+	return recoveryTerminalIntent(record, trigger, absenceProven), nil
+}
+
+func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger, absenceProven bool) TerminalIntent {
 	afterAuthorization := hasAnyGrant(record.Attempt) || hasAnyRelease(record.Attempt)
 	intent := TerminalIntent{DerivedBy: record.AdmittedBy}
 	if record.Outcome != nil {
@@ -318,14 +331,14 @@ func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger) Termin
 	if cause, ok := recordedReleaseFailureCause(record.Attempt); ok {
 		intent.Cause = cause
 		if cause == CauseReleaseOutcomeUnknown {
-			intent.Outcome = OutcomeReaped
+			intent.Outcome = unrecordedAfterAuthorizationOutcome(absenceProven)
 		} else {
 			intent.Outcome = OutcomeFailed
 		}
 		return intent
 	}
-	// Without recorded outcome progress, recovery synthesizes OutcomeReaped only
-	// for launches with grant/release evidence.
+	// Without recorded outcome progress, recovery uses the absence proof to
+	// distinguish reaped from orphaned for authorized launches.
 	switch trigger {
 	case RecoveryCancelAfterGrant:
 		intent.Outcome = OutcomeCanceled
@@ -339,7 +352,7 @@ func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger) Termin
 		intent.Cause = CauseCorruptProjection
 	case RecoveryLiveLoss:
 		if afterAuthorization {
-			intent.Outcome = OutcomeReaped
+			intent.Outcome = unrecordedAfterAuthorizationOutcome(absenceProven)
 			intent.Cause = CauseSupervisorLostAfterAuthorization
 		} else {
 			intent.Outcome = OutcomeFailed
@@ -347,7 +360,7 @@ func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger) Termin
 		}
 	default:
 		if afterAuthorization {
-			intent.Outcome = OutcomeReaped
+			intent.Outcome = unrecordedAfterAuthorizationOutcome(absenceProven)
 			intent.Cause = CauseDaemonRestartedAfterAuthorization
 		} else {
 			intent.Outcome = OutcomeFailed
@@ -355,6 +368,13 @@ func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger) Termin
 		}
 	}
 	return intent
+}
+
+func unrecordedAfterAuthorizationOutcome(absenceProven bool) Outcome {
+	if absenceProven {
+		return OutcomeReaped
+	}
+	return OutcomeOrphaned
 }
 
 func recordedReleaseFailureCause(proof AttemptProof) (TerminalCause, bool) {
