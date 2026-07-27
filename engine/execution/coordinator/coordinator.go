@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
@@ -300,7 +301,7 @@ func (c *Coordinator) contain(ctx context.Context, record model.SafetyRecord, in
 			return fmt.Errorf("record containment quiescence: %w", err)
 		}
 		record = applied.Record
-		_ = cleanup.Err
+		reportCleanupWarning(record.JobID, ordinal, custodian.QuiescenceCauseContain, cleanup.Err)
 	}
 	return nil
 }
@@ -330,9 +331,16 @@ func (c *Coordinator) retire(ctx context.Context, record model.SafetyRecord, inj
 			return fmt.Errorf("record retirement quiescence: %w", err)
 		}
 		record = applied.Record
-		_ = cleanup.Err
+		reportCleanupWarning(record.JobID, ordinal, custodian.QuiescenceCauseRecovery, cleanup.Err)
 	}
 	return nil
+}
+
+func reportCleanupWarning(jobID model.JobID, ordinal model.LaunchOrdinal, cause custodian.QuiescenceCause, err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("agentbus execution: cleanup warning: job=%s ordinal=%s phase=%s: %v", jobID, ordinal, cause, err)
 }
 
 func recoveryAborted(err error) bool {

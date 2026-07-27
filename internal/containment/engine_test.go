@@ -3,6 +3,7 @@ package containment
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -364,6 +365,69 @@ func TestContainmentCoherenceRereadContextCancelFailsClosedWithoutHang(t *testin
 	assertSignals(t, signaler)
 	if observer.calls != 1 {
 		t.Fatalf("observer calls = %d, want 1", observer.calls)
+	}
+}
+
+func TestContainmentContextErrorsClassifyAsContextDone(t *testing.T) {
+	target := testGroupRef(t)
+	retainedTarget := testRetainedGroupRef(t)
+	tests := []struct {
+		name    string
+		target  model.GroupRef
+		engine  Engine
+		wantErr error
+	}{
+		{
+			name:   "observer canceled",
+			target: target,
+			engine: testEngine(
+				&fakeObserver{err: fmt.Errorf("observe: %w", context.Canceled)},
+				&fakeSignaler{},
+			),
+			wantErr: context.Canceled,
+		},
+		{
+			name:   "signal canceled",
+			target: target,
+			engine: testEngine(
+				&fakeObserver{observations: []model.ContainmentObservation{
+					testObservation(target, model.GroupLive, model.ProcessIdentityMatching),
+				}},
+				&fakeSignaler{script: []signalScript{{signal: SignalTerminate, result: SignalUnprovable, err: fmt.Errorf("signal: %w", context.Canceled)}}},
+			),
+			wantErr: context.Canceled,
+		},
+		{
+			name:   "probe deadline",
+			target: retainedTarget,
+			engine: testEngineWithRetained(
+				&fakeObserver{observations: []model.ContainmentObservation{
+					testObservation(retainedTarget, model.GroupLive, model.ProcessIdentityMissing),
+				}},
+				&fakeSignaler{probeErrors: []error{fmt.Errorf("probe: %w", context.DeadlineExceeded)}},
+				&fakeRetainedObject{membership: RetainedMembershipEmpty},
+			),
+			wantErr: context.DeadlineExceeded,
+		},
+		{
+			name:   "retained acquire canceled",
+			target: retainedTarget,
+			engine: testEngineWithRetained(
+				&fakeObserver{},
+				&fakeSignaler{},
+				&fakeRetainedObject{acquireErr: fmt.Errorf("acquire: %w", context.Canceled)},
+			),
+			wantErr: context.Canceled,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outcome := tt.engine.Contain(context.Background(), tt.target, testParams())
+			assertUnprovable(t, outcome, ReasonContextDone)
+			if !errors.Is(outcome.Err, tt.wantErr) {
+				t.Fatalf("outcome error = %v, want %v", outcome.Err, tt.wantErr)
+			}
+		})
 	}
 }
 

@@ -379,8 +379,8 @@ func TestServedStrictCompositionReleaseAckLossConformance(t *testing.T) {
 	resp = rpc(t, conn, reader, "replay-release-ack-loss", protocol.MethodJobSubmit, params)
 	var replay protocol.JobSubmitResult
 	decodeResult(t, resp, &replay)
-	if replay.JobID != submitted.JobID || !replay.Deduplicated || replay.State != engine.StateFailed {
-		t.Fatalf("replay after release ack loss = %+v, want same failed terminal job %s", replay, submitted.JobID)
+	if replay.JobID != submitted.JobID || !replay.Deduplicated || replay.State != engine.StateReaped {
+		t.Fatalf("replay after release ack loss = %+v, want same reaped terminal job %s", replay, submitted.JobID)
 	}
 	afterReplay := readServedNativeCodexExecutions(t, fixture)
 	if len(afterReplay) != len(executions) {
@@ -1441,11 +1441,17 @@ func assertServedNativeReleaseAckLossTerminal(t *testing.T, record model.SafetyR
 	if record.Mode != model.ModeIdentifiedFenced {
 		t.Fatalf("admission mode = %s, want IdentifiedFenced", record.Mode)
 	}
-	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeFailed {
-		t.Fatalf("terminal = %+v, want failed release-ack-loss terminal", record.Terminal)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeReaped {
+		t.Fatalf("terminal = %+v, want reaped release-ack-loss terminal", record.Terminal)
 	}
 	if record.Terminal.Cause != model.CauseReleaseOutcomeUnknown {
 		t.Fatalf("terminal cause = %s, want release_outcome_unknown", record.Terminal.Cause)
+	}
+	if record.Terminal.Proof != model.ProofContained {
+		t.Fatalf("terminal proof = %s, want contained", record.Terminal.Proof)
+	}
+	if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionVerifiedAbsent {
+		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionVerifiedAbsent)
 	}
 	launchProof, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
 	if !ok || launchProof.Group == nil || launchProof.Grant == nil || launchProof.Quiescence == nil {

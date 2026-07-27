@@ -1608,13 +1608,12 @@ func TestAdmissionRecoveryExecutorBoundCurrentObligationContainsOnlyDurableGroup
 	}
 }
 
-func TestAdmissionRecoveryExecutorAttemptsAllLaunchesBeforeUnresolvedFinalization(t *testing.T) {
+func TestAdmissionRecoveryExecutorAttemptsRemainingLaunchBeforeUnresolvedFinalization(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	launcher := newAdmissionFakeLaunchCustodian(t)
 	jobID := model.JobID("job-recovery-all-ordinals")
 	ref := model.AttemptRef{JobID: jobID, AttemptID: "attempt-recovery-all-ordinals", Epoch: 1}
-	firstGroup := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne})
 	secondGroup := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalTwo})
 	boot, err := model.NewBootRef("boot-recovery-all-ordinals-new", "owner-recovery-all-ordinals-new")
 	if err != nil {
@@ -1626,20 +1625,13 @@ func TestAdmissionRecoveryExecutorAttemptsAllLaunchesBeforeUnresolvedFinalizatio
 		JobID:           jobID,
 		BasedOnRevision: token.BasedOnRevision,
 		Trigger:         model.RecoveryStartupLoss,
-		Launches: []model.RecoveryLaunch{
-			{Ordinal: model.LaunchOrdinalOne, Group: firstGroup},
-			{Ordinal: model.LaunchOrdinalTwo, Group: secondGroup},
-		},
+		// Reachable production topology: ordinal 1 has already reached durable
+		// quiescence, so startup recovery only receives the remaining live
+		// ordinal.
+		Launches: []model.RecoveryLaunch{{Ordinal: model.LaunchOrdinalTwo, Group: secondGroup}},
 	}
 	session := &admissionRecoveryFakeSession{
 		items: []model.RecoveryWorkItem{item},
-		afterAdvance: model.RecoveryWorkItem{
-			Token:           token,
-			JobID:           jobID,
-			BasedOnRevision: token.BasedOnRevision,
-			Trigger:         model.RecoveryStartupLoss,
-			Launches:        []model.RecoveryLaunch{{Ordinal: model.LaunchOrdinalTwo, Group: secondGroup}},
-		},
 		finalized: model.SafetyRecord{
 			JobID: jobID,
 			Terminal: &model.TerminalCertificate{
@@ -1658,21 +1650,103 @@ func TestAdmissionRecoveryExecutorAttemptsAllLaunchesBeforeUnresolvedFinalizatio
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.QuiescedLaunches != 1 || report.UnresolvedLaunches != 1 || report.FinalizedJobs != 1 || report.OrphanedJobs != 1 {
-		t.Fatalf("recovery report = %+v, want one quiesced launch, one unresolved launch, one orphaned job", report)
+	if report.QuiescedLaunches != 0 || report.UnresolvedLaunches != 1 || report.FinalizedJobs != 1 || report.OrphanedJobs != 1 {
+		t.Fatalf("recovery report = %+v, want one unresolved remaining launch and one orphaned job", report)
 	}
 	if session.finalizeUnresolvedCalls != 1 {
 		t.Fatalf("FinalizeUnresolved calls = %d, want 1", session.finalizeUnresolvedCalls)
 	}
-	if len(session.recordedOrdinals) != 1 || session.recordedOrdinals[0] != model.LaunchOrdinalOne {
-		t.Fatalf("recorded ordinals = %v, want only ordinal 1", session.recordedOrdinals)
+	if len(session.recordedOrdinals) != 0 {
+		t.Fatalf("recorded ordinals = %v, want none for already-quiesced ordinal 1", session.recordedOrdinals)
 	}
 	contains := launcher.containObservations()
-	if len(contains) != 2 {
-		t.Fatalf("contain attempts = %d, want both launch ordinals attempted", len(contains))
+	if len(contains) != 1 {
+		t.Fatalf("contain attempts = %d, want remaining ordinal attempted", len(contains))
 	}
-	if contains[0].group.Launch.Ordinal != model.LaunchOrdinalOne || contains[1].group.Launch.Ordinal != model.LaunchOrdinalTwo {
-		t.Fatalf("contain ordinals = %s,%s; want 1,2", contains[0].group.Launch.Ordinal, contains[1].group.Launch.Ordinal)
+	if contains[0].group.Launch.Ordinal != model.LaunchOrdinalTwo {
+		t.Fatalf("contain ordinal = %s; want 2", contains[0].group.Launch.Ordinal)
+	}
+	if reason := latch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+}
+
+func TestAdmissionRecoveryExecutorFinalizePlannedCancellationAbortsWithoutFailStop(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	jobID := model.JobID("job-recovery-finalize-planned-cancel")
+	boot, err := model.NewBootRef("boot-recovery-finalize-planned-cancel", "owner-recovery-finalize-planned-cancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := model.RecoveryToken{JobID: jobID, BasedOnRevision: 2, RecoveryBoot: boot, Opaque: "recovery-finalize-planned-cancel-token"}
+	session := &admissionRecoveryFakeSession{
+		items: []model.RecoveryWorkItem{{
+			Token:           token,
+			JobID:           jobID,
+			BasedOnRevision: token.BasedOnRevision,
+			Trigger:         model.RecoveryStartupLoss,
+		}},
+		finalizePlannedErr: context.Canceled,
+	}
+	latch := NewSafetyLatch()
+
+	_, err = recoverAdmissionBeforeReadyReport(ctx, session, launcher, latch)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("recovery error = %v, want context.Canceled", err)
+	}
+	if session.finalizePlannedCalls != 1 {
+		t.Fatalf("FinalizePlanned calls = %d, want 1", session.finalizePlannedCalls)
+	}
+	if reason := latch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+}
+
+func TestAdmissionRecoveryExecutorReportsCleanupWarningAfterQuiescence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cleanupErr := errors.New("recovery cleanup failed after proof")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.cleanupErr = cleanupErr
+	jobID := model.JobID("job-recovery-cleanup-warning")
+	ref := model.AttemptRef{JobID: jobID, AttemptID: "attempt-recovery-cleanup-warning", Epoch: 1}
+	group := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne})
+	boot, err := model.NewBootRef("boot-recovery-cleanup-warning", "owner-recovery-cleanup-warning")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := model.RecoveryToken{JobID: jobID, BasedOnRevision: 2, RecoveryBoot: boot, Opaque: "recovery-cleanup-warning-token"}
+	session := &admissionRecoveryFakeSession{
+		items: []model.RecoveryWorkItem{{
+			Token:           token,
+			JobID:           jobID,
+			BasedOnRevision: token.BasedOnRevision,
+			Trigger:         model.RecoveryStartupLoss,
+			Launches:        []model.RecoveryLaunch{{Ordinal: model.LaunchOrdinalOne, Group: group}},
+		}},
+		afterAdvance: model.RecoveryWorkItem{
+			Token:           token,
+			JobID:           jobID,
+			BasedOnRevision: token.BasedOnRevision,
+			Trigger:         model.RecoveryStartupLoss,
+		},
+	}
+	latch := NewSafetyLatch()
+
+	report, err := recoverAdmissionBeforeReadyReport(ctx, session, launcher, latch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.QuiescedLaunches != 1 || report.CleanupWarnings != 1 || report.FinalizedJobs != 1 {
+		t.Fatalf("recovery report = %+v, want one quiesced launch, cleanup warning, and finalized job", report)
+	}
+	if session.finalizePlannedCalls != 1 {
+		t.Fatalf("FinalizePlanned calls = %d, want 1", session.finalizePlannedCalls)
+	}
+	if len(session.recordedOrdinals) != 1 || session.recordedOrdinals[0] != model.LaunchOrdinalOne {
+		t.Fatalf("recorded ordinals = %v, want ordinal 1", session.recordedOrdinals)
 	}
 	if reason := latch.Reason(); reason != nil {
 		t.Fatalf("safety latch tripped: %v", reason)
@@ -1728,6 +1802,7 @@ type admissionRecoveryFakeSession struct {
 	items                   []model.RecoveryWorkItem
 	afterAdvance            model.RecoveryWorkItem
 	finalized               model.SafetyRecord
+	finalizePlannedErr      error
 	recordedOrdinals        []model.LaunchOrdinal
 	finalizePlannedCalls    int
 	finalizeUnresolvedCalls int
@@ -1743,6 +1818,9 @@ func (s *admissionRecoveryFakeSession) AdvanceRecovery(context.Context, model.Re
 
 func (s *admissionRecoveryFakeSession) FinalizePlanned(context.Context, model.RecoveryToken) error {
 	s.finalizePlannedCalls++
+	if s.finalizePlannedErr != nil {
+		return s.finalizePlannedErr
+	}
 	s.items = nil
 	return nil
 }
@@ -5502,6 +5580,63 @@ func TestDeferredLaunchRunsOnlyAfterSuccessfulAck(t *testing.T) {
 	}
 	close(release)
 	waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+}
+
+func TestLiveReleaseAckLossUnprovableAbsenceTerminalizesOrphanedWithoutRelaunch(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.releaseOutcome = custodian.ReleaseOutcomeUnknown
+	launcher.releaseErr = errors.New("release ack lost after send")
+	launcher.containErr = &custodian.CleanupUnresolvedError{
+		Reason:   containment.ReasonProbeUnprovable,
+		Decision: model.Unprovable,
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, launcher)
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-live-release-ack-loss-unresolved",
+		RequestID:    "request-live-release-ack-loss-unresolved",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "ack lost"},
+	}
+
+	submitted := submitIdentifiedViaScriptedRequest(t, server, params)
+	record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+	if record.Terminal == nil ||
+		record.Terminal.Outcome != model.OutcomeOrphaned ||
+		record.Terminal.Proof != model.ProofUnresolvedAbsence ||
+		record.Terminal.Cause != model.CauseReleaseOutcomeUnknown {
+		t.Fatalf("terminal = %+v, want orphaned release_outcome_unknown unresolved absence", record.Terminal)
+	}
+	if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionUnresolved {
+		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
+	}
+	if got := launcher.releaseCount(); got != 1 {
+		t.Fatalf("release attempts = %d, want 1", got)
+	}
+	if got := launcher.containCount(); got != 1 {
+		t.Fatalf("contain attempts = %d, want 1", got)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend sessions = %d, want 1", got)
+	}
+
+	replay := replayIdentifiedSubmit(t, server, params)
+	if replay.JobID != submitted.JobID || !replay.Deduplicated || replay.State != engine.StateOrphaned {
+		t.Fatalf("replay = %+v, want same orphaned terminal job %s", replay, submitted.JobID)
+	}
+	if got := launcher.releaseCount(); got != 1 {
+		t.Fatalf("release attempts after replay = %d, want unchanged 1", got)
+	}
+	if got := launcher.containCount(); got != 1 {
+		t.Fatalf("contain attempts after replay = %d, want unchanged 1", got)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend sessions after replay = %d, want unchanged 1", got)
+	}
+	if reason := server.safetyLatch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
 }
 
 func TestHeartbeatRacingCompletionDoesNotResurrectTerminalRecord(t *testing.T) {

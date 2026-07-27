@@ -308,7 +308,7 @@ func (a *app) runAdmissionRecover(ctx context.Context, args []string, out, errOu
 	if *jsonOut {
 		return writeOrError(out, errOut, report)
 	}
-	fmt.Fprintf(out, "mode=%s workItems=%d quiescedLaunches=%d finalizedJobs=%d recoveryPasses=%d\n", report.Mode, report.WorkItems, report.QuiescedLaunches, report.FinalizedJobs, report.RecoveryPasses)
+	fmt.Fprintf(out, "mode=%s workItems=%d quiescedLaunches=%d finalizedJobs=%d cleanupWarnings=%d recoveryPasses=%d\n", report.Mode, report.WorkItems, report.QuiescedLaunches, report.FinalizedJobs, report.CleanupWarnings, report.RecoveryPasses)
 	return 0
 }
 

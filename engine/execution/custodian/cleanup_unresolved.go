@@ -50,6 +50,9 @@ func cleanupUnresolvedFromPhysicalOutcome(outcome PhysicalOutcome) error {
 	if !outcome.Unprovable() {
 		return nil
 	}
+	if errors.Is(outcome.Err, context.Canceled) || errors.Is(outcome.Err, context.DeadlineExceeded) {
+		return outcome.Err
+	}
 	switch outcome.Reason {
 	case containment.ReasonContextDone:
 		if outcome.Err != nil {

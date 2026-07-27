@@ -1,10 +1,12 @@
 package coordinator
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -148,6 +150,16 @@ func TestCancelAfterPermitContainsBeforeTerminal(t *testing.T) {
 }
 
 func TestCancelAfterPermitRecordsQuiescenceBeforeCleanupWarning(t *testing.T) {
+	var logs bytes.Buffer
+	oldLogWriter := log.Writer()
+	oldLogFlags := log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(oldLogWriter)
+		log.SetFlags(oldLogFlags)
+	}()
+
 	ctx := context.Background()
 	h := newHarness(t, "cancel-cleanup-order")
 	events := &coordinatorEventLog{}
@@ -189,6 +201,12 @@ func TestCancelAfterPermitRecordsQuiescenceBeforeCleanupWarning(t *testing.T) {
 	}
 	if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionVerifiedAbsent {
 		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionVerifiedAbsent)
+	}
+	gotLogs := logs.String()
+	if !strings.Contains(gotLogs, "cleanup warning") ||
+		!strings.Contains(gotLogs, cleanupErr.Error()) ||
+		!strings.Contains(gotLogs, accepted.Record.JobID.String()) {
+		t.Fatalf("cleanup warning log = %q, want job id and cleanup error", gotLogs)
 	}
 }
 

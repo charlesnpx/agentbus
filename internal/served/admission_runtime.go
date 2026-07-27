@@ -482,31 +482,36 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 	if !ok {
 		return fmt.Errorf("cannot complete admission job %s with state %s", run.jobID, state)
 	}
-	if outcome == model.OutcomeFailed {
-		if intent, ok := admissionRecordedReleaseFailureIntent(snapshot.Record); ok {
-			return coord.Finalize(context.Background(), jobID, intent)
+	if intent, ok, err := admissionRecordedReleaseTerminalIntent(snapshot.Record); ok {
+		if err != nil {
+			return err
 		}
+		return coord.Finalize(context.Background(), jobID, intent)
 	}
 	return coord.Complete(context.Background(), jobID, outcome, []byte(text), nil)
 }
 
-func admissionRecordedReleaseFailureIntent(record model.SafetyRecord) (model.TerminalIntent, bool) {
+func admissionRecordedReleaseTerminalIntent(record model.SafetyRecord) (model.TerminalIntent, bool, error) {
 	if record.Terminal != nil {
-		return model.TerminalIntent{}, false
+		return model.TerminalIntent{}, false, nil
 	}
-	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+	ordinals := record.Attempt.Launches.FilledOrdinals()
+	for i := len(ordinals) - 1; i >= 0; i-- {
+		ordinal := ordinals[i]
 		launch, ok := record.Attempt.Launches.Get(ordinal)
-		if !ok || launch.ReleaseOutcome == nil {
+		if !ok || launch.Grant == nil || launch.ReleaseOutcome == nil {
 			continue
 		}
 		switch launch.ReleaseOutcome.Outcome {
-		case model.LaunchReleaseSentUnknown:
-			return model.TerminalIntent{Outcome: model.OutcomeFailed, Cause: model.CauseReleaseOutcomeUnknown}, true
-		case model.LaunchReleaseNotSent:
-			return model.TerminalIntent{Outcome: model.OutcomeFailed, Cause: model.CauseReleaseDefinitelyNotSent}, true
+		case model.LaunchReleaseSentUnknown, model.LaunchReleaseNotSent:
+			intent, err := model.RecoveryTerminalIntent(record, model.RecoveryLiveLoss, admissionAllLaunchGroupsQuiescent(record))
+			if err != nil {
+				return model.TerminalIntent{}, true, err
+			}
+			return intent, true, nil
 		}
 	}
-	return model.TerminalIntent{}, false
+	return model.TerminalIntent{}, false, nil
 }
 
 func admissionOutcomeForState(state engine.JobState) (model.Outcome, bool) {

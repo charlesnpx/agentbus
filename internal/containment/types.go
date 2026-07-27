@@ -2,6 +2,7 @@ package containment
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 	"unicode/utf8"
@@ -382,6 +383,9 @@ func AbsentOutcome(decision model.ContainmentDecision) Outcome {
 }
 
 func UnprovableOutcome(reason UnprovableReason, decision model.ContainmentDecision, err error) Outcome {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		reason = ReasonContextDone
+	}
 	return Outcome{Kind: OutcomeUnprovable, Reason: reason, Decision: decision, Err: err}
 }
 

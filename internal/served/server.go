@@ -2274,51 +2274,53 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 	}()
 	defer run.active.cancel()
 	if run.active.requestedTerminal() != "" {
-		s.finalizeRequestedTerminal(run)
+		if err := s.finalizeRequestedTerminal(run); err != nil {
+			s.handleRunFinalizationError(run, err)
+		}
 		return
 	}
 	attemptPrompt := applyPrologue(run.policy, run.prompt)
 	text, state, err := s.runAttempt(ctx, run, attemptPrompt, run.write, model.LaunchOrdinalOne)
 	if requested := run.active.requestedTerminal(); requested != "" {
-		s.finalizeTerminal(run, requested, text, nil)
+		s.completeRunTerminal(run, requested, text, nil)
 		return
 	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			s.finalizeTerminal(run, engine.StateTimedOut, text, skippedStampForRun(run, s.registry, engine.SkipTimeout))
+			s.completeRunTerminal(run, engine.StateTimedOut, text, skippedStampForRun(run, s.registry, engine.SkipTimeout))
 			return
 		}
 		if errors.Is(err, context.Canceled) {
 			state = engine.StateInterrupted
 		}
-		s.finalizeTerminal(run, state, text, skippedStampForRun(run, s.registry, skippedReasonForState(state)))
+		s.completeRunTerminal(run, state, text, skippedStampForRun(run, s.registry, skippedReasonForState(state)))
 		return
 	}
 
 	validation, retryPrompt, compliantState, err := s.validateAttempt(text, run, 1, false)
 	if err != nil {
-		s.finalizeTerminal(run, engine.StateFailed, text, skippedStampForRun(run, s.registry, engine.SkipBackendError))
+		s.completeRunTerminal(run, engine.StateFailed, text, skippedStampForRun(run, s.registry, engine.SkipBackendError))
 		return
 	}
 	if retryPrompt != "" {
 		retryText, retryState, retryErr := s.runAttempt(ctx, run, retryPrompt, false, model.LaunchOrdinalTwo)
 		if requested := run.active.requestedTerminal(); requested != "" {
-			s.finalizeTerminal(run, requested, retryText, nil)
+			s.completeRunTerminal(run, requested, retryText, nil)
 			return
 		}
 		if retryErr != nil {
-			s.finalizeTerminal(run, retryState, retryText, skippedStampForRun(run, s.registry, skippedReasonForState(retryState)))
+			s.completeRunTerminal(run, retryState, retryText, skippedStampForRun(run, s.registry, skippedReasonForState(retryState)))
 			return
 		}
 		retryValidation, _, retryCompliantState, err := s.validateAttempt(retryText, run, 2, true)
 		if err != nil {
-			s.finalizeTerminal(run, engine.StateFailed, retryText, skippedStampForRun(run, s.registry, engine.SkipBackendError))
+			s.completeRunTerminal(run, engine.StateFailed, retryText, skippedStampForRun(run, s.registry, engine.SkipBackendError))
 			return
 		}
-		s.finalizeTerminal(run, retryCompliantState, retryText, retryValidation.Stamp)
+		s.completeRunTerminal(run, retryCompliantState, retryText, retryValidation.Stamp)
 		return
 	}
-	s.finalizeTerminal(run, compliantState, text, validation.Stamp)
+	s.completeRunTerminal(run, compliantState, text, validation.Stamp)
 }
 
 func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, write bool, ordinal model.LaunchOrdinal) (string, engine.JobState, error) {
@@ -2457,15 +2459,38 @@ func (s *Server) resolvePolicy(policy *engine.TurnPolicy) (resolvedPolicy, error
 }
 
 func (s *Server) finalizeFailure(run jobRun, err error) {
-	_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
+	if finalizeErr := s.finalizeTerminal(run, engine.StateFailed, "", nil); finalizeErr != nil {
+		s.handleRunFinalizationError(run, errors.Join(err, finalizeErr))
+	}
 }
 
-func (s *Server) finalizeRequestedTerminal(run jobRun) {
+func (s *Server) finalizeRequestedTerminal(run jobRun) error {
 	state := run.active.requestedTerminal()
 	if state == "" {
 		state = engine.StateCanceled
 	}
-	_ = s.finalizeTerminal(run, state, "", nil)
+	return s.finalizeTerminal(run, state, "", nil)
+}
+
+func (s *Server) completeRunTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) {
+	if err := s.finalizeTerminal(run, state, text, stamp); err != nil {
+		s.handleRunFinalizationError(run, err)
+	}
+}
+
+func (s *Server) handleRunFinalizationError(run jobRun, err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("agentbus daemon: job %s finalization failed: %v", run.jobID, err)
+	if !run.admissionControlled {
+		return
+	}
+	failStopCtx, cancel := detachedAdmissionFailStopContext(context.Background())
+	defer cancel()
+	if stopErr := s.failStopAdmissionReady(failStopCtx, err); stopErr != nil {
+		log.Printf("agentbus daemon: job %s finalization fail-stop failed: %v", run.jobID, stopErr)
+	}
 }
 
 func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {

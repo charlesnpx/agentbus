@@ -3,6 +3,7 @@ package custodian
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -69,6 +70,10 @@ func TestPhysicalOutcomeErrorClassifiesCleanupUnresolvedBoundary(t *testing.T) {
 		{name: "probe contradicted observer", reason: containment.ReasonProbeContradictedObserver, unresolved: true},
 		{name: "absence deadline exceeded", reason: containment.ReasonAbsenceDeadlineExceeded, unresolved: true},
 		{name: "context canceled", reason: containment.ReasonContextDone, cause: context.Canceled, aborted: true},
+		{name: "canceled observation", reason: containment.ReasonObservationFailed, cause: fmt.Errorf("observer: %w", context.Canceled), aborted: true},
+		{name: "deadline signal", reason: containment.ReasonSignalUnprovable, cause: fmt.Errorf("signal: %w", context.DeadlineExceeded), aborted: true},
+		{name: "canceled probe", reason: containment.ReasonProbeUnprovable, cause: fmt.Errorf("probe: %w", context.Canceled), aborted: true},
+		{name: "canceled authorization", reason: containment.ReasonAuthorizationUnprovable, cause: fmt.Errorf("authorize: %w", context.Canceled), aborted: true},
 		{name: "invalid input fatal", reason: containment.ReasonInvalidInput},
 		{name: "authorization failed fatal", reason: containment.ReasonAuthorizationFailed},
 		{name: "unexpected decision fatal", reason: containment.ReasonUnexpectedDecision},
@@ -90,8 +95,8 @@ func TestPhysicalOutcomeErrorClassifiesCleanupUnresolvedBoundary(t *testing.T) {
 					t.Fatalf("CleanupUnresolved(%v) = %+v, want reason %s", err, unresolved, tt.reason)
 				}
 			}
-			if tt.aborted && !errors.Is(err, context.Canceled) {
-				t.Fatalf("context abort error = %v, want context.Canceled", err)
+			if tt.aborted && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("context abort error = %v, want context cancellation or deadline", err)
 			}
 		})
 	}

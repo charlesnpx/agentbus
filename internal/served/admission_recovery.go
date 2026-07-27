@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
@@ -34,6 +35,7 @@ type AdmissionRecoveryReport struct {
 	FinalizedJobs      int    `json:"finalizedJobs"`
 	OrphanedJobs       int    `json:"orphanedJobs"`
 	UnresolvedLaunches int    `json:"unresolvedLaunches"`
+	CleanupWarnings    int    `json:"cleanupWarnings,omitempty"`
 	RecoveryPasses     int    `json:"recoveryPasses"`
 }
 
@@ -80,6 +82,7 @@ func (e *admissionRecoveryExecutor) RecoverReport(ctx context.Context) (Admissio
 			report.FinalizedJobs += itemReport.FinalizedJobs
 			report.OrphanedJobs += itemReport.OrphanedJobs
 			report.UnresolvedLaunches += itemReport.UnresolvedLaunches
+			report.CleanupWarnings += itemReport.CleanupWarnings
 			progressed = true
 		}
 		if !progressed {
@@ -99,7 +102,7 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 		}
 		if len(current.Launches) == 0 {
 			if err := e.session.FinalizePlanned(ctx, current.Token); err != nil {
-				return report, fmt.Errorf("%w: finalize planned recovery for %s: %v", authority.ErrRecoveryNeeded, current.JobID, err)
+				return report, fmt.Errorf("%w: finalize planned recovery for %s: %w", authority.ErrRecoveryNeeded, current.JobID, err)
 			}
 			report.FinalizedJobs++
 			return report, nil
@@ -110,7 +113,7 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 			if unresolved[recoveryLaunch.Ordinal] {
 				continue
 			}
-			next, launchUnresolved, err := e.recoverLaunch(ctx, current, recoveryLaunch)
+			next, launchUnresolved, cleanupWarning, err := e.recoverLaunch(ctx, current, recoveryLaunch)
 			if err != nil {
 				return report, err
 			}
@@ -118,6 +121,9 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 				unresolved[recoveryLaunch.Ordinal] = true
 				report.UnresolvedLaunches++
 				continue
+			}
+			if cleanupWarning != nil {
+				report.CleanupWarnings++
 			}
 			report.QuiescedLaunches++
 			current = next
@@ -143,35 +149,37 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 	return report, fmt.Errorf("%w: recovery item %s did not converge", authority.ErrRecoveryNeeded, item.JobID)
 }
 
-func (e *admissionRecoveryExecutor) recoverLaunch(ctx context.Context, item model.RecoveryWorkItem, recoveryLaunch model.RecoveryLaunch) (model.RecoveryWorkItem, bool, error) {
+func (e *admissionRecoveryExecutor) recoverLaunch(ctx context.Context, item model.RecoveryWorkItem, recoveryLaunch model.RecoveryLaunch) (model.RecoveryWorkItem, bool, error, error) {
 	verified, cleanup, err := e.launch.ContainAndVerify(ctx, recoveryLaunch.Group, custodian.QuiescenceCauseRecovery)
 	if err != nil {
 		if custodian.IsCleanupUnresolved(err) {
-			return model.RecoveryWorkItem{}, true, nil
+			return model.RecoveryWorkItem{}, true, nil, nil
 		}
 		if recoveryAborted(err) {
-			return model.RecoveryWorkItem{}, false, err
+			return model.RecoveryWorkItem{}, false, nil, err
 		}
-		return model.RecoveryWorkItem{}, false, fmt.Errorf("%w: contain recovery launch %s ordinal %s: %w", authority.ErrRecoveryNeeded, item.JobID, recoveryLaunch.Ordinal, err)
+		return model.RecoveryWorkItem{}, false, nil, fmt.Errorf("%w: contain recovery launch %s ordinal %s: %w", authority.ErrRecoveryNeeded, item.JobID, recoveryLaunch.Ordinal, err)
 	}
 	if err := item.Validate(); err != nil {
-		return model.RecoveryWorkItem{}, false, fmt.Errorf("%w: invalid recovery work item: %v", authority.ErrRecoveryNeeded, err)
+		return model.RecoveryWorkItem{}, false, nil, fmt.Errorf("%w: invalid recovery work item: %v", authority.ErrRecoveryNeeded, err)
 	}
 	if err := e.session.RecordQuiescence(ctx, item.Token, recoveryLaunch.Ordinal, verified); err != nil {
 		if recoveryAborted(err) {
-			return model.RecoveryWorkItem{}, false, err
+			return model.RecoveryWorkItem{}, false, nil, err
 		}
-		return model.RecoveryWorkItem{}, false, fmt.Errorf("%w: record recovery quiescence for %s ordinal %s: %w", authority.ErrRecoveryNeeded, item.JobID, recoveryLaunch.Ordinal, err)
+		return model.RecoveryWorkItem{}, false, nil, fmt.Errorf("%w: record recovery quiescence for %s ordinal %s: %w", authority.ErrRecoveryNeeded, item.JobID, recoveryLaunch.Ordinal, err)
+	}
+	if cleanup.Err != nil {
+		log.Printf("agentbus daemon: admission cleanup warning: job=%s ordinal=%s phase=recovery: %v", item.JobID, recoveryLaunch.Ordinal, cleanup.Err)
 	}
 	next, err := e.session.AdvanceRecovery(ctx, item.Token)
 	if err != nil {
 		if recoveryAborted(err) {
-			return model.RecoveryWorkItem{}, false, err
+			return model.RecoveryWorkItem{}, false, cleanup.Err, err
 		}
-		return model.RecoveryWorkItem{}, false, fmt.Errorf("%w: advance recovery for %s: %w", authority.ErrRecoveryNeeded, item.JobID, err)
+		return model.RecoveryWorkItem{}, false, cleanup.Err, fmt.Errorf("%w: advance recovery for %s: %w", authority.ErrRecoveryNeeded, item.JobID, err)
 	}
-	_ = cleanup.Err
-	return next, false, nil
+	return next, false, cleanup.Err, nil
 }
 
 func recoveryAborted(err error) bool {
