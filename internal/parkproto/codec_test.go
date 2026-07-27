@@ -336,6 +336,7 @@ func TestReleaseGroupRefRetainedDomainRoundTripRequiresCurrentFields(t *testing.
 	groupRef.PIDNamespaceState = model.PIDNamespaceKnown
 	groupRef.RetainedDomainID = "retained-domain-1"
 	groupRef.RetainedDomainState = model.RetainedDomainKnown
+	groupRef.RetainedID = "retained-1"
 	groupDigest, err := DigestGroupRef(groupRef)
 	if err != nil {
 		t.Fatal(err)
@@ -415,6 +416,7 @@ func TestReleaseBindingRejectsDifferentlyShapedExpectedGroupRef(t *testing.T) {
 	differentGroup := expectedGroup
 	differentGroup.RetainedDomainID = "retained-domain-different"
 	differentGroup.RetainedDomainState = model.RetainedDomainKnown
+	differentGroup.RetainedID = "retained-different"
 	differentDigest, err := DigestGroupRef(differentGroup)
 	if err != nil {
 		t.Fatal(err)

@@ -1035,35 +1035,39 @@ func TestPreOpenFreelistPreflightRejectsCorruptFreelistBeforeBoltOpen(t *testing
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			path := createClosedSeededBboltFileForStructuralTest(t, "freelist-"+tt.name, 600)
-			tt.corrupt(t, path)
-			corruptBytes := readFileBytesForTest(t, path)
+	for _, pageSize := range []int{4096, 16384} {
+		t.Run(fmt.Sprintf("page-size-%d", pageSize), func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					path := createClosedSeededBboltFileWithPageSizeForStructuralTest(t, "freelist-"+tt.name, 600, pageSize)
+					tt.corrupt(t, path)
+					corruptBytes := readFileBytesForTest(t, path)
 
-			calledOpenFile := false
-			repo, err := OpenExisting(path, &bolt.Options{
-				Timeout: time.Second,
-				OpenFile: func(string, int, os.FileMode) (*os.File, error) {
-					calledOpenFile = true
-					panic("bolt open reached corrupt freelist")
-				},
-			})
-			if err == nil {
-				_ = repo.Close()
-				t.Fatal("OpenExisting succeeded for corrupt freelist, want ErrCorruptRecord")
-			}
-			if calledOpenFile {
-				t.Fatal("OpenExisting called bolt.Open after corrupt freelist preflight failure")
-			}
-			if !errors.Is(err, repository.ErrCorruptRecord) {
-				t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
-			}
-			if !errorTreeContains(err, tt.want) {
-				t.Fatalf("OpenExisting error = %v, want diagnostic containing %q", err, tt.want)
-			}
-			if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
-				t.Fatal("OpenExisting corrupt freelist failure mutated database bytes")
+					calledOpenFile := false
+					repo, err := OpenExisting(path, &bolt.Options{
+						Timeout: time.Second,
+						OpenFile: func(string, int, os.FileMode) (*os.File, error) {
+							calledOpenFile = true
+							panic("bolt open reached corrupt freelist")
+						},
+					})
+					if err == nil {
+						_ = repo.Close()
+						t.Fatal("OpenExisting succeeded for corrupt freelist, want ErrCorruptRecord")
+					}
+					if calledOpenFile {
+						t.Fatal("OpenExisting called bolt.Open after corrupt freelist preflight failure")
+					}
+					if !errors.Is(err, repository.ErrCorruptRecord) {
+						t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
+					}
+					if !errorTreeContains(err, tt.want) {
+						t.Fatalf("OpenExisting error = %v, want diagnostic containing %q", err, tt.want)
+					}
+					if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+						t.Fatal("OpenExisting corrupt freelist failure mutated database bytes")
+					}
+				})
 			}
 		})
 	}
@@ -1375,8 +1379,29 @@ func corruptActiveBoltFreelistCountExceedsHighWaterForTest(t *testing.T, path st
 		t.Fatalf("read freelist page: %v", err)
 	}
 	span := uint64(page.overflow) + 1
-	capacity := (span*meta.pageSize - boltPageHeaderSize) / 8
-	count := meta.pgid + 1
+	capacity := boltFreelistCapacityForTest(span, meta.pageSize)
+	highWater := meta.pgid
+	if capacity <= highWater {
+		info, err := file.Stat()
+		if err != nil {
+			t.Fatalf("stat bbolt file: %v", err)
+		}
+		filePages := uint64(info.Size()) / meta.pageSize
+		for {
+			span++
+			if span == 0 || meta.freelist > filePages-span {
+				t.Fatalf("test freelist span cannot fit count above high water mark %d in %d file pages", meta.pgid, filePages)
+			}
+			capacity = boltFreelistCapacityForTest(span, meta.pageSize)
+			highWater = max(meta.root+1, meta.freelist+span)
+			if capacity > highWater {
+				break
+			}
+		}
+		writeBoltPageOverflowForTest(t, file, meta.pageSize, meta.freelist, uint32(span-1))
+		writeActiveBoltMetaPgidForTest(t, path, highWater)
+	}
+	count := highWater + 1
 	if count >= 0xffff {
 		t.Fatalf("test freelist count %d cannot be encoded as a simple count", count)
 	}
@@ -1384,6 +1409,26 @@ func corruptActiveBoltFreelistCountExceedsHighWaterForTest(t *testing.T, path st
 		t.Fatalf("test freelist count %d exceeds freelist capacity %d", count, capacity)
 	}
 	writeBoltPageCountForTest(t, file, meta.pageSize, meta.freelist, uint16(count))
+}
+
+func boltFreelistCapacityForTest(span, pageSize uint64) uint64 {
+	return (span*pageSize - boltPageHeaderSize) / 8
+}
+
+func writeActiveBoltMetaPgidForTest(t *testing.T, path string, pgid uint64) {
+	t.Helper()
+	mutateActiveBoltMetaForTest(t, path, func(meta []byte) {
+		binary.LittleEndian.PutUint64(meta[40:48], pgid)
+	})
+}
+
+func writeBoltPageOverflowForTest(t *testing.T, file *os.File, pageSize, pageID uint64, overflow uint32) {
+	t.Helper()
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], overflow)
+	if _, err := file.WriteAt(buf[:], int64(pageID*pageSize+12)); err != nil {
+		t.Fatalf("write page %d overflow: %v", pageID, err)
+	}
 }
 
 func writeBoltPageCountForTest(t *testing.T, file *os.File, pageSize, pageID uint64, count uint16) {
@@ -1474,8 +1519,17 @@ func inlineBucketPageWithBucketValueForTest(value []byte) []byte {
 
 func createClosedSeededBboltFileForStructuralTest(t *testing.T, name string, count int) string {
 	t.Helper()
+	return createClosedSeededBboltFileWithPageSizeForStructuralTest(t, name, count, 0)
+}
+
+func createClosedSeededBboltFileWithPageSizeForStructuralTest(t *testing.T, name string, count, pageSize int) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "admission-"+name+".db")
-	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	options := &bolt.Options{Timeout: time.Second}
+	if pageSize > 0 {
+		options.PageSize = pageSize
+	}
+	repo, err := Create(path, options)
 	if err != nil {
 		t.Fatal(err)
 	}
