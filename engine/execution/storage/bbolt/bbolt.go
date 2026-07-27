@@ -490,6 +490,8 @@ const (
 
 type boltPreflightMeta struct {
 	pageSize uint64
+	root     uint64
+	freelist uint64
 	pgid     uint64
 	txid     uint64
 }
@@ -602,6 +604,8 @@ func readBoltPreflightMetaAt(file *os.File, pageID, offset uint64) (boltPrefligh
 	}
 	return boltPreflightMeta{
 		pageSize: pageSize,
+		root:     binary.LittleEndian.Uint64(meta[16:24]),
+		freelist: binary.LittleEndian.Uint64(meta[32:40]),
 		pgid:     binary.LittleEndian.Uint64(meta[40:48]),
 		txid:     binary.LittleEndian.Uint64(meta[48:56]),
 	}, true, nil
@@ -902,6 +906,7 @@ func auditIntegrityTx(tx *bolt.Tx) error {
 	var findings []error
 	if err := checkStructuralIntegrityTx(tx); err != nil {
 		findings = append(findings, repository.NewIntegrityFinding("structure", "", err))
+		return repository.NewIntegrityError(findings)
 	}
 	if err := verifyInitializedStructureTx(tx, "audit"); err != nil {
 		findings = append(findings, repository.NewIntegrityFinding("structure", "", err))
@@ -984,15 +989,29 @@ func auditJobProjectionRepairableFinding(image repository.JobImage, err error) b
 	}
 }
 
-func checkStructuralIntegrityTx(tx *bolt.Tx) error {
-	// bbolt's Tx.Check walks arbitrary page links in a helper goroutine. On
-	// deliberately corrupted files that can panic outside this stack's recover
-	// boundary, so runtime admission uses the safe file-level header preflight
-	// before continuing with direct bucket/meta/record reads.
-	if tx == nil || tx.DB() == nil || tx.DB().Path() == "" {
+func checkStructuralIntegrityTx(tx *bolt.Tx) (err error) {
+	if tx == nil {
 		return nil
 	}
-	return preflightBoltPageHeaders(tx.DB().Path())
+	path := ""
+	if tx.DB() != nil {
+		path = tx.DB().Path()
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("%w: bbolt structural integrity check panic for %s: %v", repository.ErrCorruptRecord, path, recovered)
+		}
+	}()
+	var findings []error
+	for checkErr := range tx.Check() {
+		if checkErr != nil {
+			findings = append(findings, checkErr)
+		}
+	}
+	if err := repository.NewIntegrityError(findings); err != nil {
+		return fmt.Errorf("%w: bbolt structural integrity check failed for %s: %w", repository.ErrCorruptRecord, path, err)
+	}
+	return nil
 }
 
 func (r *Repository) InjectCorruptSafetyForTest(jobID model.JobID, diagnostic string) {

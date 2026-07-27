@@ -90,7 +90,7 @@ func (backend *retainedNativeContainmentBackend) beforeMonitorBind(ctx context.C
 	if backend == nil || backend.capability == nil {
 		return model.GroupRef{}, fmt.Errorf("%w: retained containment backend is nil", ErrNativeCustodianUnavailable)
 	}
-	if group.RetainedID != backend.identity.RetainedID {
+	if group.RetainedID != "" && group.RetainedID != backend.identity.RetainedID {
 		return model.GroupRef{}, fmt.Errorf("%w: launch retained id %q does not match retained id %q", ErrNativeCustodianUnavailable, group.RetainedID, backend.identity.RetainedID)
 	}
 	expected, err := procgroup.NewProcessClaim(

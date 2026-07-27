@@ -918,7 +918,7 @@ func validateBoundMonitorGroup(releaseGroup, boundGroup model.GroupRef) error {
 	if releaseGroup.Monitor != boundGroup.Monitor {
 		return fmt.Errorf("bound group monitor changed")
 	}
-	if releaseGroup.RetainedID != boundGroup.RetainedID {
+	if releaseGroup.RetainedID != "" && releaseGroup.RetainedID != boundGroup.RetainedID {
 		return fmt.Errorf("bound group retained id changed")
 	}
 	return nil
@@ -1002,18 +1002,23 @@ func verifyMonitorReadyIdentity(reader identityReader, monitor *MonitorProcess, 
 }
 
 func groupRefFromClaims(worker, monitor procgroup.ProcessClaim, custodyID model.CustodyID, launchKey model.LaunchKey, retainedID string, noRetainedID bool) model.GroupRef {
-	if retainedID == "" && !noRetainedID {
+	domain := worker.KernelDomainID
+	if noRetainedID || domain.RetainedDomainState != model.RetainedDomainKnown {
+		retainedID = ""
+		domain.RetainedDomainID = ""
+		domain.RetainedDomainState = model.RetainedDomainNotApplicable
+	} else if retainedID == "" {
 		retainedID = defaultRetainedID(worker, monitor, custodyID, launchKey)
 	}
 	return model.GroupRef{
 		Version:             1,
 		CustodyID:           custodyID,
 		Launch:              launchKey,
-		HostBootID:          worker.KernelDomainID.HostBootID,
-		PIDNamespaceID:      worker.KernelDomainID.PIDNamespaceID,
-		PIDNamespaceState:   worker.KernelDomainID.PIDNamespaceState,
-		RetainedDomainID:    worker.KernelDomainID.RetainedDomainID,
-		RetainedDomainState: worker.KernelDomainID.RetainedDomainState,
+		HostBootID:          domain.HostBootID,
+		PIDNamespaceID:      domain.PIDNamespaceID,
+		PIDNamespaceState:   domain.PIDNamespaceState,
+		RetainedDomainID:    domain.RetainedDomainID,
+		RetainedDomainState: domain.RetainedDomainState,
 		PGID:                worker.PGID,
 		Leader: model.ProcessIdentity{
 			PID:               worker.PID,

@@ -14,9 +14,16 @@ import (
 const admissionRecoveryMaxSteps = 1024
 
 type admissionRecoveryExecutor struct {
-	session *authority.RecoverySession
+	session admissionRecoverySession
 	launch  launch.CustodianPort
 	latch   *SafetyLatch
+}
+
+type admissionRecoverySession interface {
+	WorkItems(context.Context) ([]model.RecoveryWorkItem, error)
+	FinalizePlanned(context.Context, model.RecoveryToken) error
+	RecordQuiescence(context.Context, any, model.LaunchOrdinal, custodian.VerifiedQuiescence) error
+	AdvanceRecovery(context.Context, model.RecoveryToken) (model.RecoveryWorkItem, error)
 }
 
 type AdmissionRecoveryReport struct {
@@ -27,7 +34,7 @@ type AdmissionRecoveryReport struct {
 	RecoveryPasses   int    `json:"recoveryPasses"`
 }
 
-func newAdmissionRecoveryExecutor(session *authority.RecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) *admissionRecoveryExecutor {
+func newAdmissionRecoveryExecutor(session admissionRecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) *admissionRecoveryExecutor {
 	return &admissionRecoveryExecutor{session: session, launch: launchPort, latch: latch}
 }
 
@@ -79,7 +86,7 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 	var report AdmissionRecoveryReport
 	for step := 0; step < admissionRecoveryMaxSteps; step++ {
 		if err := current.Validate(); err != nil {
-			return report, fmt.Errorf("%w: invalid recovery work item: %v", authority.ErrRecoveryNeeded, err)
+			return report, fmt.Errorf("%w: invalid recovery work item: %w", authority.ErrRecoveryNeeded, err)
 		}
 		if len(current.Launches) == 0 {
 			if err := e.session.FinalizePlanned(ctx, current.Token); err != nil {
@@ -111,7 +118,7 @@ func (e *admissionRecoveryExecutor) recoverLaunch(ctx context.Context, item mode
 		return model.RecoveryWorkItem{}, fmt.Errorf("%w: contain recovery launch %s ordinal %s: %v", authority.ErrRecoveryNeeded, item.JobID, recoveryLaunch.Ordinal, err)
 	}
 	if err := item.Validate(); err != nil {
-		return model.RecoveryWorkItem{}, fmt.Errorf("%w: invalid recovery work item: %v", authority.ErrRecoveryNeeded, err)
+		return model.RecoveryWorkItem{}, fmt.Errorf("%w: invalid recovery work item: %w", authority.ErrRecoveryNeeded, err)
 	}
 	if err := e.session.RecordQuiescence(ctx, item.Token, recoveryLaunch.Ordinal, verified); err != nil {
 		return model.RecoveryWorkItem{}, fmt.Errorf("%w: record recovery quiescence for %s ordinal %s: %v", authority.ErrRecoveryNeeded, item.JobID, recoveryLaunch.Ordinal, err)

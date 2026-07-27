@@ -3,6 +3,7 @@ package bbolt
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -556,6 +557,28 @@ func errorTreeHasCorruptKind(err error, kind string) bool {
 	}
 }
 
+func errorTreeContains(err error, substring string) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), substring) {
+		return true
+	}
+	switch typed := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, child := range typed.Unwrap() {
+			if errorTreeContains(child, substring) {
+				return true
+			}
+		}
+		return false
+	case interface{ Unwrap() error }:
+		return errorTreeContains(typed.Unwrap(), substring)
+	default:
+		return false
+	}
+}
+
 func TestPointLookupDoesNotTraverseHistoricalBindings(t *testing.T) {
 	repo := newSeededBboltRepository(t, 200)
 	target := model.JobID("job-seed-000199")
@@ -705,6 +728,55 @@ func TestAuditDoesNotMutateDatabaseBytes(t *testing.T) {
 	}
 }
 
+func TestStructuralIntegrityDetectsReachableFreedPageWithoutMutatingDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptBboltFixture(t, repo, newBboltFixture(t, "reachable-freed"))
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close before corruption: %v", err)
+	}
+
+	corruptFreelistWithReachablePageForTest(t, path)
+	corruptBytes := readFileBytesForTest(t, path)
+
+	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err == nil {
+		_ = reopened.Close()
+		t.Fatal("OpenExisting succeeded for reachable-freed corruption, want ErrCorruptRecord")
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "reachable freed") {
+		t.Fatalf("OpenExisting error = %v, want reachable-freed diagnostic", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("OpenExisting structural failure mutated database bytes")
+	}
+
+	rawDB, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("raw read-only open after corruption: %v", err)
+	}
+	auditRepo := &Repository{db: rawDB}
+	err = auditRepo.AuditIntegrity(context.Background())
+	if closeErr := auditRepo.Close(); closeErr != nil {
+		t.Fatalf("close raw read-only repo: %v", closeErr)
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("AuditIntegrity error = %v, want ErrCorruptRecord", err)
+	}
+	if kinds := repository.IntegrityFindingKinds(err); !reflect.DeepEqual(kinds, []string{"structure"}) {
+		t.Fatalf("AuditIntegrity finding kinds = %v, want [structure]", kinds)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("AuditIntegrity structural failure mutated database bytes")
+	}
+}
+
 func TestUnrelatedCorruptRecordRawBytesPreservedAcrossSuccessfulCommit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
 	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
@@ -722,6 +794,53 @@ func TestUnrelatedCorruptRecordRawBytesPreservedAcrossSuccessfulCommit(t *testin
 	rawAfter := readRawBucketValueForTest(t, repo, bucketSafety, jobIDKey(corrupt.JobID))
 	if !bytes.Equal(rawBefore, rawAfter) {
 		t.Fatal("unrelated corrupt safety raw bytes changed across successful unrelated commit")
+	}
+}
+
+func corruptFreelistWithReachablePageForTest(t *testing.T, path string) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, ok, err := readBoltPreflightMeta(file, info.Size())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("active bbolt meta not found")
+	}
+	if meta.root <= 1 || meta.root >= meta.pgid {
+		t.Fatalf("active root page = %d, high water mark = %d", meta.root, meta.pgid)
+	}
+	if meta.freelist <= 1 || meta.freelist >= meta.pgid {
+		t.Fatalf("active freelist page = %d, high water mark = %d", meta.freelist, meta.pgid)
+	}
+	if meta.root == meta.freelist {
+		t.Fatalf("root page and freelist page are both %d", meta.root)
+	}
+	page, err := readBoltPreflightPage(file, meta.freelist, meta.pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.flags != boltFreelistPageFlag {
+		t.Fatalf("page %d flags = 0x%x, want freelist", meta.freelist, page.flags)
+	}
+
+	var count [2]byte
+	binary.LittleEndian.PutUint16(count[:], 1)
+	if _, err := file.WriteAt(count[:], int64(meta.freelist*meta.pageSize+10)); err != nil {
+		t.Fatalf("write freelist count: %v", err)
+	}
+	var id [8]byte
+	binary.LittleEndian.PutUint64(id[:], meta.root)
+	if _, err := file.WriteAt(id[:], int64(meta.freelist*meta.pageSize+boltPageHeaderSize)); err != nil {
+		t.Fatalf("write freelist id: %v", err)
 	}
 }
 
