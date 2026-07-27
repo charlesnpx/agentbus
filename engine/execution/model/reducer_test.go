@@ -221,6 +221,8 @@ func TestAuthorizeSecondOrdinalRejectsSharedCustodyOrPhysicalIdentity(t *testing
 	sharedPhysical.Leader = first.Group.Leader
 	sharedPhysical.Monitor = first.Group.Monitor
 	sharedPhysical.RetainedID = first.Group.RetainedID
+	sharedPhysical.RetainedDomainID = first.Group.RetainedDomainID
+	sharedPhysical.RetainedDomainState = first.Group.RetainedDomainState
 	if _, err := apply(record, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: sharedPhysical}); !errors.Is(err, ErrConflictingDuplicate) {
 		t.Fatalf("shared physical identity bind error = %v, want ErrConflictingDuplicate", err)
 	}
@@ -255,6 +257,8 @@ func TestAuthorizeSecondOrdinalRejectsSharedCustodyOrPhysicalIdentity(t *testing
 	differentRetained.Leader = first.Group.Leader
 	differentRetained.Monitor = first.Group.Monitor
 	differentRetained.RetainedID = "different-retained"
+	differentRetained.RetainedDomainID = "different-retained-domain"
+	differentRetained.RetainedDomainState = RetainedDomainKnown
 	if _, err := apply(record, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: differentRetained}); err != nil {
 		t.Fatalf("different retained id bind error = %v, want nil", err)
 	}
@@ -1461,7 +1465,6 @@ func reducerGroup(ordinal LaunchOrdinal) GroupRef {
 		PGID:              pgid,
 		Leader:            ProcessIdentity{PID: pgid, HighResStartToken: "leader-start-" + ordinal.String()},
 		Monitor:           ProcessIdentity{PID: 30 + int(ordinal), HighResStartToken: "monitor-start-" + ordinal.String()},
-		RetainedID:        "retained-" + ordinal.String(),
 	}
 }
 

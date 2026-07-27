@@ -14,12 +14,34 @@ var ErrAdmissionContractMismatch = errors.New("admission contract version mismat
 
 type AdmissionRootMetadata = repository.AdmissionRootMetadata
 
+type IncompatibleAdmissionContractVersionError struct {
+	RootContractVersion   uint16
+	DaemonContractVersion uint16
+	Activated             bool
+}
+
+func (e IncompatibleAdmissionContractVersionError) Error() string {
+	state := "candidate"
+	if e.Activated {
+		state = "activated"
+	}
+	return fmt.Sprintf("%s: %s root contract version %d, daemon contract version %d", ErrAdmissionContractMismatch, state, e.RootContractVersion, e.DaemonContractVersion)
+}
+
+func (e IncompatibleAdmissionContractVersionError) Is(target error) bool {
+	return target == ErrAdmissionContractMismatch
+}
+
 func ValidateAdmissionRootContract(metadata AdmissionRootMetadata) error {
-	if !metadata.Activated {
+	if metadata.ContractVersion == 0 && !metadata.Activated {
 		return nil
 	}
 	if metadata.ContractVersion != CurrentAdmissionContractVersion {
-		return fmt.Errorf("%w: root contract version %d, daemon contract version %d", ErrAdmissionContractMismatch, metadata.ContractVersion, CurrentAdmissionContractVersion)
+		return IncompatibleAdmissionContractVersionError{
+			RootContractVersion:   metadata.ContractVersion,
+			DaemonContractVersion: CurrentAdmissionContractVersion,
+			Activated:             metadata.Activated,
+		}
 	}
 	return nil
 }

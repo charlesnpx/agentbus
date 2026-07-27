@@ -94,6 +94,7 @@ type Spec struct {
 	Containment   Containment
 	Monitor       *MonitorProcessSpec
 	RetainedID    string
+	NoRetainedID  bool
 
 	// RetainLeaderUnreaped leaves the target group leader as an unreaped child
 	// until ParkedHandle.Wait or ParkedHandle.WaitState is called. Native
@@ -740,7 +741,7 @@ func Prepare(ctx context.Context, spec Spec) (*Prepared, error) {
 		return nil, preIdentityAbort(fmt.Errorf("monitor joined target process group %d", workerClaim.PGID))
 	}
 
-	group = groupRefFromClaims(workerClaim, monitorClaim, spec.CustodyID, spec.LaunchKey, spec.RetainedID)
+	group = groupRefFromClaims(workerClaim, monitorClaim, spec.CustodyID, spec.LaunchKey, spec.RetainedID, spec.NoRetainedID)
 	releaseGroup := group
 	expectation, err := releaseExpectation(spec, releaseGroup)
 	if err != nil {
@@ -845,6 +846,9 @@ func validateSpec(spec Spec) error {
 	if err := spec.ReleaseSecret.Validate(); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidSpec, err)
 	}
+	if spec.NoRetainedID && spec.RetainedID != "" {
+		return fmt.Errorf("%w: retained id cannot be set when retained identity is disabled", ErrInvalidSpec)
+	}
 	return nil
 }
 
@@ -914,7 +918,7 @@ func validateBoundMonitorGroup(releaseGroup, boundGroup model.GroupRef) error {
 	if releaseGroup.Monitor != boundGroup.Monitor {
 		return fmt.Errorf("bound group monitor changed")
 	}
-	if releaseGroup.RetainedID != boundGroup.RetainedID {
+	if releaseGroup.RetainedID != "" && releaseGroup.RetainedID != boundGroup.RetainedID {
 		return fmt.Errorf("bound group retained id changed")
 	}
 	return nil
@@ -997,19 +1001,24 @@ func verifyMonitorReadyIdentity(reader identityReader, monitor *MonitorProcess, 
 	return nil
 }
 
-func groupRefFromClaims(worker, monitor procgroup.ProcessClaim, custodyID model.CustodyID, launchKey model.LaunchKey, retainedID string) model.GroupRef {
-	if retainedID == "" {
+func groupRefFromClaims(worker, monitor procgroup.ProcessClaim, custodyID model.CustodyID, launchKey model.LaunchKey, retainedID string, noRetainedID bool) model.GroupRef {
+	domain := worker.KernelDomainID
+	if noRetainedID || domain.RetainedDomainState != model.RetainedDomainKnown {
+		retainedID = ""
+		domain.RetainedDomainID = ""
+		domain.RetainedDomainState = model.RetainedDomainNotApplicable
+	} else if retainedID == "" {
 		retainedID = defaultRetainedID(worker, monitor, custodyID, launchKey)
 	}
 	return model.GroupRef{
 		Version:             1,
 		CustodyID:           custodyID,
 		Launch:              launchKey,
-		HostBootID:          worker.KernelDomainID.HostBootID,
-		PIDNamespaceID:      worker.KernelDomainID.PIDNamespaceID,
-		PIDNamespaceState:   worker.KernelDomainID.PIDNamespaceState,
-		RetainedDomainID:    worker.KernelDomainID.RetainedDomainID,
-		RetainedDomainState: worker.KernelDomainID.RetainedDomainState,
+		HostBootID:          domain.HostBootID,
+		PIDNamespaceID:      domain.PIDNamespaceID,
+		PIDNamespaceState:   domain.PIDNamespaceState,
+		RetainedDomainID:    domain.RetainedDomainID,
+		RetainedDomainState: domain.RetainedDomainState,
 		PGID:                worker.PGID,
 		Leader: model.ProcessIdentity{
 			PID:               worker.PID,

@@ -26,9 +26,11 @@ import (
 )
 
 var (
-	ErrNativeCustodianUnavailable    = errors.New("native custodian unavailable")
-	ErrPhysicalContainment           = errors.New("physical containment failed")
-	ErrNativeRuntimeSelfTestRequired = errors.New("native runtime self-test required")
+	ErrNativeCustodianUnavailable        = errors.New("native custodian unavailable")
+	ErrPhysicalContainment               = errors.New("physical containment failed")
+	ErrNativeRuntimeSelfTestRequired     = errors.New("native runtime self-test required")
+	ErrRetainedContainmentUnavailable    = errors.New("retained containment unavailable")
+	ErrRetainedObjectReacquireUnresolved = errors.New("retained object reacquire unresolved")
 )
 
 type PhysicalOutcomeKind string
@@ -48,6 +50,26 @@ type PhysicalOutcome struct {
 	Reason   containment.UnprovableReason
 	Decision model.ContainmentDecision
 	Err      error
+}
+
+type RetainedObjectReacquireUnresolvedError struct {
+	Group model.GroupRef
+	Cause error
+}
+
+func (err RetainedObjectReacquireUnresolvedError) Error() string {
+	if err.Cause == nil {
+		return fmt.Sprintf("%s: retained_id=%q", ErrRetainedObjectReacquireUnresolved, err.Group.RetainedID)
+	}
+	return fmt.Sprintf("%s: retained_id=%q: %v", ErrRetainedObjectReacquireUnresolved, err.Group.RetainedID, err.Cause)
+}
+
+func (err RetainedObjectReacquireUnresolvedError) Is(target error) bool {
+	return target == ErrRetainedObjectReacquireUnresolved
+}
+
+func (err RetainedObjectReacquireUnresolvedError) Unwrap() error {
+	return err.Cause
 }
 
 func (outcome PhysicalOutcome) Absent() bool {
@@ -421,20 +443,25 @@ func (custodian *NativeCustodian) ContainAndVerify(ctx context.Context, group mo
 }
 
 func (custodian *NativeCustodian) containRecoveredPhysical(ctx context.Context, group model.GroupRef) PhysicalOutcome {
+	if group.RetainedID == "" {
+		return containPhysical(ctx, group, custodian.options.ContainmentParams, nil, nil)
+	}
 	requiresRetained, err := model.ContainmentRequiresRetainedObject(group)
 	if err != nil {
 		return unprovablePhysical(group, containment.ReasonInvalidInput, "", err)
 	}
 	if !requiresRetained {
-		return containPhysical(ctx, group, custodian.options.ContainmentParams, nil, nil)
+		err := fmt.Errorf("%w: retained id is present but retained domain is not known", ErrNativeCustodianUnavailable)
+		return unprovablePhysical(group, containment.ReasonInvalidInput, model.Unprovable, retainedObjectReacquireUnresolved(group, err))
 	}
 	factory := platformRetainedGroupFactory(custodian.options.newRetainedGroup)
 	if factory == nil {
-		return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, fmt.Errorf("%w: required retained object acquisition provider is missing", ErrNativeCustodianUnavailable))
+		err := fmt.Errorf("%w: required retained object acquisition provider is missing", ErrNativeCustodianUnavailable)
+		return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, retainedObjectReacquireUnresolved(group, err))
 	}
 	manager, err := custodian.sharedRetainedGroup(factory)
 	if err != nil {
-		return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, err)
+		return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, retainedObjectReacquireUnresolved(group, err))
 	}
 	capability, err := manager.AcquireRetainedGroup(ctx, group, time.Now())
 	if err != nil {
@@ -452,23 +479,26 @@ func (custodian *NativeCustodian) containRecoveredPhysical(ctx context.Context, 
 				if absentErr == nil {
 					absentErr = fmt.Errorf("target process group is not stably absent")
 				}
-				return unprovablePhysical(group, containment.ReasonProbeUnprovable, model.AlreadyAbsent, errors.Join(
+				reacquireErr := retainedObjectReacquireUnresolved(group, errors.Join(
 					fmt.Errorf("%w: retained group missing without process-group absence proof", ErrNativeCustodianUnavailable),
 					err,
 					absentErr,
 				))
+				return unprovablePhysical(group, containment.ReasonProbeUnprovable, model.AlreadyAbsent, reacquireErr)
 			} else {
-				return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, errors.Join(
+				reacquireErr := retainedObjectReacquireUnresolved(group, errors.Join(
 					fmt.Errorf("%w: retained group missing without same-domain absence proof", ErrNativeCustodianUnavailable),
 					err,
 					proofErr,
 				))
+				return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, reacquireErr)
 			}
 		}
-		return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, err)
+		return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, retainedObjectReacquireUnresolved(group, err))
 	}
 	if capability == nil {
-		return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, fmt.Errorf("%w: retained object acquisition returned nil capability", ErrNativeCustodianUnavailable))
+		err := fmt.Errorf("%w: retained object acquisition returned nil capability", ErrNativeCustodianUnavailable)
+		return unprovablePhysical(group, containment.ReasonAuthorizationUnprovable, model.Unprovable, retainedObjectReacquireUnresolved(group, err))
 	}
 	defer capability.Release()
 
@@ -477,6 +507,10 @@ func (custodian *NativeCustodian) containRecoveredPhysical(ctx context.Context, 
 		witness = continuity
 	}
 	return containPhysicalWithRetainedCleanup(ctx, group, custodian.options.ContainmentParams, witness, recoveredRetainedObject{capability: capability})
+}
+
+func retainedObjectReacquireUnresolved(group model.GroupRef, cause error) error {
+	return RetainedObjectReacquireUnresolvedError{Group: group, Cause: cause}
 }
 
 func retainedGroupMissing(err error) bool {
@@ -577,6 +611,7 @@ func (custodian *NativeCustodian) parklaunchSpec(ctx context.Context, spec Nativ
 		Containment:          launchContainment,
 		Monitor:              &parklaunch.MonitorProcessSpec{Command: custodian.options.MonitorCommand, InheritedLeaf: monitorLeaf},
 		RetainedID:           backend.retainedID(),
+		NoRetainedID:         backend.retainedID() == "",
 		RetainLeaderUnreaped: backend.retainLeaderUnreaped(),
 		BeforeMonitorBind: func(ctx context.Context, group model.GroupRef) (model.GroupRef, error) {
 			bound, err := backend.beforeMonitorBind(ctx, group)

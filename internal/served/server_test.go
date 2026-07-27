@@ -7548,15 +7548,17 @@ func admissionTestGroup(key model.LaunchKey) model.GroupRef {
 	name := string(key.Attempt.JobID) + "-" + key.Ordinal.String()
 	pgid := 4100 + int(key.Ordinal)
 	return model.GroupRef{
-		Version:           1,
-		CustodyID:         model.CustodyID("custody-" + name),
-		Launch:            key,
-		HostBootID:        "host-" + name,
-		PIDNamespaceState: model.PIDNamespaceNotApplicable,
-		PGID:              pgid,
-		Leader:            model.ProcessIdentity{PID: pgid, HighResStartToken: "leader-" + name},
-		Monitor:           model.ProcessIdentity{PID: pgid + 100, HighResStartToken: "monitor-" + name},
-		RetainedID:        "retained-" + name,
+		Version:             1,
+		CustodyID:           model.CustodyID("custody-" + name),
+		Launch:              key,
+		HostBootID:          "host-" + name,
+		PIDNamespaceState:   model.PIDNamespaceNotApplicable,
+		RetainedDomainID:    "retained-domain-" + name,
+		RetainedDomainState: model.RetainedDomainKnown,
+		PGID:                pgid,
+		Leader:              model.ProcessIdentity{PID: pgid, HighResStartToken: "leader-" + name},
+		Monitor:             model.ProcessIdentity{PID: pgid + 100, HighResStartToken: "monitor-" + name},
+		RetainedID:          "retained-" + name,
 	}
 }
 

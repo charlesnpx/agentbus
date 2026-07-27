@@ -967,15 +967,17 @@ func (h *harness) request(injector *FailureInjector) LaunchRequest {
 
 func testGroup(launch LaunchContext, name string) model.GroupRef {
 	return model.GroupRef{
-		Version:           1,
-		CustodyID:         model.CustodyID("custody-" + name),
-		Launch:            launch.Key(),
-		HostBootID:        "host-boot-" + name,
-		PIDNamespaceState: model.PIDNamespaceNotApplicable,
-		PGID:              2001,
-		Leader:            model.ProcessIdentity{PID: 2001, HighResStartToken: "leader-" + name},
-		Monitor:           model.ProcessIdentity{PID: 3001, HighResStartToken: "monitor-" + name},
-		RetainedID:        "retained-" + name,
+		Version:             1,
+		CustodyID:           model.CustodyID("custody-" + name),
+		Launch:              launch.Key(),
+		HostBootID:          "host-boot-" + name,
+		PIDNamespaceState:   model.PIDNamespaceNotApplicable,
+		RetainedDomainID:    "retained-domain-" + name,
+		RetainedDomainState: model.RetainedDomainKnown,
+		PGID:                2001,
+		Leader:              model.ProcessIdentity{PID: 2001, HighResStartToken: "leader-" + name},
+		Monitor:             model.ProcessIdentity{PID: 3001, HighResStartToken: "monitor-" + name},
+		RetainedID:          "retained-" + name,
 	}
 }
 

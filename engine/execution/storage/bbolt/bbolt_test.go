@@ -3,8 +3,10 @@ package bbolt
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -556,6 +558,28 @@ func errorTreeHasCorruptKind(err error, kind string) bool {
 	}
 }
 
+func errorTreeContains(err error, substring string) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), substring) {
+		return true
+	}
+	switch typed := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, child := range typed.Unwrap() {
+			if errorTreeContains(child, substring) {
+				return true
+			}
+		}
+		return false
+	case interface{ Unwrap() error }:
+		return errorTreeContains(typed.Unwrap(), substring)
+	default:
+		return false
+	}
+}
+
 func TestPointLookupDoesNotTraverseHistoricalBindings(t *testing.T) {
 	repo := newSeededBboltRepository(t, 200)
 	target := model.JobID("job-seed-000199")
@@ -705,6 +729,426 @@ func TestAuditDoesNotMutateDatabaseBytes(t *testing.T) {
 	}
 }
 
+func TestFreelistReachablePageRejectedWithoutMutatingDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptBboltFixture(t, repo, newBboltFixture(t, "reachable-freed"))
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close before corruption: %v", err)
+	}
+
+	corruptFreelistWithReachablePageForTest(t, path)
+	corruptBytes := readFileBytesForTest(t, path)
+
+	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err == nil {
+		_ = reopened.Close()
+		t.Fatal("OpenExisting succeeded for reachable-freed corruption, want ErrCorruptRecord")
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "reachable freed") {
+		t.Fatalf("OpenExisting error = %v, want reachable-freed diagnostic", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("OpenExisting structural failure mutated database bytes")
+	}
+
+	rawDB, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("raw read-only open after corruption: %v", err)
+	}
+	auditRepo := &Repository{db: rawDB}
+	err = auditRepo.AuditIntegrity(context.Background())
+	if closeErr := auditRepo.Close(); closeErr != nil {
+		t.Fatalf("close raw read-only repo: %v", closeErr)
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("AuditIntegrity error = %v, want ErrCorruptRecord", err)
+	}
+	if kinds := repository.IntegrityFindingKinds(err); !reflect.DeepEqual(kinds, []string{"structure"}) {
+		t.Fatalf("AuditIntegrity finding kinds = %v, want [structure]", kinds)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("AuditIntegrity structural failure mutated database bytes")
+	}
+}
+
+func TestStructuralGraphPreflightRejectsCyclicBranchChildWithoutMutatingDatabase(t *testing.T) {
+	path := createClosedSeededBboltFileForStructuralTest(t, "cycle", 600)
+	corruptBranchChildToSelfForTest(t, path)
+	corruptBytes := readFileBytesForTest(t, path)
+
+	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err == nil {
+		_ = reopened.Close()
+		t.Fatal("OpenExisting succeeded for cyclic branch child, want ErrCorruptRecord")
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "cycle") {
+		t.Fatalf("OpenExisting error = %v, want cycle diagnostic", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("OpenExisting cyclic structural failure mutated database bytes")
+	}
+
+	rawDB, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("raw read-only open after cyclic corruption: %v", err)
+	}
+	auditRepo := &Repository{db: rawDB}
+	err = auditRepo.AuditIntegrity(context.Background())
+	if closeErr := auditRepo.Close(); closeErr != nil {
+		t.Fatalf("close raw read-only repo: %v", closeErr)
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("AuditIntegrity error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "cycle") {
+		t.Fatalf("AuditIntegrity error = %v, want cycle diagnostic", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("AuditIntegrity cyclic structural failure mutated database bytes")
+	}
+}
+
+func TestStructuralGraphPreflightRejectsDuplicateBranchChildWithoutMutatingDatabase(t *testing.T) {
+	path := createClosedSeededBboltFileForStructuralTest(t, "duplicate", 600)
+	corruptBranchSecondChildToDuplicateFirstForTest(t, path)
+	corruptBytes := readFileBytesForTest(t, path)
+
+	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err == nil {
+		_ = reopened.Close()
+		t.Fatal("OpenExisting succeeded for duplicate branch child, want ErrCorruptRecord")
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "duplicate page reference") {
+		t.Fatalf("OpenExisting error = %v, want duplicate page reference diagnostic", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("OpenExisting duplicate structural failure mutated database bytes")
+	}
+}
+
+func TestStructuralGraphPreflightAllowsValidSeededDatabase(t *testing.T) {
+	path := createClosedSeededBboltFileForStructuralTest(t, "valid", 600)
+	before := readFileBytesForTest(t, path)
+
+	repo, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("OpenExisting valid seeded database: %v", err)
+	}
+	if err := repo.AuditIntegrity(context.Background()); err != nil {
+		_ = repo.Close()
+		t.Fatalf("AuditIntegrity valid seeded database: %v", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close valid seeded database: %v", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(before, after) {
+		t.Fatal("valid structural preflight or audit mutated database bytes")
+	}
+}
+
+func TestNoFreelistSyncSentinelOpensCleanly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second, NoFreelistSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptBboltFixture(t, repo, newBboltFixture(t, "no-freelist-sync"))
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close NoFreelistSync repository: %v", err)
+	}
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	if err := file.Close(); err != nil {
+		t.Fatalf("close meta reader: %v", err)
+	}
+	if meta.freelist != boltNoFreelistID {
+		t.Fatalf("active freelist page = %d, want PgidNoFreelist", meta.freelist)
+	}
+	before := readFileBytesForTest(t, path)
+
+	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("OpenExisting NoFreelistSync database: %v", err)
+	}
+	if err := reopened.AuditIntegrity(context.Background()); err != nil {
+		_ = reopened.Close()
+		t.Fatalf("AuditIntegrity NoFreelistSync database: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close reopened NoFreelistSync database: %v", err)
+	}
+
+	readOnly, err := OpenExistingReadOnly(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("OpenExistingReadOnly NoFreelistSync database: %v", err)
+	}
+	if err := readOnly.AuditIntegrity(context.Background()); err != nil {
+		_ = readOnly.Close()
+		t.Fatalf("read-only AuditIntegrity NoFreelistSync database: %v", err)
+	}
+	if err := readOnly.Close(); err != nil {
+		t.Fatalf("close read-only NoFreelistSync database: %v", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(before, after) {
+		t.Fatal("NoFreelistSync open or audit mutated database bytes")
+	}
+}
+
+func TestPreOpenFreelistPreflightRejectsCorruptFreelistBeforeBoltOpen(t *testing.T) {
+	tests := []struct {
+		name    string
+		corrupt func(t *testing.T, path string)
+		want    string
+	}{
+		{
+			name: "bad-page-id",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				file, meta := openBoltFileAndMetaForTest(t, path)
+				_ = file.Close()
+				writeActiveBoltMetaFreelistForTest(t, path, meta.pgid)
+			},
+			want: "out of range",
+		},
+		{
+			name: "meta-pgid-as-free-id",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistIDsForTest(t, path, func(meta boltPreflightMeta) []uint64 {
+					return []uint64{meta.pgid}
+				})
+			},
+			want: "out of range",
+		},
+		{
+			name: "freelist-self-page-as-free-id",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistIDsForTest(t, path, func(meta boltPreflightMeta) []uint64 {
+					return []uint64{meta.freelist}
+				})
+			},
+			want: "freelist span",
+		},
+		{
+			name: "duplicate-free-id",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistIDsForTest(t, path, func(meta boltPreflightMeta) []uint64 {
+					return []uint64{meta.root, meta.root}
+				})
+			},
+			want: "duplicated",
+		},
+		{
+			name: "wrong-page-type",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistPageFlagsForTest(t, path, boltLeafPageFlag)
+			},
+			want: "want freelist",
+		},
+		{
+			name: "inconsistent-count",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistCountBeyondSpanForTest(t, path)
+			},
+			want: "requires",
+		},
+		{
+			name: "count-exceeds-high-water",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistCountExceedsHighWaterForTest(t, path)
+			},
+			want: "exceeds high water mark",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := createClosedSeededBboltFileForStructuralTest(t, "freelist-"+tt.name, 600)
+			tt.corrupt(t, path)
+			corruptBytes := readFileBytesForTest(t, path)
+
+			calledOpenFile := false
+			repo, err := OpenExisting(path, &bolt.Options{
+				Timeout: time.Second,
+				OpenFile: func(string, int, os.FileMode) (*os.File, error) {
+					calledOpenFile = true
+					panic("bolt open reached corrupt freelist")
+				},
+			})
+			if err == nil {
+				_ = repo.Close()
+				t.Fatal("OpenExisting succeeded for corrupt freelist, want ErrCorruptRecord")
+			}
+			if calledOpenFile {
+				t.Fatal("OpenExisting called bolt.Open after corrupt freelist preflight failure")
+			}
+			if !errors.Is(err, repository.ErrCorruptRecord) {
+				t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
+			}
+			if !errorTreeContains(err, tt.want) {
+				t.Fatalf("OpenExisting error = %v, want diagnostic containing %q", err, tt.want)
+			}
+			if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+				t.Fatal("OpenExisting corrupt freelist failure mutated database bytes")
+			}
+		})
+	}
+}
+
+func TestStructuralGraphPreflightCountsOverflowSpanAgainstReferenceBudget(t *testing.T) {
+	walk := boltStructuralGraphPreflight{
+		path:           "corrupt-overflow.db",
+		hwm:            4,
+		visited:        make(map[uint64]string),
+		pageReferences: 3,
+	}
+
+	err := walk.claimPageSpan(boltPreflightPage{id: 2, flags: boltLeafPageFlag, overflow: 1})
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("claimPageSpan error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "page-reference bound") {
+		t.Fatalf("claimPageSpan error = %v, want page-reference bound diagnostic", err)
+	}
+}
+
+func TestStructuralGraphPreflightBoundsNestedInlineBucketRecursion(t *testing.T) {
+	walk := boltStructuralGraphPreflight{
+		path:    "corrupt-inline.db",
+		hwm:     2,
+		visited: make(map[uint64]string),
+	}
+
+	err := walk.scanInlineBucketPage(nestedInlineBucketPageForTest(len(bucketNames)+1), nil, 1, "root")
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("scanInlineBucketPage error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "page-reference bound") {
+		t.Fatalf("scanInlineBucketPage error = %v, want page-reference bound diagnostic", err)
+	}
+}
+
+func TestStructuralGraphPreflightRejectsInlineBucketDepthBound(t *testing.T) {
+	walk := boltStructuralGraphPreflight{
+		path:    "corrupt-inline-depth.db",
+		hwm:     100,
+		visited: make(map[uint64]string),
+	}
+
+	err := walk.scanInlineBucketPage(emptyInlineBucketPageForTest(), nil, boltStructuralGraphMaxDepth+1, "too deep")
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("scanInlineBucketPage error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "depth bound") {
+		t.Fatalf("scanInlineBucketPage error = %v, want depth bound diagnostic", err)
+	}
+}
+
+func TestStructuralGraphPreflightRejectsZeroLengthLeafKeyWithoutMutatingDatabase(t *testing.T) {
+	path := createClosedSeededBboltFileForStructuralTest(t, "zero-key", 600)
+	corruptFirstLeafElementKSizeForTest(t, path, 0)
+	requireOpenExistingCorruptWithoutMutationForTest(t, path, "zero-length key")
+}
+
+func TestStructuralGraphPreflightRejectsElementPayloadIntoMetadataWithoutMutatingDatabase(t *testing.T) {
+	path := createClosedSeededBboltFileForStructuralTest(t, "payload-metadata", 600)
+	corruptFirstLeafElementPosForTest(t, path, 0)
+	requireOpenExistingCorruptWithoutMutationForTest(t, path, "element table")
+}
+
+func TestOpenBoltSafelyReraisesProgrammerPanic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "panic.db")
+	sentinel := "programmer panic"
+	defer func() {
+		recovered := recover()
+		if recovered != sentinel {
+			t.Fatalf("recovered panic = %v, want %q", recovered, sentinel)
+		}
+	}()
+
+	_, _ = openBoltSafely(path, 0o600, &bolt.Options{
+		OpenFile: func(string, int, os.FileMode) (*os.File, error) {
+			panic(sentinel)
+		},
+	})
+}
+
+func TestOpenBoltSafelyReraisesRuntimeLogicPanic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nil-deref.db")
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("openBoltSafely did not re-panic nil dereference")
+		}
+		if !strings.Contains(fmt.Sprint(recovered), "nil pointer dereference") {
+			t.Fatalf("recovered panic = %v, want nil pointer dereference", recovered)
+		}
+	}()
+
+	_, _ = openBoltSafely(path, 0o600, &bolt.Options{
+		OpenFile: func(string, int, os.FileMode) (*os.File, error) {
+			var fault *byte
+			_ = *fault
+			return nil, nil
+		},
+	})
+}
+
+func TestOpenBoltSafelyMapsRuntimeFaultToCorruptRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fault.db")
+	db, err := openBoltSafely(path, 0o600, &bolt.Options{
+		OpenFile: func(string, int, os.FileMode) (*os.File, error) {
+			panic(runtimeFaultForTest{addr: 0x1234})
+		},
+	})
+	if db != nil {
+		_ = db.Close()
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("openBoltSafely error = %v, want ErrCorruptRecord", err)
+	}
+}
+
+type runtimeFaultForTest struct {
+	addr uintptr
+}
+
+func (e runtimeFaultForTest) Error() string {
+	return "runtime error: invalid memory address or nil pointer dereference"
+}
+
+func (e runtimeFaultForTest) RuntimeError() {}
+
+func (e runtimeFaultForTest) Addr() uintptr {
+	return e.addr
+}
+
+func TestBoltCheckErrorClassificationLeavesOperationalErrorsNonCorrupt(t *testing.T) {
+	if boltCheckErrorIsCorruption(bolt.ErrDatabaseNotOpen) {
+		t.Fatal("ErrDatabaseNotOpen classified as corruption")
+	}
+	if !boltCheckErrorIsCorruption(errors.New("page 3: reachable freed")) {
+		t.Fatal("bbolt check finding was not classified as corruption")
+	}
+}
+
 func TestUnrelatedCorruptRecordRawBytesPreservedAcrossSuccessfulCommit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
 	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
@@ -722,6 +1166,384 @@ func TestUnrelatedCorruptRecordRawBytesPreservedAcrossSuccessfulCommit(t *testin
 	rawAfter := readRawBucketValueForTest(t, repo, bucketSafety, jobIDKey(corrupt.JobID))
 	if !bytes.Equal(rawBefore, rawAfter) {
 		t.Fatal("unrelated corrupt safety raw bytes changed across successful unrelated commit")
+	}
+}
+
+func corruptFreelistWithReachablePageForTest(t *testing.T, path string) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, ok, err := readBoltPreflightMeta(file, info.Size())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("active bbolt meta not found")
+	}
+	if meta.root <= 1 || meta.root >= meta.pgid {
+		t.Fatalf("active root page = %d, high water mark = %d", meta.root, meta.pgid)
+	}
+	if meta.freelist <= 1 || meta.freelist >= meta.pgid {
+		t.Fatalf("active freelist page = %d, high water mark = %d", meta.freelist, meta.pgid)
+	}
+	if meta.root == meta.freelist {
+		t.Fatalf("root page and freelist page are both %d", meta.root)
+	}
+	page, err := readBoltPreflightPage(file, meta.freelist, meta.pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.flags != boltFreelistPageFlag {
+		t.Fatalf("page %d flags = 0x%x, want freelist", meta.freelist, page.flags)
+	}
+
+	var count [2]byte
+	binary.LittleEndian.PutUint16(count[:], 1)
+	if _, err := file.WriteAt(count[:], int64(meta.freelist*meta.pageSize+10)); err != nil {
+		t.Fatalf("write freelist count: %v", err)
+	}
+	var id [8]byte
+	binary.LittleEndian.PutUint64(id[:], meta.root)
+	if _, err := file.WriteAt(id[:], int64(meta.freelist*meta.pageSize+boltPageHeaderSize)); err != nil {
+		t.Fatalf("write freelist id: %v", err)
+	}
+}
+
+func corruptActiveBoltFreelistIDsForTest(t *testing.T, path string, idsForMeta func(boltPreflightMeta) []uint64) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	if meta.freelist <= 1 || meta.freelist >= meta.pgid {
+		t.Fatalf("active freelist page = %d, high water mark = %d", meta.freelist, meta.pgid)
+	}
+	page, err := readBoltPreflightPage(file, meta.freelist, meta.pageSize)
+	if err != nil {
+		t.Fatalf("read freelist page: %v", err)
+	}
+	if page.flags != boltFreelistPageFlag {
+		t.Fatalf("page %d flags = 0x%x, want freelist", meta.freelist, page.flags)
+	}
+	ids := idsForMeta(meta)
+	if len(ids) >= 0xffff {
+		t.Fatalf("test freelist ID count %d cannot be encoded as a simple count", len(ids))
+	}
+	span := uint64(page.overflow) + 1
+	if span == 0 || span > meta.pgid || meta.freelist > meta.pgid-span {
+		t.Fatalf("freelist page %d overflow %d exceeds high water mark %d", meta.freelist, page.overflow, meta.pgid)
+	}
+	capacity := (span*meta.pageSize - boltPageHeaderSize) / 8
+	if uint64(len(ids)) > capacity {
+		t.Fatalf("test freelist ID count %d exceeds freelist capacity %d", len(ids), capacity)
+	}
+	writeBoltPageCountForTest(t, file, meta.pageSize, meta.freelist, uint16(len(ids)))
+	for i, id := range ids {
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], id)
+		offset := int64(meta.freelist*meta.pageSize + boltPageHeaderSize + uint64(i)*8)
+		if _, err := file.WriteAt(buf[:], offset); err != nil {
+			t.Fatalf("write freelist ID %d: %v", i, err)
+		}
+	}
+}
+
+func writeActiveBoltMetaFreelistForTest(t *testing.T, path string, freelist uint64) {
+	t.Helper()
+	mutateActiveBoltMetaForTest(t, path, func(meta []byte) {
+		binary.LittleEndian.PutUint64(meta[32:40], freelist)
+	})
+}
+
+func mutateActiveBoltMetaForTest(t *testing.T, path string, mutate func(meta []byte)) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+
+	pageID := meta.txid % 2
+	offset := int64(pageID*meta.pageSize + boltPageHeaderSize)
+	buf := make([]byte, boltMetaPayloadSize)
+	if _, err := file.ReadAt(buf, offset); err != nil {
+		t.Fatalf("read active meta page %d: %v", pageID, err)
+	}
+	mutate(buf)
+	checksum := fnv.New64a()
+	_, _ = checksum.Write(buf[:56])
+	binary.LittleEndian.PutUint64(buf[56:64], checksum.Sum64())
+	if _, err := file.WriteAt(buf, offset); err != nil {
+		t.Fatalf("write active meta page %d: %v", pageID, err)
+	}
+}
+
+func corruptActiveBoltFreelistPageFlagsForTest(t *testing.T, path string, flags uint16) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	var buf [2]byte
+	binary.LittleEndian.PutUint16(buf[:], flags)
+	if _, err := file.WriteAt(buf[:], int64(meta.freelist*meta.pageSize+8)); err != nil {
+		t.Fatalf("write freelist flags: %v", err)
+	}
+}
+
+func corruptActiveBoltFreelistCountBeyondSpanForTest(t *testing.T, path string) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	page, err := readBoltPreflightPage(file, meta.freelist, meta.pageSize)
+	if err != nil {
+		t.Fatalf("read freelist page: %v", err)
+	}
+	span := uint64(page.overflow) + 1
+	capacity := (span*meta.pageSize - boltPageHeaderSize) / 8
+	writeBoltPageCountForTest(t, file, meta.pageSize, meta.freelist, 0xffff)
+	var count [8]byte
+	binary.LittleEndian.PutUint64(count[:], capacity)
+	if _, err := file.WriteAt(count[:], int64(meta.freelist*meta.pageSize+boltPageHeaderSize)); err != nil {
+		t.Fatalf("write freelist extended count: %v", err)
+	}
+}
+
+func corruptActiveBoltFreelistCountExceedsHighWaterForTest(t *testing.T, path string) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	page, err := readBoltPreflightPage(file, meta.freelist, meta.pageSize)
+	if err != nil {
+		t.Fatalf("read freelist page: %v", err)
+	}
+	span := uint64(page.overflow) + 1
+	capacity := (span*meta.pageSize - boltPageHeaderSize) / 8
+	count := meta.pgid + 1
+	if count >= 0xffff {
+		t.Fatalf("test freelist count %d cannot be encoded as a simple count", count)
+	}
+	if count > capacity {
+		t.Fatalf("test freelist count %d exceeds freelist capacity %d", count, capacity)
+	}
+	writeBoltPageCountForTest(t, file, meta.pageSize, meta.freelist, uint16(count))
+}
+
+func writeBoltPageCountForTest(t *testing.T, file *os.File, pageSize, pageID uint64, count uint16) {
+	t.Helper()
+	var buf [2]byte
+	binary.LittleEndian.PutUint16(buf[:], count)
+	if _, err := file.WriteAt(buf[:], int64(pageID*pageSize+10)); err != nil {
+		t.Fatalf("write page %d count: %v", pageID, err)
+	}
+}
+
+func requireOpenExistingCorruptWithoutMutationForTest(t *testing.T, path, want string) {
+	t.Helper()
+	corruptBytes := readFileBytesForTest(t, path)
+	repo, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err == nil {
+		_ = repo.Close()
+		t.Fatal("OpenExisting succeeded for corrupt structural input, want ErrCorruptRecord")
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, want) {
+		t.Fatalf("OpenExisting error = %v, want diagnostic containing %q", err, want)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("OpenExisting structural failure mutated database bytes")
+	}
+}
+
+func corruptFirstLeafElementKSizeForTest(t *testing.T, path string, ksize uint32) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	page := requireBoltLeafPageFromFileForTest(t, file, meta, 1)
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], ksize)
+	offset := int64(page.id*meta.pageSize + boltPageHeaderSize + 8)
+	if _, err := file.WriteAt(buf[:], offset); err != nil {
+		t.Fatalf("write leaf page %d first element ksize: %v", page.id, err)
+	}
+}
+
+func corruptFirstLeafElementPosForTest(t *testing.T, path string, pos uint32) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	page := requireBoltLeafPageFromFileForTest(t, file, meta, 1)
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], pos)
+	offset := int64(page.id*meta.pageSize + boltPageHeaderSize + 4)
+	if _, err := file.WriteAt(buf[:], offset); err != nil {
+		t.Fatalf("write leaf page %d first element pos: %v", page.id, err)
+	}
+}
+
+func nestedInlineBucketPageForTest(depth int) []byte {
+	if depth <= 1 {
+		return emptyInlineBucketPageForTest()
+	}
+	child := nestedInlineBucketPageForTest(depth - 1)
+	value := make([]byte, boltBucketHeaderSize+len(child))
+	copy(value[boltBucketHeaderSize:], child)
+	return inlineBucketPageWithBucketValueForTest(value)
+}
+
+func emptyInlineBucketPageForTest() []byte {
+	page := make([]byte, boltPageHeaderSize)
+	binary.LittleEndian.PutUint16(page[8:10], boltLeafPageFlag)
+	return page
+}
+
+func inlineBucketPageWithBucketValueForTest(value []byte) []byte {
+	key := []byte("k")
+	page := make([]byte, boltPageHeaderSize+boltLeafPageElementSize+len(key)+len(value))
+	binary.LittleEndian.PutUint16(page[8:10], boltLeafPageFlag)
+	binary.LittleEndian.PutUint16(page[10:12], 1)
+	elem := page[boltPageHeaderSize : boltPageHeaderSize+boltLeafPageElementSize]
+	binary.LittleEndian.PutUint32(elem[0:4], boltBucketLeafFlag)
+	binary.LittleEndian.PutUint32(elem[4:8], boltLeafPageElementSize)
+	binary.LittleEndian.PutUint32(elem[8:12], uint32(len(key)))
+	binary.LittleEndian.PutUint32(elem[12:16], uint32(len(value)))
+	payload := page[boltPageHeaderSize+boltLeafPageElementSize:]
+	copy(payload, key)
+	copy(payload[len(key):], value)
+	return page
+}
+
+func createClosedSeededBboltFileForStructuralTest(t *testing.T, name string, count int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "admission-"+name+".db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
+		for i := 0; i < count; i++ {
+			fixture := seedFixture(t, i)
+			if err := tx.PutBinding(fixture.Binding); err != nil {
+				return err
+			}
+			if err := tx.PutSafety(fixture.Record, 0); err != nil {
+				return err
+			}
+			if err := tx.PutProjection(fixture.Projection); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		_ = repo.Close()
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close seeded repository: %v", err)
+	}
+	requireBoltBranchPageForTest(t, path, 2)
+	return path
+}
+
+func corruptBranchChildToSelfForTest(t *testing.T, path string) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	branch := requireBoltBranchPageFromFileForTest(t, file, meta, 1)
+	writeBoltBranchChildForTest(t, file, meta.pageSize, branch.id, 0, branch.id)
+}
+
+func corruptBranchSecondChildToDuplicateFirstForTest(t *testing.T, path string) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	branch := requireBoltBranchPageFromFileForTest(t, file, meta, 2)
+	firstChild := readBoltBranchChildForTest(t, file, meta.pageSize, branch.id, 0)
+	writeBoltBranchChildForTest(t, file, meta.pageSize, branch.id, 1, firstChild)
+}
+
+func requireBoltBranchPageForTest(t *testing.T, path string, minCount uint16) boltPreflightPage {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	return requireBoltBranchPageFromFileForTest(t, file, meta, minCount)
+}
+
+func requireBoltBranchPageFromFileForTest(t *testing.T, file *os.File, meta boltPreflightMeta, minCount uint16) boltPreflightPage {
+	t.Helper()
+	for pageID := uint64(0); pageID < meta.pgid; {
+		page, err := readBoltPreflightPage(file, pageID, meta.pageSize)
+		if err != nil {
+			t.Fatalf("read page %d: %v", pageID, err)
+		}
+		if page.flags == boltBranchPageFlag && page.count >= minCount {
+			return page
+		}
+		pageID += uint64(page.overflow) + 1
+	}
+	t.Fatalf("no branch page with at least %d children found", minCount)
+	return boltPreflightPage{}
+}
+
+func requireBoltLeafPageFromFileForTest(t *testing.T, file *os.File, meta boltPreflightMeta, minCount uint16) boltPreflightPage {
+	t.Helper()
+	for pageID := uint64(0); pageID < meta.pgid; {
+		page, err := readBoltPreflightPage(file, pageID, meta.pageSize)
+		if err != nil {
+			t.Fatalf("read page %d: %v", pageID, err)
+		}
+		if page.flags == boltLeafPageFlag && page.count >= minCount {
+			return page
+		}
+		pageID += uint64(page.overflow) + 1
+	}
+	t.Fatalf("no leaf page with at least %d elements found", minCount)
+	return boltPreflightPage{}
+}
+
+func openBoltFileAndMetaForTest(t *testing.T, path string) (*os.File, boltPreflightMeta) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	meta, ok, err := readBoltPreflightMeta(file, info.Size())
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if !ok {
+		_ = file.Close()
+		t.Fatal("active bbolt meta not found")
+	}
+	return file, meta
+}
+
+func readBoltBranchChildForTest(t *testing.T, file *os.File, pageSize, pageID uint64, index uint16) uint64 {
+	t.Helper()
+	var buf [8]byte
+	offset := int64(pageID*pageSize + boltPageHeaderSize + uint64(index)*boltBranchPageElementSize + 8)
+	if _, err := file.ReadAt(buf[:], offset); err != nil {
+		t.Fatalf("read branch page %d child %d: %v", pageID, index, err)
+	}
+	return binary.LittleEndian.Uint64(buf[:])
+}
+
+func writeBoltBranchChildForTest(t *testing.T, file *os.File, pageSize, pageID uint64, index uint16, child uint64) {
+	t.Helper()
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], child)
+	offset := int64(pageID*pageSize + boltPageHeaderSize + uint64(index)*boltBranchPageElementSize + 8)
+	if _, err := file.WriteAt(buf[:], offset); err != nil {
+		t.Fatalf("write branch page %d child %d: %v", pageID, index, err)
 	}
 }
 

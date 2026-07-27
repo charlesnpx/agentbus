@@ -162,6 +162,8 @@ func TestAttemptProofValidationRejectsLaunchSlotTopologyGap(t *testing.T) {
 	group.Leader = ProcessIdentity{PID: 20, HighResStartToken: "leader-start-20"}
 	group.Monitor = ProcessIdentity{PID: 22, HighResStartToken: "monitor-start-20"}
 	group.RetainedID = "retained-2"
+	group.RetainedDomainID = "retained-domain-2"
+	group.RetainedDomainState = RetainedDomainKnown
 	grant := *record.Attempt.Launches.First.Grant
 	grant.Ordinal = LaunchOrdinalTwo
 
@@ -226,6 +228,50 @@ func TestGroupRefValidationRejectsUnsafePGID(t *testing.T) {
 	}
 }
 
+func TestGroupRefValidationRequiresRetainedIdentityDomainPair(t *testing.T) {
+	base := *validSafetyRecord().Attempt.Launches.First.Group
+	tests := []struct {
+		name  string
+		group GroupRef
+		field string
+	}{
+		{
+			name: "known domain without retained id",
+			group: func() GroupRef {
+				group := base
+				group.RetainedID = ""
+				group.RetainedDomainID = "retained-domain-known"
+				group.RetainedDomainState = RetainedDomainKnown
+				return group
+			}(),
+			field: "group.retained_id",
+		},
+		{
+			name: "retained id without retained domain",
+			group: func() GroupRef {
+				group := base
+				group.RetainedID = "retained-present"
+				group.RetainedDomainID = ""
+				group.RetainedDomainState = RetainedDomainNotApplicable
+				return group
+			}(),
+			field: "group.retained_id",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.group.Validate()
+			if !errors.Is(err, ErrInvalidValue) {
+				t.Fatalf("Validate() error = %v, want ErrInvalidValue", err)
+			}
+			var validation ValidationError
+			if !errors.As(err, &validation) || validation.Field != tt.field {
+				t.Fatalf("Validate() error = %v, want %s validation error", err, tt.field)
+			}
+		})
+	}
+}
+
 func TestGroupPhysicalIdentityIncludesLeaderReuseAcrossPGIDs(t *testing.T) {
 	record := validSafetyRecord()
 	first := *record.Attempt.Launches.First.Group
@@ -239,6 +285,9 @@ func TestGroupPhysicalIdentityIncludesLeaderReuseAcrossPGIDs(t *testing.T) {
 func TestGroupPhysicalIdentityRequiresRetainedIDMatchWhenPresent(t *testing.T) {
 	record := validSafetyRecord()
 	first := *record.Attempt.Launches.First.Group
+	first.RetainedID = "retained-first"
+	first.RetainedDomainID = "retained-domain-first"
+	first.RetainedDomainState = RetainedDomainKnown
 	tests := []struct {
 		name   string
 		mutate func(*GroupRef)
@@ -380,7 +429,6 @@ func validSafetyRecord() SafetyRecord {
 		PGID:              10,
 		Leader:            ProcessIdentity{PID: 10, HighResStartToken: "leader-start-10"},
 		Monitor:           ProcessIdentity{PID: 12, HighResStartToken: "monitor-start-10"},
-		RetainedID:        "retained-1",
 	}
 	grant := LaunchGrant{
 		Attempt:   attempt,

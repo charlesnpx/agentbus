@@ -152,7 +152,6 @@ type admissionStartupHooks struct {
 // Serve bootstrap from the qualified runtime and probed backend descriptors.
 type ServeAdmissionPolicy struct {
 	Mode                      AdmissionServeMode
-	CrashDurableContainment   bool
 	AcceptIdentified          bool
 	AdvertiseRequestID        bool
 	Reason                    error
@@ -181,15 +180,14 @@ func deriveServeAdmissionPolicy(metadata authority.AdmissionRootMetadata, runtim
 		reason = newAdmissionSupportDiagnostic(metadata, runtimeSupport.Assessment, true)
 	}
 	policy := ServeAdmissionPolicy{
-		Mode:                    mode,
-		CrashDurableContainment: strictSupportAvailable(runtimeSupport),
-		AcceptIdentified:        mode == AdmissionStrictIdentified,
-		AdvertiseRequestID:      false,
-		Reason:                  reason,
-		strictRouteEnabled:      mode != AdmissionFatal,
-		runtimeSupport:          runtimeSupport,
-		runtimeAssessment:       runtimeSupport.Assessment,
-		backends:                make(map[string]ServeBackendFenceability, len(descriptors)),
+		Mode:               mode,
+		AcceptIdentified:   mode == AdmissionStrictIdentified,
+		AdvertiseRequestID: false,
+		Reason:             reason,
+		strictRouteEnabled: mode != AdmissionFatal,
+		runtimeSupport:     runtimeSupport,
+		runtimeAssessment:  runtimeSupport.Assessment,
+		backends:           make(map[string]ServeBackendFenceability, len(descriptors)),
 	}
 	if mode == AdmissionFatal {
 		policy.strictRouteDisabledReason = reason.Error()

@@ -98,7 +98,7 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 	unresolved := map[model.LaunchOrdinal]bool{}
 	for step := 0; step < admissionRecoveryMaxSteps; step++ {
 		if err := current.Validate(); err != nil {
-			return report, fmt.Errorf("%w: invalid recovery work item: %v", authority.ErrRecoveryNeeded, err)
+			return report, fmt.Errorf("%w: invalid recovery work item: %w", authority.ErrRecoveryNeeded, err)
 		}
 		if len(current.Launches) == 0 {
 			if err := e.session.FinalizePlanned(ctx, current.Token); err != nil {
@@ -150,9 +150,22 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 }
 
 func (e *admissionRecoveryExecutor) recoverLaunch(ctx context.Context, item model.RecoveryWorkItem, recoveryLaunch model.RecoveryLaunch) (model.RecoveryWorkItem, bool, error, error) {
+	// U5 integration: a contradictory/untrustworthy durable containment identity is a
+	// FATAL authority-integrity failure (ADR-11/ADR-13), NOT job-local unresolved. Validate
+	// the durable GroupRef BEFORE any containment attempt so ContainAndVerify is never
+	// invoked on a contradictory identity and the failure fails closed (ErrInvalidValue ->
+	// ErrRecoveryNeeded -> safety latch), rather than being misrouted to unresolved.
+	if err := recoveryLaunch.Group.Validate(); err != nil {
+		return model.RecoveryWorkItem{}, false, nil, fmt.Errorf("%w: contradictory recovery launch identity %s ordinal %s: %w", authority.ErrRecoveryNeeded, item.JobID, recoveryLaunch.Ordinal, err)
+	}
 	verified, cleanup, err := e.launch.ContainAndVerify(ctx, recoveryLaunch.Group, custodian.QuiescenceCauseRecovery)
 	if err != nil {
-		if custodian.IsCleanupUnresolved(err) {
+		if custodian.IsCleanupUnresolved(err) || errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved) {
+			// U5's retained-object reacquire failure is a trustworthy-identity,
+			// object-gone case: route it to the same job-local unresolved path as
+			// CleanupUnresolvedError (all-ordinal recovery -> FinalizeUnresolved ->
+			// orphaned), never fatal. Contradictory durable identity stays fatal
+			// upstream via GroupRef.Validate.
 			return model.RecoveryWorkItem{}, true, nil, nil
 		}
 		if recoveryAborted(err) {

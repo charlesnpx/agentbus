@@ -575,6 +575,7 @@ func TestContainmentGroupLeaderCoherenceExhaustive(t *testing.T) {
 
 func retainedReducerGroup(ordinal LaunchOrdinal) GroupRef {
 	ref := reducerGroup(ordinal)
+	ref.RetainedID = "retained-" + ordinal.String()
 	ref.RetainedDomainID = "retained-domain-" + ordinal.String()
 	ref.RetainedDomainState = RetainedDomainKnown
 	return ref
@@ -585,8 +586,10 @@ func decisionTableGroup(t *testing.T, retainedState RetainedDomainState) GroupRe
 	ref := reducerGroup(LaunchOrdinalOne)
 	switch retainedState {
 	case RetainedDomainKnown:
+		ref.RetainedID = "retained-table"
 		ref.RetainedDomainID = "retained-domain-table"
 	case RetainedDomainNotApplicable, RetainedDomainUnknown:
+		ref.RetainedID = ""
 		ref.RetainedDomainID = ""
 	default:
 		t.Fatalf("unsupported retained domain state %v", retainedState)

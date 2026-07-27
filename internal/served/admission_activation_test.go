@@ -1,6 +1,7 @@
 package served
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,40 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
+
+func TestServeAdmissionPolicyBaselineQualificationDoesNotRequireCrashDurableContainment(t *testing.T) {
+	support, err := custodian.NewSupport(custodian.Support{
+		ParkedExec:             true,
+		VerifiedContainment:    true,
+		ImplementationCompiled: true,
+		RuntimeProbePassed:     true,
+		FeatureConfigured:      true,
+		FeatureAdvertised:      true,
+		Platform:               "linux",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := deriveServeAdmissionPolicy(
+		authority.AdmissionRootMetadata{Activated: true, ContractVersion: authority.CurrentAdmissionContractVersion, ActivatedAtGen: 1},
+		support,
+		map[string]admissionBackendDescriptor{
+			"fake": {
+				name:             "fake",
+				capabilities:     model.ExecutionCapabilities{},
+				controlledRunner: true,
+				fenceable:        true,
+			},
+		},
+	)
+	if policy.Mode != AdmissionStrictIdentified || !policy.AcceptIdentified || !policy.strictRuntimeAvailable() {
+		t.Fatalf("policy = %+v, want strict identified admission from baseline supervision", policy)
+	}
+	fenceability, ok := policy.backendFenceability("fake")
+	if !ok || !fenceability.ControlledRunner || !fenceability.Fenceable {
+		t.Fatalf("backend fenceability = %+v ok=%t, want controlled fenceable backend", fenceability, ok)
+	}
+}
 
 func TestAdmissionContentionContextBoundsNoDeadlineFallback(t *testing.T) {
 	start := time.Now()
@@ -251,7 +286,8 @@ func TestActivatedRootContractVersionMismatchFailsStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	badRepo := repositoryWithForgedContractVersion(t, repo, authority.CurrentAdmissionContractVersion+1)
+	badRepo := repositoryWithForgedContractVersion(t, repo, 1)
+	before := badRepo.SnapshotBytes()
 	restart := newTestServerAtRoot(t, server.stateRoot, cwd, newFakeBackend("fake"))
 	restart.admissionBootstrapperFactory = func(ctx context.Context, s *Server) (*admissionBootstrapper, repository.Repository, io.Closer, error) {
 		bootstrapper, err := authority.NewBootstrapper(badRepo, authority.WithAnchorStore(anchorStore), authority.WithQuiescenceVerifier(s.admissionRuntime.quiescenceVerifier()))
@@ -267,6 +303,13 @@ func TestActivatedRootContractVersionMismatchFailsStartup(t *testing.T) {
 	err := restart.Serve(ctx)
 	if !errors.Is(err, authority.ErrAdmissionContractMismatch) {
 		t.Fatalf("Serve contract mismatch error = %v, want ErrAdmissionContractMismatch", err)
+	}
+	var incompatible authority.IncompatibleAdmissionContractVersionError
+	if !errors.As(err, &incompatible) || incompatible.RootContractVersion != 1 || incompatible.DaemonContractVersion != authority.CurrentAdmissionContractVersion || !incompatible.Activated {
+		t.Fatalf("Serve contract mismatch error = %#v %v, want activated v1 incompatible contract", incompatible, err)
+	}
+	if !bytes.Equal(before, badRepo.SnapshotBytes()) {
+		t.Fatal("contract mismatch startup mutated repository")
 	}
 }
 

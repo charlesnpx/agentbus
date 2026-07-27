@@ -22,6 +22,109 @@ func requireLinuxRetainedConformanceOrSkip(t *testing.T) {
 	requireRealNativeContainmentOrSkip(t)
 }
 
+func TestLinuxNativeContainmentBackendSelection(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("cgroup present selects retained backend", func(t *testing.T) {
+		manager := newFakeNativeRetainedManager()
+		native := &NativeCustodian{
+			options: NativeOptions{
+				newRetainedGroup: func() (containment.RetainedGroupObject, error) {
+					return manager, nil
+				},
+			},
+			running:   make(map[string]*NativeRunningProcess),
+			finalized: make(map[string]*NativeRunningProcess),
+		}
+		cleanupNativeCustodianForTest(t, native)
+
+		backend, err := newNativeContainmentBackend(ctx, native)
+		if err != nil {
+			t.Fatalf("newNativeContainmentBackend() error = %v", err)
+		}
+		defer func() {
+			if err := backend.close(ctx); err != nil {
+				t.Fatalf("backend close error = %v", err)
+			}
+		}()
+		if _, ok := backend.(*retainedNativeContainmentBackend); !ok {
+			t.Fatalf("backend = %T, want retainedNativeContainmentBackend", backend)
+		}
+		if backend.retainedID() == "" || backend.retainedObject() == nil {
+			t.Fatalf("retained backend id/object = %q/%T, want populated retained object", backend.retainedID(), backend.retainedObject())
+		}
+	})
+
+	t.Run("cgroup unsupported falls back to leader backend", func(t *testing.T) {
+		native := &NativeCustodian{
+			options: NativeOptions{
+				newRetainedGroup: func() (containment.RetainedGroupObject, error) {
+					return nil, cgroup.ErrUnsupported
+				},
+			},
+			running:   make(map[string]*NativeRunningProcess),
+			finalized: make(map[string]*NativeRunningProcess),
+		}
+		cleanupNativeCustodianForTest(t, native)
+
+		backend, err := newNativeContainmentBackend(ctx, native)
+		if err != nil {
+			t.Fatalf("newNativeContainmentBackend() error = %v", err)
+		}
+		if _, ok := backend.(*leaderNativeContainmentBackend); !ok {
+			t.Fatalf("backend = %T, want leaderNativeContainmentBackend", backend)
+		}
+		if backend.retainedID() != "" || backend.retainedObject() != nil {
+			t.Fatalf("leader backend retained id/object = %q/%T, want no retained object", backend.retainedID(), backend.retainedObject())
+		}
+	})
+
+	t.Run("prelaunch retained setup failure falls back to leader backend", func(t *testing.T) {
+		native := &NativeCustodian{
+			options: NativeOptions{
+				newRetainedGroup: func() (containment.RetainedGroupObject, error) {
+					return retainedSetupUnsupportedManager{}, nil
+				},
+			},
+			running:   make(map[string]*NativeRunningProcess),
+			finalized: make(map[string]*NativeRunningProcess),
+		}
+		cleanupNativeCustodianForTest(t, native)
+
+		backend, err := newNativeContainmentBackend(ctx, native)
+		if err != nil {
+			t.Fatalf("newNativeContainmentBackend() error = %v", err)
+		}
+		if _, ok := backend.(*leaderNativeContainmentBackend); !ok {
+			t.Fatalf("backend = %T, want leaderNativeContainmentBackend", backend)
+		}
+	})
+
+	t.Run("root lease contention does not fall back", func(t *testing.T) {
+		native := &NativeCustodian{
+			options: NativeOptions{
+				newRetainedGroup: func() (containment.RetainedGroupObject, error) {
+					return nil, cgroup.ErrRootLeaseUnavailable
+				},
+			},
+			running:   make(map[string]*NativeRunningProcess),
+			finalized: make(map[string]*NativeRunningProcess),
+		}
+		cleanupNativeCustodianForTest(t, native)
+
+		backend, err := newNativeContainmentBackend(ctx, native)
+		if err == nil {
+			t.Fatalf("newNativeContainmentBackend() error = nil backend=%T, want root lease contention", backend)
+		}
+		if !errors.Is(err, cgroup.ErrRootLeaseUnavailable) {
+			t.Fatalf("newNativeContainmentBackend() error = %v, want ErrRootLeaseUnavailable", err)
+		}
+		if errors.Is(err, ErrRetainedContainmentUnavailable) && retainedContainmentFallbackAllowed(err) {
+			t.Fatalf("root lease error = %v was classified fallback-allowed", err)
+		}
+	})
+}
+
 func TestNewNativeRuntimeSelfTestUsesReturnedSingleLeaseInstance(t *testing.T) {
 	requireLinuxRetainedConformanceOrSkip(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -74,21 +177,20 @@ func TestNewNativeRuntimeSelfTestUsesReturnedSingleLeaseInstance(t *testing.T) {
 	}
 
 	second, secondErr := NewNativeRuntime(options)
-	if secondErr == nil {
-		if closer, ok := second.Process().(interface{ Close() error }); ok {
-			_ = closer.Close()
-		}
-		t.Fatal("second NewNativeRuntime() while first is open error = nil, want typed single-lease failure")
+	if secondErr != nil {
+		t.Fatalf("second NewNativeRuntime() while first is open error = %v, want construction to succeed before per-launch selection", secondErr)
 	}
-	secondAssessment := second.SupportAssessment()
-	if secondAssessment.Class != SupportRetryable || secondAssessment.Attempts != 1 || !secondAssessment.CleanupSafe || !errors.Is(secondAssessment.Cause, cgroup.ErrRootLeaseUnavailable) {
-		t.Fatalf("second SupportAssessment() = %+v err=%v, want retryable attempts=1 cleanup-safe ErrRootLeaseUnavailable cause", secondAssessment, secondErr)
+	secondAssessment := second.SelfTest(ctx).Assessment
+	if secondAssessment.Class != SupportRetryable || secondAssessment.Attempts != 3 || !secondAssessment.CleanupSafe || !errors.Is(secondAssessment.Cause, cgroup.ErrRootLeaseUnavailable) {
+		_ = second.Close()
+		t.Fatalf("second SelfTest() = %+v, want retryable attempts=3 cleanup-safe ErrRootLeaseUnavailable cause", secondAssessment)
 	}
-	if !errors.Is(secondErr, cgroup.ErrRootLeaseUnavailable) {
-		t.Fatalf("second NewNativeRuntime() error = %v, want ErrRootLeaseUnavailable", secondErr)
+	if _, ok := second.Process().(*NativeCustodian); !ok {
+		_ = second.Close()
+		t.Fatalf("second NewNativeRuntime() process = %T, want *NativeCustodian", second.Process())
 	}
-	if _, ok := second.Process().(UnavailableCustodian); !ok {
-		t.Fatalf("second NewNativeRuntime() process = %T, want UnavailableCustodian", second.Process())
+	if err := second.Close(); err != nil {
+		t.Fatalf("second native runtime Close() error = %v", err)
 	}
 
 	if err := runtimeBundle.Close(); err != nil {
@@ -98,9 +200,46 @@ func TestNewNativeRuntimeSelfTestUsesReturnedSingleLeaseInstance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("third NewNativeRuntime() after Close error = %v support=%+v", err, third.Support())
 	}
+	thirdAssessment := third.SelfTest(ctx).Assessment
+	if thirdAssessment.Class != SupportAvailable || thirdAssessment.Attempts != 1 || !thirdAssessment.CleanupSafe {
+		_ = third.Close()
+		t.Fatalf("third SelfTest() = %+v, want available attempts=1 cleanup-safe", thirdAssessment)
+	}
 	if err := third.Close(); err != nil {
 		t.Fatalf("third native runtime Close() error = %v", err)
 	}
+}
+
+type retainedSetupUnsupportedManager struct{}
+
+func (retainedSetupUnsupportedManager) AcquireRetainedGroup(context.Context, model.GroupRef, time.Time) (containment.RetainedGroupCapability, error) {
+	return retainedSetupUnsupportedCapability{}, nil
+}
+
+type retainedSetupUnsupportedCapability struct{}
+
+func (retainedSetupUnsupportedCapability) Identity() containment.RetainedGroupIdentity {
+	return containment.RetainedGroupIdentity{}
+}
+
+func (retainedSetupUnsupportedCapability) Membership(context.Context) (containment.RetainedGroupMembership, error) {
+	return containment.RetainedMembershipUnknown, nil
+}
+
+func (retainedSetupUnsupportedCapability) StillHeld(context.Context) (bool, error) {
+	return true, nil
+}
+
+func (retainedSetupUnsupportedCapability) SignalTerm(context.Context) (containment.SignalResult, error) {
+	return containment.SignalUnprovable, nil
+}
+
+func (retainedSetupUnsupportedCapability) Kill(context.Context) (containment.SignalResult, error) {
+	return containment.SignalUnprovable, nil
+}
+
+func (retainedSetupUnsupportedCapability) Release() error {
+	return nil
 }
 
 func nativeRuntimeOptionsForRetainedTest(t *testing.T) NativeOptions {

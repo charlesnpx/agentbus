@@ -104,21 +104,21 @@ func TestNativeSelfTestClassificationTable(t *testing.T) {
 	})
 }
 
-func TestNativeSelfTestPostConstructionRootLeaseLossIsUnsafe(t *testing.T) {
+func TestNativeSelfTestRootLeaseContentionIsRetryable(t *testing.T) {
 	calls := 0
 	cause := nativePrepareFailure(fmt.Errorf("prepare: %w", cgroup.ErrRootLeaseUnavailable), false, true)
 	assessment := runClassifiedNativeSelfTest(context.Background(), 3, func(context.Context, int) nativeSelfTestAttemptResult {
 		calls++
 		return classifyNativeSelfTestPrepareFailure(cause)
 	})
-	if calls != 1 {
-		t.Fatalf("attempt calls = %d, want 1", calls)
+	if calls != 3 {
+		t.Fatalf("attempt calls = %d, want 3", calls)
 	}
-	if assessment.Class != SupportUnsafe || assessment.Attempts != 1 || assessment.CleanupSafe {
-		t.Fatalf("assessment = %+v, want unsafe attempts=1 cleanup unsafe", assessment)
+	if assessment.Class != SupportRetryable || assessment.Attempts != 3 || !assessment.CleanupSafe {
+		t.Fatalf("assessment = %+v, want retryable attempts=3 cleanup safe", assessment)
 	}
-	if !errors.Is(assessment.Cause, ErrNativeRuntimeSelfTestUnsafe) || !errors.Is(assessment.Cause, cgroup.ErrRootLeaseUnavailable) {
-		t.Fatalf("assessment cause = %v, want unsafe wrapping ErrRootLeaseUnavailable", assessment.Cause)
+	if !errors.Is(assessment.Cause, ErrNativeRuntimeSelfTestRetry) || !errors.Is(assessment.Cause, cgroup.ErrRootLeaseUnavailable) {
+		t.Fatalf("assessment cause = %v, want retryable wrapping ErrRootLeaseUnavailable", assessment.Cause)
 	}
 }
 
