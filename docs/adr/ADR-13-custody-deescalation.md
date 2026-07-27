@@ -45,17 +45,18 @@ The following outcome and cleanup matrix is NORMATIVE.
 | Backend execution definitely impossible | verified / irrelevant | keep canceled/failed; cleanup `no_execution_possible` |
 | May have occurred; no execution outcome recorded | absence verified | `reaped`; cleanup `verified_absent` |
 | May have occurred; no execution outcome recorded | absence unresolved | `OutcomeOrphaned`; cleanup `unresolved` |
-| Any execution outcome recorded (completed/failed/timed_out/interrupted/canceled) | absence verified | keep the recorded outcome; cleanup `verified_absent` |
-| Any execution outcome recorded (completed/failed/timed_out/interrupted/canceled) | absence unresolved | keep the recorded outcome AND its result; cleanup `unresolved` |
+| Any execution outcome recorded (completed/completed_noncompliant/failed/timed_out/interrupted/canceled) | absence verified | keep the recorded outcome; cleanup `verified_absent` |
+| Any execution outcome recorded (completed/completed_noncompliant/failed/timed_out/interrupted/canceled) | absence unresolved | keep the recorded outcome AND its result; cleanup `unresolved` |
 
 ### Cause and outcome compatibility
 
-The durable `TerminalCause` (engine/execution/model/types.go) determines which terminal
-outcome and cleanup basis are permitted. This table is NORMATIVE and closes the
-"which causes authorize a no-quiescence terminal" gap. "No-quiescence terminal" means a
-terminal certificate derived with the `ProofUnresolvedAbsence` basis (no quiescence
-evidence). It is permitted ONLY for the rows marked so below; every other terminal
-certificate retains the existing proven-quiescence requirement.
+The durable `TerminalCause` (engine/execution/model/types.go) determines the OUTCOME axis:
+whether execution was possible and which terminal outcome may be recorded. This table is
+NORMATIVE. The CLEANUP axis is independent (see Result semantics): the
+`ProofUnresolvedAbsence` basis may accompany ANY of these outcomes when physical absence
+could not be established. What this table restricts is the OUTCOME — in particular,
+`OutcomeOrphaned` (the only new outcome) is reachable ONLY from the marked rows, and the
+execution-impossible causes may never be orphaned.
 
 | TerminalCause | Execution possibility | Permitted terminal representation |
 | --- | --- | --- |
@@ -138,9 +139,26 @@ request replay already prevents repetition of the same logical job.
 ### Result semantics
 
 This section amends ADR-12 `Result semantics` lines 153-156. Physical proof is NO LONGER
-a universal prerequisite for terminalization. Terminalization without proven absence is
-permitted ONLY for supervisor-loss or orphan causes. Normal outcomes and successfully
-recovered outcomes MUST still carry proven quiescence.
+a universal prerequisite for terminalization.
+
+The two axes are governed independently:
+
+- **Cleanup axis (terminal basis).** The `ProofUnresolvedAbsence` terminal basis (terminal
+  WITHOUT proven absence) is the cleanup-axis representation of "physical absence could not
+  be established". It MAY accompany ANY terminal outcome and is not restricted to orphan
+  causes. Proven quiescence is required to CLAIM `verified_absent` (basis
+  `ProofCleanQuiescentOutcomeAndRetired` / `ProofContained`), NOT to terminalize at all. A
+  job whose absence is unprovable terminalizes with `ProofUnresolvedAbsence` and cleanup
+  `unresolved`, keeping whatever outcome axis applies.
+- **Outcome axis.** `OutcomeOrphaned` (unknown outcome) is reserved for the after-
+  authorization supervisor-loss / daemon-restart / unknown-release causes when NO outcome
+  was recorded (per the Cause and outcome compatibility table). A recorded outcome
+  (`completed`, `canceled`, etc.) keeps that outcome even when its cleanup basis is
+  `ProofUnresolvedAbsence`.
+
+Consequently a normal `completed` outcome that cannot prove absence at graceful shutdown
+terminalizes as `completed` + cleanup `unresolved`; it does NOT require proven quiescence
+to become terminal, and it is NOT rewritten to `orphaned`.
 
 The public `job.result` still MUST NOT serialize physical proof. The additive
 `cleanupDisposition` field is the only new public data surface.
