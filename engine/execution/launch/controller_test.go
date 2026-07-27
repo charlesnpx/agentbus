@@ -816,6 +816,43 @@ func TestLaunchControllerReleaseUnknownCleanupUnresolvedDoesNotFailStop(t *testi
 	}
 }
 
+func TestLaunchControllerReleaseUnknownRetainedObjectUnresolvedDoesNotFailStop(t *testing.T) {
+	h := newHarness(t, "release-unknown-retained-unresolved")
+	h.prepared.releaseOutcome = custodian.ReleaseOutcomeUnknown
+	h.prepared.releaseErr = errors.New("release channel lost")
+	h.custodian.containErr = &custodian.CleanupUnresolvedError{
+		Reason:   containment.ReasonProbeUnprovable,
+		Decision: model.Unprovable,
+		Cause: custodian.RetainedObjectReacquireUnresolvedError{
+			Group: h.group,
+			Cause: errors.New("retained object disappeared before absence proof"),
+		},
+	}
+
+	_, err := h.controller.Run(context.Background(), h.request(nil))
+	if err == nil {
+		t.Fatal("Run returned nil error for release-unknown retained-object unresolved cleanup")
+	}
+	if !errors.Is(err, ErrReleaseUncertain) {
+		t.Fatalf("Run error = %v, want ErrReleaseUncertain", err)
+	}
+	if !custodian.IsCleanupUnresolved(err) {
+		t.Fatalf("Run error = %v, want CleanupUnresolvedError", err)
+	}
+	if !errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved) {
+		t.Fatalf("Run error = %v, want ErrRetainedObjectReacquireUnresolved", err)
+	}
+	if h.authority.failStops != 0 {
+		t.Fatalf("fail stops = %d, want 0", h.authority.failStops)
+	}
+	if h.authority.releaseOutcomeFact != model.LaunchReleaseSentUnknown {
+		t.Fatalf("release outcome fact = %s, want %s", h.authority.releaseOutcomeFact, model.LaunchReleaseSentUnknown)
+	}
+	if h.authority.recordQuiescenceCalls != 0 {
+		t.Fatalf("record quiescence calls = %d, want 0", h.authority.recordQuiescenceCalls)
+	}
+}
+
 func TestLaunchControllerReleaseDefinitelyNotSentAbortsWithoutRetry(t *testing.T) {
 	h := newHarness(t, "release-not-sent")
 	h.prepared.releaseOutcome = custodian.ReleaseDefinitelyNotSent

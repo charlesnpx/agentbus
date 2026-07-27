@@ -377,6 +377,48 @@ func TestRecoverRecordedCompletedTypedUnresolvedKeepsResult(t *testing.T) {
 	}
 }
 
+func TestRecoverLiveLossRetainedObjectUnresolvedOrphansWithoutFailStop(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "live-loss-retained-unresolved")
+	accepted := h.submit(t, ctx, "live-loss-retained-unresolved")
+	group := h.bindGrantRelease(t, ctx, accepted, model.LaunchOrdinalOne)
+	retainedErr := custodian.RetainedObjectReacquireUnresolvedError{
+		Group: group,
+		Cause: errors.New("retained object disappeared before absence proof"),
+	}
+	h.containment.errByOrdinal = map[model.LaunchOrdinal]error{
+		model.LaunchOrdinalOne: &custodian.CleanupUnresolvedError{
+			Reason:   containment.ReasonProbeUnprovable,
+			Decision: model.Unprovable,
+			Cause:    retainedErr,
+		},
+	}
+
+	if err := h.coordinator.Recover(ctx, accepted.Record.JobID, model.RecoveryLiveLoss, nil); err != nil {
+		t.Fatal(err)
+	}
+	if h.authority.failStopped {
+		t.Fatalf("authority fail-stopped after retained-object unresolved cleanup: %v", h.authority.failReason)
+	}
+
+	snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
+	if snapshot.Record.Terminal == nil {
+		t.Fatal("terminal certificate missing")
+	}
+	if snapshot.Record.Terminal.Outcome != model.OutcomeOrphaned {
+		t.Fatalf("outcome = %s, want %s", snapshot.Record.Terminal.Outcome, model.OutcomeOrphaned)
+	}
+	if snapshot.Record.Terminal.Proof != model.ProofUnresolvedAbsence {
+		t.Fatalf("proof = %s, want %s", snapshot.Record.Terminal.Proof, model.ProofUnresolvedAbsence)
+	}
+	if snapshot.Record.Terminal.Cause != model.CauseSupervisorLostAfterAuthorization {
+		t.Fatalf("cause = %s, want %s", snapshot.Record.Terminal.Cause, model.CauseSupervisorLostAfterAuthorization)
+	}
+	if got := model.DeriveCleanupDisposition(snapshot.Record); got != model.CleanupDispositionUnresolved {
+		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
+	}
+}
+
 func TestCompleteContradictoryOpenOutcomeConflictIsNotReconciledByLaterTerminal(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, "open-outcome-conflict")
@@ -923,6 +965,7 @@ type testLaunchContainment struct {
 	retired            int
 	failContain        bool
 	cleanupErr         error
+	errByOrdinal       map[model.LaunchOrdinal]error
 	unresolvedOrdinals map[model.LaunchOrdinal]bool
 	issuer             custodian.AttestationIssuer
 	events             *coordinatorEventLog
@@ -954,6 +997,11 @@ func (c *testLaunchContainment) ContainAndVerify(ctx context.Context, launchCtx 
 	}
 	if c.failContain {
 		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, errors.New("containment failed")
+	}
+	if c.errByOrdinal != nil {
+		if err := c.errByOrdinal[launchCtx.Ordinal]; err != nil {
+			return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, err
+		}
 	}
 	if c.unresolvedOrdinals[launchCtx.Ordinal] {
 		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, &custodian.CleanupUnresolvedError{

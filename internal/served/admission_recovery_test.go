@@ -78,6 +78,50 @@ func TestAdmissionRecoveryRejectsContradictoryGroupRefAsFatalIntegrity(t *testin
 	}
 }
 
+func TestAdmissionRecoveryRetainedObjectUnresolvedDoesNotTripLatch(t *testing.T) {
+	ctx := context.Background()
+	item := admissionRecoveryTestWorkItem()
+	group := item.Launches[0].Group
+	group.RetainedDomainID = "retained-domain-served-recovery"
+	group.RetainedDomainState = model.RetainedDomainKnown
+	group.RetainedID = "retained-served-recovery"
+	item.Launches[0].Group = group
+
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.containErrByOrdinal = map[model.LaunchOrdinal]error{
+		model.LaunchOrdinalOne: custodian.RetainedObjectReacquireUnresolvedError{
+			Group: group,
+			Cause: errors.New("retained object disappeared before absence proof"),
+		},
+	}
+	session := &admissionRecoveryFakeSession{
+		items: []model.RecoveryWorkItem{item},
+		finalized: model.SafetyRecord{
+			JobID: item.JobID,
+			Terminal: &model.TerminalCertificate{
+				Outcome: model.OutcomeOrphaned,
+				Proof:   model.ProofUnresolvedAbsence,
+				Cause:   model.CauseDaemonRestartedAfterAuthorization,
+			},
+		},
+	}
+	latch := NewSafetyLatch()
+
+	report, err := recoverAdmissionBeforeReadyReport(ctx, session, launcher, latch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.UnresolvedLaunches != 1 || report.FinalizedJobs != 1 || report.OrphanedJobs != 1 {
+		t.Fatalf("recovery report = %+v, want one retained-object unresolved orphan", report)
+	}
+	if session.finalizeUnresolvedCalls != 1 {
+		t.Fatalf("FinalizeUnresolved calls = %d, want 1", session.finalizeUnresolvedCalls)
+	}
+	if reason := latch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+}
+
 func admissionRecoveryTestWorkItem() model.RecoveryWorkItem {
 	jobID := model.JobID("job-served-recovery")
 	attempt := model.AttemptRef{JobID: jobID, AttemptID: "attempt-served-recovery", Epoch: 1}

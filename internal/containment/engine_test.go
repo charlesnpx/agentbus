@@ -924,9 +924,8 @@ func TestContainmentAcquiresRetainedCapabilityBeforeFirstObservation(t *testing.
 
 func TestContainmentRetainedDomainNotApplicableDoesNotRequireRetainedAcquisition(t *testing.T) {
 	target := testGroupRef(t)
-	target.RetainedID = "legacy-retained-1001"
 	if err := target.Validate(); err != nil {
-		t.Fatalf("legacy retained GroupRef invalid: %v", err)
+		t.Fatalf("retained-domain-not-applicable GroupRef invalid: %v", err)
 	}
 	retained := &fakeRetainedObject{acquireErr: errors.New("should not acquire")}
 	observer := &fakeObserver{observations: []model.ContainmentObservation{

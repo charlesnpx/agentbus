@@ -1782,6 +1782,9 @@ func TestAdmissionRecoveryExecutorTypedUnresolvedContinuesStartupWithoutRelaunch
 	if reason := server.safetyLatch.Reason(); reason != nil {
 		t.Fatalf("safety latch tripped: %v", reason)
 	}
+	if snapshot := admissionAnchorSnapshot(t, anchorStore); snapshot.Phase == "fail_stopped" {
+		t.Fatalf("anchor phase = %q, want non-fail-stopped after typed unresolved recovery", snapshot.Phase)
+	}
 	if got := backend.count.Load(); got != 0 {
 		t.Fatalf("backend starts = %d, want no recovery relaunch", got)
 	}
