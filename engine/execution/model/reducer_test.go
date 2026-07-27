@@ -579,6 +579,90 @@ func TestReleaseTerminalCausesRequireDurableLaunchFact(t *testing.T) {
 	}
 }
 
+func TestReleaseDefinitelyNotSentRequiresAuthoritativeAttemptWideEvidence(t *testing.T) {
+	genuineNotSent := reducerGrantRecord(t)
+	genuineNotSent = reducerMustApply(t, genuineNotSent, RecordReleaseOutcome{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Outcome: LaunchReleaseNotSent})
+	genuineNotSent = reducerMustApply(t, genuineNotSent, reducerContainmentCommand(t, genuineNotSent))
+	certificate, err := DeriveTerminalCertificate(genuineNotSent, TerminalIntent{
+		Outcome: OutcomeFailed,
+		Cause:   CauseReleaseDefinitelyNotSent,
+	})
+	if err != nil {
+		t.Fatalf("DeriveTerminalCertificate genuine release-not-sent error = %v", err)
+	}
+	genuineNotSent.Terminal = &certificate
+	if err := ValidateSafetyRecord(genuineNotSent); err != nil {
+		t.Fatalf("ValidateSafetyRecord genuine release-not-sent error = %v", err)
+	}
+	if got := DeriveCleanupDisposition(genuineNotSent); got != CleanupDispositionNoExecutionPossible {
+		t.Fatalf("genuine release-not-sent cleanup = %s, want %s", got, CleanupDispositionNoExecutionPossible)
+	}
+
+	record := reducerOrdinalOneReleasedOrdinalTwoReleaseOutcomeRecord(t, LaunchReleaseNotSent)
+	if _, err := DeriveTerminalCertificate(record, TerminalIntent{
+		Outcome: OutcomeFailed,
+		Cause:   CauseReleaseDefinitelyNotSent,
+	}); !errors.Is(err, ErrCommandPrecondition) {
+		t.Fatalf("multi-ordinal release-not-sent terminal error = %v, want ErrCommandPrecondition", err)
+	}
+
+	forged := record
+	forged.Terminal = &TerminalCertificate{
+		JobID:               forged.JobID,
+		Attempt:             forged.Attempt.Ref,
+		Outcome:             OutcomeFailed,
+		Proof:               ProofContained,
+		Cause:               CauseReleaseDefinitelyNotSent,
+		DerivedFromRevision: forged.Revision,
+		DerivedBy:           forged.AdmittedBy,
+	}
+	if err := ValidateSafetyRecord(forged); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("forged multi-ordinal release-not-sent terminal error = %v, want ErrInvalidValue", err)
+	}
+	if got := DeriveCleanupDisposition(forged); got == CleanupDispositionNoExecutionPossible {
+		t.Fatalf("forged multi-ordinal cleanup = %s, want not %s", got, CleanupDispositionNoExecutionPossible)
+	}
+}
+
+func TestReleaseOutcomeUnknownRequiresAuthoritativeLaunchWithoutRecordedOutcome(t *testing.T) {
+	record := reducerOrdinalOneReleasedOrdinalTwoReleaseOutcomeRecord(t, LaunchReleaseSentUnknown)
+	certificate, err := DeriveTerminalCertificate(record, TerminalIntent{
+		Outcome: OutcomeReaped,
+		Cause:   CauseReleaseOutcomeUnknown,
+	})
+	if err != nil {
+		t.Fatalf("DeriveTerminalCertificate release-unknown without recorded outcome error = %v", err)
+	}
+	if certificate.Outcome != OutcomeReaped || certificate.Cause != CauseReleaseOutcomeUnknown || certificate.Proof != ProofContained {
+		t.Fatalf("terminal = %#v, want reaped/release-unknown/contained", certificate)
+	}
+
+	record.Outcome = &OutcomeFact{Attempt: record.Attempt.Ref, Outcome: OutcomeFailed}
+	if terminalCauseBackedByDurableFact(record, CauseReleaseOutcomeUnknown) {
+		t.Fatal("release-unknown cause backed by durable fact with recorded execution outcome, want rejected")
+	}
+	if _, err := DeriveTerminalCertificate(record, TerminalIntent{
+		Outcome: OutcomeFailed,
+		Cause:   CauseReleaseOutcomeUnknown,
+	}); err == nil {
+		t.Fatal("release-unknown constructor with recorded outcome succeeded, want error")
+	}
+
+	forged := record
+	forged.Terminal = &TerminalCertificate{
+		JobID:               forged.JobID,
+		Attempt:             forged.Attempt.Ref,
+		Outcome:             OutcomeFailed,
+		Proof:               ProofContained,
+		Cause:               CauseReleaseOutcomeUnknown,
+		DerivedFromRevision: forged.Revision,
+		DerivedBy:           forged.AdmittedBy,
+	}
+	if err := ValidateSafetyRecord(forged); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("forged release-unknown with recorded outcome error = %v, want ErrInvalidValue", err)
+	}
+}
+
 func TestRecoveryTerminalIntentSelectsUnknownOutcomeFromAbsenceProof(t *testing.T) {
 	releaseUnknown := reducerGrantRecord(t)
 	releaseUnknown = reducerMustApply(t, releaseUnknown, RecordReleaseOutcome{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Outcome: LaunchReleaseSentUnknown})
@@ -645,8 +729,8 @@ func TestRecordedOutcomeCauseCompatibilityMatchesADR(t *testing.T) {
 	if recordedOutcomeCausePermitsIntent(CauseCompletedNormally, OutcomeCanceled) {
 		t.Fatalf("%s + %s accepted, want canceled to use %s", CauseCompletedNormally, OutcomeCanceled, CauseCanceledAfterAuthorization)
 	}
-	if recordedOutcomeCausePermitsIntent(CauseResponseUndeliverable, OutcomeCanceled) {
-		t.Fatalf("%s + %s accepted, want canceled to use %s", CauseResponseUndeliverable, OutcomeCanceled, CauseCanceledAfterAuthorization)
+	if !recordedOutcomeCausePermitsIntent(CauseResponseUndeliverable, OutcomeCanceled) {
+		t.Fatalf("%s + %s rejected, want ADR recorded outcome preserved", CauseResponseUndeliverable, OutcomeCanceled)
 	}
 	if !recordedOutcomeCausePermitsIntent(CauseCanceledAfterAuthorization, OutcomeCanceled) {
 		t.Fatalf("%s + %s rejected, want canceled preserved under its authorization cause", CauseCanceledAfterAuthorization, OutcomeCanceled)
@@ -657,6 +741,17 @@ func TestRecordedOutcomeCauseCompatibilityMatchesADR(t *testing.T) {
 
 	record := reducerMustApply(t, reducerConsumedRecord(t), ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeCanceled})
 	certificate, err := DeriveTerminalCertificate(record, TerminalIntent{
+		Outcome: OutcomeCanceled,
+		Cause:   CauseResponseUndeliverable,
+	})
+	if err != nil {
+		t.Fatalf("DeriveTerminalCertificate response undeliverable canceled error = %v", err)
+	}
+	if certificate.Outcome != OutcomeCanceled || certificate.Cause != CauseResponseUndeliverable || certificate.Proof != ProofUnresolvedAbsence {
+		t.Fatalf("terminal = %#v, want canceled/response-undeliverable/unresolved", certificate)
+	}
+
+	certificate, err = DeriveTerminalCertificate(record, TerminalIntent{
 		Outcome: OutcomeCanceled,
 		Cause:   CauseCanceledAfterAuthorization,
 	})
@@ -1218,6 +1313,16 @@ func reducerCleanCompletedRecord(t *testing.T) SafetyRecord {
 	record := reducerCompletedOutcomeRecord(t)
 	record = reducerMustApply(t, record, reducerQuiescenceCommand(t, record, LaunchOrdinalOne))
 	return reducerMustApply(t, record, reducerResultCommand(t, record))
+}
+
+func reducerOrdinalOneReleasedOrdinalTwoReleaseOutcomeRecord(t *testing.T, outcome LaunchReleaseOutcome) SafetyRecord {
+	t.Helper()
+	record := reducerConsumedRecord(t)
+	record = reducerMustApply(t, record, reducerQuiescenceCommand(t, record, LaunchOrdinalOne))
+	record = reducerMustApply(t, record, BindGroup{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Group: reducerGroup(LaunchOrdinalTwo)})
+	record = reducerMustApply(t, record, CommitGrant{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Nonce: "nonce-2"})
+	record = reducerMustApply(t, record, RecordReleaseOutcome{Ref: reducerRef(), Ordinal: LaunchOrdinalTwo, Outcome: outcome})
+	return reducerMustApply(t, record, reducerQuiescenceCommandWithMethod(t, record, LaunchOrdinalTwo, QuiescenceAlreadyAbsent))
 }
 
 func reducerLegacyUnfencedCompletedRecord(t *testing.T) SafetyRecord {

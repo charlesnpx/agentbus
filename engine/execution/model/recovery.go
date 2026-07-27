@@ -328,7 +328,7 @@ func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger, absenc
 		intent.Cause = recordedOutcomeRecoveryCause(record.Outcome.Outcome, trigger, afterAuthorization)
 		return intent
 	}
-	if cause, ok := recordedReleaseFailureCause(record.Attempt); ok {
+	if cause, ok := recordedReleaseFailureCause(record); ok {
 		intent.Cause = cause
 		if cause == CauseReleaseOutcomeUnknown {
 			intent.Outcome = unrecordedAfterAuthorizationOutcome(absenceProven)
@@ -377,16 +377,18 @@ func unrecordedAfterAuthorizationOutcome(absenceProven bool) Outcome {
 	return OutcomeOrphaned
 }
 
-func recordedReleaseFailureCause(proof AttemptProof) (TerminalCause, bool) {
-	for _, ordinal := range proof.Launches.FilledOrdinals() {
-		launch, ok := proof.Launches.Get(ordinal)
-		if !ok || launch.ReleaseOutcome == nil {
-			continue
-		}
-		switch launch.ReleaseOutcome.Outcome {
-		case LaunchReleaseSentUnknown:
+func recordedReleaseFailureCause(record SafetyRecord) (TerminalCause, bool) {
+	launch, ok := authoritativeLaunch(record.Attempt)
+	if !ok || launch.ReleaseOutcome == nil {
+		return 0, false
+	}
+	switch launch.ReleaseOutcome.Outcome {
+	case LaunchReleaseSentUnknown:
+		if terminalCauseBackedByDurableFact(record, CauseReleaseOutcomeUnknown) {
 			return CauseReleaseOutcomeUnknown, true
-		case LaunchReleaseNotSent:
+		}
+	case LaunchReleaseNotSent:
+		if terminalCauseBackedByDurableFact(record, CauseReleaseDefinitelyNotSent) {
 			return CauseReleaseDefinitelyNotSent, true
 		}
 	}

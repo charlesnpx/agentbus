@@ -239,7 +239,7 @@ func recordedOutcomeCausePermitsIntent(cause TerminalCause, outcome Outcome) boo
 	case CauseCompletedNormally:
 		return cleanTerminalOutcome(outcome)
 	case CauseResponseUndeliverable:
-		return cleanTerminalOutcome(outcome)
+		return recordedExecutionOutcome(outcome)
 	case CauseCanceledAfterAuthorization:
 		return outcome == OutcomeCanceled
 	case CauseDaemonRestartedAfterAuthorization, CauseSupervisorLostAfterAuthorization, CauseReleaseOutcomeUnknown:
@@ -254,22 +254,61 @@ func recordedOutcomeCausePermitsIntent(cause TerminalCause, outcome Outcome) boo
 func terminalCauseBackedByDurableFact(record SafetyRecord, cause TerminalCause) bool {
 	switch cause {
 	case CauseReleaseDefinitelyNotSent:
-		return hasLaunchReleaseOutcome(record.Attempt, LaunchReleaseNotSent)
+		return authoritativeLaunchReleaseOutcome(record.Attempt, LaunchReleaseNotSent) &&
+			!hasAttemptExecutionEvidence(record)
 	case CauseReleaseOutcomeUnknown:
-		return hasLaunchReleaseOutcome(record.Attempt, LaunchReleaseSentUnknown)
+		return authoritativeLaunchReleaseOutcome(record.Attempt, LaunchReleaseSentUnknown) &&
+			!hasRecordedExecutionOutcome(record)
 	default:
 		return true
 	}
 }
 
-func hasLaunchReleaseOutcome(proof AttemptProof, outcome LaunchReleaseOutcome) bool {
-	for _, ordinal := range proof.Launches.FilledOrdinals() {
-		launch, ok := proof.Launches.Get(ordinal)
-		if ok && launch.ReleaseOutcome != nil && launch.ReleaseOutcome.Outcome == outcome {
+func authoritativeLaunchReleaseOutcome(proof AttemptProof, outcome LaunchReleaseOutcome) bool {
+	launch, ok := authoritativeLaunch(proof)
+	return ok && launch.ReleaseOutcome != nil && launch.ReleaseOutcome.Outcome == outcome
+}
+
+func authoritativeLaunch(proof AttemptProof) (*LaunchProof, bool) {
+	ordinals := proof.Launches.FilledOrdinals()
+	for i := len(ordinals) - 1; i >= 0; i-- {
+		if launch, ok := proof.Launches.Get(ordinals[i]); ok {
+			return launch, true
+		}
+	}
+	return nil, false
+}
+
+func hasAttemptExecutionEvidence(record SafetyRecord) bool {
+	if hasRecordedExecutionOutcome(record) {
+		return true
+	}
+	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launch, ok := record.Attempt.Launches.Get(ordinal)
+		if ok && launchHasReleaseSentEvidence(*launch) {
 			return true
 		}
 	}
 	return false
+}
+
+func hasRecordedExecutionOutcome(record SafetyRecord) bool {
+	return record.Outcome != nil && recordedExecutionOutcome(record.Outcome.Outcome)
+}
+
+func launchHasReleaseSentEvidence(launch LaunchProof) bool {
+	if launch.Released != nil {
+		return true
+	}
+	if launch.ReleaseOutcome == nil {
+		return false
+	}
+	switch launch.ReleaseOutcome.Outcome {
+	case LaunchReleaseSentUnknown, LaunchReleaseAcked:
+		return true
+	default:
+		return false
+	}
 }
 
 func recordedExecutionOutcome(outcome Outcome) bool {

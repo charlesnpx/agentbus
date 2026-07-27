@@ -25,6 +25,10 @@ func DeriveCleanupDisposition(record SafetyRecord) CleanupDisposition {
 	if record.Terminal == nil {
 		return ""
 	}
+	if record.Terminal.Cause == CauseReleaseDefinitelyNotSent &&
+		!terminalCauseBackedByDurableFact(record, record.Terminal.Cause) {
+		return CleanupDispositionUnresolved
+	}
 	if executionImpossibleCause(record.Terminal.Cause) {
 		return CleanupDispositionNoExecutionPossible
 	}
