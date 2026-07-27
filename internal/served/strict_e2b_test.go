@@ -357,7 +357,7 @@ func TestProductionStrictSIGINTIdleGracefulShutdownE2B(t *testing.T) {
 	}
 }
 
-func TestProductionStrictCLINoDaemonUnsupportedHostDarwinE2B(t *testing.T) {
+func TestProductionStrictCLINoDaemonAutostartsDarwinE2B(t *testing.T) {
 	if strings.TrimSpace(os.Getenv(strictE2ERunEnv)) != "1" {
 		t.Skipf("set %s=1 to run strict cli e2e", strictE2ERunEnv)
 	}
@@ -365,25 +365,22 @@ func TestProductionStrictCLINoDaemonUnsupportedHostDarwinE2B(t *testing.T) {
 		t.Skip("strict cli e2e is not run in short mode")
 	}
 	if runtime.GOOS != "darwin" {
-		t.Skip("unsupported-host no-daemon check is darwin-only")
+		t.Skip("darwin autostart check is macOS-only")
 	}
 	agentbusPath := builtServedNativeAgentbusPath(t)
 	root := shortTempDir(t)
 	env := upsertEnv(os.Environ(), "HOME="+shortTempDir(t))
-	for _, args := range [][]string{
-		{"status", "--job", "job_darwin_unsupported"},
-		{"result", "--job", "job_darwin_unsupported"},
-		{"cancel", "--job", "job_darwin_unsupported"},
-	} {
-		result := runProductionStrictJobCLI(t, agentbusPath, root, env, 11, args...)
-		if !strings.Contains(result.stderr, "daemon startup failed") {
-			t.Fatalf("agentbus %s stderr=%q, want daemon startup failure", strings.Join(args, " "), result.stderr)
-		}
-		if entries, err := os.ReadDir(root); err == nil && len(entries) != 0 {
-			t.Fatalf("state root entries after %s = %v, want empty", strings.Join(args, " "), entries)
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("state root read after %s: %v", strings.Join(args, " "), err)
-		}
+	result := runProductionStrictJobCLI(t, agentbusPath, root, env, 10, "status", "--job", "job_darwin_serves")
+	if strings.Contains(result.stderr, "daemon startup failed") {
+		t.Fatalf("agentbus status stderr=%q, did not expect daemon startup failure", result.stderr)
+	}
+	pid := readProductionStrictPIDFileE2B(t, root)
+	t.Cleanup(func() {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		assertProductionStrictPIDAbsentE2B(t, pid, 5*time.Second)
+	})
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("autostarted daemon pid %d not alive: %v", pid, err)
 	}
 }
 

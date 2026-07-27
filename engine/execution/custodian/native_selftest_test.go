@@ -10,11 +10,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
-	"time"
 
 	"github.com/charlesnpx/agentbus/internal/cgroup"
-	"github.com/charlesnpx/agentbus/internal/containment"
-	"github.com/charlesnpx/agentbus/internal/parklaunch"
 )
 
 func TestNativeSelfTestClassificationTable(t *testing.T) {
@@ -252,42 +249,36 @@ func TestNativeSelfTestExecSpecUsesCurrentExecutable(t *testing.T) {
 	}
 }
 
-func TestNewNativeRuntimeDarwinUnsupported(t *testing.T) {
+func TestNewNativeRuntimeDarwinQualifiesAfterSelfTest(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skip("Darwin strict-unavailable support is macOS-only")
+		t.Skip("Darwin strict runtime qualification is macOS-only")
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	exe, err = filepath.Abs(exe)
-	if err != nil {
-		t.Fatal(err)
-	}
+	exe := nativeTestBinaryPath(t)
 	runtimeBundle, err := NewNativeRuntime(NativeOptions{
-		AgentbusPath: exe,
-		MonitorCommand: parklaunch.CommandSpec{
-			Path: exe,
-		},
-		ContainmentParams: containment.Params{
-			GracePeriod:  20 * time.Millisecond,
-			PollInterval: 20 * time.Millisecond,
-			PollTimeout:  2 * time.Second,
-		},
-		WorkerDir: filepath.Dir(exe),
+		AgentbusPath:      builtNativeAgentbusPath(t),
+		MonitorCommand:    nativeMonitorCommand(t),
+		ContainmentParams: defaultNativeTestParams(),
+		WorkerEnv:         nativeAgentbusEnv(),
+		WorkerDir:         filepath.Dir(exe),
 	})
-	if err == nil {
-		t.Fatal("NewNativeRuntime() error = nil, want Darwin unsupported cause")
+	if err != nil {
+		t.Fatalf("NewNativeRuntime() error = %v", err)
 	}
+	defer func() {
+		if err := runtimeBundle.Close(); err != nil {
+			t.Fatalf("native runtime Close() error = %v", err)
+		}
+	}()
+
 	assessment := runtimeBundle.SupportAssessment()
-	if assessment.Class != SupportUnsupported || assessment.Cause == nil || assessment.Attempts != 0 || !assessment.CleanupSafe {
-		t.Fatalf("SupportAssessment() = %+v, want Darwin unsupported with no attempts and cleanup safe", assessment)
+	if assessment.Class != SupportUnsupported || !errors.Is(assessment.Cause, ErrNativeRuntimeSelfTestRequired) || assessment.Attempts != 0 || !assessment.CleanupSafe {
+		t.Fatalf("initial SupportAssessment() = %+v, want self-test-required with no attempts and cleanup safe", assessment)
 	}
-	support := runtimeBundle.Support()
-	if support.ParkedExec || support.VerifiedContainment || support.RuntimeProbePassed {
-		t.Fatalf("Darwin support = %+v, want strict unavailable capability flags", support)
+	if _, ok := runtimeBundle.Process().(*NativeCustodian); !ok {
+		t.Fatalf("Darwin Process() = %T, want *NativeCustodian", runtimeBundle.Process())
 	}
-	if _, ok := runtimeBundle.Process().(UnavailableCustodian); !ok {
-		t.Fatalf("Darwin Process() = %T, want UnavailableCustodian", runtimeBundle.Process())
+	support := runtimeBundle.SelfTest(context.Background())
+	if support.Assessment.Class != SupportAvailable || !support.RuntimeProbePassed || !support.ParkedExec || !support.VerifiedContainment || support.RuntimeProbeResult != nil {
+		t.Fatalf("Darwin support after SelfTest = %+v, want passed parked exec and verified containment probe", support)
 	}
 }

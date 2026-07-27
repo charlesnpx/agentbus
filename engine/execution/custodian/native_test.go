@@ -1046,7 +1046,7 @@ func TestUnavailableRuntimeSelfTestReturnsOriginalSupport(t *testing.T) {
 
 func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skip("C6 native runtime availability is Linux cgroup-v2 only")
+		t.Skip("real retained cgroup native runtime probe is Linux-only")
 	}
 	if runtime.GOOS == "linux" && os.Getenv(nativeCgroupConformanceEnv) != "1" {
 		t.Skip("set AGENTBUS_CGROUP_CONFORMANCE=1 to run the real Linux cgroup native runtime probe")

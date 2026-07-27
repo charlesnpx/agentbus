@@ -36,6 +36,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/internal/cgroup"
 	"github.com/charlesnpx/agentbus/internal/containment"
+	"github.com/charlesnpx/agentbus/internal/procgroup"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 	"golang.org/x/sys/unix"
 )
@@ -243,15 +244,24 @@ func TestServedStrictCompositionDefaultConstructionConformance(t *testing.T) {
 		t.Fatal("strict composition did not activate the admission root")
 	}
 
-	_, restrictedErr := StrictAdmissionConfig(Config{
+	restrictedCfg, restrictedErr := StrictAdmissionConfig(Config{
 		StateRoot:   shortTempDir(t),
 		CWD:         cwd,
 		Token:       "test-token",
 		Backends:    []engine.Backend{servedNativeCodexBackend(fixture)},
 		IdleTimeout: -1,
 	}, servedNativeStrictOptions(builtServedNativeAgentbusPath(t), fixture.env))
-	if !errors.Is(restrictedErr, cgroup.ErrRootLeaseUnavailable) {
-		t.Fatalf("restricted composition error = %v, want typed cgroup root lease contention", restrictedErr)
+	if goruntime.GOOS == "linux" {
+		if !errors.Is(restrictedErr, cgroup.ErrRootLeaseUnavailable) {
+			t.Fatalf("restricted composition error = %v, want typed cgroup root lease contention", restrictedErr)
+		}
+	} else {
+		if restrictedErr != nil {
+			t.Fatalf("second strict composition error = %v, want darwin process-group runtime construction to remain available", restrictedErr)
+		}
+		if err := restrictedCfg.Runtime.Close(); err != nil {
+			t.Fatalf("second strict composition runtime Close() error = %v", err)
+		}
 	}
 }
 
@@ -462,18 +472,23 @@ func TestServedStrictCompositionDaemonSIGKILLRestartRecoveryConformance(t *testi
 	recoveryConn, recoveryReader := servedNativeRPC(t, h)
 	defer recoveryConn.Close()
 	record := waitServedNativeAdmissionTerminal(t, recoveryServer, submittedJobID, 10*time.Second)
-	launchProof := assertServedNativeIdentifiedTerminal(t, record, model.OutcomeReaped)
-	if record.Terminal.Cause != model.CauseDaemonRestartedAfterAuthorization {
-		t.Fatalf("recovery terminal cause = %s, want daemon_restart_after_authorization", record.Terminal.Cause)
+	launchProof := assertServedNativeRestartRecoveryTerminal(t, record)
+	if launchProof.Group != nil {
+		assertServedNativeExecutionMetadata(t, firstExecution, *launchProof.Group, false)
+		if record.Terminal.Outcome == model.OutcomeReaped {
+			assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
+		}
 	}
-	assertServedNativeExecutionMetadata(t, firstExecution, *launchProof.Group, false)
-	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
 
 	resp := rpcRawParams(t, recoveryConn, recoveryReader, "replay", protocol.MethodJobSubmit, submitParams)
 	var replay protocol.JobSubmitResult
 	decodeResult(t, resp, &replay)
-	if replay.JobID != submittedJobID || !replay.Deduplicated || replay.State != engine.StateReaped {
-		t.Fatalf("replay after recovery = %+v, want reaped job %s", replay, submittedJobID)
+	wantReplayState := engine.StateReaped
+	if record.Terminal.Outcome == model.OutcomeOrphaned {
+		wantReplayState = engine.StateOrphaned
+	}
+	if replay.JobID != submittedJobID || !replay.Deduplicated || replay.State != wantReplayState {
+		t.Fatalf("replay after recovery = %+v, want %s job %s", replay, wantReplayState, submittedJobID)
 	}
 
 	newJob := submitServedNativeJobOnConn(t, recoveryConn, recoveryReader, "post-recovery", cwd, servedNativeFixtureModeClean, nil)
@@ -485,6 +500,9 @@ func TestServedStrictCompositionDaemonSIGKILLRestartRecoveryConformance(t *testi
 }
 
 func TestServedStrictCompositionActivatedRootSupportLossConformance(t *testing.T) {
+	if goruntime.GOOS != "linux" {
+		t.Skip("retained cgroup root lease support-loss is Linux-only")
+	}
 	requireServedNativeConformance(t)
 	root := shortTempDir(t)
 	cwd := shortTempDir(t)
@@ -564,21 +582,30 @@ func TestServedStrictCompositionRuntimeLeaseReuseConformance(t *testing.T) {
 		Backends:    []engine.Backend{servedNativeCodexBackend(fixture)},
 		IdleTimeout: -1,
 	}, servedNativeStrictOptions(builtServedNativeAgentbusPath(t), fixture.env))
-	if !errors.Is(concurrentErr, cgroup.ErrRootLeaseUnavailable) {
-		t.Fatalf("concurrent strict composition error = %v, want ErrRootLeaseUnavailable", concurrentErr)
-	}
-	concurrentServer, err := New(concurrentCfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = concurrentServer.Serve(context.Background())
-	var diagnostic AdmissionSupportDiagnostic
-	if !errors.As(err, &diagnostic) {
-		t.Fatalf("concurrent Serve error = %T %v, want AdmissionSupportDiagnostic", err, err)
+	if goruntime.GOOS == "linux" {
+		if !errors.Is(concurrentErr, cgroup.ErrRootLeaseUnavailable) {
+			t.Fatalf("concurrent strict composition error = %v, want ErrRootLeaseUnavailable", concurrentErr)
+		}
+		concurrentServer, err := New(concurrentCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = concurrentServer.Serve(context.Background())
+		var diagnostic AdmissionSupportDiagnostic
+		if !errors.As(err, &diagnostic) {
+			t.Fatalf("concurrent Serve error = %T %v, want AdmissionSupportDiagnostic", err, err)
+		}
+	} else {
+		if concurrentErr != nil {
+			t.Fatalf("concurrent strict composition error = %v, want darwin process-group runtime construction to remain available", concurrentErr)
+		}
+		if err := concurrentCfg.Runtime.Close(); err != nil {
+			t.Fatalf("concurrent runtime Close() error = %v", err)
+		}
 	}
 
 	stopServedNativeServer(t, h)
-	err = server.Serve(context.Background())
+	err := server.Serve(context.Background())
 	if !errors.Is(err, ErrRuntimeConsumed) {
 		t.Fatalf("same server second Serve error = %v, want ErrRuntimeConsumed", err)
 	}
@@ -635,8 +662,11 @@ func TestServedStrictCompositionRejectionsConformance(t *testing.T) {
 
 func requireServedNativeConformance(t *testing.T) {
 	t.Helper()
+	if goruntime.GOOS == "darwin" {
+		return
+	}
 	if goruntime.GOOS != "linux" {
-		t.Skip("served native strict conformance requires linux cgroup-v2")
+		t.Skip("served native strict conformance requires darwin process groups or linux cgroup-v2")
 	}
 	if os.Getenv(servedNativeCgroupConformanceEnv) != "1" {
 		t.Skip("set AGENTBUS_CGROUP_CONFORMANCE=1 to run served native cgroup-v2 conformance")
@@ -1436,6 +1466,42 @@ func assertServedNativeIdentifiedTerminal(t *testing.T, record model.SafetyRecor
 	return launchProof
 }
 
+func assertServedNativeRestartRecoveryTerminal(t *testing.T, record model.SafetyRecord) *model.LaunchProof {
+	t.Helper()
+	if record.Mode != model.ModeIdentifiedFenced {
+		t.Fatalf("admission mode = %s, want IdentifiedFenced", record.Mode)
+	}
+	if record.Terminal == nil {
+		t.Fatal("terminal is nil, want restart recovery terminal")
+	}
+	if record.Terminal.Cause != model.CauseDaemonRestartedAfterAuthorization {
+		t.Fatalf("recovery terminal cause = %s, want daemon_restart_after_authorization", record.Terminal.Cause)
+	}
+	switch record.Terminal.Outcome {
+	case model.OutcomeReaped:
+		if record.Terminal.Proof != model.ProofContained {
+			t.Fatalf("reaped recovery proof = %s, want contained", record.Terminal.Proof)
+		}
+		if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionVerifiedAbsent {
+			t.Fatalf("reaped recovery cleanup disposition = %s, want %s", got, model.CleanupDispositionVerifiedAbsent)
+		}
+	case model.OutcomeOrphaned:
+		if record.Terminal.Proof != model.ProofUnresolvedAbsence {
+			t.Fatalf("orphaned recovery proof = %s, want unresolved_absence", record.Terminal.Proof)
+		}
+		if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionUnresolved {
+			t.Fatalf("orphaned recovery cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
+		}
+	default:
+		t.Fatalf("recovery terminal outcome = %s, want reaped or orphaned", record.Terminal.Outcome)
+	}
+	launchProof, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || launchProof.Group == nil || launchProof.Grant == nil {
+		t.Fatalf("restart recovery launch proof incomplete: %+v", launchProof)
+	}
+	return launchProof
+}
+
 func assertServedNativeReleaseAckLossTerminal(t *testing.T, record model.SafetyRecord) *model.LaunchProof {
 	t.Helper()
 	if record.Mode != model.ModeIdentifiedFenced {
@@ -1551,6 +1617,17 @@ func servedNativeExactLeaderAbsent(group model.GroupRef) (bool, string, error) {
 	identity := group.Leader
 	if identity.PID <= 0 {
 		return true, "leader=invalid", nil
+	}
+	if goruntime.GOOS == "darwin" {
+		claim, err := procgroup.ReadProcessClaim(identity.PID)
+		if errors.Is(err, procgroup.ErrProcessMissing) {
+			return true, "leader=missing", nil
+		}
+		if err != nil {
+			return false, "", err
+		}
+		matches := claim.PID == identity.PID && claim.PGID == group.PGID && claim.StartToken.String() == identity.HighResStartToken
+		return !matches, fmt.Sprintf("leader_pid=%d pgid=%d starttoken=%s matches=%t", claim.PID, claim.PGID, claim.StartToken, matches), nil
 	}
 	snapshot, err := readServedNativeProcStat(identity.PID)
 	if errors.Is(err, os.ErrNotExist) {
@@ -1726,6 +1803,7 @@ func startServedNativeDaemonHelper(t *testing.T, root, cwd, agentbusPath string,
 	exe := servedNativeTestBinaryPath(t)
 	cmd := exec.Command(exe,
 		"-test.run=^TestServedNativeConformanceDaemonProcess$",
+		"-test.v",
 		"--",
 		"--root", root,
 		"--cwd", cwd,
@@ -1808,6 +1886,9 @@ func waitServedNativeHelperFiles(t *testing.T, paths []string, helper *servedNat
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-helper.done:
+			if servedNativeHelperBindDenied(helper.output.String()) {
+				t.Skipf("Unix socket bind denied by sandbox in daemon helper: %v", err)
+			}
 			t.Fatalf("daemon helper exited before markers were ready: %v\n%s\noutput:\n%s", err, helper.diagnostics(paths, err), helper.output.String())
 		default:
 		}
@@ -1824,6 +1905,10 @@ func waitServedNativeHelperFiles(t *testing.T, paths []string, helper *servedNat
 		time.Sleep(servedNativeConformancePollInterval)
 	}
 	t.Fatalf("daemon helper markers %v did not become ready after %s\n%s\noutput:\n%s", paths, servedNativeDaemonHelperReadyTimeout, helper.diagnostics(paths, nil), helper.output.String())
+}
+
+func servedNativeHelperBindDenied(output string) bool {
+	return strings.Contains(output, "bind: operation not permitted") || strings.Contains(output, "Unix socket bind denied by sandbox")
 }
 
 func (helper *servedNativeDaemonHelper) diagnostics(paths []string, waitErr error) string {
