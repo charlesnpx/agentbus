@@ -377,6 +377,121 @@ func TestRecoverRecordedCompletedTypedUnresolvedKeepsResult(t *testing.T) {
 	}
 }
 
+func TestCompleteContradictoryOpenOutcomeConflictIsNotReconciledByLaterTerminal(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "open-outcome-conflict")
+	accepted := h.submit(t, ctx, "open-outcome-conflict")
+	h.bindGrantRelease(t, ctx, accepted, model.LaunchOrdinalOne)
+	if _, err := h.authority.RecordOutcome(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.OutcomeFailed); err != nil {
+		t.Fatal(err)
+	}
+	auth := &terminalizingConflictAuthority{readyAuthority: h.authority}
+	coord, err := New(auth, h.containment, h.results, model.OwnerID("coordinator-open-outcome-conflict"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = coord.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil)
+	if err == nil {
+		t.Fatal("Complete returned nil for contradictory open outcome")
+	}
+	if !errors.Is(err, model.ErrConflictingDuplicate) {
+		t.Fatalf("Complete error = %v, want ErrConflictingDuplicate", err)
+	}
+	if errors.Is(err, ErrAlreadyFinalized) {
+		t.Fatalf("Complete error = %v, want unreconciled open-record conflict", err)
+	}
+	if !auth.finalizedAfterConflict {
+		t.Fatal("test authority did not finalize after the open-record conflict")
+	}
+	snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
+	if snapshot.Record.Terminal == nil || snapshot.Record.Terminal.Outcome != model.OutcomeFailed {
+		t.Fatalf("terminal = %+v, want later failed terminal snapshot", snapshot.Record.Terminal)
+	}
+}
+
+func TestCancelDuringPendingCompletedResultAwaitsSettlementWithoutFailStop(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "cancel-pending-completion")
+	accepted := h.submit(t, ctx, "cancel-pending-completion")
+	h.bindGrantRelease(t, ctx, accepted, model.LaunchOrdinalOne)
+	auth := &awaitingRecoveryAuthority{
+		readyAuthority: h.authority,
+		awaited:        make(chan struct{}, 1),
+	}
+	coord, err := New(auth, h.containment, h.results, model.OwnerID("coordinator-cancel-pending-completion"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcomeRecorded := make(chan struct{}, 1)
+	allowPublish := make(chan struct{})
+	h.results.beforePublish = func(ctx context.Context, _ model.JobID, _ []byte) error {
+		select {
+		case outcomeRecorded <- struct{}{}:
+		default:
+		}
+		select {
+		case <-allowPublish:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	completeDone := make(chan error, 1)
+	go func() {
+		completeDone <- coord.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("completed-result"), nil)
+	}()
+	publishReleased := false
+	defer func() {
+		if !publishReleased {
+			close(allowPublish)
+		}
+	}()
+
+	select {
+	case <-outcomeRecorded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("completion did not record outcome before publishing result")
+	}
+	mid := h.snapshot(t, ctx, accepted.Record.JobID)
+	if mid.Record.Outcome == nil || mid.Record.Outcome.Outcome != model.OutcomeCompleted || mid.Record.Result != nil || mid.Record.Terminal != nil {
+		t.Fatalf("mid-race record = %+v, want completed outcome without result or terminal", mid.Record)
+	}
+
+	cancelDone := make(chan error, 1)
+	go func() {
+		cancelDone <- coord.Cancel(ctx, accepted.Record.JobID, nil)
+	}()
+	select {
+	case <-auth.awaited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancel recovery did not await the pending completion result")
+	}
+	close(allowPublish)
+	publishReleased = true
+
+	completeErr := receiveCoordinatorErr(t, completeDone, "Complete")
+	if completeErr != nil && !errors.Is(completeErr, ErrAlreadyFinalized) {
+		t.Fatalf("Complete error = %v, want nil or ErrAlreadyFinalized contention", completeErr)
+	}
+	if cancelErr := receiveCoordinatorErr(t, cancelDone, "Cancel"); cancelErr != nil {
+		t.Fatalf("Cancel error = %v", cancelErr)
+	}
+	if h.authority.failStopped {
+		t.Fatalf("authority fail-stopped during pending completion recovery: %v", h.authority.failReason)
+	}
+	snapshot := h.snapshot(t, ctx, accepted.Record.JobID)
+	if err := model.ValidateSafetyRecord(snapshot.Record); err != nil {
+		t.Fatalf("settled safety record is invalid: %v", err)
+	}
+	if snapshot.Record.Terminal == nil ||
+		snapshot.Record.Terminal.Outcome != model.OutcomeCompleted ||
+		snapshot.Record.Terminal.Result == nil ||
+		snapshot.Record.Result == nil {
+		t.Fatalf("terminal = %+v result = %+v, want completed terminal with result", snapshot.Record.Terminal, snapshot.Record.Result)
+	}
+}
+
 func TestShutdownBlocksUntilOwnedWorkDrained(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, "shutdown")
@@ -582,6 +697,17 @@ func (h *harness) recordQuiescence(t *testing.T, ctx context.Context, jobID mode
 	}
 }
 
+func receiveCoordinatorErr(t *testing.T, done <-chan error, name string) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not finish", name)
+	}
+	return nil
+}
+
 func admissionRequest(t *testing.T, name string) authority.AcceptRequest {
 	t.Helper()
 	key, err := model.NewRequestKey("workspace-"+name, "request-"+name)
@@ -624,6 +750,47 @@ type readyAuthority struct {
 	failStopped bool
 	failReason  error
 	events      *coordinatorEventLog
+}
+
+type terminalizingConflictAuthority struct {
+	*readyAuthority
+	finalizedAfterConflict bool
+}
+
+func (a *terminalizingConflictAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) (StepResult, error) {
+	applied, err := a.readyAuthority.RecordOutcome(ctx, jobID, ref, outcome)
+	if err == nil || !errors.Is(err, model.ErrConflictingDuplicate) {
+		return applied, err
+	}
+	snapshot, snapshotErr := a.readyAuthority.Snapshot(ctx, jobID)
+	if snapshotErr != nil {
+		return applied, errors.Join(err, snapshotErr)
+	}
+	_, finalizeErr := a.readyAuthority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, model.TerminalIntent{
+		Outcome: model.OutcomeFailed,
+		Cause:   model.CauseCompletedNormally,
+	})
+	if finalizeErr != nil {
+		return applied, errors.Join(err, finalizeErr)
+	}
+	a.finalizedAfterConflict = true
+	return applied, err
+}
+
+type awaitingRecoveryAuthority struct {
+	*readyAuthority
+	awaited chan struct{}
+}
+
+func (a *awaitingRecoveryAuthority) RecoveryPlan(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger) (model.RecoveryPlan, error) {
+	plan, err := a.readyAuthority.RecoveryPlan(ctx, jobID, trigger)
+	if err == nil && plan.Next.Kind == model.RecoveryAwaitResultCertificate {
+		select {
+		case a.awaited <- struct{}{}:
+		default:
+		}
+	}
+	return plan, err
 }
 
 func (a *readyAuthority) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) (StepResult, error) {
@@ -803,14 +970,20 @@ func (c *testLaunchContainment) ContainAndVerify(ctx context.Context, launchCtx 
 }
 
 type testResults struct {
-	published int
-	verified  int
-	receipts  map[model.ResultRef]model.ResultReceipt
+	published     int
+	verified      int
+	receipts      map[model.ResultRef]model.ResultReceipt
+	beforePublish func(context.Context, model.JobID, []byte) error
 }
 
 func (r *testResults) Publish(ctx context.Context, jobID model.JobID, payload []byte) (model.ResultReceipt, error) {
 	if err := ctx.Err(); err != nil {
 		return model.ResultReceipt{}, err
+	}
+	if r.beforePublish != nil {
+		if err := r.beforePublish(ctx, jobID, payload); err != nil {
+			return model.ResultReceipt{}, err
+		}
 	}
 	r.published++
 	ref := model.ResultRef{

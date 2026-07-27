@@ -34,6 +34,7 @@ const (
 	RecoveryContainThenFinalize
 	RecoveryFinalizeCertified
 	RecoveryFatalUnprovable
+	RecoveryAwaitResultCertificate
 )
 
 type RecoveryAction struct {
@@ -257,6 +258,10 @@ func PlanRecovery(record SafetyRecord, trigger RecoveryTrigger) (RecoveryPlan, e
 		plan.Next = RecoveryAction{Kind: RecoveryFatalUnprovable}
 		return plan, nil
 	}
+	if pendingCompletionResult(record, trigger) {
+		plan.Next = RecoveryAction{Kind: RecoveryAwaitResultCertificate}
+		return plan, nil
+	}
 
 	absenceProven := allLaunchGroupsQuiescent(record.Attempt)
 	intent := recoveryTerminalIntent(record, trigger, absenceProven)
@@ -293,7 +298,7 @@ func PlanRecovery(record SafetyRecord, trigger RecoveryTrigger) (RecoveryPlan, e
 	}
 	// Fatal-unprovable remains for structurally invalid/corrupt safety records,
 	// legacy-unfenced open recovery, launch evidence with no durable group,
-	// missing physical quiescence proof, missing required result certificates,
+	// missing physical quiescence proof, non-pending missing result certificates,
 	// and contradictory recorded outcome/release/quiescence predicates.
 	plan.Next = RecoveryAction{Kind: RecoveryFatalUnprovable}
 	return plan, nil
@@ -302,6 +307,14 @@ func PlanRecovery(record SafetyRecord, trigger RecoveryTrigger) (RecoveryPlan, e
 func finalizable(record SafetyRecord, intent TerminalIntent) bool {
 	_, err := DeriveTerminalCertificate(record, intent)
 	return err == nil
+}
+
+func pendingCompletionResult(record SafetyRecord, trigger RecoveryTrigger) bool {
+	return trigger == RecoveryCancelAfterGrant &&
+		record.Cancel != nil &&
+		record.Outcome != nil &&
+		completionOutcome(record.Outcome.Outcome) &&
+		record.Result == nil
 }
 
 func needsContainment(record SafetyRecord, _ RecoveryTrigger) bool {

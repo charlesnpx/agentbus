@@ -279,6 +279,10 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 				}
 				return c.failStop(ctx, err)
 			}
+		case model.RecoveryAwaitResultCertificate:
+			if err := c.awaitResultCertificateProgress(ctx, jobID, plan.BasedOnRevision, trigger); err != nil {
+				return err
+			}
 		case model.RecoveryFatalUnprovable:
 			err := fmt.Errorf("%w: %s trigger %d", ErrFatalRecovery, jobID, trigger)
 			if cause != nil {
@@ -290,6 +294,32 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 		}
 	}
 	return c.failStop(ctx, fmt.Errorf("%w: recovery did not converge for %s", ErrFatalRecovery, jobID))
+}
+
+func (c *Coordinator) awaitResultCertificateProgress(ctx context.Context, jobID model.JobID, basedOn uint64, trigger model.RecoveryTrigger) error {
+	poll := c.shutdownPoll
+	if poll <= 0 {
+		poll = 10 * time.Millisecond
+	}
+	for {
+		snapshot, err := c.authority.Snapshot(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		if snapshot.Record.Terminal != nil ||
+			snapshot.Record.Result != nil ||
+			snapshot.Record.Revision != basedOn ||
+			!awaitingCompletionResult(snapshot.Record, trigger) {
+			return nil
+		}
+		timer := time.NewTimer(poll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, unresolved error) error {
@@ -315,27 +345,25 @@ func (c *Coordinator) alreadyFinalizedError(ctx context.Context, jobID model.Job
 	if err == nil {
 		return nil
 	}
-	if !alreadyFinalizedContentionCandidate(err) {
+	var absorbed model.TerminalAbsorbedError
+	if !errors.As(err, &absorbed) {
 		return err
 	}
-	if c == nil || c.authority == nil {
-		return err
+	if absorbed.Terminal.JobID != jobID {
+		return errors.Join(err, fmt.Errorf("absorbed terminal job mismatch: got %s want %s", absorbed.Terminal.JobID, jobID))
 	}
-	snapshot, snapshotErr := c.authority.Snapshot(ctx, jobID)
-	if snapshotErr != nil {
-		return errors.Join(err, snapshotErr)
-	}
-	if snapshot.Record.Terminal == nil {
-		return err
-	}
-	if validErr := model.ValidateSafetyRecord(snapshot.Record); validErr != nil {
-		return errors.Join(err, fmt.Errorf("existing terminal record is invalid: %w", validErr))
+	if validErr := absorbed.Terminal.Validate(); validErr != nil {
+		return errors.Join(err, fmt.Errorf("absorbing terminal certificate is invalid: %w", validErr))
 	}
 	return AlreadyFinalizedError{JobID: jobID, Cause: err}
 }
 
-func alreadyFinalizedContentionCandidate(err error) bool {
-	return errors.Is(err, model.ErrCommandPrecondition) || errors.Is(err, model.ErrConflictingDuplicate)
+func awaitingCompletionResult(record model.SafetyRecord, trigger model.RecoveryTrigger) bool {
+	return trigger == model.RecoveryCancelAfterGrant &&
+		record.Cancel != nil &&
+		record.Outcome != nil &&
+		completionOutcome(record.Outcome.Outcome) &&
+		record.Result == nil
 }
 
 func (c *Coordinator) contain(ctx context.Context, record model.SafetyRecord, injector *FailureInjector) error {
