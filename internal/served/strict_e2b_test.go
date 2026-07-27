@@ -687,41 +687,55 @@ func assertProductionStrictSIGTERMGracefulShutdownTerminalE2B(t *testing.T, reco
 	}
 	assertServedNativeExecutionMetadata(t, execution, *launchProof.Group, false)
 	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
-	switch record.Terminal.Outcome {
-	case model.OutcomeCanceled:
-		if report.WorkItems != 0 {
-			t.Fatalf("recover after contained graceful SIGTERM = %+v, want zero work items", report)
-		}
-		if record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
-			t.Fatalf("shutdown terminal cause = %s, want %s", record.Terminal.Cause, model.CauseCanceledAfterAuthorization)
-		}
+	if err := validateProductionStrictSIGTERMGracefulShutdownTerminalE2B(record, *launchProof, report); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func validateProductionStrictSIGTERMGracefulShutdownTerminalE2B(record model.SafetyRecord, launchProof model.LaunchProof, report AdmissionRecoveryReport) error {
+	if record.Terminal == nil {
+		return fmt.Errorf("shutdown terminal is nil")
+	}
+	if report.WorkItems != 0 || report.QuiescedLaunches != 0 || report.FinalizedJobs != 0 || report.OrphanedJobs != 0 || report.UnresolvedLaunches != 0 {
+		return fmt.Errorf("recover after graceful SIGTERM = %+v, want no post-shutdown recovery obligation", report)
+	}
+	if record.Terminal.Outcome != model.OutcomeCanceled {
+		return fmt.Errorf("shutdown terminal outcome = %s, want %s", record.Terminal.Outcome, model.OutcomeCanceled)
+	}
+	if record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+		return fmt.Errorf("shutdown terminal cause = %s, want %s", record.Terminal.Cause, model.CauseCanceledAfterAuthorization)
+	}
+	switch got := model.DeriveCleanupDisposition(record); got {
+	case model.CleanupDispositionVerifiedAbsent:
 		if launchProof.Quiescence == nil || launchProof.Quiescence.Method != model.QuiescenceTermKill {
-			t.Fatalf("shutdown quiescence = %+v, want term_kill", launchProof.Quiescence)
+			return fmt.Errorf("verified shutdown quiescence = %+v, want term_kill", launchProof.Quiescence)
 		}
-		if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionVerifiedAbsent {
-			t.Fatalf("contained shutdown cleanup disposition = %s, want %s", got, model.CleanupDispositionVerifiedAbsent)
-		}
-	case model.OutcomeOrphaned:
-		if runtime.GOOS != "darwin" {
-			t.Fatalf("shutdown terminal outcome = %s on %s, want canceled", record.Terminal.Outcome, runtime.GOOS)
-		}
-		if report.WorkItems == 0 {
-			t.Fatalf("recover after unresolved graceful SIGTERM = %+v, want shutdown recovery work", report)
-		}
-		if report.QuiescedLaunches != 0 {
-			t.Fatalf("recover after unresolved graceful SIGTERM = %+v, want no quiesced launch count", report)
-		}
+	case model.CleanupDispositionUnresolved:
 		if record.Terminal.Proof != model.ProofUnresolvedAbsence {
-			t.Fatalf("orphaned shutdown proof = %s, want %s", record.Terminal.Proof, model.ProofUnresolvedAbsence)
-		}
-		if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionUnresolved {
-			t.Fatalf("orphaned shutdown cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
-		}
-		if launchProof.Quiescence != nil {
-			t.Fatalf("orphaned shutdown recorded quiescence %+v, want unresolved absence without stronger cleanup proof", launchProof.Quiescence)
+			return fmt.Errorf("unresolved shutdown proof = %s, want %s", record.Terminal.Proof, model.ProofUnresolvedAbsence)
 		}
 	default:
-		t.Fatalf("shutdown terminal outcome = %s, want canceled or darwin orphaned", record.Terminal.Outcome)
+		return fmt.Errorf("shutdown cleanup disposition = %s, want %s or %s", got, model.CleanupDispositionVerifiedAbsent, model.CleanupDispositionUnresolved)
+	}
+	return nil
+}
+
+func TestProductionStrictSIGTERMGracefulShutdownValidationRejectsRecoveryOrphanedE2B(t *testing.T) {
+	record := model.SafetyRecord{
+		Terminal: &model.TerminalCertificate{
+			Outcome: model.OutcomeOrphaned,
+			Proof:   model.ProofUnresolvedAbsence,
+			Cause:   model.CauseSupervisorLostAfterAuthorization,
+		},
+	}
+	if err := validateProductionStrictSIGTERMGracefulShutdownTerminalE2B(record, model.LaunchProof{}, AdmissionRecoveryReport{
+		WorkItems:    1,
+		OrphanedJobs: 1,
+	}); err == nil || !strings.Contains(err.Error(), "no post-shutdown recovery obligation") {
+		t.Fatalf("validation error = %v, want recovery obligation rejection", err)
+	}
+	if err := validateProductionStrictSIGTERMGracefulShutdownTerminalE2B(record, model.LaunchProof{}, AdmissionRecoveryReport{}); err == nil || !strings.Contains(err.Error(), "want canceled") {
+		t.Fatalf("validation error = %v, want orphaned terminal rejection", err)
 	}
 }
 

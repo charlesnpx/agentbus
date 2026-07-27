@@ -105,8 +105,6 @@ func TestOnlyAllowedProductionFilesImportOSExec(t *testing.T) {
 		"internal/parklaunch/monitor.go": "retained monitor process launcher for native custody",
 		// Native cgroup helper launches the live self-test process and must verify cleanup.
 		"internal/cgroup/types.go": "native cgroup support self-test launcher and cleanup verifier",
-		// Native darwin containment self-test launches the live probe process and must verify cleanup.
-		"engine/execution/custodian/native_containment_darwin.go": "native darwin containment support self-test launcher and cleanup verifier",
 		// CLI daemonizer; not an adapter lifecycle/probe path.
 		"cmd/agentbus/main.go": "background daemon start helper",
 		// Client daemon autostart; not an adapter lifecycle/probe path.
