@@ -145,8 +145,11 @@ The two axes are governed independently:
 
 - **Cleanup axis (terminal basis).** The `ProofUnresolvedAbsence` terminal basis (terminal
   WITHOUT proven absence) is the cleanup-axis representation of "physical absence could not
-  be established". It MAY accompany ANY terminal outcome and is not restricted to orphan
-  causes. Proven quiescence is required to CLAIM `verified_absent` (basis
+  be established". It MAY accompany any terminal outcome whose absence can genuinely be
+  unprovable, and is not restricted to orphan causes. (It does NOT apply to `OutcomeReaped`,
+  which is verified-absent by definition, nor to the execution-impossible outcomes, whose
+  cleanup is fixed to `no_execution_possible` by the matrix.) Proven quiescence is required
+  to CLAIM `verified_absent` (basis
   `ProofCleanQuiescentOutcomeAndRetired` / `ProofContained`), NOT to terminalize at all. A
   job whose absence is unprovable terminalizes with `ProofUnresolvedAbsence` and cleanup
   `unresolved`, keeping whatever outcome axis applies.
