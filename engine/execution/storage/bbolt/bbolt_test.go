@@ -859,6 +859,63 @@ func TestStructuralGraphPreflightAllowsValidSeededDatabase(t *testing.T) {
 	}
 }
 
+func TestStructuralGraphPreflightAllowsValidDatabasesWithExplicitPageSizes(t *testing.T) {
+	for _, pageSize := range []int{4096, 16384} {
+		t.Run(fmt.Sprintf("%d", pageSize), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "admission.db")
+			repo, err := Create(path, &bolt.Options{Timeout: time.Second, PageSize: pageSize})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
+				for i := 0; i < 600; i++ {
+					fixture := seedFixture(t, i)
+					if err := tx.PutBinding(fixture.Binding); err != nil {
+						return err
+					}
+					if err := tx.PutSafety(fixture.Record, 0); err != nil {
+						return err
+					}
+					if err := tx.PutProjection(fixture.Projection); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				_ = repo.Close()
+				t.Fatal(err)
+			}
+			if err := repo.Close(); err != nil {
+				t.Fatalf("close page-size repository: %v", err)
+			}
+			file, meta := openBoltFileAndMetaForTest(t, path)
+			if err := file.Close(); err != nil {
+				t.Fatalf("close meta reader: %v", err)
+			}
+			if meta.pageSize != uint64(pageSize) {
+				t.Fatalf("meta page size = %d, want %d", meta.pageSize, pageSize)
+			}
+			before := readFileBytesForTest(t, path)
+
+			reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+			if err != nil {
+				t.Fatalf("OpenExisting %d-byte page database: %v", pageSize, err)
+			}
+			if err := reopened.AuditIntegrity(context.Background()); err != nil {
+				_ = reopened.Close()
+				t.Fatalf("AuditIntegrity %d-byte page database: %v", pageSize, err)
+			}
+			if err := reopened.Close(); err != nil {
+				t.Fatalf("close reopened %d-byte page database: %v", pageSize, err)
+			}
+			if after := readFileBytesForTest(t, path); !bytes.Equal(before, after) {
+				t.Fatalf("%d-byte page database open or audit mutated bytes", pageSize)
+			}
+		})
+	}
+}
+
 func TestNoFreelistSyncSentinelOpensCleanly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
 	repo, err := Create(path, &bolt.Options{Timeout: time.Second, NoFreelistSync: true})

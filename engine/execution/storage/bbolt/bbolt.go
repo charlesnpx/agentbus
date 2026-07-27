@@ -489,6 +489,8 @@ const (
 	boltMetaPayloadSize  = 64
 	boltMagic            = 0xED0CDAED
 	boltVersion          = 2
+	boltMinPageSize      = 512
+	boltMaxPageSize      = 128 * 1024
 	boltBranchPageFlag   = 0x01
 	boltLeafPageFlag     = 0x02
 	boltMetaPageFlag     = 0x04
@@ -735,38 +737,27 @@ func validateBoltFreelistIDs(meta boltPreflightMeta, info boltFreelistPageInfo, 
 }
 
 func readBoltPreflightMeta(file *os.File, size int64) (boltPreflightMeta, bool, error) {
-	var candidates []boltPreflightMeta
+	return readBoltPreflightMetaForTx(file, size, -1)
+}
+
+func readBoltPreflightMetaForTx(file *os.File, size int64, txID int) (boltPreflightMeta, bool, error) {
 	if meta, ok, err := readBoltPreflightMetaAt(file, 0, 0); err != nil {
 		return boltPreflightMeta{}, false, err
 	} else if ok {
-		candidates = append(candidates, meta)
 		if second, secondOK, secondErr := readBoltPreflightMetaAt(file, 1, meta.pageSize); secondErr != nil {
 			return boltPreflightMeta{}, false, secondErr
 		} else if secondOK {
-			candidates = append(candidates, second)
-		}
-	} else {
-		for pageSize := uint64(1024); pageSize <= uint64(1024<<14) && pageSize < uint64(size); pageSize <<= 1 {
-			meta, ok, err := readBoltPreflightMetaAt(file, 1, pageSize)
-			if err != nil {
-				return boltPreflightMeta{}, false, err
+			if second.pageSize != meta.pageSize {
+				return boltPreflightMeta{}, false, fmt.Errorf("%w: bbolt meta pages disagree on page size: page0=%d page1=%d", repository.ErrCorruptRecord, meta.pageSize, second.pageSize)
 			}
-			if ok {
-				candidates = append(candidates, meta)
-				break
-			}
+			return selectBoltPreflightMeta(meta, second, txID), true, nil
 		}
-	}
-	if len(candidates) == 0 {
+		if size >= 0 && uint64(size) < meta.pageSize+boltPageHeaderSize+boltMetaPayloadSize {
+			return boltPreflightMeta{}, false, fmt.Errorf("%w: bbolt meta page 1 at offset %d exceeds file size %d", repository.ErrCorruptRecord, meta.pageSize, size)
+		}
 		return boltPreflightMeta{}, false, nil
 	}
-	best := candidates[0]
-	for _, candidate := range candidates[1:] {
-		if candidate.txid > best.txid {
-			best = candidate
-		}
-	}
-	return best, true, nil
+	return boltPreflightMeta{}, false, nil
 }
 
 func readBoltPreflightMetaAt(file *os.File, pageID, offset uint64) (boltPreflightMeta, bool, error) {
@@ -830,7 +821,7 @@ func validBoltPageFlag(flag uint16) bool {
 }
 
 func plausibleBoltPageSize(size uint64) bool {
-	return size >= 1024 && size <= uint64(1024<<14) && size&(size-1) == 0
+	return size >= boltMinPageSize && size <= boltMaxPageSize && size&(size-1) == 0
 }
 
 func boltMetaChecksumMatches(meta []byte) bool {
@@ -873,22 +864,12 @@ func preflightBoltBTreeGraphTx(tx *bolt.Tx, expectedIdentity FileIdentity) (err 
 	if info == nil || info.Data == 0 {
 		return fmt.Errorf("%w: bbolt structural graph preflight has no mmap data: %s", repository.ErrCorruptRecord, path)
 	}
-	pageSize := uint64(info.PageSize)
-	if !plausibleBoltPageSize(pageSize) {
-		return fmt.Errorf("%w: bbolt structural graph preflight invalid page size %d: %s", repository.ErrCorruptRecord, pageSize, path)
-	}
-	size := tx.Size()
-	if size <= 0 {
-		return fmt.Errorf("%w: bbolt structural graph preflight invalid tx size %d: %s", repository.ErrCorruptRecord, size, path)
-	}
-	if uint64(size) > uint64(^uint(0)>>1) {
-		return fmt.Errorf("%w: bbolt structural graph preflight tx size %d exceeds addressable memory: %s", repository.ErrCorruptRecord, size, path)
-	}
-	if uint64(size)%pageSize != 0 {
-		return fmt.Errorf("%w: bbolt structural graph preflight tx size %d is not page aligned to %d: %s", repository.ErrCorruptRecord, size, pageSize, path)
+	meta, logicalSize, err := readBoltPreflightMetaForStructuralGraph(path, expectedIdentity, tx.ID())
+	if err != nil {
+		return err
 	}
 
-	data, err := mmapBoltPreflightData(path, size, expectedIdentity)
+	data, err := mmapBoltPreflightData(path, int64(logicalSize), expectedIdentity)
 	if err != nil {
 		return err
 	}
@@ -896,17 +877,15 @@ func preflightBoltBTreeGraphTx(tx *bolt.Tx, expectedIdentity FileIdentity) (err 
 		_ = syscall.Munmap(data)
 	}()
 
-	targetPgid := uint64(size) / pageSize
-	meta, ok, err := readBoltPreflightMetaFromData(data, pageSize, tx.ID(), targetPgid)
+	meta, ok, err := readBoltPreflightMetaFromData(data, tx.ID())
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return fmt.Errorf("%w: bbolt structural graph preflight could not read active meta: %s", repository.ErrCorruptRecord, path)
 	}
-	if meta.pageSize != pageSize {
-		return fmt.Errorf("%w: bbolt structural graph preflight meta page size %d differs from mmap page size %d: %s", repository.ErrCorruptRecord, meta.pageSize, pageSize, path)
-	}
+	pageSize := meta.pageSize
+	targetPgid := logicalSize / pageSize
 	if meta.pgid != targetPgid {
 		return fmt.Errorf("%w: bbolt structural graph preflight high water mark %d differs from tx pages %d: %s", repository.ErrCorruptRecord, meta.pgid, targetPgid, path)
 	}
@@ -925,6 +904,55 @@ func preflightBoltBTreeGraphTx(tx *bolt.Tx, expectedIdentity FileIdentity) (err 
 		return err
 	}
 	return walk.validateFreelist(meta)
+}
+
+func readBoltPreflightMetaForStructuralGraph(path string, expectedIdentity FileIdentity, txID int) (boltPreflightMeta, uint64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return boltPreflightMeta{}, 0, fmt.Errorf("%w: bbolt structural graph preflight open meta source for %s: %v", repository.ErrCorruptRecord, path, err)
+	}
+	defer file.Close()
+
+	if expectedIdentity != (FileIdentity{}) {
+		openedIdentity, err := fileIdentityFromFile(file)
+		if err != nil {
+			return boltPreflightMeta{}, 0, fmt.Errorf("%w: bbolt structural graph preflight stat meta source for %s: %v", repository.ErrCorruptRecord, path, err)
+		}
+		if openedIdentity != expectedIdentity {
+			return boltPreflightMeta{}, 0, FileIdentityMismatchError{Path: path, Expected: expectedIdentity, Opened: openedIdentity}
+		}
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		return boltPreflightMeta{}, 0, fmt.Errorf("%w: bbolt structural graph preflight stat meta source for %s: %v", repository.ErrCorruptRecord, path, err)
+	}
+	size := info.Size()
+	if size < 0 {
+		return boltPreflightMeta{}, 0, fmt.Errorf("%w: bbolt structural graph preflight file has invalid size %d: %s", repository.ErrCorruptRecord, size, path)
+	}
+	meta, ok, err := readBoltPreflightMetaForTx(file, size, txID)
+	if err != nil {
+		return boltPreflightMeta{}, 0, err
+	}
+	if !ok {
+		return boltPreflightMeta{}, 0, fmt.Errorf("%w: bbolt structural graph preflight meta pages are invalid: %s", repository.ErrCorruptRecord, path)
+	}
+	if meta.pgid < boltStructuralGraphPageFloor {
+		return boltPreflightMeta{}, 0, fmt.Errorf("%w: bbolt structural graph preflight high water mark %d is invalid: %s", repository.ErrCorruptRecord, meta.pgid, path)
+	}
+	fileSize := uint64(size)
+	if meta.pageSize == 0 || fileSize/meta.pageSize < meta.pgid {
+		return boltPreflightMeta{}, 0, fmt.Errorf("%w: bbolt structural graph preflight file is truncated: pages=%d page_size=%d size=%d: %s", repository.ErrCorruptRecord, meta.pgid, meta.pageSize, size, path)
+	}
+	if meta.pgid > ^uint64(0)/meta.pageSize {
+		return boltPreflightMeta{}, 0, fmt.Errorf("%w: bbolt structural graph preflight size overflows: pages=%d page_size=%d: %s", repository.ErrCorruptRecord, meta.pgid, meta.pageSize, path)
+	}
+	logicalSize := meta.pgid * meta.pageSize
+	if logicalSize > uint64(^uint(0)>>1) {
+		return boltPreflightMeta{}, 0, fmt.Errorf("%w: bbolt structural graph preflight logical size %d exceeds addressable memory: %s", repository.ErrCorruptRecord, logicalSize, path)
+	}
+	return meta, logicalSize, nil
 }
 
 func mmapBoltPreflightData(path string, size int64, expectedIdentity FileIdentity) ([]byte, error) {
@@ -951,43 +979,38 @@ func mmapBoltPreflightData(path string, size int64, expectedIdentity FileIdentit
 	return data, nil
 }
 
-func readBoltPreflightMetaFromData(data []byte, pageSize uint64, txID int, targetPgid uint64) (boltPreflightMeta, bool, error) {
-	var candidates []boltPreflightMeta
-	for _, pageID := range []uint64{0, 1} {
-		start, end, ok := checkedBoltDataRange(pageID, pageSize, 1, uint64(len(data)))
-		if !ok {
-			continue
-		}
-		meta, ok := decodeBoltPreflightMetaPage(data[start:end], pageID)
-		if ok {
-			candidates = append(candidates, meta)
-		}
-	}
-	if len(candidates) == 0 {
+func readBoltPreflightMetaFromData(data []byte, txID int) (boltPreflightMeta, bool, error) {
+	meta0, ok := decodeBoltPreflightMetaPage(data, 0)
+	if !ok {
 		return boltPreflightMeta{}, false, nil
 	}
+	start, end, ok := checkedBoltDataRange(1, meta0.pageSize, 1, uint64(len(data)))
+	if !ok {
+		return boltPreflightMeta{}, false, nil
+	}
+	meta1, ok := decodeBoltPreflightMetaPage(data[start:end], 1)
+	if !ok {
+		return boltPreflightMeta{}, false, nil
+	}
+	if meta1.pageSize != meta0.pageSize {
+		return boltPreflightMeta{}, false, fmt.Errorf("%w: bbolt meta pages disagree on page size: page0=%d page1=%d", repository.ErrCorruptRecord, meta0.pageSize, meta1.pageSize)
+	}
+	return selectBoltPreflightMeta(meta0, meta1, txID), true, nil
+}
+
+func selectBoltPreflightMeta(meta0, meta1 boltPreflightMeta, txID int) boltPreflightMeta {
 	if txID >= 0 {
-		for _, candidate := range candidates {
-			if candidate.txid == uint64(txID) && candidate.pgid == targetPgid {
-				return candidate, true, nil
-			}
+		if meta0.txid == uint64(txID) {
+			return meta0
+		}
+		if meta1.txid == uint64(txID) {
+			return meta1
 		}
 	}
-	best := candidates[0]
-	for _, candidate := range candidates[1:] {
-		if candidate.pgid == targetPgid && best.pgid != targetPgid {
-			best = candidate
-			continue
-		}
-		if candidate.pgid == best.pgid && candidate.txid > best.txid {
-			best = candidate
-			continue
-		}
-		if best.pgid != targetPgid && candidate.txid > best.txid {
-			best = candidate
-		}
+	if meta1.txid > meta0.txid {
+		return meta1
 	}
-	return best, true, nil
+	return meta0
 }
 
 func decodeBoltPreflightMetaPage(pageBytes []byte, pageID uint64) (boltPreflightMeta, bool) {
