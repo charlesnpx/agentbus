@@ -320,7 +320,7 @@ func (r *Repository) verifyExistingInitializedStructure() error {
 		return fmt.Errorf("%w: bbolt repository is not open", repository.ErrInvalidRecord)
 	}
 	return r.db.View(func(tx *bolt.Tx) error {
-		if err := checkStructuralIntegrityTx(tx); err != nil {
+		if err := checkStructuralIntegrityTx(tx, r.fileIdentity); err != nil {
 			return err
 		}
 		schemaVersion, err := authorityMetaSchemaVersionTx(tx, r.db.Path())
@@ -486,6 +486,13 @@ const (
 	boltLeafPageFlag     = 0x02
 	boltMetaPageFlag     = 0x04
 	boltFreelistPageFlag = 0x10
+
+	boltBranchPageElementSize    = 16
+	boltLeafPageElementSize      = 16
+	boltBucketHeaderSize         = 16
+	boltBucketLeafFlag           = 0x01
+	boltStructuralGraphMaxDepth  = 4096
+	boltStructuralGraphPageFloor = 2
 )
 
 type boltPreflightMeta struct {
@@ -499,6 +506,7 @@ type boltPreflightMeta struct {
 type boltPreflightPage struct {
 	id       uint64
 	flags    uint16
+	count    uint16
 	overflow uint32
 }
 
@@ -627,6 +635,7 @@ func decodeBoltPreflightPage(buf []byte) boltPreflightPage {
 	return boltPreflightPage{
 		id:       binary.LittleEndian.Uint64(buf[0:8]),
 		flags:    binary.LittleEndian.Uint16(buf[8:10]),
+		count:    binary.LittleEndian.Uint16(buf[10:12]),
 		overflow: binary.LittleEndian.Uint32(buf[12:16]),
 	}
 }
@@ -653,6 +662,409 @@ func boltMetaChecksumMatches(meta []byte) bool {
 	return hash.Sum64() == binary.LittleEndian.Uint64(meta[56:64])
 }
 
+type boltStructuralGraphPreflight struct {
+	path           string
+	data           []byte
+	pageSize       uint64
+	hwm            uint64
+	visited        map[uint64]string
+	pageReferences uint64
+}
+
+func preflightBoltBTreeGraphTx(tx *bolt.Tx, expectedIdentity FileIdentity) (err error) {
+	if tx == nil || tx.DB() == nil {
+		return nil
+	}
+	path := tx.DB().Path()
+	previous := debug.SetPanicOnFault(true)
+	defer debug.SetPanicOnFault(previous)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if boltPanicIsCorruption(recovered) {
+				err = fmt.Errorf("%w: bbolt structural graph preflight fault for %s: %v", repository.ErrCorruptRecord, path, recovered)
+				return
+			}
+			panic(recovered)
+		}
+	}()
+
+	info := tx.DB().Info()
+	if info == nil || info.Data == 0 {
+		return fmt.Errorf("%w: bbolt structural graph preflight has no mmap data: %s", repository.ErrCorruptRecord, path)
+	}
+	pageSize := uint64(info.PageSize)
+	if !plausibleBoltPageSize(pageSize) {
+		return fmt.Errorf("%w: bbolt structural graph preflight invalid page size %d: %s", repository.ErrCorruptRecord, pageSize, path)
+	}
+	size := tx.Size()
+	if size <= 0 {
+		return fmt.Errorf("%w: bbolt structural graph preflight invalid tx size %d: %s", repository.ErrCorruptRecord, size, path)
+	}
+	if uint64(size) > uint64(^uint(0)>>1) {
+		return fmt.Errorf("%w: bbolt structural graph preflight tx size %d exceeds addressable memory: %s", repository.ErrCorruptRecord, size, path)
+	}
+	if uint64(size)%pageSize != 0 {
+		return fmt.Errorf("%w: bbolt structural graph preflight tx size %d is not page aligned to %d: %s", repository.ErrCorruptRecord, size, pageSize, path)
+	}
+
+	data, err := mmapBoltPreflightData(path, size, expectedIdentity)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = syscall.Munmap(data)
+	}()
+
+	targetPgid := uint64(size) / pageSize
+	meta, ok, err := readBoltPreflightMetaFromData(data, pageSize, tx.ID(), targetPgid)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%w: bbolt structural graph preflight could not read active meta: %s", repository.ErrCorruptRecord, path)
+	}
+	if meta.pageSize != pageSize {
+		return fmt.Errorf("%w: bbolt structural graph preflight meta page size %d differs from mmap page size %d: %s", repository.ErrCorruptRecord, meta.pageSize, pageSize, path)
+	}
+	if meta.pgid != targetPgid {
+		return fmt.Errorf("%w: bbolt structural graph preflight high water mark %d differs from tx pages %d: %s", repository.ErrCorruptRecord, meta.pgid, targetPgid, path)
+	}
+	if meta.pgid < boltStructuralGraphPageFloor {
+		return fmt.Errorf("%w: bbolt structural graph preflight high water mark %d is invalid: %s", repository.ErrCorruptRecord, meta.pgid, path)
+	}
+
+	walk := boltStructuralGraphPreflight{
+		path:     path,
+		data:     data,
+		pageSize: pageSize,
+		hwm:      meta.pgid,
+		visited:  make(map[uint64]string),
+	}
+	return walk.traversePage(meta.root, nil)
+}
+
+func mmapBoltPreflightData(path string, size int64, expectedIdentity FileIdentity) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: bbolt structural graph preflight open mmap source for %s: %v", repository.ErrCorruptRecord, path, err)
+	}
+	defer file.Close()
+
+	if expectedIdentity != (FileIdentity{}) {
+		openedIdentity, err := fileIdentityFromFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("%w: bbolt structural graph preflight stat mmap source for %s: %v", repository.ErrCorruptRecord, path, err)
+		}
+		if openedIdentity != expectedIdentity {
+			return nil, FileIdentityMismatchError{Path: path, Expected: expectedIdentity, Opened: openedIdentity}
+		}
+	}
+
+	data, err := syscall.Mmap(int(file.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, fmt.Errorf("%w: bbolt structural graph preflight mmap %d bytes for %s: %v", repository.ErrCorruptRecord, size, path, err)
+	}
+	return data, nil
+}
+
+func readBoltPreflightMetaFromData(data []byte, pageSize uint64, txID int, targetPgid uint64) (boltPreflightMeta, bool, error) {
+	var candidates []boltPreflightMeta
+	for _, pageID := range []uint64{0, 1} {
+		start, end, ok := checkedBoltDataRange(pageID, pageSize, 1, uint64(len(data)))
+		if !ok {
+			continue
+		}
+		meta, ok := decodeBoltPreflightMetaPage(data[start:end], pageID)
+		if ok {
+			candidates = append(candidates, meta)
+		}
+	}
+	if len(candidates) == 0 {
+		return boltPreflightMeta{}, false, nil
+	}
+	if txID >= 0 {
+		for _, candidate := range candidates {
+			if candidate.txid == uint64(txID) && candidate.pgid == targetPgid {
+				return candidate, true, nil
+			}
+		}
+	}
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if candidate.pgid == targetPgid && best.pgid != targetPgid {
+			best = candidate
+			continue
+		}
+		if candidate.pgid == best.pgid && candidate.txid > best.txid {
+			best = candidate
+			continue
+		}
+		if best.pgid != targetPgid && candidate.txid > best.txid {
+			best = candidate
+		}
+	}
+	return best, true, nil
+}
+
+func decodeBoltPreflightMetaPage(pageBytes []byte, pageID uint64) (boltPreflightMeta, bool) {
+	if len(pageBytes) < boltPageHeaderSize+boltMetaPayloadSize {
+		return boltPreflightMeta{}, false
+	}
+	page := decodeBoltPreflightPage(pageBytes[:boltPageHeaderSize])
+	if page.id != pageID || page.flags != boltMetaPageFlag {
+		return boltPreflightMeta{}, false
+	}
+	meta := pageBytes[boltPageHeaderSize : boltPageHeaderSize+boltMetaPayloadSize]
+	if binary.LittleEndian.Uint32(meta[0:4]) != boltMagic || binary.LittleEndian.Uint32(meta[4:8]) != boltVersion {
+		return boltPreflightMeta{}, false
+	}
+	pageSize := uint64(binary.LittleEndian.Uint32(meta[8:12]))
+	if !plausibleBoltPageSize(pageSize) {
+		return boltPreflightMeta{}, false
+	}
+	if !boltMetaChecksumMatches(meta) {
+		return boltPreflightMeta{}, false
+	}
+	return boltPreflightMeta{
+		pageSize: pageSize,
+		root:     binary.LittleEndian.Uint64(meta[16:24]),
+		freelist: binary.LittleEndian.Uint64(meta[32:40]),
+		pgid:     binary.LittleEndian.Uint64(meta[40:48]),
+		txid:     binary.LittleEndian.Uint64(meta[48:56]),
+	}, true
+}
+
+func (walk *boltStructuralGraphPreflight) traversePage(pgid uint64, stack []uint64) error {
+	if pgid < boltStructuralGraphPageFloor || pgid >= walk.hwm {
+		return fmt.Errorf("%w: bbolt structural graph preflight page %d is out of range [2,%d): %s", repository.ErrCorruptRecord, pgid, walk.hwm, walk.path)
+	}
+	if len(stack) >= boltStructuralGraphMaxDepth {
+		return fmt.Errorf("%w: bbolt structural graph preflight exceeded depth bound %d at page %d: %s", repository.ErrCorruptRecord, boltStructuralGraphMaxDepth, pgid, walk.path)
+	}
+	for _, ancestor := range stack {
+		if ancestor == pgid {
+			return fmt.Errorf("%w: bbolt structural graph preflight cycle revisits page %d along stack %v: %s", repository.ErrCorruptRecord, pgid, append(stack, pgid), walk.path)
+		}
+	}
+	if owner, ok := walk.visited[pgid]; ok {
+		return fmt.Errorf("%w: bbolt structural graph preflight duplicate page reference %d previously claimed by %s: %s", repository.ErrCorruptRecord, pgid, owner, walk.path)
+	}
+	if walk.pageReferences >= walk.hwm {
+		return fmt.Errorf("%w: bbolt structural graph preflight exceeded page-reference bound %d at page %d: %s", repository.ErrCorruptRecord, walk.hwm, pgid, walk.path)
+	}
+	walk.pageReferences++
+
+	page, pageBytes, err := walk.readTreePage(pgid)
+	if err != nil {
+		return err
+	}
+	if err := walk.claimPageSpan(page); err != nil {
+		return err
+	}
+
+	stack = append(stack, pgid)
+	switch page.flags {
+	case boltBranchPageFlag:
+		return walk.scanBranchPage(page, pageBytes, stack)
+	case boltLeafPageFlag:
+		return walk.scanLeafPage(page, pageBytes, stack)
+	default:
+		return fmt.Errorf("%w: bbolt structural graph preflight page %d has invalid tree flags 0x%x: %s", repository.ErrCorruptRecord, pgid, page.flags, walk.path)
+	}
+}
+
+func (walk *boltStructuralGraphPreflight) readTreePage(pgid uint64) (boltPreflightPage, []byte, error) {
+	start, headerEnd, ok := checkedBoltDataRange(pgid, walk.pageSize, 1, uint64(len(walk.data)))
+	if !ok || headerEnd-start < boltPageHeaderSize {
+		return boltPreflightPage{}, nil, fmt.Errorf("%w: bbolt structural graph preflight page %d header is out of range: %s", repository.ErrCorruptRecord, pgid, walk.path)
+	}
+	page := decodeBoltPreflightPage(walk.data[start : start+boltPageHeaderSize])
+	if page.id != pgid {
+		return boltPreflightPage{}, nil, fmt.Errorf("%w: bbolt structural graph preflight page %d self-identifies as %d: %s", repository.ErrCorruptRecord, pgid, page.id, walk.path)
+	}
+	if page.flags != boltBranchPageFlag && page.flags != boltLeafPageFlag {
+		return boltPreflightPage{}, nil, fmt.Errorf("%w: bbolt structural graph preflight page %d has invalid tree flags 0x%x: %s", repository.ErrCorruptRecord, pgid, page.flags, walk.path)
+	}
+	span := uint64(page.overflow) + 1
+	if span == 0 || pgid > walk.hwm-span {
+		return boltPreflightPage{}, nil, fmt.Errorf("%w: bbolt structural graph preflight page %d overflow %d exceeds high water mark %d: %s", repository.ErrCorruptRecord, pgid, page.overflow, walk.hwm, walk.path)
+	}
+	start, end, ok := checkedBoltDataRange(pgid, walk.pageSize, span, uint64(len(walk.data)))
+	if !ok {
+		return boltPreflightPage{}, nil, fmt.Errorf("%w: bbolt structural graph preflight page %d overflow %d is outside mapped data: %s", repository.ErrCorruptRecord, pgid, page.overflow, walk.path)
+	}
+	return page, walk.data[start:end], nil
+}
+
+func (walk *boltStructuralGraphPreflight) claimPageSpan(page boltPreflightPage) error {
+	span := uint64(page.overflow) + 1
+	if span == 0 || page.id > walk.hwm-span {
+		return fmt.Errorf("%w: bbolt structural graph preflight page %d overflow %d exceeds high water mark %d: %s", repository.ErrCorruptRecord, page.id, page.overflow, walk.hwm, walk.path)
+	}
+	for i := uint64(0); i < span; i++ {
+		id := page.id + i
+		if owner, ok := walk.visited[id]; ok {
+			return fmt.Errorf("%w: bbolt structural graph preflight duplicate page reference %d previously claimed by %s: %s", repository.ErrCorruptRecord, id, owner, walk.path)
+		}
+		walk.visited[id] = fmt.Sprintf("page %d", page.id)
+	}
+	return nil
+}
+
+func (walk *boltStructuralGraphPreflight) scanBranchPage(page boltPreflightPage, pageBytes []byte, stack []uint64) error {
+	if err := validateBoltPageElementTable(page, pageBytes, boltBranchPageElementSize, "branch", walk.path); err != nil {
+		return err
+	}
+	var previousKey []byte
+	for i := 0; i < int(page.count); i++ {
+		elem := pageBytes[boltPageHeaderSize+i*boltBranchPageElementSize : boltPageHeaderSize+(i+1)*boltBranchPageElementSize]
+		pos := binary.LittleEndian.Uint32(elem[0:4])
+		ksize := binary.LittleEndian.Uint32(elem[4:8])
+		child := binary.LittleEndian.Uint64(elem[8:16])
+		keyStart, keyEnd, err := boltElementPayloadBounds(pageBytes, i, boltBranchPageElementSize, pos, ksize, 0)
+		if err != nil {
+			return fmt.Errorf("%w: bbolt structural graph preflight branch page %d element %d key bounds: %v: %s", repository.ErrCorruptRecord, page.id, i, err, walk.path)
+		}
+		key := pageBytes[keyStart:keyEnd]
+		if previousKey != nil && bytes.Compare(previousKey, key) >= 0 {
+			return fmt.Errorf("%w: bbolt structural graph preflight branch page %d key %d is not strictly ordered: %s", repository.ErrCorruptRecord, page.id, i, walk.path)
+		}
+		previousKey = key
+		if err := walk.traversePage(child, stack); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (walk *boltStructuralGraphPreflight) scanLeafPage(page boltPreflightPage, pageBytes []byte, stack []uint64) error {
+	return walk.scanLeafElements(page, pageBytes, stack, fmt.Sprintf("leaf page %d", page.id))
+}
+
+func (walk *boltStructuralGraphPreflight) scanInlineBucketPage(pageBytes []byte, stack []uint64, owner string) error {
+	if len(pageBytes) < boltPageHeaderSize {
+		return fmt.Errorf("%w: bbolt structural graph preflight inline bucket %s is shorter than a page header: %s", repository.ErrCorruptRecord, owner, walk.path)
+	}
+	page := decodeBoltPreflightPage(pageBytes[:boltPageHeaderSize])
+	if page.flags != boltLeafPageFlag {
+		return fmt.Errorf("%w: bbolt structural graph preflight inline bucket %s has page flags 0x%x, want leaf: %s", repository.ErrCorruptRecord, owner, page.flags, walk.path)
+	}
+	if page.overflow != 0 {
+		return fmt.Errorf("%w: bbolt structural graph preflight inline bucket %s has overflow %d: %s", repository.ErrCorruptRecord, owner, page.overflow, walk.path)
+	}
+	return walk.scanLeafElements(page, pageBytes, stack, "inline bucket "+owner)
+}
+
+func (walk *boltStructuralGraphPreflight) scanLeafElements(page boltPreflightPage, pageBytes []byte, stack []uint64, label string) error {
+	if err := validateBoltPageElementTable(page, pageBytes, boltLeafPageElementSize, label, walk.path); err != nil {
+		return err
+	}
+	var previousKey []byte
+	for i := 0; i < int(page.count); i++ {
+		elem := pageBytes[boltPageHeaderSize+i*boltLeafPageElementSize : boltPageHeaderSize+(i+1)*boltLeafPageElementSize]
+		flags := binary.LittleEndian.Uint32(elem[0:4])
+		pos := binary.LittleEndian.Uint32(elem[4:8])
+		ksize := binary.LittleEndian.Uint32(elem[8:12])
+		vsize := binary.LittleEndian.Uint32(elem[12:16])
+		keyStart, keyEnd, err := boltElementPayloadBounds(pageBytes, i, boltLeafPageElementSize, pos, ksize, vsize)
+		if err != nil {
+			return fmt.Errorf("%w: bbolt structural graph preflight %s element %d payload bounds: %v: %s", repository.ErrCorruptRecord, label, i, err, walk.path)
+		}
+		key := pageBytes[keyStart:keyEnd]
+		if previousKey != nil && bytes.Compare(previousKey, key) >= 0 {
+			return fmt.Errorf("%w: bbolt structural graph preflight %s key %d is not strictly ordered: %s", repository.ErrCorruptRecord, label, i, walk.path)
+		}
+		previousKey = key
+		if flags&boltBucketLeafFlag == 0 {
+			continue
+		}
+		value := pageBytes[keyEnd : keyEnd+int(vsize)]
+		if len(value) < boltBucketHeaderSize {
+			return fmt.Errorf("%w: bbolt structural graph preflight %s bucket element %d value is shorter than bucket header: %s", repository.ErrCorruptRecord, label, i, walk.path)
+		}
+		root := binary.LittleEndian.Uint64(value[0:8])
+		if root == 0 {
+			if len(value) == boltBucketHeaderSize {
+				return fmt.Errorf("%w: bbolt structural graph preflight %s bucket element %d has no inline page: %s", repository.ErrCorruptRecord, label, i, walk.path)
+			}
+			if err := walk.scanInlineBucketPage(value[boltBucketHeaderSize:], stack, fmt.Sprintf("%s element %d", label, i)); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := walk.traversePage(root, stack); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateBoltPageElementTable(page boltPreflightPage, pageBytes []byte, elemSize int, label, path string) error {
+	tableSize := uint64(page.count) * uint64(elemSize)
+	if tableSize > uint64(^uint(0)>>1) {
+		return fmt.Errorf("%w: bbolt structural graph preflight %s page %d element table is too large: %s", repository.ErrCorruptRecord, label, page.id, path)
+	}
+	need := uint64(boltPageHeaderSize) + tableSize
+	if need < uint64(boltPageHeaderSize) || need > uint64(len(pageBytes)) {
+		return fmt.Errorf("%w: bbolt structural graph preflight %s page %d element table exceeds page bounds: %s", repository.ErrCorruptRecord, label, page.id, path)
+	}
+	return nil
+}
+
+func boltElementPayloadBounds(pageBytes []byte, index int, elemSize int, pos, ksize, vsize uint32) (int, int, error) {
+	elemStart := uint64(boltPageHeaderSize + index*elemSize)
+	payloadStart := elemStart + uint64(pos)
+	payloadSize := uint64(ksize) + uint64(vsize)
+	payloadEnd := payloadStart + payloadSize
+	if payloadStart < elemStart || payloadEnd < payloadStart || payloadEnd > uint64(len(pageBytes)) {
+		return 0, 0, fmt.Errorf("payload range [%d,%d) exceeds page size %d", payloadStart, payloadEnd, len(pageBytes))
+	}
+	keyEnd := payloadStart + uint64(ksize)
+	if keyEnd < payloadStart || keyEnd > payloadEnd {
+		return 0, 0, fmt.Errorf("key range [%d,%d) exceeds payload end %d", payloadStart, keyEnd, payloadEnd)
+	}
+	if payloadStart > uint64(^uint(0)>>1) || keyEnd > uint64(^uint(0)>>1) {
+		return 0, 0, fmt.Errorf("payload range [%d,%d) exceeds addressable memory", payloadStart, keyEnd)
+	}
+	return int(payloadStart), int(keyEnd), nil
+}
+
+func checkedBoltDataRange(pgid, pageSize, span, dataLen uint64) (int, int, bool) {
+	if pageSize == 0 || span == 0 {
+		return 0, 0, false
+	}
+	if pgid > ^uint64(0)/pageSize || span > ^uint64(0)/pageSize {
+		return 0, 0, false
+	}
+	start := pgid * pageSize
+	size := span * pageSize
+	if start > ^uint64(0)-size {
+		return 0, 0, false
+	}
+	end := start + size
+	if start > dataLen || end > dataLen {
+		return 0, 0, false
+	}
+	if start > uint64(^uint(0)>>1) || end > uint64(^uint(0)>>1) {
+		return 0, 0, false
+	}
+	return int(start), int(end), true
+}
+
+func boltPanicIsCorruption(recovered any) bool {
+	if recovered == nil {
+		return false
+	}
+	if recoveredType := reflect.TypeOf(recovered); recoveredType != nil && recoveredType.PkgPath() == "runtime" && recoveredType.Name() == "errorAddressString" {
+		return true
+	}
+	message := fmt.Sprint(recovered)
+	return strings.Contains(message, "unexpected fault address") ||
+		strings.Contains(message, "assertion failed: Page expected to be") ||
+		strings.Contains(message, "assertion failed: page ") ||
+		strings.Contains(message, "bolt.DB.meta(): invalid meta pages")
+}
+
 func openBoltSafely(path string, mode os.FileMode, options *bolt.Options) (db *bolt.DB, err error) {
 	previous := debug.SetPanicOnFault(true)
 	defer debug.SetPanicOnFault(previous)
@@ -662,7 +1074,11 @@ func openBoltSafely(path string, mode os.FileMode, options *bolt.Options) (db *b
 				_ = db.Close()
 				db = nil
 			}
-			err = fmt.Errorf("%w: bbolt open fault for %s: %v", repository.ErrCorruptRecord, path, recovered)
+			if boltPanicIsCorruption(recovered) {
+				err = fmt.Errorf("%w: bbolt open fault for %s: %v", repository.ErrCorruptRecord, path, recovered)
+				return
+			}
+			panic(recovered)
 		}
 	}()
 	return bolt.Open(path, mode, options)
@@ -897,14 +1313,14 @@ func (r *Repository) AuditIntegrity(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		return auditIntegrityTx(tx)
+		return auditIntegrityTx(tx, r.fileIdentity)
 	})
 }
 
-func auditIntegrityTx(tx *bolt.Tx) error {
+func auditIntegrityTx(tx *bolt.Tx, expectedIdentity FileIdentity) error {
 	read := readTx{tx: tx}
 	var findings []error
-	if err := checkStructuralIntegrityTx(tx); err != nil {
+	if err := checkStructuralIntegrityTx(tx, expectedIdentity); err != nil {
 		findings = append(findings, repository.NewIntegrityFinding("structure", "", err))
 		return repository.NewIntegrityError(findings)
 	}
@@ -989,7 +1405,7 @@ func auditJobProjectionRepairableFinding(image repository.JobImage, err error) b
 	}
 }
 
-func checkStructuralIntegrityTx(tx *bolt.Tx) (err error) {
+func checkStructuralIntegrityTx(tx *bolt.Tx, expectedIdentity FileIdentity) (err error) {
 	if tx == nil {
 		return nil
 	}
@@ -999,9 +1415,16 @@ func checkStructuralIntegrityTx(tx *bolt.Tx) (err error) {
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("%w: bbolt structural integrity check panic for %s: %v", repository.ErrCorruptRecord, path, recovered)
+			if boltPanicIsCorruption(recovered) {
+				err = fmt.Errorf("%w: bbolt structural integrity check panic for %s: %v", repository.ErrCorruptRecord, path, recovered)
+				return
+			}
+			panic(recovered)
 		}
 	}()
+	if err := preflightBoltBTreeGraphTx(tx, expectedIdentity); err != nil {
+		return err
+	}
 	var findings []error
 	for checkErr := range tx.Check() {
 		if checkErr != nil {
