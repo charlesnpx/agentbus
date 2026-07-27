@@ -518,6 +518,12 @@ type boltPreflightPage struct {
 	overflow uint32
 }
 
+type boltFreelistPageInfo struct {
+	span      uint64
+	count     uint64
+	idsOffset uint64
+}
+
 func preflightBoltPageHeaders(path string) error {
 	file, err := os.Open(path)
 	if err != nil {
@@ -600,8 +606,11 @@ func preflightBoltFreelist(path string) (err error) {
 }
 
 func validateBoltFreelistPage(file *os.File, meta boltPreflightMeta, fileSize uint64, path string) error {
-	if meta.freelist == boltNoFreelistID || meta.freelist < boltStructuralGraphPageFloor || meta.freelist >= meta.pgid {
-		return fmt.Errorf("%w: bbolt freelist page %d is out of range [2,%d): %s", repository.ErrCorruptRecord, meta.freelist, meta.pgid, path)
+	if meta.freelist == boltNoFreelistID {
+		return nil
+	}
+	if err := validateBoltFreelistPageID(meta, path); err != nil {
+		return err
 	}
 	if meta.pageSize == 0 || fileSize/meta.pageSize < meta.pgid {
 		return fmt.Errorf("%w: bbolt freelist preflight file is truncated: pages=%d page_size=%d size=%d: %s", repository.ErrCorruptRecord, meta.pgid, meta.pageSize, fileSize, path)
@@ -616,41 +625,111 @@ func validateBoltFreelistPage(file *os.File, meta boltPreflightMeta, fileSize ui
 	if page.flags != boltFreelistPageFlag {
 		return fmt.Errorf("%w: bbolt freelist page %d has flags 0x%x, want freelist: %s", repository.ErrCorruptRecord, meta.freelist, page.flags, path)
 	}
-	span := uint64(page.overflow) + 1
-	if span == 0 || span > meta.pgid || meta.freelist > meta.pgid-span {
-		return fmt.Errorf("%w: bbolt freelist page %d overflow %d exceeds high water mark %d: %s", repository.ErrCorruptRecord, meta.freelist, page.overflow, meta.pgid, path)
+	span, err := validateBoltFreelistSpan(meta, page, path)
+	if err != nil {
+		return err
 	}
-	_, end, ok := checkedBoltDataRange(meta.freelist, meta.pageSize, span, fileSize)
+	start, end, ok := checkedBoltDataRange(meta.freelist, meta.pageSize, span, fileSize)
 	if !ok {
 		return fmt.Errorf("%w: bbolt freelist page %d overflow %d is outside file data: %s", repository.ErrCorruptRecord, meta.freelist, page.overflow, path)
 	}
-	spanBytes := uint64(end) - meta.freelist*meta.pageSize
+	spanBytes := uint64(end - start)
+	startOffset := uint64(start)
+	info, err := validateBoltFreelistCount(meta, page, span, spanBytes, path, func() (uint64, error) {
+		var buf [8]byte
+		if _, err := file.ReadAt(buf[:], int64(startOffset+boltPageHeaderSize)); err != nil {
+			return 0, fmt.Errorf("%w: bbolt freelist page %d extended count read failed: %v", repository.ErrCorruptRecord, meta.freelist, err)
+		}
+		return binary.LittleEndian.Uint64(buf[:]), nil
+	})
+	if err != nil {
+		return err
+	}
+	return validateBoltFreelistIDs(meta, info, nil, path, func(index uint64) (uint64, error) {
+		var buf [8]byte
+		offset := startOffset + info.idsOffset + index*8
+		if _, err := file.ReadAt(buf[:], int64(offset)); err != nil {
+			return 0, fmt.Errorf("%w: bbolt freelist page %d entry %d read failed: %v", repository.ErrCorruptRecord, meta.freelist, index, err)
+		}
+		return binary.LittleEndian.Uint64(buf[:]), nil
+	})
+}
+
+func validateBoltFreelistPageID(meta boltPreflightMeta, path string) error {
+	if meta.freelist < boltStructuralGraphPageFloor || meta.freelist >= meta.pgid {
+		return fmt.Errorf("%w: bbolt freelist page %d is out of range [2,%d): %s", repository.ErrCorruptRecord, meta.freelist, meta.pgid, path)
+	}
+	return nil
+}
+
+func validateBoltFreelistSpan(meta boltPreflightMeta, page boltPreflightPage, path string) (uint64, error) {
+	span := uint64(page.overflow) + 1
+	if span == 0 || span > meta.pgid || meta.freelist > meta.pgid-span {
+		return 0, fmt.Errorf("%w: bbolt freelist page %d overflow %d exceeds high water mark %d: %s", repository.ErrCorruptRecord, meta.freelist, page.overflow, meta.pgid, path)
+	}
+	return span, nil
+}
+
+func validateBoltFreelistCount(meta boltPreflightMeta, page boltPreflightPage, span, spanBytes uint64, path string, readExtendedCount func() (uint64, error)) (boltFreelistPageInfo, error) {
 	if spanBytes < boltPageHeaderSize {
-		return fmt.Errorf("%w: bbolt freelist page %d span is shorter than a page header: %s", repository.ErrCorruptRecord, meta.freelist, path)
+		return boltFreelistPageInfo{}, fmt.Errorf("%w: bbolt freelist page %d span is shorter than a page header: %s", repository.ErrCorruptRecord, meta.freelist, path)
 	}
 	capacity := (spanBytes - boltPageHeaderSize) / 8
 	count := uint64(page.count)
 	requiredSlots := count
+	idsOffset := uint64(boltPageHeaderSize)
 	if page.count == 0xffff {
 		if capacity == 0 {
-			return fmt.Errorf("%w: bbolt freelist page %d extended count has no storage: %s", repository.ErrCorruptRecord, meta.freelist, path)
+			return boltFreelistPageInfo{}, fmt.Errorf("%w: bbolt freelist page %d extended count has no storage: %s", repository.ErrCorruptRecord, meta.freelist, path)
 		}
-		var buf [8]byte
-		n, err := file.ReadAt(buf[:], int64(meta.freelist*meta.pageSize+boltPageHeaderSize))
-		if err != nil && n != len(buf) {
-			return fmt.Errorf("%w: bbolt freelist page %d extended count read failed: %v", repository.ErrCorruptRecord, meta.freelist, err)
+		extendedCount, err := readExtendedCount()
+		if err != nil {
+			return boltFreelistPageInfo{}, err
 		}
-		count = binary.LittleEndian.Uint64(buf[:])
+		count = extendedCount
 		if count > uint64(^uint(0)>>1) {
-			return fmt.Errorf("%w: bbolt freelist page %d extended count %d exceeds addressable memory: %s", repository.ErrCorruptRecord, meta.freelist, count, path)
+			return boltFreelistPageInfo{}, fmt.Errorf("%w: bbolt freelist page %d extended count %d exceeds addressable memory: %s", repository.ErrCorruptRecord, meta.freelist, count, path)
 		}
 		if count == ^uint64(0) {
-			return fmt.Errorf("%w: bbolt freelist page %d extended count overflows storage slots: %s", repository.ErrCorruptRecord, meta.freelist, path)
+			return boltFreelistPageInfo{}, fmt.Errorf("%w: bbolt freelist page %d extended count overflows storage slots: %s", repository.ErrCorruptRecord, meta.freelist, path)
 		}
 		requiredSlots = count + 1
+		idsOffset += 8
 	}
 	if requiredSlots > capacity {
-		return fmt.Errorf("%w: bbolt freelist page %d count %d requires %d slots, capacity %d: %s", repository.ErrCorruptRecord, meta.freelist, count, requiredSlots, capacity, path)
+		return boltFreelistPageInfo{}, fmt.Errorf("%w: bbolt freelist page %d count %d requires %d slots, capacity %d: %s", repository.ErrCorruptRecord, meta.freelist, count, requiredSlots, capacity, path)
+	}
+	if count > meta.pgid {
+		return boltFreelistPageInfo{}, fmt.Errorf("%w: bbolt freelist page %d count %d exceeds high water mark %d: %s", repository.ErrCorruptRecord, meta.freelist, count, meta.pgid, path)
+	}
+	return boltFreelistPageInfo{
+		span:      span,
+		count:     count,
+		idsOffset: idsOffset,
+	}, nil
+}
+
+func validateBoltFreelistIDs(meta boltPreflightMeta, info boltFreelistPageInfo, reachable map[uint64]string, path string, readID func(index uint64) (uint64, error)) error {
+	seen := make(map[uint64]struct{}, int(info.count))
+	freelistEnd := meta.freelist + info.span
+	for i := uint64(0); i < info.count; i++ {
+		id, err := readID(i)
+		if err != nil {
+			return err
+		}
+		if id < boltStructuralGraphPageFloor || id >= meta.pgid {
+			return fmt.Errorf("%w: bbolt freelist page %d entry %d page %d is out of range [2,%d): %s", repository.ErrCorruptRecord, meta.freelist, i, id, meta.pgid, path)
+		}
+		if _, ok := seen[id]; ok {
+			return fmt.Errorf("%w: bbolt freelist page %d entry %d page %d is duplicated: %s", repository.ErrCorruptRecord, meta.freelist, i, id, path)
+		}
+		seen[id] = struct{}{}
+		if id >= meta.freelist && id < freelistEnd {
+			return fmt.Errorf("%w: bbolt freelist page %d entry %d lists freelist span page %d in [%d,%d): %s", repository.ErrCorruptRecord, meta.freelist, i, id, meta.freelist, freelistEnd, path)
+		}
+		if owner, ok := reachable[id]; ok {
+			return fmt.Errorf("%w: bbolt freelist page %d entry %d page %d is reachable freed by %s: %s", repository.ErrCorruptRecord, meta.freelist, i, id, owner, path)
+		}
 	}
 	return nil
 }
@@ -842,7 +921,10 @@ func preflightBoltBTreeGraphTx(tx *bolt.Tx, expectedIdentity FileIdentity) (err 
 		hwm:      meta.pgid,
 		visited:  make(map[uint64]string),
 	}
-	return walk.traversePage(meta.root, nil, 1)
+	if err := walk.traversePage(meta.root, nil, 1); err != nil {
+		return err
+	}
+	return walk.validateFreelist(meta)
 }
 
 func mmapBoltPreflightData(path string, size int64, expectedIdentity FileIdentity) ([]byte, error) {
@@ -969,6 +1051,45 @@ func (walk *boltStructuralGraphPreflight) traversePage(pgid uint64, stack []uint
 	default:
 		return fmt.Errorf("%w: bbolt structural graph preflight page %d has invalid tree flags 0x%x: %s", repository.ErrCorruptRecord, pgid, page.flags, walk.path)
 	}
+}
+
+func (walk *boltStructuralGraphPreflight) validateFreelist(meta boltPreflightMeta) error {
+	if meta.freelist == boltNoFreelistID {
+		return nil
+	}
+	if err := validateBoltFreelistPageID(meta, walk.path); err != nil {
+		return err
+	}
+	start, headerEnd, ok := checkedBoltDataRange(meta.freelist, walk.pageSize, 1, uint64(len(walk.data)))
+	if !ok || headerEnd-start < boltPageHeaderSize {
+		return fmt.Errorf("%w: bbolt freelist page %d header is out of range: %s", repository.ErrCorruptRecord, meta.freelist, walk.path)
+	}
+	page := decodeBoltPreflightPage(walk.data[start : start+boltPageHeaderSize])
+	if page.id != meta.freelist {
+		return fmt.Errorf("%w: bbolt freelist page %d self-identifies as %d: %s", repository.ErrCorruptRecord, meta.freelist, page.id, walk.path)
+	}
+	if page.flags != boltFreelistPageFlag {
+		return fmt.Errorf("%w: bbolt freelist page %d has flags 0x%x, want freelist: %s", repository.ErrCorruptRecord, meta.freelist, page.flags, walk.path)
+	}
+	span, err := validateBoltFreelistSpan(meta, page, walk.path)
+	if err != nil {
+		return err
+	}
+	start, end, ok := checkedBoltDataRange(meta.freelist, walk.pageSize, span, uint64(len(walk.data)))
+	if !ok {
+		return fmt.Errorf("%w: bbolt freelist page %d overflow %d is outside mapped data: %s", repository.ErrCorruptRecord, meta.freelist, page.overflow, walk.path)
+	}
+	pageBytes := walk.data[start:end]
+	info, err := validateBoltFreelistCount(meta, page, span, uint64(len(pageBytes)), walk.path, func() (uint64, error) {
+		return binary.LittleEndian.Uint64(pageBytes[boltPageHeaderSize : boltPageHeaderSize+8]), nil
+	})
+	if err != nil {
+		return err
+	}
+	return validateBoltFreelistIDs(meta, info, walk.visited, walk.path, func(index uint64) (uint64, error) {
+		offset := info.idsOffset + index*8
+		return binary.LittleEndian.Uint64(pageBytes[offset : offset+8]), nil
+	})
 }
 
 func (walk *boltStructuralGraphPreflight) readTreePage(pgid uint64) (boltPreflightPage, []byte, error) {
@@ -1200,7 +1321,10 @@ func boltPanicIsCorruption(recovered any) bool {
 	if recovered == nil {
 		return false
 	}
-	if _, ok := recovered.(runtime.Error); ok {
+	if _, ok := recovered.(interface {
+		runtime.Error
+		Addr() uintptr
+	}); ok {
 		return true
 	}
 	err, ok := recovered.(error)

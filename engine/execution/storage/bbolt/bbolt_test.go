@@ -729,7 +729,7 @@ func TestAuditDoesNotMutateDatabaseBytes(t *testing.T) {
 	}
 }
 
-func TestStructuralIntegrityDetectsReachableFreedPageWithoutMutatingDatabase(t *testing.T) {
+func TestFreelistReachablePageRejectedWithoutMutatingDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
 	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
@@ -859,6 +859,53 @@ func TestStructuralGraphPreflightAllowsValidSeededDatabase(t *testing.T) {
 	}
 }
 
+func TestNoFreelistSyncSentinelOpensCleanly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second, NoFreelistSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptBboltFixture(t, repo, newBboltFixture(t, "no-freelist-sync"))
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close NoFreelistSync repository: %v", err)
+	}
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	if err := file.Close(); err != nil {
+		t.Fatalf("close meta reader: %v", err)
+	}
+	if meta.freelist != boltNoFreelistID {
+		t.Fatalf("active freelist page = %d, want PgidNoFreelist", meta.freelist)
+	}
+	before := readFileBytesForTest(t, path)
+
+	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("OpenExisting NoFreelistSync database: %v", err)
+	}
+	if err := reopened.AuditIntegrity(context.Background()); err != nil {
+		_ = reopened.Close()
+		t.Fatalf("AuditIntegrity NoFreelistSync database: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close reopened NoFreelistSync database: %v", err)
+	}
+
+	readOnly, err := OpenExistingReadOnly(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("OpenExistingReadOnly NoFreelistSync database: %v", err)
+	}
+	if err := readOnly.AuditIntegrity(context.Background()); err != nil {
+		_ = readOnly.Close()
+		t.Fatalf("read-only AuditIntegrity NoFreelistSync database: %v", err)
+	}
+	if err := readOnly.Close(); err != nil {
+		t.Fatalf("close read-only NoFreelistSync database: %v", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(before, after) {
+		t.Fatal("NoFreelistSync open or audit mutated database bytes")
+	}
+}
+
 func TestPreOpenFreelistPreflightRejectsCorruptFreelistBeforeBoltOpen(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -876,6 +923,36 @@ func TestPreOpenFreelistPreflightRejectsCorruptFreelistBeforeBoltOpen(t *testing
 			want: "out of range",
 		},
 		{
+			name: "meta-pgid-as-free-id",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistIDsForTest(t, path, func(meta boltPreflightMeta) []uint64 {
+					return []uint64{meta.pgid}
+				})
+			},
+			want: "out of range",
+		},
+		{
+			name: "freelist-self-page-as-free-id",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistIDsForTest(t, path, func(meta boltPreflightMeta) []uint64 {
+					return []uint64{meta.freelist}
+				})
+			},
+			want: "freelist span",
+		},
+		{
+			name: "duplicate-free-id",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistIDsForTest(t, path, func(meta boltPreflightMeta) []uint64 {
+					return []uint64{meta.root, meta.root}
+				})
+			},
+			want: "duplicated",
+		},
+		{
 			name: "wrong-page-type",
 			corrupt: func(t *testing.T, path string) {
 				t.Helper()
@@ -890,6 +967,14 @@ func TestPreOpenFreelistPreflightRejectsCorruptFreelistBeforeBoltOpen(t *testing
 				corruptActiveBoltFreelistCountBeyondSpanForTest(t, path)
 			},
 			want: "requires",
+		},
+		{
+			name: "count-exceeds-high-water",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistCountExceedsHighWaterForTest(t, path)
+			},
+			want: "exceeds high water mark",
 		},
 	}
 
@@ -1005,13 +1090,32 @@ func TestOpenBoltSafelyReraisesProgrammerPanic(t *testing.T) {
 	})
 }
 
-func TestOpenBoltSafelyMapsRuntimeFaultToCorruptRecord(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "fault.db")
-	db, err := openBoltSafely(path, 0o600, &bolt.Options{
+func TestOpenBoltSafelyReraisesRuntimeLogicPanic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nil-deref.db")
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("openBoltSafely did not re-panic nil dereference")
+		}
+		if !strings.Contains(fmt.Sprint(recovered), "nil pointer dereference") {
+			t.Fatalf("recovered panic = %v, want nil pointer dereference", recovered)
+		}
+	}()
+
+	_, _ = openBoltSafely(path, 0o600, &bolt.Options{
 		OpenFile: func(string, int, os.FileMode) (*os.File, error) {
 			var fault *byte
 			_ = *fault
 			return nil, nil
+		},
+	})
+}
+
+func TestOpenBoltSafelyMapsRuntimeFaultToCorruptRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fault.db")
+	db, err := openBoltSafely(path, 0o600, &bolt.Options{
+		OpenFile: func(string, int, os.FileMode) (*os.File, error) {
+			panic(runtimeFaultForTest{addr: 0x1234})
 		},
 	})
 	if db != nil {
@@ -1020,6 +1124,20 @@ func TestOpenBoltSafelyMapsRuntimeFaultToCorruptRecord(t *testing.T) {
 	if !errors.Is(err, repository.ErrCorruptRecord) {
 		t.Fatalf("openBoltSafely error = %v, want ErrCorruptRecord", err)
 	}
+}
+
+type runtimeFaultForTest struct {
+	addr uintptr
+}
+
+func (e runtimeFaultForTest) Error() string {
+	return "runtime error: invalid memory address or nil pointer dereference"
+}
+
+func (e runtimeFaultForTest) RuntimeError() {}
+
+func (e runtimeFaultForTest) Addr() uintptr {
+	return e.addr
 }
 
 func TestBoltCheckErrorClassificationLeavesOperationalErrorsNonCorrupt(t *testing.T) {
@@ -1098,6 +1216,43 @@ func corruptFreelistWithReachablePageForTest(t *testing.T, path string) {
 	}
 }
 
+func corruptActiveBoltFreelistIDsForTest(t *testing.T, path string, idsForMeta func(boltPreflightMeta) []uint64) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	if meta.freelist <= 1 || meta.freelist >= meta.pgid {
+		t.Fatalf("active freelist page = %d, high water mark = %d", meta.freelist, meta.pgid)
+	}
+	page, err := readBoltPreflightPage(file, meta.freelist, meta.pageSize)
+	if err != nil {
+		t.Fatalf("read freelist page: %v", err)
+	}
+	if page.flags != boltFreelistPageFlag {
+		t.Fatalf("page %d flags = 0x%x, want freelist", meta.freelist, page.flags)
+	}
+	ids := idsForMeta(meta)
+	if len(ids) >= 0xffff {
+		t.Fatalf("test freelist ID count %d cannot be encoded as a simple count", len(ids))
+	}
+	span := uint64(page.overflow) + 1
+	if span == 0 || span > meta.pgid || meta.freelist > meta.pgid-span {
+		t.Fatalf("freelist page %d overflow %d exceeds high water mark %d", meta.freelist, page.overflow, meta.pgid)
+	}
+	capacity := (span*meta.pageSize - boltPageHeaderSize) / 8
+	if uint64(len(ids)) > capacity {
+		t.Fatalf("test freelist ID count %d exceeds freelist capacity %d", len(ids), capacity)
+	}
+	writeBoltPageCountForTest(t, file, meta.pageSize, meta.freelist, uint16(len(ids)))
+	for i, id := range ids {
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], id)
+		offset := int64(meta.freelist*meta.pageSize + boltPageHeaderSize + uint64(i)*8)
+		if _, err := file.WriteAt(buf[:], offset); err != nil {
+			t.Fatalf("write freelist ID %d: %v", i, err)
+		}
+	}
+}
+
 func writeActiveBoltMetaFreelistForTest(t *testing.T, path string, freelist uint64) {
 	t.Helper()
 	mutateActiveBoltMetaForTest(t, path, func(meta []byte) {
@@ -1152,6 +1307,26 @@ func corruptActiveBoltFreelistCountBeyondSpanForTest(t *testing.T, path string) 
 	if _, err := file.WriteAt(count[:], int64(meta.freelist*meta.pageSize+boltPageHeaderSize)); err != nil {
 		t.Fatalf("write freelist extended count: %v", err)
 	}
+}
+
+func corruptActiveBoltFreelistCountExceedsHighWaterForTest(t *testing.T, path string) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	page, err := readBoltPreflightPage(file, meta.freelist, meta.pageSize)
+	if err != nil {
+		t.Fatalf("read freelist page: %v", err)
+	}
+	span := uint64(page.overflow) + 1
+	capacity := (span*meta.pageSize - boltPageHeaderSize) / 8
+	count := meta.pgid + 1
+	if count >= 0xffff {
+		t.Fatalf("test freelist count %d cannot be encoded as a simple count", count)
+	}
+	if count > capacity {
+		t.Fatalf("test freelist count %d exceeds freelist capacity %d", count, capacity)
+	}
+	writeBoltPageCountForTest(t, file, meta.pageSize, meta.freelist, uint16(count))
 }
 
 func writeBoltPageCountForTest(t *testing.T, file *os.File, pageSize, pageID uint64, count uint16) {
