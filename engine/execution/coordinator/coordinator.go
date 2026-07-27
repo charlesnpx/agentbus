@@ -260,7 +260,7 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 				if recoveryAborted(err) {
 					return err
 				}
-				if custodian.IsCleanupUnresolved(err) {
+				if physicalCleanupUnresolved(err) {
 					return c.finalizeUnresolved(ctx, jobID, trigger, cause, err)
 				}
 				return c.failStop(ctx, err)
@@ -274,7 +274,7 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 				if recoveryAborted(err) {
 					return err
 				}
-				if custodian.IsCleanupUnresolved(err) {
+				if physicalCleanupUnresolved(err) {
 					return c.finalizeUnresolved(ctx, jobID, trigger, cause, err)
 				}
 				return c.failStop(ctx, err)
@@ -325,18 +325,18 @@ func (c *Coordinator) awaitResultCertificateProgress(ctx context.Context, jobID 
 func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, unresolved error) error {
 	snapshot, err := c.authority.Snapshot(ctx, jobID)
 	if err != nil {
-		return c.failStop(ctx, errors.Join(unresolved, err))
+		return c.failStopUnlessRecoveryAborted(ctx, errors.Join(unresolved, err))
 	}
 	intent, err := model.RecoveryTerminalIntent(snapshot.Record, trigger, false)
 	if err != nil {
-		return c.failStop(ctx, errors.Join(unresolved, err))
+		return c.failStopUnlessRecoveryAborted(ctx, errors.Join(unresolved, err))
 	}
 	if _, err := c.authority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, intent); err != nil {
 		err = c.alreadyFinalizedError(ctx, jobID, err)
 		if errors.Is(err, ErrAlreadyFinalized) {
 			return err
 		}
-		return c.failStop(ctx, errors.Join(unresolved, err))
+		return c.failStopUnlessRecoveryAborted(ctx, errors.Join(unresolved, err))
 	}
 	return cause
 }
@@ -435,6 +435,22 @@ func reportCleanupWarning(jobID model.JobID, ordinal model.LaunchOrdinal, cause 
 
 func recoveryAborted(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func physicalCleanupUnresolved(err error) bool {
+	return custodian.IsCleanupUnresolved(err) || errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved)
+}
+
+func (c *Coordinator) failStopUnlessRecoveryAborted(ctx context.Context, err error) error {
+	if recoveryAborted(err) {
+		return err
+	}
+	if ctx != nil {
+		if ctxErr := ctx.Err(); recoveryAborted(ctxErr) {
+			return ctxErr
+		}
+	}
+	return c.failStop(ctx, err)
 }
 
 func (c *Coordinator) ready() error {

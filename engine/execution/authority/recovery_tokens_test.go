@@ -39,7 +39,7 @@ func TestRecoveryTokenRejectsStaleRevisionWrongBootAndReplay(t *testing.T) {
 
 func TestRecoveryTokenRecordsQuiescenceAndRederivesNextAction(t *testing.T) {
 	ctx := context.Background()
-	session, item := recoveryTokenWorkItem(t, "token-record")
+	session, item := recoveryTokenWorkItemWithGrant(t, "token-record")
 	if len(item.Launches) != 1 {
 		t.Fatalf("work launches = %d, want 1", len(item.Launches))
 	}
@@ -81,7 +81,33 @@ func TestRecoveryTokenRecordsQuiescenceAndRederivesNextAction(t *testing.T) {
 	}
 }
 
+func TestRecoveryTokenBoundOnlyStartupLossFinalizesWithoutLaunchWork(t *testing.T) {
+	ctx := context.Background()
+	session, item := recoveryTokenWorkItem(t, "token-bound-only-finalize")
+	if len(item.Launches) != 0 {
+		t.Fatalf("work launches = %d, want 0 for execution-impossible recovery", len(item.Launches))
+	}
+	if err := session.FinalizePlanned(ctx, item.Token); err != nil {
+		t.Fatalf("FinalizePlanned bound-only startup loss: %v", err)
+	}
+	items, err := session.WorkItems(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("work items after bound-only finalize = %d, want 0", len(items))
+	}
+}
+
 func recoveryTokenWorkItem(t *testing.T, name string) (*RecoverySession, RecoveryWorkItem) {
+	return recoveryTokenWorkItemWithSetup(t, name, false)
+}
+
+func recoveryTokenWorkItemWithGrant(t *testing.T, name string) (*RecoverySession, RecoveryWorkItem) {
+	return recoveryTokenWorkItemWithSetup(t, name, true)
+}
+
+func recoveryTokenWorkItemWithSetup(t *testing.T, name string, grant bool) (*RecoverySession, RecoveryWorkItem) {
 	t.Helper()
 	ctx := context.Background()
 	repo := memory.NewRepository()
@@ -92,8 +118,15 @@ func recoveryTokenWorkItem(t *testing.T, name string) (*RecoverySession, Recover
 	}
 	ref := accepted.Record.Attempt.Ref
 	group := groupRef(ref, model.LaunchOrdinalOne)
-	if _, err := oldReady.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
+	current, err := oldReady.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if grant {
+		current, err = oldReady.CommitGrant(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, model.PermitNonce("nonce-"+name))
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	session := newRecoverySession(t, repo, name+"-new")
@@ -107,8 +140,8 @@ func recoveryTokenWorkItem(t *testing.T, name string) (*RecoverySession, Recover
 	if items[0].JobID != accepted.Record.JobID {
 		t.Fatalf("work item job = %s, want %s", items[0].JobID, accepted.Record.JobID)
 	}
-	if items[0].BasedOnRevision != accepted.Record.Revision+1 {
-		t.Fatalf("work item revision = %d, want %d", items[0].BasedOnRevision, accepted.Record.Revision+1)
+	if items[0].BasedOnRevision != current.Record.Revision {
+		t.Fatalf("work item revision = %d, want %d", items[0].BasedOnRevision, current.Record.Revision)
 	}
 	if items[0].Trigger != model.RecoveryStartupLoss {
 		t.Fatalf("work item trigger = %v, want startup loss", items[0].Trigger)

@@ -4312,6 +4312,38 @@ func TestServeFailsPreListenerWhenProjectionAndBindingCorrupt(t *testing.T) {
 	}
 }
 
+func TestServeFailsPreListenerOnStartupStructuralCorruption(t *testing.T) {
+	root := shortTempDir(t)
+	cwd := shortTempDir(t)
+	if _, err := authority.ResetEmptyAdmissionRoot(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+	repoPath := filepath.Join(root, admissionRepositoryFile)
+	truncateAdmissionRepository(t, repoPath)
+	before := readFileBytes(t, repoPath)
+
+	server := newTestServerAtRoot(t, root, cwd, newFakeBackend("fake"))
+	configureTestAdmissionRuntime(t, server, newAdmissionFakeLaunchCustodian(t), true)
+	listenCalled := false
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		listenCalled = true
+		return nil, socketFileIdentity{}, errors.New("listener must not open for structural corruption")
+	}
+
+	err := server.Serve(context.Background())
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("Serve error = %T %v, want structural corruption", err, err)
+	}
+	if listenCalled {
+		t.Fatal("listener was called despite startup structural corruption")
+	}
+	assertNoServeAdmissionPublished(t, server)
+	after := readFileBytes(t, repoPath)
+	if !bytes.Equal(before, after) {
+		t.Fatal("structural startup failure mutated admission repository")
+	}
+}
+
 func TestServeBootstrapRootExistenceMatrix(t *testing.T) {
 	tests := []struct {
 		name      string

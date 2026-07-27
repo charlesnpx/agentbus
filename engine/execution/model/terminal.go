@@ -74,9 +74,6 @@ func deriveTerminalProof(record SafetyRecord, intent TerminalIntent) (TerminalPr
 		return ProofLegacyUnfencedOutcome, nil
 	}
 	if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
-		if !allLaunchGroupsQuiescent(record.Attempt) {
-			return 0, precondition("terminal derivation requires quiescence for every bound group")
-		}
 		if !validNeverPermittedIntent(intent) {
 			return 0, precondition("terminal intent is incompatible with never-permitted proof")
 		}
@@ -87,6 +84,9 @@ func deriveTerminalProof(record SafetyRecord, intent TerminalIntent) (TerminalPr
 	}
 	if cleanQuiescentOutcomeAndRetired(record, intent) {
 		return ProofCleanQuiescentOutcomeAndRetired, nil
+	}
+	if validExecutionImpossibleIntent(record, intent) {
+		return ProofNeverPermittedAndRetired, nil
 	}
 	if validUnresolvedAbsenceIntent(record, intent) {
 		return ProofUnresolvedAbsence, nil
@@ -127,6 +127,24 @@ func validNeverPermittedIntent(intent TerminalIntent) bool {
 		return intent.Outcome == OutcomeFailed
 	case CauseCorruptProjection:
 		return intent.Outcome == OutcomeQuarantined
+	default:
+		return false
+	}
+}
+
+func validExecutionImpossibleIntent(record SafetyRecord, intent TerminalIntent) bool {
+	if !terminalCauseBackedByDurableFact(record, intent.Cause) {
+		return false
+	}
+	switch intent.Cause {
+	case CauseCanceledBeforeAuthorization,
+		CauseDaemonRestartedBeforeAuthorization,
+		CauseSupervisorLostBeforeAuthorization:
+		return !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) && validNeverPermittedIntent(intent)
+	case CauseCorruptProjection:
+		return !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) && validNeverPermittedIntent(intent)
+	case CauseReleaseDefinitelyNotSent:
+		return intent.Outcome == OutcomeFailed
 	default:
 		return false
 	}
@@ -220,7 +238,7 @@ func validTerminalCompatibility(record SafetyRecord, intent TerminalIntent, proo
 	}
 	switch proof {
 	case ProofNeverPermittedAndRetired:
-		return validNeverPermittedIntent(intent)
+		return validExecutionImpossibleIntent(record, intent)
 	case ProofCleanQuiescentOutcomeAndRetired:
 		return cleanQuiescentOutcomeAndRetired(record, intent)
 	case ProofContained:

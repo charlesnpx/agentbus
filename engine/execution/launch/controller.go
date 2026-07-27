@@ -384,6 +384,12 @@ func (controller *LaunchController) abortPrepared(ctx context.Context, prepared 
 		verified, cleanup, err = controller.custodian.ContainAndVerify(ctx, prepared.Ref(), custodian.QuiescenceCauseContain)
 		if err != nil {
 			reason := errors.Join(abortErr, fmt.Errorf("contain prepared group: %w", err))
+			if groupDurable && physicalCleanupUnresolved(abortErr) && physicalCleanupUnresolved(err) {
+				if groupErr := validatePreparedGroup(launch, prepared.Ref()); groupErr != nil {
+					return errors.Join(reason, groupErr, controller.failStop(ctx, errors.Join(reason, groupErr)), ErrFailClosed)
+				}
+				return reason
+			}
 			return errors.Join(reason, controller.failStop(ctx, reason), ErrFailClosed)
 		}
 		abortErr = errors.Join(abortErr, cleanup.Err)
@@ -442,7 +448,7 @@ func (controller *LaunchController) containGroupAndFailStop(ctx context.Context,
 func (controller *LaunchController) containRecordQuiescenceOrFailStop(ctx context.Context, launch LaunchContext, group model.GroupRef, reason error) error {
 	verified, cleanup, containErr := controller.custodian.ContainAndVerify(ctx, group, custodian.QuiescenceCauseContain)
 	if containErr != nil {
-		if custodian.IsCleanupUnresolved(containErr) {
+		if physicalCleanupUnresolved(containErr) {
 			return errors.Join(reason, containErr)
 		}
 		failReason := errors.Join(reason, containErr)
@@ -464,6 +470,10 @@ func (controller *LaunchController) failStop(ctx context.Context, reason error) 
 		reason = ErrFailClosed
 	}
 	return controller.authority.FailStop(ctx, reason)
+}
+
+func physicalCleanupUnresolved(err error) bool {
+	return custodian.IsCleanupUnresolved(err) || errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved)
 }
 
 type durabilityAction uint8

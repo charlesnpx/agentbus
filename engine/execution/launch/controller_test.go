@@ -594,6 +594,73 @@ func TestLaunchControllerPreGrantAbortAndContainErrorsFailStop(t *testing.T) {
 	}
 }
 
+func TestLaunchControllerPreGrantAbortUnresolvedAfterDurableBindDoesNotFailStop(t *testing.T) {
+	tests := []struct {
+		name string
+		err  func(model.GroupRef) error
+	}{
+		{
+			name: "cleanup unresolved",
+			err: func(model.GroupRef) error {
+				return &custodian.CleanupUnresolvedError{
+					Reason:   containment.ReasonProbeUnprovable,
+					Decision: model.Unprovable,
+				}
+			},
+		},
+		{
+			name: "direct retained object reacquire unresolved",
+			err: func(group model.GroupRef) error {
+				return custodian.RetainedObjectReacquireUnresolvedError{
+					Group: group,
+					Cause: errors.New("retained object disappeared before absence proof"),
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, "pre-grant-abort-unresolved-"+tt.name)
+			unresolved := tt.err(h.group)
+			h.authority.grantOutcome = DefinitelyNotCommitted
+			h.prepared.abortErr = unresolved
+			h.custodian.containErr = unresolved
+
+			_, err := h.controller.Run(context.Background(), h.request(nil))
+			if err == nil {
+				t.Fatal("Run returned nil error for unresolved pre-grant abort")
+			}
+			if !errors.Is(err, ErrDurabilityNotCommitted) {
+				t.Fatalf("Run error = %v, want ErrDurabilityNotCommitted", err)
+			}
+			if !physicalCleanupUnresolved(err) {
+				t.Fatalf("Run error = %v, want typed physical cleanup uncertainty", err)
+			}
+			if errors.Is(err, ErrFailClosed) {
+				t.Fatalf("Run error = %v, want no fail-closed marker", err)
+			}
+			if h.prepared.abortCalls != 1 {
+				t.Fatalf("abort calls = %d, want 1", h.prepared.abortCalls)
+			}
+			if h.custodian.containCalls != 1 {
+				t.Fatalf("custodian contain calls = %d, want 1", h.custodian.containCalls)
+			}
+			if h.authority.recordQuiescenceCalls != 0 {
+				t.Fatalf("record quiescence calls = %d, want 0", h.authority.recordQuiescenceCalls)
+			}
+			if h.authority.failStops != 0 {
+				t.Fatalf("fail stops = %d, want 0", h.authority.failStops)
+			}
+			if h.prepared.releaseCalls != 0 {
+				t.Fatalf("release calls = %d, want 0", h.prepared.releaseCalls)
+			}
+			if got := h.running.attestations + h.prepared.attestations + h.custodian.attestations; got != 0 {
+				t.Fatalf("attestations = %d, want 0", got)
+			}
+		})
+	}
+}
+
 func TestLaunchControllerPreGrantRecordQuiescenceFailuresFailStop(t *testing.T) {
 	committedErr := errors.New("quiescence observer failed")
 	tests := []struct {
@@ -841,6 +908,39 @@ func TestLaunchControllerReleaseUnknownRetainedObjectUnresolvedDoesNotFailStop(t
 	}
 	if !errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved) {
 		t.Fatalf("Run error = %v, want ErrRetainedObjectReacquireUnresolved", err)
+	}
+	if h.authority.failStops != 0 {
+		t.Fatalf("fail stops = %d, want 0", h.authority.failStops)
+	}
+	if h.authority.releaseOutcomeFact != model.LaunchReleaseSentUnknown {
+		t.Fatalf("release outcome fact = %s, want %s", h.authority.releaseOutcomeFact, model.LaunchReleaseSentUnknown)
+	}
+	if h.authority.recordQuiescenceCalls != 0 {
+		t.Fatalf("record quiescence calls = %d, want 0", h.authority.recordQuiescenceCalls)
+	}
+}
+
+func TestLaunchControllerReleaseUnknownDirectRetainedObjectUnresolvedDoesNotFailStop(t *testing.T) {
+	h := newHarness(t, "release-unknown-direct-retained-unresolved")
+	h.prepared.releaseOutcome = custodian.ReleaseOutcomeUnknown
+	h.prepared.releaseErr = errors.New("release channel lost")
+	h.custodian.containErr = custodian.RetainedObjectReacquireUnresolvedError{
+		Group: h.group,
+		Cause: errors.New("retained object disappeared before absence proof"),
+	}
+
+	_, err := h.controller.Run(context.Background(), h.request(nil))
+	if err == nil {
+		t.Fatal("Run returned nil error for release-unknown direct retained-object unresolved cleanup")
+	}
+	if !errors.Is(err, ErrReleaseUncertain) {
+		t.Fatalf("Run error = %v, want ErrReleaseUncertain", err)
+	}
+	if !errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved) {
+		t.Fatalf("Run error = %v, want ErrRetainedObjectReacquireUnresolved", err)
+	}
+	if errors.Is(err, ErrFailClosed) {
+		t.Fatalf("Run error = %v, want no fail-closed marker", err)
 	}
 	if h.authority.failStops != 0 {
 		t.Fatalf("fail stops = %d, want 0", h.authority.failStops)
