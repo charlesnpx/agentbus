@@ -4,7 +4,18 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS (AB-F): IN PROGRESS (started 2026-07-27). Custody de-escalation — one weaker cross-platform
+STATUS (AB-F): COMPLETE (2026-07-28). ALL 7 UNITS (U1-U7) CLOSED, merged into abf-custody (PR #30),
+tip 069d6d9. Cross-platform verified: macOS solo battery green; Docker cgroup-v2 gate worst=0 across
+ALL partitions (strict-cgroup preflight, builds, serial-conformance, serial-race, parallel-rest, race
+detector, strict-e2e). Daemon serves on macOS (process-group/held-parent) and Linux (cgroup-v2 with
+process-group fallback). Integration caught + fixed several cross-platform-only defects: a Linux-only
+bbolt valid-DB false-positive (page-size + unsound linear page scan), an over-eager term_kill self-test
+that broke Linux startup (reverted to the ParkedExec+VerifiedContainment gate), a cgroup root-lease
+contention non-fallback bug, and two deterministic Linux-only e2e test bugs (double-hello, too-tight
+readiness) previously mistaken for a load-flake. Remaining (approval-gated, orchestrator-blocked):
+update PR title/body via gh; install scripts/ci/github-workflows-proposed/ into .github/workflows/.
+
+STATUS (AB-F, historical): IN PROGRESS (started 2026-07-27). Custody de-escalation — one weaker cross-platform
 contract; delete the universal proof obligation, retain the Linux cgroup mechanism as an
 implementation detail. 7 sequential units U1->U7 (session tasks #17-#23). U1->U6 merged; U7 is
 cross-platform closure plus docs/CI reconciliation. Plan: ~/.claude/plans/modular-splashing-falcon.md. Binding invariants: (1)
