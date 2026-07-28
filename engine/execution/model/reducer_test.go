@@ -80,7 +80,7 @@ func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
 		{
 			name:    "finalize",
 			valid:   reducerCanceledRetiredRecord(t),
-			invalid: reducerCanceledRecord(t),
+			invalid: reducerGrantRecord(t),
 			command: Finalize{Ref: reducerRef(), Intent: TerminalIntent{Outcome: OutcomeCanceled, Cause: CauseCanceledBeforeAuthorization}},
 		},
 	}
@@ -534,6 +534,87 @@ func TestDeriveTerminalCertificateDecouplesOutcomeFromUnresolvedAbsence(t *testi
 	}
 	if certificate.Proof != ProofUnresolvedAbsence {
 		t.Fatalf("response-undeliverable proof = %s, want %s", certificate.Proof, ProofUnresolvedAbsence)
+	}
+}
+
+func TestExecutionImpossibleTerminalDoesNotRequireQuiescence(t *testing.T) {
+	preAuthorization := reducerSupervisorRecord()
+	certificate, err := DeriveTerminalCertificate(preAuthorization, TerminalIntent{
+		Outcome: OutcomeCanceled,
+		Cause:   CauseCanceledBeforeAuthorization,
+	})
+	if err != nil {
+		t.Fatalf("DeriveTerminalCertificate pre-authorization error = %v", err)
+	}
+	if certificate.Proof != ProofNeverPermittedAndRetired {
+		t.Fatalf("pre-authorization proof = %s, want %s", certificate.Proof, ProofNeverPermittedAndRetired)
+	}
+	preAuthorization.Terminal = &certificate
+	if got := DeriveCleanupDisposition(preAuthorization); got != CleanupDispositionNoExecutionPossible {
+		t.Fatalf("pre-authorization cleanup = %s, want %s", got, CleanupDispositionNoExecutionPossible)
+	}
+	if err := ValidateSafetyRecord(preAuthorization); err != nil {
+		t.Fatalf("ValidateSafetyRecord pre-authorization error = %v", err)
+	}
+
+	releaseNotSent := reducerGrantRecord(t)
+	releaseNotSent = reducerMustApply(t, releaseNotSent, RecordReleaseOutcome{Ref: reducerRef(), Ordinal: LaunchOrdinalOne, Outcome: LaunchReleaseNotSent})
+	certificate, err = DeriveTerminalCertificate(releaseNotSent, TerminalIntent{
+		Outcome: OutcomeFailed,
+		Cause:   CauseReleaseDefinitelyNotSent,
+	})
+	if err != nil {
+		t.Fatalf("DeriveTerminalCertificate release-not-sent error = %v", err)
+	}
+	if certificate.Proof != ProofNeverPermittedAndRetired {
+		t.Fatalf("release-not-sent proof = %s, want %s", certificate.Proof, ProofNeverPermittedAndRetired)
+	}
+	releaseNotSent.Terminal = &certificate
+	if got := DeriveCleanupDisposition(releaseNotSent); got != CleanupDispositionNoExecutionPossible {
+		t.Fatalf("release-not-sent cleanup = %s, want %s", got, CleanupDispositionNoExecutionPossible)
+	}
+	if err := ValidateSafetyRecord(releaseNotSent); err != nil {
+		t.Fatalf("ValidateSafetyRecord release-not-sent error = %v", err)
+	}
+}
+
+func TestCorruptProjectionTerminalRequiresRetiredPreparedGroup(t *testing.T) {
+	record := reducerSupervisorRecord()
+	if _, err := DeriveTerminalCertificate(record, TerminalIntent{
+		Outcome: OutcomeQuarantined,
+		Cause:   CauseCorruptProjection,
+	}); !errors.Is(err, ErrCommandPrecondition) {
+		t.Fatalf("DeriveTerminalCertificate corrupt projection without retirement error = %v, want ErrCommandPrecondition", err)
+	}
+
+	forged := record
+	forged.Terminal = &TerminalCertificate{
+		JobID:               forged.JobID,
+		Attempt:             forged.Attempt.Ref,
+		Outcome:             OutcomeQuarantined,
+		Proof:               ProofNeverPermittedAndRetired,
+		Cause:               CauseCorruptProjection,
+		DerivedFromRevision: forged.Revision,
+		DerivedBy:           forged.AdmittedBy,
+	}
+	if err := ValidateSafetyRecord(forged); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("forged corrupt projection no-quiescence terminal error = %v, want ErrInvalidValue", err)
+	}
+
+	retired := reducerRetiredRecord(t, record)
+	certificate, err := DeriveTerminalCertificate(retired, TerminalIntent{
+		Outcome: OutcomeQuarantined,
+		Cause:   CauseCorruptProjection,
+	})
+	if err != nil {
+		t.Fatalf("DeriveTerminalCertificate corrupt projection after retirement error = %v", err)
+	}
+	if certificate.Proof != ProofContained {
+		t.Fatalf("corrupt projection proof = %s, want %s", certificate.Proof, ProofContained)
+	}
+	retired.Terminal = &certificate
+	if err := ValidateSafetyRecord(retired); err != nil {
+		t.Fatalf("ValidateSafetyRecord retired corrupt projection error = %v", err)
 	}
 }
 
@@ -1236,8 +1317,8 @@ func TestPlanRecoveryUsesOnePlannerForRecoveryTriggers(t *testing.T) {
 		trigger RecoveryTrigger
 		want    RecoveryActionKind
 	}{
-		{name: "startup loss without grant", record: reducerSupervisorRecord(), trigger: RecoveryStartupLoss, want: RecoveryRetireThenFinalize},
-		{name: "post grant failure before grant commit", record: reducerSupervisorRecord(), trigger: RecoveryPostGrantFailure, want: RecoveryRetireThenFinalize},
+		{name: "startup loss without grant", record: reducerSupervisorRecord(), trigger: RecoveryStartupLoss, want: RecoveryFinalizeCertified},
+		{name: "post grant failure before grant commit", record: reducerSupervisorRecord(), trigger: RecoveryPostGrantFailure, want: RecoveryFinalizeCertified},
 		{name: "live loss with grant", record: reducerGrantRecord(t), trigger: RecoveryLiveLoss, want: RecoveryContainThenFinalize},
 		{name: "cancel with grant", record: reducerGrantRecord(t), trigger: RecoveryCancelAfterGrant, want: RecoveryContainThenFinalize},
 		{name: "corrupt with grant", record: reducerGrantRecord(t), trigger: RecoveryCorruption, want: RecoveryContainThenFinalize},

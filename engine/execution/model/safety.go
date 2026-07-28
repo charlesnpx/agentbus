@@ -364,6 +364,9 @@ func (record SafetyRecord) validateTerminalProofSupport() error {
 		if !fencedMode(record.Mode) {
 			return invalid("terminal.proof", "fenced proof requires fenced mode")
 		}
+		if validExecutionImpossibleIntent(record, TerminalIntent{Outcome: record.Terminal.Outcome, Cause: record.Terminal.Cause}) {
+			return nil
+		}
 		if hasAnyGrant(record.Attempt) || hasAnyRelease(record.Attempt) {
 			return invalid("terminal.proof", "never-permitted proof cannot have grant or release evidence")
 		}
