@@ -45,62 +45,83 @@ func TestMain(m *testing.M) {
 func TestProductionServedConfigSelectsNativeStrictRuntime(t *testing.T) {
 	cfg, err := productionServedConfig(Config{})
 	support := cfg.Runtime.Support()
-	if runtime.GOOS == "darwin" {
-		if err == nil {
-			t.Fatal("productionServedConfig() error = nil, want native runtime unsupported")
-		}
-		if support.Reason == nil || !errors.Is(support.Reason, custodian.ErrNativeRuntimeUnsupported) {
-			t.Fatalf("runtime support = %+v, want native runtime unsupported diagnostic", support)
-		}
-		return
-	}
 	if err != nil {
 		t.Fatalf("productionServedConfig() error = %v", err)
 	}
+	defer func() {
+		if closeErr := cfg.Runtime.Close(); closeErr != nil {
+			t.Fatalf("runtime Close() error = %v", closeErr)
+		}
+	}()
 	if support.Reason != nil && errors.Is(support.Reason, custodian.ErrSupervisorUnavailable) {
 		t.Fatalf("runtime support = %+v, want native strict runtime rather than generic unavailable runtime", support)
 	}
+	if runtime.GOOS == "darwin" {
+		if !errors.Is(support.Reason, custodian.ErrNativeRuntimeSelfTestRequired) || support.RuntimeProbePassed {
+			t.Fatalf("darwin runtime support = %+v, want self-test required before serving preflight", support)
+		}
+		if _, ok := cfg.Runtime.Process().(*custodian.NativeCustodian); !ok {
+			t.Fatalf("darwin runtime process = %T, want *NativeCustodian", cfg.Runtime.Process())
+		}
+	}
 }
 
-func TestProductionStrictServeFailsTypedOnDarwin(t *testing.T) {
+func TestProductionStrictServePreflightPassesOnDarwin(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skip("darwin unsupported-platform startup diagnostic")
+		t.Skip("darwin strict runtime startup qualification")
 	}
-	err := Serve(context.Background(), Config{
+	cfg, err := strictAdmissionServedConfig(Config{
 		StateRoot:   t.TempDir(),
 		CWD:         t.TempDir(),
 		IdleTimeout: -1,
-	})
-	var diagnostic served.AdmissionSupportDiagnostic
-	if !errors.As(err, &diagnostic) {
-		t.Fatalf("Serve error = %T %v, want AdmissionSupportDiagnostic", err, err)
+	}, StrictAdmissionOptions{AgentbusPath: buildAgentbusServeRealBinary(t)})
+	if err != nil {
+		t.Fatalf("strictAdmissionServedConfig() error = %v", err)
 	}
-	if !errors.Is(err, served.ErrAdmissionStrictSupportUnavailable) {
-		t.Fatalf("Serve error = %v, want ErrAdmissionStrictSupportUnavailable", err)
+	defer func() {
+		if closeErr := cfg.Runtime.Close(); closeErr != nil {
+			t.Fatalf("runtime Close() error = %v", closeErr)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := served.StrictAdmissionSupportPreflight(ctx, cfg); err != nil {
+		t.Fatalf("StrictAdmissionSupportPreflight() error = %v", err)
 	}
-	if diagnostic.Assessment.Class == custodian.SupportAvailable {
-		t.Fatalf("diagnostic assessment = %+v, want unavailable strict support", diagnostic.Assessment)
+	support := cfg.Runtime.Support()
+	if support.Assessment.Class != custodian.SupportAvailable || !support.ParkedExec || !support.VerifiedContainment {
+		t.Fatalf("darwin runtime support after preflight = %+v, want available parked exec and verified containment", support)
 	}
 }
 
-func TestProductionServeLauncherUnsupportedLeavesFreshRootAbsentOnDarwin(t *testing.T) {
+func TestProductionServeLauncherServesOnDarwinFreshRoot(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skip("darwin unsupported-platform startup diagnostic")
+		t.Skip("darwin strict runtime startup qualification")
 	}
-	parent := t.TempDir()
+	parent := shortAgentbusServeTempDir(t)
 	root := filepath.Join(parent, "state")
-	_, err := daemonlaunch.Launch(context.Background(), agentbusServeLaunchOptions(t, root, t.TempDir()))
-	assertDarwinUnsupportedLaunchError(t, err)
-	if _, statErr := os.Stat(root); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("state root stat error = %v, want not exist", statErr)
+	result, err := daemonlaunch.Launch(context.Background(), realAgentbusServeLaunchOptions(t, root))
+	if err != nil {
+		skipIfAgentbusServeBindDenied(t, err)
+		t.Fatalf("Launch error = %v", err)
 	}
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			_ = result.KillAndWait()
+		}
+	})
+	assertAgentbusServeReady(t, root, result)
+	_ = result.KillAndWait()
+	stopped = true
+	assertAgentbusServeProcessGone(t, result.PID)
 }
 
-func TestProductionServeLauncherUnsupportedLeavesExistingRootPermissionsOnDarwin(t *testing.T) {
+func TestProductionServeLauncherServesFromExistingRootOnDarwin(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skip("darwin unsupported-platform startup diagnostic")
+		t.Skip("darwin strict runtime startup qualification")
 	}
-	parent := t.TempDir()
+	parent := shortAgentbusServeTempDir(t)
 	root := filepath.Join(parent, "state")
 	if err := os.Mkdir(root, 0o755); err != nil {
 		t.Fatal(err)
@@ -109,8 +130,18 @@ func TestProductionServeLauncherUnsupportedLeavesExistingRootPermissionsOnDarwin
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = daemonlaunch.Launch(context.Background(), agentbusServeLaunchOptions(t, root, t.TempDir()))
-	assertDarwinUnsupportedLaunchError(t, err)
+	result, err := daemonlaunch.Launch(context.Background(), realAgentbusServeLaunchOptions(t, root))
+	if err != nil {
+		skipIfAgentbusServeBindDenied(t, err)
+		t.Fatalf("Launch error = %v", err)
+	}
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			_ = result.KillAndWait()
+		}
+	})
+	assertAgentbusServeReady(t, root, result)
 	after, err := os.Stat(root)
 	if err != nil {
 		t.Fatal(err)
@@ -118,34 +149,40 @@ func TestProductionServeLauncherUnsupportedLeavesExistingRootPermissionsOnDarwin
 	if after.Mode().Perm() != before.Mode().Perm() {
 		t.Fatalf("state root mode = %o, want unchanged %o", after.Mode().Perm(), before.Mode().Perm())
 	}
-	for _, name := range []string{protocol.TokenFileName, protocol.SocketName, "agentbus.pid"} {
-		if _, statErr := os.Stat(filepath.Join(root, name)); !errors.Is(statErr, os.ErrNotExist) {
-			t.Fatalf("%s stat error = %v, want not exist", name, statErr)
-		}
-	}
+	_ = result.KillAndWait()
+	stopped = true
+	assertAgentbusServeProcessGone(t, result.PID)
 }
 
-func TestProductionRecoverCLIUnsupportedLeavesExistingRootEmptyOnDarwin(t *testing.T) {
+func TestProductionRecoverCLIReportsRootMissingOnDarwin(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skip("darwin unsupported-platform recovery diagnostic")
+		t.Skip("darwin strict runtime recovery qualification")
 	}
 	root := t.TempDir()
 	bin := buildAgentbusServeRealBinary(t)
-	cmd := exec.Command(bin, "admission", "recover", "--state-root", root)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "admission", "recover", "--state-root", root)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	if ctx.Err() != nil {
+		t.Fatalf("recover timed out: %v; stdout=%s stderr=%s", ctx.Err(), stdout.String(), stderr.String())
+	}
 	if err == nil {
-		t.Fatalf("recover succeeded, want unsupported diagnostic; stdout=%s stderr=%s", stdout.String(), stderr.String())
+		t.Fatalf("recover succeeded, want missing admission root diagnostic; stdout=%s stderr=%s", stdout.String(), stderr.String())
 	}
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() == 0 {
 		t.Fatalf("recover error = %T %v, want non-zero exit", err, err)
 	}
-	if !strings.Contains(stderr.String(), served.ErrAdmissionStrictSupportUnavailable.Error()) {
-		t.Fatalf("recover stderr = %q, want strict support diagnostic", stderr.String())
+	if strings.Contains(stderr.String(), served.ErrAdmissionStrictSupportUnavailable.Error()) {
+		t.Fatalf("recover stderr = %q, did not expect strict support diagnostic on darwin", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), served.ErrAdmissionRootMissing.Error()) {
+		t.Fatalf("recover stderr = %q, want missing admission root diagnostic", stderr.String())
 	}
 	entries, readErr := os.ReadDir(root)
 	if readErr != nil {
@@ -786,6 +823,18 @@ func buildAgentbusServeRealBinary(t *testing.T) string {
 	return path
 }
 
+func shortAgentbusServeTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "agentbus-serve-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+	})
+	return dir
+}
+
 func agentbusServeRepoRootFromCaller(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -948,20 +997,47 @@ func agentbusServeLaunchOptionsWithModeAndTimeout(t *testing.T, root, cwd, mode 
 	}
 }
 
-func assertDarwinUnsupportedLaunchError(t *testing.T, err error) {
+func realAgentbusServeLaunchOptions(t *testing.T, root string) daemonlaunch.Options {
 	t.Helper()
-	if err == nil {
-		t.Fatal("Launch succeeded, want unsupported diagnostic")
+	return daemonlaunch.Options{
+		CommandPath: buildAgentbusServeRealBinary(t),
+		Args:        []string{"serve", "--foreground"},
+		StateRoot:   root,
+		Timeout:     20 * time.Second,
+		Starter:     agentbusServeProcessStarter,
+		Env:         os.Environ(),
 	}
-	var startup *daemonlaunch.StartupError
-	if !errors.As(err, &startup) || !errors.Is(err, daemonlaunch.ErrStartupFailed) {
-		t.Fatalf("Launch error = %T %v, want startup failure", err, err)
+}
+
+func skipIfAgentbusServeBindDenied(t *testing.T, err error) {
+	t.Helper()
+	if err != nil && strings.Contains(err.Error(), "bind: operation not permitted") {
+		t.Skipf("Unix socket bind denied by sandbox: %v", err)
 	}
-	if startup.Code != served.ErrAdmissionStrictSupportUnavailable.Error() {
-		t.Fatalf("startup code = %q, want strict support unavailable", startup.Code)
+}
+
+func assertAgentbusServeReady(t *testing.T, root string, result daemonlaunch.Result) {
+	t.Helper()
+	if result.PID <= 0 {
+		t.Fatalf("daemon pid = %d, want positive", result.PID)
 	}
-	if !strings.Contains(startup.Message, served.ErrAdmissionStrictSupportUnavailable.Error()) {
-		t.Fatalf("startup message = %q, want strict support diagnostic", startup.Message)
+	assertAgentbusServeProcessAlive(t, result.PID, "after readiness")
+	clientCtx, cancelClient := context.WithTimeout(context.Background(), time.Second)
+	defer cancelClient()
+	client, err := busclient.Connect(clientCtx, busclient.Options{
+		StateRoot:        root,
+		DisableAutoStart: true,
+	})
+	if err != nil {
+		t.Fatalf("connect after readiness: %v", err)
+	}
+	defer client.Close()
+	hello, err := client.Hello(clientCtx)
+	if err != nil {
+		t.Fatalf("hello after readiness: %v", err)
+	}
+	if hello.ProtocolVersion != protocol.Version {
+		t.Fatalf("hello protocolVersion = %d, want %d", hello.ProtocolVersion, protocol.Version)
 	}
 }
 

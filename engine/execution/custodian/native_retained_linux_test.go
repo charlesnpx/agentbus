@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -154,16 +153,11 @@ func TestNewNativeRuntimeSelfTestUsesReturnedSingleLeaseInstance(t *testing.T) {
 	if !record.CleanupVerified || record.Ref == (model.GroupRef{}) {
 		t.Fatalf("self-test record = %+v, want verified cleanup and retained ref", record)
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
+	if record.ExecPath != options.AgentbusPath {
+		t.Fatalf("self-test exec path = %s, want configured agentbus path %s", record.ExecPath, options.AgentbusPath)
 	}
-	exe, err = filepath.Abs(exe)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if record.ExecPath != exe {
-		t.Fatalf("self-test exec path = %s, want current executable %s", record.ExecPath, exe)
+	if record.Method != model.QuiescenceTermKill {
+		t.Fatalf("self-test quiescence method = %s, want %s", record.Method, model.QuiescenceTermKill)
 	}
 	absent, err := stableIndependentAbsent(ctx, record.Ref)
 	if err != nil {

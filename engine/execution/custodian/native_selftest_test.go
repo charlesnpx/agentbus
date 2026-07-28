@@ -6,15 +6,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
 
+	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/cgroup"
-	"github.com/charlesnpx/agentbus/internal/containment"
-	"github.com/charlesnpx/agentbus/internal/parklaunch"
 )
 
 func TestNativeSelfTestClassificationTable(t *testing.T) {
@@ -227,22 +225,15 @@ func TestNativeRuntimeConstructionContentionIsSingleShotRetryable(t *testing.T) 
 	}
 }
 
-func TestNativeSelfTestExecSpecUsesCurrentExecutable(t *testing.T) {
-	spec, markerPath, cleanup, err := nativeSelfTestExecSpec()
+func TestNativeSelfTestExecSpecUsesConfiguredAgentbusPath(t *testing.T) {
+	agentbusPath := filepath.Join(t.TempDir(), "agentbus")
+	spec, markerPath, cleanup, err := nativeSelfTestExecSpec(agentbusPath)
 	if err != nil {
 		t.Fatalf("nativeSelfTestExecSpec() error = %v", err)
 	}
 	defer cleanup()
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	exe, err = filepath.Abs(exe)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(spec.Argv) < 2 || spec.Argv[0] != exe {
-		t.Fatalf("self-test argv = %v, want argv[0] current executable %s", spec.Argv, exe)
+	if len(spec.Argv) < 2 || spec.Argv[0] != agentbusPath {
+		t.Fatalf("self-test argv = %v, want argv[0] configured agentbus path %s", spec.Argv, agentbusPath)
 	}
 	if spec.Argv[1] != nativeSelfTestFixtureCommand {
 		t.Fatalf("self-test argv[1] = %q, want %q", spec.Argv[1], nativeSelfTestFixtureCommand)
@@ -252,42 +243,181 @@ func TestNativeSelfTestExecSpecUsesCurrentExecutable(t *testing.T) {
 	}
 }
 
-func TestNewNativeRuntimeDarwinUnsupported(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("Darwin strict-unavailable support is macOS-only")
+func TestNativeSelfTestQualificationRequiresActiveQuiescenceMethod(t *testing.T) {
+	group := testPhysicalQuiescence().Group
+	for _, tt := range []struct {
+		name       string
+		method     model.QuiescenceMethod
+		wantClass  SupportClass
+		wantActive bool
+	}{
+		{name: "already absent rejected", method: model.QuiescenceAlreadyAbsent, wantClass: SupportUnsupported},
+		{name: "natural exit rejected", method: model.QuiescenceNaturalExit, wantClass: SupportUnsupported},
+		{name: "term kill accepted", method: model.QuiescenceTermKill, wantClass: SupportAvailable, wantActive: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			issuer, verifier := NewAttestationChannel()
+			verified, err := issuer.AttestQuiescence(PhysicalQuiescence{Group: group, Method: tt.method})
+			if err != nil {
+				t.Fatalf("AttestQuiescence() error = %v", err)
+			}
+			assessment := runClassifiedNativeSelfTest(context.Background(), 1, func(context.Context, int) nativeSelfTestAttemptResult {
+				physical, err := verifySelfTestAttestation(verifier, verified, group)
+				if err != nil {
+					return unsafeNativeSelfTest(err, true)
+				}
+				if err := requireSelfTestActiveQuiescenceMethod(physical); err != nil {
+					return unsupportedNativeSelfTest(err, true)
+				}
+				return nativeSelfTestAttemptResult{Class: SupportAvailable, CleanupSafe: true}
+			})
+			if assessment.Class != tt.wantClass {
+				t.Fatalf("assessment = %+v, want class=%s", assessment, tt.wantClass)
+			}
+			if tt.wantActive && assessment.Cause != nil {
+				t.Fatalf("active assessment cause = %v, want nil", assessment.Cause)
+			}
+			if !tt.wantActive && !errors.Is(assessment.Cause, ErrNativeRuntimeUnsupported) {
+				t.Fatalf("assessment cause = %v, want ErrNativeRuntimeUnsupported", assessment.Cause)
+			}
+		})
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	exe, err = filepath.Abs(exe)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtimeBundle, err := NewNativeRuntime(NativeOptions{
-		AgentbusPath: exe,
-		MonitorCommand: parklaunch.CommandSpec{
-			Path: exe,
-		},
-		ContainmentParams: containment.Params{
-			GracePeriod:  20 * time.Millisecond,
-			PollInterval: 20 * time.Millisecond,
-			PollTimeout:  2 * time.Second,
-		},
-		WorkerDir: filepath.Dir(exe),
+}
+
+func TestNativeSelfTestRecoveredSchedulingTimeoutIsRetryable(t *testing.T) {
+	calls := 0
+	timeoutCause := fmt.Errorf("%w: fixture did not execute before containment: %w", ErrNativeRuntimeSelfTestUnsafe, context.DeadlineExceeded)
+	assessment := runClassifiedNativeSelfTest(context.Background(), 2, func(context.Context, int) nativeSelfTestAttemptResult {
+		calls++
+		if calls == 1 {
+			return classifyNativeSelfTestRecoveredFailure(timeoutCause, nativeSelfTestCleanupResult{CleanupSafe: true})
+		}
+		return nativeSelfTestAttemptResult{Class: SupportAvailable, CleanupSafe: true}
 	})
-	if err == nil {
-		t.Fatal("NewNativeRuntime() error = nil, want Darwin unsupported cause")
+	if assessment.Class != SupportAvailable || assessment.Attempts != 2 || !assessment.CleanupSafe {
+		t.Fatalf("assessment = %+v, want retry after recovered timeout then available", assessment)
 	}
+
+	recoveryErr := errors.New("recovery containment failed")
+	result := classifyNativeSelfTestRecoveredFailure(timeoutCause, nativeSelfTestCleanupResult{Err: recoveryErr, CleanupSafe: true})
+	if result.Class != SupportUnsafe || !result.CleanupSafe || !errors.Is(result.Cause, recoveryErr) {
+		t.Fatalf("failed recovery classification = %+v, want unsafe cleanup-safe preserving recovery error", result)
+	}
+}
+
+func TestNativeSelfTestRetainedActiveContainmentRecordsTermKill(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	issuer, verifier := NewAttestationChannel()
+	manager := newFakeNativeRetainedManager()
+	native := newNativeCustodianWithRetainedManagerForTest(t, defaultNativeTestParams(), manager)
+	native.issuer = issuer
+	spec, _ := nativeIgnoreTermLeaderLaunchSpec(t)
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	waitNativeReadyLine(t, running.Stdout(), "ignore-term-leader-ready")
+	ref := running.Ref()
+	manager.setTermIgnored(ref.RetainedID, true)
+	manager.setSignalProcessGroup(ref.RetainedID, true)
+
+	verified, cleanup, err := running.containSelfTestActiveAndVerify(ctx, QuiescenceCauseContain)
+	if err != nil {
+		t.Fatalf("containSelfTestActiveAndVerify() error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("containSelfTestActiveAndVerify() cleanup error = %v", cleanup.Err)
+	}
+	physical, err := verifier.VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatalf("VerifyQuiescence() error = %v", err)
+	}
+	if !physical.Group.Equal(ref) || physical.Method != model.QuiescenceTermKill {
+		t.Fatalf("self-test physical = %+v, want term_kill for %+v", physical, ref)
+	}
+	leaf := manager.leafForRetainedID(t, ref.RetainedID)
+	if leaf.termCalls != 1 || leaf.killCalls != 1 {
+		t.Fatalf("retained signal calls term/kill = %d/%d, want 1/1", leaf.termCalls, leaf.killCalls)
+	}
+	if err := native.Close(); err != nil {
+		t.Fatalf("NativeCustodian.Close() error = %v", err)
+	}
+}
+
+func TestNativeSelfTestFailurePathLastResortReapsFixtureAndAllowsClose(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	issuer, verifier := NewAttestationChannel()
+	manager := newFakeNativeRetainedManager()
+	native := newNativeCustodianWithRetainedManagerForTest(t, defaultNativeTestParams(), manager)
+	native.issuer = issuer
+	spec, _ := nativeIgnoreTermLeaderLaunchSpec(t)
+	killErr := errors.New("retained kill failed")
+
+	running, err := native.Launch(ctx, spec)
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer cleanupNativeRunning(t, running)
+	waitNativeReadyLine(t, running.Stdout(), "ignore-term-leader-ready")
+	ref := running.Ref()
+	manager.setTermIgnored(ref.RetainedID, true)
+	manager.setKillErr(ref.RetainedID, killErr)
+	manager.setSyncMembershipWithProcessGroup(ref.RetainedID, ref.PGID)
+
+	recovery := native.recoverSelfTestRunningCleanup(ctx, verifier, running, ref)
+	if !recovery.CleanupSafe {
+		t.Fatalf("recoverSelfTestRunningCleanup() = %+v, want cleanup safe after last-resort teardown", recovery)
+	}
+	if recovery.Err == nil || !errors.Is(recovery.Err, killErr) {
+		t.Fatalf("recoverSelfTestRunningCleanup() error = %v, want retained kill failure preserved", recovery.Err)
+	}
+	waitGroupAbsent(t, ref, 5*time.Second)
+	if err := native.Close(); err != nil {
+		t.Fatalf("NativeCustodian.Close() error = %v", err)
+	}
+}
+
+func TestNewNativeRuntimeDarwinQualifiesAfterSelfTest(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Darwin strict runtime qualification is macOS-only")
+	}
+	exe := nativeTestBinaryPath(t)
+	runtimeBundle, err := NewNativeRuntime(NativeOptions{
+		AgentbusPath:      builtNativeAgentbusPath(t),
+		MonitorCommand:    nativeMonitorCommand(t),
+		ContainmentParams: defaultNativeTestParams(),
+		WorkerEnv:         nativeAgentbusEnv(),
+		WorkerDir:         filepath.Dir(exe),
+	})
+	if err != nil {
+		t.Fatalf("NewNativeRuntime() error = %v", err)
+	}
+	defer func() {
+		if err := runtimeBundle.Close(); err != nil {
+			t.Fatalf("native runtime Close() error = %v", err)
+		}
+	}()
+
 	assessment := runtimeBundle.SupportAssessment()
-	if assessment.Class != SupportUnsupported || assessment.Cause == nil || assessment.Attempts != 0 || !assessment.CleanupSafe {
-		t.Fatalf("SupportAssessment() = %+v, want Darwin unsupported with no attempts and cleanup safe", assessment)
+	if assessment.Class != SupportUnsupported || !errors.Is(assessment.Cause, ErrNativeRuntimeSelfTestRequired) || assessment.Attempts != 0 || !assessment.CleanupSafe {
+		t.Fatalf("initial SupportAssessment() = %+v, want self-test-required with no attempts and cleanup safe", assessment)
 	}
-	support := runtimeBundle.Support()
-	if support.ParkedExec || support.VerifiedContainment || support.RuntimeProbePassed {
-		t.Fatalf("Darwin support = %+v, want strict unavailable capability flags", support)
+	if _, ok := runtimeBundle.Process().(*NativeCustodian); !ok {
+		t.Fatalf("Darwin Process() = %T, want *NativeCustodian", runtimeBundle.Process())
 	}
-	if _, ok := runtimeBundle.Process().(UnavailableCustodian); !ok {
-		t.Fatalf("Darwin Process() = %T, want UnavailableCustodian", runtimeBundle.Process())
+	support := runtimeBundle.SelfTest(context.Background())
+	if support.Assessment.Class != SupportAvailable || !support.RuntimeProbePassed || !support.ParkedExec || !support.VerifiedContainment || support.RuntimeProbeResult != nil {
+		t.Fatalf("Darwin support after SelfTest = %+v, want passed parked exec and verified containment probe", support)
+	}
+	native, ok := runtimeBundle.Process().(*NativeCustodian)
+	if !ok || native == nil {
+		t.Fatalf("Darwin Process() after SelfTest = %T, want *NativeCustodian", runtimeBundle.Process())
+	}
+	if native.selfTest.Method != model.QuiescenceTermKill {
+		t.Fatalf("Darwin self-test quiescence method = %s, want %s", native.selfTest.Method, model.QuiescenceTermKill)
 	}
 }

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 const internalNativeSelfTestFixtureCommand = "internal-native-self-test-fixture"
@@ -25,8 +27,9 @@ func (a *app) runInternalNativeSelfTestFixture(args []string, errOut io.Writer) 
 	if *markerPath == "" {
 		return commandError(errOut, fmt.Errorf("marker path is required"))
 	}
+	signal.Ignore(syscall.SIGTERM)
 	if err := os.WriteFile(*markerPath, []byte("executed\n"), 0o600); err != nil {
 		return commandError(errOut, err)
 	}
-	return 0
+	select {}
 }

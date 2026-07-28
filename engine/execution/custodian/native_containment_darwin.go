@@ -4,9 +4,9 @@ package custodian
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"runtime"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/containment"
@@ -121,13 +121,17 @@ func prepareNativeRuntimePlatformOptions(options NativeOptions) (NativeOptions, 
 }
 
 func nativeRuntimePlatformSelfTestEnabled() bool {
-	return false
+	return true
 }
 
 func nativeRuntimePlatformUnsupportedCause() error {
-	return fmt.Errorf("%w: strict unavailable on %s", ErrNativeRuntimeUnsupported, runtime.GOOS)
+	return nil
 }
 
-func nativeRuntimePlatformUnsupportedError(error) bool {
-	return false
+func nativeRuntimePlatformUnsupportedError(err error) bool {
+	return errors.Is(err, ErrNativeRuntimeUnsupported)
+}
+
+func nativeRuntimePlatformSelfTestQuiescenceMethod() model.QuiescenceMethod {
+	return model.QuiescenceTermKill
 }

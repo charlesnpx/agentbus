@@ -102,6 +102,10 @@ func nativeRuntimePlatformUnsupportedError(err error) bool {
 	return errors.Is(err, cgroup.ErrUnsupported)
 }
 
+func nativeRuntimePlatformSelfTestQuiescenceMethod() model.QuiescenceMethod {
+	return model.QuiescenceTermKill
+}
+
 type leaderNativeContainmentBackend struct {
 	factory   func(model.GroupRef) (*leaderRetention, error)
 	retention *leaderRetention
