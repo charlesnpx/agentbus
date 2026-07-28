@@ -13,11 +13,14 @@ import (
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/cgroup"
+	"github.com/charlesnpx/agentbus/internal/containment"
+	"golang.org/x/sys/unix"
 )
 
 const (
 	nativeSelfTestMaxAttempts    = 3
 	nativeSelfTestAttemptTimeout = 10 * time.Second
+	nativeSelfTestTeardownLimit  = 5 * time.Second
 	nativeSelfTestFixturePoll    = 20 * time.Millisecond
 	nativeSelfTestFixtureCommand = "internal-native-self-test-fixture"
 )
@@ -45,6 +48,11 @@ type nativeSelfTestAttemptResult struct {
 }
 
 type nativeSelfTestAttemptFunc func(context.Context, int) nativeSelfTestAttemptResult
+
+type nativeSelfTestCleanupResult struct {
+	Err         error
+	CleanupSafe bool
+}
 
 type nativePrepareFailureError struct {
 	cause           error
@@ -282,26 +290,33 @@ func (custodian *NativeCustodian) selfTestAttempt(ctx context.Context, verifier 
 
 	running, releaseOutcome, releaseErr := prepared.Release(ctx)
 	if releaseErr != nil || releaseOutcome != ReleaseAccepted || running == nil {
-		cleanErr := custodian.recoverSelfTestReleaseFailure(context.WithoutCancel(ctx), verifier, prepared, running, ref)
-		return unsafeNativeSelfTest(errors.Join(
+		recovery := custodian.recoverSelfTestReleaseFailure(context.WithoutCancel(ctx), verifier, prepared, running, ref)
+		return classifyNativeSelfTestRecoveredFailure(
 			fmt.Errorf("%w: release self-test fixture: outcome=%s err=%v", ErrNativeRuntimeSelfTestUnsafe, releaseOutcome, releaseErr),
-			cleanErr,
-		), cleanErr == nil)
+			recovery,
+		)
+	}
+	nativeRunning, ok := running.(*NativeRunningProcess)
+	if !ok || nativeRunning == nil {
+		recovery := custodian.recoverSelfTestRunningCleanup(context.WithoutCancel(ctx), verifier, running, ref)
+		return unsafeNativeSelfTest(errors.Join(
+			fmt.Errorf("%w: release self-test fixture returned %T", ErrNativeRuntimeSelfTestUnsafe, running),
+			recovery.Err,
+		), recovery.CleanupSafe)
 	}
 
 	if err := waitSelfTestFixtureExecuted(ctx, markerPath); err != nil {
-		cleanErr := custodian.recoverSelfTestRunningCleanup(context.WithoutCancel(ctx), verifier, running, ref)
-		return unsafeNativeSelfTest(errors.Join(err, cleanErr), cleanErr == nil)
+		recovery := custodian.recoverSelfTestRunningCleanup(context.WithoutCancel(ctx), verifier, nativeRunning, ref)
+		return classifyNativeSelfTestRecoveredFailure(err, recovery)
 	}
 
-	verified, cleanup, containErr := running.ContainAndVerify(ctx, QuiescenceCauseContain)
+	verified, cleanup, containErr := nativeRunning.containSelfTestActiveAndVerify(ctx, QuiescenceCauseContain)
 	if containErr != nil {
-		cleanErr := custodian.recoverSelfTestRunningCleanup(context.WithoutCancel(ctx), verifier, running, ref)
-		return unsafeNativeSelfTest(errors.Join(
+		recovery := custodian.recoverSelfTestRunningCleanup(context.WithoutCancel(ctx), verifier, nativeRunning, ref)
+		return classifyNativeSelfTestRecoveredFailure(errors.Join(
 			fmt.Errorf("%w: contain active self-test fixture: %w", ErrNativeRuntimeSelfTestUnsafe, containErr),
 			cleanup.Err,
-			cleanErr,
-		), cleanup.Err == nil && cleanErr == nil)
+		), recovery)
 	}
 	physical, err := verifySelfTestAttestation(verifier, verified, ref)
 	if err != nil {
@@ -316,12 +331,12 @@ func (custodian *NativeCustodian) selfTestAttempt(ctx context.Context, verifier 
 		return unsafeNativeSelfTest(errors.Join(err, cleanup.Err, cleanErr), false)
 	}
 	if cleanup.Err != nil {
-		cleanErr := custodian.recoverSelfTestCleanup(context.WithoutCancel(ctx), verifier, ref)
-		if cleanErr != nil {
+		recovery := custodian.recoverSelfTestCleanup(context.WithoutCancel(ctx), verifier, ref)
+		if recovery.Err != nil || !recovery.CleanupSafe {
 			return unsafeNativeSelfTest(errors.Join(
 				fmt.Errorf("%w: cleanup status: %w", ErrNativeRuntimeSelfTestUnsafe, cleanup.Err),
-				cleanErr,
-			), false)
+				recovery.Err,
+			), recovery.CleanupSafe)
 		}
 		return retryableNativeSelfTest(fmt.Errorf("%w: cleanup status: %w", ErrNativeRuntimeSelfTestRetry, cleanup.Err), true)
 	}
@@ -341,6 +356,20 @@ func (custodian *NativeCustodian) selfTestAttempt(ctx context.Context, verifier 
 		Ref:         ref,
 		ExecPath:    execSpec.Argv[0],
 	}
+}
+
+func classifyNativeSelfTestRecoveredFailure(cause error, recovery nativeSelfTestCleanupResult) nativeSelfTestAttemptResult {
+	joined := errors.Join(cause, recovery.Err)
+	if recovery.CleanupSafe && recovery.Err == nil && nativeSelfTestRecoveredFailureRetryable(cause) {
+		return retryableNativeSelfTest(fmt.Errorf("%w: recovered self-test scheduling failure: %w", ErrNativeRuntimeSelfTestRetry, cause), true)
+	}
+	return unsafeNativeSelfTest(joined, recovery.CleanupSafe)
+}
+
+func nativeSelfTestRecoveredFailureRetryable(cause error) bool {
+	return errors.Is(cause, ErrNativeRuntimeSelfTestRetry) ||
+		errors.Is(cause, context.DeadlineExceeded) ||
+		errors.Is(cause, context.Canceled)
 }
 
 func nativeSelfTestExecSpec(agentbusPath string) (command.ExecSpec, string, func(), error) {
@@ -408,7 +437,81 @@ func requireSelfTestActiveQuiescenceMethod(physical PhysicalQuiescence) error {
 	)
 }
 
-func (custodian *NativeCustodian) recoverSelfTestReleaseFailure(ctx context.Context, verifier AttestationVerifier, prepared PreparedProcess, running RunningProcess, ref model.GroupRef) error {
+func (process *NativeRunningProcess) containSelfTestActiveAndVerify(ctx context.Context, cause QuiescenceCause) (VerifiedQuiescence, CleanupStatus, error) {
+	_ = cause
+	if process == nil || process.custodian == nil {
+		return VerifiedQuiescence{}, CleanupStatus{}, fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable)
+	}
+	backend, ok := process.containment.(*retainedNativeContainmentBackend)
+	if !ok || backend == nil {
+		return process.ContainAndVerify(ctx, cause)
+	}
+	outcome := process.containRetainedSelfTestActive(ctx, backend)
+	if !outcome.Absent() {
+		return VerifiedQuiescence{}, CleanupStatus{}, physicalOutcomeError(outcome)
+	}
+	process.lifecycleMu.Lock()
+	defer process.lifecycleMu.Unlock()
+	if process.finalized {
+		return process.finalAttestationLocked()
+	}
+	return attestPhysicalOutcome(process.custodian.issuer, outcome)
+}
+
+func (process *NativeRunningProcess) containRetainedSelfTestActive(ctx context.Context, backend *retainedNativeContainmentBackend) PhysicalOutcome {
+	if process == nil || process.custodian == nil {
+		return unprovablePhysical(model.GroupRef{}, containment.ReasonInvalidInput, "", fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable))
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	process.lifecycleMu.Lock()
+	if process.finalized {
+		outcome := process.finalOutcome
+		process.lifecycleMu.Unlock()
+		return outcome
+	}
+	group := process.group
+	params := process.custodian.options.ContainmentParams
+	process.lifecycleMu.Unlock()
+
+	outcome := backend.containSelfTestRetainedActive(ctx, group, params, process.waitSelfTestLeaderReaped)
+	if outcome.Unprovable() {
+		return outcome
+	}
+
+	process.lifecycleMu.Lock()
+	defer process.lifecycleMu.Unlock()
+	if process.finalized {
+		return process.finalOutcome
+	}
+	finalOutcome, _, err := process.finalizeAbsentLocked(ctx, outcome)
+	if err != nil {
+		if !process.finalized {
+			return unprovablePhysical(process.group, containment.ReasonProbeUnprovable, outcome.Decision, err)
+		}
+		finalOutcome.Err = errors.Join(finalOutcome.Err, err)
+	}
+	return finalOutcome
+}
+
+func (process *NativeRunningProcess) waitSelfTestLeaderReaped(ctx context.Context) error {
+	if process == nil || process.handle == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	process.handle.StartWait()
+	select {
+	case <-process.handle.Done():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (custodian *NativeCustodian) recoverSelfTestReleaseFailure(ctx context.Context, verifier AttestationVerifier, prepared PreparedProcess, running RunningProcess, ref model.GroupRef) nativeSelfTestCleanupResult {
 	if running != nil {
 		return custodian.recoverSelfTestRunningCleanup(ctx, verifier, running, ref)
 	}
@@ -419,12 +522,13 @@ func (custodian *NativeCustodian) recoverSelfTestReleaseFailure(ctx context.Cont
 				err = verifyErr
 			}
 		}
-		return errors.Join(err, cleanup.Err, custodian.verifySelfTestClean(ctx, ref))
+		cleanErr := errors.Join(err, cleanup.Err, custodian.verifySelfTestClean(ctx, ref))
+		return nativeSelfTestCleanupResult{Err: cleanErr, CleanupSafe: cleanErr == nil}
 	}
 	return custodian.recoverSelfTestCleanup(ctx, verifier, ref)
 }
 
-func (custodian *NativeCustodian) recoverSelfTestRunningCleanup(ctx context.Context, verifier AttestationVerifier, running RunningProcess, ref model.GroupRef) error {
+func (custodian *NativeCustodian) recoverSelfTestRunningCleanup(ctx context.Context, verifier AttestationVerifier, running RunningProcess, ref model.GroupRef) nativeSelfTestCleanupResult {
 	if running == nil {
 		return custodian.recoverSelfTestCleanup(ctx, verifier, ref)
 	}
@@ -434,21 +538,98 @@ func (custodian *NativeCustodian) recoverSelfTestRunningCleanup(ctx context.Cont
 			err = verifyErr
 		}
 	}
-	return errors.Join(err, cleanup.Err, custodian.verifySelfTestClean(ctx, ref))
+	recoveryErr := errors.Join(err, cleanup.Err, custodian.verifySelfTestClean(ctx, ref))
+	if recoveryErr == nil {
+		return nativeSelfTestCleanupResult{CleanupSafe: true}
+	}
+	lastResortErr := custodian.lastResortSelfTestTeardown(ctx, running, ref)
+	if lastResortErr == nil {
+		return nativeSelfTestCleanupResult{Err: recoveryErr, CleanupSafe: true}
+	}
+	return nativeSelfTestCleanupResult{Err: errors.Join(recoveryErr, lastResortErr), CleanupSafe: false}
 }
 
-func (custodian *NativeCustodian) recoverSelfTestCleanup(ctx context.Context, verifier AttestationVerifier, ref model.GroupRef) error {
+func (custodian *NativeCustodian) recoverSelfTestCleanup(ctx context.Context, verifier AttestationVerifier, ref model.GroupRef) nativeSelfTestCleanupResult {
 	verified, cleanup, err := custodian.ContainAndVerify(ctx, ref, QuiescenceCauseRecovery)
 	if err != nil {
-		return errors.Join(err, cleanup.Err)
+		cleanErr := errors.Join(err, cleanup.Err)
+		return nativeSelfTestCleanupResult{Err: cleanErr, CleanupSafe: false}
 	}
 	if _, err := verifySelfTestAttestation(verifier, verified, ref); err != nil {
-		return err
+		return nativeSelfTestCleanupResult{Err: err, CleanupSafe: false}
 	}
 	if cleanup.Err != nil {
-		return cleanup.Err
+		return nativeSelfTestCleanupResult{Err: cleanup.Err, CleanupSafe: false}
 	}
-	return custodian.verifySelfTestClean(ctx, ref)
+	cleanErr := custodian.verifySelfTestClean(ctx, ref)
+	return nativeSelfTestCleanupResult{Err: cleanErr, CleanupSafe: cleanErr == nil}
+}
+
+func (custodian *NativeCustodian) lastResortSelfTestTeardown(ctx context.Context, running RunningProcess, ref model.GroupRef) error {
+	nativeRunning, ok := running.(*NativeRunningProcess)
+	if !ok || nativeRunning == nil {
+		return fmt.Errorf("last-resort self-test teardown requires native running process, got %T", running)
+	}
+	return nativeRunning.lastResortSelfTestTeardown(ctx, ref)
+}
+
+func (process *NativeRunningProcess) lastResortSelfTestTeardown(ctx context.Context, ref model.GroupRef) error {
+	if process == nil || process.custodian == nil {
+		return fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	teardownCtx := context.WithoutCancel(ctx)
+	teardownCtx, cancel := context.WithTimeout(teardownCtx, nativeSelfTestTeardownLimit)
+	defer cancel()
+
+	if err := signalSelfTestFixtureSIGKILL(ref); err != nil {
+		return err
+	}
+	if err := process.waitSelfTestLeaderReaped(teardownCtx); err != nil {
+		return fmt.Errorf("last-resort self-test reap: %w", err)
+	}
+
+	var finalizeErr error
+	process.lifecycleMu.Lock()
+	if !process.finalized {
+		outcome := PhysicalOutcome{
+			Kind:     PhysicalOutcomeAbsent,
+			Group:    ref,
+			Method:   model.QuiescenceTermKill,
+			Decision: model.SignalDirectly,
+		}
+		_, _, finalizeErr = process.finalizeAbsentLocked(teardownCtx, outcome)
+	} else {
+		finalizeErr = process.finalErr
+	}
+	process.lifecycleMu.Unlock()
+	if finalizeErr != nil {
+		return fmt.Errorf("last-resort self-test finalize: %w", finalizeErr)
+	}
+
+	if err := process.custodian.verifySelfTestClean(teardownCtx, ref); err != nil {
+		return fmt.Errorf("last-resort self-test cleanup proof: %w", err)
+	}
+	return nil
+}
+
+func signalSelfTestFixtureSIGKILL(ref model.GroupRef) error {
+	if err := ref.Validate(); err != nil {
+		return err
+	}
+	var signalErr error
+	if err := unix.Kill(-ref.PGID, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+		signalErr = errors.Join(signalErr, fmt.Errorf("kill self-test process group %d: %w", ref.PGID, err))
+	}
+	leader, err := observeNativeLeader(ref)
+	if err == nil && leader.Identity == model.ProcessIdentityMatching {
+		if err := unix.Kill(ref.Leader.PID, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+			signalErr = errors.Join(signalErr, fmt.Errorf("kill self-test leader pid %d: %w", ref.Leader.PID, err))
+		}
+	}
+	return signalErr
 }
 
 func (custodian *NativeCustodian) verifySelfTestClean(ctx context.Context, ref model.GroupRef) error {
