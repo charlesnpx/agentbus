@@ -50,16 +50,17 @@ type backendSpec struct {
 }
 
 type app struct {
-	version        string
-	stateRoot      string
-	cwd            string
-	setupCachePath string
-	backends       []backendSpec
-	registry       *engine.PolicyRegistry
-	processes      engine.ProcessTable
-	clock          engine.Clock
-	daemonLauncher func(context.Context, daemonlaunch.Options) (daemonlaunch.Result, error)
-	clientConnect  func(context.Context, agentclient.Options) (protocolClient, error)
+	version              string
+	stateRoot            string
+	cwd                  string
+	setupCachePath       string
+	backends             []backendSpec
+	registry             *engine.PolicyRegistry
+	processes            engine.ProcessTable
+	clock                engine.Clock
+	daemonLauncher       func(context.Context, daemonlaunch.Options) (daemonlaunch.Result, error)
+	clientConnect        func(context.Context, agentclient.Options) (protocolClient, error)
+	recoverAdmissionRoot func(context.Context, agentbusserve.Config) (agentbusserve.AdmissionRecoveryReport, error)
 }
 
 type protocolClient interface {
@@ -298,7 +299,11 @@ func (a *app) runAdmissionRecover(ctx context.Context, args []string, out, errOu
 	if *stateRoot == "" {
 		return admissionUsageError(errOut, "recover requires --state-root <path>")
 	}
-	report, err := agentbusserve.RecoverAdmissionRoot(ctx, agentbusserve.Config{
+	recoverAdmissionRoot := a.recoverAdmissionRoot
+	if recoverAdmissionRoot == nil {
+		recoverAdmissionRoot = agentbusserve.RecoverAdmissionRoot
+	}
+	report, err := recoverAdmissionRoot(ctx, agentbusserve.Config{
 		StateRoot: *stateRoot,
 		CWD:       a.cwd,
 	})

@@ -209,7 +209,10 @@ The committed CI scripts are under `scripts/ci/`:
   strict production tests.
 - `fail-closed.sh` runs the macOS supported process-group custody lane, the
   restricted-Linux process-group fallback serving lane, and typed fail-closed
-  checks for genuine no-basic-supervision and incompatible contract cases.
+  checks for genuine no-basic-supervision and incompatible contract cases. The
+  gate does not set `AGENTBUS_TEST_SANDBOX_BIND_DENIED`; Unix-socket bind
+  denial is a failure unless a developer explicitly opts into that local
+  sandbox skip.
 - `vuln.sh` installs the pinned `govulncheck` version and scans `./...`.
 
 The merge criterion is remote-green on the exact candidate SHA once GitHub

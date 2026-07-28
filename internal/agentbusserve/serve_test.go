@@ -102,7 +102,7 @@ func TestProductionServeLauncherServesOnDarwinFreshRoot(t *testing.T) {
 	root := filepath.Join(parent, "state")
 	result, err := daemonlaunch.Launch(context.Background(), realAgentbusServeLaunchOptions(t, root))
 	if err != nil {
-		skipIfAgentbusServeBindDenied(t, err)
+		failOrSkipAgentbusServeBindDenied(t, "production serve launcher fresh root", err)
 		t.Fatalf("Launch error = %v", err)
 	}
 	stopped := false
@@ -132,7 +132,7 @@ func TestProductionServeLauncherServesFromExistingRootOnDarwin(t *testing.T) {
 	}
 	result, err := daemonlaunch.Launch(context.Background(), realAgentbusServeLaunchOptions(t, root))
 	if err != nil {
-		skipIfAgentbusServeBindDenied(t, err)
+		failOrSkipAgentbusServeBindDenied(t, "production serve launcher existing root", err)
 		t.Fatalf("Launch error = %v", err)
 	}
 	stopped := false
@@ -146,8 +146,12 @@ func TestProductionServeLauncherServesFromExistingRootOnDarwin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.Mode().Perm() != before.Mode().Perm() {
-		t.Fatalf("state root mode = %o, want unchanged %o", after.Mode().Perm(), before.Mode().Perm())
+	// The daemon deliberately tightens the state root to owner-only (0700) during
+	// serve (served/server.go socket-security hardening): the root holds the
+	// socket, token, and repository. An existing looser mode is tightened, never
+	// loosened.
+	if after.Mode().Perm() != 0o700 {
+		t.Fatalf("state root mode = %o, want daemon-tightened 0700 (was %o before serve)", after.Mode().Perm(), before.Mode().Perm())
 	}
 	_ = result.KillAndWait()
 	stopped = true
@@ -755,9 +759,7 @@ func TestServeLauncherDaemonSurvivesStartupDeadline(t *testing.T) {
 		Env:         os.Environ(),
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "bind: operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
-		}
+		failOrSkipAgentbusServeBindDenied(t, "startup deadline launcher", err)
 		t.Fatalf("Launch error = %v", err)
 	}
 	stopped := false
@@ -1009,11 +1011,22 @@ func realAgentbusServeLaunchOptions(t *testing.T, root string) daemonlaunch.Opti
 	}
 }
 
-func skipIfAgentbusServeBindDenied(t *testing.T, err error) {
+func failOrSkipAgentbusServeBindDenied(t *testing.T, context string, err error) {
 	t.Helper()
-	if err != nil && strings.Contains(err.Error(), "bind: operation not permitted") {
-		t.Skipf("Unix socket bind denied by sandbox: %v", err)
+	if err == nil || !agentbusServeBindDeniedOutput(err.Error()) {
+		return
 	}
+	if strings.TrimSpace(os.Getenv("AGENTBUS_TEST_SANDBOX_BIND_DENIED")) == "1" {
+		t.Skipf("Unix socket bind denied by sandbox in %s (AGENTBUS_TEST_SANDBOX_BIND_DENIED=1): %v", context, err)
+	}
+	t.Fatalf("Unix socket bind denied in %s without AGENTBUS_TEST_SANDBOX_BIND_DENIED=1; failing to expose daemon bind regressions: %v", context, err)
+}
+
+func agentbusServeBindDeniedOutput(output string) bool {
+	output = strings.ToLower(output)
+	return strings.Contains(output, "bind: operation not permitted") ||
+		strings.Contains(output, "bind: permission denied") ||
+		strings.Contains(output, "unix socket bind denied by sandbox")
 }
 
 func assertAgentbusServeReady(t *testing.T, root string, result daemonlaunch.Result) {
@@ -1032,10 +1045,10 @@ func assertAgentbusServeReady(t *testing.T, root string, result daemonlaunch.Res
 		t.Fatalf("connect after readiness: %v", err)
 	}
 	defer client.Close()
-	hello, err := client.Hello(clientCtx)
-	if err != nil {
-		t.Fatalf("hello after readiness: %v", err)
-	}
+	// Connect already performed the protocol.hello handshake (and rejects a
+	// version mismatch typed, per the ADR-12 client contract); a second explicit
+	// Hello on the same connection is a protocol error. Assert the cached result.
+	hello := client.HelloResult()
 	if hello.ProtocolVersion != protocol.Version {
 		t.Fatalf("hello protocolVersion = %d, want %d", hello.ProtocolVersion, protocol.Version)
 	}

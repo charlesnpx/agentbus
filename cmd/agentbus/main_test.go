@@ -14,6 +14,7 @@ import (
 	agentclient "github.com/charlesnpx/agentbus/client"
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/internal/agentbusserve"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
@@ -283,6 +284,37 @@ func TestAdmissionCLIInspectResetAndSealFlags(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "Multi-root read/cancel/result routing is out of scope in this first release.") {
 		t.Fatalf("admission help missing limitation sentence: %s", stdout)
+	}
+}
+
+func TestAdmissionRecoverTextReportIncludesADR13Counts(t *testing.T) {
+	t.Parallel()
+	a := testApp(t)
+	root := filepath.Join(t.TempDir(), "admission-root")
+	a.recoverAdmissionRoot = func(_ context.Context, cfg agentbusserve.Config) (agentbusserve.AdmissionRecoveryReport, error) {
+		if cfg.StateRoot != root {
+			t.Errorf("recover state root = %q, want %q", cfg.StateRoot, root)
+		}
+		return agentbusserve.AdmissionRecoveryReport{
+			Mode:               "recovery_only",
+			WorkItems:          1,
+			QuiescedLaunches:   2,
+			FinalizedJobs:      3,
+			OrphanedJobs:       4,
+			UnresolvedLaunches: 5,
+			CleanupWarnings:    6,
+			RecoveryPasses:     7,
+		}, nil
+	}
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"admission", "recover", "--state-root", root}, "")
+	if code != 0 {
+		t.Fatalf("recover exit=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	for _, want := range []string{"orphanedJobs=4", "unresolvedLaunches=5", "cleanupWarnings=6"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("recover text report = %q, want %q", stdout, want)
+		}
 	}
 }
 

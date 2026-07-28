@@ -398,8 +398,8 @@ func TestRetryableCgroupLeaseContentionCanConvergeOnDialableDaemon(t *testing.T)
 	socketPath := filepath.Join(root, protocol.SocketName)
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		if strings.Contains(err.Error(), "bind: operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		if servedTestBindDeniedOutput(err.Error()) {
+			servedTestSkipOrFailBindDenied(t, "retryable cgroup lease listener", err)
 		}
 		t.Fatal(err)
 	}

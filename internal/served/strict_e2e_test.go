@@ -153,7 +153,7 @@ func connectProductionStrictClient(t *testing.T, stateRoot string, serveDone <-c
 		select {
 		case err := <-serveDone:
 			if productionStrictBindDeniedE2B(buffersString(stderr...)) {
-				t.Skipf("Unix socket bind denied by sandbox in production strict daemon: %v", err)
+				servedTestSkipOrFailBindDenied(t, "production strict daemon", err)
 			}
 			t.Fatalf("Serve exited before client connection: %v", err)
 		default:

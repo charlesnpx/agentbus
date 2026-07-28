@@ -1894,7 +1894,7 @@ func waitServedNativeHelperFiles(t *testing.T, paths []string, helper *servedNat
 		select {
 		case err := <-helper.done:
 			if servedNativeHelperBindDenied(helper.output.String()) {
-				t.Skipf("Unix socket bind denied by sandbox in daemon helper: %v", err)
+				servedTestSkipOrFailBindDeniedf(t, "daemon helper", "%v\n%s\noutput:\n%s", err, helper.diagnostics(paths, err), helper.output.String())
 			}
 			t.Fatalf("daemon helper exited before markers were ready: %v\n%s\noutput:\n%s", err, helper.diagnostics(paths, err), helper.output.String())
 		default:
@@ -1915,7 +1915,7 @@ func waitServedNativeHelperFiles(t *testing.T, paths []string, helper *servedNat
 }
 
 func servedNativeHelperBindDenied(output string) bool {
-	return strings.Contains(output, "bind: operation not permitted") || strings.Contains(output, "Unix socket bind denied by sandbox")
+	return servedTestBindDeniedOutput(output)
 }
 
 func (helper *servedNativeDaemonHelper) diagnostics(paths []string, waitErr error) string {

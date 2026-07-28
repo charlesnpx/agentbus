@@ -613,7 +613,7 @@ func launchProductionStrictDaemonE2B(t *testing.T, agentbusPath, stateRoot strin
 	})
 	if err != nil {
 		if productionStrictBindDeniedE2B(err.Error()) {
-			t.Skipf("Unix socket bind denied by sandbox in production strict daemon: %v", err)
+			servedTestSkipOrFailBindDenied(t, "production strict daemon", err)
 		}
 		t.Fatalf("launch production strict daemon: %v", err)
 	}
@@ -657,7 +657,7 @@ func connectProductionStrictForegroundClientE2B(t *testing.T, stateRoot string, 
 		select {
 		case err := <-daemon.done:
 			if productionStrictBindDeniedE2B(daemon.stderr.String()) {
-				t.Skipf("Unix socket bind denied by sandbox in foreground daemon: %v", err)
+				servedTestSkipOrFailBindDeniedf(t, "foreground daemon", "%v\nstdout=%s\nstderr=%s", err, daemon.stdout.String(), daemon.stderr.String())
 			}
 			t.Fatalf("Serve exited before client connection: %v\nstdout=%s\nstderr=%s", err, daemon.stdout.String(), daemon.stderr.String())
 		default:
@@ -680,9 +680,7 @@ func connectProductionStrictForegroundClientE2B(t *testing.T, stateRoot string, 
 }
 
 func productionStrictBindDeniedE2B(output string) bool {
-	return strings.Contains(output, "bind: operation not permitted") ||
-		strings.Contains(output, "bind: permission denied") ||
-		strings.Contains(output, "Unix socket bind denied by sandbox")
+	return servedTestBindDeniedOutput(output)
 }
 
 func writeProductionStrictOwnerPIDFileE2B(t *testing.T, stateRoot string, pid int) {
@@ -855,7 +853,7 @@ func runProductionStrictJobCLI(t *testing.T, agentbusPath, stateRoot string, env
 	result := productionStrictCLIResultE2B{code: code, stdout: stdout.String(), stderr: stderr.String()}
 	if result.code != wantCode {
 		if productionStrictBindDeniedE2B(result.stderr) {
-			t.Skipf("Unix socket bind denied by sandbox in agentbus %s: %s", strings.Join(args, " "), result.stderr)
+			servedTestSkipOrFailBindDeniedf(t, "agentbus "+strings.Join(args, " "), "stderr=%s", result.stderr)
 		}
 		t.Fatalf("agentbus %s exit=%d want=%d\nstdout=%s\nstderr=%s", strings.Join(args, " "), result.code, wantCode, result.stdout, result.stderr)
 	}

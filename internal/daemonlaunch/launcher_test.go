@@ -136,8 +136,11 @@ func TestLaunchAlreadyListeningVerifiesWinner(t *testing.T) {
 	socketPath := filepath.Join(root, protocol.SocketName)
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		if strings.Contains(err.Error(), "operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		if launchTestBindDeniedOutput(err.Error()) {
+			if strings.TrimSpace(os.Getenv("AGENTBUS_TEST_SANDBOX_BIND_DENIED")) == "1" {
+				t.Skipf("Unix socket bind denied by sandbox (AGENTBUS_TEST_SANDBOX_BIND_DENIED=1): %v", err)
+			}
+			t.Fatalf("Unix socket bind denied without AGENTBUS_TEST_SANDBOX_BIND_DENIED=1; failing to expose daemon bind regressions: %v", err)
 		}
 		t.Fatal(err)
 	}
@@ -157,6 +160,13 @@ func TestLaunchAlreadyListeningVerifiesWinner(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("winner did not receive authenticated hello")
 	}
+}
+
+func launchTestBindDeniedOutput(output string) bool {
+	output = strings.ToLower(output)
+	return strings.Contains(output, "bind: operation not permitted") ||
+		strings.Contains(output, "bind: permission denied") ||
+		strings.Contains(output, "unix socket bind denied by sandbox")
 }
 
 func TestLaunchFailedRecordSurfacesReapError(t *testing.T) {

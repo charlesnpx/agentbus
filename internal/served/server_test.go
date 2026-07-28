@@ -470,8 +470,8 @@ func TestListenUnixSocketPrivateChmodsBeforeListen(t *testing.T) {
 
 	ln, identity, err := server.listen()
 	if err != nil {
-		if strings.Contains(err.Error(), "bind: operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		if servedTestBindDeniedOutput(err.Error()) {
+			servedTestSkipOrFailBindDenied(t, "server listen", err)
 		}
 		t.Fatal(err)
 	}
@@ -538,8 +538,8 @@ func TestListenUnixSocketPrivateDetectsPreListenPathReplacement(t *testing.T) {
 		_ = ln.Close()
 		t.Fatal("listen succeeded after pre-listen socket replacement")
 	}
-	if strings.Contains(err.Error(), "bind: operation not permitted") {
-		t.Skipf("Unix socket bind denied by sandbox: %v", err)
+	if servedTestBindDeniedOutput(err.Error()) {
+		servedTestSkipOrFailBindDenied(t, "server listen replacement", err)
 	}
 	if !hookCalled {
 		t.Fatal("before-listen hook was not called")
@@ -6853,8 +6853,8 @@ func waitForServerReady(t *testing.T, ready <-chan struct{}, done <-chan error) 
 	select {
 	case <-ready:
 	case err := <-done:
-		if err != nil && strings.Contains(err.Error(), "bind: operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		if err != nil && servedTestBindDeniedOutput(err.Error()) {
+			servedTestSkipOrFailBindDenied(t, "server ready wait", err)
 		}
 		t.Fatalf("server exited before ready hook: %v", err)
 	case <-time.After(5 * time.Second):
@@ -6962,8 +6962,8 @@ func waitForSocket(t *testing.T, socketPath string, done <-chan error) {
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-done:
-			if err != nil && strings.Contains(err.Error(), "bind: operation not permitted") {
-				t.Skipf("Unix socket bind denied by sandbox: %v", err)
+			if err != nil && servedTestBindDeniedOutput(err.Error()) {
+				servedTestSkipOrFailBindDenied(t, "socket ready wait", err)
 			}
 			t.Fatalf("server exited before socket was ready: %v", err)
 		default:
