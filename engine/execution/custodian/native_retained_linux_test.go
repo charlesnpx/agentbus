@@ -177,17 +177,18 @@ func TestNewNativeRuntimeSelfTestUsesReturnedSingleLeaseInstance(t *testing.T) {
 	}
 
 	second, secondErr := NewNativeRuntime(options)
-	if secondErr != nil {
-		t.Fatalf("second NewNativeRuntime() while first is open error = %v, want construction to succeed before per-launch selection", secondErr)
-	}
-	secondAssessment := second.SelfTest(ctx).Assessment
-	if secondAssessment.Class != SupportRetryable || secondAssessment.Attempts != 3 || !secondAssessment.CleanupSafe || !errors.Is(secondAssessment.Cause, cgroup.ErrRootLeaseUnavailable) {
+	secondAssessment := second.SupportAssessment()
+	if !errors.Is(secondErr, cgroup.ErrRootLeaseUnavailable) {
 		_ = second.Close()
-		t.Fatalf("second SelfTest() = %+v, want retryable attempts=3 cleanup-safe ErrRootLeaseUnavailable cause", secondAssessment)
+		t.Fatalf("second NewNativeRuntime() while first is open error = %v, want ErrRootLeaseUnavailable", secondErr)
 	}
-	if _, ok := second.Process().(*NativeCustodian); !ok {
+	if secondAssessment.Class != SupportRetryable || secondAssessment.Attempts != 1 || !secondAssessment.CleanupSafe || !errors.Is(secondAssessment.Cause, cgroup.ErrRootLeaseUnavailable) {
 		_ = second.Close()
-		t.Fatalf("second NewNativeRuntime() process = %T, want *NativeCustodian", second.Process())
+		t.Fatalf("second SupportAssessment() = %+v, want construction retryable attempts=1 cleanup-safe ErrRootLeaseUnavailable cause", secondAssessment)
+	}
+	if _, ok := second.Process().(UnavailableCustodian); !ok {
+		_ = second.Close()
+		t.Fatalf("second NewNativeRuntime() process = %T, want UnavailableCustodian after construction contention", second.Process())
 	}
 	if err := second.Close(); err != nil {
 		t.Fatalf("second native runtime Close() error = %v", err)

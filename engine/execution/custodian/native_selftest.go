@@ -110,6 +110,13 @@ func nativeRuntimeConstructionAssessment(cause error) SupportAssessment {
 	}
 }
 
+func nativeCgroupConstructionFallbackAllowed(cause error) bool {
+	if cause == nil || errors.Is(cause, cgroup.ErrRootLeaseUnavailable) {
+		return false
+	}
+	return errors.Is(cause, cgroup.ErrUnsupported)
+}
+
 func (custodian *NativeCustodian) SelfTest(ctx context.Context, verifier AttestationVerifier) SupportAssessment {
 	if ctx == nil {
 		ctx = context.Background()

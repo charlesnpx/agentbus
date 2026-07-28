@@ -87,7 +87,27 @@ func platformBindContainmentTarget(ctx context.Context, real RealContainment, gr
 }
 
 func prepareNativeRuntimePlatformOptions(options NativeOptions) (NativeOptions, func() error, error) {
-	return options, nil, nil
+	if options.newRetainedGroup != nil {
+		return options, nil, nil
+	}
+	manager, err := cgroup.New("")
+	if err != nil {
+		if nativeCgroupConstructionFallbackAllowed(err) {
+			return options, nil, nil
+		}
+		return options, nil, err
+	}
+	if err := manager.HoldRootLease(context.Background()); err != nil {
+		closeErr := manager.Close()
+		if nativeCgroupConstructionFallbackAllowed(err) && closeErr == nil {
+			return options, nil, nil
+		}
+		return options, nil, errors.Join(err, closeErr)
+	}
+	options.newRetainedGroup = func() (containment.RetainedGroupObject, error) {
+		return manager, nil
+	}
+	return options, manager.Close, nil
 }
 
 func nativeRuntimePlatformSelfTestEnabled() bool {

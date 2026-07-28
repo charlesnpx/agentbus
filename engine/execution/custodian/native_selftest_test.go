@@ -224,6 +224,47 @@ func TestNativeRuntimeConstructionContentionIsSingleShotRetryable(t *testing.T) 
 	}
 }
 
+func TestNativeCgroupConstructionFallbackClassification(t *testing.T) {
+	tests := []struct {
+		name         string
+		cause        error
+		wantFallback bool
+	}{
+		{
+			name:         "nil",
+			cause:        nil,
+			wantFallback: false,
+		},
+		{
+			name:         "unsupported cgroup",
+			cause:        fmt.Errorf("cgroup absent: %w", cgroup.ErrUnsupported),
+			wantFallback: true,
+		},
+		{
+			name:         "root lease contention",
+			cause:        fmt.Errorf("root already leased: %w", cgroup.ErrRootLeaseUnavailable),
+			wantFallback: false,
+		},
+		{
+			name:         "contention wins over unsupported",
+			cause:        errors.Join(cgroup.ErrUnsupported, cgroup.ErrRootLeaseUnavailable),
+			wantFallback: false,
+		},
+		{
+			name:         "ordinary unsafe error",
+			cause:        errors.New("retained root changed unexpectedly"),
+			wantFallback: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nativeCgroupConstructionFallbackAllowed(tt.cause); got != tt.wantFallback {
+				t.Fatalf("nativeCgroupConstructionFallbackAllowed(%v) = %t, want %t", tt.cause, got, tt.wantFallback)
+			}
+		})
+	}
+}
+
 func TestNativeSelfTestExecSpecUsesCurrentExecutable(t *testing.T) {
 	spec, markerPath, cleanup, err := nativeSelfTestExecSpec()
 	if err != nil {
