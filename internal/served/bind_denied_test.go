@@ -18,7 +18,7 @@ func servedTestBindDeniedOutput(output string) bool {
 
 func servedTestSkipOrFailBindDenied(t *testing.T, context string, detail any) {
 	t.Helper()
-	if strings.TrimSpace(os.Getenv(servedTestSandboxBindDeniedEnv)) == "1" {
+	if os.Getenv(servedTestSandboxBindDeniedEnv) == "1" {
 		t.Skipf("Unix socket bind denied by sandbox in %s (%s=1): %v", context, servedTestSandboxBindDeniedEnv, detail)
 	}
 	t.Fatalf("Unix socket bind denied in %s without %s=1; failing to expose daemon bind regressions: %v", context, servedTestSandboxBindDeniedEnv, detail)

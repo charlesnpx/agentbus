@@ -137,7 +137,7 @@ func TestLaunchAlreadyListeningVerifiesWinner(t *testing.T) {
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		if launchTestBindDeniedOutput(err.Error()) {
-			if strings.TrimSpace(os.Getenv("AGENTBUS_TEST_SANDBOX_BIND_DENIED")) == "1" {
+			if os.Getenv("AGENTBUS_TEST_SANDBOX_BIND_DENIED") == "1" {
 				t.Skipf("Unix socket bind denied by sandbox (AGENTBUS_TEST_SANDBOX_BIND_DENIED=1): %v", err)
 			}
 			t.Fatalf("Unix socket bind denied without AGENTBUS_TEST_SANDBOX_BIND_DENIED=1; failing to expose daemon bind regressions: %v", err)

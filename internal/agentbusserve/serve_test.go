@@ -1016,7 +1016,7 @@ func failOrSkipAgentbusServeBindDenied(t *testing.T, context string, err error) 
 	if err == nil || !agentbusServeBindDeniedOutput(err.Error()) {
 		return
 	}
-	if strings.TrimSpace(os.Getenv("AGENTBUS_TEST_SANDBOX_BIND_DENIED")) == "1" {
+	if os.Getenv("AGENTBUS_TEST_SANDBOX_BIND_DENIED") == "1" {
 		t.Skipf("Unix socket bind denied by sandbox in %s (AGENTBUS_TEST_SANDBOX_BIND_DENIED=1): %v", context, err)
 	}
 	t.Fatalf("Unix socket bind denied in %s without AGENTBUS_TEST_SANDBOX_BIND_DENIED=1; failing to expose daemon bind regressions: %v", context, err)

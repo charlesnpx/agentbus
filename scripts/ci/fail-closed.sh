@@ -21,6 +21,9 @@ if [[ "$MODE" == "auto" ]]; then
   esac
 fi
 
+restricted_stage=""
+restricted_pid=""
+
 run() {
   printf '\n==> %s\n' "$*"
   "$@"
@@ -37,6 +40,30 @@ assert_process_absent() {
     printf 'fail-closed: process %s is still present\n' "$pid" >&2
     return 1
   fi
+}
+
+cleanup_restricted() {
+  local cleanup_status=0
+  if [[ -n "$restricted_pid" ]] && kill -0 "$restricted_pid" >/dev/null 2>&1; then
+    kill -TERM "$restricted_pid" >/dev/null 2>&1 || true
+    if ! assert_process_absent "$restricted_pid"; then
+      cleanup_status=1
+    fi
+  fi
+  restricted_pid=""
+  if [[ -n "$restricted_stage" ]]; then
+    if ! rm -rf -- "$restricted_stage"; then
+      cleanup_status=1
+    fi
+  fi
+  restricted_stage=""
+  return "$cleanup_status"
+}
+
+cleanup_restricted_trap() {
+  local status=$?
+  cleanup_restricted || status=$?
+  exit "$status"
 }
 
 assert_restricted_cgroup_unavailable() {
@@ -251,43 +278,32 @@ run_darwin() {
 }
 
 run_linux_restricted() {
-  local stage bin state_root stdout stderr pid code version fake_bin_dir fake_codex cwd job_file submit_go verify_go helper_stdout helper_stderr job_id
+  local bin state_root stdout stderr code version fake_bin_dir fake_codex cwd job_file submit_go verify_go helper_stdout helper_stderr job_id
   if [[ "$(go env GOOS)" != "linux" ]]; then
     printf 'fail-closed: linux-restricted mode requires GOOS=linux, got %s\n' "$(go env GOOS)" >&2
     exit 2
   fi
   run go test ./engine/execution/custodian ./internal/served ./internal/agentbusserve -run 'Test(LinuxNativeContainmentBackendSelection|NativeCgroupConstructionFallbackClassification|DefaultStrictServeRejectsUnavailableRuntimeBeforeListen|StrictRequestedUnavailableRuntimeFailsStartupWithSupportDiagnostic|BootstrapAdmissionStrictRuntimeFailurePrecedesRepositoryOpen|ProductionServedConfigSelectsNativeStrictRuntime|ActivatedBboltV1RootFailsTypedBeforeSocketBindAndLeavesFileUntouched)' -count=1
 
-  stage=$(mktemp -d "${TMPDIR:-/tmp}/agentbus-fail-closed.XXXXXX")
-  bin="$stage/agentbus"
-  state_root="$stage/state"
-  stdout="$stage/stdout.log"
-  stderr="$stage/stderr.log"
-  helper_stdout="$stage/helper.stdout"
-  helper_stderr="$stage/helper.stderr"
-  job_file="$stage/job-id"
-  cwd="$stage/workspace"
-  fake_bin_dir="$stage/fake-bin"
+  restricted_stage=$(mktemp -d "${TMPDIR:-/tmp}/agentbus-fail-closed.XXXXXX")
+  bin="$restricted_stage/agentbus"
+  state_root="$restricted_stage/state"
+  stdout="$restricted_stage/stdout.log"
+  stderr="$restricted_stage/stderr.log"
+  helper_stdout="$restricted_stage/helper.stdout"
+  helper_stderr="$restricted_stage/helper.stderr"
+  job_file="$restricted_stage/job-id"
+  cwd="$restricted_stage/workspace"
+  fake_bin_dir="$restricted_stage/fake-bin"
   fake_codex="$fake_bin_dir/codex"
-  submit_go="$stage/restricted_submit.go"
-  verify_go="$stage/restricted_verify.go"
+  submit_go="$restricted_stage/restricted_submit.go"
+  verify_go="$restricted_stage/restricted_verify.go"
   version=$(tr -d '[:space:]' <"$ROOT/VERSION")
-  pid=""
-  cleanup() {
-    if [[ -n "${pid:-}" ]] && kill -0 "$pid" >/dev/null 2>&1; then
-      kill -TERM "$pid" >/dev/null 2>&1 || true
-      assert_process_absent "$pid" || true
-    fi
-    # stage is a function local; the EXIT trap can fire after it left scope
-    # (set -u would abort on the bare reference).
-    if [[ -n "${stage:-}" ]]; then
-      rm -rf -- "$stage"
-    fi
-  }
-  trap cleanup EXIT
+  restricted_pid=""
+  trap cleanup_restricted_trap EXIT
 
-  mkdir -p -- "$fake_bin_dir" "$stage/home" "$stage/codex-home" "$cwd"
-  assert_restricted_cgroup_unavailable "$stage"
+  mkdir -p -- "$fake_bin_dir" "$restricted_stage/home" "$restricted_stage/codex-home" "$cwd"
+  assert_restricted_cgroup_unavailable "$restricted_stage"
   write_restricted_fake_codex "$fake_codex"
   write_restricted_setup_cache "$state_root" "$fake_codex"
   write_restricted_submit_program "$submit_go"
@@ -296,7 +312,7 @@ run_linux_restricted() {
 
   printf '\n==> restricted Linux exact-binary process-group fallback smoke\n'
   set +e
-  PATH="$fake_bin_dir:/usr/bin:/bin" HOME="$stage/home" XDG_CACHE_HOME="$stage/home/cache" CODEX_HOME="$stage/codex-home" AGENTBUS_STATE_ROOT="$state_root" "$bin" status --job job_linux_fallback --json >"$stdout" 2>"$stderr"
+  PATH="$fake_bin_dir:/usr/bin:/bin" HOME="$restricted_stage/home" XDG_CACHE_HOME="$restricted_stage/home/cache" CODEX_HOME="$restricted_stage/codex-home" AGENTBUS_STATE_ROOT="$state_root" "$bin" status --job job_linux_fallback --json >"$stdout" 2>"$stderr"
   code=$?
   set -e
   if [[ "$code" -ne 10 ]]; then
@@ -311,9 +327,9 @@ run_linux_restricted() {
     printf 'fail-closed: restricted Linux fallback did not leave a serving state root\nstdout=%s\nstderr=%s\nstate entries:\n%s\n' "$(cat "$stdout")" "$(cat "$stderr")" "$(find "$state_root" -mindepth 1 -maxdepth 1 -print | sort)" >&2
     return 1
   fi
-  pid=$(tr -d '[:space:]' <"$state_root/agentbus.pid")
-  if ! kill -0 "$pid" >/dev/null 2>&1; then
-    printf 'fail-closed: restricted Linux fallback daemon pid %s is not alive\nstdout=%s\nstderr=%s\n' "$pid" "$(cat "$stdout")" "$(cat "$stderr")" >&2
+  restricted_pid=$(tr -d '[:space:]' <"$state_root/agentbus.pid")
+  if ! kill -0 "$restricted_pid" >/dev/null 2>&1; then
+    printf 'fail-closed: restricted Linux fallback daemon pid %s is not alive\nstdout=%s\nstderr=%s\n' "$restricted_pid" "$(cat "$stdout")" "$(cat "$stderr")" >&2
     return 1
   fi
 
@@ -327,15 +343,15 @@ run_linux_restricted() {
     printf 'fail-closed: restricted Linux submit did not report a job id\nstderr=%s\n' "$(cat "$helper_stderr")" >&2
     return 1
   fi
-  kill -TERM "$pid" >/dev/null 2>&1 || true
-  assert_process_absent "$pid"
+  kill -TERM "$restricted_pid" >/dev/null 2>&1 || true
+  assert_process_absent "$restricted_pid"
+  restricted_pid=""
   printf '\n==> go run restricted group verification\n'
   if ! go run "$verify_go" "$state_root" "$job_id" >"$helper_stdout" 2>"$helper_stderr"; then
     printf 'fail-closed: restricted Linux group verification failed\nstdout=%s\nstderr=%s\n' "$(cat "$helper_stdout")" "$(cat "$helper_stderr")" >&2
     return 1
   fi
   cat "$helper_stdout"
-  pid=""
 }
 
 case "$MODE" in

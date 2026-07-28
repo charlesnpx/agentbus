@@ -95,6 +95,23 @@ func recordAutostartDetachDaemonError(err error) {
 	}
 }
 
+const clientTestSandboxBindDeniedEnv = "AGENTBUS_TEST_SANDBOX_BIND_DENIED"
+
+func clientTestBindDeniedOutput(output string) bool {
+	output = strings.ToLower(output)
+	return strings.Contains(output, "bind: operation not permitted") ||
+		strings.Contains(output, "bind: permission denied") ||
+		strings.Contains(output, "unix socket bind denied by sandbox")
+}
+
+func clientTestSkipOrFailBindDenied(t *testing.T, context string, detail any) {
+	t.Helper()
+	if os.Getenv(clientTestSandboxBindDeniedEnv) == "1" {
+		t.Skipf("Unix socket bind denied by sandbox in %s (%s=1): %v", context, clientTestSandboxBindDeniedEnv, detail)
+	}
+	t.Fatalf("Unix socket bind denied in %s without %s=1; failing to expose daemon bind regressions: %v", context, clientTestSandboxBindDeniedEnv, detail)
+}
+
 func TestClientHelloParsesBackendMetadata(t *testing.T) {
 	hello := runClientHello(t, `{"protocolVersion":2,"backends":["codex"],"backendMetadata":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}],"capabilities":{"models.discovery":true}}`)
 
@@ -137,8 +154,8 @@ func TestConnectProtocolVersionMismatchDoesNotAutostart(t *testing.T) {
 	socketPath := filepath.Join(root, protocol.SocketName)
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		if strings.Contains(err.Error(), "bind: operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		if clientTestBindDeniedOutput(err.Error()) {
+			clientTestSkipOrFailBindDenied(t, "protocol-mismatch listener", err)
 		}
 		t.Fatal(err)
 	}
@@ -203,8 +220,8 @@ func TestConnectBadTokenDoesNotAutostart(t *testing.T) {
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	done, err := startClientTestDaemon(serverCtx, root, "server-token")
 	if err != nil {
-		if strings.Contains(err.Error(), "bind: operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		if clientTestBindDeniedOutput(err.Error()) {
+			clientTestSkipOrFailBindDenied(t, "bad-token daemon", err)
 		}
 		t.Fatal(err)
 	}
@@ -337,9 +354,9 @@ func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 	wg.Wait()
 	close(errs)
 	for err := range errs {
-		if strings.Contains(err.Error(), "bind: operation not permitted") ||
-			strings.Contains(err.Error(), "connect: no such file") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		if clientTestBindDeniedOutput(err.Error()) ||
+			strings.Contains(strings.ToLower(err.Error()), "connect: no such file") {
+			clientTestSkipOrFailBindDenied(t, "autostart race", err)
 		}
 		t.Fatalf("connect error: %v", err)
 	}
@@ -489,8 +506,8 @@ func testConnectHelloTransportFailureAutostartsReplacement(t *testing.T, token s
 		Starter:      starter,
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "bind: operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		if clientTestBindDeniedOutput(err.Error()) {
+			clientTestSkipOrFailBindDenied(t, "hello transport replacement", err)
 		}
 		t.Fatal(err)
 	}
@@ -507,8 +524,8 @@ func startHelloTransportFailureDaemon(t *testing.T, socketPath string, write fun
 	t.Helper()
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		if strings.Contains(err.Error(), "bind: operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		if clientTestBindDeniedOutput(err.Error()) {
+			clientTestSkipOrFailBindDenied(t, "hello transport listener", err)
 		}
 		t.Fatal(err)
 	}
@@ -557,8 +574,8 @@ func TestAutostartReplacesRefusedSocket(t *testing.T) {
 	socketPath := filepath.Join(root, "agentbus.sock")
 	stale, err := net.Listen("unix", socketPath)
 	if err != nil {
-		if strings.Contains(err.Error(), "bind: operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		if clientTestBindDeniedOutput(err.Error()) {
+			clientTestSkipOrFailBindDenied(t, "refused-socket listener", err)
 		}
 		t.Fatal(err)
 	}
@@ -710,6 +727,9 @@ func TestConnectAutostartRealUnsupportedHostSurfacesLauncherDiagnosticOnDarwin(t
 	if errors.Is(err, daemonlaunch.ErrReadinessTimeout) || errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Connect error = %v, want launcher failure code, not timeout", err)
 	}
+	if clientTestBindDeniedOutput(err.Error()) {
+		clientTestSkipOrFailBindDenied(t, "real unsupported-host autostart", err)
+	}
 	if startup.Code != served.ErrAdmissionStrictSupportUnavailable.Error() ||
 		!strings.Contains(startup.Message, served.ErrAdmissionStrictSupportUnavailable.Error()) {
 		t.Fatalf("startup error = %+v, want strict support diagnostic", startup)
@@ -803,8 +823,8 @@ func TestConnectAutostartHelloHangUsesSingleStartTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("Connect succeeded, want hello timeout")
 	}
-	if strings.Contains(err.Error(), "bind: operation not permitted") {
-		t.Skipf("Unix socket bind denied by sandbox: %v", err)
+	if clientTestBindDeniedOutput(err.Error()) {
+		clientTestSkipOrFailBindDenied(t, "hello-hang listener", err)
 	}
 	select {
 	case <-listenerReady:
@@ -843,7 +863,7 @@ func TestDefaultStarterDoesNotCancelDaemonAfterStartupContextEnds(t *testing.T) 
 	if err != nil {
 		if helperErr, readErr := os.ReadFile(errorPath); readErr == nil {
 			if strings.Contains(string(helperErr), "operation not permitted") {
-				t.Skipf("Unix socket bind denied by sandbox: %s", helperErr)
+				clientTestSkipOrFailBindDenied(t, "default-starter detach helper", string(helperErr))
 			}
 			t.Fatalf("%v; helper error: %s", err, helperErr)
 		}
@@ -887,7 +907,7 @@ func TestAutostartedDaemonSurvivesLauncherProcessGroupTermination(t *testing.T) 
 	helperPID := cmd.Process.Pid
 	if err := cmd.Wait(); err != nil {
 		if daemonErr, readErr := os.ReadFile(errorPath); readErr == nil && strings.Contains(string(daemonErr), "operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %s", daemonErr)
+			clientTestSkipOrFailBindDenied(t, "process-group detach helper", string(daemonErr))
 		}
 		t.Fatalf("autostart helper failed: %v\n%s", err, output.String())
 	}
