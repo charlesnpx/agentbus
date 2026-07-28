@@ -42,7 +42,7 @@ import (
 )
 
 //go:linkname parklaunchReleaseAfterSendBeforeAckForTest github.com/charlesnpx/agentbus/internal/parklaunch.releaseAfterSendBeforeAckForTest
-var parklaunchReleaseAfterSendBeforeAckForTest func(model.LaunchKey, func() error) error
+var parklaunchReleaseAfterSendBeforeAckForTest func(func() error) error
 
 //go:linkname authorityAllocateGrantBeforeCommitForTest github.com/charlesnpx/agentbus/engine/execution/authority.allocateGrantBeforeCommitForTest
 var authorityAllocateGrantBeforeCommitForTest func() error
@@ -346,10 +346,7 @@ func TestServedStrictCompositionNoExecBeforeGrantConformance(t *testing.T) {
 
 func TestServedStrictCompositionReleaseAckLossConformance(t *testing.T) {
 	var hookCalls atomic.Int32
-	setServedNativeReleaseAfterSendBeforeAckHook(t, func(key model.LaunchKey, dropAck func() error) error {
-		if key.Attempt.JobID == "job-native-self-test" {
-			return nil
-		}
+	setServedNativeReleaseAfterSendBeforeAckHook(t, func(dropAck func() error) error {
 		call := hookCalls.Add(1)
 		if call != 1 {
 			return nil
@@ -855,7 +852,7 @@ func servedNativeRPC(t *testing.T, h *servedNativeStrictHandle) (net.Conn, *bufi
 	return conn, reader
 }
 
-func setServedNativeReleaseAfterSendBeforeAckHook(t *testing.T, hook func(model.LaunchKey, func() error) error) {
+func setServedNativeReleaseAfterSendBeforeAckHook(t *testing.T, hook func(func() error) error) {
 	t.Helper()
 	previous := parklaunchReleaseAfterSendBeforeAckForTest
 	parklaunchReleaseAfterSendBeforeAckForTest = hook

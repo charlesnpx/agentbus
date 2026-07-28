@@ -39,7 +39,7 @@ var (
 	ErrReleaseOutcomeUnknown     = errors.New("parked worker release outcome unknown")
 )
 
-var releaseAfterSendBeforeAckForTest func(model.LaunchKey, func() error) error
+var releaseAfterSendBeforeAckForTest func(dropAck func() error) error
 
 var cleanupTimeout = 3 * time.Second
 
@@ -226,7 +226,7 @@ func (prepared *Prepared) Release(ctx context.Context) (*ParkedHandle, error) {
 			}
 			return closeFileErr(&prepared.pipes.fromWorkerRead)
 		}
-		if err := releaseAfterSendBeforeAckForTest(prepared.release.Binding.LaunchKey, dropAck); err != nil {
+		if err := releaseAfterSendBeforeAckForTest(dropAck); err != nil {
 			prepared.setState(preparedStateReleaseUnknown)
 			return nil, errors.Join(ErrReleaseOutcomeUnknown, err)
 		}
@@ -1137,10 +1137,10 @@ func abortArmedMonitorAndVerify(containment Containment, reader identityReader, 
 		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("close monitor daemon control: %w", err))
 	}
 	containErr := containTargetGroup(containment, group)
-	if containErr != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("contain target group: %w", containErr))
-	}
 	if err := waitArmedMonitorCleanup(containment, reader, monitor, group); err != nil {
+		if containErr != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("contain target group: %w", containErr))
+		}
 		cleanupErr = errors.Join(cleanupErr, err)
 	}
 	return cleanupErr

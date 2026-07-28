@@ -131,7 +131,3 @@ func nativeRuntimePlatformUnsupportedCause() error {
 func nativeRuntimePlatformUnsupportedError(err error) bool {
 	return errors.Is(err, ErrNativeRuntimeUnsupported)
 }
-
-func nativeRuntimePlatformSelfTestQuiescenceMethod() model.QuiescenceMethod {
-	return model.QuiescenceTermKill
-}

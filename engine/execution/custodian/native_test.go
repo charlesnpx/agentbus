@@ -2250,23 +2250,19 @@ type fakeNativeRetainedManager struct {
 }
 
 type fakeNativeRetainedLeaf struct {
-	retainedID         string
-	domain             model.KernelDomainID
-	membership         containment.RetainedGroupMembership
-	ignoreTerm         bool
-	killErr            error
-	signalProcessGroup bool
-	syncMembershipPGID int
-	removeErr          error
-	placedPIDs         []int
-	pgid               int
-	openCalls          int
-	termCalls          int
-	killCalls          int
-	removeCalls        int
-	rootLeaseReleases  int
-	removed            bool
-	releases           int
+	retainedID        string
+	domain            model.KernelDomainID
+	membership        containment.RetainedGroupMembership
+	ignoreTerm        bool
+	removeErr         error
+	placedPIDs        []int
+	openCalls         int
+	termCalls         int
+	killCalls         int
+	removeCalls       int
+	rootLeaseReleases int
+	removed           bool
+	releases          int
 }
 
 type fakeNativeRetainedCapability struct {
@@ -2366,33 +2362,6 @@ func (manager *fakeNativeRetainedManager) setTermIgnored(retainedID string, igno
 	}
 }
 
-func (manager *fakeNativeRetainedManager) setKillErr(retainedID string, err error) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	leaf := manager.leaves[retainedID]
-	if leaf != nil {
-		leaf.killErr = err
-	}
-}
-
-func (manager *fakeNativeRetainedManager) setSignalProcessGroup(retainedID string, enabled bool) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	leaf := manager.leaves[retainedID]
-	if leaf != nil {
-		leaf.signalProcessGroup = enabled
-	}
-}
-
-func (manager *fakeNativeRetainedManager) setSyncMembershipWithProcessGroup(retainedID string, pgid int) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	leaf := manager.leaves[retainedID]
-	if leaf != nil {
-		leaf.syncMembershipPGID = pgid
-	}
-}
-
 func (manager *fakeNativeRetainedManager) setRemoveErr(retainedID string, err error) {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
@@ -2462,11 +2431,6 @@ func (capability *fakeNativeRetainedCapability) Membership(context.Context) (con
 	if capability.leaf.removed {
 		return containment.RetainedMembershipUnknown, fmt.Errorf("%w: retained leaf was removed", ErrNativeCustodianUnavailable)
 	}
-	if capability.leaf.membership == containment.RetainedMembershipPresent && capability.leaf.syncMembershipPGID > 1 {
-		if err := unix.Kill(-capability.leaf.syncMembershipPGID, 0); errors.Is(err, unix.ESRCH) {
-			capability.leaf.membership = containment.RetainedMembershipEmpty
-		}
-	}
 	return capability.leaf.membership, nil
 }
 
@@ -2506,13 +2470,7 @@ func (capability *fakeNativeRetainedCapability) PlaceProcess(ctx context.Context
 	if observation.Identity != model.ProcessIdentityMatching || observation.RunState != procgroup.ProcessRunStateRunning {
 		return fmt.Errorf("fake retained placement identity observation = %+v, want matching running", observation)
 	}
-	if err := capability.PlacePID(ctx, expected.PID); err != nil {
-		return err
-	}
-	capability.manager.mu.Lock()
-	capability.leaf.pgid = expected.PGID
-	capability.manager.mu.Unlock()
-	return nil
+	return capability.PlacePID(ctx, expected.PID)
 }
 
 func (capability *fakeNativeRetainedCapability) ReleaseRootLease() error {
@@ -2593,19 +2551,11 @@ func (capability *fakeNativeRetainedCapability) signalRetained(term bool) (conta
 	} else {
 		capability.leaf.killCalls++
 	}
-	if !term && capability.leaf.killErr != nil {
-		return containment.SignalUnprovable, capability.leaf.killErr
-	}
 	if capability.leaf.membership == containment.RetainedMembershipEmpty {
 		return containment.SignalTargetAbsent, nil
 	}
 	if term && capability.leaf.ignoreTerm {
 		return containment.SignalDelivered, nil
-	}
-	if !term && capability.leaf.signalProcessGroup && capability.leaf.pgid > 1 {
-		if err := unix.Kill(-capability.leaf.pgid, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
-			return containment.SignalUnprovable, err
-		}
 	}
 	capability.leaf.membership = containment.RetainedMembershipEmpty
 	return containment.SignalDelivered, nil
