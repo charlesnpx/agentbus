@@ -62,6 +62,9 @@ func TestRejectedFinalizationLeavesSafetyAndProjectionUnchanged(t *testing.T) {
 	if _, err := ready.BindGroup(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.LaunchOrdinalOne, group); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := ready.CommitGrant(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.LaunchOrdinalOne, model.PermitNonce("nonce-finalize-rollback")); err != nil {
+		t.Fatal(err)
+	}
 
 	beforeRepo := repo.SnapshotBytes()
 	beforeImage, err := ready.LoadJob(ctx, accepted.Record.JobID)

@@ -10,11 +10,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
-	"time"
 
 	"github.com/charlesnpx/agentbus/internal/cgroup"
-	"github.com/charlesnpx/agentbus/internal/containment"
-	"github.com/charlesnpx/agentbus/internal/parklaunch"
 )
 
 func TestNativeSelfTestClassificationTable(t *testing.T) {
@@ -104,21 +101,21 @@ func TestNativeSelfTestClassificationTable(t *testing.T) {
 	})
 }
 
-func TestNativeSelfTestPostConstructionRootLeaseLossIsUnsafe(t *testing.T) {
+func TestNativeSelfTestRootLeaseContentionIsRetryable(t *testing.T) {
 	calls := 0
 	cause := nativePrepareFailure(fmt.Errorf("prepare: %w", cgroup.ErrRootLeaseUnavailable), false, true)
 	assessment := runClassifiedNativeSelfTest(context.Background(), 3, func(context.Context, int) nativeSelfTestAttemptResult {
 		calls++
 		return classifyNativeSelfTestPrepareFailure(cause)
 	})
-	if calls != 1 {
-		t.Fatalf("attempt calls = %d, want 1", calls)
+	if calls != 3 {
+		t.Fatalf("attempt calls = %d, want 3", calls)
 	}
-	if assessment.Class != SupportUnsafe || assessment.Attempts != 1 || assessment.CleanupSafe {
-		t.Fatalf("assessment = %+v, want unsafe attempts=1 cleanup unsafe", assessment)
+	if assessment.Class != SupportRetryable || assessment.Attempts != 3 || !assessment.CleanupSafe {
+		t.Fatalf("assessment = %+v, want retryable attempts=3 cleanup safe", assessment)
 	}
-	if !errors.Is(assessment.Cause, ErrNativeRuntimeSelfTestUnsafe) || !errors.Is(assessment.Cause, cgroup.ErrRootLeaseUnavailable) {
-		t.Fatalf("assessment cause = %v, want unsafe wrapping ErrRootLeaseUnavailable", assessment.Cause)
+	if !errors.Is(assessment.Cause, ErrNativeRuntimeSelfTestRetry) || !errors.Is(assessment.Cause, cgroup.ErrRootLeaseUnavailable) {
+		t.Fatalf("assessment cause = %v, want retryable wrapping ErrRootLeaseUnavailable", assessment.Cause)
 	}
 }
 
@@ -227,6 +224,47 @@ func TestNativeRuntimeConstructionContentionIsSingleShotRetryable(t *testing.T) 
 	}
 }
 
+func TestNativeCgroupConstructionFallbackClassification(t *testing.T) {
+	tests := []struct {
+		name         string
+		cause        error
+		wantFallback bool
+	}{
+		{
+			name:         "nil",
+			cause:        nil,
+			wantFallback: false,
+		},
+		{
+			name:         "unsupported cgroup",
+			cause:        fmt.Errorf("cgroup absent: %w", cgroup.ErrUnsupported),
+			wantFallback: true,
+		},
+		{
+			name:         "root lease contention",
+			cause:        fmt.Errorf("root already leased: %w", cgroup.ErrRootLeaseUnavailable),
+			wantFallback: false,
+		},
+		{
+			name:         "contention wins over unsupported",
+			cause:        errors.Join(cgroup.ErrUnsupported, cgroup.ErrRootLeaseUnavailable),
+			wantFallback: false,
+		},
+		{
+			name:         "ordinary unsafe error",
+			cause:        errors.New("retained root changed unexpectedly"),
+			wantFallback: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nativeCgroupConstructionFallbackAllowed(tt.cause); got != tt.wantFallback {
+				t.Fatalf("nativeCgroupConstructionFallbackAllowed(%v) = %t, want %t", tt.cause, got, tt.wantFallback)
+			}
+		})
+	}
+}
+
 func TestNativeSelfTestExecSpecUsesCurrentExecutable(t *testing.T) {
 	spec, markerPath, cleanup, err := nativeSelfTestExecSpec()
 	if err != nil {
@@ -252,42 +290,36 @@ func TestNativeSelfTestExecSpecUsesCurrentExecutable(t *testing.T) {
 	}
 }
 
-func TestNewNativeRuntimeDarwinUnsupported(t *testing.T) {
+func TestNewNativeRuntimeDarwinQualifiesAfterSelfTest(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skip("Darwin strict-unavailable support is macOS-only")
+		t.Skip("Darwin strict runtime qualification is macOS-only")
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	exe, err = filepath.Abs(exe)
-	if err != nil {
-		t.Fatal(err)
-	}
+	exe := nativeTestBinaryPath(t)
 	runtimeBundle, err := NewNativeRuntime(NativeOptions{
-		AgentbusPath: exe,
-		MonitorCommand: parklaunch.CommandSpec{
-			Path: exe,
-		},
-		ContainmentParams: containment.Params{
-			GracePeriod:  20 * time.Millisecond,
-			PollInterval: 20 * time.Millisecond,
-			PollTimeout:  2 * time.Second,
-		},
-		WorkerDir: filepath.Dir(exe),
+		AgentbusPath:      builtNativeAgentbusPath(t),
+		MonitorCommand:    nativeMonitorCommand(t),
+		ContainmentParams: defaultNativeTestParams(),
+		WorkerEnv:         nativeAgentbusEnv(),
+		WorkerDir:         filepath.Dir(exe),
 	})
-	if err == nil {
-		t.Fatal("NewNativeRuntime() error = nil, want Darwin unsupported cause")
+	if err != nil {
+		t.Fatalf("NewNativeRuntime() error = %v", err)
 	}
+	defer func() {
+		if err := runtimeBundle.Close(); err != nil {
+			t.Fatalf("native runtime Close() error = %v", err)
+		}
+	}()
+
 	assessment := runtimeBundle.SupportAssessment()
-	if assessment.Class != SupportUnsupported || assessment.Cause == nil || assessment.Attempts != 0 || !assessment.CleanupSafe {
-		t.Fatalf("SupportAssessment() = %+v, want Darwin unsupported with no attempts and cleanup safe", assessment)
+	if assessment.Class != SupportUnsupported || !errors.Is(assessment.Cause, ErrNativeRuntimeSelfTestRequired) || assessment.Attempts != 0 || !assessment.CleanupSafe {
+		t.Fatalf("initial SupportAssessment() = %+v, want self-test-required with no attempts and cleanup safe", assessment)
 	}
-	support := runtimeBundle.Support()
-	if support.ParkedExec || support.VerifiedContainment || support.RuntimeProbePassed {
-		t.Fatalf("Darwin support = %+v, want strict unavailable capability flags", support)
+	if _, ok := runtimeBundle.Process().(*NativeCustodian); !ok {
+		t.Fatalf("Darwin Process() = %T, want *NativeCustodian", runtimeBundle.Process())
 	}
-	if _, ok := runtimeBundle.Process().(UnavailableCustodian); !ok {
-		t.Fatalf("Darwin Process() = %T, want UnavailableCustodian", runtimeBundle.Process())
+	support := runtimeBundle.SelfTest(context.Background())
+	if support.Assessment.Class != SupportAvailable || !support.RuntimeProbePassed || !support.ParkedExec || !support.VerifiedContainment || support.RuntimeProbeResult != nil {
+		t.Fatalf("Darwin support after SelfTest = %+v, want passed parked exec and verified containment probe", support)
 	}
 }

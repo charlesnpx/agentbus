@@ -69,8 +69,8 @@ func TestLaunchHappyPathReleasesBackendWithStablePIDAndEOF(t *testing.T) {
 	if result.PGID != handle.GroupRef.PGID {
 		t.Fatalf("backend pgid = %d, want target group %d", result.PGID, handle.GroupRef.PGID)
 	}
-	if !strings.HasPrefix(handle.GroupRef.RetainedID, "parklaunch-retained-sha256-") {
-		t.Fatalf("retained id = %q, want parklaunch-retained-sha256-*", handle.GroupRef.RetainedID)
+	if handle.GroupRef.RetainedID != "" {
+		t.Fatalf("retained id = %q, want empty process-group identity", handle.GroupRef.RetainedID)
 	}
 	if handle.GroupRef.Monitor.PID == handle.GroupRef.PGID {
 		t.Fatalf("monitor pid %d is target group leader", handle.GroupRef.Monitor.PID)
@@ -296,6 +296,7 @@ func TestPrepareFailureAfterRetainedPlacementBeforeMonitorTargetBindStartsWaitBe
 		if err := closeMonitorTarget(launchedMonitor); err != nil {
 			return model.GroupRef{}, err
 		}
+		group.RetainedID = fixture.spec.RetainedID
 		group.RetainedDomainID = "retained-domain-placement-ordering"
 		group.RetainedDomainState = model.RetainedDomainKnown
 		return group, nil
@@ -329,6 +330,7 @@ func TestPrepareArmedFailureStartsWaitOnlyAfterFenceAcquired(t *testing.T) {
 		containment.wait = wait
 	}
 	fixture.spec.BeforeMonitorBind = func(_ context.Context, group model.GroupRef) (model.GroupRef, error) {
+		group.RetainedID = fixture.spec.RetainedID
 		group.RetainedDomainID = "retained-domain-armed-fence-ordering"
 		group.RetainedDomainState = model.RetainedDomainKnown
 		fenceHeld.Store(true)
@@ -661,6 +663,7 @@ func TestLaunchBeforeMonitorBindRefinesReturnedTarget(t *testing.T) {
 	fixture := newLaunchFixture(t, backendFixtureOptions{ClosedFDs: []int{3, 4, 5}})
 	fixture.spec.RetainedID = "cgroup-retained-test"
 	fixture.spec.BeforeMonitorBind = func(_ context.Context, group model.GroupRef) (model.GroupRef, error) {
+		group.RetainedID = fixture.spec.RetainedID
 		group.RetainedDomainID = "cgroup-domain-test"
 		group.RetainedDomainState = model.RetainedDomainKnown
 		return group, nil

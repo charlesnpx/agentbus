@@ -276,6 +276,70 @@ func TestApplyReducerProjectionAndTerminalReleaseAfterCommit(t *testing.T) {
 	}
 }
 
+func TestOrphanedUnresolvedTerminalClassifiedAsTerminalJobAndTombstone(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	ready := newReady(t, repo, "orphaned-terminal")
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "orphaned-terminal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := terminalizeOrphanedUnresolvedForTest(t, ctx, ready, accepted)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeOrphaned || record.Terminal.Proof != model.ProofUnresolvedAbsence {
+		t.Fatalf("terminal = %+v, want orphaned unresolved", record.Terminal)
+	}
+
+	plans, err := ready.RecoveryPlans(ctx, model.RecoveryStartupLoss)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 0 {
+		t.Fatalf("recovery plans = %+v, want none for terminal orphaned job", plans)
+	}
+
+	if err := repo.View(ctx, func(tx repository.ReadTx) error {
+		stats, err := tx.RootStats()
+		if err != nil {
+			return err
+		}
+		if stats.Jobs != 1 || stats.Bindings != 1 || stats.LaunchRecords != 1 || stats.RecoveryObligations != 0 {
+			t.Fatalf("root stats = %+v, want one job/binding/launch and zero recovery obligations", stats)
+		}
+		nonterminal, err := tx.ListNonterminalByBoot(ready.Boot().BootID)
+		if err != nil {
+			return err
+		}
+		if len(nonterminal) != 0 {
+			t.Fatalf("nonterminal jobs = %+v, want none", nonterminal)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	replay, err := ready.LookupReplay(ctx, accepted.Binding.RequestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.State != ReplayLive || replay.Record.Terminal == nil || replay.Projection.Public != model.PublicOrphaned {
+		t.Fatalf("live replay = %+v, want terminal orphaned live binding", replay)
+	}
+	tombstone, err := ready.Expire(ctx, accepted.Binding.RequestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tombstone.JobID != accepted.Record.JobID {
+		t.Fatalf("tombstone job = %s, want %s", tombstone.JobID, accepted.Record.JobID)
+	}
+	replay, err = ready.LookupReplay(ctx, accepted.Binding.RequestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.State != ReplayExpired || replay.Tombstone.JobID != accepted.Record.JobID {
+		t.Fatalf("expired replay = %+v, want tombstone for orphaned job", replay)
+	}
+}
+
 func TestRecoverySessionPlansBlockReadinessForPriorBootWork(t *testing.T) {
 	ctx := context.Background()
 	repo := memory.NewRepository()
@@ -440,6 +504,27 @@ func assertNoAcceptedJobs(t *testing.T, repo repository.Repository) {
 	}
 }
 
+func terminalizeOrphanedUnresolvedForTest(t *testing.T, ctx context.Context, ready *Ready, accepted AcceptResult) model.SafetyRecord {
+	t.Helper()
+	ref := accepted.Record.Attempt.Ref
+	ordinal := model.LaunchOrdinalOne
+	group := groupRef(ref, ordinal)
+	if _, err := ready.BindGroup(ctx, accepted.Record.JobID, ref, ordinal, group); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ready.AllocateGrant(ctx, ref, ordinal); err != nil {
+		t.Fatal(err)
+	}
+	finalized, err := ready.Finalize(ctx, accepted.Record.JobID, ref, model.TerminalIntent{
+		Outcome: model.OutcomeOrphaned,
+		Cause:   model.CauseDaemonRestartedAfterAuthorization,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return finalized.Record
+}
+
 func assertAnchorFailStopped(t *testing.T, anchorStore *AnchorStore) {
 	t.Helper()
 	snapshot := anchorSnapshot(t, anchorStore)
@@ -466,9 +551,11 @@ func groupRef(ref model.AttemptRef, ordinal model.LaunchOrdinal) model.GroupRef 
 			Attempt: ref,
 			Ordinal: ordinal,
 		},
-		HostBootID:        "host-boot-" + ref.JobID.String(),
-		PIDNamespaceState: model.PIDNamespaceNotApplicable,
-		PGID:              pgid,
+		HostBootID:          "host-boot-" + ref.JobID.String(),
+		PIDNamespaceState:   model.PIDNamespaceNotApplicable,
+		RetainedDomainID:    "retained-domain-" + ref.JobID.String() + "-" + ordinal.String(),
+		RetainedDomainState: model.RetainedDomainKnown,
+		PGID:                pgid,
 		Leader: model.ProcessIdentity{
 			PID:               pgid,
 			HighResStartToken: "leader-start-" + ordinal.String(),

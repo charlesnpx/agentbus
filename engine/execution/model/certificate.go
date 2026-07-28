@@ -235,7 +235,19 @@ func (ref GroupRef) Validate() error {
 	if err := ref.Monitor.Validate(); err != nil {
 		return err
 	}
-	return validateOptionalToken("group.retained_id", ref.RetainedID)
+	if err := validateOptionalToken("group.retained_id", ref.RetainedID); err != nil {
+		return err
+	}
+	if ref.RetainedID == "" {
+		if ref.RetainedDomainState == RetainedDomainKnown {
+			return invalid("group.retained_id", "is required when retained domain is known")
+		}
+		return nil
+	}
+	if ref.RetainedDomainState != RetainedDomainKnown {
+		return invalid("group.retained_id", "requires known retained domain")
+	}
+	return nil
 }
 
 func (ref GroupRef) Equal(other GroupRef) bool {
@@ -301,6 +313,9 @@ type OutcomeFact struct {
 func (fact OutcomeFact) Validate() error {
 	if err := fact.Attempt.Validate(); err != nil {
 		return err
+	}
+	if fact.Outcome == OutcomeOrphaned {
+		return invalid("outcome", "orphaned cannot be observed")
 	}
 	return fact.Outcome.ValidateTerminal()
 }

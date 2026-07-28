@@ -23,7 +23,9 @@ import (
 	agentclient "github.com/charlesnpx/agentbus/client"
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
@@ -233,7 +235,11 @@ func TestProductionStrictJobCLIStatusResultCancelE2B(t *testing.T) {
 		t.Fatalf("cli status after autostart = %+v", cliStatus)
 	}
 	autostartPID := readProductionStrictPIDFileE2B(t, stateRoot)
+	autostartStopped := false
 	t.Cleanup(func() {
+		if autostartStopped {
+			return
+		}
 		_ = syscall.Kill(autostartPID, syscall.SIGKILL)
 		assertProductionStrictPIDAbsentE2B(t, autostartPID, 5*time.Second)
 	})
@@ -271,10 +277,24 @@ func TestProductionStrictJobCLIStatusResultCancelE2B(t *testing.T) {
 	if canceledResult.JobID != running.JobID || canceledResult.State != engine.StateCanceled || canceledResult.Result != nil {
 		t.Fatalf("canceled cli result = %+v", canceledResult)
 	}
+	executions := waitServedNativeCodexExecutions(t, fixture, 2, 10*time.Second)
+	if err := secondClient.Close(); err != nil {
+		t.Fatalf("second client close before repository read: %v", err)
+	}
+	if err := syscall.Kill(autostartPID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("kill autostart daemon before repository read: %v", err)
+	}
+	assertProductionStrictPIDAbsentE2B(t, autostartPID, 5*time.Second)
+	autostartStopped = true
+
+	canceledRecord := waitProductionStrictAdmissionTerminalFromRepository(t, stateRoot, running.JobID, 5*time.Second)
+	canceledProof := assertServedNativeIdentifiedTerminal(t, canceledRecord, model.OutcomeCanceled)
+	assertServedNativeExecutionMetadata(t, executions[1], *canceledProof.Group, false)
+	assertServedNativeIndependentGroupAbsent(t, *canceledProof.Group, 5*time.Second)
 }
 
 func TestProductionStrictSIGTERMMidJobGracefulShutdownE2B(t *testing.T) {
-	requireProductionStrictE2BGate(t)
+	requireProductionStrictSIGTERMGracefulShutdownE2BGate(t)
 	stateRoot := shortTempDir(t)
 	cwd := shortTempDir(t)
 	fixture := installServedNativeCodexFixture(t, stateRoot)
@@ -286,7 +306,7 @@ func TestProductionStrictSIGTERMMidJobGracefulShutdownE2B(t *testing.T) {
 			stopProductionStrictCommand(t, daemon.cmd, daemon.done, &daemon.stdout, &daemon.stderr)
 		}
 	})
-	client := connectProductionStrictClient(t, stateRoot, daemon.done)
+	client := connectProductionStrictForegroundClientE2B(t, stateRoot, daemon)
 	defer client.Close()
 	writeProductionStrictOwnerPIDFileE2B(t, stateRoot, daemon.cmd.Process.Pid)
 
@@ -300,6 +320,7 @@ func TestProductionStrictSIGTERMMidJobGracefulShutdownE2B(t *testing.T) {
 	if err := waitServedNativeFile(startedPath, 10*time.Second); err != nil {
 		t.Fatalf("hold job did not start: %v", err)
 	}
+	execution := waitServedNativeCodexExecutions(t, fixture, 1, time.Second)[0]
 	if err := syscall.Kill(daemon.cmd.Process.Pid, syscall.SIGTERM); err != nil {
 		t.Fatalf("SIGTERM daemon: %v", err)
 	}
@@ -311,19 +332,9 @@ func TestProductionStrictSIGTERMMidJobGracefulShutdownE2B(t *testing.T) {
 	assertProductionStrictSocketPIDRemovedE2B(t, stateRoot)
 	assertProductionStrictPIDAbsentE2B(t, daemon.cmd.Process.Pid, 5*time.Second)
 
-	record := waitProductionStrictAdmissionTerminalFromRepository(t, stateRoot, submitted.JobID, 10*time.Second)
-	launchProof := assertServedNativeIdentifiedTerminal(t, record, model.OutcomeCanceled)
-	if record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
-		t.Fatalf("shutdown terminal cause = %s, want %s", record.Terminal.Cause, model.CauseCanceledAfterAuthorization)
-	}
-	if launchProof.Quiescence.Method != model.QuiescenceTermKill {
-		t.Fatalf("shutdown quiescence method = %s, want term_kill", launchProof.Quiescence.Method)
-	}
-	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
 	report := runProductionStrictRecoverCLI(t, agentbusPath, stateRoot)
-	if report.WorkItems != 0 {
-		t.Fatalf("recover after graceful SIGTERM = %+v, want zero work items", report)
-	}
+	record := waitProductionStrictAdmissionTerminalFromRepository(t, stateRoot, submitted.JobID, 10*time.Second)
+	assertProductionStrictSIGTERMGracefulShutdownTerminalE2B(t, record, execution, report)
 }
 
 func TestProductionStrictSIGINTIdleGracefulShutdownE2B(t *testing.T) {
@@ -357,7 +368,7 @@ func TestProductionStrictSIGINTIdleGracefulShutdownE2B(t *testing.T) {
 	}
 }
 
-func TestProductionStrictCLINoDaemonUnsupportedHostDarwinE2B(t *testing.T) {
+func TestProductionStrictCLINoDaemonAutostartsDarwinE2B(t *testing.T) {
 	if strings.TrimSpace(os.Getenv(strictE2ERunEnv)) != "1" {
 		t.Skipf("set %s=1 to run strict cli e2e", strictE2ERunEnv)
 	}
@@ -365,26 +376,47 @@ func TestProductionStrictCLINoDaemonUnsupportedHostDarwinE2B(t *testing.T) {
 		t.Skip("strict cli e2e is not run in short mode")
 	}
 	if runtime.GOOS != "darwin" {
-		t.Skip("unsupported-host no-daemon check is darwin-only")
+		t.Skip("darwin autostart check is macOS-only")
 	}
 	agentbusPath := builtServedNativeAgentbusPath(t)
 	root := shortTempDir(t)
 	env := upsertEnv(os.Environ(), "HOME="+shortTempDir(t))
-	for _, args := range [][]string{
-		{"status", "--job", "job_darwin_unsupported"},
-		{"result", "--job", "job_darwin_unsupported"},
-		{"cancel", "--job", "job_darwin_unsupported"},
-	} {
-		result := runProductionStrictJobCLI(t, agentbusPath, root, env, 11, args...)
-		if !strings.Contains(result.stderr, "daemon startup failed") {
-			t.Fatalf("agentbus %s stderr=%q, want daemon startup failure", strings.Join(args, " "), result.stderr)
-		}
-		if entries, err := os.ReadDir(root); err == nil && len(entries) != 0 {
-			t.Fatalf("state root entries after %s = %v, want empty", strings.Join(args, " "), entries)
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("state root read after %s: %v", strings.Join(args, " "), err)
-		}
+	result := runProductionStrictJobCLI(t, agentbusPath, root, env, 10, "status", "--job", "job_darwin_serves")
+	if strings.Contains(result.stderr, "daemon startup failed") {
+		t.Fatalf("agentbus status stderr=%q, did not expect daemon startup failure", result.stderr)
 	}
+	pid := readProductionStrictPIDFileE2B(t, root)
+	t.Cleanup(func() {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		assertProductionStrictPIDAbsentE2B(t, pid, 5*time.Second)
+	})
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("autostarted daemon pid %d not alive: %v", pid, err)
+	}
+}
+
+func TestProductionStrictCLIOrphanedExitCodeE2B(t *testing.T) {
+	requireProductionStrictE2BGate(t)
+	stateRoot := shortTempDir(t)
+	fixture := installServedNativeCodexFixture(t, stateRoot)
+	agentbusPath := builtServedNativeAgentbusPath(t)
+	jobID := createProductionStrictOrphanedRootE2B(t, stateRoot)
+	env := productionStrictSandboxedEnvE2B(t, fixture.env)
+
+	result := runProductionStrictJobCLI(t, agentbusPath, stateRoot, env, 14, "status", "--job", jobID, "--json")
+	var status protocol.JobStatusResult
+	mustUnmarshal(t, bytes.TrimSpace([]byte(result.stdout)), &status)
+	if len(status.Jobs) != 1 ||
+		status.Jobs[0].JobID != jobID ||
+		status.Jobs[0].State != engine.StateOrphaned ||
+		status.Jobs[0].CleanupDisposition != model.CleanupDispositionUnresolved.String() {
+		t.Fatalf("orphaned cli status = %+v, want terminal orphaned unresolved job %s", status, jobID)
+	}
+	pid := readProductionStrictPIDFileE2B(t, stateRoot)
+	t.Cleanup(func() {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		assertProductionStrictPIDAbsentE2B(t, pid, 5*time.Second)
+	})
 }
 
 func TestProductionStrictCLIStatusFailStopExitE2B(t *testing.T) {
@@ -540,9 +572,31 @@ func requireProductionStrictE2BGate(t *testing.T) {
 		t.Skip("strict E2B e2e is not run in short mode")
 	}
 	if runtime.GOOS != "linux" {
-		t.Skip("strict E2B e2e gate runs on linux")
+		if runtime.GOOS == "darwin" {
+			requireServedNativeConformance(t)
+			return
+		}
+		t.Skip("strict E2B e2e gate runs on darwin or linux")
 	}
 	requireProductionStrictCgroup(t)
+}
+
+func requireProductionStrictSIGTERMGracefulShutdownE2BGate(t *testing.T) {
+	t.Helper()
+	if strings.TrimSpace(os.Getenv(strictE2ERunEnv)) != "1" {
+		t.Skipf("set %s=1 to run E2B strict e2e", strictE2ERunEnv)
+	}
+	if testing.Short() {
+		t.Skip("strict E2B e2e is not run in short mode")
+	}
+	switch runtime.GOOS {
+	case "linux":
+		requireProductionStrictCgroup(t)
+	case "darwin":
+		requireServedNativeConformance(t)
+	default:
+		t.Skip("strict E2B SIGTERM graceful shutdown requires darwin process groups or linux cgroup-v2")
+	}
 }
 
 func launchProductionStrictDaemonE2B(t *testing.T, agentbusPath, stateRoot string, env []string) daemonlaunch.Result {
@@ -558,6 +612,9 @@ func launchProductionStrictDaemonE2B(t *testing.T, agentbusPath, stateRoot strin
 		Env:         env,
 	})
 	if err != nil {
+		if productionStrictBindDeniedE2B(err.Error()) {
+			servedTestSkipOrFailBindDenied(t, "production strict daemon", err)
+		}
 		t.Fatalf("launch production strict daemon: %v", err)
 	}
 	if result.PID <= 0 || result.ExistingDaemon {
@@ -590,6 +647,40 @@ func startProductionStrictForegroundCommandE2B(t *testing.T, agentbusPath, state
 		close(daemon.done)
 	}()
 	return daemon
+}
+
+func connectProductionStrictForegroundClientE2B(t *testing.T, stateRoot string, daemon *productionStrictForegroundCommandE2B) *agentclient.Client {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-daemon.done:
+			if productionStrictBindDeniedE2B(daemon.stderr.String()) {
+				servedTestSkipOrFailBindDeniedf(t, "foreground daemon", "%v\nstdout=%s\nstderr=%s", err, daemon.stdout.String(), daemon.stderr.String())
+			}
+			t.Fatalf("Serve exited before client connection: %v\nstdout=%s\nstderr=%s", err, daemon.stdout.String(), daemon.stderr.String())
+		default:
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		client, err := agentclient.Connect(ctx, agentclient.Options{
+			StateRoot:        stateRoot,
+			DisableAutoStart: true,
+		})
+		cancel()
+		if err == nil {
+			return client
+		}
+		lastErr = err
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("client did not connect to production strict server: %v\nstdout=%s\nstderr=%s", lastErr, daemon.stdout.String(), daemon.stderr.String())
+	return nil
+}
+
+func productionStrictBindDeniedE2B(output string) bool {
+	return servedTestBindDeniedOutput(output)
 }
 
 func writeProductionStrictOwnerPIDFileE2B(t *testing.T, stateRoot string, pid int) {
@@ -631,6 +722,69 @@ func assertProductionStrictSocketPIDRemovedE2B(t *testing.T, stateRoot string) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s stat = %v, want not exist", path, err)
 		}
+	}
+}
+
+func assertProductionStrictSIGTERMGracefulShutdownTerminalE2B(t *testing.T, record model.SafetyRecord, execution servedNativeCodexExecution, report AdmissionRecoveryReport) {
+	t.Helper()
+	if record.Terminal == nil {
+		t.Fatal("shutdown terminal is nil")
+	}
+	launchProof, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne)
+	if !ok || launchProof.Group == nil || launchProof.Grant == nil {
+		t.Fatalf("shutdown launch proof incomplete: %+v", launchProof)
+	}
+	assertServedNativeExecutionMetadata(t, execution, *launchProof.Group, false)
+	assertServedNativeIndependentGroupAbsent(t, *launchProof.Group, 5*time.Second)
+	if err := validateProductionStrictSIGTERMGracefulShutdownTerminalE2B(record, *launchProof, report); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func validateProductionStrictSIGTERMGracefulShutdownTerminalE2B(record model.SafetyRecord, launchProof model.LaunchProof, report AdmissionRecoveryReport) error {
+	if record.Terminal == nil {
+		return fmt.Errorf("shutdown terminal is nil")
+	}
+	if report.WorkItems != 0 || report.QuiescedLaunches != 0 || report.FinalizedJobs != 0 || report.OrphanedJobs != 0 || report.UnresolvedLaunches != 0 {
+		return fmt.Errorf("recover after graceful SIGTERM = %+v, want no post-shutdown recovery obligation", report)
+	}
+	if record.Terminal.Outcome != model.OutcomeCanceled {
+		return fmt.Errorf("shutdown terminal outcome = %s, want %s", record.Terminal.Outcome, model.OutcomeCanceled)
+	}
+	if record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+		return fmt.Errorf("shutdown terminal cause = %s, want %s", record.Terminal.Cause, model.CauseCanceledAfterAuthorization)
+	}
+	switch got := model.DeriveCleanupDisposition(record); got {
+	case model.CleanupDispositionVerifiedAbsent:
+		if launchProof.Quiescence == nil || launchProof.Quiescence.Method != model.QuiescenceTermKill {
+			return fmt.Errorf("verified shutdown quiescence = %+v, want term_kill", launchProof.Quiescence)
+		}
+	case model.CleanupDispositionUnresolved:
+		if record.Terminal.Proof != model.ProofUnresolvedAbsence {
+			return fmt.Errorf("unresolved shutdown proof = %s, want %s", record.Terminal.Proof, model.ProofUnresolvedAbsence)
+		}
+	default:
+		return fmt.Errorf("shutdown cleanup disposition = %s, want %s or %s", got, model.CleanupDispositionVerifiedAbsent, model.CleanupDispositionUnresolved)
+	}
+	return nil
+}
+
+func TestProductionStrictSIGTERMGracefulShutdownValidationRejectsRecoveryOrphanedE2B(t *testing.T) {
+	record := model.SafetyRecord{
+		Terminal: &model.TerminalCertificate{
+			Outcome: model.OutcomeOrphaned,
+			Proof:   model.ProofUnresolvedAbsence,
+			Cause:   model.CauseSupervisorLostAfterAuthorization,
+		},
+	}
+	if err := validateProductionStrictSIGTERMGracefulShutdownTerminalE2B(record, model.LaunchProof{}, AdmissionRecoveryReport{
+		WorkItems:    1,
+		OrphanedJobs: 1,
+	}); err == nil || !strings.Contains(err.Error(), "no post-shutdown recovery obligation") {
+		t.Fatalf("validation error = %v, want recovery obligation rejection", err)
+	}
+	if err := validateProductionStrictSIGTERMGracefulShutdownTerminalE2B(record, model.LaunchProof{}, AdmissionRecoveryReport{}); err == nil || !strings.Contains(err.Error(), "want canceled") {
+		t.Fatalf("validation error = %v, want orphaned terminal rejection", err)
 	}
 }
 
@@ -698,9 +852,20 @@ func runProductionStrictJobCLI(t *testing.T, agentbusPath, stateRoot string, env
 	}
 	result := productionStrictCLIResultE2B{code: code, stdout: stdout.String(), stderr: stderr.String()}
 	if result.code != wantCode {
+		if productionStrictBindDeniedE2B(result.stderr) {
+			servedTestSkipOrFailBindDeniedf(t, "agentbus "+strings.Join(args, " "), "stderr=%s", result.stderr)
+		}
 		t.Fatalf("agentbus %s exit=%d want=%d\nstdout=%s\nstderr=%s", strings.Join(args, " "), result.code, wantCode, result.stdout, result.stderr)
 	}
 	return result
+}
+
+func productionStrictSandboxedEnvE2B(t *testing.T, env []string) []string {
+	t.Helper()
+	home := shortTempDir(t)
+	env = upsertEnv(env, "HOME="+home)
+	env = upsertEnv(env, "XDG_CACHE_HOME="+filepath.Join(home, "cache"))
+	return env
 }
 
 func readProductionStrictPIDFileE2B(t *testing.T, stateRoot string) int {
@@ -905,6 +1070,84 @@ func assertProductionStrictDaemonCountE2B(t *testing.T, agentbusPath string, wan
 	if len(got) != want {
 		t.Fatalf("agentbus daemon pids for %s = %v, want %d", agentbusPath, got, want)
 	}
+}
+
+func createProductionStrictOrphanedRootE2B(t *testing.T, stateRoot string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := authority.ResetEmptyAdmissionRoot(ctx, stateRoot); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := bboltrepo.OpenExisting(filepath.Join(stateRoot, admissionRepositoryFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := repo.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	dbUUID, schemaMajor, err := repo.AnchorIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, verifier := custodian.NewAttestationChannel()
+	bootstrapper, err := authority.NewBootstrapper(
+		repo,
+		authority.WithAnchor(authority.NewFileAnchor(filepath.Join(stateRoot, admissionAnchorFile), dbUUID, schemaMajor)),
+		authority.WithQuiescenceVerifier(verifier),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, err := model.NewBootRef("boot-production-strict-orphaned-e2b", "owner-production-strict-orphaned-e2b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := bootstrapper.Begin(ctx, boot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := session.SealReady(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := ready.Accept(ctx, authority.AcceptRequest{
+		RequestKey: model.RequestKey{
+			WorkspaceKey: "workspace-production-strict-orphaned-e2b",
+			RequestID:    "request-production-strict-orphaned-e2b",
+		},
+		WorkspaceLayoutKey: model.WorkspaceKey(strings.Repeat("b", 64)),
+		TaskIdentity:       model.NewSHA256TaskIdentity([]byte("production-strict-orphaned-e2b")),
+		Mode:               model.ModeIdentifiedFenced,
+		SessionID:          "session-production-strict-orphaned-e2b",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := accepted.Record.Attempt.Ref
+	group := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne})
+	if _, err := ready.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ready.AllocateGrant(ctx, ref, model.LaunchOrdinalOne); err != nil {
+		t.Fatal(err)
+	}
+	finalized, err := ready.Finalize(ctx, accepted.Record.JobID, ref, model.TerminalIntent{
+		Outcome: model.OutcomeOrphaned,
+		Cause:   model.CauseDaemonRestartedAfterAuthorization,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalized.Record.Terminal == nil || finalized.Record.Terminal.Outcome != model.OutcomeOrphaned {
+		t.Fatalf("finalized = %+v, want orphaned terminal", finalized.Record.Terminal)
+	}
+	return string(accepted.Record.JobID)
 }
 
 func productionStrictDaemonPIDsE2B(agentbusPath string) ([]int, error) {

@@ -11,16 +11,21 @@ import (
 
 type fakeObserver struct {
 	observations []model.ContainmentObservation
+	err          error
 	onObserve    func()
 	calls        int
 }
 
 func (observer *fakeObserver) ObserveGroup(_ context.Context, _ model.GroupRef) (model.ContainmentObservation, error) {
-	if len(observer.observations) == 0 {
-		return model.ContainmentObservation{}, errors.New("no scripted observations")
-	}
 	if observer.onObserve != nil {
 		observer.onObserve()
+	}
+	if observer.err != nil {
+		observer.calls++
+		return model.ContainmentObservation{}, observer.err
+	}
+	if len(observer.observations) == 0 {
+		return model.ContainmentObservation{}, errors.New("no scripted observations")
 	}
 	index := observer.calls
 	if index >= len(observer.observations) {

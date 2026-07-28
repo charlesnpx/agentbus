@@ -1,7 +1,9 @@
 package custodian
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/internal/containment"
 )
 
 func TestAttestationChannelsRejectCrossChannelQuiescence(t *testing.T) {
@@ -48,6 +51,54 @@ func TestPhysicalQuiescenceCarriesOnlyPhysicalFields(t *testing.T) {
 		if _, ok := payloadType.FieldByName(name); ok {
 			t.Fatalf("PhysicalQuiescence carries logical field %s", name)
 		}
+	}
+}
+
+func TestPhysicalOutcomeErrorClassifiesCleanupUnresolvedBoundary(t *testing.T) {
+	tests := []struct {
+		name       string
+		reason     containment.UnprovableReason
+		cause      error
+		unresolved bool
+		aborted    bool
+	}{
+		{name: "observation failed", reason: containment.ReasonObservationFailed, unresolved: true},
+		{name: "authorization unprovable", reason: containment.ReasonAuthorizationUnprovable, unresolved: true},
+		{name: "unauthorized wait expired", reason: containment.ReasonUnauthorizedWaitExpired, unresolved: true},
+		{name: "signal unprovable", reason: containment.ReasonSignalUnprovable, unresolved: true},
+		{name: "probe unprovable", reason: containment.ReasonProbeUnprovable, unresolved: true},
+		{name: "probe contradicted observer", reason: containment.ReasonProbeContradictedObserver, unresolved: true},
+		{name: "absence deadline exceeded", reason: containment.ReasonAbsenceDeadlineExceeded, unresolved: true},
+		{name: "context canceled", reason: containment.ReasonContextDone, cause: context.Canceled, aborted: true},
+		{name: "canceled observation", reason: containment.ReasonObservationFailed, cause: fmt.Errorf("observer: %w", context.Canceled), aborted: true},
+		{name: "deadline signal", reason: containment.ReasonSignalUnprovable, cause: fmt.Errorf("signal: %w", context.DeadlineExceeded), aborted: true},
+		{name: "canceled probe", reason: containment.ReasonProbeUnprovable, cause: fmt.Errorf("probe: %w", context.Canceled), aborted: true},
+		{name: "canceled authorization", reason: containment.ReasonAuthorizationUnprovable, cause: fmt.Errorf("authorize: %w", context.Canceled), aborted: true},
+		{name: "invalid input fatal", reason: containment.ReasonInvalidInput},
+		{name: "authorization failed fatal", reason: containment.ReasonAuthorizationFailed},
+		{name: "unexpected decision fatal", reason: containment.ReasonUnexpectedDecision},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := physicalOutcomeError(PhysicalOutcome{
+				Kind:     PhysicalOutcomeUnprovable,
+				Reason:   tt.reason,
+				Decision: model.Unprovable,
+				Err:      tt.cause,
+			})
+			if got := IsCleanupUnresolved(err); got != tt.unresolved {
+				t.Fatalf("IsCleanupUnresolved(%v) = %t, want %t", err, got, tt.unresolved)
+			}
+			if tt.unresolved {
+				unresolved := CleanupUnresolved(err)
+				if unresolved == nil || unresolved.Reason != tt.reason {
+					t.Fatalf("CleanupUnresolved(%v) = %+v, want reason %s", err, unresolved, tt.reason)
+				}
+			}
+			if tt.aborted && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("context abort error = %v, want context cancellation or deadline", err)
+			}
+		})
 	}
 }
 
@@ -218,12 +269,14 @@ func testPhysicalQuiescence() PhysicalQuiescence {
 			Attempt: ref,
 			Ordinal: model.LaunchOrdinalOne,
 		},
-		HostBootID:        "host-boot-custodian",
-		PIDNamespaceState: model.PIDNamespaceNotApplicable,
-		PGID:              100,
-		Leader:            model.ProcessIdentity{PID: 100, HighResStartToken: "leader-start-custodian"},
-		Monitor:           model.ProcessIdentity{PID: 102, HighResStartToken: "monitor-start-custodian"},
-		RetainedID:        "retained-custodian",
+		HostBootID:          "host-boot-custodian",
+		PIDNamespaceState:   model.PIDNamespaceNotApplicable,
+		RetainedDomainID:    "retained-domain-custodian",
+		RetainedDomainState: model.RetainedDomainKnown,
+		PGID:                100,
+		Leader:              model.ProcessIdentity{PID: 100, HighResStartToken: "leader-start-custodian"},
+		Monitor:             model.ProcessIdentity{PID: 102, HighResStartToken: "monitor-start-custodian"},
+		RetainedID:          "retained-custodian",
 	}
 	return PhysicalQuiescence{
 		Group:  group,

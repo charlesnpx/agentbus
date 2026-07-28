@@ -163,10 +163,8 @@ func PublicProjection(decision Decision, dispatch Dispatch, outcome Outcome) Pub
 		return PublicQueued
 	case DispatchSupervisorPrepared, DispatchPermitGranted:
 		return PublicStarting
-	case DispatchActive, DispatchResultPublishing:
+	case DispatchActive, DispatchReconciling, DispatchContained, DispatchResultPublishing:
 		return PublicRunning
-	case DispatchReconciling, DispatchContained, DispatchDone:
-		return PublicOrphaned
 	default:
 		return 0
 	}
@@ -190,6 +188,8 @@ func terminalPublicForOutcome(outcome Outcome) PublicState {
 		return PublicInterrupted
 	case OutcomeQuarantined:
 		return PublicQuarantined
+	case OutcomeOrphaned:
+		return PublicOrphaned
 	default:
 		return 0
 	}
@@ -197,7 +197,7 @@ func terminalPublicForOutcome(outcome Outcome) PublicState {
 
 func terminalPublicState(state PublicState) bool {
 	switch state {
-	case PublicCompleted, PublicCompletedNoncompliant, PublicInterrupted, PublicQuarantined, PublicFailed, PublicTimedOut, PublicCanceled, PublicReaped:
+	case PublicCompleted, PublicCompletedNoncompliant, PublicInterrupted, PublicQuarantined, PublicFailed, PublicTimedOut, PublicCanceled, PublicReaped, PublicOrphaned:
 		return true
 	default:
 		return false

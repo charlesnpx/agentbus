@@ -9,7 +9,36 @@ var (
 	ErrInvalidCommand       = errors.New("invalid command")
 	ErrCommandPrecondition  = errors.New("command precondition failed")
 	ErrConflictingDuplicate = errors.New("conflicting duplicate")
+	ErrTerminalAbsorbed     = errors.New("terminal record is absorbing")
 )
+
+type TerminalAbsorbedError struct {
+	Terminal TerminalCertificate
+	Cause    error
+}
+
+func (e TerminalAbsorbedError) Error() string {
+	terminal := fmt.Sprintf(
+		"job=%s outcome=%s cause=%s proof=%s revision=%d",
+		e.Terminal.JobID,
+		e.Terminal.Outcome,
+		e.Terminal.Cause,
+		e.Terminal.Proof,
+		e.Terminal.DerivedFromRevision,
+	)
+	if e.Cause == nil {
+		return fmt.Sprintf("%s: %s", ErrTerminalAbsorbed, terminal)
+	}
+	return fmt.Sprintf("%s: %s: %v", ErrTerminalAbsorbed, terminal, e.Cause)
+}
+
+func (e TerminalAbsorbedError) Unwrap() error {
+	return e.Cause
+}
+
+func (e TerminalAbsorbedError) Is(target error) bool {
+	return target == ErrTerminalAbsorbed
+}
 
 type ApplyResult struct {
 	Record  SafetyRecord
@@ -422,6 +451,9 @@ func applyObserveOutcome(next *SafetyRecord, current SafetyRecord, command Obser
 	if err := command.Outcome.ValidateTerminal(); err != nil {
 		return false, invalidCommand("outcome: %v", err)
 	}
+	if command.Outcome == OutcomeOrphaned {
+		return false, invalidCommand("outcome: orphaned cannot be observed")
+	}
 	fact := OutcomeFact{Attempt: current.Attempt.Ref, Outcome: command.Outcome}
 	if current.Outcome != nil {
 		return mergeFact(&next.Outcome, fact, "outcome")
@@ -469,7 +501,7 @@ func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (
 func applyTerminalAbsorbing(current SafetyRecord, command any) (ApplyResult, error) {
 	finalize, ok := command.(Finalize)
 	if !ok {
-		return ApplyResult{}, precondition("terminal record is absorbing")
+		return ApplyResult{}, terminalAbsorbed(current, precondition("terminal record is absorbing"))
 	}
 	if err := ensureAttempt(current, finalize.Ref); err != nil {
 		return ApplyResult{}, err
@@ -483,7 +515,7 @@ func applyTerminalAbsorbing(current SafetyRecord, command any) (ApplyResult, err
 		current.Terminal.DerivedBy == intent.DerivedBy {
 		return ApplyResult{Record: cloneSafetyRecord(current), Changed: false}, nil
 	}
-	return ApplyResult{}, conflict("terminal certificate is already recorded")
+	return ApplyResult{}, terminalAbsorbed(current, conflict("terminal certificate is already recorded"))
 }
 
 func normalizeCommand(command Command) (any, error) {
@@ -848,4 +880,11 @@ func precondition(format string, args ...any) error {
 
 func conflict(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrConflictingDuplicate, fmt.Sprintf(format, args...))
+}
+
+func terminalAbsorbed(record SafetyRecord, cause error) error {
+	if record.Terminal == nil {
+		return cause
+	}
+	return TerminalAbsorbedError{Terminal: *record.Terminal, Cause: cause}
 }

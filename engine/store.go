@@ -800,10 +800,7 @@ func (s *Store) reapRecordWithLookup(record *JobRecord, now time.Time, lookup fu
 	}
 	switch record.State {
 	case StateOrphaned:
-		if record.UpdatedAt.IsZero() || now.Sub(record.UpdatedAt) < s.orphanGrace {
-			return changed, nil
-		}
-		return true, record.Transition(StateReaped, now)
+		return changed, nil
 	case StateQueued, StateStarting:
 		if !record.UpdatedAt.IsZero() && now.Sub(record.UpdatedAt) >= s.retention.StaleJobAfter {
 			return true, record.Transition(StateOrphaned, now)

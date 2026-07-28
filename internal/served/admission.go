@@ -152,7 +152,6 @@ type admissionStartupHooks struct {
 // Serve bootstrap from the qualified runtime and probed backend descriptors.
 type ServeAdmissionPolicy struct {
 	Mode                      AdmissionServeMode
-	CrashDurableContainment   bool
 	AcceptIdentified          bool
 	AdvertiseRequestID        bool
 	Reason                    error
@@ -181,15 +180,14 @@ func deriveServeAdmissionPolicy(metadata authority.AdmissionRootMetadata, runtim
 		reason = newAdmissionSupportDiagnostic(metadata, runtimeSupport.Assessment, true)
 	}
 	policy := ServeAdmissionPolicy{
-		Mode:                    mode,
-		CrashDurableContainment: strictSupportAvailable(runtimeSupport),
-		AcceptIdentified:        mode == AdmissionStrictIdentified,
-		AdvertiseRequestID:      false,
-		Reason:                  reason,
-		strictRouteEnabled:      mode != AdmissionFatal,
-		runtimeSupport:          runtimeSupport,
-		runtimeAssessment:       runtimeSupport.Assessment,
-		backends:                make(map[string]ServeBackendFenceability, len(descriptors)),
+		Mode:               mode,
+		AcceptIdentified:   mode == AdmissionStrictIdentified,
+		AdvertiseRequestID: false,
+		Reason:             reason,
+		strictRouteEnabled: mode != AdmissionFatal,
+		runtimeSupport:     runtimeSupport,
+		runtimeAssessment:  runtimeSupport.Assessment,
+		backends:           make(map[string]ServeBackendFenceability, len(descriptors)),
 	}
 	if mode == AdmissionFatal {
 		policy.strictRouteDisabledReason = reason.Error()
@@ -1416,7 +1414,7 @@ func recoverAdmissionBeforeReady(ctx context.Context, session *authority.Recover
 	return newAdmissionRecoveryExecutor(session, launchPort, latch).Recover(ctx)
 }
 
-func recoverAdmissionBeforeReadyReport(ctx context.Context, session *authority.RecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) (AdmissionRecoveryReport, error) {
+func recoverAdmissionBeforeReadyReport(ctx context.Context, session admissionRecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) (AdmissionRecoveryReport, error) {
 	return newAdmissionRecoveryExecutor(session, launchPort, latch).RecoverReport(ctx)
 }
 
@@ -2378,15 +2376,23 @@ func admissionState(state model.PublicState) engine.JobState {
 	return engine.JobState(state.String())
 }
 
+func admissionCleanupDisposition(record model.SafetyRecord) string {
+	if record.Terminal == nil {
+		return ""
+	}
+	return model.DeriveCleanupDisposition(record).String()
+}
+
 func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *protocol.ErrorObject) {
-	_, projection, ok, errObj := s.authorityJobProjection(jobID)
+	record, projection, ok, errObj := s.authorityJobProjection(jobID)
 	if !ok || errObj != nil {
 		return protocol.JobStatus{}, ok, errObj
 	}
 	return protocol.JobStatus{
-		JobID:     projection.JobID.String(),
-		SessionID: projection.SessionID,
-		State:     admissionState(projection.Public),
+		JobID:              projection.JobID.String(),
+		SessionID:          projection.SessionID,
+		State:              admissionState(projection.Public),
+		CleanupDisposition: admissionCleanupDisposition(record),
 	}, true, nil
 }
 
@@ -2436,10 +2442,11 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 		result = s.authorityResultInfo(*record.Terminal.Result)
 	}
 	return protocol.JobResult{
-		JobID:     projection.JobID.String(),
-		SessionID: projection.SessionID,
-		State:     admissionState(projection.Public),
-		Result:    result,
+		JobID:              projection.JobID.String(),
+		SessionID:          projection.SessionID,
+		State:              admissionState(projection.Public),
+		CleanupDisposition: admissionCleanupDisposition(record),
+		Result:             result,
 	}, true, nil
 }
 
@@ -2497,9 +2504,10 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 	}
 	projection := image.Projection.Value
 	return protocol.JobStatus{
-		JobID:     projection.JobID.String(),
-		SessionID: projection.SessionID,
-		State:     admissionState(projection.Public),
+		JobID:              projection.JobID.String(),
+		SessionID:          projection.SessionID,
+		State:              admissionState(projection.Public),
+		CleanupDisposition: admissionCleanupDisposition(image.Safety.Value),
 	}, true, nil
 }
 

@@ -63,7 +63,7 @@ const (
 	// StrictAuthorityMetaSchemaVersion is the ADR-12 storage schema version
 	StrictAuthorityMetaSchemaVersion  = uint16(2)
 	CurrentAuthorityMetaSchemaVersion = StrictAuthorityMetaSchemaVersion
-	CurrentAdmissionContractVersion   = uint16(1)
+	CurrentAdmissionContractVersion   = uint16(2)
 )
 
 type AdmissionRootMetadata struct {

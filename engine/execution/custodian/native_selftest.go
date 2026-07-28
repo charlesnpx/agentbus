@@ -110,6 +110,13 @@ func nativeRuntimeConstructionAssessment(cause error) SupportAssessment {
 	}
 }
 
+func nativeCgroupConstructionFallbackAllowed(cause error) bool {
+	if cause == nil || errors.Is(cause, cgroup.ErrRootLeaseUnavailable) {
+		return false
+	}
+	return errors.Is(cause, cgroup.ErrUnsupported)
+}
+
 func (custodian *NativeCustodian) SelfTest(ctx context.Context, verifier AttestationVerifier) SupportAssessment {
 	if ctx == nil {
 		ctx = context.Background()
@@ -240,7 +247,7 @@ func classifyNativeSelfTestPrepareFailure(err error) nativeSelfTestAttemptResult
 		return unsupportedNativeSelfTest(fmt.Errorf("%w: %w", ErrNativeRuntimeUnsupported, err), true)
 	}
 	if errors.Is(err, cgroup.ErrRootLeaseUnavailable) {
-		return unsafeNativeSelfTest(fmt.Errorf("%w: post-construction root lease unavailable during self-test: %w", ErrNativeRuntimeSelfTestUnsafe, err), false)
+		return retryableNativeSelfTest(fmt.Errorf("%w: retained cgroup root lease unavailable during self-test: %w", ErrNativeRuntimeSelfTestRetry, err), true)
 	}
 	created, cleanupVerified, ok := nativePrepareFailureEvidence(err)
 	if ok && (!created || cleanupVerified) {

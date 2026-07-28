@@ -80,15 +80,18 @@ from that cache.
 `agentbus serve` starts it in the background. `AGENTBUS_STATE_ROOT` may be set
 to isolate daemon state for tests or local development.
 
-`agentbus serve` always starts strict identified admission and crash-durable
-containment. Strict activation is sticky and one-way for a state root: an
-activated root must keep serving with strict support or be handled with
-`agentbus admission recover`, `seal`, or `reset-empty-root`. The first strict
-release supports one active state root; seal rotation starts a new root and does
-not route read, cancel, result, or replay requests across old and new roots.
-Strict mode currently requires Linux cgroup-v2 with a delegated writable cgroup
-root. Darwin and unsupported or restricted Linux hosts fail closed at startup
-instead of advertising a weaker strict capability.
+`agentbus serve` always starts strict identified admission under the shared
+custody contract. macOS serves with process-group/held-parent supervision.
+Linux serves with process-group supervision when cgroup v2 is unavailable, and
+uses cgroup v2 as a preferred cleanup enhancement when a delegated writable
+root is available. A host fails closed only when it cannot provide basic
+controlled supervision: process groups, identity/start-token observation,
+TERM/KILL/wait, and the controlled runner. Strict activation is sticky and
+one-way for a state root: an activated root must keep serving under the current
+admission contract version or be handled with `agentbus admission recover`,
+`seal`, or `reset-empty-root`. The first strict release supports one active
+state root; seal rotation starts a new root and does not route read, cancel,
+result, or replay requests across old and new roots.
 
 The status/result/cancel commands map terminal job states to the exit codes
 defined in [docs/protocol.md](docs/protocol.md).

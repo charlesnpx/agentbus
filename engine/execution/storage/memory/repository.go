@@ -613,6 +613,8 @@ func (s *storeState) syncMeta() {
 		sealed = s.meta.value.Sealed
 		successorDomainUUID = s.meta.value.SuccessorDomainUUID
 		successorStateRoot = s.meta.value.SuccessorStateRoot
+	} else {
+		admissionRoot.ContractVersion = repository.CurrentAdmissionContractVersion
 	}
 	s.meta = validSlot(repository.AuthorityMeta{
 		SchemaVersion:       repository.CurrentAuthorityMetaSchemaVersion,

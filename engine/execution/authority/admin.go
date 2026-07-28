@@ -396,13 +396,13 @@ func SealAdmissionRoot(ctx context.Context, stateRoot string, options SealOption
 	reservation, err := reserveSealDestination(newStateRoot)
 	if err != nil {
 		if errors.Is(err, ErrNewStateRootNotEmpty) {
-			if inspection, inspectErr := inspectPristineFreshSealDestination(ctx, newStateRoot, before.ActivationMetadata.ContractVersion); inspectErr == nil {
+			if inspection, inspectErr := inspectPristineFreshSealDestination(ctx, newStateRoot, CurrentAdmissionContractVersion); inspectErr == nil {
 				return SealReport{OldRoot: stateRoot, OldInspection: before}, PristineNewStateRootError{StateRoot: newStateRoot, Inspection: inspection}
 			}
 		}
 		return SealReport{OldRoot: stateRoot, OldInspection: before}, err
 	}
-	newInspection, err := initializeReservedAdmissionRoot(ctx, reservation, AdmissionRootMetadata{ContractVersion: before.ActivationMetadata.ContractVersion})
+	newInspection, err := initializeReservedAdmissionRoot(ctx, reservation, AdmissionRootMetadata{ContractVersion: CurrentAdmissionContractVersion})
 	if err != nil {
 		if cleanupErr := cleanupPartialAdmissionRoot(reservation); cleanupErr != nil {
 			return SealReport{}, errors.Join(err, cleanupErr)
@@ -717,6 +717,9 @@ func initializeReservedAdmissionRoot(ctx context.Context, reservation *admission
 }
 
 func initializeAdmissionRootWithReservation(ctx context.Context, stateRoot string, metadata AdmissionRootMetadata, reservation *admissionRootReservation) (RootInspection, error) {
+	if metadata == (AdmissionRootMetadata{}) {
+		metadata.ContractVersion = CurrentAdmissionContractVersion
+	}
 	repoPath, anchorPath, err := admissionRootPaths(stateRoot)
 	if err != nil {
 		return RootInspection{}, err
@@ -762,7 +765,18 @@ func initializeAdmissionRootWithReservation(ctx context.Context, stateRoot strin
 			return RootInspection{}, err
 		}
 	}
-	if metadata != (AdmissionRootMetadata{}) {
+	var currentMetadata AdmissionRootMetadata
+	if err := repo.View(ctx, func(tx repository.ReadTx) error {
+		metaRecord := tx.Meta()
+		if metaRecord.State != repository.RecordValid {
+			return fmt.Errorf("%w: meta is %s", repository.ErrInvalidRecord, metaRecord.State)
+		}
+		currentMetadata = metaRecord.Value.AdmissionRoot
+		return nil
+	}); err != nil {
+		return RootInspection{}, err
+	}
+	if currentMetadata != metadata {
 		if _, err := repo.Update(ctx, func(tx repository.WriteTx) error {
 			metaRecord := tx.Meta()
 			if metaRecord.State != repository.RecordValid {

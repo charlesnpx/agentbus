@@ -3,6 +3,8 @@ package protocol
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/charlesnpx/agentbus/engine"
 )
 
 func TestDefaultCapabilitiesAndStructuredError(t *testing.T) {
@@ -67,5 +69,31 @@ func TestJobSubmitRequestIdentityFieldsAreAdditive(t *testing.T) {
 	}
 	if string(deduped) != `{"jobId":"job-1","state":"queued","deduplicated":true}` {
 		t.Fatalf("deduplicated result JSON = %s", deduped)
+	}
+}
+
+func TestJobStatusAndResultCleanupDispositionFieldsAreAdditive(t *testing.T) {
+	status, err := json.Marshal(JobStatus{JobID: "job-1", State: engine.StateCompleted, CleanupDisposition: "verified_absent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var statusFields map[string]json.RawMessage
+	if err := json.Unmarshal(status, &statusFields); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(statusFields["cleanupDisposition"]); got != `"verified_absent"` {
+		t.Fatalf("status cleanupDisposition = %s in %s", got, status)
+	}
+
+	result, err := json.Marshal(JobResult{JobID: "job-1", State: engine.StateCompleted, CleanupDisposition: "unresolved"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resultFields map[string]json.RawMessage
+	if err := json.Unmarshal(result, &resultFields); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(resultFields["cleanupDisposition"]); got != `"unresolved"` {
+		t.Fatalf("result cleanupDisposition = %s in %s", got, result)
 	}
 }

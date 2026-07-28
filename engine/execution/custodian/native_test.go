@@ -1046,7 +1046,7 @@ func TestUnavailableRuntimeSelfTestReturnsOriginalSupport(t *testing.T) {
 
 func TestNewNativeRuntimeProbeExercisesContainmentButDoesNotAdvertise(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skip("C6 native runtime availability is Linux cgroup-v2 only")
+		t.Skip("real retained cgroup native runtime probe is Linux-only")
 	}
 	if runtime.GOOS == "linux" && os.Getenv(nativeCgroupConformanceEnv) != "1" {
 		t.Skip("set AGENTBUS_CGROUP_CONFORMANCE=1 to run the real Linux cgroup native runtime probe")
@@ -1342,6 +1342,78 @@ func TestNativeContainAndVerifyRecoveryTreatsMissingRetainedGroupAsAlreadyAbsent
 	}
 }
 
+func TestNativeContainAndVerifyRecoverySelectsProcessGroupForUnretainedGroupRef(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	issuer, verifier := NewAttestationChannel()
+	retainedFactoryCalls := atomic.Int64{}
+	native := &NativeCustodian{
+		options: NativeOptions{
+			ContainmentParams: defaultNativeTestParams(),
+			newRetainedGroup: func() (containment.RetainedGroupObject, error) {
+				retainedFactoryCalls.Add(1)
+				return nil, errors.New("retained manager must not be used for unretained recovery")
+			},
+		},
+		issuer:    issuer,
+		running:   make(map[string]*NativeRunningProcess),
+		finalized: make(map[string]*NativeRunningProcess),
+	}
+	cleanupNativeCustodianForTest(t, native)
+	domain, err := procgroup.CurrentKernelDomain()
+	if err != nil {
+		t.Fatal(err)
+	}
+	domain.RetainedDomainID = ""
+	domain.RetainedDomainState = model.RetainedDomainNotApplicable
+	if err := domain.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := absentProcessGroupForDomain(t, domain)
+	group := model.GroupRef{
+		Version:   1,
+		CustodyID: "custody-native-recovery-unretained",
+		Launch: model.LaunchKey{
+			Attempt: model.AttemptRef{JobID: "job-native-recovery-unretained", AttemptID: "attempt-native-recovery-unretained", Epoch: 1},
+			Ordinal: model.LaunchOrdinalOne,
+		},
+		HostBootID:          domain.HostBootID,
+		PIDNamespaceID:      domain.PIDNamespaceID,
+		PIDNamespaceState:   domain.PIDNamespaceState,
+		RetainedDomainState: model.RetainedDomainNotApplicable,
+		PGID:                pgid,
+		Leader: model.ProcessIdentity{
+			PID:               pgid,
+			HighResStartToken: "leader-start-native-recovery-unretained",
+		},
+		Monitor: model.ProcessIdentity{
+			PID:               pgid - 1,
+			HighResStartToken: "monitor-start-native-recovery-unretained",
+		},
+	}
+	if err := group.Validate(); err != nil {
+		t.Fatalf("unretained recovery group Validate() error = %v", err)
+	}
+
+	verified, cleanup, err := native.ContainAndVerify(ctx, group, QuiescenceCauseRecovery)
+	if err != nil {
+		t.Fatalf("ContainAndVerify(unretained recovery) error = %v", err)
+	}
+	if cleanup.Err != nil {
+		t.Fatalf("ContainAndVerify(unretained recovery) cleanup error = %v, want nil", cleanup.Err)
+	}
+	payload, err := verifier.VerifyQuiescence(verified)
+	if err != nil {
+		t.Fatalf("VerifyQuiescence(unretained recovery) error = %v", err)
+	}
+	if !payload.Group.Equal(group) || payload.Method != model.QuiescenceAlreadyAbsent {
+		t.Fatalf("payload = %+v, want process-group already-absent for %+v", payload, group)
+	}
+	if got := retainedFactoryCalls.Load(); got != 0 {
+		t.Fatalf("retained factory calls = %d, want 0 for unretained recovery", got)
+	}
+}
+
 func TestNativeContainAndVerifyRecoveryMissingRetainedGroupRequiresProcessGroupAbsent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1421,6 +1493,9 @@ func TestNativeContainAndVerifyRecoveryMissingRetainedGroupRequiresProcessGroupA
 	if !errors.Is(err, ErrNativeCustodianUnavailable) {
 		t.Fatalf("ContainAndVerify() error = %v, want ErrNativeCustodianUnavailable", err)
 	}
+	if !errors.Is(err, ErrRetainedObjectReacquireUnresolved) {
+		t.Fatalf("ContainAndVerify() error = %v, want ErrRetainedObjectReacquireUnresolved", err)
+	}
 	if counting.count.Load() != 0 {
 		t.Fatalf("quiescence attestations = %d, want 0", counting.count.Load())
 	}
@@ -1451,6 +1526,9 @@ func TestNativeContainAndVerifyRecoveryMissingRetainedGroupMismatchedDomainIsUnp
 	}
 	if !errors.Is(err, ErrNativeCustodianUnavailable) {
 		t.Fatalf("ContainAndVerify() error = %v, want ErrNativeCustodianUnavailable", err)
+	}
+	if !errors.Is(err, ErrRetainedObjectReacquireUnresolved) {
+		t.Fatalf("ContainAndVerify() error = %v, want ErrRetainedObjectReacquireUnresolved", err)
 	}
 	if counting.count.Load() != 0 {
 		t.Fatalf("quiescence attestations = %d, want 0", counting.count.Load())

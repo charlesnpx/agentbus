@@ -93,6 +93,9 @@ func (proof AttemptProof) Validate() error {
 	if err := proof.Ref.Validate(); err != nil {
 		return err
 	}
+	if err := validateLaunchSlotTopology(proof.Launches); err != nil {
+		return err
+	}
 	if err := forEachLaunchSlot(proof.Launches, func(ordinal LaunchOrdinal, launch LaunchProof) error {
 		if err := launch.Validate(); err != nil {
 			return err
@@ -108,6 +111,13 @@ func (proof AttemptProof) Validate() error {
 		return err
 	}
 	return validateLaunchGroupsDistinct(proof.Launches)
+}
+
+func validateLaunchSlotTopology[T any](slots LaunchSlots[T]) error {
+	if slots.Second != nil && slots.First == nil {
+		return invalid("launch_slots.topology", "launch slots must be contiguous from ordinal 1")
+	}
+	return nil
 }
 
 func (launch LaunchProof) Validate() error {
@@ -341,6 +351,9 @@ func (record SafetyRecord) validateOptionalFacts() error {
 		if err := record.validateTerminalProofSupport(); err != nil {
 			return err
 		}
+		if err := record.validateTerminalCompatibility(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -350,6 +363,9 @@ func (record SafetyRecord) validateTerminalProofSupport() error {
 	case ProofNeverPermittedAndRetired:
 		if !fencedMode(record.Mode) {
 			return invalid("terminal.proof", "fenced proof requires fenced mode")
+		}
+		if validExecutionImpossibleIntent(record, TerminalIntent{Outcome: record.Terminal.Outcome, Cause: record.Terminal.Cause}) {
+			return nil
 		}
 		if hasAnyGrant(record.Attempt) || hasAnyRelease(record.Attempt) {
 			return invalid("terminal.proof", "never-permitted proof cannot have grant or release evidence")
@@ -384,8 +400,46 @@ func (record SafetyRecord) validateTerminalProofSupport() error {
 		if hasAnyLaunchEvidence(record.Attempt) {
 			return invalid("terminal.proof", "legacy-unfenced proof cannot have launch evidence")
 		}
+	case ProofUnresolvedAbsence:
+		if !fencedMode(record.Mode) {
+			return invalid("terminal.proof", "unresolved proof requires fenced mode")
+		}
+		if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
+			return invalid("terminal.proof", "unresolved proof requires authorization evidence")
+		}
+		if allLaunchGroupsQuiescent(record.Attempt) {
+			return invalid("terminal.proof", "unresolved proof requires absence not proven")
+		}
 	default:
 		return invalid("terminal.proof", "is unknown")
+	}
+	return nil
+}
+
+func (record SafetyRecord) validateTerminalCompatibility() error {
+	if record.Terminal == nil {
+		return nil
+	}
+	intent := TerminalIntent{
+		Outcome: record.Terminal.Outcome,
+		Cause:   record.Terminal.Cause,
+	}
+	if record.Terminal.Outcome == OutcomeOrphaned {
+		if record.Outcome != nil {
+			return invalid("terminal.outcome", "orphaned requires no observed outcome")
+		}
+		if record.Result != nil || record.Terminal.Result != nil {
+			return invalid("terminal.result", "orphaned requires no result")
+		}
+		if record.Terminal.Proof != ProofUnresolvedAbsence {
+			return invalid("terminal.proof", "orphaned requires unresolved absence proof")
+		}
+		if !orphanedOutcomeCause(record.Terminal.Cause) {
+			return invalid("terminal.cause", "orphaned requires after-authorization or unknown-release cause")
+		}
+	}
+	if !validTerminalCompatibility(record, intent, record.Terminal.Proof) {
+		return invalid("terminal.cause_outcome_basis", "is not permitted")
 	}
 	return nil
 }

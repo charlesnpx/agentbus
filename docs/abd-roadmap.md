@@ -4,10 +4,29 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS (AB-F): IN PROGRESS (started 2026-07-27). Custody de-escalation — one weaker cross-platform
+STATUS (AB-F): COMPLETE (2026-07-28). ALL 7 UNITS (U1-U7) CLOSED + post-review corrective pass
+(C1-C3), merged into abf-custody (PR #30). Corrective pass fixed 3 live-served-pipeline
+integration leaks a principal PR review found (architecture/model approved): C1 execution-outcome
+vs cleanup-status conflation across launch->adapter->served (cleanup no longer stringified into a
+terminal error; completed+unresolved / completed+verified_absent preserve the result); C2 active/
+shutdown job.cancel continues to Coordinator.Cancel on typed cleanup uncertainty (commits
+canceled+ProofUnresolvedAbsence instead of returning backend_unavailable); C3 AbandonUnresolvedCustody
+releases local native custody after a durable unresolved terminal so it stops counting as active
+work. Corrective review: SHIP (no findings); macOS battery green; Docker cgroup-v2 worst=0.
+tip 069d6d9 (base campaign) / 5e5e545 (corrective). Cross-platform verified: macOS solo battery green; Docker cgroup-v2 gate worst=0 across
+ALL partitions (strict-cgroup preflight, builds, serial-conformance, serial-race, parallel-rest, race
+detector, strict-e2e). Daemon serves on macOS (process-group/held-parent) and Linux (cgroup-v2 with
+process-group fallback). Integration caught + fixed several cross-platform-only defects: a Linux-only
+bbolt valid-DB false-positive (page-size + unsound linear page scan), an over-eager term_kill self-test
+that broke Linux startup (reverted to the ParkedExec+VerifiedContainment gate), a cgroup root-lease
+contention non-fallback bug, and two deterministic Linux-only e2e test bugs (double-hello, too-tight
+readiness) previously mistaken for a load-flake. Remaining (approval-gated, orchestrator-blocked):
+update PR title/body via gh; install scripts/ci/github-workflows-proposed/ into .github/workflows/.
+
+STATUS (AB-F, historical): IN PROGRESS (started 2026-07-27). Custody de-escalation — one weaker cross-platform
 contract; delete the universal proof obligation, retain the Linux cgroup mechanism as an
-implementation detail. 7 sequential units U1->U7 (session tasks #17-#23). U1 (normative contract,
-ADR-13) IN PROGRESS. Plan: ~/.claude/plans/modular-splashing-falcon.md. Binding invariants: (1)
+implementation detail. 7 sequential units U1->U7 (session tasks #17-#23). U1->U6 merged; U7 is
+cross-platform closure plus docs/CI reconciliation. Plan: ~/.claude/plans/modular-splashing-falcon.md. Binding invariants: (1)
 outcome and cleanup are independent axes — OutcomeOrphaned only for UNKNOWN outcome; (2) only typed
 physical uncertainty -> job-local `unresolved`, integrity/ownership stays fatal; (3) root activation
 kept, contract version 1->2; (4) containment selected per launch, cgroups optional, baseline verified
@@ -23,8 +42,9 @@ gate runs a REAL identified job end-to-end through the production binary on Linu
 (sentinel `strict_admission_real_job_end_to_end`), with byte-identical replay, exactly-once
 execution, persisted IdentifiedFenced proof, protocol-correct inline results, and
 independent-oracle containment. Version 0.6.0. The R6/R7A+R7B gate arc found and fixed FIVE
-production defects that no unit test caught. Darwin/unsupported platforms fail closed typed. AB-E
-later removed the legacy/default admission split; current production `agentbus serve` is strict-only.
+production defects that no unit test caught. ADR-13 later made macOS and Linux process-group fallback
+supported serving lanes; only hosts without basic supervision fail closed typed. AB-E later removed the
+legacy/default admission split; current production `agentbus serve` is strict-only.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).

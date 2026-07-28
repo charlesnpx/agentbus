@@ -199,20 +199,20 @@ func (controller *LaunchController) Start(ctx context.Context, request LaunchReq
 		return nil, err
 	}
 	if err := inject(request.Failures, FailAfterPrepare); err != nil {
-		return nil, errors.Join(err, controller.abortPrepared(containmentContext(ctx), prepared, false, request.Context))
+		return nil, errors.Join(err, controller.abortPrepared(containmentContext(ctx), prepared, nil, request.Context))
 	}
 
 	group := prepared.Ref()
 	bindOutcome, bindErr := controller.BindGroup(ctx, request.Context, group)
-	if err := controller.handlePreGrantDurability(containmentContext(ctx), "bind_group", bindOutcome, bindErr, prepared, false, request.Context); err != nil {
+	if err := controller.handlePreGrantDurability(containmentContext(ctx), "bind_group", bindOutcome, bindErr, prepared, group, false, request.Context); err != nil {
 		return nil, err
 	}
 	if err := inject(request.Failures, FailAfterBindGroup); err != nil {
-		return nil, errors.Join(err, controller.abortPrepared(containmentContext(ctx), prepared, true, request.Context))
+		return nil, errors.Join(err, controller.abortPrepared(containmentContext(ctx), prepared, &group, request.Context))
 	}
 
 	grant, grantOutcome, grantErr := controller.AllocateGrant(ctx, request.Context)
-	if err := controller.handleGrantDurability(containmentContext(ctx), "allocate_grant", grantOutcome, grantErr, prepared, request.Context); err != nil {
+	if err := controller.handleGrantDurability(containmentContext(ctx), "allocate_grant", grantOutcome, grantErr, prepared, group, request.Context); err != nil {
 		return nil, err
 	}
 	if err := validateGrant(request.Context, grant); err != nil {
@@ -305,11 +305,11 @@ func (controller *LaunchController) handleReleaseOutcome(ctx context.Context, pr
 		}
 		outcome, err := controller.RecordReleaseOutcome(ctx, launch, model.LaunchReleaseNotSent)
 		if mapped := durableMutationError("record_release_outcome", outcome, err); mapped != nil {
-			abortErr := controller.abortPrepared(ctx, prepared, true, launch)
+			abortErr := controller.abortPrepared(ctx, prepared, &group, launch)
 			failReason := errors.Join(reason, mapped, abortErr)
 			return errors.Join(failReason, controller.failStop(ctx, failReason), ErrFailClosed)
 		}
-		return errors.Join(reason, controller.abortPrepared(ctx, prepared, true, launch))
+		return errors.Join(reason, controller.abortPrepared(ctx, prepared, &group, launch))
 	case custodian.ReleaseOutcomeUnknown:
 		reason := ErrReleaseUncertain
 		if releaseErr != nil {
@@ -346,8 +346,8 @@ func (controller *LaunchController) RecordQuiescence(ctx context.Context, launch
 }
 
 func (controller *LaunchController) ContainAndVerify(ctx context.Context, launch LaunchContext, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, error) {
-	verified, cleanup, err := controller.ContainAndVerifyWithCleanup(ctx, launch, group, cause)
-	return verified, errors.Join(err, cleanup.Err)
+	verified, _, err := controller.ContainAndVerifyWithCleanup(ctx, launch, group, cause)
+	return verified, err
 }
 
 func (controller *LaunchController) ContainAndVerifyWithCleanup(ctx context.Context, launch LaunchContext, group model.GroupRef, cause custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
@@ -376,19 +376,30 @@ func (controller *LaunchController) ready() error {
 	return nil
 }
 
-func (controller *LaunchController) abortPrepared(ctx context.Context, prepared PreparedProcess, groupDurable bool, launch LaunchContext) error {
+func (controller *LaunchController) abortPrepared(ctx context.Context, prepared PreparedProcess, boundGroup *model.GroupRef, launch LaunchContext) error {
+	preparedGroup := prepared.Ref()
 	verified, cleanup, err := prepared.AbortAndVerify(ctx)
 	abortErr := cleanup.Err
 	if err != nil {
 		abortErr = fmt.Errorf("abort prepared process: %w", err)
-		verified, cleanup, err = controller.custodian.ContainAndVerify(ctx, prepared.Ref(), custodian.QuiescenceCauseContain)
+		containGroup := preparedGroup
+		if boundGroup != nil {
+			containGroup = *boundGroup
+		}
+		verified, cleanup, err = controller.custodian.ContainAndVerify(ctx, containGroup, custodian.QuiescenceCauseContain)
 		if err != nil {
 			reason := errors.Join(abortErr, fmt.Errorf("contain prepared group: %w", err))
+			if boundGroup != nil && physicalCleanupUnresolved(abortErr) && physicalCleanupUnresolved(err) {
+				if groupErr := validateJobLocalPreparedAbortGroup(launch, *boundGroup, preparedGroup, abortErr, err); groupErr != nil {
+					return errors.Join(reason, groupErr, controller.failStop(ctx, errors.Join(reason, groupErr)), ErrFailClosed)
+				}
+				return reason
+			}
 			return errors.Join(reason, controller.failStop(ctx, reason), ErrFailClosed)
 		}
 		abortErr = errors.Join(abortErr, cleanup.Err)
 	}
-	if !groupDurable {
+	if boundGroup == nil {
 		return abortErr
 	}
 	outcome, err := controller.RecordQuiescence(ctx, launch, verified)
@@ -399,38 +410,89 @@ func (controller *LaunchController) abortPrepared(ctx context.Context, prepared 
 	return abortErr
 }
 
-func (controller *LaunchController) handlePreGrantDurability(ctx context.Context, step string, outcome DurabilityOutcome, stepErr error, prepared PreparedProcess, groupDurable bool, launch LaunchContext) error {
+func (controller *LaunchController) handlePreGrantDurability(ctx context.Context, step string, outcome DurabilityOutcome, stepErr error, prepared PreparedProcess, boundGroup model.GroupRef, groupDurable bool, launch LaunchContext) error {
 	recordDurable := groupDurable || durabilityDecision(outcome) == durabilityCommitted
 	switch durabilityDecision(outcome) {
 	case durabilityCommitted:
 		if stepErr == nil {
 			return nil
 		}
-		return errors.Join(durableMutationError(step, outcome, stepErr), controller.abortPrepared(ctx, prepared, recordDurable, launch))
+		return errors.Join(durableMutationError(step, outcome, stepErr), controller.abortPrepared(ctx, prepared, durableGroup(boundGroup, recordDurable), launch))
 	case durabilityNotCommitted:
-		return errors.Join(durableMutationError(step, outcome, stepErr), controller.abortPrepared(ctx, prepared, groupDurable, launch))
+		return errors.Join(durableMutationError(step, outcome, stepErr), controller.abortPrepared(ctx, prepared, durableGroup(boundGroup, groupDurable), launch))
 	case durabilityUnknown:
-		return controller.containGroupAndFailStop(ctx, prepared.Ref(), durableMutationError(step, outcome, stepErr))
+		return controller.containGroupAndFailStop(ctx, boundGroup, durableMutationError(step, outcome, stepErr))
 	default:
-		return controller.containGroupAndFailStop(ctx, prepared.Ref(), durableMutationError(step, outcome, stepErr))
+		return controller.containGroupAndFailStop(ctx, boundGroup, durableMutationError(step, outcome, stepErr))
 	}
 }
 
-func (controller *LaunchController) handleGrantDurability(ctx context.Context, step string, outcome DurabilityOutcome, stepErr error, prepared PreparedProcess, launch LaunchContext) error {
-	group := prepared.Ref()
+func (controller *LaunchController) handleGrantDurability(ctx context.Context, step string, outcome DurabilityOutcome, stepErr error, prepared PreparedProcess, boundGroup model.GroupRef, launch LaunchContext) error {
 	switch durabilityDecision(outcome) {
 	case durabilityCommitted:
 		if stepErr == nil {
 			return nil
 		}
-		return controller.containGroupAndFailStop(ctx, group, durableMutationError(step, outcome, stepErr))
+		return controller.containGroupAndFailStop(ctx, boundGroup, durableMutationError(step, outcome, stepErr))
 	case durabilityNotCommitted:
-		return errors.Join(durableMutationError(step, outcome, stepErr), controller.abortPrepared(ctx, prepared, true, launch))
+		return errors.Join(durableMutationError(step, outcome, stepErr), controller.abortPrepared(ctx, prepared, &boundGroup, launch))
 	case durabilityUnknown:
-		return controller.containGroupAndFailStop(ctx, group, durableMutationError(step, outcome, stepErr))
+		return controller.containGroupAndFailStop(ctx, boundGroup, durableMutationError(step, outcome, stepErr))
 	default:
-		return controller.containGroupAndFailStop(ctx, group, durableMutationError(step, outcome, stepErr))
+		return controller.containGroupAndFailStop(ctx, boundGroup, durableMutationError(step, outcome, stepErr))
 	}
+}
+
+func durableGroup(group model.GroupRef, durable bool) *model.GroupRef {
+	if !durable {
+		return nil
+	}
+	return &group
+}
+
+func validateJobLocalPreparedAbortGroup(launch LaunchContext, boundGroup, preparedGroup model.GroupRef, abortErr, containErr error) error {
+	if err := validatePreparedGroup(launch, boundGroup); err != nil {
+		return fmt.Errorf("bound group identity is invalid: %w", err)
+	}
+	if err := validatePreparedGroup(launch, preparedGroup); err != nil {
+		return fmt.Errorf("prepared group identity is invalid: %w", err)
+	}
+	if !preparedGroup.Equal(boundGroup) {
+		return fmt.Errorf("prepared group identity changed after durable bind")
+	}
+	if err := validateRetainedObjectUnresolvedGroup("abort prepared process", abortErr, boundGroup); err != nil {
+		return err
+	}
+	if err := validateRetainedObjectUnresolvedGroup("contain prepared group", containErr, boundGroup); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateRetainedObjectUnresolvedGroup(step string, err error, boundGroup model.GroupRef) error {
+	if err == nil {
+		return nil
+	}
+	group, ok := retainedObjectUnresolvedGroup(err)
+	if !ok {
+		return nil
+	}
+	if !group.Equal(boundGroup) {
+		return fmt.Errorf("%s retained-object unresolved group does not match durable bound group", step)
+	}
+	return nil
+}
+
+func retainedObjectUnresolvedGroup(err error) (model.GroupRef, bool) {
+	var retained custodian.RetainedObjectReacquireUnresolvedError
+	if errors.As(err, &retained) {
+		return retained.Group, true
+	}
+	var retainedPtr *custodian.RetainedObjectReacquireUnresolvedError
+	if errors.As(err, &retainedPtr) && retainedPtr != nil {
+		return retainedPtr.Group, true
+	}
+	return model.GroupRef{}, false
 }
 
 func (controller *LaunchController) containGroupAndFailStop(ctx context.Context, group model.GroupRef, reason error) error {
@@ -442,6 +504,9 @@ func (controller *LaunchController) containGroupAndFailStop(ctx context.Context,
 func (controller *LaunchController) containRecordQuiescenceOrFailStop(ctx context.Context, launch LaunchContext, group model.GroupRef, reason error) error {
 	verified, cleanup, containErr := controller.custodian.ContainAndVerify(ctx, group, custodian.QuiescenceCauseContain)
 	if containErr != nil {
+		if physicalCleanupUnresolved(containErr) {
+			return errors.Join(reason, containErr)
+		}
 		failReason := errors.Join(reason, containErr)
 		return errors.Join(failReason, controller.failStop(ctx, failReason), ErrFailClosed)
 	}
@@ -461,6 +526,10 @@ func (controller *LaunchController) failStop(ctx context.Context, reason error) 
 		reason = ErrFailClosed
 	}
 	return controller.authority.FailStop(ctx, reason)
+}
+
+func physicalCleanupUnresolved(err error) bool {
+	return custodian.IsCleanupUnresolved(err) || errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved)
 }
 
 type durabilityAction uint8
@@ -568,8 +637,10 @@ type Result struct {
 	Grant           model.LaunchGrant
 	Exit            command.ExitObservation
 	Verified        custodian.VerifiedQuiescence
+	Cleanup         custodian.CleanupStatus
 	Contained       bool
 	ReleaseRecorded bool
+	ExecutionErr    error
 }
 
 type Process struct {
@@ -653,6 +724,9 @@ func (process *Process) Wait(ctx context.Context) (command.ExitObservation, erro
 		result, finalErr := process.final()
 		if !result.Contained {
 			reason := errors.Join(ctx.Err(), finalErr)
+			if custodian.IsCleanupUnresolved(finalErr) {
+				return result.Exit, reason
+			}
 			return result.Exit, errors.Join(reason, process.failStop(containmentContext(ctx), reason), ErrFailClosed)
 		}
 		return result.Exit, errors.Join(ctx.Err(), finalErr)
@@ -679,6 +753,15 @@ func (process *Process) FinalResult(ctx context.Context) (Result, error) {
 	case <-ctx.Done():
 		return Result{}, ctx.Err()
 	}
+}
+
+func (process *Process) FinalObservation(ctx context.Context) (command.FinalObservation, error) {
+	result, err := process.FinalResult(ctx)
+	return command.FinalObservation{
+		Exit:         result.Exit,
+		ExecutionErr: result.ExecutionErr,
+		CleanupErr:   result.Cleanup.Err,
+	}, err
 }
 
 func (process *Process) Result(ctx context.Context) (Result, error) {
@@ -754,7 +837,10 @@ func (process *Process) eagerWait(ctx context.Context) {
 	if err != nil {
 		cause := custodian.QuiescenceCauseWait
 		priorErr := err
-		if ctx.Err() != nil || process.containmentRequested() {
+		if custodian.IsCleanupUnresolved(err) {
+			cause = custodian.QuiescenceCauseContain
+			priorErr = nil
+		} else if ctx.Err() != nil || process.containmentRequested() {
 			cause = custodian.QuiescenceCauseContain
 			priorErr = nil
 		} else {
@@ -763,7 +849,7 @@ func (process *Process) eagerWait(ctx context.Context) {
 		process.finalizeFromContain(process.controlCtx, cause, exit, priorErr, true)
 		return
 	}
-	process.finalizeWithVerified(process.controlCtx, exit, verified, waitReportedContainment(process.running), true, cleanup.Err)
+	process.finalizeWithVerified(process.controlCtx, exit, verified, waitReportedContainment(process.running), true, nil, cleanup)
 }
 
 func waitReportedContainment(running RunningProcess) bool {
@@ -785,7 +871,9 @@ func (process *Process) finalizeFromContain(ctx context.Context, cause custodian
 	}
 	process.finalOnce.Do(func() {
 		verified, cleanup, containErr := process.running.ContainAndVerify(ctx, cause)
-		process.finish(ctx, priorExit, verified, containErr == nil, containErr == nil, errors.Join(priorErr, containErr, cleanup.Err))
+		executionErr, cleanupErr := splitContainmentErr(containErr)
+		cleanup.Err = errors.Join(cleanup.Err, cleanupErr)
+		process.finish(ctx, priorExit, verified, containErr == nil, containErr == nil, errors.Join(priorErr, executionErr), cleanup)
 	})
 }
 
@@ -803,22 +891,22 @@ func (process *Process) containmentRequested() bool {
 	return containing || process.intent.Requested()
 }
 
-func (process *Process) finalizeWithVerified(ctx context.Context, exit command.ExitObservation, verified custodian.VerifiedQuiescence, contained bool, verifiedOK bool, reconcileErr error) {
+func (process *Process) finalizeWithVerified(ctx context.Context, exit command.ExitObservation, verified custodian.VerifiedQuiescence, contained bool, verifiedOK bool, executionErr error, cleanup custodian.CleanupStatus) {
 	process.finalOnce.Do(func() {
-		process.finish(ctx, exit, verified, contained, verifiedOK, reconcileErr)
+		process.finish(ctx, exit, verified, contained, verifiedOK, executionErr, cleanup)
 	})
 }
 
-func (process *Process) finish(ctx context.Context, exit command.ExitObservation, verified custodian.VerifiedQuiescence, contained bool, verifiedOK bool, reconcileErr error) {
+func (process *Process) finish(ctx context.Context, exit command.ExitObservation, verified custodian.VerifiedQuiescence, contained bool, verifiedOK bool, executionErr error, cleanup custodian.CleanupStatus) {
 	result := Result{
 		Context:   process.context,
 		Group:     process.group,
 		Grant:     process.grant,
 		Exit:      exit,
 		Verified:  verified,
+		Cleanup:   cleanup,
 		Contained: contained,
 	}
-	finalErr := reconcileErr
 	if verifiedOK {
 		state := <-process.releaseState
 		result.ReleaseRecorded = state.record
@@ -826,40 +914,53 @@ func (process *Process) finish(ctx context.Context, exit command.ExitObservation
 			process.requestFailClosed(err)
 		}
 		if process.failClosedReason() != nil && !result.Contained {
-			verifiedOK = process.containFinalResult(ctx, &result, &finalErr)
+			verifiedOK = process.containFinalResult(ctx, &result, &executionErr)
 		}
 		if !state.record {
-			finalErr = errors.Join(finalErr, ErrReleaseRecordUnavailable, state.err)
+			executionErr = errors.Join(executionErr, ErrReleaseRecordUnavailable, state.err)
 		} else if verifiedOK {
 			outcome, err := process.controller.RecordQuiescence(ctx, process.context, result.Verified)
 			if mapped := durableMutationError("record_quiescence", outcome, err); mapped != nil {
-				finalErr = errors.Join(finalErr, mapped)
-				process.containFinalResult(ctx, &result, &finalErr)
+				executionErr = errors.Join(executionErr, mapped)
+				process.containFinalResult(ctx, &result, &executionErr)
 				process.requestFailClosed(mapped)
 			} else if err := inject(process.failures, FailAfterRecordQuiescence); err != nil {
-				finalErr = errors.Join(finalErr, err)
-				process.containFinalResult(ctx, &result, &finalErr)
+				executionErr = errors.Join(executionErr, err)
+				process.containFinalResult(ctx, &result, &executionErr)
 				process.requestFailClosed(err)
 			}
 		}
 	}
 	if reason := process.failClosedReason(); reason != nil {
-		finalErr = errors.Join(finalErr, reason, process.failStop(ctx, errors.Join(reason, finalErr)), ErrFailClosed)
+		executionErr = errors.Join(executionErr, reason, process.failStop(ctx, errors.Join(reason, executionErr)), ErrFailClosed)
 	}
+	result.ExecutionErr = executionErr
+	finalErr := errors.Join(executionErr, result.Cleanup.Err)
 	process.setFinal(result, finalErr)
 }
 
 func (process *Process) containFinalResult(ctx context.Context, result *Result, finalErr *error) bool {
 	verified, cleanup, containErr := process.running.ContainAndVerify(ctx, custodian.QuiescenceCauseContain)
+	executionErr, cleanupErr := splitContainmentErr(containErr)
+	result.Cleanup.Err = errors.Join(result.Cleanup.Err, cleanup.Err, cleanupErr)
 	if containErr != nil {
 		result.Contained = false
-		*finalErr = errors.Join(*finalErr, containErr)
+		*finalErr = errors.Join(*finalErr, executionErr)
 		return false
 	}
 	result.Verified = verified
 	result.Contained = true
-	*finalErr = errors.Join(*finalErr, cleanup.Err)
 	return true
+}
+
+func splitContainmentErr(err error) (error, error) {
+	if err == nil {
+		return nil, nil
+	}
+	if custodian.IsCleanupUnresolved(err) || errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved) {
+		return nil, err
+	}
+	return err, nil
 }
 
 func (process *Process) requestFailClosed(reason error) {

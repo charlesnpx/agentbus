@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
@@ -16,7 +17,28 @@ var (
 	ErrAuthorityRequired         = errors.New("coordinator authority is required")
 	ErrLaunchContainmentRequired = errors.New("coordinator launch containment is required")
 	ErrFatalRecovery             = errors.New("coordinator fatal recovery plan")
+	ErrAlreadyFinalized          = errors.New("coordinator job already finalized")
 )
+
+type AlreadyFinalizedError struct {
+	JobID model.JobID
+	Cause error
+}
+
+func (e AlreadyFinalizedError) Error() string {
+	if e.Cause == nil {
+		return fmt.Sprintf("%s: %s", ErrAlreadyFinalized, e.JobID)
+	}
+	return fmt.Sprintf("%s: %s: %v", ErrAlreadyFinalized, e.JobID, e.Cause)
+}
+
+func (e AlreadyFinalizedError) Unwrap() error {
+	return e.Cause
+}
+
+func (e AlreadyFinalizedError) Is(target error) bool {
+	return target == ErrAlreadyFinalized
+}
 
 type AdmissionAuthority interface {
 	RecordQuiescence(context.Context, model.JobID, model.LaunchOrdinal, custodian.VerifiedQuiescence) (StepResult, error)
@@ -89,7 +111,7 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 		return err
 	}
 	if _, err := c.authority.RecordOutcome(ctx, jobID, snapshot.Record.Attempt.Ref, outcome); err != nil {
-		return err
+		return c.alreadyFinalizedError(ctx, jobID, err)
 	}
 	if completionOutcome(outcome) {
 		if c.results == nil {
@@ -107,7 +129,10 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 		Outcome: outcome,
 		Cause:   model.CauseCompletedNormally,
 	})
-	return err
+	if err != nil {
+		return c.alreadyFinalizedError(ctx, jobID, err)
+	}
+	return nil
 }
 
 func (c *Coordinator) Finalize(ctx context.Context, jobID model.JobID, intent model.TerminalIntent) error {
@@ -119,7 +144,10 @@ func (c *Coordinator) Finalize(ctx context.Context, jobID model.JobID, intent mo
 		return err
 	}
 	_, err = c.authority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, intent)
-	return err
+	if err != nil {
+		return c.alreadyFinalizedError(ctx, jobID, err)
+	}
+	return nil
 }
 
 func (c *Coordinator) Cancel(ctx context.Context, jobID model.JobID, injector *FailureInjector) error {
@@ -127,7 +155,7 @@ func (c *Coordinator) Cancel(ctx context.Context, jobID model.JobID, injector *F
 		return err
 	}
 	if _, err := c.authority.RequestCancel(ctx, jobID); err != nil {
-		return err
+		return c.alreadyFinalizedError(ctx, jobID, err)
 	}
 	return c.recover(ctx, jobID, model.RecoveryCancelAfterGrant, nil, injector)
 }
@@ -195,7 +223,10 @@ func (c *Coordinator) publishResult(ctx context.Context, jobID model.JobID, payl
 		return err
 	}
 	_, err = c.authority.RecordResult(ctx, jobID, snapshot.Record.Attempt.Ref, verified)
-	return err
+	if err != nil {
+		return c.alreadyFinalizedError(ctx, jobID, err)
+	}
+	return nil
 }
 
 func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, injector *FailureInjector) error {
@@ -213,8 +244,9 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 				return cause
 			}
 			if _, err := c.authority.Finalize(ctx, jobID, plan.Next.Finalize.Ref, plan.Next.Finalize.Intent); err != nil {
+				err = c.alreadyFinalizedError(ctx, jobID, err)
 				if cause != nil {
-					return fmt.Errorf("%w; finalize recovery: %v", cause, err)
+					return errors.Join(cause, fmt.Errorf("finalize recovery: %w", err))
 				}
 				return err
 			}
@@ -225,6 +257,12 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 				return err
 			}
 			if err := c.retire(ctx, snapshot.Record, injector); err != nil {
+				if recoveryAborted(err) {
+					return err
+				}
+				if physicalCleanupUnresolved(err) {
+					return c.finalizeUnresolved(ctx, jobID, trigger, cause, err)
+				}
 				return c.failStop(ctx, err)
 			}
 		case model.RecoveryContainThenFinalize:
@@ -233,7 +271,17 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 				return err
 			}
 			if err := c.contain(ctx, snapshot.Record, injector); err != nil {
+				if recoveryAborted(err) {
+					return err
+				}
+				if physicalCleanupUnresolved(err) {
+					return c.finalizeUnresolved(ctx, jobID, trigger, cause, err)
+				}
 				return c.failStop(ctx, err)
+			}
+		case model.RecoveryAwaitResultCertificate:
+			if err := c.awaitResultCertificateProgress(ctx, jobID, plan.BasedOnRevision, trigger); err != nil {
+				return err
 			}
 		case model.RecoveryFatalUnprovable:
 			err := fmt.Errorf("%w: %s trigger %d", ErrFatalRecovery, jobID, trigger)
@@ -246,6 +294,82 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 		}
 	}
 	return c.failStop(ctx, fmt.Errorf("%w: recovery did not converge for %s", ErrFatalRecovery, jobID))
+}
+
+func (c *Coordinator) awaitResultCertificateProgress(ctx context.Context, jobID model.JobID, basedOn uint64, trigger model.RecoveryTrigger) error {
+	poll := c.shutdownPoll
+	if poll <= 0 {
+		poll = 10 * time.Millisecond
+	}
+	for {
+		snapshot, err := c.authority.Snapshot(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		if snapshot.Record.Terminal != nil ||
+			snapshot.Record.Result != nil ||
+			snapshot.Record.Revision != basedOn ||
+			!awaitingCompletionResult(snapshot.Record, trigger) {
+			return nil
+		}
+		timer := time.NewTimer(poll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, unresolved error) error {
+	if err := recoveryAbortedBeforeOperation(ctx); err != nil {
+		return err
+	}
+	snapshot, err := c.authority.Snapshot(ctx, jobID)
+	if err != nil {
+		return c.failStopUnlessRecoveryAborted(ctx, errors.Join(unresolved, err))
+	}
+	intent, err := model.RecoveryTerminalIntent(snapshot.Record, trigger, false)
+	if err != nil {
+		return c.failStopUnlessRecoveryAborted(ctx, errors.Join(unresolved, err))
+	}
+	if err := recoveryAbortedBeforeOperation(ctx); err != nil {
+		return err
+	}
+	if _, err := c.authority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, intent); err != nil {
+		err = c.alreadyFinalizedError(ctx, jobID, err)
+		if errors.Is(err, ErrAlreadyFinalized) {
+			return err
+		}
+		return c.failStopUnlessRecoveryAborted(ctx, errors.Join(unresolved, err))
+	}
+	return cause
+}
+
+func (c *Coordinator) alreadyFinalizedError(ctx context.Context, jobID model.JobID, err error) error {
+	if err == nil {
+		return nil
+	}
+	var absorbed model.TerminalAbsorbedError
+	if !errors.As(err, &absorbed) {
+		return err
+	}
+	if absorbed.Terminal.JobID != jobID {
+		return errors.Join(err, fmt.Errorf("absorbed terminal job mismatch: got %s want %s", absorbed.Terminal.JobID, jobID))
+	}
+	if validErr := absorbed.Terminal.Validate(); validErr != nil {
+		return errors.Join(err, fmt.Errorf("absorbing terminal certificate is invalid: %w", validErr))
+	}
+	return AlreadyFinalizedError{JobID: jobID, Cause: err}
+}
+
+func awaitingCompletionResult(record model.SafetyRecord, trigger model.RecoveryTrigger) bool {
+	return trigger == model.RecoveryCancelAfterGrant &&
+		record.Cancel != nil &&
+		record.Outcome != nil &&
+		completionOutcome(record.Outcome.Outcome) &&
+		record.Result == nil
 }
 
 func (c *Coordinator) contain(ctx context.Context, record model.SafetyRecord, injector *FailureInjector) error {
@@ -273,9 +397,7 @@ func (c *Coordinator) contain(ctx context.Context, record model.SafetyRecord, in
 			return fmt.Errorf("record containment quiescence: %w", err)
 		}
 		record = applied.Record
-		if cleanup.Err != nil {
-			return fmt.Errorf("containment cleanup after quiescence record: %w", cleanup.Err)
-		}
+		reportCleanupWarning(record.JobID, ordinal, custodian.QuiescenceCauseContain, cleanup.Err)
 	}
 	return nil
 }
@@ -305,11 +427,41 @@ func (c *Coordinator) retire(ctx context.Context, record model.SafetyRecord, inj
 			return fmt.Errorf("record retirement quiescence: %w", err)
 		}
 		record = applied.Record
-		if cleanup.Err != nil {
-			return fmt.Errorf("retirement cleanup after quiescence record: %w", cleanup.Err)
-		}
+		reportCleanupWarning(record.JobID, ordinal, custodian.QuiescenceCauseRecovery, cleanup.Err)
 	}
 	return nil
+}
+
+func reportCleanupWarning(jobID model.JobID, ordinal model.LaunchOrdinal, cause custodian.QuiescenceCause, err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("agentbus execution: cleanup warning: job=%s ordinal=%s phase=%s: %v", jobID, ordinal, cause, err)
+}
+
+func recoveryAborted(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func recoveryAbortedBeforeOperation(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	if err := ctx.Err(); recoveryAborted(err) {
+		return err
+	}
+	return nil
+}
+
+func physicalCleanupUnresolved(err error) bool {
+	return custodian.IsCleanupUnresolved(err) || errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved)
+}
+
+func (c *Coordinator) failStopUnlessRecoveryAborted(ctx context.Context, err error) error {
+	if recoveryAborted(err) {
+		return err
+	}
+	return c.failStop(ctx, err)
 }
 
 func (c *Coordinator) ready() error {
@@ -354,7 +506,7 @@ func launchContext(record model.SafetyRecord, ordinal model.LaunchOrdinal) launc
 
 func terminalOutcome(outcome model.Outcome) bool {
 	switch outcome {
-	case model.OutcomeCompleted, model.OutcomeCompletedNoncompliant, model.OutcomeFailed, model.OutcomeTimedOut, model.OutcomeCanceled, model.OutcomeReaped, model.OutcomeInterrupted, model.OutcomeQuarantined:
+	case model.OutcomeCompleted, model.OutcomeCompletedNoncompliant, model.OutcomeFailed, model.OutcomeTimedOut, model.OutcomeCanceled, model.OutcomeReaped, model.OutcomeInterrupted, model.OutcomeQuarantined, model.OutcomeOrphaned:
 		return true
 	default:
 		return false

@@ -164,6 +164,7 @@ const (
 	OutcomeReaped
 	OutcomeInterrupted
 	OutcomeQuarantined
+	OutcomeOrphaned
 )
 
 func AllOutcomes() []Outcome {
@@ -177,12 +178,13 @@ func AllOutcomes() []Outcome {
 		OutcomeReaped,
 		OutcomeInterrupted,
 		OutcomeQuarantined,
+		OutcomeOrphaned,
 	}
 }
 
 func (outcome Outcome) Valid() bool {
 	switch outcome {
-	case OutcomeNone, OutcomeCompleted, OutcomeCompletedNoncompliant, OutcomeFailed, OutcomeTimedOut, OutcomeCanceled, OutcomeReaped, OutcomeInterrupted, OutcomeQuarantined:
+	case OutcomeNone, OutcomeCompleted, OutcomeCompletedNoncompliant, OutcomeFailed, OutcomeTimedOut, OutcomeCanceled, OutcomeReaped, OutcomeInterrupted, OutcomeQuarantined, OutcomeOrphaned:
 		return true
 	default:
 		return false
@@ -216,6 +218,8 @@ func (outcome Outcome) String() string {
 		return "interrupted"
 	case OutcomeQuarantined:
 		return "quarantined"
+	case OutcomeOrphaned:
+		return "orphaned"
 	default:
 		return ""
 	}
@@ -306,11 +310,12 @@ const (
 	ProofCleanQuiescentOutcomeAndRetired
 	ProofContained
 	ProofLegacyUnfencedOutcome
+	ProofUnresolvedAbsence
 )
 
 func (proof TerminalProof) Valid() bool {
 	switch proof {
-	case ProofNeverPermittedAndRetired, ProofCleanQuiescentOutcomeAndRetired, ProofContained, ProofLegacyUnfencedOutcome:
+	case ProofNeverPermittedAndRetired, ProofCleanQuiescentOutcomeAndRetired, ProofContained, ProofLegacyUnfencedOutcome, ProofUnresolvedAbsence:
 		return true
 	default:
 		return false
@@ -334,6 +339,8 @@ func (proof TerminalProof) String() string {
 		return "Contained"
 	case ProofLegacyUnfencedOutcome:
 		return "LegacyUnfencedOutcome"
+	case ProofUnresolvedAbsence:
+		return "UnresolvedAbsence"
 	default:
 		return ""
 	}
@@ -422,7 +429,7 @@ func (cause TerminalCause) ProtocolString() string {
 
 func terminalOutcome(outcome Outcome) bool {
 	switch outcome {
-	case OutcomeCompleted, OutcomeCompletedNoncompliant, OutcomeFailed, OutcomeTimedOut, OutcomeCanceled, OutcomeReaped, OutcomeInterrupted, OutcomeQuarantined:
+	case OutcomeCompleted, OutcomeCompletedNoncompliant, OutcomeFailed, OutcomeTimedOut, OutcomeCanceled, OutcomeReaped, OutcomeInterrupted, OutcomeQuarantined, OutcomeOrphaned:
 		return true
 	default:
 		return false

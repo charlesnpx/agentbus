@@ -239,6 +239,11 @@ func cancellationContainsBootstrapFailure(err error) bool {
 	}
 }
 
+// AdmissionRecoveryReport re-exports the served recovery report so callers
+// (notably cmd/agentbus) reach served only through agentbusserve, per the
+// architecture import guard.
+type AdmissionRecoveryReport = served.AdmissionRecoveryReport
+
 func RecoverAdmissionRoot(ctx context.Context, cfg Config) (served.AdmissionRecoveryReport, error) {
 	servedCfg, configErr := recoveryServedConfig(cfg)
 	if configErr != nil {

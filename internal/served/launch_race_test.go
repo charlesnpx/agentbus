@@ -69,7 +69,7 @@ func TestLaunchConcurrentFreshRootConvergesOnSingleToken(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		if launchRaceSocketDenied(err) {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+			servedTestSkipOrFailBindDenied(t, "concurrent fresh-root launch", err)
 		}
 		t.Fatalf("Launch error: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestLaunchBindRaceAlreadyListeningVerifiesWinner(t *testing.T) {
 	result, err := daemonlaunch.Launch(context.Background(), servedLaunchOptions(t, root, cwd, "bind-race", ""))
 	if err != nil {
 		if launchRaceSocketDenied(err) {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+			servedTestSkipOrFailBindDenied(t, "bind-race launch", err)
 		}
 		t.Fatalf("Launch bind-race error: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestLaunchBindRaceAlreadyListeningVerifiesWinner(t *testing.T) {
 	}
 	if err := <-winnerErr; err != nil {
 		if launchRaceSocketDenied(err) {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+			servedTestSkipOrFailBindDenied(t, "bind-race winner", err)
 		}
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestLaunchAdmissionLockPreBindDelayVerifiesWinner(t *testing.T) {
 	result, err := daemonlaunch.Launch(ctx, servedLaunchOptionsWithTimeout(t, root, cwd, "serve", "", 6*time.Second))
 	if err != nil {
 		if launchRaceSocketDenied(err) {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+			servedTestSkipOrFailBindDenied(t, "pre-bind delay launch", err)
 		}
 		t.Fatalf("Launch during pre-bind delay error: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestLaunchAdmissionLockPreBindDelayVerifiesWinner(t *testing.T) {
 	case outcome := <-winnerDone:
 		if outcome.err != nil {
 			if launchRaceSocketDenied(outcome.err) {
-				t.Skipf("Unix socket bind denied by sandbox: %v", outcome.err)
+				servedTestSkipOrFailBindDenied(t, "pre-bind delay winner", outcome.err)
 			}
 			t.Fatalf("winner launch error: %v", outcome.err)
 		}
@@ -302,7 +302,7 @@ func TestServeStartupLockRejectsConcurrentDirectServeBeforeBind(t *testing.T) {
 	case <-preBind:
 	case err := <-winnerDone:
 		if launchRaceSocketDenied(err) {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+			servedTestSkipOrFailBindDenied(t, "direct serve pre-bind", err)
 		}
 		t.Fatalf("winner exited before pre-bind window: %v", err)
 	case <-time.After(2 * time.Second):
@@ -339,7 +339,7 @@ func TestServeStartupLockRejectsConcurrentDirectServeBeforeBind(t *testing.T) {
 	case <-winnerReady:
 	case err := <-winnerDone:
 		if launchRaceSocketDenied(err) {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+			servedTestSkipOrFailBindDenied(t, "direct serve pre-bind release", err)
 		}
 		t.Fatalf("winner exited before ready: %v", err)
 	case <-time.After(2 * time.Second):
@@ -391,7 +391,7 @@ func TestLaunchAdmissionLockWithDialableWinnerVerifiesExistingDaemon(t *testing.
 	case err := <-done:
 		cancel()
 		if launchRaceSocketDenied(err) {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+			servedTestSkipOrFailBindDenied(t, "dialable winner server", err)
 		}
 		t.Fatalf("winner server exited before ready: %v", err)
 	case <-time.After(2 * time.Second):
@@ -415,7 +415,7 @@ func TestLaunchAdmissionLockWithDialableWinnerVerifiesExistingDaemon(t *testing.
 	result, err := daemonlaunch.Launch(context.Background(), servedLaunchOptions(t, root, cwd, "serve", ""))
 	if err != nil {
 		if launchRaceSocketDenied(err) {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+			servedTestSkipOrFailBindDenied(t, "dialable winner launch", err)
 		}
 		t.Fatalf("Launch with dialable winner error: %v", err)
 	}
@@ -810,5 +810,5 @@ func serveServedLaunchHello(listener net.Listener, token string, helloSeen chan<
 }
 
 func launchRaceSocketDenied(err error) bool {
-	return err != nil && (strings.Contains(err.Error(), "operation not permitted") || strings.Contains(err.Error(), "bind: permission denied"))
+	return err != nil && servedTestBindDeniedOutput(err.Error())
 }

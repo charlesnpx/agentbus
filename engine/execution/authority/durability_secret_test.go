@@ -292,15 +292,17 @@ func (nopWriteCloser) Close() error {
 func liveSecretGroupRef(key model.LaunchKey) model.GroupRef {
 	pgid := 7200 + int(key.Ordinal)
 	return model.GroupRef{
-		Version:           1,
-		CustodyID:         model.CustodyID("custody-live-secret-" + key.Ordinal.String()),
-		Launch:            key,
-		HostBootID:        "host-live-secret",
-		PIDNamespaceState: model.PIDNamespaceNotApplicable,
-		PGID:              pgid,
-		Leader:            model.ProcessIdentity{PID: pgid, HighResStartToken: "leader-live-secret"},
-		Monitor:           model.ProcessIdentity{PID: pgid + 1, HighResStartToken: "monitor-live-secret"},
-		RetainedID:        "retained-live-secret",
+		Version:             1,
+		CustodyID:           model.CustodyID("custody-live-secret-" + key.Ordinal.String()),
+		Launch:              key,
+		HostBootID:          "host-live-secret",
+		PIDNamespaceState:   model.PIDNamespaceNotApplicable,
+		RetainedDomainID:    "retained-domain-live-secret",
+		RetainedDomainState: model.RetainedDomainKnown,
+		PGID:                pgid,
+		Leader:              model.ProcessIdentity{PID: pgid, HighResStartToken: "leader-live-secret"},
+		Monitor:             model.ProcessIdentity{PID: pgid + 1, HighResStartToken: "monitor-live-secret"},
+		RetainedID:          "retained-live-secret",
 	}
 }
 

@@ -4,9 +4,9 @@ package custodian
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"runtime"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/containment"
@@ -97,6 +97,10 @@ func (backend *leaderNativeContainmentBackend) leaderRetention() *leaderRetentio
 	return backend.retention
 }
 
+func (backend *leaderNativeContainmentBackend) abandon(ctx context.Context) error {
+	return backend.close(ctx)
+}
+
 func (backend *leaderNativeContainmentBackend) close(context.Context) error {
 	if backend == nil || backend.retention == nil {
 		return nil
@@ -121,13 +125,13 @@ func prepareNativeRuntimePlatformOptions(options NativeOptions) (NativeOptions, 
 }
 
 func nativeRuntimePlatformSelfTestEnabled() bool {
-	return false
+	return true
 }
 
 func nativeRuntimePlatformUnsupportedCause() error {
-	return fmt.Errorf("%w: strict unavailable on %s", ErrNativeRuntimeUnsupported, runtime.GOOS)
+	return nil
 }
 
-func nativeRuntimePlatformUnsupportedError(error) bool {
-	return false
+func nativeRuntimePlatformUnsupportedError(err error) bool {
+	return errors.Is(err, ErrNativeRuntimeUnsupported)
 }

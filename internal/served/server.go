@@ -25,6 +25,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -338,6 +339,10 @@ func (j *activeJob) interruptAdmissionCommand(ctx context.Context) error {
 		return nil
 	}
 	return cmd.Interrupt(ctx)
+}
+
+func admissionPhysicalCleanupUncertain(err error) bool {
+	return custodian.IsCleanupUnresolved(err) || errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved)
 }
 
 type requestOutcome struct {
@@ -942,7 +947,11 @@ func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context, admission *
 			if err := s.requestActiveJobShutdownCancel(ctx, id.String()); err != nil {
 				return err
 			}
-			return coord.Cancel(ctx, id, nil)
+			if err := coord.Cancel(ctx, id, nil); err != nil {
+				return err
+			}
+			s.abandonAdmissionUnresolvedCustody(ctx, coord, id)
+			return nil
 		})
 		if err != nil {
 			return err
@@ -1004,7 +1013,9 @@ func (s *Server) requestActiveJobShutdownCancel(ctx context.Context, jobID strin
 	}
 	active.requestTerminal(engine.StateCanceled)
 	if err := active.interruptAdmissionCommand(ctx); err != nil {
-		return err
+		if !admissionPhysicalCleanupUncertain(err) {
+			return err
+		}
 	}
 	if active.cancel != nil {
 		active.cancel()
@@ -1949,8 +1960,7 @@ func (s *Server) protocolCapabilities() map[string]bool {
 	}
 	if instance != nil &&
 		instance.policy.Mode == AdmissionStrictIdentified &&
-		instance.policy.AcceptIdentified &&
-		instance.policy.CrashDurableContainment {
+		instance.policy.AcceptIdentified {
 		capabilities[protocol.CapabilityAdmissionStrictContainment] = true
 	}
 	s.admissionStateMu.RUnlock()
@@ -2168,7 +2178,9 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 		err := active.interruptAdmissionCommand(interruptCtx)
 		interruptCancel()
 		if err != nil {
-			return requestOutcome{err: admissionProtocolError(err)}
+			if !admissionPhysicalCleanupUncertain(err) {
+				return requestOutcome{err: admissionProtocolError(err)}
+			}
 		}
 	}
 	record, projection, ok, errObj := s.authorityJobProjection(jobID)
@@ -2180,9 +2192,33 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	}
 	if record.Terminal == nil {
 		err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
-			return coord.Cancel(context.Background(), model.JobID(jobID), nil)
+			modelJobID := model.JobID(jobID)
+			if err := coord.Cancel(context.Background(), modelJobID, nil); err != nil {
+				return err
+			}
+			s.abandonAdmissionUnresolvedCustody(context.Background(), coord, modelJobID)
+			return nil
 		})
 		if err != nil {
+			var reloadErr *protocol.ErrorObject
+			record, projection, ok, reloadErr = s.authorityJobProjection(jobID)
+			if reloadErr == nil && ok {
+				if errors.Is(err, coordinator.ErrAlreadyFinalized) {
+					if validErr := admissionValidTerminalRecord(record); validErr != nil {
+						return requestOutcome{err: s.failStopAdmissionFinalizationReconcile(jobID, errors.Join(err, validErr))}
+					}
+					if abandonErr := s.abandonAdmissionRecordUnresolvedCustody(context.Background(), record); abandonErr != nil {
+						log.Printf("agentbus daemon: job %s unresolved custody abandon warning: %v", jobID, abandonErr)
+					}
+					return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
+				}
+				if admissionRecordTerminalCanceledByRequest(record) {
+					if abandonErr := s.abandonAdmissionRecordUnresolvedCustody(context.Background(), record); abandonErr != nil {
+						log.Printf("agentbus daemon: job %s unresolved custody abandon warning: %v", jobID, abandonErr)
+					}
+					return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
+				}
+			}
 			return requestOutcome{err: admissionProtocolError(err)}
 		}
 		var reloadErr *protocol.ErrorObject
@@ -2195,6 +2231,18 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 		}
 	}
 	return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
+}
+
+func admissionRecordTerminalCanceledByRequest(record model.SafetyRecord) bool {
+	if record.Cancel == nil || record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled {
+		return false
+	}
+	switch record.Terminal.Cause {
+	case model.CauseCanceledBeforeAuthorization, model.CauseCanceledAfterAuthorization:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) handlePolicyValidate(raw json.RawMessage) requestOutcome {
@@ -2274,51 +2322,53 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 	}()
 	defer run.active.cancel()
 	if run.active.requestedTerminal() != "" {
-		s.finalizeRequestedTerminal(run)
+		if err := s.finalizeRequestedTerminal(run); err != nil {
+			s.handleRunFinalizationError(run, err)
+		}
 		return
 	}
 	attemptPrompt := applyPrologue(run.policy, run.prompt)
 	text, state, err := s.runAttempt(ctx, run, attemptPrompt, run.write, model.LaunchOrdinalOne)
 	if requested := run.active.requestedTerminal(); requested != "" {
-		s.finalizeTerminal(run, requested, text, nil)
+		s.completeRunTerminal(run, requested, text, nil)
 		return
 	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			s.finalizeTerminal(run, engine.StateTimedOut, text, skippedStampForRun(run, s.registry, engine.SkipTimeout))
+			s.completeRunTerminal(run, engine.StateTimedOut, text, skippedStampForRun(run, s.registry, engine.SkipTimeout))
 			return
 		}
 		if errors.Is(err, context.Canceled) {
 			state = engine.StateInterrupted
 		}
-		s.finalizeTerminal(run, state, text, skippedStampForRun(run, s.registry, skippedReasonForState(state)))
+		s.completeRunTerminal(run, state, text, skippedStampForRun(run, s.registry, skippedReasonForState(state)))
 		return
 	}
 
 	validation, retryPrompt, compliantState, err := s.validateAttempt(text, run, 1, false)
 	if err != nil {
-		s.finalizeTerminal(run, engine.StateFailed, text, skippedStampForRun(run, s.registry, engine.SkipBackendError))
+		s.completeRunTerminal(run, engine.StateFailed, text, skippedStampForRun(run, s.registry, engine.SkipBackendError))
 		return
 	}
 	if retryPrompt != "" {
 		retryText, retryState, retryErr := s.runAttempt(ctx, run, retryPrompt, false, model.LaunchOrdinalTwo)
 		if requested := run.active.requestedTerminal(); requested != "" {
-			s.finalizeTerminal(run, requested, retryText, nil)
+			s.completeRunTerminal(run, requested, retryText, nil)
 			return
 		}
 		if retryErr != nil {
-			s.finalizeTerminal(run, retryState, retryText, skippedStampForRun(run, s.registry, skippedReasonForState(retryState)))
+			s.completeRunTerminal(run, retryState, retryText, skippedStampForRun(run, s.registry, skippedReasonForState(retryState)))
 			return
 		}
 		retryValidation, _, retryCompliantState, err := s.validateAttempt(retryText, run, 2, true)
 		if err != nil {
-			s.finalizeTerminal(run, engine.StateFailed, retryText, skippedStampForRun(run, s.registry, engine.SkipBackendError))
+			s.completeRunTerminal(run, engine.StateFailed, retryText, skippedStampForRun(run, s.registry, engine.SkipBackendError))
 			return
 		}
-		s.finalizeTerminal(run, retryCompliantState, retryText, retryValidation.Stamp)
+		s.completeRunTerminal(run, retryCompliantState, retryText, retryValidation.Stamp)
 		return
 	}
-	s.finalizeTerminal(run, compliantState, text, validation.Stamp)
+	s.completeRunTerminal(run, compliantState, text, validation.Stamp)
 }
 
 func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, write bool, ordinal model.LaunchOrdinal) (string, engine.JobState, error) {
@@ -2457,15 +2507,47 @@ func (s *Server) resolvePolicy(policy *engine.TurnPolicy) (resolvedPolicy, error
 }
 
 func (s *Server) finalizeFailure(run jobRun, err error) {
-	_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
+	if finalizeErr := s.finalizeTerminal(run, engine.StateFailed, "", nil); finalizeErr != nil {
+		s.handleRunFinalizationError(run, errors.Join(err, finalizeErr))
+	}
 }
 
-func (s *Server) finalizeRequestedTerminal(run jobRun) {
+func (s *Server) finalizeRequestedTerminal(run jobRun) error {
 	state := run.active.requestedTerminal()
 	if state == "" {
 		state = engine.StateCanceled
 	}
-	_ = s.finalizeTerminal(run, state, "", nil)
+	return s.finalizeTerminal(run, state, "", nil)
+}
+
+func (s *Server) completeRunTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) {
+	if err := s.finalizeTerminal(run, state, text, stamp); err != nil {
+		s.handleRunFinalizationError(run, err)
+	}
+}
+
+func (s *Server) handleRunFinalizationError(run jobRun, err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("agentbus daemon: job %s finalization failed: %v", run.jobID, err)
+	if !run.admissionControlled {
+		return
+	}
+	failStopCtx, cancel := detachedAdmissionFailStopContext(context.Background())
+	defer cancel()
+	if stopErr := s.failStopAdmissionReady(failStopCtx, err); stopErr != nil {
+		log.Printf("agentbus daemon: job %s finalization fail-stop failed: %v", run.jobID, stopErr)
+	}
+}
+
+func (s *Server) failStopAdmissionFinalizationReconcile(jobID string, err error) *protocol.ErrorObject {
+	failStopCtx, cancel := detachedAdmissionFailStopContext(context.Background())
+	defer cancel()
+	if stopErr := s.failStopAdmissionReady(failStopCtx, err); stopErr != nil {
+		log.Printf("agentbus daemon: job %s finalization reconcile fail-stop failed: %v", jobID, stopErr)
+	}
+	return admissionProtocolError(err)
 }
 
 func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {
@@ -2477,11 +2559,10 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		backendSessionID = run.session.ID()
 	}
 	_, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
-		salvageReaped := run.authoritativeCompletion && record.State == engine.StateReaped && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant)
-		if engine.IsTerminal(record.State) && !salvageReaped {
+		lateFinalization := run.authoritativeCompletion && canLateFinalize(record.State, state)
+		if engine.IsTerminal(record.State) && !lateFinalization {
 			return false, nil
 		}
-		lateFinalization := run.authoritativeCompletion && record.State == engine.StateOrphaned && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant || state == engine.StateFailed) || salvageReaped
 		var result *engine.ResultInfo
 		if state == engine.StateCompleted || state == engine.StateCompletedNoncompliant {
 			if text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
@@ -2494,7 +2575,7 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 			info.ModelReported = record.ModelReported
 			result = &info
 		}
-		if salvageReaped {
+		if lateFinalization && record.State == engine.StateReaped {
 			if err := record.Transition(state, s.clock.Now().UTC()); err != nil {
 				return false, err
 			}
@@ -2521,6 +2602,17 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		return err
 	}
 	return nil
+}
+
+func canLateFinalize(from, to engine.JobState) bool {
+	switch from {
+	case engine.StateOrphaned:
+		return to == engine.StateCompleted || to == engine.StateCompletedNoncompliant || to == engine.StateFailed
+	case engine.StateReaped:
+		return to == engine.StateCompleted || to == engine.StateCompletedNoncompliant
+	default:
+		return false
+	}
 }
 
 func (s *Server) heartbeat(store *engine.Store, jobID string, done <-chan struct{}) {

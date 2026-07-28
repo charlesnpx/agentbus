@@ -15,6 +15,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -121,6 +122,10 @@ type admissionActiveCustodyReporter interface {
 	HasActiveCustodies() bool
 }
 
+type admissionUnresolvedCustodyAbandoner interface {
+	AbandonUnresolvedCustody(context.Context, model.GroupRef) error
+}
+
 func (s *servedAdmissionRuntime) hasActiveCustodies() bool {
 	if s == nil {
 		return false
@@ -132,6 +137,22 @@ func (s *servedAdmissionRuntime) hasActiveCustodies() bool {
 		return true
 	}
 	return false
+}
+
+func (s *servedAdmissionRuntime) abandonUnresolvedCustody(ctx context.Context, group model.GroupRef) error {
+	if s == nil {
+		return nil
+	}
+	var err error
+	if abandoner, ok := s.launchCustodian.(admissionUnresolvedCustodyAbandoner); ok {
+		err = errors.Join(err, abandoner.AbandonUnresolvedCustody(ctx, group))
+	}
+	if process := s.runtime.Process(); process != nil {
+		if abandoner, ok := process.(admissionUnresolvedCustodyAbandoner); ok {
+			err = errors.Join(err, abandoner.AbandonUnresolvedCustody(ctx, group))
+		}
+	}
+	return err
 }
 
 func (s *servedAdmissionRuntime) close() error {
@@ -476,37 +497,136 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		return err
 	}
 	if snapshot.Record.Terminal != nil {
+		if model.DeriveCleanupDisposition(snapshot.Record) == model.CleanupDispositionUnresolved {
+			if err := s.abandonAdmissionRecordUnresolvedCustody(context.Background(), snapshot.Record); err != nil {
+				log.Printf("agentbus daemon: job %s unresolved custody abandon warning: %v", jobID, err)
+			}
+		}
+		return nil
+	}
+	if admissionRunHasRequestedCancel(run, state) {
+		if err := coord.Cancel(context.Background(), jobID, nil); err != nil {
+			if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
+				return err
+			}
+		}
+		s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
 		return nil
 	}
 	outcome, ok := admissionOutcomeForState(state)
 	if !ok {
 		return fmt.Errorf("cannot complete admission job %s with state %s", run.jobID, state)
 	}
-	if outcome == model.OutcomeFailed {
-		if intent, ok := admissionRecordedReleaseFailureIntent(snapshot.Record); ok {
-			return coord.Finalize(context.Background(), jobID, intent)
+	if intent, ok, err := admissionRecordedReleaseTerminalIntent(snapshot.Record); ok {
+		if err != nil {
+			return err
+		}
+		if err := coord.Finalize(context.Background(), jobID, intent); err != nil {
+			if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
+				return err
+			}
+		}
+		s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
+		return nil
+	}
+	if err := coord.Complete(context.Background(), jobID, outcome, []byte(text), nil); err != nil {
+		if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
+			return err
 		}
 	}
-	return coord.Complete(context.Background(), jobID, outcome, []byte(text), nil)
+	s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
+	return nil
 }
 
-func admissionRecordedReleaseFailureIntent(record model.SafetyRecord) (model.TerminalIntent, bool) {
-	if record.Terminal != nil {
-		return model.TerminalIntent{}, false
+func (s *Server) abandonAdmissionUnresolvedCustody(ctx context.Context, coord *admissionCoordinator, jobID model.JobID) {
+	if coord == nil {
+		return
 	}
+	snapshot, err := coord.Snapshot(ctx, jobID)
+	if err != nil {
+		log.Printf("agentbus daemon: job %s unresolved custody abandon skipped after terminal commit: snapshot failed: %v", jobID, err)
+		return
+	}
+	if model.DeriveCleanupDisposition(snapshot.Record) != model.CleanupDispositionUnresolved {
+		return
+	}
+	if err := s.abandonAdmissionRecordUnresolvedCustody(ctx, snapshot.Record); err != nil {
+		log.Printf("agentbus daemon: job %s unresolved custody abandon warning: %v", jobID, err)
+	}
+}
+
+func (s *Server) abandonAdmissionRecordUnresolvedCustody(ctx context.Context, record model.SafetyRecord) error {
+	if record.Terminal == nil {
+		return nil
+	}
+	s.admissionStateMu.RLock()
+	runtime := s.admissionRuntime
+	s.admissionStateMu.RUnlock()
+	if runtime == nil {
+		return nil
+	}
+	var err error
 	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launchRecord, ok := record.Attempt.Launches.Get(ordinal)
+		if !ok || launchRecord.Group == nil || launchRecord.Quiescence != nil {
+			continue
+		}
+		err = errors.Join(err, runtime.abandonUnresolvedCustody(ctx, *launchRecord.Group))
+	}
+	return err
+}
+
+func reconcileAdmissionFinalizationContention(ctx context.Context, coord *admissionCoordinator, jobID model.JobID, err error) error {
+	if err == nil || !errors.Is(err, coordinator.ErrAlreadyFinalized) {
+		return err
+	}
+	snapshot, snapshotErr := coord.Snapshot(ctx, jobID)
+	if snapshotErr != nil {
+		return errors.Join(err, snapshotErr)
+	}
+	if validErr := admissionValidTerminalRecord(snapshot.Record); validErr != nil {
+		return errors.Join(err, validErr)
+	}
+	return nil
+}
+
+func admissionValidTerminalRecord(record model.SafetyRecord) error {
+	if record.Terminal == nil {
+		return errors.New("existing admission terminal record is missing")
+	}
+	if err := model.ValidateSafetyRecord(record); err != nil {
+		return fmt.Errorf("existing admission terminal record is invalid: %w", err)
+	}
+	return nil
+}
+
+func admissionRunHasRequestedCancel(run jobRun, state engine.JobState) bool {
+	return state == engine.StateCanceled &&
+		run.active != nil &&
+		run.active.requestedTerminal() == engine.StateCanceled
+}
+
+func admissionRecordedReleaseTerminalIntent(record model.SafetyRecord) (model.TerminalIntent, bool, error) {
+	if record.Terminal != nil {
+		return model.TerminalIntent{}, false, nil
+	}
+	ordinals := record.Attempt.Launches.FilledOrdinals()
+	for i := len(ordinals) - 1; i >= 0; i-- {
+		ordinal := ordinals[i]
 		launch, ok := record.Attempt.Launches.Get(ordinal)
-		if !ok || launch.ReleaseOutcome == nil {
+		if !ok || launch.Grant == nil || launch.ReleaseOutcome == nil {
 			continue
 		}
 		switch launch.ReleaseOutcome.Outcome {
-		case model.LaunchReleaseSentUnknown:
-			return model.TerminalIntent{Outcome: model.OutcomeFailed, Cause: model.CauseReleaseOutcomeUnknown}, true
-		case model.LaunchReleaseNotSent:
-			return model.TerminalIntent{Outcome: model.OutcomeFailed, Cause: model.CauseReleaseDefinitelyNotSent}, true
+		case model.LaunchReleaseSentUnknown, model.LaunchReleaseNotSent:
+			intent, err := model.RecoveryTerminalIntent(record, model.RecoveryLiveLoss, admissionAllLaunchGroupsQuiescent(record))
+			if err != nil {
+				return model.TerminalIntent{}, true, err
+			}
+			return intent, true, nil
 		}
 	}
-	return model.TerminalIntent{}, false
+	return model.TerminalIntent{}, false, nil
 }
 
 func admissionOutcomeForState(state engine.JobState) (model.Outcome, bool) {

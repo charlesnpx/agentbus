@@ -3,9 +3,13 @@ package authority
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +18,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
+	bolt "go.etcd.io/bbolt"
 )
 
 func TestAdmissionRootActivationIsOneWayAndAdminDoesNotClearNonemptyRoot(t *testing.T) {
@@ -120,6 +125,18 @@ func TestResetEmptyRootRefusesEveryNonzeroCategory(t *testing.T) {
 			},
 			wantFragment: "recovery_obligations=1",
 		},
+		{
+			name: "terminal orphaned unresolved",
+			populate: func(t *testing.T, ready *Ready) {
+				t.Helper()
+				accepted, err := ready.Accept(ctx, acceptRequest(t, "reset-terminal-orphaned"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				terminalizeOrphanedUnresolvedForTest(t, ctx, ready, accepted)
+			},
+			wantFragment: "jobs=1",
+		},
 	}
 	for _, tt := range cases {
 		tt := tt
@@ -183,6 +200,51 @@ func TestResetEmptyRootReinitializesWholeDomainAndAnchor(t *testing.T) {
 	}
 	if !anchor.Initialized || anchor.DBUUID != reset.DomainUUID || anchor.Generation != reset.Generation {
 		t.Fatalf("reset anchor = %+v, inspection = %+v", anchor, reset)
+	}
+}
+
+func TestCandidateV1RootCanResetEmptyOrSealToV2(t *testing.T) {
+	ctx := context.Background()
+
+	resetRoot := t.TempDir()
+	initial, err := ResetEmptyAdmissionRoot(ctx, resetRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgeBboltAdmissionContractVersionForTest(t, resetRoot, 1)
+	forged, err := InspectAdmissionRoot(ctx, resetRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forged.ActivationMetadata.Activated || forged.ActivationMetadata.ContractVersion != 1 {
+		t.Fatalf("forged candidate metadata = %+v, want unactivated v1", forged.ActivationMetadata)
+	}
+	reset, err := ResetEmptyAdmissionRoot(ctx, resetRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reset.DomainUUID == "" || reset.DomainUUID == initial.DomainUUID {
+		t.Fatalf("reset domain UUID = %q, initial %q; want fresh UUID", reset.DomainUUID, initial.DomainUUID)
+	}
+	if reset.ActivationMetadata.Activated || reset.ActivationMetadata.ContractVersion != CurrentAdmissionContractVersion {
+		t.Fatalf("reset candidate metadata = %+v, want fresh v%d candidate", reset.ActivationMetadata, CurrentAdmissionContractVersion)
+	}
+
+	sealRoot := t.TempDir()
+	if _, err := ResetEmptyAdmissionRoot(ctx, sealRoot); err != nil {
+		t.Fatal(err)
+	}
+	forgeBboltAdmissionContractVersionForTest(t, sealRoot, 1)
+	successorRoot := filepath.Join(t.TempDir(), "successor")
+	sealed, err := SealAdmissionRoot(ctx, sealRoot, SealOptions{StartNewAuthorityDomain: true, AcknowledgeReplayHistoryReset: true, NewStateRoot: successorRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sealed.OldRootSealed || sealed.OldInspection.ActivationMetadata.ContractVersion != 1 {
+		t.Fatalf("sealed candidate v1 report = %+v, want sealed old v1 root", sealed)
+	}
+	if sealed.NewInspection.ActivationMetadata.Activated || sealed.NewInspection.ActivationMetadata.ContractVersion != CurrentAdmissionContractVersion {
+		t.Fatalf("seal successor metadata = %+v, want fresh v%d candidate", sealed.NewInspection.ActivationMetadata, CurrentAdmissionContractVersion)
 	}
 }
 
@@ -969,6 +1031,42 @@ func TestSealRefusesNonterminalObligations(t *testing.T) {
 	}
 }
 
+func TestSealAllowsTerminalOrphanedUnresolvedHistory(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-terminal-orphaned")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := session.SealReady(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "seal-terminal-orphaned"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := terminalizeOrphanedUnresolvedForTest(t, ctx, ready, accepted)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeOrphaned {
+		t.Fatalf("terminal = %+v, want orphaned", record.Terminal)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := SealAdmissionRoot(ctx, root, SealOptions{
+		StartNewAuthorityDomain:       true,
+		AcknowledgeReplayHistoryReset: true,
+		NewStateRoot:                  filepath.Join(t.TempDir(), "new-domain"),
+	})
+	if err != nil {
+		t.Fatalf("seal terminal orphaned root: %v", err)
+	}
+	if !report.OldRootSealed || !report.OldInspection.Sealed {
+		t.Fatalf("seal report = %+v, want old root sealed", report)
+	}
+}
+
 func TestSealAndInspectSurfaceCorruptSafetyStats(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -1289,6 +1387,76 @@ func openOrCreateBboltAdmissionRepositoryForTest(path string) (*bboltrepo.Reposi
 		return nil, err
 	}
 	return bboltrepo.OpenExisting(path)
+}
+
+type bboltEnvelopeForTest struct {
+	Kind          string          `json:"kind"`
+	SchemaVersion uint16          `json:"schema_version"`
+	Revision      uint64          `json:"revision"`
+	Payload       json.RawMessage `json:"payload"`
+	Checksum      string          `json:"checksum"`
+}
+
+func forgeBboltAdmissionContractVersionForTest(t *testing.T, root string, version uint16) {
+	t.Helper()
+	db, err := bolt.Open(filepath.Join(root, AdmissionRepositoryFile), 0o600, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("meta"))
+		if bucket == nil {
+			return errors.New("meta bucket missing")
+		}
+		raw := bucket.Get([]byte("authority"))
+		if raw == nil {
+			return errors.New("authority meta missing")
+		}
+		var envelope bboltEnvelopeForTest
+		if err := json.Unmarshal(raw, &envelope); err != nil {
+			return err
+		}
+		var meta repository.AuthorityMeta
+		if err := json.Unmarshal(envelope.Payload, &meta); err != nil {
+			return err
+		}
+		meta.AdmissionRoot.ContractVersion = version
+		payload, err := json.Marshal(meta)
+		if err != nil {
+			return err
+		}
+		envelope.Payload = append(json.RawMessage(nil), payload...)
+		envelope.Checksum = checksumBboltEnvelopeForTest(envelope.Kind, envelope.SchemaVersion, envelope.Revision, []byte("authority"), envelope.Payload)
+		encoded, err := json.Marshal(envelope)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte("authority"), encoded)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checksumBboltEnvelopeForTest(kind string, schemaVersion uint16, revision uint64, key, payload []byte) string {
+	hash := sha256.New()
+	checksumBboltFieldForTest(hash, kind)
+	checksumBboltFieldForTest(hash, strconv.FormatUint(uint64(schemaVersion), 10))
+	checksumBboltFieldForTest(hash, strconv.FormatUint(revision, 10))
+	checksumBboltFieldForTest(hash, string(key))
+	checksumBboltFieldForTest(hash, string(payload))
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func checksumBboltFieldForTest(hash interface{ Write([]byte) (int, error) }, value string) {
+	_, _ = hash.Write([]byte(strconv.Itoa(len(value))))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(value))
+	_, _ = hash.Write([]byte{0})
 }
 
 func copyFile(dst, src string) error {

@@ -32,6 +32,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
+	"github.com/charlesnpx/agentbus/internal/containment"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -260,8 +261,12 @@ func (s *fakeSession) TurnWithRunner(ctx context.Context, input engine.TurnInput
 		if stdout := running.Stdout(); stdout != nil {
 			_, _ = io.Copy(io.Discard, stdout)
 		}
-		if _, err := running.Wait(ctx); err != nil {
-			ch <- engine.Event{Type: engine.EventTerminalError, Text: err.Error()}
+		observation := testFinalObservation(ctx, running)
+		if observation.CleanupErr != nil {
+			ch <- engine.Event{Type: engine.EventWarning, Text: observation.CleanupErr.Error()}
+		}
+		if observation.ExecutionErr != nil {
+			ch <- engine.Event{Type: engine.EventTerminalError, Text: observation.ExecutionErr.Error()}
 			<-stderrDone
 			return
 		}
@@ -310,6 +315,21 @@ func (s *nonOrdinalSession) Interrupt(context.Context) error { return nil }
 func (s *fakeSession) Interrupt(context.Context) error {
 	s.backend.interrupts.Add(1)
 	return nil
+}
+
+func testFinalObservation(ctx context.Context, running command.RunningCommand) command.FinalObservation {
+	exit, waitErr := running.Wait(ctx)
+	if observer, ok := running.(command.FinalObserver); ok {
+		observation, err := observer.FinalObservation(context.WithoutCancel(ctx))
+		if observation.Exit == (command.ExitObservation{}) {
+			observation.Exit = exit
+		}
+		if observation.ExecutionErr == nil && observation.CleanupErr == nil {
+			observation.ExecutionErr = errors.Join(waitErr, err)
+		}
+		return observation
+	}
+	return command.FinalObservation{Exit: exit, ExecutionErr: waitErr}
 }
 
 type unsafeNamedBackend struct {
@@ -469,8 +489,8 @@ func TestListenUnixSocketPrivateChmodsBeforeListen(t *testing.T) {
 
 	ln, identity, err := server.listen()
 	if err != nil {
-		if strings.Contains(err.Error(), "bind: operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		if servedTestBindDeniedOutput(err.Error()) {
+			servedTestSkipOrFailBindDenied(t, "server listen", err)
 		}
 		t.Fatal(err)
 	}
@@ -537,8 +557,8 @@ func TestListenUnixSocketPrivateDetectsPreListenPathReplacement(t *testing.T) {
 		_ = ln.Close()
 		t.Fatal("listen succeeded after pre-listen socket replacement")
 	}
-	if strings.Contains(err.Error(), "bind: operation not permitted") {
-		t.Skipf("Unix socket bind denied by sandbox: %v", err)
+	if servedTestBindDeniedOutput(err.Error()) {
+		servedTestSkipOrFailBindDenied(t, "server listen replacement", err)
 	}
 	if !hookCalled {
 		t.Fatal("before-listen hook was not called")
@@ -1605,6 +1625,257 @@ func TestAdmissionRecoveryExecutorBoundCurrentObligationContainsOnlyDurableGroup
 	if reason := server.safetyLatch.Reason(); reason != nil {
 		t.Fatalf("safety latch tripped: %v", reason)
 	}
+}
+
+func TestAdmissionRecoveryExecutorAttemptsRemainingLaunchBeforeUnresolvedFinalization(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	jobID := model.JobID("job-recovery-all-ordinals")
+	ref := model.AttemptRef{JobID: jobID, AttemptID: "attempt-recovery-all-ordinals", Epoch: 1}
+	secondGroup := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalTwo})
+	boot, err := model.NewBootRef("boot-recovery-all-ordinals-new", "owner-recovery-all-ordinals-new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := model.RecoveryToken{JobID: jobID, BasedOnRevision: 3, RecoveryBoot: boot, Opaque: "recovery-all-ordinals-token"}
+	item := model.RecoveryWorkItem{
+		Token:           token,
+		JobID:           jobID,
+		BasedOnRevision: token.BasedOnRevision,
+		Trigger:         model.RecoveryStartupLoss,
+		// Reachable production topology: ordinal 1 has already reached durable
+		// quiescence, so startup recovery only receives the remaining live
+		// ordinal.
+		Launches: []model.RecoveryLaunch{{Ordinal: model.LaunchOrdinalTwo, Group: secondGroup}},
+	}
+	session := &admissionRecoveryFakeSession{
+		items: []model.RecoveryWorkItem{item},
+		finalized: model.SafetyRecord{
+			JobID: jobID,
+			Terminal: &model.TerminalCertificate{
+				Outcome: model.OutcomeOrphaned,
+				Proof:   model.ProofUnresolvedAbsence,
+				Cause:   model.CauseDaemonRestartedAfterAuthorization,
+			},
+		},
+	}
+	launcher.containErrByOrdinal = map[model.LaunchOrdinal]error{
+		model.LaunchOrdinalTwo: &custodian.CleanupUnresolvedError{Reason: containment.ReasonProbeUnprovable, Decision: model.Unprovable},
+	}
+
+	latch := NewSafetyLatch()
+	report, err := recoverAdmissionBeforeReadyReport(ctx, session, launcher, latch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.QuiescedLaunches != 0 || report.UnresolvedLaunches != 1 || report.FinalizedJobs != 1 || report.OrphanedJobs != 1 {
+		t.Fatalf("recovery report = %+v, want one unresolved remaining launch and one orphaned job", report)
+	}
+	if session.finalizeUnresolvedCalls != 1 {
+		t.Fatalf("FinalizeUnresolved calls = %d, want 1", session.finalizeUnresolvedCalls)
+	}
+	if len(session.recordedOrdinals) != 0 {
+		t.Fatalf("recorded ordinals = %v, want none for already-quiesced ordinal 1", session.recordedOrdinals)
+	}
+	contains := launcher.containObservations()
+	if len(contains) != 1 {
+		t.Fatalf("contain attempts = %d, want remaining ordinal attempted", len(contains))
+	}
+	if contains[0].group.Launch.Ordinal != model.LaunchOrdinalTwo {
+		t.Fatalf("contain ordinal = %s; want 2", contains[0].group.Launch.Ordinal)
+	}
+	if reason := latch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+}
+
+func TestAdmissionRecoveryExecutorFinalizePlannedCancellationAbortsWithoutFailStop(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	jobID := model.JobID("job-recovery-finalize-planned-cancel")
+	boot, err := model.NewBootRef("boot-recovery-finalize-planned-cancel", "owner-recovery-finalize-planned-cancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := model.RecoveryToken{JobID: jobID, BasedOnRevision: 2, RecoveryBoot: boot, Opaque: "recovery-finalize-planned-cancel-token"}
+	session := &admissionRecoveryFakeSession{
+		items: []model.RecoveryWorkItem{{
+			Token:           token,
+			JobID:           jobID,
+			BasedOnRevision: token.BasedOnRevision,
+			Trigger:         model.RecoveryStartupLoss,
+		}},
+		finalizePlannedErr: context.Canceled,
+	}
+	latch := NewSafetyLatch()
+
+	_, err = recoverAdmissionBeforeReadyReport(ctx, session, launcher, latch)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("recovery error = %v, want context.Canceled", err)
+	}
+	if session.finalizePlannedCalls != 1 {
+		t.Fatalf("FinalizePlanned calls = %d, want 1", session.finalizePlannedCalls)
+	}
+	if reason := latch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+}
+
+func TestAdmissionRecoveryExecutorReportsCleanupWarningAfterQuiescence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cleanupErr := errors.New("recovery cleanup failed after proof")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.cleanupErr = cleanupErr
+	jobID := model.JobID("job-recovery-cleanup-warning")
+	ref := model.AttemptRef{JobID: jobID, AttemptID: "attempt-recovery-cleanup-warning", Epoch: 1}
+	group := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne})
+	boot, err := model.NewBootRef("boot-recovery-cleanup-warning", "owner-recovery-cleanup-warning")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := model.RecoveryToken{JobID: jobID, BasedOnRevision: 2, RecoveryBoot: boot, Opaque: "recovery-cleanup-warning-token"}
+	session := &admissionRecoveryFakeSession{
+		items: []model.RecoveryWorkItem{{
+			Token:           token,
+			JobID:           jobID,
+			BasedOnRevision: token.BasedOnRevision,
+			Trigger:         model.RecoveryStartupLoss,
+			Launches:        []model.RecoveryLaunch{{Ordinal: model.LaunchOrdinalOne, Group: group}},
+		}},
+		afterAdvance: model.RecoveryWorkItem{
+			Token:           token,
+			JobID:           jobID,
+			BasedOnRevision: token.BasedOnRevision,
+			Trigger:         model.RecoveryStartupLoss,
+		},
+	}
+	latch := NewSafetyLatch()
+
+	report, err := recoverAdmissionBeforeReadyReport(ctx, session, launcher, latch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.QuiescedLaunches != 1 || report.CleanupWarnings != 1 || report.FinalizedJobs != 1 {
+		t.Fatalf("recovery report = %+v, want one quiesced launch, cleanup warning, and finalized job", report)
+	}
+	if session.finalizePlannedCalls != 1 {
+		t.Fatalf("FinalizePlanned calls = %d, want 1", session.finalizePlannedCalls)
+	}
+	if len(session.recordedOrdinals) != 1 || session.recordedOrdinals[0] != model.LaunchOrdinalOne {
+		t.Fatalf("recorded ordinals = %v, want ordinal 1", session.recordedOrdinals)
+	}
+	if reason := latch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+}
+
+func TestAdmissionRecoveryExecutorTypedUnresolvedContinuesStartupWithoutRelaunch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	oldReady, accepted := newPriorBootAuthorityWork(t, repo, anchorStore, launcher, "recovery-orphan-continues")
+	ref := accepted.Record.Attempt.Ref
+	group := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne})
+	if _, err := oldReady.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := oldReady.AllocateGrant(ctx, ref, model.LaunchOrdinalOne); err != nil {
+		t.Fatal(err)
+	}
+	launcher.containErrByOrdinal = map[model.LaunchOrdinal]error{
+		model.LaunchOrdinalOne: &custodian.CleanupUnresolvedError{Reason: containment.ReasonAbsenceDeadlineExceeded, Decision: model.SignalDirectly},
+	}
+
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+
+	if server.admissionReady == nil {
+		t.Fatal("admission did not seal ready after typed unresolved recovery")
+	}
+	if reason := server.safetyLatch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
+	if snapshot := admissionAnchorSnapshot(t, anchorStore); snapshot.Phase == "fail_stopped" {
+		t.Fatalf("anchor phase = %q, want non-fail-stopped after typed unresolved recovery", snapshot.Phase)
+	}
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want no recovery relaunch", got)
+	}
+	image, err := server.admissionReady.LoadJob(ctx, accepted.Record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := image.Safety.Value
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeOrphaned || record.Terminal.Proof != model.ProofUnresolvedAbsence {
+		t.Fatalf("terminal = %+v, want orphaned unresolved", record.Terminal)
+	}
+	if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionUnresolved {
+		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
+	}
+	replay, err := server.admissionReady.LookupReplay(ctx, accepted.Binding.RequestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.State != authority.ReplayLive || replay.Record.JobID != accepted.Record.JobID || replay.Record.Terminal == nil || replay.Projection.Public != model.PublicOrphaned {
+		t.Fatalf("orphaned replay = %+v, want original terminal orphaned job %s", replay, accepted.Record.JobID)
+	}
+	newSubmit := submitIdentifiedForReplayTest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-recovery-orphan-continues-new",
+		RequestID:    "request-recovery-orphan-continues-new",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Write:   false,
+			Prompt:  "after orphaned recovery",
+		},
+	})
+	if newSubmit.JobID == string(accepted.Record.JobID) || newSubmit.Deduplicated {
+		t.Fatalf("new submit after orphaned recovery = %+v, want new accepted job", newSubmit)
+	}
+}
+
+type admissionRecoveryFakeSession struct {
+	items                   []model.RecoveryWorkItem
+	afterAdvance            model.RecoveryWorkItem
+	finalized               model.SafetyRecord
+	finalizePlannedErr      error
+	recordedOrdinals        []model.LaunchOrdinal
+	finalizePlannedCalls    int
+	finalizeUnresolvedCalls int
+}
+
+func (s *admissionRecoveryFakeSession) WorkItems(context.Context) ([]model.RecoveryWorkItem, error) {
+	return append([]model.RecoveryWorkItem(nil), s.items...), nil
+}
+
+func (s *admissionRecoveryFakeSession) AdvanceRecovery(context.Context, model.RecoveryToken) (model.RecoveryWorkItem, error) {
+	return s.afterAdvance, nil
+}
+
+func (s *admissionRecoveryFakeSession) FinalizePlanned(context.Context, model.RecoveryToken) error {
+	s.finalizePlannedCalls++
+	if s.finalizePlannedErr != nil {
+		return s.finalizePlannedErr
+	}
+	s.items = nil
+	return nil
+}
+
+func (s *admissionRecoveryFakeSession) FinalizeUnresolved(context.Context, model.RecoveryToken) (model.SafetyRecord, error) {
+	s.finalizeUnresolvedCalls++
+	s.items = nil
+	return s.finalized, nil
+}
+
+func (s *admissionRecoveryFakeSession) RecordQuiescence(_ context.Context, _ any, ordinal model.LaunchOrdinal, _ custodian.VerifiedQuiescence) error {
+	s.recordedOrdinals = append(s.recordedOrdinals, ordinal)
+	return nil
 }
 
 func TestAdmissionRecoveryExecutorTripsLatchWhenContainmentUnprovable(t *testing.T) {
@@ -3112,6 +3383,274 @@ func TestAuthorityJobCancelHeldStartPostReleasePreRegistration(t *testing.T) {
 	}
 }
 
+func TestAuthorityJobCancelInterruptRaceTerminalizesCanceled(t *testing.T) {
+	t.Run("runner finalizes before handler cancel completes", func(t *testing.T) {
+		holdNaturalExit := make(chan struct{})
+		defer close(holdNaturalExit)
+		releaseRunner := make(chan struct{})
+		var releaseRunnerOnce sync.Once
+		releaseRun := func() { releaseRunnerOnce.Do(func() { close(releaseRunner) }) }
+		defer releaseRun()
+
+		backend := newFakeBackend("fake")
+		backend.started = make(chan struct{}, 1)
+		backend.block = releaseRunner
+		server, _, cwd := newUnstartedTestServer(t, backend)
+		launcher := newAdmissionFakeLaunchCustodian(t)
+		launcher.waitAndVerify = holdNaturalExit
+		enableTestAdmission(t, server, launcher)
+		finalizes := installRecordingAdmissionAuthorityForTest(t, server)
+
+		firstRequestCancel := make(chan struct{})
+		secondRequestCancel := make(chan struct{})
+		allowFirstRequestCancel := make(chan struct{})
+		var requestCancels atomic.Int32
+		var releaseFirstOnce sync.Once
+		releaseFirstRequestCancel := func() {
+			releaseFirstOnce.Do(func() { close(allowFirstRequestCancel) })
+		}
+		defer releaseFirstRequestCancel()
+		finalizes.beforeRequestCancel = func(ctx context.Context, jobID model.JobID) error {
+			switch requestCancels.Add(1) {
+			case 1:
+				close(firstRequestCancel)
+				select {
+				case <-allowFirstRequestCancel:
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(5 * time.Second):
+					return errors.New("held first request cancel timed out")
+				}
+			case 2:
+				close(secondRequestCancel)
+			}
+			return nil
+		}
+
+		conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+			WorkspaceKey: "workspace-authority-cancel-interrupt-race",
+			RequestID:    "request-authority-cancel-interrupt-race",
+			TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+		}, nil)
+		resp := responseFromScriptedConn(t, conn)
+		var submitted protocol.JobSubmitResult
+		decodeResult(t, resp, &submitted)
+		waitBackendStarted(t, backend)
+
+		cancelDone := make(chan requestOutcome, 1)
+		go func() {
+			cancelDone <- server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: submitted.JobID}))
+		}()
+
+		select {
+		case <-firstRequestCancel:
+		case <-time.After(time.Second):
+			t.Fatal("handler cancel did not enter RequestCancel")
+		}
+		releaseRun()
+		select {
+		case <-secondRequestCancel:
+		case <-time.After(time.Second):
+			t.Fatal("runner finalization did not enter cancel-derived RequestCancel")
+		}
+
+		record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+		if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority terminal = %+v, want canceled after authorization", record.Terminal)
+		}
+		if record.Cancel == nil {
+			t.Fatalf("cancel fact missing after runner finalization: %+v", record)
+		}
+		if reason := server.safetyLatch.Reason(); reason != nil {
+			t.Fatalf("safety latch tripped: %v", reason)
+		}
+		select {
+		case outcome := <-cancelDone:
+			t.Fatalf("handler cancel completed before its held RequestCancel was released: %+v", outcome)
+		default:
+		}
+
+		releaseFirstRequestCancel()
+		select {
+		case outcome := <-cancelDone:
+			if outcome.err != nil {
+				t.Fatalf("job.cancel error = %+v", outcome.err)
+			}
+			canceled, ok := outcome.result.(protocol.JobCancelResult)
+			if !ok {
+				t.Fatalf("job.cancel result type = %T", outcome.result)
+			}
+			if canceled.JobID != submitted.JobID || canceled.State != engine.StateCanceled {
+				t.Fatalf("job.cancel result = %+v, want canceled job %s", canceled, submitted.JobID)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("handler cancel did not finish after held RequestCancel was released")
+		}
+		waitActiveJobGone(t, server, submitted.JobID)
+		intents := finalizes.finalizeIntents()
+		if len(intents) != 1 || intents[0].Outcome != model.OutcomeCanceled || intents[0].Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority finalize intents = %+v, want exactly one canceled-after-authorization terminal", intents)
+		}
+		if reason := server.safetyLatch.Reason(); reason != nil {
+			t.Fatalf("safety latch tripped after handler cancel completed: %v", reason)
+		}
+	})
+
+	t.Run("handler cancel finalizes before runner", func(t *testing.T) {
+		holdNaturalExit := make(chan struct{})
+		defer close(holdNaturalExit)
+		releaseRunner := make(chan struct{})
+		var releaseRunnerOnce sync.Once
+		releaseRun := func() { releaseRunnerOnce.Do(func() { close(releaseRunner) }) }
+		defer releaseRun()
+
+		backend := newFakeBackend("fake")
+		backend.started = make(chan struct{}, 1)
+		backend.block = releaseRunner
+		server, _, cwd := newUnstartedTestServer(t, backend)
+		launcher := newAdmissionFakeLaunchCustodian(t)
+		launcher.waitAndVerify = holdNaturalExit
+		enableTestAdmission(t, server, launcher)
+		finalizes := installRecordingAdmissionAuthorityForTest(t, server)
+
+		conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+			WorkspaceKey: "workspace-authority-cancel-handler-first",
+			RequestID:    "request-authority-cancel-handler-first",
+			TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+		}, nil)
+		resp := responseFromScriptedConn(t, conn)
+		var submitted protocol.JobSubmitResult
+		decodeResult(t, resp, &submitted)
+		waitBackendStarted(t, backend)
+
+		canceled := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: submitted.JobID})
+		if canceled.JobID != submitted.JobID || canceled.State != engine.StateCanceled {
+			t.Fatalf("job.cancel result = %+v, want canceled job %s", canceled, submitted.JobID)
+		}
+		record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+		if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority terminal = %+v, want canceled after authorization", record.Terminal)
+		}
+		if reason := server.safetyLatch.Reason(); reason != nil {
+			t.Fatalf("safety latch tripped: %v", reason)
+		}
+		releaseRun()
+		waitActiveJobGone(t, server, submitted.JobID)
+		after := loadAdmissionSafetyRecord(t, server, submitted.JobID)
+		if after.Terminal == nil || after.Terminal.Outcome != model.OutcomeCanceled || after.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority terminal after runner resumed = %+v, want unchanged canceled terminal", after.Terminal)
+		}
+		intents := finalizes.finalizeIntents()
+		if len(intents) != 1 || intents[0].Outcome != model.OutcomeCanceled || intents[0].Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority finalize intents = %+v, want exactly one canceled-after-authorization terminal", intents)
+		}
+		if reason := server.safetyLatch.Reason(); reason != nil {
+			t.Fatalf("safety latch tripped after runner resumed: %v", reason)
+		}
+	})
+
+	t.Run("late completed sample reconciles already canceled terminal", func(t *testing.T) {
+		backend := newFakeBackend("fake")
+		backend.started = make(chan struct{}, 1)
+		server, _, cwd := newUnstartedTestServer(t, backend)
+		launcher := newAdmissionFakeLaunchCustodian(t)
+		enableTestAdmission(t, server, launcher)
+		finalizes := installRecordingAdmissionAuthorityForTest(t, server)
+
+		runnerRecordOutcome := make(chan struct{})
+		allowRunnerRecordOutcome := make(chan struct{})
+		var enteredOutcomeOnce sync.Once
+		var releaseOutcomeOnce sync.Once
+		releaseRunnerOutcome := func() {
+			releaseOutcomeOnce.Do(func() { close(allowRunnerRecordOutcome) })
+		}
+		defer releaseRunnerOutcome()
+		finalizes.beforeRecordOutcome = func(ctx context.Context, _ model.JobID, _ model.AttemptRef, outcome model.Outcome) error {
+			if outcome != model.OutcomeCompleted {
+				return nil
+			}
+			enteredOutcomeOnce.Do(func() { close(runnerRecordOutcome) })
+			select {
+			case <-allowRunnerRecordOutcome:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+				return errors.New("held runner RecordOutcome timed out")
+			}
+		}
+
+		conn := serveScriptedRequest(t, server, protocol.MethodJobSubmit, protocol.JobSubmitParams{
+			WorkspaceKey: "workspace-authority-cancel-late-completed-sample",
+			RequestID:    "request-authority-cancel-late-completed-sample",
+			TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "done"},
+		}, nil)
+		resp := responseFromScriptedConn(t, conn)
+		var submitted protocol.JobSubmitResult
+		decodeResult(t, resp, &submitted)
+		waitBackendStarted(t, backend)
+
+		select {
+		case <-runnerRecordOutcome:
+		case <-time.After(5 * time.Second):
+			t.Fatal("runner completion did not enter RecordOutcome")
+		}
+
+		canceled := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: submitted.JobID})
+		if canceled.JobID != submitted.JobID || canceled.State != engine.StateCanceled {
+			t.Fatalf("job.cancel result = %+v, want canceled job %s", canceled, submitted.JobID)
+		}
+		record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+		if err := model.ValidateSafetyRecord(record); err != nil {
+			t.Fatalf("canceled terminal record is invalid: %v", err)
+		}
+		if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority terminal = %+v, want canceled after authorization", record.Terminal)
+		}
+		if reason := server.safetyLatch.Reason(); reason != nil {
+			t.Fatalf("safety latch tripped before runner resumed: %v", reason)
+		}
+
+		releaseRunnerOutcome()
+		waitActiveJobGone(t, server, submitted.JobID)
+		after := loadAdmissionSafetyRecord(t, server, submitted.JobID)
+		if err := model.ValidateSafetyRecord(after); err != nil {
+			t.Fatalf("terminal record after runner resumed is invalid: %v", err)
+		}
+		if after.Terminal == nil || after.Terminal.Outcome != model.OutcomeCanceled || after.Terminal.Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority terminal after runner resumed = %+v, want unchanged canceled terminal", after.Terminal)
+		}
+		intents := finalizes.finalizeIntents()
+		if len(intents) != 1 || intents[0].Outcome != model.OutcomeCanceled || intents[0].Cause != model.CauseCanceledAfterAuthorization {
+			t.Fatalf("authority finalize intents = %+v, want exactly one canceled-after-authorization terminal", intents)
+		}
+		if reason := server.safetyLatch.Reason(); reason != nil {
+			t.Fatalf("safety latch tripped after runner reconciled: %v", reason)
+		}
+	})
+}
+
+func TestAdmissionFinalizationUnexpectedFailureStillFailStops(t *testing.T) {
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	accepted := acceptIdentifiedAuthorityWork(t, server, "unexpected-finalization-failure")
+	jobID := accepted.Record.JobID.String()
+
+	server.completeRunTerminal(jobRun{jobID: jobID, admissionControlled: true}, engine.StateCompleted, "done", nil)
+
+	reason := server.safetyLatch.Reason()
+	if reason == nil {
+		t.Fatal("safety latch did not trip after unexpected finalization failure")
+	}
+	if errors.Is(reason, coordinator.ErrAlreadyFinalized) {
+		t.Fatalf("safety latch reason = %v, want non-reconciled finalization failure", reason)
+	}
+	record := loadAuthoritySafetyRecordFromRepository(t, server.admissionRepository, jobID)
+	if record.Terminal != nil {
+		t.Fatalf("unexpected finalization terminalized record: %+v", record.Terminal)
+	}
+}
+
 func TestAdmissionActiveRunnerInterruptsCommandForAuthorityCancel(t *testing.T) {
 	t.Parallel()
 	t.Run("later cancel", func(t *testing.T) {
@@ -3809,6 +4348,38 @@ func TestServeFailsPreListenerWhenProjectionAndBindingCorrupt(t *testing.T) {
 	}
 	if listenCalled {
 		t.Fatal("listener was called despite authoritative binding corruption")
+	}
+}
+
+func TestServeFailsPreListenerOnStartupStructuralCorruption(t *testing.T) {
+	root := shortTempDir(t)
+	cwd := shortTempDir(t)
+	if _, err := authority.ResetEmptyAdmissionRoot(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+	repoPath := filepath.Join(root, admissionRepositoryFile)
+	truncateAdmissionRepository(t, repoPath)
+	before := readFileBytes(t, repoPath)
+
+	server := newTestServerAtRoot(t, root, cwd, newFakeBackend("fake"))
+	configureTestAdmissionRuntime(t, server, newAdmissionFakeLaunchCustodian(t), true)
+	listenCalled := false
+	server.listenerFactory = func() (net.Listener, socketFileIdentity, error) {
+		listenCalled = true
+		return nil, socketFileIdentity{}, errors.New("listener must not open for structural corruption")
+	}
+
+	err := server.Serve(context.Background())
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("Serve error = %T %v, want structural corruption", err, err)
+	}
+	if listenCalled {
+		t.Fatal("listener was called despite startup structural corruption")
+	}
+	assertNoServeAdmissionPublished(t, server)
+	after := readFileBytes(t, repoPath)
+	if !bytes.Equal(before, after) {
+		t.Fatal("structural startup failure mutated admission repository")
 	}
 }
 
@@ -5289,6 +5860,164 @@ func TestResultMessageWinsOverAssistantTextWithoutDuplication(t *testing.T) {
 	}
 }
 
+func TestAdmissionRunPreservesResultWhenCleanupUnresolvedAfterZeroExit(t *testing.T) {
+	t.Parallel()
+	unresolved := &custodian.CleanupUnresolvedError{
+		Reason:   containment.ReasonAbsenceDeadlineExceeded,
+		Decision: model.SignalDirectly,
+	}
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{{Type: engine.EventResultMessage, Text: "final report"}}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitErr = unresolved
+	launcher.containErr = unresolved
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-cleanup-unresolved-complete",
+		RequestID:    "request-cleanup-unresolved-complete",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "cleanup unresolved"},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCompleted || record.Terminal.Proof != model.ProofUnresolvedAbsence {
+		t.Fatalf("terminal = %+v, want completed unresolved absence", record.Terminal)
+	}
+	if first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne); !ok || first.Quiescence != nil {
+		t.Fatalf("ordinal 1 quiescence = %+v, want absent", first.Quiescence)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if result.State != engine.StateCompleted || result.CleanupDisposition != model.CleanupDispositionUnresolved.String() {
+		t.Fatalf("job result state/cleanup = %s/%s, want completed/unresolved", result.State, result.CleanupDisposition)
+	}
+	if result.Result == nil || result.Result.Text != "final report" {
+		t.Fatalf("result payload = %+v, want preserved final report", result.Result)
+	}
+}
+
+func TestAdmissionRunPreservesResultWhenPostQuiescenceCleanupWarns(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{{Type: engine.EventResultMessage, Text: "verified report"}}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.cleanupErr = errors.New("cleanup warning after proof")
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-cleanup-warning-complete",
+		RequestID:    "request-cleanup-warning-complete",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "cleanup warning"},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCompleted {
+		t.Fatalf("terminal = %+v, want completed", record.Terminal)
+	}
+	if first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne); !ok || first.Quiescence == nil {
+		t.Fatalf("ordinal 1 launch = %+v, want quiescence recorded", first)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if result.State != engine.StateCompleted || result.CleanupDisposition != model.CleanupDispositionVerifiedAbsent.String() {
+		t.Fatalf("job result state/cleanup = %s/%s, want completed/verified_absent", result.State, result.CleanupDisposition)
+	}
+	if result.Result == nil || result.Result.Text != "verified report" {
+		t.Fatalf("result payload = %+v, want preserved verified report", result.Result)
+	}
+}
+
+func TestAdmissionActiveCancelCommitsUnresolvedCleanupInsteadOfRPCError(t *testing.T) {
+	t.Parallel()
+	holdNaturalExit := make(chan struct{})
+	defer close(holdNaturalExit)
+	unresolved := &custodian.CleanupUnresolvedError{
+		Reason:   containment.ReasonProbeUnprovable,
+		Decision: model.Unprovable,
+	}
+	backend := newFakeBackend("fake")
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitAndVerify = holdNaturalExit
+	launcher.containErr = unresolved
+	enableTestAdmission(t, server, launcher)
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-active-cancel-unresolved",
+		RequestID:    "request-active-cancel-unresolved",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold for cancel"},
+	})
+	waitBackendStarted(t, backend)
+
+	cancel := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: job.JobID})
+	if cancel.State != engine.StateCanceled {
+		t.Fatalf("job.cancel = %+v, want canceled", cancel)
+	}
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Proof != model.ProofUnresolvedAbsence {
+		t.Fatalf("terminal = %+v, want canceled unresolved absence", record.Terminal)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if result.State != engine.StateCanceled || result.CleanupDisposition != model.CleanupDispositionUnresolved.String() {
+		t.Fatalf("job result state/cleanup = %s/%s, want canceled/unresolved", result.State, result.CleanupDisposition)
+	}
+	if err := server.safetyFailStopErr(); err != nil {
+		t.Fatalf("authority root fail-stopped after cleanup uncertainty: %v", err)
+	}
+}
+
+func TestAdmissionUnresolvedTerminalAbandonsActiveCustodyAndDrains(t *testing.T) {
+	t.Parallel()
+	unresolved := &custodian.CleanupUnresolvedError{
+		Reason:   containment.ReasonAbsenceDeadlineExceeded,
+		Decision: model.SignalDirectly,
+	}
+	backend := newFakeBackend("fake")
+	backend.started = make(chan struct{}, 2)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitErr = unresolved
+	launcher.containErr = unresolved
+	launcher.activeCustodies.Store(true)
+	enableTestAdmission(t, server, launcher)
+
+	first := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-abandon-unresolved",
+		RequestID:    "request-abandon-unresolved-first",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "first unresolved"},
+	})
+	waitBackendStarted(t, backend)
+	record := waitAdmissionSafetyTerminal(t, server, first.JobID)
+	waitActiveJobGone(t, server, first.JobID)
+	if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionUnresolved {
+		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
+	}
+	if launcher.HasActiveCustodies() {
+		t.Fatal("launcher still reports active custody after unresolved terminal")
+	}
+	if got := launcher.abandonCount(); got != 1 {
+		t.Fatalf("abandon count = %d, want 1", got)
+	}
+	if server.activeWorkWithContext(context.Background()) {
+		t.Fatal("server still treats unresolved terminal job as active work")
+	}
+
+	launcher.waitErr = nil
+	launcher.containErr = nil
+	second := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-abandon-unresolved",
+		RequestID:    "request-abandon-unresolved-second",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "second runs"},
+	})
+	waitBackendStarted(t, backend)
+	secondRecord := waitAdmissionSafetyTerminal(t, server, second.JobID)
+	if secondRecord.Terminal == nil || secondRecord.Terminal.Outcome != model.OutcomeCompleted {
+		t.Fatalf("second terminal = %+v, want completed", secondRecord.Terminal)
+	}
+}
+
 func TestConcurrentBackgroundJobs(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
@@ -5351,6 +6080,63 @@ func TestDeferredLaunchRunsOnlyAfterSuccessfulAck(t *testing.T) {
 	}
 	close(release)
 	waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+}
+
+func TestLiveReleaseAckLossUnprovableAbsenceTerminalizesOrphanedWithoutRelaunch(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.releaseOutcome = custodian.ReleaseOutcomeUnknown
+	launcher.releaseErr = errors.New("release ack lost after send")
+	launcher.containErr = &custodian.CleanupUnresolvedError{
+		Reason:   containment.ReasonProbeUnprovable,
+		Decision: model.Unprovable,
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, launcher)
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-live-release-ack-loss-unresolved",
+		RequestID:    "request-live-release-ack-loss-unresolved",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "ack lost"},
+	}
+
+	submitted := submitIdentifiedViaScriptedRequest(t, server, params)
+	record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+	if record.Terminal == nil ||
+		record.Terminal.Outcome != model.OutcomeOrphaned ||
+		record.Terminal.Proof != model.ProofUnresolvedAbsence ||
+		record.Terminal.Cause != model.CauseReleaseOutcomeUnknown {
+		t.Fatalf("terminal = %+v, want orphaned release_outcome_unknown unresolved absence", record.Terminal)
+	}
+	if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionUnresolved {
+		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
+	}
+	if got := launcher.releaseCount(); got != 1 {
+		t.Fatalf("release attempts = %d, want 1", got)
+	}
+	if got := launcher.containCount(); got != 1 {
+		t.Fatalf("contain attempts = %d, want 1", got)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend sessions = %d, want 1", got)
+	}
+
+	replay := replayIdentifiedSubmit(t, server, params)
+	if replay.JobID != submitted.JobID || !replay.Deduplicated || replay.State != engine.StateOrphaned {
+		t.Fatalf("replay = %+v, want same orphaned terminal job %s", replay, submitted.JobID)
+	}
+	if got := launcher.releaseCount(); got != 1 {
+		t.Fatalf("release attempts after replay = %d, want unchanged 1", got)
+	}
+	if got := launcher.containCount(); got != 1 {
+		t.Fatalf("contain attempts after replay = %d, want unchanged 1", got)
+	}
+	if got := backend.count.Load(); got != 1 {
+		t.Fatalf("backend sessions after replay = %d, want unchanged 1", got)
+	}
+	if reason := server.safetyLatch.Reason(); reason != nil {
+		t.Fatalf("safety latch tripped: %v", reason)
+	}
 }
 
 func TestHeartbeatRacingCompletionDoesNotResurrectTerminalRecord(t *testing.T) {
@@ -5456,10 +6242,18 @@ func TestFinalizeCompletedSalvagesReapedJobOnlyWithAuthoritativeCompletion(t *te
 	if err := server.createQueuedRecord(store, jobID, "ses_reaped", "fake", nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning, engine.StateOrphaned, engine.StateReaped} {
+	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning, engine.StateOrphaned} {
 		if err := server.transitionRecord(store, jobID, state); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
+		if err := record.Transition(engine.StateReaped, server.clock.Now().UTC()); err != nil {
+			return false, err
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if err := server.finalizeTerminal(jobRun{jobID: jobID, store: store}, engine.StateCompleted, "ignored", nil); err != nil {
 		t.Fatal(err)
@@ -6236,8 +7030,8 @@ func waitForServerReady(t *testing.T, ready <-chan struct{}, done <-chan error) 
 	select {
 	case <-ready:
 	case err := <-done:
-		if err != nil && strings.Contains(err.Error(), "bind: operation not permitted") {
-			t.Skipf("Unix socket bind denied by sandbox: %v", err)
+		if err != nil && servedTestBindDeniedOutput(err.Error()) {
+			servedTestSkipOrFailBindDenied(t, "server ready wait", err)
 		}
 		t.Fatalf("server exited before ready hook: %v", err)
 	case <-time.After(5 * time.Second):
@@ -6345,8 +7139,8 @@ func waitForSocket(t *testing.T, socketPath string, done <-chan error) {
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-done:
-			if err != nil && strings.Contains(err.Error(), "bind: operation not permitted") {
-				t.Skipf("Unix socket bind denied by sandbox: %v", err)
+			if err != nil && servedTestBindDeniedOutput(err.Error()) {
+				servedTestSkipOrFailBindDenied(t, "socket ready wait", err)
 			}
 			t.Fatalf("server exited before socket was ready: %v", err)
 		default:
@@ -6542,8 +7336,29 @@ func newPriorBootAuthorityWork(t *testing.T, repo *memory.Repository, anchorStor
 type recordingAdmissionAuthority struct {
 	*servedAdmissionAuthority
 
+	beforeRequestCancel func(context.Context, model.JobID) error
+	beforeRecordOutcome func(context.Context, model.JobID, model.AttemptRef, model.Outcome) error
+
 	mu              sync.Mutex
 	finalizeRecords []model.TerminalIntent
+}
+
+func (a *recordingAdmissionAuthority) RequestCancel(ctx context.Context, jobID model.JobID) (coordinator.StepResult, error) {
+	if a.beforeRequestCancel != nil {
+		if err := a.beforeRequestCancel(ctx, jobID); err != nil {
+			return coordinator.StepResult{}, err
+		}
+	}
+	return a.servedAdmissionAuthority.RequestCancel(ctx, jobID)
+}
+
+func (a *recordingAdmissionAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) (coordinator.StepResult, error) {
+	if a.beforeRecordOutcome != nil {
+		if err := a.beforeRecordOutcome(ctx, jobID, ref, outcome); err != nil {
+			return coordinator.StepResult{}, err
+		}
+	}
+	return a.servedAdmissionAuthority.RecordOutcome(ctx, jobID, ref, outcome)
 }
 
 func (a *recordingAdmissionAuthority) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent) (coordinator.StepResult, error) {
@@ -6645,7 +7460,9 @@ type admissionFakeLaunchCustodian struct {
 	releases     int
 	aborts       int
 	contains     int
+	abandons     int
 	containments []admissionContainObservation
+	abandoned    []model.GroupRef
 	running      map[string]*admissionFakeRunning
 
 	containCtxErrs      []error
@@ -6660,7 +7477,10 @@ type admissionFakeLaunchCustodian struct {
 	releaseErr                error
 	releaseStarted            chan struct{}
 	containErr                error
+	containErrByOrdinal       map[model.LaunchOrdinal]error
 	cleanupErr                error
+	waitErr                   error
+	waitExit                  command.ExitObservation
 	abortCleanupErr           error
 	waitAndVerify             <-chan struct{}
 	activeCustodies           atomic.Bool
@@ -6692,6 +7512,9 @@ func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.E
 		contained:    make(chan struct{}),
 		wait:         c.waitAndVerify,
 		cleanupErr:   c.cleanupErr,
+		waitErr:      c.waitErr,
+		waitExit:     c.waitExit,
+		containErr:   c.containErr,
 	}
 	c.mu.Lock()
 	c.ordinals = append(c.ordinals, key.Ordinal)
@@ -6714,6 +7537,11 @@ func (c *admissionFakeLaunchCustodian) ContainAndVerify(ctx context.Context, gro
 	c.containCtxErrs = append(c.containCtxErrs, ctx.Err())
 	c.containCtxDeadlines = append(c.containCtxDeadlines, hasDeadline)
 	containErr := c.containErr
+	if c.containErrByOrdinal != nil {
+		if ordinalErr := c.containErrByOrdinal[group.Launch.Ordinal]; ordinalErr != nil {
+			containErr = ordinalErr
+		}
+	}
 	running := c.running[string(group.CustodyID)]
 	cleanupErr := c.cleanupErr
 	c.mu.Unlock()
@@ -6773,6 +7601,29 @@ func (c *admissionFakeLaunchCustodian) runningContained(custodyID model.CustodyI
 
 func (c *admissionFakeLaunchCustodian) HasActiveCustodies() bool {
 	return c != nil && c.activeCustodies.Load()
+}
+
+func (c *admissionFakeLaunchCustodian) AbandonUnresolvedCustody(_ context.Context, group model.GroupRef) error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	c.abandons++
+	c.abandoned = append(c.abandoned, group)
+	running := c.running[string(group.CustodyID)]
+	delete(c.running, string(group.CustodyID))
+	c.activeCustodies.Store(false)
+	c.mu.Unlock()
+	if running != nil {
+		running.closeStreams()
+	}
+	return nil
+}
+
+func (c *admissionFakeLaunchCustodian) abandonCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.abandons
 }
 
 func (c *admissionFakeLaunchCustodian) abortContextObservations() ([]error, []bool) {
@@ -6887,6 +7738,9 @@ type admissionFakeRunning struct {
 	contained    chan struct{}
 	wait         <-chan struct{}
 	cleanupErr   error
+	waitErr      error
+	waitExit     command.ExitObservation
+	containErr   error
 }
 
 func (r *admissionFakeRunning) Ref() model.GroupRef {
@@ -6915,11 +7769,22 @@ func (r *admissionFakeRunning) WaitAndVerify(ctx context.Context) (command.ExitO
 			return command.ExitObservation{}, custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, ctx.Err()
 		}
 	}
+	if r.waitErr != nil {
+		r.closeStreams()
+		exit := r.waitExit
+		if exit == (command.ExitObservation{}) {
+			exit = command.ExitObservation{Exited: true, Code: 0}
+		}
+		return exit, custodian.VerifiedQuiescence{}, custodian.CleanupStatus{Err: r.cleanupErr}, r.waitErr
+	}
 	return r.finish(model.QuiescenceNaturalExit)
 }
 
 func (r *admissionFakeRunning) ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	r.markContained()
+	if r.containErr != nil {
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, r.containErr
+	}
 	_, verified, cleanup, err := r.finish(model.QuiescenceTermKill)
 	return verified, cleanup, err
 }
@@ -6959,15 +7824,17 @@ func admissionTestGroup(key model.LaunchKey) model.GroupRef {
 	name := string(key.Attempt.JobID) + "-" + key.Ordinal.String()
 	pgid := 4100 + int(key.Ordinal)
 	return model.GroupRef{
-		Version:           1,
-		CustodyID:         model.CustodyID("custody-" + name),
-		Launch:            key,
-		HostBootID:        "host-" + name,
-		PIDNamespaceState: model.PIDNamespaceNotApplicable,
-		PGID:              pgid,
-		Leader:            model.ProcessIdentity{PID: pgid, HighResStartToken: "leader-" + name},
-		Monitor:           model.ProcessIdentity{PID: pgid + 100, HighResStartToken: "monitor-" + name},
-		RetainedID:        "retained-" + name,
+		Version:             1,
+		CustodyID:           model.CustodyID("custody-" + name),
+		Launch:              key,
+		HostBootID:          "host-" + name,
+		PIDNamespaceState:   model.PIDNamespaceNotApplicable,
+		RetainedDomainID:    "retained-domain-" + name,
+		RetainedDomainState: model.RetainedDomainKnown,
+		PGID:                pgid,
+		Leader:              model.ProcessIdentity{PID: pgid, HighResStartToken: "leader-" + name},
+		Monitor:             model.ProcessIdentity{PID: pgid + 100, HighResStartToken: "monitor-" + name},
+		RetainedID:          "retained-" + name,
 	}
 }
 

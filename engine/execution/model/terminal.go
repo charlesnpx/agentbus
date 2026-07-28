@@ -22,6 +22,9 @@ func DeriveTerminalCertificate(record SafetyRecord, intent TerminalIntent) (Term
 	if err != nil {
 		return TerminalCertificate{}, err
 	}
+	if !validTerminalCompatibility(record, intent, proof) {
+		return TerminalCertificate{}, precondition("terminal intent is incompatible with cause/outcome/proof table")
+	}
 	return TerminalCertificate{
 		JobID:               record.JobID,
 		Attempt:             record.Attempt.Ref,
@@ -65,22 +68,25 @@ func deriveTerminalProof(record SafetyRecord, intent TerminalIntent) (TerminalPr
 		if hasAnyLaunchEvidence(record.Attempt) {
 			return 0, precondition("legacy unfenced terminal proof requires no launch evidence")
 		}
+		if !validLegacyUnfencedIntent(record, intent) {
+			return 0, precondition("terminal intent is incompatible with legacy-unfenced proof")
+		}
 		return ProofLegacyUnfencedOutcome, nil
 	}
-	if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
-		if !allLaunchGroupsQuiescent(record.Attempt) {
-			return 0, precondition("terminal derivation requires quiescence for every bound group")
-		}
-		if !validNeverPermittedIntent(intent) {
-			return 0, precondition("terminal intent is incompatible with never-permitted proof")
-		}
+	if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) && validNeverPermittedIntent(intent) {
 		return ProofNeverPermittedAndRetired, nil
 	}
-	if allLaunchGroupsQuiescent(record.Attempt) && validContainedIntent(intent) {
+	if hasAnyLaunchEvidence(record.Attempt) && allLaunchGroupsQuiescent(record.Attempt) && validContainedIntent(record, intent) {
 		return ProofContained, nil
 	}
 	if cleanQuiescentOutcomeAndRetired(record, intent) {
 		return ProofCleanQuiescentOutcomeAndRetired, nil
+	}
+	if validExecutionImpossibleIntent(record, intent) {
+		return ProofNeverPermittedAndRetired, nil
+	}
+	if validUnresolvedAbsenceIntent(record, intent) {
+		return ProofUnresolvedAbsence, nil
 	}
 	return 0, precondition("terminal proof predicates are not satisfied")
 }
@@ -112,18 +118,48 @@ func cleanTerminalOutcome(outcome Outcome) bool {
 
 func validNeverPermittedIntent(intent TerminalIntent) bool {
 	switch intent.Cause {
-	case CauseCanceledBeforeAuthorization, CauseResponseUndeliverable:
+	case CauseCanceledBeforeAuthorization:
 		return intent.Outcome == OutcomeCanceled
 	case CauseDaemonRestartedBeforeAuthorization, CauseSupervisorLostBeforeAuthorization:
 		return intent.Outcome == OutcomeFailed
-	case CauseCorruptProjection:
-		return intent.Outcome == OutcomeQuarantined
 	default:
 		return false
 	}
 }
 
-func validContainedIntent(intent TerminalIntent) bool {
+func validExecutionImpossibleIntent(record SafetyRecord, intent TerminalIntent) bool {
+	if !terminalCauseBackedByDurableFact(record, intent.Cause) {
+		return false
+	}
+	switch intent.Cause {
+	case CauseCanceledBeforeAuthorization,
+		CauseDaemonRestartedBeforeAuthorization,
+		CauseSupervisorLostBeforeAuthorization:
+		return !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) && validNeverPermittedIntent(intent)
+	case CauseReleaseDefinitelyNotSent:
+		return intent.Outcome == OutcomeFailed
+	default:
+		return false
+	}
+}
+
+func validContainedIntent(record SafetyRecord, intent TerminalIntent) bool {
+	if !terminalCauseBackedByDurableFact(record, intent.Cause) {
+		return false
+	}
+	if record.Outcome != nil &&
+		record.Outcome.Outcome == intent.Outcome &&
+		recordedOutcomeCausePermitsIntent(intent.Cause, intent.Outcome) {
+		switch intent.Cause {
+		case CauseResponseUndeliverable,
+			CauseCanceledAfterAuthorization,
+			CauseDaemonRestartedAfterAuthorization,
+			CauseSupervisorLostAfterAuthorization,
+			CauseReleaseOutcomeUnknown,
+			CauseCorruptProjection:
+			return true
+		}
+	}
 	switch intent.Cause {
 	case CauseCanceledAfterAuthorization:
 		return intent.Outcome == OutcomeCanceled
@@ -131,8 +167,179 @@ func validContainedIntent(intent TerminalIntent) bool {
 		return intent.Outcome == OutcomeReaped
 	case CauseCorruptProjection:
 		return intent.Outcome == OutcomeQuarantined
-	case CauseReleaseOutcomeUnknown, CauseReleaseDefinitelyNotSent:
+	case CauseReleaseOutcomeUnknown:
+		return intent.Outcome == OutcomeReaped
+	case CauseReleaseDefinitelyNotSent:
 		return intent.Outcome == OutcomeFailed
+	default:
+		return false
+	}
+}
+
+func validUnresolvedAbsenceIntent(record SafetyRecord, intent TerminalIntent) bool {
+	if !terminalCauseBackedByDurableFact(record, intent.Cause) {
+		return false
+	}
+	if !hasAnyGrant(record.Attempt) && !hasAnyRelease(record.Attempt) {
+		return false
+	}
+	if allLaunchGroupsQuiescent(record.Attempt) {
+		return false
+	}
+	if intent.Outcome == OutcomeOrphaned {
+		return record.Outcome == nil && orphanedOutcomeCause(intent.Cause)
+	}
+	if intent.Outcome == OutcomeReaped {
+		return false
+	}
+	if record.Outcome != nil {
+		return record.Outcome.Outcome == intent.Outcome &&
+			recordedOutcomeCausePermitsIntent(intent.Cause, intent.Outcome)
+	}
+	return intent.Cause == CauseCanceledAfterAuthorization && intent.Outcome == OutcomeCanceled
+}
+
+func orphanedOutcomeCause(cause TerminalCause) bool {
+	switch cause {
+	case CauseDaemonRestartedAfterAuthorization, CauseSupervisorLostAfterAuthorization, CauseReleaseOutcomeUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+func validLegacyUnfencedIntent(record SafetyRecord, intent TerminalIntent) bool {
+	if !terminalCauseBackedByDurableFact(record, intent.Cause) {
+		return false
+	}
+	if intent.Outcome == OutcomeOrphaned || intent.Outcome == OutcomeReaped {
+		return false
+	}
+	if record.Outcome != nil {
+		return record.Outcome.Outcome == intent.Outcome &&
+			recordedOutcomeCausePermitsIntent(intent.Cause, intent.Outcome)
+	}
+	return validNeverPermittedIntent(intent)
+}
+
+func validTerminalCompatibility(record SafetyRecord, intent TerminalIntent, proof TerminalProof) bool {
+	if !terminalCauseBackedByDurableFact(record, intent.Cause) {
+		return false
+	}
+	if intent.Outcome == OutcomeOrphaned && record.Result != nil {
+		return false
+	}
+	switch proof {
+	case ProofNeverPermittedAndRetired:
+		return validExecutionImpossibleIntent(record, intent)
+	case ProofCleanQuiescentOutcomeAndRetired:
+		return cleanQuiescentOutcomeAndRetired(record, intent)
+	case ProofContained:
+		return validContainedIntent(record, intent)
+	case ProofLegacyUnfencedOutcome:
+		return validLegacyUnfencedIntent(record, intent)
+	case ProofUnresolvedAbsence:
+		return validUnresolvedAbsenceIntent(record, intent)
+	default:
+		return false
+	}
+}
+
+func recordedOutcomeCausePermitsIntent(cause TerminalCause, outcome Outcome) bool {
+	switch cause {
+	case CauseCompletedNormally:
+		return cleanTerminalOutcome(outcome)
+	case CauseResponseUndeliverable:
+		return recordedExecutionOutcome(outcome)
+	case CauseCanceledAfterAuthorization:
+		return outcome == OutcomeCanceled
+	case CauseDaemonRestartedAfterAuthorization, CauseSupervisorLostAfterAuthorization, CauseReleaseOutcomeUnknown:
+		return recordedExecutionOutcome(outcome)
+	case CauseCorruptProjection:
+		return outcome == OutcomeQuarantined
+	default:
+		return false
+	}
+}
+
+func terminalCauseBackedByDurableFact(record SafetyRecord, cause TerminalCause) bool {
+	switch cause {
+	case CauseReleaseDefinitelyNotSent:
+		return authoritativeLaunchReleaseOutcome(record.Attempt, LaunchReleaseNotSent) &&
+			!hasAttemptExecutionEvidence(record)
+	case CauseReleaseOutcomeUnknown:
+		return authoritativeLaunchReleaseOutcome(record.Attempt, LaunchReleaseSentUnknown) &&
+			!hasRecordedExecutionOutcome(record)
+	default:
+		return true
+	}
+}
+
+func authoritativeLaunchReleaseOutcome(proof AttemptProof, outcome LaunchReleaseOutcome) bool {
+	launch, ok := authoritativeLaunch(proof)
+	return ok && launch.ReleaseOutcome != nil && launch.ReleaseOutcome.Outcome == outcome
+}
+
+func authoritativeLaunch(proof AttemptProof) (*LaunchProof, bool) {
+	ordinals := proof.Launches.FilledOrdinals()
+	for i := len(ordinals) - 1; i >= 0; i-- {
+		if launch, ok := proof.Launches.Get(ordinals[i]); ok {
+			if launch.Grant != nil {
+				return launch, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func hasAttemptExecutionEvidence(record SafetyRecord) bool {
+	if hasRecordedExecutionOutcome(record) {
+		return true
+	}
+	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launch, ok := record.Attempt.Launches.Get(ordinal)
+		if ok && launchHasReleaseSentEvidence(*launch) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRecordedExecutionOutcome(record SafetyRecord) bool {
+	return record.Outcome != nil && recordedExecutionOutcome(record.Outcome.Outcome)
+}
+
+func launchHasReleaseSentEvidence(launch LaunchProof) bool {
+	if launch.Released != nil {
+		return true
+	}
+	if launch.ReleaseOutcome == nil {
+		return false
+	}
+	switch launch.ReleaseOutcome.Outcome {
+	case LaunchReleaseSentUnknown, LaunchReleaseAcked:
+		return true
+	default:
+		return false
+	}
+}
+
+func recordedExecutionOutcome(outcome Outcome) bool {
+	switch outcome {
+	case OutcomeCompleted, OutcomeCompletedNoncompliant, OutcomeFailed, OutcomeTimedOut, OutcomeInterrupted, OutcomeCanceled:
+		return true
+	default:
+		return false
+	}
+}
+
+func executionImpossibleCause(cause TerminalCause) bool {
+	switch cause {
+	case CauseReleaseDefinitelyNotSent,
+		CauseCanceledBeforeAuthorization,
+		CauseDaemonRestartedBeforeAuthorization,
+		CauseSupervisorLostBeforeAuthorization:
+		return true
 	default:
 		return false
 	}

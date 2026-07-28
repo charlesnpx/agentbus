@@ -514,7 +514,7 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 			return nil, err
 		}
 	}
-	command, err := runner.Start(ctx, spec)
+	running, err := runner.Start(ctx, spec)
 	if err != nil {
 		if stdoutLog != nil {
 			_ = stdoutLog.Close()
@@ -526,17 +526,17 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 		return nil, err
 	}
 	if input.OnProcessStart != nil {
-		if reporter, ok := command.(interface {
+		if reporter, ok := running.(interface {
 			ProcessRef() (engine.ProcessRef, int)
 		}); ok {
 			ref, backendChildPID := reporter.ProcessRef()
 			input.OnProcessStart(ref, backendChildPID)
 		}
 	}
-	stdin := command.Stdin()
-	stdout := command.Stdout()
-	stderrPipe := command.Stderr()
-	s.active = command
+	stdin := running.Stdin()
+	stdout := running.Stdout()
+	stderrPipe := running.Stderr()
+	s.active = running
 	s.mu.Unlock()
 
 	events := make(chan engine.Event, 16)
@@ -565,16 +565,15 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 		if stdoutLog != nil {
 			stdoutReader = io.TeeReader(stdout, stdoutLog)
 		}
-		waitDone := make(chan error, 1)
+		waitDone := make(chan command.FinalObservation, 1)
 		go func() {
-			_, err := command.Wait(ctx)
-			waitDone <- err
+			waitDone <- finalObservation(ctx, running)
 		}()
 		parseErr := s.scan(stdoutReader, events)
-		waitErr := <-waitDone
+		observation := <-waitDone
 		stderrCopyErr := <-stderrDone
 		s.mu.Lock()
-		if s.active == command {
+		if s.active == running {
 			s.active = nil
 		}
 		s.mu.Unlock()
@@ -585,13 +584,16 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 		if parseErr != nil {
 			events <- terminalError(parseErr.Error())
 		}
-		if waitErr != nil {
+		if observation.CleanupErr != nil {
+			events <- warning(observation.CleanupErr.Error())
+		}
+		if observation.ExecutionErr != nil {
 			msg := strings.TrimSpace(stderr.String())
 			if msg == "" && stderrCopyErr != nil {
 				msg = stderrCopyErr.Error()
 			}
 			if msg == "" {
-				msg = waitErr.Error()
+				msg = observation.ExecutionErr.Error()
 			}
 			events <- terminalError(msg)
 			return
@@ -601,6 +603,21 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 		}
 	}()
 	return events, nil
+}
+
+func finalObservation(ctx context.Context, running command.RunningCommand) command.FinalObservation {
+	exit, waitErr := running.Wait(ctx)
+	if observer, ok := running.(command.FinalObserver); ok {
+		observation, err := observer.FinalObservation(context.WithoutCancel(ctx))
+		if observation.Exit == (command.ExitObservation{}) {
+			observation.Exit = exit
+		}
+		if observation.ExecutionErr == nil && observation.CleanupErr == nil {
+			observation.ExecutionErr = errors.Join(waitErr, err)
+		}
+		return observation
+	}
+	return command.FinalObservation{Exit: exit, ExecutionErr: waitErr}
 }
 
 func (s *Session) Interrupt(ctx context.Context) error {
