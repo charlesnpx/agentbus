@@ -18,18 +18,6 @@ type HelloResult struct {
 	BackendMetadata []BackendInfo   `json:"backendMetadata,omitempty"`
 	Capabilities    map[string]bool `json:"capabilities"`
 }
-type SessionStartParams = protocol.SessionStartParams
-type SessionStartResult = protocol.SessionStartResult
-type SessionResumeParams = protocol.SessionResumeParams
-type SessionListParams = protocol.SessionListParams
-type SessionListResult = protocol.SessionListResult
-type SessionInfo = protocol.SessionInfo
-type TurnStartParams = protocol.TurnStartParams
-type TurnStartResult = protocol.TurnStartResult
-type TurnEventParams = protocol.TurnEventParams
-type TurnResultParams = protocol.TurnResultParams
-type TurnInterruptParams = protocol.TurnInterruptParams
-type TurnInterruptResult = protocol.TurnInterruptResult
 type TaskSpec = protocol.TaskSpec
 type JobSubmitParams = protocol.JobSubmitParams
 type JobSubmitResult = protocol.JobSubmitResult
@@ -45,10 +33,3 @@ type PolicyValidateResult = protocol.PolicyValidateResult
 type PolicyRegisterParams = protocol.PolicyRegisterParams
 type PolicyRegisterResult = protocol.PolicyRegisterResult
 type RPCError = protocol.RPCError
-
-// TurnNotification is one streamed foreground notification for a turn.
-type TurnNotification struct {
-	Method string
-	Event  *TurnEventParams
-	Result *TurnResultParams
-}

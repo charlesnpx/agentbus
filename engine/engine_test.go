@@ -305,10 +305,36 @@ func TestStateMachineAndExitCodes(t *testing.T) {
 		StateCanceled:              7,
 		StateReaped:                8,
 		StateQuarantined:           9,
+		StateOrphaned:              14,
 	}
 	for state, want := range exitTests {
 		if got := ExitCodeForState(state); got != want {
 			t.Fatalf("ExitCodeForState(%s) = %d, want %d", state, got, want)
+		}
+	}
+}
+
+func TestIsTerminalIncludesOrphaned(t *testing.T) {
+	t.Parallel()
+	terminal := []JobState{
+		StateCompleted,
+		StateCompletedNoncompliant,
+		StateFailed,
+		StateTimedOut,
+		StateInterrupted,
+		StateCanceled,
+		StateOrphaned,
+		StateReaped,
+		StateQuarantined,
+	}
+	for _, state := range terminal {
+		if !IsTerminal(state) {
+			t.Fatalf("IsTerminal(%s) = false, want true", state)
+		}
+	}
+	for _, state := range []JobState{StateQueued, StateStarting, StateRunning, StateRetrying} {
+		if IsTerminal(state) {
+			t.Fatalf("IsTerminal(%s) = true, want false", state)
 		}
 	}
 }
@@ -377,10 +403,10 @@ func TestStoreLeaseStatusAndReaper(t *testing.T) {
 			want: StateRunning,
 		},
 		{
-			name: "orphaned reaped",
+			name: "orphaned remains terminal",
 			job:  JobRecord{JobID: "job_orphan", State: StateOrphaned, UpdatedAt: base.Add(-DefaultLeaseDuration)},
 			pt:   fakeProcessTable{entries: map[int]ProcessInfo{}},
-			want: StateReaped,
+			want: StateOrphaned,
 		},
 	}
 	for _, tt := range tests {
@@ -455,7 +481,7 @@ func TestReaperUsesConfiguredLeaseAndOrphanGrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ = store.loadPath(record.StatePath)
-	if got.State != StateReaped {
+	if got.State != StateOrphaned {
 		t.Fatalf("state after grace = %s", got.State)
 	}
 }
@@ -671,12 +697,13 @@ func TestCancelRunningLiveBackendChildSignalsEvenWhenWorkerGone(t *testing.T) {
 		cancelGrace:   500 * time.Millisecond,
 	})
 	record := &JobRecord{
-		JobID:           "job_cancel_child",
-		State:           StateRunning,
-		UpdatedAt:       base,
-		Lease:           Lease{ExpiresAt: base.Add(time.Minute)},
-		Worker:          ProcessRef{PID: 203, PGID: 303, StartTime: "worker-start"},
-		BackendChildPID: 204,
+		JobID:                 "job_cancel_child",
+		State:                 StateRunning,
+		UpdatedAt:             base,
+		Lease:                 Lease{ExpiresAt: base.Add(time.Minute)},
+		Worker:                ProcessRef{PID: 203, PGID: 303, StartTime: "worker-start"},
+		BackendChildPID:       204,
+		BackendChildStartTime: "child-start",
 	}
 	if err := store.Save(record); err != nil {
 		t.Fatal(err)

@@ -1,0 +1,35 @@
+name: strict-lane
+
+on:
+  push:
+    branches: [main, abd-authority]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOCKER_IMAGE: golang:1.26-trixie@sha256:4ee9ffa999b4583ce281939cdff828763083610292f252279a0cee77473bd9a7
+  CGO_ENABLED: "0"
+
+jobs:
+  privileged-cgroup-v2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Privileged cgroup-v2 gate
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/strict-lane"
+          scripts/ci/docker-cgroup-v2.sh 2>&1 | tee "$RUNNER_TEMP/strict-lane/docker-cgroup-v2.log"
+      - name: Upload strict lane evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: strict-lane-${{ github.sha }}
+          path: ${{ runner.temp }}/strict-lane/docker-cgroup-v2.log
+          if-no-files-found: error
+          retention-days: 30

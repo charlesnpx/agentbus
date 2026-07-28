@@ -84,10 +84,10 @@ type JobRecord struct {
 	QuarantineReason      string            `json:"quarantineReason,omitempty"`
 }
 
-// IsTerminal reports whether state is terminal under protocol v1.
+// IsTerminal reports whether state is terminal under the public job protocol.
 func IsTerminal(state JobState) bool {
 	switch state {
-	case StateCompleted, StateCompletedNoncompliant, StateFailed, StateTimedOut, StateInterrupted, StateCanceled, StateReaped, StateQuarantined:
+	case StateCompleted, StateCompletedNoncompliant, StateFailed, StateTimedOut, StateInterrupted, StateCanceled, StateOrphaned, StateReaped, StateQuarantined:
 		return true
 	default:
 		return false
@@ -113,6 +113,10 @@ func ExitCodeForState(state JobState) int {
 		return 8
 	case StateQuarantined:
 		return 9
+	case StateOrphaned:
+		// 14 is reserved for terminal orphaned jobs; 2 remains nonterminal,
+		// and 10-13 are existing CLI protocol/daemon error codes.
+		return 14
 	default:
 		return 2
 	}

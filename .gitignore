@@ -20,3 +20,10 @@ coverage.html
 # Editor/IDE
 .idea/
 *.swp
+
+# Local Go build/module caches (never commit)
+/tmp-gocache/
+/tmp-gomodcache/
+
+# Vendored deps are regenerable via `go mod vendor`; fetch from proxy instead
+/vendor/

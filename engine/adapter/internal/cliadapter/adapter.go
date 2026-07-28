@@ -9,15 +9,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/command"
 )
 
 const DriftError = "backend version changed since setup; re-run agentbus setup"
@@ -33,29 +31,49 @@ type Backend struct {
 	BuildArgs        func(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error)
 	Parse            func(map[string]any) ([]engine.Event, string, error)
 	VersionTransform func(string) string
-	Discover         func(context.Context, string) (*engine.ModelDiscovery, error)
+	Discover         func(context.Context, command.ProbeRunner, string) (*engine.ModelDiscovery, error)
+	probed           *ProbedBackendDescriptor
+}
+
+type StaticBackendDescriptor struct {
+	NameValue              string
+	Binary                 string
+	MinimumVersion         string
+	StreamSchema           string
+	AllowedModels          map[string]struct{}
+	AllowedEfforts         map[string]struct{}
+	DiscoveredModels       []string
+	DiscoveredEfforts      []string
+	DiscoverySource        string
+	DiscoveryFetchedAt     string
+	DiscoveryClientVersion string
+	DiscoveryWarning       string
+	VersionTransform       func(string) string
+	Discover               func(context.Context, command.ProbeRunner, string) (*engine.ModelDiscovery, error)
+}
+
+type ProbedBackendDescriptor struct {
+	StaticBackendDescriptor
+	BinaryPath string
+	Version    string
 }
 
 func (b *Backend) Name() string { return b.NameValue }
 
+func (b *Backend) AdmissionParkable() bool { return true }
+
+func (b *Backend) AdmissionControlledRunner() bool { return true }
+
 func (b *Backend) Preflight(ctx context.Context) (engine.Health, error) {
-	binary, err := exec.LookPath(b.binary())
+	probed, err := ProbeBackend(ctx, command.DirectProbeRunner{}, b.staticDescriptor())
 	if err != nil {
-		return engine.Health{}, fmt.Errorf("backend_unavailable: %s binary not found: %w", b.NameValue, err)
-	}
-	version, err := commandOutput(ctx, binary, "--version")
-	if err != nil {
-		return engine.Health{}, fmt.Errorf("backend_unavailable: %s version check failed: %w", b.NameValue, err)
-	}
-	version = b.normalizeVersion(version)
-	if compareVersion(version, b.MinimumVersion) < 0 {
-		return engine.Health{}, fmt.Errorf("backend_unavailable: %s version %s is below minimum known-good %s", b.NameValue, version, b.MinimumVersion)
+		return engine.Health{}, err
 	}
 	probe, err := b.cachedProbe()
 	if err != nil {
 		return engine.Health{}, err
 	}
-	if probe.Version != version || probe.BinaryPath != binary {
+	if probe.Version != probed.Version || probe.BinaryPath != probed.BinaryPath {
 		return engine.Health{}, errors.New(DriftError)
 	}
 	if probe.StreamSchema == "" || probe.StreamSchema != b.StreamSchema {
@@ -63,24 +81,41 @@ func (b *Backend) Preflight(ctx context.Context) (engine.Health, error) {
 	}
 	return engine.Health{
 		Backend:      b.NameValue,
-		BinaryPath:   binary,
-		Version:      version,
+		BinaryPath:   probed.BinaryPath,
+		Version:      probed.Version,
 		StreamSchema: probe.StreamSchema,
 		Minimum:      b.MinimumVersion,
-		Warning:      b.discoveryWarning(probe, version),
+		Warning:      b.discoveryWarning(probe, probed.Version),
 	}, nil
 }
 
-func (b *Backend) DiscoverModels(ctx context.Context) (*engine.ModelDiscovery, error) {
-	binary, err := exec.LookPath(b.binary())
-	if err != nil || b.Discover == nil {
-		return nil, err
+func (b *Backend) DiscoverModels(ctx context.Context, runner command.ProbeRunner) (*engine.ModelDiscovery, error) {
+	if runner == nil {
+		return nil, errors.New("probe runner is required")
 	}
-	return b.Discover(ctx, binary)
+	if b.Discover == nil {
+		return nil, nil
+	}
+	binary := b.binary()
+	if b.probed != nil && b.probed.BinaryPath != "" {
+		binary = b.probed.BinaryPath
+	} else {
+		resolved, err := runner.LookPath(binary)
+		if err != nil {
+			return nil, err
+		}
+		binary = resolved
+	}
+	return b.Discover(ctx, runner, binary)
 }
 
 func (b *Backend) BackendMetadata(context.Context) engine.BackendMetadata {
 	meta := engine.BackendMetadata{Name: b.NameValue}
+	if b.probed != nil {
+		meta.Models = append([]string(nil), b.probed.DiscoveredModels...)
+		meta.Efforts = append([]string(nil), b.probed.DiscoveredEfforts...)
+		return meta
+	}
 	probe, err := b.cachedProbe()
 	if err == nil && probe.Version != "" {
 		meta.Models = append([]string(nil), probe.DiscoveredModels...)
@@ -92,17 +127,9 @@ func (b *Backend) BackendMetadata(context.Context) engine.BackendMetadata {
 // SetupProbe runs the live setup-time stream probe and returns the cache entry
 // later consumed by Preflight.
 func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, error) {
-	binary, err := exec.LookPath(b.binary())
+	probed, err := ProbeBackend(ctx, command.DirectProbeRunner{}, b.staticDescriptor())
 	if err != nil {
-		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s binary not found: %w", b.NameValue, err)
-	}
-	version, err := commandOutput(ctx, binary, "--version")
-	if err != nil {
-		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s version check failed: %w", b.NameValue, err)
-	}
-	version = b.normalizeVersion(version)
-	if compareVersion(version, b.MinimumVersion) < 0 {
-		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s version %s is below minimum known-good %s", b.NameValue, version, b.MinimumVersion)
+		return engine.BackendSetupProbe{}, err
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -143,8 +170,8 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 	}
 	probe := engine.BackendSetupProbe{
 		Backend:      b.NameValue,
-		BinaryPath:   binary,
-		Version:      version,
+		BinaryPath:   probed.BinaryPath,
+		Version:      probed.Version,
 		StreamSchema: b.StreamSchema,
 		ConfigMode: engine.ModeInfo{
 			Write:    "user",
@@ -153,24 +180,20 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 		SandboxModes:     []string{"workspace-write", "read-only"},
 		JSONEventsProbed: true,
 	}
-	if discovered, discoverErr := b.DiscoverModels(ctx); discoverErr == nil && discovered != nil {
-		probe.DiscoveredModels = discovered.Models
-		probe.DiscoveredEfforts = discovered.Efforts
-		probe.DiscoverySource = discovered.Source
-		probe.DiscoveryFetchedAt = discovered.FetchedAt
-		probe.DiscoveryClientVersion = discovered.ClientVersion
-		probe.DiscoveryWarnings = append(probe.DiscoveryWarnings, discovered.Warnings...)
-		if discovered.ClientVersion != "" && b.normalizeVersion(discovered.ClientVersion) != version {
-			probe.DiscoveryWarnings = append(probe.DiscoveryWarnings, fmt.Sprintf("%s model discovery cache client_version %q does not match probed version %q", b.NameValue, discovered.ClientVersion, version))
-		}
-	} else if discoverErr != nil {
-		probe.DiscoveryWarnings = append(probe.DiscoveryWarnings, fmt.Sprintf("%s model discovery failed: %v", b.NameValue, discoverErr))
-	}
+	probe.DiscoveredModels = probed.DiscoveredModels
+	probe.DiscoveredEfforts = probed.DiscoveredEfforts
+	probe.DiscoverySource = probed.DiscoverySource
+	probe.DiscoveryFetchedAt = probed.DiscoveryFetchedAt
+	probe.DiscoveryClientVersion = probed.DiscoveryClientVersion
+	probe.DiscoveryWarnings = discoveryWarnings(probed.DiscoveryWarning)
 	return probe, nil
 }
 
 func (b *Backend) Start(ctx context.Context, opts engine.SessionOpts) (engine.Session, error) {
-	warning, err := b.validateOptions(ctx, opts)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	warning, err := b.validateOptions(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -178,10 +201,13 @@ func (b *Backend) Start(ctx context.Context, opts engine.SessionOpts) (engine.Se
 }
 
 func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts) (engine.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(id) == "" {
 		return nil, errors.New("resume session id is required")
 	}
-	warning, err := b.validateOptions(ctx, opts)
+	warning, err := b.validateOptions(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -195,10 +221,93 @@ func (b *Backend) binary() string {
 	return b.NameValue
 }
 
+func (b *Backend) staticDescriptor() StaticBackendDescriptor {
+	return StaticBackendDescriptor{
+		NameValue:        b.NameValue,
+		Binary:           b.binary(),
+		MinimumVersion:   b.MinimumVersion,
+		StreamSchema:     b.StreamSchema,
+		AllowedModels:    cloneStringSet(b.AllowedModels),
+		AllowedEfforts:   cloneStringSet(b.AllowedEfforts),
+		VersionTransform: b.VersionTransform,
+		Discover:         b.Discover,
+	}
+}
+
+func (b *Backend) validationDescriptor() StaticBackendDescriptor {
+	if b.probed != nil {
+		return b.probed.StaticBackendDescriptor
+	}
+	return b.staticDescriptor()
+}
+
+func (b *Backend) ProbeBackend(ctx context.Context, runner command.ProbeRunner) (engine.Backend, error) {
+	probed, err := ProbeBackend(ctx, runner, b.staticDescriptor())
+	if err != nil {
+		return nil, err
+	}
+	clone := *b
+	clone.probed = &probed
+	return &clone, nil
+}
+
 func (b *Backend) normalizeVersion(s string) string {
+	return normalizeVersionWith(s, b.VersionTransform)
+}
+
+func ProbeBackend(ctx context.Context, runner command.ProbeRunner, descriptor StaticBackendDescriptor) (ProbedBackendDescriptor, error) {
+	if err := ctx.Err(); err != nil {
+		return ProbedBackendDescriptor{}, err
+	}
+	if runner == nil {
+		return ProbedBackendDescriptor{}, errors.New("probe runner is required")
+	}
+	binary, err := runner.LookPath(descriptor.Binary)
+	if err != nil {
+		return ProbedBackendDescriptor{}, fmt.Errorf("backend_unavailable: %s binary not found: %w", descriptor.NameValue, err)
+	}
+	versionResult, err := runner.Run(ctx, command.ProbeSpec{Argv: []string{binary, "--version"}})
+	if err != nil {
+		return ProbedBackendDescriptor{}, fmt.Errorf("backend_unavailable: %s version check failed: %w", descriptor.NameValue, err)
+	}
+	version := normalizeVersionWith(string(versionResult.Stdout), descriptor.VersionTransform)
+	if compareVersion(version, descriptor.MinimumVersion) < 0 {
+		return ProbedBackendDescriptor{}, fmt.Errorf("backend_unavailable: %s version %s is below minimum known-good %s", descriptor.NameValue, version, descriptor.MinimumVersion)
+	}
+	probed := ProbedBackendDescriptor{
+		StaticBackendDescriptor: descriptor,
+		BinaryPath:              binary,
+		Version:                 version,
+	}
+	if descriptor.Discover == nil {
+		return probed, nil
+	}
+	discovered, discoverErr := descriptor.Discover(ctx, runner, binary)
+	if discoverErr != nil {
+		probed.DiscoveryWarning = appendWarning(probed.DiscoveryWarning, fmt.Sprintf("%s model discovery failed: %v", descriptor.NameValue, discoverErr))
+		return probed, nil
+	}
+	if discovered == nil {
+		return probed, nil
+	}
+	probed.DiscoveredModels = append([]string(nil), discovered.Models...)
+	probed.DiscoveredEfforts = append([]string(nil), discovered.Efforts...)
+	probed.DiscoverySource = discovered.Source
+	probed.DiscoveryFetchedAt = discovered.FetchedAt
+	probed.DiscoveryClientVersion = discovered.ClientVersion
+	for _, warning := range discovered.Warnings {
+		probed.DiscoveryWarning = appendWarning(probed.DiscoveryWarning, warning)
+	}
+	if discovered.ClientVersion != "" && normalizeVersionWith(discovered.ClientVersion, descriptor.VersionTransform) != version {
+		probed.DiscoveryWarning = appendWarning(probed.DiscoveryWarning, fmt.Sprintf("%s model discovery cache client_version %q does not match probed version %q", descriptor.NameValue, discovered.ClientVersion, version))
+	}
+	return probed, nil
+}
+
+func normalizeVersionWith(s string, transform func(string) string) string {
 	s = strings.TrimSpace(s)
-	if b.VersionTransform != nil {
-		s = b.VersionTransform(s)
+	if transform != nil {
+		s = transform(s)
 	}
 	fields := strings.Fields(s)
 	for _, f := range fields {
@@ -209,58 +318,63 @@ func (b *Backend) normalizeVersion(s string) string {
 	return strings.TrimPrefix(s, "v")
 }
 
-func (b *Backend) validateOptions(ctx context.Context, opts engine.SessionOpts) (string, error) {
-	models, efforts, modelsDiscovered, effortsDiscovered, warning := b.validationSets(ctx)
+func (b *Backend) validateOptions(opts engine.SessionOpts) (string, error) {
+	return ValidateStaticOptions(b.validationDescriptor(), opts)
+}
+
+func ValidateStaticOptions(descriptor StaticBackendDescriptor, opts engine.SessionOpts) (string, error) {
+	models, efforts, modelsDiscovered, effortsDiscovered, warning := validationSets(descriptor)
 	if opts.Model != "" {
 		if _, ok := models[opts.Model]; !ok {
 			if modelsDiscovered {
-				warning = appendWarning(warning, fmt.Sprintf("model %q is not in the discovered %s catalog; passing through to backend", opts.Model, b.NameValue))
+				warning = appendWarning(warning, fmt.Sprintf("model %q is not in the discovered %s catalog; passing through to backend", opts.Model, descriptor.NameValue))
 			} else if len(models) > 0 {
-				return warning, fmt.Errorf("unsupported model %q for %s", opts.Model, b.NameValue)
+				return warning, fmt.Errorf("unsupported model %q for %s", opts.Model, descriptor.NameValue)
 			}
 		}
 	}
 	if opts.Effort != "" {
 		if _, ok := efforts[opts.Effort]; !ok {
 			if effortsDiscovered {
-				warning = appendWarning(warning, fmt.Sprintf("effort %q is not in the discovered %s catalog; passing through to backend", opts.Effort, b.NameValue))
+				warning = appendWarning(warning, fmt.Sprintf("effort %q is not in the discovered %s catalog; passing through to backend", opts.Effort, descriptor.NameValue))
 			} else if len(efforts) > 0 {
-				return warning, fmt.Errorf("unsupported effort %q for %s", opts.Effort, b.NameValue)
+				return warning, fmt.Errorf("unsupported effort %q for %s", opts.Effort, descriptor.NameValue)
 			}
 		}
 	}
 	return warning, nil
 }
 
-func (b *Backend) validationSets(ctx context.Context) (map[string]struct{}, map[string]struct{}, bool, bool, string) {
-	cache, cacheErr := b.readCache()
-	probe, err := b.cachedProbe()
-	if cacheErr == nil && cache.Version == engine.SetupProbeCacheVersion && err == nil {
-		binary, binaryErr := exec.LookPath(b.binary())
-		version := ""
-		var versionErr error
-		if binaryErr == nil {
-			version, versionErr = commandOutput(ctx, binary, "--version")
-		}
-		if binaryErr != nil || versionErr != nil || probe.BinaryPath != binary || probe.Version != b.normalizeVersion(version) {
-			return b.AllowedModels, b.AllowedEfforts, false, false, "model discovery cache is stale; using static known-good validation lists"
-		}
-		models := b.AllowedModels
-		efforts := b.AllowedEfforts
-		modelsDiscovered := probe.DiscoverySource != "" && len(probe.DiscoveredModels) > 0
-		effortsDiscovered := probe.DiscoverySource != "" && len(probe.DiscoveredEfforts) > 0
-		if modelsDiscovered {
-			models = StringSet(probe.DiscoveredModels...)
-		}
-		if effortsDiscovered {
-			efforts = StringSet(probe.DiscoveredEfforts...)
-		}
-		return models, efforts, modelsDiscovered, effortsDiscovered, ""
+func validationSets(descriptor StaticBackendDescriptor) (map[string]struct{}, map[string]struct{}, bool, bool, string) {
+	models := descriptor.AllowedModels
+	efforts := descriptor.AllowedEfforts
+	modelsDiscovered := descriptor.DiscoverySource != "" && len(descriptor.DiscoveredModels) > 0
+	effortsDiscovered := descriptor.DiscoverySource != "" && len(descriptor.DiscoveredEfforts) > 0
+	if modelsDiscovered {
+		models = StringSet(descriptor.DiscoveredModels...)
 	}
-	if cacheErr == nil {
-		return b.AllowedModels, b.AllowedEfforts, false, false, "model discovery cache is stale; using static known-good validation lists"
+	if effortsDiscovered {
+		efforts = StringSet(descriptor.DiscoveredEfforts...)
 	}
-	return b.AllowedModels, b.AllowedEfforts, false, false, ""
+	return models, efforts, modelsDiscovered, effortsDiscovered, descriptor.DiscoveryWarning
+}
+
+func cloneStringSet(in map[string]struct{}) map[string]struct{} {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]struct{}, len(in))
+	for value := range in {
+		out[value] = struct{}{}
+	}
+	return out
+}
+
+func discoveryWarnings(warning string) []string {
+	if warning == "" {
+		return nil
+	}
+	return strings.Split(warning, "; ")
 }
 
 func appendWarning(existing, addition string) string {
@@ -321,7 +435,7 @@ type Session struct {
 	validationWarning         string
 	suppressValidationWarning bool
 	mu                        sync.Mutex
-	active                    *exec.Cmd
+	active                    command.RunningCommand
 	lastAgentMessage          string
 }
 
@@ -332,7 +446,14 @@ func (s *Session) ID() string {
 }
 
 func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
-	warningText, err := s.backend.validateOptions(ctx, s.opts)
+	return s.TurnWithRunner(ctx, input, command.DirectCommandRunner{})
+}
+
+func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, runner command.Runner) (<-chan engine.Event, error) {
+	if runner == nil {
+		return nil, errors.New("command runner is required")
+	}
+	warningText, err := s.backend.validateOptions(s.opts)
 	if err != nil {
 		return nil, err
 	}
@@ -367,22 +488,9 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		s.mu.Unlock()
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, s.backend.binary(), args...)
-	cmd.Cancel = func() error { return terminateProcessGroup(cmd, engine.DefaultCancelGrace) }
-	cmd.WaitDelay = 200 * time.Millisecond
+	spec := command.ExecSpec{Argv: append([]string{s.backend.binary()}, args...)}
 	if s.opts.CWD != "" {
-		cmd.Dir = s.opts.CWD
-	}
-	setProcessGroup(cmd)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		s.mu.Unlock()
-		return nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		s.mu.Unlock()
-		return nil, err
+		spec.Dir = s.opts.CWD
 	}
 	var stderr bytes.Buffer
 	var stderrLog *engine.CappedLogWriter
@@ -395,7 +503,6 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		}
 		stderrWriter = io.MultiWriter(&stderr, stderrLog)
 	}
-	cmd.Stderr = stderrWriter
 	var stdoutLog *engine.CappedLogWriter
 	if input.LogPaths.Stdout != "" {
 		stdoutLog, err = engine.NewCappedLogWriter(input.LogPaths.Stdout, 0)
@@ -407,7 +514,8 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 			return nil, err
 		}
 	}
-	if err := cmd.Start(); err != nil {
+	running, err := runner.Start(ctx, spec)
+	if err != nil {
 		if stdoutLog != nil {
 			_ = stdoutLog.Close()
 		}
@@ -418,9 +526,17 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		return nil, err
 	}
 	if input.OnProcessStart != nil {
-		input.OnProcessStart(processRefForCmd(cmd), cmd.Process.Pid)
+		if reporter, ok := running.(interface {
+			ProcessRef() (engine.ProcessRef, int)
+		}); ok {
+			ref, backendChildPID := reporter.ProcessRef()
+			input.OnProcessStart(ref, backendChildPID)
+		}
 	}
-	s.active = cmd
+	stdin := running.Stdin()
+	stdout := running.Stdout()
+	stderrPipe := running.Stderr()
+	s.active = running
 	s.mu.Unlock()
 
 	events := make(chan engine.Event, 16)
@@ -437,6 +553,10 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 				_ = stderrLog.Close()
 			}
 		}()
+		stderrDone := make(chan error, 1)
+		go func() {
+			stderrDone <- copyAndClose(stderrWriter, stderrPipe)
+		}()
 		go func() {
 			_, _ = io.WriteString(stdin, input.Prompt)
 			_ = stdin.Close()
@@ -445,10 +565,15 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		if stdoutLog != nil {
 			stdoutReader = io.TeeReader(stdout, stdoutLog)
 		}
+		waitDone := make(chan command.FinalObservation, 1)
+		go func() {
+			waitDone <- finalObservation(ctx, running)
+		}()
 		parseErr := s.scan(stdoutReader, events)
-		waitErr := cmd.Wait()
+		observation := <-waitDone
+		stderrCopyErr := <-stderrDone
 		s.mu.Lock()
-		if s.active == cmd {
+		if s.active == running {
 			s.active = nil
 		}
 		s.mu.Unlock()
@@ -459,32 +584,50 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		if parseErr != nil {
 			events <- terminalError(parseErr.Error())
 		}
-		if waitErr != nil {
+		if observation.CleanupErr != nil {
+			events <- warning(observation.CleanupErr.Error())
+		}
+		if observation.ExecutionErr != nil {
 			msg := strings.TrimSpace(stderr.String())
+			if msg == "" && stderrCopyErr != nil {
+				msg = stderrCopyErr.Error()
+			}
 			if msg == "" {
-				msg = waitErr.Error()
+				msg = observation.ExecutionErr.Error()
 			}
 			events <- terminalError(msg)
+			return
+		}
+		if stderrCopyErr != nil {
+			events <- terminalError(stderrCopyErr.Error())
 		}
 	}()
 	return events, nil
 }
 
+func finalObservation(ctx context.Context, running command.RunningCommand) command.FinalObservation {
+	exit, waitErr := running.Wait(ctx)
+	if observer, ok := running.(command.FinalObserver); ok {
+		observation, err := observer.FinalObservation(context.WithoutCancel(ctx))
+		if observation.Exit == (command.ExitObservation{}) {
+			observation.Exit = exit
+		}
+		if observation.ExecutionErr == nil && observation.CleanupErr == nil {
+			observation.ExecutionErr = errors.Join(waitErr, err)
+		}
+		return observation
+	}
+	return command.FinalObservation{Exit: exit, ExecutionErr: waitErr}
+}
+
 func (s *Session) Interrupt(ctx context.Context) error {
 	s.mu.Lock()
-	cmd := s.active
+	command := s.active
 	s.mu.Unlock()
-	if cmd == nil {
+	if command == nil {
 		return nil
 	}
-	done := make(chan error, 1)
-	go func() { done <- terminateProcessGroup(cmd, engine.DefaultCancelGrace) }()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-done:
-		return err
-	}
+	return command.Interrupt(ctx)
 }
 
 func (s *Session) scan(r io.Reader, out chan<- engine.Event) error {
@@ -527,21 +670,10 @@ func (s *Session) scan(r io.Reader, out chan<- engine.Event) error {
 	return scanner.Err()
 }
 
-func processRefForCmd(cmd *exec.Cmd) engine.ProcessRef {
-	ref := engine.ProcessRef{}
-	if cmd == nil || cmd.Process == nil {
-		return ref
-	}
-	ref.PID = cmd.Process.Pid
-	if runtime.GOOS != "windows" {
-		if pgid, err := syscall.Getpgid(ref.PID); err == nil {
-			ref.PGID = pgid
-		}
-	}
-	if info, alive, err := (engine.NativeProcessTable{}).Lookup(ref.PID); err == nil && alive {
-		ref.StartTime = info.StartTime
-	}
-	return ref
+func copyAndClose(dst io.Writer, src io.ReadCloser) error {
+	defer func() { _ = src.Close() }()
+	_, err := io.Copy(dst, src)
+	return err
 }
 
 func capEvent(ev engine.Event) engine.Event {
@@ -559,58 +691,6 @@ func warning(text string) engine.Event {
 
 func terminalError(text string) engine.Event {
 	return engine.Event{Type: engine.EventTerminalError, Text: text}
-}
-
-func setProcessGroup(cmd *exec.Cmd) {
-	if runtime.GOOS == "windows" {
-		return
-	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-}
-
-var terminateProcessGroup = terminateProcessGroupImpl
-
-func terminateProcessGroupImpl(cmd *exec.Cmd, grace time.Duration) error {
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-	pid := cmd.Process.Pid
-	if runtime.GOOS == "windows" {
-		_ = cmd.Process.Kill()
-		return nil
-	}
-	pgid, err := syscall.Getpgid(pid)
-	if err != nil {
-		pgid = pid
-	}
-	_ = syscall.Kill(-pgid, syscall.SIGTERM)
-	waitForProcessGroupExit(pgid, grace)
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
-	return nil
-}
-
-func waitForProcessGroupExit(pgid int, grace time.Duration) {
-	if grace <= 0 {
-		return
-	}
-	deadline := time.Now().Add(grace)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(-pgid, 0); err != nil {
-			if err == syscall.ESRCH {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
-func commandOutput(ctx context.Context, binary string, arg ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, binary, arg...)
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
 }
 
 func compareVersion(a, b string) int {

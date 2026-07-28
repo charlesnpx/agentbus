@@ -21,12 +21,27 @@ type EventText struct {
 
 // WriteResult spills the authoritative final result and returns result metadata.
 func (s *Store) WriteResult(jobID string, raw []byte, inlineCap int) (ResultInfo, error) {
-	if inlineCap <= 0 {
-		inlineCap = DefaultInlineResultCap
-	}
-	path, err := s.resultPath(jobID)
+	return WriteResultForLayout(s.layout, jobID, raw, inlineCap)
+}
+
+// WriteResultForLayout writes a final result into layout.Results without
+// requiring a Store instance.
+func WriteResultForLayout(layout WorkspaceLayout, jobID string, raw []byte, inlineCap int) (ResultInfo, error) {
+	path, err := ResultPathForLayout(layout, jobID)
 	if err != nil {
 		return ResultInfo{}, err
+	}
+	return writeResultFile(path, raw, inlineCap)
+}
+
+// ResultPathForLayout returns the result artifact path for jobID in layout.
+func ResultPathForLayout(layout WorkspaceLayout, jobID string) (string, error) {
+	return safePathForID(layout.Results, jobID, ".txt")
+}
+
+func writeResultFile(path string, raw []byte, inlineCap int) (ResultInfo, error) {
+	if inlineCap <= 0 {
+		inlineCap = DefaultInlineResultCap
 	}
 	sum := sha256.Sum256(raw)
 	if err := atomicWriteFile(path, raw, 0o600); err != nil {

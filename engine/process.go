@@ -1,10 +1,7 @@
 package engine
 
 import (
-	"os"
-	"os/exec"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 )
@@ -55,26 +52,7 @@ func (NativeProcessTable) Lookup(pid int) (ProcessInfo, bool, error) {
 		}
 		return ProcessInfo{}, false, err
 	}
-	switch runtime.GOOS {
-	case "linux":
-		b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-		if err != nil {
-			return ProcessInfo{}, false, err
-		}
-		startTime, ok := linuxProcStatStartTime(string(b))
-		if !ok {
-			return ProcessInfo{}, false, nil
-		}
-		return ProcessInfo{PID: pid, StartTime: startTime}, true, nil
-	case "darwin":
-		out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
-		if err != nil {
-			return ProcessInfo{}, false, err
-		}
-		return ProcessInfo{PID: pid, StartTime: strings.TrimSpace(string(out))}, true, nil
-	default:
-		return ProcessInfo{PID: pid}, true, nil
-	}
+	return nativeProcessInfo(pid)
 }
 
 func errorsIsProcessMissing(err error) bool {

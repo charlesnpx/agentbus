@@ -3,25 +3,38 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
+	"syscall"
 
+	agentclient "github.com/charlesnpx/agentbus/client"
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/claudecli"
 	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
-	"github.com/charlesnpx/agentbus/internal/served"
+	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/internal/agentbusserve"
+	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
+	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
 const (
-	protocolMajor = 1
 	cliJSONSchema = 1
+
+	cliExitUnknownJob           = 10
+	cliExitDaemonStartupFailure = 11
+	cliExitAuthorityFailStop    = 12
+	cliExitShutdownForced       = 13
+
+	// Keep this local so cmd/agentbus reaches served only through agentbusserve.
+	cliStartupCodeServedSafetyFailStopped = "served safety fail-stop"
 )
 
 var version = "dev"
@@ -37,14 +50,24 @@ type backendSpec struct {
 }
 
 type app struct {
-	version        string
-	stateRoot      string
-	cwd            string
-	setupCachePath string
-	backends       []backendSpec
-	registry       *engine.PolicyRegistry
-	processes      engine.ProcessTable
-	clock          engine.Clock
+	version              string
+	stateRoot            string
+	cwd                  string
+	setupCachePath       string
+	backends             []backendSpec
+	registry             *engine.PolicyRegistry
+	processes            engine.ProcessTable
+	clock                engine.Clock
+	daemonLauncher       func(context.Context, daemonlaunch.Options) (daemonlaunch.Result, error)
+	clientConnect        func(context.Context, agentclient.Options) (protocolClient, error)
+	recoverAdmissionRoot func(context.Context, agentbusserve.Config) (agentbusserve.AdmissionRecoveryReport, error)
+}
+
+type protocolClient interface {
+	JobStatus(context.Context, agentclient.JobStatusParams) (agentclient.JobStatusResult, error)
+	JobResult(context.Context, agentclient.JobResultParams) (agentclient.JobResult, error)
+	JobCancel(context.Context, agentclient.JobCancelParams) (agentclient.JobCancelResult, error)
+	Close() error
 }
 
 func main() {
@@ -67,9 +90,17 @@ func newDefaultApp() *app {
 
 func defaultBackendSpecs(cachePath string) []backendSpec {
 	return []backendSpec{
-		newBackendSpec(codexcli.New(codexcli.Options{CachePath: cachePath})),
-		newBackendSpec(claudecli.New(claudecli.Options{CachePath: cachePath})),
+		newBackendSpec(codexcli.New(codexcli.Options{Binary: resolvedDefaultBackendBinary("codex"), CachePath: cachePath})),
+		newBackendSpec(claudecli.New(claudecli.Options{Binary: resolvedDefaultBackendBinary("claude"), CachePath: cachePath})),
 	}
+}
+
+func resolvedDefaultBackendBinary(name string) string {
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return ""
+	}
+	return path
 }
 
 func newBackendSpec(backend engine.Backend) backendSpec {
@@ -92,16 +123,22 @@ func (a *app) run(ctx context.Context, args []string, in io.Reader, out, errOut 
 		return a.runSetup(ctx, args[1:], out, errOut)
 	case "serve":
 		return a.runServe(ctx, args[1:], errOut)
-	case "sessions":
-		return a.runSessions(args[1:], out, errOut)
+	case "admission":
+		return a.runAdmission(ctx, args[1:], out, errOut)
 	case "status":
-		return a.runStatus(args[1:], out, errOut)
+		return a.runStatus(ctx, args[1:], out, errOut)
 	case "result":
-		return a.runResult(args[1:], out, errOut)
+		return a.runResult(ctx, args[1:], out, errOut)
 	case "cancel":
-		return a.runCancel(args[1:], out, errOut)
+		return a.runCancel(ctx, args[1:], out, errOut)
 	case "validate":
 		return a.runValidate(args[1:], in, out, errOut)
+	case "internal-parked-worker":
+		return a.runInternalParkedWorker(args[1:], errOut)
+	case "internal-monitor":
+		return a.runInternalMonitor(args[1:], errOut)
+	case "internal-native-self-test-fixture":
+		return a.runInternalNativeSelfTestFixture(args[1:], errOut)
 	default:
 		return usageError(errOut, "unknown command %q", args[0])
 	}
@@ -109,7 +146,7 @@ func (a *app) run(ctx context.Context, args []string, in io.Reader, out, errOut 
 
 func (a *app) runVersion(args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("version", errOut)
-	jsonOut := fs.Bool("json", false, "emit JSON: {\"schema\":1,\"version\":\"...\",\"protocolVersion\":1}")
+	jsonOut := fs.Bool("json", false, fmt.Sprintf("emit JSON: {\"schema\":%d,\"version\":\"...\",\"protocolVersion\":%d}", cliJSONSchema, protocol.Version))
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
@@ -117,7 +154,7 @@ func (a *app) runVersion(args []string, out, errOut io.Writer) int {
 		return usageError(errOut, "version does not accept positional arguments")
 	}
 	if *jsonOut {
-		return writeOrError(out, errOut, versionOutput{Schema: cliJSONSchema, Version: a.version, ProtocolVersion: protocolMajor})
+		return writeOrError(out, errOut, versionOutput{Schema: cliJSONSchema, Version: a.version, ProtocolVersion: protocol.Version})
 	}
 	fmt.Fprintf(out, "agentbus %s\n", a.version)
 	return 0
@@ -183,7 +220,9 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 			backends = append(backends, spec.backend)
 		}
 	}
-	server, err := served.New(served.Config{
+	serveCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
+	defer stopSignals()
+	err := agentbusserve.Serve(serveCtx, agentbusserve.Config{
 		StateRoot:    a.stateRoot,
 		CWD:          a.cwd,
 		Backends:     backends,
@@ -194,9 +233,174 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 	if err != nil {
 		return commandError(errOut, err)
 	}
-	if err := server.Serve(ctx); err != nil {
+	return 0
+}
+
+func (a *app) runAdmission(ctx context.Context, args []string, out, errOut io.Writer) int {
+	if len(args) == 0 {
+		printAdmissionHelp(errOut)
+		return 2
+	}
+	switch args[0] {
+	case "-h", "--help", "help":
+		printAdmissionHelp(out)
+		return 0
+	case "inspect":
+		return a.runAdmissionInspect(ctx, args[1:], out, errOut)
+	case "recover":
+		return a.runAdmissionRecover(ctx, args[1:], out, errOut)
+	case "reset-empty-root":
+		return a.runAdmissionResetEmptyRoot(ctx, args[1:], out, errOut)
+	case "seal":
+		return a.runAdmissionSeal(ctx, args[1:], out, errOut)
+	case "clear-fail-stop":
+		return a.runAdmissionClearFailStop(ctx, args[1:], out, errOut)
+	default:
+		fmt.Fprintf(errOut, "agentbus: unknown admission command %q\n\n", args[0])
+		printAdmissionHelp(errOut)
+		return 2
+	}
+}
+
+func (a *app) runAdmissionInspect(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newAdmissionFlagSet("inspect", errOut)
+	stateRoot := fs.String("state-root", "", "admission state root")
+	jsonOut := fs.Bool("json", false, "emit JSON admission root inspection")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return admissionUsageError(errOut, "inspect does not accept positional arguments")
+	}
+	if *stateRoot == "" {
+		return admissionUsageError(errOut, "inspect requires --state-root <path>")
+	}
+	inspection, err := authority.InspectAdmissionRoot(ctx, *stateRoot)
+	if err != nil {
 		return commandError(errOut, err)
 	}
+	if *jsonOut {
+		return writeOrError(out, errOut, inspection)
+	}
+	printAdmissionInspection(out, inspection)
+	return 0
+}
+
+func (a *app) runAdmissionRecover(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newAdmissionFlagSet("recover", errOut)
+	stateRoot := fs.String("state-root", "", "admission state root")
+	jsonOut := fs.Bool("json", false, "emit JSON recovery report")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return admissionUsageError(errOut, "recover does not accept positional arguments")
+	}
+	if *stateRoot == "" {
+		return admissionUsageError(errOut, "recover requires --state-root <path>")
+	}
+	recoverAdmissionRoot := a.recoverAdmissionRoot
+	if recoverAdmissionRoot == nil {
+		recoverAdmissionRoot = agentbusserve.RecoverAdmissionRoot
+	}
+	report, err := recoverAdmissionRoot(ctx, agentbusserve.Config{
+		StateRoot: *stateRoot,
+		CWD:       a.cwd,
+	})
+	if err != nil {
+		return commandError(errOut, err)
+	}
+	if *jsonOut {
+		return writeOrError(out, errOut, report)
+	}
+	fmt.Fprintf(out, "mode=%s workItems=%d quiescedLaunches=%d finalizedJobs=%d orphanedJobs=%d unresolvedLaunches=%d cleanupWarnings=%d recoveryPasses=%d\n", report.Mode, report.WorkItems, report.QuiescedLaunches, report.FinalizedJobs, report.OrphanedJobs, report.UnresolvedLaunches, report.CleanupWarnings, report.RecoveryPasses)
+	return 0
+}
+
+func (a *app) runAdmissionResetEmptyRoot(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newAdmissionFlagSet("reset-empty-root", errOut)
+	stateRoot := fs.String("state-root", "", "admission state root")
+	jsonOut := fs.Bool("json", false, "emit JSON admission root inspection after reset")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return admissionUsageError(errOut, "reset-empty-root does not accept positional arguments")
+	}
+	if *stateRoot == "" {
+		return admissionUsageError(errOut, "reset-empty-root requires --state-root <path>")
+	}
+	inspection, err := authority.ResetEmptyAdmissionRoot(ctx, *stateRoot)
+	if err != nil {
+		return commandError(errOut, err)
+	}
+	if *jsonOut {
+		return writeOrError(out, errOut, inspection)
+	}
+	fmt.Fprintln(out, "reset-empty-root complete")
+	printAdmissionInspection(out, inspection)
+	return 0
+}
+
+func (a *app) runAdmissionSeal(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newAdmissionFlagSet("seal", errOut)
+	stateRoot := fs.String("state-root", "", "admission state root")
+	newStateRoot := fs.String("new-state-root", "", "new admission state root; parent directory must already exist")
+	startNew := fs.Bool("start-new-authority-domain", false, "acknowledge service must continue on a new state root/authority domain")
+	ackReplayReset := fs.Bool("acknowledge-replay-history-reset", false, "acknowledge cross-root request replay history is reset")
+	jsonOut := fs.Bool("json", false, "emit JSON admission seal report")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return admissionUsageError(errOut, "seal does not accept positional arguments")
+	}
+	if *stateRoot == "" {
+		return admissionUsageError(errOut, "seal requires --state-root <path>")
+	}
+	report, err := authority.SealAdmissionRoot(ctx, *stateRoot, authority.SealOptions{
+		StartNewAuthorityDomain:       *startNew,
+		AcknowledgeReplayHistoryReset: *ackReplayReset,
+		NewStateRoot:                  *newStateRoot,
+	})
+	if err != nil {
+		return commandError(errOut, err)
+	}
+	if *jsonOut {
+		return writeOrError(out, errOut, report)
+	}
+	fmt.Fprintf(out, "seal complete oldRootSealed=%t newStateRoot=%s newDomainUUID=%s\n", report.OldRootSealed, report.NewRoot, report.NewDomainUUID)
+	printAdmissionInspection(out, report.OldInspection)
+	return 0
+}
+
+func (a *app) runAdmissionClearFailStop(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newAdmissionFlagSet("clear-fail-stop", errOut)
+	stateRoot := fs.String("state-root", "", "admission state root")
+	ack := fs.Bool("acknowledge-unsafe-diagnosis", false, "acknowledge operator diagnosis of the unsafe fail-stop reason")
+	jsonOut := fs.Bool("json", false, "emit JSON clear fail-stop report")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return admissionUsageError(errOut, "clear-fail-stop does not accept positional arguments")
+	}
+	if *stateRoot == "" {
+		return admissionUsageError(errOut, "clear-fail-stop requires --state-root <path>")
+	}
+	report, err := authority.ClearAdmissionFailStop(ctx, *stateRoot, authority.ClearFailStopOptions{AcknowledgeUnsafeDiagnosis: *ack})
+	if err != nil {
+		return commandError(errOut, err)
+	}
+	if *jsonOut {
+		return writeOrError(out, errOut, report)
+	}
+	if report.Cleared {
+		fmt.Fprintf(out, "clear-fail-stop complete reason=%q\n", report.ClearedReason)
+	} else {
+		fmt.Fprintln(out, "clear-fail-stop complete no fail-stop state present")
+	}
+	printAdmissionInspection(out, report.Inspection)
 	return 0
 }
 
@@ -205,34 +409,80 @@ func (a *app) startBackgroundDaemon(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, exe, "serve", "--foreground")
-	cmd.Env = os.Environ()
-	if a.stateRoot != "" {
-		cmd.Env = append(cmd.Env, "AGENTBUS_STATE_ROOT="+a.stateRoot)
+	launcher := daemonlaunch.Launch
+	if a.daemonLauncher != nil {
+		launcher = a.daemonLauncher
 	}
-	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	result, err := launcher(ctx, daemonlaunch.Options{
+		CommandPath: exe,
+		Args:        []string{"serve", "--foreground"},
+		StateRoot:   a.stateRoot,
+		Timeout:     daemonlaunch.DefaultTimeout,
+		Starter:     startDaemonProcess,
+	})
 	if err != nil {
 		return err
 	}
-	defer devNull.Close()
-	cmd.Stdin = devNull
-	cmd.Stdout = devNull
-	cmd.Stderr = devNull
-	if err := cmd.Start(); err != nil {
-		return err
+	if result.ExistingDaemon {
+		return nil
 	}
-	root := a.stateRoot
+	if result.PID <= 0 {
+		killErr := result.KillAndWait()
+		return errors.Join(fmt.Errorf("daemon launcher returned invalid pid %d", result.PID), killErr)
+	}
+	root := result.CanonicalStateRoot
+	if root == "" {
+		root = a.stateRoot
+	}
 	if root == "" {
 		root, err = engine.ResolveStateRoot()
 		if err != nil {
-			return err
+			killErr := result.KillAndWait()
+			return errors.Join(err, killErr)
 		}
 	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return err
-	}
 	pidPath := filepath.Join(root, "agentbus.pid")
-	return atomicWriteFile(pidPath, []byte(fmt.Sprintf("%d\n", cmd.Process.Pid)), 0o600)
+	if err := atomicWriteFile(pidPath, []byte(fmt.Sprintf("%d\n", result.PID)), 0o600); err != nil {
+		removeErr := os.Remove(pidPath)
+		if errors.Is(removeErr, os.ErrNotExist) {
+			removeErr = nil
+		}
+		killErr := result.KillAndWait()
+		return errors.Join(err, removeErr, killErr)
+	}
+	return nil
+}
+
+type daemonProcess struct {
+	cmd *exec.Cmd
+}
+
+func startDaemonProcess(config daemonlaunch.ProcessConfig) (daemonlaunch.Process, error) {
+	cmd := exec.Command(config.CommandPath, config.Args...)
+	cmd.Env = config.Env
+	cmd.ExtraFiles = config.ExtraFiles
+	cmd.Stdin = config.Stdin
+	cmd.Stdout = config.Stdout
+	cmd.Stderr = config.Stderr
+	if config.Setsid {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return daemonProcess{cmd: cmd}, nil
+}
+
+func (process daemonProcess) PID() int {
+	return process.cmd.Process.Pid
+}
+
+func (process daemonProcess) Kill() error {
+	return process.cmd.Process.Kill()
+}
+
+func (process daemonProcess) Wait() error {
+	return process.cmd.Wait()
 }
 
 func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
@@ -266,43 +516,9 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 	return os.Chmod(path, mode)
 }
 
-func (a *app) runSessions(args []string, out, errOut io.Writer) int {
-	fs := newCommandFlagSet("sessions", errOut)
-	jsonOut := fs.Bool("json", false, "emit JSON: {\"sessions\":[{\"sessionId\":\"...\",\"backend\":\"codex\",\"cwd\":\"...\",\"tags\":{},\"activeTurnId\":null}]}")
-	tags := tagFilter{}
-	fs.Var(&tags, "tags", "exact tag filter k=v; repeat for multiple tags")
-	if code, ok := parseFlags(fs, args); !ok {
-		return code
-	}
-	if fs.NArg() != 0 {
-		return usageError(errOut, "sessions does not accept positional arguments")
-	}
-	store, err := a.newStore()
-	if err != nil {
-		return commandError(errOut, err)
-	}
-	records, err := store.List()
-	if err != nil {
-		return commandError(errOut, err)
-	}
-	sessions := sessionsFromRecords(records, store.Layout().Workspace, tags)
-	result := sessionsOutput{Sessions: sessions}
-	if *jsonOut {
-		return writeOrError(out, errOut, result)
-	}
-	for _, session := range sessions {
-		active := "-"
-		if session.ActiveTurnID != nil {
-			active = *session.ActiveTurnID
-		}
-		fmt.Fprintf(out, "%s\t%s\t%s\tactive=%s\n", session.SessionID, session.Backend, session.CWD, active)
-	}
-	return 0
-}
-
-func (a *app) runStatus(args []string, out, errOut io.Writer) int {
+func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("status", errOut)
-	jsonOut := fs.Bool("json", false, "emit JSON: {\"jobs\":[{\"jobId\":\"...\",\"state\":\"running\",\"lease\":{\"expiresAt\":\"...\",\"expired\":false}}]}")
+	jsonOut := fs.Bool("json", false, "emit protocol-v2 authority JSON: {\"jobs\":[{\"jobId\":\"...\",\"sessionId\":\"...\",\"state\":\"running\"}]}")
 	jobID := fs.String("job", "", "job id")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
@@ -310,45 +526,45 @@ func (a *app) runStatus(args []string, out, errOut io.Writer) int {
 	if fs.NArg() != 0 {
 		return usageError(errOut, "status does not accept positional arguments")
 	}
-	store, err := a.newStore()
+	client, err := a.connectProtocolClient(ctx)
 	if err != nil {
-		return commandError(errOut, err)
+		return protocolCommandError(errOut, "status", err)
+	}
+	defer client.Close()
+	params := agentclient.JobStatusParams{All: true}
+	if *jobID != "" {
+		params = agentclient.JobStatusParams{JobID: *jobID}
+	}
+	statuses, err := client.JobStatus(ctx, params)
+	if err != nil {
+		return protocolCommandError(errOut, "status", err)
 	}
 	if *jobID != "" {
-		record, err := store.Load(*jobID)
-		if err != nil {
-			return commandError(errOut, err)
+		if len(statuses.Jobs) == 0 {
+			return unknownJobCommandError(errOut, "status", *jobID)
 		}
-		status := statusFromRecord(*record)
-		if *jsonOut {
-			if code := writeOrError(out, errOut, statusOutput{Jobs: []jobStatus{status}}); code != 0 {
-				return code
-			}
-		} else {
-			printJobStatus(out, status)
+		if len(statuses.Jobs) != 1 || statuses.Jobs[0].JobID != *jobID {
+			return commandError(errOut, fmt.Errorf("status returned unexpected jobs for %s", *jobID))
 		}
-		return engine.ExitCodeForState(record.State)
-	}
-	records, err := store.List()
-	if err != nil {
-		return commandError(errOut, err)
-	}
-	statuses := make([]jobStatus, 0, len(records))
-	for _, record := range records {
-		statuses = append(statuses, statusFromRecord(record))
 	}
 	if *jsonOut {
-		return writeOrError(out, errOut, statusOutput{Jobs: statuses})
+		if code := writeOrError(out, errOut, statuses); code != 0 {
+			return code
+		}
+	} else {
+		for _, status := range statuses.Jobs {
+			printJobStatus(out, status)
+		}
 	}
-	for _, status := range statuses {
-		printJobStatus(out, status)
+	if *jobID == "" {
+		return 0
 	}
-	return 0
+	return cliExitCodeForState(statuses.Jobs[0].State)
 }
 
-func (a *app) runResult(args []string, out, errOut io.Writer) int {
+func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("result", errOut)
-	jsonOut := fs.Bool("json", false, "emit JSON: {\"jobId\":\"...\",\"state\":\"completed\",\"result\":{\"text\":\"...\",\"resultPath\":\"...\",\"sha256\":\"...\",\"bytes\":1},\"contract\":{...}}")
+	jsonOut := fs.Bool("json", false, "emit protocol-v2 authority JSON: {\"jobId\":\"...\",\"state\":\"completed\",\"result\":{\"text\":\"...\",\"resultPath\":\"...\",\"sha256\":\"...\",\"bytes\":1}}")
 	jobID := fs.String("job", "", "job id")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
@@ -359,15 +575,15 @@ func (a *app) runResult(args []string, out, errOut io.Writer) int {
 	if *jobID == "" {
 		return usageError(errOut, "result requires --job <id>")
 	}
-	store, err := a.newStore()
+	client, err := a.connectProtocolClient(ctx)
 	if err != nil {
-		return commandError(errOut, err)
+		return protocolCommandError(errOut, "result", err)
 	}
-	record, err := store.Load(*jobID)
+	defer client.Close()
+	result, err := client.JobResult(ctx, agentclient.JobResultParams{JobID: *jobID})
 	if err != nil {
-		return commandError(errOut, err)
+		return protocolCommandError(errOut, "result", err)
 	}
-	result := resultFromRecord(*record)
 	if *jsonOut {
 		if code := writeOrError(out, errOut, result); code != 0 {
 			return code
@@ -375,12 +591,12 @@ func (a *app) runResult(args []string, out, errOut io.Writer) int {
 	} else {
 		printJobResult(out, result)
 	}
-	return engine.ExitCodeForState(record.State)
+	return cliExitCodeForState(result.State)
 }
 
-func (a *app) runCancel(args []string, out, errOut io.Writer) int {
+func (a *app) runCancel(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("cancel", errOut)
-	jsonOut := fs.Bool("json", false, "emit JSON: {\"jobId\":\"...\",\"state\":\"canceled\"}")
+	jsonOut := fs.Bool("json", false, "emit protocol-v2 authority JSON: {\"jobId\":\"...\",\"state\":\"canceled\"}")
 	jobID := fs.String("job", "", "job id")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
@@ -391,15 +607,15 @@ func (a *app) runCancel(args []string, out, errOut io.Writer) int {
 	if *jobID == "" {
 		return usageError(errOut, "cancel requires --job <id>")
 	}
-	store, err := a.newStore()
+	client, err := a.connectProtocolClient(ctx)
 	if err != nil {
-		return commandError(errOut, err)
+		return protocolCommandError(errOut, "cancel", err)
 	}
-	record, err := store.Cancel(*jobID)
+	defer client.Close()
+	result, err := client.JobCancel(ctx, agentclient.JobCancelParams{JobID: *jobID})
 	if err != nil {
-		return commandError(errOut, err)
+		return protocolCommandError(errOut, "cancel", err)
 	}
-	result := cancelOutput{JobID: record.JobID, State: record.State}
 	if *jsonOut {
 		if code := writeOrError(out, errOut, result); code != 0 {
 			return code
@@ -407,7 +623,7 @@ func (a *app) runCancel(args []string, out, errOut io.Writer) int {
 	} else {
 		fmt.Fprintf(out, "%s\t%s\n", result.JobID, result.State)
 	}
-	return engine.ExitCodeForState(record.State)
+	return cliExitCodeForState(result.State)
 }
 
 func (a *app) runValidate(args []string, in io.Reader, out, errOut io.Writer) int {
@@ -564,15 +780,6 @@ func setupReportFromProbe(probe engine.BackendSetupProbe) setupBackendReport {
 	}
 }
 
-func (a *app) newStore() (*engine.Store, error) {
-	return engine.NewStore(engine.StoreConfig{
-		Root:      a.stateRoot,
-		CWD:       a.cwd,
-		Clock:     a.clock,
-		Processes: a.processes,
-	})
-}
-
 func (a *app) cachePath() (string, error) {
 	if a.setupCachePath != "" {
 		return a.setupCachePath, nil
@@ -651,41 +858,6 @@ func readValidationText(path string, in io.Reader) (string, error) {
 	return string(raw), nil
 }
 
-func sessionsFromRecords(records []engine.JobRecord, cwd string, tags map[string]string) []sessionInfo {
-	byID := make(map[string]*sessionInfo)
-	for _, record := range records {
-		if record.SessionID == "" || !tagsMatch(record.Tags, tags) {
-			continue
-		}
-		session := byID[record.SessionID]
-		if session == nil {
-			session = &sessionInfo{
-				SessionID: record.SessionID,
-				Backend:   record.Backend,
-				CWD:       cwd,
-				Tags:      cloneTags(record.Tags),
-			}
-			byID[record.SessionID] = session
-		}
-		if session.Backend == "" {
-			session.Backend = record.Backend
-		}
-		if len(session.Tags) == 0 {
-			session.Tags = cloneTags(record.Tags)
-		}
-		if !engine.IsTerminal(record.State) {
-			active := record.JobID
-			session.ActiveTurnID = &active
-		}
-	}
-	sessions := make([]sessionInfo, 0, len(byID))
-	for _, session := range byID {
-		sessions = append(sessions, *session)
-	}
-	sort.Slice(sessions, func(i, j int) bool { return sessions[i].SessionID < sessions[j].SessionID })
-	return sessions
-}
-
 func tagsMatch(actual map[string]string, want map[string]string) bool {
 	for key, value := range want {
 		if actual[key] != value {
@@ -695,66 +867,22 @@ func tagsMatch(actual map[string]string, want map[string]string) bool {
 	return true
 }
 
-func cloneTags(in map[string]string) map[string]string {
-	if len(in) == 0 {
-		return nil
+func (a *app) connectProtocolClient(ctx context.Context) (protocolClient, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, err
 	}
-	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
+	opts := agentclient.Options{
+		StateRoot:   a.stateRoot,
+		CommandPath: exe,
 	}
-	return out
+	if a.clientConnect != nil {
+		return a.clientConnect(ctx, opts)
+	}
+	return agentclient.Connect(ctx, opts)
 }
 
-func statusFromRecord(record engine.JobRecord) jobStatus {
-	return jobStatus{
-		JobID:                 record.JobID,
-		SessionID:             record.SessionID,
-		Backend:               record.Backend,
-		State:                 record.State,
-		LateFinalization:      record.LateFinalization,
-		Tags:                  cloneTags(record.Tags),
-		CreatedAt:             timePtr(record.CreatedAt),
-		StartedAt:             timePtr(record.StartedAt),
-		UpdatedAt:             timePtr(record.UpdatedAt),
-		HeartbeatAt:           timePtr(record.HeartbeatAt),
-		Lease:                 leasePtr(record.Lease),
-		WorkerPID:             record.Worker.PID,
-		WorkerStartTime:       record.Worker.StartTime,
-		BackendChildPID:       record.BackendChildPID,
-		BackendChildStartTime: record.BackendChildStartTime,
-		StatePath:             record.StatePath,
-		LogPaths:              record.LogPaths,
-	}
-}
-
-func resultFromRecord(record engine.JobRecord) jobResult {
-	return jobResult{
-		JobID:            record.JobID,
-		SessionID:        record.SessionID,
-		State:            record.State,
-		LateFinalization: record.LateFinalization,
-		Result:           record.Result,
-		Contract:         record.Contract,
-	}
-}
-
-func timePtr(t time.Time) *time.Time {
-	if t.IsZero() {
-		return nil
-	}
-	u := t.UTC()
-	return &u
-}
-
-func leasePtr(lease engine.Lease) *engine.Lease {
-	if lease.ExpiresAt.IsZero() {
-		return nil
-	}
-	return &lease
-}
-
-func printJobStatus(out io.Writer, status jobStatus) {
+func printJobStatus(out io.Writer, status agentclient.JobStatus) {
 	fmt.Fprintf(out, "%s\t%s", status.JobID, status.State)
 	if status.Backend != "" {
 		fmt.Fprintf(out, "\t%s", status.Backend)
@@ -765,7 +893,7 @@ func printJobStatus(out io.Writer, status jobStatus) {
 	fmt.Fprintln(out)
 }
 
-func printJobResult(out io.Writer, result jobResult) {
+func printJobResult(out io.Writer, result agentclient.JobResult) {
 	if !engine.IsTerminal(result.State) {
 		fmt.Fprintf(out, "%s\t%s\n", result.JobID, result.State)
 		return
@@ -791,6 +919,13 @@ func newCommandFlagSet(name string, errOut io.Writer) *flag.FlagSet {
 	return fs
 }
 
+func newAdmissionFlagSet(name string, errOut io.Writer) *flag.FlagSet {
+	fs := flag.NewFlagSet("agentbus admission "+name, flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	fs.Usage = func() { printAdmissionHelp(errOut) }
+	return fs
+}
+
 func parseFlags(fs *flag.FlagSet, args []string) (int, bool) {
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -807,9 +942,92 @@ func usageError(errOut io.Writer, format string, args ...any) int {
 	return 2
 }
 
+func admissionUsageError(errOut io.Writer, format string, args ...any) int {
+	fmt.Fprintf(errOut, "agentbus admission: "+format+"\n\n", args...)
+	printAdmissionHelp(errOut)
+	return 2
+}
+
 func commandError(errOut io.Writer, err error) int {
 	fmt.Fprintf(errOut, "agentbus: %v\n", err)
+	if errors.Is(err, agentbusserve.ErrShutdownDeadlineExceeded) {
+		return cliExitShutdownForced
+	}
 	return 1
+}
+
+func protocolCommandError(errOut io.Writer, operation string, err error) int {
+	var rpcErr *protocol.RPCError
+	if errors.As(err, &rpcErr) {
+		data := rpcErr.Object.Data
+		fields := []string{}
+		if data.Code != "" {
+			fields = append(fields, "code="+data.Code)
+		}
+		if data.JobID != "" {
+			fields = append(fields, "jobId="+data.JobID)
+		}
+		if data.AdmissionCause != "" {
+			fields = append(fields, "admissionCause="+data.AdmissionCause)
+		}
+		if len(fields) > 0 {
+			fmt.Fprintf(errOut, "agentbus: %s failed (%s): %s\n", operation, strings.Join(fields, " "), rpcErr.Object.Message)
+		} else {
+			fmt.Fprintf(errOut, "agentbus: %s failed: %s\n", operation, rpcErr.Object.Message)
+		}
+		return cliExitCodeForProtocolError(rpcErr)
+	}
+	var startupErr *daemonlaunch.StartupError
+	if errors.As(err, &startupErr) {
+		if startupErrorIsAuthorityFailStop(startupErr) {
+			fmt.Fprintf(errOut, "agentbus: %s failed (code=%s admissionCause=%s): %v\n", operation, protocol.ErrorBackendUnavailable, protocol.AdmissionRejectRootFailStopped, err)
+			return cliExitAuthorityFailStop
+		}
+		fmt.Fprintf(errOut, "agentbus: %s failed: %v\n", operation, err)
+		return cliExitDaemonStartupFailure
+	}
+	fmt.Fprintf(errOut, "agentbus: %s failed: %v\n", operation, err)
+	return 1
+}
+
+func unknownJobCommandError(errOut io.Writer, operation, jobID string) int {
+	fmt.Fprintf(errOut, "agentbus: %s failed (code=%s jobId=%s): job is not known\n", operation, protocol.ErrorUnknownJob, jobID)
+	return cliExitUnknownJob
+}
+
+func cliExitCodeForProtocolError(err *protocol.RPCError) int {
+	if err == nil {
+		return 1
+	}
+	data := err.Object.Data
+	switch data.AdmissionCause {
+	case protocol.AdmissionRejectRootFailStopped,
+		protocol.AdmissionRejectRootCorrupt,
+		protocol.AdmissionRejectRootIdentityMismatch:
+		return cliExitAuthorityFailStop
+	case protocol.AdmissionRejectUnavailableNativeRuntime:
+		return cliExitDaemonStartupFailure
+	}
+	if data.JobID != "" && data.Code == protocol.ErrorUnknownJob {
+		return cliExitUnknownJob
+	}
+	return 1
+}
+
+func startupErrorIsAuthorityFailStop(err *daemonlaunch.StartupError) bool {
+	if err == nil {
+		return false
+	}
+	switch strings.TrimSpace(err.Code) {
+	case authority.ErrFailStopped.Error(), cliStartupCodeServedSafetyFailStopped:
+		return true
+	default:
+		return false
+	}
+}
+
+func cliExitCodeForState(state engine.JobState) int {
+	return engine.ExitCodeForState(state)
 }
 
 func writeOrError(out, errOut io.Writer, v any) int {
@@ -830,24 +1048,63 @@ func printRootHelp(out io.Writer) {
   agentbus version [--json]
   agentbus setup [--json]
   agentbus serve [--foreground]
-  agentbus sessions [--tags k=v] [--json]
+  agentbus admission <inspect|recover|reset-empty-root|seal|clear-fail-stop> --state-root <path>
   agentbus status [--job <id>] [--json]
   agentbus result --job <id> [--json]
   agentbus cancel --job <id> [--json]
   agentbus validate --contract <file|name> [--text-file <f>] [--json]
 
 JSON shapes:
-  version:  {"schema":1,"version":"dev","protocolVersion":1}
+  version:  {"schema":1,"version":"dev","protocolVersion":2}
   setup:    {"schema":1,"backends":[{"backend":"codex","binaryPath":"...","version":"...","configMode":{"write":"user","readOnly":"hermetic"},"sandboxModes":["workspace-write","read-only"],"jsonEventsProbe":{"ran":true,"version":"...","streamSchema":"codex-json-v1"}}]}
-  sessions: {"sessions":[{"sessionId":"...","backend":"codex","cwd":"...","tags":{},"activeTurnId":null}]}
-  status:   {"jobs":[{"jobId":"...","state":"running","lease":{"expiresAt":"...","expired":false}}]}
-  result:   {"jobId":"...","state":"completed","result":{"text":"...","resultPath":"...","sha256":"...","bytes":1},"contract":{...}}
+  status:   {"jobs":[{"jobId":"...","sessionId":"...","state":"completed","cleanupDisposition":"verified_absent"}]}
+  result:   {"jobId":"...","sessionId":"...","state":"completed","cleanupDisposition":"verified_absent","result":{"text":"...","resultPath":"...","sha256":"...","bytes":1}}
   cancel:   {"jobId":"...","state":"canceled"}
   validate: {"valid":true,"missing":[],"contractName":"...","contractSha256":"sha256:..."}
 
 Exit codes for single-job status/result/cancel:
-  completed=0, non-terminal=2, completed_noncompliant=3, failed=4, timed_out=5, interrupted=6, canceled=7, reaped=8, quarantined=9
+  completed=0, running/non-terminal=2, completed_noncompliant=3, failed=4, timed_out=5, interrupted=6, canceled=7, reaped=8, quarantined=9, unknown-job=10, daemon-startup-failure=11, fail-stop=12, shutdown-deadline=13, orphaned=14
+
+Status/result/cancel are protocol-v2 daemon clients. Offline authority diagnosis stays under admission inspect/recover/admin commands.
+
+Serve admission:
+  serve always starts the strict identified admission runtime. macOS and Linux are supported under the shared custody contract; Linux cgroup v2 is an optional cleanup enhancement. Hosts without basic process supervision fail closed at startup. Strict activation is one-way for a state root; use admission recover, seal, or reset-empty-root for the admin escape hatches. The first strict release supports one active state root.
 `)
+}
+
+func printAdmissionHelp(out io.Writer) {
+	fmt.Fprint(out, `Usage:
+  agentbus admission inspect --state-root <path> [--json]
+  agentbus admission recover --state-root <path> [--json]
+  agentbus admission reset-empty-root --state-root <path> [--json]
+  agentbus admission seal --state-root <path> --new-state-root <path> --start-new-authority-domain --acknowledge-replay-history-reset [--json]
+  agentbus admission clear-fail-stop --state-root <path> --acknowledge-unsafe-diagnosis [--json]
+
+Admission administration:
+  inspect:          read activation metadata, contract version, counts, domain UUID, and sealed flag; never mutates
+  recover:          requires strict support; reconciles durable nonterminal obligations without opening a listener
+  reset-empty-root: reinitializes only when jobs, bindings, tombstones, launch records, and recovery obligations are all zero
+  seal:             marks the old domain permanently closed for audit; --new-state-root must be a new leaf whose parent directory already exists
+  clear-fail-stop:  clears a persisted unsafe fail-stop only after explicit operator diagnosis acknowledgement
+
+Multi-root read/cancel/result routing is out of scope in this first release.
+`)
+}
+
+func printAdmissionInspection(out io.Writer, inspection authority.RootInspection) {
+	metadata := inspection.ActivationMetadata
+	fmt.Fprintf(out, "domainUUID=%s sealed=%t generation=%d\n", inspection.DomainUUID, inspection.Sealed, inspection.Generation)
+	fmt.Fprintf(out, "activated=%t contractVersion=%d activatedAtGen=%d\n", metadata.Activated, metadata.ContractVersion, metadata.ActivatedAtGen)
+	if inspection.FailStopped {
+		fmt.Fprintf(out, "failStopped=true reason=%q\n", inspection.FailStopReason)
+	}
+	fmt.Fprintf(out, "counts jobs=%d bindings=%d tombstones=%d launchRecords=%d recoveryObligations=%d\n",
+		inspection.Counts.Jobs,
+		inspection.Counts.Bindings,
+		inspection.Counts.Tombstones,
+		inspection.Counts.LaunchRecords,
+		inspection.Counts.RecoveryObligations,
+	)
 }
 
 type tagFilter map[string]string
@@ -917,54 +1174,4 @@ type setupJSONEventsProbe struct {
 	Ran          bool   `json:"ran"`
 	Version      string `json:"version,omitempty"`
 	StreamSchema string `json:"streamSchema,omitempty"`
-}
-
-type sessionsOutput struct {
-	Sessions []sessionInfo `json:"sessions"`
-}
-
-type sessionInfo struct {
-	SessionID    string            `json:"sessionId"`
-	Backend      string            `json:"backend,omitempty"`
-	CWD          string            `json:"cwd,omitempty"`
-	Tags         map[string]string `json:"tags,omitempty"`
-	ActiveTurnID *string           `json:"activeTurnId"`
-}
-
-type statusOutput struct {
-	Jobs []jobStatus `json:"jobs"`
-}
-
-type jobStatus struct {
-	JobID                 string            `json:"jobId"`
-	SessionID             string            `json:"sessionId,omitempty"`
-	Backend               string            `json:"backend,omitempty"`
-	State                 engine.JobState   `json:"state"`
-	LateFinalization      bool              `json:"lateFinalization,omitempty"`
-	Tags                  map[string]string `json:"tags,omitempty"`
-	CreatedAt             *time.Time        `json:"createdAt,omitempty"`
-	StartedAt             *time.Time        `json:"startedAt,omitempty"`
-	UpdatedAt             *time.Time        `json:"updatedAt,omitempty"`
-	HeartbeatAt           *time.Time        `json:"heartbeatAt,omitempty"`
-	Lease                 *engine.Lease     `json:"lease,omitempty"`
-	WorkerPID             int               `json:"workerPid,omitempty"`
-	WorkerStartTime       string            `json:"workerStartTime,omitempty"`
-	BackendChildPID       int               `json:"backendChildPid,omitempty"`
-	BackendChildStartTime string            `json:"backendChildStartTime,omitempty"`
-	StatePath             string            `json:"statePath,omitempty"`
-	LogPaths              engine.LogPaths   `json:"logPaths,omitempty"`
-}
-
-type jobResult struct {
-	JobID            string                `json:"jobId"`
-	SessionID        string                `json:"sessionId,omitempty"`
-	State            engine.JobState       `json:"state"`
-	LateFinalization bool                  `json:"lateFinalization,omitempty"`
-	Result           *engine.ResultInfo    `json:"result,omitempty"`
-	Contract         *engine.ContractStamp `json:"contract,omitempty"`
-}
-
-type cancelOutput struct {
-	JobID string          `json:"jobId"`
-	State engine.JobState `json:"state"`
 }

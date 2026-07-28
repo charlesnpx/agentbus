@@ -47,6 +47,8 @@ const DefaultReapInterval = 2 * time.Second
 // DefaultGCInterval bounds how often a store performs retention housekeeping.
 const DefaultGCInterval = 30 * time.Second
 
+var ErrProcessIdentityUnverifiable = errors.New("process identity unverifiable")
+
 // RetentionConfig controls reaper garbage collection.
 type RetentionConfig struct {
 	TerminalJobTTL time.Duration
@@ -583,9 +585,9 @@ func (s *Store) terminate(jobID string, state JobState) (*JobRecord, error) {
 }
 
 type cancelProcessGroupTarget struct {
-	pgid            int
-	worker          ProcessRef
-	backendChildPID int
+	pgid         int
+	worker       ProcessRef
+	backendChild ProcessRef
 }
 
 func (s *Store) cancelLiveProcessGroup(record *JobRecord) error {
@@ -596,6 +598,9 @@ func (s *Store) cancelLiveProcessGroup(record *JobRecord) error {
 	}
 	target, ok, err := s.liveCancelProcessGroup(record)
 	if err != nil || !ok {
+		if err != nil {
+			log.Printf("agentbus cancel: refusing to signal process group for %s: %v", record.JobID, err)
+		}
 		return err
 	}
 	if err := s.processGroups.SignalProcessGroup(target.pgid, syscall.SIGTERM); err != nil {
@@ -614,29 +619,22 @@ func (s *Store) liveCancelProcessGroup(record *JobRecord) (cancelProcessGroupTar
 		return cancelProcessGroupTarget{}, false, nil
 	}
 	workerAlive, workerErr := s.processRefAlive(record.Worker)
-	childAlive, childErr := s.backendChildAlive(record.BackendChildPID)
-	if workerAlive || childAlive {
-		return cancelProcessGroupTarget{
-			pgid:            record.Worker.PGID,
-			worker:          record.Worker,
-			backendChildPID: record.BackendChildPID,
-		}, true, nil
-	}
+	childRef := ProcessRef{PID: record.BackendChildPID, StartTime: record.BackendChildStartTime}
+	childAlive, childErr := s.processRefAlive(childRef)
 	if workerErr != nil {
 		return cancelProcessGroupTarget{}, false, workerErr
 	}
 	if childErr != nil {
 		return cancelProcessGroupTarget{}, false, childErr
 	}
-	return cancelProcessGroupTarget{}, false, nil
-}
-
-func (s *Store) backendChildAlive(pid int) (bool, error) {
-	if pid <= 0 {
-		return false, nil
+	if workerAlive || childAlive {
+		return cancelProcessGroupTarget{
+			pgid:         record.Worker.PGID,
+			worker:       record.Worker,
+			backendChild: childRef,
+		}, true, nil
 	}
-	_, alive, err := s.processes.Lookup(pid)
-	return alive, err
+	return cancelProcessGroupTarget{}, false, nil
 }
 
 func (s *Store) cancelProcessGroupStillAlive(target cancelProcessGroupTarget) (bool, error) {
@@ -644,28 +642,27 @@ func (s *Store) cancelProcessGroupStillAlive(target cancelProcessGroupTarget) (b
 	if err != nil || alive {
 		return alive, err
 	}
-	if target.backendChildPID <= 0 {
+	if target.backendChild.PID <= 0 {
 		return false, nil
 	}
-	_, childAlive, err := s.processes.Lookup(target.backendChildPID)
-	return childAlive, err
+	return s.processRefAlive(target.backendChild)
 }
 
 func (s *Store) processRefAlive(ref ProcessRef) (bool, error) {
 	if ref.PID <= 0 {
 		return false, nil
 	}
+	if ref.StartTime == "" {
+		return false, fmt.Errorf("%w: process %d stored start time is empty", ErrProcessIdentityUnverifiable, ref.PID)
+	}
 	info, alive, err := s.processes.Lookup(ref.PID)
 	if err != nil || !alive {
 		return false, err
 	}
-	if ref.StartTime != "" {
-		if info.StartTime == "" {
-			return false, fmt.Errorf("cannot verify process %d start time", ref.PID)
-		}
-		return ref.StartTime == info.StartTime, nil
+	if info.StartTime == "" {
+		return false, fmt.Errorf("%w: process %d observed start time is empty", ErrProcessIdentityUnverifiable, ref.PID)
 	}
-	return true, nil
+	return ref.StartTime == info.StartTime, nil
 }
 
 // Reap performs a debounced, single-flighted full reconciliation pass. The
@@ -803,10 +800,7 @@ func (s *Store) reapRecordWithLookup(record *JobRecord, now time.Time, lookup fu
 	}
 	switch record.State {
 	case StateOrphaned:
-		if record.UpdatedAt.IsZero() || now.Sub(record.UpdatedAt) < s.orphanGrace {
-			return changed, nil
-		}
-		return true, record.Transition(StateReaped, now)
+		return changed, nil
 	case StateQueued, StateStarting:
 		if !record.UpdatedAt.IsZero() && now.Sub(record.UpdatedAt) >= s.retention.StaleJobAfter {
 			return true, record.Transition(StateOrphaned, now)
@@ -842,8 +836,11 @@ func processIdentityConfirmed(record *JobRecord, lookup func(int) (ProcessInfo, 
 	}
 	confirmed := false
 	for _, ref := range refs {
-		if ref.PID <= 0 || ref.StartTime == "" {
+		if ref.PID <= 0 {
 			continue
+		}
+		if ref.StartTime == "" {
+			return false
 		}
 		confirmed = true
 		info, alive, err := lookup(ref.PID)
@@ -889,11 +886,14 @@ func processGoneOrReused(ref ProcessRef, lookup func(int) (ProcessInfo, bool, er
 	if ref.PID <= 0 {
 		return false
 	}
+	if ref.StartTime == "" {
+		return true
+	}
 	info, alive, err := lookup(ref.PID)
 	if err != nil || !alive {
 		return true
 	}
-	return ref.StartTime != "" && info.StartTime != "" && ref.StartTime != info.StartTime
+	return info.StartTime == "" || ref.StartTime != info.StartTime
 }
 
 func (s *Store) quarantine(path string, cause error) error {
@@ -1142,7 +1142,7 @@ func safePathForID(dir, id, ext string) (string, error) {
 }
 
 func validateJobID(jobID string) error {
-	if !strings.HasPrefix(jobID, "job_") || len(jobID) <= len("job_") || len(jobID) > 128 {
+	if (!strings.HasPrefix(jobID, "job_") && !strings.HasPrefix(jobID, "job-")) || len(jobID) <= len("job_") || len(jobID) > 128 {
 		return fmt.Errorf("invalid job id %q", jobID)
 	}
 	for _, r := range jobID {

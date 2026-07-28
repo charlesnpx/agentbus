@@ -12,6 +12,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/internal/cliadapter"
+	"github.com/charlesnpx/agentbus/engine/command"
 )
 
 const (
@@ -45,7 +46,7 @@ func New(opts Options) engine.Backend {
 	}
 }
 
-func discoverModels(ctx context.Context, _ string) (*engine.ModelDiscovery, error) {
+func discoverModels(ctx context.Context, _ command.ProbeRunner, _ string) (*engine.ModelDiscovery, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

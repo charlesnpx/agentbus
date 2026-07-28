@@ -9,16 +9,12 @@ import (
 )
 
 const (
-	Version       = 1
+	// Version is the strict-only protocol major version frozen by ADR-12.
+	Version       = 2
 	SocketName    = "agentbus.sock"
 	TokenFileName = "token"
 
 	MethodHello          = "protocol.hello"
-	MethodSessionStart   = "session.start"
-	MethodSessionResume  = "session.resume"
-	MethodSessionList    = "session.list"
-	MethodTurnStart      = "turn.start"
-	MethodTurnInterrupt  = "turn.interrupt"
 	MethodJobSubmit      = "job.submit"
 	MethodJobStatus      = "job.status"
 	MethodJobResult      = "job.result"
@@ -26,13 +22,12 @@ const (
 	MethodPolicyValidate = "policy.validate"
 	MethodPolicyRegister = "policy.register"
 
-	NotificationTurnEvent  = "turn.event"
-	NotificationTurnResult = "turn.result"
+	CapabilityAdmissionStrictContainment = "admission.strictContainment"
 
 	ErrorUnauthorized       = "unauthorized"
-	ErrorSessionBusy        = "session_busy"
 	ErrorNameConflict       = "name_conflict"
-	ErrorVersionMismatch    = "version_mismatch"
+	ErrorVersionMismatch    = "protocol_version_mismatch"
+	ErrorMethodNotFound     = "method_not_found"
 	ErrorCapabilityMissing  = "capability_missing"
 	ErrorBackendUnavailable = "backend_unavailable"
 	ErrorTimeout            = "timeout"
@@ -40,6 +35,36 @@ const (
 	ErrorQuarantined        = "quarantined"
 	ErrorResultTooLarge     = "result_too_large"
 	ErrorInvalidTaskSpec    = "invalid_task_spec"
+	ErrorUnknownJob         = "unknown_job"
+)
+
+const (
+	// AdmissionRejectMissingIdentity means strict admission did not receive a workspaceKey and requestId identity.
+	AdmissionRejectMissingIdentity string = "missing_identity"
+	// AdmissionRejectReplayConflict means the request key is already bound or tombstoned to a different task identity.
+	AdmissionRejectReplayConflict string = "replay_conflict"
+	// AdmissionRejectRequestExpired means the request key matches an expired tombstone.
+	AdmissionRejectRequestExpired string = "request_expired"
+	// AdmissionRejectRequestFingerprintUnsupported means the recorded fingerprint algorithm or version cannot be compared.
+	AdmissionRejectRequestFingerprintUnsupported string = "request_fingerprint_unsupported"
+	// AdmissionRejectUnsupportedBackend means the requested backend is unavailable to strict admission.
+	AdmissionRejectUnsupportedBackend string = "unsupported_backend"
+	// AdmissionRejectUnfenceableBackend means the requested backend cannot satisfy strict fencing or containment.
+	AdmissionRejectUnfenceableBackend string = "unfenceable_backend"
+	// AdmissionRejectInvalidStrictConfig means the strict task configuration is malformed or incompatible with strict admission.
+	AdmissionRejectInvalidStrictConfig string = "invalid_strict_config"
+	// AdmissionRejectUnavailableNativeRuntime means the native runtime support probe failed strict runtime requirements.
+	AdmissionRejectUnavailableNativeRuntime string = "unavailable_native_runtime"
+	// AdmissionRejectRootCorrupt means the authority root has detected repository, anchor, or integrity corruption.
+	AdmissionRejectRootCorrupt string = "root_corrupt"
+	// AdmissionRejectRootIdentityMismatch means repository and anchor identities disagree.
+	AdmissionRejectRootIdentityMismatch string = "root_identity_mismatch"
+	// AdmissionRejectRootFailStopped means the authority root has tripped fail-stop and rejects admission.
+	AdmissionRejectRootFailStopped string = "root_fail_stopped"
+	// AdmissionRejectRootSealed means the authority root is sealed against service or admission.
+	AdmissionRejectRootSealed string = "root_sealed"
+	// AdmissionRejectAdmissionClosing means the daemon is closing and rejects new admission.
+	AdmissionRejectAdmissionClosing string = "admission_closing"
 )
 
 const (
@@ -63,13 +88,6 @@ type Response struct {
 	Error   *ErrorObject    `json:"error,omitempty"`
 }
 
-// Notification is one JSON-RPC 2.0 server notification frame.
-type Notification struct {
-	JSONRPC string `json:"jsonrpc"`
-	Method  string `json:"method"`
-	Params  any    `json:"params,omitempty"`
-}
-
 // ErrorObject is the JSON-RPC error object. Code remains numeric; Data.Code is stable.
 type ErrorObject struct {
 	Code    int       `json:"code"`
@@ -77,13 +95,25 @@ type ErrorObject struct {
 	Data    ErrorData `json:"data"`
 }
 
-// ErrorData carries the stable protocol v1 error identifier and optional context.
+// ErrorData carries the stable protocol error identifier and optional context.
+// AdmissionCause carries ADR-12 strict rejection causes.
 type ErrorData struct {
-	Code                  string `json:"code"`
-	SessionID             string `json:"sessionId,omitempty"`
-	JobID                 string `json:"jobId,omitempty"`
-	TurnID                string `json:"turnId,omitempty"`
-	ServerProtocolVersion int    `json:"serverProtocolVersion,omitempty"`
+	Code                  string                        `json:"code"`
+	SessionID             string                        `json:"sessionId,omitempty"`
+	JobID                 string                        `json:"jobId,omitempty"`
+	Backend               string                        `json:"backend,omitempty"`
+	AdmissionCause        string                        `json:"admissionCause,omitempty"`
+	RuntimeSupport        *RuntimeSupportAssessmentData `json:"runtimeSupport,omitempty"`
+	ServerProtocolVersion int                           `json:"serverProtocolVersion,omitempty"`
+}
+
+// RuntimeSupportAssessmentData is the wire-safe form of the strict native
+// runtime support assessment carried on admission runtime rejections.
+type RuntimeSupportAssessmentData struct {
+	Class       string `json:"class"`
+	Cause       string `json:"cause,omitempty"`
+	Attempts    int    `json:"attempts"`
+	CleanupSafe bool   `json:"cleanupSafe"`
 }
 
 // RPCError is returned by typed clients when a JSON-RPC error response arrives.
@@ -104,7 +134,11 @@ func (e *RPCError) Error() string {
 // NewError constructs a protocol error using the implementation-defined JSON-RPC code.
 func NewError(stableCode, message string, data ErrorData) *ErrorObject {
 	data.Code = stableCode
-	return &ErrorObject{Code: -32000, Message: message, Data: data}
+	code := -32000
+	if stableCode == ErrorMethodNotFound {
+		code = -32601
+	}
+	return &ErrorObject{Code: code, Message: message, Data: data}
 }
 
 func DefaultCapabilities() map[string]bool {
@@ -138,83 +172,6 @@ type BackendInfo struct {
 	Efforts []string `json:"efforts"`
 }
 
-type SessionStartParams struct {
-	Backend string            `json:"backend"`
-	CWD     string            `json:"cwd"`
-	Write   bool              `json:"write"`
-	Model   string            `json:"model,omitempty"`
-	Effort  string            `json:"effort,omitempty"`
-	Tags    map[string]string `json:"tags,omitempty"`
-}
-
-type SessionStartResult struct {
-	SessionID string `json:"sessionId"`
-	Backend   string `json:"backend"`
-}
-
-type SessionResumeParams struct {
-	SessionID string `json:"sessionId"`
-}
-
-type SessionListParams struct {
-	Tags map[string]string `json:"tags,omitempty"`
-}
-
-type SessionListResult struct {
-	Sessions []SessionInfo `json:"sessions"`
-}
-
-type SessionInfo struct {
-	SessionID    string            `json:"sessionId"`
-	Backend      string            `json:"backend"`
-	CWD          string            `json:"cwd"`
-	Write        bool              `json:"write"`
-	Tags         map[string]string `json:"tags,omitempty"`
-	ActiveTurnID *string           `json:"activeTurnId"`
-}
-
-type TurnStartParams struct {
-	SessionID string             `json:"sessionId"`
-	Prompt    string             `json:"prompt"`
-	Write     *bool              `json:"write,omitempty"`
-	Policy    *engine.TurnPolicy `json:"policy,omitempty"`
-	TimeoutMs *int64             `json:"timeoutMs,omitempty"`
-}
-
-type TurnStartResult struct {
-	TurnID    string `json:"turnId"`
-	JobID     string `json:"jobId"`
-	SessionID string `json:"sessionId"`
-}
-
-type TurnEventParams struct {
-	SessionID string       `json:"sessionId"`
-	TurnID    string       `json:"turnId"`
-	JobID     string       `json:"jobId"`
-	Sequence  int          `json:"sequence"`
-	Event     engine.Event `json:"event"`
-}
-
-type TurnResultParams struct {
-	SessionID     string                `json:"sessionId"`
-	TurnID        string                `json:"turnId"`
-	JobID         string                `json:"jobId"`
-	State         engine.JobState       `json:"state"`
-	Result        *engine.ResultInfo    `json:"result,omitempty"`
-	ModelReported string                `json:"modelReported,omitempty"`
-	Contract      *engine.ContractStamp `json:"contract,omitempty"`
-}
-
-type TurnInterruptParams struct {
-	TurnID string `json:"turnId"`
-}
-
-type TurnInterruptResult struct {
-	TurnID string          `json:"turnId"`
-	JobID  string          `json:"jobId"`
-	State  engine.JobState `json:"state"`
-}
-
 type TaskSpec struct {
 	Backend   string             `json:"backend"`
 	CWD       string             `json:"cwd"`
@@ -228,12 +185,15 @@ type TaskSpec struct {
 }
 
 type JobSubmitParams struct {
-	TaskSpec TaskSpec `json:"taskSpec"`
+	WorkspaceKey string   `json:"workspaceKey,omitempty"`
+	RequestID    string   `json:"requestId,omitempty"`
+	TaskSpec     TaskSpec `json:"taskSpec"`
 }
 
 type JobSubmitResult struct {
-	JobID string          `json:"jobId"`
-	State engine.JobState `json:"state"`
+	JobID        string          `json:"jobId"`
+	State        engine.JobState `json:"state"`
+	Deduplicated bool            `json:"deduplicated,omitempty"`
 }
 
 type JobStatusParams struct {
@@ -250,6 +210,7 @@ type JobStatus struct {
 	SessionID             string            `json:"sessionId,omitempty"`
 	Backend               string            `json:"backend,omitempty"`
 	State                 engine.JobState   `json:"state"`
+	CleanupDisposition    string            `json:"cleanupDisposition,omitempty"`
 	LateFinalization      bool              `json:"lateFinalization,omitempty"`
 	Tags                  map[string]string `json:"tags,omitempty"`
 	StartedAt             *time.Time        `json:"startedAt,omitempty"`
@@ -271,13 +232,14 @@ type JobResultParams struct {
 }
 
 type JobResult struct {
-	JobID            string                `json:"jobId"`
-	SessionID        string                `json:"sessionId,omitempty"`
-	State            engine.JobState       `json:"state"`
-	LateFinalization bool                  `json:"lateFinalization,omitempty"`
-	Result           *engine.ResultInfo    `json:"result,omitempty"`
-	ModelReported    string                `json:"modelReported,omitempty"`
-	Contract         *engine.ContractStamp `json:"contract,omitempty"`
+	JobID              string                `json:"jobId"`
+	SessionID          string                `json:"sessionId,omitempty"`
+	State              engine.JobState       `json:"state"`
+	CleanupDisposition string                `json:"cleanupDisposition,omitempty"`
+	LateFinalization   bool                  `json:"lateFinalization,omitempty"`
+	Result             *engine.ResultInfo    `json:"result,omitempty"`
+	ModelReported      string                `json:"modelReported,omitempty"`
+	Contract           *engine.ContractStamp `json:"contract,omitempty"`
 }
 
 type JobCancelParams struct {

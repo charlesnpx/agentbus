@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,13 +23,91 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/command"
+	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
+	"github.com/charlesnpx/agentbus/engine/execution/custodian"
+	"github.com/charlesnpx/agentbus/engine/execution/launch"
+	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
 const (
 	defaultLeaseDuration = 5 * time.Minute
 	defaultHeartbeat     = 30 * time.Second
+	defaultSafetyDrain   = 30 * time.Second
+	defaultShutdown      = 30 * time.Second
 )
+
+var ErrDaemonAlreadyListening = errors.New("agentbus daemon already listening")
+
+var ErrShutdownDeadlineExceeded = errors.New("agentbus graceful shutdown deadline exceeded")
+
+var ErrShutdownNotServing = errors.New("agentbus daemon is not serving")
+
+var ErrShutdownPIDTeardownFailed = errors.New("agentbus graceful shutdown pid teardown failed")
+
+type DaemonAlreadyListeningError struct {
+	SocketPath string
+}
+
+func (e DaemonAlreadyListeningError) Error() string {
+	if e.SocketPath == "" {
+		return ErrDaemonAlreadyListening.Error()
+	}
+	return fmt.Sprintf("%s at %s", ErrDaemonAlreadyListening, e.SocketPath)
+}
+
+func (e DaemonAlreadyListeningError) Is(target error) bool {
+	return target == ErrDaemonAlreadyListening
+}
+
+var ErrAdmissionRootBusy = errors.New("agentbus admission root busy")
+
+type AdmissionRootBusyError struct {
+	Path       string
+	SocketPath string
+	Cause      error
+}
+
+func (e AdmissionRootBusyError) Error() string {
+	message := ErrAdmissionRootBusy.Error()
+	if e.Path != "" {
+		message = fmt.Sprintf("%s: %s", message, e.Path)
+	}
+	if e.SocketPath != "" {
+		message = fmt.Sprintf("%s; no listening daemon at %s", message, e.SocketPath)
+	}
+	return message
+}
+
+func (e AdmissionRootBusyError) Is(target error) bool {
+	return target == ErrAdmissionRootBusy
+}
+
+func (e AdmissionRootBusyError) Unwrap() error {
+	return e.Cause
+}
+
+func admissionSocketDialable(socketPath string) bool {
+	return admissionSocketDialableWithin(socketPath, 100*time.Millisecond)
+}
+
+func admissionSocketDialableWithin(socketPath string, timeout time.Duration) bool {
+	if timeout <= 0 {
+		return false
+	}
+	if _, err := os.Lstat(socketPath); err != nil {
+		return false
+	}
+	conn, err := net.DialTimeout("unix", socketPath, timeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
 
 // BinaryIdentity identifies the on-disk daemon executable by metadata that
 // changes when a replacement binary is installed.
@@ -65,58 +144,138 @@ type Config struct {
 	InlineResultCap     int
 	LeaseDuration       time.Duration
 	HeartbeatInterval   time.Duration
-	ReapInterval        time.Duration
 	GCInterval          time.Duration
-	ReapTickInterval    time.Duration
+	ReadyHook           func(ServeReadyInfo) error
+	ShutdownTimeout     time.Duration
+	// Runtime is an injected strict-admission runtime owned by Serve. A runtime
+	// with real close semantics is single-use: once a Serve or recovery-only
+	// admin run closes it, a later Serve on the same Server/config is rejected
+	// with ErrRuntimeConsumed. custodian.UnavailableRuntime has a no-op close and
+	// is reusable for repeated fail-closed Serves.
+	Runtime     custodian.Runtime
+	ProbeRunner command.ProbeRunner
 }
 
-type tickerSource struct {
-	c    <-chan time.Time
-	stop func()
+type ServeReadyInfo struct {
+	StateRoot  string
+	SocketPath string
 }
 
-func newTickerSource(interval time.Duration) tickerSource {
-	ticker := time.NewTicker(interval)
-	return tickerSource{c: ticker.C, stop: ticker.Stop}
+type admissionOwnedWorkChecker interface {
+	HasOwnedWork(context.Context) (bool, error)
+}
+
+type serveShutdownState struct {
+	generation uint64
+	lifecycle  serveLifecycleSnapshot
+	done       chan struct{}
+	err        error
+	complete   bool
+}
+
+type serveLifecycleSnapshot struct {
+	generation uint64
+	listener   net.Listener
+	socket     socketFileIdentity
+	pidFile    pidFileSnapshot
+	cancel     context.CancelFunc
+	admission  *serveAdmissionSnapshot
+	bound      bool
+}
+
+type pidFileSnapshot struct {
+	identity socketFileIdentity
+	known    bool
+}
+
+type serveAdmissionSnapshot struct {
+	instance     *admissionInstance
+	ready        *admissionReady
+	coordinator  *admissionCoordinator
+	checker      admissionOwnedWorkChecker
+	runtime      *servedAdmissionRuntime
+	closer       io.Closer
+	closeStarted atomic.Bool
+	closeErr     error
 }
 
 // Server serves the protocol v1 socket API over engine backends.
 type Server struct {
-	stateRoot              string
-	cwd                    string
-	socketPath             string
-	tokenPath              string
-	token                  string
-	backends               map[string]engine.Backend
-	registry               *engine.PolicyRegistry
-	clock                  engine.Clock
-	processes              engine.ProcessTable
-	processGroups          engine.ProcessGroupSignaler
-	cancelGrace            time.Duration
-	cancelWaiter           engine.Waiter
-	id                     atomic.Uint64
-	clients                atomic.Int64
-	accepting              atomic.Int64
-	idleTimeout            time.Duration
-	idleCheckInterval      time.Duration
-	binaryIdentityProbe    BinaryIdentityProbe
-	beforeStaleCloseHook   func()
-	staleListenerHook      func()
-	staleSocketRemovedHook func()
-	inlineResultCap        int
-	leaseDuration          time.Duration
-	heartbeatInterval      time.Duration
-	reapInterval           time.Duration
-	gcInterval             time.Duration
-	reapTickInterval       time.Duration
-	reapTickFactory        func(time.Duration) tickerSource
-	afterReapTickHook      func(error)
+	stateRoot                    string
+	cwd                          string
+	socketPath                   string
+	tokenPath                    string
+	token                        string
+	backends                     map[string]engine.Backend
+	registry                     *engine.PolicyRegistry
+	clock                        engine.Clock
+	processes                    engine.ProcessTable
+	processGroups                engine.ProcessGroupSignaler
+	cancelGrace                  time.Duration
+	cancelWaiter                 engine.Waiter
+	id                           atomic.Uint64
+	clients                      atomic.Int64
+	accepting                    atomic.Int64
+	idleTimeout                  time.Duration
+	idleCheckInterval            time.Duration
+	binaryIdentityProbe          BinaryIdentityProbe
+	beforeStaleCloseHook         func()
+	staleListenerHook            func()
+	staleSocketRemovedHook       func()
+	beforePIDFileQuarantineHook  func()
+	readPIDFileNoFollowHook      func(string) ([]byte, socketFileIdentity, error)
+	inlineResultCap              int
+	leaseDuration                time.Duration
+	heartbeatInterval            time.Duration
+	gcInterval                   time.Duration
+	readyHook                    func(ServeReadyInfo) error
+	listenerFactory              func() (net.Listener, socketFileIdentity, error)
+	unixSocketPrivateListenHooks unixSocketPrivateListenHooks
+	beforeListenBindHook         func()
+	safetyLatch                  *SafetyLatch
+	safetyDrainTimeout           time.Duration
+	shutdownTimeout              time.Duration
+	jobsRequestIDEnabled         bool
+	admissionSubmitMu            sync.Mutex
+	admissionCloseEpoch          atomic.Uint64
+	admissionOpenEpoch           atomic.Uint64
+	admissionStateMu             sync.RWMutex
+	resultPublications           atomic.Int64
+
+	admissionBootstrapper        *admissionBootstrapper
+	admissionReady               *admissionReady
+	admissionCoordinator         *admissionCoordinator
+	admissionOwnedWorkChecker    admissionOwnedWorkChecker
+	admissionSubmission          *servedSubmissionCoordinator
+	admissionRuntime             *servedAdmissionRuntime
+	admissionInstance            *admissionInstance
+	admissionRuntimeFactory      func(*Server) *servedAdmissionRuntime
+	admissionRuntimeConfig       custodian.Runtime
+	admissionProbeRunner         command.ProbeRunner
+	admissionUnprobeableBackends map[string]error
+	admissionStartupHooks        admissionStartupHooks
+	admissionDaemonBootOnce      sync.Once
+	admissionDaemonBootRef       model.BootRef
+	admissionDaemonBootRefErr    error
+	admissionRepository          repository.Repository
+	admissionClose               io.Closer
+	admissionBootstrapperFactory admissionBootstrapperFactory
+
+	serveStateMu    sync.Mutex
+	serveListener   net.Listener
+	serveSocket     socketFileIdentity
+	serveCancel     context.CancelFunc
+	serveGeneration uint64
+	shutdownMu      sync.Mutex
+	shutdownRunMu   sync.Mutex
+	shutdownState   *serveShutdownState
 
 	mu                 sync.Mutex
-	sessions           map[string]*sessionState
 	stores             map[string]*engine.Store
 	storesByKey        map[string]*engine.Store
 	jobStores          map[string]*engine.Store
+	admissionJobs      map[string]*admissionInstance
+	admissionEffectMu  map[string]*sync.Mutex
 	activeJobs         map[string]*activeJob
 	lastActivity       time.Time
 	executablePath     string
@@ -124,34 +283,27 @@ type Server struct {
 	binaryStale        bool
 }
 
-type sessionState struct {
-	id           string
-	backend      string
-	cwd          string
-	writeDefault bool
-	model        string
-	effort       string
-	tags         map[string]string
-	session      engine.Session
-	activeTurnID string
-}
-
 type activeJob struct {
-	jobID      string
-	sessionID  string
-	foreground bool
-	session    engine.Session
-	cancel     context.CancelFunc
+	jobID     string
+	sessionID string
+	session   engine.Session
+	cancel    context.CancelFunc
 
-	mu       sync.Mutex
-	terminal engine.JobState
+	mu                sync.Mutex
+	terminal          engine.JobState
+	admissionCommand  command.RunningCommand
+	containmentIntent *launch.ContainmentIntent
 }
 
 func (j *activeJob) requestTerminal(state engine.JobState) {
 	j.mu.Lock()
-	defer j.mu.Unlock()
 	if j.terminal == "" {
 		j.terminal = state
+	}
+	intent := j.containmentIntent
+	j.mu.Unlock()
+	if state == engine.StateCanceled {
+		intent.MarkContaining()
 	}
 }
 
@@ -159,6 +311,38 @@ func (j *activeJob) requestedTerminal() engine.JobState {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.terminal
+}
+
+func (j *activeJob) recordAdmissionCommand(cmd command.RunningCommand) bool {
+	if j == nil || cmd == nil {
+		return false
+	}
+	j.mu.Lock()
+	j.admissionCommand = cmd
+	shouldInterrupt := j.terminal == engine.StateCanceled
+	intent := j.containmentIntent
+	j.mu.Unlock()
+	if shouldInterrupt {
+		intent.MarkContaining()
+	}
+	return shouldInterrupt
+}
+
+func (j *activeJob) interruptAdmissionCommand(ctx context.Context) error {
+	if j == nil {
+		return nil
+	}
+	j.mu.Lock()
+	cmd := j.admissionCommand
+	j.mu.Unlock()
+	if cmd == nil {
+		return nil
+	}
+	return cmd.Interrupt(ctx)
+}
+
+func admissionPhysicalCleanupUncertain(err error) bool {
+	return custodian.IsCleanupUnresolved(err) || errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved)
 }
 
 type requestOutcome struct {
@@ -175,20 +359,29 @@ type resolvedPolicy struct {
 	hash     string
 }
 
-// New creates a daemon server and ensures state root and token file exist.
-func New(cfg Config) (*Server, error) {
-	root := cfg.StateRoot
+func ensureStateRoot(root string) (string, error) {
 	var err error
 	if root == "" {
 		root, err = engine.ResolveStateRoot()
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
-		return nil, err
+		return "", err
 	}
 	if err := os.Chmod(root, 0o700); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
+// New creates a daemon server and ensures state root and token file exist.
+func New(cfg Config) (*Server, error) {
+	root := cfg.StateRoot
+	var err error
+	root, err = ensureStateRoot(root)
+	if err != nil {
 		return nil, err
 	}
 	cwd := cfg.CWD
@@ -251,13 +444,6 @@ func New(cfg Config) (*Server, error) {
 	if heartbeatInterval <= 0 {
 		heartbeatInterval = defaultHeartbeat
 	}
-	reapInterval := cfg.ReapInterval
-	if reapInterval < 0 {
-		return nil, errors.New("reap interval cannot be negative")
-	}
-	if reapInterval == 0 {
-		reapInterval = engine.DefaultReapInterval
-	}
 	gcInterval := cfg.GCInterval
 	if gcInterval < 0 {
 		return nil, errors.New("gc interval cannot be negative")
@@ -265,46 +451,47 @@ func New(cfg Config) (*Server, error) {
 	if gcInterval == 0 {
 		gcInterval = engine.DefaultGCInterval
 	}
-	reapTickInterval := cfg.ReapTickInterval
-	if reapTickInterval < 0 {
-		return nil, errors.New("reap tick interval cannot be negative")
-	}
-	if reapTickInterval == 0 {
-		reapTickInterval = reapInterval
-	}
 	binaryIdentityProbe := cfg.BinaryIdentityProbe
 	if binaryIdentityProbe == nil {
 		binaryIdentityProbe = statBinaryIdentity
 	}
+	probeRunner := cfg.ProbeRunner
+	if probeRunner == nil {
+		probeRunner = command.DirectProbeRunner{}
+	}
 	return &Server{
-		stateRoot:           root,
-		cwd:                 cwd,
-		socketPath:          socketPath,
-		tokenPath:           tokenPath,
-		token:               token,
-		backends:            backends,
-		registry:            registry,
-		clock:               clock,
-		processes:           processes,
-		processGroups:       cfg.ProcessGroups,
-		cancelGrace:         cfg.CancelGrace,
-		cancelWaiter:        cfg.CancelWaiter,
-		idleTimeout:         idleTimeout,
-		idleCheckInterval:   idleCheck,
-		binaryIdentityProbe: binaryIdentityProbe,
-		inlineResultCap:     inlineResultCap,
-		leaseDuration:       leaseDuration,
-		heartbeatInterval:   heartbeatInterval,
-		reapInterval:        reapInterval,
-		gcInterval:          gcInterval,
-		reapTickInterval:    reapTickInterval,
-		reapTickFactory:     newTickerSource,
-		sessions:            make(map[string]*sessionState),
-		stores:              make(map[string]*engine.Store),
-		storesByKey:         make(map[string]*engine.Store),
-		jobStores:           make(map[string]*engine.Store),
-		activeJobs:          make(map[string]*activeJob),
-		lastActivity:        clock.Now().UTC(),
+		stateRoot:              root,
+		cwd:                    cwd,
+		socketPath:             socketPath,
+		tokenPath:              tokenPath,
+		token:                  token,
+		backends:               backends,
+		registry:               registry,
+		clock:                  clock,
+		processes:              processes,
+		processGroups:          cfg.ProcessGroups,
+		cancelGrace:            cfg.CancelGrace,
+		cancelWaiter:           cfg.CancelWaiter,
+		idleTimeout:            idleTimeout,
+		idleCheckInterval:      idleCheck,
+		binaryIdentityProbe:    binaryIdentityProbe,
+		inlineResultCap:        inlineResultCap,
+		leaseDuration:          leaseDuration,
+		heartbeatInterval:      heartbeatInterval,
+		gcInterval:             gcInterval,
+		readyHook:              cfg.ReadyHook,
+		safetyLatch:            NewSafetyLatch(),
+		safetyDrainTimeout:     defaultSafetyDrain,
+		shutdownTimeout:        normalizeShutdownTimeout(cfg.ShutdownTimeout),
+		stores:                 make(map[string]*engine.Store),
+		storesByKey:            make(map[string]*engine.Store),
+		jobStores:              make(map[string]*engine.Store),
+		admissionJobs:          make(map[string]*admissionInstance),
+		admissionEffectMu:      make(map[string]*sync.Mutex),
+		admissionRuntimeConfig: cfg.Runtime,
+		admissionProbeRunner:   probeRunner,
+		activeJobs:             make(map[string]*activeJob),
+		lastActivity:           clock.Now().UTC(),
 	}, nil
 }
 
@@ -334,13 +521,44 @@ func TokenPath(stateRoot string) (string, error) {
 
 // Serve listens on the configured Unix socket until ctx is canceled or idle shutdown fires.
 func (s *Server) Serve(ctx context.Context) error {
+	return s.serve(ctx, ctx)
+}
+
+// ServeWithStartupContext uses startupCtx for pre-ready bootstrap and ctx for
+// the daemon lifetime after readiness is reported.
+func (s *Server) ServeWithStartupContext(ctx, startupCtx context.Context) error {
+	return s.serve(ctx, startupCtx)
+}
+
+func (s *Server) serve(ctx, startupCtx context.Context) error {
+	s.ensureSafetyLatch()
 	if err := s.captureBinaryIdentity(); err != nil {
 		return err
 	}
-	if err := s.reapKnownStores(); err != nil {
+	if startupCtx == nil {
+		startupCtx = ctx
+	}
+	if err := s.bootstrapAdmission(startupCtx); err != nil {
+		if errors.Is(err, authority.ErrFailStopped) {
+			s.safetyLatch.Trip(err)
+			return s.safetyFailStopErr()
+		}
 		return err
 	}
-	ln, socketIdentity, err := s.listen()
+	registeredLifecycle := false
+	defer func() {
+		if registeredLifecycle {
+			return
+		}
+		if err := s.closeServeAdmission(); err != nil {
+			log.Printf("agentbus daemon: close admission authority: %v", err)
+		}
+	}()
+	listen := s.listen
+	if s.listenerFactory != nil {
+		listen = s.listenerFactory
+	}
+	ln, socketIdentity, err := listen()
 	if err != nil {
 		return err
 	}
@@ -349,7 +567,32 @@ func (s *Server) Serve(ctx context.Context) error {
 		s.removeOwnedSocket(socketIdentity, "server shutdown")
 	}()
 	ctx, cancel := context.WithCancel(ctx)
+	if err := startupCtx.Err(); err != nil {
+		cancel()
+		return err
+	}
+	lifecycle, err := s.registerServeLifecycleContext(startupCtx, ln, socketIdentity, cancel)
+	if err != nil {
+		cancel()
+		return err
+	}
+	registeredLifecycle = true
+	generation := lifecycle.generation
+	defer s.clearServeLifecycle(generation)
+	defer func() {
+		if err := s.closeServeAdmissionSnapshot(context.Background(), lifecycle.admission); err != nil {
+			log.Printf("agentbus daemon: close admission authority: %v", err)
+		}
+	}()
 	defer cancel()
+	if err := startupCtx.Err(); err != nil {
+		return err
+	}
+	if s.readyHook != nil {
+		if err := s.readyHook(ServeReadyInfo{StateRoot: s.stateRoot, SocketPath: s.socketPath}); err != nil {
+			return err
+		}
+	}
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
@@ -358,6 +601,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	// pair a fresh channel with a spent sync.Once.
 	acceptSettled := make(chan struct{})
 	var settleOnce sync.Once
+	safetyDone := make(chan error, 1)
+	go s.safetyLoop(ctx, cancel, ln, socketIdentity, acceptSettled, safetyDone)
 	go s.idleLoop(ctx, cancel, ln, socketIdentity, acceptSettled)
 	for {
 		conn, err := ln.Accept()
@@ -367,6 +612,15 @@ func (s *Server) Serve(ctx context.Context) error {
 			// registration. Signal that so the stale drain can trust the
 			// client counter (closes the post-Accept pre-register window).
 			settleOnce.Do(func() { close(acceptSettled) })
+			failStopErr := s.safetyFailStopErr()
+			if failStopErr != nil {
+				select {
+				case drainedErr := <-safetyDone:
+					return drainedErr
+				case <-ctx.Done():
+					return failStopErr
+				}
+			}
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -374,7 +628,14 @@ func (s *Server) Serve(ctx context.Context) error {
 				// A stale daemon closes its listener before it cancels the
 				// context, so connections already accepted by this loop can
 				// register and drain without accepting any new connections.
-				<-ctx.Done()
+				select {
+				case failStopErr := <-safetyDone:
+					return failStopErr
+				case <-ctx.Done():
+					if failStopErr := s.safetyFailStopErr(); failStopErr != nil {
+						return failStopErr
+					}
+				}
 				return nil
 			}
 			return err
@@ -392,6 +653,444 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
+func normalizeShutdownTimeout(timeout time.Duration) time.Duration {
+	if timeout < 0 {
+		return 0
+	}
+	if timeout == 0 {
+		return defaultShutdown
+	}
+	return timeout
+}
+
+func (s *Server) registerServeLifecycleContext(ctx context.Context, ln net.Listener, socketIdentity socketFileIdentity, cancel context.CancelFunc) (serveLifecycleSnapshot, error) {
+	if err := s.lockShutdownRunContext(ctx); err != nil {
+		return serveLifecycleSnapshot{}, err
+	}
+	defer s.shutdownRunMu.Unlock()
+	return s.registerServeLifecycle(ln, socketIdentity, cancel), nil
+}
+
+func (s *Server) registerServeLifecycle(ln net.Listener, socketIdentity socketFileIdentity, cancel context.CancelFunc) serveLifecycleSnapshot {
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
+	s.serveStateMu.Lock()
+	defer s.serveStateMu.Unlock()
+	s.serveGeneration++
+	generation := s.serveGeneration
+	lifecycle := serveLifecycleSnapshot{
+		generation: generation,
+		listener:   ln,
+		socket:     socketIdentity,
+		pidFile:    s.currentOwnedPIDFileSnapshot(),
+		cancel:     cancel,
+		admission:  s.currentServeAdmissionSnapshot(),
+		bound:      true,
+	}
+	s.serveListener = ln
+	s.serveSocket = socketIdentity
+	s.serveCancel = cancel
+	s.shutdownState = &serveShutdownState{generation: generation, lifecycle: lifecycle}
+	return lifecycle
+}
+
+func (s *Server) clearServeLifecycle(generation uint64) {
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
+	s.serveStateMu.Lock()
+	if s.serveGeneration != generation {
+		s.serveStateMu.Unlock()
+		return
+	}
+	s.serveListener = nil
+	s.serveSocket = socketFileIdentity{}
+	s.serveCancel = nil
+	s.serveStateMu.Unlock()
+	if s.shutdownState != nil && s.shutdownState.generation == generation && (s.shutdownState.done == nil || s.shutdownState.complete) {
+		s.shutdownState = nil
+	}
+}
+
+func (s *Server) currentServeAdmissionSnapshot() *serveAdmissionSnapshot {
+	s.admissionStateMu.RLock()
+	defer s.admissionStateMu.RUnlock()
+	if s.admissionInstance == nil && s.admissionRuntime == nil && s.admissionClose == nil {
+		return nil
+	}
+	checker := s.admissionOwnedWorkChecker
+	if checker == nil && s.admissionCoordinator != nil {
+		checker = s.admissionCoordinator
+	}
+	return &serveAdmissionSnapshot{
+		instance:    s.admissionInstance,
+		ready:       s.admissionReady,
+		coordinator: s.admissionCoordinator,
+		checker:     checker,
+		runtime:     s.admissionRuntime,
+		closer:      s.admissionClose,
+	}
+}
+
+func (s *Server) serveLifecycleCurrent(lifecycle serveLifecycleSnapshot) bool {
+	if !lifecycle.bound {
+		return true
+	}
+	s.serveStateMu.Lock()
+	defer s.serveStateMu.Unlock()
+	return s.serveGeneration == lifecycle.generation && s.serveListener == lifecycle.listener
+}
+
+func (s *Server) ShutdownTimeout() time.Duration {
+	if s == nil {
+		return defaultShutdown
+	}
+	return s.shutdownTimeout
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		state, done, run, err := s.beginShutdownState()
+		if err != nil {
+			return err
+		}
+		if run {
+			return s.runShutdownState(ctx, state, done)
+		}
+		retry, err := s.waitShutdownState(ctx, state, done)
+		if !retry {
+			return err
+		}
+	}
+}
+
+func (s *Server) beginShutdownState() (*serveShutdownState, chan struct{}, bool, error) {
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
+	state := s.shutdownState
+	if state == nil {
+		return nil, nil, false, ErrShutdownNotServing
+	}
+	if state.complete {
+		return state, nil, false, state.err
+	}
+	if state.done != nil {
+		return state, state.done, false, nil
+	}
+	done := make(chan struct{})
+	state.done = done
+	return state, done, true, nil
+}
+
+func (s *Server) waitShutdownState(ctx context.Context, state *serveShutdownState, done <-chan struct{}) (bool, error) {
+	select {
+	case <-done:
+		s.shutdownMu.Lock()
+		complete := state.complete
+		err := state.err
+		s.shutdownMu.Unlock()
+		if !complete {
+			return true, nil
+		}
+		return false, err
+	case <-ctx.Done():
+		select {
+		case <-done:
+			s.shutdownMu.Lock()
+			complete := state.complete
+			err := state.err
+			s.shutdownMu.Unlock()
+			if !complete {
+				return true, nil
+			}
+			return false, err
+		default:
+		}
+		return false, ctx.Err()
+	}
+}
+
+func (s *Server) runShutdownState(ctx context.Context, state *serveShutdownState, done chan struct{}) error {
+	if err := s.lockShutdownRunContext(ctx); err != nil {
+		s.shutdownMu.Lock()
+		if state.done == done && !state.complete {
+			state.done = nil
+			close(done)
+		}
+		s.shutdownMu.Unlock()
+		return err
+	}
+	err := s.shutdownLifecycle(ctx, state.lifecycle)
+	s.shutdownRunMu.Unlock()
+	s.shutdownMu.Lock()
+	state.err = err
+	state.complete = true
+	close(done)
+	if s.shutdownState == state && !s.serveGenerationServingLocked(state.generation) {
+		s.shutdownState = nil
+	}
+	s.shutdownMu.Unlock()
+	return err
+}
+
+func (s *Server) lockShutdownRunContext(ctx context.Context) error {
+	for {
+		if s.shutdownRunMu.TryLock() {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *Server) serveGenerationServingLocked(generation uint64) bool {
+	s.serveStateMu.Lock()
+	defer s.serveStateMu.Unlock()
+	return s.serveGeneration == generation && s.serveListener != nil
+}
+
+func (s *Server) shutdown(ctx context.Context) error {
+	return s.shutdownLifecycle(ctx, serveLifecycleSnapshot{
+		admission: s.currentServeAdmissionSnapshot(),
+	})
+}
+
+func (s *Server) shutdownLifecycle(ctx context.Context, lifecycle serveLifecycleSnapshot) error {
+	if !s.serveLifecycleCurrent(lifecycle) {
+		return nil
+	}
+	if err := s.beginAdmissionClosing(ctx, lifecycle.admission); err != nil {
+		lifecycle.forceStopServe()
+		return shutdownError(err)
+	}
+	lifecycle.closeServeListener(s, "graceful shutdown")
+	if !s.serveLifecycleCurrent(lifecycle) {
+		return nil
+	}
+	if err := s.cancelAdmissionWorkForShutdown(ctx, lifecycle.admission); err != nil {
+		lifecycle.forceStopServe()
+		return shutdownError(err)
+	}
+	if err := s.waitShutdownDrained(ctx, lifecycle); err != nil {
+		lifecycle.forceStopServe()
+		return shutdownError(err)
+	}
+	if err := s.closeServeAdmissionSnapshot(ctx, lifecycle.admission); err != nil {
+		lifecycle.forceStopServe()
+		return shutdownError(err)
+	}
+	if err := ctx.Err(); err != nil {
+		lifecycle.forceStopServe()
+		return shutdownError(err)
+	}
+	if !s.serveLifecycleCurrent(lifecycle) {
+		return nil
+	}
+	if err := s.removeOwnedPIDFile(ctx, "graceful shutdown", lifecycle.pidFile); err != nil {
+		lifecycle.forceStopServe()
+		return shutdownError(err)
+	}
+	lifecycle.forceStopServe()
+	if err := ctx.Err(); err != nil {
+		return shutdownError(err)
+	}
+	return nil
+}
+
+func shutdownError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %v", ErrShutdownDeadlineExceeded, err)
+	}
+	return err
+}
+
+func (lifecycle serveLifecycleSnapshot) closeServeListener(s *Server, phase string) {
+	if lifecycle.listener == nil {
+		return
+	}
+	if err := lifecycle.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Printf("agentbus daemon: close listener during %s: %v", phase, err)
+	}
+	s.removeOwnedSocket(lifecycle.socket, phase)
+}
+
+func (lifecycle serveLifecycleSnapshot) forceStopServe() {
+	if lifecycle.cancel != nil {
+		lifecycle.cancel()
+	}
+}
+
+func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context, admission *serveAdmissionSnapshot) error {
+	coord, jobIDs, err := s.shutdownAdmissionJobs(ctx, admission)
+	if err != nil || coord == nil {
+		return err
+	}
+	for _, jobID := range jobIDs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		id := jobID
+		err := s.withAdmissionJobEffectErr(id.String(), func() error {
+			if err := s.requestActiveJobShutdownCancel(ctx, id.String()); err != nil {
+				return err
+			}
+			if err := coord.Cancel(ctx, id, nil); err != nil {
+				return err
+			}
+			s.abandonAdmissionUnresolvedCustody(ctx, coord, id)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) shutdownAdmissionJobs(ctx context.Context, admission *serveAdmissionSnapshot) (*admissionCoordinator, []model.JobID, error) {
+	if admission == nil || admission.ready == nil || admission.coordinator == nil {
+		return nil, nil, nil
+	}
+	snapshot, err := admission.ready.RuntimeSnapshot(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	jobMap := make(map[model.JobID]struct{})
+	for _, ref := range snapshot.Pending {
+		jobMap[ref.JobID] = struct{}{}
+	}
+	for _, owned := range snapshot.Owned {
+		jobMap[owned.Ref.JobID] = struct{}{}
+	}
+	for _, jobID := range s.activeAdmissionJobIDs(admission) {
+		modelJobID, err := model.NewJobID(jobID)
+		if err != nil {
+			return nil, nil, err
+		}
+		jobMap[modelJobID] = struct{}{}
+	}
+	jobIDs := make([]model.JobID, 0, len(jobMap))
+	for jobID := range jobMap {
+		jobIDs = append(jobIDs, jobID)
+	}
+	sort.Slice(jobIDs, func(i, j int) bool { return jobIDs[i] < jobIDs[j] })
+	return admission.coordinator, jobIDs, nil
+}
+
+func (s *Server) activeAdmissionJobIDs(admission *serveAdmissionSnapshot) []string {
+	if admission == nil || admission.instance == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	jobIDs := make([]string, 0, len(s.activeJobs))
+	for jobID := range s.activeJobs {
+		if s.admissionJobs[jobID] == admission.instance {
+			jobIDs = append(jobIDs, jobID)
+		}
+	}
+	sort.Strings(jobIDs)
+	return jobIDs
+}
+
+func (s *Server) requestActiveJobShutdownCancel(ctx context.Context, jobID string) error {
+	active := s.lookupActiveJob(jobID)
+	if active == nil {
+		return nil
+	}
+	active.requestTerminal(engine.StateCanceled)
+	if err := active.interruptAdmissionCommand(ctx); err != nil {
+		if !admissionPhysicalCleanupUncertain(err) {
+			return err
+		}
+	}
+	if active.cancel != nil {
+		active.cancel()
+	}
+	return nil
+}
+
+func (s *Server) waitShutdownDrained(ctx context.Context, lifecycle serveLifecycleSnapshot) error {
+	poll := 10 * time.Millisecond
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !s.serveLifecycleCurrent(lifecycle) {
+			return nil
+		}
+		if !s.activeWorkWithAdmissionSnapshot(ctx, lifecycle.admission) {
+			break
+		}
+		if !s.serveLifecycleCurrent(lifecycle) {
+			return nil
+		}
+		timer := time.NewTimer(poll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if lifecycle.admission != nil && lifecycle.admission.coordinator != nil {
+		return lifecycle.admission.coordinator.Shutdown(ctx)
+	}
+	return nil
+}
+
+func (s *Server) activeWorkWithAdmissionSnapshot(ctx context.Context, admission *serveAdmissionSnapshot) bool {
+	s.mu.Lock()
+	activeJobs := len(s.activeJobs)
+	s.mu.Unlock()
+	if activeJobs > 0 {
+		return true
+	}
+	if s.resultPublications.Load() > 0 {
+		return true
+	}
+	if admission == nil {
+		return false
+	}
+	checker := admission.checker
+	if checker == nil && admission.coordinator != nil {
+		checker = admission.coordinator
+	}
+	if checker != nil {
+		owned, err := checker.HasOwnedWork(ctx)
+		if err != nil && s.safetyFailStopErr() == nil {
+			log.Printf("agentbus daemon: admission active-work check failed: %v", err)
+		}
+		if err != nil || owned {
+			return true
+		}
+	}
+	if admission.runtime != nil && admission.runtime.hasActiveCustodies() {
+		return true
+	}
+	return false
+}
+
+func (s *Server) ensureSafetyLatch() {
+	if s.safetyLatch != nil {
+		return
+	}
+	s.safetyLatch = NewSafetyLatch()
+}
+
 func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	if err := os.MkdirAll(filepath.Dir(s.socketPath), 0o700); err != nil {
 		return nil, socketFileIdentity{}, err
@@ -402,16 +1101,28 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	if _, err := os.Lstat(s.socketPath); err == nil {
 		if conn, dialErr := net.DialTimeout("unix", s.socketPath, 100*time.Millisecond); dialErr == nil {
 			_ = conn.Close()
-			return nil, socketFileIdentity{}, fmt.Errorf("agentbus daemon already listening at %s", s.socketPath)
+			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
 		}
+		// Production Serve reaches this cleanup only while holding the strict
+		// admission startup lease for the delegated root. A concurrent
+		// direct/autostart daemon that cannot take the same lease fails or
+		// converges before listen(), so a non-dialable path here cannot be a
+		// concurrent winner's newly listening socket unless that startup-lease
+		// invariant is already broken.
 		if err := os.Remove(s.socketPath); err != nil {
 			return nil, socketFileIdentity{}, err
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, socketFileIdentity{}, err
 	}
-	ln, err := net.Listen("unix", s.socketPath)
+	if s.beforeListenBindHook != nil {
+		s.beforeListenBindHook()
+	}
+	ln, identity, err := listenUnixSocketPrivate(s.socketPath, s.unixSocketPrivateListenHooks)
 	if err != nil {
+		if isAddrInUse(err) {
+			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
+		}
 		return nil, socketFileIdentity{}, err
 	}
 	// net.UnixListener normally removes its path on Close. Disable that BEFORE
@@ -424,38 +1135,126 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 		return nil, socketFileIdentity{}, fmt.Errorf("daemon listener for %s is not a Unix listener", s.socketPath)
 	}
 	unixListener.SetUnlinkOnClose(false)
-	identity, err := statSocketFileIdentity(s.socketPath)
-	if err != nil {
+	if !socketPathMatchesIdentity(s.socketPath, identity) {
 		_ = ln.Close()
-		return nil, socketFileIdentity{}, fmt.Errorf("stat daemon socket %q: %w", s.socketPath, err)
+		return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
 	}
 	if err := os.Chmod(s.socketPath, 0o600); err != nil {
 		_ = ln.Close()
 		s.removeOwnedSocket(identity, "listener setup failure")
 		return nil, socketFileIdentity{}, err
 	}
+	if !socketPathMatchesIdentity(s.socketPath, identity) {
+		_ = ln.Close()
+		return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
+	}
 	return ln, identity, nil
+}
+
+func listenUnixSocketPrivate(path string, hooks unixSocketPrivateListenHooks) (net.Listener, socketFileIdentity, error) {
+	return listenUnixSocketPrivateWithHooks(path, hooks)
+}
+
+type unixSocketPrivateListenHooks struct {
+	beforeListen func(socketFileIdentity) error
+}
+
+func listenUnixSocketPrivateWithHooks(path string, hooks unixSocketPrivateListenHooks) (net.Listener, socketFileIdentity, error) {
+	fd, err := openUnixSocketFD()
+	if err != nil {
+		return nil, socketFileIdentity{}, err
+	}
+	fdOpen := true
+	closeFD := func() {
+		if fdOpen {
+			_ = syscall.Close(fd)
+			fdOpen = false
+		}
+	}
+	failBound := func(identity socketFileIdentity, phase string, err error) (net.Listener, socketFileIdentity, error) {
+		closeFD()
+		removeSocketPathIfIdentity(path, identity, phase)
+		return nil, socketFileIdentity{}, err
+	}
+
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		closeFD()
+		return nil, socketFileIdentity{}, os.NewSyscallError("setsockopt", err)
+	}
+	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: path}); err != nil {
+		closeFD()
+		return nil, socketFileIdentity{}, os.NewSyscallError("bind", err)
+	}
+	identity, err := statSocketFileIdentity(path)
+	if err != nil {
+		closeFD()
+		return nil, socketFileIdentity{}, fmt.Errorf("lstat daemon socket %q after bind: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return failBound(identity, "listener setup failure", err)
+	}
+	if hooks.beforeListen != nil {
+		if err := hooks.beforeListen(identity); err != nil {
+			return failBound(identity, "listener setup failure", err)
+		}
+	}
+	if err := syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
+		return failBound(identity, "listener setup failure", os.NewSyscallError("listen", err))
+	}
+	if !socketPathMatchesIdentity(path, identity) {
+		closeFD()
+		return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: path}
+	}
+
+	file := os.NewFile(uintptr(fd), "agentbus-daemon-listener")
+	if file == nil {
+		return failBound(identity, "listener setup failure", fmt.Errorf("wrap daemon listener fd %d", fd))
+	}
+	fdOpen = false
+	ln, err := net.FileListener(file)
+	if err != nil {
+		_ = file.Close()
+		removeSocketPathIfIdentity(path, identity, "listener setup failure")
+		return nil, socketFileIdentity{}, err
+	}
+	if err := file.Close(); err != nil {
+		_ = ln.Close()
+		removeSocketPathIfIdentity(path, identity, "listener setup failure")
+		return nil, socketFileIdentity{}, err
+	}
+	return ln, identity, nil
+}
+
+func openUnixSocketFD() (int, error) {
+	socketType, closeOnExecInSocket := unixSocketStreamType()
+	if !closeOnExecInSocket {
+		syscall.ForkLock.RLock()
+	}
+	fd, err := syscall.Socket(syscall.AF_UNIX, socketType, 0)
+	if err == nil && !closeOnExecInSocket {
+		syscall.CloseOnExec(fd)
+	}
+	if !closeOnExecInSocket {
+		syscall.ForkLock.RUnlock()
+	}
+	if err != nil {
+		return -1, os.NewSyscallError("socket", err)
+	}
+	if closeOnExecInSocket {
+		syscall.CloseOnExec(fd)
+	}
+	return fd, nil
 }
 
 func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener, socketIdentity socketFileIdentity, acceptSettled <-chan struct{}) {
 	ticker := time.NewTicker(s.idleCheckInterval)
 	defer ticker.Stop()
-	reapTicker := s.reapTickFactory(s.reapTickInterval)
-	defer reapTicker.stop()
 	staleDraining := false
 	drainLogged := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-reapTicker.c:
-			err := s.reapKnownStores()
-			if s.afterReapTickHook != nil {
-				s.afterReapTickHook(err)
-			}
-			if err != nil {
-				log.Printf("agentbus daemon: periodic reap: %v", err)
-			}
 		case <-ticker.C:
 			stale := s.checkBinaryStale()
 			quiet := s.clients.Load() == 0 && s.accepting.Load() == 0 && !s.activeWork()
@@ -518,26 +1317,129 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, ln net
 	}
 }
 
+func (s *Server) safetyLoop(ctx context.Context, cancel context.CancelFunc, ln net.Listener, socketIdentity socketFileIdentity, acceptSettled <-chan struct{}, done chan<- error) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-s.safetyLatch.Done():
+	}
+
+	failStopErr := s.safetyFailStopErr()
+	log.Printf("agentbus daemon: safety latch tripped; closing listener: %v", failStopErr)
+	if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Printf("agentbus daemon: close fail-stopped listener: %v", err)
+	}
+	s.removeOwnedSocket(socketIdentity, "safety fail-stop")
+
+	drainTimeout := s.safetyDrainTimeout
+	if drainTimeout <= 0 {
+		drainTimeout = defaultSafetyDrain
+	}
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	probeResults := make(chan bool, 1)
+	probeRunning := false
+	startDrainProbe := func() {
+		if probeRunning {
+			return
+		}
+		settled := false
+		select {
+		case <-acceptSettled:
+			settled = true
+		default:
+		}
+		// The accept loop must first confirm that every connection returned
+		// before listener close has been registered in the client counters.
+		if !settled || s.clients.Load() != 0 || s.accepting.Load() != 0 {
+			return
+		}
+		probeRunning = true
+		probeCtx, probeCancel := context.WithTimeout(ctx, drainTimeout)
+		go func() {
+			defer probeCancel()
+			probeResults <- !s.activeWorkWithContext(probeCtx)
+		}()
+	}
+	startDrainProbe()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			err := fmt.Errorf("%w; safety drain timed out after %s", failStopErr, drainTimeout)
+			log.Printf("agentbus daemon: safety fail-stop drain timed out; exiting: %v", err)
+			select {
+			case done <- err:
+			default:
+			}
+			cancel()
+			return
+		case drained := <-probeResults:
+			probeRunning = false
+			if drained {
+				log.Printf("agentbus daemon: safety fail-stop drain complete; exiting: %v", failStopErr)
+				select {
+				case done <- failStopErr:
+				default:
+				}
+				cancel()
+				return
+			}
+			startDrainProbe()
+		case <-ticker.C:
+			startDrainProbe()
+		}
+	}
+}
+
+func (s *Server) safetyFailStopErr() error {
+	if s == nil || s.safetyLatch == nil {
+		return nil
+	}
+	reason := s.safetyLatch.Reason()
+	if reason == nil {
+		return nil
+	}
+	return SafetyFailStopError{Reason: reason}
+}
+
 func statSocketFileIdentity(path string) (socketFileIdentity, error) {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return socketFileIdentity{}, err
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
+	return socketFileIdentityFromStat(info.Sys())
+}
+
+func socketFileIdentityFromStat(sys any) (socketFileIdentity, error) {
+	stat, ok := sys.(*syscall.Stat_t)
 	if !ok {
-		return socketFileIdentity{}, fmt.Errorf("unexpected socket stat type %T", info.Sys())
+		return socketFileIdentity{}, fmt.Errorf("unexpected socket stat type %T", sys)
 	}
 	return socketFileIdentity{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}, nil
 }
 
+func socketPathMatchesIdentity(path string, owned socketFileIdentity) bool {
+	actual, err := statSocketFileIdentity(path)
+	return err == nil && actual == owned
+}
+
 func (s *Server) removeOwnedSocket(owned socketFileIdentity, phase string) {
-	actual, err := statSocketFileIdentity(s.socketPath)
+	removeSocketPathIfIdentity(s.socketPath, owned, phase)
+}
+
+func removeSocketPathIfIdentity(path string, owned socketFileIdentity, phase string) {
+	actual, err := statSocketFileIdentity(path)
 	if err != nil {
-		log.Printf("agentbus daemon: skipping socket removal during %s: cannot stat %s (%v); a replacement daemon may own the path", phase, s.socketPath, err)
+		log.Printf("agentbus daemon: skipping socket removal during %s: cannot stat %s (%v); a replacement daemon may own the path", phase, path, err)
 		return
 	}
 	if actual != owned {
-		log.Printf("agentbus daemon: skipping socket removal during %s: replacement daemon owns %s", phase, s.socketPath)
+		log.Printf("agentbus daemon: skipping socket removal during %s: replacement daemon owns %s", phase, path)
 		return
 	}
 	// dev+inode alone cannot prove ownership: tmpfs (Linux /tmp) reuses inodes
@@ -546,16 +1448,234 @@ func (s *Server) removeOwnedSocket(owned socketFileIdentity, phase string) {
 	// listener is already closed, so a successful dial proves a LIVE listener —
 	// necessarily a replacement — and skipping is always fail-safe (daemon
 	// startup dials and clears genuinely stale files itself).
-	if conn, dialErr := net.DialTimeout("unix", s.socketPath, 250*time.Millisecond); dialErr == nil {
+	if conn, dialErr := net.DialTimeout("unix", path, 250*time.Millisecond); dialErr == nil {
 		_ = conn.Close()
-		log.Printf("agentbus daemon: skipping socket removal during %s: %s accepts connections; a replacement daemon owns it", phase, s.socketPath)
+		log.Printf("agentbus daemon: skipping socket removal during %s: %s accepts connections; a replacement daemon owns it", phase, path)
 		return
 	}
-	if err := os.Remove(s.socketPath); err != nil {
+	if err := os.Remove(path); err != nil {
 		log.Printf("agentbus daemon: remove owned socket during %s: %v", phase, err)
 		return
 	}
 	log.Printf("agentbus daemon: removed owned socket during %s", phase)
+}
+
+func (s *Server) currentOwnedPIDFileSnapshot() pidFileSnapshot {
+	pidPath := filepath.Join(s.stateRoot, "agentbus.pid")
+	raw, identity, err := s.readPIDFileNoFollow(pidPath)
+	if err != nil {
+		return pidFileSnapshot{}
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid != os.Getpid() {
+		return pidFileSnapshot{}
+	}
+	return pidFileSnapshot{identity: identity, known: true}
+}
+
+func (s *Server) readPIDFileNoFollow(path string) ([]byte, socketFileIdentity, error) {
+	if s.readPIDFileNoFollowHook != nil {
+		return s.readPIDFileNoFollowHook(path)
+	}
+	return readPIDFileNoFollow(path)
+}
+
+func (s *Server) removeOwnedPIDFile(ctx context.Context, phase string, expected ...pidFileSnapshot) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	pidPath := filepath.Join(s.stateRoot, "agentbus.pid")
+	raw, owned, err := s.readPIDFileNoFollow(pidPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("agentbus daemon: skipping pid removal during %s: read %s: %v", phase, pidPath, err)
+			return fmt.Errorf("%w: read %s: %w", ErrShutdownPIDTeardownFailed, pidPath, err)
+		}
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(expected) > 0 && expected[0].known && owned != expected[0].identity {
+		log.Printf("agentbus daemon: skipping pid removal during %s: replacement daemon owns %s", phase, pidPath)
+		return nil
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		log.Printf("agentbus daemon: skipping pid removal during %s: invalid pid file %s", phase, pidPath)
+		return nil
+	}
+	if pid != os.Getpid() {
+		log.Printf("agentbus daemon: skipping pid removal during %s: %s belongs to pid %d", phase, pidPath, pid)
+		return nil
+	}
+	if s.beforePIDFileQuarantineHook != nil {
+		s.beforePIDFileQuarantineHook()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	quarantineDir, quarantinePath, err := createPIDFileQuarantine(s.stateRoot)
+	if err != nil {
+		log.Printf("agentbus daemon: skipping pid removal during %s: create pid quarantine: %v", phase, err)
+		return fmt.Errorf("%w: create pid quarantine: %w", ErrShutdownPIDTeardownFailed, err)
+	}
+	cleanupQuarantineDir := true
+	defer func() {
+		if !cleanupQuarantineDir {
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			log.Printf("agentbus daemon: abandoning pid quarantine directory cleanup during %s after context cancellation; dir=%s: %v", phase, quarantineDir, err)
+			return
+		}
+		if err := os.Remove(quarantineDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("agentbus daemon: remove pid quarantine directory during %s: %v", phase, err)
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Rename(pidPath, quarantinePath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("agentbus daemon: skipping pid removal during %s: quarantine %s: %v", phase, pidPath, err)
+			return fmt.Errorf("%w: quarantine %s: %w", ErrShutdownPIDTeardownFailed, pidPath, err)
+		}
+		return nil
+	}
+	if err := abortQuarantinedPIDFileIfContextDone(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir); err != nil {
+		return err
+	}
+	quarantinedRaw, quarantined, err := s.readPIDFileNoFollow(quarantinePath)
+	if err != nil {
+		log.Printf("agentbus daemon: skipping pid removal during %s: validate quarantined pid %s: %v", phase, quarantinePath, err)
+		cleanup, restoreErr := restoreQuarantinedPIDFileContext(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir)
+		if restoreErr != nil && errors.Is(restoreErr, ctx.Err()) {
+			return restoreErr
+		}
+		cleanupQuarantineDir = cleanup
+		return errors.Join(
+			fmt.Errorf("%w: validate quarantined pid %s: %w", ErrShutdownPIDTeardownFailed, quarantinePath, err),
+			wrapPIDRestoreError(restoreErr),
+		)
+	}
+	if err := abortQuarantinedPIDFileIfContextDone(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir); err != nil {
+		return err
+	}
+	quarantinedPID, err := strconv.Atoi(strings.TrimSpace(string(quarantinedRaw)))
+	if err != nil {
+		log.Printf("agentbus daemon: skipping pid removal during %s: invalid quarantined pid file %s", phase, quarantinePath)
+		cleanup, restoreErr := restoreQuarantinedPIDFileContext(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir)
+		cleanupQuarantineDir = cleanup
+		return wrapPIDRestoreError(restoreErr)
+	}
+	if quarantined != owned || quarantinedPID != os.Getpid() {
+		log.Printf("agentbus daemon: skipping pid removal during %s: replacement daemon owns %s", phase, pidPath)
+		cleanup, restoreErr := restoreQuarantinedPIDFileContext(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir)
+		cleanupQuarantineDir = cleanup
+		return wrapPIDRestoreError(restoreErr)
+	}
+	if err := abortQuarantinedPIDFileIfContextDone(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir); err != nil {
+		return err
+	}
+	if err := os.Remove(quarantinePath); err != nil {
+		log.Printf("agentbus daemon: remove owned pid during %s: %v", phase, err)
+		cleanup, restoreErr := restoreQuarantinedPIDFileContext(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir)
+		if restoreErr != nil && errors.Is(restoreErr, ctx.Err()) {
+			return restoreErr
+		}
+		cleanupQuarantineDir = cleanup
+		return errors.Join(
+			fmt.Errorf("%w: remove owned pid during %s: %w", ErrShutdownPIDTeardownFailed, phase, err),
+			wrapPIDRestoreError(restoreErr),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		cleanupQuarantineDir = false
+		log.Printf("agentbus daemon: abandoning owned pid restore during %s after context cancellation; canonical=%s quarantine=%s already removed: %v", phase, pidPath, quarantinePath, err)
+		return err
+	}
+	log.Printf("agentbus daemon: removed owned pid during %s", phase)
+	return nil
+}
+
+func readPIDFileNoFollow(path string) ([]byte, socketFileIdentity, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, socketFileIdentity{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, socketFileIdentity{}, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, socketFileIdentity{}, fmt.Errorf("unexpected pid stat type %T", info.Sys())
+	}
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return nil, socketFileIdentity{}, err
+	}
+	return raw, socketFileIdentity{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}, nil
+}
+
+func createPIDFileQuarantine(stateRoot string) (string, string, error) {
+	base := fmt.Sprintf("agentbus.pid.quarantine.%d.%d", os.Getpid(), time.Now().UnixNano())
+	for i := 0; i < 10; i++ {
+		dir := filepath.Join(stateRoot, fmt.Sprintf("%s.%d", base, i))
+		if err := os.Mkdir(dir, 0o700); err == nil {
+			return dir, filepath.Join(dir, "agentbus.pid"), nil
+		} else if !errors.Is(err, os.ErrExist) {
+			return "", "", err
+		}
+	}
+	return "", "", fmt.Errorf("could not allocate unique pid quarantine path in %s", stateRoot)
+}
+
+func abortQuarantinedPIDFileIfContextDone(ctx context.Context, pidPath, quarantinePath, phase string, cleanupQuarantineDir *bool) error {
+	if err := ctx.Err(); err != nil {
+		*cleanupQuarantineDir = false
+		log.Printf("agentbus daemon: abandoning quarantined pid restore during %s after context cancellation; canonical=%s quarantine=%s: %v", phase, pidPath, quarantinePath, err)
+		return err
+	}
+	return nil
+}
+
+func restoreQuarantinedPIDFileContext(ctx context.Context, pidPath, quarantinePath, phase string, cleanupQuarantineDir *bool) (bool, error) {
+	if err := abortQuarantinedPIDFileIfContextDone(ctx, pidPath, quarantinePath, phase, cleanupQuarantineDir); err != nil {
+		return false, err
+	}
+	return restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
+}
+
+func restoreQuarantinedPIDFile(pidPath, quarantinePath, phase string) (bool, error) {
+	if err := os.Link(quarantinePath, pidPath); err == nil {
+		if removeErr := os.Remove(quarantinePath); removeErr != nil {
+			log.Printf("agentbus daemon: restored pid during %s but could not remove quarantine %s: %v", phase, quarantinePath, removeErr)
+			return false, removeErr
+		}
+		return true, nil
+	} else if errors.Is(err, os.ErrExist) {
+		if removeErr := os.Remove(quarantinePath); removeErr != nil {
+			log.Printf("agentbus daemon: canonical pid exists during %s and quarantine %s remains: %v", phase, quarantinePath, removeErr)
+			return false, removeErr
+		}
+		return true, nil
+	} else {
+		log.Printf("agentbus daemon: could not restore replacement pid during %s from %s to %s: %v", phase, quarantinePath, pidPath, err)
+		return false, err
+	}
+}
+
+func wrapPIDRestoreError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: restore pid ownership signal: %w", ErrShutdownPIDTeardownFailed, err)
 }
 
 func statBinaryIdentity(path string) (BinaryIdentity, error) {
@@ -611,9 +1731,43 @@ func (s *Server) checkBinaryStale() bool {
 }
 
 func (s *Server) activeWork() bool {
+	return s.activeWorkWithContext(context.Background())
+}
+
+func (s *Server) activeWorkWithContext(ctx context.Context) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.activeJobs) > 0
+	activeJobs := len(s.activeJobs)
+	s.mu.Unlock()
+	if activeJobs > 0 {
+		return true
+	}
+	if s.resultPublications.Load() > 0 {
+		return true
+	}
+	// Snapshot-checkout: never hold admissionStateMu across HasOwnedWork —
+	// a stalled ownership probe must not block closeServeAdmission's write
+	// lock past the safety fail-stop drain deadline.
+	s.admissionStateMu.RLock()
+	checker := s.admissionOwnedWorkChecker
+	if checker == nil && s.admissionCoordinator != nil {
+		checker = s.admissionCoordinator
+	}
+	runtime := s.admissionRuntime
+	s.admissionStateMu.RUnlock()
+	if checker != nil {
+		owned, err := checker.HasOwnedWork(ctx)
+		if err != nil && s.safetyFailStopErr() == nil {
+			log.Printf("agentbus daemon: admission active-work check failed: %v", err)
+		}
+		if err != nil || owned {
+			return true
+		}
+	}
+	if runtime != nil && runtime.hasActiveCustodies() {
+		return true
+	}
+	// TODO(S4E-b): include pending recovery executor work once recovery execution lands.
+	return false
 }
 
 func (s *Server) touchActivity() {
@@ -630,6 +1784,8 @@ type connection struct {
 }
 
 func (c *connection) serve(ctx context.Context) {
+	stopFailStopClose := c.closeOnFailStop()
+	defer stopFailStopClose()
 	defer c.conn.Close()
 	scanner := bufio.NewScanner(c.conn)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -671,14 +1827,24 @@ func (c *connection) serve(ctx context.Context) {
 	}
 }
 
+func (c *connection) closeOnFailStop() func() {
+	if c == nil || c.server == nil || c.server.safetyLatch == nil || c.conn == nil {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	go func(done <-chan struct{}) {
+		select {
+		case <-done:
+			_ = c.conn.Close()
+		case <-stop:
+		}
+	}(c.server.safetyLatch.Done())
+	return func() { close(stop) }
+}
+
 func requiresRequestID(method string) bool {
 	switch method {
 	case protocol.MethodHello,
-		protocol.MethodSessionStart,
-		protocol.MethodSessionResume,
-		protocol.MethodSessionList,
-		protocol.MethodTurnStart,
-		protocol.MethodTurnInterrupt,
 		protocol.MethodJobSubmit,
 		protocol.MethodJobStatus,
 		protocol.MethodJobResult,
@@ -695,12 +1861,6 @@ func (c *connection) writeResponse(resp protocol.Response) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return writeFrame(c.conn, resp)
-}
-
-func (c *connection) notify(method string, params any) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return writeFrame(c.conn, protocol.Notification{JSONRPC: "2.0", Method: method, Params: params})
 }
 
 func writeFrame(w io.Writer, v any) error {
@@ -726,16 +1886,6 @@ func (s *Server) handle(ctx context.Context, c *connection, req protocol.Request
 	switch req.Method {
 	case protocol.MethodHello:
 		return s.handleHello(c, req.Params)
-	case protocol.MethodSessionStart:
-		return s.handleSessionStart(ctx, req.Params)
-	case protocol.MethodSessionResume:
-		return s.handleSessionResume(ctx, req.Params)
-	case protocol.MethodSessionList:
-		return s.handleSessionList(req.Params)
-	case protocol.MethodTurnStart:
-		return s.handleTurnStart(ctx, c, req.Params)
-	case protocol.MethodTurnInterrupt:
-		return s.handleTurnInterrupt(req.Params)
 	case protocol.MethodJobSubmit:
 		return s.handleJobSubmit(ctx, req.Params)
 	case protocol.MethodJobStatus:
@@ -749,7 +1899,35 @@ func (s *Server) handle(ctx context.Context, c *connection, req protocol.Request
 	case protocol.MethodPolicyRegister:
 		return s.handlePolicyRegister(req.Params)
 	default:
-		return requestOutcome{err: protocol.NewError(protocol.ErrorCapabilityMissing, "unknown method", protocol.ErrorData{})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorMethodNotFound, "method not found", protocol.ErrorData{})}
+	}
+}
+
+func (s *Server) failStoppedRequestError(method string) *protocol.ErrorObject {
+	if failStoppedMethodAllowed(method) {
+		return nil
+	}
+	failStopErr := s.safetyFailStopErr()
+	if failStopErr == nil {
+		return nil
+	}
+	return strictAdmissionProtocolError(
+		protocol.ErrorBackendUnavailable,
+		protocol.AdmissionRejectRootFailStopped,
+		failStopErr.Error(),
+		protocol.ErrorData{},
+	)
+}
+
+func failStoppedMethodAllowed(method string) bool {
+	switch method {
+	case protocol.MethodHello,
+		protocol.MethodJobStatus,
+		protocol.MethodJobResult,
+		protocol.MethodPolicyValidate:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -769,8 +1947,24 @@ func (s *Server) handleHello(c *connection, raw json.RawMessage) requestOutcome 
 		ProtocolVersion: protocol.Version,
 		Backends:        s.backendNames(),
 		BackendMetadata: s.backendMetadata(),
-		Capabilities:    protocol.DefaultCapabilities(),
+		Capabilities:    s.protocolCapabilities(),
 	}}
+}
+
+func (s *Server) protocolCapabilities() map[string]bool {
+	capabilities := protocol.DefaultCapabilities()
+	s.admissionStateMu.RLock()
+	instance := s.admissionInstance
+	if instance != nil && instance.policy.AdvertiseRequestID {
+		capabilities["jobs.requestId"] = true
+	}
+	if instance != nil &&
+		instance.policy.Mode == AdmissionStrictIdentified &&
+		instance.policy.AcceptIdentified {
+		capabilities[protocol.CapabilityAdmissionStrictContainment] = true
+	}
+	s.admissionStateMu.RUnlock()
+	return capabilities
 }
 
 func (s *Server) backendMetadata() []protocol.BackendInfo {
@@ -788,298 +1982,117 @@ func (s *Server) backendMetadata() []protocol.BackendInfo {
 	return result
 }
 
-func (s *Server) handleSessionStart(ctx context.Context, raw json.RawMessage) requestOutcome {
-	var params protocol.SessionStartParams
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
-	}
-	if params.Backend == "" || params.CWD == "" || !filepath.IsAbs(params.CWD) {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "session.start requires backend and absolute cwd", protocol.ErrorData{})}
-	}
-	backend, ok := s.backends[params.Backend]
-	if !ok {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{})}
-	}
-	session, err := backend.Start(ctx, engine.SessionOpts{CWD: params.CWD, Write: params.Write, Model: params.Model, Effort: params.Effort, Timeout: protocol.DefaultTimeout})
-	if err != nil {
-		return requestOutcome{err: backendError(err)}
-	}
-	sessionID := session.ID()
-	if sessionID == "" {
-		sessionID = s.nextID("ses")
-	}
-	state := &sessionState{
-		id:           sessionID,
-		backend:      params.Backend,
-		cwd:          params.CWD,
-		writeDefault: params.Write,
-		model:        params.Model,
-		effort:       params.Effort,
-		tags:         cloneTags(params.Tags),
-		session:      session,
-	}
-	s.mu.Lock()
-	s.sessions[sessionID] = state
-	s.mu.Unlock()
-	s.touchActivity()
-	return requestOutcome{result: protocol.SessionStartResult{SessionID: sessionID, Backend: params.Backend}}
-}
-
-func (s *Server) handleSessionResume(ctx context.Context, raw json.RawMessage) requestOutcome {
-	var params protocol.SessionResumeParams
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
-	}
-	if params.SessionID == "" {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "sessionId is required", protocol.ErrorData{})}
-	}
-	s.mu.Lock()
-	existing := s.sessions[params.SessionID]
-	s.mu.Unlock()
-	if existing != nil {
-		return requestOutcome{result: protocol.SessionStartResult{SessionID: existing.id, Backend: existing.backend}}
-	}
-	record, store := s.findPersistedSession(params.SessionID)
-	if record == nil || store == nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "session is not known to this daemon", protocol.ErrorData{SessionID: params.SessionID})}
-	}
-	backend, ok := s.backends[record.Backend]
-	if !ok {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{SessionID: params.SessionID})}
-	}
-	session, err := backend.Resume(ctx, record.BackendSessionID, engine.SessionOpts{
-		CWD:     store.Layout().Workspace,
-		Write:   false,
-		Timeout: protocol.DefaultTimeout,
-	})
-	if err != nil {
-		return requestOutcome{err: backendError(err)}
-	}
-	state := &sessionState{
-		id:           params.SessionID,
-		backend:      record.Backend,
-		cwd:          store.Layout().Workspace,
-		writeDefault: false,
-		tags:         cloneTags(record.Tags),
-		session:      session,
-	}
-	s.mu.Lock()
-	s.sessions[params.SessionID] = state
-	s.mu.Unlock()
-	s.touchActivity()
-	return requestOutcome{result: protocol.SessionStartResult{SessionID: params.SessionID, Backend: record.Backend}}
-}
-
-func (s *Server) handleSessionList(raw json.RawMessage) requestOutcome {
-	var params protocol.SessionListParams
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
-	}
-	s.mu.Lock()
-	sessions := make([]protocol.SessionInfo, 0, len(s.sessions))
-	for _, state := range s.sessions {
-		if !tagsMatch(state.tags, params.Tags) {
-			continue
-		}
-		var active *string
-		if state.activeTurnID != "" {
-			id := state.activeTurnID
-			active = &id
-		}
-		sessions = append(sessions, protocol.SessionInfo{
-			SessionID:    state.id,
-			Backend:      state.backend,
-			CWD:          state.cwd,
-			Write:        state.writeDefault,
-			Tags:         cloneTags(state.tags),
-			ActiveTurnID: active,
-		})
-	}
-	s.mu.Unlock()
-	sort.Slice(sessions, func(i, j int) bool { return sessions[i].SessionID < sessions[j].SessionID })
-	return requestOutcome{result: protocol.SessionListResult{Sessions: sessions}}
-}
-
-func (s *Server) handleTurnStart(ctx context.Context, c *connection, raw json.RawMessage) requestOutcome {
-	var params protocol.TurnStartParams
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
-	}
-	if params.SessionID == "" || params.Prompt == "" {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turn.start requires sessionId and prompt", protocol.ErrorData{SessionID: params.SessionID})}
-	}
-	timeout, errObj := timeoutFromMillis(params.TimeoutMs)
-	if errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-	policy, err := s.resolvePolicy(params.Policy)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{SessionID: params.SessionID})}
-	}
-	s.mu.Lock()
-	session := s.sessions[params.SessionID]
-	if session == nil {
-		s.mu.Unlock()
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "session is not known", protocol.ErrorData{SessionID: params.SessionID})}
-	}
-	if session.activeTurnID != "" {
-		active := session.activeTurnID
-		s.mu.Unlock()
-		return requestOutcome{err: protocol.NewError(protocol.ErrorSessionBusy, "session already has an active turn", protocol.ErrorData{SessionID: params.SessionID, TurnID: active, JobID: active})}
-	}
-	write := session.writeDefault
-	if params.Write != nil {
-		write = *params.Write
-	}
-	jobID := s.nextID("job")
-	session.activeTurnID = jobID
-	store, err := s.storeForCWDLocked(session.cwd)
-	if err != nil {
-		session.activeTurnID = ""
-		s.mu.Unlock()
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{SessionID: params.SessionID})}
-	}
-	s.jobStores[jobID] = store
-	s.mu.Unlock()
-	if err := s.createQueuedRecord(store, jobID, session.id, session.backend, session.tags, policy.policy, policy.contract, true); err != nil {
-		s.clearActiveTurn(session.id, jobID)
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{SessionID: params.SessionID, JobID: jobID, TurnID: jobID})}
-	}
-	runCtx, cancel := context.WithCancel(ctx)
-	active := &activeJob{jobID: jobID, sessionID: session.id, foreground: true, session: session.session, cancel: cancel}
-	s.addActiveJob(active)
-	run := jobRun{
-		jobID:        jobID,
-		sessionID:    session.id,
-		backend:      session.backend,
-		store:        store,
-		session:      session.session,
-		prompt:       params.Prompt,
-		write:        write,
-		policy:       policy.policy,
-		contract:     policy.contract,
-		contractName: policy.name,
-		contractHash: policy.hash,
-		timeout:      timeout,
-		foreground:   true,
-		conn:         c,
-		active:       active,
-		onDone: func() {
-			s.clearActiveTurn(session.id, jobID)
-		},
-	}
-	return requestOutcome{
-		result:       protocol.TurnStartResult{TurnID: jobID, JobID: jobID, SessionID: session.id},
-		after:        func() { go s.runJob(runCtx, run) },
-		onAckFailure: func(error) { s.abortUndeliveredRun(run, engine.StateInterrupted) },
-	}
-}
-
-func (s *Server) handleTurnInterrupt(raw json.RawMessage) requestOutcome {
-	var params protocol.TurnInterruptParams
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
-	}
-	if params.TurnID == "" {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turnId is required", protocol.ErrorData{})}
-	}
-	active := s.lookupActiveJob(params.TurnID)
-	if active != nil {
-		if !active.foreground {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turn.interrupt only applies to foreground turns", protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
-		}
-		active.requestTerminal(engine.StateInterrupted)
-	}
-	store := s.storeForJob(params.TurnID)
-	if store == nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turn is not known", protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
-	}
-	if active == nil {
-		record, err := store.Load(params.TurnID)
-		if err != nil {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
-		}
-		if !record.Foreground {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "turn.interrupt only applies to foreground turns", protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
-		}
-	}
-	record, err := store.Interrupt(params.TurnID)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.TurnID, TurnID: params.TurnID})}
-	}
-	if active != nil && active.cancel != nil {
-		active.cancel()
-	}
-	return requestOutcome{result: protocol.TurnInterruptResult{TurnID: params.TurnID, JobID: params.TurnID, State: record.State}}
-}
-
 func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) requestOutcome {
-	if errObj := validateTaskSpecEnvelope(raw); errObj != nil {
+	if errObj := s.failStoppedRequestError(protocol.MethodJobSubmit); errObj != nil {
 		return requestOutcome{err: errObj}
 	}
-	var params protocol.JobSubmitParams
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
+	strictByRaw, identityErr := strictIdentityPrecheck(raw)
+	if errObj := s.strictRouteDisabledPrecheck(); errObj != nil {
+		return requestOutcome{err: errObj}
 	}
-	spec := params.TaskSpec
-	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{})}
+	if !strictByRaw {
+		return requestOutcome{err: strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectMissingIdentity,
+			"job.submit requires workspaceKey and requestId",
+			protocol.ErrorData{},
+		)}
 	}
-	timeout, errObj := timeoutFromMillis(spec.TimeoutMs)
+	if identityErr != nil {
+		return requestOutcome{err: identityErr}
+	}
+	precheck, errObj := strictJobSubmitReplayPrecheck(raw)
 	if errObj != nil {
 		return requestOutcome{err: errObj}
 	}
-	policy, err := s.resolvePolicy(spec.Policy)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+	return s.handleIdentifiedJobSubmit(ctx, raw, precheck)
+}
+
+type strictJobSubmitPrecheck struct {
+	WorkspaceKey string
+	RequestID    string
+	RawTaskSpec  json.RawMessage
+}
+
+func strictJobSubmitReplayPrecheck(raw json.RawMessage) (strictJobSubmitPrecheck, *protocol.ErrorObject) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return strictJobSubmitPrecheck{}, strictAdmissionInvalidConfigError(err.Error(), protocol.ErrorData{})
 	}
-	backend, ok := s.backends[spec.Backend]
+	workspaceKey, err := requiredRawString(envelope, "workspaceKey")
+	if err != nil {
+		return strictJobSubmitPrecheck{}, strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectMissingIdentity,
+			err.Error(),
+			protocol.ErrorData{},
+		)
+	}
+	requestID, err := requiredRawString(envelope, "requestId")
+	if err != nil {
+		return strictJobSubmitPrecheck{}, strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectMissingIdentity,
+			err.Error(),
+			protocol.ErrorData{},
+		)
+	}
+	rawTaskSpec, ok := envelope["taskSpec"]
 	if !ok {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "backend is unavailable", protocol.ErrorData{})}
+		return strictJobSubmitPrecheck{}, strictAdmissionInvalidConfigError("taskSpec is required", protocol.ErrorData{})
 	}
-	session, err := backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
+	return strictJobSubmitPrecheck{
+		WorkspaceKey: workspaceKey,
+		RequestID:    requestID,
+		RawTaskSpec:  append(json.RawMessage(nil), rawTaskSpec...),
+	}, nil
+}
+
+func requiredRawString(envelope map[string]json.RawMessage, field string) (string, error) {
+	raw, ok := envelope[field]
+	if !ok {
+		return "", fmt.Errorf("%s is required", field)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("%s: %w", field, err)
+	}
+	return value, nil
+}
+
+func strictIdentityPrecheck(raw json.RawMessage) (bool, *protocol.ErrorObject) {
+	workspaceKeyPresent, err := jsonFieldPresent(raw, "workspaceKey")
 	if err != nil {
-		return requestOutcome{err: backendError(err)}
+		return false, protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
 	}
-	sessionID := session.ID()
-	if sessionID == "" {
-		sessionID = s.nextID("ses")
-	}
-	s.mu.Lock()
-	store, err := s.storeForCWDLocked(spec.CWD)
+	requestIDPresent, err := jsonFieldPresent(raw, "requestId")
 	if err != nil {
-		s.mu.Unlock()
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
+		return false, protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})
 	}
-	jobID := s.nextID("job")
-	s.jobStores[jobID] = store
-	s.mu.Unlock()
-	if err := s.createQueuedRecord(store, jobID, sessionID, spec.Backend, spec.Tags, policy.policy, policy.contract, false); err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: jobID})}
+	if !workspaceKeyPresent && !requestIDPresent {
+		return false, nil
 	}
-	runCtx, cancel := context.WithCancel(ctx)
-	active := &activeJob{jobID: jobID, sessionID: sessionID, session: session, cancel: cancel}
-	s.addActiveJob(active)
-	run := jobRun{
-		jobID:        jobID,
-		sessionID:    sessionID,
-		backend:      spec.Backend,
-		store:        store,
-		session:      session,
-		prompt:       spec.Prompt,
-		write:        spec.Write,
-		policy:       policy.policy,
-		contract:     policy.contract,
-		contractName: policy.name,
-		contractHash: policy.hash,
-		timeout:      timeout,
-		active:       active,
+	var identity struct {
+		WorkspaceKey string `json:"workspaceKey"`
+		RequestID    string `json:"requestId"`
 	}
-	return requestOutcome{
-		result:       protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
-		after:        func() { go s.runJob(runCtx, run) },
-		onAckFailure: func(error) { s.abortUndeliveredRun(run, engine.StateCanceled) },
+	if err := json.Unmarshal(raw, &identity); err != nil {
+		return true, strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectMissingIdentity,
+			err.Error(),
+			protocol.ErrorData{},
+		)
 	}
+	if _, err := model.NewRequestKey(identity.WorkspaceKey, identity.RequestID); err != nil {
+		return true, strictAdmissionProtocolError(
+			protocol.ErrorInvalidTaskSpec,
+			protocol.AdmissionRejectMissingIdentity,
+			err.Error(),
+			protocol.ErrorData{},
+		)
+	}
+	return true, nil
 }
 
 func (s *Server) handleJobStatus(raw json.RawMessage) requestOutcome {
@@ -1091,22 +2104,12 @@ func (s *Server) handleJobStatus(raw json.RawMessage) requestOutcome {
 		params.All = true
 	}
 	if params.JobID != "" {
-		store := s.storeForJob(params.JobID)
-		if store == nil {
-			return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{}}}
-		}
-		record, err := store.Load(params.JobID)
-		if err != nil {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
-		}
-		return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{statusFromRecord(*record)}}}
+		return s.handleExactJobStatus(params.JobID)
 	}
-	records := s.listKnownRecords()
-	statuses := make([]protocol.JobStatus, 0, len(records))
-	for _, record := range records {
-		statuses = append(statuses, statusFromRecord(record))
+	statuses, errObj := s.listJobStatuses()
+	if errObj != nil {
+		return requestOutcome{err: errObj}
 	}
-	sort.Slice(statuses, func(i, j int) bool { return statuses[i].JobID < statuses[j].JobID })
 	return requestOutcome{result: protocol.JobStatusResult{Jobs: statuses}}
 }
 
@@ -1118,18 +2121,35 @@ func (s *Server) handleJobResult(raw json.RawMessage) requestOutcome {
 	if params.JobID == "" {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "jobId is required", protocol.ErrorData{})}
 	}
-	store := s.storeForJob(params.JobID)
-	if store == nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+	return s.handleExactJobResult(params.JobID)
+}
+
+func (s *Server) handleExactJobStatus(jobID string) requestOutcome {
+	status, ok, authorityErr := s.authorityStatus(jobID)
+	if ok {
+		return requestOutcome{result: protocol.JobStatusResult{Jobs: []protocol.JobStatus{status}}}
 	}
-	record, err := store.Load(params.JobID)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
+	if authorityErr != nil {
+		return requestOutcome{err: authorityErr}
 	}
-	return requestOutcome{result: resultFromRecord(*record)}
+	return requestOutcome{err: unknownAuthorityJobError(jobID)}
+}
+
+func (s *Server) handleExactJobResult(jobID string) requestOutcome {
+	result, ok, authorityErr := s.authorityResult(jobID)
+	if ok {
+		return requestOutcome{result: result}
+	}
+	if authorityErr != nil {
+		return requestOutcome{err: authorityErr}
+	}
+	return requestOutcome{err: unknownAuthorityJobError(jobID)}
 }
 
 func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
+	if errObj := s.failStoppedRequestError(protocol.MethodJobCancel); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
 	var params protocol.JobCancelParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
@@ -1137,32 +2157,92 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 	if params.JobID == "" {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "jobId is required", protocol.ErrorData{})}
 	}
-	active := s.lookupActiveJob(params.JobID)
+	if _, _, ok, authorityErr := s.authorityJobProjection(params.JobID); authorityErr != nil {
+		return requestOutcome{err: authorityErr}
+	} else if ok {
+		return s.withAdmissionJobEffect(params.JobID, func() requestOutcome {
+			return s.handleAuthorityJobCancelLocked(params.JobID)
+		})
+	}
+	return requestOutcome{err: unknownAuthorityJobError(params.JobID)}
+}
+
+func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
+	active := s.lookupActiveJob(jobID)
 	if active != nil {
-		if active.foreground {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: params.JobID, TurnID: params.JobID})}
-		}
 		active.requestTerminal(engine.StateCanceled)
+		// Admission cancel is intentional containment. Mark the active launch
+		// before coordinator containment so a killed process is the cancel
+		// terminal path, not an unprovable safety event.
+		interruptCtx, interruptCancel := context.WithTimeout(context.Background(), admissionDetachedCleanupTimeout)
+		err := active.interruptAdmissionCommand(interruptCtx)
+		interruptCancel()
+		if err != nil {
+			if !admissionPhysicalCleanupUncertain(err) {
+				return requestOutcome{err: admissionProtocolError(err)}
+			}
+		}
 	}
-	store := s.storeForJob(params.JobID)
-	if store == nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+	record, projection, ok, errObj := s.authorityJobProjection(jobID)
+	if errObj != nil {
+		return requestOutcome{err: errObj}
 	}
-	record, err := store.Load(params.JobID)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
+	if !ok {
+		return requestOutcome{err: unknownAuthorityJobError(jobID)}
 	}
-	if record.Foreground {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "job.cancel only applies to background jobs", protocol.ErrorData{JobID: params.JobID, TurnID: params.JobID})}
+	if record.Terminal == nil {
+		err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
+			modelJobID := model.JobID(jobID)
+			if err := coord.Cancel(context.Background(), modelJobID, nil); err != nil {
+				return err
+			}
+			s.abandonAdmissionUnresolvedCustody(context.Background(), coord, modelJobID)
+			return nil
+		})
+		if err != nil {
+			var reloadErr *protocol.ErrorObject
+			record, projection, ok, reloadErr = s.authorityJobProjection(jobID)
+			if reloadErr == nil && ok {
+				if errors.Is(err, coordinator.ErrAlreadyFinalized) {
+					if validErr := admissionValidTerminalRecord(record); validErr != nil {
+						return requestOutcome{err: s.failStopAdmissionFinalizationReconcile(jobID, errors.Join(err, validErr))}
+					}
+					if abandonErr := s.abandonAdmissionRecordUnresolvedCustody(context.Background(), record); abandonErr != nil {
+						log.Printf("agentbus daemon: job %s unresolved custody abandon warning: %v", jobID, abandonErr)
+					}
+					return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
+				}
+				if admissionRecordTerminalCanceledByRequest(record) {
+					if abandonErr := s.abandonAdmissionRecordUnresolvedCustody(context.Background(), record); abandonErr != nil {
+						log.Printf("agentbus daemon: job %s unresolved custody abandon warning: %v", jobID, abandonErr)
+					}
+					return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
+				}
+			}
+			return requestOutcome{err: admissionProtocolError(err)}
+		}
+		var reloadErr *protocol.ErrorObject
+		_, projection, ok, reloadErr = s.authorityJobProjection(jobID)
+		if reloadErr != nil {
+			return requestOutcome{err: reloadErr}
+		}
+		if !ok {
+			return requestOutcome{err: unknownAuthorityJobError(jobID)}
+		}
 	}
-	record, err = store.Cancel(params.JobID)
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{JobID: params.JobID})}
+	return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
+}
+
+func admissionRecordTerminalCanceledByRequest(record model.SafetyRecord) bool {
+	if record.Cancel == nil || record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled {
+		return false
 	}
-	if active != nil && active.cancel != nil {
-		active.cancel()
+	switch record.Terminal.Cause {
+	case model.CauseCanceledBeforeAuthorization, model.CauseCanceledAfterAuthorization:
+		return true
+	default:
+		return false
 	}
-	return requestOutcome{result: protocol.JobCancelResult{JobID: record.JobID, State: record.State}}
 }
 
 func (s *Server) handlePolicyValidate(raw json.RawMessage) requestOutcome {
@@ -1189,6 +2269,9 @@ func (s *Server) handlePolicyValidate(raw json.RawMessage) requestOutcome {
 }
 
 func (s *Server) handlePolicyRegister(raw json.RawMessage) requestOutcome {
+	if errObj := s.failStoppedRequestError(protocol.MethodPolicyRegister); errObj != nil {
+		return requestOutcome{err: errObj}
+	}
 	var params protocol.PolicyRegisterParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
@@ -1208,6 +2291,9 @@ type jobRun struct {
 	jobID                   string
 	sessionID               string
 	backend                 string
+	cwd                     string
+	model                   string
+	effort                  string
 	store                   *engine.Store
 	session                 engine.Session
 	prompt                  string
@@ -1217,11 +2303,13 @@ type jobRun struct {
 	contractName            string
 	contractHash            string
 	timeout                 time.Duration
-	foreground              bool
-	conn                    *connection
 	active                  *activeJob
 	onDone                  func()
 	authoritativeCompletion bool
+	admissionControlled     bool
+	admissionMode           model.Mode
+	admissionAccepted       authority.AcceptResult
+	admissionLaunch         admissionLaunchBinding
 }
 
 func (s *Server) runJob(ctx context.Context, run jobRun) {
@@ -1234,70 +2322,56 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 	}()
 	defer run.active.cancel()
 	if run.active.requestedTerminal() != "" {
-		s.finalizeRequestedTerminal(run)
+		if err := s.finalizeRequestedTerminal(run); err != nil {
+			s.handleRunFinalizationError(run, err)
+		}
 		return
 	}
-	if err := s.transitionRecord(run.store, run.jobID, engine.StateStarting); err != nil {
-		s.finalizeFailure(run, err)
-		return
-	}
-	if err := s.transitionRecord(run.store, run.jobID, engine.StateRunning); err != nil {
-		s.finalizeFailure(run, err)
-		return
-	}
-	heartbeatDone := make(chan struct{})
-	go s.heartbeat(run.store, run.jobID, heartbeatDone)
-	defer close(heartbeatDone)
-
 	attemptPrompt := applyPrologue(run.policy, run.prompt)
-	text, state, err := s.runAttempt(ctx, run, attemptPrompt, run.write)
+	text, state, err := s.runAttempt(ctx, run, attemptPrompt, run.write, model.LaunchOrdinalOne)
 	if requested := run.active.requestedTerminal(); requested != "" {
-		s.finalizeTerminal(run, requested, text, nil)
+		s.completeRunTerminal(run, requested, text, nil)
 		return
 	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			s.finalizeTerminal(run, engine.StateTimedOut, text, skippedStampForRun(run, s.registry, engine.SkipTimeout))
+			s.completeRunTerminal(run, engine.StateTimedOut, text, skippedStampForRun(run, s.registry, engine.SkipTimeout))
 			return
 		}
 		if errors.Is(err, context.Canceled) {
 			state = engine.StateInterrupted
 		}
-		s.finalizeTerminal(run, state, text, skippedStampForRun(run, s.registry, skippedReasonForState(state)))
+		s.completeRunTerminal(run, state, text, skippedStampForRun(run, s.registry, skippedReasonForState(state)))
 		return
 	}
 
 	validation, retryPrompt, compliantState, err := s.validateAttempt(text, run, 1, false)
 	if err != nil {
-		s.finalizeTerminal(run, engine.StateFailed, text, skippedStampForRun(run, s.registry, engine.SkipBackendError))
+		s.completeRunTerminal(run, engine.StateFailed, text, skippedStampForRun(run, s.registry, engine.SkipBackendError))
 		return
 	}
 	if retryPrompt != "" {
-		if err := s.transitionRecord(run.store, run.jobID, engine.StateRetrying); err != nil {
-			s.finalizeFailure(run, err)
-			return
-		}
-		retryText, retryState, retryErr := s.runAttempt(ctx, run, retryPrompt, false)
+		retryText, retryState, retryErr := s.runAttempt(ctx, run, retryPrompt, false, model.LaunchOrdinalTwo)
 		if requested := run.active.requestedTerminal(); requested != "" {
-			s.finalizeTerminal(run, requested, retryText, nil)
+			s.completeRunTerminal(run, requested, retryText, nil)
 			return
 		}
 		if retryErr != nil {
-			s.finalizeTerminal(run, retryState, retryText, skippedStampForRun(run, s.registry, skippedReasonForState(retryState)))
+			s.completeRunTerminal(run, retryState, retryText, skippedStampForRun(run, s.registry, skippedReasonForState(retryState)))
 			return
 		}
 		retryValidation, _, retryCompliantState, err := s.validateAttempt(retryText, run, 2, true)
 		if err != nil {
-			s.finalizeTerminal(run, engine.StateFailed, retryText, skippedStampForRun(run, s.registry, engine.SkipBackendError))
+			s.completeRunTerminal(run, engine.StateFailed, retryText, skippedStampForRun(run, s.registry, engine.SkipBackendError))
 			return
 		}
-		s.finalizeTerminal(run, retryCompliantState, retryText, retryValidation.Stamp)
+		s.completeRunTerminal(run, retryCompliantState, retryText, retryValidation.Stamp)
 		return
 	}
-	s.finalizeTerminal(run, compliantState, text, validation.Stamp)
+	s.completeRunTerminal(run, compliantState, text, validation.Stamp)
 }
 
-func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, write bool) (string, engine.JobState, error) {
+func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, write bool, ordinal model.LaunchOrdinal) (string, engine.JobState, error) {
 	attemptCtx := ctx
 	var cancel context.CancelFunc
 	if run.timeout > 0 {
@@ -1306,33 +2380,19 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		attemptCtx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
-	record, _ := run.store.Load(run.jobID)
 	input := engine.TurnInput{
 		Prompt:   prompt,
 		Write:    write,
 		Timeout:  run.timeout,
 		LogPaths: engine.LogPaths{},
-		OnProcessStart: func(ref engine.ProcessRef, backendChildPID int) {
-			_ = s.updateBackendProcess(run.store, run.jobID, ref, backendChildPID)
-		},
 	}
-	if record != nil {
-		input.LogPaths = record.LogPaths
-	}
-	if id := run.session.ID(); id != "" {
-		_ = s.updateBackendSessionID(run.store, run.jobID, id)
-	}
-	events, err := run.session.Turn(attemptCtx, input)
+	events, err := s.admissionTurnEvents(attemptCtx, run, input, ordinal)
 	if err != nil {
-		if strings.Contains(err.Error(), protocol.ErrorSessionBusy) {
-			return "", engine.StateFailed, err
-		}
 		return "", engine.StateFailed, err
 	}
 	var assistantText strings.Builder
 	var resultText string
 	hasResultMessage := false
-	sequence := 0
 	for {
 		select {
 		case <-attemptCtx.Done():
@@ -1345,18 +2405,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				if attemptCtx.Err() != nil {
 					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), stateForContext(attemptCtx.Err()), attemptCtx.Err()
 				}
-				if id := run.session.ID(); id != "" {
-					_ = s.updateBackendSessionID(run.store, run.jobID, id)
-				}
 				return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateCompleted, nil
 			}
-			if id := run.session.ID(); id != "" {
-				_ = s.updateBackendSessionID(run.store, run.jobID, id)
-			}
 			rawText := authoritativeText(event)
-			if event.ModelReported != "" {
-				_ = s.updateModelReported(run.store, run.jobID, event.ModelReported)
-			}
 			switch event.Type {
 			case engine.EventAgentText:
 				assistantText.WriteString(rawText)
@@ -1368,17 +2419,6 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 					rawText = "backend failed"
 				}
 				return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, errors.New(rawText)
-			}
-			if run.foreground && run.conn != nil && event.Type != engine.EventResultMessage && event.Type != engine.EventTerminalError && event.Type != engine.EventModelReported {
-				sequence++
-				wireEvent := prepareWireEvent(event)
-				_ = run.conn.notify(protocol.NotificationTurnEvent, protocol.TurnEventParams{
-					SessionID: run.sessionID,
-					TurnID:    run.jobID,
-					JobID:     run.jobID,
-					Sequence:  sequence,
-					Event:     wireEvent,
-				})
 			}
 		}
 	}
@@ -1392,7 +2432,7 @@ func attemptFinalText(hasResultMessage bool, resultText, assistantText string) s
 }
 
 func shouldInterruptSessionOnAttemptCancel(run jobRun, err error) bool {
-	if errors.Is(err, context.Canceled) && !run.foreground && run.active != nil && run.active.requestedTerminal() == engine.StateCanceled {
+	if errors.Is(err, context.Canceled) && run.active != nil && run.active.requestedTerminal() == engine.StateCanceled {
 		return false
 	}
 	return true
@@ -1467,28 +2507,62 @@ func (s *Server) resolvePolicy(policy *engine.TurnPolicy) (resolvedPolicy, error
 }
 
 func (s *Server) finalizeFailure(run jobRun, err error) {
-	_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
+	if finalizeErr := s.finalizeTerminal(run, engine.StateFailed, "", nil); finalizeErr != nil {
+		s.handleRunFinalizationError(run, errors.Join(err, finalizeErr))
+	}
 }
 
-func (s *Server) finalizeRequestedTerminal(run jobRun) {
+func (s *Server) finalizeRequestedTerminal(run jobRun) error {
 	state := run.active.requestedTerminal()
 	if state == "" {
 		state = engine.StateCanceled
 	}
-	_ = s.finalizeTerminal(run, state, "", nil)
+	return s.finalizeTerminal(run, state, "", nil)
+}
+
+func (s *Server) completeRunTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) {
+	if err := s.finalizeTerminal(run, state, text, stamp); err != nil {
+		s.handleRunFinalizationError(run, err)
+	}
+}
+
+func (s *Server) handleRunFinalizationError(run jobRun, err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("agentbus daemon: job %s finalization failed: %v", run.jobID, err)
+	if !run.admissionControlled {
+		return
+	}
+	failStopCtx, cancel := detachedAdmissionFailStopContext(context.Background())
+	defer cancel()
+	if stopErr := s.failStopAdmissionReady(failStopCtx, err); stopErr != nil {
+		log.Printf("agentbus daemon: job %s finalization fail-stop failed: %v", run.jobID, stopErr)
+	}
+}
+
+func (s *Server) failStopAdmissionFinalizationReconcile(jobID string, err error) *protocol.ErrorObject {
+	failStopCtx, cancel := detachedAdmissionFailStopContext(context.Background())
+	defer cancel()
+	if stopErr := s.failStopAdmissionReady(failStopCtx, err); stopErr != nil {
+		log.Printf("agentbus daemon: job %s finalization reconcile fail-stop failed: %v", jobID, stopErr)
+	}
+	return admissionProtocolError(err)
 }
 
 func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {
+	if run.admissionControlled {
+		return s.completeAdmissionRun(run, state, text)
+	}
 	backendSessionID := ""
 	if run.session != nil {
 		backendSessionID = run.session.ID()
 	}
-	record, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
-		salvageReaped := run.authoritativeCompletion && record.State == engine.StateReaped && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant)
-		if engine.IsTerminal(record.State) && !salvageReaped {
+	_, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
+		lateFinalization := run.authoritativeCompletion && canLateFinalize(record.State, state)
+		if engine.IsTerminal(record.State) && !lateFinalization {
 			return false, nil
 		}
-		lateFinalization := run.authoritativeCompletion && record.State == engine.StateOrphaned && (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant || state == engine.StateFailed) || salvageReaped
 		var result *engine.ResultInfo
 		if state == engine.StateCompleted || state == engine.StateCompletedNoncompliant {
 			if text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
@@ -1501,7 +2575,7 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 			info.ModelReported = record.ModelReported
 			result = &info
 		}
-		if salvageReaped {
+		if lateFinalization && record.State == engine.StateReaped {
 			if err := record.Transition(state, s.clock.Now().UTC()); err != nil {
 				return false, err
 			}
@@ -1527,10 +2601,18 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 	if err != nil {
 		return err
 	}
-	if run.foreground && run.conn != nil {
-		_ = run.conn.notify(protocol.NotificationTurnResult, turnResultFromRecord(*record))
-	}
 	return nil
+}
+
+func canLateFinalize(from, to engine.JobState) bool {
+	switch from {
+	case engine.StateOrphaned:
+		return to == engine.StateCompleted || to == engine.StateCompletedNoncompliant || to == engine.StateFailed
+	case engine.StateReaped:
+		return to == engine.StateCompleted || to == engine.StateCompletedNoncompliant
+	default:
+		return false
+	}
 }
 
 func (s *Server) heartbeat(store *engine.Store, jobID string, done <-chan struct{}) {
@@ -1569,52 +2651,6 @@ func (s *Server) abortUndeliveredRun(run jobRun, state engine.JobState) {
 	if run.onDone != nil {
 		run.onDone()
 	}
-}
-
-func (s *Server) updateBackendProcess(store *engine.Store, jobID string, ref engine.ProcessRef, backendChildPID int) error {
-	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
-		if engine.IsTerminal(record.State) {
-			return false, nil
-		}
-		record.BackendChildPID = backendChildPID
-		record.BackendChildStartTime = ""
-		if info, alive, err := s.processes.Lookup(backendChildPID); err == nil && alive {
-			record.BackendChildStartTime = info.StartTime
-		}
-		if ref.PID > 0 || ref.PGID > 0 || ref.StartTime != "" {
-			record.Worker = ref
-		}
-		return true, nil
-	})
-	return err
-}
-
-func (s *Server) updateBackendSessionID(store *engine.Store, jobID, backendSessionID string) error {
-	if backendSessionID == "" {
-		return nil
-	}
-	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
-		if record.BackendSessionID == backendSessionID {
-			return false, nil
-		}
-		record.BackendSessionID = backendSessionID
-		return true, nil
-	})
-	return err
-}
-
-func (s *Server) updateModelReported(store *engine.Store, jobID, modelReported string) error {
-	if modelReported == "" {
-		return nil
-	}
-	_, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
-		if record.ModelReported == modelReported {
-			return false, nil
-		}
-		record.ModelReported = modelReported
-		return true, nil
-	})
-	return err
 }
 
 func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backend string, tags map[string]string, policy *engine.TurnPolicy, resolved *engine.ContractSpec, foreground bool) error {
@@ -1697,7 +2733,6 @@ func (s *Server) storeForCWDLocked(cwd string) (*engine.Store, error) {
 		CancelGrace:   s.cancelGrace,
 		CancelWaiter:  s.cancelWaiter,
 		LeaseDuration: s.leaseDuration,
-		ReapInterval:  s.reapInterval,
 		GCInterval:    s.gcInterval,
 	})
 	if err != nil {
@@ -1708,43 +2743,8 @@ func (s *Server) storeForCWDLocked(cwd string) (*engine.Store, error) {
 
 func (s *Server) storeForJob(jobID string) *engine.Store {
 	s.mu.Lock()
-	if store := s.jobStores[jobID]; store != nil {
-		s.mu.Unlock()
-		return store
-	}
-	s.mu.Unlock()
-
-	stores, err := s.knownStores()
-	if err != nil {
-		return nil
-	}
-	if len(stores) == 0 {
-		s.mu.Lock()
-		store, err := s.storeForCWDLocked(s.cwd)
-		s.mu.Unlock()
-		if err != nil {
-			return nil
-		}
-		stores = []*engine.Store{store}
-	}
-	for _, store := range stores {
-		ok, err := store.HasJob(jobID)
-		if err != nil {
-			return store
-		}
-		if !ok {
-			continue
-		}
-		s.mu.Lock()
-		if existing := s.jobStores[jobID]; existing != nil {
-			s.mu.Unlock()
-			return existing
-		}
-		s.jobStores[jobID] = store
-		s.mu.Unlock()
-		return store
-	}
-	return nil
+	defer s.mu.Unlock()
+	return s.jobStores[jobID]
 }
 
 func (s *Server) addActiveJob(job *activeJob) {
@@ -1761,100 +2761,47 @@ func (s *Server) removeActiveJob(jobID string) {
 	s.touchActivity()
 }
 
+func (s *Server) withAdmissionJobEffect(jobID string, fn func() requestOutcome) requestOutcome {
+	lock := s.admissionEffectLock(jobID)
+	lock.Lock()
+	defer lock.Unlock()
+	return fn()
+}
+
+func (s *Server) withAdmissionJobEffectErr(jobID string, fn func() error) error {
+	lock := s.admissionEffectLock(jobID)
+	lock.Lock()
+	defer lock.Unlock()
+	return fn()
+}
+
+func (s *Server) admissionEffectLock(jobID string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.admissionEffectMu == nil {
+		s.admissionEffectMu = make(map[string]*sync.Mutex)
+	}
+	lock := s.admissionEffectMu[jobID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		s.admissionEffectMu[jobID] = lock
+	}
+	return lock
+}
+
 func (s *Server) lookupActiveJob(jobID string) *activeJob {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.activeJobs[jobID]
 }
 
-func (s *Server) clearActiveTurn(sessionID, jobID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if session := s.sessions[sessionID]; session != nil && session.activeTurnID == jobID {
-		session.activeTurnID = ""
+func (s *Server) listJobStatuses() ([]protocol.JobStatus, *protocol.ErrorObject) {
+	statuses, errObj := s.listAuthorityStatuses()
+	if errObj != nil {
+		return nil, errObj
 	}
-}
-
-func (s *Server) listKnownRecords() []engine.JobRecord {
-	stores, err := s.knownStores()
-	if err != nil {
-		return nil
-	}
-	var records []engine.JobRecord
-	for _, store := range stores {
-		list, err := store.List()
-		if err == nil {
-			records = append(records, list...)
-		}
-	}
-	return records
-}
-
-func (s *Server) findPersistedSession(sessionID string) (*engine.JobRecord, *engine.Store) {
-	stores, err := s.knownStores()
-	if err != nil {
-		return nil, nil
-	}
-	var newest *engine.JobRecord
-	var newestStore *engine.Store
-	for _, store := range stores {
-		records, err := store.List()
-		if err != nil {
-			continue
-		}
-		for i := range records {
-			record := records[i]
-			if record.SessionID != sessionID || record.Backend == "" || record.BackendSessionID == "" {
-				continue
-			}
-			if newest == nil || record.UpdatedAt.After(newest.UpdatedAt) {
-				copy := record
-				newest = &copy
-				newestStore = store
-			}
-		}
-	}
-	return newest, newestStore
-}
-
-func (s *Server) reapKnownStores() error {
-	stores, err := s.knownStores()
-	if err != nil {
-		return err
-	}
-	for _, store := range stores {
-		if err := store.Reap(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Server) knownStores() ([]*engine.Store, error) {
-	discovered, err := engine.OpenWorkspaceStores(s.storeConfig())
-	if err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, store := range discovered {
-		s.rememberStoreLocked(store)
-	}
-	return s.storeSnapshotLocked(), nil
-}
-
-func (s *Server) storeConfig() engine.StoreConfig {
-	return engine.StoreConfig{
-		Root:          s.stateRoot,
-		Clock:         s.clock,
-		Processes:     s.processes,
-		ProcessGroups: s.processGroups,
-		CancelGrace:   s.cancelGrace,
-		CancelWaiter:  s.cancelWaiter,
-		LeaseDuration: s.leaseDuration,
-		ReapInterval:  s.reapInterval,
-		GCInterval:    s.gcInterval,
-	}
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].JobID < statuses[j].JobID })
+	return statuses, nil
 }
 
 func (s *Server) rememberStoreLocked(store *engine.Store) *engine.Store {
@@ -1870,17 +2817,6 @@ func (s *Server) rememberStoreLocked(store *engine.Store) *engine.Store {
 		s.stores[workspace] = store
 	}
 	return store
-}
-
-func (s *Server) storeSnapshotLocked() []*engine.Store {
-	stores := make([]*engine.Store, 0, len(s.storesByKey))
-	for _, store := range s.storesByKey {
-		stores = append(stores, store)
-	}
-	sort.Slice(stores, func(i, j int) bool {
-		return stores[i].Layout().Key < stores[j].Layout().Key
-	})
-	return stores
 }
 
 func (s *Server) currentProcessRef() engine.ProcessRef {
@@ -1908,33 +2844,28 @@ func (s *Server) backendNames() []string {
 }
 
 func ensureToken(path, configured string) (string, error) {
-	if configured != "" {
-		if err := atomicWrite(path, []byte(configured+"\n"), 0o600); err != nil {
-			return "", err
-		}
-		return configured, nil
-	}
-	raw, err := os.ReadFile(path)
+	token, err := readExistingToken(path)
 	if err == nil {
-		if err := os.Chmod(path, 0o600); err != nil {
-			return "", err
-		}
-		token := strings.TrimSpace(string(raw))
-		if token != "" {
-			return token, nil
-		}
+		return token, nil
 	}
 	if err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
-	token, err := randomToken()
-	if err != nil {
-		return "", err
+	token = configured
+	if token == "" {
+		token, err = randomToken()
+		if err != nil {
+			return "", err
+		}
 	}
-	if err := atomicWrite(path, []byte(token+"\n"), 0o600); err != nil {
-		return "", err
+	created, err := createTokenExclusive(path, token)
+	if err == nil {
+		return created, nil
 	}
-	return token, nil
+	if errors.Is(err, os.ErrExist) {
+		return waitForExistingToken(path)
+	}
+	return "", err
 }
 
 func randomToken() (string, error) {
@@ -1943,6 +2874,70 @@ func randomToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+func readExistingToken(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return "", errors.New("agentbus token file is empty")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func waitForExistingToken(path string) (string, error) {
+	deadline := time.Now().Add(time.Second)
+	var last error
+	for {
+		token, err := readExistingToken(path)
+		if err == nil {
+			return token, nil
+		}
+		last = err
+		if !os.IsNotExist(err) && !strings.Contains(err.Error(), "token file is empty") {
+			return "", err
+		}
+		if time.Now().After(deadline) {
+			return "", last
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func createTokenExclusive(path, token string) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+	if _, err := file.Write([]byte(token + "\n")); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE)
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
@@ -1973,7 +2968,17 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		return err
 	}
-	return os.Chmod(path, mode)
+	if err := os.Chmod(path, mode); err != nil {
+		return err
+	}
+	return nil
+}
+
+func atomicWriteDurable(path string, data []byte, mode os.FileMode) error {
+	if err := atomicWrite(path, data, mode); err != nil {
+		return err
+	}
+	return syncFileAndParent(path)
 }
 
 func ensureLogFiles(store *engine.Store, jobID string) (engine.LogPaths, error) {
@@ -2017,12 +3022,13 @@ func invalidParams(err error) requestOutcome {
 	return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 }
 
+func unknownAuthorityJobError(jobID string) *protocol.ErrorObject {
+	return protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: jobID})
+}
+
 func backendError(err error) *protocol.ErrorObject {
 	if err == nil {
 		return nil
-	}
-	if strings.Contains(err.Error(), protocol.ErrorSessionBusy) {
-		return protocol.NewError(protocol.ErrorSessionBusy, "session already has an active turn", protocol.ErrorData{})
 	}
 	return protocol.NewError(protocol.ErrorBackendUnavailable, err.Error(), protocol.ErrorData{})
 }
@@ -2065,68 +3071,6 @@ func validateTaskSpecEnvelope(raw json.RawMessage) *protocol.ErrorObject {
 	return nil
 }
 
-func statusFromRecord(record engine.JobRecord) protocol.JobStatus {
-	return protocol.JobStatus{
-		JobID:                 record.JobID,
-		SessionID:             record.SessionID,
-		Backend:               record.Backend,
-		State:                 record.State,
-		LateFinalization:      record.LateFinalization,
-		Tags:                  cloneTags(record.Tags),
-		StartedAt:             timePtr(record.StartedAt),
-		UpdatedAt:             timePtr(record.UpdatedAt),
-		HeartbeatAt:           timePtr(record.HeartbeatAt),
-		Lease:                 leasePtr(record.Lease),
-		WorkerPID:             record.Worker.PID,
-		WorkerStartTime:       record.Worker.StartTime,
-		BackendChildPID:       record.BackendChildPID,
-		BackendChildStartTime: record.BackendChildStartTime,
-		StatePath:             record.StatePath,
-		LogPaths:              record.LogPaths,
-		ModelReported:         record.ModelReported,
-		Warnings:              append([]string(nil), record.Warnings...),
-	}
-}
-
-func resultFromRecord(record engine.JobRecord) protocol.JobResult {
-	return protocol.JobResult{
-		JobID:            record.JobID,
-		SessionID:        record.SessionID,
-		State:            record.State,
-		LateFinalization: record.LateFinalization,
-		Result:           record.Result,
-		ModelReported:    record.ModelReported,
-		Contract:         record.Contract,
-	}
-}
-
-func turnResultFromRecord(record engine.JobRecord) protocol.TurnResultParams {
-	return protocol.TurnResultParams{
-		SessionID:     record.SessionID,
-		TurnID:        record.JobID,
-		JobID:         record.JobID,
-		State:         record.State,
-		Result:        record.Result,
-		ModelReported: record.ModelReported,
-		Contract:      record.Contract,
-	}
-}
-
-func timePtr(t time.Time) *time.Time {
-	if t.IsZero() {
-		return nil
-	}
-	u := t.UTC()
-	return &u
-}
-
-func leasePtr(lease engine.Lease) *engine.Lease {
-	if lease.ExpiresAt.IsZero() {
-		return nil
-	}
-	return &lease
-}
-
 func cloneTags(in map[string]string) map[string]string {
 	if len(in) == 0 {
 		return nil
@@ -2152,16 +3096,6 @@ func applyPrologue(policy *engine.TurnPolicy, prompt string) string {
 		return prompt
 	}
 	return policy.Prologue + "\n\n" + prompt
-}
-
-func prepareWireEvent(event engine.Event) engine.Event {
-	wireEvent := event
-	truncated := engine.TruncateEventText([]byte(wireEvent.Text), engine.DefaultEventTextCap)
-	wireEvent.Text = truncated.Text
-	wireEvent.Truncated = wireEvent.Truncated || truncated.Truncated
-	wireEvent.RawText = ""
-	wireEvent.Metadata = engine.SanitizeEventMetadata(wireEvent.Metadata)
-	return wireEvent
 }
 
 func authoritativeText(event engine.Event) string {

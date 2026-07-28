@@ -11,7 +11,12 @@ import (
 	"testing"
 	"time"
 
+	agentclient "github.com/charlesnpx/agentbus/client"
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/execution/authority"
+	"github.com/charlesnpx/agentbus/internal/agentbusserve"
+	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
+	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
 type testClock struct{ now time.Time }
@@ -60,13 +65,69 @@ func TestVersionAndServeCommands(t *testing.T) {
 	}
 	var version versionOutput
 	decodeJSON(t, stdout, &version)
-	if version.Version != "test" || version.ProtocolVersion != protocolMajor || version.Schema != cliJSONSchema {
+	if version.Version != "test" || version.ProtocolVersion != protocol.Version || version.Schema != cliJSONSchema {
 		t.Fatalf("version output = %+v", version)
 	}
 
-	code, _, stderr = runTestCLI(t, a, []string{"serve", "--help"}, "")
+	code, stdout, stderr = runTestCLI(t, a, []string{"serve", "--help"}, "")
 	if code != 0 {
 		t.Fatalf("serve help exit = %d stderr=%s", code, stderr)
+	}
+	help := stdout + stderr
+	removedServeFlag := "--" + "admission"
+	if strings.Contains(help, removedServeFlag) {
+		t.Fatalf("serve help still mentions admission flag: stdout=%s stderr=%s", stdout, stderr)
+	}
+
+	code, _, stderr = runTestCLI(t, a, []string{"serve", "--foreground", removedServeFlag + "=strict"}, "")
+	if code == 0 || !strings.Contains(stderr, "flag provided but not defined") {
+		t.Fatalf("removed admission flag exit=%d stderr=%s", code, stderr)
+	}
+}
+
+func TestStartBackgroundDaemonWritesPIDAfterLauncherReady(t *testing.T) {
+	a := testApp(t)
+	launched := make(chan struct{})
+	releaseReady := make(chan struct{})
+	a.daemonLauncher = func(ctx context.Context, opts daemonlaunch.Options) (daemonlaunch.Result, error) {
+		if opts.StateRoot != a.stateRoot {
+			t.Errorf("launcher state root = %q, want %q", opts.StateRoot, a.stateRoot)
+		}
+		close(launched)
+		select {
+		case <-releaseReady:
+		case <-ctx.Done():
+			return daemonlaunch.Result{}, ctx.Err()
+		}
+		return daemonlaunch.Result{PID: 4242, CanonicalStateRoot: a.stateRoot}, nil
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- a.startBackgroundDaemon(context.Background()) }()
+	select {
+	case <-launched:
+	case <-time.After(time.Second):
+		t.Fatal("launcher was not invoked")
+	}
+	pidPath := filepath.Join(a.stateRoot, "agentbus.pid")
+	if _, err := os.Stat(pidPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pid file before readiness stat error = %v, want not exist", err)
+	}
+	close(releaseReady)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("startBackgroundDaemon did not return after readiness")
+	}
+	raw, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(raw)) != "4242" {
+		t.Fatalf("pid file = %q, want 4242", raw)
 	}
 }
 
@@ -177,72 +238,112 @@ func TestSetupDriftDetectionFailsLoudly(t *testing.T) {
 	}
 }
 
-func TestSessionsFiltersRecordedState(t *testing.T) {
+func TestAdmissionCLIInspectResetAndSealFlags(t *testing.T) {
 	t.Parallel()
-	a, store := testAppAndStore(t)
-	if err := store.Save(&engine.JobRecord{
-		JobID:     "job_delegate_active",
-		SessionID: "ses_delegate",
-		Backend:   "codex",
-		State:     engine.StateRunning,
-		Tags:      map[string]string{"client": "delegate", "slot": "codex-a"},
-	}); err != nil {
-		t.Fatal(err)
+	a := testApp(t)
+	root := filepath.Join(t.TempDir(), "admission-root")
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"admission", "reset-empty-root", "--state-root", root, "--json"}, "")
+	if code != 0 {
+		t.Fatalf("reset-empty-root exit = %d stderr=%s stdout=%s", code, stderr, stdout)
 	}
-	if err := store.Save(&engine.JobRecord{
-		JobID:     "job_other_active",
-		SessionID: "ses_other",
-		Backend:   "claude",
-		State:     engine.StateRunning,
-		Tags:      map[string]string{"client": "other"},
-	}); err != nil {
-		t.Fatal(err)
+	var reset authority.RootInspection
+	decodeJSON(t, stdout, &reset)
+	if reset.DomainUUID == "" || reset.Sealed || !reset.Counts.Empty() || reset.ActivationMetadata.Activated {
+		t.Fatalf("reset inspection = %+v", reset)
 	}
 
-	code, stdout, stderr := runTestCLI(t, a, []string{"sessions", "--tags", "client=delegate", "--json"}, "")
+	code, stdout, stderr = runTestCLI(t, a, []string{"admission", "inspect", "--state-root", root, "--json"}, "")
 	if code != 0 {
-		t.Fatalf("sessions exit = %d stderr=%s", code, stderr)
+		t.Fatalf("inspect exit = %d stderr=%s stdout=%s", code, stderr, stdout)
 	}
-	var output sessionsOutput
-	decodeJSON(t, stdout, &output)
-	if len(output.Sessions) != 1 {
-		t.Fatalf("sessions = %+v", output.Sessions)
+	var inspected authority.RootInspection
+	decodeJSON(t, stdout, &inspected)
+	if inspected.DomainUUID != reset.DomainUUID || !inspected.Counts.Empty() {
+		t.Fatalf("inspect = %+v, reset = %+v", inspected, reset)
 	}
-	session := output.Sessions[0]
-	if session.SessionID != "ses_delegate" || session.Backend != "codex" || session.ActiveTurnID == nil || *session.ActiveTurnID != "job_delegate_active" {
-		t.Fatalf("session = %+v", session)
+
+	code, _, stderr = runTestCLI(t, a, []string{"admission", "seal", "--state-root", root}, "")
+	if code != 1 || !strings.Contains(stderr, authority.ErrSealConfirmationRequired.Error()) {
+		t.Fatalf("seal without flags exit=%d stderr=%s", code, stderr)
+	}
+	newRoot := filepath.Join(t.TempDir(), "new-admission-root")
+	code, stdout, stderr = runTestCLI(t, a, []string{"admission", "seal", "--state-root", root, "--new-state-root", newRoot, "--start-new-authority-domain", "--acknowledge-replay-history-reset", "--json"}, "")
+	if code != 0 {
+		t.Fatalf("seal exit=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	var sealed authority.SealReport
+	decodeJSON(t, stdout, &sealed)
+	if !sealed.OldRootSealed || sealed.NewRoot != newRoot || sealed.NewDomainUUID == "" {
+		t.Fatalf("seal report = %+v", sealed)
+	}
+
+	code, stdout, stderr = runTestCLI(t, a, []string{"admission", "--help"}, "")
+	if code != 0 {
+		t.Fatalf("admission help exit=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "Multi-root read/cancel/result routing is out of scope in this first release.") {
+		t.Fatalf("admission help missing limitation sentence: %s", stdout)
+	}
+}
+
+func TestAdmissionRecoverTextReportIncludesADR13Counts(t *testing.T) {
+	t.Parallel()
+	a := testApp(t)
+	root := filepath.Join(t.TempDir(), "admission-root")
+	a.recoverAdmissionRoot = func(_ context.Context, cfg agentbusserve.Config) (agentbusserve.AdmissionRecoveryReport, error) {
+		if cfg.StateRoot != root {
+			t.Errorf("recover state root = %q, want %q", cfg.StateRoot, root)
+		}
+		return agentbusserve.AdmissionRecoveryReport{
+			Mode:               "recovery_only",
+			WorkItems:          1,
+			QuiescedLaunches:   2,
+			FinalizedJobs:      3,
+			OrphanedJobs:       4,
+			UnresolvedLaunches: 5,
+			CleanupWarnings:    6,
+			RecoveryPasses:     7,
+		}, nil
+	}
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"admission", "recover", "--state-root", root}, "")
+	if code != 0 {
+		t.Fatalf("recover exit=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	for _, want := range []string{"orphanedJobs=4", "unresolvedLaunches=5", "cleanupWarnings=6"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("recover text report = %q, want %q", stdout, want)
+		}
 	}
 }
 
 func TestStatusResultAndCancelExitCodes(t *testing.T) {
 	t.Parallel()
-	a, store := testAppAndStore(t)
-	info, err := store.WriteResult("job_done", []byte("done"), engine.DefaultInlineResultCap)
-	if err != nil {
-		t.Fatal(err)
+	a := testApp(t)
+	client := &fakeProtocolClient{
+		statuses: map[string]agentclient.JobStatus{
+			"job_done":    {JobID: "job_done", SessionID: "ses_done", State: engine.StateCompleted},
+			"job_running": {JobID: "job_running", SessionID: "ses_running", State: engine.StateRunning},
+			"job_orphan":  {JobID: "job_orphan", SessionID: "ses_orphan", State: engine.StateOrphaned},
+		},
+		results: map[string]agentclient.JobResult{
+			"job_done":    {JobID: "job_done", SessionID: "ses_done", State: engine.StateCompleted, Result: &engine.ResultInfo{Text: "done", Bytes: 4}},
+			"job_running": {JobID: "job_running", SessionID: "ses_running", State: engine.StateRunning},
+			"job_orphan":  {JobID: "job_orphan", SessionID: "ses_orphan", State: engine.StateOrphaned},
+		},
+		cancels: map[string]agentclient.JobCancelResult{
+			"job_cancel_me": {JobID: "job_cancel_me", State: engine.StateCanceled},
+		},
 	}
-	if err := store.Save(&engine.JobRecord{
-		JobID:     "job_done",
-		SessionID: "ses_done",
-		Backend:   "codex",
-		State:     engine.StateCompleted,
-		Result:    &info,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Save(&engine.JobRecord{
-		JobID:     "job_running",
-		SessionID: "ses_running",
-		Backend:   "claude",
-		State:     engine.StateRunning,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Save(&engine.JobRecord{
-		JobID: "job_cancel_me",
-		State: engine.StateQueued,
-	}); err != nil {
-		t.Fatal(err)
+	a.clientConnect = func(ctx context.Context, opts agentclient.Options) (protocolClient, error) {
+		if opts.StateRoot != a.stateRoot {
+			t.Errorf("client state root = %q, want %q", opts.StateRoot, a.stateRoot)
+		}
+		if opts.CommandPath == "" {
+			t.Error("client command path is empty")
+		}
+		return client, nil
 	}
 
 	tests := []struct {
@@ -253,8 +354,10 @@ func TestStatusResultAndCancelExitCodes(t *testing.T) {
 	}{
 		{name: "status completed", args: []string{"status", "--job", "job_done", "--json"}, wantCode: 0, wantState: engine.StateCompleted},
 		{name: "status nonterminal", args: []string{"status", "--job", "job_running", "--json"}, wantCode: 2, wantState: engine.StateRunning},
+		{name: "status orphaned", args: []string{"status", "--job", "job_orphan", "--json"}, wantCode: 14, wantState: engine.StateOrphaned},
 		{name: "result completed", args: []string{"result", "--job", "job_done", "--json"}, wantCode: 0, wantState: engine.StateCompleted},
 		{name: "result nonterminal", args: []string{"result", "--job", "job_running", "--json"}, wantCode: 2, wantState: engine.StateRunning},
+		{name: "result orphaned", args: []string{"result", "--job", "job_orphan", "--json"}, wantCode: 14, wantState: engine.StateOrphaned},
 		{name: "cancel queued", args: []string{"cancel", "--job", "job_cancel_me", "--json"}, wantCode: 7, wantState: engine.StateCanceled},
 	}
 	for _, tt := range tests {
@@ -265,7 +368,7 @@ func TestStatusResultAndCancelExitCodes(t *testing.T) {
 				t.Fatalf("exit = %d want %d stderr=%s stdout=%s", code, tt.wantCode, stderr, stdout)
 			}
 			if tt.args[0] == "status" {
-				var output statusOutput
+				var output protocol.JobStatusResult
 				decodeJSON(t, stdout, &output)
 				if len(output.Jobs) != 1 || output.Jobs[0].State != tt.wantState {
 					t.Fatalf("status output = %+v", output)
@@ -273,7 +376,7 @@ func TestStatusResultAndCancelExitCodes(t *testing.T) {
 				return
 			}
 			if tt.args[0] == "result" {
-				var output jobResult
+				var output protocol.JobResult
 				decodeJSON(t, stdout, &output)
 				if output.State != tt.wantState {
 					t.Fatalf("result output = %+v", output)
@@ -283,19 +386,208 @@ func TestStatusResultAndCancelExitCodes(t *testing.T) {
 				}
 				return
 			}
-			var output cancelOutput
+			var output protocol.JobCancelResult
 			decodeJSON(t, stdout, &output)
 			if output.State != tt.wantState {
 				t.Fatalf("cancel output = %+v", output)
 			}
-			loaded, err := store.Load("job_cancel_me")
-			if err != nil {
-				t.Fatal(err)
+		})
+	}
+}
+
+func TestStatusListsViaProtocolClient(t *testing.T) {
+	t.Parallel()
+	a := testApp(t)
+	a.clientConnect = func(context.Context, agentclient.Options) (protocolClient, error) {
+		return &fakeProtocolClient{
+			list: []agentclient.JobStatus{
+				{JobID: "job_a", State: engine.StateRunning},
+				{JobID: "job_b", State: engine.StateCompleted},
+			},
+		}, nil
+	}
+	code, stdout, stderr := runTestCLI(t, a, []string{"status", "--json"}, "")
+	if code != 0 {
+		t.Fatalf("status list exit=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	var output protocol.JobStatusResult
+	decodeJSON(t, stdout, &output)
+	if len(output.Jobs) != 2 || output.Jobs[0].JobID != "job_a" || output.Jobs[1].JobID != "job_b" {
+		t.Fatalf("status list output = %+v", output)
+	}
+}
+
+func TestStatusResultCancelProtocolErrorExitCodes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		args       []string
+		err        error
+		wantCode   int
+		wantStderr []string
+	}{
+		{
+			name:       "unknown job",
+			args:       []string{"status", "--job", "job_missing"},
+			err:        &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: "job_missing"})},
+			wantCode:   cliExitUnknownJob,
+			wantStderr: []string{"code=unknown_job", "jobId=job_missing"},
+		},
+		{
+			name:       "unknown job classifies by code",
+			args:       []string{"result", "--job", "job_missing"},
+			err:        &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "authority does not have this job", protocol.ErrorData{JobID: "job_missing"})},
+			wantCode:   cliExitUnknownJob,
+			wantStderr: []string{"code=unknown_job", "jobId=job_missing"},
+		},
+		{
+			name:       "fail stop",
+			args:       []string{"status", "--job", "job_failstop"},
+			err:        &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorBackendUnavailable, "authority fail-stopped", protocol.ErrorData{AdmissionCause: protocol.AdmissionRejectRootFailStopped})},
+			wantCode:   cliExitAuthorityFailStop,
+			wantStderr: []string{"code=backend_unavailable", "admissionCause=root_fail_stopped"},
+		},
+		{
+			name:       "daemon startup failure",
+			args:       []string{"result", "--job", "job_any"},
+			err:        &daemonlaunch.StartupError{Kind: daemonlaunch.ErrStartupFailed, Code: "strict admission support unavailable", Message: "unsupported host"},
+			wantCode:   cliExitDaemonStartupFailure,
+			wantStderr: []string{"daemon startup failed", "unsupported host"},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			a := testApp(t)
+			a.clientConnect = func(context.Context, agentclient.Options) (protocolClient, error) {
+				return &fakeProtocolClient{err: tt.err}, nil
 			}
-			if loaded.State != engine.StateCanceled {
-				t.Fatalf("persisted cancel state = %s", loaded.State)
+			code, stdout, stderr := runTestCLI(t, a, tt.args, "")
+			if code != tt.wantCode {
+				t.Fatalf("exit=%d want=%d stdout=%s stderr=%s", code, tt.wantCode, stdout, stderr)
+			}
+			if stdout != "" {
+				t.Fatalf("stdout=%q, want empty", stdout)
+			}
+			for _, want := range tt.wantStderr {
+				if !strings.Contains(stderr, want) {
+					t.Fatalf("stderr=%q, want %q", stderr, want)
+				}
 			}
 		})
+	}
+}
+
+func TestProtocolCommandErrorStartupErrorExitCodes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		err        error
+		wantCode   int
+		wantStderr []string
+	}{
+		{
+			name: "authority fail stop code",
+			err: &daemonlaunch.StartupError{
+				Kind:    daemonlaunch.ErrStartupFailed,
+				Code:    authority.ErrFailStopped.Error(),
+				Message: "authority fail-stopped: persisted unsafe stop",
+			},
+			wantCode:   cliExitAuthorityFailStop,
+			wantStderr: []string{"code=backend_unavailable", "admissionCause=root_fail_stopped", "authority fail-stopped"},
+		},
+		{
+			name: "served safety fail stop code",
+			err: &daemonlaunch.StartupError{
+				Kind:    daemonlaunch.ErrStartupFailed,
+				Code:    cliStartupCodeServedSafetyFailStopped,
+				Message: "served safety fail-stop: authority fail-stopped: persisted unsafe stop",
+			},
+			wantCode:   cliExitAuthorityFailStop,
+			wantStderr: []string{"code=backend_unavailable", "admissionCause=root_fail_stopped", "served safety fail-stop"},
+		},
+		{
+			name:       "readiness timeout",
+			err:        &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessTimeout, Message: "deadline exceeded"},
+			wantCode:   cliExitDaemonStartupFailure,
+			wantStderr: []string{"daemon readiness timed out"},
+		},
+		{
+			name:       "readiness protocol",
+			err:        &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessProtocol, Message: "bad frame"},
+			wantCode:   cliExitDaemonStartupFailure,
+			wantStderr: []string{"daemon readiness protocol error"},
+		},
+		{
+			name:       "readiness eof",
+			err:        &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessEOF},
+			wantCode:   cliExitDaemonStartupFailure,
+			wantStderr: []string{"daemon exited before readiness"},
+		},
+		{
+			name:       "other startup kind",
+			err:        &daemonlaunch.StartupError{Kind: errors.New("daemon spawn failed"), Message: "exec failed"},
+			wantCode:   cliExitDaemonStartupFailure,
+			wantStderr: []string{"daemon spawn failed", "exec failed"},
+		},
+		{
+			name: "unknown startup code",
+			err: &daemonlaunch.StartupError{
+				Kind:    daemonlaunch.ErrStartupFailed,
+				Code:    "strict admission support unavailable",
+				Message: "unsupported host",
+			},
+			wantCode:   cliExitDaemonStartupFailure,
+			wantStderr: []string{"daemon startup failed", "strict admission support unavailable"},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			code := protocolCommandError(&stderr, "status", tt.err)
+			if code != tt.wantCode {
+				t.Fatalf("exit=%d want=%d stderr=%s", code, tt.wantCode, stderr.String())
+			}
+			for _, want := range tt.wantStderr {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("stderr=%q, want %q", stderr.String(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestStatusResultCancelDaemonStartupFailureLeavesRootEmpty(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{
+		{"status", "--job", "job_any"},
+		{"result", "--job", "job_any"},
+		{"cancel", "--job", "job_any"},
+	} {
+		args := args
+		t.Run(args[0], func(t *testing.T) {
+			a := testApp(t)
+			a.clientConnect = func(context.Context, agentclient.Options) (protocolClient, error) {
+				return nil, &daemonlaunch.StartupError{Kind: daemonlaunch.ErrStartupFailed, Code: "strict admission support unavailable", Message: "unsupported host"}
+			}
+			code, stdout, stderr := runTestCLI(t, a, args, "")
+			if code != cliExitDaemonStartupFailure {
+				t.Fatalf("exit=%d want=%d stdout=%s stderr=%s", code, cliExitDaemonStartupFailure, stdout, stderr)
+			}
+			if _, err := os.Stat(a.stateRoot); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("state root stat = %v, want not exist", err)
+			}
+		})
+	}
+}
+
+func TestSessionsCommandIsUnknown(t *testing.T) {
+	t.Parallel()
+	a := testApp(t)
+	code, _, stderr := runTestCLI(t, a, []string{"sessions"}, "")
+	if code != 2 || !strings.Contains(stderr, "unknown command") {
+		t.Fatalf("sessions exit=%d stderr=%s", code, stderr)
 	}
 }
 
@@ -363,25 +655,70 @@ func testApp(t *testing.T) *app {
 	}
 }
 
-func testAppAndStore(t *testing.T) (*app, *engine.Store) {
-	t.Helper()
-	a := testApp(t)
-	store, err := engine.NewStore(engine.StoreConfig{
-		Root:  a.stateRoot,
-		CWD:   a.cwd,
-		Clock: a.clock,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return a, store
-}
-
 func runTestCLI(t *testing.T, a *app, args []string, stdin string) (int, string, string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	code := a.run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr)
 	return code, stdout.String(), stderr.String()
+}
+
+type fakeProtocolClient struct {
+	list     []agentclient.JobStatus
+	statuses map[string]agentclient.JobStatus
+	results  map[string]agentclient.JobResult
+	cancels  map[string]agentclient.JobCancelResult
+	err      error
+}
+
+func (c *fakeProtocolClient) JobStatus(_ context.Context, params agentclient.JobStatusParams) (agentclient.JobStatusResult, error) {
+	if c.err != nil {
+		return agentclient.JobStatusResult{}, c.err
+	}
+	if params.JobID != "" {
+		status, ok := c.statuses[params.JobID]
+		if !ok {
+			return agentclient.JobStatusResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+		}
+		return agentclient.JobStatusResult{Jobs: []agentclient.JobStatus{status}}, nil
+	}
+	if len(c.list) > 0 {
+		return agentclient.JobStatusResult{Jobs: append([]agentclient.JobStatus(nil), c.list...)}, nil
+	}
+	return agentclient.JobStatusResult{Jobs: mapValues(c.statuses)}, nil
+}
+
+func (c *fakeProtocolClient) JobResult(_ context.Context, params agentclient.JobResultParams) (agentclient.JobResult, error) {
+	if c.err != nil {
+		return agentclient.JobResult{}, c.err
+	}
+	result, ok := c.results[params.JobID]
+	if !ok {
+		return agentclient.JobResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+	}
+	return result, nil
+}
+
+func (c *fakeProtocolClient) JobCancel(_ context.Context, params agentclient.JobCancelParams) (agentclient.JobCancelResult, error) {
+	if c.err != nil {
+		return agentclient.JobCancelResult{}, c.err
+	}
+	result, ok := c.cancels[params.JobID]
+	if !ok {
+		return agentclient.JobCancelResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+	}
+	return result, nil
+}
+
+func (c *fakeProtocolClient) Close() error {
+	return nil
+}
+
+func mapValues(in map[string]agentclient.JobStatus) []agentclient.JobStatus {
+	out := make([]agentclient.JobStatus, 0, len(in))
+	for _, value := range in {
+		out = append(out, value)
+	}
+	return out
 }
 
 func decodeJSON(t *testing.T, raw string, target any) {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/command"
 )
 
 func TestClaudeProfilesAndParsing(t *testing.T) {
@@ -62,7 +63,7 @@ func TestClaudeDiscoveryReportsHelpFailures(t *testing.T) {
 		if err := os.WriteFile(path, []byte("#!/bin/sh\necho help exploded >&2\nexit 7\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := discoverModels(context.Background(), path); err == nil || !strings.Contains(err.Error(), "exit status 7") {
+		if _, err := discoverModels(context.Background(), command.DirectProbeRunner{}, path); err == nil || !strings.Contains(err.Error(), "exit status 7") {
 			t.Fatalf("err=%v", err)
 		}
 	})
@@ -71,7 +72,7 @@ func TestClaudeDiscoveryReportsHelpFailures(t *testing.T) {
 		if err := os.WriteFile(path, []byte("#!/bin/sh\necho generic help\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := discoverModels(context.Background(), path); err == nil || !strings.Contains(err.Error(), "parser found no model or effort") {
+		if _, err := discoverModels(context.Background(), command.DirectProbeRunner{}, path); err == nil || !strings.Contains(err.Error(), "parser found no model or effort") {
 			t.Fatalf("err=%v", err)
 		}
 	})
@@ -151,7 +152,9 @@ func TestClaudeDiscoveryParsesFakeHelp(t *testing.T) {
 	if err := os.WriteFile(fake.bin, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(engine.ModelDiscoverer).DiscoverModels(context.Background())
+	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(interface {
+		DiscoverModels(context.Context, command.ProbeRunner) (*engine.ModelDiscovery, error)
+	}).DiscoverModels(context.Background(), command.DirectProbeRunner{})
 	if err != nil || discovery == nil || strings.Join(discovery.Models, ",") != "fable,opus,sonnet" || strings.Join(discovery.Efforts, ",") != "high,low,max,medium,xhigh" {
 		t.Fatalf("discovery=%+v err=%v", discovery, err)
 	}
@@ -159,20 +162,17 @@ func TestClaudeDiscoveryParsesFakeHelp(t *testing.T) {
 
 func TestClaudeDiscoveredCatalogMismatchWarnsAndProceeds(t *testing.T) {
 	fake := fakeClaude(t)
-	cache := engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{
-		Backend:           "claude",
-		BinaryPath:        fake.bin,
-		Version:           MinimumKnownGoodVersion,
-		StreamSchema:      StreamSchema,
-		DiscoveredModels:  []string{"sonnet"},
-		DiscoveredEfforts: []string{"medium"},
-		DiscoverySource:   "claude --help",
-	}}}
-	if err := engine.WriteSetupProbeCache(fake.cache, cache); err != nil {
-		t.Fatal(err)
-	}
 	backend := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"static"}, SupportedEfforts: []string{"low"}})
-	session, err := backend.Start(context.Background(), engine.SessionOpts{Model: "not-discovered", Effort: "high"})
+	probed := probeBackendWithRunnerForTest(t, backend, fakeProbeRunner{
+		version: MinimumKnownGoodVersion + "\n",
+		help: strings.Join([]string{
+			"  --effort <level> Effort level",
+			"    (medium)",
+			"  --model <model> Model",
+			"    (e.g. sonnet)",
+		}, "\n"),
+	})
+	session, err := probed.Start(context.Background(), engine.SessionOpts{Model: "not-discovered", Effort: "high"})
 	if err != nil {
 		t.Fatalf("discovered mismatch should pass through: %v", err)
 	}
@@ -235,11 +235,15 @@ func TestClaudeTimeoutInterruptAndTruncation(t *testing.T) {
 		t.Fatalf("expected timeout warning, got %#v", got)
 	}
 
-	events, err = session.Turn(context.Background(), engine.TurnInput{Prompt: "sleep", Write: false})
+	events, err = session.Turn(context.Background(), engine.TurnInput{Prompt: "sleep interrupt-turn", Write: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond)
+	// The fixture writes this turn's prompt to the stdin log strictly AFTER
+	// installing its TERM trap, so observing the prompt proves the trap is
+	// armed. A blind sleep raced trap installation under full-sweep load and
+	// let SIGTERM kill the untrapped shell before it could record the signal.
+	waitForFileContains(t, fake.stdin, "interrupt-turn")
 	if err := session.Interrupt(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -255,6 +259,42 @@ type fakeCLI struct {
 	argv  string
 	stdin string
 	term  string
+}
+
+type fakeProbeRunner struct {
+	version string
+	help    string
+}
+
+func (r fakeProbeRunner) LookPath(file string) (string, error) {
+	return file, nil
+}
+
+func (r fakeProbeRunner) Run(_ context.Context, spec command.ProbeSpec) (command.ProbeResult, error) {
+	if len(spec.Argv) > 1 {
+		switch spec.Argv[1] {
+		case "--version":
+			return command.ProbeResult{Stdout: []byte(r.version)}, nil
+		case "--help":
+			return command.ProbeResult{Stdout: []byte(r.help)}, nil
+		}
+	}
+	return command.ProbeResult{}, nil
+}
+
+func probeBackendWithRunnerForTest(t *testing.T, backend engine.Backend, runner command.ProbeRunner) engine.Backend {
+	t.Helper()
+	probeable, ok := backend.(interface {
+		ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error)
+	})
+	if !ok {
+		t.Fatal("backend does not implement ProbeBackend")
+	}
+	probed, err := probeable.ProbeBackend(context.Background(), runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return probed
 }
 
 func fakeClaude(t *testing.T) fakeCLI {
@@ -332,6 +372,18 @@ func readLog(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(got)
+}
+
+func waitForFileContains(t *testing.T, path, want string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), want) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("fixture never wrote %q to %s", want, path)
 }
 
 func containsWarning(events []engine.Event, sub string) bool {

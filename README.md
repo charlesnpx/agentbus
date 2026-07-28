@@ -1,8 +1,8 @@
 # agentbus
 
-agentbus is a local agent-execution service. One daemon multiplexes concurrent
-sessions, turns, and jobs across backend CLIs such as Claude Code and Codex,
-while the same core engine remains importable for embedded use.
+agentbus is a local agent-execution service. One daemon runs strict identified
+background jobs across backend CLIs such as Claude Code and Codex, while the
+same core engine remains importable for embedded use.
 
 agentbus is deliberately agent-agnostic. It owns process supervision, state,
 leases, JSON-RPC framing, result storage, and policy enforcement hooks; clients
@@ -65,7 +65,7 @@ For local installer checks:
 agentbus version [--json]
 agentbus setup [--json]
 agentbus serve [--foreground]
-agentbus sessions [--tags k=v] [--json]
+agentbus admission <inspect|recover|reset-empty-root|seal|clear-fail-stop> --state-root <path>
 agentbus status [--job <id>] [--json]
 agentbus result --job <id> [--json]
 agentbus cancel --job <id> [--json]
@@ -79,6 +79,19 @@ from that cache.
 `agentbus serve --foreground` runs the JSON-RPC daemon in the current process.
 `agentbus serve` starts it in the background. `AGENTBUS_STATE_ROOT` may be set
 to isolate daemon state for tests or local development.
+
+`agentbus serve` always starts strict identified admission under the shared
+custody contract. macOS serves with process-group/held-parent supervision.
+Linux serves with process-group supervision when cgroup v2 is unavailable, and
+uses cgroup v2 as a preferred cleanup enhancement when a delegated writable
+root is available. A host fails closed only when it cannot provide basic
+controlled supervision: process groups, identity/start-token observation,
+TERM/KILL/wait, and the controlled runner. Strict activation is sticky and
+one-way for a state root: an activated root must keep serving under the current
+admission contract version or be handled with `agentbus admission recover`,
+`seal`, or `reset-empty-root`. The first strict release supports one active
+state root; seal rotation starts a new root and does not route read, cancel,
+result, or replay requests across old and new roots.
 
 The status/result/cancel commands map terminal job states to the exit codes
 defined in [docs/protocol.md](docs/protocol.md).
@@ -102,13 +115,15 @@ Backend adapters live under `github.com/charlesnpx/agentbus/engine/adapter`.
 The Claude Code and Codex CLI adapters implement the argv profiles and setup
 drift checks described in [docs/adapters.md](docs/adapters.md).
 Backend authors can follow the normative adding-a-backend recipe in that guide.
+Packages under `github.com/charlesnpx/agentbus/engine/execution/...` are
+unstable implementation APIs for AB-E and are not an import-stability promise.
 
 ## Development
 
 ```sh
 go test ./...
 go test -race ./...
-scripts/release-check.sh v0.2.0
+scripts/ci/release-check.sh
 ```
 
 Set `GOCACHE` under `/private/tmp` or another writable cache root when running
@@ -117,7 +132,8 @@ inside restricted sandboxes.
 ## Roadmap / v0.2
 
 - `stop-review-gate`: a Claude Code Stop-hook client of agentbus that gates a
-  turn via `turn.start` with an ALLOW/BLOCK shape contract plus
+  review run submitted as an identified `job.submit` (protocol v2 removed the
+  session/turn surface) with an ALLOW/BLOCK shape contract plus
   `policy.validate`, replacing the vendor `openai-codex` plugin's stop-review
   gate. Until this lands, `delegate setup` reports
   `stop-review-gate: not available (planned v0.2)`.

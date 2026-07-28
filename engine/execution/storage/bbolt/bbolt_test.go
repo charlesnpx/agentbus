@@ -1,0 +1,2055 @@
+package bbolt
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/charlesnpx/agentbus/engine/execution/model"
+	"github.com/charlesnpx/agentbus/engine/execution/repository"
+	"github.com/charlesnpx/agentbus/engine/execution/repository/repositorytest"
+	bolt "go.etcd.io/bbolt"
+)
+
+func TestRepositoryContract(t *testing.T) {
+	repositorytest.RunRepositoryContract(t, repositorytest.Factory{
+		New: func(t *testing.T) repository.Repository {
+			t.Helper()
+			repo := newReopeningRepository(t)
+			return repo
+		},
+		Snapshot: func(t *testing.T, repo repository.Repository) []byte {
+			t.Helper()
+			bboltRepo, ok := repo.(interface{ SnapshotBytes() []byte })
+			if !ok {
+				t.Fatalf("repo type = %T, want SnapshotBytes", repo)
+			}
+			return bboltRepo.SnapshotBytes()
+		},
+		CorruptSafety: func(t *testing.T, repo repository.Repository, jobID model.JobID, diagnostic string) {
+			t.Helper()
+			bboltRepo, ok := repo.(interface {
+				InjectCorruptSafetyForTest(model.JobID, string)
+			})
+			if !ok {
+				t.Fatalf("repo type = %T, want InjectCorruptSafetyForTest", repo)
+			}
+			bboltRepo.InjectCorruptSafetyForTest(jobID, diagnostic)
+		},
+		CorruptBinding: func(t *testing.T, repo repository.Repository, key model.RequestKey, diagnostic string) {
+			t.Helper()
+			bboltRepo, ok := repo.(interface {
+				InjectCorruptBindingForTest(model.RequestKey, string)
+			})
+			if !ok {
+				t.Fatalf("repo type = %T, want InjectCorruptBindingForTest", repo)
+			}
+			bboltRepo.InjectCorruptBindingForTest(key, diagnostic)
+		},
+		CorruptTombstone: func(t *testing.T, repo repository.Repository, key model.RequestKey, diagnostic string) {
+			t.Helper()
+			bboltRepo, ok := repo.(interface {
+				InjectCorruptTombstoneForTest(model.RequestKey, string)
+			})
+			if !ok {
+				t.Fatalf("repo type = %T, want InjectCorruptTombstoneForTest", repo)
+			}
+			bboltRepo.InjectCorruptTombstoneForTest(key, diagnostic)
+		},
+		MissingMeta: func(t *testing.T, repo repository.Repository) {
+			t.Helper()
+			bboltRepo, ok := repo.(interface {
+				InjectMissingMetaForTest()
+			})
+			if !ok {
+				t.Fatalf("repo type = %T, want InjectMissingMetaForTest", repo)
+			}
+			bboltRepo.InjectMissingMetaForTest()
+		},
+		FailCommitAfterCommit: func(t *testing.T, repo repository.Repository, err error) {
+			t.Helper()
+			bboltRepo, ok := repo.(interface {
+				FailCommitAfterCommitForTest(error)
+			})
+			if !ok {
+				t.Fatalf("repo type = %T, want FailCommitAfterCommitForTest", repo)
+			}
+			bboltRepo.FailCommitAfterCommitForTest(err)
+		},
+		Audit: func(t *testing.T, repo repository.Repository) error {
+			t.Helper()
+			auditor, ok := repo.(repository.Auditor)
+			if !ok {
+				t.Fatalf("repo type = %T, want repository.Auditor", repo)
+			}
+			return auditor.AuditIntegrity(context.Background())
+		},
+	})
+}
+
+func TestAdmissionRepositoryRequiredBucketsMatchInitializedRepository(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	defer repo.Close()
+
+	var gotBuckets []string
+	var gotMetaKeys []string
+	if err := repo.db.View(func(tx *bolt.Tx) error {
+		if err := tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
+			gotBuckets = append(gotBuckets, string(name))
+			return nil
+		}); err != nil {
+			return err
+		}
+		meta := tx.Bucket(bucketMeta)
+		if meta == nil {
+			return errors.New("meta bucket is missing")
+		}
+		return meta.ForEach(func(key, _ []byte) error {
+			gotMetaKeys = append(gotMetaKeys, string(key))
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("list initialized structure: %v", err)
+	}
+	sort.Strings(gotBuckets)
+	wantBuckets := AdmissionRepositoryRequiredBuckets()
+	sort.Strings(wantBuckets)
+	if !reflect.DeepEqual(gotBuckets, wantBuckets) {
+		t.Fatalf("initialized buckets = %v, want %v", gotBuckets, wantBuckets)
+	}
+	sort.Strings(gotMetaKeys)
+	wantMetaKeys := AdmissionRepositoryRequiredMetaKeys()
+	sort.Strings(wantMetaKeys)
+	if !reflect.DeepEqual(gotMetaKeys, wantMetaKeys) {
+		t.Fatalf("initialized meta keys = %v, want %v", gotMetaKeys, wantMetaKeys)
+	}
+	if err := repo.VerifyInitializedStructure(); err != nil {
+		t.Fatalf("VerifyInitializedStructure() error = %v", err)
+	}
+}
+
+func TestAdmissionRepositoryRequiredAccessorsReturnCopies(t *testing.T) {
+	buckets := AdmissionRepositoryRequiredBuckets()
+	if len(buckets) == 0 {
+		t.Fatal("AdmissionRepositoryRequiredBuckets returned empty list")
+	}
+	buckets[0] = "mutated"
+	if got := AdmissionRepositoryRequiredBuckets()[0]; got == "mutated" {
+		t.Fatal("AdmissionRepositoryRequiredBuckets returned mutable backing storage")
+	}
+
+	metaKeys := AdmissionRepositoryRequiredMetaKeys()
+	if len(metaKeys) == 0 {
+		t.Fatal("AdmissionRepositoryRequiredMetaKeys returned empty list")
+	}
+	metaKeys[0] = "mutated"
+	if got := AdmissionRepositoryRequiredMetaKeys()[0]; got == "mutated" {
+		t.Fatal("AdmissionRepositoryRequiredMetaKeys returned mutable backing storage")
+	}
+}
+
+func TestOpenExistingRequiresStrictSchemaV2(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	before := createSchemaV1RepositoryForTest(t, path)
+
+	repo, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err == nil {
+		repo.Close()
+		t.Fatal("OpenExisting succeeded for schema v1, want incompatible schema error")
+	}
+	var schemaErr UnsupportedAuthorityMetaSchemaVersionError
+	if !errors.As(err, &schemaErr) {
+		t.Fatalf("OpenExisting error = %T %v, want UnsupportedAuthorityMetaSchemaVersionError", err, err)
+	}
+	if schemaErr.SchemaVersion != 1 {
+		t.Fatalf("schema version = %d, want 1", schemaErr.SchemaVersion)
+	}
+	after, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("failed old-schema open mutated database bytes")
+	}
+
+	repo, err = OpenExistingReadOnly(path, &bolt.Options{Timeout: time.Second})
+	if err == nil {
+		repo.Close()
+		t.Fatal("OpenExistingReadOnly succeeded for schema v1, want incompatible schema error")
+	}
+	var readOnlySchemaErr UnsupportedAuthorityMetaSchemaVersionError
+	if !errors.As(err, &readOnlySchemaErr) {
+		t.Fatalf("OpenExistingReadOnly error = %T %v, want UnsupportedAuthorityMetaSchemaVersionError", err, err)
+	}
+}
+
+func TestCreateInitializesStrictSchemaV2AndBindingIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	schema, err := repo.AuthorityMetaSchemaVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schema != repository.StrictAuthorityMetaSchemaVersion {
+		t.Fatalf("schema = %d, want %d", schema, repository.StrictAuthorityMetaSchemaVersion)
+	}
+	if err := repo.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(bucketBindingIndex) == nil {
+			return errors.New("binding_index bucket missing")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCreateRemovesPartialDatabaseAfterInitializeFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	initializeErr := errors.New("initialize fresh failed")
+	previous := initializeFreshForTest
+	initializeFreshForTest = func() error {
+		return initializeErr
+	}
+	t.Cleanup(func() {
+		initializeFreshForTest = previous
+	})
+
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if repo != nil {
+		_ = repo.Close()
+		t.Fatal("Create returned repository after injected initialize failure")
+	}
+	if !errors.Is(err, initializeErr) {
+		t.Fatalf("Create error = %v, want initialize failure", err)
+	}
+	if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("partial database stat = %v, want missing", statErr)
+	}
+
+	initializeFreshForTest = nil
+	repo, err = Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("retry Create error = %v", err)
+	}
+	defer repo.Close()
+	if _, statErr := os.Lstat(path); statErr != nil {
+		t.Fatalf("retry database stat = %v", statErr)
+	}
+}
+
+func TestBindingIndexMismatchIsCorruptionAndAuditFinding(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	fixture := newBboltFixture(t, "index-mismatch")
+	acceptBboltFixture(t, repo, fixture)
+	if err := repo.db.Update(func(tx *bolt.Tx) error {
+		index := tx.Bucket(bucketBindingIndex)
+		if index == nil {
+			return errors.New("binding_index bucket missing")
+		}
+		return index.Put(jobIDKey(fixture.JobID), requestKeyBytes(mustRequestKeyForTest(t, "workspace-other", "request-other")))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+		image := tx.LoadJob(fixture.JobID)
+		if image.Binding.State != repository.RecordCorrupt {
+			return fmt.Errorf("binding state = %s, want corrupt", image.Binding.State)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AuditIntegrity(context.Background()); !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("AuditIntegrity error = %v, want ErrCorruptRecord", err)
+	}
+}
+
+func TestBindingIndexValueCorruptionFailsProductionReads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	fixture := newBboltFixture(t, "index-value-corrupt")
+	acceptBboltFixture(t, repo, fixture)
+	repo.InjectCorruptBindingIndexValueForTest(fixture.JobID, mustRequestKeyForTest(t, "workspace-index-value-other", "request-index-value-other"))
+
+	err = repo.View(context.Background(), func(tx repository.ReadTx) error {
+		_, err := tx.ListJobs(repository.JobFilter{})
+		return err
+	})
+	requireCorruptKind(t, err, "binding_index")
+
+	err = repo.View(context.Background(), func(tx repository.ReadTx) error {
+		_, err := tx.RootStats()
+		return err
+	})
+	requireCorruptKind(t, err, "binding_index")
+
+	err = repo.View(context.Background(), func(tx repository.ReadTx) error {
+		image := tx.LoadJob(fixture.JobID)
+		if image.Binding.State != repository.RecordCorrupt {
+			return fmt.Errorf("binding state = %s, want corrupt", image.Binding.State)
+		}
+		return repository.ValidateJobClosure(fixture.JobID, image, tx.LookupRequest)
+	})
+	requireCorruptKind(t, err, "binding_index")
+}
+
+func TestPutBindingRejectsOrphanBindingIndexEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	fixture := newBboltFixture(t, "orphan-index-put")
+	repo.InjectCorruptBindingIndexValueForTest(fixture.JobID, fixture.RequestKey)
+
+	_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
+		return tx.PutBinding(fixture.Binding)
+	})
+	if !errors.Is(err, repository.ErrDefinitelyNotCommitted) {
+		t.Fatalf("PutBinding error = %v, want ErrDefinitelyNotCommitted", err)
+	}
+	requireCorruptKind(t, err, "binding_index")
+}
+
+func TestAuditIntegrityReportsBindingIndexAndSafetyFindings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	fixture := newBboltFixture(t, "audit-index-and-safety")
+	acceptBboltFixture(t, repo, fixture)
+	repo.InjectCorruptBindingIndexValueForTest(fixture.JobID, mustRequestKeyForTest(t, "workspace-audit-index-other", "request-audit-index-other"))
+	repo.InjectCorruptSafetyForTest(fixture.JobID, "safety checksum")
+
+	err = repo.AuditIntegrity(context.Background())
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("AuditIntegrity error = %v, want ErrCorruptRecord", err)
+	}
+	for _, kind := range []string{"binding_index", "safety"} {
+		if !errorTreeHasCorruptKind(err, kind) {
+			t.Fatalf("AuditIntegrity error = %v, want %s finding", err, kind)
+		}
+	}
+}
+
+func TestAuditIntegrityClassifiesProjectionOnlyFindings(t *testing.T) {
+	tests := []struct {
+		name    string
+		arrange func(*testing.T, *Repository, bboltFixture)
+	}{
+		{
+			name: "missing",
+			arrange: func(t *testing.T, repo *Repository, fixture bboltFixture) {
+				t.Helper()
+				if err := repo.db.Update(func(tx *bolt.Tx) error {
+					return tx.Bucket(bucketProjections).Delete(jobIDKey(fixture.JobID))
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "corrupt",
+			arrange: func(t *testing.T, repo *Repository, fixture bboltFixture) {
+				t.Helper()
+				repo.InjectCorruptProjectionForTest(fixture.JobID, "projection checksum")
+			},
+		},
+		{
+			name: "mismatch",
+			arrange: func(t *testing.T, repo *Repository, fixture bboltFixture) {
+				t.Helper()
+				mismatched := fixture.Projection
+				mismatched.Public = model.PublicStarting
+				if err := repo.db.Update(func(tx *bolt.Tx) error {
+					return putEnvelope(tx.Bucket(bucketProjections), kindProjection, jobIDKey(fixture.JobID), mismatched, revisionProjection(mismatched))
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "admission.db")
+			repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer repo.Close()
+			fixture := newBboltFixture(t, "audit-projection-"+tt.name)
+			acceptBboltFixture(t, repo, fixture)
+			tt.arrange(t, repo, fixture)
+
+			err = repo.AuditIntegrity(context.Background())
+			if err == nil {
+				t.Fatal("AuditIntegrity error = nil, want projection finding")
+			}
+			kinds := repository.IntegrityFindingKinds(err)
+			if len(kinds) == 0 {
+				t.Fatalf("AuditIntegrity error = %v, want classified findings", err)
+			}
+			for _, kind := range kinds {
+				if kind != "projection" {
+					t.Fatalf("AuditIntegrity kinds = %v, want only projection", kinds)
+				}
+			}
+		})
+	}
+}
+
+func TestAuditIntegrityMissingBindingIndexReturnsTypedFinding(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	fixture := newBboltFixture(t, "missing-index-audit")
+	acceptBboltFixture(t, repo, fixture)
+	if err := repo.db.Update(func(tx *bolt.Tx) error {
+		return tx.DeleteBucket(bucketBindingIndex)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = repo.AuditIntegrity(context.Background())
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("AuditIntegrity error = %v, want ErrCorruptRecord", err)
+	}
+	var aggregate interface{ Unwrap() []error }
+	if !errors.As(err, &aggregate) {
+		t.Fatalf("AuditIntegrity error = %T %v, want aggregate", err, err)
+	}
+	found := false
+	for _, finding := range aggregate.Unwrap() {
+		if strings.Contains(finding.Error(), "binding_index") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("AuditIntegrity error = %v, want binding_index finding", err)
+	}
+}
+
+func TestRootStatsFailsOnCorruptSafetyBindingAndTombstoneRecords(t *testing.T) {
+	cases := []struct {
+		name    string
+		corrupt func(*Repository, bboltFixture)
+	}{
+		{
+			name: "safety",
+			corrupt: func(repo *Repository, fixture bboltFixture) {
+				repo.InjectCorruptSafetyForTest(fixture.JobID, "safety checksum")
+			},
+		},
+		{
+			name: "binding",
+			corrupt: func(repo *Repository, fixture bboltFixture) {
+				repo.InjectCorruptBindingForTest(fixture.RequestKey, "binding checksum")
+			},
+		},
+		{
+			name: "tombstone",
+			corrupt: func(repo *Repository, fixture bboltFixture) {
+				if _, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+					if err := tx.DeleteLiveJob(fixture.JobID); err != nil {
+						return err
+					}
+					return tx.PutTombstone(repository.Tombstone{
+						RequestKey:        fixture.RequestKey,
+						JobID:             fixture.JobID,
+						TaskIdentity:      fixture.Identity,
+						ExpiredGeneration: 2,
+					})
+				}); err != nil {
+					t.Fatalf("create tombstone: %v", err)
+				}
+				repo.InjectCorruptTombstoneForTest(fixture.RequestKey, "tombstone checksum")
+			},
+		},
+	}
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "admission.db")
+			repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer repo.Close()
+			fixture := newBboltFixture(t, "rootstats-corrupt-"+tt.name)
+			acceptBboltFixture(t, repo, fixture)
+			tt.corrupt(repo, fixture)
+			err = repo.View(context.Background(), func(tx repository.ReadTx) error {
+				_, err := tx.RootStats()
+				return err
+			})
+			if !errors.Is(err, repository.ErrCorruptRecord) {
+				t.Fatalf("RootStats error = %v, want ErrCorruptRecord", err)
+			}
+			if !strings.Contains(err.Error(), tt.name) {
+				t.Fatalf("RootStats error = %v, want %s diagnostic", err, tt.name)
+			}
+		})
+	}
+}
+
+func requireCorruptKind(t *testing.T, err error, kind string) {
+	t.Helper()
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("error = %v, want ErrCorruptRecord", err)
+	}
+	var corrupt repository.CorruptRecordKindError
+	if !errors.As(err, &corrupt) || corrupt.Kind != kind {
+		t.Fatalf("error = %T %v, want corrupt kind %s", err, err, kind)
+	}
+}
+
+func errorTreeHasCorruptKind(err error, kind string) bool {
+	if err == nil {
+		return false
+	}
+	switch typed := err.(type) {
+	case repository.CorruptRecordKindError:
+		return typed.Kind == kind
+	case interface{ Unwrap() []error }:
+		for _, child := range typed.Unwrap() {
+			if errorTreeHasCorruptKind(child, kind) {
+				return true
+			}
+		}
+		return false
+	case interface{ Unwrap() error }:
+		return errorTreeHasCorruptKind(typed.Unwrap(), kind)
+	default:
+		return false
+	}
+}
+
+func errorTreeContains(err error, substring string) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), substring) {
+		return true
+	}
+	switch typed := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, child := range typed.Unwrap() {
+			if errorTreeContains(child, substring) {
+				return true
+			}
+		}
+		return false
+	case interface{ Unwrap() error }:
+		return errorTreeContains(typed.Unwrap(), substring)
+	default:
+		return false
+	}
+}
+
+func TestPointLookupDoesNotTraverseHistoricalBindings(t *testing.T) {
+	repo := newSeededBboltRepository(t, 200)
+	target := model.JobID("job-seed-000199")
+	repo.ResetOperationCountsForTest()
+	if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+		image := tx.LoadJob(target)
+		if image.Safety.State != repository.RecordValid || image.Binding.State != repository.RecordValid {
+			return fmt.Errorf("target image states binding=%s safety=%s", image.Binding.State, image.Safety.State)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	counts := repo.OperationCountsForTest()
+	if got := counts["foreach:bindings"]; got != 0 {
+		t.Fatalf("point LoadJob traversed bindings %d time(s), want 0", got)
+	}
+	if got := counts["get:binding_index"]; got != 1 {
+		t.Fatalf("binding_index gets = %d, want 1", got)
+	}
+	if got := counts["get:bindings"]; got != 1 {
+		t.Fatalf("binding gets = %d, want 1", got)
+	}
+}
+
+func TestOneRecordUpdateTouchesBoundedKeysAndDoesNotRecreateBuckets(t *testing.T) {
+	repo := newSeededBboltRepository(t, 500)
+	fixture := seedFixture(t, 499)
+	repo.ResetOperationCountsForTest()
+	_, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+		image := tx.LoadJob(fixture.JobID)
+		if image.Safety.State != repository.RecordValid {
+			return fmt.Errorf("safety state = %s", image.Safety.State)
+		}
+		next := image.Safety.Value
+		next.Revision++
+		next.Cancel = &model.CancelFact{JobID: fixture.JobID, RequestedBy: fixture.Boot}
+		if err := tx.PutSafety(next, image.Safety.Value.Revision); err != nil {
+			return err
+		}
+		projection, err := model.Project(next, model.ProjectionMetadata{SessionID: fixture.Projection.SessionID})
+		if err != nil {
+			return err
+		}
+		return tx.PutProjection(projection)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := repo.OperationCountsForTest()
+	for _, key := range []string{"create_bucket", "delete_bucket"} {
+		if counts[key] != 0 {
+			t.Fatalf("%s count = %d, want 0", key, counts[key])
+		}
+	}
+	for key, count := range counts {
+		if strings.HasPrefix(key, "foreach:") {
+			t.Fatalf("one-record update used %s %d time(s), want no bucket scans", key, count)
+		}
+	}
+	total := 0
+	for _, count := range counts {
+		total += count
+	}
+	if total > 60 {
+		t.Fatalf("operation count = %d, want bounded <= 60; counts=%v", total, counts)
+	}
+}
+
+func TestPutMetaTouchesBoundedKeysIndependentOfHistory(t *testing.T) {
+	repo := newSeededBboltRepository(t, 1500)
+	repo.ResetOperationCountsForTest()
+	_, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+		meta := tx.Meta()
+		if meta.State != repository.RecordValid {
+			return fmt.Errorf("meta state = %s, want valid", meta.State)
+		}
+		next := meta.Value
+		next.NextJobSequence++
+		return tx.PutMeta(next)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := repo.OperationCountsForTest()
+	for key, count := range counts {
+		if strings.HasPrefix(key, "foreach:") {
+			t.Fatalf("PutMeta used %s %d time(s), want no history scans; counts=%v", key, count, counts)
+		}
+	}
+	total := 0
+	for _, count := range counts {
+		total += count
+	}
+	if total > 12 {
+		t.Fatalf("PutMeta operation count = %d, want bounded <= 12; counts=%v", total, counts)
+	}
+}
+
+func TestDefinitelyNotCommittedUpdateLeavesDatabaseBytesUnchanged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	before := readFileBytesForTest(t, path)
+	fixture := newBboltFixture(t, "bytes-rejected")
+	sentinel := errors.New("reject before commit")
+
+	_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
+		if err := tx.PutBinding(fixture.Binding); err != nil {
+			return err
+		}
+		if err := tx.PutSafety(fixture.Record, 0); err != nil {
+			return err
+		}
+		if err := tx.PutProjection(fixture.Projection); err != nil {
+			return err
+		}
+		return sentinel
+	})
+	if !errors.Is(err, repository.ErrDefinitelyNotCommitted) || !errors.Is(err, sentinel) {
+		t.Fatalf("Update error = %v, want ErrDefinitelyNotCommitted wrapping sentinel", err)
+	}
+	after := readFileBytesForTest(t, path)
+	if !bytes.Equal(before, after) {
+		t.Fatal("definitely-not-committed update changed database bytes")
+	}
+}
+
+func TestAuditDoesNotMutateDatabaseBytes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	acceptBboltFixture(t, repo, newBboltFixture(t, "audit-bytes"))
+	before := readFileBytesForTest(t, path)
+	if err := repo.AuditIntegrity(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after := readFileBytesForTest(t, path)
+	if !bytes.Equal(before, after) {
+		t.Fatal("AuditIntegrity mutated database bytes")
+	}
+}
+
+func TestFreelistReachablePageRejectedWithoutMutatingDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptBboltFixture(t, repo, newBboltFixture(t, "reachable-freed"))
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close before corruption: %v", err)
+	}
+
+	corruptFreelistWithReachablePageForTest(t, path)
+	corruptBytes := readFileBytesForTest(t, path)
+
+	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err == nil {
+		_ = reopened.Close()
+		t.Fatal("OpenExisting succeeded for reachable-freed corruption, want ErrCorruptRecord")
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "reachable freed") {
+		t.Fatalf("OpenExisting error = %v, want reachable-freed diagnostic", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("OpenExisting structural failure mutated database bytes")
+	}
+
+	rawDB, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("raw read-only open after corruption: %v", err)
+	}
+	auditRepo := &Repository{db: rawDB}
+	err = auditRepo.AuditIntegrity(context.Background())
+	if closeErr := auditRepo.Close(); closeErr != nil {
+		t.Fatalf("close raw read-only repo: %v", closeErr)
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("AuditIntegrity error = %v, want ErrCorruptRecord", err)
+	}
+	if kinds := repository.IntegrityFindingKinds(err); !reflect.DeepEqual(kinds, []string{"structure"}) {
+		t.Fatalf("AuditIntegrity finding kinds = %v, want [structure]", kinds)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("AuditIntegrity structural failure mutated database bytes")
+	}
+}
+
+func TestStructuralGraphPreflightRejectsCyclicBranchChildWithoutMutatingDatabase(t *testing.T) {
+	path := createClosedSeededBboltFileForStructuralTest(t, "cycle", 600)
+	corruptBranchChildToSelfForTest(t, path)
+	corruptBytes := readFileBytesForTest(t, path)
+
+	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err == nil {
+		_ = reopened.Close()
+		t.Fatal("OpenExisting succeeded for cyclic branch child, want ErrCorruptRecord")
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "cycle") {
+		t.Fatalf("OpenExisting error = %v, want cycle diagnostic", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("OpenExisting cyclic structural failure mutated database bytes")
+	}
+
+	rawDB, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("raw read-only open after cyclic corruption: %v", err)
+	}
+	auditRepo := &Repository{db: rawDB}
+	err = auditRepo.AuditIntegrity(context.Background())
+	if closeErr := auditRepo.Close(); closeErr != nil {
+		t.Fatalf("close raw read-only repo: %v", closeErr)
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("AuditIntegrity error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "cycle") {
+		t.Fatalf("AuditIntegrity error = %v, want cycle diagnostic", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("AuditIntegrity cyclic structural failure mutated database bytes")
+	}
+}
+
+func TestStructuralGraphPreflightRejectsDuplicateBranchChildWithoutMutatingDatabase(t *testing.T) {
+	path := createClosedSeededBboltFileForStructuralTest(t, "duplicate", 600)
+	corruptBranchSecondChildToDuplicateFirstForTest(t, path)
+	corruptBytes := readFileBytesForTest(t, path)
+
+	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err == nil {
+		_ = reopened.Close()
+		t.Fatal("OpenExisting succeeded for duplicate branch child, want ErrCorruptRecord")
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "duplicate page reference") {
+		t.Fatalf("OpenExisting error = %v, want duplicate page reference diagnostic", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("OpenExisting duplicate structural failure mutated database bytes")
+	}
+}
+
+func TestStructuralGraphPreflightAllowsValidSeededDatabase(t *testing.T) {
+	path := createClosedSeededBboltFileForStructuralTest(t, "valid", 600)
+	before := readFileBytesForTest(t, path)
+
+	repo, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("OpenExisting valid seeded database: %v", err)
+	}
+	if err := repo.AuditIntegrity(context.Background()); err != nil {
+		_ = repo.Close()
+		t.Fatalf("AuditIntegrity valid seeded database: %v", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close valid seeded database: %v", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(before, after) {
+		t.Fatal("valid structural preflight or audit mutated database bytes")
+	}
+}
+
+func TestStructuralGraphPreflightAllowsValidDatabasesWithExplicitPageSizes(t *testing.T) {
+	for _, pageSize := range []int{4096, 16384} {
+		t.Run(fmt.Sprintf("%d", pageSize), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "admission.db")
+			repo, err := Create(path, &bolt.Options{Timeout: time.Second, PageSize: pageSize})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
+				for i := 0; i < 600; i++ {
+					fixture := seedFixture(t, i)
+					if err := tx.PutBinding(fixture.Binding); err != nil {
+						return err
+					}
+					if err := tx.PutSafety(fixture.Record, 0); err != nil {
+						return err
+					}
+					if err := tx.PutProjection(fixture.Projection); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				_ = repo.Close()
+				t.Fatal(err)
+			}
+			if err := repo.Close(); err != nil {
+				t.Fatalf("close page-size repository: %v", err)
+			}
+			file, meta := openBoltFileAndMetaForTest(t, path)
+			if err := file.Close(); err != nil {
+				t.Fatalf("close meta reader: %v", err)
+			}
+			if meta.pageSize != uint64(pageSize) {
+				t.Fatalf("meta page size = %d, want %d", meta.pageSize, pageSize)
+			}
+			before := readFileBytesForTest(t, path)
+
+			reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+			if err != nil {
+				t.Fatalf("OpenExisting %d-byte page database: %v", pageSize, err)
+			}
+			if err := reopened.AuditIntegrity(context.Background()); err != nil {
+				_ = reopened.Close()
+				t.Fatalf("AuditIntegrity %d-byte page database: %v", pageSize, err)
+			}
+			if err := reopened.Close(); err != nil {
+				t.Fatalf("close reopened %d-byte page database: %v", pageSize, err)
+			}
+			if after := readFileBytesForTest(t, path); !bytes.Equal(before, after) {
+				t.Fatalf("%d-byte page database open or audit mutated bytes", pageSize)
+			}
+		})
+	}
+}
+
+func TestNoFreelistSyncSentinelOpensCleanly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second, NoFreelistSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptBboltFixture(t, repo, newBboltFixture(t, "no-freelist-sync"))
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close NoFreelistSync repository: %v", err)
+	}
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	if err := file.Close(); err != nil {
+		t.Fatalf("close meta reader: %v", err)
+	}
+	if meta.freelist != boltNoFreelistID {
+		t.Fatalf("active freelist page = %d, want PgidNoFreelist", meta.freelist)
+	}
+	before := readFileBytesForTest(t, path)
+
+	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("OpenExisting NoFreelistSync database: %v", err)
+	}
+	if err := reopened.AuditIntegrity(context.Background()); err != nil {
+		_ = reopened.Close()
+		t.Fatalf("AuditIntegrity NoFreelistSync database: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close reopened NoFreelistSync database: %v", err)
+	}
+
+	readOnly, err := OpenExistingReadOnly(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("OpenExistingReadOnly NoFreelistSync database: %v", err)
+	}
+	if err := readOnly.AuditIntegrity(context.Background()); err != nil {
+		_ = readOnly.Close()
+		t.Fatalf("read-only AuditIntegrity NoFreelistSync database: %v", err)
+	}
+	if err := readOnly.Close(); err != nil {
+		t.Fatalf("close read-only NoFreelistSync database: %v", err)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(before, after) {
+		t.Fatal("NoFreelistSync open or audit mutated database bytes")
+	}
+}
+
+func TestPreOpenFreelistPreflightRejectsCorruptFreelistBeforeBoltOpen(t *testing.T) {
+	tests := []struct {
+		name    string
+		corrupt func(t *testing.T, path string)
+		want    string
+	}{
+		{
+			name: "bad-page-id",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				file, meta := openBoltFileAndMetaForTest(t, path)
+				_ = file.Close()
+				writeActiveBoltMetaFreelistForTest(t, path, meta.pgid)
+			},
+			want: "out of range",
+		},
+		{
+			name: "meta-pgid-as-free-id",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistIDsForTest(t, path, func(meta boltPreflightMeta) []uint64 {
+					return []uint64{meta.pgid}
+				})
+			},
+			want: "out of range",
+		},
+		{
+			name: "freelist-self-page-as-free-id",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistIDsForTest(t, path, func(meta boltPreflightMeta) []uint64 {
+					return []uint64{meta.freelist}
+				})
+			},
+			want: "freelist span",
+		},
+		{
+			name: "duplicate-free-id",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistIDsForTest(t, path, func(meta boltPreflightMeta) []uint64 {
+					return []uint64{meta.root, meta.root}
+				})
+			},
+			want: "duplicated",
+		},
+		{
+			name: "wrong-page-type",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistPageFlagsForTest(t, path, boltLeafPageFlag)
+			},
+			want: "want freelist",
+		},
+		{
+			name: "inconsistent-count",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistCountBeyondSpanForTest(t, path)
+			},
+			want: "requires",
+		},
+		{
+			name: "count-exceeds-high-water",
+			corrupt: func(t *testing.T, path string) {
+				t.Helper()
+				corruptActiveBoltFreelistCountExceedsHighWaterForTest(t, path)
+			},
+			want: "exceeds high water mark",
+		},
+	}
+
+	for _, pageSize := range []int{4096, 16384} {
+		t.Run(fmt.Sprintf("page-size-%d", pageSize), func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					path := createClosedSeededBboltFileWithPageSizeForStructuralTest(t, "freelist-"+tt.name, 600, pageSize)
+					tt.corrupt(t, path)
+					corruptBytes := readFileBytesForTest(t, path)
+
+					calledOpenFile := false
+					repo, err := OpenExisting(path, &bolt.Options{
+						Timeout: time.Second,
+						OpenFile: func(string, int, os.FileMode) (*os.File, error) {
+							calledOpenFile = true
+							panic("bolt open reached corrupt freelist")
+						},
+					})
+					if err == nil {
+						_ = repo.Close()
+						t.Fatal("OpenExisting succeeded for corrupt freelist, want ErrCorruptRecord")
+					}
+					if calledOpenFile {
+						t.Fatal("OpenExisting called bolt.Open after corrupt freelist preflight failure")
+					}
+					if !errors.Is(err, repository.ErrCorruptRecord) {
+						t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
+					}
+					if !errorTreeContains(err, tt.want) {
+						t.Fatalf("OpenExisting error = %v, want diagnostic containing %q", err, tt.want)
+					}
+					if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+						t.Fatal("OpenExisting corrupt freelist failure mutated database bytes")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestStructuralGraphPreflightCountsOverflowSpanAgainstReferenceBudget(t *testing.T) {
+	walk := boltStructuralGraphPreflight{
+		path:           "corrupt-overflow.db",
+		hwm:            4,
+		visited:        make(map[uint64]string),
+		pageReferences: 3,
+	}
+
+	err := walk.claimPageSpan(boltPreflightPage{id: 2, flags: boltLeafPageFlag, overflow: 1})
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("claimPageSpan error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "page-reference bound") {
+		t.Fatalf("claimPageSpan error = %v, want page-reference bound diagnostic", err)
+	}
+}
+
+func TestStructuralGraphPreflightBoundsNestedInlineBucketRecursion(t *testing.T) {
+	walk := boltStructuralGraphPreflight{
+		path:    "corrupt-inline.db",
+		hwm:     2,
+		visited: make(map[uint64]string),
+	}
+
+	err := walk.scanInlineBucketPage(nestedInlineBucketPageForTest(len(bucketNames)+1), nil, 1, "root")
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("scanInlineBucketPage error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "page-reference bound") {
+		t.Fatalf("scanInlineBucketPage error = %v, want page-reference bound diagnostic", err)
+	}
+}
+
+func TestStructuralGraphPreflightRejectsInlineBucketDepthBound(t *testing.T) {
+	walk := boltStructuralGraphPreflight{
+		path:    "corrupt-inline-depth.db",
+		hwm:     100,
+		visited: make(map[uint64]string),
+	}
+
+	err := walk.scanInlineBucketPage(emptyInlineBucketPageForTest(), nil, boltStructuralGraphMaxDepth+1, "too deep")
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("scanInlineBucketPage error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, "depth bound") {
+		t.Fatalf("scanInlineBucketPage error = %v, want depth bound diagnostic", err)
+	}
+}
+
+func TestStructuralGraphPreflightRejectsZeroLengthLeafKeyWithoutMutatingDatabase(t *testing.T) {
+	path := createClosedSeededBboltFileForStructuralTest(t, "zero-key", 600)
+	corruptFirstLeafElementKSizeForTest(t, path, 0)
+	requireOpenExistingCorruptWithoutMutationForTest(t, path, "zero-length key")
+}
+
+func TestStructuralGraphPreflightRejectsElementPayloadIntoMetadataWithoutMutatingDatabase(t *testing.T) {
+	path := createClosedSeededBboltFileForStructuralTest(t, "payload-metadata", 600)
+	corruptFirstLeafElementPosForTest(t, path, 0)
+	requireOpenExistingCorruptWithoutMutationForTest(t, path, "element table")
+}
+
+func TestOpenBoltSafelyReraisesProgrammerPanic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "panic.db")
+	sentinel := "programmer panic"
+	defer func() {
+		recovered := recover()
+		if recovered != sentinel {
+			t.Fatalf("recovered panic = %v, want %q", recovered, sentinel)
+		}
+	}()
+
+	_, _ = openBoltSafely(path, 0o600, &bolt.Options{
+		OpenFile: func(string, int, os.FileMode) (*os.File, error) {
+			panic(sentinel)
+		},
+	})
+}
+
+func TestOpenBoltSafelyReraisesRuntimeLogicPanic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nil-deref.db")
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("openBoltSafely did not re-panic nil dereference")
+		}
+		if !strings.Contains(fmt.Sprint(recovered), "nil pointer dereference") {
+			t.Fatalf("recovered panic = %v, want nil pointer dereference", recovered)
+		}
+	}()
+
+	_, _ = openBoltSafely(path, 0o600, &bolt.Options{
+		OpenFile: func(string, int, os.FileMode) (*os.File, error) {
+			var fault *byte
+			_ = *fault
+			return nil, nil
+		},
+	})
+}
+
+func TestOpenBoltSafelyMapsRuntimeFaultToCorruptRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fault.db")
+	db, err := openBoltSafely(path, 0o600, &bolt.Options{
+		OpenFile: func(string, int, os.FileMode) (*os.File, error) {
+			panic(runtimeFaultForTest{addr: 0x1234})
+		},
+	})
+	if db != nil {
+		_ = db.Close()
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("openBoltSafely error = %v, want ErrCorruptRecord", err)
+	}
+}
+
+type runtimeFaultForTest struct {
+	addr uintptr
+}
+
+func (e runtimeFaultForTest) Error() string {
+	return "runtime error: invalid memory address or nil pointer dereference"
+}
+
+func (e runtimeFaultForTest) RuntimeError() {}
+
+func (e runtimeFaultForTest) Addr() uintptr {
+	return e.addr
+}
+
+func TestBoltCheckErrorClassificationLeavesOperationalErrorsNonCorrupt(t *testing.T) {
+	if boltCheckErrorIsCorruption(bolt.ErrDatabaseNotOpen) {
+		t.Fatal("ErrDatabaseNotOpen classified as corruption")
+	}
+	if !boltCheckErrorIsCorruption(errors.New("page 3: reachable freed")) {
+		t.Fatal("bbolt check finding was not classified as corruption")
+	}
+}
+
+func TestUnrelatedCorruptRecordRawBytesPreservedAcrossSuccessfulCommit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	corrupt := newBboltFixture(t, "raw-corrupt")
+	acceptBboltFixture(t, repo, corrupt)
+	repo.InjectCorruptSafetyForTest(corrupt.JobID, "safety checksum")
+	rawBefore := readRawBucketValueForTest(t, repo, bucketSafety, jobIDKey(corrupt.JobID))
+
+	other := newBboltFixture(t, "raw-other")
+	acceptBboltFixture(t, repo, other)
+	rawAfter := readRawBucketValueForTest(t, repo, bucketSafety, jobIDKey(corrupt.JobID))
+	if !bytes.Equal(rawBefore, rawAfter) {
+		t.Fatal("unrelated corrupt safety raw bytes changed across successful unrelated commit")
+	}
+}
+
+func corruptFreelistWithReachablePageForTest(t *testing.T, path string) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, ok, err := readBoltPreflightMeta(file, info.Size())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("active bbolt meta not found")
+	}
+	if meta.root <= 1 || meta.root >= meta.pgid {
+		t.Fatalf("active root page = %d, high water mark = %d", meta.root, meta.pgid)
+	}
+	if meta.freelist <= 1 || meta.freelist >= meta.pgid {
+		t.Fatalf("active freelist page = %d, high water mark = %d", meta.freelist, meta.pgid)
+	}
+	if meta.root == meta.freelist {
+		t.Fatalf("root page and freelist page are both %d", meta.root)
+	}
+	page, err := readBoltPreflightPage(file, meta.freelist, meta.pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.flags != boltFreelistPageFlag {
+		t.Fatalf("page %d flags = 0x%x, want freelist", meta.freelist, page.flags)
+	}
+
+	var count [2]byte
+	binary.LittleEndian.PutUint16(count[:], 1)
+	if _, err := file.WriteAt(count[:], int64(meta.freelist*meta.pageSize+10)); err != nil {
+		t.Fatalf("write freelist count: %v", err)
+	}
+	var id [8]byte
+	binary.LittleEndian.PutUint64(id[:], meta.root)
+	if _, err := file.WriteAt(id[:], int64(meta.freelist*meta.pageSize+boltPageHeaderSize)); err != nil {
+		t.Fatalf("write freelist id: %v", err)
+	}
+}
+
+func corruptActiveBoltFreelistIDsForTest(t *testing.T, path string, idsForMeta func(boltPreflightMeta) []uint64) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	if meta.freelist <= 1 || meta.freelist >= meta.pgid {
+		t.Fatalf("active freelist page = %d, high water mark = %d", meta.freelist, meta.pgid)
+	}
+	page, err := readBoltPreflightPage(file, meta.freelist, meta.pageSize)
+	if err != nil {
+		t.Fatalf("read freelist page: %v", err)
+	}
+	if page.flags != boltFreelistPageFlag {
+		t.Fatalf("page %d flags = 0x%x, want freelist", meta.freelist, page.flags)
+	}
+	ids := idsForMeta(meta)
+	if len(ids) >= 0xffff {
+		t.Fatalf("test freelist ID count %d cannot be encoded as a simple count", len(ids))
+	}
+	span := uint64(page.overflow) + 1
+	if span == 0 || span > meta.pgid || meta.freelist > meta.pgid-span {
+		t.Fatalf("freelist page %d overflow %d exceeds high water mark %d", meta.freelist, page.overflow, meta.pgid)
+	}
+	capacity := (span*meta.pageSize - boltPageHeaderSize) / 8
+	if uint64(len(ids)) > capacity {
+		t.Fatalf("test freelist ID count %d exceeds freelist capacity %d", len(ids), capacity)
+	}
+	writeBoltPageCountForTest(t, file, meta.pageSize, meta.freelist, uint16(len(ids)))
+	for i, id := range ids {
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], id)
+		offset := int64(meta.freelist*meta.pageSize + boltPageHeaderSize + uint64(i)*8)
+		if _, err := file.WriteAt(buf[:], offset); err != nil {
+			t.Fatalf("write freelist ID %d: %v", i, err)
+		}
+	}
+}
+
+func writeActiveBoltMetaFreelistForTest(t *testing.T, path string, freelist uint64) {
+	t.Helper()
+	mutateActiveBoltMetaForTest(t, path, func(meta []byte) {
+		binary.LittleEndian.PutUint64(meta[32:40], freelist)
+	})
+}
+
+func mutateActiveBoltMetaForTest(t *testing.T, path string, mutate func(meta []byte)) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+
+	pageID := meta.txid % 2
+	offset := int64(pageID*meta.pageSize + boltPageHeaderSize)
+	buf := make([]byte, boltMetaPayloadSize)
+	if _, err := file.ReadAt(buf, offset); err != nil {
+		t.Fatalf("read active meta page %d: %v", pageID, err)
+	}
+	mutate(buf)
+	checksum := fnv.New64a()
+	_, _ = checksum.Write(buf[:56])
+	binary.LittleEndian.PutUint64(buf[56:64], checksum.Sum64())
+	if _, err := file.WriteAt(buf, offset); err != nil {
+		t.Fatalf("write active meta page %d: %v", pageID, err)
+	}
+}
+
+func corruptActiveBoltFreelistPageFlagsForTest(t *testing.T, path string, flags uint16) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	var buf [2]byte
+	binary.LittleEndian.PutUint16(buf[:], flags)
+	if _, err := file.WriteAt(buf[:], int64(meta.freelist*meta.pageSize+8)); err != nil {
+		t.Fatalf("write freelist flags: %v", err)
+	}
+}
+
+func corruptActiveBoltFreelistCountBeyondSpanForTest(t *testing.T, path string) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	page, err := readBoltPreflightPage(file, meta.freelist, meta.pageSize)
+	if err != nil {
+		t.Fatalf("read freelist page: %v", err)
+	}
+	span := uint64(page.overflow) + 1
+	capacity := (span*meta.pageSize - boltPageHeaderSize) / 8
+	writeBoltPageCountForTest(t, file, meta.pageSize, meta.freelist, 0xffff)
+	var count [8]byte
+	binary.LittleEndian.PutUint64(count[:], capacity)
+	if _, err := file.WriteAt(count[:], int64(meta.freelist*meta.pageSize+boltPageHeaderSize)); err != nil {
+		t.Fatalf("write freelist extended count: %v", err)
+	}
+}
+
+func corruptActiveBoltFreelistCountExceedsHighWaterForTest(t *testing.T, path string) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	page, err := readBoltPreflightPage(file, meta.freelist, meta.pageSize)
+	if err != nil {
+		t.Fatalf("read freelist page: %v", err)
+	}
+	span := uint64(page.overflow) + 1
+	capacity := boltFreelistCapacityForTest(span, meta.pageSize)
+	highWater := meta.pgid
+	if capacity <= highWater {
+		info, err := file.Stat()
+		if err != nil {
+			t.Fatalf("stat bbolt file: %v", err)
+		}
+		filePages := uint64(info.Size()) / meta.pageSize
+		for {
+			span++
+			if span == 0 || meta.freelist > filePages-span {
+				t.Fatalf("test freelist span cannot fit count above high water mark %d in %d file pages", meta.pgid, filePages)
+			}
+			capacity = boltFreelistCapacityForTest(span, meta.pageSize)
+			highWater = max(meta.root+1, meta.freelist+span)
+			if capacity > highWater {
+				break
+			}
+		}
+		writeBoltPageOverflowForTest(t, file, meta.pageSize, meta.freelist, uint32(span-1))
+		writeActiveBoltMetaPgidForTest(t, path, highWater)
+	}
+	count := highWater + 1
+	if count >= 0xffff {
+		t.Fatalf("test freelist count %d cannot be encoded as a simple count", count)
+	}
+	if count > capacity {
+		t.Fatalf("test freelist count %d exceeds freelist capacity %d", count, capacity)
+	}
+	writeBoltPageCountForTest(t, file, meta.pageSize, meta.freelist, uint16(count))
+}
+
+func boltFreelistCapacityForTest(span, pageSize uint64) uint64 {
+	return (span*pageSize - boltPageHeaderSize) / 8
+}
+
+func writeActiveBoltMetaPgidForTest(t *testing.T, path string, pgid uint64) {
+	t.Helper()
+	mutateActiveBoltMetaForTest(t, path, func(meta []byte) {
+		binary.LittleEndian.PutUint64(meta[40:48], pgid)
+	})
+}
+
+func writeBoltPageOverflowForTest(t *testing.T, file *os.File, pageSize, pageID uint64, overflow uint32) {
+	t.Helper()
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], overflow)
+	if _, err := file.WriteAt(buf[:], int64(pageID*pageSize+12)); err != nil {
+		t.Fatalf("write page %d overflow: %v", pageID, err)
+	}
+}
+
+func writeBoltPageCountForTest(t *testing.T, file *os.File, pageSize, pageID uint64, count uint16) {
+	t.Helper()
+	var buf [2]byte
+	binary.LittleEndian.PutUint16(buf[:], count)
+	if _, err := file.WriteAt(buf[:], int64(pageID*pageSize+10)); err != nil {
+		t.Fatalf("write page %d count: %v", pageID, err)
+	}
+}
+
+func requireOpenExistingCorruptWithoutMutationForTest(t *testing.T, path, want string) {
+	t.Helper()
+	corruptBytes := readFileBytesForTest(t, path)
+	repo, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
+	if err == nil {
+		_ = repo.Close()
+		t.Fatal("OpenExisting succeeded for corrupt structural input, want ErrCorruptRecord")
+	}
+	if !errors.Is(err, repository.ErrCorruptRecord) {
+		t.Fatalf("OpenExisting error = %v, want ErrCorruptRecord", err)
+	}
+	if !errorTreeContains(err, want) {
+		t.Fatalf("OpenExisting error = %v, want diagnostic containing %q", err, want)
+	}
+	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
+		t.Fatal("OpenExisting structural failure mutated database bytes")
+	}
+}
+
+func corruptFirstLeafElementKSizeForTest(t *testing.T, path string, ksize uint32) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	page := requireBoltLeafPageFromFileForTest(t, file, meta, 1)
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], ksize)
+	offset := int64(page.id*meta.pageSize + boltPageHeaderSize + 8)
+	if _, err := file.WriteAt(buf[:], offset); err != nil {
+		t.Fatalf("write leaf page %d first element ksize: %v", page.id, err)
+	}
+}
+
+func corruptFirstLeafElementPosForTest(t *testing.T, path string, pos uint32) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	page := requireBoltLeafPageFromFileForTest(t, file, meta, 1)
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], pos)
+	offset := int64(page.id*meta.pageSize + boltPageHeaderSize + 4)
+	if _, err := file.WriteAt(buf[:], offset); err != nil {
+		t.Fatalf("write leaf page %d first element pos: %v", page.id, err)
+	}
+}
+
+func nestedInlineBucketPageForTest(depth int) []byte {
+	if depth <= 1 {
+		return emptyInlineBucketPageForTest()
+	}
+	child := nestedInlineBucketPageForTest(depth - 1)
+	value := make([]byte, boltBucketHeaderSize+len(child))
+	copy(value[boltBucketHeaderSize:], child)
+	return inlineBucketPageWithBucketValueForTest(value)
+}
+
+func emptyInlineBucketPageForTest() []byte {
+	page := make([]byte, boltPageHeaderSize)
+	binary.LittleEndian.PutUint16(page[8:10], boltLeafPageFlag)
+	return page
+}
+
+func inlineBucketPageWithBucketValueForTest(value []byte) []byte {
+	key := []byte("k")
+	page := make([]byte, boltPageHeaderSize+boltLeafPageElementSize+len(key)+len(value))
+	binary.LittleEndian.PutUint16(page[8:10], boltLeafPageFlag)
+	binary.LittleEndian.PutUint16(page[10:12], 1)
+	elem := page[boltPageHeaderSize : boltPageHeaderSize+boltLeafPageElementSize]
+	binary.LittleEndian.PutUint32(elem[0:4], boltBucketLeafFlag)
+	binary.LittleEndian.PutUint32(elem[4:8], boltLeafPageElementSize)
+	binary.LittleEndian.PutUint32(elem[8:12], uint32(len(key)))
+	binary.LittleEndian.PutUint32(elem[12:16], uint32(len(value)))
+	payload := page[boltPageHeaderSize+boltLeafPageElementSize:]
+	copy(payload, key)
+	copy(payload[len(key):], value)
+	return page
+}
+
+func createClosedSeededBboltFileForStructuralTest(t *testing.T, name string, count int) string {
+	t.Helper()
+	return createClosedSeededBboltFileWithPageSizeForStructuralTest(t, name, count, 0)
+}
+
+func createClosedSeededBboltFileWithPageSizeForStructuralTest(t *testing.T, name string, count, pageSize int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "admission-"+name+".db")
+	options := &bolt.Options{Timeout: time.Second}
+	if pageSize > 0 {
+		options.PageSize = pageSize
+	}
+	repo, err := Create(path, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
+		for i := 0; i < count; i++ {
+			fixture := seedFixture(t, i)
+			if err := tx.PutBinding(fixture.Binding); err != nil {
+				return err
+			}
+			if err := tx.PutSafety(fixture.Record, 0); err != nil {
+				return err
+			}
+			if err := tx.PutProjection(fixture.Projection); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		_ = repo.Close()
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close seeded repository: %v", err)
+	}
+	requireBoltBranchPageForTest(t, path, 2)
+	return path
+}
+
+func corruptBranchChildToSelfForTest(t *testing.T, path string) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	branch := requireBoltBranchPageFromFileForTest(t, file, meta, 1)
+	writeBoltBranchChildForTest(t, file, meta.pageSize, branch.id, 0, branch.id)
+}
+
+func corruptBranchSecondChildToDuplicateFirstForTest(t *testing.T, path string) {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	branch := requireBoltBranchPageFromFileForTest(t, file, meta, 2)
+	firstChild := readBoltBranchChildForTest(t, file, meta.pageSize, branch.id, 0)
+	writeBoltBranchChildForTest(t, file, meta.pageSize, branch.id, 1, firstChild)
+}
+
+func requireBoltBranchPageForTest(t *testing.T, path string, minCount uint16) boltPreflightPage {
+	t.Helper()
+	file, meta := openBoltFileAndMetaForTest(t, path)
+	defer file.Close()
+	return requireBoltBranchPageFromFileForTest(t, file, meta, minCount)
+}
+
+func requireBoltBranchPageFromFileForTest(t *testing.T, file *os.File, meta boltPreflightMeta, minCount uint16) boltPreflightPage {
+	t.Helper()
+	for pageID := uint64(0); pageID < meta.pgid; {
+		page, err := readBoltPreflightPage(file, pageID, meta.pageSize)
+		if err != nil {
+			t.Fatalf("read page %d: %v", pageID, err)
+		}
+		if page.flags == boltBranchPageFlag && page.count >= minCount {
+			return page
+		}
+		pageID += uint64(page.overflow) + 1
+	}
+	t.Fatalf("no branch page with at least %d children found", minCount)
+	return boltPreflightPage{}
+}
+
+func requireBoltLeafPageFromFileForTest(t *testing.T, file *os.File, meta boltPreflightMeta, minCount uint16) boltPreflightPage {
+	t.Helper()
+	for pageID := uint64(0); pageID < meta.pgid; {
+		page, err := readBoltPreflightPage(file, pageID, meta.pageSize)
+		if err != nil {
+			t.Fatalf("read page %d: %v", pageID, err)
+		}
+		if page.flags == boltLeafPageFlag && page.count >= minCount {
+			return page
+		}
+		pageID += uint64(page.overflow) + 1
+	}
+	t.Fatalf("no leaf page with at least %d elements found", minCount)
+	return boltPreflightPage{}
+}
+
+func openBoltFileAndMetaForTest(t *testing.T, path string) (*os.File, boltPreflightMeta) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	meta, ok, err := readBoltPreflightMeta(file, info.Size())
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if !ok {
+		_ = file.Close()
+		t.Fatal("active bbolt meta not found")
+	}
+	return file, meta
+}
+
+func readBoltBranchChildForTest(t *testing.T, file *os.File, pageSize, pageID uint64, index uint16) uint64 {
+	t.Helper()
+	var buf [8]byte
+	offset := int64(pageID*pageSize + boltPageHeaderSize + uint64(index)*boltBranchPageElementSize + 8)
+	if _, err := file.ReadAt(buf[:], offset); err != nil {
+		t.Fatalf("read branch page %d child %d: %v", pageID, index, err)
+	}
+	return binary.LittleEndian.Uint64(buf[:])
+}
+
+func writeBoltBranchChildForTest(t *testing.T, file *os.File, pageSize, pageID uint64, index uint16, child uint64) {
+	t.Helper()
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], child)
+	offset := int64(pageID*pageSize + boltPageHeaderSize + uint64(index)*boltBranchPageElementSize + 8)
+	if _, err := file.WriteAt(buf[:], offset); err != nil {
+		t.Fatalf("write branch page %d child %d: %v", pageID, index, err)
+	}
+}
+
+func BenchmarkRepositoryPointLookup(b *testing.B) {
+	for _, size := range []int{1_000, 10_000, 100_000} {
+		b.Run(fmt.Sprintf("%d-identities", size), func(b *testing.B) {
+			repo := newDirectSeededBboltRepositoryForBenchmark(b, size)
+			target := model.JobID(fmt.Sprintf("job-seed-%06d", size-1))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+					image := tx.LoadJob(target)
+					if image.Safety.State != repository.RecordValid || image.Binding.State != repository.RecordValid {
+						return fmt.Errorf("target image states binding=%s safety=%s", image.Binding.State, image.Safety.State)
+					}
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+type reopeningRepository struct {
+	t    *testing.T
+	path string
+	repo *Repository
+}
+
+func newReopeningRepository(t *testing.T) *reopeningRepository {
+	t.Helper()
+	wrapper := &reopeningRepository{
+		t:    t,
+		path: filepath.Join(t.TempDir(), "admission.db"),
+	}
+	wrapper.reopen()
+	t.Cleanup(func() {
+		if wrapper.repo != nil {
+			if err := wrapper.repo.Close(); err != nil {
+				t.Fatalf("close bbolt repository: %v", err)
+			}
+		}
+	})
+	return wrapper
+}
+
+func (r *reopeningRepository) View(ctx context.Context, fn func(repository.ReadTx) error) error {
+	return r.repo.View(ctx, fn)
+}
+
+func (r *reopeningRepository) Update(ctx context.Context, fn func(repository.WriteTx) error) (repository.Commit, error) {
+	commit, err := r.repo.Update(ctx, fn)
+	if r.repo.VerifyInitializedStructure() == nil {
+		r.reopen()
+	}
+	return commit, err
+}
+
+func (r *reopeningRepository) SnapshotBytes() []byte {
+	return r.repo.SnapshotBytes()
+}
+
+func (r *reopeningRepository) InjectCorruptSafetyForTest(jobID model.JobID, diagnostic string) {
+	r.repo.InjectCorruptSafetyForTest(jobID, diagnostic)
+	r.reopen()
+}
+
+func (r *reopeningRepository) InjectCorruptBindingForTest(key model.RequestKey, diagnostic string) {
+	r.repo.InjectCorruptBindingForTest(key, diagnostic)
+	r.reopen()
+}
+
+func (r *reopeningRepository) InjectCorruptTombstoneForTest(key model.RequestKey, diagnostic string) {
+	r.repo.InjectCorruptTombstoneForTest(key, diagnostic)
+	r.reopen()
+}
+
+func (r *reopeningRepository) InjectMissingMetaForTest() {
+	r.repo.InjectMissingMetaForTest()
+}
+
+func (r *reopeningRepository) FailCommitAfterCommitForTest(err error) {
+	r.repo.FailCommitAfterCommitForTest(err)
+}
+
+func (r *reopeningRepository) AuditIntegrity(ctx context.Context) error {
+	return r.repo.AuditIntegrity(ctx)
+}
+
+func (r *reopeningRepository) reopen() {
+	r.t.Helper()
+	if r.repo != nil {
+		if err := r.repo.Close(); err != nil {
+			r.t.Fatalf("close bbolt repository before reopen: %v", err)
+		}
+	}
+	var repo *Repository
+	var err error
+	if _, statErr := os.Stat(r.path); errors.Is(statErr, os.ErrNotExist) {
+		repo, err = Create(r.path, &bolt.Options{Timeout: time.Second})
+	} else if statErr != nil {
+		r.t.Fatalf("stat bbolt repository: %v", statErr)
+	} else {
+		repo, err = OpenExisting(r.path, &bolt.Options{Timeout: time.Second})
+	}
+	if err != nil {
+		r.t.Fatalf("open bbolt repository: %v", err)
+	}
+	r.repo = repo
+}
+
+type bboltFixture struct {
+	RequestKey model.RequestKey
+	JobID      model.JobID
+	Identity   model.TaskIdentity
+	Boot       model.BootRef
+	Binding    model.Binding
+	Record     model.SafetyRecord
+	Projection model.JobProjection
+}
+
+func createSchemaV1RepositoryForTest(t *testing.T, path string) []byte {
+	t.Helper()
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *bolt.Tx) error {
+		for _, name := range [][]byte{bucketMeta, bucketBindings, bucketSafety, bucketProjections, bucketTombstones, bucketQuarantine} {
+			if _, err := tx.CreateBucket(name); err != nil {
+				return err
+			}
+		}
+		if err := putEnvelope(tx.Bucket(bucketMeta), kindDBUUID, keyDBUUID, "bbolt-db-schema-v1", 0); err != nil {
+			return err
+		}
+		meta := repository.AuthorityMeta{
+			SchemaVersion:   1,
+			Generation:      0,
+			NextJobSequence: 1,
+		}
+		return putEnvelope(tx.Bucket(bucketMeta), kindMeta, keyMeta, meta, revisionMeta(meta))
+	}); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func newSeededBboltRepository(t *testing.T, count int) *Repository {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Fatalf("close bbolt repository: %v", err)
+		}
+	})
+	_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
+		for i := 0; i < count; i++ {
+			fixture := seedFixture(t, i)
+			if err := tx.PutBinding(fixture.Binding); err != nil {
+				return err
+			}
+			if err := tx.PutSafety(fixture.Record, 0); err != nil {
+				return err
+			}
+			if err := tx.PutProjection(fixture.Projection); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return repo
+}
+
+func newDirectSeededBboltRepositoryForBenchmark(b *testing.B, count int) *Repository {
+	b.Helper()
+	path := filepath.Join(b.TempDir(), "admission.db")
+	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			b.Fatalf("close bbolt repository: %v", err)
+		}
+	})
+	if err := repo.db.Update(func(tx *bolt.Tx) error {
+		meta := (readTx{tx: tx}).Meta()
+		if meta.State != repository.RecordValid {
+			return fmt.Errorf("meta state = %s", meta.State)
+		}
+		meta.Value.Generation = 1
+		meta.Value.NextJobSequence = uint64(count + 1)
+		if err := putEnvelope(tx.Bucket(bucketMeta), kindMeta, keyMeta, meta.Value, revisionMeta(meta.Value)); err != nil {
+			return err
+		}
+		for i := 0; i < count; i++ {
+			fixture := seedFixture(b, i)
+			key := requestKeyBytes(fixture.RequestKey)
+			if err := putEnvelope(tx.Bucket(bucketBindings), kindBinding, key, fixture.Binding, revisionBinding(fixture.Binding)); err != nil {
+				return err
+			}
+			if err := tx.Bucket(bucketBindingIndex).Put(jobIDKey(fixture.JobID), key); err != nil {
+				return err
+			}
+			if err := putEnvelope(tx.Bucket(bucketSafety), kindSafety, jobIDKey(fixture.JobID), fixture.Record, revisionSafety(fixture.Record)); err != nil {
+				return err
+			}
+			if err := putEnvelope(tx.Bucket(bucketProjections), kindProjection, jobIDKey(fixture.JobID), fixture.Projection, revisionProjection(fixture.Projection)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		b.Fatal(err)
+	}
+	return repo
+}
+
+func seedFixture(t testing.TB, i int) bboltFixture {
+	t.Helper()
+	name := fmt.Sprintf("seed-%06d", i)
+	key := mustRequestKeyForTest(t, "workspace-"+name, "request-"+name)
+	jobID, err := model.NewJobID(fmt.Sprintf("job-seed-%06d", i))
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, err := model.NewBootRef("boot-"+name, "owner-"+name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptID, err := model.NewAttemptID("attempt-" + name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := model.NewSHA256TaskIdentity([]byte("task-" + name))
+	record := model.SafetyRecord{
+		SchemaVersion: 1,
+		Revision:      1,
+		JobID:         jobID,
+		RequestKey:    key,
+		TaskIdentity:  identity,
+		Mode:          model.ModeIdentifiedFenced,
+		AdmittedBy:    boot,
+		Attempt: model.AttemptProof{
+			Ref: model.AttemptRef{JobID: jobID, AttemptID: attemptID, Epoch: 1},
+		},
+	}
+	if err := model.ValidateSafetyRecord(record); err != nil {
+		t.Fatal(err)
+	}
+	binding := model.Binding{
+		RequestKey:   key,
+		JobID:        jobID,
+		TaskIdentity: identity,
+		Mode:         model.ModeIdentifiedFenced,
+	}
+	if err := binding.Matches(record); err != nil {
+		t.Fatal(err)
+	}
+	projection, err := model.Project(record, model.ProjectionMetadata{SessionID: "session-" + name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bboltFixture{
+		RequestKey: key,
+		JobID:      jobID,
+		Identity:   identity,
+		Boot:       boot,
+		Binding:    binding,
+		Record:     record,
+		Projection: projection,
+	}
+}
+
+func newBboltFixture(t *testing.T, name string) bboltFixture {
+	t.Helper()
+	key := mustRequestKeyForTest(t, "workspace-"+name, "request-"+name)
+	jobID, err := model.NewJobID("job-" + name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, err := model.NewBootRef("boot-"+name, "owner-"+name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptID, err := model.NewAttemptID("attempt-" + name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := model.NewSHA256TaskIdentity([]byte("task-" + name))
+	record := model.SafetyRecord{
+		SchemaVersion: 1,
+		Revision:      1,
+		JobID:         jobID,
+		RequestKey:    key,
+		TaskIdentity:  identity,
+		Mode:          model.ModeIdentifiedFenced,
+		AdmittedBy:    boot,
+		Attempt: model.AttemptProof{
+			Ref: model.AttemptRef{JobID: jobID, AttemptID: attemptID, Epoch: 1},
+		},
+	}
+	if err := model.ValidateSafetyRecord(record); err != nil {
+		t.Fatal(err)
+	}
+	binding := model.Binding{
+		RequestKey:   key,
+		JobID:        jobID,
+		TaskIdentity: identity,
+		Mode:         model.ModeIdentifiedFenced,
+	}
+	if err := binding.Matches(record); err != nil {
+		t.Fatal(err)
+	}
+	projection, err := model.Project(record, model.ProjectionMetadata{SessionID: "session-" + name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bboltFixture{
+		RequestKey: key,
+		JobID:      jobID,
+		Identity:   identity,
+		Boot:       boot,
+		Binding:    binding,
+		Record:     record,
+		Projection: projection,
+	}
+}
+
+func acceptBboltFixture(t *testing.T, repo *Repository, fixture bboltFixture) {
+	t.Helper()
+	if _, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+		if err := tx.PutBinding(fixture.Binding); err != nil {
+			return err
+		}
+		if err := tx.PutSafety(fixture.Record, 0); err != nil {
+			return err
+		}
+		return tx.PutProjection(fixture.Projection)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustRequestKeyForTest(t testing.TB, workspace, request string) model.RequestKey {
+	t.Helper()
+	key, err := model.NewRequestKey(workspace, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func readFileBytesForTest(t testing.TB, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func readRawBucketValueForTest(t testing.TB, repo *Repository, bucketName, key []byte) []byte {
+	t.Helper()
+	var out []byte
+	if err := repo.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(bucketName)
+		if bucket == nil {
+			return fmt.Errorf("bucket %q is missing", string(bucketName))
+		}
+		raw := bucket.Get(key)
+		if raw == nil {
+			return fmt.Errorf("key %q is missing", string(key))
+		}
+		out = append([]byte(nil), raw...)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
