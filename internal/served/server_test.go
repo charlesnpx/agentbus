@@ -261,8 +261,12 @@ func (s *fakeSession) TurnWithRunner(ctx context.Context, input engine.TurnInput
 		if stdout := running.Stdout(); stdout != nil {
 			_, _ = io.Copy(io.Discard, stdout)
 		}
-		if _, err := running.Wait(ctx); err != nil {
-			ch <- engine.Event{Type: engine.EventTerminalError, Text: err.Error()}
+		observation := testFinalObservation(ctx, running)
+		if observation.CleanupErr != nil {
+			ch <- engine.Event{Type: engine.EventWarning, Text: observation.CleanupErr.Error()}
+		}
+		if observation.ExecutionErr != nil {
+			ch <- engine.Event{Type: engine.EventTerminalError, Text: observation.ExecutionErr.Error()}
 			<-stderrDone
 			return
 		}
@@ -311,6 +315,21 @@ func (s *nonOrdinalSession) Interrupt(context.Context) error { return nil }
 func (s *fakeSession) Interrupt(context.Context) error {
 	s.backend.interrupts.Add(1)
 	return nil
+}
+
+func testFinalObservation(ctx context.Context, running command.RunningCommand) command.FinalObservation {
+	exit, waitErr := running.Wait(ctx)
+	if observer, ok := running.(command.FinalObserver); ok {
+		observation, err := observer.FinalObservation(context.WithoutCancel(ctx))
+		if observation.Exit == (command.ExitObservation{}) {
+			observation.Exit = exit
+		}
+		if observation.ExecutionErr == nil && observation.CleanupErr == nil {
+			observation.ExecutionErr = errors.Join(waitErr, err)
+		}
+		return observation
+	}
+	return command.FinalObservation{Exit: exit, ExecutionErr: waitErr}
 }
 
 type unsafeNamedBackend struct {
@@ -5841,6 +5860,164 @@ func TestResultMessageWinsOverAssistantTextWithoutDuplication(t *testing.T) {
 	}
 }
 
+func TestAdmissionRunPreservesResultWhenCleanupUnresolvedAfterZeroExit(t *testing.T) {
+	t.Parallel()
+	unresolved := &custodian.CleanupUnresolvedError{
+		Reason:   containment.ReasonAbsenceDeadlineExceeded,
+		Decision: model.SignalDirectly,
+	}
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{{Type: engine.EventResultMessage, Text: "final report"}}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitErr = unresolved
+	launcher.containErr = unresolved
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-cleanup-unresolved-complete",
+		RequestID:    "request-cleanup-unresolved-complete",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "cleanup unresolved"},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCompleted || record.Terminal.Proof != model.ProofUnresolvedAbsence {
+		t.Fatalf("terminal = %+v, want completed unresolved absence", record.Terminal)
+	}
+	if first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne); !ok || first.Quiescence != nil {
+		t.Fatalf("ordinal 1 quiescence = %+v, want absent", first.Quiescence)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if result.State != engine.StateCompleted || result.CleanupDisposition != model.CleanupDispositionUnresolved.String() {
+		t.Fatalf("job result state/cleanup = %s/%s, want completed/unresolved", result.State, result.CleanupDisposition)
+	}
+	if result.Result == nil || result.Result.Text != "final report" {
+		t.Fatalf("result payload = %+v, want preserved final report", result.Result)
+	}
+}
+
+func TestAdmissionRunPreservesResultWhenPostQuiescenceCleanupWarns(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{{Type: engine.EventResultMessage, Text: "verified report"}}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.cleanupErr = errors.New("cleanup warning after proof")
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-cleanup-warning-complete",
+		RequestID:    "request-cleanup-warning-complete",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "cleanup warning"},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCompleted {
+		t.Fatalf("terminal = %+v, want completed", record.Terminal)
+	}
+	if first, ok := record.Attempt.Launches.Get(model.LaunchOrdinalOne); !ok || first.Quiescence == nil {
+		t.Fatalf("ordinal 1 launch = %+v, want quiescence recorded", first)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if result.State != engine.StateCompleted || result.CleanupDisposition != model.CleanupDispositionVerifiedAbsent.String() {
+		t.Fatalf("job result state/cleanup = %s/%s, want completed/verified_absent", result.State, result.CleanupDisposition)
+	}
+	if result.Result == nil || result.Result.Text != "verified report" {
+		t.Fatalf("result payload = %+v, want preserved verified report", result.Result)
+	}
+}
+
+func TestAdmissionActiveCancelCommitsUnresolvedCleanupInsteadOfRPCError(t *testing.T) {
+	t.Parallel()
+	holdNaturalExit := make(chan struct{})
+	defer close(holdNaturalExit)
+	unresolved := &custodian.CleanupUnresolvedError{
+		Reason:   containment.ReasonProbeUnprovable,
+		Decision: model.Unprovable,
+	}
+	backend := newFakeBackend("fake")
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitAndVerify = holdNaturalExit
+	launcher.containErr = unresolved
+	enableTestAdmission(t, server, launcher)
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-active-cancel-unresolved",
+		RequestID:    "request-active-cancel-unresolved",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold for cancel"},
+	})
+	waitBackendStarted(t, backend)
+
+	cancel := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: job.JobID})
+	if cancel.State != engine.StateCanceled {
+		t.Fatalf("job.cancel = %+v, want canceled", cancel)
+	}
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Proof != model.ProofUnresolvedAbsence {
+		t.Fatalf("terminal = %+v, want canceled unresolved absence", record.Terminal)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if result.State != engine.StateCanceled || result.CleanupDisposition != model.CleanupDispositionUnresolved.String() {
+		t.Fatalf("job result state/cleanup = %s/%s, want canceled/unresolved", result.State, result.CleanupDisposition)
+	}
+	if err := server.safetyFailStopErr(); err != nil {
+		t.Fatalf("authority root fail-stopped after cleanup uncertainty: %v", err)
+	}
+}
+
+func TestAdmissionUnresolvedTerminalAbandonsActiveCustodyAndDrains(t *testing.T) {
+	t.Parallel()
+	unresolved := &custodian.CleanupUnresolvedError{
+		Reason:   containment.ReasonAbsenceDeadlineExceeded,
+		Decision: model.SignalDirectly,
+	}
+	backend := newFakeBackend("fake")
+	backend.started = make(chan struct{}, 2)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitErr = unresolved
+	launcher.containErr = unresolved
+	launcher.activeCustodies.Store(true)
+	enableTestAdmission(t, server, launcher)
+
+	first := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-abandon-unresolved",
+		RequestID:    "request-abandon-unresolved-first",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "first unresolved"},
+	})
+	waitBackendStarted(t, backend)
+	record := waitAdmissionSafetyTerminal(t, server, first.JobID)
+	waitActiveJobGone(t, server, first.JobID)
+	if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionUnresolved {
+		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
+	}
+	if launcher.HasActiveCustodies() {
+		t.Fatal("launcher still reports active custody after unresolved terminal")
+	}
+	if got := launcher.abandonCount(); got != 1 {
+		t.Fatalf("abandon count = %d, want 1", got)
+	}
+	if server.activeWorkWithContext(context.Background()) {
+		t.Fatal("server still treats unresolved terminal job as active work")
+	}
+
+	launcher.waitErr = nil
+	launcher.containErr = nil
+	second := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-abandon-unresolved",
+		RequestID:    "request-abandon-unresolved-second",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "second runs"},
+	})
+	waitBackendStarted(t, backend)
+	secondRecord := waitAdmissionSafetyTerminal(t, server, second.JobID)
+	if secondRecord.Terminal == nil || secondRecord.Terminal.Outcome != model.OutcomeCompleted {
+		t.Fatalf("second terminal = %+v, want completed", secondRecord.Terminal)
+	}
+}
+
 func TestConcurrentBackgroundJobs(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
@@ -7283,7 +7460,9 @@ type admissionFakeLaunchCustodian struct {
 	releases     int
 	aborts       int
 	contains     int
+	abandons     int
 	containments []admissionContainObservation
+	abandoned    []model.GroupRef
 	running      map[string]*admissionFakeRunning
 
 	containCtxErrs      []error
@@ -7300,6 +7479,8 @@ type admissionFakeLaunchCustodian struct {
 	containErr                error
 	containErrByOrdinal       map[model.LaunchOrdinal]error
 	cleanupErr                error
+	waitErr                   error
+	waitExit                  command.ExitObservation
 	abortCleanupErr           error
 	waitAndVerify             <-chan struct{}
 	activeCustodies           atomic.Bool
@@ -7331,6 +7512,9 @@ func (c *admissionFakeLaunchCustodian) Prepare(_ context.Context, spec command.E
 		contained:    make(chan struct{}),
 		wait:         c.waitAndVerify,
 		cleanupErr:   c.cleanupErr,
+		waitErr:      c.waitErr,
+		waitExit:     c.waitExit,
+		containErr:   c.containErr,
 	}
 	c.mu.Lock()
 	c.ordinals = append(c.ordinals, key.Ordinal)
@@ -7417,6 +7601,29 @@ func (c *admissionFakeLaunchCustodian) runningContained(custodyID model.CustodyI
 
 func (c *admissionFakeLaunchCustodian) HasActiveCustodies() bool {
 	return c != nil && c.activeCustodies.Load()
+}
+
+func (c *admissionFakeLaunchCustodian) AbandonUnresolvedCustody(_ context.Context, group model.GroupRef) error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	c.abandons++
+	c.abandoned = append(c.abandoned, group)
+	running := c.running[string(group.CustodyID)]
+	delete(c.running, string(group.CustodyID))
+	c.activeCustodies.Store(false)
+	c.mu.Unlock()
+	if running != nil {
+		running.closeStreams()
+	}
+	return nil
+}
+
+func (c *admissionFakeLaunchCustodian) abandonCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.abandons
 }
 
 func (c *admissionFakeLaunchCustodian) abortContextObservations() ([]error, []bool) {
@@ -7531,6 +7738,9 @@ type admissionFakeRunning struct {
 	contained    chan struct{}
 	wait         <-chan struct{}
 	cleanupErr   error
+	waitErr      error
+	waitExit     command.ExitObservation
+	containErr   error
 }
 
 func (r *admissionFakeRunning) Ref() model.GroupRef {
@@ -7559,11 +7769,22 @@ func (r *admissionFakeRunning) WaitAndVerify(ctx context.Context) (command.ExitO
 			return command.ExitObservation{}, custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, ctx.Err()
 		}
 	}
+	if r.waitErr != nil {
+		r.closeStreams()
+		exit := r.waitExit
+		if exit == (command.ExitObservation{}) {
+			exit = command.ExitObservation{Exited: true, Code: 0}
+		}
+		return exit, custodian.VerifiedQuiescence{}, custodian.CleanupStatus{Err: r.cleanupErr}, r.waitErr
+	}
 	return r.finish(model.QuiescenceNaturalExit)
 }
 
 func (r *admissionFakeRunning) ContainAndVerify(context.Context, custodian.QuiescenceCause) (custodian.VerifiedQuiescence, custodian.CleanupStatus, error) {
 	r.markContained()
+	if r.containErr != nil {
+		return custodian.VerifiedQuiescence{}, custodian.CleanupStatus{}, r.containErr
+	}
 	_, verified, cleanup, err := r.finish(model.QuiescenceTermKill)
 	return verified, cleanup, err
 }

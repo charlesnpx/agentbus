@@ -637,8 +637,10 @@ type Result struct {
 	Grant           model.LaunchGrant
 	Exit            command.ExitObservation
 	Verified        custodian.VerifiedQuiescence
+	Cleanup         custodian.CleanupStatus
 	Contained       bool
 	ReleaseRecorded bool
+	ExecutionErr    error
 }
 
 type Process struct {
@@ -753,6 +755,15 @@ func (process *Process) FinalResult(ctx context.Context) (Result, error) {
 	}
 }
 
+func (process *Process) FinalObservation(ctx context.Context) (command.FinalObservation, error) {
+	result, err := process.FinalResult(ctx)
+	return command.FinalObservation{
+		Exit:         result.Exit,
+		ExecutionErr: result.ExecutionErr,
+		CleanupErr:   result.Cleanup.Err,
+	}, err
+}
+
 func (process *Process) Result(ctx context.Context) (Result, error) {
 	return process.FinalResult(ctx)
 }
@@ -838,7 +849,7 @@ func (process *Process) eagerWait(ctx context.Context) {
 		process.finalizeFromContain(process.controlCtx, cause, exit, priorErr, true)
 		return
 	}
-	process.finalizeWithVerified(process.controlCtx, exit, verified, waitReportedContainment(process.running), true, cleanup.Err)
+	process.finalizeWithVerified(process.controlCtx, exit, verified, waitReportedContainment(process.running), true, nil, cleanup)
 }
 
 func waitReportedContainment(running RunningProcess) bool {
@@ -860,7 +871,9 @@ func (process *Process) finalizeFromContain(ctx context.Context, cause custodian
 	}
 	process.finalOnce.Do(func() {
 		verified, cleanup, containErr := process.running.ContainAndVerify(ctx, cause)
-		process.finish(ctx, priorExit, verified, containErr == nil, containErr == nil, errors.Join(priorErr, containErr, cleanup.Err))
+		executionErr, cleanupErr := splitContainmentErr(containErr)
+		cleanup.Err = errors.Join(cleanup.Err, cleanupErr)
+		process.finish(ctx, priorExit, verified, containErr == nil, containErr == nil, errors.Join(priorErr, executionErr), cleanup)
 	})
 }
 
@@ -878,22 +891,22 @@ func (process *Process) containmentRequested() bool {
 	return containing || process.intent.Requested()
 }
 
-func (process *Process) finalizeWithVerified(ctx context.Context, exit command.ExitObservation, verified custodian.VerifiedQuiescence, contained bool, verifiedOK bool, reconcileErr error) {
+func (process *Process) finalizeWithVerified(ctx context.Context, exit command.ExitObservation, verified custodian.VerifiedQuiescence, contained bool, verifiedOK bool, executionErr error, cleanup custodian.CleanupStatus) {
 	process.finalOnce.Do(func() {
-		process.finish(ctx, exit, verified, contained, verifiedOK, reconcileErr)
+		process.finish(ctx, exit, verified, contained, verifiedOK, executionErr, cleanup)
 	})
 }
 
-func (process *Process) finish(ctx context.Context, exit command.ExitObservation, verified custodian.VerifiedQuiescence, contained bool, verifiedOK bool, reconcileErr error) {
+func (process *Process) finish(ctx context.Context, exit command.ExitObservation, verified custodian.VerifiedQuiescence, contained bool, verifiedOK bool, executionErr error, cleanup custodian.CleanupStatus) {
 	result := Result{
 		Context:   process.context,
 		Group:     process.group,
 		Grant:     process.grant,
 		Exit:      exit,
 		Verified:  verified,
+		Cleanup:   cleanup,
 		Contained: contained,
 	}
-	finalErr := reconcileErr
 	if verifiedOK {
 		state := <-process.releaseState
 		result.ReleaseRecorded = state.record
@@ -901,40 +914,53 @@ func (process *Process) finish(ctx context.Context, exit command.ExitObservation
 			process.requestFailClosed(err)
 		}
 		if process.failClosedReason() != nil && !result.Contained {
-			verifiedOK = process.containFinalResult(ctx, &result, &finalErr)
+			verifiedOK = process.containFinalResult(ctx, &result, &executionErr)
 		}
 		if !state.record {
-			finalErr = errors.Join(finalErr, ErrReleaseRecordUnavailable, state.err)
+			executionErr = errors.Join(executionErr, ErrReleaseRecordUnavailable, state.err)
 		} else if verifiedOK {
 			outcome, err := process.controller.RecordQuiescence(ctx, process.context, result.Verified)
 			if mapped := durableMutationError("record_quiescence", outcome, err); mapped != nil {
-				finalErr = errors.Join(finalErr, mapped)
-				process.containFinalResult(ctx, &result, &finalErr)
+				executionErr = errors.Join(executionErr, mapped)
+				process.containFinalResult(ctx, &result, &executionErr)
 				process.requestFailClosed(mapped)
 			} else if err := inject(process.failures, FailAfterRecordQuiescence); err != nil {
-				finalErr = errors.Join(finalErr, err)
-				process.containFinalResult(ctx, &result, &finalErr)
+				executionErr = errors.Join(executionErr, err)
+				process.containFinalResult(ctx, &result, &executionErr)
 				process.requestFailClosed(err)
 			}
 		}
 	}
 	if reason := process.failClosedReason(); reason != nil {
-		finalErr = errors.Join(finalErr, reason, process.failStop(ctx, errors.Join(reason, finalErr)), ErrFailClosed)
+		executionErr = errors.Join(executionErr, reason, process.failStop(ctx, errors.Join(reason, executionErr)), ErrFailClosed)
 	}
+	result.ExecutionErr = executionErr
+	finalErr := errors.Join(executionErr, result.Cleanup.Err)
 	process.setFinal(result, finalErr)
 }
 
 func (process *Process) containFinalResult(ctx context.Context, result *Result, finalErr *error) bool {
 	verified, cleanup, containErr := process.running.ContainAndVerify(ctx, custodian.QuiescenceCauseContain)
+	executionErr, cleanupErr := splitContainmentErr(containErr)
+	result.Cleanup.Err = errors.Join(result.Cleanup.Err, cleanup.Err, cleanupErr)
 	if containErr != nil {
 		result.Contained = false
-		*finalErr = errors.Join(*finalErr, containErr)
+		*finalErr = errors.Join(*finalErr, executionErr)
 		return false
 	}
 	result.Verified = verified
 	result.Contained = true
-	*finalErr = errors.Join(*finalErr, cleanup.Err)
 	return true
+}
+
+func splitContainmentErr(err error) (error, error) {
+	if err == nil {
+		return nil, nil
+	}
+	if custodian.IsCleanupUnresolved(err) || errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved) {
+		return nil, err
+	}
+	return err, nil
 }
 
 func (process *Process) requestFailClosed(reason error) {

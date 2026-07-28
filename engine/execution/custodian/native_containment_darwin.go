@@ -97,6 +97,10 @@ func (backend *leaderNativeContainmentBackend) leaderRetention() *leaderRetentio
 	return backend.retention
 }
 
+func (backend *leaderNativeContainmentBackend) abandon(ctx context.Context) error {
+	return backend.close(ctx)
+}
+
 func (backend *leaderNativeContainmentBackend) close(context.Context) error {
 	if backend == nil || backend.retention == nil {
 		return nil

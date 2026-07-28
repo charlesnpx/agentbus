@@ -818,6 +818,10 @@ func (backend *fakeNativeHeldBackend) leaderRetention() *leaderRetention {
 	return nil
 }
 
+func (backend *fakeNativeHeldBackend) abandon(ctx context.Context) error {
+	return backend.close(ctx)
+}
+
 func (backend *fakeNativeHeldBackend) close(context.Context) error {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()

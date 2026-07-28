@@ -122,6 +122,10 @@ type admissionActiveCustodyReporter interface {
 	HasActiveCustodies() bool
 }
 
+type admissionUnresolvedCustodyAbandoner interface {
+	AbandonUnresolvedCustody(context.Context, model.GroupRef) error
+}
+
 func (s *servedAdmissionRuntime) hasActiveCustodies() bool {
 	if s == nil {
 		return false
@@ -133,6 +137,22 @@ func (s *servedAdmissionRuntime) hasActiveCustodies() bool {
 		return true
 	}
 	return false
+}
+
+func (s *servedAdmissionRuntime) abandonUnresolvedCustody(ctx context.Context, group model.GroupRef) error {
+	if s == nil {
+		return nil
+	}
+	var err error
+	if abandoner, ok := s.launchCustodian.(admissionUnresolvedCustodyAbandoner); ok {
+		err = errors.Join(err, abandoner.AbandonUnresolvedCustody(ctx, group))
+	}
+	if process := s.runtime.Process(); process != nil {
+		if abandoner, ok := process.(admissionUnresolvedCustodyAbandoner); ok {
+			err = errors.Join(err, abandoner.AbandonUnresolvedCustody(ctx, group))
+		}
+	}
+	return err
 }
 
 func (s *servedAdmissionRuntime) close() error {
@@ -477,12 +497,20 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		return err
 	}
 	if snapshot.Record.Terminal != nil {
+		if model.DeriveCleanupDisposition(snapshot.Record) == model.CleanupDispositionUnresolved {
+			if err := s.abandonAdmissionRecordUnresolvedCustody(context.Background(), snapshot.Record); err != nil {
+				log.Printf("agentbus daemon: job %s unresolved custody abandon warning: %v", jobID, err)
+			}
+		}
 		return nil
 	}
 	if admissionRunHasRequestedCancel(run, state) {
 		if err := coord.Cancel(context.Background(), jobID, nil); err != nil {
-			return reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err)
+			if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
+				return err
+			}
 		}
+		s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
 		return nil
 	}
 	outcome, ok := admissionOutcomeForState(state)
@@ -494,14 +522,58 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 			return err
 		}
 		if err := coord.Finalize(context.Background(), jobID, intent); err != nil {
-			return reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err)
+			if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
+				return err
+			}
 		}
+		s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
 		return nil
 	}
 	if err := coord.Complete(context.Background(), jobID, outcome, []byte(text), nil); err != nil {
-		return reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err)
+		if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
+			return err
+		}
 	}
+	s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
 	return nil
+}
+
+func (s *Server) abandonAdmissionUnresolvedCustody(ctx context.Context, coord *admissionCoordinator, jobID model.JobID) {
+	if coord == nil {
+		return
+	}
+	snapshot, err := coord.Snapshot(ctx, jobID)
+	if err != nil {
+		log.Printf("agentbus daemon: job %s unresolved custody abandon skipped after terminal commit: snapshot failed: %v", jobID, err)
+		return
+	}
+	if model.DeriveCleanupDisposition(snapshot.Record) != model.CleanupDispositionUnresolved {
+		return
+	}
+	if err := s.abandonAdmissionRecordUnresolvedCustody(ctx, snapshot.Record); err != nil {
+		log.Printf("agentbus daemon: job %s unresolved custody abandon warning: %v", jobID, err)
+	}
+}
+
+func (s *Server) abandonAdmissionRecordUnresolvedCustody(ctx context.Context, record model.SafetyRecord) error {
+	if record.Terminal == nil {
+		return nil
+	}
+	s.admissionStateMu.RLock()
+	runtime := s.admissionRuntime
+	s.admissionStateMu.RUnlock()
+	if runtime == nil {
+		return nil
+	}
+	var err error
+	for _, ordinal := range record.Attempt.Launches.FilledOrdinals() {
+		launchRecord, ok := record.Attempt.Launches.Get(ordinal)
+		if !ok || launchRecord.Group == nil || launchRecord.Quiescence != nil {
+			continue
+		}
+		err = errors.Join(err, runtime.abandonUnresolvedCustody(ctx, *launchRecord.Group))
+	}
+	return err
 }
 
 func reconcileAdmissionFinalizationContention(ctx context.Context, coord *admissionCoordinator, jobID model.JobID, err error) error {

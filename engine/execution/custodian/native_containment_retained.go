@@ -193,6 +193,15 @@ func verifyRetainedPlacementProcess(expected procgroup.ProcessClaim) error {
 	return nil
 }
 
+func (backend *retainedNativeContainmentBackend) abandon(context.Context) error {
+	if backend == nil || backend.capability == nil {
+		return nil
+	}
+	capability := backend.capability
+	backend.capability = nil
+	return capability.Release()
+}
+
 func (backend *retainedNativeContainmentBackend) close(ctx context.Context) error {
 	if backend == nil || backend.capability == nil {
 		return nil

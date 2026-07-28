@@ -44,3 +44,13 @@ type RunningCommand interface {
 	Wait(context.Context) (ExitObservation, error)
 	Interrupt(context.Context) error
 }
+
+type FinalObservation struct {
+	Exit         ExitObservation
+	ExecutionErr error
+	CleanupErr   error
+}
+
+type FinalObserver interface {
+	FinalObservation(context.Context) (FinalObservation, error)
+}

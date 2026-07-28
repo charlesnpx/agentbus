@@ -132,6 +132,7 @@ type nativeContainmentBackend interface {
 	monitorLeafFile(context.Context) (*os.File, error)
 	attachHandle(*parklaunch.ParkedHandle)
 	leaderRetention() *leaderRetention
+	abandon(context.Context) error
 	close(context.Context) error
 }
 
@@ -263,6 +264,17 @@ func (custodian *NativeCustodian) ActiveCustodyCount() int {
 		}
 	}
 	return count
+}
+
+func (custodian *NativeCustodian) AbandonUnresolvedCustody(ctx context.Context, group model.GroupRef) error {
+	if custodian == nil {
+		return nil
+	}
+	running := custodian.lookup(group)
+	if running == nil {
+		return nil
+	}
+	return running.AbandonUnresolvedCustody(ctx)
 }
 
 func (custodian *NativeCustodian) Prepare(ctx context.Context, execSpec command.ExecSpec, key model.LaunchKey) (PreparedProcess, error) {
@@ -702,6 +714,8 @@ type NativeRunningProcess struct {
 	finalExit    command.ExitObservation
 	finalWaitErr error
 	finalErr     error
+	abandoned    bool
+	abandonErr   error
 
 	finalAttestationAttempted bool
 	finalAttestation          VerifiedQuiescence
@@ -921,6 +935,98 @@ func (process *NativeRunningProcess) ContainAndVerify(ctx context.Context, cause
 	return attestPhysicalOutcome(process.custodian.issuer, outcome)
 }
 
+func (process *NativeRunningProcess) AbandonUnresolvedCustody(ctx context.Context) error {
+	if process == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	process.lifecycleMu.Lock()
+	if process.abandoned {
+		err := process.abandonErr
+		process.lifecycleMu.Unlock()
+		return err
+	}
+	process.abandoned = true
+	var err error
+	if !process.finalized {
+		err = errors.Join(err, process.abandonLocalCustodyHandlesLocked(ctx))
+	}
+	process.abandonErr = err
+	group := process.group
+	custodian := process.custodian
+	process.lifecycleMu.Unlock()
+	if custodian != nil {
+		custodian.forget(group)
+	}
+	return err
+}
+
+func (process *NativeRunningProcess) abandonLocalCustodyHandlesLocked(ctx context.Context) error {
+	var cleanupErr error
+	if process.handle != nil {
+		cleanupErr = errors.Join(cleanupErr, closeNativeProcessFiles(process.handle))
+		if process.handle.Monitor != nil {
+			cleanupErr = errors.Join(cleanupErr, abandonNativeMonitor(process.handle.Monitor, process.group))
+		}
+	}
+	if process.containment != nil {
+		cleanupErr = errors.Join(cleanupErr, process.containment.abandon(ctx))
+	} else if process.leader != nil {
+		cleanupErr = errors.Join(cleanupErr, process.leader.close())
+	}
+	return cleanupErr
+}
+
+func abandonNativeMonitor(monitor *parklaunch.MonitorProcess, group model.GroupRef) error {
+	if monitor == nil {
+		return nil
+	}
+	select {
+	case <-monitor.Done():
+		_ = monitor.Wait()
+	default:
+		if err := validateNativeMonitorForAbandon(monitor, group); err != nil {
+			return err
+		}
+		killErr := syscall.Kill(monitor.PID, syscall.SIGKILL)
+		waitErr := monitor.Wait()
+		if killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+			return errors.Join(killErr, waitErr)
+		}
+	}
+	if monitor.DaemonControlWrite == nil {
+		return nil
+	}
+	err := closeNativeProcessFile(monitor.DaemonControlWrite)
+	monitor.DaemonControlWrite = nil
+	return err
+}
+
+func validateNativeMonitorForAbandon(monitor *parklaunch.MonitorProcess, group model.GroupRef) error {
+	if monitor.PID <= 0 {
+		return fmt.Errorf("%w: monitor pid is not valid for unresolved custody abandon", ErrNativeCustodianUnavailable)
+	}
+	if group.Monitor.PID == 0 || group.Monitor.HighResStartToken == "" {
+		return nil
+	}
+	if monitor.PID != group.Monitor.PID {
+		return fmt.Errorf("%w: monitor pid mismatch during unresolved custody abandon", ErrNativeCustodianUnavailable)
+	}
+	claim, err := procgroup.ReadProcessClaim(monitor.PID)
+	if err != nil {
+		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, unix.ESRCH) || errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	if claim.PID != group.Monitor.PID || claim.StartToken.String() != group.Monitor.HighResStartToken {
+		return fmt.Errorf("%w: monitor identity changed before unresolved custody abandon", ErrNativeCustodianUnavailable)
+	}
+	return nil
+}
+
 func (process *NativeRunningProcess) containAndVerify(ctx context.Context) PhysicalOutcome {
 	if process == nil {
 		return unprovablePhysical(model.GroupRef{}, containment.ReasonInvalidInput, "", fmt.Errorf("%w: running process is nil", ErrNativeCustodianUnavailable))
@@ -930,6 +1036,9 @@ func (process *NativeRunningProcess) containAndVerify(ctx context.Context) Physi
 	}
 	process.lifecycleMu.Lock()
 	defer process.lifecycleMu.Unlock()
+	if process.abandoned {
+		return unprovablePhysical(process.group, containment.ReasonObservationFailed, model.Unprovable, fmt.Errorf("%w: unresolved custody abandoned", ErrNativeCustodianUnavailable))
+	}
 	if process.finalized {
 		return process.finalOutcome
 	}
@@ -1164,6 +1273,19 @@ func (process *NativeRunningProcess) cacheFinalLocked(ctx context.Context, outco
 	if process.finalized {
 		return process.finalOutcome, process.finalErr
 	}
+	cleanupErr := process.closeLocalCustodyHandlesLocked(ctx)
+	process.finalized = true
+	process.finalOutcome = outcome
+	process.finalExit = exit
+	process.finalWaitErr = waitErr
+	process.finalErr = cleanupErr
+	if process.custodian != nil {
+		process.custodian.cacheFinalized(process)
+	}
+	return outcome, cleanupErr
+}
+
+func (process *NativeRunningProcess) closeLocalCustodyHandlesLocked(ctx context.Context) error {
 	var cleanupErr error
 	if process.handle != nil {
 		cleanupErr = errors.Join(cleanupErr, closeNativeProcessFiles(process.handle))
@@ -1179,15 +1301,7 @@ func (process *NativeRunningProcess) cacheFinalLocked(ctx context.Context, outco
 	if process.containment != nil {
 		cleanupErr = errors.Join(cleanupErr, process.containment.close(ctx))
 	}
-	process.finalized = true
-	process.finalOutcome = outcome
-	process.finalExit = exit
-	process.finalWaitErr = waitErr
-	process.finalErr = cleanupErr
-	if process.custodian != nil {
-		process.custodian.cacheFinalized(process)
-	}
-	return outcome, cleanupErr
+	return cleanupErr
 }
 
 func (process *NativeRunningProcess) finalAttestationLocked() (VerifiedQuiescence, CleanupStatus, error) {

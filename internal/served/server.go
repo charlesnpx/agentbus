@@ -341,6 +341,10 @@ func (j *activeJob) interruptAdmissionCommand(ctx context.Context) error {
 	return cmd.Interrupt(ctx)
 }
 
+func admissionPhysicalCleanupUncertain(err error) bool {
+	return custodian.IsCleanupUnresolved(err) || errors.Is(err, custodian.ErrRetainedObjectReacquireUnresolved)
+}
+
 type requestOutcome struct {
 	result       any
 	err          *protocol.ErrorObject
@@ -943,7 +947,11 @@ func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context, admission *
 			if err := s.requestActiveJobShutdownCancel(ctx, id.String()); err != nil {
 				return err
 			}
-			return coord.Cancel(ctx, id, nil)
+			if err := coord.Cancel(ctx, id, nil); err != nil {
+				return err
+			}
+			s.abandonAdmissionUnresolvedCustody(ctx, coord, id)
+			return nil
 		})
 		if err != nil {
 			return err
@@ -1005,7 +1013,9 @@ func (s *Server) requestActiveJobShutdownCancel(ctx context.Context, jobID strin
 	}
 	active.requestTerminal(engine.StateCanceled)
 	if err := active.interruptAdmissionCommand(ctx); err != nil {
-		return err
+		if !admissionPhysicalCleanupUncertain(err) {
+			return err
+		}
 	}
 	if active.cancel != nil {
 		active.cancel()
@@ -2168,7 +2178,9 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 		err := active.interruptAdmissionCommand(interruptCtx)
 		interruptCancel()
 		if err != nil {
-			return requestOutcome{err: admissionProtocolError(err)}
+			if !admissionPhysicalCleanupUncertain(err) {
+				return requestOutcome{err: admissionProtocolError(err)}
+			}
 		}
 	}
 	record, projection, ok, errObj := s.authorityJobProjection(jobID)
@@ -2180,7 +2192,12 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	}
 	if record.Terminal == nil {
 		err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
-			return coord.Cancel(context.Background(), model.JobID(jobID), nil)
+			modelJobID := model.JobID(jobID)
+			if err := coord.Cancel(context.Background(), modelJobID, nil); err != nil {
+				return err
+			}
+			s.abandonAdmissionUnresolvedCustody(context.Background(), coord, modelJobID)
+			return nil
 		})
 		if err != nil {
 			var reloadErr *protocol.ErrorObject
@@ -2190,9 +2207,15 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 					if validErr := admissionValidTerminalRecord(record); validErr != nil {
 						return requestOutcome{err: s.failStopAdmissionFinalizationReconcile(jobID, errors.Join(err, validErr))}
 					}
+					if abandonErr := s.abandonAdmissionRecordUnresolvedCustody(context.Background(), record); abandonErr != nil {
+						log.Printf("agentbus daemon: job %s unresolved custody abandon warning: %v", jobID, abandonErr)
+					}
 					return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
 				}
 				if admissionRecordTerminalCanceledByRequest(record) {
+					if abandonErr := s.abandonAdmissionRecordUnresolvedCustody(context.Background(), record); abandonErr != nil {
+						log.Printf("agentbus daemon: job %s unresolved custody abandon warning: %v", jobID, abandonErr)
+					}
 					return requestOutcome{result: protocol.JobCancelResult{JobID: projection.JobID.String(), State: admissionState(projection.Public)}}
 				}
 			}
