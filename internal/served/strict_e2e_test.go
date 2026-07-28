@@ -323,9 +323,11 @@ func waitProductionStrictAdmissionTerminalFromRepository(t *testing.T, stateRoot
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var last model.SafetyRecord
+	var lastOpenErr error
 	for time.Now().Before(deadline) {
 		repo, err := bboltrepo.OpenExistingReadOnly(filepath.Join(stateRoot, admissionRepositoryFile))
 		if err == nil {
+			lastOpenErr = nil
 			record := loadAuthoritySafetyRecordFromRepository(t, repo, jobID)
 			if closeErr := repo.Close(); closeErr != nil {
 				t.Fatal(closeErr)
@@ -334,10 +336,12 @@ func waitProductionStrictAdmissionTerminalFromRepository(t *testing.T, stateRoot
 			if record.Terminal != nil {
 				return record
 			}
+		} else {
+			lastOpenErr = err
 		}
 		time.Sleep(servedNativeConformancePollInterval)
 	}
-	t.Fatalf("admission safety record %s did not reach terminal after %s; last = %+v", jobID, timeout, last)
+	t.Fatalf("admission safety record %s did not reach terminal after %s; last = %+v; last open error = %v", jobID, timeout, last, lastOpenErr)
 	return model.SafetyRecord{}
 }
 

@@ -235,7 +235,11 @@ func TestProductionStrictJobCLIStatusResultCancelE2B(t *testing.T) {
 		t.Fatalf("cli status after autostart = %+v", cliStatus)
 	}
 	autostartPID := readProductionStrictPIDFileE2B(t, stateRoot)
+	autostartStopped := false
 	t.Cleanup(func() {
+		if autostartStopped {
+			return
+		}
 		_ = syscall.Kill(autostartPID, syscall.SIGKILL)
 		assertProductionStrictPIDAbsentE2B(t, autostartPID, 5*time.Second)
 	})
@@ -274,6 +278,15 @@ func TestProductionStrictJobCLIStatusResultCancelE2B(t *testing.T) {
 		t.Fatalf("canceled cli result = %+v", canceledResult)
 	}
 	executions := waitServedNativeCodexExecutions(t, fixture, 2, 10*time.Second)
+	if err := secondClient.Close(); err != nil {
+		t.Fatalf("second client close before repository read: %v", err)
+	}
+	if err := syscall.Kill(autostartPID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("kill autostart daemon before repository read: %v", err)
+	}
+	assertProductionStrictPIDAbsentE2B(t, autostartPID, 5*time.Second)
+	autostartStopped = true
+
 	canceledRecord := waitProductionStrictAdmissionTerminalFromRepository(t, stateRoot, running.JobID, 5*time.Second)
 	canceledProof := assertServedNativeIdentifiedTerminal(t, canceledRecord, model.OutcomeCanceled)
 	assertServedNativeExecutionMetadata(t, executions[1], *canceledProof.Group, false)
