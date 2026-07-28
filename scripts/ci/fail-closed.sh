@@ -26,31 +26,31 @@ run() {
   "$@"
 }
 
-assert_empty_state_root() {
-  local state_root=$1
-  local residue
-  if [[ ! -d "$state_root" ]]; then
-    return 0
-  fi
-  residue=$(find "$state_root" -mindepth 1 -maxdepth 4 -print | sort)
-  if [[ -n "$residue" ]]; then
-    printf 'fail-closed: state root mutated after typed unsupported failure; forbidden residue:\n%s\n' "$residue" >&2
+assert_process_absent() {
+  local pid=$1
+  local attempts=0
+  while kill -0 "$pid" >/dev/null 2>&1 && ((attempts < 100)); do
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    printf 'fail-closed: process %s is still present\n' "$pid" >&2
     return 1
   fi
 }
 
 run_darwin() {
-  run go test ./internal/agentbusserve ./client ./internal/cgroup ./engine/execution/custodian -run 'Test(ProductionStrictServeFailsTypedOnDarwin|ProductionServeLauncherUnsupportedLeavesFreshRootAbsentOnDarwin|ProductionServeLauncherUnsupportedLeavesExistingRootPermissionsOnDarwin|ProductionRecoverCLIUnsupportedLeavesExistingRootEmptyOnDarwin|ConnectAutostartRealUnsupportedHostSurfacesLauncherDiagnosticOnDarwin|DarwinNewFailsClosed|NewNativeRuntimeDarwinUnsupported)' -count=1
-  run env AGENTBUS_RUN_STRICT_E2E=1 go test -tags abd_strict_e2e ./internal/served -run TestProductionStrictCLINoDaemonUnsupportedHostDarwinE2B -count=1
+  run go test ./internal/agentbusserve ./engine/execution/custodian -run 'Test(ProductionServedConfigSelectsNativeStrictRuntime|ProductionStrictServePreflightPassesOnDarwin|ProductionServeLauncherServesOnDarwinFreshRoot|ProductionServeLauncherServesFromExistingRootOnDarwin|ProductionRecoverCLIReportsRootMissingOnDarwin|NewNativeRuntimeDarwinQualifiesAfterSelfTest)' -count=1
+  run env AGENTBUS_RUN_STRICT_E2E=1 go test -tags abd_strict_e2e ./internal/served -run 'Test(ProductionStrictServe|ProductionStrictCLINoDaemonAutostartsDarwinE2B|ProductionStrictJobCLIStatusResultCancelE2B|ProductionStrictSIGTERMMidJobGracefulShutdownE2B|ProductionStrictCLIOrphanedExitCodeE2B|ServedStrictCompositionIdentifiedSubmitReplayConformance|ServedStrictCompositionCancellationConformance|ServedStrictCompositionDaemonSIGKILLRestartRecoveryConformance|ServedStrictCompositionReleaseAckLossConformance)' -count=1
 }
 
 run_linux_restricted() {
-  local stage bin state_root stdout stderr pid code attempts version
+  local stage bin state_root stdout stderr pid code version
   if [[ "$(go env GOOS)" != "linux" ]]; then
     printf 'fail-closed: linux-restricted mode requires GOOS=linux, got %s\n' "$(go env GOOS)" >&2
     exit 2
   fi
-  run go test ./internal/cgroup ./internal/served ./internal/agentbusserve -run 'Test(ProbeClassifiesStrictSupportAndUnsupportedConditions|DefaultStrictServeRejectsUnavailableRuntimeBeforeListen|StrictRequestedUnavailableRuntimeFailsStartupWithSupportDiagnostic|BootstrapAdmissionStrictRuntimeFailurePrecedesRepositoryOpen|ProductionServedConfigSelectsNativeStrictRuntime)' -count=1
+  run go test ./engine/execution/custodian ./internal/served ./internal/agentbusserve -run 'Test(LinuxNativeContainmentBackendSelection|NativeCgroupConstructionFallbackClassification|DefaultStrictServeRejectsUnavailableRuntimeBeforeListen|StrictRequestedUnavailableRuntimeFailsStartupWithSupportDiagnostic|BootstrapAdmissionStrictRuntimeFailurePrecedesRepositoryOpen|ProductionServedConfigSelectsNativeStrictRuntime|ActivatedBboltV1RootFailsTypedBeforeSocketBindAndLeavesFileUntouched)' -count=1
 
   stage=$(mktemp -d "${TMPDIR:-/tmp}/agentbus-fail-closed.XXXXXX")
   bin="$stage/agentbus"
@@ -58,38 +58,37 @@ run_linux_restricted() {
   stdout="$stage/stdout.log"
   stderr="$stage/stderr.log"
   version=$(tr -d '[:space:]' <"$ROOT/VERSION")
+  mkdir -p -- "$stage/no-backends" "$stage/home"
   run go build -trimpath -ldflags "-X main.version=$version" -o "$bin" ./cmd/agentbus
-  mkdir -p -- "$state_root"
 
-  printf '\n==> restricted Linux exact-binary strict unsupported smoke\n'
+  printf '\n==> restricted Linux exact-binary process-group fallback smoke\n'
   set +e
-  PATH="$stage/no-backends" AGENTBUS_STATE_ROOT="$state_root" "$bin" serve --foreground >"$stdout" 2>"$stderr" &
-  pid=$!
-  attempts=0
-  while kill -0 "$pid" >/dev/null 2>&1 && ((attempts < 100)); do
-    sleep 0.1
-    attempts=$((attempts + 1))
-  done
-  if kill -0 "$pid" >/dev/null 2>&1; then
-    kill -TERM "$pid" >/dev/null 2>&1 || true
-    wait "$pid" >/dev/null 2>&1
-    set -e
-    printf 'fail-closed: restricted Linux strict serve unexpectedly stayed up; use the privileged lane for serving checks\n' >&2
-    rm -rf -- "$stage"
-    return 1
-  fi
-  wait "$pid"
+  PATH="$stage/no-backends" HOME="$stage/home" AGENTBUS_STATE_ROOT="$state_root" "$bin" status --job job_linux_fallback --json >"$stdout" 2>"$stderr"
   code=$?
   set -e
-  if [[ "$code" -eq 0 ]] || ! grep -q 'strict admission support unavailable' "$stderr"; then
-    printf 'fail-closed: restricted Linux smoke exit=%d, want strict fail-closed diagnostic\nstdout=%s\nstderr=%s\n' "$code" "$(cat "$stdout")" "$(cat "$stderr")" >&2
+  if [[ "$code" -ne 10 ]]; then
+    printf 'fail-closed: restricted Linux fallback smoke exit=%d, want unknown-job exit 10 from a serving daemon\nstdout=%s\nstderr=%s\n' "$code" "$(cat "$stdout")" "$(cat "$stderr")" >&2
     rm -rf -- "$stage"
     return 1
   fi
-  if ! assert_empty_state_root "$state_root"; then
+  if grep -q 'strict admission support unavailable' "$stderr"; then
+    printf 'fail-closed: restricted Linux fallback smoke reported strict support unavailable\nstdout=%s\nstderr=%s\n' "$(cat "$stdout")" "$(cat "$stderr")" >&2
     rm -rf -- "$stage"
     return 1
   fi
+  if [[ ! -s "$state_root/agentbus.pid" || ! -S "$state_root/agentbus.sock" || ! -s "$state_root/token" || ! -s "$state_root/admission.bbolt" || ! -s "$state_root/admission-anchor.json" ]]; then
+    printf 'fail-closed: restricted Linux fallback did not leave a serving state root\nstdout=%s\nstderr=%s\nstate entries:\n%s\n' "$(cat "$stdout")" "$(cat "$stderr")" "$(find "$state_root" -mindepth 1 -maxdepth 1 -print | sort)" >&2
+    rm -rf -- "$stage"
+    return 1
+  fi
+  pid=$(tr -d '[:space:]' <"$state_root/agentbus.pid")
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    printf 'fail-closed: restricted Linux fallback daemon pid %s is not alive\nstdout=%s\nstderr=%s\n' "$pid" "$(cat "$stdout")" "$(cat "$stderr")" >&2
+    rm -rf -- "$stage"
+    return 1
+  fi
+  kill -TERM "$pid" >/dev/null 2>&1 || true
+  assert_process_absent "$pid"
   rm -rf -- "$stage"
 }
 

@@ -6,8 +6,8 @@ Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/
 
 STATUS (AB-F): IN PROGRESS (started 2026-07-27). Custody de-escalation — one weaker cross-platform
 contract; delete the universal proof obligation, retain the Linux cgroup mechanism as an
-implementation detail. 7 sequential units U1->U7 (session tasks #17-#23). U1 (normative contract,
-ADR-13) IN PROGRESS. Plan: ~/.claude/plans/modular-splashing-falcon.md. Binding invariants: (1)
+implementation detail. 7 sequential units U1->U7 (session tasks #17-#23). U1->U6 merged; U7 is
+cross-platform closure plus docs/CI reconciliation. Plan: ~/.claude/plans/modular-splashing-falcon.md. Binding invariants: (1)
 outcome and cleanup are independent axes — OutcomeOrphaned only for UNKNOWN outcome; (2) only typed
 physical uncertainty -> job-local `unresolved`, integrity/ownership stays fatal; (3) root activation
 kept, contract version 1->2; (4) containment selected per launch, cgroups optional, baseline verified
@@ -23,8 +23,9 @@ gate runs a REAL identified job end-to-end through the production binary on Linu
 (sentinel `strict_admission_real_job_end_to_end`), with byte-identical replay, exactly-once
 execution, persisted IdentifiedFenced proof, protocol-correct inline results, and
 independent-oracle containment. Version 0.6.0. The R6/R7A+R7B gate arc found and fixed FIVE
-production defects that no unit test caught. Darwin/unsupported platforms fail closed typed. AB-E
-later removed the legacy/default admission split; current production `agentbus serve` is strict-only.
+production defects that no unit test caught. ADR-13 later made macOS and Linux process-group fallback
+supported serving lanes; only hosts without basic supervision fail closed typed. AB-E later removed the
+legacy/default admission split; current production `agentbus serve` is strict-only.
 
 ## Repo / branch
 - Working branch `abd-authority` reset to `4a8f59d` (S5A capability-off checkpoint; reviewed clean).

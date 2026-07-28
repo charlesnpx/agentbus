@@ -23,10 +23,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macOS typed unsupported
+          - name: macOS supported process-group custody
             runner: macos-15
             mode: darwin
-          - name: Linux restricted typed unsupported
+          - name: Linux restricted process-group fallback
             runner: ubuntu-24.04
             mode: linux-restricted
     steps:
@@ -37,5 +37,5 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
-      - name: Fail-closed gate
+      - name: Custody platform gate
         run: scripts/ci/fail-closed.sh "${{ matrix.mode }}"

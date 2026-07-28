@@ -2,6 +2,7 @@ package served
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -11,6 +12,32 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 )
+
+func TestAdmissionRecoveryReportJSONIncludesADR13Counters(t *testing.T) {
+	report := AdmissionRecoveryReport{
+		Mode:               AdmissionRecoveryOnly.String(),
+		WorkItems:          1,
+		QuiescedLaunches:   2,
+		FinalizedJobs:      3,
+		OrphanedJobs:       4,
+		UnresolvedLaunches: 5,
+		CleanupWarnings:    0,
+		RecoveryPasses:     6,
+	}
+	raw, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"orphanedJobs", "unresolvedLaunches", "cleanupWarnings"} {
+		if _, ok := fields[field]; !ok {
+			t.Fatalf("recovery report JSON = %s, missing %s", raw, field)
+		}
+	}
+}
 
 func TestAdmissionRecoveryRejectsContradictoryGroupRefAsFatalIntegrity(t *testing.T) {
 	base := admissionRecoveryTestWorkItem()

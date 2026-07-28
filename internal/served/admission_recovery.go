@@ -35,7 +35,7 @@ type AdmissionRecoveryReport struct {
 	FinalizedJobs      int    `json:"finalizedJobs"`
 	OrphanedJobs       int    `json:"orphanedJobs"`
 	UnresolvedLaunches int    `json:"unresolvedLaunches"`
-	CleanupWarnings    int    `json:"cleanupWarnings,omitempty"`
+	CleanupWarnings    int    `json:"cleanupWarnings"`
 	RecoveryPasses     int    `json:"recoveryPasses"`
 }
 

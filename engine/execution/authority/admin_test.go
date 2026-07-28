@@ -1031,6 +1031,42 @@ func TestSealRefusesNonterminalObligations(t *testing.T) {
 	}
 }
 
+func TestSealAllowsTerminalOrphanedUnresolvedHistory(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, session := beginBboltAdmissionRoot(t, root, "seal-terminal-orphaned")
+	if _, _, err := session.ActivateRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := session.SealReady(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "seal-terminal-orphaned"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := terminalizeOrphanedUnresolvedForTest(t, ctx, ready, accepted)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeOrphaned {
+		t.Fatalf("terminal = %+v, want orphaned", record.Terminal)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := SealAdmissionRoot(ctx, root, SealOptions{
+		StartNewAuthorityDomain:       true,
+		AcknowledgeReplayHistoryReset: true,
+		NewStateRoot:                  filepath.Join(t.TempDir(), "new-domain"),
+	})
+	if err != nil {
+		t.Fatalf("seal terminal orphaned root: %v", err)
+	}
+	if !report.OldRootSealed || !report.OldInspection.Sealed {
+		t.Fatalf("seal report = %+v, want old root sealed", report)
+	}
+}
+
 func TestSealAndInspectSurfaceCorruptSafetyStats(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

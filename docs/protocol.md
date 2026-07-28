@@ -206,12 +206,17 @@ normally see `root_fail_stopped`.
 | `unsupported_backend` | `backend_unavailable` | The requested backend name is not available in strict admission. |
 | `unfenceable_backend` | `capability_missing` | The backend exists but cannot satisfy strict fencing or containment. |
 | `invalid_strict_config` | `invalid_task_spec` | The strict task configuration is malformed or incompatible. |
-| `unavailable_native_runtime` | `capability_missing` | Native strict runtime support is unavailable, route-disabled, or not ready. |
+| `unavailable_native_runtime` | `capability_missing` | The host cannot provide basic controlled process supervision: process groups, identity/start-token observation, TERM/KILL/wait, and a controlled runner. Lack of Linux cgroup v2 alone is not this cause. |
 | `root_corrupt` | `backend_unavailable` | The authority root has detected repository, anchor, or integrity corruption. |
 | `root_identity_mismatch` | `backend_unavailable` | Repository and anchor identities disagree. In current served startup this is a pre-socket failure surfaced through the launcher, not a normal JSON-RPC response. |
 | `root_fail_stopped` | `backend_unavailable` | The authority root or served safety latch is fail-stopped. |
 | `root_sealed` | `capability_missing` | The authority root is sealed and cannot serve admission. Current production startup normally reports this before socket readiness. |
 | `admission_closing` | `capability_missing` | The daemon is gracefully shutting down and no longer accepts admission. |
+
+These 13 cause strings are stable. Under contract version 2,
+`unavailable_native_runtime` is intentionally narrow: it means no basic
+supervision substrate is available, not that Linux cgroup v2 is absent or
+undelegated.
 
 ## `job.submit`
 
@@ -414,7 +419,7 @@ and `all` is ignored.
 Result:
 
 ```json
-{"jobs":[{"jobId":"job_...","sessionId":"ses_...","state":"running"}]}
+{"jobs":[{"jobId":"job_...","sessionId":"ses_...","state":"completed","cleanupDisposition":"verified_absent"}]}
 ```
 
 The served v2 path is authority-only. It does not fall back to legacy JSON job
@@ -423,6 +428,12 @@ While authority lookup is healthy, unknown or malformed job IDs that do not
 resolve to an authority job return `unknown_job` with `jobId` in `error.data`.
 During fail-stop, a syntactically valid absent ID can return
 `root_fail_stopped` before absence can be established.
+
+`cleanupDisposition` is an additive machine-readable field derived from the
+authority terminal record plus per-launch quiescence. Values are
+`no_execution_possible`, `verified_absent`, and `unresolved`. It is present for
+authority statuses when the disposition can be derived; it is not physical proof
+serialization.
 
 ## `job.result`
 
@@ -439,6 +450,7 @@ Result:
   "jobId": "job_...",
   "sessionId": "ses_...",
   "state": "completed",
+  "cleanupDisposition": "verified_absent",
   "result": {
     "text": "final text",
     "resultPath": "/home/me/.local/state/agentbus/workspaces/.../results/job_....txt",
@@ -448,9 +460,9 @@ Result:
 }
 ```
 
-`job.result` is authority-only. The public state and result metadata are derived
-from the authority terminal record. Physical terminal proof serialization is
-not exposed in protocol v2.
+`job.result` is authority-only. The public state, result metadata, and
+`cleanupDisposition` are derived from the authority terminal record. Physical
+terminal proof serialization is not exposed in protocol v2.
 
 For completed terminal outcomes, the authority terminal record contains a
 certified result reference. The server returns `resultPath`, `sha256`, and
@@ -517,6 +529,7 @@ interrupted
 canceled
 reaped
 quarantined
+orphaned
 ```
 
 The CLI maps single-job `status`, `result`, and `cancel` outcomes as follows.
@@ -525,7 +538,7 @@ In-band JSON-RPC errors from a running daemon are included where noted:
 | Condition | Exit code |
 | --- | ---: |
 | `completed` | 0 |
-| any non-terminal state, including `queued`, `starting`, `running`, `retrying`, and `orphaned` | 2 |
+| any non-terminal state, including `queued`, `starting`, `running`, and `retrying` | 2 |
 | `completed_noncompliant` | 3 |
 | `failed` | 4 |
 | `timed_out` | 5 |
@@ -536,6 +549,7 @@ In-band JSON-RPC errors from a running daemon are included where noted:
 | `unknown_job` | 10 |
 | in-band `unavailable_native_runtime` admission cause | 11 |
 | in-band authority root condition: `root_fail_stopped`, `root_corrupt`, or `root_identity_mismatch` | 12 |
+| `orphaned` | 14 |
 
 Launcher, startup, and local shutdown failures use a separate classification:
 
@@ -633,12 +647,14 @@ Admin commands:
 
 `inspect` returns `RootInspection`. `seal` returns `SealReport`.
 `clear-fail-stop` returns `ClearFailStopReport`. `recover` returns
-`AdmissionRecoveryReport`.
+`AdmissionRecoveryReport`, including `orphanedJobs`, `unresolvedLaunches`, and
+`cleanupWarnings`.
 
 ## Startup, autostart, and shutdown
 
-Production `agentbus serve` starts strict identified admission. Unsupported
-strict runtime support fails closed at startup.
+Production `agentbus serve` starts strict identified admission. macOS and Linux
+serve under the same custody contract; Linux cgroup v2 is an optional cleanup
+enhancement. Hosts without basic process supervision fail closed at startup.
 
 Autostart is a client and launcher behavior, not a JSON-RPC method. The Go
 client connects to the configured socket, sends hello, and only autostarts when
@@ -683,8 +699,11 @@ may drain during this sequence; fail-stop closes accepted connections through
 the served safety latch.
 
 If graceful shutdown exceeds its deadline, the CLI reports exit code `13`.
-Recovery on the next startup is fail-closed and driven by the durable authority
-records.
+Recovery on the next startup is driven by the durable authority records.
+Terminal `orphaned` and terminal unresolved-cleanup jobs are durable history,
+not recovery obligations; startup does not relaunch them. Genuine authority
+integrity, ownership ambiguity, corrupt root, and contract-version mismatch
+cases remain fail-closed before readiness.
 
 ## Examples
 

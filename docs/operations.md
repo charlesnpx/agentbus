@@ -1,10 +1,11 @@
 # Agentbus Operations Runbook
 
-This runbook covers the AB-E strict-only daemon at protocol v2 and storage
-schema v2. Production serving requires a Linux host with cgroup v2 support, a
-delegated writable cgroup root, and a strict native runtime. macOS and
-restricted Linux are useful for development, inspection, and fail-closed checks
-only.
+This runbook covers the AB-E strict-only daemon at protocol v2, storage schema
+v2, and admission contract version 2. Production serving is supported on macOS
+and Linux under the shared custody contract. macOS serves with
+process-group/held-parent supervision. Linux serves with process-group
+supervision when cgroup v2 is unavailable, and uses cgroup v2 as a preferred
+cleanup enhancement when a delegated writable root is available.
 
 ## 1. First Serve On A Supported Host
 
@@ -48,16 +49,27 @@ ready, and only then installs the authority/coordinator for new work.
 
 Crash recovery is driven by durable authority records. Recovery work consists of
 nonterminal safety records and launch records that must be quiesced,
-terminalized, or finalized before the daemon becomes ready. A successful
-graceful shutdown means there is no live custody and no remaining recovery
-obligation. That does not mean there are no historical jobs; it means inspection
-must show `recoveryObligations=0`.
+terminalized, or finalized before the daemon becomes ready. If an execution may
+have occurred and absence cannot be established, the job becomes terminal
+`orphaned` when no outcome was recorded, or keeps its recorded terminal outcome
+with `cleanupDisposition=unresolved`. Those terminal unresolved jobs are not
+recovery obligations and startup must not relaunch them. They remain durable
+history and replay normally for the same `(workspaceKey, requestId)`.
+
+A successful graceful shutdown means there is no live custody the daemon can
+still act on and no retryable recovery obligation. It may still leave terminal
+jobs whose cleanup disposition is `unresolved`. Inspection must show
+`recoveryObligations=0`; historical jobs, bindings, and launch records may
+still be present.
 
 Use `agentbus admission recover --state-root <root>` when a root needs
 daemonless recovery without opening a listener. It builds a recovery-only server
 with strict native containment, requires an existing initialized DB and matching
 anchor, refuses missing, nonregular, zero-length, mismatched, or incompatible
-authority files, and exits without serving clients.
+authority files, and exits without serving clients. JSON recovery reports
+include `orphanedJobs`, `unresolvedLaunches`, and `cleanupWarnings`; a nonzero
+`orphanedJobs` count is job-local cleanup uncertainty, not a global fail-stop by
+itself.
 
 ## 3. Clear-Fail-Stop
 
@@ -82,28 +94,34 @@ does not repair corruption and it must not be used as a substitute for diagnosis
 
 Seal permanently closes the old authority domain for audit and starts a new
 state root. It requires all acknowledgement flags and a new state-root path. It
-refuses roots with live recovery obligations and refuses unsafe or foreign
-destinations. A sealed root is not a multi-root router: read, cancel, result,
-and replay are not routed across old and new roots.
+refuses roots with live or retryable recovery obligations and refuses unsafe or
+foreign destinations. Terminal `orphaned` or unresolved-cleanup jobs do not
+block sealing once there is no active recovery work. A sealed root is not a
+multi-root router: read, cancel, result, and replay are not routed across old
+and new roots.
 
 `reset-empty-root` is only for an empty authority root. The empty proof is the
 authority count set: jobs, bindings, tombstones, launch records, and recovery
-obligations must all be zero. If a DB exists, reset opens it, verifies any
-existing initialized anchor's identity (an absent anchor is permitted for an
-empty DB), inspects counts, and refuses non-empty roots. If the anchor exists
-without the DB, reset refuses instead of creating a new root over it.
+obligations must all be zero. Terminal `orphaned` and unresolved-cleanup jobs
+still count as jobs, bindings, and launch history, so reset refuses a root that
+contains them even though they are not recovery obligations. If a DB exists,
+reset opens it, verifies any existing initialized anchor's identity (an absent
+anchor is permitted for an empty DB), inspects counts, and refuses non-empty
+roots. If the anchor exists without the DB, reset refuses instead of creating a
+new root over it.
 
-## 5. Unsupported Environments
+## 5. Supported And Unsupported Environments
 
-Unsupported strict environments fail closed with a typed strict-support
-diagnostic before a production server is created. The production operator path
-through client/launcher autostart reports daemon startup failure as exit code
-`11`. The fail-closed tests cover macOS and restricted Linux behavior: a fresh
-unsupported root is left absent, an existing unsupported root keeps its
-permissions, and no token, socket, or PID file is left behind.
+macOS and Linux are supported serving environments. Linux cgroup v2 is a
+preferred cleanup enhancement, not a serving prerequisite or a permanent root
+identity component. A single root may contain mixed cgroup-backed and
+process-group-backed launch history.
 
-Use macOS and restricted Linux for tooling, documentation, and the unsupported
-fail-closed CI lane. Do not treat them as serving environments.
+Unsupported strict environments fail closed only when the host cannot provide
+basic controlled process supervision: process groups, identity/start-token
+observation, TERM/KILL/wait, and a controlled runner. The production operator
+path through client/launcher autostart reports daemon startup failure as exit
+code `11`.
 
 ## 6. Corruption Response
 
@@ -131,7 +149,18 @@ projection and reconstruct it from the safety record. That self-repair is
 limited to projection state derived from committed safety records; safety,
 binding, tombstone, metadata, DB UUID, and binding-index corruption remain fatal.
 
-## 7. Rollback
+## 7. Contract Version And Rollback
+
+Admission contract version 2 marks the ADR-13 custody contract change. There is
+no in-place migration from activated contract-version-1 roots. A v2 daemon
+opening an activated v1 root fails closed before socket bind with a typed
+incompatible-contract-version error and leaves the files untouched. Operator
+recovery is to seal the old root and serve the successor root stamped at the
+daemon's current contract version.
+
+Candidate, unactivated v1 roots refuse activation typed. If they are empty,
+`reset-empty-root` can recreate them as fresh contract-version-2 candidates; a
+seal operation also stamps the successor at version 2.
 
 Binary rollback is safe only in the refusal sense: do not edit authority files
 to make an older binary run. Current binaries opening an existing authority DB
@@ -178,8 +207,9 @@ The committed CI scripts are under `scripts/ci/`:
 - `release-check.sh` combines the strict-capable container, full tests, strict
   preflight, exact release binary build, smoke, startup status round-trip, and
   strict production tests.
-- `fail-closed.sh` proves macOS typed unsupported behavior and restricted-Linux
-  strict unsupported behavior, including residue checks.
+- `fail-closed.sh` runs the macOS supported process-group custody lane, the
+  restricted-Linux process-group fallback serving lane, and typed fail-closed
+  checks for genuine no-basic-supervision and incompatible contract cases.
 - `vuln.sh` installs the pinned `govulncheck` version and scans `./...`.
 
 The merge criterion is remote-green on the exact candidate SHA once GitHub

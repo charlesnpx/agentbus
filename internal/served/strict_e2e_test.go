@@ -34,12 +34,14 @@ func TestProductionStrictServe(t *testing.T) {
 	if testing.Short() {
 		t.Skip("strict e2e is not run in short mode")
 	}
-	if runtime.GOOS != "linux" {
-		// The authoritative strict native gate runs under Linux cgroup-v2 Docker.
-		// Non-Linux hosts skip instead of asserting platform-specific runtime details.
-		t.Skip("strict native e2e gate runs on linux")
+	switch runtime.GOOS {
+	case "linux":
+		requireProductionStrictCgroup(t)
+	case "darwin":
+		requireServedNativeConformance(t)
+	default:
+		t.Skip("strict native e2e gate runs on darwin or linux")
 	}
-	requireProductionStrictCgroup(t)
 	stateRoot := shortTempDir(t)
 	cwd := shortTempDir(t)
 	fixture := installServedNativeCodexFixture(t, stateRoot)
@@ -68,7 +70,7 @@ func TestProductionStrictServe(t *testing.T) {
 		stopProductionStrictCommand(t, cmd, serveDone, &stdout, &stderr)
 	})
 
-	client := connectProductionStrictClient(t, stateRoot, serveDone)
+	client := connectProductionStrictClient(t, stateRoot, serveDone, &stderr)
 	t.Cleanup(func() {
 		if err := client.Close(); err != nil {
 			t.Errorf("client close: %v", err)
@@ -143,13 +145,16 @@ func TestProductionStrictServe(t *testing.T) {
 	t.Log("strict_admission_real_job_end_to_end")
 }
 
-func connectProductionStrictClient(t *testing.T, stateRoot string, serveDone <-chan error) *agentclient.Client {
+func connectProductionStrictClient(t *testing.T, stateRoot string, serveDone <-chan error, stderr ...*bytes.Buffer) *agentclient.Client {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-serveDone:
+			if productionStrictBindDeniedE2B(buffersString(stderr...)) {
+				t.Skipf("Unix socket bind denied by sandbox in production strict daemon: %v", err)
+			}
 			t.Fatalf("Serve exited before client connection: %v", err)
 		default:
 		}
@@ -168,6 +173,16 @@ func connectProductionStrictClient(t *testing.T, stateRoot string, serveDone <-c
 	}
 	t.Fatalf("client did not connect to production strict server: %v", lastErr)
 	return nil
+}
+
+func buffersString(buffers ...*bytes.Buffer) string {
+	var out strings.Builder
+	for _, buffer := range buffers {
+		if buffer != nil {
+			out.WriteString(buffer.String())
+		}
+	}
+	return out.String()
 }
 
 func requireProductionStrictCgroup(t *testing.T) {

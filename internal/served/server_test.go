@@ -1773,7 +1773,7 @@ func TestAdmissionRecoveryExecutorTypedUnresolvedContinuesStartupWithoutRelaunch
 	}
 
 	backend := newFakeBackend("fake")
-	server, _, _ := newUnstartedTestServer(t, backend)
+	server, _, cwd := newUnstartedTestServer(t, backend)
 	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
 
 	if server.admissionReady == nil {
@@ -1798,6 +1798,26 @@ func TestAdmissionRecoveryExecutorTypedUnresolvedContinuesStartupWithoutRelaunch
 	}
 	if got := model.DeriveCleanupDisposition(record); got != model.CleanupDispositionUnresolved {
 		t.Fatalf("cleanup disposition = %s, want %s", got, model.CleanupDispositionUnresolved)
+	}
+	replay, err := server.admissionReady.LookupReplay(ctx, accepted.Binding.RequestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.State != authority.ReplayLive || replay.Record.JobID != accepted.Record.JobID || replay.Record.Terminal == nil || replay.Projection.Public != model.PublicOrphaned {
+		t.Fatalf("orphaned replay = %+v, want original terminal orphaned job %s", replay, accepted.Record.JobID)
+	}
+	newSubmit := submitIdentifiedForReplayTest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-recovery-orphan-continues-new",
+		RequestID:    "request-recovery-orphan-continues-new",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Write:   false,
+			Prompt:  "after orphaned recovery",
+		},
+	})
+	if newSubmit.JobID == string(accepted.Record.JobID) || newSubmit.Deduplicated {
+		t.Fatalf("new submit after orphaned recovery = %+v, want new accepted job", newSubmit)
 	}
 }
 

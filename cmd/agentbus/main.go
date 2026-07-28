@@ -308,7 +308,7 @@ func (a *app) runAdmissionRecover(ctx context.Context, args []string, out, errOu
 	if *jsonOut {
 		return writeOrError(out, errOut, report)
 	}
-	fmt.Fprintf(out, "mode=%s workItems=%d quiescedLaunches=%d finalizedJobs=%d cleanupWarnings=%d recoveryPasses=%d\n", report.Mode, report.WorkItems, report.QuiescedLaunches, report.FinalizedJobs, report.CleanupWarnings, report.RecoveryPasses)
+	fmt.Fprintf(out, "mode=%s workItems=%d quiescedLaunches=%d finalizedJobs=%d orphanedJobs=%d unresolvedLaunches=%d cleanupWarnings=%d recoveryPasses=%d\n", report.Mode, report.WorkItems, report.QuiescedLaunches, report.FinalizedJobs, report.OrphanedJobs, report.UnresolvedLaunches, report.CleanupWarnings, report.RecoveryPasses)
 	return 0
 }
 
@@ -1052,8 +1052,8 @@ func printRootHelp(out io.Writer) {
 JSON shapes:
   version:  {"schema":1,"version":"dev","protocolVersion":2}
   setup:    {"schema":1,"backends":[{"backend":"codex","binaryPath":"...","version":"...","configMode":{"write":"user","readOnly":"hermetic"},"sandboxModes":["workspace-write","read-only"],"jsonEventsProbe":{"ran":true,"version":"...","streamSchema":"codex-json-v1"}}]}
-  status:   {"jobs":[{"jobId":"...","sessionId":"...","state":"running"}]}
-  result:   {"jobId":"...","sessionId":"...","state":"completed","result":{"text":"...","resultPath":"...","sha256":"...","bytes":1}}
+  status:   {"jobs":[{"jobId":"...","sessionId":"...","state":"completed","cleanupDisposition":"verified_absent"}]}
+  result:   {"jobId":"...","sessionId":"...","state":"completed","cleanupDisposition":"verified_absent","result":{"text":"...","resultPath":"...","sha256":"...","bytes":1}}
   cancel:   {"jobId":"...","state":"canceled"}
   validate: {"valid":true,"missing":[],"contractName":"...","contractSha256":"sha256:..."}
 
@@ -1063,7 +1063,7 @@ Exit codes for single-job status/result/cancel:
 Status/result/cancel are protocol-v2 daemon clients. Offline authority diagnosis stays under admission inspect/recover/admin commands.
 
 Serve admission:
-  serve always starts the strict identified admission runtime. Unsupported hosts fail closed at startup. Strict activation is one-way for a state root; use admission recover, seal, or reset-empty-root for the admin escape hatches. The first strict release supports one active state root.
+  serve always starts the strict identified admission runtime. macOS and Linux are supported under the shared custody contract; Linux cgroup v2 is an optional cleanup enhancement. Hosts without basic process supervision fail closed at startup. Strict activation is one-way for a state root; use admission recover, seal, or reset-empty-root for the admin escape hatches. The first strict release supports one active state root.
 `)
 }
 
