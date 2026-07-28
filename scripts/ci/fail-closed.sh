@@ -44,6 +44,12 @@ assert_process_absent() {
 
 cleanup_restricted() {
   local cleanup_status=0
+  # The autostart daemon's PID lands in the staged state root only after the smoke
+  # command triggers autostart; recover it here so a failure BETWEEN daemon start and
+  # the explicit restricted_pid capture still tears the daemon down (not just the dir).
+  if [[ -z "$restricted_pid" && -n "$restricted_stage" && -s "$restricted_stage/state/agentbus.pid" ]]; then
+    restricted_pid=$(tr -d '[:space:]' <"$restricted_stage/state/agentbus.pid" 2>/dev/null || true)
+  fi
   if [[ -n "$restricted_pid" ]] && kill -0 "$restricted_pid" >/dev/null 2>&1; then
     kill -TERM "$restricted_pid" >/dev/null 2>&1 || true
     if ! assert_process_absent "$restricted_pid"; then
@@ -62,7 +68,13 @@ cleanup_restricted() {
 
 cleanup_restricted_trap() {
   local status=$?
-  cleanup_restricted || status=$?
+  local cleanup_rc=0
+  cleanup_restricted || cleanup_rc=$?
+  # Preserve a real lane failure; only surface the cleanup failure when the lane
+  # itself succeeded (so cleanup never masks the lane's exit code).
+  if [[ "$status" -eq 0 ]]; then
+    status=$cleanup_rc
+  fi
   exit "$status"
 }
 
@@ -286,6 +298,9 @@ run_linux_restricted() {
   run go test ./engine/execution/custodian ./internal/served ./internal/agentbusserve -run 'Test(LinuxNativeContainmentBackendSelection|NativeCgroupConstructionFallbackClassification|DefaultStrictServeRejectsUnavailableRuntimeBeforeListen|StrictRequestedUnavailableRuntimeFailsStartupWithSupportDiagnostic|BootstrapAdmissionStrictRuntimeFailurePrecedesRepositoryOpen|ProductionServedConfigSelectsNativeStrictRuntime|ActivatedBboltV1RootFailsTypedBeforeSocketBindAndLeavesFileUntouched)' -count=1
 
   restricted_stage=$(mktemp -d "${TMPDIR:-/tmp}/agentbus-fail-closed.XXXXXX")
+  # Install the cleanup trap immediately after the stage exists so a failure before
+  # the explicit trap line (e.g. reading VERSION) cannot leak the stage directory.
+  trap cleanup_restricted_trap EXIT
   bin="$restricted_stage/agentbus"
   state_root="$restricted_stage/state"
   stdout="$restricted_stage/stdout.log"
@@ -300,7 +315,6 @@ run_linux_restricted() {
   verify_go="$restricted_stage/restricted_verify.go"
   version=$(tr -d '[:space:]' <"$ROOT/VERSION")
   restricted_pid=""
-  trap cleanup_restricted_trap EXIT
 
   mkdir -p -- "$fake_bin_dir" "$restricted_stage/home" "$restricted_stage/codex-home" "$cwd"
   assert_restricted_cgroup_unavailable "$restricted_stage"
