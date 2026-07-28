@@ -4,8 +4,16 @@ Canonical, durable run-state + roadmap for completing AB-D native containment in
 Doctrine (read-only): `~/tmp/orchestrator.md`. Packets: `~/tmp/delegate-packets/`. Scratch ledger:
 `~/tmp/agent-server-delegate-progress.md`. This file is the source of truth for scope + sequence + status.
 
-STATUS (AB-F): COMPLETE (2026-07-28). ALL 7 UNITS (U1-U7) CLOSED, merged into abf-custody (PR #30),
-tip 069d6d9. Cross-platform verified: macOS solo battery green; Docker cgroup-v2 gate worst=0 across
+STATUS (AB-F): COMPLETE (2026-07-28). ALL 7 UNITS (U1-U7) CLOSED + post-review corrective pass
+(C1-C3), merged into abf-custody (PR #30). Corrective pass fixed 3 live-served-pipeline
+integration leaks a principal PR review found (architecture/model approved): C1 execution-outcome
+vs cleanup-status conflation across launch->adapter->served (cleanup no longer stringified into a
+terminal error; completed+unresolved / completed+verified_absent preserve the result); C2 active/
+shutdown job.cancel continues to Coordinator.Cancel on typed cleanup uncertainty (commits
+canceled+ProofUnresolvedAbsence instead of returning backend_unavailable); C3 AbandonUnresolvedCustody
+releases local native custody after a durable unresolved terminal so it stops counting as active
+work. Corrective review: SHIP (no findings); macOS battery green; Docker cgroup-v2 worst=0.
+tip 069d6d9 (base campaign) / 5e5e545 (corrective). Cross-platform verified: macOS solo battery green; Docker cgroup-v2 gate worst=0 across
 ALL partitions (strict-cgroup preflight, builds, serial-conformance, serial-race, parallel-rest, race
 detector, strict-e2e). Daemon serves on macOS (process-group/held-parent) and Linux (cgroup-v2 with
 process-group fallback). Integration caught + fixed several cross-platform-only defects: a Linux-only
