@@ -38,6 +38,8 @@ const (
 	defaultHeartbeat     = 30 * time.Second
 	defaultSafetyDrain   = 30 * time.Second
 	defaultShutdown      = 30 * time.Second
+
+	admissionNativeInterruptGrace = 2 * time.Second
 )
 
 var ErrDaemonAlreadyListening = errors.New("agentbus daemon already listening")
@@ -339,6 +341,17 @@ func (j *activeJob) interruptAdmissionCommand(ctx context.Context) error {
 		return nil
 	}
 	return cmd.Interrupt(ctx)
+}
+
+func (j *activeJob) interruptSessionNativeFirst() {
+	if j == nil || j.session == nil {
+		return
+	}
+	nativeCtx, nativeCancel := context.WithTimeout(context.Background(), admissionNativeInterruptGrace)
+	defer nativeCancel()
+	if err := j.session.Interrupt(nativeCtx); err != nil {
+		log.Printf("agentbus daemon: job %s native session interrupt warning: %v", j.jobID, err)
+	}
 }
 
 func admissionPhysicalCleanupUncertain(err error) bool {
@@ -1012,6 +1025,7 @@ func (s *Server) requestActiveJobShutdownCancel(ctx context.Context, jobID strin
 		return nil
 	}
 	active.requestTerminal(engine.StateCanceled)
+	active.interruptSessionNativeFirst()
 	if err := active.interruptAdmissionCommand(ctx); err != nil {
 		if !admissionPhysicalCleanupUncertain(err) {
 			return err
@@ -2171,6 +2185,7 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	active := s.lookupActiveJob(jobID)
 	if active != nil {
 		active.requestTerminal(engine.StateCanceled)
+		active.interruptSessionNativeFirst()
 		// Admission cancel is intentional containment. Mark the active launch
 		// before coordinator containment so a killed process is the cancel
 		// terminal path, not an unprovable safety event.
