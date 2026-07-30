@@ -203,8 +203,13 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	defer turnCancel()
 	defer driverCancel()
 	defer s.clearActive(active)
+	var drainDone chan struct{}
 	defer func() {
-		active.conn.waitReader()
+		if drainDone == nil {
+			active.conn.drainReader()
+		} else {
+			<-drainDone
+		}
 		if stdoutLog != nil {
 			_ = stdoutLog.Close()
 		}
@@ -226,15 +231,14 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	}()
 
 	result, earlyExit := waitForTurnResult(driverDone, active.retirement, driverCancel)
-	if errors.Is(result.err, ErrBackendExitedBeforeTerminal) {
-		earlyExit = true
-		result.err = nil
-	}
-	if earlyExit && errors.Is(result.err, context.Canceled) {
-		result.err = nil
-	}
+	result, earlyExit = classifyTurnResult(result, earlyExit)
 
 	_ = active.conn.CloseStdin()
+	drainDone = make(chan struct{})
+	go func() {
+		active.conn.drainReader()
+		close(drainDone)
+	}()
 	observation, _ := active.retirement.wait(context.Background())
 	stderrCopyErr := <-stderrDone
 
@@ -260,6 +264,18 @@ func waitForTurnResult(driverDone <-chan turnResult, retirement *retirement, can
 	}
 }
 
+func classifyTurnResult(result turnResult, earlyExit bool) (turnResult, bool) {
+	if errors.Is(result.err, ErrBackendExitedBeforeTerminal) {
+		earlyExit = true
+		result.err = nil
+	} else if result.err == nil {
+		earlyExit = false
+	} else if earlyExit && errors.Is(result.err, context.Canceled) {
+		result.err = nil
+	}
+	return result, earlyExit
+}
+
 // Interrupt asks the driver to send its native interrupt frame, waits a bounded
 // grace for process retirement, and falls back to the process interrupt path.
 func (s *Session) Interrupt(ctx context.Context) error {
@@ -275,21 +291,50 @@ func (s *Session) Interrupt(ctx context.Context) error {
 		grace = DefaultInterruptGrace
 	}
 
-	nativeErr := driver.Interrupt(ctx, active.conn)
+	active.interruptOnce.Do(func() {
+		active.interruptErr = interruptActiveTurn(ctx, driver, active, grace)
+	})
+	return active.interruptErr
+}
+
+func interruptActiveTurn(ctx context.Context, driver Driver, active *activeTurn, grace time.Duration) error {
+	nativeDone := make(chan error, 1)
+	go func() {
+		nativeDone <- driver.Interrupt(ctx, active.conn)
+	}()
+
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
-	select {
-	case <-active.retirement.done:
-		return nativeErr
-	case <-timer.C:
-	case <-ctx.Done():
-		return errors.Join(nativeErr, ctx.Err())
-	}
 
-	active.interruptOnce.Do(func() {
-		active.interruptErr = active.running.Interrupt(ctx)
-	})
-	return errors.Join(nativeErr, active.interruptErr)
+	var nativeErr error
+	for {
+		select {
+		case err := <-nativeDone:
+			nativeErr = err
+			nativeDone = nil
+		case <-active.retirement.done:
+			nativeErr = collectNativeInterruptErr(nativeDone, nativeErr)
+			return nativeErr
+		case <-timer.C:
+			interruptErr := active.running.Interrupt(ctx)
+			return errors.Join(collectNativeInterruptErr(nativeDone, nativeErr), interruptErr)
+		case <-ctx.Done():
+			interruptErr := active.running.Interrupt(ctx)
+			return errors.Join(collectNativeInterruptErr(nativeDone, nativeErr), interruptErr, ctx.Err())
+		}
+	}
+}
+
+func collectNativeInterruptErr(nativeDone <-chan error, nativeErr error) error {
+	if nativeDone == nil {
+		return nativeErr
+	}
+	select {
+	case err := <-nativeDone:
+		return err
+	default:
+		return nativeErr
+	}
 }
 
 func startRetirement(ctx context.Context, running command.RunningCommand) *retirement {

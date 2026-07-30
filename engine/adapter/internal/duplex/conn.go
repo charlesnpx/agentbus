@@ -132,6 +132,27 @@ func (c *Conn) waitReader() {
 	<-c.readerDone
 }
 
+func (c *Conn) drainReader() {
+	if c == nil {
+		return
+	}
+	frames := c.Frames()
+	decodeErrs := c.DecodeErrors()
+	for frames != nil || decodeErrs != nil {
+		select {
+		case _, ok := <-frames:
+			if !ok {
+				frames = nil
+			}
+		case _, ok := <-decodeErrs:
+			if !ok {
+				decodeErrs = nil
+			}
+		}
+	}
+	c.waitReader()
+}
+
 func readJSONL(src io.ReadCloser, log io.Writer, frames chan<- Frame, decodeErrs chan<- error, done chan<- struct{}) {
 	defer close(done)
 	defer close(frames)
