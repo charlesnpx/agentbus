@@ -707,6 +707,13 @@ func (s *Session) Interrupt(ctx context.Context) error {
 	return command.Interrupt(ctx)
 }
 
+func (s *Session) NativeInterrupt(ctx context.Context) error {
+	if s.duplexSession != nil {
+		return s.duplexSession.NativeInterrupt(ctx)
+	}
+	return nil
+}
+
 func (s *Session) scan(r io.Reader, out chan<- engine.Event) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)

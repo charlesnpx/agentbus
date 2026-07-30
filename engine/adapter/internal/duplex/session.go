@@ -308,6 +308,23 @@ func (s *Session) Interrupt(ctx context.Context) error {
 	return active.interruptErr
 }
 
+// NativeInterrupt asks the driver to send only its provider-native interrupt
+// frame and then waits for process retirement or ctx cancellation. It never
+// invokes the process interrupt fallback path.
+func (s *Session) NativeInterrupt(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	active := s.active
+	driver := s.driver
+	s.mu.Unlock()
+	if active == nil {
+		return nil
+	}
+	return nativeInterruptActiveTurn(ctx, driver, active)
+}
+
 func interruptActiveTurn(ctx context.Context, driver Driver, active *activeTurn, grace time.Duration) error {
 	nativeDone := make(chan error, 1)
 	go func() {
@@ -332,6 +349,30 @@ func interruptActiveTurn(ctx context.Context, driver Driver, active *activeTurn,
 		case <-ctx.Done():
 			interruptErr := interruptWithFreshContext(ctx, active.running, grace)
 			return errors.Join(collectNativeInterruptErr(nativeDone, nativeErr), interruptErr, ctx.Err())
+		}
+	}
+}
+
+func nativeInterruptActiveTurn(ctx context.Context, driver Driver, active *activeTurn) error {
+	nativeDone := make(chan error, 1)
+	go func() {
+		nativeDone <- driver.Interrupt(ctx, active.conn)
+	}()
+
+	for {
+		select {
+		case err := <-nativeDone:
+			if err != nil {
+				return err
+			}
+			nativeDone = nil
+		case <-active.retirement.done:
+			if err := collectNativeInterruptErr(nativeDone, nil); err != nil {
+				return err
+			}
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }

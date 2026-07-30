@@ -396,6 +396,99 @@ func TestNativeInterruptWritesFrameThenFallsBackToProcessInterrupt(t *testing.T)
 	_ = collectEventsWithTimeout(t, events, 2*time.Second)
 }
 
+func TestNativeInterruptDoesNotCallProcessInterrupt(t *testing.T) {
+	t.Run("returns on retirement", func(t *testing.T) {
+		proc := newFakeCommand()
+		runner := &fakeRunner{running: proc}
+		session := newFixtureSession(t, runner, 0, "")
+		promptSeen, interruptSeen, scanDone := startInterruptFrameScanner(t, proc)
+
+		events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitForSignal(t, promptSeen, "prompt frame")
+
+		nativeDone := make(chan error, 1)
+		go func() {
+			nativeDone <- session.NativeInterrupt(context.Background())
+		}()
+		frame := waitForInterruptFrame(t, interruptSeen)
+		if frame["type"] != "interrupt" {
+			t.Fatalf("interrupt frame = %#v", frame)
+		}
+		if got := proc.interrupts.Load(); got != 0 {
+			t.Fatalf("process interrupt count = %d, want 0", got)
+		}
+		select {
+		case err := <-nativeDone:
+			t.Fatalf("NativeInterrupt returned before retirement: %v", err)
+		default:
+		}
+
+		_ = proc.stdoutW.Close()
+		_ = proc.stderrW.Close()
+		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+		select {
+		case err := <-nativeDone:
+			if err != nil {
+				t.Fatalf("NativeInterrupt error = %v, want nil", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for NativeInterrupt to return after retirement")
+		}
+		_ = collectEventsWithTimeout(t, events, 2*time.Second)
+		waitForSignal(t, scanDone, "stdin scanner shutdown")
+		if got := proc.interrupts.Load(); got != 0 {
+			t.Fatalf("process interrupt count after retirement = %d, want 0", got)
+		}
+	})
+
+	t.Run("returns on context cancellation", func(t *testing.T) {
+		proc := newFakeCommand()
+		runner := &fakeRunner{running: proc}
+		session := newFixtureSession(t, runner, 0, "")
+		promptSeen, interruptSeen, scanDone := startInterruptFrameScanner(t, proc)
+
+		events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitForSignal(t, promptSeen, "prompt frame")
+
+		ctx, cancel := context.WithCancel(context.Background())
+		nativeDone := make(chan error, 1)
+		go func() {
+			nativeDone <- session.NativeInterrupt(ctx)
+		}()
+		frame := waitForInterruptFrame(t, interruptSeen)
+		if frame["type"] != "interrupt" {
+			t.Fatalf("interrupt frame = %#v", frame)
+		}
+		if got := proc.interrupts.Load(); got != 0 {
+			t.Fatalf("process interrupt count = %d, want 0", got)
+		}
+		cancel()
+		select {
+		case err := <-nativeDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("NativeInterrupt error = %v, want context.Canceled", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for NativeInterrupt to return after context cancellation")
+		}
+
+		_ = proc.stdoutW.Close()
+		_ = proc.stderrW.Close()
+		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+		_ = collectEventsWithTimeout(t, events, 2*time.Second)
+		waitForSignal(t, scanDone, "stdin scanner shutdown")
+		if got := proc.interrupts.Load(); got != 0 {
+			t.Fatalf("process interrupt count after context cancellation = %d, want 0", got)
+		}
+	})
+}
+
 func TestInterruptFallsBackWhenNativeInterruptBlocks(t *testing.T) {
 	proc := newFakeCommand()
 	var closeOnce sync.Once
@@ -782,6 +875,51 @@ func assertFinalObservationCalled(t *testing.T, observed *fakeObservedCommand) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("FinalObservation was not awaited")
 	}
+}
+
+func startInterruptFrameScanner(t *testing.T, proc *fakeCommand) (<-chan struct{}, <-chan map[string]any, <-chan struct{}) {
+	t.Helper()
+	promptSeen := make(chan struct{})
+	interruptSeen := make(chan map[string]any, 1)
+	scanDone := make(chan struct{})
+	var promptOnce sync.Once
+	go func() {
+		defer close(scanDone)
+		scanner := bufio.NewScanner(proc.stdinR)
+		for scanner.Scan() {
+			frame := decodeLine(t, scanner.Bytes())
+			switch frame["type"] {
+			case "prompt":
+				promptOnce.Do(func() { close(promptSeen) })
+			case "interrupt":
+				interruptSeen <- frame
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			t.Errorf("stdin scan error: %v", err)
+		}
+	}()
+	return promptSeen, interruptSeen, scanDone
+}
+
+func waitForSignal(t *testing.T, ch <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+func waitForInterruptFrame(t *testing.T, ch <-chan map[string]any) map[string]any {
+	t.Helper()
+	select {
+	case frame := <-ch:
+		return frame
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for interrupt frame")
+	}
+	return nil
 }
 
 type fakeRunner struct {
