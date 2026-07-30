@@ -80,6 +80,75 @@ func TestFixtureDriverHappyPath(t *testing.T) {
 	}
 }
 
+func TestTurnWithRunnerUsesInjectedRunnerWithoutDefault(t *testing.T) {
+	proc := newFakeCommand()
+	runner := &fakeRunner{running: proc}
+	session, err := NewSession(SessionConfig{
+		Driver:   FixtureDriver{Spec: command.ExecSpec{Argv: []string{"fixture"}}},
+		ResumeID: "resume-0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		scanner := bufio.NewScanner(proc.stdinR)
+		if !scanner.Scan() {
+			t.Errorf("prompt frame missing: %v", scanner.Err())
+			return
+		}
+		prompt := decodeLine(t, scanner.Bytes())
+		if prompt["type"] != "prompt" || prompt["prompt"] != "hello" || prompt["resumeId"] != "resume-0" {
+			t.Errorf("prompt frame = %#v", prompt)
+			return
+		}
+		writePeerJSON(t, proc.stdoutW, map[string]any{"type": "complete", "text": "done", "resumeId": "resume-1"})
+		if scanner.Scan() {
+			t.Errorf("unexpected stdin frame after completion: %s", scanner.Text())
+			return
+		}
+		if err := scanner.Err(); err != nil {
+			t.Errorf("stdin scan error: %v", err)
+			return
+		}
+		_ = proc.stdoutW.Close()
+		_ = proc.stderrW.Close()
+		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	}()
+
+	events, err := session.TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	<-peerDone
+
+	if len(got) != 1 || got[0].Type != engine.EventResultMessage || got[0].Text != "done" {
+		t.Fatalf("events = %#v, want result", got)
+	}
+	if session.ID() != "resume-1" {
+		t.Fatalf("session id = %q, want resume-1", session.ID())
+	}
+	if strings.Join(runner.spec.Argv, "\x00") != "fixture" {
+		t.Fatalf("argv = %#v", runner.spec.Argv)
+	}
+}
+
+func TestTurnWithRunnerRequiresRunner(t *testing.T) {
+	session, err := NewSession(SessionConfig{
+		Driver: FixtureDriver{Spec: command.ExecSpec{Argv: []string{"fixture"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = session.TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "command runner is required") {
+		t.Fatalf("TurnWithRunner error = %v, want command runner required", err)
+	}
+}
+
 func TestMalformedStdoutSurfacesDecodeError(t *testing.T) {
 	proc := newFakeCommand()
 	observed := newFakeObservedCommand(proc, command.FinalObservation{

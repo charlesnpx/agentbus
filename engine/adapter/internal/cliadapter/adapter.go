@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/adapter/internal/duplex"
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
@@ -30,6 +31,7 @@ type Backend struct {
 	AllowedEfforts   map[string]struct{}
 	BuildArgs        func(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error)
 	Parse            func(map[string]any) ([]engine.Event, string, error)
+	Driver           duplex.Driver
 	VersionTransform func(string) string
 	Discover         func(context.Context, command.ProbeRunner, string) (*engine.ModelDiscovery, error)
 	probed           *ProbedBackendDescriptor
@@ -137,11 +139,14 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	session := &Session{backend: b, opts: engine.SessionOpts{
+	session, err := b.newSession("", engine.SessionOpts{
 		CWD:     cwd,
 		Write:   false,
 		Timeout: 2 * time.Minute,
-	}, suppressValidationWarning: true}
+	}, "", true)
+	if err != nil {
+		return engine.BackendSetupProbe{}, err
+	}
 	events, err := session.Turn(probeCtx, engine.TurnInput{
 		Prompt:  "Reply with exactly: OK\n",
 		Write:   false,
@@ -197,7 +202,7 @@ func (b *Backend) Start(ctx context.Context, opts engine.SessionOpts) (engine.Se
 	if err != nil {
 		return nil, err
 	}
-	return &Session{backend: b, opts: opts, validationWarning: warning}, nil
+	return b.newSession("", opts, warning, false)
 }
 
 func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts) (engine.Session, error) {
@@ -211,7 +216,30 @@ func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts
 	if err != nil {
 		return nil, err
 	}
-	return &Session{backend: b, id: id, opts: opts, validationWarning: warning}, nil
+	return b.newSession(id, opts, warning, false)
+}
+
+func (b *Backend) newSession(id string, opts engine.SessionOpts, validationWarning string, suppressValidationWarning bool) (*Session, error) {
+	session := &Session{
+		backend:                   b,
+		id:                        id,
+		opts:                      opts,
+		validationWarning:         validationWarning,
+		suppressValidationWarning: suppressValidationWarning,
+	}
+	if b.Driver == nil {
+		return session, nil
+	}
+	duplexSession, err := duplex.NewSession(duplex.SessionConfig{
+		Driver:   b.Driver,
+		Options:  opts,
+		ResumeID: id,
+	})
+	if err != nil {
+		return nil, err
+	}
+	session.duplexSession = duplexSession
+	return session, nil
 }
 
 func (b *Backend) binary() string {
@@ -434,12 +462,16 @@ type Session struct {
 	opts                      engine.SessionOpts
 	validationWarning         string
 	suppressValidationWarning bool
+	duplexSession             *duplex.Session
 	mu                        sync.Mutex
 	active                    command.RunningCommand
 	lastAgentMessage          string
 }
 
 func (s *Session) ID() string {
+	if s.duplexSession != nil {
+		return s.duplexSession.ID()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.id
@@ -462,6 +494,9 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	}
 	if s.suppressValidationWarning {
 		warningText = ""
+	}
+	if s.duplexSession != nil {
+		return s.turnWithDuplexRunner(ctx, input, runner, warningText)
 	}
 	s.mu.Lock()
 	if s.active != nil {
@@ -605,6 +640,25 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	return events, nil
 }
 
+func (s *Session) turnWithDuplexRunner(ctx context.Context, input engine.TurnInput, runner command.Runner, warningText string) (<-chan engine.Event, error) {
+	events, err := s.duplexSession.TurnWithRunner(ctx, input, runner)
+	if err != nil {
+		return nil, err
+	}
+	if warningText == "" {
+		return events, nil
+	}
+	out := make(chan engine.Event, 16)
+	go func() {
+		defer close(out)
+		out <- warning(warningText)
+		for ev := range events {
+			out <- ev
+		}
+	}()
+	return out, nil
+}
+
 func finalObservation(ctx context.Context, running command.RunningCommand) command.FinalObservation {
 	exit, waitErr := running.Wait(ctx)
 	if observer, ok := running.(command.FinalObserver); ok {
@@ -621,6 +675,9 @@ func finalObservation(ctx context.Context, running command.RunningCommand) comma
 }
 
 func (s *Session) Interrupt(ctx context.Context) error {
+	if s.duplexSession != nil {
+		return s.duplexSession.Interrupt(ctx)
+	}
 	s.mu.Lock()
 	command := s.active
 	s.mu.Unlock()

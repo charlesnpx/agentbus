@@ -78,9 +78,6 @@ type turnResult struct {
 
 // NewSession constructs a duplex runtime session.
 func NewSession(config SessionConfig) (*Session, error) {
-	if config.Runner == nil {
-		return nil, errors.New("duplex runner is required")
-	}
 	if config.Driver == nil {
 		return nil, errors.New("duplex driver is required")
 	}
@@ -106,6 +103,19 @@ func (s *Session) ID() string {
 
 // Turn starts one supervised duplex process turn.
 func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+	runner := s.runner
+	if runner == nil {
+		runner = command.DirectCommandRunner{}
+	}
+	return s.TurnWithRunner(ctx, input, runner)
+}
+
+// TurnWithRunner starts one supervised duplex process turn using the supplied
+// command runner for this turn.
+func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, runner command.Runner) (<-chan engine.Event, error) {
+	if runner == nil {
+		return nil, errors.New("command runner is required")
+	}
 	s.mu.Lock()
 	if s.active != nil {
 		s.mu.Unlock()
@@ -161,7 +171,7 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		}
 	}
 
-	running, err := s.runner.Start(turnCtx, spec)
+	running, err := runner.Start(turnCtx, spec)
 	if err != nil {
 		if stdoutLog != nil {
 			_ = stdoutLog.Close()
