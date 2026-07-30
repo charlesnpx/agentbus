@@ -309,17 +309,17 @@ func startupFailureCode(err error) string {
 	case errors.Is(err, served.ErrRuntimeConsumed):
 		return served.ErrRuntimeConsumed.Error()
 	case errors.Is(err, served.ErrSafetyFailStopped):
-		return served.ErrSafetyFailStopped.Error()
+		return daemonlaunch.CodeAuthorityFailStopped
 	case errors.Is(err, authority.ErrRootSealed):
-		return authority.ErrRootSealed.Error()
+		return daemonlaunch.CodeAuthorityRootSealed
 	case errors.Is(err, authority.ErrAdmissionContractMismatch):
 		return authority.ErrAdmissionContractMismatch.Error()
 	case errors.Is(err, authority.ErrAnchorInvariant):
 		return authority.ErrAnchorInvariant.Error()
 	case errors.Is(err, authority.ErrFailStopped):
-		return authority.ErrFailStopped.Error()
+		return daemonlaunch.CodeAuthorityFailStopped
 	case errors.Is(err, authority.ErrFailStopRecord):
-		return authority.ErrFailStopRecord.Error()
+		return daemonlaunch.CodeAuthorityFailStopped
 	case errors.Is(err, authority.ErrRecoveryNeeded):
 		return authority.ErrRecoveryNeeded.Error()
 	default:

@@ -490,21 +490,11 @@ func TestProtocolCommandErrorStartupErrorExitCodes(t *testing.T) {
 			name: "authority fail stop code",
 			err: &daemonlaunch.StartupError{
 				Kind:    daemonlaunch.ErrStartupFailed,
-				Code:    authority.ErrFailStopped.Error(),
+				Code:    daemonlaunch.CodeAuthorityFailStopped,
 				Message: "authority fail-stopped: persisted unsafe stop",
 			},
 			wantCode:   cliExitAuthorityFailStop,
 			wantStderr: []string{"code=backend_unavailable", "admissionCause=root_fail_stopped", "authority fail-stopped"},
-		},
-		{
-			name: "served safety fail stop code",
-			err: &daemonlaunch.StartupError{
-				Kind:    daemonlaunch.ErrStartupFailed,
-				Code:    cliStartupCodeServedSafetyFailStopped,
-				Message: "served safety fail-stop: authority fail-stopped: persisted unsafe stop",
-			},
-			wantCode:   cliExitAuthorityFailStop,
-			wantStderr: []string{"code=backend_unavailable", "admissionCause=root_fail_stopped", "served safety fail-stop"},
 		},
 		{
 			name:       "readiness timeout",
@@ -569,13 +559,13 @@ func TestServeCommandErrorAuthorityStartupRefusedExitCodes(t *testing.T) {
 		{
 			name:       "authority fail stop sentinel",
 			err:        authority.ErrFailStopped,
-			wantCode:   cliExitAuthorityStartupFailStopped,
+			wantCode:   15,
 			wantStderr: authority.ErrFailStopped.Error(),
 		},
 		{
 			name:       "authority root sealed",
 			err:        authority.ErrRootSealed,
-			wantCode:   cliExitAuthorityStartupRootSealed,
+			wantCode:   16,
 			wantStderr: authority.ErrRootSealed.Error(),
 		},
 		{

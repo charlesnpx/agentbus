@@ -178,10 +178,6 @@ type StartResult struct {
 	PID            int
 	ExistingDaemon bool
 
-	// Wait observes the started daemon process exit without killing it. A nil
-	// Wait means the starter does not provide child-exit observation.
-	Wait func(context.Context) (exitCode int, err error)
-
 	killAndWait func() error
 }
 
@@ -232,7 +228,7 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 			return nil, err
 		}
 		if err := c.autostart(ctx); err != nil {
-			return nil, err
+			return nil, startupRefusedFromStartupError(err)
 		}
 	}
 	return c, nil
@@ -399,15 +395,11 @@ func (c *Client) autostart(ctx context.Context) error {
 		Timeout:     remainingTimeout(autoCtx),
 	})
 	if err != nil {
-		return err
-	}
-	exitCh, cancelWait := autostartExitChannel(started)
-	if cancelWait != nil {
-		defer cancelWait()
+		return startupRefusedFromStartupError(err)
 	}
 	pidPath := filepath.Join(c.stateRoot, "agentbus.pid")
 	pidWritten := false
-	cleanupStarted := func(err error, processExited bool) error {
+	cleanupStarted := func(err error) error {
 		var cleanupErr error
 		if pidWritten {
 			if removeErr := os.Remove(pidPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
@@ -417,9 +409,6 @@ func (c *Client) autostart(ctx context.Context) error {
 		if started.ExistingDaemon || started.PID <= 0 {
 			return errors.Join(err, cleanupErr)
 		}
-		if processExited {
-			return errors.Join(err, cleanupErr)
-		}
 		if killErr := started.KillAndWait(); killErr != nil {
 			cleanupErr = errors.Join(cleanupErr, killErr)
 		}
@@ -427,7 +416,7 @@ func (c *Client) autostart(ctx context.Context) error {
 	}
 	if started.PID > 0 && !started.ExistingDaemon {
 		if err := atomicWrite(pidPath, []byte(strconv.Itoa(started.PID)+"\n"), 0o600); err != nil {
-			return cleanupStarted(err, false)
+			return cleanupStarted(err)
 		}
 		pidWritten = true
 	}
@@ -436,60 +425,20 @@ func (c *Client) autostart(ctx context.Context) error {
 		if err := c.connect(autoCtx); err == nil {
 			return nil
 		} else if !autostartableConnectError(err) {
-			return cleanupStarted(err, false)
+			return cleanupStarted(err)
 		} else {
 			last = err
 		}
 		select {
-		case exit := <-exitCh:
-			return cleanupStarted(autostartChildExitError(exit), true)
 		case <-autoCtx.Done():
-			return cleanupStarted(autoCtx.Err(), false)
+			return cleanupStarted(autoCtx.Err())
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
 	if last == nil {
 		last = errors.New("daemon did not become ready")
 	}
-	return cleanupStarted(errors.Join(autoCtx.Err(), last), false)
-}
-
-type autostartExitResult struct {
-	exitCode int
-	err      error
-}
-
-func autostartExitChannel(started StartResult) (<-chan autostartExitResult, context.CancelFunc) {
-	if started.Wait == nil || started.ExistingDaemon || started.PID <= 0 {
-		return nil, nil
-	}
-	waitCtx, cancel := context.WithCancel(context.Background())
-	exitCh := make(chan autostartExitResult, 1)
-	go func() {
-		exitCode, err := started.Wait(waitCtx)
-		exitCh <- autostartExitResult{exitCode: exitCode, err: err}
-	}()
-	return exitCh, cancel
-}
-
-func autostartChildExitError(exit autostartExitResult) error {
-	cause := autostartChildExitCause(exit)
-	switch exit.exitCode {
-	case daemonlaunch.ExitAuthorityFailStopped:
-		return &StartupRefusedError{Reason: protocol.AdmissionRejectRootFailStopped, Err: cause}
-	case daemonlaunch.ExitAuthorityRootSealed:
-		return &StartupRefusedError{Reason: protocol.AdmissionRejectRootSealed, Err: cause}
-	default:
-		return cause
-	}
-}
-
-func autostartChildExitCause(exit autostartExitResult) error {
-	message := fmt.Sprintf("agentbus daemon exited before becoming ready (exit code %d)", exit.exitCode)
-	if exit.err == nil {
-		return errors.New(message)
-	}
-	return fmt.Errorf("%s: %w", message, exit.err)
+	return cleanupStarted(errors.Join(autoCtx.Err(), last))
 }
 
 func (c *Client) startTimeout() time.Duration {
@@ -769,6 +718,28 @@ func remainingTimeout(ctx context.Context) time.Duration {
 	return remaining
 }
 
+func startupRefusedFromStartupError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var refused *StartupRefusedError
+	if errors.As(err, &refused) {
+		return err
+	}
+	var startup *daemonlaunch.StartupError
+	if !errors.As(err, &startup) {
+		return err
+	}
+	switch strings.TrimSpace(startup.Code) {
+	case daemonlaunch.CodeAuthorityFailStopped:
+		return &StartupRefusedError{Reason: protocol.AdmissionRejectRootFailStopped, Err: err}
+	case daemonlaunch.CodeAuthorityRootSealed:
+		return &StartupRefusedError{Reason: protocol.AdmissionRejectRootSealed, Err: err}
+	default:
+		return err
+	}
+}
+
 type defaultStarter struct{}
 
 func (defaultStarter) StartDaemon(ctx context.Context, opts StartOptions) (StartResult, error) {
@@ -801,11 +772,7 @@ func (defaultStarter) StartDaemon(ctx context.Context, opts StartOptions) (Start
 	if err != nil {
 		return StartResult{}, err
 	}
-	var wait func(context.Context) (int, error)
-	if result.PID > 0 && !result.ExistingDaemon {
-		wait = result.Wait
-	}
-	return StartResult{PID: result.PID, ExistingDaemon: result.ExistingDaemon, Wait: wait, killAndWait: result.KillAndWait}, nil
+	return StartResult{PID: result.PID, ExistingDaemon: result.ExistingDaemon, killAndWait: result.KillAndWait}, nil
 }
 
 type daemonProcess struct {
@@ -959,7 +926,7 @@ func (c *Client) reconnect(ctx context.Context) error {
 	} else if !autostartableConnectError(err) {
 		return err
 	}
-	return c.autostart(ctx)
+	return startupRefusedFromStartupError(c.autostart(ctx))
 }
 
 func autostartableConnectError(err error) bool {

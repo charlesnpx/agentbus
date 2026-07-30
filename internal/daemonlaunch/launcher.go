@@ -29,12 +29,15 @@ const (
 	DefaultStderrTailBytes   = 64 * 1024
 	CodeAlreadyListening     = "agentbus daemon already listening"
 	CodeAdmissionRootBusy    = "agentbus admission root busy"
+	CodeAuthorityFailStopped = "agentbus authority root fail-stopped"
+	CodeAuthorityRootSealed  = "agentbus authority root sealed"
 	// ExitAuthorityFailStopped is the foreground daemon exit code for startup
-	// refusal by a fail-stopped authority root.
-	ExitAuthorityFailStopped = 14
+	// refusal by a fail-stopped authority root. Exit code 14 is reserved for
+	// engine.StateOrphaned.
+	ExitAuthorityFailStopped = 15
 	// ExitAuthorityRootSealed is the foreground daemon exit code for startup
 	// refusal by a sealed authority root.
-	ExitAuthorityRootSealed    = 15
+	ExitAuthorityRootSealed    = 16
 	readinessFDChildNumber     = 3
 	existingVerifyRetryPeriod  = 50 * time.Millisecond
 	failedExitGrace            = 500 * time.Millisecond
@@ -227,13 +230,6 @@ func (result Result) KillAndWait() error {
 	return result.handle.KillAndWait()
 }
 
-func (result Result) Wait(ctx context.Context) (int, error) {
-	if result.handle == nil {
-		return 0, nil
-	}
-	return result.handle.Wait(ctx)
-}
-
 type Handle struct {
 	pid     int
 	process Process
@@ -252,21 +248,6 @@ func newHandle(process Process) *Handle {
 		close(handle.done)
 	}()
 	return handle
-}
-
-func (handle *Handle) Wait(ctx context.Context) (int, error) {
-	if handle == nil {
-		return 0, nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	select {
-	case <-handle.done:
-		return processExitCode(handle.waitErr), handle.waitErr
-	case <-ctx.Done():
-		return -1, ctx.Err()
-	}
 }
 
 func (handle *Handle) KillAndWait() error {
@@ -310,19 +291,6 @@ func (handle *Handle) waitTimeout(timeout time.Duration) error {
 	case <-timer.C:
 		return fmt.Errorf("wait for daemon process %d timed out", handle.pid)
 	}
-}
-
-func processExitCode(err error) int {
-	if err == nil {
-		return 0
-	}
-	var exitCoder interface {
-		ExitCode() int
-	}
-	if errors.As(err, &exitCoder) {
-		return exitCoder.ExitCode()
-	}
-	return -1
 }
 
 type StartupError struct {

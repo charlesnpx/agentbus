@@ -698,105 +698,118 @@ func TestConnectAutostartSurfacesLauncherFailureOnce(t *testing.T) {
 	}
 }
 
-func TestConnectAutostartChildExitAuthorityRefusedTyped(t *testing.T) {
+func TestConnectAutostartStartupErrorAuthorityRefusedTyped(t *testing.T) {
 	t.Parallel()
-	root := shortClientTempDir(t)
-	const startTimeout = time.Second
-	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
-		return StartResult{
-			PID: 12345,
-			Wait: func(context.Context) (int, error) {
-				return daemonlaunch.ExitAuthorityFailStopped, errors.New("exit status 14")
-			},
-		}, nil
-	})
+	tests := []struct {
+		name         string
+		code         string
+		wantReason   string
+		wantSentinel error
+		notSentinel  error
+	}{
+		{
+			name:         "fail stopped",
+			code:         daemonlaunch.CodeAuthorityFailStopped,
+			wantReason:   protocol.AdmissionRejectRootFailStopped,
+			wantSentinel: ErrRootFailStopped,
+			notSentinel:  ErrRootSealed,
+		},
+		{
+			name:         "root sealed",
+			code:         daemonlaunch.CodeAuthorityRootSealed,
+			wantReason:   protocol.AdmissionRejectRootSealed,
+			wantSentinel: ErrRootSealed,
+			notSentinel:  ErrRootFailStopped,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			root := shortClientTempDir(t)
+			startupErr := &daemonlaunch.StartupError{
+				Kind:    daemonlaunch.ErrStartupFailed,
+				Code:    tt.code,
+				Message: "startup refused by readiness frame",
+			}
+			starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
+				return StartResult{}, startupErr
+			})
 
-	start := time.Now()
-	client, err := Connect(context.Background(), Options{
-		StateRoot:    root,
-		Token:        "token",
-		StartTimeout: startTimeout,
-		Starter:      starter,
-	})
-	elapsed := time.Since(start)
-	if client != nil {
-		_ = client.Close()
-	}
-	if err == nil {
-		t.Fatal("Connect succeeded, want startup refusal")
-	}
-	if !errors.Is(err, ErrRootFailStopped) {
-		t.Fatalf("Connect error = %T %v, want ErrRootFailStopped", err, err)
-	}
-	if errors.Is(err, ErrRootSealed) {
-		t.Fatalf("Connect error = %T %v, unexpectedly matched ErrRootSealed", err, err)
-	}
-	var refused *StartupRefusedError
-	if !errors.As(err, &refused) {
-		t.Fatalf("Connect error = %T %v, want StartupRefusedError", err, err)
-	}
-	if refused.Reason != protocol.AdmissionRejectRootFailStopped {
-		t.Fatalf("StartupRefusedError reason = %q, want %q", refused.Reason, protocol.AdmissionRejectRootFailStopped)
-	}
-	if elapsed >= startTimeout/2 {
-		t.Fatalf("Connect elapsed = %s, want prompt child-exit classification", elapsed)
+			client, err := Connect(context.Background(), Options{
+				StateRoot: root,
+				Token:     "token",
+				Starter:   starter,
+			})
+			if client != nil {
+				_ = client.Close()
+			}
+			if err == nil {
+				t.Fatal("Connect succeeded, want startup refusal")
+			}
+			if !errors.Is(err, tt.wantSentinel) {
+				t.Fatalf("Connect error = %T %v, want %v", err, err, tt.wantSentinel)
+			}
+			if errors.Is(err, tt.notSentinel) {
+				t.Fatalf("Connect error = %T %v, unexpectedly matched %v", err, err, tt.notSentinel)
+			}
+			var refused *StartupRefusedError
+			if !errors.As(err, &refused) {
+				t.Fatalf("Connect error = %T %v, want StartupRefusedError", err, err)
+			}
+			if refused.Reason != tt.wantReason {
+				t.Fatalf("StartupRefusedError reason = %q, want %q", refused.Reason, tt.wantReason)
+			}
+			var gotStartup *daemonlaunch.StartupError
+			if !errors.As(err, &gotStartup) || gotStartup != startupErr {
+				t.Fatalf("Connect error = %T %v, want wrapped StartupError", err, err)
+			}
+		})
 	}
 }
 
-func TestConnectAutostartChildExitGenericNonZeroPrompt(t *testing.T) {
+func TestConnectAutostartStartupErrorNonAuthorityNotTyped(t *testing.T) {
 	t.Parallel()
 	root := shortClientTempDir(t)
-	const startTimeout = time.Second
+	startupErr := &daemonlaunch.StartupError{
+		Kind:    daemonlaunch.ErrStartupFailed,
+		Code:    daemonlaunch.CodeAlreadyListening,
+		Message: "existing daemon verification failed",
+	}
 	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
-		return StartResult{
-			PID: 12345,
-			Wait: func(context.Context) (int, error) {
-				return 42, errors.New("exit status 42")
-			},
-		}, nil
+		return StartResult{}, startupErr
 	})
 
-	start := time.Now()
 	client, err := Connect(context.Background(), Options{
-		StateRoot:    root,
-		Token:        "token",
-		StartTimeout: startTimeout,
-		Starter:      starter,
+		StateRoot: root,
+		Token:     "token",
+		Starter:   starter,
 	})
-	elapsed := time.Since(start)
 	if client != nil {
 		_ = client.Close()
 	}
 	if err == nil {
-		t.Fatal("Connect succeeded, want startup failure")
+		t.Fatal("Connect succeeded, want startup error")
 	}
 	if errors.Is(err, ErrRootFailStopped) || errors.Is(err, ErrRootSealed) {
-		t.Fatalf("Connect error = %T %v, want generic startup error", err, err)
+		t.Fatalf("Connect error = %T %v, want non-authority startup error", err, err)
 	}
 	var refused *StartupRefusedError
 	if errors.As(err, &refused) {
 		t.Fatalf("Connect error = %T %v, unexpectedly matched StartupRefusedError", err, err)
 	}
-	if !strings.Contains(err.Error(), "exit code 42") {
-		t.Fatalf("Connect error = %v, want exit code diagnostic", err)
-	}
-	if elapsed >= startTimeout/2 {
-		t.Fatalf("Connect elapsed = %s, want prompt child-exit failure", elapsed)
+	var gotStartup *daemonlaunch.StartupError
+	if !errors.As(err, &gotStartup) || gotStartup != startupErr {
+		t.Fatalf("Connect error = %T %v, want original StartupError", err, err)
 	}
 }
 
-func TestConnectAutostartNoChildExitKeepsTimeoutBehavior(t *testing.T) {
+func TestConnectAutostartStartResultKeepsTimeoutBehavior(t *testing.T) {
 	t.Parallel()
 	root := shortClientTempDir(t)
 	const startTimeout = 180 * time.Millisecond
 	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
-		return StartResult{
-			PID: 12345,
-			Wait: func(ctx context.Context) (int, error) {
-				<-ctx.Done()
-				return -1, ctx.Err()
-			},
-		}, nil
+		return StartResult{PID: 12345}, nil
 	})
 
 	start := time.Now()

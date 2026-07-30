@@ -34,9 +34,6 @@ const (
 	cliExitShutdownForced              = 13
 	cliExitAuthorityStartupFailStopped = daemonlaunch.ExitAuthorityFailStopped
 	cliExitAuthorityStartupRootSealed  = daemonlaunch.ExitAuthorityRootSealed
-
-	// Keep this local so cmd/agentbus reaches served only through agentbusserve.
-	cliStartupCodeServedSafetyFailStopped = "served safety fail-stop"
 )
 
 var version = "dev"
@@ -963,7 +960,7 @@ func serveCommandError(errOut io.Writer, err error) int {
 	switch {
 	case errors.Is(err, authority.ErrRootSealed):
 		return cliExitAuthorityStartupRootSealed
-	case errors.Is(err, authority.ErrFailStopped):
+	case errors.Is(err, authority.ErrFailStopped), errors.Is(err, authority.ErrFailStopRecord):
 		return cliExitAuthorityStartupFailStopped
 	case errors.Is(err, agentbusserve.ErrShutdownDeadlineExceeded):
 		return cliExitShutdownForced
@@ -1035,7 +1032,7 @@ func startupErrorIsAuthorityFailStop(err *daemonlaunch.StartupError) bool {
 		return false
 	}
 	switch strings.TrimSpace(err.Code) {
-	case authority.ErrFailStopped.Error(), cliStartupCodeServedSafetyFailStopped:
+	case daemonlaunch.CodeAuthorityFailStopped, authority.ErrFailStopped.Error(), authority.ErrFailStopRecord.Error():
 		return true
 	default:
 		return false
