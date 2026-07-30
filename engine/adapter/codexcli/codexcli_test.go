@@ -1,12 +1,16 @@
 package codexcli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,577 +18,719 @@ import (
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
-func TestCodexProfilesAndParsing(t *testing.T) {
-	fake := fakeCodex(t)
-	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
-	session, err := backend.Start(context.Background(), engine.SessionOpts{Write: true, Model: "gpt-5", Effort: "high"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello", Write: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := collect(events)
-	if session.ID() != "codex-session" {
-		t.Fatalf("session id = %q", session.ID())
-	}
-	if len(got) != 4 || got[0].Type != engine.EventAgentText || got[1].Type != engine.EventToolUse || got[2].Type != engine.EventAgentText || got[3].Type != engine.EventResultMessage {
-		t.Fatalf("events = %#v", got)
-	}
-	if got[3].Text != "final answer" {
-		t.Fatalf("terminal result = %q", got[3].Text)
-	}
-	assertLog(t, fake.argv, "exec\n--json\n--model\ngpt-5\n--sandbox\nworkspace-write\n--config\nmodel_reasoning_effort=\"high\"\n-\n")
-	assertLog(t, fake.stdin, "hello")
+func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing.T) {
+	t.Run("handshake order", func(t *testing.T) {
+		cwd := t.TempDir()
+		runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+			peer := newAppServerPeer(t, proc)
+			init := peer.expectRequest("initialize")
+			peer.respond(init, initializeResult())
+			peer.expectNotification("initialized")
+			thread := peer.expectRequest("thread/start")
+			peer.respond(thread, threadResult("thread-1"))
+			turn := peer.expectRequest("turn/start")
+			peer.respond(turn, turnResult("turn-1"))
+			peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+		})
 
-	session, err = backend.Resume(context.Background(), "codex-session", engine.SessionOpts{Write: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	events, err = session.Turn(context.Background(), engine.TurnInput{Prompt: "repair", Write: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = collect(events)
-	assertLog(t, fake.argv, "exec\n--json\n--sandbox\nread-only\n--ignore-user-config\nresume\ncodex-session\n-\n")
-	assertLog(t, fake.stdin, "repair")
+		session := startFakeCodexSession(t, engine.SessionOpts{CWD: cwd, Model: "gpt-5", Effort: "high"})
+		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = collectEventsWithTimeout(t, events, 2*time.Second)
+		spec := runner.lastSpec()
+		if strings.Join(spec.Argv, "\x00") != "fake-codex\x00app-server" {
+			t.Fatalf("argv = %#v", spec.Argv)
+		}
+		if spec.Dir != cwd {
+			t.Fatalf("dir = %q, want %q", spec.Dir, cwd)
+		}
+	})
+
+	t.Run("initialize failure", func(t *testing.T) {
+		runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+			peer := newAppServerPeer(t, proc)
+			init := peer.expectRequest("initialize")
+			peer.respondError(init, "initialize failed")
+		})
+
+		session := startFakeCodexSession(t, engine.SessionOpts{})
+		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := collectEventsWithTimeout(t, events, 2*time.Second)
+		if !containsEvent(got, engine.EventTerminalError, "initialize failed") {
+			t.Fatalf("events = %#v, want terminal initialize error", got)
+		}
+	})
 }
 
-func TestCodexTrustCheckFlagMatchesCWD(t *testing.T) {
-	gitRoot := t.TempDir()
-	if err := os.Mkdir(filepath.Join(gitRoot, ".git"), 0o700); err != nil {
+func TestAppServerThreadsStartThenResumeWithReturnedID(t *testing.T) {
+	runner := newFakeAppServerRunner(t,
+		func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+			peer := newAppServerPeer(t, proc)
+			peer.handshake()
+			thread := peer.expectRequest("thread/start")
+			if _, ok := thread["params"].(map[string]any)["threadId"]; ok {
+				t.Fatalf("thread/start params = %#v, did not want threadId", thread["params"])
+			}
+			peer.respond(thread, threadResult("thread-1"))
+			turn := peer.expectRequest("turn/start")
+			assertParam(t, turn, "threadId", "thread-1")
+			peer.respond(turn, turnResult("turn-1"))
+			peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+		},
+		func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+			peer := newAppServerPeer(t, proc)
+			peer.handshake()
+			thread := peer.expectRequest("thread/resume")
+			assertParam(t, thread, "threadId", "thread-1")
+			peer.respond(thread, threadResult("thread-1"))
+			turn := peer.expectRequest("turn/start")
+			assertParam(t, turn, "threadId", "thread-1")
+			peer.respond(turn, turnResult("turn-2"))
+			peer.notify("turn/completed", completedParams("thread-1", "turn-2", "completed", ""))
+		},
+	)
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "first"}, runner)
+	if err != nil {
 		t.Fatal(err)
 	}
-	nestedGitDir := filepath.Join(gitRoot, "nested", "workspace")
-	if err := os.MkdirAll(nestedGitDir, 0o700); err != nil {
-		t.Fatal(err)
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	if session.ID() != "thread-1" {
+		t.Fatalf("session id after first turn = %q, want thread-1", session.ID())
 	}
 
-	worktreeRoot := t.TempDir()
-	if err := os.WriteFile(filepath.Join(worktreeRoot, ".git"), []byte("gitdir: /tmp/worktree.git\n"), 0o600); err != nil {
+	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "second"}, runner)
+	if err != nil {
 		t.Fatal(err)
 	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	if session.ID() != "thread-1" {
+		t.Fatalf("session id after resume = %q, want thread-1", session.ID())
+	}
+}
 
+func TestAppServerCompletedTurnUsesLastCompletedAgentMessageAsResult(t *testing.T) {
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1", "delta": "streamed "})
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-1", "type": "agentMessage", "text": "draft"}))
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-2", "type": "agentMessage", "text": "final answer"}))
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if resultText(got) != "final answer" {
+		t.Fatalf("events = %#v, want authoritative final answer result", got)
+	}
+	if !containsEvent(got, engine.EventAgentText, "streamed ") || !containsEvent(got, engine.EventAgentText, "draft") {
+		t.Fatalf("events = %#v, want streamed and completed agent text", got)
+	}
+}
+
+func TestAppServerTerminalTurnStatuses(t *testing.T) {
 	tests := []struct {
-		name     string
-		cwd      string
-		resume   bool
-		write    bool
-		wantSkip bool
+		name      string
+		status    string
+		errorText string
+		want      string
 	}{
-		{name: "git repository write", cwd: gitRoot, write: true},
-		{name: "nested git repository read-only", cwd: nestedGitDir},
-		{name: "git file worktree", cwd: worktreeRoot},
-		{name: "non-git write", cwd: t.TempDir(), write: true, wantSkip: true},
-		{name: "non-git read-only", cwd: t.TempDir(), wantSkip: true},
-		{name: "non-git resume", cwd: t.TempDir(), resume: true, wantSkip: true},
+		{name: "failed", status: "failed", errorText: "model failed", want: "model failed"},
+		{name: "unrequested interrupted", status: "interrupted", want: "interrupted"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fake := fakeCodex(t)
-			backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
-			opts := engine.SessionOpts{CWD: test.cwd, Write: test.write}
-			var session engine.Session
-			var err error
-			if test.resume {
-				session, err = backend.Resume(context.Background(), "codex-session", opts)
-			} else {
-				session, err = backend.Start(context.Background(), opts)
-			}
+			runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+				peer := newAppServerPeer(t, proc)
+				peer.handshake()
+				thread := peer.expectRequest("thread/start")
+				peer.respond(thread, threadResult("thread-1"))
+				turn := peer.expectRequest("turn/start")
+				peer.respond(turn, turnResult("turn-1"))
+				peer.notify("turn/completed", completedParams("thread-1", "turn-1", test.status, test.errorText))
+			})
+
+			session := startFakeCodexSession(t, engine.SessionOpts{})
+			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
 			if err != nil {
 				t.Fatal(err)
 			}
-			events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello", Write: test.write})
-			if err != nil {
-				t.Fatal(err)
+			got := collectEventsWithTimeout(t, events, 2*time.Second)
+			if !containsEvent(got, engine.EventTerminalError, test.want) {
+				t.Fatalf("events = %#v, want terminal error containing %q", got, test.want)
 			}
-			_ = collect(events)
-			argv, err := os.ReadFile(fake.argv)
-			if err != nil {
-				t.Fatal(err)
-			}
-			gotSkip := strings.Contains(string(argv), "--skip-git-repo-check\n")
-			if gotSkip != test.wantSkip {
-				t.Fatalf("argv = %q, skip flag = %t, want %t", string(argv), gotSkip, test.wantSkip)
-			}
-			if test.resume && !strings.Contains(string(argv), "resume\ncodex-session\n-\n") {
-				t.Fatalf("resume argv = %q", string(argv))
+			if resultText(got) != "" {
+				t.Fatalf("events = %#v, did not want fabricated success result", got)
 			}
 		})
 	}
 }
 
-func TestCodexTrustCheckFlagUsesProcessCWDWhenUnset(t *testing.T) {
-	original, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chdir(original); err != nil {
+func TestAppServerAnswersServerRequestsAndContinues(t *testing.T) {
+	t.Run("known approval and elicitation requests", func(t *testing.T) {
+		runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+			peer := newAppServerPeer(t, proc)
+			peer.handshake()
+			thread := peer.expectRequest("thread/start")
+			peer.respond(thread, threadResult("thread-1"))
+			turn := peer.expectRequest("turn/start")
+			peer.respond(turn, turnResult("turn-1"))
+
+			peer.serverRequest("srv-approval", "item/commandExecution/requestApproval", map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "cmd-1"})
+			approval := peer.expectResponse("srv-approval")
+			if got := nestedString(approval, "result", "decision"); got != "decline" {
+				t.Fatalf("approval response = %#v, want decision decline", approval)
+			}
+
+			peer.serverRequest("srv-elicitation", "mcpServer/elicitation/request", map[string]any{"threadId": "thread-1", "serverName": "mcp", "mode": "form", "message": "question"})
+			elicitation := peer.expectResponse("srv-elicitation")
+			if got := nestedString(elicitation, "result", "action"); got != "decline" {
+				t.Fatalf("elicitation response = %#v, want action decline", elicitation)
+			}
+
+			peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-1", "type": "agentMessage", "text": "done"}))
+			peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+		})
+
+		session := startFakeCodexSession(t, engine.SessionOpts{})
+		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		if err != nil {
 			t.Fatal(err)
 		}
+		got := collectEventsWithTimeout(t, events, 2*time.Second)
+		if resultText(got) != "done" {
+			t.Fatalf("events = %#v, want completed turn after answered requests", got)
+		}
 	})
-	if err := os.Chdir(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
-	args, err := buildArgs("", engine.SessionOpts{}, engine.TurnInput{})
+
+	t.Run("unsupported server request", func(t *testing.T) {
+		runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+			peer := newAppServerPeer(t, proc)
+			peer.handshake()
+			thread := peer.expectRequest("thread/start")
+			peer.respond(thread, threadResult("thread-1"))
+			turn := peer.expectRequest("turn/start")
+			peer.respond(turn, turnResult("turn-1"))
+
+			peer.serverRequest("srv-unsupported", "unknown/request", map[string]any{})
+			response := peer.expectResponse("srv-unsupported")
+			if got := nestedString(response, "error", "message"); !strings.Contains(got, "unsupported server request") {
+				t.Fatalf("unsupported response = %#v", response)
+			}
+			peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-1", "type": "agentMessage", "text": "done"}))
+			peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+		})
+
+		session := startFakeCodexSession(t, engine.SessionOpts{})
+		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := collectEventsWithTimeout(t, events, 2*time.Second)
+		if resultText(got) != "done" {
+			t.Fatalf("events = %#v, want completion after unsupported request error response", got)
+		}
+	})
+}
+
+func TestAppServerUnknownNotificationIsIgnored(t *testing.T) {
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("new/notification", map[string]any{"unexpected": true})
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-1", "type": "agentMessage", "text": "still done"}))
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !containsString(args, "--skip-git-repo-check") {
-		t.Fatalf("args = %#v, want non-git process CWD trust-check bypass", args)
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if resultText(got) != "still done" {
+		t.Fatalf("events = %#v, want completion despite unknown notification", got)
 	}
 }
 
-func TestCodexSetupProbeUsesStdinPromptArg(t *testing.T) {
-	fake := fakeCodex(t)
-	writeModelsCache(t, filepath.Dir(fake.bin), `{
-  "fetched_at": "2026-07-10T12:00:00Z",
-  "client_version": "0.142.0",
-  "models": [{"slug":"gpt-5.4","visibility":"list","supported_reasoning_levels":[{"effort":"high"}]}]
-}`)
-	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
-	probeBackend, ok := backend.(interface {
-		SetupProbe(context.Context) (engine.BackendSetupProbe, error)
+func TestAppServerSetupQualifyDiscoversModelsAndRequiresOne(t *testing.T) {
+	t.Run("discovers model list", func(t *testing.T) {
+		runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+			peer := newAppServerPeer(t, proc)
+			peer.handshake()
+			req := peer.expectRequest("model/list")
+			peer.respond(req, map[string]any{
+				"data": []any{
+					map[string]any{
+						"model": "gpt-5.4",
+						"supportedReasoningEfforts": []any{
+							map[string]any{"reasoningEffort": "high"},
+							map[string]any{"reasoningEffort": "low"},
+						},
+					},
+					map[string]any{
+						"id":                        "id-only-model",
+						"supportedReasoningEfforts": []any{"xhigh"},
+					},
+				},
+			})
+		})
+		driver := newAppServerDriver("fake-codex")
+		discovery, err := driver.SetupQualify(context.Background(), runner, engine.SessionOpts{CWD: t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(discovery.Models, ","); got != "gpt-5.4,id-only-model" {
+			t.Fatalf("models = %q", got)
+		}
+		if got := strings.Join(discovery.Efforts, ","); got != "low,high,xhigh" {
+			t.Fatalf("efforts = %q", got)
+		}
+		if discovery.Source != "app-server" || discovery.FetchedAt == "" {
+			t.Fatalf("discovery provenance = %#v", discovery)
+		}
 	})
-	if !ok {
-		t.Fatal("backend does not implement SetupProbe")
-	}
-	probe, err := probeBackend.SetupProbe(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !probe.JSONEventsProbed {
-		t.Fatalf("probe = %#v", probe)
-	}
-	if probe.DiscoverySource != "models_cache" || probe.DiscoveryFetchedAt != "2026-07-10T12:00:00Z" || probe.DiscoveryClientVersion != "0.142.0" || !containsString(probe.DiscoveryWarnings, "client_version") {
-		t.Fatalf("discovery provenance = %#v", probe)
-	}
-	assertLog(t, fake.argv, "exec\n--json\n--sandbox\nread-only\n--ignore-user-config\n-\n")
-	assertLog(t, fake.stdin, "Reply with exactly: OK")
+
+	t.Run("zero models fails", func(t *testing.T) {
+		runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+			peer := newAppServerPeer(t, proc)
+			peer.handshake()
+			req := peer.expectRequest("model/list")
+			peer.respond(req, map[string]any{"data": []any{}})
+		})
+		driver := newAppServerDriver("fake-codex")
+		discovery, err := driver.SetupQualify(context.Background(), runner, engine.SessionOpts{CWD: t.TempDir()})
+		if err == nil || !strings.Contains(err.Error(), "no usable models") || len(discovery.Models) != 0 {
+			t.Fatalf("discovery=%#v err=%v, want zero-model qualification failure", discovery, err)
+		}
+	})
 }
 
-func TestCodexPreflightAndFailures(t *testing.T) {
-	fake := fakeCodex(t)
+func TestCodexPreflightUsesAppServerStreamSchema(t *testing.T) {
+	fake := fakeVersionCodex(t)
 	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
 	health, err := backend.Preflight(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health.Version != MinimumKnownGoodVersion || health.StreamSchema != StreamSchema {
+	if health.StreamSchema != "codex-appserver-v1" {
 		t.Fatalf("health = %#v", health)
 	}
-	writeCache(t, fake.cache, "codex", fake.bin, "0.142.0", StreamSchema)
-	if _, err := backend.Preflight(context.Background()); err == nil || !strings.Contains(err.Error(), "backend version changed since setup") {
-		t.Fatalf("drift err = %v", err)
-	}
-	if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: "xhigh"}); err != nil {
-		t.Fatalf("xhigh effort err = %v", err)
-	}
-	if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: "extreme"}); err == nil || !strings.Contains(err.Error(), "unsupported effort") {
-		t.Fatalf("unsupported effort err = %v", err)
-	}
-	restricted := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"gpt-5"}})
-	if _, err := restricted.Start(context.Background(), engine.SessionOpts{Model: "not-a-model"}); err == nil || !strings.Contains(err.Error(), "unsupported model") {
-		t.Fatalf("unsupported model err = %v", err)
-	}
 }
 
-func TestCodexDiscoveryUsesModelsCacheRatherThanHelpText(t *testing.T) {
-	fake := fakeCodex(t)
-	script := "#!/bin/sh\nif [ \"$1\" = --help ]; then echo \"-m, --model <MODEL>  Model the agent should use\"; echo \"possible values: c, disk-full-read-access, o3\"; exit 0; fi\nexec /bin/false\n"
-	if err := os.WriteFile(fake.bin, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	discovery, err := New(Options{Binary: fake.bin, CachePath: fake.cache}).(interface {
-		DiscoverModels(context.Context, command.ProbeRunner) (*engine.ModelDiscovery, error)
-	}).DiscoverModels(context.Background(), command.DirectProbeRunner{})
-	if discovery != nil || err == nil || !strings.Contains(err.Error(), "models cache") {
-		t.Fatalf("discovery=%+v err=%v", discovery, err)
-	}
-}
-
-func TestCodexDiscoveryReadsModelsCache(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("CODEX_HOME", home)
-	writeModelsCache(t, home, `{
-  "fetched_at": "2026-07-11T12:00:00Z",
-  "client_version": "0.143.0",
-  "unexpected": "ignored",
-  "models": [
-    {"slug":"gpt-5.4","display_name":"GPT-5.4","visibility":"list","supported_reasoning_levels":[{"effort":"high"},{"effort":"low"},{"effort":"turbo"}]},
-    {"slug":"codex-auto-review","visibility":"hidden","supported_reasoning_levels":[{"effort":"ultra"}]},
-    {"slug":"","visibility":"hidden"},
-    {"slug":"  ","visibility":"list"},
-    {"slug":"gpt-5.3","visibility":"list","supported_reasoning_levels":[{"effort":"none"},{"effort":"max"},{"effort":"turbo"},{"effort":"custom"}]}
-  ]
-}`)
-	discovery, err := discoverModels(context.Background(), command.DirectProbeRunner{}, "unused")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := strings.Join(discovery.Models, ","), "gpt-5.4,gpt-5.3"; got != want {
-		t.Fatalf("models = %q, want %q", got, want)
-	}
-	if got, want := strings.Join(discovery.Efforts, ","), "none,low,high,max,turbo,custom"; got != want {
-		t.Fatalf("efforts = %q, want %q", got, want)
-	}
-	if discovery.Source != "models_cache" || discovery.FetchedAt != "2026-07-11T12:00:00Z" || discovery.ClientVersion != "0.143.0" {
-		t.Fatalf("discovery provenance = %#v", discovery)
-	}
-	if !containsString(discovery.Warnings, "empty slug") {
-		t.Fatalf("warnings = %#v, want empty-slug skip warning", discovery.Warnings)
-	}
-}
-
-func TestCodexDiscoveryReportsMissingMalformedAndStaleCache(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("CODEX_HOME", home)
-	if discovery, err := discoverModels(context.Background(), command.DirectProbeRunner{}, "unused"); discovery != nil || err == nil || !strings.Contains(err.Error(), "models cache") {
-		t.Fatalf("missing discovery=%+v err=%v", discovery, err)
-	}
-	writeModelsCache(t, home, `{not-json`)
-	if discovery, err := discoverModels(context.Background(), command.DirectProbeRunner{}, "unused"); discovery != nil || err == nil || !strings.Contains(err.Error(), "parse models cache") {
-		t.Fatalf("malformed discovery=%+v err=%v", discovery, err)
-	}
-	writeModelsCache(t, home, `{"fetched_at":"2020-01-01T00:00:00Z","models":[{"slug":"gpt-5.4","visibility":"list"}]}`)
-	discovery, err := discoverModels(context.Background(), command.DirectProbeRunner{}, "unused")
-	if err != nil || !containsString(discovery.Warnings, "older than 7 days") {
-		t.Fatalf("stale discovery=%+v err=%v", discovery, err)
-	}
-}
-
-func TestCodexSetupProbeReportsModelsCacheFailuresWithoutFailing(t *testing.T) {
-	fake := fakeCodex(t)
-	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
-	probeBackend := backend.(interface {
-		SetupProbe(context.Context) (engine.BackendSetupProbe, error)
-	})
-	probe, err := probeBackend.SetupProbe(context.Background())
-	if err != nil || len(probe.DiscoveredModels) != 0 || len(probe.DiscoveredEfforts) != 0 || !containsString(probe.DiscoveryWarnings, "read models cache") {
-		t.Fatalf("missing cache probe=%#v err=%v", probe, err)
-	}
-	writeModelsCache(t, filepath.Dir(fake.bin), `{not-json`)
-	probe, err = probeBackend.SetupProbe(context.Background())
-	if err != nil || len(probe.DiscoveredModels) != 0 || len(probe.DiscoveredEfforts) != 0 || !containsString(probe.DiscoveryWarnings, "parse models cache") {
-		t.Fatalf("malformed cache probe=%#v err=%v", probe, err)
-	}
-}
-
-func TestCodexDiscoveredCacheWinsAndLegacyFallsBack(t *testing.T) {
-	fake := fakeCodex(t)
-	writeModelsCache(t, filepath.Dir(fake.bin), `{
-  "fetched_at": "2026-07-11T12:00:00Z",
-  "client_version": "0.143.0",
-  "models": [{"slug":"discovered","visibility":"list","supported_reasoning_levels":[{"effort":"turbo"}]}]
-}`)
-	backend := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"static"}, SupportedEfforts: []string{"low"}})
-	probed := probeBackendForTest(t, backend)
-	if _, err := probed.Start(context.Background(), engine.SessionOpts{Model: "discovered", Effort: "turbo"}); err != nil {
-		t.Fatal(err)
-	}
-	session, err := probed.Start(context.Background(), engine.SessionOpts{Model: "static", Effort: "low"})
-	if err != nil {
-		t.Fatalf("discovered mismatch should pass through: %v", err)
-	}
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := collect(events); !containsWarning(got, "not in the discovered") {
-		t.Fatalf("events=%#v, want discovered-catalog warning", got)
-	}
-	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "discovered"}); err == nil || !strings.Contains(err.Error(), "unsupported model") {
-		t.Fatalf("unprobed backend should use static validation, err=%v", err)
-	}
-	v1 := fmt.Sprintf(`{"version":1,"backends":[{"backend":"codex","binaryPath":%q,"version":%q,"streamSchema":%q,"jsonEventsProbed":true}]}`, fake.bin, MinimumKnownGoodVersion, StreamSchema)
-	if err := os.WriteFile(fake.cache, []byte(v1), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "static", Effort: "low"}); err != nil {
-		t.Fatalf("legacy fallback: %v", err)
-	}
-	health, err := backend.Preflight(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "re-run agentbus setup") {
-		t.Fatalf("health=%+v err=%v", health, err)
-	}
-	legacy, err := engine.ReadSetupProbeCache(fake.cache)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := engine.WriteSetupProbeCache(fake.cache, legacy); err != nil {
-		t.Fatal(err)
-	}
-	migrated, err := engine.ReadSetupProbeCache(fake.cache)
-	if err != nil || migrated.Version != engine.SetupProbeCacheVersion {
-		t.Fatalf("migrated=%+v err=%v", migrated, err)
-	}
-}
-
-func TestCodexEmptyDiscoveredCatalogFallsBackToStaticEnforcement(t *testing.T) {
-	fake := fakeCodex(t)
-	writeModelsCache(t, filepath.Dir(fake.bin), `{"fetched_at":"2026-07-11T12:00:00Z","client_version":"0.143.0","models":[]}`)
-	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
-	probed := probeBackendForTest(t, backend)
-	if _, err := probed.Start(context.Background(), engine.SessionOpts{Effort: "turbo"}); err == nil || !strings.Contains(err.Error(), "unsupported effort") {
-		t.Fatalf("empty discovered catalog must fall back to static effort enforcement, err=%v", err)
-	}
-	if _, err := probed.Start(context.Background(), engine.SessionOpts{Effort: "xhigh"}); err != nil {
-		t.Fatalf("static effort should pass: %v", err)
-	}
-}
-
-func TestCodexSetupProbeCacheProvenanceRoundTripAndLegacyRequiresSetup(t *testing.T) {
-	fake := fakeCodex(t)
-	cache := engine.SetupProbeCache{Backends: []engine.BackendSetupProbe{{
-		Backend:                "codex",
-		BinaryPath:             fake.bin,
-		Version:                MinimumKnownGoodVersion,
-		StreamSchema:           StreamSchema,
-		DiscoverySource:        "models_cache",
-		DiscoveryFetchedAt:     "2026-07-11T12:00:00Z",
-		DiscoveryClientVersion: MinimumKnownGoodVersion,
-		DiscoveredModels:       []string{"gpt-5.4"},
-		DiscoveredEfforts:      []string{"medium", "high"},
-		DiscoveryWarnings:      []string{"cache is stale"},
-	}}}
-	if err := engine.WriteSetupProbeCache(fake.cache, cache); err != nil {
-		t.Fatal(err)
-	}
-	roundTrip, err := engine.ReadSetupProbeCache(fake.cache)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if roundTrip.Version != engine.SetupProbeCacheVersion || len(roundTrip.Backends) != 1 || roundTrip.Backends[0].DiscoveryFetchedAt != "2026-07-11T12:00:00Z" || roundTrip.Backends[0].DiscoveryClientVersion != MinimumKnownGoodVersion {
-		t.Fatalf("cache round trip = %#v", roundTrip)
-	}
-
-	legacy := fmt.Sprintf(`{"version":2,"backends":[{"backend":"codex","binaryPath":%q,"version":%q,"streamSchema":%q}]}`, fake.bin, MinimumKnownGoodVersion, StreamSchema)
-	if err := os.WriteFile(fake.cache, []byte(legacy), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
-	if _, err := backend.Preflight(context.Background()); err == nil || !strings.Contains(err.Error(), "re-run agentbus setup") {
-		t.Fatalf("legacy cache preflight err = %v", err)
-	}
-}
-
-func TestCodexUpgradedVersionFallsBackAndWarnsOnTurn(t *testing.T) {
-	fake := fakeCodex(t)
-	backend := New(Options{Binary: fake.bin, CachePath: fake.cache, SupportedModels: []string{"static"}})
-	if _, err := backend.Start(context.Background(), engine.SessionOpts{Model: "old-discovered"}); err == nil {
-		t.Fatal("unprobed discovered model unexpectedly accepted")
-	}
-	session, err := backend.Start(context.Background(), engine.SessionOpts{Model: "static"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := collect(events); containsWarning(got, "stale") {
-		t.Fatalf("events=%#v, want no stale discovery warning from unprobed validation", got)
-	}
-}
-
-func TestCodexLegacyAliasResultMessage(t *testing.T) {
-	events, id, err := parseEvent(map[string]any{
-		"type":               "task_complete",
-		"session_id":         "codex-session",
-		"last_agent_message": "final answer",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if id != "codex-session" || len(events) != 1 || events[0].Type != engine.EventResultMessage || events[0].Text != "final answer" {
-		t.Fatalf("parse task_complete = events:%#v id:%q", events, id)
-	}
-}
-
-func TestCodexDottedEventSchema(t *testing.T) {
-	events, id, err := parseEvent(map[string]any{
-		"type":      "thread.started",
-		"thread_id": "codex-session",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if id != "codex-session" || len(events) != 0 {
-		t.Fatalf("parse thread.started = events:%#v id:%q", events, id)
-	}
-
-	events, id, err = parseEvent(map[string]any{
-		"type": "item.completed",
-		"item": map[string]any{
-			"type": "agent_message",
-			"text": "stream text",
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(events) != 1 || events[0].Type != engine.EventAgentText || events[0].Text != "stream text" {
-		t.Fatalf("parse agent item.completed = events:%#v id:%q", events, id)
-	}
-
-	events, _, err = parseEvent(map[string]any{
-		"type": "item.completed",
-		"item": map[string]any{
-			"type":    "command_execution",
-			"command": "git status",
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(events) != 1 || events[0].Type != engine.EventToolUse || events[0].Text != "git status" {
-		t.Fatalf("parse tool item.completed = %#v", events)
-	}
-}
-
-func TestCodexParseReportedModel(t *testing.T) {
-	events, id, err := parseEvent(map[string]any{"type": "session_configured", "thread_id": "codex-session", "model": "gpt-5.4"})
-	if err != nil || id != "codex-session" || len(events) != 1 || events[0].Type != engine.EventModelReported || events[0].ModelReported != "gpt-5.4" {
-		t.Fatalf("session_configured events=%#v id=%q err=%v", events, id, err)
-	}
-	events, _, err = parseEvent(map[string]any{"type": "thread.started", "model": ""})
-	if err != nil || len(events) != 0 {
-		t.Fatalf("empty model events=%#v err=%v", events, err)
-	}
-}
-
-func TestCodexTimeoutInterruptAndTruncation(t *testing.T) {
-	fake := fakeCodex(t)
-	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
-	session, err := backend.Start(context.Background(), engine.SessionOpts{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "huge", Write: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := collect(events)
-	if len(got) == 0 || !got[0].Truncated {
-		t.Fatalf("expected truncated event, got %#v", got)
-	}
-
-	events, err = session.Turn(context.Background(), engine.TurnInput{Prompt: "sleep", Write: false, Timeout: 50 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got = collect(events)
-	if !containsWarning(got, "timed out") {
-		t.Fatalf("expected timeout warning, got %#v", got)
-	}
-
-	events, err = session.Turn(context.Background(), engine.TurnInput{Prompt: "sleep interrupt-turn", Write: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The fixture writes this turn's prompt to the stdin log strictly AFTER
-	// installing its TERM trap, so observing the prompt proves the trap is
-	// armed. A blind sleep raced trap installation under full-sweep load and
-	// let SIGTERM kill the untrapped shell before it could record the signal.
-	waitForFileContains(t, fake.stdin, "interrupt-turn")
-	if err := session.Interrupt(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	_ = collect(events)
-	if b, _ := os.ReadFile(fake.term); !strings.Contains(string(b), "TERM") {
-		t.Fatalf("expected fake backend to receive SIGTERM, got %q", string(b))
-	}
-}
-
-type fakeCLI struct {
-	bin   string
-	cache string
-	argv  string
-	stdin string
-	term  string
-}
-
-func probeBackendForTest(t *testing.T, backend engine.Backend) engine.Backend {
+func startFakeCodexSession(t *testing.T, opts engine.SessionOpts) engine.Session {
 	t.Helper()
-	probeable, ok := backend.(interface {
-		ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error)
+	backend := New(Options{Binary: "fake-codex"})
+	session, err := backend.Start(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session
+}
+
+func turnWithRunner(t *testing.T, session engine.Session, input engine.TurnInput, runner command.Runner) (<-chan engine.Event, error) {
+	t.Helper()
+	turner, ok := session.(interface {
+		TurnWithRunner(context.Context, engine.TurnInput, command.Runner) (<-chan engine.Event, error)
 	})
 	if !ok {
-		t.Fatal("backend does not implement ProbeBackend")
+		t.Fatal("session does not support TurnWithRunner")
 	}
-	probed, err := probeable.ProbeBackend(context.Background(), command.DirectProbeRunner{})
+	return turner.TurnWithRunner(context.Background(), input, runner)
+}
+
+type appServerPeerFunc func(*testing.T, *fakeAppServerProcess, command.ExecSpec)
+
+type fakeAppServerRunner struct {
+	t *testing.T
+
+	mu    sync.Mutex
+	peers []appServerPeerFunc
+	specs []command.ExecSpec
+}
+
+func newFakeAppServerRunner(t *testing.T, peers ...appServerPeerFunc) *fakeAppServerRunner {
+	t.Helper()
+	return &fakeAppServerRunner{t: t, peers: append([]appServerPeerFunc(nil), peers...)}
+}
+
+func (r *fakeAppServerRunner) Start(_ context.Context, spec command.ExecSpec) (command.RunningCommand, error) {
+	r.mu.Lock()
+	if len(r.peers) == 0 {
+		r.mu.Unlock()
+		return nil, errors.New("unexpected fake app-server start")
+	}
+	peer := r.peers[0]
+	r.peers = r.peers[1:]
+	r.specs = append(r.specs, spec)
+	r.mu.Unlock()
+
+	proc := newFakeAppServerProcess()
+	go func() {
+		defer proc.closeOutputs()
+		defer proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+		peer(r.t, proc, spec)
+	}()
+	return proc, nil
+}
+
+func (r *fakeAppServerRunner) lastSpec() command.ExecSpec {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.specs) == 0 {
+		return command.ExecSpec{}
+	}
+	return r.specs[len(r.specs)-1]
+}
+
+type fakeAppServerProcess struct {
+	stdinR  *io.PipeReader
+	stdinW  *trackedPipeWriter
+	stdoutR *io.PipeReader
+	stdoutW *io.PipeWriter
+	stderrR *io.PipeReader
+	stderrW *io.PipeWriter
+
+	waitCh      chan struct{}
+	finishOnce  sync.Once
+	outputsOnce sync.Once
+	exit        command.ExitObservation
+	waitErr     error
+	interrupts  atomic.Int32
+	stdinClosed atomic.Bool
+}
+
+func newFakeAppServerProcess() *fakeAppServerProcess {
+	stdinR, stdinW := io.Pipe()
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	proc := &fakeAppServerProcess{
+		stdinR:  stdinR,
+		stdoutR: stdoutR,
+		stdoutW: stdoutW,
+		stderrR: stderrR,
+		stderrW: stderrW,
+		waitCh:  make(chan struct{}),
+	}
+	proc.stdinW = &trackedPipeWriter{PipeWriter: stdinW, closed: &proc.stdinClosed}
+	return proc
+}
+
+func (p *fakeAppServerProcess) Stdin() io.WriteCloser {
+	return p.stdinW
+}
+
+func (p *fakeAppServerProcess) Stdout() io.ReadCloser {
+	return p.stdoutR
+}
+
+func (p *fakeAppServerProcess) Stderr() io.ReadCloser {
+	return p.stderrR
+}
+
+func (p *fakeAppServerProcess) Wait(ctx context.Context) (command.ExitObservation, error) {
+	select {
+	case <-p.waitCh:
+		return p.exit, p.waitErr
+	case <-ctx.Done():
+		return command.ExitObservation{}, ctx.Err()
+	}
+}
+
+func (p *fakeAppServerProcess) Interrupt(context.Context) error {
+	p.interrupts.Add(1)
+	return nil
+}
+
+func (p *fakeAppServerProcess) finish(exit command.ExitObservation, err error) {
+	p.finishOnce.Do(func() {
+		p.exit = exit
+		p.waitErr = err
+		close(p.waitCh)
+	})
+}
+
+func (p *fakeAppServerProcess) closeOutputs() {
+	p.outputsOnce.Do(func() {
+		_ = p.stdoutW.Close()
+		_ = p.stderrW.Close()
+	})
+}
+
+type trackedPipeWriter struct {
+	*io.PipeWriter
+	closed *atomic.Bool
+}
+
+func (w *trackedPipeWriter) Close() error {
+	w.closed.Store(true)
+	return w.PipeWriter.Close()
+}
+
+type appServerPeer struct {
+	t       *testing.T
+	proc    *fakeAppServerProcess
+	scanner *bufio.Scanner
+}
+
+func newAppServerPeer(t *testing.T, proc *fakeAppServerProcess) *appServerPeer {
+	t.Helper()
+	return &appServerPeer{
+		t:       t,
+		proc:    proc,
+		scanner: bufio.NewScanner(proc.stdinR),
+	}
+}
+
+func (p *appServerPeer) handshake() {
+	init := p.expectRequest("initialize")
+	p.respond(init, initializeResult())
+	p.expectNotification("initialized")
+}
+
+func (p *appServerPeer) expectRequest(method string) map[string]any {
+	p.t.Helper()
+	frame := p.readFrame()
+	if got := firstString(frame, "method"); got != method {
+		p.t.Fatalf("client method = %q, want %q in frame %#v", got, method, frame)
+	}
+	if _, ok := frame["id"]; !ok {
+		p.t.Fatalf("%s frame missing id: %#v", method, frame)
+	}
+	return frame
+}
+
+func (p *appServerPeer) expectNotification(method string) map[string]any {
+	p.t.Helper()
+	frame := p.readFrame()
+	if got := firstString(frame, "method"); got != method {
+		p.t.Fatalf("client notification method = %q, want %q in frame %#v", got, method, frame)
+	}
+	if _, ok := frame["id"]; ok {
+		p.t.Fatalf("%s notification unexpectedly has id: %#v", method, frame)
+	}
+	return frame
+}
+
+func (p *appServerPeer) expectResponse(id string) map[string]any {
+	p.t.Helper()
+	frame := p.readFrame()
+	if got := requestIDKey(frame["id"]); got != id {
+		p.t.Fatalf("response id = %q, want %q in frame %#v", got, id, frame)
+	}
+	if _, hasMethod := frame["method"]; hasMethod {
+		p.t.Fatalf("response has method: %#v", frame)
+	}
+	return frame
+}
+
+func (p *appServerPeer) respond(request map[string]any, result any) {
+	p.write(map[string]any{"id": request["id"], "result": result})
+}
+
+func (p *appServerPeer) respondError(request map[string]any, message string) {
+	p.write(map[string]any{
+		"id": request["id"],
+		"error": map[string]any{
+			"code":    -32000,
+			"message": message,
+		},
+	})
+}
+
+func (p *appServerPeer) notify(method string, params map[string]any) {
+	p.write(map[string]any{"method": method, "params": params})
+}
+
+func (p *appServerPeer) serverRequest(id, method string, params map[string]any) {
+	p.write(map[string]any{"id": id, "method": method, "params": params})
+}
+
+func (p *appServerPeer) readFrame() map[string]any {
+	p.t.Helper()
+	if !p.scanner.Scan() {
+		p.t.Fatalf("missing client frame: %v", p.scanner.Err())
+	}
+	var frame map[string]any
+	if err := json.Unmarshal(p.scanner.Bytes(), &frame); err != nil {
+		p.t.Fatalf("decode client frame %q: %v", p.scanner.Text(), err)
+	}
+	return frame
+}
+
+func (p *appServerPeer) write(v any) {
+	p.t.Helper()
+	payload, err := json.Marshal(v)
 	if err != nil {
-		t.Fatal(err)
+		p.t.Fatal(err)
 	}
-	return probed
-}
-
-func fakeCodex(t *testing.T) fakeCLI {
-	t.Helper()
-	dir := t.TempDir()
-	f := fakeCLI{
-		bin:   filepath.Join(dir, "fakecodex"),
-		cache: filepath.Join(dir, "setup-probes.json"),
-		argv:  filepath.Join(dir, "argv.log"),
-		stdin: filepath.Join(dir, "stdin.log"),
-		term:  filepath.Join(dir, "term.log"),
-	}
-	script := `#!/bin/sh
-if [ "$1" = "--version" ]; then echo "codex-cli 0.143.0"; exit 0; fi
-if [ "$1" = "--help" ]; then echo "codex help"; exit 0; fi
-trap 'echo TERM >> "$AGENTBUS_TERM_LOG"; exit 0' TERM
-: > "$AGENTBUS_ARGV_LOG"
-for arg in "$@"; do printf '%s\n' "$arg" >> "$AGENTBUS_ARGV_LOG"; done
-input=$(cat)
-printf '%s' "$input" > "$AGENTBUS_STDIN_LOG"
-last=
-for arg in "$@"; do last=$arg; done
-if [ "$1" = "exec" ] && [ "$last" != "-" ]; then exit 0; fi
-case "$input" in
-  *sleep*) while :; do :; done ;;
-  *huge*) printf '{"type":"thread.started","thread_id":"codex-session"}\n{"type":"item.completed","item":{"type":"agent_message","text":"'; i=0; while [ $i -lt 70000 ]; do printf a; i=$((i+1)); done; printf '"}}\n{"type":"turn.completed"}\n' ;;
-  *) printf '{"type":"thread.started","thread_id":"codex-session"}\n{"type":"turn.started"}\n{"type":"item.completed","item":{"type":"agent_message","text":"hello text"}}\n{"type":"item.completed","item":{"type":"command_execution","command":"git status"}}\n{"type":"item.updated","item":{"type":"todo_list"}}\n{"type":"item.completed","item":{"type":"agent_message","text":"final answer"}}\n{"type":"turn.completed","usage":{"input_tokens":15110}}\n' ;;
-esac
-`
-	if err := os.WriteFile(f.bin, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("AGENTBUS_ARGV_LOG", f.argv)
-	t.Setenv("AGENTBUS_STDIN_LOG", f.stdin)
-	t.Setenv("AGENTBUS_TERM_LOG", f.term)
-	t.Setenv("CODEX_HOME", dir)
-	writeCache(t, f.cache, "codex", f.bin, MinimumKnownGoodVersion, StreamSchema)
-	return f
-}
-
-func writeModelsCache(t *testing.T, home, content string) {
-	t.Helper()
-	if err := os.WriteFile(filepath.Join(home, "models_cache.json"), []byte(content), 0o600); err != nil {
-		t.Fatal(err)
+	payload = append(payload, '\n')
+	if _, err := p.proc.stdoutW.Write(payload); err != nil {
+		p.t.Fatalf("write server frame: %v", err)
 	}
 }
 
-func waitForFileContains(t *testing.T, path, want string) {
+func initializeResult() map[string]any {
+	return map[string]any{
+		"codexHome":      "/tmp/codex-home",
+		"platformFamily": "unix",
+		"platformOs":     "macos",
+		"userAgent":      "codex-cli/0.143.0",
+	}
+}
+
+func threadResult(id string) map[string]any {
+	return map[string]any{
+		"thread": map[string]any{
+			"id":            id,
+			"sessionId":     id,
+			"cwd":           "/tmp/work",
+			"createdAt":     float64(1),
+			"updatedAt":     float64(1),
+			"cliVersion":    "0.143.0",
+			"modelProvider": "openai",
+			"preview":       "",
+			"source":        "app-server",
+			"status":        "running",
+			"turns":         []any{},
+			"ephemeral":     false,
+		},
+	}
+}
+
+func turnResult(id string) map[string]any {
+	return map[string]any{
+		"turn": map[string]any{
+			"id":     id,
+			"items":  []any{},
+			"status": "inProgress",
+		},
+	}
+}
+
+func completedParams(threadID, turnID, status, errorText string) map[string]any {
+	turn := map[string]any{
+		"id":     turnID,
+		"items":  []any{},
+		"status": status,
+	}
+	if errorText != "" {
+		turn["error"] = map[string]any{"message": errorText}
+	}
+	return map[string]any{"threadId": threadID, "turn": turn}
+}
+
+func itemParams(threadID, turnID string, item map[string]any) map[string]any {
+	return map[string]any{
+		"threadId": threadID,
+		"turnId":   turnID,
+		"item":     item,
+	}
+}
+
+func assertParam(t *testing.T, frame map[string]any, key, want string) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), want) {
-			return
+	params, ok := frame["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("frame params = %#v", frame["params"])
+	}
+	if got := firstString(params, key); got != want {
+		t.Fatalf("params[%s] = %q, want %q in %#v", key, got, want, params)
+	}
+}
+
+func nestedString(obj map[string]any, path ...string) string {
+	current := obj
+	for i, key := range path {
+		if i == len(path)-1 {
+			return firstString(current, key)
 		}
-		time.Sleep(5 * time.Millisecond)
+		next, _ := current[key].(map[string]any)
+		current = next
 	}
-	t.Fatalf("fixture never wrote %q to %s", want, path)
+	return ""
 }
 
-func containsString(values []string, sub string) bool {
-	for _, value := range values {
-		if strings.Contains(value, sub) {
+func collectEventsWithTimeout(t *testing.T, ch <-chan engine.Event, timeout time.Duration) []engine.Event {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var out []engine.Event
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				return out
+			}
+			out = append(out, ev)
+		case <-timer.C:
+			t.Fatalf("timed out collecting events after %s; collected %#v", timeout, out)
+		}
+	}
+}
+
+func containsEvent(events []engine.Event, typ, sub string) bool {
+	for _, ev := range events {
+		if ev.Type == typ && strings.Contains(ev.Text, sub) {
 			return true
 		}
 	}
 	return false
+}
+
+func resultText(events []engine.Event) string {
+	var out string
+	for _, ev := range events {
+		if ev.Type == engine.EventResultMessage {
+			out = ev.Text
+		}
+	}
+	return out
+}
+
+type fakeVersionCLI struct {
+	bin   string
+	cache string
+}
+
+func fakeVersionCodex(t *testing.T) fakeVersionCLI {
+	t.Helper()
+	dir := t.TempDir()
+	fake := fakeVersionCLI{
+		bin:   filepath.Join(dir, "fakecodex"),
+		cache: filepath.Join(dir, "setup-probes.json"),
+	}
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'codex-cli 0.143.0\n'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(fake.bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeCache(t, fake.cache, "codex", fake.bin, MinimumKnownGoodVersion, StreamSchema)
+	return fake
 }
 
 func writeCache(t *testing.T, path, backend, bin, version, schema string) {
@@ -604,32 +750,4 @@ func writeCache(t *testing.T, path, backend, bin, version, schema string) {
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func collect(ch <-chan engine.Event) []engine.Event {
-	var out []engine.Event
-	for ev := range ch {
-		out = append(out, ev)
-	}
-	return out
-}
-
-func assertLog(t *testing.T, path, want string) {
-	t.Helper()
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != want {
-		t.Fatalf("%s = %q, want %q", path, string(got), want)
-	}
-}
-
-func containsWarning(events []engine.Event, sub string) bool {
-	for _, ev := range events {
-		if ev.Type == engine.EventWarning && strings.Contains(ev.Text, sub) {
-			return true
-		}
-	}
-	return false
 }

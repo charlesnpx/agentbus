@@ -34,6 +34,7 @@ type Backend struct {
 	Driver           duplex.Driver
 	VersionTransform func(string) string
 	Discover         func(context.Context, command.ProbeRunner, string) (*engine.ModelDiscovery, error)
+	SetupQualify     func(context.Context, command.Runner, engine.SessionOpts) (engine.ModelDiscovery, error)
 	probed           *ProbedBackendDescriptor
 }
 
@@ -139,11 +140,26 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	session, err := b.newSession("", engine.SessionOpts{
+	probeOpts := engine.SessionOpts{
 		CWD:     cwd,
 		Write:   false,
 		Timeout: 2 * time.Minute,
-	}, "", true)
+	}
+	if b.SetupQualify != nil {
+		discovery, err := b.SetupQualify(probeCtx, command.DirectCommandRunner{}, probeOpts)
+		if err != nil {
+			return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s setup qualification failed: %w", b.NameValue, err)
+		}
+		probe := b.setupProbe(probed)
+		probe.DiscoveredModels = append([]string(nil), discovery.Models...)
+		probe.DiscoveredEfforts = append([]string(nil), discovery.Efforts...)
+		probe.DiscoverySource = discovery.Source
+		probe.DiscoveryFetchedAt = discovery.FetchedAt
+		probe.DiscoveryClientVersion = probed.Version
+		probe.DiscoveryWarnings = append([]string(nil), discovery.Warnings...)
+		return probe, nil
+	}
+	session, err := b.newSession("", probeOpts, "", true)
 	if err != nil {
 		return engine.BackendSetupProbe{}, err
 	}
@@ -173,7 +189,18 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 	if !sawEvent {
 		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s setup stream probe produced no JSON events", b.NameValue)
 	}
-	probe := engine.BackendSetupProbe{
+	probe := b.setupProbe(probed)
+	probe.DiscoveredModels = probed.DiscoveredModels
+	probe.DiscoveredEfforts = probed.DiscoveredEfforts
+	probe.DiscoverySource = probed.DiscoverySource
+	probe.DiscoveryFetchedAt = probed.DiscoveryFetchedAt
+	probe.DiscoveryClientVersion = probed.DiscoveryClientVersion
+	probe.DiscoveryWarnings = discoveryWarnings(probed.DiscoveryWarning)
+	return probe, nil
+}
+
+func (b *Backend) setupProbe(probed ProbedBackendDescriptor) engine.BackendSetupProbe {
+	return engine.BackendSetupProbe{
 		Backend:      b.NameValue,
 		BinaryPath:   probed.BinaryPath,
 		Version:      probed.Version,
@@ -185,13 +212,6 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 		SandboxModes:     []string{"workspace-write", "read-only"},
 		JSONEventsProbed: true,
 	}
-	probe.DiscoveredModels = probed.DiscoveredModels
-	probe.DiscoveredEfforts = probed.DiscoveredEfforts
-	probe.DiscoverySource = probed.DiscoverySource
-	probe.DiscoveryFetchedAt = probed.DiscoveryFetchedAt
-	probe.DiscoveryClientVersion = probed.DiscoveryClientVersion
-	probe.DiscoveryWarnings = discoveryWarnings(probed.DiscoveryWarning)
-	return probe, nil
 }
 
 func (b *Backend) Start(ctx context.Context, opts engine.SessionOpts) (engine.Session, error) {
