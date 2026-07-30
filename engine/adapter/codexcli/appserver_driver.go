@@ -410,6 +410,7 @@ func (c *appServerRPC) handleNotification(frame duplex.Frame) {
 type turnObserver struct {
 	emit               duplex.EmitFunc
 	lastCompletedAgent string
+	agentDeltaText     strings.Builder
 	completion         *turnCompletion
 }
 
@@ -425,6 +426,7 @@ func (o *turnObserver) handle(frame duplex.Frame) bool {
 	switch method {
 	case "item/agentMessage/delta":
 		if text := firstString(payload, "delta", "text"); text != "" {
+			o.agentDeltaText.WriteString(text)
 			o.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: frame.Object})
 		}
 	case "item/started", "item/completed":
@@ -496,6 +498,13 @@ func (o *turnObserver) emitEvent(ev engine.Event) {
 	}
 }
 
+func (o *turnObserver) resultText() string {
+	if o.lastCompletedAgent != "" {
+		return o.lastCompletedAgent
+	}
+	return o.agentDeltaText.String()
+}
+
 func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer *turnObserver) (string, error) {
 	completion := observer.completion
 	if completion == nil {
@@ -506,7 +515,7 @@ func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer
 	}
 	switch completion.status {
 	case "completed", "":
-		observer.emitEvent(engine.Event{Type: engine.EventResultMessage, Text: observer.lastCompletedAgent})
+		observer.emitEvent(engine.Event{Type: engine.EventResultMessage, Text: observer.resultText()})
 		return threadID, nil
 	case "failed":
 		msg := strings.TrimSpace(completion.error)
