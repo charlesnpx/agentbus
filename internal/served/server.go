@@ -347,10 +347,30 @@ func (j *activeJob) interruptSessionNativeFirst() {
 	if j == nil || j.session == nil {
 		return
 	}
-	nativeCtx, nativeCancel := context.WithTimeout(context.Background(), admissionNativeInterruptGrace)
-	defer nativeCancel()
-	if err := j.session.Interrupt(nativeCtx); err != nil {
-		log.Printf("agentbus daemon: job %s native session interrupt warning: %v", j.jobID, err)
+	session := j.session
+	jobID := j.jobID
+	// Session.Interrupt performs the provider-native interrupt (e.g. app-server
+	// turn/interrupt) and, as its own fallback, an idempotent OS containment. It
+	// can block behind launch setup (the session mutex is held across runner.Start)
+	// or run its full internal grace, and it does NOT reliably honor a context
+	// deadline. So run it detached and bound only our own wait here: after the grace
+	// the caller unconditionally proceeds to the guaranteed interruptAdmissionCommand
+	// containment (idempotent via launch.Process finalOnce) and, on shutdown, to
+	// active.cancel() — which unblocks a stalled runner.Start. The detached goroutine
+	// completes on its own; its containment is a no-op once the admission command has
+	// contained the same launch.Process.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := session.Interrupt(context.Background()); err != nil {
+			log.Printf("agentbus daemon: job %s native session interrupt warning: %v", jobID, err)
+		}
+	}()
+	timer := time.NewTimer(admissionNativeInterruptGrace)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
 	}
 }
 
