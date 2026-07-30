@@ -410,7 +410,8 @@ func (c *appServerRPC) handleNotification(frame duplex.Frame) {
 type turnObserver struct {
 	emit               duplex.EmitFunc
 	lastCompletedAgent string
-	agentDeltaText     strings.Builder
+	agentDeltaText     map[string]*strings.Builder
+	lastDeltaAgentItem string
 	completion         *turnCompletion
 }
 
@@ -426,7 +427,7 @@ func (o *turnObserver) handle(frame duplex.Frame) bool {
 	switch method {
 	case "item/agentMessage/delta":
 		if text := firstString(payload, "delta", "text"); text != "" {
-			o.agentDeltaText.WriteString(text)
+			o.appendAgentDelta(payload, text)
 			o.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: frame.Object})
 		}
 	case "item/started", "item/completed":
@@ -498,11 +499,36 @@ func (o *turnObserver) emitEvent(ev engine.Event) {
 	}
 }
 
+const defaultAgentDeltaItemID = "\x00agent-delta-default"
+
+func (o *turnObserver) appendAgentDelta(payload map[string]any, text string) {
+	itemID := agentDeltaItemID(payload)
+	if itemID == "" {
+		itemID = defaultAgentDeltaItemID
+	}
+	if o.agentDeltaText == nil {
+		o.agentDeltaText = make(map[string]*strings.Builder)
+	}
+	builder := o.agentDeltaText[itemID]
+	if builder == nil {
+		builder = &strings.Builder{}
+		o.agentDeltaText[itemID] = builder
+	}
+	builder.WriteString(text)
+	o.lastDeltaAgentItem = itemID
+}
+
 func (o *turnObserver) resultText() string {
 	if o.lastCompletedAgent != "" {
 		return o.lastCompletedAgent
 	}
-	return o.agentDeltaText.String()
+	if o.lastDeltaAgentItem == "" {
+		return ""
+	}
+	if builder := o.agentDeltaText[o.lastDeltaAgentItem]; builder != nil {
+		return builder.String()
+	}
+	return ""
 }
 
 func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer *turnObserver) (string, error) {
@@ -790,6 +816,16 @@ func paramsMap(obj map[string]any) map[string]any {
 		return params
 	}
 	return obj
+}
+
+func agentDeltaItemID(payload map[string]any) string {
+	if id := firstString(payload, "itemId", "item_id"); id != "" {
+		return id
+	}
+	if item, ok := firstMap(payload, "item", "payload", "response_item"); ok {
+		return firstString(item, "id", "itemId", "item_id")
+	}
+	return ""
 }
 
 func isResponse(obj map[string]any) bool {
