@@ -42,6 +42,30 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func TestStartupFailureCodeAuthorityRefusals(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "served safety fail stopped", err: served.ErrSafetyFailStopped, want: daemonlaunch.CodeAuthorityFailStopped},
+		{name: "authority fail stopped", err: authority.ErrFailStopped, want: daemonlaunch.CodeAuthorityFailStopped},
+		{name: "authority fail stop record", err: authority.ErrFailStopRecord, want: daemonlaunch.CodeAuthorityFailStopped},
+		{name: "authority root sealed", err: authority.ErrRootSealed, want: daemonlaunch.CodeAuthorityRootSealed},
+		{name: "unrelated", err: errors.New("ordinary startup failure"), want: "error"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := startupFailureCode(tt.err); got != tt.want {
+				t.Fatalf("startupFailureCode(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestProductionServedConfigSelectsNativeStrictRuntime(t *testing.T) {
 	cfg, err := productionServedConfig(Config{})
 	support := cfg.Runtime.Support()
@@ -494,8 +518,8 @@ func TestServeLauncherReportsJoinedSafetyFailStopDuringCancellation(t *testing.T
 	if !errors.As(err, &startup) || !errors.Is(startup, daemonlaunch.ErrStartupFailed) {
 		t.Fatalf("Launch error = %T %v, want startup failure", err, err)
 	}
-	if startup.Code != served.ErrSafetyFailStopped.Error() {
-		t.Fatalf("startup code = %q, want %q", startup.Code, served.ErrSafetyFailStopped)
+	if startup.Code != daemonlaunch.CodeAuthorityFailStopped {
+		t.Fatalf("startup code = %q, want %q", startup.Code, daemonlaunch.CodeAuthorityFailStopped)
 	}
 	if !strings.Contains(startup.Message, served.ErrSafetyFailStopped.Error()) {
 		t.Fatalf("startup message = %q, want safety fail-stop", startup.Message)
@@ -512,8 +536,8 @@ func TestServeLauncherReportsAuthorityFailStopDuringCancellation(t *testing.T) {
 	if !errors.As(err, &startup) || !errors.Is(startup, daemonlaunch.ErrStartupFailed) {
 		t.Fatalf("Launch error = %T %v, want startup failure", err, err)
 	}
-	if startup.Code != served.ErrSafetyFailStopped.Error() {
-		t.Fatalf("startup code = %q, want %q", startup.Code, served.ErrSafetyFailStopped)
+	if startup.Code != daemonlaunch.CodeAuthorityFailStopped {
+		t.Fatalf("startup code = %q, want %q", startup.Code, daemonlaunch.CodeAuthorityFailStopped)
 	}
 	if !strings.Contains(startup.Message, authority.ErrFailStopped.Error()) {
 		t.Fatalf("startup message = %q, want authority fail-stop", startup.Message)

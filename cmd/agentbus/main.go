@@ -28,13 +28,12 @@ import (
 const (
 	cliJSONSchema = 1
 
-	cliExitUnknownJob           = 10
-	cliExitDaemonStartupFailure = 11
-	cliExitAuthorityFailStop    = 12
-	cliExitShutdownForced       = 13
-
-	// Keep this local so cmd/agentbus reaches served only through agentbusserve.
-	cliStartupCodeServedSafetyFailStopped = "served safety fail-stop"
+	cliExitUnknownJob                  = 10
+	cliExitDaemonStartupFailure        = 11
+	cliExitAuthorityFailStop           = 12
+	cliExitShutdownForced              = 13
+	cliExitAuthorityStartupFailStopped = daemonlaunch.ExitAuthorityFailStopped
+	cliExitAuthorityStartupRootSealed  = daemonlaunch.ExitAuthorityRootSealed
 )
 
 var version = "dev"
@@ -231,7 +230,7 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 		ProcessTable: a.processes,
 	})
 	if err != nil {
-		return commandError(errOut, err)
+		return serveCommandError(errOut, err)
 	}
 	return 0
 }
@@ -956,6 +955,20 @@ func commandError(errOut io.Writer, err error) int {
 	return 1
 }
 
+func serveCommandError(errOut io.Writer, err error) int {
+	fmt.Fprintf(errOut, "agentbus: %v\n", err)
+	switch {
+	case errors.Is(err, authority.ErrRootSealed):
+		return cliExitAuthorityStartupRootSealed
+	case errors.Is(err, authority.ErrFailStopped), errors.Is(err, authority.ErrFailStopRecord):
+		return cliExitAuthorityStartupFailStopped
+	case errors.Is(err, agentbusserve.ErrShutdownDeadlineExceeded):
+		return cliExitShutdownForced
+	default:
+		return 1
+	}
+}
+
 func protocolCommandError(errOut io.Writer, operation string, err error) int {
 	var rpcErr *protocol.RPCError
 	if errors.As(err, &rpcErr) {
@@ -1019,7 +1032,7 @@ func startupErrorIsAuthorityFailStop(err *daemonlaunch.StartupError) bool {
 		return false
 	}
 	switch strings.TrimSpace(err.Code) {
-	case authority.ErrFailStopped.Error(), cliStartupCodeServedSafetyFailStopped:
+	case daemonlaunch.CodeAuthorityFailStopped, authority.ErrFailStopped.Error(), authority.ErrFailStopRecord.Error():
 		return true
 	default:
 		return false

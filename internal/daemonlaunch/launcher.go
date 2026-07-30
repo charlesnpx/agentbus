@@ -22,13 +22,22 @@ import (
 )
 
 const (
-	ReadyFDEnv                 = "AGENTBUS_READY_FD"
-	StartupDeadlineEnv         = "AGENTBUS_STARTUP_DEADLINE_UNIX_NANO"
-	ReadinessProtocolVersion   = 1
-	DefaultTimeout             = 10 * time.Second
-	DefaultStderrTailBytes     = 64 * 1024
-	CodeAlreadyListening       = "agentbus daemon already listening"
-	CodeAdmissionRootBusy      = "agentbus admission root busy"
+	ReadyFDEnv               = "AGENTBUS_READY_FD"
+	StartupDeadlineEnv       = "AGENTBUS_STARTUP_DEADLINE_UNIX_NANO"
+	ReadinessProtocolVersion = 1
+	DefaultTimeout           = 10 * time.Second
+	DefaultStderrTailBytes   = 64 * 1024
+	CodeAlreadyListening     = "agentbus daemon already listening"
+	CodeAdmissionRootBusy    = "agentbus admission root busy"
+	CodeAuthorityFailStopped = "agentbus authority root fail-stopped"
+	CodeAuthorityRootSealed  = "agentbus authority root sealed"
+	// ExitAuthorityFailStopped is the foreground daemon exit code for startup
+	// refusal by a fail-stopped authority root. Exit code 14 is reserved for
+	// engine.StateOrphaned.
+	ExitAuthorityFailStopped = 15
+	// ExitAuthorityRootSealed is the foreground daemon exit code for startup
+	// refusal by a sealed authority root.
+	ExitAuthorityRootSealed    = 16
 	readinessFDChildNumber     = 3
 	existingVerifyRetryPeriod  = 50 * time.Millisecond
 	failedExitGrace            = 500 * time.Millisecond
@@ -224,17 +233,19 @@ func (result Result) KillAndWait() error {
 type Handle struct {
 	pid     int
 	process Process
-	done    chan error
+	done    chan struct{}
+	waitErr error
 }
 
 func newHandle(process Process) *Handle {
 	handle := &Handle{
 		pid:     process.PID(),
 		process: process,
-		done:    make(chan error, 1),
+		done:    make(chan struct{}),
 	}
 	go func() {
-		handle.done <- process.Wait()
+		handle.waitErr = process.Wait()
+		close(handle.done)
 	}()
 	return handle
 }
@@ -261,8 +272,8 @@ func (handle *Handle) waitGraceOrKill(grace time.Duration) error {
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
 	select {
-	case err := <-handle.done:
-		return err
+	case <-handle.done:
+		return handle.waitErr
 	case <-timer.C:
 		return handle.KillAndWait()
 	}
@@ -275,8 +286,8 @@ func (handle *Handle) waitTimeout(timeout time.Duration) error {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case err := <-handle.done:
-		return err
+	case <-handle.done:
+		return handle.waitErr
 	case <-timer.C:
 		return fmt.Errorf("wait for daemon process %d timed out", handle.pid)
 	}
