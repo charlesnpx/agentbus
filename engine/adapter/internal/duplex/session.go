@@ -174,15 +174,6 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 		s.mu.Unlock()
 		return nil, err
 	}
-	if input.OnProcessStart != nil {
-		if reporter, ok := running.(interface {
-			ProcessRef() (engine.ProcessRef, int)
-		}); ok {
-			ref, backendChildPID := reporter.ProcessRef()
-			input.OnProcessStart(ref, backendChildPID)
-		}
-	}
-
 	var stdoutWriter io.Writer
 	if stdoutLog != nil {
 		stdoutWriter = stdoutLog
@@ -192,6 +183,17 @@ func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engi
 	active := &activeTurn{running: running, conn: conn, retirement: retirement}
 	s.active = active
 	s.mu.Unlock()
+
+	// Notify AFTER the turn is registered active and the mutex is released, so a
+	// callback that re-enters ID()/Turn()/Interrupt() cannot deadlock on s.mu.
+	if input.OnProcessStart != nil {
+		if reporter, ok := running.(interface {
+			ProcessRef() (engine.ProcessRef, int)
+		}); ok {
+			ref, backendChildPID := reporter.ProcessRef()
+			input.OnProcessStart(ref, backendChildPID)
+		}
+	}
 
 	events := make(chan engine.Event, eventBufferSize)
 	go s.runTurn(driverCtx, driverCancel, turnCtx, turnCancel, input, resumeID, active, running.Stderr(), stderrWriter, &stderr, stdoutLog, stderrLog, events)
