@@ -28,10 +28,12 @@ import (
 const (
 	cliJSONSchema = 1
 
-	cliExitUnknownJob           = 10
-	cliExitDaemonStartupFailure = 11
-	cliExitAuthorityFailStop    = 12
-	cliExitShutdownForced       = 13
+	cliExitUnknownJob                  = 10
+	cliExitDaemonStartupFailure        = 11
+	cliExitAuthorityFailStop           = 12
+	cliExitShutdownForced              = 13
+	cliExitAuthorityStartupFailStopped = daemonlaunch.ExitAuthorityFailStopped
+	cliExitAuthorityStartupRootSealed  = daemonlaunch.ExitAuthorityRootSealed
 
 	// Keep this local so cmd/agentbus reaches served only through agentbusserve.
 	cliStartupCodeServedSafetyFailStopped = "served safety fail-stop"
@@ -231,7 +233,7 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 		ProcessTable: a.processes,
 	})
 	if err != nil {
-		return commandError(errOut, err)
+		return serveCommandError(errOut, err)
 	}
 	return 0
 }
@@ -954,6 +956,20 @@ func commandError(errOut io.Writer, err error) int {
 		return cliExitShutdownForced
 	}
 	return 1
+}
+
+func serveCommandError(errOut io.Writer, err error) int {
+	fmt.Fprintf(errOut, "agentbus: %v\n", err)
+	switch {
+	case errors.Is(err, authority.ErrRootSealed):
+		return cliExitAuthorityStartupRootSealed
+	case errors.Is(err, authority.ErrFailStopped):
+		return cliExitAuthorityStartupFailStopped
+	case errors.Is(err, agentbusserve.ErrShutdownDeadlineExceeded):
+		return cliExitShutdownForced
+	default:
+		return 1
+	}
 }
 
 func protocolCommandError(errOut io.Writer, operation string, err error) int {

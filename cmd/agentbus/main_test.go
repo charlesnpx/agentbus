@@ -558,6 +558,48 @@ func TestProtocolCommandErrorStartupErrorExitCodes(t *testing.T) {
 	}
 }
 
+func TestServeCommandErrorAuthorityStartupRefusedExitCodes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		err        error
+		wantCode   int
+		wantStderr string
+	}{
+		{
+			name:       "authority fail stop sentinel",
+			err:        authority.ErrFailStopped,
+			wantCode:   cliExitAuthorityStartupFailStopped,
+			wantStderr: authority.ErrFailStopped.Error(),
+		},
+		{
+			name:       "authority root sealed",
+			err:        authority.ErrRootSealed,
+			wantCode:   cliExitAuthorityStartupRootSealed,
+			wantStderr: authority.ErrRootSealed.Error(),
+		},
+		{
+			name:       "generic error",
+			err:        errors.New("ordinary startup failure"),
+			wantCode:   1,
+			wantStderr: "ordinary startup failure",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			code := serveCommandError(&stderr, tt.err)
+			if code != tt.wantCode {
+				t.Fatalf("exit=%d want=%d stderr=%s", code, tt.wantCode, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tt.wantStderr) {
+				t.Fatalf("stderr=%q, want %q", stderr.String(), tt.wantStderr)
+			}
+		})
+	}
+}
+
 func TestStatusResultCancelDaemonStartupFailureLeavesRootEmpty(t *testing.T) {
 	t.Parallel()
 	for _, args := range [][]string{

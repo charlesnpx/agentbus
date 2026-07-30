@@ -22,13 +22,19 @@ import (
 )
 
 const (
-	ReadyFDEnv                 = "AGENTBUS_READY_FD"
-	StartupDeadlineEnv         = "AGENTBUS_STARTUP_DEADLINE_UNIX_NANO"
-	ReadinessProtocolVersion   = 1
-	DefaultTimeout             = 10 * time.Second
-	DefaultStderrTailBytes     = 64 * 1024
-	CodeAlreadyListening       = "agentbus daemon already listening"
-	CodeAdmissionRootBusy      = "agentbus admission root busy"
+	ReadyFDEnv               = "AGENTBUS_READY_FD"
+	StartupDeadlineEnv       = "AGENTBUS_STARTUP_DEADLINE_UNIX_NANO"
+	ReadinessProtocolVersion = 1
+	DefaultTimeout           = 10 * time.Second
+	DefaultStderrTailBytes   = 64 * 1024
+	CodeAlreadyListening     = "agentbus daemon already listening"
+	CodeAdmissionRootBusy    = "agentbus admission root busy"
+	// ExitAuthorityFailStopped is the foreground daemon exit code for startup
+	// refusal by a fail-stopped authority root.
+	ExitAuthorityFailStopped = 14
+	// ExitAuthorityRootSealed is the foreground daemon exit code for startup
+	// refusal by a sealed authority root.
+	ExitAuthorityRootSealed    = 15
 	readinessFDChildNumber     = 3
 	existingVerifyRetryPeriod  = 50 * time.Millisecond
 	failedExitGrace            = 500 * time.Millisecond
@@ -221,22 +227,46 @@ func (result Result) KillAndWait() error {
 	return result.handle.KillAndWait()
 }
 
+func (result Result) Wait(ctx context.Context) (int, error) {
+	if result.handle == nil {
+		return 0, nil
+	}
+	return result.handle.Wait(ctx)
+}
+
 type Handle struct {
 	pid     int
 	process Process
-	done    chan error
+	done    chan struct{}
+	waitErr error
 }
 
 func newHandle(process Process) *Handle {
 	handle := &Handle{
 		pid:     process.PID(),
 		process: process,
-		done:    make(chan error, 1),
+		done:    make(chan struct{}),
 	}
 	go func() {
-		handle.done <- process.Wait()
+		handle.waitErr = process.Wait()
+		close(handle.done)
 	}()
 	return handle
+}
+
+func (handle *Handle) Wait(ctx context.Context) (int, error) {
+	if handle == nil {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-handle.done:
+		return processExitCode(handle.waitErr), handle.waitErr
+	case <-ctx.Done():
+		return -1, ctx.Err()
+	}
 }
 
 func (handle *Handle) KillAndWait() error {
@@ -261,8 +291,8 @@ func (handle *Handle) waitGraceOrKill(grace time.Duration) error {
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
 	select {
-	case err := <-handle.done:
-		return err
+	case <-handle.done:
+		return handle.waitErr
 	case <-timer.C:
 		return handle.KillAndWait()
 	}
@@ -275,11 +305,24 @@ func (handle *Handle) waitTimeout(timeout time.Duration) error {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case err := <-handle.done:
-		return err
+	case <-handle.done:
+		return handle.waitErr
 	case <-timer.C:
 		return fmt.Errorf("wait for daemon process %d timed out", handle.pid)
 	}
+}
+
+func processExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitCoder interface {
+		ExitCode() int
+	}
+	if errors.As(err, &exitCoder) {
+		return exitCoder.ExitCode()
+	}
+	return -1
 }
 
 type StartupError struct {
