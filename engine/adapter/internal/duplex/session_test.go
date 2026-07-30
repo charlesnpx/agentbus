@@ -170,15 +170,14 @@ func TestProcessExitBeforeSemanticTerminalSplitsCleanupAndExecutionAxes(t *testi
 	}
 }
 
-func TestSuccessfulTurnExitAfterTerminalDoesNotEmitEarlyExit(t *testing.T) {
+func TestBufferedTerminalFrameSurvivesImmediateRetirement(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		t.Run(fmt.Sprintf("iteration_%d", i), func(t *testing.T) {
 			proc := newFakeCommand()
 			runner := &fakeRunner{running: proc}
-			terminalSeen := make(chan struct{})
-			session := newSessionWithDriver(t, runner, &delayedTerminalSuccessDriver{
+			session := newSessionWithDriver(t, runner, &delayedFrameConsumerDriver{
 				FixtureDriver: FixtureDriver{Spec: command.ExecSpec{Argv: []string{"fixture"}}},
-				terminalSeen:  terminalSeen,
+				readDelay:     25 * time.Millisecond,
 			}, 0, "resume-0")
 			peerDone := make(chan struct{})
 			go func() {
@@ -190,12 +189,6 @@ func TestSuccessfulTurnExitAfterTerminalDoesNotEmitEarlyExit(t *testing.T) {
 				}
 				writePeerJSON(t, proc.stdoutW, map[string]any{"type": "message", "text": "working"})
 				writePeerJSON(t, proc.stdoutW, map[string]any{"type": "complete", "text": "done", "resumeId": "resume-1"})
-				select {
-				case <-terminalSeen:
-				case <-time.After(2 * time.Second):
-					t.Error("driver did not observe terminal frame")
-					return
-				}
 				_ = proc.stdoutW.Close()
 				_ = proc.stderrW.Close()
 				proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
@@ -390,6 +383,60 @@ func TestInterruptFallsBackWhenNativeInterruptBlocks(t *testing.T) {
 	_ = collectEventsWithTimeout(t, events, 2*time.Second)
 }
 
+func TestInterruptWithExpiredContextUsesFreshFallbackContext(t *testing.T) {
+	proc := newFakeCommand()
+	fallbackEntered := make(chan struct{})
+	proc.onInterruptCtx = func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("fallback interrupt context expired: %w", err)
+		}
+		close(fallbackEntered)
+		return nil
+	}
+	runner := &fakeRunner{running: proc}
+	session := newFixtureSession(t, runner, 50*time.Millisecond, "")
+	promptSeen := make(chan struct{})
+	go func() {
+		scanner := bufio.NewScanner(proc.stdinR)
+		if scanner.Scan() {
+			close(promptSeen)
+		}
+		if err := scanner.Err(); err != nil {
+			t.Errorf("stdin scan error: %v", err)
+		}
+	}()
+
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-promptSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for prompt frame")
+	}
+
+	expiredCtx, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+	err = session.Interrupt(expiredCtx)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("interrupt error = %v, want original deadline", err)
+	}
+	select {
+	case <-fallbackEntered:
+	default:
+		t.Fatalf("fallback interrupt did not enter with a non-expired context; err = %v", err)
+	}
+	if got := proc.interrupts.Load(); got != 1 {
+		t.Fatalf("process interrupt count = %d, want 1", got)
+	}
+
+	_ = proc.stdoutW.Close()
+	_ = proc.stderrW.Close()
+	proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+}
+
 func TestConcurrentInterruptsShareSingleSequence(t *testing.T) {
 	proc := newFakeCommand()
 	var closeOnce sync.Once
@@ -534,13 +581,12 @@ func (d *decodeCapturingDriver) RunTurn(ctx context.Context, conn *Conn, resumeI
 	return id, err
 }
 
-type delayedTerminalSuccessDriver struct {
+type delayedFrameConsumerDriver struct {
 	FixtureDriver
-	terminalSeen chan struct{}
-	terminalOnce sync.Once
+	readDelay time.Duration
 }
 
-func (d *delayedTerminalSuccessDriver) RunTurn(ctx context.Context, conn *Conn, resumeID string, _ engine.SessionOpts, input engine.TurnInput, emit EmitFunc) (string, error) {
+func (d *delayedFrameConsumerDriver) RunTurn(ctx context.Context, conn *Conn, resumeID string, _ engine.SessionOpts, input engine.TurnInput, emit EmitFunc) (string, error) {
 	prompt := map[string]any{
 		"type":   "prompt",
 		"prompt": input.Prompt,
@@ -551,6 +597,13 @@ func (d *delayedTerminalSuccessDriver) RunTurn(ctx context.Context, conn *Conn, 
 	}
 	if err := conn.WriteJSON(prompt); err != nil {
 		return "", err
+	}
+	if d.readDelay > 0 {
+		select {
+		case <-time.After(d.readDelay):
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
 	}
 	for {
 		select {
@@ -573,10 +626,6 @@ func (d *delayedTerminalSuccessDriver) RunTurn(ctx context.Context, conn *Conn, 
 					nextID = resumeID
 				}
 				emit(engine.Event{Type: engine.EventResultMessage, Text: text, Metadata: frame.Object})
-				d.terminalOnce.Do(func() {
-					close(d.terminalSeen)
-				})
-				<-ctx.Done()
 				return nextID, nil
 			}
 		case err, ok := <-conn.DecodeErrors():
@@ -685,13 +734,14 @@ type fakeCommand struct {
 	stderrR *io.PipeReader
 	stderrW *io.PipeWriter
 
-	waitCh      chan struct{}
-	finishOnce  sync.Once
-	exit        command.ExitObservation
-	waitErr     error
-	onInterrupt func() error
-	interrupts  atomic.Int32
-	stdinClosed atomic.Bool
+	waitCh         chan struct{}
+	finishOnce     sync.Once
+	exit           command.ExitObservation
+	waitErr        error
+	onInterrupt    func() error
+	onInterruptCtx func(context.Context) error
+	interrupts     atomic.Int32
+	stdinClosed    atomic.Bool
 }
 
 func newFakeCommand() *fakeCommand {
@@ -731,8 +781,11 @@ func (c *fakeCommand) Wait(ctx context.Context) (command.ExitObservation, error)
 	}
 }
 
-func (c *fakeCommand) Interrupt(context.Context) error {
+func (c *fakeCommand) Interrupt(ctx context.Context) error {
 	c.interrupts.Add(1)
+	if c.onInterruptCtx != nil {
+		return c.onInterruptCtx(ctx)
+	}
 	if c.onInterrupt != nil {
 		return c.onInterrupt()
 	}

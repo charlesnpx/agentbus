@@ -230,7 +230,7 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 		driverDone <- turnResult{resumeID: id, err: err}
 	}()
 
-	result, earlyExit := waitForTurnResult(driverDone, active.retirement, driverCancel)
+	result, earlyExit := waitForTurnResult(driverDone, active.retirement)
 	result, earlyExit = classifyTurnResult(result, earlyExit)
 
 	_ = active.conn.CloseStdin()
@@ -248,7 +248,7 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	emitCompletionEvents(turnCtx, events, result.err, earlyExit, observation, stderr, stderrCopyErr)
 }
 
-func waitForTurnResult(driverDone <-chan turnResult, retirement *retirement, cancel context.CancelFunc) (turnResult, bool) {
+func waitForTurnResult(driverDone <-chan turnResult, retirement *retirement) (turnResult, bool) {
 	select {
 	case result := <-driverDone:
 		return result, false
@@ -258,7 +258,6 @@ func waitForTurnResult(driverDone <-chan turnResult, retirement *retirement, can
 			return result, false
 		default:
 		}
-		cancel()
 		result := <-driverDone
 		return result, true
 	}
@@ -316,13 +315,19 @@ func interruptActiveTurn(ctx context.Context, driver Driver, active *activeTurn,
 			nativeErr = collectNativeInterruptErr(nativeDone, nativeErr)
 			return nativeErr
 		case <-timer.C:
-			interruptErr := active.running.Interrupt(ctx)
+			interruptErr := interruptWithFreshContext(ctx, active.running, grace)
 			return errors.Join(collectNativeInterruptErr(nativeDone, nativeErr), interruptErr)
 		case <-ctx.Done():
-			interruptErr := active.running.Interrupt(ctx)
+			interruptErr := interruptWithFreshContext(ctx, active.running, grace)
 			return errors.Join(collectNativeInterruptErr(nativeDone, nativeErr), interruptErr, ctx.Err())
 		}
 	}
+}
+
+func interruptWithFreshContext(ctx context.Context, running command.RunningCommand, grace time.Duration) error {
+	fallbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), grace)
+	defer cancel()
+	return running.Interrupt(fallbackCtx)
 }
 
 func collectNativeInterruptErr(nativeDone <-chan error, nativeErr error) error {
