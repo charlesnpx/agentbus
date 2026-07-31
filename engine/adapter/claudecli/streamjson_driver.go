@@ -131,6 +131,12 @@ func (s *claudeStream) initialize(ctx context.Context) error {
 	}
 	initCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	var deferred []duplex.Frame
+	defer func() {
+		if len(deferred) > 0 {
+			s.pending = append(deferred, s.pending...)
+		}
+	}()
 	for {
 		frame, err := s.nextFrame(initCtx)
 		if err != nil {
@@ -149,7 +155,7 @@ func (s *claudeStream) initialize(ctx context.Context) error {
 		if handled {
 			continue
 		}
-		s.pending = append(s.pending, frame)
+		deferred = append(deferred, frame)
 	}
 }
 

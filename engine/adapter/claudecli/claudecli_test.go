@@ -134,6 +134,59 @@ func TestClaudeInitializeOrderingAndTimeoutFallback(t *testing.T) {
 		}
 	})
 
+	t.Run("defers unmatched control response before initialize response", func(t *testing.T) {
+		runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
+			peer := newClaudePeer(t, proc)
+			init := peer.expectControlRequest("initialize")
+			peer.write(map[string]any{
+				"type": "control_response",
+				"response": map[string]any{
+					"subtype":    "success",
+					"request_id": "interrupt-before-init",
+					"response":   map[string]any{"ok": true},
+				},
+			})
+			peer.respondControlSuccess(init, map[string]any{"ok": true})
+			peer.expectUser("hello")
+			peer.emitResult("success", false, "done")
+		})
+
+		session := startFakeClaudeSession(t, engine.SessionOpts{})
+		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := collectEventsWithTimeout(t, events, 2*time.Second)
+		if !containsEvent(got, engine.EventResultMessage, "done") {
+			t.Fatalf("events = %#v, want successful result after unmatched pre-init control response", got)
+		}
+	})
+
+	t.Run("terminates when unmatched pre-init control response is followed by close", func(t *testing.T) {
+		runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
+			peer := newClaudePeer(t, proc)
+			peer.expectControlRequest("initialize")
+			peer.write(map[string]any{
+				"type": "control_response",
+				"response": map[string]any{
+					"subtype":    "success",
+					"request_id": "interrupt-before-init",
+					"response":   map[string]any{"ok": true},
+				},
+			})
+		})
+
+		session := startFakeClaudeSession(t, engine.SessionOpts{})
+		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := collectEventsWithTimeout(t, events, 2*time.Second)
+		if !containsEvent(got, engine.EventTerminalError, "backend exited before turn completed") {
+			t.Fatalf("events = %#v, want terminal backend-exited error after unmatched pre-init control response", got)
+		}
+	})
+
 	t.Run("proceeds when initialize response is absent", func(t *testing.T) {
 		runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
 			peer := newClaudePeer(t, proc)
