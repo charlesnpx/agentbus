@@ -321,7 +321,14 @@ func (s *Session) NativeInterrupt(ctx context.Context) (bool, error) {
 	driver := s.driver
 	s.mu.Unlock()
 	if active == nil {
-		return false, nil
+		// No live turn. s.active is set under s.mu before the process work
+		// begins (Turn) and cleared only after retirement completes
+		// (clearActive), so a nil active means either nothing launched yet or
+		// the turn already retired — in both cases there is no process to
+		// natively interrupt. Report settled: forcing a raw containment
+		// fallback here would, in the post-completion window, re-touch an
+		// already-final launch and can surface its cached execution error.
+		return true, nil
 	}
 	return nativeInterruptActiveTurn(ctx, driver, active)
 }
@@ -360,20 +367,25 @@ func nativeInterruptActiveTurn(ctx context.Context, driver Driver, active *activ
 		nativeDone <- driver.Interrupt(ctx, active.conn)
 	}()
 
+	var nativeErr error
 	for {
 		select {
-		case err := <-nativeDone:
-			if err != nil {
-				return false, err
-			}
-			nativeDone = nil
 		case <-active.retirement.done:
-			if err := collectNativeInterruptErr(nativeDone, nil); err != nil {
-				return false, err
-			}
+			// The process retired: the turn is settled regardless of whether
+			// the native interrupt write itself errored. A write that loses the
+			// race with process exit yields a closed-pipe error, which must not
+			// mask the fact that the process is gone.
 			return true, nil
+		case err := <-nativeDone:
+			nativeDone = nil
+			// A native write error alone does not mean "not settled" — the
+			// process may simply be exiting. Retain it as a warning and keep
+			// awaiting retirement (bounded by ctx), mirroring interruptActiveTurn.
+			if err != nil {
+				nativeErr = err
+			}
 		case <-ctx.Done():
-			return false, ctx.Err()
+			return false, errors.Join(nativeErr, ctx.Err())
 		}
 	}
 }
