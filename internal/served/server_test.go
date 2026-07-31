@@ -2312,6 +2312,49 @@ func TestServeBootstrapRecordsProbeFailureUnfenceableWithoutFailingClosed(t *tes
 	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
 }
 
+func TestServeBootstrapRecordsCodexSetupSchemaMismatchUnfenceable(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "version-probe-marker")
+	binary := markerCodexCLI(t, marker)
+	cachePath := filepath.Join(dir, "setup-probes.json")
+	if err := engine.WriteSetupProbeCache(cachePath, engine.SetupProbeCache{Backends: []engine.BackendSetupProbe{{
+		Backend:          "codex",
+		BinaryPath:       binary,
+		Version:          codexcli.MinimumKnownGoodVersion,
+		StreamSchema:     "legacy-stream-json",
+		ConfigMode:       engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
+		SandboxModes:     []string{"workspace-write", "read-only"},
+		JSONEventsProbed: true,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	backend := codexcli.New(codexcli.Options{Binary: binary, CachePath: cachePath})
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("version probe marker stat error = %v, want probe to run", err)
+	}
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-codex-schema-mismatch",
+		RequestID:    "request-codex-schema-mismatch",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want rejection", outcome.result)
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorCapabilityMissing)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectUnfenceableBackend)
+	if !strings.Contains(outcome.err.Message, `setup cache for codex lacks stream schema "codex-appserver-v1"`) {
+		t.Fatalf("rejection message = %q, want setup schema mismatch cause", outcome.err.Message)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+}
+
 func TestServeBootstrapRecordsLiveParentContextProbeFailureUnfenceable(t *testing.T) {
 	t.Parallel()
 	backend := &probeErrorBackend{fakeBackend: newFakeBackend("fake"), err: context.DeadlineExceeded}

@@ -293,6 +293,16 @@ func (b *Backend) ProbeBackend(ctx context.Context, runner command.ProbeRunner) 
 	if err != nil {
 		return nil, err
 	}
+	probe, err := b.cachedProbe()
+	if err != nil {
+		return nil, err
+	}
+	if probe.Version != probed.Version || probe.BinaryPath != probed.BinaryPath {
+		return nil, errors.New(DriftError)
+	}
+	if probe.StreamSchema == "" || probe.StreamSchema != b.StreamSchema {
+		return nil, fmt.Errorf("backend_unavailable: setup cache for %s lacks stream schema %q", b.NameValue, b.StreamSchema)
+	}
 	b.hydrateEmptyProbeDiscovery(&probed)
 	clone := *b
 	clone.probed = &probed
