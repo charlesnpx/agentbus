@@ -128,11 +128,13 @@ func TestServedNativeConformanceDaemonProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cachePath := filepath.Join(filepath.Dir(codexPath), "setup-probes.json")
+	writeServedNativeCodexSetupCache(t, cachePath, codexPath)
 	cfg, err := StrictAdmissionConfig(Config{
 		StateRoot:   *root,
 		CWD:         *cwd,
 		Token:       "test-token",
-		Backends:    []engine.Backend{codexcli.New(codexcli.Options{Binary: codexPath})},
+		Backends:    []engine.Backend{codexcli.New(codexcli.Options{Binary: codexPath, CachePath: cachePath})},
 		IdleTimeout: -1,
 	}, servedNativeStrictOptions(*agentbus, os.Environ()))
 	if err != nil {
@@ -704,6 +706,7 @@ func servedNativeStrictOptions(agentbusPath string, env []string) StrictAdmissio
 type servedNativeCodexFixture struct {
 	binDir    string
 	codexPath string
+	cachePath string
 	execLog   string
 	readyDir  string
 	env       []string
@@ -735,6 +738,8 @@ func installServedNativeCodexFixture(t *testing.T, root string) servedNativeCode
 	if err := os.WriteFile(codexPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	cachePath := filepath.Join(binDir, "setup-probes.json")
+	writeServedNativeCodexSetupCache(t, cachePath, codexPath)
 	execLog := filepath.Join(root, "codex-executions.jsonl")
 	env := append(os.Environ(),
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
@@ -749,11 +754,33 @@ func installServedNativeCodexFixture(t *testing.T, root string) servedNativeCode
 	t.Setenv(servedNativeCodexFixtureEnv, "1")
 	t.Setenv(servedNativeCodexExecLogEnv, execLog)
 	t.Setenv(servedNativeCodexReadyDirEnv, readyDir)
-	return servedNativeCodexFixture{binDir: binDir, codexPath: codexPath, execLog: execLog, readyDir: readyDir, env: env}
+	return servedNativeCodexFixture{binDir: binDir, codexPath: codexPath, cachePath: cachePath, execLog: execLog, readyDir: readyDir, env: env}
+}
+
+func writeServedNativeCodexSetupCache(t *testing.T, cachePath, codexPath string) {
+	t.Helper()
+	if err := engine.WriteSetupProbeCache(cachePath, engine.SetupProbeCache{
+		Version: engine.SetupProbeCacheVersion,
+		Backends: []engine.BackendSetupProbe{{
+			Backend:                servedNativeBackendName,
+			BinaryPath:             codexPath,
+			Version:                codexcli.MinimumKnownGoodVersion,
+			StreamSchema:           codexcli.StreamSchema,
+			ConfigMode:             engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
+			SandboxModes:           []string{"workspace-write", "read-only"},
+			JSONEventsProbed:       true,
+			DiscoveredModels:       []string{"gpt-5-codex"},
+			DiscoveredEfforts:      []string{"high"},
+			DiscoverySource:        "served-native-fixture",
+			DiscoveryClientVersion: codexcli.MinimumKnownGoodVersion,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func servedNativeCodexBackend(fixture servedNativeCodexFixture) engine.Backend {
-	return codexcli.New(codexcli.Options{Binary: fixture.codexPath})
+	return codexcli.New(codexcli.Options{Binary: fixture.codexPath, CachePath: fixture.cachePath})
 }
 
 func shellQuote(s string) string {
