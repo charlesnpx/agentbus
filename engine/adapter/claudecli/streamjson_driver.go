@@ -15,7 +15,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
-const defaultInitializeTimeout = 3 * time.Second
+const defaultInitializeTimeout = 60 * time.Second
 
 type streamJSONDriver struct {
 	binary            string
@@ -122,7 +122,7 @@ func (d *streamJSONDriver) nextRequestID() string {
 
 func (s *claudeStream) initialize(ctx context.Context) error {
 	id := s.driver.nextRequestID()
-	if err := s.writeControlRequest(ctx, id, "initialize"); err != nil {
+	if err := s.writeControlRequest(ctx, id, "initialize", map[string]any{"hooks": nil}); err != nil {
 		return err
 	}
 	timeout := s.driver.initializeTimeout
@@ -141,7 +141,14 @@ func (s *claudeStream) initialize(ctx context.Context) error {
 		frame, err := s.nextFrame(initCtx)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				return nil
+				if ctx.Err() != nil {
+					// The parent turn context is already done (canceled or its
+					// own deadline). Surface the parent's actual cause rather
+					// than the child initialize deadline, so a turn cancellation
+					// is not mislabeled as an init timeout.
+					return ctx.Err()
+				}
+				return fmt.Errorf("claude initialize was not acknowledged within %s", timeout)
 			}
 			return err
 		}
@@ -159,18 +166,20 @@ func (s *claudeStream) initialize(ctx context.Context) error {
 	}
 }
 
-func (s *claudeStream) writeControlRequest(ctx context.Context, id, subtype string) error {
+func (s *claudeStream) writeControlRequest(ctx context.Context, id, subtype string, fields map[string]any) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
+	request := map[string]any{"subtype": subtype}
+	for key, value := range fields {
+		request[key] = value
+	}
 	return s.conn.WriteJSON(map[string]any{
 		"type":       "control_request",
 		"request_id": id,
-		"request": map[string]any{
-			"subtype": subtype,
-		},
+		"request":    request,
 	})
 }
 
@@ -380,6 +389,9 @@ func sessionIDFrom(obj map[string]any) string {
 }
 
 func resultErrorText(obj map[string]any, subtype string) string {
+	if text := errorsArrayText(obj["errors"]); text != "" {
+		return text
+	}
 	for _, key := range []string{"error", "message"} {
 		if text := textValue(obj[key]); text != "" {
 			return text
@@ -407,12 +419,42 @@ func explicitResultText(value any) string {
 }
 
 func missingSuccessResultText(obj map[string]any) string {
+	if text := errorsArrayText(obj["errors"]); text != "" {
+		return text
+	}
 	for _, key := range []string{"error", "message"} {
 		if text := textValue(obj[key]); text != "" {
 			return text
 		}
 	}
 	return "claude success result missing result text"
+}
+
+func errorsArrayText(value any) string {
+	var parts []string
+	switch values := value.(type) {
+	case []any:
+		parts = make([]string, 0, len(values))
+		for _, item := range values {
+			text, ok := item.(string)
+			if !ok {
+				continue
+			}
+			if text = strings.TrimSpace(text); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	case []string:
+		parts = make([]string, 0, len(values))
+		for _, text := range values {
+			if text = strings.TrimSpace(text); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	default:
+		return ""
+	}
+	return strings.Join(parts, "; ")
 }
 
 func firstMap(obj map[string]any, keys ...string) (map[string]any, bool) {

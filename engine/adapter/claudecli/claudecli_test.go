@@ -74,11 +74,12 @@ func TestClaudeStreamJSONArgvAndPermissionProfiles(t *testing.T) {
 	assertNotContainsArg(t, writeSpec.Argv, "--permission-mode")
 }
 
-func TestClaudeInitializeOrderingAndTimeoutFallback(t *testing.T) {
+func TestClaudeInitializeOrderingAndTimeoutFailure(t *testing.T) {
 	t.Run("awaits initialize response before user message", func(t *testing.T) {
 		runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
 			peer := newClaudePeer(t, proc)
 			init := peer.expectControlRequest("initialize")
+			assertRequestFieldNull(t, init, "hooks")
 			next := peer.startReadFrame()
 			select {
 			case frame := <-next:
@@ -98,6 +99,45 @@ func TestClaudeInitializeOrderingAndTimeoutFallback(t *testing.T) {
 			t.Fatal(err)
 		}
 		_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	})
+
+	t.Run("initialize includes hooks null and interrupt omits hooks", func(t *testing.T) {
+		ready := make(chan struct{})
+		runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
+			peer := newClaudePeer(t, proc)
+			init := peer.expectControlRequest("initialize")
+			assertRequestFieldNull(t, init, "hooks")
+			peer.respondControlSuccess(init, map[string]any{"ok": true})
+			peer.expectUser("hello")
+			close(ready)
+			interrupt := peer.expectControlRequest("interrupt")
+			assertRequestOmitsField(t, interrupt, "hooks")
+			peer.emitResult("success", false, "done")
+		})
+
+		session := startFakeClaudeSession(t, engine.SessionOpts{})
+		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-ready:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for fake claude to receive user message")
+		}
+		native, ok := session.(interface {
+			NativeInterrupt(context.Context) (bool, error)
+		})
+		if !ok {
+			t.Fatal("session does not support NativeInterrupt")
+		}
+		if _, err := native.NativeInterrupt(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		got := collectEventsWithTimeout(t, events, 2*time.Second)
+		if !containsEvent(got, engine.EventResultMessage, "done") {
+			t.Fatalf("events = %#v, want result after interrupt control request", got)
+		}
 	})
 
 	t.Run("answers control request before initialize response and keeps waiting", func(t *testing.T) {
@@ -187,13 +227,22 @@ func TestClaudeInitializeOrderingAndTimeoutFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("proceeds when initialize response is absent", func(t *testing.T) {
+	t.Run("fails when initialize response is absent", func(t *testing.T) {
 		runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
 			peer := newClaudePeer(t, proc)
 			peer.expectControlRequest("initialize")
-			peer.expectUser("hello")
-			peer.emitSystem("session-init-timeout", "claude-sonnet")
-			peer.emitResult("success", false, "done")
+			next := peer.startReadFrame()
+			select {
+			case frame := <-next:
+				if frame.err != nil {
+					t.Fatalf("read client frame: %v", frame.err)
+				}
+				if frame.obj != nil {
+					t.Fatalf("client sent frame without initialize response: %#v", frame.obj)
+				}
+			case <-time.After(250 * time.Millisecond):
+				t.Fatal("client stdin stayed open after initialize timeout")
+			}
 		})
 
 		session := startFakeClaudeSessionWithInitializeTimeout(t, 15*time.Millisecond, engine.SessionOpts{})
@@ -202,8 +251,11 @@ func TestClaudeInitializeOrderingAndTimeoutFallback(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := collectEventsWithTimeout(t, events, 2*time.Second)
-		if !containsEvent(got, engine.EventResultMessage, "done") {
-			t.Fatalf("events = %#v, want result after initialize timeout", got)
+		if !containsEvent(got, engine.EventTerminalError, "claude initialize was not acknowledged within 15ms") {
+			t.Fatalf("events = %#v, want terminal initialize timeout error", got)
+		}
+		if containsEventType(got, engine.EventResultMessage) {
+			t.Fatalf("events = %#v, did not want result after initialize timeout", got)
 		}
 	})
 }
@@ -225,11 +277,16 @@ func TestClaudeResultStatusMapping(t *testing.T) {
 			wantType: engine.EventResultMessage, wantText: "answer", wantResult: "answer",
 		},
 		{
-			name: "is_error",
+			name: "is_error errors array",
 			emitResult: func(peer *claudePeer) {
-				peer.emitResult("success", true, map[string]any{"message": "tool failed"})
+				peer.write(map[string]any{
+					"type":     "result",
+					"subtype":  "success",
+					"is_error": true,
+					"errors":   []any{"rate limited", "retry later"},
+				})
 			},
-			wantType: engine.EventTerminalError, wantText: "tool failed",
+			wantType: engine.EventTerminalError, wantText: "rate limited; retry later",
 		},
 		{
 			name: "error subtype",
@@ -257,6 +314,7 @@ func TestClaudeResultStatusMapping(t *testing.T) {
 					"type":     "result",
 					"subtype":  "success",
 					"is_error": false,
+					"errors":   []any{"missing result"},
 				})
 			},
 			wantType: engine.EventTerminalError, wantText: "missing result",
@@ -834,6 +892,32 @@ func assertArgValue(t *testing.T, argv []string, arg, want string) {
 	}
 	if got := argv[i+1]; got != want {
 		t.Fatalf("argv value after %q = %q, want %q in %#v", arg, got, want, argv)
+	}
+}
+
+func assertRequestFieldNull(t *testing.T, frame map[string]any, key string) {
+	t.Helper()
+	request, ok := firstMap(frame, "request")
+	if !ok {
+		t.Fatalf("control_request missing request: %#v", frame)
+	}
+	value, ok := request[key]
+	if !ok {
+		t.Fatalf("control_request request missing %q: %#v", key, frame)
+	}
+	if value != nil {
+		t.Fatalf("control_request request %q = %#v, want JSON null in %#v", key, value, frame)
+	}
+}
+
+func assertRequestOmitsField(t *testing.T, frame map[string]any, key string) {
+	t.Helper()
+	request, ok := firstMap(frame, "request")
+	if !ok {
+		t.Fatalf("control_request missing request: %#v", frame)
+	}
+	if _, ok := request[key]; ok {
+		t.Fatalf("control_request request included %q: %#v", key, frame)
 	}
 }
 
