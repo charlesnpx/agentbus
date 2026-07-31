@@ -142,7 +142,11 @@ func (s *claudeStream) initialize(ctx context.Context) error {
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				if ctx.Err() != nil {
-					return err
+					// The parent turn context is already done (canceled or its
+					// own deadline). Surface the parent's actual cause rather
+					// than the child initialize deadline, so a turn cancellation
+					// is not mislabeled as an init timeout.
+					return ctx.Err()
 				}
 				return fmt.Errorf("claude initialize was not acknowledged within %s", timeout)
 			}
