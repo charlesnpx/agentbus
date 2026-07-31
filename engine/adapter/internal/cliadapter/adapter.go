@@ -300,7 +300,7 @@ func (b *Backend) ProbeBackend(ctx context.Context, runner command.ProbeRunner) 
 }
 
 func (b *Backend) hydrateEmptyProbeDiscovery(probed *ProbedBackendDescriptor) {
-	if probed.DiscoverySource != "" && len(probed.DiscoveredModels) > 0 {
+	if probed.DiscoverySource != "" && (len(probed.DiscoveredModels) > 0 || len(probed.DiscoveredEfforts) > 0) {
 		return
 	}
 	probe, err := b.cachedProbe()
@@ -315,7 +315,11 @@ func (b *Backend) hydrateEmptyProbeDiscovery(probed *ProbedBackendDescriptor) {
 	probed.DiscoverySource = probe.DiscoverySource
 	probed.DiscoveryFetchedAt = probe.DiscoveryFetchedAt
 	probed.DiscoveryClientVersion = probe.DiscoveryClientVersion
-	probed.DiscoveryWarning = strings.Join(probe.DiscoveryWarnings, "; ")
+	// Preserve any live-discovery warning (e.g. a transient discovery failure that
+	// triggered the cache fallback) and append the cached discovery warnings.
+	for _, w := range probe.DiscoveryWarnings {
+		probed.DiscoveryWarning = appendWarning(probed.DiscoveryWarning, w)
+	}
 }
 
 func (b *Backend) normalizeVersion(s string) string {
