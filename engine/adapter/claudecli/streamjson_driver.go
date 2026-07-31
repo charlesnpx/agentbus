@@ -142,8 +142,12 @@ func (s *claudeStream) initialize(ctx context.Context) error {
 		if isControlResponseTo(frame.Object, id) {
 			return controlResponseError(frame.Object)
 		}
-		if handled, err := s.handleControlRequest(ctx, frame.Object); handled || err != nil {
+		handled, err := s.handleControlRequest(ctx, frame.Object)
+		if err != nil {
 			return err
+		}
+		if handled {
+			continue
 		}
 		s.pending = append(s.pending, frame)
 	}
@@ -316,13 +320,18 @@ func (s *claudeStream) emitAssistant(obj map[string]any) {
 }
 
 func (s *claudeStream) emitResult(obj map[string]any) {
-	subtype := strings.ToLower(strings.TrimSpace(firstString(obj, "subtype")))
+	subtype, _ := obj["subtype"].(string)
 	isError := boolValue(obj["is_error"]) || boolValue(obj["isError"])
-	if !isError && (subtype == "" || subtype == "success") {
-		s.emitEvent(engine.Event{Type: engine.EventResultMessage, Text: textValue(obj["result"]), Metadata: obj})
+	if !isError && subtype == "success" {
+		text := explicitResultText(obj["result"])
+		if strings.TrimSpace(text) == "" {
+			s.emitEvent(engine.Event{Type: engine.EventTerminalError, Text: missingSuccessResultText(obj), Metadata: obj})
+			return
+		}
+		s.emitEvent(engine.Event{Type: engine.EventResultMessage, Text: text, Metadata: obj})
 		return
 	}
-	text := resultErrorText(obj, subtype)
+	text := resultErrorText(obj, strings.TrimSpace(subtype))
 	s.emitEvent(engine.Event{Type: engine.EventTerminalError, Text: text, Metadata: obj})
 }
 
@@ -377,6 +386,27 @@ func resultErrorText(obj map[string]any, subtype string) string {
 		return "claude result " + subtype
 	}
 	return "claude result error"
+}
+
+func explicitResultText(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case map[string]any:
+		text, _ := v["text"].(string)
+		return text
+	default:
+		return ""
+	}
+}
+
+func missingSuccessResultText(obj map[string]any) string {
+	for _, key := range []string{"error", "message"} {
+		if text := textValue(obj[key]); text != "" {
+			return text
+		}
+	}
+	return "claude success result missing result text"
 }
 
 func firstMap(obj map[string]any, keys ...string) (map[string]any, bool) {

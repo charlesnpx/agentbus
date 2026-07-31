@@ -100,6 +100,40 @@ func TestClaudeInitializeOrderingAndTimeoutFallback(t *testing.T) {
 		_ = collectEventsWithTimeout(t, events, 2*time.Second)
 	})
 
+	t.Run("answers control request before initialize response and keeps waiting", func(t *testing.T) {
+		runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
+			peer := newClaudePeer(t, proc)
+			init := peer.expectControlRequest("initialize")
+			peer.emitControlRequest("tool-before-init", "can_use_tool")
+			toolResponse := peer.expectControlResponse("tool-before-init")
+			if got := nestedString(toolResponse, "response", "response", "behavior"); got != "allow" {
+				t.Fatalf("can_use_tool response = %#v, want behavior allow", toolResponse)
+			}
+
+			next := peer.startReadFrame()
+			select {
+			case frame := <-next:
+				t.Fatalf("client sent frame before initialize response: %#v", frame.obj)
+			case <-time.After(25 * time.Millisecond):
+			}
+			peer.respondControlSuccess(init, map[string]any{"ok": true})
+			user := peer.receiveFrame(next, 2*time.Second)
+			peer.assertUser(user, "hello")
+			peer.emitSystem("session-init-control", "claude-sonnet")
+			peer.emitResult("success", false, "done")
+		})
+
+		session := startFakeClaudeSession(t, engine.SessionOpts{})
+		events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := collectEventsWithTimeout(t, events, 2*time.Second)
+		if !containsEvent(got, engine.EventResultMessage, "done") {
+			t.Fatalf("events = %#v, want successful result after initialize control request", got)
+		}
+	})
+
 	t.Run("proceeds when initialize response is absent", func(t *testing.T) {
 		runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
 			peer := newClaudePeer(t, proc)
@@ -124,16 +158,56 @@ func TestClaudeInitializeOrderingAndTimeoutFallback(t *testing.T) {
 func TestClaudeResultStatusMapping(t *testing.T) {
 	tests := []struct {
 		name       string
-		subtype    string
-		isError    bool
-		result     any
+		emitResult func(*claudePeer)
 		wantType   string
 		wantText   string
-		wantResult bool
+		wantResult string
 	}{
-		{name: "success", subtype: "success", result: "final answer", wantType: engine.EventResultMessage, wantText: "final answer", wantResult: true},
-		{name: "is_error", subtype: "success", isError: true, result: map[string]any{"message": "tool failed"}, wantType: engine.EventTerminalError, wantText: "tool failed"},
-		{name: "error subtype", subtype: "error_during_execution", result: "execution failed", wantType: engine.EventTerminalError, wantText: "execution failed"},
+		{
+			name: "success uses explicit result text",
+			emitResult: func(peer *claudePeer) {
+				peer.emitAssistant("partial", "Bash", map[string]any{"command": "echo partial"})
+				peer.emitResult("success", false, "answer")
+			},
+			wantType: engine.EventResultMessage, wantText: "answer", wantResult: "answer",
+		},
+		{
+			name: "is_error",
+			emitResult: func(peer *claudePeer) {
+				peer.emitResult("success", true, map[string]any{"message": "tool failed"})
+			},
+			wantType: engine.EventTerminalError, wantText: "tool failed",
+		},
+		{
+			name: "error subtype",
+			emitResult: func(peer *claudePeer) {
+				peer.emitResult("error_during_execution", false, "execution failed")
+			},
+			wantType: engine.EventTerminalError, wantText: "execution failed",
+		},
+		{
+			name: "missing subtype fails closed",
+			emitResult: func(peer *claudePeer) {
+				peer.write(map[string]any{
+					"type":     "result",
+					"is_error": false,
+					"result":   "answer",
+				})
+			},
+			wantType: engine.EventTerminalError, wantText: "answer",
+		},
+		{
+			name: "success without result text fails closed",
+			emitResult: func(peer *claudePeer) {
+				peer.emitAssistant("partial", "Bash", map[string]any{"command": "echo partial"})
+				peer.write(map[string]any{
+					"type":     "result",
+					"subtype":  "success",
+					"is_error": false,
+				})
+			},
+			wantType: engine.EventTerminalError, wantText: "missing result",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -142,7 +216,7 @@ func TestClaudeResultStatusMapping(t *testing.T) {
 				peer.handshake()
 				peer.expectUser("hello")
 				peer.emitSystem("session-result", "claude-sonnet")
-				peer.emitResult(test.subtype, test.isError, test.result)
+				test.emitResult(peer)
 			})
 
 			session := startFakeClaudeSession(t, engine.SessionOpts{})
@@ -154,7 +228,11 @@ func TestClaudeResultStatusMapping(t *testing.T) {
 			if !containsEvent(got, test.wantType, test.wantText) {
 				t.Fatalf("events = %#v, want %s containing %q", got, test.wantType, test.wantText)
 			}
-			if !test.wantResult && resultText(got) != "" {
+			if test.wantResult != "" {
+				if resultText(got) != test.wantResult {
+					t.Fatalf("events = %#v, want result %q", got, test.wantResult)
+				}
+			} else if containsEventType(got, engine.EventResultMessage) {
 				t.Fatalf("events = %#v, did not want fabricated success result", got)
 			}
 		})
@@ -638,6 +716,15 @@ func collectEventsWithTimeout(t *testing.T, ch <-chan engine.Event, timeout time
 func containsEvent(events []engine.Event, typ, sub string) bool {
 	for _, ev := range events {
 		if ev.Type == typ && strings.Contains(ev.Text, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsEventType(events []engine.Event, typ string) bool {
+	for _, ev := range events {
+		if ev.Type == typ {
 			return true
 		}
 	}
