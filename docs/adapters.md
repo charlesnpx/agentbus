@@ -282,7 +282,7 @@ Read-only turns MUST apply the strongest backend-supported read-only profile:
 
 | Backend | Required read-only config behavior |
 | --- | --- |
-| codex | Use the app-server read-only sandbox, approval policy `never`, and disabled network access in the thread and turn requests. No legacy exec-mode config-isolation flag is passed. |
+| codex | Use the app-server read-only sandbox, approval policy `never`, and disabled network access in the turn request's sandbox policy. No legacy exec-mode config-isolation flag is passed. |
 | claude | Pass `--strict-mcp-config` with an empty `mcpServers` record. MCP servers are excluded, but full settings isolation is unavailable because Claude 2.1.x `--bare` strips API authentication; user settings and hooks may still load on read-only turns. |
 
 Write turns run under user configuration because real work may legitimately
