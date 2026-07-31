@@ -1,0 +1,460 @@
+package claudecli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/adapter/internal/duplex"
+	"github.com/charlesnpx/agentbus/engine/command"
+)
+
+const defaultInitializeTimeout = 3 * time.Second
+
+type streamJSONDriver struct {
+	binary            string
+	initializeTimeout time.Duration
+	nextID            atomic.Uint64
+}
+
+type claudeStream struct {
+	driver  *streamJSONDriver
+	conn    *duplex.Conn
+	emit    duplex.EmitFunc
+	pending []duplex.Frame
+}
+
+func newStreamJSONDriver(binary string) *streamJSONDriver {
+	return &streamJSONDriver{
+		binary:            binary,
+		initializeTimeout: defaultInitializeTimeout,
+	}
+}
+
+func (d *streamJSONDriver) ExecSpec(resumeID string, opts engine.SessionOpts, input engine.TurnInput) (command.ExecSpec, error) {
+	args := []string{
+		d.binaryName(),
+		"-p",
+		"--input-format",
+		"stream-json",
+		"--output-format",
+		"stream-json",
+		"--verbose",
+	}
+	if opts.Model != "" {
+		args = append(args, "--model", opts.Model)
+	}
+	if opts.Effort != "" {
+		args = append(args, "--effort", opts.Effort)
+	}
+	if input.Write {
+		args = append(args, "--dangerously-skip-permissions")
+	} else {
+		args = append(args,
+			"--strict-mcp-config",
+			"--mcp-config", `{"mcpServers":{}}`,
+			"--permission-mode", "dontAsk",
+			"--allowedTools", strings.Join(readOnlyAllowedTools, ","),
+			"--disallowedTools", strings.Join(readOnlyDeniedTools, ","),
+		)
+	}
+	if resumeID != "" {
+		args = append(args, "--resume", resumeID)
+	}
+	return command.ExecSpec{Argv: args, Dir: opts.CWD}, nil
+}
+
+func (d *streamJSONDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID string, _ engine.SessionOpts, input engine.TurnInput, emit duplex.EmitFunc) (string, error) {
+	stream := &claudeStream{driver: d, conn: conn, emit: emit}
+	sessionID := resumeID
+	if err := stream.initialize(ctx); err != nil {
+		return sessionID, err
+	}
+	if err := stream.writeUserMessage(ctx, input.Prompt); err != nil {
+		return sessionID, err
+	}
+	for {
+		frame, err := stream.nextFrame(ctx)
+		if err != nil {
+			return sessionID, err
+		}
+		terminal, err := stream.handleFrame(ctx, frame, &sessionID)
+		if err != nil {
+			return sessionID, err
+		}
+		if terminal {
+			return sessionID, nil
+		}
+	}
+}
+
+func (d *streamJSONDriver) Interrupt(ctx context.Context, conn *duplex.Conn) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	return conn.WriteJSON(map[string]any{
+		"type":       "control_request",
+		"request_id": d.nextRequestID(),
+		"request": map[string]any{
+			"subtype": "interrupt",
+		},
+	})
+}
+
+func (d *streamJSONDriver) binaryName() string {
+	if strings.TrimSpace(d.binary) == "" {
+		return "claude"
+	}
+	return d.binary
+}
+
+func (d *streamJSONDriver) nextRequestID() string {
+	return fmt.Sprintf("req_%d", d.nextID.Add(1))
+}
+
+func (s *claudeStream) initialize(ctx context.Context) error {
+	id := s.driver.nextRequestID()
+	if err := s.writeControlRequest(ctx, id, "initialize"); err != nil {
+		return err
+	}
+	timeout := s.driver.initializeTimeout
+	if timeout <= 0 {
+		timeout = defaultInitializeTimeout
+	}
+	initCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		frame, err := s.nextFrame(initCtx)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil
+			}
+			return err
+		}
+		if isControlResponseTo(frame.Object, id) {
+			return controlResponseError(frame.Object)
+		}
+		if handled, err := s.handleControlRequest(ctx, frame.Object); handled || err != nil {
+			return err
+		}
+		s.pending = append(s.pending, frame)
+	}
+}
+
+func (s *claudeStream) writeControlRequest(ctx context.Context, id, subtype string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	return s.conn.WriteJSON(map[string]any{
+		"type":       "control_request",
+		"request_id": id,
+		"request": map[string]any{
+			"subtype": subtype,
+		},
+	})
+}
+
+func (s *claudeStream) writeUserMessage(ctx context.Context, prompt string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	return s.conn.WriteJSON(map[string]any{
+		"type": "user",
+		"message": map[string]any{
+			"role":    "user",
+			"content": prompt,
+		},
+	})
+}
+
+func (s *claudeStream) nextFrame(ctx context.Context) (duplex.Frame, error) {
+	if len(s.pending) > 0 {
+		frame := s.pending[0]
+		copy(s.pending, s.pending[1:])
+		s.pending = s.pending[:len(s.pending)-1]
+		return frame, nil
+	}
+	frames := s.conn.Frames()
+	decodeErrs := s.conn.DecodeErrors()
+	for frames != nil || decodeErrs != nil {
+		select {
+		case frame, ok := <-frames:
+			if !ok {
+				frames = nil
+				continue
+			}
+			return frame, nil
+		case err, ok := <-decodeErrs:
+			if !ok {
+				decodeErrs = nil
+				continue
+			}
+			if err != nil {
+				return duplex.Frame{}, err
+			}
+		case <-ctx.Done():
+			return duplex.Frame{}, ctx.Err()
+		}
+	}
+	return duplex.Frame{}, duplex.ErrBackendExitedBeforeTerminal
+}
+
+func (s *claudeStream) handleFrame(ctx context.Context, frame duplex.Frame, sessionID *string) (bool, error) {
+	obj := frame.Object
+	if id := sessionIDFrom(obj); id != "" {
+		*sessionID = id
+	}
+	switch strings.ToLower(firstString(obj, "type")) {
+	case "control_request":
+		_, err := s.handleControlRequest(ctx, obj)
+		return false, err
+	case "control_response", "user":
+		return false, nil
+	case "system":
+		s.emitModelReported(obj)
+		return false, nil
+	case "assistant":
+		s.emitAssistant(obj)
+		return false, nil
+	case "result":
+		s.emitResult(obj)
+		return true, nil
+	case "warning":
+		if text := textFrom(obj); text != "" {
+			s.emitEvent(engine.Event{Type: engine.EventWarning, Text: text, Metadata: obj})
+		}
+	case "error":
+		if text := textFrom(obj); text != "" {
+			s.emitEvent(engine.Event{Type: engine.EventTerminalError, Text: text, Metadata: obj})
+		}
+	default:
+		if text := textFrom(obj); text != "" {
+			s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
+		}
+	}
+	return false, nil
+}
+
+func (s *claudeStream) handleControlRequest(ctx context.Context, obj map[string]any) (bool, error) {
+	if strings.ToLower(firstString(obj, "type")) != "control_request" {
+		return false, nil
+	}
+	request, _ := firstMap(obj, "request")
+	response := map[string]any{}
+	switch strings.ToLower(firstString(request, "subtype")) {
+	case "can_use_tool":
+		response["behavior"] = "allow"
+	case "hook_callback":
+		response["continue"] = true
+	case "mcp_message":
+		response["mcp_response"] = map[string]any{}
+	}
+	select {
+	case <-ctx.Done():
+		return true, ctx.Err()
+	default:
+	}
+	return true, s.conn.WriteJSON(map[string]any{
+		"type": "control_response",
+		"response": map[string]any{
+			"subtype":    "success",
+			"request_id": firstString(obj, "request_id", "requestId", "id"),
+			"response":   response,
+		},
+	})
+}
+
+func (s *claudeStream) emitModelReported(obj map[string]any) {
+	if model := strings.TrimSpace(firstString(obj, "model")); model != "" {
+		s.emitEvent(engine.Event{Type: engine.EventModelReported, ModelReported: model, Metadata: obj})
+	}
+}
+
+func (s *claudeStream) emitAssistant(obj map[string]any) {
+	msg, _ := firstMap(obj, "message")
+	content := anySlice(msg["content"])
+	if len(content) == 0 {
+		if text := textFrom(obj); text != "" {
+			s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
+		}
+		return
+	}
+	for _, item := range content {
+		block, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch firstString(block, "type") {
+		case "text":
+			if text := textValue(block["text"]); text != "" {
+				s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
+			}
+		case "tool_use":
+			name := firstString(block, "name")
+			text := textValue(block["text"])
+			if text == "" {
+				text = textValue(block["input"])
+			}
+			if text == "" {
+				text = name
+			}
+			s.emitEvent(engine.Event{Type: engine.EventToolUse, Name: name, Text: text, Metadata: obj})
+		}
+	}
+}
+
+func (s *claudeStream) emitResult(obj map[string]any) {
+	subtype := strings.ToLower(strings.TrimSpace(firstString(obj, "subtype")))
+	isError := boolValue(obj["is_error"]) || boolValue(obj["isError"])
+	if !isError && (subtype == "" || subtype == "success") {
+		s.emitEvent(engine.Event{Type: engine.EventResultMessage, Text: textValue(obj["result"]), Metadata: obj})
+		return
+	}
+	text := resultErrorText(obj, subtype)
+	s.emitEvent(engine.Event{Type: engine.EventTerminalError, Text: text, Metadata: obj})
+}
+
+func (s *claudeStream) emitEvent(ev engine.Event) {
+	if s.emit != nil {
+		s.emit(ev)
+	}
+}
+
+func isControlResponseTo(obj map[string]any, id string) bool {
+	if strings.ToLower(firstString(obj, "type")) != "control_response" {
+		return false
+	}
+	response, _ := firstMap(obj, "response")
+	got := firstString(response, "request_id", "requestId")
+	if got == "" {
+		got = firstString(obj, "request_id", "requestId", "id")
+	}
+	return got == id
+}
+
+func controlResponseError(obj map[string]any) error {
+	response, _ := firstMap(obj, "response")
+	subtype := strings.ToLower(firstString(response, "subtype"))
+	if subtype != "error" && response["error"] == nil {
+		return nil
+	}
+	msg := textValue(response["error"])
+	if msg == "" {
+		msg = textFrom(response)
+	}
+	if msg == "" {
+		msg = "claude control initialize failed"
+	}
+	return errors.New(msg)
+}
+
+func sessionIDFrom(obj map[string]any) string {
+	return strings.TrimSpace(firstString(obj, "session_id", "sessionId", "uuid"))
+}
+
+func resultErrorText(obj map[string]any, subtype string) string {
+	for _, key := range []string{"error", "message"} {
+		if text := textValue(obj[key]); text != "" {
+			return text
+		}
+	}
+	if text := textValue(obj["result"]); text != "" {
+		return text
+	}
+	if subtype != "" {
+		return "claude result " + subtype
+	}
+	return "claude result error"
+}
+
+func firstMap(obj map[string]any, keys ...string) (map[string]any, bool) {
+	if obj == nil {
+		return nil, false
+	}
+	for _, key := range keys {
+		if value, ok := obj[key].(map[string]any); ok {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func firstString(obj map[string]any, keys ...string) string {
+	if obj == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if value, ok := obj[key]; ok {
+			if s := textValue(value); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func textFrom(obj map[string]any) string {
+	for _, key := range []string{"text", "message", "content", "result", "error"} {
+		if text := textValue(obj[key]); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func textValue(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			if text := textValue(item); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "")
+	case map[string]any:
+		for _, key := range []string{"text", "message", "content", "result", "error"} {
+			if text := textValue(v[key]); text != "" {
+				return text
+			}
+		}
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return string(raw)
+	case json.Number:
+		return v.String()
+	case float64:
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		return ""
+	}
+}
+
+func anySlice(value any) []any {
+	values, _ := value.([]any)
+	return values
+}
+
+func boolValue(value any) bool {
+	v, _ := value.(bool)
+	return v
+}
