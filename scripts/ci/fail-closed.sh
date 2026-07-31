@@ -101,22 +101,266 @@ assert_restricted_cgroup_unavailable() {
 
 write_restricted_fake_codex() {
   local path=$1
-  cat >"$path" <<'EOF'
-#!/usr/bin/env sh
-if [ "${1:-}" = "--version" ]; then echo "codex-cli 0.143.0"; exit 0; fi
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "help" ]; then echo "codex help"; exit 0; fi
-if [ "${1:-}" = "exec" ]; then
-  input=$(cat)
-  : "$input"
-  printf '{"type":"thread.started","thread_id":"restricted-smoke-session"}\n'
-  printf '{"type":"turn.started"}\n'
-  printf '{"type":"item.completed","item":{"type":"agent_message","text":"restricted smoke ok"}}\n'
-  printf '{"type":"turn.completed"}\n'
-  exit 0
-fi
-echo "unexpected fake codex argv: $*" >&2
-exit 2
+  local src="${path}.go"
+  cat >"$src" <<'EOF'
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"runtime"
+	"strings"
+)
+
+const (
+	codexVersion = "0.143.0"
+	resultText   = "restricted smoke ok"
+)
+
+type appServerFrame struct {
+	ID     json.RawMessage `json:"id,omitempty"`
+	Method string          `json:"method,omitempty"`
+	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func main() {
+	os.Exit(run(os.Args[1:]))
+}
+
+func run(args []string) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "--version":
+			fmt.Println("codex-cli " + codexVersion)
+			return 0
+		case "--help", "help":
+			fmt.Println("codex help")
+			return 0
+		case "app-server":
+			return runAppServer()
+		}
+	}
+	fmt.Fprintf(os.Stderr, "unexpected fake codex argv: %s\n", strings.Join(args, " "))
+	return 2
+}
+
+func runAppServer() int {
+	dec := json.NewDecoder(os.Stdin)
+	enc := json.NewEncoder(os.Stdout)
+	threadID := "restricted-smoke-session"
+	for {
+		var frame appServerFrame
+		if err := dec.Decode(&frame); err != nil {
+			if errors.Is(err, io.EOF) {
+				return 0
+			}
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		params := appServerParams(frame.Params)
+		switch frame.Method {
+		case "":
+			continue
+		case "initialize":
+			if !hasAppServerID(frame.ID) {
+				continue
+			}
+			if err := respond(enc, frame.ID, initializeResult()); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+		case "initialized":
+			continue
+		case "thread/start", "thread/resume":
+			if id := stringFromMap(params, "threadId", "thread_id", "id"); id != "" {
+				threadID = id
+			}
+			if !hasAppServerID(frame.ID) {
+				continue
+			}
+			if err := respond(enc, frame.ID, threadResult(threadID)); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+		case "turn/start":
+			if id := stringFromMap(params, "threadId", "thread_id"); id != "" {
+				threadID = id
+			}
+			turnID := fmt.Sprintf("restricted-smoke-turn-%d", os.Getpid())
+			if hasAppServerID(frame.ID) {
+				if err := respond(enc, frame.ID, turnResult(turnID)); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					return 4
+				}
+			}
+			if err := writeTurnCompleted(enc, threadID, turnID); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+			return 0
+		case "model/list":
+			if !hasAppServerID(frame.ID) {
+				continue
+			}
+			if err := respond(enc, frame.ID, modelListResult()); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+		case "turn/interrupt":
+			if !hasAppServerID(frame.ID) {
+				continue
+			}
+			if err := respond(enc, frame.ID, map[string]any{}); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+		default:
+			if hasAppServerID(frame.ID) {
+				_ = respondError(enc, frame.ID, -32601, "unsupported fake codex method: "+frame.Method)
+			}
+		}
+	}
+}
+
+func hasAppServerID(id json.RawMessage) bool {
+	return len(bytes.TrimSpace(id)) != 0
+}
+
+func appServerParams(raw json.RawMessage) map[string]any {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return map[string]any{}
+	}
+	var params map[string]any
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return map[string]any{}
+	}
+	return params
+}
+
+func respond(enc *json.Encoder, id json.RawMessage, result any) error {
+	return enc.Encode(map[string]any{"id": id, "result": result})
+}
+
+func respondError(enc *json.Encoder, id json.RawMessage, code int, message string) error {
+	return enc.Encode(map[string]any{
+		"id": id,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	})
+}
+
+func initializeResult() map[string]any {
+	return map[string]any{
+		"codexHome":      os.TempDir(),
+		"platformFamily": "unix",
+		"platformOs":     runtime.GOOS,
+		"userAgent":      "codex-cli/" + codexVersion,
+	}
+}
+
+func threadResult(threadID string) map[string]any {
+	return map[string]any{
+		"threadId": threadID,
+		"thread": map[string]any{
+			"id":        threadID,
+			"sessionId": threadID,
+			"status":    "running",
+			"source":    "app-server",
+			"turns":     []any{},
+		},
+	}
+}
+
+func turnResult(turnID string) map[string]any {
+	return map[string]any{
+		"turnId": turnID,
+		"turn": map[string]any{
+			"id":     turnID,
+			"items":  []any{},
+			"status": "inProgress",
+		},
+	}
+}
+
+func modelListResult() map[string]any {
+	return map[string]any{
+		"data": []any{
+			map[string]any{
+				"model": "gpt-5.5",
+				"supportedReasoningEfforts": []any{
+					"none",
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"xhigh",
+				},
+			},
+		},
+	}
+}
+
+func writeTurnCompleted(enc *json.Encoder, threadID, turnID string) error {
+	itemID := "restricted-smoke-result"
+	item := map[string]any{
+		"id":   itemID,
+		"type": "agentMessage",
+		"text": resultText,
+	}
+	itemParams := map[string]any{
+		"threadId": threadID,
+		"turnId":   turnID,
+		"item":     item,
+	}
+	if err := enc.Encode(map[string]any{"method": "item/started", "params": itemParams}); err != nil {
+		return err
+	}
+	if err := enc.Encode(map[string]any{
+		"method": "item/agentMessage/delta",
+		"params": map[string]any{
+			"threadId": threadID,
+			"turnId":   turnID,
+			"itemId":   itemID,
+			"delta":    resultText,
+		},
+	}); err != nil {
+		return err
+	}
+	if err := enc.Encode(map[string]any{"method": "item/completed", "params": itemParams}); err != nil {
+		return err
+	}
+	return enc.Encode(map[string]any{
+		"method": "turn/completed",
+		"params": map[string]any{
+			"threadId": threadID,
+			"turnId":   turnID,
+			"status":   "completed",
+			"turn": map[string]any{
+				"id":     turnID,
+				"items":  []any{item},
+				"status": "completed",
+			},
+		},
+	})
+}
+
+func stringFromMap(obj map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := obj[key].(string); ok && value != "" {
+			return value
+		}
+	}
+	return ""
+}
 EOF
+  gofmt -w "$src"
+  go build -trimpath -o "$path" "$src"
   chmod 755 "$path"
 }
 
@@ -132,7 +376,7 @@ write_restricted_setup_cache() {
       "backend": "codex",
       "binaryPath": "$codex_path",
       "version": "0.143.0",
-      "streamSchema": "codex-json-v1",
+      "streamSchema": "codex-appserver-v1",
       "configMode": {"write": "user", "readOnly": "hermetic"},
       "sandboxModes": ["workspace-write", "read-only"],
       "jsonEventsProbed": true

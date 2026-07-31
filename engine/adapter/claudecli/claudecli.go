@@ -2,11 +2,9 @@ package claudecli
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
-	"strings"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/internal/cliadapter"
@@ -15,7 +13,7 @@ import (
 
 const (
 	MinimumKnownGoodVersion = "2.1.205"
-	StreamSchema            = "claude-stream-json-v1"
+	StreamSchema            = "claude-streamjson-v2"
 )
 
 var readOnlyAllowedTools = []string{
@@ -87,6 +85,7 @@ func New(opts Options) engine.Backend {
 	if len(efforts) == 0 {
 		efforts = []string{"low", "medium", "high", "max"}
 	}
+	driver := newStreamJSONDriver(opts.Binary)
 	return &cliadapter.Backend{
 		NameValue:      "claude",
 		Binary:         opts.Binary,
@@ -95,8 +94,7 @@ func New(opts Options) engine.Backend {
 		StreamSchema:   StreamSchema,
 		AllowedModels:  cliadapter.StringSet(opts.SupportedModels...),
 		AllowedEfforts: cliadapter.StringSet(efforts...),
-		BuildArgs:      buildArgs,
-		Parse:          parseEvent,
+		Driver:         driver,
 		Discover:       discoverModels,
 	}
 }
@@ -135,116 +133,4 @@ func valuesFromGroup(text, pattern string) []string {
 	}
 	sort.Strings(values)
 	return values
-}
-
-func buildArgs(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error) {
-	args := []string{"--print", "--output-format", "stream-json", "--verbose"}
-	if opts.Model != "" {
-		args = append(args, "--model", opts.Model)
-	}
-	if opts.Effort != "" {
-		args = append(args, "--effort", opts.Effort)
-	}
-	if input.Write {
-		args = append(args, "--dangerously-skip-permissions")
-	} else {
-		args = append(args,
-			"--strict-mcp-config",
-			"--mcp-config", `{"mcpServers":{}}`,
-			"--permission-mode", "dontAsk",
-			"--allowedTools", strings.Join(readOnlyAllowedTools, ","),
-			"--disallowedTools", strings.Join(readOnlyDeniedTools, ","),
-		)
-	}
-	if resumeID != "" {
-		args = append(args, "--resume", resumeID)
-	}
-	return args, nil
-}
-
-func parseEvent(obj map[string]any) ([]engine.Event, string, error) {
-	id := firstString(obj, "session_id", "sessionId", "uuid")
-	typ := strings.ToLower(firstString(obj, "type"))
-	switch typ {
-	case "system":
-		return modelReportedEvent(obj), id, nil
-	case "assistant":
-		return parseAssistant(obj, id)
-	case "result":
-		if text := firstString(obj, "result"); text != "" {
-			return []engine.Event{{Type: engine.EventResultMessage, Text: text, Metadata: obj}}, id, nil
-		}
-	case "user":
-		return nil, id, nil
-	case "error", "warning":
-		return []engine.Event{{Type: engine.EventWarning, Text: textFrom(obj), Metadata: obj}}, id, nil
-	}
-	if text := textFrom(obj); text != "" && typ != "" {
-		return []engine.Event{{Type: engine.EventAgentText, Text: text, Metadata: obj}}, id, nil
-	}
-	return nil, id, nil
-}
-
-func modelReportedEvent(obj map[string]any) []engine.Event {
-	model := strings.TrimSpace(firstString(obj, "model"))
-	if model == "" {
-		return nil
-	}
-	return []engine.Event{{Type: engine.EventModelReported, ModelReported: model, Metadata: obj}}
-}
-
-func parseAssistant(obj map[string]any, id string) ([]engine.Event, string, error) {
-	msg, _ := obj["message"].(map[string]any)
-	content, ok := msg["content"].([]any)
-	if !ok {
-		if text := textFrom(obj); text != "" {
-			return []engine.Event{{Type: engine.EventAgentText, Text: text, Metadata: obj}}, id, nil
-		}
-		return nil, id, nil
-	}
-	var events []engine.Event
-	for _, item := range content {
-		block, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		switch firstString(block, "type") {
-		case "text":
-			if text := firstString(block, "text"); text != "" {
-				events = append(events, engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
-			}
-		case "tool_use":
-			name := firstString(block, "name")
-			text := firstString(block, "text")
-			if text == "" {
-				b, _ := json.Marshal(block["input"])
-				text = string(b)
-			}
-			if text == "" {
-				text = name
-			}
-			events = append(events, engine.Event{Type: engine.EventToolUse, Name: name, Text: text, Metadata: obj})
-		}
-	}
-	return events, id, nil
-}
-
-func textFrom(obj map[string]any) string {
-	for _, key := range []string{"text", "message", "content", "result", "error"} {
-		if s := firstString(obj, key); s != "" {
-			return s
-		}
-	}
-	return fmt.Sprint(obj)
-}
-
-func firstString(obj map[string]any, keys ...string) string {
-	for _, key := range keys {
-		if v, ok := obj[key]; ok {
-			if s, ok := v.(string); ok {
-				return s
-			}
-		}
-	}
-	return ""
 }

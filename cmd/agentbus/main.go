@@ -1069,7 +1069,7 @@ func printRootHelp(out io.Writer) {
 
 JSON shapes:
   version:  {"schema":1,"version":"dev","protocolVersion":2}
-  setup:    {"schema":1,"backends":[{"backend":"codex","binaryPath":"...","version":"...","configMode":{"write":"user","readOnly":"hermetic"},"sandboxModes":["workspace-write","read-only"],"jsonEventsProbe":{"ran":true,"version":"...","streamSchema":"codex-json-v1"}}]}
+  setup:    {"schema":1,"backends":[{"backend":"codex","binaryPath":"...","version":"...","configMode":{"write":"user","readOnly":"hermetic"},"sandboxModes":["workspace-write","read-only"],"jsonEventsProbe":{"ran":true,"version":"...","streamSchema":"codex-appserver-v1"}}]}
   status:   {"jobs":[{"jobId":"...","sessionId":"...","state":"completed","cleanupDisposition":"verified_absent"}]}
   result:   {"jobId":"...","sessionId":"...","state":"completed","cleanupDisposition":"verified_absent","result":{"text":"...","resultPath":"...","sha256":"...","bytes":1}}
   cancel:   {"jobId":"...","state":"canceled"}

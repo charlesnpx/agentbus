@@ -1,20 +1,16 @@
 package cliadapter
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/adapter/internal/duplex"
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
@@ -30,8 +26,10 @@ type Backend struct {
 	AllowedEfforts   map[string]struct{}
 	BuildArgs        func(resumeID string, opts engine.SessionOpts, input engine.TurnInput) ([]string, error)
 	Parse            func(map[string]any) ([]engine.Event, string, error)
+	Driver           duplex.Driver
 	VersionTransform func(string) string
 	Discover         func(context.Context, command.ProbeRunner, string) (*engine.ModelDiscovery, error)
+	SetupQualify     func(context.Context, command.Runner, engine.SessionOpts) (engine.ModelDiscovery, error)
 	probed           *ProbedBackendDescriptor
 }
 
@@ -137,11 +135,29 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	session := &Session{backend: b, opts: engine.SessionOpts{
+	probeOpts := engine.SessionOpts{
 		CWD:     cwd,
 		Write:   false,
 		Timeout: 2 * time.Minute,
-	}, suppressValidationWarning: true}
+	}
+	if b.SetupQualify != nil {
+		discovery, err := b.SetupQualify(probeCtx, command.DirectCommandRunner{}, probeOpts)
+		if err != nil {
+			return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s setup qualification failed: %w", b.NameValue, err)
+		}
+		probe := b.setupProbe(probed)
+		probe.DiscoveredModels = append([]string(nil), discovery.Models...)
+		probe.DiscoveredEfforts = append([]string(nil), discovery.Efforts...)
+		probe.DiscoverySource = discovery.Source
+		probe.DiscoveryFetchedAt = discovery.FetchedAt
+		probe.DiscoveryClientVersion = probed.Version
+		probe.DiscoveryWarnings = append([]string(nil), discovery.Warnings...)
+		return probe, nil
+	}
+	session, err := b.newSession("", probeOpts, "", true)
+	if err != nil {
+		return engine.BackendSetupProbe{}, err
+	}
 	events, err := session.Turn(probeCtx, engine.TurnInput{
 		Prompt:  "Reply with exactly: OK\n",
 		Write:   false,
@@ -168,7 +184,18 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 	if !sawEvent {
 		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s setup stream probe produced no JSON events", b.NameValue)
 	}
-	probe := engine.BackendSetupProbe{
+	probe := b.setupProbe(probed)
+	probe.DiscoveredModels = probed.DiscoveredModels
+	probe.DiscoveredEfforts = probed.DiscoveredEfforts
+	probe.DiscoverySource = probed.DiscoverySource
+	probe.DiscoveryFetchedAt = probed.DiscoveryFetchedAt
+	probe.DiscoveryClientVersion = probed.DiscoveryClientVersion
+	probe.DiscoveryWarnings = discoveryWarnings(probed.DiscoveryWarning)
+	return probe, nil
+}
+
+func (b *Backend) setupProbe(probed ProbedBackendDescriptor) engine.BackendSetupProbe {
+	return engine.BackendSetupProbe{
 		Backend:      b.NameValue,
 		BinaryPath:   probed.BinaryPath,
 		Version:      probed.Version,
@@ -180,13 +207,6 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 		SandboxModes:     []string{"workspace-write", "read-only"},
 		JSONEventsProbed: true,
 	}
-	probe.DiscoveredModels = probed.DiscoveredModels
-	probe.DiscoveredEfforts = probed.DiscoveredEfforts
-	probe.DiscoverySource = probed.DiscoverySource
-	probe.DiscoveryFetchedAt = probed.DiscoveryFetchedAt
-	probe.DiscoveryClientVersion = probed.DiscoveryClientVersion
-	probe.DiscoveryWarnings = discoveryWarnings(probed.DiscoveryWarning)
-	return probe, nil
 }
 
 func (b *Backend) Start(ctx context.Context, opts engine.SessionOpts) (engine.Session, error) {
@@ -197,7 +217,7 @@ func (b *Backend) Start(ctx context.Context, opts engine.SessionOpts) (engine.Se
 	if err != nil {
 		return nil, err
 	}
-	return &Session{backend: b, opts: opts, validationWarning: warning}, nil
+	return b.newSession("", opts, warning, false)
 }
 
 func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts) (engine.Session, error) {
@@ -211,7 +231,34 @@ func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts
 	if err != nil {
 		return nil, err
 	}
-	return &Session{backend: b, id: id, opts: opts, validationWarning: warning}, nil
+	return b.newSession(id, opts, warning, false)
+}
+
+func (b *Backend) newSession(id string, opts engine.SessionOpts, validationWarning string, suppressValidationWarning bool) (*Session, error) {
+	session := &Session{
+		backend:                   b,
+		opts:                      opts,
+		validationWarning:         validationWarning,
+		suppressValidationWarning: suppressValidationWarning,
+	}
+	driver := b.Driver
+	if driver == nil {
+		var err error
+		driver, err = newOneShotDriver(b)
+		if err != nil {
+			return nil, err
+		}
+	}
+	duplexSession, err := duplex.NewSession(duplex.SessionConfig{
+		Driver:   driver,
+		Options:  opts,
+		ResumeID: id,
+	})
+	if err != nil {
+		return nil, err
+	}
+	session.duplexSession = duplexSession
+	return session, nil
 }
 
 func (b *Backend) binary() string {
@@ -246,9 +293,43 @@ func (b *Backend) ProbeBackend(ctx context.Context, runner command.ProbeRunner) 
 	if err != nil {
 		return nil, err
 	}
+	probe, err := b.cachedProbe()
+	if err != nil {
+		return nil, err
+	}
+	if probe.Version != probed.Version || probe.BinaryPath != probed.BinaryPath {
+		return nil, errors.New(DriftError)
+	}
+	if probe.StreamSchema == "" || probe.StreamSchema != b.StreamSchema {
+		return nil, fmt.Errorf("backend_unavailable: setup cache for %s lacks stream schema %q", b.NameValue, b.StreamSchema)
+	}
+	b.hydrateEmptyProbeDiscovery(&probed)
 	clone := *b
 	clone.probed = &probed
 	return &clone, nil
+}
+
+func (b *Backend) hydrateEmptyProbeDiscovery(probed *ProbedBackendDescriptor) {
+	if probed.DiscoverySource != "" && (len(probed.DiscoveredModels) > 0 || len(probed.DiscoveredEfforts) > 0) {
+		return
+	}
+	probe, err := b.cachedProbe()
+	if err != nil {
+		return
+	}
+	if probe.Version != probed.Version || probe.BinaryPath != probed.BinaryPath || probe.StreamSchema != probed.StreamSchema {
+		return
+	}
+	probed.DiscoveredModels = append([]string(nil), probe.DiscoveredModels...)
+	probed.DiscoveredEfforts = append([]string(nil), probe.DiscoveredEfforts...)
+	probed.DiscoverySource = probe.DiscoverySource
+	probed.DiscoveryFetchedAt = probe.DiscoveryFetchedAt
+	probed.DiscoveryClientVersion = probe.DiscoveryClientVersion
+	// Preserve any live-discovery warning (e.g. a transient discovery failure that
+	// triggered the cache fallback) and append the cached discovery warnings.
+	for _, w := range probe.DiscoveryWarnings {
+		probed.DiscoveryWarning = appendWarning(probed.DiscoveryWarning, w)
+	}
 }
 
 func (b *Backend) normalizeVersion(s string) string {
@@ -430,19 +511,14 @@ func (b *Backend) cachedProbe() (engine.BackendSetupProbe, error) {
 
 type Session struct {
 	backend                   *Backend
-	id                        string
 	opts                      engine.SessionOpts
 	validationWarning         string
 	suppressValidationWarning bool
-	mu                        sync.Mutex
-	active                    command.RunningCommand
-	lastAgentMessage          string
+	duplexSession             *duplex.Session
 }
 
 func (s *Session) ID() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.id
+	return s.duplexSession.ID()
 }
 
 func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
@@ -463,217 +539,34 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	if s.suppressValidationWarning {
 		warningText = ""
 	}
-	s.mu.Lock()
-	if s.active != nil {
-		s.mu.Unlock()
-		return nil, errors.New("session_busy")
-	}
-	s.lastAgentMessage = ""
-	timeout := input.Timeout
-	if timeout == 0 {
-		timeout = s.opts.Timeout
-	}
-	if timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer func() {
-			if ctx.Err() != nil {
-				cancel()
-			}
-		}()
-	}
-	resumeID := s.id
-	args, err := s.backend.BuildArgs(resumeID, s.opts, input)
-	if err != nil {
-		s.mu.Unlock()
-		return nil, err
-	}
-	spec := command.ExecSpec{Argv: append([]string{s.backend.binary()}, args...)}
-	if s.opts.CWD != "" {
-		spec.Dir = s.opts.CWD
-	}
-	var stderr bytes.Buffer
-	var stderrLog *engine.CappedLogWriter
-	stderrWriter := io.Writer(&stderr)
-	if input.LogPaths.Stderr != "" {
-		stderrLog, err = engine.NewCappedLogWriter(input.LogPaths.Stderr, 0)
-		if err != nil {
-			s.mu.Unlock()
-			return nil, err
-		}
-		stderrWriter = io.MultiWriter(&stderr, stderrLog)
-	}
-	var stdoutLog *engine.CappedLogWriter
-	if input.LogPaths.Stdout != "" {
-		stdoutLog, err = engine.NewCappedLogWriter(input.LogPaths.Stdout, 0)
-		if err != nil {
-			if stderrLog != nil {
-				_ = stderrLog.Close()
-			}
-			s.mu.Unlock()
-			return nil, err
-		}
-	}
-	running, err := runner.Start(ctx, spec)
-	if err != nil {
-		if stdoutLog != nil {
-			_ = stdoutLog.Close()
-		}
-		if stderrLog != nil {
-			_ = stderrLog.Close()
-		}
-		s.mu.Unlock()
-		return nil, err
-	}
-	if input.OnProcessStart != nil {
-		if reporter, ok := running.(interface {
-			ProcessRef() (engine.ProcessRef, int)
-		}); ok {
-			ref, backendChildPID := reporter.ProcessRef()
-			input.OnProcessStart(ref, backendChildPID)
-		}
-	}
-	stdin := running.Stdin()
-	stdout := running.Stdout()
-	stderrPipe := running.Stderr()
-	s.active = running
-	s.mu.Unlock()
-
-	events := make(chan engine.Event, 16)
-	go func() {
-		defer close(events)
-		if warningText != "" {
-			events <- warning(warningText)
-		}
-		defer func() {
-			if stdoutLog != nil {
-				_ = stdoutLog.Close()
-			}
-			if stderrLog != nil {
-				_ = stderrLog.Close()
-			}
-		}()
-		stderrDone := make(chan error, 1)
-		go func() {
-			stderrDone <- copyAndClose(stderrWriter, stderrPipe)
-		}()
-		go func() {
-			_, _ = io.WriteString(stdin, input.Prompt)
-			_ = stdin.Close()
-		}()
-		var stdoutReader io.Reader = stdout
-		if stdoutLog != nil {
-			stdoutReader = io.TeeReader(stdout, stdoutLog)
-		}
-		waitDone := make(chan command.FinalObservation, 1)
-		go func() {
-			waitDone <- finalObservation(ctx, running)
-		}()
-		parseErr := s.scan(stdoutReader, events)
-		observation := <-waitDone
-		stderrCopyErr := <-stderrDone
-		s.mu.Lock()
-		if s.active == running {
-			s.active = nil
-		}
-		s.mu.Unlock()
-		if ctx.Err() == context.DeadlineExceeded {
-			events <- warning("backend turn timed out")
-			return
-		}
-		if parseErr != nil {
-			events <- terminalError(parseErr.Error())
-		}
-		if observation.CleanupErr != nil {
-			events <- warning(observation.CleanupErr.Error())
-		}
-		if observation.ExecutionErr != nil {
-			msg := strings.TrimSpace(stderr.String())
-			if msg == "" && stderrCopyErr != nil {
-				msg = stderrCopyErr.Error()
-			}
-			if msg == "" {
-				msg = observation.ExecutionErr.Error()
-			}
-			events <- terminalError(msg)
-			return
-		}
-		if stderrCopyErr != nil {
-			events <- terminalError(stderrCopyErr.Error())
-		}
-	}()
-	return events, nil
+	return s.turnWithDuplexRunner(ctx, input, runner, warningText)
 }
 
-func finalObservation(ctx context.Context, running command.RunningCommand) command.FinalObservation {
-	exit, waitErr := running.Wait(ctx)
-	if observer, ok := running.(command.FinalObserver); ok {
-		observation, err := observer.FinalObservation(context.WithoutCancel(ctx))
-		if observation.Exit == (command.ExitObservation{}) {
-			observation.Exit = exit
-		}
-		if observation.ExecutionErr == nil && observation.CleanupErr == nil {
-			observation.ExecutionErr = errors.Join(waitErr, err)
-		}
-		return observation
+func (s *Session) turnWithDuplexRunner(ctx context.Context, input engine.TurnInput, runner command.Runner, warningText string) (<-chan engine.Event, error) {
+	events, err := s.duplexSession.TurnWithRunner(ctx, input, runner)
+	if err != nil {
+		return nil, err
 	}
-	return command.FinalObservation{Exit: exit, ExecutionErr: waitErr}
+	if warningText == "" {
+		return events, nil
+	}
+	out := make(chan engine.Event, 16)
+	go func() {
+		defer close(out)
+		out <- warning(warningText)
+		for ev := range events {
+			out <- ev
+		}
+	}()
+	return out, nil
 }
 
 func (s *Session) Interrupt(ctx context.Context) error {
-	s.mu.Lock()
-	command := s.active
-	s.mu.Unlock()
-	if command == nil {
-		return nil
-	}
-	return command.Interrupt(ctx)
+	return s.duplexSession.Interrupt(ctx)
 }
 
-func (s *Session) scan(r io.Reader, out chan<- engine.Event) error {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		var obj map[string]any
-		if err := json.Unmarshal(line, &obj); err != nil {
-			return fmt.Errorf("malformed backend stream: %w", err)
-		}
-		events, id, err := s.backend.Parse(obj)
-		if err != nil {
-			return err
-		}
-		if id != "" {
-			s.mu.Lock()
-			if s.id == "" {
-				s.id = id
-			}
-			s.mu.Unlock()
-		}
-		for _, ev := range events {
-			if ev.Type == engine.EventAgentText && ev.Text != "" {
-				s.mu.Lock()
-				s.lastAgentMessage = ev.Text
-				s.mu.Unlock()
-			}
-			if ev.Type == engine.EventResultMessage && ev.Text == "" {
-				s.mu.Lock()
-				ev.Text = s.lastAgentMessage
-				s.mu.Unlock()
-			}
-			out <- capEvent(ev)
-		}
-	}
-	return scanner.Err()
-}
-
-func copyAndClose(dst io.Writer, src io.ReadCloser) error {
-	defer func() { _ = src.Close() }()
-	_, err := io.Copy(dst, src)
-	return err
+func (s *Session) NativeInterrupt(ctx context.Context) (bool, error) {
+	return s.duplexSession.NativeInterrupt(ctx)
 }
 
 func capEvent(ev engine.Event) engine.Event {
@@ -687,10 +580,6 @@ func capEvent(ev engine.Event) engine.Event {
 
 func warning(text string) engine.Event {
 	return engine.Event{Type: engine.EventWarning, Text: text}
-}
-
-func terminalError(text string) engine.Event {
-	return engine.Event{Type: engine.EventTerminalError, Text: text}
 }
 
 func compareVersion(a, b string) int {

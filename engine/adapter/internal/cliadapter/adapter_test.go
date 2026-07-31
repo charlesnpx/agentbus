@@ -9,12 +9,16 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/adapter/internal/duplex"
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
@@ -251,18 +255,6 @@ func TestSessionTurnTimeoutKillsDescendantHoldingStdout(t *testing.T) {
 	}
 }
 
-func TestCopyAndCloseClosesSourceOnWriterFailure(t *testing.T) {
-	wantErr := errors.New("writer failed")
-	src := &recordingReadCloser{Reader: strings.NewReader("stderr")}
-	err := copyAndClose(errorWriter{err: wantErr}, src)
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("copyAndClose error = %v, want %v", err, wantErr)
-	}
-	if !src.closed {
-		t.Fatal("copyAndClose did not close the source after writer failure")
-	}
-}
-
 func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 	runner := &fakeCommandRunner{}
 	marker := filepath.Join(t.TempDir(), "direct-exec-marker")
@@ -300,6 +292,446 @@ func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 		t.Fatalf("dir = %q, want %q", runner.spec.Dir, cwd)
 	}
 	assertFileMissing(t, marker)
+}
+
+func TestOneShotBackendRunsThroughDuplexRuntime(t *testing.T) {
+	stdin := &recordingWriteCloser{}
+	runner := &fakeCommandRunner{
+		stdin:  stdin,
+		stdout: io.NopCloser(strings.NewReader(`{"event":"agent","text":"from stdout"}` + "\n" + `{"event":"result"}` + "\n")),
+	}
+	backend := &Backend{
+		NameValue: "fake",
+		Binary:    "fake-bin",
+		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
+			return []string{"run", "--json"}, nil
+		},
+		Parse: func(obj map[string]any) ([]engine.Event, string, error) {
+			switch obj["event"] {
+			case "agent":
+				text, _ := obj["text"].(string)
+				return []engine.Event{{Type: engine.EventAgentText, Text: text}}, "stream-session", nil
+			case "result":
+				return []engine.Event{{Type: engine.EventResultMessage}}, "", nil
+			default:
+				return nil, "", nil
+			}
+		},
+		probed: &ProbedBackendDescriptor{StaticBackendDescriptor: StaticBackendDescriptor{
+			NameValue:        "fake",
+			DiscoveredModels: []string{"known-model"},
+			DiscoverySource:  "test",
+		}},
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{Model: "new-model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello prompt"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if len(got) != 3 {
+		t.Fatalf("events = %#v, want warning, agent text, and result", got)
+	}
+	if got[0].Type != engine.EventWarning || !strings.Contains(got[0].Text, `model "new-model"`) {
+		t.Fatalf("first event = %#v, want validation warning", got[0])
+	}
+	if got[1].Type != engine.EventAgentText || got[1].Text != "from stdout" {
+		t.Fatalf("second event = %#v, want parsed agent text", got[1])
+	}
+	if got[2].Type != engine.EventResultMessage || got[2].Text != "from stdout" {
+		t.Fatalf("third event = %#v, want backfilled result message", got[2])
+	}
+	if session.ID() != "stream-session" {
+		t.Fatalf("session id = %q, want stream-session", session.ID())
+	}
+	written, closed := stdin.snapshot()
+	if written != "hello prompt" || !closed {
+		t.Fatalf("stdin = %q closed=%v, want prompt write and close", written, closed)
+	}
+	if strings.Join(runner.spec.Argv, "\x00") != strings.Join([]string{"fake-bin", "run", "--json"}, "\x00") {
+		t.Fatalf("argv = %#v", runner.spec.Argv)
+	}
+}
+
+func TestBackendWithDriverPreservesAdmissionProbeAndRunsDuplexTurn(t *testing.T) {
+	const (
+		binaryPath = "/tmp/fake-bin"
+		schema     = "duplex-json-v1"
+	)
+	driver := newCliDuplexTestDriver("resume-1")
+	runner := &duplexCommandRunner{finishOnStart: true}
+	cachePath := filepath.Join(t.TempDir(), "setup-probes.json")
+	writeCliAdapterSetupCache(t, cachePath, engine.BackendSetupProbe{
+		Backend:      "fake",
+		BinaryPath:   binaryPath,
+		Version:      "1.0.0",
+		StreamSchema: schema,
+	})
+	backend := &Backend{
+		NameValue:      "fake",
+		Binary:         "fake-bin",
+		MinimumVersion: "0.1.0",
+		CachePath:      cachePath,
+		StreamSchema:   schema,
+		Driver:         driver,
+	}
+	if !backend.AdmissionParkable() {
+		t.Fatal("driver-backed backend is not admission-parkable")
+	}
+	if !backend.AdmissionControlledRunner() {
+		t.Fatal("driver-backed backend is not admission-controlled")
+	}
+	probed, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probedBackend, ok := probed.(*Backend)
+	if !ok || probedBackend.Driver == nil {
+		t.Fatalf("probed backend = %T, want *Backend with driver", probed)
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{CWD: "/tmp/work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := session.(interface {
+		TurnWithRunner(context.Context, engine.TurnInput, command.Runner) (<-chan engine.Event, error)
+	}); !ok {
+		t.Fatal("session does not implement TurnWithRunner")
+	}
+
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[0].Text != "duplex:hello" || got[1].Type != engine.EventResultMessage {
+		t.Fatalf("events = %#v, want duplex agent text and result", got)
+	}
+	if session.ID() != "resume-1" {
+		t.Fatalf("session id = %q, want resume-1", session.ID())
+	}
+	spec := runner.lastSpec()
+	if strings.Join(spec.Argv, "\x00") != strings.Join([]string{"duplex-fake", "hello"}, "\x00") {
+		t.Fatalf("argv = %#v", spec.Argv)
+	}
+	if spec.Dir != "/tmp/work" {
+		t.Fatalf("dir = %q, want /tmp/work", spec.Dir)
+	}
+}
+
+func TestProbeBackendHydratesEmptyDiscoveryFromMatchingSetupCache(t *testing.T) {
+	const (
+		backendName = "fake"
+		binaryPath  = "/tmp/fake-bin"
+		version     = "1.0.0"
+		schema      = "duplex-json-v1"
+	)
+	cachePath := filepath.Join(t.TempDir(), "setup-probes.json")
+	writeCliAdapterSetupCache(t, cachePath, engine.BackendSetupProbe{
+		Backend:                backendName,
+		BinaryPath:             binaryPath,
+		Version:                version,
+		StreamSchema:           schema,
+		DiscoveredModels:       []string{"cached-model", "cached-model-2"},
+		DiscoveredEfforts:      []string{"medium", "high"},
+		DiscoverySource:        "setup model/list",
+		DiscoveryFetchedAt:     "2026-07-30T12:00:00Z",
+		DiscoveryClientVersion: version,
+		DiscoveryWarnings:      []string{"cached warning"},
+	})
+	backend := &Backend{
+		NameValue:      backendName,
+		Binary:         "fake-bin",
+		MinimumVersion: "0.1.0",
+		CachePath:      cachePath,
+		StreamSchema:   schema,
+		Driver:         newCliDuplexTestDriver(),
+	}
+
+	probed, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probedBackend, ok := probed.(*Backend)
+	if !ok {
+		t.Fatalf("probed backend = %T, want *Backend", probed)
+	}
+	meta := probedBackend.BackendMetadata(context.Background())
+	if !slices.Equal(meta.Models, []string{"cached-model", "cached-model-2"}) {
+		t.Fatalf("metadata models = %#v, want cached models", meta.Models)
+	}
+	if !slices.Equal(meta.Efforts, []string{"medium", "high"}) {
+		t.Fatalf("metadata efforts = %#v, want cached efforts", meta.Efforts)
+	}
+	if probedBackend.probed.DiscoverySource != "setup model/list" ||
+		probedBackend.probed.DiscoveryFetchedAt != "2026-07-30T12:00:00Z" ||
+		probedBackend.probed.DiscoveryClientVersion != version ||
+		probedBackend.probed.DiscoveryWarning != "cached warning" {
+		t.Fatalf("probed discovery = %#v, want setup cache discovery fields", probedBackend.probed)
+	}
+	warning, err := probedBackend.validateOptions(engine.SessionOpts{Model: "not-in-cache"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(warning, `model "not-in-cache" is not in the discovered fake catalog`) {
+		t.Fatalf("validation warning = %q, want discovered catalog warning", warning)
+	}
+}
+
+func TestProbeBackendRequiresSetupCache(t *testing.T) {
+	const (
+		backendName = "fake"
+		binaryPath  = "/tmp/fake-bin"
+		schema      = "duplex-json-v1"
+	)
+	backend := &Backend{
+		NameValue:      backendName,
+		Binary:         "fake-bin",
+		MinimumVersion: "0.1.0",
+		CachePath:      filepath.Join(t.TempDir(), "missing-setup-probes.json"),
+		StreamSchema:   schema,
+		Driver:         newCliDuplexTestDriver(),
+	}
+
+	if _, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"}); err == nil {
+		t.Fatal("ProbeBackend error = nil, want missing setup cache error")
+	}
+}
+
+func TestProbeBackendRejectsMismatchedSetupCache(t *testing.T) {
+	const (
+		backendName = "fake"
+		binaryPath  = "/tmp/fake-bin"
+		version     = "1.0.0"
+		schema      = "duplex-json-v1"
+	)
+	tests := []struct {
+		name        string
+		probe       engine.BackendSetupProbe
+		wantMessage string
+	}{
+		{
+			name: "version drift",
+			probe: engine.BackendSetupProbe{
+				Backend:      backendName,
+				BinaryPath:   binaryPath,
+				Version:      "0.9.0",
+				StreamSchema: schema,
+			},
+			wantMessage: DriftError,
+		},
+		{
+			name: "binary drift",
+			probe: engine.BackendSetupProbe{
+				Backend:      backendName,
+				BinaryPath:   "/tmp/other-fake-bin",
+				Version:      version,
+				StreamSchema: schema,
+			},
+			wantMessage: DriftError,
+		},
+		{
+			name: "schema mismatch",
+			probe: engine.BackendSetupProbe{
+				Backend:      backendName,
+				BinaryPath:   binaryPath,
+				Version:      version,
+				StreamSchema: "legacy-schema",
+			},
+			wantMessage: `backend_unavailable: setup cache for fake lacks stream schema "duplex-json-v1"`,
+		},
+		{
+			name: "missing backend",
+			probe: engine.BackendSetupProbe{
+				Backend:      "other",
+				BinaryPath:   binaryPath,
+				Version:      version,
+				StreamSchema: schema,
+			},
+			wantMessage: "backend_unavailable: setup cache missing backend fake; re-run agentbus setup",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			cachePath := filepath.Join(t.TempDir(), "setup-probes.json")
+			writeCliAdapterSetupCache(t, cachePath, tt.probe)
+			backend := &Backend{
+				NameValue:      backendName,
+				Binary:         "fake-bin",
+				MinimumVersion: "0.1.0",
+				CachePath:      cachePath,
+				StreamSchema:   schema,
+				Driver:         newCliDuplexTestDriver(),
+			}
+
+			_, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"})
+			if err == nil {
+				t.Fatal("ProbeBackend error = nil, want setup cache mismatch error")
+			}
+			if err.Error() != tt.wantMessage {
+				t.Fatalf("ProbeBackend error = %q, want %q", err.Error(), tt.wantMessage)
+			}
+		})
+	}
+}
+
+func TestBackendWithDriverThreadsResumeIDAcrossTurns(t *testing.T) {
+	driver := newCliDuplexTestDriver("resume-1", "resume-2")
+	runner := &duplexCommandRunner{finishOnStart: true}
+	backend := &Backend{NameValue: "fake", Driver: driver}
+	session, err := backend.Resume(context.Background(), "resume-0", engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "first"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	events, err = session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "second"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+
+	got := driver.runResumeIDs()
+	want := []string{"resume-0", "resume-1"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("driver resume ids = %#v, want %#v", got, want)
+	}
+	if session.ID() != "resume-2" {
+		t.Fatalf("session id = %q, want resume-2", session.ID())
+	}
+}
+
+func TestBackendWithDriverPrependsValidationWarning(t *testing.T) {
+	driver := newCliDuplexTestDriver("resume-1")
+	runner := &duplexCommandRunner{finishOnStart: true}
+	backend := &Backend{
+		NameValue: "fake",
+		Driver:    driver,
+		probed: &ProbedBackendDescriptor{StaticBackendDescriptor: StaticBackendDescriptor{
+			NameValue:        "fake",
+			DiscoveredModels: []string{"known-model"},
+			DiscoverySource:  "test",
+		}},
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{Model: "new-model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if len(got) < 2 || got[0].Type != engine.EventWarning || !strings.Contains(got[0].Text, `model "new-model"`) {
+		t.Fatalf("events = %#v, want leading validation warning", got)
+	}
+	if got[1].Type != engine.EventAgentText || got[1].Text != "duplex:hello" {
+		t.Fatalf("second event = %#v, want duplex agent text", got[1])
+	}
+}
+
+func TestBackendWithDriverInterruptForwardsToActiveDuplexTurn(t *testing.T) {
+	driver := newCliDuplexTestDriver("resume-interrupted")
+	driver.waitForInterrupt = true
+	runner := &duplexCommandRunner{}
+	driver.finish = runner.finishLast
+	backend := &Backend{NameValue: "fake", Driver: driver}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := receiveEventWithTimeout(t, events, 2*time.Second)
+	if first.Type != engine.EventAgentText || first.Text != "duplex:hello" {
+		t.Fatalf("first event = %#v, want duplex start event", first)
+	}
+	if err := session.Interrupt(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if driver.nativeInterrupts.Load() != 1 {
+		t.Fatalf("native interrupt count = %d, want 1", driver.nativeInterrupts.Load())
+	}
+	if len(got) != 1 || got[0].Type != engine.EventResultMessage || session.ID() != "resume-interrupted" {
+		t.Fatalf("events = %#v id = %q, want interrupted result", got, session.ID())
+	}
+}
+
+func TestBackendWithDriverNativeInterruptReportsSettlement(t *testing.T) {
+	driver := newCliDuplexTestDriver("resume-native-settled")
+	driver.waitForInterrupt = true
+	runner := &duplexCommandRunner{}
+	driver.finish = runner.finishLast
+	backend := &Backend{NameValue: "fake", Driver: driver}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := receiveEventWithTimeout(t, events, 2*time.Second)
+	if first.Type != engine.EventAgentText || first.Text != "duplex:hello" {
+		t.Fatalf("first event = %#v, want duplex start event", first)
+	}
+	settled, err := session.(*Session).NativeInterrupt(context.Background())
+	if !settled || err != nil {
+		t.Fatalf("NativeInterrupt = (%t, %v), want (true, nil)", settled, err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if driver.nativeInterrupts.Load() != 1 {
+		t.Fatalf("native interrupt count = %d, want 1", driver.nativeInterrupts.Load())
+	}
+	if len(got) != 1 || got[0].Type != engine.EventResultMessage || session.ID() != "resume-native-settled" {
+		t.Fatalf("events = %#v id = %q, want native interrupted result", got, session.ID())
+	}
+}
+
+func TestBackendWithDriverRejectsConcurrentTurn(t *testing.T) {
+	block := make(chan struct{})
+	driver := newCliDuplexTestDriver("resume-1")
+	driver.blockCh = block
+	runner := &duplexCommandRunner{finishOnStart: true}
+	backend := &Backend{NameValue: "fake", Driver: driver}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "first"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := receiveEventWithTimeout(t, events, 2*time.Second)
+	if first.Type != engine.EventAgentText || first.Text != "duplex:first" {
+		t.Fatalf("first event = %#v, want duplex start event", first)
+	}
+	_, err = session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "second"}, runner)
+	if err == nil || err.Error() != "session_busy" {
+		t.Fatalf("concurrent turn error = %v, want session_busy", err)
+	}
+	close(block)
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if len(got) != 1 || got[0].Type != engine.EventResultMessage {
+		t.Fatalf("events = %#v, want first turn result", got)
+	}
 }
 
 func TestSessionTurnSurfacesOutputTruncationAsTerminalError(t *testing.T) {
@@ -427,26 +859,25 @@ func collectEventsWithTimeout(t *testing.T, ch <-chan engine.Event, timeout time
 	}
 }
 
-type errorWriter struct {
-	err error
-}
-
-func (w errorWriter) Write([]byte) (int, error) {
-	return 0, w.err
-}
-
-type recordingReadCloser struct {
-	io.Reader
-	closed bool
-}
-
-func (r *recordingReadCloser) Close() error {
-	r.closed = true
-	return nil
+func receiveEventWithTimeout(t *testing.T, ch <-chan engine.Event, timeout time.Duration) engine.Event {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case ev, ok := <-ch:
+		if !ok {
+			t.Fatal("event channel closed before event")
+		}
+		return ev
+	case <-timer.C:
+		t.Fatalf("timed out waiting for event after %s", timeout)
+	}
+	return engine.Event{}
 }
 
 type fakeCommandRunner struct {
 	spec   command.ExecSpec
+	stdin  io.WriteCloser
 	stdout io.ReadCloser
 }
 
@@ -456,11 +887,40 @@ func (r *fakeCommandRunner) Start(_ context.Context, spec command.ExecSpec) (com
 	if stdout == nil {
 		stdout = io.NopCloser(strings.NewReader(`{"event":"ok"}` + "\n"))
 	}
+	stdin := r.stdin
+	if stdin == nil {
+		stdin = discardWriteCloser{}
+	}
 	return &fakeRunningCommand{
-		stdin:  discardWriteCloser{},
+		stdin:  stdin,
 		stdout: stdout,
 		stderr: io.NopCloser(strings.NewReader("")),
 	}, nil
+}
+
+type recordingWriteCloser struct {
+	mu     sync.Mutex
+	buf    strings.Builder
+	closed bool
+}
+
+func (w *recordingWriteCloser) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *recordingWriteCloser) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+	return nil
+}
+
+func (w *recordingWriteCloser) snapshot() (string, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String(), w.closed
 }
 
 type fakeRunningCommand struct {
@@ -514,4 +974,193 @@ func (r *errorAfterReader) Read(p []byte) (int, error) {
 
 func (r *errorAfterReader) Close() error {
 	return nil
+}
+
+type cliDuplexTestDriver struct {
+	mu               sync.Mutex
+	nextIDs          []string
+	resumeIDs        []string
+	blockCh          <-chan struct{}
+	waitForInterrupt bool
+	interruptCh      chan struct{}
+	interruptOnce    sync.Once
+	nativeInterrupts atomic.Int32
+	finish           func()
+}
+
+func newCliDuplexTestDriver(nextIDs ...string) *cliDuplexTestDriver {
+	return &cliDuplexTestDriver{
+		nextIDs:     append([]string(nil), nextIDs...),
+		interruptCh: make(chan struct{}),
+	}
+}
+
+func (d *cliDuplexTestDriver) ExecSpec(_ string, opts engine.SessionOpts, input engine.TurnInput) (command.ExecSpec, error) {
+	return command.ExecSpec{
+		Argv: []string{"duplex-fake", input.Prompt},
+		Dir:  opts.CWD,
+	}, nil
+}
+
+func (d *cliDuplexTestDriver) RunTurn(ctx context.Context, _ *duplex.Conn, resumeID string, _ engine.SessionOpts, input engine.TurnInput, emit duplex.EmitFunc) (string, error) {
+	d.mu.Lock()
+	d.resumeIDs = append(d.resumeIDs, resumeID)
+	d.mu.Unlock()
+	emit(engine.Event{Type: engine.EventAgentText, Text: "duplex:" + input.Prompt})
+	if d.waitForInterrupt {
+		select {
+		case <-d.interruptCh:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	if d.blockCh != nil {
+		select {
+		case <-d.blockCh:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	nextID := d.takeNextID(resumeID)
+	emit(engine.Event{Type: engine.EventResultMessage, Text: "done"})
+	return nextID, nil
+}
+
+func (d *cliDuplexTestDriver) Interrupt(context.Context, *duplex.Conn) error {
+	d.nativeInterrupts.Add(1)
+	d.interruptOnce.Do(func() {
+		close(d.interruptCh)
+		if d.finish != nil {
+			d.finish()
+		}
+	})
+	return nil
+}
+
+func (d *cliDuplexTestDriver) takeNextID(fallback string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.nextIDs) == 0 {
+		return fallback
+	}
+	nextID := d.nextIDs[0]
+	d.nextIDs = d.nextIDs[1:]
+	return nextID
+}
+
+func (d *cliDuplexTestDriver) runResumeIDs() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.resumeIDs...)
+}
+
+func writeCliAdapterSetupCache(t *testing.T, path string, probe engine.BackendSetupProbe) {
+	t.Helper()
+	if err := engine.WriteSetupProbeCache(path, engine.SetupProbeCache{Backends: []engine.BackendSetupProbe{probe}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type duplexCommandRunner struct {
+	mu            sync.Mutex
+	specs         []command.ExecSpec
+	last          *duplexRunningCommand
+	finishOnStart bool
+}
+
+func (r *duplexCommandRunner) Start(_ context.Context, spec command.ExecSpec) (command.RunningCommand, error) {
+	cmd := newDuplexRunningCommand()
+	r.mu.Lock()
+	r.specs = append(r.specs, spec)
+	r.last = cmd
+	r.mu.Unlock()
+	if r.finishOnStart {
+		cmd.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	}
+	return cmd, nil
+}
+
+func (r *duplexCommandRunner) lastSpec() command.ExecSpec {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.specs) == 0 {
+		return command.ExecSpec{}
+	}
+	return r.specs[len(r.specs)-1]
+}
+
+func (r *duplexCommandRunner) finishLast() {
+	r.mu.Lock()
+	cmd := r.last
+	r.mu.Unlock()
+	if cmd != nil {
+		cmd.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	}
+}
+
+type duplexRunningCommand struct {
+	done   chan struct{}
+	once   sync.Once
+	exit   command.ExitObservation
+	err    error
+	cancel atomic.Int32
+}
+
+func newDuplexRunningCommand() *duplexRunningCommand {
+	return &duplexRunningCommand{done: make(chan struct{})}
+}
+
+func (c *duplexRunningCommand) Stdin() io.WriteCloser {
+	return discardWriteCloser{}
+}
+
+func (c *duplexRunningCommand) Stdout() io.ReadCloser {
+	return io.NopCloser(strings.NewReader(""))
+}
+
+func (c *duplexRunningCommand) Stderr() io.ReadCloser {
+	return io.NopCloser(strings.NewReader(""))
+}
+
+func (c *duplexRunningCommand) Wait(ctx context.Context) (command.ExitObservation, error) {
+	select {
+	case <-c.done:
+		return c.exit, c.err
+	case <-ctx.Done():
+		return command.ExitObservation{}, ctx.Err()
+	}
+}
+
+func (c *duplexRunningCommand) Interrupt(context.Context) error {
+	c.cancel.Add(1)
+	c.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	return nil
+}
+
+func (c *duplexRunningCommand) finish(exit command.ExitObservation, err error) {
+	c.once.Do(func() {
+		c.exit = exit
+		c.err = err
+		close(c.done)
+	})
+}
+
+type fakeProbeRunner struct {
+	path    string
+	version string
+}
+
+func (r fakeProbeRunner) LookPath(binary string) (string, error) {
+	if r.path != "" {
+		return r.path, nil
+	}
+	return binary, nil
+}
+
+func (r fakeProbeRunner) Run(context.Context, command.ProbeSpec) (command.ProbeResult, error) {
+	version := r.version
+	if version == "" {
+		version = "fake 1.0.0\n"
+	}
+	return command.ProbeResult{Stdout: []byte(version)}, nil
 }

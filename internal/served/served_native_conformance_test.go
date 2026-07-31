@@ -128,11 +128,13 @@ func TestServedNativeConformanceDaemonProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cachePath := filepath.Join(filepath.Dir(codexPath), "setup-probes.json")
+	writeServedNativeCodexSetupCache(t, cachePath, codexPath)
 	cfg, err := StrictAdmissionConfig(Config{
 		StateRoot:   *root,
 		CWD:         *cwd,
 		Token:       "test-token",
-		Backends:    []engine.Backend{codexcli.New(codexcli.Options{Binary: codexPath})},
+		Backends:    []engine.Backend{codexcli.New(codexcli.Options{Binary: codexPath, CachePath: cachePath})},
 		IdleTimeout: -1,
 	}, servedNativeStrictOptions(*agentbus, os.Environ()))
 	if err != nil {
@@ -704,6 +706,7 @@ func servedNativeStrictOptions(agentbusPath string, env []string) StrictAdmissio
 type servedNativeCodexFixture struct {
 	binDir    string
 	codexPath string
+	cachePath string
 	execLog   string
 	readyDir  string
 	env       []string
@@ -735,6 +738,8 @@ func installServedNativeCodexFixture(t *testing.T, root string) servedNativeCode
 	if err := os.WriteFile(codexPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	cachePath := filepath.Join(binDir, "setup-probes.json")
+	writeServedNativeCodexSetupCache(t, cachePath, codexPath)
 	execLog := filepath.Join(root, "codex-executions.jsonl")
 	env := append(os.Environ(),
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
@@ -749,11 +754,33 @@ func installServedNativeCodexFixture(t *testing.T, root string) servedNativeCode
 	t.Setenv(servedNativeCodexFixtureEnv, "1")
 	t.Setenv(servedNativeCodexExecLogEnv, execLog)
 	t.Setenv(servedNativeCodexReadyDirEnv, readyDir)
-	return servedNativeCodexFixture{binDir: binDir, codexPath: codexPath, execLog: execLog, readyDir: readyDir, env: env}
+	return servedNativeCodexFixture{binDir: binDir, codexPath: codexPath, cachePath: cachePath, execLog: execLog, readyDir: readyDir, env: env}
+}
+
+func writeServedNativeCodexSetupCache(t *testing.T, cachePath, codexPath string) {
+	t.Helper()
+	if err := engine.WriteSetupProbeCache(cachePath, engine.SetupProbeCache{
+		Version: engine.SetupProbeCacheVersion,
+		Backends: []engine.BackendSetupProbe{{
+			Backend:                servedNativeBackendName,
+			BinaryPath:             codexPath,
+			Version:                codexcli.MinimumKnownGoodVersion,
+			StreamSchema:           codexcli.StreamSchema,
+			ConfigMode:             engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
+			SandboxModes:           []string{"workspace-write", "read-only"},
+			JSONEventsProbed:       true,
+			DiscoveredModels:       []string{"gpt-5-codex"},
+			DiscoveredEfforts:      []string{"high"},
+			DiscoverySource:        "served-native-fixture",
+			DiscoveryClientVersion: codexcli.MinimumKnownGoodVersion,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func servedNativeCodexBackend(fixture servedNativeCodexFixture) engine.Backend {
-	return codexcli.New(codexcli.Options{Binary: fixture.codexPath})
+	return codexcli.New(codexcli.Options{Binary: fixture.codexPath, CachePath: fixture.cachePath})
 }
 
 func shellQuote(s string) string {
@@ -1044,6 +1071,18 @@ type servedNativeCodexExecution struct {
 	GrandchildPGID int               `json:"grandchildPgid,omitempty"`
 }
 
+type servedNativeCodexFixtureEntry struct {
+	envTags       map[string]string
+	entryRecorded bool
+	entryPGID     int
+}
+
+type servedNativeAppServerFrame struct {
+	ID     json.RawMessage `json:"id,omitempty"`
+	Method string          `json:"method,omitempty"`
+	Params json.RawMessage `json:"params,omitempty"`
+}
+
 func runServedNativeCodexFixture(args []string) int {
 	if len(args) > 0 {
 		switch args[0] {
@@ -1053,6 +1092,8 @@ func runServedNativeCodexFixture(args []string) int {
 		case "--help", "help":
 			fmt.Println("codex fixture")
 			return 0
+		case "app-server":
+			return runServedNativeCodexAppServerFixture(args)
 		}
 	}
 	envTags := servedNativeEnvTags()
@@ -1177,6 +1218,374 @@ func runServedNativeCodexFixture(args []string) int {
 	default:
 		return 2
 	}
+}
+
+func runServedNativeCodexAppServerFixture(args []string) int {
+	entry, code := startServedNativeCodexAppServerEntry(args)
+	if code != 0 {
+		return code
+	}
+	dec := json.NewDecoder(os.Stdin)
+	enc := json.NewEncoder(os.Stdout)
+	threadID := "served-native-session"
+	for {
+		var frame servedNativeAppServerFrame
+		if err := dec.Decode(&frame); err != nil {
+			if errors.Is(err, io.EOF) {
+				return 0
+			}
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		params := servedNativeAppServerParams(frame.Params)
+		switch frame.Method {
+		case "":
+			continue
+		case "initialize":
+			if !servedNativeAppServerHasID(frame.ID) {
+				continue
+			}
+			if err := servedNativeAppServerRespond(enc, frame.ID, servedNativeAppServerInitializeResult()); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+		case "initialized":
+			continue
+		case "thread/start", "thread/resume":
+			if id := servedNativeStringFromMap(params, "threadId", "thread_id", "id"); id != "" {
+				threadID = id
+			}
+			if !servedNativeAppServerHasID(frame.ID) {
+				continue
+			}
+			if err := servedNativeAppServerRespond(enc, frame.ID, servedNativeAppServerThreadResult(threadID)); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+		case "turn/start":
+			if id := servedNativeStringFromMap(params, "threadId", "thread_id"); id != "" {
+				threadID = id
+			}
+			turnID := fmt.Sprintf("served-native-turn-%d", os.Getpid())
+			if servedNativeAppServerHasID(frame.ID) {
+				if err := servedNativeAppServerRespond(enc, frame.ID, servedNativeAppServerTurnResult(turnID)); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					return 4
+				}
+			}
+			prompt := servedNativeAppServerPrompt(params)
+			return runServedNativeCodexAppServerTurn(args, entry, prompt, func() error {
+				return writeServedNativeCodexAppServerResult(enc, threadID, turnID)
+			})
+		case "model/list":
+			if !servedNativeAppServerHasID(frame.ID) {
+				continue
+			}
+			if err := servedNativeAppServerRespond(enc, frame.ID, servedNativeAppServerModelListResult()); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+		default:
+			if servedNativeAppServerHasID(frame.ID) {
+				_ = servedNativeAppServerRespondError(enc, frame.ID, -32601, "unsupported fixture method: "+frame.Method)
+			}
+		}
+	}
+}
+
+func startServedNativeCodexAppServerEntry(args []string) (servedNativeCodexFixtureEntry, int) {
+	envTags := servedNativeEnvTags()
+	entry := servedNativeCodexFixtureEntry{envTags: envTags}
+	if path := envTags[servedNativeStartedPathTag]; path != "" {
+		pgid, err := unix.Getpgid(0)
+		if err != nil {
+			return entry, 3
+		}
+		entry.entryPGID = pgid
+		execution := servedNativeCodexExecution{
+			PID:  os.Getpid(),
+			PGID: pgid,
+			Mode: servedNativeExecModeEntry,
+			Args: append([]string(nil), args...),
+			Tags: envTags,
+		}
+		if err := appendServedNativeCodexExecution(execution); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return entry, 4
+		}
+		if err := writeServedNativeStartedMarker(path, servedNativeEntryStartedMarker); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return entry, 4
+		}
+		entry.entryRecorded = true
+	}
+	return entry, 0
+}
+
+func runServedNativeCodexAppServerTurn(args []string, entry servedNativeCodexFixtureEntry, prompt string, complete func() error) int {
+	mode := servedNativeFixtureModeClean
+	switch {
+	case strings.Contains(prompt, servedNativeFixtureModeGrandchild):
+		mode = servedNativeFixtureModeGrandchild
+	case strings.Contains(prompt, servedNativeFixtureModeHold):
+		mode = servedNativeFixtureModeHold
+	}
+	pgid := entry.entryPGID
+	if pgid == 0 {
+		var err error
+		pgid, err = unix.Getpgid(0)
+		if err != nil {
+			return 3
+		}
+	}
+	tags := mergeServedNativeTags(entry.envTags, parseServedNativePromptTags(prompt))
+	execution := servedNativeCodexExecution{
+		PID:    os.Getpid(),
+		PGID:   pgid,
+		Mode:   mode,
+		Prompt: prompt,
+		Args:   append([]string(nil), args...),
+		Tags:   tags,
+	}
+	if !entry.entryRecorded && tags[servedNativeStartedPathTag] != "" {
+		execution.Mode = servedNativeExecModeStdin
+	}
+	switch mode {
+	case servedNativeFixtureModeClean:
+		if !entry.entryRecorded {
+			if err := appendServedNativeCodexExecution(execution); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+		}
+		if complete != nil {
+			if err := complete(); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+		}
+		return 0
+	case servedNativeFixtureModeHold:
+		signal.Ignore(syscall.SIGTERM)
+		if !entry.entryRecorded {
+			if err := appendServedNativeCodexExecution(execution); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+		}
+		if path := execution.Tags[servedNativeStartedPathTag]; path != "" && !entry.entryRecorded {
+			_ = writeServedNativeStartedMarker(path, servedNativeStdinStartedMarker)
+		}
+		for {
+			time.Sleep(time.Hour)
+		}
+	case servedNativeFixtureModeGrandchild:
+		readyPath := filepath.Join(os.Getenv(servedNativeCodexReadyDirEnv), fmt.Sprintf("grandchild-%d-ready", os.Getpid()))
+		exe, err := os.Executable()
+		if err != nil {
+			return 5
+		}
+		cmd := exec.Command(exe,
+			"-test.run=^TestServedNativeConformanceGrandchildProcess$",
+			"--",
+			"--ready", readyPath,
+		)
+		cmd.Env = append(os.Environ(), servedNativeGrandchildEnv+"=1")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			return 6
+		}
+		if err := waitServedNativeFile(readyPath, 5*time.Second); err != nil {
+			_ = cmd.Process.Kill()
+			return 7
+		}
+		childPGID, err := readServedNativeGrandchildPGID(readyPath)
+		if err != nil {
+			_ = cmd.Process.Kill()
+			return 8
+		}
+		execution.GrandchildPID = cmd.Process.Pid
+		execution.GrandchildPGID = childPGID
+		if !entry.entryRecorded {
+			if err := appendServedNativeCodexExecution(execution); err != nil {
+				_ = cmd.Process.Kill()
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+		}
+		if complete != nil {
+			if err := complete(); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 4
+			}
+		}
+		return 0
+	default:
+		return 2
+	}
+}
+
+func servedNativeAppServerHasID(id json.RawMessage) bool {
+	return len(bytes.TrimSpace(id)) != 0
+}
+
+func servedNativeAppServerParams(raw json.RawMessage) map[string]any {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return map[string]any{}
+	}
+	var params map[string]any
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return map[string]any{}
+	}
+	return params
+}
+
+func servedNativeAppServerRespond(enc *json.Encoder, id json.RawMessage, result any) error {
+	return enc.Encode(map[string]any{"id": id, "result": result})
+}
+
+func servedNativeAppServerRespondError(enc *json.Encoder, id json.RawMessage, code int, message string) error {
+	return enc.Encode(map[string]any{
+		"id": id,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	})
+}
+
+func servedNativeAppServerInitializeResult() map[string]any {
+	return map[string]any{
+		"codexHome":      os.TempDir(),
+		"platformFamily": "unix",
+		"platformOs":     goruntime.GOOS,
+		"userAgent":      "codex-cli/" + codexcli.MinimumKnownGoodVersion,
+	}
+}
+
+func servedNativeAppServerThreadResult(threadID string) map[string]any {
+	return map[string]any{
+		"threadId": threadID,
+		"thread": map[string]any{
+			"id":        threadID,
+			"sessionId": threadID,
+			"status":    "running",
+			"source":    "app-server",
+			"turns":     []any{},
+		},
+	}
+}
+
+func servedNativeAppServerTurnResult(turnID string) map[string]any {
+	return map[string]any{
+		"turnId": turnID,
+		"turn": map[string]any{
+			"id":     turnID,
+			"items":  []any{},
+			"status": "inProgress",
+		},
+	}
+}
+
+func servedNativeAppServerModelListResult() map[string]any {
+	return map[string]any{
+		"data": []any{
+			map[string]any{
+				"model": "gpt-5.5",
+				"supportedReasoningEfforts": []any{
+					"none",
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"xhigh",
+				},
+			},
+		},
+	}
+}
+
+func servedNativeAppServerPrompt(params map[string]any) string {
+	if text := servedNativeStringFromMap(params, "prompt", "text"); text != "" {
+		return text
+	}
+	if text := servedNativeStringValue(params["input"]); text != "" {
+		return text
+	}
+	return ""
+}
+
+func servedNativeStringFromMap(obj map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if text := servedNativeStringValue(obj[key]); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func servedNativeStringValue(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			if text := servedNativeStringValue(item); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "")
+	case map[string]any:
+		return servedNativeStringFromMap(v, "text", "content", "message", "prompt")
+	default:
+		return ""
+	}
+}
+
+func writeServedNativeCodexAppServerResult(enc *json.Encoder, threadID, turnID string) error {
+	itemID := "served-native-result"
+	item := map[string]any{
+		"id":   itemID,
+		"type": "agentMessage",
+		"text": servedNativeResultText,
+	}
+	itemParams := map[string]any{
+		"threadId": threadID,
+		"turnId":   turnID,
+		"item":     item,
+	}
+	if err := enc.Encode(map[string]any{"method": "item/started", "params": itemParams}); err != nil {
+		return err
+	}
+	if err := enc.Encode(map[string]any{
+		"method": "item/agentMessage/delta",
+		"params": map[string]any{
+			"threadId": threadID,
+			"turnId":   turnID,
+			"itemId":   itemID,
+			"delta":    servedNativeResultText,
+		},
+	}); err != nil {
+		return err
+	}
+	if err := enc.Encode(map[string]any{"method": "item/completed", "params": itemParams}); err != nil {
+		return err
+	}
+	return enc.Encode(map[string]any{
+		"method": "turn/completed",
+		"params": map[string]any{
+			"threadId": threadID,
+			"turnId":   turnID,
+			"status":   "completed",
+			"turn": map[string]any{
+				"id":     turnID,
+				"items":  []any{item},
+				"status": "completed",
+			},
+		},
+	})
 }
 
 func servedNativeEnvTags() map[string]string {
