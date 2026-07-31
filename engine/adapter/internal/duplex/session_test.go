@@ -409,9 +409,16 @@ func TestNativeInterruptDoesNotCallProcessInterrupt(t *testing.T) {
 		}
 		waitForSignal(t, promptSeen, "prompt frame")
 
-		nativeDone := make(chan error, 1)
+		nativeDone := make(chan struct {
+			settled bool
+			err     error
+		}, 1)
 		go func() {
-			nativeDone <- session.NativeInterrupt(context.Background())
+			settled, err := session.NativeInterrupt(context.Background())
+			nativeDone <- struct {
+				settled bool
+				err     error
+			}{settled: settled, err: err}
 		}()
 		frame := waitForInterruptFrame(t, interruptSeen)
 		if frame["type"] != "interrupt" {
@@ -421,8 +428,8 @@ func TestNativeInterruptDoesNotCallProcessInterrupt(t *testing.T) {
 			t.Fatalf("process interrupt count = %d, want 0", got)
 		}
 		select {
-		case err := <-nativeDone:
-			t.Fatalf("NativeInterrupt returned before retirement: %v", err)
+		case result := <-nativeDone:
+			t.Fatalf("NativeInterrupt returned before retirement: settled=%t err=%v", result.settled, result.err)
 		default:
 		}
 
@@ -430,9 +437,9 @@ func TestNativeInterruptDoesNotCallProcessInterrupt(t *testing.T) {
 		_ = proc.stderrW.Close()
 		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
 		select {
-		case err := <-nativeDone:
-			if err != nil {
-				t.Fatalf("NativeInterrupt error = %v, want nil", err)
+		case result := <-nativeDone:
+			if !result.settled || result.err != nil {
+				t.Fatalf("NativeInterrupt = (%t, %v), want (true, nil)", result.settled, result.err)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for NativeInterrupt to return after retirement")
@@ -444,7 +451,7 @@ func TestNativeInterruptDoesNotCallProcessInterrupt(t *testing.T) {
 		}
 	})
 
-	t.Run("returns on context cancellation", func(t *testing.T) {
+	t.Run("returns unsettled on context timeout", func(t *testing.T) {
 		proc := newFakeCommand()
 		runner := &fakeRunner{running: proc}
 		session := newFixtureSession(t, runner, 0, "")
@@ -456,10 +463,18 @@ func TestNativeInterruptDoesNotCallProcessInterrupt(t *testing.T) {
 		}
 		waitForSignal(t, promptSeen, "prompt frame")
 
-		ctx, cancel := context.WithCancel(context.Background())
-		nativeDone := make(chan error, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		nativeDone := make(chan struct {
+			settled bool
+			err     error
+		}, 1)
 		go func() {
-			nativeDone <- session.NativeInterrupt(ctx)
+			settled, err := session.NativeInterrupt(ctx)
+			nativeDone <- struct {
+				settled bool
+				err     error
+			}{settled: settled, err: err}
 		}()
 		frame := waitForInterruptFrame(t, interruptSeen)
 		if frame["type"] != "interrupt" {
@@ -468,14 +483,13 @@ func TestNativeInterruptDoesNotCallProcessInterrupt(t *testing.T) {
 		if got := proc.interrupts.Load(); got != 0 {
 			t.Fatalf("process interrupt count = %d, want 0", got)
 		}
-		cancel()
 		select {
-		case err := <-nativeDone:
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("NativeInterrupt error = %v, want context.Canceled", err)
+		case result := <-nativeDone:
+			if result.settled || !errors.Is(result.err, context.DeadlineExceeded) {
+				t.Fatalf("NativeInterrupt = (%t, %v), want (false, context deadline exceeded)", result.settled, result.err)
 			}
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for NativeInterrupt to return after context cancellation")
+			t.Fatal("timed out waiting for NativeInterrupt to return after context timeout")
 		}
 
 		_ = proc.stdoutW.Close()

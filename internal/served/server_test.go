@@ -387,6 +387,31 @@ func (s *controlledSession) Interrupt(context.Context) error {
 	return nil
 }
 
+type nativeSettledSession struct {
+	id          string
+	settled     bool
+	err         error
+	nativeCalls atomic.Int64
+}
+
+func (s *nativeSettledSession) ID() string { return s.id }
+
+func (s *nativeSettledSession) Turn(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+	events := make(chan engine.Event)
+	close(events)
+	return events, nil
+}
+
+func (s *nativeSettledSession) Interrupt(context.Context) error { return nil }
+
+func (s *nativeSettledSession) NativeInterrupt(ctx context.Context) (bool, error) {
+	s.nativeCalls.Add(1)
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return s.settled, s.err
+}
+
 func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -5968,6 +5993,57 @@ func TestAdmissionActiveCancelCommitsUnresolvedCleanupInsteadOfRPCError(t *testi
 	}
 }
 
+func TestAdmissionActiveCancelNativeRetirementSkipsRawExecutionError(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	accepted := acceptIdentifiedAuthorityWork(t, server, "native-retirement-cancel")
+	jobID := accepted.Record.JobID.String()
+	executionErr := errors.New("provider process exited with code 37")
+	session := &nativeSettledSession{id: "native-settled-session", settled: true}
+	running := &recordingRunningCommand{interruptErr: executionErr}
+	active := &activeJob{
+		jobID:             jobID,
+		sessionID:         session.ID(),
+		session:           session,
+		admissionCommand:  running,
+		containmentIntent: &launch.ContainmentIntent{},
+	}
+	server.addActiveJob(active)
+	server.markAdmissionJob(jobID, server.admissionInstance)
+	t.Cleanup(func() {
+		server.removeActiveJob(jobID)
+	})
+
+	outcome := server.handleJobCancel(mustMarshal(t, protocol.JobCancelParams{JobID: jobID}))
+	if outcome.err != nil {
+		t.Fatalf("job.cancel error = %+v, want canceled despite raw execution error %q", outcome.err, executionErr)
+	}
+	canceled, ok := outcome.result.(protocol.JobCancelResult)
+	if !ok {
+		t.Fatalf("job.cancel result type = %T", outcome.result)
+	}
+	if canceled.JobID != jobID || canceled.State != engine.StateCanceled {
+		t.Fatalf("job.cancel result = %+v, want canceled job %s", canceled, jobID)
+	}
+	if got := session.nativeCalls.Load(); got != 1 {
+		t.Fatalf("native interrupt calls = %d, want 1", got)
+	}
+	if got := running.interrupts.Load(); got != 0 {
+		t.Fatalf("raw admission interrupts = %d, want 0 after native settlement", got)
+	}
+	record := waitAdmissionSafetyTerminal(t, server, jobID)
+	if record.Cancel == nil {
+		t.Fatalf("cancel fact missing after native-settled cancel: %+v", record)
+	}
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled {
+		t.Fatalf("terminal = %+v, want canceled", record.Terminal)
+	}
+	if err := server.safetyFailStopErr(); err != nil {
+		t.Fatalf("authority root fail-stopped after native-settled cancel: %v", err)
+	}
+}
+
 func TestAdmissionUnresolvedTerminalAbandonsActiveCustodyAndDrains(t *testing.T) {
 	t.Parallel()
 	unresolved := &custodian.CleanupUnresolvedError{
@@ -8239,6 +8315,7 @@ func (r recordingCommandRunner) Start(context.Context, command.ExecSpec) (comman
 type recordingRunningCommand struct {
 	interrupts           atomic.Int64
 	interruptHadDeadline atomic.Bool
+	interruptErr         error
 }
 
 func (c *recordingRunningCommand) Stdin() io.WriteCloser { return nil }
@@ -8251,7 +8328,7 @@ func (c *recordingRunningCommand) Interrupt(ctx context.Context) error {
 	c.interrupts.Add(1)
 	_, hasDeadline := ctx.Deadline()
 	c.interruptHadDeadline.Store(hasDeadline)
-	return nil
+	return c.interruptErr
 }
 
 func newControlledBackgroundRun(t *testing.T) (*Server, jobRun, *controlledSession, context.Context, context.CancelFunc) {

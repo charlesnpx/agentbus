@@ -602,6 +602,38 @@ func TestBackendWithDriverInterruptForwardsToActiveDuplexTurn(t *testing.T) {
 	}
 }
 
+func TestBackendWithDriverNativeInterruptReportsSettlement(t *testing.T) {
+	driver := newCliDuplexTestDriver("resume-native-settled")
+	driver.waitForInterrupt = true
+	runner := &duplexCommandRunner{}
+	driver.finish = runner.finishLast
+	backend := &Backend{NameValue: "fake", Driver: driver}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := receiveEventWithTimeout(t, events, 2*time.Second)
+	if first.Type != engine.EventAgentText || first.Text != "duplex:hello" {
+		t.Fatalf("first event = %#v, want duplex start event", first)
+	}
+	settled, err := session.(*Session).NativeInterrupt(context.Background())
+	if !settled || err != nil {
+		t.Fatalf("NativeInterrupt = (%t, %v), want (true, nil)", settled, err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if driver.nativeInterrupts.Load() != 1 {
+		t.Fatalf("native interrupt count = %d, want 1", driver.nativeInterrupts.Load())
+	}
+	if len(got) != 1 || got[0].Type != engine.EventResultMessage || session.ID() != "resume-native-settled" {
+		t.Fatalf("events = %#v id = %q, want native interrupted result", got, session.ID())
+	}
+}
+
 func TestBackendWithDriverRejectsConcurrentTurn(t *testing.T) {
 	block := make(chan struct{})
 	driver := newCliDuplexTestDriver("resume-1")

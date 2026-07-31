@@ -298,7 +298,7 @@ type activeJob struct {
 }
 
 type nativeInterruptSession interface {
-	NativeInterrupt(context.Context) error
+	NativeInterrupt(context.Context) (bool, error)
 }
 
 func (j *activeJob) requestTerminal(state engine.JobState) {
@@ -347,31 +347,34 @@ func (j *activeJob) interruptAdmissionCommand(ctx context.Context) error {
 	return cmd.Interrupt(ctx)
 }
 
-func (j *activeJob) interruptSessionNativeFirst() {
+func (j *activeJob) interruptSessionNativeFirst() bool {
 	if j == nil || j.session == nil {
-		return
+		return false
 	}
 	session, ok := j.session.(nativeInterruptSession)
 	if !ok {
-		return
+		return false
 	}
 	jobID := j.jobID
 	// NativeInterrupt is provider-only and never performs OS containment. Keep
 	// this detached and locally bounded so a launch mutex or blocked native write
 	// cannot stall the caller before the foreground interruptAdmissionCommand
-	// performs the sole ctx-bounded containment.
-	done := make(chan struct{})
+	// performs the ctx-bounded containment when settlement is not confirmed.
+	done := make(chan bool, 1)
 	go func() {
-		defer close(done)
-		if err := session.NativeInterrupt(context.Background()); err != nil {
+		settled, err := session.NativeInterrupt(context.Background())
+		if err != nil {
 			log.Printf("agentbus daemon: job %s native session interrupt warning: %v", jobID, err)
 		}
+		done <- settled
 	}()
 	timer := time.NewTimer(admissionNativeInterruptGrace)
 	defer timer.Stop()
 	select {
-	case <-done:
+	case settled := <-done:
+		return settled
 	case <-timer.C:
+		return false
 	}
 }
 
@@ -1046,10 +1049,12 @@ func (s *Server) requestActiveJobShutdownCancel(ctx context.Context, jobID strin
 		return nil
 	}
 	active.requestTerminal(engine.StateCanceled)
-	active.interruptSessionNativeFirst()
-	if err := active.interruptAdmissionCommand(ctx); err != nil {
-		if !admissionPhysicalCleanupUncertain(err) {
-			return err
+	settled := active.interruptSessionNativeFirst()
+	if !settled {
+		if err := active.interruptAdmissionCommand(ctx); err != nil {
+			if !admissionPhysicalCleanupUncertain(err) {
+				return err
+			}
 		}
 	}
 	if active.cancel != nil {
@@ -2206,16 +2211,18 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	active := s.lookupActiveJob(jobID)
 	if active != nil {
 		active.requestTerminal(engine.StateCanceled)
-		active.interruptSessionNativeFirst()
+		settled := active.interruptSessionNativeFirst()
 		// Admission cancel is intentional containment. Mark the active launch
 		// before coordinator containment so a killed process is the cancel
 		// terminal path, not an unprovable safety event.
-		interruptCtx, interruptCancel := context.WithTimeout(context.Background(), admissionDetachedCleanupTimeout)
-		err := active.interruptAdmissionCommand(interruptCtx)
-		interruptCancel()
-		if err != nil {
-			if !admissionPhysicalCleanupUncertain(err) {
-				return requestOutcome{err: admissionProtocolError(err)}
+		if !settled {
+			interruptCtx, interruptCancel := context.WithTimeout(context.Background(), admissionDetachedCleanupTimeout)
+			err := active.interruptAdmissionCommand(interruptCtx)
+			interruptCancel()
+			if err != nil {
+				if !admissionPhysicalCleanupUncertain(err) {
+					return requestOutcome{err: admissionProtocolError(err)}
+				}
 			}
 		}
 	}
