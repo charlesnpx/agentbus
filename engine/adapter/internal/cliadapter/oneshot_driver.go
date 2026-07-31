@@ -51,8 +51,12 @@ func (d oneShotDriver) RunTurn(ctx context.Context, conn *duplex.Conn, _ string,
 
 	var id string
 	frames := conn.Frames()
-	decodeErrs := conn.DecodeErrors()
-	for frames != nil || decodeErrs != nil {
+	// Drain frames (the reader delivers every parsed frame before it surfaces a
+	// decode error and closes the channel), then read the pending decode error.
+	// Do NOT select on DecodeErrors() concurrently with frames: when a valid frame
+	// and a decode error are both ready, a concurrent select can take the error
+	// first and drop the buffered parsed event.
+	for {
 		select {
 		case frame, ok := <-frames:
 			if !ok {
@@ -71,19 +75,10 @@ func (d oneShotDriver) RunTurn(ctx context.Context, conn *duplex.Conn, _ string,
 			for _, event := range events {
 				emit(event)
 			}
-		case err, ok := <-decodeErrs:
-			if !ok {
-				decodeErrs = nil
-				continue
-			}
-			if ok && err != nil {
-				return id, malformedBackendStreamError(err)
-			}
 		case <-ctx.Done():
 			return id, ctx.Err()
 		}
 	}
-	return id, nil
 }
 
 func (d oneShotDriver) Interrupt(context.Context, *duplex.Conn) error {
