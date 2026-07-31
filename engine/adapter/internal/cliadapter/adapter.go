@@ -1,17 +1,12 @@
 package cliadapter
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
@@ -242,16 +237,20 @@ func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts
 func (b *Backend) newSession(id string, opts engine.SessionOpts, validationWarning string, suppressValidationWarning bool) (*Session, error) {
 	session := &Session{
 		backend:                   b,
-		id:                        id,
 		opts:                      opts,
 		validationWarning:         validationWarning,
 		suppressValidationWarning: suppressValidationWarning,
 	}
-	if b.Driver == nil {
-		return session, nil
+	driver := b.Driver
+	if driver == nil {
+		var err error
+		driver, err = newOneShotDriver(b)
+		if err != nil {
+			return nil, err
+		}
 	}
 	duplexSession, err := duplex.NewSession(duplex.SessionConfig{
-		Driver:   b.Driver,
+		Driver:   driver,
 		Options:  opts,
 		ResumeID: id,
 	})
@@ -478,23 +477,14 @@ func (b *Backend) cachedProbe() (engine.BackendSetupProbe, error) {
 
 type Session struct {
 	backend                   *Backend
-	id                        string
 	opts                      engine.SessionOpts
 	validationWarning         string
 	suppressValidationWarning bool
 	duplexSession             *duplex.Session
-	mu                        sync.Mutex
-	active                    command.RunningCommand
-	lastAgentMessage          string
 }
 
 func (s *Session) ID() string {
-	if s.duplexSession != nil {
-		return s.duplexSession.ID()
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.id
+	return s.duplexSession.ID()
 }
 
 func (s *Session) Turn(ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
@@ -515,149 +505,7 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	if s.suppressValidationWarning {
 		warningText = ""
 	}
-	if s.duplexSession != nil {
-		return s.turnWithDuplexRunner(ctx, input, runner, warningText)
-	}
-	s.mu.Lock()
-	if s.active != nil {
-		s.mu.Unlock()
-		return nil, errors.New("session_busy")
-	}
-	s.lastAgentMessage = ""
-	timeout := input.Timeout
-	if timeout == 0 {
-		timeout = s.opts.Timeout
-	}
-	if timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer func() {
-			if ctx.Err() != nil {
-				cancel()
-			}
-		}()
-	}
-	resumeID := s.id
-	args, err := s.backend.BuildArgs(resumeID, s.opts, input)
-	if err != nil {
-		s.mu.Unlock()
-		return nil, err
-	}
-	spec := command.ExecSpec{Argv: append([]string{s.backend.binary()}, args...)}
-	if s.opts.CWD != "" {
-		spec.Dir = s.opts.CWD
-	}
-	var stderr bytes.Buffer
-	var stderrLog *engine.CappedLogWriter
-	stderrWriter := io.Writer(&stderr)
-	if input.LogPaths.Stderr != "" {
-		stderrLog, err = engine.NewCappedLogWriter(input.LogPaths.Stderr, 0)
-		if err != nil {
-			s.mu.Unlock()
-			return nil, err
-		}
-		stderrWriter = io.MultiWriter(&stderr, stderrLog)
-	}
-	var stdoutLog *engine.CappedLogWriter
-	if input.LogPaths.Stdout != "" {
-		stdoutLog, err = engine.NewCappedLogWriter(input.LogPaths.Stdout, 0)
-		if err != nil {
-			if stderrLog != nil {
-				_ = stderrLog.Close()
-			}
-			s.mu.Unlock()
-			return nil, err
-		}
-	}
-	running, err := runner.Start(ctx, spec)
-	if err != nil {
-		if stdoutLog != nil {
-			_ = stdoutLog.Close()
-		}
-		if stderrLog != nil {
-			_ = stderrLog.Close()
-		}
-		s.mu.Unlock()
-		return nil, err
-	}
-	if input.OnProcessStart != nil {
-		if reporter, ok := running.(interface {
-			ProcessRef() (engine.ProcessRef, int)
-		}); ok {
-			ref, backendChildPID := reporter.ProcessRef()
-			input.OnProcessStart(ref, backendChildPID)
-		}
-	}
-	stdin := running.Stdin()
-	stdout := running.Stdout()
-	stderrPipe := running.Stderr()
-	s.active = running
-	s.mu.Unlock()
-
-	events := make(chan engine.Event, 16)
-	go func() {
-		defer close(events)
-		if warningText != "" {
-			events <- warning(warningText)
-		}
-		defer func() {
-			if stdoutLog != nil {
-				_ = stdoutLog.Close()
-			}
-			if stderrLog != nil {
-				_ = stderrLog.Close()
-			}
-		}()
-		stderrDone := make(chan error, 1)
-		go func() {
-			stderrDone <- copyAndClose(stderrWriter, stderrPipe)
-		}()
-		go func() {
-			_, _ = io.WriteString(stdin, input.Prompt)
-			_ = stdin.Close()
-		}()
-		var stdoutReader io.Reader = stdout
-		if stdoutLog != nil {
-			stdoutReader = io.TeeReader(stdout, stdoutLog)
-		}
-		waitDone := make(chan command.FinalObservation, 1)
-		go func() {
-			waitDone <- finalObservation(ctx, running)
-		}()
-		parseErr := s.scan(stdoutReader, events)
-		observation := <-waitDone
-		stderrCopyErr := <-stderrDone
-		s.mu.Lock()
-		if s.active == running {
-			s.active = nil
-		}
-		s.mu.Unlock()
-		if ctx.Err() == context.DeadlineExceeded {
-			events <- warning("backend turn timed out")
-			return
-		}
-		if parseErr != nil {
-			events <- terminalError(parseErr.Error())
-		}
-		if observation.CleanupErr != nil {
-			events <- warning(observation.CleanupErr.Error())
-		}
-		if observation.ExecutionErr != nil {
-			msg := strings.TrimSpace(stderr.String())
-			if msg == "" && stderrCopyErr != nil {
-				msg = stderrCopyErr.Error()
-			}
-			if msg == "" {
-				msg = observation.ExecutionErr.Error()
-			}
-			events <- terminalError(msg)
-			return
-		}
-		if stderrCopyErr != nil {
-			events <- terminalError(stderrCopyErr.Error())
-		}
-	}()
-	return events, nil
+	return s.turnWithDuplexRunner(ctx, input, runner, warningText)
 }
 
 func (s *Session) turnWithDuplexRunner(ctx context.Context, input engine.TurnInput, runner command.Runner, warningText string) (<-chan engine.Event, error) {
@@ -679,85 +527,12 @@ func (s *Session) turnWithDuplexRunner(ctx context.Context, input engine.TurnInp
 	return out, nil
 }
 
-func finalObservation(ctx context.Context, running command.RunningCommand) command.FinalObservation {
-	exit, waitErr := running.Wait(ctx)
-	if observer, ok := running.(command.FinalObserver); ok {
-		observation, err := observer.FinalObservation(context.WithoutCancel(ctx))
-		if observation.Exit == (command.ExitObservation{}) {
-			observation.Exit = exit
-		}
-		if observation.ExecutionErr == nil && observation.CleanupErr == nil {
-			observation.ExecutionErr = errors.Join(waitErr, err)
-		}
-		return observation
-	}
-	return command.FinalObservation{Exit: exit, ExecutionErr: waitErr}
-}
-
 func (s *Session) Interrupt(ctx context.Context) error {
-	if s.duplexSession != nil {
-		return s.duplexSession.Interrupt(ctx)
-	}
-	s.mu.Lock()
-	command := s.active
-	s.mu.Unlock()
-	if command == nil {
-		return nil
-	}
-	return command.Interrupt(ctx)
+	return s.duplexSession.Interrupt(ctx)
 }
 
 func (s *Session) NativeInterrupt(ctx context.Context) error {
-	if s.duplexSession != nil {
-		return s.duplexSession.NativeInterrupt(ctx)
-	}
-	return nil
-}
-
-func (s *Session) scan(r io.Reader, out chan<- engine.Event) error {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		var obj map[string]any
-		if err := json.Unmarshal(line, &obj); err != nil {
-			return fmt.Errorf("malformed backend stream: %w", err)
-		}
-		events, id, err := s.backend.Parse(obj)
-		if err != nil {
-			return err
-		}
-		if id != "" {
-			s.mu.Lock()
-			if s.id == "" {
-				s.id = id
-			}
-			s.mu.Unlock()
-		}
-		for _, ev := range events {
-			if ev.Type == engine.EventAgentText && ev.Text != "" {
-				s.mu.Lock()
-				s.lastAgentMessage = ev.Text
-				s.mu.Unlock()
-			}
-			if ev.Type == engine.EventResultMessage && ev.Text == "" {
-				s.mu.Lock()
-				ev.Text = s.lastAgentMessage
-				s.mu.Unlock()
-			}
-			out <- capEvent(ev)
-		}
-	}
-	return scanner.Err()
-}
-
-func copyAndClose(dst io.Writer, src io.ReadCloser) error {
-	defer func() { _ = src.Close() }()
-	_, err := io.Copy(dst, src)
-	return err
+	return s.duplexSession.NativeInterrupt(ctx)
 }
 
 func capEvent(ev engine.Event) engine.Event {
@@ -771,10 +546,6 @@ func capEvent(ev engine.Event) engine.Event {
 
 func warning(text string) engine.Event {
 	return engine.Event{Type: engine.EventWarning, Text: text}
-}
-
-func terminalError(text string) engine.Event {
-	return engine.Event{Type: engine.EventTerminalError, Text: text}
 }
 
 func compareVersion(a, b string) int {

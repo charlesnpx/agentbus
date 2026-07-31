@@ -89,6 +89,14 @@ func (c *Conn) WriteJSON(v any) error {
 	return err
 }
 
+// WriteStdin writes raw bytes to process stdin. Calls are serialized with
+// WriteJSON and CloseStdin so mixed protocol writes cannot interleave.
+func (c *Conn) WriteStdin(p []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.stdin.Write(p)
+}
+
 // CloseStdin half-closes the process stdin. It is safe to call more than once.
 func (c *Conn) CloseStdin() error {
 	c.closeOnce.Do(func() {

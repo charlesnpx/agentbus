@@ -254,18 +254,6 @@ func TestSessionTurnTimeoutKillsDescendantHoldingStdout(t *testing.T) {
 	}
 }
 
-func TestCopyAndCloseClosesSourceOnWriterFailure(t *testing.T) {
-	wantErr := errors.New("writer failed")
-	src := &recordingReadCloser{Reader: strings.NewReader("stderr")}
-	err := copyAndClose(errorWriter{err: wantErr}, src)
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("copyAndClose error = %v, want %v", err, wantErr)
-	}
-	if !src.closed {
-		t.Fatal("copyAndClose did not close the source after writer failure")
-	}
-}
-
 func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 	runner := &fakeCommandRunner{}
 	marker := filepath.Join(t.TempDir(), "direct-exec-marker")
@@ -303,6 +291,69 @@ func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 		t.Fatalf("dir = %q, want %q", runner.spec.Dir, cwd)
 	}
 	assertFileMissing(t, marker)
+}
+
+func TestOneShotBackendRunsThroughDuplexRuntime(t *testing.T) {
+	stdin := &recordingWriteCloser{}
+	runner := &fakeCommandRunner{
+		stdin:  stdin,
+		stdout: io.NopCloser(strings.NewReader(`{"event":"agent","text":"from stdout"}` + "\n" + `{"event":"result"}` + "\n")),
+	}
+	backend := &Backend{
+		NameValue: "fake",
+		Binary:    "fake-bin",
+		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
+			return []string{"run", "--json"}, nil
+		},
+		Parse: func(obj map[string]any) ([]engine.Event, string, error) {
+			switch obj["event"] {
+			case "agent":
+				text, _ := obj["text"].(string)
+				return []engine.Event{{Type: engine.EventAgentText, Text: text}}, "stream-session", nil
+			case "result":
+				return []engine.Event{{Type: engine.EventResultMessage}}, "", nil
+			default:
+				return nil, "", nil
+			}
+		},
+		probed: &ProbedBackendDescriptor{StaticBackendDescriptor: StaticBackendDescriptor{
+			NameValue:        "fake",
+			DiscoveredModels: []string{"known-model"},
+			DiscoverySource:  "test",
+		}},
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{Model: "new-model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello prompt"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if len(got) != 3 {
+		t.Fatalf("events = %#v, want warning, agent text, and result", got)
+	}
+	if got[0].Type != engine.EventWarning || !strings.Contains(got[0].Text, `model "new-model"`) {
+		t.Fatalf("first event = %#v, want validation warning", got[0])
+	}
+	if got[1].Type != engine.EventAgentText || got[1].Text != "from stdout" {
+		t.Fatalf("second event = %#v, want parsed agent text", got[1])
+	}
+	if got[2].Type != engine.EventResultMessage || got[2].Text != "from stdout" {
+		t.Fatalf("third event = %#v, want backfilled result message", got[2])
+	}
+	if session.ID() != "stream-session" {
+		t.Fatalf("session id = %q, want stream-session", session.ID())
+	}
+	written, closed := stdin.snapshot()
+	if written != "hello prompt" || !closed {
+		t.Fatalf("stdin = %q closed=%v, want prompt write and close", written, closed)
+	}
+	if strings.Join(runner.spec.Argv, "\x00") != strings.Join([]string{"fake-bin", "run", "--json"}, "\x00") {
+		t.Fatalf("argv = %#v", runner.spec.Argv)
+	}
 }
 
 func TestBackendWithDriverPreservesAdmissionProbeAndRunsDuplexTurn(t *testing.T) {
@@ -620,26 +671,9 @@ func receiveEventWithTimeout(t *testing.T, ch <-chan engine.Event, timeout time.
 	return engine.Event{}
 }
 
-type errorWriter struct {
-	err error
-}
-
-func (w errorWriter) Write([]byte) (int, error) {
-	return 0, w.err
-}
-
-type recordingReadCloser struct {
-	io.Reader
-	closed bool
-}
-
-func (r *recordingReadCloser) Close() error {
-	r.closed = true
-	return nil
-}
-
 type fakeCommandRunner struct {
 	spec   command.ExecSpec
+	stdin  io.WriteCloser
 	stdout io.ReadCloser
 }
 
@@ -649,11 +683,40 @@ func (r *fakeCommandRunner) Start(_ context.Context, spec command.ExecSpec) (com
 	if stdout == nil {
 		stdout = io.NopCloser(strings.NewReader(`{"event":"ok"}` + "\n"))
 	}
+	stdin := r.stdin
+	if stdin == nil {
+		stdin = discardWriteCloser{}
+	}
 	return &fakeRunningCommand{
-		stdin:  discardWriteCloser{},
+		stdin:  stdin,
 		stdout: stdout,
 		stderr: io.NopCloser(strings.NewReader("")),
 	}, nil
+}
+
+type recordingWriteCloser struct {
+	mu     sync.Mutex
+	buf    strings.Builder
+	closed bool
+}
+
+func (w *recordingWriteCloser) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *recordingWriteCloser) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+	return nil
+}
+
+func (w *recordingWriteCloser) snapshot() (string, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String(), w.closed
 }
 
 type fakeRunningCommand struct {
