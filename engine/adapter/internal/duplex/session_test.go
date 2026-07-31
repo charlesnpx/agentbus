@@ -503,6 +503,68 @@ func TestNativeInterruptDoesNotCallProcessInterrupt(t *testing.T) {
 	})
 }
 
+// A native interrupt write that errors (e.g. a closed pipe from a process
+// exiting underneath it) must not be reported as unsettled when the process
+// then retires — retirement is the authoritative settlement signal.
+func TestNativeInterruptWriteErrorDoesNotMaskRetirement(t *testing.T) {
+	proc := newFakeCommand()
+	runner := &fakeRunner{running: proc}
+	driver := erroringInterruptDriver{
+		FixtureDriver: FixtureDriver{Spec: command.ExecSpec{Argv: []string{"fixture"}}},
+		interruptErr:  errors.New("write |1: file already closed"),
+	}
+	session := newSessionWithDriver(t, runner, driver, 0, "")
+	promptSeen, interruptSeen, scanDone := startInterruptFrameScanner(t, proc)
+
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSignal(t, promptSeen, "prompt frame")
+
+	nativeDone := make(chan struct {
+		settled bool
+		err     error
+	}, 1)
+	go func() {
+		settled, err := session.NativeInterrupt(context.Background())
+		nativeDone <- struct {
+			settled bool
+			err     error
+		}{settled: settled, err: err}
+	}()
+
+	// The interrupt frame is written (and errors) before retirement. Despite the
+	// native write error, NativeInterrupt must keep awaiting retirement rather
+	// than returning (false, err) early.
+	frame := waitForInterruptFrame(t, interruptSeen)
+	if frame["type"] != "interrupt" {
+		t.Fatalf("interrupt frame = %#v", frame)
+	}
+	select {
+	case result := <-nativeDone:
+		t.Fatalf("NativeInterrupt returned before retirement despite live process: settled=%t err=%v", result.settled, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	_ = proc.stdoutW.Close()
+	_ = proc.stderrW.Close()
+	proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	select {
+	case result := <-nativeDone:
+		if !result.settled || result.err != nil {
+			t.Fatalf("NativeInterrupt = (%t, %v), want (true, nil) after retirement", result.settled, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for NativeInterrupt to return after retirement")
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	waitForSignal(t, scanDone, "stdin scanner shutdown")
+	if got := proc.interrupts.Load(); got != 0 {
+		t.Fatalf("process interrupt count = %d, want 0 (native path only)", got)
+	}
+}
+
 func TestInterruptFallsBackWhenNativeInterruptBlocks(t *testing.T) {
 	proc := newFakeCommand()
 	var closeOnce sync.Once
@@ -812,6 +874,19 @@ func (d *delayedFrameConsumerDriver) RunTurn(ctx context.Context, conn *Conn, re
 			return "", ctx.Err()
 		}
 	}
+}
+
+// erroringInterruptDriver writes the native interrupt frame (so tests can
+// synchronize on it) and then reports a write error, simulating an interrupt
+// that loses the race with process exit and hits a closed pipe.
+type erroringInterruptDriver struct {
+	FixtureDriver
+	interruptErr error
+}
+
+func (d erroringInterruptDriver) Interrupt(ctx context.Context, conn *Conn) error {
+	_ = d.FixtureDriver.Interrupt(ctx, conn)
+	return d.interruptErr
 }
 
 type countingInterruptDriver struct {
