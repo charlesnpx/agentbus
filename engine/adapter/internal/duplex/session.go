@@ -457,7 +457,7 @@ func emitCompletionEvents(ctx context.Context, events chan<- engine.Event, drive
 	if observation.CleanupErr != nil {
 		events <- warning(observation.CleanupErr.Error())
 	}
-	if observation.ExecutionErr != nil || earlyExit {
+	if observation.ExecutionErr != nil || (earlyExit && driverErr == nil) {
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" && stderrCopyErr != nil {
 			msg = stderrCopyErr.Error()
