@@ -36,69 +36,72 @@ and policy retry decisions. Adapters own CLI argv construction, process launch,
 stream parsing, session-id extraction, and interruption of their active backend
 process.
 
+CLI-backed adapters run through the shared duplex runtime. A backend with a
+bidirectional provider protocol supplies a `duplex.Driver`; the older
+build-argv/parse-JSONL shape is wrapped as a trivial one-shot driver.
+
 ## Supported argv profiles
 
 The following profiles are the only supported v1 CLI shapes. Adapters MUST NOT
 invent additional permission modes under protocol v1.
 
-| Backend | Profile | Argv shape |
+| Backend | Profile | Argv/process shape |
 | --- | --- | --- |
-| codex | write | `codex exec --json [--skip-git-repo-check when CWD is non-git] --sandbox workspace-write -` |
-| codex | read-only | `codex exec --json [--skip-git-repo-check when CWD is non-git] --sandbox read-only --ignore-user-config -` |
-| codex | corrective-resume | `codex exec --json [--skip-git-repo-check when CWD is non-git] --sandbox read-only --ignore-user-config resume <session-id> -` |
-| claude | write | `claude --print --output-format stream-json --verbose --dangerously-skip-permissions` plus `--resume <session-id>` when resuming |
-| claude | read-only | `claude --print --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <claude-read-only-allow-list> --disallowedTools <claude-read-only-deny-list>` |
+| codex | write | spawn `codex app-server`; start or resume an app-server thread and send a writable turn request |
+| codex | read-only | spawn `codex app-server`; start or resume an app-server thread and send a read-only turn request |
+| codex | corrective-resume | spawn `codex app-server`; `thread/resume <session-id>` followed by a read-only `turn/start` request |
+| claude | write | `claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions` plus `--resume <session-id>` when resuming |
+| claude | read-only | `claude -p --input-format stream-json --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <claude-read-only-allow-list> --disallowedTools <claude-read-only-deny-list>` |
 | claude | corrective-resume | claude read-only profile plus `--resume <session-id>` |
 
 ### codex write
 
 ```text
-codex exec --json [--skip-git-repo-check when CWD is non-git] --sandbox workspace-write -
+codex app-server
 ```
 
-Write turns run under the user's normal Codex configuration.
+Codex turns use JSON-RPC over JSONL stdio. The driver sends `initialize`,
+then `initialized`, then `thread/start` for a fresh session or `thread/resume`
+for a resumed session, then `turn/start`. Progress arrives as `item/*`
+notifications and semantic completion arrives as `turn/completed`.
+
+Write turns set the app-server turn request's sandbox to workspace-write with
+approval policy `never` and network access disabled. When a CWD is available,
+it is also used as the writable root.
 
 ### codex read-only
 
 ```text
-codex exec --json [--skip-git-repo-check when CWD is non-git] --sandbox read-only --ignore-user-config -
+codex app-server
 ```
 
-Read-only turns MUST be hermetic and MUST ignore user configuration.
-The trailing `-` explicitly selects stdin for the initial prompt, matching the
-resume invocation shape and avoiding CLI-version-dependent implicit stdin
-detection during setup probes.
+Read-only turns use the same app-server lifecycle, but the turn request's
+sandbox is read-only, approval policy is `never`, and network access is
+disabled. Agentbus does not pass legacy exec-mode sandbox or user-config flags
+to Codex; isolation is represented in the app-server thread and turn requests.
 
 ### codex corrective-resume
 
 ```text
-codex exec --json [--skip-git-repo-check when CWD is non-git] --sandbox read-only --ignore-user-config resume <session-id> -
+codex app-server
 ```
 
 Corrective resume is always read-only. It is used for policy repair after an
 invalid final result and MUST NOT inherit writable permissions from the original
-turn. The trailing `-` is the resume subcommand's prompt argument and makes the
-CLI read the corrective prompt from stdin.
+turn. The app-server driver resumes the existing thread id and sends a
+read-only `turn/start` request.
 
-All Codex profiles include `--skip-git-repo-check` only when the resolved
-session CWD is outside a Git repository (the adapter walks ancestors for either
-a `.git` directory or a worktree `.git` file). It is omitted inside repositories
-so Codex retains its trust check there. The conditional bypass lets sanitized
-artifact workspaces and other non-repository scratch directories run: Codex's
-repository trust model does not apply to those directories.
-
-The detection is check-time, not spawn-time; `GIT_DIR` and `GIT_WORK_TREE`
-environment-defined worktrees are not consulted. Both choices are deliberate
-under agentbus's [same-user trust model](protocol.md#trust-model): a same-user
-process that can race the repository identity can already invoke Codex directly.
+All Codex profiles spawn the app-server with `SessionOpts.CWD` as the process
+working directory when one is supplied. The app-server thread and turn requests
+carry the requested working directory and model when provided; the turn request
+also carries the prompt, reasoning effort, sandbox, and approval policy.
+`Interrupt` sends `turn/interrupt` for the active thread and turn before the
+shared runtime falls back to process interruption.
 
 ### codex effort values
 
-When `SessionOpts.Effort` is provided, the codex adapter passes it as:
-
-```text
---config model_reasoning_effort="<effort>"
-```
+When `SessionOpts.Effort` is provided, the codex adapter includes it in the
+app-server turn request's reasoning effort field.
 
 The default codex effort allow-list is `none`, `minimal`, `low`, `medium`,
 `high`, and `xhigh`.
@@ -106,16 +109,21 @@ The default codex effort allow-list is `none`, `minimal`, `low`, `medium`,
 ### claude write
 
 ```text
-claude --print --output-format stream-json --verbose --dangerously-skip-permissions
+claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions
 ```
 
 When resuming:
 
 ```text
-claude --print --output-format stream-json --verbose --dangerously-skip-permissions --resume <session-id>
+claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions --resume <session-id>
 ```
 
-Write turns run under the user's normal Claude configuration.
+Write turns run under the user's normal Claude configuration. The driver uses
+Claude's bidirectional stream-json input protocol: it sends a control-protocol
+`initialize` request, sends one user-message envelope, answers supported
+`control_request` messages, and treats the `result` message as authoritative
+turn completion. A `result` with subtype `success` and no error flag emits the
+result text; other result subtypes or `is_error` values emit terminal errors.
 
 ### claude effort values
 
@@ -132,7 +140,7 @@ The default claude effort allow-list is `low`, `medium`, `high`, and `max`.
 Base argv:
 
 ```text
-claude --print --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <allow-list> --disallowedTools <deny-list>
+claude -p --input-format stream-json --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <allow-list> --disallowedTools <deny-list>
 ```
 
 The read-only profile MUST NOT include `--dangerously-skip-permissions`.
@@ -270,11 +278,11 @@ turn.
 
 ## Config hermeticity
 
-Read-only turns MUST be hermetic:
+Read-only turns MUST apply the strongest backend-supported read-only profile:
 
 | Backend | Required read-only config behavior |
 | --- | --- |
-| codex | Pass `--ignore-user-config`. |
+| codex | Use the app-server read-only sandbox, approval policy `never`, and disabled network access in the thread and turn requests. No legacy exec-mode config-isolation flag is passed. |
 | claude | Pass `--strict-mcp-config` with an empty `mcpServers` record. MCP servers are excluded, but full settings isolation is unavailable because Claude 2.1.x `--bare` strips API authentication; user settings and hooks may still load on read-only turns. |
 
 Write turns run under user configuration because real work may legitimately
@@ -295,16 +303,20 @@ need the user's MCP servers, hooks, plugins, credentials, and skills.
   "jsonEventsProbe": {
     "ran": true,
     "version": "1.2.3",
-    "streamSchema": "codex-json-v1"
+    "streamSchema": "codex-appserver-v1"
   }
 }
 ```
 
 ## Drift guard
 
-Adapters MUST run a live trivial-turn stream probe only during
-`agentbus setup`. That probe may spend real API quota. It records the detected
-backend version and stream schema in agentbus state.
+Adapters MUST run setup-time stream qualification only during
+`agentbus setup`. Generic adapters use a live trivial-turn stream probe, which
+may spend real API quota. Codex app-server uses a driver-backed setup
+qualification instead: it starts `codex app-server`, completes the
+`initialize`/`initialized` handshake, and calls `model/list` without sending a
+user prompt. Setup records the detected backend version and stream schema in
+agentbus state.
 
 Routine `Preflight` MUST NOT run a network turn. It checks:
 
@@ -327,6 +339,13 @@ pinned by adapter tests:
 | codex | `0.143.0` |
 | claude | `2.1.205` |
 
+Current stream schema identifiers are:
+
+| Backend | Stream schema |
+| --- | --- |
+| codex | `codex-appserver-v1` |
+| claude | `claude-streamjson-v2` |
+
 The setup probe cache consumed by `Preflight` is internal agentbus state and has
 this shape:
 
@@ -338,7 +357,7 @@ this shape:
       "backend": "codex",
       "binaryPath": "/Users/me/.local/bin/codex",
       "version": "0.143.0",
-      "streamSchema": "codex-json-v1",
+      "streamSchema": "codex-appserver-v1",
       "configMode": {
         "write": "user",
         "readOnly": "hermetic"
@@ -347,7 +366,7 @@ this shape:
       "jsonEventsProbed": true,
       "discoveredModels": ["gpt-5.4"],
       "discoveredEfforts": ["low", "medium", "high", "xhigh"],
-      "discoverySource": "models_cache",
+      "discoverySource": "app-server",
       "discoveryFetchedAt": "2026-07-11T12:00:00Z",
       "discoveryClientVersion": "0.143.0"
     }
@@ -355,42 +374,41 @@ this shape:
 }
 ```
 
-Model and effort discovery runs only inside `agentbus setup`, alongside the
-live stream probe. Routine `Preflight` reads the versioned cache and never runs
-a discovery command or network turn. A stale setup-probe cache version requires
-a new setup probe; it is not silently migrated into a trusted discovery result.
+Model and effort discovery is captured into the setup probe cache. Codex
+discovers models during app-server setup qualification by calling `model/list`
+with hidden models excluded and following cursors until the listing is complete.
+The adapter caches non-hidden model identifiers and the union of supported
+reasoning efforts, ordered as `none`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`, `ultra`, then first-seen unknown levels. A repeated cursor, an
+empty usable model list, or a `model/list` error fails Codex setup
+qualification.
 
-For Codex, discovery reads `${CODEX_HOME:-~/.codex}/models_cache.json` locally.
-This is an undocumented internal Codex file and agentbus reads it strictly
-best-effort: it relies only on `fetched_at`, `client_version`, and
-`models[].slug`, `models[].visibility`, and
-`models[].supported_reasoning_levels[].effort`, tolerating all other fields.
-Only models with `visibility == "list"` are advertised. Models retain cache
-order; effort levels are the per-model union ordered as `none`, `minimal`,
-`low`, `medium`, `high`, `xhigh`, `max`, `ultra`, then first-seen unknown
-levels. A missing or malformed cache produces empty lists and an explicit setup
-warning. An old `fetched_at` (more than seven days) or a `client_version` that
-differs from the probed Codex version still supplies the catalog, with a
-staleness warning.
+Claude discovery remains local help scraping: the adapter runs `claude --help`
+and parses documented model aliases/examples and effort choices. Help-scraped
+values are not an account-entitlement query.
 
-Discovery data never makes a backend unavailable. A requested model or effort
-outside a discovered catalog emits a warning and is passed through to the
-backend. Only explicitly configured static allow-lists reject a selection
-before the backend starts. Missing discovery data falls back to those static
-known-good lists with a warning.
+For generic discovery hooks, discovery failure does not by itself make a
+backend unavailable. A requested model or effort outside a discovered catalog
+emits a warning and is passed through to the backend. Only explicitly
+configured static allow-lists reject a selection before the backend starts.
+Missing discovery data falls back to those static known-good lists with a
+warning.
 
 Verified discovery surfaces for the installed CLIs:
 
 | Backend | Verified source | Discovery status |
 | --- | --- | --- |
-| codex | `${CODEX_HOME:-~/.codex}/models_cache.json` | Best-effort undocumented internal cache; `visibility == "list"` model slugs and supported reasoning efforts are cached. |
+| codex | app-server `model/list` during setup qualification | Non-hidden model identifiers and supported reasoning efforts are cached from the app-server response. |
 | claude | `claude --help` lists effort choices and documents model aliases/examples | Efforts and documented model aliases/examples are cached. These are help-advertised values, not an account-entitlement query. |
 | gemini | `gemini --help` exposes `--model` but no model or effort listing | B1-ready discovery interface returns no listing; static fallback applies when the B2 adapter is added. |
 
 `agentbus setup --json` exposes `discoveredModels`, `discoveredEfforts`,
 `discoveryFetchedAt`, `discoveryClientVersion`, and `warnings` per backend.
 `protocol.hello.backendMetadata` exposes the cached arrays with capability
-`models.discovery`; the protocol major remains 1.
+`models.discovery`; the protocol major remains 1. When a driver-backed backend
+has empty live discovery during serve-time probing, validation and metadata are
+hydrated from the matching setup cache entry if the binary path, version, and
+stream schema still match.
 
 ## A5 flag verification amendments
 
@@ -398,38 +416,36 @@ The installed CLIs verified for A5 reported:
 
 | Backend | Documented flag/profile item | Installed CLI result | Amendment |
 | --- | --- | --- | --- |
-| codex | `exec --json` | present in `codex exec --help`; omitted `PROMPT` or `-` reads stdin | pass explicit `-` for fresh turns |
-| codex | `--sandbox read-only|workspace-write` | present in `codex exec --help` | none |
-| codex | `--ignore-user-config` | present in `codex exec --help` and `codex exec resume --help` | none |
-| codex | `exec resume <session-id>` | present as `codex exec resume [SESSION_ID] [PROMPT]`; `PROMPT` may be `-` to read stdin | pass `-` after `<session-id>` |
-| codex | resume sandbox profile | `--sandbox` is present in `codex exec --help` but absent from `codex exec resume --help` | pass exec options before `resume` |
-| claude | `--print` | present in `claude --help` | none |
-| claude | `--output-format stream-json` | present in `claude --help`; with `--print`, the installed CLI requires `--verbose` | add `--verbose` |
+| codex | `app-server` process | adapter launches `codex app-server` and speaks JSON-RPC over JSONL stdio | use the duplex app-server driver |
+| codex | app-server handshake | `initialize` response followed by `initialized` notification | required before thread, turn, or discovery requests |
+| codex | app-server turn lifecycle | `thread/start` or `thread/resume`, then `turn/start`; `turn/interrupt` cancels the active turn | map session id, prompt, CWD, model, effort, sandbox, and approval policy through app-server requests |
+| codex | setup model discovery | app-server `model/list` is called during `SetupQualify` | cache discovery source `app-server`; do not read an external model cache file |
+| claude | `-p` stream-json input mode | present in `claude --help` as print mode with `--input-format stream-json` | send control-protocol initialization and one user-message envelope on stdin |
+| claude | `--output-format stream-json` | present in `claude --help`; the installed CLI requires `--verbose` with print-mode streaming | add `--verbose` |
 | claude | `--dangerously-skip-permissions` | present in `claude --help` | none |
 | claude | `--resume <session-id>` | present in `claude --help` | none |
 | claude | read-only tool allow/deny flags | real flags are `--allowedTools`/`--allowed-tools` and `--disallowedTools`/`--disallowed-tools` | use `--allowedTools` and `--disallowedTools` |
 | claude | fail-closed print-mode permission behavior | real flag is `--permission-mode dontAsk` | add `--permission-mode dontAsk` |
 | claude | hermetic customization minimization | `--strict-mcp-config` exists; `--mcp-config` accepts JSON strings; live Claude 2.1.x runs with `--bare` fail authentication, while the same profile without it succeeds | exclude MCP servers with `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`; do not use `--bare`, and document that user settings/hooks can still load |
 
-## Codex 0.144.1 JSON event mapping
+## Codex app-server event mapping
 
-For Codex 0.144.1, `codex --help`, `codex exec --help`, and
-`codex exec resume --help` verify only the JSONL mode and argv shape. The
-live orchestrator captures expose the dotted event names `thread.started`,
-`turn.started`, `item.completed`, `item.updated`, and `turn.completed`.
+For `codex-appserver-v1`, the Codex adapter uses app-server JSON-RPC frames,
+not one-shot CLI JSON events. The driver treats request responses and
+notifications separately and maps only verified app-server methods into
+agentbus events.
 
 The codex adapter maps:
 
-| Codex event | agentbus event | Basis |
+| Codex app-server frame | agentbus event | Basis |
 | --- | --- | --- |
-| `thread.started.thread_id` | session ID | live-verified resume identifier |
-| `thread.started.model` or `session_configured.model` | reported model | best-effort backend-resolved model capture |
-| `item.completed` with `item.type=agent_message` | `AgentText` | live-verified nested message shape |
-| `item.completed` with another item type | `ToolUse` | covers command execution, todo lists, and future item types |
-| `turn.completed` | `ResultMessage` | uses its own result text when present, otherwise the last agent message |
-
-Older underscore aliases such as `item_completed`, `task_complete`, and `result`
-remain accepted for compatibility.
+| `thread/start` or `thread/resume` response thread id | session ID | stable app-server resume identifier |
+| `item/agentMessage/delta` | `AgentText` | incremental assistant text |
+| `item/completed` with an agent or assistant message item | `AgentText` | completed assistant text |
+| `item/started` or `item/completed` with command, file-change, MCP, or dynamic-tool items | `ToolUse` | app-server tool/progress item types |
+| `warning`, `error`, `config/warning`, or `guardian/warning` notification text | `Warning` | backend warning surfaces |
+| `turn/completed` with status `completed` or empty status | `ResultMessage` | result text is the last completed agent message, a turn-level last-agent message, or the last agent delta |
+| `turn/completed` with status `failed`, unexpected interruption, or unsupported status | terminal error | the shared duplex runtime emits the driver error as a terminal error |
 
 ## Adding a backend
 
@@ -449,31 +465,34 @@ The implementation MUST keep responsibilities at the existing boundary:
   local availability and drift checks. `Start` and `Resume` validate options
   and create sessions; `Resume` MUST reject an empty backend session id.
 - `Session.ID` returns the backend id extracted from the stream. `Turn` launches
-  exactly one CLI turn and emits normalized events. `Interrupt` terminates the
-  active process group and is a no-op after the process has exited.
+  exactly one backend process turn and emits normalized events. `Interrupt`
+  sends the backend-native interrupt request when supported, falls back to
+  process interruption, and is a no-op after the process has exited.
 - argv construction MUST use the effective `TurnInput.Write`, not only the
   `SessionOpts.Write` default. A corrective resume MUST therefore downgrade to
   the complete read-only profile even when the original session was writable.
 - The adapter MUST NOT take over job state, policy validation or retry
   decisions, result spilling, or workflow semantics owned by the engine.
 
-Implement the B1 discovery hooks in addition to `Backend`: expose
-`ModelDiscoverer.DiscoverModels(context.Context)` and
-`BackendMetadataProvider.BackendMetadata(context.Context)`. Discovery MUST run
-only during `agentbus setup`, use a local evidenced source, and return
-`ModelDiscovery` with models, efforts, provenance, and warnings as available.
-Cache the result in `BackendSetupProbe`. Missing or failed discovery MUST leave
-empty lists plus an explicit warning and MUST NOT make the backend unavailable.
-Selections outside a discovered set MUST warn and pass through; only an
-explicit static allow-list may reject them. Metadata advertised by
-`protocol.hello` comes from the cache and MUST NOT launch discovery or a
-network turn.
+Implement the B1 discovery or setup-qualification hooks in addition to
+`Backend`: expose `ModelDiscoverer.DiscoverModels(context.Context)` for local
+discovery surfaces, or a driver-backed setup qualifier when the backend
+protocol itself is the evidenced discovery surface. Return `ModelDiscovery`
+with models, efforts, provenance, and warnings as available, and cache the
+result in `BackendSetupProbe`. For generic discovery hooks, missing or failed
+discovery MUST leave empty lists plus an explicit warning and MUST NOT make the
+backend unavailable. A driver-backed setup qualifier MAY fail setup when it
+cannot produce the required setup facts. Selections outside a discovered set
+MUST warn and pass through; only an explicit static allow-list may reject them.
+Metadata advertised by `protocol.hello` comes from setup cache or matching
+cache hydration and MUST NOT launch a network turn.
 
 ### 2. Verify and pin argv profiles
 
 Record the installed binary version and preserve receipts from its `--help`,
-subcommand help, offline strings, and hermetic fake runs. Pin golden argv tests
-for write, read-only, fresh, and resume forms. Verify option placement for every
+subcommand help, protocol fixtures, offline strings, and hermetic fake runs as
+applicable. Pin golden process argv and protocol-input tests for write,
+read-only, fresh, and resume forms. Verify option placement for every
 subcommand rather than assuming top-level flags remain valid after a resume
 verb.
 
@@ -526,19 +545,20 @@ non-zero process exits MUST surface as terminal errors rather than successful
 empty results.
 
 Do not infer schemas from an old adapter or generic JSON mode. The
-[Codex 0.144.1 JSON event mapping](#codex-01441-json-event-mapping) is the drift
-lesson: the installed event names and authoritative `last_agent_message` field
-differed from the earlier assumed schema, and valid resume options had to move
-before the subcommand. Capture representative installed-binary events without
-API spend where possible, parse defensively only around verified shapes, and
-pin those fixtures in tests.
+[Codex app-server event mapping](#codex-app-server-event-mapping) is the drift
+lesson: provider request/response frames, notifications, item payloads, and
+terminal completion semantics are backend-specific. Capture representative
+installed-binary events without API spend where possible, parse defensively
+only around verified shapes, and pin those fixtures in tests.
 
 ### 5. Wire setup, versions, and drift guards
 
 Declare and test a minimum known-good CLI version and a version normalizer.
-Wire the backend into `agentbus setup` so its live trivial-turn probe records
-the resolved binary path, normalized version, stream schema, configuration
-modes, sandbox modes, JSON-event success, and discovery result or warning.
+Wire the backend into `agentbus setup` so its setup qualification records the
+resolved binary path, normalized version, stream schema, configuration modes,
+sandbox modes, JSON-event success, and discovery result or warning. Generic
+adapters may use a live trivial-turn probe; driver-backed adapters may provide
+their own setup qualification when that is the evidenced discovery surface.
 Setup is the only place a live probe may spend API quota.
 
 Routine `Preflight` MUST remain local: resolve the executable, reject versions
@@ -553,7 +573,7 @@ and `protocol.hello` metadata are wired and tested.
 Use a temporary executable and isolated setup cache; tests MUST NOT require the
 real vendor CLI, user configuration, network, or API quota. At minimum, cover:
 
-- golden argv and stdin for write, read-only, resume, and corrective-resume;
+- golden process argv and protocol input for write, read-only, resume, and corrective-resume;
   assert that corrective resume downgrades a writable session to the complete
   read-only and hermetic profile
 - representative stream fixtures, session-id extraction, authoritative
@@ -565,7 +585,7 @@ real vendor CLI, user configuration, network, or API quota. At minimum, cover:
 - unsupported model and effort rejection, discovered-cache validation, missing
   discovery fallback, and stale-cache warnings
 - minimum-version rejection, binary/version/schema drift, setup-probe output,
-  and discovery parsing from captured fake help/config output
+  and discovery parsing from captured fake help or backend-protocol output
 
 Run `go test -race ./...` and `go vet ./...` after registration. A backend is
 not complete until the tests can falsify its permission profile, process
