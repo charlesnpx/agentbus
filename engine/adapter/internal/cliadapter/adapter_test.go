@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -406,6 +407,107 @@ func TestBackendWithDriverPreservesAdmissionProbeAndRunsDuplexTurn(t *testing.T)
 	}
 	if spec.Dir != "/tmp/work" {
 		t.Fatalf("dir = %q, want /tmp/work", spec.Dir)
+	}
+}
+
+func TestProbeBackendHydratesEmptyDiscoveryFromMatchingSetupCache(t *testing.T) {
+	const (
+		backendName = "fake"
+		binaryPath  = "/tmp/fake-bin"
+		version     = "1.0.0"
+		schema      = "duplex-json-v1"
+	)
+	cachePath := filepath.Join(t.TempDir(), "setup-probes.json")
+	writeCliAdapterSetupCache(t, cachePath, engine.BackendSetupProbe{
+		Backend:                backendName,
+		BinaryPath:             binaryPath,
+		Version:                version,
+		StreamSchema:           schema,
+		DiscoveredModels:       []string{"cached-model", "cached-model-2"},
+		DiscoveredEfforts:      []string{"medium", "high"},
+		DiscoverySource:        "setup model/list",
+		DiscoveryFetchedAt:     "2026-07-30T12:00:00Z",
+		DiscoveryClientVersion: version,
+		DiscoveryWarnings:      []string{"cached warning"},
+	})
+	backend := &Backend{
+		NameValue:      backendName,
+		Binary:         "fake-bin",
+		MinimumVersion: "0.1.0",
+		CachePath:      cachePath,
+		StreamSchema:   schema,
+		Driver:         newCliDuplexTestDriver(),
+	}
+
+	probed, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probedBackend, ok := probed.(*Backend)
+	if !ok {
+		t.Fatalf("probed backend = %T, want *Backend", probed)
+	}
+	meta := probedBackend.BackendMetadata(context.Background())
+	if !slices.Equal(meta.Models, []string{"cached-model", "cached-model-2"}) {
+		t.Fatalf("metadata models = %#v, want cached models", meta.Models)
+	}
+	if !slices.Equal(meta.Efforts, []string{"medium", "high"}) {
+		t.Fatalf("metadata efforts = %#v, want cached efforts", meta.Efforts)
+	}
+	if probedBackend.probed.DiscoverySource != "setup model/list" ||
+		probedBackend.probed.DiscoveryFetchedAt != "2026-07-30T12:00:00Z" ||
+		probedBackend.probed.DiscoveryClientVersion != version ||
+		probedBackend.probed.DiscoveryWarning != "cached warning" {
+		t.Fatalf("probed discovery = %#v, want setup cache discovery fields", probedBackend.probed)
+	}
+	warning, err := probedBackend.validateOptions(engine.SessionOpts{Model: "not-in-cache"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(warning, `model "not-in-cache" is not in the discovered fake catalog`) {
+		t.Fatalf("validation warning = %q, want discovered catalog warning", warning)
+	}
+}
+
+func TestProbeBackendDoesNotHydrateEmptyDiscoveryFromMismatchedSetupCache(t *testing.T) {
+	const (
+		backendName = "fake"
+		binaryPath  = "/tmp/fake-bin"
+		schema      = "duplex-json-v1"
+	)
+	cachePath := filepath.Join(t.TempDir(), "setup-probes.json")
+	writeCliAdapterSetupCache(t, cachePath, engine.BackendSetupProbe{
+		Backend:           backendName,
+		BinaryPath:        binaryPath,
+		Version:           "0.9.0",
+		StreamSchema:      schema,
+		DiscoveredModels:  []string{"stale-model"},
+		DiscoveredEfforts: []string{"stale-effort"},
+		DiscoverySource:   "setup model/list",
+	})
+	backend := &Backend{
+		NameValue:      backendName,
+		Binary:         "fake-bin",
+		MinimumVersion: "0.1.0",
+		CachePath:      cachePath,
+		StreamSchema:   schema,
+		Driver:         newCliDuplexTestDriver(),
+	}
+
+	probed, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probedBackend, ok := probed.(*Backend)
+	if !ok {
+		t.Fatalf("probed backend = %T, want *Backend", probed)
+	}
+	meta := probedBackend.BackendMetadata(context.Background())
+	if len(meta.Models) != 0 || len(meta.Efforts) != 0 {
+		t.Fatalf("metadata = %#v, want no stale cache discovery", meta)
+	}
+	if probedBackend.probed.DiscoverySource != "" || len(probedBackend.probed.DiscoveredModels) != 0 || len(probedBackend.probed.DiscoveredEfforts) != 0 {
+		t.Fatalf("probed discovery = %#v, want empty discovery", probedBackend.probed)
 	}
 }
 
@@ -848,6 +950,13 @@ func (d *cliDuplexTestDriver) runResumeIDs() []string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return append([]string(nil), d.resumeIDs...)
+}
+
+func writeCliAdapterSetupCache(t *testing.T, path string, probe engine.BackendSetupProbe) {
+	t.Helper()
+	if err := engine.WriteSetupProbeCache(path, engine.SetupProbeCache{Backends: []engine.BackendSetupProbe{probe}}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 type duplexCommandRunner struct {
