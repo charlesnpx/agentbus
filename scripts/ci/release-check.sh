@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
-# Pinned multi-arch manifest-list digest for golang:1.26-trixie (Go 1.26.1, Debian trixie);
+# Pinned multi-arch manifest-list digest for golang:1.26.5-trixie (Go 1.26.5, Debian trixie);
 # runs natively on both amd64 and arm64 (no --platform: emulation breaks pidfd syscalls).
-IMAGE="${DOCKER_IMAGE:-golang:1.26-trixie@sha256:4ee9ffa999b4583ce281939cdff828763083610292f252279a0cee77473bd9a7}"
+IMAGE="${DOCKER_IMAGE:-golang:1.26.5-trixie@sha256:4ee9ffa999b4583ce281939cdff828763083610292f252279a0cee77473bd9a7}"
 
 if [[ "${AGENTBUS_STRICT_DOCKER_INSIDE:-0}" != "1" ]]; then
   if ! command -v docker >/dev/null 2>&1; then
