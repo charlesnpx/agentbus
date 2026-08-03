@@ -24,7 +24,7 @@ such as `delegate` supply concrete delegation workflows and contract text.
 ## Install
 
 agentbus is a delegated `mise-en-place` entry. In the registry it is expected to
-start under `experimental:` as a private optional delegated repo:
+start under `experimental:` as an optional delegated repo:
 
 ```yaml
 experimental:
@@ -32,7 +32,7 @@ experimental:
     repo: github.com/charlesnpx/agentbus
     channel: latest-release
     fallback_ref: main
-    visibility: private
+    visibility: public
     optional: true
 ```
 
@@ -129,7 +129,9 @@ scripts/ci/release-check.sh
 Set `GOCACHE` under `/private/tmp` or another writable cache root when running
 inside restricted sandboxes.
 
-## Roadmap / v0.2
+## Roadmap
+
+Planned work not yet shipped as of v0.6.0:
 
 - `stop-review-gate`: a Claude Code Stop-hook client of agentbus that gates a
   review run submitted as an identified `job.submit` (protocol v2 removed the
