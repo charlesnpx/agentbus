@@ -279,12 +279,19 @@ type Server struct {
 	admissionJobs      map[string]*admissionInstance
 	admissionEffectMu  map[string]*sync.Mutex
 	activeJobs         map[string]*activeJob
+	jobLiveness        map[string]*jobLiveness
 	reportedModels     map[string]string
 	reportedModelOrder []string
 	lastActivity       time.Time
 	executablePath     string
 	executableIdentity BinaryIdentity
 	binaryStale        bool
+}
+
+type jobLiveness struct {
+	startedAt   time.Time
+	lastEventAt time.Time
+	eventCount  int
 }
 
 type activeJob struct {
@@ -530,6 +537,7 @@ func New(cfg Config) (*Server, error) {
 		admissionRuntimeConfig: cfg.Runtime,
 		admissionProbeRunner:   probeRunner,
 		activeJobs:             make(map[string]*activeJob),
+		jobLiveness:            make(map[string]*jobLiveness),
 		reportedModels:         make(map[string]string),
 		lastActivity:           clock.Now().UTC(),
 	}, nil
@@ -2432,6 +2440,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		Timeout:  run.timeout,
 		LogPaths: engine.LogPaths{},
 	}
+	if run.admissionControlled {
+		s.rememberJobLivenessStarted(run.jobID)
+	}
 	events, err := s.admissionTurnEvents(attemptCtx, run, input, ordinal)
 	if err != nil {
 		return "", engine.StateFailed, err
@@ -2452,6 +2463,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), stateForContext(attemptCtx.Err()), attemptCtx.Err()
 				}
 				return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateCompleted, nil
+			}
+			if run.admissionControlled {
+				s.recordJobLivenessEvent(run.jobID)
 			}
 			rawText := authoritativeText(event)
 			switch event.Type {
@@ -2704,6 +2718,50 @@ func (s *Server) reportedModel(jobID string) string {
 	return s.reportedModels[jobID]
 }
 
+func (s *Server) rememberJobLivenessStarted(jobID string) {
+	if strings.TrimSpace(jobID) == "" {
+		return
+	}
+	now := s.clock.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.jobLiveness == nil {
+		s.jobLiveness = make(map[string]*jobLiveness)
+	}
+	if s.jobLiveness[jobID] == nil {
+		s.jobLiveness[jobID] = &jobLiveness{startedAt: now, lastEventAt: now}
+	}
+}
+
+func (s *Server) recordJobLivenessEvent(jobID string) {
+	if strings.TrimSpace(jobID) == "" {
+		return
+	}
+	now := s.clock.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.jobLiveness == nil {
+		s.jobLiveness = make(map[string]*jobLiveness)
+	}
+	liveness := s.jobLiveness[jobID]
+	if liveness == nil {
+		liveness = &jobLiveness{startedAt: now}
+		s.jobLiveness[jobID] = liveness
+	}
+	liveness.lastEventAt = now
+	liveness.eventCount++
+}
+
+func (s *Server) jobLivenessSnapshot(jobID string) (time.Time, time.Time, int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	liveness := s.jobLiveness[jobID]
+	if liveness == nil {
+		return time.Time{}, time.Time{}, 0, false
+	}
+	return liveness.startedAt, liveness.lastEventAt, liveness.eventCount, true
+}
+
 func canLateFinalize(from, to engine.JobState) bool {
 	switch from {
 	case engine.StateOrphaned:
@@ -2857,6 +2915,7 @@ func (s *Server) addActiveJob(job *activeJob) {
 func (s *Server) removeActiveJob(jobID string) {
 	s.mu.Lock()
 	delete(s.activeJobs, jobID)
+	delete(s.jobLiveness, jobID)
 	s.mu.Unlock()
 	s.touchActivity()
 }
