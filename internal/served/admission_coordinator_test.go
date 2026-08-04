@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/coordinator"
@@ -137,8 +138,8 @@ func (a *servedCoordinatorOrderAuthority) RequestCancel(ctx context.Context, job
 	return admissionStepResult(applied, err)
 }
 
-func (a *servedCoordinatorOrderAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) (coordinator.StepResult, error) {
-	applied, err := a.ready.RecordOutcome(ctx, jobID, ref, outcome)
+func (a *servedCoordinatorOrderAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome, contract *engine.ContractStamp) (coordinator.StepResult, error) {
+	applied, err := a.ready.RecordOutcome(ctx, jobID, ref, outcome, contract)
 	return admissionStepResult(applied, err)
 }
 

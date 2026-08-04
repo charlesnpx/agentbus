@@ -248,12 +248,56 @@ const (
 // RenderRetryTemplate renders the corrective retry template. The substituted
 // violation text is capped so invalid responses cannot inflate a retry prompt.
 func RenderRetryTemplate(template string, missing []string) string {
+	return renderRetryTemplate(template, missing, retryTemplateHints{})
+}
+
+// RenderRetryTemplateForContract renders the corrective retry template with
+// shape-specific guidance when the resolved contract exposes it.
+func RenderRetryTemplateForContract(template string, missing []string, contract ContractSpec) string {
+	hints := retryTemplateHints{}
+	if contract.Shape != nil {
+		hints.firstLineEnum = contract.Shape.FirstLineEnum
+	}
+	return renderRetryTemplate(template, missing, hints)
+}
+
+type retryTemplateHints struct {
+	firstLineEnum []string
+}
+
+func renderRetryTemplate(template string, missing []string, hints retryTemplateHints) string {
 	const missingToken = "{{missing}}"
 	occurrences := strings.Count(template, missingToken)
 	if occurrences == 0 {
 		return template
 	}
-	return strings.ReplaceAll(template, missingToken, boundedViolationText(missing, maxRetryViolationTextBytes/occurrences))
+	return strings.ReplaceAll(template, missingToken, boundedViolationText(translateViolations(missing, hints), maxRetryViolationTextBytes/occurrences))
+}
+
+func translateViolations(codes []string, hints retryTemplateHints) []string {
+	translated := make([]string, 0, len(codes))
+	for _, code := range codes {
+		translated = append(translated, translateViolation(code, hints))
+	}
+	return translated
+}
+
+func translateViolation(code string, hints retryTemplateHints) string {
+	switch {
+	case code == "firstLineEnum":
+		if len(hints.firstLineEnum) > 0 {
+			return "Line 1 must be exactly one of these values, with nothing else on the line: " + strings.Join(hints.firstLineEnum, ", ")
+		}
+		return "Line 1 must be exactly one lowercase word: complete, partial, or blocked — nothing else on the line."
+	case strings.HasPrefix(code, "section:"):
+		return "Add this top-level heading with its content: # " + strings.TrimPrefix(code, "section:")
+	case strings.HasPrefix(code, "attestation:"):
+		return "Include this exact attestation text outside code fences: " + strings.TrimPrefix(code, "attestation:")
+	case code == "evidence":
+		return "Findings were claimed without accepted evidence. Add an outside-code-fence file:line reference, an outside-code-fence diff hunk line starting @@, or a fenced command block with an exit-code line immediately before or after the fence."
+	default:
+		return code
+	}
 }
 
 // StampValidation builds a contract stamp for a completed validation pipeline.

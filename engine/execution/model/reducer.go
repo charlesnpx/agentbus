@@ -3,6 +3,8 @@ package model
 import (
 	"errors"
 	"fmt"
+
+	"github.com/charlesnpx/agentbus/engine"
 )
 
 var (
@@ -454,9 +456,9 @@ func applyObserveOutcome(next *SafetyRecord, current SafetyRecord, command Obser
 	if command.Outcome == OutcomeOrphaned {
 		return false, invalidCommand("outcome: orphaned cannot be observed")
 	}
-	fact := OutcomeFact{Attempt: current.Attempt.Ref, Outcome: command.Outcome}
+	fact := OutcomeFact{Attempt: current.Attempt.Ref, Outcome: command.Outcome, Contract: cloneContractStamp(command.Contract)}
 	if current.Outcome != nil {
-		return mergeFact(&next.Outcome, fact, "outcome")
+		return mergeOutcomeFact(&next.Outcome, fact)
 	}
 	if completionOutcome(command.Outcome) && current.Mode != ModeLegacyUnfenced && !hasAnyRelease(current.Attempt) {
 		return false, precondition("completed outcome requires release evidence")
@@ -464,7 +466,7 @@ func applyObserveOutcome(next *SafetyRecord, current SafetyRecord, command Obser
 	if current.Cancel != nil && !hasAnyLaunchEvidence(current.Attempt) && command.Outcome != OutcomeCanceled {
 		return false, precondition("cancel before authorization cannot be rewritten by outcome")
 	}
-	return mergeFact(&next.Outcome, fact, "outcome")
+	return mergeOutcomeFact(&next.Outcome, fact)
 }
 
 func applyCertifyResult(next *SafetyRecord, current SafetyRecord, command CertifyResult) (bool, error) {
@@ -771,6 +773,23 @@ func mergeFact[T comparable](target **T, fact T, label string) (bool, error) {
 	return false, conflict("%s already recorded with different evidence", label)
 }
 
+func mergeOutcomeFact(target **OutcomeFact, fact OutcomeFact) (bool, error) {
+	if *target == nil {
+		*target = cloneOutcomeFact(&fact)
+		return true, nil
+	}
+	if outcomeFactEqual(**target, fact) {
+		return false, nil
+	}
+	return false, conflict("outcome already recorded with different evidence")
+}
+
+func outcomeFactEqual(left, right OutcomeFact) bool {
+	return left.Attempt.Equal(right.Attempt) &&
+		left.Outcome == right.Outcome &&
+		contractStampEqual(left.Contract, right.Contract)
+}
+
 func mergeLaunchSlot[T comparable](slots *LaunchSlots[T], ordinal LaunchOrdinal, fact T, label string) (bool, error) {
 	existing, ok := slots.Get(ordinal)
 	if !ok {
@@ -826,9 +845,9 @@ func terminalCertificateEqual(left, right TerminalCertificate) bool {
 		return false
 	}
 	if left.Result == nil || right.Result == nil {
-		return left.Result == nil && right.Result == nil
+		return left.Result == nil && right.Result == nil && contractStampEqual(left.Contract, right.Contract)
 	}
-	return *left.Result == *right.Result
+	return *left.Result == *right.Result && contractStampEqual(left.Contract, right.Contract)
 }
 
 func cloneSafetyRecord(record SafetyRecord) SafetyRecord {
@@ -836,10 +855,60 @@ func cloneSafetyRecord(record SafetyRecord) SafetyRecord {
 	next.Attempt.Launches = cloneLaunchSlots(record.Attempt.Launches)
 	next.Acknowledgement = clonePtr(record.Acknowledgement)
 	next.Cancel = clonePtr(record.Cancel)
-	next.Outcome = clonePtr(record.Outcome)
+	next.Outcome = cloneOutcomeFact(record.Outcome)
 	next.Result = clonePtr(record.Result)
-	next.Terminal = clonePtr(record.Terminal)
+	next.Terminal = cloneTerminalCertificate(record.Terminal)
 	return next
+}
+
+func cloneOutcomeFact(fact *OutcomeFact) *OutcomeFact {
+	if fact == nil {
+		return nil
+	}
+	copied := *fact
+	copied.Contract = cloneContractStamp(fact.Contract)
+	return &copied
+}
+
+func contractStampEqual(left, right *engine.ContractStamp) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	if left.Status != right.Status ||
+		left.Reason != right.Reason ||
+		left.ContractName != right.ContractName ||
+		left.ContractSHA256 != right.ContractSHA256 ||
+		left.Attempts != right.Attempts ||
+		left.RetryUsed != right.RetryUsed ||
+		!left.ValidatedAt.Equal(right.ValidatedAt) ||
+		len(left.Missing) != len(right.Missing) {
+		return false
+	}
+	for i := range left.Missing {
+		if left.Missing[i] != right.Missing[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneTerminalCertificate(certificate *TerminalCertificate) *TerminalCertificate {
+	if certificate == nil {
+		return nil
+	}
+	copied := *certificate
+	copied.Result = clonePtr(certificate.Result)
+	copied.Contract = cloneContractStamp(certificate.Contract)
+	return &copied
+}
+
+func cloneContractStamp(stamp *engine.ContractStamp) *engine.ContractStamp {
+	if stamp == nil {
+		return nil
+	}
+	copied := *stamp
+	copied.Missing = append([]string(nil), stamp.Missing...)
+	return &copied
 }
 
 func cloneLaunchSlots(slots LaunchSlots[LaunchProof]) LaunchSlots[LaunchProof] {

@@ -1720,8 +1720,8 @@ func (a *servedAdmissionAuthority) RequestCancel(ctx context.Context, jobID mode
 	return admissionStepResult(applied, err)
 }
 
-func (a *servedAdmissionAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) (coordinator.StepResult, error) {
-	applied, err := a.ready.RecordOutcome(ctx, jobID, ref, outcome)
+func (a *servedAdmissionAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome, contract *engine.ContractStamp) (coordinator.StepResult, error) {
+	applied, err := a.ready.RecordOutcome(ctx, jobID, ref, outcome, contract)
 	return admissionStepResult(applied, err)
 }
 
@@ -2438,8 +2438,12 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 		return protocol.JobResult{}, ok, errObj
 	}
 	var result *engine.ResultInfo
+	var contract *engine.ContractStamp
 	if record.Terminal != nil && record.Terminal.Result != nil {
 		result = s.authorityResultInfo(*record.Terminal.Result)
+	}
+	if record.Terminal != nil {
+		contract = record.Terminal.Contract
 	}
 	return protocol.JobResult{
 		JobID:              projection.JobID.String(),
@@ -2447,6 +2451,7 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 		State:              admissionState(projection.Public),
 		CleanupDisposition: admissionCleanupDisposition(record),
 		Result:             result,
+		Contract:           contract,
 	}, true, nil
 }
 
@@ -2570,6 +2575,11 @@ func (s *Server) authorityResultInfo(ref model.ResultRef) *engine.ResultInfo {
 		inlineCap = engine.DefaultInlineResultCap
 	}
 	if ref.Bytes >= int64(inlineCap) {
+		stat, err := os.Stat(ref.Path)
+		if err != nil || !stat.Mode().IsRegular() || stat.Size() != ref.Bytes {
+			return info
+		}
+		info.TextElided = true
 		return info
 	}
 	// Bounded read: the certified byte count gates hydration, but the file on

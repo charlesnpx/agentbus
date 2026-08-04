@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
@@ -29,7 +30,7 @@ func TestAuthorityLifecycleCompletesFromLiveLaunchFacts(t *testing.T) {
 	accepted := h.submit(t, ctx, "lifecycle")
 	group := h.bindGrantReleaseQuiescence(t, ctx, accepted, model.LaunchOrdinalOne, model.QuiescenceNaturalExit)
 
-	if err := h.coordinator.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil); err != nil {
+	if err := h.coordinator.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -68,7 +69,7 @@ func TestCompleteWithoutQuiescenceTerminalizesUnresolved(t *testing.T) {
 	accepted := h.submit(t, ctx, "complete-no-certify")
 	h.bindGrantRelease(t, ctx, accepted, model.LaunchOrdinalOne)
 
-	if err := h.coordinator.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil); err != nil {
+	if err := h.coordinator.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if h.containment.contained != 0 || h.containment.retired != 0 {
@@ -345,7 +346,7 @@ func TestRecoverRecordedCompletedTypedUnresolvedKeepsResult(t *testing.T) {
 	h := newHarness(t, "completed-unresolved")
 	accepted := h.submit(t, ctx, "completed-unresolved")
 	h.bindGrantRelease(t, ctx, accepted, model.LaunchOrdinalOne)
-	if _, err := h.authority.RecordOutcome(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.OutcomeCompleted); err != nil {
+	if _, err := h.authority.RecordOutcome(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.OutcomeCompleted, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.coordinator.publishResult(ctx, accepted.Record.JobID, []byte("completed-result"), nil); err != nil {
@@ -599,7 +600,7 @@ func TestCompleteContradictoryOpenOutcomeConflictIsNotReconciledByLaterTerminal(
 	h := newHarness(t, "open-outcome-conflict")
 	accepted := h.submit(t, ctx, "open-outcome-conflict")
 	h.bindGrantRelease(t, ctx, accepted, model.LaunchOrdinalOne)
-	if _, err := h.authority.RecordOutcome(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.OutcomeFailed); err != nil {
+	if _, err := h.authority.RecordOutcome(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.OutcomeFailed, nil); err != nil {
 		t.Fatal(err)
 	}
 	auth := &terminalizingConflictAuthority{readyAuthority: h.authority}
@@ -608,7 +609,7 @@ func TestCompleteContradictoryOpenOutcomeConflictIsNotReconciledByLaterTerminal(
 		t.Fatal(err)
 	}
 
-	err = coord.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil)
+	err = coord.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil, nil)
 	if err == nil {
 		t.Fatal("Complete returned nil for contradictory open outcome")
 	}
@@ -656,7 +657,7 @@ func TestCancelDuringPendingCompletedResultAwaitsSettlementWithoutFailStop(t *te
 	}
 	completeDone := make(chan error, 1)
 	go func() {
-		completeDone <- coord.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("completed-result"), nil)
+		completeDone <- coord.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("completed-result"), nil, nil)
 	}()
 	publishReleased := false
 	defer func() {
@@ -976,8 +977,8 @@ type terminalizingConflictAuthority struct {
 	finalizedAfterConflict bool
 }
 
-func (a *terminalizingConflictAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) (StepResult, error) {
-	applied, err := a.readyAuthority.RecordOutcome(ctx, jobID, ref, outcome)
+func (a *terminalizingConflictAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome, contract *engine.ContractStamp) (StepResult, error) {
+	applied, err := a.readyAuthority.RecordOutcome(ctx, jobID, ref, outcome, contract)
 	if err == nil || !errors.Is(err, model.ErrConflictingDuplicate) {
 		return applied, err
 	}
@@ -1061,8 +1062,8 @@ func (a *readyAuthority) RequestCancel(ctx context.Context, jobID model.JobID) (
 	return stepResult(applied, err)
 }
 
-func (a *readyAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) (StepResult, error) {
-	applied, err := a.ready.RecordOutcome(ctx, jobID, ref, outcome)
+func (a *readyAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome, contract *engine.ContractStamp) (StepResult, error) {
+	applied, err := a.ready.RecordOutcome(ctx, jobID, ref, outcome, contract)
 	return stepResult(applied, err)
 }
 

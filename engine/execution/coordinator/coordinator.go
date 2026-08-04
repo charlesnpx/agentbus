@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -43,7 +44,7 @@ func (e AlreadyFinalizedError) Is(target error) bool {
 type AdmissionAuthority interface {
 	RecordQuiescence(context.Context, model.JobID, model.LaunchOrdinal, custodian.VerifiedQuiescence) (StepResult, error)
 	RequestCancel(context.Context, model.JobID) (StepResult, error)
-	RecordOutcome(context.Context, model.JobID, model.AttemptRef, model.Outcome) (StepResult, error)
+	RecordOutcome(context.Context, model.JobID, model.AttemptRef, model.Outcome, *engine.ContractStamp) (StepResult, error)
 	RecordResult(context.Context, model.JobID, model.AttemptRef, model.ResultReceipt) (StepResult, error)
 	Finalize(context.Context, model.JobID, model.AttemptRef, model.TerminalIntent) (StepResult, error)
 	Snapshot(context.Context, model.JobID) (JobSnapshot, error)
@@ -99,7 +100,7 @@ func (c *Coordinator) Snapshot(ctx context.Context, jobID model.JobID) (JobSnaps
 	return c.authority.Snapshot(ctx, jobID)
 }
 
-func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome model.Outcome, result []byte, injector *FailureInjector) error {
+func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome model.Outcome, result []byte, contract *engine.ContractStamp, injector *FailureInjector) error {
 	if err := c.ready(); err != nil {
 		return err
 	}
@@ -110,7 +111,7 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 	if err != nil {
 		return err
 	}
-	if _, err := c.authority.RecordOutcome(ctx, jobID, snapshot.Record.Attempt.Ref, outcome); err != nil {
+	if _, err := c.authority.RecordOutcome(ctx, jobID, snapshot.Record.Attempt.Ref, outcome, contract); err != nil {
 		return c.alreadyFinalizedError(ctx, jobID, err)
 	}
 	if completionOutcome(outcome) {

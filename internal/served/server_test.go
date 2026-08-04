@@ -895,7 +895,7 @@ func TestCompleteAdmissionRunLogsRecoveryObligationWhenAuthorityCleared(t *testi
 		t.Fatal(err)
 	}
 
-	if err := server.completeAdmissionRun(jobRun{jobID: jobID}, engine.StateCompleted, "done"); err != nil {
+	if err := server.completeAdmissionRun(jobRun{jobID: jobID}, engine.StateCompleted, "done", nil); err != nil {
 		t.Fatal(err)
 	}
 	got := logs.String()
@@ -992,7 +992,7 @@ func TestAdmissionSnapshotCorruptionTripsFailStopDuringCompletion(t *testing.T) 
 			accepted := acceptIdentifiedAuthorityWork(t, server, "snapshot-complete-"+tt.name)
 			tt.corrupt(t, server, accepted.Binding.RequestKey, accepted.Record.JobID)
 
-			err := server.completeAdmissionRun(jobRun{jobID: accepted.Record.JobID.String()}, engine.StateCompleted, "done")
+			err := server.completeAdmissionRun(jobRun{jobID: accepted.Record.JobID.String()}, engine.StateCompleted, "done", nil)
 			requireServedCorruptKind(t, err, tt.kind)
 			if !errors.Is(err, authority.ErrFailStopped) {
 				t.Fatalf("completeAdmissionRun error = %v, want durable fail-stop", err)
@@ -1279,7 +1279,7 @@ func TestIdentifiedSubmitReplayAfterRestartPreservesRecordedOutcome(t *testing.T
 	if _, err := firstServer.admissionReady.RecordRelease(ctx, record.JobID, ref, model.LaunchOrdinalOne, child, evidence); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := firstServer.admissionReady.RecordOutcome(ctx, record.JobID, ref, model.OutcomeFailed); err != nil {
+	if _, err := firstServer.admissionReady.RecordOutcome(ctx, record.JobID, ref, model.OutcomeFailed, nil); err != nil {
 		t.Fatal(err)
 	}
 	record = loadAdmissionSafetyRecord(t, firstServer, submitted.JobID)
@@ -3095,7 +3095,7 @@ func TestAuthorityResultHidesCertifiedResultUntilTerminalRecord(t *testing.T) {
 	if _, err := server.admissionReady.RecordQuiescence(ctx, jobID, ordinal, verified); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.admissionReady.RecordOutcome(ctx, jobID, ref, model.OutcomeCompleted); err != nil {
+	if _, err := server.admissionReady.RecordOutcome(ctx, jobID, ref, model.OutcomeCompleted, nil); err != nil {
 		t.Fatal(err)
 	}
 	dirSynced, err := model.NewEvidence("dir_synced", "terminal-only result directory fsynced")
@@ -5787,7 +5787,7 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 	backend := newFakeBackend("fake")
 	backend.events = func(string, bool) []engine.Event {
 		if turns.Add(1) == 1 {
-			return []engine.Event{{Type: engine.EventAgentText, Text: "FAIL\n"}}
+			return []engine.Event{{Type: engine.EventAgentText, Text: "NOPE\n"}}
 		}
 		return []engine.Event{{Type: engine.EventAgentText, Text: "PASS\n"}}
 	}
@@ -5805,7 +5805,7 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 			Write:   false,
 			Prompt:  "retry",
 			Policy: &engine.TurnPolicy{
-				Contract: &engine.ContractSpec{Shape: &engine.ShapeSpec{FirstLineEnum: []string{"PASS"}}},
+				Contract: &engine.ContractSpec{Shape: &engine.ShapeSpec{FirstLineEnum: []string{"PASS", "FAIL"}}},
 				Retry: &engine.RetryPolicy{
 					Max:      1,
 					Template: "Your response missed: {{missing}}. Emit the corrected report only; make no further changes.",
@@ -5817,6 +5817,27 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 	var submitted protocol.JobSubmitResult
 	decodeResult(t, resp, &submitted)
 	waitBackendStarts(t, backend, 2)
+	var firstTurn, retryTurn fakeTurn
+	select {
+	case firstTurn = <-backend.turns:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first backend turn was not recorded")
+	}
+	select {
+	case retryTurn = <-backend.turns:
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry backend turn was not recorded")
+	}
+	if firstTurn.Prompt != "retry" {
+		t.Fatalf("first prompt = %q, want original task prompt", firstTurn.Prompt)
+	}
+	wantRetryInstruction := "Line 1 must be exactly one of these values, with nothing else on the line: PASS, FAIL"
+	if !strings.Contains(retryTurn.Prompt, wantRetryInstruction) {
+		t.Fatalf("retry prompt = %q, want instruction %q", retryTurn.Prompt, wantRetryInstruction)
+	}
+	if strings.Contains(retryTurn.Prompt, "complete, partial, or blocked") || strings.Contains(retryTurn.Prompt, "firstLineEnum") {
+		t.Fatalf("retry prompt = %q, want contract enum translation without delegate defaults or raw token", retryTurn.Prompt)
+	}
 	waitAdmissionSafetyTerminal(t, server, submitted.JobID)
 
 	ordinals := launcher.preparedOrdinals()
@@ -7471,13 +7492,13 @@ func (a *recordingAdmissionAuthority) RequestCancel(ctx context.Context, jobID m
 	return a.servedAdmissionAuthority.RequestCancel(ctx, jobID)
 }
 
-func (a *recordingAdmissionAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) (coordinator.StepResult, error) {
+func (a *recordingAdmissionAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome, contract *engine.ContractStamp) (coordinator.StepResult, error) {
 	if a.beforeRecordOutcome != nil {
 		if err := a.beforeRecordOutcome(ctx, jobID, ref, outcome); err != nil {
 			return coordinator.StepResult{}, err
 		}
 	}
-	return a.servedAdmissionAuthority.RecordOutcome(ctx, jobID, ref, outcome)
+	return a.servedAdmissionAuthority.RecordOutcome(ctx, jobID, ref, outcome, contract)
 }
 
 func (a *recordingAdmissionAuthority) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent) (coordinator.StepResult, error) {

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 )
@@ -1052,10 +1053,38 @@ func cloneSafetyRecord(record model.SafetyRecord) model.SafetyRecord {
 	next.Attempt.Launches = cloneLaunchSlots(record.Attempt.Launches)
 	next.Acknowledgement = clonePtr(record.Acknowledgement)
 	next.Cancel = clonePtr(record.Cancel)
-	next.Outcome = clonePtr(record.Outcome)
+	next.Outcome = cloneOutcomeFact(record.Outcome)
 	next.Result = clonePtr(record.Result)
-	next.Terminal = clonePtr(record.Terminal)
+	next.Terminal = cloneTerminalCertificate(record.Terminal)
 	return next
+}
+
+func cloneOutcomeFact(fact *model.OutcomeFact) *model.OutcomeFact {
+	if fact == nil {
+		return nil
+	}
+	copied := *fact
+	copied.Contract = cloneContractStamp(fact.Contract)
+	return &copied
+}
+
+func cloneTerminalCertificate(certificate *model.TerminalCertificate) *model.TerminalCertificate {
+	if certificate == nil {
+		return nil
+	}
+	copied := *certificate
+	copied.Result = clonePtr(certificate.Result)
+	copied.Contract = cloneContractStamp(certificate.Contract)
+	return &copied
+}
+
+func cloneContractStamp(stamp *engine.ContractStamp) *engine.ContractStamp {
+	if stamp == nil {
+		return nil
+	}
+	copied := *stamp
+	copied.Missing = append([]string(nil), stamp.Missing...)
+	return &copied
 }
 
 func cloneLaunchSlots(slots model.LaunchSlots[model.LaunchProof]) model.LaunchSlots[model.LaunchProof] {
