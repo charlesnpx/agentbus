@@ -2389,13 +2389,22 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 		return protocol.JobStatus{}, ok, errObj
 	}
 	reported := s.reportedModel(projection.JobID.String())
-	return protocol.JobStatus{
+	status := protocol.JobStatus{
 		JobID:              projection.JobID.String(),
 		SessionID:          projection.SessionID,
 		State:              admissionState(projection.Public),
 		CleanupDisposition: admissionCleanupDisposition(record),
 		ModelReported:      reported,
-	}, true, nil
+	}
+	if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
+		startedAt := started
+		updatedAt := lastEvent
+		heartbeatAt := lastEvent
+		status.StartedAt = &startedAt
+		status.UpdatedAt = &updatedAt
+		status.HeartbeatAt = &heartbeatAt
+	}
+	return status, true, nil
 }
 
 func (s *Server) listAuthorityStatuses() ([]protocol.JobStatus, *protocol.ErrorObject) {
@@ -2422,6 +2431,14 @@ func (s *Server) listAuthorityStatuses() ([]protocol.JobStatus, *protocol.ErrorO
 			}
 			if ok {
 				status.ModelReported = s.reportedModel(status.JobID)
+				if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
+					startedAt := started
+					updatedAt := lastEvent
+					heartbeatAt := lastEvent
+					status.StartedAt = &startedAt
+					status.UpdatedAt = &updatedAt
+					status.HeartbeatAt = &heartbeatAt
+				}
 				statuses = append(statuses, status)
 			}
 		}

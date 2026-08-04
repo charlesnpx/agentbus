@@ -64,6 +64,23 @@ type resumedSession struct {
 	Opts engine.SessionOpts
 }
 
+type steppedClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *steppedClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *steppedClock) Set(now time.Time) {
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
+}
+
 type cancelOnAdvanceAnchor struct {
 	authority.Anchor
 	cancel context.CancelFunc
@@ -177,6 +194,85 @@ func (b *fakeBackend) Resume(_ context.Context, id string, opts engine.SessionOp
 		b.resumes <- resumedSession{ID: id, Opts: opts}
 	}
 	return &fakeSession{id: id, backend: b}, nil
+}
+
+type admissionLivenessBackend struct {
+	*fakeBackend
+	eventStream    chan engine.Event
+	runnerObserved chan struct{}
+}
+
+func newAdmissionLivenessBackend(name string) *admissionLivenessBackend {
+	backend := &admissionLivenessBackend{
+		fakeBackend:    newFakeBackend(name),
+		eventStream:    make(chan engine.Event),
+		runnerObserved: make(chan struct{}),
+	}
+	backend.started = make(chan struct{}, 1)
+	return backend
+}
+
+func (b *admissionLivenessBackend) ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error) {
+	return b, nil
+}
+
+func (b *admissionLivenessBackend) Start(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
+	n := b.count.Add(1)
+	if b.startHook != nil {
+		b.startHook(opts)
+	}
+	return &admissionLivenessSession{id: b.name + "-session-" + stringID(n), backend: b}, nil
+}
+
+func (b *admissionLivenessBackend) Resume(_ context.Context, id string, opts engine.SessionOpts) (engine.Session, error) {
+	if b.resumes != nil {
+		b.resumes <- resumedSession{ID: id, Opts: opts}
+	}
+	return &admissionLivenessSession{id: id, backend: b}, nil
+}
+
+type admissionLivenessSession struct {
+	id      string
+	backend *admissionLivenessBackend
+}
+
+func (s *admissionLivenessSession) ID() string { return s.id }
+
+func (s *admissionLivenessSession) Turn(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+	return s.backend.eventStream, nil
+}
+
+func (s *admissionLivenessSession) TurnWithRunner(ctx context.Context, input engine.TurnInput, runner command.Runner) (<-chan engine.Event, error) {
+	if runner == nil {
+		return nil, errors.New("command runner is required")
+	}
+	running, err := runner.Start(ctx, command.ExecSpec{Argv: []string{"/bin/fake-agent"}})
+	if err != nil {
+		return nil, err
+	}
+	s.backend.turns <- fakeTurn{Prompt: input.Prompt, Write: input.Write}
+	if stdin := running.Stdin(); stdin != nil {
+		_ = stdin.Close()
+	}
+	if stdout := running.Stdout(); stdout != nil {
+		go func() { _, _ = io.Copy(io.Discard, stdout) }()
+	}
+	if stderr := running.Stderr(); stderr != nil {
+		go func() { _, _ = io.Copy(io.Discard, stderr) }()
+	}
+	go func() {
+		_ = testFinalObservation(ctx, running)
+		close(s.backend.runnerObserved)
+	}()
+	if s.backend.started != nil {
+		s.backend.started <- struct{}{}
+	}
+	return s.backend.eventStream, nil
+}
+
+func (s *admissionLivenessSession) Interrupt(context.Context) error {
+	s.backend.interrupts.Add(1)
+	return nil
 }
 
 type fakeSession struct {
@@ -3115,6 +3211,113 @@ func TestStrictAuthorityResultSurfacesBackendReportedModel(t *testing.T) {
 				t.Fatalf("job.status All=true did not include job %s", job.JobID)
 			}
 		})
+	}
+}
+
+func TestStrictAuthorityStatusSurfacesRuntimeLivenessOnlyWhileRunning(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	clock := &steppedClock{now: base}
+	backend := newAdmissionLivenessBackend("fake")
+	root := shortTempDir(t)
+	cwd := shortTempDir(t)
+	server := newTestServerWithRoot(t, root, cwd, backend, Config{
+		Clock:        clock,
+		ProcessTable: mapProcessTable{entries: map[int]engine.ProcessInfo{os.Getpid(): {PID: os.Getpid(), StartTime: "daemon-start"}}},
+		IdleTimeout:  -1,
+	})
+	releaseRunner := make(chan struct{})
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitAndVerify = releaseRunner
+	enableTestAdmission(t, server, launcher)
+	releaseEvents := sync.OnceFunc(func() { close(backend.eventStream) })
+	t.Cleanup(releaseEvents)
+	releaseRunnerOnce := sync.OnceFunc(func() { close(releaseRunner) })
+	t.Cleanup(releaseRunnerOnce)
+
+	submitted := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-liveness-status",
+		RequestID:    "request-liveness-status",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold for status"},
+	})
+	waitBackendStarted(t, backend.fakeBackend)
+	clock.Set(base.Add(2 * time.Second))
+	select {
+	case backend.eventStream <- engine.Event{Type: engine.EventAgentText, Text: "PASS\n\n## Findings\nNone.\n"}:
+	case <-time.After(5 * time.Second):
+		t.Fatal("admission liveness event was not received")
+	}
+
+	var running protocol.JobStatus
+	var lastRunningStatus protocol.JobStatusResult
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: submitted.JobID})
+		lastRunningStatus = status
+		if len(status.Jobs) == 1 &&
+			status.Jobs[0].State == engine.StateRunning &&
+			status.Jobs[0].StartedAt != nil &&
+			status.Jobs[0].HeartbeatAt != nil &&
+			status.Jobs[0].UpdatedAt != nil &&
+			// Wait until the recorded event has advanced the heartbeat past the
+			// start stamp, so the assertions below deterministically prove event
+			// recording actually ran (not just the first-write start stamp).
+			status.Jobs[0].HeartbeatAt.After(*status.Jobs[0].StartedAt) {
+			running = status.Jobs[0]
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if running.JobID == "" {
+		t.Fatalf("running admission status did not expose liveness; last status = %+v", lastRunningStatus)
+	}
+	// Discriminating exact-time assertions on the stepped clock: startedAt is
+	// stamped at attempt start (base), and the recorded event advanced the
+	// heartbeat to base+2s. If recordJobLivenessEvent were removed or misplaced,
+	// heartbeatAt would stay at base and this would fail.
+	if !running.StartedAt.Equal(base) {
+		t.Fatalf("startedAt = %s, want %s", running.StartedAt, base)
+	}
+	if !running.HeartbeatAt.Equal(base.Add(2 * time.Second)) {
+		t.Fatalf("heartbeatAt = %s, want %s (advanced by the recorded event)", running.HeartbeatAt, base.Add(2*time.Second))
+	}
+	if !running.UpdatedAt.Equal(*running.HeartbeatAt) {
+		t.Fatalf("updatedAt = %s, want heartbeatAt %s", running.UpdatedAt, running.HeartbeatAt)
+	}
+
+	all := jobStatusViaHandler(t, server, protocol.JobStatusParams{All: true})
+	var listed protocol.JobStatus
+	for _, status := range all.Jobs {
+		if status.JobID == submitted.JobID {
+			listed = status
+			break
+		}
+	}
+	if listed.JobID == "" {
+		t.Fatalf("job.status All=true did not include job %s", submitted.JobID)
+	}
+	if listed.State != engine.StateRunning || listed.StartedAt == nil || listed.HeartbeatAt == nil || listed.UpdatedAt == nil {
+		t.Fatalf("job.status All=true liveness = %+v, want running status with liveness", listed)
+	}
+	if listed.HeartbeatAt.Before(*listed.StartedAt) {
+		t.Fatalf("All=true heartbeatAt = %s, want >= startedAt %s", listed.HeartbeatAt, listed.StartedAt)
+	}
+
+	releaseRunnerOnce()
+	select {
+	case <-backend.runnerObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("admission runner observation did not finish")
+	}
+	releaseEvents()
+	waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+	waitActiveJobGone(t, server, submitted.JobID)
+	terminal := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: submitted.JobID})
+	if len(terminal.Jobs) != 1 || terminal.Jobs[0].State != engine.StateCompleted {
+		t.Fatalf("terminal status = %+v, want completed job", terminal)
+	}
+	if terminal.Jobs[0].StartedAt != nil || terminal.Jobs[0].HeartbeatAt != nil || terminal.Jobs[0].UpdatedAt != nil {
+		t.Fatalf("terminal status liveness = %+v, want nil liveness fields after active-job eviction", terminal.Jobs[0])
 	}
 }
 
