@@ -159,6 +159,7 @@ func (r *PolicyRegistry) Resolve(name string) (ContractSpec, string, error) {
 // ResolveContract resolves named contracts and returns the concrete spec to persist.
 // Contract variants are exclusive.
 func ResolveContract(contract ContractSpec, registry *PolicyRegistry) (ContractSpec, string, string, error) {
+	contract = normalizeContractSpec(contract)
 	if err := validateContractVariant(contract); err != nil {
 		return ContractSpec{}, "", "", err
 	}
@@ -191,6 +192,7 @@ func ResolveContract(contract ContractSpec, registry *PolicyRegistry) (ContractS
 // ValidateContract validates text against a concrete contract. Shape contracts
 // are identity-only and do not inspect text.
 func ValidateContract(text string, contract ContractSpec) (ValidationResult, error) {
+	contract = normalizeContractSpec(contract)
 	if err := validateConcreteContract(contract); err != nil {
 		return ValidationResult{}, err
 	}
@@ -301,6 +303,7 @@ func ContractSHA256(contract ContractSpec) (string, error) {
 }
 
 func validateConcreteContract(contract ContractSpec) error {
+	contract = normalizeContractSpec(contract)
 	if err := validateContractVariant(contract); err != nil {
 		return err
 	}
@@ -319,6 +322,20 @@ func validateConcreteContract(contract ContractSpec) error {
 		return errors.New("named contract must be resolved before validation")
 	}
 	return nil
+}
+
+// normalizeContractSpec treats an empty or JSON-null raw variant field as absent.
+// Shape and JSONSchema are json.RawMessage, so a client that serializes an unused
+// optional field as `null` would otherwise decode to non-nil bytes and be counted
+// as an active variant, breaking the "exactly one" exclusivity check.
+func normalizeContractSpec(contract ContractSpec) ContractSpec {
+	if len(contract.JSONSchema) == 0 || bytes.Equal(bytes.TrimSpace(contract.JSONSchema), []byte("null")) {
+		contract.JSONSchema = nil
+	}
+	if len(contract.Shape) == 0 || bytes.Equal(bytes.TrimSpace(contract.Shape), []byte("null")) {
+		contract.Shape = nil
+	}
+	return contract
 }
 
 func validateContractVariant(contract ContractSpec) error {

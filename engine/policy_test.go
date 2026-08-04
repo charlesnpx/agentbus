@@ -487,6 +487,30 @@ func TestResolveContractRejectsMultipleVariants(t *testing.T) {
 	}
 }
 
+func TestContractVariantTreatsJSONNullAsAbsent(t *testing.T) {
+	t.Parallel()
+	// A client that serializes an unused optional variant as `null` must not be
+	// counted as a second active variant now that Shape is json.RawMessage.
+	schema := json.RawMessage(`{"type":"object","required":["status"],"properties":{"status":{"enum":["ok"]}},"additionalProperties":false}`)
+	contract := ContractSpec{JSONSchema: schema, Shape: json.RawMessage(`null`)}
+
+	resolved, _, _, err := ResolveContract(contract, NewPolicyRegistry())
+	if err != nil {
+		t.Fatalf("ResolveContract with shape:null err = %v, want jsonSchema-only success", err)
+	}
+	if resolved.Shape != nil {
+		t.Fatalf("resolved.Shape = %q, want nil", resolved.Shape)
+	}
+
+	// JSON-Schema validation must still apply (not silently treated as identity-only shape).
+	if got, err := ValidateContract(`{"status":"ok"}`, contract); err != nil || !got.Valid {
+		t.Fatalf("valid body: got %+v err %v, want Valid", got, err)
+	}
+	if got, err := ValidateContract(`{"status":"bad"}`, contract); err != nil || got.Valid {
+		t.Fatalf("invalid body: got %+v err %v, want !Valid", got, err)
+	}
+}
+
 func TestPolicyPersistenceFieldsAndStamps(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
