@@ -2388,11 +2388,13 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 	if !ok || errObj != nil {
 		return protocol.JobStatus{}, ok, errObj
 	}
+	reported := s.reportedModel(projection.JobID.String())
 	return protocol.JobStatus{
 		JobID:              projection.JobID.String(),
 		SessionID:          projection.SessionID,
 		State:              admissionState(projection.Public),
 		CleanupDisposition: admissionCleanupDisposition(record),
+		ModelReported:      reported,
 	}, true, nil
 }
 
@@ -2419,6 +2421,7 @@ func (s *Server) listAuthorityStatuses() ([]protocol.JobStatus, *protocol.ErrorO
 				return err
 			}
 			if ok {
+				status.ModelReported = s.reportedModel(status.JobID)
 				statuses = append(statuses, status)
 			}
 		}
@@ -2445,12 +2448,17 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 	if record.Terminal != nil {
 		contract = record.Terminal.Contract
 	}
+	reported := s.reportedModel(projection.JobID.String())
+	if result != nil {
+		result.ModelReported = reported
+	}
 	return protocol.JobResult{
 		JobID:              projection.JobID.String(),
 		SessionID:          projection.SessionID,
 		State:              admissionState(projection.Public),
 		CleanupDisposition: admissionCleanupDisposition(record),
 		Result:             result,
+		ModelReported:      reported,
 		Contract:           contract,
 	}, true, nil
 }

@@ -279,6 +279,8 @@ type Server struct {
 	admissionJobs      map[string]*admissionInstance
 	admissionEffectMu  map[string]*sync.Mutex
 	activeJobs         map[string]*activeJob
+	reportedModels     map[string]string
+	reportedModelOrder []string
 	lastActivity       time.Time
 	executablePath     string
 	executableIdentity BinaryIdentity
@@ -528,6 +530,7 @@ func New(cfg Config) (*Server, error) {
 		admissionRuntimeConfig: cfg.Runtime,
 		admissionProbeRunner:   probeRunner,
 		activeJobs:             make(map[string]*activeJob),
+		reportedModels:         make(map[string]string),
 		lastActivity:           clock.Now().UTC(),
 	}, nil
 }
@@ -2457,6 +2460,10 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			case engine.EventResultMessage:
 				resultText = rawText
 				hasResultMessage = true
+			case engine.EventModelReported:
+				if err := s.recordModelReported(run, event.ModelReported); err != nil {
+					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, err
+				}
 			case engine.EventTerminalError:
 				if rawText == "" {
 					rawText = "backend failed"
@@ -2640,6 +2647,61 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		return err
 	}
 	return nil
+}
+
+func (s *Server) recordModelReported(run jobRun, reported string) error {
+	if strings.TrimSpace(reported) == "" {
+		return nil
+	}
+	if run.admissionControlled {
+		s.rememberReportedModel(run.jobID, reported)
+		return nil
+	}
+	if run.store == nil {
+		return nil
+	}
+	_, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
+		if record.ModelReported == reported {
+			return false, nil
+		}
+		record.ModelReported = reported
+		return true, nil
+	})
+	return err
+}
+
+// maxReportedModels bounds the transient strict reported-model cache. This is
+// best-effort runtime metadata with no durable home: removeActiveJob is too early
+// to evict (the terminal job.result read happens after completion), so entries are
+// retained past completion and capped here with FIFO eviction to prevent unbounded
+// growth on a long-running daemon. The cap comfortably covers the realistic
+// submit->poll->result window for concurrently-tracked jobs.
+const maxReportedModels = 4096
+
+func (s *Server) rememberReportedModel(jobID, reported string) {
+	if strings.TrimSpace(jobID) == "" || strings.TrimSpace(reported) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reportedModels == nil {
+		s.reportedModels = make(map[string]string)
+	}
+	if _, exists := s.reportedModels[jobID]; !exists {
+		if len(s.reportedModelOrder) >= maxReportedModels {
+			oldest := s.reportedModelOrder[0]
+			s.reportedModelOrder = s.reportedModelOrder[1:]
+			delete(s.reportedModels, oldest)
+		}
+		s.reportedModelOrder = append(s.reportedModelOrder, jobID)
+	}
+	s.reportedModels[jobID] = reported
+}
+
+func (s *Server) reportedModel(jobID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reportedModels[jobID]
 }
 
 func canLateFinalize(from, to engine.JobState) bool {
