@@ -1,6 +1,6 @@
 # ADR-1D: Execution command surface boundaries
 
-**Status:** Superseded by [ADR-11](ADR-11-admission-authority.md).
+**Status:** Superseded by [ADR-11](../adr/ADR-11-admission-authority.md).
 
 ## Decision
 

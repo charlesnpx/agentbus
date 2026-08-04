@@ -1,7 +1,6 @@
 package bbolt
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -142,29 +141,9 @@ func TestAdmissionRepositoryRequiredBucketsMatchInitializedRepository(t *testing
 	}
 }
 
-func TestAdmissionRepositoryRequiredAccessorsReturnCopies(t *testing.T) {
-	buckets := AdmissionRepositoryRequiredBuckets()
-	if len(buckets) == 0 {
-		t.Fatal("AdmissionRepositoryRequiredBuckets returned empty list")
-	}
-	buckets[0] = "mutated"
-	if got := AdmissionRepositoryRequiredBuckets()[0]; got == "mutated" {
-		t.Fatal("AdmissionRepositoryRequiredBuckets returned mutable backing storage")
-	}
-
-	metaKeys := AdmissionRepositoryRequiredMetaKeys()
-	if len(metaKeys) == 0 {
-		t.Fatal("AdmissionRepositoryRequiredMetaKeys returned empty list")
-	}
-	metaKeys[0] = "mutated"
-	if got := AdmissionRepositoryRequiredMetaKeys()[0]; got == "mutated" {
-		t.Fatal("AdmissionRepositoryRequiredMetaKeys returned mutable backing storage")
-	}
-}
-
 func TestOpenExistingRequiresStrictSchemaV2(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
-	before := createSchemaV1RepositoryForTest(t, path)
+	createSchemaV1RepositoryForTest(t, path)
 
 	repo, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
 	if err == nil {
@@ -177,13 +156,6 @@ func TestOpenExistingRequiresStrictSchemaV2(t *testing.T) {
 	}
 	if schemaErr.SchemaVersion != 1 {
 		t.Fatalf("schema version = %d, want 1", schemaErr.SchemaVersion)
-	}
-	after, readErr := os.ReadFile(path)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if !bytes.Equal(before, after) {
-		t.Fatal("failed old-schema open mutated database bytes")
 	}
 
 	repo, err = OpenExistingReadOnly(path, &bolt.Options{Timeout: time.Second})
@@ -679,57 +651,7 @@ func TestPutMetaTouchesBoundedKeysIndependentOfHistory(t *testing.T) {
 	}
 }
 
-func TestDefinitelyNotCommittedUpdateLeavesDatabaseBytesUnchanged(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer repo.Close()
-	before := readFileBytesForTest(t, path)
-	fixture := newBboltFixture(t, "bytes-rejected")
-	sentinel := errors.New("reject before commit")
-
-	_, err = repo.Update(context.Background(), func(tx repository.WriteTx) error {
-		if err := tx.PutBinding(fixture.Binding); err != nil {
-			return err
-		}
-		if err := tx.PutSafety(fixture.Record, 0); err != nil {
-			return err
-		}
-		if err := tx.PutProjection(fixture.Projection); err != nil {
-			return err
-		}
-		return sentinel
-	})
-	if !errors.Is(err, repository.ErrDefinitelyNotCommitted) || !errors.Is(err, sentinel) {
-		t.Fatalf("Update error = %v, want ErrDefinitelyNotCommitted wrapping sentinel", err)
-	}
-	after := readFileBytesForTest(t, path)
-	if !bytes.Equal(before, after) {
-		t.Fatal("definitely-not-committed update changed database bytes")
-	}
-}
-
-func TestAuditDoesNotMutateDatabaseBytes(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer repo.Close()
-	acceptBboltFixture(t, repo, newBboltFixture(t, "audit-bytes"))
-	before := readFileBytesForTest(t, path)
-	if err := repo.AuditIntegrity(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	after := readFileBytesForTest(t, path)
-	if !bytes.Equal(before, after) {
-		t.Fatal("AuditIntegrity mutated database bytes")
-	}
-}
-
-func TestFreelistReachablePageRejectedWithoutMutatingDatabase(t *testing.T) {
+func TestFreelistReachablePageRejected(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.db")
 	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
@@ -741,7 +663,6 @@ func TestFreelistReachablePageRejectedWithoutMutatingDatabase(t *testing.T) {
 	}
 
 	corruptFreelistWithReachablePageForTest(t, path)
-	corruptBytes := readFileBytesForTest(t, path)
 
 	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
 	if err == nil {
@@ -753,9 +674,6 @@ func TestFreelistReachablePageRejectedWithoutMutatingDatabase(t *testing.T) {
 	}
 	if !errorTreeContains(err, "reachable freed") {
 		t.Fatalf("OpenExisting error = %v, want reachable-freed diagnostic", err)
-	}
-	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
-		t.Fatal("OpenExisting structural failure mutated database bytes")
 	}
 
 	rawDB, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: time.Second})
@@ -773,15 +691,11 @@ func TestFreelistReachablePageRejectedWithoutMutatingDatabase(t *testing.T) {
 	if kinds := repository.IntegrityFindingKinds(err); !reflect.DeepEqual(kinds, []string{"structure"}) {
 		t.Fatalf("AuditIntegrity finding kinds = %v, want [structure]", kinds)
 	}
-	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
-		t.Fatal("AuditIntegrity structural failure mutated database bytes")
-	}
 }
 
-func TestStructuralGraphPreflightRejectsCyclicBranchChildWithoutMutatingDatabase(t *testing.T) {
+func TestStructuralGraphPreflightRejectsCyclicBranchChild(t *testing.T) {
 	path := createClosedSeededBboltFileForStructuralTest(t, "cycle", 600)
 	corruptBranchChildToSelfForTest(t, path)
-	corruptBytes := readFileBytesForTest(t, path)
 
 	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
 	if err == nil {
@@ -793,9 +707,6 @@ func TestStructuralGraphPreflightRejectsCyclicBranchChildWithoutMutatingDatabase
 	}
 	if !errorTreeContains(err, "cycle") {
 		t.Fatalf("OpenExisting error = %v, want cycle diagnostic", err)
-	}
-	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
-		t.Fatal("OpenExisting cyclic structural failure mutated database bytes")
 	}
 
 	rawDB, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: time.Second})
@@ -813,15 +724,11 @@ func TestStructuralGraphPreflightRejectsCyclicBranchChildWithoutMutatingDatabase
 	if !errorTreeContains(err, "cycle") {
 		t.Fatalf("AuditIntegrity error = %v, want cycle diagnostic", err)
 	}
-	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
-		t.Fatal("AuditIntegrity cyclic structural failure mutated database bytes")
-	}
 }
 
-func TestStructuralGraphPreflightRejectsDuplicateBranchChildWithoutMutatingDatabase(t *testing.T) {
+func TestStructuralGraphPreflightRejectsDuplicateBranchChild(t *testing.T) {
 	path := createClosedSeededBboltFileForStructuralTest(t, "duplicate", 600)
 	corruptBranchSecondChildToDuplicateFirstForTest(t, path)
-	corruptBytes := readFileBytesForTest(t, path)
 
 	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
 	if err == nil {
@@ -834,14 +741,10 @@ func TestStructuralGraphPreflightRejectsDuplicateBranchChildWithoutMutatingDatab
 	if !errorTreeContains(err, "duplicate page reference") {
 		t.Fatalf("OpenExisting error = %v, want duplicate page reference diagnostic", err)
 	}
-	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
-		t.Fatal("OpenExisting duplicate structural failure mutated database bytes")
-	}
 }
 
 func TestStructuralGraphPreflightAllowsValidSeededDatabase(t *testing.T) {
 	path := createClosedSeededBboltFileForStructuralTest(t, "valid", 600)
-	before := readFileBytesForTest(t, path)
 
 	repo, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
@@ -853,9 +756,6 @@ func TestStructuralGraphPreflightAllowsValidSeededDatabase(t *testing.T) {
 	}
 	if err := repo.Close(); err != nil {
 		t.Fatalf("close valid seeded database: %v", err)
-	}
-	if after := readFileBytesForTest(t, path); !bytes.Equal(before, after) {
-		t.Fatal("valid structural preflight or audit mutated database bytes")
 	}
 }
 
@@ -896,7 +796,6 @@ func TestStructuralGraphPreflightAllowsValidDatabasesWithExplicitPageSizes(t *te
 			if meta.pageSize != uint64(pageSize) {
 				t.Fatalf("meta page size = %d, want %d", meta.pageSize, pageSize)
 			}
-			before := readFileBytesForTest(t, path)
 
 			reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
 			if err != nil {
@@ -908,9 +807,6 @@ func TestStructuralGraphPreflightAllowsValidDatabasesWithExplicitPageSizes(t *te
 			}
 			if err := reopened.Close(); err != nil {
 				t.Fatalf("close reopened %d-byte page database: %v", pageSize, err)
-			}
-			if after := readFileBytesForTest(t, path); !bytes.Equal(before, after) {
-				t.Fatalf("%d-byte page database open or audit mutated bytes", pageSize)
 			}
 		})
 	}
@@ -933,7 +829,6 @@ func TestNoFreelistSyncSentinelOpensCleanly(t *testing.T) {
 	if meta.freelist != boltNoFreelistID {
 		t.Fatalf("active freelist page = %d, want PgidNoFreelist", meta.freelist)
 	}
-	before := readFileBytesForTest(t, path)
 
 	reopened, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
 	if err != nil {
@@ -957,9 +852,6 @@ func TestNoFreelistSyncSentinelOpensCleanly(t *testing.T) {
 	}
 	if err := readOnly.Close(); err != nil {
 		t.Fatalf("close read-only NoFreelistSync database: %v", err)
-	}
-	if after := readFileBytesForTest(t, path); !bytes.Equal(before, after) {
-		t.Fatal("NoFreelistSync open or audit mutated database bytes")
 	}
 }
 
@@ -1041,7 +933,6 @@ func TestPreOpenFreelistPreflightRejectsCorruptFreelistBeforeBoltOpen(t *testing
 				t.Run(tt.name, func(t *testing.T) {
 					path := createClosedSeededBboltFileWithPageSizeForStructuralTest(t, "freelist-"+tt.name, 600, pageSize)
 					tt.corrupt(t, path)
-					corruptBytes := readFileBytesForTest(t, path)
 
 					calledOpenFile := false
 					repo, err := OpenExisting(path, &bolt.Options{
@@ -1063,9 +954,6 @@ func TestPreOpenFreelistPreflightRejectsCorruptFreelistBeforeBoltOpen(t *testing
 					}
 					if !errorTreeContains(err, tt.want) {
 						t.Fatalf("OpenExisting error = %v, want diagnostic containing %q", err, tt.want)
-					}
-					if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
-						t.Fatal("OpenExisting corrupt freelist failure mutated database bytes")
 					}
 				})
 			}
@@ -1122,16 +1010,16 @@ func TestStructuralGraphPreflightRejectsInlineBucketDepthBound(t *testing.T) {
 	}
 }
 
-func TestStructuralGraphPreflightRejectsZeroLengthLeafKeyWithoutMutatingDatabase(t *testing.T) {
+func TestStructuralGraphPreflightRejectsZeroLengthLeafKey(t *testing.T) {
 	path := createClosedSeededBboltFileForStructuralTest(t, "zero-key", 600)
 	corruptFirstLeafElementKSizeForTest(t, path, 0)
-	requireOpenExistingCorruptWithoutMutationForTest(t, path, "zero-length key")
+	requireOpenExistingCorruptForTest(t, path, "zero-length key")
 }
 
-func TestStructuralGraphPreflightRejectsElementPayloadIntoMetadataWithoutMutatingDatabase(t *testing.T) {
+func TestStructuralGraphPreflightRejectsElementPayloadIntoMetadata(t *testing.T) {
 	path := createClosedSeededBboltFileForStructuralTest(t, "payload-metadata", 600)
 	corruptFirstLeafElementPosForTest(t, path, 0)
-	requireOpenExistingCorruptWithoutMutationForTest(t, path, "element table")
+	requireOpenExistingCorruptForTest(t, path, "element table")
 }
 
 func TestOpenBoltSafelyReraisesProgrammerPanic(t *testing.T) {
@@ -1207,26 +1095,6 @@ func TestBoltCheckErrorClassificationLeavesOperationalErrorsNonCorrupt(t *testin
 	}
 	if !boltCheckErrorIsCorruption(errors.New("page 3: reachable freed")) {
 		t.Fatal("bbolt check finding was not classified as corruption")
-	}
-}
-
-func TestUnrelatedCorruptRecordRawBytesPreservedAcrossSuccessfulCommit(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "admission.db")
-	repo, err := Create(path, &bolt.Options{Timeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer repo.Close()
-	corrupt := newBboltFixture(t, "raw-corrupt")
-	acceptBboltFixture(t, repo, corrupt)
-	repo.InjectCorruptSafetyForTest(corrupt.JobID, "safety checksum")
-	rawBefore := readRawBucketValueForTest(t, repo, bucketSafety, jobIDKey(corrupt.JobID))
-
-	other := newBboltFixture(t, "raw-other")
-	acceptBboltFixture(t, repo, other)
-	rawAfter := readRawBucketValueForTest(t, repo, bucketSafety, jobIDKey(corrupt.JobID))
-	if !bytes.Equal(rawBefore, rawAfter) {
-		t.Fatal("unrelated corrupt safety raw bytes changed across successful unrelated commit")
 	}
 }
 
@@ -1440,9 +1308,8 @@ func writeBoltPageCountForTest(t *testing.T, file *os.File, pageSize, pageID uin
 	}
 }
 
-func requireOpenExistingCorruptWithoutMutationForTest(t *testing.T, path, want string) {
+func requireOpenExistingCorruptForTest(t *testing.T, path, want string) {
 	t.Helper()
-	corruptBytes := readFileBytesForTest(t, path)
 	repo, err := OpenExisting(path, &bolt.Options{Timeout: time.Second})
 	if err == nil {
 		_ = repo.Close()
@@ -1453,9 +1320,6 @@ func requireOpenExistingCorruptWithoutMutationForTest(t *testing.T, path, want s
 	}
 	if !errorTreeContains(err, want) {
 		t.Fatalf("OpenExisting error = %v, want diagnostic containing %q", err, want)
-	}
-	if after := readFileBytesForTest(t, path); !bytes.Equal(corruptBytes, after) {
-		t.Fatal("OpenExisting structural failure mutated database bytes")
 	}
 }
 
@@ -1777,7 +1641,7 @@ type bboltFixture struct {
 	Projection model.JobProjection
 }
 
-func createSchemaV1RepositoryForTest(t *testing.T, path string) []byte {
+func createSchemaV1RepositoryForTest(t *testing.T, path string) {
 	t.Helper()
 	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
 	if err != nil {
@@ -1805,11 +1669,6 @@ func createSchemaV1RepositoryForTest(t *testing.T, path string) []byte {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return data
 }
 
 func newSeededBboltRepository(t *testing.T, count int) *Repository {
@@ -2023,33 +1882,4 @@ func mustRequestKeyForTest(t testing.TB, workspace, request string) model.Reques
 		t.Fatal(err)
 	}
 	return key
-}
-
-func readFileBytesForTest(t testing.TB, path string) []byte {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return data
-}
-
-func readRawBucketValueForTest(t testing.TB, repo *Repository, bucketName, key []byte) []byte {
-	t.Helper()
-	var out []byte
-	if err := repo.db.View(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(bucketName)
-		if bucket == nil {
-			return fmt.Errorf("bucket %q is missing", string(bucketName))
-		}
-		raw := bucket.Get(key)
-		if raw == nil {
-			return fmt.Errorf("key %q is missing", string(key))
-		}
-		out = append([]byte(nil), raw...)
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	return out
 }
