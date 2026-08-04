@@ -2506,7 +2506,7 @@ func (s *Server) validateAttempt(text string, run jobRun, attempts int, retryUse
 	stamp := engine.StampValidation(attempts, retryUsed, name, result, s.clock.Now().UTC())
 	validation := engine.PolicyValidation{Stamp: &stamp, ResolvedContract: &resolved}
 	if !result.Valid && !retryUsed && run.policy.Retry != nil && run.policy.Retry.Max == 1 {
-		retryPrompt := engine.RenderRetryTemplateForContract(run.policy.Retry.Template, result.Missing, resolved)
+		retryPrompt := engine.RenderRetryTemplate(run.policy.Retry.Template, result.Missing)
 		return validation, retryPrompt, engine.StateCompletedNoncompliant, nil
 	}
 	if result.Valid {
@@ -2525,11 +2525,6 @@ func validateRetryPolicy(retry *engine.RetryPolicy) error {
 	if retry.Max == 1 {
 		if !strings.Contains(retry.Template, "{{missing}}") {
 			return errors.New("retry.template must include {{missing}} when retry.max is 1")
-		}
-		normalized := strings.ToLower(retry.Template)
-		if !strings.Contains(normalized, "emit the corrected report only") ||
-			!strings.Contains(normalized, "make no further changes") {
-			return errors.New("retry.template must instruct the backend to emit the corrected report only and make no further changes when retry.max is 1")
 		}
 	}
 	return nil

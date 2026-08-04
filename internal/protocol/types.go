@@ -143,7 +143,7 @@ func NewError(stableCode, message string, data ErrorData) *ErrorObject {
 
 func DefaultCapabilities() map[string]bool {
 	return map[string]bool{
-		"policy.shape":                  true,
+		"policy.shape":                  false,
 		"policy.jsonSchema":             true,
 		"policy.named":                  true,
 		"policy.retry":                  true,

@@ -32,8 +32,8 @@ func TestTaskIdentityFieldMatrix(t *testing.T) {
 		{name: "tag removal", field: "tags", raw: strings.Replace(base, `"tags":{"priority":"high","suite":"architecture"}`, `"tags":{"suite":"architecture"}`, 1)},
 		{name: "policy prologue", field: "policy", raw: strings.Replace(base, `"prologue":"return receipts"`, `"prologue":"return json"`, 1)},
 		{name: "retry max", field: "policy", raw: strings.Replace(base, `"max":1`, `"max":0`, 1)},
-		{name: "retry template", field: "policy", raw: strings.Replace(base, `"template":"retry with {{missing}}; emit the corrected report only and make no further changes"`, `"template":"retry with evidence"`, 1)},
-		{name: "contract variant", field: "policy", raw: strings.Replace(base, `"contract":{"jsonSchema":{"properties":{"status":{"const":"ok"}},"required":["status"],"type":"object"}}`, `"contract":{"shape":{"requiredSections":["Findings"]}}`, 1)},
+		{name: "retry template", field: "policy", raw: strings.Replace(base, `"template":"retry with {{missing}}"`, `"template":"retry with different {{missing}}"`, 1)},
+		{name: "contract variant", field: "policy", raw: strings.Replace(base, `"contract":{"jsonSchema":{"properties":{"status":{"const":"ok"}},"required":["status"],"type":"object"}}`, `"contract":{"shape":{"delegateContract":"report-v1"}}`, 1)},
 		{name: "contract nested field", field: "policy", raw: strings.Replace(base, `"required":["status"]`, `"required":["status","receipt"]`, 1)},
 		{name: "json schema content", field: "policy", raw: strings.Replace(base, `"const":"ok"`, `"const":"done"`, 1)},
 	}
@@ -214,7 +214,7 @@ func mustTaskIdentity(t *testing.T, raw string) TaskIdentity {
 }
 
 func baseRawTaskSpec() string {
-	return `{"backend":"codex","cwd":"/workspace/a","write":true,"model":"gpt-5","effort":"medium","prompt":"do the work","timeoutMs":30000,"tags":{"priority":"high","suite":"architecture"},"policy":{"prologue":"return receipts","retry":{"max":1,"template":"retry with {{missing}}; emit the corrected report only and make no further changes"},"contract":{"jsonSchema":{"properties":{"status":{"const":"ok"}},"required":["status"],"type":"object"}}}}`
+	return `{"backend":"codex","cwd":"/workspace/a","write":true,"model":"gpt-5","effort":"medium","prompt":"do the work","timeoutMs":30000,"tags":{"priority":"high","suite":"architecture"},"policy":{"prologue":"return receipts","retry":{"max":1,"template":"retry with {{missing}}"},"contract":{"jsonSchema":{"properties":{"status":{"const":"ok"}},"required":["status"],"type":"object"}}}}`
 }
 
 func assertTaskSpecFieldsCovered(t *testing.T, covered map[string]bool, raw string) {

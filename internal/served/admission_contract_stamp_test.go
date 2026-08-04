@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,25 +15,40 @@ import (
 )
 
 func TestAdmissionContractStampRoundTripsToAuthorityResult(t *testing.T) {
+	jsonSchemaContract := &engine.ContractSpec{JSONSchema: json.RawMessage(`{
+		"type":"object",
+		"required":["status"],
+		"properties":{"status":{"const":"pass"}}
+	}`)}
 	cases := []struct {
 		name        string
 		text        string
+		contract    *engine.ContractSpec
 		wantState   engine.JobState
 		wantStatus  engine.ContractStatus
 		wantMissing []string
 	}{
 		{
-			name:       "compliant",
-			text:       "PASS\n",
+			name:       "json-schema-compliant",
+			text:       `{"status":"pass"}`,
+			contract:   jsonSchemaContract,
 			wantState:  engine.StateCompleted,
 			wantStatus: engine.ContractCompliant,
 		},
 		{
-			name:        "noncompliant-missing",
-			text:        "FAIL\n",
+			name:        "json-schema-noncompliant",
+			text:        `{"status":"bad"}`,
+			contract:    jsonSchemaContract,
 			wantState:   engine.StateCompletedNoncompliant,
 			wantStatus:  engine.ContractNoncompliant,
-			wantMissing: []string{"firstLineEnum"},
+			wantMissing: []string{"/status: value must be 'pass'"},
+		},
+		{
+			name:       "shape-identity-only",
+			text:       "FAIL\n",
+			contract:   &engine.ContractSpec{Shape: json.RawMessage(`{"delegateContract":"report-v1"}`)},
+			wantState:  engine.StateCompleted,
+			wantStatus: engine.ContractCompliant,
 		},
 	}
 
@@ -54,7 +70,7 @@ func TestAdmissionContractStampRoundTripsToAuthorityResult(t *testing.T) {
 					Write:   false,
 					Prompt:  "contract stamp",
 					Policy: &engine.TurnPolicy{
-						Contract: &engine.ContractSpec{Shape: &engine.ShapeSpec{FirstLineEnum: []string{"PASS"}}},
+						Contract: tt.contract,
 					},
 				},
 			})
