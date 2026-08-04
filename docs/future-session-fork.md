@@ -1,7 +1,7 @@
 # Deferred feature: session forking (fork_turns-equivalent) for delegated jobs
 
 STATUS: DEFERRED — not scheduled. Do not implement before the AB-D strict-native ledger completes
-(R7B; see `docs/abd-roadmap.md`). Recorded 2026-07-21 so the design intent is not lost.
+(R7B; see `docs/history/abd-roadmap.md`). Recorded 2026-07-21 so the design intent is not lost.
 
 ## What
 
