@@ -1,5 +1,7 @@
 package model
 
+import "github.com/charlesnpx/agentbus/engine"
+
 func DeriveTerminalCertificate(record SafetyRecord, intent TerminalIntent) (TerminalCertificate, error) {
 	if err := ValidateSafetyRecord(record); err != nil {
 		return TerminalCertificate{}, invalidCommand("current safety record is invalid: %v", err)
@@ -14,6 +16,7 @@ func DeriveTerminalCertificate(record SafetyRecord, intent TerminalIntent) (Term
 	if record.Outcome != nil && record.Outcome.Outcome != intent.Outcome {
 		return TerminalCertificate{}, precondition("terminal outcome does not match observed outcome")
 	}
+	contract := terminalContract(record, intent)
 	result, err := terminalResult(record, intent.Outcome)
 	if err != nil {
 		return TerminalCertificate{}, err
@@ -34,8 +37,15 @@ func DeriveTerminalCertificate(record SafetyRecord, intent TerminalIntent) (Term
 		DerivedFromRevision: record.Revision,
 		DerivedBy:           intent.DerivedBy,
 		Result:              result,
-		Contract:            cloneContractStamp(intent.Contract),
+		Contract:            contract,
 	}, nil
+}
+
+func terminalContract(record SafetyRecord, intent TerminalIntent) *engine.ContractStamp {
+	if record.Outcome != nil {
+		return cloneContractStamp(record.Outcome.Contract)
+	}
+	return cloneContractStamp(intent.Contract)
 }
 
 func resolveTerminalIntent(record SafetyRecord, intent TerminalIntent) (TerminalIntent, error) {

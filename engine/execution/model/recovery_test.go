@@ -1,6 +1,11 @@
 package model
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/charlesnpx/agentbus/engine"
+)
 
 func TestDecideGroupRecoveryMatrix(t *testing.T) {
 	ref := reducerGroup(LaunchOrdinalOne)
@@ -191,6 +196,51 @@ func TestDecideGroupRecoveryExplicitUnknownObservationRemainsUnprovable(t *testi
 	}
 }
 
+func TestRecoveryTerminalFromOutcomeFactCarriesContractStamp(t *testing.T) {
+	compliantStamp := &engine.ContractStamp{
+		Status:         engine.ContractCompliant,
+		Missing:        []string{},
+		ContractSHA256: "sha256:compliant",
+		Attempts:       1,
+	}
+	compliant := recoveryFinalizeRecordedCompletion(t, OutcomeCompleted, compliantStamp)
+	if !contractStampEqual(compliant.Terminal.Contract, compliantStamp) {
+		t.Fatalf("compliant terminal contract = %#v, want %#v", compliant.Terminal.Contract, compliantStamp)
+	}
+
+	noncompliantStamp := &engine.ContractStamp{
+		Status:         engine.ContractNoncompliant,
+		Missing:        []string{"Findings"},
+		Reason:         "response missed structural requirements",
+		ContractSHA256: "sha256:noncompliant",
+		Attempts:       1,
+	}
+	noncompliant := recoveryFinalizeRecordedCompletion(t, OutcomeCompletedNoncompliant, noncompliantStamp)
+	if !contractStampEqual(noncompliant.Terminal.Contract, noncompliantStamp) {
+		t.Fatalf("noncompliant terminal contract = %#v, want %#v", noncompliant.Terminal.Contract, noncompliantStamp)
+	}
+}
+
+func TestRecoveryTerminalFromLegacyOutcomeFactHasNilContract(t *testing.T) {
+	record := reducerQuiescentRecord(t)
+	record = reducerMustApply(t, record, ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeCompleted})
+	record = reducerMustApply(t, record, reducerResultCommand(t, record))
+	record = decodeLegacyOutcomeFactWithoutContract(t, record)
+
+	intent, err := RecoveryTerminalIntent(record, RecoveryStartupLoss, true)
+	if err != nil {
+		t.Fatalf("RecoveryTerminalIntent legacy outcome error = %v", err)
+	}
+	if intent.Contract != nil {
+		t.Fatalf("legacy recovery intent contract = %#v, want nil", intent.Contract)
+	}
+
+	finalized := recoveryFinalize(t, record)
+	if finalized.Terminal.Contract != nil {
+		t.Fatalf("legacy terminal contract = %#v, want nil", finalized.Terminal.Contract)
+	}
+}
+
 func expectedGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) GroupRecoveryDecision {
 	observationDomain, err := observation.kernelDomain()
 	if err != nil {
@@ -217,4 +267,73 @@ func expectedGroupRecovery(ref GroupRef, observation GroupRecoveryObservation) G
 
 func noPIDNamespaceDomain(hostBootID string) KernelDomainID {
 	return KernelDomainID{HostBootID: hostBootID, PIDNamespaceState: PIDNamespaceNotApplicable}
+}
+
+func recoveryFinalizeRecordedCompletion(t *testing.T, outcome Outcome, stamp *engine.ContractStamp) SafetyRecord {
+	t.Helper()
+	record := reducerQuiescentRecord(t)
+	record = reducerMustApply(t, record, ObserveOutcome{Ref: reducerRef(), Outcome: outcome, Contract: stamp})
+	record = reducerMustApply(t, record, reducerResultCommand(t, record))
+	if !contractStampEqual(record.Outcome.Contract, stamp) {
+		t.Fatalf("outcome contract = %#v, want %#v", record.Outcome.Contract, stamp)
+	}
+	return recoveryFinalize(t, record)
+}
+
+func recoveryFinalize(t *testing.T, record SafetyRecord) SafetyRecord {
+	t.Helper()
+	plan, err := PlanRecovery(record, RecoveryStartupLoss)
+	if err != nil {
+		t.Fatalf("PlanRecovery error = %v", err)
+	}
+	if plan.Next.Kind != RecoveryFinalizeCertified || plan.Next.Finalize == nil {
+		t.Fatalf("recovery action = %#v, want certified finalize", plan.Next)
+	}
+	if !contractStampEqual(plan.Next.Finalize.Intent.Contract, record.Outcome.Contract) {
+		t.Fatalf("recovery intent contract = %#v, want %#v", plan.Next.Finalize.Intent.Contract, record.Outcome.Contract)
+	}
+	finalized, err := apply(record, *plan.Next.Finalize)
+	if err != nil {
+		t.Fatalf("recovery Finalize error = %v", err)
+	}
+	if finalized.Record.Terminal == nil {
+		t.Fatal("recovery terminal missing")
+	}
+	return finalized.Record
+}
+
+func decodeLegacyOutcomeFactWithoutContract(t *testing.T, record SafetyRecord) SafetyRecord {
+	t.Helper()
+	raw, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal safety record: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal safety record object: %v", err)
+	}
+	var outcome map[string]json.RawMessage
+	if err := json.Unmarshal(fields["Outcome"], &outcome); err != nil {
+		t.Fatalf("unmarshal outcome object: %v", err)
+	}
+	delete(outcome, "Contract")
+	fields["Outcome"], err = json.Marshal(outcome)
+	if err != nil {
+		t.Fatalf("marshal legacy outcome object: %v", err)
+	}
+	raw, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("marshal legacy safety record: %v", err)
+	}
+	var decoded SafetyRecord
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode legacy safety record: %v", err)
+	}
+	if decoded.Outcome == nil || decoded.Outcome.Contract != nil {
+		t.Fatalf("decoded legacy outcome = %#v, want nil contract", decoded.Outcome)
+	}
+	if err := ValidateSafetyRecord(decoded); err != nil {
+		t.Fatalf("legacy safety record failed validation: %v", err)
+	}
+	return decoded
 }

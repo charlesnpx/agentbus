@@ -44,7 +44,7 @@ func (e AlreadyFinalizedError) Is(target error) bool {
 type AdmissionAuthority interface {
 	RecordQuiescence(context.Context, model.JobID, model.LaunchOrdinal, custodian.VerifiedQuiescence) (StepResult, error)
 	RequestCancel(context.Context, model.JobID) (StepResult, error)
-	RecordOutcome(context.Context, model.JobID, model.AttemptRef, model.Outcome) (StepResult, error)
+	RecordOutcome(context.Context, model.JobID, model.AttemptRef, model.Outcome, *engine.ContractStamp) (StepResult, error)
 	RecordResult(context.Context, model.JobID, model.AttemptRef, model.ResultReceipt) (StepResult, error)
 	Finalize(context.Context, model.JobID, model.AttemptRef, model.TerminalIntent) (StepResult, error)
 	Snapshot(context.Context, model.JobID) (JobSnapshot, error)
@@ -111,7 +111,7 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 	if err != nil {
 		return err
 	}
-	if _, err := c.authority.RecordOutcome(ctx, jobID, snapshot.Record.Attempt.Ref, outcome); err != nil {
+	if _, err := c.authority.RecordOutcome(ctx, jobID, snapshot.Record.Attempt.Ref, outcome, contract); err != nil {
 		return c.alreadyFinalizedError(ctx, jobID, err)
 	}
 	if completionOutcome(outcome) {
@@ -127,9 +127,8 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 		return err
 	}
 	_, err = c.authority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, model.TerminalIntent{
-		Outcome:  outcome,
-		Cause:    model.CauseCompletedNormally,
-		Contract: contract,
+		Outcome: outcome,
+		Cause:   model.CauseCompletedNormally,
 	})
 	if err != nil {
 		return c.alreadyFinalizedError(ctx, jobID, err)

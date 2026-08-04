@@ -1279,7 +1279,7 @@ func TestIdentifiedSubmitReplayAfterRestartPreservesRecordedOutcome(t *testing.T
 	if _, err := firstServer.admissionReady.RecordRelease(ctx, record.JobID, ref, model.LaunchOrdinalOne, child, evidence); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := firstServer.admissionReady.RecordOutcome(ctx, record.JobID, ref, model.OutcomeFailed); err != nil {
+	if _, err := firstServer.admissionReady.RecordOutcome(ctx, record.JobID, ref, model.OutcomeFailed, nil); err != nil {
 		t.Fatal(err)
 	}
 	record = loadAdmissionSafetyRecord(t, firstServer, submitted.JobID)
@@ -3095,7 +3095,7 @@ func TestAuthorityResultHidesCertifiedResultUntilTerminalRecord(t *testing.T) {
 	if _, err := server.admissionReady.RecordQuiescence(ctx, jobID, ordinal, verified); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.admissionReady.RecordOutcome(ctx, jobID, ref, model.OutcomeCompleted); err != nil {
+	if _, err := server.admissionReady.RecordOutcome(ctx, jobID, ref, model.OutcomeCompleted, nil); err != nil {
 		t.Fatal(err)
 	}
 	dirSynced, err := model.NewEvidence("dir_synced", "terminal-only result directory fsynced")
@@ -7471,13 +7471,13 @@ func (a *recordingAdmissionAuthority) RequestCancel(ctx context.Context, jobID m
 	return a.servedAdmissionAuthority.RequestCancel(ctx, jobID)
 }
 
-func (a *recordingAdmissionAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) (coordinator.StepResult, error) {
+func (a *recordingAdmissionAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome, contract *engine.ContractStamp) (coordinator.StepResult, error) {
 	if a.beforeRecordOutcome != nil {
 		if err := a.beforeRecordOutcome(ctx, jobID, ref, outcome); err != nil {
 			return coordinator.StepResult{}, err
 		}
 	}
-	return a.servedAdmissionAuthority.RecordOutcome(ctx, jobID, ref, outcome)
+	return a.servedAdmissionAuthority.RecordOutcome(ctx, jobID, ref, outcome, contract)
 }
 
 func (a *recordingAdmissionAuthority) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent) (coordinator.StepResult, error) {

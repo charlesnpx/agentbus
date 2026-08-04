@@ -25,6 +25,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bolt "go.etcd.io/bbolt"
@@ -2909,10 +2910,19 @@ func cloneSafetyRecord(record model.SafetyRecord) model.SafetyRecord {
 	next.Attempt.Launches = cloneLaunchSlots(record.Attempt.Launches)
 	next.Acknowledgement = clonePtr(record.Acknowledgement)
 	next.Cancel = clonePtr(record.Cancel)
-	next.Outcome = clonePtr(record.Outcome)
+	next.Outcome = cloneOutcomeFact(record.Outcome)
 	next.Result = clonePtr(record.Result)
 	next.Terminal = cloneTerminalCertificate(record.Terminal)
 	return next
+}
+
+func cloneOutcomeFact(fact *model.OutcomeFact) *model.OutcomeFact {
+	if fact == nil {
+		return nil
+	}
+	copied := *fact
+	copied.Contract = cloneContractStamp(fact.Contract)
+	return &copied
 }
 
 func cloneTerminalCertificate(certificate *model.TerminalCertificate) *model.TerminalCertificate {
@@ -2921,11 +2931,16 @@ func cloneTerminalCertificate(certificate *model.TerminalCertificate) *model.Ter
 	}
 	copied := *certificate
 	copied.Result = clonePtr(certificate.Result)
-	if certificate.Contract != nil {
-		contract := *certificate.Contract
-		contract.Missing = append([]string(nil), certificate.Contract.Missing...)
-		copied.Contract = &contract
+	copied.Contract = cloneContractStamp(certificate.Contract)
+	return &copied
+}
+
+func cloneContractStamp(stamp *engine.ContractStamp) *engine.ContractStamp {
+	if stamp == nil {
+		return nil
 	}
+	copied := *stamp
+	copied.Missing = append([]string(nil), stamp.Missing...)
 	return &copied
 }
 

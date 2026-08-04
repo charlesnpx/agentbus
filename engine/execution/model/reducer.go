@@ -456,9 +456,9 @@ func applyObserveOutcome(next *SafetyRecord, current SafetyRecord, command Obser
 	if command.Outcome == OutcomeOrphaned {
 		return false, invalidCommand("outcome: orphaned cannot be observed")
 	}
-	fact := OutcomeFact{Attempt: current.Attempt.Ref, Outcome: command.Outcome}
+	fact := OutcomeFact{Attempt: current.Attempt.Ref, Outcome: command.Outcome, Contract: cloneContractStamp(command.Contract)}
 	if current.Outcome != nil {
-		return mergeFact(&next.Outcome, fact, "outcome")
+		return mergeOutcomeFact(&next.Outcome, fact)
 	}
 	if completionOutcome(command.Outcome) && current.Mode != ModeLegacyUnfenced && !hasAnyRelease(current.Attempt) {
 		return false, precondition("completed outcome requires release evidence")
@@ -466,7 +466,7 @@ func applyObserveOutcome(next *SafetyRecord, current SafetyRecord, command Obser
 	if current.Cancel != nil && !hasAnyLaunchEvidence(current.Attempt) && command.Outcome != OutcomeCanceled {
 		return false, precondition("cancel before authorization cannot be rewritten by outcome")
 	}
-	return mergeFact(&next.Outcome, fact, "outcome")
+	return mergeOutcomeFact(&next.Outcome, fact)
 }
 
 func applyCertifyResult(next *SafetyRecord, current SafetyRecord, command CertifyResult) (bool, error) {
@@ -773,6 +773,23 @@ func mergeFact[T comparable](target **T, fact T, label string) (bool, error) {
 	return false, conflict("%s already recorded with different evidence", label)
 }
 
+func mergeOutcomeFact(target **OutcomeFact, fact OutcomeFact) (bool, error) {
+	if *target == nil {
+		*target = cloneOutcomeFact(&fact)
+		return true, nil
+	}
+	if outcomeFactEqual(**target, fact) {
+		return false, nil
+	}
+	return false, conflict("outcome already recorded with different evidence")
+}
+
+func outcomeFactEqual(left, right OutcomeFact) bool {
+	return left.Attempt.Equal(right.Attempt) &&
+		left.Outcome == right.Outcome &&
+		contractStampEqual(left.Contract, right.Contract)
+}
+
 func mergeLaunchSlot[T comparable](slots *LaunchSlots[T], ordinal LaunchOrdinal, fact T, label string) (bool, error) {
 	existing, ok := slots.Get(ordinal)
 	if !ok {
@@ -838,10 +855,19 @@ func cloneSafetyRecord(record SafetyRecord) SafetyRecord {
 	next.Attempt.Launches = cloneLaunchSlots(record.Attempt.Launches)
 	next.Acknowledgement = clonePtr(record.Acknowledgement)
 	next.Cancel = clonePtr(record.Cancel)
-	next.Outcome = clonePtr(record.Outcome)
+	next.Outcome = cloneOutcomeFact(record.Outcome)
 	next.Result = clonePtr(record.Result)
 	next.Terminal = cloneTerminalCertificate(record.Terminal)
 	return next
+}
+
+func cloneOutcomeFact(fact *OutcomeFact) *OutcomeFact {
+	if fact == nil {
+		return nil
+	}
+	copied := *fact
+	copied.Contract = cloneContractStamp(fact.Contract)
+	return &copied
 }
 
 func contractStampEqual(left, right *engine.ContractStamp) bool {

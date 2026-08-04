@@ -310,8 +310,9 @@ func (fact CancelFact) Validate() error {
 }
 
 type OutcomeFact struct {
-	Attempt AttemptRef
-	Outcome Outcome
+	Attempt  AttemptRef
+	Outcome  Outcome
+	Contract *engine.ContractStamp
 }
 
 func (fact OutcomeFact) Validate() error {

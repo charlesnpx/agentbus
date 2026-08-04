@@ -339,6 +339,7 @@ func recoveryTerminalIntent(record SafetyRecord, trigger RecoveryTrigger, absenc
 	if record.Outcome != nil {
 		intent.Outcome = record.Outcome.Outcome
 		intent.Cause = recordedOutcomeRecoveryCause(record.Outcome.Outcome, trigger, afterAuthorization)
+		intent.Contract = cloneContractStamp(record.Outcome.Contract)
 		return intent
 	}
 	if cause, ok := recordedReleaseFailureCause(record); ok {

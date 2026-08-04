@@ -1720,8 +1720,8 @@ func (a *servedAdmissionAuthority) RequestCancel(ctx context.Context, jobID mode
 	return admissionStepResult(applied, err)
 }
 
-func (a *servedAdmissionAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) (coordinator.StepResult, error) {
-	applied, err := a.ready.RecordOutcome(ctx, jobID, ref, outcome)
+func (a *servedAdmissionAuthority) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome, contract *engine.ContractStamp) (coordinator.StepResult, error) {
+	applied, err := a.ready.RecordOutcome(ctx, jobID, ref, outcome, contract)
 	return admissionStepResult(applied, err)
 }
 
@@ -2575,6 +2575,10 @@ func (s *Server) authorityResultInfo(ref model.ResultRef) *engine.ResultInfo {
 		inlineCap = engine.DefaultInlineResultCap
 	}
 	if ref.Bytes >= int64(inlineCap) {
+		stat, err := os.Stat(ref.Path)
+		if err != nil || !stat.Mode().IsRegular() || stat.Size() != ref.Bytes {
+			return info
+		}
 		info.TextElided = true
 		return info
 	}

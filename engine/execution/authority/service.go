@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
@@ -248,8 +249,8 @@ func (r *Ready) RequestCancel(ctx context.Context, jobID model.JobID, options ..
 	return r.apply(ctx, jobID, model.RequestCancel{JobID: jobID}, options...)
 }
 
-func (r *Ready) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome, options ...ApplyOption) (ApplyResult, error) {
-	return r.apply(ctx, jobID, model.ObserveOutcome{Ref: ref, Outcome: outcome}, options...)
+func (r *Ready) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome, contract *engine.ContractStamp, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.ObserveOutcome{Ref: ref, Outcome: outcome, Contract: contract}, options...)
 }
 
 func (r *Ready) RecordResult(ctx context.Context, jobID model.JobID, ref model.AttemptRef, receipt model.ResultReceipt, options ...ApplyOption) (ApplyResult, error) {

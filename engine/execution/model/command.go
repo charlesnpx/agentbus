@@ -59,8 +59,9 @@ type RequestCancel struct {
 }
 
 type ObserveOutcome struct {
-	Ref     AttemptRef
-	Outcome Outcome
+	Ref      AttemptRef
+	Outcome  Outcome
+	Contract *engine.ContractStamp
 }
 
 type CertifyResult struct {

@@ -85,9 +85,28 @@ func TestAuthorityResultInfoSignalsTextElision(t *testing.T) {
 	}
 
 	largeRaw := bytes.Repeat([]byte("x"), engine.DefaultInlineResultCap)
-	large := server.authorityResultInfo(writeAuthorityResultInfoFixture(t, dir, "large.txt", largeRaw))
+	largeRef := writeAuthorityResultInfoFixture(t, dir, "large.txt", largeRaw)
+	large := server.authorityResultInfo(largeRef)
 	if large == nil || large.Text != "" || !large.TextElided {
 		t.Fatalf("large result = %+v, want elided text signal", large)
+	}
+
+	missingRef := writeAuthorityResultInfoFixture(t, dir, "missing.txt", largeRaw)
+	if err := os.Remove(missingRef.Path); err != nil {
+		t.Fatal(err)
+	}
+	missing := server.authorityResultInfo(missingRef)
+	if missing == nil || missing.Text != "" || missing.TextElided {
+		t.Fatalf("missing large result = %+v, want unavailable text without elision", missing)
+	}
+
+	mismatchedRef := writeAuthorityResultInfoFixture(t, dir, "mismatched.txt", largeRaw)
+	if err := os.Truncate(mismatchedRef.Path, mismatchedRef.Bytes-1); err != nil {
+		t.Fatal(err)
+	}
+	mismatched := server.authorityResultInfo(mismatchedRef)
+	if mismatched == nil || mismatched.Text != "" || mismatched.TextElided {
+		t.Fatalf("size-mismatched large result = %+v, want unavailable text without elision", mismatched)
 	}
 }
 
