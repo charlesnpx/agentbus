@@ -709,7 +709,7 @@ func TestValidatePolicyTextHelper(t *testing.T) {
 
 func TestRetryTemplateAndSkippedDisabledStamps(t *testing.T) {
 	t.Parallel()
-	if got := RenderRetryTemplate("missing: {{missing}}", []string{"section:Findings", "evidence"}); got != "missing: Add this top-level heading with its content: # Findings, Findings were claimed without receipts. Add file:line references, commands with exit codes, or output fragments supporting each finding." {
+	if got := RenderRetryTemplate("missing: {{missing}}", []string{"section:Findings", "evidence"}); got != "missing: Add this top-level heading with its content: # Findings, Findings were claimed without accepted evidence. Add an outside-code-fence file:line reference, an outside-code-fence diff hunk line starting @@, or a fenced command block with an exit-code line immediately before or after the fence." {
 		t.Fatalf("rendered = %q", got)
 	}
 	retry := RetryPolicy{Max: 1, Template: correctiveRetryTemplate}
@@ -734,6 +734,7 @@ func TestRetryTemplateAndSkippedDisabledStamps(t *testing.T) {
 
 func TestRenderRetryTemplateTranslatesShapeViolations(t *testing.T) {
 	t.Parallel()
+	contract := ContractSpec{Shape: &ShapeSpec{FirstLineEnum: []string{"PASS", "FAIL"}}}
 	missing := []string{
 		"firstLineEnum",
 		"section:Criteria scored",
@@ -742,13 +743,13 @@ func TestRenderRetryTemplateTranslatesShapeViolations(t *testing.T) {
 		"json: invalid",
 	}
 	want := "missing: " + strings.Join([]string{
-		"Line 1 must be exactly one lowercase word: complete, partial, or blocked — nothing else on the line.",
+		"Line 1 must be exactly one of these values, with nothing else on the line: PASS, FAIL",
 		"Add this top-level heading with its content: # Criteria scored",
 		"Include this exact attestation text outside code fences: I validated the criteria.",
-		"Findings were claimed without receipts. Add file:line references, commands with exit codes, or output fragments supporting each finding.",
+		"Findings were claimed without accepted evidence. Add an outside-code-fence file:line reference, an outside-code-fence diff hunk line starting @@, or a fenced command block with an exit-code line immediately before or after the fence.",
 		"json: invalid",
 	}, ", ")
-	got := RenderRetryTemplate("missing: {{missing}}", missing)
+	got := RenderRetryTemplateForContract("missing: {{missing}}", missing, contract)
 	if got != want {
 		t.Fatalf("rendered = %q, want %q", got, want)
 	}
@@ -756,6 +757,14 @@ func TestRenderRetryTemplateTranslatesShapeViolations(t *testing.T) {
 		if strings.Contains(got, raw) {
 			t.Fatalf("rendered = %q, should not contain raw token %q", got, raw)
 		}
+	}
+	if strings.Contains(got, "complete, partial, or blocked") {
+		t.Fatalf("rendered = %q, should use contract enum instead of delegate-report defaults", got)
+	}
+
+	generic := RenderRetryTemplateForContract("missing: {{missing}}", []string{"firstLineEnum"}, ContractSpec{JSONSchema: json.RawMessage(`{}`)})
+	if !strings.Contains(generic, "complete, partial, or blocked") {
+		t.Fatalf("generic firstLineEnum fallback = %q, want delegate-report fallback wording", generic)
 	}
 
 	largeMissing := make([]string, maxRetryViolationTextBytes)

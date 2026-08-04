@@ -5787,7 +5787,7 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 	backend := newFakeBackend("fake")
 	backend.events = func(string, bool) []engine.Event {
 		if turns.Add(1) == 1 {
-			return []engine.Event{{Type: engine.EventAgentText, Text: "FAIL\n"}}
+			return []engine.Event{{Type: engine.EventAgentText, Text: "NOPE\n"}}
 		}
 		return []engine.Event{{Type: engine.EventAgentText, Text: "PASS\n"}}
 	}
@@ -5805,7 +5805,7 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 			Write:   false,
 			Prompt:  "retry",
 			Policy: &engine.TurnPolicy{
-				Contract: &engine.ContractSpec{Shape: &engine.ShapeSpec{FirstLineEnum: []string{"PASS"}}},
+				Contract: &engine.ContractSpec{Shape: &engine.ShapeSpec{FirstLineEnum: []string{"PASS", "FAIL"}}},
 				Retry: &engine.RetryPolicy{
 					Max:      1,
 					Template: "Your response missed: {{missing}}. Emit the corrected report only; make no further changes.",
@@ -5817,6 +5817,27 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 	var submitted protocol.JobSubmitResult
 	decodeResult(t, resp, &submitted)
 	waitBackendStarts(t, backend, 2)
+	var firstTurn, retryTurn fakeTurn
+	select {
+	case firstTurn = <-backend.turns:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first backend turn was not recorded")
+	}
+	select {
+	case retryTurn = <-backend.turns:
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry backend turn was not recorded")
+	}
+	if firstTurn.Prompt != "retry" {
+		t.Fatalf("first prompt = %q, want original task prompt", firstTurn.Prompt)
+	}
+	wantRetryInstruction := "Line 1 must be exactly one of these values, with nothing else on the line: PASS, FAIL"
+	if !strings.Contains(retryTurn.Prompt, wantRetryInstruction) {
+		t.Fatalf("retry prompt = %q, want instruction %q", retryTurn.Prompt, wantRetryInstruction)
+	}
+	if strings.Contains(retryTurn.Prompt, "complete, partial, or blocked") || strings.Contains(retryTurn.Prompt, "firstLineEnum") {
+		t.Fatalf("retry prompt = %q, want contract enum translation without delegate defaults or raw token", retryTurn.Prompt)
+	}
 	waitAdmissionSafetyTerminal(t, server, submitted.JobID)
 
 	ordinals := launcher.preparedOrdinals()

@@ -2506,7 +2506,7 @@ func (s *Server) validateAttempt(text string, run jobRun, attempts int, retryUse
 	stamp := engine.StampValidation(attempts, retryUsed, name, result, s.clock.Now().UTC())
 	validation := engine.PolicyValidation{Stamp: &stamp, ResolvedContract: &resolved}
 	if !result.Valid && !retryUsed && run.policy.Retry != nil && run.policy.Retry.Max == 1 {
-		retryPrompt := engine.RenderRetryTemplate(run.policy.Retry.Template, result.Missing)
+		retryPrompt := engine.RenderRetryTemplateForContract(run.policy.Retry.Template, result.Missing, resolved)
 		return validation, retryPrompt, engine.StateCompletedNoncompliant, nil
 	}
 	if result.Valid {
