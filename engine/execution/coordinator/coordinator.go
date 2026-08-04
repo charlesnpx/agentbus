@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -99,7 +100,7 @@ func (c *Coordinator) Snapshot(ctx context.Context, jobID model.JobID) (JobSnaps
 	return c.authority.Snapshot(ctx, jobID)
 }
 
-func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome model.Outcome, result []byte, injector *FailureInjector) error {
+func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome model.Outcome, result []byte, contract *engine.ContractStamp, injector *FailureInjector) error {
 	if err := c.ready(); err != nil {
 		return err
 	}
@@ -126,8 +127,9 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 		return err
 	}
 	_, err = c.authority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, model.TerminalIntent{
-		Outcome: outcome,
-		Cause:   model.CauseCompletedNormally,
+		Outcome:  outcome,
+		Cause:    model.CauseCompletedNormally,
+		Contract: contract,
 	})
 	if err != nil {
 		return c.alreadyFinalizedError(ctx, jobID, err)

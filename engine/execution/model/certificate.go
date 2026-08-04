@@ -1,6 +1,10 @@
 package model
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/charlesnpx/agentbus/engine"
+)
 
 type LaunchNonce string
 
@@ -508,6 +512,7 @@ type TerminalCertificate struct {
 	DerivedFromRevision uint64
 	DerivedBy           BootRef
 	Result              *ResultRef
+	Contract            *engine.ContractStamp
 }
 
 func (certificate TerminalCertificate) Validate() error {

@@ -47,6 +47,7 @@ type LogPaths struct {
 // ResultInfo describes the authoritative spilled final result.
 type ResultInfo struct {
 	Text          string `json:"text,omitempty"`
+	TextElided    bool   `json:"textElided,omitempty"`
 	ResultPath    string `json:"resultPath"`
 	SHA256        string `json:"sha256"`
 	Bytes         int64  `json:"bytes"`

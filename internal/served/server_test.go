@@ -895,7 +895,7 @@ func TestCompleteAdmissionRunLogsRecoveryObligationWhenAuthorityCleared(t *testi
 		t.Fatal(err)
 	}
 
-	if err := server.completeAdmissionRun(jobRun{jobID: jobID}, engine.StateCompleted, "done"); err != nil {
+	if err := server.completeAdmissionRun(jobRun{jobID: jobID}, engine.StateCompleted, "done", nil); err != nil {
 		t.Fatal(err)
 	}
 	got := logs.String()
@@ -992,7 +992,7 @@ func TestAdmissionSnapshotCorruptionTripsFailStopDuringCompletion(t *testing.T) 
 			accepted := acceptIdentifiedAuthorityWork(t, server, "snapshot-complete-"+tt.name)
 			tt.corrupt(t, server, accepted.Binding.RequestKey, accepted.Record.JobID)
 
-			err := server.completeAdmissionRun(jobRun{jobID: accepted.Record.JobID.String()}, engine.StateCompleted, "done")
+			err := server.completeAdmissionRun(jobRun{jobID: accepted.Record.JobID.String()}, engine.StateCompleted, "done", nil)
 			requireServedCorruptKind(t, err, tt.kind)
 			if !errors.Is(err, authority.ErrFailStopped) {
 				t.Fatalf("completeAdmissionRun error = %v, want durable fail-stop", err)

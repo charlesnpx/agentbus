@@ -1,5 +1,7 @@
 package model
 
+import "github.com/charlesnpx/agentbus/engine"
+
 type PermitNonce = LaunchNonce
 type QuiescenceReceipt = QuiescenceCertificate
 type ResultReceipt = ResultCertificate
@@ -70,6 +72,7 @@ type TerminalIntent struct {
 	Outcome   Outcome
 	Cause     TerminalCause
 	DerivedBy BootRef
+	Contract  *engine.ContractStamp
 }
 
 type Finalize struct {

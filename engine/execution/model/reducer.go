@@ -3,6 +3,8 @@ package model
 import (
 	"errors"
 	"fmt"
+
+	"github.com/charlesnpx/agentbus/engine"
 )
 
 var (
@@ -826,9 +828,9 @@ func terminalCertificateEqual(left, right TerminalCertificate) bool {
 		return false
 	}
 	if left.Result == nil || right.Result == nil {
-		return left.Result == nil && right.Result == nil
+		return left.Result == nil && right.Result == nil && contractStampEqual(left.Contract, right.Contract)
 	}
-	return *left.Result == *right.Result
+	return *left.Result == *right.Result && contractStampEqual(left.Contract, right.Contract)
 }
 
 func cloneSafetyRecord(record SafetyRecord) SafetyRecord {
@@ -838,8 +840,49 @@ func cloneSafetyRecord(record SafetyRecord) SafetyRecord {
 	next.Cancel = clonePtr(record.Cancel)
 	next.Outcome = clonePtr(record.Outcome)
 	next.Result = clonePtr(record.Result)
-	next.Terminal = clonePtr(record.Terminal)
+	next.Terminal = cloneTerminalCertificate(record.Terminal)
 	return next
+}
+
+func contractStampEqual(left, right *engine.ContractStamp) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	if left.Status != right.Status ||
+		left.Reason != right.Reason ||
+		left.ContractName != right.ContractName ||
+		left.ContractSHA256 != right.ContractSHA256 ||
+		left.Attempts != right.Attempts ||
+		left.RetryUsed != right.RetryUsed ||
+		!left.ValidatedAt.Equal(right.ValidatedAt) ||
+		len(left.Missing) != len(right.Missing) {
+		return false
+	}
+	for i := range left.Missing {
+		if left.Missing[i] != right.Missing[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneTerminalCertificate(certificate *TerminalCertificate) *TerminalCertificate {
+	if certificate == nil {
+		return nil
+	}
+	copied := *certificate
+	copied.Result = clonePtr(certificate.Result)
+	copied.Contract = cloneContractStamp(certificate.Contract)
+	return &copied
+}
+
+func cloneContractStamp(stamp *engine.ContractStamp) *engine.ContractStamp {
+	if stamp == nil {
+		return nil
+	}
+	copied := *stamp
+	copied.Missing = append([]string(nil), stamp.Missing...)
+	return &copied
 }
 
 func cloneLaunchSlots(slots LaunchSlots[LaunchProof]) LaunchSlots[LaunchProof] {

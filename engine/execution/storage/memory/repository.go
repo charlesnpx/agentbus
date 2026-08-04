@@ -1054,8 +1054,22 @@ func cloneSafetyRecord(record model.SafetyRecord) model.SafetyRecord {
 	next.Cancel = clonePtr(record.Cancel)
 	next.Outcome = clonePtr(record.Outcome)
 	next.Result = clonePtr(record.Result)
-	next.Terminal = clonePtr(record.Terminal)
+	next.Terminal = cloneTerminalCertificate(record.Terminal)
 	return next
+}
+
+func cloneTerminalCertificate(certificate *model.TerminalCertificate) *model.TerminalCertificate {
+	if certificate == nil {
+		return nil
+	}
+	copied := *certificate
+	copied.Result = clonePtr(certificate.Result)
+	if certificate.Contract != nil {
+		contract := *certificate.Contract
+		contract.Missing = append([]string(nil), certificate.Contract.Missing...)
+		copied.Contract = &contract
+	}
+	return &copied
 }
 
 func cloneLaunchSlots(slots model.LaunchSlots[model.LaunchProof]) model.LaunchSlots[model.LaunchProof] {

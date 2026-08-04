@@ -473,7 +473,7 @@ func (s *Server) isAdmissionJob(jobID string) bool {
 	return s.admissionJobs[jobID] != nil
 }
 
-func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text string) error {
+func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {
 	jobID, err := model.NewJobID(run.jobID)
 	if err != nil {
 		return err
@@ -517,6 +517,9 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 	if !ok {
 		return fmt.Errorf("cannot complete admission job %s with state %s", run.jobID, state)
 	}
+	if (state == engine.StateCompleted || state == engine.StateCompletedNoncompliant) && text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
+		stamp = skippedStampForRun(run, s.registry, engine.SkipNoFinalMessage)
+	}
 	if intent, ok, err := admissionRecordedReleaseTerminalIntent(snapshot.Record); ok {
 		if err != nil {
 			return err
@@ -529,7 +532,7 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
 		return nil
 	}
-	if err := coord.Complete(context.Background(), jobID, outcome, []byte(text), nil); err != nil {
+	if err := coord.Complete(context.Background(), jobID, outcome, []byte(text), stamp, nil); err != nil {
 		if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
 			return err
 		}

@@ -29,7 +29,7 @@ func TestAuthorityLifecycleCompletesFromLiveLaunchFacts(t *testing.T) {
 	accepted := h.submit(t, ctx, "lifecycle")
 	group := h.bindGrantReleaseQuiescence(t, ctx, accepted, model.LaunchOrdinalOne, model.QuiescenceNaturalExit)
 
-	if err := h.coordinator.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil); err != nil {
+	if err := h.coordinator.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -68,7 +68,7 @@ func TestCompleteWithoutQuiescenceTerminalizesUnresolved(t *testing.T) {
 	accepted := h.submit(t, ctx, "complete-no-certify")
 	h.bindGrantRelease(t, ctx, accepted, model.LaunchOrdinalOne)
 
-	if err := h.coordinator.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil); err != nil {
+	if err := h.coordinator.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if h.containment.contained != 0 || h.containment.retired != 0 {
@@ -608,7 +608,7 @@ func TestCompleteContradictoryOpenOutcomeConflictIsNotReconciledByLaterTerminal(
 		t.Fatal(err)
 	}
 
-	err = coord.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil)
+	err = coord.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("result"), nil, nil)
 	if err == nil {
 		t.Fatal("Complete returned nil for contradictory open outcome")
 	}
@@ -656,7 +656,7 @@ func TestCancelDuringPendingCompletedResultAwaitsSettlementWithoutFailStop(t *te
 	}
 	completeDone := make(chan error, 1)
 	go func() {
-		completeDone <- coord.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("completed-result"), nil)
+		completeDone <- coord.Complete(ctx, accepted.Record.JobID, model.OutcomeCompleted, []byte("completed-result"), nil, nil)
 	}()
 	publishReleased := false
 	defer func() {

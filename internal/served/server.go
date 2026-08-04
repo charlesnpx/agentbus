@@ -2595,7 +2595,7 @@ func (s *Server) failStopAdmissionFinalizationReconcile(jobID string, err error)
 
 func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {
 	if run.admissionControlled {
-		return s.completeAdmissionRun(run, state, text)
+		return s.completeAdmissionRun(run, state, text, stamp)
 	}
 	backendSessionID := ""
 	if run.session != nil {

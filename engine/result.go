@@ -54,6 +54,8 @@ func writeResultFile(path string, raw []byte, inlineCap int) (ResultInfo, error)
 	}
 	if len(raw) < inlineCap {
 		info.Text = string(raw)
+	} else {
+		info.TextElided = true
 	}
 	return info, nil
 }

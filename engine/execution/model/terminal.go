@@ -34,6 +34,7 @@ func DeriveTerminalCertificate(record SafetyRecord, intent TerminalIntent) (Term
 		DerivedFromRevision: record.Revision,
 		DerivedBy:           intent.DerivedBy,
 		Result:              result,
+		Contract:            cloneContractStamp(intent.Contract),
 	}, nil
 }
 
