@@ -253,7 +253,30 @@ func RenderRetryTemplate(template string, missing []string) string {
 	if occurrences == 0 {
 		return template
 	}
-	return strings.ReplaceAll(template, missingToken, boundedViolationText(missing, maxRetryViolationTextBytes/occurrences))
+	return strings.ReplaceAll(template, missingToken, boundedViolationText(translateViolations(missing), maxRetryViolationTextBytes/occurrences))
+}
+
+func translateViolations(codes []string) []string {
+	translated := make([]string, 0, len(codes))
+	for _, code := range codes {
+		translated = append(translated, translateViolation(code))
+	}
+	return translated
+}
+
+func translateViolation(code string) string {
+	switch {
+	case code == "firstLineEnum":
+		return "Line 1 must be exactly one lowercase word: complete, partial, or blocked — nothing else on the line."
+	case strings.HasPrefix(code, "section:"):
+		return "Add this top-level heading with its content: # " + strings.TrimPrefix(code, "section:")
+	case strings.HasPrefix(code, "attestation:"):
+		return "Include this exact attestation text outside code fences: " + strings.TrimPrefix(code, "attestation:")
+	case code == "evidence":
+		return "Findings were claimed without receipts. Add file:line references, commands with exit codes, or output fragments supporting each finding."
+	default:
+		return code
+	}
 }
 
 // StampValidation builds a contract stamp for a completed validation pipeline.

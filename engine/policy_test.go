@@ -709,7 +709,7 @@ func TestValidatePolicyTextHelper(t *testing.T) {
 
 func TestRetryTemplateAndSkippedDisabledStamps(t *testing.T) {
 	t.Parallel()
-	if got := RenderRetryTemplate("missing: {{missing}}", []string{"section:Findings", "evidence"}); got != "missing: section:Findings, evidence" {
+	if got := RenderRetryTemplate("missing: {{missing}}", []string{"section:Findings", "evidence"}); got != "missing: Add this top-level heading with its content: # Findings, Findings were claimed without receipts. Add file:line references, commands with exit codes, or output fragments supporting each finding." {
 		t.Fatalf("rendered = %q", got)
 	}
 	retry := RetryPolicy{Max: 1, Template: correctiveRetryTemplate}
@@ -729,6 +729,45 @@ func TestRetryTemplateAndSkippedDisabledStamps(t *testing.T) {
 	disabled := DisabledContractStamp()
 	if disabled.Status != ContractDisabled || disabled.Attempts != 0 || len(disabled.Missing) != 0 {
 		t.Fatalf("disabled stamp = %#v", disabled)
+	}
+}
+
+func TestRenderRetryTemplateTranslatesShapeViolations(t *testing.T) {
+	t.Parallel()
+	missing := []string{
+		"firstLineEnum",
+		"section:Criteria scored",
+		"attestation:I validated the criteria.",
+		"evidence",
+		"json: invalid",
+	}
+	want := "missing: " + strings.Join([]string{
+		"Line 1 must be exactly one lowercase word: complete, partial, or blocked — nothing else on the line.",
+		"Add this top-level heading with its content: # Criteria scored",
+		"Include this exact attestation text outside code fences: I validated the criteria.",
+		"Findings were claimed without receipts. Add file:line references, commands with exit codes, or output fragments supporting each finding.",
+		"json: invalid",
+	}, ", ")
+	got := RenderRetryTemplate("missing: {{missing}}", missing)
+	if got != want {
+		t.Fatalf("rendered = %q, want %q", got, want)
+	}
+	for _, raw := range []string{"firstLineEnum", "section:"} {
+		if strings.Contains(got, raw) {
+			t.Fatalf("rendered = %q, should not contain raw token %q", got, raw)
+		}
+	}
+
+	largeMissing := make([]string, maxRetryViolationTextBytes)
+	for i := range largeMissing {
+		largeMissing[i] = "firstLineEnum"
+	}
+	capped := RenderRetryTemplate("{{missing}}{{missing}}", largeMissing)
+	if len(capped) > maxRetryViolationTextBytes {
+		t.Fatalf("retry violation text is %d bytes, want at most %d", len(capped), maxRetryViolationTextBytes)
+	}
+	if strings.Contains(capped, "firstLineEnum") {
+		t.Fatalf("capped retry prompt leaked raw firstLineEnum token: %q", capped)
 	}
 }
 
