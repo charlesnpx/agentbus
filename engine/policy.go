@@ -38,16 +38,8 @@ type RetryPolicy struct {
 // ContractSpec is exactly one policy contract variant.
 type ContractSpec struct {
 	JSONSchema json.RawMessage `json:"jsonSchema,omitempty"`
-	Shape      *ShapeSpec      `json:"shape,omitempty"`
+	Shape      json.RawMessage `json:"shape,omitempty"`
 	Named      string          `json:"named,omitempty"`
-}
-
-// ShapeSpec is the protocol v1 shape contract.
-type ShapeSpec struct {
-	FirstLineEnum        []string `json:"firstLineEnum,omitempty"`
-	RequiredSections     []string `json:"requiredSections,omitempty"`
-	RequiredAttestations []string `json:"requiredAttestations,omitempty"`
-	EvidenceHeuristic    bool     `json:"evidenceHeuristic,omitempty"`
 }
 
 // ContractStatus is the contract stamp status enum.
@@ -179,7 +171,7 @@ func ResolveContract(contract ContractSpec, registry *PolicyRegistry) (ContractS
 		return concrete, "", hash, err
 	}
 	if contract.Shape != nil {
-		concrete := ContractSpec{Shape: cloneShapeSpec(contract.Shape)}
+		concrete := ContractSpec{Shape: append(json.RawMessage(nil), contract.Shape...)}
 		if err := validateConcreteContract(concrete); err != nil {
 			return ContractSpec{}, "", "", err
 		}
@@ -196,7 +188,8 @@ func ResolveContract(contract ContractSpec, registry *PolicyRegistry) (ContractS
 	return spec, contract.Named, hash, nil
 }
 
-// ValidateContract validates text against a concrete contract.
+// ValidateContract validates text against a concrete contract. Shape contracts
+// are identity-only and do not inspect text.
 func ValidateContract(text string, contract ContractSpec) (ValidationResult, error) {
 	if err := validateConcreteContract(contract); err != nil {
 		return ValidationResult{}, err
@@ -208,7 +201,7 @@ func ValidateContract(text string, contract ContractSpec) (ValidationResult, err
 	var missing []string
 	switch {
 	case contract.Shape != nil:
-		missing = validateShape(text, *contract.Shape)
+		missing = nil
 	case contract.JSONSchema != nil:
 		missing = validateJSONSchema(text, contract.JSONSchema)
 	default:
@@ -248,56 +241,12 @@ const (
 // RenderRetryTemplate renders the corrective retry template. The substituted
 // violation text is capped so invalid responses cannot inflate a retry prompt.
 func RenderRetryTemplate(template string, missing []string) string {
-	return renderRetryTemplate(template, missing, retryTemplateHints{})
-}
-
-// RenderRetryTemplateForContract renders the corrective retry template with
-// shape-specific guidance when the resolved contract exposes it.
-func RenderRetryTemplateForContract(template string, missing []string, contract ContractSpec) string {
-	hints := retryTemplateHints{}
-	if contract.Shape != nil {
-		hints.firstLineEnum = contract.Shape.FirstLineEnum
-	}
-	return renderRetryTemplate(template, missing, hints)
-}
-
-type retryTemplateHints struct {
-	firstLineEnum []string
-}
-
-func renderRetryTemplate(template string, missing []string, hints retryTemplateHints) string {
 	const missingToken = "{{missing}}"
 	occurrences := strings.Count(template, missingToken)
 	if occurrences == 0 {
 		return template
 	}
-	return strings.ReplaceAll(template, missingToken, boundedViolationText(translateViolations(missing, hints), maxRetryViolationTextBytes/occurrences))
-}
-
-func translateViolations(codes []string, hints retryTemplateHints) []string {
-	translated := make([]string, 0, len(codes))
-	for _, code := range codes {
-		translated = append(translated, translateViolation(code, hints))
-	}
-	return translated
-}
-
-func translateViolation(code string, hints retryTemplateHints) string {
-	switch {
-	case code == "firstLineEnum":
-		if len(hints.firstLineEnum) > 0 {
-			return "Line 1 must be exactly one of these values, with nothing else on the line: " + strings.Join(hints.firstLineEnum, ", ")
-		}
-		return "Line 1 must be exactly one lowercase word: complete, partial, or blocked — nothing else on the line."
-	case strings.HasPrefix(code, "section:"):
-		return "Add this top-level heading with its content: # " + strings.TrimPrefix(code, "section:")
-	case strings.HasPrefix(code, "attestation:"):
-		return "Include this exact attestation text outside code fences: " + strings.TrimPrefix(code, "attestation:")
-	case code == "evidence":
-		return "Findings were claimed without accepted evidence. Add an outside-code-fence file:line reference, an outside-code-fence diff hunk line starting @@, or a fenced command block with an exit-code line immediately before or after the fence."
-	default:
-		return code
-	}
+	return strings.ReplaceAll(template, missingToken, boundedViolationText(missing, maxRetryViolationTextBytes/occurrences))
 }
 
 // StampValidation builds a contract stamp for a completed validation pipeline.
@@ -363,6 +312,9 @@ func validateConcreteContract(contract ContractSpec) error {
 			return fmt.Errorf("jsonSchema must be valid Draft 2020-12 schema: %w", err)
 		}
 	}
+	if contract.Shape != nil && !json.Valid(contract.Shape) {
+		return errors.New("shape must be valid JSON")
+	}
 	if contract.Named != "" {
 		return errors.New("named contract must be resolved before validation")
 	}
@@ -397,11 +349,6 @@ func validateRetryPolicy(retry *RetryPolicy) error {
 		if !strings.Contains(retry.Template, "{{missing}}") {
 			return errors.New("retry.template must include {{missing}} when retry.max is 1")
 		}
-		normalized := strings.ToLower(retry.Template)
-		if !strings.Contains(normalized, "emit the corrected report only") ||
-			!strings.Contains(normalized, "make no further changes") {
-			return errors.New("retry.template must instruct the backend to emit the corrected report only and make no further changes when retry.max is 1")
-		}
 	}
 	return nil
 }
@@ -411,20 +358,10 @@ func cloneContractSpec(spec ContractSpec) ContractSpec {
 	if spec.JSONSchema != nil {
 		clone.JSONSchema = append(json.RawMessage(nil), spec.JSONSchema...)
 	}
-	clone.Shape = cloneShapeSpec(spec.Shape)
+	if spec.Shape != nil {
+		clone.Shape = append(json.RawMessage(nil), spec.Shape...)
+	}
 	return clone
-}
-
-func cloneShapeSpec(spec *ShapeSpec) *ShapeSpec {
-	if spec == nil {
-		return nil
-	}
-	return &ShapeSpec{
-		FirstLineEnum:        append([]string(nil), spec.FirstLineEnum...),
-		RequiredSections:     append([]string(nil), spec.RequiredSections...),
-		RequiredAttestations: append([]string(nil), spec.RequiredAttestations...),
-		EvidenceHeuristic:    spec.EvidenceHeuristic,
-	}
 }
 
 func validatePolicyName(name string) error {
@@ -444,284 +381,6 @@ func validatePolicyName(name string) error {
 		return fmt.Errorf("invalid policy name: %s", name)
 	}
 	return nil
-}
-
-var ansiRE = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
-var findingItemLabelRE = regexp.MustCompile(`(?i)^p[0-9]+$`)
-
-func stripANSI(s string) string {
-	return ansiRE.ReplaceAllString(s, "")
-}
-
-func validateShape(text string, spec ShapeSpec) []string {
-	raw := stripANSI(text)
-	var missing []string
-	if len(spec.FirstLineEnum) > 0 {
-		first := firstLine(raw)
-		found := false
-		for _, allowed := range spec.FirstLineEnum {
-			if first == allowed {
-				found = true
-				break
-			}
-		}
-		if !found {
-			missing = append(missing, "firstLineEnum")
-		}
-	}
-
-	outside := outsideFences(raw)
-	for _, section := range spec.RequiredSections {
-		if !hasSection(outside, section) {
-			missing = append(missing, "section:"+section)
-		}
-	}
-	for _, attestation := range spec.RequiredAttestations {
-		if !strings.Contains(outside, attestation) {
-			missing = append(missing, "attestation:"+attestation)
-		}
-	}
-	if spec.EvidenceHeuristic && claimsFindings(outside) && !hasEvidence(raw, outside) {
-		missing = append(missing, "evidence")
-	}
-	return missing
-}
-
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		line := s[:i]
-		return strings.TrimSuffix(line, "\r")
-	}
-	return strings.TrimSuffix(s, "\r")
-}
-
-func outsideFences(raw string) string {
-	lines := splitLines(raw)
-	var b strings.Builder
-	var fence *fenceMarker
-	for _, line := range lines {
-		if fence != nil {
-			if isClosingFence(line, *fence) {
-				fence = nil
-			}
-			continue
-		}
-		if marker, ok := openingFence(line); ok {
-			fence = &marker
-			continue
-		}
-		b.WriteString(line)
-		b.WriteByte('\n')
-	}
-	return b.String()
-}
-
-func splitLines(s string) []string {
-	s = strings.ReplaceAll(s, "\r\n", "\n")
-	s = strings.ReplaceAll(s, "\r", "\n")
-	return strings.Split(s, "\n")
-}
-
-type fenceMarker struct {
-	char byte
-	run  int
-}
-
-func openingFence(line string) (fenceMarker, bool) {
-	spaces := 0
-	for spaces < len(line) && line[spaces] == ' ' {
-		spaces++
-	}
-	if spaces > 3 {
-		return fenceMarker{}, false
-	}
-	line = line[spaces:]
-	if len(line) < 3 || (line[0] != '`' && line[0] != '~') {
-		return fenceMarker{}, false
-	}
-	run := fenceRun(line, line[0])
-	if run < 3 {
-		return fenceMarker{}, false
-	}
-	return fenceMarker{char: line[0], run: run}, true
-}
-
-func isClosingFence(line string, opener fenceMarker) bool {
-	spaces := 0
-	for spaces < len(line) && line[spaces] == ' ' {
-		spaces++
-	}
-	if spaces > 3 {
-		return false
-	}
-	line = line[spaces:]
-	run := fenceRun(line, opener.char)
-	if run < opener.run {
-		return false
-	}
-	return strings.TrimSpace(line[run:]) == ""
-}
-
-func fenceRun(line string, char byte) int {
-	run := 0
-	for run < len(line) && line[run] == char {
-		run++
-	}
-	return run
-}
-
-type sectionMarker struct {
-	index int
-	name  string
-	rest  string
-}
-
-func hasSection(outside string, section string) bool {
-	want := strings.ToLower(strings.TrimSpace(section))
-	for _, marker := range sectionMarkers(outside) {
-		if strings.ToLower(strings.TrimSpace(marker.name)) == want {
-			return true
-		}
-	}
-	return false
-}
-
-func sectionMarkers(outside string) []sectionMarker {
-	lines := splitLines(outside)
-	markers := make([]sectionMarker, 0)
-	for i, line := range lines {
-		if name, ok := headingName(line); ok {
-			markers = append(markers, sectionMarker{index: i, name: name})
-			continue
-		}
-		if name, rest, ok := labelName(line); ok {
-			markers = append(markers, sectionMarker{index: i, name: name, rest: rest})
-		}
-	}
-	return markers
-}
-
-func headingName(line string) (string, bool) {
-	n := 0
-	for n < len(line) && line[n] == '#' {
-		n++
-	}
-	if n == 0 || n > 4 || len(line) == n || (line[n] != ' ' && line[n] != '\t') {
-		return "", false
-	}
-	name := strings.TrimSpace(line[n:])
-	name = strings.TrimSpace(strings.TrimRight(name, "#"))
-	return name, name != ""
-}
-
-func labelName(line string) (string, string, bool) {
-	if len(line) == 0 || line[0] == ' ' || line[0] == '\t' {
-		return "", "", false
-	}
-	i := strings.IndexByte(line, ':')
-	if i <= 0 {
-		return "", "", false
-	}
-	name := strings.TrimSpace(line[:i])
-	if name == "" {
-		return "", "", false
-	}
-	return name, strings.TrimSpace(line[i+1:]), true
-}
-
-func claimsFindings(outside string) bool {
-	lines := splitLines(outside)
-	markers := sectionMarkers(outside)
-	for mi, marker := range markers {
-		if !strings.EqualFold(strings.TrimSpace(marker.name), "Findings") {
-			continue
-		}
-		body := []string{}
-		if marker.rest != "" {
-			body = append(body, marker.rest)
-		}
-		end := findingsBodyEnd(lines, markers, mi)
-		if marker.index+1 < end {
-			body = append(body, lines[marker.index+1:end]...)
-		}
-		for _, line := range body {
-			normalized := strings.ToLower(strings.TrimSpace(line))
-			if normalized == "" || normalized == "none" || normalized == "no findings" || normalized == "n/a" || normalized == "not applicable" {
-				continue
-			}
-			return true
-		}
-		return false
-	}
-	return false
-}
-
-func findingsBodyEnd(lines []string, markers []sectionMarker, markerIndex int) int {
-	for i := markerIndex + 1; i < len(markers); i++ {
-		marker := markers[i]
-		if _, ok := headingName(lines[marker.index]); ok {
-			return marker.index
-		}
-		if marker.rest == "" && !isFindingItemLabel(marker.name) {
-			return marker.index
-		}
-	}
-	return len(lines)
-}
-
-func isFindingItemLabel(name string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(name))
-	if normalized == "" {
-		return false
-	}
-	if findingItemLabelRE.MatchString(normalized) {
-		return true
-	}
-	switch normalized {
-	case "critical", "high", "medium", "low", "info", "informational":
-		return true
-	default:
-		return false
-	}
-}
-
-var (
-	pathLineRE = regexp.MustCompile(`(?:^|[[:space:]])[^[:space:]:]+:\d+(?:$|[[:space:].,;)])`)
-	exitCodeRE = regexp.MustCompile(`(?i)\bexit(?:\s+code)?\s+\d+\b`)
-	diffHunkRE = regexp.MustCompile(`(?m)^@@\s`)
-)
-
-func hasEvidence(raw, outside string) bool {
-	if pathLineRE.MatchString(outside) || diffHunkRE.MatchString(outside) {
-		return true
-	}
-	lines := splitLines(raw)
-	for i := 0; i < len(lines); i++ {
-		marker, ok := openingFence(lines[i])
-		if !ok {
-			continue
-		}
-		start := i
-		i++
-		for i < len(lines) && !isClosingFence(lines[i], marker) {
-			i++
-		}
-		if i >= len(lines) {
-			break
-		}
-		before := ""
-		after := ""
-		if start > 0 {
-			before = lines[start-1]
-		}
-		if i+1 < len(lines) {
-			after = lines[i+1]
-		}
-		if exitCodeRE.MatchString(before) || exitCodeRE.MatchString(after) {
-			return true
-		}
-	}
-	return false
 }
 
 func canonicalJSON(v any) ([]byte, error) {

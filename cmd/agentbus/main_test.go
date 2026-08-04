@@ -626,13 +626,14 @@ func TestSessionsCommandIsUnknown(t *testing.T) {
 func TestValidateContractFilesAndRegisteredNames(t *testing.T) {
 	t.Parallel()
 	a := testApp(t)
-	spec := engine.ContractSpec{Shape: &engine.ShapeSpec{
-		FirstLineEnum:    []string{"PASS"},
-		RequiredSections: []string{"Findings"},
-	}}
+	spec := engine.ContractSpec{JSONSchema: json.RawMessage(`{
+		"type":"object",
+		"required":["status"],
+		"properties":{"status":{"const":"ok"}}
+	}`)}
 	contractPath := writeJSONFile(t, t.TempDir(), "contract.json", spec)
 	textPath := filepath.Join(t.TempDir(), "result.txt")
-	if err := os.WriteFile(textPath, []byte("PASS\n\n## Findings\nNone.\n"), 0o600); err != nil {
+	if err := os.WriteFile(textPath, []byte(`{"status":"ok"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -660,7 +661,7 @@ func TestValidateContractFilesAndRegisteredNames(t *testing.T) {
 	}
 
 	badPath := filepath.Join(t.TempDir(), "bad.txt")
-	if err := os.WriteFile(badPath, []byte("FAIL\n"), 0o600); err != nil {
+	if err := os.WriteFile(badPath, []byte(`{"status":"bad"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	code, stdout, stderr = runTestCLI(t, a, []string{"validate", "--contract", contractPath, "--text-file", badPath, "--json"}, "")

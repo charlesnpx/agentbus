@@ -238,16 +238,17 @@ Params:
     "policy": {
       "prologue": "Optional text prepended to the backend prompt.",
       "contract": {
-        "shape": {
-          "firstLineEnum": ["PASS", "FAIL"],
-          "requiredSections": ["Findings", "Tests"],
-          "requiredAttestations": ["I inspected the diff."],
-          "evidenceHeuristic": true
+        "jsonSchema": {
+          "type": "object",
+          "required": ["status"],
+          "properties": {
+            "status": {"const": "ok"}
+          }
         }
       },
       "retry": {
         "max": 1,
-        "template": "Your response missed: {{missing}}. Emit the corrected report only; make no further changes."
+        "template": "Your response missed: {{missing}}."
       }
     },
     "tags": {
@@ -288,12 +289,11 @@ decode after replay lookup.
 | Contract field | Meaning |
 | --- | --- |
 | `jsonSchema` | JSON Schema used to validate final text as JSON. |
-| `shape` | Built-in shape contract with `firstLineEnum`, `requiredSections`, `requiredAttestations`, and `evidenceHeuristic`. |
+| `shape` | Opaque client-owned contract identity. Agentbus records and stamps the digest but does not validate markdown shape. |
 | `named` | Name registered with `policy.register`. |
 
 If `policy.retry.max` is `1`, `policy.retry.template` must include
-`{{missing}}` and must instruct the backend to emit the corrected report only
-and make no further changes. Other non-zero retry counts are invalid.
+`{{missing}}`. Other non-zero retry counts are invalid.
 
 Result:
 
@@ -565,10 +565,14 @@ Launcher, startup, and local shutdown failures use a separate classification:
 
 ```json
 {
-  "text": "## Findings\nNo issues found.",
+  "text": "{\"status\":\"ok\"}",
   "contract": {
-    "shape": {
-      "requiredSections": ["Findings"]
+    "jsonSchema": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {"const": "ok"}
+      }
     }
   }
 }
@@ -588,17 +592,21 @@ Invalid result example:
 
 ```json
 {
-  "text": "candidate output",
+  "text": "{\"status\":\"bad\"}",
   "contract": {
-    "shape": {
-      "requiredSections": ["Findings"]
+    "jsonSchema": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {"const": "ok"}
+      }
     }
   }
 }
 ```
 
 ```json
-{"valid":false,"missing":["section:Findings"],"contractSha256":"sha256:<elided>"}
+{"valid":false,"missing":["/status: value must be 'ok'"],"contractSha256":"sha256:<elided>"}
 ```
 
 `policy.register` params:
@@ -608,7 +616,7 @@ Invalid result example:
   "name": "delegate/delegate-report@1",
   "spec": {
     "shape": {
-      "requiredSections": ["Findings"]
+      "delegateContract": "report-v1"
     }
   }
 }
@@ -718,7 +726,7 @@ Request:
 Response:
 
 ```json
-{"jsonrpc":"2.0","id":"hello","result":{"protocolVersion":2,"backends":["codex"],"backendMetadata":[{"backend":"codex","models":["gpt-5"],"efforts":["low","medium","high"]}],"capabilities":{"policy.shape":true,"policy.jsonSchema":true,"policy.named":true,"policy.retry":true,"nativeStructuredOutput.codex":false,"nativeStructuredOutput.claude":false,"models.discovery":true,"models.reported":true,"admission.strictContainment":true}}}
+{"jsonrpc":"2.0","id":"hello","result":{"protocolVersion":2,"backends":["codex"],"backendMetadata":[{"backend":"codex","models":["gpt-5"],"efforts":["low","medium","high"]}],"capabilities":{"policy.shape":false,"policy.jsonSchema":true,"policy.named":true,"policy.retry":true,"nativeStructuredOutput.codex":false,"nativeStructuredOutput.claude":false,"models.discovery":true,"models.reported":true,"admission.strictContainment":true}}}
 ```
 
 ### Submit accept

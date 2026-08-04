@@ -15,6 +15,9 @@ func TestDefaultCapabilitiesAndStructuredError(t *testing.T) {
 			t.Fatalf("missing capability %s in %+v", name, caps)
 		}
 	}
+	if caps["policy.shape"] {
+		t.Fatalf("policy.shape advertised as enabled: %+v", caps)
+	}
 	if _, ok := caps["jobs.requestId"]; ok {
 		t.Fatalf("jobs.requestId capability is advertised: %+v", caps)
 	}

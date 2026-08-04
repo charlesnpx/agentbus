@@ -12,159 +12,17 @@ import (
 	"unicode/utf8"
 )
 
-const correctiveRetryTemplate = "Your response missed: {{missing}}. Emit the corrected report only; make no further changes."
+const correctiveRetryTemplate = "Your response missed: {{missing}}."
 
-func TestShapeContracts(t *testing.T) {
+func TestShapeContractsAreIdentityOnly(t *testing.T) {
 	t.Parallel()
-	contract := ContractSpec{Shape: &ShapeSpec{
-		FirstLineEnum:        []string{"PASS", "FAIL"},
-		RequiredSections:     []string{"Findings", "Tests"},
-		RequiredAttestations: []string{"I inspected the diff."},
-	}}
-	tests := []struct {
-		name        string
-		text        string
-		wantMissing string
-	}{
-		{
-			name: "compliant headings",
-			text: "PASS\n\n## Findings\n\n## Tests\n\nI inspected the diff.",
-		},
-		{
-			name: "case insensitive labels and ansi stripped",
-			text: "\x1b[32mPASS\x1b[0m\nfindings:\nTests:\nI inspected the diff.",
-		},
-		{
-			name:        "first line exact no trim",
-			text:        " PASS\n\n## Findings\n## Tests\nI inspected the diff.",
-			wantMissing: "firstLineEnum",
-		},
-		{
-			name:        "missing findings",
-			text:        "PASS\n\n## Tests\nI inspected the diff.",
-			wantMissing: "section:Findings",
-		},
-		{
-			name:        "missing tests",
-			text:        "PASS\n\n## Findings\nI inspected the diff.",
-			wantMissing: "section:Tests",
-		},
-		{
-			name:        "missing attestation",
-			text:        "PASS\n\n## Findings\n\n## Tests\n",
-			wantMissing: "attestation:I inspected the diff.",
-		},
-		{
-			name:        "fenced sections and attestations excluded",
-			text:        "PASS\n```md\n## Findings\n## Tests\nI inspected the diff.\n```\n",
-			wantMissing: "section:Findings",
-		},
-		{
-			name:        "indented tilde fenced sections and attestations excluded",
-			text:        "PASS\n   ~~~md\n## Findings\n## Tests\nI inspected the diff.\n   ~~~\n",
-			wantMissing: "section:Findings",
-		},
-		{
-			name:        "backtick fence not closed by tilde fence",
-			text:        "PASS\n```md\n~~~\n## Findings\n## Tests\nI inspected the diff.\n```\n",
-			wantMissing: "section:Findings",
-		},
-		{
-			name:        "long backtick fence not closed by shorter run",
-			text:        "PASS\n````md\n```\n## Findings\n## Tests\nI inspected the diff.\n````\n",
-			wantMissing: "section:Findings",
-		},
-		{
-			name:        "tilde fence not closed by backtick fence",
-			text:        "PASS\n~~~md\n```\n## Findings\n## Tests\nI inspected the diff.\n~~~\n",
-			wantMissing: "section:Findings",
-		},
-		{
-			name: "duplicates allowed first wins empty section satisfies",
-			text: "PASS\nFindings:\nfindings: later\nTests:\nI inspected the diff.",
-		},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got, err := ValidateContract(tt.text, contract)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if tt.wantMissing == "" && !got.Valid {
-				t.Fatalf("valid = false, missing = %v", got.Missing)
-			}
-			if tt.wantMissing != "" && !contains(got.Missing, tt.wantMissing) {
-				t.Fatalf("missing = %v, want %q", got.Missing, tt.wantMissing)
-			}
-		})
-	}
-}
-
-func TestShapeEvidenceHeuristic(t *testing.T) {
-	t.Parallel()
-	contract := ContractSpec{Shape: &ShapeSpec{RequiredSections: []string{"Findings"}, EvidenceHeuristic: true}}
-	tests := []struct {
-		name  string
-		text  string
-		valid bool
-	}{
-		{name: "no findings does not require evidence", text: "Findings:\nNo findings", valid: true},
-		{name: "not applicable does not require evidence", text: "## Findings\nnot applicable", valid: true},
-		{name: "path line evidence", text: "Findings:\nBug in engine/run.go:42", valid: true},
-		{name: "diff hunk evidence", text: "Findings:\nRegression observed\n@@ -1,2 +1,2 @@", valid: true},
-		{name: "priority label finding without evidence", text: "Findings:\nP1: missing validation", valid: false},
-		{name: "fenced command adjacent exit evidence before", text: "Findings:\nIt failed\nexit code 1\n```sh\ngo test ./...\n```", valid: true},
-		{name: "fenced command adjacent exit evidence after", text: "Findings:\nIt failed\n```sh\ngo test ./...\n```\nexit 1", valid: true},
-		{name: "fenced command evidence inside backtick fence not closed by tilde run", text: "Findings:\nIt failed\n```md\nexit code 1\n~~~sh\ngo test ./...\n~~~\n```", valid: false},
-		{name: "fenced command evidence inside longer backtick fence not closed by shorter run", text: "Findings:\nIt failed\n````md\nexit code 1\n```sh\ngo test ./...\n```\n````", valid: false},
-		{name: "properly closed fence followed by command exit evidence", text: "Findings:\nIt failed\n```md\nexample transcript\n```\nexit code 1\n```sh\ngo test ./...\n```", valid: true},
-		{name: "fenced path line excluded", text: "Findings:\nIt failed\n```\nengine/run.go:42\n```", valid: false},
-		{name: "claimed finding without evidence", text: "Findings:\nThere is a real issue", valid: false},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got, err := ValidateContract(tt.text, contract)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got.Valid != tt.valid {
-				t.Fatalf("valid = %v, missing = %v, want %v", got.Valid, got.Missing, tt.valid)
-			}
-		})
-	}
-}
-
-func TestShapeEvidenceFencedFindingsDoNotTrigger(t *testing.T) {
-	t.Parallel()
-	contract := ContractSpec{Shape: &ShapeSpec{EvidenceHeuristic: true}}
-	got, err := ValidateContract("```\nFindings:\nThere is a real issue\n```", contract)
+	contract := ContractSpec{Shape: json.RawMessage(`{"delegateContract":"report-v1"}`)}
+	got, err := ValidateContract("any final text", contract)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Valid {
-		t.Fatalf("valid = false, missing = %v", got.Missing)
-	}
-}
-
-func TestShapeIndentedFencesExcludeSectionsAttestationsAndEvidence(t *testing.T) {
-	t.Parallel()
-	contract := ContractSpec{Shape: &ShapeSpec{
-		RequiredSections:     []string{"Findings"},
-		RequiredAttestations: []string{"I inspected the diff."},
-		EvidenceHeuristic:    true,
-	}}
-	got, err := ValidateContract("   ```md\n## Findings\nI inspected the diff.\nengine/policy.go:461\n   ```\nFindings:\nThere is a real issue", contract)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"attestation:I inspected the diff.", "evidence"} {
-		if !contains(got.Missing, want) {
-			t.Fatalf("missing = %v, want %q", got.Missing, want)
-		}
+	if !got.Valid || len(got.Missing) != 0 || got.ContractSHA256 == "" {
+		t.Fatalf("shape contract should be identity-only pass-through, got %+v", got)
 	}
 }
 
@@ -563,7 +421,7 @@ func TestJSONSchemaDraft202012Features(t *testing.T) {
 func TestPolicyRegistry(t *testing.T) {
 	t.Parallel()
 	registry := NewPolicyRegistry()
-	spec := ContractSpec{Shape: &ShapeSpec{RequiredSections: []string{"Findings"}}}
+	spec := ContractSpec{Shape: json.RawMessage(`{"delegateContract":"report-v1"}`)}
 	hash, err := registry.Register("delegate/delegate-report@1", spec)
 	if err != nil {
 		t.Fatal(err)
@@ -575,7 +433,7 @@ func TestPolicyRegistry(t *testing.T) {
 	if hash != hash2 {
 		t.Fatalf("idempotent hash = %q, want %q", hash2, hash)
 	}
-	_, err = registry.Register("delegate/delegate-report@1", ContractSpec{Shape: &ShapeSpec{RequiredSections: []string{"Tests"}}})
+	_, err = registry.Register("delegate/delegate-report@1", ContractSpec{Shape: json.RawMessage(`{"delegateContract":"report-v2"}`)})
 	var conflict NameConflictError
 	if !errors.As(err, &conflict) {
 		t.Fatalf("conflict err = %v", err)
@@ -592,33 +450,34 @@ func TestPolicyRegistry(t *testing.T) {
 func TestPolicyRegistryDefensiveCopies(t *testing.T) {
 	t.Parallel()
 	registry := NewPolicyRegistry()
-	spec := ContractSpec{Shape: &ShapeSpec{RequiredSections: []string{"Findings"}}}
+	const shapeSpec = `{"delegateContract":"report-v1"}`
+	spec := ContractSpec{Shape: json.RawMessage(shapeSpec)}
 	hash, err := registry.Register("delegate/delegate-report@1", spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	spec.Shape.RequiredSections[0] = "MutatedAfterRegister"
+	spec.Shape[len(`{"delegateContract":"`)] = 'm'
 	resolved, resolvedHash, err := registry.Resolve("delegate/delegate-report@1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolvedHash != hash || resolved.Shape.RequiredSections[0] != "Findings" {
-		t.Fatalf("resolved = %#v hash=%q, want immutable Findings hash=%q", resolved, resolvedHash, hash)
+	if resolvedHash != hash || string(resolved.Shape) != shapeSpec {
+		t.Fatalf("resolved = %#v hash=%q, want immutable shape hash=%q", resolved, resolvedHash, hash)
 	}
-	resolved.Shape.RequiredSections[0] = "MutatedAfterResolve"
+	resolved.Shape[len(`{"delegateContract":"`)] = 'm'
 	resolvedAgain, resolvedAgainHash, err := registry.Resolve("delegate/delegate-report@1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolvedAgainHash != hash || resolvedAgain.Shape.RequiredSections[0] != "Findings" {
-		t.Fatalf("resolved again = %#v hash=%q, want immutable Findings hash=%q", resolvedAgain, resolvedAgainHash, hash)
+	if resolvedAgainHash != hash || string(resolvedAgain.Shape) != shapeSpec {
+		t.Fatalf("resolved again = %#v hash=%q, want immutable shape hash=%q", resolvedAgain, resolvedAgainHash, hash)
 	}
 }
 
 func TestResolveContractRejectsMultipleVariants(t *testing.T) {
 	t.Parallel()
 	registry := NewPolicyRegistry()
-	spec := ContractSpec{Shape: &ShapeSpec{RequiredSections: []string{"Findings"}}}
+	spec := ContractSpec{Shape: json.RawMessage(`{"delegateContract":"report-v1"}`)}
 	if _, err := registry.Register("delegate/delegate-report@1", spec); err != nil {
 		t.Fatal(err)
 	}
@@ -632,8 +491,8 @@ func TestPolicyPersistenceFieldsAndStamps(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	store := newTestStore(t, now, fakeProcessTable{entries: map[int]ProcessInfo{}})
-	spec := ContractSpec{Shape: &ShapeSpec{RequiredSections: []string{"Findings"}}}
-	result, err := ValidateContract("## Findings\nNone", spec)
+	spec := ContractSpec{Shape: json.RawMessage(`{"delegateContract":"report-v1"}`)}
+	result, err := ValidateContract("any final text", spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,11 +526,11 @@ func TestValidatePolicyTextHelper(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	registry := NewPolicyRegistry()
-	spec := ContractSpec{Shape: &ShapeSpec{RequiredSections: []string{"Findings"}}}
+	spec := ContractSpec{Shape: json.RawMessage(`{"delegateContract":"report-v1"}`)}
 	if _, err := registry.Register("delegate/delegate-report@1", spec); err != nil {
 		t.Fatal(err)
 	}
-	got, err := ValidatePolicyText("## Findings\nNone", &TurnPolicy{
+	got, err := ValidatePolicyText("anything", &TurnPolicy{
 		Contract: &ContractSpec{Named: "delegate/delegate-report@1"},
 		Retry:    &RetryPolicy{Max: 1, Template: correctiveRetryTemplate},
 	}, registry, now)
@@ -691,25 +550,18 @@ func TestValidatePolicyTextHelper(t *testing.T) {
 	if passthrough.Stamp != nil || passthrough.ResolvedContract != nil {
 		t.Fatalf("passthrough = %#v", passthrough)
 	}
-	_, err = ValidatePolicyText("## Findings\nNone", &TurnPolicy{
+	_, err = ValidatePolicyText("any final text", &TurnPolicy{
 		Contract: &spec,
 		Retry:    &RetryPolicy{Max: 1, Template: "Missing"},
 	}, registry, now)
 	if err == nil {
 		t.Fatal("invalid retry template succeeded")
 	}
-	_, err = ValidatePolicyText("## Findings\nNone", &TurnPolicy{
-		Contract: &spec,
-		Retry:    &RetryPolicy{Max: 1, Template: "Missing {{missing}}"},
-	}, registry, now)
-	if err == nil {
-		t.Fatal("retry template without corrective-only instruction succeeded")
-	}
 }
 
 func TestRetryTemplateAndSkippedDisabledStamps(t *testing.T) {
 	t.Parallel()
-	if got := RenderRetryTemplate("missing: {{missing}}", []string{"section:Findings", "evidence"}); got != "missing: Add this top-level heading with its content: # Findings, Findings were claimed without accepted evidence. Add an outside-code-fence file:line reference, an outside-code-fence diff hunk line starting @@, or a fenced command block with an exit-code line immediately before or after the fence." {
+	if got := RenderRetryTemplate("missing: {{missing}}", []string{"json: invalid", "/status: value must be 'ok'"}); got != "missing: json: invalid, /status: value must be 'ok'" {
 		t.Fatalf("rendered = %q", got)
 	}
 	retry := RetryPolicy{Max: 1, Template: correctiveRetryTemplate}
@@ -732,51 +584,15 @@ func TestRetryTemplateAndSkippedDisabledStamps(t *testing.T) {
 	}
 }
 
-func TestRenderRetryTemplateTranslatesShapeViolations(t *testing.T) {
+func TestRenderRetryTemplateBoundsRawViolations(t *testing.T) {
 	t.Parallel()
-	contract := ContractSpec{Shape: &ShapeSpec{FirstLineEnum: []string{"PASS", "FAIL"}}}
-	missing := []string{
-		"firstLineEnum",
-		"section:Criteria scored",
-		"attestation:I validated the criteria.",
-		"evidence",
-		"json: invalid",
-	}
-	want := "missing: " + strings.Join([]string{
-		"Line 1 must be exactly one of these values, with nothing else on the line: PASS, FAIL",
-		"Add this top-level heading with its content: # Criteria scored",
-		"Include this exact attestation text outside code fences: I validated the criteria.",
-		"Findings were claimed without accepted evidence. Add an outside-code-fence file:line reference, an outside-code-fence diff hunk line starting @@, or a fenced command block with an exit-code line immediately before or after the fence.",
-		"json: invalid",
-	}, ", ")
-	got := RenderRetryTemplateForContract("missing: {{missing}}", missing, contract)
-	if got != want {
-		t.Fatalf("rendered = %q, want %q", got, want)
-	}
-	for _, raw := range []string{"firstLineEnum", "section:"} {
-		if strings.Contains(got, raw) {
-			t.Fatalf("rendered = %q, should not contain raw token %q", got, raw)
-		}
-	}
-	if strings.Contains(got, "complete, partial, or blocked") {
-		t.Fatalf("rendered = %q, should use contract enum instead of delegate-report defaults", got)
-	}
-
-	generic := RenderRetryTemplateForContract("missing: {{missing}}", []string{"firstLineEnum"}, ContractSpec{JSONSchema: json.RawMessage(`{}`)})
-	if !strings.Contains(generic, "complete, partial, or blocked") {
-		t.Fatalf("generic firstLineEnum fallback = %q, want delegate-report fallback wording", generic)
-	}
-
 	largeMissing := make([]string, maxRetryViolationTextBytes)
 	for i := range largeMissing {
-		largeMissing[i] = "firstLineEnum"
+		largeMissing[i] = "/status: value must be 'ok'"
 	}
 	capped := RenderRetryTemplate("{{missing}}{{missing}}", largeMissing)
 	if len(capped) > maxRetryViolationTextBytes {
 		t.Fatalf("retry violation text is %d bytes, want at most %d", len(capped), maxRetryViolationTextBytes)
-	}
-	if strings.Contains(capped, "firstLineEnum") {
-		t.Fatalf("capped retry prompt leaked raw firstLineEnum token: %q", capped)
 	}
 }
 
@@ -786,15 +602,6 @@ func TestNoPolicyPassthrough(t *testing.T) {
 	if policy != nil {
 		t.Fatal("nil policy should be passthrough with no stamp")
 	}
-}
-
-func contains(list []string, want string) bool {
-	for _, item := range list {
-		if item == want {
-			return true
-		}
-	}
-	return false
 }
 
 func equalStringSlices(got, want []string) bool {

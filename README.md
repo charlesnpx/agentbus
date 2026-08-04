@@ -135,7 +135,7 @@ Planned work not yet shipped as of v0.6.0:
 
 - `stop-review-gate`: a Claude Code Stop-hook client of agentbus that gates a
   review run submitted as an identified `job.submit` (protocol v2 removed the
-  session/turn surface) with an ALLOW/BLOCK shape contract plus
-  `policy.validate`, replacing the vendor `openai-codex` plugin's stop-review
-  gate. Until this lands, `delegate setup` reports
+  session/turn surface) with delegate-owned ALLOW/BLOCK report validation while
+  agentbus records contract identity, replacing the vendor `openai-codex`
+  plugin's stop-review gate. Until this lands, `delegate setup` reports
   `stop-review-gate: not available (planned v0.2)`.

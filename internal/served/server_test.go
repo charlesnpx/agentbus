@@ -452,6 +452,9 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 			t.Fatalf("missing capability %s in %+v", capability, hello.Capabilities)
 		}
 	}
+	if hello.Capabilities["policy.shape"] {
+		t.Fatalf("policy.shape capability is enabled in hello: %+v", hello.Capabilities)
+	}
 	if _, ok := hello.Capabilities["jobs.requestId"]; ok {
 		t.Fatalf("jobs.requestId capability is advertised in hello: %+v", hello.Capabilities)
 	}
@@ -5787,9 +5790,9 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 	backend := newFakeBackend("fake")
 	backend.events = func(string, bool) []engine.Event {
 		if turns.Add(1) == 1 {
-			return []engine.Event{{Type: engine.EventAgentText, Text: "NOPE\n"}}
+			return []engine.Event{{Type: engine.EventAgentText, Text: `{"status":"bad"}`}}
 		}
-		return []engine.Event{{Type: engine.EventAgentText, Text: "PASS\n"}}
+		return []engine.Event{{Type: engine.EventAgentText, Text: `{"status":"pass"}`}}
 	}
 	backend.started = make(chan struct{}, 2)
 	server, _, cwd := newUnstartedTestServer(t, backend)
@@ -5805,10 +5808,14 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 			Write:   false,
 			Prompt:  "retry",
 			Policy: &engine.TurnPolicy{
-				Contract: &engine.ContractSpec{Shape: &engine.ShapeSpec{FirstLineEnum: []string{"PASS", "FAIL"}}},
+				Contract: &engine.ContractSpec{JSONSchema: json.RawMessage(`{
+					"type":"object",
+					"required":["status"],
+					"properties":{"status":{"const":"pass"}}
+				}`)},
 				Retry: &engine.RetryPolicy{
 					Max:      1,
-					Template: "Your response missed: {{missing}}. Emit the corrected report only; make no further changes.",
+					Template: "Your response missed: {{missing}}.",
 				},
 			},
 		},
@@ -5831,12 +5838,9 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 	if firstTurn.Prompt != "retry" {
 		t.Fatalf("first prompt = %q, want original task prompt", firstTurn.Prompt)
 	}
-	wantRetryInstruction := "Line 1 must be exactly one of these values, with nothing else on the line: PASS, FAIL"
+	wantRetryInstruction := "/status: value must be 'pass'"
 	if !strings.Contains(retryTurn.Prompt, wantRetryInstruction) {
 		t.Fatalf("retry prompt = %q, want instruction %q", retryTurn.Prompt, wantRetryInstruction)
-	}
-	if strings.Contains(retryTurn.Prompt, "complete, partial, or blocked") || strings.Contains(retryTurn.Prompt, "firstLineEnum") {
-		t.Fatalf("retry prompt = %q, want contract enum translation without delegate defaults or raw token", retryTurn.Prompt)
 	}
 	waitAdmissionSafetyTerminal(t, server, submitted.JobID)
 
@@ -6290,7 +6294,7 @@ func TestHeartbeatRacingCompletionDoesNotResurrectTerminalRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobID := server.nextID("job")
-	contract := &engine.ContractSpec{Shape: &engine.ShapeSpec{FirstLineEnum: []string{"PASS"}}}
+	contract := &engine.ContractSpec{Shape: json.RawMessage(`{"delegateContract":"report-v1"}`)}
 	if err := server.createQueuedRecord(store, jobID, "ses_race", "fake", nil, &engine.TurnPolicy{Contract: contract}, contract, false); err != nil {
 		t.Fatal(err)
 	}
