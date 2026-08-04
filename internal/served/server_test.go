@@ -3057,6 +3057,67 @@ func TestIdentifiedFencedJobReadsAuthorityOnlyWithoutJSONFallback(t *testing.T) 
 	}
 }
 
+func TestStrictAuthorityResultSurfacesBackendReportedModel(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name     string
+		reported string
+	}{
+		{name: "reported", reported: "claude-opus-4-1-20250805"},
+		{name: "not_reported"},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			backend := newFakeBackend("fake")
+			backend.events = func(string, bool) []engine.Event {
+				events := []engine.Event{}
+				if tt.reported != "" {
+					events = append(events, engine.Event{Type: engine.EventModelReported, ModelReported: tt.reported})
+				}
+				return append(events, engine.Event{Type: engine.EventResultMessage, Text: "final report"})
+			}
+			server, _, cwd := newUnstartedTestServer(t, backend)
+			launcher := newAdmissionFakeLaunchCustodian(t)
+			enableTestAdmission(t, server, launcher)
+
+			job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+				WorkspaceKey: "workspace-model-reported-" + tt.name,
+				RequestID:    "request-model-reported-" + tt.name,
+				TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "report model"},
+			})
+			waitAdmissionSafetyTerminal(t, server, job.JobID)
+			result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+			if result.ModelReported != tt.reported {
+				t.Fatalf("job.result modelReported = %q, want %q", result.ModelReported, tt.reported)
+			}
+			if result.Result == nil || result.Result.Text != "final report" || result.Result.ModelReported != tt.reported {
+				t.Fatalf("job.result payload = %+v, want text and modelReported %q", result.Result, tt.reported)
+			}
+			status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+			if len(status.Jobs) != 1 || status.Jobs[0].ModelReported != tt.reported {
+				t.Fatalf("job.status = %+v, want modelReported %q", status, tt.reported)
+			}
+			// The all-jobs list projection must also surface the reported model
+			// (guards the separate listAuthorityStatuses assignment).
+			list := jobStatusViaHandler(t, server, protocol.JobStatusParams{All: true})
+			found := false
+			for _, js := range list.Jobs {
+				if js.JobID != job.JobID {
+					continue
+				}
+				found = true
+				if js.ModelReported != tt.reported {
+					t.Fatalf("job.status All=true modelReported = %q, want %q", js.ModelReported, tt.reported)
+				}
+			}
+			if !found {
+				t.Fatalf("job.status All=true did not include job %s", job.JobID)
+			}
+		})
+	}
+}
+
 // TODO(E5A/E5B): Add submit-time named-policy authority-record coverage once
 // model.SafetyRecord carries policy/contract fields; today it only records the
 // task identity, so there is no authority-owned named-policy field to assert.
@@ -3281,6 +3342,51 @@ func TestIdentifiedFencedResultPublishUsesDurableWorkspaceLayoutKeyWithoutJobSto
 	missing := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: submitted.JobID})
 	if missing.Result == nil || missing.Result.Text != "" || missing.Result.ResultPath != expectedPath {
 		t.Fatalf("missing-artifact result = %+v, want omitted inline text with authoritative path", missing)
+	}
+}
+
+func TestStrictCodexElidedResultRetainsCertifiedResultRef(t *testing.T) {
+	t.Parallel()
+	large := strings.Repeat("strict codex result\n", 16)
+	backend := newFakeBackend("codex")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{{Type: engine.EventResultMessage, Text: large}}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	server.inlineResultCap = 32
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-strict-codex-elided-result",
+		RequestID:    "request-strict-codex-elided-result",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "large result"},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Result == nil {
+		t.Fatal("SafetyRecord.Result is nil, want certified result")
+	}
+	if record.Terminal == nil || record.Terminal.Result == nil {
+		t.Fatalf("terminal = %+v, want terminal result receipt", record.Terminal)
+	}
+	if *record.Terminal.Result != record.Result.Result {
+		t.Fatalf("terminal result = %+v, want certified receipt %+v", *record.Terminal.Result, record.Result.Result)
+	}
+	if _, err := os.Stat(record.Result.Result.Path); err != nil {
+		t.Fatalf("workspace result file stat error = %v", err)
+	}
+
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if result.Result == nil {
+		t.Fatal("served job.result Result is nil, want elided ResultRef")
+	}
+	if result.Result.ResultPath != record.Result.Result.Path ||
+		result.Result.SHA256 != record.Result.Result.Digest ||
+		result.Result.Bytes != record.Result.Result.Bytes {
+		t.Fatalf("served result = %+v, want certified %+v", result.Result, record.Result.Result)
+	}
+	if !result.Result.TextElided || result.Result.Text != "" {
+		t.Fatalf("served result text = %q elided=%t, want empty elided text", result.Result.Text, result.Result.TextElided)
 	}
 }
 
