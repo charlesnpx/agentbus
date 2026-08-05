@@ -1164,3 +1164,44 @@ func (r fakeProbeRunner) Run(context.Context, command.ProbeSpec) (command.ProbeR
 	}
 	return command.ProbeResult{Stdout: []byte(version)}, nil
 }
+
+func TestSetupProbeMetadataOverrides(t *testing.T) {
+	cases := []struct {
+		name         string
+		configMode   engine.ModeInfo
+		sandboxModes []string
+		wantConfig   engine.ModeInfo
+		wantSandbox  []string
+	}{
+		{
+			name:        "empty overrides retain historical defaults",
+			wantConfig:  engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
+			wantSandbox: []string{"workspace-write", "read-only"},
+		},
+		{
+			name:         "explicit overrides are emitted verbatim",
+			configMode:   engine.ModeInfo{Write: "user", ReadOnly: "user"},
+			sandboxModes: []string{"agent", "plan", "ask"},
+			wantConfig:   engine.ModeInfo{Write: "user", ReadOnly: "user"},
+			wantSandbox:  []string{"agent", "plan", "ask"},
+		},
+		{
+			name:        "partial override falls back per field",
+			configMode:  engine.ModeInfo{ReadOnly: "user"},
+			wantConfig:  engine.ModeInfo{Write: "user", ReadOnly: "user"},
+			wantSandbox: []string{"workspace-write", "read-only"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &Backend{NameValue: "x", ConfigMode: tc.configMode, SandboxModes: tc.sandboxModes}
+			got := b.setupProbe(ProbedBackendDescriptor{})
+			if got.ConfigMode != tc.wantConfig {
+				t.Errorf("ConfigMode = %+v, want %+v", got.ConfigMode, tc.wantConfig)
+			}
+			if !slices.Equal(got.SandboxModes, tc.wantSandbox) {
+				t.Errorf("SandboxModes = %v, want %v", got.SandboxModes, tc.wantSandbox)
+			}
+		})
+	}
+}
