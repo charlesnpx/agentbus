@@ -50,6 +50,9 @@ invent additional permission modes under protocol v1.
 | codex | write | spawn `codex app-server`; start or resume an app-server thread and send a writable turn request |
 | codex | read-only | spawn `codex app-server`; start or resume an app-server thread and send a read-only turn request |
 | codex | corrective-resume | spawn `codex app-server`; `thread/resume <session-id>` followed by a read-only `turn/start` request |
+| cursor | write | spawn `cursor-agent [--model <id>] acp`; create or load an ACP session, set mode `agent`, then prompt |
+| cursor | read-only | spawn `cursor-agent [--model <id>] acp`; create or load an ACP session, set mode `plan`, then prompt |
+| cursor | corrective-resume | cursor read-only profile plus ACP `session/load <session-id>` before setting mode `plan` |
 | claude | write | `claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions` plus `--resume <session-id>` when resuming |
 | claude | read-only | `claude -p --input-format stream-json --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --permission-mode dontAsk --allowedTools <claude-read-only-allow-list> --disallowedTools <claude-read-only-deny-list>` |
 | claude | corrective-resume | claude read-only profile plus `--resume <session-id>` |
@@ -105,6 +108,41 @@ app-server turn request's reasoning effort field.
 
 The default codex effort allow-list is `none`, `minimal`, `low`, `medium`,
 `high`, and `xhigh`.
+
+### cursor ACP
+
+```text
+cursor-agent [--model <id>] acp
+```
+
+The Cursor adapter resolves `cursor-agent` first and falls back to `agent` when
+the former is unavailable. It never passes `--mode`: ACP mode is selected per
+session. Each process performs ACP v1 `initialize` with file-system and
+terminal client capabilities disabled, authenticates with `cursor_login`, then
+uses `session/new` or `session/load`. A loaded session's replay updates are
+discarded before the load response; they are never treated as output for the
+new turn.
+
+Writable turns select Cursor mode `agent`; read-only and corrective-resume
+turns select `plan`, including when the resumed session was previously
+writable. The adapter verifies `session/set_mode` before prompting. It answers
+only ACP's qualified `session/request_permission` reverse request: writable
+turns choose an offered `allow_once` option and read-only turns choose an
+offered `reject_once` option. It never selects an `*_always` option. Other
+server requests fail explicitly as JSON-RPC method-not-found.
+
+`Interrupt` sends ACP `session/cancel` for the active session. A resulting
+`stopReason: "cancelled"` is clean only after that interrupt was requested.
+Assistant chunks are emitted live and concatenated into the final result on an
+`end_turn` completion. Cursor does not expose an effort control through this
+adapter; specifying one is rejected before launch.
+
+The adapter reports the resolved ACP `models.currentModelId`, rather than
+echoing a requested model flag. Setup uses a no-prompt ACP qualification
+(`initialize`, `authenticate`, `session/new`, and verified `session/set_mode`)
+in a temporary working directory. Model discovery additionally parses the
+small `cursor-agent models` listing after its `Available models` header; an
+empty parsed catalog is valid and explicit model IDs pass through.
 
 ### claude write
 
@@ -283,6 +321,7 @@ Read-only turns MUST apply the strongest backend-supported read-only profile:
 | Backend | Required read-only config behavior |
 | --- | --- |
 | codex | Use the app-server read-only sandbox, approval policy `never`, and disabled network access in the turn request's sandbox policy. No legacy exec-mode config-isolation flag is passed. |
+| cursor | Use ACP mode `plan`, which permits read tools and blocks edits. Cursor user configuration still loads for both write and read-only ACP turns. |
 | claude | Pass `--strict-mcp-config` with an empty `mcpServers` record. MCP servers are excluded, but full settings isolation is unavailable because Claude 2.1.x `--bare` strips API authentication; user settings and hooks may still load on read-only turns. |
 
 Write turns run under user configuration because real work may legitimately
@@ -337,6 +376,7 @@ pinned by adapter tests:
 | Backend | Minimum known-good version |
 | --- | --- |
 | codex | `0.143.0` |
+| cursor | `2026.08.04` |
 | claude | `2.1.205` |
 
 Current stream schema identifiers are:
@@ -344,6 +384,7 @@ Current stream schema identifiers are:
 | Backend | Stream schema |
 | --- | --- |
 | codex | `codex-appserver-v1` |
+| cursor | `cursor-acp-v1` |
 | claude | `claude-streamjson-v2` |
 
 The setup probe cache consumed by `Preflight` is internal agentbus state and has
@@ -399,6 +440,7 @@ Verified discovery surfaces for the installed CLIs:
 | Backend | Verified source | Discovery status |
 | --- | --- | --- |
 | codex | app-server `model/list` during setup qualification | Non-hidden model identifiers and supported reasoning efforts are cached from the app-server response. |
+| cursor | ACP `session/new` plus best-effort `cursor-agent models` parsing | ACP's available/current model identifiers are cached during no-prompt qualification; the CLI listing is a small best-effort catalog and may be empty. |
 | claude | `claude --help` lists effort choices and documents model aliases/examples | Efforts and documented model aliases/examples are cached. These are help-advertised values, not an account-entitlement query. |
 | gemini | `gemini --help` exposes `--model` but no model or effort listing | B1-ready discovery interface returns no listing; static fallback applies when the B2 adapter is added. |
 
@@ -420,6 +462,9 @@ The installed CLIs verified for A5 reported:
 | codex | app-server handshake | `initialize` response followed by `initialized` notification | required before thread, turn, or discovery requests |
 | codex | app-server turn lifecycle | `thread/start` or `thread/resume`, then `turn/start`; `turn/interrupt` cancels the active turn | map session id, prompt, CWD, model, effort, sandbox, and approval policy through app-server requests |
 | codex | setup model discovery | app-server `model/list` is called during `SetupQualify` | cache discovery source `app-server`; do not read an external model cache file |
+| cursor | ACP process | `cursor-agent [--model <id>] acp` is a hidden ACP subcommand | use ACP JSON-RPC over JSONL stdio; do not pass `--mode` |
+| cursor | ACP lifecycle | v1 `initialize`, `authenticate(cursor_login)`, `session/new` or `session/load`, verified `session/set_mode`, then `session/prompt` | map write to `agent`, read-only to `plan`, and discard load replay updates before collecting the new turn |
+| cursor | setup qualification | no-prompt ACP handshake and session mode verification | run in a temporary working directory; require a usable mode and clean process retirement |
 | claude | `-p` stream-json input mode | present in `claude --help` as print mode with `--input-format stream-json` | send control-protocol initialization and one user-message envelope on stdin |
 | claude | `--output-format stream-json` | present in `claude --help`; the installed CLI requires `--verbose` with print-mode streaming | add `--verbose` |
 | claude | `--dangerously-skip-permissions` | present in `claude --help` | none |
