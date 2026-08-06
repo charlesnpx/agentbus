@@ -55,7 +55,11 @@ func (d oneShotDriver) RunTurn(ctx context.Context, conn *duplex.Conn, _ string,
 	writeErr := writeOneShotPrompt(conn, input.Prompt)
 
 	var id string
-	sawFrame := false
+	// producedOutput tracks whether the backend emitted AUTHORITATIVE output — a
+	// parsed event or a session id — not merely any frame. A lone ignored/progress
+	// frame must NOT suppress a genuine stdin-write failure: only real output means
+	// the turn completed despite the write, so the deferred write error is dropped.
+	producedOutput := false
 	frames := conn.Frames()
 	// Drain frames (the reader delivers every parsed frame before it surfaces a
 	// decode error and closes the channel), then read the pending decode error.
@@ -69,15 +73,17 @@ func (d oneShotDriver) RunTurn(ctx context.Context, conn *duplex.Conn, _ string,
 				if err := pendingOneShotDecodeError(conn); err != nil {
 					return id, malformedBackendStreamError(err)
 				}
-				if !sawFrame && writeErr != nil {
+				if !producedOutput && writeErr != nil {
 					return id, writeErr
 				}
 				return id, nil
 			}
-			sawFrame = true
 			events, nextID, err := d.parse(frame.Object)
 			if err != nil {
 				return id, err
+			}
+			if len(events) > 0 || nextID != "" {
+				producedOutput = true
 			}
 			if id == "" && nextID != "" {
 				id = nextID

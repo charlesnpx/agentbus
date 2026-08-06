@@ -872,6 +872,9 @@ func TestConnectAutostartRealUnsupportedHostSurfacesLauncherDiagnosticOnDarwin(t
 	if client != nil {
 		_ = client.Close()
 	}
+	if err == nil {
+		t.Fatal("Connect unexpectedly succeeded; want a strict-support launcher diagnostic or a supported-host unauthorized rejection")
+	}
 	var startup *daemonlaunch.StartupError
 	if !errors.As(err, &startup) || !errors.Is(err, daemonlaunch.ErrStartupFailed) {
 		// This test reproduces the launcher diagnostic for a host on which the
