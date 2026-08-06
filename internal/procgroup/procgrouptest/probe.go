@@ -46,9 +46,13 @@ func RequireProvableProcessGroupObservation(tb testing.TB) {
 	}
 
 	live := procgroup.GroupClaim{PGID: claim.PGID, KernelDomainID: claim.KernelDomainID}
-	if got := procgroup.ClassifyGroup(live); got != model.GroupLive {
+	switch got := procgroup.ClassifyGroup(live); got {
+	case model.GroupLive:
+	case model.GroupExistenceUnknown:
 		tb.Skipf("process-group observation unprovable: ClassifyGroup(live probe group) = %v "+
 			"(host cannot prove group liveness; e.g. unreadable foreign /proc or restricted PID namespace)", got)
+	default:
+		tb.Fatalf("ClassifyGroup(live probe group) = %v, want %v (wrong definite answer indicates a classification regression, not a host limitation)", got, model.GroupLive)
 	}
 
 	// Mirror TestRealGroupLiveAndAbsent: scan a small window of high PGIDs for a
@@ -63,5 +67,5 @@ func RequireProvableProcessGroupObservation(tb testing.TB) {
 				"(host cannot prove group absence)", pgid)
 		}
 	}
-	tb.Skip("process-group observation unprovable: no provably-absent candidate pgid found")
+	tb.Fatal("no provably-absent candidate pgid found among the high sentinel window (unexpected on a capable host)")
 }

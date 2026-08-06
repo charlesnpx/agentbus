@@ -66,8 +66,12 @@ func TestRealGroupLiveAndAbsent(t *testing.T) {
 	// the definite observations, so it skips-with-diagnostic there rather than
 	// failing. (Cannot use internal/procgroup/procgrouptest here — that would be
 	// an import cycle; the same probe logic is inlined.)
-	if got := ClassifyGroup(liveGroup); got != model.GroupLive {
+	switch got := ClassifyGroup(liveGroup); got {
+	case model.GroupLive:
+	case model.GroupExistenceUnknown:
 		t.Skipf("process-group observation unprovable: ClassifyGroup(live child group) = %v, want %v", got, model.GroupLive)
+	default:
+		t.Fatalf("ClassifyGroup(live child group) = %v, want %v (wrong definite answer indicates a classification regression, not a host limitation)", got, model.GroupLive)
 	}
 
 	for pgid := 2147483647; pgid > 2147483547; pgid-- {
