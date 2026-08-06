@@ -218,6 +218,90 @@ func TestACPLoadedReadOnlyTurnCancellation(t *testing.T) {
 	}
 }
 
+func TestACPNegativeTerminalProtocolBranches(t *testing.T) {
+	tests := []struct {
+		name         string
+		run          func(*testing.T, *acpPeer)
+		terminalText string
+		wantResult   bool
+	}{
+		{
+			name: "set mode error prevents prompt",
+			run: func(t *testing.T, peer *acpPeer) {
+				setMode := peer.expectRequest("session/set_mode")
+				peer.write(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      setMode["id"],
+					"error":   map[string]any{"code": -32000, "message": "set mode rejected"},
+				})
+				peer.expectStdinClose()
+			},
+			terminalText: "could not verify Cursor mode: set mode rejected",
+		},
+		{
+			name: "unsupported reverse request is method not found",
+			run: func(t *testing.T, peer *acpPeer) {
+				setMode := peer.expectRequest("session/set_mode")
+				peer.respond(setMode, map[string]any{})
+				prompt := peer.expectRequest("session/prompt")
+				peer.serverRequest("unsupported-reverse", "cursor/ask_question", map[string]any{
+					"options": []any{map[string]any{"optionId": "allow-once", "kind": "allow_once"}},
+				})
+				response := peer.expectResponse("unsupported-reverse")
+				rpcError, _ := response["error"].(map[string]any)
+				if got := protocolVersion(rpcError["code"]); got != -32601 {
+					t.Fatalf("unsupported reverse response = %#v, want error code -32601", response)
+				}
+				peer.respond(prompt, map[string]any{"stopReason": "end_turn"})
+				peer.expectStdinClose()
+			},
+			wantResult: true,
+		},
+		{
+			name: "unrequested prompt cancellation is terminal",
+			run: func(t *testing.T, peer *acpPeer) {
+				setMode := peer.expectRequest("session/set_mode")
+				peer.respond(setMode, map[string]any{})
+				prompt := peer.expectRequest("session/prompt")
+				peer.respond(prompt, map[string]any{"stopReason": "cancelled"})
+				peer.expectStdinClose()
+			},
+			terminalText: "cursor ACP prompt was cancelled without a requested interrupt",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := newFakeACPRunner(t, func(t *testing.T, proc *fakeACPProcess, spec command.ExecSpec) {
+				peer := newACPPeer(t, proc)
+				peer.handshake(false)
+				newSession := peer.expectRequest("session/new")
+				peer.respond(newSession, acpSessionResult("session-negative", "negative-model"))
+				test.run(t, peer)
+			})
+
+			session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir()})
+			events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := collectEvents(t, events, 2*time.Second)
+			terminal := eventsOfType(got, engine.EventTerminalError)
+			if test.terminalText != "" {
+				if len(terminal) != 1 || !strings.Contains(terminal[0].Text, test.terminalText) {
+					t.Fatalf("events = %#v, want terminal error containing %q", got, test.terminalText)
+				}
+			} else if len(terminal) != 0 {
+				t.Fatalf("events = %#v, did not want terminal error", got)
+			}
+			if test.wantResult && len(eventsOfType(got, engine.EventResultMessage)) != 1 {
+				t.Fatalf("events = %#v, want one result", got)
+			}
+			runner.assertRetired(t)
+		})
+	}
+}
+
 func TestACPSetupQualification(t *testing.T) {
 	backend := New(Options{Binary: "fake-cursor"})
 	if got := backend.VersionTransform("cursor-agent 2026.08.04-aaa8809"); got != MinimumKnownGoodVersion {

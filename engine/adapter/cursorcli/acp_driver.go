@@ -448,7 +448,9 @@ func (c *acpRPC) handlePermissionRequest(id any, params map[string]any) error {
 	if active == nil {
 		return c.permissionTerminalError(id, "Cursor permission request arrived without an active session")
 	}
-	if active.interruptWasRequested() {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	if active.interruptRequested {
 		return c.writeResult(id, map[string]any{
 			"outcome": map[string]any{"outcome": "cancelled"},
 		})
