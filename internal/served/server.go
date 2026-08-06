@@ -2496,6 +2496,7 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				}
 				terminalState = engine.StateFailed
 				terminalErr = errors.New(rawText)
+			case engine.EventTurnFinal:
 			}
 		}
 	}

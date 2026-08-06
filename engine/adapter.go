@@ -51,13 +51,27 @@ type TurnInput struct {
 
 // Event is an agentbus streaming event emitted by an adapter.
 type Event struct {
-	Type          string         `json:"type"`
-	Name          string         `json:"name,omitempty"`
-	Text          string         `json:"text"`
-	Truncated     bool           `json:"truncated"`
-	ModelReported string         `json:"modelReported,omitempty"`
-	Metadata      map[string]any `json:"metadata,omitempty"`
-	RawText       string         `json:"-"`
+	Type          string                `json:"type"`
+	Name          string                `json:"name,omitempty"`
+	Text          string                `json:"text"`
+	Truncated     bool                  `json:"truncated"`
+	ModelReported string                `json:"modelReported,omitempty"`
+	Metadata      map[string]any        `json:"metadata,omitempty"`
+	TurnFinal     *TurnFinalObservation `json:"-"`
+	RawText       string                `json:"-"`
+}
+
+// TurnFinalObservation is the embedded-only retirement observation emitted at
+// the end of a duplex turn.
+type TurnFinalObservation struct {
+	BackendSessionID string
+	ReturnCodeKnown  bool
+	ReturnCode       int
+	Signal           string
+	TimedOut         bool
+	Canceled         bool
+	ExecutionFailed  bool
+	CleanupFailed    bool
 }
 
 const (
@@ -67,6 +81,7 @@ const (
 	EventModelReported = "ModelReported"
 	EventResultMessage = "ResultMessage"
 	EventTerminalError = "TerminalError"
+	EventTurnFinal     = "TurnFinal"
 )
 
 // SetupProbeCache is written by setup after a live stream probe and read by
