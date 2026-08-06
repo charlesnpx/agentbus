@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,6 +66,105 @@ func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing
 			t.Fatalf("events = %#v, want terminal initialize error", got)
 		}
 	})
+}
+
+func TestAppServerTurnSandboxPolicyFollowsWritePolicy(t *testing.T) {
+	cwd := t.TempDir()
+	tests := []struct {
+		name        string
+		writePolicy WritePolicy
+		write       bool
+		want        map[string]any
+	}{
+		{
+			name:  "zero value write remains workspace offline",
+			write: true,
+			want: map[string]any{
+				"type":          "workspaceWrite",
+				"networkAccess": false,
+				"writableRoots": []any{cwd},
+			},
+		},
+		{
+			name:        "workspace network write enables network",
+			writePolicy: WritePolicyWorkspaceNetwork,
+			write:       true,
+			want: map[string]any{
+				"type":          "workspaceWrite",
+				"networkAccess": true,
+				"writableRoots": []any{cwd},
+			},
+		},
+		{
+			name:        "trusted write uses unrestricted policy",
+			writePolicy: WritePolicyTrusted,
+			write:       true,
+			want: map[string]any{
+				"type": "dangerFullAccess",
+			},
+		},
+		{
+			name:  "zero value read is read only offline",
+			write: false,
+			want: map[string]any{
+				"type":          "readOnly",
+				"networkAccess": false,
+			},
+		},
+		{
+			name:        "workspace network read is read only offline",
+			writePolicy: WritePolicyWorkspaceNetwork,
+			write:       false,
+			want: map[string]any{
+				"type":          "readOnly",
+				"networkAccess": false,
+			},
+		},
+		{
+			name:        "trusted read is read only offline",
+			writePolicy: WritePolicyTrusted,
+			write:       false,
+			want: map[string]any{
+				"type":          "readOnly",
+				"networkAccess": false,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+				peer := newAppServerPeer(t, proc)
+				peer.handshake()
+				thread := peer.expectRequest("thread/start")
+				peer.respond(thread, threadResult("thread-1"))
+				turn := peer.expectRequest("turn/start")
+				params, ok := turn["params"].(map[string]any)
+				if !ok {
+					t.Fatalf("turn/start params = %#v", turn["params"])
+				}
+				got, ok := params["sandboxPolicy"].(map[string]any)
+				if !ok {
+					t.Fatalf("turn/start sandboxPolicy = %#v", params["sandboxPolicy"])
+				}
+				if !reflect.DeepEqual(got, test.want) {
+					t.Fatalf("turn/start sandboxPolicy = %#v, want %#v", got, test.want)
+				}
+				peer.respond(turn, turnResult("turn-1"))
+				peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+			})
+
+			session := startFakeCodexSessionWithOptions(t, Options{
+				Binary:      "fake-codex",
+				WritePolicy: test.writePolicy,
+			}, engine.SessionOpts{CWD: cwd})
+			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello", Write: test.write}, runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = collectEventsWithTimeout(t, events, 2*time.Second)
+		})
+	}
 }
 
 func TestAppServerThreadsStartThenResumeWithReturnedID(t *testing.T) {
@@ -344,7 +444,7 @@ func TestAppServerSetupQualifyDiscoversModelsAndRequiresOne(t *testing.T) {
 				},
 			})
 		})
-		driver := newAppServerDriver("fake-codex")
+		driver := newAppServerDriver("fake-codex", WritePolicyWorkspaceOffline)
 		discovery, err := driver.SetupQualify(context.Background(), runner, engine.SessionOpts{CWD: t.TempDir()})
 		if err != nil {
 			t.Fatal(err)
@@ -367,7 +467,7 @@ func TestAppServerSetupQualifyDiscoversModelsAndRequiresOne(t *testing.T) {
 			req := peer.expectRequest("model/list")
 			peer.respond(req, map[string]any{"data": []any{}})
 		})
-		driver := newAppServerDriver("fake-codex")
+		driver := newAppServerDriver("fake-codex", WritePolicyWorkspaceOffline)
 		discovery, err := driver.SetupQualify(context.Background(), runner, engine.SessionOpts{CWD: t.TempDir()})
 		if err == nil || !strings.Contains(err.Error(), "no usable models") || len(discovery.Models) != 0 {
 			t.Fatalf("discovery=%#v err=%v, want zero-model qualification failure", discovery, err)
@@ -389,7 +489,12 @@ func TestCodexPreflightUsesAppServerStreamSchema(t *testing.T) {
 
 func startFakeCodexSession(t *testing.T, opts engine.SessionOpts) engine.Session {
 	t.Helper()
-	backend := New(Options{Binary: "fake-codex"})
+	return startFakeCodexSessionWithOptions(t, Options{Binary: "fake-codex"}, opts)
+}
+
+func startFakeCodexSessionWithOptions(t *testing.T, adapterOpts Options, opts engine.SessionOpts) engine.Session {
+	t.Helper()
+	backend := New(adapterOpts)
 	session, err := backend.Start(context.Background(), opts)
 	if err != nil {
 		t.Fatal(err)

@@ -23,6 +23,7 @@ var canonicalEffortOrder = []string{"none", "minimal", "low", "medium", "high", 
 
 type appServerDriver struct {
 	binary         string
+	writePolicy    WritePolicy
 	requestTimeout time.Duration
 	nextID         atomic.Uint64
 
@@ -36,9 +37,10 @@ type activeAppServerTurn struct {
 	interruptRequested atomic.Bool
 }
 
-func newAppServerDriver(binary string) *appServerDriver {
+func newAppServerDriver(binary string, writePolicy WritePolicy) *appServerDriver {
 	return &appServerDriver{
 		binary:         binary,
+		writePolicy:    writePolicy,
 		requestTimeout: appServerRequestTimeout,
 		active:         make(map[*duplex.Conn]*activeAppServerTurn),
 	}
@@ -76,7 +78,7 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	}
 
 	observer := &turnObserver{emit: emit}
-	turnResult, err := rpc.request(ctx, "turn/start", turnStartParams(threadID, opts, input), observer)
+	turnResult, err := rpc.request(ctx, "turn/start", turnStartParams(threadID, opts, input, d.writePolicy), observer)
 	if err != nil {
 		return threadID, err
 	}
@@ -576,11 +578,11 @@ func threadParams(opts engine.SessionOpts, input engine.TurnInput, resumeID stri
 	return params
 }
 
-func turnStartParams(threadID string, opts engine.SessionOpts, input engine.TurnInput) map[string]any {
+func turnStartParams(threadID string, opts engine.SessionOpts, input engine.TurnInput, writePolicy WritePolicy) map[string]any {
 	params := map[string]any{
 		"threadId":       threadID,
 		"approvalPolicy": "never",
-		"sandboxPolicy":  sandboxPolicy(input.Write, opts.CWD),
+		"sandboxPolicy":  sandboxPolicy(input.Write, opts.CWD, writePolicy),
 		"input": []map[string]any{{
 			"type": "text",
 			"text": input.Prompt,
@@ -605,16 +607,21 @@ func sandboxMode(write bool) string {
 	return "read-only"
 }
 
-func sandboxPolicy(write bool, cwd string) map[string]any {
+func sandboxPolicy(write bool, cwd string, writePolicy WritePolicy) map[string]any {
 	if !write {
 		return map[string]any{
 			"type":          "readOnly",
 			"networkAccess": false,
 		}
 	}
+	if writePolicy == WritePolicyTrusted {
+		return map[string]any{
+			"type": "dangerFullAccess",
+		}
+	}
 	policy := map[string]any{
 		"type":          "workspaceWrite",
-		"networkAccess": false,
+		"networkAccess": writePolicy == WritePolicyWorkspaceNetwork,
 	}
 	if root := workspaceRoot(cwd); root != "" {
 		policy["writableRoots"] = []string{root}
