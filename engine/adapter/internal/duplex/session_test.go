@@ -257,6 +257,113 @@ func TestTurnFinalObservationAcrossTerminalShapes(t *testing.T) {
 	}
 }
 
+func TestTurnFinalKeepsCompletedResumeIDWhenFinalSendBackpressures(t *testing.T) {
+	const (
+		firstResumeID  = "resume-first"
+		secondResumeID = "resume-second"
+	)
+
+	firstProc := newFakeCommand()
+	firstObserved := newFakeObservedCommand(firstProc, command.FinalObservation{
+		Exit: command.ExitObservation{Exited: true, Code: 0},
+	}, nil)
+	runner := &fakeRunner{running: firstObserved}
+	session := newSessionWithDriver(t, runner, backpressuredFinalTestDriver{}, 0, "resume-before-first")
+
+	firstEvents, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = firstProc.stdoutW.Close()
+	_ = firstProc.stderrW.Close()
+	firstProc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	assertFinalObservationCalled(t, firstObserved)
+	waitForSessionIdle(t, session)
+	if got := len(firstEvents); got != eventBufferSize {
+		t.Fatalf("first event buffer length = %d, want %d before TurnFinal is received", got, eventBufferSize)
+	}
+
+	secondProc := newFakeCommand()
+	secondObserved := newFakeObservedCommand(secondProc, command.FinalObservation{
+		Exit: command.ExitObservation{Exited: true, Code: 0},
+	}, nil)
+	runner.running = secondObserved
+	secondEvents, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "second"})
+	if err != nil {
+		t.Fatalf("second turn error = %v", err)
+	}
+	_ = secondProc.stdoutW.Close()
+	_ = secondProc.stderrW.Close()
+	secondProc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	second := collectEventsWithTimeout(t, secondEvents, 2*time.Second)
+	if len(second) != 1 || second[0].Type != engine.EventTurnFinal || second[0].TurnFinal == nil || second[0].TurnFinal.BackendSessionID != secondResumeID {
+		t.Fatalf("second events = %#v, want TurnFinal for %q", second, secondResumeID)
+	}
+	if got := session.ID(); got != secondResumeID {
+		t.Fatalf("session ID after second turn = %q, want %q", got, secondResumeID)
+	}
+
+	first := collectEventsWithTimeout(t, firstEvents, 2*time.Second)
+	if len(first) != eventBufferSize+1 {
+		t.Fatalf("first events = %#v, want %d buffered events and TurnFinal", first, eventBufferSize)
+	}
+	final := first[len(first)-1].TurnFinal
+	if first[len(first)-1].Type != engine.EventTurnFinal || final == nil {
+		t.Fatalf("first final event = %#v, want TurnFinal", first[len(first)-1])
+	}
+	if final.BackendSessionID != firstResumeID {
+		t.Fatalf("first TurnFinal BackendSessionID = %q, want %q", final.BackendSessionID, firstResumeID)
+	}
+}
+
+func TestHasExecutionFailureTraversesSingleErrorWrappers(t *testing.T) {
+	err := fmt.Errorf("execute: %w", errors.Join(context.Canceled, errors.New("wait failed")))
+	if !hasExecutionFailure(err) {
+		t.Fatalf("hasExecutionFailure(%v) = false, want true", err)
+	}
+}
+
+func TestTurnFinalKeepsSettlementDispositionWhenDeadlineExpiresDuringTeardown(t *testing.T) {
+	baseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ctx := &errNotifyingContext{
+		Context:    baseCtx,
+		errChecked: make(chan struct{}),
+	}
+
+	proc := newFakeCommand()
+	observed := newFakeObservedCommand(proc, command.FinalObservation{
+		Exit: command.ExitObservation{Exited: true, Code: 0},
+	}, nil)
+	runner := &fakeRunner{running: observed}
+	session := newSessionWithDriver(t, runner, finalObservationTestDriver{resumeID: "resume-settled"}, 0, "resume-before-turn")
+
+	events, err := session.Turn(ctx, engine.TurnInput{Prompt: "turn"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = proc.stderrW.Close()
+	proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	waitForSignal(t, ctx.errChecked, "settlement context check")
+	if err := baseCtx.Err(); err != nil {
+		t.Fatalf("context expired before settlement disposition was captured: %v", err)
+	}
+	select {
+	case <-baseCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for context deadline during teardown")
+	}
+	_ = proc.stdoutW.Close()
+
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if len(got) != 1 || got[0].Type != engine.EventTurnFinal || got[0].TurnFinal == nil {
+		t.Fatalf("events = %#v, want exactly one TurnFinal", got)
+	}
+	if final := got[0].TurnFinal; final.TimedOut || final.Canceled {
+		t.Fatalf("TurnFinal after post-settlement deadline = %#v, want TimedOut=false and Canceled=false", *final)
+	}
+}
+
 func TestTurnWithRunnerUsesInjectedRunnerWithoutDefault(t *testing.T) {
 	proc := newFakeCommand()
 	runner := &fakeRunner{running: proc}
@@ -1239,6 +1346,41 @@ func (finalObservationTestDriver) Interrupt(context.Context, *Conn) error {
 	return nil
 }
 
+type backpressuredFinalTestDriver struct{}
+
+func (backpressuredFinalTestDriver) ExecSpec(string, engine.SessionOpts, engine.TurnInput) (command.ExecSpec, error) {
+	return command.ExecSpec{Argv: []string{"backpressured-final-test"}}, nil
+}
+
+func (backpressuredFinalTestDriver) RunTurn(_ context.Context, _ *Conn, _ string, _ engine.SessionOpts, input engine.TurnInput, emit EmitFunc) (string, error) {
+	switch input.Prompt {
+	case "first":
+		for i := 0; i < eventBufferSize; i++ {
+			emit(engine.Event{Type: engine.EventAgentText, Text: fmt.Sprintf("buffered-%d", i)})
+		}
+		return "resume-first", nil
+	case "second":
+		return "resume-second", nil
+	default:
+		return "", fmt.Errorf("unexpected prompt %q", input.Prompt)
+	}
+}
+
+func (backpressuredFinalTestDriver) Interrupt(context.Context, *Conn) error {
+	return nil
+}
+
+type errNotifyingContext struct {
+	context.Context
+	errChecked chan struct{}
+	errOnce    sync.Once
+}
+
+func (c *errNotifyingContext) Err() error {
+	c.errOnce.Do(func() { close(c.errChecked) })
+	return c.Context.Err()
+}
+
 type delayedFrameConsumerDriver struct {
 	FixtureDriver
 	readDelay time.Duration
@@ -1427,6 +1569,27 @@ func waitForSignal(t *testing.T, ch <-chan struct{}, name string) {
 	case <-ch:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+func waitForSessionIdle(t *testing.T, session *Session) {
+	t.Helper()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for {
+		session.mu.Lock()
+		idle := session.active == nil
+		session.mu.Unlock()
+		if idle {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			t.Fatal("timed out waiting for session to become idle")
+		}
 	}
 }
 

@@ -309,7 +309,12 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	if result.resumeID != "" {
 		s.setID(result.resumeID)
 	}
-	emitCompletionEvents(turnCtx, events, result.err, earlyExit, observation, stderr, stderrCopyErr)
+	// Capture settled state before teardown releases the session for another turn.
+	// A later turn may install a new resume ID, and teardown itself can outlive a
+	// caller's deadline.
+	completedSessionID := s.ID()
+	disposition := captureTurnDisposition(turnCtx)
+	emitCompletionEvents(disposition, events, result.err, earlyExit, observation, stderr, stderrCopyErr)
 
 	if drainDone == nil {
 		active.conn.drainReader()
@@ -327,7 +332,7 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	// a caller that observes closure can begin its next turn. The deferred call
 	// remains as the panic-safe fallback.
 	s.clearActive(active)
-	events <- turnFinalEvent(s.ID(), turnCtx, observation)
+	events <- turnFinalEvent(completedSessionID, disposition, observation)
 }
 
 func waitForTurnResult(driverDone <-chan turnResult, retirement *retirement) (turnResult, bool) {
@@ -529,8 +534,24 @@ func (s *Session) clearActive(active *activeTurn) {
 	}
 }
 
-func emitCompletionEvents(ctx context.Context, events chan<- engine.Event, driverErr error, earlyExit bool, observation command.FinalObservation, stderr *bytes.Buffer, stderrCopyErr error) {
-	if ctx.Err() == context.DeadlineExceeded {
+type turnDisposition struct {
+	timedOut bool
+	canceled bool
+}
+
+func captureTurnDisposition(ctx context.Context) turnDisposition {
+	if ctx == nil {
+		return turnDisposition{}
+	}
+	err := ctx.Err()
+	return turnDisposition{
+		timedOut: errors.Is(err, context.DeadlineExceeded),
+		canceled: errors.Is(err, context.Canceled),
+	}
+}
+
+func emitCompletionEvents(disposition turnDisposition, events chan<- engine.Event, driverErr error, earlyExit bool, observation command.FinalObservation, stderr *bytes.Buffer, stderrCopyErr error) {
+	if disposition.timedOut {
 		events <- warning("backend turn timed out")
 		return
 	}
@@ -559,12 +580,7 @@ func emitCompletionEvents(ctx context.Context, events chan<- engine.Event, drive
 	}
 }
 
-func turnFinalEvent(backendSessionID string, ctx context.Context, observation command.FinalObservation) engine.Event {
-	var timedOut, canceled bool
-	if ctx != nil {
-		timedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
-		canceled = errors.Is(ctx.Err(), context.Canceled)
-	}
+func turnFinalEvent(backendSessionID string, disposition turnDisposition, observation command.FinalObservation) engine.Event {
 	return engine.Event{
 		Type: engine.EventTurnFinal,
 		TurnFinal: &engine.TurnFinalObservation{
@@ -572,8 +588,8 @@ func turnFinalEvent(backendSessionID string, ctx context.Context, observation co
 			ReturnCodeKnown:  observation.Exit.Exited,
 			ReturnCode:       observation.Exit.Code,
 			Signal:           observation.Exit.Signal,
-			TimedOut:         timedOut,
-			Canceled:         canceled,
+			TimedOut:         disposition.timedOut,
+			Canceled:         disposition.canceled,
 			ExecutionFailed:  hasExecutionFailure(observation.ExecutionErr),
 			CleanupFailed:    observation.CleanupErr != nil,
 		},
@@ -591,6 +607,9 @@ func hasExecutionFailure(err error) bool {
 			}
 		}
 		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return hasExecutionFailure(wrapped.Unwrap())
 	}
 	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
