@@ -246,6 +246,36 @@ func TestAppServerCompletedTurnUsesLastCompletedAgentMessageAsResult(t *testing.
 	}
 }
 
+func TestAppServerCompletedTurnUsesCompletedTextAfterMismatchedAgentDelta(t *testing.T) {
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1", "delta": "streamed "})
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-1", "type": "agentMessage", "text": "draft"}))
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if resultText(got) != "draft" {
+		t.Fatalf("events = %#v, want authoritative completed result", got)
+	}
+	if resultRawText(got) != "draft" {
+		t.Fatalf("events = %#v, want authoritative completed raw result", got)
+	}
+	if agentText := agentTextTexts(got); !reflect.DeepEqual(agentText, []string{"streamed "}) {
+		t.Fatalf("agent text = %#v, want streamed delta only", agentText)
+	}
+}
+
 func TestAppServerCompletedTurnUsesAccumulatedAgentMessageDeltasAsResult(t *testing.T) {
 	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
 		peer := newAppServerPeer(t, proc)
