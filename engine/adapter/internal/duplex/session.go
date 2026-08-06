@@ -94,6 +94,8 @@ func NewSession(config SessionConfig) (*Session, error) {
 			return nil, errors.New("environment overlay key must not contain NUL")
 		case strings.Contains(key, "="):
 			return nil, errors.New("environment overlay key must not contain equals")
+		case strings.ContainsRune(value, '\x00'):
+			return nil, errors.New("environment overlay value must not contain NUL")
 		}
 		envOverlay = append(envOverlay, key+"="+value)
 	}
@@ -196,6 +198,9 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 		}
 	}
 
+	// Contract: driver ExecSpec.Env is an ADDITIVE layer over the full inherited
+	// process environment, not a replacement or isolation mechanism (no current
+	// driver sets it). The session overlay is applied last and wins.
 	spec.Env = normalizeEnvironment(runtime.GOOS, os.Environ(), spec.Env, s.envOverlay)
 	running, err := runner.Start(turnCtx, spec)
 	if err != nil {

@@ -225,20 +225,22 @@ func TestSessionEnvOverlayIsClonedAndMergedBeforeRunnerStart(t *testing.T) {
 
 func TestNewSessionRejectsInvalidEnvOverlayKeys(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		key  string
+		name  string
+		key   string
+		value string
 	}{
-		{name: "empty", key: ""},
-		{name: "equals", key: "A=B"},
-		{name: "nul", key: "A\x00B"},
+		{name: "empty", key: "", value: "value"},
+		{name: "equals", key: "A=B", value: "value"},
+		{name: "nul", key: "A\x00B", value: "value"},
+		{name: "nul value", key: "A", value: "a\x00b"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := NewSession(SessionConfig{
 				Driver:  FixtureDriver{Spec: command.ExecSpec{Argv: []string{"fixture"}}},
-				Options: engine.SessionOpts{EnvOverlay: map[string]string{tc.key: "value"}},
+				Options: engine.SessionOpts{EnvOverlay: map[string]string{tc.key: tc.value}},
 			})
 			if err == nil {
-				t.Fatalf("NewSession accepted invalid overlay key %q", tc.key)
+				t.Fatalf("NewSession accepted invalid overlay entry %q=%q", tc.key, tc.value)
 			}
 		})
 	}
