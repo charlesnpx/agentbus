@@ -235,7 +235,7 @@ func TestAppServerCompletedTurnUsesLastCompletedAgentMessageAsResult(t *testing.
 		turn := peer.expectRequest("turn/start")
 		peer.respond(turn, turnResult("turn-1"))
 		peer.notify("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1", "delta": "streamed "})
-		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-1", "type": "agentMessage", "text": "draft"}))
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-1", "type": "agentMessage", "text": "streamed "}))
 		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-2", "type": "agentMessage", "text": "final answer"}))
 		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
 	})
@@ -249,8 +249,41 @@ func TestAppServerCompletedTurnUsesLastCompletedAgentMessageAsResult(t *testing.
 	if resultText(got) != "final answer" {
 		t.Fatalf("events = %#v, want authoritative final answer result", got)
 	}
-	if !containsEvent(got, engine.EventAgentText, "streamed ") || !containsEvent(got, engine.EventAgentText, "draft") {
-		t.Fatalf("events = %#v, want streamed and completed agent text", got)
+	if resultRawText(got) != "final answer" {
+		t.Fatalf("events = %#v, want authoritative final answer raw result", got)
+	}
+	if agentText := agentTextTexts(got); !reflect.DeepEqual(agentText, []string{"streamed ", "final answer"}) {
+		t.Fatalf("agent text = %#v, want streamed delta once and completed text without prior delta once", agentText)
+	}
+}
+
+func TestAppServerCompletedTurnUsesCompletedTextAfterMismatchedAgentDelta(t *testing.T) {
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1", "delta": "streamed "})
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-1", "type": "agentMessage", "text": "draft"}))
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if resultText(got) != "draft" {
+		t.Fatalf("events = %#v, want authoritative completed result", got)
+	}
+	if resultRawText(got) != "draft" {
+		t.Fatalf("events = %#v, want authoritative completed raw result", got)
+	}
+	if agentText := agentTextTexts(got); !reflect.DeepEqual(agentText, []string{"streamed "}) {
+		t.Fatalf("agent text = %#v, want streamed delta only", agentText)
 	}
 }
 
@@ -275,6 +308,12 @@ func TestAppServerCompletedTurnUsesAccumulatedAgentMessageDeltasAsResult(t *test
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
 	if resultText(got) != "Hello, world" {
 		t.Fatalf("events = %#v, want accumulated delta result", got)
+	}
+	if resultRawText(got) != "Hello, world" {
+		t.Fatalf("events = %#v, want accumulated delta raw result", got)
+	}
+	if agentText := agentTextTexts(got); !reflect.DeepEqual(agentText, []string{"Hello, ", "world"}) {
+		t.Fatalf("agent text = %#v, want accumulated delta chunks", agentText)
 	}
 }
 
@@ -863,11 +902,31 @@ func containsEvent(events []engine.Event, typ, sub string) bool {
 	return false
 }
 
+func agentTextTexts(events []engine.Event) []string {
+	var texts []string
+	for _, ev := range events {
+		if ev.Type == engine.EventAgentText {
+			texts = append(texts, ev.Text)
+		}
+	}
+	return texts
+}
+
 func resultText(events []engine.Event) string {
 	var out string
 	for _, ev := range events {
 		if ev.Type == engine.EventResultMessage {
 			out = ev.Text
+		}
+	}
+	return out
+}
+
+func resultRawText(events []engine.Event) string {
+	var out string
+	for _, ev := range events {
+		if ev.Type == engine.EventResultMessage {
+			out = ev.RawText
 		}
 	}
 	return out

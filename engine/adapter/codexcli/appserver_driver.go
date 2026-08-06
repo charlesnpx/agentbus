@@ -412,6 +412,7 @@ func (c *appServerRPC) handleNotification(frame duplex.Frame) {
 type turnObserver struct {
 	emit               duplex.EmitFunc
 	lastCompletedAgent string
+	agentDeltaSeen     map[string]bool
 	agentDeltaText     map[string]*strings.Builder
 	lastDeltaAgentItem string
 	completion         *turnCompletion
@@ -455,7 +456,9 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 		if method == "item/completed" {
 			if text := textFrom(item); text != "" {
 				o.lastCompletedAgent = text
-				o.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: metadata})
+				if !o.hasAgentDelta(payload) {
+					o.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: metadata})
+				}
 			}
 		}
 	case "commandexecution", "filechange", "mcptoolcall", "dynamictoolcall":
@@ -503,11 +506,16 @@ func (o *turnObserver) emitEvent(ev engine.Event) {
 
 const defaultAgentDeltaItemID = "\x00agent-delta-default"
 
+func (o *turnObserver) hasAgentDelta(payload map[string]any) bool {
+	return o.agentDeltaSeen[agentDeltaItemIDOrDefault(payload)]
+}
+
 func (o *turnObserver) appendAgentDelta(payload map[string]any, text string) {
-	itemID := agentDeltaItemID(payload)
-	if itemID == "" {
-		itemID = defaultAgentDeltaItemID
+	itemID := agentDeltaItemIDOrDefault(payload)
+	if o.agentDeltaSeen == nil {
+		o.agentDeltaSeen = make(map[string]bool)
 	}
+	o.agentDeltaSeen[itemID] = true
 	if o.agentDeltaText == nil {
 		o.agentDeltaText = make(map[string]*strings.Builder)
 	}
@@ -832,7 +840,14 @@ func agentDeltaItemID(payload map[string]any) string {
 	if item, ok := firstMap(payload, "item", "payload", "response_item"); ok {
 		return firstString(item, "id", "itemId", "item_id")
 	}
-	return ""
+	return firstString(payload, "id")
+}
+
+func agentDeltaItemIDOrDefault(payload map[string]any) string {
+	if itemID := agentDeltaItemID(payload); itemID != "" {
+		return itemID
+	}
+	return defaultAgentDeltaItemID
 }
 
 func isResponse(obj map[string]any) bool {
