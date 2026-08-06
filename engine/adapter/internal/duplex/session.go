@@ -56,7 +56,11 @@ type Session struct {
 	envOverlay     []string
 	interruptGrace time.Duration
 
-	mu     sync.Mutex
+	mu sync.Mutex
+	// id is the provider-confirmed resume ID supplied to the next turn. It is
+	// retained after errored or interrupted turns, so that turn resumes the same
+	// conversation. Callers needing a fresh conversation must discard this
+	// Session and Start a new one.
 	id     string
 	active *activeTurn
 }
@@ -315,7 +319,7 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	observation, _ := active.retirement.wait(context.Background())
 	stderrCopyErr := <-stderrDone
 
-	if result.err == nil && result.resumeID != "" {
+	if result.resumeID != "" {
 		s.setID(result.resumeID)
 	}
 	emitCompletionEvents(turnCtx, events, result.err, earlyExit, observation, stderr, stderrCopyErr)

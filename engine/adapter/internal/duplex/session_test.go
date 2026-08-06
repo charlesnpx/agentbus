@@ -320,6 +320,84 @@ func TestMalformedStdoutSurfacesDecodeError(t *testing.T) {
 	}
 }
 
+func TestSessionRetainsProviderResumeIDAfterTerminalError(t *testing.T) {
+	const confirmedResumeID = "resume-after-terminal-error"
+	terminalErr := errors.New("provider reported terminal error")
+	proc := newFakeCommand()
+	runner := &fakeRunner{running: proc}
+	session := newSessionWithDriver(t, runner, terminalErrorResumeDriver{
+		FixtureDriver: FixtureDriver{Spec: command.ExecSpec{Argv: []string{"fixture"}}},
+		resumeID:      confirmedResumeID,
+		err:           terminalErr,
+	}, 0, "")
+
+	firstPeerDone := make(chan struct{})
+	go func() {
+		defer close(firstPeerDone)
+		scanner := bufio.NewScanner(proc.stdinR)
+		if scanner.Scan() {
+			t.Errorf("unexpected prompt frame after terminal provider error: %s", scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			t.Errorf("stdin scan error: %v", err)
+		}
+		_ = proc.stdoutW.Close()
+		_ = proc.stderrW.Close()
+		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	}()
+
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "terminal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	<-firstPeerDone
+	if len(got) != 1 || got[0].Type != engine.EventTerminalError || !strings.Contains(got[0].Text, terminalErr.Error()) {
+		t.Fatalf("events = %#v, want terminal provider error", got)
+	}
+	if session.ID() != confirmedResumeID {
+		t.Fatalf("session id = %q, want %q", session.ID(), confirmedResumeID)
+	}
+
+	proc = newFakeCommand()
+	runner.running = proc
+	secondPeerDone := make(chan struct{})
+	go func() {
+		defer close(secondPeerDone)
+		scanner := bufio.NewScanner(proc.stdinR)
+		if !scanner.Scan() {
+			t.Errorf("resumed prompt frame missing: %v", scanner.Err())
+			return
+		}
+		prompt := decodeLine(t, scanner.Bytes())
+		if prompt["type"] != "prompt" || prompt["prompt"] != "continue" || prompt["resumeId"] != confirmedResumeID {
+			t.Errorf("resumed prompt frame = %#v", prompt)
+			return
+		}
+		writePeerJSON(t, proc.stdoutW, map[string]any{"type": "complete", "text": "resumed"})
+		if scanner.Scan() {
+			t.Errorf("unexpected stdin frame after resumed completion: %s", scanner.Text())
+			return
+		}
+		if err := scanner.Err(); err != nil {
+			t.Errorf("stdin scan error: %v", err)
+		}
+		_ = proc.stdoutW.Close()
+		_ = proc.stderrW.Close()
+		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	}()
+
+	events, err = session.Turn(context.Background(), engine.TurnInput{Prompt: "continue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = collectEventsWithTimeout(t, events, 2*time.Second)
+	<-secondPeerDone
+	if len(got) != 1 || got[0].Type != engine.EventResultMessage || got[0].Text != "resumed" {
+		t.Fatalf("events = %#v, want resumed result", got)
+	}
+}
+
 func TestProcessExitBeforeSemanticTerminalSplitsCleanupAndExecutionAxes(t *testing.T) {
 	proc := newFakeCommand()
 	cleanupErr := errors.New("cleanup failed after process exit")
@@ -942,6 +1020,21 @@ func (d *decodeCapturingDriver) RunTurn(ctx context.Context, conn *Conn, resumeI
 		d.errs <- err
 	}
 	return id, err
+}
+
+// terminalErrorResumeDriver models a provider that confirms a resume ID before
+// returning a terminal turn error.
+type terminalErrorResumeDriver struct {
+	FixtureDriver
+	resumeID string
+	err      error
+}
+
+func (d terminalErrorResumeDriver) RunTurn(ctx context.Context, conn *Conn, resumeID string, opts engine.SessionOpts, input engine.TurnInput, emit EmitFunc) (string, error) {
+	if input.Prompt == "terminal" {
+		return d.resumeID, d.err
+	}
+	return d.FixtureDriver.RunTurn(ctx, conn, resumeID, opts, input, emit)
 }
 
 type delayedFrameConsumerDriver struct {
