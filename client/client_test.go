@@ -872,9 +872,28 @@ func TestConnectAutostartRealUnsupportedHostSurfacesLauncherDiagnosticOnDarwin(t
 	if client != nil {
 		_ = client.Close()
 	}
+	if err == nil {
+		t.Fatal("Connect unexpectedly succeeded; want a strict-support launcher diagnostic or a supported-host unauthorized rejection")
+	}
 	var startup *daemonlaunch.StartupError
 	if !errors.As(err, &startup) || !errors.Is(err, daemonlaunch.ErrStartupFailed) {
-		t.Fatalf("Connect error = %T %v, want daemon launch startup failure", err, err)
+		// This test reproduces the launcher diagnostic for a host on which the
+		// strict native runtime is genuinely UNAVAILABLE. GOOS==darwin is not a
+		// proxy for that: a real macOS host (including GitHub's macos runner)
+		// supports the strict runtime, so the daemon starts, binds, and rejects
+		// this test's deliberately-invalid hello token with an unauthorized RPC
+		// error. Treat that as positive evidence of strict support and skip — the
+		// unsupported-host precondition cannot be reproduced here. This makes the
+		// test self-gating (the external skip-list entry is no longer required);
+		// any other outcome is unexpected and still fails.
+		var rpcErr *protocol.RPCError
+		if errors.As(err, &rpcErr) && rpcErr.Object.Data.Code == protocol.ErrorUnauthorized {
+			t.Skipf("host supports the strict native runtime; unsupported-host precondition unreproducible (Connect error = %v)", err)
+		}
+		if clientTestBindDeniedOutput(err.Error()) {
+			clientTestSkipOrFailBindDenied(t, "real unsupported-host autostart", err)
+		}
+		t.Fatalf("Connect error = %T %v, want the strict-support launcher diagnostic or a supported-host unauthorized rejection", err, err)
 	}
 	if errors.Is(err, daemonlaunch.ErrReadinessTimeout) || errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Connect error = %v, want launcher failure code, not timeout", err)

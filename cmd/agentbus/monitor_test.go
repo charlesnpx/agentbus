@@ -21,6 +21,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
 	"github.com/charlesnpx/agentbus/internal/procgroup"
+	"github.com/charlesnpx/agentbus/internal/procgroup/procgrouptest"
 	"golang.org/x/sys/unix"
 )
 
@@ -72,6 +73,10 @@ func TestInternalMonitorCommandContainsTargetOnDaemonEOF(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real subprocess containment test")
 	}
+	// Requires provable process-group observation; skip-with-diagnostic on hosts
+	// where the kernel cannot prove it (unreadable foreign /proc, restricted PID
+	// namespace) rather than fail closed.
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	agentbus := buildAgentbusForMonitorTest(t)

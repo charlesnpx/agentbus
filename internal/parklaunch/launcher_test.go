@@ -24,6 +24,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/parkproto"
 	"github.com/charlesnpx/agentbus/internal/procgroup"
+	"github.com/charlesnpx/agentbus/internal/procgroup/procgrouptest"
 	"golang.org/x/sys/unix"
 )
 
@@ -1437,6 +1438,11 @@ type backendResult struct {
 
 func newLaunchFixture(t *testing.T, backendOpts backendFixtureOptions) launchFixture {
 	t.Helper()
+	// Every real-subprocess launch test here depends on provable process-group
+	// observation (both the happy path and the after-containment absence proof).
+	// Skip with a diagnostic on hosts where the kernel cannot prove it, rather
+	// than fail closed — the fail-closed behavior is asserted by dedicated tests.
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 	dir := t.TempDir()

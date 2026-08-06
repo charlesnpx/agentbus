@@ -18,6 +18,7 @@ import (
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
 	"github.com/charlesnpx/agentbus/internal/parkproto"
 	"github.com/charlesnpx/agentbus/internal/procgroup"
+	"github.com/charlesnpx/agentbus/internal/procgroup/procgrouptest"
 )
 
 func TestGenerateNativeReleaseSecretRandomAndValid(t *testing.T) {
@@ -41,6 +42,7 @@ func TestGenerateNativeReleaseSecretRandomAndValid(t *testing.T) {
 }
 
 func TestNativeHeldLaunchGeneratesInternalSecretAndAbortPrepared(t *testing.T) {
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	manager := newFakeNativeRetainedManager()
@@ -95,6 +97,7 @@ func TestNativeHeldLaunchGeneratesInternalSecretAndAbortPrepared(t *testing.T) {
 }
 
 func TestNativeHeldLaunchPrivateReleaseExecsOnce(t *testing.T) {
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	manager := newFakeNativeRetainedManager()
@@ -170,6 +173,7 @@ func TestNativeHeldLaunchPrivateReleaseExecsOnce(t *testing.T) {
 }
 
 func TestNativeCustodianPublicPrepareReleaseExecsOnceAndKeepsSecretPrivate(t *testing.T) {
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	manager := newFakeNativeRetainedManager()
@@ -472,6 +476,7 @@ func TestNativeHeldLaunchControlLossFromAbortingRetriesContainment(t *testing.T)
 }
 
 func TestNativeCustodianCloseAbortsPreparedHeldLaunchAndIsIdempotent(t *testing.T) {
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	manager := newFakeNativeRetainedManager()
@@ -563,6 +568,7 @@ func TestNativeReleaseOutcomeFromParklaunchMapping(t *testing.T) {
 }
 
 func TestNativeCustodianPublicPrepareReturnsHeldPreparedProcess(t *testing.T) {
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	manager := newFakeNativeRetainedManager()
