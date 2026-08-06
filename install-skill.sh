@@ -229,7 +229,7 @@ restart_live_daemon() {
     fi
     matched=1
     if kill -TERM "$pid" 2>/dev/null; then
-      add_warning "restarted running agentbus daemon (pid $pid) so the upgraded binary serves new connections; in-flight jobs are recovered by the reaper"
+      add_warning "restarted running agentbus daemon (pid $pid) so the upgraded binary serves new connections; any in-flight jobs are interrupted by the restart and reconciled (not resumed) by the reaper — re-submit them if needed"
     else
       add_warning "could not restart running agentbus daemon (pid $pid) after upgrade"
     fi
