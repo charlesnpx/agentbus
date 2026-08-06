@@ -29,6 +29,7 @@ import (
 	"github.com/charlesnpx/agentbus/internal/containment"
 	"github.com/charlesnpx/agentbus/internal/parklaunch"
 	"github.com/charlesnpx/agentbus/internal/procgroup"
+	"github.com/charlesnpx/agentbus/internal/procgroup/procgrouptest"
 	"golang.org/x/sys/unix"
 )
 
@@ -1134,6 +1135,7 @@ func TestRetainedNativeContainmentBackendClosePropagatesRemoveFailure(t *testing
 }
 
 func TestNativeRetainedContainAndVerifyPreservesCleanupFailureAfterFinalization(t *testing.T) {
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	issuer, verifier := NewAttestationChannel()
@@ -1188,6 +1190,7 @@ func TestNativeRetainedContainAndVerifyPreservesCleanupFailureAfterFinalization(
 }
 
 func TestNativeRetainedWaitCompletesWithoutLeaderRetention(t *testing.T) {
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	manager := newFakeNativeRetainedManager()
@@ -1230,6 +1233,7 @@ func TestNativeRetainedWaitCompletesWithoutLeaderRetention(t *testing.T) {
 }
 
 func TestNativeRetainedWaitContainsResidualWithoutLeaderRetention(t *testing.T) {
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	manager := newFakeNativeRetainedManager()
@@ -1546,6 +1550,7 @@ func TestNativeContainAndVerifyRecoveryMissingRetainedGroupMismatchedDomainIsUnp
 }
 
 func TestNativeRetainedCanceledWaitsDoNotLeakReapers(t *testing.T) {
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	manager := newFakeNativeRetainedManager()
@@ -1584,6 +1589,7 @@ func TestNativeRetainedCanceledWaitsDoNotLeakReapers(t *testing.T) {
 }
 
 func TestNativeRetainedSharedManagerSequentialAndConcurrentLaunches(t *testing.T) {
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	manager := newFakeNativeRetainedManager()
@@ -1650,6 +1656,7 @@ func TestNativeRetainedSharedManagerSequentialAndConcurrentLaunches(t *testing.T
 }
 
 func TestNativeRetainedLeafRetiredAfterPlacePIDFailure(t *testing.T) {
+	procgrouptest.RequireProvableProcessGroupObservation(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	manager := newFakeNativeRetainedManager()
@@ -1824,7 +1831,12 @@ func absentProcessGroupForDomain(t *testing.T, domain model.KernelDomainID) int 
 			return pgid
 		}
 		if got == model.GroupExistenceUnknown {
-			t.Fatalf("ClassifyGroup(absent candidate %d) = %v", pgid, got)
+			// The host cannot prove process-group absence (unreadable foreign
+			// /proc, restricted PID namespace, hidepid). The containment code
+			// correctly fails closed; tests that need a provably-absent group as
+			// a fixture cannot run meaningfully here, so skip with a diagnostic
+			// rather than fail. The fail-closed behavior is asserted elsewhere.
+			t.Skipf("process-group observation unprovable: ClassifyGroup(absent candidate %d) = %v", pgid, got)
 		}
 	}
 	t.Fatal("could not find an absent process group candidate")
