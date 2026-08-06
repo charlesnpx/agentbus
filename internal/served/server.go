@@ -2450,13 +2450,23 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 	var assistantText strings.Builder
 	var resultText string
 	hasResultMessage := false
+	var terminalState engine.JobState
+	var terminalErr error
 	for {
+		if terminalErr != nil {
+			// The producer may need the consumer to make space for tail events
+			// before it can finish session cleanup and close the stream.
+			for range events {
+			}
+			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), terminalState, terminalErr
+		}
 		select {
 		case <-attemptCtx.Done():
 			if shouldInterruptSessionOnAttemptCancel(run, attemptCtx.Err()) {
 				_ = run.session.Interrupt(context.Background())
 			}
-			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), stateForContext(attemptCtx.Err()), attemptCtx.Err()
+			terminalState = stateForContext(attemptCtx.Err())
+			terminalErr = attemptCtx.Err()
 		case event, ok := <-events:
 			if !ok {
 				if attemptCtx.Err() != nil {
@@ -2482,7 +2492,8 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				if rawText == "" {
 					rawText = "backend failed"
 				}
-				return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, errors.New(rawText)
+				terminalState = engine.StateFailed
+				terminalErr = errors.New(rawText)
 			}
 		}
 	}

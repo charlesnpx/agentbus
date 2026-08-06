@@ -6238,6 +6238,70 @@ func TestTerminalErrorEventFailsJob(t *testing.T) {
 	}
 }
 
+func TestTerminalErrorEventDrainsStreamBeforeFailingJob(t *testing.T) {
+	t.Parallel()
+	backend := newAdmissionLivenessBackend("fake")
+	backend.eventStream = make(chan engine.Event, 16)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-terminal-error-drain",
+		RequestID:    "request-terminal-error-drain",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "fail after cleanup"},
+	})
+	waitBackendStarted(t, backend.fakeBackend)
+
+	stopProducer := make(chan struct{})
+	stop := sync.OnceFunc(func() { close(stopProducer) })
+	producerClosed := make(chan struct{})
+	t.Cleanup(func() {
+		stop()
+		select {
+		case <-producerClosed:
+		case <-time.After(time.Second):
+			t.Error("terminal-error producer did not stop")
+		}
+	})
+	go func() {
+		defer close(producerClosed)
+		defer close(backend.eventStream)
+		send := func(event engine.Event) bool {
+			select {
+			case backend.eventStream <- event:
+				return true
+			case <-stopProducer:
+				return false
+			}
+		}
+		if !send(engine.Event{Type: engine.EventTerminalError, Text: "backend exploded"}) {
+			return
+		}
+		// Seventeen tail events overflow the 16-event source buffer unless the
+		// consumer keeps draining after it sees the terminal error.
+		for i := 0; i < 17; i++ {
+			if !send(engine.Event{Type: engine.EventAgentText, Text: "discarded tail"}) {
+				return
+			}
+		}
+		select {
+		case <-backend.runnerObserved:
+		case <-stopProducer:
+		}
+	}()
+
+	select {
+	case <-producerClosed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal-error producer blocked before closing its event stream")
+	}
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if result.State != engine.StateFailed || result.Result != nil {
+		t.Fatalf("terminal error result = %+v", result)
+	}
+}
+
 func TestResultMessageWinsOverAssistantTextWithoutDuplication(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
