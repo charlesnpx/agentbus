@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -147,6 +149,129 @@ func TestTurnWithRunnerRequiresRunner(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "command runner is required") {
 		t.Fatalf("TurnWithRunner error = %v, want command runner required", err)
 	}
+}
+
+func TestSessionEnvOverlayIsClonedAndMergedBeforeRunnerStart(t *testing.T) {
+	proc := newFakeCommand()
+	runner := &fakeRunner{running: proc}
+	overlay := map[string]string{
+		"AGENTBUS_ENV_OVERLAY_CLONED": "initial",
+		"AGENTBUS_ENV_OVERLAY_DRIVER": "overlay-value",
+		"AGENTBUS_ENV_OVERLAY_EMPTY":  "",
+	}
+	session, err := NewSession(SessionConfig{
+		Runner: runner,
+		Driver: FixtureDriver{Spec: command.ExecSpec{
+			Argv: []string{"fixture"},
+			Env: []string{
+				"AGENTBUS_ENV_OVERLAY_DRIVER=driver-value",
+				"AGENTBUS_ENV_OVERLAY_DRIVER_ONLY=driver-only",
+			},
+		}},
+		Options: engine.SessionOpts{EnvOverlay: overlay},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay["AGENTBUS_ENV_OVERLAY_CLONED"] = "mutated"
+	overlay["AGENTBUS_ENV_OVERLAY_LATE"] = "late"
+
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		scanner := bufio.NewScanner(proc.stdinR)
+		if !scanner.Scan() {
+			t.Errorf("prompt frame missing: %v", scanner.Err())
+			return
+		}
+		writePeerJSON(t, proc.stdoutW, map[string]any{"type": "complete", "text": "done"})
+		_ = proc.stdoutW.Close()
+		_ = proc.stderrW.Close()
+		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	}()
+
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	<-peerDone
+
+	if got, ok := environmentValue(runner.spec.Env, "AGENTBUS_ENV_OVERLAY_CLONED"); !ok || got != "initial" {
+		t.Fatal("cloned overlay value did not reach runner")
+	}
+	if _, ok := environmentValue(runner.spec.Env, "AGENTBUS_ENV_OVERLAY_LATE"); ok {
+		t.Fatal("post-construction overlay mutation reached runner")
+	}
+	if got, ok := environmentValue(runner.spec.Env, "AGENTBUS_ENV_OVERLAY_DRIVER"); !ok || got != "overlay-value" {
+		t.Fatal("overlay did not replace the driver environment value")
+	}
+	if got, ok := environmentValue(runner.spec.Env, "AGENTBUS_ENV_OVERLAY_DRIVER_ONLY"); !ok || got != "driver-only" {
+		t.Fatal("driver-only environment value did not reach runner")
+	}
+	if !slices.Contains(runner.spec.Env, "AGENTBUS_ENV_OVERLAY_EMPTY=") {
+		t.Fatal("empty overlay value missing from runner environment")
+	}
+	if inherited := os.Environ(); len(inherited) > 0 {
+		key, value, ok := strings.Cut(inherited[0], "=")
+		if !ok {
+			t.Fatal("inherited environment did not contain KEY=VALUE")
+		}
+		if got, found := environmentValue(runner.spec.Env, key); !found || got != value {
+			t.Fatal("inherited environment entry was not preserved")
+		}
+	}
+}
+
+func TestNewSessionRejectsInvalidEnvOverlayKeys(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "empty", key: "", value: "value"},
+		{name: "equals", key: "A=B", value: "value"},
+		{name: "nul", key: "A\x00B", value: "value"},
+		{name: "nul value", key: "A", value: "a\x00b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewSession(SessionConfig{
+				Driver:  FixtureDriver{Spec: command.ExecSpec{Argv: []string{"fixture"}}},
+				Options: engine.SessionOpts{EnvOverlay: map[string]string{tc.key: tc.value}},
+			})
+			if err == nil {
+				t.Fatalf("NewSession accepted invalid overlay entry %q=%q", tc.key, tc.value)
+			}
+		})
+	}
+}
+
+func TestNormalizeEnvironmentWindowsCaseInsensitiveLastWriteWins(t *testing.T) {
+	got := normalizeEnvironment("windows",
+		[]string{"Path=inherited", "OTHER=keep"},
+		[]string{"PATH=driver"},
+		[]string{"path=overlay"},
+	)
+	want := []string{"path=overlay", "OTHER=keep"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("windows normalized environment = %#v, want %#v", got, want)
+	}
+
+	got = normalizeEnvironment("linux", []string{"Path=inherited", "PATH=driver"})
+	want = []string{"Path=inherited", "PATH=driver"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("linux normalized environment = %#v, want %#v", got, want)
+	}
+}
+
+func environmentValue(env []string, key string) (string, bool) {
+	for _, entry := range env {
+		entryKey, value, ok := strings.Cut(entry, "=")
+		if ok && entryKey == key {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 func TestMalformedStdoutSurfacesDecodeError(t *testing.T) {
