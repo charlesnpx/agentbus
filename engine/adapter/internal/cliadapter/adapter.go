@@ -171,23 +171,8 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 	if err != nil {
 		return engine.BackendSetupProbe{}, err
 	}
-	var sawEvent bool
-	var warnings []string
-	for event := range events {
-		if event.Type == engine.EventWarning || event.Type == engine.EventTerminalError {
-			warnings = append(warnings, event.Text)
-			continue
-		}
-		sawEvent = true
-	}
-	if probeCtx.Err() != nil {
-		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s setup stream probe failed: %w", b.NameValue, probeCtx.Err())
-	}
-	if len(warnings) > 0 {
-		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s setup stream probe warning: %s", b.NameValue, strings.Join(warnings, "; "))
-	}
-	if !sawEvent {
-		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s setup stream probe produced no JSON events", b.NameValue)
+	if err := b.qualifySetupStream(probeCtx, events); err != nil {
+		return engine.BackendSetupProbe{}, err
 	}
 	probe := b.setupProbe(probed)
 	probe.DiscoveredModels = probed.DiscoveredModels
@@ -197,6 +182,36 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 	probe.DiscoveryClientVersion = probed.DiscoveryClientVersion
 	probe.DiscoveryWarnings = discoveryWarnings(probed.DiscoveryWarning)
 	return probe, nil
+}
+
+func (b *Backend) qualifySetupStream(probeCtx context.Context, events <-chan engine.Event) error {
+	var sawSemanticEvent bool
+	var warnings []string
+	for event := range events {
+		if event.Type == engine.EventWarning || event.Type == engine.EventTerminalError {
+			warnings = append(warnings, event.Text)
+			continue
+		}
+		if isLifecycleEvent(event.Type) {
+			continue
+		}
+		sawSemanticEvent = true
+	}
+	if probeCtx.Err() != nil {
+		return fmt.Errorf("backend_unavailable: %s setup stream probe failed: %w", b.NameValue, probeCtx.Err())
+	}
+	if len(warnings) > 0 {
+		return fmt.Errorf("backend_unavailable: %s setup stream probe warning: %s", b.NameValue, strings.Join(warnings, "; "))
+	}
+	if !sawSemanticEvent {
+		return fmt.Errorf("backend_unavailable: %s setup stream probe produced no semantic JSON events", b.NameValue)
+	}
+	return nil
+}
+
+func isLifecycleEvent(eventType string) bool {
+	// EventProgress belongs here when that later lifecycle-only event is added.
+	return eventType == engine.EventTurnFinal
 }
 
 func (b *Backend) setupProbe(probed ProbedBackendDescriptor) engine.BackendSetupProbe {

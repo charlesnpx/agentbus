@@ -60,6 +60,7 @@ func TestFixtureDriverHappyPath(t *testing.T) {
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
 	<-peerDone
+	got = withoutTurnFinal(got)
 
 	if len(got) != 2 {
 		t.Fatalf("events = %#v, want agent text and result", got)
@@ -79,6 +80,180 @@ func TestFixtureDriverHappyPath(t *testing.T) {
 	assertFinalObservationCalled(t, observed)
 	if strings.Join(runner.spec.Argv, "\x00") != "fixture" {
 		t.Fatalf("argv = %#v", runner.spec.Argv)
+	}
+}
+
+func TestTurnFinalObservationAcrossTerminalShapes(t *testing.T) {
+	executionErr := errors.New("backend execution failed")
+	cleanupErr := errors.New("backend cleanup failed")
+	tests := []struct {
+		name           string
+		observation    command.FinalObservation
+		resumeID       string
+		driverErr      error
+		waitForContext bool
+		newContext     func() (context.Context, context.CancelFunc)
+		cancelAfterRun bool
+		want           engine.TurnFinalObservation
+	}{
+		{
+			name:        "success",
+			observation: command.FinalObservation{Exit: command.ExitObservation{Exited: true, Code: 0}},
+			resumeID:    "resume-success",
+			want: engine.TurnFinalObservation{
+				BackendSessionID: "resume-success",
+				ReturnCodeKnown:  true,
+			},
+		},
+		{
+			name:        "nonzero exit",
+			observation: command.FinalObservation{Exit: command.ExitObservation{Exited: true, Code: 7}},
+			resumeID:    "resume-nonzero",
+			want: engine.TurnFinalObservation{
+				BackendSessionID: "resume-nonzero",
+				ReturnCodeKnown:  true,
+				ReturnCode:       7,
+			},
+		},
+		{
+			name:           "timeout",
+			observation:    command.FinalObservation{Exit: command.ExitObservation{Code: -1, Signal: "killed"}},
+			resumeID:       "resume-timeout",
+			waitForContext: true,
+			newContext: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 10*time.Millisecond)
+			},
+			want: engine.TurnFinalObservation{
+				BackendSessionID: "resume-timeout",
+				ReturnCode:       -1,
+				Signal:           "killed",
+				TimedOut:         true,
+			},
+		},
+		{
+			name:           "canceled",
+			observation:    command.FinalObservation{Exit: command.ExitObservation{Code: -1, Signal: "interrupt"}},
+			resumeID:       "resume-canceled",
+			waitForContext: true,
+			newContext: func() (context.Context, context.CancelFunc) {
+				return context.WithCancel(context.Background())
+			},
+			cancelAfterRun: true,
+			want: engine.TurnFinalObservation{
+				BackendSessionID: "resume-canceled",
+				ReturnCode:       -1,
+				Signal:           "interrupt",
+				Canceled:         true,
+			},
+		},
+		{
+			name:        "signal",
+			observation: command.FinalObservation{Exit: command.ExitObservation{Code: -1, Signal: "terminated"}},
+			resumeID:    "resume-signal",
+			want: engine.TurnFinalObservation{
+				BackendSessionID: "resume-signal",
+				ReturnCode:       -1,
+				Signal:           "terminated",
+			},
+		},
+		{
+			name: "execution failure retains installed ID",
+			observation: command.FinalObservation{
+				Exit:         command.ExitObservation{Exited: true, Code: 9},
+				ExecutionErr: executionErr,
+			},
+			resumeID:  "resume-after-errored-turn",
+			driverErr: errors.New("provider returned an error"),
+			want: engine.TurnFinalObservation{
+				BackendSessionID: "resume-after-errored-turn",
+				ReturnCodeKnown:  true,
+				ReturnCode:       9,
+				ExecutionFailed:  true,
+			},
+		},
+		{
+			name: "cleanup failure",
+			observation: command.FinalObservation{
+				Exit:       command.ExitObservation{Exited: true, Code: 0},
+				CleanupErr: cleanupErr,
+			},
+			resumeID: "resume-cleanup",
+			want: engine.TurnFinalObservation{
+				BackendSessionID: "resume-cleanup",
+				ReturnCodeKnown:  true,
+				CleanupFailed:    true,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			cancel := func() {}
+			if test.newContext != nil {
+				ctx, cancel = test.newContext()
+			}
+			defer cancel()
+
+			proc := newFakeCommand()
+			observed := newFakeObservedCommand(proc, test.observation, nil)
+			runner := &fakeRunner{running: observed}
+			session := newSessionWithDriver(t, runner, finalObservationTestDriver{
+				resumeID:       test.resumeID,
+				err:            test.driverErr,
+				waitForContext: test.waitForContext,
+			}, 0, "resume-before-turn")
+
+			peerDone := make(chan struct{})
+			go func() {
+				defer close(peerDone)
+				if test.waitForContext {
+					<-ctx.Done()
+				}
+				_ = proc.stdoutW.Close()
+				_ = proc.stderrW.Close()
+				proc.finish(test.observation.Exit, nil)
+			}()
+
+			events, err := session.Turn(ctx, engine.TurnInput{Prompt: "turn"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.cancelAfterRun {
+				cancel()
+			}
+			got := collectEventsWithTimeout(t, events, 2*time.Second)
+			<-peerDone
+
+			var finalCount int
+			for _, event := range got {
+				if event.Type == engine.EventTurnFinal {
+					finalCount++
+				}
+			}
+			if finalCount != 1 {
+				t.Fatalf("TurnFinal events = %d, want exactly one; events = %#v", finalCount, got)
+			}
+			if len(got) == 0 {
+				t.Fatal("event channel closed without a TurnFinal event")
+			}
+			if got[len(got)-1].Type != engine.EventTurnFinal {
+				t.Fatalf("last event = %#v, want TurnFinal; events = %#v", got[len(got)-1], got)
+			}
+			final := got[len(got)-1].TurnFinal
+			if final == nil {
+				t.Fatalf("TurnFinal payload = nil; events = %#v", got)
+			}
+			if got[len(got)-1].Text != "" || got[len(got)-1].Metadata != nil {
+				t.Fatalf("TurnFinal leaked observation into Text or Metadata: %#v", got[len(got)-1])
+			}
+			if *final != test.want {
+				t.Fatalf("TurnFinal payload = %#v, want %#v", *final, test.want)
+			}
+			if gotID := session.ID(); gotID != test.want.BackendSessionID {
+				t.Fatalf("session ID = %q, want %q", gotID, test.want.BackendSessionID)
+			}
+		})
 	}
 }
 
@@ -125,6 +300,7 @@ func TestTurnWithRunnerUsesInjectedRunnerWithoutDefault(t *testing.T) {
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
 	<-peerDone
+	got = withoutTurnFinal(got)
 
 	if len(got) != 1 || got[0].Type != engine.EventResultMessage || got[0].Text != "done" {
 		t.Fatalf("events = %#v, want result", got)
@@ -306,6 +482,7 @@ func TestMalformedStdoutSurfacesDecodeError(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	got = withoutTurnFinal(got)
 	var decodeErr *DecodeError
 	select {
 	case err := <-errs:
@@ -352,6 +529,7 @@ func TestSessionRetainsProviderResumeIDAfterTerminalError(t *testing.T) {
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
 	<-firstPeerDone
+	got = withoutTurnFinal(got)
 	if len(got) != 1 || got[0].Type != engine.EventTerminalError || !strings.Contains(got[0].Text, terminalErr.Error()) {
 		t.Fatalf("events = %#v, want terminal provider error", got)
 	}
@@ -393,6 +571,7 @@ func TestSessionRetainsProviderResumeIDAfterTerminalError(t *testing.T) {
 	}
 	got = collectEventsWithTimeout(t, events, 2*time.Second)
 	<-secondPeerDone
+	got = withoutTurnFinal(got)
 	if len(got) != 1 || got[0].Type != engine.EventResultMessage || got[0].Text != "resumed" {
 		t.Fatalf("events = %#v, want resumed result", got)
 	}
@@ -522,6 +701,7 @@ func TestTrailingFramesAfterTerminalDoNotWedgeSession(t *testing.T) {
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
 	<-peerDone
+	got = withoutTurnFinal(got)
 	if len(got) != 1 || got[0].Type != engine.EventResultMessage || got[0].Text != "done" {
 		t.Fatalf("events = %#v, want result only", got)
 	}
@@ -1037,6 +1217,28 @@ func (d terminalErrorResumeDriver) RunTurn(ctx context.Context, conn *Conn, resu
 	return d.FixtureDriver.RunTurn(ctx, conn, resumeID, opts, input, emit)
 }
 
+type finalObservationTestDriver struct {
+	resumeID       string
+	err            error
+	waitForContext bool
+}
+
+func (d finalObservationTestDriver) ExecSpec(string, engine.SessionOpts, engine.TurnInput) (command.ExecSpec, error) {
+	return command.ExecSpec{Argv: []string{"final-observation-test"}}, nil
+}
+
+func (d finalObservationTestDriver) RunTurn(ctx context.Context, _ *Conn, _ string, _ engine.SessionOpts, _ engine.TurnInput, _ EmitFunc) (string, error) {
+	if d.waitForContext {
+		<-ctx.Done()
+		return d.resumeID, ctx.Err()
+	}
+	return d.resumeID, d.err
+}
+
+func (finalObservationTestDriver) Interrupt(context.Context, *Conn) error {
+	return nil
+}
+
 type delayedFrameConsumerDriver struct {
 	FixtureDriver
 	readDelay time.Duration
@@ -1152,6 +1354,16 @@ func collectEventsWithTimeout(t *testing.T, ch <-chan engine.Event, timeout time
 			t.Fatalf("timed out collecting events after %s; collected %#v", timeout, out)
 		}
 	}
+}
+
+func withoutTurnFinal(events []engine.Event) []engine.Event {
+	withoutFinal := make([]engine.Event, 0, len(events))
+	for _, event := range events {
+		if event.Type != engine.EventTurnFinal {
+			withoutFinal = append(withoutFinal, event)
+		}
+	}
+	return withoutFinal
 }
 
 func decodeLine(t *testing.T, line []byte) map[string]any {

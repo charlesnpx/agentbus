@@ -281,19 +281,6 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	defer driverCancel()
 	defer s.clearActive(active)
 	var drainDone chan struct{}
-	defer func() {
-		if drainDone == nil {
-			active.conn.drainReader()
-		} else {
-			<-drainDone
-		}
-		if stdoutLog != nil {
-			_ = stdoutLog.Close()
-		}
-		if stderrLog != nil {
-			_ = stderrLog.Close()
-		}
-	}()
 
 	stderrDone := make(chan error, 1)
 	go func() {
@@ -323,6 +310,24 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 		s.setID(result.resumeID)
 	}
 	emitCompletionEvents(turnCtx, events, result.err, earlyExit, observation, stderr, stderrCopyErr)
+
+	if drainDone == nil {
+		active.conn.drainReader()
+	} else {
+		<-drainDone
+	}
+	if stdoutLog != nil {
+		_ = stdoutLog.Close()
+	}
+	if stderrLog != nil {
+		_ = stderrLog.Close()
+	}
+
+	// Clear active before channel closure, preserving the existing guarantee that
+	// a caller that observes closure can begin its next turn. The deferred call
+	// remains as the panic-safe fallback.
+	s.clearActive(active)
+	events <- turnFinalEvent(s.ID(), turnCtx, observation)
 }
 
 func waitForTurnResult(driverDone <-chan turnResult, retirement *retirement) (turnResult, bool) {
@@ -552,6 +557,42 @@ func emitCompletionEvents(ctx context.Context, events chan<- engine.Event, drive
 	if stderrCopyErr != nil {
 		events <- terminalError(stderrCopyErr.Error())
 	}
+}
+
+func turnFinalEvent(backendSessionID string, ctx context.Context, observation command.FinalObservation) engine.Event {
+	var timedOut, canceled bool
+	if ctx != nil {
+		timedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+		canceled = errors.Is(ctx.Err(), context.Canceled)
+	}
+	return engine.Event{
+		Type: engine.EventTurnFinal,
+		TurnFinal: &engine.TurnFinalObservation{
+			BackendSessionID: backendSessionID,
+			ReturnCodeKnown:  observation.Exit.Exited,
+			ReturnCode:       observation.Exit.Code,
+			Signal:           observation.Exit.Signal,
+			TimedOut:         timedOut,
+			Canceled:         canceled,
+			ExecutionFailed:  hasExecutionFailure(observation.ExecutionErr),
+			CleanupFailed:    observation.CleanupErr != nil,
+		},
+	}
+}
+
+func hasExecutionFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, wrapped := range joined.Unwrap() {
+			if hasExecutionFailure(wrapped) {
+				return true
+			}
+		}
+		return false
+	}
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 func turnEmitter(events chan<- engine.Event) EmitFunc {
