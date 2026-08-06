@@ -19,6 +19,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/claudecli"
 	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
+	"github.com/charlesnpx/agentbus/engine/adapter/cursorcli"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/internal/agentbusserve"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
@@ -91,6 +92,7 @@ func defaultBackendSpecs(cachePath string) []backendSpec {
 	return []backendSpec{
 		newBackendSpec(codexcli.New(codexcli.Options{Binary: resolvedDefaultBackendBinary("codex"), CachePath: cachePath})),
 		newBackendSpec(claudecli.New(claudecli.Options{Binary: resolvedDefaultBackendBinary("claude"), CachePath: cachePath})),
+		newBackendSpec(cursorcli.New(cursorcli.Options{Binary: resolvedCursorBinary(), CachePath: cachePath})),
 	}
 }
 
@@ -100,6 +102,15 @@ func resolvedDefaultBackendBinary(name string) string {
 		return ""
 	}
 	return path
+}
+
+func resolvedCursorBinary() string {
+	for _, name := range []string{"cursor-agent", "agent"} {
+		if path, err := exec.LookPath(name); err == nil {
+			return path
+		}
+	}
+	return ""
 }
 
 func newBackendSpec(backend engine.Backend) backendSpec {

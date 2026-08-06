@@ -49,6 +49,9 @@ does not install Claude or Codex skills in v1. The release tag should be
 
 ## Release notes
 
+- Unreleased: agentbus adds the `cursor` backend over Cursor ACP v1. It resolves
+  `cursor-agent` first (then `agent`), qualifies the no-prompt ACP lifecycle at
+  setup, and maps writable/read-only turns to Cursor `agent`/`plan` modes.
 - v0.4.0: a real direct tools install stops a matching `agentbus serve` daemon after replacing the binary. For staged/mise upgrades, the running daemon detects that its on-disk binary changed and exits at its next quiet moment; the next client autostarts the upgraded binary.
 
 For local installer checks:
@@ -112,8 +115,8 @@ import "github.com/charlesnpx/agentbus/engine"
 ```
 
 Backend adapters live under `github.com/charlesnpx/agentbus/engine/adapter`.
-The Claude Code and Codex CLI adapters implement the argv profiles and setup
-drift checks described in [docs/adapters.md](docs/adapters.md).
+The Cursor ACP, Claude Code, and Codex CLI adapters implement the argv profiles
+and setup drift checks described in [docs/adapters.md](docs/adapters.md).
 Backend authors can follow the normative adding-a-backend recipe in that guide.
 Packages under `github.com/charlesnpx/agentbus/engine/execution/...` are
 unstable implementation APIs for AB-E and are not an import-stability promise.

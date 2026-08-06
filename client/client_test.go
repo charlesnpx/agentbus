@@ -845,6 +845,15 @@ func TestConnectAutostartRealUnsupportedHostSurfacesLauncherDiagnosticOnDarwin(t
 	if runtime.GOOS != "darwin" {
 		t.Skip("real unsupported-host autostart diagnostic is macOS-only")
 	}
+	// This subprocess test exercises the strict-runtime diagnostic, not a
+	// developer's locally installed backend CLIs. Keep provider discovery out of
+	// the fixture so adding a default backend cannot turn the test into a live
+	// CLI probe before the intended startup failure is reached.
+	goBinary, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(goBinary))
 	root := shortClientTempDir(t)
 	bin := buildClientRealAgentbusBinary(t)
 

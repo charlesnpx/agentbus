@@ -30,7 +30,12 @@ type Backend struct {
 	VersionTransform func(string) string
 	Discover         func(context.Context, command.ProbeRunner, string) (*engine.ModelDiscovery, error)
 	SetupQualify     func(context.Context, command.Runner, engine.SessionOpts) (engine.ModelDiscovery, error)
-	probed           *ProbedBackendDescriptor
+	// ConfigMode and SandboxModes let a backend report honest setup metadata.
+	// When left zero, setupProbe falls back to the historical codex/claude
+	// defaults (user/hermetic + workspace-write/read-only), preserving behavior.
+	ConfigMode   engine.ModeInfo
+	SandboxModes []string
+	probed       *ProbedBackendDescriptor
 }
 
 type StaticBackendDescriptor struct {
@@ -195,16 +200,24 @@ func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, err
 }
 
 func (b *Backend) setupProbe(probed ProbedBackendDescriptor) engine.BackendSetupProbe {
+	configMode := b.ConfigMode
+	if configMode.Write == "" {
+		configMode.Write = "user"
+	}
+	if configMode.ReadOnly == "" {
+		configMode.ReadOnly = "hermetic"
+	}
+	sandboxModes := b.SandboxModes
+	if len(sandboxModes) == 0 {
+		sandboxModes = []string{"workspace-write", "read-only"}
+	}
 	return engine.BackendSetupProbe{
-		Backend:      b.NameValue,
-		BinaryPath:   probed.BinaryPath,
-		Version:      probed.Version,
-		StreamSchema: b.StreamSchema,
-		ConfigMode: engine.ModeInfo{
-			Write:    "user",
-			ReadOnly: "hermetic",
-		},
-		SandboxModes:     []string{"workspace-write", "read-only"},
+		Backend:          b.NameValue,
+		BinaryPath:       probed.BinaryPath,
+		Version:          probed.Version,
+		StreamSchema:     b.StreamSchema,
+		ConfigMode:       configMode,
+		SandboxModes:     sandboxModes,
 		JSONEventsProbed: true,
 	}
 }
