@@ -34,7 +34,7 @@ type Options struct {
 func New(opts Options) engine.Backend {
 	efforts := opts.SupportedEfforts
 	if len(efforts) == 0 {
-		efforts = []string{"none", "minimal", "low", "medium", "high", "xhigh"}
+		efforts = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 	}
 	driver := newAppServerDriver(opts.Binary, opts.WritePolicy)
 	return &cliadapter.Backend{

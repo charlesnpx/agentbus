@@ -19,6 +19,17 @@ import (
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
+func TestStaticDefaultEffortsAcceptMaxAndUltra(t *testing.T) {
+	for _, effort := range []string{"max", "ultra"} {
+		t.Run(effort, func(t *testing.T) {
+			backend := New(Options{Binary: "fake-codex"})
+			if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: effort}); err != nil {
+				t.Fatalf("Start() with static default effort %q: %v", effort, err)
+			}
+		})
+	}
+}
+
 func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing.T) {
 	t.Run("handshake order", func(t *testing.T) {
 		cwd := t.TempDir()
