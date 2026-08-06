@@ -6251,6 +6251,11 @@ func TestTerminalErrorEventDrainsStreamBeforeFailingJob(t *testing.T) {
 		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "fail after cleanup"},
 	})
 	waitBackendStarted(t, backend.fakeBackend)
+	select {
+	case <-backend.runnerObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal-error runner observation did not finish")
+	}
 
 	stopProducer := make(chan struct{})
 	stop := sync.OnceFunc(func() { close(stopProducer) })
@@ -6284,10 +6289,6 @@ func TestTerminalErrorEventDrainsStreamBeforeFailingJob(t *testing.T) {
 				return
 			}
 		}
-		select {
-		case <-backend.runnerObserved:
-		case <-stopProducer:
-		}
 	}()
 
 	select {
@@ -6300,6 +6301,27 @@ func TestTerminalErrorEventDrainsStreamBeforeFailingJob(t *testing.T) {
 	if result.State != engine.StateFailed || result.Result != nil {
 		t.Fatalf("terminal error result = %+v", result)
 	}
+}
+
+func TestCanceledAttemptReturnsWhileEventStreamRemainsOpen(t *testing.T) {
+	t.Parallel()
+	backend := newAdmissionLivenessBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+	t.Cleanup(func() { close(backend.eventStream) })
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-canceled-open-stream",
+		RequestID:    "request-canceled-open-stream",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "cancel with open stream"},
+	})
+	waitBackendStarted(t, backend.fakeBackend)
+
+	if err := server.requestActiveJobShutdownCancel(context.Background(), job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	waitActiveJobGone(t, server, job.JobID)
 }
 
 func TestResultMessageWinsOverAssistantTextWithoutDuplication(t *testing.T) {

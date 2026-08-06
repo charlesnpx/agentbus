@@ -2456,8 +2456,10 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		if terminalErr != nil {
 			// The producer may need the consumer to make space for tail events
 			// before it can finish session cleanup and close the stream.
-			for range events {
-			}
+			go func() {
+				for range events {
+				}
+			}()
 			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), terminalState, terminalErr
 		}
 		select {
