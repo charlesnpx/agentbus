@@ -32,11 +32,12 @@ type Health struct {
 
 // SessionOpts configures a backend session default.
 type SessionOpts struct {
-	CWD     string
-	Write   bool
-	Model   string
-	Effort  string
-	Timeout time.Duration
+	CWD        string
+	EnvOverlay map[string]string
+	Write      bool
+	Model      string
+	Effort     string
+	Timeout    time.Duration
 }
 
 // TurnInput is the effective input for one backend turn.

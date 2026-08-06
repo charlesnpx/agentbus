@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +53,7 @@ type Session struct {
 	runner         command.Runner
 	driver         Driver
 	opts           engine.SessionOpts
+	envOverlay     []string
 	interruptGrace time.Duration
 
 	mu     sync.Mutex
@@ -81,6 +85,26 @@ func NewSession(config SessionConfig) (*Session, error) {
 	if config.Driver == nil {
 		return nil, errors.New("duplex driver is required")
 	}
+	envOverlay := make([]string, 0, len(config.Options.EnvOverlay))
+	for key, value := range config.Options.EnvOverlay {
+		switch {
+		case key == "":
+			return nil, errors.New("environment overlay key is required")
+		case strings.ContainsRune(key, '\x00'):
+			return nil, errors.New("environment overlay key must not contain NUL")
+		case strings.Contains(key, "="):
+			return nil, errors.New("environment overlay key must not contain equals")
+		}
+		envOverlay = append(envOverlay, key+"="+value)
+	}
+	// Map input has no insertion order, so make Windows key collision handling
+	// deterministic before the shared environment normalization below.
+	sort.Strings(envOverlay)
+
+	opts := config.Options
+	// The shared runtime owns the validated overlay and applies it after every
+	// driver ExecSpec. Drivers do not need the caller-owned map.
+	opts.EnvOverlay = nil
 	grace := config.InterruptGrace
 	if grace == 0 {
 		grace = DefaultInterruptGrace
@@ -88,7 +112,8 @@ func NewSession(config SessionConfig) (*Session, error) {
 	return &Session{
 		runner:         config.Runner,
 		driver:         config.Driver,
-		opts:           config.Options,
+		opts:           opts,
+		envOverlay:     normalizeEnvironment(runtime.GOOS, envOverlay),
 		interruptGrace: grace,
 		id:             config.ResumeID,
 	}, nil
@@ -171,6 +196,7 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 		}
 	}
 
+	spec.Env = normalizeEnvironment(runtime.GOOS, os.Environ(), spec.Env, s.envOverlay)
 	running, err := runner.Start(turnCtx, spec)
 	if err != nil {
 		if stdoutLog != nil {
@@ -208,6 +234,36 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	events := make(chan engine.Event, eventBufferSize)
 	go s.runTurn(driverCtx, driverCancel, turnCtx, turnCancel, input, resumeID, active, running.Stderr(), stderrWriter, &stderr, stdoutLog, stderrLog, events)
 	return events, nil
+}
+
+// normalizeEnvironment applies layers in order, retaining the last value for
+// each key. Windows environment variable names are case-insensitive.
+func normalizeEnvironment(goos string, layers ...[]string) []string {
+	count := 0
+	for _, layer := range layers {
+		count += len(layer)
+	}
+	env := make([]string, 0, count)
+	index := make(map[string]int, count)
+	for _, layer := range layers {
+		for _, entry := range layer {
+			key, _, hasValue := strings.Cut(entry, "=")
+			if !hasValue {
+				env = append(env, entry)
+				continue
+			}
+			if goos == "windows" {
+				key = strings.ToUpper(key)
+			}
+			if existing, ok := index[key]; ok {
+				env[existing] = entry
+				continue
+			}
+			index[key] = len(env)
+			env = append(env, entry)
+		}
+	}
+	return env
 }
 
 func (s *Session) runTurn(driverCtx context.Context, driverCancel context.CancelFunc, turnCtx context.Context, turnCancel context.CancelFunc, input engine.TurnInput, resumeID string, active *activeTurn, stderrPipe io.ReadCloser, stderrWriter io.Writer, stderr *bytes.Buffer, stdoutLog *engine.CappedLogWriter, stderrLog *engine.CappedLogWriter, events chan<- engine.Event) {
