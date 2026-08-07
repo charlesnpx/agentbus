@@ -82,6 +82,7 @@ const (
 	EventResultMessage = "ResultMessage"
 	EventTerminalError = "TerminalError"
 	EventTurnFinal     = "TurnFinal"
+	EventProgress      = "Progress"
 )
 
 // SetupProbeCache is written by setup after a live stream probe and read by

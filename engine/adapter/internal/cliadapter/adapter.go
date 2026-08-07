@@ -210,8 +210,7 @@ func (b *Backend) qualifySetupStream(probeCtx context.Context, events <-chan eng
 }
 
 func isLifecycleEvent(eventType string) bool {
-	// EventProgress belongs here when that later lifecycle-only event is added.
-	return eventType == engine.EventTurnFinal
+	return eventType == engine.EventProgress || eventType == engine.EventTurnFinal
 }
 
 func (b *Backend) setupProbe(probed ProbedBackendDescriptor) engine.BackendSetupProbe {

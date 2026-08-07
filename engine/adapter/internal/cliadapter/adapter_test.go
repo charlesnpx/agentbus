@@ -50,8 +50,9 @@ func TestCapEventKeepsRawTextOutOfJSONMetadata(t *testing.T) {
 	}
 }
 
-func TestSetupQualificationRejectsLifecycleOnlyTurnFinal(t *testing.T) {
-	events := make(chan engine.Event, 1)
+func TestSetupQualificationRejectsLifecycleOnlyProgressAndTurnFinal(t *testing.T) {
+	events := make(chan engine.Event, 2)
+	events <- engine.Event{Type: engine.EventProgress}
 	events <- engine.Event{
 		Type: engine.EventTurnFinal,
 		TurnFinal: &engine.TurnFinalObservation{
