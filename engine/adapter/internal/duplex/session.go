@@ -257,6 +257,13 @@ func normalizeEnvironment(goos string, layers ...[]string) []string {
 	for _, layer := range layers {
 		for _, entry := range layer {
 			key, _, hasValue := strings.Cut(entry, "=")
+			// Windows per-drive working-directory variables begin with "=";
+			// their key ends at the following "=".
+			if strings.HasPrefix(entry, "=") {
+				if driveKey, _, hasDriveValue := strings.Cut(entry[1:], "="); hasDriveValue {
+					key = "=" + driveKey
+				}
+			}
 			if !hasValue {
 				env = append(env, entry)
 				continue

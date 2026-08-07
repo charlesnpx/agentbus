@@ -531,11 +531,11 @@ func TestNewSessionRejectsInvalidEnvOverlayKeys(t *testing.T) {
 
 func TestNormalizeEnvironmentWindowsCaseInsensitiveLastWriteWins(t *testing.T) {
 	got := normalizeEnvironment("windows",
-		[]string{"Path=inherited", "OTHER=keep"},
+		[]string{"Path=inherited", "OTHER=keep", "=C:=C:\\one", "=D:=D:\\two"},
 		[]string{"PATH=driver"},
-		[]string{"path=overlay"},
+		[]string{"path=overlay", "=C:=C:\\three"},
 	)
-	want := []string{"path=overlay", "OTHER=keep"}
+	want := []string{"path=overlay", "OTHER=keep", "=C:=C:\\three", "=D:=D:\\two"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("windows normalized environment = %#v, want %#v", got, want)
 	}
