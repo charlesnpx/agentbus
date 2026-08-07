@@ -423,6 +423,86 @@ func TestClaudeAnswersControlRequestsAndMapsAssistantEvents(t *testing.T) {
 	}
 }
 
+func TestClaudeThinkingFramesEmitRateLimitedProgress(t *testing.T) {
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("think")
+		peer.write(map[string]any{"type": "thinking", "thinking": "first private thought"})
+		peer.write(map[string]any{"type": "thinking", "thinking": "second private thought"})
+		peer.emitResult("success", false, "done")
+	})
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "think"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	progress := eventsOfType(got, engine.EventProgress)
+	if len(progress) != 1 {
+		t.Fatalf("progress events = %#v, want one rate-limited event; all events = %#v", progress, got)
+	}
+	if progress[0].Text != "" || progress[0].Metadata != nil {
+		t.Fatalf("progress event = %#v, want no text or metadata", progress[0])
+	}
+	if resultText(got) != "done" {
+		t.Fatalf("events = %#v, want result done", got)
+	}
+}
+
+func TestClaudeAssistantThinkingBlockEmitsProgress(t *testing.T) {
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("think")
+		peer.write(map[string]any{
+			"type": "assistant",
+			"message": map[string]any{
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "thinking", "thinking": "private thought"},
+				},
+			},
+		})
+		peer.emitResult("success", false, "done")
+	})
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "think"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	progress := eventsOfType(got, engine.EventProgress)
+	if len(progress) != 1 || progress[0].Text != "" || progress[0].Metadata != nil {
+		t.Fatalf("progress events = %#v, want one empty progress event; all events = %#v", progress, got)
+	}
+}
+
+func TestClaudeUnknownFramesRetainAgentTextHandling(t *testing.T) {
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("unknown")
+		peer.write(map[string]any{"type": "future_event", "text": "future payload"})
+		peer.emitResult("success", false, "done")
+	})
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "unknown"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if !containsEvent(got, engine.EventAgentText, "future payload") {
+		t.Fatalf("events = %#v, want unknown frame text as agent text", got)
+	}
+	if containsEventType(got, engine.EventProgress) {
+		t.Fatalf("events = %#v, did not want progress for unknown frame", got)
+	}
+}
+
 func TestClaudeDiscoveryParsesFakeHelp(t *testing.T) {
 	discovery, err := New(Options{Binary: "fake-claude"}).(interface {
 		DiscoverModels(context.Context, command.ProbeRunner) (*engine.ModelDiscovery, error)
@@ -840,6 +920,16 @@ func containsEventType(events []engine.Event, typ string) bool {
 		}
 	}
 	return false
+}
+
+func eventsOfType(events []engine.Event, typ string) []engine.Event {
+	var out []engine.Event
+	for _, ev := range events {
+		if ev.Type == typ {
+			out = append(out, ev)
+		}
+	}
+	return out
 }
 
 func containsModel(events []engine.Event, model string) bool {

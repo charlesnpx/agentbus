@@ -17,6 +17,8 @@ import (
 
 const defaultInitializeTimeout = 60 * time.Second
 
+const progressEmissionInterval = time.Second
+
 type streamJSONDriver struct {
 	binary            string
 	initializeTimeout time.Duration
@@ -24,10 +26,11 @@ type streamJSONDriver struct {
 }
 
 type claudeStream struct {
-	driver  *streamJSONDriver
-	conn    *duplex.Conn
-	emit    duplex.EmitFunc
-	pending []duplex.Frame
+	driver       *streamJSONDriver
+	conn         *duplex.Conn
+	emit         duplex.EmitFunc
+	pending      []duplex.Frame
+	lastProgress time.Time
 }
 
 func newStreamJSONDriver(binary string) *streamJSONDriver {
@@ -235,7 +238,12 @@ func (s *claudeStream) handleFrame(ctx context.Context, frame duplex.Frame, sess
 	if id := sessionIDFrom(obj); id != "" {
 		*sessionID = id
 	}
-	switch strings.ToLower(firstString(obj, "type")) {
+	frameType := strings.ToLower(firstString(obj, "type"))
+	if isClaudeProgressFrameType(frameType) {
+		s.emitProgress()
+		return false, nil
+	}
+	switch frameType {
 	case "control_request":
 		_, err := s.handleControlRequest(ctx, obj)
 		return false, err
@@ -315,7 +323,12 @@ func (s *claudeStream) emitAssistant(obj map[string]any) {
 		if !ok {
 			continue
 		}
-		switch firstString(block, "type") {
+		blockType := strings.ToLower(firstString(block, "type"))
+		if isClaudeProgressFrameType(blockType) {
+			s.emitProgress()
+			continue
+		}
+		switch blockType {
 		case "text":
 			if text := textValue(block["text"]); text != "" {
 				s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
@@ -353,6 +366,26 @@ func (s *claudeStream) emitResult(obj map[string]any) {
 func (s *claudeStream) emitEvent(ev engine.Event) {
 	if s.emit != nil {
 		s.emit(ev)
+	}
+}
+
+func (s *claudeStream) emitProgress() {
+	now := time.Now()
+	if !s.lastProgress.IsZero() && now.Sub(s.lastProgress) < progressEmissionInterval {
+		return
+	}
+	s.lastProgress = now
+	s.emitEvent(engine.Event{Type: engine.EventProgress})
+}
+
+func isClaudeProgressFrameType(frameType string) bool {
+	// Keep this list concrete: unknown and system frames must retain their
+	// existing handling so they cannot mask a stalled backend.
+	switch frameType {
+	case "thinking":
+		return true
+	default:
+		return false
 	}
 }
 
