@@ -1111,10 +1111,10 @@ func (s *Store) withJobLock(jobID string, fn func() error) error {
 		return err
 	}
 	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	if err := lockJobFile(f); err != nil {
 		return err
 	}
-	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+	defer func() { _ = unlockJobFile(f) }()
 	return fn()
 }
 
