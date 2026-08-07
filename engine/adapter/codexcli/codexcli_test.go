@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,17 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/command"
 )
+
+func TestStaticDefaultEffortsAcceptMaxAndUltra(t *testing.T) {
+	for _, effort := range []string{"max", "ultra"} {
+		t.Run(effort, func(t *testing.T) {
+			backend := New(Options{Binary: "fake-codex"})
+			if _, err := backend.Start(context.Background(), engine.SessionOpts{Effort: effort}); err != nil {
+				t.Fatalf("Start() with static default effort %q: %v", effort, err)
+			}
+		})
+	}
+}
 
 func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing.T) {
 	t.Run("handshake order", func(t *testing.T) {
@@ -65,6 +77,105 @@ func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing
 			t.Fatalf("events = %#v, want terminal initialize error", got)
 		}
 	})
+}
+
+func TestAppServerTurnSandboxPolicyFollowsWritePolicy(t *testing.T) {
+	cwd := t.TempDir()
+	tests := []struct {
+		name        string
+		writePolicy WritePolicy
+		write       bool
+		want        map[string]any
+	}{
+		{
+			name:  "zero value write remains workspace offline",
+			write: true,
+			want: map[string]any{
+				"type":          "workspaceWrite",
+				"networkAccess": false,
+				"writableRoots": []any{cwd},
+			},
+		},
+		{
+			name:        "workspace network write enables network",
+			writePolicy: WritePolicyWorkspaceNetwork,
+			write:       true,
+			want: map[string]any{
+				"type":          "workspaceWrite",
+				"networkAccess": true,
+				"writableRoots": []any{cwd},
+			},
+		},
+		{
+			name:        "trusted write uses unrestricted policy",
+			writePolicy: WritePolicyTrusted,
+			write:       true,
+			want: map[string]any{
+				"type": "dangerFullAccess",
+			},
+		},
+		{
+			name:  "zero value read is read only offline",
+			write: false,
+			want: map[string]any{
+				"type":          "readOnly",
+				"networkAccess": false,
+			},
+		},
+		{
+			name:        "workspace network read is read only offline",
+			writePolicy: WritePolicyWorkspaceNetwork,
+			write:       false,
+			want: map[string]any{
+				"type":          "readOnly",
+				"networkAccess": false,
+			},
+		},
+		{
+			name:        "trusted read is read only offline",
+			writePolicy: WritePolicyTrusted,
+			write:       false,
+			want: map[string]any{
+				"type":          "readOnly",
+				"networkAccess": false,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+				peer := newAppServerPeer(t, proc)
+				peer.handshake()
+				thread := peer.expectRequest("thread/start")
+				peer.respond(thread, threadResult("thread-1"))
+				turn := peer.expectRequest("turn/start")
+				params, ok := turn["params"].(map[string]any)
+				if !ok {
+					t.Fatalf("turn/start params = %#v", turn["params"])
+				}
+				got, ok := params["sandboxPolicy"].(map[string]any)
+				if !ok {
+					t.Fatalf("turn/start sandboxPolicy = %#v", params["sandboxPolicy"])
+				}
+				if !reflect.DeepEqual(got, test.want) {
+					t.Fatalf("turn/start sandboxPolicy = %#v, want %#v", got, test.want)
+				}
+				peer.respond(turn, turnResult("turn-1"))
+				peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+			})
+
+			session := startFakeCodexSessionWithOptions(t, Options{
+				Binary:      "fake-codex",
+				WritePolicy: test.writePolicy,
+			}, engine.SessionOpts{CWD: cwd})
+			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello", Write: test.write}, runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = collectEventsWithTimeout(t, events, 2*time.Second)
+		})
+	}
 }
 
 func TestAppServerThreadsStartThenResumeWithReturnedID(t *testing.T) {
@@ -124,7 +235,7 @@ func TestAppServerCompletedTurnUsesLastCompletedAgentMessageAsResult(t *testing.
 		turn := peer.expectRequest("turn/start")
 		peer.respond(turn, turnResult("turn-1"))
 		peer.notify("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1", "delta": "streamed "})
-		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-1", "type": "agentMessage", "text": "draft"}))
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-1", "type": "agentMessage", "text": "streamed "}))
 		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-2", "type": "agentMessage", "text": "final answer"}))
 		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
 	})
@@ -138,8 +249,41 @@ func TestAppServerCompletedTurnUsesLastCompletedAgentMessageAsResult(t *testing.
 	if resultText(got) != "final answer" {
 		t.Fatalf("events = %#v, want authoritative final answer result", got)
 	}
-	if !containsEvent(got, engine.EventAgentText, "streamed ") || !containsEvent(got, engine.EventAgentText, "draft") {
-		t.Fatalf("events = %#v, want streamed and completed agent text", got)
+	if resultRawText(got) != "final answer" {
+		t.Fatalf("events = %#v, want authoritative final answer raw result", got)
+	}
+	if agentText := agentTextTexts(got); !reflect.DeepEqual(agentText, []string{"streamed ", "final answer"}) {
+		t.Fatalf("agent text = %#v, want streamed delta once and completed text without prior delta once", agentText)
+	}
+}
+
+func TestAppServerCompletedTurnUsesCompletedTextAfterMismatchedAgentDelta(t *testing.T) {
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1", "delta": "streamed "})
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "item-1", "type": "agentMessage", "text": "draft"}))
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if resultText(got) != "draft" {
+		t.Fatalf("events = %#v, want authoritative completed result", got)
+	}
+	if resultRawText(got) != "draft" {
+		t.Fatalf("events = %#v, want authoritative completed raw result", got)
+	}
+	if agentText := agentTextTexts(got); !reflect.DeepEqual(agentText, []string{"streamed "}) {
+		t.Fatalf("agent text = %#v, want streamed delta only", agentText)
 	}
 }
 
@@ -164,6 +308,12 @@ func TestAppServerCompletedTurnUsesAccumulatedAgentMessageDeltasAsResult(t *test
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
 	if resultText(got) != "Hello, world" {
 		t.Fatalf("events = %#v, want accumulated delta result", got)
+	}
+	if resultRawText(got) != "Hello, world" {
+		t.Fatalf("events = %#v, want accumulated delta raw result", got)
+	}
+	if agentText := agentTextTexts(got); !reflect.DeepEqual(agentText, []string{"Hello, ", "world"}) {
+		t.Fatalf("agent text = %#v, want accumulated delta chunks", agentText)
 	}
 }
 
@@ -344,7 +494,7 @@ func TestAppServerSetupQualifyDiscoversModelsAndRequiresOne(t *testing.T) {
 				},
 			})
 		})
-		driver := newAppServerDriver("fake-codex")
+		driver := newAppServerDriver("fake-codex", WritePolicyWorkspaceOffline)
 		discovery, err := driver.SetupQualify(context.Background(), runner, engine.SessionOpts{CWD: t.TempDir()})
 		if err != nil {
 			t.Fatal(err)
@@ -367,7 +517,7 @@ func TestAppServerSetupQualifyDiscoversModelsAndRequiresOne(t *testing.T) {
 			req := peer.expectRequest("model/list")
 			peer.respond(req, map[string]any{"data": []any{}})
 		})
-		driver := newAppServerDriver("fake-codex")
+		driver := newAppServerDriver("fake-codex", WritePolicyWorkspaceOffline)
 		discovery, err := driver.SetupQualify(context.Background(), runner, engine.SessionOpts{CWD: t.TempDir()})
 		if err == nil || !strings.Contains(err.Error(), "no usable models") || len(discovery.Models) != 0 {
 			t.Fatalf("discovery=%#v err=%v, want zero-model qualification failure", discovery, err)
@@ -389,7 +539,12 @@ func TestCodexPreflightUsesAppServerStreamSchema(t *testing.T) {
 
 func startFakeCodexSession(t *testing.T, opts engine.SessionOpts) engine.Session {
 	t.Helper()
-	backend := New(Options{Binary: "fake-codex"})
+	return startFakeCodexSessionWithOptions(t, Options{Binary: "fake-codex"}, opts)
+}
+
+func startFakeCodexSessionWithOptions(t *testing.T, adapterOpts Options, opts engine.SessionOpts) engine.Session {
+	t.Helper()
+	backend := New(adapterOpts)
 	session, err := backend.Start(context.Background(), opts)
 	if err != nil {
 		t.Fatal(err)
@@ -747,11 +902,31 @@ func containsEvent(events []engine.Event, typ, sub string) bool {
 	return false
 }
 
+func agentTextTexts(events []engine.Event) []string {
+	var texts []string
+	for _, ev := range events {
+		if ev.Type == engine.EventAgentText {
+			texts = append(texts, ev.Text)
+		}
+	}
+	return texts
+}
+
 func resultText(events []engine.Event) string {
 	var out string
 	for _, ev := range events {
 		if ev.Type == engine.EventResultMessage {
 			out = ev.Text
+		}
+	}
+	return out
+}
+
+func resultRawText(events []engine.Event) string {
+	var out string
+	for _, ev := range events {
+		if ev.Type == engine.EventResultMessage {
+			out = ev.RawText
 		}
 	}
 	return out

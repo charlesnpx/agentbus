@@ -50,6 +50,39 @@ func TestCapEventKeepsRawTextOutOfJSONMetadata(t *testing.T) {
 	}
 }
 
+func TestSetupQualificationRejectsLifecycleOnlyProgressAndTurnFinal(t *testing.T) {
+	events := make(chan engine.Event, 2)
+	events <- engine.Event{Type: engine.EventProgress}
+	events <- engine.Event{
+		Type: engine.EventTurnFinal,
+		TurnFinal: &engine.TurnFinalObservation{
+			BackendSessionID: "resume-1",
+		},
+	}
+	close(events)
+
+	err := (&Backend{NameValue: "fake"}).qualifySetupStream(context.Background(), events)
+	if err == nil || !strings.Contains(err.Error(), "setup stream probe produced no semantic JSON events") {
+		t.Fatalf("qualification error = %v, want no semantic provider events", err)
+	}
+}
+
+func TestTurnFinalPayloadDoesNotChangeEventJSON(t *testing.T) {
+	event := engine.Event{
+		Type: engine.EventTurnFinal,
+		TurnFinal: &engine.TurnFinalObservation{
+			BackendSessionID: "resume-1",
+		},
+	}
+	wire, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(wire), "turnFinal") || strings.Contains(string(wire), "resume-1") {
+		t.Fatalf("TurnFinal payload leaked into event JSON: %s", wire)
+	}
+}
+
 func TestSessionTurnSurfacesMalformedStreamAsTerminalError(t *testing.T) {
 	fake := fakeTerminalErrorCLI(t)
 	backend := &Backend{
@@ -71,6 +104,7 @@ func TestSessionTurnSurfacesMalformedStreamAsTerminalError(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEvents(events)
+	got = withoutTurnFinal(got)
 	if len(got) == 0 || got[len(got)-1].Type != engine.EventTerminalError || !strings.Contains(got[len(got)-1].Text, "malformed backend stream") {
 		t.Fatalf("events = %#v, want terminal malformed-stream error", got)
 	}
@@ -97,6 +131,7 @@ func TestSessionTurnSurfacesNonzeroExitAsTerminalError(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEvents(events)
+	got = withoutTurnFinal(got)
 	if len(got) == 0 || got[len(got)-1].Type != engine.EventTerminalError || !strings.Contains(got[len(got)-1].Text, "backend exploded") {
 		t.Fatalf("events = %#v, want terminal nonzero-exit error", got)
 	}
@@ -125,6 +160,7 @@ func TestSessionTurnPreservesLargeStderrTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEventsWithTimeout(t, events, 3*time.Second)
+	got = withoutTurnFinal(got)
 	if ctx.Err() != nil {
 		t.Fatalf("turn context ended unexpectedly: %v", ctx.Err())
 	}
@@ -279,6 +315,7 @@ func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEvents(events)
+	got = withoutTurnFinal(got)
 	if len(got) != 1 || got[0].Type != engine.EventAgentText || got[0].Text != "ok" {
 		t.Fatalf("events = %#v, want parsed adapter event", got)
 	}
@@ -333,6 +370,7 @@ func TestOneShotBackendRunsThroughDuplexRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	got = withoutTurnFinal(got)
 	if len(got) != 3 {
 		t.Fatalf("events = %#v, want warning, agent text, and result", got)
 	}
@@ -408,6 +446,7 @@ func TestBackendWithDriverPreservesAdmissionProbeAndRunsDuplexTurn(t *testing.T)
 		t.Fatal(err)
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	got = withoutTurnFinal(got)
 	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[0].Text != "duplex:hello" || got[1].Type != engine.EventResultMessage {
 		t.Fatalf("events = %#v, want duplex agent text and result", got)
 	}
@@ -664,6 +703,7 @@ func TestBackendWithDriverInterruptForwardsToActiveDuplexTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	got = withoutTurnFinal(got)
 	if driver.nativeInterrupts.Load() != 1 {
 		t.Fatalf("native interrupt count = %d, want 1", driver.nativeInterrupts.Load())
 	}
@@ -696,6 +736,7 @@ func TestBackendWithDriverNativeInterruptReportsSettlement(t *testing.T) {
 		t.Fatalf("NativeInterrupt = (%t, %v), want (true, nil)", settled, err)
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	got = withoutTurnFinal(got)
 	if driver.nativeInterrupts.Load() != 1 {
 		t.Fatalf("native interrupt count = %d, want 1", driver.nativeInterrupts.Load())
 	}
@@ -729,6 +770,7 @@ func TestBackendWithDriverRejectsConcurrentTurn(t *testing.T) {
 	}
 	close(block)
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	got = withoutTurnFinal(got)
 	if len(got) != 1 || got[0].Type != engine.EventResultMessage {
 		t.Fatalf("events = %#v, want first turn result", got)
 	}
@@ -760,6 +802,7 @@ func TestSessionTurnSurfacesOutputTruncationAsTerminalError(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEvents(events)
+	got = withoutTurnFinal(got)
 	if len(got) != 2 || got[0].Type != engine.EventAgentText || got[1].Type != engine.EventTerminalError || !strings.Contains(got[1].Text, command.ErrOutputTruncated.Error()) {
 		t.Fatalf("events = %#v, want parsed event followed by truncation terminal error", got)
 	}
@@ -839,6 +882,16 @@ func collectEvents(ch <-chan engine.Event) []engine.Event {
 		out = append(out, ev)
 	}
 	return out
+}
+
+func withoutTurnFinal(events []engine.Event) []engine.Event {
+	withoutFinal := make([]engine.Event, 0, len(events))
+	for _, event := range events {
+		if event.Type != engine.EventTurnFinal {
+			withoutFinal = append(withoutFinal, event)
+		}
+	}
+	return withoutFinal
 }
 
 func collectEventsWithTimeout(t *testing.T, ch <-chan engine.Event, timeout time.Duration) []engine.Event {

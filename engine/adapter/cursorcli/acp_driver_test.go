@@ -98,8 +98,8 @@ func TestACPFreshWritableTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEvents(t, events, 2*time.Second)
-	if spec := runner.lastSpec(); !slices.Equal(spec.Argv, []string{"fake-cursor", "--model", "requested-model", "acp"}) || spec.Dir != cwd || spec.Env != nil {
-		t.Fatalf("exec spec = %#v", spec)
+	if spec := runner.lastSpec(); !slices.Equal(spec.Argv, []string{"fake-cursor", "--model", "requested-model", "acp"}) || spec.Dir != cwd || spec.Env == nil {
+		t.Fatalf("exec argv=%#v dir=%q envSet=%v", spec.Argv, spec.Dir, spec.Env != nil)
 	}
 	if session.ID() != "session-write" {
 		t.Fatalf("session id = %q, want session-write", session.ID())
@@ -353,8 +353,8 @@ func TestACPSetupQualification(t *testing.T) {
 		t.Fatalf("ACP qualification discovery = %#v", qualified)
 	}
 	spec := runner.lastSpec()
-	if !slices.Equal(spec.Argv, []string{"fake-cursor", "acp"}) || spec.Env != nil {
-		t.Fatalf("qualification exec spec = %#v", spec)
+	if !slices.Equal(spec.Argv, []string{"fake-cursor", "acp"}) || spec.Env == nil {
+		t.Fatalf("qualification exec argv=%#v envSet=%v", spec.Argv, spec.Env != nil)
 	}
 	serialized, err := json.Marshal(qualified)
 	if err != nil || strings.Contains(string(serialized), "credential") || strings.Contains(strings.Join(spec.Argv, "\x00"), "credential") {

@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -50,9 +53,14 @@ type Session struct {
 	runner         command.Runner
 	driver         Driver
 	opts           engine.SessionOpts
+	envOverlay     []string
 	interruptGrace time.Duration
 
-	mu     sync.Mutex
+	mu sync.Mutex
+	// id is the provider-confirmed resume ID supplied to the next turn. It is
+	// retained after errored or interrupted turns, so that turn resumes the same
+	// conversation. Callers needing a fresh conversation must discard this
+	// Session and Start a new one.
 	id     string
 	active *activeTurn
 }
@@ -81,6 +89,28 @@ func NewSession(config SessionConfig) (*Session, error) {
 	if config.Driver == nil {
 		return nil, errors.New("duplex driver is required")
 	}
+	envOverlay := make([]string, 0, len(config.Options.EnvOverlay))
+	for key, value := range config.Options.EnvOverlay {
+		switch {
+		case key == "":
+			return nil, errors.New("environment overlay key is required")
+		case strings.ContainsRune(key, '\x00'):
+			return nil, errors.New("environment overlay key must not contain NUL")
+		case strings.Contains(key, "="):
+			return nil, errors.New("environment overlay key must not contain equals")
+		case strings.ContainsRune(value, '\x00'):
+			return nil, errors.New("environment overlay value must not contain NUL")
+		}
+		envOverlay = append(envOverlay, key+"="+value)
+	}
+	// Map input has no insertion order, so make Windows key collision handling
+	// deterministic before the shared environment normalization below.
+	sort.Strings(envOverlay)
+
+	opts := config.Options
+	// The shared runtime owns the validated overlay and applies it after every
+	// driver ExecSpec. Drivers do not need the caller-owned map.
+	opts.EnvOverlay = nil
 	grace := config.InterruptGrace
 	if grace == 0 {
 		grace = DefaultInterruptGrace
@@ -88,7 +118,8 @@ func NewSession(config SessionConfig) (*Session, error) {
 	return &Session{
 		runner:         config.Runner,
 		driver:         config.Driver,
-		opts:           config.Options,
+		opts:           opts,
+		envOverlay:     normalizeEnvironment(runtime.GOOS, envOverlay),
 		interruptGrace: grace,
 		id:             config.ResumeID,
 	}, nil
@@ -171,6 +202,10 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 		}
 	}
 
+	// Contract: driver ExecSpec.Env is an ADDITIVE layer over the full inherited
+	// process environment, not a replacement or isolation mechanism (no current
+	// driver sets it). The session overlay is applied last and wins.
+	spec.Env = normalizeEnvironment(runtime.GOOS, os.Environ(), spec.Env, s.envOverlay)
 	running, err := runner.Start(turnCtx, spec)
 	if err != nil {
 		if stdoutLog != nil {
@@ -210,25 +245,49 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	return events, nil
 }
 
+// normalizeEnvironment applies layers in order, retaining the last value for
+// each key. Windows environment variable names are case-insensitive.
+func normalizeEnvironment(goos string, layers ...[]string) []string {
+	count := 0
+	for _, layer := range layers {
+		count += len(layer)
+	}
+	env := make([]string, 0, count)
+	index := make(map[string]int, count)
+	for _, layer := range layers {
+		for _, entry := range layer {
+			key, _, hasValue := strings.Cut(entry, "=")
+			// Windows per-drive working-directory variables begin with "=";
+			// their key ends at the following "=".
+			if strings.HasPrefix(entry, "=") {
+				if driveKey, _, hasDriveValue := strings.Cut(entry[1:], "="); hasDriveValue {
+					key = "=" + driveKey
+				}
+			}
+			if !hasValue {
+				env = append(env, entry)
+				continue
+			}
+			if goos == "windows" {
+				key = strings.ToUpper(key)
+			}
+			if existing, ok := index[key]; ok {
+				env[existing] = entry
+				continue
+			}
+			index[key] = len(env)
+			env = append(env, entry)
+		}
+	}
+	return env
+}
+
 func (s *Session) runTurn(driverCtx context.Context, driverCancel context.CancelFunc, turnCtx context.Context, turnCancel context.CancelFunc, input engine.TurnInput, resumeID string, active *activeTurn, stderrPipe io.ReadCloser, stderrWriter io.Writer, stderr *bytes.Buffer, stdoutLog *engine.CappedLogWriter, stderrLog *engine.CappedLogWriter, events chan<- engine.Event) {
 	defer close(events)
 	defer turnCancel()
 	defer driverCancel()
 	defer s.clearActive(active)
 	var drainDone chan struct{}
-	defer func() {
-		if drainDone == nil {
-			active.conn.drainReader()
-		} else {
-			<-drainDone
-		}
-		if stdoutLog != nil {
-			_ = stdoutLog.Close()
-		}
-		if stderrLog != nil {
-			_ = stderrLog.Close()
-		}
-	}()
 
 	stderrDone := make(chan error, 1)
 	go func() {
@@ -254,10 +313,33 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	observation, _ := active.retirement.wait(context.Background())
 	stderrCopyErr := <-stderrDone
 
-	if result.err == nil && result.resumeID != "" {
+	if result.resumeID != "" {
 		s.setID(result.resumeID)
 	}
-	emitCompletionEvents(turnCtx, events, result.err, earlyExit, observation, stderr, stderrCopyErr)
+	// Capture settled state before teardown releases the session for another turn.
+	// A later turn may install a new resume ID, and teardown itself can outlive a
+	// caller's deadline.
+	completedSessionID := s.ID()
+	disposition := captureTurnDisposition(turnCtx)
+	emitCompletionEvents(disposition, events, result.err, earlyExit, observation, stderr, stderrCopyErr)
+
+	if drainDone == nil {
+		active.conn.drainReader()
+	} else {
+		<-drainDone
+	}
+	if stdoutLog != nil {
+		_ = stdoutLog.Close()
+	}
+	if stderrLog != nil {
+		_ = stderrLog.Close()
+	}
+
+	// Clear active before channel closure, preserving the existing guarantee that
+	// a caller that observes closure can begin its next turn. The deferred call
+	// remains as the panic-safe fallback.
+	s.clearActive(active)
+	events <- turnFinalEvent(completedSessionID, disposition, observation)
 }
 
 func waitForTurnResult(driverDone <-chan turnResult, retirement *retirement) (turnResult, bool) {
@@ -459,8 +541,24 @@ func (s *Session) clearActive(active *activeTurn) {
 	}
 }
 
-func emitCompletionEvents(ctx context.Context, events chan<- engine.Event, driverErr error, earlyExit bool, observation command.FinalObservation, stderr *bytes.Buffer, stderrCopyErr error) {
-	if ctx.Err() == context.DeadlineExceeded {
+type turnDisposition struct {
+	timedOut bool
+	canceled bool
+}
+
+func captureTurnDisposition(ctx context.Context) turnDisposition {
+	if ctx == nil {
+		return turnDisposition{}
+	}
+	err := ctx.Err()
+	return turnDisposition{
+		timedOut: errors.Is(err, context.DeadlineExceeded),
+		canceled: errors.Is(err, context.Canceled),
+	}
+}
+
+func emitCompletionEvents(disposition turnDisposition, events chan<- engine.Event, driverErr error, earlyExit bool, observation command.FinalObservation, stderr *bytes.Buffer, stderrCopyErr error) {
+	if disposition.timedOut {
 		events <- warning("backend turn timed out")
 		return
 	}
@@ -487,6 +585,40 @@ func emitCompletionEvents(ctx context.Context, events chan<- engine.Event, drive
 	if stderrCopyErr != nil {
 		events <- terminalError(stderrCopyErr.Error())
 	}
+}
+
+func turnFinalEvent(backendSessionID string, disposition turnDisposition, observation command.FinalObservation) engine.Event {
+	return engine.Event{
+		Type: engine.EventTurnFinal,
+		TurnFinal: &engine.TurnFinalObservation{
+			BackendSessionID: backendSessionID,
+			ReturnCodeKnown:  observation.Exit.Exited,
+			ReturnCode:       observation.Exit.Code,
+			Signal:           observation.Exit.Signal,
+			TimedOut:         disposition.timedOut,
+			Canceled:         disposition.canceled,
+			ExecutionFailed:  hasExecutionFailure(observation.ExecutionErr),
+			CleanupFailed:    observation.CleanupErr != nil,
+		},
+	}
+}
+
+func hasExecutionFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, wrapped := range joined.Unwrap() {
+			if hasExecutionFailure(wrapped) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return hasExecutionFailure(wrapped.Unwrap())
+	}
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 func turnEmitter(events chan<- engine.Event) EmitFunc {
