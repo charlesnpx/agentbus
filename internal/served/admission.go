@@ -1225,7 +1225,11 @@ func (s *Server) refreshAdmissionBackendOnSetupCacheChange(ctx context.Context, 
 	if probeErr != nil {
 		probeErr = admissionProbeFailureError(name, probeErr)
 	}
-	s.finishAdmissionBackendSetupCacheRefresh(instance, name, fingerprint, probed, probeErr, cacheStable, true)
+	// A failed post-probe read cannot establish that this revision is still the
+	// cache revision. Leave the prior fingerprint in place so the next
+	// submission can retry the same candidate. A known different revision is
+	// still consumed: the next refresh will observe and probe that revision.
+	s.finishAdmissionBackendSetupCacheRefresh(instance, name, fingerprint, probed, probeErr, cacheStable, postKnown)
 }
 
 func (s *Server) finishAdmissionBackendSetupCacheRefresh(instance *admissionInstance, name, fingerprint string, probed engine.Backend, probeErr error, cacheStable, consumeFingerprint bool) {
