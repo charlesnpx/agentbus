@@ -64,7 +64,7 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 }
 
 func projectedFinalAttemptTiming(record SafetyRecord, public PublicState) (*time.Time, *time.Time) {
-	if !terminalPublicState(public) {
+	if !terminalPublicState(public) || record.FinalAttemptStartedAt == nil || record.FinalAttemptEndedAt == nil {
 		return nil, nil
 	}
 	return clonePtr(record.FinalAttemptStartedAt), clonePtr(record.FinalAttemptEndedAt)

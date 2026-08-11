@@ -2600,7 +2600,7 @@ func admissionCleanupDisposition(record model.SafetyRecord) string {
 }
 
 func authorityFinalAttemptTiming(projection model.JobProjection) (*time.Time, *time.Time) {
-	if projection.Decision != model.DecisionTerminal {
+	if projection.Decision != model.DecisionTerminal || projection.FinalAttemptStartedAt == nil || projection.FinalAttemptEndedAt == nil {
 		return nil, nil
 	}
 	return cloneTime(projection.FinalAttemptStartedAt), cloneTime(projection.FinalAttemptEndedAt)

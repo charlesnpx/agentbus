@@ -133,6 +133,27 @@ func TestProjectDerivesReadModelFromSafetyRecordOnly(t *testing.T) {
 	}
 }
 
+func TestProjectSuppressesPartialTerminalFinalAttemptTiming(t *testing.T) {
+	startedAt := time.Date(2026, 8, 11, 16, 0, 0, 0, time.UTC)
+	record := reducerCanceledRetiredRecord(t)
+	record = reducerMustApply(t, record, RecordFinalAttemptStart{JobID: reducerJobID(), StartedAt: startedAt})
+	record = reducerMustApply(t, record, Finalize{
+		Ref:    reducerRef(),
+		Intent: TerminalIntent{Outcome: OutcomeCanceled, Cause: CauseCanceledBeforeAuthorization},
+	})
+	if record.FinalAttemptStartedAt == nil || !record.FinalAttemptStartedAt.Equal(startedAt) || record.FinalAttemptEndedAt != nil {
+		t.Fatalf("durable partial timing = start:%v end:%v, want %s/<nil>", record.FinalAttemptStartedAt, record.FinalAttemptEndedAt, startedAt)
+	}
+
+	projection, err := Project(record, ProjectionMetadata{})
+	if err != nil {
+		t.Fatalf("Project partial terminal timing: %v", err)
+	}
+	if projection.FinalAttemptStartedAt != nil || projection.FinalAttemptEndedAt != nil {
+		t.Fatalf("partial terminal projection timing = start:%v end:%v, want absent", projection.FinalAttemptStartedAt, projection.FinalAttemptEndedAt)
+	}
+}
+
 func TestProjectKeepsCompletedOutcomeWhenCleanupUnresolved(t *testing.T) {
 	record := reducerConsumedRecord(t)
 	record = reducerMustApply(t, record, ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeCompleted})

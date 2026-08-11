@@ -1799,6 +1799,45 @@ func TestAdmissionRecoveryPersistsFinalAttemptTimingForRestartedRun(t *testing.T
 	}
 }
 
+func TestStrictAuthorityTerminalTimingSuppressesPartialPair(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	accepted := acceptIdentifiedAuthorityWork(t, server, "partial-terminal-timing")
+	startedAt := time.Date(2026, 8, 11, 16, 0, 0, 0, time.UTC)
+
+	if _, err := server.admissionReady.RecordFinalAttemptStart(ctx, accepted.Record.JobID, startedAt); err != nil {
+		t.Fatalf("RecordFinalAttemptStart() error = %v", err)
+	}
+	if _, err := server.admissionReady.Finalize(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.TerminalIntent{
+		Outcome: model.OutcomeCanceled,
+		Cause:   model.CauseCanceledBeforeAuthorization,
+	}); err != nil {
+		t.Fatalf("Finalize() error = %v", err)
+	}
+
+	image, err := server.admissionReady.LoadJob(ctx, accepted.Record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image.Safety.Value.FinalAttemptStartedAt == nil || !image.Safety.Value.FinalAttemptStartedAt.Equal(startedAt) || image.Safety.Value.FinalAttemptEndedAt != nil {
+		t.Fatalf("durable partial timing = start:%v end:%v, want %s/<nil>", image.Safety.Value.FinalAttemptStartedAt, image.Safety.Value.FinalAttemptEndedAt, startedAt)
+	}
+	if image.Projection.Value.FinalAttemptStartedAt != nil || image.Projection.Value.FinalAttemptEndedAt != nil {
+		t.Fatalf("partial terminal projection timing = start:%v end:%v, want absent", image.Projection.Value.FinalAttemptStartedAt, image.Projection.Value.FinalAttemptEndedAt)
+	}
+
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: accepted.Record.JobID.String()})
+	if len(status.Jobs) != 1 || status.Jobs[0].FinalAttemptStartedAt != nil || status.Jobs[0].FinalAttemptEndedAt != nil {
+		t.Fatalf("partial terminal status timing = %+v, want absent", status)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: accepted.Record.JobID.String()})
+	if result.FinalAttemptStartedAt != nil || result.FinalAttemptEndedAt != nil {
+		t.Fatalf("partial terminal result timing = start:%v end:%v, want absent", result.FinalAttemptStartedAt, result.FinalAttemptEndedAt)
+	}
+}
+
 func TestAdmissionRecoveryExecutorAttemptsRemainingLaunchBeforeUnresolvedFinalization(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -3813,6 +3852,10 @@ func TestStrictAuthorityStatusSurfacesRuntimeLivenessOnlyWhileRunning(t *testing
 	}
 	if running.FinalAttemptStartedAt != nil || running.FinalAttemptEndedAt != nil {
 		t.Fatalf("running terminal timing = start:%v end:%v, want absent", running.FinalAttemptStartedAt, running.FinalAttemptEndedAt)
+	}
+	runningRecord := loadAdmissionSafetyRecord(t, server, submitted.JobID)
+	if runningRecord.FinalAttemptStartedAt == nil || !runningRecord.FinalAttemptStartedAt.Equal(base) || runningRecord.FinalAttemptEndedAt != nil {
+		t.Fatalf("running durable timing = start:%v end:%v, want %s/<nil>", runningRecord.FinalAttemptStartedAt, runningRecord.FinalAttemptEndedAt, base)
 	}
 
 	all := jobStatusViaHandler(t, server, protocol.JobStatusParams{All: true})
