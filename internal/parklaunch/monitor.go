@@ -200,9 +200,6 @@ func StartMonitorProcess(ctx context.Context, spec MonitorProcessSpec) (*Monitor
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := platformParkLaunchSupported(); err != nil {
-		return nil, err
-	}
 	inheritedLeaf := spec.InheritedLeaf
 	inheritedLeafTransferred := false
 	defer func() {
@@ -210,6 +207,9 @@ func StartMonitorProcess(ctx context.Context, spec MonitorProcessSpec) (*Monitor
 			_ = inheritedLeaf.Close()
 		}
 	}()
+	if err := platformParkLaunchSupported(); err != nil {
+		return nil, err
+	}
 	if spec.Command.Path == "" {
 		return nil, fmt.Errorf("%w: monitor command path is required", ErrInvalidSpec)
 	}
