@@ -2499,7 +2499,11 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 					rawText = "backend failed"
 				}
 				terminalState = engine.StateFailed
-				terminalErr = classifyFailureError(terminalFailureBackendRan, errors.New(rawText))
+				cause := event.Err
+				if cause == nil {
+					cause = errors.New(rawText)
+				}
+				terminalErr = classifyFailureError(terminalFailureBackendRan, cause)
 			case engine.EventTurnFinal:
 			}
 		}
@@ -2602,8 +2606,11 @@ func (s *Server) completeRunTerminal(run jobRun, state engine.JobState, text str
 }
 
 func (s *Server) completeRunFailure(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp, origin terminalFailureOrigin, cause error) {
-	if err := s.recordFailureMetadata(run, terminalFailureFor(origin, cause, terminalFailureStopWasRequestedByAgentbus(run, cause))); err != nil {
-		log.Printf("agentbus daemon: job %s failure metadata persistence failed: %v", run.jobID, err)
+	failure := terminalFailureFor(origin, cause, terminalFailureStopWasRequestedByAgentbus(run, cause))
+	if err := s.recordFailureMetadata(run, failure); err != nil {
+		if err := s.recordFailureMetadata(run, failure); err != nil {
+			log.Printf("agentbus daemon: job %s failure metadata persistence failed: %v", run.jobID, err)
+		}
 	}
 	s.completeRunTerminal(run, state, text, stamp)
 }

@@ -563,7 +563,7 @@ func emitCompletionEvents(disposition turnDisposition, events chan<- engine.Even
 		return
 	}
 	if driverErr != nil {
-		events <- terminalError(driverErr.Error())
+		events <- terminalError(driverErr)
 	}
 	if observation.CleanupErr != nil {
 		events <- warning(observation.CleanupErr.Error())
@@ -579,11 +579,11 @@ func emitCompletionEvents(disposition turnDisposition, events chan<- engine.Even
 		if msg == "" {
 			msg = ErrBackendExitedBeforeTerminal.Error()
 		}
-		events <- terminalError(msg)
+		events <- terminalError(errors.New(msg))
 		return
 	}
 	if stderrCopyErr != nil {
-		events <- terminalError(stderrCopyErr.Error())
+		events <- terminalError(stderrCopyErr)
 	}
 }
 
@@ -653,6 +653,9 @@ func warning(text string) engine.Event {
 	return engine.Event{Type: engine.EventWarning, Text: text}
 }
 
-func terminalError(text string) engine.Event {
-	return engine.Event{Type: engine.EventTerminalError, Text: text}
+func terminalError(err error) engine.Event {
+	if err == nil {
+		err = errors.New("backend failed")
+	}
+	return engine.Event{Type: engine.EventTerminalError, Text: err.Error(), Err: err}
 }

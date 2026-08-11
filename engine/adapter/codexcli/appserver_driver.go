@@ -563,7 +563,7 @@ func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer
 		if active != nil && active.interruptRequested.Load() {
 			return threadID, nil
 		}
-		return threadID, errors.New("codex app-server turn interrupted before completion")
+		return threadID, fmt.Errorf("codex app-server turn interrupted before completion: %w", engine.ErrTurnInterrupted)
 	default:
 		return threadID, fmt.Errorf("codex app-server turn completed with unsupported status %q", completion.status)
 	}

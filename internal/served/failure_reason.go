@@ -78,23 +78,13 @@ func classifyTerminalFailure(origin terminalFailureOrigin, err error, agentbusRe
 			// safer than claiming an unrequested backend interruption.
 			return engine.FailureClassInternalError
 		}
-		if errors.Is(err, context.Canceled) || unexpectedBackendInterruption(err) {
+		if errors.Is(err, context.Canceled) || errors.Is(err, engine.ErrTurnInterrupted) {
 			return engine.FailureClassBackendInterrupted
 		}
 		return engine.FailureClassBackendError
 	default:
 		return engine.FailureClassInternalError
 	}
-}
-
-func unexpectedBackendInterruption(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "turn interrupted before completion") ||
-		strings.Contains(message, "cancelled without a requested interrupt") ||
-		strings.Contains(message, "canceled without a requested interrupt")
 }
 
 func terminalFailureFor(origin terminalFailureOrigin, err error, agentbusRequestedStop bool) terminalFailure {

@@ -3,6 +3,7 @@ package served
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -38,8 +39,14 @@ func TestClassifyTerminalFailure(t *testing.T) {
 		{
 			name:   "unrequested codex interruption",
 			origin: terminalFailureBackendRan,
-			err:    errors.New("codex app-server turn interrupted before completion"),
+			err:    fmt.Errorf("codex app-server turn interrupted before completion: %w", engine.ErrTurnInterrupted),
 			want:   engine.FailureClassBackendInterrupted,
+		},
+		{
+			name:   "backend text cannot spoof interruption",
+			origin: terminalFailureBackendRan,
+			err:    errors.New("ordinary backend failure: turn interrupted before completion"),
+			want:   engine.FailureClassBackendError,
 		},
 		{
 			name:   "unrequested context interruption",
@@ -200,6 +207,31 @@ func TestFailedJobExposesSanitizedFailureMetadata(t *testing.T) {
 	}
 	if strings.ContainsAny(result.FailureReason, "\n\r\x00") {
 		t.Fatalf("job.result failure reason retained control characters: %q", result.FailureReason)
+	}
+}
+
+func TestBackendTerminalTextCannotSpoofInterruptedFailureClass(t *testing.T) {
+	t.Parallel()
+	const backendText = "ordinary backend failure: turn interrupted before completion"
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{{Type: engine.EventTerminalError, Text: backendText}}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-text-spoof",
+		RequestID:    "request-text-spoof",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Write:   false,
+			Prompt:  "fail",
+		},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if got := record.FailureClass; got != engine.FailureClassBackendError {
+		t.Fatalf("failure class = %q, want %q", got, engine.FailureClassBackendError)
 	}
 }
 
