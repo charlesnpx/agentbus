@@ -200,6 +200,9 @@ func StartMonitorProcess(ctx context.Context, spec MonitorProcessSpec) (*Monitor
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := platformParkLaunchSupported(); err != nil {
+		return nil, err
+	}
 	inheritedLeaf := spec.InheritedLeaf
 	inheritedLeafTransferred := false
 	defer func() {
