@@ -74,8 +74,9 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 
 // projectedFinalAttemptTiming and projectedFailureMetadata are independent
 // suppression rules over the same record: timing is advertised only as a
-// complete pair on a terminal job, and failure metadata only when the terminal
-// state is itself a failure. Both durable observations are retained either way.
+// complete pair on a terminal job, and failure metadata only for failure or
+// interrupted terminal states. Both durable observations are retained either
+// way.
 func projectedFinalAttemptTiming(record SafetyRecord, public PublicState) (*time.Time, *time.Time) {
 	if !terminalPublicState(public) || record.FinalAttemptStartedAt == nil || record.FinalAttemptEndedAt == nil {
 		return nil, nil
@@ -83,11 +84,11 @@ func projectedFinalAttemptTiming(record SafetyRecord, public PublicState) (*time
 	return clonePtr(record.FinalAttemptStartedAt), clonePtr(record.FinalAttemptEndedAt)
 }
 
+// projectedFailureMetadata exposes durable failure metadata only for failure
+// or interrupted terminal states.
 func projectedFailureMetadata(record SafetyRecord, public PublicState) (string, engine.FailureClass) {
-	// Preserve metadata durably on SafetyRecord for forensics, but only expose
-	// it through a projection when the terminal state is itself a failure.
 	switch public {
-	case PublicFailed, PublicQuarantined:
+	case PublicFailed, PublicInterrupted, PublicQuarantined:
 		return record.FailureReason, record.FailureClass
 	default:
 		return "", ""

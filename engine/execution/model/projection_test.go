@@ -61,14 +61,14 @@ func TestTerminalOutcomesProjectToTerminalPublicStates(t *testing.T) {
 	}
 }
 
-func TestProjectedFailureMetadataOnlyForFailurePublicStates(t *testing.T) {
+func TestProjectedFailureMetadataOnlyForFailureOrInterruptedPublicStates(t *testing.T) {
 	record := SafetyRecord{
 		FailureClass:  engine.FailureClassBackendError,
 		FailureReason: "retained for forensics",
 	}
 	for _, public := range AllPublicStates() {
 		gotReason, gotClass := projectedFailureMetadata(record, public)
-		wantExposed := public == PublicFailed || public == PublicQuarantined
+		wantExposed := public == PublicFailed || public == PublicInterrupted || public == PublicQuarantined
 		if wantExposed {
 			if gotReason != record.FailureReason || gotClass != record.FailureClass {
 				t.Fatalf("failure metadata for %s = (%q, %q), want (%q, %q)", public, gotReason, gotClass, record.FailureReason, record.FailureClass)

@@ -2631,10 +2631,11 @@ func cloneTime(value *time.Time) *time.Time {
 	return &copied
 }
 
+// authorityFailureMetadata exposes failure metadata only for failure or
+// interrupted terminal states.
 func authorityFailureMetadata(projection model.JobProjection) (string, engine.FailureClass) {
-	// Failure metadata is only meaningful for failure terminals.
 	switch projection.Public {
-	case model.PublicFailed, model.PublicQuarantined:
+	case model.PublicFailed, model.PublicInterrupted, model.PublicQuarantined:
 		return projection.FailureReason, projection.FailureClass
 	default:
 		return "", ""

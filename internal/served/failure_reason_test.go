@@ -83,6 +83,27 @@ func TestClassifyTerminalFailure(t *testing.T) {
 	}
 }
 
+func TestAuthorityFailureMetadataOnlyForFailureOrInterruptedTerminalStates(t *testing.T) {
+	projection := model.JobProjection{
+		FailureClass:  engine.FailureClassBackendInterrupted,
+		FailureReason: "retained for an interrupted backend turn",
+	}
+	for _, public := range model.AllPublicStates() {
+		projection.Public = public
+		gotReason, gotClass := authorityFailureMetadata(projection)
+		wantExposed := public == model.PublicFailed || public == model.PublicInterrupted || public == model.PublicQuarantined
+		if wantExposed {
+			if gotReason != projection.FailureReason || gotClass != projection.FailureClass {
+				t.Fatalf("failure metadata for %s = (%q, %q), want (%q, %q)", public, gotReason, gotClass, projection.FailureReason, projection.FailureClass)
+			}
+			continue
+		}
+		if gotReason != "" || gotClass != "" {
+			t.Fatalf("failure metadata for %s = (%q, %q), want empty", public, gotReason, gotClass)
+		}
+	}
+}
+
 type turnWithRunnerFailureSession struct {
 	err error
 }
@@ -235,6 +256,65 @@ func TestFailedJobExposesSanitizedFailureMetadata(t *testing.T) {
 	}
 }
 
+func TestInterruptedJobExposesFailureMetadata(t *testing.T) {
+	t.Parallel()
+	interruption := fmt.Errorf("backend turn stopped unexpectedly: %w", context.Canceled)
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{{Type: engine.EventTerminalError, Text: interruption.Error(), Err: interruption}}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-interrupted-metadata",
+		RequestID:    "request-interrupted-metadata",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Write:   false,
+			Prompt:  "interrupt",
+		},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Cancel != nil {
+		t.Fatalf("interrupted record cancel = %+v, want no requested cancel", record.Cancel)
+	}
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeInterrupted {
+		t.Fatalf("terminal record = %+v, want interrupted", record.Terminal)
+	}
+	if got := record.FailureClass; got != engine.FailureClassBackendInterrupted {
+		t.Fatalf("durable failure class = %q, want %q", got, engine.FailureClassBackendInterrupted)
+	}
+	if got := record.FailureReason; got != interruption.Error() {
+		t.Fatalf("durable failure reason = %q, want %q", got, interruption.Error())
+	}
+
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+	if len(status.Jobs) != 1 {
+		t.Fatalf("job.status jobs = %+v, want one job", status.Jobs)
+	}
+	if got := status.Jobs[0].State; got != engine.StateInterrupted {
+		t.Fatalf("job.status state = %q, want %q", got, engine.StateInterrupted)
+	}
+	if got := status.Jobs[0].FailureClass; got != engine.FailureClassBackendInterrupted {
+		t.Fatalf("job.status failure class = %q, want %q", got, engine.FailureClassBackendInterrupted)
+	}
+	if got := status.Jobs[0].FailureReason; got != interruption.Error() {
+		t.Fatalf("job.status failure reason = %q, want %q", got, interruption.Error())
+	}
+
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if got := result.State; got != engine.StateInterrupted {
+		t.Fatalf("job.result state = %q, want %q", got, engine.StateInterrupted)
+	}
+	if got := result.FailureClass; got != engine.FailureClassBackendInterrupted {
+		t.Fatalf("job.result failure class = %q, want %q", got, engine.FailureClassBackendInterrupted)
+	}
+	if got := result.FailureReason; got != interruption.Error() {
+		t.Fatalf("job.result failure reason = %q, want %q", got, interruption.Error())
+	}
+}
+
 func TestBackendTerminalTextCannotSpoofInterruptedFailureClass(t *testing.T) {
 	t.Parallel()
 	const backendText = "ordinary backend failure: turn interrupted before completion"
@@ -305,6 +385,9 @@ func TestNonFailureTerminalHidesPersistedFailureMetadata(t *testing.T) {
 	if len(status.Jobs) != 1 {
 		t.Fatalf("job.status jobs = %+v, want one job", status.Jobs)
 	}
+	if got := status.Jobs[0].State; got != engine.StateCompleted {
+		t.Fatalf("completed job.status state = %q, want %q", got, engine.StateCompleted)
+	}
 	if got := status.Jobs[0].FailureClass; got != "" {
 		t.Fatalf("completed job.status failure class = %q, want empty", got)
 	}
@@ -313,10 +396,63 @@ func TestNonFailureTerminalHidesPersistedFailureMetadata(t *testing.T) {
 	}
 
 	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if got := result.State; got != engine.StateCompleted {
+		t.Fatalf("completed job.result state = %q, want %q", got, engine.StateCompleted)
+	}
 	if got := result.FailureClass; got != "" {
 		t.Fatalf("completed job.result failure class = %q, want empty", got)
 	}
 	if got := result.FailureReason; got != "" {
 		t.Fatalf("completed job.result failure reason = %q, want empty", got)
+	}
+}
+
+func TestCanceledJobDoesNotExposeFailureMetadata(t *testing.T) {
+	t.Parallel()
+	holdNaturalExit := make(chan struct{})
+	defer close(holdNaturalExit)
+	backend := newFakeBackend("fake")
+	backend.started = make(chan struct{}, 1)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	launcher.waitAndVerify = holdNaturalExit
+	enableTestAdmission(t, server, launcher)
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-canceled-metadata",
+		RequestID:    "request-canceled-metadata",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Write:   false,
+			Prompt:  "cancel",
+		},
+	})
+	waitBackendStarted(t, backend)
+	canceled := jobCancelViaHandler(t, server, protocol.JobCancelParams{JobID: job.JobID})
+	if canceled.JobID != job.JobID || canceled.State != engine.StateCanceled {
+		t.Fatalf("job.cancel = %+v, want canceled job %s", canceled, job.JobID)
+	}
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled {
+		t.Fatalf("terminal record = %+v, want canceled", record.Terminal)
+	}
+	if record.FailureClass != "" || record.FailureReason != "" {
+		t.Fatalf("canceled durable failure metadata = (%q, %q), want empty", record.FailureReason, record.FailureClass)
+	}
+
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+	if len(status.Jobs) != 1 || status.Jobs[0].State != engine.StateCanceled {
+		t.Fatalf("job.status = %+v, want one canceled job", status)
+	}
+	if status.Jobs[0].FailureClass != "" || status.Jobs[0].FailureReason != "" {
+		t.Fatalf("canceled job.status failure metadata = (%q, %q), want empty", status.Jobs[0].FailureReason, status.Jobs[0].FailureClass)
+	}
+
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if result.State != engine.StateCanceled {
+		t.Fatalf("job.result state = %q, want %q", result.State, engine.StateCanceled)
+	}
+	if result.FailureClass != "" || result.FailureReason != "" {
+		t.Fatalf("canceled job.result failure metadata = (%q, %q), want empty", result.FailureReason, result.FailureClass)
 	}
 }
