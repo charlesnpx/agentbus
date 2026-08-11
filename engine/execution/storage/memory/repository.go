@@ -1037,7 +1037,10 @@ func cloneBinding(binding model.Binding) model.Binding {
 }
 
 func cloneProjection(projection model.JobProjection) model.JobProjection {
-	return projection
+	next := projection
+	next.FinalAttemptStartedAt = clonePtr(projection.FinalAttemptStartedAt)
+	next.FinalAttemptEndedAt = clonePtr(projection.FinalAttemptEndedAt)
+	return next
 }
 
 func cloneTombstone(tombstone repository.Tombstone) repository.Tombstone {
@@ -1056,6 +1059,8 @@ func cloneSafetyRecord(record model.SafetyRecord) model.SafetyRecord {
 	next.Outcome = cloneOutcomeFact(record.Outcome)
 	next.Result = clonePtr(record.Result)
 	next.Terminal = cloneTerminalCertificate(record.Terminal)
+	next.FinalAttemptStartedAt = clonePtr(record.FinalAttemptStartedAt)
+	next.FinalAttemptEndedAt = clonePtr(record.FinalAttemptEndedAt)
 	return next
 }
 
@@ -1148,6 +1153,12 @@ func validateProjectionShape(projection model.JobProjection) error {
 	}
 	if projection.TerminalCause != 0 && !projection.TerminalCause.Valid() {
 		return fmt.Errorf("%w: projection.terminal_cause is unknown", repository.ErrInvalidRecord)
+	}
+	if err := model.ValidateFinalAttemptTiming(projection.FinalAttemptStartedAt, projection.FinalAttemptEndedAt); err != nil {
+		return fmt.Errorf("%w: projection final attempt timing: %v", repository.ErrInvalidRecord, err)
+	}
+	if (projection.FinalAttemptStartedAt != nil || projection.FinalAttemptEndedAt != nil) && projection.Decision != model.DecisionTerminal {
+		return fmt.Errorf("%w: projection final attempt timing requires terminal decision", repository.ErrInvalidRecord)
 	}
 	return nil
 }

@@ -1,6 +1,10 @@
 package model
 
-import "github.com/charlesnpx/agentbus/engine"
+import (
+	"time"
+
+	"github.com/charlesnpx/agentbus/engine"
+)
 
 type ProjectionMetadata struct {
 	SessionID string
@@ -23,8 +27,13 @@ type JobProjection struct {
 	Public        PublicState
 	TerminalCause TerminalCause
 	SessionID     string
-	FailureReason string              `json:"failureReason,omitempty"`
-	FailureClass  engine.FailureClass `json:"failureClass,omitempty"`
+	// FinalAttemptStartedAt is the start of the final contract attempt, not
+	// whole-job elapsed time. A retry replaces this value with its own start.
+	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
+	// FinalAttemptEndedAt is when that same final attempt reached terminal.
+	FinalAttemptEndedAt *time.Time          `json:"finalAttemptEndedAt,omitempty"`
+	FailureReason       string              `json:"failureReason,omitempty"`
+	FailureClass        engine.FailureClass `json:"failureClass,omitempty"`
 }
 
 // Project rebuilds the read model from the proof-bearing SafetyRecord. The
@@ -41,23 +50,37 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 	dispatch := projectDispatch(record)
 	outcome := projectOutcome(record)
 	public := PublicProjection(decision, dispatch, outcome)
+	finalAttemptStartedAt, finalAttemptEndedAt := projectedFinalAttemptTiming(record, public)
 	failureReason, failureClass := projectedFailureMetadata(record, public)
 	return JobProjection{
-		SchemaVersion: record.SchemaVersion,
-		Revision:      record.Revision,
-		JobID:         record.JobID,
-		RequestKey:    record.RequestKey,
-		TaskIdentity:  record.TaskIdentity,
-		Mode:          record.Mode,
-		Decision:      decision,
-		Dispatch:      dispatch,
-		Outcome:       outcome,
-		Public:        public,
-		TerminalCause: projectTerminalCause(record),
-		SessionID:     metadata.SessionID,
-		FailureReason: failureReason,
-		FailureClass:  failureClass,
+		SchemaVersion:         record.SchemaVersion,
+		Revision:              record.Revision,
+		JobID:                 record.JobID,
+		RequestKey:            record.RequestKey,
+		TaskIdentity:          record.TaskIdentity,
+		Mode:                  record.Mode,
+		Decision:              decision,
+		Dispatch:              dispatch,
+		Outcome:               outcome,
+		Public:                public,
+		TerminalCause:         projectTerminalCause(record),
+		SessionID:             metadata.SessionID,
+		FinalAttemptStartedAt: finalAttemptStartedAt,
+		FinalAttemptEndedAt:   finalAttemptEndedAt,
+		FailureReason:         failureReason,
+		FailureClass:          failureClass,
 	}, nil
+}
+
+// projectedFinalAttemptTiming and projectedFailureMetadata are independent
+// suppression rules over the same record: timing is advertised only as a
+// complete pair on a terminal job, and failure metadata only when the terminal
+// state is itself a failure. Both durable observations are retained either way.
+func projectedFinalAttemptTiming(record SafetyRecord, public PublicState) (*time.Time, *time.Time) {
+	if !terminalPublicState(public) || record.FinalAttemptStartedAt == nil || record.FinalAttemptEndedAt == nil {
+		return nil, nil
+	}
+	return clonePtr(record.FinalAttemptStartedAt), clonePtr(record.FinalAttemptEndedAt)
 }
 
 func projectedFailureMetadata(record SafetyRecord, public PublicState) (string, engine.FailureClass) {

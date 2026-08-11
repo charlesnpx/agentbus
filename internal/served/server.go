@@ -2445,7 +2445,11 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		LogPaths: engine.LogPaths{},
 	}
 	if run.admissionControlled {
-		s.rememberJobLivenessStarted(run.jobID)
+		startedAt := s.clock.Now().UTC()
+		s.rememberJobLivenessStartedAt(run.jobID, startedAt)
+		if err := s.recordAdmissionFinalAttemptStart(attemptCtx, run.jobID, startedAt); err != nil {
+			return "", engine.StateFailed, err
+		}
 	}
 	events, err := s.admissionTurnEvents(attemptCtx, run, input, ordinal)
 	if err != nil {
@@ -2752,10 +2756,13 @@ func (s *Server) reportedModel(jobID string) string {
 }
 
 func (s *Server) rememberJobLivenessStarted(jobID string) {
+	s.rememberJobLivenessStartedAt(jobID, s.clock.Now().UTC())
+}
+
+func (s *Server) rememberJobLivenessStartedAt(jobID string, now time.Time) {
 	if strings.TrimSpace(jobID) == "" {
 		return
 	}
-	now := s.clock.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.jobLiveness == nil {
@@ -2764,6 +2771,22 @@ func (s *Server) rememberJobLivenessStarted(jobID string) {
 	if s.jobLiveness[jobID] == nil {
 		s.jobLiveness[jobID] = &jobLiveness{startedAt: now, lastEventAt: now}
 	}
+}
+
+func (s *Server) recordAdmissionFinalAttemptStart(ctx context.Context, jobID string, startedAt time.Time) error {
+	modelJobID, err := model.NewJobID(jobID)
+	if err != nil {
+		return err
+	}
+	s.admissionStateMu.RLock()
+	ready := s.admissionReady
+	available := s.admissionInstance != nil && ready != nil
+	s.admissionStateMu.RUnlock()
+	if !available {
+		return authority.ErrNotReady
+	}
+	_, err = ready.RecordFinalAttemptStart(ctx, modelJobID, startedAt)
+	return err
 }
 
 func (s *Server) recordJobLivenessEvent(jobID string) {

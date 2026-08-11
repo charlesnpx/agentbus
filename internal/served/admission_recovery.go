@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/authority"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/launch"
@@ -18,6 +20,7 @@ type admissionRecoveryExecutor struct {
 	session admissionRecoverySession
 	launch  launch.CustodianPort
 	latch   *SafetyLatch
+	clock   engine.Clock
 }
 
 type admissionRecoverySession interface {
@@ -26,6 +29,14 @@ type admissionRecoverySession interface {
 	FinalizePlanned(context.Context, model.RecoveryToken) error
 	FinalizeUnresolved(context.Context, model.RecoveryToken) (model.SafetyRecord, error)
 	RecordQuiescence(context.Context, any, model.LaunchOrdinal, custodian.VerifiedQuiescence) error
+}
+
+// admissionRecoveryTimingSession is implemented by the durable recovery
+// session. Keeping it separate lets narrowly scoped recovery fakes retain the
+// pre-timing interface while production recovery requires an atomic end time.
+type admissionRecoveryTimingSession interface {
+	FinalizePlannedAt(context.Context, model.RecoveryToken, time.Time) error
+	FinalizeUnresolvedAt(context.Context, model.RecoveryToken, time.Time) (model.SafetyRecord, error)
 }
 
 type AdmissionRecoveryReport struct {
@@ -39,8 +50,12 @@ type AdmissionRecoveryReport struct {
 	RecoveryPasses     int    `json:"recoveryPasses"`
 }
 
-func newAdmissionRecoveryExecutor(session admissionRecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) *admissionRecoveryExecutor {
-	return &admissionRecoveryExecutor{session: session, launch: launchPort, latch: latch}
+func newAdmissionRecoveryExecutor(session admissionRecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch, clocks ...engine.Clock) *admissionRecoveryExecutor {
+	var clock engine.Clock
+	if len(clocks) != 0 {
+		clock = clocks[0]
+	}
+	return &admissionRecoveryExecutor{session: session, launch: launchPort, latch: latch, clock: clock}
 }
 
 func (e *admissionRecoveryExecutor) Recover(ctx context.Context) error {
@@ -101,7 +116,7 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 			return report, fmt.Errorf("%w: invalid recovery work item: %w", authority.ErrRecoveryNeeded, err)
 		}
 		if len(current.Launches) == 0 {
-			if err := e.session.FinalizePlanned(ctx, current.Token); err != nil {
+			if err := e.finalizePlanned(ctx, current.Token); err != nil {
 				return report, fmt.Errorf("%w: finalize planned recovery for %s: %w", authority.ErrRecoveryNeeded, current.JobID, err)
 			}
 			report.FinalizedJobs++
@@ -134,7 +149,7 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 			continue
 		}
 		if len(unresolved) != 0 {
-			finalized, err := e.session.FinalizeUnresolved(ctx, current.Token)
+			finalized, err := e.finalizeUnresolved(ctx, current.Token)
 			if err != nil {
 				return report, fmt.Errorf("%w: finalize unresolved recovery for %s: %w", authority.ErrRecoveryNeeded, current.JobID, err)
 			}
@@ -147,6 +162,28 @@ func (e *admissionRecoveryExecutor) recoverItem(ctx context.Context, item model.
 		return report, fmt.Errorf("%w: recovery item %s made no launch progress", authority.ErrRecoveryNeeded, item.JobID)
 	}
 	return report, fmt.Errorf("%w: recovery item %s did not converge", authority.ErrRecoveryNeeded, item.JobID)
+}
+
+func (e *admissionRecoveryExecutor) finalizePlanned(ctx context.Context, token model.RecoveryToken) error {
+	if e.clock == nil {
+		return e.session.FinalizePlanned(ctx, token)
+	}
+	timed, ok := e.session.(admissionRecoveryTimingSession)
+	if !ok {
+		return fmt.Errorf("%w: recovery session does not support terminal attempt timing", authority.ErrRecoveryNeeded)
+	}
+	return timed.FinalizePlannedAt(ctx, token, e.clock.Now().UTC())
+}
+
+func (e *admissionRecoveryExecutor) finalizeUnresolved(ctx context.Context, token model.RecoveryToken) (model.SafetyRecord, error) {
+	if e.clock == nil {
+		return e.session.FinalizeUnresolved(ctx, token)
+	}
+	timed, ok := e.session.(admissionRecoveryTimingSession)
+	if !ok {
+		return model.SafetyRecord{}, fmt.Errorf("%w: recovery session does not support terminal attempt timing", authority.ErrRecoveryNeeded)
+	}
+	return timed.FinalizeUnresolvedAt(ctx, token, e.clock.Now().UTC())
 }
 
 func (e *admissionRecoveryExecutor) recoverLaunch(ctx context.Context, item model.RecoveryWorkItem, recoveryLaunch model.RecoveryLaunch) (model.RecoveryWorkItem, bool, error, error) {

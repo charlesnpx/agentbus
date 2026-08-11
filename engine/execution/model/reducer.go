@@ -3,6 +3,8 @@ package model
 import (
 	"errors"
 	"fmt"
+	"log"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 )
@@ -97,6 +99,10 @@ func ApplyCertifyResult(current SafetyRecord, command CertifyResult) (ApplyResul
 	return apply(current, command)
 }
 
+func ApplyRecordFinalAttemptStart(current SafetyRecord, command RecordFinalAttemptStart) (ApplyResult, error) {
+	return apply(current, command)
+}
+
 func ApplyRecordFailure(current SafetyRecord, command RecordFailure) (ApplyResult, error) {
 	return apply(current, command)
 }
@@ -178,6 +184,8 @@ func applyOpen(next *SafetyRecord, current SafetyRecord, command any) (bool, err
 		return applyObserveOutcome(next, current, c)
 	case CertifyResult:
 		return applyCertifyResult(next, current, c)
+	case RecordFinalAttemptStart:
+		return applyRecordFinalAttemptStart(next, current, c)
 	case RecordFailure:
 		return applyRecordFailure(next, current, c)
 	case Finalize:
@@ -513,6 +521,62 @@ func applyCertifyResult(next *SafetyRecord, current SafetyRecord, command Certif
 	return mergeFact(&next.Result, receipt, "result")
 }
 
+func applyRecordFinalAttemptStart(next *SafetyRecord, current SafetyRecord, command RecordFinalAttemptStart) (bool, error) {
+	if err := ensureJob(current, command.JobID); err != nil {
+		return false, err
+	}
+	startedAt := command.StartedAt
+	if startedAt.IsZero() {
+		reportFinalAttemptTimingWarning(current.JobID, "dropping zero final attempt start")
+		return false, nil
+	}
+	if current.FinalAttemptEndedAt != nil {
+		reportFinalAttemptTimingWarning(current.JobID, "dropping start after a final attempt end is already recorded")
+		return false, nil
+	}
+	if current.FinalAttemptStartedAt != nil {
+		if current.FinalAttemptStartedAt.Equal(startedAt) {
+			return false, nil
+		}
+		if startedAt.Before(*current.FinalAttemptStartedAt) {
+			reportFinalAttemptTimingWarning(current.JobID, "retry start %s precedes persisted start %s; replacing it because the current retry observation wins", startedAt.Format(time.RFC3339Nano), current.FinalAttemptStartedAt.Format(time.RFC3339Nano))
+		}
+	}
+	// The command being applied identifies the current final attempt, so its
+	// timestamp always replaces the prior one. Wall-clock order is diagnostic
+	// only and must not become a precondition for a retry.
+	next.FinalAttemptStartedAt = clonePtr(&startedAt)
+	return true, nil
+}
+
+func applyFinalAttemptEnd(next *SafetyRecord, current SafetyRecord, endedAt *time.Time) bool {
+	if endedAt == nil {
+		return false
+	}
+	if current.FinalAttemptStartedAt == nil {
+		// A job can reach terminal before an attempt starts (for example, an
+		// early cancellation). In that case there is no final attempt to time.
+		return false
+	}
+	if endedAt.IsZero() {
+		reportFinalAttemptTimingWarning(current.JobID, "dropping zero final attempt end")
+		return false
+	}
+	if endedAt.Before(*current.FinalAttemptStartedAt) {
+		reportFinalAttemptTimingWarning(current.JobID, "dropping final attempt end %s because it precedes start %s", endedAt.Format(time.RFC3339Nano), current.FinalAttemptStartedAt.Format(time.RFC3339Nano))
+		return false
+	}
+	if current.FinalAttemptEndedAt != nil {
+		if current.FinalAttemptEndedAt.Equal(*endedAt) {
+			return false
+		}
+		reportFinalAttemptTimingWarning(current.JobID, "dropping final attempt end %s because end %s is already recorded", endedAt.Format(time.RFC3339Nano), current.FinalAttemptEndedAt.Format(time.RFC3339Nano))
+		return false
+	}
+	next.FinalAttemptEndedAt = clonePtr(endedAt)
+	return true
+}
+
 func applyRecordFailure(next *SafetyRecord, current SafetyRecord, command RecordFailure) (bool, error) {
 	if err := ensureJob(current, command.JobID); err != nil {
 		return false, err
@@ -538,7 +602,16 @@ func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (
 	if err != nil {
 		return false, err
 	}
-	return mergeTerminal(next, certificate)
+	terminalChanged, err := mergeTerminal(next, certificate)
+	if err != nil {
+		return false, err
+	}
+	timingChanged := applyFinalAttemptEnd(next, current, command.Intent.FinalAttemptEndedAt)
+	return terminalChanged || timingChanged, nil
+}
+
+func reportFinalAttemptTimingWarning(jobID JobID, format string, args ...any) {
+	log.Printf("agentbus execution: final attempt timing warning: job=%s: %s", jobID, fmt.Sprintf(format, args...))
 }
 
 func applyTerminalAbsorbing(current SafetyRecord, command any) (ApplyResult, error) {
@@ -636,6 +709,13 @@ func normalizeCommand(command Command) (any, error) {
 			return nil, invalidCommand("command is nil")
 		}
 		return *c, nil
+	case RecordFinalAttemptStart:
+		return c, nil
+	case *RecordFinalAttemptStart:
+		if c == nil {
+			return nil, invalidCommand("command is nil")
+		}
+		return *c, nil
 	case RecordFailure:
 		return c, nil
 	case *RecordFailure:
@@ -665,7 +745,7 @@ func groupBindingAllowed(record SafetyRecord) bool {
 
 func legacyUnfencedCommand(command any) bool {
 	switch command.(type) {
-	case RequestCancel, ObserveOutcome, CertifyResult, RecordFailure, Finalize:
+	case RequestCancel, ObserveOutcome, CertifyResult, RecordFinalAttemptStart, RecordFailure, Finalize:
 		return true
 	default:
 		return false
@@ -906,6 +986,8 @@ func cloneSafetyRecord(record SafetyRecord) SafetyRecord {
 	next.Outcome = cloneOutcomeFact(record.Outcome)
 	next.Result = clonePtr(record.Result)
 	next.Terminal = cloneTerminalCertificate(record.Terminal)
+	next.FinalAttemptStartedAt = clonePtr(record.FinalAttemptStartedAt)
+	next.FinalAttemptEndedAt = clonePtr(record.FinalAttemptEndedAt)
 	return next
 }
 

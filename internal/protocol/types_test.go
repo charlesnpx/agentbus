@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 )
@@ -98,5 +99,64 @@ func TestJobStatusAndResultCleanupDispositionFieldsAreAdditive(t *testing.T) {
 	}
 	if got := string(resultFields["cleanupDisposition"]); got != `"unresolved"` {
 		t.Fatalf("result cleanupDisposition = %s in %s", got, result)
+	}
+}
+
+func TestJobStatusAndResultFinalAttemptTimingFieldsAreAdditive(t *testing.T) {
+	startedAt := time.Date(2026, 8, 11, 16, 0, 0, 0, time.UTC)
+	endedAt := startedAt.Add(7 * time.Second)
+	status, err := json.Marshal(JobStatus{
+		JobID:                 "job-1",
+		State:                 engine.StateCompleted,
+		FinalAttemptStartedAt: &startedAt,
+		FinalAttemptEndedAt:   &endedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var statusFields map[string]json.RawMessage
+	if err := json.Unmarshal(status, &statusFields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := statusFields["finalAttemptStartedAt"]; !ok {
+		t.Fatalf("status JSON = %s, missing finalAttemptStartedAt", status)
+	}
+	if _, ok := statusFields["finalAttemptEndedAt"]; !ok {
+		t.Fatalf("status JSON = %s, missing finalAttemptEndedAt", status)
+	}
+
+	result, err := json.Marshal(JobResult{
+		JobID:                 "job-1",
+		State:                 engine.StateCompleted,
+		FinalAttemptStartedAt: &startedAt,
+		FinalAttemptEndedAt:   &endedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resultFields map[string]json.RawMessage
+	if err := json.Unmarshal(result, &resultFields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := resultFields["finalAttemptStartedAt"]; !ok {
+		t.Fatalf("result JSON = %s, missing finalAttemptStartedAt", result)
+	}
+	if _, ok := resultFields["finalAttemptEndedAt"]; !ok {
+		t.Fatalf("result JSON = %s, missing finalAttemptEndedAt", result)
+	}
+
+	legacy, err := json.Marshal(JobStatus{JobID: "job-1", State: engine.StateCompleted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusFields = nil
+	if err := json.Unmarshal(legacy, &statusFields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := statusFields["finalAttemptStartedAt"]; ok {
+		t.Fatalf("legacy status JSON = %s, unexpectedly has finalAttemptStartedAt", legacy)
+	}
+	if _, ok := statusFields["finalAttemptEndedAt"]; ok {
+		t.Fatalf("legacy status JSON = %s, unexpectedly has finalAttemptEndedAt", legacy)
 	}
 }

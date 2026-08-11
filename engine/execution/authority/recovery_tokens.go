@@ -3,6 +3,7 @@ package authority
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -91,6 +92,16 @@ func (s *RecoverySession) AdvanceRecovery(ctx context.Context, token model.Recov
 }
 
 func (s *RecoverySession) FinalizePlanned(ctx context.Context, token model.RecoveryToken) error {
+	return s.finalizePlanned(ctx, token, nil)
+}
+
+// FinalizePlannedAt finalizes a planned recovery transition and atomically
+// records when its final contract attempt reached terminal.
+func (s *RecoverySession) FinalizePlannedAt(ctx context.Context, token model.RecoveryToken, endedAt time.Time) error {
+	return s.finalizePlanned(ctx, token, recoveryFinalAttemptEndedAt(endedAt))
+}
+
+func (s *RecoverySession) finalizePlanned(ctx context.Context, token model.RecoveryToken, finalAttemptEndedAt *time.Time) error {
 	if s == nil || s.core == nil {
 		return ErrNotReady
 	}
@@ -126,6 +137,7 @@ func (s *RecoverySession) FinalizePlanned(ctx context.Context, token model.Recov
 		}
 		finalize := *plan.Next.Finalize
 		finalize.Intent.DerivedBy = s.token.boot
+		finalize.Intent.FinalAttemptEndedAt = finalAttemptEndedAt
 		applied, err := applyRecoveryCommandTx(tx, token.JobID, finalize, meta.Generation+1)
 		if err != nil {
 			return err
@@ -147,6 +159,23 @@ func (s *RecoverySession) FinalizePlanned(ctx context.Context, token model.Recov
 }
 
 func (s *RecoverySession) FinalizeUnresolved(ctx context.Context, token model.RecoveryToken) (model.SafetyRecord, error) {
+	return s.finalizeUnresolved(ctx, token, nil)
+}
+
+// FinalizeUnresolvedAt finalizes an unresolved recovery transition and
+// atomically records when its final contract attempt reached terminal.
+func (s *RecoverySession) FinalizeUnresolvedAt(ctx context.Context, token model.RecoveryToken, endedAt time.Time) (model.SafetyRecord, error) {
+	return s.finalizeUnresolved(ctx, token, recoveryFinalAttemptEndedAt(endedAt))
+}
+
+func recoveryFinalAttemptEndedAt(endedAt time.Time) *time.Time {
+	// Forward every observation to the reducer. It owns the advisory-timing
+	// policy and can discard an unusable value without stranding recovery.
+	normalized := endedAt.UTC()
+	return &normalized
+}
+
+func (s *RecoverySession) finalizeUnresolved(ctx context.Context, token model.RecoveryToken, finalAttemptEndedAt *time.Time) (model.SafetyRecord, error) {
 	if s == nil || s.core == nil {
 		return model.SafetyRecord{}, ErrNotReady
 	}
@@ -173,6 +202,7 @@ func (s *RecoverySession) FinalizeUnresolved(ctx context.Context, token model.Re
 			return err
 		}
 		intent.DerivedBy = s.token.boot
+		intent.FinalAttemptEndedAt = finalAttemptEndedAt
 		applied, err := applyRecoveryCommandTx(tx, token.JobID, model.Finalize{Ref: record.Attempt.Ref, Intent: intent}, meta.Generation+1)
 		if err != nil {
 			return err

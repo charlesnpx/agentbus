@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIDValueValidation(t *testing.T) {
@@ -117,6 +118,52 @@ func TestEnumAndCertificateValidation(t *testing.T) {
 	}
 	if err := LaunchOrdinal(3).Validate(); !errors.Is(err, ErrInvalidValue) {
 		t.Fatalf("ordinal 3 error = %v, want ErrInvalidValue", err)
+	}
+}
+
+func TestSafetyRecordValidationRetainsFinalAttemptTimingIntegrity(t *testing.T) {
+	startedAt := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	endedBeforeStart := startedAt.Add(-time.Second)
+	zero := time.Time{}
+	tests := []struct {
+		name   string
+		mutate func(*SafetyRecord)
+	}{
+		{
+			name: "zero start",
+			mutate: func(record *SafetyRecord) {
+				record.FinalAttemptStartedAt = &zero
+			},
+		},
+		{
+			name: "end without start",
+			mutate: func(record *SafetyRecord) {
+				record.FinalAttemptEndedAt = &startedAt
+			},
+		},
+		{
+			name: "zero end",
+			mutate: func(record *SafetyRecord) {
+				record.FinalAttemptStartedAt = &startedAt
+				record.FinalAttemptEndedAt = &zero
+			},
+		},
+		{
+			name: "end before start",
+			mutate: func(record *SafetyRecord) {
+				record.FinalAttemptStartedAt = &startedAt
+				record.FinalAttemptEndedAt = &endedBeforeStart
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			record := validSafetyRecord()
+			tt.mutate(&record)
+			if err := record.Validate(); !errors.Is(err, ErrInvalidValue) {
+				t.Fatalf("SafetyRecord.Validate() error = %v, want ErrInvalidValue", err)
+			}
+		})
 	}
 }
 
