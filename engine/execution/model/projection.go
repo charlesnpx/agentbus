@@ -40,6 +40,8 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 	decision := projectDecision(record)
 	dispatch := projectDispatch(record)
 	outcome := projectOutcome(record)
+	public := PublicProjection(decision, dispatch, outcome)
+	failureReason, failureClass := projectedFailureMetadata(record, public)
 	return JobProjection{
 		SchemaVersion: record.SchemaVersion,
 		Revision:      record.Revision,
@@ -50,12 +52,23 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 		Decision:      decision,
 		Dispatch:      dispatch,
 		Outcome:       outcome,
-		Public:        PublicProjection(decision, dispatch, outcome),
+		Public:        public,
 		TerminalCause: projectTerminalCause(record),
 		SessionID:     metadata.SessionID,
-		FailureReason: record.FailureReason,
-		FailureClass:  record.FailureClass,
+		FailureReason: failureReason,
+		FailureClass:  failureClass,
 	}, nil
+}
+
+func projectedFailureMetadata(record SafetyRecord, public PublicState) (string, engine.FailureClass) {
+	// Preserve metadata durably on SafetyRecord for forensics, but only expose
+	// it through a projection when the terminal state is itself a failure.
+	switch public {
+	case PublicFailed, PublicQuarantined:
+		return record.FailureReason, record.FailureClass
+	default:
+		return "", ""
+	}
 }
 
 func projectDecision(record SafetyRecord) Decision {

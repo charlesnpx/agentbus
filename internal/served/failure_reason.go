@@ -62,15 +62,22 @@ func terminalFailureOriginFor(err error, fallback terminalFailureOrigin) termina
 }
 
 // classifyTerminalFailure makes the one stable class decision for all served
-// terminal failure paths. It relies only on error facts this code can already
-// distinguish today.
-func classifyTerminalFailure(origin terminalFailureOrigin, err error) engine.FailureClass {
+// terminal failure paths. agentbusRequestedStop is explicit intent from the
+// run lifecycle; an error alone cannot safely establish that distinction.
+func classifyTerminalFailure(origin terminalFailureOrigin, err error, agentbusRequestedStop bool) engine.FailureClass {
 	switch origin {
 	case terminalFailureBackendNotStarted:
 		return engine.FailureClassBackendNotStarted
 	case terminalFailureFinalization:
 		return engine.FailureClassFinalizationError
 	case terminalFailureBackendRan:
+		if agentbusRequestedStop {
+			// An agentbus-requested cancellation or timeout normally terminalizes
+			// separately. If it nevertheless reaches a failed path, none of the
+			// existing backend classes honestly describes it; internal_error is
+			// safer than claiming an unrequested backend interruption.
+			return engine.FailureClassInternalError
+		}
 		if errors.Is(err, context.Canceled) || unexpectedBackendInterruption(err) {
 			return engine.FailureClassBackendInterrupted
 		}
@@ -90,7 +97,7 @@ func unexpectedBackendInterruption(err error) bool {
 		strings.Contains(message, "canceled without a requested interrupt")
 }
 
-func terminalFailureFor(origin terminalFailureOrigin, err error) terminalFailure {
+func terminalFailureFor(origin terminalFailureOrigin, err error, agentbusRequestedStop bool) terminalFailure {
 	reason := "unknown failure"
 	if err != nil && strings.TrimSpace(err.Error()) != "" {
 		reason = err.Error()
@@ -100,41 +107,44 @@ func terminalFailureFor(origin terminalFailureOrigin, err error) terminalFailure
 		reason = "unknown failure"
 	}
 	return terminalFailure{
-		class:  classifyTerminalFailure(origin, err),
+		class:  classifyTerminalFailure(origin, err, agentbusRequestedStop),
 		reason: reason,
 	}
+}
+
+func terminalFailureStopWasRequestedByAgentbus(run jobRun, err error) bool {
+	if run.active != nil && run.active.requestedTerminal() != "" {
+		// Both client cancellation and graceful shutdown record a requested
+		// terminal state on the active job before canceling its context.
+		return true
+	}
+	// Daemon-imposed timeouts normally become timed_out before this classifier
+	// runs. Preserve that intent if a wrapped timeout instead reaches a failure
+	// path, so it cannot be advertised as an unrequested interruption.
+	return run.timeout > 0 && errors.Is(err, context.DeadlineExceeded)
 }
 
 func (s *Server) recordFailureMetadata(run jobRun, failure terminalFailure) error {
 	if !failure.class.Valid() || strings.TrimSpace(failure.reason) == "" {
 		return fmt.Errorf("invalid failure metadata for job %s", run.jobID)
 	}
-	if run.admissionControlled {
-		jobID, err := model.NewJobID(run.jobID)
-		if err != nil {
-			return err
-		}
-		s.admissionStateMu.RLock()
-		ready := s.admissionReady
-		available := s.admissionInstance != nil && ready != nil
-		s.admissionStateMu.RUnlock()
-		if !available {
-			return authority.ErrNotReady
-		}
-		_, err = ready.RecordFailure(context.Background(), jobID, failure.class, failure.reason)
+	if !run.admissionControlled {
+		// Serve starts strict admission before it accepts requests, and the only
+		// production jobRun constructor marks those runs admission-controlled.
+		// A non-admission write would advertise a path the daemon does not have.
+		return fmt.Errorf("failure metadata for non-admission job %s is unreachable", run.jobID)
+	}
+	jobID, err := model.NewJobID(run.jobID)
+	if err != nil {
 		return err
 	}
-	if run.store == nil {
-		return fmt.Errorf("job store not found for %s", run.jobID)
+	s.admissionStateMu.RLock()
+	ready := s.admissionReady
+	available := s.admissionInstance != nil && ready != nil
+	s.admissionStateMu.RUnlock()
+	if !available {
+		return authority.ErrNotReady
 	}
-	_, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
-		if record.FailureClass != "" || record.FailureReason != "" {
-			return false, nil
-		}
-		record.FailureClass = failure.class
-		record.FailureReason = failure.reason
-		record.UpdatedAt = s.clock.Now().UTC()
-		return true, nil
-	})
+	_, err = ready.RecordFailure(context.Background(), jobID, failure.class, failure.reason)
 	return err
 }

@@ -1,6 +1,10 @@
 package model
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/charlesnpx/agentbus/engine"
+)
 
 func TestProjectionEnumsMatchProtocolStrings(t *testing.T) {
 	assertStrings(t, "Decision", decisionsToStrings(AllDecisions()), []string{"accepted", "awaiting_ack", "cancel_requested", "terminal"})
@@ -52,6 +56,26 @@ func TestTerminalOutcomesProjectToTerminalPublicStates(t *testing.T) {
 		got := PublicProjection(DecisionTerminal, DispatchDone, outcome)
 		if got != want {
 			t.Fatalf("terminal %s projected to %s, want %s", outcome, got, want)
+		}
+	}
+}
+
+func TestProjectedFailureMetadataOnlyForFailurePublicStates(t *testing.T) {
+	record := SafetyRecord{
+		FailureClass:  engine.FailureClassBackendError,
+		FailureReason: "retained for forensics",
+	}
+	for _, public := range AllPublicStates() {
+		gotReason, gotClass := projectedFailureMetadata(record, public)
+		wantExposed := public == PublicFailed || public == PublicQuarantined
+		if wantExposed {
+			if gotReason != record.FailureReason || gotClass != record.FailureClass {
+				t.Fatalf("failure metadata for %s = (%q, %q), want (%q, %q)", public, gotReason, gotClass, record.FailureReason, record.FailureClass)
+			}
+			continue
+		}
+		if gotReason != "" || gotClass != "" {
+			t.Fatalf("failure metadata for %s = (%q, %q), want empty", public, gotReason, gotClass)
 		}
 	}
 }
