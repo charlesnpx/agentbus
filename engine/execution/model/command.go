@@ -69,6 +69,14 @@ type CertifyResult struct {
 	Receipt ResultReceipt
 }
 
+// RecordFailure attaches the first observed terminal-failure explanation to a
+// job without changing its outcome or terminal-state proof.
+type RecordFailure struct {
+	JobID  JobID
+	Class  engine.FailureClass
+	Reason string
+}
+
 type TerminalIntent struct {
 	Outcome   Outcome
 	Cause     TerminalCause
@@ -91,4 +99,5 @@ func (RecordQuiescence) isCommand()     {}
 func (RequestCancel) isCommand()        {}
 func (ObserveOutcome) isCommand()       {}
 func (CertifyResult) isCommand()        {}
+func (RecordFailure) isCommand()        {}
 func (Finalize) isCommand()             {}

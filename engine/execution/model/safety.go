@@ -1,5 +1,12 @@
 package model
 
+import (
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/charlesnpx/agentbus/engine"
+)
+
 type LaunchOrdinal uint8
 
 const (
@@ -257,6 +264,8 @@ type SafetyRecord struct {
 	Outcome            *OutcomeFact
 	Result             *ResultCertificate
 	Terminal           *TerminalCertificate
+	FailureReason      string              `json:"failureReason,omitempty"`
+	FailureClass       engine.FailureClass `json:"failureClass,omitempty"`
 }
 
 func (record SafetyRecord) Validate() error {
@@ -293,7 +302,30 @@ func (record SafetyRecord) Validate() error {
 	if err := record.validateOptionalFacts(); err != nil {
 		return err
 	}
+	if err := ValidateFailureMetadata(record.FailureClass, record.FailureReason); err != nil {
+		return err
+	}
 	return nil
+}
+
+// ValidateFailureMetadata accepts the empty legacy representation or a complete
+// persisted failure class and sanitized human-readable reason.
+func ValidateFailureMetadata(class engine.FailureClass, reason string) error {
+	if class == "" && reason == "" {
+		return nil
+	}
+	if !class.Valid() {
+		return invalid("failure.class", "is unknown")
+	}
+	if utf8.RuneCountInString(reason) > engine.FailureReasonMaxRunes {
+		return invalid("failure.reason", "is too long")
+	}
+	for _, r := range reason {
+		if !unicode.IsPrint(r) && r != ' ' {
+			return invalid("failure.reason", "must not contain control characters")
+		}
+	}
+	return validateText("failure.reason", reason, engine.FailureReasonMaxRunes*utf8.UTFMax)
 }
 
 func (record SafetyRecord) validateOptionalFacts() error {

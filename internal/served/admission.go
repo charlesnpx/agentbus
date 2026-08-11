@@ -41,7 +41,7 @@ const (
 	admissionRepositoryCloseTimeout = 5 * time.Second
 	admissionContentionRetryDelay   = 50 * time.Millisecond
 	admissionContentionFallback     = 2 * time.Second
-	admissionProbeReasonMaxRunes    = 512
+	admissionProbeReasonMaxRunes    = engine.FailureReasonMaxRunes
 )
 
 var admissionDetachedCleanupTimeout = 30 * time.Second
@@ -2222,7 +2222,7 @@ func (s *Server) launchAdmittedJob(ctx context.Context, run jobRun) {
 		return launchErr
 	})
 	if err != nil {
-		_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
+		s.completeRunFailure(run, engine.StateFailed, "", nil, terminalFailureBackendNotStarted, err)
 		return
 	}
 	if launched.active == nil {
@@ -2395,6 +2395,8 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 		State:              admissionState(projection.Public),
 		CleanupDisposition: admissionCleanupDisposition(record),
 		ModelReported:      reported,
+		FailureReason:      projection.FailureReason,
+		FailureClass:       projection.FailureClass,
 	}
 	if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
 		startedAt := started
@@ -2477,6 +2479,8 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 		Result:             result,
 		ModelReported:      reported,
 		Contract:           contract,
+		FailureReason:      projection.FailureReason,
+		FailureClass:       projection.FailureClass,
 	}, true, nil
 }
 
@@ -2538,6 +2542,8 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 		SessionID:          projection.SessionID,
 		State:              admissionState(projection.Public),
 		CleanupDisposition: admissionCleanupDisposition(image.Safety.Value),
+		FailureReason:      projection.FailureReason,
+		FailureClass:       projection.FailureClass,
 	}, true, nil
 }
 

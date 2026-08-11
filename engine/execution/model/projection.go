@@ -1,5 +1,7 @@
 package model
 
+import "github.com/charlesnpx/agentbus/engine"
+
 type ProjectionMetadata struct {
 	SessionID string
 }
@@ -21,6 +23,8 @@ type JobProjection struct {
 	Public        PublicState
 	TerminalCause TerminalCause
 	SessionID     string
+	FailureReason string              `json:"failureReason,omitempty"`
+	FailureClass  engine.FailureClass `json:"failureClass,omitempty"`
 }
 
 // Project rebuilds the read model from the proof-bearing SafetyRecord. The
@@ -49,6 +53,8 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 		Public:        PublicProjection(decision, dispatch, outcome),
 		TerminalCause: projectTerminalCause(record),
 		SessionID:     metadata.SessionID,
+		FailureReason: record.FailureReason,
+		FailureClass:  record.FailureClass,
 	}, nil
 }
 
