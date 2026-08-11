@@ -75,11 +75,26 @@ type admissionProbeableBackend interface {
 	ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error)
 }
 
+// admissionSetupProbeCacheFingerprintBackend is an optional adapter contract.
+// It identifies the on-disk setup evidence that a pinned backend needs before
+// strict admission may safely attempt one more probe.
+type admissionSetupProbeCacheFingerprintBackend interface {
+	SetupProbeCacheFingerprint() (string, error)
+}
+
+type admissionPinnedBackend struct {
+	setupCacheFingerprint      string
+	setupCacheFingerprintKnown bool
+	reprobeInFlight            bool
+}
+
 type admissionInstance struct {
 	runtime     *servedAdmissionRuntime
 	epoch       uint64
+	backendMu   sync.RWMutex
 	descriptors map[string]admissionBackendDescriptor
 	policy      ServeAdmissionPolicy
+	pinned      map[string]admissionPinnedBackend
 
 	bootstrapper *admissionBootstrapper
 	ready        *admissionReady
@@ -90,11 +105,33 @@ type admissionInstance struct {
 }
 
 func (instance *admissionInstance) descriptor(name string) (admissionBackendDescriptor, bool) {
-	if instance == nil || instance.descriptors == nil {
+	if instance == nil {
+		return admissionBackendDescriptor{}, false
+	}
+	instance.backendMu.RLock()
+	defer instance.backendMu.RUnlock()
+	if instance.descriptors == nil {
 		return admissionBackendDescriptor{}, false
 	}
 	descriptor, ok := instance.descriptors[name]
 	return descriptor, ok
+}
+
+func (instance *admissionInstance) descriptorAndFenceability(name string) (admissionBackendDescriptor, ServeBackendFenceability, bool) {
+	if instance == nil {
+		return admissionBackendDescriptor{}, ServeBackendFenceability{}, false
+	}
+	instance.backendMu.RLock()
+	defer instance.backendMu.RUnlock()
+	if instance.descriptors == nil {
+		return admissionBackendDescriptor{}, ServeBackendFenceability{}, false
+	}
+	descriptor, ok := instance.descriptors[name]
+	if !ok {
+		return admissionBackendDescriptor{}, ServeBackendFenceability{}, false
+	}
+	fenceability, _ := instance.policy.backendFenceability(name)
+	return descriptor, fenceability, true
 }
 
 type admissionBackendDescriptor struct {
@@ -148,8 +185,10 @@ type admissionStartupHooks struct {
 	BeforePolicyInstall     func()
 }
 
-// ServeAdmissionPolicy is the immutable strict-admission policy derived during
-// Serve bootstrap from the qualified runtime and probed backend descriptors.
+// ServeAdmissionPolicy holds the strict-admission policy derived during Serve
+// bootstrap. Its strict-route and runtime fields never change; a backend's
+// fenceability entry may be refreshed only after a newly observed setup cache
+// passes a fresh strict probe.
 type ServeAdmissionPolicy struct {
 	Mode                      AdmissionServeMode
 	AcceptIdentified          bool
@@ -193,15 +232,19 @@ func deriveServeAdmissionPolicy(metadata authority.AdmissionRootMetadata, runtim
 		policy.strictRouteDisabledReason = reason.Error()
 	}
 	for name, descriptor := range descriptors {
-		policy.backends[name] = ServeBackendFenceability{
-			Backend:          name,
-			Capabilities:     descriptor.capabilities,
-			ControlledRunner: descriptor.controlledRunner,
-			Fenceable:        descriptor.fenceable,
-			Reason:           descriptor.unfenceableCause,
-		}
+		policy.backends[name] = admissionBackendFenceability(name, descriptor)
 	}
 	return policy
+}
+
+func admissionBackendFenceability(name string, descriptor admissionBackendDescriptor) ServeBackendFenceability {
+	return ServeBackendFenceability{
+		Backend:          name,
+		Capabilities:     descriptor.capabilities,
+		ControlledRunner: descriptor.controlledRunner,
+		Fenceable:        descriptor.fenceable,
+		Reason:           descriptor.unfenceableCause,
+	}
 }
 
 func (policy ServeAdmissionPolicy) backendFenceability(name string) (ServeBackendFenceability, bool) {
@@ -497,7 +540,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err := s.failUnavailableStrictRuntimeBeforeRepository(ctx, runtime); err != nil {
 		return err
 	}
-	descriptors, err := s.probeAdmissionBackends(ctx)
+	descriptors, pinnedBackends, err := s.probeAdmissionBackends(ctx)
 	if err != nil {
 		return err
 	}
@@ -620,6 +663,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		epoch:        epoch,
 		descriptors:  cloneAdmissionBackendDescriptors(descriptors),
 		policy:       policy,
+		pinned:       pinnedBackends,
 		bootstrapper: bootstrapper,
 		ready:        ready,
 		coordinator:  coord,
@@ -938,9 +982,9 @@ func (s *Server) withAdmissionSubmission(fn func(*servedSubmissionCoordinator) e
 	return fn(submissionRef)
 }
 
-func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissionBackendDescriptor, error) {
+func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissionBackendDescriptor, map[string]admissionPinnedBackend, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	runner := s.admissionProbeRunner
 	if runner == nil {
@@ -952,6 +996,7 @@ func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissi
 	}
 	sort.Strings(names)
 	descriptors := make(map[string]admissionBackendDescriptor, len(names))
+	pinned := make(map[string]admissionPinnedBackend)
 	for _, name := range names {
 		backend := s.backends[name]
 		probeable, ok := backend.(admissionProbeableBackend)
@@ -966,10 +1011,11 @@ func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissi
 			descriptors[name] = s.admissionBackendDescriptor(name, backend, probeErr)
 			continue
 		}
+		fingerprint, fingerprintKnown := admissionSetupProbeCacheFingerprint(backend)
 		probed, err := probeable.ProbeBackend(ctx, runner)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, fmt.Errorf("probe strict backend %s canceled by serve context: %w", name, ctxErr)
+				return nil, nil, fmt.Errorf("probe strict backend %s canceled by serve context: %w", name, ctxErr)
 			}
 			// Probe cancellation is fatal only when the Serve parent context
 			// is canceled. A backend-returned context sentinel while that
@@ -983,13 +1029,17 @@ func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissi
 			}
 			s.admissionUnprobeableBackends[name] = probeErr
 			descriptors[name] = s.admissionBackendDescriptor(name, backend, probeErr)
+			pinned[name] = admissionPinnedBackend{
+				setupCacheFingerprint:      fingerprint,
+				setupCacheFingerprintKnown: fingerprintKnown,
+			}
 			continue
 		}
 		if probed == nil {
-			return nil, fmt.Errorf("probe strict backend %s: nil probed backend", name)
+			return nil, nil, fmt.Errorf("probe strict backend %s: nil probed backend", name)
 		}
 		if probed.Name() != name {
-			return nil, fmt.Errorf("probe strict backend %s: probed backend changed name to %s", name, probed.Name())
+			return nil, nil, fmt.Errorf("probe strict backend %s: probed backend changed name to %s", name, probed.Name())
 		}
 		s.backends[name] = probed
 		if s.admissionUnprobeableBackends != nil {
@@ -997,7 +1047,10 @@ func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissi
 		}
 		descriptors[name] = s.admissionBackendDescriptor(name, probed, nil)
 	}
-	return descriptors, nil
+	if len(pinned) == 0 {
+		pinned = nil
+	}
+	return descriptors, pinned, nil
 }
 
 func admissionProbeFailureError(name string, err error) error {
@@ -1068,6 +1121,160 @@ func cloneAdmissionBackendDescriptors(src map[string]admissionBackendDescriptor)
 		dst[name] = descriptor
 	}
 	return dst
+}
+
+func admissionSetupProbeCacheFingerprint(backend engine.Backend) (string, bool) {
+	provider, ok := backend.(admissionSetupProbeCacheFingerprintBackend)
+	if !ok {
+		return "", false
+	}
+	fingerprint, err := provider.SetupProbeCacheFingerprint()
+	if err != nil || fingerprint == "" {
+		return "", false
+	}
+	return fingerprint, true
+}
+
+func (instance *admissionInstance) setupCacheRefreshCandidate(name string) (admissionBackendDescriptor, string, bool, bool) {
+	if instance == nil {
+		return admissionBackendDescriptor{}, "", false, false
+	}
+	instance.backendMu.RLock()
+	defer instance.backendMu.RUnlock()
+	pinned, ok := instance.pinned[name]
+	if !ok || pinned.reprobeInFlight {
+		return admissionBackendDescriptor{}, "", false, false
+	}
+	descriptor, ok := instance.descriptors[name]
+	if !ok || descriptor.probeError == nil {
+		return admissionBackendDescriptor{}, "", false, false
+	}
+	return descriptor, pinned.setupCacheFingerprint, pinned.setupCacheFingerprintKnown, true
+}
+
+func (instance *admissionInstance) beginSetupCacheRefresh(name, fingerprint string) (admissionBackendDescriptor, bool) {
+	if instance == nil {
+		return admissionBackendDescriptor{}, false
+	}
+	instance.backendMu.Lock()
+	defer instance.backendMu.Unlock()
+	pinned, ok := instance.pinned[name]
+	if !ok || pinned.reprobeInFlight || (pinned.setupCacheFingerprintKnown && pinned.setupCacheFingerprint == fingerprint) {
+		return admissionBackendDescriptor{}, false
+	}
+	descriptor, ok := instance.descriptors[name]
+	if !ok || descriptor.probeError == nil {
+		return admissionBackendDescriptor{}, false
+	}
+	pinned.reprobeInFlight = true
+	instance.pinned[name] = pinned
+	return descriptor, true
+}
+
+func (instance *admissionInstance) replaceBackendDescriptorLocked(name string, descriptor admissionBackendDescriptor) {
+	if instance.descriptors == nil {
+		return
+	}
+	instance.descriptors[name] = descriptor
+	if instance.policy.backends != nil {
+		instance.policy.backends[name] = admissionBackendFenceability(name, descriptor)
+	}
+}
+
+// refreshAdmissionBackendOnSetupCacheChange is deliberately a snapshot-checkout
+// operation. It holds no admission lock while ProbeBackend can spawn a process;
+// simultaneous submitters see the existing pin until this one finishes.
+func (s *Server) refreshAdmissionBackendOnSetupCacheChange(ctx context.Context, instance *admissionInstance, name string) {
+	descriptor, priorFingerprint, priorFingerprintKnown, refreshable := instance.setupCacheRefreshCandidate(name)
+	if !refreshable {
+		return
+	}
+	fingerprint, changed := admissionSetupProbeCacheFingerprint(descriptor.backend)
+	if !changed || (priorFingerprintKnown && fingerprint == priorFingerprint) {
+		return
+	}
+	descriptor, started := instance.beginSetupCacheRefresh(name, fingerprint)
+	if !started {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeable, ok := descriptor.backend.(admissionProbeableBackend)
+	if !ok {
+		s.finishAdmissionBackendSetupCacheRefresh(instance, name, fingerprint, nil, errors.New("strict backend no longer implements ProbeBackend"), true, true)
+		return
+	}
+	runner := s.admissionProbeRunner
+	if runner == nil {
+		runner = command.DirectProbeRunner{}
+	}
+	probed, probeErr := probeable.ProbeBackend(ctx, runner)
+	if ctx.Err() != nil {
+		// A client cancellation must not consume a freshly observed cache
+		// revision or turn that cancellation into a daemon-lifetime pin.
+		s.finishAdmissionBackendSetupCacheRefresh(instance, name, fingerprint, nil, nil, false, false)
+		return
+	}
+	if probeErr == nil && probed == nil {
+		probeErr = errors.New("probe returned nil backend")
+	}
+	if probeErr == nil && probed.Name() != name {
+		probeErr = fmt.Errorf("probe returned backend named %s", probed.Name())
+	}
+	postFingerprint, postKnown := admissionSetupProbeCacheFingerprint(descriptor.backend)
+	cacheStable := postKnown && postFingerprint == fingerprint
+	if probeErr != nil {
+		probeErr = admissionProbeFailureError(name, probeErr)
+	}
+	// A failed post-probe read cannot establish that this revision is still the
+	// cache revision. Leave the prior fingerprint in place so the next
+	// submission can retry the same candidate. A known different revision is
+	// still consumed: the next refresh will observe and probe that revision.
+	s.finishAdmissionBackendSetupCacheRefresh(instance, name, fingerprint, probed, probeErr, cacheStable, postKnown)
+}
+
+func (s *Server) finishAdmissionBackendSetupCacheRefresh(instance *admissionInstance, name, fingerprint string, probed engine.Backend, probeErr error, cacheStable, consumeFingerprint bool) {
+	// State publication is short and happens only after the probe. A closing or
+	// replacement Serve wins; its checked-out instance is never modified.
+	s.admissionStateMu.Lock()
+	defer s.admissionStateMu.Unlock()
+	if s.admissionInstance != instance || s.admissionInstanceClosing(instance) {
+		return
+	}
+	instance.backendMu.Lock()
+	defer instance.backendMu.Unlock()
+	pinned, ok := instance.pinned[name]
+	if !ok || !pinned.reprobeInFlight {
+		return
+	}
+	pinned.reprobeInFlight = false
+	if !consumeFingerprint {
+		instance.pinned[name] = pinned
+		return
+	}
+	pinned.setupCacheFingerprint = fingerprint
+	pinned.setupCacheFingerprintKnown = true
+	if cacheStable && probeErr == nil {
+		descriptor := s.admissionBackendDescriptor(name, probed, nil)
+		instance.replaceBackendDescriptorLocked(name, descriptor)
+		s.backends[name] = probed
+		delete(instance.pinned, name)
+		if s.admissionUnprobeableBackends != nil {
+			delete(s.admissionUnprobeableBackends, name)
+		}
+		return
+	}
+	if cacheStable && probeErr != nil {
+		if descriptor, ok := instance.descriptors[name]; ok {
+			instance.replaceBackendDescriptorLocked(name, s.admissionBackendDescriptor(name, descriptor.backend, probeErr))
+		}
+		if s.admissionUnprobeableBackends == nil {
+			s.admissionUnprobeableBackends = make(map[string]error)
+		}
+		s.admissionUnprobeableBackends[name] = probeErr
+	}
+	instance.pinned[name] = pinned
 }
 
 func (s *Server) admissionDaemonBoot() (model.BootRef, error) {
@@ -1930,8 +2137,13 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	spec := params.TaskSpec
 	var descriptor admissionBackendDescriptor
 	if spec.Backend != "" {
+		s.refreshAdmissionBackendOnSetupCacheChange(ctx, instance, spec.Backend)
+		if s.admissionInstanceClosing(instance) {
+			return requestOutcome{err: admissionProtocolError(errAdmissionClosing)}
+		}
+		var fenceability ServeBackendFenceability
 		var ok bool
-		descriptor, ok = instance.descriptor(spec.Backend)
+		descriptor, fenceability, ok = instance.descriptorAndFenceability(spec.Backend)
 		if !ok {
 			return requestOutcome{err: strictAdmissionProtocolError(
 				protocol.ErrorBackendUnavailable,
@@ -1940,7 +2152,6 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 				protocol.ErrorData{Backend: spec.Backend},
 			)}
 		}
-		fenceability, _ := instance.policy.backendFenceability(spec.Backend)
 		if !fenceability.Fenceable {
 			message := fenceability.Reason
 			if message == "" {

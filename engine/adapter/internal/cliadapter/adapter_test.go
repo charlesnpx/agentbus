@@ -536,9 +536,24 @@ func TestProbeBackendRequiresSetupCache(t *testing.T) {
 		Driver:         newCliDuplexTestDriver(),
 	}
 
-	if _, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"}); err == nil {
+	_, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"})
+	if err == nil {
 		t.Fatal("ProbeBackend error = nil, want missing setup cache error")
 	}
+	assertSetupCacheRemediation(t, err.Error())
+}
+
+func TestCachedProbeStaleCacheExplainsDaemonRefresh(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "setup-probes.json")
+	if err := os.WriteFile(cachePath, []byte("{\"version\": 0, \"backends\": []}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := &Backend{NameValue: "fake", CachePath: cachePath}
+	_, err := backend.cachedProbe()
+	if err == nil {
+		t.Fatal("cachedProbe error = nil, want stale cache error")
+	}
+	assertSetupCacheRemediation(t, err.Error())
 }
 
 func TestProbeBackendRejectsMismatchedSetupCache(t *testing.T) {
@@ -591,7 +606,7 @@ func TestProbeBackendRejectsMismatchedSetupCache(t *testing.T) {
 				Version:      version,
 				StreamSchema: schema,
 			},
-			wantMessage: "backend_unavailable: setup cache missing backend fake; re-run agentbus setup",
+			wantMessage: "backend_unavailable: setup cache missing backend fake; " + setupCacheRefreshInstruction,
 		},
 	}
 
@@ -616,7 +631,17 @@ func TestProbeBackendRejectsMismatchedSetupCache(t *testing.T) {
 			if err.Error() != tt.wantMessage {
 				t.Fatalf("ProbeBackend error = %q, want %q", err.Error(), tt.wantMessage)
 			}
+			if strings.Contains(tt.wantMessage, "re-run agentbus setup") {
+				assertSetupCacheRemediation(t, tt.wantMessage)
+			}
 		})
+	}
+}
+
+func assertSetupCacheRemediation(t *testing.T, message string) {
+	t.Helper()
+	if !strings.Contains(message, "re-run agentbus setup") || !strings.Contains(message, "running daemon") || !strings.Contains(message, "restart the daemon") {
+		t.Fatalf("setup remediation = %q, want running-daemon refresh and restart guidance", message)
 	}
 }
 
