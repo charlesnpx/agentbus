@@ -2995,49 +2995,7 @@ func revisionQuarantine(record repository.QuarantineRecord) uint64 {
 }
 
 func validateProjectionShape(projection model.JobProjection) error {
-	if projection.SchemaVersion == 0 {
-		return fmt.Errorf("%w: projection.schema_version is required", repository.ErrInvalidRecord)
-	}
-	if projection.Revision == 0 {
-		return fmt.Errorf("%w: projection.revision is required", repository.ErrInvalidRecord)
-	}
-	if err := projection.JobID.Validate(); err != nil {
-		return fmt.Errorf("%w: projection.job_id: %v", repository.ErrInvalidRecord, err)
-	}
-	if err := projection.RequestKey.Validate(); err != nil {
-		return fmt.Errorf("%w: projection.request_key: %v", repository.ErrInvalidRecord, err)
-	}
-	if err := projection.TaskIdentity.Validate(); err != nil {
-		return fmt.Errorf("%w: projection.task_identity: %v", repository.ErrInvalidRecord, err)
-	}
-	if err := projection.Mode.Validate(); err != nil {
-		return fmt.Errorf("%w: projection.mode: %v", repository.ErrInvalidRecord, err)
-	}
-	if !projection.Decision.Valid() {
-		return fmt.Errorf("%w: projection.decision is unknown", repository.ErrInvalidRecord)
-	}
-	if !projection.Dispatch.Valid() {
-		return fmt.Errorf("%w: projection.dispatch is unknown", repository.ErrInvalidRecord)
-	}
-	if !projection.Outcome.Valid() {
-		return fmt.Errorf("%w: projection.outcome is unknown", repository.ErrInvalidRecord)
-	}
-	if !projection.Public.Valid() {
-		return fmt.Errorf("%w: projection.public is unknown", repository.ErrInvalidRecord)
-	}
-	if projection.TerminalCause != 0 && !projection.TerminalCause.Valid() {
-		return fmt.Errorf("%w: projection.terminal_cause is unknown", repository.ErrInvalidRecord)
-	}
-	if err := model.ValidateFinalAttemptTiming(projection.FinalAttemptStartedAt, projection.FinalAttemptEndedAt); err != nil {
-		return fmt.Errorf("%w: projection final attempt timing: %v", repository.ErrInvalidRecord, err)
-	}
-	if (projection.FinalAttemptStartedAt != nil || projection.FinalAttemptEndedAt != nil) && projection.Decision != model.DecisionTerminal {
-		return fmt.Errorf("%w: projection final attempt timing requires terminal decision", repository.ErrInvalidRecord)
-	}
-	if err := model.ValidateFailureMetadata(projection.FailureClass, projection.FailureReason); err != nil {
-		return fmt.Errorf("%w: projection failure metadata: %v", repository.ErrInvalidRecord, err)
-	}
-	return nil
+	return repository.ValidateProjectionShape(projection)
 }
 
 func validateProjectionMatches(projection model.JobProjection, record model.SafetyRecord) error {

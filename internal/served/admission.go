@@ -990,15 +990,16 @@ func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissi
 	if runner == nil {
 		runner = command.DirectProbeRunner{}
 	}
-	names := make([]string, 0, len(s.backends))
-	for name := range s.backends {
+	backends := s.backendSnapshot()
+	names := make([]string, 0, len(backends))
+	for name := range backends {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	descriptors := make(map[string]admissionBackendDescriptor, len(names))
 	pinned := make(map[string]admissionPinnedBackend)
 	for _, name := range names {
-		backend := s.backends[name]
+		backend := backends[name]
 		probeable, ok := backend.(admissionProbeableBackend)
 		if !ok {
 			probeErr := model.IncompatibleExecutionCapabilitiesError{
@@ -1041,7 +1042,7 @@ func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissi
 		if probed.Name() != name {
 			return nil, nil, fmt.Errorf("probe strict backend %s: probed backend changed name to %s", name, probed.Name())
 		}
-		s.backends[name] = probed
+		s.replaceBackend(name, probed)
 		if s.admissionUnprobeableBackends != nil {
 			delete(s.admissionUnprobeableBackends, name)
 		}
@@ -1237,6 +1238,9 @@ func (s *Server) refreshAdmissionBackendOnSetupCacheChange(ctx context.Context, 
 func (s *Server) finishAdmissionBackendSetupCacheRefresh(instance *admissionInstance, name, fingerprint string, probed engine.Backend, probeErr error, cacheStable, consumeFingerprint bool) {
 	// State publication is short and happens only after the probe. A closing or
 	// replacement Serve wins; its checked-out instance is never modified.
+	// The backend-map lock is always innermost: admissionStateMu ->
+	// instance.backendMu -> backendMapMu. Readers acquire only backendMapMu and
+	// never acquire admission locks, so this adds no reverse lock ordering.
 	s.admissionStateMu.Lock()
 	defer s.admissionStateMu.Unlock()
 	if s.admissionInstance != instance || s.admissionInstanceClosing(instance) {
@@ -1258,7 +1262,7 @@ func (s *Server) finishAdmissionBackendSetupCacheRefresh(instance *admissionInst
 	if cacheStable && probeErr == nil {
 		descriptor := s.admissionBackendDescriptor(name, probed, nil)
 		instance.replaceBackendDescriptorLocked(name, descriptor)
-		s.backends[name] = probed
+		s.replaceBackend(name, probed)
 		delete(instance.pinned, name)
 		if s.admissionUnprobeableBackends != nil {
 			delete(s.admissionUnprobeableBackends, name)

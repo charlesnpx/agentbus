@@ -1518,9 +1518,7 @@ func TestIdentifiedSubmitReplayIgnoresRemovedBackendComposition(t *testing.T) {
 	delete(server.admissionInstance.policy.backends, "fake")
 	server.admissionInstance.backendMu.Unlock()
 	server.admissionStateMu.Unlock()
-	server.mu.Lock()
-	delete(server.backends, "fake")
-	server.mu.Unlock()
+	server.removeBackend("fake")
 
 	replayed := replayIdentifiedSubmit(t, server, params)
 	if replayed.JobID != submitted.JobID || !replayed.Deduplicated {
@@ -2705,10 +2703,91 @@ func TestAdmissionSetupCacheRefreshPublishesProbedBackendToCanonicalMap(t *testi
 	if outcome.err != nil {
 		t.Fatalf("submit error = %+v, want refresh to publish", outcome.err)
 	}
-	server.admissionStateMu.RLock()
-	canonical := server.backends["fake"]
-	server.admissionStateMu.RUnlock()
+	canonical, ok := server.backendFor("fake")
+	if !ok {
+		t.Fatal("canonical backend is missing")
+	}
 	if canonical != probed {
+		t.Fatalf("canonical backend = %T %p, want probed backend %T %p", canonical, canonical, probed, probed)
+	}
+}
+
+func TestAdmissionSetupCacheRefreshIsSafeWithConcurrentBackendReaders(t *testing.T) {
+	backendProbeStarted := make(chan struct{}, 2)
+	backend := &setupCacheRefreshProbeBackend{
+		fakeBackend: newFakeBackend("fake"),
+		fingerprint: "before-refresh",
+		err:         errors.New("setup cache is stale"),
+		started:     backendProbeStarted,
+	}
+	server, _, _ := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	select {
+	case <-backendProbeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bootstrap probe did not start")
+	}
+
+	server.admissionStateMu.RLock()
+	instance := server.admissionInstance
+	server.admissionStateMu.RUnlock()
+	if instance == nil {
+		t.Fatal("admission instance is nil")
+	}
+
+	gate := make(chan struct{})
+	probed := newFakeBackend("fake")
+	backend.setSetupCacheRefreshState("after-refresh", nil, gate)
+	backend.setSetupCacheRefreshProbedBackend(probed)
+	refreshed := make(chan struct{})
+	go func() {
+		server.refreshAdmissionBackendOnSetupCacheChange(context.Background(), instance, "fake")
+		close(refreshed)
+	}()
+	select {
+	case <-backendProbeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh probe did not start")
+	}
+
+	stopReaders := make(chan struct{})
+	readerStarted := make(chan struct{})
+	var readers sync.WaitGroup
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		for {
+			_ = server.backendMetadata()
+			_ = server.backendNames()
+			select {
+			case <-readerStarted:
+			default:
+				close(readerStarted)
+			}
+			select {
+			case <-stopReaders:
+				return
+			default:
+			}
+		}
+	}()
+	select {
+	case <-readerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("backend reader did not start")
+	}
+
+	close(gate)
+	select {
+	case <-refreshed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh did not finish")
+	}
+	close(stopReaders)
+	readers.Wait()
+
+	canonical, ok := server.backendFor("fake")
+	if !ok || canonical != probed {
 		t.Fatalf("canonical backend = %T %p, want probed backend %T %p", canonical, canonical, probed, probed)
 	}
 }

@@ -162,6 +162,31 @@ func TestAdmissionTurnEventsClassifiesLaunchProvenance(t *testing.T) {
 	}
 }
 
+func TestRunAttemptClassifiesFinalAttemptTimingRecordFailureAsBackendNotStarted(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, _ := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	accepted := acceptIdentifiedAuthorityWork(t, server, "final-attempt-record-failure")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := server.runAttempt(ctx, jobRun{
+		jobID:               accepted.Record.JobID.String(),
+		admissionControlled: true,
+	}, "must not launch", false, model.LaunchOrdinalOne)
+	if err == nil {
+		t.Fatal("runAttempt error = nil, want canceled timing-record failure")
+	}
+	origin := terminalFailureOriginFor(err, terminalFailureInternal)
+	if got := classifyTerminalFailure(origin, err, false); got != engine.FailureClassBackendNotStarted {
+		t.Fatalf("failure class = %q, want %q (error: %v)", got, engine.FailureClassBackendNotStarted, err)
+	}
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("backend starts = %d, want 0", got)
+	}
+}
+
 func TestFailedJobExposesSanitizedFailureMetadata(t *testing.T) {
 	t.Parallel()
 	hostile := "backend failed\n" + strings.Repeat("界", admissionProbeReasonMaxRunes) + "\x00tail"

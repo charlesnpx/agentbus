@@ -208,6 +208,7 @@ type Server struct {
 	socketPath                   string
 	tokenPath                    string
 	token                        string
+	backendMapMu                 sync.RWMutex
 	backends                     map[string]engine.Backend
 	registry                     *engine.PolicyRegistry
 	clock                        engine.Clock
@@ -2023,7 +2024,8 @@ func (s *Server) backendMetadata() []protocol.BackendInfo {
 	result := make([]protocol.BackendInfo, 0, len(names))
 	for _, name := range names {
 		info := protocol.BackendInfo{Backend: name, Models: []string{}, Efforts: []string{}}
-		if provider, ok := s.backends[name].(engine.BackendMetadataProvider); ok {
+		backend, _ := s.backendFor(name)
+		if provider, ok := backend.(engine.BackendMetadataProvider); ok {
 			metadata := provider.BackendMetadata(context.Background())
 			info.Models = append([]string(nil), metadata.Models...)
 			info.Efforts = append([]string(nil), metadata.Efforts...)
@@ -2448,7 +2450,7 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		startedAt := s.clock.Now().UTC()
 		s.rememberJobLivenessStartedAt(run.jobID, startedAt)
 		if err := s.recordAdmissionFinalAttemptStart(attemptCtx, run.jobID, startedAt); err != nil {
-			return "", engine.StateFailed, err
+			return "", engine.StateFailed, classifyFailureError(terminalFailureBackendNotStarted, err)
 		}
 	}
 	events, err := s.admissionTurnEvents(attemptCtx, run, input, ordinal)
@@ -3050,12 +3052,45 @@ func (s *Server) nextID(prefix string) string {
 }
 
 func (s *Server) backendNames() []string {
-	names := make([]string, 0, len(s.backends))
-	for name := range s.backends {
+	backends := s.backendSnapshot()
+	names := make([]string, 0, len(backends))
+	for name := range backends {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	return names
+}
+
+func (s *Server) backendFor(name string) (engine.Backend, bool) {
+	s.backendMapMu.RLock()
+	defer s.backendMapMu.RUnlock()
+	backend, ok := s.backends[name]
+	return backend, ok
+}
+
+func (s *Server) backendSnapshot() map[string]engine.Backend {
+	s.backendMapMu.RLock()
+	defer s.backendMapMu.RUnlock()
+	backends := make(map[string]engine.Backend, len(s.backends))
+	for name, backend := range s.backends {
+		backends[name] = backend
+	}
+	return backends
+}
+
+func (s *Server) replaceBackend(name string, backend engine.Backend) {
+	s.backendMapMu.Lock()
+	defer s.backendMapMu.Unlock()
+	if s.backends == nil {
+		s.backends = make(map[string]engine.Backend)
+	}
+	s.backends[name] = backend
+}
+
+func (s *Server) removeBackend(name string) {
+	s.backendMapMu.Lock()
+	defer s.backendMapMu.Unlock()
+	delete(s.backends, name)
 }
 
 func ensureToken(path, configured string) (string, error) {
