@@ -318,6 +318,33 @@ func TestResetEmptyRootRefusesBusyRoot(t *testing.T) {
 	}
 }
 
+func TestInspectAdmissionRootReportsBusyRoot(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, err := bboltrepo.Create(filepath.Join(root, AdmissionRepositoryFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+
+	oldTimeout := adminOpenTimeout
+	adminOpenTimeout = 20 * time.Millisecond
+	defer func() { adminOpenTimeout = oldTimeout }()
+
+	_, err = InspectAdmissionRoot(ctx, root)
+	if !errors.Is(err, ErrRootBusy) {
+		t.Fatalf("inspect busy root error = %v, want ErrRootBusy", err)
+	}
+	if !errors.Is(err, bolt.ErrTimeout) {
+		t.Fatalf("inspect busy root error = %v, want bolt.ErrTimeout", err)
+	}
+	for _, want := range []string{"another process", "running daemon", "stop the daemon"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("inspect busy root error = %q, want guidance containing %q", err, want)
+		}
+	}
+}
+
 func TestAdmissionInspectAndSeal(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
