@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
@@ -304,6 +305,69 @@ func TestReadyAcceptAndClaimFailStopsOnRealBboltAmbiguousCommit(t *testing.T) {
 	}
 	if persisted.Terminal != nil {
 		t.Fatalf("persisted record terminal after ambiguous commit: %+v", persisted.Terminal)
+	}
+}
+
+func TestFinalAttemptTimingSurvivesBboltReopenAndLoadJob(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "admission.bbolt")
+	inner, err := bboltrepo.Create(path)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	innerClosed := false
+	t.Cleanup(func() {
+		if !innerClosed {
+			if err := inner.Close(); err != nil {
+				t.Fatalf("close bbolt repository: %v", err)
+			}
+		}
+	})
+	ready := newReadyWithAnchorStore(t, inner, NewAnchorStore(), "final-attempt-reopen")
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "final-attempt-reopen"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	endedAt := startedAt.Add(9 * time.Second)
+	if _, err := ready.RecordFinalAttemptStart(ctx, accepted.Record.JobID, startedAt); err != nil {
+		t.Fatalf("RecordFinalAttemptStart() error = %v", err)
+	}
+	if _, err := ready.Finalize(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.TerminalIntent{
+		Outcome:             model.OutcomeFailed,
+		Cause:               model.CauseDaemonRestartedBeforeAuthorization,
+		FinalAttemptEndedAt: &endedAt,
+	}); err != nil {
+		t.Fatalf("Finalize() error = %v", err)
+	}
+
+	if err := inner.Close(); err != nil {
+		t.Fatalf("close bbolt repository before reopen: %v", err)
+	}
+	innerClosed = true
+	reopened, err := bboltrepo.OpenExisting(path)
+	if err != nil {
+		t.Fatalf("reopen bbolt repository: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("close reopened bbolt repository: %v", err)
+		}
+	})
+	if err := reopened.View(ctx, func(tx repository.ReadTx) error {
+		image := tx.LoadJob(accepted.Record.JobID)
+		if image.Safety.State != repository.RecordValid || image.Projection.State != repository.RecordValid {
+			return fmt.Errorf("LoadJob states safety=%s projection=%s", image.Safety.State, image.Projection.State)
+		}
+		if image.Safety.Value.FinalAttemptStartedAt == nil || !image.Safety.Value.FinalAttemptStartedAt.Equal(startedAt) || image.Safety.Value.FinalAttemptEndedAt == nil || !image.Safety.Value.FinalAttemptEndedAt.Equal(endedAt) {
+			return fmt.Errorf("LoadJob safety timing = start:%v end:%v", image.Safety.Value.FinalAttemptStartedAt, image.Safety.Value.FinalAttemptEndedAt)
+		}
+		if image.Projection.Value.FinalAttemptStartedAt == nil || !image.Projection.Value.FinalAttemptStartedAt.Equal(startedAt) || image.Projection.Value.FinalAttemptEndedAt == nil || !image.Projection.Value.FinalAttemptEndedAt.Equal(endedAt) {
+			return fmt.Errorf("LoadJob projection timing = start:%v end:%v", image.Projection.Value.FinalAttemptStartedAt, image.Projection.Value.FinalAttemptEndedAt)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

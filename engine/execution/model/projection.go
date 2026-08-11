@@ -1,5 +1,7 @@
 package model
 
+import "time"
+
 type ProjectionMetadata struct {
 	SessionID string
 }
@@ -21,6 +23,11 @@ type JobProjection struct {
 	Public        PublicState
 	TerminalCause TerminalCause
 	SessionID     string
+	// FinalAttemptStartedAt is the start of the final contract attempt, not
+	// whole-job elapsed time. A retry replaces this value with its own start.
+	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
+	// FinalAttemptEndedAt is when that same final attempt reached terminal.
+	FinalAttemptEndedAt *time.Time `json:"finalAttemptEndedAt,omitempty"`
 }
 
 // Project rebuilds the read model from the proof-bearing SafetyRecord. The
@@ -36,20 +43,31 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 	decision := projectDecision(record)
 	dispatch := projectDispatch(record)
 	outcome := projectOutcome(record)
+	public := PublicProjection(decision, dispatch, outcome)
+	finalAttemptStartedAt, finalAttemptEndedAt := projectedFinalAttemptTiming(record, public)
 	return JobProjection{
-		SchemaVersion: record.SchemaVersion,
-		Revision:      record.Revision,
-		JobID:         record.JobID,
-		RequestKey:    record.RequestKey,
-		TaskIdentity:  record.TaskIdentity,
-		Mode:          record.Mode,
-		Decision:      decision,
-		Dispatch:      dispatch,
-		Outcome:       outcome,
-		Public:        PublicProjection(decision, dispatch, outcome),
-		TerminalCause: projectTerminalCause(record),
-		SessionID:     metadata.SessionID,
+		SchemaVersion:         record.SchemaVersion,
+		Revision:              record.Revision,
+		JobID:                 record.JobID,
+		RequestKey:            record.RequestKey,
+		TaskIdentity:          record.TaskIdentity,
+		Mode:                  record.Mode,
+		Decision:              decision,
+		Dispatch:              dispatch,
+		Outcome:               outcome,
+		Public:                public,
+		TerminalCause:         projectTerminalCause(record),
+		SessionID:             metadata.SessionID,
+		FinalAttemptStartedAt: finalAttemptStartedAt,
+		FinalAttemptEndedAt:   finalAttemptEndedAt,
 	}, nil
+}
+
+func projectedFinalAttemptTiming(record SafetyRecord, public PublicState) (*time.Time, *time.Time) {
+	if !terminalPublicState(public) {
+		return nil, nil
+	}
+	return clonePtr(record.FinalAttemptStartedAt), clonePtr(record.FinalAttemptEndedAt)
 }
 
 func projectDecision(record SafetyRecord) Decision {

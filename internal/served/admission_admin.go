@@ -388,7 +388,7 @@ func (server *Server) recoverAdmissionRoot(ctx context.Context) (report Admissio
 		logAdmissionSupportDiagnostic(diagnostic)
 		return AdmissionRecoveryReport{}, diagnostic
 	}
-	report, err = recoverAdmissionBeforeReadyReport(ctx, session, runtime.launchPort(), server.safetyLatch)
+	report, err = recoverAdmissionBeforeReadyReport(ctx, session, runtime.launchPort(), server.safetyLatch, server.clock)
 	if err != nil {
 		return report, err
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
@@ -255,6 +256,12 @@ func (r *Ready) RecordOutcome(ctx context.Context, jobID model.JobID, ref model.
 
 func (r *Ready) RecordResult(ctx context.Context, jobID model.JobID, ref model.AttemptRef, receipt model.ResultReceipt, options ...ApplyOption) (ApplyResult, error) {
 	return r.apply(ctx, jobID, model.CertifyResult{Ref: ref, Receipt: receipt}, options...)
+}
+
+// RecordFinalAttemptStart durably records the start of the attempt that is
+// currently final. A later contract retry replaces this start timestamp.
+func (r *Ready) RecordFinalAttemptStart(ctx context.Context, jobID model.JobID, startedAt time.Time, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.RecordFinalAttemptStart{JobID: jobID, StartedAt: startedAt}, options...)
 }
 
 func (r *Ready) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent, options ...ApplyOption) (ApplyResult, error) {
@@ -759,6 +766,13 @@ func applyLogicalCommand(record model.SafetyRecord, command model.Command) (mode
 			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
 		}
 		return model.ApplyCertifyResult(record, *c)
+	case model.RecordFinalAttemptStart:
+		return model.ApplyRecordFinalAttemptStart(record, c)
+	case *model.RecordFinalAttemptStart:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyRecordFinalAttemptStart(record, *c)
 	case model.Finalize:
 		return model.ApplyFinalize(record, c)
 	case *model.Finalize:
@@ -1022,6 +1036,8 @@ func commandWithBoot(command model.Command, boot model.BootRef) model.Command {
 			next.Receipt.CertifiedBy = boot
 		}
 		return next
+	case model.RecordFinalAttemptStart, *model.RecordFinalAttemptStart:
+		return command
 	case model.Finalize:
 		if emptyBootRef(c.Intent.DerivedBy) {
 			c.Intent.DerivedBy = boot
@@ -1110,6 +1126,13 @@ func commandJobID(command model.Command) (model.JobID, error) {
 			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
 		}
 		return c.Receipt.JobID, nil
+	case model.RecordFinalAttemptStart:
+		return c.JobID, nil
+	case *model.RecordFinalAttemptStart:
+		if c == nil {
+			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
+		}
+		return c.JobID, nil
 	case model.Finalize:
 		return c.Ref.JobID, nil
 	case *model.Finalize:

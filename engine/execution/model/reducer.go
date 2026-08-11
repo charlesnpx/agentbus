@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 )
@@ -97,6 +98,10 @@ func ApplyCertifyResult(current SafetyRecord, command CertifyResult) (ApplyResul
 	return apply(current, command)
 }
 
+func ApplyRecordFinalAttemptStart(current SafetyRecord, command RecordFinalAttemptStart) (ApplyResult, error) {
+	return apply(current, command)
+}
+
 func ApplyFinalize(current SafetyRecord, command Finalize) (ApplyResult, error) {
 	return apply(current, command)
 }
@@ -156,6 +161,8 @@ func applyOpen(next *SafetyRecord, current SafetyRecord, command any) (bool, err
 		return applyObserveOutcome(next, current, c)
 	case CertifyResult:
 		return applyCertifyResult(next, current, c)
+	case RecordFinalAttemptStart:
+		return applyRecordFinalAttemptStart(next, current, c)
 	case Finalize:
 		return applyFinalize(next, current, c)
 	default:
@@ -489,6 +496,48 @@ func applyCertifyResult(next *SafetyRecord, current SafetyRecord, command Certif
 	return mergeFact(&next.Result, receipt, "result")
 }
 
+func applyRecordFinalAttemptStart(next *SafetyRecord, current SafetyRecord, command RecordFinalAttemptStart) (bool, error) {
+	if err := ensureJob(current, command.JobID); err != nil {
+		return false, err
+	}
+	startedAt := command.StartedAt
+	if err := ValidateFinalAttemptTiming(&startedAt, nil); err != nil {
+		return false, invalidCommand("final attempt timing: %v", err)
+	}
+	if current.FinalAttemptEndedAt != nil {
+		return false, precondition("final attempt timing is already terminal")
+	}
+	if current.FinalAttemptStartedAt != nil {
+		if current.FinalAttemptStartedAt.Equal(startedAt) {
+			return false, nil
+		}
+		if startedAt.Before(*current.FinalAttemptStartedAt) {
+			return false, precondition("final attempt start precedes recorded start")
+		}
+	}
+	next.FinalAttemptStartedAt = clonePtr(&startedAt)
+	return true, nil
+}
+
+func applyFinalAttemptEnd(next *SafetyRecord, current SafetyRecord, endedAt *time.Time) (bool, error) {
+	if endedAt == nil || current.FinalAttemptStartedAt == nil {
+		// A job can reach terminal before an attempt starts (for example, an
+		// early cancellation). In that case there is no final attempt to time.
+		return false, nil
+	}
+	if err := ValidateFinalAttemptTiming(current.FinalAttemptStartedAt, endedAt); err != nil {
+		return false, invalidCommand("final attempt timing: %v", err)
+	}
+	if current.FinalAttemptEndedAt != nil {
+		if current.FinalAttemptEndedAt.Equal(*endedAt) {
+			return false, nil
+		}
+		return false, conflict("final attempt end already recorded with different timestamp")
+	}
+	next.FinalAttemptEndedAt = clonePtr(endedAt)
+	return true, nil
+}
+
 func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (bool, error) {
 	if err := ensureAttempt(current, command.Ref); err != nil {
 		return false, err
@@ -497,7 +546,15 @@ func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (
 	if err != nil {
 		return false, err
 	}
-	return mergeTerminal(next, certificate)
+	terminalChanged, err := mergeTerminal(next, certificate)
+	if err != nil {
+		return false, err
+	}
+	timingChanged, err := applyFinalAttemptEnd(next, current, command.Intent.FinalAttemptEndedAt)
+	if err != nil {
+		return false, err
+	}
+	return terminalChanged || timingChanged, nil
 }
 
 func applyTerminalAbsorbing(current SafetyRecord, command any) (ApplyResult, error) {
@@ -595,6 +652,13 @@ func normalizeCommand(command Command) (any, error) {
 			return nil, invalidCommand("command is nil")
 		}
 		return *c, nil
+	case RecordFinalAttemptStart:
+		return c, nil
+	case *RecordFinalAttemptStart:
+		if c == nil {
+			return nil, invalidCommand("command is nil")
+		}
+		return *c, nil
 	case Finalize:
 		return c, nil
 	case *Finalize:
@@ -617,7 +681,7 @@ func groupBindingAllowed(record SafetyRecord) bool {
 
 func legacyUnfencedCommand(command any) bool {
 	switch command.(type) {
-	case RequestCancel, ObserveOutcome, CertifyResult, Finalize:
+	case RequestCancel, ObserveOutcome, CertifyResult, RecordFinalAttemptStart, Finalize:
 		return true
 	default:
 		return false
@@ -858,6 +922,8 @@ func cloneSafetyRecord(record SafetyRecord) SafetyRecord {
 	next.Outcome = cloneOutcomeFact(record.Outcome)
 	next.Result = clonePtr(record.Result)
 	next.Terminal = cloneTerminalCertificate(record.Terminal)
+	next.FinalAttemptStartedAt = clonePtr(record.FinalAttemptStartedAt)
+	next.FinalAttemptEndedAt = clonePtr(record.FinalAttemptEndedAt)
 	return next
 }
 

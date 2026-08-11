@@ -1,6 +1,10 @@
 package model
 
-import "github.com/charlesnpx/agentbus/engine"
+import (
+	"time"
+
+	"github.com/charlesnpx/agentbus/engine"
+)
 
 type PermitNonce = LaunchNonce
 type QuiescenceReceipt = QuiescenceCertificate
@@ -69,11 +73,21 @@ type CertifyResult struct {
 	Receipt ResultReceipt
 }
 
+// RecordFinalAttemptStart records the start of the attempt that is currently
+// final. A contract retry replaces this timestamp; no attempt history is kept.
+type RecordFinalAttemptStart struct {
+	JobID     JobID
+	StartedAt time.Time
+}
+
 type TerminalIntent struct {
 	Outcome   Outcome
 	Cause     TerminalCause
 	DerivedBy BootRef
 	Contract  *engine.ContractStamp
+	// FinalAttemptEndedAt is when the final contract attempt reached this
+	// terminal transition. It is not a whole-job duration or attempt history.
+	FinalAttemptEndedAt *time.Time
 }
 
 type Finalize struct {
@@ -81,14 +95,15 @@ type Finalize struct {
 	Intent TerminalIntent
 }
 
-func (Acknowledge) isCommand()          {}
-func (BeginReject) isCommand()          {}
-func (BindGroup) isCommand()            {}
-func (CommitGrant) isCommand()          {}
-func (RecordReleaseOutcome) isCommand() {}
-func (RecordRelease) isCommand()        {}
-func (RecordQuiescence) isCommand()     {}
-func (RequestCancel) isCommand()        {}
-func (ObserveOutcome) isCommand()       {}
-func (CertifyResult) isCommand()        {}
-func (Finalize) isCommand()             {}
+func (Acknowledge) isCommand()             {}
+func (BeginReject) isCommand()             {}
+func (BindGroup) isCommand()               {}
+func (CommitGrant) isCommand()             {}
+func (RecordReleaseOutcome) isCommand()    {}
+func (RecordRelease) isCommand()           {}
+func (RecordQuiescence) isCommand()        {}
+func (RequestCancel) isCommand()           {}
+func (ObserveOutcome) isCommand()          {}
+func (CertifyResult) isCommand()           {}
+func (RecordFinalAttemptStart) isCommand() {}
+func (Finalize) isCommand()                {}

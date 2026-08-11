@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
@@ -179,6 +180,34 @@ func TestApplyRejectsConflictingDuplicates(t *testing.T) {
 				t.Fatalf("conflicting duplicate error = %v, want ErrConflictingDuplicate", err)
 			}
 		})
+	}
+}
+
+func TestRecordFinalAttemptTimingRetainsOnlyTheFinalRetry(t *testing.T) {
+	firstStart := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	finalStart := firstStart.Add(5 * time.Second)
+	finalEnd := finalStart.Add(8 * time.Second)
+	record := reducerCanceledRetiredRecord(t)
+
+	record = reducerMustApply(t, record, RecordFinalAttemptStart{JobID: reducerJobID(), StartedAt: firstStart})
+	record = reducerMustApply(t, record, RecordFinalAttemptStart{JobID: reducerJobID(), StartedAt: finalStart})
+	record = reducerMustApply(t, record, Finalize{
+		Ref:    reducerRef(),
+		Intent: TerminalIntent{Outcome: OutcomeCanceled, Cause: CauseCanceledBeforeAuthorization, FinalAttemptEndedAt: &finalEnd},
+	})
+
+	if record.FinalAttemptStartedAt == nil || !record.FinalAttemptStartedAt.Equal(finalStart) {
+		t.Fatalf("final attempt start = %v, want retry start %s", record.FinalAttemptStartedAt, finalStart)
+	}
+	if record.FinalAttemptEndedAt == nil || !record.FinalAttemptEndedAt.Equal(finalEnd) {
+		t.Fatalf("final attempt end = %v, want %s", record.FinalAttemptEndedAt, finalEnd)
+	}
+	projection, err := Project(record, ProjectionMetadata{})
+	if err != nil {
+		t.Fatalf("Project final attempt timing: %v", err)
+	}
+	if projection.FinalAttemptStartedAt == nil || !projection.FinalAttemptStartedAt.Equal(finalStart) || projection.FinalAttemptEndedAt == nil || !projection.FinalAttemptEndedAt.Equal(finalEnd) {
+		t.Fatalf("projection final attempt timing = start:%v end:%v, want %s/%s", projection.FinalAttemptStartedAt, projection.FinalAttemptEndedAt, finalStart, finalEnd)
 	}
 }
 

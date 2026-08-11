@@ -578,7 +578,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		if s.admissionStartupHooks.BeforeRecovery != nil {
 			s.admissionStartupHooks.BeforeRecovery()
 		}
-		if err := recoverAdmissionBeforeReady(ctx, session, runtime.launchPort(), s.safetyLatch); err != nil {
+		if err := recoverAdmissionBeforeReady(ctx, session, runtime.launchPort(), s.safetyLatch, s.clock); err != nil {
 			return err
 		}
 		if s.admissionStartupHooks.AfterRecovery != nil {
@@ -603,7 +603,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		if s.admissionStartupHooks.BeforeRecovery != nil {
 			s.admissionStartupHooks.BeforeRecovery()
 		}
-		if err := recoverAdmissionBeforeReady(ctx, session, runtime.launchPort(), s.safetyLatch); err != nil {
+		if err := recoverAdmissionBeforeReady(ctx, session, runtime.launchPort(), s.safetyLatch, s.clock); err != nil {
 			return err
 		}
 		if s.admissionStartupHooks.AfterRecovery != nil {
@@ -628,7 +628,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	adapter := &servedAdmissionAuthority{ready: ready, latch: s.safetyLatch}
+	adapter := &servedAdmissionAuthority{ready: ready, latch: s.safetyLatch, clock: s.clock}
 	owner, err := model.NewOwnerID(s.nextID("coordinator"))
 	if err != nil {
 		return err
@@ -1617,12 +1617,12 @@ func admissionContentionExpiredError(parent context.Context, repoPath, socketPat
 	return expiration
 }
 
-func recoverAdmissionBeforeReady(ctx context.Context, session *authority.RecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) error {
-	return newAdmissionRecoveryExecutor(session, launchPort, latch).Recover(ctx)
+func recoverAdmissionBeforeReady(ctx context.Context, session *authority.RecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch, clock engine.Clock) error {
+	return newAdmissionRecoveryExecutor(session, launchPort, latch, clock).Recover(ctx)
 }
 
-func recoverAdmissionBeforeReadyReport(ctx context.Context, session admissionRecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) (AdmissionRecoveryReport, error) {
-	return newAdmissionRecoveryExecutor(session, launchPort, latch).RecoverReport(ctx)
+func recoverAdmissionBeforeReadyReport(ctx context.Context, session admissionRecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch, clocks ...engine.Clock) (AdmissionRecoveryReport, error) {
+	return newAdmissionRecoveryExecutor(session, launchPort, latch, clocks...).RecoverReport(ctx)
 }
 
 type servedSubmissionCoordinator struct {
@@ -1915,6 +1915,7 @@ func (a servedLaunchAuthority) FailStop(ctx context.Context, err error) error {
 type servedAdmissionAuthority struct {
 	ready *authority.Ready
 	latch *SafetyLatch
+	clock engine.Clock
 }
 
 func (a *servedAdmissionAuthority) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) (coordinator.StepResult, error) {
@@ -1938,6 +1939,10 @@ func (a *servedAdmissionAuthority) RecordResult(ctx context.Context, jobID model
 }
 
 func (a *servedAdmissionAuthority) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent) (coordinator.StepResult, error) {
+	if a.clock != nil {
+		endedAt := a.clock.Now().UTC()
+		intent.FinalAttemptEndedAt = &endedAt
+	}
 	applied, err := a.ready.Finalize(ctx, jobID, ref, intent)
 	return admissionStepResult(applied, err)
 }
@@ -2594,18 +2599,36 @@ func admissionCleanupDisposition(record model.SafetyRecord) string {
 	return model.DeriveCleanupDisposition(record).String()
 }
 
+func authorityFinalAttemptTiming(projection model.JobProjection) (*time.Time, *time.Time) {
+	if projection.Decision != model.DecisionTerminal {
+		return nil, nil
+	}
+	return cloneTime(projection.FinalAttemptStartedAt), cloneTime(projection.FinalAttemptEndedAt)
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
+
 func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *protocol.ErrorObject) {
 	record, projection, ok, errObj := s.authorityJobProjection(jobID)
 	if !ok || errObj != nil {
 		return protocol.JobStatus{}, ok, errObj
 	}
+	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
 	reported := s.reportedModel(projection.JobID.String())
 	status := protocol.JobStatus{
-		JobID:              projection.JobID.String(),
-		SessionID:          projection.SessionID,
-		State:              admissionState(projection.Public),
-		CleanupDisposition: admissionCleanupDisposition(record),
-		ModelReported:      reported,
+		JobID:                 projection.JobID.String(),
+		SessionID:             projection.SessionID,
+		State:                 admissionState(projection.Public),
+		CleanupDisposition:    admissionCleanupDisposition(record),
+		ModelReported:         reported,
+		FinalAttemptStartedAt: finalAttemptStartedAt,
+		FinalAttemptEndedAt:   finalAttemptEndedAt,
 	}
 	if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
 		startedAt := started
@@ -2676,18 +2699,21 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 	if record.Terminal != nil {
 		contract = record.Terminal.Contract
 	}
+	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
 	reported := s.reportedModel(projection.JobID.String())
 	if result != nil {
 		result.ModelReported = reported
 	}
 	return protocol.JobResult{
-		JobID:              projection.JobID.String(),
-		SessionID:          projection.SessionID,
-		State:              admissionState(projection.Public),
-		CleanupDisposition: admissionCleanupDisposition(record),
-		Result:             result,
-		ModelReported:      reported,
-		Contract:           contract,
+		JobID:                 projection.JobID.String(),
+		SessionID:             projection.SessionID,
+		State:                 admissionState(projection.Public),
+		CleanupDisposition:    admissionCleanupDisposition(record),
+		Result:                result,
+		ModelReported:         reported,
+		Contract:              contract,
+		FinalAttemptStartedAt: finalAttemptStartedAt,
+		FinalAttemptEndedAt:   finalAttemptEndedAt,
 	}, true, nil
 }
 
@@ -2744,11 +2770,14 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 		return protocol.JobStatus{}, false, fmt.Errorf("%w: authority projection is not valid for %s", authority.ErrInvalidRequest, jobID)
 	}
 	projection := image.Projection.Value
+	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
 	return protocol.JobStatus{
-		JobID:              projection.JobID.String(),
-		SessionID:          projection.SessionID,
-		State:              admissionState(projection.Public),
-		CleanupDisposition: admissionCleanupDisposition(image.Safety.Value),
+		JobID:                 projection.JobID.String(),
+		SessionID:             projection.SessionID,
+		State:                 admissionState(projection.Public),
+		CleanupDisposition:    admissionCleanupDisposition(image.Safety.Value),
+		FinalAttemptStartedAt: finalAttemptStartedAt,
+		FinalAttemptEndedAt:   finalAttemptEndedAt,
 	}, true, nil
 }
 
