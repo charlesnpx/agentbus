@@ -1,5 +1,13 @@
 package model
 
+import (
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/charlesnpx/agentbus/engine"
+)
+
 type LaunchOrdinal uint8
 
 const (
@@ -257,6 +265,13 @@ type SafetyRecord struct {
 	Outcome            *OutcomeFact
 	Result             *ResultCertificate
 	Terminal           *TerminalCertificate
+	// FinalAttemptStartedAt is the start of the final contract attempt, not
+	// whole-job elapsed time. A retry replaces this value with its own start.
+	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
+	// FinalAttemptEndedAt is when that same final attempt reached terminal.
+	FinalAttemptEndedAt *time.Time          `json:"finalAttemptEndedAt,omitempty"`
+	FailureReason       string              `json:"failureReason,omitempty"`
+	FailureClass        engine.FailureClass `json:"failureClass,omitempty"`
 }
 
 func (record SafetyRecord) Validate() error {
@@ -293,7 +308,61 @@ func (record SafetyRecord) Validate() error {
 	if err := record.validateOptionalFacts(); err != nil {
 		return err
 	}
+	if err := ValidateFinalAttemptTiming(record.FinalAttemptStartedAt, record.FinalAttemptEndedAt); err != nil {
+		return err
+	}
+	if record.FinalAttemptEndedAt != nil && record.Terminal == nil {
+		return invalid("final_attempt.ended_at", "requires terminal certificate")
+	}
+	if err := ValidateFailureMetadata(record.FailureClass, record.FailureReason); err != nil {
+		return err
+	}
 	return nil
+}
+
+// ValidateFinalAttemptTiming accepts an absent legacy representation or a
+// single final-attempt start/end pair. It deliberately permits a start without
+// an end while the attempt is still running.
+func ValidateFinalAttemptTiming(startedAt, endedAt *time.Time) error {
+	if startedAt == nil && endedAt == nil {
+		return nil
+	}
+	if startedAt == nil {
+		return invalid("final_attempt.ended_at", "requires started_at")
+	}
+	if startedAt.IsZero() {
+		return invalid("final_attempt.started_at", "is required")
+	}
+	if endedAt == nil {
+		return nil
+	}
+	if endedAt.IsZero() {
+		return invalid("final_attempt.ended_at", "is required")
+	}
+	if endedAt.Before(*startedAt) {
+		return invalid("final_attempt.ended_at", "precedes started_at")
+	}
+	return nil
+}
+
+// ValidateFailureMetadata accepts the empty legacy representation or a complete
+// persisted failure class and sanitized human-readable reason.
+func ValidateFailureMetadata(class engine.FailureClass, reason string) error {
+	if class == "" && reason == "" {
+		return nil
+	}
+	if !class.Valid() {
+		return invalid("failure.class", "is unknown")
+	}
+	if utf8.RuneCountInString(reason) > engine.FailureReasonMaxRunes {
+		return invalid("failure.reason", "is too long")
+	}
+	for _, r := range reason {
+		if !unicode.IsPrint(r) && r != ' ' {
+			return invalid("failure.reason", "must not contain control characters")
+		}
+	}
+	return validateText("failure.reason", reason, engine.FailureReasonMaxRunes*utf8.UTFMax)
 }
 
 func (record SafetyRecord) validateOptionalFacts() error {

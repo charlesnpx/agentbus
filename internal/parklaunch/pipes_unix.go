@@ -142,3 +142,14 @@ func setCloseOnExec(file *os.File) {
 func newProcessGroupSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setpgid: true}
 }
+
+func platformParkLaunchSupported() error {
+	return nil
+}
+
+func signalStartedProcess(process *os.Process) error {
+	if process == nil {
+		return nil
+	}
+	return process.Signal(syscall.SIGTERM)
+}

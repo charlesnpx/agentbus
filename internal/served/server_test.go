@@ -1513,12 +1513,12 @@ func TestIdentifiedSubmitReplayIgnoresRemovedBackendComposition(t *testing.T) {
 
 	submitted := submitIdentifiedForReplayTest(t, server, params)
 	server.admissionStateMu.Lock()
+	server.admissionInstance.backendMu.Lock()
 	delete(server.admissionInstance.descriptors, "fake")
 	delete(server.admissionInstance.policy.backends, "fake")
+	server.admissionInstance.backendMu.Unlock()
 	server.admissionStateMu.Unlock()
-	server.mu.Lock()
-	delete(server.backends, "fake")
-	server.mu.Unlock()
+	server.removeBackend("fake")
 
 	replayed := replayIdentifiedSubmit(t, server, params)
 	if replayed.JobID != submitted.JobID || !replayed.Deduplicated {
@@ -1748,6 +1748,91 @@ func TestAdmissionRecoveryExecutorBoundCurrentObligationContainsOnlyDurableGroup
 	}
 	if reason := server.safetyLatch.Reason(); reason != nil {
 		t.Fatalf("safety latch tripped: %v", reason)
+	}
+}
+
+func TestAdmissionRecoveryPersistsFinalAttemptTimingForRestartedRun(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	oldReady, accepted := newPriorBootAuthorityWork(t, repo, anchorStore, launcher, "recovery-final-attempt-timing")
+	ref := accepted.Record.Attempt.Ref
+	group := admissionTestGroup(model.LaunchKey{Attempt: ref, Ordinal: model.LaunchOrdinalOne})
+	if _, err := oldReady.BindGroup(ctx, accepted.Record.JobID, ref, model.LaunchOrdinalOne, group); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := oldReady.AllocateGrant(ctx, ref, model.LaunchOrdinalOne); err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Date(2026, 8, 11, 15, 0, 0, 0, time.UTC)
+	endedAt := startedAt.Add(12 * time.Second)
+	if _, err := oldReady.RecordFinalAttemptStart(ctx, accepted.Record.JobID, startedAt); err != nil {
+		t.Fatalf("RecordFinalAttemptStart() error = %v", err)
+	}
+
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	server.clock = &steppedClock{now: endedAt}
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+
+	image, err := server.admissionReady.LoadJob(ctx, accepted.Record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image.Safety.Value.FinalAttemptStartedAt == nil || !image.Safety.Value.FinalAttemptStartedAt.Equal(startedAt) || image.Safety.Value.FinalAttemptEndedAt == nil || !image.Safety.Value.FinalAttemptEndedAt.Equal(endedAt) {
+		t.Fatalf("recovered safety timing = start:%v end:%v, want %s/%s", image.Safety.Value.FinalAttemptStartedAt, image.Safety.Value.FinalAttemptEndedAt, startedAt, endedAt)
+	}
+	if image.Projection.Value.FinalAttemptStartedAt == nil || !image.Projection.Value.FinalAttemptStartedAt.Equal(startedAt) || image.Projection.Value.FinalAttemptEndedAt == nil || !image.Projection.Value.FinalAttemptEndedAt.Equal(endedAt) {
+		t.Fatalf("recovered projection timing = start:%v end:%v, want %s/%s", image.Projection.Value.FinalAttemptStartedAt, image.Projection.Value.FinalAttemptEndedAt, startedAt, endedAt)
+	}
+
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: accepted.Record.JobID.String()})
+	if len(status.Jobs) != 1 || status.Jobs[0].FinalAttemptStartedAt == nil || !status.Jobs[0].FinalAttemptStartedAt.Equal(startedAt) || status.Jobs[0].FinalAttemptEndedAt == nil || !status.Jobs[0].FinalAttemptEndedAt.Equal(endedAt) {
+		t.Fatalf("recovered status timing = %+v, want %s/%s", status, startedAt, endedAt)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: accepted.Record.JobID.String()})
+	if result.FinalAttemptStartedAt == nil || !result.FinalAttemptStartedAt.Equal(startedAt) || result.FinalAttemptEndedAt == nil || !result.FinalAttemptEndedAt.Equal(endedAt) {
+		t.Fatalf("recovered result timing = start:%v end:%v, want %s/%s", result.FinalAttemptStartedAt, result.FinalAttemptEndedAt, startedAt, endedAt)
+	}
+}
+
+func TestStrictAuthorityTerminalTimingSuppressesPartialPair(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	accepted := acceptIdentifiedAuthorityWork(t, server, "partial-terminal-timing")
+	startedAt := time.Date(2026, 8, 11, 16, 0, 0, 0, time.UTC)
+
+	if _, err := server.admissionReady.RecordFinalAttemptStart(ctx, accepted.Record.JobID, startedAt); err != nil {
+		t.Fatalf("RecordFinalAttemptStart() error = %v", err)
+	}
+	if _, err := server.admissionReady.Finalize(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.TerminalIntent{
+		Outcome: model.OutcomeCanceled,
+		Cause:   model.CauseCanceledBeforeAuthorization,
+	}); err != nil {
+		t.Fatalf("Finalize() error = %v", err)
+	}
+
+	image, err := server.admissionReady.LoadJob(ctx, accepted.Record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image.Safety.Value.FinalAttemptStartedAt == nil || !image.Safety.Value.FinalAttemptStartedAt.Equal(startedAt) || image.Safety.Value.FinalAttemptEndedAt != nil {
+		t.Fatalf("durable partial timing = start:%v end:%v, want %s/<nil>", image.Safety.Value.FinalAttemptStartedAt, image.Safety.Value.FinalAttemptEndedAt, startedAt)
+	}
+	if image.Projection.Value.FinalAttemptStartedAt != nil || image.Projection.Value.FinalAttemptEndedAt != nil {
+		t.Fatalf("partial terminal projection timing = start:%v end:%v, want absent", image.Projection.Value.FinalAttemptStartedAt, image.Projection.Value.FinalAttemptEndedAt)
+	}
+
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: accepted.Record.JobID.String()})
+	if len(status.Jobs) != 1 || status.Jobs[0].FinalAttemptStartedAt != nil || status.Jobs[0].FinalAttemptEndedAt != nil {
+		t.Fatalf("partial terminal status timing = %+v, want absent", status)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: accepted.Record.JobID.String()})
+	if result.FinalAttemptStartedAt != nil || result.FinalAttemptEndedAt != nil {
+		t.Fatalf("partial terminal result timing = start:%v end:%v, want absent", result.FinalAttemptStartedAt, result.FinalAttemptEndedAt)
 	}
 }
 
@@ -2341,6 +2426,84 @@ func (b *probeErrorBackend) ProbeBackend(ctx context.Context, _ command.ProbeRun
 	return nil, ctx.Err()
 }
 
+type setupCacheRefreshProbeBackend struct {
+	*fakeBackend
+	mu               sync.Mutex
+	fingerprint      string
+	fingerprintReads []setupCacheRefreshFingerprintRead
+	err              error
+	gate             <-chan struct{}
+	started          chan struct{}
+	probed           engine.Backend
+	probes           atomic.Int64
+}
+
+type setupCacheRefreshFingerprintRead struct {
+	fingerprint string
+	err         error
+}
+
+func (b *setupCacheRefreshProbeBackend) SetupProbeCacheFingerprint() (string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.fingerprintReads) > 0 {
+		read := b.fingerprintReads[0]
+		b.fingerprintReads = b.fingerprintReads[1:]
+		return read.fingerprint, read.err
+	}
+	return b.fingerprint, nil
+}
+
+func (b *setupCacheRefreshProbeBackend) ProbeBackend(ctx context.Context, _ command.ProbeRunner) (engine.Backend, error) {
+	b.probes.Add(1)
+	b.mu.Lock()
+	err := b.err
+	gate := b.gate
+	started := b.started
+	probed := b.probed
+	b.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if probed != nil {
+		return probed, nil
+	}
+	return b, nil
+}
+
+func (b *setupCacheRefreshProbeBackend) setSetupCacheRefreshState(fingerprint string, err error, gate <-chan struct{}) {
+	b.mu.Lock()
+	b.fingerprint = fingerprint
+	b.err = err
+	b.gate = gate
+	b.mu.Unlock()
+}
+
+func (b *setupCacheRefreshProbeBackend) setSetupCacheRefreshProbedBackend(probed engine.Backend) {
+	b.mu.Lock()
+	b.probed = probed
+	b.mu.Unlock()
+}
+
+func (b *setupCacheRefreshProbeBackend) setSetupCacheRefreshFingerprintReads(reads ...setupCacheRefreshFingerprintRead) {
+	b.mu.Lock()
+	b.fingerprintReads = append(b.fingerprintReads[:0], reads...)
+	b.mu.Unlock()
+}
+
 type lyingControlledBackend struct {
 	*fakeBackend
 	session *nonOrdinalSession
@@ -2409,6 +2572,488 @@ func TestServeBootstrapRecordsProbeFailureUnfenceableWithoutFailingClosed(t *tes
 	}
 	assertNoAcceptedJobsInAdmission(t, server)
 	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+}
+
+func TestAdmissionSetupCacheRefreshRecoversFromUnknownBootstrapFingerprint(t *testing.T) {
+	t.Parallel()
+	backend := &setupCacheRefreshProbeBackend{
+		fakeBackend: newFakeBackend("fake"),
+		fingerprint: "readable-cache",
+		fingerprintReads: []setupCacheRefreshFingerprintRead{{
+			err: errors.New("setup cache unreadable during bootstrap"),
+		}},
+		err: errors.New("setup cache is stale"),
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	if got := backend.probes.Load(); got != 1 {
+		t.Fatalf("bootstrap probes = %d, want 1", got)
+	}
+
+	server.admissionStateMu.RLock()
+	instance := server.admissionInstance
+	instance.backendMu.RLock()
+	pinned, stillPinned := instance.pinned["fake"]
+	instance.backendMu.RUnlock()
+	server.admissionStateMu.RUnlock()
+	if !stillPinned || pinned.setupCacheFingerprintKnown || pinned.setupCacheFingerprint != "" || pinned.reprobeInFlight {
+		t.Fatalf("bootstrap pin = %+v stillPinned=%t, want an idle unknown-fingerprint pin", pinned, stillPinned)
+	}
+
+	backend.setSetupCacheRefreshState("readable-cache", nil, nil)
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-refresh-unknown-bootstrap",
+		RequestID:    "request-refresh-unknown-bootstrap",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err != nil {
+		t.Fatalf("submit error = %+v, want refresh to publish", outcome.err)
+	}
+	if got := backend.probes.Load(); got != 2 {
+		t.Fatalf("probes after readable cache = %d, want 2", got)
+	}
+	server.admissionStateMu.RLock()
+	instance = server.admissionInstance
+	_, stillPinned = server.admissionUnprobeableBackends["fake"]
+	server.admissionStateMu.RUnlock()
+	descriptor, ok := instance.descriptor("fake")
+	if !ok || !descriptor.fenceable || stillPinned {
+		t.Fatalf("refresh state descriptor=%+v stillPinned=%t, want fenceable and unpinned", descriptor, stillPinned)
+	}
+}
+
+func TestAdmissionSetupCacheRefreshDoesNotReprobeUnchangedCache(t *testing.T) {
+	t.Parallel()
+	backend := &setupCacheRefreshProbeBackend{
+		fakeBackend: newFakeBackend("fake"),
+		fingerprint: "before-refresh",
+		err:         errors.New("setup cache is stale"),
+	}
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	if got := backend.probes.Load(); got != 1 {
+		t.Fatalf("bootstrap probes = %d, want 1", got)
+	}
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-refresh-unchanged",
+		RequestID:    "request-refresh-unchanged",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want pinned-backend rejection", outcome.result)
+	}
+	if got := backend.probes.Load(); got != 1 {
+		t.Fatalf("probes after unchanged cache = %d, want 1", got)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+}
+
+func TestAdmissionSetupCacheRefreshReprobesChangedCacheAndUnpins(t *testing.T) {
+	t.Parallel()
+	backend := &setupCacheRefreshProbeBackend{
+		fakeBackend: newFakeBackend("fake"),
+		fingerprint: "before-refresh",
+		err:         errors.New("setup cache is stale"),
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	backend.setSetupCacheRefreshState("after-refresh", nil, nil)
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-refresh-changed",
+		RequestID:    "request-refresh-changed",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err != nil {
+		t.Fatalf("submit error = %+v", outcome.err)
+	}
+	if got := backend.probes.Load(); got != 2 {
+		t.Fatalf("probes after changed cache = %d, want 2", got)
+	}
+	server.admissionStateMu.RLock()
+	instance := server.admissionInstance
+	_, stillPinned := server.admissionUnprobeableBackends["fake"]
+	server.admissionStateMu.RUnlock()
+	descriptor, ok := instance.descriptor("fake")
+	if !ok || !descriptor.fenceable || stillPinned {
+		t.Fatalf("refresh state descriptor=%+v stillPinned=%t, want fenceable and unpinned", descriptor, stillPinned)
+	}
+}
+
+func TestAdmissionSetupCacheRefreshPublishesProbedBackendToCanonicalMap(t *testing.T) {
+	t.Parallel()
+	backend := &setupCacheRefreshProbeBackend{
+		fakeBackend: newFakeBackend("fake"),
+		fingerprint: "before-refresh",
+		err:         errors.New("setup cache is stale"),
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	probed := newFakeBackend("fake")
+	backend.setSetupCacheRefreshState("after-refresh", nil, nil)
+	backend.setSetupCacheRefreshProbedBackend(probed)
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-refresh-canonical-backend",
+		RequestID:    "request-refresh-canonical-backend",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err != nil {
+		t.Fatalf("submit error = %+v, want refresh to publish", outcome.err)
+	}
+	canonical, ok := server.backendFor("fake")
+	if !ok {
+		t.Fatal("canonical backend is missing")
+	}
+	if canonical != probed {
+		t.Fatalf("canonical backend = %T %p, want probed backend %T %p", canonical, canonical, probed, probed)
+	}
+}
+
+func TestAdmissionSetupCacheRefreshIsSafeWithConcurrentBackendReaders(t *testing.T) {
+	backendProbeStarted := make(chan struct{}, 2)
+	backend := &setupCacheRefreshProbeBackend{
+		fakeBackend: newFakeBackend("fake"),
+		fingerprint: "before-refresh",
+		err:         errors.New("setup cache is stale"),
+		started:     backendProbeStarted,
+	}
+	server, _, _ := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	select {
+	case <-backendProbeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bootstrap probe did not start")
+	}
+
+	server.admissionStateMu.RLock()
+	instance := server.admissionInstance
+	server.admissionStateMu.RUnlock()
+	if instance == nil {
+		t.Fatal("admission instance is nil")
+	}
+
+	gate := make(chan struct{})
+	probed := newFakeBackend("fake")
+	backend.setSetupCacheRefreshState("after-refresh", nil, gate)
+	backend.setSetupCacheRefreshProbedBackend(probed)
+	refreshed := make(chan struct{})
+	go func() {
+		server.refreshAdmissionBackendOnSetupCacheChange(context.Background(), instance, "fake")
+		close(refreshed)
+	}()
+	select {
+	case <-backendProbeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh probe did not start")
+	}
+
+	stopReaders := make(chan struct{})
+	readerStarted := make(chan struct{})
+	var readers sync.WaitGroup
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		for {
+			_ = server.backendMetadata()
+			_ = server.backendNames()
+			select {
+			case <-readerStarted:
+			default:
+				close(readerStarted)
+			}
+			select {
+			case <-stopReaders:
+				return
+			default:
+			}
+		}
+	}()
+	select {
+	case <-readerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("backend reader did not start")
+	}
+
+	close(gate)
+	select {
+	case <-refreshed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh did not finish")
+	}
+	close(stopReaders)
+	readers.Wait()
+
+	canonical, ok := server.backendFor("fake")
+	if !ok || canonical != probed {
+		t.Fatalf("canonical backend = %T %p, want probed backend %T %p", canonical, canonical, probed, probed)
+	}
+}
+
+func TestAdmissionSetupCacheRefreshUsesRewrittenCodexCache(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	binary := markerCodexCLI(t, filepath.Join(dir, "version-probe-marker"))
+	cachePath := filepath.Join(dir, "setup-probes.json")
+	if err := engine.WriteSetupProbeCache(cachePath, engine.SetupProbeCache{Backends: []engine.BackendSetupProbe{{
+		Backend:          "codex",
+		BinaryPath:       binary,
+		Version:          codexcli.MinimumKnownGoodVersion,
+		StreamSchema:     "legacy-stream-json",
+		ConfigMode:       engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
+		SandboxModes:     []string{"workspace-write", "read-only"},
+		JSONEventsProbed: true,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	server, _, _ := newUnstartedTestServer(t, codexcli.New(codexcli.Options{Binary: binary, CachePath: cachePath}))
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+
+	if err := engine.WriteSetupProbeCache(cachePath, engine.SetupProbeCache{Backends: []engine.BackendSetupProbe{{
+		Backend:          "codex",
+		BinaryPath:       binary,
+		Version:          codexcli.MinimumKnownGoodVersion,
+		StreamSchema:     codexcli.StreamSchema,
+		ConfigMode:       engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
+		SandboxModes:     []string{"workspace-write", "read-only"},
+		JSONEventsProbed: true,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-codex-cache-refresh",
+		RequestID:    "request-codex-cache-refresh",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex"},
+	}))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want invalid task-spec rejection after re-probe", outcome.result)
+	}
+	assertRPCCode(t, protocol.Response{Error: outcome.err}, protocol.ErrorInvalidTaskSpec)
+	server.admissionStateMu.RLock()
+	instance := server.admissionInstance
+	_, stillPinned := server.admissionUnprobeableBackends["codex"]
+	server.admissionStateMu.RUnlock()
+	descriptor, ok := instance.descriptor("codex")
+	if !ok || !descriptor.fenceable || stillPinned {
+		t.Fatalf("rewritten cache descriptor=%+v stillPinned=%t, want fenceable and unpinned", descriptor, stillPinned)
+	}
+}
+
+func TestAdmissionSetupCacheRefreshFailureKeepsBackendPinned(t *testing.T) {
+	t.Parallel()
+	backend := &setupCacheRefreshProbeBackend{
+		fakeBackend: newFakeBackend("fake"),
+		fingerprint: "before-refresh",
+		err:         errors.New("setup cache is stale"),
+	}
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	backend.setSetupCacheRefreshState("after-refresh", errors.New("refreshed setup cache is still invalid"), nil)
+
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-refresh-failed",
+		RequestID:    "request-refresh-failed",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, params))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want pinned-backend rejection", outcome.result)
+	}
+	if !strings.Contains(outcome.err.Message, "refreshed setup cache is still invalid") {
+		t.Fatalf("rejection message = %q, want refreshed probe failure", outcome.err.Message)
+	}
+	if got := backend.probes.Load(); got != 2 {
+		t.Fatalf("probes after failed refresh = %d, want 2", got)
+	}
+	params.RequestID = "request-refresh-failed-unchanged"
+	outcome = server.handleJobSubmit(context.Background(), mustMarshal(t, params))
+	if outcome.err == nil {
+		t.Fatalf("unchanged failed-refresh submit result = %+v, want rejection", outcome.result)
+	}
+	if got := backend.probes.Load(); got != 2 {
+		t.Fatalf("probes after unchanged failed refresh = %d, want 2", got)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+}
+
+func TestAdmissionSetupCacheRefreshUnknownPostProbeFingerprintDoesNotConsumeRevision(t *testing.T) {
+	t.Parallel()
+	backend := &setupCacheRefreshProbeBackend{
+		fakeBackend: newFakeBackend("fake"),
+		fingerprint: "before-refresh",
+		err:         errors.New("setup cache is stale"),
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	backend.setSetupCacheRefreshState("after-refresh", nil, nil)
+	backend.setSetupCacheRefreshFingerprintReads(
+		setupCacheRefreshFingerprintRead{fingerprint: "after-refresh"},
+		setupCacheRefreshFingerprintRead{err: errors.New("transient setup cache read failure")},
+	)
+
+	params := protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-refresh-unknown-post",
+		RequestID:    "request-refresh-unknown-post-first",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}
+	first := server.handleJobSubmit(context.Background(), mustMarshal(t, params))
+	if first.err == nil {
+		t.Fatalf("first submit result = %+v, want pinned-backend rejection", first.result)
+	}
+	if got := backend.probes.Load(); got != 2 {
+		t.Fatalf("probes after unknown post-probe fingerprint = %d, want 2", got)
+	}
+
+	server.admissionStateMu.RLock()
+	instance := server.admissionInstance
+	instance.backendMu.RLock()
+	pinned, stillPinned := instance.pinned["fake"]
+	instance.backendMu.RUnlock()
+	server.admissionStateMu.RUnlock()
+	if !stillPinned || pinned.setupCacheFingerprint != "before-refresh" || pinned.reprobeInFlight {
+		t.Fatalf("pin after unknown post-probe fingerprint = %+v stillPinned=%t, want prior fingerprint and no re-probe in flight", pinned, stillPinned)
+	}
+
+	params.RequestID = "request-refresh-unknown-post-follow-up"
+	followUp := server.handleJobSubmit(context.Background(), mustMarshal(t, params))
+	if followUp.err != nil {
+		t.Fatalf("follow-up submit error = %+v, want refresh to publish", followUp.err)
+	}
+	if got := backend.probes.Load(); got != 3 {
+		t.Fatalf("probes after follow-up at same revision = %d, want 3", got)
+	}
+	server.admissionStateMu.RLock()
+	instance = server.admissionInstance
+	_, stillPinned = server.admissionUnprobeableBackends["fake"]
+	server.admissionStateMu.RUnlock()
+	descriptor, ok := instance.descriptor("fake")
+	if !ok || !descriptor.fenceable || stillPinned {
+		t.Fatalf("follow-up refresh descriptor=%+v stillPinned=%t, want fenceable and unpinned", descriptor, stillPinned)
+	}
+}
+
+func TestAdmissionSetupCacheRefreshMovedCacheConsumesCandidateRevision(t *testing.T) {
+	t.Parallel()
+	probeStarted := make(chan struct{}, 2)
+	backend := &setupCacheRefreshProbeBackend{
+		fakeBackend: newFakeBackend("fake"),
+		fingerprint: "before-refresh",
+		err:         errors.New("setup cache is stale"),
+		started:     probeStarted,
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bootstrap probe did not start")
+	}
+
+	gate := make(chan struct{})
+	backend.setSetupCacheRefreshState("candidate-refresh", nil, gate)
+	done := make(chan requestOutcome, 1)
+	go func() {
+		done <- server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+			WorkspaceKey: "workspace-refresh-moved-cache",
+			RequestID:    "request-refresh-moved-cache",
+			TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+		}))
+	}()
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("candidate refresh probe did not start")
+	}
+	backend.setSetupCacheRefreshState("later-refresh", nil, nil)
+	close(gate)
+	select {
+	case outcome := <-done:
+		if outcome.err == nil {
+			t.Fatalf("submit result = %+v, want pinned-backend rejection while cache moved", outcome.result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("candidate refresh submit did not finish")
+	}
+
+	server.admissionStateMu.RLock()
+	instance := server.admissionInstance
+	instance.backendMu.RLock()
+	pinned, stillPinned := instance.pinned["fake"]
+	instance.backendMu.RUnlock()
+	server.admissionStateMu.RUnlock()
+	if !stillPinned || pinned.setupCacheFingerprint != "candidate-refresh" || pinned.reprobeInFlight {
+		t.Fatalf("pin after moved cache = %+v stillPinned=%t, want consumed candidate revision and no re-probe in flight", pinned, stillPinned)
+	}
+}
+
+func TestAdmissionSetupCacheRefreshConcurrentSubmittersProbeAtMostOnce(t *testing.T) {
+	t.Parallel()
+	probeStarted := make(chan struct{}, 2)
+	backend := &setupCacheRefreshProbeBackend{
+		fakeBackend: newFakeBackend("fake"),
+		fingerprint: "before-refresh",
+		err:         errors.New("setup cache is stale"),
+		started:     probeStarted,
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bootstrap probe did not start")
+	}
+
+	gate := make(chan struct{})
+	backend.setSetupCacheRefreshState("after-refresh", nil, gate)
+	firstDone := make(chan requestOutcome, 1)
+	go func() {
+		firstDone <- server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+			WorkspaceKey: "workspace-refresh-concurrent-first",
+			RequestID:    "request-refresh-concurrent-first",
+			TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+		}))
+	}()
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh probe did not start")
+	}
+
+	secondDone := make(chan requestOutcome, 1)
+	go func() {
+		secondDone <- server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+			WorkspaceKey: "workspace-refresh-concurrent-second",
+			RequestID:    "request-refresh-concurrent-second",
+			TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+		}))
+	}()
+	select {
+	case outcome := <-secondDone:
+		if outcome.err == nil {
+			t.Fatalf("concurrent submit result = %+v, want pinned-backend rejection while re-probe runs", outcome.result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent submit waited for the in-flight re-probe")
+	}
+	if got := backend.probes.Load(); got != 2 {
+		t.Fatalf("probes while refresh is gated = %d, want 2", got)
+	}
+	close(gate)
+	select {
+	case outcome := <-firstDone:
+		if outcome.err != nil {
+			t.Fatalf("first submit error after refresh = %+v", outcome.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first submit did not finish after refresh probe released")
+	}
+	if got := backend.probes.Load(); got != 2 {
+		t.Fatalf("probes after concurrent refresh = %d, want 2", got)
+	}
 }
 
 func TestServeBootstrapRecordsCodexSetupSchemaMismatchUnfenceable(t *testing.T) {
@@ -3284,6 +3929,13 @@ func TestStrictAuthorityStatusSurfacesRuntimeLivenessOnlyWhileRunning(t *testing
 	if !running.UpdatedAt.Equal(*running.HeartbeatAt) {
 		t.Fatalf("updatedAt = %s, want heartbeatAt %s", running.UpdatedAt, running.HeartbeatAt)
 	}
+	if running.FinalAttemptStartedAt != nil || running.FinalAttemptEndedAt != nil {
+		t.Fatalf("running terminal timing = start:%v end:%v, want absent", running.FinalAttemptStartedAt, running.FinalAttemptEndedAt)
+	}
+	runningRecord := loadAdmissionSafetyRecord(t, server, submitted.JobID)
+	if runningRecord.FinalAttemptStartedAt == nil || !runningRecord.FinalAttemptStartedAt.Equal(base) || runningRecord.FinalAttemptEndedAt != nil {
+		t.Fatalf("running durable timing = start:%v end:%v, want %s/<nil>", runningRecord.FinalAttemptStartedAt, runningRecord.FinalAttemptEndedAt, base)
+	}
 
 	all := jobStatusViaHandler(t, server, protocol.JobStatusParams{All: true})
 	var listed protocol.JobStatus
@@ -3302,6 +3954,9 @@ func TestStrictAuthorityStatusSurfacesRuntimeLivenessOnlyWhileRunning(t *testing
 	if listed.HeartbeatAt.Before(*listed.StartedAt) {
 		t.Fatalf("All=true heartbeatAt = %s, want >= startedAt %s", listed.HeartbeatAt, listed.StartedAt)
 	}
+	if listed.FinalAttemptStartedAt != nil || listed.FinalAttemptEndedAt != nil {
+		t.Fatalf("All=true running terminal timing = start:%v end:%v, want absent", listed.FinalAttemptStartedAt, listed.FinalAttemptEndedAt)
+	}
 
 	releaseRunnerOnce()
 	select {
@@ -3318,6 +3973,13 @@ func TestStrictAuthorityStatusSurfacesRuntimeLivenessOnlyWhileRunning(t *testing
 	}
 	if terminal.Jobs[0].StartedAt != nil || terminal.Jobs[0].HeartbeatAt != nil || terminal.Jobs[0].UpdatedAt != nil {
 		t.Fatalf("terminal status liveness = %+v, want nil liveness fields after active-job eviction", terminal.Jobs[0])
+	}
+	if terminal.Jobs[0].FinalAttemptStartedAt == nil || !terminal.Jobs[0].FinalAttemptStartedAt.Equal(base) || terminal.Jobs[0].FinalAttemptEndedAt == nil || !terminal.Jobs[0].FinalAttemptEndedAt.Equal(base.Add(2*time.Second)) {
+		t.Fatalf("terminal status timing = start:%v end:%v, want %s/%s", terminal.Jobs[0].FinalAttemptStartedAt, terminal.Jobs[0].FinalAttemptEndedAt, base, base.Add(2*time.Second))
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: submitted.JobID})
+	if result.FinalAttemptStartedAt == nil || !result.FinalAttemptStartedAt.Equal(base) || result.FinalAttemptEndedAt == nil || !result.FinalAttemptEndedAt.Equal(base.Add(2*time.Second)) {
+		t.Fatalf("terminal result timing = start:%v end:%v, want %s/%s", result.FinalAttemptStartedAt, result.FinalAttemptEndedAt, base, base.Add(2*time.Second))
 	}
 }
 
@@ -3391,6 +4053,9 @@ func TestAuthorityResultHidesCertifiedResultUntilTerminalRecord(t *testing.T) {
 	if publicPreTerminal.Result != nil {
 		t.Fatalf("pre-terminal job.result = %+v, want no public result content", publicPreTerminal)
 	}
+	if publicPreTerminal.FinalAttemptStartedAt != nil || publicPreTerminal.FinalAttemptEndedAt != nil {
+		t.Fatalf("pre-terminal timing = start:%v end:%v, want absent", publicPreTerminal.FinalAttemptStartedAt, publicPreTerminal.FinalAttemptEndedAt)
+	}
 
 	if _, err := server.admissionReady.Finalize(ctx, jobID, ref, model.TerminalIntent{
 		Outcome: model.OutcomeCompleted,
@@ -3401,6 +4066,13 @@ func TestAuthorityResultHidesCertifiedResultUntilTerminalRecord(t *testing.T) {
 	publicTerminal := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: jobID.String()})
 	if publicTerminal.Result == nil || publicTerminal.Result.ResultPath != resultPath || publicTerminal.Result.SHA256 != receipt.Result.Digest || publicTerminal.Result.Bytes != receipt.Result.Bytes {
 		t.Fatalf("terminal job.result = %+v, want terminal-derived result metadata", publicTerminal)
+	}
+	if publicTerminal.FinalAttemptStartedAt != nil || publicTerminal.FinalAttemptEndedAt != nil {
+		t.Fatalf("legacy terminal timing = start:%v end:%v, want absent", publicTerminal.FinalAttemptStartedAt, publicTerminal.FinalAttemptEndedAt)
+	}
+	terminalStatus := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: jobID.String()})
+	if len(terminalStatus.Jobs) != 1 || terminalStatus.Jobs[0].FinalAttemptStartedAt != nil || terminalStatus.Jobs[0].FinalAttemptEndedAt != nil {
+		t.Fatalf("legacy terminal status = %+v, want served status without timing", terminalStatus)
 	}
 }
 
@@ -7924,6 +8596,7 @@ func installRecordingAdmissionAuthorityForTest(t *testing.T, server *Server) *re
 		servedAdmissionAuthority: &servedAdmissionAuthority{
 			ready: server.admissionReady,
 			latch: server.safetyLatch,
+			clock: server.clock,
 		},
 	}
 	coord, err := coordinator.New(

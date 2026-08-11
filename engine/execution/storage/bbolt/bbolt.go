@@ -21,7 +21,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode"
 
@@ -217,7 +216,7 @@ func removeFailedCreate(path string, identity FileIdentity) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("%w: failed create path is not a regular file: %s", repository.ErrInvalidRecord, path)
 	}
-	current, err := fileIdentityFromFileInfo(info)
+	current, err := fileIdentityFromPath(path, info)
 	if err != nil {
 		return err
 	}
@@ -865,13 +864,11 @@ func preflightBoltBTreeGraphTx(tx *bolt.Tx, expectedIdentity FileIdentity) (err 
 		return err
 	}
 
-	data, err := mmapBoltPreflightData(path, int64(logicalSize), expectedIdentity)
+	data, releaseData, err := openBoltPreflightData(path, int64(logicalSize), expectedIdentity)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = syscall.Munmap(data)
-	}()
+	defer releaseData()
 
 	meta, ok, err := readBoltPreflightMetaFromData(data, tx.ID())
 	if err != nil {
@@ -949,30 +946,6 @@ func readBoltPreflightMetaForStructuralGraph(path string, expectedIdentity FileI
 		return boltPreflightMeta{}, 0, fmt.Errorf("%w: bbolt structural graph preflight logical size %d exceeds addressable memory: %s", repository.ErrCorruptRecord, logicalSize, path)
 	}
 	return meta, logicalSize, nil
-}
-
-func mmapBoltPreflightData(path string, size int64, expectedIdentity FileIdentity) ([]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("%w: bbolt structural graph preflight open mmap source for %s: %v", repository.ErrCorruptRecord, path, err)
-	}
-	defer file.Close()
-
-	if expectedIdentity != (FileIdentity{}) {
-		openedIdentity, err := fileIdentityFromFile(file)
-		if err != nil {
-			return nil, fmt.Errorf("%w: bbolt structural graph preflight stat mmap source for %s: %v", repository.ErrCorruptRecord, path, err)
-		}
-		if openedIdentity != expectedIdentity {
-			return nil, FileIdentityMismatchError{Path: path, Expected: expectedIdentity, Opened: openedIdentity}
-		}
-	}
-
-	data, err := syscall.Mmap(int(file.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
-	if err != nil {
-		return nil, fmt.Errorf("%w: bbolt structural graph preflight mmap %d bytes for %s: %v", repository.ErrCorruptRecord, size, path, err)
-	}
-	return data, nil
 }
 
 func readBoltPreflightMetaFromData(data []byte, txID int) (boltPreflightMeta, bool, error) {
@@ -1400,22 +1373,6 @@ func existingOpenError(path string, err error) error {
 		return err
 	}
 	return fmt.Errorf("%w: structural bbolt open failed for %s: %v", repository.ErrCorruptRecord, path, err)
-}
-
-func fileIdentityFromFile(file *os.File) (FileIdentity, error) {
-	info, err := file.Stat()
-	if err != nil {
-		return FileIdentity{}, err
-	}
-	return fileIdentityFromFileInfo(info)
-}
-
-func fileIdentityFromFileInfo(info os.FileInfo) (FileIdentity, error) {
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return FileIdentity{}, fmt.Errorf("unexpected bbolt stat type %T", info.Sys())
-	}
-	return FileIdentity{Dev: uint64(stat.Dev), Ino: uint64(stat.Ino)}, nil
 }
 
 func (r *Repository) FailCommitAfterCallbackForTest(err error) {
@@ -2894,7 +2851,10 @@ func cloneBinding(binding model.Binding) model.Binding {
 }
 
 func cloneProjection(projection model.JobProjection) model.JobProjection {
-	return projection
+	next := projection
+	next.FinalAttemptStartedAt = clonePtr(projection.FinalAttemptStartedAt)
+	next.FinalAttemptEndedAt = clonePtr(projection.FinalAttemptEndedAt)
+	return next
 }
 
 func cloneTombstone(tombstone repository.Tombstone) repository.Tombstone {
@@ -2913,6 +2873,8 @@ func cloneSafetyRecord(record model.SafetyRecord) model.SafetyRecord {
 	next.Outcome = cloneOutcomeFact(record.Outcome)
 	next.Result = clonePtr(record.Result)
 	next.Terminal = cloneTerminalCertificate(record.Terminal)
+	next.FinalAttemptStartedAt = clonePtr(record.FinalAttemptStartedAt)
+	next.FinalAttemptEndedAt = clonePtr(record.FinalAttemptEndedAt)
 	return next
 }
 
@@ -3033,40 +2995,7 @@ func revisionQuarantine(record repository.QuarantineRecord) uint64 {
 }
 
 func validateProjectionShape(projection model.JobProjection) error {
-	if projection.SchemaVersion == 0 {
-		return fmt.Errorf("%w: projection.schema_version is required", repository.ErrInvalidRecord)
-	}
-	if projection.Revision == 0 {
-		return fmt.Errorf("%w: projection.revision is required", repository.ErrInvalidRecord)
-	}
-	if err := projection.JobID.Validate(); err != nil {
-		return fmt.Errorf("%w: projection.job_id: %v", repository.ErrInvalidRecord, err)
-	}
-	if err := projection.RequestKey.Validate(); err != nil {
-		return fmt.Errorf("%w: projection.request_key: %v", repository.ErrInvalidRecord, err)
-	}
-	if err := projection.TaskIdentity.Validate(); err != nil {
-		return fmt.Errorf("%w: projection.task_identity: %v", repository.ErrInvalidRecord, err)
-	}
-	if err := projection.Mode.Validate(); err != nil {
-		return fmt.Errorf("%w: projection.mode: %v", repository.ErrInvalidRecord, err)
-	}
-	if !projection.Decision.Valid() {
-		return fmt.Errorf("%w: projection.decision is unknown", repository.ErrInvalidRecord)
-	}
-	if !projection.Dispatch.Valid() {
-		return fmt.Errorf("%w: projection.dispatch is unknown", repository.ErrInvalidRecord)
-	}
-	if !projection.Outcome.Valid() {
-		return fmt.Errorf("%w: projection.outcome is unknown", repository.ErrInvalidRecord)
-	}
-	if !projection.Public.Valid() {
-		return fmt.Errorf("%w: projection.public is unknown", repository.ErrInvalidRecord)
-	}
-	if projection.TerminalCause != 0 && !projection.TerminalCause.Valid() {
-		return fmt.Errorf("%w: projection.terminal_cause is unknown", repository.ErrInvalidRecord)
-	}
-	return nil
+	return repository.ValidateProjectionShape(projection)
 }
 
 func validateProjectionMatches(projection model.JobProjection, record model.SafetyRecord) error {

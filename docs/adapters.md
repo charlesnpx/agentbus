@@ -367,7 +367,7 @@ Routine `Preflight` MUST NOT run a network turn. It checks:
 If the version differs from the setup cache, `Preflight` MUST fail loudly with:
 
 ```text
-backend version changed since setup; re-run agentbus setup
+backend version changed since setup; re-run agentbus setup, then retry the launch so the running daemon can re-probe the refreshed cache; restart the daemon if it is running an older agentbus binary
 ```
 
 Each adapter MUST declare a minimum known-good version. The exact values are

@@ -161,6 +161,32 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 		assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
 	})
 
+	t.Run("invalid projection failure metadata rolls back", func(t *testing.T) {
+		repo := factory.New(t)
+		fixture := newFixture(t, "projection-failure-metadata")
+		before := factory.Snapshot(t, repo)
+
+		_, err := repo.Update(context.Background(), func(tx repository.WriteTx) error {
+			if _, err := tx.AllocateJobID(); err != nil {
+				return err
+			}
+			if err := tx.PutBinding(fixture.Binding); err != nil {
+				return err
+			}
+			if err := tx.PutSafety(fixture.Record, 0); err != nil {
+				return err
+			}
+			invalid := fixture.Projection
+			invalid.FailureClass = "unknown_failure_class"
+			invalid.FailureReason = "projection must reject invalid failure metadata"
+			return tx.PutProjection(invalid)
+		})
+		if !errors.Is(err, repository.ErrInvalidRecord) {
+			t.Fatalf("invalid projection failure metadata error = %v, want ErrInvalidRecord", err)
+		}
+		assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
+	})
+
 	t.Run("projection mismatch rolls back", func(t *testing.T) {
 		repo := factory.New(t)
 		fixture := newFixture(t, "projection")

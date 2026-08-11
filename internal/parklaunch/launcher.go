@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
@@ -37,6 +36,7 @@ var (
 	ErrPreparedExecutionPossible = errors.New("prepared launch execution is possible")
 	ErrPreparedCloseRefused      = errors.New("prepared launch close refused")
 	ErrReleaseOutcomeUnknown     = errors.New("parked worker release outcome unknown")
+	ErrPlatformUnsupported       = errors.New("parked worker process-group custody unsupported on this platform")
 )
 
 var releaseAfterSendBeforeAckForTest func(dropAck func() error) error
@@ -579,6 +579,9 @@ func cleanupLaunchReleaseError(prepared *Prepared, releaseErr error) error {
 func Prepare(ctx context.Context, spec Spec) (*Prepared, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := platformParkLaunchSupported(); err != nil {
+		return nil, err
 	}
 	if spec.identity == nil {
 		spec.identity = nativeIdentityReader{}
@@ -1348,7 +1351,7 @@ func terminateStartedProcess(ctx context.Context, process *os.Process, wait *pro
 		return nil
 	default:
 	}
-	_ = process.Signal(syscall.SIGTERM)
+	_ = signalStartedProcess(process)
 	timer := time.NewTimer(100 * time.Millisecond)
 	select {
 	case <-wait.Done():

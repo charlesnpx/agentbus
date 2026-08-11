@@ -1,6 +1,11 @@
 package model
 
-import "testing"
+import (
+	"testing"
+	"time"
+
+	"github.com/charlesnpx/agentbus/engine"
+)
 
 func TestProjectionEnumsMatchProtocolStrings(t *testing.T) {
 	assertStrings(t, "Decision", decisionsToStrings(AllDecisions()), []string{"accepted", "awaiting_ack", "cancel_requested", "terminal"})
@@ -56,6 +61,26 @@ func TestTerminalOutcomesProjectToTerminalPublicStates(t *testing.T) {
 	}
 }
 
+func TestProjectedFailureMetadataOnlyForFailureOrInterruptedPublicStates(t *testing.T) {
+	record := SafetyRecord{
+		FailureClass:  engine.FailureClassBackendError,
+		FailureReason: "retained for forensics",
+	}
+	for _, public := range AllPublicStates() {
+		gotReason, gotClass := projectedFailureMetadata(record, public)
+		wantExposed := public == PublicFailed || public == PublicInterrupted || public == PublicQuarantined
+		if wantExposed {
+			if gotReason != record.FailureReason || gotClass != record.FailureClass {
+				t.Fatalf("failure metadata for %s = (%q, %q), want (%q, %q)", public, gotReason, gotClass, record.FailureReason, record.FailureClass)
+			}
+			continue
+		}
+		if gotReason != "" || gotClass != "" {
+			t.Fatalf("failure metadata for %s = (%q, %q), want empty", public, gotReason, gotClass)
+		}
+	}
+}
+
 func TestProjectDerivesReadModelFromSafetyRecordOnly(t *testing.T) {
 	record := validSafetyRecord()
 	projection, err := Project(record, ProjectionMetadata{SessionID: "session-1"})
@@ -64,6 +89,9 @@ func TestProjectDerivesReadModelFromSafetyRecordOnly(t *testing.T) {
 	}
 	if projection.Decision != DecisionAccepted || projection.Dispatch != DispatchPermitGranted || projection.Outcome != OutcomeNone || projection.Public != PublicStarting {
 		t.Fatalf("projection = decision:%s dispatch:%s outcome:%s public:%s", projection.Decision, projection.Dispatch, projection.Outcome, projection.Public)
+	}
+	if projection.FinalAttemptStartedAt != nil || projection.FinalAttemptEndedAt != nil {
+		t.Fatalf("legacy projection timing = start:%v end:%v, want absent", projection.FinalAttemptStartedAt, projection.FinalAttemptEndedAt)
 	}
 
 	release := LaunchReleaseFact{
@@ -81,6 +109,9 @@ func TestProjectDerivesReadModelFromSafetyRecordOnly(t *testing.T) {
 	}
 	if projection.Dispatch != DispatchActive || projection.Public != PublicRunning {
 		t.Fatalf("active projection = dispatch:%s public:%s", projection.Dispatch, projection.Public)
+	}
+	if projection.FinalAttemptStartedAt != nil || projection.FinalAttemptEndedAt != nil {
+		t.Fatalf("active projection timing = start:%v end:%v, want absent", projection.FinalAttemptStartedAt, projection.FinalAttemptEndedAt)
 	}
 
 	result := ResultRef{Path: "results/job-0001.txt", Digest: "sha256:abc123", Bytes: 3}
@@ -108,12 +139,40 @@ func TestProjectDerivesReadModelFromSafetyRecordOnly(t *testing.T) {
 		DerivedBy:           record.AdmittedBy,
 		Result:              &result,
 	}
+	startedAt := time.Date(2026, 8, 11, 15, 0, 0, 0, time.UTC)
+	endedAt := startedAt.Add(3 * time.Second)
+	record.FinalAttemptStartedAt = &startedAt
+	record.FinalAttemptEndedAt = &endedAt
 	projection, err = Project(record, ProjectionMetadata{})
 	if err != nil {
 		t.Fatalf("project terminal record: %v", err)
 	}
 	if projection.Decision != DecisionTerminal || projection.Dispatch != DispatchDone || projection.Outcome != OutcomeCompleted || projection.Public != PublicCompleted || projection.TerminalCause != CauseCompletedNormally {
 		t.Fatalf("terminal projection = decision:%s dispatch:%s outcome:%s public:%s cause:%s", projection.Decision, projection.Dispatch, projection.Outcome, projection.Public, projection.TerminalCause)
+	}
+	if projection.FinalAttemptStartedAt == nil || !projection.FinalAttemptStartedAt.Equal(startedAt) || projection.FinalAttemptEndedAt == nil || !projection.FinalAttemptEndedAt.Equal(endedAt) {
+		t.Fatalf("terminal projection timing = start:%v end:%v, want %s/%s", projection.FinalAttemptStartedAt, projection.FinalAttemptEndedAt, startedAt, endedAt)
+	}
+}
+
+func TestProjectSuppressesPartialTerminalFinalAttemptTiming(t *testing.T) {
+	startedAt := time.Date(2026, 8, 11, 16, 0, 0, 0, time.UTC)
+	record := reducerCanceledRetiredRecord(t)
+	record = reducerMustApply(t, record, RecordFinalAttemptStart{JobID: reducerJobID(), StartedAt: startedAt})
+	record = reducerMustApply(t, record, Finalize{
+		Ref:    reducerRef(),
+		Intent: TerminalIntent{Outcome: OutcomeCanceled, Cause: CauseCanceledBeforeAuthorization},
+	})
+	if record.FinalAttemptStartedAt == nil || !record.FinalAttemptStartedAt.Equal(startedAt) || record.FinalAttemptEndedAt != nil {
+		t.Fatalf("durable partial timing = start:%v end:%v, want %s/<nil>", record.FinalAttemptStartedAt, record.FinalAttemptEndedAt, startedAt)
+	}
+
+	projection, err := Project(record, ProjectionMetadata{})
+	if err != nil {
+		t.Fatalf("Project partial terminal timing: %v", err)
+	}
+	if projection.FinalAttemptStartedAt != nil || projection.FinalAttemptEndedAt != nil {
+		t.Fatalf("partial terminal projection timing = start:%v end:%v, want absent", projection.FinalAttemptStartedAt, projection.FinalAttemptEndedAt)
 	}
 }
 

@@ -345,13 +345,14 @@ func TestAppServerCompletedTurnUsesLastDeltaAgentMessageItemAsResult(t *testing.
 
 func TestAppServerTerminalTurnStatuses(t *testing.T) {
 	tests := []struct {
-		name      string
-		status    string
-		errorText string
-		want      string
+		name        string
+		status      string
+		errorText   string
+		want        string
+		interrupted bool
 	}{
 		{name: "failed", status: "failed", errorText: "model failed", want: "model failed"},
-		{name: "unrequested interrupted", status: "interrupted", want: "interrupted"},
+		{name: "unrequested interrupted", status: "interrupted", want: "interrupted", interrupted: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -373,6 +374,11 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 			got := collectEventsWithTimeout(t, events, 2*time.Second)
 			if !containsEvent(got, engine.EventTerminalError, test.want) {
 				t.Fatalf("events = %#v, want terminal error containing %q", got, test.want)
+			}
+			for _, event := range got {
+				if event.Type == engine.EventTerminalError && test.interrupted && !errors.Is(event.Err, engine.ErrTurnInterrupted) {
+					t.Fatalf("terminal event error = %v, want ErrTurnInterrupted", event.Err)
+				}
 			}
 			if resultText(got) != "" {
 				t.Fatalf("events = %#v, did not want fabricated success result", got)

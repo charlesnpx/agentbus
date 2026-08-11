@@ -41,7 +41,7 @@ const (
 	admissionRepositoryCloseTimeout = 5 * time.Second
 	admissionContentionRetryDelay   = 50 * time.Millisecond
 	admissionContentionFallback     = 2 * time.Second
-	admissionProbeReasonMaxRunes    = 512
+	admissionProbeReasonMaxRunes    = engine.FailureReasonMaxRunes
 )
 
 var admissionDetachedCleanupTimeout = 30 * time.Second
@@ -75,11 +75,26 @@ type admissionProbeableBackend interface {
 	ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error)
 }
 
+// admissionSetupProbeCacheFingerprintBackend is an optional adapter contract.
+// It identifies the on-disk setup evidence that a pinned backend needs before
+// strict admission may safely attempt one more probe.
+type admissionSetupProbeCacheFingerprintBackend interface {
+	SetupProbeCacheFingerprint() (string, error)
+}
+
+type admissionPinnedBackend struct {
+	setupCacheFingerprint      string
+	setupCacheFingerprintKnown bool
+	reprobeInFlight            bool
+}
+
 type admissionInstance struct {
 	runtime     *servedAdmissionRuntime
 	epoch       uint64
+	backendMu   sync.RWMutex
 	descriptors map[string]admissionBackendDescriptor
 	policy      ServeAdmissionPolicy
+	pinned      map[string]admissionPinnedBackend
 
 	bootstrapper *admissionBootstrapper
 	ready        *admissionReady
@@ -90,11 +105,33 @@ type admissionInstance struct {
 }
 
 func (instance *admissionInstance) descriptor(name string) (admissionBackendDescriptor, bool) {
-	if instance == nil || instance.descriptors == nil {
+	if instance == nil {
+		return admissionBackendDescriptor{}, false
+	}
+	instance.backendMu.RLock()
+	defer instance.backendMu.RUnlock()
+	if instance.descriptors == nil {
 		return admissionBackendDescriptor{}, false
 	}
 	descriptor, ok := instance.descriptors[name]
 	return descriptor, ok
+}
+
+func (instance *admissionInstance) descriptorAndFenceability(name string) (admissionBackendDescriptor, ServeBackendFenceability, bool) {
+	if instance == nil {
+		return admissionBackendDescriptor{}, ServeBackendFenceability{}, false
+	}
+	instance.backendMu.RLock()
+	defer instance.backendMu.RUnlock()
+	if instance.descriptors == nil {
+		return admissionBackendDescriptor{}, ServeBackendFenceability{}, false
+	}
+	descriptor, ok := instance.descriptors[name]
+	if !ok {
+		return admissionBackendDescriptor{}, ServeBackendFenceability{}, false
+	}
+	fenceability, _ := instance.policy.backendFenceability(name)
+	return descriptor, fenceability, true
 }
 
 type admissionBackendDescriptor struct {
@@ -148,8 +185,10 @@ type admissionStartupHooks struct {
 	BeforePolicyInstall     func()
 }
 
-// ServeAdmissionPolicy is the immutable strict-admission policy derived during
-// Serve bootstrap from the qualified runtime and probed backend descriptors.
+// ServeAdmissionPolicy holds the strict-admission policy derived during Serve
+// bootstrap. Its strict-route and runtime fields never change; a backend's
+// fenceability entry may be refreshed only after a newly observed setup cache
+// passes a fresh strict probe.
 type ServeAdmissionPolicy struct {
 	Mode                      AdmissionServeMode
 	AcceptIdentified          bool
@@ -193,15 +232,19 @@ func deriveServeAdmissionPolicy(metadata authority.AdmissionRootMetadata, runtim
 		policy.strictRouteDisabledReason = reason.Error()
 	}
 	for name, descriptor := range descriptors {
-		policy.backends[name] = ServeBackendFenceability{
-			Backend:          name,
-			Capabilities:     descriptor.capabilities,
-			ControlledRunner: descriptor.controlledRunner,
-			Fenceable:        descriptor.fenceable,
-			Reason:           descriptor.unfenceableCause,
-		}
+		policy.backends[name] = admissionBackendFenceability(name, descriptor)
 	}
 	return policy
+}
+
+func admissionBackendFenceability(name string, descriptor admissionBackendDescriptor) ServeBackendFenceability {
+	return ServeBackendFenceability{
+		Backend:          name,
+		Capabilities:     descriptor.capabilities,
+		ControlledRunner: descriptor.controlledRunner,
+		Fenceable:        descriptor.fenceable,
+		Reason:           descriptor.unfenceableCause,
+	}
 }
 
 func (policy ServeAdmissionPolicy) backendFenceability(name string) (ServeBackendFenceability, bool) {
@@ -497,7 +540,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err := s.failUnavailableStrictRuntimeBeforeRepository(ctx, runtime); err != nil {
 		return err
 	}
-	descriptors, err := s.probeAdmissionBackends(ctx)
+	descriptors, pinnedBackends, err := s.probeAdmissionBackends(ctx)
 	if err != nil {
 		return err
 	}
@@ -535,7 +578,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		if s.admissionStartupHooks.BeforeRecovery != nil {
 			s.admissionStartupHooks.BeforeRecovery()
 		}
-		if err := recoverAdmissionBeforeReady(ctx, session, runtime.launchPort(), s.safetyLatch); err != nil {
+		if err := recoverAdmissionBeforeReady(ctx, session, runtime.launchPort(), s.safetyLatch, s.clock); err != nil {
 			return err
 		}
 		if s.admissionStartupHooks.AfterRecovery != nil {
@@ -560,7 +603,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		if s.admissionStartupHooks.BeforeRecovery != nil {
 			s.admissionStartupHooks.BeforeRecovery()
 		}
-		if err := recoverAdmissionBeforeReady(ctx, session, runtime.launchPort(), s.safetyLatch); err != nil {
+		if err := recoverAdmissionBeforeReady(ctx, session, runtime.launchPort(), s.safetyLatch, s.clock); err != nil {
 			return err
 		}
 		if s.admissionStartupHooks.AfterRecovery != nil {
@@ -585,7 +628,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	adapter := &servedAdmissionAuthority{ready: ready, latch: s.safetyLatch}
+	adapter := &servedAdmissionAuthority{ready: ready, latch: s.safetyLatch, clock: s.clock}
 	owner, err := model.NewOwnerID(s.nextID("coordinator"))
 	if err != nil {
 		return err
@@ -620,6 +663,7 @@ func (s *Server) bootstrapAdmission(ctx context.Context) error {
 		epoch:        epoch,
 		descriptors:  cloneAdmissionBackendDescriptors(descriptors),
 		policy:       policy,
+		pinned:       pinnedBackends,
 		bootstrapper: bootstrapper,
 		ready:        ready,
 		coordinator:  coord,
@@ -938,22 +982,24 @@ func (s *Server) withAdmissionSubmission(fn func(*servedSubmissionCoordinator) e
 	return fn(submissionRef)
 }
 
-func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissionBackendDescriptor, error) {
+func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissionBackendDescriptor, map[string]admissionPinnedBackend, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	runner := s.admissionProbeRunner
 	if runner == nil {
 		runner = command.DirectProbeRunner{}
 	}
-	names := make([]string, 0, len(s.backends))
-	for name := range s.backends {
+	backends := s.backendSnapshot()
+	names := make([]string, 0, len(backends))
+	for name := range backends {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	descriptors := make(map[string]admissionBackendDescriptor, len(names))
+	pinned := make(map[string]admissionPinnedBackend)
 	for _, name := range names {
-		backend := s.backends[name]
+		backend := backends[name]
 		probeable, ok := backend.(admissionProbeableBackend)
 		if !ok {
 			probeErr := model.IncompatibleExecutionCapabilitiesError{
@@ -966,10 +1012,11 @@ func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissi
 			descriptors[name] = s.admissionBackendDescriptor(name, backend, probeErr)
 			continue
 		}
+		fingerprint, fingerprintKnown := admissionSetupProbeCacheFingerprint(backend)
 		probed, err := probeable.ProbeBackend(ctx, runner)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, fmt.Errorf("probe strict backend %s canceled by serve context: %w", name, ctxErr)
+				return nil, nil, fmt.Errorf("probe strict backend %s canceled by serve context: %w", name, ctxErr)
 			}
 			// Probe cancellation is fatal only when the Serve parent context
 			// is canceled. A backend-returned context sentinel while that
@@ -983,21 +1030,28 @@ func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissi
 			}
 			s.admissionUnprobeableBackends[name] = probeErr
 			descriptors[name] = s.admissionBackendDescriptor(name, backend, probeErr)
+			pinned[name] = admissionPinnedBackend{
+				setupCacheFingerprint:      fingerprint,
+				setupCacheFingerprintKnown: fingerprintKnown,
+			}
 			continue
 		}
 		if probed == nil {
-			return nil, fmt.Errorf("probe strict backend %s: nil probed backend", name)
+			return nil, nil, fmt.Errorf("probe strict backend %s: nil probed backend", name)
 		}
 		if probed.Name() != name {
-			return nil, fmt.Errorf("probe strict backend %s: probed backend changed name to %s", name, probed.Name())
+			return nil, nil, fmt.Errorf("probe strict backend %s: probed backend changed name to %s", name, probed.Name())
 		}
-		s.backends[name] = probed
+		s.replaceBackend(name, probed)
 		if s.admissionUnprobeableBackends != nil {
 			delete(s.admissionUnprobeableBackends, name)
 		}
 		descriptors[name] = s.admissionBackendDescriptor(name, probed, nil)
 	}
-	return descriptors, nil
+	if len(pinned) == 0 {
+		pinned = nil
+	}
+	return descriptors, pinned, nil
 }
 
 func admissionProbeFailureError(name string, err error) error {
@@ -1068,6 +1122,163 @@ func cloneAdmissionBackendDescriptors(src map[string]admissionBackendDescriptor)
 		dst[name] = descriptor
 	}
 	return dst
+}
+
+func admissionSetupProbeCacheFingerprint(backend engine.Backend) (string, bool) {
+	provider, ok := backend.(admissionSetupProbeCacheFingerprintBackend)
+	if !ok {
+		return "", false
+	}
+	fingerprint, err := provider.SetupProbeCacheFingerprint()
+	if err != nil || fingerprint == "" {
+		return "", false
+	}
+	return fingerprint, true
+}
+
+func (instance *admissionInstance) setupCacheRefreshCandidate(name string) (admissionBackendDescriptor, string, bool, bool) {
+	if instance == nil {
+		return admissionBackendDescriptor{}, "", false, false
+	}
+	instance.backendMu.RLock()
+	defer instance.backendMu.RUnlock()
+	pinned, ok := instance.pinned[name]
+	if !ok || pinned.reprobeInFlight {
+		return admissionBackendDescriptor{}, "", false, false
+	}
+	descriptor, ok := instance.descriptors[name]
+	if !ok || descriptor.probeError == nil {
+		return admissionBackendDescriptor{}, "", false, false
+	}
+	return descriptor, pinned.setupCacheFingerprint, pinned.setupCacheFingerprintKnown, true
+}
+
+func (instance *admissionInstance) beginSetupCacheRefresh(name, fingerprint string) (admissionBackendDescriptor, bool) {
+	if instance == nil {
+		return admissionBackendDescriptor{}, false
+	}
+	instance.backendMu.Lock()
+	defer instance.backendMu.Unlock()
+	pinned, ok := instance.pinned[name]
+	if !ok || pinned.reprobeInFlight || (pinned.setupCacheFingerprintKnown && pinned.setupCacheFingerprint == fingerprint) {
+		return admissionBackendDescriptor{}, false
+	}
+	descriptor, ok := instance.descriptors[name]
+	if !ok || descriptor.probeError == nil {
+		return admissionBackendDescriptor{}, false
+	}
+	pinned.reprobeInFlight = true
+	instance.pinned[name] = pinned
+	return descriptor, true
+}
+
+func (instance *admissionInstance) replaceBackendDescriptorLocked(name string, descriptor admissionBackendDescriptor) {
+	if instance.descriptors == nil {
+		return
+	}
+	instance.descriptors[name] = descriptor
+	if instance.policy.backends != nil {
+		instance.policy.backends[name] = admissionBackendFenceability(name, descriptor)
+	}
+}
+
+// refreshAdmissionBackendOnSetupCacheChange is deliberately a snapshot-checkout
+// operation. It holds no admission lock while ProbeBackend can spawn a process;
+// simultaneous submitters see the existing pin until this one finishes.
+func (s *Server) refreshAdmissionBackendOnSetupCacheChange(ctx context.Context, instance *admissionInstance, name string) {
+	descriptor, priorFingerprint, priorFingerprintKnown, refreshable := instance.setupCacheRefreshCandidate(name)
+	if !refreshable {
+		return
+	}
+	fingerprint, changed := admissionSetupProbeCacheFingerprint(descriptor.backend)
+	if !changed || (priorFingerprintKnown && fingerprint == priorFingerprint) {
+		return
+	}
+	descriptor, started := instance.beginSetupCacheRefresh(name, fingerprint)
+	if !started {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeable, ok := descriptor.backend.(admissionProbeableBackend)
+	if !ok {
+		s.finishAdmissionBackendSetupCacheRefresh(instance, name, fingerprint, nil, errors.New("strict backend no longer implements ProbeBackend"), true, true)
+		return
+	}
+	runner := s.admissionProbeRunner
+	if runner == nil {
+		runner = command.DirectProbeRunner{}
+	}
+	probed, probeErr := probeable.ProbeBackend(ctx, runner)
+	if ctx.Err() != nil {
+		// A client cancellation must not consume a freshly observed cache
+		// revision or turn that cancellation into a daemon-lifetime pin.
+		s.finishAdmissionBackendSetupCacheRefresh(instance, name, fingerprint, nil, nil, false, false)
+		return
+	}
+	if probeErr == nil && probed == nil {
+		probeErr = errors.New("probe returned nil backend")
+	}
+	if probeErr == nil && probed.Name() != name {
+		probeErr = fmt.Errorf("probe returned backend named %s", probed.Name())
+	}
+	postFingerprint, postKnown := admissionSetupProbeCacheFingerprint(descriptor.backend)
+	cacheStable := postKnown && postFingerprint == fingerprint
+	if probeErr != nil {
+		probeErr = admissionProbeFailureError(name, probeErr)
+	}
+	// A failed post-probe read cannot establish that this revision is still the
+	// cache revision. Leave the prior fingerprint in place so the next
+	// submission can retry the same candidate. A known different revision is
+	// still consumed: the next refresh will observe and probe that revision.
+	s.finishAdmissionBackendSetupCacheRefresh(instance, name, fingerprint, probed, probeErr, cacheStable, postKnown)
+}
+
+func (s *Server) finishAdmissionBackendSetupCacheRefresh(instance *admissionInstance, name, fingerprint string, probed engine.Backend, probeErr error, cacheStable, consumeFingerprint bool) {
+	// State publication is short and happens only after the probe. A closing or
+	// replacement Serve wins; its checked-out instance is never modified.
+	// The backend-map lock is always innermost: admissionStateMu ->
+	// instance.backendMu -> backendMapMu. Readers acquire only backendMapMu and
+	// never acquire admission locks, so this adds no reverse lock ordering.
+	s.admissionStateMu.Lock()
+	defer s.admissionStateMu.Unlock()
+	if s.admissionInstance != instance || s.admissionInstanceClosing(instance) {
+		return
+	}
+	instance.backendMu.Lock()
+	defer instance.backendMu.Unlock()
+	pinned, ok := instance.pinned[name]
+	if !ok || !pinned.reprobeInFlight {
+		return
+	}
+	pinned.reprobeInFlight = false
+	if !consumeFingerprint {
+		instance.pinned[name] = pinned
+		return
+	}
+	pinned.setupCacheFingerprint = fingerprint
+	pinned.setupCacheFingerprintKnown = true
+	if cacheStable && probeErr == nil {
+		descriptor := s.admissionBackendDescriptor(name, probed, nil)
+		instance.replaceBackendDescriptorLocked(name, descriptor)
+		s.replaceBackend(name, probed)
+		delete(instance.pinned, name)
+		if s.admissionUnprobeableBackends != nil {
+			delete(s.admissionUnprobeableBackends, name)
+		}
+		return
+	}
+	if cacheStable && probeErr != nil {
+		if descriptor, ok := instance.descriptors[name]; ok {
+			instance.replaceBackendDescriptorLocked(name, s.admissionBackendDescriptor(name, descriptor.backend, probeErr))
+		}
+		if s.admissionUnprobeableBackends == nil {
+			s.admissionUnprobeableBackends = make(map[string]error)
+		}
+		s.admissionUnprobeableBackends[name] = probeErr
+	}
+	instance.pinned[name] = pinned
 }
 
 func (s *Server) admissionDaemonBoot() (model.BootRef, error) {
@@ -1410,12 +1621,12 @@ func admissionContentionExpiredError(parent context.Context, repoPath, socketPat
 	return expiration
 }
 
-func recoverAdmissionBeforeReady(ctx context.Context, session *authority.RecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) error {
-	return newAdmissionRecoveryExecutor(session, launchPort, latch).Recover(ctx)
+func recoverAdmissionBeforeReady(ctx context.Context, session *authority.RecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch, clock engine.Clock) error {
+	return newAdmissionRecoveryExecutor(session, launchPort, latch, clock).Recover(ctx)
 }
 
-func recoverAdmissionBeforeReadyReport(ctx context.Context, session admissionRecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch) (AdmissionRecoveryReport, error) {
-	return newAdmissionRecoveryExecutor(session, launchPort, latch).RecoverReport(ctx)
+func recoverAdmissionBeforeReadyReport(ctx context.Context, session admissionRecoverySession, launchPort launch.CustodianPort, latch *SafetyLatch, clocks ...engine.Clock) (AdmissionRecoveryReport, error) {
+	return newAdmissionRecoveryExecutor(session, launchPort, latch, clocks...).RecoverReport(ctx)
 }
 
 type servedSubmissionCoordinator struct {
@@ -1466,7 +1677,7 @@ type ordinalBoundSession interface {
 
 func (s *Server) admissionTurnEvents(ctx context.Context, run jobRun, input engine.TurnInput, ordinal model.LaunchOrdinal) (<-chan engine.Event, error) {
 	if err := ordinal.Validate(); err != nil {
-		return nil, err
+		return nil, classifyFailureError(terminalFailureBackendNotStarted, err)
 	}
 	// Snapshot-checkout: launch preparation and the turn must not hold
 	// admissionStateMu (see activeWork). The coordinator-identity comparison
@@ -1477,23 +1688,30 @@ func (s *Server) admissionTurnEvents(ctx context.Context, run jobRun, input engi
 	ready := s.admissionInstance != nil && submission != nil
 	s.admissionStateMu.RUnlock()
 	if !ready || run.admissionLaunch.coordinator != submission {
-		return nil, authority.ErrNotReady
+		return nil, classifyFailureError(terminalFailureBackendNotStarted, authority.ErrNotReady)
 	}
 	if run.admissionLaunch.coordinator == nil {
-		return nil, custodian.ErrSupervisorUnavailable
+		return nil, classifyFailureError(terminalFailureBackendNotStarted, custodian.ErrSupervisorUnavailable)
 	}
 	session, ok := run.session.(ordinalBoundSession)
 	if !ok {
-		return nil, fmt.Errorf("%w: backend session does not support ordinal-bound runners", custodian.ErrSupervisorUnavailable)
+		return nil, classifyFailureError(terminalFailureBackendNotStarted, fmt.Errorf("%w: backend session does not support ordinal-bound runners", custodian.ErrSupervisorUnavailable))
 	}
 	runner, err := run.admissionLaunch.coordinator.LaunchRunner(run.admissionLaunch, ordinal)
 	if err != nil {
-		return nil, err
+		// LaunchRunner can fail after launch preparation has crossed the point
+		// where backend work may be possible. Its provenance is therefore
+		// deliberately conservative rather than claiming no backend started.
+		return nil, classifyFailureError(terminalFailureBackendRan, err)
 	}
 	if run.active != nil {
 		runner = admissionActiveRunner{inner: runner, active: run.active}
 	}
-	return session.TurnWithRunner(ctx, input, runner)
+	events, err := session.TurnWithRunner(ctx, input, runner)
+	if err != nil {
+		return nil, classifyFailureError(terminalFailureBackendRan, err)
+	}
+	return events, nil
 }
 
 type admissionActiveRunner struct {
@@ -1708,6 +1926,7 @@ func (a servedLaunchAuthority) FailStop(ctx context.Context, err error) error {
 type servedAdmissionAuthority struct {
 	ready *authority.Ready
 	latch *SafetyLatch
+	clock engine.Clock
 }
 
 func (a *servedAdmissionAuthority) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) (coordinator.StepResult, error) {
@@ -1731,6 +1950,10 @@ func (a *servedAdmissionAuthority) RecordResult(ctx context.Context, jobID model
 }
 
 func (a *servedAdmissionAuthority) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent) (coordinator.StepResult, error) {
+	if a.clock != nil {
+		endedAt := a.clock.Now().UTC()
+		intent.FinalAttemptEndedAt = &endedAt
+	}
 	applied, err := a.ready.Finalize(ctx, jobID, ref, intent)
 	return admissionStepResult(applied, err)
 }
@@ -1930,8 +2153,13 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	spec := params.TaskSpec
 	var descriptor admissionBackendDescriptor
 	if spec.Backend != "" {
+		s.refreshAdmissionBackendOnSetupCacheChange(ctx, instance, spec.Backend)
+		if s.admissionInstanceClosing(instance) {
+			return requestOutcome{err: admissionProtocolError(errAdmissionClosing)}
+		}
+		var fenceability ServeBackendFenceability
 		var ok bool
-		descriptor, ok = instance.descriptor(spec.Backend)
+		descriptor, fenceability, ok = instance.descriptorAndFenceability(spec.Backend)
 		if !ok {
 			return requestOutcome{err: strictAdmissionProtocolError(
 				protocol.ErrorBackendUnavailable,
@@ -1940,7 +2168,6 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 				protocol.ErrorData{Backend: spec.Backend},
 			)}
 		}
-		fenceability, _ := instance.policy.backendFenceability(spec.Backend)
 		if !fenceability.Fenceable {
 			message := fenceability.Reason
 			if message == "" {
@@ -2222,7 +2449,9 @@ func (s *Server) launchAdmittedJob(ctx context.Context, run jobRun) {
 		return launchErr
 	})
 	if err != nil {
-		_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
+		// prepareAdmittedJobLaunch only reads admission state and registers the
+		// active job; it does not call LaunchRunner or the backend session.
+		s.completeRunFailure(run, engine.StateFailed, "", nil, terminalFailureBackendNotStarted, err)
 		return
 	}
 	if launched.active == nil {
@@ -2383,18 +2612,54 @@ func admissionCleanupDisposition(record model.SafetyRecord) string {
 	return model.DeriveCleanupDisposition(record).String()
 }
 
+// authorityFinalAttemptTiming and authorityFailureMetadata are the
+// response-boundary twins of the projection guards: Project filters new
+// records, and these also protect projections persisted by an older daemon
+// written before those guards existed.
+func authorityFinalAttemptTiming(projection model.JobProjection) (*time.Time, *time.Time) {
+	if projection.Decision != model.DecisionTerminal || projection.FinalAttemptStartedAt == nil || projection.FinalAttemptEndedAt == nil {
+		return nil, nil
+	}
+	return cloneTime(projection.FinalAttemptStartedAt), cloneTime(projection.FinalAttemptEndedAt)
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
+
+// authorityFailureMetadata exposes failure metadata only for failure or
+// interrupted terminal states.
+func authorityFailureMetadata(projection model.JobProjection) (string, engine.FailureClass) {
+	switch projection.Public {
+	case model.PublicFailed, model.PublicInterrupted, model.PublicQuarantined:
+		return projection.FailureReason, projection.FailureClass
+	default:
+		return "", ""
+	}
+}
+
 func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *protocol.ErrorObject) {
 	record, projection, ok, errObj := s.authorityJobProjection(jobID)
 	if !ok || errObj != nil {
 		return protocol.JobStatus{}, ok, errObj
 	}
+	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
+	failureReason, failureClass := authorityFailureMetadata(projection)
 	reported := s.reportedModel(projection.JobID.String())
 	status := protocol.JobStatus{
-		JobID:              projection.JobID.String(),
-		SessionID:          projection.SessionID,
-		State:              admissionState(projection.Public),
-		CleanupDisposition: admissionCleanupDisposition(record),
-		ModelReported:      reported,
+		JobID:                 projection.JobID.String(),
+		SessionID:             projection.SessionID,
+		State:                 admissionState(projection.Public),
+		CleanupDisposition:    admissionCleanupDisposition(record),
+		ModelReported:         reported,
+		FinalAttemptStartedAt: finalAttemptStartedAt,
+		FinalAttemptEndedAt:   finalAttemptEndedAt,
+		FailureReason:         failureReason,
+		FailureClass:          failureClass,
 	}
 	if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
 		startedAt := started
@@ -2465,18 +2730,24 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 	if record.Terminal != nil {
 		contract = record.Terminal.Contract
 	}
+	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
+	failureReason, failureClass := authorityFailureMetadata(projection)
 	reported := s.reportedModel(projection.JobID.String())
 	if result != nil {
 		result.ModelReported = reported
 	}
 	return protocol.JobResult{
-		JobID:              projection.JobID.String(),
-		SessionID:          projection.SessionID,
-		State:              admissionState(projection.Public),
-		CleanupDisposition: admissionCleanupDisposition(record),
-		Result:             result,
-		ModelReported:      reported,
-		Contract:           contract,
+		JobID:                 projection.JobID.String(),
+		SessionID:             projection.SessionID,
+		State:                 admissionState(projection.Public),
+		CleanupDisposition:    admissionCleanupDisposition(record),
+		Result:                result,
+		ModelReported:         reported,
+		Contract:              contract,
+		FinalAttemptStartedAt: finalAttemptStartedAt,
+		FinalAttemptEndedAt:   finalAttemptEndedAt,
+		FailureReason:         failureReason,
+		FailureClass:          failureClass,
 	}, true, nil
 }
 
@@ -2533,11 +2804,17 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 		return protocol.JobStatus{}, false, fmt.Errorf("%w: authority projection is not valid for %s", authority.ErrInvalidRequest, jobID)
 	}
 	projection := image.Projection.Value
+	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
+	failureReason, failureClass := authorityFailureMetadata(projection)
 	return protocol.JobStatus{
-		JobID:              projection.JobID.String(),
-		SessionID:          projection.SessionID,
-		State:              admissionState(projection.Public),
-		CleanupDisposition: admissionCleanupDisposition(image.Safety.Value),
+		JobID:                 projection.JobID.String(),
+		SessionID:             projection.SessionID,
+		State:                 admissionState(projection.Public),
+		CleanupDisposition:    admissionCleanupDisposition(image.Safety.Value),
+		FinalAttemptStartedAt: finalAttemptStartedAt,
+		FinalAttemptEndedAt:   finalAttemptEndedAt,
+		FailureReason:         failureReason,
+		FailureClass:          failureClass,
 	}, true, nil
 }
 

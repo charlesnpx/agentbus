@@ -3,6 +3,8 @@ package model
 import (
 	"errors"
 	"fmt"
+	"log"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 )
@@ -97,6 +99,14 @@ func ApplyCertifyResult(current SafetyRecord, command CertifyResult) (ApplyResul
 	return apply(current, command)
 }
 
+func ApplyRecordFinalAttemptStart(current SafetyRecord, command RecordFinalAttemptStart) (ApplyResult, error) {
+	return apply(current, command)
+}
+
+func ApplyRecordFailure(current SafetyRecord, command RecordFailure) (ApplyResult, error) {
+	return apply(current, command)
+}
+
 func ApplyFinalize(current SafetyRecord, command Finalize) (ApplyResult, error) {
 	return apply(current, command)
 }
@@ -110,6 +120,24 @@ func apply(current SafetyRecord, command Command) (ApplyResult, error) {
 		return ApplyResult{}, err
 	}
 	if current.Terminal != nil {
+		if failure, ok := normalized.(RecordFailure); ok {
+			next := cloneSafetyRecord(current)
+			changed, err := applyRecordFailure(&next, current, failure)
+			if err != nil {
+				return ApplyResult{}, err
+			}
+			if !changed {
+				return ApplyResult{Record: cloneSafetyRecord(current), Changed: false}, nil
+			}
+			if current.Revision == ^uint64(0) {
+				return ApplyResult{}, precondition("safety record revision overflow")
+			}
+			next.Revision = current.Revision + 1
+			if err := ValidateSafetyRecord(next); err != nil {
+				return ApplyResult{}, fmt.Errorf("reducer produced invalid safety record: %w", err)
+			}
+			return ApplyResult{Record: next, Changed: true}, nil
+		}
 		return applyTerminalAbsorbing(current, normalized)
 	}
 	if current.Mode == ModeLegacyUnfenced && !legacyUnfencedCommand(normalized) {
@@ -156,6 +184,10 @@ func applyOpen(next *SafetyRecord, current SafetyRecord, command any) (bool, err
 		return applyObserveOutcome(next, current, c)
 	case CertifyResult:
 		return applyCertifyResult(next, current, c)
+	case RecordFinalAttemptStart:
+		return applyRecordFinalAttemptStart(next, current, c)
+	case RecordFailure:
+		return applyRecordFailure(next, current, c)
 	case Finalize:
 		return applyFinalize(next, current, c)
 	default:
@@ -489,6 +521,79 @@ func applyCertifyResult(next *SafetyRecord, current SafetyRecord, command Certif
 	return mergeFact(&next.Result, receipt, "result")
 }
 
+func applyRecordFinalAttemptStart(next *SafetyRecord, current SafetyRecord, command RecordFinalAttemptStart) (bool, error) {
+	if err := ensureJob(current, command.JobID); err != nil {
+		return false, err
+	}
+	startedAt := command.StartedAt
+	if startedAt.IsZero() {
+		reportFinalAttemptTimingWarning(current.JobID, "dropping zero final attempt start")
+		return false, nil
+	}
+	if current.FinalAttemptEndedAt != nil {
+		reportFinalAttemptTimingWarning(current.JobID, "dropping start after a final attempt end is already recorded")
+		return false, nil
+	}
+	if current.FinalAttemptStartedAt != nil {
+		if current.FinalAttemptStartedAt.Equal(startedAt) {
+			return false, nil
+		}
+		if startedAt.Before(*current.FinalAttemptStartedAt) {
+			reportFinalAttemptTimingWarning(current.JobID, "retry start %s precedes persisted start %s; replacing it because the current retry observation wins", startedAt.Format(time.RFC3339Nano), current.FinalAttemptStartedAt.Format(time.RFC3339Nano))
+		}
+	}
+	// The command being applied identifies the current final attempt, so its
+	// timestamp always replaces the prior one. Wall-clock order is diagnostic
+	// only and must not become a precondition for a retry.
+	next.FinalAttemptStartedAt = clonePtr(&startedAt)
+	return true, nil
+}
+
+func applyFinalAttemptEnd(next *SafetyRecord, current SafetyRecord, endedAt *time.Time) bool {
+	if endedAt == nil {
+		return false
+	}
+	if current.FinalAttemptStartedAt == nil {
+		// A job can reach terminal before an attempt starts (for example, an
+		// early cancellation). In that case there is no final attempt to time.
+		return false
+	}
+	if endedAt.IsZero() {
+		reportFinalAttemptTimingWarning(current.JobID, "dropping zero final attempt end")
+		return false
+	}
+	if endedAt.Before(*current.FinalAttemptStartedAt) {
+		reportFinalAttemptTimingWarning(current.JobID, "dropping final attempt end %s because it precedes start %s", endedAt.Format(time.RFC3339Nano), current.FinalAttemptStartedAt.Format(time.RFC3339Nano))
+		return false
+	}
+	if current.FinalAttemptEndedAt != nil {
+		if current.FinalAttemptEndedAt.Equal(*endedAt) {
+			return false
+		}
+		reportFinalAttemptTimingWarning(current.JobID, "dropping final attempt end %s because end %s is already recorded", endedAt.Format(time.RFC3339Nano), current.FinalAttemptEndedAt.Format(time.RFC3339Nano))
+		return false
+	}
+	next.FinalAttemptEndedAt = clonePtr(endedAt)
+	return true
+}
+
+func applyRecordFailure(next *SafetyRecord, current SafetyRecord, command RecordFailure) (bool, error) {
+	if err := ensureJob(current, command.JobID); err != nil {
+		return false, err
+	}
+	if err := ValidateFailureMetadata(command.Class, command.Reason); err != nil {
+		return false, invalidCommand("failure metadata: %v", err)
+	}
+	if current.FailureClass != "" || current.FailureReason != "" {
+		// The first failure observed is the one most directly connected to the
+		// job's terminal path. Keep it authoritative when cleanup later fails.
+		return false, nil
+	}
+	next.FailureClass = command.Class
+	next.FailureReason = command.Reason
+	return true, nil
+}
+
 func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (bool, error) {
 	if err := ensureAttempt(current, command.Ref); err != nil {
 		return false, err
@@ -497,7 +602,16 @@ func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (
 	if err != nil {
 		return false, err
 	}
-	return mergeTerminal(next, certificate)
+	terminalChanged, err := mergeTerminal(next, certificate)
+	if err != nil {
+		return false, err
+	}
+	timingChanged := applyFinalAttemptEnd(next, current, command.Intent.FinalAttemptEndedAt)
+	return terminalChanged || timingChanged, nil
+}
+
+func reportFinalAttemptTimingWarning(jobID JobID, format string, args ...any) {
+	log.Printf("agentbus execution: final attempt timing warning: job=%s: %s", jobID, fmt.Sprintf(format, args...))
 }
 
 func applyTerminalAbsorbing(current SafetyRecord, command any) (ApplyResult, error) {
@@ -595,6 +709,20 @@ func normalizeCommand(command Command) (any, error) {
 			return nil, invalidCommand("command is nil")
 		}
 		return *c, nil
+	case RecordFinalAttemptStart:
+		return c, nil
+	case *RecordFinalAttemptStart:
+		if c == nil {
+			return nil, invalidCommand("command is nil")
+		}
+		return *c, nil
+	case RecordFailure:
+		return c, nil
+	case *RecordFailure:
+		if c == nil {
+			return nil, invalidCommand("command is nil")
+		}
+		return *c, nil
 	case Finalize:
 		return c, nil
 	case *Finalize:
@@ -617,7 +745,7 @@ func groupBindingAllowed(record SafetyRecord) bool {
 
 func legacyUnfencedCommand(command any) bool {
 	switch command.(type) {
-	case RequestCancel, ObserveOutcome, CertifyResult, Finalize:
+	case RequestCancel, ObserveOutcome, CertifyResult, RecordFinalAttemptStart, RecordFailure, Finalize:
 		return true
 	default:
 		return false
@@ -858,6 +986,8 @@ func cloneSafetyRecord(record SafetyRecord) SafetyRecord {
 	next.Outcome = cloneOutcomeFact(record.Outcome)
 	next.Result = clonePtr(record.Result)
 	next.Terminal = cloneTerminalCertificate(record.Terminal)
+	next.FinalAttemptStartedAt = clonePtr(record.FinalAttemptStartedAt)
+	next.FinalAttemptEndedAt = clonePtr(record.FinalAttemptEndedAt)
 	return next
 }
 

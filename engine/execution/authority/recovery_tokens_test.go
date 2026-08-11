@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/storage/memory"
@@ -96,6 +97,22 @@ func TestRecoveryTokenBoundOnlyStartupLossFinalizesWithoutLaunchWork(t *testing.
 	}
 	if len(items) != 0 {
 		t.Fatalf("work items after bound-only finalize = %d, want 0", len(items))
+	}
+}
+
+func TestRecoveryTokenFinalizePlannedAtZeroTimingStillFinalizes(t *testing.T) {
+	ctx := context.Background()
+	session, item := recoveryTokenWorkItem(t, "token-zero-timing-finalize")
+
+	if err := session.FinalizePlannedAt(ctx, item.Token, time.Time{}); err != nil {
+		t.Fatalf("FinalizePlannedAt zero timing: %v", err)
+	}
+	items, err := session.WorkItems(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("work items after zero-timing finalize = %d, want 0", len(items))
 	}
 }
 

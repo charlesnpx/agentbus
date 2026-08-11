@@ -208,6 +208,7 @@ type Server struct {
 	socketPath                   string
 	tokenPath                    string
 	token                        string
+	backendMapMu                 sync.RWMutex
 	backends                     map[string]engine.Backend
 	registry                     *engine.PolicyRegistry
 	clock                        engine.Clock
@@ -2023,7 +2024,8 @@ func (s *Server) backendMetadata() []protocol.BackendInfo {
 	result := make([]protocol.BackendInfo, 0, len(names))
 	for _, name := range names {
 		info := protocol.BackendInfo{Backend: name, Models: []string{}, Efforts: []string{}}
-		if provider, ok := s.backends[name].(engine.BackendMetadataProvider); ok {
+		backend, _ := s.backendFor(name)
+		if provider, ok := backend.(engine.BackendMetadataProvider); ok {
 			metadata := provider.BackendMetadata(context.Background())
 			info.Models = append([]string(nil), metadata.Models...)
 			info.Efforts = append([]string(nil), metadata.Efforts...)
@@ -2395,13 +2397,13 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 		if errors.Is(err, context.Canceled) {
 			state = engine.StateInterrupted
 		}
-		s.completeRunTerminal(run, state, text, skippedStampForRun(run, s.registry, skippedReasonForState(state)))
+		s.completeRunFailure(run, state, text, skippedStampForRun(run, s.registry, skippedReasonForState(state)), terminalFailureOriginFor(err, terminalFailureBackendRan), err)
 		return
 	}
 
 	validation, retryPrompt, compliantState, err := s.validateAttempt(text, run, 1, false)
 	if err != nil {
-		s.completeRunTerminal(run, engine.StateFailed, text, skippedStampForRun(run, s.registry, engine.SkipBackendError))
+		s.completeRunFailure(run, engine.StateFailed, text, skippedStampForRun(run, s.registry, engine.SkipBackendError), terminalFailureInternal, err)
 		return
 	}
 	if retryPrompt != "" {
@@ -2411,12 +2413,16 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 			return
 		}
 		if retryErr != nil {
-			s.completeRunTerminal(run, retryState, retryText, skippedStampForRun(run, s.registry, skippedReasonForState(retryState)))
+			if errors.Is(retryErr, context.DeadlineExceeded) {
+				s.completeRunTerminal(run, engine.StateTimedOut, retryText, skippedStampForRun(run, s.registry, engine.SkipTimeout))
+				return
+			}
+			s.completeRunFailure(run, retryState, retryText, skippedStampForRun(run, s.registry, skippedReasonForState(retryState)), terminalFailureOriginFor(retryErr, terminalFailureBackendRan), retryErr)
 			return
 		}
 		retryValidation, _, retryCompliantState, err := s.validateAttempt(retryText, run, 2, true)
 		if err != nil {
-			s.completeRunTerminal(run, engine.StateFailed, retryText, skippedStampForRun(run, s.registry, engine.SkipBackendError))
+			s.completeRunFailure(run, engine.StateFailed, retryText, skippedStampForRun(run, s.registry, engine.SkipBackendError), terminalFailureInternal, err)
 			return
 		}
 		s.completeRunTerminal(run, retryCompliantState, retryText, retryValidation.Stamp)
@@ -2441,7 +2447,11 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		LogPaths: engine.LogPaths{},
 	}
 	if run.admissionControlled {
-		s.rememberJobLivenessStarted(run.jobID)
+		startedAt := s.clock.Now().UTC()
+		s.rememberJobLivenessStartedAt(run.jobID, startedAt)
+		if err := s.recordAdmissionFinalAttemptStart(attemptCtx, run.jobID, startedAt); err != nil {
+			return "", engine.StateFailed, classifyFailureError(terminalFailureBackendNotStarted, err)
+		}
 	}
 	events, err := s.admissionTurnEvents(attemptCtx, run, input, ordinal)
 	if err != nil {
@@ -2488,14 +2498,18 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				hasResultMessage = true
 			case engine.EventModelReported:
 				if err := s.recordModelReported(run, event.ModelReported); err != nil {
-					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, err
+					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, classifyFailureError(terminalFailureInternal, err)
 				}
 			case engine.EventTerminalError:
 				if rawText == "" {
 					rawText = "backend failed"
 				}
 				terminalState = engine.StateFailed
-				terminalErr = errors.New(rawText)
+				cause := event.Err
+				if cause == nil {
+					cause = errors.New(rawText)
+				}
+				terminalErr = classifyFailureError(terminalFailureBackendRan, cause)
 			case engine.EventTurnFinal:
 			}
 		}
@@ -2580,9 +2594,7 @@ func (s *Server) resolvePolicy(policy *engine.TurnPolicy) (resolvedPolicy, error
 }
 
 func (s *Server) finalizeFailure(run jobRun, err error) {
-	if finalizeErr := s.finalizeTerminal(run, engine.StateFailed, "", nil); finalizeErr != nil {
-		s.handleRunFinalizationError(run, errors.Join(err, finalizeErr))
-	}
+	s.completeRunFailure(run, engine.StateFailed, "", nil, terminalFailureInternal, err)
 }
 
 func (s *Server) finalizeRequestedTerminal(run jobRun) error {
@@ -2599,11 +2611,24 @@ func (s *Server) completeRunTerminal(run jobRun, state engine.JobState, text str
 	}
 }
 
+func (s *Server) completeRunFailure(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp, origin terminalFailureOrigin, cause error) {
+	failure := terminalFailureFor(origin, cause, terminalFailureStopWasRequestedByAgentbus(run, cause))
+	if err := s.recordFailureMetadata(run, failure); err != nil {
+		if err := s.recordFailureMetadata(run, failure); err != nil {
+			log.Printf("agentbus daemon: job %s failure metadata persistence failed: %v", run.jobID, err)
+		}
+	}
+	s.completeRunTerminal(run, state, text, stamp)
+}
+
 func (s *Server) handleRunFinalizationError(run jobRun, err error) {
 	if err == nil {
 		return
 	}
 	log.Printf("agentbus daemon: job %s finalization failed: %v", run.jobID, err)
+	if failureErr := s.recordFailureMetadata(run, terminalFailureFor(terminalFailureFinalization, err, false)); failureErr != nil {
+		log.Printf("agentbus daemon: job %s finalization failure metadata persistence failed: %v", run.jobID, failureErr)
+	}
 	if !run.admissionControlled {
 		return
 	}
@@ -2733,10 +2758,13 @@ func (s *Server) reportedModel(jobID string) string {
 }
 
 func (s *Server) rememberJobLivenessStarted(jobID string) {
+	s.rememberJobLivenessStartedAt(jobID, s.clock.Now().UTC())
+}
+
+func (s *Server) rememberJobLivenessStartedAt(jobID string, now time.Time) {
 	if strings.TrimSpace(jobID) == "" {
 		return
 	}
-	now := s.clock.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.jobLiveness == nil {
@@ -2745,6 +2773,22 @@ func (s *Server) rememberJobLivenessStarted(jobID string) {
 	if s.jobLiveness[jobID] == nil {
 		s.jobLiveness[jobID] = &jobLiveness{startedAt: now, lastEventAt: now}
 	}
+}
+
+func (s *Server) recordAdmissionFinalAttemptStart(ctx context.Context, jobID string, startedAt time.Time) error {
+	modelJobID, err := model.NewJobID(jobID)
+	if err != nil {
+		return err
+	}
+	s.admissionStateMu.RLock()
+	ready := s.admissionReady
+	available := s.admissionInstance != nil && ready != nil
+	s.admissionStateMu.RUnlock()
+	if !available {
+		return authority.ErrNotReady
+	}
+	_, err = ready.RecordFinalAttemptStart(ctx, modelJobID, startedAt)
+	return err
 }
 
 func (s *Server) recordJobLivenessEvent(jobID string) {
@@ -3008,12 +3052,45 @@ func (s *Server) nextID(prefix string) string {
 }
 
 func (s *Server) backendNames() []string {
-	names := make([]string, 0, len(s.backends))
-	for name := range s.backends {
+	backends := s.backendSnapshot()
+	names := make([]string, 0, len(backends))
+	for name := range backends {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	return names
+}
+
+func (s *Server) backendFor(name string) (engine.Backend, bool) {
+	s.backendMapMu.RLock()
+	defer s.backendMapMu.RUnlock()
+	backend, ok := s.backends[name]
+	return backend, ok
+}
+
+func (s *Server) backendSnapshot() map[string]engine.Backend {
+	s.backendMapMu.RLock()
+	defer s.backendMapMu.RUnlock()
+	backends := make(map[string]engine.Backend, len(s.backends))
+	for name, backend := range s.backends {
+		backends[name] = backend
+	}
+	return backends
+}
+
+func (s *Server) replaceBackend(name string, backend engine.Backend) {
+	s.backendMapMu.Lock()
+	defer s.backendMapMu.Unlock()
+	if s.backends == nil {
+		s.backends = make(map[string]engine.Backend)
+	}
+	s.backends[name] = backend
+}
+
+func (s *Server) removeBackend(name string) {
+	s.backendMapMu.Lock()
+	defer s.backendMapMu.Unlock()
+	delete(s.backends, name)
 }
 
 func ensureToken(path, configured string) (string, error) {
