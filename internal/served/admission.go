@@ -48,7 +48,10 @@ var admissionDetachedCleanupTimeout = 30 * time.Second
 
 var ErrRuntimeConsumed = errors.New("admission runtime consumed")
 
-var admissionRecordReleaseBeforeCommitForTest func() error
+var (
+	admissionRecordReleaseBeforeCommitForTest func() error
+	admissionRepositoryBeforeCreateForTest    func() error
+)
 
 type admissionClosingError struct{}
 
@@ -1425,8 +1428,14 @@ func openAdmissionRepositoryWithContentionRetry(ctx context.Context, repoPath, a
 		return nil, false, err
 	}
 	repo, created, err := openAdmissionRepositoryOnce(repoPath, anchorPath, timeout)
-	if err == nil || !errors.Is(err, bolt.ErrTimeout) {
+	if err == nil {
 		return repo, created, err
+	}
+	if admissionRepositoryCreateRaced(repoPath, err) {
+		return nil, false, waitForConcurrentAdmissionRepositoryCreator(ctx, socketPath, err)
+	}
+	if !errors.Is(err, bolt.ErrTimeout) {
+		return nil, false, err
 	}
 	err = retryAdmissionRepositoryContention(ctx, repoPath, socketPath, err, func(timeout time.Duration) (bool, error) {
 		repo, created, err = openAdmissionRepositoryOnce(repoPath, anchorPath, timeout)
@@ -1452,11 +1461,64 @@ func openAdmissionRepositoryOnce(repoPath, anchorPath string, timeout time.Durat
 		if err := requireAdmissionAnchorAbsentForCreate(anchorPath); err != nil {
 			return nil, false, err
 		}
+		if admissionRepositoryBeforeCreateForTest != nil {
+			if err := admissionRepositoryBeforeCreateForTest(); err != nil {
+				return nil, false, err
+			}
+		}
 		repo, createErr := bboltrepo.Create(repoPath, &bolt.Options{Timeout: timeout})
 		return repo, true, createErr
 	}
 	repo, err := bboltrepo.OpenExisting(repoPath, &bolt.Options{Timeout: timeout})
 	return repo, false, err
+}
+
+// admissionRepositoryCreateRaced recognizes only the create-specific race:
+// openAdmissionRepositoryOnce had already observed no repository and no
+// anchor, then bbolt's O_EXCL create lost to a regular file at the same path.
+// A pre-existing, malformed, symlinked, or otherwise invalid root never takes
+// this branch because it is opened through OpenExisting instead.
+func admissionRepositoryCreateRaced(repoPath string, err error) bool {
+	var alreadyExists bboltrepo.RepositoryAlreadyExistsError
+	if !errors.As(err, &alreadyExists) || alreadyExists.Path != repoPath {
+		return false
+	}
+	info, statErr := os.Lstat(repoPath)
+	return statErr == nil && info.Mode().IsRegular()
+}
+
+// waitForConcurrentAdmissionRepositoryCreator waits only after the exact
+// O_EXCL create race above. It does not retry repository validation or convert
+// invalid-record errors into success: the only convergence proof is that the
+// peer becomes live at the expected socket, after which daemonlaunch performs
+// its token-authenticated hello verification before reporting ExistingDaemon.
+func waitForConcurrentAdmissionRepositoryCreator(ctx context.Context, socketPath string, cause error) error {
+	contentionCtx, cancel := admissionContentionContext(ctx)
+	defer cancel()
+	for {
+		if err := contentionCtx.Err(); err != nil {
+			return concurrentAdmissionRepositoryCreatorUnavailable(ctx, cause)
+		}
+		dialTimeout, err := admissionContentionAttemptTimeout(contentionCtx, admissionRepositoryOpenTimeout)
+		if err != nil {
+			return concurrentAdmissionRepositoryCreatorUnavailable(ctx, cause)
+		}
+		if admissionSocketDialableWithin(socketPath, dialTimeout) {
+			return DaemonAlreadyListeningError{SocketPath: socketPath}
+		}
+		select {
+		case <-contentionCtx.Done():
+			return concurrentAdmissionRepositoryCreatorUnavailable(ctx, cause)
+		case <-time.After(admissionContentionRetryDelay):
+		}
+	}
+}
+
+func concurrentAdmissionRepositoryCreatorUnavailable(ctx context.Context, cause error) error {
+	if parentErr := ctx.Err(); parentErr != nil {
+		return errors.Join(cause, parentErr)
+	}
+	return cause
 }
 
 func requireAdmissionAnchorAbsentForCreate(anchorPath string) error {

@@ -27,12 +27,13 @@ import (
 )
 
 const (
-	servedLaunchHelperEnv        = "AGENTBUS_SERVED_LAUNCH_HELPER"
-	servedLaunchHelperModeEnv    = "AGENTBUS_SERVED_LAUNCH_HELPER_MODE"
-	servedLaunchHelperCWDEnv     = "AGENTBUS_SERVED_LAUNCH_HELPER_CWD"
-	servedLaunchHelperBarrierEnv = "AGENTBUS_SERVED_LAUNCH_HELPER_BARRIER"
-	servedLaunchHelperMarkerEnv  = "AGENTBUS_SERVED_LAUNCH_HELPER_MARKER"
-	servedLaunchHelperReadyEnv   = "AGENTBUS_SERVED_LAUNCH_HELPER_READY"
+	servedLaunchHelperEnv              = "AGENTBUS_SERVED_LAUNCH_HELPER"
+	servedLaunchHelperModeEnv          = "AGENTBUS_SERVED_LAUNCH_HELPER_MODE"
+	servedLaunchHelperCWDEnv           = "AGENTBUS_SERVED_LAUNCH_HELPER_CWD"
+	servedLaunchHelperBarrierEnv       = "AGENTBUS_SERVED_LAUNCH_HELPER_BARRIER"
+	servedLaunchHelperCreateBarrierEnv = "AGENTBUS_SERVED_LAUNCH_HELPER_CREATE_BARRIER"
+	servedLaunchHelperMarkerEnv        = "AGENTBUS_SERVED_LAUNCH_HELPER_MARKER"
+	servedLaunchHelperReadyEnv         = "AGENTBUS_SERVED_LAUNCH_HELPER_READY"
 )
 
 func TestMain(m *testing.M) {
@@ -47,8 +48,11 @@ func TestLaunchConcurrentFreshRootConvergesOnSingleToken(t *testing.T) {
 	root := filepath.Join(parent, "state")
 	cwd := shortTempDir(t)
 	barrier := filepath.Join(parent, "barrier")
+	createBarrier := filepath.Join(parent, "repository-create-barrier")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	options := servedLaunchOptions(t, root, cwd, "serve", barrier)
+	options.Env = append(options.Env, servedLaunchHelperCreateBarrierEnv+"="+createBarrier)
 
 	var wg sync.WaitGroup
 	results := make(chan daemonlaunch.Result, 2)
@@ -57,7 +61,7 @@ func TestLaunchConcurrentFreshRootConvergesOnSingleToken(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := daemonlaunch.Launch(ctx, servedLaunchOptions(t, root, cwd, "serve", barrier))
+			result, err := daemonlaunch.Launch(ctx, options)
 			if err != nil {
 				errs <- err
 				return
@@ -476,6 +480,13 @@ func runServedLaunchHelper() int {
 		return 1
 	}
 	configureServedLaunchAdmission(server)
+	if barrier := os.Getenv(servedLaunchHelperCreateBarrierEnv); barrier != "" {
+		previous := admissionRepositoryBeforeCreateForTest
+		admissionRepositoryBeforeCreateForTest = func() error {
+			return waitAtServedLaunchBarrier(barrier, 2, 2*time.Second)
+		}
+		defer func() { admissionRepositoryBeforeCreateForTest = previous }()
+	}
 	if os.Getenv(servedLaunchHelperModeEnv) == "bind-race" {
 		marker := os.Getenv(servedLaunchHelperMarkerEnv)
 		ready := os.Getenv(servedLaunchHelperReadyEnv)

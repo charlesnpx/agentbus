@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -22,9 +23,12 @@ import (
 )
 
 const (
-	launchHelperEnv     = "AGENTBUS_DAEMONLAUNCH_HELPER"
-	launchHelperModeEnv = "AGENTBUS_DAEMONLAUNCH_HELPER_MODE"
-	launchHelperPIDEnv  = "AGENTBUS_DAEMONLAUNCH_HELPER_PID"
+	launchHelperEnv              = "AGENTBUS_DAEMONLAUNCH_HELPER"
+	launchHelperModeEnv          = "AGENTBUS_DAEMONLAUNCH_HELPER_MODE"
+	launchHelperPIDEnv           = "AGENTBUS_DAEMONLAUNCH_HELPER_PID"
+	launchHelperStderrReadyFDEnv = "AGENTBUS_DAEMONLAUNCH_HELPER_STDERR_READY_FD"
+
+	helperStderrReadyTimeout = 2 * time.Second
 )
 
 func TestMain(m *testing.M) {
@@ -74,7 +78,7 @@ func TestLaunchCrashBeforeRecordIncludesStderrAndReaps(t *testing.T) {
 func TestLaunchTimeoutKillsAndReaps(t *testing.T) {
 	root := shortLaunchTempDir(t)
 	pidPath := filepath.Join(root, "helper.pid")
-	_, err := Launch(context.Background(), helperLaunchOptions(t, root, "hang", pidPath, 100*time.Millisecond))
+	err, _ := launchTimeoutAfterHelperStderr(t, root, "hang", pidPath)
 	if err == nil {
 		t.Fatal("Launch succeeded, want timeout")
 	}
@@ -91,9 +95,7 @@ func TestLaunchTimeoutKillsAndReaps(t *testing.T) {
 func TestLaunchTimeoutKillsChattyChildAndBoundsStderr(t *testing.T) {
 	root := shortLaunchTempDir(t)
 	pidPath := filepath.Join(root, "helper.pid")
-	start := time.Now()
-	_, err := Launch(context.Background(), helperLaunchOptions(t, root, "chatty-hang", pidPath, 100*time.Millisecond))
-	elapsed := time.Since(start)
+	err, elapsed := launchTimeoutAfterHelperStderr(t, root, "chatty-hang", pidPath)
 	if err == nil {
 		t.Fatal("Launch succeeded, want timeout")
 	}
@@ -111,6 +113,63 @@ func TestLaunchTimeoutKillsChattyChildAndBoundsStderr(t *testing.T) {
 		t.Fatalf("stderr tail = %q, want chatty stderr", startup.StderrTail)
 	}
 	assertPIDGone(t, readPIDFile(t, pidPath))
+}
+
+func launchTimeoutAfterHelperStderr(t *testing.T, root, mode, pidPath string) (error, time.Duration) {
+	t.Helper()
+	deadline := newManualDeadlineContext()
+	stderrReady := make(chan error, 1)
+	opts := helperLaunchOptions(t, root, mode, pidPath, 5*time.Second)
+	opts.Starter = testProcessStarterWithStderrReady(stderrReady)
+	result := make(chan error, 1)
+	go func() {
+		_, err := Launch(deadline, opts)
+		result <- err
+	}()
+
+	select {
+	case err := <-stderrReady:
+		if err != nil {
+			deadline.expire()
+			t.Fatalf("helper stderr readiness: %v; Launch() after cleanup = %v", err, <-result)
+		}
+	case err := <-result:
+		t.Fatalf("Launch() returned before helper emitted stderr: %v", err)
+	case <-time.After(helperStderrReadyTimeout):
+		deadline.expire()
+		t.Fatalf("helper did not emit stderr readiness within %s; Launch() after cleanup = %v", helperStderrReadyTimeout, <-result)
+	}
+
+	start := time.Now()
+	deadline.expire()
+	return <-result, time.Since(start)
+}
+
+type manualDeadlineContext struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+}
+
+func newManualDeadlineContext() *manualDeadlineContext {
+	return &manualDeadlineContext{Context: context.Background(), done: make(chan struct{})}
+}
+
+func (ctx *manualDeadlineContext) Done() <-chan struct{} {
+	return ctx.done
+}
+
+func (ctx *manualDeadlineContext) Err() error {
+	select {
+	case <-ctx.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (ctx *manualDeadlineContext) expire() {
+	ctx.once.Do(func() { close(ctx.done) })
 }
 
 func TestLaunchRootMismatchKillsAndReaps(t *testing.T) {
@@ -267,11 +326,18 @@ func runLaunchHelper() int {
 		fmt.Fprintln(os.Stderr, "helper crash stderr")
 		return 42
 	case "hang":
-		fmt.Fprintln(os.Stderr, "helper hang stderr")
+		if _, err := fmt.Fprintln(os.Stderr, "helper hang stderr"); err == nil {
+			signalLaunchHelperStderrReady()
+		}
 		sleepForever()
 	case "chatty-hang":
 		for i := 0; ; i++ {
-			fmt.Fprintf(os.Stderr, "helper chatty stderr %06d %s\n", i, strings.Repeat("x", 1024))
+			if _, err := fmt.Fprintf(os.Stderr, "helper chatty stderr %06d %s\n", i, strings.Repeat("x", 1024)); err != nil {
+				return 2
+			}
+			if i == 0 {
+				signalLaunchHelperStderrReady()
+			}
 		}
 	case "mismatch":
 		fmt.Fprintln(os.Stderr, "helper mismatch stderr")
@@ -303,6 +369,23 @@ func sleepForever() {
 	for {
 		time.Sleep(time.Hour)
 	}
+}
+
+func signalLaunchHelperStderrReady() {
+	raw := strings.TrimSpace(os.Getenv(launchHelperStderrReadyFDEnv))
+	if raw == "" {
+		return
+	}
+	fd, err := strconv.Atoi(raw)
+	if err != nil {
+		return
+	}
+	file := os.NewFile(uintptr(fd), "daemonlaunch-helper-stderr-ready")
+	if file == nil {
+		return
+	}
+	_, _ = file.Write([]byte{1})
+	_ = file.Close()
 }
 
 func helperLaunchOptions(t *testing.T, root, mode, pidPath string, timeout time.Duration) Options {
@@ -356,6 +439,46 @@ func testProcessStarter(config ProcessConfig) (Process, error) {
 		return nil, err
 	}
 	return testProcess{cmd: cmd}, nil
+}
+
+func testProcessStarterWithStderrReady(stderrReady chan<- error) ProcessStarter {
+	return func(config ProcessConfig) (Process, error) {
+		readyRead, readyWrite, err := os.Pipe()
+		if err != nil {
+			return nil, err
+		}
+		childFD := readinessFDChildNumber + len(config.ExtraFiles)
+		cmd := exec.Command(config.CommandPath, config.Args...)
+		cmd.Env = upsertEnv(append([]string(nil), config.Env...), launchHelperStderrReadyFDEnv+"="+strconv.Itoa(childFD))
+		cmd.ExtraFiles = append(append([]*os.File(nil), config.ExtraFiles...), readyWrite)
+		cmd.Stdin = config.Stdin
+		cmd.Stdout = config.Stdout
+		cmd.Stderr = config.Stderr
+		if config.Setsid {
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		}
+		if err := cmd.Start(); err != nil {
+			_ = readyRead.Close()
+			_ = readyWrite.Close()
+			return nil, err
+		}
+		_ = readyWrite.Close()
+		go func() {
+			defer readyRead.Close()
+			var signal [1]byte
+			n, err := readyRead.Read(signal[:])
+			if err != nil {
+				stderrReady <- fmt.Errorf("read helper stderr readiness: %w", err)
+				return
+			}
+			if n != len(signal) {
+				stderrReady <- fmt.Errorf("read helper stderr readiness: got %d bytes, want 1", n)
+				return
+			}
+			stderrReady <- nil
+		}()
+		return testProcess{cmd: cmd}, nil
+	}
 }
 
 func (process testProcess) PID() int {

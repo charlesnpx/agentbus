@@ -5,6 +5,7 @@ package cgroup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -197,8 +198,16 @@ func TestRealFSUnleasedInheritedCleanupRemovesMatchingLeaf(t *testing.T) {
 	fs, object := newUnleasedInheritedCleanupFixture(t, "cg-inherited-cleanup")
 	defer object.Close()
 
-	if err := fs.removeUnleasedInheritedLeaf(context.Background(), object); err != nil {
-		t.Fatalf("removeUnleasedInheritedLeaf() error = %v", err)
+	// A regular filesystem cannot model cgroup.events: a regular file would
+	// make the leaf non-empty and prevent rmdir. The FIFO is removed after the
+	// cleanup path reads it, mirroring cgroupfs's virtual cgroup.events entry.
+	eventsDone := serveUnleasedCleanupEvents(t, filepath.Join(fs.root, object.leafName, "cgroup.events"))
+	cleanupErr := fs.removeUnleasedInheritedLeaf(context.Background(), object)
+	if eventsErr := <-eventsDone; eventsErr != nil {
+		t.Fatalf("serve cgroup.events: %v", eventsErr)
+	}
+	if cleanupErr != nil {
+		t.Fatalf("removeUnleasedInheritedLeaf() error = %v", cleanupErr)
 	}
 	if _, err := os.Stat(filepath.Join(fs.root, object.leafName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("retained leaf stat after unleased cleanup = %v, want not-exist", err)
@@ -211,6 +220,58 @@ func TestRealFSUnleasedInheritedCleanupRemovesMatchingLeaf(t *testing.T) {
 	}
 	if !object.leaf.durableEqual(tombstone) {
 		t.Fatalf("unleased cleanup tombstone = %+v, want %+v", tombstone, object.leaf)
+	}
+}
+
+func serveUnleasedCleanupEvents(t *testing.T, path string) <-chan error {
+	t.Helper()
+	if err := unix.Mkfifo(path, 0o600); err != nil {
+		t.Fatalf("mkfifo cgroup.events: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		fd, err := openUnleasedCleanupEventsWriter(path, time.Second)
+		if err != nil {
+			done <- err
+			return
+		}
+		if err := writeAll(fd, []byte("populated 0\n")); err != nil {
+			_ = unix.Close(fd)
+			done <- err
+			return
+		}
+		// Removing the FIFO while its descriptors remain open lets the reader
+		// drain the event data, then leaves the test leaf empty for rmdir.
+		if err := os.Remove(path); err != nil {
+			_ = unix.Close(fd)
+			done <- err
+			return
+		}
+		done <- unix.Close(fd)
+	}()
+	return done
+}
+
+func openUnleasedCleanupEventsWriter(path string, timeout time.Duration) (int, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		fd, err := unix.Open(path, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if err == nil {
+			return fd, nil
+		}
+		if !errors.Is(err, unix.ENXIO) {
+			return -1, err
+		}
+		select {
+		case <-timer.C:
+			return -1, fmt.Errorf("timed out waiting for cleanup to open cgroup.events: %w", err)
+		case <-ticker.C:
+		}
 	}
 }
 
