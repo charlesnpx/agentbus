@@ -39,3 +39,23 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+  cross-compile:
+    name: Cross-compile embedded engine
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.x
+          cache: true
+
+      - name: Cross-compile embedded engine
+        # ./... includes cmd/agentbus, whose nativecustody implementation is Unix-only; downstream consumers cross-compile the embedded engine.
+        run: |
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./engine/...
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./engine/...

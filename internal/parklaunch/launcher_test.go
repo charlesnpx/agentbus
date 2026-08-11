@@ -1256,6 +1256,9 @@ func TestStartMonitorProcessStartFailureDoesNotLeakFDs(t *testing.T) {
 }
 
 func TestStartMonitorProcessInvalidSpecClosesInheritedLeaf(t *testing.T) {
+	// On Unix, this is the adjacent early-return path that proves ownership
+	// cleanup is registered before validation. Windows reaches its unsupported
+	// platform return at the same position relative to that cleanup.
 	leaf := newOwnedMonitorLeafFile(t)
 
 	monitor, err := StartMonitorProcess(context.Background(), MonitorProcessSpec{InheritedLeaf: leaf})
