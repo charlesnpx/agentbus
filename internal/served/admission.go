@@ -41,7 +41,7 @@ const (
 	admissionRepositoryCloseTimeout = 5 * time.Second
 	admissionContentionRetryDelay   = 50 * time.Millisecond
 	admissionContentionFallback     = 2 * time.Second
-	admissionProbeReasonMaxRunes    = 512
+	admissionProbeReasonMaxRunes    = engine.FailureReasonMaxRunes
 )
 
 var admissionDetachedCleanupTimeout = 30 * time.Second
@@ -1673,7 +1673,7 @@ type ordinalBoundSession interface {
 
 func (s *Server) admissionTurnEvents(ctx context.Context, run jobRun, input engine.TurnInput, ordinal model.LaunchOrdinal) (<-chan engine.Event, error) {
 	if err := ordinal.Validate(); err != nil {
-		return nil, err
+		return nil, classifyFailureError(terminalFailureBackendNotStarted, err)
 	}
 	// Snapshot-checkout: launch preparation and the turn must not hold
 	// admissionStateMu (see activeWork). The coordinator-identity comparison
@@ -1684,23 +1684,30 @@ func (s *Server) admissionTurnEvents(ctx context.Context, run jobRun, input engi
 	ready := s.admissionInstance != nil && submission != nil
 	s.admissionStateMu.RUnlock()
 	if !ready || run.admissionLaunch.coordinator != submission {
-		return nil, authority.ErrNotReady
+		return nil, classifyFailureError(terminalFailureBackendNotStarted, authority.ErrNotReady)
 	}
 	if run.admissionLaunch.coordinator == nil {
-		return nil, custodian.ErrSupervisorUnavailable
+		return nil, classifyFailureError(terminalFailureBackendNotStarted, custodian.ErrSupervisorUnavailable)
 	}
 	session, ok := run.session.(ordinalBoundSession)
 	if !ok {
-		return nil, fmt.Errorf("%w: backend session does not support ordinal-bound runners", custodian.ErrSupervisorUnavailable)
+		return nil, classifyFailureError(terminalFailureBackendNotStarted, fmt.Errorf("%w: backend session does not support ordinal-bound runners", custodian.ErrSupervisorUnavailable))
 	}
 	runner, err := run.admissionLaunch.coordinator.LaunchRunner(run.admissionLaunch, ordinal)
 	if err != nil {
-		return nil, err
+		// LaunchRunner can fail after launch preparation has crossed the point
+		// where backend work may be possible. Its provenance is therefore
+		// deliberately conservative rather than claiming no backend started.
+		return nil, classifyFailureError(terminalFailureBackendRan, err)
 	}
 	if run.active != nil {
 		runner = admissionActiveRunner{inner: runner, active: run.active}
 	}
-	return session.TurnWithRunner(ctx, input, runner)
+	events, err := session.TurnWithRunner(ctx, input, runner)
+	if err != nil {
+		return nil, classifyFailureError(terminalFailureBackendRan, err)
+	}
+	return events, nil
 }
 
 type admissionActiveRunner struct {
@@ -2438,7 +2445,9 @@ func (s *Server) launchAdmittedJob(ctx context.Context, run jobRun) {
 		return launchErr
 	})
 	if err != nil {
-		_ = s.finalizeTerminal(run, engine.StateFailed, "", nil)
+		// prepareAdmittedJobLaunch only reads admission state and registers the
+		// active job; it does not call LaunchRunner or the backend session.
+		s.completeRunFailure(run, engine.StateFailed, "", nil, terminalFailureBackendNotStarted, err)
 		return
 	}
 	if launched.active == nil {
@@ -2599,6 +2608,10 @@ func admissionCleanupDisposition(record model.SafetyRecord) string {
 	return model.DeriveCleanupDisposition(record).String()
 }
 
+// authorityFinalAttemptTiming and authorityFailureMetadata are the
+// response-boundary twins of the projection guards: Project filters new
+// records, and these also protect projections persisted by an older daemon
+// written before those guards existed.
 func authorityFinalAttemptTiming(projection model.JobProjection) (*time.Time, *time.Time) {
 	if projection.Decision != model.DecisionTerminal || projection.FinalAttemptStartedAt == nil || projection.FinalAttemptEndedAt == nil {
 		return nil, nil
@@ -2614,12 +2627,23 @@ func cloneTime(value *time.Time) *time.Time {
 	return &copied
 }
 
+func authorityFailureMetadata(projection model.JobProjection) (string, engine.FailureClass) {
+	// Failure metadata is only meaningful for failure terminals.
+	switch projection.Public {
+	case model.PublicFailed, model.PublicQuarantined:
+		return projection.FailureReason, projection.FailureClass
+	default:
+		return "", ""
+	}
+}
+
 func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *protocol.ErrorObject) {
 	record, projection, ok, errObj := s.authorityJobProjection(jobID)
 	if !ok || errObj != nil {
 		return protocol.JobStatus{}, ok, errObj
 	}
 	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
+	failureReason, failureClass := authorityFailureMetadata(projection)
 	reported := s.reportedModel(projection.JobID.String())
 	status := protocol.JobStatus{
 		JobID:                 projection.JobID.String(),
@@ -2629,6 +2653,8 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 		ModelReported:         reported,
 		FinalAttemptStartedAt: finalAttemptStartedAt,
 		FinalAttemptEndedAt:   finalAttemptEndedAt,
+		FailureReason:         failureReason,
+		FailureClass:          failureClass,
 	}
 	if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
 		startedAt := started
@@ -2700,6 +2726,7 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 		contract = record.Terminal.Contract
 	}
 	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
+	failureReason, failureClass := authorityFailureMetadata(projection)
 	reported := s.reportedModel(projection.JobID.String())
 	if result != nil {
 		result.ModelReported = reported
@@ -2714,6 +2741,8 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 		Contract:              contract,
 		FinalAttemptStartedAt: finalAttemptStartedAt,
 		FinalAttemptEndedAt:   finalAttemptEndedAt,
+		FailureReason:         failureReason,
+		FailureClass:          failureClass,
 	}, true, nil
 }
 
@@ -2771,6 +2800,7 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 	}
 	projection := image.Projection.Value
 	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
+	failureReason, failureClass := authorityFailureMetadata(projection)
 	return protocol.JobStatus{
 		JobID:                 projection.JobID.String(),
 		SessionID:             projection.SessionID,
@@ -2778,6 +2808,8 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 		CleanupDisposition:    admissionCleanupDisposition(image.Safety.Value),
 		FinalAttemptStartedAt: finalAttemptStartedAt,
 		FinalAttemptEndedAt:   finalAttemptEndedAt,
+		FailureReason:         failureReason,
+		FailureClass:          failureClass,
 	}, true, nil
 }
 

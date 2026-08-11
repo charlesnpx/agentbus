@@ -491,6 +491,9 @@ func openReadOnlyAdmissionRepository(ctx context.Context, stateRoot string) (*bb
 	}
 	repo, err := bboltrepo.OpenExistingReadOnly(repoPath, &bolt.Options{Timeout: adminOpenTimeout})
 	if err != nil {
+		if errors.Is(err, bolt.ErrTimeout) {
+			return nil, fmt.Errorf("%w: another process (normally the running daemon) holds the admission store at %s; stop the daemon before retrying this offline authority operation: %w", ErrRootBusy, repoPath, err)
+		}
 		return nil, err
 	}
 	if err := auditAdmissionRepository(ctx, repo); err != nil {

@@ -287,6 +287,37 @@ func TestAdmissionCLIInspectResetAndSealFlags(t *testing.T) {
 	}
 }
 
+func TestAdmissionCLIInspectBusyRootErrorsAreActionableAndStructured(t *testing.T) {
+	a := testApp(t)
+	a.inspectAdmissionRoot = func(context.Context, string) (authority.RootInspection, error) {
+		return authority.RootInspection{}, authority.ErrRootBusy
+	}
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"admission", "inspect", "--state-root", t.TempDir()}, "")
+	if code != 1 {
+		t.Fatalf("text inspect exit = %d, want 1; stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	if stdout != "" {
+		t.Fatalf("text inspect stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, authority.ErrRootBusy.Error()) {
+		t.Fatalf("text inspect stderr = %q, want root-busy error", stderr)
+	}
+
+	code, stdout, stderr = runTestCLI(t, a, []string{"admission", "inspect", "--state-root", t.TempDir(), "--json"}, "")
+	if code != 1 {
+		t.Fatalf("JSON inspect exit = %d, want 1; stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	if stderr != "" {
+		t.Fatalf("JSON inspect stderr = %q, want empty", stderr)
+	}
+	var output admissionInspectErrorOutput
+	decodeJSON(t, stdout, &output)
+	if output.Schema != cliJSONSchema || output.Code != authority.ErrRootBusy.Error() || !strings.Contains(output.Error, authority.ErrRootBusy.Error()) {
+		t.Fatalf("JSON inspect error = %+v, want schema, root-busy code, and root-busy error", output)
+	}
+}
+
 func TestAdmissionRecoverTextReportIncludesADR13Counts(t *testing.T) {
 	t.Parallel()
 	a := testApp(t)

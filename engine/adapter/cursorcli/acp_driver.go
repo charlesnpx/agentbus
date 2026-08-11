@@ -127,7 +127,7 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 		if active.interruptWasRequested() {
 			return info.sessionID, nil
 		}
-		return info.sessionID, errors.New("cursor ACP prompt was cancelled without a requested interrupt")
+		return info.sessionID, fmt.Errorf("cursor ACP prompt was cancelled without a requested interrupt: %w", engine.ErrTurnInterrupted)
 	default:
 		return info.sessionID, fmt.Errorf("cursor ACP prompt completed with terminal stopReason %q", stopReason)
 	}

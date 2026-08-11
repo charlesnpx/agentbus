@@ -264,6 +264,12 @@ func (r *Ready) RecordFinalAttemptStart(ctx context.Context, jobID model.JobID, 
 	return r.apply(ctx, jobID, model.RecordFinalAttemptStart{JobID: jobID, StartedAt: startedAt}, options...)
 }
 
+// RecordFailure durably preserves the first terminal-failure explanation
+// without changing the job's state machine outcome or terminal certificate.
+func (r *Ready) RecordFailure(ctx context.Context, jobID model.JobID, class engine.FailureClass, reason string, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.RecordFailure{JobID: jobID, Class: class, Reason: reason}, options...)
+}
+
 func (r *Ready) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent, options ...ApplyOption) (ApplyResult, error) {
 	return r.apply(ctx, jobID, model.Finalize{Ref: ref, Intent: intent}, options...)
 }
@@ -773,6 +779,13 @@ func applyLogicalCommand(record model.SafetyRecord, command model.Command) (mode
 			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
 		}
 		return model.ApplyRecordFinalAttemptStart(record, *c)
+	case model.RecordFailure:
+		return model.ApplyRecordFailure(record, c)
+	case *model.RecordFailure:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyRecordFailure(record, *c)
 	case model.Finalize:
 		return model.ApplyFinalize(record, c)
 	case *model.Finalize:
@@ -1036,7 +1049,8 @@ func commandWithBoot(command model.Command, boot model.BootRef) model.Command {
 			next.Receipt.CertifiedBy = boot
 		}
 		return next
-	case model.RecordFinalAttemptStart, *model.RecordFinalAttemptStart:
+	case model.RecordFinalAttemptStart, *model.RecordFinalAttemptStart,
+		model.RecordFailure, *model.RecordFailure:
 		return command
 	case model.Finalize:
 		if emptyBootRef(c.Intent.DerivedBy) {
@@ -1129,6 +1143,13 @@ func commandJobID(command model.Command) (model.JobID, error) {
 	case model.RecordFinalAttemptStart:
 		return c.JobID, nil
 	case *model.RecordFinalAttemptStart:
+		if c == nil {
+			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
+		}
+		return c.JobID, nil
+	case model.RecordFailure:
+		return c.JobID, nil
+	case *model.RecordFailure:
 		if c == nil {
 			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
 		}

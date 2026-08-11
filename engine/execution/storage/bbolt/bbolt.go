@@ -3034,6 +3034,9 @@ func validateProjectionShape(projection model.JobProjection) error {
 	if (projection.FinalAttemptStartedAt != nil || projection.FinalAttemptEndedAt != nil) && projection.Decision != model.DecisionTerminal {
 		return fmt.Errorf("%w: projection final attempt timing requires terminal decision", repository.ErrInvalidRecord)
 	}
+	if err := model.ValidateFailureMetadata(projection.FailureClass, projection.FailureReason); err != nil {
+		return fmt.Errorf("%w: projection failure metadata: %v", repository.ErrInvalidRecord, err)
+	}
 	return nil
 }
 

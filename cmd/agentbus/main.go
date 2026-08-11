@@ -60,6 +60,7 @@ type app struct {
 	clock                engine.Clock
 	daemonLauncher       func(context.Context, daemonlaunch.Options) (daemonlaunch.Result, error)
 	clientConnect        func(context.Context, agentclient.Options) (protocolClient, error)
+	inspectAdmissionRoot func(context.Context, string) (authority.RootInspection, error)
 	recoverAdmissionRoot func(context.Context, agentbusserve.Config) (agentbusserve.AdmissionRecoveryReport, error)
 }
 
@@ -285,8 +286,15 @@ func (a *app) runAdmissionInspect(ctx context.Context, args []string, out, errOu
 	if *stateRoot == "" {
 		return admissionUsageError(errOut, "inspect requires --state-root <path>")
 	}
-	inspection, err := authority.InspectAdmissionRoot(ctx, *stateRoot)
+	inspectAdmissionRoot := a.inspectAdmissionRoot
+	if inspectAdmissionRoot == nil {
+		inspectAdmissionRoot = authority.InspectAdmissionRoot
+	}
+	inspection, err := inspectAdmissionRoot(ctx, *stateRoot)
 	if err != nil {
+		if *jsonOut {
+			return admissionInspectError(out, errOut, err)
+		}
 		return commandError(errOut, err)
 	}
 	if *jsonOut {
@@ -1061,6 +1069,20 @@ func writeOrError(out, errOut io.Writer, v any) int {
 	return 0
 }
 
+func admissionInspectError(out, errOut io.Writer, err error) int {
+	output := admissionInspectErrorOutput{
+		Schema: cliJSONSchema,
+		Error:  err.Error(),
+	}
+	if errors.Is(err, authority.ErrRootBusy) {
+		output.Code = authority.ErrRootBusy.Error()
+	}
+	if code := writeOrError(out, errOut, output); code != 0 {
+		return code
+	}
+	return 1
+}
+
 func writeJSON(out io.Writer, v any) error {
 	enc := json.NewEncoder(out)
 	enc.SetEscapeHTML(false)
@@ -1171,6 +1193,12 @@ type versionOutput struct {
 	Schema          int    `json:"schema"`
 	Version         string `json:"version"`
 	ProtocolVersion int    `json:"protocolVersion"`
+}
+
+type admissionInspectErrorOutput struct {
+	Schema int    `json:"schema"`
+	Code   string `json:"code,omitempty"`
+	Error  string `json:"error"`
 }
 
 type setupOutput struct {

@@ -25,6 +25,48 @@ const (
 	StateQuarantined           JobState = "quarantined"
 )
 
+// FailureClass is the stable, machine-readable category for a persisted job
+// failure. It is intentionally a small closed set so callers can make safe
+// retry and operator-routing decisions without parsing FailureReason.
+type FailureClass string
+
+// FailureReasonMaxRunes is the maximum length retained by the existing served
+// backend-error sanitizer and by durable failure metadata validation.
+const FailureReasonMaxRunes = 512
+
+const (
+	// FailureClassBackendNotStarted means agentbus could not admit or launch the
+	// backend turn, so no backend work was possible.
+	FailureClassBackendNotStarted FailureClass = "backend_not_started"
+	// FailureClassBackendError means a launched backend turn returned an error;
+	// it may have performed work before doing so.
+	FailureClassBackendError FailureClass = "backend_error"
+	// FailureClassBackendInterrupted means a backend turn stopped without an
+	// interrupt request from agentbus.
+	FailureClassBackendInterrupted FailureClass = "backend_interrupted"
+	// FailureClassFinalizationError means the backend completed, but agentbus
+	// failed while finalizing or publishing its result.
+	FailureClassFinalizationError FailureClass = "finalization_error"
+	// FailureClassInternalError means no more specific failure category is
+	// available.
+	FailureClassInternalError FailureClass = "internal_error"
+)
+
+// Valid reports whether class is one of the supported persisted failure
+// categories. The empty class is allowed only when no failure metadata exists.
+func (class FailureClass) Valid() bool {
+	switch class {
+	case FailureClassBackendNotStarted,
+		FailureClassBackendError,
+		FailureClassBackendInterrupted,
+		FailureClassFinalizationError,
+		FailureClassInternalError:
+		return true
+	default:
+		return false
+	}
+}
+
 // ProcessRef records enough process identity to detect PID reuse.
 type ProcessRef struct {
 	PID       int    `json:"pid,omitempty"`
@@ -83,6 +125,8 @@ type JobRecord struct {
 	RetryCount            int               `json:"retryCount,omitempty"`
 	Warnings              []string          `json:"warnings,omitempty"`
 	QuarantineReason      string            `json:"quarantineReason,omitempty"`
+	FailureReason         string            `json:"failureReason,omitempty"`
+	FailureClass          FailureClass      `json:"failureClass,omitempty"`
 }
 
 // IsTerminal reports whether state is terminal under the public job protocol.

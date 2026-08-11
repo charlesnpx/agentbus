@@ -1,6 +1,12 @@
 package model
 
-import "time"
+import (
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/charlesnpx/agentbus/engine"
+)
 
 type LaunchOrdinal uint8
 
@@ -263,7 +269,9 @@ type SafetyRecord struct {
 	// whole-job elapsed time. A retry replaces this value with its own start.
 	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
 	// FinalAttemptEndedAt is when that same final attempt reached terminal.
-	FinalAttemptEndedAt *time.Time `json:"finalAttemptEndedAt,omitempty"`
+	FinalAttemptEndedAt *time.Time          `json:"finalAttemptEndedAt,omitempty"`
+	FailureReason       string              `json:"failureReason,omitempty"`
+	FailureClass        engine.FailureClass `json:"failureClass,omitempty"`
 }
 
 func (record SafetyRecord) Validate() error {
@@ -306,6 +314,9 @@ func (record SafetyRecord) Validate() error {
 	if record.FinalAttemptEndedAt != nil && record.Terminal == nil {
 		return invalid("final_attempt.ended_at", "requires terminal certificate")
 	}
+	if err := ValidateFailureMetadata(record.FailureClass, record.FailureReason); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -332,6 +343,26 @@ func ValidateFinalAttemptTiming(startedAt, endedAt *time.Time) error {
 		return invalid("final_attempt.ended_at", "precedes started_at")
 	}
 	return nil
+}
+
+// ValidateFailureMetadata accepts the empty legacy representation or a complete
+// persisted failure class and sanitized human-readable reason.
+func ValidateFailureMetadata(class engine.FailureClass, reason string) error {
+	if class == "" && reason == "" {
+		return nil
+	}
+	if !class.Valid() {
+		return invalid("failure.class", "is unknown")
+	}
+	if utf8.RuneCountInString(reason) > engine.FailureReasonMaxRunes {
+		return invalid("failure.reason", "is too long")
+	}
+	for _, r := range reason {
+		if !unicode.IsPrint(r) && r != ' ' {
+			return invalid("failure.reason", "must not contain control characters")
+		}
+	}
+	return validateText("failure.reason", reason, engine.FailureReasonMaxRunes*utf8.UTFMax)
 }
 
 func (record SafetyRecord) validateOptionalFacts() error {

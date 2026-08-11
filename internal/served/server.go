@@ -2395,13 +2395,13 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 		if errors.Is(err, context.Canceled) {
 			state = engine.StateInterrupted
 		}
-		s.completeRunTerminal(run, state, text, skippedStampForRun(run, s.registry, skippedReasonForState(state)))
+		s.completeRunFailure(run, state, text, skippedStampForRun(run, s.registry, skippedReasonForState(state)), terminalFailureOriginFor(err, terminalFailureBackendRan), err)
 		return
 	}
 
 	validation, retryPrompt, compliantState, err := s.validateAttempt(text, run, 1, false)
 	if err != nil {
-		s.completeRunTerminal(run, engine.StateFailed, text, skippedStampForRun(run, s.registry, engine.SkipBackendError))
+		s.completeRunFailure(run, engine.StateFailed, text, skippedStampForRun(run, s.registry, engine.SkipBackendError), terminalFailureInternal, err)
 		return
 	}
 	if retryPrompt != "" {
@@ -2411,12 +2411,16 @@ func (s *Server) runJob(ctx context.Context, run jobRun) {
 			return
 		}
 		if retryErr != nil {
-			s.completeRunTerminal(run, retryState, retryText, skippedStampForRun(run, s.registry, skippedReasonForState(retryState)))
+			if errors.Is(retryErr, context.DeadlineExceeded) {
+				s.completeRunTerminal(run, engine.StateTimedOut, retryText, skippedStampForRun(run, s.registry, engine.SkipTimeout))
+				return
+			}
+			s.completeRunFailure(run, retryState, retryText, skippedStampForRun(run, s.registry, skippedReasonForState(retryState)), terminalFailureOriginFor(retryErr, terminalFailureBackendRan), retryErr)
 			return
 		}
 		retryValidation, _, retryCompliantState, err := s.validateAttempt(retryText, run, 2, true)
 		if err != nil {
-			s.completeRunTerminal(run, engine.StateFailed, retryText, skippedStampForRun(run, s.registry, engine.SkipBackendError))
+			s.completeRunFailure(run, engine.StateFailed, retryText, skippedStampForRun(run, s.registry, engine.SkipBackendError), terminalFailureInternal, err)
 			return
 		}
 		s.completeRunTerminal(run, retryCompliantState, retryText, retryValidation.Stamp)
@@ -2492,14 +2496,18 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				hasResultMessage = true
 			case engine.EventModelReported:
 				if err := s.recordModelReported(run, event.ModelReported); err != nil {
-					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, err
+					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, classifyFailureError(terminalFailureInternal, err)
 				}
 			case engine.EventTerminalError:
 				if rawText == "" {
 					rawText = "backend failed"
 				}
 				terminalState = engine.StateFailed
-				terminalErr = errors.New(rawText)
+				cause := event.Err
+				if cause == nil {
+					cause = errors.New(rawText)
+				}
+				terminalErr = classifyFailureError(terminalFailureBackendRan, cause)
 			case engine.EventTurnFinal:
 			}
 		}
@@ -2584,9 +2592,7 @@ func (s *Server) resolvePolicy(policy *engine.TurnPolicy) (resolvedPolicy, error
 }
 
 func (s *Server) finalizeFailure(run jobRun, err error) {
-	if finalizeErr := s.finalizeTerminal(run, engine.StateFailed, "", nil); finalizeErr != nil {
-		s.handleRunFinalizationError(run, errors.Join(err, finalizeErr))
-	}
+	s.completeRunFailure(run, engine.StateFailed, "", nil, terminalFailureInternal, err)
 }
 
 func (s *Server) finalizeRequestedTerminal(run jobRun) error {
@@ -2603,11 +2609,24 @@ func (s *Server) completeRunTerminal(run jobRun, state engine.JobState, text str
 	}
 }
 
+func (s *Server) completeRunFailure(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp, origin terminalFailureOrigin, cause error) {
+	failure := terminalFailureFor(origin, cause, terminalFailureStopWasRequestedByAgentbus(run, cause))
+	if err := s.recordFailureMetadata(run, failure); err != nil {
+		if err := s.recordFailureMetadata(run, failure); err != nil {
+			log.Printf("agentbus daemon: job %s failure metadata persistence failed: %v", run.jobID, err)
+		}
+	}
+	s.completeRunTerminal(run, state, text, stamp)
+}
+
 func (s *Server) handleRunFinalizationError(run jobRun, err error) {
 	if err == nil {
 		return
 	}
 	log.Printf("agentbus daemon: job %s finalization failed: %v", run.jobID, err)
+	if failureErr := s.recordFailureMetadata(run, terminalFailureFor(terminalFailureFinalization, err, false)); failureErr != nil {
+		log.Printf("agentbus daemon: job %s finalization failure metadata persistence failed: %v", run.jobID, failureErr)
+	}
 	if !run.admissionControlled {
 		return
 	}

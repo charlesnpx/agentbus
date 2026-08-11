@@ -220,16 +220,18 @@ type JobStatus struct {
 	// whole-job elapsed time. A retry replaces this value with its own start.
 	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
 	// FinalAttemptEndedAt is when that same final attempt reached terminal.
-	FinalAttemptEndedAt   *time.Time      `json:"finalAttemptEndedAt,omitempty"`
-	Lease                 *engine.Lease   `json:"lease,omitempty"`
-	WorkerPID             int             `json:"workerPid,omitempty"`
-	WorkerStartTime       string          `json:"workerStartTime,omitempty"`
-	BackendChildPID       int             `json:"backendChildPid,omitempty"`
-	BackendChildStartTime string          `json:"backendChildStartTime,omitempty"`
-	StatePath             string          `json:"statePath,omitempty"`
-	LogPaths              engine.LogPaths `json:"logPaths,omitempty"`
-	ModelReported         string          `json:"modelReported,omitempty"`
-	Warnings              []string        `json:"warnings,omitempty"`
+	FinalAttemptEndedAt   *time.Time          `json:"finalAttemptEndedAt,omitempty"`
+	Lease                 *engine.Lease       `json:"lease,omitempty"`
+	WorkerPID             int                 `json:"workerPid,omitempty"`
+	WorkerStartTime       string              `json:"workerStartTime,omitempty"`
+	BackendChildPID       int                 `json:"backendChildPid,omitempty"`
+	BackendChildStartTime string              `json:"backendChildStartTime,omitempty"`
+	StatePath             string              `json:"statePath,omitempty"`
+	LogPaths              engine.LogPaths     `json:"logPaths,omitempty"`
+	ModelReported         string              `json:"modelReported,omitempty"`
+	Warnings              []string            `json:"warnings,omitempty"`
+	FailureReason         string              `json:"failureReason,omitempty"`
+	FailureClass          engine.FailureClass `json:"failureClass,omitempty"`
 }
 
 type JobResultParams struct {
@@ -249,7 +251,9 @@ type JobResult struct {
 	// whole-job elapsed time. A retry replaces this value with its own start.
 	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
 	// FinalAttemptEndedAt is when that same final attempt reached terminal.
-	FinalAttemptEndedAt *time.Time `json:"finalAttemptEndedAt,omitempty"`
+	FinalAttemptEndedAt *time.Time          `json:"finalAttemptEndedAt,omitempty"`
+	FailureReason       string              `json:"failureReason,omitempty"`
+	FailureClass        engine.FailureClass `json:"failureClass,omitempty"`
 }
 
 type JobCancelParams struct {
