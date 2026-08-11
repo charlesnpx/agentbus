@@ -2351,6 +2351,7 @@ type setupCacheRefreshProbeBackend struct {
 	err              error
 	gate             <-chan struct{}
 	started          chan struct{}
+	probed           engine.Backend
 	probes           atomic.Int64
 }
 
@@ -2376,6 +2377,7 @@ func (b *setupCacheRefreshProbeBackend) ProbeBackend(ctx context.Context, _ comm
 	err := b.err
 	gate := b.gate
 	started := b.started
+	probed := b.probed
 	b.mu.Unlock()
 	if started != nil {
 		select {
@@ -2393,6 +2395,9 @@ func (b *setupCacheRefreshProbeBackend) ProbeBackend(ctx context.Context, _ comm
 	if err != nil {
 		return nil, err
 	}
+	if probed != nil {
+		return probed, nil
+	}
 	return b, nil
 }
 
@@ -2401,6 +2406,12 @@ func (b *setupCacheRefreshProbeBackend) setSetupCacheRefreshState(fingerprint st
 	b.fingerprint = fingerprint
 	b.err = err
 	b.gate = gate
+	b.mu.Unlock()
+}
+
+func (b *setupCacheRefreshProbeBackend) setSetupCacheRefreshProbedBackend(probed engine.Backend) {
+	b.mu.Lock()
+	b.probed = probed
 	b.mu.Unlock()
 }
 
@@ -2480,6 +2491,54 @@ func TestServeBootstrapRecordsProbeFailureUnfenceableWithoutFailingClosed(t *tes
 	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
 }
 
+func TestAdmissionSetupCacheRefreshRecoversFromUnknownBootstrapFingerprint(t *testing.T) {
+	t.Parallel()
+	backend := &setupCacheRefreshProbeBackend{
+		fakeBackend: newFakeBackend("fake"),
+		fingerprint: "readable-cache",
+		fingerprintReads: []setupCacheRefreshFingerprintRead{{
+			err: errors.New("setup cache unreadable during bootstrap"),
+		}},
+		err: errors.New("setup cache is stale"),
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	if got := backend.probes.Load(); got != 1 {
+		t.Fatalf("bootstrap probes = %d, want 1", got)
+	}
+
+	server.admissionStateMu.RLock()
+	instance := server.admissionInstance
+	instance.backendMu.RLock()
+	pinned, stillPinned := instance.pinned["fake"]
+	instance.backendMu.RUnlock()
+	server.admissionStateMu.RUnlock()
+	if !stillPinned || pinned.setupCacheFingerprintKnown || pinned.setupCacheFingerprint != "" || pinned.reprobeInFlight {
+		t.Fatalf("bootstrap pin = %+v stillPinned=%t, want an idle unknown-fingerprint pin", pinned, stillPinned)
+	}
+
+	backend.setSetupCacheRefreshState("readable-cache", nil, nil)
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-refresh-unknown-bootstrap",
+		RequestID:    "request-refresh-unknown-bootstrap",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err != nil {
+		t.Fatalf("submit error = %+v, want refresh to publish", outcome.err)
+	}
+	if got := backend.probes.Load(); got != 2 {
+		t.Fatalf("probes after readable cache = %d, want 2", got)
+	}
+	server.admissionStateMu.RLock()
+	instance = server.admissionInstance
+	_, stillPinned = server.admissionUnprobeableBackends["fake"]
+	server.admissionStateMu.RUnlock()
+	descriptor, ok := instance.descriptor("fake")
+	if !ok || !descriptor.fenceable || stillPinned {
+		t.Fatalf("refresh state descriptor=%+v stillPinned=%t, want fenceable and unpinned", descriptor, stillPinned)
+	}
+}
+
 func TestAdmissionSetupCacheRefreshDoesNotReprobeUnchangedCache(t *testing.T) {
 	t.Parallel()
 	backend := &setupCacheRefreshProbeBackend{
@@ -2537,6 +2596,35 @@ func TestAdmissionSetupCacheRefreshReprobesChangedCacheAndUnpins(t *testing.T) {
 	descriptor, ok := instance.descriptor("fake")
 	if !ok || !descriptor.fenceable || stillPinned {
 		t.Fatalf("refresh state descriptor=%+v stillPinned=%t, want fenceable and unpinned", descriptor, stillPinned)
+	}
+}
+
+func TestAdmissionSetupCacheRefreshPublishesProbedBackendToCanonicalMap(t *testing.T) {
+	t.Parallel()
+	backend := &setupCacheRefreshProbeBackend{
+		fakeBackend: newFakeBackend("fake"),
+		fingerprint: "before-refresh",
+		err:         errors.New("setup cache is stale"),
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	probed := newFakeBackend("fake")
+	backend.setSetupCacheRefreshState("after-refresh", nil, nil)
+	backend.setSetupCacheRefreshProbedBackend(probed)
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-refresh-canonical-backend",
+		RequestID:    "request-refresh-canonical-backend",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "hold"},
+	}))
+	if outcome.err != nil {
+		t.Fatalf("submit error = %+v, want refresh to publish", outcome.err)
+	}
+	server.admissionStateMu.RLock()
+	canonical := server.backends["fake"]
+	server.admissionStateMu.RUnlock()
+	if canonical != probed {
+		t.Fatalf("canonical backend = %T %p, want probed backend %T %p", canonical, canonical, probed, probed)
 	}
 }
 

@@ -83,8 +83,9 @@ type admissionSetupProbeCacheFingerprintBackend interface {
 }
 
 type admissionPinnedBackend struct {
-	setupCacheFingerprint string
-	reprobeInFlight       bool
+	setupCacheFingerprint      string
+	setupCacheFingerprintKnown bool
+	reprobeInFlight            bool
 }
 
 type admissionInstance struct {
@@ -1028,8 +1029,9 @@ func (s *Server) probeAdmissionBackends(ctx context.Context) (map[string]admissi
 			}
 			s.admissionUnprobeableBackends[name] = probeErr
 			descriptors[name] = s.admissionBackendDescriptor(name, backend, probeErr)
-			if fingerprintKnown {
-				pinned[name] = admissionPinnedBackend{setupCacheFingerprint: fingerprint}
+			pinned[name] = admissionPinnedBackend{
+				setupCacheFingerprint:      fingerprint,
+				setupCacheFingerprintKnown: fingerprintKnown,
 			}
 			continue
 		}
@@ -1133,21 +1135,21 @@ func admissionSetupProbeCacheFingerprint(backend engine.Backend) (string, bool) 
 	return fingerprint, true
 }
 
-func (instance *admissionInstance) setupCacheRefreshCandidate(name string) (admissionBackendDescriptor, string, bool) {
+func (instance *admissionInstance) setupCacheRefreshCandidate(name string) (admissionBackendDescriptor, string, bool, bool) {
 	if instance == nil {
-		return admissionBackendDescriptor{}, "", false
+		return admissionBackendDescriptor{}, "", false, false
 	}
 	instance.backendMu.RLock()
 	defer instance.backendMu.RUnlock()
 	pinned, ok := instance.pinned[name]
 	if !ok || pinned.reprobeInFlight {
-		return admissionBackendDescriptor{}, "", false
+		return admissionBackendDescriptor{}, "", false, false
 	}
 	descriptor, ok := instance.descriptors[name]
 	if !ok || descriptor.probeError == nil {
-		return admissionBackendDescriptor{}, "", false
+		return admissionBackendDescriptor{}, "", false, false
 	}
-	return descriptor, pinned.setupCacheFingerprint, true
+	return descriptor, pinned.setupCacheFingerprint, pinned.setupCacheFingerprintKnown, true
 }
 
 func (instance *admissionInstance) beginSetupCacheRefresh(name, fingerprint string) (admissionBackendDescriptor, bool) {
@@ -1157,7 +1159,7 @@ func (instance *admissionInstance) beginSetupCacheRefresh(name, fingerprint stri
 	instance.backendMu.Lock()
 	defer instance.backendMu.Unlock()
 	pinned, ok := instance.pinned[name]
-	if !ok || pinned.reprobeInFlight || pinned.setupCacheFingerprint == fingerprint {
+	if !ok || pinned.reprobeInFlight || (pinned.setupCacheFingerprintKnown && pinned.setupCacheFingerprint == fingerprint) {
 		return admissionBackendDescriptor{}, false
 	}
 	descriptor, ok := instance.descriptors[name]
@@ -1183,12 +1185,12 @@ func (instance *admissionInstance) replaceBackendDescriptorLocked(name string, d
 // operation. It holds no admission lock while ProbeBackend can spawn a process;
 // simultaneous submitters see the existing pin until this one finishes.
 func (s *Server) refreshAdmissionBackendOnSetupCacheChange(ctx context.Context, instance *admissionInstance, name string) {
-	descriptor, priorFingerprint, refreshable := instance.setupCacheRefreshCandidate(name)
+	descriptor, priorFingerprint, priorFingerprintKnown, refreshable := instance.setupCacheRefreshCandidate(name)
 	if !refreshable {
 		return
 	}
 	fingerprint, changed := admissionSetupProbeCacheFingerprint(descriptor.backend)
-	if !changed || fingerprint == priorFingerprint {
+	if !changed || (priorFingerprintKnown && fingerprint == priorFingerprint) {
 		return
 	}
 	descriptor, started := instance.beginSetupCacheRefresh(name, fingerprint)
@@ -1252,9 +1254,11 @@ func (s *Server) finishAdmissionBackendSetupCacheRefresh(instance *admissionInst
 		return
 	}
 	pinned.setupCacheFingerprint = fingerprint
+	pinned.setupCacheFingerprintKnown = true
 	if cacheStable && probeErr == nil {
 		descriptor := s.admissionBackendDescriptor(name, probed, nil)
 		instance.replaceBackendDescriptorLocked(name, descriptor)
+		s.backends[name] = probed
 		delete(instance.pinned, name)
 		if s.admissionUnprobeableBackends != nil {
 			delete(s.admissionUnprobeableBackends, name)
