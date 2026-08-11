@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
@@ -304,6 +305,82 @@ func TestReadyAcceptAndClaimFailStopsOnRealBboltAmbiguousCommit(t *testing.T) {
 	}
 	if persisted.Terminal != nil {
 		t.Fatalf("persisted record terminal after ambiguous commit: %+v", persisted.Terminal)
+	}
+}
+
+func TestFailureMetadataSurvivesBboltLoadJobRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "admission.bbolt")
+	repo, err := bboltrepo.Create(path)
+	if err != nil {
+		t.Fatalf("create bbolt repository: %v", err)
+	}
+	repoClosed := false
+	t.Cleanup(func() {
+		if !repoClosed {
+			if err := repo.Close(); err != nil {
+				t.Fatalf("close bbolt repository: %v", err)
+			}
+		}
+	})
+
+	anchorStore := NewAnchorStore()
+	ready := newReadyWithAnchorStore(t, repo, anchorStore, "failure-reason-first")
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "failure-reason-round-trip"))
+	if err != nil {
+		t.Fatalf("accept job: %v", err)
+	}
+	terminalizeReady(t, ctx, ready, accepted.Record.Attempt.Ref, accepted.Record.JobID)
+	const reason = "backend returned a durable failure"
+	if _, err := ready.RecordFailure(ctx, accepted.Record.JobID, engine.FailureClassBackendError, reason); err != nil {
+		t.Fatalf("record failure metadata: %v", err)
+	}
+	if image, err := ready.LoadJob(ctx, accepted.Record.JobID); err != nil {
+		t.Fatalf("load job before reopen: %v", err)
+	} else {
+		assertFailureMetadataImage(t, image, engine.FailureClassBackendError, reason)
+	}
+
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close bbolt repository before reopen: %v", err)
+	}
+	repoClosed = true
+	reopened, err := bboltrepo.OpenExisting(path)
+	if err != nil {
+		t.Fatalf("reopen bbolt repository: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("close reopened bbolt repository: %v", err)
+		}
+	})
+	restarted := newReadyWithAnchorStore(t, reopened, anchorStore, "failure-reason-restarted")
+	image, err := restarted.LoadJob(ctx, accepted.Record.JobID)
+	if err != nil {
+		t.Fatalf("load job after reopen: %v", err)
+	}
+	assertFailureMetadataImage(t, image, engine.FailureClassBackendError, reason)
+}
+
+func assertFailureMetadataImage(t *testing.T, image repository.JobImage, wantClass engine.FailureClass, wantReason string) {
+	t.Helper()
+	if image.Safety.State != repository.RecordValid {
+		t.Fatalf("safety state = %s, want valid", image.Safety.State)
+	}
+	if image.Projection.State != repository.RecordValid {
+		t.Fatalf("projection state = %s, want valid", image.Projection.State)
+	}
+	if got := image.Safety.Value.FailureClass; got != wantClass {
+		t.Fatalf("safety failure class = %q, want %q", got, wantClass)
+	}
+	if got := image.Safety.Value.FailureReason; got != wantReason {
+		t.Fatalf("safety failure reason = %q, want %q", got, wantReason)
+	}
+	if got := image.Projection.Value.FailureClass; got != wantClass {
+		t.Fatalf("projection failure class = %q, want %q", got, wantClass)
+	}
+	if got := image.Projection.Value.FailureReason; got != wantReason {
+		t.Fatalf("projection failure reason = %q, want %q", got, wantReason)
 	}
 }
 

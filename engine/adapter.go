@@ -59,6 +59,10 @@ type Event struct {
 	Metadata      map[string]any        `json:"metadata,omitempty"`
 	TurnFinal     *TurnFinalObservation `json:"-"`
 	RawText       string                `json:"-"`
+	// Err preserves an in-process, adapter-confirmed terminal condition. It is
+	// deliberately never serialized because text from a backend is not a typed
+	// status signal.
+	Err error `json:"-"`
 }
 
 // TurnFinalObservation is the embedded-only retirement observation emitted at

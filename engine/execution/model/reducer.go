@@ -97,6 +97,10 @@ func ApplyCertifyResult(current SafetyRecord, command CertifyResult) (ApplyResul
 	return apply(current, command)
 }
 
+func ApplyRecordFailure(current SafetyRecord, command RecordFailure) (ApplyResult, error) {
+	return apply(current, command)
+}
+
 func ApplyFinalize(current SafetyRecord, command Finalize) (ApplyResult, error) {
 	return apply(current, command)
 }
@@ -110,6 +114,24 @@ func apply(current SafetyRecord, command Command) (ApplyResult, error) {
 		return ApplyResult{}, err
 	}
 	if current.Terminal != nil {
+		if failure, ok := normalized.(RecordFailure); ok {
+			next := cloneSafetyRecord(current)
+			changed, err := applyRecordFailure(&next, current, failure)
+			if err != nil {
+				return ApplyResult{}, err
+			}
+			if !changed {
+				return ApplyResult{Record: cloneSafetyRecord(current), Changed: false}, nil
+			}
+			if current.Revision == ^uint64(0) {
+				return ApplyResult{}, precondition("safety record revision overflow")
+			}
+			next.Revision = current.Revision + 1
+			if err := ValidateSafetyRecord(next); err != nil {
+				return ApplyResult{}, fmt.Errorf("reducer produced invalid safety record: %w", err)
+			}
+			return ApplyResult{Record: next, Changed: true}, nil
+		}
 		return applyTerminalAbsorbing(current, normalized)
 	}
 	if current.Mode == ModeLegacyUnfenced && !legacyUnfencedCommand(normalized) {
@@ -156,6 +178,8 @@ func applyOpen(next *SafetyRecord, current SafetyRecord, command any) (bool, err
 		return applyObserveOutcome(next, current, c)
 	case CertifyResult:
 		return applyCertifyResult(next, current, c)
+	case RecordFailure:
+		return applyRecordFailure(next, current, c)
 	case Finalize:
 		return applyFinalize(next, current, c)
 	default:
@@ -489,6 +513,23 @@ func applyCertifyResult(next *SafetyRecord, current SafetyRecord, command Certif
 	return mergeFact(&next.Result, receipt, "result")
 }
 
+func applyRecordFailure(next *SafetyRecord, current SafetyRecord, command RecordFailure) (bool, error) {
+	if err := ensureJob(current, command.JobID); err != nil {
+		return false, err
+	}
+	if err := ValidateFailureMetadata(command.Class, command.Reason); err != nil {
+		return false, invalidCommand("failure metadata: %v", err)
+	}
+	if current.FailureClass != "" || current.FailureReason != "" {
+		// The first failure observed is the one most directly connected to the
+		// job's terminal path. Keep it authoritative when cleanup later fails.
+		return false, nil
+	}
+	next.FailureClass = command.Class
+	next.FailureReason = command.Reason
+	return true, nil
+}
+
 func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (bool, error) {
 	if err := ensureAttempt(current, command.Ref); err != nil {
 		return false, err
@@ -595,6 +636,13 @@ func normalizeCommand(command Command) (any, error) {
 			return nil, invalidCommand("command is nil")
 		}
 		return *c, nil
+	case RecordFailure:
+		return c, nil
+	case *RecordFailure:
+		if c == nil {
+			return nil, invalidCommand("command is nil")
+		}
+		return *c, nil
 	case Finalize:
 		return c, nil
 	case *Finalize:
@@ -617,7 +665,7 @@ func groupBindingAllowed(record SafetyRecord) bool {
 
 func legacyUnfencedCommand(command any) bool {
 	switch command.(type) {
-	case RequestCancel, ObserveOutcome, CertifyResult, Finalize:
+	case RequestCancel, ObserveOutcome, CertifyResult, RecordFailure, Finalize:
 		return true
 	default:
 		return false

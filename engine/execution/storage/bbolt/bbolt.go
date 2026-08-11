@@ -3023,6 +3023,9 @@ func validateProjectionShape(projection model.JobProjection) error {
 	if projection.TerminalCause != 0 && !projection.TerminalCause.Valid() {
 		return fmt.Errorf("%w: projection.terminal_cause is unknown", repository.ErrInvalidRecord)
 	}
+	if err := model.ValidateFailureMetadata(projection.FailureClass, projection.FailureReason); err != nil {
+		return fmt.Errorf("%w: projection failure metadata: %v", repository.ErrInvalidRecord, err)
+	}
 	return nil
 }
 

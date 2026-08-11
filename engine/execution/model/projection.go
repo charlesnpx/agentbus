@@ -1,5 +1,7 @@
 package model
 
+import "github.com/charlesnpx/agentbus/engine"
+
 type ProjectionMetadata struct {
 	SessionID string
 }
@@ -21,6 +23,8 @@ type JobProjection struct {
 	Public        PublicState
 	TerminalCause TerminalCause
 	SessionID     string
+	FailureReason string              `json:"failureReason,omitempty"`
+	FailureClass  engine.FailureClass `json:"failureClass,omitempty"`
 }
 
 // Project rebuilds the read model from the proof-bearing SafetyRecord. The
@@ -36,6 +40,8 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 	decision := projectDecision(record)
 	dispatch := projectDispatch(record)
 	outcome := projectOutcome(record)
+	public := PublicProjection(decision, dispatch, outcome)
+	failureReason, failureClass := projectedFailureMetadata(record, public)
 	return JobProjection{
 		SchemaVersion: record.SchemaVersion,
 		Revision:      record.Revision,
@@ -46,10 +52,23 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 		Decision:      decision,
 		Dispatch:      dispatch,
 		Outcome:       outcome,
-		Public:        PublicProjection(decision, dispatch, outcome),
+		Public:        public,
 		TerminalCause: projectTerminalCause(record),
 		SessionID:     metadata.SessionID,
+		FailureReason: failureReason,
+		FailureClass:  failureClass,
 	}, nil
+}
+
+func projectedFailureMetadata(record SafetyRecord, public PublicState) (string, engine.FailureClass) {
+	// Preserve metadata durably on SafetyRecord for forensics, but only expose
+	// it through a projection when the terminal state is itself a failure.
+	switch public {
+	case PublicFailed, PublicQuarantined:
+		return record.FailureReason, record.FailureClass
+	default:
+		return "", ""
+	}
 }
 
 func projectDecision(record SafetyRecord) Decision {

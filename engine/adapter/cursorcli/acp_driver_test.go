@@ -224,6 +224,7 @@ func TestACPNegativeTerminalProtocolBranches(t *testing.T) {
 		run          func(*testing.T, *acpPeer)
 		terminalText string
 		wantResult   bool
+		interrupted  bool
 	}{
 		{
 			name: "set mode error prevents prompt",
@@ -267,6 +268,7 @@ func TestACPNegativeTerminalProtocolBranches(t *testing.T) {
 				peer.expectStdinClose()
 			},
 			terminalText: "cursor ACP prompt was cancelled without a requested interrupt",
+			interrupted:  true,
 		},
 	}
 
@@ -290,6 +292,9 @@ func TestACPNegativeTerminalProtocolBranches(t *testing.T) {
 			if test.terminalText != "" {
 				if len(terminal) != 1 || !strings.Contains(terminal[0].Text, test.terminalText) {
 					t.Fatalf("events = %#v, want terminal error containing %q", got, test.terminalText)
+				}
+				if test.interrupted && !errors.Is(terminal[0].Err, engine.ErrTurnInterrupted) {
+					t.Fatalf("terminal event error = %v, want ErrTurnInterrupted", terminal[0].Err)
 				}
 			} else if len(terminal) != 0 {
 				t.Fatalf("events = %#v, did not want terminal error", got)

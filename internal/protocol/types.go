@@ -206,25 +206,27 @@ type JobStatusResult struct {
 }
 
 type JobStatus struct {
-	JobID                 string            `json:"jobId"`
-	SessionID             string            `json:"sessionId,omitempty"`
-	Backend               string            `json:"backend,omitempty"`
-	State                 engine.JobState   `json:"state"`
-	CleanupDisposition    string            `json:"cleanupDisposition,omitempty"`
-	LateFinalization      bool              `json:"lateFinalization,omitempty"`
-	Tags                  map[string]string `json:"tags,omitempty"`
-	StartedAt             *time.Time        `json:"startedAt,omitempty"`
-	UpdatedAt             *time.Time        `json:"updatedAt,omitempty"`
-	HeartbeatAt           *time.Time        `json:"heartbeatAt,omitempty"`
-	Lease                 *engine.Lease     `json:"lease,omitempty"`
-	WorkerPID             int               `json:"workerPid,omitempty"`
-	WorkerStartTime       string            `json:"workerStartTime,omitempty"`
-	BackendChildPID       int               `json:"backendChildPid,omitempty"`
-	BackendChildStartTime string            `json:"backendChildStartTime,omitempty"`
-	StatePath             string            `json:"statePath,omitempty"`
-	LogPaths              engine.LogPaths   `json:"logPaths,omitempty"`
-	ModelReported         string            `json:"modelReported,omitempty"`
-	Warnings              []string          `json:"warnings,omitempty"`
+	JobID                 string              `json:"jobId"`
+	SessionID             string              `json:"sessionId,omitempty"`
+	Backend               string              `json:"backend,omitempty"`
+	State                 engine.JobState     `json:"state"`
+	CleanupDisposition    string              `json:"cleanupDisposition,omitempty"`
+	LateFinalization      bool                `json:"lateFinalization,omitempty"`
+	Tags                  map[string]string   `json:"tags,omitempty"`
+	StartedAt             *time.Time          `json:"startedAt,omitempty"`
+	UpdatedAt             *time.Time          `json:"updatedAt,omitempty"`
+	HeartbeatAt           *time.Time          `json:"heartbeatAt,omitempty"`
+	Lease                 *engine.Lease       `json:"lease,omitempty"`
+	WorkerPID             int                 `json:"workerPid,omitempty"`
+	WorkerStartTime       string              `json:"workerStartTime,omitempty"`
+	BackendChildPID       int                 `json:"backendChildPid,omitempty"`
+	BackendChildStartTime string              `json:"backendChildStartTime,omitempty"`
+	StatePath             string              `json:"statePath,omitempty"`
+	LogPaths              engine.LogPaths     `json:"logPaths,omitempty"`
+	ModelReported         string              `json:"modelReported,omitempty"`
+	Warnings              []string            `json:"warnings,omitempty"`
+	FailureReason         string              `json:"failureReason,omitempty"`
+	FailureClass          engine.FailureClass `json:"failureClass,omitempty"`
 }
 
 type JobResultParams struct {
@@ -240,6 +242,8 @@ type JobResult struct {
 	Result             *engine.ResultInfo    `json:"result,omitempty"`
 	ModelReported      string                `json:"modelReported,omitempty"`
 	Contract           *engine.ContractStamp `json:"contract,omitempty"`
+	FailureReason      string                `json:"failureReason,omitempty"`
+	FailureClass       engine.FailureClass   `json:"failureClass,omitempty"`
 }
 
 type JobCancelParams struct {
