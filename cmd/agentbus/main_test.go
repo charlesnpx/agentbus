@@ -207,7 +207,7 @@ func TestSetupReportsDiscoveryWarnings(t *testing.T) {
 func TestSetupDriftDetectionFailsLoudly(t *testing.T) {
 	t.Parallel()
 	a := testApp(t)
-	drift := "backend version changed since setup; re-run agentbus setup"
+	drift := "backend version changed since setup; re-run agentbus setup, then retry the launch so the running daemon can re-probe the refreshed cache; restart the daemon if it is running an older agentbus binary"
 	probe := engine.BackendSetupProbe{
 		Backend:          "claude",
 		BinaryPath:       "/tmp/bin/claude",

@@ -2,8 +2,10 @@ package cliadapter
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -14,7 +16,9 @@ import (
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
-const DriftError = "backend version changed since setup; re-run agentbus setup"
+const setupCacheRefreshInstruction = "re-run agentbus setup, then retry the launch so the running daemon can re-probe the refreshed cache; restart the daemon if it is running an older agentbus binary"
+
+const DriftError = "backend version changed since setup; " + setupCacheRefreshInstruction
 
 type Backend struct {
 	NameValue        string
@@ -508,32 +512,68 @@ func (b *Backend) discoveryWarning(probe engine.BackendSetupProbe, version strin
 	return ""
 }
 
-func (b *Backend) readCache() (engine.SetupProbeCache, error) {
+func (b *Backend) setupProbeCachePath() (string, error) {
 	path := b.CachePath
 	if path == "" {
 		var err error
 		path, err = engine.SetupProbeCachePath("")
 		if err != nil {
-			return engine.SetupProbeCache{}, err
+			return "", err
 		}
 	}
+	return path, nil
+}
+
+func (b *Backend) readCache() (engine.SetupProbeCache, error) {
+	path, err := b.setupProbeCachePath()
+	if err != nil {
+		return engine.SetupProbeCache{}, err
+	}
 	return engine.ReadSetupProbeCache(path)
+}
+
+// SetupProbeCacheFingerprint identifies the setup cache revision consumed by
+// this backend. Strict admission uses it only to decide whether a backend that
+// was pinned after a failed probe may be safely re-probed.
+func (b *Backend) SetupProbeCacheFingerprint() (string, error) {
+	path, err := b.setupProbeCachePath()
+	if err != nil {
+		return "", err
+	}
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "missing", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return fmt.Sprintf("%x:%d:%d", sum, info.Size(), info.ModTime().UnixNano()), nil
 }
 
 func (b *Backend) cachedProbe() (engine.BackendSetupProbe, error) {
 	cache, err := b.readCache()
 	if err != nil {
-		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache missing for %s; re-run agentbus setup: %w", b.NameValue, err)
+		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache missing for %s; %s: %w", b.NameValue, setupCacheRefreshInstruction, err)
 	}
 	if cache.Version != engine.SetupProbeCacheVersion {
-		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache version %d is stale; re-run agentbus setup", cache.Version)
+		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache version %d is stale; %s", cache.Version, setupCacheRefreshInstruction)
 	}
 	for _, p := range cache.Backends {
 		if p.Backend == b.NameValue {
 			return p, nil
 		}
 	}
-	return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache missing backend %s; re-run agentbus setup", b.NameValue)
+	return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache missing backend %s; %s", b.NameValue, setupCacheRefreshInstruction)
 }
 
 type Session struct {
