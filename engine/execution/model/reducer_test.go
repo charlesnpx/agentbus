@@ -1,7 +1,9 @@
 package model
 
 import (
+	"bytes"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -209,6 +211,84 @@ func TestRecordFinalAttemptTimingRetainsOnlyTheFinalRetry(t *testing.T) {
 	if projection.FinalAttemptStartedAt == nil || !projection.FinalAttemptStartedAt.Equal(finalStart) || projection.FinalAttemptEndedAt == nil || !projection.FinalAttemptEndedAt.Equal(finalEnd) {
 		t.Fatalf("projection final attempt timing = start:%v end:%v, want %s/%s", projection.FinalAttemptStartedAt, projection.FinalAttemptEndedAt, finalStart, finalEnd)
 	}
+}
+
+func TestRecordFinalAttemptStartAcceptsEarlierRetryTime(t *testing.T) {
+	firstStart := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	retryStart := firstStart.Add(-5 * time.Second)
+	record := reducerCanceledRetiredRecord(t)
+	record = reducerMustApply(t, record, RecordFinalAttemptStart{JobID: reducerJobID(), StartedAt: firstStart})
+
+	logs := captureFinalAttemptTimingWarnings(t)
+	result, err := ApplyRecordFinalAttemptStart(record, RecordFinalAttemptStart{JobID: reducerJobID(), StartedAt: retryStart})
+	if err != nil {
+		t.Fatalf("RecordFinalAttemptStart earlier retry error = %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("RecordFinalAttemptStart earlier retry did not replace the current attempt")
+	}
+	if result.Record.FinalAttemptStartedAt == nil || !result.Record.FinalAttemptStartedAt.Equal(retryStart) {
+		t.Fatalf("final attempt start = %v, want current retry %s", result.Record.FinalAttemptStartedAt, retryStart)
+	}
+	if err := ValidateSafetyRecord(result.Record); err != nil {
+		t.Fatalf("earlier retry output failed ValidateSafetyRecord: %v", err)
+	}
+	if !strings.Contains(logs.String(), "final attempt timing warning") || !strings.Contains(logs.String(), "current retry observation wins") {
+		t.Fatalf("timing anomaly log = %q, want observable backward retry warning", logs.String())
+	}
+}
+
+func TestFinalizeDropsEndBeforeStartWithoutBlockingTerminalization(t *testing.T) {
+	startedAt := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	endedAt := startedAt.Add(-time.Second)
+	record := reducerCanceledRetiredRecord(t)
+	record = reducerMustApply(t, record, RecordFinalAttemptStart{JobID: reducerJobID(), StartedAt: startedAt})
+
+	logs := captureFinalAttemptTimingWarnings(t)
+	result, err := ApplyFinalize(record, Finalize{
+		Ref: reducerRef(),
+		Intent: TerminalIntent{
+			Outcome:             OutcomeCanceled,
+			Cause:               CauseCanceledBeforeAuthorization,
+			FinalAttemptEndedAt: &endedAt,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Finalize end before start error = %v", err)
+	}
+	if !result.Changed || result.Record.Terminal == nil {
+		t.Fatalf("Finalize result = changed:%t terminal:%v, want terminal transition", result.Changed, result.Record.Terminal)
+	}
+	if result.Record.FinalAttemptStartedAt == nil || !result.Record.FinalAttemptStartedAt.Equal(startedAt) || result.Record.FinalAttemptEndedAt != nil {
+		t.Fatalf("durable timing = start:%v end:%v, want %s/<nil>", result.Record.FinalAttemptStartedAt, result.Record.FinalAttemptEndedAt, startedAt)
+	}
+	if err := ValidateSafetyRecord(result.Record); err != nil {
+		t.Fatalf("finalized output failed ValidateSafetyRecord: %v", err)
+	}
+	projection, err := Project(result.Record, ProjectionMetadata{})
+	if err != nil {
+		t.Fatalf("Project finalized result: %v", err)
+	}
+	if projection.FinalAttemptStartedAt != nil || projection.FinalAttemptEndedAt != nil {
+		t.Fatalf("projection timing = start:%v end:%v, want absent", projection.FinalAttemptStartedAt, projection.FinalAttemptEndedAt)
+	}
+	if !strings.Contains(logs.String(), "final attempt timing warning") || !strings.Contains(logs.String(), "precedes start") {
+		t.Fatalf("timing anomaly log = %q, want observable dropped end warning", logs.String())
+	}
+}
+
+func captureFinalAttemptTimingWarnings(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	oldLogWriter := log.Writer()
+	oldLogFlags := log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(oldLogWriter)
+		log.SetFlags(oldLogFlags)
+	})
+	return &logs
 }
 
 func TestAuthorizeSecondOrdinalRequiresFirstQuiescence(t *testing.T) {

@@ -98,11 +98,7 @@ func (s *RecoverySession) FinalizePlanned(ctx context.Context, token model.Recov
 // FinalizePlannedAt finalizes a planned recovery transition and atomically
 // records when its final contract attempt reached terminal.
 func (s *RecoverySession) FinalizePlannedAt(ctx context.Context, token model.RecoveryToken, endedAt time.Time) error {
-	finalAttemptEndedAt, err := recoveryFinalAttemptEndedAt(endedAt)
-	if err != nil {
-		return err
-	}
-	return s.finalizePlanned(ctx, token, finalAttemptEndedAt)
+	return s.finalizePlanned(ctx, token, recoveryFinalAttemptEndedAt(endedAt))
 }
 
 func (s *RecoverySession) finalizePlanned(ctx context.Context, token model.RecoveryToken, finalAttemptEndedAt *time.Time) error {
@@ -169,19 +165,14 @@ func (s *RecoverySession) FinalizeUnresolved(ctx context.Context, token model.Re
 // FinalizeUnresolvedAt finalizes an unresolved recovery transition and
 // atomically records when its final contract attempt reached terminal.
 func (s *RecoverySession) FinalizeUnresolvedAt(ctx context.Context, token model.RecoveryToken, endedAt time.Time) (model.SafetyRecord, error) {
-	finalAttemptEndedAt, err := recoveryFinalAttemptEndedAt(endedAt)
-	if err != nil {
-		return model.SafetyRecord{}, err
-	}
-	return s.finalizeUnresolved(ctx, token, finalAttemptEndedAt)
+	return s.finalizeUnresolved(ctx, token, recoveryFinalAttemptEndedAt(endedAt))
 }
 
-func recoveryFinalAttemptEndedAt(endedAt time.Time) (*time.Time, error) {
-	if endedAt.IsZero() {
-		return nil, fmt.Errorf("%w: final attempt end time is required", ErrInvalidRequest)
-	}
+func recoveryFinalAttemptEndedAt(endedAt time.Time) *time.Time {
+	// Forward every observation to the reducer. It owns the advisory-timing
+	// policy and can discard an unusable value without stranding recovery.
 	normalized := endedAt.UTC()
-	return &normalized, nil
+	return &normalized
 }
 
 func (s *RecoverySession) finalizeUnresolved(ctx context.Context, token model.RecoveryToken, finalAttemptEndedAt *time.Time) (model.SafetyRecord, error) {

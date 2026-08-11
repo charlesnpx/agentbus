@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
@@ -525,41 +526,55 @@ func applyRecordFinalAttemptStart(next *SafetyRecord, current SafetyRecord, comm
 		return false, err
 	}
 	startedAt := command.StartedAt
-	if err := ValidateFinalAttemptTiming(&startedAt, nil); err != nil {
-		return false, invalidCommand("final attempt timing: %v", err)
+	if startedAt.IsZero() {
+		reportFinalAttemptTimingWarning(current.JobID, "dropping zero final attempt start")
+		return false, nil
 	}
 	if current.FinalAttemptEndedAt != nil {
-		return false, precondition("final attempt timing is already terminal")
+		reportFinalAttemptTimingWarning(current.JobID, "dropping start after a final attempt end is already recorded")
+		return false, nil
 	}
 	if current.FinalAttemptStartedAt != nil {
 		if current.FinalAttemptStartedAt.Equal(startedAt) {
 			return false, nil
 		}
 		if startedAt.Before(*current.FinalAttemptStartedAt) {
-			return false, precondition("final attempt start precedes recorded start")
+			reportFinalAttemptTimingWarning(current.JobID, "retry start %s precedes persisted start %s; replacing it because the current retry observation wins", startedAt.Format(time.RFC3339Nano), current.FinalAttemptStartedAt.Format(time.RFC3339Nano))
 		}
 	}
+	// The command being applied identifies the current final attempt, so its
+	// timestamp always replaces the prior one. Wall-clock order is diagnostic
+	// only and must not become a precondition for a retry.
 	next.FinalAttemptStartedAt = clonePtr(&startedAt)
 	return true, nil
 }
 
-func applyFinalAttemptEnd(next *SafetyRecord, current SafetyRecord, endedAt *time.Time) (bool, error) {
-	if endedAt == nil || current.FinalAttemptStartedAt == nil {
+func applyFinalAttemptEnd(next *SafetyRecord, current SafetyRecord, endedAt *time.Time) bool {
+	if endedAt == nil {
+		return false
+	}
+	if current.FinalAttemptStartedAt == nil {
 		// A job can reach terminal before an attempt starts (for example, an
 		// early cancellation). In that case there is no final attempt to time.
-		return false, nil
+		return false
 	}
-	if err := ValidateFinalAttemptTiming(current.FinalAttemptStartedAt, endedAt); err != nil {
-		return false, invalidCommand("final attempt timing: %v", err)
+	if endedAt.IsZero() {
+		reportFinalAttemptTimingWarning(current.JobID, "dropping zero final attempt end")
+		return false
+	}
+	if endedAt.Before(*current.FinalAttemptStartedAt) {
+		reportFinalAttemptTimingWarning(current.JobID, "dropping final attempt end %s because it precedes start %s", endedAt.Format(time.RFC3339Nano), current.FinalAttemptStartedAt.Format(time.RFC3339Nano))
+		return false
 	}
 	if current.FinalAttemptEndedAt != nil {
 		if current.FinalAttemptEndedAt.Equal(*endedAt) {
-			return false, nil
+			return false
 		}
-		return false, conflict("final attempt end already recorded with different timestamp")
+		reportFinalAttemptTimingWarning(current.JobID, "dropping final attempt end %s because end %s is already recorded", endedAt.Format(time.RFC3339Nano), current.FinalAttemptEndedAt.Format(time.RFC3339Nano))
+		return false
 	}
 	next.FinalAttemptEndedAt = clonePtr(endedAt)
-	return true, nil
+	return true
 }
 
 func applyRecordFailure(next *SafetyRecord, current SafetyRecord, command RecordFailure) (bool, error) {
@@ -591,11 +606,12 @@ func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (
 	if err != nil {
 		return false, err
 	}
-	timingChanged, err := applyFinalAttemptEnd(next, current, command.Intent.FinalAttemptEndedAt)
-	if err != nil {
-		return false, err
-	}
+	timingChanged := applyFinalAttemptEnd(next, current, command.Intent.FinalAttemptEndedAt)
 	return terminalChanged || timingChanged, nil
+}
+
+func reportFinalAttemptTimingWarning(jobID JobID, format string, args ...any) {
+	log.Printf("agentbus execution: final attempt timing warning: job=%s: %s", jobID, fmt.Sprintf(format, args...))
 }
 
 func applyTerminalAbsorbing(current SafetyRecord, command any) (ApplyResult, error) {
