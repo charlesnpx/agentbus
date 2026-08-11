@@ -345,13 +345,31 @@ func TestAppServerCompletedTurnUsesLastDeltaAgentMessageItemAsResult(t *testing.
 
 func TestAppServerTerminalTurnStatuses(t *testing.T) {
 	tests := []struct {
-		name        string
-		status      string
-		errorText   string
-		want        string
-		interrupted bool
+		name         string
+		status       string
+		errorText    string
+		errorInfo    string
+		want         string
+		interrupted  bool
+		overloaded   bool
+		taskComplete bool
 	}{
 		{name: "failed", status: "failed", errorText: "model failed", want: "model failed"},
+		{
+			name:         "structured server overloaded task completion",
+			errorText:    "Selected model is at capacity. Please try a different model.",
+			errorInfo:    "server_overloaded",
+			want:         "Selected model is at capacity. Please try a different model.",
+			overloaded:   true,
+			taskComplete: true,
+		},
+		{
+			name:         "message-only overloaded task completion",
+			errorText:    "Selected model is at capacity. Please try a different model.",
+			want:         "Selected model is at capacity. Please try a different model.",
+			overloaded:   true,
+			taskComplete: true,
+		},
 		{name: "unrequested interrupted", status: "interrupted", want: "interrupted", interrupted: true},
 	}
 	for _, test := range tests {
@@ -363,7 +381,13 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 				peer.respond(thread, threadResult("thread-1"))
 				turn := peer.expectRequest("turn/start")
 				peer.respond(turn, turnResult("turn-1"))
-				peer.notify("turn/completed", completedParams("thread-1", "turn-1", test.status, test.errorText))
+				method := "turn/completed"
+				params := completedParamsWithErrorInfo("thread-1", "turn-1", test.status, test.errorText, test.errorInfo)
+				if test.taskComplete {
+					method = "task_complete"
+					params = taskCompleteParams("turn-1", test.errorText, test.errorInfo)
+				}
+				peer.notify(method, params)
 			})
 
 			session := startFakeCodexSession(t, engine.SessionOpts{})
@@ -378,6 +402,9 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 			for _, event := range got {
 				if event.Type == engine.EventTerminalError && test.interrupted && !errors.Is(event.Err, engine.ErrTurnInterrupted) {
 					t.Fatalf("terminal event error = %v, want ErrTurnInterrupted", event.Err)
+				}
+				if event.Type == engine.EventTerminalError && test.overloaded && !errors.Is(event.Err, engine.ErrProviderOverloaded) {
+					t.Fatalf("terminal event error = %v, want ErrProviderOverloaded", event.Err)
 				}
 			}
 			if resultText(got) != "" {
@@ -839,15 +866,35 @@ func turnResult(id string) map[string]any {
 }
 
 func completedParams(threadID, turnID, status, errorText string) map[string]any {
+	return completedParamsWithErrorInfo(threadID, turnID, status, errorText, "")
+}
+
+func completedParamsWithErrorInfo(threadID, turnID, status, errorText, errorInfo string) map[string]any {
 	turn := map[string]any{
 		"id":     turnID,
 		"items":  []any{},
 		"status": status,
 	}
 	if errorText != "" {
-		turn["error"] = map[string]any{"message": errorText}
+		err := map[string]any{"message": errorText}
+		if errorInfo != "" {
+			err["codex_error_info"] = errorInfo
+		}
+		turn["error"] = err
 	}
 	return map[string]any{"threadId": threadID, "turn": turn}
+}
+
+func taskCompleteParams(turnID, errorText, errorInfo string) map[string]any {
+	err := map[string]any{"message": errorText}
+	if errorInfo != "" {
+		err["codex_error_info"] = errorInfo
+	}
+	return map[string]any{
+		"turn_id":            turnID,
+		"last_agent_message": nil,
+		"error":              err,
+	}
 }
 
 func itemParams(threadID, turnID string, item map[string]any) map[string]any {

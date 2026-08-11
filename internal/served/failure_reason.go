@@ -81,6 +81,9 @@ func classifyTerminalFailure(origin terminalFailureOrigin, err error, agentbusRe
 		if errors.Is(err, context.Canceled) || errors.Is(err, engine.ErrTurnInterrupted) {
 			return engine.FailureClassBackendInterrupted
 		}
+		if errors.Is(err, engine.ErrProviderOverloaded) {
+			return engine.FailureClassProviderOverloaded
+		}
 		return engine.FailureClassBackendError
 	default:
 		return engine.FailureClassInternalError
