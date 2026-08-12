@@ -2956,7 +2956,7 @@ func (s *Server) abortUndeliveredRun(run jobRun, state engine.JobState) {
 	}
 }
 
-func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backend string, tags map[string]string, policy *engine.TurnPolicy, resolved *engine.ContractSpec, foreground bool) error {
+func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backend string, tags map[string]string, policy *engine.TurnPolicy, resolved *engine.ContractSpec, timeout *engine.TimeoutResolution, foreground bool) error {
 	logPaths, err := ensureLogFiles(store, jobID)
 	if err != nil {
 		return err
@@ -2972,6 +2972,7 @@ func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backe
 		JobID:            jobID,
 		SessionID:        sessionID,
 		Backend:          backend,
+		Timeout:          engine.CloneTimeoutResolution(timeout),
 		Foreground:       foreground,
 		State:            engine.StateQueued,
 		Tags:             cloneTags(tags),
@@ -3370,21 +3371,32 @@ func backendError(err error) *protocol.ErrorObject {
 	return protocol.NewError(protocol.ErrorBackendUnavailable, err.Error(), protocol.ErrorData{})
 }
 
-func timeoutFromMillis(ms *int64) (time.Duration, *protocol.ErrorObject) {
+func timeoutFromMillis(ms *int64) (time.Duration, *engine.TimeoutResolution, *protocol.ErrorObject) {
 	if ms == nil {
-		return protocol.DefaultTimeout, nil
+		return protocol.DefaultTimeout, &engine.TimeoutResolution{
+			Effective: protocol.DefaultTimeout.Milliseconds(),
+			Source:    engine.TimeoutSourceDaemonDefault,
+		}, nil
 	}
 	if *ms < 0 {
-		return 0, protocol.NewError(protocol.ErrorInvalidTaskSpec, "timeoutMs cannot be negative", protocol.ErrorData{})
+		return 0, nil, protocol.NewError(protocol.ErrorInvalidTaskSpec, "timeoutMs cannot be negative", protocol.ErrorData{})
 	}
 	if *ms == 0 {
-		return 0, nil
+		return 0, &engine.TimeoutResolution{
+			Requested: ms,
+			Effective: 0,
+			Source:    engine.TimeoutSourceClient,
+		}, nil
+	}
+	if *ms > protocol.MaxTimeout.Milliseconds() {
+		return 0, nil, protocol.NewError(protocol.ErrorInvalidTaskSpec, "timeoutMs exceeds maximum", protocol.ErrorData{})
 	}
 	d := time.Duration(*ms) * time.Millisecond
-	if d > protocol.MaxTimeout {
-		return 0, protocol.NewError(protocol.ErrorInvalidTaskSpec, "timeoutMs exceeds maximum", protocol.ErrorData{})
-	}
-	return d, nil
+	return d, &engine.TimeoutResolution{
+		Requested: ms,
+		Effective: d.Milliseconds(),
+		Source:    engine.TimeoutSourceClient,
+	}, nil
 }
 
 func validateTaskSpecEnvelope(raw json.RawMessage) *protocol.ErrorObject {

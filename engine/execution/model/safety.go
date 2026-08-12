@@ -265,6 +265,7 @@ type SafetyRecord struct {
 	Outcome            *OutcomeFact
 	Result             *ResultCertificate
 	Terminal           *TerminalCertificate
+	Timeout            *engine.TimeoutResolution `json:"timeout,omitempty"`
 	// FinalAttemptStartedAt is the start of the final contract attempt, not
 	// whole-job elapsed time. A retry replaces this value with its own start.
 	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
@@ -308,6 +309,9 @@ func (record SafetyRecord) Validate() error {
 	}
 	if err := record.validateOptionalFacts(); err != nil {
 		return err
+	}
+	if record.Timeout != nil && !record.Timeout.Valid() {
+		return invalid("timeout", "is invalid")
 	}
 	if err := ValidateFinalAttemptTiming(record.FinalAttemptStartedAt, record.FinalAttemptEndedAt); err != nil {
 		return err

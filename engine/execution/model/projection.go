@@ -27,6 +27,7 @@ type JobProjection struct {
 	Public        PublicState
 	TerminalCause TerminalCause
 	SessionID     string
+	Timeout       *engine.TimeoutResolution `json:"timeout,omitempty"`
 	// FinalAttemptStartedAt is the start of the final contract attempt, not
 	// whole-job elapsed time. A retry replaces this value with its own start.
 	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
@@ -66,6 +67,7 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 		Public:                public,
 		TerminalCause:         projectTerminalCause(record),
 		SessionID:             metadata.SessionID,
+		Timeout:               engine.CloneTimeoutResolution(record.Timeout),
 		FinalAttemptStartedAt: finalAttemptStartedAt,
 		FinalAttemptEndedAt:   finalAttemptEndedAt,
 		FailureReason:         failureReason,

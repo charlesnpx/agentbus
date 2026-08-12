@@ -100,6 +100,7 @@ type AcceptRequest struct {
 	TaskIdentity       model.TaskIdentity
 	Mode               model.Mode
 	SessionID          string
+	Timeout            *engine.TimeoutResolution
 }
 
 type AcceptResult struct {
@@ -436,6 +437,9 @@ func normalizeAcceptRequest(request AcceptRequest) (AcceptRequest, error) {
 	if err := ValidateSessionID(request.SessionID); err != nil {
 		return AcceptRequest{}, fmt.Errorf("%w: projection metadata: %v", ErrInvalidRequest, err)
 	}
+	if request.Timeout != nil && !request.Timeout.Valid() {
+		return AcceptRequest{}, fmt.Errorf("%w: timeout is invalid", ErrInvalidRequest)
+	}
 	if _, err := model.Project(model.SafetyRecord{
 		SchemaVersion:      safetySchemaVersion,
 		Revision:           1,
@@ -482,6 +486,7 @@ func acceptTx(tx repository.WriteTx, request AcceptRequest, boot model.BootRef) 
 		WorkspaceLayoutKey: request.WorkspaceLayoutKey,
 		TaskIdentity:       request.TaskIdentity,
 		Mode:               request.Mode,
+		Timeout:            engine.CloneTimeoutResolution(request.Timeout),
 		AdmittedBy:         boot,
 		Attempt: model.AttemptProof{
 			Ref: model.AttemptRef{JobID: jobID, AttemptID: attemptID, Epoch: 1},

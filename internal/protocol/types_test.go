@@ -76,6 +76,40 @@ func TestJobSubmitRequestIdentityFieldsAreAdditive(t *testing.T) {
 	}
 }
 
+func TestJobTimeoutResolutionFieldsAreAdditive(t *testing.T) {
+	requested := int64(45_000)
+	timeout := &engine.TimeoutResolution{
+		Requested: &requested,
+		Effective: requested,
+		Source:    engine.TimeoutSourceClient,
+	}
+	for name, value := range map[string]any{
+		"submit": JobSubmitResult{JobID: "job-1", State: engine.StateQueued, Timeout: timeout},
+		"status": JobStatus{JobID: "job-1", State: engine.StateCompleted, Timeout: timeout},
+		"result": JobResult{JobID: "job-1", State: engine.StateCompleted, Timeout: timeout},
+	} {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("%s marshal: %v", name, err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Fatalf("%s decode fields: %v", name, err)
+		}
+		timeoutRaw, ok := fields["timeout"]
+		if !ok {
+			t.Fatalf("%s JSON = %s, missing timeout", name, raw)
+		}
+		var got engine.TimeoutResolution
+		if err := json.Unmarshal(timeoutRaw, &got); err != nil {
+			t.Fatalf("%s decode timeout: %v", name, err)
+		}
+		if got.Requested == nil || *got.Requested != requested || got.Effective != requested || got.Source != engine.TimeoutSourceClient {
+			t.Fatalf("%s timeout = %+v, want requested/effective/source client", name, got)
+		}
+	}
+}
+
 func TestJobStatusAndResultCleanupDispositionFieldsAreAdditive(t *testing.T) {
 	status, err := json.Marshal(JobStatus{JobID: "job-1", State: engine.StateCompleted, CleanupDisposition: "verified_absent"})
 	if err != nil {
