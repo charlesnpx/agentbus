@@ -338,11 +338,85 @@ func TestInspectAdmissionRootReportsBusyRoot(t *testing.T) {
 	if !errors.Is(err, bolt.ErrTimeout) {
 		t.Fatalf("inspect busy root error = %v, want bolt.ErrTimeout", err)
 	}
-	for _, want := range []string{"another process", "running daemon", "stop the daemon"} {
+	for _, want := range []string{"could not be opened because it is held under an exclusive lock", "lock holder liveness is unknown", "inspection is offline-only", "if an agentbus daemon holds the database", "agentbus status", "agentbus result", "stop it"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("inspect busy root error = %q, want guidance containing %q", err, want)
 		}
 	}
+	if strings.Contains(err.Error(), "agentbus.pid names a live process") {
+		t.Fatalf("inspect busy root error = %q, must not identify an unknown lock holder as the daemon", err)
+	}
+}
+
+func TestInspectAdmissionRootReportsLivePIDEvidenceForBusyRoot(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, err := bboltrepo.Create(filepath.Join(root, AdmissionRepositoryFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := os.WriteFile(filepath.Join(root, admissionDaemonPIDFile), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldTimeout := adminOpenTimeout
+	adminOpenTimeout = 20 * time.Millisecond
+	defer func() { adminOpenTimeout = oldTimeout }()
+
+	_, err = InspectAdmissionRoot(ctx, root)
+	if !errors.Is(err, ErrRootBusy) || !errors.Is(err, bolt.ErrTimeout) {
+		t.Fatalf("inspect busy live-pid root error = %v, want ErrRootBusy and bolt.ErrTimeout", err)
+	}
+	for _, want := range []string{"could not be opened because it is held under an exclusive lock", "agentbus.pid names a live process", "pid " + strconv.Itoa(os.Getpid()), "inspection is offline-only", "if that process is the agentbus daemon holding the database", "agentbus status", "agentbus result", "stop it"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("inspect busy live-pid root error = %q, want guidance containing %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "the daemon is running") {
+		t.Fatalf("inspect busy live-pid root error = %q, must not identify an unverified lock holder as the daemon", err)
+	}
+}
+
+func TestInspectAdmissionRootKeepsMissingRootAndAnchorDiagnostics(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("missing root", func(t *testing.T) {
+		_, err := InspectAdmissionRoot(ctx, filepath.Join(t.TempDir(), "missing"))
+		if !errors.Is(err, os.ErrNotExist) || errors.Is(err, ErrRootBusy) {
+			t.Fatalf("inspect missing root error = %v, want not-exist without ErrRootBusy", err)
+		}
+	})
+
+	t.Run("absent anchor", func(t *testing.T) {
+		root := t.TempDir()
+		repo, _ := beginBboltAdmissionRoot(t, root, "inspect-absent-anchor")
+		if err := repo.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(root, AdmissionAnchorFile)); err != nil {
+			t.Fatal(err)
+		}
+		_, err := InspectAdmissionRoot(ctx, root)
+		if !errors.Is(err, ErrAnchorInvariant) || errors.Is(err, ErrRootBusy) || !strings.Contains(err.Error(), "anchor is missing") {
+			t.Fatalf("inspect absent anchor error = %v, want anchor invariant without ErrRootBusy", err)
+		}
+	})
+
+	t.Run("malformed anchor", func(t *testing.T) {
+		root := t.TempDir()
+		repo, _ := beginBboltAdmissionRoot(t, root, "inspect-malformed-anchor")
+		if err := repo.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, AdmissionAnchorFile), []byte("not json\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := InspectAdmissionRoot(ctx, root)
+		if !errors.Is(err, ErrAnchorInvariant) || errors.Is(err, ErrRootBusy) || !strings.Contains(err.Error(), "anchor is corrupt") {
+			t.Fatalf("inspect malformed anchor error = %v, want anchor invariant without ErrRootBusy", err)
+		}
+	})
 }
 
 func TestAdmissionInspectAndSeal(t *testing.T) {

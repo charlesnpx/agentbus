@@ -83,6 +83,12 @@ from that cache.
 `agentbus serve` starts it in the background. `AGENTBUS_STATE_ROOT` may be set
 to isolate daemon state for tests or local development.
 
+Admission administration is offline-only for its state root: do not run
+`agentbus admission inspect`, `recover`, or the other admission administrative
+commands while that root's daemon is running. Use `agentbus status` or
+`agentbus result` for live job state, or stop the daemon before offline
+authority inspection.
+
 Codex backend jobs use a private `CODEX_HOME` at
 `<state-root>/workspaces/<workspace-hash>/codex/<job-id>/`, with only
 `auth.json` and `config.toml` symlinked from `${CODEX_HOME:-~/.codex}`. This

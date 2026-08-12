@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	bboltrepo "github.com/charlesnpx/agentbus/engine/execution/storage/bbolt"
@@ -18,8 +20,11 @@ import (
 )
 
 const (
-	AdmissionRepositoryFile = "admission.bbolt"
-	AdmissionAnchorFile     = "admission-anchor.json"
+	AdmissionRepositoryFile        = "admission.bbolt"
+	AdmissionAnchorFile            = "admission-anchor.json"
+	admissionDaemonPIDFile         = "agentbus.pid"
+	maxAdmissionDaemonPIDFileBytes = 64
+	admissionDaemonPIDReadTimeout  = 100 * time.Millisecond
 )
 
 var adminOpenTimeout = 10 * time.Second
@@ -56,6 +61,33 @@ type RootInspection struct {
 	AnchorPhase         string                        `json:"anchorPhase,omitempty"`
 	FailStopped         bool                          `json:"failStopped"`
 	FailStopReason      string                        `json:"failStopReason,omitempty"`
+}
+
+type admissionInspectionBusyError struct {
+	RepositoryPath string
+	DaemonPID      int
+	Cause          error
+}
+
+func (e admissionInspectionBusyError) Error() string {
+	message := fmt.Sprintf("%s: admission database at %s could not be opened because it is held under an exclusive lock", ErrRootBusy, e.RepositoryPath)
+	if e.DaemonPID > 0 {
+		message += fmt.Sprintf("; %s names a live process (pid %d); inspection is offline-only: if that process is the agentbus daemon holding the database, query it with `agentbus status` or `agentbus result` for job state, or stop it before running `agentbus admission inspect`", admissionDaemonPIDFile, e.DaemonPID)
+	} else {
+		message += "; lock holder liveness is unknown; inspection is offline-only: if an agentbus daemon holds the database, query it with `agentbus status` or `agentbus result` for job state, or stop it before running `agentbus admission inspect`"
+	}
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e admissionInspectionBusyError) Is(target error) bool {
+	return target == ErrRootBusy
+}
+
+func (e admissionInspectionBusyError) Unwrap() error {
+	return e.Cause
 }
 
 type RootNotEmptyError struct {
@@ -492,7 +524,11 @@ func openReadOnlyAdmissionRepository(ctx context.Context, stateRoot string) (*bb
 	repo, err := bboltrepo.OpenExistingReadOnly(repoPath, &bolt.Options{Timeout: adminOpenTimeout})
 	if err != nil {
 		if errors.Is(err, bolt.ErrTimeout) {
-			return nil, fmt.Errorf("%w: another process (normally the running daemon) holds the admission store at %s; stop the daemon before retrying this offline authority operation: %w", ErrRootBusy, repoPath, err)
+			return nil, admissionInspectionBusyError{
+				RepositoryPath: repoPath,
+				DaemonPID:      liveAdmissionDaemonPID(stateRoot),
+				Cause:          err,
+			}
 		}
 		return nil, err
 	}
@@ -501,6 +537,56 @@ func openReadOnlyAdmissionRepository(ctx context.Context, stateRoot string) (*bb
 		return nil, err
 	}
 	return repo, nil
+}
+
+// liveAdmissionDaemonPID returns a PID only when the state root's existing
+// pid file is a small regular file and names a process the host can still
+// observe as alive. The pid file does not include an identity token, so it
+// cannot independently establish that process owns the database; failures,
+// unsafe files, and stale entries leave the lock holder unidentified.
+func liveAdmissionDaemonPID(stateRoot string) int {
+	pidPath := filepath.Join(stateRoot, admissionDaemonPIDFile)
+	raw, ok := readAdmissionDaemonPIDFile(pidPath)
+	if !ok {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	_, alive, err := (engine.NativeProcessTable{}).Lookup(pid)
+	if err != nil || !alive {
+		return 0
+	}
+	return pid
+}
+
+func readAdmissionDaemonPIDFile(path string) ([]byte, bool) {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > maxAdmissionDaemonPIDFileBytes {
+		return nil, false
+	}
+	read := make(chan admissionDaemonPIDReadResult, 1)
+	go func() {
+		raw, err := readSmallRegularAdmissionDaemonPIDFile(path)
+		if err != nil || len(raw) > maxAdmissionDaemonPIDFileBytes {
+			read <- admissionDaemonPIDReadResult{}
+			return
+		}
+		read <- admissionDaemonPIDReadResult{raw: raw, ok: true}
+	}()
+
+	select {
+	case result := <-read:
+		return result.raw, result.ok
+	case <-time.After(admissionDaemonPIDReadTimeout):
+		return nil, false
+	}
+}
+
+type admissionDaemonPIDReadResult struct {
+	raw []byte
+	ok  bool
 }
 
 func openWritableAdmissionRepository(ctx context.Context, stateRoot string) (*bboltrepo.Repository, error) {

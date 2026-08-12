@@ -1141,6 +1141,7 @@ func printAdmissionHelp(out io.Writer) {
   agentbus admission clear-fail-stop --state-root <path> --acknowledge-unsafe-diagnosis [--json]
 
 Admission administration:
+  All admission commands are offline-only for their state root. For a running daemon, use status/result for job state; stop the daemon before inspection or administration.
   inspect:          read activation metadata, contract version, counts, domain UUID, and sealed flag; never mutates
   recover:          requires strict support; reconciles durable nonterminal obligations without opening a listener
   reset-empty-root: reinitializes only when jobs, bindings, tombstones, launch records, and recovery obligations are all zero
