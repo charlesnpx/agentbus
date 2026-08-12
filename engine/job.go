@@ -38,10 +38,9 @@ const (
 	// FailureClassBackendNotStarted means agentbus could not admit or launch the
 	// backend turn, so no backend work was possible.
 	FailureClassBackendNotStarted FailureClass = "backend_not_started"
-	// FailureClassProviderOverloaded means the provider refused the turn for
-	// capacity or overload reasons. The adapter emits it only when its terminal
-	// protocol evidence is a well-formed agent-message-only inventory and it
-	// observed no tool work; it is a conservative retry classification.
+	// FailureClassProviderOverloaded means the provider reported a capacity or
+	// overload refusal. It does not establish whether backend work occurred and
+	// therefore does not by itself license an automatic retry.
 	FailureClassProviderOverloaded FailureClass = "provider_overloaded"
 	// FailureClassBackendError means a launched backend turn returned an error;
 	// it may have performed work before doing so.

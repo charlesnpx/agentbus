@@ -370,6 +370,9 @@ func TestAppServerTaskCompleteUsesLastAgentMessageAsResult(t *testing.T) {
 	if resultRawText(got) != "done" {
 		t.Fatalf("events = %#v, want task_complete last agent message raw result", got)
 	}
+	if session.ID() != "thread-1" {
+		t.Fatalf("session id after task_complete = %q, want thread-1", session.ID())
+	}
 }
 
 func TestAppServerTerminalTurnStatuses(t *testing.T) {
@@ -385,30 +388,30 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 	}{
 		{name: "failed", status: "failed", errorText: "model failed", want: "model failed"},
 		{
-			name:       "structured server overloaded completion with empty inventory",
-			errorText:  "Selected model is at capacity. Please try a different model.",
+			name:       "structured server overloaded completion",
+			errorText:  "provider refused this turn",
 			errorInfo:  "server_overloaded",
-			want:       "Selected model is at capacity. Please try a different model.",
+			want:       "provider refused this turn",
 			overloaded: true,
 		},
 		{
-			name:       "message-only overloaded completion with empty inventory",
+			name:       "message-only overloaded completion",
 			errorText:  "Selected model is at capacity. Please try a different model.",
 			want:       "Selected model is at capacity. Please try a different model.",
 			overloaded: true,
 		},
 		{
-			name:       "overloaded completion with agent-only inventory",
-			errorText:  "Selected model is at capacity. Please try a different model.",
-			errorInfo:  "server_overloaded",
-			want:       "Selected model is at capacity. Please try a different model.",
-			overloaded: true,
+			name:      "different structured code suppresses capacity-message fallback",
+			errorText: "Selected model is at capacity. Please try a different model.",
+			errorInfo: "rate_limited",
+			want:      "Selected model is at capacity. Please try a different model.",
 		},
 		{
-			name:         "task completion without inventory remains backend error",
+			name:         "structured server overloaded task completion",
 			errorText:    "Selected model is at capacity. Please try a different model.",
 			errorInfo:    "server_overloaded",
 			want:         "Selected model is at capacity. Please try a different model.",
+			overloaded:   true,
 			taskComplete: true,
 		},
 		{name: "unrequested interrupted", status: "interrupted", want: "interrupted", interrupted: true},
@@ -423,11 +426,7 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 				turn := peer.expectRequest("turn/start")
 				peer.respond(turn, turnResult("turn-1"))
 				method := "turn/completed"
-				items := []any{}
-				if test.name == "overloaded completion with agent-only inventory" {
-					items = []any{map[string]any{"id": "agent-1", "type": "agentMessage", "text": "could not finish"}}
-				}
-				params := completedParamsWithItemsAndErrorInfo("thread-1", "turn-1", test.status, test.errorText, test.errorInfo, items)
+				params := completedParamsWithErrorInfo("thread-1", "turn-1", test.status, test.errorText, test.errorInfo)
 				if test.taskComplete {
 					method = "task_complete"
 					params = taskCompleteParams("turn-1", test.errorText, test.errorInfo)
@@ -462,61 +461,43 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 	}
 }
 
-func TestAppServerProviderOverloadFallsBackAfterToolWorkEvidence(t *testing.T) {
+func TestAppServerProviderOverloadIgnoresTerminalItemInventory(t *testing.T) {
 	const capacityMessage = "Selected model is at capacity. Please try a different model."
 	tests := []struct {
 		name          string
 		notifyItems   []map[string]any
-		terminalItems []any
+		configureTurn func(map[string]any)
 	}{
 		{
-			name: "started and completed tool items",
+			name: "items absent",
+			configureTurn: func(turn map[string]any) {
+				delete(turn, "items")
+			},
+		},
+		{
+			name: "items empty",
+		},
+		{
+			name: "items null",
+			configureTurn: func(turn map[string]any) {
+				turn["items"] = nil
+			},
+		},
+		{
+			name: "unknown and malformed terminal items",
+			configureTurn: func(turn map[string]any) {
+				turn["items"] = []any{
+					map[string]any{"id": "unknown-1", "type": "newItemKind"},
+					map[string]any{"type": "agentMessage"},
+					"not an item object",
+				}
+			},
+		},
+		{
+			name: "observed tool notification",
 			notifyItems: []map[string]any{
 				{"id": "command-1", "type": "commandExecution", "command": "echo wrote"},
 				{"id": "file-1", "type": "fileChange", "changes": "wrote a file"},
-			},
-		},
-		{
-			name: "terminal tool item",
-			terminalItems: []any{
-				map[string]any{"id": "mcp-1", "type": "mcpToolCall", "tool": "mutate"},
-				map[string]any{"id": "dynamic-1", "type": "dynamicToolCall", "tool": "mutate"},
-			},
-		},
-		{
-			name: "terminal unknown item",
-			terminalItems: []any{
-				map[string]any{"id": "unknown-1", "type": "newItemKind"},
-			},
-		},
-		{
-			name: "terminal agent message without identity or content",
-			terminalItems: []any{
-				map[string]any{"type": "agentMessage"},
-			},
-		},
-		{
-			name: "terminal assistant message alias without identity or content",
-			terminalItems: []any{
-				map[string]any{"type": "assistantMessage"},
-			},
-		},
-		{
-			name: "terminal message alias without identity or content",
-			terminalItems: []any{
-				map[string]any{"type": "message"},
-			},
-		},
-		{
-			name: "terminal agent message with wrong identity and content types",
-			terminalItems: []any{
-				map[string]any{"id": 1, "type": "agentMessage", "text": []any{"not text"}},
-			},
-		},
-		{
-			name: "terminal non-object item",
-			terminalItems: []any{
-				"agentMessage",
 			},
 		},
 	}
@@ -536,7 +517,15 @@ func TestAppServerProviderOverloadFallsBackAfterToolWorkEvidence(t *testing.T) {
 					}
 					peer.notify(method, itemParams("thread-1", "turn-1", item))
 				}
-				peer.notify("turn/completed", completedParamsWithItemsAndErrorInfo("thread-1", "turn-1", "failed", capacityMessage, "server_overloaded", test.terminalItems))
+				params := completedParamsWithErrorInfo("thread-1", "turn-1", "failed", capacityMessage, "server_overloaded")
+				if test.configureTurn != nil {
+					turn, ok := params["turn"].(map[string]any)
+					if !ok {
+						t.Fatal("completed params missing turn")
+					}
+					test.configureTurn(turn)
+				}
+				peer.notify("turn/completed", params)
 			})
 
 			session := startFakeCodexSession(t, engine.SessionOpts{})
@@ -549,8 +538,8 @@ func TestAppServerProviderOverloadFallsBackAfterToolWorkEvidence(t *testing.T) {
 				t.Fatalf("events = %#v, want terminal error containing %q", got, capacityMessage)
 			}
 			for _, event := range got {
-				if event.Type == engine.EventTerminalError && errors.Is(event.Err, engine.ErrProviderOverloaded) {
-					t.Fatalf("terminal event error = %v, did not want ErrProviderOverloaded after tool-work evidence", event.Err)
+				if event.Type == engine.EventTerminalError && !errors.Is(event.Err, engine.ErrProviderOverloaded) {
+					t.Fatalf("terminal event error = %v, want ErrProviderOverloaded", event.Err)
 				}
 			}
 		})
@@ -1013,13 +1002,9 @@ func completedParams(threadID, turnID, status, errorText string) map[string]any 
 }
 
 func completedParamsWithErrorInfo(threadID, turnID, status, errorText, errorInfo string) map[string]any {
-	return completedParamsWithItemsAndErrorInfo(threadID, turnID, status, errorText, errorInfo, []any{})
-}
-
-func completedParamsWithItemsAndErrorInfo(threadID, turnID, status, errorText, errorInfo string, items []any) map[string]any {
 	turn := map[string]any{
 		"id":     turnID,
-		"items":  items,
+		"items":  []any{},
 		"status": status,
 	}
 	if errorText != "" {
