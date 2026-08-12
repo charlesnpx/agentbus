@@ -324,8 +324,13 @@ type activeJob struct {
 	cancellation                    terminalCancellation
 	admissionCommand                command.RunningCommand
 	containmentIntent               *launch.ContainmentIntent
-	observedWorkspaceWriteItemCount atomic.Uint64
-	observedWorkspaceWriteAttempt   atomic.Uint32
+	observedWorkspaceWriteItemCount uint64
+	observedWorkspaceWriteAttempt   model.LaunchOrdinal
+	// These hooks only coordinate deterministic activeJob tests around the pair's
+	// synchronization boundary. The reset hook runs while mu is held; the
+	// snapshot hook runs immediately before it is acquired.
+	observedWorkspaceWriteAfterCountResetForTest        func()
+	observedWorkspaceWriteBeforeTerminalSnapshotForTest func()
 }
 
 type nativeInterruptSession interface {
@@ -367,34 +372,43 @@ func (j *activeJob) observeWorkspaceWriteItem() uint64 {
 	if j == nil {
 		return 1
 	}
-	for {
-		current := j.observedWorkspaceWriteItemCount.Load()
-		if current == ^uint64(0) {
-			return current
-		}
-		if j.observedWorkspaceWriteItemCount.CompareAndSwap(current, current+1) {
-			return current + 1
-		}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.observedWorkspaceWriteItemCount == ^uint64(0) {
+		return j.observedWorkspaceWriteItemCount
 	}
+	j.observedWorkspaceWriteItemCount++
+	return j.observedWorkspaceWriteItemCount
 }
 
 func (j *activeJob) beginObservedWorkspaceWriteAttempt(ordinal model.LaunchOrdinal) {
 	if j == nil {
 		return
 	}
-	j.observedWorkspaceWriteItemCount.Store(0)
-	j.observedWorkspaceWriteAttempt.Store(uint32(ordinal))
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.observedWorkspaceWriteItemCount = 0
+	if j.observedWorkspaceWriteAfterCountResetForTest != nil {
+		j.observedWorkspaceWriteAfterCountResetForTest()
+	}
+	j.observedWorkspaceWriteAttempt = ordinal
 }
 
 func (j *activeJob) observedWorkspaceWriteItemCountForTerminal() (uint64, model.LaunchOrdinal) {
 	if j == nil {
 		return 0, 0
 	}
-	ordinal := model.LaunchOrdinal(j.observedWorkspaceWriteAttempt.Load())
-	if !ordinal.Valid() {
+	if j.observedWorkspaceWriteBeforeTerminalSnapshotForTest != nil {
+		j.observedWorkspaceWriteBeforeTerminalSnapshotForTest()
+	}
+	j.mu.Lock()
+	if !j.observedWorkspaceWriteAttempt.Valid() {
+		j.mu.Unlock()
 		return 0, 0
 	}
-	return j.observedWorkspaceWriteItemCount.Load(), ordinal
+	count, ordinal := j.observedWorkspaceWriteItemCount, j.observedWorkspaceWriteAttempt
+	j.mu.Unlock()
+	return count, ordinal
 }
 
 func activeObservedWorkspaceWriteItemCount(job *activeJob) (uint64, model.LaunchOrdinal) {

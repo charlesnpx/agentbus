@@ -7455,6 +7455,48 @@ func TestCorrectiveRetryReplacesObservedWorkspaceWriteItemCount(t *testing.T) {
 	}
 }
 
+func TestObservedWorkspaceWriteAttemptSnapshotIsAtomic(t *testing.T) {
+	active := &activeJob{
+		observedWorkspaceWriteItemCount: 7,
+		observedWorkspaceWriteAttempt:   model.LaunchOrdinalOne,
+	}
+	resetReached := make(chan struct{})
+	allowOrdinalStore := make(chan struct{})
+	active.observedWorkspaceWriteAfterCountResetForTest = func() {
+		close(resetReached)
+		<-allowOrdinalStore
+	}
+
+	beginDone := make(chan struct{})
+	go func() {
+		active.beginObservedWorkspaceWriteAttempt(model.LaunchOrdinalTwo)
+		close(beginDone)
+	}()
+	<-resetReached
+
+	type snapshot struct {
+		count   uint64
+		ordinal model.LaunchOrdinal
+	}
+	snapshots := make(chan snapshot, 1)
+	snapshotStarted := make(chan struct{})
+	active.observedWorkspaceWriteBeforeTerminalSnapshotForTest = func() {
+		close(snapshotStarted)
+	}
+	go func() {
+		count, ordinal := active.observedWorkspaceWriteItemCountForTerminal()
+		snapshots <- snapshot{count: count, ordinal: ordinal}
+	}()
+	<-snapshotStarted
+
+	close(allowOrdinalStore)
+	<-beginDone
+	got := <-snapshots
+	if got.count != 0 || got.ordinal != model.LaunchOrdinalTwo {
+		t.Fatalf("snapshot = (%d, %s), want (0, %s)", got.count, got.ordinal, model.LaunchOrdinalTwo)
+	}
+}
+
 func TestRemovedAndUnknownMethodsReturnMethodNotFound(t *testing.T) {
 	t.Parallel()
 	for _, method := range []string{
