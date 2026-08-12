@@ -2379,11 +2379,12 @@ type jobRun struct {
 	timeout                 time.Duration
 	codexIsolated           bool
 	codexHome               string
-	managedCodexHome        bool
+	managedCodexHome        *managedCodexHome
 	active                  *activeJob
 	onDone                  func()
 	authoritativeCompletion bool
 	admissionControlled     bool
+	admissionLaunchFailed   bool
 	admissionMode           model.Mode
 	admissionAccepted       authority.AcceptResult
 	admissionLaunch         admissionLaunchBinding
@@ -2392,6 +2393,7 @@ type jobRun struct {
 func (s *Server) runJob(ctx context.Context, run jobRun) {
 	run.authoritativeCompletion = true
 	defer s.removeActiveJob(run.jobID)
+	defer s.cleanupManagedCodexHomeForAdmissionRun(run)
 	defer func() {
 		if run.onDone != nil {
 			run.onDone()

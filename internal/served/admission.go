@@ -2514,22 +2514,71 @@ func (s *Server) launchAdmittedJob(ctx context.Context, run jobRun) {
 		var ok bool
 		var launchErr error
 		launched, runCtx, ok, launchErr = s.prepareAdmittedJobLaunch(ctx, run)
+		if launchErr != nil {
+			return launchErr
+		}
 		if !ok {
 			return nil
 		}
-		return launchErr
+		return nil
 	})
 	if err != nil {
 		// prepareAdmittedJobLaunch only reads admission state, prepares the
 		// accepted job's Codex session when needed, and registers the active job;
 		// it does not call LaunchRunner or start a backend turn.
-		s.completeRunFailure(run, engine.StateFailed, "", nil, terminalFailureBackendNotStarted, err)
+		if launched.active == nil {
+			launched.admissionLaunchFailed = true
+			s.finalizeAdmittedLaunchFailure(launched, err)
+		} else {
+			s.completeRunFailure(launched, engine.StateFailed, "", nil, terminalFailureBackendNotStarted, err)
+		}
 		return
 	}
 	if launched.active == nil {
 		return
 	}
 	s.runJob(runCtx, launched)
+}
+
+func (s *Server) finalizeAdmittedLaunchFailure(run jobRun, cause error) {
+	jobID, err := model.NewJobID(run.jobID)
+	if err != nil {
+		s.handleRunFinalizationError(run, err)
+		return
+	}
+	err = s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
+		snapshot, err := coord.Snapshot(context.Background(), jobID)
+		if err != nil {
+			return err
+		}
+		if snapshot.Record.Terminal != nil || snapshot.Record.Cancel != nil {
+			return nil
+		}
+		if err := coord.Finalize(context.Background(), jobID, model.TerminalIntent{
+			Outcome: model.OutcomeFailed,
+			Cause:   model.CauseDaemonRestartedBeforeAuthorization,
+		}); err != nil {
+			if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		s.handleRunFinalizationError(run, err)
+		return
+	}
+	if err := s.recordFailureMetadata(run, terminalFailureFor(terminalFailureBackendNotStarted, cause, false)); err != nil {
+		log.Printf("agentbus daemon: job %s preparation failure metadata persistence failed: %v", run.jobID, err)
+	}
+	if err := s.cleanupAdmittedCodexHomeFromCommittedTerminal(run); err != nil {
+		s.handleRunFinalizationError(run, err)
+	}
+}
+
+func (s *Server) cleanupAdmittedCodexHomeFromCommittedTerminal(run jobRun) error {
+	s.cleanupManagedCodexHomeForAdmissionRun(run)
+	return nil
 }
 
 func (s *Server) handleAdmissionResponseOutcome(ctx context.Context, run jobRun, delivered bool) {

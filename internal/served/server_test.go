@@ -4385,6 +4385,136 @@ func TestIdentifiedCodexJobRetainsPrivateHomeAfterFailure(t *testing.T) {
 	}
 }
 
+func TestIdentifiedCodexPreparationFailureFinalizesAndRetainsPrivateHome(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("codex")
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	authHome := filepath.Join(t.TempDir(), "operator-codex")
+	if err := os.MkdirAll(filepath.Join(authHome, "auth.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	server.codexAuthHome = authHome
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-codex-preparation-failure",
+		RequestID:    "request-codex-preparation-failure",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "prepare fails"},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeFailed {
+		t.Fatalf("terminal = %+v, want failed", record.Terminal)
+	}
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("Codex backend Start calls = %d, want none after home preparation failure", got)
+	}
+	home := testCodexHomePath(t, root, cwd, job.JobID)
+	if _, err := os.Stat(home); err != nil {
+		t.Fatalf("preparation-failed private Codex home stat = %v, want retained", err)
+	}
+}
+
+func TestIdentifiedCodexHomeCleanupUsesCommittedTerminalOutcome(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		suffix           string
+		events           func(string, bool) []engine.Event
+		attemptOutcome   model.Outcome
+		committedOutcome model.Outcome
+		wantRetained     bool
+	}{
+		{
+			name:             "successful attempt commits failed terminal and retains",
+			suffix:           "success-to-failed",
+			attemptOutcome:   model.OutcomeCompleted,
+			committedOutcome: model.OutcomeFailed,
+			wantRetained:     true,
+		},
+		{
+			name:   "failed attempt commits completed terminal and removes",
+			suffix: "failed-to-success",
+			events: func(string, bool) []engine.Event {
+				return []engine.Event{{Type: engine.EventTerminalError, Text: "attempt failed"}}
+			},
+			attemptOutcome:   model.OutcomeFailed,
+			committedOutcome: model.OutcomeCompleted,
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			backend := newFakeBackend("codex")
+			if tt.events != nil {
+				backend.events = tt.events
+			}
+			server, root, cwd := newUnstartedTestServer(t, backend)
+			server.codexAuthHome = filepath.Join(t.TempDir(), "missing-codex-auth")
+			launcher := newAdmissionFakeLaunchCustodian(t)
+			enableTestAdmission(t, server, launcher)
+			recorder := installRecordingAdmissionAuthorityForTest(t, server)
+
+			var injected sync.Once
+			recorder.beforeRecordOutcome = func(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) error {
+				if outcome != tt.attemptOutcome {
+					return nil
+				}
+				var err error
+				injected.Do(func() {
+					switch tt.committedOutcome {
+					case model.OutcomeFailed:
+						_, err = recorder.servedAdmissionAuthority.RecordOutcome(ctx, jobID, ref, model.OutcomeFailed, nil)
+						if err == nil {
+							_, err = recorder.servedAdmissionAuthority.Finalize(ctx, jobID, ref, model.TerminalIntent{Outcome: model.OutcomeFailed, Cause: model.CauseCompletedNormally})
+						}
+					case model.OutcomeCompleted:
+						_, err = recorder.servedAdmissionAuthority.RecordOutcome(ctx, jobID, ref, model.OutcomeCompleted, nil)
+						if err != nil {
+							return
+						}
+						publisher := servedResultPublisher{server: server}
+						receipt, publishErr := publisher.Publish(ctx, jobID, []byte("committed success"))
+						if publishErr != nil {
+							err = publishErr
+							return
+						}
+						verified, verifyErr := publisher.Verify(ctx, receipt.Result)
+						if verifyErr != nil {
+							err = verifyErr
+							return
+						}
+						_, err = recorder.servedAdmissionAuthority.RecordResult(ctx, jobID, ref, verified)
+						if err == nil {
+							_, err = recorder.servedAdmissionAuthority.Finalize(ctx, jobID, ref, model.TerminalIntent{Outcome: model.OutcomeCompleted, Cause: model.CauseCompletedNormally})
+						}
+					default:
+						err = fmt.Errorf("unsupported committed outcome %s", tt.committedOutcome)
+					}
+				})
+				return err
+			}
+
+			job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+				WorkspaceKey: "workspace-codex-committed-cleanup-" + tt.suffix,
+				RequestID:    "request-codex-committed-cleanup-" + tt.suffix,
+				TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "cleanup follows committed terminal"},
+			})
+			record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+			if record.Terminal == nil || record.Terminal.Outcome != tt.committedOutcome {
+				t.Fatalf("terminal = %+v, want committed %s", record.Terminal, tt.committedOutcome)
+			}
+			waitActiveJobGone(t, server, job.JobID)
+			home := testCodexHomePath(t, root, cwd, job.JobID)
+			_, err := os.Stat(home)
+			if tt.wantRetained && err != nil {
+				t.Fatalf("committed failed Codex home stat = %v, want retained", err)
+			}
+			if !tt.wantRetained && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("committed completed Codex home stat = %v, want removed", err)
+			}
+		})
+	}
+}
+
 func TestIdentifiedCodexHomeOverrideAndInheritanceOptOut(t *testing.T) {
 	for _, tt := range []struct {
 		name        string

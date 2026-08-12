@@ -530,21 +530,53 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 			}
 		}
 		s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
-		s.cleanupManagedCodexHome(run.codexHome, run.managedCodexHome, state)
 		return nil
 	}
 	if err := coord.Complete(context.Background(), jobID, outcome, []byte(text), stamp, nil); err != nil {
 		if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
 			return err
 		}
+		// A different terminal won the commit race. Its committed outcome, not
+		// this attempt's state, owns the private-home cleanup decision below.
 	}
 	s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
-	// A normally completed job has no forensic need for its private home. All
-	// other terminal outcomes intentionally retain it alongside the workspace
-	// artifacts for diagnosis. The directory is a managed per-job path only;
-	// fixed operator overrides are never removed by agentbus.
-	s.cleanupManagedCodexHome(run.codexHome, run.managedCodexHome, state)
 	return nil
+}
+
+func (s *Server) cleanupManagedCodexHomeForAdmissionRun(run jobRun) {
+	if run.managedCodexHome == nil {
+		return
+	}
+	cleanup := func() error {
+		return s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
+			outcome, err := admissionCommittedTerminalOutcome(context.Background(), coord, model.JobID(run.jobID))
+			if err != nil {
+				return err
+			}
+			s.cleanupManagedCodexHome(run.managedCodexHome, outcome)
+			return nil
+		})
+	}
+	var err error
+	if run.admissionLaunchFailed {
+		err = cleanup()
+	} else {
+		err = s.withAdmissionJobEffectErr(run.jobID, cleanup)
+	}
+	if err != nil {
+		log.Printf("agentbus daemon: retain managed Codex home %s: cannot read committed terminal: %v", run.codexHome, err)
+	}
+}
+
+func admissionCommittedTerminalOutcome(ctx context.Context, coord *admissionCoordinator, jobID model.JobID) (model.Outcome, error) {
+	snapshot, err := coord.Snapshot(ctx, jobID)
+	if err != nil {
+		return model.OutcomeNone, err
+	}
+	if err := admissionValidTerminalRecord(snapshot.Record); err != nil {
+		return model.OutcomeNone, err
+	}
+	return snapshot.Record.Terminal.Outcome, nil
 }
 
 func (s *Server) abandonAdmissionUnresolvedCustody(ctx context.Context, coord *admissionCoordinator, jobID model.JobID) {
