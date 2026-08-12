@@ -186,6 +186,9 @@ func ValidateProjectionShape(projection model.JobProjection) error {
 	if projection.TerminalCause != 0 && !projection.TerminalCause.Valid() {
 		return fmt.Errorf("%w: projection.terminal_cause is unknown", ErrInvalidRecord)
 	}
+	if projection.Timeout != nil && !projection.Timeout.Valid() {
+		return fmt.Errorf("%w: projection.timeout is invalid", ErrInvalidRecord)
+	}
 	if err := model.ValidateFinalAttemptTiming(projection.FinalAttemptStartedAt, projection.FinalAttemptEndedAt); err != nil {
 		return fmt.Errorf("%w: projection final attempt timing: %v", ErrInvalidRecord, err)
 	}

@@ -2852,6 +2852,7 @@ func cloneBinding(binding model.Binding) model.Binding {
 
 func cloneProjection(projection model.JobProjection) model.JobProjection {
 	next := projection
+	next.Timeout = engine.CloneTimeoutResolution(projection.Timeout)
 	next.FinalAttemptStartedAt = clonePtr(projection.FinalAttemptStartedAt)
 	next.FinalAttemptEndedAt = clonePtr(projection.FinalAttemptEndedAt)
 	return next
@@ -2873,6 +2874,7 @@ func cloneSafetyRecord(record model.SafetyRecord) model.SafetyRecord {
 	next.Outcome = cloneOutcomeFact(record.Outcome)
 	next.Result = clonePtr(record.Result)
 	next.Terminal = cloneTerminalCertificate(record.Terminal)
+	next.Timeout = engine.CloneTimeoutResolution(record.Timeout)
 	next.FinalAttemptStartedAt = clonePtr(record.FinalAttemptStartedAt)
 	next.FinalAttemptEndedAt = clonePtr(record.FinalAttemptEndedAt)
 	return next

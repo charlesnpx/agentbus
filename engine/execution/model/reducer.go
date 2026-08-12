@@ -1038,6 +1038,7 @@ func cloneSafetyRecord(record SafetyRecord) SafetyRecord {
 	next.Outcome = cloneOutcomeFact(record.Outcome)
 	next.Result = clonePtr(record.Result)
 	next.Terminal = cloneTerminalCertificate(record.Terminal)
+	next.Timeout = engine.CloneTimeoutResolution(record.Timeout)
 	next.FinalAttemptStartedAt = clonePtr(record.FinalAttemptStartedAt)
 	next.FinalAttemptEndedAt = clonePtr(record.FinalAttemptEndedAt)
 	next.TransportFrameDrops = cloneTransportFrameDrops(record.TransportFrameDrops)

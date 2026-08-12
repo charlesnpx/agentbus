@@ -3529,6 +3529,62 @@ func TestIdentifiedFencedSubmitUsesLaunchControllerAndCompletes(t *testing.T) {
 	}
 }
 
+func TestIdentifiedSubmitReportsAndPersistsResolvedTimeout(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name          string
+		timeout       *int64
+		wantRequested *int64
+		wantEffective int64
+		wantSource    string
+	}{
+		{
+			name:          "explicit client timeout",
+			timeout:       int64Pointer(45_000),
+			wantRequested: int64Pointer(45_000),
+			wantEffective: 45_000,
+			wantSource:    engine.TimeoutSourceClient,
+		},
+		{
+			name:          "omitted daemon default",
+			wantEffective: protocol.DefaultTimeout.Milliseconds(),
+			wantSource:    engine.TimeoutSourceDaemonDefault,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			backend := newFakeBackend("fake")
+			server, _, cwd := newUnstartedTestServer(t, backend)
+			enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+
+			submitted := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+				WorkspaceKey: "workspace-timeout-" + strings.ReplaceAll(tt.name, " ", "-"),
+				RequestID:    "request-timeout-" + strings.ReplaceAll(tt.name, " ", "-"),
+				TaskSpec: protocol.TaskSpec{
+					Backend:   "fake",
+					CWD:       cwd,
+					Write:     false,
+					Prompt:    "report timeout",
+					TimeoutMs: tt.timeout,
+				},
+			})
+			assertTimeoutResolution(t, submitted.Timeout, tt.wantRequested, tt.wantEffective, tt.wantSource)
+
+			record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+			assertTimeoutResolution(t, record.Timeout, tt.wantRequested, tt.wantEffective, tt.wantSource)
+
+			status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: submitted.JobID})
+			if len(status.Jobs) != 1 {
+				t.Fatalf("job.status = %+v, want one job", status)
+			}
+			assertTimeoutResolution(t, status.Jobs[0].Timeout, tt.wantRequested, tt.wantEffective, tt.wantSource)
+
+			result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: submitted.JobID})
+			assertTimeoutResolution(t, result.Timeout, tt.wantRequested, tt.wantEffective, tt.wantSource)
+		})
+	}
+}
+
 func TestIdentifiedSubmitRejectsNoControlledRunnerBeforeBackendStart(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -3762,7 +3818,7 @@ func TestIdentifiedFencedJobReadsAuthorityOnlyWithoutJSONFallback(t *testing.T) 
 	if store == nil {
 		t.Fatalf("job store missing for %s", submitted.JobID)
 	}
-	if err := server.createQueuedRecord(store, submitted.JobID, "ses_stale_json", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, submitted.JobID, "ses_stale_json", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	clearAdmissionJobMarkersForTest(t, server)
@@ -3776,7 +3832,7 @@ func TestIdentifiedFencedJobReadsAuthorityOnlyWithoutJSONFallback(t *testing.T) 
 	}
 
 	legacyID := server.nextID("job")
-	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_json", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_json", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	assertJobHandlerError(t, server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{JobID: legacyID})), protocol.ErrorUnknownJob, "", legacyID)
@@ -5108,7 +5164,7 @@ func TestJobCancelUnknownWhenAuthorityCleanlyDisclaims(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacyID := server.nextID("job")
-	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_cancel_authority_down", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_cancel_authority_down", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, ok, errObj := server.authorityJobProjection(legacyID); ok || errObj != nil {
@@ -5153,7 +5209,7 @@ func TestJobCancelFailsClosedWhenAuthorityDegradedWithStaleJSONDuplicate(t *test
 	if store == nil {
 		t.Fatalf("job store missing for %s", submitted.JobID)
 	}
-	if err := server.createQueuedRecord(store, submitted.JobID, projection.SessionID, "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, submitted.JobID, projection.SessionID, "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	server.removeActiveJob(submitted.JobID)
@@ -5193,7 +5249,7 @@ func TestExactReadsReturnTypedFailStopWithoutJSONFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacyID := server.nextID("job")
-	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_json_authority_down", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_json_authority_down", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning} {
@@ -5224,7 +5280,7 @@ func TestExactReadsReturnTypedFailStopWithoutJSONFallback(t *testing.T) {
 	if fencedStore == nil {
 		t.Fatalf("job store missing for %s", fenced.JobID)
 	}
-	if err := server.createQueuedRecord(fencedStore, fenced.JobID, "ses_stale_json_authority_down", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(fencedStore, fenced.JobID, "ses_stale_json_authority_down", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := server.admissionReady.FailStop(context.Background(), "test authority degraded"); err != nil {
@@ -7706,7 +7762,7 @@ func TestHeartbeatRacingCompletionDoesNotResurrectTerminalRecord(t *testing.T) {
 	}
 	jobID := server.nextID("job")
 	contract := &engine.ContractSpec{Shape: json.RawMessage(`{"delegateContract":"report-v1"}`)}
-	if err := server.createQueuedRecord(store, jobID, "ses_race", "fake", nil, &engine.TurnPolicy{Contract: contract}, contract, false); err != nil {
+	if err := server.createQueuedRecord(store, jobID, "ses_race", "fake", nil, &engine.TurnPolicy{Contract: contract}, contract, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := server.transitionRecord(store, jobID, engine.StateStarting); err != nil {
@@ -7761,7 +7817,7 @@ func TestFinalizeCompletedSalvagesOrphanedJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobID := server.nextID("job")
-	if err := server.createQueuedRecord(store, jobID, "ses_salvage", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, jobID, "ses_salvage", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning, engine.StateOrphaned} {
@@ -7794,7 +7850,7 @@ func TestFinalizeCompletedSalvagesReapedJobOnlyWithAuthoritativeCompletion(t *te
 		t.Fatal(err)
 	}
 	jobID := server.nextID("job")
-	if err := server.createQueuedRecord(store, jobID, "ses_reaped", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, jobID, "ses_reaped", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning, engine.StateOrphaned} {
@@ -7900,7 +7956,7 @@ func TestHeartbeatDoesNotBlockOnJobLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobID := server.nextID("job")
-	if err := server.createQueuedRecord(store, jobID, "ses_lock", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, jobID, "ses_lock", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	lockPath := filepath.Join(store.Layout().Jobs, jobID+".lock")
@@ -9667,6 +9723,29 @@ func jobResultViaHandler(t *testing.T, server *Server, params protocol.JobResult
 	return result
 }
 
+func int64Pointer(value int64) *int64 {
+	return &value
+}
+
+func assertTimeoutResolution(t *testing.T, got *engine.TimeoutResolution, wantRequested *int64, wantEffective int64, wantSource string) {
+	t.Helper()
+	if got == nil {
+		t.Fatal("timeout resolution is nil")
+	}
+	if got.Effective != wantEffective || got.Source != wantSource {
+		t.Fatalf("timeout resolution = %+v, want effective=%d source=%q", got, wantEffective, wantSource)
+	}
+	if wantRequested == nil {
+		if got.Requested != nil {
+			t.Fatalf("timeout requested = %d, want omitted", *got.Requested)
+		}
+		return
+	}
+	if got.Requested == nil || *got.Requested != *wantRequested {
+		t.Fatalf("timeout requested = %v, want %d", got.Requested, *wantRequested)
+	}
+}
+
 func jobCancelViaHandler(t *testing.T, server *Server, params protocol.JobCancelParams) protocol.JobCancelResult {
 	t.Helper()
 	outcome := server.handleJobCancel(mustMarshal(t, params))
@@ -9831,7 +9910,7 @@ func newControlledBackgroundRun(t *testing.T) (*Server, jobRun, *controlledSessi
 		t.Fatal(err)
 	}
 	jobID := server.nextID("job")
-	if err := server.createQueuedRecord(store, jobID, "ses_controlled", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, jobID, "ses_controlled", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := server.transitionRecord(store, jobID, engine.StateStarting); err != nil {

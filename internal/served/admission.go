@@ -2205,6 +2205,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 			JobID:        replay.Record.JobID.String(),
 			State:        admissionState(replay.Projection.Public),
 			Deduplicated: true,
+			Timeout:      engine.CloneTimeoutResolution(replay.Projection.Timeout),
 		}}
 	case authority.ReplayExpired:
 		if errObj := strictAdmissionReplayIdentityError(replay.Tombstone.TaskIdentity, rawTaskSpec); errObj != nil {
@@ -2254,7 +2255,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
 		return requestOutcome{err: strictAdmissionInvalidConfigError("taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{Backend: spec.Backend})}
 	}
-	timeout, errObj := timeoutFromMillis(spec.TimeoutMs)
+	timeout, timeoutResolution, errObj := timeoutFromMillis(spec.TimeoutMs)
 	if errObj != nil {
 		return requestOutcome{err: strictAdmissionInvalidConfigError(errObj.Message, protocol.ErrorData{Backend: spec.Backend})}
 	}
@@ -2325,6 +2326,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		TaskIdentity:       taskIdentity,
 		Mode:               model.ModeIdentifiedFenced,
 		SessionID:          admissionSessionID,
+		Timeout:            timeoutResolution,
 	}
 	s.admissionSubmitMu.Lock()
 	if s.admissionInstanceClosing(instance) {
@@ -2356,6 +2358,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 			JobID:        jobID,
 			State:        admissionState(accepted.Projection.Public),
 			Deduplicated: true,
+			Timeout:      engine.CloneTimeoutResolution(accepted.Projection.Timeout),
 		}}
 	}
 	jobModelID := accepted.Record.JobID
@@ -2397,7 +2400,11 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		},
 	}
 	return requestOutcome{
-		result:       protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
+		result: protocol.JobSubmitResult{
+			JobID:   jobID,
+			State:   engine.StateQueued,
+			Timeout: engine.CloneTimeoutResolution(timeoutResolution),
+		},
 		after:        func() { s.handleAdmissionResponseOutcome(ctx, run, true) },
 		onAckFailure: func(error) { s.handleAdmissionResponseOutcome(ctx, run, false) },
 	}
@@ -2814,6 +2821,7 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 		SessionID:             projection.SessionID,
 		State:                 admissionState(projection.Public),
 		CleanupDisposition:    admissionCleanupDisposition(record),
+		Timeout:               engine.CloneTimeoutResolution(projection.Timeout),
 		ModelReported:         reported,
 		FinalAttemptStartedAt: finalAttemptStartedAt,
 		FinalAttemptEndedAt:   finalAttemptEndedAt,
@@ -2901,6 +2909,7 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 		SessionID:             projection.SessionID,
 		State:                 admissionState(projection.Public),
 		CleanupDisposition:    admissionCleanupDisposition(record),
+		Timeout:               engine.CloneTimeoutResolution(projection.Timeout),
 		Result:                result,
 		ModelReported:         reported,
 		Contract:              contract,
@@ -2972,6 +2981,7 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 		SessionID:             projection.SessionID,
 		State:                 admissionState(projection.Public),
 		CleanupDisposition:    admissionCleanupDisposition(image.Safety.Value),
+		Timeout:               engine.CloneTimeoutResolution(projection.Timeout),
 		FinalAttemptStartedAt: finalAttemptStartedAt,
 		FinalAttemptEndedAt:   finalAttemptEndedAt,
 		FailureReason:         failureReason,

@@ -212,11 +212,59 @@ type ResultInfo struct {
 	ModelReported string `json:"modelReported,omitempty"`
 }
 
+const (
+	// TimeoutSourceClient means the effective timeout came from taskSpec.timeoutMs.
+	TimeoutSourceClient = "client"
+	// TimeoutSourceDaemonDefault means the effective timeout came from the daemon default.
+	TimeoutSourceDaemonDefault = "daemon_default"
+)
+
+// TimeoutResolution records the timeout applied to a job in milliseconds.
+// Requested is present only when the client supplied taskSpec.timeoutMs;
+// Effective is the duration used for each runAttempt invocation; Source
+// identifies whether that duration came from the client or the daemon default.
+type TimeoutResolution struct {
+	Requested *int64 `json:"requested,omitempty"`
+	Effective int64  `json:"effective"`
+	Source    string `json:"source"`
+}
+
+// Valid reports whether resolution is either absent in a legacy record or has
+// a complete, internally consistent source shape.
+func (resolution TimeoutResolution) Valid() bool {
+	if resolution.Source == "" {
+		return resolution.Requested == nil && resolution.Effective == 0
+	}
+	switch resolution.Source {
+	case TimeoutSourceClient:
+		return resolution.Requested != nil
+	case TimeoutSourceDaemonDefault:
+		return resolution.Requested == nil
+	default:
+		return false
+	}
+}
+
+// CloneTimeoutResolution returns an independent copy suitable for a durable
+// record or wire response.
+func CloneTimeoutResolution(resolution *TimeoutResolution) *TimeoutResolution {
+	if resolution == nil {
+		return nil
+	}
+	copy := *resolution
+	if resolution.Requested != nil {
+		requested := *resolution.Requested
+		copy.Requested = &requested
+	}
+	return &copy
+}
+
 // JobRecord is the durable job state record stored as JSON.
 type JobRecord struct {
 	JobID                 string               `json:"jobId"`
 	SessionID             string               `json:"sessionId,omitempty"`
 	Backend               string               `json:"backend,omitempty"`
+	Timeout               *TimeoutResolution   `json:"timeout,omitempty"`
 	Foreground            bool                 `json:"foreground,omitempty"`
 	State                 JobState             `json:"state"`
 	Tags                  map[string]string    `json:"tags,omitempty"`
