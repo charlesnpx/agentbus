@@ -530,6 +530,7 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 			}
 		}
 		s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
+		s.cleanupManagedCodexHome(run.codexHome, run.managedCodexHome, state)
 		return nil
 	}
 	if err := coord.Complete(context.Background(), jobID, outcome, []byte(text), stamp, nil); err != nil {
@@ -538,6 +539,11 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		}
 	}
 	s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
+	// A normally completed job has no forensic need for its private home. All
+	// other terminal outcomes intentionally retain it alongside the workspace
+	// artifacts for diagnosis. The directory is a managed per-job path only;
+	// fixed operator overrides are never removed by agentbus.
+	s.cleanupManagedCodexHome(run.codexHome, run.managedCodexHome, state)
 	return nil
 }
 

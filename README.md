@@ -83,6 +83,14 @@ from that cache.
 `agentbus serve` starts it in the background. `AGENTBUS_STATE_ROOT` may be set
 to isolate daemon state for tests or local development.
 
+Codex backend jobs use a private `CODEX_HOME` at
+`<state-root>/workspaces/<workspace-hash>/codex/<job-id>/`, with only
+`auth.json` and `config.toml` symlinked from `${CODEX_HOME:-~/.codex}`. This
+keeps worker transcripts out of the operator home. Set
+`AGENTBUS_CODEX_HOME=/absolute/path` to use a fixed home instead, or set
+`AGENTBUS_CODEX_HOME_INHERIT=1` to disable isolation and inherit `CODEX_HOME`
+as before. The inherit opt-out takes precedence when both variables are set.
+
 `agentbus serve` always starts strict identified admission under the shared
 custody contract. macOS serves with process-group/held-parent supervision.
 Linux serves with process-group supervision when cgroup v2 is unavailable, and
