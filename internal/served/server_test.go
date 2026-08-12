@@ -319,8 +319,10 @@ func (b *fakeBackend) Resume(_ context.Context, id string, opts engine.SessionOp
 
 type admissionLivenessBackend struct {
 	*fakeBackend
-	eventStream    chan engine.Event
-	runnerObserved chan struct{}
+	eventStream       chan engine.Event
+	runnerObserved    chan struct{}
+	attemptCanceled   chan struct{}
+	attemptCancelOnce sync.Once
 }
 
 func newAdmissionLivenessBackend(name string) *admissionLivenessBackend {
@@ -387,6 +389,12 @@ func (s *admissionLivenessSession) TurnWithRunner(ctx context.Context, input eng
 	}()
 	if s.backend.started != nil {
 		s.backend.started <- struct{}{}
+	}
+	if s.backend.attemptCanceled != nil {
+		go func() {
+			<-ctx.Done()
+			s.backend.attemptCancelOnce.Do(func() { close(s.backend.attemptCanceled) })
+		}()
 	}
 	return s.backend.eventStream, nil
 }
@@ -7455,53 +7463,34 @@ func TestCorrectiveRetryReplacesObservedWorkspaceWriteItemCount(t *testing.T) {
 	}
 }
 
-func TestCancellationSettlesBufferedWorkspaceWriteBeforeTerminalCommit(t *testing.T) {
+func TestTimedOutAttemptSettlesBufferedWorkspaceWriteBeforeTerminalCommit(t *testing.T) {
 	t.Parallel()
 	backend := newAdmissionLivenessBackend("fake")
 	backend.eventStream = make(chan engine.Event, 2)
+	backend.attemptCanceled = make(chan struct{})
 	server, _, cwd := newUnstartedTestServer(t, backend)
 	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	timeout := int64(2_000)
 
 	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
 		WorkspaceKey: "workspace-cancel-buffered-write",
 		RequestID:    "request-cancel-buffered-write",
-		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: true, Prompt: "cancel after buffered write"},
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake", CWD: cwd, Write: true, Prompt: "timeout after buffered write", TimeoutMs: &timeout,
+		},
 	})
 	waitBackendStarted(t, backend.fakeBackend)
-	cancelParams := mustMarshal(t, protocol.JobCancelParams{JobID: job.JobID})
-	cancelDone := make(chan requestOutcome, 1)
-	go func() {
-		cancelDone <- server.handleJobCancel(cancelParams)
-	}()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		active := server.lookupActiveJob(job.JobID)
-		if active != nil && active.requestedTerminal() == engine.StateCanceled {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if active := server.lookupActiveJob(job.JobID); active == nil || active.requestedTerminal() != engine.StateCanceled {
-		t.Fatal("cancellation did not reach the active attempt")
+	select {
+	case <-backend.attemptCanceled:
+	case <-time.After(4 * time.Second):
+		t.Fatal("attempt did not time out")
 	}
 	backend.eventStream <- engine.Event{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true}
 	close(backend.eventStream)
-	select {
-	case outcome := <-cancelDone:
-		if outcome.err != nil {
-			t.Fatalf("job.cancel error = %+v", outcome.err)
-		}
-		canceled, ok := outcome.result.(protocol.JobCancelResult)
-		if !ok {
-			t.Fatalf("job.cancel result type = %T", outcome.result)
-		}
-		if canceled.State != engine.StateCanceled {
-			t.Fatalf("job.cancel = %+v, want canceled", canceled)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("job.cancel did not return after buffered workspace-write event")
-	}
 	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeTimedOut {
+		t.Fatalf("terminal = %+v, want timed out", record.Terminal)
+	}
 	if got := record.ObservedWorkspaceWriteItemCount; got != 1 {
 		t.Fatalf("terminal observed workspace-write count = %d, want 1", got)
 	}

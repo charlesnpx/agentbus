@@ -2395,6 +2395,13 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 
 func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	active := s.lookupActiveJob(jobID)
+	// Keep the client-cancel snapshot and RequestCancel ordering together. The
+	// runner may be between release and registration, or may itself be entering
+	// cancel recovery; waiting for its diagnostic drain here lets both paths
+	// pass the pre-terminal check and submit the same terminal intent. Runner
+	// interruption and shutdown terminalization perform the bounded settle and
+	// take their snapshot after it instead.
+	count, ordinal := activeObservedWorkspaceWriteItemCount(active)
 	if active != nil {
 		active.requestTerminal(engine.StateCanceled, terminalCancellationFor(engine.CancellationOriginClientRequest, "client requested cancellation"))
 		settled := active.interruptSessionNativeFirst()
@@ -2411,9 +2418,7 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 				}
 			}
 		}
-		active.settleAdmissionDiagnostics(admissionNativeInterruptGrace)
 	}
-	count, ordinal := activeObservedWorkspaceWriteItemCount(active)
 	record, projection, ok, errObj := s.authorityJobProjection(jobID)
 	if errObj != nil {
 		return requestOutcome{err: errObj}
