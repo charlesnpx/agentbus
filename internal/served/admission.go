@@ -2553,6 +2553,10 @@ func (s *Server) launchAdmittedJob(ctx context.Context, run jobRun) {
 }
 
 func (s *Server) finalizeAdmittedLaunchFailure(run jobRun, cause error) {
+	if err := discardEmptyBackendLogs(run.logPaths); err != nil {
+		s.handleRunFinalizationError(run, err)
+		return
+	}
 	jobID, err := model.NewJobID(run.jobID)
 	if err != nil {
 		s.handleRunFinalizationError(run, err)
@@ -2616,6 +2620,14 @@ func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobR
 	if snapshot.Record.Terminal != nil || snapshot.Record.Cancel != nil {
 		return run, nil, false, nil
 	}
+	if run.store == nil {
+		return run, nil, false, errors.New("admission log store is unavailable")
+	}
+	logPaths, err := ensureLogFiles(run.store, run.jobID)
+	if err != nil {
+		return run, nil, false, fmt.Errorf("allocate backend logs: %w", err)
+	}
+	run.logPaths = logPaths
 	s.mu.Lock()
 	_, active := s.activeJobs[run.jobID]
 	s.mu.Unlock()
@@ -2841,6 +2853,7 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 		CancellationReason:    cancellationReason,
 		CancellationOrigin:    cancellationOrigin,
 	}
+	status.LogPaths = s.admissionLogPaths(record)
 	if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
 		startedAt := started
 		updatedAt := lastEvent
@@ -2875,6 +2888,7 @@ func (s *Server) listAuthorityStatuses() ([]protocol.JobStatus, *protocol.ErrorO
 				return err
 			}
 			if ok {
+				status.LogPaths = s.admissionLogPaths(image.Safety.Value)
 				status.ModelReported = s.reportedModel(status.JobID)
 				if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
 					startedAt := started
@@ -3006,6 +3020,59 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 		CancellationReason:    cancellationReason,
 		CancellationOrigin:    cancellationOrigin,
 	}, true, nil
+}
+
+func (s *Server) admissionLogPaths(record model.SafetyRecord) *engine.LogPaths {
+	layout, err := authorityResultLayout(s.stateRoot, record)
+	if err != nil {
+		return nil
+	}
+	s.sweepExpiredAdmissionLogs(layout, record)
+	paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
+	if err != nil {
+		return nil
+	}
+	if record.Terminal != nil {
+		_ = discardEmptyBackendLogs(paths)
+	}
+	var advertised engine.LogPaths
+	if admissionReadableLogFile(paths.Stdout) {
+		advertised.Stdout = paths.Stdout
+	}
+	if admissionReadableLogFile(paths.Stderr) {
+		advertised.Stderr = paths.Stderr
+	}
+	if advertised.Stdout == "" && advertised.Stderr == "" {
+		return nil
+	}
+	return &advertised
+}
+
+func (s *Server) sweepExpiredAdmissionLogs(layout engine.WorkspaceLayout, record model.SafetyRecord) {
+	if record.Terminal == nil || record.FinalAttemptEndedAt == nil || s.clock.Now().UTC().Sub(*record.FinalAttemptEndedAt) < engine.DefaultLogTTL {
+		return
+	}
+	paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
+	if err != nil {
+		return
+	}
+	for _, path := range []string{paths.Stdout, paths.Stderr} {
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		_ = os.Remove(path)
+	}
+}
+
+func admissionReadableLogFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	return err == nil && info.Mode().IsRegular() && info.Size() > 0
 }
 
 func cloneTransportFrameDrops(drops *engine.TransportFrameDrops) *engine.TransportFrameDrops {

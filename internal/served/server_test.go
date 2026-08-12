@@ -59,6 +59,84 @@ type fakeTurn struct {
 	Write  bool
 }
 
+type logCaptureBackend struct {
+	*fakeBackend
+	input chan engine.TurnInput
+}
+
+func newLogCaptureBackend(name string) *logCaptureBackend {
+	return &logCaptureBackend{fakeBackend: newFakeBackend(name), input: make(chan engine.TurnInput, 1)}
+}
+
+func (b *logCaptureBackend) ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error) {
+	return b, nil
+}
+
+func (b *logCaptureBackend) Start(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
+	b.count.Add(1)
+	return &logCaptureSession{id: b.name + "-session", backend: b}, nil
+}
+
+func (b *logCaptureBackend) Resume(_ context.Context, id string, opts engine.SessionOpts) (engine.Session, error) {
+	return &logCaptureSession{id: id, backend: b}, nil
+}
+
+type logCaptureSession struct {
+	id      string
+	backend *logCaptureBackend
+}
+
+func (s *logCaptureSession) ID() string { return s.id }
+
+func (s *logCaptureSession) Turn(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+	return nil, errors.New("direct turn must not be used")
+}
+
+func (s *logCaptureSession) TurnWithRunner(ctx context.Context, input engine.TurnInput, runner command.Runner) (<-chan engine.Event, error) {
+	if runner == nil {
+		return nil, errors.New("command runner is required")
+	}
+	running, err := runner.Start(ctx, command.ExecSpec{Argv: []string{"/bin/fake-agent"}})
+	if err != nil {
+		return nil, err
+	}
+	s.backend.input <- input
+	if stdin := running.Stdin(); stdin != nil {
+		_ = stdin.Close()
+	}
+	if stdout := running.Stdout(); stdout != nil {
+		go func() { _, _ = io.Copy(io.Discard, stdout) }()
+	}
+	if stderr := running.Stderr(); stderr != nil {
+		go func() { _, _ = io.Copy(io.Discard, stderr) }()
+	}
+	if observer, ok := running.(command.FinalObserver); ok {
+		go func() { _, _ = observer.FinalObservation(context.Background()) }()
+	}
+	for path, content := range map[string]string{
+		input.LogPaths.Stdout: "backend stdout\n",
+		input.LogPaths.Stderr: "backend stderr\n",
+	} {
+		writer, err := engine.NewCappedLogWriter(path, 0)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := io.WriteString(writer, content); err != nil {
+			_ = writer.Close()
+			return nil, err
+		}
+		if err := writer.Close(); err != nil {
+			return nil, err
+		}
+	}
+	events := make(chan engine.Event, 1)
+	events <- engine.Event{Type: engine.EventTerminalError, Text: "backend exploded"}
+	close(events)
+	return events, nil
+}
+
+func (*logCaptureSession) Interrupt(context.Context) error { return nil }
+
 type resumedSession struct {
 	ID   string
 	Opts engine.SessionOpts
@@ -7345,6 +7423,83 @@ func TestTerminalErrorEventFailsJob(t *testing.T) {
 	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
 	if result.State != engine.StateFailed || result.Result != nil {
 		t.Fatalf("terminal error result = %+v", result)
+	}
+}
+
+func TestFailedAdmissionJobCapturesAndAdvertisesBackendLogs(t *testing.T) {
+	t.Parallel()
+	backend := newLogCaptureBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-log-capture",
+		RequestID:    "request-log-capture",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "fail"},
+	})
+
+	var input engine.TurnInput
+	select {
+	case input = <-backend.input:
+	case <-time.After(5 * time.Second):
+		t.Fatal("admission backend did not receive a turn input")
+	}
+	if input.LogPaths.Stdout == "" || input.LogPaths.Stderr == "" {
+		t.Fatalf("turn input log paths = %+v, want stdout and stderr paths", input.LogPaths)
+	}
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+	if len(status.Jobs) != 1 || status.Jobs[0].State != engine.StateFailed || status.Jobs[0].LogPaths == nil {
+		t.Fatalf("terminal status = %+v, want failed job with log paths", status)
+	}
+	if got := *status.Jobs[0].LogPaths; got != input.LogPaths {
+		t.Fatalf("advertised log paths = %+v, want %+v", got, input.LogPaths)
+	}
+	for path, want := range map[string]string{input.LogPaths.Stdout: "backend stdout", input.LogPaths.Stderr: "backend stderr"} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read backend log %s: %v", path, err)
+		}
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("backend log %s = %q, want %q", path, content, want)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("backend log %s mode = %o, want 600", path, got)
+		}
+	}
+}
+
+func TestSuccessfulAdmissionJobDoesNotAdvertiseEmptyLogPaths(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-empty-logs",
+		RequestID:    "request-empty-logs",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "succeed"},
+	})
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+	if len(status.Jobs) != 1 || status.Jobs[0].State != engine.StateCompleted {
+		t.Fatalf("terminal status = %+v, want completed job", status)
+	}
+	if status.Jobs[0].LogPaths != nil {
+		t.Fatalf("completed status log paths = %+v, want omitted empty paths", status.Jobs[0].LogPaths)
+	}
+	raw, err := json.Marshal(status.Jobs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fields["logPaths"]; ok {
+		t.Fatalf("completed status JSON = %s, unexpectedly contains logPaths", raw)
 	}
 }
 

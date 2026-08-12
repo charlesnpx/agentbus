@@ -2426,6 +2426,7 @@ type jobRun struct {
 	admissionMode           model.Mode
 	admissionAccepted       authority.AcceptResult
 	admissionLaunch         admissionLaunchBinding
+	logPaths                engine.LogPaths
 }
 
 func (s *Server) runJob(ctx context.Context, run jobRun) {
@@ -2505,7 +2506,7 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		Prompt:   prompt,
 		Write:    write,
 		Timeout:  run.timeout,
-		LogPaths: engine.LogPaths{},
+		LogPaths: run.logPaths,
 	}
 	if run.admissionControlled {
 		startedAt := s.clock.Now().UTC()
@@ -2803,6 +2804,30 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 	return nil
 }
 
+func discardEmptyBackendLogs(paths engine.LogPaths) error {
+	for _, path := range []string{paths.Stdout, paths.Stderr} {
+		if path == "" {
+			continue
+		}
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("backend log %q is not a regular file", path)
+		}
+		if info.Size() == 0 {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Server) recordModelReported(run jobRun, reported string) error {
 	if strings.TrimSpace(reported) == "" {
 		return nil
@@ -2995,7 +3020,7 @@ func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backe
 		HeartbeatAt:      now,
 		Lease:            engine.Lease{ExpiresAt: now.Add(s.leaseDuration)},
 		Supervisor:       ref,
-		LogPaths:         logPaths,
+		LogPaths:         &logPaths,
 		Policy:           policy,
 		ResolvedContract: resolvedCopy,
 	}
@@ -3335,9 +3360,9 @@ func atomicWriteDurable(path string, data []byte, mode os.FileMode) error {
 
 func ensureLogFiles(store *engine.Store, jobID string) (engine.LogPaths, error) {
 	layout := store.Layout()
-	paths := engine.LogPaths{
-		Stdout: filepath.Join(layout.Logs, jobID+".stdout.log"),
-		Stderr: filepath.Join(layout.Logs, jobID+".stderr.log"),
+	paths, err := engine.LogPathsForLayout(layout, jobID)
+	if err != nil {
+		return engine.LogPaths{}, err
 	}
 	for _, path := range []string{paths.Stdout, paths.Stderr} {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)

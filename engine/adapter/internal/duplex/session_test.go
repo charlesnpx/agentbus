@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -80,6 +81,53 @@ func TestFixtureDriverHappyPath(t *testing.T) {
 	assertFinalObservationCalled(t, observed)
 	if strings.Join(runner.spec.Argv, "\x00") != "fixture" {
 		t.Fatalf("argv = %#v", runner.spec.Argv)
+	}
+}
+
+func TestTurnCapturesBackendStdoutAndStderrLogs(t *testing.T) {
+	proc := newFakeCommand()
+	runner := &fakeRunner{running: proc}
+	session := newFixtureSession(t, runner, 0, "")
+	logs := engine.LogPaths{
+		Stdout: filepath.Join(t.TempDir(), "backend.stdout.log"),
+		Stderr: filepath.Join(t.TempDir(), "backend.stderr.log"),
+	}
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		scanner := bufio.NewScanner(proc.stdinR)
+		if !scanner.Scan() {
+			t.Errorf("prompt frame missing: %v", scanner.Err())
+			return
+		}
+		writePeerJSON(t, proc.stdoutW, map[string]any{"type": "complete", "text": "done"})
+		_, _ = io.WriteString(proc.stderrW, "backend stderr\\n")
+		_ = proc.stdoutW.Close()
+		_ = proc.stderrW.Close()
+		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	}()
+
+	events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "hello", LogPaths: logs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	<-peerDone
+	for path, want := range map[string]string{logs.Stdout: `"type":"complete"`, logs.Stderr: "backend stderr"} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read log %s: %v", path, err)
+		}
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("log %s = %q, want %q", path, content, want)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("log %s mode = %o, want 600", path, got)
+		}
 	}
 }
 

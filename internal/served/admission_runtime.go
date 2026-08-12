@@ -474,6 +474,9 @@ func (s *Server) isAdmissionJob(jobID string) bool {
 }
 
 func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {
+	if err := discardEmptyBackendLogs(run.logPaths); err != nil {
+		return err
+	}
 	jobID, err := model.NewJobID(run.jobID)
 	if err != nil {
 		return err
