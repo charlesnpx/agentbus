@@ -85,6 +85,16 @@ func TestVersionAndServeCommands(t *testing.T) {
 	}
 }
 
+func TestCodexHomeSettingsPreferInheritanceOptOut(t *testing.T) {
+	t.Setenv("AGENTBUS_CODEX_HOME", "/tmp/fixed-codex-home")
+	t.Setenv("AGENTBUS_CODEX_HOME_INHERIT", "1")
+	t.Setenv("CODEX_HOME", "/tmp/operator-codex-home")
+	override, inherit, authHome := codexHomeSettings()
+	if override != "/tmp/fixed-codex-home" || !inherit || authHome != "/tmp/operator-codex-home" {
+		t.Fatalf("codex settings = override=%q inherit=%t auth=%q", override, inherit, authHome)
+	}
+}
+
 func TestStartBackgroundDaemonWritesPIDAfterLauncherReady(t *testing.T) {
 	a := testApp(t)
 	launched := make(chan struct{})

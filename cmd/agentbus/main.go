@@ -233,18 +233,32 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 	}
 	serveCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
 	defer stopSignals()
+	codexHomeOverride, codexHomeInherit, codexAuthHome := codexHomeSettings()
 	err := agentbusserve.Serve(serveCtx, agentbusserve.Config{
-		StateRoot:    a.stateRoot,
-		CWD:          a.cwd,
-		Backends:     backends,
-		Registry:     a.registryOrDefault(),
-		Clock:        a.clock,
-		ProcessTable: a.processes,
+		StateRoot:         a.stateRoot,
+		CWD:               a.cwd,
+		CodexHomeOverride: codexHomeOverride,
+		CodexHomeInherit:  codexHomeInherit,
+		CodexAuthHome:     codexAuthHome,
+		Backends:          backends,
+		Registry:          a.registryOrDefault(),
+		Clock:             a.clock,
+		ProcessTable:      a.processes,
 	})
 	if err != nil {
 		return serveCommandError(errOut, err)
 	}
 	return 0
+}
+
+// codexHomeSettings reads the daemon-owned home controls once at startup.
+// Inheritance is intentionally checked independently of an override: opting
+// out wins, so an operator can keep a fixed override in their environment
+// while temporarily restoring the historical inherited CODEX_HOME behavior.
+func codexHomeSettings() (override string, inherit bool, authHome string) {
+	return strings.TrimSpace(os.Getenv("AGENTBUS_CODEX_HOME")),
+		strings.TrimSpace(os.Getenv("AGENTBUS_CODEX_HOME_INHERIT")) == "1",
+		strings.TrimSpace(os.Getenv("CODEX_HOME"))
 }
 
 func (a *app) runAdmission(ctx context.Context, args []string, out, errOut io.Writer) int {

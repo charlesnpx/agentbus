@@ -92,14 +92,17 @@ func WorkspaceKey(canonicalCWD string) string {
 
 // WorkspaceLayout contains protocol state paths for one workspace namespace.
 type WorkspaceLayout struct {
-	Root       string
-	Workspace  string
-	Key        string
-	Namespace  string
-	Jobs       string
-	Logs       string
-	Results    string
-	Inputs     string
+	Root      string
+	Workspace string
+	Key       string
+	Namespace string
+	Jobs      string
+	Logs      string
+	Results   string
+	Inputs    string
+	// Codex contains per-job CODEX_HOME directories. It is deliberately not
+	// created by ensureLayout: non-Codex workspaces do not need it.
+	Codex      string
 	Quarantine string
 }
 
@@ -135,6 +138,7 @@ func layoutForWorkspaceKey(root, key, workspace string) (WorkspaceLayout, error)
 		Logs:       filepath.Join(ns, "logs"),
 		Results:    filepath.Join(ns, "results"),
 		Inputs:     filepath.Join(ns, "inputs"),
+		Codex:      filepath.Join(ns, "codex"),
 		Quarantine: filepath.Join(ns, "quarantine"),
 	}, nil
 }

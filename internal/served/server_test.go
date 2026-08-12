@@ -4265,6 +4265,350 @@ func TestStrictCodexElidedResultRetainsCertifiedResultRef(t *testing.T) {
 	}
 }
 
+func TestIdentifiedCodexJobUsesPrivateHomeWithLinkedCredentials(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("codex")
+	block := make(chan struct{})
+	backend.block = block
+	started := make(chan engine.SessionOpts, 1)
+	backend.startHook = func(opts engine.SessionOpts) { started <- opts }
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	authHome := filepath.Join(t.TempDir(), "operator-codex")
+	for name, content := range map[string]string{"auth.json": `{"token":"test"}`, "config.toml": "model = \"test\"\n"} {
+		if err := os.MkdirAll(authHome, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(authHome, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server.codexAuthHome = authHome
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-codex-private-home",
+		RequestID:    "request-codex-private-home",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "hold"},
+	})
+	var opts engine.SessionOpts
+	select {
+	case opts = <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Codex session construction did not run")
+	}
+	wantHome := testCodexHomePath(t, root, cwd, job.JobID)
+	if got := opts.EnvOverlay["CODEX_HOME"]; got != wantHome {
+		t.Fatalf("CODEX_HOME overlay = %q, want %q", got, wantHome)
+	}
+	if info, err := os.Stat(wantHome); err != nil {
+		t.Fatalf("private Codex home stat = %v", err)
+	} else if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("private Codex home mode = %o, want 700", got)
+	}
+	for _, name := range codexHomeLinkedFiles {
+		path := filepath.Join(wantHome, name)
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatalf("%s lstat = %v", name, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("%s mode = %v, want symlink", name, info.Mode())
+		}
+		if target, err := os.Readlink(path); err != nil || target != filepath.Join(authHome, name) {
+			t.Fatalf("%s target = %q err=%v, want %q", name, target, err, filepath.Join(authHome, name))
+		}
+	}
+	close(block)
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	waitActiveJobGone(t, server, job.JobID)
+	if _, err := os.Stat(wantHome); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("completed private Codex home stat = %v, want removed", err)
+	}
+}
+
+func TestIdentifiedCodexJobSkipsMissingCredentialLinks(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("codex")
+	block := make(chan struct{})
+	backend.block = block
+	started := make(chan engine.SessionOpts, 1)
+	backend.startHook = func(opts engine.SessionOpts) { started <- opts }
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	server.codexAuthHome = filepath.Join(t.TempDir(), "empty-codex-home")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-codex-missing-links",
+		RequestID:    "request-codex-missing-links",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "hold"},
+	})
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Codex session construction did not run")
+	}
+	home := testCodexHomePath(t, root, cwd, job.JobID)
+	for _, name := range codexHomeLinkedFiles {
+		if _, err := os.Lstat(filepath.Join(home, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("missing source produced %s: %v", name, err)
+		}
+	}
+	close(block)
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+}
+
+func TestIdentifiedCodexJobRetainsPrivateHomeAfterFailure(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("codex")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{{Type: engine.EventTerminalError, Text: "backend failed"}}
+	}
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	server.codexAuthHome = filepath.Join(t.TempDir(), "missing-codex-home")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-codex-failure-retained",
+		RequestID:    "request-codex-failure-retained",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "fail"},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeFailed {
+		t.Fatalf("terminal = %+v, want failed", record.Terminal)
+	}
+	home := testCodexHomePath(t, root, cwd, job.JobID)
+	if _, err := os.Stat(home); err != nil {
+		t.Fatalf("failed job private Codex home stat = %v, want retained", err)
+	}
+}
+
+func TestIdentifiedCodexPreparationFailureFinalizesAndRetainsPrivateHome(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("codex")
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	authHome := filepath.Join(t.TempDir(), "operator-codex")
+	if err := os.MkdirAll(filepath.Join(authHome, "auth.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	server.codexAuthHome = authHome
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-codex-preparation-failure",
+		RequestID:    "request-codex-preparation-failure",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "prepare fails"},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeFailed {
+		t.Fatalf("terminal = %+v, want failed", record.Terminal)
+	}
+	if got := backend.count.Load(); got != 0 {
+		t.Fatalf("Codex backend Start calls = %d, want none after home preparation failure", got)
+	}
+	home := testCodexHomePath(t, root, cwd, job.JobID)
+	if _, err := os.Stat(home); err != nil {
+		t.Fatalf("preparation-failed private Codex home stat = %v, want retained", err)
+	}
+}
+
+func TestIdentifiedCodexHomeCleanupUsesCommittedTerminalOutcome(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		suffix           string
+		events           func(string, bool) []engine.Event
+		attemptOutcome   model.Outcome
+		committedOutcome model.Outcome
+		wantRetained     bool
+	}{
+		{
+			name:             "successful attempt commits failed terminal and retains",
+			suffix:           "success-to-failed",
+			attemptOutcome:   model.OutcomeCompleted,
+			committedOutcome: model.OutcomeFailed,
+			wantRetained:     true,
+		},
+		{
+			name:   "failed attempt commits completed terminal and removes",
+			suffix: "failed-to-success",
+			events: func(string, bool) []engine.Event {
+				return []engine.Event{{Type: engine.EventTerminalError, Text: "attempt failed"}}
+			},
+			attemptOutcome:   model.OutcomeFailed,
+			committedOutcome: model.OutcomeCompleted,
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			backend := newFakeBackend("codex")
+			if tt.events != nil {
+				backend.events = tt.events
+			}
+			server, root, cwd := newUnstartedTestServer(t, backend)
+			server.codexAuthHome = filepath.Join(t.TempDir(), "missing-codex-auth")
+			launcher := newAdmissionFakeLaunchCustodian(t)
+			enableTestAdmission(t, server, launcher)
+			recorder := installRecordingAdmissionAuthorityForTest(t, server)
+
+			var injected sync.Once
+			recorder.beforeRecordOutcome = func(ctx context.Context, jobID model.JobID, ref model.AttemptRef, outcome model.Outcome) error {
+				if outcome != tt.attemptOutcome {
+					return nil
+				}
+				var err error
+				injected.Do(func() {
+					switch tt.committedOutcome {
+					case model.OutcomeFailed:
+						_, err = recorder.servedAdmissionAuthority.RecordOutcome(ctx, jobID, ref, model.OutcomeFailed, nil)
+						if err == nil {
+							_, err = recorder.servedAdmissionAuthority.Finalize(ctx, jobID, ref, model.TerminalIntent{Outcome: model.OutcomeFailed, Cause: model.CauseCompletedNormally})
+						}
+					case model.OutcomeCompleted:
+						_, err = recorder.servedAdmissionAuthority.RecordOutcome(ctx, jobID, ref, model.OutcomeCompleted, nil)
+						if err != nil {
+							return
+						}
+						publisher := servedResultPublisher{server: server}
+						receipt, publishErr := publisher.Publish(ctx, jobID, []byte("committed success"))
+						if publishErr != nil {
+							err = publishErr
+							return
+						}
+						verified, verifyErr := publisher.Verify(ctx, receipt.Result)
+						if verifyErr != nil {
+							err = verifyErr
+							return
+						}
+						_, err = recorder.servedAdmissionAuthority.RecordResult(ctx, jobID, ref, verified)
+						if err == nil {
+							_, err = recorder.servedAdmissionAuthority.Finalize(ctx, jobID, ref, model.TerminalIntent{Outcome: model.OutcomeCompleted, Cause: model.CauseCompletedNormally})
+						}
+					default:
+						err = fmt.Errorf("unsupported committed outcome %s", tt.committedOutcome)
+					}
+				})
+				return err
+			}
+
+			job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+				WorkspaceKey: "workspace-codex-committed-cleanup-" + tt.suffix,
+				RequestID:    "request-codex-committed-cleanup-" + tt.suffix,
+				TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "cleanup follows committed terminal"},
+			})
+			record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+			if record.Terminal == nil || record.Terminal.Outcome != tt.committedOutcome {
+				t.Fatalf("terminal = %+v, want committed %s", record.Terminal, tt.committedOutcome)
+			}
+			waitActiveJobGone(t, server, job.JobID)
+			home := testCodexHomePath(t, root, cwd, job.JobID)
+			_, err := os.Stat(home)
+			if tt.wantRetained && err != nil {
+				t.Fatalf("committed failed Codex home stat = %v, want retained", err)
+			}
+			if !tt.wantRetained && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("committed completed Codex home stat = %v, want removed", err)
+			}
+		})
+	}
+}
+
+func TestIdentifiedCodexHomeOverrideAndInheritanceOptOut(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		override    string
+		inherit     bool
+		wantOverlay bool
+	}{
+		{
+			name:        "override",
+			override:    filepath.Join(t.TempDir(), "fixed-codex-home"),
+			wantOverlay: true,
+		},
+		{
+			name:        "inherit wins over override",
+			override:    filepath.Join(t.TempDir(), "ignored-fixed-codex-home"),
+			inherit:     true,
+			wantOverlay: false,
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			backend := newFakeBackend("codex")
+			block := make(chan struct{})
+			backend.block = block
+			started := make(chan engine.SessionOpts, 1)
+			backend.startHook = func(opts engine.SessionOpts) { started <- opts }
+			server, _, cwd := newUnstartedTestServer(t, backend)
+			server.codexHomeOverride = tt.override
+			server.codexHomeInherit = tt.inherit
+			server.codexAuthHome = filepath.Join(t.TempDir(), "missing-codex-home")
+			launcher := newAdmissionFakeLaunchCustodian(t)
+			enableTestAdmission(t, server, launcher)
+
+			job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+				WorkspaceKey: "workspace-codex-" + strings.ReplaceAll(tt.name, " ", "-"),
+				RequestID:    "request-codex-" + strings.ReplaceAll(tt.name, " ", "-"),
+				TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "hold"},
+			})
+			select {
+			case opts := <-started:
+				got, ok := opts.EnvOverlay["CODEX_HOME"]
+				if ok != tt.wantOverlay {
+					t.Fatalf("CODEX_HOME present = %t, want %t; overlay=%v", ok, tt.wantOverlay, opts.EnvOverlay)
+				}
+				if tt.wantOverlay && got != tt.override {
+					t.Fatalf("CODEX_HOME overlay = %q, want fixed %q", got, tt.override)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Codex session construction did not run")
+			}
+			if tt.wantOverlay {
+				info, err := os.Stat(tt.override)
+				if err != nil {
+					t.Fatalf("fixed Codex home stat = %v", err)
+				}
+				if info.Mode().Perm() != 0o700 {
+					t.Fatalf("fixed Codex home mode = %o, want 0700", info.Mode())
+				}
+			}
+			close(block)
+			waitAdmissionSafetyTerminal(t, server, job.JobID)
+		})
+	}
+}
+
+func TestIdentifiedNonCodexJobHasNoCodexHomeOverlay(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("claude")
+	block := make(chan struct{})
+	backend.block = block
+	started := make(chan engine.SessionOpts, 1)
+	backend.startHook = func(opts engine.SessionOpts) { started <- opts }
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	server.codexHomeOverride = filepath.Join(t.TempDir(), "must-not-be-used")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-claude-no-codex-home",
+		RequestID:    "request-claude-no-codex-home",
+		TaskSpec:     protocol.TaskSpec{Backend: "claude", CWD: cwd, Write: false, Prompt: "hold"},
+	})
+	select {
+	case opts := <-started:
+		if _, ok := opts.EnvOverlay["CODEX_HOME"]; ok {
+			t.Fatalf("non-Codex EnvOverlay = %v, want no CODEX_HOME", opts.EnvOverlay)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Claude session construction did not run")
+	}
+	close(block)
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+}
+
 func TestAuthorityJobCancelQueuedBeforeLaunch(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -9415,6 +9759,15 @@ func assertNoWorkspaceNamespaceForCWD(t *testing.T, root, cwd string) {
 	if _, err := os.Stat(namespace); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("workspace namespace stat error = %v, want not exist for %s", err, namespace)
 	}
+}
+
+func testCodexHomePath(t *testing.T, root, cwd, jobID string) string {
+	t.Helper()
+	canonicalCWD, err := engine.CanonicalWorkspace(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(root, "workspaces", engine.WorkspaceKey(canonicalCWD), "codex", jobID)
 }
 
 func markerCodexCLI(t *testing.T, marker string) string {
