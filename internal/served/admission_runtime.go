@@ -505,7 +505,8 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		return nil
 	}
 	if admissionRunHasRequestedCancel(run, state) {
-		if err := coord.Cancel(context.Background(), jobID, nil); err != nil {
+		cancellation := run.active.requestedCancellation()
+		if err := coord.CancelWithMetadata(context.Background(), jobID, cancellation.origin, cancellation.reason, nil); err != nil {
 			if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
 				return err
 			}

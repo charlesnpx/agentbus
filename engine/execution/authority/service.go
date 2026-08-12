@@ -279,11 +279,17 @@ func (r *Ready) RecordTransportFrameDrops(ctx context.Context, jobID model.JobID
 
 // RecordCancellation durably preserves the first cancellation explanation
 // without changing the job's state machine outcome or terminal certificate.
+// Callers must pass non-sensitive text: it is persisted and exposed on
+// job.status and job.result.
 func (r *Ready) RecordCancellation(ctx context.Context, jobID model.JobID, origin engine.CancellationOrigin, reason string, options ...ApplyOption) (ApplyResult, error) {
 	return r.apply(ctx, jobID, model.RecordCancellation{JobID: jobID, Origin: origin, Reason: reason}, options...)
 }
 
 func (r *Ready) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent, options ...ApplyOption) (ApplyResult, error) {
+	if intent.Outcome == model.OutcomeCanceled && intent.CancellationOrigin == "" && intent.CancellationReason == "" {
+		intent.CancellationOrigin = engine.CancellationOriginUnattributable
+		intent.CancellationReason = "canceled without an attributable origin"
+	}
 	return r.apply(ctx, jobID, model.Finalize{Ref: ref, Intent: intent}, options...)
 }
 

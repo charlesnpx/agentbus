@@ -163,26 +163,3 @@ func (s *Server) recordFailureMetadata(run jobRun, failure terminalFailure) erro
 	_, err = ready.RecordFailure(context.Background(), jobID, failure.class, failure.reason)
 	return err
 }
-
-func (s *Server) recordCancellationMetadata(run jobRun, cancellation terminalCancellation) error {
-	return s.recordCancellationMetadataForJob(run.jobID, cancellation)
-}
-
-func (s *Server) recordCancellationMetadataForJob(jobID string, cancellation terminalCancellation) error {
-	if !cancellation.origin.Valid() || strings.TrimSpace(cancellation.reason) == "" {
-		return fmt.Errorf("invalid cancellation metadata for job %s", jobID)
-	}
-	modelJobID, err := model.NewJobID(jobID)
-	if err != nil {
-		return err
-	}
-	s.admissionStateMu.RLock()
-	ready := s.admissionReady
-	available := s.admissionInstance != nil && ready != nil
-	s.admissionStateMu.RUnlock()
-	if !available {
-		return authority.ErrNotReady
-	}
-	_, err = ready.RecordCancellation(context.Background(), modelJobID, cancellation.origin, cancellation.reason)
-	return err
-}

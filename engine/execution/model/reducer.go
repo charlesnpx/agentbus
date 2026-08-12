@@ -677,6 +677,13 @@ func applyRecordCancellation(next *SafetyRecord, current SafetyRecord, command R
 		return false, nil
 	}
 	if current.CancellationOrigin != "" || current.CancellationReason != "" {
+		if current.CancellationOrigin == engine.CancellationOriginUnattributable &&
+			current.CancellationReason == "canceled without an attributable origin" &&
+			command.Origin != engine.CancellationOriginUnattributable {
+			next.CancellationOrigin = command.Origin
+			next.CancellationReason = command.Reason
+			return true, nil
+		}
 		// The first observed cancellation is the one most directly connected to
 		// the job's terminal path. Keep it authoritative when cleanup later
 		// observes another possible cause.
@@ -695,12 +702,41 @@ func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (
 	if err != nil {
 		return false, err
 	}
+	origin, reason, err := terminalCancellationMetadata(certificate.Outcome, command.Intent.CancellationOrigin, command.Intent.CancellationReason)
+	if err != nil {
+		return false, err
+	}
 	terminalChanged, err := mergeTerminal(next, certificate)
 	if err != nil {
 		return false, err
 	}
+	cancellationChanged := false
+	if certificate.Outcome == OutcomeCanceled {
+		next.CancellationOrigin = origin
+		next.CancellationReason = reason
+		cancellationChanged = current.CancellationOrigin != next.CancellationOrigin || current.CancellationReason != next.CancellationReason
+	}
 	timingChanged := applyFinalAttemptEnd(next, current, command.Intent.FinalAttemptEndedAt)
-	return terminalChanged || timingChanged, nil
+	return terminalChanged || cancellationChanged || timingChanged, nil
+}
+
+func terminalCancellationMetadata(outcome Outcome, origin engine.CancellationOrigin, reason string) (engine.CancellationOrigin, string, error) {
+	if outcome != OutcomeCanceled {
+		if origin != "" || reason != "" {
+			return "", "", invalidCommand("cancellation metadata requires canceled terminal outcome")
+		}
+		return "", "", nil
+	}
+	if origin == "" || reason == "" {
+		if origin == "" && reason == "" {
+			return engine.CancellationOriginUnattributable, "canceled without an attributable origin", nil
+		}
+		return "", "", invalidCommand("canceled terminal requires complete cancellation metadata")
+	}
+	if err := ValidateCancellationMetadata(origin, reason); err != nil {
+		return "", "", invalidCommand("cancellation metadata: %v", err)
+	}
+	return origin, reason, nil
 }
 
 func reportFinalAttemptTimingWarning(jobID JobID, format string, args ...any) {

@@ -1028,11 +1028,8 @@ func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context, admission *
 			if err := s.requestActiveJobShutdownCancel(ctx, id.String()); err != nil {
 				return err
 			}
-			if err := coord.Cancel(ctx, id, nil); err != nil {
+			if err := coord.CancelWithMetadata(ctx, id, engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation", nil); err != nil {
 				return err
-			}
-			if err := s.recordCancellationMetadataForJob(id.String(), terminalCancellationFor(engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation")); err != nil && !errors.Is(err, authority.ErrNotReady) && !errors.Is(err, coordinator.ErrAlreadyFinalized) {
-				log.Printf("agentbus daemon: job %s shutdown cancellation metadata persistence failed: %v", id, err)
 			}
 			s.abandonAdmissionUnresolvedCustody(ctx, coord, id)
 			return nil
@@ -2307,7 +2304,7 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	if record.Terminal == nil {
 		err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
 			modelJobID := model.JobID(jobID)
-			if err := coord.Cancel(context.Background(), modelJobID, nil); err != nil {
+			if err := coord.CancelWithMetadata(context.Background(), modelJobID, engine.CancellationOriginClientRequest, "client requested cancellation", nil); err != nil {
 				return err
 			}
 			s.abandonAdmissionUnresolvedCustody(context.Background(), coord, modelJobID)
@@ -2334,9 +2331,6 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 				}
 			}
 			return requestOutcome{err: admissionProtocolError(err)}
-		}
-		if err := s.recordCancellationMetadataForJob(jobID, terminalCancellationFor(engine.CancellationOriginClientRequest, "client requested cancellation")); err != nil && !errors.Is(err, coordinator.ErrAlreadyFinalized) {
-			log.Printf("agentbus daemon: job %s client cancellation metadata persistence failed: %v", jobID, err)
 		}
 		var reloadErr *protocol.ErrorObject
 		_, projection, ok, reloadErr = s.authorityJobProjection(jobID)
@@ -2706,35 +2700,15 @@ func (s *Server) finalizeFailure(run jobRun, err error) {
 
 func (s *Server) finalizeRequestedTerminal(run jobRun) error {
 	state := run.active.requestedTerminal()
-	cancellation := run.active.requestedCancellation()
 	if state == "" {
 		state = engine.StateCanceled
-		cancellation = terminalCancellationFor(engine.CancellationOriginUnattributable, "canceled without an attributable origin")
 	}
-	if err := s.finalizeTerminal(run, state, "", nil); err != nil {
-		return err
-	}
-	if state == engine.StateCanceled {
-		if err := s.recordCancellationMetadata(run, cancellation); err != nil {
-			log.Printf("agentbus daemon: job %s cancellation metadata persistence failed: %v", run.jobID, err)
-		}
-	}
-	return nil
+	return s.finalizeTerminal(run, state, "", nil)
 }
 
 func (s *Server) completeRunTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) {
 	if err := s.finalizeTerminal(run, state, text, stamp); err != nil {
 		s.handleRunFinalizationError(run, err)
-		return
-	}
-	if state == engine.StateCanceled && run.active != nil {
-		cancellation := run.active.requestedCancellation()
-		if cancellation.origin == "" {
-			cancellation = terminalCancellationFor(engine.CancellationOriginUnattributable, "canceled without an attributable origin")
-		}
-		if err := s.recordCancellationMetadata(run, cancellation); err != nil {
-			log.Printf("agentbus daemon: job %s cancellation metadata persistence failed: %v", run.jobID, err)
-		}
 	}
 }
 

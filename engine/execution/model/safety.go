@@ -275,7 +275,10 @@ type SafetyRecord struct {
 	FailureClass        engine.FailureClass         `json:"failureClass,omitempty"`
 	TransportFrameDrops *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
 	CancellationReason  string                      `json:"cancellationReason,omitempty"`
-	CancellationOrigin  engine.CancellationOrigin   `json:"cancellationOrigin,omitempty"`
+	// CancellationOrigin identifies why a canceled terminal was written. An
+	// absent origin on a canceled terminal means the record predates
+	// cancellation provenance and is unattributable, not a missing current write.
+	CancellationOrigin engine.CancellationOrigin `json:"cancellationOrigin,omitempty"`
 }
 
 func (record SafetyRecord) Validate() error {

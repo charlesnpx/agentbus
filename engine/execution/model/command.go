@@ -104,10 +104,12 @@ type RecordCancellation struct {
 }
 
 type TerminalIntent struct {
-	Outcome   Outcome
-	Cause     TerminalCause
-	DerivedBy BootRef
-	Contract  *engine.ContractStamp
+	Outcome            Outcome
+	Cause              TerminalCause
+	DerivedBy          BootRef
+	Contract           *engine.ContractStamp
+	CancellationOrigin engine.CancellationOrigin
+	CancellationReason string
 	// FinalAttemptEndedAt is when the final contract attempt reached this
 	// terminal transition. It is not a whole-job duration or attempt history.
 	FinalAttemptEndedAt *time.Time

@@ -554,7 +554,9 @@ func (s *Store) Cancel(jobID string) (*JobRecord, error) {
 }
 
 // CancelWithMetadata transitions a queued or active background job record to
-// canceled and records the observed cancellation explanation.
+// canceled and records the observed cancellation explanation. Callers must
+// pass non-sensitive text: it is persisted and exposed on job.status and
+// job.result.
 func (s *Store) CancelWithMetadata(jobID string, origin CancellationOrigin, reason string) (*JobRecord, error) {
 	if !origin.Valid() {
 		origin = CancellationOriginUnattributable
