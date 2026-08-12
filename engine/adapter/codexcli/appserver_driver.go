@@ -642,12 +642,20 @@ func terminalItemInventory(payload, turn map[string]any) (present, mayHaveToolWo
 }
 
 func itemMayHavePerformedToolWork(item map[string]any) bool {
-	switch normalizeKind(firstString(item, "type")) {
-	case "agentmessage", "assistantmessage", "message":
-		return false
-	default:
-		return true
-	}
+	return !isTerminalAgentMessage(item)
+}
+
+// isTerminalAgentMessage recognizes the one terminal-item shape that can
+// contribute to a safe provider-overload retry decision. Codex CLI 0.147.0's
+// app-server schema defines AgentMessageThreadItem as an object with the
+// literal type "agentMessage" plus string id and text fields. Do not reuse
+// the more permissive streaming-item aliases here: an unfamiliar or malformed
+// terminal item cannot prove that tool work did not happen.
+func isTerminalAgentMessage(item map[string]any) bool {
+	itemType, typeOK := item["type"].(string)
+	_, idOK := item["id"].(string)
+	_, textOK := item["text"].(string)
+	return typeOK && itemType == "agentMessage" && idOK && textOK
 }
 
 func isProviderOverloaded(errorInfo, message string) bool {

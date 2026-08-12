@@ -489,6 +489,36 @@ func TestAppServerProviderOverloadFallsBackAfterToolWorkEvidence(t *testing.T) {
 				map[string]any{"id": "unknown-1", "type": "newItemKind"},
 			},
 		},
+		{
+			name: "terminal agent message without identity or content",
+			terminalItems: []any{
+				map[string]any{"type": "agentMessage"},
+			},
+		},
+		{
+			name: "terminal assistant message alias without identity or content",
+			terminalItems: []any{
+				map[string]any{"type": "assistantMessage"},
+			},
+		},
+		{
+			name: "terminal message alias without identity or content",
+			terminalItems: []any{
+				map[string]any{"type": "message"},
+			},
+		},
+		{
+			name: "terminal agent message with wrong identity and content types",
+			terminalItems: []any{
+				map[string]any{"id": 1, "type": "agentMessage", "text": []any{"not text"}},
+			},
+		},
+		{
+			name: "terminal non-object item",
+			terminalItems: []any{
+				"agentMessage",
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

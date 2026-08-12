@@ -39,9 +39,9 @@ const (
 	// backend turn, so no backend work was possible.
 	FailureClassBackendNotStarted FailureClass = "backend_not_started"
 	// FailureClassProviderOverloaded means the provider refused the turn for
-	// capacity or overload reasons after the adapter established that no
-	// potentially side-effecting backend tool work occurred. The condition is
-	// transient and safe to retry.
+	// capacity or overload reasons. The adapter emits it only when its terminal
+	// protocol evidence is a well-formed agent-message-only inventory and it
+	// observed no tool work; it is a conservative retry classification.
 	FailureClassProviderOverloaded FailureClass = "provider_overloaded"
 	// FailureClassBackendError means a launched backend turn returned an error;
 	// it may have performed work before doing so.
