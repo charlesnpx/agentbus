@@ -2282,30 +2282,37 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		return requestOutcome{err: strictAdmissionRuntimeUnavailableError(instance.policy.runtimeAssessment, protocol.ErrorData{Backend: spec.Backend})}
 	}
 
-	session, err := descriptor.backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
-	if err != nil {
-		return requestOutcome{err: backendError(err)}
-	}
-	if _, ok := session.(ordinalBoundSession); !ok {
-		err := admissionBackendContractViolationError{backend: spec.Backend}
-		return requestOutcome{err: strictAdmissionProtocolError(
-			protocol.ErrorCapabilityMissing,
-			protocol.AdmissionRejectUnfenceableBackend,
-			err.Error(),
-			protocol.ErrorData{Backend: spec.Backend},
-		)}
-	}
-	// CLI-adapter sessions have NO id at Start time: the backend stream assigns
-	// it during the first turn (cliadapter Session.id is set from stream parse).
-	// An empty id here is therefore the NORMAL controlled-backend contract, and
-	// served supplies the admission session id — the pre-existing behavior. Only
-	// a NONEMPTY id that fails the authority's own validation is a backend
-	// metadata defect (backend_unavailable, pre-acceptance, no durable mutation).
-	admissionSessionID := session.ID()
-	if admissionSessionID == "" {
-		admissionSessionID = s.nextID("ses")
-	} else if err := authority.ValidateSessionID(admissionSessionID); err != nil {
-		return requestOutcome{err: backendSessionMetadataError(spec.Backend, admissionSessionID, err)}
+	// The authority owns job IDs, so an isolated Codex home cannot be named
+	// until after durable acceptance. Creating a Codex adapter session does not
+	// start its app-server process; it only prepares the session object that the
+	// later admitted turn will launch. Other backends retain the established
+	// construct-before-accept ordering.
+	isolateCodexHome := spec.Backend == "codex" && !s.codexHomeInherit
+	var session engine.Session
+	admissionSessionID := s.nextID("ses")
+	if !isolateCodexHome {
+		session, err = descriptor.backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
+		if err != nil {
+			return requestOutcome{err: backendError(err)}
+		}
+		if _, ok := session.(ordinalBoundSession); !ok {
+			err := admissionBackendContractViolationError{backend: spec.Backend}
+			return requestOutcome{err: strictAdmissionProtocolError(
+				protocol.ErrorCapabilityMissing,
+				protocol.AdmissionRejectUnfenceableBackend,
+				err.Error(),
+				protocol.ErrorData{Backend: spec.Backend},
+			)}
+		}
+		// CLI-adapter sessions have NO id at Start time: the backend stream
+		// assigns it during the first turn. An empty ID is therefore normal;
+		// served supplies a durable admission-session ID in that case.
+		if backendSessionID := session.ID(); backendSessionID != "" {
+			if err := authority.ValidateSessionID(backendSessionID); err != nil {
+				return requestOutcome{err: backendSessionMetadataError(spec.Backend, backendSessionID, err)}
+			}
+			admissionSessionID = backendSessionID
+		}
 	}
 	request := authority.AcceptRequest{
 		RequestKey:         requestKey,
@@ -2360,6 +2367,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		jobID:               jobID,
 		sessionID:           admissionSessionID,
 		backend:             spec.Backend,
+		backendImpl:         descriptor.backend,
 		cwd:                 spec.CWD,
 		model:               spec.Model,
 		effort:              spec.Effort,
@@ -2372,6 +2380,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		contractName:        policy.name,
 		contractHash:        policy.hash,
 		timeout:             timeout,
+		codexIsolated:       isolateCodexHome,
 		admissionControlled: true,
 		admissionMode:       model.ModeIdentifiedFenced,
 		admissionAccepted:   accepted,
@@ -2505,21 +2514,71 @@ func (s *Server) launchAdmittedJob(ctx context.Context, run jobRun) {
 		var ok bool
 		var launchErr error
 		launched, runCtx, ok, launchErr = s.prepareAdmittedJobLaunch(ctx, run)
+		if launchErr != nil {
+			return launchErr
+		}
 		if !ok {
 			return nil
 		}
-		return launchErr
+		return nil
 	})
 	if err != nil {
-		// prepareAdmittedJobLaunch only reads admission state and registers the
-		// active job; it does not call LaunchRunner or the backend session.
-		s.completeRunFailure(run, engine.StateFailed, "", nil, terminalFailureBackendNotStarted, err)
+		// prepareAdmittedJobLaunch only reads admission state, prepares the
+		// accepted job's Codex session when needed, and registers the active job;
+		// it does not call LaunchRunner or start a backend turn.
+		if launched.active == nil {
+			launched.admissionLaunchFailed = true
+			s.finalizeAdmittedLaunchFailure(launched, err)
+		} else {
+			s.completeRunFailure(launched, engine.StateFailed, "", nil, terminalFailureBackendNotStarted, err)
+		}
 		return
 	}
 	if launched.active == nil {
 		return
 	}
 	s.runJob(runCtx, launched)
+}
+
+func (s *Server) finalizeAdmittedLaunchFailure(run jobRun, cause error) {
+	jobID, err := model.NewJobID(run.jobID)
+	if err != nil {
+		s.handleRunFinalizationError(run, err)
+		return
+	}
+	err = s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
+		snapshot, err := coord.Snapshot(context.Background(), jobID)
+		if err != nil {
+			return err
+		}
+		if snapshot.Record.Terminal != nil || snapshot.Record.Cancel != nil {
+			return nil
+		}
+		if err := coord.Finalize(context.Background(), jobID, model.TerminalIntent{
+			Outcome: model.OutcomeFailed,
+			Cause:   model.CauseDaemonRestartedBeforeAuthorization,
+		}); err != nil {
+			if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		s.handleRunFinalizationError(run, err)
+		return
+	}
+	if err := s.recordFailureMetadata(run, terminalFailureFor(terminalFailureBackendNotStarted, cause, false)); err != nil {
+		log.Printf("agentbus daemon: job %s preparation failure metadata persistence failed: %v", run.jobID, err)
+	}
+	if err := s.cleanupAdmittedCodexHomeFromCommittedTerminal(run); err != nil {
+		s.handleRunFinalizationError(run, err)
+	}
+}
+
+func (s *Server) cleanupAdmittedCodexHomeFromCommittedTerminal(run jobRun) error {
+	s.cleanupManagedCodexHomeForAdmissionRun(run)
+	return nil
 }
 
 func (s *Server) handleAdmissionResponseOutcome(ctx context.Context, run jobRun, delivered bool) {
@@ -2552,7 +2611,40 @@ func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobR
 		return run, nil, false, nil
 	}
 	if run.session == nil {
-		return run, nil, false, errors.New("admission session is not ready")
+		if run.backend != "codex" || !run.codexIsolated {
+			return run, nil, false, errors.New("admission session is not ready")
+		}
+		if run.backendImpl == nil {
+			return run, nil, false, errors.New("admission Codex backend is unavailable")
+		}
+		layout, err := engine.LayoutForWorkspace(s.stateRoot, run.cwd)
+		if err != nil {
+			return run, nil, false, err
+		}
+		run.codexHome, run.managedCodexHome, err = s.prepareCodexHome(layout, run.jobID)
+		if err != nil {
+			return run, nil, false, err
+		}
+		session, err := run.backendImpl.Start(ctx, engine.SessionOpts{
+			CWD:        run.cwd,
+			Write:      run.write,
+			Model:      run.model,
+			Effort:     run.effort,
+			Timeout:    run.timeout,
+			EnvOverlay: map[string]string{"CODEX_HOME": run.codexHome},
+		})
+		if err != nil {
+			return run, nil, false, err
+		}
+		if _, ok := session.(ordinalBoundSession); !ok {
+			return run, nil, false, admissionBackendContractViolationError{backend: run.backend}
+		}
+		if backendSessionID := session.ID(); backendSessionID != "" {
+			if err := authority.ValidateSessionID(backendSessionID); err != nil {
+				return run, nil, false, fmt.Errorf("backend returned invalid session id: %w", err)
+			}
+		}
+		run.session = session
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	activeJob := &activeJob{jobID: run.jobID, sessionID: run.sessionID, session: run.session, cancel: cancel, containmentIntent: run.admissionLaunch.containmentIntent}

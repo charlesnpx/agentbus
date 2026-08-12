@@ -129,10 +129,21 @@ type BinaryIdentityProbe func(path string) (BinaryIdentity, error)
 
 // Config configures the local JSON-RPC daemon.
 type Config struct {
-	StateRoot           string
-	CWD                 string
-	SocketPath          string
-	Token               string
+	StateRoot  string
+	CWD        string
+	SocketPath string
+	Token      string
+	// CodexHomeOverride sets a fixed CODEX_HOME for all Codex jobs. When empty,
+	// each job receives a private home under its workspace namespace.
+	CodexHomeOverride string
+	// CodexHomeInherit disables Codex home isolation and preserves the process
+	// environment exactly as it was before this setting existed.
+	CodexHomeInherit bool
+	// CodexAuthHome is the operator Codex home from which auth.json and
+	// config.toml are linked. Empty resolves from ambient CODEX_HOME, then
+	// ~/.codex. It exists so embedded callers can avoid consulting process
+	// environment state.
+	CodexAuthHome       string
 	Backends            []engine.Backend
 	Registry            *engine.PolicyRegistry
 	Clock               engine.Clock
@@ -208,6 +219,9 @@ type Server struct {
 	socketPath                   string
 	tokenPath                    string
 	token                        string
+	codexHomeOverride            string
+	codexHomeInherit             bool
+	codexAuthHome                string
 	backendMapMu                 sync.RWMutex
 	backends                     map[string]engine.Backend
 	registry                     *engine.PolicyRegistry
@@ -512,6 +526,9 @@ func New(cfg Config) (*Server, error) {
 		socketPath:             socketPath,
 		tokenPath:              tokenPath,
 		token:                  token,
+		codexHomeOverride:      cfg.CodexHomeOverride,
+		codexHomeInherit:       cfg.CodexHomeInherit,
+		codexAuthHome:          cfg.CodexAuthHome,
 		backends:               backends,
 		registry:               registry,
 		clock:                  clock,
@@ -2347,6 +2364,7 @@ type jobRun struct {
 	jobID                   string
 	sessionID               string
 	backend                 string
+	backendImpl             engine.Backend
 	cwd                     string
 	model                   string
 	effort                  string
@@ -2359,10 +2377,14 @@ type jobRun struct {
 	contractName            string
 	contractHash            string
 	timeout                 time.Duration
+	codexIsolated           bool
+	codexHome               string
+	managedCodexHome        *managedCodexHome
 	active                  *activeJob
 	onDone                  func()
 	authoritativeCompletion bool
 	admissionControlled     bool
+	admissionLaunchFailed   bool
 	admissionMode           model.Mode
 	admissionAccepted       authority.AcceptResult
 	admissionLaunch         admissionLaunchBinding
@@ -2371,6 +2393,7 @@ type jobRun struct {
 func (s *Server) runJob(ctx context.Context, run jobRun) {
 	run.authoritativeCompletion = true
 	defer s.removeActiveJob(run.jobID)
+	defer s.cleanupManagedCodexHomeForAdmissionRun(run)
 	defer func() {
 		if run.onDone != nil {
 			run.onDone()

@@ -101,6 +101,13 @@ also carries the prompt, reasoning effort, sandbox, and approval policy.
 `Interrupt` sends `turn/interrupt` for the active thread and turn before the
 shared runtime falls back to process interruption.
 
+When served by the daemon, Codex additionally receives a job-private
+`CODEX_HOME` under the workspace state namespace. Agentbus links only the
+operator home’s `auth.json` and `config.toml` into it; it never copies
+credentials. `AGENTBUS_CODEX_HOME` selects a fixed absolute replacement home
+and `AGENTBUS_CODEX_HOME_INHERIT=1` disables isolation. The opt-out wins over
+the fixed override.
+
 ### codex effort values
 
 When `SessionOpts.Effort` is provided, the codex adapter includes it in the
