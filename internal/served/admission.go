@@ -42,6 +42,7 @@ const (
 	admissionContentionRetryDelay   = 50 * time.Millisecond
 	admissionContentionFallback     = 2 * time.Second
 	admissionProbeReasonMaxRunes    = engine.FailureReasonMaxRunes
+	defaultAdmissionLogRetentionCap = int64(1 << 30)
 )
 
 var admissionDetachedCleanupTimeout = 30 * time.Second
@@ -3023,17 +3024,19 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 }
 
 func (s *Server) admissionLogPaths(record model.SafetyRecord) *engine.LogPaths {
+	if record.Terminal != nil && record.Terminal.Outcome == model.OutcomeCompleted {
+		return nil
+	}
+	if s.admissionLogDrain(record.JobID.String()) != nil {
+		return nil
+	}
 	layout, err := authorityResultLayout(s.stateRoot, record)
 	if err != nil {
 		return nil
 	}
-	s.sweepExpiredAdmissionLogs(layout, record)
 	paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
 	if err != nil {
 		return nil
-	}
-	if record.Terminal != nil {
-		_ = discardEmptyBackendLogs(paths)
 	}
 	var advertised engine.LogPaths
 	if admissionReadableLogFile(paths.Stdout) {
@@ -3048,21 +3051,150 @@ func (s *Server) admissionLogPaths(record model.SafetyRecord) *engine.LogPaths {
 	return &advertised
 }
 
-func (s *Server) sweepExpiredAdmissionLogs(layout engine.WorkspaceLayout, record model.SafetyRecord) {
-	if record.Terminal == nil || record.FinalAttemptEndedAt == nil || s.clock.Now().UTC().Sub(*record.FinalAttemptEndedAt) < engine.DefaultLogTTL {
+type admissionLogCandidate struct {
+	jobID       string
+	paths       engine.LogPaths
+	terminalAt  time.Time
+	bytes       int64
+	workspaceID string
+}
+
+// admissionLogSweepLoop runs retention independently of status reads while a
+// server is serving requests.
+func (s *Server) admissionLogSweepLoop(ctx context.Context) {
+	s.sweepAdmissionLogs()
+	interval := s.gcInterval
+	if interval <= 0 {
+		interval = engine.DefaultGCInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.sweepAdmissionLogs()
+		}
+	}
+}
+
+func (s *Server) sweepAdmissionLogs() {
+	s.admissionStateMu.RLock()
+	repo := s.admissionRepository
+	ready := s.admissionInstance != nil && repo != nil
+	s.admissionStateMu.RUnlock()
+	if !ready {
 		return
 	}
-	paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
-	if err != nil {
+	var records []model.SafetyRecord
+	if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+		images, err := tx.ListJobs(repository.JobFilter{})
+		if err != nil {
+			return err
+		}
+		for _, image := range images {
+			if image.Safety.State == repository.RecordValid {
+				records = append(records, image.Safety.Value)
+			}
+		}
+		return nil
+	}); err != nil {
+		log.Printf("agentbus daemon: admission backend log retention sweep failed: %v", err)
 		return
 	}
-	for _, path := range []string{paths.Stdout, paths.Stderr} {
-		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() {
+
+	now := s.clock.Now().UTC()
+	workspaceBytes := make(map[string]int64)
+	eligible := make(map[string][]admissionLogCandidate)
+	for _, record := range records {
+		layout, err := authorityResultLayout(s.stateRoot, record)
+		if err != nil {
 			continue
 		}
-		_ = os.Remove(path)
+		paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
+		if err != nil {
+			continue
+		}
+		bytes := backendLogBytes(paths)
+		workspaceID := record.WorkspaceLayoutKey.String()
+		workspaceBytes[workspaceID] += bytes
+		if record.Terminal == nil || s.admissionLogProtected(record.JobID.String()) {
+			continue
+		}
+		if record.Terminal.Outcome == model.OutcomeCompleted || admissionLogsExpired(record, now) {
+			if err := discardBackendLogs(paths); err != nil {
+				log.Printf("agentbus daemon: remove backend logs for %s: %v", record.JobID, err)
+				continue
+			}
+			workspaceBytes[workspaceID] -= bytes
+			continue
+		}
+		if bytes == 0 {
+			continue
+		}
+		terminalAt := time.Time{}
+		if record.FinalAttemptEndedAt != nil {
+			terminalAt = record.FinalAttemptEndedAt.UTC()
+		}
+		eligible[workspaceID] = append(eligible[workspaceID], admissionLogCandidate{
+			jobID:       record.JobID.String(),
+			paths:       paths,
+			terminalAt:  terminalAt,
+			bytes:       bytes,
+			workspaceID: workspaceID,
+		})
 	}
+
+	capBytes := s.admissionLogRetentionCap
+	if capBytes <= 0 {
+		capBytes = defaultAdmissionLogRetentionCap
+	}
+	for workspaceID, candidates := range eligible {
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].terminalAt.Equal(candidates[j].terminalAt) {
+				return candidates[i].jobID < candidates[j].jobID
+			}
+			return candidates[i].terminalAt.Before(candidates[j].terminalAt)
+		})
+		for _, candidate := range candidates {
+			if workspaceBytes[workspaceID] <= capBytes {
+				break
+			}
+			if s.admissionLogProtected(candidate.jobID) {
+				continue
+			}
+			if err := discardBackendLogs(candidate.paths); err != nil {
+				log.Printf("agentbus daemon: evict backend logs for %s: %v", candidate.jobID, err)
+				continue
+			}
+			workspaceBytes[workspaceID] -= candidate.bytes
+		}
+	}
+}
+
+func admissionLogsExpired(record model.SafetyRecord, now time.Time) bool {
+	return record.FinalAttemptEndedAt != nil && now.Sub(record.FinalAttemptEndedAt.UTC()) >= engine.DefaultLogTTL
+}
+
+func backendLogBytes(paths engine.LogPaths) int64 {
+	var total int64
+	for _, path := range []string{paths.Stdout, paths.Stderr} {
+		info, err := os.Lstat(path)
+		if err == nil && info.Mode().IsRegular() {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
+func (s *Server) admissionLogProtected(jobID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeJobs[jobID] != nil {
+		return true
+	}
+	return s.admissionLogDrains[jobID] != nil
 }
 
 func admissionReadableLogFile(path string) bool {

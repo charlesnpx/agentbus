@@ -246,6 +246,7 @@ type Server struct {
 	leaseDuration                time.Duration
 	heartbeatInterval            time.Duration
 	gcInterval                   time.Duration
+	admissionLogRetentionCap     int64
 	readyHook                    func(ServeReadyInfo) error
 	listenerFactory              func() (net.Listener, socketFileIdentity, error)
 	unixSocketPrivateListenHooks unixSocketPrivateListenHooks
@@ -295,6 +296,7 @@ type Server struct {
 	admissionJobs      map[string]*admissionInstance
 	admissionEffectMu  map[string]*sync.Mutex
 	activeJobs         map[string]*activeJob
+	admissionLogDrains map[string]<-chan struct{}
 	jobLiveness        map[string]*jobLiveness
 	reportedModels     map[string]string
 	reportedModelOrder []string
@@ -536,43 +538,45 @@ func New(cfg Config) (*Server, error) {
 		probeRunner = command.DirectProbeRunner{}
 	}
 	return &Server{
-		stateRoot:              root,
-		cwd:                    cwd,
-		socketPath:             socketPath,
-		tokenPath:              tokenPath,
-		token:                  token,
-		codexHomeOverride:      cfg.CodexHomeOverride,
-		codexHomeInherit:       cfg.CodexHomeInherit,
-		codexAuthHome:          cfg.CodexAuthHome,
-		backends:               backends,
-		registry:               registry,
-		clock:                  clock,
-		processes:              processes,
-		processGroups:          cfg.ProcessGroups,
-		cancelGrace:            cfg.CancelGrace,
-		cancelWaiter:           cfg.CancelWaiter,
-		idleTimeout:            idleTimeout,
-		idleCheckInterval:      idleCheck,
-		binaryIdentityProbe:    binaryIdentityProbe,
-		inlineResultCap:        inlineResultCap,
-		leaseDuration:          leaseDuration,
-		heartbeatInterval:      heartbeatInterval,
-		gcInterval:             gcInterval,
-		readyHook:              cfg.ReadyHook,
-		safetyLatch:            NewSafetyLatch(),
-		safetyDrainTimeout:     defaultSafetyDrain,
-		shutdownTimeout:        normalizeShutdownTimeout(cfg.ShutdownTimeout),
-		stores:                 make(map[string]*engine.Store),
-		storesByKey:            make(map[string]*engine.Store),
-		jobStores:              make(map[string]*engine.Store),
-		admissionJobs:          make(map[string]*admissionInstance),
-		admissionEffectMu:      make(map[string]*sync.Mutex),
-		admissionRuntimeConfig: cfg.Runtime,
-		admissionProbeRunner:   probeRunner,
-		activeJobs:             make(map[string]*activeJob),
-		jobLiveness:            make(map[string]*jobLiveness),
-		reportedModels:         make(map[string]string),
-		lastActivity:           clock.Now().UTC(),
+		stateRoot:                root,
+		cwd:                      cwd,
+		socketPath:               socketPath,
+		tokenPath:                tokenPath,
+		token:                    token,
+		codexHomeOverride:        cfg.CodexHomeOverride,
+		codexHomeInherit:         cfg.CodexHomeInherit,
+		codexAuthHome:            cfg.CodexAuthHome,
+		backends:                 backends,
+		registry:                 registry,
+		clock:                    clock,
+		processes:                processes,
+		processGroups:            cfg.ProcessGroups,
+		cancelGrace:              cfg.CancelGrace,
+		cancelWaiter:             cfg.CancelWaiter,
+		idleTimeout:              idleTimeout,
+		idleCheckInterval:        idleCheck,
+		binaryIdentityProbe:      binaryIdentityProbe,
+		inlineResultCap:          inlineResultCap,
+		leaseDuration:            leaseDuration,
+		heartbeatInterval:        heartbeatInterval,
+		gcInterval:               gcInterval,
+		admissionLogRetentionCap: defaultAdmissionLogRetentionCap,
+		readyHook:                cfg.ReadyHook,
+		safetyLatch:              NewSafetyLatch(),
+		safetyDrainTimeout:       defaultSafetyDrain,
+		shutdownTimeout:          normalizeShutdownTimeout(cfg.ShutdownTimeout),
+		stores:                   make(map[string]*engine.Store),
+		storesByKey:              make(map[string]*engine.Store),
+		jobStores:                make(map[string]*engine.Store),
+		admissionJobs:            make(map[string]*admissionInstance),
+		admissionEffectMu:        make(map[string]*sync.Mutex),
+		admissionLogDrains:       make(map[string]<-chan struct{}),
+		admissionRuntimeConfig:   cfg.Runtime,
+		admissionProbeRunner:     probeRunner,
+		activeJobs:               make(map[string]*activeJob),
+		jobLiveness:              make(map[string]*jobLiveness),
+		reportedModels:           make(map[string]string),
+		lastActivity:             clock.Now().UTC(),
 	}, nil
 }
 
@@ -685,6 +689,7 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	safetyDone := make(chan error, 1)
 	go s.safetyLoop(ctx, cancel, ln, socketIdentity, acceptSettled, safetyDone)
 	go s.idleLoop(ctx, cancel, ln, socketIdentity, acceptSettled)
+	go s.admissionLogSweepLoop(ctx)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -2525,24 +2530,18 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 	var terminalState engine.JobState
 	var terminalErr error
 	for {
-		if terminalErr != nil {
-			// The producer may need the consumer to make space for tail events
-			// before it can finish session cleanup and close the stream.
-			go func() {
-				for range events {
-				}
-			}()
-			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), terminalState, terminalErr
-		}
 		select {
 		case <-attemptCtx.Done():
 			if shouldInterruptSessionOnAttemptCancel(run, attemptCtx.Err()) {
 				_ = run.session.Interrupt(context.Background())
 			}
-			terminalState = stateForContext(attemptCtx.Err())
-			terminalErr = attemptCtx.Err()
+			s.deferAdmissionEventDrain(run, events)
+			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), stateForContext(attemptCtx.Err()), attemptCtx.Err()
 		case event, ok := <-events:
 			if !ok {
+				if terminalErr != nil {
+					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), terminalState, terminalErr
+				}
 				if attemptCtx.Err() != nil {
 					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), stateForContext(attemptCtx.Err()), attemptCtx.Err()
 				}
@@ -2565,6 +2564,7 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				hasResultMessage = true
 			case engine.EventModelReported:
 				if err := s.recordModelReported(run, event.ModelReported); err != nil {
+					s.deferAdmissionEventDrain(run, events)
 					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, classifyFailureError(terminalFailureInternal, err)
 				}
 			case engine.EventTerminalError:
@@ -2616,6 +2616,45 @@ func (s *Server) recordTransportFrameDrops(run jobRun, drops engine.TransportFra
 		return *record.TransportFrameDrops != before, nil
 	})
 	return err
+}
+
+// deferAdmissionEventDrain waits for an adapter stream that outlives an
+// interrupted attempt. Deferred backend-log cleanup observes its completion
+// before inspecting the corresponding files.
+func (s *Server) deferAdmissionEventDrain(run jobRun, events <-chan engine.Event) {
+	if !run.admissionControlled || run.jobID == "" || events == nil {
+		return
+	}
+	done := make(chan struct{})
+	s.mu.Lock()
+	if s.admissionLogDrains == nil {
+		s.admissionLogDrains = make(map[string]<-chan struct{})
+	}
+	if _, exists := s.admissionLogDrains[run.jobID]; exists {
+		s.mu.Unlock()
+		return
+	}
+	s.admissionLogDrains[run.jobID] = done
+	s.mu.Unlock()
+	go func() {
+		for range events {
+		}
+		close(done)
+	}()
+}
+
+func (s *Server) admissionLogDrain(jobID string) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.admissionLogDrains[jobID]
+}
+
+func (s *Server) finishAdmissionLogDrain(jobID string, done <-chan struct{}) {
+	s.mu.Lock()
+	if s.admissionLogDrains[jobID] == done {
+		delete(s.admissionLogDrains, jobID)
+	}
+	s.mu.Unlock()
 }
 
 func attemptFinalText(hasResultMessage bool, resultText, assistantText string) string {
@@ -2823,6 +2862,28 @@ func discardEmptyBackendLogs(paths engine.LogPaths) error {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func discardBackendLogs(paths engine.LogPaths) error {
+	for _, path := range []string{paths.Stdout, paths.Stderr} {
+		if path == "" {
+			continue
+		}
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("backend log %q is not a regular file", path)
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
 	}
 	return nil

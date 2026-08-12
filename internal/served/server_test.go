@@ -61,11 +61,19 @@ type fakeTurn struct {
 
 type logCaptureBackend struct {
 	*fakeBackend
-	input chan engine.TurnInput
+	input              chan engine.TurnInput
+	terminal           engine.Event
+	logContent         map[string]string
+	writeAfterTerminal <-chan struct{}
+	writersOpened      chan struct{}
 }
 
 func newLogCaptureBackend(name string) *logCaptureBackend {
-	return &logCaptureBackend{fakeBackend: newFakeBackend(name), input: make(chan engine.TurnInput, 1)}
+	return &logCaptureBackend{
+		fakeBackend: newFakeBackend(name),
+		input:       make(chan engine.TurnInput, 8),
+		terminal:    engine.Event{Type: engine.EventTerminalError, Text: "backend exploded"},
+	}
 }
 
 func (b *logCaptureBackend) ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error) {
@@ -113,15 +121,50 @@ func (s *logCaptureSession) TurnWithRunner(ctx context.Context, input engine.Tur
 	if observer, ok := running.(command.FinalObserver); ok {
 		go func() { _, _ = observer.FinalObservation(context.Background()) }()
 	}
-	for path, content := range map[string]string{
-		input.LogPaths.Stdout: "backend stdout\n",
-		input.LogPaths.Stderr: "backend stderr\n",
-	} {
+	content := s.backend.logContent
+	if content == nil {
+		content = map[string]string{
+			input.LogPaths.Stdout: "backend stdout\n",
+			input.LogPaths.Stderr: "backend stderr\n",
+		}
+	}
+	if s.backend.writeAfterTerminal != nil {
+		type delayedLogWriter struct {
+			writer *engine.CappedLogWriter
+			text   string
+		}
+		writers := make([]delayedLogWriter, 0, len(content))
+		for path, text := range content {
+			writer, err := engine.NewCappedLogWriter(path, 0)
+			if err != nil {
+				for _, opened := range writers {
+					_ = opened.writer.Close()
+				}
+				return nil, err
+			}
+			writers = append(writers, delayedLogWriter{writer: writer, text: text})
+		}
+		if s.backend.writersOpened != nil {
+			close(s.backend.writersOpened)
+		}
+		events := make(chan engine.Event, 1)
+		events <- s.backend.terminal
+		go func() {
+			<-s.backend.writeAfterTerminal
+			for _, writer := range writers {
+				_, _ = io.WriteString(writer.writer, writer.text)
+				_ = writer.writer.Close()
+			}
+			close(events)
+		}()
+		return events, nil
+	}
+	for path, text := range content {
 		writer, err := engine.NewCappedLogWriter(path, 0)
 		if err != nil {
 			return nil, err
 		}
-		if _, err := io.WriteString(writer, content); err != nil {
+		if _, err := io.WriteString(writer, text); err != nil {
 			_ = writer.Close()
 			return nil, err
 		}
@@ -130,7 +173,7 @@ func (s *logCaptureSession) TurnWithRunner(ctx context.Context, input engine.Tur
 		}
 	}
 	events := make(chan engine.Event, 1)
-	events <- engine.Event{Type: engine.EventTerminalError, Text: "backend exploded"}
+	events <- s.backend.terminal
 	close(events)
 	return events, nil
 }
@@ -7500,6 +7543,200 @@ func TestSuccessfulAdmissionJobDoesNotAdvertiseEmptyLogPaths(t *testing.T) {
 	}
 	if _, ok := fields["logPaths"]; ok {
 		t.Fatalf("completed status JSON = %s, unexpectedly contains logPaths", raw)
+	}
+}
+
+func TestSuccessfulAdmissionJobDiscardsNonemptyBackendLogs(t *testing.T) {
+	t.Parallel()
+	backend := newLogCaptureBackend("fake")
+	backend.terminal = engine.Event{Type: engine.EventAgentText, Text: "done"}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-successful-log-discard",
+		RequestID:    "request-successful-log-discard",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "succeed"},
+	})
+	input := <-backend.input
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	waitAdmissionLogPairAbsent(t, input.LogPaths)
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+	if len(status.Jobs) != 1 || status.Jobs[0].LogPaths != nil {
+		t.Fatalf("successful terminal status = %+v, want no log paths", status)
+	}
+}
+
+func TestTerminalErrorWaitsForLogWritersBeforeCleanup(t *testing.T) {
+	t.Parallel()
+	backend := newLogCaptureBackend("fake")
+	releaseWriters := make(chan struct{})
+	backend.writeAfterTerminal = releaseWriters
+	backend.writersOpened = make(chan struct{})
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-terminal-log-drain",
+		RequestID:    "request-terminal-log-drain",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "fail"},
+	})
+	input := <-backend.input
+	select {
+	case <-backend.writersOpened:
+	case <-time.After(time.Second):
+		t.Fatal("backend did not open log writers")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if record := loadAdmissionSafetyRecord(t, server, job.JobID); record.Terminal != nil {
+		t.Fatalf("job terminalized before backend log writers finished: %+v", record.Terminal)
+	}
+	close(releaseWriters)
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	for _, path := range []string{input.LogPaths.Stdout, input.LogPaths.Stderr} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read retained backend log %s: %v", path, err)
+		}
+		if !strings.Contains(string(content), "backend") {
+			t.Fatalf("retained backend log %s = %q, want backend content", path, content)
+		}
+	}
+}
+
+func TestAdmissionLogSweepExpiresAndCapsTerminalLogs(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, _ := newUnstartedTestServer(t, backend)
+	clock := &steppedClock{now: time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)}
+	server.clock = clock
+	server.admissionLogRetentionCap = 20
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	expired := acceptAndFailAuthorityWorkForLogRetention(t, server, "retention-expired", clock.Now())
+	writeAdmissionLogPair(t, server, expired.Record, "expired")
+	clock.Set(clock.Now().Add(engine.DefaultLogTTL + time.Second))
+	old := acceptAndFailAuthorityWorkForLogRetention(t, server, "retention-old", clock.Now())
+	writeAdmissionLogPair(t, server, old.Record, "old")
+	clock.Set(clock.Now().Add(time.Second))
+	newer := acceptAndFailAuthorityWorkForLogRetention(t, server, "retention-new", clock.Now())
+	writeAdmissionLogPair(t, server, newer.Record, "new")
+	active := acceptAuthorityWorkForLogRetention(t, server, "retention-active")
+	writeAdmissionLogPair(t, server, active.Record, "active")
+
+	server.gcInterval = 10 * time.Millisecond
+	sweepCtx, stopSweep := context.WithCancel(context.Background())
+	defer stopSweep()
+	go server.admissionLogSweepLoop(sweepCtx)
+	assertAdmissionLogPairAbsent(t, server, expired.Record)
+	assertAdmissionLogPairAbsent(t, server, old.Record)
+	assertAdmissionLogPairPresent(t, server, newer.Record)
+	assertAdmissionLogPairPresent(t, server, active.Record)
+}
+
+func acceptAndFailAuthorityWorkForLogRetention(t *testing.T, server *Server, requestID string, terminalAt time.Time) authority.AcceptResult {
+	t.Helper()
+	accepted := acceptAuthorityWorkForLogRetention(t, server, requestID)
+	if _, err := server.admissionReady.Finalize(context.Background(), accepted.Record.JobID, accepted.Record.Attempt.Ref, model.TerminalIntent{
+		Outcome:             model.OutcomeFailed,
+		Cause:               model.CauseDaemonRestartedBeforeAuthorization,
+		FinalAttemptEndedAt: &terminalAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return accepted
+}
+
+func acceptAuthorityWorkForLogRetention(t *testing.T, server *Server, requestID string) authority.AcceptResult {
+	t.Helper()
+	accepted, err := server.admissionReady.Accept(context.Background(), authority.AcceptRequest{
+		RequestKey: model.RequestKey{
+			WorkspaceKey: model.WorkspaceKey("workspace-log-retention"),
+			RequestID:    model.RequestID(requestID),
+		},
+		WorkspaceLayoutKey: model.WorkspaceKey(strings.Repeat("a", 64)),
+		TaskIdentity:       model.NewSHA256TaskIdentity([]byte(requestID)),
+		Mode:               model.ModeIdentifiedFenced,
+		SessionID:          "session-" + requestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return accepted
+}
+
+func writeAdmissionLogPair(t *testing.T, server *Server, record model.SafetyRecord, text string) {
+	t.Helper()
+	layout, err := authorityResultLayout(server.stateRoot, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{paths.Stdout, paths.Stderr} {
+		writer, err := engine.NewCappedLogWriter(path, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(writer, text); err != nil {
+			_ = writer.Close()
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func assertAdmissionLogPairAbsent(t *testing.T, server *Server, record model.SafetyRecord) {
+	t.Helper()
+	layout, err := authorityResultLayout(server.stateRoot, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitAdmissionLogPairAbsent(t, paths)
+}
+
+func waitAdmissionLogPairAbsent(t *testing.T, paths engine.LogPaths) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		missing := true
+		for _, path := range []string{paths.Stdout, paths.Stderr} {
+			if _, err := os.Stat(path); err == nil {
+				missing = false
+				break
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("backend log %s stat error = %v", path, err)
+			}
+		}
+		if missing {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("backend logs %+v still exist after cleanup", paths)
+}
+
+func assertAdmissionLogPairPresent(t *testing.T, server *Server, record model.SafetyRecord) {
+	t.Helper()
+	layout, err := authorityResultLayout(server.stateRoot, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{paths.Stdout, paths.Stderr} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("backend log %s stat error = %v, want retained log", path, err)
+		}
 	}
 }
 
