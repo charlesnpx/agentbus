@@ -289,6 +289,76 @@ func TestFailedJobExposesSanitizedFailureMetadata(t *testing.T) {
 	}
 }
 
+func TestReadOnlyJobRecordsZeroObservedWorkspaceWriteItems(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{{Type: engine.EventAgentText, Text: "read-only response"}}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-observed-write-read-only",
+		RequestID:    "request-observed-write-read-only",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Write:   false,
+			Prompt:  "read only",
+		},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if got := record.ObservedWorkspaceWriteItemCount; got != 0 {
+		t.Fatalf("durable observed workspace-write count = %d, want 0", got)
+	}
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+	if len(status.Jobs) != 1 || status.Jobs[0].ObservedWorkspaceWriteItemCount != 0 {
+		t.Fatalf("job.status observed workspace-write count = %+v, want 0", status.Jobs)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if got := result.ObservedWorkspaceWriteItemCount; got != 0 {
+		t.Fatalf("job.result observed workspace-write count = %d, want 0", got)
+	}
+}
+
+func TestFailedJobRetainsObservedWorkspaceWriteItemCount(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{
+			{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true},
+			{Type: engine.EventTerminalError, Text: "backend failed"},
+		}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-observed-write-failure",
+		RequestID:    "request-observed-write-failure",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Write:   true,
+			Prompt:  "fail after write",
+		},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeFailed {
+		t.Fatalf("terminal record = %+v, want failed terminal", record.Terminal)
+	}
+	if got := record.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("durable observed workspace-write count = %d, want 1", got)
+	}
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+	if len(status.Jobs) != 1 || status.Jobs[0].ObservedWorkspaceWriteItemCount != 1 {
+		t.Fatalf("job.status observed workspace-write count = %+v, want 1", status.Jobs)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if got := result.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("job.result observed workspace-write count = %d, want 1", got)
+	}
+}
+
 func TestTransportFrameFailurePersistsDroppedFrameMetadata(t *testing.T) {
 	t.Parallel()
 	drops := engine.TransportFrameDrops{

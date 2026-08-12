@@ -319,11 +319,18 @@ type activeJob struct {
 	session   engine.Session
 	cancel    context.CancelFunc
 
-	mu                sync.Mutex
-	terminal          engine.JobState
-	cancellation      terminalCancellation
-	admissionCommand  command.RunningCommand
-	containmentIntent *launch.ContainmentIntent
+	mu                              sync.Mutex
+	terminal                        engine.JobState
+	cancellation                    terminalCancellation
+	admissionCommand                command.RunningCommand
+	containmentIntent               *launch.ContainmentIntent
+	observedWorkspaceWriteItemCount uint64
+	observedWorkspaceWriteAttempt   model.LaunchOrdinal
+	// These hooks only coordinate deterministic activeJob tests around the pair's
+	// synchronization boundary. The reset hook runs while mu is held; the
+	// snapshot hook runs immediately before it is acquired.
+	observedWorkspaceWriteAfterCountResetForTest        func()
+	observedWorkspaceWriteBeforeTerminalSnapshotForTest func()
 }
 
 type nativeInterruptSession interface {
@@ -359,6 +366,56 @@ func (j *activeJob) requestedCancellation() terminalCancellation {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.cancellation
+}
+
+func (j *activeJob) observeWorkspaceWriteItem() uint64 {
+	if j == nil {
+		return 1
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.observedWorkspaceWriteItemCount == ^uint64(0) {
+		return j.observedWorkspaceWriteItemCount
+	}
+	j.observedWorkspaceWriteItemCount++
+	return j.observedWorkspaceWriteItemCount
+}
+
+func (j *activeJob) beginObservedWorkspaceWriteAttempt(ordinal model.LaunchOrdinal) {
+	if j == nil {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.observedWorkspaceWriteItemCount = 0
+	if j.observedWorkspaceWriteAfterCountResetForTest != nil {
+		j.observedWorkspaceWriteAfterCountResetForTest()
+	}
+	j.observedWorkspaceWriteAttempt = ordinal
+}
+
+func (j *activeJob) observedWorkspaceWriteItemCountForTerminal() (uint64, model.LaunchOrdinal) {
+	if j == nil {
+		return 0, 0
+	}
+	if j.observedWorkspaceWriteBeforeTerminalSnapshotForTest != nil {
+		j.observedWorkspaceWriteBeforeTerminalSnapshotForTest()
+	}
+	j.mu.Lock()
+	if !j.observedWorkspaceWriteAttempt.Valid() {
+		j.mu.Unlock()
+		return 0, 0
+	}
+	count, ordinal := j.observedWorkspaceWriteItemCount, j.observedWorkspaceWriteAttempt
+	j.mu.Unlock()
+	return count, ordinal
+}
+
+func activeObservedWorkspaceWriteItemCount(job *activeJob) (uint64, model.LaunchOrdinal) {
+	if job == nil {
+		return 0, 0
+	}
+	return job.observedWorkspaceWriteItemCountForTerminal()
 }
 
 func (j *activeJob) recordAdmissionCommand(cmd command.RunningCommand) bool {
@@ -1031,10 +1088,11 @@ func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context, admission *
 		}
 		id := jobID
 		err := s.withAdmissionJobEffectErr(id.String(), func() error {
+			count, ordinal := activeObservedWorkspaceWriteItemCount(s.lookupActiveJob(id.String()))
 			if err := s.requestActiveJobShutdownCancel(ctx, id.String()); err != nil {
 				return err
 			}
-			if err := coord.CancelWithMetadata(ctx, id, engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation", nil); err != nil {
+			if err := coord.CancelWithMetadataAndObservedWorkspaceWriteItemCount(ctx, id, engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation", count, ordinal, nil); err != nil {
 				return err
 			}
 			s.abandonAdmissionUnresolvedCustody(ctx, coord, id)
@@ -2283,6 +2341,7 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 
 func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	active := s.lookupActiveJob(jobID)
+	count, ordinal := activeObservedWorkspaceWriteItemCount(active)
 	if active != nil {
 		active.requestTerminal(engine.StateCanceled, terminalCancellationFor(engine.CancellationOriginClientRequest, "client requested cancellation"))
 		settled := active.interruptSessionNativeFirst()
@@ -2310,7 +2369,7 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	if record.Terminal == nil {
 		err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
 			modelJobID := model.JobID(jobID)
-			if err := coord.CancelWithMetadata(context.Background(), modelJobID, engine.CancellationOriginClientRequest, "client requested cancellation", nil); err != nil {
+			if err := coord.CancelWithMetadataAndObservedWorkspaceWriteItemCount(context.Background(), modelJobID, engine.CancellationOriginClientRequest, "client requested cancellation", count, ordinal, nil); err != nil {
 				return err
 			}
 			s.abandonAdmissionUnresolvedCustody(context.Background(), coord, modelJobID)
@@ -2520,6 +2579,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		LogPaths: run.logPaths,
 	}
 	if run.admissionControlled {
+		run.active.beginObservedWorkspaceWriteAttempt(ordinal)
+	}
+	if run.admissionControlled {
 		startedAt := s.clock.Now().UTC()
 		s.rememberJobLivenessStartedAt(run.jobID, startedAt)
 		if err := s.recordAdmissionFinalAttemptStart(attemptCtx, run.jobID, startedAt); err != nil {
@@ -2560,6 +2622,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				if err := s.recordTransportFrameDrops(run, drops); err != nil {
 					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, classifyFailureError(terminalFailureInternal, err)
 				}
+			}
+			if event.ObservedWorkspaceWriteItem {
+				run.active.observeWorkspaceWriteItem()
 			}
 			rawText := authoritativeText(event)
 			switch event.Type {
@@ -2643,7 +2708,10 @@ func (s *Server) deferAdmissionEventDrain(run jobRun, events <-chan engine.Event
 	s.admissionLogDrains[run.jobID] = done
 	s.mu.Unlock()
 	go func() {
-		for range events {
+		for event := range events {
+			if event.ObservedWorkspaceWriteItem {
+				run.active.observeWorkspaceWriteItem()
+			}
 		}
 		close(done)
 	}()

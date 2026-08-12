@@ -688,6 +688,37 @@ func TestAppServerProviderOverloadIgnoresTerminalItemInventory(t *testing.T) {
 	}
 }
 
+func TestAppServerCompletedFileChangeReportsObservedWorkspaceWriteItem(t *testing.T) {
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("item/started", itemParams("thread-1", "turn-1", map[string]any{"id": "change-started", "type": "fileChange"}))
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "command", "type": "commandExecution"}))
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "change-completed", "type": "fileChange"}))
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	var observed int
+	for _, event := range got {
+		if event.ObservedWorkspaceWriteItem {
+			observed++
+		}
+	}
+	if observed != 1 {
+		t.Fatalf("observed workspace-write events = %d, want 1; events = %#v", observed, got)
+	}
+}
+
 func TestAppServerAnswersServerRequestsAndContinues(t *testing.T) {
 	t.Run("known approval and elicitation requests", func(t *testing.T) {
 		runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {

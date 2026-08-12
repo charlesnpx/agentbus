@@ -1,6 +1,7 @@
 package model
 
 import (
+	"fmt"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -274,7 +275,19 @@ type SafetyRecord struct {
 	FailureReason       string                      `json:"failureReason,omitempty"`
 	FailureClass        engine.FailureClass         `json:"failureClass,omitempty"`
 	TransportFrameDrops *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
-	CancellationReason  string                      `json:"cancellationReason,omitempty"`
+	// ObservedWorkspaceWriteItemCount is the number of workspace-write items
+	// reported by the backend while this job ran, not a verified filesystem
+	// state. Zero means no write items
+	// were observed; it does not guarantee the workspace is clean because the
+	// stream may have been truncated or a write may have happened by a route
+	// the backend did not report. A crash before terminalization can also leave
+	// observed writes absent from this count.
+	ObservedWorkspaceWriteItemCount uint64 `json:"observedWorkspaceWriteItemCount"`
+	// ObservedWorkspaceWriteItemCountAttemptOrdinal identifies the attempt
+	// whose count is retained. It is durable reducer metadata, not protocol
+	// surface area.
+	ObservedWorkspaceWriteItemCountAttemptOrdinal LaunchOrdinal `json:"observedWorkspaceWriteItemCountAttemptOrdinal,omitempty"`
+	CancellationReason                            string        `json:"cancellationReason,omitempty"`
 	// CancellationOrigin identifies why a canceled terminal was written. An
 	// absent origin on a canceled terminal means the record predates
 	// cancellation provenance and is unattributable, not a missing current write.
@@ -320,6 +333,11 @@ func (record SafetyRecord) Validate() error {
 	}
 	if err := ValidateFinalAttemptTiming(record.FinalAttemptStartedAt, record.FinalAttemptEndedAt); err != nil {
 		return err
+	}
+	if record.ObservedWorkspaceWriteItemCountAttemptOrdinal != 0 {
+		if err := record.ObservedWorkspaceWriteItemCountAttemptOrdinal.Validate(); err != nil {
+			return fmt.Errorf("observed_workspace_write_item_count_attempt_ordinal: %w", err)
+		}
 	}
 	if record.FinalAttemptEndedAt != nil && record.Terminal == nil {
 		return invalid("final_attempt.ended_at", "requires terminal certificate")

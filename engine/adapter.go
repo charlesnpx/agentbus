@@ -51,14 +51,18 @@ type TurnInput struct {
 
 // Event is an agentbus streaming event emitted by an adapter.
 type Event struct {
-	Type          string                `json:"type"`
-	Name          string                `json:"name,omitempty"`
-	Text          string                `json:"text"`
-	Truncated     bool                  `json:"truncated"`
-	ModelReported string                `json:"modelReported,omitempty"`
-	Metadata      map[string]any        `json:"metadata,omitempty"`
-	TurnFinal     *TurnFinalObservation `json:"-"`
-	RawText       string                `json:"-"`
+	Type          string         `json:"type"`
+	Name          string         `json:"name,omitempty"`
+	Text          string         `json:"text"`
+	Truncated     bool           `json:"truncated"`
+	ModelReported string         `json:"modelReported,omitempty"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
+	// ObservedWorkspaceWriteItem reports one write-bearing item observed by
+	// the backend. It is in-process metadata only: callers persist its count,
+	// never the item, paths, or contents.
+	ObservedWorkspaceWriteItem bool                  `json:"-"`
+	TurnFinal                  *TurnFinalObservation `json:"-"`
+	RawText                    string                `json:"-"`
 	// Err preserves an in-process, adapter-confirmed terminal condition. It is
 	// deliberately never serialized because text from a backend is not a typed
 	// status signal.

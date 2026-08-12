@@ -323,6 +323,42 @@ func TestRecordFinalAttemptStartAcceptsEarlierRetryTime(t *testing.T) {
 	}
 }
 
+func TestFinalizeObservedWorkspaceWriteItemCountReplacesEarlierAttempt(t *testing.T) {
+	record := reducerCanceledRetiredRecord(t)
+	first := reducerMustApply(t, record, Finalize{
+		Ref: reducerRef(),
+		Intent: TerminalIntent{
+			Outcome:                         OutcomeCanceled,
+			Cause:                           CauseCanceledBeforeAuthorization,
+			ObservedWorkspaceWriteItemCount: 2,
+			ObservedWorkspaceWriteItemCountAttemptOrdinal: LaunchOrdinalOne,
+		},
+	})
+	if got := first.ObservedWorkspaceWriteItemCount; got != 2 {
+		t.Fatalf("first attempt workspace-write count = %d, want 2", got)
+	}
+	// Terminal records are absorbing, so exercise the retry replacement rule
+	// while the second corrective attempt is still open.
+	record = reducerCanceledRetiredRecord(t)
+	record.ObservedWorkspaceWriteItemCount = 2
+	record.ObservedWorkspaceWriteItemCountAttemptOrdinal = LaunchOrdinalOne
+	record = reducerMustApply(t, record, Finalize{
+		Ref: reducerRef(),
+		Intent: TerminalIntent{
+			Outcome:                         OutcomeCanceled,
+			Cause:                           CauseCanceledBeforeAuthorization,
+			ObservedWorkspaceWriteItemCount: 1,
+			ObservedWorkspaceWriteItemCountAttemptOrdinal: LaunchOrdinalTwo,
+		},
+	})
+	if got := record.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("retry workspace-write count = %d, want 1", got)
+	}
+	if got := record.ObservedWorkspaceWriteItemCountAttemptOrdinal; got != LaunchOrdinalTwo {
+		t.Fatalf("retry workspace-write count ordinal = %s, want %s", got, LaunchOrdinalTwo)
+	}
+}
+
 func TestFinalizeDropsEndBeforeStartWithoutBlockingTerminalization(t *testing.T) {
 	startedAt := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
 	endedAt := startedAt.Add(-time.Second)

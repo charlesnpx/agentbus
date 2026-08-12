@@ -7408,6 +7408,95 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 	}
 }
 
+func TestCorrectiveRetryReplacesObservedWorkspaceWriteItemCount(t *testing.T) {
+	t.Parallel()
+	var turns atomic.Int64
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		if turns.Add(1) == 1 {
+			return []engine.Event{
+				{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true},
+				{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true},
+				{Type: engine.EventAgentText, Text: `{"status":"bad"}`},
+			}
+		}
+		return []engine.Event{
+			{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true},
+			{Type: engine.EventAgentText, Text: `{"status":"pass"}`},
+		}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-observed-write-retry",
+		RequestID:    "request-observed-write-retry",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Write:   false,
+			Prompt:  "retry observed writes",
+			Policy: &engine.TurnPolicy{
+				Contract: &engine.ContractSpec{JSONSchema: json.RawMessage(`{"type":"object","required":["status"],"properties":{"status":{"const":"pass"}}}`)},
+				Retry:    &engine.RetryPolicy{Max: 1, Template: "Your response missed: {{missing}}."},
+			},
+		},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if got := record.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("terminal observed workspace-write count = %d, want retry count 1", got)
+	}
+	if got := record.ObservedWorkspaceWriteItemCountAttemptOrdinal; got != model.LaunchOrdinalTwo {
+		t.Fatalf("terminal observed workspace-write ordinal = %s, want retry ordinal %s", got, model.LaunchOrdinalTwo)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if got := result.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("job.result observed workspace-write count = %d, want retry count 1", got)
+	}
+}
+
+func TestObservedWorkspaceWriteAttemptSnapshotIsAtomic(t *testing.T) {
+	active := &activeJob{
+		observedWorkspaceWriteItemCount: 7,
+		observedWorkspaceWriteAttempt:   model.LaunchOrdinalOne,
+	}
+	resetReached := make(chan struct{})
+	allowOrdinalStore := make(chan struct{})
+	active.observedWorkspaceWriteAfterCountResetForTest = func() {
+		close(resetReached)
+		<-allowOrdinalStore
+	}
+
+	beginDone := make(chan struct{})
+	go func() {
+		active.beginObservedWorkspaceWriteAttempt(model.LaunchOrdinalTwo)
+		close(beginDone)
+	}()
+	<-resetReached
+
+	type snapshot struct {
+		count   uint64
+		ordinal model.LaunchOrdinal
+	}
+	snapshots := make(chan snapshot, 1)
+	snapshotStarted := make(chan struct{})
+	active.observedWorkspaceWriteBeforeTerminalSnapshotForTest = func() {
+		close(snapshotStarted)
+	}
+	go func() {
+		count, ordinal := active.observedWorkspaceWriteItemCountForTerminal()
+		snapshots <- snapshot{count: count, ordinal: ordinal}
+	}()
+	<-snapshotStarted
+
+	close(allowOrdinalStore)
+	<-beginDone
+	got := <-snapshots
+	if got.count != 0 || got.ordinal != model.LaunchOrdinalTwo {
+		t.Fatalf("snapshot = (%d, %s), want (0, %s)", got.count, got.ordinal, model.LaunchOrdinalTwo)
+	}
+}
+
 func TestRemovedAndUnknownMethodsReturnMethodNotFound(t *testing.T) {
 	t.Parallel()
 	for _, method := range []string{

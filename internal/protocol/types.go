@@ -241,8 +241,16 @@ type JobStatus struct {
 	FailureReason         string                      `json:"failureReason,omitempty"`
 	FailureClass          engine.FailureClass         `json:"failureClass,omitempty"`
 	TransportFrameDrops   *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
-	CancellationReason    string                      `json:"cancellationReason,omitempty"`
-	CancellationOrigin    engine.CancellationOrigin   `json:"cancellationOrigin,omitempty"`
+	// ObservedWorkspaceWriteItemCount is the number of workspace-write items
+	// reported by the backend while this job ran, not a verified filesystem
+	// state. Zero means no write items
+	// were observed; it does not guarantee the workspace is clean because the
+	// stream may have been truncated or a write may have happened by a route
+	// the backend did not report. A crash before terminalization can also leave
+	// observed writes absent from this count.
+	ObservedWorkspaceWriteItemCount uint64                    `json:"observedWorkspaceWriteItemCount"`
+	CancellationReason              string                    `json:"cancellationReason,omitempty"`
+	CancellationOrigin              engine.CancellationOrigin `json:"cancellationOrigin,omitempty"`
 }
 
 type JobResultParams struct {
@@ -270,8 +278,16 @@ type JobResult struct {
 	FailureReason       string                      `json:"failureReason,omitempty"`
 	FailureClass        engine.FailureClass         `json:"failureClass,omitempty"`
 	TransportFrameDrops *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
-	CancellationReason  string                      `json:"cancellationReason,omitempty"`
-	CancellationOrigin  engine.CancellationOrigin   `json:"cancellationOrigin,omitempty"`
+	// ObservedWorkspaceWriteItemCount is the number of workspace-write items
+	// reported by the backend while this job ran, not a verified filesystem
+	// state. Zero means no write items
+	// were observed; it does not guarantee the workspace is clean because the
+	// stream may have been truncated or a write may have happened by a route
+	// the backend did not report. A crash before terminalization can also leave
+	// observed writes absent from this count.
+	ObservedWorkspaceWriteItemCount uint64                    `json:"observedWorkspaceWriteItemCount"`
+	CancellationReason              string                    `json:"cancellationReason,omitempty"`
+	CancellationOrigin              engine.CancellationOrigin `json:"cancellationOrigin,omitempty"`
 }
 
 type JobCancelParams struct {

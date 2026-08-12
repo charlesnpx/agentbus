@@ -509,7 +509,8 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 	}
 	if admissionRunHasRequestedCancel(run, state) {
 		cancellation := run.active.requestedCancellation()
-		if err := coord.CancelWithMetadata(context.Background(), jobID, cancellation.origin, cancellation.reason, nil); err != nil {
+		count, ordinal := run.active.observedWorkspaceWriteItemCountForTerminal()
+		if err := coord.CancelWithMetadataAndObservedWorkspaceWriteItemCount(context.Background(), jobID, cancellation.origin, cancellation.reason, count, ordinal, nil); err != nil {
 			if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
 				return err
 			}
@@ -528,7 +529,8 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		if err != nil {
 			return err
 		}
-		if err := coord.Finalize(context.Background(), jobID, intent); err != nil {
+		count, ordinal := run.active.observedWorkspaceWriteItemCountForTerminal()
+		if err := coord.FinalizeWithObservedWorkspaceWriteItemCount(context.Background(), jobID, intent, count, ordinal); err != nil {
 			if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
 				return err
 			}
@@ -536,7 +538,8 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
 		return s.cleanupAdmissionBackendLogsForCommittedTerminal(run, coord, jobID)
 	}
-	if err := coord.Complete(context.Background(), jobID, outcome, []byte(text), stamp, nil); err != nil {
+	count, ordinal := run.active.observedWorkspaceWriteItemCountForTerminal()
+	if err := coord.CompleteWithObservedWorkspaceWriteItemCount(context.Background(), jobID, outcome, []byte(text), stamp, count, ordinal, nil); err != nil {
 		if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
 			return err
 		}

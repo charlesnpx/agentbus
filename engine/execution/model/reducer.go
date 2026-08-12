@@ -710,7 +710,29 @@ func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (
 		cancellationChanged = current.CancellationOrigin != next.CancellationOrigin || current.CancellationReason != next.CancellationReason
 	}
 	timingChanged := applyFinalAttemptEnd(next, current, command.Intent.FinalAttemptEndedAt)
-	return terminalChanged || cancellationChanged || timingChanged, nil
+	workspaceWritesChanged := applyTerminalObservedWorkspaceWriteItemCount(next, current, command.Intent)
+	return terminalChanged || cancellationChanged || timingChanged || workspaceWritesChanged, nil
+}
+
+// applyTerminalObservedWorkspaceWriteItemCount deliberately treats malformed
+// diagnostic metadata as absent. Terminal publication is more important than
+// a routing hint, and the count is committed only as part of that publication.
+func applyTerminalObservedWorkspaceWriteItemCount(next *SafetyRecord, current SafetyRecord, intent TerminalIntent) bool {
+	ordinal := intent.ObservedWorkspaceWriteItemCountAttemptOrdinal
+	if !ordinal.Valid() {
+		return false
+	}
+	currentOrdinal := current.ObservedWorkspaceWriteItemCountAttemptOrdinal
+	if !currentOrdinal.Valid() || ordinal > currentOrdinal {
+		next.ObservedWorkspaceWriteItemCount = intent.ObservedWorkspaceWriteItemCount
+		next.ObservedWorkspaceWriteItemCountAttemptOrdinal = ordinal
+		return current.ObservedWorkspaceWriteItemCount != next.ObservedWorkspaceWriteItemCount || currentOrdinal != ordinal
+	}
+	if ordinal != currentOrdinal || intent.ObservedWorkspaceWriteItemCount <= current.ObservedWorkspaceWriteItemCount {
+		return false
+	}
+	next.ObservedWorkspaceWriteItemCount = intent.ObservedWorkspaceWriteItemCount
+	return true
 }
 
 func terminalCancellationMetadata(outcome Outcome, origin engine.CancellationOrigin, reason string) (engine.CancellationOrigin, string, error) {

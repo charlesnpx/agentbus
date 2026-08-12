@@ -624,10 +624,11 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 		}
 	case "commandexecution", "filechange", "mcptoolcall", "dynamictoolcall":
 		o.emitEvent(engine.Event{
-			Type:     engine.EventToolUse,
-			Name:     toolName(item),
-			Text:     toolText(item),
-			Metadata: metadata,
+			Type:                       engine.EventToolUse,
+			Name:                       toolName(item),
+			Text:                       toolText(item),
+			Metadata:                   metadata,
+			ObservedWorkspaceWriteItem: method == "item/completed" && kind == "filechange",
 		})
 	}
 }
