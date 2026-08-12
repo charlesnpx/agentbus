@@ -2591,6 +2591,7 @@ func (s *Server) finalizeAdmittedLaunchFailure(run jobRun, cause error) {
 	if err := s.cleanupAdmittedCodexHomeFromCommittedTerminal(run); err != nil {
 		s.handleRunFinalizationError(run, err)
 	}
+	s.enforceAdmissionLogRetention(run.admissionAccepted.Record.WorkspaceLayoutKey.String())
 }
 
 func (s *Server) cleanupAdmittedCodexHomeFromCommittedTerminal(run jobRun) error {
@@ -3059,6 +3060,12 @@ type admissionLogCandidate struct {
 	workspaceID string
 }
 
+// A fixed set of retention locks serializes a workspace's immediate and
+// periodic passes without retaining a mutex for every workspace. A collision
+// only makes two workspaces serialize with each other; it never weakens their
+// individual retention guarantees.
+const admissionLogRetentionLockStripes = 64
+
 // admissionLogSweepLoop runs retention independently of status reads while a
 // server is serving requests.
 func (s *Server) admissionLogSweepLoop(ctx context.Context) {
@@ -3080,6 +3087,44 @@ func (s *Server) admissionLogSweepLoop(ctx context.Context) {
 }
 
 func (s *Server) sweepAdmissionLogs() {
+	for i := range s.admissionLogRetentionMu {
+		s.admissionLogRetentionMu[i].Lock()
+	}
+	defer func() {
+		for i := len(s.admissionLogRetentionMu) - 1; i >= 0; i-- {
+			s.admissionLogRetentionMu[i].Unlock()
+		}
+	}()
+	s.sweepAdmissionLogsForWorkspace("")
+}
+
+// enforceAdmissionLogRetention runs an immediate, serialized pass for one
+// workspace once a terminal log has settled. The periodic full sweep remains
+// responsible for TTL expiration and restart recovery.
+func (s *Server) enforceAdmissionLogRetention(workspaceID string) {
+	if workspaceID == "" {
+		return
+	}
+	lock := &s.admissionLogRetentionMu[admissionLogRetentionLockIndex(workspaceID)]
+	lock.Lock()
+	defer lock.Unlock()
+	s.sweepAdmissionLogsForWorkspace(workspaceID)
+}
+
+func admissionLogRetentionLockIndex(workspaceID string) uint32 {
+	const (
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	hash := uint32(offset32)
+	for i := 0; i < len(workspaceID); i++ {
+		hash ^= uint32(workspaceID[i])
+		hash *= prime32
+	}
+	return hash % admissionLogRetentionLockStripes
+}
+
+func (s *Server) sweepAdmissionLogsForWorkspace(workspaceID string) {
 	s.admissionStateMu.RLock()
 	repo := s.admissionRepository
 	ready := s.admissionInstance != nil && repo != nil
@@ -3108,6 +3153,9 @@ func (s *Server) sweepAdmissionLogs() {
 	workspaceBytes := make(map[string]int64)
 	eligible := make(map[string][]admissionLogCandidate)
 	for _, record := range records {
+		if workspaceID != "" && record.WorkspaceLayoutKey.String() != workspaceID {
+			continue
+		}
 		layout, err := authorityResultLayout(s.stateRoot, record)
 		if err != nil {
 			continue

@@ -497,7 +497,7 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		return err
 	}
 	if snapshot.Record.Terminal != nil {
-		if err := s.cleanupAdmissionBackendLogs(run, snapshot.Record.Terminal.Outcome); err != nil {
+		if err := s.cleanupAdmissionBackendLogs(run, snapshot.Record.Terminal.Outcome, snapshot.Record.WorkspaceLayoutKey.String()); err != nil {
 			return err
 		}
 		if model.DeriveCleanupDisposition(snapshot.Record) == model.CleanupDispositionUnresolved {
@@ -555,10 +555,10 @@ func (s *Server) cleanupAdmissionBackendLogsForCommittedTerminal(run jobRun, coo
 	if snapshot.Record.Terminal == nil {
 		return nil
 	}
-	return s.cleanupAdmissionBackendLogs(run, snapshot.Record.Terminal.Outcome)
+	return s.cleanupAdmissionBackendLogs(run, snapshot.Record.Terminal.Outcome, snapshot.Record.WorkspaceLayoutKey.String())
 }
 
-func (s *Server) cleanupAdmissionBackendLogs(run jobRun, outcome model.Outcome) error {
+func (s *Server) cleanupAdmissionBackendLogs(run jobRun, outcome model.Outcome, workspaceID string) error {
 	if run.logPaths.Stdout == "" && run.logPaths.Stderr == "" {
 		return nil
 	}
@@ -575,10 +575,14 @@ func (s *Server) cleanupAdmissionBackendLogs(run jobRun, outcome model.Outcome) 
 				log.Printf("agentbus daemon: job %s backend log cleanup after event drain failed: %v", run.jobID, err)
 			}
 			s.finishAdmissionLogDrain(run.jobID, drain)
+			s.enforceAdmissionLogRetention(workspaceID)
 		}()
 		return nil
 	}
-	return cleanup()
+	if err := cleanup(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Server) cleanupManagedCodexHomeForAdmissionRun(run jobRun) {

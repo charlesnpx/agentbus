@@ -7633,6 +7633,74 @@ func TestAdmissionLogSweepExpiresAndCapsTerminalLogs(t *testing.T) {
 	assertAdmissionLogPairPresent(t, server, active.Record)
 }
 
+func TestAdmissionTerminalLogSettlementImmediatelyEnforcesRetentionCap(t *testing.T) {
+	t.Parallel()
+	backend := newLogCaptureBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	server.gcInterval = time.Hour
+	// The test backend writes two 15-byte log files per failed turn. Keep one
+	// pair but not two, so only terminal settlement can evict the older pair.
+	server.admissionLogRetentionCap = 31
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+
+	first := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-immediate-log-retention",
+		RequestID:    "request-immediate-log-retention-first",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "first failure"},
+	})
+	firstInput := <-backend.input
+	waitAdmissionSafetyTerminal(t, server, first.JobID)
+	if firstBytes := backendLogBytes(firstInput.LogPaths); firstBytes != 30 {
+		t.Fatalf("first terminal log bytes = %d, want 30", firstBytes)
+	}
+
+	second := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-immediate-log-retention",
+		RequestID:    "request-immediate-log-retention-second",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "second failure"},
+	})
+	secondInput := <-backend.input
+	waitAdmissionSafetyTerminal(t, server, second.JobID)
+	waitAdmissionLogPairAbsent(t, firstInput.LogPaths)
+	for _, path := range []string{secondInput.LogPaths.Stdout, secondInput.LogPaths.Stderr} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("newest terminal log %s stat error = %v, want retained log", path, err)
+		}
+	}
+}
+
+func TestImmediateAdmissionLogRetentionPreservesActiveAndDrainingLogs(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	server.admissionLogRetentionCap = 1
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	terminalAt := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+
+	active := acceptAuthorityWorkForLogRetention(t, server, "immediate-retention-active")
+	writeAdmissionLogPair(t, server, active.Record, "active")
+	server.addActiveJob(&activeJob{jobID: active.Record.JobID.String()})
+	t.Cleanup(func() { server.removeActiveJob(active.Record.JobID.String()) })
+
+	draining := acceptAndFailAuthorityWorkForLogRetention(t, server, "immediate-retention-draining", terminalAt)
+	writeAdmissionLogPair(t, server, draining.Record, "draining")
+	drainDone := make(chan struct{})
+	server.mu.Lock()
+	server.admissionLogDrains[draining.Record.JobID.String()] = drainDone
+	server.mu.Unlock()
+	t.Cleanup(func() {
+		server.finishAdmissionLogDrain(draining.Record.JobID.String(), drainDone)
+		close(drainDone)
+	})
+
+	evictable := acceptAndFailAuthorityWorkForLogRetention(t, server, "immediate-retention-evictable", terminalAt.Add(time.Second))
+	writeAdmissionLogPair(t, server, evictable.Record, "evictable")
+	server.enforceAdmissionLogRetention(active.Record.WorkspaceLayoutKey.String())
+
+	assertAdmissionLogPairPresent(t, server, active.Record)
+	assertAdmissionLogPairPresent(t, server, draining.Record)
+	assertAdmissionLogPairAbsent(t, server, evictable.Record)
+}
+
 func acceptAndFailAuthorityWorkForLogRetention(t *testing.T, server *Server, requestID string, terminalAt time.Time) authority.AcceptResult {
 	t.Helper()
 	accepted := acceptAuthorityWorkForLogRetention(t, server, requestID)

@@ -247,6 +247,7 @@ type Server struct {
 	heartbeatInterval            time.Duration
 	gcInterval                   time.Duration
 	admissionLogRetentionCap     int64
+	admissionLogRetentionMu      [admissionLogRetentionLockStripes]sync.Mutex
 	readyHook                    func(ServeReadyInfo) error
 	listenerFactory              func() (net.Listener, socketFileIdentity, error)
 	unixSocketPrivateListenHooks unixSocketPrivateListenHooks
@@ -2436,7 +2437,12 @@ type jobRun struct {
 
 func (s *Server) runJob(ctx context.Context, run jobRun) {
 	run.authoritativeCompletion = true
-	defer s.removeActiveJob(run.jobID)
+	defer func() {
+		s.removeActiveJob(run.jobID)
+		if run.admissionControlled {
+			s.enforceAdmissionLogRetention(run.admissionAccepted.Record.WorkspaceLayoutKey.String())
+		}
+	}()
 	defer s.cleanupManagedCodexHomeForAdmissionRun(run)
 	defer func() {
 		if run.onDone != nil {
