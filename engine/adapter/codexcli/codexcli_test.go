@@ -343,15 +343,77 @@ func TestAppServerCompletedTurnUsesLastDeltaAgentMessageItemAsResult(t *testing.
 	}
 }
 
+func TestAppServerTaskCompleteUsesLastAgentMessageAsResult(t *testing.T) {
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("task_complete", map[string]any{
+			"turn_id":            "turn-1",
+			"last_agent_message": "done",
+			"error":              nil,
+		})
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if resultText(got) != "done" {
+		t.Fatalf("events = %#v, want task_complete last agent message result", got)
+	}
+	if resultRawText(got) != "done" {
+		t.Fatalf("events = %#v, want task_complete last agent message raw result", got)
+	}
+	if session.ID() != "thread-1" {
+		t.Fatalf("session id after task_complete = %q, want thread-1", session.ID())
+	}
+}
+
 func TestAppServerTerminalTurnStatuses(t *testing.T) {
 	tests := []struct {
-		name        string
-		status      string
-		errorText   string
-		want        string
-		interrupted bool
+		name         string
+		status       string
+		errorText    string
+		errorInfo    string
+		want         string
+		interrupted  bool
+		overloaded   bool
+		taskComplete bool
 	}{
 		{name: "failed", status: "failed", errorText: "model failed", want: "model failed"},
+		{
+			name:       "structured server overloaded completion",
+			errorText:  "provider refused this turn",
+			errorInfo:  "server_overloaded",
+			want:       "provider refused this turn",
+			overloaded: true,
+		},
+		{
+			name:       "message-only overloaded completion",
+			errorText:  "Selected model is at capacity. Please try a different model.",
+			want:       "Selected model is at capacity. Please try a different model.",
+			overloaded: true,
+		},
+		{
+			name:      "different structured code suppresses capacity-message fallback",
+			errorText: "Selected model is at capacity. Please try a different model.",
+			errorInfo: "rate_limited",
+			want:      "Selected model is at capacity. Please try a different model.",
+		},
+		{
+			name:         "structured server overloaded task completion",
+			errorText:    "Selected model is at capacity. Please try a different model.",
+			errorInfo:    "server_overloaded",
+			want:         "Selected model is at capacity. Please try a different model.",
+			overloaded:   true,
+			taskComplete: true,
+		},
 		{name: "unrequested interrupted", status: "interrupted", want: "interrupted", interrupted: true},
 	}
 	for _, test := range tests {
@@ -363,7 +425,13 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 				peer.respond(thread, threadResult("thread-1"))
 				turn := peer.expectRequest("turn/start")
 				peer.respond(turn, turnResult("turn-1"))
-				peer.notify("turn/completed", completedParams("thread-1", "turn-1", test.status, test.errorText))
+				method := "turn/completed"
+				params := completedParamsWithErrorInfo("thread-1", "turn-1", test.status, test.errorText, test.errorInfo)
+				if test.taskComplete {
+					method = "task_complete"
+					params = taskCompleteParams("turn-1", test.errorText, test.errorInfo)
+				}
+				peer.notify(method, params)
 			})
 
 			session := startFakeCodexSession(t, engine.SessionOpts{})
@@ -376,12 +444,103 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 				t.Fatalf("events = %#v, want terminal error containing %q", got, test.want)
 			}
 			for _, event := range got {
-				if event.Type == engine.EventTerminalError && test.interrupted && !errors.Is(event.Err, engine.ErrTurnInterrupted) {
+				if event.Type != engine.EventTerminalError {
+					continue
+				}
+				if test.interrupted && !errors.Is(event.Err, engine.ErrTurnInterrupted) {
 					t.Fatalf("terminal event error = %v, want ErrTurnInterrupted", event.Err)
+				}
+				if gotOverload := errors.Is(event.Err, engine.ErrProviderOverloaded); gotOverload != test.overloaded {
+					t.Fatalf("terminal event error = %v, provider overloaded = %t, want %t", event.Err, gotOverload, test.overloaded)
 				}
 			}
 			if resultText(got) != "" {
 				t.Fatalf("events = %#v, did not want fabricated success result", got)
+			}
+		})
+	}
+}
+
+func TestAppServerProviderOverloadIgnoresTerminalItemInventory(t *testing.T) {
+	const capacityMessage = "Selected model is at capacity. Please try a different model."
+	tests := []struct {
+		name          string
+		notifyItems   []map[string]any
+		configureTurn func(map[string]any)
+	}{
+		{
+			name: "items absent",
+			configureTurn: func(turn map[string]any) {
+				delete(turn, "items")
+			},
+		},
+		{
+			name: "items empty",
+		},
+		{
+			name: "items null",
+			configureTurn: func(turn map[string]any) {
+				turn["items"] = nil
+			},
+		},
+		{
+			name: "unknown and malformed terminal items",
+			configureTurn: func(turn map[string]any) {
+				turn["items"] = []any{
+					map[string]any{"id": "unknown-1", "type": "newItemKind"},
+					map[string]any{"type": "agentMessage"},
+					"not an item object",
+				}
+			},
+		},
+		{
+			name: "observed tool notification",
+			notifyItems: []map[string]any{
+				{"id": "command-1", "type": "commandExecution", "command": "echo wrote"},
+				{"id": "file-1", "type": "fileChange", "changes": "wrote a file"},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+				peer := newAppServerPeer(t, proc)
+				peer.handshake()
+				thread := peer.expectRequest("thread/start")
+				peer.respond(thread, threadResult("thread-1"))
+				turn := peer.expectRequest("turn/start")
+				peer.respond(turn, turnResult("turn-1"))
+				for index, item := range test.notifyItems {
+					method := "item/started"
+					if index > 0 {
+						method = "item/completed"
+					}
+					peer.notify(method, itemParams("thread-1", "turn-1", item))
+				}
+				params := completedParamsWithErrorInfo("thread-1", "turn-1", "failed", capacityMessage, "server_overloaded")
+				if test.configureTurn != nil {
+					turn, ok := params["turn"].(map[string]any)
+					if !ok {
+						t.Fatal("completed params missing turn")
+					}
+					test.configureTurn(turn)
+				}
+				peer.notify("turn/completed", params)
+			})
+
+			session := startFakeCodexSession(t, engine.SessionOpts{})
+			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := collectEventsWithTimeout(t, events, 2*time.Second)
+			if !containsEvent(got, engine.EventTerminalError, capacityMessage) {
+				t.Fatalf("events = %#v, want terminal error containing %q", got, capacityMessage)
+			}
+			for _, event := range got {
+				if event.Type == engine.EventTerminalError && !errors.Is(event.Err, engine.ErrProviderOverloaded) {
+					t.Fatalf("terminal event error = %v, want ErrProviderOverloaded", event.Err)
+				}
 			}
 		})
 	}
@@ -839,15 +998,35 @@ func turnResult(id string) map[string]any {
 }
 
 func completedParams(threadID, turnID, status, errorText string) map[string]any {
+	return completedParamsWithErrorInfo(threadID, turnID, status, errorText, "")
+}
+
+func completedParamsWithErrorInfo(threadID, turnID, status, errorText, errorInfo string) map[string]any {
 	turn := map[string]any{
 		"id":     turnID,
 		"items":  []any{},
 		"status": status,
 	}
 	if errorText != "" {
-		turn["error"] = map[string]any{"message": errorText}
+		err := map[string]any{"message": errorText}
+		if errorInfo != "" {
+			err["codex_error_info"] = errorInfo
+		}
+		turn["error"] = err
 	}
 	return map[string]any{"threadId": threadID, "turn": turn}
+}
+
+func taskCompleteParams(turnID, errorText, errorInfo string) map[string]any {
+	err := map[string]any{"message": errorText}
+	if errorInfo != "" {
+		err["codex_error_info"] = errorInfo
+	}
+	return map[string]any{
+		"turn_id":            turnID,
+		"last_agent_message": nil,
+		"error":              err,
+	}
 }
 
 func itemParams(threadID, turnID string, item map[string]any) map[string]any {

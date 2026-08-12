@@ -419,9 +419,10 @@ type turnObserver struct {
 }
 
 type turnCompletion struct {
-	threadID string
-	status   string
-	error    string
+	threadID  string
+	status    string
+	error     string
+	errorInfo string
 }
 
 func (o *turnObserver) handle(frame duplex.Frame) bool {
@@ -435,7 +436,7 @@ func (o *turnObserver) handle(frame duplex.Frame) bool {
 		}
 	case "item/started", "item/completed":
 		o.handleItem(method, payload, frame.Object)
-	case "turn/completed":
+	case "turn/completed", "task_complete":
 		o.complete(payload)
 		return true
 	case "warning", "error", "config/warning", "guardian/warning":
@@ -451,7 +452,8 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 	if !ok {
 		item = payload
 	}
-	switch normalizeKind(firstString(item, "type")) {
+	kind := normalizeKind(firstString(item, "type"))
+	switch kind {
 	case "agentmessage", "assistantmessage", "message":
 		if method == "item/completed" {
 			if text := textFrom(item); text != "" {
@@ -478,23 +480,38 @@ func (o *turnObserver) complete(payload map[string]any) {
 			o.lastCompletedAgent = text
 		}
 	}
+	if text := firstString(payload, "last_agent_message", "lastAgentMessage"); text != "" {
+		o.lastCompletedAgent = text
+	}
 	status := firstString(payload, "status")
 	if status == "" && turn != nil {
 		status = firstString(turn, "status")
 	}
 	errText := ""
-	if turn != nil {
-		if errObj, ok := firstMap(turn, "error"); ok {
+	errInfo := ""
+	for _, completion := range []map[string]any{turn, payload} {
+		if completion == nil {
+			continue
+		}
+		errObj, ok := firstMap(completion, "error")
+		if !ok {
+			continue
+		}
+		if errText == "" {
 			errText = textFrom(errObj)
+		}
+		if errInfo == "" {
+			errInfo = firstString(errObj, "codex_error_info", "codexErrorInfo")
 		}
 	}
 	if errText == "" {
 		errText = textFrom(payload)
 	}
 	o.completion = &turnCompletion{
-		threadID: firstString(payload, "threadId", "thread_id"),
-		status:   status,
-		error:    errText,
+		threadID:  firstString(payload, "threadId", "thread_id"),
+		status:    status,
+		error:     errText,
+		errorInfo: errInfo,
 	}
 }
 
@@ -550,13 +567,20 @@ func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer
 		threadID = completion.threadID
 	}
 	switch completion.status {
-	case "completed", "":
+	case "completed":
 		observer.emitEvent(engine.Event{Type: engine.EventResultMessage, Text: observer.resultText()})
 		return threadID, nil
-	case "failed":
+	case "failed", "":
 		msg := strings.TrimSpace(completion.error)
+		if completion.status == "" && msg == "" {
+			observer.emitEvent(engine.Event{Type: engine.EventResultMessage, Text: observer.resultText()})
+			return threadID, nil
+		}
 		if msg == "" {
 			msg = "turn failed"
+		}
+		if isProviderOverloaded(completion.errorInfo, msg) {
+			return threadID, fmt.Errorf("codex app-server provider overload: %s: %w", msg, engine.ErrProviderOverloaded)
 		}
 		return threadID, fmt.Errorf("codex app-server turn failed: %s", msg)
 	case "interrupted":
@@ -567,6 +591,16 @@ func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer
 	default:
 		return threadID, fmt.Errorf("codex app-server turn completed with unsupported status %q", completion.status)
 	}
+}
+
+func isProviderOverloaded(errorInfo, message string) bool {
+	if errorInfo = strings.TrimSpace(errorInfo); errorInfo != "" {
+		return strings.EqualFold(errorInfo, "server_overloaded")
+	}
+	message = strings.ToLower(message)
+	return strings.Contains(message, "at capacity") ||
+		strings.Contains(message, "server overloaded") ||
+		strings.Contains(message, "server_overloaded")
 }
 
 func threadParams(opts engine.SessionOpts, input engine.TurnInput, resumeID string) map[string]any {

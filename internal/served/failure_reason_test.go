@@ -17,17 +17,25 @@ import (
 
 func TestClassifyTerminalFailure(t *testing.T) {
 	t.Parallel()
+	const providerCapacityMessage = "Selected model is at capacity. Please try a different model."
 	tests := []struct {
 		name                  string
 		origin                terminalFailureOrigin
 		err                   error
 		agentbusRequestedStop bool
 		want                  engine.FailureClass
+		wantReasonContains    string
 	}{
 		{
 			name:   "backend not started",
 			origin: terminalFailureBackendNotStarted,
 			err:    errors.New("runner was not admitted"),
+			want:   engine.FailureClassBackendNotStarted,
+		},
+		{
+			name:   "pre-launch overload remains not started",
+			origin: terminalFailureBackendNotStarted,
+			err:    fmt.Errorf("provider refused before launch: %w", engine.ErrProviderOverloaded),
 			want:   engine.FailureClassBackendNotStarted,
 		},
 		{
@@ -37,9 +45,22 @@ func TestClassifyTerminalFailure(t *testing.T) {
 			want:   engine.FailureClassBackendError,
 		},
 		{
+			name:               "provider overload sentinel preserves provider message",
+			origin:             terminalFailureBackendRan,
+			err:                fmt.Errorf("codex app-server provider overload: %s: %w", providerCapacityMessage, engine.ErrProviderOverloaded),
+			want:               engine.FailureClassProviderOverloaded,
+			wantReasonContains: providerCapacityMessage,
+		},
+		{
 			name:   "unrequested codex interruption",
 			origin: terminalFailureBackendRan,
 			err:    fmt.Errorf("codex app-server turn interrupted before completion: %w", engine.ErrTurnInterrupted),
+			want:   engine.FailureClassBackendInterrupted,
+		},
+		{
+			name:   "interruption takes precedence over provider overload",
+			origin: terminalFailureBackendRan,
+			err:    errors.Join(engine.ErrTurnInterrupted, engine.ErrProviderOverloaded),
 			want:   engine.FailureClassBackendInterrupted,
 		},
 		{
@@ -78,6 +99,12 @@ func TestClassifyTerminalFailure(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := classifyTerminalFailure(tt.origin, tt.err, tt.agentbusRequestedStop); got != tt.want {
 				t.Fatalf("classifyTerminalFailure(%v, %v, requested=%t) = %q, want %q", tt.origin, tt.err, tt.agentbusRequestedStop, got, tt.want)
+			}
+			if tt.wantReasonContains != "" {
+				failure := terminalFailureFor(tt.origin, tt.err, tt.agentbusRequestedStop)
+				if !strings.Contains(failure.reason, tt.wantReasonContains) {
+					t.Fatalf("failure reason = %q, want provider message %q", failure.reason, tt.wantReasonContains)
+				}
 			}
 		})
 	}
