@@ -39,6 +39,19 @@ func ResultPathForLayout(layout WorkspaceLayout, jobID string) (string, error) {
 	return safePathForID(layout.Results, jobID, ".txt")
 }
 
+// LogPathsForLayout returns the backend stdout and stderr paths for jobID.
+func LogPathsForLayout(layout WorkspaceLayout, jobID string) (LogPaths, error) {
+	stdout, err := safePathForID(layout.Logs, jobID, ".stdout.log")
+	if err != nil {
+		return LogPaths{}, err
+	}
+	stderr, err := safePathForID(layout.Logs, jobID, ".stderr.log")
+	if err != nil {
+		return LogPaths{}, err
+	}
+	return LogPaths{Stdout: stdout, Stderr: stderr}, nil
+}
+
 func writeResultFile(path string, raw []byte, inlineCap int) (ResultInfo, error) {
 	if inlineCap <= 0 {
 		inlineCap = DefaultInlineResultCap

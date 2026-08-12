@@ -235,7 +235,7 @@ type JobStatus struct {
 	BackendChildPID       int                         `json:"backendChildPid,omitempty"`
 	BackendChildStartTime string                      `json:"backendChildStartTime,omitempty"`
 	StatePath             string                      `json:"statePath,omitempty"`
-	LogPaths              engine.LogPaths             `json:"logPaths,omitempty"`
+	LogPaths              *engine.LogPaths            `json:"logPaths,omitempty"`
 	ModelReported         string                      `json:"modelReported,omitempty"`
 	Warnings              []string                    `json:"warnings,omitempty"`
 	FailureReason         string                      `json:"failureReason,omitempty"`

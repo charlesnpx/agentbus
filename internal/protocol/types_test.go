@@ -236,3 +236,29 @@ func TestJobStatusAndResultFinalAttemptTimingFieldsAreAdditive(t *testing.T) {
 		t.Fatalf("legacy status JSON = %s, unexpectedly has finalAttemptEndedAt", legacy)
 	}
 }
+
+func TestJobStatusOmitsEmptyLogPaths(t *testing.T) {
+	status, err := json.Marshal(JobStatus{JobID: "job-1", State: engine.StateCompleted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(status, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fields["logPaths"]; ok {
+		t.Fatalf("status JSON = %s, unexpectedly contains empty logPaths", status)
+	}
+
+	paths := &engine.LogPaths{Stdout: "/state/logs/job-1.stdout.log"}
+	status, err = json.Marshal(JobStatus{JobID: "job-1", State: engine.StateFailed, LogPaths: paths})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(status, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fields["logPaths"]; !ok {
+		t.Fatalf("status JSON = %s, missing populated logPaths", status)
+	}
+}

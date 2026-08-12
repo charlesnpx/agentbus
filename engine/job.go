@@ -316,7 +316,7 @@ type JobRecord struct {
 	BackendChildStartTime string               `json:"backendChildStartTime,omitempty"`
 	ModelReported         string               `json:"modelReported,omitempty"`
 	StatePath             string               `json:"statePath,omitempty"`
-	LogPaths              LogPaths             `json:"logPaths,omitempty"`
+	LogPaths              *LogPaths            `json:"logPaths,omitempty"`
 	Result                *ResultInfo          `json:"result,omitempty"`
 	LateFinalization      bool                 `json:"lateFinalization,omitempty"`
 	Policy                *TurnPolicy          `json:"policy,omitempty"`

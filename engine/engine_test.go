@@ -82,6 +82,9 @@ func newTestStoreWithOptions(t *testing.T, now time.Time, pt ProcessTable, opts 
 	if retention.ResultTTL == 0 {
 		retention.ResultTTL = time.Hour
 	}
+	if retention.LogTTL == 0 {
+		retention.LogTTL = time.Hour
+	}
 	if retention.StaleJobAfter == 0 {
 		retention.StaleJobAfter = time.Minute
 	}
@@ -1305,7 +1308,7 @@ func TestGCDoesNotDeleteRefreshedTerminalCandidate(t *testing.T) {
 		JobID:     "job_gc_refresh",
 		State:     StateReaped,
 		UpdatedAt: old,
-		LogPaths:  LogPaths{Stdout: logPath},
+		LogPaths:  &LogPaths{Stdout: logPath},
 	}
 	if err := store.Save(stale); err != nil {
 		t.Fatal(err)
@@ -1363,7 +1366,7 @@ func TestGCDeletesFreshTerminalCandidateStillPastTTL(t *testing.T) {
 		JobID:     "job_gc_expired",
 		State:     StateCompleted,
 		UpdatedAt: old,
-		LogPaths:  LogPaths{Stdout: logPath},
+		LogPaths:  &LogPaths{Stdout: logPath},
 	}
 	if err := store.Save(expired); err != nil {
 		t.Fatal(err)
@@ -1556,7 +1559,7 @@ func TestGCIgnoresLogPathsOutsideLayout(t *testing.T) {
 		JobID:     "job_malicious_logs",
 		State:     StateCompleted,
 		UpdatedAt: old,
-		LogPaths:  LogPaths{Stdout: outside, Stderr: filepath.Join("..", "escape.log")},
+		LogPaths:  &LogPaths{Stdout: outside, Stderr: filepath.Join("..", "escape.log")},
 	}
 	if err := store.Save(record); err != nil {
 		t.Fatal(err)
@@ -1687,7 +1690,7 @@ func TestGCRetention(t *testing.T) {
 		JobID:     "job_gc",
 		State:     StateCompleted,
 		UpdatedAt: old,
-		LogPaths:  LogPaths{Stdout: logPath},
+		LogPaths:  &LogPaths{Stdout: logPath},
 		Result:    &ResultInfo{ResultPath: resultPath},
 	}
 	if err := store.Save(record); err != nil {
@@ -1705,6 +1708,46 @@ func TestGCRetention(t *testing.T) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("%s still exists or unexpected err: %v", path, err)
 		}
+	}
+}
+
+func TestGCRetainsFailedLogsUntilLogTTL(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	old := base.Add(-2 * time.Hour)
+	store := newTestStoreWithOptions(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}}, testStoreOptions{
+		retention: RetentionConfig{
+			TerminalJobTTL: time.Hour,
+			ResultTTL:      time.Hour,
+			LogTTL:         3 * time.Hour,
+			StaleJobAfter:  time.Minute,
+		},
+	})
+	logPath := filepath.Join(store.Layout().Logs, "job_failed_log_retained.stderr.log")
+	if err := os.WriteFile(logPath, []byte("backend stderr"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record := &JobRecord{
+		JobID:     "job_failed_log_retained",
+		State:     StateFailed,
+		UpdatedAt: old,
+		LogPaths:  &LogPaths{Stderr: logPath},
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	record.UpdatedAt = old
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(record.StatePath); !os.IsNotExist(err) {
+		t.Fatalf("failed record still exists or stat failed: %v", err)
+	}
+	if _, err := os.Stat(logPath); err != nil {
+		t.Fatalf("failed log removed before LogTTL: %v", err)
 	}
 }
 
@@ -1763,7 +1806,7 @@ func TestGCKeepsReferencedResultUntilResultTTLAfterRecordTTL(t *testing.T) {
 		JobID:     "job_result_retained",
 		State:     StateCompleted,
 		UpdatedAt: old,
-		LogPaths:  LogPaths{Stdout: logPath},
+		LogPaths:  &LogPaths{Stdout: logPath},
 		Result:    &ResultInfo{ResultPath: resultPath},
 	}
 	if err := store.Save(record); err != nil {
@@ -1812,7 +1855,7 @@ func TestGCRemovesReferencedResultAtResultTTLBeforeRecordTTL(t *testing.T) {
 		JobID:     "job_result_expired",
 		State:     StateCompleted,
 		UpdatedAt: old,
-		LogPaths:  LogPaths{Stdout: logPath},
+		LogPaths:  &LogPaths{Stdout: logPath},
 		Result:    &ResultInfo{ResultPath: resultPath},
 	}
 	if err := store.Save(record); err != nil {
