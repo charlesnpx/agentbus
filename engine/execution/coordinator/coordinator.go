@@ -152,20 +152,31 @@ func (c *Coordinator) Finalize(ctx context.Context, jobID model.JobID, intent mo
 }
 
 func (c *Coordinator) Cancel(ctx context.Context, jobID model.JobID, injector *FailureInjector) error {
+	return c.CancelWithMetadata(ctx, jobID, engine.CancellationOriginUnattributable, "canceled without an attributable origin", injector)
+}
+
+// CancelWithMetadata requests cancellation and records the cancellation
+// explanation with a canceled terminal, if cancellation produces one. Callers
+// must pass non-sensitive text: it is persisted and exposed on job.status and
+// job.result.
+func (c *Coordinator) CancelWithMetadata(ctx context.Context, jobID model.JobID, origin engine.CancellationOrigin, reason string, injector *FailureInjector) error {
 	if err := c.ready(); err != nil {
 		return err
+	}
+	if err := model.ValidateCancellationMetadata(origin, reason); err != nil {
+		return fmt.Errorf("cancellation metadata: %w", err)
 	}
 	if _, err := c.authority.RequestCancel(ctx, jobID); err != nil {
 		return c.alreadyFinalizedError(ctx, jobID, err)
 	}
-	return c.recover(ctx, jobID, model.RecoveryCancelAfterGrant, nil, injector)
+	return c.recover(ctx, jobID, model.RecoveryCancelAfterGrant, nil, &cancellationMetadata{origin: origin, reason: reason}, injector)
 }
 
 func (c *Coordinator) Recover(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, injector *FailureInjector) error {
 	if err := c.ready(); err != nil {
 		return err
 	}
-	return c.recover(ctx, jobID, trigger, nil, injector)
+	return c.recover(ctx, jobID, trigger, nil, nil, injector)
 }
 
 func (c *Coordinator) HasOwnedWork(ctx context.Context) (bool, error) {
@@ -230,7 +241,12 @@ func (c *Coordinator) publishResult(ctx context.Context, jobID model.JobID, payl
 	return nil
 }
 
-func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, injector *FailureInjector) error {
+type cancellationMetadata struct {
+	origin engine.CancellationOrigin
+	reason string
+}
+
+func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, cancellation *cancellationMetadata, injector *FailureInjector) error {
 	for i := 0; i < 8; i++ {
 		plan, err := c.authority.RecoveryPlan(ctx, jobID, trigger)
 		if err != nil {
@@ -244,7 +260,9 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 			if plan.Next.Finalize == nil {
 				return cause
 			}
-			if _, err := c.authority.Finalize(ctx, jobID, plan.Next.Finalize.Ref, plan.Next.Finalize.Intent); err != nil {
+			finalize := *plan.Next.Finalize
+			finalize.Intent = withCancellationMetadata(finalize.Intent, cancellation)
+			if _, err := c.authority.Finalize(ctx, jobID, finalize.Ref, finalize.Intent); err != nil {
 				err = c.alreadyFinalizedError(ctx, jobID, err)
 				if cause != nil {
 					return errors.Join(cause, fmt.Errorf("finalize recovery: %w", err))
@@ -262,7 +280,7 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 					return err
 				}
 				if physicalCleanupUnresolved(err) {
-					return c.finalizeUnresolved(ctx, jobID, trigger, cause, err)
+					return c.finalizeUnresolved(ctx, jobID, trigger, cause, cancellation, err)
 				}
 				return c.failStop(ctx, err)
 			}
@@ -276,7 +294,7 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 					return err
 				}
 				if physicalCleanupUnresolved(err) {
-					return c.finalizeUnresolved(ctx, jobID, trigger, cause, err)
+					return c.finalizeUnresolved(ctx, jobID, trigger, cause, cancellation, err)
 				}
 				return c.failStop(ctx, err)
 			}
@@ -323,7 +341,7 @@ func (c *Coordinator) awaitResultCertificateProgress(ctx context.Context, jobID 
 	}
 }
 
-func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, unresolved error) error {
+func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, cancellation *cancellationMetadata, unresolved error) error {
 	if err := recoveryAbortedBeforeOperation(ctx); err != nil {
 		return err
 	}
@@ -335,6 +353,7 @@ func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID,
 	if err != nil {
 		return c.failStopUnlessRecoveryAborted(ctx, errors.Join(unresolved, err))
 	}
+	intent = withCancellationMetadata(intent, cancellation)
 	if err := recoveryAbortedBeforeOperation(ctx); err != nil {
 		return err
 	}
@@ -346,6 +365,14 @@ func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID,
 		return c.failStopUnlessRecoveryAborted(ctx, errors.Join(unresolved, err))
 	}
 	return cause
+}
+
+func withCancellationMetadata(intent model.TerminalIntent, cancellation *cancellationMetadata) model.TerminalIntent {
+	if cancellation != nil && intent.Outcome == model.OutcomeCanceled {
+		intent.CancellationOrigin = cancellation.origin
+		intent.CancellationReason = cancellation.reason
+	}
+	return intent
 }
 
 func (c *Coordinator) alreadyFinalizedError(ctx context.Context, jobID model.JobID, err error) error {

@@ -274,6 +274,11 @@ type SafetyRecord struct {
 	FailureReason       string                      `json:"failureReason,omitempty"`
 	FailureClass        engine.FailureClass         `json:"failureClass,omitempty"`
 	TransportFrameDrops *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
+	CancellationReason  string                      `json:"cancellationReason,omitempty"`
+	// CancellationOrigin identifies why a canceled terminal was written. An
+	// absent origin on a canceled terminal means the record predates
+	// cancellation provenance and is unattributable, not a missing current write.
+	CancellationOrigin engine.CancellationOrigin `json:"cancellationOrigin,omitempty"`
 }
 
 func (record SafetyRecord) Validate() error {
@@ -324,6 +329,12 @@ func (record SafetyRecord) Validate() error {
 	}
 	if err := validateTransportFrameDrops(record.TransportFrameDrops); err != nil {
 		return err
+	}
+	if err := ValidateCancellationMetadata(record.CancellationOrigin, record.CancellationReason); err != nil {
+		return err
+	}
+	if record.CancellationOrigin != "" && (record.Terminal == nil || record.Terminal.Outcome != OutcomeCanceled) {
+		return invalid("cancellation", "requires canceled terminal certificate")
 	}
 	return nil
 }
@@ -392,6 +403,26 @@ func ValidateFailureMetadata(class engine.FailureClass, reason string) error {
 		}
 	}
 	return validateText("failure.reason", reason, engine.FailureReasonMaxRunes*utf8.UTFMax)
+}
+
+// ValidateCancellationMetadata accepts the empty legacy representation or a
+// complete persisted cancellation origin and sanitized human-readable reason.
+func ValidateCancellationMetadata(origin engine.CancellationOrigin, reason string) error {
+	if origin == "" && reason == "" {
+		return nil
+	}
+	if !origin.Valid() {
+		return invalid("cancellation.origin", "is unknown")
+	}
+	if utf8.RuneCountInString(reason) > engine.FailureReasonMaxRunes {
+		return invalid("cancellation.reason", "is too long")
+	}
+	for _, r := range reason {
+		if !unicode.IsPrint(r) && r != ' ' {
+			return invalid("cancellation.reason", "must not contain control characters")
+		}
+	}
+	return validateText("cancellation.reason", reason, engine.FailureReasonMaxRunes*utf8.UTFMax)
 }
 
 func (record SafetyRecord) validateOptionalFacts() error {

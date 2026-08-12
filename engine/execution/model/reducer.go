@@ -111,6 +111,10 @@ func ApplyRecordTransportFrameDrops(current SafetyRecord, command RecordTranspor
 	return apply(current, command)
 }
 
+func ApplyRecordCancellation(current SafetyRecord, command RecordCancellation) (ApplyResult, error) {
+	return apply(current, command)
+}
+
 func ApplyFinalize(current SafetyRecord, command Finalize) (ApplyResult, error) {
 	return apply(current, command)
 }
@@ -145,6 +149,24 @@ func apply(current SafetyRecord, command Command) (ApplyResult, error) {
 		if transport, ok := normalized.(RecordTransportFrameDrops); ok {
 			next := cloneSafetyRecord(current)
 			changed, err := applyRecordTransportFrameDrops(&next, current, transport)
+			if err != nil {
+				return ApplyResult{}, err
+			}
+			if !changed {
+				return ApplyResult{Record: cloneSafetyRecord(current), Changed: false}, nil
+			}
+			if current.Revision == ^uint64(0) {
+				return ApplyResult{}, precondition("safety record revision overflow")
+			}
+			next.Revision = current.Revision + 1
+			if err := ValidateSafetyRecord(next); err != nil {
+				return ApplyResult{}, fmt.Errorf("reducer produced invalid safety record: %w", err)
+			}
+			return ApplyResult{Record: next, Changed: true}, nil
+		}
+		if cancellation, ok := normalized.(RecordCancellation); ok {
+			next := cloneSafetyRecord(current)
+			changed, err := applyRecordCancellation(&next, current, cancellation)
 			if err != nil {
 				return ApplyResult{}, err
 			}
@@ -212,6 +234,8 @@ func applyOpen(next *SafetyRecord, current SafetyRecord, command any) (bool, err
 		return applyRecordFailure(next, current, c)
 	case RecordTransportFrameDrops:
 		return applyRecordTransportFrameDrops(next, current, c)
+	case RecordCancellation:
+		return applyRecordCancellation(next, current, c)
 	case Finalize:
 		return applyFinalize(next, current, c)
 	default:
@@ -639,6 +663,30 @@ func applyRecordTransportFrameDrops(next *SafetyRecord, current SafetyRecord, co
 	return true, nil
 }
 
+func applyRecordCancellation(next *SafetyRecord, current SafetyRecord, command RecordCancellation) (bool, error) {
+	if err := ensureJob(current, command.JobID); err != nil {
+		return false, err
+	}
+	if err := ValidateCancellationMetadata(command.Origin, command.Reason); err != nil {
+		return false, invalidCommand("cancellation metadata: %v", err)
+	}
+	if current.Terminal == nil {
+		return false, precondition("cancellation metadata requires terminal certificate")
+	}
+	if current.Terminal.Outcome != OutcomeCanceled {
+		return false, nil
+	}
+	if current.CancellationOrigin != "" || current.CancellationReason != "" {
+		// Terminal cancellation provenance is immutable once committed. The
+		// atomic finalization path supplies the best available provenance at
+		// commit time, so a later observer must not revise it.
+		return false, nil
+	}
+	next.CancellationOrigin = command.Origin
+	next.CancellationReason = command.Reason
+	return true, nil
+}
+
 func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (bool, error) {
 	if err := ensureAttempt(current, command.Ref); err != nil {
 		return false, err
@@ -647,12 +695,41 @@ func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (
 	if err != nil {
 		return false, err
 	}
+	origin, reason, err := terminalCancellationMetadata(certificate.Outcome, command.Intent.CancellationOrigin, command.Intent.CancellationReason)
+	if err != nil {
+		return false, err
+	}
 	terminalChanged, err := mergeTerminal(next, certificate)
 	if err != nil {
 		return false, err
 	}
+	cancellationChanged := false
+	if certificate.Outcome == OutcomeCanceled {
+		next.CancellationOrigin = origin
+		next.CancellationReason = reason
+		cancellationChanged = current.CancellationOrigin != next.CancellationOrigin || current.CancellationReason != next.CancellationReason
+	}
 	timingChanged := applyFinalAttemptEnd(next, current, command.Intent.FinalAttemptEndedAt)
-	return terminalChanged || timingChanged, nil
+	return terminalChanged || cancellationChanged || timingChanged, nil
+}
+
+func terminalCancellationMetadata(outcome Outcome, origin engine.CancellationOrigin, reason string) (engine.CancellationOrigin, string, error) {
+	if outcome != OutcomeCanceled {
+		if origin != "" || reason != "" {
+			return "", "", invalidCommand("cancellation metadata requires canceled terminal outcome")
+		}
+		return "", "", nil
+	}
+	if origin == "" || reason == "" {
+		if origin == "" && reason == "" {
+			return engine.CancellationOriginUnattributable, "canceled without an attributable origin", nil
+		}
+		return "", "", invalidCommand("canceled terminal requires complete cancellation metadata")
+	}
+	if err := ValidateCancellationMetadata(origin, reason); err != nil {
+		return "", "", invalidCommand("cancellation metadata: %v", err)
+	}
+	return origin, reason, nil
 }
 
 func reportFinalAttemptTimingWarning(jobID JobID, format string, args ...any) {
@@ -775,6 +852,13 @@ func normalizeCommand(command Command) (any, error) {
 			return nil, invalidCommand("command is nil")
 		}
 		return *c, nil
+	case RecordCancellation:
+		return c, nil
+	case *RecordCancellation:
+		if c == nil {
+			return nil, invalidCommand("command is nil")
+		}
+		return *c, nil
 	case Finalize:
 		return c, nil
 	case *Finalize:
@@ -797,7 +881,7 @@ func groupBindingAllowed(record SafetyRecord) bool {
 
 func legacyUnfencedCommand(command any) bool {
 	switch command.(type) {
-	case RequestCancel, ObserveOutcome, CertifyResult, RecordFinalAttemptStart, RecordFailure, RecordTransportFrameDrops, Finalize:
+	case RequestCancel, ObserveOutcome, CertifyResult, RecordFinalAttemptStart, RecordFailure, RecordTransportFrameDrops, RecordCancellation, Finalize:
 		return true
 	default:
 		return false

@@ -81,6 +81,25 @@ func TestProjectedFailureMetadataOnlyForFailureOrInterruptedPublicStates(t *test
 	}
 }
 
+func TestProjectedCancellationMetadataOnlyForCanceledPublicState(t *testing.T) {
+	record := SafetyRecord{
+		CancellationOrigin: engine.CancellationOriginClientRequest,
+		CancellationReason: "client requested cancellation",
+	}
+	for _, public := range AllPublicStates() {
+		gotReason, gotOrigin := projectedCancellationMetadata(record, public)
+		if public == PublicCanceled {
+			if gotReason != record.CancellationReason || gotOrigin != record.CancellationOrigin {
+				t.Fatalf("cancellation metadata for %s = (%q, %q), want (%q, %q)", public, gotReason, gotOrigin, record.CancellationReason, record.CancellationOrigin)
+			}
+			continue
+		}
+		if gotReason != "" || gotOrigin != "" {
+			t.Fatalf("cancellation metadata for %s = (%q, %q), want empty", public, gotReason, gotOrigin)
+		}
+	}
+}
+
 func TestProjectDerivesReadModelFromSafetyRecordOnly(t *testing.T) {
 	record := validSafetyRecord()
 	projection, err := Project(record, ProjectionMetadata{SessionID: "session-1"})

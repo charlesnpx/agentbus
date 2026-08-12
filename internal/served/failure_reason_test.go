@@ -510,6 +510,9 @@ func TestCanceledJobDoesNotExposeFailureMetadata(t *testing.T) {
 	if record.FailureClass != "" || record.FailureReason != "" {
 		t.Fatalf("canceled durable failure metadata = (%q, %q), want empty", record.FailureReason, record.FailureClass)
 	}
+	if record.CancellationOrigin != engine.CancellationOriginClientRequest || record.CancellationReason != "client requested cancellation" {
+		t.Fatalf("canceled durable cancellation metadata = (%q, %q), want client request", record.CancellationOrigin, record.CancellationReason)
+	}
 
 	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
 	if len(status.Jobs) != 1 || status.Jobs[0].State != engine.StateCanceled {
@@ -518,6 +521,9 @@ func TestCanceledJobDoesNotExposeFailureMetadata(t *testing.T) {
 	if status.Jobs[0].FailureClass != "" || status.Jobs[0].FailureReason != "" {
 		t.Fatalf("canceled job.status failure metadata = (%q, %q), want empty", status.Jobs[0].FailureReason, status.Jobs[0].FailureClass)
 	}
+	if status.Jobs[0].CancellationOrigin != engine.CancellationOriginClientRequest || status.Jobs[0].CancellationReason != "client requested cancellation" {
+		t.Fatalf("canceled job.status cancellation metadata = (%q, %q), want client request", status.Jobs[0].CancellationOrigin, status.Jobs[0].CancellationReason)
+	}
 
 	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
 	if result.State != engine.StateCanceled {
@@ -525,5 +531,8 @@ func TestCanceledJobDoesNotExposeFailureMetadata(t *testing.T) {
 	}
 	if result.FailureClass != "" || result.FailureReason != "" {
 		t.Fatalf("canceled job.result failure metadata = (%q, %q), want empty", result.FailureReason, result.FailureClass)
+	}
+	if result.CancellationOrigin != engine.CancellationOriginClientRequest || result.CancellationReason != "client requested cancellation" {
+		t.Fatalf("canceled job.result cancellation metadata = (%q, %q), want client request", result.CancellationOrigin, result.CancellationReason)
 	}
 }

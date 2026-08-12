@@ -241,6 +241,8 @@ type JobStatus struct {
 	FailureReason         string                      `json:"failureReason,omitempty"`
 	FailureClass          engine.FailureClass         `json:"failureClass,omitempty"`
 	TransportFrameDrops   *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
+	CancellationReason    string                      `json:"cancellationReason,omitempty"`
+	CancellationOrigin    engine.CancellationOrigin   `json:"cancellationOrigin,omitempty"`
 }
 
 type JobResultParams struct {
@@ -268,6 +270,8 @@ type JobResult struct {
 	FailureReason       string                      `json:"failureReason,omitempty"`
 	FailureClass        engine.FailureClass         `json:"failureClass,omitempty"`
 	TransportFrameDrops *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
+	CancellationReason  string                      `json:"cancellationReason,omitempty"`
+	CancellationOrigin  engine.CancellationOrigin   `json:"cancellationOrigin,omitempty"`
 }
 
 type JobCancelParams struct {

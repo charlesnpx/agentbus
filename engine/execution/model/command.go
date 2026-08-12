@@ -95,11 +95,21 @@ type RecordTransportFrameDrops struct {
 	Drops engine.TransportFrameDrops
 }
 
+// RecordCancellation attaches the first observed cancellation explanation to
+// a job without changing its outcome or terminal-state proof.
+type RecordCancellation struct {
+	JobID  JobID
+	Origin engine.CancellationOrigin
+	Reason string
+}
+
 type TerminalIntent struct {
-	Outcome   Outcome
-	Cause     TerminalCause
-	DerivedBy BootRef
-	Contract  *engine.ContractStamp
+	Outcome            Outcome
+	Cause              TerminalCause
+	DerivedBy          BootRef
+	Contract           *engine.ContractStamp
+	CancellationOrigin engine.CancellationOrigin
+	CancellationReason string
 	// FinalAttemptEndedAt is when the final contract attempt reached this
 	// terminal transition. It is not a whole-job duration or attempt history.
 	FinalAttemptEndedAt *time.Time
@@ -123,4 +133,5 @@ func (CertifyResult) isCommand()             {}
 func (RecordFinalAttemptStart) isCommand()   {}
 func (RecordFailure) isCommand()             {}
 func (RecordTransportFrameDrops) isCommand() {}
+func (RecordCancellation) isCommand()        {}
 func (Finalize) isCommand()                  {}

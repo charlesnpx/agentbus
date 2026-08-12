@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sync"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
@@ -277,6 +278,10 @@ func (s *RecoverySession) Plans(ctx context.Context) ([]model.RecoveryPlan, erro
 }
 
 func (s *RecoverySession) Finalize(ctx context.Context, ref model.AttemptRef, intent model.TerminalIntent) error {
+	if intent.Outcome == model.OutcomeCanceled && intent.CancellationOrigin == "" && intent.CancellationReason == "" {
+		intent.CancellationOrigin = engine.CancellationOriginUnattributable
+		intent.CancellationReason = "canceled without an attributable origin"
+	}
 	return s.applyReceipt(ctx, model.Finalize{Ref: ref, Intent: intent})
 }
 

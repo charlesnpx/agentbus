@@ -609,6 +609,40 @@ func TestCancelRunningLiveProcessSignalsTermThenKillBeforeCanceled(t *testing.T)
 	}
 }
 
+func TestCancelUsesUnattributableOriginWhenNoCauseIsObserved(t *testing.T) {
+	base := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	record := &JobRecord{JobID: "job_cancel_unknown", State: StateQueued, UpdatedAt: base}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	canceled, err := store.Cancel(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceled.CancellationOrigin != CancellationOriginUnattributable || canceled.CancellationReason != "canceled without an attributable origin" {
+		t.Fatalf("cancellation metadata = (%q, %q), want unattributable fallback", canceled.CancellationOrigin, canceled.CancellationReason)
+	}
+}
+
+func TestCancelWithUnknownOriginUsesUnattributableFallback(t *testing.T) {
+	base := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t, base, fakeProcessTable{entries: map[int]ProcessInfo{}})
+	record := &JobRecord{JobID: "job_cancel_unknown_origin", State: StateQueued, UpdatedAt: base}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	canceled, err := store.CancelWithMetadata(record.JobID, CancellationOrigin("not_a_real_origin"), "incorrect attribution")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceled.CancellationOrigin != CancellationOriginUnattributable || canceled.CancellationReason != "canceled without an attributable origin" {
+		t.Fatalf("cancellation metadata = (%q, %q), want unattributable fallback", canceled.CancellationOrigin, canceled.CancellationReason)
+	}
+}
+
 func TestCancelRunningProcessDyingOnTermSkipsKill(t *testing.T) {
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	entries := map[int]ProcessInfo{202: {PID: 202, StartTime: "worker-start"}}

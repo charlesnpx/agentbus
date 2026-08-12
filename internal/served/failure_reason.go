@@ -25,6 +25,11 @@ type terminalFailure struct {
 	reason string
 }
 
+type terminalCancellation struct {
+	origin engine.CancellationOrigin
+	reason string
+}
+
 // classifiedTerminalError preserves where an error arose while retaining its
 // original identity for existing errors.Is and errors.As callers.
 type classifiedTerminalError struct {
@@ -94,18 +99,32 @@ func classifyTerminalFailure(origin terminalFailureOrigin, err error, agentbusRe
 }
 
 func terminalFailureFor(origin terminalFailureOrigin, err error, agentbusRequestedStop bool) terminalFailure {
-	reason := "unknown failure"
+	return terminalFailure{
+		class:  classifyTerminalFailure(origin, err, agentbusRequestedStop),
+		reason: terminalReasonFor(err, "unknown failure"),
+	}
+}
+
+func terminalCancellationFor(origin engine.CancellationOrigin, reason string) terminalCancellation {
+	if !origin.Valid() {
+		origin = engine.CancellationOriginUnattributable
+	}
+	return terminalCancellation{
+		origin: origin,
+		reason: terminalReasonFor(errors.New(reason), "canceled without an attributable origin"),
+	}
+}
+
+func terminalReasonFor(err error, fallback string) string {
+	reason := fallback
 	if err != nil && strings.TrimSpace(err.Error()) != "" {
 		reason = err.Error()
 	}
 	reason = sanitizeAdmissionProbeReason(reason)
 	if strings.TrimSpace(reason) == "" {
-		reason = "unknown failure"
+		return fallback
 	}
-	return terminalFailure{
-		class:  classifyTerminalFailure(origin, err, agentbusRequestedStop),
-		reason: reason,
-	}
+	return reason
 }
 
 func terminalFailureStopWasRequestedByAgentbus(run jobRun, err error) bool {

@@ -203,6 +203,9 @@ func ValidateProjectionShape(projection model.JobProjection) error {
 			return fmt.Errorf("%w: projection transport frame drops are invalid", ErrInvalidRecord)
 		}
 	}
+	if err := model.ValidateCancellationMetadata(projection.CancellationOrigin, projection.CancellationReason); err != nil {
+		return fmt.Errorf("%w: projection cancellation metadata: %v", ErrInvalidRecord, err)
+	}
 	return nil
 }
 
