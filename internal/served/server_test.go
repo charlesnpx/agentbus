@@ -9872,6 +9872,50 @@ func serveScriptedRequest(t *testing.T, server *Server, method string, params an
 	return conn
 }
 
+func TestConnectionServeAnswersOversizedRequest(t *testing.T) {
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	request := append([]byte(`{"jsonrpc":"2.0","id":"1","method":"job.status","params":{"padding":"`), bytes.Repeat([]byte("x"), 4*1024*1024)...)
+	request = append(request, []byte(`"}}`+"\n")...)
+	conn := &scriptedConn{read: bytes.NewReader(request)}
+	(&connection{server: server, conn: conn, hello: true}).serve(context.Background())
+	response := responseFromScriptedConn(t, conn)
+	if response.Error == nil {
+		t.Fatal("oversized request response error = nil")
+	}
+	if response.Error.Data.Code != protocol.ErrorInvalidTaskSpec || !strings.Contains(response.Error.Message, "exceeded") {
+		t.Fatalf("oversized request response = %+v", response.Error)
+	}
+}
+
+func TestConnectionServeBoundsOversizedRequestErrorWrite(t *testing.T) {
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	request := append([]byte(`{"jsonrpc":"2.0","id":"1","method":"job.status","params":{"padding":"`), bytes.Repeat([]byte("x"), 4*1024*1024)...)
+	request = append(request, []byte(`"}}`+"\n")...)
+	conn := &deadlineBlockingConn{read: bytes.NewReader(request), deadlineSet: make(chan time.Time, 1)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&connection{server: server, conn: conn, hello: true}).serve(context.Background())
+	}()
+
+	select {
+	case deadline := <-conn.deadlineSet:
+		if deadline.IsZero() || time.Until(deadline) > oversizedRequestWriteTimeout+time.Second {
+			t.Fatalf("write deadline = %v, want short non-zero deadline", deadline)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("oversized request response did not set a write deadline")
+	}
+	select {
+	case <-done:
+	case <-time.After(oversizedRequestWriteTimeout + time.Second):
+		t.Fatal("oversized request response write did not return by its deadline")
+	}
+	if !conn.isClosed() {
+		t.Fatal("connection was not closed after the bounded response write")
+	}
+}
+
 func waitControlledSessionStarted(t *testing.T, session *controlledSession) {
 	t.Helper()
 	select {
@@ -9898,6 +9942,73 @@ type scriptedConn struct {
 	writes   bytes.Buffer
 	writeErr error
 	closed   bool
+}
+
+type deadlineBlockingConn struct {
+	read        *bytes.Reader
+	mu          sync.Mutex
+	deadline    time.Time
+	deadlineSet chan time.Time
+	closed      bool
+}
+
+func (c *deadlineBlockingConn) Read(p []byte) (int, error) {
+	return c.read.Read(p)
+}
+
+func (c *deadlineBlockingConn) Write([]byte) (int, error) {
+	c.mu.Lock()
+	deadline := c.deadline
+	c.mu.Unlock()
+	if deadline.IsZero() {
+		return 0, errors.New("write began without a deadline")
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	<-timer.C
+	return 0, os.ErrDeadlineExceeded
+}
+
+func (c *deadlineBlockingConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *deadlineBlockingConn) LocalAddr() net.Addr {
+	return &net.UnixAddr{Name: "deadline-local", Net: "unix"}
+}
+
+func (c *deadlineBlockingConn) RemoteAddr() net.Addr {
+	return &net.UnixAddr{Name: "deadline-remote", Net: "unix"}
+}
+
+func (c *deadlineBlockingConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (c *deadlineBlockingConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *deadlineBlockingConn) SetWriteDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	c.deadline = deadline
+	c.mu.Unlock()
+	if !deadline.IsZero() {
+		select {
+		case c.deadlineSet <- deadline:
+		default:
+		}
+	}
+	return nil
+}
+
+func (c *deadlineBlockingConn) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 func (c *scriptedConn) Read(p []byte) (int, error) {

@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -48,6 +50,9 @@ const (
 	// FailureClassBackendInterrupted means a backend turn stopped without an
 	// interrupt request from agentbus.
 	FailureClassBackendInterrupted FailureClass = "backend_interrupted"
+	// FailureClassTransportFrameTooLarge means agentbus observed a backend
+	// transport frame exceed the configured limit.
+	FailureClassTransportFrameTooLarge FailureClass = "transport_frame_too_large"
 	// FailureClassFinalizationError means the backend completed, but agentbus
 	// failed while finalizing or publishing its result.
 	FailureClassFinalizationError FailureClass = "finalization_error"
@@ -64,12 +69,118 @@ func (class FailureClass) Valid() bool {
 		FailureClassProviderOverloaded,
 		FailureClassBackendError,
 		FailureClassBackendInterrupted,
+		FailureClassTransportFrameTooLarge,
 		FailureClassFinalizationError,
 		FailureClassInternalError:
 		return true
 	default:
 		return false
 	}
+}
+
+// TransportFrameDrops records bounded metadata about backend JSONL frames
+// discarded because they exceeded the configured transport limit. The prefix
+// is a redacted frame-type summary, never backend payload text.
+type TransportFrameDrops struct {
+	Count          uint64 `json:"count,omitempty"`
+	Bytes          uint64 `json:"bytes,omitempty"`
+	RedactedPrefix string `json:"redactedPrefix,omitempty"`
+}
+
+// Empty reports whether no backend transport frame was discarded.
+func (drops TransportFrameDrops) Empty() bool {
+	return drops.Count == 0
+}
+
+// Merge adds independently observed dropped-frame counters. It saturates on
+// overflow because transport diagnostics must remain bounded and non-fatal.
+func (drops *TransportFrameDrops) Merge(other TransportFrameDrops) {
+	if drops == nil || other.Empty() {
+		return
+	}
+	if math.MaxUint64-drops.Count < other.Count {
+		drops.Count = math.MaxUint64
+	} else {
+		drops.Count += other.Count
+	}
+	if math.MaxUint64-drops.Bytes < other.Bytes {
+		drops.Bytes = math.MaxUint64
+	} else {
+		drops.Bytes += other.Bytes
+	}
+	if other.RedactedPrefix != "" {
+		drops.RedactedPrefix = other.RedactedPrefix
+	}
+}
+
+// TransportFrameDropsMetadataKey identifies dropped-frame metadata carried on
+// an in-process adapter warning event.
+const TransportFrameDropsMetadataKey = "agentbusTransportFrameDrops"
+
+// EventMetadata returns the bounded transport-drop metadata carried with an
+// adapter warning event.
+func (drops TransportFrameDrops) EventMetadata() map[string]any {
+	if drops.Empty() {
+		return nil
+	}
+	return map[string]any{
+		TransportFrameDropsMetadataKey: map[string]any{
+			"count":          drops.Count,
+			"bytes":          drops.Bytes,
+			"redactedPrefix": drops.RedactedPrefix,
+		},
+	}
+}
+
+// TransportFrameDropsFromMetadata reads transport-drop metadata from an
+// in-process adapter warning event. Invalid metadata is ignored.
+func TransportFrameDropsFromMetadata(metadata map[string]any) (TransportFrameDrops, bool) {
+	if len(metadata) == 0 {
+		return TransportFrameDrops{}, false
+	}
+	raw, ok := metadata[TransportFrameDropsMetadataKey].(map[string]any)
+	if !ok {
+		return TransportFrameDrops{}, false
+	}
+	count, ok := metadataUint64(raw["count"])
+	if !ok || count == 0 {
+		return TransportFrameDrops{}, false
+	}
+	bytes, ok := metadataUint64(raw["bytes"])
+	if !ok || bytes == 0 {
+		return TransportFrameDrops{}, false
+	}
+	prefix, _ := raw["redactedPrefix"].(string)
+	return TransportFrameDrops{Count: count, Bytes: bytes, RedactedPrefix: prefix}, true
+}
+
+func metadataUint64(value any) (uint64, bool) {
+	switch value := value.(type) {
+	case uint64:
+		return value, true
+	case uint:
+		return uint64(value), true
+	case uint32:
+		return uint64(value), true
+	case int:
+		if value >= 0 {
+			return uint64(value), true
+		}
+	case int64:
+		if value >= 0 {
+			return uint64(value), true
+		}
+	case float64:
+		if value >= 0 && value <= math.MaxUint64 && value == math.Trunc(value) {
+			return uint64(value), true
+		}
+	case json.Number:
+		parsed, err := value.Int64()
+		if err == nil && parsed >= 0 {
+			return uint64(parsed), true
+		}
+	}
+	return 0, false
 }
 
 // ProcessRef records enough process identity to detect PID reuse.
@@ -103,35 +214,36 @@ type ResultInfo struct {
 
 // JobRecord is the durable job state record stored as JSON.
 type JobRecord struct {
-	JobID                 string            `json:"jobId"`
-	SessionID             string            `json:"sessionId,omitempty"`
-	Backend               string            `json:"backend,omitempty"`
-	Foreground            bool              `json:"foreground,omitempty"`
-	State                 JobState          `json:"state"`
-	Tags                  map[string]string `json:"tags,omitempty"`
-	CreatedAt             time.Time         `json:"createdAt"`
-	StartedAt             time.Time         `json:"startedAt,omitempty"`
-	UpdatedAt             time.Time         `json:"updatedAt"`
-	HeartbeatAt           time.Time         `json:"heartbeatAt,omitempty"`
-	Lease                 Lease             `json:"lease,omitempty"`
-	Supervisor            ProcessRef        `json:"supervisor,omitempty"`
-	Worker                ProcessRef        `json:"worker,omitempty"`
-	BackendSessionID      string            `json:"backendSessionId,omitempty"`
-	BackendChildPID       int               `json:"backendChildPid,omitempty"`
-	BackendChildStartTime string            `json:"backendChildStartTime,omitempty"`
-	ModelReported         string            `json:"modelReported,omitempty"`
-	StatePath             string            `json:"statePath,omitempty"`
-	LogPaths              LogPaths          `json:"logPaths,omitempty"`
-	Result                *ResultInfo       `json:"result,omitempty"`
-	LateFinalization      bool              `json:"lateFinalization,omitempty"`
-	Policy                *TurnPolicy       `json:"policy,omitempty"`
-	ResolvedContract      *ContractSpec     `json:"resolvedContract,omitempty"`
-	Contract              *ContractStamp    `json:"contract,omitempty"`
-	RetryCount            int               `json:"retryCount,omitempty"`
-	Warnings              []string          `json:"warnings,omitempty"`
-	QuarantineReason      string            `json:"quarantineReason,omitempty"`
-	FailureReason         string            `json:"failureReason,omitempty"`
-	FailureClass          FailureClass      `json:"failureClass,omitempty"`
+	JobID                 string               `json:"jobId"`
+	SessionID             string               `json:"sessionId,omitempty"`
+	Backend               string               `json:"backend,omitempty"`
+	Foreground            bool                 `json:"foreground,omitempty"`
+	State                 JobState             `json:"state"`
+	Tags                  map[string]string    `json:"tags,omitempty"`
+	CreatedAt             time.Time            `json:"createdAt"`
+	StartedAt             time.Time            `json:"startedAt,omitempty"`
+	UpdatedAt             time.Time            `json:"updatedAt"`
+	HeartbeatAt           time.Time            `json:"heartbeatAt,omitempty"`
+	Lease                 Lease                `json:"lease,omitempty"`
+	Supervisor            ProcessRef           `json:"supervisor,omitempty"`
+	Worker                ProcessRef           `json:"worker,omitempty"`
+	BackendSessionID      string               `json:"backendSessionId,omitempty"`
+	BackendChildPID       int                  `json:"backendChildPid,omitempty"`
+	BackendChildStartTime string               `json:"backendChildStartTime,omitempty"`
+	ModelReported         string               `json:"modelReported,omitempty"`
+	StatePath             string               `json:"statePath,omitempty"`
+	LogPaths              LogPaths             `json:"logPaths,omitempty"`
+	Result                *ResultInfo          `json:"result,omitempty"`
+	LateFinalization      bool                 `json:"lateFinalization,omitempty"`
+	Policy                *TurnPolicy          `json:"policy,omitempty"`
+	ResolvedContract      *ContractSpec        `json:"resolvedContract,omitempty"`
+	Contract              *ContractStamp       `json:"contract,omitempty"`
+	RetryCount            int                  `json:"retryCount,omitempty"`
+	Warnings              []string             `json:"warnings,omitempty"`
+	QuarantineReason      string               `json:"quarantineReason,omitempty"`
+	FailureReason         string               `json:"failureReason,omitempty"`
+	FailureClass          FailureClass         `json:"failureClass,omitempty"`
+	TransportFrameDrops   *TransportFrameDrops `json:"transportFrameDrops,omitempty"`
 }
 
 // IsTerminal reports whether state is terminal under the public job protocol.

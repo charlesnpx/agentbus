@@ -107,6 +107,10 @@ func ApplyRecordFailure(current SafetyRecord, command RecordFailure) (ApplyResul
 	return apply(current, command)
 }
 
+func ApplyRecordTransportFrameDrops(current SafetyRecord, command RecordTransportFrameDrops) (ApplyResult, error) {
+	return apply(current, command)
+}
+
 func ApplyFinalize(current SafetyRecord, command Finalize) (ApplyResult, error) {
 	return apply(current, command)
 }
@@ -123,6 +127,24 @@ func apply(current SafetyRecord, command Command) (ApplyResult, error) {
 		if failure, ok := normalized.(RecordFailure); ok {
 			next := cloneSafetyRecord(current)
 			changed, err := applyRecordFailure(&next, current, failure)
+			if err != nil {
+				return ApplyResult{}, err
+			}
+			if !changed {
+				return ApplyResult{Record: cloneSafetyRecord(current), Changed: false}, nil
+			}
+			if current.Revision == ^uint64(0) {
+				return ApplyResult{}, precondition("safety record revision overflow")
+			}
+			next.Revision = current.Revision + 1
+			if err := ValidateSafetyRecord(next); err != nil {
+				return ApplyResult{}, fmt.Errorf("reducer produced invalid safety record: %w", err)
+			}
+			return ApplyResult{Record: next, Changed: true}, nil
+		}
+		if transport, ok := normalized.(RecordTransportFrameDrops); ok {
+			next := cloneSafetyRecord(current)
+			changed, err := applyRecordTransportFrameDrops(&next, current, transport)
 			if err != nil {
 				return ApplyResult{}, err
 			}
@@ -188,6 +210,8 @@ func applyOpen(next *SafetyRecord, current SafetyRecord, command any) (bool, err
 		return applyRecordFinalAttemptStart(next, current, c)
 	case RecordFailure:
 		return applyRecordFailure(next, current, c)
+	case RecordTransportFrameDrops:
+		return applyRecordTransportFrameDrops(next, current, c)
 	case Finalize:
 		return applyFinalize(next, current, c)
 	default:
@@ -594,6 +618,27 @@ func applyRecordFailure(next *SafetyRecord, current SafetyRecord, command Record
 	return true, nil
 }
 
+func applyRecordTransportFrameDrops(next *SafetyRecord, current SafetyRecord, command RecordTransportFrameDrops) (bool, error) {
+	if err := ensureJob(current, command.JobID); err != nil {
+		return false, err
+	}
+	if err := validateTransportFrameDrops(&command.Drops); err != nil {
+		return false, invalidCommand("transport frame drops: %v", err)
+	}
+	if current.TransportFrameDrops == nil {
+		drops := command.Drops
+		next.TransportFrameDrops = &drops
+		return true, nil
+	}
+	merged := *current.TransportFrameDrops
+	merged.Merge(command.Drops)
+	if merged == *current.TransportFrameDrops {
+		return false, nil
+	}
+	next.TransportFrameDrops = &merged
+	return true, nil
+}
+
 func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (bool, error) {
 	if err := ensureAttempt(current, command.Ref); err != nil {
 		return false, err
@@ -723,6 +768,13 @@ func normalizeCommand(command Command) (any, error) {
 			return nil, invalidCommand("command is nil")
 		}
 		return *c, nil
+	case RecordTransportFrameDrops:
+		return c, nil
+	case *RecordTransportFrameDrops:
+		if c == nil {
+			return nil, invalidCommand("command is nil")
+		}
+		return *c, nil
 	case Finalize:
 		return c, nil
 	case *Finalize:
@@ -745,7 +797,7 @@ func groupBindingAllowed(record SafetyRecord) bool {
 
 func legacyUnfencedCommand(command any) bool {
 	switch command.(type) {
-	case RequestCancel, ObserveOutcome, CertifyResult, RecordFinalAttemptStart, RecordFailure, Finalize:
+	case RequestCancel, ObserveOutcome, CertifyResult, RecordFinalAttemptStart, RecordFailure, RecordTransportFrameDrops, Finalize:
 		return true
 	default:
 		return false
@@ -988,6 +1040,7 @@ func cloneSafetyRecord(record SafetyRecord) SafetyRecord {
 	next.Terminal = cloneTerminalCertificate(record.Terminal)
 	next.FinalAttemptStartedAt = clonePtr(record.FinalAttemptStartedAt)
 	next.FinalAttemptEndedAt = clonePtr(record.FinalAttemptEndedAt)
+	next.TransportFrameDrops = cloneTransportFrameDrops(record.TransportFrameDrops)
 	return next
 }
 

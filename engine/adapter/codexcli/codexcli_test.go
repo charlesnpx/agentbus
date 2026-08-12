@@ -79,6 +79,148 @@ func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing
 	})
 }
 
+func TestAppServerOversizedTerminalFrameFailsWithTransportClass(t *testing.T) {
+	t.Setenv("AGENTBUS_BACKEND_JSON_LINE_BYTES", "512")
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		init := peer.expectRequest("initialize")
+		peer.respond(init, initializeResult())
+		peer.expectNotification("initialized")
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		payload := `{"method":"turn/completed","params":{"status":"completed","padding":"` + strings.Repeat("x", 1024) + `"}}` + "\n"
+		if _, err := io.WriteString(proc.stdoutW, payload); err != nil {
+			t.Fatal(err)
+		}
+		// A later valid completion must not race ahead of the discarded terminal
+		// frame and turn this transport failure into a false success.
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	found := false
+	dropsRecorded := false
+	for _, event := range got {
+		if event.Type == engine.EventWarning {
+			if drops, ok := engine.TransportFrameDropsFromMetadata(event.Metadata); ok && drops.Count == 1 && drops.Bytes > 512 {
+				dropsRecorded = true
+			}
+		}
+		if event.Type == engine.EventTerminalError && errors.Is(event.Err, engine.ErrTransportFrameTooLarge) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("events = %#v, want transport frame terminal error", got)
+	}
+	if !dropsRecorded {
+		t.Fatalf("events = %#v, want dropped-frame metadata before terminal error", got)
+	}
+}
+
+func TestAppServerSkipsOversizedFileChangeFrame(t *testing.T) {
+	t.Setenv("AGENTBUS_BACKEND_JSON_LINE_BYTES", "512")
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		init := peer.expectRequest("initialize")
+		peer.respond(init, initializeResult())
+		peer.expectNotification("initialized")
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		payload := `{"method":"item/completed","params":{"item":{"type":"fileChange","diff":"` + strings.Repeat("x", 1024) + `"}}}` + "\n"
+		if _, err := io.WriteString(proc.stdoutW, payload); err != nil {
+			t.Fatal(err)
+		}
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if containsEvent(got, engine.EventTerminalError, "transport") {
+		t.Fatalf("events = %#v, want oversized fileChange skipped", got)
+	}
+	if resultText(got) != "" {
+		t.Fatalf("result text = %q, want empty completed turn", resultText(got))
+	}
+	foundDrops := false
+	for _, event := range got {
+		if drops, ok := engine.TransportFrameDropsFromMetadata(event.Metadata); ok && drops.Count == 1 && drops.Bytes > 512 && drops.RedactedPrefix == "method=item/completed" {
+			foundDrops = true
+		}
+	}
+	if !foundDrops {
+		t.Fatalf("events = %#v, want persisted dropped-frame warning", got)
+	}
+}
+
+func TestAppServerOversizedDuplicateDiscriminatorFailsClosed(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name:    "top-level method",
+			payload: `{"method":"warning","padding":"` + strings.Repeat("x", 1024) + `","method":"turn/completed","params":{"status":"completed"}}` + "\n",
+		},
+		{
+			name:    "nested item type",
+			payload: `{"method":"item/completed","params":{"item":{"type":"fileChange","diff":"` + strings.Repeat("x", 1024) + `","type":"agentMessage"}}}` + "\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("AGENTBUS_BACKEND_JSON_LINE_BYTES", "512")
+			runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+				peer := newAppServerPeer(t, proc)
+				init := peer.expectRequest("initialize")
+				peer.respond(init, initializeResult())
+				peer.expectNotification("initialized")
+				thread := peer.expectRequest("thread/start")
+				peer.respond(thread, threadResult("thread-1"))
+				turn := peer.expectRequest("turn/start")
+				peer.respond(turn, turnResult("turn-1"))
+				if _, err := io.WriteString(proc.stdoutW, test.payload); err != nil {
+					t.Fatal(err)
+				}
+				// A later completion makes a skip observable as a false success.
+				peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+			})
+
+			session := startFakeCodexSession(t, engine.SessionOpts{})
+			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := collectEventsWithTimeout(t, events, 2*time.Second)
+			if !containsTransportFrameError(got) {
+				t.Fatalf("events = %#v, want duplicate discriminator transport error", got)
+			}
+		})
+	}
+}
+
+func containsTransportFrameError(events []engine.Event) bool {
+	for _, event := range events {
+		if event.Type == engine.EventTerminalError && errors.Is(event.Err, engine.ErrTransportFrameTooLarge) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestAppServerTurnSandboxPolicyFollowsWritePolicy(t *testing.T) {
 	cwd := t.TempDir()
 	tests := []struct {

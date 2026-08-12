@@ -31,9 +31,10 @@ type JobProjection struct {
 	// whole-job elapsed time. A retry replaces this value with its own start.
 	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
 	// FinalAttemptEndedAt is when that same final attempt reached terminal.
-	FinalAttemptEndedAt *time.Time          `json:"finalAttemptEndedAt,omitempty"`
-	FailureReason       string              `json:"failureReason,omitempty"`
-	FailureClass        engine.FailureClass `json:"failureClass,omitempty"`
+	FinalAttemptEndedAt *time.Time                  `json:"finalAttemptEndedAt,omitempty"`
+	FailureReason       string                      `json:"failureReason,omitempty"`
+	FailureClass        engine.FailureClass         `json:"failureClass,omitempty"`
+	TransportFrameDrops *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
 }
 
 // Project rebuilds the read model from the proof-bearing SafetyRecord. The
@@ -69,7 +70,16 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 		FinalAttemptEndedAt:   finalAttemptEndedAt,
 		FailureReason:         failureReason,
 		FailureClass:          failureClass,
+		TransportFrameDrops:   cloneTransportFrameDrops(record.TransportFrameDrops),
 	}, nil
+}
+
+func cloneTransportFrameDrops(drops *engine.TransportFrameDrops) *engine.TransportFrameDrops {
+	if drops == nil {
+		return nil
+	}
+	copied := *drops
+	return &copied
 }
 
 // projectedFinalAttemptTiming and projectedFailureMetadata are independent

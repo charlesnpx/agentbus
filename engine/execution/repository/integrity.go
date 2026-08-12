@@ -195,6 +195,11 @@ func ValidateProjectionShape(projection model.JobProjection) error {
 	if err := model.ValidateFailureMetadata(projection.FailureClass, projection.FailureReason); err != nil {
 		return fmt.Errorf("%w: projection failure metadata: %v", ErrInvalidRecord, err)
 	}
+	if projection.TransportFrameDrops != nil {
+		if projection.TransportFrameDrops.Count == 0 || projection.TransportFrameDrops.Bytes == 0 || projection.TransportFrameDrops.RedactedPrefix == "" {
+			return fmt.Errorf("%w: projection transport frame drops are invalid", ErrInvalidRecord)
+		}
+	}
 	return nil
 }
 

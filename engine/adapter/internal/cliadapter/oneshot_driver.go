@@ -78,6 +78,9 @@ func (d oneShotDriver) RunTurn(ctx context.Context, conn *duplex.Conn, _ string,
 				}
 				return id, nil
 			}
+			if frame.Err != nil {
+				return id, malformedBackendStreamError(frame.Err)
+			}
 			events, nextID, err := d.parse(frame.Object)
 			if err != nil {
 				return id, err

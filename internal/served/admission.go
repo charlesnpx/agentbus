@@ -1991,6 +1991,11 @@ type servedAdmissionAuthority struct {
 	clock engine.Clock
 }
 
+func (a *servedAdmissionAuthority) RecordTransportFrameDrops(ctx context.Context, jobID model.JobID, drops engine.TransportFrameDrops) (coordinator.StepResult, error) {
+	applied, err := a.ready.RecordTransportFrameDrops(ctx, jobID, drops)
+	return admissionStepResult(applied, err)
+}
+
 func (a *servedAdmissionAuthority) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) (coordinator.StepResult, error) {
 	applied, err := a.ready.RecordQuiescence(ctx, jobID, ordinal, verified)
 	return admissionStepResult(applied, err)
@@ -2814,6 +2819,7 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 		FinalAttemptEndedAt:   finalAttemptEndedAt,
 		FailureReason:         failureReason,
 		FailureClass:          failureClass,
+		TransportFrameDrops:   cloneTransportFrameDrops(projection.TransportFrameDrops),
 	}
 	if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
 		startedAt := started
@@ -2902,6 +2908,7 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 		FinalAttemptEndedAt:   finalAttemptEndedAt,
 		FailureReason:         failureReason,
 		FailureClass:          failureClass,
+		TransportFrameDrops:   cloneTransportFrameDrops(projection.TransportFrameDrops),
 	}, true, nil
 }
 
@@ -2969,7 +2976,16 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 		FinalAttemptEndedAt:   finalAttemptEndedAt,
 		FailureReason:         failureReason,
 		FailureClass:          failureClass,
+		TransportFrameDrops:   cloneTransportFrameDrops(projection.TransportFrameDrops),
 	}, true, nil
+}
+
+func cloneTransportFrameDrops(drops *engine.TransportFrameDrops) *engine.TransportFrameDrops {
+	if drops == nil {
+		return nil
+	}
+	copied := *drops
+	return &copied
 }
 
 func authorityImageEmpty(image repository.JobImage) bool {

@@ -270,6 +270,12 @@ func (r *Ready) RecordFailure(ctx context.Context, jobID model.JobID, class engi
 	return r.apply(ctx, jobID, model.RecordFailure{JobID: jobID, Class: class, Reason: reason}, options...)
 }
 
+// RecordTransportFrameDrops durably preserves bounded metadata about backend
+// frames discarded by the transport reader without retaining payload bytes.
+func (r *Ready) RecordTransportFrameDrops(ctx context.Context, jobID model.JobID, drops engine.TransportFrameDrops, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.RecordTransportFrameDrops{JobID: jobID, Drops: drops}, options...)
+}
+
 func (r *Ready) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent, options ...ApplyOption) (ApplyResult, error) {
 	return r.apply(ctx, jobID, model.Finalize{Ref: ref, Intent: intent}, options...)
 }
@@ -786,6 +792,13 @@ func applyLogicalCommand(record model.SafetyRecord, command model.Command) (mode
 			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
 		}
 		return model.ApplyRecordFailure(record, *c)
+	case model.RecordTransportFrameDrops:
+		return model.ApplyRecordTransportFrameDrops(record, c)
+	case *model.RecordTransportFrameDrops:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyRecordTransportFrameDrops(record, *c)
 	case model.Finalize:
 		return model.ApplyFinalize(record, c)
 	case *model.Finalize:
@@ -1050,7 +1063,8 @@ func commandWithBoot(command model.Command, boot model.BootRef) model.Command {
 		}
 		return next
 	case model.RecordFinalAttemptStart, *model.RecordFinalAttemptStart,
-		model.RecordFailure, *model.RecordFailure:
+		model.RecordFailure, *model.RecordFailure,
+		model.RecordTransportFrameDrops, *model.RecordTransportFrameDrops:
 		return command
 	case model.Finalize:
 		if emptyBootRef(c.Intent.DerivedBy) {
@@ -1150,6 +1164,13 @@ func commandJobID(command model.Command) (model.JobID, error) {
 	case model.RecordFailure:
 		return c.JobID, nil
 	case *model.RecordFailure:
+		if c == nil {
+			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
+		}
+		return c.JobID, nil
+	case model.RecordTransportFrameDrops:
+		return c.JobID, nil
+	case *model.RecordTransportFrameDrops:
 		if c == nil {
 			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
 		}
