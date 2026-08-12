@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charlesnpx/agentbus/engine"
 )
 
 func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
@@ -130,6 +132,62 @@ func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
 				t.Fatal("Apply mutated invalid predecessor input")
 			}
 		})
+	}
+}
+
+func TestRecordCancellationKeepsFirstObservedOrigin(t *testing.T) {
+	record := reducerCanceledRetiredRecord(t)
+	record = reducerMustApply(t, record, Finalize{
+		Ref:    reducerRef(),
+		Intent: TerminalIntent{Outcome: OutcomeCanceled, Cause: CauseCanceledBeforeAuthorization},
+	})
+	first := RecordCancellation{
+		JobID:  record.JobID,
+		Origin: engine.CancellationOriginClientRequest,
+		Reason: "client requested cancellation",
+	}
+	updated, err := ApplyRecordCancellation(record, first)
+	if err != nil {
+		t.Fatalf("record client cancellation: %v", err)
+	}
+	if updated.Record.CancellationOrigin != first.Origin || updated.Record.CancellationReason != first.Reason {
+		t.Fatalf("cancellation metadata = (%q, %q), want (%q, %q)", updated.Record.CancellationOrigin, updated.Record.CancellationReason, first.Origin, first.Reason)
+	}
+
+	second := RecordCancellation{
+		JobID:  record.JobID,
+		Origin: engine.CancellationOriginDaemonShutdown,
+		Reason: "daemon shutdown requested cancellation",
+	}
+	again, err := ApplyRecordCancellation(updated.Record, second)
+	if err != nil {
+		t.Fatalf("record later shutdown cancellation: %v", err)
+	}
+	if again.Changed {
+		t.Fatalf("later cancellation metadata changed record: %+v", again.Record)
+	}
+	if again.Record.CancellationOrigin != first.Origin || again.Record.CancellationReason != first.Reason {
+		t.Fatalf("later cancellation metadata = (%q, %q), want first (%q, %q)", again.Record.CancellationOrigin, again.Record.CancellationReason, first.Origin, first.Reason)
+	}
+}
+
+func TestRecordCancellationDoesNotAttachToCompletedTerminal(t *testing.T) {
+	record := reducerCleanCompletedRecord(t)
+	record = reducerMustApply(t, record, Finalize{
+		Ref:    reducerRef(),
+		Intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally},
+	})
+
+	result, err := ApplyRecordCancellation(record, RecordCancellation{
+		JobID:  record.JobID,
+		Origin: engine.CancellationOriginClientRequest,
+		Reason: "client requested cancellation",
+	})
+	if err != nil {
+		t.Fatalf("record cancellation on completed terminal: %v", err)
+	}
+	if result.Changed || result.Record.CancellationOrigin != "" || result.Record.CancellationReason != "" {
+		t.Fatalf("completed cancellation metadata = (%q, %q), changed=%v; want absent and unchanged", result.Record.CancellationOrigin, result.Record.CancellationReason, result.Changed)
 	}
 }
 

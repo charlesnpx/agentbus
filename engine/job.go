@@ -36,6 +36,11 @@ type FailureClass string
 // backend-error sanitizer and by durable failure metadata validation.
 const FailureReasonMaxRunes = 512
 
+// CancellationOrigin is the stable, machine-readable category for a persisted
+// job cancellation. It is intentionally a small closed set so callers can
+// route operator investigation without parsing CancellationReason.
+type CancellationOrigin string
+
 const (
 	// FailureClassBackendNotStarted means agentbus could not admit or launch the
 	// backend turn, so no backend work was possible.
@@ -59,6 +64,20 @@ const (
 	// FailureClassInternalError means no more specific failure category is
 	// available.
 	FailureClassInternalError FailureClass = "internal_error"
+)
+
+const (
+	// CancellationOriginClientRequest means agentbus observed a client request
+	// to cancel the job. It does not establish whether backend work occurred.
+	CancellationOriginClientRequest CancellationOrigin = "client_request"
+	// CancellationOriginDaemonShutdown means agentbus canceled the job while
+	// performing graceful daemon shutdown. It does not establish whether backend
+	// work occurred.
+	CancellationOriginDaemonShutdown CancellationOrigin = "daemon_shutdown"
+	// CancellationOriginUnattributable means agentbus recorded a canceled job
+	// but did not observe a more specific cause. It does not establish whether
+	// backend work occurred.
+	CancellationOriginUnattributable CancellationOrigin = "unattributable"
 )
 
 // Valid reports whether class is one of the supported persisted failure
@@ -183,6 +202,20 @@ func metadataUint64(value any) (uint64, bool) {
 	return 0, false
 }
 
+// Valid reports whether origin is one of the supported persisted cancellation
+// categories. The empty origin is allowed only when no cancellation metadata
+// exists.
+func (origin CancellationOrigin) Valid() bool {
+	switch origin {
+	case CancellationOriginClientRequest,
+		CancellationOriginDaemonShutdown,
+		CancellationOriginUnattributable:
+		return true
+	default:
+		return false
+	}
+}
+
 // ProcessRef records enough process identity to detect PID reuse.
 type ProcessRef struct {
 	PID       int    `json:"pid,omitempty"`
@@ -295,6 +328,8 @@ type JobRecord struct {
 	FailureReason         string               `json:"failureReason,omitempty"`
 	FailureClass          FailureClass         `json:"failureClass,omitempty"`
 	TransportFrameDrops   *TransportFrameDrops `json:"transportFrameDrops,omitempty"`
+	CancellationReason    string               `json:"cancellationReason,omitempty"`
+	CancellationOrigin    CancellationOrigin   `json:"cancellationOrigin,omitempty"`
 }
 
 // IsTerminal reports whether state is terminal under the public job protocol.

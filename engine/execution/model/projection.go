@@ -36,6 +36,8 @@ type JobProjection struct {
 	FailureReason       string                      `json:"failureReason,omitempty"`
 	FailureClass        engine.FailureClass         `json:"failureClass,omitempty"`
 	TransportFrameDrops *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
+	CancellationReason  string                      `json:"cancellationReason,omitempty"`
+	CancellationOrigin  engine.CancellationOrigin   `json:"cancellationOrigin,omitempty"`
 }
 
 // Project rebuilds the read model from the proof-bearing SafetyRecord. The
@@ -54,6 +56,7 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 	public := PublicProjection(decision, dispatch, outcome)
 	finalAttemptStartedAt, finalAttemptEndedAt := projectedFinalAttemptTiming(record, public)
 	failureReason, failureClass := projectedFailureMetadata(record, public)
+	cancellationReason, cancellationOrigin := projectedCancellationMetadata(record, public)
 	return JobProjection{
 		SchemaVersion:         record.SchemaVersion,
 		Revision:              record.Revision,
@@ -73,7 +76,22 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 		FailureReason:         failureReason,
 		FailureClass:          failureClass,
 		TransportFrameDrops:   cloneTransportFrameDrops(record.TransportFrameDrops),
+		CancellationReason:    cancellationReason,
+		CancellationOrigin:    cancellationOrigin,
 	}, nil
+}
+
+// projectedFinalAttemptTiming, projectedFailureMetadata, and
+// projectedCancellationMetadata are independent suppression rules over the
+// same record: timing is advertised only as a complete pair on a terminal job,
+// failure metadata only for failure or interrupted terminal states, and
+// cancellation metadata only for canceled terminal states. All durable
+// observations are retained either way.
+func projectedFinalAttemptTiming(record SafetyRecord, public PublicState) (*time.Time, *time.Time) {
+	if !terminalPublicState(public) || record.FinalAttemptStartedAt == nil || record.FinalAttemptEndedAt == nil {
+		return nil, nil
+	}
+	return clonePtr(record.FinalAttemptStartedAt), clonePtr(record.FinalAttemptEndedAt)
 }
 
 func cloneTransportFrameDrops(drops *engine.TransportFrameDrops) *engine.TransportFrameDrops {
@@ -82,18 +100,6 @@ func cloneTransportFrameDrops(drops *engine.TransportFrameDrops) *engine.Transpo
 	}
 	copied := *drops
 	return &copied
-}
-
-// projectedFinalAttemptTiming and projectedFailureMetadata are independent
-// suppression rules over the same record: timing is advertised only as a
-// complete pair on a terminal job, and failure metadata only for failure or
-// interrupted terminal states. Both durable observations are retained either
-// way.
-func projectedFinalAttemptTiming(record SafetyRecord, public PublicState) (*time.Time, *time.Time) {
-	if !terminalPublicState(public) || record.FinalAttemptStartedAt == nil || record.FinalAttemptEndedAt == nil {
-		return nil, nil
-	}
-	return clonePtr(record.FinalAttemptStartedAt), clonePtr(record.FinalAttemptEndedAt)
 }
 
 // projectedFailureMetadata exposes durable failure metadata only for failure
@@ -105,6 +111,15 @@ func projectedFailureMetadata(record SafetyRecord, public PublicState) (string, 
 	default:
 		return "", ""
 	}
+}
+
+// projectedCancellationMetadata exposes durable cancellation metadata only for
+// canceled terminal states.
+func projectedCancellationMetadata(record SafetyRecord, public PublicState) (string, engine.CancellationOrigin) {
+	if public == PublicCanceled {
+		return record.CancellationReason, record.CancellationOrigin
+	}
+	return "", ""
 }
 
 func projectDecision(record SafetyRecord) Decision {

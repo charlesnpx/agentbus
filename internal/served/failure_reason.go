@@ -25,6 +25,11 @@ type terminalFailure struct {
 	reason string
 }
 
+type terminalCancellation struct {
+	origin engine.CancellationOrigin
+	reason string
+}
+
 // classifiedTerminalError preserves where an error arose while retaining its
 // original identity for existing errors.Is and errors.As callers.
 type classifiedTerminalError struct {
@@ -94,18 +99,32 @@ func classifyTerminalFailure(origin terminalFailureOrigin, err error, agentbusRe
 }
 
 func terminalFailureFor(origin terminalFailureOrigin, err error, agentbusRequestedStop bool) terminalFailure {
-	reason := "unknown failure"
+	return terminalFailure{
+		class:  classifyTerminalFailure(origin, err, agentbusRequestedStop),
+		reason: terminalReasonFor(err, "unknown failure"),
+	}
+}
+
+func terminalCancellationFor(origin engine.CancellationOrigin, reason string) terminalCancellation {
+	if !origin.Valid() {
+		origin = engine.CancellationOriginUnattributable
+	}
+	return terminalCancellation{
+		origin: origin,
+		reason: terminalReasonFor(errors.New(reason), "canceled without an attributable origin"),
+	}
+}
+
+func terminalReasonFor(err error, fallback string) string {
+	reason := fallback
 	if err != nil && strings.TrimSpace(err.Error()) != "" {
 		reason = err.Error()
 	}
 	reason = sanitizeAdmissionProbeReason(reason)
 	if strings.TrimSpace(reason) == "" {
-		reason = "unknown failure"
+		return fallback
 	}
-	return terminalFailure{
-		class:  classifyTerminalFailure(origin, err, agentbusRequestedStop),
-		reason: reason,
-	}
+	return reason
 }
 
 func terminalFailureStopWasRequestedByAgentbus(run jobRun, err error) bool {
@@ -142,5 +161,28 @@ func (s *Server) recordFailureMetadata(run jobRun, failure terminalFailure) erro
 		return authority.ErrNotReady
 	}
 	_, err = ready.RecordFailure(context.Background(), jobID, failure.class, failure.reason)
+	return err
+}
+
+func (s *Server) recordCancellationMetadata(run jobRun, cancellation terminalCancellation) error {
+	return s.recordCancellationMetadataForJob(run.jobID, cancellation)
+}
+
+func (s *Server) recordCancellationMetadataForJob(jobID string, cancellation terminalCancellation) error {
+	if !cancellation.origin.Valid() || strings.TrimSpace(cancellation.reason) == "" {
+		return fmt.Errorf("invalid cancellation metadata for job %s", jobID)
+	}
+	modelJobID, err := model.NewJobID(jobID)
+	if err != nil {
+		return err
+	}
+	s.admissionStateMu.RLock()
+	ready := s.admissionReady
+	available := s.admissionInstance != nil && ready != nil
+	s.admissionStateMu.RUnlock()
+	if !available {
+		return authority.ErrNotReady
+	}
+	_, err = ready.RecordCancellation(context.Background(), modelJobID, cancellation.origin, cancellation.reason)
 	return err
 }

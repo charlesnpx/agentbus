@@ -136,6 +136,48 @@ func TestJobStatusAndResultCleanupDispositionFieldsAreAdditive(t *testing.T) {
 	}
 }
 
+func TestJobStatusAndResultCancellationMetadataFieldsAreAdditive(t *testing.T) {
+	status, err := json.Marshal(JobStatus{
+		JobID:              "job-1",
+		State:              engine.StateCanceled,
+		CancellationOrigin: engine.CancellationOriginClientRequest,
+		CancellationReason: "client requested cancellation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var statusFields map[string]json.RawMessage
+	if err := json.Unmarshal(status, &statusFields); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(statusFields["cancellationOrigin"]); got != `"client_request"` {
+		t.Fatalf("status cancellationOrigin = %s in %s", got, status)
+	}
+	if got := string(statusFields["cancellationReason"]); got != `"client requested cancellation"` {
+		t.Fatalf("status cancellationReason = %s in %s", got, status)
+	}
+
+	result, err := json.Marshal(JobResult{
+		JobID:              "job-1",
+		State:              engine.StateCanceled,
+		CancellationOrigin: engine.CancellationOriginDaemonShutdown,
+		CancellationReason: "daemon shutdown requested cancellation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resultFields map[string]json.RawMessage
+	if err := json.Unmarshal(result, &resultFields); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(resultFields["cancellationOrigin"]); got != `"daemon_shutdown"` {
+		t.Fatalf("result cancellationOrigin = %s in %s", got, result)
+	}
+	if got := string(resultFields["cancellationReason"]); got != `"daemon shutdown requested cancellation"` {
+		t.Fatalf("result cancellationReason = %s in %s", got, result)
+	}
+}
+
 func TestJobStatusAndResultFinalAttemptTimingFieldsAreAdditive(t *testing.T) {
 	startedAt := time.Date(2026, 8, 11, 16, 0, 0, 0, time.UTC)
 	endedAt := startedAt.Add(7 * time.Second)

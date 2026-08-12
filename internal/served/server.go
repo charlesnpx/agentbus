@@ -318,6 +318,7 @@ type activeJob struct {
 
 	mu                sync.Mutex
 	terminal          engine.JobState
+	cancellation      terminalCancellation
 	admissionCommand  command.RunningCommand
 	containmentIntent *launch.ContainmentIntent
 }
@@ -326,10 +327,17 @@ type nativeInterruptSession interface {
 	NativeInterrupt(context.Context) (bool, error)
 }
 
-func (j *activeJob) requestTerminal(state engine.JobState) {
+func (j *activeJob) requestTerminal(state engine.JobState, metadata ...terminalCancellation) {
+	cancellation := terminalCancellationFor(engine.CancellationOriginUnattributable, "canceled without an attributable origin")
+	if len(metadata) > 0 {
+		cancellation = metadata[0]
+	}
 	j.mu.Lock()
 	if j.terminal == "" {
 		j.terminal = state
+		if state == engine.StateCanceled {
+			j.cancellation = cancellation
+		}
 	}
 	intent := j.containmentIntent
 	j.mu.Unlock()
@@ -342,6 +350,12 @@ func (j *activeJob) requestedTerminal() engine.JobState {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.terminal
+}
+
+func (j *activeJob) requestedCancellation() terminalCancellation {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.cancellation
 }
 
 func (j *activeJob) recordAdmissionCommand(cmd command.RunningCommand) bool {
@@ -1017,6 +1031,9 @@ func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context, admission *
 			if err := coord.Cancel(ctx, id, nil); err != nil {
 				return err
 			}
+			if err := s.recordCancellationMetadataForJob(id.String(), terminalCancellationFor(engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation")); err != nil && !errors.Is(err, authority.ErrNotReady) && !errors.Is(err, coordinator.ErrAlreadyFinalized) {
+				log.Printf("agentbus daemon: job %s shutdown cancellation metadata persistence failed: %v", id, err)
+			}
 			s.abandonAdmissionUnresolvedCustody(ctx, coord, id)
 			return nil
 		})
@@ -1078,7 +1095,7 @@ func (s *Server) requestActiveJobShutdownCancel(ctx context.Context, jobID strin
 	if active == nil {
 		return nil
 	}
-	active.requestTerminal(engine.StateCanceled)
+	active.requestTerminal(engine.StateCanceled, terminalCancellationFor(engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation"))
 	settled := active.interruptSessionNativeFirst()
 	if !settled {
 		if err := active.interruptAdmissionCommand(ctx); err != nil {
@@ -2264,7 +2281,7 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	active := s.lookupActiveJob(jobID)
 	if active != nil {
-		active.requestTerminal(engine.StateCanceled)
+		active.requestTerminal(engine.StateCanceled, terminalCancellationFor(engine.CancellationOriginClientRequest, "client requested cancellation"))
 		settled := active.interruptSessionNativeFirst()
 		// Admission cancel is intentional containment. Mark the active launch
 		// before coordinator containment so a killed process is the cancel
@@ -2317,6 +2334,9 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 				}
 			}
 			return requestOutcome{err: admissionProtocolError(err)}
+		}
+		if err := s.recordCancellationMetadataForJob(jobID, terminalCancellationFor(engine.CancellationOriginClientRequest, "client requested cancellation")); err != nil && !errors.Is(err, coordinator.ErrAlreadyFinalized) {
+			log.Printf("agentbus daemon: job %s client cancellation metadata persistence failed: %v", jobID, err)
 		}
 		var reloadErr *protocol.ErrorObject
 		_, projection, ok, reloadErr = s.authorityJobProjection(jobID)
@@ -2686,15 +2706,35 @@ func (s *Server) finalizeFailure(run jobRun, err error) {
 
 func (s *Server) finalizeRequestedTerminal(run jobRun) error {
 	state := run.active.requestedTerminal()
+	cancellation := run.active.requestedCancellation()
 	if state == "" {
 		state = engine.StateCanceled
+		cancellation = terminalCancellationFor(engine.CancellationOriginUnattributable, "canceled without an attributable origin")
 	}
-	return s.finalizeTerminal(run, state, "", nil)
+	if err := s.finalizeTerminal(run, state, "", nil); err != nil {
+		return err
+	}
+	if state == engine.StateCanceled {
+		if err := s.recordCancellationMetadata(run, cancellation); err != nil {
+			log.Printf("agentbus daemon: job %s cancellation metadata persistence failed: %v", run.jobID, err)
+		}
+	}
+	return nil
 }
 
 func (s *Server) completeRunTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) {
 	if err := s.finalizeTerminal(run, state, text, stamp); err != nil {
 		s.handleRunFinalizationError(run, err)
+		return
+	}
+	if state == engine.StateCanceled && run.active != nil {
+		cancellation := run.active.requestedCancellation()
+		if cancellation.origin == "" {
+			cancellation = terminalCancellationFor(engine.CancellationOriginUnattributable, "canceled without an attributable origin")
+		}
+		if err := s.recordCancellationMetadata(run, cancellation); err != nil {
+			log.Printf("agentbus daemon: job %s cancellation metadata persistence failed: %v", run.jobID, err)
+		}
 	}
 }
 
@@ -2946,7 +2986,7 @@ func (s *Server) abortUndeliveredRun(run jobRun, state engine.JobState) {
 	case engine.StateInterrupted:
 		_, _ = run.store.Interrupt(run.jobID)
 	case engine.StateCanceled:
-		_, _ = run.store.Cancel(run.jobID)
+		_, _ = run.store.CancelWithMetadata(run.jobID, engine.CancellationOriginUnattributable, "canceled without an attributable origin")
 	default:
 		_ = s.finalizeTerminal(run, state, "", nil)
 	}

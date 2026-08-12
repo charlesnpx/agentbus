@@ -6246,6 +6246,9 @@ func TestShutdownCancelsPendingAuthorityWorkBeforeClose(t *testing.T) {
 	if record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Cause != model.CauseCanceledBeforeAuthorization {
 		t.Fatalf("terminal = %+v, want canceled before authorization", record.Terminal)
 	}
+	if record.CancellationOrigin != engine.CancellationOriginDaemonShutdown || record.CancellationReason != "daemon shutdown requested cancellation" {
+		t.Fatalf("shutdown cancellation metadata = (%q, %q), want daemon shutdown", record.CancellationOrigin, record.CancellationReason)
+	}
 	if server.admissionInstance != nil || server.admissionReady != nil || server.admissionCoordinator != nil || server.admissionRuntime != nil || server.admissionRepository != nil {
 		t.Fatalf("admission state after Shutdown: instance=%p ready=%p coord=%p runtime=%p repo=%v",
 			server.admissionInstance, server.admissionReady, server.admissionCoordinator, server.admissionRuntime, server.admissionRepository)
@@ -7553,6 +7556,9 @@ func TestAdmissionActiveCancelCommitsUnresolvedCleanupInsteadOfRPCError(t *testi
 	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
 	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Proof != model.ProofUnresolvedAbsence {
 		t.Fatalf("terminal = %+v, want canceled unresolved absence", record.Terminal)
+	}
+	if record.CancellationOrigin != engine.CancellationOriginClientRequest || record.CancellationReason != "client requested cancellation" {
+		t.Fatalf("admission cancellation metadata = (%q, %q), want client request", record.CancellationOrigin, record.CancellationReason)
 	}
 	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
 	if result.State != engine.StateCanceled || result.CleanupDisposition != model.CleanupDispositionUnresolved.String() {

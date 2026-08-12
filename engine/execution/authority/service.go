@@ -277,6 +277,12 @@ func (r *Ready) RecordTransportFrameDrops(ctx context.Context, jobID model.JobID
 	return r.apply(ctx, jobID, model.RecordTransportFrameDrops{JobID: jobID, Drops: drops}, options...)
 }
 
+// RecordCancellation durably preserves the first cancellation explanation
+// without changing the job's state machine outcome or terminal certificate.
+func (r *Ready) RecordCancellation(ctx context.Context, jobID model.JobID, origin engine.CancellationOrigin, reason string, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.RecordCancellation{JobID: jobID, Origin: origin, Reason: reason}, options...)
+}
+
 func (r *Ready) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent, options ...ApplyOption) (ApplyResult, error) {
 	return r.apply(ctx, jobID, model.Finalize{Ref: ref, Intent: intent}, options...)
 }
@@ -804,6 +810,13 @@ func applyLogicalCommand(record model.SafetyRecord, command model.Command) (mode
 			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
 		}
 		return model.ApplyRecordTransportFrameDrops(record, *c)
+	case model.RecordCancellation:
+		return model.ApplyRecordCancellation(record, c)
+	case *model.RecordCancellation:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyRecordCancellation(record, *c)
 	case model.Finalize:
 		return model.ApplyFinalize(record, c)
 	case *model.Finalize:
@@ -1069,7 +1082,8 @@ func commandWithBoot(command model.Command, boot model.BootRef) model.Command {
 		return next
 	case model.RecordFinalAttemptStart, *model.RecordFinalAttemptStart,
 		model.RecordFailure, *model.RecordFailure,
-		model.RecordTransportFrameDrops, *model.RecordTransportFrameDrops:
+		model.RecordTransportFrameDrops, *model.RecordTransportFrameDrops,
+		model.RecordCancellation, *model.RecordCancellation:
 		return command
 	case model.Finalize:
 		if emptyBootRef(c.Intent.DerivedBy) {
@@ -1176,6 +1190,13 @@ func commandJobID(command model.Command) (model.JobID, error) {
 	case model.RecordTransportFrameDrops:
 		return c.JobID, nil
 	case *model.RecordTransportFrameDrops:
+		if c == nil {
+			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
+		}
+		return c.JobID, nil
+	case model.RecordCancellation:
+		return c.JobID, nil
+	case *model.RecordCancellation:
 		if c == nil {
 			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
 		}

@@ -2808,6 +2808,15 @@ func authorityFailureMetadata(projection model.JobProjection) (string, engine.Fa
 	}
 }
 
+// authorityCancellationMetadata exposes cancellation metadata only for
+// canceled terminal states.
+func authorityCancellationMetadata(projection model.JobProjection) (string, engine.CancellationOrigin) {
+	if projection.Public == model.PublicCanceled {
+		return projection.CancellationReason, projection.CancellationOrigin
+	}
+	return "", ""
+}
+
 func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *protocol.ErrorObject) {
 	record, projection, ok, errObj := s.authorityJobProjection(jobID)
 	if !ok || errObj != nil {
@@ -2815,6 +2824,7 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 	}
 	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
 	failureReason, failureClass := authorityFailureMetadata(projection)
+	cancellationReason, cancellationOrigin := authorityCancellationMetadata(projection)
 	reported := s.reportedModel(projection.JobID.String())
 	status := protocol.JobStatus{
 		JobID:                 projection.JobID.String(),
@@ -2828,6 +2838,8 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 		FailureReason:         failureReason,
 		FailureClass:          failureClass,
 		TransportFrameDrops:   cloneTransportFrameDrops(projection.TransportFrameDrops),
+		CancellationReason:    cancellationReason,
+		CancellationOrigin:    cancellationOrigin,
 	}
 	if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
 		startedAt := started
@@ -2900,6 +2912,7 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 	}
 	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
 	failureReason, failureClass := authorityFailureMetadata(projection)
+	cancellationReason, cancellationOrigin := authorityCancellationMetadata(projection)
 	reported := s.reportedModel(projection.JobID.String())
 	if result != nil {
 		result.ModelReported = reported
@@ -2918,6 +2931,8 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 		FailureReason:         failureReason,
 		FailureClass:          failureClass,
 		TransportFrameDrops:   cloneTransportFrameDrops(projection.TransportFrameDrops),
+		CancellationReason:    cancellationReason,
+		CancellationOrigin:    cancellationOrigin,
 	}, true, nil
 }
 
@@ -2976,6 +2991,7 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 	projection := image.Projection.Value
 	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
 	failureReason, failureClass := authorityFailureMetadata(projection)
+	cancellationReason, cancellationOrigin := authorityCancellationMetadata(projection)
 	return protocol.JobStatus{
 		JobID:                 projection.JobID.String(),
 		SessionID:             projection.SessionID,
@@ -2987,6 +3003,8 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 		FailureReason:         failureReason,
 		FailureClass:          failureClass,
 		TransportFrameDrops:   cloneTransportFrameDrops(projection.TransportFrameDrops),
+		CancellationReason:    cancellationReason,
+		CancellationOrigin:    cancellationOrigin,
 	}, true, nil
 }
 
