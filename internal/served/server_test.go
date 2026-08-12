@@ -7408,6 +7408,53 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 	}
 }
 
+func TestCorrectiveRetryReplacesObservedWorkspaceWriteItemCount(t *testing.T) {
+	t.Parallel()
+	var turns atomic.Int64
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		if turns.Add(1) == 1 {
+			return []engine.Event{
+				{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true},
+				{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true},
+				{Type: engine.EventAgentText, Text: `{"status":"bad"}`},
+			}
+		}
+		return []engine.Event{
+			{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true},
+			{Type: engine.EventAgentText, Text: `{"status":"pass"}`},
+		}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-observed-write-retry",
+		RequestID:    "request-observed-write-retry",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Write:   false,
+			Prompt:  "retry observed writes",
+			Policy: &engine.TurnPolicy{
+				Contract: &engine.ContractSpec{JSONSchema: json.RawMessage(`{"type":"object","required":["status"],"properties":{"status":{"const":"pass"}}}`)},
+				Retry:    &engine.RetryPolicy{Max: 1, Template: "Your response missed: {{missing}}."},
+			},
+		},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if got := record.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("terminal observed workspace-write count = %d, want retry count 1", got)
+	}
+	if got := record.ObservedWorkspaceWriteItemCountAttemptOrdinal; got != model.LaunchOrdinalTwo {
+		t.Fatalf("terminal observed workspace-write ordinal = %s, want retry ordinal %s", got, model.LaunchOrdinalTwo)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if got := result.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("job.result observed workspace-write count = %d, want retry count 1", got)
+	}
+}
+
 func TestRemovedAndUnknownMethodsReturnMethodNotFound(t *testing.T) {
 	t.Parallel()
 	for _, method := range []string{

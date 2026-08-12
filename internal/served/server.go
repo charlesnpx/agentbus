@@ -325,6 +325,7 @@ type activeJob struct {
 	admissionCommand                command.RunningCommand
 	containmentIntent               *launch.ContainmentIntent
 	observedWorkspaceWriteItemCount atomic.Uint64
+	observedWorkspaceWriteAttempt   atomic.Uint32
 }
 
 type nativeInterruptSession interface {
@@ -375,6 +376,32 @@ func (j *activeJob) observeWorkspaceWriteItem() uint64 {
 			return current + 1
 		}
 	}
+}
+
+func (j *activeJob) beginObservedWorkspaceWriteAttempt(ordinal model.LaunchOrdinal) {
+	if j == nil {
+		return
+	}
+	j.observedWorkspaceWriteItemCount.Store(0)
+	j.observedWorkspaceWriteAttempt.Store(uint32(ordinal))
+}
+
+func (j *activeJob) observedWorkspaceWriteItemCountForTerminal() (uint64, model.LaunchOrdinal) {
+	if j == nil {
+		return 0, 0
+	}
+	ordinal := model.LaunchOrdinal(j.observedWorkspaceWriteAttempt.Load())
+	if !ordinal.Valid() {
+		return 0, 0
+	}
+	return j.observedWorkspaceWriteItemCount.Load(), ordinal
+}
+
+func activeObservedWorkspaceWriteItemCount(job *activeJob) (uint64, model.LaunchOrdinal) {
+	if job == nil {
+		return 0, 0
+	}
+	return job.observedWorkspaceWriteItemCountForTerminal()
 }
 
 func (j *activeJob) recordAdmissionCommand(cmd command.RunningCommand) bool {
@@ -1047,10 +1074,11 @@ func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context, admission *
 		}
 		id := jobID
 		err := s.withAdmissionJobEffectErr(id.String(), func() error {
+			count, ordinal := activeObservedWorkspaceWriteItemCount(s.lookupActiveJob(id.String()))
 			if err := s.requestActiveJobShutdownCancel(ctx, id.String()); err != nil {
 				return err
 			}
-			if err := coord.CancelWithMetadata(ctx, id, engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation", nil); err != nil {
+			if err := coord.CancelWithMetadataAndObservedWorkspaceWriteItemCount(ctx, id, engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation", count, ordinal, nil); err != nil {
 				return err
 			}
 			s.abandonAdmissionUnresolvedCustody(ctx, coord, id)
@@ -2299,6 +2327,7 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 
 func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	active := s.lookupActiveJob(jobID)
+	count, ordinal := activeObservedWorkspaceWriteItemCount(active)
 	if active != nil {
 		active.requestTerminal(engine.StateCanceled, terminalCancellationFor(engine.CancellationOriginClientRequest, "client requested cancellation"))
 		settled := active.interruptSessionNativeFirst()
@@ -2326,7 +2355,7 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	if record.Terminal == nil {
 		err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
 			modelJobID := model.JobID(jobID)
-			if err := coord.CancelWithMetadata(context.Background(), modelJobID, engine.CancellationOriginClientRequest, "client requested cancellation", nil); err != nil {
+			if err := coord.CancelWithMetadataAndObservedWorkspaceWriteItemCount(context.Background(), modelJobID, engine.CancellationOriginClientRequest, "client requested cancellation", count, ordinal, nil); err != nil {
 				return err
 			}
 			s.abandonAdmissionUnresolvedCustody(context.Background(), coord, modelJobID)
@@ -2536,6 +2565,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		LogPaths: run.logPaths,
 	}
 	if run.admissionControlled {
+		run.active.beginObservedWorkspaceWriteAttempt(ordinal)
+	}
+	if run.admissionControlled {
 		startedAt := s.clock.Now().UTC()
 		s.rememberJobLivenessStartedAt(run.jobID, startedAt)
 		if err := s.recordAdmissionFinalAttemptStart(attemptCtx, run.jobID, startedAt); err != nil {
@@ -2608,38 +2640,6 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 	}
 }
 
-func (s *Server) recordObservedWorkspaceWriteItemCount(run jobRun, count uint64) error {
-	if count == 0 {
-		return nil
-	}
-	if run.admissionControlled {
-		jobID, err := model.NewJobID(run.jobID)
-		if err != nil {
-			return err
-		}
-		s.admissionStateMu.RLock()
-		ready := s.admissionReady
-		available := s.admissionInstance != nil && ready != nil
-		s.admissionStateMu.RUnlock()
-		if !available {
-			return authority.ErrNotReady
-		}
-		_, err = ready.RecordObservedWorkspaceWriteItemCount(context.Background(), jobID, count)
-		return err
-	}
-	if run.store == nil {
-		return nil
-	}
-	_, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
-		if count <= record.ObservedWorkspaceWriteItemCount {
-			return false, nil
-		}
-		record.ObservedWorkspaceWriteItemCount = count
-		return true, nil
-	})
-	return err
-}
-
 func (s *Server) recordTransportFrameDrops(run jobRun, drops engine.TransportFrameDrops) error {
 	if drops.Empty() {
 		return nil
@@ -2698,9 +2698,6 @@ func (s *Server) deferAdmissionEventDrain(run jobRun, events <-chan engine.Event
 			if event.ObservedWorkspaceWriteItem {
 				run.active.observeWorkspaceWriteItem()
 			}
-		}
-		if err := s.recordObservedWorkspaceWriteItemCount(run, run.active.observedWorkspaceWriteItemCount.Load()); err != nil {
-			log.Printf("agentbus daemon: job %s observed workspace-write item count persistence failed while draining: %v", run.jobID, err)
 		}
 		close(done)
 	}()
@@ -2853,11 +2850,6 @@ func (s *Server) failStopAdmissionFinalizationReconcile(jobID string, err error)
 }
 
 func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {
-	if run.active != nil && run.admissionControlled {
-		if err := s.recordObservedWorkspaceWriteItemCount(run, run.active.observedWorkspaceWriteItemCount.Load()); err != nil {
-			log.Printf("agentbus daemon: job %s observed workspace-write item count persistence failed: %v", run.jobID, err)
-		}
-	}
 	if run.admissionControlled {
 		return s.completeAdmissionRun(run, state, text, stamp)
 	}

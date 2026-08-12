@@ -333,7 +333,8 @@ type JobRecord struct {
 	// state. Zero means no write items
 	// were observed; it does not guarantee the workspace is clean because the
 	// stream may have been truncated or a write may have happened by a route
-	// the backend did not report.
+	// the backend did not report. A crash before terminalization can also leave
+	// observed writes absent from this count.
 	ObservedWorkspaceWriteItemCount uint64             `json:"observedWorkspaceWriteItemCount"`
 	CancellationReason              string             `json:"cancellationReason,omitempty"`
 	CancellationOrigin              CancellationOrigin `json:"cancellationOrigin,omitempty"`

@@ -111,10 +111,6 @@ func ApplyRecordTransportFrameDrops(current SafetyRecord, command RecordTranspor
 	return apply(current, command)
 }
 
-func ApplyRecordObservedWorkspaceWriteItemCount(current SafetyRecord, command RecordObservedWorkspaceWriteItemCount) (ApplyResult, error) {
-	return apply(current, command)
-}
-
 func ApplyRecordCancellation(current SafetyRecord, command RecordCancellation) (ApplyResult, error) {
 	return apply(current, command)
 }
@@ -153,24 +149,6 @@ func apply(current SafetyRecord, command Command) (ApplyResult, error) {
 		if transport, ok := normalized.(RecordTransportFrameDrops); ok {
 			next := cloneSafetyRecord(current)
 			changed, err := applyRecordTransportFrameDrops(&next, current, transport)
-			if err != nil {
-				return ApplyResult{}, err
-			}
-			if !changed {
-				return ApplyResult{Record: cloneSafetyRecord(current), Changed: false}, nil
-			}
-			if current.Revision == ^uint64(0) {
-				return ApplyResult{}, precondition("safety record revision overflow")
-			}
-			next.Revision = current.Revision + 1
-			if err := ValidateSafetyRecord(next); err != nil {
-				return ApplyResult{}, fmt.Errorf("reducer produced invalid safety record: %w", err)
-			}
-			return ApplyResult{Record: next, Changed: true}, nil
-		}
-		if writes, ok := normalized.(RecordObservedWorkspaceWriteItemCount); ok {
-			next := cloneSafetyRecord(current)
-			changed, err := applyRecordObservedWorkspaceWriteItemCount(&next, current, writes)
 			if err != nil {
 				return ApplyResult{}, err
 			}
@@ -256,8 +234,6 @@ func applyOpen(next *SafetyRecord, current SafetyRecord, command any) (bool, err
 		return applyRecordFailure(next, current, c)
 	case RecordTransportFrameDrops:
 		return applyRecordTransportFrameDrops(next, current, c)
-	case RecordObservedWorkspaceWriteItemCount:
-		return applyRecordObservedWorkspaceWriteItemCount(next, current, c)
 	case RecordCancellation:
 		return applyRecordCancellation(next, current, c)
 	case Finalize:
@@ -687,17 +663,6 @@ func applyRecordTransportFrameDrops(next *SafetyRecord, current SafetyRecord, co
 	return true, nil
 }
 
-func applyRecordObservedWorkspaceWriteItemCount(next *SafetyRecord, current SafetyRecord, command RecordObservedWorkspaceWriteItemCount) (bool, error) {
-	if err := ensureJob(current, command.JobID); err != nil {
-		return false, err
-	}
-	if command.Count <= current.ObservedWorkspaceWriteItemCount {
-		return false, nil
-	}
-	next.ObservedWorkspaceWriteItemCount = command.Count
-	return true, nil
-}
-
 func applyRecordCancellation(next *SafetyRecord, current SafetyRecord, command RecordCancellation) (bool, error) {
 	if err := ensureJob(current, command.JobID); err != nil {
 		return false, err
@@ -745,7 +710,29 @@ func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (
 		cancellationChanged = current.CancellationOrigin != next.CancellationOrigin || current.CancellationReason != next.CancellationReason
 	}
 	timingChanged := applyFinalAttemptEnd(next, current, command.Intent.FinalAttemptEndedAt)
-	return terminalChanged || cancellationChanged || timingChanged, nil
+	workspaceWritesChanged := applyTerminalObservedWorkspaceWriteItemCount(next, current, command.Intent)
+	return terminalChanged || cancellationChanged || timingChanged || workspaceWritesChanged, nil
+}
+
+// applyTerminalObservedWorkspaceWriteItemCount deliberately treats malformed
+// diagnostic metadata as absent. Terminal publication is more important than
+// a routing hint, and the count is committed only as part of that publication.
+func applyTerminalObservedWorkspaceWriteItemCount(next *SafetyRecord, current SafetyRecord, intent TerminalIntent) bool {
+	ordinal := intent.ObservedWorkspaceWriteItemCountAttemptOrdinal
+	if !ordinal.Valid() {
+		return false
+	}
+	currentOrdinal := current.ObservedWorkspaceWriteItemCountAttemptOrdinal
+	if !currentOrdinal.Valid() || ordinal > currentOrdinal {
+		next.ObservedWorkspaceWriteItemCount = intent.ObservedWorkspaceWriteItemCount
+		next.ObservedWorkspaceWriteItemCountAttemptOrdinal = ordinal
+		return current.ObservedWorkspaceWriteItemCount != next.ObservedWorkspaceWriteItemCount || currentOrdinal != ordinal
+	}
+	if ordinal != currentOrdinal || intent.ObservedWorkspaceWriteItemCount <= current.ObservedWorkspaceWriteItemCount {
+		return false
+	}
+	next.ObservedWorkspaceWriteItemCount = intent.ObservedWorkspaceWriteItemCount
+	return true
 }
 
 func terminalCancellationMetadata(outcome Outcome, origin engine.CancellationOrigin, reason string) (engine.CancellationOrigin, string, error) {
@@ -887,13 +874,6 @@ func normalizeCommand(command Command) (any, error) {
 			return nil, invalidCommand("command is nil")
 		}
 		return *c, nil
-	case RecordObservedWorkspaceWriteItemCount:
-		return c, nil
-	case *RecordObservedWorkspaceWriteItemCount:
-		if c == nil {
-			return nil, invalidCommand("command is nil")
-		}
-		return *c, nil
 	case RecordCancellation:
 		return c, nil
 	case *RecordCancellation:
@@ -923,7 +903,7 @@ func groupBindingAllowed(record SafetyRecord) bool {
 
 func legacyUnfencedCommand(command any) bool {
 	switch command.(type) {
-	case RequestCancel, ObserveOutcome, CertifyResult, RecordFinalAttemptStart, RecordFailure, RecordTransportFrameDrops, RecordObservedWorkspaceWriteItemCount, RecordCancellation, Finalize:
+	case RequestCancel, ObserveOutcome, CertifyResult, RecordFinalAttemptStart, RecordFailure, RecordTransportFrameDrops, RecordCancellation, Finalize:
 		return true
 	default:
 		return false

@@ -160,10 +160,12 @@ func TestFinalizeCanceledWithMetadataDoesNotPartiallyCommit(t *testing.T) {
 
 	repo.fault = durabilityFaultPreDBCommit
 	_, err = ready.Finalize(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.TerminalIntent{
-		Outcome:            model.OutcomeCanceled,
-		Cause:              model.CauseCanceledBeforeAuthorization,
-		CancellationOrigin: engine.CancellationOriginClientRequest,
-		CancellationReason: "client requested cancellation",
+		Outcome:                         model.OutcomeCanceled,
+		Cause:                           model.CauseCanceledBeforeAuthorization,
+		CancellationOrigin:              engine.CancellationOriginClientRequest,
+		CancellationReason:              "client requested cancellation",
+		ObservedWorkspaceWriteItemCount: 2,
+		ObservedWorkspaceWriteItemCountAttemptOrdinal: model.LaunchOrdinalOne,
 	})
 	if !errors.Is(err, repository.ErrDefinitelyNotCommitted) {
 		t.Fatalf("Finalize error = %v, want ErrDefinitelyNotCommitted", err)
@@ -181,6 +183,9 @@ func TestFinalizeCanceledWithMetadataDoesNotPartiallyCommit(t *testing.T) {
 	}
 	if image.Safety.Value.CancellationOrigin != "" || image.Safety.Value.CancellationReason != "" {
 		t.Fatalf("cancellation metadata = (%q, %q), want absent with uncommitted terminal", image.Safety.Value.CancellationOrigin, image.Safety.Value.CancellationReason)
+	}
+	if image.Safety.Value.ObservedWorkspaceWriteItemCount != 0 || image.Safety.Value.ObservedWorkspaceWriteItemCountAttemptOrdinal != 0 {
+		t.Fatalf("workspace-write metadata = (%d, %s), want absent with uncommitted terminal", image.Safety.Value.ObservedWorkspaceWriteItemCount, image.Safety.Value.ObservedWorkspaceWriteItemCountAttemptOrdinal)
 	}
 }
 
