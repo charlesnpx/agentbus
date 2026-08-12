@@ -677,16 +677,9 @@ func applyRecordCancellation(next *SafetyRecord, current SafetyRecord, command R
 		return false, nil
 	}
 	if current.CancellationOrigin != "" || current.CancellationReason != "" {
-		if current.CancellationOrigin == engine.CancellationOriginUnattributable &&
-			current.CancellationReason == "canceled without an attributable origin" &&
-			command.Origin != engine.CancellationOriginUnattributable {
-			next.CancellationOrigin = command.Origin
-			next.CancellationReason = command.Reason
-			return true, nil
-		}
-		// The first observed cancellation is the one most directly connected to
-		// the job's terminal path. Keep it authoritative when cleanup later
-		// observes another possible cause.
+		// Terminal cancellation provenance is immutable once committed. The
+		// atomic finalization path supplies the best available provenance at
+		// commit time, so a later observer must not revise it.
 		return false, nil
 	}
 	next.CancellationOrigin = command.Origin

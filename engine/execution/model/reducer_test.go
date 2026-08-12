@@ -135,23 +135,24 @@ func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
 	}
 }
 
-func TestRecordCancellationKeepsFirstObservedOrigin(t *testing.T) {
+func TestRecordCancellationKeepsFirstCommittedOrigin(t *testing.T) {
 	record := reducerCanceledRetiredRecord(t)
-	record = reducerMustApply(t, record, Finalize{
-		Ref:    reducerRef(),
-		Intent: TerminalIntent{Outcome: OutcomeCanceled, Cause: CauseCanceledBeforeAuthorization},
-	})
 	first := RecordCancellation{
 		JobID:  record.JobID,
 		Origin: engine.CancellationOriginClientRequest,
 		Reason: "client requested cancellation",
 	}
-	updated, err := ApplyRecordCancellation(record, first)
-	if err != nil {
-		t.Fatalf("record client cancellation: %v", err)
-	}
-	if updated.Record.CancellationOrigin != first.Origin || updated.Record.CancellationReason != first.Reason {
-		t.Fatalf("cancellation metadata = (%q, %q), want (%q, %q)", updated.Record.CancellationOrigin, updated.Record.CancellationReason, first.Origin, first.Reason)
+	record = reducerMustApply(t, record, Finalize{
+		Ref: reducerRef(),
+		Intent: TerminalIntent{
+			Outcome:            OutcomeCanceled,
+			Cause:              CauseCanceledBeforeAuthorization,
+			CancellationOrigin: first.Origin,
+			CancellationReason: first.Reason,
+		},
+	})
+	if record.CancellationOrigin != first.Origin || record.CancellationReason != first.Reason {
+		t.Fatalf("committed cancellation metadata = (%q, %q), want (%q, %q)", record.CancellationOrigin, record.CancellationReason, first.Origin, first.Reason)
 	}
 
 	second := RecordCancellation{
@@ -159,7 +160,7 @@ func TestRecordCancellationKeepsFirstObservedOrigin(t *testing.T) {
 		Origin: engine.CancellationOriginDaemonShutdown,
 		Reason: "daemon shutdown requested cancellation",
 	}
-	again, err := ApplyRecordCancellation(updated.Record, second)
+	again, err := ApplyRecordCancellation(record, second)
 	if err != nil {
 		t.Fatalf("record later shutdown cancellation: %v", err)
 	}
@@ -168,6 +169,32 @@ func TestRecordCancellationKeepsFirstObservedOrigin(t *testing.T) {
 	}
 	if again.Record.CancellationOrigin != first.Origin || again.Record.CancellationReason != first.Reason {
 		t.Fatalf("later cancellation metadata = (%q, %q), want first (%q, %q)", again.Record.CancellationOrigin, again.Record.CancellationReason, first.Origin, first.Reason)
+	}
+}
+
+func TestRecordCancellationDoesNotReplaceCommittedUnattributableProvenance(t *testing.T) {
+	record := reducerCanceledRetiredRecord(t)
+	record = reducerMustApply(t, record, Finalize{
+		Ref:    reducerRef(),
+		Intent: TerminalIntent{Outcome: OutcomeCanceled, Cause: CauseCanceledBeforeAuthorization},
+	})
+	if record.CancellationOrigin != engine.CancellationOriginUnattributable || record.CancellationReason != "canceled without an attributable origin" {
+		t.Fatalf("committed cancellation metadata = (%q, %q), want unattributable provenance", record.CancellationOrigin, record.CancellationReason)
+	}
+
+	result, err := ApplyRecordCancellation(record, RecordCancellation{
+		JobID:  record.JobID,
+		Origin: engine.CancellationOriginClientRequest,
+		Reason: "client requested cancellation",
+	})
+	if err != nil {
+		t.Fatalf("record later specific cancellation: %v", err)
+	}
+	if result.Changed {
+		t.Fatalf("later specific cancellation changed record: %+v", result.Record)
+	}
+	if result.Record.CancellationOrigin != record.CancellationOrigin || result.Record.CancellationReason != record.CancellationReason {
+		t.Fatalf("later specific cancellation metadata = (%q, %q), want committed (%q, %q)", result.Record.CancellationOrigin, result.Record.CancellationReason, record.CancellationOrigin, record.CancellationReason)
 	}
 }
 
