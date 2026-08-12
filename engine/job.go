@@ -328,8 +328,15 @@ type JobRecord struct {
 	FailureReason         string               `json:"failureReason,omitempty"`
 	FailureClass          FailureClass         `json:"failureClass,omitempty"`
 	TransportFrameDrops   *TransportFrameDrops `json:"transportFrameDrops,omitempty"`
-	CancellationReason    string               `json:"cancellationReason,omitempty"`
-	CancellationOrigin    CancellationOrigin   `json:"cancellationOrigin,omitempty"`
+	// ObservedWorkspaceWriteItemCount is the number of workspace-write items
+	// reported by the backend while this job ran, not a verified filesystem
+	// state. Zero means no write items
+	// were observed; it does not guarantee the workspace is clean because the
+	// stream may have been truncated or a write may have happened by a route
+	// the backend did not report.
+	ObservedWorkspaceWriteItemCount uint64             `json:"observedWorkspaceWriteItemCount"`
+	CancellationReason              string             `json:"cancellationReason,omitempty"`
+	CancellationOrigin              CancellationOrigin `json:"cancellationOrigin,omitempty"`
 }
 
 // IsTerminal reports whether state is terminal under the public job protocol.

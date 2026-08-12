@@ -2841,19 +2841,20 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 	cancellationReason, cancellationOrigin := authorityCancellationMetadata(projection)
 	reported := s.reportedModel(projection.JobID.String())
 	status := protocol.JobStatus{
-		JobID:                 projection.JobID.String(),
-		SessionID:             projection.SessionID,
-		State:                 admissionState(projection.Public),
-		CleanupDisposition:    admissionCleanupDisposition(record),
-		Timeout:               engine.CloneTimeoutResolution(projection.Timeout),
-		ModelReported:         reported,
-		FinalAttemptStartedAt: finalAttemptStartedAt,
-		FinalAttemptEndedAt:   finalAttemptEndedAt,
-		FailureReason:         failureReason,
-		FailureClass:          failureClass,
-		TransportFrameDrops:   cloneTransportFrameDrops(projection.TransportFrameDrops),
-		CancellationReason:    cancellationReason,
-		CancellationOrigin:    cancellationOrigin,
+		JobID:                           projection.JobID.String(),
+		SessionID:                       projection.SessionID,
+		State:                           admissionState(projection.Public),
+		CleanupDisposition:              admissionCleanupDisposition(record),
+		Timeout:                         engine.CloneTimeoutResolution(projection.Timeout),
+		ModelReported:                   reported,
+		FinalAttemptStartedAt:           finalAttemptStartedAt,
+		FinalAttemptEndedAt:             finalAttemptEndedAt,
+		FailureReason:                   failureReason,
+		FailureClass:                    failureClass,
+		TransportFrameDrops:             cloneTransportFrameDrops(projection.TransportFrameDrops),
+		ObservedWorkspaceWriteItemCount: projection.ObservedWorkspaceWriteItemCount,
+		CancellationReason:              cancellationReason,
+		CancellationOrigin:              cancellationOrigin,
 	}
 	status.LogPaths = s.admissionLogPaths(record)
 	if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
@@ -2934,21 +2935,22 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 		result.ModelReported = reported
 	}
 	return protocol.JobResult{
-		JobID:                 projection.JobID.String(),
-		SessionID:             projection.SessionID,
-		State:                 admissionState(projection.Public),
-		CleanupDisposition:    admissionCleanupDisposition(record),
-		Timeout:               engine.CloneTimeoutResolution(projection.Timeout),
-		Result:                result,
-		ModelReported:         reported,
-		Contract:              contract,
-		FinalAttemptStartedAt: finalAttemptStartedAt,
-		FinalAttemptEndedAt:   finalAttemptEndedAt,
-		FailureReason:         failureReason,
-		FailureClass:          failureClass,
-		TransportFrameDrops:   cloneTransportFrameDrops(projection.TransportFrameDrops),
-		CancellationReason:    cancellationReason,
-		CancellationOrigin:    cancellationOrigin,
+		JobID:                           projection.JobID.String(),
+		SessionID:                       projection.SessionID,
+		State:                           admissionState(projection.Public),
+		CleanupDisposition:              admissionCleanupDisposition(record),
+		Timeout:                         engine.CloneTimeoutResolution(projection.Timeout),
+		Result:                          result,
+		ModelReported:                   reported,
+		Contract:                        contract,
+		FinalAttemptStartedAt:           finalAttemptStartedAt,
+		FinalAttemptEndedAt:             finalAttemptEndedAt,
+		FailureReason:                   failureReason,
+		FailureClass:                    failureClass,
+		TransportFrameDrops:             cloneTransportFrameDrops(projection.TransportFrameDrops),
+		ObservedWorkspaceWriteItemCount: projection.ObservedWorkspaceWriteItemCount,
+		CancellationReason:              cancellationReason,
+		CancellationOrigin:              cancellationOrigin,
 	}, true, nil
 }
 
@@ -3009,18 +3011,19 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 	failureReason, failureClass := authorityFailureMetadata(projection)
 	cancellationReason, cancellationOrigin := authorityCancellationMetadata(projection)
 	return protocol.JobStatus{
-		JobID:                 projection.JobID.String(),
-		SessionID:             projection.SessionID,
-		State:                 admissionState(projection.Public),
-		CleanupDisposition:    admissionCleanupDisposition(image.Safety.Value),
-		Timeout:               engine.CloneTimeoutResolution(projection.Timeout),
-		FinalAttemptStartedAt: finalAttemptStartedAt,
-		FinalAttemptEndedAt:   finalAttemptEndedAt,
-		FailureReason:         failureReason,
-		FailureClass:          failureClass,
-		TransportFrameDrops:   cloneTransportFrameDrops(projection.TransportFrameDrops),
-		CancellationReason:    cancellationReason,
-		CancellationOrigin:    cancellationOrigin,
+		JobID:                           projection.JobID.String(),
+		SessionID:                       projection.SessionID,
+		State:                           admissionState(projection.Public),
+		CleanupDisposition:              admissionCleanupDisposition(image.Safety.Value),
+		Timeout:                         engine.CloneTimeoutResolution(projection.Timeout),
+		FinalAttemptStartedAt:           finalAttemptStartedAt,
+		FinalAttemptEndedAt:             finalAttemptEndedAt,
+		FailureReason:                   failureReason,
+		FailureClass:                    failureClass,
+		TransportFrameDrops:             cloneTransportFrameDrops(projection.TransportFrameDrops),
+		ObservedWorkspaceWriteItemCount: projection.ObservedWorkspaceWriteItemCount,
+		CancellationReason:              cancellationReason,
+		CancellationOrigin:              cancellationOrigin,
 	}, true, nil
 }
 

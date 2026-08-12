@@ -319,11 +319,12 @@ type activeJob struct {
 	session   engine.Session
 	cancel    context.CancelFunc
 
-	mu                sync.Mutex
-	terminal          engine.JobState
-	cancellation      terminalCancellation
-	admissionCommand  command.RunningCommand
-	containmentIntent *launch.ContainmentIntent
+	mu                              sync.Mutex
+	terminal                        engine.JobState
+	cancellation                    terminalCancellation
+	admissionCommand                command.RunningCommand
+	containmentIntent               *launch.ContainmentIntent
+	observedWorkspaceWriteItemCount atomic.Uint64
 }
 
 type nativeInterruptSession interface {
@@ -359,6 +360,21 @@ func (j *activeJob) requestedCancellation() terminalCancellation {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.cancellation
+}
+
+func (j *activeJob) observeWorkspaceWriteItem() uint64 {
+	if j == nil {
+		return 1
+	}
+	for {
+		current := j.observedWorkspaceWriteItemCount.Load()
+		if current == ^uint64(0) {
+			return current
+		}
+		if j.observedWorkspaceWriteItemCount.CompareAndSwap(current, current+1) {
+			return current + 1
+		}
+	}
 }
 
 func (j *activeJob) recordAdmissionCommand(cmd command.RunningCommand) bool {
@@ -2561,6 +2577,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, classifyFailureError(terminalFailureInternal, err)
 				}
 			}
+			if event.ObservedWorkspaceWriteItem {
+				run.active.observeWorkspaceWriteItem()
+			}
 			rawText := authoritativeText(event)
 			switch event.Type {
 			case engine.EventAgentText:
@@ -2587,6 +2606,38 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			}
 		}
 	}
+}
+
+func (s *Server) recordObservedWorkspaceWriteItemCount(run jobRun, count uint64) error {
+	if count == 0 {
+		return nil
+	}
+	if run.admissionControlled {
+		jobID, err := model.NewJobID(run.jobID)
+		if err != nil {
+			return err
+		}
+		s.admissionStateMu.RLock()
+		ready := s.admissionReady
+		available := s.admissionInstance != nil && ready != nil
+		s.admissionStateMu.RUnlock()
+		if !available {
+			return authority.ErrNotReady
+		}
+		_, err = ready.RecordObservedWorkspaceWriteItemCount(context.Background(), jobID, count)
+		return err
+	}
+	if run.store == nil {
+		return nil
+	}
+	_, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
+		if count <= record.ObservedWorkspaceWriteItemCount {
+			return false, nil
+		}
+		record.ObservedWorkspaceWriteItemCount = count
+		return true, nil
+	})
+	return err
 }
 
 func (s *Server) recordTransportFrameDrops(run jobRun, drops engine.TransportFrameDrops) error {
@@ -2643,7 +2694,13 @@ func (s *Server) deferAdmissionEventDrain(run jobRun, events <-chan engine.Event
 	s.admissionLogDrains[run.jobID] = done
 	s.mu.Unlock()
 	go func() {
-		for range events {
+		for event := range events {
+			if event.ObservedWorkspaceWriteItem {
+				run.active.observeWorkspaceWriteItem()
+			}
+		}
+		if err := s.recordObservedWorkspaceWriteItemCount(run, run.active.observedWorkspaceWriteItemCount.Load()); err != nil {
+			log.Printf("agentbus daemon: job %s observed workspace-write item count persistence failed while draining: %v", run.jobID, err)
 		}
 		close(done)
 	}()
@@ -2796,6 +2853,11 @@ func (s *Server) failStopAdmissionFinalizationReconcile(jobID string, err error)
 }
 
 func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string, stamp *engine.ContractStamp) error {
+	if run.active != nil && run.admissionControlled {
+		if err := s.recordObservedWorkspaceWriteItemCount(run, run.active.observedWorkspaceWriteItemCount.Load()); err != nil {
+			log.Printf("agentbus daemon: job %s observed workspace-write item count persistence failed: %v", run.jobID, err)
+		}
+	}
 	if run.admissionControlled {
 		return s.completeAdmissionRun(run, state, text, stamp)
 	}

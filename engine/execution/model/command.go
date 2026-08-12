@@ -95,6 +95,13 @@ type RecordTransportFrameDrops struct {
 	Drops engine.TransportFrameDrops
 }
 
+// RecordObservedWorkspaceWriteItemCount records a monotonic count without
+// retaining the backend item, workspace paths, or file contents.
+type RecordObservedWorkspaceWriteItemCount struct {
+	JobID JobID
+	Count uint64
+}
+
 // RecordCancellation attaches the first observed cancellation explanation to
 // a job without changing its outcome or terminal-state proof.
 type RecordCancellation struct {
@@ -120,18 +127,19 @@ type Finalize struct {
 	Intent TerminalIntent
 }
 
-func (Acknowledge) isCommand()               {}
-func (BeginReject) isCommand()               {}
-func (BindGroup) isCommand()                 {}
-func (CommitGrant) isCommand()               {}
-func (RecordReleaseOutcome) isCommand()      {}
-func (RecordRelease) isCommand()             {}
-func (RecordQuiescence) isCommand()          {}
-func (RequestCancel) isCommand()             {}
-func (ObserveOutcome) isCommand()            {}
-func (CertifyResult) isCommand()             {}
-func (RecordFinalAttemptStart) isCommand()   {}
-func (RecordFailure) isCommand()             {}
-func (RecordTransportFrameDrops) isCommand() {}
-func (RecordCancellation) isCommand()        {}
-func (Finalize) isCommand()                  {}
+func (Acknowledge) isCommand()                           {}
+func (BeginReject) isCommand()                           {}
+func (BindGroup) isCommand()                             {}
+func (CommitGrant) isCommand()                           {}
+func (RecordReleaseOutcome) isCommand()                  {}
+func (RecordRelease) isCommand()                         {}
+func (RecordQuiescence) isCommand()                      {}
+func (RequestCancel) isCommand()                         {}
+func (ObserveOutcome) isCommand()                        {}
+func (CertifyResult) isCommand()                         {}
+func (RecordFinalAttemptStart) isCommand()               {}
+func (RecordFailure) isCommand()                         {}
+func (RecordTransportFrameDrops) isCommand()             {}
+func (RecordObservedWorkspaceWriteItemCount) isCommand() {}
+func (RecordCancellation) isCommand()                    {}
+func (Finalize) isCommand()                              {}

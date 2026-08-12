@@ -277,6 +277,12 @@ func (r *Ready) RecordTransportFrameDrops(ctx context.Context, jobID model.JobID
 	return r.apply(ctx, jobID, model.RecordTransportFrameDrops{JobID: jobID, Drops: drops}, options...)
 }
 
+// RecordObservedWorkspaceWriteItemCount durably preserves the backend-reported
+// workspace-write observation count without retaining item details.
+func (r *Ready) RecordObservedWorkspaceWriteItemCount(ctx context.Context, jobID model.JobID, count uint64, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.RecordObservedWorkspaceWriteItemCount{JobID: jobID, Count: count}, options...)
+}
+
 // RecordCancellation durably preserves the first cancellation explanation
 // without changing the job's state machine outcome or terminal certificate.
 // Callers must pass non-sensitive text: it is persisted and exposed on
@@ -816,6 +822,13 @@ func applyLogicalCommand(record model.SafetyRecord, command model.Command) (mode
 			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
 		}
 		return model.ApplyRecordTransportFrameDrops(record, *c)
+	case model.RecordObservedWorkspaceWriteItemCount:
+		return model.ApplyRecordObservedWorkspaceWriteItemCount(record, c)
+	case *model.RecordObservedWorkspaceWriteItemCount:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyRecordObservedWorkspaceWriteItemCount(record, *c)
 	case model.RecordCancellation:
 		return model.ApplyRecordCancellation(record, c)
 	case *model.RecordCancellation:
@@ -1089,6 +1102,7 @@ func commandWithBoot(command model.Command, boot model.BootRef) model.Command {
 	case model.RecordFinalAttemptStart, *model.RecordFinalAttemptStart,
 		model.RecordFailure, *model.RecordFailure,
 		model.RecordTransportFrameDrops, *model.RecordTransportFrameDrops,
+		model.RecordObservedWorkspaceWriteItemCount, *model.RecordObservedWorkspaceWriteItemCount,
 		model.RecordCancellation, *model.RecordCancellation:
 		return command
 	case model.Finalize:
@@ -1196,6 +1210,13 @@ func commandJobID(command model.Command) (model.JobID, error) {
 	case model.RecordTransportFrameDrops:
 		return c.JobID, nil
 	case *model.RecordTransportFrameDrops:
+		if c == nil {
+			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
+		}
+		return c.JobID, nil
+	case model.RecordObservedWorkspaceWriteItemCount:
+		return c.JobID, nil
+	case *model.RecordObservedWorkspaceWriteItemCount:
 		if c == nil {
 			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
 		}
