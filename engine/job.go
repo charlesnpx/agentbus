@@ -232,6 +232,9 @@ type TimeoutResolution struct {
 // Valid reports whether resolution is either absent in a legacy record or has
 // a complete, internally consistent source shape.
 func (resolution TimeoutResolution) Valid() bool {
+	if resolution.Effective < 0 {
+		return false
+	}
 	if resolution.Source == "" {
 		return resolution.Requested == nil && resolution.Effective == 0
 	}

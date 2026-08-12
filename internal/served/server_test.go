@@ -3585,6 +3585,41 @@ func TestIdentifiedSubmitReportsAndPersistsResolvedTimeout(t *testing.T) {
 	}
 }
 
+func TestIdentifiedSubmitRejectsOverflowTimeoutBeforeDurableAccept(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	overflow := int64(9223372036854775807)
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-overflow-timeout",
+		RequestID:    "request-overflow-timeout",
+		TaskSpec: protocol.TaskSpec{
+			Backend:   "fake",
+			CWD:       cwd,
+			Write:     false,
+			Prompt:    "reject overflow timeout",
+			TimeoutMs: &overflow,
+		},
+	}))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want timeout rejection", outcome.result)
+	}
+	if outcome.after != nil {
+		t.Fatal("overflow timeout returned a launch hook")
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectInvalidStrictConfig)
+	if !strings.Contains(outcome.err.Message, "timeoutMs exceeds maximum") {
+		t.Fatalf("rejection message = %q, want maximum timeout error", outcome.err.Message)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoAuthoritySafetyRecords(t, server)
+	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+}
+
 func TestIdentifiedSubmitRejectsNoControlledRunnerBeforeBackendStart(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")

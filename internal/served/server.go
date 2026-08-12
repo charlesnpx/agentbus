@@ -3388,10 +3388,10 @@ func timeoutFromMillis(ms *int64) (time.Duration, *engine.TimeoutResolution, *pr
 			Source:    engine.TimeoutSourceClient,
 		}, nil
 	}
-	d := time.Duration(*ms) * time.Millisecond
-	if d > protocol.MaxTimeout {
+	if *ms > protocol.MaxTimeout.Milliseconds() {
 		return 0, nil, protocol.NewError(protocol.ErrorInvalidTaskSpec, "timeoutMs exceeds maximum", protocol.ErrorData{})
 	}
+	d := time.Duration(*ms) * time.Millisecond
 	return d, &engine.TimeoutResolution{
 		Requested: ms,
 		Effective: d.Milliseconds(),
