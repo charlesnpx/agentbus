@@ -9,8 +9,9 @@ var (
 	// text.
 	ErrTurnInterrupted = errors.New("backend turn interrupted")
 	// ErrProviderOverloaded marks an adapter-confirmed provider refusal due to
-	// capacity or overload before backend work began. It is carried in an
-	// in-process Event.Err so served can classify the condition without parsing
+	// capacity or overload where the adapter established that no potentially
+	// side-effecting backend tool work occurred. It is carried in an in-process
+	// Event.Err so served can classify the condition without parsing
 	// backend-controlled text.
 	ErrProviderOverloaded = errors.New("provider overloaded")
 )

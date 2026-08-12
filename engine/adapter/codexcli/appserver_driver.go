@@ -415,14 +415,17 @@ type turnObserver struct {
 	agentDeltaSeen     map[string]bool
 	agentDeltaText     map[string]*strings.Builder
 	lastDeltaAgentItem string
+	toolWorkObserved   bool
 	completion         *turnCompletion
 }
 
 type turnCompletion struct {
-	threadID  string
-	status    string
-	error     string
-	errorInfo string
+	threadID                     string
+	status                       string
+	error                        string
+	errorInfo                    string
+	terminalItemInventoryPresent bool
+	terminalItemMayHaveToolWork  bool
 }
 
 func (o *turnObserver) handle(frame duplex.Frame) bool {
@@ -452,7 +455,11 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 	if !ok {
 		item = payload
 	}
-	switch normalizeKind(firstString(item, "type")) {
+	kind := normalizeKind(firstString(item, "type"))
+	if itemMayHavePerformedToolWork(item) {
+		o.toolWorkObserved = true
+	}
+	switch kind {
 	case "agentmessage", "assistantmessage", "message":
 		if method == "item/completed" {
 			if text := textFrom(item); text != "" {
@@ -479,6 +486,9 @@ func (o *turnObserver) complete(payload map[string]any) {
 			o.lastCompletedAgent = text
 		}
 	}
+	if text := firstString(payload, "last_agent_message", "lastAgentMessage"); text != "" {
+		o.lastCompletedAgent = text
+	}
 	status := firstString(payload, "status")
 	if status == "" && turn != nil {
 		status = firstString(turn, "status")
@@ -503,11 +513,14 @@ func (o *turnObserver) complete(payload map[string]any) {
 	if errText == "" {
 		errText = textFrom(payload)
 	}
+	terminalItemInventoryPresent, terminalItemMayHaveToolWork := terminalItemInventory(payload, turn)
 	o.completion = &turnCompletion{
-		threadID:  firstString(payload, "threadId", "thread_id"),
-		status:    status,
-		error:     errText,
-		errorInfo: errInfo,
+		threadID:                     firstString(payload, "threadId", "thread_id"),
+		status:                       status,
+		error:                        errText,
+		errorInfo:                    errInfo,
+		terminalItemInventoryPresent: terminalItemInventoryPresent,
+		terminalItemMayHaveToolWork:  terminalItemMayHaveToolWork,
 	}
 }
 
@@ -575,7 +588,7 @@ func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer
 		if msg == "" {
 			msg = "turn failed"
 		}
-		if isProviderOverloaded(completion.errorInfo, msg) {
+		if isProviderOverloaded(completion.errorInfo, msg) && observer.providerOverloadIsSafeToRetry() {
 			return threadID, fmt.Errorf("codex app-server provider overload: %s: %w", msg, engine.ErrProviderOverloaded)
 		}
 		return threadID, fmt.Errorf("codex app-server turn failed: %s", msg)
@@ -586,6 +599,54 @@ func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer
 		return threadID, fmt.Errorf("codex app-server turn interrupted before completion: %w", engine.ErrTurnInterrupted)
 	default:
 		return threadID, fmt.Errorf("codex app-server turn completed with unsupported status %q", completion.status)
+	}
+}
+
+// providerOverloadIsSafeToRetry reports whether the terminal payload proves
+// that no potentially side-effecting tool work occurred. The inventory is
+// required because missing notifications cannot establish that no tool work
+// happened; a non-agent or malformed item is likewise treated as work.
+func (o *turnObserver) providerOverloadIsSafeToRetry() bool {
+	completion := o.completion
+	return completion != nil &&
+		completion.terminalItemInventoryPresent &&
+		!o.toolWorkObserved &&
+		!completion.terminalItemMayHaveToolWork
+}
+
+func terminalItemInventory(payload, turn map[string]any) (present, mayHaveToolWork bool) {
+	inventories := make([]any, 0, 2)
+	if turn != nil {
+		if items, ok := turn["items"]; ok {
+			present = true
+			inventories = append(inventories, items)
+		}
+	}
+	if items, ok := payload["items"]; ok {
+		present = true
+		inventories = append(inventories, items)
+	}
+	for _, inventory := range inventories {
+		items, ok := inventory.([]any)
+		if !ok {
+			return present, true
+		}
+		for _, rawItem := range items {
+			item, ok := rawItem.(map[string]any)
+			if !ok || itemMayHavePerformedToolWork(item) {
+				return present, true
+			}
+		}
+	}
+	return present, false
+}
+
+func itemMayHavePerformedToolWork(item map[string]any) bool {
+	switch normalizeKind(firstString(item, "type")) {
+	case "agentmessage", "assistantmessage", "message":
+		return false
+	default:
+		return true
 	}
 }
 
