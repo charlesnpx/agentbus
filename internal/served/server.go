@@ -1894,6 +1894,17 @@ func (c *connection) serve(ctx context.Context) {
 			}
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		message := "JSON-RPC connection read failed"
+		if errors.Is(err, bufio.ErrTooLong) {
+			message = "JSON-RPC request frame exceeded 4194304 byte limit"
+		}
+		_ = c.writeResponse(protocol.Response{
+			JSONRPC: "2.0",
+			ID:      json.RawMessage("null"),
+			Error:   protocol.NewError(protocol.ErrorInvalidTaskSpec, message, protocol.ErrorData{}),
+		})
+	}
 }
 
 func (c *connection) closeOnFailStop() func() {
@@ -2512,6 +2523,11 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			if run.admissionControlled {
 				s.recordJobLivenessEvent(run.jobID)
 			}
+			if drops, ok := engine.TransportFrameDropsFromMetadata(event.Metadata); ok {
+				if err := s.recordTransportFrameDrops(run, drops); err != nil {
+					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, classifyFailureError(terminalFailureInternal, err)
+				}
+			}
 			rawText := authoritativeText(event)
 			switch event.Type {
 			case engine.EventAgentText:
@@ -2537,6 +2553,41 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			}
 		}
 	}
+}
+
+func (s *Server) recordTransportFrameDrops(run jobRun, drops engine.TransportFrameDrops) error {
+	if drops.Empty() {
+		return nil
+	}
+	if run.admissionControlled {
+		jobID, err := model.NewJobID(run.jobID)
+		if err != nil {
+			return err
+		}
+		s.admissionStateMu.RLock()
+		ready := s.admissionReady
+		available := s.admissionInstance != nil && ready != nil
+		s.admissionStateMu.RUnlock()
+		if !available {
+			return authority.ErrNotReady
+		}
+		_, err = ready.RecordTransportFrameDrops(context.Background(), jobID, drops)
+		return err
+	}
+	if run.store == nil {
+		return nil
+	}
+	_, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
+		if record.TransportFrameDrops == nil {
+			copied := drops
+			record.TransportFrameDrops = &copied
+			return true, nil
+		}
+		before := *record.TransportFrameDrops
+		record.TransportFrameDrops.Merge(drops)
+		return *record.TransportFrameDrops != before, nil
+	})
+	return err
 }
 
 func attemptFinalText(hasResultMessage bool, resultText, assistantText string) string {

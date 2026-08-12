@@ -408,6 +408,9 @@ func (c *acpRPC) nextFrame(ctx context.Context) (duplex.Frame, error) {
 				frames = nil
 				continue
 			}
+			if frame.Err != nil {
+				return duplex.Frame{}, cursorTransportReadError(frame.Err)
+			}
 			return frame, nil
 		case err, ok := <-decodeErrs:
 			if !ok {
@@ -415,13 +418,21 @@ func (c *acpRPC) nextFrame(ctx context.Context) (duplex.Frame, error) {
 				continue
 			}
 			if err != nil {
-				return duplex.Frame{}, err
+				return duplex.Frame{}, cursorTransportReadError(err)
 			}
 		case <-ctx.Done():
 			return duplex.Frame{}, ctx.Err()
 		}
 	}
 	return duplex.Frame{}, duplex.ErrBackendExitedBeforeTerminal
+}
+
+func cursorTransportReadError(err error) error {
+	var overlong *duplex.OverlongFrameError
+	if errors.As(err, &overlong) {
+		return fmt.Errorf("cursor ACP transport: %w: %w", engine.ErrTransportFrameTooLarge, err)
+	}
+	return err
 }
 
 // Cursor ACP v1 implements only the qualified core permission reverse request. Cursor extension requests

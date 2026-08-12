@@ -604,6 +604,56 @@ func TestMalformedStdoutSurfacesDecodeError(t *testing.T) {
 	}
 }
 
+func TestReadJSONLResynchronizesAfterOversizedNonterminalFrame(t *testing.T) {
+	t.Setenv(JSONLineBytesEnv, "96")
+	reader, writer := io.Pipe()
+	frames := make(chan Frame, 2)
+	decodeErrs := make(chan error, 2)
+	done := make(chan struct{})
+	go readJSONL(reader, nil, frames, decodeErrs, done, nil)
+
+	_, _ = io.WriteString(writer, `{"type":"message","text":"`+strings.Repeat("x", 128)+`"}`+"\n")
+	_, _ = io.WriteString(writer, `{"type":"complete","text":"done"}`+"\n")
+	_ = writer.Close()
+
+	select {
+	case frame := <-frames:
+		var overlong *OverlongFrameError
+		if !errors.As(frame.Err, &overlong) {
+			t.Fatalf("frame error = %T %v, want OverlongFrameError", frame.Err, frame.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("oversized frame was not reported")
+	}
+	select {
+	case frame := <-frames:
+		if got := frame.Object["type"]; got != "complete" {
+			t.Fatalf("following frame type = %#v, want complete", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("following frame did not arrive")
+	}
+	<-done
+}
+
+func TestConfiguredJSONLineBytesHonorsOverrideAndFailsSafe(t *testing.T) {
+	t.Setenv(JSONLineBytesEnv, "12345")
+	if got := configuredJSONLineBytes(); got != 12345 {
+		t.Fatalf("configured limit = %d, want 12345", got)
+	}
+	t.Setenv(JSONLineBytesEnv, "not-a-number")
+	if got := configuredJSONLineBytes(); got != MaxJSONLineBytes {
+		t.Fatalf("invalid configured limit = %d, want safe default %d", got, MaxJSONLineBytes)
+	}
+}
+
+func TestFrameTypeFromPrefixAcceptsCompleteEnvelopeBeforeLargePayload(t *testing.T) {
+	kind, field := FrameTypeFromPrefix([]byte(`{"method":"turn/completed","params":{"padding":"`))
+	if kind != "turn/completed" || field != "method" {
+		t.Fatalf("frame prefix = (%q, %q), want turn/completed method", kind, field)
+	}
+}
+
 func TestSessionRetainsProviderResumeIDAfterTerminalError(t *testing.T) {
 	const confirmedResumeID = "resume-after-terminal-error"
 	terminalErr := errors.New("provider reported terminal error")
@@ -1413,6 +1463,9 @@ func (d *delayedFrameConsumerDriver) RunTurn(ctx context.Context, conn *Conn, re
 					return "", err
 				}
 				return "", ErrBackendExitedBeforeTerminal
+			}
+			if frame.Err != nil {
+				return "", frame.Err
 			}
 			kind, _ := frame.Object["type"].(string)
 			switch kind {

@@ -88,6 +88,13 @@ type RecordFailure struct {
 	Reason string
 }
 
+// RecordTransportFrameDrops preserves bounded metadata about backend frames
+// discarded by the transport reader without retaining backend payload bytes.
+type RecordTransportFrameDrops struct {
+	JobID JobID
+	Drops engine.TransportFrameDrops
+}
+
 type TerminalIntent struct {
 	Outcome   Outcome
 	Cause     TerminalCause
@@ -103,16 +110,17 @@ type Finalize struct {
 	Intent TerminalIntent
 }
 
-func (Acknowledge) isCommand()             {}
-func (BeginReject) isCommand()             {}
-func (BindGroup) isCommand()               {}
-func (CommitGrant) isCommand()             {}
-func (RecordReleaseOutcome) isCommand()    {}
-func (RecordRelease) isCommand()           {}
-func (RecordQuiescence) isCommand()        {}
-func (RequestCancel) isCommand()           {}
-func (ObserveOutcome) isCommand()          {}
-func (CertifyResult) isCommand()           {}
-func (RecordFinalAttemptStart) isCommand() {}
-func (RecordFailure) isCommand()           {}
-func (Finalize) isCommand()                {}
+func (Acknowledge) isCommand()               {}
+func (BeginReject) isCommand()               {}
+func (BindGroup) isCommand()                 {}
+func (CommitGrant) isCommand()               {}
+func (RecordReleaseOutcome) isCommand()      {}
+func (RecordRelease) isCommand()             {}
+func (RecordQuiescence) isCommand()          {}
+func (RequestCancel) isCommand()             {}
+func (ObserveOutcome) isCommand()            {}
+func (CertifyResult) isCommand()             {}
+func (RecordFinalAttemptStart) isCommand()   {}
+func (RecordFailure) isCommand()             {}
+func (RecordTransportFrameDrops) isCommand() {}
+func (Finalize) isCommand()                  {}

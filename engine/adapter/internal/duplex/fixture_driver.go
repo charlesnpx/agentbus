@@ -42,6 +42,13 @@ func (d FixtureDriver) RunTurn(ctx context.Context, conn *Conn, resumeID string,
 				}
 				return "", ErrBackendExitedBeforeTerminal
 			}
+			if frame.Err != nil {
+				var overlong *OverlongFrameError
+				if errors.As(frame.Err, &overlong) && fixtureOverlongFrameCanBeSkipped(overlong) {
+					continue
+				}
+				return "", frame.Err
+			}
 			kind, _ := frame.Object["type"].(string)
 			switch kind {
 			case "message":
@@ -67,6 +74,14 @@ func (d FixtureDriver) RunTurn(ctx context.Context, conn *Conn, resumeID string,
 			return "", ctx.Err()
 		}
 	}
+}
+
+func fixtureOverlongFrameCanBeSkipped(frame *OverlongFrameError) bool {
+	if frame == nil {
+		return false
+	}
+	kind, field := FrameTypeFromPrefix(frame.Prefix)
+	return field == "type" && kind == "message"
 }
 
 func (d FixtureDriver) Interrupt(ctx context.Context, conn *Conn) error {

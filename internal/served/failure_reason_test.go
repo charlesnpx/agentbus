@@ -45,6 +45,12 @@ func TestClassifyTerminalFailure(t *testing.T) {
 			want:   engine.FailureClassBackendError,
 		},
 		{
+			name:   "oversized backend transport frame",
+			origin: terminalFailureBackendRan,
+			err:    fmt.Errorf("transport: %w", engine.ErrTransportFrameTooLarge),
+			want:   engine.FailureClassTransportFrameTooLarge,
+		},
+		{
 			name:               "provider overload sentinel preserves provider message",
 			origin:             terminalFailureBackendRan,
 			err:                fmt.Errorf("codex app-server provider overload: %s: %w", providerCapacityMessage, engine.ErrProviderOverloaded),
@@ -280,6 +286,44 @@ func TestFailedJobExposesSanitizedFailureMetadata(t *testing.T) {
 	}
 	if strings.ContainsAny(result.FailureReason, "\n\r\x00") {
 		t.Fatalf("job.result failure reason retained control characters: %q", result.FailureReason)
+	}
+}
+
+func TestTransportFrameFailurePersistsDroppedFrameMetadata(t *testing.T) {
+	t.Parallel()
+	drops := engine.TransportFrameDrops{
+		Count:          1,
+		Bytes:          33 * 1024 * 1024,
+		RedactedPrefix: "method=turn/completed",
+	}
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{
+			{Type: engine.EventWarning, Text: "discarded backend transport frame", Metadata: drops.EventMetadata()},
+			{Type: engine.EventTerminalError, Text: engine.ErrTransportFrameTooLarge.Error(), Err: engine.ErrTransportFrameTooLarge},
+		}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-transport-frame",
+		RequestID:    "request-transport-frame",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Prompt:  "fail",
+		},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if got := record.FailureClass; got != engine.FailureClassTransportFrameTooLarge {
+		t.Fatalf("durable failure class = %q, want %q; reason=%q", got, engine.FailureClassTransportFrameTooLarge, record.FailureReason)
+	}
+	if record.TransportFrameDrops == nil || *record.TransportFrameDrops != drops {
+		t.Fatalf("durable transport frame drops = %#v, want %#v", record.TransportFrameDrops, drops)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if result.TransportFrameDrops == nil || *result.TransportFrameDrops != drops {
+		t.Fatalf("job.result transport frame drops = %#v, want %#v", result.TransportFrameDrops, drops)
 	}
 }
 

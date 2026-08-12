@@ -269,9 +269,10 @@ type SafetyRecord struct {
 	// whole-job elapsed time. A retry replaces this value with its own start.
 	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
 	// FinalAttemptEndedAt is when that same final attempt reached terminal.
-	FinalAttemptEndedAt *time.Time          `json:"finalAttemptEndedAt,omitempty"`
-	FailureReason       string              `json:"failureReason,omitempty"`
-	FailureClass        engine.FailureClass `json:"failureClass,omitempty"`
+	FinalAttemptEndedAt *time.Time                  `json:"finalAttemptEndedAt,omitempty"`
+	FailureReason       string                      `json:"failureReason,omitempty"`
+	FailureClass        engine.FailureClass         `json:"failureClass,omitempty"`
+	TransportFrameDrops *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
 }
 
 func (record SafetyRecord) Validate() error {
@@ -316,6 +317,30 @@ func (record SafetyRecord) Validate() error {
 	}
 	if err := ValidateFailureMetadata(record.FailureClass, record.FailureReason); err != nil {
 		return err
+	}
+	if err := validateTransportFrameDrops(record.TransportFrameDrops); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateTransportFrameDrops(drops *engine.TransportFrameDrops) error {
+	if drops == nil {
+		return nil
+	}
+	if drops.Count == 0 {
+		return invalid("transport_frame_drops.count", "is required")
+	}
+	if drops.Bytes == 0 {
+		return invalid("transport_frame_drops.bytes", "is required")
+	}
+	if len(drops.RedactedPrefix) == 0 || len(drops.RedactedPrefix) > 128 {
+		return invalid("transport_frame_drops.redacted_prefix", "must be 1 to 128 bytes")
+	}
+	for _, value := range drops.RedactedPrefix {
+		if value < ' ' || value > '~' {
+			return invalid("transport_frame_drops.redacted_prefix", "must contain printable ASCII only")
+		}
 	}
 	return nil
 }

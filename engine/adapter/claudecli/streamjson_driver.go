@@ -217,6 +217,9 @@ func (s *claudeStream) nextFrame(ctx context.Context) (duplex.Frame, error) {
 				frames = nil
 				continue
 			}
+			if frame.Err != nil {
+				return duplex.Frame{}, frame.Err
+			}
 			return frame, nil
 		case err, ok := <-decodeErrs:
 			if !ok {

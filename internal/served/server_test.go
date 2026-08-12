@@ -9872,6 +9872,21 @@ func serveScriptedRequest(t *testing.T, server *Server, method string, params an
 	return conn
 }
 
+func TestConnectionServeAnswersOversizedRequest(t *testing.T) {
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	request := append([]byte(`{"jsonrpc":"2.0","id":"1","method":"job.status","params":{"padding":"`), bytes.Repeat([]byte("x"), 4*1024*1024)...)
+	request = append(request, []byte(`"}}`+"\n")...)
+	conn := &scriptedConn{read: bytes.NewReader(request)}
+	(&connection{server: server, conn: conn, hello: true}).serve(context.Background())
+	response := responseFromScriptedConn(t, conn)
+	if response.Error == nil {
+		t.Fatal("oversized request response error = nil")
+	}
+	if response.Error.Data.Code != protocol.ErrorInvalidTaskSpec || !strings.Contains(response.Error.Message, "exceeded") {
+		t.Fatalf("oversized request response = %+v", response.Error)
+	}
+}
+
 func waitControlledSessionStarted(t *testing.T, session *controlledSession) {
 	t.Helper()
 	select {
