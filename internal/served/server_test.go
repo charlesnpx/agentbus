@@ -7450,9 +7450,115 @@ func TestCorrectiveRetryReplacesObservedWorkspaceWriteItemCount(t *testing.T) {
 		t.Fatalf("terminal observed workspace-write ordinal = %s, want retry ordinal %s", got, model.LaunchOrdinalTwo)
 	}
 	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
-	if got := result.ObservedWorkspaceWriteItemCount; got != 1 {
-		t.Fatalf("job.result observed workspace-write count = %d, want retry count 1", got)
+	if got := result.ObservedWorkspaceWriteItemCount; got == nil || *got != 1 {
+		t.Fatalf("job.result observed workspace-write count = %v, want retry count 1", got)
 	}
+}
+
+func TestCancellationSettlesBufferedWorkspaceWriteBeforeTerminalCommit(t *testing.T) {
+	t.Parallel()
+	backend := newAdmissionLivenessBackend("fake")
+	backend.eventStream = make(chan engine.Event, 2)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-cancel-buffered-write",
+		RequestID:    "request-cancel-buffered-write",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: true, Prompt: "cancel after buffered write"},
+	})
+	waitBackendStarted(t, backend.fakeBackend)
+	cancelParams := mustMarshal(t, protocol.JobCancelParams{JobID: job.JobID})
+	cancelDone := make(chan requestOutcome, 1)
+	go func() {
+		cancelDone <- server.handleJobCancel(cancelParams)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		active := server.lookupActiveJob(job.JobID)
+		if active != nil && active.requestedTerminal() == engine.StateCanceled {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if active := server.lookupActiveJob(job.JobID); active == nil || active.requestedTerminal() != engine.StateCanceled {
+		t.Fatal("cancellation did not reach the active attempt")
+	}
+	backend.eventStream <- engine.Event{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true}
+	close(backend.eventStream)
+	select {
+	case outcome := <-cancelDone:
+		if outcome.err != nil {
+			t.Fatalf("job.cancel error = %+v", outcome.err)
+		}
+		canceled, ok := outcome.result.(protocol.JobCancelResult)
+		if !ok {
+			t.Fatalf("job.cancel result type = %T", outcome.result)
+		}
+		if canceled.State != engine.StateCanceled {
+			t.Fatalf("job.cancel = %+v, want canceled", canceled)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("job.cancel did not return after buffered workspace-write event")
+	}
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if got := record.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("terminal observed workspace-write count = %d, want 1", got)
+	}
+}
+
+func TestDeferredDrainRecordsLateTransportFrameDropsAfterTerminalCommit(t *testing.T) {
+	t.Parallel()
+	backend := newAdmissionLivenessBackend("fake")
+	backend.eventStream = make(chan engine.Event)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-cancel-late-drops",
+		RequestID:    "request-cancel-late-drops",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "cancel before late frame drops"},
+	})
+	waitBackendStarted(t, backend.fakeBackend)
+
+	cancelParams := mustMarshal(t, protocol.JobCancelParams{JobID: job.JobID})
+	cancelDone := make(chan requestOutcome, 1)
+	go func() {
+		cancelDone <- server.handleJobCancel(cancelParams)
+	}()
+	select {
+	case outcome := <-cancelDone:
+		if outcome.err != nil {
+			t.Fatalf("job.cancel error = %+v", outcome.err)
+		}
+		canceled, ok := outcome.result.(protocol.JobCancelResult)
+		if !ok {
+			t.Fatalf("job.cancel result type = %T", outcome.result)
+		}
+		if canceled.State != engine.StateCanceled {
+			t.Fatalf("job.cancel = %+v, want canceled", canceled)
+		}
+	case <-time.After(admissionNativeInterruptGrace + 2*time.Second):
+		t.Fatal("job.cancel did not return after bounded diagnostic settle")
+	}
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+
+	drops := engine.TransportFrameDrops{Count: 1, Bytes: 1024, RedactedPrefix: "method=turn/completed"}
+	backend.eventStream <- engine.Event{Type: engine.EventWarning, Metadata: drops.EventMetadata()}
+	close(backend.eventStream)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		record := loadAdmissionSafetyRecord(t, server, job.JobID)
+		if record.TransportFrameDrops != nil {
+			if *record.TransportFrameDrops != drops {
+				t.Fatalf("terminal transport frame drops = %#v, want %#v", record.TransportFrameDrops, drops)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("late deferred frame-drop metadata was not recorded")
 }
 
 func TestObservedWorkspaceWriteAttemptSnapshotIsAtomic(t *testing.T) {

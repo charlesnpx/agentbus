@@ -312,12 +312,12 @@ func TestReadOnlyJobRecordsZeroObservedWorkspaceWriteItems(t *testing.T) {
 		t.Fatalf("durable observed workspace-write count = %d, want 0", got)
 	}
 	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
-	if len(status.Jobs) != 1 || status.Jobs[0].ObservedWorkspaceWriteItemCount != 0 {
+	if len(status.Jobs) != 1 || status.Jobs[0].ObservedWorkspaceWriteItemCount == nil || *status.Jobs[0].ObservedWorkspaceWriteItemCount != 0 {
 		t.Fatalf("job.status observed workspace-write count = %+v, want 0", status.Jobs)
 	}
 	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
-	if got := result.ObservedWorkspaceWriteItemCount; got != 0 {
-		t.Fatalf("job.result observed workspace-write count = %d, want 0", got)
+	if got := result.ObservedWorkspaceWriteItemCount; got == nil || *got != 0 {
+		t.Fatalf("job.result observed workspace-write count = %v, want 0", got)
 	}
 }
 
@@ -350,12 +350,12 @@ func TestFailedJobRetainsObservedWorkspaceWriteItemCount(t *testing.T) {
 		t.Fatalf("durable observed workspace-write count = %d, want 1", got)
 	}
 	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
-	if len(status.Jobs) != 1 || status.Jobs[0].ObservedWorkspaceWriteItemCount != 1 {
+	if len(status.Jobs) != 1 || status.Jobs[0].ObservedWorkspaceWriteItemCount == nil || *status.Jobs[0].ObservedWorkspaceWriteItemCount != 1 {
 		t.Fatalf("job.status observed workspace-write count = %+v, want 1", status.Jobs)
 	}
 	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
-	if got := result.ObservedWorkspaceWriteItemCount; got != 1 {
-		t.Fatalf("job.result observed workspace-write count = %d, want 1", got)
+	if got := result.ObservedWorkspaceWriteItemCount; got == nil || *got != 1 {
+		t.Fatalf("job.result observed workspace-write count = %v, want 1", got)
 	}
 }
 

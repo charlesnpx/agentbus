@@ -100,6 +100,22 @@ func TestProjectedCancellationMetadataOnlyForCanceledPublicState(t *testing.T) {
 	}
 }
 
+func TestProjectedObservedWorkspaceWriteItemCountOnlyForTerminalPublicState(t *testing.T) {
+	record := SafetyRecord{ObservedWorkspaceWriteItemCount: 0}
+	for _, public := range AllPublicStates() {
+		got := projectedObservedWorkspaceWriteItemCount(record, public)
+		if terminalPublicState(public) {
+			if got == nil || *got != 0 {
+				t.Fatalf("workspace-write count for terminal %s = %v, want present zero", public, got)
+			}
+			continue
+		}
+		if got != nil {
+			t.Fatalf("workspace-write count for non-terminal %s = %v, want absent", public, got)
+		}
+	}
+}
+
 func TestProjectDerivesReadModelFromSafetyRecordOnly(t *testing.T) {
 	record := validSafetyRecord()
 	projection, err := Project(record, ProjectionMetadata{SessionID: "session-1"})

@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
 )
@@ -337,6 +338,42 @@ func RunRepositoryContract(t *testing.T, factory Factory) {
 		mutateLaunchPhysicalFactForTest(t, &loaded, model.LaunchOrdinalOne)
 		assertSnapshotUnchanged(t, before, factory.Snapshot(t, repo))
 		assertJobSafetyRecord(t, repo, fixture.JobID, want)
+	})
+
+	t.Run("returned transport frame-drop images are isolated", func(t *testing.T) {
+		repo := factory.New(t)
+		fixture := newFixture(t, "transport-frame-drops-clone")
+		drops := engine.TransportFrameDrops{Count: 1, Bytes: 1024, RedactedPrefix: "method=turn/completed"}
+		fixture.Record.TransportFrameDrops = &drops
+		projection, err := model.Project(fixture.Record, model.ProjectionMetadata{SessionID: fixture.Projection.SessionID})
+		if err != nil {
+			t.Fatalf("Project fixture with transport frame drops: %v", err)
+		}
+		fixture.Projection = projection
+		acceptFixture(t, repo, fixture)
+
+		if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+			image := tx.LoadJob(fixture.JobID)
+			if image.Safety.Value.TransportFrameDrops == nil || image.Projection.Value.TransportFrameDrops == nil {
+				return fmt.Errorf("transport frame drops missing from returned image: %+v", image)
+			}
+			image.Safety.Value.TransportFrameDrops.Count = 99
+			image.Projection.Value.TransportFrameDrops.Bytes = 99
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		assertJobSafetyRecord(t, repo, fixture.JobID, fixture.Record)
+		if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+			image := tx.LoadJob(fixture.JobID)
+			if !reflect.DeepEqual(image.Projection.Value, fixture.Projection) {
+				return fmt.Errorf("projection = %#v, want %#v", image.Projection.Value, fixture.Projection)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
 	})
 
 	t.Run("expiry atomically replaces live records with tombstone", func(t *testing.T) {
