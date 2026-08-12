@@ -338,13 +338,13 @@ func TestInspectAdmissionRootReportsBusyRoot(t *testing.T) {
 	if !errors.Is(err, bolt.ErrTimeout) {
 		t.Fatalf("inspect busy root error = %v, want bolt.ErrTimeout", err)
 	}
-	for _, want := range []string{"admission database is held", "agentbus status", "agentbus result", "stop the daemon", "offline authority inspection"} {
+	for _, want := range []string{"could not be opened because it is held under an exclusive lock", "lock holder liveness is unknown", "inspection is offline-only", "if an agentbus daemon holds the database", "agentbus status", "agentbus result", "stop it"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("inspect busy root error = %q, want guidance containing %q", err, want)
 		}
 	}
-	if strings.Contains(err.Error(), "the daemon is running") {
-		t.Fatalf("inspect busy root error = %q, must not identify an uncorroborated lock holder as the daemon", err)
+	if strings.Contains(err.Error(), "agentbus.pid names a live process") {
+		t.Fatalf("inspect busy root error = %q, must not identify an unknown lock holder as the daemon", err)
 	}
 }
 
@@ -368,7 +368,7 @@ func TestInspectAdmissionRootReportsLivePIDEvidenceForBusyRoot(t *testing.T) {
 	if !errors.Is(err, ErrRootBusy) || !errors.Is(err, bolt.ErrTimeout) {
 		t.Fatalf("inspect busy live-pid root error = %v, want ErrRootBusy and bolt.ErrTimeout", err)
 	}
-	for _, want := range []string{"agentbus.pid names a live process", "pid " + strconv.Itoa(os.Getpid()), "agentbus status", "agentbus result", "stop the daemon"} {
+	for _, want := range []string{"could not be opened because it is held under an exclusive lock", "agentbus.pid names a live process", "pid " + strconv.Itoa(os.Getpid()), "inspection is offline-only", "if that process is the agentbus daemon holding the database", "agentbus status", "agentbus result", "stop it"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("inspect busy live-pid root error = %q, want guidance containing %q", err, want)
 		}
