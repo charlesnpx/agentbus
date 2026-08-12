@@ -61,9 +61,10 @@ type DecodeError struct {
 // bounded, untrusted transport evidence and is intentionally not an error
 // message payload.
 type OverlongFrameError struct {
-	Limit  int
-	Bytes  uint64
-	Prefix []byte
+	Limit                  int
+	Bytes                  uint64
+	Prefix                 []byte
+	DuplicateDiscriminator bool
 }
 
 func (e *OverlongFrameError) Error() string {
@@ -284,12 +285,16 @@ func (tracker *frameDropTracker) record(frame *OverlongFrameError) {
 	if tracker == nil || frame == nil {
 		return
 	}
+	summary := "unclassified"
+	if !frame.DuplicateDiscriminator {
+		summary = redactedFramePrefix(frame.Prefix)
+	}
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 	tracker.drops.Merge(engine.TransportFrameDrops{
 		Count:          1,
 		Bytes:          frame.Bytes,
-		RedactedPrefix: redactedFramePrefix(frame.Prefix),
+		RedactedPrefix: summary,
 	})
 }
 
@@ -304,11 +309,26 @@ func (tracker *frameDropTracker) snapshot() engine.TransportFrameDrops {
 
 func redactedFramePrefix(prefix []byte) string {
 	kind, field := FrameTypeFromPrefix(prefix)
-	if kind != "" {
-		return field + "=" + safeFrameType(kind)
+	summary := "unclassified"
+	switch field {
+	case "method":
+		switch kind {
+		case "turn/completed", "task_complete", "item/started", "warning", "error", "config/warning", "guardian/warning", "item/completed":
+			summary = "method=" + kind
+		}
+	case "type":
+		switch kind {
+		case "message", "complete", "warning":
+			summary = "type=" + kind
+		}
 	}
-	return "unclassified"
+	if len(summary) > maxRedactedFrameSummaryBytes {
+		return "unclassified"
+	}
+	return summary
 }
+
+const maxRedactedFrameSummaryBytes = 128
 
 // FrameTypeFromPrefix returns a complete top-level method or type string from
 // a bounded JSON object prefix. It returns no value for incomplete or malformed
@@ -438,24 +458,328 @@ func skipJSONValuePrefix(payload []byte, index int) (int, bool) {
 	return index, false
 }
 
-func safeFrameType(value string) string {
-	value = strings.TrimSpace(value)
-	if len(value) > 128 {
-		value = value[:128]
-	}
-	if value == "" {
-		return "unclassified"
-	}
-	for _, runeValue := range value {
-		if runeValue < ' ' || runeValue > '~' {
-			return "unclassified"
-		}
-	}
-	return value
-}
-
 func maxInt() int {
 	return int(^uint(0) >> 1)
+}
+
+// frameDiscriminatorTracker observes only the object-key positions that can
+// authorize an oversized-frame skip. It retains no frame values and does not
+// validate the JSON document.
+type frameDiscriminatorTracker struct {
+	started bool
+	depth   int
+
+	inString      bool
+	escaped       bool
+	unicodeDigits int
+	unicodeValue  uint16
+	keyContext    frameKeyContext
+	key           frameKeyCapture
+
+	rootActive        bool
+	rootExpectKey     bool
+	rootAwaitingColon bool
+	rootValuePending  bool
+	rootKey           frameKey
+
+	paramsActive        bool
+	paramsDepth         int
+	paramsExpectKey     bool
+	paramsAwaitingColon bool
+	paramsValuePending  bool
+	paramsKey           frameKey
+
+	itemActive        bool
+	itemDepth         int
+	itemExpectKey     bool
+	itemAwaitingColon bool
+
+	methodCount   uint8
+	typeCount     uint8
+	itemTypeCount uint8
+}
+
+type frameKeyContext uint8
+
+const (
+	frameKeyContextNone frameKeyContext = iota
+	frameKeyContextRoot
+	frameKeyContextParams
+	frameKeyContextItem
+)
+
+type frameKey uint8
+
+const (
+	frameKeyOther frameKey = iota
+	frameKeyParams
+	frameKeyItem
+)
+
+type frameKeyCapture struct {
+	value    [8]byte
+	length   int
+	overflow bool
+}
+
+func (tracker *frameDiscriminatorTracker) consume(payload []byte) {
+	for _, value := range payload {
+		tracker.consumeByte(value)
+	}
+}
+
+func (tracker *frameDiscriminatorTracker) consumeByte(value byte) {
+	if tracker.inString {
+		tracker.consumeStringByte(value)
+		return
+	}
+	if !tracker.started {
+		if value == ' ' || value == '\t' || value == '\r' {
+			return
+		}
+		if value != '{' {
+			tracker.started = true
+			return
+		}
+		tracker.started = true
+		tracker.depth = 1
+		tracker.rootActive = true
+		tracker.rootExpectKey = true
+		return
+	}
+	if value == ' ' || value == '\t' || value == '\r' {
+		return
+	}
+	if tracker.consumeColon(value) {
+		return
+	}
+	tracker.beginValue(value)
+	if value == '"' {
+		tracker.inString = true
+		tracker.escaped = false
+		tracker.unicodeDigits = 0
+		tracker.keyContext = tracker.nextKeyContext()
+		if tracker.keyContext != frameKeyContextNone {
+			tracker.key = frameKeyCapture{}
+		}
+		return
+	}
+	switch value {
+	case '{', '[':
+		tracker.depth++
+	case '}', ']':
+		tracker.closeContainer()
+	case ',':
+		tracker.nextObjectKey()
+	}
+}
+
+func (tracker *frameDiscriminatorTracker) consumeStringByte(value byte) {
+	if tracker.unicodeDigits > 0 {
+		digit, ok := hexDigit(value)
+		if !ok {
+			tracker.key.overflow = true
+			tracker.unicodeDigits = 0
+			return
+		}
+		tracker.unicodeValue = tracker.unicodeValue<<4 | uint16(digit)
+		tracker.unicodeDigits--
+		if tracker.unicodeDigits == 0 {
+			if tracker.unicodeValue <= 0x7f {
+				tracker.appendKeyByte(byte(tracker.unicodeValue))
+			} else {
+				tracker.key.overflow = true
+			}
+		}
+		return
+	}
+	if tracker.escaped {
+		tracker.escaped = false
+		switch value {
+		case 'u':
+			tracker.unicodeDigits = 4
+			tracker.unicodeValue = 0
+		case '"', '\\', '/':
+			tracker.appendKeyByte(value)
+		default:
+			tracker.key.overflow = true
+		}
+		return
+	}
+	switch value {
+	case '\\':
+		tracker.escaped = true
+	case '"':
+		tracker.inString = false
+		tracker.completeKey()
+	default:
+		tracker.appendKeyByte(value)
+	}
+}
+
+func (tracker *frameDiscriminatorTracker) appendKeyByte(value byte) {
+	if tracker.keyContext == frameKeyContextNone {
+		return
+	}
+	if tracker.key.length >= len(tracker.key.value) {
+		tracker.key.overflow = true
+		return
+	}
+	tracker.key.value[tracker.key.length] = value
+	tracker.key.length++
+}
+
+func (tracker *frameDiscriminatorTracker) completeKey() {
+	context := tracker.keyContext
+	tracker.keyContext = frameKeyContextNone
+	if context == frameKeyContextNone {
+		return
+	}
+	switch context {
+	case frameKeyContextRoot:
+		tracker.rootExpectKey = false
+		tracker.rootAwaitingColon = true
+		tracker.rootKey = frameKeyOther
+		if tracker.key.matches("method") {
+			tracker.increment(&tracker.methodCount)
+		} else if tracker.key.matches("type") {
+			tracker.increment(&tracker.typeCount)
+		} else if tracker.key.matches("params") {
+			tracker.rootKey = frameKeyParams
+		}
+	case frameKeyContextParams:
+		tracker.paramsExpectKey = false
+		tracker.paramsAwaitingColon = true
+		tracker.paramsKey = frameKeyOther
+		if tracker.key.matches("item") {
+			tracker.paramsKey = frameKeyItem
+		}
+	case frameKeyContextItem:
+		tracker.itemExpectKey = false
+		tracker.itemAwaitingColon = true
+		if tracker.key.matches("type") {
+			tracker.increment(&tracker.itemTypeCount)
+		}
+	}
+}
+
+func (tracker *frameDiscriminatorTracker) consumeColon(value byte) bool {
+	if value != ':' {
+		return false
+	}
+	switch {
+	case tracker.rootActive && tracker.depth == 1 && tracker.rootAwaitingColon:
+		tracker.rootAwaitingColon = false
+		tracker.rootValuePending = true
+		return true
+	case tracker.paramsActive && tracker.depth == tracker.paramsDepth && tracker.paramsAwaitingColon:
+		tracker.paramsAwaitingColon = false
+		tracker.paramsValuePending = true
+		return true
+	case tracker.itemActive && tracker.depth == tracker.itemDepth && tracker.itemAwaitingColon:
+		tracker.itemAwaitingColon = false
+		return true
+	default:
+		return false
+	}
+}
+
+func (tracker *frameDiscriminatorTracker) beginValue(value byte) {
+	if tracker.rootActive && tracker.depth == 1 && tracker.rootValuePending {
+		tracker.rootValuePending = false
+		if tracker.rootKey == frameKeyParams && value == '{' {
+			tracker.paramsActive = true
+			tracker.paramsDepth = tracker.depth + 1
+			tracker.paramsExpectKey = true
+		}
+	}
+	if tracker.paramsActive && tracker.depth == tracker.paramsDepth && tracker.paramsValuePending {
+		tracker.paramsValuePending = false
+		if tracker.paramsKey == frameKeyItem && value == '{' {
+			tracker.itemActive = true
+			tracker.itemDepth = tracker.depth + 1
+			tracker.itemExpectKey = true
+		}
+	}
+}
+
+func (tracker *frameDiscriminatorTracker) nextKeyContext() frameKeyContext {
+	switch {
+	case tracker.rootActive && tracker.depth == 1 && tracker.rootExpectKey:
+		return frameKeyContextRoot
+	case tracker.paramsActive && tracker.depth == tracker.paramsDepth && tracker.paramsExpectKey:
+		return frameKeyContextParams
+	case tracker.itemActive && tracker.depth == tracker.itemDepth && tracker.itemExpectKey:
+		return frameKeyContextItem
+	default:
+		return frameKeyContextNone
+	}
+}
+
+func (tracker *frameDiscriminatorTracker) closeContainer() {
+	if tracker.itemActive && tracker.depth == tracker.itemDepth {
+		tracker.itemActive = false
+	}
+	if tracker.paramsActive && tracker.depth == tracker.paramsDepth {
+		tracker.paramsActive = false
+	}
+	if tracker.rootActive && tracker.depth == 1 {
+		tracker.rootActive = false
+	}
+	if tracker.depth > 0 {
+		tracker.depth--
+	}
+}
+
+func (tracker *frameDiscriminatorTracker) nextObjectKey() {
+	switch {
+	case tracker.rootActive && tracker.depth == 1:
+		tracker.rootExpectKey = true
+		tracker.rootAwaitingColon = false
+		tracker.rootValuePending = false
+	case tracker.paramsActive && tracker.depth == tracker.paramsDepth:
+		tracker.paramsExpectKey = true
+		tracker.paramsAwaitingColon = false
+		tracker.paramsValuePending = false
+	case tracker.itemActive && tracker.depth == tracker.itemDepth:
+		tracker.itemExpectKey = true
+		tracker.itemAwaitingColon = false
+	}
+}
+
+func (tracker *frameDiscriminatorTracker) duplicateDiscriminator() bool {
+	return tracker.methodCount > 1 || tracker.typeCount > 1 || tracker.itemTypeCount > 1
+}
+
+func (tracker *frameDiscriminatorTracker) increment(count *uint8) {
+	if *count < 2 {
+		*count++
+	}
+}
+
+func (capture frameKeyCapture) matches(want string) bool {
+	if capture.overflow || capture.length != len(want) {
+		return false
+	}
+	for index := range want {
+		if capture.value[index] != want[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func hexDigit(value byte) (byte, bool) {
+	switch {
+	case value >= '0' && value <= '9':
+		return value - '0', true
+	case value >= 'a' && value <= 'f':
+		return value - 'a' + 10, true
+	case value >= 'A' && value <= 'F':
+		return value - 'A' + 10, true
+	default:
+		return 0, false
+	}
 }
 
 // readJSONLine reads one newline-delimited frame. When its payload exceeds
@@ -467,6 +791,7 @@ func readJSONLine(reader *bufio.Reader, limit int) ([]byte, *OverlongFrameError,
 	}
 	line := make([]byte, 0, min(limit, InitialJSONLineBufferBytes))
 	prefix := make([]byte, 0, min(limit, OverlongFramePrefixBytes))
+	discriminators := &frameDiscriminatorTracker{}
 	var bytesRead uint64
 	overlong := false
 	for {
@@ -480,7 +805,11 @@ func readJSONLine(reader *bufio.Reader, limit int) ([]byte, *OverlongFrameError,
 		if !overlong && len(line)+len(payload) <= limit {
 			line = append(line, payload...)
 		} else {
+			if !overlong {
+				discriminators.consume(line)
+			}
 			overlong = true
+			discriminators.consume(payload)
 			if len(prefix) < OverlongFramePrefixBytes {
 				fromLine := min(len(line), OverlongFramePrefixBytes-len(prefix))
 				prefix = append(prefix, line[:fromLine]...)
@@ -501,7 +830,7 @@ func readJSONLine(reader *bufio.Reader, limit int) ([]byte, *OverlongFrameError,
 		}
 		if errors.Is(err, io.EOF) {
 			if overlong {
-				return nil, &OverlongFrameError{Limit: limit, Bytes: bytesRead, Prefix: append([]byte(nil), prefix...)}, nil
+				return nil, &OverlongFrameError{Limit: limit, Bytes: bytesRead, Prefix: append([]byte(nil), prefix...), DuplicateDiscriminator: discriminators.duplicateDiscriminator()}, nil
 			}
 			if len(line) > 0 {
 				return line, nil, nil
@@ -511,7 +840,7 @@ func readJSONLine(reader *bufio.Reader, limit int) ([]byte, *OverlongFrameError,
 		return nil, nil, err
 	}
 	if overlong {
-		return nil, &OverlongFrameError{Limit: limit, Bytes: bytesRead, Prefix: append([]byte(nil), prefix...)}, nil
+		return nil, &OverlongFrameError{Limit: limit, Bytes: bytesRead, Prefix: append([]byte(nil), prefix...), DuplicateDiscriminator: discriminators.duplicateDiscriminator()}, nil
 	}
 	return line, nil, nil
 }

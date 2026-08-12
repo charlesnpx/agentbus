@@ -395,7 +395,7 @@ func codexTransportReadError(err error) error {
 // treated as a transport failure rather than risking a successful turn after
 // an unrecognized result-bearing frame was discarded.
 func codexOverlongFrameCanBeSkipped(frame *duplex.OverlongFrameError) bool {
-	if frame == nil {
+	if frame == nil || frame.DuplicateDiscriminator {
 		return false
 	}
 	method, field := duplex.FrameTypeFromPrefix(frame.Prefix)

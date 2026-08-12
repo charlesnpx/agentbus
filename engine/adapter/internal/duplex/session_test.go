@@ -654,6 +654,61 @@ func TestFrameTypeFromPrefixAcceptsCompleteEnvelopeBeforeLargePayload(t *testing
 	}
 }
 
+func TestRedactedFramePrefixUsesCanonicalAllowlist(t *testing.T) {
+	if got := redactedFramePrefix([]byte(`{"method":"warning","padding":"`)); got != "method=warning" {
+		t.Fatalf("known summary = %q, want method=warning", got)
+	}
+	if got := redactedFramePrefix([]byte(`{"method":"rm -rf /workspace/customer-a","padding":"`)); got != "unclassified" {
+		t.Fatalf("unknown summary = %q, want unclassified", got)
+	}
+	if got := redactedFramePrefix([]byte(`{"method":"` + strings.Repeat("x", maxRedactedFrameSummaryBytes) + `","padding":"`)); got != "unclassified" {
+		t.Fatalf("long summary = %q, want unclassified", got)
+	}
+}
+
+func TestReadJSONLineMarksDuplicateDiscriminators(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+	}{
+		{
+			name: "top-level method",
+			line: `{"method":"warning","padding":"` + strings.Repeat("x", 128) + `","method":"turn/completed"}` + "\n",
+		},
+		{
+			name: "top-level type",
+			line: `{"type":"message","padding":"` + strings.Repeat("x", 128) + `","type":"complete"}` + "\n",
+		},
+		{
+			name: "params item type",
+			line: `{"method":"item/completed","params":{"item":{"type":"fileChange","padding":"` + strings.Repeat("x", 128) + `","type":"agentMessage"}}}` + "\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, overlong, err := readJSONLine(bufio.NewReader(strings.NewReader(test.line)), 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if overlong == nil || !overlong.DuplicateDiscriminator {
+				t.Fatalf("overlong = %#v, want duplicate discriminator", overlong)
+			}
+		})
+	}
+}
+
+func TestFrameDropTrackerRedactsAmbiguousDiscriminator(t *testing.T) {
+	tracker := &frameDropTracker{}
+	tracker.record(&OverlongFrameError{
+		Bytes:                  129,
+		Prefix:                 []byte(`{"method":"warning"`),
+		DuplicateDiscriminator: true,
+	})
+	if got := tracker.snapshot().RedactedPrefix; got != "unclassified" {
+		t.Fatalf("ambiguous summary = %q, want unclassified", got)
+	}
+}
+
 func TestSessionRetainsProviderResumeIDAfterTerminalError(t *testing.T) {
 	const confirmedResumeID = "resume-after-terminal-error"
 	terminalErr := errors.New("provider reported terminal error")

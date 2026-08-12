@@ -166,6 +166,61 @@ func TestAppServerSkipsOversizedFileChangeFrame(t *testing.T) {
 	}
 }
 
+func TestAppServerOversizedDuplicateDiscriminatorFailsClosed(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name:    "top-level method",
+			payload: `{"method":"warning","padding":"` + strings.Repeat("x", 1024) + `","method":"turn/completed","params":{"status":"completed"}}` + "\n",
+		},
+		{
+			name:    "nested item type",
+			payload: `{"method":"item/completed","params":{"item":{"type":"fileChange","diff":"` + strings.Repeat("x", 1024) + `","type":"agentMessage"}}}` + "\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("AGENTBUS_BACKEND_JSON_LINE_BYTES", "512")
+			runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+				peer := newAppServerPeer(t, proc)
+				init := peer.expectRequest("initialize")
+				peer.respond(init, initializeResult())
+				peer.expectNotification("initialized")
+				thread := peer.expectRequest("thread/start")
+				peer.respond(thread, threadResult("thread-1"))
+				turn := peer.expectRequest("turn/start")
+				peer.respond(turn, turnResult("turn-1"))
+				if _, err := io.WriteString(proc.stdoutW, test.payload); err != nil {
+					t.Fatal(err)
+				}
+				// A later completion makes a skip observable as a false success.
+				peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+			})
+
+			session := startFakeCodexSession(t, engine.SessionOpts{})
+			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := collectEventsWithTimeout(t, events, 2*time.Second)
+			if !containsTransportFrameError(got) {
+				t.Fatalf("events = %#v, want duplicate discriminator transport error", got)
+			}
+		})
+	}
+}
+
+func containsTransportFrameError(events []engine.Event) bool {
+	for _, event := range events {
+		if event.Type == engine.EventTerminalError && errors.Is(event.Err, engine.ErrTransportFrameTooLarge) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestAppServerTurnSandboxPolicyFollowsWritePolicy(t *testing.T) {
 	cwd := t.TempDir()
 	tests := []struct {

@@ -40,6 +40,7 @@ const (
 	defaultShutdown      = 30 * time.Second
 
 	admissionNativeInterruptGrace = 2 * time.Second
+	oversizedRequestWriteTimeout  = time.Second
 )
 
 var ErrDaemonAlreadyListening = errors.New("agentbus daemon already listening")
@@ -1899,12 +1900,24 @@ func (c *connection) serve(ctx context.Context) {
 		if errors.Is(err, bufio.ErrTooLong) {
 			message = "JSON-RPC request frame exceeded 4194304 byte limit"
 		}
-		_ = c.writeResponse(protocol.Response{
+		_ = c.writeOversizedRequestResponse(protocol.Response{
 			JSONRPC: "2.0",
 			ID:      json.RawMessage("null"),
 			Error:   protocol.NewError(protocol.ErrorInvalidTaskSpec, message, protocol.ErrorData{}),
 		})
 	}
+}
+
+func (c *connection) writeOversizedRequestResponse(resp protocol.Response) error {
+	if c == nil || c.conn == nil {
+		return net.ErrClosed
+	}
+	if err := c.conn.SetWriteDeadline(time.Now().Add(oversizedRequestWriteTimeout)); err != nil {
+		_ = c.conn.Close()
+		return err
+	}
+	defer c.conn.SetWriteDeadline(time.Time{})
+	return c.writeResponse(resp)
 }
 
 func (c *connection) closeOnFailStop() func() {

@@ -77,7 +77,7 @@ func (d FixtureDriver) RunTurn(ctx context.Context, conn *Conn, resumeID string,
 }
 
 func fixtureOverlongFrameCanBeSkipped(frame *OverlongFrameError) bool {
-	if frame == nil {
+	if frame == nil || frame.DuplicateDiscriminator {
 		return false
 	}
 	kind, field := FrameTypeFromPrefix(frame.Prefix)
