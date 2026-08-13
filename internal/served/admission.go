@@ -42,6 +42,7 @@ const (
 	admissionContentionRetryDelay   = 50 * time.Millisecond
 	admissionContentionFallback     = 2 * time.Second
 	admissionProbeReasonMaxRunes    = engine.FailureReasonMaxRunes
+	defaultAdmissionLogRetentionCap = int64(1 << 30)
 )
 
 var admissionDetachedCleanupTimeout = 30 * time.Second
@@ -1991,6 +1992,11 @@ type servedAdmissionAuthority struct {
 	clock engine.Clock
 }
 
+func (a *servedAdmissionAuthority) RecordTransportFrameDrops(ctx context.Context, jobID model.JobID, drops engine.TransportFrameDrops) (coordinator.StepResult, error) {
+	applied, err := a.ready.RecordTransportFrameDrops(ctx, jobID, drops)
+	return admissionStepResult(applied, err)
+}
+
 func (a *servedAdmissionAuthority) RecordQuiescence(ctx context.Context, jobID model.JobID, ordinal model.LaunchOrdinal, verified custodian.VerifiedQuiescence) (coordinator.StepResult, error) {
 	applied, err := a.ready.RecordQuiescence(ctx, jobID, ordinal, verified)
 	return admissionStepResult(applied, err)
@@ -2200,6 +2206,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 			JobID:        replay.Record.JobID.String(),
 			State:        admissionState(replay.Projection.Public),
 			Deduplicated: true,
+			Timeout:      engine.CloneTimeoutResolution(replay.Projection.Timeout),
 		}}
 	case authority.ReplayExpired:
 		if errObj := strictAdmissionReplayIdentityError(replay.Tombstone.TaskIdentity, rawTaskSpec); errObj != nil {
@@ -2249,7 +2256,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
 		return requestOutcome{err: strictAdmissionInvalidConfigError("taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{Backend: spec.Backend})}
 	}
-	timeout, errObj := timeoutFromMillis(spec.TimeoutMs)
+	timeout, timeoutResolution, errObj := timeoutFromMillis(spec.TimeoutMs)
 	if errObj != nil {
 		return requestOutcome{err: strictAdmissionInvalidConfigError(errObj.Message, protocol.ErrorData{Backend: spec.Backend})}
 	}
@@ -2320,6 +2327,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		TaskIdentity:       taskIdentity,
 		Mode:               model.ModeIdentifiedFenced,
 		SessionID:          admissionSessionID,
+		Timeout:            timeoutResolution,
 	}
 	s.admissionSubmitMu.Lock()
 	if s.admissionInstanceClosing(instance) {
@@ -2351,6 +2359,7 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 			JobID:        jobID,
 			State:        admissionState(accepted.Projection.Public),
 			Deduplicated: true,
+			Timeout:      engine.CloneTimeoutResolution(accepted.Projection.Timeout),
 		}}
 	}
 	jobModelID := accepted.Record.JobID
@@ -2392,7 +2401,11 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		},
 	}
 	return requestOutcome{
-		result:       protocol.JobSubmitResult{JobID: jobID, State: engine.StateQueued},
+		result: protocol.JobSubmitResult{
+			JobID:   jobID,
+			State:   engine.StateQueued,
+			Timeout: engine.CloneTimeoutResolution(timeoutResolution),
+		},
 		after:        func() { s.handleAdmissionResponseOutcome(ctx, run, true) },
 		onAckFailure: func(error) { s.handleAdmissionResponseOutcome(ctx, run, false) },
 	}
@@ -2541,6 +2554,10 @@ func (s *Server) launchAdmittedJob(ctx context.Context, run jobRun) {
 }
 
 func (s *Server) finalizeAdmittedLaunchFailure(run jobRun, cause error) {
+	if err := discardEmptyBackendLogs(run.logPaths); err != nil {
+		s.handleRunFinalizationError(run, err)
+		return
+	}
 	jobID, err := model.NewJobID(run.jobID)
 	if err != nil {
 		s.handleRunFinalizationError(run, err)
@@ -2574,6 +2591,7 @@ func (s *Server) finalizeAdmittedLaunchFailure(run jobRun, cause error) {
 	if err := s.cleanupAdmittedCodexHomeFromCommittedTerminal(run); err != nil {
 		s.handleRunFinalizationError(run, err)
 	}
+	s.enforceAdmissionLogRetention(run.admissionAccepted.Record.WorkspaceLayoutKey.String())
 }
 
 func (s *Server) cleanupAdmittedCodexHomeFromCommittedTerminal(run jobRun) error {
@@ -2604,6 +2622,14 @@ func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobR
 	if snapshot.Record.Terminal != nil || snapshot.Record.Cancel != nil {
 		return run, nil, false, nil
 	}
+	if run.store == nil {
+		return run, nil, false, errors.New("admission log store is unavailable")
+	}
+	logPaths, err := ensureLogFiles(run.store, run.jobID)
+	if err != nil {
+		return run, nil, false, fmt.Errorf("allocate backend logs: %w", err)
+	}
+	run.logPaths = logPaths
 	s.mu.Lock()
 	_, active := s.activeJobs[run.jobID]
 	s.mu.Unlock()
@@ -2785,6 +2811,14 @@ func cloneTime(value *time.Time) *time.Time {
 	return &copied
 }
 
+func cloneUint64(value *uint64) *uint64 {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
+
 // authorityFailureMetadata exposes failure metadata only for failure or
 // interrupted terminal states.
 func authorityFailureMetadata(projection model.JobProjection) (string, engine.FailureClass) {
@@ -2796,6 +2830,15 @@ func authorityFailureMetadata(projection model.JobProjection) (string, engine.Fa
 	}
 }
 
+// authorityCancellationMetadata exposes cancellation metadata only for
+// canceled terminal states.
+func authorityCancellationMetadata(projection model.JobProjection) (string, engine.CancellationOrigin) {
+	if projection.Public == model.PublicCanceled {
+		return projection.CancellationReason, projection.CancellationOrigin
+	}
+	return "", ""
+}
+
 func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *protocol.ErrorObject) {
 	record, projection, ok, errObj := s.authorityJobProjection(jobID)
 	if !ok || errObj != nil {
@@ -2803,18 +2846,25 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 	}
 	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
 	failureReason, failureClass := authorityFailureMetadata(projection)
+	cancellationReason, cancellationOrigin := authorityCancellationMetadata(projection)
 	reported := s.reportedModel(projection.JobID.String())
 	status := protocol.JobStatus{
-		JobID:                 projection.JobID.String(),
-		SessionID:             projection.SessionID,
-		State:                 admissionState(projection.Public),
-		CleanupDisposition:    admissionCleanupDisposition(record),
-		ModelReported:         reported,
-		FinalAttemptStartedAt: finalAttemptStartedAt,
-		FinalAttemptEndedAt:   finalAttemptEndedAt,
-		FailureReason:         failureReason,
-		FailureClass:          failureClass,
+		JobID:                           projection.JobID.String(),
+		SessionID:                       projection.SessionID,
+		State:                           admissionState(projection.Public),
+		CleanupDisposition:              admissionCleanupDisposition(record),
+		Timeout:                         engine.CloneTimeoutResolution(projection.Timeout),
+		ModelReported:                   reported,
+		FinalAttemptStartedAt:           finalAttemptStartedAt,
+		FinalAttemptEndedAt:             finalAttemptEndedAt,
+		FailureReason:                   failureReason,
+		FailureClass:                    failureClass,
+		TransportFrameDrops:             cloneTransportFrameDrops(projection.TransportFrameDrops),
+		ObservedWorkspaceWriteItemCount: cloneUint64(projection.ObservedWorkspaceWriteItemCount),
+		CancellationReason:              cancellationReason,
+		CancellationOrigin:              cancellationOrigin,
 	}
+	status.LogPaths = s.admissionLogPaths(record)
 	if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
 		startedAt := started
 		updatedAt := lastEvent
@@ -2849,6 +2899,7 @@ func (s *Server) listAuthorityStatuses() ([]protocol.JobStatus, *protocol.ErrorO
 				return err
 			}
 			if ok {
+				status.LogPaths = s.admissionLogPaths(image.Safety.Value)
 				status.ModelReported = s.reportedModel(status.JobID)
 				if started, lastEvent, _, ok := s.jobLivenessSnapshot(status.JobID); ok {
 					startedAt := started
@@ -2886,22 +2937,28 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 	}
 	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
 	failureReason, failureClass := authorityFailureMetadata(projection)
+	cancellationReason, cancellationOrigin := authorityCancellationMetadata(projection)
 	reported := s.reportedModel(projection.JobID.String())
 	if result != nil {
 		result.ModelReported = reported
 	}
 	return protocol.JobResult{
-		JobID:                 projection.JobID.String(),
-		SessionID:             projection.SessionID,
-		State:                 admissionState(projection.Public),
-		CleanupDisposition:    admissionCleanupDisposition(record),
-		Result:                result,
-		ModelReported:         reported,
-		Contract:              contract,
-		FinalAttemptStartedAt: finalAttemptStartedAt,
-		FinalAttemptEndedAt:   finalAttemptEndedAt,
-		FailureReason:         failureReason,
-		FailureClass:          failureClass,
+		JobID:                           projection.JobID.String(),
+		SessionID:                       projection.SessionID,
+		State:                           admissionState(projection.Public),
+		CleanupDisposition:              admissionCleanupDisposition(record),
+		Timeout:                         engine.CloneTimeoutResolution(projection.Timeout),
+		Result:                          result,
+		ModelReported:                   reported,
+		Contract:                        contract,
+		FinalAttemptStartedAt:           finalAttemptStartedAt,
+		FinalAttemptEndedAt:             finalAttemptEndedAt,
+		FailureReason:                   failureReason,
+		FailureClass:                    failureClass,
+		TransportFrameDrops:             cloneTransportFrameDrops(projection.TransportFrameDrops),
+		ObservedWorkspaceWriteItemCount: cloneUint64(projection.ObservedWorkspaceWriteItemCount),
+		CancellationReason:              cancellationReason,
+		CancellationOrigin:              cancellationOrigin,
 	}, true, nil
 }
 
@@ -2960,16 +3017,261 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 	projection := image.Projection.Value
 	finalAttemptStartedAt, finalAttemptEndedAt := authorityFinalAttemptTiming(projection)
 	failureReason, failureClass := authorityFailureMetadata(projection)
+	cancellationReason, cancellationOrigin := authorityCancellationMetadata(projection)
 	return protocol.JobStatus{
-		JobID:                 projection.JobID.String(),
-		SessionID:             projection.SessionID,
-		State:                 admissionState(projection.Public),
-		CleanupDisposition:    admissionCleanupDisposition(image.Safety.Value),
-		FinalAttemptStartedAt: finalAttemptStartedAt,
-		FinalAttemptEndedAt:   finalAttemptEndedAt,
-		FailureReason:         failureReason,
-		FailureClass:          failureClass,
+		JobID:                           projection.JobID.String(),
+		SessionID:                       projection.SessionID,
+		State:                           admissionState(projection.Public),
+		CleanupDisposition:              admissionCleanupDisposition(image.Safety.Value),
+		Timeout:                         engine.CloneTimeoutResolution(projection.Timeout),
+		FinalAttemptStartedAt:           finalAttemptStartedAt,
+		FinalAttemptEndedAt:             finalAttemptEndedAt,
+		FailureReason:                   failureReason,
+		FailureClass:                    failureClass,
+		TransportFrameDrops:             cloneTransportFrameDrops(projection.TransportFrameDrops),
+		ObservedWorkspaceWriteItemCount: cloneUint64(projection.ObservedWorkspaceWriteItemCount),
+		CancellationReason:              cancellationReason,
+		CancellationOrigin:              cancellationOrigin,
 	}, true, nil
+}
+
+func (s *Server) admissionLogPaths(record model.SafetyRecord) *engine.LogPaths {
+	if record.Terminal != nil && record.Terminal.Outcome == model.OutcomeCompleted {
+		return nil
+	}
+	if s.admissionLogDrain(record.JobID.String()) != nil {
+		return nil
+	}
+	layout, err := authorityResultLayout(s.stateRoot, record)
+	if err != nil {
+		return nil
+	}
+	paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
+	if err != nil {
+		return nil
+	}
+	var advertised engine.LogPaths
+	if admissionReadableLogFile(paths.Stdout) {
+		advertised.Stdout = paths.Stdout
+	}
+	if admissionReadableLogFile(paths.Stderr) {
+		advertised.Stderr = paths.Stderr
+	}
+	if advertised.Stdout == "" && advertised.Stderr == "" {
+		return nil
+	}
+	return &advertised
+}
+
+type admissionLogCandidate struct {
+	jobID       string
+	paths       engine.LogPaths
+	terminalAt  time.Time
+	bytes       int64
+	workspaceID string
+}
+
+// A fixed set of retention locks serializes a workspace's immediate and
+// periodic passes without retaining a mutex for every workspace. A collision
+// only makes two workspaces serialize with each other; it never weakens their
+// individual retention guarantees.
+const admissionLogRetentionLockStripes = 64
+
+// admissionLogSweepLoop runs retention independently of status reads while a
+// server is serving requests.
+func (s *Server) admissionLogSweepLoop(ctx context.Context) {
+	s.sweepAdmissionLogs()
+	interval := s.gcInterval
+	if interval <= 0 {
+		interval = engine.DefaultGCInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.sweepAdmissionLogs()
+		}
+	}
+}
+
+func (s *Server) sweepAdmissionLogs() {
+	for i := range s.admissionLogRetentionMu {
+		s.admissionLogRetentionMu[i].Lock()
+	}
+	defer func() {
+		for i := len(s.admissionLogRetentionMu) - 1; i >= 0; i-- {
+			s.admissionLogRetentionMu[i].Unlock()
+		}
+	}()
+	s.sweepAdmissionLogsForWorkspace("")
+}
+
+// enforceAdmissionLogRetention runs an immediate, serialized pass for one
+// workspace once a terminal log has settled. The periodic full sweep remains
+// responsible for TTL expiration and restart recovery.
+func (s *Server) enforceAdmissionLogRetention(workspaceID string) {
+	if workspaceID == "" {
+		return
+	}
+	lock := &s.admissionLogRetentionMu[admissionLogRetentionLockIndex(workspaceID)]
+	lock.Lock()
+	defer lock.Unlock()
+	s.sweepAdmissionLogsForWorkspace(workspaceID)
+}
+
+func admissionLogRetentionLockIndex(workspaceID string) uint32 {
+	const (
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	hash := uint32(offset32)
+	for i := 0; i < len(workspaceID); i++ {
+		hash ^= uint32(workspaceID[i])
+		hash *= prime32
+	}
+	return hash % admissionLogRetentionLockStripes
+}
+
+func (s *Server) sweepAdmissionLogsForWorkspace(workspaceID string) {
+	s.admissionStateMu.RLock()
+	repo := s.admissionRepository
+	ready := s.admissionInstance != nil && repo != nil
+	s.admissionStateMu.RUnlock()
+	if !ready {
+		return
+	}
+	var records []model.SafetyRecord
+	if err := repo.View(context.Background(), func(tx repository.ReadTx) error {
+		images, err := tx.ListJobs(repository.JobFilter{})
+		if err != nil {
+			return err
+		}
+		for _, image := range images {
+			if image.Safety.State == repository.RecordValid {
+				records = append(records, image.Safety.Value)
+			}
+		}
+		return nil
+	}); err != nil {
+		log.Printf("agentbus daemon: admission backend log retention sweep failed: %v", err)
+		return
+	}
+
+	now := s.clock.Now().UTC()
+	workspaceBytes := make(map[string]int64)
+	eligible := make(map[string][]admissionLogCandidate)
+	for _, record := range records {
+		if workspaceID != "" && record.WorkspaceLayoutKey.String() != workspaceID {
+			continue
+		}
+		layout, err := authorityResultLayout(s.stateRoot, record)
+		if err != nil {
+			continue
+		}
+		paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
+		if err != nil {
+			continue
+		}
+		bytes := backendLogBytes(paths)
+		workspaceID := record.WorkspaceLayoutKey.String()
+		workspaceBytes[workspaceID] += bytes
+		if record.Terminal == nil || s.admissionLogProtected(record.JobID.String()) {
+			continue
+		}
+		if record.Terminal.Outcome == model.OutcomeCompleted || admissionLogsExpired(record, now) {
+			if err := discardBackendLogs(paths); err != nil {
+				log.Printf("agentbus daemon: remove backend logs for %s: %v", record.JobID, err)
+				continue
+			}
+			workspaceBytes[workspaceID] -= bytes
+			continue
+		}
+		if bytes == 0 {
+			continue
+		}
+		terminalAt := time.Time{}
+		if record.FinalAttemptEndedAt != nil {
+			terminalAt = record.FinalAttemptEndedAt.UTC()
+		}
+		eligible[workspaceID] = append(eligible[workspaceID], admissionLogCandidate{
+			jobID:       record.JobID.String(),
+			paths:       paths,
+			terminalAt:  terminalAt,
+			bytes:       bytes,
+			workspaceID: workspaceID,
+		})
+	}
+
+	capBytes := s.admissionLogRetentionCap
+	if capBytes <= 0 {
+		capBytes = defaultAdmissionLogRetentionCap
+	}
+	for workspaceID, candidates := range eligible {
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].terminalAt.Equal(candidates[j].terminalAt) {
+				return candidates[i].jobID < candidates[j].jobID
+			}
+			return candidates[i].terminalAt.Before(candidates[j].terminalAt)
+		})
+		for _, candidate := range candidates {
+			if workspaceBytes[workspaceID] <= capBytes {
+				break
+			}
+			if s.admissionLogProtected(candidate.jobID) {
+				continue
+			}
+			if err := discardBackendLogs(candidate.paths); err != nil {
+				log.Printf("agentbus daemon: evict backend logs for %s: %v", candidate.jobID, err)
+				continue
+			}
+			workspaceBytes[workspaceID] -= candidate.bytes
+		}
+	}
+}
+
+func admissionLogsExpired(record model.SafetyRecord, now time.Time) bool {
+	return record.FinalAttemptEndedAt != nil && now.Sub(record.FinalAttemptEndedAt.UTC()) >= engine.DefaultLogTTL
+}
+
+func backendLogBytes(paths engine.LogPaths) int64 {
+	var total int64
+	for _, path := range []string{paths.Stdout, paths.Stderr} {
+		info, err := os.Lstat(path)
+		if err == nil && info.Mode().IsRegular() {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
+func (s *Server) admissionLogProtected(jobID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeJobs[jobID] != nil {
+		return true
+	}
+	return s.admissionLogDrains[jobID] != nil
+}
+
+func admissionReadableLogFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	return err == nil && info.Mode().IsRegular() && info.Size() > 0
+}
+
+func cloneTransportFrameDrops(drops *engine.TransportFrameDrops) *engine.TransportFrameDrops {
+	if drops == nil {
+		return nil
+	}
+	copied := *drops
+	return &copied
 }
 
 func authorityImageEmpty(image repository.JobImage) bool {

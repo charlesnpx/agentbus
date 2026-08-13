@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/execution/custodian"
 	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/engine/execution/repository"
@@ -12,6 +13,14 @@ import (
 
 type RecoveryLaunch = model.RecoveryLaunch
 type RecoveryWorkItem = model.RecoveryWorkItem
+
+func finalizeWithCancellationMetadata(finalize model.Finalize) model.Finalize {
+	if finalize.Intent.Outcome == model.OutcomeCanceled && finalize.Intent.CancellationOrigin == "" && finalize.Intent.CancellationReason == "" {
+		finalize.Intent.CancellationOrigin = engine.CancellationOriginUnattributable
+		finalize.Intent.CancellationReason = "canceled without an attributable origin"
+	}
+	return finalize
+}
 
 type issuedRecoveryToken struct {
 	jobID        model.JobID
@@ -138,6 +147,7 @@ func (s *RecoverySession) finalizePlanned(ctx context.Context, token model.Recov
 		finalize := *plan.Next.Finalize
 		finalize.Intent.DerivedBy = s.token.boot
 		finalize.Intent.FinalAttemptEndedAt = finalAttemptEndedAt
+		finalize = finalizeWithCancellationMetadata(finalize)
 		applied, err := applyRecoveryCommandTx(tx, token.JobID, finalize, meta.Generation+1)
 		if err != nil {
 			return err
@@ -203,7 +213,7 @@ func (s *RecoverySession) finalizeUnresolved(ctx context.Context, token model.Re
 		}
 		intent.DerivedBy = s.token.boot
 		intent.FinalAttemptEndedAt = finalAttemptEndedAt
-		applied, err := applyRecoveryCommandTx(tx, token.JobID, model.Finalize{Ref: record.Attempt.Ref, Intent: intent}, meta.Generation+1)
+		applied, err := applyRecoveryCommandTx(tx, token.JobID, finalizeWithCancellationMetadata(model.Finalize{Ref: record.Attempt.Ref, Intent: intent}), meta.Generation+1)
 		if err != nil {
 			return err
 		}

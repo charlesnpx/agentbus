@@ -40,6 +40,7 @@ const (
 	defaultShutdown      = 30 * time.Second
 
 	admissionNativeInterruptGrace = 2 * time.Second
+	oversizedRequestWriteTimeout  = time.Second
 )
 
 var ErrDaemonAlreadyListening = errors.New("agentbus daemon already listening")
@@ -245,6 +246,8 @@ type Server struct {
 	leaseDuration                time.Duration
 	heartbeatInterval            time.Duration
 	gcInterval                   time.Duration
+	admissionLogRetentionCap     int64
+	admissionLogRetentionMu      [admissionLogRetentionLockStripes]sync.Mutex
 	readyHook                    func(ServeReadyInfo) error
 	listenerFactory              func() (net.Listener, socketFileIdentity, error)
 	unixSocketPrivateListenHooks unixSocketPrivateListenHooks
@@ -294,6 +297,7 @@ type Server struct {
 	admissionJobs      map[string]*admissionInstance
 	admissionEffectMu  map[string]*sync.Mutex
 	activeJobs         map[string]*activeJob
+	admissionLogDrains map[string]<-chan struct{}
 	jobLiveness        map[string]*jobLiveness
 	reportedModels     map[string]string
 	reportedModelOrder []string
@@ -315,20 +319,38 @@ type activeJob struct {
 	session   engine.Session
 	cancel    context.CancelFunc
 
-	mu                sync.Mutex
-	terminal          engine.JobState
-	admissionCommand  command.RunningCommand
-	containmentIntent *launch.ContainmentIntent
+	mu                              sync.Mutex
+	terminal                        engine.JobState
+	cancellation                    terminalCancellation
+	admissionCommand                command.RunningCommand
+	containmentIntent               *launch.ContainmentIntent
+	observedWorkspaceWriteItemCount uint64
+	observedWorkspaceWriteAttempt   model.LaunchOrdinal
+	diagnosticsSettleRequest        chan struct{}
+	diagnosticsSettled              chan struct{}
+	diagnosticsSettleRequested      bool
+	// These hooks only coordinate deterministic activeJob tests around the pair's
+	// synchronization boundary. The reset hook runs while mu is held; the
+	// snapshot hook runs immediately before it is acquired.
+	observedWorkspaceWriteAfterCountResetForTest        func()
+	observedWorkspaceWriteBeforeTerminalSnapshotForTest func()
 }
 
 type nativeInterruptSession interface {
 	NativeInterrupt(context.Context) (bool, error)
 }
 
-func (j *activeJob) requestTerminal(state engine.JobState) {
+func (j *activeJob) requestTerminal(state engine.JobState, metadata ...terminalCancellation) {
+	cancellation := terminalCancellationFor(engine.CancellationOriginUnattributable, "canceled without an attributable origin")
+	if len(metadata) > 0 {
+		cancellation = metadata[0]
+	}
 	j.mu.Lock()
 	if j.terminal == "" {
 		j.terminal = state
+		if state == engine.StateCanceled {
+			j.cancellation = cancellation
+		}
 	}
 	intent := j.containmentIntent
 	j.mu.Unlock()
@@ -341,6 +363,117 @@ func (j *activeJob) requestedTerminal() engine.JobState {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.terminal
+}
+
+func (j *activeJob) requestedCancellation() terminalCancellation {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.cancellation
+}
+
+func (j *activeJob) observeWorkspaceWriteItem() uint64 {
+	if j == nil {
+		return 1
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.observedWorkspaceWriteItemCount == ^uint64(0) {
+		return j.observedWorkspaceWriteItemCount
+	}
+	j.observedWorkspaceWriteItemCount++
+	return j.observedWorkspaceWriteItemCount
+}
+
+func (j *activeJob) beginObservedWorkspaceWriteAttempt(ordinal model.LaunchOrdinal) {
+	if j == nil {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.observedWorkspaceWriteItemCount = 0
+	if j.observedWorkspaceWriteAfterCountResetForTest != nil {
+		j.observedWorkspaceWriteAfterCountResetForTest()
+	}
+	j.observedWorkspaceWriteAttempt = ordinal
+}
+
+func (j *activeJob) observedWorkspaceWriteItemCountForTerminal() (uint64, model.LaunchOrdinal) {
+	if j == nil {
+		return 0, 0
+	}
+	if j.observedWorkspaceWriteBeforeTerminalSnapshotForTest != nil {
+		j.observedWorkspaceWriteBeforeTerminalSnapshotForTest()
+	}
+	j.mu.Lock()
+	if !j.observedWorkspaceWriteAttempt.Valid() {
+		j.mu.Unlock()
+		return 0, 0
+	}
+	count, ordinal := j.observedWorkspaceWriteItemCount, j.observedWorkspaceWriteAttempt
+	j.mu.Unlock()
+	return count, ordinal
+}
+
+func activeObservedWorkspaceWriteItemCount(job *activeJob) (uint64, model.LaunchOrdinal) {
+	if job == nil {
+		return 0, 0
+	}
+	return job.observedWorkspaceWriteItemCountForTerminal()
+}
+
+// beginAdmissionDiagnosticsSettle makes this attempt available to terminal
+// paths that need its buffered diagnostics before committing an absorbing
+// terminal record. The caller must invoke finish once it will no longer read
+// the stream.
+func (j *activeJob) beginAdmissionDiagnosticsSettle() (<-chan struct{}, func()) {
+	if j == nil {
+		return nil, func() {}
+	}
+	j.mu.Lock()
+	request := make(chan struct{})
+	settled := make(chan struct{})
+	j.diagnosticsSettleRequest = request
+	j.diagnosticsSettled = settled
+	j.diagnosticsSettleRequested = false
+	j.mu.Unlock()
+	return request, func() {
+		j.mu.Lock()
+		if j.diagnosticsSettled == settled {
+			close(settled)
+		}
+		j.mu.Unlock()
+	}
+}
+
+// settleAdmissionDiagnostics asks the active attempt to drain buffered
+// diagnostics before terminalization. A backend that continues streaming past
+// the grace interval, or past the caller's shutdown deadline, is intentionally
+// left to the deferred drain.
+func (j *activeJob) settleAdmissionDiagnostics(ctx context.Context, bound time.Duration) {
+	if j == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	j.mu.Lock()
+	request := j.diagnosticsSettleRequest
+	settled := j.diagnosticsSettled
+	if request != nil && !j.diagnosticsSettleRequested {
+		close(request)
+		j.diagnosticsSettleRequested = true
+	}
+	j.mu.Unlock()
+	if settled == nil {
+		return
+	}
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-settled:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
 }
 
 func (j *activeJob) recordAdmissionCommand(cmd command.RunningCommand) bool {
@@ -521,43 +654,45 @@ func New(cfg Config) (*Server, error) {
 		probeRunner = command.DirectProbeRunner{}
 	}
 	return &Server{
-		stateRoot:              root,
-		cwd:                    cwd,
-		socketPath:             socketPath,
-		tokenPath:              tokenPath,
-		token:                  token,
-		codexHomeOverride:      cfg.CodexHomeOverride,
-		codexHomeInherit:       cfg.CodexHomeInherit,
-		codexAuthHome:          cfg.CodexAuthHome,
-		backends:               backends,
-		registry:               registry,
-		clock:                  clock,
-		processes:              processes,
-		processGroups:          cfg.ProcessGroups,
-		cancelGrace:            cfg.CancelGrace,
-		cancelWaiter:           cfg.CancelWaiter,
-		idleTimeout:            idleTimeout,
-		idleCheckInterval:      idleCheck,
-		binaryIdentityProbe:    binaryIdentityProbe,
-		inlineResultCap:        inlineResultCap,
-		leaseDuration:          leaseDuration,
-		heartbeatInterval:      heartbeatInterval,
-		gcInterval:             gcInterval,
-		readyHook:              cfg.ReadyHook,
-		safetyLatch:            NewSafetyLatch(),
-		safetyDrainTimeout:     defaultSafetyDrain,
-		shutdownTimeout:        normalizeShutdownTimeout(cfg.ShutdownTimeout),
-		stores:                 make(map[string]*engine.Store),
-		storesByKey:            make(map[string]*engine.Store),
-		jobStores:              make(map[string]*engine.Store),
-		admissionJobs:          make(map[string]*admissionInstance),
-		admissionEffectMu:      make(map[string]*sync.Mutex),
-		admissionRuntimeConfig: cfg.Runtime,
-		admissionProbeRunner:   probeRunner,
-		activeJobs:             make(map[string]*activeJob),
-		jobLiveness:            make(map[string]*jobLiveness),
-		reportedModels:         make(map[string]string),
-		lastActivity:           clock.Now().UTC(),
+		stateRoot:                root,
+		cwd:                      cwd,
+		socketPath:               socketPath,
+		tokenPath:                tokenPath,
+		token:                    token,
+		codexHomeOverride:        cfg.CodexHomeOverride,
+		codexHomeInherit:         cfg.CodexHomeInherit,
+		codexAuthHome:            cfg.CodexAuthHome,
+		backends:                 backends,
+		registry:                 registry,
+		clock:                    clock,
+		processes:                processes,
+		processGroups:            cfg.ProcessGroups,
+		cancelGrace:              cfg.CancelGrace,
+		cancelWaiter:             cfg.CancelWaiter,
+		idleTimeout:              idleTimeout,
+		idleCheckInterval:        idleCheck,
+		binaryIdentityProbe:      binaryIdentityProbe,
+		inlineResultCap:          inlineResultCap,
+		leaseDuration:            leaseDuration,
+		heartbeatInterval:        heartbeatInterval,
+		gcInterval:               gcInterval,
+		admissionLogRetentionCap: defaultAdmissionLogRetentionCap,
+		readyHook:                cfg.ReadyHook,
+		safetyLatch:              NewSafetyLatch(),
+		safetyDrainTimeout:       defaultSafetyDrain,
+		shutdownTimeout:          normalizeShutdownTimeout(cfg.ShutdownTimeout),
+		stores:                   make(map[string]*engine.Store),
+		storesByKey:              make(map[string]*engine.Store),
+		jobStores:                make(map[string]*engine.Store),
+		admissionJobs:            make(map[string]*admissionInstance),
+		admissionEffectMu:        make(map[string]*sync.Mutex),
+		admissionLogDrains:       make(map[string]<-chan struct{}),
+		admissionRuntimeConfig:   cfg.Runtime,
+		admissionProbeRunner:     probeRunner,
+		activeJobs:               make(map[string]*activeJob),
+		jobLiveness:              make(map[string]*jobLiveness),
+		reportedModels:           make(map[string]string),
+		lastActivity:             clock.Now().UTC(),
 	}, nil
 }
 
@@ -670,6 +805,7 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	safetyDone := make(chan error, 1)
 	go s.safetyLoop(ctx, cancel, ln, socketIdentity, acceptSettled, safetyDone)
 	go s.idleLoop(ctx, cancel, ln, socketIdentity, acceptSettled)
+	go s.admissionLogSweepLoop(ctx)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -1000,26 +1136,83 @@ func (lifecycle serveLifecycleSnapshot) forceStopServe() {
 }
 
 func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context, admission *serveAdmissionSnapshot) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	coord, jobIDs, err := s.shutdownAdmissionJobs(ctx, admission)
 	if err != nil || coord == nil {
 		return err
 	}
+	type shutdownAdmissionJob struct {
+		id       model.JobID
+		prepared chan error
+		finalize chan context.Context
+		done     chan error
+	}
+	jobs := make([]shutdownAdmissionJob, 0, len(jobIDs))
 	for _, jobID := range jobIDs {
-		if err := ctx.Err(); err != nil {
+		job := shutdownAdmissionJob{
+			id:       jobID,
+			prepared: make(chan error, 1),
+			finalize: make(chan context.Context),
+			done:     make(chan error, 1),
+		}
+		jobs = append(jobs, job)
+	}
+	for i := range jobs {
+		job := &jobs[i]
+		go func() {
+			err := s.withAdmissionJobEffectErr(job.id.String(), func() error {
+				if err := s.requestActiveJobShutdownCancel(ctx, job.id.String()); err != nil {
+					job.prepared <- err
+					return err
+				}
+				// Retain the per-job effect lock while the coordinator commit is
+				// queued. This preserves the existing client-cancel and runner
+				// serialization while every job's bounded diagnostic settle runs
+				// concurrently.
+				job.prepared <- nil
+				finalizeCtx, ok := <-job.finalize
+				if !ok {
+					return nil
+				}
+				count, ordinal := activeObservedWorkspaceWriteItemCount(s.lookupActiveJob(job.id.String()))
+				if err := coord.CancelWithMetadataAndObservedWorkspaceWriteItemCount(finalizeCtx, job.id, engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation", count, ordinal, nil); err != nil {
+					return err
+				}
+				s.abandonAdmissionUnresolvedCustody(finalizeCtx, coord, job.id)
+				return nil
+			})
+			job.done <- err
+		}()
+	}
+	for i := range jobs {
+		if err := <-jobs[i].prepared; err != nil {
+			for j := range jobs {
+				close(jobs[j].finalize)
+			}
+			for j := range jobs {
+				<-jobs[j].done
+			}
 			return err
 		}
-		id := jobID
-		err := s.withAdmissionJobEffectErr(id.String(), func() error {
-			if err := s.requestActiveJobShutdownCancel(ctx, id.String()); err != nil {
-				return err
+	}
+
+	// Commit the accepted work with whatever diagnostics settled before its
+	// individual wait ended. A caller deadline may expire while the settles or
+	// earlier serialized commits run; it must not turn a later terminal commit
+	// into a no-op. shutdownLifecycle observes that deadline immediately after
+	// this phase.
+	finalizeCtx := context.WithoutCancel(ctx)
+	for i := range jobs {
+		jobs[i].finalize <- finalizeCtx
+		if err := <-jobs[i].done; err != nil {
+			for j := i + 1; j < len(jobs); j++ {
+				close(jobs[j].finalize)
 			}
-			if err := coord.Cancel(ctx, id, nil); err != nil {
-				return err
+			for j := i + 1; j < len(jobs); j++ {
+				<-jobs[j].done
 			}
-			s.abandonAdmissionUnresolvedCustody(ctx, coord, id)
-			return nil
-		})
-		if err != nil {
 			return err
 		}
 	}
@@ -1077,7 +1270,7 @@ func (s *Server) requestActiveJobShutdownCancel(ctx context.Context, jobID strin
 	if active == nil {
 		return nil
 	}
-	active.requestTerminal(engine.StateCanceled)
+	active.requestTerminal(engine.StateCanceled, terminalCancellationFor(engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation"))
 	settled := active.interruptSessionNativeFirst()
 	if !settled {
 		if err := active.interruptAdmissionCommand(ctx); err != nil {
@@ -1086,6 +1279,7 @@ func (s *Server) requestActiveJobShutdownCancel(ctx context.Context, jobID strin
 			}
 		}
 	}
+	active.settleAdmissionDiagnostics(ctx, admissionNativeInterruptGrace)
 	if active.cancel != nil {
 		active.cancel()
 	}
@@ -1894,6 +2088,29 @@ func (c *connection) serve(ctx context.Context) {
 			}
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		message := "JSON-RPC connection read failed"
+		if errors.Is(err, bufio.ErrTooLong) {
+			message = "JSON-RPC request frame exceeded 4194304 byte limit"
+		}
+		_ = c.writeOversizedRequestResponse(protocol.Response{
+			JSONRPC: "2.0",
+			ID:      json.RawMessage("null"),
+			Error:   protocol.NewError(protocol.ErrorInvalidTaskSpec, message, protocol.ErrorData{}),
+		})
+	}
+}
+
+func (c *connection) writeOversizedRequestResponse(resp protocol.Response) error {
+	if c == nil || c.conn == nil {
+		return net.ErrClosed
+	}
+	if err := c.conn.SetWriteDeadline(time.Now().Add(oversizedRequestWriteTimeout)); err != nil {
+		_ = c.conn.Close()
+		return err
+	}
+	defer c.conn.SetWriteDeadline(time.Time{})
+	return c.writeResponse(resp)
 }
 
 func (c *connection) closeOnFailStop() func() {
@@ -2239,8 +2456,15 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 
 func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	active := s.lookupActiveJob(jobID)
+	// Keep the client-cancel snapshot and RequestCancel ordering together. The
+	// runner may be between release and registration, or may itself be entering
+	// cancel recovery; waiting for its diagnostic drain here lets both paths
+	// pass the pre-terminal check and submit the same terminal intent. Runner
+	// interruption and shutdown terminalization perform the bounded settle and
+	// take their snapshot after it instead.
+	count, ordinal := activeObservedWorkspaceWriteItemCount(active)
 	if active != nil {
-		active.requestTerminal(engine.StateCanceled)
+		active.requestTerminal(engine.StateCanceled, terminalCancellationFor(engine.CancellationOriginClientRequest, "client requested cancellation"))
 		settled := active.interruptSessionNativeFirst()
 		// Admission cancel is intentional containment. Mark the active launch
 		// before coordinator containment so a killed process is the cancel
@@ -2266,7 +2490,7 @@ func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	if record.Terminal == nil {
 		err := s.withAdmissionCoordinator(func(coord *admissionCoordinator) error {
 			modelJobID := model.JobID(jobID)
-			if err := coord.Cancel(context.Background(), modelJobID, nil); err != nil {
+			if err := coord.CancelWithMetadataAndObservedWorkspaceWriteItemCount(context.Background(), modelJobID, engine.CancellationOriginClientRequest, "client requested cancellation", count, ordinal, nil); err != nil {
 				return err
 			}
 			s.abandonAdmissionUnresolvedCustody(context.Background(), coord, modelJobID)
@@ -2388,11 +2612,17 @@ type jobRun struct {
 	admissionMode           model.Mode
 	admissionAccepted       authority.AcceptResult
 	admissionLaunch         admissionLaunchBinding
+	logPaths                engine.LogPaths
 }
 
 func (s *Server) runJob(ctx context.Context, run jobRun) {
 	run.authoritativeCompletion = true
-	defer s.removeActiveJob(run.jobID)
+	defer func() {
+		s.removeActiveJob(run.jobID)
+		if run.admissionControlled {
+			s.enforceAdmissionLogRetention(run.admissionAccepted.Record.WorkspaceLayoutKey.String())
+		}
+	}()
 	defer s.cleanupManagedCodexHomeForAdmissionRun(run)
 	defer func() {
 		if run.onDone != nil {
@@ -2467,7 +2697,10 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		Prompt:   prompt,
 		Write:    write,
 		Timeout:  run.timeout,
-		LogPaths: engine.LogPaths{},
+		LogPaths: run.logPaths,
+	}
+	if run.admissionControlled {
+		run.active.beginObservedWorkspaceWriteAttempt(ordinal)
 	}
 	if run.admissionControlled {
 		startedAt := s.clock.Now().UTC()
@@ -2476,34 +2709,40 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			return "", engine.StateFailed, classifyFailureError(terminalFailureBackendNotStarted, err)
 		}
 	}
+	settleRequested, finishSettling := run.active.beginAdmissionDiagnosticsSettle()
 	events, err := s.admissionTurnEvents(attemptCtx, run, input, ordinal)
 	if err != nil {
+		finishSettling()
 		return "", engine.StateFailed, err
 	}
+	defer finishSettling()
 	var assistantText strings.Builder
 	var resultText string
 	hasResultMessage := false
 	var terminalState engine.JobState
 	var terminalErr error
 	for {
-		if terminalErr != nil {
-			// The producer may need the consumer to make space for tail events
-			// before it can finish session cleanup and close the stream.
-			go func() {
-				for range events {
-				}
-			}()
-			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), terminalState, terminalErr
+		select {
+		case <-settleRequested:
+			s.settleAdmissionEventDrain(run, events)
+			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateCanceled, context.Canceled
+		default:
 		}
 		select {
 		case <-attemptCtx.Done():
 			if shouldInterruptSessionOnAttemptCancel(run, attemptCtx.Err()) {
 				_ = run.session.Interrupt(context.Background())
 			}
-			terminalState = stateForContext(attemptCtx.Err())
-			terminalErr = attemptCtx.Err()
+			s.settleAdmissionEventDrain(run, events)
+			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), stateForContext(attemptCtx.Err()), attemptCtx.Err()
+		case <-settleRequested:
+			s.settleAdmissionEventDrain(run, events)
+			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateCanceled, context.Canceled
 		case event, ok := <-events:
 			if !ok {
+				if terminalErr != nil {
+					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), terminalState, terminalErr
+				}
 				if attemptCtx.Err() != nil {
 					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), stateForContext(attemptCtx.Err()), attemptCtx.Err()
 				}
@@ -2511,6 +2750,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			}
 			if run.admissionControlled {
 				s.recordJobLivenessEvent(run.jobID)
+			}
+			if err := s.recordAdmissionEventDiagnostics(run, event); err != nil {
+				return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, classifyFailureError(terminalFailureInternal, err)
 			}
 			rawText := authoritativeText(event)
 			switch event.Type {
@@ -2521,6 +2763,7 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				hasResultMessage = true
 			case engine.EventModelReported:
 				if err := s.recordModelReported(run, event.ModelReported); err != nil {
+					s.deferAdmissionEventDrain(run, events)
 					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, classifyFailureError(terminalFailureInternal, err)
 				}
 			case engine.EventTerminalError:
@@ -2537,6 +2780,127 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			}
 		}
 	}
+}
+
+func (s *Server) recordAdmissionEventDiagnostics(run jobRun, event engine.Event) error {
+	if event.ObservedWorkspaceWriteItem {
+		run.active.observeWorkspaceWriteItem()
+	}
+	if drops, ok := engine.TransportFrameDropsFromMetadata(event.Metadata); ok {
+		return s.recordTransportFrameDrops(run, drops)
+	}
+	return nil
+}
+
+// settleAdmissionEventDrain consumes diagnostics until the backend stream
+// closes or the native interrupt grace expires. Workspace-write events after
+// that boundary cannot be merged into a terminal record; the deferred drain
+// still preserves transport-drop diagnostics, which support post-terminal
+// recording.
+func (s *Server) settleAdmissionEventDrain(run jobRun, events <-chan engine.Event) {
+	if !run.admissionControlled || events == nil {
+		return
+	}
+	deadline := time.Now().Add(admissionNativeInterruptGrace)
+	for {
+		if !time.Now().Before(deadline) {
+			s.deferAdmissionEventDrain(run, events)
+			return
+		}
+		timer := time.NewTimer(time.Until(deadline))
+		select {
+		case event, ok := <-events:
+			timer.Stop()
+			if !ok {
+				return
+			}
+			if err := s.recordAdmissionEventDiagnostics(run, event); err != nil {
+				log.Printf("agentbus daemon: job %s terminal diagnostic settle warning: %v", run.jobID, err)
+			}
+		case <-timer.C:
+			s.deferAdmissionEventDrain(run, events)
+			return
+		}
+	}
+}
+
+func (s *Server) recordTransportFrameDrops(run jobRun, drops engine.TransportFrameDrops) error {
+	if drops.Empty() {
+		return nil
+	}
+	if run.admissionControlled {
+		jobID, err := model.NewJobID(run.jobID)
+		if err != nil {
+			return err
+		}
+		s.admissionStateMu.RLock()
+		ready := s.admissionReady
+		available := s.admissionInstance != nil && ready != nil
+		s.admissionStateMu.RUnlock()
+		if !available {
+			return authority.ErrNotReady
+		}
+		_, err = ready.RecordTransportFrameDrops(context.Background(), jobID, drops)
+		return err
+	}
+	if run.store == nil {
+		return nil
+	}
+	_, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
+		if record.TransportFrameDrops == nil {
+			copied := drops
+			record.TransportFrameDrops = &copied
+			return true, nil
+		}
+		before := *record.TransportFrameDrops
+		record.TransportFrameDrops.Merge(drops)
+		return *record.TransportFrameDrops != before, nil
+	})
+	return err
+}
+
+// deferAdmissionEventDrain waits for an adapter stream that outlives the
+// bounded terminal diagnostic settle. Deferred backend-log cleanup observes
+// its completion before inspecting the corresponding files.
+func (s *Server) deferAdmissionEventDrain(run jobRun, events <-chan engine.Event) {
+	if !run.admissionControlled || run.jobID == "" || events == nil {
+		return
+	}
+	done := make(chan struct{})
+	s.mu.Lock()
+	if s.admissionLogDrains == nil {
+		s.admissionLogDrains = make(map[string]<-chan struct{})
+	}
+	if _, exists := s.admissionLogDrains[run.jobID]; exists {
+		s.mu.Unlock()
+		return
+	}
+	s.admissionLogDrains[run.jobID] = done
+	s.mu.Unlock()
+	go func() {
+		for event := range events {
+			if drops, ok := engine.TransportFrameDropsFromMetadata(event.Metadata); ok {
+				if err := s.recordTransportFrameDrops(run, drops); err != nil {
+					log.Printf("agentbus daemon: job %s deferred transport frame-drop recording warning: %v", run.jobID, err)
+				}
+			}
+		}
+		close(done)
+	}()
+}
+
+func (s *Server) admissionLogDrain(jobID string) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.admissionLogDrains[jobID]
+}
+
+func (s *Server) finishAdmissionLogDrain(jobID string, done <-chan struct{}) {
+	s.mu.Lock()
+	if s.admissionLogDrains[jobID] == done {
+		delete(s.admissionLogDrains, jobID)
+	}
+	s.mu.Unlock()
 }
 
 func attemptFinalText(hasResultMessage bool, resultText, assistantText string) string {
@@ -2725,6 +3089,52 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 	return nil
 }
 
+func discardEmptyBackendLogs(paths engine.LogPaths) error {
+	for _, path := range []string{paths.Stdout, paths.Stderr} {
+		if path == "" {
+			continue
+		}
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("backend log %q is not a regular file", path)
+		}
+		if info.Size() == 0 {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func discardBackendLogs(paths engine.LogPaths) error {
+	for _, path := range []string{paths.Stdout, paths.Stderr} {
+		if path == "" {
+			continue
+		}
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("backend log %q is not a regular file", path)
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Server) recordModelReported(run jobRun, reported string) error {
 	if strings.TrimSpace(reported) == "" {
 		return nil
@@ -2882,7 +3292,7 @@ func (s *Server) abortUndeliveredRun(run jobRun, state engine.JobState) {
 	case engine.StateInterrupted:
 		_, _ = run.store.Interrupt(run.jobID)
 	case engine.StateCanceled:
-		_, _ = run.store.Cancel(run.jobID)
+		_, _ = run.store.CancelWithMetadata(run.jobID, engine.CancellationOriginUnattributable, "canceled without an attributable origin")
 	default:
 		_ = s.finalizeTerminal(run, state, "", nil)
 	}
@@ -2892,7 +3302,7 @@ func (s *Server) abortUndeliveredRun(run jobRun, state engine.JobState) {
 	}
 }
 
-func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backend string, tags map[string]string, policy *engine.TurnPolicy, resolved *engine.ContractSpec, foreground bool) error {
+func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backend string, tags map[string]string, policy *engine.TurnPolicy, resolved *engine.ContractSpec, timeout *engine.TimeoutResolution, foreground bool) error {
 	logPaths, err := ensureLogFiles(store, jobID)
 	if err != nil {
 		return err
@@ -2908,6 +3318,7 @@ func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backe
 		JobID:            jobID,
 		SessionID:        sessionID,
 		Backend:          backend,
+		Timeout:          engine.CloneTimeoutResolution(timeout),
 		Foreground:       foreground,
 		State:            engine.StateQueued,
 		Tags:             cloneTags(tags),
@@ -2916,7 +3327,7 @@ func (s *Server) createQueuedRecord(store *engine.Store, jobID, sessionID, backe
 		HeartbeatAt:      now,
 		Lease:            engine.Lease{ExpiresAt: now.Add(s.leaseDuration)},
 		Supervisor:       ref,
-		LogPaths:         logPaths,
+		LogPaths:         &logPaths,
 		Policy:           policy,
 		ResolvedContract: resolvedCopy,
 	}
@@ -3256,9 +3667,9 @@ func atomicWriteDurable(path string, data []byte, mode os.FileMode) error {
 
 func ensureLogFiles(store *engine.Store, jobID string) (engine.LogPaths, error) {
 	layout := store.Layout()
-	paths := engine.LogPaths{
-		Stdout: filepath.Join(layout.Logs, jobID+".stdout.log"),
-		Stderr: filepath.Join(layout.Logs, jobID+".stderr.log"),
+	paths, err := engine.LogPathsForLayout(layout, jobID)
+	if err != nil {
+		return engine.LogPaths{}, err
 	}
 	for _, path := range []string{paths.Stdout, paths.Stderr} {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -3306,21 +3717,32 @@ func backendError(err error) *protocol.ErrorObject {
 	return protocol.NewError(protocol.ErrorBackendUnavailable, err.Error(), protocol.ErrorData{})
 }
 
-func timeoutFromMillis(ms *int64) (time.Duration, *protocol.ErrorObject) {
+func timeoutFromMillis(ms *int64) (time.Duration, *engine.TimeoutResolution, *protocol.ErrorObject) {
 	if ms == nil {
-		return protocol.DefaultTimeout, nil
+		return protocol.DefaultTimeout, &engine.TimeoutResolution{
+			Effective: protocol.DefaultTimeout.Milliseconds(),
+			Source:    engine.TimeoutSourceDaemonDefault,
+		}, nil
 	}
 	if *ms < 0 {
-		return 0, protocol.NewError(protocol.ErrorInvalidTaskSpec, "timeoutMs cannot be negative", protocol.ErrorData{})
+		return 0, nil, protocol.NewError(protocol.ErrorInvalidTaskSpec, "timeoutMs cannot be negative", protocol.ErrorData{})
 	}
 	if *ms == 0 {
-		return 0, nil
+		return 0, &engine.TimeoutResolution{
+			Requested: ms,
+			Effective: 0,
+			Source:    engine.TimeoutSourceClient,
+		}, nil
+	}
+	if *ms > protocol.MaxTimeout.Milliseconds() {
+		return 0, nil, protocol.NewError(protocol.ErrorInvalidTaskSpec, "timeoutMs exceeds maximum", protocol.ErrorData{})
 	}
 	d := time.Duration(*ms) * time.Millisecond
-	if d > protocol.MaxTimeout {
-		return 0, protocol.NewError(protocol.ErrorInvalidTaskSpec, "timeoutMs exceeds maximum", protocol.ErrorData{})
-	}
-	return d, nil
+	return d, &engine.TimeoutResolution{
+		Requested: ms,
+		Effective: d.Milliseconds(),
+		Source:    engine.TimeoutSourceClient,
+	}, nil
 }
 
 func validateTaskSpecEnvelope(raw json.RawMessage) *protocol.ErrorObject {

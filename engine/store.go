@@ -13,6 +13,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // Clock provides deterministic time in tests.
@@ -47,12 +48,16 @@ const DefaultReapInterval = 2 * time.Second
 // DefaultGCInterval bounds how often a store performs retention housekeeping.
 const DefaultGCInterval = 30 * time.Second
 
+// DefaultLogTTL bounds retained backend stdout and stderr artifacts.
+const DefaultLogTTL = 30 * 24 * time.Hour
+
 var ErrProcessIdentityUnverifiable = errors.New("process identity unverifiable")
 
 // RetentionConfig controls reaper garbage collection.
 type RetentionConfig struct {
 	TerminalJobTTL time.Duration
 	ResultTTL      time.Duration
+	LogTTL         time.Duration
 	StaleJobAfter  time.Duration
 }
 
@@ -61,6 +66,7 @@ func DefaultRetention() RetentionConfig {
 	return RetentionConfig{
 		TerminalJobTTL: 14 * 24 * time.Hour,
 		ResultTTL:      14 * 24 * time.Hour,
+		LogTTL:         DefaultLogTTL,
 		StaleJobAfter:  30 * time.Minute,
 	}
 }
@@ -234,6 +240,9 @@ func newStoreWithLayout(cfg StoreConfig, layout WorkspaceLayout) (*Store, error)
 	if retention.ResultTTL == 0 {
 		retention.ResultTTL = defaults.ResultTTL
 	}
+	if retention.LogTTL == 0 {
+		retention.LogTTL = defaults.LogTTL
+	}
 	if retention.StaleJobAfter == 0 {
 		retention.StaleJobAfter = defaults.StaleJobAfter
 	}
@@ -334,6 +343,12 @@ func (s *Store) Save(record *JobRecord) error {
 	if err := validateJobID(record.JobID); err != nil {
 		return err
 	}
+	if err := validateCancellationMetadata(record.CancellationOrigin, record.CancellationReason); err != nil {
+		return err
+	}
+	if record.CancellationOrigin != "" && record.State != StateCanceled {
+		return errors.New("cancellation metadata requires canceled state")
+	}
 	return s.withJobLock(record.JobID, func() error {
 		path, err := s.jobPath(record.JobID)
 		if err != nil {
@@ -371,6 +386,12 @@ func (s *Store) Update(jobID string, mutate func(*JobRecord) (bool, error)) (*Jo
 		}
 		if err := validateGuardedStateChange(before, *record); err != nil {
 			return err
+		}
+		if err := validateCancellationMetadata(record.CancellationOrigin, record.CancellationReason); err != nil {
+			return err
+		}
+		if record.CancellationOrigin != "" && record.State != StateCanceled {
+			return errors.New("cancellation metadata requires canceled state")
 		}
 		if changed {
 			if err := s.saveRecordLocked(record, path); err != nil {
@@ -537,10 +558,32 @@ func (s *Store) Interrupt(jobID string) (*JobRecord, error) {
 
 // Cancel transitions a queued or active background job record to canceled.
 func (s *Store) Cancel(jobID string) (*JobRecord, error) {
-	return s.terminate(jobID, StateCanceled)
+	return s.CancelWithMetadata(jobID, CancellationOriginUnattributable, "canceled without an attributable origin")
+}
+
+// CancelWithMetadata transitions a queued or active background job record to
+// canceled and records the observed cancellation explanation. Callers must
+// pass non-sensitive text: it is persisted and exposed on job.status and
+// job.result.
+func (s *Store) CancelWithMetadata(jobID string, origin CancellationOrigin, reason string) (*JobRecord, error) {
+	if !origin.Valid() {
+		origin = CancellationOriginUnattributable
+		reason = "canceled without an attributable origin"
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "canceled without an attributable origin"
+	}
+	if err := validateCancellationMetadata(origin, reason); err != nil {
+		return nil, err
+	}
+	return s.terminateWithCancellation(jobID, StateCanceled, origin, reason)
 }
 
 func (s *Store) terminate(jobID string, state JobState) (*JobRecord, error) {
+	return s.terminateWithCancellation(jobID, state, "", "")
+}
+
+func (s *Store) terminateWithCancellation(jobID string, state JobState, cancellationOrigin CancellationOrigin, cancellationReason string) (*JobRecord, error) {
 	if err := validateJobID(jobID); err != nil {
 		return nil, err
 	}
@@ -568,6 +611,10 @@ func (s *Store) terminate(jobID string, state JobState) (*JobRecord, error) {
 		}
 		if err := record.Transition(state, now); err != nil {
 			return err
+		}
+		if state == StateCanceled {
+			record.CancellationOrigin = cancellationOrigin
+			record.CancellationReason = cancellationReason
 		}
 		if err := s.saveIfUnchanged(record, path, original); err != nil {
 			return err
@@ -916,6 +963,7 @@ func (s *Store) quarantine(path string, cause error) error {
 
 func (s *Store) gc(now time.Time, records []reapedRecord) error {
 	protectedResults := make(map[string]struct{})
+	protectedLogs := make(map[string]struct{})
 	for _, item := range records {
 		record := item.record
 		if record.Result != nil && record.Result.ResultPath != "" {
@@ -928,6 +976,19 @@ func (s *Store) gc(now time.Time, records []reapedRecord) error {
 				continue
 			}
 			protectedResults[resultPath] = struct{}{}
+		}
+		if record.LogPaths != nil {
+			for _, logPath := range []string{record.LogPaths.Stdout, record.LogPaths.Stderr} {
+				clean := filepath.Clean(logPath)
+				if !pathWithinDir(s.layout.Logs, clean) {
+					continue
+				}
+				if !IsTerminal(record.State) ||
+					now.Sub(record.UpdatedAt) < s.retention.TerminalJobTTL ||
+					(record.State == StateFailed && now.Sub(record.UpdatedAt) < s.retention.LogTTL) {
+					protectedLogs[clean] = struct{}{}
+				}
+			}
 		}
 	}
 	for _, item := range records {
@@ -951,15 +1012,25 @@ func (s *Store) gc(now time.Time, records []reapedRecord) error {
 				return nil
 			}
 			s.sweepTerminalJobArtifacts(record.JobID)
-			logRemoveContainedIfExists(s.layout.Logs, record.LogPaths.Stdout)
-			logRemoveContainedIfExists(s.layout.Logs, record.LogPaths.Stderr)
+			if record.State != StateFailed && record.LogPaths != nil {
+				logRemoveContainedIfExists(s.layout.Logs, record.LogPaths.Stdout)
+				logRemoveContainedIfExists(s.layout.Logs, record.LogPaths.Stderr)
+			}
 			logRemoveIfExists(item.path)
 			return nil
 		}); err != nil {
 			return err
 		}
 	}
-	for _, dir := range []string{s.layout.Results} {
+	for _, artifact := range []struct {
+		dir       string
+		ttl       time.Duration
+		protected map[string]struct{}
+	}{
+		{dir: s.layout.Results, ttl: s.retention.ResultTTL, protected: protectedResults},
+		{dir: s.layout.Logs, ttl: s.retention.LogTTL, protected: protectedLogs},
+	} {
+		dir := artifact.dir
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			return err
@@ -973,10 +1044,10 @@ func (s *Store) gc(now time.Time, records []reapedRecord) error {
 				return err
 			}
 			path := filepath.Join(dir, entry.Name())
-			if _, ok := protectedResults[filepath.Clean(path)]; ok {
+			if _, ok := artifact.protected[filepath.Clean(path)]; ok {
 				continue
 			}
-			if now.Sub(info.ModTime()) >= s.retention.ResultTTL {
+			if now.Sub(info.ModTime()) >= artifact.ttl {
 				logRemoveIfExists(path)
 			}
 		}
@@ -1045,6 +1116,12 @@ func (s *Store) loadPathWithBytes(path string) (*JobRecord, []byte, error) {
 	if err := validateJobID(record.JobID); err != nil {
 		return nil, nil, &recordContentError{err: err}
 	}
+	if err := validateCancellationMetadata(record.CancellationOrigin, record.CancellationReason); err != nil {
+		return nil, nil, &recordContentError{err: err}
+	}
+	if record.CancellationOrigin != "" && record.State != StateCanceled {
+		return nil, nil, &recordContentError{err: errors.New("cancellation metadata requires canceled state")}
+	}
 	expected := strings.TrimSuffix(filepath.Base(path), ".json")
 	if record.JobID != expected {
 		return nil, nil, &recordContentError{err: fmt.Errorf("invalid job record: jobId %q does not match path %q", record.JobID, filepath.Base(path))}
@@ -1097,6 +1174,27 @@ func validateGuardedStateChange(before, after JobRecord) error {
 	}
 	if !LegalTransition(before.State, after.State, before.RetryCount) {
 		return fmt.Errorf("illegal job state transition %q -> %q", before.State, after.State)
+	}
+	return nil
+}
+
+func validateCancellationMetadata(origin CancellationOrigin, reason string) error {
+	if origin == "" && reason == "" {
+		return nil
+	}
+	if !origin.Valid() {
+		return errors.New("invalid cancellation origin")
+	}
+	if len([]rune(reason)) > FailureReasonMaxRunes {
+		return errors.New("cancellation reason is too long")
+	}
+	if strings.TrimSpace(reason) == "" {
+		return errors.New("cancellation reason is required")
+	}
+	for _, r := range reason {
+		if !unicode.IsPrint(r) && r != ' ' {
+			return errors.New("cancellation reason contains control characters")
+		}
 	}
 	return nil
 }

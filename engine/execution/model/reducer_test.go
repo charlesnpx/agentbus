@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charlesnpx/agentbus/engine"
 )
 
 func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
@@ -133,6 +135,89 @@ func TestApplyCommandsValidatePredecessorsAndIdempotence(t *testing.T) {
 	}
 }
 
+func TestRecordCancellationKeepsFirstCommittedOrigin(t *testing.T) {
+	record := reducerCanceledRetiredRecord(t)
+	first := RecordCancellation{
+		JobID:  record.JobID,
+		Origin: engine.CancellationOriginClientRequest,
+		Reason: "client requested cancellation",
+	}
+	record = reducerMustApply(t, record, Finalize{
+		Ref: reducerRef(),
+		Intent: TerminalIntent{
+			Outcome:            OutcomeCanceled,
+			Cause:              CauseCanceledBeforeAuthorization,
+			CancellationOrigin: first.Origin,
+			CancellationReason: first.Reason,
+		},
+	})
+	if record.CancellationOrigin != first.Origin || record.CancellationReason != first.Reason {
+		t.Fatalf("committed cancellation metadata = (%q, %q), want (%q, %q)", record.CancellationOrigin, record.CancellationReason, first.Origin, first.Reason)
+	}
+
+	second := RecordCancellation{
+		JobID:  record.JobID,
+		Origin: engine.CancellationOriginDaemonShutdown,
+		Reason: "daemon shutdown requested cancellation",
+	}
+	again, err := ApplyRecordCancellation(record, second)
+	if err != nil {
+		t.Fatalf("record later shutdown cancellation: %v", err)
+	}
+	if again.Changed {
+		t.Fatalf("later cancellation metadata changed record: %+v", again.Record)
+	}
+	if again.Record.CancellationOrigin != first.Origin || again.Record.CancellationReason != first.Reason {
+		t.Fatalf("later cancellation metadata = (%q, %q), want first (%q, %q)", again.Record.CancellationOrigin, again.Record.CancellationReason, first.Origin, first.Reason)
+	}
+}
+
+func TestRecordCancellationDoesNotReplaceCommittedUnattributableProvenance(t *testing.T) {
+	record := reducerCanceledRetiredRecord(t)
+	record = reducerMustApply(t, record, Finalize{
+		Ref:    reducerRef(),
+		Intent: TerminalIntent{Outcome: OutcomeCanceled, Cause: CauseCanceledBeforeAuthorization},
+	})
+	if record.CancellationOrigin != engine.CancellationOriginUnattributable || record.CancellationReason != "canceled without an attributable origin" {
+		t.Fatalf("committed cancellation metadata = (%q, %q), want unattributable provenance", record.CancellationOrigin, record.CancellationReason)
+	}
+
+	result, err := ApplyRecordCancellation(record, RecordCancellation{
+		JobID:  record.JobID,
+		Origin: engine.CancellationOriginClientRequest,
+		Reason: "client requested cancellation",
+	})
+	if err != nil {
+		t.Fatalf("record later specific cancellation: %v", err)
+	}
+	if result.Changed {
+		t.Fatalf("later specific cancellation changed record: %+v", result.Record)
+	}
+	if result.Record.CancellationOrigin != record.CancellationOrigin || result.Record.CancellationReason != record.CancellationReason {
+		t.Fatalf("later specific cancellation metadata = (%q, %q), want committed (%q, %q)", result.Record.CancellationOrigin, result.Record.CancellationReason, record.CancellationOrigin, record.CancellationReason)
+	}
+}
+
+func TestRecordCancellationDoesNotAttachToCompletedTerminal(t *testing.T) {
+	record := reducerCleanCompletedRecord(t)
+	record = reducerMustApply(t, record, Finalize{
+		Ref:    reducerRef(),
+		Intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally},
+	})
+
+	result, err := ApplyRecordCancellation(record, RecordCancellation{
+		JobID:  record.JobID,
+		Origin: engine.CancellationOriginClientRequest,
+		Reason: "client requested cancellation",
+	})
+	if err != nil {
+		t.Fatalf("record cancellation on completed terminal: %v", err)
+	}
+	if result.Changed || result.Record.CancellationOrigin != "" || result.Record.CancellationReason != "" {
+		t.Fatalf("completed cancellation metadata = (%q, %q), changed=%v; want absent and unchanged", result.Record.CancellationOrigin, result.Record.CancellationReason, result.Changed)
+	}
+}
+
 func TestApplyRejectsConflictingDuplicates(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -235,6 +320,42 @@ func TestRecordFinalAttemptStartAcceptsEarlierRetryTime(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "final attempt timing warning") || !strings.Contains(logs.String(), "current retry observation wins") {
 		t.Fatalf("timing anomaly log = %q, want observable backward retry warning", logs.String())
+	}
+}
+
+func TestFinalizeObservedWorkspaceWriteItemCountReplacesEarlierAttempt(t *testing.T) {
+	record := reducerCanceledRetiredRecord(t)
+	first := reducerMustApply(t, record, Finalize{
+		Ref: reducerRef(),
+		Intent: TerminalIntent{
+			Outcome:                         OutcomeCanceled,
+			Cause:                           CauseCanceledBeforeAuthorization,
+			ObservedWorkspaceWriteItemCount: 2,
+			ObservedWorkspaceWriteItemCountAttemptOrdinal: LaunchOrdinalOne,
+		},
+	})
+	if got := first.ObservedWorkspaceWriteItemCount; got != 2 {
+		t.Fatalf("first attempt workspace-write count = %d, want 2", got)
+	}
+	// Terminal records are absorbing, so exercise the retry replacement rule
+	// while the second corrective attempt is still open.
+	record = reducerCanceledRetiredRecord(t)
+	record.ObservedWorkspaceWriteItemCount = 2
+	record.ObservedWorkspaceWriteItemCountAttemptOrdinal = LaunchOrdinalOne
+	record = reducerMustApply(t, record, Finalize{
+		Ref: reducerRef(),
+		Intent: TerminalIntent{
+			Outcome:                         OutcomeCanceled,
+			Cause:                           CauseCanceledBeforeAuthorization,
+			ObservedWorkspaceWriteItemCount: 1,
+			ObservedWorkspaceWriteItemCountAttemptOrdinal: LaunchOrdinalTwo,
+		},
+	})
+	if got := record.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("retry workspace-write count = %d, want 1", got)
+	}
+	if got := record.ObservedWorkspaceWriteItemCountAttemptOrdinal; got != LaunchOrdinalTwo {
+		t.Fatalf("retry workspace-write count ordinal = %s, want %s", got, LaunchOrdinalTwo)
 	}
 }
 

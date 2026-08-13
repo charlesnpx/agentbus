@@ -1,6 +1,7 @@
 package codexcli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -358,6 +359,13 @@ func (c *appServerRPC) nextFrame(ctx context.Context) (duplex.Frame, error) {
 				frames = nil
 				continue
 			}
+			if frame.Err != nil {
+				var overlong *duplex.OverlongFrameError
+				if errors.As(frame.Err, &overlong) && codexOverlongFrameCanBeSkipped(overlong) {
+					continue
+				}
+				return duplex.Frame{}, codexTransportReadError(frame.Err)
+			}
 			return frame, nil
 		case err, ok := <-decodeErrs:
 			if !ok {
@@ -365,13 +373,164 @@ func (c *appServerRPC) nextFrame(ctx context.Context) (duplex.Frame, error) {
 				continue
 			}
 			if err != nil {
-				return duplex.Frame{}, err
+				return duplex.Frame{}, codexTransportReadError(err)
 			}
 		case <-ctx.Done():
 			return duplex.Frame{}, ctx.Err()
 		}
 	}
 	return duplex.Frame{}, duplex.ErrBackendExitedBeforeTerminal
+}
+
+func codexTransportReadError(err error) error {
+	var overlong *duplex.OverlongFrameError
+	if errors.As(err, &overlong) {
+		return fmt.Errorf("codex app-server transport: %w: %w", engine.ErrTransportFrameTooLarge, err)
+	}
+	return err
+}
+
+// codexOverlongFrameCanBeSkipped accepts only a prefix that identifies a
+// known non-terminal Codex notification. An absent or malformed envelope is
+// treated as a transport failure rather than risking a successful turn after
+// an unrecognized result-bearing frame was discarded.
+func codexOverlongFrameCanBeSkipped(frame *duplex.OverlongFrameError) bool {
+	if frame == nil || frame.DuplicateDiscriminator {
+		return false
+	}
+	method, field := duplex.FrameTypeFromPrefix(frame.Prefix)
+	if method == "" || field != "method" {
+		return false
+	}
+	switch method {
+	case "turn/completed", "task_complete":
+		return false
+	case "item/started", "warning", "error", "config/warning", "guardian/warning":
+		return true
+	case "item/completed":
+		switch codexCompletedItemTypeFromPrefix(frame.Prefix) {
+		case "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall":
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// codexCompletedItemTypeFromPrefix extracts only the structural
+// params.item.type path from a bounded prefix. It stops as soon as that string
+// is complete; an incomplete or unexpected path proves nothing and returns an
+// empty type so the caller fails the turn rather than losing possible result
+// text.
+func codexCompletedItemTypeFromPrefix(prefix []byte) string {
+	decoder := json.NewDecoder(bytes.NewReader(prefix))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return ""
+	}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return ""
+		}
+		keyText, ok := key.(string)
+		if !ok {
+			return ""
+		}
+		if keyText != "params" {
+			if !skipPrefixJSONValue(decoder) {
+				return ""
+			}
+			continue
+		}
+		return codexItemTypeFromParamsPrefix(decoder)
+	}
+	return ""
+}
+
+func codexItemTypeFromParamsPrefix(decoder *json.Decoder) string {
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return ""
+	}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return ""
+		}
+		keyText, ok := key.(string)
+		if !ok {
+			return ""
+		}
+		if keyText != "item" {
+			if !skipPrefixJSONValue(decoder) {
+				return ""
+			}
+			continue
+		}
+		return codexItemTypeFromItemPrefix(decoder)
+	}
+	return ""
+}
+
+func codexItemTypeFromItemPrefix(decoder *json.Decoder) string {
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return ""
+	}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return ""
+		}
+		keyText, ok := key.(string)
+		if !ok {
+			return ""
+		}
+		if keyText == "type" {
+			var itemType string
+			if err := decoder.Decode(&itemType); err != nil {
+				return ""
+			}
+			return itemType
+		}
+		if !skipPrefixJSONValue(decoder) {
+			return ""
+		}
+	}
+	return ""
+}
+
+func skipPrefixJSONValue(decoder *json.Decoder) bool {
+	token, err := decoder.Token()
+	if err != nil {
+		return false
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return true
+	}
+	switch delimiter {
+	case '{':
+		for decoder.More() {
+			if _, err := decoder.Token(); err != nil || !skipPrefixJSONValue(decoder) {
+				return false
+			}
+		}
+		_, err := decoder.Token()
+		return err == nil
+	case '[':
+		for decoder.More() {
+			if !skipPrefixJSONValue(decoder) {
+				return false
+			}
+		}
+		_, err := decoder.Token()
+		return err == nil
+	default:
+		return false
+	}
 }
 
 func (c *appServerRPC) handleServerRequest(frame duplex.Frame) (bool, error) {
@@ -465,10 +624,11 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 		}
 	case "commandexecution", "filechange", "mcptoolcall", "dynamictoolcall":
 		o.emitEvent(engine.Event{
-			Type:     engine.EventToolUse,
-			Name:     toolName(item),
-			Text:     toolText(item),
-			Metadata: metadata,
+			Type:                       engine.EventToolUse,
+			Name:                       toolName(item),
+			Text:                       toolText(item),
+			Metadata:                   metadata,
+			ObservedWorkspaceWriteItem: method == "item/completed" && kind == "filechange",
 		})
 	}
 }

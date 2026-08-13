@@ -497,6 +497,9 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		return err
 	}
 	if snapshot.Record.Terminal != nil {
+		if err := s.cleanupAdmissionBackendLogs(run, snapshot.Record.Terminal.Outcome, snapshot.Record.WorkspaceLayoutKey.String()); err != nil {
+			return err
+		}
 		if model.DeriveCleanupDisposition(snapshot.Record) == model.CleanupDispositionUnresolved {
 			if err := s.abandonAdmissionRecordUnresolvedCustody(context.Background(), snapshot.Record); err != nil {
 				log.Printf("agentbus daemon: job %s unresolved custody abandon warning: %v", jobID, err)
@@ -505,13 +508,15 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		return nil
 	}
 	if admissionRunHasRequestedCancel(run, state) {
-		if err := coord.Cancel(context.Background(), jobID, nil); err != nil {
+		cancellation := run.active.requestedCancellation()
+		count, ordinal := run.active.observedWorkspaceWriteItemCountForTerminal()
+		if err := coord.CancelWithMetadataAndObservedWorkspaceWriteItemCount(context.Background(), jobID, cancellation.origin, cancellation.reason, count, ordinal, nil); err != nil {
 			if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
 				return err
 			}
 		}
 		s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
-		return nil
+		return s.cleanupAdmissionBackendLogsForCommittedTerminal(run, coord, jobID)
 	}
 	outcome, ok := admissionOutcomeForState(state)
 	if !ok {
@@ -524,15 +529,17 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		if err != nil {
 			return err
 		}
-		if err := coord.Finalize(context.Background(), jobID, intent); err != nil {
+		count, ordinal := run.active.observedWorkspaceWriteItemCountForTerminal()
+		if err := coord.FinalizeWithObservedWorkspaceWriteItemCount(context.Background(), jobID, intent, count, ordinal); err != nil {
 			if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
 				return err
 			}
 		}
 		s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
-		return nil
+		return s.cleanupAdmissionBackendLogsForCommittedTerminal(run, coord, jobID)
 	}
-	if err := coord.Complete(context.Background(), jobID, outcome, []byte(text), stamp, nil); err != nil {
+	count, ordinal := run.active.observedWorkspaceWriteItemCountForTerminal()
+	if err := coord.CompleteWithObservedWorkspaceWriteItemCount(context.Background(), jobID, outcome, []byte(text), stamp, count, ordinal, nil); err != nil {
 		if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
 			return err
 		}
@@ -540,6 +547,44 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		// this attempt's state, owns the private-home cleanup decision below.
 	}
 	s.abandonAdmissionUnresolvedCustody(context.Background(), coord, jobID)
+	return s.cleanupAdmissionBackendLogsForCommittedTerminal(run, coord, jobID)
+}
+
+func (s *Server) cleanupAdmissionBackendLogsForCommittedTerminal(run jobRun, coord *admissionCoordinator, jobID model.JobID) error {
+	snapshot, err := coord.Snapshot(context.Background(), jobID)
+	if err != nil {
+		return err
+	}
+	if snapshot.Record.Terminal == nil {
+		return nil
+	}
+	return s.cleanupAdmissionBackendLogs(run, snapshot.Record.Terminal.Outcome, snapshot.Record.WorkspaceLayoutKey.String())
+}
+
+func (s *Server) cleanupAdmissionBackendLogs(run jobRun, outcome model.Outcome, workspaceID string) error {
+	if run.logPaths.Stdout == "" && run.logPaths.Stderr == "" {
+		return nil
+	}
+	cleanup := func() error {
+		if outcome == model.OutcomeCompleted {
+			return discardBackendLogs(run.logPaths)
+		}
+		return discardEmptyBackendLogs(run.logPaths)
+	}
+	if drain := s.admissionLogDrain(run.jobID); drain != nil {
+		go func() {
+			<-drain
+			if err := cleanup(); err != nil {
+				log.Printf("agentbus daemon: job %s backend log cleanup after event drain failed: %v", run.jobID, err)
+			}
+			s.finishAdmissionLogDrain(run.jobID, drain)
+			s.enforceAdmissionLogRetention(workspaceID)
+		}()
+		return nil
+	}
+	if err := cleanup(); err != nil {
+		return err
+	}
 	return nil
 }
 

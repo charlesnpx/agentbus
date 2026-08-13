@@ -1,6 +1,7 @@
 package model
 
 import (
+	"fmt"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -265,13 +266,32 @@ type SafetyRecord struct {
 	Outcome            *OutcomeFact
 	Result             *ResultCertificate
 	Terminal           *TerminalCertificate
+	Timeout            *engine.TimeoutResolution `json:"timeout,omitempty"`
 	// FinalAttemptStartedAt is the start of the final contract attempt, not
 	// whole-job elapsed time. A retry replaces this value with its own start.
 	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
 	// FinalAttemptEndedAt is when that same final attempt reached terminal.
-	FinalAttemptEndedAt *time.Time          `json:"finalAttemptEndedAt,omitempty"`
-	FailureReason       string              `json:"failureReason,omitempty"`
-	FailureClass        engine.FailureClass `json:"failureClass,omitempty"`
+	FinalAttemptEndedAt *time.Time                  `json:"finalAttemptEndedAt,omitempty"`
+	FailureReason       string                      `json:"failureReason,omitempty"`
+	FailureClass        engine.FailureClass         `json:"failureClass,omitempty"`
+	TransportFrameDrops *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
+	// ObservedWorkspaceWriteItemCount is the number of workspace-write items
+	// reported by the backend while this job ran, not a verified filesystem
+	// state. Zero means no write items
+	// were observed; it does not guarantee the workspace is clean because the
+	// stream may have been truncated or a write may have happened by a route
+	// the backend did not report. A crash before terminalization can also leave
+	// observed writes absent from this count.
+	ObservedWorkspaceWriteItemCount uint64 `json:"observedWorkspaceWriteItemCount"`
+	// ObservedWorkspaceWriteItemCountAttemptOrdinal identifies the attempt
+	// whose count is retained. It is durable reducer metadata, not protocol
+	// surface area.
+	ObservedWorkspaceWriteItemCountAttemptOrdinal LaunchOrdinal `json:"observedWorkspaceWriteItemCountAttemptOrdinal,omitempty"`
+	CancellationReason                            string        `json:"cancellationReason,omitempty"`
+	// CancellationOrigin identifies why a canceled terminal was written. An
+	// absent origin on a canceled terminal means the record predates
+	// cancellation provenance and is unattributable, not a missing current write.
+	CancellationOrigin engine.CancellationOrigin `json:"cancellationOrigin,omitempty"`
 }
 
 func (record SafetyRecord) Validate() error {
@@ -308,14 +328,52 @@ func (record SafetyRecord) Validate() error {
 	if err := record.validateOptionalFacts(); err != nil {
 		return err
 	}
+	if record.Timeout != nil && !record.Timeout.Valid() {
+		return invalid("timeout", "is invalid")
+	}
 	if err := ValidateFinalAttemptTiming(record.FinalAttemptStartedAt, record.FinalAttemptEndedAt); err != nil {
 		return err
+	}
+	if record.ObservedWorkspaceWriteItemCountAttemptOrdinal != 0 {
+		if err := record.ObservedWorkspaceWriteItemCountAttemptOrdinal.Validate(); err != nil {
+			return fmt.Errorf("observed_workspace_write_item_count_attempt_ordinal: %w", err)
+		}
 	}
 	if record.FinalAttemptEndedAt != nil && record.Terminal == nil {
 		return invalid("final_attempt.ended_at", "requires terminal certificate")
 	}
 	if err := ValidateFailureMetadata(record.FailureClass, record.FailureReason); err != nil {
 		return err
+	}
+	if err := validateTransportFrameDrops(record.TransportFrameDrops); err != nil {
+		return err
+	}
+	if err := ValidateCancellationMetadata(record.CancellationOrigin, record.CancellationReason); err != nil {
+		return err
+	}
+	if record.CancellationOrigin != "" && (record.Terminal == nil || record.Terminal.Outcome != OutcomeCanceled) {
+		return invalid("cancellation", "requires canceled terminal certificate")
+	}
+	return nil
+}
+
+func validateTransportFrameDrops(drops *engine.TransportFrameDrops) error {
+	if drops == nil {
+		return nil
+	}
+	if drops.Count == 0 {
+		return invalid("transport_frame_drops.count", "is required")
+	}
+	if drops.Bytes == 0 {
+		return invalid("transport_frame_drops.bytes", "is required")
+	}
+	if len(drops.RedactedPrefix) == 0 || len(drops.RedactedPrefix) > 128 {
+		return invalid("transport_frame_drops.redacted_prefix", "must be 1 to 128 bytes")
+	}
+	for _, value := range drops.RedactedPrefix {
+		if value < ' ' || value > '~' {
+			return invalid("transport_frame_drops.redacted_prefix", "must contain printable ASCII only")
+		}
 	}
 	return nil
 }
@@ -363,6 +421,26 @@ func ValidateFailureMetadata(class engine.FailureClass, reason string) error {
 		}
 	}
 	return validateText("failure.reason", reason, engine.FailureReasonMaxRunes*utf8.UTFMax)
+}
+
+// ValidateCancellationMetadata accepts the empty legacy representation or a
+// complete persisted cancellation origin and sanitized human-readable reason.
+func ValidateCancellationMetadata(origin engine.CancellationOrigin, reason string) error {
+	if origin == "" && reason == "" {
+		return nil
+	}
+	if !origin.Valid() {
+		return invalid("cancellation.origin", "is unknown")
+	}
+	if utf8.RuneCountInString(reason) > engine.FailureReasonMaxRunes {
+		return invalid("cancellation.reason", "is too long")
+	}
+	for _, r := range reason {
+		if !unicode.IsPrint(r) && r != ' ' {
+			return invalid("cancellation.reason", "must not contain control characters")
+		}
+	}
+	return validateText("cancellation.reason", reason, engine.FailureReasonMaxRunes*utf8.UTFMax)
 }
 
 func (record SafetyRecord) validateOptionalFacts() error {

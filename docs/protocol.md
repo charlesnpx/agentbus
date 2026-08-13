@@ -302,6 +302,7 @@ Result:
 | `jobId` | string | Authority job ID. |
 | `state` | string | Current public state. New non-replay submissions return `queued`. |
 | `deduplicated` | boolean | Present and `true` only when replay returns an existing live job. Omitted otherwise. |
+| `timeout` | object | Resolved deadline with `requested` (present only when the client sent `timeoutMs`), `effective` (milliseconds), and `source` (`client` or `daemon_default`). The deadline is measured separately from entry to each `runAttempt`, before launch work; time spent admitted or queued does not count. An effective value of `0` means no timeout. Also returned by `job.status` and `job.result`. |
 
 Clients MUST treat `jobId` as opaque. Current strict authority allocation emits
 IDs in the form `job-%020d`, but clients must not parse sequence numbers or
@@ -419,7 +420,7 @@ and `all` is ignored.
 Result:
 
 ```json
-{"jobs":[{"jobId":"job_...","sessionId":"ses_...","state":"completed","cleanupDisposition":"verified_absent"}]}
+{"jobs":[{"jobId":"job_...","sessionId":"ses_...","state":"completed","cleanupDisposition":"verified_absent","timeout":{"effective":1800000,"source":"daemon_default"}}]}
 ```
 
 The served v2 path is authority-only. It does not fall back to legacy JSON job
@@ -434,6 +435,12 @@ authority terminal record plus per-launch quiescence. Values are
 `no_execution_possible`, `verified_absent`, and `unresolved`. It is present for
 authority statuses when the disposition can be derived; it is not physical proof
 serialization.
+
+`timeout` uses the same resolved-deadline shape as `job.submit`: `requested`
+is present only when the client supplied `timeoutMs`, `effective` is in
+milliseconds, and `source` is `client` or `daemon_default`. The deadline starts
+on entry to each `runAttempt`, before launch work; admitted and queued time is
+excluded. A retry receives a new deadline of the same effective duration.
 
 ## `job.result`
 
@@ -451,6 +458,7 @@ Result:
   "sessionId": "ses_...",
   "state": "completed",
   "cleanupDisposition": "verified_absent",
+  "timeout": {"effective": 1800000, "source": "daemon_default"},
   "result": {
     "text": "final text",
     "resultPath": "/home/me/.local/state/agentbus/workspaces/.../results/job_....txt",
@@ -463,6 +471,8 @@ Result:
 `job.result` is authority-only. The public state, result metadata, and
 `cleanupDisposition` are derived from the authority terminal record. Physical
 terminal proof serialization is not exposed in protocol v2.
+
+`timeout` has the same semantics and shape as the `job.status` field.
 
 For completed terminal outcomes, the authority terminal record contains a
 certified result reference. The server returns `resultPath`, `sha256`, and
@@ -740,7 +750,7 @@ Request:
 Response:
 
 ```json
-{"jsonrpc":"2.0","id":"submit-1","result":{"jobId":"job-00000000000000000001","state":"queued"}}
+{"jsonrpc":"2.0","id":"submit-1","result":{"jobId":"job-00000000000000000001","state":"queued","timeout":{"requested":1800000,"effective":1800000,"source":"client"}}}
 ```
 
 ### Submit deduplicated replay
@@ -754,7 +764,7 @@ Request:
 Response:
 
 ```json
-{"jsonrpc":"2.0","id":"submit-replay","result":{"jobId":"job-00000000000000000001","state":"completed","deduplicated":true}}
+{"jsonrpc":"2.0","id":"submit-replay","result":{"jobId":"job-00000000000000000001","state":"completed","deduplicated":true,"timeout":{"requested":1800000,"effective":1800000,"source":"client"}}}
 ```
 
 ### Replay conflict

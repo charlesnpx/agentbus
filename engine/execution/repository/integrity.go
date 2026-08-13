@@ -186,6 +186,9 @@ func ValidateProjectionShape(projection model.JobProjection) error {
 	if projection.TerminalCause != 0 && !projection.TerminalCause.Valid() {
 		return fmt.Errorf("%w: projection.terminal_cause is unknown", ErrInvalidRecord)
 	}
+	if projection.Timeout != nil && !projection.Timeout.Valid() {
+		return fmt.Errorf("%w: projection.timeout is invalid", ErrInvalidRecord)
+	}
 	if err := model.ValidateFinalAttemptTiming(projection.FinalAttemptStartedAt, projection.FinalAttemptEndedAt); err != nil {
 		return fmt.Errorf("%w: projection final attempt timing: %v", ErrInvalidRecord, err)
 	}
@@ -194,6 +197,14 @@ func ValidateProjectionShape(projection model.JobProjection) error {
 	}
 	if err := model.ValidateFailureMetadata(projection.FailureClass, projection.FailureReason); err != nil {
 		return fmt.Errorf("%w: projection failure metadata: %v", ErrInvalidRecord, err)
+	}
+	if projection.TransportFrameDrops != nil {
+		if projection.TransportFrameDrops.Count == 0 || projection.TransportFrameDrops.Bytes == 0 || projection.TransportFrameDrops.RedactedPrefix == "" {
+			return fmt.Errorf("%w: projection transport frame drops are invalid", ErrInvalidRecord)
+		}
+	}
+	if err := model.ValidateCancellationMetadata(projection.CancellationOrigin, projection.CancellationReason); err != nil {
+		return fmt.Errorf("%w: projection cancellation metadata: %v", ErrInvalidRecord, err)
 	}
 	return nil
 }

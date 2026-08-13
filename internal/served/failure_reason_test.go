@@ -45,6 +45,12 @@ func TestClassifyTerminalFailure(t *testing.T) {
 			want:   engine.FailureClassBackendError,
 		},
 		{
+			name:   "oversized backend transport frame",
+			origin: terminalFailureBackendRan,
+			err:    fmt.Errorf("transport: %w", engine.ErrTransportFrameTooLarge),
+			want:   engine.FailureClassTransportFrameTooLarge,
+		},
+		{
 			name:               "provider overload sentinel preserves provider message",
 			origin:             terminalFailureBackendRan,
 			err:                fmt.Errorf("codex app-server provider overload: %s: %w", providerCapacityMessage, engine.ErrProviderOverloaded),
@@ -283,6 +289,114 @@ func TestFailedJobExposesSanitizedFailureMetadata(t *testing.T) {
 	}
 }
 
+func TestReadOnlyJobRecordsZeroObservedWorkspaceWriteItems(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{{Type: engine.EventAgentText, Text: "read-only response"}}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-observed-write-read-only",
+		RequestID:    "request-observed-write-read-only",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Write:   false,
+			Prompt:  "read only",
+		},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if got := record.ObservedWorkspaceWriteItemCount; got != 0 {
+		t.Fatalf("durable observed workspace-write count = %d, want 0", got)
+	}
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+	if len(status.Jobs) != 1 || status.Jobs[0].ObservedWorkspaceWriteItemCount == nil || *status.Jobs[0].ObservedWorkspaceWriteItemCount != 0 {
+		t.Fatalf("job.status observed workspace-write count = %+v, want 0", status.Jobs)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if got := result.ObservedWorkspaceWriteItemCount; got == nil || *got != 0 {
+		t.Fatalf("job.result observed workspace-write count = %v, want 0", got)
+	}
+}
+
+func TestFailedJobRetainsObservedWorkspaceWriteItemCount(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{
+			{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true},
+			{Type: engine.EventTerminalError, Text: "backend failed"},
+		}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-observed-write-failure",
+		RequestID:    "request-observed-write-failure",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Write:   true,
+			Prompt:  "fail after write",
+		},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeFailed {
+		t.Fatalf("terminal record = %+v, want failed terminal", record.Terminal)
+	}
+	if got := record.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("durable observed workspace-write count = %d, want 1", got)
+	}
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+	if len(status.Jobs) != 1 || status.Jobs[0].ObservedWorkspaceWriteItemCount == nil || *status.Jobs[0].ObservedWorkspaceWriteItemCount != 1 {
+		t.Fatalf("job.status observed workspace-write count = %+v, want 1", status.Jobs)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if got := result.ObservedWorkspaceWriteItemCount; got == nil || *got != 1 {
+		t.Fatalf("job.result observed workspace-write count = %v, want 1", got)
+	}
+}
+
+func TestTransportFrameFailurePersistsDroppedFrameMetadata(t *testing.T) {
+	t.Parallel()
+	drops := engine.TransportFrameDrops{
+		Count:          1,
+		Bytes:          33 * 1024 * 1024,
+		RedactedPrefix: "method=turn/completed",
+	}
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		return []engine.Event{
+			{Type: engine.EventWarning, Text: "discarded backend transport frame", Metadata: drops.EventMetadata()},
+			{Type: engine.EventTerminalError, Text: engine.ErrTransportFrameTooLarge.Error(), Err: engine.ErrTransportFrameTooLarge},
+		}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-transport-frame",
+		RequestID:    "request-transport-frame",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Prompt:  "fail",
+		},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if got := record.FailureClass; got != engine.FailureClassTransportFrameTooLarge {
+		t.Fatalf("durable failure class = %q, want %q; reason=%q", got, engine.FailureClassTransportFrameTooLarge, record.FailureReason)
+	}
+	if record.TransportFrameDrops == nil || *record.TransportFrameDrops != drops {
+		t.Fatalf("durable transport frame drops = %#v, want %#v", record.TransportFrameDrops, drops)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if result.TransportFrameDrops == nil || *result.TransportFrameDrops != drops {
+		t.Fatalf("job.result transport frame drops = %#v, want %#v", result.TransportFrameDrops, drops)
+	}
+}
+
 func TestInterruptedJobExposesFailureMetadata(t *testing.T) {
 	t.Parallel()
 	interruption := fmt.Errorf("backend turn stopped unexpectedly: %w", context.Canceled)
@@ -466,6 +580,9 @@ func TestCanceledJobDoesNotExposeFailureMetadata(t *testing.T) {
 	if record.FailureClass != "" || record.FailureReason != "" {
 		t.Fatalf("canceled durable failure metadata = (%q, %q), want empty", record.FailureReason, record.FailureClass)
 	}
+	if record.CancellationOrigin != engine.CancellationOriginClientRequest || record.CancellationReason != "client requested cancellation" {
+		t.Fatalf("canceled durable cancellation metadata = (%q, %q), want client request", record.CancellationOrigin, record.CancellationReason)
+	}
 
 	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
 	if len(status.Jobs) != 1 || status.Jobs[0].State != engine.StateCanceled {
@@ -474,6 +591,9 @@ func TestCanceledJobDoesNotExposeFailureMetadata(t *testing.T) {
 	if status.Jobs[0].FailureClass != "" || status.Jobs[0].FailureReason != "" {
 		t.Fatalf("canceled job.status failure metadata = (%q, %q), want empty", status.Jobs[0].FailureReason, status.Jobs[0].FailureClass)
 	}
+	if status.Jobs[0].CancellationOrigin != engine.CancellationOriginClientRequest || status.Jobs[0].CancellationReason != "client requested cancellation" {
+		t.Fatalf("canceled job.status cancellation metadata = (%q, %q), want client request", status.Jobs[0].CancellationOrigin, status.Jobs[0].CancellationReason)
+	}
 
 	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
 	if result.State != engine.StateCanceled {
@@ -481,5 +601,8 @@ func TestCanceledJobDoesNotExposeFailureMetadata(t *testing.T) {
 	}
 	if result.FailureClass != "" || result.FailureReason != "" {
 		t.Fatalf("canceled job.result failure metadata = (%q, %q), want empty", result.FailureReason, result.FailureClass)
+	}
+	if result.CancellationOrigin != engine.CancellationOriginClientRequest || result.CancellationReason != "client requested cancellation" {
+		t.Fatalf("canceled job.result cancellation metadata = (%q, %q), want client request", result.CancellationOrigin, result.CancellationReason)
 	}
 }

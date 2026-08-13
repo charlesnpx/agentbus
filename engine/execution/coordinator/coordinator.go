@@ -101,6 +101,12 @@ func (c *Coordinator) Snapshot(ctx context.Context, jobID model.JobID) (JobSnaps
 }
 
 func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome model.Outcome, result []byte, contract *engine.ContractStamp, injector *FailureInjector) error {
+	return c.CompleteWithObservedWorkspaceWriteItemCount(ctx, jobID, outcome, result, contract, 0, 0, injector)
+}
+
+// CompleteWithObservedWorkspaceWriteItemCount includes the final attempt's
+// routing hint in the terminal certificate mutation.
+func (c *Coordinator) CompleteWithObservedWorkspaceWriteItemCount(ctx context.Context, jobID model.JobID, outcome model.Outcome, result []byte, contract *engine.ContractStamp, observedWorkspaceWriteItemCount uint64, observedWorkspaceWriteItemCountAttemptOrdinal model.LaunchOrdinal, injector *FailureInjector) error {
 	if err := c.ready(); err != nil {
 		return err
 	}
@@ -127,8 +133,10 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 		return err
 	}
 	_, err = c.authority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, model.TerminalIntent{
-		Outcome: outcome,
-		Cause:   model.CauseCompletedNormally,
+		Outcome:                         outcome,
+		Cause:                           model.CauseCompletedNormally,
+		ObservedWorkspaceWriteItemCount: observedWorkspaceWriteItemCount,
+		ObservedWorkspaceWriteItemCountAttemptOrdinal: observedWorkspaceWriteItemCountAttemptOrdinal,
 	})
 	if err != nil {
 		return c.alreadyFinalizedError(ctx, jobID, err)
@@ -137,6 +145,12 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 }
 
 func (c *Coordinator) Finalize(ctx context.Context, jobID model.JobID, intent model.TerminalIntent) error {
+	return c.FinalizeWithObservedWorkspaceWriteItemCount(ctx, jobID, intent, 0, 0)
+}
+
+// FinalizeWithObservedWorkspaceWriteItemCount includes the final attempt's
+// routing hint in the terminal certificate mutation.
+func (c *Coordinator) FinalizeWithObservedWorkspaceWriteItemCount(ctx context.Context, jobID model.JobID, intent model.TerminalIntent, observedWorkspaceWriteItemCount uint64, observedWorkspaceWriteItemCountAttemptOrdinal model.LaunchOrdinal) error {
 	if err := c.ready(); err != nil {
 		return err
 	}
@@ -144,6 +158,7 @@ func (c *Coordinator) Finalize(ctx context.Context, jobID model.JobID, intent mo
 	if err != nil {
 		return err
 	}
+	intent = withTerminalMetadata(intent, nil, terminalObservedWorkspaceWriteItemCount(observedWorkspaceWriteItemCount, observedWorkspaceWriteItemCountAttemptOrdinal))
 	_, err = c.authority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, intent)
 	if err != nil {
 		return c.alreadyFinalizedError(ctx, jobID, err)
@@ -152,20 +167,38 @@ func (c *Coordinator) Finalize(ctx context.Context, jobID model.JobID, intent mo
 }
 
 func (c *Coordinator) Cancel(ctx context.Context, jobID model.JobID, injector *FailureInjector) error {
+	return c.CancelWithMetadata(ctx, jobID, engine.CancellationOriginUnattributable, "canceled without an attributable origin", injector)
+}
+
+// CancelWithMetadata requests cancellation and records the cancellation
+// explanation with a canceled terminal, if cancellation produces one. Callers
+// must pass non-sensitive text: it is persisted and exposed on job.status and
+// job.result.
+func (c *Coordinator) CancelWithMetadata(ctx context.Context, jobID model.JobID, origin engine.CancellationOrigin, reason string, injector *FailureInjector) error {
+	return c.CancelWithMetadataAndObservedWorkspaceWriteItemCount(ctx, jobID, origin, reason, 0, 0, injector)
+}
+
+// CancelWithMetadataAndObservedWorkspaceWriteItemCount preserves cancellation
+// provenance and the final attempt's diagnostic workspace-write count in the
+// same terminal mutation.
+func (c *Coordinator) CancelWithMetadataAndObservedWorkspaceWriteItemCount(ctx context.Context, jobID model.JobID, origin engine.CancellationOrigin, reason string, observedWorkspaceWriteItemCount uint64, observedWorkspaceWriteItemCountAttemptOrdinal model.LaunchOrdinal, injector *FailureInjector) error {
 	if err := c.ready(); err != nil {
 		return err
+	}
+	if err := model.ValidateCancellationMetadata(origin, reason); err != nil {
+		return fmt.Errorf("cancellation metadata: %w", err)
 	}
 	if _, err := c.authority.RequestCancel(ctx, jobID); err != nil {
 		return c.alreadyFinalizedError(ctx, jobID, err)
 	}
-	return c.recover(ctx, jobID, model.RecoveryCancelAfterGrant, nil, injector)
+	return c.recover(ctx, jobID, model.RecoveryCancelAfterGrant, nil, &cancellationMetadata{origin: origin, reason: reason}, terminalObservedWorkspaceWriteItemCount(observedWorkspaceWriteItemCount, observedWorkspaceWriteItemCountAttemptOrdinal), injector)
 }
 
 func (c *Coordinator) Recover(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, injector *FailureInjector) error {
 	if err := c.ready(); err != nil {
 		return err
 	}
-	return c.recover(ctx, jobID, trigger, nil, injector)
+	return c.recover(ctx, jobID, trigger, nil, nil, nil, injector)
 }
 
 func (c *Coordinator) HasOwnedWork(ctx context.Context) (bool, error) {
@@ -230,7 +263,12 @@ func (c *Coordinator) publishResult(ctx context.Context, jobID model.JobID, payl
 	return nil
 }
 
-func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, injector *FailureInjector) error {
+type cancellationMetadata struct {
+	origin engine.CancellationOrigin
+	reason string
+}
+
+func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, cancellation *cancellationMetadata, observedWorkspaceWrites *model.TerminalIntent, injector *FailureInjector) error {
 	for i := 0; i < 8; i++ {
 		plan, err := c.authority.RecoveryPlan(ctx, jobID, trigger)
 		if err != nil {
@@ -244,7 +282,9 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 			if plan.Next.Finalize == nil {
 				return cause
 			}
-			if _, err := c.authority.Finalize(ctx, jobID, plan.Next.Finalize.Ref, plan.Next.Finalize.Intent); err != nil {
+			finalize := *plan.Next.Finalize
+			finalize.Intent = withTerminalMetadata(finalize.Intent, cancellation, observedWorkspaceWrites)
+			if _, err := c.authority.Finalize(ctx, jobID, finalize.Ref, finalize.Intent); err != nil {
 				err = c.alreadyFinalizedError(ctx, jobID, err)
 				if cause != nil {
 					return errors.Join(cause, fmt.Errorf("finalize recovery: %w", err))
@@ -262,7 +302,7 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 					return err
 				}
 				if physicalCleanupUnresolved(err) {
-					return c.finalizeUnresolved(ctx, jobID, trigger, cause, err)
+					return c.finalizeUnresolved(ctx, jobID, trigger, cause, cancellation, observedWorkspaceWrites, err)
 				}
 				return c.failStop(ctx, err)
 			}
@@ -276,7 +316,7 @@ func (c *Coordinator) recover(ctx context.Context, jobID model.JobID, trigger mo
 					return err
 				}
 				if physicalCleanupUnresolved(err) {
-					return c.finalizeUnresolved(ctx, jobID, trigger, cause, err)
+					return c.finalizeUnresolved(ctx, jobID, trigger, cause, cancellation, observedWorkspaceWrites, err)
 				}
 				return c.failStop(ctx, err)
 			}
@@ -323,7 +363,7 @@ func (c *Coordinator) awaitResultCertificateProgress(ctx context.Context, jobID 
 	}
 }
 
-func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, unresolved error) error {
+func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID, trigger model.RecoveryTrigger, cause error, cancellation *cancellationMetadata, observedWorkspaceWrites *model.TerminalIntent, unresolved error) error {
 	if err := recoveryAbortedBeforeOperation(ctx); err != nil {
 		return err
 	}
@@ -335,6 +375,7 @@ func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID,
 	if err != nil {
 		return c.failStopUnlessRecoveryAborted(ctx, errors.Join(unresolved, err))
 	}
+	intent = withTerminalMetadata(intent, cancellation, observedWorkspaceWrites)
 	if err := recoveryAbortedBeforeOperation(ctx); err != nil {
 		return err
 	}
@@ -346,6 +387,28 @@ func (c *Coordinator) finalizeUnresolved(ctx context.Context, jobID model.JobID,
 		return c.failStopUnlessRecoveryAborted(ctx, errors.Join(unresolved, err))
 	}
 	return cause
+}
+
+func withTerminalMetadata(intent model.TerminalIntent, cancellation *cancellationMetadata, observedWorkspaceWrites *model.TerminalIntent) model.TerminalIntent {
+	if cancellation != nil && intent.Outcome == model.OutcomeCanceled {
+		intent.CancellationOrigin = cancellation.origin
+		intent.CancellationReason = cancellation.reason
+	}
+	if observedWorkspaceWrites != nil && observedWorkspaceWrites.ObservedWorkspaceWriteItemCountAttemptOrdinal.Valid() {
+		intent.ObservedWorkspaceWriteItemCount = observedWorkspaceWrites.ObservedWorkspaceWriteItemCount
+		intent.ObservedWorkspaceWriteItemCountAttemptOrdinal = observedWorkspaceWrites.ObservedWorkspaceWriteItemCountAttemptOrdinal
+	}
+	return intent
+}
+
+func terminalObservedWorkspaceWriteItemCount(count uint64, ordinal model.LaunchOrdinal) *model.TerminalIntent {
+	if !ordinal.Valid() {
+		return nil
+	}
+	return &model.TerminalIntent{
+		ObservedWorkspaceWriteItemCount:               count,
+		ObservedWorkspaceWriteItemCountAttemptOrdinal: ordinal,
+	}
 }
 
 func (c *Coordinator) alreadyFinalizedError(ctx context.Context, jobID model.JobID, err error) error {

@@ -194,6 +194,10 @@ type JobSubmitResult struct {
 	JobID        string          `json:"jobId"`
 	State        engine.JobState `json:"state"`
 	Deduplicated bool            `json:"deduplicated,omitempty"`
+	// Timeout is the resolved deadline in milliseconds. It applies separately
+	// to each runAttempt invocation, measured from runAttempt entry before
+	// launch work; time while the job is admitted or queued does not count.
+	Timeout *engine.TimeoutResolution `json:"timeout,omitempty"`
 }
 
 type JobStatusParams struct {
@@ -206,32 +210,43 @@ type JobStatusResult struct {
 }
 
 type JobStatus struct {
-	JobID              string            `json:"jobId"`
-	SessionID          string            `json:"sessionId,omitempty"`
-	Backend            string            `json:"backend,omitempty"`
-	State              engine.JobState   `json:"state"`
-	CleanupDisposition string            `json:"cleanupDisposition,omitempty"`
-	LateFinalization   bool              `json:"lateFinalization,omitempty"`
-	Tags               map[string]string `json:"tags,omitempty"`
-	StartedAt          *time.Time        `json:"startedAt,omitempty"`
-	UpdatedAt          *time.Time        `json:"updatedAt,omitempty"`
-	HeartbeatAt        *time.Time        `json:"heartbeatAt,omitempty"`
+	JobID     string `json:"jobId"`
+	SessionID string `json:"sessionId,omitempty"`
+	Backend   string `json:"backend,omitempty"`
+	// Timeout is the resolved deadline in milliseconds. It applies separately
+	// to each runAttempt invocation, measured from runAttempt entry before
+	// launch work; time while the job is admitted or queued does not count.
+	Timeout            *engine.TimeoutResolution `json:"timeout,omitempty"`
+	State              engine.JobState           `json:"state"`
+	CleanupDisposition string                    `json:"cleanupDisposition,omitempty"`
+	LateFinalization   bool                      `json:"lateFinalization,omitempty"`
+	Tags               map[string]string         `json:"tags,omitempty"`
+	StartedAt          *time.Time                `json:"startedAt,omitempty"`
+	UpdatedAt          *time.Time                `json:"updatedAt,omitempty"`
+	HeartbeatAt        *time.Time                `json:"heartbeatAt,omitempty"`
 	// FinalAttemptStartedAt is the start of the final contract attempt, not
 	// whole-job elapsed time. A retry replaces this value with its own start.
 	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
 	// FinalAttemptEndedAt is when that same final attempt reached terminal.
-	FinalAttemptEndedAt   *time.Time          `json:"finalAttemptEndedAt,omitempty"`
-	Lease                 *engine.Lease       `json:"lease,omitempty"`
-	WorkerPID             int                 `json:"workerPid,omitempty"`
-	WorkerStartTime       string              `json:"workerStartTime,omitempty"`
-	BackendChildPID       int                 `json:"backendChildPid,omitempty"`
-	BackendChildStartTime string              `json:"backendChildStartTime,omitempty"`
-	StatePath             string              `json:"statePath,omitempty"`
-	LogPaths              engine.LogPaths     `json:"logPaths,omitempty"`
-	ModelReported         string              `json:"modelReported,omitempty"`
-	Warnings              []string            `json:"warnings,omitempty"`
-	FailureReason         string              `json:"failureReason,omitempty"`
-	FailureClass          engine.FailureClass `json:"failureClass,omitempty"`
+	FinalAttemptEndedAt   *time.Time                  `json:"finalAttemptEndedAt,omitempty"`
+	Lease                 *engine.Lease               `json:"lease,omitempty"`
+	WorkerPID             int                         `json:"workerPid,omitempty"`
+	WorkerStartTime       string                      `json:"workerStartTime,omitempty"`
+	BackendChildPID       int                         `json:"backendChildPid,omitempty"`
+	BackendChildStartTime string                      `json:"backendChildStartTime,omitempty"`
+	StatePath             string                      `json:"statePath,omitempty"`
+	LogPaths              *engine.LogPaths            `json:"logPaths,omitempty"`
+	ModelReported         string                      `json:"modelReported,omitempty"`
+	Warnings              []string                    `json:"warnings,omitempty"`
+	FailureReason         string                      `json:"failureReason,omitempty"`
+	FailureClass          engine.FailureClass         `json:"failureClass,omitempty"`
+	TransportFrameDrops   *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
+	// ObservedWorkspaceWriteItemCount is present only for terminal jobs. A
+	// present zero means no workspace-write items were reported; it is not a
+	// verified filesystem-cleanliness claim.
+	ObservedWorkspaceWriteItemCount *uint64                   `json:"observedWorkspaceWriteItemCount,omitempty"`
+	CancellationReason              string                    `json:"cancellationReason,omitempty"`
+	CancellationOrigin              engine.CancellationOrigin `json:"cancellationOrigin,omitempty"`
 }
 
 type JobResultParams struct {
@@ -239,21 +254,32 @@ type JobResultParams struct {
 }
 
 type JobResult struct {
-	JobID              string                `json:"jobId"`
-	SessionID          string                `json:"sessionId,omitempty"`
-	State              engine.JobState       `json:"state"`
-	CleanupDisposition string                `json:"cleanupDisposition,omitempty"`
-	LateFinalization   bool                  `json:"lateFinalization,omitempty"`
-	Result             *engine.ResultInfo    `json:"result,omitempty"`
-	ModelReported      string                `json:"modelReported,omitempty"`
-	Contract           *engine.ContractStamp `json:"contract,omitempty"`
+	JobID              string          `json:"jobId"`
+	SessionID          string          `json:"sessionId,omitempty"`
+	State              engine.JobState `json:"state"`
+	CleanupDisposition string          `json:"cleanupDisposition,omitempty"`
+	LateFinalization   bool            `json:"lateFinalization,omitempty"`
+	// Timeout is the resolved deadline in milliseconds. It applies separately
+	// to each runAttempt invocation, measured from runAttempt entry before
+	// launch work; time while the job is admitted or queued does not count.
+	Timeout       *engine.TimeoutResolution `json:"timeout,omitempty"`
+	Result        *engine.ResultInfo        `json:"result,omitempty"`
+	ModelReported string                    `json:"modelReported,omitempty"`
+	Contract      *engine.ContractStamp     `json:"contract,omitempty"`
 	// FinalAttemptStartedAt is the start of the final contract attempt, not
 	// whole-job elapsed time. A retry replaces this value with its own start.
 	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
 	// FinalAttemptEndedAt is when that same final attempt reached terminal.
-	FinalAttemptEndedAt *time.Time          `json:"finalAttemptEndedAt,omitempty"`
-	FailureReason       string              `json:"failureReason,omitempty"`
-	FailureClass        engine.FailureClass `json:"failureClass,omitempty"`
+	FinalAttemptEndedAt *time.Time                  `json:"finalAttemptEndedAt,omitempty"`
+	FailureReason       string                      `json:"failureReason,omitempty"`
+	FailureClass        engine.FailureClass         `json:"failureClass,omitempty"`
+	TransportFrameDrops *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
+	// ObservedWorkspaceWriteItemCount is present only for terminal jobs. A
+	// present zero means no workspace-write items were reported; it is not a
+	// verified filesystem-cleanliness claim.
+	ObservedWorkspaceWriteItemCount *uint64                   `json:"observedWorkspaceWriteItemCount,omitempty"`
+	CancellationReason              string                    `json:"cancellationReason,omitempty"`
+	CancellationOrigin              engine.CancellationOrigin `json:"cancellationOrigin,omitempty"`
 }
 
 type JobCancelParams struct {

@@ -27,13 +27,23 @@ type JobProjection struct {
 	Public        PublicState
 	TerminalCause TerminalCause
 	SessionID     string
+	Timeout       *engine.TimeoutResolution `json:"timeout,omitempty"`
 	// FinalAttemptStartedAt is the start of the final contract attempt, not
 	// whole-job elapsed time. A retry replaces this value with its own start.
 	FinalAttemptStartedAt *time.Time `json:"finalAttemptStartedAt,omitempty"`
 	// FinalAttemptEndedAt is when that same final attempt reached terminal.
-	FinalAttemptEndedAt *time.Time          `json:"finalAttemptEndedAt,omitempty"`
-	FailureReason       string              `json:"failureReason,omitempty"`
-	FailureClass        engine.FailureClass `json:"failureClass,omitempty"`
+	FinalAttemptEndedAt *time.Time                  `json:"finalAttemptEndedAt,omitempty"`
+	FailureReason       string                      `json:"failureReason,omitempty"`
+	FailureClass        engine.FailureClass         `json:"failureClass,omitempty"`
+	TransportFrameDrops *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
+	// ObservedWorkspaceWriteItemCount is present only for terminal jobs. Its
+	// value is the number of workspace-write items reported by the backend, not
+	// a verified filesystem state. A present zero means none were observed; it
+	// does not guarantee the workspace is clean because the stream may have
+	// been truncated or a write may have happened by an unreported route.
+	ObservedWorkspaceWriteItemCount *uint64                   `json:"observedWorkspaceWriteItemCount,omitempty"`
+	CancellationReason              string                    `json:"cancellationReason,omitempty"`
+	CancellationOrigin              engine.CancellationOrigin `json:"cancellationOrigin,omitempty"`
 }
 
 // Project rebuilds the read model from the proof-bearing SafetyRecord. The
@@ -52,36 +62,55 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 	public := PublicProjection(decision, dispatch, outcome)
 	finalAttemptStartedAt, finalAttemptEndedAt := projectedFinalAttemptTiming(record, public)
 	failureReason, failureClass := projectedFailureMetadata(record, public)
+	observedWorkspaceWriteItemCount := projectedObservedWorkspaceWriteItemCount(record, public)
+	cancellationReason, cancellationOrigin := projectedCancellationMetadata(record, public)
 	return JobProjection{
-		SchemaVersion:         record.SchemaVersion,
-		Revision:              record.Revision,
-		JobID:                 record.JobID,
-		RequestKey:            record.RequestKey,
-		TaskIdentity:          record.TaskIdentity,
-		Mode:                  record.Mode,
-		Decision:              decision,
-		Dispatch:              dispatch,
-		Outcome:               outcome,
-		Public:                public,
-		TerminalCause:         projectTerminalCause(record),
-		SessionID:             metadata.SessionID,
-		FinalAttemptStartedAt: finalAttemptStartedAt,
-		FinalAttemptEndedAt:   finalAttemptEndedAt,
-		FailureReason:         failureReason,
-		FailureClass:          failureClass,
+		SchemaVersion:                   record.SchemaVersion,
+		Revision:                        record.Revision,
+		JobID:                           record.JobID,
+		RequestKey:                      record.RequestKey,
+		TaskIdentity:                    record.TaskIdentity,
+		Mode:                            record.Mode,
+		Decision:                        decision,
+		Dispatch:                        dispatch,
+		Outcome:                         outcome,
+		Public:                          public,
+		TerminalCause:                   projectTerminalCause(record),
+		SessionID:                       metadata.SessionID,
+		Timeout:                         engine.CloneTimeoutResolution(record.Timeout),
+		FinalAttemptStartedAt:           finalAttemptStartedAt,
+		FinalAttemptEndedAt:             finalAttemptEndedAt,
+		FailureReason:                   failureReason,
+		FailureClass:                    failureClass,
+		TransportFrameDrops:             cloneTransportFrameDrops(record.TransportFrameDrops),
+		ObservedWorkspaceWriteItemCount: observedWorkspaceWriteItemCount,
+		CancellationReason:              cancellationReason,
+		CancellationOrigin:              cancellationOrigin,
 	}, nil
 }
 
-// projectedFinalAttemptTiming and projectedFailureMetadata are independent
-// suppression rules over the same record: timing is advertised only as a
-// complete pair on a terminal job, and failure metadata only for failure or
-// interrupted terminal states. Both durable observations are retained either
-// way.
+// projectedFinalAttemptTiming, projectedFailureMetadata,
+// projectedObservedWorkspaceWriteItemCount, and
+// projectedCancellationMetadata are independent suppression rules over the
+// same record: timing is advertised only as a complete pair on a terminal job,
+// failure metadata only for failure or interrupted terminal states, and
+// observed workspace-write activity is absent for non-terminal jobs and present
+// for terminal jobs, including an honest zero. Cancellation metadata is
+// advertised only for canceled terminal states. All durable observations are
+// retained either way.
 func projectedFinalAttemptTiming(record SafetyRecord, public PublicState) (*time.Time, *time.Time) {
 	if !terminalPublicState(public) || record.FinalAttemptStartedAt == nil || record.FinalAttemptEndedAt == nil {
 		return nil, nil
 	}
 	return clonePtr(record.FinalAttemptStartedAt), clonePtr(record.FinalAttemptEndedAt)
+}
+
+func cloneTransportFrameDrops(drops *engine.TransportFrameDrops) *engine.TransportFrameDrops {
+	if drops == nil {
+		return nil
+	}
+	copied := *drops
+	return &copied
 }
 
 // projectedFailureMetadata exposes durable failure metadata only for failure
@@ -93,6 +122,23 @@ func projectedFailureMetadata(record SafetyRecord, public PublicState) (string, 
 	default:
 		return "", ""
 	}
+}
+
+func projectedObservedWorkspaceWriteItemCount(record SafetyRecord, public PublicState) *uint64 {
+	if !terminalPublicState(public) {
+		return nil
+	}
+	count := record.ObservedWorkspaceWriteItemCount
+	return &count
+}
+
+// projectedCancellationMetadata exposes durable cancellation metadata only for
+// canceled terminal states.
+func projectedCancellationMetadata(record SafetyRecord, public PublicState) (string, engine.CancellationOrigin) {
+	if public == PublicCanceled {
+		return record.CancellationReason, record.CancellationOrigin
+	}
+	return "", ""
 }
 
 func projectDecision(record SafetyRecord) Decision {

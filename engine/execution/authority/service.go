@@ -100,6 +100,7 @@ type AcceptRequest struct {
 	TaskIdentity       model.TaskIdentity
 	Mode               model.Mode
 	SessionID          string
+	Timeout            *engine.TimeoutResolution
 }
 
 type AcceptResult struct {
@@ -270,7 +271,25 @@ func (r *Ready) RecordFailure(ctx context.Context, jobID model.JobID, class engi
 	return r.apply(ctx, jobID, model.RecordFailure{JobID: jobID, Class: class, Reason: reason}, options...)
 }
 
+// RecordTransportFrameDrops durably preserves bounded metadata about backend
+// frames discarded by the transport reader without retaining payload bytes.
+func (r *Ready) RecordTransportFrameDrops(ctx context.Context, jobID model.JobID, drops engine.TransportFrameDrops, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.RecordTransportFrameDrops{JobID: jobID, Drops: drops}, options...)
+}
+
+// RecordCancellation durably preserves the first cancellation explanation
+// without changing the job's state machine outcome or terminal certificate.
+// Callers must pass non-sensitive text: it is persisted and exposed on
+// job.status and job.result.
+func (r *Ready) RecordCancellation(ctx context.Context, jobID model.JobID, origin engine.CancellationOrigin, reason string, options ...ApplyOption) (ApplyResult, error) {
+	return r.apply(ctx, jobID, model.RecordCancellation{JobID: jobID, Origin: origin, Reason: reason}, options...)
+}
+
 func (r *Ready) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent, options ...ApplyOption) (ApplyResult, error) {
+	if intent.Outcome == model.OutcomeCanceled && intent.CancellationOrigin == "" && intent.CancellationReason == "" {
+		intent.CancellationOrigin = engine.CancellationOriginUnattributable
+		intent.CancellationReason = "canceled without an attributable origin"
+	}
 	return r.apply(ctx, jobID, model.Finalize{Ref: ref, Intent: intent}, options...)
 }
 
@@ -430,6 +449,9 @@ func normalizeAcceptRequest(request AcceptRequest) (AcceptRequest, error) {
 	if err := ValidateSessionID(request.SessionID); err != nil {
 		return AcceptRequest{}, fmt.Errorf("%w: projection metadata: %v", ErrInvalidRequest, err)
 	}
+	if request.Timeout != nil && !request.Timeout.Valid() {
+		return AcceptRequest{}, fmt.Errorf("%w: timeout is invalid", ErrInvalidRequest)
+	}
 	if _, err := model.Project(model.SafetyRecord{
 		SchemaVersion:      safetySchemaVersion,
 		Revision:           1,
@@ -476,6 +498,7 @@ func acceptTx(tx repository.WriteTx, request AcceptRequest, boot model.BootRef) 
 		WorkspaceLayoutKey: request.WorkspaceLayoutKey,
 		TaskIdentity:       request.TaskIdentity,
 		Mode:               request.Mode,
+		Timeout:            engine.CloneTimeoutResolution(request.Timeout),
 		AdmittedBy:         boot,
 		Attempt: model.AttemptProof{
 			Ref: model.AttemptRef{JobID: jobID, AttemptID: attemptID, Epoch: 1},
@@ -786,6 +809,20 @@ func applyLogicalCommand(record model.SafetyRecord, command model.Command) (mode
 			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
 		}
 		return model.ApplyRecordFailure(record, *c)
+	case model.RecordTransportFrameDrops:
+		return model.ApplyRecordTransportFrameDrops(record, c)
+	case *model.RecordTransportFrameDrops:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyRecordTransportFrameDrops(record, *c)
+	case model.RecordCancellation:
+		return model.ApplyRecordCancellation(record, c)
+	case *model.RecordCancellation:
+		if c == nil {
+			return model.ApplyResult{}, fmt.Errorf("%w: command is nil", model.ErrInvalidCommand)
+		}
+		return model.ApplyRecordCancellation(record, *c)
 	case model.Finalize:
 		return model.ApplyFinalize(record, c)
 	case *model.Finalize:
@@ -1050,7 +1087,9 @@ func commandWithBoot(command model.Command, boot model.BootRef) model.Command {
 		}
 		return next
 	case model.RecordFinalAttemptStart, *model.RecordFinalAttemptStart,
-		model.RecordFailure, *model.RecordFailure:
+		model.RecordFailure, *model.RecordFailure,
+		model.RecordTransportFrameDrops, *model.RecordTransportFrameDrops,
+		model.RecordCancellation, *model.RecordCancellation:
 		return command
 	case model.Finalize:
 		if emptyBootRef(c.Intent.DerivedBy) {
@@ -1150,6 +1189,20 @@ func commandJobID(command model.Command) (model.JobID, error) {
 	case model.RecordFailure:
 		return c.JobID, nil
 	case *model.RecordFailure:
+		if c == nil {
+			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
+		}
+		return c.JobID, nil
+	case model.RecordTransportFrameDrops:
+		return c.JobID, nil
+	case *model.RecordTransportFrameDrops:
+		if c == nil {
+			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
+		}
+		return c.JobID, nil
+	case model.RecordCancellation:
+		return c.JobID, nil
+	case *model.RecordCancellation:
 		if c == nil {
 			return "", fmt.Errorf("%w: nil command", ErrInvalidRequest)
 		}

@@ -59,6 +59,127 @@ type fakeTurn struct {
 	Write  bool
 }
 
+type logCaptureBackend struct {
+	*fakeBackend
+	input              chan engine.TurnInput
+	terminal           engine.Event
+	logContent         map[string]string
+	writeAfterTerminal <-chan struct{}
+	writersOpened      chan struct{}
+}
+
+func newLogCaptureBackend(name string) *logCaptureBackend {
+	return &logCaptureBackend{
+		fakeBackend: newFakeBackend(name),
+		input:       make(chan engine.TurnInput, 8),
+		terminal:    engine.Event{Type: engine.EventTerminalError, Text: "backend exploded"},
+	}
+}
+
+func (b *logCaptureBackend) ProbeBackend(context.Context, command.ProbeRunner) (engine.Backend, error) {
+	return b, nil
+}
+
+func (b *logCaptureBackend) Start(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
+	b.count.Add(1)
+	return &logCaptureSession{id: b.name + "-session", backend: b}, nil
+}
+
+func (b *logCaptureBackend) Resume(_ context.Context, id string, opts engine.SessionOpts) (engine.Session, error) {
+	return &logCaptureSession{id: id, backend: b}, nil
+}
+
+type logCaptureSession struct {
+	id      string
+	backend *logCaptureBackend
+}
+
+func (s *logCaptureSession) ID() string { return s.id }
+
+func (s *logCaptureSession) Turn(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+	return nil, errors.New("direct turn must not be used")
+}
+
+func (s *logCaptureSession) TurnWithRunner(ctx context.Context, input engine.TurnInput, runner command.Runner) (<-chan engine.Event, error) {
+	if runner == nil {
+		return nil, errors.New("command runner is required")
+	}
+	running, err := runner.Start(ctx, command.ExecSpec{Argv: []string{"/bin/fake-agent"}})
+	if err != nil {
+		return nil, err
+	}
+	s.backend.input <- input
+	if stdin := running.Stdin(); stdin != nil {
+		_ = stdin.Close()
+	}
+	if stdout := running.Stdout(); stdout != nil {
+		go func() { _, _ = io.Copy(io.Discard, stdout) }()
+	}
+	if stderr := running.Stderr(); stderr != nil {
+		go func() { _, _ = io.Copy(io.Discard, stderr) }()
+	}
+	if observer, ok := running.(command.FinalObserver); ok {
+		go func() { _, _ = observer.FinalObservation(context.Background()) }()
+	}
+	content := s.backend.logContent
+	if content == nil {
+		content = map[string]string{
+			input.LogPaths.Stdout: "backend stdout\n",
+			input.LogPaths.Stderr: "backend stderr\n",
+		}
+	}
+	if s.backend.writeAfterTerminal != nil {
+		type delayedLogWriter struct {
+			writer *engine.CappedLogWriter
+			text   string
+		}
+		writers := make([]delayedLogWriter, 0, len(content))
+		for path, text := range content {
+			writer, err := engine.NewCappedLogWriter(path, 0)
+			if err != nil {
+				for _, opened := range writers {
+					_ = opened.writer.Close()
+				}
+				return nil, err
+			}
+			writers = append(writers, delayedLogWriter{writer: writer, text: text})
+		}
+		if s.backend.writersOpened != nil {
+			close(s.backend.writersOpened)
+		}
+		events := make(chan engine.Event, 1)
+		events <- s.backend.terminal
+		go func() {
+			<-s.backend.writeAfterTerminal
+			for _, writer := range writers {
+				_, _ = io.WriteString(writer.writer, writer.text)
+				_ = writer.writer.Close()
+			}
+			close(events)
+		}()
+		return events, nil
+	}
+	for path, text := range content {
+		writer, err := engine.NewCappedLogWriter(path, 0)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := io.WriteString(writer, text); err != nil {
+			_ = writer.Close()
+			return nil, err
+		}
+		if err := writer.Close(); err != nil {
+			return nil, err
+		}
+	}
+	events := make(chan engine.Event, 1)
+	events <- s.backend.terminal
+	close(events)
+	return events, nil
+}
+
+func (*logCaptureSession) Interrupt(context.Context) error { return nil }
+
 type resumedSession struct {
 	ID   string
 	Opts engine.SessionOpts
@@ -198,8 +319,10 @@ func (b *fakeBackend) Resume(_ context.Context, id string, opts engine.SessionOp
 
 type admissionLivenessBackend struct {
 	*fakeBackend
-	eventStream    chan engine.Event
-	runnerObserved chan struct{}
+	eventStream       chan engine.Event
+	runnerObserved    chan struct{}
+	attemptCanceled   chan struct{}
+	attemptCancelOnce sync.Once
 }
 
 func newAdmissionLivenessBackend(name string) *admissionLivenessBackend {
@@ -266,6 +389,12 @@ func (s *admissionLivenessSession) TurnWithRunner(ctx context.Context, input eng
 	}()
 	if s.backend.started != nil {
 		s.backend.started <- struct{}{}
+	}
+	if s.backend.attemptCanceled != nil {
+		go func() {
+			<-ctx.Done()
+			s.backend.attemptCancelOnce.Do(func() { close(s.backend.attemptCanceled) })
+		}()
 	}
 	return s.backend.eventStream, nil
 }
@@ -3529,6 +3658,97 @@ func TestIdentifiedFencedSubmitUsesLaunchControllerAndCompletes(t *testing.T) {
 	}
 }
 
+func TestIdentifiedSubmitReportsAndPersistsResolvedTimeout(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name          string
+		timeout       *int64
+		wantRequested *int64
+		wantEffective int64
+		wantSource    string
+	}{
+		{
+			name:          "explicit client timeout",
+			timeout:       int64Pointer(45_000),
+			wantRequested: int64Pointer(45_000),
+			wantEffective: 45_000,
+			wantSource:    engine.TimeoutSourceClient,
+		},
+		{
+			name:          "omitted daemon default",
+			wantEffective: protocol.DefaultTimeout.Milliseconds(),
+			wantSource:    engine.TimeoutSourceDaemonDefault,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			backend := newFakeBackend("fake")
+			server, _, cwd := newUnstartedTestServer(t, backend)
+			enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+
+			submitted := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+				WorkspaceKey: "workspace-timeout-" + strings.ReplaceAll(tt.name, " ", "-"),
+				RequestID:    "request-timeout-" + strings.ReplaceAll(tt.name, " ", "-"),
+				TaskSpec: protocol.TaskSpec{
+					Backend:   "fake",
+					CWD:       cwd,
+					Write:     false,
+					Prompt:    "report timeout",
+					TimeoutMs: tt.timeout,
+				},
+			})
+			assertTimeoutResolution(t, submitted.Timeout, tt.wantRequested, tt.wantEffective, tt.wantSource)
+
+			record := waitAdmissionSafetyTerminal(t, server, submitted.JobID)
+			assertTimeoutResolution(t, record.Timeout, tt.wantRequested, tt.wantEffective, tt.wantSource)
+
+			status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: submitted.JobID})
+			if len(status.Jobs) != 1 {
+				t.Fatalf("job.status = %+v, want one job", status)
+			}
+			assertTimeoutResolution(t, status.Jobs[0].Timeout, tt.wantRequested, tt.wantEffective, tt.wantSource)
+
+			result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: submitted.JobID})
+			assertTimeoutResolution(t, result.Timeout, tt.wantRequested, tt.wantEffective, tt.wantSource)
+		})
+	}
+}
+
+func TestIdentifiedSubmitRejectsOverflowTimeoutBeforeDurableAccept(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	overflow := int64(9223372036854775807)
+
+	outcome := server.handleJobSubmit(context.Background(), mustMarshal(t, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-overflow-timeout",
+		RequestID:    "request-overflow-timeout",
+		TaskSpec: protocol.TaskSpec{
+			Backend:   "fake",
+			CWD:       cwd,
+			Write:     false,
+			Prompt:    "reject overflow timeout",
+			TimeoutMs: &overflow,
+		},
+	}))
+	if outcome.err == nil {
+		t.Fatalf("submit result = %+v, want timeout rejection", outcome.result)
+	}
+	if outcome.after != nil {
+		t.Fatal("overflow timeout returned a launch hook")
+	}
+	resp := protocol.Response{Error: outcome.err}
+	assertRPCCode(t, resp, protocol.ErrorInvalidTaskSpec)
+	assertRPCAdmissionCause(t, resp, protocol.AdmissionRejectInvalidStrictConfig)
+	if !strings.Contains(outcome.err.Message, "timeoutMs exceeds maximum") {
+		t.Fatalf("rejection message = %q, want maximum timeout error", outcome.err.Message)
+	}
+	assertNoAcceptedJobsInAdmission(t, server)
+	assertNoAuthoritySafetyRecords(t, server)
+	assertNoWorkspaceNamespaceForCWD(t, root, cwd)
+}
+
 func TestIdentifiedSubmitRejectsNoControlledRunnerBeforeBackendStart(t *testing.T) {
 	t.Parallel()
 	backend := newFakeBackend("fake")
@@ -3762,7 +3982,7 @@ func TestIdentifiedFencedJobReadsAuthorityOnlyWithoutJSONFallback(t *testing.T) 
 	if store == nil {
 		t.Fatalf("job store missing for %s", submitted.JobID)
 	}
-	if err := server.createQueuedRecord(store, submitted.JobID, "ses_stale_json", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, submitted.JobID, "ses_stale_json", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	clearAdmissionJobMarkersForTest(t, server)
@@ -3776,7 +3996,7 @@ func TestIdentifiedFencedJobReadsAuthorityOnlyWithoutJSONFallback(t *testing.T) 
 	}
 
 	legacyID := server.nextID("job")
-	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_json", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_json", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	assertJobHandlerError(t, server.handleJobStatus(mustMarshal(t, protocol.JobStatusParams{JobID: legacyID})), protocol.ErrorUnknownJob, "", legacyID)
@@ -5108,7 +5328,7 @@ func TestJobCancelUnknownWhenAuthorityCleanlyDisclaims(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacyID := server.nextID("job")
-	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_cancel_authority_down", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_cancel_authority_down", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, ok, errObj := server.authorityJobProjection(legacyID); ok || errObj != nil {
@@ -5153,7 +5373,7 @@ func TestJobCancelFailsClosedWhenAuthorityDegradedWithStaleJSONDuplicate(t *test
 	if store == nil {
 		t.Fatalf("job store missing for %s", submitted.JobID)
 	}
-	if err := server.createQueuedRecord(store, submitted.JobID, projection.SessionID, "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, submitted.JobID, projection.SessionID, "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	server.removeActiveJob(submitted.JobID)
@@ -5193,7 +5413,7 @@ func TestExactReadsReturnTypedFailStopWithoutJSONFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacyID := server.nextID("job")
-	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_json_authority_down", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, legacyID, "ses_legacy_json_authority_down", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning} {
@@ -5224,7 +5444,7 @@ func TestExactReadsReturnTypedFailStopWithoutJSONFallback(t *testing.T) {
 	if fencedStore == nil {
 		t.Fatalf("job store missing for %s", fenced.JobID)
 	}
-	if err := server.createQueuedRecord(fencedStore, fenced.JobID, "ses_stale_json_authority_down", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(fencedStore, fenced.JobID, "ses_stale_json_authority_down", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := server.admissionReady.FailStop(context.Background(), "test authority degraded"); err != nil {
@@ -6155,9 +6375,105 @@ func TestShutdownCancelsPendingAuthorityWorkBeforeClose(t *testing.T) {
 	if record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Cause != model.CauseCanceledBeforeAuthorization {
 		t.Fatalf("terminal = %+v, want canceled before authorization", record.Terminal)
 	}
+	if record.CancellationOrigin != engine.CancellationOriginDaemonShutdown || record.CancellationReason != "daemon shutdown requested cancellation" {
+		t.Fatalf("shutdown cancellation metadata = (%q, %q), want daemon shutdown", record.CancellationOrigin, record.CancellationReason)
+	}
 	if server.admissionInstance != nil || server.admissionReady != nil || server.admissionCoordinator != nil || server.admissionRuntime != nil || server.admissionRepository != nil {
 		t.Fatalf("admission state after Shutdown: instance=%p ready=%p coord=%p runtime=%p repo=%v",
 			server.admissionInstance, server.admissionReady, server.admissionCoordinator, server.admissionRuntime, server.admissionRepository)
+	}
+}
+
+func TestShutdownSettlesActiveAdmissionDiagnosticsConcurrently(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+	t.Cleanup(func() { _ = server.closeServeAdmission() })
+
+	const jobs = 3
+	type activeShutdownJob struct {
+		accepted authority.AcceptResult
+		command  *recordingRunningCommand
+	}
+	activeJobs := make([]activeShutdownJob, 0, jobs)
+	for i := 0; i < jobs; i++ {
+		accepted := acceptIdentifiedAuthorityWork(t, server, "shutdown-concurrent-"+strconv.Itoa(i))
+		command := &recordingRunningCommand{}
+		active := &activeJob{
+			jobID:             accepted.Record.JobID.String(),
+			admissionCommand:  command,
+			containmentIntent: &launch.ContainmentIntent{},
+		}
+		_, finishSettling := active.beginAdmissionDiagnosticsSettle()
+		t.Cleanup(finishSettling)
+		active.cancel = func() { server.removeActiveJob(active.jobID) }
+		server.addActiveJob(active)
+		server.markAdmissionJob(active.jobID, server.admissionInstance)
+		activeJobs = append(activeJobs, activeShutdownJob{accepted: accepted, command: command})
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*admissionNativeInterruptGrace)
+	defer cancel()
+	started := time.Now()
+	if err := server.shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*admissionNativeInterruptGrace {
+		t.Fatalf("shutdown elapsed = %s, want bounded by a small multiple of one diagnostic grace %s", elapsed, admissionNativeInterruptGrace)
+	}
+	for _, job := range activeJobs {
+		if got := job.command.interrupts.Load(); got != 1 {
+			t.Fatalf("job %s admission interrupt calls = %d, want 1", job.accepted.Record.JobID, got)
+		}
+		record := loadAuthoritySafetyRecordFromRepository(t, repo, job.accepted.Record.JobID.String())
+		if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled {
+			t.Fatalf("job %s terminal = %+v, want canceled", job.accepted.Record.JobID, record.Terminal)
+		}
+	}
+}
+
+func TestShutdownDeadlineDuringAdmissionDiagnosticSettleStillTerminalizes(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+	t.Cleanup(func() { _ = server.closeServeAdmission() })
+
+	accepted := acceptIdentifiedAuthorityWork(t, server, "shutdown-deadline-diagnostic-settle")
+	command := &recordingRunningCommand{}
+	active := &activeJob{
+		jobID:             accepted.Record.JobID.String(),
+		admissionCommand:  command,
+		containmentIntent: &launch.ContainmentIntent{},
+	}
+	_, finishSettling := active.beginAdmissionDiagnosticsSettle()
+	t.Cleanup(finishSettling)
+	active.cancel = func() { server.removeActiveJob(active.jobID) }
+	server.addActiveJob(active)
+	server.markAdmissionJob(active.jobID, server.admissionInstance)
+
+	const shutdownDeadline = 50 * time.Millisecond
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownDeadline)
+	defer cancel()
+	started := time.Now()
+	err := server.shutdown(shutdownCtx)
+	if !errors.Is(err, ErrShutdownDeadlineExceeded) {
+		t.Fatalf("shutdown error = %v, want ErrShutdownDeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > admissionNativeInterruptGrace/2 {
+		t.Fatalf("shutdown elapsed = %s, want prompt return near deadline %s", elapsed, shutdownDeadline)
+	}
+	if got := command.interrupts.Load(); got != 1 {
+		t.Fatalf("admission interrupt calls = %d, want 1", got)
+	}
+	record := loadAuthoritySafetyRecordFromRepository(t, repo, accepted.Record.JobID.String())
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled {
+		t.Fatalf("terminal = %+v, want canceled despite shutdown deadline", record.Terminal)
 	}
 }
 
@@ -7193,6 +7509,182 @@ func TestIdentifiedFencedRetryBindsOrdinalTwoToDistinctLaunch(t *testing.T) {
 	}
 }
 
+func TestCorrectiveRetryReplacesObservedWorkspaceWriteItemCount(t *testing.T) {
+	t.Parallel()
+	var turns atomic.Int64
+	backend := newFakeBackend("fake")
+	backend.events = func(string, bool) []engine.Event {
+		if turns.Add(1) == 1 {
+			return []engine.Event{
+				{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true},
+				{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true},
+				{Type: engine.EventAgentText, Text: `{"status":"bad"}`},
+			}
+		}
+		return []engine.Event{
+			{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true},
+			{Type: engine.EventAgentText, Text: `{"status":"pass"}`},
+		}
+	}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-observed-write-retry",
+		RequestID:    "request-observed-write-retry",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake",
+			CWD:     cwd,
+			Write:   false,
+			Prompt:  "retry observed writes",
+			Policy: &engine.TurnPolicy{
+				Contract: &engine.ContractSpec{JSONSchema: json.RawMessage(`{"type":"object","required":["status"],"properties":{"status":{"const":"pass"}}}`)},
+				Retry:    &engine.RetryPolicy{Max: 1, Template: "Your response missed: {{missing}}."},
+			},
+		},
+	})
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if got := record.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("terminal observed workspace-write count = %d, want retry count 1", got)
+	}
+	if got := record.ObservedWorkspaceWriteItemCountAttemptOrdinal; got != model.LaunchOrdinalTwo {
+		t.Fatalf("terminal observed workspace-write ordinal = %s, want retry ordinal %s", got, model.LaunchOrdinalTwo)
+	}
+	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
+	if got := result.ObservedWorkspaceWriteItemCount; got == nil || *got != 1 {
+		t.Fatalf("job.result observed workspace-write count = %v, want retry count 1", got)
+	}
+}
+
+func TestTimedOutAttemptSettlesBufferedWorkspaceWriteBeforeTerminalCommit(t *testing.T) {
+	t.Parallel()
+	backend := newAdmissionLivenessBackend("fake")
+	backend.eventStream = make(chan engine.Event, 2)
+	backend.attemptCanceled = make(chan struct{})
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	timeout := int64(2_000)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-cancel-buffered-write",
+		RequestID:    "request-cancel-buffered-write",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake", CWD: cwd, Write: true, Prompt: "timeout after buffered write", TimeoutMs: &timeout,
+		},
+	})
+	waitBackendStarted(t, backend.fakeBackend)
+	select {
+	case <-backend.attemptCanceled:
+	case <-time.After(4 * time.Second):
+		t.Fatal("attempt did not time out")
+	}
+	backend.eventStream <- engine.Event{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true}
+	close(backend.eventStream)
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeTimedOut {
+		t.Fatalf("terminal = %+v, want timed out", record.Terminal)
+	}
+	if got := record.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("terminal observed workspace-write count = %d, want 1", got)
+	}
+}
+
+func TestDeferredDrainRecordsLateTransportFrameDropsAfterTerminalCommit(t *testing.T) {
+	t.Parallel()
+	backend := newAdmissionLivenessBackend("fake")
+	backend.eventStream = make(chan engine.Event)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-cancel-late-drops",
+		RequestID:    "request-cancel-late-drops",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "cancel before late frame drops"},
+	})
+	waitBackendStarted(t, backend.fakeBackend)
+
+	cancelParams := mustMarshal(t, protocol.JobCancelParams{JobID: job.JobID})
+	cancelDone := make(chan requestOutcome, 1)
+	go func() {
+		cancelDone <- server.handleJobCancel(cancelParams)
+	}()
+	select {
+	case outcome := <-cancelDone:
+		if outcome.err != nil {
+			t.Fatalf("job.cancel error = %+v", outcome.err)
+		}
+		canceled, ok := outcome.result.(protocol.JobCancelResult)
+		if !ok {
+			t.Fatalf("job.cancel result type = %T", outcome.result)
+		}
+		if canceled.State != engine.StateCanceled {
+			t.Fatalf("job.cancel = %+v, want canceled", canceled)
+		}
+	case <-time.After(admissionNativeInterruptGrace + 2*time.Second):
+		t.Fatal("job.cancel did not return after bounded diagnostic settle")
+	}
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+
+	drops := engine.TransportFrameDrops{Count: 1, Bytes: 1024, RedactedPrefix: "method=turn/completed"}
+	backend.eventStream <- engine.Event{Type: engine.EventWarning, Metadata: drops.EventMetadata()}
+	close(backend.eventStream)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		record := loadAdmissionSafetyRecord(t, server, job.JobID)
+		if record.TransportFrameDrops != nil {
+			if *record.TransportFrameDrops != drops {
+				t.Fatalf("terminal transport frame drops = %#v, want %#v", record.TransportFrameDrops, drops)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("late deferred frame-drop metadata was not recorded")
+}
+
+func TestObservedWorkspaceWriteAttemptSnapshotIsAtomic(t *testing.T) {
+	active := &activeJob{
+		observedWorkspaceWriteItemCount: 7,
+		observedWorkspaceWriteAttempt:   model.LaunchOrdinalOne,
+	}
+	resetReached := make(chan struct{})
+	allowOrdinalStore := make(chan struct{})
+	active.observedWorkspaceWriteAfterCountResetForTest = func() {
+		close(resetReached)
+		<-allowOrdinalStore
+	}
+
+	beginDone := make(chan struct{})
+	go func() {
+		active.beginObservedWorkspaceWriteAttempt(model.LaunchOrdinalTwo)
+		close(beginDone)
+	}()
+	<-resetReached
+
+	type snapshot struct {
+		count   uint64
+		ordinal model.LaunchOrdinal
+	}
+	snapshots := make(chan snapshot, 1)
+	snapshotStarted := make(chan struct{})
+	active.observedWorkspaceWriteBeforeTerminalSnapshotForTest = func() {
+		close(snapshotStarted)
+	}
+	go func() {
+		count, ordinal := active.observedWorkspaceWriteItemCountForTerminal()
+		snapshots <- snapshot{count: count, ordinal: ordinal}
+	}()
+	<-snapshotStarted
+
+	close(allowOrdinalStore)
+	<-beginDone
+	got := <-snapshots
+	if got.count != 0 || got.ordinal != model.LaunchOrdinalTwo {
+		t.Fatalf("snapshot = (%d, %s), want (0, %s)", got.count, got.ordinal, model.LaunchOrdinalTwo)
+	}
+}
+
 func TestRemovedAndUnknownMethodsReturnMethodNotFound(t *testing.T) {
 	t.Parallel()
 	for _, method := range []string{
@@ -7251,6 +7743,345 @@ func TestTerminalErrorEventFailsJob(t *testing.T) {
 	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
 	if result.State != engine.StateFailed || result.Result != nil {
 		t.Fatalf("terminal error result = %+v", result)
+	}
+}
+
+func TestFailedAdmissionJobCapturesAndAdvertisesBackendLogs(t *testing.T) {
+	t.Parallel()
+	backend := newLogCaptureBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-log-capture",
+		RequestID:    "request-log-capture",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "fail"},
+	})
+
+	var input engine.TurnInput
+	select {
+	case input = <-backend.input:
+	case <-time.After(5 * time.Second):
+		t.Fatal("admission backend did not receive a turn input")
+	}
+	if input.LogPaths.Stdout == "" || input.LogPaths.Stderr == "" {
+		t.Fatalf("turn input log paths = %+v, want stdout and stderr paths", input.LogPaths)
+	}
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+	if len(status.Jobs) != 1 || status.Jobs[0].State != engine.StateFailed || status.Jobs[0].LogPaths == nil {
+		t.Fatalf("terminal status = %+v, want failed job with log paths", status)
+	}
+	if got := *status.Jobs[0].LogPaths; got != input.LogPaths {
+		t.Fatalf("advertised log paths = %+v, want %+v", got, input.LogPaths)
+	}
+	for path, want := range map[string]string{input.LogPaths.Stdout: "backend stdout", input.LogPaths.Stderr: "backend stderr"} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read backend log %s: %v", path, err)
+		}
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("backend log %s = %q, want %q", path, content, want)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("backend log %s mode = %o, want 600", path, got)
+		}
+	}
+}
+
+func TestSuccessfulAdmissionJobDoesNotAdvertiseEmptyLogPaths(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-empty-logs",
+		RequestID:    "request-empty-logs",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "succeed"},
+	})
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+	if len(status.Jobs) != 1 || status.Jobs[0].State != engine.StateCompleted {
+		t.Fatalf("terminal status = %+v, want completed job", status)
+	}
+	if status.Jobs[0].LogPaths != nil {
+		t.Fatalf("completed status log paths = %+v, want omitted empty paths", status.Jobs[0].LogPaths)
+	}
+	raw, err := json.Marshal(status.Jobs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fields["logPaths"]; ok {
+		t.Fatalf("completed status JSON = %s, unexpectedly contains logPaths", raw)
+	}
+}
+
+func TestSuccessfulAdmissionJobDiscardsNonemptyBackendLogs(t *testing.T) {
+	t.Parallel()
+	backend := newLogCaptureBackend("fake")
+	backend.terminal = engine.Event{Type: engine.EventAgentText, Text: "done"}
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-successful-log-discard",
+		RequestID:    "request-successful-log-discard",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "succeed"},
+	})
+	input := <-backend.input
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	waitAdmissionLogPairAbsent(t, input.LogPaths)
+	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
+	if len(status.Jobs) != 1 || status.Jobs[0].LogPaths != nil {
+		t.Fatalf("successful terminal status = %+v, want no log paths", status)
+	}
+}
+
+func TestTerminalErrorWaitsForLogWritersBeforeCleanup(t *testing.T) {
+	t.Parallel()
+	backend := newLogCaptureBackend("fake")
+	releaseWriters := make(chan struct{})
+	backend.writeAfterTerminal = releaseWriters
+	backend.writersOpened = make(chan struct{})
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-terminal-log-drain",
+		RequestID:    "request-terminal-log-drain",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "fail"},
+	})
+	input := <-backend.input
+	select {
+	case <-backend.writersOpened:
+	case <-time.After(time.Second):
+		t.Fatal("backend did not open log writers")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if record := loadAdmissionSafetyRecord(t, server, job.JobID); record.Terminal != nil {
+		t.Fatalf("job terminalized before backend log writers finished: %+v", record.Terminal)
+	}
+	close(releaseWriters)
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	for _, path := range []string{input.LogPaths.Stdout, input.LogPaths.Stderr} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read retained backend log %s: %v", path, err)
+		}
+		if !strings.Contains(string(content), "backend") {
+			t.Fatalf("retained backend log %s = %q, want backend content", path, content)
+		}
+	}
+}
+
+func TestAdmissionLogSweepExpiresAndCapsTerminalLogs(t *testing.T) {
+	t.Parallel()
+	backend := newFakeBackend("fake")
+	server, _, _ := newUnstartedTestServer(t, backend)
+	clock := &steppedClock{now: time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)}
+	server.clock = clock
+	server.admissionLogRetentionCap = 20
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	expired := acceptAndFailAuthorityWorkForLogRetention(t, server, "retention-expired", clock.Now())
+	writeAdmissionLogPair(t, server, expired.Record, "expired")
+	clock.Set(clock.Now().Add(engine.DefaultLogTTL + time.Second))
+	old := acceptAndFailAuthorityWorkForLogRetention(t, server, "retention-old", clock.Now())
+	writeAdmissionLogPair(t, server, old.Record, "old")
+	clock.Set(clock.Now().Add(time.Second))
+	newer := acceptAndFailAuthorityWorkForLogRetention(t, server, "retention-new", clock.Now())
+	writeAdmissionLogPair(t, server, newer.Record, "new")
+	active := acceptAuthorityWorkForLogRetention(t, server, "retention-active")
+	writeAdmissionLogPair(t, server, active.Record, "active")
+
+	server.gcInterval = 10 * time.Millisecond
+	sweepCtx, stopSweep := context.WithCancel(context.Background())
+	defer stopSweep()
+	go server.admissionLogSweepLoop(sweepCtx)
+	assertAdmissionLogPairAbsent(t, server, expired.Record)
+	assertAdmissionLogPairAbsent(t, server, old.Record)
+	assertAdmissionLogPairPresent(t, server, newer.Record)
+	assertAdmissionLogPairPresent(t, server, active.Record)
+}
+
+func TestAdmissionTerminalLogSettlementImmediatelyEnforcesRetentionCap(t *testing.T) {
+	t.Parallel()
+	backend := newLogCaptureBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	server.gcInterval = time.Hour
+	// The test backend writes two 15-byte log files per failed turn. Keep one
+	// pair but not two, so only terminal settlement can evict the older pair.
+	server.admissionLogRetentionCap = 31
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+
+	first := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-immediate-log-retention",
+		RequestID:    "request-immediate-log-retention-first",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "first failure"},
+	})
+	firstInput := <-backend.input
+	waitAdmissionSafetyTerminal(t, server, first.JobID)
+	if firstBytes := backendLogBytes(firstInput.LogPaths); firstBytes != 30 {
+		t.Fatalf("first terminal log bytes = %d, want 30", firstBytes)
+	}
+
+	second := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-immediate-log-retention",
+		RequestID:    "request-immediate-log-retention-second",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "second failure"},
+	})
+	secondInput := <-backend.input
+	waitAdmissionSafetyTerminal(t, server, second.JobID)
+	waitAdmissionLogPairAbsent(t, firstInput.LogPaths)
+	for _, path := range []string{secondInput.LogPaths.Stdout, secondInput.LogPaths.Stderr} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("newest terminal log %s stat error = %v, want retained log", path, err)
+		}
+	}
+}
+
+func TestImmediateAdmissionLogRetentionPreservesActiveAndDrainingLogs(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	server.admissionLogRetentionCap = 1
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	terminalAt := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+
+	active := acceptAuthorityWorkForLogRetention(t, server, "immediate-retention-active")
+	writeAdmissionLogPair(t, server, active.Record, "active")
+	server.addActiveJob(&activeJob{jobID: active.Record.JobID.String()})
+	t.Cleanup(func() { server.removeActiveJob(active.Record.JobID.String()) })
+
+	draining := acceptAndFailAuthorityWorkForLogRetention(t, server, "immediate-retention-draining", terminalAt)
+	writeAdmissionLogPair(t, server, draining.Record, "draining")
+	drainDone := make(chan struct{})
+	server.mu.Lock()
+	server.admissionLogDrains[draining.Record.JobID.String()] = drainDone
+	server.mu.Unlock()
+	t.Cleanup(func() {
+		server.finishAdmissionLogDrain(draining.Record.JobID.String(), drainDone)
+		close(drainDone)
+	})
+
+	evictable := acceptAndFailAuthorityWorkForLogRetention(t, server, "immediate-retention-evictable", terminalAt.Add(time.Second))
+	writeAdmissionLogPair(t, server, evictable.Record, "evictable")
+	server.enforceAdmissionLogRetention(active.Record.WorkspaceLayoutKey.String())
+
+	assertAdmissionLogPairPresent(t, server, active.Record)
+	assertAdmissionLogPairPresent(t, server, draining.Record)
+	assertAdmissionLogPairAbsent(t, server, evictable.Record)
+}
+
+func acceptAndFailAuthorityWorkForLogRetention(t *testing.T, server *Server, requestID string, terminalAt time.Time) authority.AcceptResult {
+	t.Helper()
+	accepted := acceptAuthorityWorkForLogRetention(t, server, requestID)
+	if _, err := server.admissionReady.Finalize(context.Background(), accepted.Record.JobID, accepted.Record.Attempt.Ref, model.TerminalIntent{
+		Outcome:             model.OutcomeFailed,
+		Cause:               model.CauseDaemonRestartedBeforeAuthorization,
+		FinalAttemptEndedAt: &terminalAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return accepted
+}
+
+func acceptAuthorityWorkForLogRetention(t *testing.T, server *Server, requestID string) authority.AcceptResult {
+	t.Helper()
+	accepted, err := server.admissionReady.Accept(context.Background(), authority.AcceptRequest{
+		RequestKey: model.RequestKey{
+			WorkspaceKey: model.WorkspaceKey("workspace-log-retention"),
+			RequestID:    model.RequestID(requestID),
+		},
+		WorkspaceLayoutKey: model.WorkspaceKey(strings.Repeat("a", 64)),
+		TaskIdentity:       model.NewSHA256TaskIdentity([]byte(requestID)),
+		Mode:               model.ModeIdentifiedFenced,
+		SessionID:          "session-" + requestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return accepted
+}
+
+func writeAdmissionLogPair(t *testing.T, server *Server, record model.SafetyRecord, text string) {
+	t.Helper()
+	layout, err := authorityResultLayout(server.stateRoot, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{paths.Stdout, paths.Stderr} {
+		writer, err := engine.NewCappedLogWriter(path, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(writer, text); err != nil {
+			_ = writer.Close()
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func assertAdmissionLogPairAbsent(t *testing.T, server *Server, record model.SafetyRecord) {
+	t.Helper()
+	layout, err := authorityResultLayout(server.stateRoot, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitAdmissionLogPairAbsent(t, paths)
+}
+
+func waitAdmissionLogPairAbsent(t *testing.T, paths engine.LogPaths) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		missing := true
+		for _, path := range []string{paths.Stdout, paths.Stderr} {
+			if _, err := os.Stat(path); err == nil {
+				missing = false
+				break
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("backend log %s stat error = %v", path, err)
+			}
+		}
+		if missing {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("backend logs %+v still exist after cleanup", paths)
+}
+
+func assertAdmissionLogPairPresent(t *testing.T, server *Server, record model.SafetyRecord) {
+	t.Helper()
+	layout, err := authorityResultLayout(server.stateRoot, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := engine.LogPathsForLayout(layout, record.JobID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{paths.Stdout, paths.Stderr} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("backend log %s stat error = %v, want retained log", path, err)
+		}
 	}
 }
 
@@ -7462,6 +8293,9 @@ func TestAdmissionActiveCancelCommitsUnresolvedCleanupInsteadOfRPCError(t *testi
 	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
 	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled || record.Terminal.Proof != model.ProofUnresolvedAbsence {
 		t.Fatalf("terminal = %+v, want canceled unresolved absence", record.Terminal)
+	}
+	if record.CancellationOrigin != engine.CancellationOriginClientRequest || record.CancellationReason != "client requested cancellation" {
+		t.Fatalf("admission cancellation metadata = (%q, %q), want client request", record.CancellationOrigin, record.CancellationReason)
 	}
 	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
 	if result.State != engine.StateCanceled || result.CleanupDisposition != model.CleanupDispositionUnresolved.String() {
@@ -7706,7 +8540,7 @@ func TestHeartbeatRacingCompletionDoesNotResurrectTerminalRecord(t *testing.T) {
 	}
 	jobID := server.nextID("job")
 	contract := &engine.ContractSpec{Shape: json.RawMessage(`{"delegateContract":"report-v1"}`)}
-	if err := server.createQueuedRecord(store, jobID, "ses_race", "fake", nil, &engine.TurnPolicy{Contract: contract}, contract, false); err != nil {
+	if err := server.createQueuedRecord(store, jobID, "ses_race", "fake", nil, &engine.TurnPolicy{Contract: contract}, contract, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := server.transitionRecord(store, jobID, engine.StateStarting); err != nil {
@@ -7761,7 +8595,7 @@ func TestFinalizeCompletedSalvagesOrphanedJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobID := server.nextID("job")
-	if err := server.createQueuedRecord(store, jobID, "ses_salvage", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, jobID, "ses_salvage", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning, engine.StateOrphaned} {
@@ -7794,7 +8628,7 @@ func TestFinalizeCompletedSalvagesReapedJobOnlyWithAuthoritativeCompletion(t *te
 		t.Fatal(err)
 	}
 	jobID := server.nextID("job")
-	if err := server.createQueuedRecord(store, jobID, "ses_reaped", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, jobID, "ses_reaped", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning, engine.StateOrphaned} {
@@ -7900,7 +8734,7 @@ func TestHeartbeatDoesNotBlockOnJobLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobID := server.nextID("job")
-	if err := server.createQueuedRecord(store, jobID, "ses_lock", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, jobID, "ses_lock", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	lockPath := filepath.Join(store.Layout().Jobs, jobID+".lock")
@@ -9667,6 +10501,29 @@ func jobResultViaHandler(t *testing.T, server *Server, params protocol.JobResult
 	return result
 }
 
+func int64Pointer(value int64) *int64 {
+	return &value
+}
+
+func assertTimeoutResolution(t *testing.T, got *engine.TimeoutResolution, wantRequested *int64, wantEffective int64, wantSource string) {
+	t.Helper()
+	if got == nil {
+		t.Fatal("timeout resolution is nil")
+	}
+	if got.Effective != wantEffective || got.Source != wantSource {
+		t.Fatalf("timeout resolution = %+v, want effective=%d source=%q", got, wantEffective, wantSource)
+	}
+	if wantRequested == nil {
+		if got.Requested != nil {
+			t.Fatalf("timeout requested = %d, want omitted", *got.Requested)
+		}
+		return
+	}
+	if got.Requested == nil || *got.Requested != *wantRequested {
+		t.Fatalf("timeout requested = %v, want %d", got.Requested, *wantRequested)
+	}
+}
+
 func jobCancelViaHandler(t *testing.T, server *Server, params protocol.JobCancelParams) protocol.JobCancelResult {
 	t.Helper()
 	outcome := server.handleJobCancel(mustMarshal(t, params))
@@ -9831,7 +10688,7 @@ func newControlledBackgroundRun(t *testing.T) (*Server, jobRun, *controlledSessi
 		t.Fatal(err)
 	}
 	jobID := server.nextID("job")
-	if err := server.createQueuedRecord(store, jobID, "ses_controlled", "fake", nil, nil, nil, false); err != nil {
+	if err := server.createQueuedRecord(store, jobID, "ses_controlled", "fake", nil, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := server.transitionRecord(store, jobID, engine.StateStarting); err != nil {
@@ -9872,6 +10729,50 @@ func serveScriptedRequest(t *testing.T, server *Server, method string, params an
 	return conn
 }
 
+func TestConnectionServeAnswersOversizedRequest(t *testing.T) {
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	request := append([]byte(`{"jsonrpc":"2.0","id":"1","method":"job.status","params":{"padding":"`), bytes.Repeat([]byte("x"), 4*1024*1024)...)
+	request = append(request, []byte(`"}}`+"\n")...)
+	conn := &scriptedConn{read: bytes.NewReader(request)}
+	(&connection{server: server, conn: conn, hello: true}).serve(context.Background())
+	response := responseFromScriptedConn(t, conn)
+	if response.Error == nil {
+		t.Fatal("oversized request response error = nil")
+	}
+	if response.Error.Data.Code != protocol.ErrorInvalidTaskSpec || !strings.Contains(response.Error.Message, "exceeded") {
+		t.Fatalf("oversized request response = %+v", response.Error)
+	}
+}
+
+func TestConnectionServeBoundsOversizedRequestErrorWrite(t *testing.T) {
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	request := append([]byte(`{"jsonrpc":"2.0","id":"1","method":"job.status","params":{"padding":"`), bytes.Repeat([]byte("x"), 4*1024*1024)...)
+	request = append(request, []byte(`"}}`+"\n")...)
+	conn := &deadlineBlockingConn{read: bytes.NewReader(request), deadlineSet: make(chan time.Time, 1)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&connection{server: server, conn: conn, hello: true}).serve(context.Background())
+	}()
+
+	select {
+	case deadline := <-conn.deadlineSet:
+		if deadline.IsZero() || time.Until(deadline) > oversizedRequestWriteTimeout+time.Second {
+			t.Fatalf("write deadline = %v, want short non-zero deadline", deadline)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("oversized request response did not set a write deadline")
+	}
+	select {
+	case <-done:
+	case <-time.After(oversizedRequestWriteTimeout + time.Second):
+		t.Fatal("oversized request response write did not return by its deadline")
+	}
+	if !conn.isClosed() {
+		t.Fatal("connection was not closed after the bounded response write")
+	}
+}
+
 func waitControlledSessionStarted(t *testing.T, session *controlledSession) {
 	t.Helper()
 	select {
@@ -9898,6 +10799,73 @@ type scriptedConn struct {
 	writes   bytes.Buffer
 	writeErr error
 	closed   bool
+}
+
+type deadlineBlockingConn struct {
+	read        *bytes.Reader
+	mu          sync.Mutex
+	deadline    time.Time
+	deadlineSet chan time.Time
+	closed      bool
+}
+
+func (c *deadlineBlockingConn) Read(p []byte) (int, error) {
+	return c.read.Read(p)
+}
+
+func (c *deadlineBlockingConn) Write([]byte) (int, error) {
+	c.mu.Lock()
+	deadline := c.deadline
+	c.mu.Unlock()
+	if deadline.IsZero() {
+		return 0, errors.New("write began without a deadline")
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	<-timer.C
+	return 0, os.ErrDeadlineExceeded
+}
+
+func (c *deadlineBlockingConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *deadlineBlockingConn) LocalAddr() net.Addr {
+	return &net.UnixAddr{Name: "deadline-local", Net: "unix"}
+}
+
+func (c *deadlineBlockingConn) RemoteAddr() net.Addr {
+	return &net.UnixAddr{Name: "deadline-remote", Net: "unix"}
+}
+
+func (c *deadlineBlockingConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (c *deadlineBlockingConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *deadlineBlockingConn) SetWriteDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	c.deadline = deadline
+	c.mu.Unlock()
+	if !deadline.IsZero() {
+		select {
+		case c.deadlineSet <- deadline:
+		default:
+		}
+	}
+	return nil
+}
+
+func (c *deadlineBlockingConn) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 func (c *scriptedConn) Read(p []byte) (int, error) {

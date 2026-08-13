@@ -146,6 +146,49 @@ func TestClassifyRepositoryCommitErrorFailsClosed(t *testing.T) {
 	}
 }
 
+func TestFinalizeCanceledWithMetadataDoesNotPartiallyCommit(t *testing.T) {
+	ctx := context.Background()
+	repo := &durabilityFaultingRepository{inner: memory.NewRepository()}
+	ready := newReady(t, repo, "cancel-metadata-atomic")
+	accepted, err := ready.Accept(ctx, acceptRequest(t, "cancel-metadata-atomic"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ready.RequestCancel(ctx, accepted.Record.JobID); err != nil {
+		t.Fatal(err)
+	}
+
+	repo.fault = durabilityFaultPreDBCommit
+	_, err = ready.Finalize(ctx, accepted.Record.JobID, accepted.Record.Attempt.Ref, model.TerminalIntent{
+		Outcome:                         model.OutcomeCanceled,
+		Cause:                           model.CauseCanceledBeforeAuthorization,
+		CancellationOrigin:              engine.CancellationOriginClientRequest,
+		CancellationReason:              "client requested cancellation",
+		ObservedWorkspaceWriteItemCount: 2,
+		ObservedWorkspaceWriteItemCountAttemptOrdinal: model.LaunchOrdinalOne,
+	})
+	if !errors.Is(err, repository.ErrDefinitelyNotCommitted) {
+		t.Fatalf("Finalize error = %v, want ErrDefinitelyNotCommitted", err)
+	}
+
+	image, err := ready.LoadJob(ctx, accepted.Record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image.Safety.State != repository.RecordValid {
+		t.Fatalf("safety state = %s, want valid", image.Safety.State)
+	}
+	if image.Safety.Value.Terminal != nil {
+		t.Fatalf("terminal = %+v, want absent after failed atomic cancellation", image.Safety.Value.Terminal)
+	}
+	if image.Safety.Value.CancellationOrigin != "" || image.Safety.Value.CancellationReason != "" {
+		t.Fatalf("cancellation metadata = (%q, %q), want absent with uncommitted terminal", image.Safety.Value.CancellationOrigin, image.Safety.Value.CancellationReason)
+	}
+	if image.Safety.Value.ObservedWorkspaceWriteItemCount != 0 || image.Safety.Value.ObservedWorkspaceWriteItemCountAttemptOrdinal != 0 {
+		t.Fatalf("workspace-write metadata = (%d, %s), want absent with uncommitted terminal", image.Safety.Value.ObservedWorkspaceWriteItemCount, image.Safety.Value.ObservedWorkspaceWriteItemCountAttemptOrdinal)
+	}
+}
+
 func TestReadyApplySurfacesCommitOutcomeUnknownOnAnchorFailure(t *testing.T) {
 	ctx := context.Background()
 	tests := []struct {

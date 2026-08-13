@@ -81,6 +81,41 @@ func TestProjectedFailureMetadataOnlyForFailureOrInterruptedPublicStates(t *test
 	}
 }
 
+func TestProjectedCancellationMetadataOnlyForCanceledPublicState(t *testing.T) {
+	record := SafetyRecord{
+		CancellationOrigin: engine.CancellationOriginClientRequest,
+		CancellationReason: "client requested cancellation",
+	}
+	for _, public := range AllPublicStates() {
+		gotReason, gotOrigin := projectedCancellationMetadata(record, public)
+		if public == PublicCanceled {
+			if gotReason != record.CancellationReason || gotOrigin != record.CancellationOrigin {
+				t.Fatalf("cancellation metadata for %s = (%q, %q), want (%q, %q)", public, gotReason, gotOrigin, record.CancellationReason, record.CancellationOrigin)
+			}
+			continue
+		}
+		if gotReason != "" || gotOrigin != "" {
+			t.Fatalf("cancellation metadata for %s = (%q, %q), want empty", public, gotReason, gotOrigin)
+		}
+	}
+}
+
+func TestProjectedObservedWorkspaceWriteItemCountOnlyForTerminalPublicState(t *testing.T) {
+	record := SafetyRecord{ObservedWorkspaceWriteItemCount: 0}
+	for _, public := range AllPublicStates() {
+		got := projectedObservedWorkspaceWriteItemCount(record, public)
+		if terminalPublicState(public) {
+			if got == nil || *got != 0 {
+				t.Fatalf("workspace-write count for terminal %s = %v, want present zero", public, got)
+			}
+			continue
+		}
+		if got != nil {
+			t.Fatalf("workspace-write count for non-terminal %s = %v, want absent", public, got)
+		}
+	}
+}
+
 func TestProjectDerivesReadModelFromSafetyRecordOnly(t *testing.T) {
 	record := validSafetyRecord()
 	projection, err := Project(record, ProjectionMetadata{SessionID: "session-1"})

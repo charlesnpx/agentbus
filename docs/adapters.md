@@ -108,6 +108,23 @@ credentials. `AGENTBUS_CODEX_HOME` selects a fixed absolute replacement home
 and `AGENTBUS_CODEX_HOME_INHERIT=1` disables isolation. The opt-out wins over
 the fixed override.
 
+### Backend JSONL frame limit
+
+Backend stdout uses newline-delimited JSON with a default maximum frame size of
+32 MiB. This accommodates normal Codex `fileChange` diffs and command-output
+events while preserving a hard bound. Set `AGENTBUS_BACKEND_JSON_LINE_BYTES` to
+a positive integer byte count to override it. An absent, invalid, zero, or
+negative value uses the 32 MiB default; it never disables the limit.
+
+When a backend frame exceeds the limit, agentbus discards that frame through
+its newline and resumes at the next frame. It retains at most 4 KiB in memory
+only to classify the envelope; it does not persist that payload. The terminal
+record keeps only the discarded-frame count, total bytes, and a short redacted
+`method=` or `type=` summary when the bounded prefix establishes one. Codex
+turn-terminal frames (`turn/completed` and `task_complete`) and unclassified
+or unknown oversized frames fail the turn rather than being skipped, because a
+prefix is evidence of a frame type, not proof that no result was carried.
+
 ### codex effort values
 
 When `SessionOpts.Effort` is provided, the codex adapter includes it in the

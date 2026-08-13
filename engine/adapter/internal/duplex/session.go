@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"runtime"
@@ -303,7 +304,9 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 
 	result, earlyExit := waitForTurnResult(driverDone, active.retirement)
 	result, earlyExit = classifyTurnResult(result, earlyExit)
-
+	if errors.Is(result.err, ErrFrameTooLarge) && !errors.Is(result.err, engine.ErrTransportFrameTooLarge) {
+		result.err = fmt.Errorf("%w: %w", engine.ErrTransportFrameTooLarge, result.err)
+	}
 	_ = active.conn.CloseStdin()
 	drainDone = make(chan struct{})
 	go func() {
@@ -321,13 +324,16 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	// caller's deadline.
 	completedSessionID := s.ID()
 	disposition := captureTurnDisposition(turnCtx)
-	emitCompletionEvents(disposition, events, result.err, earlyExit, observation, stderr, stderrCopyErr)
-
 	if drainDone == nil {
 		active.conn.drainReader()
 	} else {
 		<-drainDone
 	}
+	frameDrops := active.conn.FrameDrops()
+	if !frameDrops.Empty() {
+		events <- warningWithMetadata(frameDropWarning(frameDrops), frameDrops.EventMetadata())
+	}
+	emitCompletionEvents(disposition, events, result.err, earlyExit, observation, stderr, stderrCopyErr)
 	if stdoutLog != nil {
 		_ = stdoutLog.Close()
 	}
@@ -651,6 +657,14 @@ func capEvent(ev engine.Event) engine.Event {
 
 func warning(text string) engine.Event {
 	return engine.Event{Type: engine.EventWarning, Text: text}
+}
+
+func warningWithMetadata(text string, metadata map[string]any) engine.Event {
+	return engine.Event{Type: engine.EventWarning, Text: text, Metadata: metadata}
+}
+
+func frameDropWarning(drops engine.TransportFrameDrops) string {
+	return fmt.Sprintf("discarded %d backend transport frame(s), totaling %d bytes", drops.Count, drops.Bytes)
 }
 
 func terminalError(err error) engine.Event {
