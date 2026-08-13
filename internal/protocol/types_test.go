@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -234,6 +235,33 @@ func TestJobStatusAndResultFinalAttemptTimingFieldsAreAdditive(t *testing.T) {
 	}
 	if _, ok := statusFields["finalAttemptEndedAt"]; ok {
 		t.Fatalf("legacy status JSON = %s, unexpectedly has finalAttemptEndedAt", legacy)
+	}
+}
+
+func TestJobStatusAndResultObservedWorkspaceWriteItemCountAreTerminalOnly(t *testing.T) {
+	zero := uint64(0)
+	for name, value := range map[string]any{
+		"running status":  JobStatus{JobID: "job-1", State: engine.StateRunning},
+		"running result":  JobResult{JobID: "job-1", State: engine.StateRunning},
+		"terminal status": JobStatus{JobID: "job-1", State: engine.StateCanceled, ObservedWorkspaceWriteItemCount: &zero},
+		"terminal result": JobResult{JobID: "job-1", State: engine.StateCanceled, ObservedWorkspaceWriteItemCount: &zero},
+	} {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("%s marshal: %v", name, err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("%s unmarshal: %v", name, err)
+		}
+		_, present := decoded["observedWorkspaceWriteItemCount"]
+		wantPresent := strings.HasPrefix(name, "terminal")
+		if present != wantPresent {
+			t.Fatalf("%s count presence = %t in %s, want %t", name, present, raw, wantPresent)
+		}
+		if wantPresent && decoded["observedWorkspaceWriteItemCount"] != float64(0) {
+			t.Fatalf("%s count = %#v in %s, want 0", name, decoded["observedWorkspaceWriteItemCount"], raw)
+		}
 	}
 }
 

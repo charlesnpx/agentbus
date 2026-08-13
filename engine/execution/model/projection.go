@@ -36,14 +36,12 @@ type JobProjection struct {
 	FailureReason       string                      `json:"failureReason,omitempty"`
 	FailureClass        engine.FailureClass         `json:"failureClass,omitempty"`
 	TransportFrameDrops *engine.TransportFrameDrops `json:"transportFrameDrops,omitempty"`
-	// ObservedWorkspaceWriteItemCount is the number of workspace-write items
-	// reported by the backend while this job ran, not a verified filesystem
-	// state. Zero means no write items
-	// were observed; it does not guarantee the workspace is clean because the
-	// stream may have been truncated or a write may have happened by a route
-	// the backend did not report. A crash before terminalization can also leave
-	// observed writes absent from this count.
-	ObservedWorkspaceWriteItemCount uint64                    `json:"observedWorkspaceWriteItemCount"`
+	// ObservedWorkspaceWriteItemCount is present only for terminal jobs. Its
+	// value is the number of workspace-write items reported by the backend, not
+	// a verified filesystem state. A present zero means none were observed; it
+	// does not guarantee the workspace is clean because the stream may have
+	// been truncated or a write may have happened by an unreported route.
+	ObservedWorkspaceWriteItemCount *uint64                   `json:"observedWorkspaceWriteItemCount,omitempty"`
 	CancellationReason              string                    `json:"cancellationReason,omitempty"`
 	CancellationOrigin              engine.CancellationOrigin `json:"cancellationOrigin,omitempty"`
 }
@@ -96,9 +94,10 @@ func Project(record SafetyRecord, metadata ProjectionMetadata) (JobProjection, e
 // projectedCancellationMetadata are independent suppression rules over the
 // same record: timing is advertised only as a complete pair on a terminal job,
 // failure metadata only for failure or interrupted terminal states, and
-// observed workspace-write activity is advertised only for terminal jobs.
-// Cancellation metadata is advertised only for canceled terminal states. All durable
-// observations are retained either way.
+// observed workspace-write activity is absent for non-terminal jobs and present
+// for terminal jobs, including an honest zero. Cancellation metadata is
+// advertised only for canceled terminal states. All durable observations are
+// retained either way.
 func projectedFinalAttemptTiming(record SafetyRecord, public PublicState) (*time.Time, *time.Time) {
 	if !terminalPublicState(public) || record.FinalAttemptStartedAt == nil || record.FinalAttemptEndedAt == nil {
 		return nil, nil
@@ -125,11 +124,12 @@ func projectedFailureMetadata(record SafetyRecord, public PublicState) (string, 
 	}
 }
 
-func projectedObservedWorkspaceWriteItemCount(record SafetyRecord, public PublicState) uint64 {
+func projectedObservedWorkspaceWriteItemCount(record SafetyRecord, public PublicState) *uint64 {
 	if !terminalPublicState(public) {
-		return 0
+		return nil
 	}
-	return record.ObservedWorkspaceWriteItemCount
+	count := record.ObservedWorkspaceWriteItemCount
+	return &count
 }
 
 // projectedCancellationMetadata exposes durable cancellation metadata only for

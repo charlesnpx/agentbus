@@ -2855,6 +2855,8 @@ func cloneProjection(projection model.JobProjection) model.JobProjection {
 	next.Timeout = engine.CloneTimeoutResolution(projection.Timeout)
 	next.FinalAttemptStartedAt = clonePtr(projection.FinalAttemptStartedAt)
 	next.FinalAttemptEndedAt = clonePtr(projection.FinalAttemptEndedAt)
+	next.TransportFrameDrops = cloneTransportFrameDrops(projection.TransportFrameDrops)
+	next.ObservedWorkspaceWriteItemCount = clonePtr(projection.ObservedWorkspaceWriteItemCount)
 	return next
 }
 
@@ -2877,7 +2879,12 @@ func cloneSafetyRecord(record model.SafetyRecord) model.SafetyRecord {
 	next.Timeout = engine.CloneTimeoutResolution(record.Timeout)
 	next.FinalAttemptStartedAt = clonePtr(record.FinalAttemptStartedAt)
 	next.FinalAttemptEndedAt = clonePtr(record.FinalAttemptEndedAt)
+	next.TransportFrameDrops = cloneTransportFrameDrops(record.TransportFrameDrops)
 	return next
+}
+
+func cloneTransportFrameDrops(drops *engine.TransportFrameDrops) *engine.TransportFrameDrops {
+	return clonePtr(drops)
 }
 
 func cloneOutcomeFact(fact *model.OutcomeFact) *model.OutcomeFact {

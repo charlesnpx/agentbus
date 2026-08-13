@@ -2811,6 +2811,14 @@ func cloneTime(value *time.Time) *time.Time {
 	return &copied
 }
 
+func cloneUint64(value *uint64) *uint64 {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
+
 // authorityFailureMetadata exposes failure metadata only for failure or
 // interrupted terminal states.
 func authorityFailureMetadata(projection model.JobProjection) (string, engine.FailureClass) {
@@ -2852,7 +2860,7 @@ func (s *Server) authorityStatus(jobID string) (protocol.JobStatus, bool, *proto
 		FailureReason:                   failureReason,
 		FailureClass:                    failureClass,
 		TransportFrameDrops:             cloneTransportFrameDrops(projection.TransportFrameDrops),
-		ObservedWorkspaceWriteItemCount: projection.ObservedWorkspaceWriteItemCount,
+		ObservedWorkspaceWriteItemCount: cloneUint64(projection.ObservedWorkspaceWriteItemCount),
 		CancellationReason:              cancellationReason,
 		CancellationOrigin:              cancellationOrigin,
 	}
@@ -2948,7 +2956,7 @@ func (s *Server) authorityResult(jobID string) (protocol.JobResult, bool, *proto
 		FailureReason:                   failureReason,
 		FailureClass:                    failureClass,
 		TransportFrameDrops:             cloneTransportFrameDrops(projection.TransportFrameDrops),
-		ObservedWorkspaceWriteItemCount: projection.ObservedWorkspaceWriteItemCount,
+		ObservedWorkspaceWriteItemCount: cloneUint64(projection.ObservedWorkspaceWriteItemCount),
 		CancellationReason:              cancellationReason,
 		CancellationOrigin:              cancellationOrigin,
 	}, true, nil
@@ -3021,7 +3029,7 @@ func authorityStatusFromImage(image repository.JobImage) (protocol.JobStatus, bo
 		FailureReason:                   failureReason,
 		FailureClass:                    failureClass,
 		TransportFrameDrops:             cloneTransportFrameDrops(projection.TransportFrameDrops),
-		ObservedWorkspaceWriteItemCount: projection.ObservedWorkspaceWriteItemCount,
+		ObservedWorkspaceWriteItemCount: cloneUint64(projection.ObservedWorkspaceWriteItemCount),
 		CancellationReason:              cancellationReason,
 		CancellationOrigin:              cancellationOrigin,
 	}, true, nil

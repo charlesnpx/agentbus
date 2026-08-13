@@ -319,8 +319,10 @@ func (b *fakeBackend) Resume(_ context.Context, id string, opts engine.SessionOp
 
 type admissionLivenessBackend struct {
 	*fakeBackend
-	eventStream    chan engine.Event
-	runnerObserved chan struct{}
+	eventStream       chan engine.Event
+	runnerObserved    chan struct{}
+	attemptCanceled   chan struct{}
+	attemptCancelOnce sync.Once
 }
 
 func newAdmissionLivenessBackend(name string) *admissionLivenessBackend {
@@ -387,6 +389,12 @@ func (s *admissionLivenessSession) TurnWithRunner(ctx context.Context, input eng
 	}()
 	if s.backend.started != nil {
 		s.backend.started <- struct{}{}
+	}
+	if s.backend.attemptCanceled != nil {
+		go func() {
+			<-ctx.Done()
+			s.backend.attemptCancelOnce.Do(func() { close(s.backend.attemptCanceled) })
+		}()
 	}
 	return s.backend.eventStream, nil
 }
@@ -6376,6 +6384,99 @@ func TestShutdownCancelsPendingAuthorityWorkBeforeClose(t *testing.T) {
 	}
 }
 
+func TestShutdownSettlesActiveAdmissionDiagnosticsConcurrently(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+	t.Cleanup(func() { _ = server.closeServeAdmission() })
+
+	const jobs = 3
+	type activeShutdownJob struct {
+		accepted authority.AcceptResult
+		command  *recordingRunningCommand
+	}
+	activeJobs := make([]activeShutdownJob, 0, jobs)
+	for i := 0; i < jobs; i++ {
+		accepted := acceptIdentifiedAuthorityWork(t, server, "shutdown-concurrent-"+strconv.Itoa(i))
+		command := &recordingRunningCommand{}
+		active := &activeJob{
+			jobID:             accepted.Record.JobID.String(),
+			admissionCommand:  command,
+			containmentIntent: &launch.ContainmentIntent{},
+		}
+		_, finishSettling := active.beginAdmissionDiagnosticsSettle()
+		t.Cleanup(finishSettling)
+		active.cancel = func() { server.removeActiveJob(active.jobID) }
+		server.addActiveJob(active)
+		server.markAdmissionJob(active.jobID, server.admissionInstance)
+		activeJobs = append(activeJobs, activeShutdownJob{accepted: accepted, command: command})
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*admissionNativeInterruptGrace)
+	defer cancel()
+	started := time.Now()
+	if err := server.shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*admissionNativeInterruptGrace {
+		t.Fatalf("shutdown elapsed = %s, want bounded by a small multiple of one diagnostic grace %s", elapsed, admissionNativeInterruptGrace)
+	}
+	for _, job := range activeJobs {
+		if got := job.command.interrupts.Load(); got != 1 {
+			t.Fatalf("job %s admission interrupt calls = %d, want 1", job.accepted.Record.JobID, got)
+		}
+		record := loadAuthoritySafetyRecordFromRepository(t, repo, job.accepted.Record.JobID.String())
+		if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled {
+			t.Fatalf("job %s terminal = %+v, want canceled", job.accepted.Record.JobID, record.Terminal)
+		}
+	}
+}
+
+func TestShutdownDeadlineDuringAdmissionDiagnosticSettleStillTerminalizes(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+	t.Cleanup(func() { _ = server.closeServeAdmission() })
+
+	accepted := acceptIdentifiedAuthorityWork(t, server, "shutdown-deadline-diagnostic-settle")
+	command := &recordingRunningCommand{}
+	active := &activeJob{
+		jobID:             accepted.Record.JobID.String(),
+		admissionCommand:  command,
+		containmentIntent: &launch.ContainmentIntent{},
+	}
+	_, finishSettling := active.beginAdmissionDiagnosticsSettle()
+	t.Cleanup(finishSettling)
+	active.cancel = func() { server.removeActiveJob(active.jobID) }
+	server.addActiveJob(active)
+	server.markAdmissionJob(active.jobID, server.admissionInstance)
+
+	const shutdownDeadline = 50 * time.Millisecond
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownDeadline)
+	defer cancel()
+	started := time.Now()
+	err := server.shutdown(shutdownCtx)
+	if !errors.Is(err, ErrShutdownDeadlineExceeded) {
+		t.Fatalf("shutdown error = %v, want ErrShutdownDeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > admissionNativeInterruptGrace/2 {
+		t.Fatalf("shutdown elapsed = %s, want prompt return near deadline %s", elapsed, shutdownDeadline)
+	}
+	if got := command.interrupts.Load(); got != 1 {
+		t.Fatalf("admission interrupt calls = %d, want 1", got)
+	}
+	record := loadAuthoritySafetyRecordFromRepository(t, repo, accepted.Record.JobID.String())
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled {
+		t.Fatalf("terminal = %+v, want canceled despite shutdown deadline", record.Terminal)
+	}
+}
+
 func TestShutdownDeadlineExceededLeavesForcedRecoveryPath(t *testing.T) {
 	t.Parallel()
 	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
@@ -7450,9 +7551,96 @@ func TestCorrectiveRetryReplacesObservedWorkspaceWriteItemCount(t *testing.T) {
 		t.Fatalf("terminal observed workspace-write ordinal = %s, want retry ordinal %s", got, model.LaunchOrdinalTwo)
 	}
 	result := jobResultViaHandler(t, server, protocol.JobResultParams{JobID: job.JobID})
-	if got := result.ObservedWorkspaceWriteItemCount; got != 1 {
-		t.Fatalf("job.result observed workspace-write count = %d, want retry count 1", got)
+	if got := result.ObservedWorkspaceWriteItemCount; got == nil || *got != 1 {
+		t.Fatalf("job.result observed workspace-write count = %v, want retry count 1", got)
 	}
+}
+
+func TestTimedOutAttemptSettlesBufferedWorkspaceWriteBeforeTerminalCommit(t *testing.T) {
+	t.Parallel()
+	backend := newAdmissionLivenessBackend("fake")
+	backend.eventStream = make(chan engine.Event, 2)
+	backend.attemptCanceled = make(chan struct{})
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+	timeout := int64(2_000)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-cancel-buffered-write",
+		RequestID:    "request-cancel-buffered-write",
+		TaskSpec: protocol.TaskSpec{
+			Backend: "fake", CWD: cwd, Write: true, Prompt: "timeout after buffered write", TimeoutMs: &timeout,
+		},
+	})
+	waitBackendStarted(t, backend.fakeBackend)
+	select {
+	case <-backend.attemptCanceled:
+	case <-time.After(4 * time.Second):
+		t.Fatal("attempt did not time out")
+	}
+	backend.eventStream <- engine.Event{Type: engine.EventToolUse, ObservedWorkspaceWriteItem: true}
+	close(backend.eventStream)
+	record := waitAdmissionSafetyTerminal(t, server, job.JobID)
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeTimedOut {
+		t.Fatalf("terminal = %+v, want timed out", record.Terminal)
+	}
+	if got := record.ObservedWorkspaceWriteItemCount; got != 1 {
+		t.Fatalf("terminal observed workspace-write count = %d, want 1", got)
+	}
+}
+
+func TestDeferredDrainRecordsLateTransportFrameDropsAfterTerminalCommit(t *testing.T) {
+	t.Parallel()
+	backend := newAdmissionLivenessBackend("fake")
+	backend.eventStream = make(chan engine.Event)
+	server, _, cwd := newUnstartedTestServer(t, backend)
+	enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-cancel-late-drops",
+		RequestID:    "request-cancel-late-drops",
+		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "cancel before late frame drops"},
+	})
+	waitBackendStarted(t, backend.fakeBackend)
+
+	cancelParams := mustMarshal(t, protocol.JobCancelParams{JobID: job.JobID})
+	cancelDone := make(chan requestOutcome, 1)
+	go func() {
+		cancelDone <- server.handleJobCancel(cancelParams)
+	}()
+	select {
+	case outcome := <-cancelDone:
+		if outcome.err != nil {
+			t.Fatalf("job.cancel error = %+v", outcome.err)
+		}
+		canceled, ok := outcome.result.(protocol.JobCancelResult)
+		if !ok {
+			t.Fatalf("job.cancel result type = %T", outcome.result)
+		}
+		if canceled.State != engine.StateCanceled {
+			t.Fatalf("job.cancel = %+v, want canceled", canceled)
+		}
+	case <-time.After(admissionNativeInterruptGrace + 2*time.Second):
+		t.Fatal("job.cancel did not return after bounded diagnostic settle")
+	}
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+
+	drops := engine.TransportFrameDrops{Count: 1, Bytes: 1024, RedactedPrefix: "method=turn/completed"}
+	backend.eventStream <- engine.Event{Type: engine.EventWarning, Metadata: drops.EventMetadata()}
+	close(backend.eventStream)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		record := loadAdmissionSafetyRecord(t, server, job.JobID)
+		if record.TransportFrameDrops != nil {
+			if *record.TransportFrameDrops != drops {
+				t.Fatalf("terminal transport frame drops = %#v, want %#v", record.TransportFrameDrops, drops)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("late deferred frame-drop metadata was not recorded")
 }
 
 func TestObservedWorkspaceWriteAttemptSnapshotIsAtomic(t *testing.T) {

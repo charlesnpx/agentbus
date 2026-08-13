@@ -326,6 +326,9 @@ type activeJob struct {
 	containmentIntent               *launch.ContainmentIntent
 	observedWorkspaceWriteItemCount uint64
 	observedWorkspaceWriteAttempt   model.LaunchOrdinal
+	diagnosticsSettleRequest        chan struct{}
+	diagnosticsSettled              chan struct{}
+	diagnosticsSettleRequested      bool
 	// These hooks only coordinate deterministic activeJob tests around the pair's
 	// synchronization boundary. The reset hook runs while mu is held; the
 	// snapshot hook runs immediately before it is acquired.
@@ -416,6 +419,61 @@ func activeObservedWorkspaceWriteItemCount(job *activeJob) (uint64, model.Launch
 		return 0, 0
 	}
 	return job.observedWorkspaceWriteItemCountForTerminal()
+}
+
+// beginAdmissionDiagnosticsSettle makes this attempt available to terminal
+// paths that need its buffered diagnostics before committing an absorbing
+// terminal record. The caller must invoke finish once it will no longer read
+// the stream.
+func (j *activeJob) beginAdmissionDiagnosticsSettle() (<-chan struct{}, func()) {
+	if j == nil {
+		return nil, func() {}
+	}
+	j.mu.Lock()
+	request := make(chan struct{})
+	settled := make(chan struct{})
+	j.diagnosticsSettleRequest = request
+	j.diagnosticsSettled = settled
+	j.diagnosticsSettleRequested = false
+	j.mu.Unlock()
+	return request, func() {
+		j.mu.Lock()
+		if j.diagnosticsSettled == settled {
+			close(settled)
+		}
+		j.mu.Unlock()
+	}
+}
+
+// settleAdmissionDiagnostics asks the active attempt to drain buffered
+// diagnostics before terminalization. A backend that continues streaming past
+// the grace interval, or past the caller's shutdown deadline, is intentionally
+// left to the deferred drain.
+func (j *activeJob) settleAdmissionDiagnostics(ctx context.Context, bound time.Duration) {
+	if j == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	j.mu.Lock()
+	request := j.diagnosticsSettleRequest
+	settled := j.diagnosticsSettled
+	if request != nil && !j.diagnosticsSettleRequested {
+		close(request)
+		j.diagnosticsSettleRequested = true
+	}
+	j.mu.Unlock()
+	if settled == nil {
+		return
+	}
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-settled:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
 }
 
 func (j *activeJob) recordAdmissionCommand(cmd command.RunningCommand) bool {
@@ -1078,27 +1136,83 @@ func (lifecycle serveLifecycleSnapshot) forceStopServe() {
 }
 
 func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context, admission *serveAdmissionSnapshot) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	coord, jobIDs, err := s.shutdownAdmissionJobs(ctx, admission)
 	if err != nil || coord == nil {
 		return err
 	}
+	type shutdownAdmissionJob struct {
+		id       model.JobID
+		prepared chan error
+		finalize chan context.Context
+		done     chan error
+	}
+	jobs := make([]shutdownAdmissionJob, 0, len(jobIDs))
 	for _, jobID := range jobIDs {
-		if err := ctx.Err(); err != nil {
+		job := shutdownAdmissionJob{
+			id:       jobID,
+			prepared: make(chan error, 1),
+			finalize: make(chan context.Context),
+			done:     make(chan error, 1),
+		}
+		jobs = append(jobs, job)
+	}
+	for i := range jobs {
+		job := &jobs[i]
+		go func() {
+			err := s.withAdmissionJobEffectErr(job.id.String(), func() error {
+				if err := s.requestActiveJobShutdownCancel(ctx, job.id.String()); err != nil {
+					job.prepared <- err
+					return err
+				}
+				// Retain the per-job effect lock while the coordinator commit is
+				// queued. This preserves the existing client-cancel and runner
+				// serialization while every job's bounded diagnostic settle runs
+				// concurrently.
+				job.prepared <- nil
+				finalizeCtx, ok := <-job.finalize
+				if !ok {
+					return nil
+				}
+				count, ordinal := activeObservedWorkspaceWriteItemCount(s.lookupActiveJob(job.id.String()))
+				if err := coord.CancelWithMetadataAndObservedWorkspaceWriteItemCount(finalizeCtx, job.id, engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation", count, ordinal, nil); err != nil {
+					return err
+				}
+				s.abandonAdmissionUnresolvedCustody(finalizeCtx, coord, job.id)
+				return nil
+			})
+			job.done <- err
+		}()
+	}
+	for i := range jobs {
+		if err := <-jobs[i].prepared; err != nil {
+			for j := range jobs {
+				close(jobs[j].finalize)
+			}
+			for j := range jobs {
+				<-jobs[j].done
+			}
 			return err
 		}
-		id := jobID
-		err := s.withAdmissionJobEffectErr(id.String(), func() error {
-			count, ordinal := activeObservedWorkspaceWriteItemCount(s.lookupActiveJob(id.String()))
-			if err := s.requestActiveJobShutdownCancel(ctx, id.String()); err != nil {
-				return err
+	}
+
+	// Commit the accepted work with whatever diagnostics settled before its
+	// individual wait ended. A caller deadline may expire while the settles or
+	// earlier serialized commits run; it must not turn a later terminal commit
+	// into a no-op. shutdownLifecycle observes that deadline immediately after
+	// this phase.
+	finalizeCtx := context.WithoutCancel(ctx)
+	for i := range jobs {
+		jobs[i].finalize <- finalizeCtx
+		if err := <-jobs[i].done; err != nil {
+			for j := i + 1; j < len(jobs); j++ {
+				close(jobs[j].finalize)
 			}
-			if err := coord.CancelWithMetadataAndObservedWorkspaceWriteItemCount(ctx, id, engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation", count, ordinal, nil); err != nil {
-				return err
+			for j := i + 1; j < len(jobs); j++ {
+				<-jobs[j].done
 			}
-			s.abandonAdmissionUnresolvedCustody(ctx, coord, id)
-			return nil
-		})
-		if err != nil {
 			return err
 		}
 	}
@@ -1165,6 +1279,7 @@ func (s *Server) requestActiveJobShutdownCancel(ctx context.Context, jobID strin
 			}
 		}
 	}
+	active.settleAdmissionDiagnostics(ctx, admissionNativeInterruptGrace)
 	if active.cancel != nil {
 		active.cancel()
 	}
@@ -2341,6 +2456,12 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 
 func (s *Server) handleAuthorityJobCancelLocked(jobID string) requestOutcome {
 	active := s.lookupActiveJob(jobID)
+	// Keep the client-cancel snapshot and RequestCancel ordering together. The
+	// runner may be between release and registration, or may itself be entering
+	// cancel recovery; waiting for its diagnostic drain here lets both paths
+	// pass the pre-terminal check and submit the same terminal intent. Runner
+	// interruption and shutdown terminalization perform the bounded settle and
+	// take their snapshot after it instead.
 	count, ordinal := activeObservedWorkspaceWriteItemCount(active)
 	if active != nil {
 		active.requestTerminal(engine.StateCanceled, terminalCancellationFor(engine.CancellationOriginClientRequest, "client requested cancellation"))
@@ -2588,10 +2709,13 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			return "", engine.StateFailed, classifyFailureError(terminalFailureBackendNotStarted, err)
 		}
 	}
+	settleRequested, finishSettling := run.active.beginAdmissionDiagnosticsSettle()
 	events, err := s.admissionTurnEvents(attemptCtx, run, input, ordinal)
 	if err != nil {
+		finishSettling()
 		return "", engine.StateFailed, err
 	}
+	defer finishSettling()
 	var assistantText strings.Builder
 	var resultText string
 	hasResultMessage := false
@@ -2599,12 +2723,21 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 	var terminalErr error
 	for {
 		select {
+		case <-settleRequested:
+			s.settleAdmissionEventDrain(run, events)
+			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateCanceled, context.Canceled
+		default:
+		}
+		select {
 		case <-attemptCtx.Done():
 			if shouldInterruptSessionOnAttemptCancel(run, attemptCtx.Err()) {
 				_ = run.session.Interrupt(context.Background())
 			}
-			s.deferAdmissionEventDrain(run, events)
+			s.settleAdmissionEventDrain(run, events)
 			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), stateForContext(attemptCtx.Err()), attemptCtx.Err()
+		case <-settleRequested:
+			s.settleAdmissionEventDrain(run, events)
+			return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateCanceled, context.Canceled
 		case event, ok := <-events:
 			if !ok {
 				if terminalErr != nil {
@@ -2618,13 +2751,8 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 			if run.admissionControlled {
 				s.recordJobLivenessEvent(run.jobID)
 			}
-			if drops, ok := engine.TransportFrameDropsFromMetadata(event.Metadata); ok {
-				if err := s.recordTransportFrameDrops(run, drops); err != nil {
-					return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, classifyFailureError(terminalFailureInternal, err)
-				}
-			}
-			if event.ObservedWorkspaceWriteItem {
-				run.active.observeWorkspaceWriteItem()
+			if err := s.recordAdmissionEventDiagnostics(run, event); err != nil {
+				return attemptFinalText(hasResultMessage, resultText, assistantText.String()), engine.StateFailed, classifyFailureError(terminalFailureInternal, err)
 			}
 			rawText := authoritativeText(event)
 			switch event.Type {
@@ -2650,6 +2778,48 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 				terminalErr = classifyFailureError(terminalFailureBackendRan, cause)
 			case engine.EventTurnFinal:
 			}
+		}
+	}
+}
+
+func (s *Server) recordAdmissionEventDiagnostics(run jobRun, event engine.Event) error {
+	if event.ObservedWorkspaceWriteItem {
+		run.active.observeWorkspaceWriteItem()
+	}
+	if drops, ok := engine.TransportFrameDropsFromMetadata(event.Metadata); ok {
+		return s.recordTransportFrameDrops(run, drops)
+	}
+	return nil
+}
+
+// settleAdmissionEventDrain consumes diagnostics until the backend stream
+// closes or the native interrupt grace expires. Workspace-write events after
+// that boundary cannot be merged into a terminal record; the deferred drain
+// still preserves transport-drop diagnostics, which support post-terminal
+// recording.
+func (s *Server) settleAdmissionEventDrain(run jobRun, events <-chan engine.Event) {
+	if !run.admissionControlled || events == nil {
+		return
+	}
+	deadline := time.Now().Add(admissionNativeInterruptGrace)
+	for {
+		if !time.Now().Before(deadline) {
+			s.deferAdmissionEventDrain(run, events)
+			return
+		}
+		timer := time.NewTimer(time.Until(deadline))
+		select {
+		case event, ok := <-events:
+			timer.Stop()
+			if !ok {
+				return
+			}
+			if err := s.recordAdmissionEventDiagnostics(run, event); err != nil {
+				log.Printf("agentbus daemon: job %s terminal diagnostic settle warning: %v", run.jobID, err)
+			}
+		case <-timer.C:
+			s.deferAdmissionEventDrain(run, events)
+			return
 		}
 	}
 }
@@ -2689,9 +2859,9 @@ func (s *Server) recordTransportFrameDrops(run jobRun, drops engine.TransportFra
 	return err
 }
 
-// deferAdmissionEventDrain waits for an adapter stream that outlives an
-// interrupted attempt. Deferred backend-log cleanup observes its completion
-// before inspecting the corresponding files.
+// deferAdmissionEventDrain waits for an adapter stream that outlives the
+// bounded terminal diagnostic settle. Deferred backend-log cleanup observes
+// its completion before inspecting the corresponding files.
 func (s *Server) deferAdmissionEventDrain(run jobRun, events <-chan engine.Event) {
 	if !run.admissionControlled || run.jobID == "" || events == nil {
 		return
@@ -2709,8 +2879,10 @@ func (s *Server) deferAdmissionEventDrain(run jobRun, events <-chan engine.Event
 	s.mu.Unlock()
 	go func() {
 		for event := range events {
-			if event.ObservedWorkspaceWriteItem {
-				run.active.observeWorkspaceWriteItem()
+			if drops, ok := engine.TransportFrameDropsFromMetadata(event.Metadata); ok {
+				if err := s.recordTransportFrameDrops(run, drops); err != nil {
+					log.Printf("agentbus daemon: job %s deferred transport frame-drop recording warning: %v", run.jobID, err)
+				}
 			}
 		}
 		close(done)
