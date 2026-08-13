@@ -6512,6 +6512,25 @@ func (c blockingCloser) Close() error {
 	return nil
 }
 
+type rootCheckingCloser struct {
+	inner              io.Closer
+	root               string
+	rootExistedAtClose bool
+}
+
+func (c *rootCheckingCloser) Close() error {
+	if c == nil {
+		return nil
+	}
+	if _, err := os.Stat(c.root); err == nil {
+		c.rootExistedAtClose = true
+	}
+	if c.inner == nil {
+		return nil
+	}
+	return c.inner.Close()
+}
+
 type notifyCloser struct {
 	once   sync.Once
 	closed chan struct{}
@@ -7757,12 +7776,7 @@ func TestFailedAdmissionJobCapturesAndAdvertisesBackendLogs(t *testing.T) {
 		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "fail"},
 	})
 
-	var input engine.TurnInput
-	select {
-	case input = <-backend.input:
-	case <-time.After(5 * time.Second):
-		t.Fatal("admission backend did not receive a turn input")
-	}
+	input := waitLogCaptureInput(t, backend)
 	if input.LogPaths.Stdout == "" || input.LogPaths.Stderr == "" {
 		t.Fatalf("turn input log paths = %+v, want stdout and stderr paths", input.LogPaths)
 	}
@@ -7834,7 +7848,7 @@ func TestSuccessfulAdmissionJobDiscardsNonemptyBackendLogs(t *testing.T) {
 		RequestID:    "request-successful-log-discard",
 		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "succeed"},
 	})
-	input := <-backend.input
+	input := waitLogCaptureInput(t, backend)
 	waitAdmissionSafetyTerminal(t, server, job.JobID)
 	waitAdmissionLogPairAbsent(t, input.LogPaths)
 	status := jobStatusViaHandler(t, server, protocol.JobStatusParams{JobID: job.JobID})
@@ -7856,7 +7870,7 @@ func TestTerminalErrorWaitsForLogWritersBeforeCleanup(t *testing.T) {
 		RequestID:    "request-terminal-log-drain",
 		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "fail"},
 	})
-	input := <-backend.input
+	input := waitLogCaptureInput(t, backend)
 	select {
 	case <-backend.writersOpened:
 	case <-time.After(time.Second):
@@ -7925,7 +7939,7 @@ func TestAdmissionTerminalLogSettlementImmediatelyEnforcesRetentionCap(t *testin
 		RequestID:    "request-immediate-log-retention-first",
 		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "first failure"},
 	})
-	firstInput := <-backend.input
+	firstInput := waitLogCaptureInput(t, backend)
 	waitAdmissionSafetyTerminal(t, server, first.JobID)
 	if firstBytes := backendLogBytes(firstInput.LogPaths); firstBytes != 30 {
 		t.Fatalf("first terminal log bytes = %d, want 30", firstBytes)
@@ -7936,13 +7950,31 @@ func TestAdmissionTerminalLogSettlementImmediatelyEnforcesRetentionCap(t *testin
 		RequestID:    "request-immediate-log-retention-second",
 		TaskSpec:     protocol.TaskSpec{Backend: "fake", CWD: cwd, Write: false, Prompt: "second failure"},
 	})
-	secondInput := <-backend.input
+	secondInput := waitLogCaptureInput(t, backend)
 	waitAdmissionSafetyTerminal(t, server, second.JobID)
 	waitAdmissionLogPairAbsent(t, firstInput.LogPaths)
 	for _, path := range []string{secondInput.LogPaths.Stdout, secondInput.LogPaths.Stderr} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("newest terminal log %s stat error = %v, want retained log", path, err)
 		}
+	}
+}
+
+func TestUnstartedTestServerClosesAdmissionBeforeTemporaryRootCleanup(t *testing.T) {
+	var closer *rootCheckingCloser
+	var root string
+	t.Run("fixture", func(t *testing.T) {
+		server, serverRoot, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+		root = serverRoot
+		enableTestAdmission(t, server, newAdmissionFakeLaunchCustodian(t))
+		closer = &rootCheckingCloser{inner: server.admissionClose, root: root}
+		server.admissionClose = closer
+	})
+	if closer == nil || !closer.rootExistedAtClose {
+		t.Fatal("test admission repository closed after its temporary root was removed")
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary root after fixture cleanup = %v, want removed", err)
 	}
 }
 
@@ -9632,6 +9664,23 @@ func newUnstartedTestServer(t *testing.T, backend engine.Backend) (*Server, stri
 	if err != nil {
 		t.Fatal(err)
 	}
+	// shortTempDir's cleanup removes the backing state root. Keep the server's
+	// admission repository and file anchor alive until its asynchronous work has
+	// been detached from them, then close the admission resources before that
+	// cleanup runs. This is registered after both temporary-directory cleanups,
+	// so t.Cleanup's LIFO order makes the lifetime explicit for every unstarted
+	// server fixture that bootstraps admission.
+	t.Cleanup(func() {
+		server.admissionStateMu.RLock()
+		bootstrapped := server.admissionInstance != nil
+		server.admissionStateMu.RUnlock()
+		if !bootstrapped {
+			return
+		}
+		if err := server.closeServeAdmission(); err != nil {
+			t.Errorf("close test admission before temporary-root cleanup: %v", err)
+		}
+	})
 	return server, root, cwd
 }
 
@@ -10315,6 +10364,20 @@ func waitAdmissionSafetyTerminal(t *testing.T, server *Server, jobID string) mod
 	}
 	t.Fatalf("admission safety record %s did not reach terminal state; last = %+v", jobID, last)
 	return model.SafetyRecord{}
+}
+
+func waitLogCaptureInput(t *testing.T, backend *logCaptureBackend) engine.TurnInput {
+	t.Helper()
+	if backend == nil {
+		t.Fatal("log-capture backend is nil")
+	}
+	select {
+	case input := <-backend.input:
+		return input
+	case <-time.After(5 * time.Second):
+		t.Fatal("admission backend did not receive a turn input")
+		return engine.TurnInput{}
+	}
 }
 
 func waitBackendRunnerStartPathDone(t *testing.T, backend *fakeBackend) {
