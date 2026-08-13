@@ -447,10 +447,14 @@ func (j *activeJob) beginAdmissionDiagnosticsSettle() (<-chan struct{}, func()) 
 
 // settleAdmissionDiagnostics asks the active attempt to drain buffered
 // diagnostics before terminalization. A backend that continues streaming past
-// the grace interval is intentionally left to the deferred drain.
-func (j *activeJob) settleAdmissionDiagnostics(bound time.Duration) {
+// the grace interval, or past the caller's shutdown deadline, is intentionally
+// left to the deferred drain.
+func (j *activeJob) settleAdmissionDiagnostics(ctx context.Context, bound time.Duration) {
 	if j == nil {
 		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	j.mu.Lock()
 	request := j.diagnosticsSettleRequest
@@ -468,6 +472,7 @@ func (j *activeJob) settleAdmissionDiagnostics(bound time.Duration) {
 	select {
 	case <-settled:
 	case <-timer.C:
+	case <-ctx.Done():
 	}
 }
 
@@ -1131,27 +1136,83 @@ func (lifecycle serveLifecycleSnapshot) forceStopServe() {
 }
 
 func (s *Server) cancelAdmissionWorkForShutdown(ctx context.Context, admission *serveAdmissionSnapshot) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	coord, jobIDs, err := s.shutdownAdmissionJobs(ctx, admission)
 	if err != nil || coord == nil {
 		return err
 	}
+	type shutdownAdmissionJob struct {
+		id       model.JobID
+		prepared chan error
+		finalize chan context.Context
+		done     chan error
+	}
+	jobs := make([]shutdownAdmissionJob, 0, len(jobIDs))
 	for _, jobID := range jobIDs {
-		if err := ctx.Err(); err != nil {
+		job := shutdownAdmissionJob{
+			id:       jobID,
+			prepared: make(chan error, 1),
+			finalize: make(chan context.Context),
+			done:     make(chan error, 1),
+		}
+		jobs = append(jobs, job)
+	}
+	for i := range jobs {
+		job := &jobs[i]
+		go func() {
+			err := s.withAdmissionJobEffectErr(job.id.String(), func() error {
+				if err := s.requestActiveJobShutdownCancel(ctx, job.id.String()); err != nil {
+					job.prepared <- err
+					return err
+				}
+				// Retain the per-job effect lock while the coordinator commit is
+				// queued. This preserves the existing client-cancel and runner
+				// serialization while every job's bounded diagnostic settle runs
+				// concurrently.
+				job.prepared <- nil
+				finalizeCtx, ok := <-job.finalize
+				if !ok {
+					return nil
+				}
+				count, ordinal := activeObservedWorkspaceWriteItemCount(s.lookupActiveJob(job.id.String()))
+				if err := coord.CancelWithMetadataAndObservedWorkspaceWriteItemCount(finalizeCtx, job.id, engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation", count, ordinal, nil); err != nil {
+					return err
+				}
+				s.abandonAdmissionUnresolvedCustody(finalizeCtx, coord, job.id)
+				return nil
+			})
+			job.done <- err
+		}()
+	}
+	for i := range jobs {
+		if err := <-jobs[i].prepared; err != nil {
+			for j := range jobs {
+				close(jobs[j].finalize)
+			}
+			for j := range jobs {
+				<-jobs[j].done
+			}
 			return err
 		}
-		id := jobID
-		err := s.withAdmissionJobEffectErr(id.String(), func() error {
-			if err := s.requestActiveJobShutdownCancel(ctx, id.String()); err != nil {
-				return err
+	}
+
+	// Commit the accepted work with whatever diagnostics settled before its
+	// individual wait ended. A caller deadline may expire while the settles or
+	// earlier serialized commits run; it must not turn a later terminal commit
+	// into a no-op. shutdownLifecycle observes that deadline immediately after
+	// this phase.
+	finalizeCtx := context.WithoutCancel(ctx)
+	for i := range jobs {
+		jobs[i].finalize <- finalizeCtx
+		if err := <-jobs[i].done; err != nil {
+			for j := i + 1; j < len(jobs); j++ {
+				close(jobs[j].finalize)
 			}
-			count, ordinal := activeObservedWorkspaceWriteItemCount(s.lookupActiveJob(id.String()))
-			if err := coord.CancelWithMetadataAndObservedWorkspaceWriteItemCount(ctx, id, engine.CancellationOriginDaemonShutdown, "daemon shutdown requested cancellation", count, ordinal, nil); err != nil {
-				return err
+			for j := i + 1; j < len(jobs); j++ {
+				<-jobs[j].done
 			}
-			s.abandonAdmissionUnresolvedCustody(ctx, coord, id)
-			return nil
-		})
-		if err != nil {
 			return err
 		}
 	}
@@ -1218,7 +1279,7 @@ func (s *Server) requestActiveJobShutdownCancel(ctx context.Context, jobID strin
 			}
 		}
 	}
-	active.settleAdmissionDiagnostics(admissionNativeInterruptGrace)
+	active.settleAdmissionDiagnostics(ctx, admissionNativeInterruptGrace)
 	if active.cancel != nil {
 		active.cancel()
 	}

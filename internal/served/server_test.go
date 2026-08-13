@@ -6384,6 +6384,99 @@ func TestShutdownCancelsPendingAuthorityWorkBeforeClose(t *testing.T) {
 	}
 }
 
+func TestShutdownSettlesActiveAdmissionDiagnosticsConcurrently(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+	t.Cleanup(func() { _ = server.closeServeAdmission() })
+
+	const jobs = 3
+	type activeShutdownJob struct {
+		accepted authority.AcceptResult
+		command  *recordingRunningCommand
+	}
+	activeJobs := make([]activeShutdownJob, 0, jobs)
+	for i := 0; i < jobs; i++ {
+		accepted := acceptIdentifiedAuthorityWork(t, server, "shutdown-concurrent-"+strconv.Itoa(i))
+		command := &recordingRunningCommand{}
+		active := &activeJob{
+			jobID:             accepted.Record.JobID.String(),
+			admissionCommand:  command,
+			containmentIntent: &launch.ContainmentIntent{},
+		}
+		_, finishSettling := active.beginAdmissionDiagnosticsSettle()
+		t.Cleanup(finishSettling)
+		active.cancel = func() { server.removeActiveJob(active.jobID) }
+		server.addActiveJob(active)
+		server.markAdmissionJob(active.jobID, server.admissionInstance)
+		activeJobs = append(activeJobs, activeShutdownJob{accepted: accepted, command: command})
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*admissionNativeInterruptGrace)
+	defer cancel()
+	started := time.Now()
+	if err := server.shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*admissionNativeInterruptGrace {
+		t.Fatalf("shutdown elapsed = %s, want bounded by a small multiple of one diagnostic grace %s", elapsed, admissionNativeInterruptGrace)
+	}
+	for _, job := range activeJobs {
+		if got := job.command.interrupts.Load(); got != 1 {
+			t.Fatalf("job %s admission interrupt calls = %d, want 1", job.accepted.Record.JobID, got)
+		}
+		record := loadAuthoritySafetyRecordFromRepository(t, repo, job.accepted.Record.JobID.String())
+		if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled {
+			t.Fatalf("job %s terminal = %+v, want canceled", job.accepted.Record.JobID, record.Terminal)
+		}
+	}
+}
+
+func TestShutdownDeadlineDuringAdmissionDiagnosticSettleStillTerminalizes(t *testing.T) {
+	t.Parallel()
+	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	repo := memory.NewRepository()
+	anchorStore := authority.NewAnchorStore()
+	enableTestAdmissionWithAuthorityStore(t, server, launcher, repo, anchorStore)
+	t.Cleanup(func() { _ = server.closeServeAdmission() })
+
+	accepted := acceptIdentifiedAuthorityWork(t, server, "shutdown-deadline-diagnostic-settle")
+	command := &recordingRunningCommand{}
+	active := &activeJob{
+		jobID:             accepted.Record.JobID.String(),
+		admissionCommand:  command,
+		containmentIntent: &launch.ContainmentIntent{},
+	}
+	_, finishSettling := active.beginAdmissionDiagnosticsSettle()
+	t.Cleanup(finishSettling)
+	active.cancel = func() { server.removeActiveJob(active.jobID) }
+	server.addActiveJob(active)
+	server.markAdmissionJob(active.jobID, server.admissionInstance)
+
+	const shutdownDeadline = 50 * time.Millisecond
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownDeadline)
+	defer cancel()
+	started := time.Now()
+	err := server.shutdown(shutdownCtx)
+	if !errors.Is(err, ErrShutdownDeadlineExceeded) {
+		t.Fatalf("shutdown error = %v, want ErrShutdownDeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > admissionNativeInterruptGrace/2 {
+		t.Fatalf("shutdown elapsed = %s, want prompt return near deadline %s", elapsed, shutdownDeadline)
+	}
+	if got := command.interrupts.Load(); got != 1 {
+		t.Fatalf("admission interrupt calls = %d, want 1", got)
+	}
+	record := loadAuthoritySafetyRecordFromRepository(t, repo, accepted.Record.JobID.String())
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCanceled {
+		t.Fatalf("terminal = %+v, want canceled despite shutdown deadline", record.Terminal)
+	}
+}
+
 func TestShutdownDeadlineExceededLeavesForcedRecoveryPath(t *testing.T) {
 	t.Parallel()
 	server, _, _ := newUnstartedTestServer(t, newFakeBackend("fake"))
