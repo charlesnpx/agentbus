@@ -403,6 +403,90 @@ func TestAppServerWriteCacheAppliesOnlyToWriteTurns(t *testing.T) {
 	}
 }
 
+// TestAppServerWriteCacheDoesNotLeakIntoReadOnlyRetryOnSameSession pins the
+// boundary the table test above cannot: each of its cases builds a fresh
+// session, so it would pass even if a write turn contaminated persistent session
+// state and a following read-only turn inherited the overlay or extra root.
+// A read-only retry after a write attempt reuses one session, so that is the
+// path where a leak would actually happen.
+func TestAppServerWriteCacheDoesNotLeakIntoReadOnlyRetryOnSameSession(t *testing.T) {
+	cwd := t.TempDir()
+	cacheRoot := filepath.Join(t.TempDir(), "job-cache")
+	ambient := map[string]string{
+		"GOCACHE":    "ambient-go-build",
+		"GOMODCACHE": "ambient-go-mod",
+		"TMPDIR":     "ambient-tmp",
+	}
+	for key, value := range ambient {
+		t.Setenv(key, value)
+	}
+	writeOverlay := map[string]string{
+		"GOCACHE":    filepath.Join(cacheRoot, "cache", "go-build"),
+		"GOMODCACHE": filepath.Join(cacheRoot, "cache", "go-mod"),
+		"TMPDIR":     filepath.Join(cacheRoot, "tmp"),
+	}
+
+	newRunner := func(turnID, threadMethod string, wantPolicy map[string]any) *fakeAppServerRunner {
+		return newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+			peer := newAppServerPeer(t, proc)
+			peer.handshake()
+			thread := peer.expectRequest(threadMethod)
+			peer.respond(thread, threadResult("thread-1"))
+			turn := peer.expectRequest("turn/start")
+			params, ok := turn["params"].(map[string]any)
+			if !ok {
+				t.Fatalf("turn/start params = %#v", turn["params"])
+			}
+			gotPolicy, ok := params["sandboxPolicy"].(map[string]any)
+			if !ok || !reflect.DeepEqual(gotPolicy, wantPolicy) {
+				t.Fatalf("turn/start sandboxPolicy = %#v, want %#v", params["sandboxPolicy"], wantPolicy)
+			}
+			peer.respond(turn, turnResult(turnID))
+			peer.notify("turn/completed", completedParams("thread-1", turnID, "completed", ""))
+		})
+	}
+
+	session := startFakeCodexSession(t, engine.SessionOpts{
+		CWD:              cwd,
+		WriteSandboxRoot: cacheRoot,
+		WriteEnvOverlay:  writeOverlay,
+	})
+
+	writeRunner := newRunner("turn-1", "thread/start", map[string]any{
+		"type":          "workspaceWrite",
+		"networkAccess": false,
+		"writableRoots": []any{cwd, cacheRoot},
+	})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "write", Write: true}, writeRunner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	for key, want := range writeOverlay {
+		if got, ok := execSpecEnvironmentValue(writeRunner.lastSpec(), key); !ok || got != want {
+			t.Fatalf("write turn %s = %q present=%t, want %q", key, got, ok, want)
+		}
+	}
+
+	// The second turn resumes the established thread rather than starting a new
+	// one, which is exactly why it is the interesting case: session state carries
+	// across it.
+	readRunner := newRunner("turn-2", "thread/resume", map[string]any{
+		"type":          "readOnly",
+		"networkAccess": false,
+	})
+	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "read", Write: false}, readRunner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	for key, want := range ambient {
+		if got, ok := execSpecEnvironmentValue(readRunner.lastSpec(), key); !ok || got != want {
+			t.Fatalf("read-only retry %s = %q present=%t, want the ambient value %q", key, got, ok, want)
+		}
+	}
+}
+
 func TestAppServerThreadsStartThenResumeWithReturnedID(t *testing.T) {
 	runner := newFakeAppServerRunner(t,
 		func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {

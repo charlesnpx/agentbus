@@ -4588,6 +4588,23 @@ func TestIdentifiedCodexWriteJobProvisionsCacheBeforeSessionStart(t *testing.T) 
 			t.Fatalf("provisioned cache path %s stat = %v info=%v, want directory", path, err, info)
 		}
 	}
+	// Go creates module-cache directories mode 0555, and unlinking an entry needs
+	// write permission on its containing directory, so cleanup of a populated
+	// GOMODCACHE is the case that actually matters: an empty tree removes fine
+	// whether or not cleanup restores permissions.
+	moduleDir := filepath.Join(wantOverlay["GOMODCACHE"], "example.com", "mod@v1.0.0")
+	if err := os.MkdirAll(moduleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(moduleDir, "go.mod"), []byte("module example.com/mod\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{moduleDir, filepath.Dir(moduleDir)} {
+		if err := os.Chmod(dir, 0o555); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	close(block)
 	waitAdmissionSafetyTerminal(t, server, job.JobID)
 	waitActiveJobGone(t, server, job.JobID)
