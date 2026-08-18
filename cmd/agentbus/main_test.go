@@ -85,6 +85,28 @@ func TestVersionAndServeCommands(t *testing.T) {
 	}
 }
 
+func TestVersionFlagMatchesVersionSubcommand(t *testing.T) {
+	t.Parallel()
+	a := testApp(t)
+
+	wantCode, wantStdout, wantStderr := runTestCLI(t, a, []string{"version"}, "")
+	gotCode, gotStdout, gotStderr := runTestCLI(t, a, []string{"--version"}, "")
+	if gotCode != wantCode || gotStdout != wantStdout || gotStderr != wantStderr {
+		t.Fatalf("--version = code=%d stdout=%q stderr=%q, want code=%d stdout=%q stderr=%q", gotCode, gotStdout, gotStderr, wantCode, wantStdout, wantStderr)
+	}
+}
+
+func TestVersionJSONFlagMatchesVersionJSONSubcommand(t *testing.T) {
+	t.Parallel()
+	a := testApp(t)
+
+	wantCode, wantStdout, wantStderr := runTestCLI(t, a, []string{"version", "--json"}, "")
+	gotCode, gotStdout, gotStderr := runTestCLI(t, a, []string{"--version", "--json"}, "")
+	if gotCode != wantCode || gotStdout != wantStdout || gotStderr != wantStderr {
+		t.Fatalf("--version --json = code=%d stdout=%q stderr=%q, want code=%d stdout=%q stderr=%q", gotCode, gotStdout, gotStderr, wantCode, wantStdout, wantStderr)
+	}
+}
+
 func TestCodexHomeSettingsPreferInheritanceOptOut(t *testing.T) {
 	t.Setenv("AGENTBUS_CODEX_HOME", "/tmp/fixed-codex-home")
 	t.Setenv("AGENTBUS_CODEX_HOME_INHERIT", "1")

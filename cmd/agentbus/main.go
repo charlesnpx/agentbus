@@ -124,7 +124,13 @@ func (a *app) run(ctx context.Context, args []string, in io.Reader, out, errOut 
 		printRootHelp(errOut)
 		return 2
 	}
-	switch args[0] {
+	// Accept the flag spellings of the version subcommand as a first argument.
+	// Copied rather than assigned in place so the caller's slice is not mutated.
+	command := args[0]
+	if command == "--version" || command == "-version" || command == "-V" {
+		command = "version"
+	}
+	switch command {
 	case "-h", "--help", "help":
 		printRootHelp(out)
 		return 0
@@ -1105,7 +1111,7 @@ func writeJSON(out io.Writer, v any) error {
 
 func printRootHelp(out io.Writer) {
 	fmt.Fprint(out, `Usage:
-  agentbus version [--json]
+  agentbus version [--json] (aliases: --version, -version, -V)
   agentbus setup [--json]
   agentbus serve [--foreground]
   agentbus admission <inspect|recover|reset-empty-root|seal|clear-fail-stop> --state-root <path>
