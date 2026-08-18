@@ -34,10 +34,15 @@ type Health struct {
 type SessionOpts struct {
 	CWD        string
 	EnvOverlay map[string]string
-	Write      bool
-	Model      string
-	Effort     string
-	Timeout    time.Duration
+	// WriteEnvOverlay is merged after EnvOverlay only for write turns.
+	WriteEnvOverlay map[string]string
+	// WriteSandboxRoot is added to workspace-write sandbox policies for write
+	// turns only. It is ignored for read-only and trusted turns.
+	WriteSandboxRoot string
+	Write            bool
+	Model            string
+	Effort           string
+	Timeout          time.Duration
 }
 
 // TurnInput is the effective input for one backend turn.

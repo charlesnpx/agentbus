@@ -27,6 +27,13 @@ type managedCodexHome struct {
 	ino         uint64
 }
 
+type jobCachePaths struct {
+	root    string
+	goBuild string
+	goMod   string
+	tmp     string
+}
+
 func (home *managedCodexHome) close() {
 	if home == nil {
 		return
@@ -109,6 +116,69 @@ func (s *Server) prepareCodexHome(layout engine.WorkspaceLayout, jobID string) (
 		}
 	}
 	return path, managed, nil
+}
+
+// prepareCodexJobCache creates the private Go cache and temporary directories
+// inside the accepted job's managed Codex state leaf. It runs before the
+// adapter starts an app-server process, so toolchains never race directory
+// creation under their sandbox.
+func prepareCodexJobCache(layout engine.WorkspaceLayout, jobID string, managed *managedCodexHome) (jobCachePaths, *managedCodexHome, error) {
+	if jobID == "" || filepath.Base(jobID) != jobID || jobID == "." || jobID == ".." {
+		return jobCachePaths{}, managed, fmt.Errorf("invalid Codex job directory name")
+	}
+	if managed == nil {
+		var err error
+		managed, err = createManagedCodexHome(layout, jobID)
+		if err != nil {
+			return jobCachePaths{}, managed, err
+		}
+	}
+	if managed.directoryFD < 0 {
+		return jobCachePaths{}, managed, errors.New("managed Codex job directory is unavailable")
+	}
+	root, err := filepath.Abs(managed.path)
+	if err != nil {
+		return jobCachePaths{}, managed, fmt.Errorf("resolve managed Codex job cache path: %w", err)
+	}
+	paths := jobCachePaths{
+		root:    root,
+		goBuild: filepath.Join(root, "cache", "go-build"),
+		goMod:   filepath.Join(root, "cache", "go-mod"),
+		tmp:     filepath.Join(root, "tmp"),
+	}
+	cacheFD, err := createManagedDirectory(managed.directoryFD, "cache")
+	if err != nil {
+		return paths, managed, err
+	}
+	defer unix.Close(cacheFD)
+	for _, name := range []string{"go-build", "go-mod"} {
+		directoryFD, err := createManagedDirectory(cacheFD, name)
+		if err != nil {
+			return paths, managed, err
+		}
+		_ = unix.Close(directoryFD)
+	}
+	tmpFD, err := createManagedDirectory(managed.directoryFD, "tmp")
+	if err != nil {
+		return paths, managed, err
+	}
+	_ = unix.Close(tmpFD)
+	return paths, managed, nil
+}
+
+func createManagedDirectory(parentFD int, name string) (int, error) {
+	if err := unix.Mkdirat(parentFD, name, 0o700); err != nil {
+		return -1, fmt.Errorf("create managed Codex job directory %s: %w", name, err)
+	}
+	directoryFD, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, fmt.Errorf("open managed Codex job directory %s: %w", name, err)
+	}
+	if err := unix.Fchmod(directoryFD, 0o700); err != nil {
+		_ = unix.Close(directoryFD)
+		return -1, fmt.Errorf("secure managed Codex job directory %s: %w", name, err)
+	}
+	return directoryFD, nil
 }
 
 // createManagedCodexHome exclusively creates a job leaf below a pinned,

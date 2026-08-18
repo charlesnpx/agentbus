@@ -784,7 +784,7 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 	params := map[string]any{
 		"threadId":       threadID,
 		"approvalPolicy": "never",
-		"sandboxPolicy":  sandboxPolicy(input.Write, opts.CWD, writePolicy),
+		"sandboxPolicy":  sandboxPolicy(input.Write, opts.CWD, opts.WriteSandboxRoot, writePolicy),
 		"input": []map[string]any{{
 			"type": "text",
 			"text": input.Prompt,
@@ -809,7 +809,7 @@ func sandboxMode(write bool) string {
 	return "read-only"
 }
 
-func sandboxPolicy(write bool, cwd string, writePolicy WritePolicy) map[string]any {
+func sandboxPolicy(write bool, cwd, writeSandboxRoot string, writePolicy WritePolicy) map[string]any {
 	if !write {
 		return map[string]any{
 			"type":          "readOnly",
@@ -825,8 +825,15 @@ func sandboxPolicy(write bool, cwd string, writePolicy WritePolicy) map[string]a
 		"type":          "workspaceWrite",
 		"networkAccess": writePolicy == WritePolicyWorkspaceNetwork,
 	}
+	roots := make([]string, 0, 2)
 	if root := workspaceRoot(cwd); root != "" {
-		policy["writableRoots"] = []string{root}
+		roots = append(roots, root)
+	}
+	if writeSandboxRoot != "" {
+		roots = append(roots, writeSandboxRoot)
+	}
+	if len(roots) > 0 {
+		policy["writableRoots"] = roots
 	}
 	return policy
 }

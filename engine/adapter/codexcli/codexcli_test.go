@@ -320,6 +320,89 @@ func TestAppServerTurnSandboxPolicyFollowsWritePolicy(t *testing.T) {
 	}
 }
 
+func TestAppServerWriteCacheAppliesOnlyToWriteTurns(t *testing.T) {
+	cwd := t.TempDir()
+	cacheRoot := filepath.Join(t.TempDir(), "job-cache")
+	ambient := map[string]string{
+		"GOCACHE":    "ambient-go-build",
+		"GOMODCACHE": "ambient-go-mod",
+		"TMPDIR":     "ambient-tmp",
+	}
+	for key, value := range ambient {
+		t.Setenv(key, value)
+	}
+	writeOverlay := map[string]string{
+		"GOCACHE":    filepath.Join(cacheRoot, "cache", "go-build"),
+		"GOMODCACHE": filepath.Join(cacheRoot, "cache", "go-mod"),
+		"TMPDIR":     filepath.Join(cacheRoot, "tmp"),
+	}
+
+	for _, tt := range []struct {
+		name       string
+		write      bool
+		wantPolicy map[string]any
+		wantEnv    map[string]string
+	}{
+		{
+			name:  "write",
+			write: true,
+			wantPolicy: map[string]any{
+				"type":          "workspaceWrite",
+				"networkAccess": false,
+				"writableRoots": []any{cwd, cacheRoot},
+			},
+			wantEnv: writeOverlay,
+		},
+		{
+			name:  "read only",
+			write: false,
+			wantPolicy: map[string]any{
+				"type":          "readOnly",
+				"networkAccess": false,
+			},
+			wantEnv: ambient,
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+				peer := newAppServerPeer(t, proc)
+				peer.handshake()
+				thread := peer.expectRequest("thread/start")
+				peer.respond(thread, threadResult("thread-1"))
+				turn := peer.expectRequest("turn/start")
+				params, ok := turn["params"].(map[string]any)
+				if !ok {
+					t.Fatalf("turn/start params = %#v", turn["params"])
+				}
+				gotPolicy, ok := params["sandboxPolicy"].(map[string]any)
+				if !ok || !reflect.DeepEqual(gotPolicy, tt.wantPolicy) {
+					t.Fatalf("turn/start sandboxPolicy = %#v, want %#v", params["sandboxPolicy"], tt.wantPolicy)
+				}
+				peer.respond(turn, turnResult("turn-1"))
+				peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+			})
+			session := startFakeCodexSession(t, engine.SessionOpts{
+				CWD:              cwd,
+				WriteSandboxRoot: cacheRoot,
+				WriteEnvOverlay:  writeOverlay,
+			})
+			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello", Write: tt.write}, runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = collectEventsWithTimeout(t, events, 2*time.Second)
+			spec := runner.lastSpec()
+			for key, want := range tt.wantEnv {
+				got, ok := execSpecEnvironmentValue(spec, key)
+				if !ok || got != want {
+					t.Fatalf("%s = %q present=%t, want %q", key, got, ok, want)
+				}
+			}
+		})
+	}
+}
+
 func TestAppServerThreadsStartThenResumeWithReturnedID(t *testing.T) {
 	runner := newFakeAppServerRunner(t,
 		func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
@@ -943,6 +1026,16 @@ func (r *fakeAppServerRunner) lastSpec() command.ExecSpec {
 		return command.ExecSpec{}
 	}
 	return r.specs[len(r.specs)-1]
+}
+
+func execSpecEnvironmentValue(spec command.ExecSpec, key string) (string, bool) {
+	for _, entry := range spec.Env {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok && name == key {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 type fakeAppServerProcess struct {
