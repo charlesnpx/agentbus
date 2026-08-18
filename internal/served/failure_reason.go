@@ -30,6 +30,43 @@ type terminalCancellation struct {
 	reason string
 }
 
+type backendFailureClassPattern struct {
+	class     engine.FailureClass
+	fragments []string
+}
+
+// backendFailureClassPatterns maps stable provider error fragments to the
+// launched-turn classes that need a changed retry input. Matching is
+// case-insensitive. Content-policy patterns take precedence over model-
+// unavailable patterns when a provider error contains both kinds of fragment:
+// the prompt must change before that retry can succeed, so the table order
+// below is behavioral and is pinned by a mixed-fragment test.
+
+// Fragments are matched against the whole wrapped error text, so each must be
+// specific enough not to collide with an unrelated refusal: "content was
+// flagged for possible" is used rather than "flagged for possible" so that an
+// account-level refusal such as "This account was flagged for possible abuse"
+// keeps its backend_error class instead of directing an operator to rewrite a
+// prompt that was never the problem.
+var backendFailureClassPatterns = []backendFailureClassPattern{
+	{
+		class: engine.FailureClassContentPolicy,
+		fragments: []string{
+			"content was flagged for possible",
+			"content policy",
+			"trusted access for cyber",
+		},
+	},
+	{
+		class: engine.FailureClassModelUnavailable,
+		fragments: []string{
+			"model is not supported",
+			"unknown model",
+			"model_not_found",
+		},
+	},
+}
+
 // classifiedTerminalError preserves where an error arose while retaining its
 // original identity for existing errors.Is and errors.As callers.
 type classifiedTerminalError struct {
@@ -92,10 +129,27 @@ func classifyTerminalFailure(origin terminalFailureOrigin, err error, agentbusRe
 		if errors.Is(err, engine.ErrProviderOverloaded) {
 			return engine.FailureClassProviderOverloaded
 		}
-		return engine.FailureClassBackendError
+		return classifyBackendFailureText(err)
 	default:
 		return engine.FailureClassInternalError
 	}
+}
+
+// classifyBackendFailureText returns a specific class only for a stable
+// provider fragment. Unrecognized launched-turn failures retain backend_error.
+func classifyBackendFailureText(err error) engine.FailureClass {
+	if err == nil {
+		return engine.FailureClassBackendError
+	}
+	text := strings.ToLower(err.Error())
+	for _, pattern := range backendFailureClassPatterns {
+		for _, fragment := range pattern.fragments {
+			if strings.Contains(text, fragment) {
+				return pattern.class
+			}
+		}
+	}
+	return engine.FailureClassBackendError
 }
 
 func terminalFailureFor(origin terminalFailureOrigin, err error, agentbusRequestedStop bool) terminalFailure {

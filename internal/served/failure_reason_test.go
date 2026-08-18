@@ -116,6 +116,33 @@ func TestClassifyTerminalFailure(t *testing.T) {
 	}
 }
 
+func TestClassifyTerminalFailureContentPolicy(t *testing.T) {
+	t.Parallel()
+	err := errors.New(`codex app-server turn failed: This content was flagged for possible cybersecurity risk. If this
+seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted
+Access for Cyber program: https://chatgpt.com/cyber`)
+	if got := classifyTerminalFailure(terminalFailureBackendRan, err, false); got != engine.FailureClassContentPolicy {
+		t.Fatalf("classifyTerminalFailure() = %q, want %q", got, engine.FailureClassContentPolicy)
+	}
+}
+
+func TestClassifyTerminalFailureModelUnavailable(t *testing.T) {
+	t.Parallel()
+	err := errors.New(`codex app-server turn failed: {"detail":"The 'gpt-5.6-max' model is not supported when using
+Codex with a ChatGPT account."}`)
+	if got := classifyTerminalFailure(terminalFailureBackendRan, err, false); got != engine.FailureClassModelUnavailable {
+		t.Fatalf("classifyTerminalFailure() = %q, want %q", got, engine.FailureClassModelUnavailable)
+	}
+}
+
+func TestClassifyTerminalFailureUnrecognizedBackendError(t *testing.T) {
+	t.Parallel()
+	err := errors.New("backend exited 1")
+	if got := classifyTerminalFailure(terminalFailureBackendRan, err, false); got != engine.FailureClassBackendError {
+		t.Fatalf("classifyTerminalFailure() = %q, want %q", got, engine.FailureClassBackendError)
+	}
+}
+
 func TestAuthorityFailureMetadataOnlyForFailureOrInterruptedTerminalStates(t *testing.T) {
 	projection := model.JobProjection{
 		FailureClass:  engine.FailureClassBackendInterrupted,
@@ -604,5 +631,24 @@ func TestCanceledJobDoesNotExposeFailureMetadata(t *testing.T) {
 	}
 	if result.CancellationOrigin != engine.CancellationOriginClientRequest || result.CancellationReason != "client requested cancellation" {
 		t.Fatalf("canceled job.result cancellation metadata = (%q, %q), want client request", result.CancellationOrigin, result.CancellationReason)
+	}
+}
+
+func TestClassifyTerminalFailureContentPolicyOutranksModelUnavailable(t *testing.T) {
+	// Table order is behavioral: an error naming both a content refusal and an
+	// unsupported model must ask for a rewritten prompt, since that retry
+	// cannot succeed regardless of which model it names.
+	err := errors.New("codex app-server turn failed: content policy refusal; the 'x' model is not supported")
+	if got := classifyTerminalFailure(terminalFailureBackendRan, err, false); got != engine.FailureClassContentPolicy {
+		t.Fatalf("class = %q, want %q", got, engine.FailureClassContentPolicy)
+	}
+}
+
+func TestClassifyTerminalFailureAccountRefusalStaysBackendError(t *testing.T) {
+	// An account-level refusal shares wording with a content refusal but needs
+	// a human, not a rewritten prompt.
+	err := errors.New("codex app-server turn failed: This account was flagged for possible abuse and has been disabled.")
+	if got := classifyTerminalFailure(terminalFailureBackendRan, err, false); got != engine.FailureClassBackendError {
+		t.Fatalf("class = %q, want %q", got, engine.FailureClassBackendError)
 	}
 }

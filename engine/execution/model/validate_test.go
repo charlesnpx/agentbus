@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charlesnpx/agentbus/engine"
 )
 
 func TestIDValueValidation(t *testing.T) {
@@ -518,4 +520,19 @@ func mustChild(t *testing.T) ChildIdentity {
 		t.Fatal(err)
 	}
 	return child
+}
+
+func TestValidateFailureMetadataAcceptsRetryInputClasses(t *testing.T) {
+	// These two classes exist to tell an operator what must change before a
+	// retry: the prompt, or the model. ValidateFailureMetadata is the gate every
+	// persisted failure record passes, so a class missing from FailureClass.Valid
+	// would be rejected here and never reach a terminal envelope.
+	for _, class := range []engine.FailureClass{
+		engine.FailureClassContentPolicy,
+		engine.FailureClassModelUnavailable,
+	} {
+		if err := ValidateFailureMetadata(class, "codex app-server turn failed"); err != nil {
+			t.Fatalf("ValidateFailureMetadata(%q) = %v, want nil", class, err)
+		}
+	}
 }
