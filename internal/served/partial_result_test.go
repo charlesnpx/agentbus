@@ -383,6 +383,64 @@ func TestLegacyPartialResultReclaimedWhenTerminalRecordSaveFails(t *testing.T) {
 	}
 }
 
+// TestLegacyPartialResultCommittedGuardsAmbiguousSaveError covers the case that
+// makes an unconditional reclaim dangerous. atomicWriteFile renames the terminal
+// record into place before its Chmod and directory Sync, so a save error can be
+// returned when the record is in fact committed and already references the
+// partial artifact. Reclaiming then would leave an authoritative record pointing
+// at a deleted file — worse than the leak the reclaim exists to prevent.
+func TestLegacyPartialResultCommittedGuardsAmbiguousSaveError(t *testing.T) {
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := server.nextID("job")
+	if err := server.createQueuedRecord(store, jobID, "ses_legacy_partial_commit_guard", "fake", nil, nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning} {
+		if err := server.transitionRecord(store, jobID, state); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run := jobRun{jobID: jobID, store: store}
+	committedPath := filepath.Join(store.Layout().Results, jobID+".partial-committed.txt")
+
+	if legacyPartialResultCommitted(run, committedPath) {
+		t.Fatal("non-terminal record reported the partial result as committed")
+	}
+
+	if _, err := store.Update(jobID, func(record *engine.JobRecord) (bool, error) {
+		if err := transitionOrSet(record, engine.StateTimedOut, server.clock.Now().UTC()); err != nil {
+			return false, err
+		}
+		record.Result = &engine.ResultInfo{
+			ResultPath:    committedPath,
+			SHA256:        "sha",
+			Bytes:         1,
+			Partial:       true,
+			PartialReason: model.PartialResultReasonTimeout,
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !legacyPartialResultCommitted(run, committedPath) {
+		t.Fatal("terminal record referencing the partial result reported it as uncommitted; an ambiguous save error would delete a committed artifact")
+	}
+	other := filepath.Join(store.Layout().Results, jobID+".partial-other.txt")
+	if legacyPartialResultCommitted(run, other) {
+		t.Fatalf("record reported an unreferenced path %q as committed", other)
+	}
+}
+
 func writePartialTranscript(t *testing.T, path, text string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

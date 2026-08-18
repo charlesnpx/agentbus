@@ -3113,6 +3113,17 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 	if publishedPartialPath == "" {
 		return err
 	}
+	// The save error is ambiguous: atomicWriteFile renames the record into place
+	// before its Chmod and directory Sync, so a failure there can mean the
+	// terminal record IS committed and already references this artifact.
+	// Reclaiming then would leave an authoritative record pointing at a deleted
+	// file, which is worse than the leak this reclaim exists to prevent. Mirror
+	// the admission path: reconcile the persisted record first, and only reclaim
+	// what it does not reference.
+	if legacyPartialResultCommitted(run, publishedPartialPath) {
+		log.Printf("agentbus daemon: job %s terminal record save reported %v but the record already commits partial result %q; keeping it and treating terminalization as committed", run.jobID, err, publishedPartialPath)
+		return nil
+	}
 	log.Printf("agentbus daemon: job %s terminal record save failed after publishing a partial result; reclaiming it and retrying without it: %v", run.jobID, err)
 	if removeErr := engine.RemovePartialResultForLayout(run.store.Layout(), run.jobID, publishedPartialPath); removeErr != nil {
 		log.Printf("agentbus daemon: job %s reclaim of uncommitted partial result %q failed: %v", run.jobID, publishedPartialPath, removeErr)
@@ -3121,6 +3132,24 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 		return retryErr
 	}
 	return nil
+}
+
+// legacyPartialResultCommitted reports whether the persisted record already
+// terminalized against this exact partial artifact. A load failure is treated as
+// "not committed": reclaiming an artifact no record references is recoverable,
+// while keeping one nothing references is the leak being prevented.
+func legacyPartialResultCommitted(run jobRun, path string) bool {
+	if path == "" {
+		return false
+	}
+	record, err := run.store.Load(run.jobID)
+	if err != nil || record == nil {
+		return false
+	}
+	if !engine.IsTerminal(record.State) || record.Result == nil {
+		return false
+	}
+	return record.Result.Partial && record.Result.ResultPath == path
 }
 
 func discardEmptyBackendLogs(paths engine.LogPaths) error {
