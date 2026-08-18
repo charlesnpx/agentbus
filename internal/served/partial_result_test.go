@@ -130,7 +130,7 @@ func TestTimedOutAdmissionWithNoAssistantTextLeavesResultAbsent(t *testing.T) {
 	if record.Result != nil || record.Terminal == nil || record.Terminal.Result != nil {
 		t.Fatalf("terminal record = %+v, want no result artifact", record)
 	}
-	layout, err := authorityResultLayout(server.stateRoot, accepted.Record)
+	layout, err := authorityResultLayout(server.stateRoot, record)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,6 +161,76 @@ func TestTimedOutAdmissionPartialResultSynthesisFailureDoesNotFailTerminalizatio
 	if record.Result != nil || record.Terminal.Result != nil {
 		t.Fatalf("terminal record = %+v, want no partial result after synthesis failure", record)
 	}
+}
+
+func TestTimedOutAdmissionPartialResultReceiptCommitFailureDoesNotFailTerminalization(t *testing.T) {
+	server, accepted, run, paths := partialResultAdmissionRun(t, "partial-result-receipt-commit-failure")
+	writePartialTranscript(t, paths.Stdout, `{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"recoverable transcript excerpt"}}}`+"\n")
+	recorder := installRecordingAdmissionAuthorityForTest(t, server)
+	failed := false
+	recorder.beforeFinalize = func(_ context.Context, _ model.JobID, _ model.AttemptRef, intent model.TerminalIntent) error {
+		if intent.PartialResult == nil || failed {
+			return nil
+		}
+		failed = true
+		return errors.New("injected partial result receipt commit failure")
+	}
+
+	if err := server.completeAdmissionRun(run, engine.StateTimedOut, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if !failed {
+		t.Fatal("partial result receipt commit failure was not injected")
+	}
+	record := loadAdmissionSafetyRecord(t, server, accepted.Record.JobID.String())
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeTimedOut {
+		t.Fatalf("terminal record = %+v, want timed out terminal", record.Terminal)
+	}
+	if record.Result != nil || record.Terminal.Result != nil {
+		t.Fatalf("terminal record = %+v, want unchanged terminal path without partial result", record)
+	}
+	assertNoPartialResultArtifacts(t, server, accepted.Record)
+}
+
+func TestTimedOutAdmissionPartialResultDoesNotReplaceCompetingCompletedResult(t *testing.T) {
+	server, accepted, run, paths := partialResultAdmissionRun(t, "partial-result-competing-completed")
+	writePartialTranscript(t, paths.Stdout, `{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"transcript excerpt must not replace final report"}}}`+"\n")
+	const finalReport = "competing authoritative completed report"
+	setPartialResultBeforePublishHookForTest(t, func() error {
+		return server.admissionCoordinator.CompleteWithObservedWorkspaceWriteItemCount(
+			context.Background(),
+			accepted.Record.JobID,
+			model.OutcomeCompleted,
+			[]byte(finalReport),
+			nil,
+			0,
+			0,
+			nil,
+		)
+	})
+
+	if err := server.completeAdmissionRun(run, engine.StateTimedOut, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	record := loadAdmissionSafetyRecord(t, server, accepted.Record.JobID.String())
+	if record.Terminal == nil || record.Terminal.Outcome != model.OutcomeCompleted || record.Result == nil || record.Result.Result.Partial {
+		t.Fatalf("terminal record = %+v, want competing completed result", record)
+	}
+	path, err := engine.ResultPathForLayout(mustAuthorityResultLayout(t, server, accepted.Record), accepted.Record.JobID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Result.Result.Path != path {
+		t.Fatalf("completed result path = %q, want %q", record.Result.Result.Path, path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != finalReport {
+		t.Fatalf("completed artifact = %q, want %q", raw, finalReport)
+	}
+	assertNoPartialResultArtifacts(t, server, accepted.Record)
 }
 
 func TestCompletedAdmissionResultIsNotReplacedByTranscriptRecovery(t *testing.T) {
@@ -257,4 +327,39 @@ func writePartialTranscript(t *testing.T, path, text string) {
 	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func setPartialResultBeforePublishHookForTest(t *testing.T, hook func() error) {
+	t.Helper()
+	previous := partialResultBeforePublishForTest
+	partialResultBeforePublishForTest = hook
+	t.Cleanup(func() {
+		partialResultBeforePublishForTest = previous
+	})
+}
+
+func assertNoPartialResultArtifacts(t *testing.T, server *Server, record model.SafetyRecord) {
+	t.Helper()
+	layout := mustAuthorityResultLayout(t, server, record)
+	entries, err := os.ReadDir(layout.Results)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".partial-") {
+			t.Fatalf("uncommitted partial artifact %q remains", entry.Name())
+		}
+	}
+}
+
+func mustAuthorityResultLayout(t *testing.T, server *Server, record model.SafetyRecord) engine.WorkspaceLayout {
+	t.Helper()
+	layout, err := authorityResultLayout(server.stateRoot, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return layout
 }

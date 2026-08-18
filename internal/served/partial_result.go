@@ -46,32 +46,26 @@ func (s *Server) synthesizeAdmissionPartialResult(ctx context.Context, jobID mod
 	if err != nil {
 		return nil, err
 	}
-	path, err := engine.ResultPathForLayout(layout, jobID.String())
-	if err != nil {
-		return nil, err
-	}
-	missing, err := partialResultArtifactMissing(path)
-	if err != nil {
-		return nil, err
-	}
-	if !missing {
-		return nil, nil
-	}
 	payload, recovered, err := partialResultArtifact(stdoutPath, state)
 	if err != nil || !recovered {
 		return nil, err
 	}
+	if partialResultBeforePublishForTest != nil {
+		if err := partialResultBeforePublishForTest(); err != nil {
+			return nil, err
+		}
+	}
 	publisher := servedResultPublisher{server: s}
-	published, err := publisher.Publish(ctx, jobID, payload)
+	published, err := publisher.publishPartial(ctx, layout, jobID, payload)
 	if err != nil {
 		return nil, err
 	}
+	published.Result.Partial = true
+	published.Result.PartialReason = reason
 	verified, err := publisher.Verify(ctx, published.Result)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, engine.RemovePartialResultForLayout(layout, jobID.String(), published.Result.Path))
 	}
-	verified.Result.Partial = true
-	verified.Result.PartialReason = reason
 	return &verified, nil
 }
 
@@ -83,22 +77,11 @@ func (s *Server) synthesizeLegacyPartialResult(run jobRun, record *engine.JobRec
 	if !ok || run.logPaths.Stdout == "" {
 		return nil, nil
 	}
-	path, err := engine.ResultPathForLayout(run.store.Layout(), run.jobID)
-	if err != nil {
-		return nil, err
-	}
-	missing, err := partialResultArtifactMissing(path)
-	if err != nil {
-		return nil, err
-	}
-	if !missing {
-		return nil, nil
-	}
 	payload, recovered, err := partialResultArtifact(run.logPaths.Stdout, state)
 	if err != nil || !recovered {
 		return nil, err
 	}
-	info, err := run.store.WriteResult(run.jobID, payload, s.inlineResultCap)
+	info, err := engine.WritePartialResultForLayout(run.store.Layout(), run.jobID, payload, s.inlineResultCap)
 	if err != nil {
 		return nil, err
 	}
@@ -156,17 +139,6 @@ func partialResultArtifact(stdoutPath string, state engine.JobState) ([]byte, bo
 	return artifact, true, nil
 }
 
-func partialResultArtifactMissing(path string) (bool, error) {
-	_, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return false, nil
-}
-
 func partialResultMetadataForState(state engine.JobState) (reason, header string, ok bool) {
 	switch state {
 	case engine.StateTimedOut:
@@ -184,6 +156,8 @@ type partialTranscriptTail struct {
 	elided  bool
 	hasText bool
 }
+
+var partialResultBeforePublishForTest func() error
 
 func (tail *partialTranscriptTail) append(text string) {
 	if tail.hasText {

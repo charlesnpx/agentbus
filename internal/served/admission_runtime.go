@@ -328,6 +328,27 @@ func (p servedResultPublisher) publishAuthorityResult(jobID model.JobID, record 
 	return servedResultReceipt(jobID, info), nil
 }
 
+func (p servedResultPublisher) publishPartial(ctx context.Context, layout engine.WorkspaceLayout, jobID model.JobID, payload []byte) (model.ResultReceipt, error) {
+	if p.server != nil {
+		p.server.resultPublications.Add(1)
+		defer p.server.resultPublications.Add(-1)
+	}
+	if err := ctx.Err(); err != nil {
+		return model.ResultReceipt{}, err
+	}
+	if p.server == nil {
+		return model.ResultReceipt{}, errors.New("served result publisher has no server")
+	}
+	info, err := engine.WritePartialResultForLayout(layout, jobID.String(), payload, p.server.inlineResultCap)
+	if err != nil {
+		return model.ResultReceipt{}, err
+	}
+	if !engine.IsPartialResultPathForLayout(layout, jobID.String(), info.ResultPath) {
+		return model.ResultReceipt{}, fmt.Errorf("partial authority result path %q is not uniquely owned by %s", info.ResultPath, jobID)
+	}
+	return servedResultReceipt(jobID, info), nil
+}
+
 func servedResultReceipt(jobID model.JobID, info engine.ResultInfo) model.ResultReceipt {
 	return model.ResultReceipt{
 		JobID: jobID,
@@ -351,6 +372,9 @@ func (p servedResultPublisher) Verify(ctx context.Context, result model.ResultRe
 	if err := ctx.Err(); err != nil {
 		return model.ResultReceipt{}, err
 	}
+	if err := result.Validate(); err != nil {
+		return model.ResultReceipt{}, err
+	}
 	jobID, err := jobIDFromResultPath(result.Path)
 	if err != nil {
 		return model.ResultReceipt{}, err
@@ -360,7 +384,7 @@ func (p servedResultPublisher) Verify(ctx context.Context, result model.ResultRe
 		return model.ResultReceipt{}, err
 	}
 	if authorityOwned {
-		if err := validateAuthorityResultPath(p.server.stateRoot, record, jobID, result.Path); err != nil {
+		if err := validateAuthorityResultPath(p.server.stateRoot, record, jobID, result); err != nil {
 			return model.ResultReceipt{}, err
 		}
 	}
@@ -426,13 +450,20 @@ func authorityResultLayout(root string, record model.SafetyRecord) (engine.Works
 	return layout, nil
 }
 
-func validateAuthorityResultPath(root string, record model.SafetyRecord, jobID model.JobID, path string) error {
+func validateAuthorityResultPath(root string, record model.SafetyRecord, jobID model.JobID, result model.ResultRef) error {
 	layout, err := authorityResultLayout(root, record)
 	if err != nil {
 		return err
 	}
+	path := result.Path
 	if !servedPathWithinDir(layout.Results, path) {
 		return fmt.Errorf("authority result path %q escapes results root %q", path, layout.Results)
+	}
+	if result.Partial {
+		if !engine.IsPartialResultPathForLayout(layout, jobID.String(), path) {
+			return fmt.Errorf("partial authority result path %q is not uniquely owned by %s", path, jobID)
+		}
+		return nil
 	}
 	expected, err := engine.ResultPathForLayout(layout, jobID.String())
 	if err != nil {
@@ -457,6 +488,9 @@ func jobIDFromResultPath(path string) (model.JobID, error) {
 	ext := filepath.Ext(base)
 	if ext != "" {
 		base = base[:len(base)-len(ext)]
+	}
+	if marker := strings.Index(base, ".partial-"); marker >= 0 {
+		base = base[:marker]
 	}
 	return model.NewJobID(base)
 }
@@ -547,6 +581,9 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 	if partialResult != nil {
 		completeErr = coord.CompleteWithPartialResultReceiptAndObservedWorkspaceWriteItemCount(context.Background(), jobID, outcome, *partialResult, stamp, count, ordinal, nil)
 		if completeErr != nil {
+			if err := s.removeUncommittedAdmissionPartialResult(context.Background(), coord, jobID, *partialResult); err != nil {
+				log.Printf("agentbus daemon: job %s uncommitted partial result cleanup failed: %v", jobID, err)
+			}
 			// A transcript excerpt is optional. Retry the unchanged terminal path
 			// without its receipt so a result-artifact failure cannot strand a job.
 			log.Printf("agentbus daemon: job %s partial result commit failed; terminalizing without it: %v", jobID, completeErr)
@@ -704,6 +741,31 @@ func admissionValidTerminalRecord(record model.SafetyRecord) error {
 		return fmt.Errorf("existing admission terminal record is invalid: %w", err)
 	}
 	return nil
+}
+
+func (s *Server) removeUncommittedAdmissionPartialResult(ctx context.Context, coord *admissionCoordinator, jobID model.JobID, receipt model.ResultReceipt) error {
+	if !receipt.Result.Partial {
+		return nil
+	}
+	snapshot, err := coord.Snapshot(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if admissionPartialResultCommitted(snapshot.Record, receipt.Result) {
+		return nil
+	}
+	layout, err := authorityResultLayout(s.stateRoot, snapshot.Record)
+	if err != nil {
+		return err
+	}
+	return engine.RemovePartialResultForLayout(layout, jobID.String(), receipt.Result.Path)
+}
+
+func admissionPartialResultCommitted(record model.SafetyRecord, result model.ResultRef) bool {
+	if record.Result != nil && record.Result.Result == result {
+		return true
+	}
+	return record.Terminal != nil && record.Terminal.Result != nil && *record.Terminal.Result == result
 }
 
 func admissionRunHasRequestedCancel(run jobRun, state engine.JobState) bool {

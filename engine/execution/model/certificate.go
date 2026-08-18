@@ -509,6 +509,34 @@ func validPartialResultReason(reason string) bool {
 	return reason == PartialResultReasonTimeout || reason == PartialResultReasonInterrupted
 }
 
+func validateTerminalResult(outcome Outcome, result *ResultRef) error {
+	if result == nil {
+		if completionOutcome(outcome) {
+			return invalid("terminal.result", "is required for completed outcomes")
+		}
+		return nil
+	}
+	if err := result.Validate(); err != nil {
+		return err
+	}
+	if completionOutcome(outcome) {
+		if result.Partial {
+			return invalid("terminal.result", "completed outcomes cannot use partial results")
+		}
+		return nil
+	}
+	if !partialResultOutcome(outcome) {
+		return invalid("terminal.result", "requires a completed, timed out, or interrupted outcome")
+	}
+	if !result.Partial {
+		return invalid("terminal.result", "timed out and interrupted outcomes require partial results")
+	}
+	if result.PartialReason != partialResultReasonForOutcome(outcome) {
+		return invalid("terminal.result.partial_reason", "does not match terminal outcome")
+	}
+	return nil
+}
+
 type ResultCertificate struct {
 	JobID       JobID
 	Result      ResultRef
@@ -566,13 +594,8 @@ func (certificate TerminalCertificate) Validate() error {
 	if err := certificate.DerivedBy.Validate(); err != nil {
 		return err
 	}
-	if certificate.Result != nil {
-		if err := certificate.Result.Validate(); err != nil {
-			return err
-		}
-	}
-	if completionOutcome(certificate.Outcome) && certificate.Result == nil {
-		return invalid("terminal.result", "is required for completed outcomes")
+	if err := validateTerminalResult(certificate.Outcome, certificate.Result); err != nil {
+		return err
 	}
 	return nil
 }

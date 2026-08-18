@@ -489,10 +489,18 @@ func (record SafetyRecord) validateOptionalFacts() error {
 		if record.Outcome != nil && record.Terminal.Outcome != record.Outcome.Outcome {
 			return invalid("terminal.outcome", "does not match outcome fact")
 		}
-		if completionOutcome(record.Terminal.Outcome) && record.Result == nil {
-			return invalid("terminal.result", "completed terminal certificate requires result certificate")
+		var result *ResultRef
+		if record.Result != nil {
+			copied := record.Result.Result
+			result = &copied
 		}
-		if record.Terminal.Result != nil && record.Result != nil && *record.Terminal.Result != record.Result.Result {
+		if err := validateTerminalResult(record.Terminal.Outcome, result); err != nil {
+			return err
+		}
+		if (record.Terminal.Result == nil) != (record.Result == nil) {
+			return invalid("terminal.result", "does not match result certificate")
+		}
+		if record.Terminal.Result != nil && *record.Terminal.Result != record.Result.Result {
 			return invalid("terminal.result", "does not match result certificate")
 		}
 		if err := record.validateTerminalProofSupport(); err != nil {
