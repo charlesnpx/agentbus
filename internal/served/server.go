@@ -2602,8 +2602,10 @@ type jobRun struct {
 	contractHash            string
 	timeout                 time.Duration
 	codexIsolated           bool
+	codexSessionDeferred    bool
 	codexHome               string
 	managedCodexHome        *managedCodexHome
+	jobCache                jobCachePaths
 	active                  *activeJob
 	onDone                  func()
 	authoritativeCompletion bool
@@ -2710,6 +2712,9 @@ func (s *Server) runAttempt(ctx context.Context, run jobRun, prompt string, writ
 		}
 	}
 	settleRequested, finishSettling := run.active.beginAdmissionDiagnosticsSettle()
+	if write && run.jobCache.root != "" {
+		log.Printf("agentbus daemon: job %s write cache root=%s go-build=%s go-mod=%s tmp=%s", run.jobID, run.jobCache.root, run.jobCache.goBuild, run.jobCache.goMod, run.jobCache.tmp)
+	}
 	events, err := s.admissionTurnEvents(attemptCtx, run, input, ordinal)
 	if err != nil {
 		finishSettling()

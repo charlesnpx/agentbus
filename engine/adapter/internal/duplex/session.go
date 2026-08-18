@@ -51,11 +51,12 @@ type SessionConfig struct {
 
 // Session is one resumable duplex process session.
 type Session struct {
-	runner         command.Runner
-	driver         Driver
-	opts           engine.SessionOpts
-	envOverlay     []string
-	interruptGrace time.Duration
+	runner          command.Runner
+	driver          Driver
+	opts            engine.SessionOpts
+	envOverlay      []string
+	writeEnvOverlay []string
+	interruptGrace  time.Duration
 
 	mu sync.Mutex
 	// id is the provider-confirmed resume ID supplied to the next turn. It is
@@ -90,8 +91,38 @@ func NewSession(config SessionConfig) (*Session, error) {
 	if config.Driver == nil {
 		return nil, errors.New("duplex driver is required")
 	}
-	envOverlay := make([]string, 0, len(config.Options.EnvOverlay))
-	for key, value := range config.Options.EnvOverlay {
+	envOverlay, err := validatedEnvironmentOverlay(config.Options.EnvOverlay)
+	if err != nil {
+		return nil, err
+	}
+	writeEnvOverlay, err := validatedEnvironmentOverlay(config.Options.WriteEnvOverlay)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := config.Options
+	// The shared runtime owns the validated overlays and applies them after
+	// every driver ExecSpec. Drivers do not need the caller-owned maps.
+	opts.EnvOverlay = nil
+	opts.WriteEnvOverlay = nil
+	grace := config.InterruptGrace
+	if grace == 0 {
+		grace = DefaultInterruptGrace
+	}
+	return &Session{
+		runner:          config.Runner,
+		driver:          config.Driver,
+		opts:            opts,
+		envOverlay:      envOverlay,
+		writeEnvOverlay: writeEnvOverlay,
+		interruptGrace:  grace,
+		id:              config.ResumeID,
+	}, nil
+}
+
+func validatedEnvironmentOverlay(overlay map[string]string) ([]string, error) {
+	envOverlay := make([]string, 0, len(overlay))
+	for key, value := range overlay {
 		switch {
 		case key == "":
 			return nil, errors.New("environment overlay key is required")
@@ -107,23 +138,7 @@ func NewSession(config SessionConfig) (*Session, error) {
 	// Map input has no insertion order, so make Windows key collision handling
 	// deterministic before the shared environment normalization below.
 	sort.Strings(envOverlay)
-
-	opts := config.Options
-	// The shared runtime owns the validated overlay and applies it after every
-	// driver ExecSpec. Drivers do not need the caller-owned map.
-	opts.EnvOverlay = nil
-	grace := config.InterruptGrace
-	if grace == 0 {
-		grace = DefaultInterruptGrace
-	}
-	return &Session{
-		runner:         config.Runner,
-		driver:         config.Driver,
-		opts:           opts,
-		envOverlay:     normalizeEnvironment(runtime.GOOS, envOverlay),
-		interruptGrace: grace,
-		id:             config.ResumeID,
-	}, nil
+	return normalizeEnvironment(runtime.GOOS, envOverlay), nil
 }
 
 // ID returns the current backend resume id.
@@ -205,8 +220,14 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 
 	// Contract: driver ExecSpec.Env is an ADDITIVE layer over the full inherited
 	// process environment, not a replacement or isolation mechanism (no current
-	// driver sets it). The session overlay is applied last and wins.
-	spec.Env = normalizeEnvironment(runtime.GOOS, os.Environ(), spec.Env, s.envOverlay)
+	// driver sets it). The session overlay is applied last and wins. The
+	// write-only overlay is deliberately absent from read-only turns, including
+	// a read-only retry after a write attempt.
+	if input.Write {
+		spec.Env = normalizeEnvironment(runtime.GOOS, os.Environ(), spec.Env, s.envOverlay, s.writeEnvOverlay)
+	} else {
+		spec.Env = normalizeEnvironment(runtime.GOOS, os.Environ(), spec.Env, s.envOverlay)
+	}
 	running, err := runner.Start(turnCtx, spec)
 	if err != nil {
 		if stdoutLog != nil {

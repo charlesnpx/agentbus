@@ -609,7 +609,11 @@ func (s *Server) cleanupManagedCodexHomeForAdmissionRun(run jobRun) {
 		err = s.withAdmissionJobEffectErr(run.jobID, cleanup)
 	}
 	if err != nil {
-		log.Printf("agentbus daemon: retain managed Codex home %s: cannot read committed terminal: %v", run.codexHome, err)
+		path := run.codexHome
+		if run.managedCodexHome != nil {
+			path = run.managedCodexHome.path
+		}
+		log.Printf("agentbus daemon: retain managed Codex home %s: cannot read committed terminal: %v", path, err)
 	}
 }
 
