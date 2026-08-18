@@ -530,11 +530,12 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 	}{
 		{name: "failed", status: "failed", errorText: "model failed", want: "model failed"},
 		{
-			name:       "structured server overloaded completion",
-			errorText:  "provider refused this turn",
-			errorInfo:  "server_overloaded",
-			want:       "provider refused this turn",
-			overloaded: true,
+			name:         "camel-case structured server overloaded task completion",
+			errorText:    "Selected model is at capacity. Please try a different model.",
+			errorInfo:    "serverOverloaded",
+			want:         "Selected model is at capacity. Please try a different model.",
+			overloaded:   true,
+			taskComplete: true,
 		},
 		{
 			name:       "message-only overloaded completion",
@@ -543,18 +544,17 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 			overloaded: true,
 		},
 		{
-			name:      "different structured code suppresses capacity-message fallback",
-			errorText: "Selected model is at capacity. Please try a different model.",
-			errorInfo: "rate_limited",
-			want:      "Selected model is at capacity. Please try a different model.",
+			name:       "unrecognized structured code falls through to capacity message",
+			errorText:  "Selected model is at capacity. Please try a different model.",
+			errorInfo:  "someOtherCode",
+			want:       "Selected model is at capacity. Please try a different model.",
+			overloaded: true,
 		},
 		{
-			name:         "structured server overloaded task completion",
-			errorText:    "Selected model is at capacity. Please try a different model.",
-			errorInfo:    "server_overloaded",
-			want:         "Selected model is at capacity. Please try a different model.",
-			overloaded:   true,
-			taskComplete: true,
+			name:      "unrecognized structured code leaves unrelated message alone",
+			errorText: "model failed",
+			errorInfo: "someOtherCode",
+			want:      "model failed",
 		},
 		{name: "unrequested interrupted", status: "interrupted", want: "interrupted", interrupted: true},
 	}
@@ -1183,7 +1183,7 @@ func completedParamsWithErrorInfo(threadID, turnID, status, errorText, errorInfo
 	if errorText != "" {
 		err := map[string]any{"message": errorText}
 		if errorInfo != "" {
-			err["codex_error_info"] = errorInfo
+			err["codexErrorInfo"] = errorInfo
 		}
 		turn["error"] = err
 	}
@@ -1193,7 +1193,7 @@ func completedParamsWithErrorInfo(threadID, turnID, status, errorText, errorInfo
 func taskCompleteParams(turnID, errorText, errorInfo string) map[string]any {
 	err := map[string]any{"message": errorText}
 	if errorInfo != "" {
-		err["codex_error_info"] = errorInfo
+		err["codexErrorInfo"] = errorInfo
 	}
 	return map[string]any{
 		"turn_id":            turnID,

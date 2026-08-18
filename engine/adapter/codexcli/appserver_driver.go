@@ -753,14 +753,24 @@ func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer
 	}
 }
 
+// isProviderOverloaded recognizes a confirmed overload code or a capacity message.
+// An unrecognized errorInfo is no signal and must fall through to the message
+// heuristic; providers can introduce new codes without suppressing it.
 func isProviderOverloaded(errorInfo, message string) bool {
-	if errorInfo = strings.TrimSpace(errorInfo); errorInfo != "" {
-		return strings.EqualFold(errorInfo, "server_overloaded")
+	if normalizeProviderErrorInfo(errorInfo) == "serveroverloaded" {
+		return true
 	}
 	message = strings.ToLower(message)
 	return strings.Contains(message, "at capacity") ||
 		strings.Contains(message, "server overloaded") ||
 		strings.Contains(message, "server_overloaded")
+}
+
+func normalizeProviderErrorInfo(errorInfo string) string {
+	errorInfo = strings.TrimSpace(errorInfo)
+	errorInfo = strings.ReplaceAll(errorInfo, "_", "")
+	errorInfo = strings.ReplaceAll(errorInfo, "-", "")
+	return strings.ToLower(errorInfo)
 }
 
 func threadParams(opts engine.SessionOpts, input engine.TurnInput, resumeID string) map[string]any {
