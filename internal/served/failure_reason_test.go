@@ -633,3 +633,22 @@ func TestCanceledJobDoesNotExposeFailureMetadata(t *testing.T) {
 		t.Fatalf("canceled job.result cancellation metadata = (%q, %q), want client request", result.CancellationOrigin, result.CancellationReason)
 	}
 }
+
+func TestClassifyTerminalFailureContentPolicyOutranksModelUnavailable(t *testing.T) {
+	// Table order is behavioral: an error naming both a content refusal and an
+	// unsupported model must ask for a rewritten prompt, since that retry
+	// cannot succeed regardless of which model it names.
+	err := errors.New("codex app-server turn failed: content policy refusal; the 'x' model is not supported")
+	if got := classifyTerminalFailure(terminalFailureBackendRan, err, false); got != engine.FailureClassContentPolicy {
+		t.Fatalf("class = %q, want %q", got, engine.FailureClassContentPolicy)
+	}
+}
+
+func TestClassifyTerminalFailureAccountRefusalStaysBackendError(t *testing.T) {
+	// An account-level refusal shares wording with a content refusal but needs
+	// a human, not a rewritten prompt.
+	err := errors.New("codex app-server turn failed: This account was flagged for possible abuse and has been disabled.")
+	if got := classifyTerminalFailure(terminalFailureBackendRan, err, false); got != engine.FailureClassBackendError {
+		t.Fatalf("class = %q, want %q", got, engine.FailureClassBackendError)
+	}
+}

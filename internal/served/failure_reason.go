@@ -39,12 +39,20 @@ type backendFailureClassPattern struct {
 // launched-turn classes that need a changed retry input. Matching is
 // case-insensitive. Content-policy patterns take precedence over model-
 // unavailable patterns when a provider error contains both kinds of fragment:
-// the prompt must change before that retry can succeed.
+// the prompt must change before that retry can succeed, so the table order
+// below is behavioral and is pinned by a mixed-fragment test.
+
+// Fragments are matched against the whole wrapped error text, so each must be
+// specific enough not to collide with an unrelated refusal: "content was
+// flagged for possible" is used rather than "flagged for possible" so that an
+// account-level refusal such as "This account was flagged for possible abuse"
+// keeps its backend_error class instead of directing an operator to rewrite a
+// prompt that was never the problem.
 var backendFailureClassPatterns = []backendFailureClassPattern{
 	{
 		class: engine.FailureClassContentPolicy,
 		fragments: []string{
-			"flagged for possible",
+			"content was flagged for possible",
 			"content policy",
 			"trusted access for cyber",
 		},
