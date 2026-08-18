@@ -107,11 +107,25 @@ func (c *Coordinator) Complete(ctx context.Context, jobID model.JobID, outcome m
 // CompleteWithObservedWorkspaceWriteItemCount includes the final attempt's
 // routing hint in the terminal certificate mutation.
 func (c *Coordinator) CompleteWithObservedWorkspaceWriteItemCount(ctx context.Context, jobID model.JobID, outcome model.Outcome, result []byte, contract *engine.ContractStamp, observedWorkspaceWriteItemCount uint64, observedWorkspaceWriteItemCountAttemptOrdinal model.LaunchOrdinal, injector *FailureInjector) error {
+	return c.complete(ctx, jobID, outcome, result, nil, contract, observedWorkspaceWriteItemCount, observedWorkspaceWriteItemCountAttemptOrdinal, injector)
+}
+
+// CompleteWithPartialResultReceiptAndObservedWorkspaceWriteItemCount commits a
+// verified transcript excerpt in the same terminal mutation as a timed-out or
+// interrupted outcome.
+func (c *Coordinator) CompleteWithPartialResultReceiptAndObservedWorkspaceWriteItemCount(ctx context.Context, jobID model.JobID, outcome model.Outcome, partialResult model.ResultReceipt, contract *engine.ContractStamp, observedWorkspaceWriteItemCount uint64, observedWorkspaceWriteItemCountAttemptOrdinal model.LaunchOrdinal, injector *FailureInjector) error {
+	return c.complete(ctx, jobID, outcome, nil, &partialResult, contract, observedWorkspaceWriteItemCount, observedWorkspaceWriteItemCountAttemptOrdinal, injector)
+}
+
+func (c *Coordinator) complete(ctx context.Context, jobID model.JobID, outcome model.Outcome, result []byte, partialResult *model.ResultReceipt, contract *engine.ContractStamp, observedWorkspaceWriteItemCount uint64, observedWorkspaceWriteItemCountAttemptOrdinal model.LaunchOrdinal, injector *FailureInjector) error {
 	if err := c.ready(); err != nil {
 		return err
 	}
 	if !terminalOutcome(outcome) {
 		return fmt.Errorf("terminal outcome required: %s", outcome)
+	}
+	if partialResult != nil && outcome != model.OutcomeTimedOut && outcome != model.OutcomeInterrupted {
+		return fmt.Errorf("partial result requires timed_out or interrupted outcome: %s", outcome)
 	}
 	snapshot, err := c.authority.Snapshot(ctx, jobID)
 	if err != nil {
@@ -128,6 +142,11 @@ func (c *Coordinator) CompleteWithObservedWorkspaceWriteItemCount(ctx context.Co
 			return err
 		}
 	}
+	var terminalPartialResult *model.ResultReceipt
+	if partialResult != nil {
+		copied := *partialResult
+		terminalPartialResult = &copied
+	}
 	snapshot, err = c.authority.Snapshot(ctx, jobID)
 	if err != nil {
 		return err
@@ -135,6 +154,7 @@ func (c *Coordinator) CompleteWithObservedWorkspaceWriteItemCount(ctx context.Co
 	_, err = c.authority.Finalize(ctx, jobID, snapshot.Record.Attempt.Ref, model.TerminalIntent{
 		Outcome:                         outcome,
 		Cause:                           model.CauseCompletedNormally,
+		PartialResult:                   terminalPartialResult,
 		ObservedWorkspaceWriteItemCount: observedWorkspaceWriteItemCount,
 		ObservedWorkspaceWriteItemCountAttemptOrdinal: observedWorkspaceWriteItemCountAttemptOrdinal,
 	})

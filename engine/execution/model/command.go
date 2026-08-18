@@ -104,10 +104,13 @@ type RecordCancellation struct {
 }
 
 type TerminalIntent struct {
-	Outcome            Outcome
-	Cause              TerminalCause
-	DerivedBy          BootRef
-	Contract           *engine.ContractStamp
+	Outcome   Outcome
+	Cause     TerminalCause
+	DerivedBy BootRef
+	Contract  *engine.ContractStamp
+	// PartialResult is a verified transcript excerpt committed with a timed-out
+	// or interrupted terminal record. It is never a worker final report.
+	PartialResult      *ResultReceipt
 	CancellationOrigin engine.CancellationOrigin
 	CancellationReason string
 	// FinalAttemptEndedAt is when the final contract attempt reached this

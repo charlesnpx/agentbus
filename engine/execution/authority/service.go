@@ -1095,6 +1095,13 @@ func commandWithBoot(command model.Command, boot model.BootRef) model.Command {
 		if emptyBootRef(c.Intent.DerivedBy) {
 			c.Intent.DerivedBy = boot
 		}
+		if c.Intent.PartialResult != nil {
+			partial := *c.Intent.PartialResult
+			if emptyBootRef(partial.CertifiedBy) {
+				partial.CertifiedBy = boot
+			}
+			c.Intent.PartialResult = &partial
+		}
 		return c
 	case *model.Finalize:
 		if c == nil {
@@ -1103,6 +1110,13 @@ func commandWithBoot(command model.Command, boot model.BootRef) model.Command {
 		next := *c
 		if emptyBootRef(next.Intent.DerivedBy) {
 			next.Intent.DerivedBy = boot
+		}
+		if next.Intent.PartialResult != nil {
+			partial := *next.Intent.PartialResult
+			if emptyBootRef(partial.CertifiedBy) {
+				partial.CertifiedBy = boot
+			}
+			next.Intent.PartialResult = &partial
 		}
 		return next
 	default:

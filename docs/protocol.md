@@ -475,12 +475,19 @@ terminal proof serialization is not exposed in protocol v2.
 `timeout` has the same semantics and shape as the `job.status` field.
 
 For completed terminal outcomes, the authority terminal record contains a
-certified result reference. The server returns `resultPath`, `sha256`, and
-`bytes`. It includes inline `text` only when the result is below the inline cap
-and a bounded read verifies both byte count and digest. If verification fails,
-the path and digest metadata remain, and `text` is omitted.
+certified final-result reference. The server returns `resultPath`, `sha256`,
+and `bytes`. It includes inline `text` only when the result is below the inline
+cap and a bounded read verifies both byte count and digest. If verification
+fails, the path and digest metadata remain, and `text` is omitted.
 
-Non-completion terminal states and non-terminal states return no `result`.
+Timed-out and interrupted terminal outcomes can also contain a recovered
+transcript excerpt when no worker report was produced. Those results include
+`"partial": true` and `"partialReason": "timeout"` or `"interrupted"`; they
+are not worker final reports, and their artifact text begins with that warning.
+The excerpt is a bounded tail of assistant-visible transcript messages.
+
+Other non-completion terminal states and non-terminal states return no
+`result`.
 While authority lookup is healthy, unknown jobs return `unknown_job` with
 `jobId` in `error.data`. During fail-stop, a syntactically valid absent ID can
 return `root_fail_stopped` before absence can be established.

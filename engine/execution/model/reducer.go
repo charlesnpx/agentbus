@@ -691,13 +691,30 @@ func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (
 	if err := ensureAttempt(current, command.Ref); err != nil {
 		return false, err
 	}
-	certificate, err := DeriveTerminalCertificate(current, command.Intent)
+	intent, err := resolveTerminalIntent(current, command.Intent)
 	if err != nil {
 		return false, err
 	}
-	origin, reason, err := terminalCancellationMetadata(certificate.Outcome, command.Intent.CancellationOrigin, command.Intent.CancellationReason)
+	terminalRecord := current
+	if intent.PartialResult != nil {
+		if _, err := mergeFact(&terminalRecord.Result, *intent.PartialResult, "result"); err != nil {
+			return false, err
+		}
+	}
+	certificate, err := DeriveTerminalCertificate(terminalRecord, intent)
 	if err != nil {
 		return false, err
+	}
+	origin, reason, err := terminalCancellationMetadata(certificate.Outcome, intent.CancellationOrigin, intent.CancellationReason)
+	if err != nil {
+		return false, err
+	}
+	partialResultChanged := false
+	if intent.PartialResult != nil {
+		partialResultChanged, err = mergeFact(&next.Result, *intent.PartialResult, "result")
+		if err != nil {
+			return false, err
+		}
 	}
 	terminalChanged, err := mergeTerminal(next, certificate)
 	if err != nil {
@@ -709,9 +726,9 @@ func applyFinalize(next *SafetyRecord, current SafetyRecord, command Finalize) (
 		next.CancellationReason = reason
 		cancellationChanged = current.CancellationOrigin != next.CancellationOrigin || current.CancellationReason != next.CancellationReason
 	}
-	timingChanged := applyFinalAttemptEnd(next, current, command.Intent.FinalAttemptEndedAt)
-	workspaceWritesChanged := applyTerminalObservedWorkspaceWriteItemCount(next, current, command.Intent)
-	return terminalChanged || cancellationChanged || timingChanged || workspaceWritesChanged, nil
+	timingChanged := applyFinalAttemptEnd(next, current, intent.FinalAttemptEndedAt)
+	workspaceWritesChanged := applyTerminalObservedWorkspaceWriteItemCount(next, current, intent)
+	return partialResultChanged || terminalChanged || cancellationChanged || timingChanged || workspaceWritesChanged, nil
 }
 
 // applyTerminalObservedWorkspaceWriteItemCount deliberately treats malformed

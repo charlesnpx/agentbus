@@ -539,8 +539,24 @@ func (s *Server) completeAdmissionRun(run jobRun, state engine.JobState, text st
 		return s.cleanupAdmissionBackendLogsForCommittedTerminal(run, coord, jobID)
 	}
 	count, ordinal := run.active.observedWorkspaceWriteItemCountForTerminal()
-	if err := coord.CompleteWithObservedWorkspaceWriteItemCount(context.Background(), jobID, outcome, []byte(text), stamp, count, ordinal, nil); err != nil {
-		if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, err); err != nil {
+	partialResult, partialErr := s.synthesizeAdmissionPartialResult(context.Background(), jobID, snapshot.Record, run.logPaths.Stdout, state)
+	if partialErr != nil {
+		log.Printf("agentbus daemon: job %s partial result synthesis failed: %v", jobID, partialErr)
+	}
+	var completeErr error
+	if partialResult != nil {
+		completeErr = coord.CompleteWithPartialResultReceiptAndObservedWorkspaceWriteItemCount(context.Background(), jobID, outcome, *partialResult, stamp, count, ordinal, nil)
+		if completeErr != nil {
+			// A transcript excerpt is optional. Retry the unchanged terminal path
+			// without its receipt so a result-artifact failure cannot strand a job.
+			log.Printf("agentbus daemon: job %s partial result commit failed; terminalizing without it: %v", jobID, completeErr)
+			completeErr = coord.CompleteWithObservedWorkspaceWriteItemCount(context.Background(), jobID, outcome, []byte(text), stamp, count, ordinal, nil)
+		}
+	} else {
+		completeErr = coord.CompleteWithObservedWorkspaceWriteItemCount(context.Background(), jobID, outcome, []byte(text), stamp, count, ordinal, nil)
+	}
+	if completeErr != nil {
+		if err := reconcileAdmissionFinalizationContention(context.Background(), coord, jobID, completeErr); err != nil {
 			return err
 		}
 		// A different terminal won the commit race. Its committed outcome, not

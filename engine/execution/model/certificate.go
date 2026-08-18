@@ -469,9 +469,11 @@ func (certificate QuiescenceCertificate) Validate() error {
 }
 
 type ResultRef struct {
-	Path   string
-	Digest string
-	Bytes  int64
+	Path          string
+	Digest        string
+	Bytes         int64
+	Partial       bool
+	PartialReason string
 }
 
 func (result ResultRef) Validate() error {
@@ -481,7 +483,30 @@ func (result ResultRef) Validate() error {
 	if err := validateToken("result.digest", result.Digest); err != nil {
 		return err
 	}
-	return validateNonNegativeInt64("result.bytes", result.Bytes)
+	if err := validateNonNegativeInt64("result.bytes", result.Bytes); err != nil {
+		return err
+	}
+	if result.Partial {
+		if !validPartialResultReason(result.PartialReason) {
+			return invalid("result.partial_reason", "must be timeout or interrupted")
+		}
+		return nil
+	}
+	if result.PartialReason != "" {
+		return invalid("result.partial_reason", "requires partial result")
+	}
+	return nil
+}
+
+const (
+	// PartialResultReasonTimeout identifies a transcript excerpt recovered after a timeout.
+	PartialResultReasonTimeout = "timeout"
+	// PartialResultReasonInterrupted identifies a transcript excerpt recovered after an interruption.
+	PartialResultReasonInterrupted = "interrupted"
+)
+
+func validPartialResultReason(reason string) bool {
+	return reason == PartialResultReasonTimeout || reason == PartialResultReasonInterrupted
 }
 
 type ResultCertificate struct {

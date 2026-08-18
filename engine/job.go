@@ -243,10 +243,13 @@ type LogPaths struct {
 	Stderr string `json:"stderr,omitempty"`
 }
 
-// ResultInfo describes the authoritative spilled final result.
+// ResultInfo describes an authoritative spilled result artifact. A partial
+// result is a recovered transcript excerpt, not a worker final report.
 type ResultInfo struct {
 	Text          string `json:"text,omitempty"`
 	TextElided    bool   `json:"textElided,omitempty"`
+	Partial       bool   `json:"partial,omitempty"`
+	PartialReason string `json:"partialReason,omitempty"`
 	ResultPath    string `json:"resultPath"`
 	SHA256        string `json:"sha256"`
 	Bytes         int64  `json:"bytes"`

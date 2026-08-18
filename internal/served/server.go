@@ -3064,6 +3064,14 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 			}
 			info.ModelReported = record.ModelReported
 			result = &info
+		} else if _, _, partial := partialResultMetadataForState(state); partial {
+			info, err := s.synthesizeLegacyPartialResult(run, record, state)
+			if err != nil {
+				log.Printf("agentbus daemon: job %s partial result synthesis failed: %v", run.jobID, err)
+			} else if info != nil {
+				info.ModelReported = record.ModelReported
+				result = info
+			}
 		}
 		if lateFinalization && record.State == engine.StateReaped {
 			if err := record.Transition(state, s.clock.Now().UTC()); err != nil {

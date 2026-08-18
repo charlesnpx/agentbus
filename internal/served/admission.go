@@ -3349,9 +3349,11 @@ func authorityImageJobID(image repository.JobImage) string {
 
 func (s *Server) authorityResultInfo(ref model.ResultRef) *engine.ResultInfo {
 	info := &engine.ResultInfo{
-		ResultPath: ref.Path,
-		SHA256:     ref.Digest,
-		Bytes:      ref.Bytes,
+		ResultPath:    ref.Path,
+		SHA256:        ref.Digest,
+		Bytes:         ref.Bytes,
+		Partial:       ref.Partial,
+		PartialReason: ref.PartialReason,
 	}
 	inlineCap := s.inlineResultCap
 	if inlineCap <= 0 {
