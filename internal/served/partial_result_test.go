@@ -319,6 +319,70 @@ func partialResultAdmissionRun(t *testing.T, requestID string) (*Server, authori
 	return server, accepted, jobRun{jobID: jobID.String(), logPaths: paths}, paths
 }
 
+// TestLegacyPartialResultReclaimedWhenTerminalRecordSaveFails covers the legacy
+// (non-admission) finalizer, where the partial artifact is published inside the
+// store mutator but the authoritative record save happens after the mutator
+// returns. If that save fails, leaving the excerpt behind is exactly what must
+// not happen: on a nearly full filesystem its blocks are the ones the record
+// write needs, so the optional artifact could block terminalization outright.
+func TestLegacyPartialResultReclaimedWhenTerminalRecordSaveFails(t *testing.T) {
+	backend := newFakeBackend("fake")
+	server, _, cwd := newUnstartedTestServer(t, backend)
+
+	server.mu.Lock()
+	store, err := server.storeForCWDLocked(cwd)
+	server.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := server.nextID("job")
+	if err := server.createQueuedRecord(store, jobID, "ses_legacy_partial_reclaim", "fake", nil, nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []engine.JobState{engine.StateStarting, engine.StateRunning} {
+		if err := server.transitionRecord(store, jobID, state); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	layout := store.Layout()
+	paths, err := engine.LogPathsForLayout(layout, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writePartialTranscript(t, paths.Stdout, `{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"legacy excerpt must not survive a failed save"}}}`+"\n")
+
+	// Make the authoritative record write fail for real rather than through a
+	// seam: atomicWriteFile creates its temp file in the records directory, so a
+	// read-only records directory fails the save while leaving reads working.
+	info, err := os.Stat(layout.Jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(layout.Jobs, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(layout.Jobs, info.Mode().Perm()) })
+
+	err = server.finalizeTerminal(jobRun{jobID: jobID, store: store, logPaths: paths}, engine.StateTimedOut, "", nil)
+	if err == nil {
+		t.Skip("records directory remained writable; cannot exercise a failed terminal record save here")
+	}
+
+	entries, readErr := os.ReadDir(layout.Results)
+	if readErr != nil {
+		if !errors.Is(readErr, os.ErrNotExist) {
+			t.Fatal(readErr)
+		}
+		return
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".partial-") {
+			t.Fatalf("uncommitted legacy partial artifact %q remains after a failed terminal record save", entry.Name())
+		}
+	}
+}
+
 func writePartialTranscript(t *testing.T, path, text string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
