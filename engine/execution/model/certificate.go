@@ -469,9 +469,11 @@ func (certificate QuiescenceCertificate) Validate() error {
 }
 
 type ResultRef struct {
-	Path   string
-	Digest string
-	Bytes  int64
+	Path          string
+	Digest        string
+	Bytes         int64
+	Partial       bool
+	PartialReason string
 }
 
 func (result ResultRef) Validate() error {
@@ -481,7 +483,58 @@ func (result ResultRef) Validate() error {
 	if err := validateToken("result.digest", result.Digest); err != nil {
 		return err
 	}
-	return validateNonNegativeInt64("result.bytes", result.Bytes)
+	if err := validateNonNegativeInt64("result.bytes", result.Bytes); err != nil {
+		return err
+	}
+	if result.Partial {
+		if !validPartialResultReason(result.PartialReason) {
+			return invalid("result.partial_reason", "must be timeout or interrupted")
+		}
+		return nil
+	}
+	if result.PartialReason != "" {
+		return invalid("result.partial_reason", "requires partial result")
+	}
+	return nil
+}
+
+const (
+	// PartialResultReasonTimeout identifies a transcript excerpt recovered after a timeout.
+	PartialResultReasonTimeout = "timeout"
+	// PartialResultReasonInterrupted identifies a transcript excerpt recovered after an interruption.
+	PartialResultReasonInterrupted = "interrupted"
+)
+
+func validPartialResultReason(reason string) bool {
+	return reason == PartialResultReasonTimeout || reason == PartialResultReasonInterrupted
+}
+
+func validateTerminalResult(outcome Outcome, result *ResultRef) error {
+	if result == nil {
+		if completionOutcome(outcome) {
+			return invalid("terminal.result", "is required for completed outcomes")
+		}
+		return nil
+	}
+	if err := result.Validate(); err != nil {
+		return err
+	}
+	if completionOutcome(outcome) {
+		if result.Partial {
+			return invalid("terminal.result", "completed outcomes cannot use partial results")
+		}
+		return nil
+	}
+	if !partialResultOutcome(outcome) {
+		return invalid("terminal.result", "requires a completed, timed out, or interrupted outcome")
+	}
+	if !result.Partial {
+		return invalid("terminal.result", "timed out and interrupted outcomes require partial results")
+	}
+	if result.PartialReason != partialResultReasonForOutcome(outcome) {
+		return invalid("terminal.result.partial_reason", "does not match terminal outcome")
+	}
+	return nil
 }
 
 type ResultCertificate struct {
@@ -541,13 +594,8 @@ func (certificate TerminalCertificate) Validate() error {
 	if err := certificate.DerivedBy.Validate(); err != nil {
 		return err
 	}
-	if certificate.Result != nil {
-		if err := certificate.Result.Validate(); err != nil {
-			return err
-		}
-	}
-	if completionOutcome(certificate.Outcome) && certificate.Result == nil {
-		return invalid("terminal.result", "is required for completed outcomes")
+	if err := validateTerminalResult(certificate.Outcome, certificate.Result); err != nil {
+		return err
 	}
 	return nil
 }

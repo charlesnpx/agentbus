@@ -123,6 +123,85 @@ func TestEnumAndCertificateValidation(t *testing.T) {
 	}
 }
 
+func TestTerminalAndSafetyValidationRejectIncompatibleResultKinds(t *testing.T) {
+	completed := reducerMustApply(t, reducerCleanCompletedRecord(t), Finalize{
+		Ref:    reducerRef(),
+		Intent: TerminalIntent{Outcome: OutcomeCompleted, Cause: CauseCompletedNormally},
+	})
+	completedTerminal := *completed.Terminal
+
+	partialCompleted := completedTerminal
+	partialRef := *partialCompleted.Result
+	partialRef.Partial = true
+	partialRef.PartialReason = PartialResultReasonTimeout
+	partialCompleted.Result = &partialRef
+	if err := partialCompleted.Validate(); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("completed terminal with partial result error = %v, want ErrInvalidValue", err)
+	}
+
+	timedOut := completedTerminal
+	timedOut.Outcome = OutcomeTimedOut
+	timedOutRef := *timedOut.Result
+	timedOutRef.Partial = true
+	timedOutRef.PartialReason = PartialResultReasonTimeout
+	timedOut.Result = &timedOutRef
+	if err := timedOut.Validate(); err != nil {
+		t.Fatalf("timed out terminal with matching partial result error = %v", err)
+	}
+
+	finalTimedOut := timedOut
+	finalRef := *finalTimedOut.Result
+	finalRef.Partial = false
+	finalRef.PartialReason = ""
+	finalTimedOut.Result = &finalRef
+	if err := finalTimedOut.Validate(); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("timed out terminal with final result error = %v, want ErrInvalidValue", err)
+	}
+
+	wrongReason := timedOut
+	wrongReasonRef := *wrongReason.Result
+	wrongReasonRef.PartialReason = PartialResultReasonInterrupted
+	wrongReason.Result = &wrongReasonRef
+	if err := wrongReason.Validate(); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("timed out terminal with interrupted partial reason error = %v, want ErrInvalidValue", err)
+	}
+
+	completedPartialRecord := completed
+	completedPartialRef := completedPartialRecord.Result.Result
+	completedPartialRef.Partial = true
+	completedPartialRef.PartialReason = PartialResultReasonTimeout
+	completedPartialRecord.Result.Result = completedPartialRef
+	completedPartialRecord.Terminal.Result = &completedPartialRef
+	if err := ValidateSafetyRecord(completedPartialRecord); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("completed safety record with partial result error = %v, want ErrInvalidValue", err)
+	}
+
+	timedOutRecord := reducerConsumedRecord(t)
+	timedOutRecord = reducerMustApply(t, timedOutRecord, ObserveOutcome{Ref: reducerRef(), Outcome: OutcomeTimedOut})
+	timedOutRecord = reducerMustApply(t, timedOutRecord, reducerQuiescenceCommand(t, timedOutRecord, LaunchOrdinalOne))
+	receipt := reducerResultCommand(t, timedOutRecord).Receipt
+	receipt.Result.Partial = true
+	receipt.Result.PartialReason = PartialResultReasonTimeout
+	timedOutRecord = reducerMustApply(t, timedOutRecord, Finalize{
+		Ref: reducerRef(),
+		Intent: TerminalIntent{
+			Outcome:       OutcomeTimedOut,
+			Cause:         CauseCompletedNormally,
+			PartialResult: &receipt,
+		},
+	})
+
+	timedOutFinalRecord := timedOutRecord
+	timedOutFinalRef := timedOutFinalRecord.Result.Result
+	timedOutFinalRef.Partial = false
+	timedOutFinalRef.PartialReason = ""
+	timedOutFinalRecord.Result.Result = timedOutFinalRef
+	timedOutFinalRecord.Terminal.Result = &timedOutFinalRef
+	if err := ValidateSafetyRecord(timedOutFinalRecord); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("timed out safety record with final result error = %v, want ErrInvalidValue", err)
+	}
+}
+
 func TestSafetyRecordValidationRetainsFinalAttemptTimingIntegrity(t *testing.T) {
 	startedAt := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
 	endedBeforeStart := startedAt.Add(-time.Second)

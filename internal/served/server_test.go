@@ -9877,6 +9877,7 @@ type recordingAdmissionAuthority struct {
 
 	beforeRequestCancel func(context.Context, model.JobID) error
 	beforeRecordOutcome func(context.Context, model.JobID, model.AttemptRef, model.Outcome) error
+	beforeFinalize      func(context.Context, model.JobID, model.AttemptRef, model.TerminalIntent) error
 
 	mu              sync.Mutex
 	finalizeRecords []model.TerminalIntent
@@ -9901,6 +9902,11 @@ func (a *recordingAdmissionAuthority) RecordOutcome(ctx context.Context, jobID m
 }
 
 func (a *recordingAdmissionAuthority) Finalize(ctx context.Context, jobID model.JobID, ref model.AttemptRef, intent model.TerminalIntent) (coordinator.StepResult, error) {
+	if a.beforeFinalize != nil {
+		if err := a.beforeFinalize(ctx, jobID, ref, intent); err != nil {
+			return coordinator.StepResult{}, err
+		}
+	}
 	a.mu.Lock()
 	a.finalizeRecords = append(a.finalizeRecords, intent)
 	a.mu.Unlock()

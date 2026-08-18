@@ -3048,50 +3048,108 @@ func (s *Server) finalizeTerminal(run jobRun, state engine.JobState, text string
 	if run.session != nil {
 		backendSessionID = run.session.ID()
 	}
-	_, err := run.store.Update(run.jobID, func(record *engine.JobRecord) (bool, error) {
-		lateFinalization := run.authoritativeCompletion && canLateFinalize(record.State, state)
-		if engine.IsTerminal(record.State) && !lateFinalization {
-			return false, nil
-		}
-		var result *engine.ResultInfo
-		if state == engine.StateCompleted || state == engine.StateCompletedNoncompliant {
-			if text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
-				stamp = skippedStampForRun(run, s.registry, engine.SkipNoFinalMessage)
+	// The partial artifact is published inside the mutator, but the authoritative
+	// record save happens only after the mutator returns. If that save fails, the
+	// optional excerpt must not be left behind — on a nearly full filesystem its
+	// blocks are the ones the record write needs — so reclaim it and retry the
+	// transition without it. The excerpt is expendable; terminalizing is not.
+	publishedPartialPath := ""
+	mutate := func(allowPartial bool) func(record *engine.JobRecord) (bool, error) {
+		return func(record *engine.JobRecord) (bool, error) {
+			lateFinalization := run.authoritativeCompletion && canLateFinalize(record.State, state)
+			if engine.IsTerminal(record.State) && !lateFinalization {
+				return false, nil
 			}
-			info, err := run.store.WriteResult(run.jobID, []byte(text), s.inlineResultCap)
-			if err != nil {
+			var result *engine.ResultInfo
+			if state == engine.StateCompleted || state == engine.StateCompletedNoncompliant {
+				if text == "" && run.policy != nil && run.policy.Contract != nil && stamp == nil {
+					stamp = skippedStampForRun(run, s.registry, engine.SkipNoFinalMessage)
+				}
+				info, err := run.store.WriteResult(run.jobID, []byte(text), s.inlineResultCap)
+				if err != nil {
+					return false, err
+				}
+				info.ModelReported = record.ModelReported
+				result = &info
+			} else if _, _, partial := partialResultMetadataForState(state); partial && allowPartial {
+				info, err := s.synthesizeLegacyPartialResult(run, record, state)
+				if err != nil {
+					log.Printf("agentbus daemon: job %s partial result synthesis failed: %v", run.jobID, err)
+				} else if info != nil {
+					info.ModelReported = record.ModelReported
+					result = info
+					publishedPartialPath = info.ResultPath
+				}
+			}
+			if lateFinalization && record.State == engine.StateReaped {
+				if err := record.Transition(state, s.clock.Now().UTC()); err != nil {
+					return false, err
+				}
+			} else if err := transitionOrSet(record, state, s.clock.Now().UTC()); err != nil {
 				return false, err
 			}
-			info.ModelReported = record.ModelReported
-			result = &info
-		}
-		if lateFinalization && record.State == engine.StateReaped {
-			if err := record.Transition(state, s.clock.Now().UTC()); err != nil {
-				return false, err
+			record.Result = result
+			if stamp != nil {
+				record.Contract = stamp
 			}
-		} else if err := transitionOrSet(record, state, s.clock.Now().UTC()); err != nil {
-			return false, err
+			if run.contract != nil {
+				resolved := *run.contract
+				record.ResolvedContract = &resolved
+			}
+			if backendSessionID != "" {
+				record.BackendSessionID = backendSessionID
+			}
+			if lateFinalization {
+				record.LateFinalization = true
+			}
+			return true, nil
 		}
-		record.Result = result
-		if stamp != nil {
-			record.Contract = stamp
-		}
-		if run.contract != nil {
-			resolved := *run.contract
-			record.ResolvedContract = &resolved
-		}
-		if backendSessionID != "" {
-			record.BackendSessionID = backendSessionID
-		}
-		if lateFinalization {
-			record.LateFinalization = true
-		}
-		return true, nil
-	})
-	if err != nil {
+	}
+
+	_, err := run.store.Update(run.jobID, mutate(true))
+	if err == nil {
+		return nil
+	}
+	if publishedPartialPath == "" {
 		return err
 	}
+	// The save error is ambiguous: atomicWriteFile renames the record into place
+	// before its Chmod and directory Sync, so a failure there can mean the
+	// terminal record IS committed and already references this artifact.
+	// Reclaiming then would leave an authoritative record pointing at a deleted
+	// file, which is worse than the leak this reclaim exists to prevent. Mirror
+	// the admission path: reconcile the persisted record first, and only reclaim
+	// what it does not reference.
+	if legacyPartialResultCommitted(run, publishedPartialPath) {
+		log.Printf("agentbus daemon: job %s terminal record save reported %v but the record already commits partial result %q; keeping it and treating terminalization as committed", run.jobID, err, publishedPartialPath)
+		return nil
+	}
+	log.Printf("agentbus daemon: job %s terminal record save failed after publishing a partial result; reclaiming it and retrying without it: %v", run.jobID, err)
+	if removeErr := engine.RemovePartialResultForLayout(run.store.Layout(), run.jobID, publishedPartialPath); removeErr != nil {
+		log.Printf("agentbus daemon: job %s reclaim of uncommitted partial result %q failed: %v", run.jobID, publishedPartialPath, removeErr)
+	}
+	if _, retryErr := run.store.Update(run.jobID, mutate(false)); retryErr != nil {
+		return retryErr
+	}
 	return nil
+}
+
+// legacyPartialResultCommitted reports whether the persisted record already
+// terminalized against this exact partial artifact. A load failure is treated as
+// "not committed": reclaiming an artifact no record references is recoverable,
+// while keeping one nothing references is the leak being prevented.
+func legacyPartialResultCommitted(run jobRun, path string) bool {
+	if path == "" {
+		return false
+	}
+	record, err := run.store.Load(run.jobID)
+	if err != nil || record == nil {
+		return false
+	}
+	if !engine.IsTerminal(record.State) || record.Result == nil {
+		return false
+	}
+	return record.Result.Partial && record.Result.ResultPath == path
 }
 
 func discardEmptyBackendLogs(paths engine.LogPaths) error {

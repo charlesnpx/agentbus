@@ -4,8 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const (
@@ -19,12 +22,12 @@ type EventText struct {
 	Truncated bool   `json:"truncated"`
 }
 
-// WriteResult spills the authoritative final result and returns result metadata.
+// WriteResult spills an authoritative result artifact and returns its metadata.
 func (s *Store) WriteResult(jobID string, raw []byte, inlineCap int) (ResultInfo, error) {
 	return WriteResultForLayout(s.layout, jobID, raw, inlineCap)
 }
 
-// WriteResultForLayout writes a final result into layout.Results without
+// WriteResultForLayout writes a result artifact into layout.Results without
 // requiring a Store instance.
 func WriteResultForLayout(layout WorkspaceLayout, jobID string, raw []byte, inlineCap int) (ResultInfo, error) {
 	path, err := ResultPathForLayout(layout, jobID)
@@ -32,6 +35,57 @@ func WriteResultForLayout(layout WorkspaceLayout, jobID string, raw []byte, inli
 		return ResultInfo{}, err
 	}
 	return writeResultFile(path, raw, inlineCap)
+}
+
+const partialResultFileNameMarker = ".partial-"
+
+// WritePartialResultForLayout writes a transcript excerpt to a uniquely owned
+// result artifact. Unlike WriteResultForLayout, it never replaces another
+// result pathname.
+func WritePartialResultForLayout(layout WorkspaceLayout, jobID string, raw []byte, inlineCap int) (ResultInfo, error) {
+	prefix, err := partialResultPathPrefix(layout, jobID)
+	if err != nil {
+		return ResultInfo{}, err
+	}
+	return writePartialResultFile(layout, jobID, prefix, raw, inlineCap)
+}
+
+// RemovePartialResultForLayout removes a uniquely owned partial-result
+// artifact when it was not committed into an authority record.
+func RemovePartialResultForLayout(layout WorkspaceLayout, jobID, path string) error {
+	if !IsPartialResultPathForLayout(layout, jobID, path) {
+		return fmt.Errorf("partial result path %q is not owned by job %s", path, jobID)
+	}
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return fsyncDir(layout.Results)
+}
+
+// IsPartialResultPathForLayout reports whether path is a uniquely generated
+// partial-result artifact for jobID in layout.Results.
+func IsPartialResultPathForLayout(layout WorkspaceLayout, jobID, path string) bool {
+	prefix, err := partialResultPathPrefix(layout, jobID)
+	if err != nil {
+		return false
+	}
+	clean := filepath.Clean(path)
+	if filepath.Dir(clean) != filepath.Clean(layout.Results) {
+		return false
+	}
+	base := filepath.Base(clean)
+	prefixBase := filepath.Base(prefix)
+	if !strings.HasPrefix(base, prefixBase) || !strings.HasSuffix(base, ".txt") {
+		return false
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(base, prefixBase), ".txt") != ""
+}
+
+func partialResultPathPrefix(layout WorkspaceLayout, jobID string) (string, error) {
+	return safePathForID(layout.Results, jobID, partialResultFileNameMarker)
 }
 
 // ResultPathForLayout returns the result artifact path for jobID in layout.
@@ -70,6 +124,67 @@ func writeResultFile(path string, raw []byte, inlineCap int) (ResultInfo, error)
 	} else {
 		info.TextElided = true
 	}
+	return info, nil
+}
+
+func writePartialResultFile(layout WorkspaceLayout, jobID, prefix string, raw []byte, inlineCap int) (info ResultInfo, err error) {
+	if inlineCap <= 0 {
+		inlineCap = DefaultInlineResultCap
+	}
+	if err := os.MkdirAll(layout.Results, 0o700); err != nil {
+		return ResultInfo{}, err
+	}
+	file, err := os.CreateTemp(filepath.Dir(prefix), filepath.Base(prefix)+"*.txt")
+	if err != nil {
+		return ResultInfo{}, err
+	}
+	path := file.Name()
+	closed := false
+	committed := false
+	defer func() {
+		if !closed {
+			if closeErr := file.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+		}
+		if committed {
+			return
+		}
+		if removeErr := RemovePartialResultForLayout(layout, jobID, path); removeErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove uncommitted partial result %q: %w", path, removeErr))
+		}
+	}()
+
+	if err := file.Chmod(0o600); err != nil {
+		return ResultInfo{}, err
+	}
+	if _, err := file.Write(raw); err != nil {
+		return ResultInfo{}, err
+	}
+	if err := file.Sync(); err != nil {
+		return ResultInfo{}, err
+	}
+	if err := file.Close(); err != nil {
+		closed = true
+		return ResultInfo{}, err
+	}
+	closed = true
+	if err := fsyncDir(layout.Results); err != nil {
+		return ResultInfo{}, err
+	}
+
+	sum := sha256.Sum256(raw)
+	info = ResultInfo{
+		ResultPath: path,
+		SHA256:     hex.EncodeToString(sum[:]),
+		Bytes:      int64(len(raw)),
+	}
+	if len(raw) < inlineCap {
+		info.Text = string(raw)
+	} else {
+		info.TextElided = true
+	}
+	committed = true
 	return info, nil
 }
 

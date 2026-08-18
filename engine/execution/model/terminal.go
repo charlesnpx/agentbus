@@ -60,18 +60,62 @@ func resolveTerminalIntent(record SafetyRecord, intent TerminalIntent) (Terminal
 		return TerminalIntent{}, err
 	}
 	intent.DerivedBy = derivedBy
+	if intent.PartialResult != nil {
+		receipt := *intent.PartialResult
+		if err := receipt.Validate(); err != nil {
+			return TerminalIntent{}, invalidCommand("partial result receipt: %v", err)
+		}
+		if err := validateJobField("partial_result.job_id", receipt.JobID, record.JobID); err != nil {
+			return TerminalIntent{}, invalidCommand("%v", err)
+		}
+		if !partialResultOutcome(intent.Outcome) {
+			return TerminalIntent{}, invalidCommand("partial result requires timed_out or interrupted terminal outcome")
+		}
+		if !receipt.Result.Partial {
+			return TerminalIntent{}, invalidCommand("partial result receipt must be marked partial")
+		}
+		if receipt.Result.PartialReason != partialResultReasonForOutcome(intent.Outcome) {
+			return TerminalIntent{}, invalidCommand("partial result reason does not match terminal outcome")
+		}
+		intent.PartialResult = &receipt
+	}
 	return intent, nil
 }
 
 func terminalResult(record SafetyRecord, outcome Outcome) (*ResultRef, error) {
-	if !completionOutcome(outcome) {
+	if completionOutcome(outcome) {
+		if record.Result == nil {
+			return nil, precondition("completed terminal outcome requires result certificate")
+		}
+		if record.Result.Result.Partial {
+			return nil, precondition("completed terminal outcome cannot use partial result certificate")
+		}
+		result := record.Result.Result
+		return &result, nil
+	}
+	if !partialResultOutcome(outcome) || record.Result == nil {
 		return nil, nil
 	}
-	if record.Result == nil {
-		return nil, precondition("completed terminal outcome requires result certificate")
+	if !record.Result.Result.Partial {
+		return nil, precondition("non-completed terminal outcome cannot use final result certificate")
 	}
 	result := record.Result.Result
 	return &result, nil
+}
+
+func partialResultOutcome(outcome Outcome) bool {
+	return outcome == OutcomeTimedOut || outcome == OutcomeInterrupted
+}
+
+func partialResultReasonForOutcome(outcome Outcome) string {
+	switch outcome {
+	case OutcomeTimedOut:
+		return PartialResultReasonTimeout
+	case OutcomeInterrupted:
+		return PartialResultReasonInterrupted
+	default:
+		return ""
+	}
 }
 
 func deriveTerminalProof(record SafetyRecord, intent TerminalIntent) (TerminalProof, error) {
