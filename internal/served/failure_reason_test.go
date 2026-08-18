@@ -116,6 +116,33 @@ func TestClassifyTerminalFailure(t *testing.T) {
 	}
 }
 
+func TestClassifyTerminalFailureContentPolicy(t *testing.T) {
+	t.Parallel()
+	err := errors.New(`codex app-server turn failed: This content was flagged for possible cybersecurity risk. If this
+seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted
+Access for Cyber program: https://chatgpt.com/cyber`)
+	if got := classifyTerminalFailure(terminalFailureBackendRan, err, false); got != engine.FailureClassContentPolicy {
+		t.Fatalf("classifyTerminalFailure() = %q, want %q", got, engine.FailureClassContentPolicy)
+	}
+}
+
+func TestClassifyTerminalFailureModelUnavailable(t *testing.T) {
+	t.Parallel()
+	err := errors.New(`codex app-server turn failed: {"detail":"The 'gpt-5.6-max' model is not supported when using
+Codex with a ChatGPT account."}`)
+	if got := classifyTerminalFailure(terminalFailureBackendRan, err, false); got != engine.FailureClassModelUnavailable {
+		t.Fatalf("classifyTerminalFailure() = %q, want %q", got, engine.FailureClassModelUnavailable)
+	}
+}
+
+func TestClassifyTerminalFailureUnrecognizedBackendError(t *testing.T) {
+	t.Parallel()
+	err := errors.New("backend exited 1")
+	if got := classifyTerminalFailure(terminalFailureBackendRan, err, false); got != engine.FailureClassBackendError {
+		t.Fatalf("classifyTerminalFailure() = %q, want %q", got, engine.FailureClassBackendError)
+	}
+}
+
 func TestAuthorityFailureMetadataOnlyForFailureOrInterruptedTerminalStates(t *testing.T) {
 	projection := model.JobProjection{
 		FailureClass:  engine.FailureClassBackendInterrupted,
