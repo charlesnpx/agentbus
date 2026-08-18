@@ -530,10 +530,13 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 	}{
 		{name: "failed", status: "failed", errorText: "model failed", want: "model failed"},
 		{
+			// The message is deliberately generic: only recognizing the code can
+			// classify this, so the case fails if normalization stops matching
+			// the provider's camelCase spelling.
 			name:         "camel-case structured server overloaded task completion",
-			errorText:    "Selected model is at capacity. Please try a different model.",
+			errorText:    "provider refused this turn",
 			errorInfo:    "serverOverloaded",
-			want:         "Selected model is at capacity. Please try a different model.",
+			want:         "provider refused this turn",
 			overloaded:   true,
 			taskComplete: true,
 		},
@@ -555,6 +558,16 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 			errorText: "model failed",
 			errorInfo: "someOtherCode",
 			want:      "model failed",
+		},
+		{
+			// A model-unavailable failure quoting a model named like the overload
+			// code must not be classified as capacity: the served layer checks the
+			// overload sentinel before its text classes, so a false positive here
+			// would mask model_unavailable and tell an operator to retry.
+			name:      "quoted code-like model name is not a capacity signal",
+			errorText: "unknown model 'server_overloaded-preview'",
+			errorInfo: "model_not_found",
+			want:      "unknown model 'server_overloaded-preview'",
 		},
 		{name: "unrequested interrupted", status: "interrupted", want: "interrupted", interrupted: true},
 	}
