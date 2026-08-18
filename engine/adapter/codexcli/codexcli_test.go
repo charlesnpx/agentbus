@@ -530,11 +530,15 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 	}{
 		{name: "failed", status: "failed", errorText: "model failed", want: "model failed"},
 		{
-			name:       "structured server overloaded completion",
-			errorText:  "provider refused this turn",
-			errorInfo:  "server_overloaded",
-			want:       "provider refused this turn",
-			overloaded: true,
+			// The message is deliberately generic: only recognizing the code can
+			// classify this, so the case fails if normalization stops matching
+			// the provider's camelCase spelling.
+			name:         "camel-case structured server overloaded task completion",
+			errorText:    "provider refused this turn",
+			errorInfo:    "serverOverloaded",
+			want:         "provider refused this turn",
+			overloaded:   true,
+			taskComplete: true,
 		},
 		{
 			name:       "message-only overloaded completion",
@@ -543,18 +547,27 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 			overloaded: true,
 		},
 		{
-			name:      "different structured code suppresses capacity-message fallback",
-			errorText: "Selected model is at capacity. Please try a different model.",
-			errorInfo: "rate_limited",
-			want:      "Selected model is at capacity. Please try a different model.",
+			name:       "unrecognized structured code falls through to capacity message",
+			errorText:  "Selected model is at capacity. Please try a different model.",
+			errorInfo:  "someOtherCode",
+			want:       "Selected model is at capacity. Please try a different model.",
+			overloaded: true,
 		},
 		{
-			name:         "structured server overloaded task completion",
-			errorText:    "Selected model is at capacity. Please try a different model.",
-			errorInfo:    "server_overloaded",
-			want:         "Selected model is at capacity. Please try a different model.",
-			overloaded:   true,
-			taskComplete: true,
+			name:      "unrecognized structured code leaves unrelated message alone",
+			errorText: "model failed",
+			errorInfo: "someOtherCode",
+			want:      "model failed",
+		},
+		{
+			// A model-unavailable failure quoting a model named like the overload
+			// code must not be classified as capacity: the served layer checks the
+			// overload sentinel before its text classes, so a false positive here
+			// would mask model_unavailable and tell an operator to retry.
+			name:      "quoted code-like model name is not a capacity signal",
+			errorText: "unknown model 'server_overloaded-preview'",
+			errorInfo: "model_not_found",
+			want:      "unknown model 'server_overloaded-preview'",
 		},
 		{name: "unrequested interrupted", status: "interrupted", want: "interrupted", interrupted: true},
 	}
@@ -1183,7 +1196,7 @@ func completedParamsWithErrorInfo(threadID, turnID, status, errorText, errorInfo
 	if errorText != "" {
 		err := map[string]any{"message": errorText}
 		if errorInfo != "" {
-			err["codex_error_info"] = errorInfo
+			err["codexErrorInfo"] = errorInfo
 		}
 		turn["error"] = err
 	}
@@ -1193,7 +1206,7 @@ func completedParamsWithErrorInfo(threadID, turnID, status, errorText, errorInfo
 func taskCompleteParams(turnID, errorText, errorInfo string) map[string]any {
 	err := map[string]any{"message": errorText}
 	if errorInfo != "" {
-		err["codex_error_info"] = errorInfo
+		err["codexErrorInfo"] = errorInfo
 	}
 	return map[string]any{
 		"turn_id":            turnID,
