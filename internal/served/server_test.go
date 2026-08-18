@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -4545,6 +4546,106 @@ func TestIdentifiedCodexJobUsesPrivateHomeWithLinkedCredentials(t *testing.T) {
 	if _, err := os.Stat(wantHome); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("completed private Codex home stat = %v, want removed", err)
 	}
+}
+
+func TestIdentifiedCodexWriteJobProvisionsCacheBeforeSessionStart(t *testing.T) {
+	backend := newFakeBackend("codex")
+	block := make(chan struct{})
+	backend.block = block
+	started := make(chan engine.SessionOpts, 1)
+	backend.startHook = func(opts engine.SessionOpts) { started <- opts }
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	server.codexAuthHome = filepath.Join(t.TempDir(), "missing-codex-home")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-codex-write-cache",
+		RequestID:    "request-codex-write-cache",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: true, Prompt: "hold"},
+	})
+	var opts engine.SessionOpts
+	select {
+	case opts = <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Codex session construction did not run")
+	}
+	cacheRoot := testCodexHomePath(t, root, cwd, job.JobID)
+	if opts.WriteSandboxRoot != cacheRoot {
+		t.Fatalf("write sandbox root = %q, want %q", opts.WriteSandboxRoot, cacheRoot)
+	}
+	wantOverlay := map[string]string{
+		"GOCACHE":    filepath.Join(cacheRoot, "cache", "go-build"),
+		"GOMODCACHE": filepath.Join(cacheRoot, "cache", "go-mod"),
+		"TMPDIR":     filepath.Join(cacheRoot, "tmp"),
+	}
+	if !reflect.DeepEqual(opts.WriteEnvOverlay, wantOverlay) {
+		t.Fatalf("write environment overlay = %#v, want %#v", opts.WriteEnvOverlay, wantOverlay)
+	}
+	for _, path := range []string{cacheRoot, wantOverlay["GOCACHE"], wantOverlay["GOMODCACHE"], wantOverlay["TMPDIR"]} {
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("provisioned cache path %s stat = %v info=%v, want directory", path, err, info)
+		}
+	}
+	// Go creates module-cache directories mode 0555, and unlinking an entry needs
+	// write permission on its containing directory, so cleanup of a populated
+	// GOMODCACHE is the case that actually matters: an empty tree removes fine
+	// whether or not cleanup restores permissions.
+	moduleDir := filepath.Join(wantOverlay["GOMODCACHE"], "example.com", "mod@v1.0.0")
+	if err := os.MkdirAll(moduleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(moduleDir, "go.mod"), []byte("module example.com/mod\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{moduleDir, filepath.Dir(moduleDir)} {
+		if err := os.Chmod(dir, 0o555); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	close(block)
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
+	waitActiveJobGone(t, server, job.JobID)
+	if _, err := os.Stat(cacheRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("completed job cache root stat = %v, want removed", err)
+	}
+}
+
+func TestIdentifiedCodexReadOnlyJobDoesNotProvisionWriteCache(t *testing.T) {
+	backend := newFakeBackend("codex")
+	block := make(chan struct{})
+	backend.block = block
+	started := make(chan engine.SessionOpts, 1)
+	backend.startHook = func(opts engine.SessionOpts) { started <- opts }
+	server, root, cwd := newUnstartedTestServer(t, backend)
+	server.codexAuthHome = filepath.Join(t.TempDir(), "missing-codex-home")
+	launcher := newAdmissionFakeLaunchCustodian(t)
+	enableTestAdmission(t, server, launcher)
+
+	job := submitIdentifiedViaScriptedRequest(t, server, protocol.JobSubmitParams{
+		WorkspaceKey: "workspace-codex-read-cache",
+		RequestID:    "request-codex-read-cache",
+		TaskSpec:     protocol.TaskSpec{Backend: "codex", CWD: cwd, Write: false, Prompt: "hold"},
+	})
+	select {
+	case opts := <-started:
+		if opts.WriteSandboxRoot != "" || opts.WriteEnvOverlay != nil {
+			t.Fatalf("read-only write settings = root %q overlay %#v, want unchanged", opts.WriteSandboxRoot, opts.WriteEnvOverlay)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Codex session construction did not run")
+	}
+	cacheRoot := testCodexHomePath(t, root, cwd, job.JobID)
+	if _, err := os.Stat(filepath.Join(cacheRoot, "cache")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only cache directory stat = %v, want absent", err)
+	}
+	if _, err := os.Stat(filepath.Join(cacheRoot, "tmp")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only tmp directory stat = %v, want absent", err)
+	}
+	close(block)
+	waitAdmissionSafetyTerminal(t, server, job.JobID)
 }
 
 func TestIdentifiedCodexJobSkipsMissingCredentialLinks(t *testing.T) {

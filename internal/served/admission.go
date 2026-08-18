@@ -2289,15 +2289,16 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 		return requestOutcome{err: strictAdmissionRuntimeUnavailableError(instance.policy.runtimeAssessment, protocol.ErrorData{Backend: spec.Backend})}
 	}
 
-	// The authority owns job IDs, so an isolated Codex home cannot be named
-	// until after durable acceptance. Creating a Codex adapter session does not
-	// start its app-server process; it only prepares the session object that the
-	// later admitted turn will launch. Other backends retain the established
-	// construct-before-accept ordering.
+	// The authority owns job IDs, so an isolated Codex home or job-scoped write
+	// cache cannot be named until after durable acceptance. Creating a Codex
+	// adapter session does not start its app-server process; it only prepares
+	// the session object that the later admitted turn will launch. Other
+	// backends retain the established construct-before-accept ordering.
 	isolateCodexHome := spec.Backend == "codex" && !s.codexHomeInherit
+	deferCodexSession := spec.Backend == "codex" && (isolateCodexHome || spec.Write)
 	var session engine.Session
 	admissionSessionID := s.nextID("ses")
-	if !isolateCodexHome {
+	if !deferCodexSession {
 		session, err = descriptor.backend.Start(ctx, engine.SessionOpts{CWD: spec.CWD, Write: spec.Write, Model: spec.Model, Effort: spec.Effort, Timeout: timeout})
 		if err != nil {
 			return requestOutcome{err: backendError(err)}
@@ -2373,26 +2374,27 @@ func (s *Server) handleIdentifiedJobSubmit(ctx context.Context, raw json.RawMess
 	s.markAdmissionJob(jobID, instance)
 	containmentIntent := &launch.ContainmentIntent{}
 	run := jobRun{
-		jobID:               jobID,
-		sessionID:           admissionSessionID,
-		backend:             spec.Backend,
-		backendImpl:         descriptor.backend,
-		cwd:                 spec.CWD,
-		model:               spec.Model,
-		effort:              spec.Effort,
-		store:               store,
-		session:             session,
-		prompt:              spec.Prompt,
-		write:               spec.Write,
-		policy:              policy.policy,
-		contract:            policy.contract,
-		contractName:        policy.name,
-		contractHash:        policy.hash,
-		timeout:             timeout,
-		codexIsolated:       isolateCodexHome,
-		admissionControlled: true,
-		admissionMode:       model.ModeIdentifiedFenced,
-		admissionAccepted:   accepted,
+		jobID:                jobID,
+		sessionID:            admissionSessionID,
+		backend:              spec.Backend,
+		backendImpl:          descriptor.backend,
+		cwd:                  spec.CWD,
+		model:                spec.Model,
+		effort:               spec.Effort,
+		store:                store,
+		session:              session,
+		prompt:               spec.Prompt,
+		write:                spec.Write,
+		policy:               policy.policy,
+		contract:             policy.contract,
+		contractName:         policy.name,
+		contractHash:         policy.hash,
+		timeout:              timeout,
+		codexIsolated:        isolateCodexHome,
+		codexSessionDeferred: deferCodexSession,
+		admissionControlled:  true,
+		admissionMode:        model.ModeIdentifiedFenced,
+		admissionAccepted:    accepted,
 		admissionLaunch: admissionLaunchBinding{
 			coordinator:       instance.submission,
 			jobID:             jobModelID,
@@ -2637,7 +2639,7 @@ func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobR
 		return run, nil, false, nil
 	}
 	if run.session == nil {
-		if run.backend != "codex" || !run.codexIsolated {
+		if run.backend != "codex" || !run.codexSessionDeferred {
 			return run, nil, false, errors.New("admission session is not ready")
 		}
 		if run.backendImpl == nil {
@@ -2647,18 +2649,41 @@ func (s *Server) prepareAdmittedJobLaunch(ctx context.Context, run jobRun) (jobR
 		if err != nil {
 			return run, nil, false, err
 		}
-		run.codexHome, run.managedCodexHome, err = s.prepareCodexHome(layout, run.jobID)
-		if err != nil {
-			return run, nil, false, err
+		if run.codexIsolated {
+			run.codexHome, run.managedCodexHome, err = s.prepareCodexHome(layout, run.jobID)
+			if err != nil {
+				return run, nil, false, err
+			}
 		}
-		session, err := run.backendImpl.Start(ctx, engine.SessionOpts{
-			CWD:        run.cwd,
-			Write:      run.write,
-			Model:      run.model,
-			Effort:     run.effort,
-			Timeout:    run.timeout,
-			EnvOverlay: map[string]string{"CODEX_HOME": run.codexHome},
-		})
+		opts := engine.SessionOpts{
+			CWD:     run.cwd,
+			Write:   run.write,
+			Model:   run.model,
+			Effort:  run.effort,
+			Timeout: run.timeout,
+		}
+		if run.codexHome != "" {
+			opts.EnvOverlay = map[string]string{"CODEX_HOME": run.codexHome}
+		}
+		if run.write {
+			cache, managed, cacheErr := prepareCodexJobCache(layout, run.jobID, run.managedCodexHome)
+			if managed != nil {
+				run.managedCodexHome = managed
+			}
+			if cacheErr != nil {
+				return run, nil, false, cacheErr
+			}
+			run.jobCache = cache
+			opts.WriteSandboxRoot = cache.root
+			// Override unconditionally: inherited host cache and temporary paths are
+			// outside the write sandbox, which is the condition this cache fixes.
+			opts.WriteEnvOverlay = map[string]string{
+				"GOCACHE":    cache.goBuild,
+				"GOMODCACHE": cache.goMod,
+				"TMPDIR":     cache.tmp,
+			}
+		}
+		session, err := run.backendImpl.Start(ctx, opts)
 		if err != nil {
 			return run, nil, false, err
 		}

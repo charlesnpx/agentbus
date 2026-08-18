@@ -320,6 +320,173 @@ func TestAppServerTurnSandboxPolicyFollowsWritePolicy(t *testing.T) {
 	}
 }
 
+func TestAppServerWriteCacheAppliesOnlyToWriteTurns(t *testing.T) {
+	cwd := t.TempDir()
+	cacheRoot := filepath.Join(t.TempDir(), "job-cache")
+	ambient := map[string]string{
+		"GOCACHE":    "ambient-go-build",
+		"GOMODCACHE": "ambient-go-mod",
+		"TMPDIR":     "ambient-tmp",
+	}
+	for key, value := range ambient {
+		t.Setenv(key, value)
+	}
+	writeOverlay := map[string]string{
+		"GOCACHE":    filepath.Join(cacheRoot, "cache", "go-build"),
+		"GOMODCACHE": filepath.Join(cacheRoot, "cache", "go-mod"),
+		"TMPDIR":     filepath.Join(cacheRoot, "tmp"),
+	}
+
+	for _, tt := range []struct {
+		name       string
+		write      bool
+		wantPolicy map[string]any
+		wantEnv    map[string]string
+	}{
+		{
+			name:  "write",
+			write: true,
+			wantPolicy: map[string]any{
+				"type":          "workspaceWrite",
+				"networkAccess": false,
+				"writableRoots": []any{cwd, cacheRoot},
+			},
+			wantEnv: writeOverlay,
+		},
+		{
+			name:  "read only",
+			write: false,
+			wantPolicy: map[string]any{
+				"type":          "readOnly",
+				"networkAccess": false,
+			},
+			wantEnv: ambient,
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+				peer := newAppServerPeer(t, proc)
+				peer.handshake()
+				thread := peer.expectRequest("thread/start")
+				peer.respond(thread, threadResult("thread-1"))
+				turn := peer.expectRequest("turn/start")
+				params, ok := turn["params"].(map[string]any)
+				if !ok {
+					t.Fatalf("turn/start params = %#v", turn["params"])
+				}
+				gotPolicy, ok := params["sandboxPolicy"].(map[string]any)
+				if !ok || !reflect.DeepEqual(gotPolicy, tt.wantPolicy) {
+					t.Fatalf("turn/start sandboxPolicy = %#v, want %#v", params["sandboxPolicy"], tt.wantPolicy)
+				}
+				peer.respond(turn, turnResult("turn-1"))
+				peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+			})
+			session := startFakeCodexSession(t, engine.SessionOpts{
+				CWD:              cwd,
+				WriteSandboxRoot: cacheRoot,
+				WriteEnvOverlay:  writeOverlay,
+			})
+			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello", Write: tt.write}, runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = collectEventsWithTimeout(t, events, 2*time.Second)
+			spec := runner.lastSpec()
+			for key, want := range tt.wantEnv {
+				got, ok := execSpecEnvironmentValue(spec, key)
+				if !ok || got != want {
+					t.Fatalf("%s = %q present=%t, want %q", key, got, ok, want)
+				}
+			}
+		})
+	}
+}
+
+// TestAppServerWriteCacheDoesNotLeakIntoReadOnlyRetryOnSameSession pins the
+// boundary the table test above cannot: each of its cases builds a fresh
+// session, so it would pass even if a write turn contaminated persistent session
+// state and a following read-only turn inherited the overlay or extra root.
+// A read-only retry after a write attempt reuses one session, so that is the
+// path where a leak would actually happen.
+func TestAppServerWriteCacheDoesNotLeakIntoReadOnlyRetryOnSameSession(t *testing.T) {
+	cwd := t.TempDir()
+	cacheRoot := filepath.Join(t.TempDir(), "job-cache")
+	ambient := map[string]string{
+		"GOCACHE":    "ambient-go-build",
+		"GOMODCACHE": "ambient-go-mod",
+		"TMPDIR":     "ambient-tmp",
+	}
+	for key, value := range ambient {
+		t.Setenv(key, value)
+	}
+	writeOverlay := map[string]string{
+		"GOCACHE":    filepath.Join(cacheRoot, "cache", "go-build"),
+		"GOMODCACHE": filepath.Join(cacheRoot, "cache", "go-mod"),
+		"TMPDIR":     filepath.Join(cacheRoot, "tmp"),
+	}
+
+	newRunner := func(turnID, threadMethod string, wantPolicy map[string]any) *fakeAppServerRunner {
+		return newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+			peer := newAppServerPeer(t, proc)
+			peer.handshake()
+			thread := peer.expectRequest(threadMethod)
+			peer.respond(thread, threadResult("thread-1"))
+			turn := peer.expectRequest("turn/start")
+			params, ok := turn["params"].(map[string]any)
+			if !ok {
+				t.Fatalf("turn/start params = %#v", turn["params"])
+			}
+			gotPolicy, ok := params["sandboxPolicy"].(map[string]any)
+			if !ok || !reflect.DeepEqual(gotPolicy, wantPolicy) {
+				t.Fatalf("turn/start sandboxPolicy = %#v, want %#v", params["sandboxPolicy"], wantPolicy)
+			}
+			peer.respond(turn, turnResult(turnID))
+			peer.notify("turn/completed", completedParams("thread-1", turnID, "completed", ""))
+		})
+	}
+
+	session := startFakeCodexSession(t, engine.SessionOpts{
+		CWD:              cwd,
+		WriteSandboxRoot: cacheRoot,
+		WriteEnvOverlay:  writeOverlay,
+	})
+
+	writeRunner := newRunner("turn-1", "thread/start", map[string]any{
+		"type":          "workspaceWrite",
+		"networkAccess": false,
+		"writableRoots": []any{cwd, cacheRoot},
+	})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "write", Write: true}, writeRunner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	for key, want := range writeOverlay {
+		if got, ok := execSpecEnvironmentValue(writeRunner.lastSpec(), key); !ok || got != want {
+			t.Fatalf("write turn %s = %q present=%t, want %q", key, got, ok, want)
+		}
+	}
+
+	// The second turn resumes the established thread rather than starting a new
+	// one, which is exactly why it is the interesting case: session state carries
+	// across it.
+	readRunner := newRunner("turn-2", "thread/resume", map[string]any{
+		"type":          "readOnly",
+		"networkAccess": false,
+	})
+	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "read", Write: false}, readRunner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	for key, want := range ambient {
+		if got, ok := execSpecEnvironmentValue(readRunner.lastSpec(), key); !ok || got != want {
+			t.Fatalf("read-only retry %s = %q present=%t, want the ambient value %q", key, got, ok, want)
+		}
+	}
+}
+
 func TestAppServerThreadsStartThenResumeWithReturnedID(t *testing.T) {
 	runner := newFakeAppServerRunner(t,
 		func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
@@ -530,11 +697,15 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 	}{
 		{name: "failed", status: "failed", errorText: "model failed", want: "model failed"},
 		{
-			name:       "structured server overloaded completion",
-			errorText:  "provider refused this turn",
-			errorInfo:  "server_overloaded",
-			want:       "provider refused this turn",
-			overloaded: true,
+			// The message is deliberately generic: only recognizing the code can
+			// classify this, so the case fails if normalization stops matching
+			// the provider's camelCase spelling.
+			name:         "camel-case structured server overloaded task completion",
+			errorText:    "provider refused this turn",
+			errorInfo:    "serverOverloaded",
+			want:         "provider refused this turn",
+			overloaded:   true,
+			taskComplete: true,
 		},
 		{
 			name:       "message-only overloaded completion",
@@ -543,18 +714,27 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 			overloaded: true,
 		},
 		{
-			name:      "different structured code suppresses capacity-message fallback",
-			errorText: "Selected model is at capacity. Please try a different model.",
-			errorInfo: "rate_limited",
-			want:      "Selected model is at capacity. Please try a different model.",
+			name:       "unrecognized structured code falls through to capacity message",
+			errorText:  "Selected model is at capacity. Please try a different model.",
+			errorInfo:  "someOtherCode",
+			want:       "Selected model is at capacity. Please try a different model.",
+			overloaded: true,
 		},
 		{
-			name:         "structured server overloaded task completion",
-			errorText:    "Selected model is at capacity. Please try a different model.",
-			errorInfo:    "server_overloaded",
-			want:         "Selected model is at capacity. Please try a different model.",
-			overloaded:   true,
-			taskComplete: true,
+			name:      "unrecognized structured code leaves unrelated message alone",
+			errorText: "model failed",
+			errorInfo: "someOtherCode",
+			want:      "model failed",
+		},
+		{
+			// A model-unavailable failure quoting a model named like the overload
+			// code must not be classified as capacity: the served layer checks the
+			// overload sentinel before its text classes, so a false positive here
+			// would mask model_unavailable and tell an operator to retry.
+			name:      "quoted code-like model name is not a capacity signal",
+			errorText: "unknown model 'server_overloaded-preview'",
+			errorInfo: "model_not_found",
+			want:      "unknown model 'server_overloaded-preview'",
 		},
 		{name: "unrequested interrupted", status: "interrupted", want: "interrupted", interrupted: true},
 	}
@@ -945,6 +1125,16 @@ func (r *fakeAppServerRunner) lastSpec() command.ExecSpec {
 	return r.specs[len(r.specs)-1]
 }
 
+func execSpecEnvironmentValue(spec command.ExecSpec, key string) (string, bool) {
+	for _, entry := range spec.Env {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok && name == key {
+			return value, true
+		}
+	}
+	return "", false
+}
+
 type fakeAppServerProcess struct {
 	stdinR  *io.PipeReader
 	stdinW  *trackedPipeWriter
@@ -1183,7 +1373,7 @@ func completedParamsWithErrorInfo(threadID, turnID, status, errorText, errorInfo
 	if errorText != "" {
 		err := map[string]any{"message": errorText}
 		if errorInfo != "" {
-			err["codex_error_info"] = errorInfo
+			err["codexErrorInfo"] = errorInfo
 		}
 		turn["error"] = err
 	}
@@ -1193,7 +1383,7 @@ func completedParamsWithErrorInfo(threadID, turnID, status, errorText, errorInfo
 func taskCompleteParams(turnID, errorText, errorInfo string) map[string]any {
 	err := map[string]any{"message": errorText}
 	if errorInfo != "" {
-		err["codex_error_info"] = errorInfo
+		err["codexErrorInfo"] = errorInfo
 	}
 	return map[string]any{
 		"turn_id":            turnID,

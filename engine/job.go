@@ -49,6 +49,12 @@ const (
 	// overload refusal. It does not establish whether backend work occurred and
 	// therefore does not by itself license an automatic retry.
 	FailureClassProviderOverloaded FailureClass = "provider_overloaded"
+	// FailureClassContentPolicy means the provider refused the request on
+	// content-policy grounds; the prompt must change before a retry can succeed.
+	FailureClassContentPolicy FailureClass = "content_policy"
+	// FailureClassModelUnavailable means the requested model is not available to
+	// this backend or account; the model must change before a retry can succeed.
+	FailureClassModelUnavailable FailureClass = "model_unavailable"
 	// FailureClassBackendError means a launched backend turn returned an error;
 	// it may have performed work before doing so.
 	FailureClassBackendError FailureClass = "backend_error"
@@ -86,6 +92,8 @@ func (class FailureClass) Valid() bool {
 	switch class {
 	case FailureClassBackendNotStarted,
 		FailureClassProviderOverloaded,
+		FailureClassContentPolicy,
+		FailureClassModelUnavailable,
 		FailureClassBackendError,
 		FailureClassBackendInterrupted,
 		FailureClassTransportFrameTooLarge,

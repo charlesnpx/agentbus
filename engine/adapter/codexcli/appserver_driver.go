@@ -753,14 +753,38 @@ func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer
 	}
 }
 
+// isProviderOverloaded recognizes a confirmed overload code or a capacity message.
+// An unrecognized errorInfo is no signal and must fall through to the message
+// heuristic; providers can introduce new codes without suppressing it.
+//
+// The fall-through is narrowed to the human-language phrase. The other two
+// fragments are code spellings, which only appear in a message when a code has
+// leaked into prose, and provider messages quote caller-supplied identifiers: a
+// model-unavailable failure reporting an unknown model named "server_overloaded"
+// would otherwise be reported as capacity, telling an operator to retry when the
+// model is what must change. When no code is supplied at all, all three
+// fragments still apply exactly as before.
 func isProviderOverloaded(errorInfo, message string) bool {
-	if errorInfo = strings.TrimSpace(errorInfo); errorInfo != "" {
-		return strings.EqualFold(errorInfo, "server_overloaded")
+	errorInfo = normalizeProviderErrorInfo(errorInfo)
+	if errorInfo == "serveroverloaded" {
+		return true
 	}
 	message = strings.ToLower(message)
-	return strings.Contains(message, "at capacity") ||
-		strings.Contains(message, "server overloaded") ||
+	if strings.Contains(message, "at capacity") {
+		return true
+	}
+	if errorInfo != "" {
+		return false
+	}
+	return strings.Contains(message, "server overloaded") ||
 		strings.Contains(message, "server_overloaded")
+}
+
+func normalizeProviderErrorInfo(errorInfo string) string {
+	errorInfo = strings.TrimSpace(errorInfo)
+	errorInfo = strings.ReplaceAll(errorInfo, "_", "")
+	errorInfo = strings.ReplaceAll(errorInfo, "-", "")
+	return strings.ToLower(errorInfo)
 }
 
 func threadParams(opts engine.SessionOpts, input engine.TurnInput, resumeID string) map[string]any {
@@ -784,7 +808,7 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 	params := map[string]any{
 		"threadId":       threadID,
 		"approvalPolicy": "never",
-		"sandboxPolicy":  sandboxPolicy(input.Write, opts.CWD, writePolicy),
+		"sandboxPolicy":  sandboxPolicy(input.Write, opts.CWD, opts.WriteSandboxRoot, writePolicy),
 		"input": []map[string]any{{
 			"type": "text",
 			"text": input.Prompt,
@@ -809,7 +833,7 @@ func sandboxMode(write bool) string {
 	return "read-only"
 }
 
-func sandboxPolicy(write bool, cwd string, writePolicy WritePolicy) map[string]any {
+func sandboxPolicy(write bool, cwd, writeSandboxRoot string, writePolicy WritePolicy) map[string]any {
 	if !write {
 		return map[string]any{
 			"type":          "readOnly",
@@ -825,8 +849,15 @@ func sandboxPolicy(write bool, cwd string, writePolicy WritePolicy) map[string]a
 		"type":          "workspaceWrite",
 		"networkAccess": writePolicy == WritePolicyWorkspaceNetwork,
 	}
+	roots := make([]string, 0, 2)
 	if root := workspaceRoot(cwd); root != "" {
-		policy["writableRoots"] = []string{root}
+		roots = append(roots, root)
+	}
+	if writeSandboxRoot != "" {
+		roots = append(roots, writeSandboxRoot)
+	}
+	if len(roots) > 0 {
+		policy["writableRoots"] = roots
 	}
 	return policy
 }
