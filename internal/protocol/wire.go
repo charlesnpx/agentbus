@@ -109,20 +109,27 @@ type ContractResult struct {
 	Evaluated    bool     `json:"evaluated"`
 	Compliant    bool     `json:"compliant"`
 	Attempts     int      `json:"attempts"`
-	Violations   []string `json:"violations,omitempty"`
+	Violations   []string `json:"violations"`
+}
+
+// ContractVerdict is the compact output-schema evaluation result included in
+// a listed job.
+type ContractVerdict struct {
+	Evaluated bool `json:"evaluated"`
+	Compliant bool `json:"compliant"`
 }
 
 // TaskSpecV3 describes a job submitted through protocol v3.
 type TaskSpecV3 struct {
-	Backend      string            `json:"backend"`
-	CWD          string            `json:"cwd"`
-	Prompt       string            `json:"prompt"`
-	Write        bool              `json:"write"`
-	Model        string            `json:"model,omitempty"`
-	Effort       string            `json:"effort,omitempty"`
-	TimeoutMS    *int64            `json:"timeoutMs,omitempty"`
-	OutputSchema json.RawMessage   `json:"outputSchema,omitempty"`
-	Tags         map[string]string `json:"tags,omitempty"`
+	Backend      string             `json:"backend"`
+	CWD          string             `json:"cwd"`
+	Prompt       string             `json:"prompt"`
+	Write        bool               `json:"write"`
+	Model        *string            `json:"model,omitempty"`
+	Effort       *string            `json:"effort,omitempty"`
+	TimeoutMS    *int64             `json:"timeoutMs,omitempty"`
+	OutputSchema json.RawMessage    `json:"outputSchema,omitempty"`
+	Tags         *map[string]string `json:"tags,omitempty"`
 }
 
 // JobSubmitParamsV3 is the parameter object for job.submit.
@@ -136,19 +143,19 @@ type JobSubmitParamsV3 struct {
 type JobSubmitResultV3 struct {
 	JobID        string                    `json:"jobId"`
 	State        PublicState               `json:"state"`
-	Deduplicated bool                      `json:"deduplicated,omitempty"`
+	Deduplicated bool                      `json:"deduplicated"`
 	Timeout      *engine.TimeoutResolution `json:"timeout,omitempty"`
 }
 
-// JobGetParams is the parameter object for job.get. An empty JobID lists all
-// jobs.
+// JobGetParams is the parameter object for job.get. A non-empty JobID returns
+// a JobRecordWire directly; an empty JobID returns a JobGetListResult.
 type JobGetParams struct {
 	JobID string `json:"jobId,omitempty"`
 }
 
-// JobGetResult is the result object for job.get.
-type JobGetResult struct {
-	Jobs []JobRecordWire `json:"jobs"`
+// JobGetListResult is the response to job.get when JobID is empty.
+type JobGetListResult struct {
+	Jobs []JobSummaryWire `json:"jobs"`
 }
 
 // JobCancelParamsV3 is the parameter object for job.cancel.
@@ -171,7 +178,7 @@ type HelloResultV3 struct {
 	BackendMetadata []BackendInfo `json:"backendMetadata,omitempty"`
 }
 
-// JobRecordWire is the single record projected by both status and result.
+// JobRecordWire is the detailed response to job.get when JobID is provided.
 type JobRecordWire struct {
 	JobID         string                    `json:"jobId"`
 	WorkspaceKey  string                    `json:"workspaceKey"`
@@ -191,6 +198,30 @@ type JobRecordWire struct {
 	ModelReported string                    `json:"modelReported,omitempty"`
 }
 
+// JobSummaryWire is the compact item returned when job.get lists jobs. It
+// deliberately excludes request-local identifiers, task details, detailed
+// results, failure reasons, logs, and process claims.
+type JobSummaryWire struct {
+	// JobID lets a client select this job for a subsequent detailed lookup.
+	JobID string `json:"jobId"`
+	// Backend identifies the executor for a listed job.
+	Backend string `json:"backend"`
+	// State lets a client distinguish pending work from terminal work.
+	State PublicState `json:"state"`
+	// Cleanup reports post-run cleanup certainty alongside the public state.
+	Cleanup Cleanup `json:"cleanup"`
+	// CreatedAt reports when the job was created.
+	CreatedAt time.Time `json:"createdAt"`
+	// UpdatedAt reports when the job was last updated.
+	UpdatedAt time.Time `json:"updatedAt"`
+	// ModelReported is the model reported by the backend, when available.
+	ModelReported string `json:"modelReported,omitempty"`
+	// FailureClass is the compact failure category for a failed job, when set.
+	FailureClass FailureClass `json:"failureClass,omitempty"`
+	// Contract is the compact output-schema verdict, when evaluation occurred.
+	Contract *ContractVerdict `json:"contract,omitempty"`
+}
+
 // JobFailureWire records the public failure category and reason for a job.
 type JobFailureWire struct {
 	Class  FailureClass `json:"class"`
@@ -199,12 +230,10 @@ type JobFailureWire struct {
 
 // ResultInfoWire describes the authoritative spilled final result.
 type ResultInfoWire struct {
-	Text          string `json:"text,omitempty"`
-	TextElided    bool   `json:"textElided,omitempty"`
-	ResultPath    string `json:"resultPath"`
-	SHA256        string `json:"sha256"`
-	Bytes         int64  `json:"bytes"`
-	ModelReported string `json:"modelReported,omitempty"`
+	Text       string `json:"text,omitempty"`
+	ResultPath string `json:"resultPath"`
+	SHA256     string `json:"sha256"`
+	Bytes      int64  `json:"bytes"`
 }
 
 // LogPathsWire identifies captured backend log files.
