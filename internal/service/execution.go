@@ -216,6 +216,7 @@ func (s *Server) enqueueQueuedJob(record jobstore.Record, backend engine.Backend
 // a provider process. The process-claim callback runs only after the retained
 // adapter has forked and execed into its own process group.
 func (s *Server) runJob(parent context.Context, record jobstore.Record, run *activeExecution) {
+	defer s.closeManagedCodexHome(record.JobID)
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -273,13 +274,50 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, fmt.Errorf("backend %q is unavailable", record.Backend), nil)
 		return
 	}
-	session, err := run.backend.Start(jobCtx, engine.SessionOpts{
+	opts := engine.SessionOpts{
 		CWD:     record.CWD,
 		Write:   record.Write,
 		Model:   record.Model,
 		Effort:  record.Effort,
 		Timeout: timeout,
-	})
+	}
+	if record.Backend == "codex" {
+		layout, err := engine.LayoutForWorkspace(s.stateRoot, record.CWD)
+		if err != nil {
+			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare Codex workspace layout: %w", err), nil)
+			return
+		}
+		codexHome, managed, err := s.prepareCodexHome(layout, record.JobID)
+		if managed != nil {
+			s.rememberManagedCodexHome(record.JobID, managed)
+		}
+		if err != nil {
+			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare Codex home: %w", err), nil)
+			return
+		}
+		if codexHome != "" {
+			opts.EnvOverlay = map[string]string{"CODEX_HOME": codexHome}
+		}
+		if record.Write {
+			cache, managed, cacheErr := prepareCodexJobCache(layout, record.JobID, managed)
+			if managed != nil {
+				s.rememberManagedCodexHome(record.JobID, managed)
+			}
+			if cacheErr != nil {
+				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare Codex job cache: %w", cacheErr), nil)
+				return
+			}
+			opts.WriteSandboxRoot = cache.root
+			// Override unconditionally: inherited host cache and temporary paths are
+			// outside the write sandbox, which is the condition this cache fixes.
+			opts.WriteEnvOverlay = map[string]string{
+				"GOCACHE":    cache.goBuild,
+				"GOMODCACHE": cache.goMod,
+				"TMPDIR":     cache.tmp,
+			}
+		}
+	}
+	session, err := run.backend.Start(jobCtx, opts)
 	if err != nil {
 		s.finishStartError(store, record, jobCtx, err)
 		return
@@ -484,20 +522,14 @@ func classifyStartFailure(err error) protocol.FailureClass {
 	if errors.Is(err, engine.ErrProviderOverloaded) {
 		return protocol.FailureClassProviderOverloaded
 	}
-	return protocol.FailureClassBackendUnavailable
+	return classifyTerminalFailure(terminalFailureBackendNotStarted, err, false)
 }
 
 func classifyExecutionFailure(err error) protocol.FailureClass {
-	switch {
-	case errors.Is(err, engine.ErrProviderOverloaded):
-		return protocol.FailureClassProviderOverloaded
-	case errors.Is(err, context.DeadlineExceeded):
+	if errors.Is(err, context.DeadlineExceeded) {
 		return protocol.FailureClassTimeout
-	case errors.Is(err, context.Canceled), errors.Is(err, engine.ErrTurnInterrupted):
-		return protocol.FailureClassInterrupted
-	default:
-		return protocol.FailureClassBackendError
 	}
+	return classifyTerminalFailure(terminalFailureBackendRan, err, false)
 }
 
 type turnOutcome struct {
@@ -668,6 +700,19 @@ func (s *Server) recordExecutionFailure(store *jobstore.Store, record jobstore.R
 }
 
 func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobstore.TerminalUpdate) {
+	if home := s.takeManagedCodexHome(jobID); home != nil {
+		current, getErr := store.Get(jobID)
+		if getErr != nil {
+			home.close()
+			terminal.Cleanup = protocol.CleanupUncertain
+			terminal.Diagnostics = append(terminal.Diagnostics, "inspect managed Codex home terminal record: "+getErr.Error())
+		} else if current.State.IsTerminal() {
+			home.close()
+			return
+		} else {
+			terminal.Cleanup, terminal.Diagnostics = finalizeManagedCodexHome(home, terminal.State, terminal.Cleanup, terminal.Diagnostics)
+		}
+	}
 	_, err := store.MarkTerminal(jobID, terminal)
 	if err == nil || errors.Is(err, jobstore.ErrTerminal) {
 		// ErrTerminal is the store-enforced first-terminal-wins result. A

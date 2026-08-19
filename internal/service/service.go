@@ -77,6 +77,16 @@ type Config struct {
 	Token      string
 	Backends   []engine.Backend
 
+	// CodexHomeOverride selects a fixed CODEX_HOME instead of a per-job home.
+	// It is intended for an operator-owned compatibility configuration.
+	CodexHomeOverride string
+	// CodexHomeInherit preserves the historical inherited CODEX_HOME behavior.
+	// It wins over CodexHomeOverride when both are configured.
+	CodexHomeInherit bool
+	// CodexAuthHome selects the operator home from which auth.json and
+	// config.toml are linked into a managed per-job CODEX_HOME.
+	CodexAuthHome string
+
 	IdleTimeout       time.Duration
 	IdleCheckInterval time.Duration
 	ShutdownTimeout   time.Duration
@@ -121,6 +131,12 @@ type Server struct {
 	socketPath string
 	token      string
 	backends   map[string]engine.Backend
+
+	codexHomeOverride string
+	codexHomeInherit  bool
+	codexAuthHome     string
+	codexHomesMu      sync.Mutex
+	managedCodexHomes map[string]*managedCodexHome
 
 	jobStoreMu sync.Mutex
 	jobStore   *jobstore.Store
@@ -200,6 +216,10 @@ func New(cfg Config) (*Server, error) {
 		socketPath:        socketPath,
 		token:             token,
 		backends:          backends,
+		codexHomeOverride: cfg.CodexHomeOverride,
+		codexHomeInherit:  cfg.CodexHomeInherit,
+		codexAuthHome:     cfg.CodexAuthHome,
+		managedCodexHomes: make(map[string]*managedCodexHome),
 		idleTimeout:       idleTimeout,
 		idleCheckInterval: idleCheckInterval,
 		shutdownTimeout:   normalizeShutdownTimeout(cfg.ShutdownTimeout),
@@ -263,10 +283,16 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	if startupCtx == nil {
 		startupCtx = ctx
 	}
-	if _, err := s.ensureJobStore(); err != nil {
+	store, err := s.ensureJobStore()
+	if err != nil {
 		return err
 	}
 	defer s.closeJobStore()
+	if err := s.sweepManagedCodexHomes(store); err != nil {
+		// A sweep cannot safely broaden into a path-based deletion fallback.
+		// Retain anything it could not inspect and keep the daemon available.
+		log.Printf("agentbus service: startup managed Codex home sweep: %v", err)
+	}
 	if err := s.captureBinaryIdentity(); err != nil {
 		return err
 	}
