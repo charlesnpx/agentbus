@@ -1,10 +1,10 @@
 package jobstore
 
 import (
-	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,12 +17,12 @@ func TestSubmitReplaySkipsDeletedCWD(t *testing.T) {
 	defer closeTestStore(t, store)
 
 	key := RequestKey{WorkspaceKey: "workspace-replay", RequestID: "request-replay"}
-	hash := testHash("same exact task spec")
+	taskSpec := testTaskSpec("same exact task spec")
 	cwd := filepath.Join(t.TempDir(), "deleted-workspace")
 	if err := os.Mkdir(cwd, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	original, deduplicated, err := store.SubmitTx(key, hash, func(string) Record {
+	original, deduplicated, err := store.SubmitTx(key, taskSpec, func(string) Record {
 		return Record{Backend: "codex", CWD: cwd}
 	})
 	if err != nil || deduplicated {
@@ -33,7 +33,7 @@ func TestSubmitReplaySkipsDeletedCWD(t *testing.T) {
 	}
 
 	factoryCalled := false
-	replayed, deduplicated, err := store.SubmitTx(key, hash, func(string) Record {
+	replayed, deduplicated, err := store.SubmitTx(key, taskSpec, func(string) Record {
 		factoryCalled = true
 		if _, err := os.Stat(cwd); err != nil {
 			t.Fatalf("replay tried to stat deleted cwd: %v", err)
@@ -51,19 +51,33 @@ func TestSubmitReplaySkipsDeletedCWD(t *testing.T) {
 	}
 }
 
-func TestSubmitDifferentHashConflictsWithoutMutation(t *testing.T) {
+func TestSubmitReplayMatchesOnlyCanonicalTaskSpec(t *testing.T) {
 	store := newTestStore(t)
 	defer closeTestStore(t, store)
 
 	key := RequestKey{WorkspaceKey: "workspace-conflict", RequestID: "request-conflict"}
-	original, _, err := store.SubmitTx(key, testHash("one"), func(string) Record {
-		return Record{Backend: "codex"}
+	firstTaskSpec := testTaskSpec("one")
+	expectedTaskSpec := append([]byte(nil), firstTaskSpec...)
+	secondTaskSpec := testTaskSpec("two")
+	original, _, err := store.SubmitTx(key, firstTaskSpec, func(string) Record {
+		copy(firstTaskSpec, secondTaskSpec)
+		return Record{Backend: "codex", TaskSpec: testTaskSpec("factory supplied a different task")}
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got, want := string(original.TaskSpec), string(expectedTaskSpec); got != want {
+		t.Fatalf("stored task spec = %s, want canonical submit task %s", got, want)
+	}
+	stored, err := store.Get(original.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(stored.TaskSpec), string(expectedTaskSpec); got != want {
+		t.Fatalf("durable task spec = %s, want canonical submit task %s", got, want)
+	}
 	factoryCalled := false
-	_, _, err = store.SubmitTx(key, testHash("two"), func(string) Record {
+	_, _, err = store.SubmitTx(key, secondTaskSpec, func(string) Record {
 		factoryCalled = true
 		return Record{Backend: "must-not-be-created"}
 	})
@@ -84,7 +98,7 @@ func TestSubmitDifferentHashConflictsWithoutMutation(t *testing.T) {
 	if len(records) != 1 || records[0].JobID != original.JobID {
 		t.Fatalf("records after conflict = %+v, want only %q", records, original.JobID)
 	}
-	replayed, deduplicated, err := store.SubmitTx(key, testHash("one"), func(string) Record {
+	replayed, deduplicated, err := store.SubmitTx(key, expectedTaskSpec, func(string) Record {
 		t.Fatal("matching replay invoked new-record factory")
 		return Record{}
 	})
@@ -98,9 +112,10 @@ func TestSubmitTransactionRollsBackJobAndBinding(t *testing.T) {
 	defer closeTestStore(t, store)
 
 	key := RequestKey{WorkspaceKey: "workspace-atomic", RequestID: "request-atomic"}
+	taskSpec := testTaskSpec("atomic task")
 	injected := errors.New("injected after job put")
 	store.setSubmitFailureForTest(injected)
-	_, _, err := store.SubmitTx(key, testHash("atomic task"), func(string) Record {
+	_, _, err := store.SubmitTx(key, taskSpec, func(string) Record {
 		return Record{Backend: "codex"}
 	})
 	if !errors.Is(err, injected) {
@@ -114,7 +129,7 @@ func TestSubmitTransactionRollsBackJobAndBinding(t *testing.T) {
 		t.Fatalf("records after injected transaction failure = %+v, want none", records)
 	}
 	store.setSubmitFailureForTest(nil)
-	record, deduplicated, err := store.SubmitTx(key, testHash("atomic task"), func(string) Record {
+	record, deduplicated, err := store.SubmitTx(key, taskSpec, func(string) Record {
 		return Record{Backend: "codex"}
 	})
 	if err != nil || deduplicated || record.JobID == "" {
@@ -127,7 +142,7 @@ func TestGeneratedJobIDIsOpaque(t *testing.T) {
 	defer closeTestStore(t, store)
 
 	key := RequestKey{WorkspaceKey: "workspace-opaque-sentinel", RequestID: "request-opaque-sentinel"}
-	record, _, err := store.SubmitTx(key, testHash("opaque task"), func(string) Record {
+	record, _, err := store.SubmitTx(key, testTaskSpec("opaque task"), func(string) Record {
 		return Record{Backend: "codex", CWD: "/workspace/opaque-sentinel"}
 	})
 	if err != nil {
@@ -151,7 +166,7 @@ func TestReopenRecoversTerminalRecord(t *testing.T) {
 	}
 	record, _, err := store.SubmitTx(
 		RequestKey{WorkspaceKey: "workspace-reopen", RequestID: "request-reopen"},
-		testHash("terminal task"),
+		testTaskSpec("terminal task"),
 		func(string) Record { return Record{Backend: "codex", Model: "gpt-test"} },
 	)
 	if err != nil {
@@ -174,7 +189,7 @@ func TestReopenRecoversTerminalRecord(t *testing.T) {
 	}
 	queued, _, err := store.SubmitTx(
 		RequestKey{WorkspaceKey: "workspace-reopen", RequestID: "request-queued"},
-		testHash("queued task"),
+		testTaskSpec("queued task"),
 		func(string) Record { return Record{Backend: "codex"} },
 	)
 	if err != nil {
@@ -256,14 +271,17 @@ func TestSweepArtifactsDeletesExpiredFilesButRetainsRecord(t *testing.T) {
 
 	record, _, err := store.SubmitTx(
 		RequestKey{WorkspaceKey: "workspace-artifacts", RequestID: "request-artifacts"},
-		testHash("artifact task"),
+		testTaskSpec("artifact task"),
 		func(string) Record { return Record{Backend: "codex"} },
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{record.Artifacts.Prompt, record.Artifacts.Log, record.Artifacts.Result} {
-		if err := atomicWrite(path, []byte("expired artifact"), 0o600); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("create artifact directory %s: %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte("expired artifact"), 0o600); err != nil {
 			t.Fatalf("write artifact %s: %v", path, err)
 		}
 	}
@@ -307,6 +325,6 @@ func closeTestStore(t *testing.T, store *Store) {
 	}
 }
 
-func testHash(value string) [32]byte {
-	return sha256.Sum256([]byte(value))
+func testTaskSpec(value string) []byte {
+	return []byte(`{"prompt":` + strconv.Quote(value) + `}`)
 }

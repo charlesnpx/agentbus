@@ -3,6 +3,7 @@ package jobstore
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -28,7 +29,9 @@ const (
 	// replacement daemon hang silently while a draining predecessor still holds
 	// the database.
 	defaultOpenTimeout = 500 * time.Millisecond
-	defaultLogTTL      = 30 * 24 * time.Hour
+	artifactPromptTTL  = 14 * 24 * time.Hour
+	artifactResultTTL  = 14 * 24 * time.Hour
+	artifactLogTTL     = 30 * 24 * time.Hour
 )
 
 var (
@@ -143,24 +146,6 @@ type TerminalUpdate struct {
 	FinishedAt    time.Time
 }
 
-// RetentionConfig controls only sidecar prompt, log, and result artifacts.
-// TerminalJobTTL retains its historical name but now applies only to prompt
-// artifacts; it never causes job or binding deletion.
-type RetentionConfig struct {
-	TerminalJobTTL time.Duration
-	ResultTTL      time.Duration
-	LogTTL         time.Duration
-}
-
-// DefaultRetention returns the version-3 artifact-retention defaults.
-func DefaultRetention() RetentionConfig {
-	return RetentionConfig{
-		TerminalJobTTL: 14 * 24 * time.Hour,
-		ResultTTL:      14 * 24 * time.Hour,
-		LogTTL:         defaultLogTTL,
-	}
-}
-
 // ConflictError identifies the existing binding that disagrees with a replay.
 type ConflictError struct {
 	Key           RequestKey
@@ -217,7 +202,6 @@ type Store struct {
 	db        *bolt.DB
 	path      string
 	artifacts artifactLayout
-	retention RetentionConfig
 
 	testMu                 sync.Mutex
 	failAfterJobPutForTest error
@@ -266,7 +250,6 @@ func Open(path string) (*Store, error) {
 			logs:    filepath.Join(filepath.Dir(path), "artifacts", "logs"),
 			results: filepath.Join(filepath.Dir(path), "artifacts", "results"),
 		},
-		retention: DefaultRetention(),
 	}
 	if fresh {
 		err = store.initialize()
@@ -347,24 +330,24 @@ func (store *Store) verifyIntegrity() error {
 }
 
 // SubmitTx binds a new record or returns a matching replay in one bbolt.Update.
-// hash must already be the canonical hash of the exact task specification. The
-// method validates only key syntax before looking up requests; it neither
-// canonicalizes nor stats any cwd, and it never invokes mk for a replay.
-func (store *Store) SubmitTx(key RequestKey, hash [32]byte, mk func(id string) Record) (Record, bool, error) {
+// taskSpec must be the canonical bytes of the exact task specification. The
+// method copies and hashes them before it opens a transaction or invokes mk, so
+// no caller-side cwd or backend validation can precede the identity check.
+func (store *Store) SubmitTx(key RequestKey, taskSpec []byte, mk func(id string) Record) (Record, bool, error) {
 	if mk == nil {
 		return Record{}, false, fmt.Errorf("%w: record factory is required", ErrInvalid)
 	}
+	if err := key.Validate(); err != nil {
+		return Record{}, false, err
+	}
+	canonicalTaskSpec := append([]byte(nil), taskSpec...)
+	hash := sha256.Sum256(canonicalTaskSpec)
 
 	var result Record
 	deduplicated := false
 	err := store.update(func(tx *bolt.Tx) error {
-		// 1. Validate only the compound identity syntax.
-		if err := key.Validate(); err != nil {
-			return err
-		}
-		// 2. The caller supplied the exact TaskSpec hash before this method. There
-		// is deliberately no cwd inspection here.
-		// 3. Look up the immutable compound-key binding.
+		// The canonical task was copied and hashed before this transaction; no
+		// caller-owned record code has run yet.
 		requests, jobs, err := requiredBuckets(tx)
 		if err != nil {
 			return err
@@ -375,7 +358,7 @@ func (store *Store) SubmitTx(key RequestKey, hash [32]byte, mk func(id string) R
 			if err != nil {
 				return err
 			}
-			// 4. A matching hash returns the original record without touching mk.
+			// A matching hash returns the original record without touching mk.
 			if binding.RequestHash == hash {
 				record, err := getRecord(jobs, binding.JobID)
 				if err != nil {
@@ -388,12 +371,12 @@ func (store *Store) SubmitTx(key RequestKey, hash [32]byte, mk func(id string) R
 				deduplicated = true
 				return nil
 			}
-			// 5. A different hash is a typed conflict and writes nothing.
+			// A different hash is a typed conflict and writes nothing.
 			return &ConflictError{Key: key, ExistingJobID: binding.JobID}
 		}
 
-		// 6. A new key is the only path that calls the new-record factory. Caller
-		// task/backend/cwd validation belongs outside this storage unit.
+		// A new key is the only path that calls the new-record factory. Caller
+		// backend and cwd validation belongs outside this storage unit.
 		id, err := newJobID(jobs)
 		if err != nil {
 			return err
@@ -414,6 +397,9 @@ func (store *Store) SubmitTx(key RequestKey, hash [32]byte, mk func(id string) R
 		if record.WorkspaceKey != key.WorkspaceKey || record.RequestID != key.RequestID {
 			return fmt.Errorf("%w: record factory changed request identity", ErrInvalid)
 		}
+		// The stored bytes are the exact copied bytes that were hashed above, so
+		// a factory cannot make the durable task disagree with its binding.
+		record.TaskSpec = append(json.RawMessage(nil), canonicalTaskSpec...)
 		paths, err := store.artifactPathsForID(id)
 		if err != nil {
 			return err
@@ -423,7 +409,7 @@ func (store *Store) SubmitTx(key RequestKey, hash [32]byte, mk func(id string) R
 		if err := validateRecord(record); err != nil {
 			return err
 		}
-		// 7. Put the job first, then the binding, in this one transaction. An
+		// Put the job first, then the binding, in this one transaction. An
 		// error after the first Put rolls both writes back.
 		if err := putRecord(jobs, record); err != nil {
 			return err
@@ -515,15 +501,16 @@ func (store *Store) listWhere(include func(Record) bool) ([]Record, error) {
 	return records, nil
 }
 
-// Update changes one nonterminal record in a transaction. The job identity,
-// request identity, creation time, and artifact locations remain immutable.
-func (store *Store) Update(id string, mutate func(*Record) error) (Record, error) {
+// MarkTerminal records the first terminal state. Later updates are rejected so
+// a known result can never be overwritten by a late finalization or recovery.
+func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, error) {
+	if !terminal.State.IsTerminal() {
+		return Record{}, fmt.Errorf("%w: terminal state is required", ErrInvalid)
+	}
 	if err := validateJobID(id); err != nil {
 		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
-	if mutate == nil {
-		return Record{}, fmt.Errorf("%w: mutation is required", ErrInvalid)
-	}
+
 	var result Record
 	err := store.update(func(tx *bolt.Tx) error {
 		jobs := tx.Bucket(bucketJobs)
@@ -537,17 +524,24 @@ func (store *Store) Update(id string, mutate func(*Record) error) (Record, error
 		if current.State.IsTerminal() {
 			return ErrTerminal
 		}
+
 		next := cloneRecord(current)
-		if err := mutate(&next); err != nil {
-			return err
+		next.State = terminal.State
+		next.Starting = false
+		next.Cleanup = terminal.Cleanup
+		next.FailureClass = terminal.FailureClass
+		next.FailureReason = terminal.FailureReason
+		next.Diagnostics = append([]string(nil), terminal.Diagnostics...)
+		next.Contract = terminal.Contract
+		next.ResultText = terminal.ResultText
+		if terminal.FinishedAt.IsZero() {
+			now := time.Now().UTC()
+			next.FinishedAt = &now
+		} else {
+			finished := terminal.FinishedAt.UTC()
+			next.FinishedAt = &finished
 		}
-		if next.JobID != current.JobID ||
-			next.WorkspaceKey != current.WorkspaceKey ||
-			next.RequestID != current.RequestID ||
-			!next.CreatedAt.Equal(current.CreatedAt) ||
-			next.Artifacts != current.Artifacts {
-			return fmt.Errorf("%w: immutable record identity or artifact paths changed", ErrInvalid)
-		}
+
 		next.UpdatedAt = time.Now().UTC()
 		normalizeRecord(&next)
 		if err := validateRecord(next); err != nil {
@@ -562,32 +556,6 @@ func (store *Store) Update(id string, mutate func(*Record) error) (Record, error
 	return result, err
 }
 
-// MarkTerminal records the first terminal state. Later updates are rejected so
-// a known result can never be overwritten by a late finalization or recovery.
-func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, error) {
-	if !terminal.State.IsTerminal() {
-		return Record{}, fmt.Errorf("%w: terminal state is required", ErrInvalid)
-	}
-	return store.Update(id, func(record *Record) error {
-		record.State = terminal.State
-		record.Starting = false
-		record.Cleanup = terminal.Cleanup
-		record.FailureClass = terminal.FailureClass
-		record.FailureReason = terminal.FailureReason
-		record.Diagnostics = append([]string(nil), terminal.Diagnostics...)
-		record.Contract = terminal.Contract
-		record.ResultText = terminal.ResultText
-		if terminal.FinishedAt.IsZero() {
-			now := time.Now().UTC()
-			record.FinishedAt = &now
-		} else {
-			finished := terminal.FinishedAt.UTC()
-			record.FinishedAt = &finished
-		}
-		return nil
-	})
-}
-
 // SweepArtifacts removes only expired prompt, log, and result sidecar files.
 // It intentionally does not open a transaction and cannot delete records,
 // bindings, identity hashes, or ContractResult values.
@@ -600,9 +568,9 @@ func (store *Store) SweepArtifacts(now time.Time) error {
 		dir string
 		ttl time.Duration
 	}{
-		{dir: store.artifacts.prompts, ttl: store.retention.TerminalJobTTL},
-		{dir: store.artifacts.logs, ttl: store.retention.LogTTL},
-		{dir: store.artifacts.results, ttl: store.retention.ResultTTL},
+		{dir: store.artifacts.prompts, ttl: artifactPromptTTL},
+		{dir: store.artifacts.logs, ttl: artifactLogTTL},
+		{dir: store.artifacts.results, ttl: artifactResultTTL},
 	} {
 		entries, err := os.ReadDir(artifact.dir)
 		if errors.Is(err, os.ErrNotExist) {
@@ -622,10 +590,7 @@ func (store *Store) SweepArtifacts(now time.Time) error {
 			if now.Sub(info.ModTime()) < artifact.ttl {
 				continue
 			}
-			path := filepath.Clean(filepath.Join(artifact.dir, entry.Name()))
-			if !pathWithinDir(artifact.dir, path) {
-				continue
-			}
+			path := filepath.Join(artifact.dir, entry.Name())
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
@@ -922,65 +887,5 @@ func safePathForID(dir, id, ext string) (string, error) {
 	if err := validateJobID(id); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, id+ext)
-	rel, err := filepath.Rel(dir, path)
-	if err != nil {
-		return "", err
-	}
-	if rel == "." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." || filepath.IsAbs(rel) {
-		return "", fmt.Errorf("job id %q escapes state namespace", id)
-	}
-	return path, nil
-}
-
-func pathWithinDir(dir, path string) bool {
-	rel, err := filepath.Rel(dir, path)
-	if err != nil {
-		return false
-	}
-	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
-}
-
-func atomicWrite(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer func() { _ = os.Remove(tmpName) }()
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	if err := os.Chmod(path, perm); err != nil {
-		return err
-	}
-	return fsyncDir(dir)
-}
-
-func fsyncDir(dir string) error {
-	file, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	return file.Sync()
+	return filepath.Join(dir, id+ext), nil
 }
