@@ -4,6 +4,7 @@ package command
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"os/exec"
 	"runtime"
@@ -118,6 +119,55 @@ func TestTerminateProcessGroupMissingTokenSendsNoSignal(t *testing.T) {
 	}
 	assertNoTerminationSignal(t, calls)
 	assertProcessRunning(t, cmd.Process.Pid)
+}
+
+func TestDirectCommandRunnerCanceledWithMissingTokenLeavesProcessAliveAfterWaitDelay(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	running, err := (DirectCommandRunner{CancelGrace: 10 * time.Millisecond}).Start(ctx, ExecSpec{
+		Argv: []string{"/bin/sh", "-c", "trap '' TERM; while :; do :; done"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, ok := running.(*directRunningCommand)
+	if !ok {
+		t.Fatalf("running command type = %T, want *directRunningCommand", running)
+	}
+	t.Cleanup(func() {
+		_ = command.Stdin().Close()
+		_ = command.Stdout().Close()
+		_ = command.Stderr().Close()
+		if command.cmd.ProcessState == nil {
+			_ = command.cmd.Process.Kill()
+		}
+		_, _ = command.Wait(context.Background())
+	})
+
+	ref := command.terminator.capturedProcessRef()
+	ref.StartTime = ""
+	setTerminatorProcessRef(command.terminator, ref)
+
+	original := terminateProcessGroup
+	terminated := make(chan struct{})
+	terminateProcessGroup = func(cmd *exec.Cmd, ref engine.ProcessRef, grace time.Duration) error {
+		err := original(cmd, ref, grace)
+		close(terminated)
+		return err
+	}
+	t.Cleanup(func() { terminateProcessGroup = original })
+
+	cancel()
+	select {
+	case <-terminated:
+	case <-time.After(time.Second):
+		t.Fatal("context cancellation did not reach the terminator")
+	}
+
+	timer := time.NewTimer(directCommandWaitDelay + 25*time.Millisecond)
+	defer timer.Stop()
+	<-timer.C
+	assertProcessRunning(t, command.cmd.Process.Pid)
 }
 
 func TestTerminateProcessGroupAlreadyExitedReturnsPromptly(t *testing.T) {
@@ -248,9 +298,7 @@ func startTerminationTestProcess(t *testing.T, script string, grace time.Duratio
 }
 
 func setTerminatorProcessRef(terminator *directTerminator, ref engine.ProcessRef) {
-	terminator.processRefMu.Lock()
 	terminator.processRef = ref
-	terminator.processRefMu.Unlock()
 }
 
 func setProcessGroupSignal(t *testing.T, signal func(int, syscall.Signal) error) {

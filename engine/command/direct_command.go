@@ -3,6 +3,7 @@ package command
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -25,20 +26,29 @@ var ErrOutputTruncated = errors.New("command output truncated")
 const (
 	directOutputBufferLimit = 16 << 20
 	directStderrDrainGrace  = 200 * time.Millisecond
+	directCommandWaitDelay  = 200 * time.Millisecond
 )
 
 func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningCommand, error) {
+	if ctx == nil {
+		panic("nil Context")
+	}
 	if len(spec.Argv) == 0 || strings.TrimSpace(spec.Argv[0]) == "" {
 		return nil, errors.New("command argv is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	grace := r.CancelGrace
 	if grace == 0 {
 		grace = engine.DefaultCancelGrace
 	}
-	cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
-	terminator := &directTerminator{cmd: cmd, grace: grace, processRefReady: make(chan struct{})}
-	cmd.Cancel = terminator.terminate
-	cmd.WaitDelay = 200 * time.Millisecond
+	// Do not give os/exec the context: its watchdog can call Process.Kill
+	// independently after WaitDelay. DirectCommandRunner owns cancellation so
+	// every termination attempt reaches the identity-fenced terminator.
+	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...)
+	terminator := &directTerminator{cmd: cmd, grace: grace}
+	cmd.WaitDelay = directCommandWaitDelay
 	if spec.Dir != "" {
 		cmd.Dir = spec.Dir
 	}
@@ -72,7 +82,6 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 	cmd.Stdout = stdoutWriter
 	cmd.Stderr = stderrWriter
 	if err := cmd.Start(); err != nil {
-		terminator.markProcessRefReady()
 		_ = stdin.Close()
 		_ = stdoutReader.Close()
 		_ = stdoutWriter.Close()
@@ -87,34 +96,44 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 	_ = stderrWriter.Close()
 	stdoutDrain := drainDirectOutput(stdoutReader, stdout)
 	stderrDrain := drainDirectOutput(stderrReader, stderr)
-	return &directRunningCommand{
-		cmd:         cmd,
-		stdin:       stdin,
-		stdout:      stdout,
-		stderr:      stderr,
-		cancelGrace: grace,
-		terminator:  terminator,
-		stdoutDrain: stdoutDrain,
-		stderrDrain: stderrDrain,
-		stdoutPipe:  stdoutReader,
-		stderrPipe:  stderrReader,
-	}, nil
+	running := &directRunningCommand{
+		cmd:              cmd,
+		stdin:            stdin,
+		stdout:           stdout,
+		stderr:           stderr,
+		cancelGrace:      grace,
+		terminator:       terminator,
+		stdoutDrain:      stdoutDrain,
+		stderrDrain:      stderrDrain,
+		stdoutPipe:       stdoutReader,
+		stderrPipe:       stderrReader,
+		startContext:     ctx,
+		startContextStop: make(chan struct{}),
+		startContextDone: make(chan struct{}),
+	}
+	running.watchStartContext(ctx)
+	return running, nil
 }
 
 type directRunningCommand struct {
-	cmd         *exec.Cmd
-	stdin       io.WriteCloser
-	stdout      *directOutputBuffer
-	stderr      *directOutputBuffer
-	cancelGrace time.Duration
-	terminator  *directTerminator
-	stdoutDrain <-chan struct{}
-	stderrDrain <-chan struct{}
-	stdoutPipe  *os.File
-	stderrPipe  *os.File
-	waitOnce    sync.Once
-	waitExit    ExitObservation
-	waitErr     error
+	cmd                  *exec.Cmd
+	stdin                io.WriteCloser
+	stdout               *directOutputBuffer
+	stderr               *directOutputBuffer
+	cancelGrace          time.Duration
+	terminator           *directTerminator
+	stdoutDrain          <-chan struct{}
+	stderrDrain          <-chan struct{}
+	stdoutPipe           *os.File
+	stderrPipe           *os.File
+	startContext         context.Context
+	startContextStop     chan struct{}
+	startContextDone     chan struct{}
+	startContextCanceled bool
+	startContextErr      error
+	waitOnce             sync.Once
+	waitExit             ExitObservation
+	waitErr              error
 }
 
 func (r *directRunningCommand) Stdin() io.WriteCloser {
@@ -134,6 +153,14 @@ func (r *directRunningCommand) Wait(ctx context.Context) (ExitObservation, error
 	defer stopWatching()
 	r.waitOnce.Do(func() {
 		err := r.cmd.Wait()
+		r.stopStartContext()
+		if r.startContextCanceled {
+			if r.startContextErr != nil {
+				err = fmt.Errorf("exec: canceling Cmd: %w", r.startContextErr)
+			} else if r.startContext != nil {
+				err = r.startContext.Err()
+			}
+		}
 		if errors.Is(err, exec.ErrWaitDelay) {
 			err = nil
 		}
@@ -158,6 +185,35 @@ func (r *directRunningCommand) Wait(ctx context.Context) (ExitObservation, error
 		r.waitErr = err
 	})
 	return r.waitExit, r.waitErr
+}
+
+func (r *directRunningCommand) watchStartContext(ctx context.Context) {
+	if r.startContextDone == nil {
+		return
+	}
+	if ctx == nil || ctx.Done() == nil {
+		close(r.startContextDone)
+		return
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			r.startContextCanceled = true
+			if r.terminator != nil {
+				r.startContextErr = r.terminator.terminate()
+			}
+		case <-r.startContextStop:
+		}
+		close(r.startContextDone)
+	}()
+}
+
+func (r *directRunningCommand) stopStartContext() {
+	if r.startContextStop == nil || r.startContextDone == nil {
+		return
+	}
+	close(r.startContextStop)
+	<-r.startContextDone
 }
 
 func (r *directRunningCommand) closeOutputPipes() {
@@ -197,7 +253,7 @@ func (r *directRunningCommand) Interrupt(ctx context.Context) error {
 			done <- r.terminator.terminate()
 			return
 		}
-		done <- terminateProcessGroup(r.cmd, r.cancelGrace)
+		done <- terminateProcessGroup(r.cmd, processRefForCmd(r.cmd), r.cancelGrace)
 	}()
 	select {
 	case <-ctx.Done():
@@ -232,68 +288,35 @@ func exitObservationForCmd(cmd *exec.Cmd) ExitObservation {
 }
 
 type directTerminator struct {
-	cmd                 *exec.Cmd
-	grace               time.Duration
-	pipes               []*os.File
-	once                sync.Once
-	pipesOnce           sync.Once
-	processRefMu        sync.RWMutex
-	processRef          engine.ProcessRef
-	processRefReady     chan struct{}
-	processRefReadyOnce sync.Once
-	err                 error
+	cmd        *exec.Cmd
+	grace      time.Duration
+	pipes      []*os.File
+	once       sync.Once
+	pipesOnce  sync.Once
+	processRef engine.ProcessRef
+	err        error
 }
-
-// capturedDirectProcessRefs passes the identity captured immediately after
-// Start to the platform terminator while retaining terminateProcessGroup as a
-// test seam for the command package.
-var capturedDirectProcessRefs sync.Map // map[*exec.Cmd]engine.ProcessRef
 
 func (t *directTerminator) captureProcessRef() {
 	if t == nil {
 		return
 	}
-	ref := processRefForCmd(t.cmd)
-	t.processRefMu.Lock()
-	t.processRef = ref
-	t.processRefMu.Unlock()
-	t.markProcessRefReady()
+	t.processRef = processRefForCmd(t.cmd)
 }
 
 func (t *directTerminator) capturedProcessRef() engine.ProcessRef {
 	if t == nil {
 		return engine.ProcessRef{}
 	}
-	t.processRefMu.RLock()
-	defer t.processRefMu.RUnlock()
 	return t.processRef
-}
-
-func (t *directTerminator) markProcessRefReady() {
-	if t == nil || t.processRefReady == nil {
-		return
-	}
-	t.processRefReadyOnce.Do(func() { close(t.processRefReady) })
-}
-
-func (t *directTerminator) waitForProcessRef() {
-	if t == nil || t.processRefReady == nil {
-		return
-	}
-	<-t.processRefReady
 }
 
 func (t *directTerminator) terminate() error {
 	if t == nil {
 		return nil
 	}
-	t.waitForProcessRef()
 	t.once.Do(func() {
-		if t.cmd != nil {
-			capturedDirectProcessRefs.Store(t.cmd, t.capturedProcessRef())
-			defer capturedDirectProcessRefs.Delete(t.cmd)
-		}
-		t.err = terminateProcessGroup(t.cmd, t.grace)
+		t.err = terminateProcessGroup(t.cmd, t.processRef, t.grace)
 		t.closePipes()
 	})
 	return t.err

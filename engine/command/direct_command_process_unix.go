@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"runtime"
 	"syscall"
 	"time"
 
@@ -19,10 +18,8 @@ func processRefForCmd(cmd *exec.Cmd) engine.ProcessRef {
 		return ref
 	}
 	ref.PID = cmd.Process.Pid
-	if runtime.GOOS != "windows" {
-		if pgid, err := syscall.Getpgid(ref.PID); err == nil {
-			ref.PGID = pgid
-		}
+	if pgid, err := syscall.Getpgid(ref.PID); err == nil {
+		ref.PGID = pgid
 	}
 	if info, alive, err := (engine.NativeProcessTable{}).Lookup(ref.PID); err == nil && alive {
 		ref.StartTime = info.StartTime
@@ -31,9 +28,6 @@ func processRefForCmd(cmd *exec.Cmd) engine.ProcessRef {
 }
 
 func setProcessGroup(cmd *exec.Cmd) {
-	if runtime.GOOS == "windows" {
-		return
-	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
@@ -44,19 +38,8 @@ var (
 	processGroupSignal = syscall.Kill
 )
 
-func terminateProcessGroupImpl(cmd *exec.Cmd, grace time.Duration) error {
-	return terminateProcessGroupForRef(cmd, capturedProcessRefForTermination(cmd), grace)
-}
-
-func capturedProcessRefForTermination(cmd *exec.Cmd) engine.ProcessRef {
-	if cmd != nil {
-		if ref, ok := capturedDirectProcessRefs.Load(cmd); ok {
-			if ref, ok := ref.(engine.ProcessRef); ok {
-				return ref
-			}
-		}
-	}
-	return processRefForCmd(cmd)
+func terminateProcessGroupImpl(cmd *exec.Cmd, ref engine.ProcessRef, grace time.Duration) error {
+	return terminateProcessGroupForRef(cmd, ref, grace)
 }
 
 func terminateProcessGroupForRef(cmd *exec.Cmd, ref engine.ProcessRef, grace time.Duration) error {
@@ -64,10 +47,6 @@ func terminateProcessGroupForRef(cmd *exec.Cmd, ref engine.ProcessRef, grace tim
 		return nil
 	}
 	pid := cmd.Process.Pid
-	if runtime.GOOS == "windows" {
-		_ = cmd.Process.Kill()
-		return nil
-	}
 	pgid := ref.PGID
 	if pgid <= 0 {
 		var err error
@@ -83,7 +62,7 @@ func terminateProcessGroupForRef(cmd *exec.Cmd, ref engine.ProcessRef, grace tim
 	} else if gone {
 		return nil
 	}
-	if err := verifyProcessGroupLeader(ref, pid); err != nil {
+	if err := verifyProcessGroupLeader(ref); err != nil {
 		return err
 	}
 	if gone, err := processGroupSignalResult("send SIGTERM to", pgid, processGroupSignal(-pgid, syscall.SIGTERM)); err != nil {
@@ -96,7 +75,7 @@ func terminateProcessGroupForRef(cmd *exec.Cmd, ref engine.ProcessRef, grace tim
 	} else if gone {
 		return nil
 	}
-	if err := verifyProcessGroupLeader(ref, pid); err != nil {
+	if err := verifyProcessGroupLeader(ref); err != nil {
 		return err
 	}
 	if _, err := processGroupSignalResult("send SIGKILL to", pgid, processGroupSignal(-pgid, syscall.SIGKILL)); err != nil {
@@ -140,13 +119,7 @@ func waitForProcessGroupExit(pgid int, grace time.Duration) (bool, error) {
 	}
 }
 
-func verifyProcessGroupLeader(ref engine.ProcessRef, pid int) error {
-	if ref.PID <= 0 {
-		return fmt.Errorf("%w: process group can no longer be identified: recorded leader pid is missing", engine.ErrProcessIdentityUnverifiable)
-	}
-	if ref.PID != pid {
-		return fmt.Errorf("%w: process group can no longer be identified: recorded leader pid %d differs from command pid %d", engine.ErrProcessIdentityUnverifiable, ref.PID, pid)
-	}
+func verifyProcessGroupLeader(ref engine.ProcessRef) error {
 	if ref.StartTime == "" {
 		return fmt.Errorf("%w: process group can no longer be identified: recorded leader start token is missing", engine.ErrProcessIdentityUnverifiable)
 	}
@@ -156,9 +129,6 @@ func verifyProcessGroupLeader(ref engine.ProcessRef, pid int) error {
 	}
 	if !alive {
 		return fmt.Errorf("%w: process group can no longer be identified: leader %d is missing", engine.ErrProcessIdentityUnverifiable, ref.PID)
-	}
-	if info.StartTime == "" {
-		return fmt.Errorf("%w: process group can no longer be identified: observed leader start token is missing", engine.ErrProcessIdentityUnverifiable)
 	}
 	if info.StartTime != ref.StartTime {
 		return fmt.Errorf("%w: process group can no longer be identified: leader %d start token changed", engine.ErrProcessIdentityUnverifiable, ref.PID)
