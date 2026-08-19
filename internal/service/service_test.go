@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -137,6 +138,34 @@ func TestHelloRejectsWrongToken(t *testing.T) {
 	}
 }
 
+func TestHelloSerializesNilProviderMetadataAsEmptyArrays(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{
+		Backends: []engine.Backend{helloBackend{name: "codex"}},
+	})
+	response := helloResponse(t, server, ProtocolVersion, "test-token")
+	if response.Error != nil {
+		t.Fatalf("hello response error = %#v", response.Error)
+	}
+	result, ok := response.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("hello result = %T, want object", response.Result)
+	}
+	backends, ok := result["backends"].([]any)
+	if !ok || len(backends) != 1 {
+		t.Fatalf("hello backends = %#v, want one backend", result["backends"])
+	}
+	backend, ok := backends[0].(map[string]any)
+	if !ok {
+		t.Fatalf("hello backend = %T, want object", backends[0])
+	}
+	for _, field := range []string{"models", "efforts"} {
+		values, ok := backend[field].([]any)
+		if !ok || len(values) != 0 {
+			t.Fatalf("hello %s = %#v, want []", field, backend[field])
+		}
+	}
+}
+
 func TestListenRefusesSecondDaemonOnLiveSocket(t *testing.T) {
 	root := shortTestDir(t)
 	first := newTestServer(t, root, Config{})
@@ -188,9 +217,6 @@ func TestListenReplacesStaleSocket(t *testing.T) {
 		_ = listener.Close()
 		server.removeOwnedSocket(identity, "test cleanup")
 	}()
-	if !socketPathMatchesIdentity(socketPath, identity) {
-		t.Fatal("stale socket was not replaced by the private listener")
-	}
 	connection, err := net.DialTimeout("unix", socketPath, time.Second)
 	if err != nil {
 		t.Fatalf("replacement socket did not accept connections: %v", err)
@@ -244,17 +270,26 @@ func TestListenRefusesConcurrentStaleSocketReplacement(t *testing.T) {
 	}
 
 	loser := newTestServer(t, root, Config{})
-	loserStarted := make(chan struct{})
+	loserFlock := make(chan error, 1)
+	loser.beforeSocketStateFlockHook = func(file *os.File) {
+		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		}
+		loserFlock <- err
+	}
 	loserResult := make(chan listenResult, 1)
 	go func() {
-		close(loserStarted)
 		listener, identity, err := loser.listen()
 		loserResult <- listenResult{listener: listener, identity: identity, err: err}
 	}()
 	select {
-	case <-loserStarted:
+	case err := <-loserFlock:
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			t.Fatalf("loser flock while winner held the state-root lock = %v, want would block", err)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("loser did not start while winner held the final removal window")
+		t.Fatal("loser did not reach the state-root flock while winner held the final removal window")
 	}
 	close(release)
 	released = true
@@ -288,9 +323,6 @@ func TestListenRefusesConcurrentStaleSocketReplacement(t *testing.T) {
 	var typed DaemonAlreadyListeningError
 	if !errors.As(loserListen.err, &typed) || typed.SocketPath != socketPath {
 		t.Fatalf("loser listen error = %#v, want typed socket path %q", loserListen.err, socketPath)
-	}
-	if !socketPathMatchesIdentity(socketPath, winnerListen.identity) {
-		t.Fatal("loser unlinked the winner socket")
 	}
 	connection, err := net.DialTimeout("unix", socketPath, time.Second)
 	if err != nil {

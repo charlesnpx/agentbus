@@ -266,6 +266,9 @@ func (s *Server) lockSocketState() (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	if s.beforeSocketStateFlockHook != nil {
+		s.beforeSocketStateFlockHook(file)
+	}
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
 		_ = file.Close()
 		return nil, err
@@ -279,83 +282,27 @@ func unlockSocketState(file *os.File) error {
 
 // listenUnixSocketPrivate is called while the state-root socket lock is held.
 func listenUnixSocketPrivate(path string) (net.Listener, socketFileIdentity, error) {
-	fd, err := openUnixSocketFD()
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
 		return nil, socketFileIdentity{}, err
 	}
-	fdOpen := true
-	closeFD := func() {
-		if fdOpen {
-			_ = syscall.Close(fd)
-			fdOpen = false
-		}
-	}
-	failBound := func(identity socketFileIdentity, phase string, err error) (net.Listener, socketFileIdentity, error) {
-		closeFD()
-		removeSocketPathIfIdentityLocked(path, identity, phase)
-		return nil, socketFileIdentity{}, err
-	}
-	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
-		closeFD()
-		return nil, socketFileIdentity{}, os.NewSyscallError("setsockopt", err)
-	}
-	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: path}); err != nil {
-		closeFD()
-		return nil, socketFileIdentity{}, os.NewSyscallError("bind", err)
-	}
+	// Socket removal is identity checked by the caller, so net must not unlink
+	// this path when listener setup later fails or the listener closes.
+	listener.SetUnlinkOnClose(false)
 	identity, err := statSocketFileIdentity(path)
 	if err != nil {
-		closeFD()
+		_ = listener.Close()
 		return nil, socketFileIdentity{}, fmt.Errorf("lstat daemon socket %q after bind: %w", path, err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return failBound(identity, "listener setup failure", err)
-	}
-	if err := syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
-		return failBound(identity, "listener setup failure", os.NewSyscallError("listen", err))
-	}
-	if !socketPathMatchesIdentity(path, identity) {
-		closeFD()
-		return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: path}
-	}
-	file := os.NewFile(uintptr(fd), "agentbus-daemon-listener")
-	if file == nil {
-		return failBound(identity, "listener setup failure", fmt.Errorf("wrap daemon listener fd %d", fd))
-	}
-	fdOpen = false
-	listener, err := net.FileListener(file)
-	if err != nil {
-		_ = file.Close()
-		removeSocketPathIfIdentityLocked(path, identity, "listener setup failure")
-		return nil, socketFileIdentity{}, err
-	}
-	if err := file.Close(); err != nil {
+	failBound := func(err error) (net.Listener, socketFileIdentity, error) {
 		_ = listener.Close()
 		removeSocketPathIfIdentityLocked(path, identity, "listener setup failure")
 		return nil, socketFileIdentity{}, err
 	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return failBound(err)
+	}
 	return listener, identity, nil
-}
-
-func openUnixSocketFD() (int, error) {
-	socketType, closeOnExecInSocket := unixSocketStreamType()
-	if !closeOnExecInSocket {
-		syscall.ForkLock.RLock()
-	}
-	fd, err := syscall.Socket(syscall.AF_UNIX, socketType, 0)
-	if err == nil && !closeOnExecInSocket {
-		syscall.CloseOnExec(fd)
-	}
-	if !closeOnExecInSocket {
-		syscall.ForkLock.RUnlock()
-	}
-	if err != nil {
-		return -1, os.NewSyscallError("socket", err)
-	}
-	if closeOnExecInSocket {
-		syscall.CloseOnExec(fd)
-	}
-	return fd, nil
 }
 
 func statSocketFileIdentity(path string) (socketFileIdentity, error) {
@@ -372,11 +319,6 @@ func socketFileIdentityFromStat(sys any) (socketFileIdentity, error) {
 		return socketFileIdentity{}, fmt.Errorf("unexpected socket stat type %T", sys)
 	}
 	return socketFileIdentity{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}, nil
-}
-
-func socketPathMatchesIdentity(path string, owned socketFileIdentity) bool {
-	actual, err := statSocketFileIdentity(path)
-	return err == nil && actual == owned
 }
 
 func (s *Server) removeOwnedSocket(owned socketFileIdentity, phase string) {
@@ -430,9 +372,6 @@ func (s *Server) removeOwnedPIDFile(ctx context.Context, phase string) error {
 		}
 		return nil
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
 	if err != nil {
 		log.Printf("agentbus daemon: skipping pid removal during %s: invalid pid file %s", phase, pidPath)
@@ -447,18 +386,11 @@ func (s *Server) removeOwnedPIDFile(ctx context.Context, phase string) error {
 		log.Printf("agentbus daemon: skipping pid removal during %s: create pid quarantine: %v", phase, err)
 		return fmt.Errorf("%w: create pid quarantine: %w", ErrShutdownPIDTeardownFailed, err)
 	}
-	cleanupQuarantineDir := true
 	defer func() {
-		if !cleanupQuarantineDir || ctx.Err() != nil {
-			return
-		}
 		if err := os.Remove(quarantineDir); err != nil && !errors.Is(err, os.ErrNotExist) {
 			log.Printf("agentbus daemon: remove pid quarantine directory during %s: %v", phase, err)
 		}
 	}()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	if err := os.Rename(pidPath, quarantinePath); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("agentbus daemon: skipping pid removal during %s: quarantine %s: %v", phase, pidPath, err)
@@ -466,41 +398,25 @@ func (s *Server) removeOwnedPIDFile(ctx context.Context, phase string) error {
 		}
 		return nil
 	}
-	if err := abortQuarantinedPIDFileIfContextDone(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir); err != nil {
-		return err
-	}
 	quarantinedRaw, quarantined, err := readPIDFileNoFollow(quarantinePath)
 	if err != nil {
-		cleanup, restoreErr := restoreQuarantinedPIDFileContext(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir)
-		cleanupQuarantineDir = cleanup
+		restoreErr := restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
 		return errors.Join(
 			fmt.Errorf("%w: validate quarantined pid %s: %w", ErrShutdownPIDTeardownFailed, quarantinePath, err),
 			wrapPIDRestoreError(restoreErr),
 		)
 	}
-	if err := abortQuarantinedPIDFileIfContextDone(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir); err != nil {
-		return err
-	}
 	quarantinedPID, err := strconv.Atoi(strings.TrimSpace(string(quarantinedRaw)))
 	if err != nil || quarantined != owned || quarantinedPID != os.Getpid() {
-		cleanup, restoreErr := restoreQuarantinedPIDFileContext(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir)
-		cleanupQuarantineDir = cleanup
+		restoreErr := restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
 		return wrapPIDRestoreError(restoreErr)
 	}
-	if err := abortQuarantinedPIDFileIfContextDone(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir); err != nil {
-		return err
-	}
 	if err := os.Remove(quarantinePath); err != nil {
-		cleanup, restoreErr := restoreQuarantinedPIDFileContext(ctx, pidPath, quarantinePath, phase, &cleanupQuarantineDir)
-		cleanupQuarantineDir = cleanup
+		restoreErr := restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
 		return errors.Join(
 			fmt.Errorf("%w: remove owned pid during %s: %w", ErrShutdownPIDTeardownFailed, phase, err),
 			wrapPIDRestoreError(restoreErr),
 		)
-	}
-	if err := ctx.Err(); err != nil {
-		cleanupQuarantineDir = false
-		return err
 	}
 	log.Printf("agentbus daemon: removed owned pid during %s", phase)
 	return nil
@@ -540,38 +456,22 @@ func createPIDFileQuarantine(stateRoot string) (string, string, error) {
 	return "", "", fmt.Errorf("could not allocate unique pid quarantine path in %s", stateRoot)
 }
 
-func abortQuarantinedPIDFileIfContextDone(ctx context.Context, pidPath, quarantinePath, phase string, cleanupQuarantineDir *bool) error {
-	if err := ctx.Err(); err != nil {
-		*cleanupQuarantineDir = false
-		log.Printf("agentbus daemon: abandoning quarantined pid restore during %s after context cancellation; canonical=%s quarantine=%s: %v", phase, pidPath, quarantinePath, err)
-		return err
-	}
-	return nil
-}
-
-func restoreQuarantinedPIDFileContext(ctx context.Context, pidPath, quarantinePath, phase string, cleanupQuarantineDir *bool) (bool, error) {
-	if err := abortQuarantinedPIDFileIfContextDone(ctx, pidPath, quarantinePath, phase, cleanupQuarantineDir); err != nil {
-		return false, err
-	}
-	return restoreQuarantinedPIDFile(pidPath, quarantinePath, phase)
-}
-
-func restoreQuarantinedPIDFile(pidPath, quarantinePath, phase string) (bool, error) {
+func restoreQuarantinedPIDFile(pidPath, quarantinePath, phase string) error {
 	if err := os.Link(quarantinePath, pidPath); err == nil {
 		if removeErr := os.Remove(quarantinePath); removeErr != nil {
 			log.Printf("agentbus daemon: restored pid during %s but could not remove quarantine %s: %v", phase, quarantinePath, removeErr)
-			return false, removeErr
+			return removeErr
 		}
-		return true, nil
+		return nil
 	} else if errors.Is(err, os.ErrExist) {
 		if removeErr := os.Remove(quarantinePath); removeErr != nil {
 			log.Printf("agentbus daemon: canonical pid exists during %s and quarantine %s remains: %v", phase, quarantinePath, removeErr)
-			return false, removeErr
+			return removeErr
 		}
-		return true, nil
+		return nil
 	} else {
 		log.Printf("agentbus daemon: could not restore replacement pid during %s from %s to %s: %v", phase, quarantinePath, pidPath, err)
-		return false, err
+		return err
 	}
 }
 

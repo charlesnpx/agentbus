@@ -130,6 +130,9 @@ type Server struct {
 	// hold the winner in the final removal window while it holds the state-root
 	// socket lock.
 	beforeStaleSocketRemovalHook func()
+	// beforeSocketStateFlockHook lets the stale-replacement regression test
+	// establish that a loser encounters the winner's held flock before release.
+	beforeSocketStateFlockHook func(*os.File)
 
 	clients   atomic.Int64
 	accepting atomic.Int64
@@ -493,26 +496,10 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 		}
 		return nil, socketFileIdentity{}, err
 	}
-	unixListener, ok := listener.(*net.UnixListener)
-	if !ok {
-		_ = listener.Close()
-		return nil, socketFileIdentity{}, fmt.Errorf("daemon listener for %s is not a Unix listener", s.socketPath)
-	}
-	// Every path removal is identity checked. Disable net.UnixListener's
-	// automatic unlink before any later setup can fail.
-	unixListener.SetUnlinkOnClose(false)
-	if !socketPathMatchesIdentity(s.socketPath, identity) {
-		_ = listener.Close()
-		return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
-	}
 	if err := os.Chmod(s.socketPath, 0o600); err != nil {
 		_ = listener.Close()
 		removeSocketPathIfIdentityLocked(s.socketPath, identity, "listener setup failure")
 		return nil, socketFileIdentity{}, err
-	}
-	if !socketPathMatchesIdentity(s.socketPath, identity) {
-		_ = listener.Close()
-		return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
 	}
 	return listener, identity, nil
 }
@@ -641,8 +628,8 @@ func (s *Server) backendMetadata() []protocol.BackendInfo {
 		info := protocol.BackendInfo{Backend: name, Models: []string{}, Efforts: []string{}}
 		if provider, ok := s.backends[name].(engine.BackendMetadataProvider); ok {
 			providerMetadata := provider.BackendMetadata(context.Background())
-			info.Models = append([]string(nil), providerMetadata.Models...)
-			info.Efforts = append([]string(nil), providerMetadata.Efforts...)
+			info.Models = append([]string{}, providerMetadata.Models...)
+			info.Efforts = append([]string{}, providerMetadata.Efforts...)
 		}
 		metadata = append(metadata, info)
 	}
