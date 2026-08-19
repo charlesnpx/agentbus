@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -235,6 +236,9 @@ func (r *directRunningCommand) startWait() {
 
 func (r *directRunningCommand) waitForExit() {
 	err := r.cmd.Wait()
+	if r.terminator != nil {
+		r.terminator.markLeaderReaped()
+	}
 	r.stopStartContext()
 	if errors.Is(err, exec.ErrWaitDelay) {
 		err = nil
@@ -378,13 +382,14 @@ func exitObservationForCmd(cmd *exec.Cmd) ExitObservation {
 }
 
 type directTerminator struct {
-	cmd        *exec.Cmd
-	grace      time.Duration
-	pipes      []*os.File
-	once       sync.Once
-	pipesOnce  sync.Once
-	processRef engine.ProcessRef
-	err        error
+	cmd          *exec.Cmd
+	grace        time.Duration
+	pipes        []*os.File
+	once         sync.Once
+	pipesOnce    sync.Once
+	processRef   engine.ProcessRef
+	leaderReaped atomic.Bool
+	err          error
 }
 
 func (t *directTerminator) captureProcessRef() {
@@ -401,11 +406,27 @@ func (t *directTerminator) capturedProcessRef() engine.ProcessRef {
 	return t.processRef
 }
 
+// markLeaderReaped records the sole cmd.Wait completion. Once the direct child
+// has exited, its retained output descriptors may be released without trying
+// to signal an orphaned process group whose identity can no longer be fenced.
+func (t *directTerminator) markLeaderReaped() {
+	if t != nil {
+		t.leaderReaped.Store(true)
+	}
+}
+
 func (t *directTerminator) terminate() error {
 	if t == nil {
 		return nil
 	}
 	t.once.Do(func() {
+		// cmd.Wait has established that this direct execution is over. Do not
+		// attempt a group signal after its leader has been reaped, but close the
+		// local read ends so a surviving descendant cannot retain the turn.
+		if t.leaderReaped.Load() {
+			t.closePipes()
+			return
+		}
 		t.err = terminateProcessGroup(t.cmd, t.processRef, t.grace)
 		if t.err == nil {
 			t.closePipes()
