@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"sort"
-	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -23,19 +22,20 @@ const (
 	maxSchemaViolationEntries      = 20
 	maxSchemaViolationPointerRunes = 120
 	maxSchemaViolationMessageRunes = 200
+	draft2020SchemaURI             = "https://json-schema.org/draft/2020-12/schema"
 )
 
 // Result is the outcome of validating one document against an optional schema.
-// A missing or JSON-null schema is not evaluated and leaves the document compliant.
+// A missing schema is not evaluated and leaves the document compliant.
 type Result struct {
 	Evaluated  bool     `json:"evaluated"`
 	Compliant  bool     `json:"compliant"`
 	Violations []string `json:"violations,omitempty"`
 }
 
-// Validate validates document against schemaRaw. An absent or JSON-null schema is
-// optional and therefore does not evaluate the document. A supplied invalid schema
-// fails closed: the result is noncompliant and the compilation error is returned.
+// Validate validates document against schemaRaw. An absent schema is optional and
+// therefore does not evaluate the document. A supplied invalid schema fails closed:
+// the result is noncompliant and the compilation error is returned.
 func Validate(document string, schemaRaw json.RawMessage) (Result, error) {
 	if schemaAbsent(schemaRaw) {
 		return Result{Compliant: true}, nil
@@ -63,7 +63,7 @@ func Digest(raw json.RawMessage) (string, error) {
 }
 
 func schemaAbsent(schemaRaw json.RawMessage) bool {
-	return len(schemaRaw) == 0 || bytes.Equal(bytes.TrimSpace(schemaRaw), []byte("null"))
+	return len(schemaRaw) == 0
 }
 
 func canonicalJSON(v any) ([]byte, error) {
@@ -77,55 +77,7 @@ func canonicalJSON(v any) ([]byte, error) {
 	if err := decodeJSONDocument(decoder, &decoded); err != nil {
 		return nil, err
 	}
-	var out bytes.Buffer
-	writeCanonical(&out, decoded)
-	return out.Bytes(), nil
-}
-
-func writeCanonical(out *bytes.Buffer, v any) {
-	switch x := v.(type) {
-	case nil:
-		out.WriteString("null")
-	case bool:
-		if x {
-			out.WriteString("true")
-		} else {
-			out.WriteString("false")
-		}
-	case float64:
-		out.WriteString(strconv.FormatFloat(x, 'f', -1, 64))
-	case json.Number:
-		out.WriteString(x.String())
-	case string:
-		b, _ := json.Marshal(x)
-		out.Write(b)
-	case []any:
-		out.WriteByte('[')
-		for i, item := range x {
-			if i > 0 {
-				out.WriteByte(',')
-			}
-			writeCanonical(out, item)
-		}
-		out.WriteByte(']')
-	case map[string]any:
-		keys := make([]string, 0, len(x))
-		for k := range x {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		out.WriteByte('{')
-		for i, k := range keys {
-			if i > 0 {
-				out.WriteByte(',')
-			}
-			kb, _ := json.Marshal(k)
-			out.Write(kb)
-			out.WriteByte(':')
-			writeCanonical(out, x[k])
-		}
-		out.WriteByte('}')
-	}
+	return json.Marshal(decoded)
 }
 
 func validateJSONSchema(text string, schemaRaw json.RawMessage) ([]string, error) {
@@ -301,6 +253,18 @@ func compileJSONSchema(schemaRaw json.RawMessage) (*jsonschema.Schema, error) {
 	decoder.UseNumber()
 	if err := decodeJSONDocument(decoder, &schemaDoc); err != nil {
 		return nil, err
+	}
+	switch schemaDoc := schemaDoc.(type) {
+	case bool:
+	case map[string]any:
+		if declaredDialect, ok := schemaDoc["$schema"]; ok {
+			dialect, ok := declaredDialect.(string)
+			if !ok || dialect != draft2020SchemaURI {
+				return nil, fmt.Errorf("JSON Schema $schema must be %q (Draft 2020-12)", draft2020SchemaURI)
+			}
+		}
+	default:
+		return nil, errors.New("JSON Schema root must be an object or boolean")
 	}
 	compiler := jsonschema.NewCompiler()
 	compiler.DefaultDraft(jsonschema.Draft2020)

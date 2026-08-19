@@ -171,23 +171,61 @@ func TestDigestIsCanonicalAndDistinct(t *testing.T) {
 }
 
 func TestCorrectionPromptIsFixedAndReadOnly(t *testing.T) {
+	const canonicalSchema = `{"properties":{"name":{"type":"string"}},"type":"object"}`
 	violations := []string{"/payload/name: got number, want string"}
-	first := CorrectionPrompt(violations)
-	second := CorrectionPrompt(violations)
+	want := "The preceding final result did not satisfy the required JSON Schema. Return a\n" +
+		"replacement final result that satisfies it. This is the one permitted\n" +
+		"correction attempt. It is read-only: make no further changes. Do not edit\n" +
+		"files, write data, invoke tools, or alter the workspace or external systems.\n\n" +
+		"Schema:\n" + canonicalSchema + "\n\nSchema violations:\n" + violations[0]
+	first := CorrectionPrompt(canonicalSchema, violations)
+	second := CorrectionPrompt(canonicalSchema, violations)
 	if first != second {
 		t.Fatalf("prompts differ: first %q second %q", first, second)
 	}
-	for _, want := range []string{"READ-ONLY", "NO further changes", violations[0]} {
-		if !strings.Contains(first, want) {
-			t.Fatalf("prompt = %q, want %q", first, want)
-		}
+	if first != want {
+		t.Fatalf("prompt = %q, want %q", first, want)
+	}
+	if !strings.Contains(first, canonicalSchema) {
+		t.Fatalf("prompt = %q, want canonical schema %q", first, canonicalSchema)
 	}
 }
 
-func TestValidateInvalidSchemaFailsClosed(t *testing.T) {
-	result, err := Validate(`{}`, json.RawMessage(`{"type":42}`))
+func TestValidateInvalidSchemaRootsFailClosed(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		schema string
+	}{
+		{name: "null", schema: `null`},
+		{name: "number", schema: `42`},
+		{name: "string", schema: `"string"`},
+		{name: "array", schema: `[]`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := Validate(`{}`, json.RawMessage(test.schema))
+			if err == nil {
+				t.Fatalf("result = %+v, want invalid schema error", result)
+			}
+			if !strings.Contains(err.Error(), "JSON Schema root must be an object or boolean") {
+				t.Fatalf("error = %q, want explicit root error", err)
+			}
+			if !result.Evaluated || result.Compliant {
+				t.Fatalf("result = %+v, want evaluated noncompliant result", result)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsDeclaredOlderDraft(t *testing.T) {
+	result, err := Validate(`{}`, json.RawMessage(`{
+		"$schema":"http://json-schema.org/draft-07/schema#",
+		"type":"object"
+	}`))
 	if err == nil {
-		t.Fatalf("result = %+v, want invalid schema error", result)
+		t.Fatalf("result = %+v, want dialect error", result)
+	}
+	if !strings.Contains(err.Error(), "Draft 2020-12") {
+		t.Fatalf("error = %q, want Draft 2020-12 dialect error", err)
 	}
 	if !result.Evaluated || result.Compliant {
 		t.Fatalf("result = %+v, want evaluated noncompliant result", result)
