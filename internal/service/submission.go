@@ -60,7 +60,7 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	if err := key.Validate(); err != nil {
 		return invalidParams(err)
 	}
-	hash, err := canonicalTaskSpecHash(precheck.rawTaskSpec)
+	canonicalTaskSpec, err := model.CanonicalTaskSpecJSON(precheck.rawTaskSpec)
 	if err != nil {
 		return invalidParams(err)
 	}
@@ -76,18 +76,24 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailableV3, "open job store: "+err.Error(), protocol.ErrorData{})}
 	}
-	record, deduplicated, err := store.SubmitTx(key, hash, func(id string) jobstore.Record {
+	record, deduplicated, err := store.SubmitTx(key, canonicalTaskSpec, func(id string) (jobstore.Record, error) {
+		if err := s.ensureBackendAvailable(ctx, params.TaskSpec.Backend); err != nil {
+			return jobstore.Record{}, err
+		}
+		canonicalCWD, err := engine.CanonicalWorkspace(params.TaskSpec.CWD)
+		if err != nil {
+			return jobstore.Record{}, err
+		}
 		return jobstore.Record{
 			JobID:        id,
 			WorkspaceKey: key.WorkspaceKey,
 			RequestID:    key.RequestID,
 			Backend:      params.TaskSpec.Backend,
-			Model:        params.TaskSpec.Model,
-			CWD:          params.TaskSpec.CWD,
+			Model:        taskSpecOptionalString(params.TaskSpec.Model),
+			CWD:          canonicalCWD,
 			Write:        params.TaskSpec.Write,
-			Effort:       params.TaskSpec.Effort,
-			TaskSpec:     append(json.RawMessage(nil), precheck.rawTaskSpec...),
-		}
+			Effort:       taskSpecOptionalString(params.TaskSpec.Effort),
+		}, nil
 	})
 	if err != nil {
 		if errors.Is(err, jobstore.ErrConflict) {
@@ -97,32 +103,6 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	}
 	if deduplicated {
 		return requestOutcome{result: jobSubmitResult(record, true, timeout)}
-	}
-
-	// These checks occur only after SubmitTx has atomically created the new
-	// request binding. A failure is therefore an admitted failed job rather
-	// than a rejection, while every replay above remains side-effect free.
-	if err := s.ensureBackendAvailable(ctx, params.TaskSpec.Backend); err != nil {
-		failed, markErr := markSubmittedJobFailed(store, record, protocol.FailureClassBackendUnavailable, err)
-		if markErr != nil {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailableV3, "record unavailable backend: "+markErr.Error(), protocol.ErrorData{JobID: record.JobID, Backend: params.TaskSpec.Backend})}
-		}
-		return requestOutcome{result: jobSubmitResult(failed, false, timeout)}
-	}
-	canonicalCWD, err := engine.CanonicalWorkspace(params.TaskSpec.CWD)
-	if err != nil {
-		failed, markErr := markSubmittedJobFailed(store, record, protocol.FailureClassInternal, err)
-		if markErr != nil {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "record invalid cwd: "+markErr.Error(), protocol.ErrorData{JobID: record.JobID, Backend: params.TaskSpec.Backend})}
-		}
-		return requestOutcome{result: jobSubmitResult(failed, false, timeout)}
-	}
-	record, err = store.Update(record.JobID, func(record *jobstore.Record) error {
-		record.CWD = canonicalCWD
-		return nil
-	})
-	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "record canonical cwd: "+err.Error(), protocol.ErrorData{JobID: record.JobID, Backend: params.TaskSpec.Backend})}
 	}
 	return requestOutcome{result: jobSubmitResult(record, false, timeout)}
 }
@@ -147,15 +127,13 @@ func validateStaticTaskSpec(spec protocol.TaskSpecV3) *protocol.ErrorObject {
 	return errObj
 }
 
-// canonicalTaskSpecHash supplies SubmitTx with the canonical raw-spec hash it
-// requires. CanonicalTaskSpecJSON is pure: it parses only request bytes and
-// never stats, resolves, or otherwise reads the requested workspace.
-func canonicalTaskSpecHash(raw json.RawMessage) ([32]byte, error) {
-	canonical, err := model.CanonicalTaskSpecJSON(raw)
-	if err != nil {
-		return [32]byte{}, err
+// taskSpecOptionalString supplies Record's summary fields. Presence remains
+// authoritative in the canonical task bytes that SubmitTx persists unchanged.
+func taskSpecOptionalString(value *string) string {
+	if value == nil {
+		return ""
 	}
-	return sha256.Sum256(canonical), nil
+	return *value
 }
 
 func jobSubmitResult(record jobstore.Record, deduplicated bool, timeout *engine.TimeoutResolution) protocol.JobSubmitResultV3 {
@@ -184,20 +162,6 @@ func (s *Server) jobSubmitConflict(store *jobstore.Store, submitErr error, timeo
 		result: result,
 		err:    protocol.NewError(protocol.ErrorInvalidTaskSpecV3, submitErr.Error(), data),
 	}
-}
-
-func markSubmittedJobFailed(store *jobstore.Store, record jobstore.Record, class protocol.FailureClass, cause error) (jobstore.Record, error) {
-	if cause == nil {
-		cause = errors.New("submission validation failed")
-	}
-	return store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
-		State:         protocol.PublicStateFailed,
-		Cleanup:       protocol.CleanupClean,
-		FailureClass:  class,
-		FailureReason: cause.Error(),
-		Diagnostics:   []string{cause.Error()},
-		FinishedAt:    time.Now().UTC(),
-	})
 }
 
 func (s *Server) ensureJobStore() (*jobstore.Store, error) {

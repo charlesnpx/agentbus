@@ -12,7 +12,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -522,22 +521,31 @@ func TestJobSubmitDifferentPromptReturnsTypedConflict(t *testing.T) {
 	}
 }
 
-func TestJobSubmitUnknownBackendNewKeyIsAdmittedFailed(t *testing.T) {
+func TestJobSubmitUnknownBackendNewKeyLeavesNoRecordOrBinding(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{})
-	result := submitResultForTest(t, submitForTest(t, server, submissionParams("workspace-unknown-new", "request-unknown-new", "missing", t.TempDir(), "task")))
-	if result.Deduplicated || result.State != protocol.PublicStateFailed {
-		t.Fatalf("unknown-backend new result = %+v, want non-deduplicated failed job", result)
+	params := submissionParams("workspace-unknown-new", "request-unknown-new", "missing", t.TempDir(), "task")
+	outcome := submitForTest(t, server, params)
+	if outcome.err == nil {
+		t.Fatalf("unknown-backend new result = %#v, want submission error", outcome.result)
+	}
+	if outcome.result != nil {
+		t.Fatalf("unknown-backend new result = %#v, want no result", outcome.result)
 	}
 	store, err := server.ensureJobStore()
 	if err != nil {
 		t.Fatal(err)
 	}
-	record, err := store.Get(result.JobID)
+	records, err := store.List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.FailureClass != protocol.FailureClassBackendUnavailable {
-		t.Fatalf("unknown-backend failure class = %q, want %q", record.FailureClass, protocol.FailureClassBackendUnavailable)
+	if len(records) != 0 {
+		t.Fatalf("records after unknown-backend submission = %+v, want none", records)
+	}
+	server.backends["missing"] = helloBackend{name: "missing"}
+	retried := submitResultForTest(t, submitForTest(t, server, params))
+	if retried.Deduplicated || retried.State != protocol.PublicStateQueued {
+		t.Fatalf("retried unknown-backend result = %+v, want new queued job", retried)
 	}
 }
 
