@@ -15,6 +15,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 	createdAt := time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC)
 	startedAt := time.Date(2025, time.January, 2, 3, 5, 5, 0, time.UTC)
 	finishedAt := time.Date(2025, time.January, 2, 3, 6, 5, 0, time.UTC)
+	updatedAt := time.Date(2025, time.January, 2, 3, 7, 5, 0, time.UTC)
 	timeout := &engine.TimeoutResolution{
 		Requested: &requested,
 		Effective: 2345,
@@ -28,14 +29,13 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		Violations:   []string{"/answer"},
 	}
 	result := &ResultInfoWire{
-		Text:          "answer",
-		TextElided:    true,
-		ResultPath:    "/results/job-1",
-		SHA256:        "result-sha",
-		Bytes:         42,
-		ModelReported: "gpt-5",
+		Text:       "answer",
+		ResultPath: "/results/job-1",
+		SHA256:     "result-sha",
+		Bytes:      42,
 	}
 	logPaths := &LogPathsWire{Stdout: "/logs/job-1.out", Stderr: "/logs/job-1.err"}
+	summaryContract := &ContractVerdict{Evaluated: true, Compliant: false}
 	record := JobRecordWire{
 		JobID:         "job-1",
 		WorkspaceKey:  "workspace-1",
@@ -55,11 +55,15 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		ModelReported: "gpt-5",
 	}
 	summary := JobSummaryWire{
-		JobID:     "job-1",
-		State:     PublicStateCompleted,
-		Backend:   "codex",
-		Cleanup:   CleanupUncertain,
-		CreatedAt: createdAt,
+		JobID:         "job-1",
+		Backend:       "codex",
+		State:         PublicStateFailed,
+		Cleanup:       CleanupUncertain,
+		CreatedAt:     createdAt,
+		UpdatedAt:     updatedAt,
+		ModelReported: "gpt-5",
+		FailureClass:  FailureClassBackendError,
+		Contract:      summaryContract,
 	}
 	taskSpec := TaskSpecV3{
 		Backend:      "codex",
@@ -73,8 +77,8 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		Tags:         map[string]string{"team": "core"},
 	}
 
-	const recordJSON = `{"jobId":"job-1","workspaceKey":"workspace-1","requestId":"request-1","backend":"codex","state":"completed","tags":{"team":"core"},"createdAt":"2025-01-02T03:04:05Z","startedAt":"2025-01-02T03:05:05Z","finishedAt":"2025-01-02T03:06:05Z","timeout":{"requested":1234,"effective":2345,"source":"client"},"result":{"text":"answer","textElided":true,"resultPath":"/results/job-1","sha256":"result-sha","bytes":42,"modelReported":"gpt-5"},"contract":{"schemaSha256":"schema-sha","evaluated":true,"compliant":true,"attempts":2,"violations":["/answer"]},"failure":{"class":"backend_error","reason":"backend stopped"},"cleanup":"uncertain","logPaths":{"stdout":"/logs/job-1.out","stderr":"/logs/job-1.err"},"modelReported":"gpt-5"}`
-	const summaryJSON = `{"jobId":"job-1","state":"completed","backend":"codex","cleanup":"uncertain","createdAt":"2025-01-02T03:04:05Z"}`
+	const recordJSON = `{"jobId":"job-1","workspaceKey":"workspace-1","requestId":"request-1","backend":"codex","state":"completed","tags":{"team":"core"},"createdAt":"2025-01-02T03:04:05Z","startedAt":"2025-01-02T03:05:05Z","finishedAt":"2025-01-02T03:06:05Z","timeout":{"requested":1234,"effective":2345,"source":"client"},"result":{"text":"answer","resultPath":"/results/job-1","sha256":"result-sha","bytes":42},"contract":{"schemaSha256":"schema-sha","evaluated":true,"compliant":true,"attempts":2,"violations":["/answer"]},"failure":{"class":"backend_error","reason":"backend stopped"},"cleanup":"uncertain","logPaths":{"stdout":"/logs/job-1.out","stderr":"/logs/job-1.err"},"modelReported":"gpt-5"}`
+	const summaryJSON = `{"jobId":"job-1","backend":"codex","state":"failed","cleanup":"uncertain","createdAt":"2025-01-02T03:04:05Z","updatedAt":"2025-01-02T03:07:05Z","modelReported":"gpt-5","failureClass":"backend_error","contract":{"evaluated":true,"compliant":false}}`
 
 	tests := []struct {
 		name  string
@@ -174,7 +178,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 			name:  "ResultInfoWire",
 			value: *result,
 			new:   func() any { return new(ResultInfoWire) },
-			want:  `{"text":"answer","textElided":true,"resultPath":"/results/job-1","sha256":"result-sha","bytes":42,"modelReported":"gpt-5"}`,
+			want:  `{"text":"answer","resultPath":"/results/job-1","sha256":"result-sha","bytes":42}`,
 		},
 		{
 			name:  "LogPathsWire",
@@ -230,7 +234,8 @@ func TestJobRecordWireFieldAllowList(t *testing.T) {
 
 func TestJobSummaryWireFieldAllowList(t *testing.T) {
 	want := map[string]struct{}{
-		"JobID": {}, "State": {}, "Backend": {}, "Cleanup": {}, "CreatedAt": {},
+		"JobID": {}, "Backend": {}, "State": {}, "Cleanup": {}, "CreatedAt": {},
+		"UpdatedAt": {}, "ModelReported": {}, "FailureClass": {}, "Contract": {},
 	}
 
 	summaryType := reflect.TypeOf(JobSummaryWire{})

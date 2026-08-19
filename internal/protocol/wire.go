@@ -112,6 +112,13 @@ type ContractResult struct {
 	Violations   []string `json:"violations"`
 }
 
+// ContractVerdict is the compact output-schema evaluation result included in
+// a listed job.
+type ContractVerdict struct {
+	Evaluated bool `json:"evaluated"`
+	Compliant bool `json:"compliant"`
+}
+
 // TaskSpecV3 describes a job submitted through protocol v3.
 type TaskSpecV3 struct {
 	Backend      string            `json:"backend"`
@@ -192,18 +199,27 @@ type JobRecordWire struct {
 }
 
 // JobSummaryWire is the compact item returned when job.get lists jobs. It
-// deliberately excludes request-local identifiers and detailed outcome data.
+// deliberately excludes request-local identifiers, task details, detailed
+// results, failure reasons, logs, and process claims.
 type JobSummaryWire struct {
 	// JobID lets a client select this job for a subsequent detailed lookup.
 	JobID string `json:"jobId"`
-	// State lets a client distinguish pending work from terminal work.
-	State PublicState `json:"state"`
 	// Backend identifies the executor for a listed job.
 	Backend string `json:"backend"`
+	// State lets a client distinguish pending work from terminal work.
+	State PublicState `json:"state"`
 	// Cleanup reports post-run cleanup certainty alongside the public state.
 	Cleanup Cleanup `json:"cleanup"`
-	// CreatedAt is the sole timestamp needed to show a listed job's age.
+	// CreatedAt reports when the job was created.
 	CreatedAt time.Time `json:"createdAt"`
+	// UpdatedAt reports when the job was last updated.
+	UpdatedAt time.Time `json:"updatedAt"`
+	// ModelReported is the model reported by the backend, when available.
+	ModelReported string `json:"modelReported,omitempty"`
+	// FailureClass is the compact failure category for a failed job, when set.
+	FailureClass FailureClass `json:"failureClass,omitempty"`
+	// Contract is the compact output-schema verdict, when evaluation occurred.
+	Contract *ContractVerdict `json:"contract,omitempty"`
 }
 
 // JobFailureWire records the public failure category and reason for a job.
@@ -214,12 +230,10 @@ type JobFailureWire struct {
 
 // ResultInfoWire describes the authoritative spilled final result.
 type ResultInfoWire struct {
-	Text          string `json:"text,omitempty"`
-	TextElided    bool   `json:"textElided,omitempty"`
-	ResultPath    string `json:"resultPath"`
-	SHA256        string `json:"sha256"`
-	Bytes         int64  `json:"bytes"`
-	ModelReported string `json:"modelReported,omitempty"`
+	Text       string `json:"text,omitempty"`
+	ResultPath string `json:"resultPath"`
+	SHA256     string `json:"sha256"`
+	Bytes      int64  `json:"bytes"`
 }
 
 // LogPathsWire identifies captured backend log files.
