@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/internal/protocol"
+	bolt "go.etcd.io/bbolt"
 )
 
 func TestSubmitReplaySkipsDeletedCWD(t *testing.T) {
@@ -22,8 +23,8 @@ func TestSubmitReplaySkipsDeletedCWD(t *testing.T) {
 	if err := os.Mkdir(cwd, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	original, deduplicated, err := store.SubmitTx(key, taskSpec, func(string) Record {
-		return Record{Backend: "codex", CWD: cwd}
+	original, deduplicated, err := store.SubmitTx(key, taskSpec, func(string) (Record, error) {
+		return Record{Backend: "codex", CWD: cwd}, nil
 	})
 	if err != nil || deduplicated {
 		t.Fatalf("first SubmitTx = (%+v, deduplicated=%t, %v), want new record", original, deduplicated, err)
@@ -33,12 +34,12 @@ func TestSubmitReplaySkipsDeletedCWD(t *testing.T) {
 	}
 
 	factoryCalled := false
-	replayed, deduplicated, err := store.SubmitTx(key, taskSpec, func(string) Record {
+	replayed, deduplicated, err := store.SubmitTx(key, taskSpec, func(string) (Record, error) {
 		factoryCalled = true
 		if _, err := os.Stat(cwd); err != nil {
 			t.Fatalf("replay tried to stat deleted cwd: %v", err)
 		}
-		return Record{Backend: "must-not-be-created"}
+		return Record{Backend: "must-not-be-created"}, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -59,9 +60,9 @@ func TestSubmitReplayMatchesOnlyCanonicalTaskSpec(t *testing.T) {
 	firstTaskSpec := testTaskSpec("one")
 	expectedTaskSpec := append([]byte(nil), firstTaskSpec...)
 	secondTaskSpec := testTaskSpec("two")
-	original, _, err := store.SubmitTx(key, firstTaskSpec, func(string) Record {
+	original, _, err := store.SubmitTx(key, firstTaskSpec, func(string) (Record, error) {
 		copy(firstTaskSpec, secondTaskSpec)
-		return Record{Backend: "codex", TaskSpec: testTaskSpec("factory supplied a different task")}
+		return Record{Backend: "codex", TaskSpec: testTaskSpec("factory supplied a different task")}, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -77,9 +78,9 @@ func TestSubmitReplayMatchesOnlyCanonicalTaskSpec(t *testing.T) {
 		t.Fatalf("durable task spec = %s, want canonical submit task %s", got, want)
 	}
 	factoryCalled := false
-	_, _, err = store.SubmitTx(key, secondTaskSpec, func(string) Record {
+	_, _, err = store.SubmitTx(key, secondTaskSpec, func(string) (Record, error) {
 		factoryCalled = true
-		return Record{Backend: "must-not-be-created"}
+		return Record{Backend: "must-not-be-created"}, nil
 	})
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting SubmitTx error = %v, want ErrConflict", err)
@@ -98,9 +99,9 @@ func TestSubmitReplayMatchesOnlyCanonicalTaskSpec(t *testing.T) {
 	if len(records) != 1 || records[0].JobID != original.JobID {
 		t.Fatalf("records after conflict = %+v, want only %q", records, original.JobID)
 	}
-	replayed, deduplicated, err := store.SubmitTx(key, expectedTaskSpec, func(string) Record {
+	replayed, deduplicated, err := store.SubmitTx(key, expectedTaskSpec, func(string) (Record, error) {
 		t.Fatal("matching replay invoked new-record factory")
-		return Record{}
+		return Record{}, nil
 	})
 	if err != nil || !deduplicated || replayed.JobID != original.JobID {
 		t.Fatalf("matching replay after conflict = (%+v, %t, %v), want original replay", replayed, deduplicated, err)
@@ -115,8 +116,8 @@ func TestSubmitTransactionRollsBackJobAndBinding(t *testing.T) {
 	taskSpec := testTaskSpec("atomic task")
 	injected := errors.New("injected after job put")
 	store.setSubmitFailureForTest(injected)
-	_, _, err := store.SubmitTx(key, taskSpec, func(string) Record {
-		return Record{Backend: "codex"}
+	_, _, err := store.SubmitTx(key, taskSpec, func(string) (Record, error) {
+		return Record{Backend: "codex"}, nil
 	})
 	if !errors.Is(err, injected) {
 		t.Fatalf("injected SubmitTx error = %v, want %v", err, injected)
@@ -129,11 +130,51 @@ func TestSubmitTransactionRollsBackJobAndBinding(t *testing.T) {
 		t.Fatalf("records after injected transaction failure = %+v, want none", records)
 	}
 	store.setSubmitFailureForTest(nil)
-	record, deduplicated, err := store.SubmitTx(key, taskSpec, func(string) Record {
-		return Record{Backend: "codex"}
+	record, deduplicated, err := store.SubmitTx(key, taskSpec, func(string) (Record, error) {
+		return Record{Backend: "codex"}, nil
 	})
 	if err != nil || deduplicated || record.JobID == "" {
 		t.Fatalf("SubmitTx after rollback = (%+v, %t, %v), want new record", record, deduplicated, err)
+	}
+}
+
+func TestSubmitFactoryErrorLeavesJobAndBindingAbsent(t *testing.T) {
+	store := newTestStore(t)
+	defer closeTestStore(t, store)
+
+	key := RequestKey{WorkspaceKey: "workspace-factory-error", RequestID: "request-factory-error"}
+	factoryErr := errors.New("backend unavailable")
+	var generatedID string
+	record, deduplicated, err := store.SubmitTx(key, testTaskSpec("factory validation"), func(id string) (Record, error) {
+		generatedID = id
+		return Record{}, factoryErr
+	})
+	if !errors.Is(err, factoryErr) {
+		t.Fatalf("SubmitTx factory error = %v, want %v", err, factoryErr)
+	}
+	if deduplicated {
+		t.Fatal("SubmitTx factory error reported deduplicated")
+	}
+	if record.JobID != "" {
+		t.Fatalf("SubmitTx factory error returned job %q, want zero record", record.JobID)
+	}
+	if generatedID == "" {
+		t.Fatal("factory did not receive generated job ID")
+	}
+	if err := store.view(func(tx *bolt.Tx) error {
+		requests, jobs, err := requiredBuckets(tx)
+		if err != nil {
+			return err
+		}
+		if jobs.Get([]byte(generatedID)) != nil {
+			t.Errorf("job %q written despite factory error", generatedID)
+		}
+		if requests.Get(key.storageKey()) != nil {
+			t.Errorf("request binding for %q written despite factory error", key.storageKey())
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -142,8 +183,8 @@ func TestGeneratedJobIDIsOpaque(t *testing.T) {
 	defer closeTestStore(t, store)
 
 	key := RequestKey{WorkspaceKey: "workspace-opaque-sentinel", RequestID: "request-opaque-sentinel"}
-	record, _, err := store.SubmitTx(key, testTaskSpec("opaque task"), func(string) Record {
-		return Record{Backend: "codex", CWD: "/workspace/opaque-sentinel"}
+	record, _, err := store.SubmitTx(key, testTaskSpec("opaque task"), func(string) (Record, error) {
+		return Record{Backend: "codex", CWD: "/workspace/opaque-sentinel"}, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -167,7 +208,7 @@ func TestReopenRecoversTerminalRecord(t *testing.T) {
 	record, _, err := store.SubmitTx(
 		RequestKey{WorkspaceKey: "workspace-reopen", RequestID: "request-reopen"},
 		testTaskSpec("terminal task"),
-		func(string) Record { return Record{Backend: "codex", Model: "gpt-test"} },
+		func(string) (Record, error) { return Record{Backend: "codex", Model: "gpt-test"}, nil },
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +231,7 @@ func TestReopenRecoversTerminalRecord(t *testing.T) {
 	queued, _, err := store.SubmitTx(
 		RequestKey{WorkspaceKey: "workspace-reopen", RequestID: "request-queued"},
 		testTaskSpec("queued task"),
-		func(string) Record { return Record{Backend: "codex"} },
+		func(string) (Record, error) { return Record{Backend: "codex"}, nil },
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -272,7 +313,7 @@ func TestSweepArtifactsDeletesExpiredFilesButRetainsRecord(t *testing.T) {
 	record, _, err := store.SubmitTx(
 		RequestKey{WorkspaceKey: "workspace-artifacts", RequestID: "request-artifacts"},
 		testTaskSpec("artifact task"),
-		func(string) Record { return Record{Backend: "codex"} },
+		func(string) (Record, error) { return Record{Backend: "codex"}, nil },
 	)
 	if err != nil {
 		t.Fatal(err)

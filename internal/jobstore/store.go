@@ -333,7 +333,9 @@ func (store *Store) verifyIntegrity() error {
 // taskSpec must be the canonical bytes of the exact task specification. The
 // method copies and hashes them before it opens a transaction or invokes mk, so
 // no caller-side cwd or backend validation can precede the identity check.
-func (store *Store) SubmitTx(key RequestKey, taskSpec []byte, mk func(id string) Record) (Record, bool, error) {
+// For a new identity, mk may return a validation error; SubmitTx returns it
+// before either the job or its request binding is persisted.
+func (store *Store) SubmitTx(key RequestKey, taskSpec []byte, mk func(id string) (Record, error)) (Record, bool, error) {
 	if mk == nil {
 		return Record{}, false, fmt.Errorf("%w: record factory is required", ErrInvalid)
 	}
@@ -381,7 +383,10 @@ func (store *Store) SubmitTx(key RequestKey, taskSpec []byte, mk func(id string)
 		if err != nil {
 			return err
 		}
-		record := mk(id)
+		record, err := mk(id)
+		if err != nil {
+			return err
+		}
 		if record.JobID == "" {
 			record.JobID = id
 		}
