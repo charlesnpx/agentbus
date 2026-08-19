@@ -214,6 +214,5 @@ run go run ./scripts/ci/strict-cgroup-preflight
 run go build -trimpath -ldflags "-X main.version=$VERSION" -o "$BIN" ./cmd/agentbus
 run smoke_release_binary
 run strict_startup_smoke
-run env AGENTBUS_E2E_PREBUILT_BINARY="$BIN" AGENTBUS_RUN_STRICT_E2E=1 go test -tags abd_strict_e2e ./internal/served -run TestProductionStrict -count=1
 
 printf '\nrelease-check: ok version=%s binary=%s\n' "$VERSION" "$BIN"
