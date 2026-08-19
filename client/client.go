@@ -1021,6 +1021,20 @@ func (c *Client) JobSubmit(ctx context.Context, params JobSubmitParams) (JobSubm
 	return out, err
 }
 
+// JobGet returns the complete record for the requested job.
+func (c *Client) JobGet(ctx context.Context, params JobGetParams) (JobGetResult, error) {
+	var out JobGetResult
+	err := c.do(ctx, protocol.MethodJobGet, params, &out)
+	return out, err
+}
+
+// JobGetList returns the compact summaries from an empty job.get request.
+func (c *Client) JobGetList(ctx context.Context) (JobGetListResult, error) {
+	var out JobGetListResult
+	err := c.do(ctx, protocol.MethodJobGet, JobGetParams{}, &out)
+	return out, err
+}
+
 func (c *Client) JobStatus(ctx context.Context, params JobStatusParams) (JobStatusResult, error) {
 	var out JobStatusResult
 	err := c.do(ctx, protocol.MethodJobStatus, params, &out)

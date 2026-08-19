@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -122,7 +123,7 @@ func TestClientHelloParsesBackendMetadata(t *testing.T) {
 		t.Fatalf("backend metadata = %+v", hello.BackendMetadata)
 	}
 	info := hello.BackendMetadata[0]
-	if info.Name != "codex" || len(info.Models) != 1 || info.Models[0] != "gpt-5" || len(info.Efforts) != 1 || info.Efforts[0] != "high" {
+	if info.Backend != "codex" || len(info.Models) != 1 || info.Models[0] != "gpt-5" || len(info.Efforts) != 1 || info.Efforts[0] != "high" {
 		t.Fatalf("backend metadata = %+v", hello.BackendMetadata)
 	}
 }
@@ -142,6 +143,10 @@ func TestClientHelloRejectsProtocolVersionMismatch(t *testing.T) {
 	err := runClientHelloError(t, `{"protocolVersion":1,"backends":["codex"],"capabilities":{}}`)
 	if !errors.Is(err, ErrProtocolVersionMismatch) {
 		t.Fatalf("clientHello error = %v, want ErrProtocolVersionMismatch", err)
+	}
+	var mismatch *ProtocolVersionMismatchError
+	if !errors.As(err, &mismatch) || mismatch.Received != 1 {
+		t.Fatalf("clientHello mismatch = %#v, want server version 1", mismatch)
 	}
 	if !strings.Contains(err.Error(), "expected 2") || !strings.Contains(err.Error(), "received 1") {
 		t.Fatalf("clientHello error message = %q, want expected and received versions", err.Error())
@@ -310,6 +315,254 @@ func runClientHelloResult(t *testing.T, result string) (HelloResult, error) {
 		t.Fatal(err)
 	}
 	return hello, err
+}
+
+func TestJobGetReflectWalksEveryRecordField(t *testing.T) {
+	want := reflectPopulatedValue[JobGetResult](t)
+	client, requests, done := newOneShotClient(t, protocol.Response{Result: want})
+
+	got, err := client.JobGet(context.Background(), JobGetParams{JobID: "job-reflect"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJobGetRequest(t, <-requests, JobGetParams{JobID: "job-reflect"})
+	assertOneShotClientDone(t, done)
+	assertReflectDecoded(t, reflect.ValueOf(want), reflect.ValueOf(got), "job.get record")
+}
+
+func TestJobGetReflectWalksEverySummaryField(t *testing.T) {
+	want := reflectPopulatedValue[JobSummaryWire](t)
+	client, requests, done := newOneShotClient(t, protocol.Response{
+		Result: JobGetListResult{Jobs: []JobSummaryWire{want}},
+	})
+
+	got, err := client.JobGetList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJobGetRequest(t, <-requests, JobGetParams{})
+	assertOneShotClientDone(t, done)
+	if len(got.Jobs) != 1 {
+		t.Fatalf("job.get summaries = %d, want 1", len(got.Jobs))
+	}
+	assertReflectDecoded(t, reflect.ValueOf(want), reflect.ValueOf(got.Jobs[0]), "job.get summary")
+}
+
+func TestJobGetReturnsTypedRPCError(t *testing.T) {
+	const jsonRPCCode = -32017
+	client, _, done := newOneShotClient(t, protocol.Response{Error: &protocol.ErrorObject{
+		Code:    jsonRPCCode,
+		Message: "backend unavailable",
+		Data: protocol.ErrorData{
+			Code: protocol.ErrorBackendUnavailable,
+		},
+	}})
+
+	_, err := client.JobGet(context.Background(), JobGetParams{JobID: "job-error"})
+	if err == nil {
+		t.Fatal("JobGet succeeded, want RPC error")
+	}
+	assertOneShotClientDone(t, done)
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("JobGet error = %T %v, want *RPCError", err, err)
+	}
+	if rpcErr.Object.Code != jsonRPCCode {
+		t.Fatalf("JSON-RPC code = %d, want %d", rpcErr.Object.Code, jsonRPCCode)
+	}
+	if got, want := FailureClass(rpcErr.Object.Data.Code), protocol.FailureClassBackendUnavailable; got != want {
+		t.Fatalf("failure class = %q, want %q", got, want)
+	}
+}
+
+func newOneShotClient(t *testing.T, response protocol.Response) (*Client, <-chan protocol.Request, <-chan error) {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	client := &Client{
+		conn:    clientConn,
+		reader:  bufio.NewReader(clientConn),
+		pending: make(map[string]chan protocol.Response),
+	}
+	requests := make(chan protocol.Request, 1)
+	done := make(chan error, 1)
+	go client.readLoop(clientConn, client.reader)
+	go func() {
+		defer serverConn.Close()
+		line, err := bufio.NewReader(serverConn).ReadBytes('\n')
+		if err != nil {
+			done <- err
+			return
+		}
+		var request protocol.Request
+		if err := json.Unmarshal(line, &request); err != nil {
+			done <- err
+			return
+		}
+		requests <- request
+		response.JSONRPC = "2.0"
+		response.ID = request.ID
+		done <- json.NewEncoder(serverConn).Encode(response)
+	}()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = serverConn.Close()
+	})
+	return client, requests, done
+}
+
+func assertJobGetRequest(t *testing.T, request protocol.Request, want JobGetParams) {
+	t.Helper()
+	if request.Method != protocol.MethodJobGet {
+		t.Fatalf("method = %q, want %q", request.Method, protocol.MethodJobGet)
+	}
+	var got JobGetParams
+	if err := json.Unmarshal(request.Params, &got); err != nil {
+		t.Fatalf("decode job.get params: %v", err)
+	}
+	if got != want {
+		t.Fatalf("job.get params = %#v, want %#v", got, want)
+	}
+	if want.JobID == "" && string(request.Params) != "{}" {
+		t.Fatalf("empty job.get params = %s, want {}", request.Params)
+	}
+}
+
+func assertOneShotClientDone(t *testing.T, done <-chan error) {
+	t.Helper()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func reflectPopulatedValue[T any](t *testing.T) T {
+	t.Helper()
+	return reflectPopulated(t, reflect.TypeFor[T]()).Interface().(T)
+}
+
+func reflectPopulated(t *testing.T, typ reflect.Type) reflect.Value {
+	t.Helper()
+	if typ == reflect.TypeFor[time.Time]() {
+		return reflect.ValueOf(time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC))
+	}
+	if typ == reflect.TypeFor[json.RawMessage]() {
+		return reflect.ValueOf(json.RawMessage(`{"reflect":true}`))
+	}
+
+	switch typ.Kind() {
+	case reflect.Bool:
+		value := reflect.New(typ).Elem()
+		value.SetBool(true)
+		return value
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		value := reflect.New(typ).Elem()
+		value.SetInt(7)
+		return value
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		value := reflect.New(typ).Elem()
+		value.SetUint(7)
+		return value
+	case reflect.Float32, reflect.Float64:
+		value := reflect.New(typ).Elem()
+		value.SetFloat(7.5)
+		return value
+	case reflect.String:
+		value := reflect.New(typ).Elem()
+		value.SetString("reflect-value")
+		return value
+	case reflect.Pointer:
+		value := reflect.New(typ.Elem())
+		value.Elem().Set(reflectPopulated(t, typ.Elem()))
+		return value
+	case reflect.Slice:
+		value := reflect.MakeSlice(typ, 1, 1)
+		value.Index(0).Set(reflectPopulated(t, typ.Elem()))
+		return value
+	case reflect.Array:
+		value := reflect.New(typ).Elem()
+		for i := 0; i < value.Len(); i++ {
+			value.Index(i).Set(reflectPopulated(t, typ.Elem()))
+		}
+		return value
+	case reflect.Map:
+		value := reflect.MakeMapWithSize(typ, 1)
+		value.SetMapIndex(reflectPopulated(t, typ.Key()), reflectPopulated(t, typ.Elem()))
+		return value
+	case reflect.Struct:
+		value := reflect.New(typ).Elem()
+		for i := 0; i < typ.NumField(); i++ {
+			if !value.Field(i).CanSet() {
+				continue
+			}
+			value.Field(i).Set(reflectPopulated(t, typ.Field(i).Type))
+		}
+		return value
+	case reflect.Interface:
+		value := reflect.New(typ).Elem()
+		value.Set(reflect.ValueOf("reflect-value"))
+		return value
+	default:
+		t.Fatalf("unsupported reflected response field type %s", typ)
+		return reflect.Value{}
+	}
+}
+
+func assertReflectDecoded(t *testing.T, want, got reflect.Value, path string) {
+	t.Helper()
+	if want.Type() != got.Type() {
+		t.Fatalf("%s type = %s, want %s", path, got.Type(), want.Type())
+	}
+	if want.Type() == reflect.TypeFor[time.Time]() {
+		if !reflect.DeepEqual(want.Interface(), got.Interface()) {
+			t.Fatalf("%s = %#v, want %#v", path, got.Interface(), want.Interface())
+		}
+		return
+	}
+
+	switch want.Kind() {
+	case reflect.Struct:
+		for i := 0; i < want.NumField(); i++ {
+			if want.Type().Field(i).PkgPath != "" {
+				continue
+			}
+			assertReflectDecoded(t, want.Field(i), got.Field(i), path+"."+want.Type().Field(i).Name)
+		}
+	case reflect.Pointer:
+		if want.IsNil() != got.IsNil() {
+			t.Fatalf("%s nil = %t, want %t", path, got.IsNil(), want.IsNil())
+		}
+		if !want.IsNil() {
+			assertReflectDecoded(t, want.Elem(), got.Elem(), path)
+		}
+	case reflect.Interface:
+		if want.IsNil() != got.IsNil() {
+			t.Fatalf("%s nil = %t, want %t", path, got.IsNil(), want.IsNil())
+		}
+		if !want.IsNil() {
+			assertReflectDecoded(t, want.Elem(), got.Elem(), path)
+		}
+	case reflect.Slice, reflect.Array:
+		if want.Len() != got.Len() {
+			t.Fatalf("%s length = %d, want %d", path, got.Len(), want.Len())
+		}
+		for i := 0; i < want.Len(); i++ {
+			assertReflectDecoded(t, want.Index(i), got.Index(i), fmt.Sprintf("%s[%d]", path, i))
+		}
+	case reflect.Map:
+		if want.Len() != got.Len() {
+			t.Fatalf("%s length = %d, want %d", path, got.Len(), want.Len())
+		}
+		for _, key := range want.MapKeys() {
+			gotValue := got.MapIndex(key)
+			if !gotValue.IsValid() {
+				t.Fatalf("%s missing key %v", path, key.Interface())
+			}
+			assertReflectDecoded(t, want.MapIndex(key), gotValue, fmt.Sprintf("%s[%v]", path, key.Interface()))
+		}
+	default:
+		if !reflect.DeepEqual(want.Interface(), got.Interface()) {
+			t.Fatalf("%s = %#v, want %#v", path, got.Interface(), want.Interface())
+		}
+	}
 }
 
 func TestAutostartRaceStartsOneDaemon(t *testing.T) {

@@ -3,21 +3,8 @@ package client
 import "github.com/charlesnpx/agentbus/internal/protocol"
 
 type HelloParams = protocol.HelloParams
-
-// BackendInfo describes the models and effort levels advertised by a backend.
-type BackendInfo struct {
-	Name    string   `json:"backend"`
-	Models  []string `json:"models"`
-	Efforts []string `json:"efforts"`
-}
-
-// HelloResult describes the server and its negotiated client capabilities.
-type HelloResult struct {
-	ProtocolVersion int             `json:"protocolVersion"`
-	Backends        []string        `json:"backends"`
-	BackendMetadata []BackendInfo   `json:"backendMetadata,omitempty"`
-	Capabilities    map[string]bool `json:"capabilities"`
-}
+type BackendInfo = protocol.BackendInfo
+type HelloResult = protocol.HelloResult
 type TaskSpec = protocol.TaskSpec
 type JobSubmitParams = protocol.JobSubmitParams
 type JobSubmitResult = protocol.JobSubmitResult
@@ -28,6 +15,16 @@ type JobResultParams = protocol.JobResultParams
 type JobResult = protocol.JobResult
 type JobCancelParams = protocol.JobCancelParams
 type JobCancelResult = protocol.JobCancelResult
+type JobGetParams = protocol.JobGetParams
+type JobGetResult = protocol.JobRecordWire
+type JobGetListResult = protocol.JobGetListResult
+type JobRecordWire = protocol.JobRecordWire
+type JobSummaryWire = protocol.JobSummaryWire
+type PublicState = protocol.PublicState
+type FailureClass = protocol.FailureClass
+type Cleanup = protocol.Cleanup
+type ContractResult = protocol.ContractResult
+type ContractVerdict = protocol.ContractVerdict
 type PolicyValidateParams = protocol.PolicyValidateParams
 type PolicyValidateResult = protocol.PolicyValidateResult
 type PolicyRegisterParams = protocol.PolicyRegisterParams
