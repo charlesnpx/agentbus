@@ -54,6 +54,13 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		LogPaths:      logPaths,
 		ModelReported: "gpt-5",
 	}
+	summary := JobSummaryWire{
+		JobID:     "job-1",
+		State:     PublicStateCompleted,
+		Backend:   "codex",
+		Cleanup:   CleanupUncertain,
+		CreatedAt: createdAt,
+	}
 	taskSpec := TaskSpecV3{
 		Backend:      "codex",
 		CWD:          "/workspace",
@@ -67,6 +74,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 	}
 
 	const recordJSON = `{"jobId":"job-1","workspaceKey":"workspace-1","requestId":"request-1","backend":"codex","state":"completed","tags":{"team":"core"},"createdAt":"2025-01-02T03:04:05Z","startedAt":"2025-01-02T03:05:05Z","finishedAt":"2025-01-02T03:06:05Z","timeout":{"requested":1234,"effective":2345,"source":"client"},"result":{"text":"answer","textElided":true,"resultPath":"/results/job-1","sha256":"result-sha","bytes":42,"modelReported":"gpt-5"},"contract":{"schemaSha256":"schema-sha","evaluated":true,"compliant":true,"attempts":2,"violations":["/answer"]},"failure":{"class":"backend_error","reason":"backend stopped"},"cleanup":"uncertain","logPaths":{"stdout":"/logs/job-1.out","stderr":"/logs/job-1.err"},"modelReported":"gpt-5"}`
+	const summaryJSON = `{"jobId":"job-1","state":"completed","backend":"codex","cleanup":"uncertain","createdAt":"2025-01-02T03:04:05Z"}`
 
 	tests := []struct {
 		name  string
@@ -123,10 +131,16 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 			want:  `{"jobId":"job-1"}`,
 		},
 		{
-			name:  "JobGetResult",
-			value: JobGetResult{Jobs: []JobRecordWire{record}},
-			new:   func() any { return new(JobGetResult) },
-			want:  `{"jobs":[` + recordJSON + `]}`,
+			name:  "JobGet single response",
+			value: record,
+			new:   func() any { return new(JobRecordWire) },
+			want:  recordJSON,
+		},
+		{
+			name:  "JobGet list response",
+			value: JobGetListResult{Jobs: []JobSummaryWire{summary}},
+			new:   func() any { return new(JobGetListResult) },
+			want:  `{"jobs":[` + summaryJSON + `]}`,
 		},
 		{
 			name:  "JobCancelParamsV3",
@@ -149,12 +163,6 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 			},
 			new:  func() any { return new(HelloResultV3) },
 			want: `{"protocolVersion":3,"backends":["codex"],"backendMetadata":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}]}`,
-		},
-		{
-			name:  "JobRecordWire",
-			value: record,
-			new:   func() any { return new(JobRecordWire) },
-			want:  recordJSON,
 		},
 		{
 			name:  "JobFailureWire",
@@ -217,6 +225,21 @@ func TestJobRecordWireFieldAllowList(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("JobRecordWire field names = %v, want %v", got, want)
+	}
+}
+
+func TestJobSummaryWireFieldAllowList(t *testing.T) {
+	want := map[string]struct{}{
+		"JobID": {}, "State": {}, "Backend": {}, "Cleanup": {}, "CreatedAt": {},
+	}
+
+	summaryType := reflect.TypeOf(JobSummaryWire{})
+	got := make(map[string]struct{}, summaryType.NumField())
+	for i := 0; i < summaryType.NumField(); i++ {
+		got[summaryType.Field(i).Name] = struct{}{}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("JobSummaryWire field names = %v, want %v", got, want)
 	}
 }
 
