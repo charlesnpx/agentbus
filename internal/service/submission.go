@@ -80,6 +80,12 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "stored taskSpec timeout: "+err.Error(), protocol.ErrorData{JobID: record.JobID})}
 	}
+	// Only a live daemon owns new execution, and only a genuinely new job is
+	// enqueued: a deduplicated replay is already running or terminal, so
+	// enqueueing it again would be the second launch the ordering forbids.
+	if !deduplicated {
+		s.enqueueQueuedJob(record)
+	}
 	return requestOutcome{result: jobSubmitResult(record, deduplicated, timeout)}
 }
 
@@ -250,6 +256,7 @@ func (s *Server) closeJobStore() {
 	if s == nil {
 		return
 	}
+	s.stopExecutions()
 	s.jobStoreMu.Lock()
 	store := s.jobStore
 	s.jobStore = nil
