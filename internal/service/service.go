@@ -1,8 +1,8 @@
 //go:build darwin || linux
 
 // Package service exposes the transport and lifecycle for the version-3
-// agentbus daemon. It intentionally serves protocol.hello only; job methods
-// are added by their owning units.
+// agentbus daemon. It serves protocol.hello and durable job.submit; later
+// units add the remaining job methods.
 package service
 
 import (
@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -121,6 +122,12 @@ type Server struct {
 	token      string
 	backends   map[string]engine.Backend
 
+	jobStoreMu sync.Mutex
+	jobStore   *jobstore.Store
+
+	backendProbeMu           sync.Mutex
+	backendProbeFingerprints map[string]string
+
 	idleTimeout       time.Duration
 	idleCheckInterval time.Duration
 	shutdownTimeout   time.Duration
@@ -185,15 +192,16 @@ func New(cfg Config) (*Server, error) {
 		}
 	}
 	return &Server{
-		stateRoot:         root,
-		socketPath:        socketPath,
-		token:             token,
-		backends:          backends,
-		idleTimeout:       idleTimeout,
-		idleCheckInterval: idleCheckInterval,
-		shutdownTimeout:   normalizeShutdownTimeout(cfg.ShutdownTimeout),
-		readyHook:         cfg.ReadyHook,
-		lastActivity:      time.Now().UTC(),
+		stateRoot:                root,
+		socketPath:               socketPath,
+		token:                    token,
+		backends:                 backends,
+		backendProbeFingerprints: make(map[string]string),
+		idleTimeout:              idleTimeout,
+		idleCheckInterval:        idleCheckInterval,
+		shutdownTimeout:          normalizeShutdownTimeout(cfg.ShutdownTimeout),
+		readyHook:                cfg.ReadyHook,
+		lastActivity:             time.Now().UTC(),
 	}, nil
 }
 
@@ -231,7 +239,7 @@ func (s *Server) ShutdownTimeout() time.Duration {
 }
 
 // Serve listens until ctx is canceled, an idle timeout fires, or a stale
-// binary has drained. It serves protocol.hello only.
+// binary has drained. It serves protocol.hello and job.submit.
 func (s *Server) Serve(ctx context.Context) error {
 	return s.serve(ctx, ctx)
 }
@@ -252,6 +260,10 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	if startupCtx == nil {
 		startupCtx = ctx
 	}
+	if _, err := s.ensureJobStore(); err != nil {
+		return err
+	}
+	defer s.closeJobStore()
 	if err := s.captureBinaryIdentity(); err != nil {
 		return err
 	}

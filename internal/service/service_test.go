@@ -8,9 +8,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -53,6 +57,7 @@ func newTestServer(t *testing.T, root string, cfg Config) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(server.closeJobStore)
 	return server
 }
 
@@ -391,5 +396,226 @@ func TestIdleShutdownAfterConfiguredWindow(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("idle shutdown did not fire")
+	}
+}
+
+type submitProbeBackend struct {
+	name       string
+	probes     atomic.Int64
+	preflights atomic.Int64
+	preflight  error
+	probe      error
+}
+
+func (backend *submitProbeBackend) Name() string { return backend.name }
+
+func (backend *submitProbeBackend) Preflight(context.Context) (engine.Health, error) {
+	backend.preflights.Add(1)
+	return engine.Health{Backend: backend.name}, backend.preflight
+}
+
+func (backend *submitProbeBackend) Start(context.Context, engine.SessionOpts) (engine.Session, error) {
+	return nil, errors.New("not used by submission tests")
+}
+
+func (backend *submitProbeBackend) Resume(context.Context, string, engine.SessionOpts) (engine.Session, error) {
+	return nil, errors.New("not used by submission tests")
+}
+
+func (backend *submitProbeBackend) SetupProbe(context.Context) (engine.BackendSetupProbe, error) {
+	backend.probes.Add(1)
+	if backend.probe != nil {
+		return engine.BackendSetupProbe{}, backend.probe
+	}
+	return engine.BackendSetupProbe{Backend: backend.name, Version: "test"}, nil
+}
+
+func submitForTest(t *testing.T, server *Server, params protocol.JobSubmitParamsV3) requestOutcome {
+	t.Helper()
+	return server.handleJobSubmit(context.Background(), mustJSON(t, params))
+}
+
+func submitResultForTest(t *testing.T, outcome requestOutcome) protocol.JobSubmitResultV3 {
+	t.Helper()
+	if outcome.err != nil {
+		t.Fatalf("submit error = %+v", outcome.err)
+	}
+	result, ok := outcome.result.(protocol.JobSubmitResultV3)
+	if !ok {
+		t.Fatalf("submit result = %T %#v, want protocol.JobSubmitResultV3", outcome.result, outcome.result)
+	}
+	if result.Timeout == nil || result.Timeout.Source == "" {
+		t.Fatalf("submit timeout = %#v, want populated resolution", result.Timeout)
+	}
+	return result
+}
+
+func submissionParams(workspaceKey, requestID, backend, cwd, prompt string) protocol.JobSubmitParamsV3 {
+	return protocol.JobSubmitParamsV3{
+		WorkspaceKey: workspaceKey,
+		RequestID:    requestID,
+		TaskSpec: protocol.TaskSpecV3{
+			Backend: backend,
+			CWD:     cwd,
+			Write:   false,
+			Prompt:  prompt,
+		},
+	}
+}
+
+func TestJobSubmitReplaySurvivesDeletedWorkspace(t *testing.T) {
+	root := t.TempDir()
+	cwd := filepath.Join(root, "workspace")
+	if err := os.Mkdir(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	server := newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	params := submissionParams("workspace-delete", "request-delete", "codex", cwd, "same task")
+	first := submitResultForTest(t, submitForTest(t, server, params))
+	if err := os.RemoveAll(cwd); err != nil {
+		t.Fatal(err)
+	}
+	replay := submitResultForTest(t, submitForTest(t, server, params))
+	if !replay.Deduplicated || replay.JobID != first.JobID || replay.State != protocol.PublicStateQueued {
+		t.Fatalf("deleted-workspace replay = %+v, want queued deduplication of %q", replay, first.JobID)
+	}
+}
+
+func TestJobSubmitReplaySurvivesWorkspaceSymlinkReplacement(t *testing.T) {
+	root := t.TempDir()
+	cwd := filepath.Join(root, "workspace")
+	if err := os.Mkdir(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	server := newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	params := submissionParams("workspace-symlink", "request-symlink", "codex", cwd, "same task")
+	first := submitResultForTest(t, submitForTest(t, server, params))
+	if err := os.RemoveAll(cwd); err != nil {
+		t.Fatal(err)
+	}
+	target := t.TempDir()
+	if err := os.Symlink(target, cwd); err != nil {
+		t.Fatal(err)
+	}
+	replay := submitResultForTest(t, submitForTest(t, server, params))
+	if !replay.Deduplicated || replay.JobID != first.JobID || replay.State != protocol.PublicStateQueued {
+		t.Fatalf("symlink-workspace replay = %+v, want queued deduplication of %q", replay, first.JobID)
+	}
+}
+
+func TestJobSubmitDifferentPromptReturnsTypedConflict(t *testing.T) {
+	root := t.TempDir()
+	server := newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	params := submissionParams("workspace-conflict", "request-conflict", "codex", t.TempDir(), "first prompt")
+	first := submitResultForTest(t, submitForTest(t, server, params))
+	params.TaskSpec.Prompt = "different prompt"
+	conflict := submitForTest(t, server, params)
+	if conflict.err == nil || conflict.err.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
+		t.Fatalf("conflict error = %#v, want typed invalid-task conflict", conflict.err)
+	}
+	if conflict.err.Data.JobID != first.JobID || !strings.Contains(conflict.err.Message, "jobstore: request conflict") {
+		t.Fatalf("conflict error = %#v, want existing job %q and jobstore conflict", conflict.err, first.JobID)
+	}
+	result, ok := conflict.result.(protocol.JobSubmitResultV3)
+	if !ok || result.Timeout == nil || result.Timeout.Source == "" {
+		t.Fatalf("conflict result = %#v, want populated timeout resolution", conflict.result)
+	}
+}
+
+func TestJobSubmitUnknownBackendNewKeyIsAdmittedFailed(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{})
+	result := submitResultForTest(t, submitForTest(t, server, submissionParams("workspace-unknown-new", "request-unknown-new", "missing", t.TempDir(), "task")))
+	if result.Deduplicated || result.State != protocol.PublicStateFailed {
+		t.Fatalf("unknown-backend new result = %+v, want non-deduplicated failed job", result)
+	}
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(result.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.FailureClass != protocol.FailureClassBackendUnavailable {
+		t.Fatalf("unknown-backend failure class = %q, want %q", record.FailureClass, protocol.FailureClassBackendUnavailable)
+	}
+}
+
+func TestJobSubmitUnknownBackendReplayDeduplicates(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	params := submissionParams("workspace-unknown-replay", "request-unknown-replay", "codex", t.TempDir(), "task")
+	first := submitResultForTest(t, submitForTest(t, server, params))
+	delete(server.backends, "codex")
+	replay := submitResultForTest(t, submitForTest(t, server, params))
+	if !replay.Deduplicated || replay.JobID != first.JobID || replay.State != protocol.PublicStateQueued {
+		t.Fatalf("unknown-backend replay = %+v, want queued deduplication of %q", replay, first.JobID)
+	}
+}
+
+func TestJobSubmitRejectsTimeoutAboveMaximum(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	timeout := protocol.MaxTimeout.Milliseconds() + 1
+	params := submissionParams("workspace-timeout", "request-timeout", "codex", t.TempDir(), "task")
+	params.TaskSpec.TimeoutMS = &timeout
+	outcome := submitForTest(t, server, params)
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
+		t.Fatalf("oversized timeout outcome = %#v, want invalid task spec", outcome.err)
+	}
+}
+
+func TestJobSubmitRejectsUnknownTaskSpecField(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	raw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":"workspace-unknown-field","requestId":"request-unknown-field","taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","unexpected":true}}`, t.TempDir()))
+	outcome := server.handleJobSubmit(context.Background(), raw)
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
+		t.Fatalf("unknown taskSpec field outcome = %#v, want invalid task spec", outcome.err)
+	}
+}
+
+func TestJobSubmitTimeoutResolutionIsPresentOnNewReplayAndConflict(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	timeout := int64(1234)
+	params := submissionParams("workspace-timeout-resolution", "request-timeout-resolution", "codex", t.TempDir(), "first prompt")
+	params.TaskSpec.TimeoutMS = &timeout
+	first := submitResultForTest(t, submitForTest(t, server, params))
+	if first.Timeout.Requested == nil || *first.Timeout.Requested != timeout || first.Timeout.Effective != timeout || first.Timeout.Source != engine.TimeoutSourceClient {
+		t.Fatalf("new timeout = %#v, want requested client resolution", first.Timeout)
+	}
+	replay := submitResultForTest(t, submitForTest(t, server, params))
+	if replay.Timeout.Requested == nil || *replay.Timeout.Requested != timeout || replay.Timeout.Effective != timeout || replay.Timeout.Source != engine.TimeoutSourceClient {
+		t.Fatalf("replay timeout = %#v, want requested client resolution", replay.Timeout)
+	}
+	params.TaskSpec.Prompt = "conflicting prompt"
+	conflict := submitForTest(t, server, params)
+	if conflict.err == nil {
+		t.Fatal("conflict error = nil, want typed conflict")
+	}
+	result, ok := conflict.result.(protocol.JobSubmitResultV3)
+	if !ok || result.Timeout == nil || result.Timeout.Requested == nil || *result.Timeout.Requested != timeout || result.Timeout.Effective != timeout || result.Timeout.Source != engine.TimeoutSourceClient {
+		t.Fatalf("conflict timeout result = %#v, want requested client resolution", conflict.result)
+	}
+}
+
+func TestJobSubmitProbesAndCachesBackendOnDemand(t *testing.T) {
+	root := t.TempDir()
+	backend := &submitProbeBackend{name: "probed"}
+	server := newTestServer(t, root, Config{Backends: []engine.Backend{backend}})
+	result := submitResultForTest(t, submitForTest(t, server, submissionParams("workspace-probed", "request-probed", "probed", t.TempDir(), "task")))
+	if result.State != protocol.PublicStateQueued {
+		t.Fatalf("on-demand probe result = %+v, want queued", result)
+	}
+	if got := backend.probes.Load(); got != 1 {
+		t.Fatalf("on-demand probes = %d, want 1", got)
+	}
+	cachePath, err := engine.SetupProbeCachePath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, err := engine.ReadSetupProbeCache(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cacheHasBackend(cache, "probed") {
+		t.Fatalf("cached probes = %+v, want probed backend", cache.Backends)
 	}
 }
