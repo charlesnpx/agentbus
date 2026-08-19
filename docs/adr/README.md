@@ -1,13 +1,8 @@
 # Agentbus ADR Index
 
 These records summarize the evolution of the reliable-admission decisions from
-the implementation spec through the AB-E hardening units. Entries marked
-superseded are historical: ADR-12 (strict-only contract, protocol v2) is
-normative for production strict admission and overrides earlier
-legacy-surface decisions. ADR-13 (custody de-escalation) normatively amends
-the daemon-crash custody portions of ADR-12 (corruption safety-scope, shutdown
-contract, result semantics, and the meaning of `unavailable_native_runtime`);
-all other ADR-12 provisions remain in force.
+the implementation spec through the AB-E hardening units. ADR-14 is the sole
+normative contract. Every entry marked superseded is historical only.
 
 | ADR | Decision |
 | --- | --- |
