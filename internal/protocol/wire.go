@@ -174,8 +174,7 @@ type JobCancelResultV3 struct {
 // never set anywhere in the tree.
 type HelloResultV3 struct {
 	ProtocolVersion int           `json:"protocolVersion"`
-	Backends        []string      `json:"backends"`
-	BackendMetadata []BackendInfo `json:"backendMetadata,omitempty"`
+	BackendMetadata []BackendInfo `json:"backends"`
 }
 
 // JobRecordWire is the detailed response to job.get when JobID is provided.
