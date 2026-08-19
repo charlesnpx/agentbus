@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -253,6 +255,118 @@ func TestDirectCommandRunnerCanceledWithMismatchedTokenKeepsWritingProcessAlive(
 	select {
 	case <-time.After(100 * time.Millisecond):
 		assertProcessRunning(t, command.cmd.Process.Pid)
+	}
+}
+
+func TestDirectCommandRunnerCanceledAfterLeaderTERMExitKeepsDescendantPipeOpen(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("process-group fixtures require a native Linux or Darwin start token")
+	}
+	const cancelGrace = 25 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	running, err := (DirectCommandRunner{CancelGrace: cancelGrace}).Start(ctx, ExecSpec{
+		Argv: []string{"/bin/sh", "-c", `
+trap 'exit 0' TERM
+/bin/sh -c '
+	trap "" TERM
+	deadline=$(( $(date +%s) + 2 ))
+	printf "child-ready:%s\\n" "$$"
+	while :; do
+		printf "child-output\\n"
+		if [ "$(date +%s)" -ge "$deadline" ]; then exit 0; fi
+		sleep 0.01
+	done
+' &
+while :; do :; done
+`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, ok := running.(*directRunningCommand)
+	if !ok {
+		t.Fatalf("running command type = %T, want *directRunningCommand", running)
+	}
+	t.Cleanup(func() {
+		cancel()
+		command.startWait()
+		if command.stdin != nil {
+			_ = command.stdin.Close()
+		}
+		if command.stdout != nil {
+			_ = command.stdout.Close()
+		}
+		if command.stderr != nil {
+			_ = command.stderr.Close()
+		}
+		select {
+		case <-command.waitDone:
+		case <-time.After(3 * time.Second):
+			t.Error("asynchronous reaper did not reap descendant after test cleanup")
+		}
+	})
+
+	ready := make(chan string, 1)
+	readyErr := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(command.Stdout())
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				readyErr <- err
+				return
+			}
+			if strings.HasPrefix(line, "child-ready:") {
+				ready <- strings.TrimSpace(strings.TrimPrefix(line, "child-ready:"))
+				return
+			}
+		}
+	}()
+	var childPID int
+	select {
+	case err := <-readyErr:
+		t.Fatalf("child readiness read error = %v", err)
+	case pid := <-ready:
+		childPID, err = strconv.Atoi(pid)
+		if err != nil || childPID <= 0 {
+			t.Fatalf("child pid = %q, want a positive pid", pid)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("TERM-ignoring descendant did not become ready")
+	}
+	if childGroup, err := syscall.Getpgid(childPID); err != nil {
+		t.Fatalf("child process group lookup error = %v", err)
+	} else if want := command.terminator.capturedProcessRef().PGID; childGroup != want {
+		t.Fatalf("child process group = %d, want leader process group %d", childGroup, want)
+	}
+
+	cancel()
+	waitDone := make(chan error, 1)
+	go func() {
+		_, err := command.Wait(context.Background())
+		waitDone <- err
+	}()
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, engine.ErrProcessIdentityUnverifiable) {
+			t.Fatalf("Wait() error = %v, want ErrProcessIdentityUnverifiable", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Wait blocked after partial cancellation")
+	}
+	var observer FinalObserver = command
+	observation, err := observer.FinalObservation(context.Background())
+	if err != nil {
+		t.Fatalf("FinalObservation() error = %v", err)
+	}
+	if !errors.Is(observation.CleanupErr, engine.ErrProcessIdentityUnverifiable) {
+		t.Fatalf("cleanup error = %v, want ErrProcessIdentityUnverifiable", observation.CleanupErr)
+	}
+
+	<-time.After(2 * cancelGrace)
+	assertProcessRunning(t, childPID)
+	if _, err := command.stdoutPipe.Stat(); err != nil {
+		t.Fatalf("stdout pipe closed after partial termination: %v", err)
 	}
 }
 

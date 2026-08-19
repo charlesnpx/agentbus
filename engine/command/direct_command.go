@@ -27,7 +27,6 @@ var ErrOutputTruncated = errors.New("command output truncated")
 const (
 	directOutputBufferLimit = 16 << 20
 	directStderrDrainGrace  = 200 * time.Millisecond
-	directCommandWaitDelay  = 200 * time.Millisecond
 )
 
 func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningCommand, error) {
@@ -44,12 +43,10 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 	if grace == 0 {
 		grace = engine.DefaultCancelGrace
 	}
-	// Do not give os/exec the context: its watchdog can call Process.Kill
-	// independently after WaitDelay. DirectCommandRunner owns cancellation so
-	// every termination attempt reaches the identity-fenced terminator.
+	// DirectCommandRunner owns cancellation so every termination attempt reaches
+	// the identity-fenced terminator.
 	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...)
 	terminator := &directTerminator{cmd: cmd, grace: grace}
-	cmd.WaitDelay = directCommandWaitDelay
 	if spec.Dir != "" {
 		cmd.Dir = spec.Dir
 	}
@@ -240,9 +237,6 @@ func (r *directRunningCommand) waitForExit() {
 		r.terminator.markLeaderReaped()
 	}
 	r.stopStartContext()
-	if errors.Is(err, exec.ErrWaitDelay) {
-		err = nil
-	}
 	if r.stdoutDrain != nil {
 		// Stdout is the live-leader stream boundary. Once the leader has
 		// exited, descendants retaining stdout get only the runner cancel
@@ -318,7 +312,9 @@ func (r *directRunningCommand) stopStartContext() {
 
 func (r *directRunningCommand) closeOutputPipes() {
 	if r.terminator != nil {
-		r.terminator.closePipes()
+		if r.terminator.canClosePipes() {
+			r.terminator.closePipes()
+		}
 		return
 	}
 	if r.stdoutPipe != nil {
@@ -382,14 +378,16 @@ func exitObservationForCmd(cmd *exec.Cmd) ExitObservation {
 }
 
 type directTerminator struct {
-	cmd          *exec.Cmd
-	grace        time.Duration
-	pipes        []*os.File
-	once         sync.Once
-	pipesOnce    sync.Once
-	processRef   engine.ProcessRef
-	leaderReaped atomic.Bool
-	err          error
+	cmd                  *exec.Cmd
+	grace                time.Duration
+	pipes                []*os.File
+	once                 sync.Once
+	pipesOnce            sync.Once
+	processRef           engine.ProcessRef
+	leaderReaped         atomic.Bool
+	terminationStarted   atomic.Bool
+	terminationSucceeded atomic.Bool
+	err                  error
 }
 
 func (t *directTerminator) captureProcessRef() {
@@ -406,9 +404,9 @@ func (t *directTerminator) capturedProcessRef() engine.ProcessRef {
 	return t.processRef
 }
 
-// markLeaderReaped records the sole cmd.Wait completion. Once the direct child
-// has exited, its retained output descriptors may be released without trying
-// to signal an orphaned process group whose identity can no longer be fenced.
+// markLeaderReaped records the sole cmd.Wait completion, so a later termination
+// attempt does not signal an orphaned process group whose identity cannot be
+// fenced.
 func (t *directTerminator) markLeaderReaped() {
 	if t != nil {
 		t.leaderReaped.Store(true)
@@ -419,20 +417,26 @@ func (t *directTerminator) terminate() error {
 	if t == nil {
 		return nil
 	}
+	t.terminationStarted.Store(true)
 	t.once.Do(func() {
 		// cmd.Wait has established that this direct execution is over. Do not
-		// attempt a group signal after its leader has been reaped, but close the
-		// local read ends so a surviving descendant cannot retain the turn.
+		// attempt a group signal after its leader has been reaped.
 		if t.leaderReaped.Load() {
+			t.terminationSucceeded.Store(true)
 			t.closePipes()
 			return
 		}
 		t.err = terminateProcessGroup(t.cmd, t.processRef, t.grace)
 		if t.err == nil {
+			t.terminationSucceeded.Store(true)
 			t.closePipes()
 		}
 	})
 	return t.err
+}
+
+func (t *directTerminator) canClosePipes() bool {
+	return !t.terminationStarted.Load() || t.terminationSucceeded.Load()
 }
 
 func (t *directTerminator) closePipes() {
