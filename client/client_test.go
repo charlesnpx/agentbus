@@ -123,7 +123,7 @@ func TestClientHelloParsesBackendMetadata(t *testing.T) {
 		t.Fatalf("backend metadata = %+v", hello.BackendMetadata)
 	}
 	info := hello.BackendMetadata[0]
-	if info.Backend != "codex" || len(info.Models) != 1 || info.Models[0] != "gpt-5" || len(info.Efforts) != 1 || info.Efforts[0] != "high" {
+	if info.Name != "codex" || len(info.Models) != 1 || info.Models[0] != "gpt-5" || len(info.Efforts) != 1 || info.Efforts[0] != "high" {
 		t.Fatalf("backend metadata = %+v", hello.BackendMetadata)
 	}
 }

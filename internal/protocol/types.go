@@ -167,7 +167,7 @@ type HelloResult struct {
 }
 
 type BackendInfo struct {
-	Backend string   `json:"backend"`
+	Name    string   `json:"backend"`
 	Models  []string `json:"models"`
 	Efforts []string `json:"efforts"`
 }
