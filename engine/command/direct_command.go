@@ -36,7 +36,7 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 		grace = engine.DefaultCancelGrace
 	}
 	cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
-	terminator := &directTerminator{cmd: cmd, grace: grace}
+	terminator := &directTerminator{cmd: cmd, grace: grace, processRefReady: make(chan struct{})}
 	cmd.Cancel = terminator.terminate
 	cmd.WaitDelay = 200 * time.Millisecond
 	if spec.Dir != "" {
@@ -72,6 +72,7 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 	cmd.Stdout = stdoutWriter
 	cmd.Stderr = stderrWriter
 	if err := cmd.Start(); err != nil {
+		terminator.markProcessRefReady()
 		_ = stdin.Close()
 		_ = stdoutReader.Close()
 		_ = stdoutWriter.Close()
@@ -81,6 +82,7 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 		stderr.closeWriter(err)
 		return nil, err
 	}
+	terminator.captureProcessRef()
 	_ = stdoutWriter.Close()
 	_ = stderrWriter.Close()
 	stdoutDrain := drainDirectOutput(stdoutReader, stdout)
@@ -206,6 +208,10 @@ func (r *directRunningCommand) Interrupt(ctx context.Context) error {
 }
 
 func (r *directRunningCommand) ProcessRef() (engine.ProcessRef, int) {
+	if r.terminator != nil {
+		ref := r.terminator.capturedProcessRef()
+		return ref, ref.PID
+	}
 	ref := processRefForCmd(r.cmd)
 	return ref, ref.PID
 }
@@ -226,19 +232,67 @@ func exitObservationForCmd(cmd *exec.Cmd) ExitObservation {
 }
 
 type directTerminator struct {
-	cmd       *exec.Cmd
-	grace     time.Duration
-	pipes     []*os.File
-	once      sync.Once
-	pipesOnce sync.Once
-	err       error
+	cmd                 *exec.Cmd
+	grace               time.Duration
+	pipes               []*os.File
+	once                sync.Once
+	pipesOnce           sync.Once
+	processRefMu        sync.RWMutex
+	processRef          engine.ProcessRef
+	processRefReady     chan struct{}
+	processRefReadyOnce sync.Once
+	err                 error
+}
+
+// capturedDirectProcessRefs passes the identity captured immediately after
+// Start to the platform terminator while retaining terminateProcessGroup as a
+// test seam for the command package.
+var capturedDirectProcessRefs sync.Map // map[*exec.Cmd]engine.ProcessRef
+
+func (t *directTerminator) captureProcessRef() {
+	if t == nil {
+		return
+	}
+	ref := processRefForCmd(t.cmd)
+	t.processRefMu.Lock()
+	t.processRef = ref
+	t.processRefMu.Unlock()
+	t.markProcessRefReady()
+}
+
+func (t *directTerminator) capturedProcessRef() engine.ProcessRef {
+	if t == nil {
+		return engine.ProcessRef{}
+	}
+	t.processRefMu.RLock()
+	defer t.processRefMu.RUnlock()
+	return t.processRef
+}
+
+func (t *directTerminator) markProcessRefReady() {
+	if t == nil || t.processRefReady == nil {
+		return
+	}
+	t.processRefReadyOnce.Do(func() { close(t.processRefReady) })
+}
+
+func (t *directTerminator) waitForProcessRef() {
+	if t == nil || t.processRefReady == nil {
+		return
+	}
+	<-t.processRefReady
 }
 
 func (t *directTerminator) terminate() error {
 	if t == nil {
 		return nil
 	}
+	t.waitForProcessRef()
 	t.once.Do(func() {
+		if t.cmd != nil {
+			capturedDirectProcessRefs.Store(t.cmd, t.capturedProcessRef())
+			defer capturedDirectProcessRefs.Delete(t.cmd)
+		}
 		t.err = terminateProcessGroup(t.cmd, t.grace)
 		t.closePipes()
 	})
