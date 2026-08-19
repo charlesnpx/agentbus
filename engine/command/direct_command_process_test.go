@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"runtime"
 	"syscall"
@@ -165,6 +166,17 @@ func TestDirectCommandRunnerCanceledWithMissingTokenReturnsPromptlyAndLeavesProc
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Wait blocked after cancellation identity rejection")
 	}
+	var observer FinalObserver = command
+	observation, err := observer.FinalObservation(context.Background())
+	if err != nil {
+		t.Fatalf("FinalObservation() error = %v", err)
+	}
+	if !errors.Is(observation.CleanupErr, engine.ErrProcessIdentityUnverifiable) {
+		t.Fatalf("cleanup error = %v, want ErrProcessIdentityUnverifiable", observation.CleanupErr)
+	}
+	if observation.ExecutionErr != nil {
+		t.Fatalf("execution error = %v, want nil before asynchronous reap", observation.ExecutionErr)
+	}
 	assertProcessRunning(t, command.cmd.Process.Pid)
 }
 
@@ -186,7 +198,7 @@ func TestDirectCommandRunnerCanceledWithMismatchedTokenKeepsWritingProcessAlive(
 	}
 	capturedRef := command.terminator.capturedProcessRef()
 	requireStartToken(t, capturedRef)
-	t.Cleanup(func() { stopDirectRunningCommand(t, command, capturedRef) })
+	t.Cleanup(func() { stopDirectRunningCommand(t, command) })
 
 	outputDone := make(chan error, 1)
 	go func() {
@@ -220,11 +232,89 @@ func TestDirectCommandRunnerCanceledWithMismatchedTokenKeepsWritingProcessAlive(
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Wait blocked after cancellation identity rejection")
 	}
+	var observer FinalObserver = command
+	observation, err := observer.FinalObservation(context.Background())
+	if err != nil {
+		t.Fatalf("FinalObservation() error = %v", err)
+	}
+	if !errors.Is(observation.CleanupErr, engine.ErrProcessIdentityUnverifiable) {
+		t.Fatalf("cleanup error = %v, want ErrProcessIdentityUnverifiable", observation.CleanupErr)
+	}
+	if observation.ExecutionErr != nil {
+		t.Fatalf("execution error = %v, want nil before asynchronous reap", observation.ExecutionErr)
+	}
+	if _, err := command.stdoutPipe.Stat(); err != nil {
+		t.Fatalf("stdout pipe closed after cleanup uncertainty: %v", err)
+	}
+	if _, err := command.stderrPipe.Stat(); err != nil {
+		t.Fatalf("stderr pipe closed after cleanup uncertainty: %v", err)
+	}
 
 	select {
 	case <-time.After(100 * time.Millisecond):
 		assertProcessRunning(t, command.cmd.Process.Pid)
 	}
+}
+
+func TestDirectCommandRunnerPermissionDeniedReportsCleanupFailure(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("process-group fixtures require a native Linux or Darwin start token")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	running, err := (DirectCommandRunner{CancelGrace: 10 * time.Millisecond}).Start(ctx, ExecSpec{
+		Argv: []string{"/usr/bin/yes"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, ok := running.(*directRunningCommand)
+	if !ok {
+		t.Fatalf("running command type = %T, want *directRunningCommand", running)
+	}
+	t.Cleanup(func() { stopDirectRunningCommand(t, command) })
+	var calls []syscall.Signal
+	setProcessGroupSignal(t, func(_ int, signal syscall.Signal) error {
+		calls = append(calls, signal)
+		if signal == 0 {
+			return syscall.EPERM
+		}
+		return nil
+	})
+
+	cancel()
+	waitDone := make(chan error, 1)
+	go func() {
+		_, err := command.Wait(context.Background())
+		waitDone <- err
+	}()
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, syscall.EPERM) {
+			t.Fatalf("Wait() error = %v, want EPERM", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Wait blocked after cancellation permission failure")
+	}
+	assertNoTerminationSignal(t, calls)
+	var observer FinalObserver = command
+	observation, err := observer.FinalObservation(context.Background())
+	if err != nil {
+		t.Fatalf("FinalObservation() error = %v", err)
+	}
+	if !errors.Is(observation.CleanupErr, syscall.EPERM) {
+		t.Fatalf("cleanup error = %v, want EPERM", observation.CleanupErr)
+	}
+	if observation.ExecutionErr != nil {
+		t.Fatalf("execution error = %v, want nil before asynchronous reap", observation.ExecutionErr)
+	}
+	if _, err := command.stdoutPipe.Stat(); err != nil {
+		t.Fatalf("stdout pipe closed after cleanup uncertainty: %v", err)
+	}
+	if _, err := command.stderrPipe.Stat(); err != nil {
+		t.Fatalf("stderr pipe closed after cleanup uncertainty: %v", err)
+	}
+	assertProcessRunning(t, command.cmd.Process.Pid)
 }
 
 func TestDirectCommandRunnerKilledCancellationRetainsExecutionFailure(t *testing.T) {
@@ -242,7 +332,7 @@ func TestDirectCommandRunnerKilledCancellationRetainsExecutionFailure(t *testing
 	}
 	capturedRef := command.terminator.capturedProcessRef()
 	requireStartToken(t, capturedRef)
-	t.Cleanup(func() { stopDirectRunningCommand(t, command, capturedRef) })
+	t.Cleanup(func() { stopDirectRunningCommand(t, command) })
 
 	ready := make(chan []byte, 1)
 	readyErr := make(chan error, 1)
@@ -282,7 +372,20 @@ func TestDirectCommandRunnerKilledCancellationRetainsExecutionFailure(t *testing
 		t.Fatal("Wait blocked after KILL escalation")
 	}
 
-	observation := FinalObservation{Exit: result.exit, ExecutionErr: result.err}
+	var observer FinalObserver = command
+	observation, err := observer.FinalObservation(context.Background())
+	if err != nil {
+		t.Fatalf("FinalObservation() error = %v", err)
+	}
+	if observation.Exit != result.exit {
+		t.Fatalf("observation exit = %+v, want Wait exit %+v", observation.Exit, result.exit)
+	}
+	if observation.ExecutionErr != result.err {
+		t.Fatalf("observation execution error = %v, want Wait error %v", observation.ExecutionErr, result.err)
+	}
+	if observation.CleanupErr != nil {
+		t.Fatalf("cleanup error = %v, want nil after successful termination", observation.CleanupErr)
+	}
 	if observation.Exit.Signal != syscall.SIGKILL.String() {
 		t.Fatalf("observation exit signal = %q, want %q", observation.Exit.Signal, syscall.SIGKILL.String())
 	}
@@ -483,15 +586,18 @@ func stopTerminationTestProcess(t *testing.T, cmd *exec.Cmd) {
 	}
 }
 
-func stopDirectRunningCommand(t *testing.T, command *directRunningCommand, ref engine.ProcessRef) {
+func stopDirectRunningCommand(t *testing.T, command *directRunningCommand) {
 	t.Helper()
 	if command == nil || command.cmd == nil {
 		return
 	}
 	command.startWait()
-	terminator := &directTerminator{cmd: command.cmd, grace: 10 * time.Millisecond, processRef: ref}
-	if err := terminator.terminate(); err != nil && !errors.Is(err, engine.ErrProcessIdentityUnverifiable) {
-		t.Errorf("cleanup terminate() error = %v", err)
+	// Tests already own the direct child. Cleanup deliberately avoids the
+	// production process-group path because environments may deny it.
+	if command.cmd.Process != nil {
+		if err := command.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Errorf("cleanup direct child kill error = %v", err)
+		}
 	}
 	if command.stdin != nil {
 		_ = command.stdin.Close()

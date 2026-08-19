@@ -107,38 +107,34 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 		stderrDrain:      stderrDrain,
 		stdoutPipe:       stdoutReader,
 		stderrPipe:       stderrReader,
-		startContext:     ctx,
 		startContextStop: make(chan struct{}),
 		startContextDone: make(chan struct{}),
-		cancelResultDone: make(chan struct{}),
+		cleanupDone:      make(chan struct{}),
 	}
 	running.watchStartContext(ctx)
 	return running, nil
 }
 
 type directRunningCommand struct {
-	cmd                  *exec.Cmd
-	stdin                io.WriteCloser
-	stdout               *directOutputBuffer
-	stderr               *directOutputBuffer
-	cancelGrace          time.Duration
-	terminator           *directTerminator
-	stdoutDrain          <-chan struct{}
-	stderrDrain          <-chan struct{}
-	stdoutPipe           *os.File
-	stderrPipe           *os.File
-	startContext         context.Context
-	startContextStop     chan struct{}
-	startContextDone     chan struct{}
-	startContextCanceled bool
-	startContextErr      error
-	cancelResultOnce     sync.Once
-	cancelResultDone     chan struct{}
-	cancelResult         error
-	waitOnce             sync.Once
-	waitDone             chan struct{}
-	waitExit             ExitObservation
-	waitErr              error
+	cmd              *exec.Cmd
+	stdin            io.WriteCloser
+	stdout           *directOutputBuffer
+	stderr           *directOutputBuffer
+	cancelGrace      time.Duration
+	terminator       *directTerminator
+	stdoutDrain      <-chan struct{}
+	stderrDrain      <-chan struct{}
+	stdoutPipe       *os.File
+	stderrPipe       *os.File
+	startContextStop chan struct{}
+	startContextDone chan struct{}
+	cleanupOnce      sync.Once
+	cleanupDone      chan struct{}
+	cleanupErr       error
+	waitOnce         sync.Once
+	waitDone         chan struct{}
+	waitExit         ExitObservation
+	waitErr          error
 }
 
 func (r *directRunningCommand) Stdin() io.WriteCloser {
@@ -157,7 +153,7 @@ func (r *directRunningCommand) Wait(ctx context.Context) (ExitObservation, error
 	stopWatching := r.watchWaitContext(ctx)
 	defer stopWatching()
 	r.startWait()
-	if r.cancelResultDone == nil {
+	if r.cleanupDone == nil {
 		<-r.waitDone
 		return r.waitExit, r.waitErr
 	}
@@ -169,9 +165,60 @@ func (r *directRunningCommand) Wait(ctx context.Context) (ExitObservation, error
 	select {
 	case <-r.waitDone:
 		return r.waitExit, r.waitErr
-	case <-r.cancelResultDone:
-		return ExitObservation{}, r.cancelResult
+	case <-r.cleanupDone:
+		return ExitObservation{}, r.cleanupErr
 	}
+}
+
+// FinalObservation keeps execution and cleanup outcomes independent. A failed
+// termination attempt is reported as cleanup uncertainty immediately, while
+// the single waiter continues to reap the command if it exits later.
+func (r *directRunningCommand) FinalObservation(ctx context.Context) (FinalObservation, error) {
+	r.startWait()
+	if cleanupErr, reported := r.cleanupResult(); reported {
+		return r.finalObservationWithCleanup(cleanupErr), nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-r.waitDone:
+		observation := FinalObservation{
+			Exit:         r.waitExit,
+			ExecutionErr: r.waitErr,
+		}
+		if cleanupErr, reported := r.cleanupResult(); reported {
+			observation.CleanupErr = cleanupErr
+		}
+		return observation, nil
+	case <-r.cleanupDone:
+		return r.finalObservationWithCleanup(r.cleanupErr), nil
+	case <-ctx.Done():
+		return FinalObservation{}, ctx.Err()
+	}
+}
+
+func (r *directRunningCommand) cleanupResult() (error, bool) {
+	if r.cleanupDone == nil {
+		return nil, false
+	}
+	select {
+	case <-r.cleanupDone:
+		return r.cleanupErr, true
+	default:
+		return nil, false
+	}
+}
+
+func (r *directRunningCommand) finalObservationWithCleanup(cleanupErr error) FinalObservation {
+	observation := FinalObservation{CleanupErr: cleanupErr}
+	select {
+	case <-r.waitDone:
+		observation.Exit = r.waitExit
+		observation.ExecutionErr = r.waitErr
+	default:
+	}
+	return observation
 }
 
 func (r *directRunningCommand) startWait() {
@@ -189,13 +236,6 @@ func (r *directRunningCommand) startWait() {
 func (r *directRunningCommand) waitForExit() {
 	err := r.cmd.Wait()
 	r.stopStartContext()
-	if err == nil && r.startContextCanceled {
-		if r.startContextErr != nil {
-			err = fmt.Errorf("exec: canceling Cmd: %w", r.startContextErr)
-		} else if r.startContext != nil {
-			err = r.startContext.Err()
-		}
-	}
 	if errors.Is(err, exec.ErrWaitDelay) {
 		err = nil
 	}
@@ -231,28 +271,35 @@ func (r *directRunningCommand) watchStartContext(ctx context.Context) {
 	go func() {
 		select {
 		case <-ctx.Done():
-			r.startContextCanceled = true
-			if r.terminator != nil {
-				r.startContextErr = r.terminator.terminate()
-				r.publishCancellationResult(r.startContextErr)
-			}
+			_ = r.terminate()
 		case <-r.startContextStop:
 		}
 		close(r.startContextDone)
 	}()
 }
 
-func (r *directRunningCommand) publishCancellationResult(err error) {
+func (r *directRunningCommand) terminate() error {
+	var err error
+	if r.terminator != nil {
+		err = r.terminator.terminate()
+	} else {
+		err = terminateProcessGroup(r.cmd, processRefForCmd(r.cmd), r.cancelGrace)
+	}
+	r.publishCleanupResult(err)
+	return err
+}
+
+func (r *directRunningCommand) publishCleanupResult(err error) {
 	if err == nil {
 		return
 	}
-	r.cancelResultOnce.Do(func() {
-		r.cancelResult = fmt.Errorf("exec: canceling Cmd: %w", err)
-		if r.cancelResultDone != nil {
-			close(r.cancelResultDone)
+	r.cleanupOnce.Do(func() {
+		r.cleanupErr = fmt.Errorf("exec: canceling Cmd: %w", err)
+		if r.cleanupDone != nil {
+			close(r.cleanupDone)
 		}
-		// An unverifiable process must not be signaled, but it still needs a
-		// waiter to reap it if it exits after its cancellation is reported.
+		// A cleanup failure must not trigger another signal attempt, but it
+		// still needs one waiter to reap the command if it exits later.
 		r.startWait()
 	})
 }
@@ -286,9 +333,7 @@ func (r *directRunningCommand) watchWaitContext(ctx context.Context) func() {
 	go func() {
 		select {
 		case <-ctx.Done():
-			if r.terminator != nil {
-				_ = r.terminator.terminate()
-			}
+			_ = r.terminate()
 		case <-stop:
 		}
 	}()
@@ -298,11 +343,7 @@ func (r *directRunningCommand) watchWaitContext(ctx context.Context) func() {
 func (r *directRunningCommand) Interrupt(ctx context.Context) error {
 	done := make(chan error, 1)
 	go func() {
-		if r.terminator != nil {
-			done <- r.terminator.terminate()
-			return
-		}
-		done <- terminateProcessGroup(r.cmd, processRefForCmd(r.cmd), r.cancelGrace)
+		done <- r.terminate()
 	}()
 	select {
 	case <-ctx.Done():
@@ -366,7 +407,7 @@ func (t *directTerminator) terminate() error {
 	}
 	t.once.Do(func() {
 		t.err = terminateProcessGroup(t.cmd, t.processRef, t.grace)
-		if !errors.Is(t.err, engine.ErrProcessIdentityUnverifiable) {
+		if t.err == nil {
 			t.closePipes()
 		}
 	})
