@@ -283,16 +283,14 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	if startupCtx == nil {
 		startupCtx = ctx
 	}
-	store, err := s.ensureJobStore()
+	_, err := s.ensureJobStore()
 	if err != nil {
 		return err
 	}
 	defer s.closeJobStore()
-	if err := s.sweepManagedCodexHomes(store); err != nil {
-		// A sweep cannot safely broaden into a path-based deletion fallback.
-		// Retain anything it could not inspect and keep the daemon available.
-		log.Printf("agentbus service: startup managed Codex home sweep: %v", err)
-	}
+	// Startup sweeping is deliberately absent: SIGKILL-orphaned leaves under
+	// the Codex layout are a known residual, and removing them is an operator
+	// action rather than a daemon guess.
 	if err := s.captureBinaryIdentity(); err != nil {
 		return err
 	}

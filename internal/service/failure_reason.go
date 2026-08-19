@@ -3,27 +3,10 @@
 package service
 
 import (
-	"context"
-	"errors"
 	"strings"
 
-	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
-
-type terminalFailureOrigin uint8
-
-const (
-	terminalFailureInternal terminalFailureOrigin = iota + 1
-	terminalFailureBackendNotStarted
-	terminalFailureBackendRan
-	terminalFailureFinalization
-)
-
-type terminalFailure struct {
-	class  protocol.FailureClass
-	reason string
-}
 
 type backendFailureClassPattern struct {
 	class     protocol.FailureClass
@@ -62,71 +45,6 @@ var backendFailureClassPatterns = []backendFailureClassPattern{
 	},
 }
 
-// classifiedTerminalError preserves where an error arose while retaining its
-// original identity for existing errors.Is and errors.As callers.
-type classifiedTerminalError struct {
-	origin terminalFailureOrigin
-	err    error
-}
-
-func (e *classifiedTerminalError) Error() string {
-	if e == nil || e.err == nil {
-		return "terminal failure"
-	}
-	return e.err.Error()
-}
-
-func (e *classifiedTerminalError) Unwrap() error {
-	if e == nil {
-		return nil
-	}
-	return e.err
-}
-
-func classifyFailureError(origin terminalFailureOrigin, err error) error {
-	if err == nil {
-		err = errors.New("unknown failure")
-	}
-	return &classifiedTerminalError{origin: origin, err: err}
-}
-
-func terminalFailureOriginFor(err error, fallback terminalFailureOrigin) terminalFailureOrigin {
-	var classified *classifiedTerminalError
-	if errors.As(err, &classified) && classified != nil && classified.origin != 0 {
-		return classified.origin
-	}
-	return fallback
-}
-
-// classifyTerminalFailure makes the one stable class decision for all service
-// terminal failure paths. agentbusRequestedStop is explicit intent from the
-// run lifecycle; an error alone cannot safely establish that distinction.
-func classifyTerminalFailure(origin terminalFailureOrigin, err error, agentbusRequestedStop bool) protocol.FailureClass {
-	switch origin {
-	case terminalFailureBackendNotStarted:
-		return protocol.FailureClassBackendUnavailable
-	case terminalFailureFinalization:
-		return protocol.FailureClassInternal
-	case terminalFailureBackendRan:
-		if agentbusRequestedStop {
-			// An agentbus-requested cancellation or timeout normally terminalizes
-			// separately. If it nevertheless reaches a failed path, none of the
-			// existing backend classes honestly describes it; internal is safer
-			// than claiming an unrequested backend interruption.
-			return protocol.FailureClassInternal
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, engine.ErrTurnInterrupted) {
-			return protocol.FailureClassInterrupted
-		}
-		if errors.Is(err, engine.ErrProviderOverloaded) {
-			return protocol.FailureClassProviderOverloaded
-		}
-		return classifyBackendFailureText(err)
-	default:
-		return protocol.FailureClassInternal
-	}
-}
-
 // classifyBackendFailureText returns a specific class only for a stable
 // provider fragment. Unrecognized launched-turn failures retain backend_error.
 func classifyBackendFailureText(err error) protocol.FailureClass {
@@ -142,18 +60,4 @@ func classifyBackendFailureText(err error) protocol.FailureClass {
 		}
 	}
 	return protocol.FailureClassBackendError
-}
-
-func terminalFailureFor(origin terminalFailureOrigin, err error, agentbusRequestedStop bool) terminalFailure {
-	return terminalFailure{
-		class:  classifyTerminalFailure(origin, err, agentbusRequestedStop),
-		reason: terminalReasonFor(err, "unknown failure"),
-	}
-}
-
-func terminalReasonFor(err error, fallback string) string {
-	if err == nil || strings.TrimSpace(err.Error()) == "" {
-		return fallback
-	}
-	return executionFailureReason(err)
 }

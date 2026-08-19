@@ -522,14 +522,20 @@ func classifyStartFailure(err error) protocol.FailureClass {
 	if errors.Is(err, engine.ErrProviderOverloaded) {
 		return protocol.FailureClassProviderOverloaded
 	}
-	return classifyTerminalFailure(terminalFailureBackendNotStarted, err, false)
+	return protocol.FailureClassBackendUnavailable
 }
 
 func classifyExecutionFailure(err error) protocol.FailureClass {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return protocol.FailureClassTimeout
 	}
-	return classifyTerminalFailure(terminalFailureBackendRan, err, false)
+	if errors.Is(err, context.Canceled) || errors.Is(err, engine.ErrTurnInterrupted) {
+		return protocol.FailureClassInterrupted
+	}
+	if errors.Is(err, engine.ErrProviderOverloaded) {
+		return protocol.FailureClassProviderOverloaded
+	}
+	return classifyBackendFailureText(err)
 }
 
 type turnOutcome struct {

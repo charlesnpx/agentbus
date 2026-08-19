@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/agentbus/engine"
-	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 	"golang.org/x/sys/unix"
 )
@@ -398,21 +397,6 @@ func linkManagedCodexHomeFile(sourceHome string, destination *managedCodexHome, 
 	return nil
 }
 
-func (s *Server) cleanupManagedCodexHome(home *managedCodexHome, state protocol.PublicState) {
-	if home == nil {
-		return
-	}
-	defer home.close()
-	if !codexHomeCleanupEligible(state) {
-		return
-	}
-	if err := removeManagedCodexHome(home); err != nil {
-		// Retain the leaf whenever identity cannot be proved. Cleanup must never
-		// reach a replacement path simply because it has the same job name.
-		log.Printf("agentbus daemon: retain completed managed Codex home %s: %v", home.path, err)
-	}
-}
-
 func codexHomeCleanupEligible(state protocol.PublicState) bool {
 	return state == protocol.PublicStateCompleted
 }
@@ -569,99 +553,4 @@ func (s *Server) closeManagedCodexHome(jobID string) {
 	if home := s.takeManagedCodexHome(jobID); home != nil {
 		home.close()
 	}
-}
-
-// sweepManagedCodexHomes reconciles leaves left behind when a daemon died
-// between home creation and its in-memory cleanup. A leaf is removable only
-// when its exact job is a terminal, clean record in the same computed
-// workspace layout; names with no such record, live records, and uncertain
-// cleanup records are deliberately retained.
-func (s *Server) sweepManagedCodexHomes(store *jobstore.Store) error {
-	if s == nil {
-		return errors.New("nil service server")
-	}
-	if store == nil {
-		return errors.New("managed Codex home sweep requires a job store")
-	}
-	records, err := store.List()
-	if err != nil {
-		return fmt.Errorf("list jobs for managed Codex home sweep: %w", err)
-	}
-	terminalByLayout := make(map[string]map[string]struct{})
-	for _, record := range records {
-		if !record.State.IsTerminal() || record.Cleanup != protocol.CleanupClean || record.CWD == "" {
-			continue
-		}
-		layoutKey := engine.WorkspaceKey(record.CWD)
-		jobs := terminalByLayout[layoutKey]
-		if jobs == nil {
-			jobs = make(map[string]struct{})
-			terminalByLayout[layoutKey] = jobs
-		}
-		jobs[record.JobID] = struct{}{}
-	}
-	for layoutKey, jobs := range terminalByLayout {
-		layout, err := engine.LayoutForWorkspaceKey(s.stateRoot, layoutKey)
-		if err != nil {
-			log.Printf("agentbus daemon: retain managed Codex homes for invalid workspace layout %s: %v", layoutKey, err)
-			continue
-		}
-		entries, err := os.ReadDir(layout.Codex)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("read managed Codex home root %s: %w", layout.Codex, err)
-		}
-		for _, entry := range entries {
-			if _, ok := jobs[entry.Name()]; !ok {
-				continue
-			}
-			home, err := openManagedCodexHomeForSweep(layout, entry.Name())
-			if err != nil {
-				log.Printf("agentbus daemon: retain managed Codex home %s: %v", filepath.Join(layout.Codex, entry.Name()), err)
-				continue
-			}
-			err = removeManagedCodexHome(home)
-			home.close()
-			if err != nil {
-				log.Printf("agentbus daemon: retain managed Codex home %s: %v", filepath.Join(layout.Codex, entry.Name()), err)
-			}
-		}
-	}
-	return nil
-}
-
-func openManagedCodexHomeForSweep(layout engine.WorkspaceLayout, jobID string) (*managedCodexHome, error) {
-	if jobID == "" || filepath.Base(jobID) != jobID || jobID == "." || jobID == ".." {
-		return nil, fmt.Errorf("invalid Codex job directory name")
-	}
-	parentFD, err := openManagedCodexHomeParent(layout)
-	if err != nil {
-		return nil, err
-	}
-	directoryFD, err := unix.Openat(parentFD, jobID, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		_ = unix.Close(parentFD)
-		return nil, fmt.Errorf("open managed Codex home for sweep: %w", err)
-	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(directoryFD, &stat); err != nil {
-		_ = unix.Close(directoryFD)
-		_ = unix.Close(parentFD)
-		return nil, fmt.Errorf("identify managed Codex home for sweep: %w", err)
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
-		_ = unix.Close(directoryFD)
-		_ = unix.Close(parentFD)
-		return nil, fmt.Errorf("managed Codex home for sweep is not a directory")
-	}
-	return &managedCodexHome{
-		path:        filepath.Join(layout.Codex, jobID),
-		name:        jobID,
-		parentFD:    parentFD,
-		directoryFD: directoryFD,
-		dev:         uint64(stat.Dev),
-		ino:         uint64(stat.Ino),
-	}, nil
 }

@@ -246,60 +246,6 @@ func TestManagedCodexHomeRetainedWhenCleanupUncertainAndResultSurvives(t *testin
 	}
 }
 
-func TestStartupCodexHomeSweepRemovesTerminalAndRetainsOtherLeaves(t *testing.T) {
-	backend := &executionFakeBackend{name: "codex"}
-	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
-	workspace := t.TempDir()
-	terminal := runtimeHygieneRecord(t, server, workspace, "sweep-terminal", false)
-	live := runtimeHygieneRecord(t, server, workspace, "sweep-live", false)
-	store, err := server.ensureJobStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.MarkTerminal(terminal.JobID, jobstore.TerminalUpdate{
-		State:      protocol.PublicStateCompleted,
-		Cleanup:    protocol.CleanupClean,
-		FinishedAt: terminal.CreatedAt,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	layout, err := engine.LayoutForWorkspace(server.stateRoot, workspace)
-	if err != nil {
-		t.Fatal(err)
-	}
-	terminalHome, err := createManagedCodexHome(layout, terminal.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	terminalPath := terminalHome.path
-	terminalHome.close()
-	liveHome, err := createManagedCodexHome(layout, live.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	livePath := liveHome.path
-	liveHome.close()
-	unknownHome, err := createManagedCodexHome(layout, "job_unrecognized")
-	if err != nil {
-		t.Fatal(err)
-	}
-	unknownPath := unknownHome.path
-	unknownHome.close()
-
-	if err := server.sweepManagedCodexHomes(store); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(terminalPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("terminal managed home stat = %v, want removed", err)
-	}
-	if _, err := os.Stat(livePath); err != nil {
-		t.Fatalf("live managed home stat = %v, want retained", err)
-	}
-	if _, err := os.Stat(unknownPath); err != nil {
-		t.Fatalf("unrecognized managed home stat = %v, want retained", err)
-	}
-}
-
 func TestManagedCodexHomeIdentityMismatchIsRetained(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{})
 	layout, err := engine.LayoutForWorkspace(server.stateRoot, t.TempDir())
@@ -322,7 +268,10 @@ func TestManagedCodexHomeIdentityMismatchIsRetained(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server.cleanupManagedCodexHome(home, protocol.PublicStateCompleted)
+	cleanup, _ := finalizeManagedCodexHome(home, protocol.PublicStateCompleted, protocol.CleanupClean, nil)
+	if cleanup != protocol.CleanupUncertain {
+		t.Fatalf("cleanup = %q, want %q", cleanup, protocol.CleanupUncertain)
+	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("replacement managed home marker stat = %v, want retained", err)
 	}
@@ -330,14 +279,14 @@ func TestManagedCodexHomeIdentityMismatchIsRetained(t *testing.T) {
 
 func TestContentPolicyFailurePrecedesModelUnavailable(t *testing.T) {
 	err := errors.New("unknown model: requested content was flagged for possible policy violation")
-	if got := classifyTerminalFailure(terminalFailureBackendRan, err, false); got != protocol.FailureClassContentPolicy {
+	if got := classifyExecutionFailure(err); got != protocol.FailureClassContentPolicy {
 		t.Fatalf("failure class = %q, want %q", got, protocol.FailureClassContentPolicy)
 	}
 }
 
 func TestAccountFlaggedForAbuseStaysBackendError(t *testing.T) {
 	err := errors.New("This account was flagged for possible abuse")
-	if got := classifyTerminalFailure(terminalFailureBackendRan, err, false); got != protocol.FailureClassBackendError {
+	if got := classifyExecutionFailure(err); got != protocol.FailureClassBackendError {
 		t.Fatalf("failure class = %q, want %q", got, protocol.FailureClassBackendError)
 	}
 }
