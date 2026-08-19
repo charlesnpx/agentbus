@@ -398,6 +398,40 @@ func TestExecutionCommitsStartingBeforeBackendStart(t *testing.T) {
 	runExecution(t, server, record)
 }
 
+func TestExecutionMarkStartingFailureTerminalizesWithoutBackendStart(t *testing.T) {
+	startedBackend := false
+	backend := &executionFakeBackend{name: "starting-failure"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		startedBackend = true
+		return nil, errors.New("backend must not start after MarkStarting fails")
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "starting failure", nil)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(record.JobID); err != nil {
+		t.Fatalf("prepare starting record: %v", err)
+	}
+
+	runExecution(t, server, record)
+
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if startedBackend {
+		t.Fatal("backend started after MarkStarting failed")
+	}
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassInternal || got.Starting || got.FinishedAt == nil {
+		t.Fatalf("terminal record = %+v, want failed internal non-starting terminal record", got)
+	}
+	if !strings.Contains(got.FailureReason, "job is already starting") {
+		t.Fatalf("failure reason = %q, want MarkStarting error", got.FailureReason)
+	}
+}
+
 func TestExecutionRecordsClaimInSeparateTransaction(t *testing.T) {
 	var server *Server
 	backend := &executionFakeBackend{name: "claim"}

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -251,16 +250,22 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	// transaction in activeExecution.recordProcessClaim.
 	started, err := store.MarkStarting(record.JobID)
 	if err != nil {
-		// A failed or ambiguous starting commit must leave the record alone and
-		// must never license a spawn.
+		// A failed or ambiguous starting commit must never license a spawn. Try
+		// to make that failure durable so the job remains visible; markTerminal
+		// logs and leaves it alone if that write also fails.
+		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("commit starting transition: %w", err), nil)
 		log.Printf("agentbus service: job %s starting commit failed; backend was not launched: %v", record.JobID, err)
 		return
 	}
 	record = started
 
-	logPaths, err := ensureJobLogFiles(record)
+	if strings.TrimSpace(record.Artifacts.Log) == "" {
+		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, errors.New("job log artifact path is missing"), nil)
+		return
+	}
+	logPaths, err := engine.LogPathsForLayout(engine.WorkspaceLayout{Logs: filepath.Dir(record.Artifacts.Log)}, record.JobID)
 	if err != nil {
-		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare backend logs: %w", err), nil)
+		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("resolve backend logs: %w", err), nil)
 		return
 	}
 
@@ -311,12 +316,6 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	}
 
 	outcome := collectTurn(jobCtx, run, events)
-	if outcome.streamClosed {
-		if err := discardEmptyBackendLogs(logPaths); err != nil {
-			outcome.cleanup = protocol.CleanupUncertain
-			outcome.diagnostics = append(outcome.diagnostics, "discard empty backend logs: "+err.Error())
-		}
-	}
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 
 	if errors.Is(outcome.err, context.DeadlineExceeded) || outcome.timedOut {
@@ -445,12 +444,6 @@ func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record
 	}
 
 	outcome := collectTurn(ctx, run, events)
-	if outcome.streamClosed {
-		if err := discardEmptyBackendLogs(logPaths); err != nil {
-			outcome.cleanup = protocol.CleanupUncertain
-			outcome.diagnostics = append(outcome.diagnostics, "discard empty backend logs: "+err.Error())
-		}
-	}
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 	return outcome
 }
@@ -508,13 +501,12 @@ func classifyExecutionFailure(err error) protocol.FailureClass {
 }
 
 type turnOutcome struct {
-	text         string
-	err          error
-	timedOut     bool
-	interrupted  bool
-	cleanup      protocol.Cleanup
-	diagnostics  []string
-	streamClosed bool
+	text        string
+	err         error
+	timedOut    bool
+	interrupted bool
+	cleanup     protocol.Cleanup
+	diagnostics []string
 }
 
 func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine.Event) turnOutcome {
@@ -535,7 +527,6 @@ func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine
 			}
 			if drainTurnEvents(events, &outcome, &assistant, &result, &hasResult) {
 				outcome.text = attemptFinalText(hasResult, result, assistant.String())
-				outcome.streamClosed = true
 			} else {
 				outcome.cleanup = protocol.CleanupUncertain
 				outcome.diagnostics = append(outcome.diagnostics, "backend event stream did not close after containment grace")
@@ -546,7 +537,6 @@ func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine
 		case event, ok := <-events:
 			if !ok {
 				outcome.text = attemptFinalText(hasResult, result, assistant.String())
-				outcome.streamClosed = true
 				return outcome
 			}
 			absorbTurnEvent(&outcome, &assistant, &result, &hasResult, event)
@@ -697,36 +687,6 @@ func executionFailureReason(err error) string {
 	return string(runes[:maxRunes-3]) + "..."
 }
 
-func ensureJobLogFiles(record jobstore.Record) (engine.LogPaths, error) {
-	if strings.TrimSpace(record.Artifacts.Log) == "" {
-		return engine.LogPaths{}, errors.New("job log artifact path is missing")
-	}
-	paths, err := engine.LogPathsForLayout(engine.WorkspaceLayout{Logs: filepath.Dir(record.Artifacts.Log)}, record.JobID)
-	if err != nil {
-		return engine.LogPaths{}, err
-	}
-	for _, path := range []string{paths.Stdout, paths.Stderr} {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return engine.LogPaths{}, err
-		}
-		if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
-			return engine.LogPaths{}, err
-		}
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-		if err != nil {
-			return engine.LogPaths{}, err
-		}
-		if err := file.Chmod(0o600); err != nil {
-			_ = file.Close()
-			return engine.LogPaths{}, err
-		}
-		if err := file.Close(); err != nil {
-			return engine.LogPaths{}, err
-		}
-	}
-	return paths, nil
-}
-
 func spillAuthoritativeResult(record jobstore.Record, raw []byte) (engine.ResultInfo, error) {
 	if strings.TrimSpace(record.Artifacts.Result) == "" {
 		return engine.ResultInfo{}, errors.New("job result artifact path is missing")
@@ -740,30 +700,6 @@ func spillAuthoritativeResult(record jobstore.Record, raw []byte) (engine.Result
 		return engine.ResultInfo{}, errors.New("result helper resolved a path outside the durable job artifact")
 	}
 	return info, nil
-}
-
-func discardEmptyBackendLogs(paths engine.LogPaths) error {
-	for _, path := range []string{paths.Stdout, paths.Stderr} {
-		if path == "" {
-			continue
-		}
-		info, err := os.Stat(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("backend log %q is not a regular file", path)
-		}
-		if info.Size() == 0 {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 func attemptFinalText(hasResultMessage bool, resultText, assistantText string) string {
