@@ -121,15 +121,15 @@ type ContractVerdict struct {
 
 // TaskSpecV3 describes a job submitted through protocol v3.
 type TaskSpecV3 struct {
-	Backend      string            `json:"backend"`
-	CWD          string            `json:"cwd"`
-	Prompt       string            `json:"prompt"`
-	Write        bool              `json:"write"`
-	Model        *string           `json:"model,omitempty"`
-	Effort       *string           `json:"effort,omitempty"`
-	TimeoutMS    *int64            `json:"timeoutMs,omitempty"`
-	OutputSchema json.RawMessage   `json:"outputSchema,omitempty"`
-	Tags         map[string]string `json:"tags,omitempty"`
+	Backend      string             `json:"backend"`
+	CWD          string             `json:"cwd"`
+	Prompt       string             `json:"prompt"`
+	Write        bool               `json:"write"`
+	Model        *string            `json:"model,omitempty"`
+	Effort       *string            `json:"effort,omitempty"`
+	TimeoutMS    *int64             `json:"timeoutMs,omitempty"`
+	OutputSchema json.RawMessage    `json:"outputSchema,omitempty"`
+	Tags         *map[string]string `json:"tags,omitempty"`
 }
 
 // JobSubmitParamsV3 is the parameter object for job.submit.

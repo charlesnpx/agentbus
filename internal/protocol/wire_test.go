@@ -15,6 +15,8 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 	model := "gpt-5"
 	effort := "high"
 	empty := ""
+	tags := map[string]string{"team": "core"}
+	emptyTags := map[string]string{}
 	createdAt := time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC)
 	startedAt := time.Date(2025, time.January, 2, 3, 5, 5, 0, time.UTC)
 	finishedAt := time.Date(2025, time.January, 2, 3, 6, 5, 0, time.UTC)
@@ -77,7 +79,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		Effort:       &effort,
 		TimeoutMS:    &requested,
 		OutputSchema: json.RawMessage(`{"type":"object"}`),
-		Tags:         map[string]string{"team": "core"},
+		Tags:         &tags,
 	}
 
 	const recordJSON = `{"jobId":"job-1","workspaceKey":"workspace-1","requestId":"request-1","backend":"codex","state":"completed","tags":{"team":"core"},"createdAt":"2025-01-02T03:04:05Z","startedAt":"2025-01-02T03:05:05Z","finishedAt":"2025-01-02T03:06:05Z","timeout":{"requested":1234,"effective":2345,"source":"client"},"result":{"text":"answer","resultPath":"/results/job-1","sha256":"result-sha","bytes":42},"contract":{"schemaSha256":"schema-sha","evaluated":true,"compliant":true,"attempts":2,"violations":["/answer"]},"failure":{"class":"backend_error","reason":"backend stopped"},"cleanup":"uncertain","logPaths":{"stdout":"/logs/job-1.out","stderr":"/logs/job-1.err"},"modelReported":"gpt-5"}`
@@ -122,9 +124,10 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 				Write:   true,
 				Model:   &empty,
 				Effort:  &empty,
+				Tags:    &emptyTags,
 			},
 			new:  func() any { return new(TaskSpecV3) },
-			want: `{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true,"model":"","effort":""}`,
+			want: `{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true,"model":"","effort":"","tags":{}}`,
 		},
 		{
 			name: "TaskSpecV3 absent optional fields",
