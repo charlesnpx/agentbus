@@ -167,8 +167,7 @@ type JobCancelResultV3 struct {
 // never set anywhere in the tree.
 type HelloResultV3 struct {
 	ProtocolVersion int           `json:"protocolVersion"`
-	Backends        []string      `json:"backends"`
-	BackendMetadata []BackendInfo `json:"backendMetadata,omitempty"`
+	BackendMetadata []BackendInfo `json:"backends"`
 }
 
 // JobRecordWire is the single record projected by both status and result.

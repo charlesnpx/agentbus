@@ -18,7 +18,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -29,7 +28,6 @@ import (
 type connection struct {
 	server *Server
 	conn   net.Conn
-	mu     sync.Mutex
 	hello  bool
 }
 
@@ -95,8 +93,6 @@ func requiresRequestID(method string) bool {
 }
 
 func (c *connection) writeResponse(response protocol.Response) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	return writeFrame(c.conn, response)
 }
 
@@ -147,7 +143,6 @@ func (s *Server) handleHello(connection *connection, raw json.RawMessage) reques
 	connection.hello = true
 	return requestOutcome{result: protocol.HelloResultV3{
 		ProtocolVersion: ProtocolVersion,
-		Backends:        s.backendNames(),
 		BackendMetadata: s.backendMetadata(),
 	}}
 }
@@ -393,20 +388,7 @@ func removeSocketPathIfIdentity(path string, owned socketFileIdentity, phase str
 	log.Printf("agentbus daemon: removed owned socket during %s", phase)
 }
 
-func (s *Server) currentOwnedPIDFileSnapshot() pidFileSnapshot {
-	pidPath := filepath.Join(s.stateRoot, "agentbus.pid")
-	raw, identity, err := readPIDFileNoFollow(pidPath)
-	if err != nil {
-		return pidFileSnapshot{}
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil || pid != os.Getpid() {
-		return pidFileSnapshot{}
-	}
-	return pidFileSnapshot{identity: identity, known: true}
-}
-
-func (s *Server) removeOwnedPIDFile(ctx context.Context, phase string, expected ...pidFileSnapshot) error {
+func (s *Server) removeOwnedPIDFile(ctx context.Context, phase string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -424,10 +406,6 @@ func (s *Server) removeOwnedPIDFile(ctx context.Context, phase string, expected 
 	}
 	if err := ctx.Err(); err != nil {
 		return err
-	}
-	if len(expected) > 0 && expected[0].known && owned != expected[0].identity {
-		log.Printf("agentbus daemon: skipping pid removal during %s: replacement daemon owns %s", phase, pidPath)
-		return nil
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
 	if err != nil {
@@ -576,71 +554,6 @@ func wrapPIDRestoreError(err error) error {
 		return nil
 	}
 	return fmt.Errorf("%w: restore pid ownership signal: %w", ErrShutdownPIDTeardownFailed, err)
-}
-
-func atomicWrite(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-	return os.Chmod(path, mode)
-}
-
-func atomicWriteDurable(path string, data []byte, mode os.FileMode) error {
-	if err := atomicWrite(path, data, mode); err != nil {
-		return err
-	}
-	return syncFileAndParent(path)
-}
-
-func syncFileAndParent(path string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	return syncParentDir(path)
-}
-
-func syncParentDir(path string) error {
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	if err := dir.Sync(); err != nil {
-		_ = dir.Close()
-		return err
-	}
-	return dir.Close()
 }
 
 func decodeStrict(raw json.RawMessage, dst any) error {

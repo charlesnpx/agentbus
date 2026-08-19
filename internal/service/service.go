@@ -69,10 +69,6 @@ type BinaryIdentity struct {
 	Size    int64
 }
 
-// BinaryIdentityProbe is configurable so callers can model a changed daemon
-// executable without modifying the running binary.
-type BinaryIdentityProbe func(path string) (BinaryIdentity, error)
-
 // Config configures the one local JSON-RPC daemon.
 type Config struct {
 	StateRoot  string
@@ -80,11 +76,10 @@ type Config struct {
 	Token      string
 	Backends   []engine.Backend
 
-	IdleTimeout         time.Duration
-	IdleCheckInterval   time.Duration
-	ShutdownTimeout     time.Duration
-	BinaryIdentityProbe BinaryIdentityProbe
-	ReadyHook           func(ServeReadyInfo) error
+	IdleTimeout       time.Duration
+	IdleCheckInterval time.Duration
+	ShutdownTimeout   time.Duration
+	ReadyHook         func(ServeReadyInfo) error
 }
 
 // ServeReadyInfo identifies the ready daemon for startup launchers.
@@ -98,15 +93,9 @@ type socketFileIdentity struct {
 	ino uint64
 }
 
-type pidFileSnapshot struct {
-	identity socketFileIdentity
-	known    bool
-}
-
 type serveLifecycle struct {
 	listener      net.Listener
 	socket        socketFileIdentity
-	pidFile       pidFileSnapshot
 	cancel        context.CancelFunc
 	acceptSettled chan struct{}
 	serveDone     chan struct{}
@@ -129,15 +118,17 @@ func (lifecycle *serveLifecycle) settleAccept() {
 type Server struct {
 	stateRoot  string
 	socketPath string
-	tokenPath  string
 	token      string
 	backends   map[string]engine.Backend
 
-	idleTimeout         time.Duration
-	idleCheckInterval   time.Duration
-	shutdownTimeout     time.Duration
-	binaryIdentityProbe BinaryIdentityProbe
-	readyHook           func(ServeReadyInfo) error
+	idleTimeout       time.Duration
+	idleCheckInterval time.Duration
+	shutdownTimeout   time.Duration
+	readyHook         func(ServeReadyInfo) error
+
+	// beforeStaleSocketRemovalHook lets the stale-replacement regression test
+	// hold the loser after its failed liveness probe and before its recheck.
+	beforeStaleSocketRemovalHook func()
 
 	clients   atomic.Int64
 	accepting atomic.Int64
@@ -189,22 +180,16 @@ func New(cfg Config) (*Server, error) {
 			}
 		}
 	}
-	identityProbe := cfg.BinaryIdentityProbe
-	if identityProbe == nil {
-		identityProbe = statBinaryIdentity
-	}
 	return &Server{
-		stateRoot:           root,
-		socketPath:          socketPath,
-		tokenPath:           tokenPath,
-		token:               token,
-		backends:            backends,
-		idleTimeout:         idleTimeout,
-		idleCheckInterval:   idleCheckInterval,
-		shutdownTimeout:     normalizeShutdownTimeout(cfg.ShutdownTimeout),
-		binaryIdentityProbe: identityProbe,
-		readyHook:           cfg.ReadyHook,
-		lastActivity:        time.Now().UTC(),
+		stateRoot:         root,
+		socketPath:        socketPath,
+		token:             token,
+		backends:          backends,
+		idleTimeout:       idleTimeout,
+		idleCheckInterval: idleCheckInterval,
+		shutdownTimeout:   normalizeShutdownTimeout(cfg.ShutdownTimeout),
+		readyHook:         cfg.ReadyHook,
+		lastActivity:      time.Now().UTC(),
 	}, nil
 }
 
@@ -277,7 +262,6 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	lifecycle := &serveLifecycle{
 		listener:      listener,
 		socket:        socketIdentity,
-		pidFile:       s.currentOwnedPIDFileSnapshot(),
 		cancel:        cancel,
 		acceptSettled: make(chan struct{}),
 		serveDone:     make(chan struct{}),
@@ -431,7 +415,7 @@ func (s *Server) shutdownLifecycle(ctx context.Context, lifecycle *serveLifecycl
 	if err := waitForChannel(ctx, clientsDone); err != nil {
 		return shutdownError(err)
 	}
-	if err := s.removeOwnedPIDFile(ctx, "graceful shutdown", lifecycle.pidFile); err != nil {
+	if err := s.removeOwnedPIDFile(ctx, "graceful shutdown"); err != nil {
 		return shutdownError(err)
 	}
 	// A listener closed by graceful shutdown deliberately leaves the accept loop
@@ -480,9 +464,22 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	if err := os.Chmod(filepath.Dir(s.socketPath), 0o700); err != nil {
 		return nil, socketFileIdentity{}, err
 	}
-	if _, err := os.Lstat(s.socketPath); err == nil {
+	if observed, err := statSocketFileIdentity(s.socketPath); err == nil {
 		if conn, dialErr := net.DialTimeout("unix", s.socketPath, 100*time.Millisecond); dialErr == nil {
 			_ = conn.Close()
+			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
+		}
+		if s.beforeStaleSocketRemovalHook != nil {
+			s.beforeStaleSocketRemovalHook()
+		}
+		if !socketPathMatchesIdentity(s.socketPath, observed) {
+			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
+		}
+		if conn, dialErr := net.DialTimeout("unix", s.socketPath, 100*time.Millisecond); dialErr == nil {
+			_ = conn.Close()
+			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
+		}
+		if !socketPathMatchesIdentity(s.socketPath, observed) {
 			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
 		}
 		if err := os.Remove(s.socketPath); err != nil {
@@ -596,7 +593,7 @@ func (s *Server) captureBinaryIdentity() error {
 	if err != nil {
 		return fmt.Errorf("resolve daemon executable %q: %w", path, err)
 	}
-	identity, err := s.binaryIdentityProbe(path)
+	identity, err := statBinaryIdentity(path)
 	if err != nil {
 		return fmt.Errorf("stat daemon executable %q: %w", path, err)
 	}
@@ -617,7 +614,7 @@ func (s *Server) checkBinaryStale() bool {
 	expected := s.executableIdentity
 	s.mu.Unlock()
 
-	actual, err := s.binaryIdentityProbe(path)
+	actual, err := statBinaryIdentity(path)
 	if err == nil && actual.Size == expected.Size && actual.ModTime.Equal(expected.ModTime) {
 		return false
 	}

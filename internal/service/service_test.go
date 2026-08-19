@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
@@ -199,42 +198,91 @@ func TestListenReplacesStaleSocket(t *testing.T) {
 	_ = connection.Close()
 }
 
-func TestRemoveOwnedPIDFileRequiresRecordedIdentityMatch(t *testing.T) {
-	root := t.TempDir()
-	server := newTestServer(t, root, Config{})
-	pidPath := filepath.Join(root, "agentbus.pid")
-	pid := []byte(strconv.Itoa(os.Getpid()) + "\n")
-	if err := os.WriteFile(pidPath, pid, 0o600); err != nil {
+func TestListenRefusesConcurrentStaleSocketReplacement(t *testing.T) {
+	root := shortTestDir(t)
+	socketPath := filepath.Join(root, protocol.SocketName)
+	stale, err := net.Listen("unix", socketPath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	matching := server.currentOwnedPIDFileSnapshot()
-	if !matching.known {
-		t.Fatal("owned PID snapshot was not recorded")
+	unixStale, ok := stale.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("stale listener = %T, want *net.UnixListener", stale)
 	}
-	if err := server.removeOwnedPIDFile(context.Background(), "matching identity", matching); err != nil {
+	unixStale.SetUnlinkOnClose(false)
+	if err := stale.Close(); err != nil {
 		t.Fatal(err)
-	}
-	if _, err := os.Lstat(pidPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("matching PID file removal = %v, want not exist", err)
 	}
 
-	if err := os.WriteFile(pidPath, pid, 0o600); err != nil {
+	loser := newTestServer(t, root, Config{})
+	paused := make(chan struct{})
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	loser.beforeStaleSocketRemovalHook = func() {
+		close(paused)
+		<-release
+	}
+	type listenResult struct {
+		listener net.Listener
+		identity socketFileIdentity
+		err      error
+	}
+	loserResult := make(chan listenResult, 1)
+	go func() {
+		listener, identity, err := loser.listen()
+		loserResult <- listenResult{listener: listener, identity: identity, err: err}
+	}()
+	select {
+	case <-paused:
+	case <-time.After(time.Second):
+		t.Fatal("loser did not reach stale socket removal")
+	}
+
+	if err := os.Remove(socketPath); err != nil {
 		t.Fatal(err)
 	}
-	staleSnapshot := server.currentOwnedPIDFileSnapshot()
-	replacement := filepath.Join(root, "agentbus.pid.replacement")
-	if err := os.WriteFile(replacement, pid, 0o600); err != nil {
+	winner := newTestServer(t, root, Config{})
+	winnerListener, winnerIdentity, err := winner.listen()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(replacement, pidPath); err != nil {
-		t.Fatal(err)
+	defer func() {
+		_ = winnerListener.Close()
+		winner.removeOwnedSocket(winnerIdentity, "test cleanup")
+	}()
+
+	close(release)
+	var result listenResult
+	select {
+	case result = <-loserResult:
+	case <-time.After(time.Second):
+		t.Fatal("loser listen did not return after replacement")
 	}
-	if err := server.removeOwnedPIDFile(context.Background(), "mismatched identity", staleSnapshot); err != nil {
-		t.Fatal(err)
+	if result.listener != nil {
+		_ = result.listener.Close()
+		loser.removeOwnedSocket(result.identity, "test cleanup")
 	}
-	if _, err := os.Lstat(pidPath); err != nil {
-		t.Fatalf("replacement PID file was removed: %v", err)
+	if !errors.Is(result.err, ErrDaemonAlreadyListening) {
+		t.Fatalf("loser listen error = %v, want ErrDaemonAlreadyListening", result.err)
 	}
+	var typed DaemonAlreadyListeningError
+	if !errors.As(result.err, &typed) || typed.SocketPath != socketPath {
+		t.Fatalf("loser listen error = %#v, want typed socket path %q", result.err, socketPath)
+	}
+	if !socketPathMatchesIdentity(socketPath, winnerIdentity) {
+		t.Fatal("loser unlinked the winner socket")
+	}
+	connection, err := net.DialTimeout("unix", socketPath, time.Second)
+	if err != nil {
+		t.Fatalf("winner socket did not accept connections: %v", err)
+	}
+	_ = connection.Close()
 }
 
 func TestConnectionReturnsBoundedOversizedFrameError(t *testing.T) {
