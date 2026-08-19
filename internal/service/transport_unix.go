@@ -31,7 +31,7 @@ type connection struct {
 	hello  bool
 }
 
-func (c *connection) serve(_ context.Context) {
+func (c *connection) serve() {
 	defer c.conn.Close()
 	scanner := bufio.NewScanner(c.conn)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -124,6 +124,8 @@ func (s *Server) handle(connection *connection, request protocol.Request) reques
 	switch request.Method {
 	case protocol.MethodHello:
 		return s.handleHello(connection, request.Params)
+	case protocol.MethodJobSubmit:
+		return s.handleJobSubmit(request.Params)
 	default:
 		return requestOutcome{err: protocol.NewError(protocol.ErrorMethodNotFoundV3, "method not found", protocol.ErrorData{})}
 	}

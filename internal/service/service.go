@@ -1,8 +1,8 @@
 //go:build darwin || linux
 
 // Package service exposes the transport and lifecycle for the version-3
-// agentbus daemon. It intentionally serves protocol.hello only; job methods
-// are added by their owning units.
+// agentbus daemon. It serves protocol.hello and durable job.submit; later
+// units add the remaining job methods.
 package service
 
 import (
@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -120,6 +121,9 @@ type Server struct {
 	socketPath string
 	token      string
 	backends   map[string]engine.Backend
+
+	jobStoreMu sync.Mutex
+	jobStore   *jobstore.Store
 
 	idleTimeout       time.Duration
 	idleCheckInterval time.Duration
@@ -231,7 +235,7 @@ func (s *Server) ShutdownTimeout() time.Duration {
 }
 
 // Serve listens until ctx is canceled, an idle timeout fires, or a stale
-// binary has drained. It serves protocol.hello only.
+// binary has drained. It serves protocol.hello and job.submit.
 func (s *Server) Serve(ctx context.Context) error {
 	return s.serve(ctx, ctx)
 }
@@ -252,6 +256,10 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	if startupCtx == nil {
 		startupCtx = ctx
 	}
+	if _, err := s.ensureJobStore(); err != nil {
+		return err
+	}
+	defer s.closeJobStore()
 	if err := s.captureBinaryIdentity(); err != nil {
 		return err
 	}
@@ -323,7 +331,7 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 			defer lifecycle.clients.Done()
 			defer s.clients.Add(-1)
 			defer s.touchActivity()
-			connection.serve(serveCtx)
+			connection.serve()
 		}()
 	}
 }
