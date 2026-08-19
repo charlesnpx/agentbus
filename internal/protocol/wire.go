@@ -125,8 +125,8 @@ type TaskSpecV3 struct {
 	CWD          string            `json:"cwd"`
 	Prompt       string            `json:"prompt"`
 	Write        bool              `json:"write"`
-	Model        string            `json:"model,omitempty"`
-	Effort       string            `json:"effort,omitempty"`
+	Model        *string           `json:"model,omitempty"`
+	Effort       *string           `json:"effort,omitempty"`
 	TimeoutMS    *int64            `json:"timeoutMs,omitempty"`
 	OutputSchema json.RawMessage   `json:"outputSchema,omitempty"`
 	Tags         map[string]string `json:"tags,omitempty"`

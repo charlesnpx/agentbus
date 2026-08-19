@@ -12,6 +12,9 @@ import (
 
 func TestWireGoldenJSONRoundTrip(t *testing.T) {
 	requested := int64(1234)
+	model := "gpt-5"
+	effort := "high"
+	empty := ""
 	createdAt := time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC)
 	startedAt := time.Date(2025, time.January, 2, 3, 5, 5, 0, time.UTC)
 	finishedAt := time.Date(2025, time.January, 2, 3, 6, 5, 0, time.UTC)
@@ -70,8 +73,8 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		CWD:          "/workspace",
 		Prompt:       "do work",
 		Write:        true,
-		Model:        "gpt-5",
-		Effort:       "high",
+		Model:        &model,
+		Effort:       &effort,
 		TimeoutMS:    &requested,
 		OutputSchema: json.RawMessage(`{"type":"object"}`),
 		Tags:         map[string]string{"team": "core"},
@@ -111,10 +114,28 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 			want:  `{"schemaSha256":"schema-sha","evaluated":true,"compliant":true,"attempts":2,"violations":["/answer"]}`,
 		},
 		{
-			name:  "TaskSpecV3",
-			value: taskSpec,
-			new:   func() any { return new(TaskSpecV3) },
-			want:  `{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true,"model":"gpt-5","effort":"high","timeoutMs":1234,"outputSchema":{"type":"object"},"tags":{"team":"core"}}`,
+			name: "TaskSpecV3 supplied-empty optional fields",
+			value: TaskSpecV3{
+				Backend: "codex",
+				CWD:     "/workspace",
+				Prompt:  "do work",
+				Write:   true,
+				Model:   &empty,
+				Effort:  &empty,
+			},
+			new:  func() any { return new(TaskSpecV3) },
+			want: `{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true,"model":"","effort":""}`,
+		},
+		{
+			name: "TaskSpecV3 absent optional fields",
+			value: TaskSpecV3{
+				Backend: "codex",
+				CWD:     "/workspace",
+				Prompt:  "do work",
+				Write:   true,
+			},
+			new:  func() any { return new(TaskSpecV3) },
+			want: `{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true}`,
 		},
 		{
 			name:  "JobSubmitParamsV3",
