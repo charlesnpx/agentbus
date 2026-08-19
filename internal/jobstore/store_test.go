@@ -203,6 +203,114 @@ func TestGeneratedJobIDIsOpaque(t *testing.T) {
 	}
 }
 
+func TestMarkStartingTransitionsQueuedAndRefusesTerminal(t *testing.T) {
+	store := newTestStore(t)
+	defer closeTestStore(t, store)
+
+	key := RequestKey{WorkspaceKey: "workspace-starting", RequestID: "request-starting"}
+	taskSpec := testTaskSpec("durable starting transition")
+	record, _, err := store.SubmitTx(key, taskSpec, func(string) (Record, error) {
+		return Record{Backend: "codex", Model: "gpt-test", CWD: "/workspace/starting"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started, err := store.MarkStarting(record.JobID)
+	if err != nil {
+		t.Fatalf("MarkStarting = %v", err)
+	}
+	if started.State != protocol.PublicStateRunning || !started.Starting || started.StartedAt == nil {
+		t.Fatalf("started record = %+v, want private starting running record", started)
+	}
+	if started.Backend != record.Backend || started.CWD != record.CWD || string(started.TaskSpec) != string(record.TaskSpec) {
+		t.Fatalf("MarkStarting changed immutable request fields: got %+v, want backend=%q cwd=%q taskSpec=%s", started, record.Backend, record.CWD, record.TaskSpec)
+	}
+	if _, err := store.MarkStarting(record.JobID); !errors.Is(err, ErrStarting) {
+		t.Fatalf("second MarkStarting error = %v, want ErrStarting", err)
+	}
+
+	replayed, deduplicated, err := store.SubmitTx(key, taskSpec, func(string) (Record, error) {
+		t.Fatal("matching replay invoked new-record factory")
+		return Record{}, nil
+	})
+	if err != nil || !deduplicated || replayed.JobID != record.JobID {
+		t.Fatalf("matching replay after MarkStarting = (%+v, %t, %v), want original replay", replayed, deduplicated, err)
+	}
+
+	if _, err := store.MarkTerminal(record.JobID, TerminalUpdate{
+		State:   protocol.PublicStateCompleted,
+		Cleanup: protocol.CleanupClean,
+	}); err != nil {
+		t.Fatalf("MarkTerminal = %v", err)
+	}
+	if _, err := store.MarkStarting(record.JobID); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("MarkStarting terminal record error = %v, want ErrTerminal", err)
+	}
+}
+
+func TestRecordProcessClaimUsesSeparateTransaction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := RequestKey{WorkspaceKey: "workspace-claim", RequestID: "request-claim"}
+	taskSpec := testTaskSpec("separate claim transaction")
+	record, _, err := store.SubmitTx(key, taskSpec, func(string) (Record, error) {
+		return Record{Backend: "codex", Model: "gpt-test", CWD: "/workspace/claim"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(record.JobID); err != nil {
+		t.Fatalf("MarkStarting = %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	claim := ProcessClaim{PID: 4242, PGID: 4242, StartToken: "claim-start-token"}
+	if _, err := store.RecordProcessClaim(record.JobID, claim); err == nil {
+		t.Fatal("RecordProcessClaim succeeded after its database was closed")
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestStore(t, reopened)
+	persisted, err := reopened.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.State != protocol.PublicStateRunning || !persisted.Starting || persisted.ProcessClaim != nil {
+		t.Fatalf("record after failed claim transaction = %+v, want intact starting record", persisted)
+	}
+	if persisted.Backend != record.Backend || persisted.CWD != record.CWD || string(persisted.TaskSpec) != string(record.TaskSpec) {
+		t.Fatalf("failed claim changed immutable request fields: got %+v, want backend=%q cwd=%q taskSpec=%s", persisted, record.Backend, record.CWD, record.TaskSpec)
+	}
+
+	claimed, err := reopened.RecordProcessClaim(record.JobID, claim)
+	if err != nil {
+		t.Fatalf("RecordProcessClaim = %v", err)
+	}
+	if claimed.State != protocol.PublicStateRunning || claimed.Starting || claimed.ProcessClaim == nil || *claimed.ProcessClaim != claim {
+		t.Fatalf("claimed record = %+v, want running record with %+v", claimed, claim)
+	}
+	if claimed.Backend != record.Backend || claimed.CWD != record.CWD || string(claimed.TaskSpec) != string(record.TaskSpec) {
+		t.Fatalf("RecordProcessClaim changed immutable request fields: got %+v, want backend=%q cwd=%q taskSpec=%s", claimed, record.Backend, record.CWD, record.TaskSpec)
+	}
+	replayed, deduplicated, err := reopened.SubmitTx(key, taskSpec, func(string) (Record, error) {
+		t.Fatal("matching replay invoked new-record factory")
+		return Record{}, nil
+	})
+	if err != nil || !deduplicated || replayed.JobID != record.JobID {
+		t.Fatalf("matching replay after RecordProcessClaim = (%+v, %t, %v), want original replay", replayed, deduplicated, err)
+	}
+}
+
 func TestReopenRecoversTerminalRecord(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "jobs.db")
 	store, err := Open(path)

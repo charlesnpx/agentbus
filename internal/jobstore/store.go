@@ -41,6 +41,9 @@ var (
 	ErrConflict = errors.New("jobstore: request conflict")
 	// ErrTerminal reports an attempt to alter a recorded terminal job.
 	ErrTerminal = errors.New("jobstore: terminal job is immutable")
+	// ErrStarting reports an attempt to start a job that already crossed the
+	// durable no-relaunch boundary.
+	ErrStarting = errors.New("jobstore: job is already starting")
 	// ErrBusy reports a database held by another daemon beyond Open's timeout.
 	ErrBusy = errors.New("jobstore: root busy")
 	// ErrCorrupt reports an unsafe or structurally invalid bbolt database.
@@ -102,6 +105,15 @@ type ArtifactPaths struct {
 	Result string `json:"result,omitempty"`
 }
 
+// ProcessClaim identifies the process group created for a job. StartToken is
+// used with PID and PGID to distinguish a recycled PID from the launched
+// process group during recovery.
+type ProcessClaim struct {
+	PID        int    `json:"pid"`
+	PGID       int    `json:"pgid"`
+	StartToken string `json:"startToken"`
+}
+
 // Record is the durable job record. State, cleanup, failure class, and contract
 // deliberately use the protocol's v3 types rather than parallel store types.
 // Starting is the private persisted no-relaunch marker; its public projection
@@ -118,6 +130,7 @@ type Record struct {
 	TaskSpec      json.RawMessage         `json:"taskSpec,omitempty"`
 	State         protocol.PublicState    `json:"state"`
 	Starting      bool                    `json:"starting,omitempty"`
+	ProcessClaim  *ProcessClaim           `json:"processClaim,omitempty"`
 	Cleanup       protocol.Cleanup        `json:"cleanup"`
 	CreatedAt     time.Time               `json:"createdAt"`
 	UpdatedAt     time.Time               `json:"updatedAt"`
@@ -493,6 +506,102 @@ func (store *Store) listWhere(include func(Record) bool) ([]Record, error) {
 	return records, nil
 }
 
+// MarkStarting commits the private no-relaunch marker before a caller spawns
+// a backend process. Only queued jobs may make this transition.
+func (store *Store) MarkStarting(id string) (Record, error) {
+	if err := validateJobID(id); err != nil {
+		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+
+	var result Record
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if current.State.IsTerminal() {
+			return ErrTerminal
+		}
+		if current.Starting {
+			return ErrStarting
+		}
+		if current.State != protocol.PublicStateQueued {
+			return fmt.Errorf("%w: queued state is required to start job", ErrInvalid)
+		}
+
+		next := current
+		now := time.Now().UTC()
+		next.State = protocol.PublicStateRunning
+		next.Starting = true
+		next.StartedAt = &now
+		next.UpdatedAt = now
+		normalizeRecord(&next)
+		if err := validateRecord(next); err != nil {
+			return err
+		}
+		if err := putRecord(jobs, next); err != nil {
+			return err
+		}
+		result = next
+		return nil
+	})
+	return result, err
+}
+
+// RecordProcessClaim records the process identity in its own transaction after
+// a backend has been spawned. It may transition a private starting record to
+// ordinary running, but never changes immutable request fields or bindings.
+func (store *Store) RecordProcessClaim(id string, claim ProcessClaim) (Record, error) {
+	if err := validateJobID(id); err != nil {
+		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	if err := claim.validate(); err != nil {
+		return Record{}, err
+	}
+
+	var result Record
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if current.State.IsTerminal() {
+			return ErrTerminal
+		}
+		if !current.Starting && current.State != protocol.PublicStateRunning {
+			return fmt.Errorf("%w: process claim requires starting or running job", ErrInvalid)
+		}
+
+		next := current
+		next.State = protocol.PublicStateRunning
+		next.Starting = false
+		next.ProcessClaim = &ProcessClaim{
+			PID:        claim.PID,
+			PGID:       claim.PGID,
+			StartToken: claim.StartToken,
+		}
+		next.UpdatedAt = time.Now().UTC()
+		normalizeRecord(&next)
+		if err := validateRecord(next); err != nil {
+			return err
+		}
+		if err := putRecord(jobs, next); err != nil {
+			return err
+		}
+		result = next
+		return nil
+	})
+	return result, err
+}
+
 // MarkTerminal records the first terminal state. Later updates are rejected so
 // a known result can never be overwritten by a late finalization or recovery.
 func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, error) {
@@ -675,6 +784,10 @@ func normalizeRecord(record *Record) {
 		value := record.FinishedAt.UTC()
 		record.FinishedAt = &value
 	}
+	if record.ProcessClaim != nil {
+		claim := *record.ProcessClaim
+		record.ProcessClaim = &claim
+	}
 	if record.Diagnostics == nil {
 		record.Diagnostics = []string{}
 	}
@@ -696,6 +809,11 @@ func validateRecord(record Record) error {
 	if record.Starting && record.State != protocol.PublicStateRunning {
 		return fmt.Errorf("%w: starting marker requires running public state", ErrInvalid)
 	}
+	if record.ProcessClaim != nil {
+		if err := record.ProcessClaim.validate(); err != nil {
+			return err
+		}
+	}
 	if !record.Cleanup.Valid() {
 		return fmt.Errorf("%w: invalid cleanup %q", ErrInvalid, record.Cleanup)
 	}
@@ -716,6 +834,16 @@ func validateRecord(record Record) error {
 		return fmt.Errorf("%w: result text requires completed state", ErrInvalid)
 	}
 	return nil
+}
+
+func (claim ProcessClaim) validate() error {
+	if claim.PID <= 0 {
+		return fmt.Errorf("%w: process PID must be positive", ErrInvalid)
+	}
+	if claim.PGID <= 0 {
+		return fmt.Errorf("%w: process PGID must be positive", ErrInvalid)
+	}
+	return validateOpaqueIdentityPart("process start token", claim.StartToken)
 }
 
 func validPublicState(state protocol.PublicState) bool {
@@ -800,6 +928,7 @@ func typedOperationError(path string, err error) error {
 		errors.Is(err, ErrNotFound) ||
 		errors.Is(err, ErrConflict) ||
 		errors.Is(err, ErrTerminal) ||
+		errors.Is(err, ErrStarting) ||
 		errors.Is(err, ErrBusy) ||
 		errors.Is(err, ErrIncompatible) {
 		return err
