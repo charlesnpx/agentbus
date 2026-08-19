@@ -108,33 +108,37 @@ func TestSubmitReplayMatchesOnlyCanonicalTaskSpec(t *testing.T) {
 	}
 }
 
-func TestSubmitTransactionRollsBackJobAndBinding(t *testing.T) {
+func TestSubmitNewRecordForcesQueuedState(t *testing.T) {
 	store := newTestStore(t)
 	defer closeTestStore(t, store)
 
-	key := RequestKey{WorkspaceKey: "workspace-atomic", RequestID: "request-atomic"}
-	taskSpec := testTaskSpec("atomic task")
-	injected := errors.New("injected after job put")
-	store.setSubmitFailureForTest(injected)
-	_, _, err := store.SubmitTx(key, taskSpec, func(string) (Record, error) {
-		return Record{Backend: "codex"}, nil
-	})
-	if !errors.Is(err, injected) {
-		t.Fatalf("injected SubmitTx error = %v, want %v", err, injected)
+	finished := time.Now().UTC()
+	record, deduplicated, err := store.SubmitTx(
+		RequestKey{WorkspaceKey: "workspace-queued", RequestID: "request-queued"},
+		testTaskSpec("queued admission"),
+		func(string) (Record, error) {
+			return Record{
+				Backend:    "codex",
+				State:      protocol.PublicStateCompleted,
+				FinishedAt: &finished,
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("SubmitTx = %v", err)
 	}
-	records, err := store.List()
+	if deduplicated {
+		t.Fatal("SubmitTx reported a new record as deduplicated")
+	}
+	if record.State != protocol.PublicStateQueued {
+		t.Fatalf("submitted state = %q, want %q", record.State, protocol.PublicStateQueued)
+	}
+	persisted, err := store.Get(record.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 0 {
-		t.Fatalf("records after injected transaction failure = %+v, want none", records)
-	}
-	store.setSubmitFailureForTest(nil)
-	record, deduplicated, err := store.SubmitTx(key, taskSpec, func(string) (Record, error) {
-		return Record{Backend: "codex"}, nil
-	})
-	if err != nil || deduplicated || record.JobID == "" {
-		t.Fatalf("SubmitTx after rollback = (%+v, %t, %v), want new record", record, deduplicated, err)
+	if persisted.State != protocol.PublicStateQueued {
+		t.Fatalf("persisted state = %q, want %q", persisted.State, protocol.PublicStateQueued)
 	}
 }
 

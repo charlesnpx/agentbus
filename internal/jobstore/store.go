@@ -11,9 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -202,9 +200,6 @@ type Store struct {
 	db        *bolt.DB
 	path      string
 	artifacts artifactLayout
-
-	testMu                 sync.Mutex
-	failAfterJobPutForTest error
 }
 
 // Open opens or creates one version-3 jobstore database at path. Existing
@@ -369,7 +364,7 @@ func (store *Store) SubmitTx(key RequestKey, taskSpec []byte, mk func(id string)
 				if record.WorkspaceKey != key.WorkspaceKey || record.RequestID != key.RequestID {
 					return fmt.Errorf("%w: binding %q disagrees with job %q identity", ErrCorrupt, requestKey, binding.JobID)
 				}
-				result = cloneRecord(record)
+				result = record
 				deduplicated = true
 				return nil
 			}
@@ -404,12 +399,8 @@ func (store *Store) SubmitTx(key RequestKey, taskSpec []byte, mk func(id string)
 		}
 		// The stored bytes are the exact copied bytes that were hashed above, so
 		// a factory cannot make the durable task disagree with its binding.
-		record.TaskSpec = append(json.RawMessage(nil), canonicalTaskSpec...)
-		paths, err := store.artifactPathsForID(id)
-		if err != nil {
-			return err
-		}
-		record.Artifacts = paths
+		record.TaskSpec = canonicalTaskSpec
+		record.Artifacts = store.artifactPathsForID(id)
 		normalizeNewRecord(&record, time.Now().UTC())
 		if err := validateRecord(record); err != nil {
 			return err
@@ -419,9 +410,6 @@ func (store *Store) SubmitTx(key RequestKey, taskSpec []byte, mk func(id string)
 		if err := putRecord(jobs, record); err != nil {
 			return err
 		}
-		if err := store.submitFailureForTest(); err != nil {
-			return err
-		}
 		binding, err := json.Marshal(RequestBinding{JobID: id, RequestHash: hash})
 		if err != nil {
 			return err
@@ -429,7 +417,7 @@ func (store *Store) SubmitTx(key RequestKey, taskSpec []byte, mk func(id string)
 		if err := requests.Put(requestKey, binding); err != nil {
 			return err
 		}
-		result = cloneRecord(record)
+		result = record
 		return nil
 	})
 	if err != nil {
@@ -453,7 +441,7 @@ func (store *Store) Get(id string) (Record, error) {
 		if err != nil {
 			return err
 		}
-		result = cloneRecord(record)
+		result = record
 		return nil
 	})
 	return result, err
@@ -494,7 +482,7 @@ func (store *Store) listWhere(include func(Record) bool) ([]Record, error) {
 				return err
 			}
 			if include(record) {
-				records = append(records, cloneRecord(record))
+				records = append(records, record)
 			}
 			return nil
 		})
@@ -502,7 +490,6 @@ func (store *Store) listWhere(include func(Record) bool) ([]Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	sort.Slice(records, func(i, j int) bool { return records[i].JobID < records[j].JobID })
 	return records, nil
 }
 
@@ -530,7 +517,7 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 			return ErrTerminal
 		}
 
-		next := cloneRecord(current)
+		next := current
 		next.State = terminal.State
 		next.Starting = false
 		next.Cleanup = terminal.Cleanup
@@ -555,7 +542,7 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 		if err := putRecord(jobs, next); err != nil {
 			return err
 		}
-		result = cloneRecord(next)
+		result = next
 		return nil
 	})
 	return result, err
@@ -604,20 +591,12 @@ func (store *Store) SweepArtifacts(now time.Time) error {
 	return nil
 }
 
-func (store *Store) artifactPathsForID(id string) (ArtifactPaths, error) {
-	prompt, err := safePathForID(store.artifacts.prompts, id, ".json")
-	if err != nil {
-		return ArtifactPaths{}, err
+func (store *Store) artifactPathsForID(id string) ArtifactPaths {
+	return ArtifactPaths{
+		Prompt: filepath.Join(store.artifacts.prompts, id+".json"),
+		Log:    filepath.Join(store.artifacts.logs, id+".log"),
+		Result: filepath.Join(store.artifacts.results, id+".txt"),
 	}
-	log, err := safePathForID(store.artifacts.logs, id, ".log")
-	if err != nil {
-		return ArtifactPaths{}, err
-	}
-	result, err := safePathForID(store.artifacts.results, id, ".txt")
-	if err != nil {
-		return ArtifactPaths{}, err
-	}
-	return ArtifactPaths{Prompt: prompt, Log: log, Result: result}, nil
 }
 
 func requiredBuckets(tx *bolt.Tx) (requests, jobs *bolt.Bucket, err error) {
@@ -672,9 +651,7 @@ func decodeRecord(encoded []byte, expectedID string) (Record, error) {
 }
 
 func normalizeNewRecord(record *Record, now time.Time) {
-	if record.State == "" {
-		record.State = protocol.PublicStateQueued
-	}
+	record.State = protocol.PublicStateQueued
 	if record.Cleanup == "" {
 		record.Cleanup = protocol.CleanupClean
 	}
@@ -703,9 +680,6 @@ func normalizeRecord(record *Record) {
 	}
 	if record.Contract.Violations == nil {
 		record.Contract.Violations = []string{}
-	}
-	if record.TaskSpec != nil {
-		record.TaskSpec = append(json.RawMessage(nil), record.TaskSpec...)
 	}
 }
 
@@ -758,22 +732,6 @@ func validPublicState(state protocol.PublicState) bool {
 	}
 }
 
-func cloneRecord(record Record) Record {
-	cloned := record
-	cloned.Diagnostics = append([]string(nil), record.Diagnostics...)
-	cloned.Contract.Violations = append([]string(nil), record.Contract.Violations...)
-	cloned.TaskSpec = append(json.RawMessage(nil), record.TaskSpec...)
-	if record.StartedAt != nil {
-		value := *record.StartedAt
-		cloned.StartedAt = &value
-	}
-	if record.FinishedAt != nil {
-		value := *record.FinishedAt
-		cloned.FinishedAt = &value
-	}
-	return cloned
-}
-
 func newJobID(jobs *bolt.Bucket) (string, error) {
 	for range 16 {
 		bytes := make([]byte, 16)
@@ -786,18 +744,6 @@ func newJobID(jobs *bolt.Bucket) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("jobstore: could not allocate an opaque job ID")
-}
-
-func (store *Store) submitFailureForTest() error {
-	store.testMu.Lock()
-	defer store.testMu.Unlock()
-	return store.failAfterJobPutForTest
-}
-
-func (store *Store) setSubmitFailureForTest(err error) {
-	store.testMu.Lock()
-	defer store.testMu.Unlock()
-	store.failAfterJobPutForTest = err
 }
 
 func (store *Store) view(fn func(*bolt.Tx) error) (err error) {
@@ -886,11 +832,4 @@ func validateJobID(jobID string) error {
 		return fmt.Errorf("invalid job id %q", jobID)
 	}
 	return nil
-}
-
-func safePathForID(dir, id, ext string) (string, error) {
-	if err := validateJobID(id); err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, id+ext), nil
 }
