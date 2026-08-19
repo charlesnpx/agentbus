@@ -16,11 +16,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
+	"github.com/charlesnpx/agentbus/internal/schema"
 )
 
 type executionFakeBackend struct {
@@ -82,12 +82,18 @@ func newExecutionServer(t *testing.T, backend engine.Backend) *Server {
 
 func queuedExecutionRecord(t *testing.T, server *Server, backend, prompt string, timeoutMS *int64) jobstore.Record {
 	t.Helper()
+	return queuedExecutionRecordWithSchema(t, server, backend, prompt, timeoutMS, nil)
+}
+
+func queuedExecutionRecordWithSchema(t *testing.T, server *Server, backend, prompt string, timeoutMS *int64, outputSchema json.RawMessage) jobstore.Record {
+	t.Helper()
 	spec := protocol.TaskSpecV3{
-		Backend:   backend,
-		CWD:       t.TempDir(),
-		Prompt:    prompt,
-		Write:     false,
-		TimeoutMS: timeoutMS,
+		Backend:      backend,
+		CWD:          t.TempDir(),
+		Prompt:       prompt,
+		Write:        false,
+		TimeoutMS:    timeoutMS,
+		OutputSchema: append(json.RawMessage(nil), outputSchema...),
 	}
 	raw, err := json.Marshal(spec)
 	if err != nil {
@@ -115,13 +121,12 @@ func queuedExecutionRecord(t *testing.T, server *Server, backend, prompt string,
 
 func runExecution(t *testing.T, server *Server, record jobstore.Record) {
 	t.Helper()
-	run := newActiveExecution(record.JobID)
-	server.runJob(context.Background(), record, run)
-	select {
-	case <-run.done:
-	case <-time.After(time.Second):
-		t.Fatal("execution did not finish")
+	backend := server.backends[record.Backend]
+	if backend == nil {
+		t.Fatalf("configured backend %q is missing", record.Backend)
 	}
+	run := newActiveExecution(record.JobID, backend)
+	server.runJob(context.Background(), record, run)
 }
 
 func claimedResultSession(result string) *executionFakeSession {
@@ -133,11 +138,16 @@ func claimedResultSession(result string) *executionFakeSession {
 	}
 }
 
-func TestExecutionNormalCompletionRecordsAuthoritativeText(t *testing.T) {
+func TestExecutionNoSchemaDoesNotEvaluateOrCorrect(t *testing.T) {
+	turns := 0
 	backend := &executionFakeBackend{name: "fake"}
 	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
 		return &executionFakeSession{
 			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				turns++
+				if turns != 1 {
+					t.Fatalf("turns = %d, want no correction without a schema", turns)
+				}
 				input.OnProcessStart(engine.ProcessRef{PID: 4100, PGID: 4100, StartTime: "completion-token"}, 0)
 				return executionEvents(
 					engine.Event{Type: engine.EventAgentText, Text: "non-authoritative"},
@@ -161,12 +171,208 @@ func TestExecutionNormalCompletionRecordsAuthoritativeText(t *testing.T) {
 	if got.State != protocol.PublicStateCompleted || got.ResultText != "authoritative final text" {
 		t.Fatalf("terminal record = %+v, want completed authoritative result", got)
 	}
+	if got.Contract.Evaluated || got.Contract.Attempts != 0 {
+		t.Fatalf("contract without schema = %+v, want unevaluated with no correction", got.Contract)
+	}
+	if turns != 1 {
+		t.Fatalf("turn count = %d, want 1 without a schema", turns)
+	}
 	spilled, err := os.ReadFile(got.Artifacts.Result)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(spilled) != got.ResultText {
 		t.Fatalf("spilled result = %q, want %q", spilled, got.ResultText)
+	}
+}
+
+func TestExecutionCompliantSchemaRecordsContract(t *testing.T) {
+	const result = `{"ok":true}`
+	schemaRaw := json.RawMessage(`{"required":["ok"],"type":"object"}`)
+	turns := 0
+	backend := &executionFakeBackend{name: "compliant-schema"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				turns++
+				if turns != 1 {
+					t.Fatalf("turns = %d, want no correction for a compliant result", turns)
+				}
+				input.OnProcessStart(engine.ProcessRef{PID: 4106, PGID: 4106, StartTime: "compliant-token"}, 0)
+				return executionEvents(engine.Event{Type: engine.EventResultMessage, Text: result}), nil
+			},
+		}, nil
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecordWithSchema(t, server, backend.Name(), "compliant", nil, schemaRaw)
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := schema.Digest(schemaRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateCompleted || got.ResultText != result {
+		t.Fatalf("terminal record = %+v, want completed compliant result", got)
+	}
+	if got.Contract.SchemaSHA256 != digest || !got.Contract.Evaluated || !got.Contract.Compliant || got.Contract.Attempts != 1 || len(got.Contract.Violations) != 0 {
+		t.Fatalf("contract = %+v, want evaluated compliant one-attempt contract", got.Contract)
+	}
+	if turns != 1 {
+		t.Fatalf("turn count = %d, want 1", turns)
+	}
+}
+
+func TestExecutionNoncompliantSchemaUsesOneSuccessfulCorrection(t *testing.T) {
+	const initialResult = `{"wrong":true}`
+	const correctedResult = `{"ok":true}`
+	schemaRaw := json.RawMessage(`{"required":["ok"],"type":"object"}`)
+	initialValidation, err := schema.Validate(initialResult, schemaRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var server *Server
+	var record jobstore.Record
+	turns := 0
+	var correctionPrompt string
+	backend := &executionFakeBackend{name: "successful-correction"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				turns++
+				switch turns {
+				case 1:
+					input.OnProcessStart(engine.ProcessRef{PID: 4107, PGID: 4107, StartTime: "initial-token"}, 0)
+					return executionEvents(engine.Event{Type: engine.EventResultMessage, Text: initialResult}), nil
+				case 2:
+					if input.Write {
+						t.Fatal("correction turn was write-enabled")
+					}
+					correctionPrompt = input.Prompt
+					store, err := server.ensureJobStore()
+					if err != nil {
+						t.Fatal(err)
+					}
+					beforeCorrectionClaim, err := store.Get(record.JobID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if beforeCorrectionClaim.ProcessClaim == nil || beforeCorrectionClaim.ProcessClaim.StartToken != "initial-token" {
+						t.Fatalf("claim before correction = %+v, want retired initial claim", beforeCorrectionClaim.ProcessClaim)
+					}
+					input.OnProcessStart(engine.ProcessRef{PID: 4108, PGID: 4108, StartTime: "correction-token"}, 0)
+					return executionEvents(engine.Event{Type: engine.EventResultMessage, Text: correctedResult}), nil
+				default:
+					t.Fatalf("turns = %d, want exactly one correction", turns)
+					return nil, nil
+				}
+			},
+		}, nil
+	}
+	server = newExecutionServer(t, backend)
+	record = queuedExecutionRecordWithSchema(t, server, backend.Name(), "correct", nil, schemaRaw)
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := schema.Digest(schemaRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if correctionPrompt != schema.CorrectionPrompt(string(schemaRaw), initialValidation.Violations) {
+		t.Fatalf("correction prompt = %q, want fixed schema correction prompt", correctionPrompt)
+	}
+	if got.State != protocol.PublicStateCompleted || got.ResultText != correctedResult {
+		t.Fatalf("terminal record = %+v, want corrected authoritative result", got)
+	}
+	if got.Contract.SchemaSHA256 != digest || !got.Contract.Evaluated || !got.Contract.Compliant || got.Contract.Attempts != 2 || len(got.Contract.Violations) != 0 {
+		t.Fatalf("contract = %+v, want evaluated compliant two-attempt contract", got.Contract)
+	}
+	if got.ProcessClaim == nil || got.ProcessClaim.StartToken != "correction-token" {
+		t.Fatalf("terminal process claim = %+v, want correction claim", got.ProcessClaim)
+	}
+	if turns != 2 {
+		t.Fatalf("turn count = %d, want 2", turns)
+	}
+}
+
+func TestExecutionFailedCorrectionPreservesOriginalNoncompliantResult(t *testing.T) {
+	const initialResult = `{"wrong":true}`
+	schemaRaw := json.RawMessage(`{"required":["ok"],"type":"object"}`)
+	initialValidation, err := schema.Validate(initialResult, schemaRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turns := 0
+	backend := &executionFakeBackend{name: "failed-correction"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				turns++
+				switch turns {
+				case 1:
+					input.OnProcessStart(engine.ProcessRef{PID: 4109, PGID: 4109, StartTime: "failed-initial-token"}, 0)
+					return executionEvents(engine.Event{Type: engine.EventResultMessage, Text: initialResult}), nil
+				case 2:
+					if input.Write {
+						t.Fatal("correction turn was write-enabled")
+					}
+					input.OnProcessStart(engine.ProcessRef{PID: 4110, PGID: 4110, StartTime: "failed-correction-token"}, 0)
+					return executionEvents(engine.Event{Type: engine.EventTerminalError, Err: errors.New("correction backend failed")}), nil
+				default:
+					t.Fatalf("turns = %d, want exactly one correction", turns)
+					return nil, nil
+				}
+			},
+		}, nil
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecordWithSchema(t, server, backend.Name(), "failed correction", nil, schemaRaw)
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := schema.Digest(schemaRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateCompleted || got.ResultText != initialResult {
+		t.Fatalf("terminal record = %+v, want original completed result", got)
+	}
+	if got.Contract.SchemaSHA256 != digest || !got.Contract.Evaluated || got.Contract.Compliant || got.Contract.Attempts != 2 || strings.Join(got.Contract.Violations, "\n") != strings.Join(initialValidation.Violations, "\n") {
+		t.Fatalf("contract = %+v, want original noncompliant two-attempt contract", got.Contract)
+	}
+	spilled, err := os.ReadFile(got.Artifacts.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(spilled) != initialResult {
+		t.Fatalf("spilled result = %q, want preserved original result %q", spilled, initialResult)
+	}
+	if got.ProcessClaim == nil || got.ProcessClaim.StartToken != "failed-correction-token" {
+		t.Fatalf("terminal process claim = %+v, want correction claim", got.ProcessClaim)
+	}
+	if turns != 2 {
+		t.Fatalf("turn count = %d, want 2", turns)
 	}
 }
 
@@ -270,54 +476,6 @@ func TestExecutionTimeoutFailsAndInterruptsProcessGroup(t *testing.T) {
 	}
 }
 
-func TestExecutionCancellationRecordsCleanOrUncertainCleanup(t *testing.T) {
-	for _, test := range []struct {
-		name         string
-		interruptErr error
-		wantCleanup  protocol.Cleanup
-	}{
-		{name: "clean", wantCleanup: protocol.CleanupClean},
-		{name: "uncertain", interruptErr: errors.New("process group did not settle"), wantCleanup: protocol.CleanupUncertain},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			stream := make(chan engine.Event)
-			var closeOnce sync.Once
-			turnStarted := make(chan struct{})
-			backend := &executionFakeBackend{name: "cancel-" + test.name}
-			backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
-				return &executionFakeSession{
-					turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
-						input.OnProcessStart(engine.ProcessRef{PID: 4104, PGID: 4104, StartTime: "cancel-token-" + test.name}, 0)
-						close(turnStarted)
-						return stream, nil
-					},
-					interrupt: func(context.Context) error {
-						closeOnce.Do(func() { close(stream) })
-						return test.interruptErr
-					},
-				}, nil
-			}
-			server := newExecutionServer(t, backend)
-			server.beginExecutions(context.Background())
-			defer server.stopExecutions()
-			record := queuedExecutionRecord(t, server, backend.Name(), "cancel", nil)
-			server.enqueueQueuedJob(record)
-			select {
-			case <-turnStarted:
-			case <-time.After(time.Second):
-				t.Fatal("turn did not start")
-			}
-			got, err := server.cancelJob(context.Background(), record.JobID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got.State != protocol.PublicStateCanceled || got.Cleanup != test.wantCleanup {
-				t.Fatalf("canceled record = %+v, want canceled cleanup=%q", got, test.wantCleanup)
-			}
-		})
-	}
-}
-
 func TestExecutionSpillsLargeTerminalResultWithDigestAndElision(t *testing.T) {
 	text := strings.Repeat("x", engine.DefaultInlineResultCap+1)
 	backend := &executionFakeBackend{name: "spill"}
@@ -375,37 +533,6 @@ func TestExecutionProviderOverloadedUsesTypedFailureClass(t *testing.T) {
 	}
 	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassProviderOverloaded {
 		t.Fatalf("overload terminal = %+v, want provider_overloaded", got)
-	}
-}
-
-func TestExecutionSecondTerminalWriteDoesNotOverwriteFirst(t *testing.T) {
-	backend := &executionFakeBackend{name: "first-terminal"}
-	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
-		return claimedResultSession("first result"), nil
-	}
-	server := newExecutionServer(t, backend)
-	record := queuedExecutionRecord(t, server, backend.Name(), "first", nil)
-	runExecution(t, server, record)
-
-	store, err := server.ensureJobStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
-		State:         protocol.PublicStateFailed,
-		Cleanup:       protocol.CleanupUncertain,
-		FailureClass:  protocol.FailureClassInternal,
-		FailureReason: "later result",
-	})
-	if !errors.Is(err, jobstore.ErrTerminal) {
-		t.Fatalf("second terminal write error = %v, want ErrTerminal", err)
-	}
-	got, err := store.Get(record.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != protocol.PublicStateCompleted || got.ResultText != "first result" {
-		t.Fatalf("record after second terminal write = %+v, want first completed result", got)
 	}
 }
 

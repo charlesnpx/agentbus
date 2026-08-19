@@ -17,6 +17,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
+	"github.com/charlesnpx/agentbus/internal/schema"
 )
 
 // activeExecution is deliberately small. The retained adapter and
@@ -24,80 +25,47 @@ import (
 // and KILL; service owns only one job context, its deadline, and the durable
 // job lifecycle around that turn.
 type activeExecution struct {
-	jobID string
-	done  chan struct{}
+	jobID   string
+	backend engine.Backend
 
-	mu              sync.Mutex
-	cancel          context.CancelFunc
-	session         engine.Session
-	cancelRequested bool
-	claimAttempted  bool
-	claimRecorded   bool
-	claimErr        error
-	interruptOnce   sync.Once
-	interruptErr    error
+	mu             sync.Mutex
+	cancel         context.CancelFunc
+	session        engine.Session
+	claimAttempted bool
+	claimRecorded  bool
+	claimErr       error
+	interruptOnce  sync.Once
+	interruptErr   error
 }
 
-func newActiveExecution(jobID string) *activeExecution {
-	return &activeExecution{jobID: jobID, done: make(chan struct{})}
+func newActiveExecution(jobID string, backend engine.Backend) *activeExecution {
+	return &activeExecution{jobID: jobID, backend: backend}
 }
 
 func (run *activeExecution) setCancel(cancel context.CancelFunc) {
-	if run == nil {
-		return
-	}
 	run.mu.Lock()
 	run.cancel = cancel
-	requested := run.cancelRequested
 	run.mu.Unlock()
-	if requested && cancel != nil {
-		cancel()
-	}
 }
 
 func (run *activeExecution) setSession(session engine.Session) {
-	if run == nil {
-		return
-	}
 	run.mu.Lock()
 	run.session = session
-	requested := run.cancelRequested
 	run.mu.Unlock()
-	if requested && session != nil {
-		go func() { _ = run.interrupt() }()
-	}
 }
 
-func (run *activeExecution) requestCancel() {
-	if run == nil {
-		return
-	}
+// beginTurn resets process-claim tracking only after the preceding turn has
+// retired. Each retained adapter turn owns exactly one process and therefore
+// has exactly one separate durable claim transaction.
+func (run *activeExecution) beginTurn() {
 	run.mu.Lock()
-	run.cancelRequested = true
-	cancel := run.cancel
-	session := run.session
+	run.claimAttempted = false
+	run.claimRecorded = false
+	run.claimErr = nil
 	run.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	if session != nil {
-		go func() { _ = run.interrupt() }()
-	}
-}
-
-func (run *activeExecution) cancellationRequested() bool {
-	if run == nil {
-		return false
-	}
-	run.mu.Lock()
-	defer run.mu.Unlock()
-	return run.cancelRequested
 }
 
 func (run *activeExecution) interrupt() error {
-	if run == nil {
-		return nil
-	}
 	run.interruptOnce.Do(func() {
 		run.mu.Lock()
 		session := run.session
@@ -120,9 +88,6 @@ func (run *activeExecution) interrupt() error {
 }
 
 func (run *activeExecution) recordProcessClaim(store *jobstore.Store, ref engine.ProcessRef) {
-	if run == nil {
-		return
-	}
 	run.mu.Lock()
 	if run.claimAttempted {
 		run.claimErr = errors.New("backend reported more than one process claim for one turn")
@@ -149,9 +114,6 @@ func (run *activeExecution) recordProcessClaim(store *jobstore.Store, ref engine
 }
 
 func (run *activeExecution) containAfterClaimFailure() {
-	if run == nil {
-		return
-	}
 	run.mu.Lock()
 	cancel := run.cancel
 	session := run.session
@@ -165,9 +127,6 @@ func (run *activeExecution) containAfterClaimFailure() {
 }
 
 func (run *activeExecution) claimStatus() (attempted, recorded bool, err error) {
-	if run == nil {
-		return false, false, errors.New("missing active execution")
-	}
 	run.mu.Lock()
 	defer run.mu.Unlock()
 	return run.claimAttempted, run.claimRecorded, run.claimErr
@@ -220,7 +179,7 @@ func (s *Server) stopExecutions() {
 // enqueueQueuedJob starts exactly one newly admitted queued record while the
 // daemon is serving. A recovered queued record is intentionally never passed
 // here.
-func (s *Server) enqueueQueuedJob(record jobstore.Record) {
+func (s *Server) enqueueQueuedJob(record jobstore.Record, backend engine.Backend) {
 	if s == nil || record.State != protocol.PublicStateQueued || record.JobID == "" {
 		return
 	}
@@ -233,7 +192,7 @@ func (s *Server) enqueueQueuedJob(record jobstore.Record) {
 		s.executionMu.Unlock()
 		return
 	}
-	run := newActiveExecution(record.JobID)
+	run := newActiveExecution(record.JobID, backend)
 	s.executions[record.JobID] = run
 	parent := s.executionCtx
 	s.executionWG.Add(1)
@@ -253,65 +212,11 @@ func (s *Server) enqueueQueuedJob(record jobstore.Record) {
 	}()
 }
 
-// cancelJob is the lifecycle half of job.cancel. U9 supplies the RPC surface;
-// this method contains no transport behavior. For an active job it requests
-// cancellation and waits for the owning goroutine to commit its one terminal
-// record. For an unowned queued record, it records cancellation directly
-// before any launch can occur.
-func (s *Server) cancelJob(ctx context.Context, jobID string) (jobstore.Record, error) {
-	if s == nil {
-		return jobstore.Record{}, errors.New("nil service server")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	store, err := s.ensureJobStore()
-	if err != nil {
-		return jobstore.Record{}, err
-	}
-
-	s.executionMu.Lock()
-	run := s.executions[jobID]
-	s.executionMu.Unlock()
-	if run != nil {
-		run.requestCancel()
-		select {
-		case <-run.done:
-		case <-ctx.Done():
-			return store.Get(jobID)
-		}
-		return store.Get(jobID)
-	}
-
-	record, err := store.Get(jobID)
-	if err != nil || record.State.IsTerminal() {
-		return record, err
-	}
-	if record.State != protocol.PublicStateQueued {
-		// A nonterminal record without a local owner is a restart/reaper case.
-		// Do not guess whether a process still exists or signal it here.
-		return record, nil
-	}
-	terminal, err := store.MarkTerminal(jobID, jobstore.TerminalUpdate{
-		State:      protocol.PublicStateCanceled,
-		Cleanup:    protocol.CleanupClean,
-		FinishedAt: time.Now().UTC(),
-	})
-	if errors.Is(err, jobstore.ErrTerminal) {
-		return store.Get(jobID)
-	}
-	return terminal, err
-}
-
-// runJob is the only initial-turn launch path. Its first store mutation is
+// runJob establishes the initial turn. Its first store mutation is
 // MarkStarting, which commits before Backend.Start and Session.Turn can spawn
 // a provider process. The process-claim callback runs only after the retained
 // adapter has forked and execed into its own process group.
 func (s *Server) runJob(parent context.Context, record jobstore.Record, run *activeExecution) {
-	if run == nil {
-		return
-	}
-	defer close(run.done)
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -326,11 +231,14 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, err, nil)
 		return
 	}
-	timeout, _, timeoutErr := timeoutFromMillis(spec.TimeoutMS)
+	resolution, timeoutErr := timeoutFromMillis(spec.TimeoutMS)
 	if timeoutErr != nil {
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, errors.New(timeoutErr.Message), nil)
 		return
 	}
+	// Derived from the resolution rather than returned alongside it, so the
+	// effective timeout has exactly one source of truth.
+	timeout := time.Duration(resolution.Effective) * time.Millisecond
 
 	jobCtx, cancel := context.WithCancel(parent)
 	if timeout > 0 {
@@ -338,11 +246,6 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	}
 	run.setCancel(cancel)
 	defer cancel()
-
-	if run.cancellationRequested() {
-		s.recordExecutionCanceled(store, record, protocol.CleanupClean, nil)
-		return
-	}
 
 	// This durable transaction is intentionally separate from the later claim
 	// transaction in activeExecution.recordProcessClaim.
@@ -355,23 +258,17 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	}
 	record = started
 
-	if run.cancellationRequested() {
-		s.recordExecutionCanceled(store, record, protocol.CleanupClean, nil)
-		return
-	}
-
 	logPaths, err := ensureJobLogFiles(record)
 	if err != nil {
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare backend logs: %w", err), nil)
 		return
 	}
 
-	backend, ok := s.backends[record.Backend]
-	if !ok || backend == nil {
+	if run.backend == nil {
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, fmt.Errorf("backend %q is unavailable", record.Backend), nil)
 		return
 	}
-	session, err := backend.Start(jobCtx, engine.SessionOpts{
+	session, err := run.backend.Start(jobCtx, engine.SessionOpts{
 		CWD:     record.CWD,
 		Write:   record.Write,
 		Model:   record.Model,
@@ -379,7 +276,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		Timeout: timeout,
 	})
 	if err != nil {
-		s.finishStartError(store, record, run, jobCtx, err)
+		s.finishStartError(store, record, jobCtx, err)
 		return
 	}
 	if session == nil {
@@ -390,10 +287,11 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 
 	if err := jobCtx.Err(); err != nil {
 		cleanup, diagnostics := cleanupAfterContextStop(run, err)
-		s.finishContextStop(store, record, run, err, cleanup, diagnostics)
+		s.finishContextStop(store, record, err, cleanup, diagnostics)
 		return
 	}
 
+	run.beginTurn()
 	events, err := session.Turn(jobCtx, engine.TurnInput{
 		Prompt:   spec.Prompt,
 		Write:    spec.Write,
@@ -408,7 +306,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		if cleanup == protocol.CleanupClean {
 			cleanup, diagnostics = cleanupForRun(run, cleanup, diagnostics)
 		}
-		s.finishTurnError(store, record, run, jobCtx, err, cleanup, diagnostics)
+		s.finishTurnError(store, record, jobCtx, err, cleanup, diagnostics)
 		return
 	}
 
@@ -421,10 +319,6 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	}
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 
-	if run.cancellationRequested() {
-		s.recordExecutionCanceled(store, record, outcome.cleanup, outcome.diagnostics)
-		return
-	}
 	if errors.Is(outcome.err, context.DeadlineExceeded) || outcome.timedOut {
 		s.recordExecutionFailure(store, record, outcome.cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, outcome.diagnostics)
 		return
@@ -442,7 +336,8 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.recordExecutionFailure(store, record, outcome.cleanup, classifyExecutionFailure(outcome.err), outcome.err, outcome.diagnostics)
 		return
 	}
-	s.recordExecutionCompletion(store, record, outcome.text, outcome.cleanup, outcome.diagnostics)
+	text, contract, cleanup, diagnostics := s.evaluateOutputSchema(store, record, run, session, jobCtx, timeout, spec, logPaths, outcome.text, outcome.cleanup, outcome.diagnostics)
+	s.recordExecutionCompletion(store, record, text, cleanup, diagnostics, contract)
 }
 
 func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpecV3, error) {
@@ -459,11 +354,108 @@ func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpecV3, error) {
 	return spec, nil
 }
 
-func (s *Server) finishStartError(store *jobstore.Store, record jobstore.Record, run *activeExecution, ctx context.Context, err error) {
-	if run.cancellationRequested() {
-		s.recordExecutionCanceled(store, record, protocol.CleanupClean, nil)
-		return
+// evaluateOutputSchema runs only after the initial turn has successfully
+// retired and before the job's sole terminal write. A correction failure is a
+// contract failure, not a reason to discard the already authoritative result.
+func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, spec protocol.TaskSpecV3, logPaths engine.LogPaths, original string, cleanup protocol.Cleanup, diagnostics []string) (string, protocol.ContractResult, protocol.Cleanup, []string) {
+	if len(spec.OutputSchema) == 0 {
+		return original, protocol.ContractResult{}, cleanup, diagnostics
 	}
+
+	digest, err := schema.Digest(spec.OutputSchema)
+	if err != nil {
+		return original, protocol.ContractResult{
+			Evaluated:  true,
+			Compliant:  false,
+			Attempts:   1,
+			Violations: []string{"schema digest: " + executionFailureReason(err)},
+		}, cleanup, append(diagnostics, "evaluate output schema: "+executionFailureReason(err))
+	}
+	initial, err := schema.Validate(original, spec.OutputSchema)
+	contract := protocol.ContractResult{
+		SchemaSHA256: digest,
+		Evaluated:    initial.Evaluated,
+		Compliant:    initial.Compliant,
+		Attempts:     1,
+		Violations:   append([]string(nil), initial.Violations...),
+	}
+	if err != nil {
+		contract.Evaluated = true
+		contract.Compliant = false
+		contract.Violations = []string{"schema validation: " + executionFailureReason(err)}
+		return original, contract, cleanup, append(diagnostics, "evaluate output schema: "+executionFailureReason(err))
+	}
+	if contract.Compliant {
+		return original, contract, cleanup, diagnostics
+	}
+	if err := ctx.Err(); err != nil {
+		return original, contract, cleanup, diagnostics
+	}
+	initialClaimAttempted, initialClaimRecorded, initialClaimErr := run.claimStatus()
+	if initialClaimErr != nil || !initialClaimAttempted || !initialClaimRecorded {
+		return original, contract, cleanup, diagnostics
+	}
+
+	// collectTurn returns only after the initial event stream closes. The
+	// retained adapter clears that turn's active process before closing its
+	// stream, so the correction's claim is recorded after the initial process
+	// has retired.
+	correction := s.runCorrectionTurn(store, record, run, session, ctx, timeout, logPaths, schema.CorrectionPrompt(string(spec.OutputSchema), initial.Violations))
+	if correction.cleanup == protocol.CleanupUncertain {
+		cleanup = protocol.CleanupUncertain
+	}
+	diagnostics = append(diagnostics, correction.diagnostics...)
+	contract.Attempts = 2
+	if correction.err != nil || correction.timedOut || correction.interrupted {
+		return original, contract, cleanup, diagnostics
+	}
+	if _, _, claimErr := run.claimStatus(); claimErr != nil {
+		return original, contract, cleanup, diagnostics
+	}
+
+	corrected, err := schema.Validate(correction.text, spec.OutputSchema)
+	if err != nil || !corrected.Compliant {
+		return original, contract, cleanup, diagnostics
+	}
+	contract.Evaluated = corrected.Evaluated
+	contract.Compliant = corrected.Compliant
+	contract.Violations = append([]string(nil), corrected.Violations...)
+	return correction.text, contract, cleanup, diagnostics
+}
+
+// runCorrectionTurn starts the sole read-only correction turn after the
+// initial turn has retired.
+func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, logPaths engine.LogPaths, prompt string) turnOutcome {
+	run.beginTurn()
+	events, err := session.Turn(ctx, engine.TurnInput{
+		Prompt:   prompt,
+		Write:    false,
+		Timeout:  timeout,
+		LogPaths: logPaths,
+		OnProcessStart: func(ref engine.ProcessRef, _ int) {
+			run.recordProcessClaim(store, ref)
+		},
+	})
+	if err != nil {
+		cleanup, diagnostics := cleanupAfterContextStop(run, ctx.Err())
+		if cleanup == protocol.CleanupClean {
+			cleanup, diagnostics = cleanupForRun(run, cleanup, diagnostics)
+		}
+		return turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics}
+	}
+
+	outcome := collectTurn(ctx, run, events)
+	if outcome.streamClosed {
+		if err := discardEmptyBackendLogs(logPaths); err != nil {
+			outcome.cleanup = protocol.CleanupUncertain
+			outcome.diagnostics = append(outcome.diagnostics, "discard empty backend logs: "+err.Error())
+		}
+	}
+	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
+	return outcome
+}
+
+func (s *Server) finishStartError(store *jobstore.Store, record jobstore.Record, ctx context.Context, err error) {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassTimeout, context.DeadlineExceeded, nil)
 		return
@@ -475,11 +467,7 @@ func (s *Server) finishStartError(store *jobstore.Store, record jobstore.Record,
 	s.recordExecutionFailure(store, record, protocol.CleanupClean, classifyStartFailure(err), err, nil)
 }
 
-func (s *Server) finishTurnError(store *jobstore.Store, record jobstore.Record, run *activeExecution, ctx context.Context, err error, cleanup protocol.Cleanup, diagnostics []string) {
-	if run.cancellationRequested() {
-		s.recordExecutionCanceled(store, record, cleanup, diagnostics)
-		return
-	}
+func (s *Server) finishTurnError(store *jobstore.Store, record jobstore.Record, ctx context.Context, err error, cleanup protocol.Cleanup, diagnostics []string) {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		s.recordExecutionFailure(store, record, cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, diagnostics)
 		return
@@ -491,11 +479,7 @@ func (s *Server) finishTurnError(store *jobstore.Store, record jobstore.Record, 
 	s.recordExecutionFailure(store, record, cleanup, classifyExecutionFailure(err), err, diagnostics)
 }
 
-func (s *Server) finishContextStop(store *jobstore.Store, record jobstore.Record, run *activeExecution, err error, cleanup protocol.Cleanup, diagnostics []string) {
-	if run.cancellationRequested() {
-		s.recordExecutionCanceled(store, record, cleanup, diagnostics)
-		return
-	}
+func (s *Server) finishContextStop(store *jobstore.Store, record jobstore.Record, err error, cleanup protocol.Cleanup, diagnostics []string) {
 	if errors.Is(err, context.DeadlineExceeded) {
 		s.recordExecutionFailure(store, record, cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, diagnostics)
 		return
@@ -656,7 +640,7 @@ func cleanupForRun(run *activeExecution, cleanup protocol.Cleanup, diagnostics [
 	return cleanup, diagnostics
 }
 
-func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstore.Record, text string, cleanup protocol.Cleanup, diagnostics []string) {
+func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstore.Record, text string, cleanup protocol.Cleanup, diagnostics []string, contract protocol.ContractResult) {
 	info, err := spillAuthoritativeResult(record, []byte(text))
 	if err != nil {
 		s.recordExecutionFailure(store, record, cleanup, protocol.FailureClassInternal, fmt.Errorf("spill authoritative result: %w", err), diagnostics)
@@ -670,6 +654,7 @@ func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstor
 		State:       protocol.PublicStateCompleted,
 		Cleanup:     cleanup,
 		Diagnostics: diagnostics,
+		Contract:    contract,
 		ResultText:  resultText,
 		FinishedAt:  time.Now().UTC(),
 	})
@@ -686,15 +671,6 @@ func (s *Server) recordExecutionFailure(store *jobstore.Store, record jobstore.R
 		FailureReason: executionFailureReason(cause),
 		Diagnostics:   diagnostics,
 		FinishedAt:    time.Now().UTC(),
-	})
-}
-
-func (s *Server) recordExecutionCanceled(store *jobstore.Store, record jobstore.Record, cleanup protocol.Cleanup, diagnostics []string) {
-	s.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
-		State:       protocol.PublicStateCanceled,
-		Cleanup:     cleanup,
-		Diagnostics: diagnostics,
-		FinishedAt:  time.Now().UTC(),
 	})
 }
 
@@ -785,28 +761,6 @@ func discardEmptyBackendLogs(paths engine.LogPaths) error {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
-		}
-	}
-	return nil
-}
-
-func discardBackendLogs(paths engine.LogPaths) error {
-	for _, path := range []string{paths.Stdout, paths.Stderr} {
-		if path == "" {
-			continue
-		}
-		info, err := os.Stat(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("backend log %q is not a regular file", path)
-		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
 		}
 	}
 	return nil

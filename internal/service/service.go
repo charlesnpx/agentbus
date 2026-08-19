@@ -279,7 +279,6 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	}
 	serveCtx, cancel := context.WithCancel(ctx)
 	s.beginExecutions(serveCtx)
-	defer s.stopExecutions()
 	lifecycle := &serveLifecycle{
 		listener:      listener,
 		socket:        socketIdentity,

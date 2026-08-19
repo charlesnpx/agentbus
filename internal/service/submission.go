@@ -42,6 +42,7 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailableV3, "open job store: "+err.Error(), protocol.ErrorData{})}
 	}
+	var executionBackend engine.Backend
 	record, deduplicated, err := store.SubmitTx(input.key, input.canonicalTaskSpec, func(id string) (jobstore.Record, error) {
 		// Everything in this factory is new-key-only: SubmitTx has already
 		// compared the canonical TaskSpec hash with a durable binding.
@@ -52,9 +53,14 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 		if err := validateNewTaskSpec(spec, input.taskSpec); err != nil {
 			return jobstore.Record{}, err
 		}
-		if err := s.ensureConfiguredBackend(spec.Backend); err != nil {
-			return jobstore.Record{}, err
+		// Production Server instances never mutate their private configured
+		// backend map after New. Capture the admitted adapter with this new job
+		// so execution does not repeat a backend map lookup after queueing.
+		backend, ok := s.backends[spec.Backend]
+		if !ok || backend == nil {
+			return jobstore.Record{}, fmt.Errorf("backend %q is unavailable", spec.Backend)
 		}
+		executionBackend = backend
 		canonicalCWD, err := engine.CanonicalWorkspace(spec.CWD)
 		if err != nil {
 			return jobstore.Record{}, err
@@ -84,7 +90,7 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 	// enqueued: a deduplicated replay is already running or terminal, so
 	// enqueueing it again would be the second launch the ordering forbids.
 	if !deduplicated {
-		s.enqueueQueuedJob(record)
+		s.enqueueQueuedJob(record, executionBackend)
 	}
 	return requestOutcome{result: jobSubmitResult(record, deduplicated, timeout)}
 }
