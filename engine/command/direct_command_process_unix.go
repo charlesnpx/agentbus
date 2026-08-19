@@ -3,8 +3,9 @@
 package command
 
 import (
+	"errors"
+	"fmt"
 	"os/exec"
-	"runtime"
 	"syscall"
 	"time"
 
@@ -17,10 +18,8 @@ func processRefForCmd(cmd *exec.Cmd) engine.ProcessRef {
 		return ref
 	}
 	ref.PID = cmd.Process.Pid
-	if runtime.GOOS != "windows" {
-		if pgid, err := syscall.Getpgid(ref.PID); err == nil {
-			ref.PGID = pgid
-		}
+	if pgid, err := syscall.Getpgid(ref.PID); err == nil {
+		ref.PGID = pgid
 	}
 	if info, alive, err := (engine.NativeProcessTable{}).Lookup(ref.PID); err == nil && alive {
 		ref.StartTime = info.StartTime
@@ -29,44 +28,110 @@ func processRefForCmd(cmd *exec.Cmd) engine.ProcessRef {
 }
 
 func setProcessGroup(cmd *exec.Cmd) {
-	if runtime.GOOS == "windows" {
-		return
-	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-var terminateProcessGroup = terminateProcessGroupImpl
+var (
+	terminateProcessGroup = terminateProcessGroupImpl
+	// processGroupSignal is the host syscall; tests replace it to observe the
+	// exact escalation decisions without requiring host group-signal permission.
+	processGroupSignal = syscall.Kill
+)
 
-func terminateProcessGroupImpl(cmd *exec.Cmd, grace time.Duration) error {
+func terminateProcessGroupImpl(cmd *exec.Cmd, ref engine.ProcessRef, grace time.Duration) error {
+	return terminateProcessGroupForRef(cmd, ref, grace)
+}
+
+func terminateProcessGroupForRef(cmd *exec.Cmd, ref engine.ProcessRef, grace time.Duration) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
 	pid := cmd.Process.Pid
-	if runtime.GOOS == "windows" {
-		_ = cmd.Process.Kill()
+	pgid := ref.PGID
+	if pgid <= 0 {
+		var err error
+		pgid, err = syscall.Getpgid(pid)
+		if err != nil {
+			pgid = pid
+		}
+	}
+	// A missing group is already stopped. Check it before reading the leader so
+	// an already-exited group remains a prompt successful cancellation.
+	if gone, err := processGroupSignalResult("inspect", pgid, processGroupSignal(-pgid, 0)); err != nil {
+		return err
+	} else if gone {
 		return nil
 	}
-	pgid, err := syscall.Getpgid(pid)
-	if err != nil {
-		pgid = pid
+	if err := verifyProcessGroupLeader(ref); err != nil {
+		return err
 	}
-	_ = syscall.Kill(-pgid, syscall.SIGTERM)
-	waitForProcessGroupExit(pgid, grace)
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	if gone, err := processGroupSignalResult("send SIGTERM to", pgid, processGroupSignal(-pgid, syscall.SIGTERM)); err != nil {
+		return err
+	} else if gone {
+		return nil
+	}
+	if gone, err := waitForProcessGroupExit(pgid, grace); err != nil {
+		return err
+	} else if gone {
+		return nil
+	}
+	if err := verifyProcessGroupLeader(ref); err != nil {
+		return err
+	}
+	if _, err := processGroupSignalResult("send SIGKILL to", pgid, processGroupSignal(-pgid, syscall.SIGKILL)); err != nil {
+		return err
+	}
 	return nil
 }
 
-func waitForProcessGroupExit(pgid int, grace time.Duration) {
+func processGroupSignalResult(action string, pgid int, err error) (bool, error) {
+	if err == nil {
+		return false, nil
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		return true, nil
+	}
+	if errors.Is(err, syscall.EPERM) {
+		return false, fmt.Errorf("%s process group %d: permission denied: %w", action, pgid, err)
+	}
+	return false, fmt.Errorf("%s process group %d: %w", action, pgid, err)
+}
+
+func waitForProcessGroupExit(pgid int, grace time.Duration) (bool, error) {
 	if grace <= 0 {
-		return
+		return false, nil
 	}
 	deadline := time.Now().Add(grace)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(-pgid, 0); err != nil {
-			if err == syscall.ESRCH {
-				return
-			}
+	for {
+		if gone, err := processGroupSignalResult("inspect", pgid, processGroupSignal(-pgid, 0)); err != nil {
+			return false, err
+		} else if gone {
+			return true, nil
 		}
-		time.Sleep(50 * time.Millisecond)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false, nil
+		}
+		if remaining > 10*time.Millisecond {
+			remaining = 10 * time.Millisecond
+		}
+		time.Sleep(remaining)
 	}
+}
+
+func verifyProcessGroupLeader(ref engine.ProcessRef) error {
+	if ref.StartTime == "" {
+		return fmt.Errorf("%w: process group can no longer be identified: recorded leader start token is missing", engine.ErrProcessIdentityUnverifiable)
+	}
+	info, alive, err := (engine.NativeProcessTable{}).Lookup(ref.PID)
+	if err != nil {
+		return fmt.Errorf("%w: process group can no longer be identified: read leader %d start token: %v", engine.ErrProcessIdentityUnverifiable, ref.PID, err)
+	}
+	if !alive {
+		return fmt.Errorf("%w: process group can no longer be identified: leader %d is missing", engine.ErrProcessIdentityUnverifiable, ref.PID)
+	}
+	if info.StartTime != ref.StartTime {
+		return fmt.Errorf("%w: process group can no longer be identified: leader %d start token changed", engine.ErrProcessIdentityUnverifiable, ref.PID)
+	}
+	return nil
 }

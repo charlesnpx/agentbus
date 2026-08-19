@@ -25,7 +25,7 @@ func setProcessGroup(_ *exec.Cmd) {}
 
 var terminateProcessGroup = terminateProcessGroupImpl
 
-func terminateProcessGroupImpl(cmd *exec.Cmd, _ time.Duration) error {
+func terminateProcessGroupImpl(cmd *exec.Cmd, _ engine.ProcessRef, _ time.Duration) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
