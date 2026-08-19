@@ -125,8 +125,7 @@ type Server struct {
 	jobStoreMu sync.Mutex
 	jobStore   *jobstore.Store
 
-	backendProbeMu           sync.Mutex
-	backendProbeFingerprints map[string]string
+	backendProbeMu sync.Mutex
 
 	idleTimeout       time.Duration
 	idleCheckInterval time.Duration
@@ -192,16 +191,15 @@ func New(cfg Config) (*Server, error) {
 		}
 	}
 	return &Server{
-		stateRoot:                root,
-		socketPath:               socketPath,
-		token:                    token,
-		backends:                 backends,
-		backendProbeFingerprints: make(map[string]string),
-		idleTimeout:              idleTimeout,
-		idleCheckInterval:        idleCheckInterval,
-		shutdownTimeout:          normalizeShutdownTimeout(cfg.ShutdownTimeout),
-		readyHook:                cfg.ReadyHook,
-		lastActivity:             time.Now().UTC(),
+		stateRoot:         root,
+		socketPath:        socketPath,
+		token:             token,
+		backends:          backends,
+		idleTimeout:       idleTimeout,
+		idleCheckInterval: idleCheckInterval,
+		shutdownTimeout:   normalizeShutdownTimeout(cfg.ShutdownTimeout),
+		readyHook:         cfg.ReadyHook,
+		lastActivity:      time.Now().UTC(),
 	}, nil
 }
 

@@ -515,9 +515,113 @@ func TestJobSubmitDifferentPromptReturnsTypedConflict(t *testing.T) {
 	if conflict.err.Data.JobID != first.JobID || !strings.Contains(conflict.err.Message, "jobstore: request conflict") {
 		t.Fatalf("conflict error = %#v, want existing job %q and jobstore conflict", conflict.err, first.JobID)
 	}
-	result, ok := conflict.result.(protocol.JobSubmitResultV3)
-	if !ok || result.Timeout == nil || result.Timeout.Source == "" {
-		t.Fatalf("conflict result = %#v, want populated timeout resolution", conflict.result)
+	if conflict.result != nil {
+		t.Fatalf("conflict result = %#v, want error-only JSON-RPC outcome", conflict.result)
+	}
+}
+
+func TestJobSubmitInvalidOutputSchemaLeavesNoBinding(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+	}{
+		{name: "null", schema: `null`},
+		{name: "array", schema: `[]`},
+		{name: "uncompilable", schema: `{"type":7}`},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+			workspaceKey := "workspace-invalid-schema-" + tt.name
+			requestID := "request-invalid-schema-" + tt.name
+			cwd := t.TempDir()
+			invalidRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","outputSchema":%s}}`, workspaceKey, requestID, cwd, tt.schema))
+			invalid := server.handleJobSubmit(context.Background(), invalidRaw)
+			if invalid.err == nil || invalid.err.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
+				t.Fatalf("invalid schema outcome = %#v, want invalid task spec", invalid.err)
+			}
+			if invalid.result != nil {
+				t.Fatalf("invalid schema result = %#v, want none", invalid.result)
+			}
+
+			store, err := server.ensureJobStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			records, err := store.List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(records) != 0 {
+				t.Fatalf("records after invalid schema = %+v, want none", records)
+			}
+
+			correctedRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","outputSchema":{}}}`, workspaceKey, requestID, cwd))
+			corrected := submitResultForTest(t, server.handleJobSubmit(context.Background(), correctedRaw))
+			if corrected.Deduplicated || corrected.State != protocol.PublicStateQueued {
+				t.Fatalf("corrected schema result = %+v, want a new queued job", corrected)
+			}
+		})
+	}
+}
+
+func TestJobSubmitEquivalentNumericOutputSchemaSpellingsReplay(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	workspaceKey, requestID, cwd := "workspace-jcs-number", "request-jcs-number", t.TempDir()
+	firstRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","outputSchema":{"type":"number","minimum":1.0}}}`, workspaceKey, requestID, cwd))
+	first := submitResultForTest(t, server.handleJobSubmit(context.Background(), firstRaw))
+
+	secondRaw := json.RawMessage(fmt.Sprintf(`{"requestId":%q,"taskSpec":{"outputSchema":{"minimum":1e0,"type":"number"},"prompt":"task","write":false,"cwd":%q,"backend":"codex"},"workspaceKey":%q}`, requestID, cwd, workspaceKey))
+	replay := submitResultForTest(t, server.handleJobSubmit(context.Background(), secondRaw))
+	if !replay.Deduplicated || replay.JobID != first.JobID || replay.State != protocol.PublicStateQueued {
+		t.Fatalf("numeric-spelling replay = %+v, want queued deduplication of %q", replay, first.JobID)
+	}
+}
+
+func TestTaskSpecJCSCanonicalRendering(t *testing.T) {
+	value, err := parseJCSJSON([]byte(`{"\uE000":1,"\uD834\uDD1E":2,"z":-0,"a":[true,null,"<tag>"],"n":9007199254740993}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := canonicalJCSJSON(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "{\"a\":[true,null,\"<tag>\"],\"n\":9007199254740992,\"z\":0,\"\U0001D11E\":2,\"\uE000\":1}"
+	if got := string(canonical); got != want {
+		t.Fatalf("JCS canonical = %s, want %s", got, want)
+	}
+
+	for _, tt := range []struct {
+		raw  string
+		want string
+	}{
+		{raw: `1`, want: `1`},
+		{raw: `1.0`, want: `1`},
+		{raw: `1e0`, want: `1`},
+		{raw: `333333333.33333329`, want: `333333333.3333333`},
+		{raw: `4.50`, want: `4.5`},
+		{raw: `2e-3`, want: `0.002`},
+		{raw: `0.000001`, want: `0.000001`},
+		{raw: `1e-7`, want: `1e-7`},
+		{raw: `0.000000000000000000000000001`, want: `1e-27`},
+		{raw: `100000000000000000000`, want: `100000000000000000000`},
+		{raw: `1e21`, want: `1e+21`},
+		{raw: `1E30`, want: `1e+30`},
+	} {
+		t.Run(tt.raw, func(t *testing.T) {
+			value, err := parseJCSJSON([]byte(tt.raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonical, err := canonicalJCSJSON(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := string(canonical); got != tt.want {
+				t.Fatalf("JCS number = %s, want %s", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -560,6 +664,27 @@ func TestJobSubmitUnknownBackendReplayDeduplicates(t *testing.T) {
 	}
 }
 
+func TestJobSubmitConflictPrecedesSemanticTaskSpecValidation(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	params := submissionParams("workspace-invalid-conflict", "request-invalid-conflict", "codex", t.TempDir(), "first prompt")
+	first := submitResultForTest(t, submitForTest(t, server, params))
+
+	params.TaskSpec.CWD = "relative"
+	params.TaskSpec.Prompt = ""
+	timeout := protocol.MaxTimeout.Milliseconds() + 1
+	params.TaskSpec.TimeoutMS = &timeout
+	conflict := submitForTest(t, server, params)
+	if conflict.err == nil || conflict.err.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
+		t.Fatalf("invalid conflicting task error = %#v, want typed conflict", conflict.err)
+	}
+	if conflict.err.Data.JobID != first.JobID || !strings.Contains(conflict.err.Message, "jobstore: request conflict") {
+		t.Fatalf("invalid conflicting task error = %#v, want existing job %q", conflict.err, first.JobID)
+	}
+	if conflict.result != nil {
+		t.Fatalf("invalid conflicting task result = %#v, want error-only conflict", conflict.result)
+	}
+}
+
 func TestJobSubmitRejectsTimeoutAboveMaximum(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
 	timeout := protocol.MaxTimeout.Milliseconds() + 1
@@ -580,7 +705,7 @@ func TestJobSubmitRejectsUnknownTaskSpecField(t *testing.T) {
 	}
 }
 
-func TestJobSubmitTimeoutResolutionIsPresentOnNewReplayAndConflict(t *testing.T) {
+func TestJobSubmitTimeoutResolutionIsPresentOnNewAndReplay(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
 	timeout := int64(1234)
 	params := submissionParams("workspace-timeout-resolution", "request-timeout-resolution", "codex", t.TempDir(), "first prompt")
@@ -598,9 +723,8 @@ func TestJobSubmitTimeoutResolutionIsPresentOnNewReplayAndConflict(t *testing.T)
 	if conflict.err == nil {
 		t.Fatal("conflict error = nil, want typed conflict")
 	}
-	result, ok := conflict.result.(protocol.JobSubmitResultV3)
-	if !ok || result.Timeout == nil || result.Timeout.Requested == nil || *result.Timeout.Requested != timeout || result.Timeout.Effective != timeout || result.Timeout.Source != engine.TimeoutSourceClient {
-		t.Fatalf("conflict timeout result = %#v, want requested client resolution", conflict.result)
+	if conflict.result != nil {
+		t.Fatalf("conflict result = %#v, want error-only JSON-RPC outcome", conflict.result)
 	}
 }
 
@@ -625,5 +749,22 @@ func TestJobSubmitProbesAndCachesBackendOnDemand(t *testing.T) {
 	}
 	if !cacheHasBackend(cache, "probed") {
 		t.Fatalf("cached probes = %+v, want probed backend", cache.Backends)
+	}
+}
+
+func TestJobSubmitDoesNotReprobeForUnrelatedCacheChange(t *testing.T) {
+	root := t.TempDir()
+	first := &submitProbeBackend{name: "first"}
+	second := &submitProbeBackend{name: "second"}
+	server := newTestServer(t, root, Config{Backends: []engine.Backend{first, second}})
+
+	submitResultForTest(t, submitForTest(t, server, submissionParams("workspace-first-one", "request-first-one", "first", t.TempDir(), "task")))
+	if got := first.probes.Load(); got != 1 {
+		t.Fatalf("first probes after initial submission = %d, want 1", got)
+	}
+	submitResultForTest(t, submitForTest(t, server, submissionParams("workspace-second", "request-second", "second", t.TempDir(), "task")))
+	submitResultForTest(t, submitForTest(t, server, submissionParams("workspace-first-two", "request-first-two", "first", t.TempDir(), "task")))
+	if got := first.probes.Load(); got != 1 {
+		t.Fatalf("first probes after unrelated cache update = %d, want 1", got)
 	}
 }

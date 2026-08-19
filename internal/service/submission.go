@@ -4,18 +4,16 @@ package service
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
-	"github.com/charlesnpx/agentbus/engine/execution/model"
 	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
+	"github.com/charlesnpx/agentbus/internal/schema"
 )
 
 const jobStoreFilename = "jobs.db"
@@ -27,8 +25,10 @@ type backendSetupProber interface {
 	SetupProbe(context.Context) (engine.BackendSetupProbe, error)
 }
 
-type jobSubmitPrecheck struct {
-	rawTaskSpec json.RawMessage
+type jobSubmitInput struct {
+	key               jobstore.RequestKey
+	taskSpec          jcsValue
+	canonicalTaskSpec []byte
 }
 
 // handleJobSubmit keeps idempotency ahead of all present-time backend and
@@ -39,92 +39,151 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 		ctx = context.Background()
 	}
 
-	var params protocol.JobSubmitParamsV3
-	if err := decodeStrict(raw, &params); err != nil {
-		return invalidParams(err)
-	}
-	precheck, errObj := jobSubmitRawPrecheck(raw)
-	if errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-	if errObj := validateTaskSpecEnvelope(raw); errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-
-	key := jobstore.RequestKey{
-		WorkspaceKey: params.WorkspaceKey,
-		RequestID:    params.RequestID,
-	}
-	// This is deliberately the only identity validation before hashing. It
-	// neither resolves cwd nor checks whether the requested backend exists.
-	if err := key.Validate(); err != nil {
-		return invalidParams(err)
-	}
-	canonicalTaskSpec, err := model.CanonicalTaskSpecJSON(precheck.rawTaskSpec)
+	input, err := parseJobSubmitInput(raw)
 	if err != nil {
 		return invalidParams(err)
 	}
-	if errObj := validateStaticTaskSpec(params.TaskSpec); errObj != nil {
-		return requestOutcome{err: errObj}
-	}
-	_, timeout, errObj := timeoutFromMillis(params.TaskSpec.TimeoutMS)
-	if errObj != nil {
-		return requestOutcome{err: errObj}
+	// This is deliberately the only identity validation before hashing. It
+	// neither resolves cwd nor checks whether the requested backend exists.
+	if err := input.key.Validate(); err != nil {
+		return invalidParams(err)
 	}
 
 	store, err := s.ensureJobStore()
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailableV3, "open job store: "+err.Error(), protocol.ErrorData{})}
 	}
-	record, deduplicated, err := store.SubmitTx(key, canonicalTaskSpec, func(id string) (jobstore.Record, error) {
-		if err := s.ensureBackendAvailable(ctx, params.TaskSpec.Backend); err != nil {
+	record, deduplicated, err := store.SubmitTx(input.key, input.canonicalTaskSpec, func(id string) (jobstore.Record, error) {
+		// Everything in this factory is new-key-only: SubmitTx has already
+		// compared the canonical TaskSpec hash with a durable binding.
+		spec, err := decodeTaskSpec(input.canonicalTaskSpec)
+		if err != nil {
 			return jobstore.Record{}, err
 		}
-		canonicalCWD, err := engine.CanonicalWorkspace(params.TaskSpec.CWD)
+		if err := validateNewTaskSpec(spec, input.taskSpec); err != nil {
+			return jobstore.Record{}, err
+		}
+		if err := s.ensureBackendAvailable(ctx, spec.Backend); err != nil {
+			return jobstore.Record{}, err
+		}
+		canonicalCWD, err := engine.CanonicalWorkspace(spec.CWD)
 		if err != nil {
 			return jobstore.Record{}, err
 		}
 		return jobstore.Record{
 			JobID:        id,
-			WorkspaceKey: key.WorkspaceKey,
-			RequestID:    key.RequestID,
-			Backend:      params.TaskSpec.Backend,
-			Model:        taskSpecOptionalString(params.TaskSpec.Model),
+			WorkspaceKey: input.key.WorkspaceKey,
+			RequestID:    input.key.RequestID,
+			Backend:      spec.Backend,
+			Model:        taskSpecOptionalString(spec.Model),
 			CWD:          canonicalCWD,
-			Write:        params.TaskSpec.Write,
-			Effort:       taskSpecOptionalString(params.TaskSpec.Effort),
+			Write:        spec.Write,
+			Effort:       taskSpecOptionalString(spec.Effort),
 		}, nil
 	})
 	if err != nil {
 		if errors.Is(err, jobstore.ErrConflict) {
-			return s.jobSubmitConflict(store, err, timeout)
+			return s.jobSubmitConflict(store, err)
 		}
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "submit job: "+err.Error(), protocol.ErrorData{})}
 	}
-	if deduplicated {
-		return requestOutcome{result: jobSubmitResult(record, true, timeout)}
+	timeout, err := timeoutFromStoredTaskSpec(record.TaskSpec)
+	if err != nil {
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "stored taskSpec timeout: "+err.Error(), protocol.ErrorData{JobID: record.JobID})}
 	}
-	return requestOutcome{result: jobSubmitResult(record, false, timeout)}
+	return requestOutcome{result: jobSubmitResult(record, deduplicated, timeout)}
 }
 
-func jobSubmitRawPrecheck(raw json.RawMessage) (jobSubmitPrecheck, *protocol.ErrorObject) {
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return jobSubmitPrecheck{}, protocol.NewError(protocol.ErrorInvalidTaskSpecV3, err.Error(), protocol.ErrorData{})
+// parseJobSubmitInput performs only the JSON work needed to derive the
+// immutable TaskSpec hash and validate the compound identity. In particular,
+// TaskSpec semantics intentionally remain in SubmitTx's new-record factory.
+func parseJobSubmitInput(raw json.RawMessage) (jobSubmitInput, error) {
+	root, err := parseJCSJSON(raw)
+	if err != nil {
+		return jobSubmitInput{}, err
 	}
-	rawTaskSpec, ok := envelope["taskSpec"]
-	if !ok {
-		return jobSubmitPrecheck{}, protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "taskSpec is required", protocol.ErrorData{})
+	if root.kind != jcsObject {
+		return jobSubmitInput{}, fmt.Errorf("params must be a JSON object")
 	}
-	return jobSubmitPrecheck{rawTaskSpec: append(json.RawMessage(nil), rawTaskSpec...)}, nil
+
+	input := jobSubmitInput{}
+	hasTaskSpec := false
+	for _, member := range root.object {
+		switch member.name {
+		case "workspaceKey":
+			if member.value.kind != jcsString {
+				return jobSubmitInput{}, fmt.Errorf("workspaceKey must be a string")
+			}
+			input.key.WorkspaceKey = member.value.string
+		case "requestId":
+			if member.value.kind != jcsString {
+				return jobSubmitInput{}, fmt.Errorf("requestId must be a string")
+			}
+			input.key.RequestID = member.value.string
+		case "taskSpec":
+			input.taskSpec = member.value
+			hasTaskSpec = true
+		default:
+			return jobSubmitInput{}, fmt.Errorf("json: unknown field %q", member.name)
+		}
+	}
+	if !hasTaskSpec {
+		return jobSubmitInput{}, fmt.Errorf("taskSpec is required")
+	}
+	if input.taskSpec.kind != jcsObject {
+		return jobSubmitInput{}, fmt.Errorf("taskSpec must be an object")
+	}
+	for _, member := range input.taskSpec.object {
+		switch member.name {
+		case "backend", "cwd", "write", "prompt", "model", "effort", "outputSchema", "tags", "timeoutMs":
+		default:
+			return jobSubmitInput{}, fmt.Errorf("json: unknown field %q", member.name)
+		}
+	}
+	input.canonicalTaskSpec, err = canonicalJCSJSON(input.taskSpec)
+	if err != nil {
+		return jobSubmitInput{}, err
+	}
+	return input, nil
 }
 
-func validateStaticTaskSpec(spec protocol.TaskSpecV3) *protocol.ErrorObject {
+func decodeTaskSpec(raw json.RawMessage) (protocol.TaskSpecV3, error) {
+	var spec protocol.TaskSpecV3
+	if err := decodeStrict(raw, &spec); err != nil {
+		return protocol.TaskSpecV3{}, err
+	}
+	return spec, nil
+}
+
+func validateNewTaskSpec(spec protocol.TaskSpecV3, raw jcsValue) error {
+	for _, required := range []string{"backend", "cwd", "write", "prompt"} {
+		value, present := raw.objectMember(required)
+		if !present || value.kind == jcsNull {
+			return fmt.Errorf("taskSpec missing required field %s", required)
+		}
+	}
+	for _, optional := range []string{"model", "effort", "outputSchema", "tags", "timeoutMs"} {
+		value, present := raw.objectMember(optional)
+		if present && value.kind == jcsNull {
+			return fmt.Errorf("taskSpec.%s cannot be null", optional)
+		}
+	}
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
-		return protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "taskSpec requires backend, absolute cwd, write, and prompt", protocol.ErrorData{Backend: spec.Backend})
+		return fmt.Errorf("taskSpec requires backend, absolute cwd, write, and prompt")
 	}
-	_, _, errObj := timeoutFromMillis(spec.TimeoutMS)
-	return errObj
+	if _, _, errObj := timeoutFromMillis(spec.TimeoutMS); errObj != nil {
+		return errors.New(errObj.Message)
+	}
+	if _, supplied := raw.objectMember("outputSchema"); supplied {
+		// Validate compiles Draft 2020-12 schemas, including boolean roots,
+		// and rejects non-schema roots and non-2020-12 declared dialects.
+		// "null" is a valid JSON instance, so only a schema compilation
+		// error matters here.
+		if _, err := schema.Validate("null", spec.OutputSchema); err != nil {
+			return fmt.Errorf("outputSchema: %w", err)
+		}
+	}
+	return nil
 }
 
 // taskSpecOptionalString supplies Record's summary fields. Presence remains
@@ -145,22 +204,38 @@ func jobSubmitResult(record jobstore.Record, deduplicated bool, timeout *engine.
 	}
 }
 
-func (s *Server) jobSubmitConflict(store *jobstore.Store, submitErr error, timeout *engine.TimeoutResolution) requestOutcome {
+func timeoutFromStoredTaskSpec(raw json.RawMessage) (*engine.TimeoutResolution, error) {
+	spec, err := decodeTaskSpec(raw)
+	if err != nil {
+		return nil, err
+	}
+	_, timeout, errObj := timeoutFromMillis(spec.TimeoutMS)
+	if errObj != nil {
+		return nil, errors.New(errObj.Message)
+	}
+	return timeout, nil
+}
+
+func (s *Server) jobSubmitConflict(store *jobstore.Store, submitErr error) requestOutcome {
 	var conflict *jobstore.ConflictError
 	if !errors.As(submitErr, &conflict) {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, submitErr.Error(), protocol.ErrorData{})}
 	}
 	data := protocol.ErrorData{JobID: conflict.ExistingJobID}
-	result := protocol.JobSubmitResultV3{JobID: conflict.ExistingJobID, Timeout: engine.CloneTimeoutResolution(timeout)}
+	// A conflict must not use an invalid incoming TaskSpec to resolve timeout.
+	// Its stored canonical TaskSpec remains the source of that resolution, even
+	// though JSON-RPC's error-only conflict response deliberately exposes no
+	// result object.
 	if record, err := store.Get(conflict.ExistingJobID); err == nil {
-		result.State = record.State
+		if _, err := timeoutFromStoredTaskSpec(record.TaskSpec); err != nil {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "stored taskSpec timeout: "+err.Error(), data)}
+		}
 	}
 	// protocol v3 has no distinct conflict error code. Keep the typed store
-	// conflict visible as an invalid-task response, while retaining a complete
-	// timeout result for clients that need it on every submit path.
+	// conflict visible as an invalid-task response without violating JSON-RPC's
+	// result XOR error response invariant.
 	return requestOutcome{
-		result: result,
-		err:    protocol.NewError(protocol.ErrorInvalidTaskSpecV3, submitErr.Error(), data),
+		err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, submitErr.Error(), data),
 	}
 }
 
@@ -210,16 +285,14 @@ func (s *Server) ensureBackendAvailable(ctx context.Context, name string) error 
 	if err != nil {
 		return err
 	}
-	cache, fingerprint, cacheErr := readSetupProbeCache(cachePath)
-	previousFingerprint, observed := s.backendProbeFingerprints[name]
-	needsProbe := cacheErr != nil || !cacheHasBackend(cache, name) || (observed && previousFingerprint != fingerprint)
+	cache, cacheErr := engine.ReadSetupProbeCache(cachePath)
+	needsProbe := cacheErr != nil || !cacheHasBackend(cache, name)
 	probed := false
 	if needsProbe {
 		if err := s.probeAndCacheBackend(ctx, name, backend, cache, cacheErr); err != nil {
 			return err
 		}
 		probed = true
-		cache, fingerprint, cacheErr = readSetupProbeCache(cachePath)
 	}
 	if _, err := backend.Preflight(ctx); err != nil {
 		if probed {
@@ -231,10 +304,6 @@ func (s *Server) ensureBackendAvailable(ctx context.Context, name string) error 
 		if _, err := backend.Preflight(ctx); err != nil {
 			return err
 		}
-		cache, fingerprint, cacheErr = readSetupProbeCache(cachePath)
-	}
-	if cacheErr == nil && cacheHasBackend(cache, name) {
-		s.backendProbeFingerprints[name] = fingerprint
 	}
 	return nil
 }
@@ -263,19 +332,6 @@ func (s *Server) probeAndCacheBackend(ctx context.Context, name string, backend 
 		return err
 	}
 	return engine.WriteSetupProbeCache(cachePath, cache)
-}
-
-func readSetupProbeCache(path string) (engine.SetupProbeCache, string, error) {
-	cache, err := engine.ReadSetupProbeCache(path)
-	if err != nil {
-		return engine.SetupProbeCache{}, "", err
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return engine.SetupProbeCache{}, "", err
-	}
-	fingerprint := sha256.Sum256(raw)
-	return cache, fmt.Sprintf("%x", fingerprint), nil
 }
 
 func cacheHasBackend(cache engine.SetupProbeCache, name string) bool {
@@ -326,25 +382,4 @@ func timeoutFromMillis(ms *int64) (time.Duration, *engine.TimeoutResolution, *pr
 		Effective: duration.Milliseconds(),
 		Source:    engine.TimeoutSourceClient,
 	}, nil
-}
-
-func validateTaskSpecEnvelope(raw json.RawMessage) *protocol.ErrorObject {
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return protocol.NewError(protocol.ErrorInvalidTaskSpecV3, err.Error(), protocol.ErrorData{})
-	}
-	specRaw, ok := envelope["taskSpec"]
-	if !ok {
-		return protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "taskSpec is required", protocol.ErrorData{})
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(specRaw, &fields); err != nil {
-		return protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "taskSpec must be an object", protocol.ErrorData{})
-	}
-	for _, required := range []string{"backend", "cwd", "write", "prompt"} {
-		if _, ok := fields[required]; !ok {
-			return protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "taskSpec missing required field "+required, protocol.ErrorData{})
-		}
-	}
-	return nil
 }
