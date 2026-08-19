@@ -1,6 +1,5 @@
-//go:build darwin || linux
-
-package service
+// Package jcs renders JSON using RFC 8785.
+package jcs
 
 import (
 	"bytes"
@@ -13,7 +12,18 @@ import (
 	"unicode/utf8"
 )
 
-// jcsValue is the deliberately small JSON tree used to render TaskSpec input
+// Render returns raw rendered according to RFC 8785's JSON Canonicalization
+// Scheme. It accepts exactly one UTF-8 JSON value and rejects duplicate object
+// member names at every depth.
+func Render(raw []byte) ([]byte, error) {
+	value, err := parseJCSJSON(raw)
+	if err != nil {
+		return nil, err
+	}
+	return canonicalJCSJSON(value)
+}
+
+// jcsValue is the deliberately small JSON tree used to render JSON input
 // according to RFC 8785. It retains JSON numbers as source text until
 // rendering, where they are converted through IEEE-754 binary64 just as
 // ECMAScript's Number::toString does.
@@ -43,8 +53,7 @@ type jcsMember struct {
 }
 
 // parseJCSJSON accepts exactly one UTF-8 JSON value and rejects duplicate
-// object member names at every depth. That makes the raw outputSchema value a
-// single, unambiguous JSON value before it contributes to the TaskSpec hash.
+// object member names at every depth.
 func parseJCSJSON(raw []byte) (jcsValue, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return jcsValue{}, fmt.Errorf("json is required")
@@ -64,18 +73,6 @@ func parseJCSJSON(raw []byte) (jcsValue, error) {
 		return jcsValue{}, parser.errorf("contains multiple top-level values")
 	}
 	return value, nil
-}
-
-func (value jcsValue) objectMember(name string) (jcsValue, bool) {
-	if value.kind != jcsObject {
-		return jcsValue{}, false
-	}
-	for _, member := range value.object {
-		if member.name == name {
-			return member.value, true
-		}
-	}
-	return jcsValue{}, false
 }
 
 func canonicalJCSJSON(value jcsValue) ([]byte, error) {

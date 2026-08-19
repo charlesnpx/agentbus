@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/internal/jcs"
 	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 	"github.com/charlesnpx/agentbus/internal/schema"
@@ -18,7 +19,7 @@ const jobStoreFilename = "jobs.db"
 
 type jobSubmitInput struct {
 	key               jobstore.RequestKey
-	taskSpec          jcsValue
+	taskSpec          map[string]json.RawMessage
 	canonicalTaskSpec []byte
 }
 
@@ -86,52 +87,62 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 // immutable TaskSpec hash and validate the compound identity. In particular,
 // TaskSpec semantics intentionally remain in SubmitTx's new-record factory.
 func parseJobSubmitInput(raw json.RawMessage) (jobSubmitInput, error) {
-	root, err := parseJCSJSON(raw)
+	canonicalParams, err := jcs.Render(raw)
 	if err != nil {
 		return jobSubmitInput{}, err
 	}
-	if root.kind != jcsObject {
+	if len(canonicalParams) == 0 || canonicalParams[0] != '{' {
 		return jobSubmitInput{}, fmt.Errorf("params must be a JSON object")
+	}
+
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(canonicalParams, &root); err != nil {
+		return jobSubmitInput{}, err
 	}
 
 	input := jobSubmitInput{}
 	hasTaskSpec := false
-	for _, member := range root.object {
-		switch member.name {
+	var taskSpecRaw json.RawMessage
+	for name, value := range root {
+		switch name {
 		case "workspaceKey":
-			if member.value.kind != jcsString {
+			if len(value) == 0 || value[0] != '"' {
 				return jobSubmitInput{}, fmt.Errorf("workspaceKey must be a string")
 			}
-			input.key.WorkspaceKey = member.value.string
+			if err := json.Unmarshal(value, &input.key.WorkspaceKey); err != nil {
+				return jobSubmitInput{}, err
+			}
 		case "requestId":
-			if member.value.kind != jcsString {
+			if len(value) == 0 || value[0] != '"' {
 				return jobSubmitInput{}, fmt.Errorf("requestId must be a string")
 			}
-			input.key.RequestID = member.value.string
+			if err := json.Unmarshal(value, &input.key.RequestID); err != nil {
+				return jobSubmitInput{}, err
+			}
 		case "taskSpec":
-			input.taskSpec = member.value
+			taskSpecRaw = value
 			hasTaskSpec = true
 		default:
-			return jobSubmitInput{}, fmt.Errorf("json: unknown field %q", member.name)
+			return jobSubmitInput{}, fmt.Errorf("json: unknown field %q", name)
 		}
 	}
 	if !hasTaskSpec {
 		return jobSubmitInput{}, fmt.Errorf("taskSpec is required")
 	}
-	if input.taskSpec.kind != jcsObject {
+	if len(taskSpecRaw) == 0 || taskSpecRaw[0] != '{' {
 		return jobSubmitInput{}, fmt.Errorf("taskSpec must be an object")
 	}
-	for _, member := range input.taskSpec.object {
-		switch member.name {
-		case "backend", "cwd", "write", "prompt", "model", "effort", "outputSchema", "tags", "timeoutMs":
-		default:
-			return jobSubmitInput{}, fmt.Errorf("json: unknown field %q", member.name)
-		}
-	}
-	input.canonicalTaskSpec, err = canonicalJCSJSON(input.taskSpec)
-	if err != nil {
+	if err := json.Unmarshal(taskSpecRaw, &input.taskSpec); err != nil {
 		return jobSubmitInput{}, err
 	}
+	for name := range input.taskSpec {
+		switch name {
+		case "backend", "cwd", "write", "prompt", "model", "effort", "outputSchema", "tags", "timeoutMs":
+		default:
+			return jobSubmitInput{}, fmt.Errorf("json: unknown field %q", name)
+		}
+	}
+	input.canonicalTaskSpec = taskSpecRaw
 	return input, nil
 }
 
@@ -143,16 +154,16 @@ func decodeTaskSpec(raw json.RawMessage) (protocol.TaskSpecV3, error) {
 	return spec, nil
 }
 
-func validateNewTaskSpec(spec protocol.TaskSpecV3, raw jcsValue) error {
+func validateNewTaskSpec(spec protocol.TaskSpecV3, raw map[string]json.RawMessage) error {
 	for _, required := range []string{"backend", "cwd", "write", "prompt"} {
-		value, present := raw.objectMember(required)
-		if !present || value.kind == jcsNull {
+		value, present := raw[required]
+		if !present || string(value) == "null" {
 			return fmt.Errorf("taskSpec missing required field %s", required)
 		}
 	}
 	for _, optional := range []string{"model", "effort", "outputSchema", "tags", "timeoutMs"} {
-		value, present := raw.objectMember(optional)
-		if present && value.kind == jcsNull {
+		value, present := raw[optional]
+		if present && string(value) == "null" {
 			return fmt.Errorf("taskSpec.%s cannot be null", optional)
 		}
 	}
@@ -162,7 +173,7 @@ func validateNewTaskSpec(spec protocol.TaskSpecV3, raw jcsValue) error {
 	if _, errObj := timeoutFromMillis(spec.TimeoutMS); errObj != nil {
 		return errors.New(errObj.Message)
 	}
-	if _, supplied := raw.objectMember("outputSchema"); supplied {
+	if _, supplied := raw["outputSchema"]; supplied {
 		// Validate compiles Draft 2020-12 schemas, including boolean roots,
 		// and rejects non-schema roots and non-2020-12 declared dialects.
 		// "null" is a valid JSON instance, so only a schema compilation

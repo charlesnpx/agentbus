@@ -170,6 +170,20 @@ func TestDigestIsCanonicalAndDistinct(t *testing.T) {
 	}
 }
 
+func TestDigestEquivalentNumericSpellings(t *testing.T) {
+	first, err := Digest(json.RawMessage(`{"type":"number","minimum":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Digest(json.RawMessage(`{"type":"number","minimum":1.0}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("digests = first %q second %q, want equal", first, second)
+	}
+}
+
 func TestCorrectionPromptIsFixedAndReadOnly(t *testing.T) {
 	const canonicalSchema = `{"properties":{"name":{"type":"string"}},"type":"object"}`
 	violations := []string{"/payload/name: got number, want string"}

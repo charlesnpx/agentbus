@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/internal/jcs"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -572,11 +573,7 @@ func TestJobSubmitEquivalentNumericOutputSchemaSpellingsReplay(t *testing.T) {
 }
 
 func TestTaskSpecJCSCanonicalRendering(t *testing.T) {
-	value, err := parseJCSJSON([]byte(`{"\uE000":1,"\uD834\uDD1E":2,"z":-0,"a":[true,null,"<tag>"],"n":9007199254740993}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	canonical, err := canonicalJCSJSON(value)
+	canonical, err := jcs.Render([]byte(`{"\uE000":1,"\uD834\uDD1E":2,"z":-0,"a":[true,null,"<tag>"],"n":9007199254740993}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -603,11 +600,7 @@ func TestTaskSpecJCSCanonicalRendering(t *testing.T) {
 		{raw: `1E30`, want: `1e+30`},
 	} {
 		t.Run(tt.raw, func(t *testing.T) {
-			value, err := parseJCSJSON([]byte(tt.raw))
-			if err != nil {
-				t.Fatal(err)
-			}
-			canonical, err := canonicalJCSJSON(value)
+			canonical, err := jcs.Render([]byte(tt.raw))
 			if err != nil {
 				t.Fatal(err)
 			}

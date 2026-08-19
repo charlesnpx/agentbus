@@ -13,6 +13,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/charlesnpx/agentbus/internal/jcs"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
@@ -54,7 +55,7 @@ func Validate(document string, schemaRaw json.RawMessage) (Result, error) {
 
 // Digest returns sha256:<hex> over canonical JSON for raw.
 func Digest(raw json.RawMessage) (string, error) {
-	canonical, err := canonicalJSON(raw)
+	canonical, err := jcs.Render(raw)
 	if err != nil {
 		return "", err
 	}
@@ -64,20 +65,6 @@ func Digest(raw json.RawMessage) (string, error) {
 
 func schemaAbsent(schemaRaw json.RawMessage) bool {
 	return len(schemaRaw) == 0
-}
-
-func canonicalJSON(v any) ([]byte, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	var decoded any
-	decoder := json.NewDecoder(bytes.NewReader(b))
-	decoder.UseNumber()
-	if err := decodeJSONDocument(decoder, &decoded); err != nil {
-		return nil, err
-	}
-	return json.Marshal(decoded)
 }
 
 func validateJSONSchema(text string, schemaRaw json.RawMessage) ([]string, error) {
