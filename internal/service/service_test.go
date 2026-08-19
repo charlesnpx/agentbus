@@ -76,7 +76,7 @@ func helloResponse(t *testing.T, server *Server, version int, token string) prot
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		(&connection{server: server, conn: daemon}).serve(context.Background())
+		(&connection{server: server, conn: daemon}).serve()
 	}()
 	request := protocol.Request{
 		JSONRPC: "2.0",
@@ -341,7 +341,7 @@ func TestConnectionReturnsBoundedOversizedFrameError(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		(&connection{server: server, conn: daemon, hello: true}).serve(context.Background())
+		(&connection{server: server, conn: daemon, hello: true}).serve()
 	}()
 	request := append([]byte(`{"jsonrpc":"2.0","id":"oversized","method":"protocol.hello","params":{"padding":"`), bytes.Repeat([]byte("x"), 4*1024*1024)...)
 	request = append(request, []byte(`"}}`+"\n")...)
@@ -424,7 +424,7 @@ func (backend *submitSessionBackend) Resume(context.Context, string, engine.Sess
 
 func submitForTest(t *testing.T, server *Server, params protocol.JobSubmitParamsV3) requestOutcome {
 	t.Helper()
-	return server.handleJobSubmit(context.Background(), mustJSON(t, params))
+	return server.handleJobSubmit(mustJSON(t, params))
 }
 
 func submitResultForTest(t *testing.T, outcome requestOutcome) protocol.JobSubmitResultV3 {
@@ -529,7 +529,7 @@ func TestJobSubmitInvalidOutputSchemaLeavesNoBinding(t *testing.T) {
 			requestID := "request-invalid-schema-" + tt.name
 			cwd := t.TempDir()
 			invalidRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","outputSchema":%s}}`, workspaceKey, requestID, cwd, tt.schema))
-			invalid := server.handleJobSubmit(context.Background(), invalidRaw)
+			invalid := server.handleJobSubmit(invalidRaw)
 			if invalid.err == nil || invalid.err.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
 				t.Fatalf("invalid schema outcome = %#v, want invalid task spec", invalid.err)
 			}
@@ -550,7 +550,7 @@ func TestJobSubmitInvalidOutputSchemaLeavesNoBinding(t *testing.T) {
 			}
 
 			correctedRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","outputSchema":{}}}`, workspaceKey, requestID, cwd))
-			corrected := submitResultForTest(t, server.handleJobSubmit(context.Background(), correctedRaw))
+			corrected := submitResultForTest(t, server.handleJobSubmit(correctedRaw))
 			if corrected.Deduplicated || corrected.State != protocol.PublicStateQueued {
 				t.Fatalf("corrected schema result = %+v, want a new queued job", corrected)
 			}
@@ -562,10 +562,10 @@ func TestJobSubmitEquivalentNumericOutputSchemaSpellingsReplay(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
 	workspaceKey, requestID, cwd := "workspace-jcs-number", "request-jcs-number", t.TempDir()
 	firstRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","outputSchema":{"type":"number","minimum":1.0}}}`, workspaceKey, requestID, cwd))
-	first := submitResultForTest(t, server.handleJobSubmit(context.Background(), firstRaw))
+	first := submitResultForTest(t, server.handleJobSubmit(firstRaw))
 
 	secondRaw := json.RawMessage(fmt.Sprintf(`{"requestId":%q,"taskSpec":{"outputSchema":{"minimum":1e0,"type":"number"},"prompt":"task","write":false,"cwd":%q,"backend":"codex"},"workspaceKey":%q}`, requestID, cwd, workspaceKey))
-	replay := submitResultForTest(t, server.handleJobSubmit(context.Background(), secondRaw))
+	replay := submitResultForTest(t, server.handleJobSubmit(secondRaw))
 	if !replay.Deduplicated || replay.JobID != first.JobID || replay.State != protocol.PublicStateQueued {
 		t.Fatalf("numeric-spelling replay = %+v, want queued deduplication of %q", replay, first.JobID)
 	}
@@ -696,7 +696,7 @@ func TestJobSubmitRejectsTimeoutAboveMaximum(t *testing.T) {
 func TestJobSubmitRejectsUnknownTaskSpecField(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
 	raw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":"workspace-unknown-field","requestId":"request-unknown-field","taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","unexpected":true}}`, t.TempDir()))
-	outcome := server.handleJobSubmit(context.Background(), raw)
+	outcome := server.handleJobSubmit(raw)
 	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
 		t.Fatalf("unknown taskSpec field outcome = %#v, want invalid task spec", outcome.err)
 	}

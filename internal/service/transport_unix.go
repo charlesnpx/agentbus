@@ -31,7 +31,7 @@ type connection struct {
 	hello  bool
 }
 
-func (c *connection) serve(ctx context.Context) {
+func (c *connection) serve() {
 	defer c.conn.Close()
 	scanner := bufio.NewScanner(c.conn)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -57,7 +57,7 @@ func (c *connection) serve(ctx context.Context) {
 			})
 			continue
 		}
-		outcome := c.server.handle(ctx, c, request)
+		outcome := c.server.handle(c, request)
 		if len(request.ID) != 0 {
 			response := protocol.Response{JSONRPC: "2.0", ID: request.ID, Result: outcome.result, Error: outcome.err}
 			_ = c.writeResponse(response)
@@ -111,7 +111,7 @@ type requestOutcome struct {
 	err    *protocol.ErrorObject
 }
 
-func (s *Server) handle(ctx context.Context, connection *connection, request protocol.Request) requestOutcome {
+func (s *Server) handle(connection *connection, request protocol.Request) requestOutcome {
 	if request.JSONRPC != "2.0" || request.Method == "" {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "invalid JSON-RPC request", protocol.ErrorData{})}
 	}
@@ -125,7 +125,7 @@ func (s *Server) handle(ctx context.Context, connection *connection, request pro
 	case protocol.MethodHello:
 		return s.handleHello(connection, request.Params)
 	case protocol.MethodJobSubmit:
-		return s.handleJobSubmit(ctx, request.Params)
+		return s.handleJobSubmit(request.Params)
 	default:
 		return requestOutcome{err: protocol.NewError(protocol.ErrorMethodNotFoundV3, "method not found", protocol.ErrorData{})}
 	}

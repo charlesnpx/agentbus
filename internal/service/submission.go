@@ -3,12 +3,10 @@
 package service
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
-	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/jobstore"
@@ -28,11 +26,7 @@ type jobSubmitInput struct {
 // filesystem checks. In particular, SubmitTx does not invoke its factory for a
 // matching replay, so the code below never validates a new record or resolves
 // its cwd for one.
-func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) requestOutcome {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
+func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 	input, err := parseJobSubmitInput(raw)
 	if err != nil {
 		return invalidParams(err)
@@ -77,7 +71,7 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 	})
 	if err != nil {
 		if errors.Is(err, jobstore.ErrConflict) {
-			return s.jobSubmitConflict(store, err)
+			return s.jobSubmitConflict(err)
 		}
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "submit job: "+err.Error(), protocol.ErrorData{})}
 	}
@@ -165,7 +159,7 @@ func validateNewTaskSpec(spec protocol.TaskSpecV3, raw jcsValue) error {
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
 		return fmt.Errorf("taskSpec requires backend, absolute cwd, write, and prompt")
 	}
-	if _, _, errObj := timeoutFromMillis(spec.TimeoutMS); errObj != nil {
+	if _, errObj := timeoutFromMillis(spec.TimeoutMS); errObj != nil {
 		return errors.New(errObj.Message)
 	}
 	if _, supplied := raw.objectMember("outputSchema"); supplied {
@@ -203,28 +197,19 @@ func timeoutFromStoredTaskSpec(raw json.RawMessage) (*engine.TimeoutResolution, 
 	if err != nil {
 		return nil, err
 	}
-	_, timeout, errObj := timeoutFromMillis(spec.TimeoutMS)
+	timeout, errObj := timeoutFromMillis(spec.TimeoutMS)
 	if errObj != nil {
 		return nil, errors.New(errObj.Message)
 	}
 	return timeout, nil
 }
 
-func (s *Server) jobSubmitConflict(store *jobstore.Store, submitErr error) requestOutcome {
+func (s *Server) jobSubmitConflict(submitErr error) requestOutcome {
 	var conflict *jobstore.ConflictError
 	if !errors.As(submitErr, &conflict) {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, submitErr.Error(), protocol.ErrorData{})}
 	}
 	data := protocol.ErrorData{JobID: conflict.ExistingJobID}
-	// A conflict must not use an invalid incoming TaskSpec to resolve timeout.
-	// Its stored canonical TaskSpec remains the source of that resolution, even
-	// though JSON-RPC's error-only conflict response deliberately exposes no
-	// result object.
-	if record, err := store.Get(conflict.ExistingJobID); err == nil {
-		if _, err := timeoutFromStoredTaskSpec(record.TaskSpec); err != nil {
-			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "stored taskSpec timeout: "+err.Error(), data)}
-		}
-	}
 	// protocol v3 has no distinct conflict error code. Keep the typed store
 	// conflict visible as an invalid-task response without violating JSON-RPC's
 	// result XOR error response invariant.
@@ -272,30 +257,29 @@ func (s *Server) ensureConfiguredBackend(name string) error {
 	return nil
 }
 
-func timeoutFromMillis(ms *int64) (time.Duration, *engine.TimeoutResolution, *protocol.ErrorObject) {
+func timeoutFromMillis(ms *int64) (*engine.TimeoutResolution, *protocol.ErrorObject) {
 	if ms == nil {
-		return protocol.DefaultTimeout, &engine.TimeoutResolution{
+		return &engine.TimeoutResolution{
 			Effective: protocol.DefaultTimeout.Milliseconds(),
 			Source:    engine.TimeoutSourceDaemonDefault,
 		}, nil
 	}
 	if *ms < 0 {
-		return 0, nil, protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "timeoutMs cannot be negative", protocol.ErrorData{})
+		return nil, protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "timeoutMs cannot be negative", protocol.ErrorData{})
 	}
 	if *ms == 0 {
-		return 0, &engine.TimeoutResolution{
+		return &engine.TimeoutResolution{
 			Requested: ms,
 			Effective: 0,
 			Source:    engine.TimeoutSourceClient,
 		}, nil
 	}
 	if *ms > protocol.MaxTimeout.Milliseconds() {
-		return 0, nil, protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "timeoutMs exceeds maximum", protocol.ErrorData{})
+		return nil, protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "timeoutMs exceeds maximum", protocol.ErrorData{})
 	}
-	duration := time.Duration(*ms) * time.Millisecond
-	return duration, &engine.TimeoutResolution{
+	return &engine.TimeoutResolution{
 		Requested: ms,
-		Effective: duration.Milliseconds(),
+		Effective: *ms,
 		Source:    engine.TimeoutSourceClient,
 	}, nil
 }

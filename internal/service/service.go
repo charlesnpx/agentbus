@@ -331,7 +331,7 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 			defer lifecycle.clients.Done()
 			defer s.clients.Add(-1)
 			defer s.touchActivity()
-			connection.serve(serveCtx)
+			connection.serve()
 		}()
 	}
 }
