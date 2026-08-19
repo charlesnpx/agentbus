@@ -398,35 +398,28 @@ func TestIdleShutdownAfterConfiguredWindow(t *testing.T) {
 	}
 }
 
-type submitProbeBackend struct {
+type submitSessionBackend struct {
 	name       string
-	probes     atomic.Int64
+	sessions   atomic.Int64
 	preflights atomic.Int64
 	preflight  error
-	probe      error
 }
 
-func (backend *submitProbeBackend) Name() string { return backend.name }
+func (backend *submitSessionBackend) Name() string { return backend.name }
 
-func (backend *submitProbeBackend) Preflight(context.Context) (engine.Health, error) {
+func (backend *submitSessionBackend) Preflight(context.Context) (engine.Health, error) {
 	backend.preflights.Add(1)
 	return engine.Health{Backend: backend.name}, backend.preflight
 }
 
-func (backend *submitProbeBackend) Start(context.Context, engine.SessionOpts) (engine.Session, error) {
+func (backend *submitSessionBackend) Start(context.Context, engine.SessionOpts) (engine.Session, error) {
+	backend.sessions.Add(1)
 	return nil, errors.New("not used by submission tests")
 }
 
-func (backend *submitProbeBackend) Resume(context.Context, string, engine.SessionOpts) (engine.Session, error) {
+func (backend *submitSessionBackend) Resume(context.Context, string, engine.SessionOpts) (engine.Session, error) {
+	backend.sessions.Add(1)
 	return nil, errors.New("not used by submission tests")
-}
-
-func (backend *submitProbeBackend) SetupProbe(context.Context) (engine.BackendSetupProbe, error) {
-	backend.probes.Add(1)
-	if backend.probe != nil {
-		return engine.BackendSetupProbe{}, backend.probe
-	}
-	return engine.BackendSetupProbe{Backend: backend.name, Version: "test"}, nil
 }
 
 func submitForTest(t *testing.T, server *Server, params protocol.JobSubmitParamsV3) requestOutcome {
@@ -626,7 +619,8 @@ func TestTaskSpecJCSCanonicalRendering(t *testing.T) {
 }
 
 func TestJobSubmitUnknownBackendNewKeyLeavesNoRecordOrBinding(t *testing.T) {
-	server := newTestServer(t, t.TempDir(), Config{})
+	backend := &submitSessionBackend{name: "configured"}
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
 	params := submissionParams("workspace-unknown-new", "request-unknown-new", "missing", t.TempDir(), "task")
 	outcome := submitForTest(t, server, params)
 	if outcome.err == nil {
@@ -634,6 +628,9 @@ func TestJobSubmitUnknownBackendNewKeyLeavesNoRecordOrBinding(t *testing.T) {
 	}
 	if outcome.result != nil {
 		t.Fatalf("unknown-backend new result = %#v, want no result", outcome.result)
+	}
+	if got := backend.sessions.Load(); got != 0 {
+		t.Fatalf("provider sessions after unknown-backend submission = %d, want 0", got)
 	}
 	store, err := server.ensureJobStore()
 	if err != nil {
@@ -728,43 +725,17 @@ func TestJobSubmitTimeoutResolutionIsPresentOnNewAndReplay(t *testing.T) {
 	}
 }
 
-func TestJobSubmitProbesAndCachesBackendOnDemand(t *testing.T) {
-	root := t.TempDir()
-	backend := &submitProbeBackend{name: "probed"}
-	server := newTestServer(t, root, Config{Backends: []engine.Backend{backend}})
-	result := submitResultForTest(t, submitForTest(t, server, submissionParams("workspace-probed", "request-probed", "probed", t.TempDir(), "task")))
+func TestJobSubmitConfiguredBackendDoesNotPreflightDuringAdmission(t *testing.T) {
+	backend := &submitSessionBackend{name: "configured", preflight: errors.New("backend unavailable")}
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
+	result := submitResultForTest(t, submitForTest(t, server, submissionParams("workspace-configured", "request-configured", "configured", t.TempDir(), "task")))
 	if result.State != protocol.PublicStateQueued {
-		t.Fatalf("on-demand probe result = %+v, want queued", result)
+		t.Fatalf("configured-backend result = %+v, want queued", result)
 	}
-	if got := backend.probes.Load(); got != 1 {
-		t.Fatalf("on-demand probes = %d, want 1", got)
+	if got := backend.preflights.Load(); got != 0 {
+		t.Fatalf("preflight calls during admission = %d, want 0", got)
 	}
-	cachePath, err := engine.SetupProbeCachePath(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cache, err := engine.ReadSetupProbeCache(cachePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !cacheHasBackend(cache, "probed") {
-		t.Fatalf("cached probes = %+v, want probed backend", cache.Backends)
-	}
-}
-
-func TestJobSubmitDoesNotReprobeForUnrelatedCacheChange(t *testing.T) {
-	root := t.TempDir()
-	first := &submitProbeBackend{name: "first"}
-	second := &submitProbeBackend{name: "second"}
-	server := newTestServer(t, root, Config{Backends: []engine.Backend{first, second}})
-
-	submitResultForTest(t, submitForTest(t, server, submissionParams("workspace-first-one", "request-first-one", "first", t.TempDir(), "task")))
-	if got := first.probes.Load(); got != 1 {
-		t.Fatalf("first probes after initial submission = %d, want 1", got)
-	}
-	submitResultForTest(t, submitForTest(t, server, submissionParams("workspace-second", "request-second", "second", t.TempDir(), "task")))
-	submitResultForTest(t, submitForTest(t, server, submissionParams("workspace-first-two", "request-first-two", "first", t.TempDir(), "task")))
-	if got := first.probes.Load(); got != 1 {
-		t.Fatalf("first probes after unrelated cache update = %d, want 1", got)
+	if got := backend.sessions.Load(); got != 0 {
+		t.Fatalf("provider sessions during admission = %d, want 0", got)
 	}
 }

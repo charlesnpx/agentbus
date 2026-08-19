@@ -125,8 +125,6 @@ type Server struct {
 	jobStoreMu sync.Mutex
 	jobStore   *jobstore.Store
 
-	backendProbeMu sync.Mutex
-
 	idleTimeout       time.Duration
 	idleCheckInterval time.Duration
 	shutdownTimeout   time.Duration

@@ -18,13 +18,6 @@ import (
 
 const jobStoreFilename = "jobs.db"
 
-// backendSetupProber is implemented by the retained CLI adapters. It performs
-// the one live probe needed to create a preflight cache entry when setup has
-// not populated one yet.
-type backendSetupProber interface {
-	SetupProbe(context.Context) (engine.BackendSetupProbe, error)
-}
-
 type jobSubmitInput struct {
 	key               jobstore.RequestKey
 	taskSpec          jcsValue
@@ -33,7 +26,8 @@ type jobSubmitInput struct {
 
 // handleJobSubmit keeps idempotency ahead of all present-time backend and
 // filesystem checks. In particular, SubmitTx does not invoke its factory for a
-// matching replay, so the code below never probes or resolves cwd for one.
+// matching replay, so the code below never validates a new record or resolves
+// its cwd for one.
 func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) requestOutcome {
 	if ctx == nil {
 		ctx = context.Background()
@@ -63,7 +57,7 @@ func (s *Server) handleJobSubmit(ctx context.Context, raw json.RawMessage) reque
 		if err := validateNewTaskSpec(spec, input.taskSpec); err != nil {
 			return jobstore.Record{}, err
 		}
-		if err := s.ensureBackendAvailable(ctx, spec.Backend); err != nil {
+		if err := s.ensureConfiguredBackend(spec.Backend); err != nil {
 			return jobstore.Record{}, err
 		}
 		canonicalCWD, err := engine.CanonicalWorkspace(spec.CWD)
@@ -269,91 +263,13 @@ func (s *Server) closeJobStore() {
 	}
 }
 
-func (s *Server) ensureBackendAvailable(ctx context.Context, name string) error {
-	backend, ok := s.backends[name]
-	if !ok {
+// ensureConfiguredBackend deliberately does only a map lookup. Live backend
+// checks belong after the job has been durably admitted.
+func (s *Server) ensureConfiguredBackend(name string) error {
+	if _, ok := s.backends[name]; !ok {
 		return fmt.Errorf("backend %q is unavailable", name)
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	s.backendProbeMu.Lock()
-	defer s.backendProbeMu.Unlock()
-
-	cachePath, err := engine.SetupProbeCachePath(s.stateRoot)
-	if err != nil {
-		return err
-	}
-	cache, cacheErr := engine.ReadSetupProbeCache(cachePath)
-	needsProbe := cacheErr != nil || !cacheHasBackend(cache, name)
-	probed := false
-	if needsProbe {
-		if err := s.probeAndCacheBackend(ctx, name, backend, cache, cacheErr); err != nil {
-			return err
-		}
-		probed = true
-	}
-	if _, err := backend.Preflight(ctx); err != nil {
-		if probed {
-			return err
-		}
-		if err := s.probeAndCacheBackend(ctx, name, backend, cache, cacheErr); err != nil {
-			return err
-		}
-		if _, err := backend.Preflight(ctx); err != nil {
-			return err
-		}
-	}
 	return nil
-}
-
-func (s *Server) probeAndCacheBackend(ctx context.Context, name string, backend engine.Backend, cache engine.SetupProbeCache, cacheErr error) error {
-	prober, ok := backend.(backendSetupProber)
-	if !ok {
-		return nil
-	}
-	probe, err := prober.SetupProbe(ctx)
-	if err != nil {
-		return err
-	}
-	if probe.Backend == "" {
-		probe.Backend = name
-	}
-	if probe.Backend != name {
-		return fmt.Errorf("backend %q setup probe returned %q", name, probe.Backend)
-	}
-	if cacheErr != nil || cache.Version != engine.SetupProbeCacheVersion {
-		cache = engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion}
-	}
-	cache.Backends = replaceProbe(cache.Backends, probe)
-	cachePath, err := engine.SetupProbeCachePath(s.stateRoot)
-	if err != nil {
-		return err
-	}
-	return engine.WriteSetupProbeCache(cachePath, cache)
-}
-
-func cacheHasBackend(cache engine.SetupProbeCache, name string) bool {
-	if cache.Version != engine.SetupProbeCacheVersion {
-		return false
-	}
-	for _, probe := range cache.Backends {
-		if probe.Backend == name {
-			return true
-		}
-	}
-	return false
-}
-
-func replaceProbe(probes []engine.BackendSetupProbe, replacement engine.BackendSetupProbe) []engine.BackendSetupProbe {
-	result := make([]engine.BackendSetupProbe, 0, len(probes)+1)
-	for _, probe := range probes {
-		if probe.Backend != replacement.Backend {
-			result = append(result, probe)
-		}
-	}
-	return append(result, replacement)
 }
 
 func timeoutFromMillis(ms *int64) (time.Duration, *engine.TimeoutResolution, *protocol.ErrorObject) {
