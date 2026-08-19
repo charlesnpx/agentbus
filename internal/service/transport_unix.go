@@ -261,6 +261,23 @@ func isAddrInUse(err error) bool {
 	return errors.Is(err, syscall.EADDRINUSE)
 }
 
+func (s *Server) lockSocketState() (*os.File, error) {
+	file, err := os.OpenFile(filepath.Join(s.stateRoot, protocol.SocketName+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+func unlockSocketState(file *os.File) error {
+	return syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+}
+
+// listenUnixSocketPrivate is called while the state-root socket lock is held.
 func listenUnixSocketPrivate(path string) (net.Listener, socketFileIdentity, error) {
 	fd, err := openUnixSocketFD()
 	if err != nil {
@@ -275,7 +292,7 @@ func listenUnixSocketPrivate(path string) (net.Listener, socketFileIdentity, err
 	}
 	failBound := func(identity socketFileIdentity, phase string, err error) (net.Listener, socketFileIdentity, error) {
 		closeFD()
-		removeSocketPathIfIdentity(path, identity, phase)
+		removeSocketPathIfIdentityLocked(path, identity, phase)
 		return nil, socketFileIdentity{}, err
 	}
 	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
@@ -309,12 +326,12 @@ func listenUnixSocketPrivate(path string) (net.Listener, socketFileIdentity, err
 	listener, err := net.FileListener(file)
 	if err != nil {
 		_ = file.Close()
-		removeSocketPathIfIdentity(path, identity, "listener setup failure")
+		removeSocketPathIfIdentityLocked(path, identity, "listener setup failure")
 		return nil, socketFileIdentity{}, err
 	}
 	if err := file.Close(); err != nil {
 		_ = listener.Close()
-		removeSocketPathIfIdentity(path, identity, "listener setup failure")
+		removeSocketPathIfIdentityLocked(path, identity, "listener setup failure")
 		return nil, socketFileIdentity{}, err
 	}
 	return listener, identity, nil
@@ -363,10 +380,19 @@ func socketPathMatchesIdentity(path string, owned socketFileIdentity) bool {
 }
 
 func (s *Server) removeOwnedSocket(owned socketFileIdentity, phase string) {
-	removeSocketPathIfIdentity(s.socketPath, owned, phase)
+	socketLock, err := s.lockSocketState()
+	if err != nil {
+		log.Printf("agentbus daemon: lock socket removal during %s: %v", phase, err)
+		return
+	}
+	defer socketLock.Close()
+	defer func() { _ = unlockSocketState(socketLock) }()
+	removeSocketPathIfIdentityLocked(s.socketPath, owned, phase)
 }
 
-func removeSocketPathIfIdentity(path string, owned socketFileIdentity, phase string) {
+// removeSocketPathIfIdentityLocked removes a socket only while the state-root
+// socket lock is held.
+func removeSocketPathIfIdentityLocked(path string, owned socketFileIdentity, phase string) {
 	actual, err := statSocketFileIdentity(path)
 	if err != nil {
 		log.Printf("agentbus daemon: skipping socket removal during %s: cannot stat %s (%v); a replacement daemon may own the path", phase, path, err)

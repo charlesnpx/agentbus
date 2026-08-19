@@ -214,17 +214,16 @@ func TestListenRefusesConcurrentStaleSocketReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	loser := newTestServer(t, root, Config{})
+	winner := newTestServer(t, root, Config{})
 	paused := make(chan struct{})
 	release := make(chan struct{})
+	released := false
 	defer func() {
-		select {
-		case <-release:
-		default:
+		if !released {
 			close(release)
 		}
 	}()
-	loser.beforeStaleSocketRemovalHook = func() {
+	winner.beforeStaleSocketRemovalHook = func() {
 		close(paused)
 		<-release
 	}
@@ -233,49 +232,64 @@ func TestListenRefusesConcurrentStaleSocketReplacement(t *testing.T) {
 		identity socketFileIdentity
 		err      error
 	}
-	loserResult := make(chan listenResult, 1)
+	winnerResult := make(chan listenResult, 1)
 	go func() {
-		listener, identity, err := loser.listen()
-		loserResult <- listenResult{listener: listener, identity: identity, err: err}
+		listener, identity, err := winner.listen()
+		winnerResult <- listenResult{listener: listener, identity: identity, err: err}
 	}()
 	select {
 	case <-paused:
 	case <-time.After(time.Second):
-		t.Fatal("loser did not reach stale socket removal")
+		t.Fatal("winner did not reach the final stale socket removal window")
 	}
 
-	if err := os.Remove(socketPath); err != nil {
-		t.Fatal(err)
+	loser := newTestServer(t, root, Config{})
+	loserStarted := make(chan struct{})
+	loserResult := make(chan listenResult, 1)
+	go func() {
+		close(loserStarted)
+		listener, identity, err := loser.listen()
+		loserResult <- listenResult{listener: listener, identity: identity, err: err}
+	}()
+	select {
+	case <-loserStarted:
+	case <-time.After(time.Second):
+		t.Fatal("loser did not start while winner held the final removal window")
 	}
-	winner := newTestServer(t, root, Config{})
-	winnerListener, winnerIdentity, err := winner.listen()
-	if err != nil {
-		t.Fatal(err)
+	close(release)
+	released = true
+	var winnerListen listenResult
+	select {
+	case winnerListen = <-winnerResult:
+	case <-time.After(time.Second):
+		t.Fatal("winner listen did not return after stale socket removal")
+	}
+	if winnerListen.err != nil {
+		t.Fatalf("winner listen error = %v", winnerListen.err)
 	}
 	defer func() {
-		_ = winnerListener.Close()
-		winner.removeOwnedSocket(winnerIdentity, "test cleanup")
+		_ = winnerListen.listener.Close()
+		winner.removeOwnedSocket(winnerListen.identity, "test cleanup")
 	}()
 
-	close(release)
-	var result listenResult
+	var loserListen listenResult
 	select {
-	case result = <-loserResult:
+	case loserListen = <-loserResult:
 	case <-time.After(time.Second):
-		t.Fatal("loser listen did not return after replacement")
+		t.Fatal("loser listen did not return after winner bound the socket")
 	}
-	if result.listener != nil {
-		_ = result.listener.Close()
-		loser.removeOwnedSocket(result.identity, "test cleanup")
+	if loserListen.listener != nil {
+		_ = loserListen.listener.Close()
+		loser.removeOwnedSocket(loserListen.identity, "test cleanup")
 	}
-	if !errors.Is(result.err, ErrDaemonAlreadyListening) {
-		t.Fatalf("loser listen error = %v, want ErrDaemonAlreadyListening", result.err)
+	if !errors.Is(loserListen.err, ErrDaemonAlreadyListening) {
+		t.Fatalf("loser listen error = %v, want ErrDaemonAlreadyListening", loserListen.err)
 	}
 	var typed DaemonAlreadyListeningError
-	if !errors.As(result.err, &typed) || typed.SocketPath != socketPath {
-		t.Fatalf("loser listen error = %#v, want typed socket path %q", result.err, socketPath)
+	if !errors.As(loserListen.err, &typed) || typed.SocketPath != socketPath {
+		t.Fatalf("loser listen error = %#v, want typed socket path %q", loserListen.err, socketPath)
 	}
-	if !socketPathMatchesIdentity(socketPath, winnerIdentity) {
+	if !socketPathMatchesIdentity(socketPath, winnerListen.identity) {
 		t.Fatal("loser unlinked the winner socket")
 	}
 	connection, err := net.DialTimeout("unix", socketPath, time.Second)

@@ -127,7 +127,8 @@ type Server struct {
 	readyHook         func(ServeReadyInfo) error
 
 	// beforeStaleSocketRemovalHook lets the stale-replacement regression test
-	// hold the loser after its failed liveness probe and before its recheck.
+	// hold the winner in the final removal window while it holds the state-root
+	// socket lock.
 	beforeStaleSocketRemovalHook func()
 
 	clients   atomic.Int64
@@ -464,23 +465,20 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	if err := os.Chmod(filepath.Dir(s.socketPath), 0o700); err != nil {
 		return nil, socketFileIdentity{}, err
 	}
-	if observed, err := statSocketFileIdentity(s.socketPath); err == nil {
+	socketLock, err := s.lockSocketState()
+	if err != nil {
+		return nil, socketFileIdentity{}, err
+	}
+	defer socketLock.Close()
+	defer func() { _ = unlockSocketState(socketLock) }()
+
+	if _, err := os.Lstat(s.socketPath); err == nil {
 		if conn, dialErr := net.DialTimeout("unix", s.socketPath, 100*time.Millisecond); dialErr == nil {
 			_ = conn.Close()
 			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
 		}
 		if s.beforeStaleSocketRemovalHook != nil {
 			s.beforeStaleSocketRemovalHook()
-		}
-		if !socketPathMatchesIdentity(s.socketPath, observed) {
-			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
-		}
-		if conn, dialErr := net.DialTimeout("unix", s.socketPath, 100*time.Millisecond); dialErr == nil {
-			_ = conn.Close()
-			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
-		}
-		if !socketPathMatchesIdentity(s.socketPath, observed) {
-			return nil, socketFileIdentity{}, DaemonAlreadyListeningError{SocketPath: s.socketPath}
 		}
 		if err := os.Remove(s.socketPath); err != nil {
 			return nil, socketFileIdentity{}, err
@@ -509,7 +507,7 @@ func (s *Server) listen() (net.Listener, socketFileIdentity, error) {
 	}
 	if err := os.Chmod(s.socketPath, 0o600); err != nil {
 		_ = listener.Close()
-		s.removeOwnedSocket(identity, "listener setup failure")
+		removeSocketPathIfIdentityLocked(s.socketPath, identity, "listener setup failure")
 		return nil, socketFileIdentity{}, err
 	}
 	if !socketPathMatchesIdentity(s.socketPath, identity) {
