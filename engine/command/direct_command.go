@@ -110,6 +110,7 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 		startContext:     ctx,
 		startContextStop: make(chan struct{}),
 		startContextDone: make(chan struct{}),
+		cancelResultDone: make(chan struct{}),
 	}
 	running.watchStartContext(ctx)
 	return running, nil
@@ -131,7 +132,11 @@ type directRunningCommand struct {
 	startContextDone     chan struct{}
 	startContextCanceled bool
 	startContextErr      error
+	cancelResultOnce     sync.Once
+	cancelResultDone     chan struct{}
+	cancelResult         error
 	waitOnce             sync.Once
+	waitDone             chan struct{}
 	waitExit             ExitObservation
 	waitErr              error
 }
@@ -151,40 +156,68 @@ func (r *directRunningCommand) Stderr() io.ReadCloser {
 func (r *directRunningCommand) Wait(ctx context.Context) (ExitObservation, error) {
 	stopWatching := r.watchWaitContext(ctx)
 	defer stopWatching()
+	r.startWait()
+	if r.cancelResultDone == nil {
+		<-r.waitDone
+		return r.waitExit, r.waitErr
+	}
+	select {
+	case <-r.waitDone:
+		return r.waitExit, r.waitErr
+	default:
+	}
+	select {
+	case <-r.waitDone:
+		return r.waitExit, r.waitErr
+	case <-r.cancelResultDone:
+		return ExitObservation{}, r.cancelResult
+	}
+}
+
+func (r *directRunningCommand) startWait() {
 	r.waitOnce.Do(func() {
-		err := r.cmd.Wait()
-		r.stopStartContext()
-		if r.startContextCanceled {
-			if r.startContextErr != nil {
-				err = fmt.Errorf("exec: canceling Cmd: %w", r.startContextErr)
-			} else if r.startContext != nil {
-				err = r.startContext.Err()
-			}
+		if r.waitDone == nil {
+			r.waitDone = make(chan struct{})
 		}
-		if errors.Is(err, exec.ErrWaitDelay) {
-			err = nil
-		}
-		if r.stdoutDrain != nil {
-			// Stdout is the live-leader stream boundary. Once the leader has
-			// exited, descendants retaining stdout get only the runner cancel
-			// grace before the local read end is closed.
-			if !waitDirectDrain(r.stdoutDrain, r.cancelGrace) && r.stdoutPipe != nil {
-				r.closeOutputPipes()
-			}
-			<-r.stdoutDrain
-		}
-		if r.stderrDrain != nil {
-			if !waitDirectDrain(r.stderrDrain, directStderrDrainGrace) && r.stderrPipe != nil {
-				r.closeOutputPipes()
-			}
-			<-r.stderrDrain
-		}
-		r.stdout.closeWriter(nil)
-		r.stderr.closeWriter(nil)
-		r.waitExit = exitObservationForCmd(r.cmd)
-		r.waitErr = err
+		go func() {
+			r.waitForExit()
+			close(r.waitDone)
+		}()
 	})
-	return r.waitExit, r.waitErr
+}
+
+func (r *directRunningCommand) waitForExit() {
+	err := r.cmd.Wait()
+	r.stopStartContext()
+	if err == nil && r.startContextCanceled {
+		if r.startContextErr != nil {
+			err = fmt.Errorf("exec: canceling Cmd: %w", r.startContextErr)
+		} else if r.startContext != nil {
+			err = r.startContext.Err()
+		}
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		err = nil
+	}
+	if r.stdoutDrain != nil {
+		// Stdout is the live-leader stream boundary. Once the leader has
+		// exited, descendants retaining stdout get only the runner cancel
+		// grace before the local read end is closed.
+		if !waitDirectDrain(r.stdoutDrain, r.cancelGrace) && r.stdoutPipe != nil {
+			r.closeOutputPipes()
+		}
+		<-r.stdoutDrain
+	}
+	if r.stderrDrain != nil {
+		if !waitDirectDrain(r.stderrDrain, directStderrDrainGrace) && r.stderrPipe != nil {
+			r.closeOutputPipes()
+		}
+		<-r.stderrDrain
+	}
+	r.stdout.closeWriter(nil)
+	r.stderr.closeWriter(nil)
+	r.waitExit = exitObservationForCmd(r.cmd)
+	r.waitErr = err
 }
 
 func (r *directRunningCommand) watchStartContext(ctx context.Context) {
@@ -201,11 +234,27 @@ func (r *directRunningCommand) watchStartContext(ctx context.Context) {
 			r.startContextCanceled = true
 			if r.terminator != nil {
 				r.startContextErr = r.terminator.terminate()
+				r.publishCancellationResult(r.startContextErr)
 			}
 		case <-r.startContextStop:
 		}
 		close(r.startContextDone)
 	}()
+}
+
+func (r *directRunningCommand) publishCancellationResult(err error) {
+	if err == nil {
+		return
+	}
+	r.cancelResultOnce.Do(func() {
+		r.cancelResult = fmt.Errorf("exec: canceling Cmd: %w", err)
+		if r.cancelResultDone != nil {
+			close(r.cancelResultDone)
+		}
+		// An unverifiable process must not be signaled, but it still needs a
+		// waiter to reap it if it exits after its cancellation is reported.
+		r.startWait()
+	})
 }
 
 func (r *directRunningCommand) stopStartContext() {
@@ -317,7 +366,9 @@ func (t *directTerminator) terminate() error {
 	}
 	t.once.Do(func() {
 		t.err = terminateProcessGroup(t.cmd, t.processRef, t.grace)
-		t.closePipes()
+		if !errors.Is(t.err, engine.ErrProcessIdentityUnverifiable) {
+			t.closePipes()
+		}
 	})
 	return t.err
 }

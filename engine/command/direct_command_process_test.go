@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"io"
 	"os/exec"
 	"runtime"
 	"syscall"
@@ -121,11 +122,11 @@ func TestTerminateProcessGroupMissingTokenSendsNoSignal(t *testing.T) {
 	assertProcessRunning(t, cmd.Process.Pid)
 }
 
-func TestDirectCommandRunnerCanceledWithMissingTokenLeavesProcessAliveAfterWaitDelay(t *testing.T) {
+func TestDirectCommandRunnerCanceledWithMissingTokenReturnsPromptlyAndLeavesProcessAlive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	running, err := (DirectCommandRunner{CancelGrace: 10 * time.Millisecond}).Start(ctx, ExecSpec{
-		Argv: []string{"/bin/sh", "-c", "trap '' TERM; while :; do :; done"},
+		Argv: []string{"/bin/sh", "-c", "read line"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -135,39 +136,163 @@ func TestDirectCommandRunnerCanceledWithMissingTokenLeavesProcessAliveAfterWaitD
 		t.Fatalf("running command type = %T, want *directRunningCommand", running)
 	}
 	t.Cleanup(func() {
+		_, _ = command.Stdin().Write([]byte("done\n"))
 		_ = command.Stdin().Close()
 		_ = command.Stdout().Close()
 		_ = command.Stderr().Close()
-		if command.cmd.ProcessState == nil {
-			_ = command.cmd.Process.Kill()
+		select {
+		case <-command.waitDone:
+		case <-time.After(time.Second):
+			t.Error("asynchronous reaper did not reap process")
 		}
-		_, _ = command.Wait(context.Background())
 	})
 
 	ref := command.terminator.capturedProcessRef()
 	ref.StartTime = ""
 	setTerminatorProcessRef(command.terminator, ref)
 
-	original := terminateProcessGroup
-	terminated := make(chan struct{})
-	terminateProcessGroup = func(cmd *exec.Cmd, ref engine.ProcessRef, grace time.Duration) error {
-		err := original(cmd, ref, grace)
-		close(terminated)
-		return err
+	cancel()
+	waitDone := make(chan error, 1)
+	go func() {
+		_, err := command.Wait(context.Background())
+		waitDone <- err
+	}()
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, engine.ErrProcessIdentityUnverifiable) {
+			t.Fatalf("Wait() error = %v, want ErrProcessIdentityUnverifiable", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Wait blocked after cancellation identity rejection")
 	}
-	t.Cleanup(func() { terminateProcessGroup = original })
+	assertProcessRunning(t, command.cmd.Process.Pid)
+}
+
+func TestDirectCommandRunnerCanceledWithMismatchedTokenKeepsWritingProcessAlive(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("process-group fixtures require a native Linux or Darwin start token")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	running, err := (DirectCommandRunner{CancelGrace: 10 * time.Millisecond}).Start(ctx, ExecSpec{
+		Argv: []string{"/usr/bin/yes"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, ok := running.(*directRunningCommand)
+	if !ok {
+		t.Fatalf("running command type = %T, want *directRunningCommand", running)
+	}
+	capturedRef := command.terminator.capturedProcessRef()
+	requireStartToken(t, capturedRef)
+	t.Cleanup(func() { stopDirectRunningCommand(t, command, capturedRef) })
+
+	outputDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := command.Stdout().Read(buf)
+		outputDone <- err
+	}()
+	select {
+	case err := <-outputDone:
+		if err != nil {
+			t.Fatalf("initial stdout read error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("writing process produced no stdout")
+	}
+
+	mismatchedRef := capturedRef
+	mismatchedRef.StartTime += "-wrong"
+	setTerminatorProcessRef(command.terminator, mismatchedRef)
+	cancel()
+	waitDone := make(chan error, 1)
+	go func() {
+		_, err := command.Wait(context.Background())
+		waitDone <- err
+	}()
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, engine.ErrProcessIdentityUnverifiable) {
+			t.Fatalf("Wait() error = %v, want ErrProcessIdentityUnverifiable", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Wait blocked after cancellation identity rejection")
+	}
+
+	select {
+	case <-time.After(100 * time.Millisecond):
+		assertProcessRunning(t, command.cmd.Process.Pid)
+	}
+}
+
+func TestDirectCommandRunnerKilledCancellationRetainsExecutionFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	running, err := (DirectCommandRunner{CancelGrace: 10 * time.Millisecond}).Start(ctx, ExecSpec{
+		Argv: []string{"/bin/sh", "-c", "trap '' TERM; printf 'ready\\n'; while :; do :; done"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, ok := running.(*directRunningCommand)
+	if !ok {
+		t.Fatalf("running command type = %T, want *directRunningCommand", running)
+	}
+	capturedRef := command.terminator.capturedProcessRef()
+	requireStartToken(t, capturedRef)
+	t.Cleanup(func() { stopDirectRunningCommand(t, command, capturedRef) })
+
+	ready := make(chan []byte, 1)
+	readyErr := make(chan error, 1)
+	go func() {
+		output, err := io.ReadAll(io.LimitReader(command.Stdout(), int64(len("ready\n"))))
+		if err != nil {
+			readyErr <- err
+			return
+		}
+		ready <- output
+	}()
+	select {
+	case err := <-readyErr:
+		t.Fatalf("ready read error = %v", err)
+	case output := <-ready:
+		if string(output) != "ready\n" {
+			t.Fatalf("ready output = %q, want ready", output)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("TERM-ignoring process did not become ready")
+	}
 
 	cancel()
+	type waitResult struct {
+		exit ExitObservation
+		err  error
+	}
+	done := make(chan waitResult, 1)
+	go func() {
+		exit, err := command.Wait(context.Background())
+		done <- waitResult{exit: exit, err: err}
+	}()
+	var result waitResult
 	select {
-	case <-terminated:
+	case result = <-done:
 	case <-time.After(time.Second):
-		t.Fatal("context cancellation did not reach the terminator")
+		t.Fatal("Wait blocked after KILL escalation")
 	}
 
-	timer := time.NewTimer(directCommandWaitDelay + 25*time.Millisecond)
-	defer timer.Stop()
-	<-timer.C
-	assertProcessRunning(t, command.cmd.Process.Pid)
+	observation := FinalObservation{Exit: result.exit, ExecutionErr: result.err}
+	if observation.Exit.Signal != syscall.SIGKILL.String() {
+		t.Fatalf("observation exit signal = %q, want %q", observation.Exit.Signal, syscall.SIGKILL.String())
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(observation.ExecutionErr, &exitErr) {
+		t.Fatalf("observation execution error = %v, want *exec.ExitError", observation.ExecutionErr)
+	}
+	if errors.Is(observation.ExecutionErr, context.Canceled) {
+		t.Fatalf("observation execution error = %v, must retain execution failure instead of context.Canceled", observation.ExecutionErr)
+	}
 }
 
 func TestTerminateProcessGroupAlreadyExitedReturnsPromptly(t *testing.T) {
@@ -355,5 +480,31 @@ func stopTerminationTestProcess(t *testing.T, cmd *exec.Cmd) {
 	_ = cmd.Process.Kill()
 	if err := cmd.Wait(); err != nil && cmd.ProcessState == nil {
 		t.Errorf("cleanup Wait() error = %v", err)
+	}
+}
+
+func stopDirectRunningCommand(t *testing.T, command *directRunningCommand, ref engine.ProcessRef) {
+	t.Helper()
+	if command == nil || command.cmd == nil {
+		return
+	}
+	command.startWait()
+	terminator := &directTerminator{cmd: command.cmd, grace: 10 * time.Millisecond, processRef: ref}
+	if err := terminator.terminate(); err != nil && !errors.Is(err, engine.ErrProcessIdentityUnverifiable) {
+		t.Errorf("cleanup terminate() error = %v", err)
+	}
+	if command.stdin != nil {
+		_ = command.stdin.Close()
+	}
+	if command.stdout != nil {
+		_ = command.stdout.Close()
+	}
+	if command.stderr != nil {
+		_ = command.stderr.Close()
+	}
+	select {
+	case <-command.waitDone:
+	case <-time.After(time.Second):
+		t.Error("asynchronous reaper did not reap process")
 	}
 }
