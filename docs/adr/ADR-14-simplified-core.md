@@ -74,26 +74,28 @@ job.submit:
         "model": "string",
         "effort": "string",
         "prompt": "string",
-        "jsonSchema": {},
+        "outputSchema": {},
         "tags": {"string": "string"},
         "timeoutMs": 1800000
       }
     }
 
 backend, cwd, write, and prompt are required TaskSpec fields. model, effort,
-jsonSchema, tags, and timeoutMs are optional. jsonSchema, if present, is exactly
-one inline Draft 2020-12 JSON Schema value, either an object or a boolean. It is
-not a name, registry key, or caller-supplied correction program.
+outputSchema, tags, and timeoutMs are optional. outputSchema, if present, is
+exactly one inline Draft 2020-12 JSON Schema value, either an object or a
+boolean. It is not a name, registry key, or caller-supplied correction program.
 
     result
     {
       "jobId": "string",
-      "state": "queued",
-      "deduplicated": false
+      "state": "queued|running|completed|failed|canceled|unknown",
+      "deduplicated": "false|true"
     }
 
 state is the current public projection. deduplicated is always present. A new
-job returns false; a matching replay returns true with the existing job state.
+admission returns the queued snapshot with deduplicated false; a matching replay
+returns the existing job's current state, including a terminal state, with
+deduplicated true.
 
 job.get with a jobId returns this full JobRecord:
 
@@ -106,15 +108,22 @@ job.get with a jobId returns this full JobRecord:
       "workspaceKey": "string",
       "requestId": "string",
       "backend": "string",
-      "model": "string",
       "state": "queued|running|completed|failed|canceled|unknown",
-      "cleanup": "clean|uncertain",
+      "tags": {"string": "string"},
       "createdAt": "RFC3339 UTC timestamp",
       "startedAt": "RFC3339 UTC timestamp",
       "finishedAt": "RFC3339 UTC timestamp",
-      "failureClass": "backend_unavailable|provider_overloaded|model_unavailable|content_policy|authentication|backend_error|timeout|interrupted|internal",
-      "failureReason": "string",
-      "diagnostics": ["string"],
+      "timeout": {
+        "requested": 1800000,
+        "effective": 1800000,
+        "source": "client|daemon_default"
+      },
+      "result": {
+        "text": "string",
+        "resultPath": "string",
+        "sha256": "sha256:lowercase-hex",
+        "bytes": 123
+      },
       "contract": {
         "schemaSha256": "sha256:lowercase-hex",
         "evaluated": true,
@@ -122,17 +131,29 @@ job.get with a jobId returns this full JobRecord:
         "attempts": 1,
         "violations": ["string"]
       },
-      "resultText": "string"
+      "failure": {
+        "class": "backend_unavailable|provider_overloaded|model_unavailable|content_policy|authentication|backend_error|timeout|interrupted|internal",
+        "reason": "string"
+      },
+      "cleanup": "clean|uncertain",
+      "logPaths": {
+        "stdout": "string",
+        "stderr": "string"
+      },
+      "modelReported": "string"
     }
 
 JobRecord requires jobId, workspaceKey, requestId, backend, state, cleanup,
-createdAt, diagnostics, and contract. model, startedAt, finishedAt,
-failureClass, failureReason, and resultText are optional. resultText exists only
-for an authoritative terminal result. failureClass and failureReason exist only
-for failed jobs. schemaSha256 exists only when a schema was submitted.
-ContractResult is exactly the object named contract: without a schema evaluated
-is false, compliant is not meaningful, attempts is zero, and violations is an
-empty array.
+createdAt, and timeout. timeout always contains effective and source; requested
+is absent unless taskSpec.timeoutMs was supplied. tags, startedAt, finishedAt,
+and modelReported are optional. result, contract, failure, and logPaths are
+pointer-valued groups and are absent when they do not apply. result exists only
+for an authoritative terminal result. In a present result, text is optional;
+resultPath, sha256, and bytes are required, retaining inline text or an
+authoritative path with its digest and byte count. A present failure has class
+and reason and exists only for failed jobs. contract exists only when
+outputSchema was submitted. ContractResult is exactly the object named contract;
+schemaSha256 exists only when a schema was submitted.
 
 job.get with an empty object returns compact summaries:
 
@@ -145,28 +166,25 @@ job.get with an empty object returns compact summaries:
         {
           "jobId": "string",
           "backend": "string",
-          "model": "string",
+          "modelReported": "string",
           "state": "queued|running|completed|failed|canceled|unknown",
           "cleanup": "clean|uncertain",
           "createdAt": "RFC3339 UTC timestamp",
           "updatedAt": "RFC3339 UTC timestamp",
           "failureClass": "backend_unavailable|provider_overloaded|model_unavailable|content_policy|authentication|backend_error|timeout|interrupted|internal",
-          "diagnostics": ["string"],
           "contract": {
-            "schemaSha256": "sha256:lowercase-hex",
             "evaluated": true,
-            "compliant": true,
-            "attempts": 1,
-            "violations": ["string"]
+            "compliant": true
           }
         }
       ]
     }
 
-Each JobSummary requires jobId, backend, state, cleanup, createdAt, updatedAt,
-diagnostics, and contract. model and failureClass are optional. A summary never
-contains workspaceKey, requestId, failureReason, resultText, prompt, cwd, or a
-process claim.
+Each JobSummary requires jobId, backend, state, cleanup, createdAt, and
+updatedAt. modelReported, failureClass, and the compact contract verdict are
+optional. If present, contract contains only evaluated and compliant. A summary
+never contains workspaceKey, requestId, tags, timeout, result, failure reason,
+logPaths, prompt, cwd, or a process claim.
 
 job.cancel:
 
@@ -191,12 +209,11 @@ identity preparation.
 
 status and result MUST project the same job.get response differently. status
 uses JobSummary for a list or JobRecord for one job, shows lifecycle, cleanup,
-contract verdict, failure class, and diagnostics, and MUST NEVER print
-resultText. result fetches the same JobRecord, writes authoritative terminal
-resultText to standard output, and writes diagnostics to standard error. A
+contract verdict, and failure class, and MUST NEVER print the result text.
+result fetches the same JobRecord, writes authoritative terminal result text to
+standard output, and writes the applicable failure reason to standard error. A
 successful result is therefore pipeable. If no authoritative terminal result
-exists, result writes no result text and reports the diagnostic on standard
-error.
+exists, result writes no result text and reports why on standard error.
 
 cancel invokes job.cancel. version reports application version 0.13.0 and
 protocol version 3. serve owns daemon startup only. setup, validate, every
@@ -205,8 +222,8 @@ admission subcommand, and every internal-* subcommand are deleted.
 ### One state vocabulary
 
 The public state set is exactly queued, running, completed, failed, canceled,
-and unknown. starting is a private persisted launch marker. It MUST project as
-running and MUST NOT appear in a protocol or CLI response.
+and unknown. starting and retrying are private persisted launch markers. Each
+MUST project as running and MUST NOT appear in a protocol or CLI response.
 
 This table maps the current thirteen labels to version-3 public vocabulary for
 review only. It is not a database migration and MUST NOT be implemented as one.
@@ -214,9 +231,9 @@ review only. It is not a database migration and MUST NOT be implemented as one.
 | Current label | Version-3 projection | Required interpretation |
 | --- | --- | --- |
 | queued | queued | Awaiting launch. |
-| starting | running | Retained only as the private durable no-relaunch marker. |
+| starting | running | Private durable no-relaunch marker for the initial turn. |
 | running | running | Active work. |
-| retrying | running | A bounded correction is work, not a public state. |
+| retrying | running | Private durable no-relaunch marker for the correction turn. |
 | completed | completed | Terminal completion. |
 | completed_noncompliant | completed | ContractResult is evaluated and not compliant. |
 | failed | failed | FailureClass supplies the cause. |
@@ -238,8 +255,8 @@ Cleanup is an axis orthogonal to state. Its only values are clean and uncertain.
 clean means Agentbus has no recorded cleanup uncertainty; it does not claim that
 a nonterminal job has no live process. uncertain means cleanup could not be
 established under the process-claim rule. A completed job MAY be completed plus
-uncertain and MUST retain resultText and ContractResult. Cleanup uncertainty MUST
-NOT rewrite a known result or state to unknown.
+uncertain and MUST retain ResultInfo and any applicable ContractResult. Cleanup
+uncertainty MUST NOT rewrite a known result or state to unknown.
 
 ### Failure classes
 
@@ -278,7 +295,8 @@ Agentbus appends the canonical submitted schema and bounded validation violation
 after that immutable text. The caller cannot replace, template, or extend it. A
 correction therefore has no authority to continue task work.
 
-ContractResult is recorded for every job as:
+When outputSchema is present, ContractResult is recorded in the optional
+contract group as:
 
     ContractResult{
       schemaSha256,
@@ -289,11 +307,11 @@ ContractResult is recorded for every job as:
     }
 
 schemaSha256 is the sha256 digest of the canonical inline schema. attempts is
-zero without a schema, one after initial evaluation, and two only when the one
-correction attempt was made. A successful correction becomes authoritative
-resultText and records compliant true. A failed correction MUST preserve the
-original resultText, record compliant false with its violations, and MUST NOT
-replace completed with failed merely because correction failed.
+one after initial evaluation, and two only when the one correction attempt was
+made. A successful correction becomes the authoritative final result and records
+compliant true. A failed correction MUST preserve the original final result,
+record compliant false with its violations, and MUST NOT replace completed with
+failed merely because correction failed.
 
 Named contracts, PolicyRegistry, shape contracts, client-supplied retry
 templates, ContractStatus, and the skipped-reason vocabulary are deleted. There
@@ -305,9 +323,8 @@ The public compound identity (workspaceKey, requestId) is retained. Submission
 MUST use this order:
 
 1. Validate only workspaceKey and requestId syntax.
-2. Canonically serialize and hash the complete TaskSpec without touching the
-   filesystem. cwd is bytes at this point; it is not resolved, statted, or
-   canonicalized.
+2. Canonically serialize and hash the complete TaskSpec as specified below,
+   without touching the filesystem.
 3. Look up the compound key in requests.
 4. If a binding has the same TaskSpec hash, return its job with deduplicated
    true.
@@ -321,6 +338,24 @@ A same-hash replay does not inspect present backend availability or filesystem
 state. It succeeds even if cwd has been deleted or changed. A different hash is
 a conflict before backend or cwd validation.
 
+The TaskSpec hash is SHA-256 over the UTF-8 bytes of the RFC 8785 JSON
+Canonicalization Scheme (JCS) representation of the submitted TaskSpec. Its
+input contains exactly the required fields backend, cwd, write, and prompt, plus
+each supplied optional field among model, effort, outputSchema, tags, and
+timeoutMs. It contains no derived value, default, workspaceKey, requestId, or
+filesystem observation. cwd is the submitted string bytes; it is not resolved,
+statted, or path-canonicalized.
+
+An absent optional field is omitted from the canonical object; a present field
+remains present even when its legal value is empty, including model: "", tags:
+{}, an empty outputSchema object, or timeoutMs: 0. null is not a legal
+substitute for absence. JCS sorts object members, preserves array order,
+canonicalizes numbers and JSON string escaping, and performs no Unicode
+normalization. Before hashing, the raw submitted outputSchema bytes MUST parse
+as exactly one JSON value with duplicate object member names rejected, then be
+rendered as that value by JCS; its original member order and insignificant
+whitespace do not affect the hash.
+
 There are no tombstones, request expiry, fingerprint-version negotiation,
 binding index, job-metadata garbage collection, or migrations. The requests
 binding lives for the version-3 store lifetime. Artifact garbage collection may
@@ -329,26 +364,36 @@ bindings, identity hashes, terminal metadata, or ContractResult.
 
 ### Crash safety and no relaunch
 
-The launch ordering is normative:
+Agentbus permits at most one initial process turn and, when required, at most
+one correction process turn per job. The retained adapter tree remains
+unchanged and continues to supervise one process per turn. The launch ordering
+is normative for both turns:
 
-1. Commit the job as private starting durably.
+1. Commit the job as private starting durably for the initial turn, or as
+   private retrying durably for the correction turn.
 2. If that commit did not cleanly succeed, DO NOT SPAWN.
 3. Fork and exec the backend into a new process group.
 4. In a separate transaction, record the process claim
    {pid, pgid, startToken}.
 
-The claim transaction MUST be separate from the starting transaction. It may
-fail after exec; that failure never licenses a second spawn.
+The claim transaction MUST be separate from the durable turn-state transaction.
+It may fail after exec; that failure never licenses a second spawn for that
+turn. The initial process MUST have retired before Agentbus records the
+correction claim that replaces the initial claim. Neither turn is ever
+relaunched after a durable turn-state commit whose exec outcome is unknown.
 
 On daemon restart, Agentbus MUST relaunch nothing. It terminalizes a recovered
 queued job as failed with FailureClass internal. It terminalizes a recovered
-starting or running job as unknown. It preserves every terminal record.
+starting, retrying, or running job as unknown. It preserves every terminal
+record.
 Recovery and the orphan reaper run before new work is accepted.
 
-This design CAN guarantee that a daemon never launches one job twice. It CANNOT
-distinguish a job never spawned from one spawned and lost between the durable
-starting write and exec. A false unknown is possible and accepted. It CANNOT
-reap a process that died between exec and the separate claim write.
+This design CAN guarantee at most one initial launch and at most one correction
+launch per job, and can guarantee that neither turn is relaunched. It CANNOT
+distinguish a permitted initial or correction turn never spawned from one
+spawned and lost between its durable turn-state write and exec. A false unknown
+is possible and accepted. It CANNOT reap a process that died between exec and
+the separate claim write.
 
 The accepted cost is direct: after daemon restart, a provider CLI from the
 previous incarnation may still run. The orphan reaper reduces but does not
@@ -356,7 +401,7 @@ eliminate that risk.
 
 ### Orphan reaper
 
-At restart, Agentbus snapshots each recovered starting or running job before
+At restart, Agentbus snapshots each recovered starting, retrying, or running job before
 terminalizing its public projection. For each such job with a claim, it reads
 the live process start token and compares it for exact equality with startToken.
 It signals the recorded process group only on exact equality.
@@ -436,7 +481,7 @@ delete an old root.
 | cgroup subsystem | Delete it; it is not an optional enhancement. | Plain process-group supervision and token-equality reaping. |
 | PolicyRegistry, named/shape contracts, retry templates, policy methods | Delete them. | One inline JSON Schema and one fixed correction attempt. |
 | engine/store.go workspace-store implementation | Delete it. | Single bbolt meta/requests/jobs store; no job-metadata GC. |
-| Parallel engine.JobState, model Outcome, and model PublicState vocabularies | Delete them together. | Six public states plus private starting. |
+| Parallel engine.JobState, model Outcome, and model PublicState vocabularies | Delete them together. | Six public states plus private starting and retrying markers. |
 | LateFinalization and orphaned/reaped re-entry | Delete them. | First-terminal-wins. |
 | engine/adapter tree and engine/command | Retain unchanged. | Convo Relay dependency remains supported. |
 | Provider sandbox policy, per-job write cache, private CODEX_HOME | Retain unchanged. | Delegate is deleting duplicate copies, not protections. |
@@ -448,7 +493,8 @@ delete an old root.
   authority.
 - Identified replay compares canonical TaskSpec hash before filesystem or backend
   validation.
-- A daemon never launches one job twice and never relaunches on restart.
+- A job has at most one initial launch and at most one correction launch; neither
+  turn is relaunched on restart or after an unknown exec outcome.
 - A recorded terminal state is immutable.
 - Cleanup uncertainty cannot erase an authoritative result.
 - Restart reaping signals only exact start-token equality.
@@ -462,7 +508,7 @@ delete an old root.
 - Retaining parked workers or a release/ack protocol.
 - Retaining a durable authority, anchor, safety latch, proof vocabulary, or
   binding index behind a simpler protocol.
-- Relaunching queued, starting, or running jobs on restart.
+- Relaunching queued, starting, retrying, or running jobs on restart.
 - Signaling on a missing, unreadable, or unequal start token.
 - Letting a late result overwrite terminal state.
 - Retaining named contracts, a registry, caller correction templates, or more
@@ -471,10 +517,11 @@ delete an old root.
 
 ## Consequences
 
-Each identified job has one small durable lifetime. Agentbus remains safe against
-daemon-initiated duplicate launch while expressly accepting false unknown states
-and possibly leftover provider CLIs after a crash. That loss is visible rather
-than hidden behind custody proof machinery.
+Each identified job has one small durable lifetime with at most one initial turn
+and one correction turn. Agentbus remains safe against daemon-initiated duplicate
+launch of either turn while expressly accepting false unknown states and possibly
+leftover provider CLIs after a crash. That loss is visible rather than hidden
+behind custody proof machinery.
 
 Later deletion can remove authority, custody, cgroup, policy, legacy store, and
 parallel-state code against this ADR. Convo Relay adapters, command execution,
@@ -489,3 +536,19 @@ policy, per-job write cache, private CODEX_HOME, or underlying provider
 failure-classification logic. It does not provide protocol-v2 compatibility,
 state-root migration, cgroup retention, or a stronger daemon-restart cleanup
 guarantee than exact-token process-group signaling supports.
+
+## Amendments
+
+After ADR-14 was first written, its wire examples were corrected against the
+authoritative specification. TaskSpec uses outputSchema, and JobRecord preserves
+the required nested, operator-visible fields while the empty-object job.get
+listing remains compact. These corrections remove shape drift without changing
+the collapse's semantics.
+
+The amended launch invariant distinguishes the one initial turn from the one
+permitted correction turn, applies durable state-before-spawn and separate claims
+to both, and preserves the unchanged one-process-per-turn adapter surface. The
+job.submit result now admits every public replay state, the replay hash fixes its
+TaskSpec inputs and canonical form, and the ADR index names ADR-14 as the sole
+normative contract. These corrections remove contradictory review targets without
+changing the collapse's retained boundaries.
