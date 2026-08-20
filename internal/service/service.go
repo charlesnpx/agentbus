@@ -141,6 +141,15 @@ type Server struct {
 	jobStoreMu sync.Mutex
 	jobStore   *jobstore.Store
 
+	// processTable and processGroups are the service's restart-recovery
+	// dependencies. They deliberately live here instead of in jobstore: the
+	// store owns durable records, while service owns the only process action
+	// taken from a recovered claim. Tests replace them with deterministic
+	// fakes; production uses the native implementations below.
+	processTable      engine.ProcessTable
+	processGroups     engine.ProcessGroupSignaler
+	processGroupGrace time.Duration
+
 	executionMu     sync.Mutex
 	executionCtx    context.Context
 	executionCancel context.CancelFunc
@@ -220,6 +229,9 @@ func New(cfg Config) (*Server, error) {
 		codexHomeInherit:  cfg.CodexHomeInherit,
 		codexAuthHome:     cfg.CodexAuthHome,
 		managedCodexHomes: make(map[string]*managedCodexHome),
+		processTable:      engine.NativeProcessTable{},
+		processGroups:     engine.NativeProcessGroupSignaler{},
+		processGroupGrace: engine.DefaultCancelGrace,
 		idleTimeout:       idleTimeout,
 		idleCheckInterval: idleCheckInterval,
 		shutdownTimeout:   normalizeShutdownTimeout(cfg.ShutdownTimeout),
@@ -283,7 +295,7 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	if startupCtx == nil {
 		startupCtx = ctx
 	}
-	_, err := s.ensureJobStore()
+	store, err := s.ensureJobStore()
 	if err != nil {
 		return err
 	}
@@ -291,6 +303,9 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	// Startup sweeping is deliberately absent: SIGKILL-orphaned leaves under
 	// the Codex layout are a known residual, and removing them is an operator
 	// action rather than a daemon guess.
+	if err := s.reconcileRecoveredJobs(store); err != nil {
+		return err
+	}
 	if err := s.captureBinaryIdentity(); err != nil {
 		return err
 	}

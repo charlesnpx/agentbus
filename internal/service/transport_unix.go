@@ -126,6 +126,10 @@ func (s *Server) handle(connection *connection, request protocol.Request) reques
 		return s.handleHello(connection, request.Params)
 	case protocol.MethodJobSubmit:
 		return s.handleJobSubmit(request.Params)
+	case protocol.MethodJobGet:
+		return s.handleJobGet(request.Params)
+	case protocol.MethodJobCancel:
+		return s.handleJobCancel(request.Params)
 	default:
 		return requestOutcome{err: protocol.NewError(protocol.ErrorMethodNotFoundV3, "method not found", protocol.ErrorData{})}
 	}

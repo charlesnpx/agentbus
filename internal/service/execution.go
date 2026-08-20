@@ -27,14 +27,20 @@ type activeExecution struct {
 	jobID   string
 	backend engine.Backend
 
-	mu             sync.Mutex
-	cancel         context.CancelFunc
-	session        engine.Session
-	claimAttempted bool
-	claimRecorded  bool
-	claimErr       error
-	interruptOnce  sync.Once
-	interruptErr   error
+	// launchMu linearizes a cancellation request with the two calls that may
+	// cross a process-launch boundary. A request that acquires it first keeps a
+	// queued/starting job from subsequently reaching Backend.Start or
+	// Session.Turn before its durable cancellation is committed.
+	launchMu        sync.Mutex
+	mu              sync.Mutex
+	cancel          context.CancelFunc
+	session         engine.Session
+	cancelRequested bool
+	claimAttempted  bool
+	claimRecorded   bool
+	claimErr        error
+	interruptOnce   sync.Once
+	interruptErr    error
 }
 
 func newActiveExecution(jobID string, backend engine.Backend) *activeExecution {
@@ -53,6 +59,78 @@ func (run *activeExecution) setSession(session engine.Session) {
 	run.mu.Unlock()
 }
 
+func (run *activeExecution) cancellationRequested() bool {
+	if run == nil {
+		return false
+	}
+	run.mu.Lock()
+	requested := run.cancelRequested
+	run.mu.Unlock()
+	return requested
+}
+
+// requestCancellation prevents a future launch before returning. If a session
+// already exists, it also invokes its retained, identity-fenced interrupt
+// path. The caller still has to persist MarkTerminal: this flag is only the
+// short in-process gate that closes the launch/cancel race.
+func (run *activeExecution) requestCancellation() (sessionPresent bool, err error) {
+	if run == nil {
+		return false, nil
+	}
+	run.launchMu.Lock()
+	run.mu.Lock()
+	run.cancelRequested = true
+	cancel := run.cancel
+	sessionPresent = run.session != nil
+	run.mu.Unlock()
+	run.launchMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if !sessionPresent {
+		return false, nil
+	}
+	return true, run.interrupt()
+}
+
+// startSession serializes Backend.Start with requestCancellation. It reports a
+// pending cancellation separately so runJob never converts that request into
+// a competing interrupted/failed terminal record.
+func (run *activeExecution) startSession(ctx context.Context, opts engine.SessionOpts) (engine.Session, error, bool) {
+	run.launchMu.Lock()
+	if run.cancellationRequested() {
+		run.launchMu.Unlock()
+		return nil, context.Canceled, true
+	}
+	session, err := run.backend.Start(ctx, opts)
+	if session != nil {
+		run.setSession(session)
+	}
+	canceled := run.cancellationRequested()
+	run.launchMu.Unlock()
+	if canceled && session != nil {
+		_ = run.interrupt()
+	}
+	return session, err, canceled
+}
+
+// startTurn applies the same launch gate to Session.Turn, which is where the
+// retained adapters fork and exec their provider process groups.
+func (run *activeExecution) startTurn(session engine.Session, ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error, bool) {
+	run.launchMu.Lock()
+	if run.cancellationRequested() {
+		run.launchMu.Unlock()
+		return nil, context.Canceled, true
+	}
+	events, err := session.Turn(ctx, input)
+	canceled := run.cancellationRequested()
+	run.launchMu.Unlock()
+	if canceled {
+		_ = run.interrupt()
+	}
+	return events, err, canceled
+}
+
 // beginTurn resets process-claim tracking only after the preceding turn has
 // retired. Each retained adapter turn owns exactly one process and therefore
 // has exactly one separate durable claim transaction.
@@ -65,13 +143,16 @@ func (run *activeExecution) beginTurn() {
 }
 
 func (run *activeExecution) interrupt() error {
+	run.mu.Lock()
+	session := run.session
+	run.mu.Unlock()
+	if session == nil {
+		// Do not consume interruptOnce before Start publishes a session. A
+		// cancel may arrive in that short interval, and the later session must
+		// still receive the fenced interruption.
+		return nil
+	}
 	run.interruptOnce.Do(func() {
-		run.mu.Lock()
-		session := run.session
-		run.mu.Unlock()
-		if session == nil {
-			return
-		}
 		// A canceled job context cannot carry the containment request. The
 		// session's retained direct runner applies its own TERM/KILL grace.
 		interruptCtx, cancel := context.WithTimeout(context.Background(), 2*engine.DefaultCancelGrace)
@@ -246,6 +327,9 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	}
 	run.setCancel(cancel)
 	defer cancel()
+	if run.cancellationRequested() {
+		return
+	}
 
 	// This durable transaction is intentionally separate from the later claim
 	// transaction in activeExecution.recordProcessClaim.
@@ -259,6 +343,9 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		return
 	}
 	record = started
+	if run.cancellationRequested() {
+		return
+	}
 
 	if strings.TrimSpace(record.Artifacts.Log) == "" {
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, errors.New("job log artifact path is missing"), nil)
@@ -317,7 +404,10 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			}
 		}
 	}
-	session, err := run.backend.Start(jobCtx, opts)
+	session, err, canceled := run.startSession(jobCtx, opts)
+	if canceled {
+		return
+	}
 	if err != nil {
 		s.finishStartError(store, record, jobCtx, err)
 		return
@@ -326,16 +416,17 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, errors.New("backend returned a nil session"), nil)
 		return
 	}
-	run.setSession(session)
-
 	if err := jobCtx.Err(); err != nil {
+		if run.cancellationRequested() {
+			return
+		}
 		cleanup, diagnostics := cleanupAfterContextStop(run, err)
 		s.finishContextStop(store, record, err, cleanup, diagnostics)
 		return
 	}
 
 	run.beginTurn()
-	events, err := session.Turn(jobCtx, engine.TurnInput{
+	events, err, canceled := run.startTurn(session, jobCtx, engine.TurnInput{
 		Prompt:   spec.Prompt,
 		Write:    spec.Write,
 		Timeout:  timeout,
@@ -344,6 +435,9 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			run.recordProcessClaim(store, ref)
 		},
 	})
+	if canceled {
+		return
+	}
 	if err != nil {
 		cleanup, diagnostics := cleanupAfterContextStop(run, jobCtx.Err())
 		if cleanup == protocol.CleanupClean {
@@ -355,6 +449,9 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 
 	outcome := collectTurn(jobCtx, run, events)
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
+	if run.cancellationRequested() {
+		return
+	}
 
 	if errors.Is(outcome.err, context.DeadlineExceeded) || outcome.timedOut {
 		s.recordExecutionFailure(store, record, outcome.cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, outcome.diagnostics)
@@ -464,7 +561,7 @@ func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Rec
 // initial turn has retired.
 func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, logPaths engine.LogPaths, prompt string) turnOutcome {
 	run.beginTurn()
-	events, err := session.Turn(ctx, engine.TurnInput{
+	events, err, canceled := run.startTurn(session, ctx, engine.TurnInput{
 		Prompt:   prompt,
 		Write:    false,
 		Timeout:  timeout,
@@ -473,6 +570,9 @@ func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record
 			run.recordProcessClaim(store, ref)
 		},
 	})
+	if canceled {
+		return turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean}
+	}
 	if err != nil {
 		cleanup, diagnostics := cleanupAfterContextStop(run, ctx.Err())
 		if cleanup == protocol.CleanupClean {
@@ -706,6 +806,12 @@ func (s *Server) recordExecutionFailure(store *jobstore.Store, record jobstore.R
 }
 
 func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobstore.TerminalUpdate) {
+	// job.cancel has already reserved this active execution and will commit a
+	// canceled first terminal itself. Do not let an asynchronously drained
+	// backend stream race it with an interrupted, failed, or completed record.
+	if s.cancellationPending(jobID) {
+		return
+	}
 	if home := s.takeManagedCodexHome(jobID); home != nil {
 		current, getErr := store.Get(jobID)
 		if getErr != nil {
