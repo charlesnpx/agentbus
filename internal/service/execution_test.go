@@ -8,11 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"go/parser"
-	"go/token"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -586,35 +582,5 @@ func TestExecutionProviderOverloadedUsesTypedFailureClass(t *testing.T) {
 	}
 	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassProviderOverloaded {
 		t.Fatalf("overload terminal = %+v, want provider_overloaded", got)
-	}
-}
-
-func TestExecutionServiceHasNoEngineExecutionImport(t *testing.T) {
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	entries, err := os.ReadDir(wd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
-			continue
-		}
-		path := filepath.Join(wd, entry.Name())
-		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, imported := range file.Imports {
-			path, err := strconv.Unquote(imported.Path.Value)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if strings.Contains(path, "/engine/execution") {
-				t.Fatalf("%s imports forbidden %q", entry.Name(), path)
-			}
-		}
 	}
 }

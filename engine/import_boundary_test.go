@@ -11,17 +11,12 @@ import (
 	"testing"
 )
 
-func TestEngineDoesNotImportDaemonInternals(t *testing.T) {
+func TestEngineDoesNotImportModuleInternals(t *testing.T) {
 	_, guardFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
-	forbidden := []string{
-		"github.com/charlesnpx/agentbus/internal/service",
-		"github.com/charlesnpx/agentbus/internal/jobstore",
-		"github.com/charlesnpx/agentbus/internal/schema",
-		"github.com/charlesnpx/agentbus/internal/jcs",
-	}
+	const moduleInternalImportRoot = "github.com/charlesnpx/agentbus/internal"
 	err := filepath.WalkDir(filepath.Dir(guardFile), func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -38,10 +33,8 @@ func TestEngineDoesNotImportDaemonInternals(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			for _, blocked := range forbidden {
-				if importPath == blocked || strings.HasPrefix(importPath, blocked+"/") {
-					t.Fatalf("%s imports daemon-internal package %q", path, importPath)
-				}
+			if importPath == moduleInternalImportRoot || strings.HasPrefix(importPath, moduleInternalImportRoot+"/") {
+				t.Fatalf("%s imports module-internal package %q", path, importPath)
 			}
 		}
 		return nil
@@ -57,34 +50,41 @@ func TestCLIAdapterUsesCommandRunners(t *testing.T) {
 		t.Fatal("runtime.Caller failed")
 	}
 	adapterDir := filepath.Join(filepath.Dir(guardFile), "adapter", "internal", "cliadapter")
-	files, err := filepath.Glob(filepath.Join(adapterDir, "*.go"))
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	const commandImport = "github.com/charlesnpx/agentbus/engine/command"
 	var execImportFiles []string
 	usesCommandRunner := false
-	for _, path := range files {
-		if strings.HasSuffix(path, "_test.go") {
-			continue
+	err := filepath.WalkDir(adapterDir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		relativePath, err := filepath.Rel(adapterDir, path)
+		if err != nil {
+			return err
 		}
 		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
 		if err != nil {
-			t.Fatal(err)
+			return err
 		}
 		for _, spec := range file.Imports {
 			importPath, err := strconv.Unquote(spec.Path.Value)
 			if err != nil {
-				t.Fatal(err)
+				return err
 			}
 			switch importPath {
 			case "os/exec":
-				execImportFiles = append(execImportFiles, filepath.Base(path))
+				execImportFiles = append(execImportFiles, filepath.ToSlash(relativePath))
 			case commandImport:
 				usesCommandRunner = true
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(execImportFiles) != 0 {
 		t.Fatalf("cliadapter imports forbidden package os/exec in %s", strings.Join(execImportFiles, ", "))
