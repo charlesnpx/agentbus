@@ -670,7 +670,7 @@ func TestHelloTokenCapabilitiesAndSocketPermissions(t *testing.T) {
 	if hello.ProtocolVersion != protocol.Version || len(hello.Backends) != 1 || hello.Backends[0] != "fake" {
 		t.Fatalf("hello = %+v", hello)
 	}
-	if len(hello.BackendMetadata) != 1 || hello.BackendMetadata[0].Backend != "fake" || hello.BackendMetadata[0].Models == nil || hello.BackendMetadata[0].Efforts == nil {
+	if len(hello.BackendMetadata) != 1 || hello.BackendMetadata[0].Name != "fake" || hello.BackendMetadata[0].Models == nil || hello.BackendMetadata[0].Efforts == nil {
 		t.Fatalf("hello backend metadata = %+v", hello.BackendMetadata)
 	}
 	for _, capability := range []string{"policy.shape", "policy.jsonSchema", "policy.named", "policy.retry", "nativeStructuredOutput.codex", "nativeStructuredOutput.claude", "models.discovery", "models.reported"} {

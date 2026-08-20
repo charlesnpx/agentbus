@@ -2257,7 +2257,7 @@ func (s *Server) backendMetadata() []protocol.BackendInfo {
 	names := s.backendNames()
 	result := make([]protocol.BackendInfo, 0, len(names))
 	for _, name := range names {
-		info := protocol.BackendInfo{Backend: name, Models: []string{}, Efforts: []string{}}
+		info := protocol.BackendInfo{Name: name, Models: []string{}, Efforts: []string{}}
 		backend, _ := s.backendFor(name)
 		if provider, ok := backend.(engine.BackendMetadataProvider); ok {
 			metadata := provider.BackendMetadata(context.Background())
