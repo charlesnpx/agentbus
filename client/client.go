@@ -43,71 +43,6 @@ var ErrProtocolVersionMismatch = errors.New("protocol version mismatch")
 // fallback.
 var ErrAutostartLockUnsafe = errors.New("agentbus autostart lock path unsafe")
 
-// ErrRootFailStopped identifies daemon startup refusal because the authority
-// root has tripped fail-stop before the daemon opened its socket.
-var ErrRootFailStopped = errors.New("agentbus authority root fail-stopped")
-
-// ErrRootSealed identifies daemon startup refusal because the authority root
-// has been permanently sealed before the daemon opened its socket.
-var ErrRootSealed = errors.New("agentbus authority root sealed")
-
-// StartupRefusedError reports a daemon autostart that exited before becoming
-// ready because the authority root permanently refused startup. Reason is the
-// admission cause, such as "root_fail_stopped" or "root_sealed".
-type StartupRefusedError struct {
-	Reason string
-	Err    error
-}
-
-func (e *StartupRefusedError) Error() string {
-	if e == nil {
-		return "agentbus daemon startup refused"
-	}
-	message := "agentbus daemon startup refused"
-	if sentinel := startupRefusedSentinel(e.Reason); sentinel != nil {
-		message += ": " + sentinel.Error()
-	} else if reason := strings.TrimSpace(e.Reason); reason != "" {
-		message += ": " + reason
-	}
-	if e.Err != nil {
-		message += ": " + e.Err.Error()
-	}
-	return message
-}
-
-func (e *StartupRefusedError) Is(target error) bool {
-	if e == nil {
-		return false
-	}
-	return target != nil && startupRefusedSentinel(e.Reason) == target
-}
-
-func (e *StartupRefusedError) Unwrap() error {
-	if e == nil {
-		return nil
-	}
-	sentinel := startupRefusedSentinel(e.Reason)
-	switch {
-	case sentinel != nil && e.Err != nil:
-		return errors.Join(sentinel, e.Err)
-	case sentinel != nil:
-		return sentinel
-	default:
-		return e.Err
-	}
-}
-
-func startupRefusedSentinel(reason string) error {
-	switch strings.TrimSpace(reason) {
-	case protocol.AdmissionRejectRootFailStopped:
-		return ErrRootFailStopped
-	case protocol.AdmissionRejectRootSealed:
-		return ErrRootSealed
-	default:
-		return nil
-	}
-}
-
 type AutostartLockUnsafeError struct {
 	Path   string
 	Reason string
@@ -249,7 +184,7 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 			return nil, err
 		}
 		if err := c.autostart(ctx); err != nil {
-			return nil, startupRefusedFromStartupError(err)
+			return nil, err
 		}
 	}
 	return c, nil
@@ -416,7 +351,7 @@ func (c *Client) autostart(ctx context.Context) error {
 		Timeout:     remainingTimeout(autoCtx),
 	})
 	if err != nil {
-		return startupRefusedFromStartupError(err)
+		return err
 	}
 	pidPath := filepath.Join(c.stateRoot, "agentbus.pid")
 	pidWritten := false
@@ -739,28 +674,6 @@ func remainingTimeout(ctx context.Context) time.Duration {
 	return remaining
 }
 
-func startupRefusedFromStartupError(err error) error {
-	if err == nil {
-		return nil
-	}
-	var refused *StartupRefusedError
-	if errors.As(err, &refused) {
-		return err
-	}
-	var startup *daemonlaunch.StartupError
-	if !errors.As(err, &startup) {
-		return err
-	}
-	switch strings.TrimSpace(startup.Code) {
-	case daemonlaunch.CodeAuthorityFailStopped:
-		return &StartupRefusedError{Reason: protocol.AdmissionRejectRootFailStopped, Err: err}
-	case daemonlaunch.CodeAuthorityRootSealed:
-		return &StartupRefusedError{Reason: protocol.AdmissionRejectRootSealed, Err: err}
-	default:
-		return err
-	}
-}
-
 type defaultStarter struct{}
 
 func (defaultStarter) StartDaemon(ctx context.Context, opts StartOptions) (StartResult, error) {
@@ -947,7 +860,7 @@ func (c *Client) reconnect(ctx context.Context) error {
 	} else if !autostartableConnectError(err) {
 		return err
 	}
-	return startupRefusedFromStartupError(c.autostart(ctx))
+	return c.autostart(ctx)
 }
 
 func autostartableConnectError(err error) bool {

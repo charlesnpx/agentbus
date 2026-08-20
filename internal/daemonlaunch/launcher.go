@@ -22,22 +22,12 @@ import (
 )
 
 const (
-	ReadyFDEnv               = "AGENTBUS_READY_FD"
-	StartupDeadlineEnv       = "AGENTBUS_STARTUP_DEADLINE_UNIX_NANO"
-	ReadinessProtocolVersion = 1
-	DefaultTimeout           = 10 * time.Second
-	DefaultStderrTailBytes   = 64 * 1024
-	CodeAlreadyListening     = "agentbus daemon already listening"
-	CodeAdmissionRootBusy    = "agentbus admission root busy"
-	CodeAuthorityFailStopped = "agentbus authority root fail-stopped"
-	CodeAuthorityRootSealed  = "agentbus authority root sealed"
-	// ExitAuthorityFailStopped is the foreground daemon exit code for startup
-	// refusal by a fail-stopped authority root. Exit code 14 is reserved for
-	// engine.StateOrphaned.
-	ExitAuthorityFailStopped = 15
-	// ExitAuthorityRootSealed is the foreground daemon exit code for startup
-	// refusal by a sealed authority root.
-	ExitAuthorityRootSealed    = 16
+	ReadyFDEnv                 = "AGENTBUS_READY_FD"
+	StartupDeadlineEnv         = "AGENTBUS_STARTUP_DEADLINE_UNIX_NANO"
+	ReadinessProtocolVersion   = 1
+	DefaultTimeout             = 10 * time.Second
+	DefaultStderrTailBytes     = 64 * 1024
+	CodeAlreadyListening       = "agentbus daemon already listening"
 	readinessFDChildNumber     = 3
 	existingVerifyRetryPeriod  = 50 * time.Millisecond
 	failedExitGrace            = 500 * time.Millisecond

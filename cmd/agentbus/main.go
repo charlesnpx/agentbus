@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -32,6 +34,7 @@ const (
 	cliExitUnknownJob           = 10
 	cliExitDaemonStartupFailure = 11
 	cliExitShutdownForced       = 13
+	cliExitResultUnavailable    = 15
 	shortSHA256HexLength        = 12
 )
 
@@ -358,7 +361,9 @@ func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Write
 		}
 		return code
 	}
-	printJobRecordResult(out, errOut, record)
+	if resultCode := printJobRecordResult(out, errOut, record); resultCode != 0 {
+		return resultCode
+	}
 	return code
 }
 
@@ -459,7 +464,7 @@ func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
 	fmt.Fprintln(out)
 }
 
-func printJobRecordResult(out, errOut io.Writer, record agentclient.JobGetResult) {
+func printJobRecordResult(out, errOut io.Writer, record agentclient.JobGetResult) int {
 	switch record.State {
 	case protocol.PublicStateFailed:
 		class, reason := "", ""
@@ -467,30 +472,75 @@ func printJobRecordResult(out, errOut io.Writer, record agentclient.JobGetResult
 			class, reason = string(record.Failure.Class), record.Failure.Reason
 		}
 		fmt.Fprintf(errOut, "jobId=%s state=%s failure.class=%s failure.reason=%s\n", record.JobID, record.State, class, reason)
-		return
+		return 0
 	case protocol.PublicStateQueued, protocol.PublicStateRunning:
 		fmt.Fprintf(errOut, "jobId=%s state=%s\n", record.JobID, record.State)
-		return
+		return 0
 	case protocol.PublicStateCanceled, protocol.PublicStateUnknown:
 		fmt.Fprintf(errOut, "jobId=%s state=%s: no authoritative result\n", record.JobID, record.State)
-		return
+		return 0
 	case protocol.PublicStateCompleted:
 		if record.Result == nil {
 			fmt.Fprintf(errOut, "jobId=%s state=%s: no authoritative result\n", record.JobID, record.State)
-			return
+			return 0
 		}
 		if record.Result.Text != "" {
 			fmt.Fprint(out, record.Result.Text)
 			if !strings.HasSuffix(record.Result.Text, "\n") {
 				fmt.Fprintln(out)
 			}
-			return
+			return 0
 		}
-		fmt.Fprintf(out, "resultPath=%s sha256=%s bytes=%d\n", record.Result.ResultPath, record.Result.SHA256, record.Result.Bytes)
-		return
+		if record.Result.ResultPath == "" {
+			fmt.Fprintf(errOut, "jobId=%s state=%s: no authoritative result\n", record.JobID, record.State)
+			return 0
+		}
+		artifact, err := openVerifiedResultArtifact(record.Result)
+		if err != nil {
+			fmt.Fprintf(errOut, "jobId=%s state=%s: %v\n", record.JobID, record.State, err)
+			return cliExitResultUnavailable
+		}
+		defer artifact.Close()
+		if _, err := io.Copy(out, artifact); err != nil {
+			fmt.Fprintf(errOut, "jobId=%s state=%s: write result artifact %q: %v\n", record.JobID, record.State, record.Result.ResultPath, err)
+			return 1
+		}
+		return 0
 	default:
 		fmt.Fprintf(errOut, "jobId=%s state=%s: no authoritative result\n", record.JobID, record.State)
+		return 0
 	}
+}
+
+func openVerifiedResultArtifact(result *protocol.ResultInfoWire) (*os.File, error) {
+	artifact, err := os.Open(result.ResultPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("result artifact %q is missing: %w", result.ResultPath, err)
+		}
+		return nil, fmt.Errorf("result artifact %q is unreadable: %w", result.ResultPath, err)
+	}
+
+	digest := sha256.New()
+	bytes, err := io.Copy(digest, artifact)
+	if err != nil {
+		_ = artifact.Close()
+		return nil, fmt.Errorf("result artifact %q is unreadable during verification: %w", result.ResultPath, err)
+	}
+	if bytes != result.Bytes {
+		_ = artifact.Close()
+		return nil, fmt.Errorf("result artifact %q byte-count check failed: got %d, want %d", result.ResultPath, bytes, result.Bytes)
+	}
+	actualSHA256 := hex.EncodeToString(digest.Sum(nil))
+	if actualSHA256 != strings.TrimPrefix(result.SHA256, "sha256:") {
+		_ = artifact.Close()
+		return nil, fmt.Errorf("result artifact %q SHA-256 check failed: got %s, want %s", result.ResultPath, actualSHA256, result.SHA256)
+	}
+	if _, err := artifact.Seek(0, io.SeekStart); err != nil {
+		_ = artifact.Close()
+		return nil, fmt.Errorf("result artifact %q is unreadable after verification: %w", result.ResultPath, err)
+	}
+	return artifact, nil
 }
 
 func jobAge(createdAt time.Time) string {
@@ -649,7 +699,8 @@ output is identical; status is the operator projection and result is pipeable.
 Exit codes for a selected job:
   completed=0, queued/running=2, completed-noncompliant=3, failed=4,
   timeout=5, interrupted=6, canceled=7, unknown-job=10,
-  daemon-startup-failure=11, shutdown-deadline=13, unknown=14
+  daemon-startup-failure=11, shutdown-deadline=13, unknown=14,
+  result-artifact-unavailable=15: completed, but the authoritative result artifact is missing, unreadable, or does not match its recorded digest
 `)
 }
 

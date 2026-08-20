@@ -430,6 +430,7 @@ look noncompliant.
 | 10 | Unknown job ID, unchanged |
 | 11 | Daemon startup failure, unchanged |
 | 13 | Shutdown deadline, unchanged |
+| 15 | completed, but the authoritative result artifact is missing, unreadable, or does not match its recorded digest |
 
 Codes 8 (reaped), 9 (quarantined), and 12 (authority fail-stop) are permanently
 retired and MUST NEVER be reused. unknown uses 14 rather than 8 because

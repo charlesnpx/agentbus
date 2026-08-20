@@ -989,112 +989,6 @@ func TestConnectAutostartSurfacesLauncherFailureOnce(t *testing.T) {
 	}
 }
 
-func TestConnectAutostartStartupErrorAuthorityRefusedTyped(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name         string
-		code         string
-		wantReason   string
-		wantSentinel error
-		notSentinel  error
-	}{
-		{
-			name:         "fail stopped",
-			code:         daemonlaunch.CodeAuthorityFailStopped,
-			wantReason:   protocol.AdmissionRejectRootFailStopped,
-			wantSentinel: ErrRootFailStopped,
-			notSentinel:  ErrRootSealed,
-		},
-		{
-			name:         "root sealed",
-			code:         daemonlaunch.CodeAuthorityRootSealed,
-			wantReason:   protocol.AdmissionRejectRootSealed,
-			wantSentinel: ErrRootSealed,
-			notSentinel:  ErrRootFailStopped,
-		},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			root := shortClientTempDir(t)
-			startupErr := &daemonlaunch.StartupError{
-				Kind:    daemonlaunch.ErrStartupFailed,
-				Code:    tt.code,
-				Message: "startup refused by readiness frame",
-			}
-			starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
-				return StartResult{}, startupErr
-			})
-
-			client, err := Connect(context.Background(), Options{
-				StateRoot: root,
-				Token:     "token",
-				Starter:   starter,
-			})
-			if client != nil {
-				_ = client.Close()
-			}
-			if err == nil {
-				t.Fatal("Connect succeeded, want startup refusal")
-			}
-			if !errors.Is(err, tt.wantSentinel) {
-				t.Fatalf("Connect error = %T %v, want %v", err, err, tt.wantSentinel)
-			}
-			if errors.Is(err, tt.notSentinel) {
-				t.Fatalf("Connect error = %T %v, unexpectedly matched %v", err, err, tt.notSentinel)
-			}
-			var refused *StartupRefusedError
-			if !errors.As(err, &refused) {
-				t.Fatalf("Connect error = %T %v, want StartupRefusedError", err, err)
-			}
-			if refused.Reason != tt.wantReason {
-				t.Fatalf("StartupRefusedError reason = %q, want %q", refused.Reason, tt.wantReason)
-			}
-			var gotStartup *daemonlaunch.StartupError
-			if !errors.As(err, &gotStartup) || gotStartup != startupErr {
-				t.Fatalf("Connect error = %T %v, want wrapped StartupError", err, err)
-			}
-		})
-	}
-}
-
-func TestConnectAutostartStartupErrorNonAuthorityNotTyped(t *testing.T) {
-	t.Parallel()
-	root := shortClientTempDir(t)
-	startupErr := &daemonlaunch.StartupError{
-		Kind:    daemonlaunch.ErrStartupFailed,
-		Code:    daemonlaunch.CodeAlreadyListening,
-		Message: "existing daemon verification failed",
-	}
-	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
-		return StartResult{}, startupErr
-	})
-
-	client, err := Connect(context.Background(), Options{
-		StateRoot: root,
-		Token:     "token",
-		Starter:   starter,
-	})
-	if client != nil {
-		_ = client.Close()
-	}
-	if err == nil {
-		t.Fatal("Connect succeeded, want startup error")
-	}
-	if errors.Is(err, ErrRootFailStopped) || errors.Is(err, ErrRootSealed) {
-		t.Fatalf("Connect error = %T %v, want non-authority startup error", err, err)
-	}
-	var refused *StartupRefusedError
-	if errors.As(err, &refused) {
-		t.Fatalf("Connect error = %T %v, unexpectedly matched StartupRefusedError", err, err)
-	}
-	var gotStartup *daemonlaunch.StartupError
-	if !errors.As(err, &gotStartup) || gotStartup != startupErr {
-		t.Fatalf("Connect error = %T %v, want original StartupError", err, err)
-	}
-}
-
 func TestConnectAutostartStartResultKeepsTimeoutBehavior(t *testing.T) {
 	t.Parallel()
 	root := shortClientTempDir(t)
@@ -1116,13 +1010,6 @@ func TestConnectAutostartStartResultKeepsTimeoutBehavior(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("Connect succeeded, want timeout")
-	}
-	if errors.Is(err, ErrRootFailStopped) || errors.Is(err, ErrRootSealed) {
-		t.Fatalf("Connect error = %T %v, want generic timeout", err, err)
-	}
-	var refused *StartupRefusedError
-	if errors.As(err, &refused) {
-		t.Fatalf("Connect error = %T %v, unexpectedly matched StartupRefusedError", err, err)
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Connect error = %v, want deadline exceeded", err)

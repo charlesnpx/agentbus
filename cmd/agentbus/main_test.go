@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -147,11 +150,6 @@ func TestResultHumanProjection(t *testing.T) {
 			wantCode: 0, wantStdout: "pipe me\n",
 		},
 		{
-			name:     "elided text reports artifact metadata",
-			record:   withResult(detailedRecord(protocol.PublicStateCompleted), &protocol.ResultInfoWire{ResultPath: "/state/result", SHA256: "sha256:abc", Bytes: 7}),
-			wantCode: 0, wantStdout: "resultPath=/state/result sha256=sha256:abc bytes=7\n",
-		},
-		{
 			name:     "failed writes diagnostics only",
 			record:   withFailure(detailedRecord(protocol.PublicStateFailed), protocol.FailureClassTimeout, "deadline exceeded"),
 			wantCode: 5, wantStderr: "failure.class=timeout failure.reason=deadline exceeded",
@@ -172,6 +170,43 @@ func TestResultHumanProjection(t *testing.T) {
 				t.Fatalf("result=(code=%d stdout=%q stderr=%q), want code=%d stdout=%q stderr containing %q", code, stdout, stderr, tt.wantCode, tt.wantStdout, tt.wantStderr)
 			}
 		})
+	}
+}
+
+func TestResultStreamsVerifiedArtifact(t *testing.T) {
+	artifactBytes := []byte(strings.Repeat("a", engine.DefaultInlineResultCap+1))
+	artifactPath := filepath.Join(t.TempDir(), "result.txt")
+	if err := os.WriteFile(artifactPath, artifactBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(artifactBytes)
+	record := withResult(detailedRecord(protocol.PublicStateCompleted), &protocol.ResultInfoWire{
+		ResultPath: artifactPath,
+		SHA256:     hex.EncodeToString(sum[:]),
+		Bytes:      int64(len(artifactBytes)),
+	})
+	a := testApp(t)
+	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1"})
+	if code != 0 || stdout != string(artifactBytes) || stderr != "" {
+		t.Fatalf("result=(code=%d stdout=%d bytes stderr=%q), want verified artifact bytes and success", code, len(stdout), stderr)
+	}
+}
+
+func TestResultMissingArtifactReturnsExit15WithoutStdout(t *testing.T) {
+	artifactPath := filepath.Join(t.TempDir(), "missing-result.txt")
+	record := withResult(detailedRecord(protocol.PublicStateCompleted), &protocol.ResultInfoWire{
+		ResultPath: artifactPath,
+		SHA256:     strings.Repeat("0", sha256.Size*2),
+		Bytes:      1,
+	})
+	a := testApp(t)
+	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1"})
+	if code != 15 || stdout != "" || !strings.Contains(stderr, artifactPath) || !strings.Contains(stderr, "missing") {
+		t.Fatalf("result=(code=%d stdout=%q stderr=%q), want exit 15, empty stdout, and missing artifact diagnostic", code, stdout, stderr)
 	}
 }
 
@@ -247,7 +282,7 @@ func TestProtocolErrorsAndStartupFailuresKeepTypedExitCodes(t *testing.T) {
 func TestStartBackgroundDaemonWritesPIDAfterReady(t *testing.T) {
 	a := testApp(t)
 	a.daemonLauncher = func(_ context.Context, opts daemonlaunch.Options) (daemonlaunch.Result, error) {
-		if got, want := opts.Args, []string{"serve", "--foreground"}; !sameStrings(got, want) {
+		if got, want := opts.Args, []string{"serve", "--foreground"}; !slices.Equal(got, want) {
 			t.Fatalf("launch args=%v want=%v", got, want)
 		}
 		return daemonlaunch.Result{PID: 4242, CanonicalStateRoot: a.stateRoot}, nil
@@ -357,16 +392,4 @@ func decodeJSON(t *testing.T, raw string, target any) {
 	if err := json.Unmarshal([]byte(raw), target); err != nil {
 		t.Fatalf("decode JSON %q: %v", raw, err)
 	}
-}
-
-func sameStrings(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
-	}
-	return true
 }
