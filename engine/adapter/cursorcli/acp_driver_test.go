@@ -307,67 +307,6 @@ func TestACPNegativeTerminalProtocolBranches(t *testing.T) {
 	}
 }
 
-func TestACPSetupQualification(t *testing.T) {
-	backend := New(Options{Binary: "fake-cursor"})
-	if got := backend.VersionTransform("cursor-agent 2026.08.04-aaa8809"); got != MinimumKnownGoodVersion {
-		t.Fatalf("normalized version = %q, want %q", got, MinimumKnownGoodVersion)
-	}
-	if backend.ConfigMode != (engine.ModeInfo{Write: "user", ReadOnly: "user"}) || !slices.Equal(backend.SandboxModes, []string{"agent", "plan", "ask"}) {
-		t.Fatalf("backend setup metadata = %+v %#v", backend.ConfigMode, backend.SandboxModes)
-	}
-
-	probe := &fakeCursorProbeRunner{
-		path: "/qualified/bin/cursor-agent",
-		output: "Available models\n" +
-			"  cursor-fast - Cursor Fast\n" +
-			"  cursor-pro - Cursor Pro\n",
-	}
-	discoverer := interface {
-		DiscoverModels(context.Context, command.ProbeRunner) (*engine.ModelDiscovery, error)
-	}(backend)
-	discovered, err := discoverer.DiscoverModels(context.Background(), probe)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(discovered.Models, []string{"cursor-fast", "cursor-pro"}) || len(probe.specs) != 1 || !slices.Equal(probe.specs[0].Argv, []string{"/qualified/bin/cursor-agent", "models"}) {
-		t.Fatalf("CLI model discovery = %#v, probe specs = %#v", discovered, probe.specs)
-	}
-
-	runner := newFakeACPRunner(t, func(t *testing.T, proc *fakeACPProcess, spec command.ExecSpec) {
-		peer := newACPPeer(t, proc)
-		peer.handshake(false)
-		newSession := peer.expectRequest("session/new")
-		if got := nestedString(newSession, "params", "cwd"); !filepath.IsAbs(got) {
-			t.Fatalf("qualification cwd = %q, want absolute temporary directory", got)
-		}
-		peer.respond(newSession, acpSessionResult("qualification-session", "qualified-model"))
-		setMode := peer.expectRequest("session/set_mode")
-		if got := nestedString(setMode, "params", "modeId"); got != "plan" {
-			t.Fatalf("qualification mode = %q, want plan", got)
-		}
-		peer.respond(setMode, map[string]any{})
-		peer.expectStdinClose()
-	})
-
-	driver := newACPDriver("fake-cursor")
-	qualified, err := driver.SetupQualify(context.Background(), runner, engine.SessionOpts{CWD: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(qualified.Models, []string{"qualified-model", "fallback-model"}) || qualified.Source != "cursor ACP session/new" {
-		t.Fatalf("ACP qualification discovery = %#v", qualified)
-	}
-	spec := runner.lastSpec()
-	if !slices.Equal(spec.Argv, []string{"fake-cursor", "acp"}) || spec.Env == nil {
-		t.Fatalf("qualification exec argv=%#v envSet=%v", spec.Argv, spec.Env != nil)
-	}
-	serialized, err := json.Marshal(qualified)
-	if err != nil || strings.Contains(string(serialized), "credential") || strings.Contains(strings.Join(spec.Argv, "\x00"), "credential") {
-		t.Fatalf("qualification leaked credentials: discovery=%s argv=%#v err=%v", serialized, spec.Argv, err)
-	}
-	runner.assertRetired(t)
-}
-
 func startFakeCursorSession(t *testing.T, opts engine.SessionOpts) engine.Session {
 	t.Helper()
 	backend := New(Options{Binary: "fake-cursor"})
@@ -415,24 +354,6 @@ func eventsOfType(events []engine.Event, typ string) []engine.Event {
 		}
 	}
 	return result
-}
-
-type fakeCursorProbeRunner struct {
-	path   string
-	output string
-	specs  []command.ProbeSpec
-}
-
-func (r *fakeCursorProbeRunner) LookPath(string) (string, error) {
-	return r.path, nil
-}
-
-func (r *fakeCursorProbeRunner) Run(_ context.Context, spec command.ProbeSpec) (command.ProbeResult, error) {
-	r.specs = append(r.specs, spec)
-	if len(spec.Argv) > 1 && spec.Argv[1] == "models" {
-		return command.ProbeResult{Stdout: []byte(r.output)}, nil
-	}
-	return command.ProbeResult{}, errors.New("unexpected probe command")
 }
 
 type acpPeerFunc func(*testing.T, *fakeACPProcess, command.ExecSpec)

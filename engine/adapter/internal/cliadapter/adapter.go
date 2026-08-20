@@ -2,29 +2,21 @@ package cliadapter
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io"
-	"os"
+	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/internal/duplex"
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
-const setupCacheRefreshInstruction = "submit a job; the daemon probes the backend on first use and caches the result under the state root"
-
-const DriftError = "backend version changed since setup; " + setupCacheRefreshInstruction
-
 type Backend struct {
 	NameValue        string
 	Binary           string
 	MinimumVersion   string
-	CachePath        string
 	StreamSchema     string
 	AllowedModels    map[string]struct{}
 	AllowedEfforts   map[string]struct{}
@@ -33,13 +25,6 @@ type Backend struct {
 	Driver           duplex.Driver
 	VersionTransform func(string) string
 	Discover         func(context.Context, command.ProbeRunner, string) (*engine.ModelDiscovery, error)
-	SetupQualify     func(context.Context, command.Runner, engine.SessionOpts) (engine.ModelDiscovery, error)
-	// ConfigMode and SandboxModes let a backend report honest setup metadata.
-	// When left zero, setupProbe falls back to the historical codex/claude
-	// defaults (user/hermetic + workspace-write/read-only), preserving behavior.
-	ConfigMode   engine.ModeInfo
-	SandboxModes []string
-	probed       *ProbedBackendDescriptor
 }
 
 type StaticBackendDescriptor struct {
@@ -67,32 +52,18 @@ type ProbedBackendDescriptor struct {
 
 func (b *Backend) Name() string { return b.NameValue }
 
-func (b *Backend) AdmissionParkable() bool { return true }
-
-func (b *Backend) AdmissionControlledRunner() bool { return true }
-
 func (b *Backend) Preflight(ctx context.Context) (engine.Health, error) {
 	probed, err := ProbeBackend(ctx, command.DirectProbeRunner{}, b.staticDescriptor())
 	if err != nil {
 		return engine.Health{}, err
 	}
-	probe, err := b.cachedProbe()
-	if err != nil {
-		return engine.Health{}, err
-	}
-	if probe.Version != probed.Version || probe.BinaryPath != probed.BinaryPath {
-		return engine.Health{}, errors.New(DriftError)
-	}
-	if probe.StreamSchema == "" || probe.StreamSchema != b.StreamSchema {
-		return engine.Health{}, fmt.Errorf("backend_unavailable: setup cache for %s lacks stream schema %q", b.NameValue, b.StreamSchema)
-	}
 	return engine.Health{
 		Backend:      b.NameValue,
 		BinaryPath:   probed.BinaryPath,
 		Version:      probed.Version,
-		StreamSchema: probe.StreamSchema,
+		StreamSchema: b.StreamSchema,
 		Minimum:      b.MinimumVersion,
-		Warning:      b.discoveryWarning(probe, probed.Version),
+		Warning:      b.discoveryWarning(probed),
 	}, nil
 }
 
@@ -103,140 +74,18 @@ func (b *Backend) DiscoverModels(ctx context.Context, runner command.ProbeRunner
 	if b.Discover == nil {
 		return nil, nil
 	}
-	binary := b.binary()
-	if b.probed != nil && b.probed.BinaryPath != "" {
-		binary = b.probed.BinaryPath
-	} else {
-		resolved, err := runner.LookPath(binary)
-		if err != nil {
-			return nil, err
-		}
-		binary = resolved
+	binary, err := runner.LookPath(b.binary())
+	if err != nil {
+		return nil, err
 	}
 	return b.Discover(ctx, runner, binary)
 }
 
 func (b *Backend) BackendMetadata(context.Context) engine.BackendMetadata {
-	meta := engine.BackendMetadata{Name: b.NameValue}
-	if b.probed != nil {
-		meta.Models = append([]string(nil), b.probed.DiscoveredModels...)
-		meta.Efforts = append([]string(nil), b.probed.DiscoveredEfforts...)
-		return meta
-	}
-	probe, err := b.cachedProbe()
-	if err == nil && probe.Version != "" {
-		meta.Models = append([]string(nil), probe.DiscoveredModels...)
-		meta.Efforts = append([]string(nil), probe.DiscoveredEfforts...)
-	}
-	return meta
-}
-
-// SetupProbe runs the live setup-time stream probe and returns the cache entry
-// later consumed by Preflight.
-func (b *Backend) SetupProbe(ctx context.Context) (engine.BackendSetupProbe, error) {
-	probed, err := ProbeBackend(ctx, command.DirectProbeRunner{}, b.staticDescriptor())
-	if err != nil {
-		return engine.BackendSetupProbe{}, err
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return engine.BackendSetupProbe{}, err
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	probeOpts := engine.SessionOpts{
-		CWD:     cwd,
-		Write:   false,
-		Timeout: 2 * time.Minute,
-	}
-	if b.SetupQualify != nil {
-		discovery, err := b.SetupQualify(probeCtx, command.DirectCommandRunner{}, probeOpts)
-		if err != nil {
-			return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: %s setup qualification failed: %w", b.NameValue, err)
-		}
-		probe := b.setupProbe(probed)
-		probe.DiscoveredModels = append([]string(nil), discovery.Models...)
-		probe.DiscoveredEfforts = append([]string(nil), discovery.Efforts...)
-		probe.DiscoverySource = discovery.Source
-		probe.DiscoveryFetchedAt = discovery.FetchedAt
-		probe.DiscoveryClientVersion = probed.Version
-		probe.DiscoveryWarnings = append([]string(nil), discovery.Warnings...)
-		return probe, nil
-	}
-	session, err := b.newSession("", probeOpts, "", true)
-	if err != nil {
-		return engine.BackendSetupProbe{}, err
-	}
-	events, err := session.Turn(probeCtx, engine.TurnInput{
-		Prompt:  "Reply with exactly: OK\n",
-		Write:   false,
-		Timeout: 2 * time.Minute,
-	})
-	if err != nil {
-		return engine.BackendSetupProbe{}, err
-	}
-	if err := b.qualifySetupStream(probeCtx, events); err != nil {
-		return engine.BackendSetupProbe{}, err
-	}
-	probe := b.setupProbe(probed)
-	probe.DiscoveredModels = probed.DiscoveredModels
-	probe.DiscoveredEfforts = probed.DiscoveredEfforts
-	probe.DiscoverySource = probed.DiscoverySource
-	probe.DiscoveryFetchedAt = probed.DiscoveryFetchedAt
-	probe.DiscoveryClientVersion = probed.DiscoveryClientVersion
-	probe.DiscoveryWarnings = discoveryWarnings(probed.DiscoveryWarning)
-	return probe, nil
-}
-
-func (b *Backend) qualifySetupStream(probeCtx context.Context, events <-chan engine.Event) error {
-	var sawSemanticEvent bool
-	var warnings []string
-	for event := range events {
-		if event.Type == engine.EventWarning || event.Type == engine.EventTerminalError {
-			warnings = append(warnings, event.Text)
-			continue
-		}
-		if isLifecycleEvent(event.Type) {
-			continue
-		}
-		sawSemanticEvent = true
-	}
-	if probeCtx.Err() != nil {
-		return fmt.Errorf("backend_unavailable: %s setup stream probe failed: %w", b.NameValue, probeCtx.Err())
-	}
-	if len(warnings) > 0 {
-		return fmt.Errorf("backend_unavailable: %s setup stream probe warning: %s", b.NameValue, strings.Join(warnings, "; "))
-	}
-	if !sawSemanticEvent {
-		return fmt.Errorf("backend_unavailable: %s setup stream probe produced no semantic JSON events", b.NameValue)
-	}
-	return nil
-}
-
-func isLifecycleEvent(eventType string) bool {
-	return eventType == engine.EventProgress || eventType == engine.EventTurnFinal
-}
-
-func (b *Backend) setupProbe(probed ProbedBackendDescriptor) engine.BackendSetupProbe {
-	configMode := b.ConfigMode
-	if configMode.Write == "" {
-		configMode.Write = "user"
-	}
-	if configMode.ReadOnly == "" {
-		configMode.ReadOnly = "hermetic"
-	}
-	sandboxModes := b.SandboxModes
-	if len(sandboxModes) == 0 {
-		sandboxModes = []string{"workspace-write", "read-only"}
-	}
-	return engine.BackendSetupProbe{
-		Backend:          b.NameValue,
-		BinaryPath:       probed.BinaryPath,
-		Version:          probed.Version,
-		StreamSchema:     b.StreamSchema,
-		ConfigMode:       configMode,
-		SandboxModes:     sandboxModes,
-		JSONEventsProbed: true,
+	return engine.BackendMetadata{
+		Name:    b.NameValue,
+		Models:  sortedStringSet(b.AllowedModels),
+		Efforts: sortedStringSet(b.AllowedEfforts),
 	}
 }
 
@@ -312,57 +161,6 @@ func (b *Backend) staticDescriptor() StaticBackendDescriptor {
 	}
 }
 
-func (b *Backend) validationDescriptor() StaticBackendDescriptor {
-	if b.probed != nil {
-		return b.probed.StaticBackendDescriptor
-	}
-	return b.staticDescriptor()
-}
-
-func (b *Backend) ProbeBackend(ctx context.Context, runner command.ProbeRunner) (engine.Backend, error) {
-	probed, err := ProbeBackend(ctx, runner, b.staticDescriptor())
-	if err != nil {
-		return nil, err
-	}
-	probe, err := b.cachedProbe()
-	if err != nil {
-		return nil, err
-	}
-	if probe.Version != probed.Version || probe.BinaryPath != probed.BinaryPath {
-		return nil, errors.New(DriftError)
-	}
-	if probe.StreamSchema == "" || probe.StreamSchema != b.StreamSchema {
-		return nil, fmt.Errorf("backend_unavailable: setup cache for %s lacks stream schema %q", b.NameValue, b.StreamSchema)
-	}
-	b.hydrateEmptyProbeDiscovery(&probed)
-	clone := *b
-	clone.probed = &probed
-	return &clone, nil
-}
-
-func (b *Backend) hydrateEmptyProbeDiscovery(probed *ProbedBackendDescriptor) {
-	if probed.DiscoverySource != "" && (len(probed.DiscoveredModels) > 0 || len(probed.DiscoveredEfforts) > 0) {
-		return
-	}
-	probe, err := b.cachedProbe()
-	if err != nil {
-		return
-	}
-	if probe.Version != probed.Version || probe.BinaryPath != probed.BinaryPath || probe.StreamSchema != probed.StreamSchema {
-		return
-	}
-	probed.DiscoveredModels = append([]string(nil), probe.DiscoveredModels...)
-	probed.DiscoveredEfforts = append([]string(nil), probe.DiscoveredEfforts...)
-	probed.DiscoverySource = probe.DiscoverySource
-	probed.DiscoveryFetchedAt = probe.DiscoveryFetchedAt
-	probed.DiscoveryClientVersion = probe.DiscoveryClientVersion
-	// Preserve any live-discovery warning (e.g. a transient discovery failure that
-	// triggered the cache fallback) and append the cached discovery warnings.
-	for _, w := range probe.DiscoveryWarnings {
-		probed.DiscoveryWarning = appendWarning(probed.DiscoveryWarning, w)
-	}
-}
-
 func (b *Backend) normalizeVersion(s string) string {
 	return normalizeVersionWith(s, b.VersionTransform)
 }
@@ -431,44 +229,21 @@ func normalizeVersionWith(s string, transform func(string) string) string {
 }
 
 func (b *Backend) validateOptions(opts engine.SessionOpts) (string, error) {
-	return ValidateStaticOptions(b.validationDescriptor(), opts)
+	return ValidateStaticOptions(b.staticDescriptor(), opts)
 }
 
 func ValidateStaticOptions(descriptor StaticBackendDescriptor, opts engine.SessionOpts) (string, error) {
-	models, efforts, modelsDiscovered, effortsDiscovered, warning := validationSets(descriptor)
 	if opts.Model != "" {
-		if _, ok := models[opts.Model]; !ok {
-			if modelsDiscovered {
-				warning = appendWarning(warning, fmt.Sprintf("model %q is not in the discovered %s catalog; passing through to backend", opts.Model, descriptor.NameValue))
-			} else if len(models) > 0 {
-				return warning, fmt.Errorf("unsupported model %q for %s", opts.Model, descriptor.NameValue)
-			}
+		if _, ok := descriptor.AllowedModels[opts.Model]; !ok && len(descriptor.AllowedModels) > 0 {
+			return "", fmt.Errorf("unsupported model %q for %s", opts.Model, descriptor.NameValue)
 		}
 	}
 	if opts.Effort != "" {
-		if _, ok := efforts[opts.Effort]; !ok {
-			if effortsDiscovered {
-				warning = appendWarning(warning, fmt.Sprintf("effort %q is not in the discovered %s catalog; passing through to backend", opts.Effort, descriptor.NameValue))
-			} else if len(efforts) > 0 {
-				return warning, fmt.Errorf("unsupported effort %q for %s", opts.Effort, descriptor.NameValue)
-			}
+		if _, ok := descriptor.AllowedEfforts[opts.Effort]; !ok && len(descriptor.AllowedEfforts) > 0 {
+			return "", fmt.Errorf("unsupported effort %q for %s", opts.Effort, descriptor.NameValue)
 		}
 	}
-	return warning, nil
-}
-
-func validationSets(descriptor StaticBackendDescriptor) (map[string]struct{}, map[string]struct{}, bool, bool, string) {
-	models := descriptor.AllowedModels
-	efforts := descriptor.AllowedEfforts
-	modelsDiscovered := descriptor.DiscoverySource != "" && len(descriptor.DiscoveredModels) > 0
-	effortsDiscovered := descriptor.DiscoverySource != "" && len(descriptor.DiscoveredEfforts) > 0
-	if modelsDiscovered {
-		models = StringSet(descriptor.DiscoveredModels...)
-	}
-	if effortsDiscovered {
-		efforts = StringSet(descriptor.DiscoveredEfforts...)
-	}
-	return models, efforts, modelsDiscovered, effortsDiscovered, descriptor.DiscoveryWarning
+	return "", nil
 }
 
 func cloneStringSet(in map[string]struct{}) map[string]struct{} {
@@ -482,11 +257,13 @@ func cloneStringSet(in map[string]struct{}) map[string]struct{} {
 	return out
 }
 
-func discoveryWarnings(warning string) []string {
-	if warning == "" {
-		return nil
+func sortedStringSet(values map[string]struct{}) []string {
+	ordered := make([]string, 0, len(values))
+	for value := range values {
+		ordered = append(ordered, value)
 	}
-	return strings.Split(warning, "; ")
+	sort.Strings(ordered)
+	return ordered
 }
 
 func appendWarning(existing, addition string) string {
@@ -496,84 +273,14 @@ func appendWarning(existing, addition string) string {
 	return existing + "; " + addition
 }
 
-func (b *Backend) discoveryWarning(probe engine.BackendSetupProbe, version string) string {
-	if cache, err := b.readCache(); err == nil && cache.Version != engine.SetupProbeCacheVersion {
-		return "model discovery cache is stale; using static known-good validation lists"
-	}
-	if len(probe.DiscoveryWarnings) > 0 {
-		return strings.Join(probe.DiscoveryWarnings, "; ")
+func (b *Backend) discoveryWarning(probe ProbedBackendDescriptor) string {
+	if probe.DiscoveryWarning != "" {
+		return probe.DiscoveryWarning
 	}
 	if probe.DiscoverySource == "" && len(probe.DiscoveredModels) == 0 && len(probe.DiscoveredEfforts) == 0 {
 		return "model discovery unavailable; using static known-good validation lists"
 	}
-	if probe.Version != version {
-		return "model discovery cache is stale; using static known-good validation lists"
-	}
 	return ""
-}
-
-func (b *Backend) setupProbeCachePath() (string, error) {
-	path := b.CachePath
-	if path == "" {
-		var err error
-		path, err = engine.SetupProbeCachePath("")
-		if err != nil {
-			return "", err
-		}
-	}
-	return path, nil
-}
-
-func (b *Backend) readCache() (engine.SetupProbeCache, error) {
-	path, err := b.setupProbeCachePath()
-	if err != nil {
-		return engine.SetupProbeCache{}, err
-	}
-	return engine.ReadSetupProbeCache(path)
-}
-
-// SetupProbeCacheFingerprint identifies the setup cache revision consumed by
-// this backend. Strict admission uses it only to decide whether a backend that
-// was pinned after a failed probe may be safely re-probed.
-func (b *Backend) SetupProbeCacheFingerprint() (string, error) {
-	path, err := b.setupProbeCachePath()
-	if err != nil {
-		return "", err
-	}
-	file, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return "missing", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return "", err
-	}
-	raw, err := io.ReadAll(file)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(raw)
-	return fmt.Sprintf("%x:%d:%d", sum, info.Size(), info.ModTime().UnixNano()), nil
-}
-
-func (b *Backend) cachedProbe() (engine.BackendSetupProbe, error) {
-	cache, err := b.readCache()
-	if err != nil {
-		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache missing for %s; %s: %w", b.NameValue, setupCacheRefreshInstruction, err)
-	}
-	if cache.Version != engine.SetupProbeCacheVersion {
-		return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache version %d is stale; %s", cache.Version, setupCacheRefreshInstruction)
-	}
-	for _, p := range cache.Backends {
-		if p.Backend == b.NameValue {
-			return p, nil
-		}
-	}
-	return engine.BackendSetupProbe{}, fmt.Errorf("backend_unavailable: setup cache missing backend %s; %s", b.NameValue, setupCacheRefreshInstruction)
 }
 
 type Session struct {

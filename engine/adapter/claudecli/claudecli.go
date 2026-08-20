@@ -75,7 +75,6 @@ var readOnlyDeniedTools = []string{
 
 type Options struct {
 	Binary           string
-	CachePath        string
 	SupportedModels  []string
 	SupportedEfforts []string
 }
@@ -90,7 +89,6 @@ func New(opts Options) engine.Backend {
 		NameValue:      "claude",
 		Binary:         opts.Binary,
 		MinimumVersion: MinimumKnownGoodVersion,
-		CachePath:      opts.CachePath,
 		StreamSchema:   StreamSchema,
 		AllowedModels:  cliadapter.StringSet(opts.SupportedModels...),
 		AllowedEfforts: cliadapter.StringSet(efforts...),

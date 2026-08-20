@@ -146,53 +146,6 @@ func (d *acpDriver) Interrupt(ctx context.Context, conn *duplex.Conn) error {
 	return active.sendCancel(conn)
 }
 
-// SetupQualify validates Cursor's no-prompt ACP lifecycle. Version and CLI
-// discovery are performed by cliadapter.SetupProbe before this driver hook.
-func (d *acpDriver) SetupQualify(ctx context.Context, runner command.Runner, opts engine.SessionOpts) (engine.ModelDiscovery, error) {
-	if runner == nil {
-		return engine.ModelDiscovery{}, errors.New("command runner is required")
-	}
-	tempCWD, err := os.MkdirTemp("", "agentbus-cursor-acp-")
-	if err != nil {
-		return engine.ModelDiscovery{}, fmt.Errorf("create Cursor ACP qualification directory: %w", err)
-	}
-	defer os.RemoveAll(tempCWD)
-
-	qualifier := &acpQualificationDriver{driver: d}
-	qualifyOpts := opts
-	qualifyOpts.CWD = tempCWD
-	session, err := duplex.NewSession(duplex.SessionConfig{
-		Runner:  runner,
-		Driver:  qualifier,
-		Options: qualifyOpts,
-	})
-	if err != nil {
-		return engine.ModelDiscovery{}, err
-	}
-	events, err := session.TurnWithRunner(ctx, engine.TurnInput{Write: false, Timeout: opts.Timeout}, runner)
-	if err != nil {
-		return engine.ModelDiscovery{}, err
-	}
-
-	var terminal []string
-	for event := range events {
-		if event.Type == engine.EventTerminalError || event.Type == engine.EventWarning {
-			terminal = append(terminal, event.Text)
-		}
-	}
-	qualifier.mu.Lock()
-	discovery := qualifier.discovery
-	runErr := qualifier.err
-	qualifier.mu.Unlock()
-	if runErr != nil {
-		return engine.ModelDiscovery{}, runErr
-	}
-	if len(terminal) > 0 {
-		return engine.ModelDiscovery{}, errors.New(strings.Join(terminal, "; "))
-	}
-	return discovery, nil
-}
-
 func (d *acpDriver) newRPC(conn *duplex.Conn, emit duplex.EmitFunc) *acpRPC {
 	timeout := d.requestTimeout
 	if timeout <= 0 {
@@ -226,61 +179,6 @@ func (d *acpDriver) activeTurn(conn *duplex.Conn) *activeACPTurn {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.active[conn]
-}
-
-type acpQualificationDriver struct {
-	driver *acpDriver
-
-	mu        sync.Mutex
-	discovery engine.ModelDiscovery
-	err       error
-}
-
-func (d *acpQualificationDriver) ExecSpec(resumeID string, opts engine.SessionOpts, input engine.TurnInput) (command.ExecSpec, error) {
-	return d.driver.ExecSpec(resumeID, opts, input)
-}
-
-func (d *acpQualificationDriver) RunTurn(ctx context.Context, conn *duplex.Conn, _ string, opts engine.SessionOpts, input engine.TurnInput, _ duplex.EmitFunc) (string, error) {
-	sessionID, discovery, err := d.driver.qualify(ctx, conn, opts, input.Write)
-	d.mu.Lock()
-	d.discovery = discovery
-	d.err = err
-	d.mu.Unlock()
-	return sessionID, err
-}
-
-func (d *acpQualificationDriver) Interrupt(ctx context.Context, conn *duplex.Conn) error {
-	return d.driver.Interrupt(ctx, conn)
-}
-
-func (d *acpDriver) qualify(ctx context.Context, conn *duplex.Conn, opts engine.SessionOpts, write bool) (string, engine.ModelDiscovery, error) {
-	rpc := d.newRPC(conn, nil)
-	capabilities, err := rpc.initialize(ctx)
-	if err != nil {
-		return "", engine.ModelDiscovery{}, fmt.Errorf("cursor ACP initialize: %w", err)
-	}
-	if err := rpc.authenticate(ctx); err != nil {
-		return "", engine.ModelDiscovery{}, fmt.Errorf("cursor ACP authenticate: %w", err)
-	}
-	cwd, err := absoluteCWD(opts.CWD)
-	if err != nil {
-		return "", engine.ModelDiscovery{}, err
-	}
-	info, err := rpc.openSession(ctx, capabilities, "", cwd)
-	if err != nil {
-		return "", engine.ModelDiscovery{}, err
-	}
-
-	active := &activeACPTurn{sessionID: info.sessionID, write: write}
-	d.setActive(conn, active)
-	defer d.clearActive(conn, active)
-	if err := rpc.setMode(ctx, info.sessionID, cursorMode(write)); err != nil {
-		return info.sessionID, engine.ModelDiscovery{}, fmt.Errorf("could not verify Cursor mode: %w", err)
-	}
-	if !info.hasUsableModes() {
-		return info.sessionID, engine.ModelDiscovery{}, errors.New("Cursor session response missing usable modes")
-	}
-	return info.sessionID, info.discovery(), nil
 }
 
 type acpRPC struct {
@@ -514,7 +412,6 @@ func (c *acpRPC) writeError(id any, code int, message string) error {
 
 type acpSessionInfo struct {
 	sessionID string
-	modes     map[string]any
 	models    map[string]any
 }
 
@@ -526,7 +423,6 @@ func parseSessionInfo(result any) (acpSessionInfo, error) {
 	info := acpSessionInfo{
 		sessionID: firstString(object, "sessionId"),
 	}
-	info.modes, _ = firstMap(object, "modes")
 	info.models, _ = firstMap(object, "models")
 	if info.sessionID == "" {
 		return acpSessionInfo{}, errors.New("Cursor session response missing sessionId")
@@ -536,53 +432,6 @@ func parseSessionInfo(result any) (acpSessionInfo, error) {
 
 func (i acpSessionInfo) currentModel() string {
 	return firstString(i.models, "currentModelId")
-}
-
-func (i acpSessionInfo) hasUsableModes() bool {
-	for _, raw := range anySlice(i.modes["availableModes"]) {
-		switch value := raw.(type) {
-		case string:
-			if strings.TrimSpace(value) != "" {
-				return true
-			}
-		case map[string]any:
-			if firstString(value, "modeId", "id") != "" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (i acpSessionInfo) discovery() engine.ModelDiscovery {
-	discovery := engine.ModelDiscovery{
-		Source:    "cursor ACP session/new",
-		FetchedAt: time.Now().UTC().Format(time.RFC3339),
-	}
-	seen := make(map[string]struct{})
-	for _, raw := range anySlice(i.models["availableModels"]) {
-		model := ""
-		switch value := raw.(type) {
-		case string:
-			model = strings.TrimSpace(value)
-		case map[string]any:
-			model = firstString(value, "modelId", "id")
-		}
-		if model == "" {
-			continue
-		}
-		if _, ok := seen[model]; ok {
-			continue
-		}
-		seen[model] = struct{}{}
-		discovery.Models = append(discovery.Models, model)
-	}
-	if current := i.currentModel(); current != "" {
-		if _, ok := seen[current]; !ok {
-			discovery.Models = append(discovery.Models, current)
-		}
-	}
-	return discovery
 }
 
 type acpTurnObserver struct {

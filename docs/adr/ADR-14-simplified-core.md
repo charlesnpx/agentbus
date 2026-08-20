@@ -223,6 +223,15 @@ cancel invokes job.cancel. version reports application version 0.13.0 and
 protocol version 3. serve owns daemon startup only. setup, validate, every
 admission subcommand, and every internal-* subcommand are deleted.
 
+Admission validates a requested backend only by registered-backend map lookup;
+the daemon does not probe backends, lazily probe them, or retain a probe cache.
+A backend that cannot run still produces an in-memory session at session start;
+failure surfaces later inside `Session.Turn` as `failed` / `backend_error` with
+`cleanup=uncertain`. `Health.StreamSchema` is the stream protocol an adapter
+speaks, not a capability verified from the binary by Preflight. Probing during
+admission is prohibited because it could start a provider before a durable job
+record exists.
+
 ### One state vocabulary
 
 The public state set is exactly queued, running, completed, failed, canceled,
