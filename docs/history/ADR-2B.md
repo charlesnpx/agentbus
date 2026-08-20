@@ -1,5 +1,7 @@
 # ADR-2B: Submission modes
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 There are three submission modes. `IdentifiedFenced` resolves replay first, accepts atomically, and

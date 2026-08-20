@@ -18,7 +18,7 @@ func TestSessionInterruptUsesProtocolDefaultGrace(t *testing.T) {
 	original := terminateProcessGroup
 	defer func() { terminateProcessGroup = original }()
 	seen := make(chan time.Duration, 1)
-	terminateProcessGroup = func(_ *exec.Cmd, grace time.Duration) error {
+	terminateProcessGroup = func(_ *exec.Cmd, _ engine.ProcessRef, grace time.Duration) error {
 		seen <- grace
 		return nil
 	}
@@ -156,9 +156,9 @@ func assertDirectCommandRunnerContextDoneTerminatesOnce(t *testing.T, ctx contex
 	}
 	original := terminateProcessGroup
 	var calls atomic.Int32
-	terminateProcessGroup = func(cmd *exec.Cmd, grace time.Duration) error {
+	terminateProcessGroup = func(cmd *exec.Cmd, ref engine.ProcessRef, grace time.Duration) error {
 		calls.Add(1)
-		return original(cmd, grace)
+		return original(cmd, ref, grace)
 	}
 	t.Cleanup(func() { terminateProcessGroup = original })
 

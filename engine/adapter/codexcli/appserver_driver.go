@@ -20,8 +20,6 @@ import (
 
 const appServerRequestTimeout = 15 * time.Second
 
-var canonicalEffortOrder = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
-
 type appServerDriver struct {
 	binary         string
 	writePolicy    WritePolicy
@@ -137,47 +135,6 @@ func (d *appServerDriver) Interrupt(ctx context.Context, conn *duplex.Conn) erro
 	})
 }
 
-func (d *appServerDriver) SetupQualify(ctx context.Context, runner command.Runner, opts engine.SessionOpts) (engine.ModelDiscovery, error) {
-	if runner == nil {
-		return engine.ModelDiscovery{}, errors.New("command runner is required")
-	}
-	qualifier := &modelListQualificationDriver{driver: d}
-	session, err := duplex.NewSession(duplex.SessionConfig{
-		Runner:  runner,
-		Driver:  qualifier,
-		Options: opts,
-	})
-	if err != nil {
-		return engine.ModelDiscovery{}, err
-	}
-	events, err := session.TurnWithRunner(ctx, engine.TurnInput{Write: false, Timeout: opts.Timeout}, runner)
-	if err != nil {
-		return engine.ModelDiscovery{}, err
-	}
-
-	var terminal []string
-	for ev := range events {
-		if ev.Type == engine.EventTerminalError || ev.Type == engine.EventWarning {
-			terminal = append(terminal, ev.Text)
-		}
-	}
-
-	qualifier.mu.Lock()
-	discovery := qualifier.discovery
-	runErr := qualifier.err
-	qualifier.mu.Unlock()
-	if runErr != nil {
-		return engine.ModelDiscovery{}, runErr
-	}
-	if len(terminal) > 0 {
-		return engine.ModelDiscovery{}, errors.New(strings.Join(terminal, "; "))
-	}
-	if len(discovery.Models) == 0 {
-		return engine.ModelDiscovery{}, errors.New("codex app-server model/list returned no usable models")
-	}
-	return discovery, nil
-}
-
 func (d *appServerDriver) binaryName() string {
 	if strings.TrimSpace(d.binary) == "" {
 		return "codex"
@@ -218,36 +175,6 @@ func (d *appServerDriver) activeTurn(conn *duplex.Conn) *activeAppServerTurn {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.active[conn]
-}
-
-type modelListQualificationDriver struct {
-	driver *appServerDriver
-
-	mu        sync.Mutex
-	discovery engine.ModelDiscovery
-	err       error
-}
-
-func (d *modelListQualificationDriver) ExecSpec(resumeID string, opts engine.SessionOpts, input engine.TurnInput) (command.ExecSpec, error) {
-	return d.driver.ExecSpec(resumeID, opts, input)
-}
-
-func (d *modelListQualificationDriver) RunTurn(ctx context.Context, conn *duplex.Conn, _ string, _ engine.SessionOpts, _ engine.TurnInput, _ duplex.EmitFunc) (string, error) {
-	rpc := d.driver.newRPC(conn, nil)
-	err := rpc.handshake(ctx)
-	var discovery engine.ModelDiscovery
-	if err == nil {
-		discovery, err = rpc.listModels(ctx)
-	}
-	d.mu.Lock()
-	d.discovery = discovery
-	d.err = err
-	d.mu.Unlock()
-	return "", err
-}
-
-func (d *modelListQualificationDriver) Interrupt(ctx context.Context, conn *duplex.Conn) error {
-	return d.driver.Interrupt(ctx, conn)
 }
 
 type appServerRPC struct {
@@ -311,39 +238,6 @@ func (c *appServerRPC) request(ctx context.Context, method string, params any, o
 		}
 		c.handleNotification(frame)
 	}
-}
-
-func (c *appServerRPC) listModels(ctx context.Context) (engine.ModelDiscovery, error) {
-	discovery := engine.ModelDiscovery{
-		Source:    "app-server",
-		FetchedAt: time.Now().UTC().Format(time.RFC3339),
-	}
-	seenModels := make(map[string]struct{})
-	seenEfforts := make(map[string]struct{})
-	var unknownEfforts []string
-	seenCursors := make(map[string]struct{})
-	cursor := ""
-	for {
-		params := map[string]any{"includeHidden": false}
-		if cursor != "" {
-			params["cursor"] = cursor
-		}
-		result, err := c.request(ctx, "model/list", params, nil)
-		if err != nil {
-			return engine.ModelDiscovery{}, err
-		}
-		nextCursor := parseModelListPage(result, &discovery, seenModels, seenEfforts, &unknownEfforts)
-		if nextCursor == "" {
-			break
-		}
-		if _, seen := seenCursors[nextCursor]; seen {
-			return engine.ModelDiscovery{}, fmt.Errorf("codex app-server model/list repeated cursor %q", nextCursor)
-		}
-		seenCursors[nextCursor] = struct{}{}
-		cursor = nextCursor
-	}
-	discovery.Efforts = orderedEfforts(seenEfforts, unknownEfforts)
-	return discovery, nil
 }
 
 func (c *appServerRPC) nextFrame(ctx context.Context) (duplex.Frame, error) {
@@ -920,72 +814,6 @@ func responseResult(obj map[string]any) (any, error) {
 		return nil, errors.New("response missing result")
 	}
 	return result, nil
-}
-
-func parseModelListPage(result any, discovery *engine.ModelDiscovery, seenModels, seenEfforts map[string]struct{}, unknownEfforts *[]string) string {
-	obj, _ := result.(map[string]any)
-	models := anySlice(firstAny(obj, "data", "models"))
-	for _, raw := range models {
-		model, ok := raw.(map[string]any)
-		if !ok || boolValue(model["hidden"]) {
-			continue
-		}
-		slug := strings.TrimSpace(firstString(model, "model", "id", "slug", "name"))
-		if slug == "" {
-			continue
-		}
-		if _, seen := seenModels[slug]; !seen {
-			seenModels[slug] = struct{}{}
-			discovery.Models = append(discovery.Models, slug)
-		}
-		for _, effort := range effortsFromModel(model) {
-			if _, seen := seenEfforts[effort]; seen {
-				continue
-			}
-			seenEfforts[effort] = struct{}{}
-			if isCanonicalEffort(effort) {
-				continue
-			}
-			*unknownEfforts = append(*unknownEfforts, effort)
-		}
-	}
-	return strings.TrimSpace(firstString(obj, "nextCursor", "next_cursor", "cursor"))
-}
-
-func effortsFromModel(model map[string]any) []string {
-	var efforts []string
-	for _, raw := range anySlice(firstAny(model, "supportedReasoningEfforts", "supported_reasoning_efforts", "supportedReasoningLevels", "supported_reasoning_levels")) {
-		switch value := raw.(type) {
-		case string:
-			if effort := strings.TrimSpace(value); effort != "" {
-				efforts = append(efforts, effort)
-			}
-		case map[string]any:
-			if effort := strings.TrimSpace(firstString(value, "reasoningEffort", "reasoning_effort", "effort")); effort != "" {
-				efforts = append(efforts, effort)
-			}
-		}
-	}
-	return efforts
-}
-
-func orderedEfforts(seen map[string]struct{}, unknown []string) []string {
-	var efforts []string
-	for _, effort := range canonicalEffortOrder {
-		if _, ok := seen[effort]; ok {
-			efforts = append(efforts, effort)
-		}
-	}
-	return append(efforts, unknown...)
-}
-
-func isCanonicalEffort(effort string) bool {
-	for _, known := range canonicalEffortOrder {
-		if effort == known {
-			return true
-		}
-	}
-	return false
 }
 
 func extractThreadID(result any) string {

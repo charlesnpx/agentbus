@@ -3,12 +3,14 @@ package command
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,17 +30,23 @@ const (
 )
 
 func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningCommand, error) {
+	if ctx == nil {
+		panic("nil Context")
+	}
 	if len(spec.Argv) == 0 || strings.TrimSpace(spec.Argv[0]) == "" {
 		return nil, errors.New("command argv is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	grace := r.CancelGrace
 	if grace == 0 {
 		grace = engine.DefaultCancelGrace
 	}
-	cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
+	// DirectCommandRunner owns cancellation so every termination attempt reaches
+	// the identity-fenced terminator.
+	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...)
 	terminator := &directTerminator{cmd: cmd, grace: grace}
-	cmd.Cancel = terminator.terminate
-	cmd.WaitDelay = 200 * time.Millisecond
 	if spec.Dir != "" {
 		cmd.Dir = spec.Dir
 	}
@@ -81,38 +89,50 @@ func (r DirectCommandRunner) Start(ctx context.Context, spec ExecSpec) (RunningC
 		stderr.closeWriter(err)
 		return nil, err
 	}
+	terminator.captureProcessRef()
 	_ = stdoutWriter.Close()
 	_ = stderrWriter.Close()
 	stdoutDrain := drainDirectOutput(stdoutReader, stdout)
 	stderrDrain := drainDirectOutput(stderrReader, stderr)
-	return &directRunningCommand{
-		cmd:         cmd,
-		stdin:       stdin,
-		stdout:      stdout,
-		stderr:      stderr,
-		cancelGrace: grace,
-		terminator:  terminator,
-		stdoutDrain: stdoutDrain,
-		stderrDrain: stderrDrain,
-		stdoutPipe:  stdoutReader,
-		stderrPipe:  stderrReader,
-	}, nil
+	running := &directRunningCommand{
+		cmd:              cmd,
+		stdin:            stdin,
+		stdout:           stdout,
+		stderr:           stderr,
+		cancelGrace:      grace,
+		terminator:       terminator,
+		stdoutDrain:      stdoutDrain,
+		stderrDrain:      stderrDrain,
+		stdoutPipe:       stdoutReader,
+		stderrPipe:       stderrReader,
+		startContextStop: make(chan struct{}),
+		startContextDone: make(chan struct{}),
+		cleanupDone:      make(chan struct{}),
+	}
+	running.watchStartContext(ctx)
+	return running, nil
 }
 
 type directRunningCommand struct {
-	cmd         *exec.Cmd
-	stdin       io.WriteCloser
-	stdout      *directOutputBuffer
-	stderr      *directOutputBuffer
-	cancelGrace time.Duration
-	terminator  *directTerminator
-	stdoutDrain <-chan struct{}
-	stderrDrain <-chan struct{}
-	stdoutPipe  *os.File
-	stderrPipe  *os.File
-	waitOnce    sync.Once
-	waitExit    ExitObservation
-	waitErr     error
+	cmd              *exec.Cmd
+	stdin            io.WriteCloser
+	stdout           *directOutputBuffer
+	stderr           *directOutputBuffer
+	cancelGrace      time.Duration
+	terminator       *directTerminator
+	stdoutDrain      <-chan struct{}
+	stderrDrain      <-chan struct{}
+	stdoutPipe       *os.File
+	stderrPipe       *os.File
+	startContextStop chan struct{}
+	startContextDone chan struct{}
+	cleanupOnce      sync.Once
+	cleanupDone      chan struct{}
+	cleanupErr       error
+	waitOnce         sync.Once
+	waitDone         chan struct{}
+	waitExit         ExitObservation
+	waitErr          error
 }
 
 func (r *directRunningCommand) Stdin() io.WriteCloser {
@@ -130,37 +150,171 @@ func (r *directRunningCommand) Stderr() io.ReadCloser {
 func (r *directRunningCommand) Wait(ctx context.Context) (ExitObservation, error) {
 	stopWatching := r.watchWaitContext(ctx)
 	defer stopWatching()
+	r.startWait()
+	if r.cleanupDone == nil {
+		<-r.waitDone
+		return r.waitExit, r.waitErr
+	}
+	select {
+	case <-r.waitDone:
+		return r.waitExit, r.waitErr
+	default:
+	}
+	select {
+	case <-r.waitDone:
+		return r.waitExit, r.waitErr
+	case <-r.cleanupDone:
+		return ExitObservation{}, r.cleanupErr
+	}
+}
+
+// FinalObservation keeps execution and cleanup outcomes independent. A failed
+// termination attempt is reported as cleanup uncertainty immediately, while
+// the single waiter continues to reap the command if it exits later.
+func (r *directRunningCommand) FinalObservation(ctx context.Context) (FinalObservation, error) {
+	r.startWait()
+	if cleanupErr, reported := r.cleanupResult(); reported {
+		return r.finalObservationWithCleanup(cleanupErr), nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-r.waitDone:
+		observation := FinalObservation{
+			Exit:         r.waitExit,
+			ExecutionErr: r.waitErr,
+		}
+		if cleanupErr, reported := r.cleanupResult(); reported {
+			observation.CleanupErr = cleanupErr
+		}
+		return observation, nil
+	case <-r.cleanupDone:
+		return r.finalObservationWithCleanup(r.cleanupErr), nil
+	case <-ctx.Done():
+		return FinalObservation{}, ctx.Err()
+	}
+}
+
+func (r *directRunningCommand) cleanupResult() (error, bool) {
+	if r.cleanupDone == nil {
+		return nil, false
+	}
+	select {
+	case <-r.cleanupDone:
+		return r.cleanupErr, true
+	default:
+		return nil, false
+	}
+}
+
+func (r *directRunningCommand) finalObservationWithCleanup(cleanupErr error) FinalObservation {
+	observation := FinalObservation{CleanupErr: cleanupErr}
+	select {
+	case <-r.waitDone:
+		observation.Exit = r.waitExit
+		observation.ExecutionErr = r.waitErr
+	default:
+	}
+	return observation
+}
+
+func (r *directRunningCommand) startWait() {
 	r.waitOnce.Do(func() {
-		err := r.cmd.Wait()
-		if errors.Is(err, exec.ErrWaitDelay) {
-			err = nil
+		if r.waitDone == nil {
+			r.waitDone = make(chan struct{})
 		}
-		if r.stdoutDrain != nil {
-			// Stdout is the live-leader stream boundary. Once the leader has
-			// exited, descendants retaining stdout get only the runner cancel
-			// grace before the local read end is closed.
-			if !waitDirectDrain(r.stdoutDrain, r.cancelGrace) && r.stdoutPipe != nil {
-				r.closeOutputPipes()
-			}
-			<-r.stdoutDrain
-		}
-		if r.stderrDrain != nil {
-			if !waitDirectDrain(r.stderrDrain, directStderrDrainGrace) && r.stderrPipe != nil {
-				r.closeOutputPipes()
-			}
-			<-r.stderrDrain
-		}
-		r.stdout.closeWriter(nil)
-		r.stderr.closeWriter(nil)
-		r.waitExit = exitObservationForCmd(r.cmd)
-		r.waitErr = err
+		go func() {
+			r.waitForExit()
+			close(r.waitDone)
+		}()
 	})
-	return r.waitExit, r.waitErr
+}
+
+func (r *directRunningCommand) waitForExit() {
+	err := r.cmd.Wait()
+	if r.terminator != nil {
+		r.terminator.markLeaderReaped()
+	}
+	r.stopStartContext()
+	if r.stdoutDrain != nil {
+		// Stdout is the live-leader stream boundary. Once the leader has
+		// exited, descendants retaining stdout get only the runner cancel
+		// grace before the local read end is closed.
+		if !waitDirectDrain(r.stdoutDrain, r.cancelGrace) && r.stdoutPipe != nil {
+			r.closeOutputPipes()
+		}
+		<-r.stdoutDrain
+	}
+	if r.stderrDrain != nil {
+		if !waitDirectDrain(r.stderrDrain, directStderrDrainGrace) && r.stderrPipe != nil {
+			r.closeOutputPipes()
+		}
+		<-r.stderrDrain
+	}
+	r.stdout.closeWriter(nil)
+	r.stderr.closeWriter(nil)
+	r.waitExit = exitObservationForCmd(r.cmd)
+	r.waitErr = err
+}
+
+func (r *directRunningCommand) watchStartContext(ctx context.Context) {
+	if r.startContextDone == nil {
+		return
+	}
+	if ctx == nil || ctx.Done() == nil {
+		close(r.startContextDone)
+		return
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = r.terminate()
+		case <-r.startContextStop:
+		}
+		close(r.startContextDone)
+	}()
+}
+
+func (r *directRunningCommand) terminate() error {
+	var err error
+	if r.terminator != nil {
+		err = r.terminator.terminate()
+	} else {
+		err = terminateProcessGroup(r.cmd, processRefForCmd(r.cmd), r.cancelGrace)
+	}
+	r.publishCleanupResult(err)
+	return err
+}
+
+func (r *directRunningCommand) publishCleanupResult(err error) {
+	if err == nil {
+		return
+	}
+	r.cleanupOnce.Do(func() {
+		r.cleanupErr = fmt.Errorf("exec: canceling Cmd: %w", err)
+		if r.cleanupDone != nil {
+			close(r.cleanupDone)
+		}
+		// A cleanup failure must not trigger another signal attempt, but it
+		// still needs one waiter to reap the command if it exits later.
+		r.startWait()
+	})
+}
+
+func (r *directRunningCommand) stopStartContext() {
+	if r.startContextStop == nil || r.startContextDone == nil {
+		return
+	}
+	close(r.startContextStop)
+	<-r.startContextDone
 }
 
 func (r *directRunningCommand) closeOutputPipes() {
 	if r.terminator != nil {
-		r.terminator.closePipes()
+		if r.terminator.canClosePipes() {
+			r.terminator.closePipes()
+		}
 		return
 	}
 	if r.stdoutPipe != nil {
@@ -179,9 +333,7 @@ func (r *directRunningCommand) watchWaitContext(ctx context.Context) func() {
 	go func() {
 		select {
 		case <-ctx.Done():
-			if r.terminator != nil {
-				_ = r.terminator.terminate()
-			}
+			_ = r.terminate()
 		case <-stop:
 		}
 	}()
@@ -191,11 +343,7 @@ func (r *directRunningCommand) watchWaitContext(ctx context.Context) func() {
 func (r *directRunningCommand) Interrupt(ctx context.Context) error {
 	done := make(chan error, 1)
 	go func() {
-		if r.terminator != nil {
-			done <- r.terminator.terminate()
-			return
-		}
-		done <- terminateProcessGroup(r.cmd, r.cancelGrace)
+		done <- r.terminate()
 	}()
 	select {
 	case <-ctx.Done():
@@ -206,6 +354,10 @@ func (r *directRunningCommand) Interrupt(ctx context.Context) error {
 }
 
 func (r *directRunningCommand) ProcessRef() (engine.ProcessRef, int) {
+	if r.terminator != nil {
+		ref := r.terminator.capturedProcessRef()
+		return ref, ref.PID
+	}
 	ref := processRefForCmd(r.cmd)
 	return ref, ref.PID
 }
@@ -226,23 +378,65 @@ func exitObservationForCmd(cmd *exec.Cmd) ExitObservation {
 }
 
 type directTerminator struct {
-	cmd       *exec.Cmd
-	grace     time.Duration
-	pipes     []*os.File
-	once      sync.Once
-	pipesOnce sync.Once
-	err       error
+	cmd                  *exec.Cmd
+	grace                time.Duration
+	pipes                []*os.File
+	once                 sync.Once
+	pipesOnce            sync.Once
+	processRef           engine.ProcessRef
+	leaderReaped         atomic.Bool
+	terminationStarted   atomic.Bool
+	terminationSucceeded atomic.Bool
+	err                  error
+}
+
+func (t *directTerminator) captureProcessRef() {
+	if t == nil {
+		return
+	}
+	t.processRef = processRefForCmd(t.cmd)
+}
+
+func (t *directTerminator) capturedProcessRef() engine.ProcessRef {
+	if t == nil {
+		return engine.ProcessRef{}
+	}
+	return t.processRef
+}
+
+// markLeaderReaped records the sole cmd.Wait completion, so a later termination
+// attempt does not signal an orphaned process group whose identity cannot be
+// fenced.
+func (t *directTerminator) markLeaderReaped() {
+	if t != nil {
+		t.leaderReaped.Store(true)
+	}
 }
 
 func (t *directTerminator) terminate() error {
 	if t == nil {
 		return nil
 	}
+	t.terminationStarted.Store(true)
 	t.once.Do(func() {
-		t.err = terminateProcessGroup(t.cmd, t.grace)
-		t.closePipes()
+		// cmd.Wait has established that this direct execution is over. Do not
+		// attempt a group signal after its leader has been reaped.
+		if t.leaderReaped.Load() {
+			t.terminationSucceeded.Store(true)
+			t.closePipes()
+			return
+		}
+		t.err = terminateProcessGroup(t.cmd, t.processRef, t.grace)
+		if t.err == nil {
+			t.terminationSucceeded.Store(true)
+			t.closePipes()
+		}
 	})
 	return t.err
+}
+
+func (t *directTerminator) canClosePipes() bool {
+	return !t.terminationStarted.Load() || t.terminationSucceeded.Load()
 }
 
 func (t *directTerminator) closePipes() {

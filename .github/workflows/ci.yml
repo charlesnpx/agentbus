@@ -28,6 +28,9 @@ jobs:
           go-version: 1.26.x
           cache: true
 
+      - name: Format
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
       - name: Build
         run: go build ./...
 
@@ -55,7 +58,7 @@ jobs:
           cache: true
 
       - name: Cross-compile embedded engine
-        # ./... includes cmd/agentbus, whose nativecustody implementation is Unix-only; downstream consumers cross-compile the embedded engine.
+        # Downstream consumers cross-compile the embedded engine.
         run: |
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./engine/...
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./engine/...

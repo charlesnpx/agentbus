@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charlesnpx/agentbus/internal/procgroup"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -56,6 +54,23 @@ func TestLaunchFailedRecordIncludesDiagnosticAndStderr(t *testing.T) {
 		t.Fatalf("stderr tail not surfaced: %+v / %v", startup, err)
 	}
 	assertPIDGone(t, readPIDFile(t, pidPath))
+}
+
+func TestLaunchSetsid(t *testing.T) {
+	root := shortLaunchTempDir(t)
+	result, err := Launch(context.Background(), helperLaunchOptions(t, root, "ready", "", 2*time.Second))
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	t.Cleanup(func() { _ = result.KillAndWait() })
+
+	pgid, err := syscall.Getpgid(result.PID)
+	if err != nil {
+		t.Fatalf("Getpgid(%d) error = %v", result.PID, err)
+	}
+	if pgid != result.PID {
+		t.Fatalf("launched child process group = %d, want its pid %d", pgid, result.PID)
+	}
 }
 
 func TestLaunchCrashBeforeRecordIncludesStderrAndReaps(t *testing.T) {
@@ -280,25 +295,6 @@ func TestInheritedReporterClearsEnvAndMarksCloseOnExec(t *testing.T) {
 	}
 }
 
-func TestLaunchSetsid(t *testing.T) {
-	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
-		t.Skip("process group assertion is Unix-specific")
-	}
-	root := shortLaunchTempDir(t)
-	result, err := Launch(context.Background(), helperLaunchOptions(t, root, "ready", "", 2*time.Second))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = result.KillAndWait() })
-	pgid, err := procgroup.ReadProcessPGID(result.PID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pgid != result.PID {
-		t.Fatalf("child pgid = %d, want pid %d", pgid, result.PID)
-	}
-}
-
 func runLaunchHelper() int {
 	mode := os.Getenv(launchHelperModeEnv)
 	root := os.Getenv("AGENTBUS_STATE_ROOT")
@@ -510,15 +506,13 @@ func serveOneVerifiedHello(listener net.Listener, token string, helloSeen chan<-
 	}
 	resp := protocol.Response{JSONRPC: "2.0", ID: req.ID}
 	var params protocol.HelloParams
-	if req.Method != protocol.MethodHello || json.Unmarshal(req.Params, &params) != nil || params.Token != token {
+	if req.Method != protocol.MethodHello || json.Unmarshal(req.Params, &params) != nil || params.Token != token || params.ClientProtocolVersion != protocol.Version {
 		resp.Error = protocol.NewError(protocol.ErrorUnauthorized, "unauthorized", protocol.ErrorData{})
 		_ = json.NewEncoder(conn).Encode(resp)
 		return
 	}
 	resp.Result = protocol.HelloResult{
 		ProtocolVersion: protocol.Version,
-		Backends:        []string{},
-		Capabilities:    protocol.DefaultCapabilities(),
 	}
 	_ = json.NewEncoder(conn).Encode(resp)
 	helloSeen <- struct{}{}
