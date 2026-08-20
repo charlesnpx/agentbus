@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/service"
@@ -16,17 +15,6 @@ import (
 type Config = service.Config
 
 var ErrShutdownDeadlineExceeded = service.ErrShutdownDeadlineExceeded
-
-type serviceServer interface {
-	ServeWithStartupContext(context.Context, context.Context) error
-	Shutdown(context.Context) error
-	ShutdownTimeout() time.Duration
-}
-
-var canonicalStateRootFunc = daemonlaunch.CanonicalStateRoot
-var newServiceServer = func(cfg service.Config) (serviceServer, error) {
-	return service.New(cfg)
-}
 
 type readinessPublicationGuard struct {
 	mu         sync.Mutex
@@ -107,7 +95,7 @@ func Serve(ctx context.Context, cfg Config) error {
 					return err
 				}
 			}
-			canonicalRoot, err := canonicalStateRootFunc(info.StateRoot)
+			canonicalRoot, err := daemonlaunch.CanonicalStateRoot(info.StateRoot)
 			if err != nil {
 				return err
 			}
@@ -119,7 +107,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	server, err := newServiceServer(cfg)
+	server, err := service.New(cfg)
 	if err != nil {
 		if cleanServeTerminationAfterCancel(ctx, err) {
 			return nil

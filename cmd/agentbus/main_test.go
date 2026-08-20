@@ -19,11 +19,19 @@ import (
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
-func TestVersionReportsV3(t *testing.T) {
+func TestVersionReportsBothVersions(t *testing.T) {
 	a := testApp(t)
-	code, stdout, stderr := runTestCLI(t, a, []string{"version", "--json"})
+	code, stdout, stderr := runTestCLI(t, a, []string{"version"})
 	if code != 0 || stderr != "" {
 		t.Fatalf("version exit=%d stderr=%q", code, stderr)
+	}
+	if stdout != "agentbus test protocol 3\n" {
+		t.Fatalf("human version output = %q", stdout)
+	}
+
+	code, stdout, stderr = runTestCLI(t, a, []string{"version", "--json"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("JSON version exit=%d stderr=%q", code, stderr)
 	}
 	var got versionOutput
 	decodeJSON(t, stdout, &got)
@@ -32,29 +40,21 @@ func TestVersionReportsV3(t *testing.T) {
 	}
 }
 
-func TestDeletedCommandsAreUnknown(t *testing.T) {
+func TestDeletedCommandIsUnknown(t *testing.T) {
 	a := testApp(t)
-	for _, command := range []string{
-		"setup",
-		"validate",
-		"admission",
-		"internal-parked-worker",
-		"internal-monitor",
-		"internal-native-self-test-fixture",
-	} {
-		code, _, stderr := runTestCLI(t, a, []string{command})
-		if code != 2 || !strings.Contains(stderr, "unknown command") {
-			t.Fatalf("%s: exit=%d stderr=%q, want unknown-command usage error", command, code, stderr)
-		}
+	code, _, stderr := runTestCLI(t, a, []string{"setup"})
+	if code != 2 || !strings.Contains(stderr, "unknown command") {
+		t.Fatalf("exit=%d stderr=%q, want unknown-command usage error", code, stderr)
 	}
 }
 
 func TestStatusAndResultJSONAreByteIdentical(t *testing.T) {
+	digest := strings.Repeat("a", sha256.Size*2)
 	record := detailedRecord(protocol.PublicStateCompleted)
 	record.Result = &protocol.ResultInfoWire{
 		Text:       "the result",
 		ResultPath: "/state/results/job-1",
-		SHA256:     "sha256:0123456789abcdef",
+		SHA256:     digest,
 		Bytes:      10,
 	}
 	a := testApp(t)
@@ -70,6 +70,9 @@ func TestStatusAndResultJSONAreByteIdentical(t *testing.T) {
 	if statusJSON != resultJSON {
 		t.Fatalf("status JSON = %q\nresult JSON = %q\nwant byte-identical job.get records", statusJSON, resultJSON)
 	}
+	if !strings.Contains(statusJSON, `"result":{"text":"the result","resultPath":"/state/results/job-1","sha256":"`+digest+`","bytes":10}`) {
+		t.Fatalf("result JSON shape = %q, want bare lowercase SHA-256 value", statusJSON)
+	}
 }
 
 func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testing.T) {
@@ -83,7 +86,7 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	record.Result = &protocol.ResultInfoWire{
 		Text:       "secret result text",
 		ResultPath: "/state/results/job-1",
-		SHA256:     "sha256:0123456789abcdef",
+		SHA256:     strings.Repeat("a", sha256.Size*2),
 		Bytes:      18,
 	}
 	record.Failure = &protocol.JobFailureWire{Class: protocol.FailureClassBackendError, Reason: "provider stopped"}
@@ -103,7 +106,7 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 		"finishedAt=2026-01-02T03:06:05Z",
 		"timeout.effective=1800000 timeout.source=client",
 		"model=gpt-5 tags=a=first,z=last",
-		"result.bytes=18 result.sha256=sha256:0123456789ab",
+		"result.bytes=18 result.sha256=sha256:aaaaaaaaaaaa",
 		"failure.class=backend_error failure.reason=provider stopped",
 		"contract.evaluated=true contract.compliant=false",
 		"logPaths.stdout=/logs/out logPaths.stderr=/logs/err",
@@ -117,21 +120,25 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 	}
 }
 
-func TestStatusListHumanProjectionUsesCompactFields(t *testing.T) {
+func TestStatusListHumanProjectionIncludesFailureClassAndContractVerdict(t *testing.T) {
 	created := time.Now().UTC().Add(-2 * time.Minute)
 	a := testApp(t)
 	a.clientConnect = fakeConnector(&fakeProtocolClient{list: agentclient.JobGetListResult{Jobs: []agentclient.JobSummaryWire{{
-		JobID:     "job-1",
-		Backend:   "codex",
-		State:     protocol.PublicStateRunning,
-		Cleanup:   protocol.CleanupUncertain,
-		CreatedAt: created,
+		JobID:        "job-1",
+		Backend:      "codex",
+		State:        protocol.PublicStateRunning,
+		Cleanup:      protocol.CleanupUncertain,
+		CreatedAt:    created,
+		FailureClass: protocol.FailureClassBackendError,
+		Contract:     &protocol.ContractVerdict{Evaluated: true, Compliant: false},
 	}}}})
 	code, stdout, stderr := runTestCLI(t, a, []string{"status"})
 	if code != 0 || stderr != "" {
 		t.Fatalf("status list exit=%d stderr=%q", code, stderr)
 	}
-	if !strings.Contains(stdout, "jobId=job-1 state=running backend=codex cleanup=uncertain age=") {
+	if !strings.Contains(stdout, "jobId=job-1 state=running backend=codex cleanup=uncertain age=") ||
+		!strings.Contains(stdout, "failure.class=backend_error") ||
+		!strings.Contains(stdout, "contract.evaluated=true contract.compliant=false") {
 		t.Fatalf("status list = %q", stdout)
 	}
 }
@@ -146,8 +153,14 @@ func TestResultHumanProjection(t *testing.T) {
 	}{
 		{
 			name:     "text is pipeable and newline terminated",
-			record:   withResult(detailedRecord(protocol.PublicStateCompleted), &protocol.ResultInfoWire{Text: "pipe me", SHA256: "sha256:abc", Bytes: 7}),
+			record:   withResult(detailedRecord(protocol.PublicStateCompleted), &protocol.ResultInfoWire{Text: "pipe me", SHA256: strings.Repeat("a", sha256.Size*2), Bytes: 7}),
 			wantCode: 0, wantStdout: "pipe me\n",
+		},
+		{
+			name:       "completed without result is unavailable",
+			record:     detailedRecord(protocol.PublicStateCompleted),
+			wantCode:   cliExitResultUnavailable,
+			wantStderr: "no authoritative result",
 		},
 		{
 			name:     "failed writes diagnostics only",
@@ -191,6 +204,27 @@ func TestResultStreamsVerifiedArtifact(t *testing.T) {
 	code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1"})
 	if code != 0 || stdout != string(artifactBytes) || stderr != "" {
 		t.Fatalf("result=(code=%d stdout=%d bytes stderr=%q), want verified artifact bytes and success", code, len(stdout), stderr)
+	}
+}
+
+func TestResultRejectsPrefixedDigest(t *testing.T) {
+	artifactBytes := []byte("authoritative result")
+	artifactPath := filepath.Join(t.TempDir(), "result.txt")
+	if err := os.WriteFile(artifactPath, artifactBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(artifactBytes)
+	record := withResult(detailedRecord(protocol.PublicStateCompleted), &protocol.ResultInfoWire{
+		ResultPath: artifactPath,
+		SHA256:     "sha256:" + hex.EncodeToString(sum[:]),
+		Bytes:      int64(len(artifactBytes)),
+	})
+	a := testApp(t)
+	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1"})
+	if code != cliExitResultUnavailable || stdout != "" || !strings.Contains(stderr, "SHA-256 check failed") {
+		t.Fatalf("result=(code=%d stdout=%q stderr=%q), want prefixed digest rejection", code, stdout, stderr)
 	}
 }
 
@@ -276,6 +310,18 @@ func TestProtocolErrorsAndStartupFailuresKeepTypedExitCodes(t *testing.T) {
 				t.Fatalf("status=(%d,%q,%q), want code %d and diagnostics", code, stdout, stderr, tt.want)
 			}
 		})
+	}
+}
+
+func TestServeBackgroundStartupFailureUsesExit11(t *testing.T) {
+	a := testApp(t)
+	a.daemonLauncher = func(context.Context, daemonlaunch.Options) (daemonlaunch.Result, error) {
+		return daemonlaunch.Result{}, &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessEOF}
+	}
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"serve"})
+	if code != cliExitDaemonStartupFailure || stdout != "" || !strings.Contains(stderr, "serve:") {
+		t.Fatalf("serve=(code=%d stdout=%q stderr=%q), want startup exit %d", code, stdout, stderr, cliExitDaemonStartupFailure)
 	}
 }
 

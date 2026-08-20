@@ -118,7 +118,7 @@ type Options struct {
 	DisableAutoStart bool
 	CommandPath      string
 	StartTimeout     time.Duration
-	Starter          DaemonStarter
+	Starter          Starter
 }
 
 // StartOptions are passed to a daemon starter.
@@ -144,17 +144,8 @@ func (result StartResult) KillAndWait() error {
 	return result.killAndWait()
 }
 
-// DaemonStarter starts an agentbus foreground daemon process.
-type DaemonStarter interface {
-	StartDaemon(context.Context, StartOptions) (StartResult, error)
-}
-
-// StartFunc adapts a function to DaemonStarter.
-type StartFunc func(context.Context, StartOptions) (StartResult, error)
-
-func (f StartFunc) StartDaemon(ctx context.Context, opts StartOptions) (StartResult, error) {
-	return f(ctx, opts)
-}
+// Starter starts an agentbus foreground daemon process.
+type Starter func(context.Context, StartOptions) (StartResult, error)
 
 // Client is a typed JSON-RPC client for the local agentbus daemon.
 type Client struct {
@@ -341,9 +332,9 @@ func (c *Client) autostart(ctx context.Context) error {
 	}
 	starter := c.opts.Starter
 	if starter == nil {
-		starter = defaultStarter{}
+		starter = defaultStarter
 	}
-	started, err := starter.StartDaemon(autoCtx, StartOptions{
+	started, err := starter(autoCtx, StartOptions{
 		StateRoot:   c.stateRoot,
 		SocketPath:  c.socketPath,
 		TokenPath:   c.tokenPath,
@@ -674,9 +665,7 @@ func remainingTimeout(ctx context.Context) time.Duration {
 	return remaining
 }
 
-type defaultStarter struct{}
-
-func (defaultStarter) StartDaemon(ctx context.Context, opts StartOptions) (StartResult, error) {
+func defaultStarter(ctx context.Context, opts StartOptions) (StartResult, error) {
 	command := opts.CommandPath
 	if command == "" {
 		var err error

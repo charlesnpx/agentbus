@@ -135,7 +135,7 @@ func (a *app) runVersion(args []string, out, errOut io.Writer) int {
 	if *jsonOut {
 		return writeOrError(out, errOut, versionOutput{Schema: cliJSONSchema, Version: a.version, ProtocolVersion: protocol.Version3})
 	}
-	fmt.Fprintf(out, "agentbus %s\n", a.version)
+	fmt.Fprintf(out, "agentbus %s protocol %d\n", a.version, protocol.Version3)
 	return 0
 }
 
@@ -150,7 +150,7 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 	}
 	if !*foreground {
 		if err := a.startBackgroundDaemon(ctx); err != nil {
-			return commandError(errOut, err)
+			return protocolCommandError(errOut, "serve", err)
 		}
 		return 0
 	}
@@ -313,7 +313,15 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 			return writeOrError(out, errOut, list)
 		}
 		for _, summary := range list.Jobs {
-			printJobSummary(out, summary)
+			printJobSummary(out,
+				summary.JobID,
+				summary.State,
+				summary.Backend,
+				summary.Cleanup,
+				summary.CreatedAt,
+				summary.FailureClass,
+				summary.Contract,
+			)
 		}
 		return 0
 	}
@@ -420,24 +428,19 @@ func (a *app) connectProtocolClient(ctx context.Context) (protocolClient, error)
 	return agentclient.Connect(ctx, opts)
 }
 
-func printJobSummary(out io.Writer, summary agentclient.JobSummaryWire) {
-	fmt.Fprintf(out, "jobId=%s state=%s backend=%s cleanup=%s age=%s\n",
-		summary.JobID,
-		summary.State,
-		summary.Backend,
-		summary.Cleanup,
-		jobAge(summary.CreatedAt),
-	)
+func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, backend string, cleanup protocol.Cleanup, createdAt time.Time, failureClass protocol.FailureClass, contract *protocol.ContractVerdict) {
+	fmt.Fprintf(out, "jobId=%s state=%s backend=%s cleanup=%s age=%s", jobID, state, backend, cleanup, jobAge(createdAt))
+	if failureClass != "" {
+		fmt.Fprintf(out, " failure.class=%s", failureClass)
+	}
+	if contract != nil {
+		fmt.Fprintf(out, " contract.evaluated=%t contract.compliant=%t", contract.Evaluated, contract.Compliant)
+	}
+	fmt.Fprintln(out)
 }
 
 func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
-	printJobSummary(out, agentclient.JobSummaryWire{
-		JobID:     record.JobID,
-		Backend:   record.Backend,
-		State:     record.State,
-		Cleanup:   record.Cleanup,
-		CreatedAt: record.CreatedAt,
-	})
+	printJobSummary(out, record.JobID, record.State, record.Backend, record.Cleanup, record.CreatedAt, "", nil)
 	fmt.Fprintf(out, "createdAt=%s", humanTime(record.CreatedAt))
 	if record.StartedAt != nil {
 		fmt.Fprintf(out, " startedAt=%s", humanTime(*record.StartedAt))
@@ -482,7 +485,7 @@ func printJobRecordResult(out, errOut io.Writer, record agentclient.JobGetResult
 	case protocol.PublicStateCompleted:
 		if record.Result == nil {
 			fmt.Fprintf(errOut, "jobId=%s state=%s: no authoritative result\n", record.JobID, record.State)
-			return 0
+			return cliExitResultUnavailable
 		}
 		if record.Result.Text != "" {
 			fmt.Fprint(out, record.Result.Text)
@@ -532,7 +535,7 @@ func openVerifiedResultArtifact(result *protocol.ResultInfoWire) (*os.File, erro
 		return nil, fmt.Errorf("result artifact %q byte-count check failed: got %d, want %d", result.ResultPath, bytes, result.Bytes)
 	}
 	actualSHA256 := hex.EncodeToString(digest.Sum(nil))
-	if actualSHA256 != strings.TrimPrefix(result.SHA256, "sha256:") {
+	if actualSHA256 != result.SHA256 {
 		_ = artifact.Close()
 		return nil, fmt.Errorf("result artifact %q SHA-256 check failed: got %s, want %s", result.ResultPath, actualSHA256, result.SHA256)
 	}
@@ -575,7 +578,7 @@ func formatTags(tags map[string]string) string {
 }
 
 func shortSHA256(value string) string {
-	digest := strings.TrimPrefix(value, "sha256:")
+	digest := value
 	if len(digest) > shortSHA256HexLength {
 		digest = digest[:shortSHA256HexLength]
 	}

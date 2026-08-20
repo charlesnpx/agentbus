@@ -181,7 +181,7 @@ func TestConnectProtocolVersionMismatchDoesNotAutostart(t *testing.T) {
 	}()
 
 	var starts atomic.Int64
-	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
+	starter := Starter(func(context.Context, StartOptions) (StartResult, error) {
 		starts.Add(1)
 		return StartResult{}, errors.New("starter should not be invoked for protocol mismatch")
 	})
@@ -229,7 +229,7 @@ func TestConnectBadTokenDoesNotAutostart(t *testing.T) {
 	})
 
 	var starts atomic.Int64
-	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
+	starter := Starter(func(context.Context, StartOptions) (StartResult, error) {
 		starts.Add(1)
 		return StartResult{}, errors.New("starter should not be invoked for bad token")
 	})
@@ -609,7 +609,7 @@ func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	defer cancelServer()
 	var starts atomic.Int64
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
+	starter := Starter(func(ctx context.Context, opts StartOptions) (StartResult, error) {
 		starts.Add(1)
 		_, err := startClientTestDaemon(serverCtx, root, "race-token")
 		if err != nil {
@@ -762,7 +762,7 @@ func testConnectHelloTransportFailureAutostartsReplacement(t *testing.T, token s
 	serverDone := make(chan error, 1)
 	var starts atomic.Int64
 	var serverStarted atomic.Bool
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
+	starter := Starter(func(ctx context.Context, opts StartOptions) (StartResult, error) {
 		starts.Add(1)
 		done, err := startClientTestDaemon(serverCtx, root, token)
 		if err != nil {
@@ -902,7 +902,7 @@ func TestAutostartReplacesRefusedSocket(t *testing.T) {
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
 	var starts atomic.Int64
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
+	starter := Starter(func(ctx context.Context, opts StartOptions) (StartResult, error) {
 		starts.Add(1)
 		done, err := startClientTestDaemon(serverCtx, root, "refused-token")
 		if err != nil {
@@ -950,9 +950,9 @@ func TestConnectAutostartSurfacesLauncherFailureOnce(t *testing.T) {
 	t.Setenv("AGENTBUS_AUTOSTART_FAILURE_HELPER", "1")
 
 	var starts atomic.Int64
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
+	starter := Starter(func(ctx context.Context, opts StartOptions) (StartResult, error) {
 		starts.Add(1)
-		return (defaultStarter{}).StartDaemon(ctx, opts)
+		return defaultStarter(ctx, opts)
 	})
 	client, err := Connect(context.Background(), Options{
 		StateRoot:    root,
@@ -993,7 +993,7 @@ func TestConnectAutostartStartResultKeepsTimeoutBehavior(t *testing.T) {
 	t.Parallel()
 	root := shortClientTempDir(t)
 	const startTimeout = 180 * time.Millisecond
-	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
+	starter := Starter(func(context.Context, StartOptions) (StartResult, error) {
 		return StartResult{PID: 12345}, nil
 	})
 
@@ -1030,7 +1030,7 @@ func TestConnectAutostartHelloHangUsesSingleStartTimeout(t *testing.T) {
 	var listenerStarted atomic.Bool
 	var listenerMu sync.Mutex
 	var hungListener net.Listener
-	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
+	starter := Starter(func(context.Context, StartOptions) (StartResult, error) {
 		listener, err := net.Listen("unix", socketPath)
 		if err != nil {
 			return StartResult{}, err
@@ -1123,7 +1123,7 @@ func TestDefaultStarterDoesNotCancelDaemonAfterStartupContextEnds(t *testing.T) 
 	errorPath := filepath.Join(dir, "default-starter-helper-error")
 	t.Setenv("AGENTBUS_AUTOSTART_DETACH_ERROR_PATH", errorPath)
 	ctx, cancel := context.WithCancel(context.Background())
-	started, err := (defaultStarter{}).StartDaemon(ctx, StartOptions{
+	started, err := defaultStarter(ctx, StartOptions{
 		StateRoot:   dir,
 		SocketPath:  filepath.Join(dir, "agentbus.sock"),
 		TokenPath:   filepath.Join(dir, "token"),

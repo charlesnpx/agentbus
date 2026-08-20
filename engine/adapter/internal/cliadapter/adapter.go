@@ -16,7 +16,7 @@ import (
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
-const setupCacheRefreshInstruction = "re-run agentbus setup, then retry the launch so the running daemon can re-probe the refreshed cache; restart the daemon if it is running an older agentbus binary"
+const setupCacheRefreshInstruction = "submit a job; the daemon probes the backend on first use and caches the result under the state root"
 
 const DriftError = "backend version changed since setup; " + setupCacheRefreshInstruction
 

@@ -631,7 +631,7 @@ func TestProbeBackendRejectsMismatchedSetupCache(t *testing.T) {
 			if err.Error() != tt.wantMessage {
 				t.Fatalf("ProbeBackend error = %q, want %q", err.Error(), tt.wantMessage)
 			}
-			if strings.Contains(tt.wantMessage, "re-run agentbus setup") {
+			if strings.Contains(tt.wantMessage, setupCacheRefreshInstruction) {
 				assertSetupCacheRemediation(t, tt.wantMessage)
 			}
 		})
@@ -640,8 +640,11 @@ func TestProbeBackendRejectsMismatchedSetupCache(t *testing.T) {
 
 func assertSetupCacheRemediation(t *testing.T, message string) {
 	t.Helper()
-	if !strings.Contains(message, "re-run agentbus setup") || !strings.Contains(message, "running daemon") || !strings.Contains(message, "restart the daemon") {
-		t.Fatalf("setup remediation = %q, want running-daemon refresh and restart guidance", message)
+	if strings.Contains(message, "agentbus setup") ||
+		!strings.Contains(message, "submit a job") ||
+		!strings.Contains(message, "probes the backend on first use") ||
+		!strings.Contains(message, "caches the result under the state root") {
+		t.Fatalf("setup remediation = %q, want lazy daemon probe guidance", message)
 	}
 }
 
