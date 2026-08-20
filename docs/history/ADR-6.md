@@ -1,5 +1,7 @@
 # ADR-6: Permit and cancel linearization
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 `GrantPermit` and `RequestCancel` are mutually exclusive durable CAS operations. Permit commits

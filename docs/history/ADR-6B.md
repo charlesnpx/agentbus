@@ -1,5 +1,7 @@
 # ADR-6B: Supervisor retirement in terminal proof
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Before terminal commit, the coordinator closes or revokes the control channel, waits for the parked

@@ -1,5 +1,7 @@
 # ADR-6A: Execution evidence and corrective launches
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Terminal proof is one of `NeverPermittedAndRetired`, `CleanQuiescentOutcomeAndRetired`, or

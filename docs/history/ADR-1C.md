@@ -1,5 +1,7 @@
 # ADR-1C: Corrupt aggregate handling
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Individual aggregate decode, checksum, or invariant failures are distinct from whole-DB corruption.

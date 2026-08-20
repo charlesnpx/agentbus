@@ -1,5 +1,7 @@
 # ADR-5: Fenced attempt custodian
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Fenced attempts use a process custodian as trusted computing base for physical process facts. Custody

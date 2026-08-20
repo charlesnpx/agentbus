@@ -1,5 +1,7 @@
 # ADR-0B: Stable replay key and fingerprint-version ordering
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Identified `job.submit` carries a top-level `workspaceKey` computed and persisted by delegate before

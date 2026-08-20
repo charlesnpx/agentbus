@@ -1,5 +1,7 @@
 # ADR-1: Atomic root AdmissionStore
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 All jobs admitted through the fenced coordinator use one small root AdmissionStore. Acceptance is one

@@ -1,5 +1,7 @@
 # ADR-2: Current-boot coordinator
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 The coordinator serializes admission by request key, owns OS side effects, and retains current-boot

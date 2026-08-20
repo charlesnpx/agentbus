@@ -1,5 +1,7 @@
 # ADR-1B: External admission-authority anchor
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 A root `admission.anchor` file outside bbolt records `dbUUID`, `schemaMajor`,
