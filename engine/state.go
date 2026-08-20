@@ -100,13 +100,11 @@ type WorkspaceLayout struct {
 	Logs      string
 	Results   string
 	Inputs    string
-	// Codex contains per-job CODEX_HOME directories. It is deliberately not
-	// created by ensureLayout: non-Codex workspaces do not need it.
+	// Codex contains per-job CODEX_HOME directories. It is created only for
+	// Codex workspaces, which do not all need it.
 	Codex      string
 	Quarantine string
 }
-
-const workspaceManifestFile = "workspace.json"
 
 // LayoutForWorkspace resolves and describes the state layout for cwd.
 func LayoutForWorkspace(root, cwd string) (WorkspaceLayout, error) {
@@ -115,23 +113,10 @@ func LayoutForWorkspace(root, cwd string) (WorkspaceLayout, error) {
 		return WorkspaceLayout{}, err
 	}
 	key := WorkspaceKey(canon)
-	return layoutForWorkspaceKey(root, key, canon)
-}
-
-// LayoutForWorkspaceKey describes the state layout for a persisted workspace
-// namespace key without requiring the original workspace path.
-func LayoutForWorkspaceKey(root, key string) (WorkspaceLayout, error) {
-	return layoutForWorkspaceKey(root, key, "")
-}
-
-func layoutForWorkspaceKey(root, key, workspace string) (WorkspaceLayout, error) {
-	if err := validateWorkspaceKey(key); err != nil {
-		return WorkspaceLayout{}, err
-	}
 	ns := filepath.Join(root, "workspaces", key)
 	return WorkspaceLayout{
 		Root:       root,
-		Workspace:  workspace,
+		Workspace:  canon,
 		Key:        key,
 		Namespace:  ns,
 		Jobs:       filepath.Join(ns, "jobs"),
@@ -141,29 +126,4 @@ func layoutForWorkspaceKey(root, key, workspace string) (WorkspaceLayout, error)
 		Codex:      filepath.Join(ns, "codex"),
 		Quarantine: filepath.Join(ns, "quarantine"),
 	}, nil
-}
-
-func validateWorkspaceKey(key string) error {
-	if len(key) != sha256.Size*2 {
-		return errors.New("invalid workspace key")
-	}
-	for _, r := range key {
-		if r >= '0' && r <= '9' || r >= 'a' && r <= 'f' {
-			continue
-		}
-		return errors.New("invalid workspace key")
-	}
-	return nil
-}
-
-func ensureLayout(layout WorkspaceLayout) error {
-	for _, dir := range []string{layout.Root, filepath.Join(layout.Root, "workspaces"), layout.Namespace, layout.Jobs, layout.Logs, layout.Results, layout.Inputs, layout.Quarantine} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return err
-		}
-	}
-	return nil
 }
