@@ -3,6 +3,10 @@
 package service
 
 import (
+	"errors"
+	"io/fs"
+	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/charlesnpx/agentbus/internal/protocol"
@@ -45,11 +49,21 @@ var backendFailureClassPatterns = []backendFailureClassPattern{
 	},
 }
 
-// classifyBackendFailureText returns a specific class only for a stable
-// provider fragment. Unrecognized launched-turn failures retain backend_error.
+// classifyBackendFailureText recognizes failures to create the backend process
+// before examining stable provider fragments. Unrecognized launched-turn
+// failures retain backend_error.
 func classifyBackendFailureText(err error) protocol.FailureClass {
 	if err == nil {
 		return protocol.FailureClassBackendError
+	}
+	var execErr *exec.Error
+	if errors.As(err, &execErr) && errors.Is(execErr.Err, exec.ErrNotFound) {
+		return protocol.FailureClassBackendUnavailable
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) && pathErr.Op == "fork/exec" &&
+		(errors.Is(pathErr.Err, fs.ErrNotExist) || errors.Is(pathErr.Err, fs.ErrPermission)) {
+		return protocol.FailureClassBackendUnavailable
 	}
 	text := strings.ToLower(err.Error())
 	for _, pattern := range backendFailureClassPatterns {

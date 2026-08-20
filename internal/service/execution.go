@@ -755,15 +755,11 @@ func cleanupAfterContextStop(run *activeExecution, contextErr error) (protocol.C
 }
 
 func cleanupForRun(run *activeExecution, cleanup protocol.Cleanup, diagnostics []string) (protocol.Cleanup, []string) {
-	attempted, recorded, claimErr := run.claimStatus()
+	_, _, claimErr := run.claimStatus()
 	if claimErr != nil {
 		cleanup = protocol.CleanupUncertain
 		diagnostics = append(diagnostics, "process claim: "+claimErr.Error())
 		return cleanup, diagnostics
-	}
-	if !attempted || !recorded {
-		cleanup = protocol.CleanupUncertain
-		diagnostics = append(diagnostics, "process claim was not recorded")
 	}
 	return cleanup, diagnostics
 }

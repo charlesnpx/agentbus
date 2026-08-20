@@ -9,11 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/adapter/claudecli"
 	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 	"github.com/charlesnpx/agentbus/internal/schema"
@@ -564,5 +566,87 @@ func TestExecutionProviderOverloadedUsesTypedFailureClass(t *testing.T) {
 	}
 	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassProviderOverloaded {
 		t.Fatalf("overload terminal = %+v, want provider_overloaded", got)
+	}
+}
+
+func TestExecutionMissingBinaryIsBackendUnavailableWithCleanCleanup(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "missing-claude")
+	if _, err := os.Stat(binary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing binary stat = %v, want not exist", err)
+	}
+	backend := claudecli.New(claudecli.Options{Binary: binary})
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "missing binary", nil)
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassBackendUnavailable || got.Cleanup != protocol.CleanupClean || got.ProcessClaim != nil {
+		t.Fatalf("missing-binary terminal record = %+v, want failed backend_unavailable with clean cleanup and no process claim", got)
+	}
+}
+
+func TestExecutionFailureAfterRecordedClaimPreservesUncertainCleanup(t *testing.T) {
+	backend := &executionFakeBackend{name: "uncertain-after-spawn"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				input.OnProcessStart(engine.ProcessRef{PID: 4106, PGID: 4106, StartTime: "uncertain-after-spawn-token"}, 0)
+				return executionEvents(
+					engine.Event{Type: engine.EventTerminalError, Err: errors.New("backend turn failed after launch")},
+					engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{CleanupFailed: true}},
+				), nil
+			},
+		}, nil
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "uncertain after spawn", nil)
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassBackendError || got.Cleanup != protocol.CleanupUncertain || got.ProcessClaim == nil || got.ProcessClaim.StartToken != "uncertain-after-spawn-token" {
+		t.Fatalf("post-launch terminal record = %+v, want failed backend_error with uncertain cleanup and recorded claim", got)
+	}
+}
+
+func TestExecutionFailureWithoutRecordedClaimPreservesUncertainCleanup(t *testing.T) {
+	backend := &executionFakeBackend{name: "uncertain-without-claim"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, _ engine.TurnInput) (<-chan engine.Event, error) {
+				return executionEvents(
+					engine.Event{Type: engine.EventTerminalError, Err: errors.New("backend turn failed before process claim")},
+					engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{CleanupFailed: true}},
+				), nil
+			},
+		}, nil
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "uncertain without claim", nil)
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassBackendError || got.Cleanup != protocol.CleanupUncertain || got.ProcessClaim != nil {
+		t.Fatalf("no-claim terminal record = %+v, want failed backend_error with uncertain cleanup and no process claim", got)
 	}
 }

@@ -122,3 +122,27 @@ binding its socket. A corrupt, truncated, incompatible, or busy database stops
 startup rather than being repaired in place. Preserve the root for diagnosis;
 do not create a replacement database at the same path unless you have first
 performed the required version-break cleanup above.
+
+## Current footprint and residual risks
+
+At the final sweep, excluding vendor, Agentbus has 15,272 production Go lines
+and 13,819 test Go lines: reductions of 40,166 and 50,875 from the
+55,438-production-line and 64,694-test-line baseline. It has 17 Go packages.
+The largest production file is `engine/adapter/codexcli/appserver_driver.go`
+at 1,032 lines, and the largest test file is
+`engine/adapter/internal/duplex/session_test.go` at 1,880 lines.
+
+If the daemon dies mid-run, a provider process can remain orphaned. Recovery
+marks recovered running work unknown and never relaunches it; the reaper signals
+a recorded process group only when its live start token exactly matches the
+recorded token. This is the deliberate trade-off for preventing duplicate work.
+
+Result and log artifacts remain until an operator removes them. Nothing reclaims
+that disk automatically.
+
+Downstream compatibility remains incomplete: Delegate will not build against
+0.13.0 without edits, and Convo Relay needs two line edits to drop a removed
+option field.
+
+Admission validates only backend registration. An unusable backend binary is
+therefore discovered when a job runs, not when it is submitted.
