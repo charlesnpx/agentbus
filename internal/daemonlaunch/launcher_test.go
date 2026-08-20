@@ -506,13 +506,13 @@ func serveOneVerifiedHello(listener net.Listener, token string, helloSeen chan<-
 	}
 	resp := protocol.Response{JSONRPC: "2.0", ID: req.ID}
 	var params protocol.HelloParams
-	if req.Method != protocol.MethodHello || json.Unmarshal(req.Params, &params) != nil || params.Token != token || params.ClientProtocolVersion != protocol.Version3 {
+	if req.Method != protocol.MethodHello || json.Unmarshal(req.Params, &params) != nil || params.Token != token || params.ClientProtocolVersion != protocol.Version {
 		resp.Error = protocol.NewError(protocol.ErrorUnauthorized, "unauthorized", protocol.ErrorData{})
 		_ = json.NewEncoder(conn).Encode(resp)
 		return
 	}
-	resp.Result = protocol.HelloResultV3{
-		ProtocolVersion: protocol.Version3,
+	resp.Result = protocol.HelloResult{
+		ProtocolVersion: protocol.Version,
 	}
 	_ = json.NewEncoder(conn).Encode(resp)
 	helloSeen <- struct{}{}

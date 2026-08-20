@@ -124,8 +124,8 @@ func TestHelloRejectsWrongClientProtocolVersion(t *testing.T) {
 	if response.Error == nil {
 		t.Fatal("hello response error = nil")
 	}
-	if response.Error.Data.Code != protocol.ErrorVersionMismatchV3 {
-		t.Fatalf("hello error code = %q, want %q", response.Error.Data.Code, protocol.ErrorVersionMismatchV3)
+	if response.Error.Data.Code != protocol.ErrorVersionMismatch {
+		t.Fatalf("hello error code = %q, want %q", response.Error.Data.Code, protocol.ErrorVersionMismatch)
 	}
 	if response.Error.Data.ServerProtocolVersion != ProtocolVersion {
 		t.Fatalf("server protocol version = %d, want %d", response.Error.Data.ServerProtocolVersion, ProtocolVersion)
@@ -138,8 +138,8 @@ func TestHelloRejectsWrongToken(t *testing.T) {
 	if response.Error == nil {
 		t.Fatal("hello response error = nil")
 	}
-	if response.Error.Data.Code != protocol.ErrorUnauthorizedV3 {
-		t.Fatalf("hello error code = %q, want %q", response.Error.Data.Code, protocol.ErrorUnauthorizedV3)
+	if response.Error.Data.Code != protocol.ErrorUnauthorized {
+		t.Fatalf("hello error code = %q, want %q", response.Error.Data.Code, protocol.ErrorUnauthorized)
 	}
 }
 
@@ -362,7 +362,7 @@ func TestConnectionReturnsBoundedOversizedFrameError(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimSpace(line), &response); err != nil {
 		t.Fatal(err)
 	}
-	if response.Error == nil || response.Error.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
+	if response.Error == nil || response.Error.Data.Code != protocol.ErrorInvalidTaskSpec {
 		t.Fatalf("oversized response = %#v, want bounded invalid-task error", response.Error)
 	}
 	if err := client.Close(); err != nil {
@@ -423,19 +423,19 @@ func (backend *submitSessionBackend) Resume(context.Context, string, engine.Sess
 	return nil, errors.New("not used by submission tests")
 }
 
-func submitForTest(t *testing.T, server *Server, params protocol.JobSubmitParamsV3) requestOutcome {
+func submitForTest(t *testing.T, server *Server, params protocol.JobSubmitParams) requestOutcome {
 	t.Helper()
 	return server.handleJobSubmit(mustJSON(t, params))
 }
 
-func submitResultForTest(t *testing.T, outcome requestOutcome) protocol.JobSubmitResultV3 {
+func submitResultForTest(t *testing.T, outcome requestOutcome) protocol.JobSubmitResult {
 	t.Helper()
 	if outcome.err != nil {
 		t.Fatalf("submit error = %+v", outcome.err)
 	}
-	result, ok := outcome.result.(protocol.JobSubmitResultV3)
+	result, ok := outcome.result.(protocol.JobSubmitResult)
 	if !ok {
-		t.Fatalf("submit result = %T %#v, want protocol.JobSubmitResultV3", outcome.result, outcome.result)
+		t.Fatalf("submit result = %T %#v, want protocol.JobSubmitResult", outcome.result, outcome.result)
 	}
 	if result.Timeout == nil || result.Timeout.Source == "" {
 		t.Fatalf("submit timeout = %#v, want populated resolution", result.Timeout)
@@ -443,11 +443,11 @@ func submitResultForTest(t *testing.T, outcome requestOutcome) protocol.JobSubmi
 	return result
 }
 
-func submissionParams(workspaceKey, requestID, backend, cwd, prompt string) protocol.JobSubmitParamsV3 {
-	return protocol.JobSubmitParamsV3{
+func submissionParams(workspaceKey, requestID, backend, cwd, prompt string) protocol.JobSubmitParams {
+	return protocol.JobSubmitParams{
 		WorkspaceKey: workspaceKey,
 		RequestID:    requestID,
-		TaskSpec: protocol.TaskSpecV3{
+		TaskSpec: protocol.TaskSpec{
 			Backend: backend,
 			CWD:     cwd,
 			Write:   false,
@@ -503,7 +503,7 @@ func TestJobSubmitDifferentPromptReturnsTypedConflict(t *testing.T) {
 	first := submitResultForTest(t, submitForTest(t, server, params))
 	params.TaskSpec.Prompt = "different prompt"
 	conflict := submitForTest(t, server, params)
-	if conflict.err == nil || conflict.err.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
+	if conflict.err == nil || conflict.err.Data.Code != protocol.ErrorInvalidTaskSpec {
 		t.Fatalf("conflict error = %#v, want typed invalid-task conflict", conflict.err)
 	}
 	if conflict.err.Data.JobID != first.JobID || !strings.Contains(conflict.err.Message, "jobstore: request conflict") {
@@ -531,7 +531,7 @@ func TestJobSubmitInvalidOutputSchemaLeavesNoBinding(t *testing.T) {
 			cwd := t.TempDir()
 			invalidRaw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","outputSchema":%s}}`, workspaceKey, requestID, cwd, tt.schema))
 			invalid := server.handleJobSubmit(invalidRaw)
-			if invalid.err == nil || invalid.err.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
+			if invalid.err == nil || invalid.err.Data.Code != protocol.ErrorInvalidTaskSpec {
 				t.Fatalf("invalid schema outcome = %#v, want invalid task spec", invalid.err)
 			}
 			if invalid.result != nil {
@@ -664,7 +664,7 @@ func TestJobSubmitConflictPrecedesSemanticTaskSpecValidation(t *testing.T) {
 	timeout := protocol.MaxTimeout.Milliseconds() + 1
 	params.TaskSpec.TimeoutMS = &timeout
 	conflict := submitForTest(t, server, params)
-	if conflict.err == nil || conflict.err.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
+	if conflict.err == nil || conflict.err.Data.Code != protocol.ErrorInvalidTaskSpec {
 		t.Fatalf("invalid conflicting task error = %#v, want typed conflict", conflict.err)
 	}
 	if conflict.err.Data.JobID != first.JobID || !strings.Contains(conflict.err.Message, "jobstore: request conflict") {
@@ -681,7 +681,7 @@ func TestJobSubmitRejectsTimeoutAboveMaximum(t *testing.T) {
 	params := submissionParams("workspace-timeout", "request-timeout", "codex", t.TempDir(), "task")
 	params.TaskSpec.TimeoutMS = &timeout
 	outcome := submitForTest(t, server, params)
-	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec {
 		t.Fatalf("oversized timeout outcome = %#v, want invalid task spec", outcome.err)
 	}
 }
@@ -690,7 +690,7 @@ func TestJobSubmitRejectsUnknownTaskSpecField(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
 	raw := json.RawMessage(fmt.Sprintf(`{"workspaceKey":"workspace-unknown-field","requestId":"request-unknown-field","taskSpec":{"backend":"codex","cwd":%q,"write":false,"prompt":"task","unexpected":true}}`, t.TempDir()))
 	outcome := server.handleJobSubmit(raw)
-	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpecV3 {
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec {
 		t.Fatalf("unknown taskSpec field outcome = %#v, want invalid task spec", outcome.err)
 	}
 }

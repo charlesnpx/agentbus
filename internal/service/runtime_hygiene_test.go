@@ -23,7 +23,7 @@ func runtimeHygieneRecord(t *testing.T, server *Server, cwd, requestID string, w
 	if err != nil {
 		t.Fatal(err)
 	}
-	spec := protocol.TaskSpecV3{
+	spec := protocol.TaskSpec{
 		Backend: "codex",
 		CWD:     cwd,
 		Prompt:  "runtime hygiene test",

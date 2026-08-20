@@ -70,7 +70,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		FailureClass:  FailureClassBackendError,
 		Contract:      summaryContract,
 	}
-	taskSpec := TaskSpecV3{
+	taskSpec := TaskSpec{
 		Backend:      "codex",
 		CWD:          "/workspace",
 		Prompt:       "do work",
@@ -116,8 +116,8 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 			want:  `{"schemaSha256":"schema-sha","evaluated":true,"compliant":true,"attempts":2,"violations":["/answer"]}`,
 		},
 		{
-			name: "TaskSpecV3 supplied-empty optional fields",
-			value: TaskSpecV3{
+			name: "TaskSpec supplied-empty optional fields",
+			value: TaskSpec{
 				Backend: "codex",
 				CWD:     "/workspace",
 				Prompt:  "do work",
@@ -126,30 +126,30 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 				Effort:  &empty,
 				Tags:    &emptyTags,
 			},
-			new:  func() any { return new(TaskSpecV3) },
+			new:  func() any { return new(TaskSpec) },
 			want: `{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true,"model":"","effort":"","tags":{}}`,
 		},
 		{
-			name: "TaskSpecV3 absent optional fields",
-			value: TaskSpecV3{
+			name: "TaskSpec absent optional fields",
+			value: TaskSpec{
 				Backend: "codex",
 				CWD:     "/workspace",
 				Prompt:  "do work",
 				Write:   true,
 			},
-			new:  func() any { return new(TaskSpecV3) },
+			new:  func() any { return new(TaskSpec) },
 			want: `{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true}`,
 		},
 		{
-			name:  "JobSubmitParamsV3",
-			value: JobSubmitParamsV3{WorkspaceKey: "workspace-1", RequestID: "request-1", TaskSpec: taskSpec},
-			new:   func() any { return new(JobSubmitParamsV3) },
+			name:  "JobSubmitParams",
+			value: JobSubmitParams{WorkspaceKey: "workspace-1", RequestID: "request-1", TaskSpec: taskSpec},
+			new:   func() any { return new(JobSubmitParams) },
 			want:  `{"workspaceKey":"workspace-1","requestId":"request-1","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true,"model":"gpt-5","effort":"high","timeoutMs":1234,"outputSchema":{"type":"object"},"tags":{"team":"core"}}}`,
 		},
 		{
-			name:  "JobSubmitResultV3",
-			value: JobSubmitResultV3{JobID: "job-1", State: PublicStateQueued, Deduplicated: true, Timeout: timeout},
-			new:   func() any { return new(JobSubmitResultV3) },
+			name:  "JobSubmitResult",
+			value: JobSubmitResult{JobID: "job-1", State: PublicStateQueued, Deduplicated: true, Timeout: timeout},
+			new:   func() any { return new(JobSubmitResult) },
 			want:  `{"jobId":"job-1","state":"queued","deduplicated":true,"timeout":{"requested":1234,"effective":2345,"source":"client"}}`,
 		},
 		{
@@ -171,24 +171,24 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 			want:  `{"jobs":[` + summaryJSON + `]}`,
 		},
 		{
-			name:  "JobCancelParamsV3",
-			value: JobCancelParamsV3{JobID: "job-1"},
-			new:   func() any { return new(JobCancelParamsV3) },
+			name:  "JobCancelParams",
+			value: JobCancelParams{JobID: "job-1"},
+			new:   func() any { return new(JobCancelParams) },
 			want:  `{"jobId":"job-1"}`,
 		},
 		{
-			name:  "JobCancelResultV3",
-			value: JobCancelResultV3{JobID: "job-1", State: PublicStateCanceled},
-			new:   func() any { return new(JobCancelResultV3) },
+			name:  "JobCancelResult",
+			value: JobCancelResult{JobID: "job-1", State: PublicStateCanceled},
+			new:   func() any { return new(JobCancelResult) },
 			want:  `{"jobId":"job-1","state":"canceled"}`,
 		},
 		{
-			name: "HelloResultV3",
-			value: HelloResultV3{
+			name: "HelloResult",
+			value: HelloResult{
 				ProtocolVersion: 3,
 				BackendMetadata: []BackendInfo{{Name: "codex", Models: []string{"gpt-5"}, Efforts: []string{"high"}}},
 			},
-			new:  func() any { return new(HelloResultV3) },
+			new:  func() any { return new(HelloResult) },
 			want: `{"protocolVersion":3,"backends":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}]}`,
 		},
 		{

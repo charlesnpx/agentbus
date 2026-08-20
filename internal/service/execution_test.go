@@ -84,7 +84,7 @@ func queuedExecutionRecord(t *testing.T, server *Server, backend, prompt string,
 
 func queuedExecutionRecordWithSchema(t *testing.T, server *Server, backend, prompt string, timeoutMS *int64, outputSchema json.RawMessage) jobstore.Record {
 	t.Helper()
-	spec := protocol.TaskSpecV3{
+	spec := protocol.TaskSpec{
 		Backend:      backend,
 		CWD:          t.TempDir(),
 		Prompt:       prompt,

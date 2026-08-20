@@ -104,7 +104,7 @@ func rpcResponseError(object protocol.ErrorObject) error {
 		return rpcErr
 	}
 	return &ProtocolVersionMismatchError{
-		Expected: protocol.Version3,
+		Expected: protocol.Version,
 		Received: object.Data.ServerProtocolVersion,
 		Cause:    rpcErr,
 	}
@@ -244,7 +244,7 @@ func clientHello(ctx context.Context, conn net.Conn, reader *bufio.Reader, token
 		JSONRPC: "2.0",
 		ID:      json.RawMessage(`"hello"`),
 		Method:  protocol.MethodHello,
-		Params:  mustMarshal(protocol.HelloParams{ClientProtocolVersion: protocol.Version3, Token: token}),
+		Params:  mustMarshal(protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: token}),
 	}
 	if err := writeDeadline(ctx, conn, req); err != nil {
 		return HelloResult{}, &helloTransportError{err: err}
@@ -272,8 +272,8 @@ func clientHello(ctx context.Context, conn net.Conn, reader *bufio.Reader, token
 	if err := json.Unmarshal(raw, &hello); err != nil {
 		return HelloResult{}, err
 	}
-	if hello.ProtocolVersion != protocol.Version3 {
-		return HelloResult{}, &ProtocolVersionMismatchError{Expected: protocol.Version3, Received: hello.ProtocolVersion}
+	if hello.ProtocolVersion != protocol.Version {
+		return HelloResult{}, &ProtocolVersionMismatchError{Expected: protocol.Version, Received: hello.ProtocolVersion}
 	}
 	return hello, nil
 }
@@ -934,7 +934,7 @@ func (c *Client) Hello(ctx context.Context) (HelloResult, error) {
 		return HelloResult{}, err
 	}
 	var out HelloResult
-	err = c.do(ctx, protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version3, Token: token}, &out)
+	err = c.do(ctx, protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: token}, &out)
 	return out, err
 }
 

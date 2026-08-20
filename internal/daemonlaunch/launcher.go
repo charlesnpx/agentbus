@@ -691,7 +691,7 @@ func verifyExistingDaemon(ctx context.Context, socketPath, tokenPath string) err
 		JSONRPC: "2.0",
 		ID:      json.RawMessage(`"hello"`),
 		Method:  protocol.MethodHello,
-		Params:  mustMarshal(protocol.HelloParams{ClientProtocolVersion: protocol.Version3, Token: token}),
+		Params:  mustMarshal(protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: token}),
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetWriteDeadline(deadline)
@@ -717,7 +717,7 @@ func verifyExistingDaemon(ctx context.Context, socketPath, tokenPath string) err
 	if resp.Error != nil {
 		return &protocol.RPCError{Object: *resp.Error}
 	}
-	var hello protocol.HelloResultV3
+	var hello protocol.HelloResult
 	raw, err = json.Marshal(resp.Result)
 	if err != nil {
 		return err
@@ -725,8 +725,8 @@ func verifyExistingDaemon(ctx context.Context, socketPath, tokenPath string) err
 	if err := json.Unmarshal(raw, &hello); err != nil {
 		return err
 	}
-	if hello.ProtocolVersion != protocol.Version3 {
-		return fmt.Errorf("protocol version mismatch: expected %d received %d", protocol.Version3, hello.ProtocolVersion)
+	if hello.ProtocolVersion != protocol.Version {
+		return fmt.Errorf("protocol version mismatch: expected %d received %d", protocol.Version, hello.ProtocolVersion)
 	}
 	return nil
 }

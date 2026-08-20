@@ -65,7 +65,7 @@ func (s *Server) handleJobGet(raw json.RawMessage) requestOutcome {
 // used by ordinary execution. The in-memory interruption is containment only;
 // MarkTerminal is the durable cancellation fact.
 func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
-	var params protocol.JobCancelParamsV3
+	var params protocol.JobCancelParams
 	if err := decodeStrict(raw, &params); err != nil {
 		return invalidParams(err)
 	}
@@ -85,7 +85,7 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 		return invalidParams(fmt.Errorf("get job for cancellation: %w", err))
 	}
 	if record.State.IsTerminal() {
-		return requestOutcome{result: protocol.JobCancelResultV3{JobID: record.JobID, State: projectedState(record)}}
+		return requestOutcome{result: protocol.JobCancelResult{JobID: record.JobID, State: projectedState(record)}}
 	}
 
 	cleanup, diagnostics := s.cancelActiveOrRecordedProcess(store, record)
@@ -101,21 +101,21 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 			// wins, so return that durable fact without overwriting it.
 			current, getErr := store.Get(record.JobID)
 			if getErr == nil {
-				return requestOutcome{result: protocol.JobCancelResultV3{JobID: current.JobID, State: projectedState(current)}}
+				return requestOutcome{result: protocol.JobCancelResult{JobID: current.JobID, State: projectedState(current)}}
 			}
 			return jobStoreUnavailable("read concurrent terminal cancellation", getErr)
 		}
 		return jobStoreUnavailable("persist cancellation", err)
 	}
-	return requestOutcome{result: protocol.JobCancelResultV3{JobID: terminal.JobID, State: projectedState(terminal)}}
+	return requestOutcome{result: protocol.JobCancelResult{JobID: terminal.JobID, State: projectedState(terminal)}}
 }
 
 func jobStoreUnavailable(action string, err error) requestOutcome {
-	return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailableV3, action+": "+err.Error(), protocol.ErrorData{})}
+	return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, action+": "+err.Error(), protocol.ErrorData{})}
 }
 
 func unknownJobError(jobID string) *protocol.ErrorObject {
-	return protocol.NewError(protocol.ErrorUnknownJobV3, "unknown job", protocol.ErrorData{JobID: jobID})
+	return protocol.NewError(protocol.ErrorUnknownJob, "unknown job", protocol.ErrorData{JobID: jobID})
 }
 
 func projectedState(record jobstore.Record) protocol.PublicState {
@@ -170,26 +170,26 @@ func jobSummaryWire(record jobstore.Record) (protocol.JobSummaryWire, error) {
 	}, nil
 }
 
-func taskSpecForProjection(record jobstore.Record) (protocol.TaskSpecV3, *engine.TimeoutResolution, error) {
+func taskSpecForProjection(record jobstore.Record) (protocol.TaskSpec, *engine.TimeoutResolution, error) {
 	spec, err := decodeTaskSpec(record.TaskSpec)
 	if err != nil {
-		return protocol.TaskSpecV3{}, nil, fmt.Errorf("decode durable task spec: %w", err)
+		return protocol.TaskSpec{}, nil, fmt.Errorf("decode durable task spec: %w", err)
 	}
 	timeout, errObj := timeoutFromMillis(spec.TimeoutMS)
 	if errObj != nil {
-		return protocol.TaskSpecV3{}, nil, errors.New(errObj.Message)
+		return protocol.TaskSpec{}, nil, errors.New(errObj.Message)
 	}
 	return spec, timeout, nil
 }
 
-func projectContract(record jobstore.Record, spec protocol.TaskSpecV3) *protocol.ContractResult {
+func projectContract(record jobstore.Record, spec protocol.TaskSpec) *protocol.ContractResult {
 	if len(spec.OutputSchema) == 0 {
 		return nil
 	}
 	return &record.Contract
 }
 
-func projectContractVerdict(record jobstore.Record, spec protocol.TaskSpecV3) *protocol.ContractVerdict {
+func projectContractVerdict(record jobstore.Record, spec protocol.TaskSpec) *protocol.ContractVerdict {
 	if len(spec.OutputSchema) == 0 {
 		return nil
 	}

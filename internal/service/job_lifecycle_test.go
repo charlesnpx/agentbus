@@ -142,7 +142,7 @@ func TestJobGetStartingSerializesRunning(t *testing.T) {
 func TestJobGetUnknownIDReturnsTypedError(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{})
 	outcome := server.handleJobGet(json.RawMessage(`{"jobId":"job_missing"}`))
-	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorUnknownJobV3 {
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorUnknownJob {
 		t.Fatalf("unknown job.get outcome = %#v, want typed unknown-job error", outcome.err)
 	}
 }
@@ -172,7 +172,7 @@ func TestJobGetStoreReadFailureIsBackendUnavailable(t *testing.T) {
 
 	restarted := newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "get-store-error"}}})
 	outcome := restarted.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: submitted.JobID}))
-	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorBackendUnavailableV3 {
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorBackendUnavailable {
 		t.Fatalf("job.get store-read error = %#v, want backend-unavailable error", outcome.err)
 	}
 }
@@ -202,7 +202,7 @@ func TestJobCancelBeforeSpawnIsDurable(t *testing.T) {
 	server.executionMu.Lock()
 	server.executions = map[string]*activeExecution{record.JobID: run}
 	server.executionMu.Unlock()
-	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParamsV3{JobID: record.JobID}))
+	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
 	if canceled.err != nil {
 		t.Fatalf("job.cancel error = %#v", canceled.err)
 	}
@@ -272,7 +272,7 @@ func TestJobCancelAfterSpawnRecordsCleanupOutcome(t *testing.T) {
 			server.executions = map[string]*activeExecution{record.JobID: run}
 			server.executionMu.Unlock()
 
-			outcome := server.handleJobCancel(mustJSON(t, protocol.JobCancelParamsV3{JobID: record.JobID}))
+			outcome := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
 			if outcome.err != nil {
 				t.Fatalf("job.cancel error = %#v", outcome.err)
 			}
