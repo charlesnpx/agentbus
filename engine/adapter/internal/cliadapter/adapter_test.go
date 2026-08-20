@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -203,6 +204,23 @@ func TestBackendResumeNeverExecsBinary(t *testing.T) {
 	assertFileMissing(t, marker)
 }
 
+func TestBackendMetadataListsHelloAcceptedValuesInStableOrder(t *testing.T) {
+	backend := &Backend{
+		NameValue:      "fake",
+		AllowedModels:  StringSet("zeta", "alpha", "middle"),
+		AllowedEfforts: StringSet("ultra", "high", "minimal"),
+	}
+	wantModels := []string{"alpha", "middle", "zeta"}
+	wantEfforts := []string{"high", "minimal", "ultra"}
+
+	for range 2 {
+		metadata := backend.BackendMetadata(context.Background())
+		if metadata.Name != "fake" || !slices.Equal(metadata.Models, wantModels) || !slices.Equal(metadata.Efforts, wantEfforts) {
+			t.Fatalf("hello backend metadata = %#v, want models=%#v efforts=%#v", metadata, wantModels, wantEfforts)
+		}
+	}
+}
+
 func TestSessionTurnTimeoutKillsDescendantHoldingStdout(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("process group signal assertions are unix-only")
@@ -334,13 +352,8 @@ func TestOneShotBackendRunsThroughDuplexRuntime(t *testing.T) {
 				return nil, "", nil
 			}
 		},
-		probed: &ProbedBackendDescriptor{StaticBackendDescriptor: StaticBackendDescriptor{
-			NameValue:        "fake",
-			DiscoveredModels: []string{"known-model"},
-			DiscoverySource:  "test",
-		}},
 	}
-	session, err := backend.Start(context.Background(), engine.SessionOpts{Model: "new-model"})
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,17 +364,14 @@ func TestOneShotBackendRunsThroughDuplexRuntime(t *testing.T) {
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
 	got = withoutTurnFinal(got)
-	if len(got) != 3 {
-		t.Fatalf("events = %#v, want warning, agent text, and result", got)
+	if len(got) != 2 {
+		t.Fatalf("events = %#v, want agent text and result", got)
 	}
-	if got[0].Type != engine.EventWarning || !strings.Contains(got[0].Text, `model "new-model"`) {
-		t.Fatalf("first event = %#v, want validation warning", got[0])
+	if got[0].Type != engine.EventAgentText || got[0].Text != "from stdout" {
+		t.Fatalf("first event = %#v, want parsed agent text", got[0])
 	}
-	if got[1].Type != engine.EventAgentText || got[1].Text != "from stdout" {
-		t.Fatalf("second event = %#v, want parsed agent text", got[1])
-	}
-	if got[2].Type != engine.EventResultMessage || got[2].Text != "from stdout" {
-		t.Fatalf("third event = %#v, want backfilled result message", got[2])
+	if got[1].Type != engine.EventResultMessage || got[1].Text != "from stdout" {
+		t.Fatalf("second event = %#v, want backfilled result message", got[1])
 	}
 	if session.ID() != "stream-session" {
 		t.Fatalf("session id = %q, want stream-session", session.ID())
@@ -375,27 +385,14 @@ func TestOneShotBackendRunsThroughDuplexRuntime(t *testing.T) {
 	}
 }
 
-func TestBackendWithDriverPreservesLiveProbeAndRunsDuplexTurn(t *testing.T) {
-	const (
-		binaryPath = "/tmp/fake-bin"
-		schema     = "duplex-json-v1"
-	)
+func TestBackendWithDriverRunsDuplexTurn(t *testing.T) {
 	driver := newCliDuplexTestDriver("resume-1")
 	runner := &duplexCommandRunner{finishOnStart: true}
 	backend := &Backend{
 		NameValue:      "fake",
 		Binary:         "fake-bin",
 		MinimumVersion: "0.1.0",
-		StreamSchema:   schema,
 		Driver:         driver,
-	}
-	probed, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	probedBackend, ok := probed.(*Backend)
-	if !ok || probedBackend.Driver == nil {
-		t.Fatalf("probed backend = %T, want *Backend with driver", probed)
 	}
 	session, err := backend.Start(context.Background(), engine.SessionOpts{CWD: "/tmp/work"})
 	if err != nil {
@@ -455,36 +452,6 @@ func TestBackendWithDriverThreadsResumeIDAcrossTurns(t *testing.T) {
 	}
 	if session.ID() != "resume-2" {
 		t.Fatalf("session id = %q, want resume-2", session.ID())
-	}
-}
-
-func TestBackendWithDriverPrependsValidationWarning(t *testing.T) {
-	driver := newCliDuplexTestDriver("resume-1")
-	runner := &duplexCommandRunner{finishOnStart: true}
-	backend := &Backend{
-		NameValue: "fake",
-		Driver:    driver,
-		probed: &ProbedBackendDescriptor{StaticBackendDescriptor: StaticBackendDescriptor{
-			NameValue:        "fake",
-			DiscoveredModels: []string{"known-model"},
-			DiscoverySource:  "test",
-		}},
-	}
-	session, err := backend.Start(context.Background(), engine.SessionOpts{Model: "new-model"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	events, err := session.(*Session).TurnWithRunner(context.Background(), engine.TurnInput{Prompt: "hello"}, runner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := collectEventsWithTimeout(t, events, 2*time.Second)
-	if len(got) < 2 || got[0].Type != engine.EventWarning || !strings.Contains(got[0].Text, `model "new-model"`) {
-		t.Fatalf("events = %#v, want leading validation warning", got)
-	}
-	if got[1].Type != engine.EventAgentText || got[1].Text != "duplex:hello" {
-		t.Fatalf("second event = %#v, want duplex agent text", got[1])
 	}
 }
 
@@ -997,24 +964,4 @@ func (c *duplexRunningCommand) finish(exit command.ExitObservation, err error) {
 		c.err = err
 		close(c.done)
 	})
-}
-
-type fakeProbeRunner struct {
-	path    string
-	version string
-}
-
-func (r fakeProbeRunner) LookPath(binary string) (string, error) {
-	if r.path != "" {
-		return r.path, nil
-	}
-	return binary, nil
-}
-
-func (r fakeProbeRunner) Run(context.Context, command.ProbeSpec) (command.ProbeResult, error) {
-	version := r.version
-	if version == "" {
-		version = "fake 1.0.0\n"
-	}
-	return command.ProbeResult{Stdout: []byte(version)}, nil
 }

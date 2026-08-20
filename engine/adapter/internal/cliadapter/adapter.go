@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -24,7 +25,6 @@ type Backend struct {
 	Driver           duplex.Driver
 	VersionTransform func(string) string
 	Discover         func(context.Context, command.ProbeRunner, string) (*engine.ModelDiscovery, error)
-	probed           *ProbedBackendDescriptor
 }
 
 type StaticBackendDescriptor struct {
@@ -74,26 +74,19 @@ func (b *Backend) DiscoverModels(ctx context.Context, runner command.ProbeRunner
 	if b.Discover == nil {
 		return nil, nil
 	}
-	binary := b.binary()
-	if b.probed != nil && b.probed.BinaryPath != "" {
-		binary = b.probed.BinaryPath
-	} else {
-		resolved, err := runner.LookPath(binary)
-		if err != nil {
-			return nil, err
-		}
-		binary = resolved
+	binary, err := runner.LookPath(b.binary())
+	if err != nil {
+		return nil, err
 	}
 	return b.Discover(ctx, runner, binary)
 }
 
 func (b *Backend) BackendMetadata(context.Context) engine.BackendMetadata {
-	meta := engine.BackendMetadata{Name: b.NameValue}
-	if b.probed != nil {
-		meta.Models = append([]string(nil), b.probed.DiscoveredModels...)
-		meta.Efforts = append([]string(nil), b.probed.DiscoveredEfforts...)
+	return engine.BackendMetadata{
+		Name:    b.NameValue,
+		Models:  sortedStringSet(b.AllowedModels),
+		Efforts: sortedStringSet(b.AllowedEfforts),
 	}
-	return meta
 }
 
 func (b *Backend) Start(ctx context.Context, opts engine.SessionOpts) (engine.Session, error) {
@@ -168,23 +161,6 @@ func (b *Backend) staticDescriptor() StaticBackendDescriptor {
 	}
 }
 
-func (b *Backend) validationDescriptor() StaticBackendDescriptor {
-	if b.probed != nil {
-		return b.probed.StaticBackendDescriptor
-	}
-	return b.staticDescriptor()
-}
-
-func (b *Backend) ProbeBackend(ctx context.Context, runner command.ProbeRunner) (engine.Backend, error) {
-	probed, err := ProbeBackend(ctx, runner, b.staticDescriptor())
-	if err != nil {
-		return nil, err
-	}
-	clone := *b
-	clone.probed = &probed
-	return &clone, nil
-}
-
 func (b *Backend) normalizeVersion(s string) string {
 	return normalizeVersionWith(s, b.VersionTransform)
 }
@@ -253,44 +229,21 @@ func normalizeVersionWith(s string, transform func(string) string) string {
 }
 
 func (b *Backend) validateOptions(opts engine.SessionOpts) (string, error) {
-	return ValidateStaticOptions(b.validationDescriptor(), opts)
+	return ValidateStaticOptions(b.staticDescriptor(), opts)
 }
 
 func ValidateStaticOptions(descriptor StaticBackendDescriptor, opts engine.SessionOpts) (string, error) {
-	models, efforts, modelsDiscovered, effortsDiscovered, warning := validationSets(descriptor)
 	if opts.Model != "" {
-		if _, ok := models[opts.Model]; !ok {
-			if modelsDiscovered {
-				warning = appendWarning(warning, fmt.Sprintf("model %q is not in the discovered %s catalog; passing through to backend", opts.Model, descriptor.NameValue))
-			} else if len(models) > 0 {
-				return warning, fmt.Errorf("unsupported model %q for %s", opts.Model, descriptor.NameValue)
-			}
+		if _, ok := descriptor.AllowedModels[opts.Model]; !ok && len(descriptor.AllowedModels) > 0 {
+			return "", fmt.Errorf("unsupported model %q for %s", opts.Model, descriptor.NameValue)
 		}
 	}
 	if opts.Effort != "" {
-		if _, ok := efforts[opts.Effort]; !ok {
-			if effortsDiscovered {
-				warning = appendWarning(warning, fmt.Sprintf("effort %q is not in the discovered %s catalog; passing through to backend", opts.Effort, descriptor.NameValue))
-			} else if len(efforts) > 0 {
-				return warning, fmt.Errorf("unsupported effort %q for %s", opts.Effort, descriptor.NameValue)
-			}
+		if _, ok := descriptor.AllowedEfforts[opts.Effort]; !ok && len(descriptor.AllowedEfforts) > 0 {
+			return "", fmt.Errorf("unsupported effort %q for %s", opts.Effort, descriptor.NameValue)
 		}
 	}
-	return warning, nil
-}
-
-func validationSets(descriptor StaticBackendDescriptor) (map[string]struct{}, map[string]struct{}, bool, bool, string) {
-	models := descriptor.AllowedModels
-	efforts := descriptor.AllowedEfforts
-	modelsDiscovered := descriptor.DiscoverySource != "" && len(descriptor.DiscoveredModels) > 0
-	effortsDiscovered := descriptor.DiscoverySource != "" && len(descriptor.DiscoveredEfforts) > 0
-	if modelsDiscovered {
-		models = StringSet(descriptor.DiscoveredModels...)
-	}
-	if effortsDiscovered {
-		efforts = StringSet(descriptor.DiscoveredEfforts...)
-	}
-	return models, efforts, modelsDiscovered, effortsDiscovered, descriptor.DiscoveryWarning
+	return "", nil
 }
 
 func cloneStringSet(in map[string]struct{}) map[string]struct{} {
@@ -302,6 +255,15 @@ func cloneStringSet(in map[string]struct{}) map[string]struct{} {
 		out[value] = struct{}{}
 	}
 	return out
+}
+
+func sortedStringSet(values map[string]struct{}) []string {
+	ordered := make([]string, 0, len(values))
+	for value := range values {
+		ordered = append(ordered, value)
+	}
+	sort.Strings(ordered)
+	return ordered
 }
 
 func appendWarning(existing, addition string) string {

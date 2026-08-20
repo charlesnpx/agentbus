@@ -990,59 +990,6 @@ func TestAppServerUnknownNotificationIsIgnored(t *testing.T) {
 	}
 }
 
-func TestAppServerSetupQualifyDiscoversModelsAndRequiresOne(t *testing.T) {
-	t.Run("discovers model list", func(t *testing.T) {
-		runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
-			peer := newAppServerPeer(t, proc)
-			peer.handshake()
-			req := peer.expectRequest("model/list")
-			peer.respond(req, map[string]any{
-				"data": []any{
-					map[string]any{
-						"model": "gpt-5.4",
-						"supportedReasoningEfforts": []any{
-							map[string]any{"reasoningEffort": "high"},
-							map[string]any{"reasoningEffort": "low"},
-						},
-					},
-					map[string]any{
-						"id":                        "id-only-model",
-						"supportedReasoningEfforts": []any{"xhigh"},
-					},
-				},
-			})
-		})
-		driver := newAppServerDriver("fake-codex", WritePolicyWorkspaceOffline)
-		discovery, err := driver.SetupQualify(context.Background(), runner, engine.SessionOpts{CWD: t.TempDir()})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := strings.Join(discovery.Models, ","); got != "gpt-5.4,id-only-model" {
-			t.Fatalf("models = %q", got)
-		}
-		if got := strings.Join(discovery.Efforts, ","); got != "low,high,xhigh" {
-			t.Fatalf("efforts = %q", got)
-		}
-		if discovery.Source != "app-server" || discovery.FetchedAt == "" {
-			t.Fatalf("discovery provenance = %#v", discovery)
-		}
-	})
-
-	t.Run("zero models fails", func(t *testing.T) {
-		runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
-			peer := newAppServerPeer(t, proc)
-			peer.handshake()
-			req := peer.expectRequest("model/list")
-			peer.respond(req, map[string]any{"data": []any{}})
-		})
-		driver := newAppServerDriver("fake-codex", WritePolicyWorkspaceOffline)
-		discovery, err := driver.SetupQualify(context.Background(), runner, engine.SessionOpts{CWD: t.TempDir()})
-		if err == nil || !strings.Contains(err.Error(), "no usable models") || len(discovery.Models) != 0 {
-			t.Fatalf("discovery=%#v err=%v, want zero-model qualification failure", discovery, err)
-		}
-	})
-}
-
 func TestCodexPreflightSucceedsWithoutSetupProbeCache(t *testing.T) {
 	stateRoot := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", stateRoot)

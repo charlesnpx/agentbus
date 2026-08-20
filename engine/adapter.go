@@ -22,9 +22,12 @@ type Session interface {
 
 // Health is the non-network preflight result for a backend.
 type Health struct {
-	Backend      string
-	BinaryPath   string
-	Version      string
+	Backend    string
+	BinaryPath string
+	Version    string
+	// StreamSchema is the stream protocol this adapter speaks. It is an
+	// adapter declaration, not a capability verified from the binary by
+	// Preflight.
 	StreamSchema string
 	Minimum      string
 	Warning      string
