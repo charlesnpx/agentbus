@@ -3,8 +3,6 @@
 package service
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -230,29 +228,14 @@ func projectFailureClass(record jobstore.Record) protocol.FailureClass {
 }
 
 func projectResult(record jobstore.Record) *protocol.ResultInfoWire {
-	if record.State != protocol.PublicStateCompleted || record.Artifacts.Result == "" {
+	if record.State != protocol.PublicStateCompleted || record.ResultPath == "" {
 		return nil
 	}
-	raw, err := os.ReadFile(record.Artifacts.Result)
-	if err != nil {
-		if record.ResultText == "" {
-			// Artifact retention is permitted to remove result files. The
-			// durable record still remains readable even when no authoritative
-			// result metadata can be reconstructed from it.
-			return nil
-		}
-		raw = []byte(record.ResultText)
-	}
-	sum := sha256.Sum256(raw)
-	text := record.ResultText
-	if len(raw) < engine.DefaultInlineResultCap {
-		text = string(raw)
-	}
 	return &protocol.ResultInfoWire{
-		Text:       text,
-		ResultPath: record.Artifacts.Result,
-		SHA256:     "sha256:" + hex.EncodeToString(sum[:]),
-		Bytes:      int64(len(raw)),
+		Text:       record.ResultText,
+		ResultPath: record.ResultPath,
+		SHA256:     record.ResultSHA256,
+		Bytes:      record.ResultBytes,
 	}
 }
 

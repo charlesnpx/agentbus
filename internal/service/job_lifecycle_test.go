@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
 	"sync/atomic"
 	"syscall"
@@ -38,6 +39,54 @@ func TestJobGetReturnsBareRecordAndCompactSummaries(t *testing.T) {
 	}
 	if record.JobID != submitted.JobID || record.Tags["unit"] != "u9" || record.Timeout == nil || record.Timeout.Effective != timeout {
 		t.Fatalf("job.get single record = %#v", record)
+	}
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := store.Get(submitted.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := spillAuthoritativeResult(terminal, bytes.Repeat([]byte("x"), engine.DefaultInlineResultCap+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkTerminal(terminal.JobID, jobstore.TerminalUpdate{
+		State:        protocol.PublicStateCompleted,
+		Cleanup:      protocol.CleanupClean,
+		ResultText:   info.Text,
+		ResultPath:   info.ResultPath,
+		ResultSHA256: info.SHA256,
+		ResultBytes:  info.Bytes,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := os.Chtimes(info.ResultPath, now.Add(-15*24*time.Hour), now.Add(-15*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SweepArtifacts(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(info.ResultPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("swept result %q remains: %v", info.ResultPath, err)
+	}
+	durable, err := store.Get(terminal.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	swept := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: terminal.JobID}))
+	if swept.err != nil {
+		t.Fatalf("job.get swept result error = %#v", swept.err)
+	}
+	sweptRecord, ok := swept.result.(protocol.JobRecordWire)
+	if !ok || sweptRecord.Result == nil {
+		t.Fatalf("job.get swept result = %#v, want record with result metadata", swept.result)
+	}
+	if result := sweptRecord.Result; result.Text != durable.ResultText || result.ResultPath != durable.ResultPath || result.SHA256 != durable.ResultSHA256 || result.Bytes != durable.ResultBytes {
+		t.Fatalf("job.get swept result = %#v, want durable path:%q sha256:%q bytes:%d", result, durable.ResultPath, durable.ResultSHA256, durable.ResultBytes)
 	}
 
 	list := server.handleJobGet(json.RawMessage(`{}`))
