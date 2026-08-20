@@ -6,7 +6,7 @@
 // to that fd and closes it:
 //
 //	{"ready":{"protocolVersion":1,"pid":123,"canonicalStateRoot":"/...","socketPath":"/.../agentbus.sock"}}
-//	{"failed":{"code":"strict admission support unavailable","message":"..."}}
+//	{"failed":{"code":"error","message":"..."}}
 //
 // The readiness protocol version is private to this launcher. It is not the
 // JSON-RPC protocol version spoken on the daemon socket.

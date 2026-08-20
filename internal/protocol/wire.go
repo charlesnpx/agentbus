@@ -8,6 +8,11 @@ import (
 )
 
 const (
+	// Version3 is the protocol major version served by the simplified daemon.
+	// Version remains the legacy v2 value in types.go so internal/served can
+	// continue to compile until its deletion-oriented unit lands.
+	Version3 = 3
+
 	// MethodJobGet retrieves one job, or all jobs when jobId is empty.
 	MethodJobGet = "job.get"
 )

@@ -169,7 +169,7 @@ func rpcResponseError(object protocol.ErrorObject) error {
 		return rpcErr
 	}
 	return &ProtocolVersionMismatchError{
-		Expected: protocol.Version,
+		Expected: protocol.Version3,
 		Received: object.Data.ServerProtocolVersion,
 		Cause:    rpcErr,
 	}
@@ -318,7 +318,7 @@ func clientHello(ctx context.Context, conn net.Conn, reader *bufio.Reader, token
 		JSONRPC: "2.0",
 		ID:      json.RawMessage(`"hello"`),
 		Method:  protocol.MethodHello,
-		Params:  mustMarshal(protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: token}),
+		Params:  mustMarshal(protocol.HelloParams{ClientProtocolVersion: protocol.Version3, Token: token}),
 	}
 	if err := writeDeadline(ctx, conn, req); err != nil {
 		return HelloResult{}, &helloTransportError{err: err}
@@ -346,8 +346,8 @@ func clientHello(ctx context.Context, conn net.Conn, reader *bufio.Reader, token
 	if err := json.Unmarshal(raw, &hello); err != nil {
 		return HelloResult{}, err
 	}
-	if hello.ProtocolVersion != protocol.Version {
-		return HelloResult{}, &ProtocolVersionMismatchError{Expected: protocol.Version, Received: hello.ProtocolVersion}
+	if hello.ProtocolVersion != protocol.Version3 {
+		return HelloResult{}, &ProtocolVersionMismatchError{Expected: protocol.Version3, Received: hello.ProtocolVersion}
 	}
 	return hello, nil
 }
@@ -1032,7 +1032,7 @@ func (c *Client) Hello(ctx context.Context) (HelloResult, error) {
 		return HelloResult{}, err
 	}
 	var out HelloResult
-	err = c.do(ctx, protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: token}, &out)
+	err = c.do(ctx, protocol.MethodHello, protocol.HelloParams{ClientProtocolVersion: protocol.Version3, Token: token}, &out)
 	return out, err
 }
 
@@ -1059,33 +1059,9 @@ func (c *Client) JobGetList(ctx context.Context) (JobGetListResult, error) {
 	return out, err
 }
 
-func (c *Client) JobStatus(ctx context.Context, params JobStatusParams) (JobStatusResult, error) {
-	var out JobStatusResult
-	err := c.do(ctx, protocol.MethodJobStatus, params, &out)
-	return out, err
-}
-
-func (c *Client) JobResult(ctx context.Context, params JobResultParams) (JobResult, error) {
-	var out JobResult
-	err := c.do(ctx, protocol.MethodJobResult, params, &out)
-	return out, err
-}
-
 func (c *Client) JobCancel(ctx context.Context, params JobCancelParams) (JobCancelResult, error) {
 	var out JobCancelResult
 	err := c.do(ctx, protocol.MethodJobCancel, params, &out)
-	return out, err
-}
-
-func (c *Client) PolicyValidate(ctx context.Context, params PolicyValidateParams) (PolicyValidateResult, error) {
-	var out PolicyValidateResult
-	err := c.do(ctx, protocol.MethodPolicyValidate, params, &out)
-	return out, err
-}
-
-func (c *Client) PolicyRegister(ctx context.Context, params PolicyRegisterParams) (PolicyRegisterResult, error) {
-	var out PolicyRegisterResult
-	err := c.do(ctx, protocol.MethodPolicyRegister, params, &out)
 	return out, err
 }
 

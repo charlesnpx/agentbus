@@ -114,9 +114,9 @@ func clientTestSkipOrFailBindDenied(t *testing.T, context string, detail any) {
 }
 
 func TestClientHelloParsesBackendMetadata(t *testing.T) {
-	hello := runClientHello(t, `{"protocolVersion":2,"backends":["codex"],"backendMetadata":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}],"capabilities":{"models.discovery":true}}`)
+	hello := runClientHello(t, `{"protocolVersion":3,"backends":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}]}`)
 
-	if hello.ProtocolVersion != protocol.Version || len(hello.Backends) != 1 || hello.Backends[0] != "codex" || !hello.Capabilities["models.discovery"] {
+	if hello.ProtocolVersion != protocol.Version3 {
 		t.Fatalf("hello = %+v", hello)
 	}
 	if len(hello.BackendMetadata) != 1 {
@@ -128,19 +128,8 @@ func TestClientHelloParsesBackendMetadata(t *testing.T) {
 	}
 }
 
-func TestClientHelloParsesCapabilitiesWithoutBackendMetadata(t *testing.T) {
-	hello := runClientHello(t, `{"protocolVersion":2,"backends":["codex"],"capabilities":{"models.discovery":false}}`)
-
-	if hello.ProtocolVersion != protocol.Version || len(hello.Backends) != 1 || hello.Backends[0] != "codex" || hello.Capabilities["models.discovery"] {
-		t.Fatalf("hello = %+v", hello)
-	}
-	if hello.BackendMetadata != nil {
-		t.Fatalf("backend metadata = %+v, want nil", hello.BackendMetadata)
-	}
-}
-
 func TestClientHelloRejectsProtocolVersionMismatch(t *testing.T) {
-	err := runClientHelloError(t, `{"protocolVersion":1,"backends":["codex"],"capabilities":{}}`)
+	err := runClientHelloError(t, `{"protocolVersion":1,"backends":[]}`)
 	if !errors.Is(err, ErrProtocolVersionMismatch) {
 		t.Fatalf("clientHello error = %v, want ErrProtocolVersionMismatch", err)
 	}
@@ -148,7 +137,7 @@ func TestClientHelloRejectsProtocolVersionMismatch(t *testing.T) {
 	if !errors.As(err, &mismatch) || mismatch.Received != 1 {
 		t.Fatalf("clientHello mismatch = %#v, want server version 1", mismatch)
 	}
-	if !strings.Contains(err.Error(), "expected 2") || !strings.Contains(err.Error(), "received 1") {
+	if !strings.Contains(err.Error(), "expected 3") || !strings.Contains(err.Error(), "received 1") {
 		t.Fatalf("clientHello error message = %q, want expected and received versions", err.Error())
 	}
 }
@@ -186,10 +175,8 @@ func TestConnectProtocolVersionMismatchDoesNotAutostart(t *testing.T) {
 		done <- json.NewEncoder(conn).Encode(protocol.Response{
 			JSONRPC: "2.0",
 			ID:      json.RawMessage(`"hello"`),
-			Result: protocol.HelloResult{
+			Result: protocol.HelloResultV3{
 				ProtocolVersion: 1,
-				Backends:        []string{"codex"},
-				Capabilities:    protocol.DefaultCapabilities(),
 			},
 		})
 	}()
@@ -396,7 +383,7 @@ func TestJobGetVersionMismatchRPCErrorIsTyped(t *testing.T) {
 		Message: "protocol version mismatch",
 		Data: protocol.ErrorData{
 			Code:                  protocol.ErrorVersionMismatch,
-			ServerProtocolVersion: protocol.Version + 1,
+			ServerProtocolVersion: protocol.Version3 + 1,
 		},
 	}})
 
@@ -412,8 +399,8 @@ func TestJobGetVersionMismatchRPCErrorIsTyped(t *testing.T) {
 	if !errors.As(err, &mismatch) {
 		t.Fatalf("JobGet error = %T %v, want *ProtocolVersionMismatchError", err, err)
 	}
-	if mismatch.Expected != protocol.Version || mismatch.Received != protocol.Version+1 {
-		t.Fatalf("version mismatch = %#v, want expected %d received %d", mismatch, protocol.Version, protocol.Version+1)
+	if mismatch.Expected != protocol.Version3 || mismatch.Received != protocol.Version3+1 {
+		t.Fatalf("version mismatch = %#v, want expected %d received %d", mismatch, protocol.Version3, protocol.Version3+1)
 	}
 	var rpcErr *RPCError
 	if !errors.As(err, &rpcErr) {
@@ -667,7 +654,7 @@ func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 	}
 	close(clients)
 	for c := range clients {
-		if c.HelloResult().ProtocolVersion != protocol.Version {
+		if c.HelloResult().ProtocolVersion != protocol.Version3 {
 			t.Fatalf("hello = %+v", c.HelloResult())
 		}
 		_ = c.Close()
@@ -820,7 +807,7 @@ func testConnectHelloTransportFailureAutostartsReplacement(t *testing.T, token s
 	if got := starts.Load(); got != 1 {
 		t.Fatalf("starts = %d, want 1", got)
 	}
-	if client.HelloResult().ProtocolVersion != protocol.Version {
+	if client.HelloResult().ProtocolVersion != protocol.Version3 {
 		t.Fatalf("hello = %+v", client.HelloResult())
 	}
 }
@@ -1523,18 +1510,16 @@ func serveClientTestConn(conn net.Conn, token string) {
 				resp.Error = protocol.NewError(protocol.ErrorUnauthorized, "unauthorized", protocol.ErrorData{})
 				break
 			}
-			if params.ClientProtocolVersion != protocol.Version {
+			if params.ClientProtocolVersion != protocol.Version3 {
 				resp.Error = protocol.NewError(
 					protocol.ErrorVersionMismatch,
 					"protocol version mismatch",
-					protocol.ErrorData{ServerProtocolVersion: protocol.Version},
+					protocol.ErrorData{ServerProtocolVersion: protocol.Version3},
 				)
 				break
 			}
-			resp.Result = protocol.HelloResult{
-				ProtocolVersion: protocol.Version,
-				Backends:        []string{},
-				Capabilities:    protocol.DefaultCapabilities(),
+			resp.Result = protocol.HelloResultV3{
+				ProtocolVersion: protocol.Version3,
 			}
 		default:
 			resp.Error = protocol.NewError(protocol.ErrorMethodNotFound, "method not found", protocol.ErrorData{})
