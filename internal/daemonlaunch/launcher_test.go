@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charlesnpx/agentbus/internal/procgroup"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -56,6 +54,23 @@ func TestLaunchFailedRecordIncludesDiagnosticAndStderr(t *testing.T) {
 		t.Fatalf("stderr tail not surfaced: %+v / %v", startup, err)
 	}
 	assertPIDGone(t, readPIDFile(t, pidPath))
+}
+
+func TestLaunchSetsid(t *testing.T) {
+	root := shortLaunchTempDir(t)
+	result, err := Launch(context.Background(), helperLaunchOptions(t, root, "ready", "", 2*time.Second))
+	if err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	t.Cleanup(func() { _ = result.KillAndWait() })
+
+	pgid, err := syscall.Getpgid(result.PID)
+	if err != nil {
+		t.Fatalf("Getpgid(%d) error = %v", result.PID, err)
+	}
+	if pgid != result.PID {
+		t.Fatalf("launched child process group = %d, want its pid %d", pgid, result.PID)
+	}
 }
 
 func TestLaunchCrashBeforeRecordIncludesStderrAndReaps(t *testing.T) {
@@ -277,25 +292,6 @@ func TestInheritedReporterClearsEnvAndMarksCloseOnExec(t *testing.T) {
 	}
 	if !closeOnExec {
 		t.Fatal("readiness fd is not marked close-on-exec")
-	}
-}
-
-func TestLaunchSetsid(t *testing.T) {
-	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
-		t.Skip("process group assertion is Unix-specific")
-	}
-	root := shortLaunchTempDir(t)
-	result, err := Launch(context.Background(), helperLaunchOptions(t, root, "ready", "", 2*time.Second))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = result.KillAndWait() })
-	pgid, err := procgroup.ReadProcessPGID(result.PID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pgid != result.PID {
-		t.Fatalf("child pgid = %d, want pid %d", pgid, result.PID)
 	}
 }
 
