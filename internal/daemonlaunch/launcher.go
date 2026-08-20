@@ -717,7 +717,7 @@ func verifyExistingDaemon(ctx context.Context, socketPath, tokenPath string) err
 	if resp.Error != nil {
 		return &protocol.RPCError{Object: *resp.Error}
 	}
-	var hello protocol.HelloResultV3
+	var hello protocol.HelloResult
 	raw, err = json.Marshal(resp.Result)
 	if err != nil {
 		return err

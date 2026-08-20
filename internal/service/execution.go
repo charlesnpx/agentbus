@@ -474,8 +474,8 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	s.recordExecutionCompletion(store, record, text, cleanup, diagnostics, contract)
 }
 
-func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpecV3, error) {
-	var spec protocol.TaskSpecV3
+func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpec, error) {
+	var spec protocol.TaskSpec
 	if len(record.TaskSpec) == 0 {
 		return spec, errors.New("durable task spec is missing")
 	}
@@ -491,7 +491,7 @@ func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpecV3, error) {
 // evaluateOutputSchema runs only after the initial turn has successfully
 // retired and before the job's sole terminal write. A correction failure is a
 // contract failure, not a reason to discard the already authoritative result.
-func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, spec protocol.TaskSpecV3, logPaths engine.LogPaths, original string, cleanup protocol.Cleanup, diagnostics []string) (string, protocol.ContractResult, protocol.Cleanup, []string) {
+func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, spec protocol.TaskSpec, logPaths engine.LogPaths, original string, cleanup protocol.Cleanup, diagnostics []string) (string, protocol.ContractResult, protocol.Cleanup, []string) {
 	if len(spec.OutputSchema) == 0 {
 		return original, protocol.ContractResult{}, cleanup, diagnostics
 	}

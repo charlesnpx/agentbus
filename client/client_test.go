@@ -174,7 +174,7 @@ func TestConnectProtocolVersionMismatchDoesNotAutostart(t *testing.T) {
 		done <- json.NewEncoder(conn).Encode(protocol.Response{
 			JSONRPC: "2.0",
 			ID:      json.RawMessage(`"hello"`),
-			Result: protocol.HelloResultV3{
+			Result: protocol.HelloResult{
 				ProtocolVersion: 1,
 			},
 		})
@@ -1324,7 +1324,7 @@ func serveClientTestConn(conn net.Conn, token string) {
 				)
 				break
 			}
-			resp.Result = protocol.HelloResultV3{
+			resp.Result = protocol.HelloResult{
 				ProtocolVersion: protocol.Version3,
 			}
 		default:

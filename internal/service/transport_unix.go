@@ -45,7 +45,7 @@ func (c *connection) serve() {
 			_ = c.writeResponse(protocol.Response{
 				JSONRPC: "2.0",
 				ID:      json.RawMessage("null"),
-				Error:   protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "malformed JSON-RPC frame", protocol.ErrorData{}),
+				Error:   protocol.NewError(protocol.ErrorInvalidTaskSpec, "malformed JSON-RPC frame", protocol.ErrorData{}),
 			})
 			continue
 		}
@@ -53,7 +53,7 @@ func (c *connection) serve() {
 			_ = c.writeResponse(protocol.Response{
 				JSONRPC: "2.0",
 				ID:      json.RawMessage("null"),
-				Error:   protocol.NewError(protocol.ErrorInvalidTaskSpecV3, request.Method+" requires a JSON-RPC id", protocol.ErrorData{}),
+				Error:   protocol.NewError(protocol.ErrorInvalidTaskSpec, request.Method+" requires a JSON-RPC id", protocol.ErrorData{}),
 			})
 			continue
 		}
@@ -71,7 +71,7 @@ func (c *connection) serve() {
 		_ = c.writeOversizedRequestResponse(protocol.Response{
 			JSONRPC: "2.0",
 			ID:      json.RawMessage("null"),
-			Error:   protocol.NewError(protocol.ErrorInvalidTaskSpecV3, message, protocol.ErrorData{}),
+			Error:   protocol.NewError(protocol.ErrorInvalidTaskSpec, message, protocol.ErrorData{}),
 		})
 	}
 }
@@ -113,13 +113,13 @@ type requestOutcome struct {
 
 func (s *Server) handle(connection *connection, request protocol.Request) requestOutcome {
 	if request.JSONRPC != "2.0" || request.Method == "" {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "invalid JSON-RPC request", protocol.ErrorData{})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "invalid JSON-RPC request", protocol.ErrorData{})}
 	}
 	if !connection.hello && request.Method != protocol.MethodHello {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorUnauthorizedV3, "protocol.hello is required before other methods", protocol.ErrorData{})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorUnauthorized, "protocol.hello is required before other methods", protocol.ErrorData{})}
 	}
 	if connection.hello && request.Method == protocol.MethodHello {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "protocol.hello has already been completed on this connection", protocol.ErrorData{})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "protocol.hello has already been completed on this connection", protocol.ErrorData{})}
 	}
 	switch request.Method {
 	case protocol.MethodHello:
@@ -131,7 +131,7 @@ func (s *Server) handle(connection *connection, request protocol.Request) reques
 	case protocol.MethodJobCancel:
 		return s.handleJobCancel(request.Params)
 	default:
-		return requestOutcome{err: protocol.NewError(protocol.ErrorMethodNotFoundV3, "method not found", protocol.ErrorData{})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorMethodNotFound, "method not found", protocol.ErrorData{})}
 	}
 }
 
@@ -141,13 +141,13 @@ func (s *Server) handleHello(connection *connection, raw json.RawMessage) reques
 		return invalidParams(err)
 	}
 	if params.Token == "" || params.Token != s.token {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorUnauthorizedV3, "missing or invalid hello token", protocol.ErrorData{})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorUnauthorized, "missing or invalid hello token", protocol.ErrorData{})}
 	}
 	if params.ClientProtocolVersion != ProtocolVersion {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorVersionMismatchV3, "protocol major version mismatch", protocol.ErrorData{ServerProtocolVersion: ProtocolVersion})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorVersionMismatch, "protocol major version mismatch", protocol.ErrorData{ServerProtocolVersion: ProtocolVersion})}
 	}
 	connection.hello = true
-	return requestOutcome{result: protocol.HelloResultV3{
+	return requestOutcome{result: protocol.HelloResult{
 		ProtocolVersion: ProtocolVersion,
 		BackendMetadata: s.backendMetadata(),
 	}}
@@ -504,5 +504,5 @@ func decodeStrict(raw json.RawMessage, dst any) error {
 }
 
 func invalidParams(err error) requestOutcome {
-	return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, err.Error(), protocol.ErrorData{})}
+	return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, err.Error(), protocol.ErrorData{})}
 }

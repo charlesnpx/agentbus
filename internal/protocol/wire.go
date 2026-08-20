@@ -9,24 +9,21 @@ import (
 
 const (
 	// Version3 is the protocol major version served by the simplified daemon.
-	// Version remains the legacy v2 compatibility value in types.go; v3 callers
-	// use Version3 explicitly.
 	Version3 = 3
 
 	// MethodJobGet retrieves one job, or all jobs when jobId is empty.
 	MethodJobGet = "job.get"
 )
 
-// The V3 error codes are the only codes protocol.hello, job.submit, job.get,
-// and job.cancel may produce. Policy-specific name_conflict and quarantined
-// are intentionally absent.
+// The protocol error codes are the only codes protocol.hello, job.submit, job.get,
+// and job.cancel may produce.
 const (
-	ErrorUnauthorizedV3       = ErrorUnauthorized
-	ErrorVersionMismatchV3    = ErrorVersionMismatch
-	ErrorMethodNotFoundV3     = ErrorMethodNotFound
-	ErrorBackendUnavailableV3 = ErrorBackendUnavailable
-	ErrorInvalidTaskSpecV3    = ErrorInvalidTaskSpec
-	ErrorUnknownJobV3         = ErrorUnknownJob
+	ErrorUnauthorized       = "unauthorized"
+	ErrorVersionMismatch    = "protocol_version_mismatch"
+	ErrorMethodNotFound     = "method_not_found"
+	ErrorBackendUnavailable = "backend_unavailable"
+	ErrorInvalidTaskSpec    = "invalid_task_spec"
+	ErrorUnknownJob         = "unknown_job"
 )
 
 // PublicState is the stable job state exposed by protocol v3. The daemon
@@ -124,8 +121,8 @@ type ContractVerdict struct {
 	Compliant bool `json:"compliant"`
 }
 
-// TaskSpecV3 describes a job submitted through protocol v3.
-type TaskSpecV3 struct {
+// TaskSpec describes a job submitted through protocol v3.
+type TaskSpec struct {
 	Backend      string             `json:"backend"`
 	CWD          string             `json:"cwd"`
 	Prompt       string             `json:"prompt"`
@@ -137,15 +134,15 @@ type TaskSpecV3 struct {
 	Tags         *map[string]string `json:"tags,omitempty"`
 }
 
-// JobSubmitParamsV3 is the parameter object for job.submit.
-type JobSubmitParamsV3 struct {
-	WorkspaceKey string     `json:"workspaceKey,omitempty"`
-	RequestID    string     `json:"requestId,omitempty"`
-	TaskSpec     TaskSpecV3 `json:"taskSpec"`
+// JobSubmitParams is the parameter object for job.submit.
+type JobSubmitParams struct {
+	WorkspaceKey string   `json:"workspaceKey,omitempty"`
+	RequestID    string   `json:"requestId,omitempty"`
+	TaskSpec     TaskSpec `json:"taskSpec"`
 }
 
-// JobSubmitResultV3 is the result object for job.submit.
-type JobSubmitResultV3 struct {
+// JobSubmitResult is the result object for job.submit.
+type JobSubmitResult struct {
 	JobID        string                    `json:"jobId"`
 	State        PublicState               `json:"state"`
 	Deduplicated bool                      `json:"deduplicated"`
@@ -163,21 +160,19 @@ type JobGetListResult struct {
 	Jobs []JobSummaryWire `json:"jobs"`
 }
 
-// JobCancelParamsV3 is the parameter object for job.cancel.
-type JobCancelParamsV3 struct {
+// JobCancelParams is the parameter object for job.cancel.
+type JobCancelParams struct {
 	JobID string `json:"jobId"`
 }
 
-// JobCancelResultV3 is the result object for job.cancel.
-type JobCancelResultV3 struct {
+// JobCancelResult is the result object for job.cancel.
+type JobCancelResult struct {
 	JobID string      `json:"jobId"`
 	State PublicState `json:"state"`
 }
 
-// HelloResultV3 is the result object for protocol.hello. It deliberately has
-// no capabilities map: the v2 map had eight keys, three hardcoded false and
-// never set anywhere in the tree.
-type HelloResultV3 struct {
+// HelloResult is the result object for protocol.hello.
+type HelloResult struct {
 	ProtocolVersion int           `json:"protocolVersion"`
 	BackendMetadata []BackendInfo `json:"backends"`
 }

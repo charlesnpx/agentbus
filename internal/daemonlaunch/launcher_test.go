@@ -511,7 +511,7 @@ func serveOneVerifiedHello(listener net.Listener, token string, helloSeen chan<-
 		_ = json.NewEncoder(conn).Encode(resp)
 		return
 	}
-	resp.Result = protocol.HelloResultV3{
+	resp.Result = protocol.HelloResult{
 		ProtocolVersion: protocol.Version3,
 	}
 	_ = json.NewEncoder(conn).Encode(resp)

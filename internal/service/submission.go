@@ -40,7 +40,7 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 
 	store, err := s.ensureJobStore()
 	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailableV3, "open job store: "+err.Error(), protocol.ErrorData{})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "open job store: "+err.Error(), protocol.ErrorData{})}
 	}
 	var executionBackend engine.Backend
 	record, deduplicated, err := store.SubmitTx(input.key, input.canonicalTaskSpec, func(id string) (jobstore.Record, error) {
@@ -80,11 +80,11 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 		if errors.Is(err, jobstore.ErrConflict) {
 			return s.jobSubmitConflict(err)
 		}
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "submit job: "+err.Error(), protocol.ErrorData{})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "submit job: "+err.Error(), protocol.ErrorData{})}
 	}
 	timeout, err := timeoutFromStoredTaskSpec(record.TaskSpec)
 	if err != nil {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "stored taskSpec timeout: "+err.Error(), protocol.ErrorData{JobID: record.JobID})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "stored taskSpec timeout: "+err.Error(), protocol.ErrorData{JobID: record.JobID})}
 	}
 	// Only a live daemon owns new execution, and only a genuinely new job is
 	// enqueued: a deduplicated replay is already running or terminal, so
@@ -158,15 +158,15 @@ func parseJobSubmitInput(raw json.RawMessage) (jobSubmitInput, error) {
 	return input, nil
 }
 
-func decodeTaskSpec(raw json.RawMessage) (protocol.TaskSpecV3, error) {
-	var spec protocol.TaskSpecV3
+func decodeTaskSpec(raw json.RawMessage) (protocol.TaskSpec, error) {
+	var spec protocol.TaskSpec
 	if err := decodeStrict(raw, &spec); err != nil {
-		return protocol.TaskSpecV3{}, err
+		return protocol.TaskSpec{}, err
 	}
 	return spec, nil
 }
 
-func validateNewTaskSpec(spec protocol.TaskSpecV3, raw map[string]json.RawMessage) error {
+func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage) error {
 	for _, required := range []string{"backend", "cwd", "write", "prompt"} {
 		value, present := raw[required]
 		if !present || string(value) == "null" {
@@ -206,8 +206,8 @@ func taskSpecOptionalString(value *string) string {
 	return *value
 }
 
-func jobSubmitResult(record jobstore.Record, deduplicated bool, timeout *engine.TimeoutResolution) protocol.JobSubmitResultV3 {
-	return protocol.JobSubmitResultV3{
+func jobSubmitResult(record jobstore.Record, deduplicated bool, timeout *engine.TimeoutResolution) protocol.JobSubmitResult {
+	return protocol.JobSubmitResult{
 		JobID:        record.JobID,
 		State:        record.State,
 		Deduplicated: deduplicated,
@@ -230,14 +230,14 @@ func timeoutFromStoredTaskSpec(raw json.RawMessage) (*engine.TimeoutResolution, 
 func (s *Server) jobSubmitConflict(submitErr error) requestOutcome {
 	var conflict *jobstore.ConflictError
 	if !errors.As(submitErr, &conflict) {
-		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, submitErr.Error(), protocol.ErrorData{})}
+		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, submitErr.Error(), protocol.ErrorData{})}
 	}
 	data := protocol.ErrorData{JobID: conflict.ExistingJobID}
 	// protocol v3 has no distinct conflict error code. Keep the typed store
 	// conflict visible as an invalid-task response without violating JSON-RPC's
 	// result XOR error response invariant.
 	return requestOutcome{
-		err: protocol.NewError(protocol.ErrorInvalidTaskSpecV3, submitErr.Error(), data),
+		err: protocol.NewError(protocol.ErrorInvalidTaskSpec, submitErr.Error(), data),
 	}
 }
 
@@ -289,7 +289,7 @@ func timeoutFromMillis(ms *int64) (*engine.TimeoutResolution, *protocol.ErrorObj
 		}, nil
 	}
 	if *ms < 0 {
-		return nil, protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "timeoutMs cannot be negative", protocol.ErrorData{})
+		return nil, protocol.NewError(protocol.ErrorInvalidTaskSpec, "timeoutMs cannot be negative", protocol.ErrorData{})
 	}
 	if *ms == 0 {
 		return &engine.TimeoutResolution{
@@ -299,7 +299,7 @@ func timeoutFromMillis(ms *int64) (*engine.TimeoutResolution, *protocol.ErrorObj
 		}, nil
 	}
 	if *ms > protocol.MaxTimeout.Milliseconds() {
-		return nil, protocol.NewError(protocol.ErrorInvalidTaskSpecV3, "timeoutMs exceeds maximum", protocol.ErrorData{})
+		return nil, protocol.NewError(protocol.ErrorInvalidTaskSpec, "timeoutMs exceeds maximum", protocol.ErrorData{})
 	}
 	return &engine.TimeoutResolution{
 		Requested: ms,
