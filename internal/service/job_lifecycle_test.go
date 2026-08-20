@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -393,35 +394,53 @@ func TestRestartPreservesUnknownTerminalRecordBytes(t *testing.T) {
 }
 
 func TestOrphanReaperSignalsExactTokenMatch(t *testing.T) {
-	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "reaper-exact"}}})
-	fixture := newOrphanReaperFixture()
-	server.processTable = fixture
-	server.processGroups = fixture
-	server.processGroupGoneFn = fixture.processGroupGone
-	claim := fixture.claim()
-	record := persistRunningClaim(t, server, "reaper-exact", claim)
-	store, err := server.ensureJobStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := server.reconcileRecoveredJobs(store); err != nil {
-		t.Fatal(err)
-	}
-	stored, err := store.Get(record.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored.State != protocol.PublicStateUnknown || stored.Cleanup != protocol.CleanupClean {
-		t.Fatalf("exact-token reaped record = %#v", stored)
-	}
-	if fixture.lookups != 2 {
-		t.Fatalf("exact-token leader lookups = %d, want 2 checks before SIGTERM", fixture.lookups)
-	}
-	if len(fixture.signals) != 1 || fixture.signals[0].pgid != claim.PGID || fixture.signals[0].signal != syscall.SIGTERM {
-		t.Fatalf("exact-token signals = %#v, want one SIGTERM for PGID %d", fixture.signals, claim.PGID)
-	}
-	if len(fixture.groupGone) != 2 || fixture.groupGone[0] || !fixture.groupGone[1] {
-		t.Fatalf("exact-token group-gone observations = %#v, want [false true]", fixture.groupGone)
+	for _, tt := range []struct {
+		name              string
+		secondLookupToken string
+		wantCleanup       protocol.Cleanup
+		wantEvents        []string
+	}{
+		{
+			name:        "matching token signals in order",
+			wantCleanup: protocol.CleanupClean,
+			wantEvents:  []string{"lookup", "group-present", "lookup", "TERM", "group-gone"},
+		},
+		{
+			name:              "changed second token does not signal",
+			secondLookupToken: "recycled-pid-token",
+			wantCleanup:       protocol.CleanupUncertain,
+			wantEvents:        []string{"lookup", "group-present", "lookup"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "reaper-exact"}}})
+			fixture := newOrphanReaperFixture()
+			if tt.secondLookupToken != "" {
+				fixture.lookupTokens = []string{fixture.startToken, tt.secondLookupToken}
+			}
+			server.processTable = fixture
+			server.processGroups = fixture
+			server.processGroupGoneFn = fixture.processGroupGone
+			claim := fixture.claim()
+			record := persistRunningClaim(t, server, "reaper-exact", claim)
+			store, err := server.ensureJobStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := server.reconcileRecoveredJobs(store); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := store.Get(record.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.State != protocol.PublicStateUnknown || stored.Cleanup != tt.wantCleanup {
+				t.Fatalf("exact-token reaped record = %#v, want cleanup %s", stored, tt.wantCleanup)
+			}
+			if !slices.Equal(fixture.events, tt.wantEvents) {
+				t.Fatalf("exact-token events = %#v, want %#v", fixture.events, tt.wantEvents)
+			}
+		})
 	}
 }
 
@@ -467,6 +486,10 @@ type orphanReaperFixture struct {
 	startToken string
 	groupLive  bool
 
+	lookupTokens []string
+	lookupIndex  int
+	events       []string
+
 	lookups   int
 	signals   []processGroupSignalCall
 	groupGone []bool
@@ -486,11 +509,17 @@ func (f *orphanReaperFixture) claim() jobstore.ProcessClaim {
 }
 
 func (f *orphanReaperFixture) Lookup(pid int) (engine.ProcessInfo, bool, error) {
+	f.events = append(f.events, "lookup")
 	f.lookups++
 	if pid != f.pid {
 		return engine.ProcessInfo{}, false, nil
 	}
-	return engine.ProcessInfo{PID: f.pid, StartTime: f.startToken}, true, nil
+	startToken := f.startToken
+	if f.lookupIndex < len(f.lookupTokens) {
+		startToken = f.lookupTokens[f.lookupIndex]
+	}
+	f.lookupIndex++
+	return engine.ProcessInfo{PID: f.pid, StartTime: startToken}, true, nil
 }
 
 func (f *orphanReaperFixture) SignalProcessGroup(pgid int, signal syscall.Signal) error {
@@ -501,6 +530,7 @@ func (f *orphanReaperFixture) SignalProcessGroup(pgid int, signal syscall.Signal
 	if signal != syscall.SIGTERM {
 		return errors.New("unexpected process-group signal")
 	}
+	f.events = append(f.events, "TERM")
 	f.groupLive = false
 	return nil
 }
@@ -511,6 +541,11 @@ func (f *orphanReaperFixture) processGroupGone(pgid int) (bool, error) {
 	}
 	seenGone := !f.groupLive
 	f.groupGone = append(f.groupGone, seenGone)
+	if seenGone {
+		f.events = append(f.events, "group-gone")
+	} else {
+		f.events = append(f.events, "group-present")
+	}
 	return seenGone, nil
 }
 
