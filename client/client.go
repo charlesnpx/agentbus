@@ -137,10 +137,12 @@ func (e AutostartLockUnsafeError) Unwrap() error {
 }
 
 // ProtocolVersionMismatchError reports the expected and received protocol
-// versions from a failed hello exchange.
+// versions. Cause carries the RPC error when the server reports the mismatch
+// through a JSON-RPC error response.
 type ProtocolVersionMismatchError struct {
 	Expected int
 	Received int
+	Cause    *protocol.RPCError
 }
 
 func (e *ProtocolVersionMismatchError) Error() string {
@@ -152,6 +154,25 @@ func (e *ProtocolVersionMismatchError) Error() string {
 
 func (e *ProtocolVersionMismatchError) Is(target error) bool {
 	return target == ErrProtocolVersionMismatch
+}
+
+func (e *ProtocolVersionMismatchError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func rpcResponseError(object protocol.ErrorObject) error {
+	rpcErr := &protocol.RPCError{Object: object}
+	if object.Data.Code != protocol.ErrorVersionMismatch {
+		return rpcErr
+	}
+	return &ProtocolVersionMismatchError{
+		Expected: protocol.Version,
+		Received: object.Data.ServerProtocolVersion,
+		Cause:    rpcErr,
+	}
 }
 
 // Options configures a protocol client.
@@ -315,7 +336,7 @@ func clientHello(ctx context.Context, conn net.Conn, reader *bufio.Reader, token
 		return HelloResult{}, err
 	}
 	if resp.Error != nil {
-		return HelloResult{}, &protocol.RPCError{Object: *resp.Error}
+		return HelloResult{}, rpcResponseError(*resp.Error)
 	}
 	raw, err := json.Marshal(resp.Result)
 	if err != nil {
@@ -894,7 +915,7 @@ func (c *Client) do(ctx context.Context, method string, params any, result any) 
 		return ctx.Err()
 	case resp := <-ch:
 		if resp.Error != nil {
-			return &protocol.RPCError{Object: *resp.Error}
+			return rpcResponseError(*resp.Error)
 		}
 		if result == nil {
 			return nil
@@ -1018,6 +1039,23 @@ func (c *Client) Hello(ctx context.Context) (HelloResult, error) {
 func (c *Client) JobSubmit(ctx context.Context, params JobSubmitParams) (JobSubmitResult, error) {
 	var out JobSubmitResult
 	err := c.do(ctx, protocol.MethodJobSubmit, params, &out)
+	return out, err
+}
+
+// JobGet returns the complete record for the requested job.
+func (c *Client) JobGet(ctx context.Context, params JobGetParams) (JobGetResult, error) {
+	var out JobGetResult
+	if params.JobID == "" {
+		return out, errors.New("job.get requires a non-empty job ID; use JobGetList for list requests")
+	}
+	err := c.do(ctx, protocol.MethodJobGet, params, &out)
+	return out, err
+}
+
+// JobGetList returns the compact summaries from an empty job.get request.
+func (c *Client) JobGetList(ctx context.Context) (JobGetListResult, error) {
+	var out JobGetListResult
+	err := c.do(ctx, protocol.MethodJobGet, JobGetParams{}, &out)
 	return out, err
 }
 
