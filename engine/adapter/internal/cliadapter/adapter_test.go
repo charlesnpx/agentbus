@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,23 +46,6 @@ func TestCapEventKeepsRawTextOutOfJSONMetadata(t *testing.T) {
 	}
 	if strings.Contains(string(wire), "agentbusRawText") || strings.Contains(string(wire), "SECRET_RAW_TAIL") {
 		t.Fatalf("wire event leaked raw text metadata: %s", wire)
-	}
-}
-
-func TestSetupQualificationRejectsLifecycleOnlyProgressAndTurnFinal(t *testing.T) {
-	events := make(chan engine.Event, 2)
-	events <- engine.Event{Type: engine.EventProgress}
-	events <- engine.Event{
-		Type: engine.EventTurnFinal,
-		TurnFinal: &engine.TurnFinalObservation{
-			BackendSessionID: "resume-1",
-		},
-	}
-	close(events)
-
-	err := (&Backend{NameValue: "fake"}).qualifySetupStream(context.Background(), events)
-	if err == nil || !strings.Contains(err.Error(), "setup stream probe produced no semantic JSON events") {
-		t.Fatalf("qualification error = %v, want no semantic provider events", err)
 	}
 }
 
@@ -229,7 +211,6 @@ func TestSessionTurnTimeoutKillsDescendantHoldingStdout(t *testing.T) {
 	backend := &Backend{
 		NameValue: "sh",
 		Binary:    "/bin/sh",
-		CachePath: filepath.Join(t.TempDir(), "missing-cache.json"),
 		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
 			return []string{"-c", script}, nil
 		},
@@ -297,7 +278,6 @@ func TestSessionTurnUsesCommandRunnerExecSpec(t *testing.T) {
 	backend := &Backend{
 		NameValue: "fake",
 		Binary:    markerCLI(t, marker),
-		CachePath: filepath.Join(t.TempDir(), "missing-cache.json"),
 		BuildArgs: func(string, engine.SessionOpts, engine.TurnInput) ([]string, error) {
 			return []string{"run", "--json"}, nil
 		},
@@ -395,33 +375,19 @@ func TestOneShotBackendRunsThroughDuplexRuntime(t *testing.T) {
 	}
 }
 
-func TestBackendWithDriverPreservesAdmissionProbeAndRunsDuplexTurn(t *testing.T) {
+func TestBackendWithDriverPreservesLiveProbeAndRunsDuplexTurn(t *testing.T) {
 	const (
 		binaryPath = "/tmp/fake-bin"
 		schema     = "duplex-json-v1"
 	)
 	driver := newCliDuplexTestDriver("resume-1")
 	runner := &duplexCommandRunner{finishOnStart: true}
-	cachePath := filepath.Join(t.TempDir(), "setup-probes.json")
-	writeCliAdapterSetupCache(t, cachePath, engine.BackendSetupProbe{
-		Backend:      "fake",
-		BinaryPath:   binaryPath,
-		Version:      "1.0.0",
-		StreamSchema: schema,
-	})
 	backend := &Backend{
 		NameValue:      "fake",
 		Binary:         "fake-bin",
 		MinimumVersion: "0.1.0",
-		CachePath:      cachePath,
 		StreamSchema:   schema,
 		Driver:         driver,
-	}
-	if !backend.AdmissionParkable() {
-		t.Fatal("driver-backed backend is not admission-parkable")
-	}
-	if !backend.AdmissionControlledRunner() {
-		t.Fatal("driver-backed backend is not admission-controlled")
 	}
 	probed, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"})
 	if err != nil {
@@ -459,192 +425,6 @@ func TestBackendWithDriverPreservesAdmissionProbeAndRunsDuplexTurn(t *testing.T)
 	}
 	if spec.Dir != "/tmp/work" {
 		t.Fatalf("dir = %q, want /tmp/work", spec.Dir)
-	}
-}
-
-func TestProbeBackendHydratesEmptyDiscoveryFromMatchingSetupCache(t *testing.T) {
-	const (
-		backendName = "fake"
-		binaryPath  = "/tmp/fake-bin"
-		version     = "1.0.0"
-		schema      = "duplex-json-v1"
-	)
-	cachePath := filepath.Join(t.TempDir(), "setup-probes.json")
-	writeCliAdapterSetupCache(t, cachePath, engine.BackendSetupProbe{
-		Backend:                backendName,
-		BinaryPath:             binaryPath,
-		Version:                version,
-		StreamSchema:           schema,
-		DiscoveredModels:       []string{"cached-model", "cached-model-2"},
-		DiscoveredEfforts:      []string{"medium", "high"},
-		DiscoverySource:        "setup model/list",
-		DiscoveryFetchedAt:     "2026-07-30T12:00:00Z",
-		DiscoveryClientVersion: version,
-		DiscoveryWarnings:      []string{"cached warning"},
-	})
-	backend := &Backend{
-		NameValue:      backendName,
-		Binary:         "fake-bin",
-		MinimumVersion: "0.1.0",
-		CachePath:      cachePath,
-		StreamSchema:   schema,
-		Driver:         newCliDuplexTestDriver(),
-	}
-
-	probed, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	probedBackend, ok := probed.(*Backend)
-	if !ok {
-		t.Fatalf("probed backend = %T, want *Backend", probed)
-	}
-	meta := probedBackend.BackendMetadata(context.Background())
-	if !slices.Equal(meta.Models, []string{"cached-model", "cached-model-2"}) {
-		t.Fatalf("metadata models = %#v, want cached models", meta.Models)
-	}
-	if !slices.Equal(meta.Efforts, []string{"medium", "high"}) {
-		t.Fatalf("metadata efforts = %#v, want cached efforts", meta.Efforts)
-	}
-	if probedBackend.probed.DiscoverySource != "setup model/list" ||
-		probedBackend.probed.DiscoveryFetchedAt != "2026-07-30T12:00:00Z" ||
-		probedBackend.probed.DiscoveryClientVersion != version ||
-		probedBackend.probed.DiscoveryWarning != "cached warning" {
-		t.Fatalf("probed discovery = %#v, want setup cache discovery fields", probedBackend.probed)
-	}
-	warning, err := probedBackend.validateOptions(engine.SessionOpts{Model: "not-in-cache"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(warning, `model "not-in-cache" is not in the discovered fake catalog`) {
-		t.Fatalf("validation warning = %q, want discovered catalog warning", warning)
-	}
-}
-
-func TestProbeBackendRequiresSetupCache(t *testing.T) {
-	const (
-		backendName = "fake"
-		binaryPath  = "/tmp/fake-bin"
-		schema      = "duplex-json-v1"
-	)
-	backend := &Backend{
-		NameValue:      backendName,
-		Binary:         "fake-bin",
-		MinimumVersion: "0.1.0",
-		CachePath:      filepath.Join(t.TempDir(), "missing-setup-probes.json"),
-		StreamSchema:   schema,
-		Driver:         newCliDuplexTestDriver(),
-	}
-
-	_, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"})
-	if err == nil {
-		t.Fatal("ProbeBackend error = nil, want missing setup cache error")
-	}
-	assertSetupCacheRemediation(t, err.Error())
-}
-
-func TestCachedProbeStaleCacheExplainsDaemonRefresh(t *testing.T) {
-	cachePath := filepath.Join(t.TempDir(), "setup-probes.json")
-	if err := os.WriteFile(cachePath, []byte("{\"version\": 0, \"backends\": []}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	backend := &Backend{NameValue: "fake", CachePath: cachePath}
-	_, err := backend.cachedProbe()
-	if err == nil {
-		t.Fatal("cachedProbe error = nil, want stale cache error")
-	}
-	assertSetupCacheRemediation(t, err.Error())
-}
-
-func TestProbeBackendRejectsMismatchedSetupCache(t *testing.T) {
-	const (
-		backendName = "fake"
-		binaryPath  = "/tmp/fake-bin"
-		version     = "1.0.0"
-		schema      = "duplex-json-v1"
-	)
-	tests := []struct {
-		name        string
-		probe       engine.BackendSetupProbe
-		wantMessage string
-	}{
-		{
-			name: "version drift",
-			probe: engine.BackendSetupProbe{
-				Backend:      backendName,
-				BinaryPath:   binaryPath,
-				Version:      "0.9.0",
-				StreamSchema: schema,
-			},
-			wantMessage: DriftError,
-		},
-		{
-			name: "binary drift",
-			probe: engine.BackendSetupProbe{
-				Backend:      backendName,
-				BinaryPath:   "/tmp/other-fake-bin",
-				Version:      version,
-				StreamSchema: schema,
-			},
-			wantMessage: DriftError,
-		},
-		{
-			name: "schema mismatch",
-			probe: engine.BackendSetupProbe{
-				Backend:      backendName,
-				BinaryPath:   binaryPath,
-				Version:      version,
-				StreamSchema: "legacy-schema",
-			},
-			wantMessage: `backend_unavailable: setup cache for fake lacks stream schema "duplex-json-v1"`,
-		},
-		{
-			name: "missing backend",
-			probe: engine.BackendSetupProbe{
-				Backend:      "other",
-				BinaryPath:   binaryPath,
-				Version:      version,
-				StreamSchema: schema,
-			},
-			wantMessage: "backend_unavailable: setup cache missing backend fake; " + setupCacheRefreshInstruction,
-		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			cachePath := filepath.Join(t.TempDir(), "setup-probes.json")
-			writeCliAdapterSetupCache(t, cachePath, tt.probe)
-			backend := &Backend{
-				NameValue:      backendName,
-				Binary:         "fake-bin",
-				MinimumVersion: "0.1.0",
-				CachePath:      cachePath,
-				StreamSchema:   schema,
-				Driver:         newCliDuplexTestDriver(),
-			}
-
-			_, err := backend.ProbeBackend(context.Background(), fakeProbeRunner{path: binaryPath, version: "fake 1.0.0\n"})
-			if err == nil {
-				t.Fatal("ProbeBackend error = nil, want setup cache mismatch error")
-			}
-			if err.Error() != tt.wantMessage {
-				t.Fatalf("ProbeBackend error = %q, want %q", err.Error(), tt.wantMessage)
-			}
-			if strings.Contains(tt.wantMessage, setupCacheRefreshInstruction) {
-				assertSetupCacheRemediation(t, tt.wantMessage)
-			}
-		})
-	}
-}
-
-func assertSetupCacheRemediation(t *testing.T, message string) {
-	t.Helper()
-	if strings.Contains(message, "agentbus setup") ||
-		!strings.Contains(message, "submit a job") ||
-		!strings.Contains(message, "probes the backend on first use") ||
-		!strings.Contains(message, "caches the result under the state root") {
-		t.Fatalf("setup remediation = %q, want lazy daemon probe guidance", message)
 	}
 }
 
@@ -1135,13 +915,6 @@ func (d *cliDuplexTestDriver) runResumeIDs() []string {
 	return append([]string(nil), d.resumeIDs...)
 }
 
-func writeCliAdapterSetupCache(t *testing.T, path string, probe engine.BackendSetupProbe) {
-	t.Helper()
-	if err := engine.WriteSetupProbeCache(path, engine.SetupProbeCache{Backends: []engine.BackendSetupProbe{probe}}); err != nil {
-		t.Fatal(err)
-	}
-}
-
 type duplexCommandRunner struct {
 	mu            sync.Mutex
 	specs         []command.ExecSpec
@@ -1244,45 +1017,4 @@ func (r fakeProbeRunner) Run(context.Context, command.ProbeSpec) (command.ProbeR
 		version = "fake 1.0.0\n"
 	}
 	return command.ProbeResult{Stdout: []byte(version)}, nil
-}
-
-func TestSetupProbeMetadataOverrides(t *testing.T) {
-	cases := []struct {
-		name         string
-		configMode   engine.ModeInfo
-		sandboxModes []string
-		wantConfig   engine.ModeInfo
-		wantSandbox  []string
-	}{
-		{
-			name:        "empty overrides retain historical defaults",
-			wantConfig:  engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
-			wantSandbox: []string{"workspace-write", "read-only"},
-		},
-		{
-			name:         "explicit overrides are emitted verbatim",
-			configMode:   engine.ModeInfo{Write: "user", ReadOnly: "user"},
-			sandboxModes: []string{"agent", "plan", "ask"},
-			wantConfig:   engine.ModeInfo{Write: "user", ReadOnly: "user"},
-			wantSandbox:  []string{"agent", "plan", "ask"},
-		},
-		{
-			name:        "partial override falls back per field",
-			configMode:  engine.ModeInfo{ReadOnly: "user"},
-			wantConfig:  engine.ModeInfo{Write: "user", ReadOnly: "user"},
-			wantSandbox: []string{"workspace-write", "read-only"},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			b := &Backend{NameValue: "x", ConfigMode: tc.configMode, SandboxModes: tc.sandboxModes}
-			got := b.setupProbe(ProbedBackendDescriptor{})
-			if got.ConfigMode != tc.wantConfig {
-				t.Errorf("ConfigMode = %+v, want %+v", got.ConfigMode, tc.wantConfig)
-			}
-			if !slices.Equal(got.SandboxModes, tc.wantSandbox) {
-				t.Errorf("SandboxModes = %v, want %v", got.SandboxModes, tc.wantSandbox)
-			}
-		})
-	}
 }

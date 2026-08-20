@@ -312,9 +312,6 @@ func TestACPSetupQualification(t *testing.T) {
 	if got := backend.VersionTransform("cursor-agent 2026.08.04-aaa8809"); got != MinimumKnownGoodVersion {
 		t.Fatalf("normalized version = %q, want %q", got, MinimumKnownGoodVersion)
 	}
-	if backend.ConfigMode != (engine.ModeInfo{Write: "user", ReadOnly: "user"}) || !slices.Equal(backend.SandboxModes, []string{"agent", "plan", "ask"}) {
-		t.Fatalf("backend setup metadata = %+v %#v", backend.ConfigMode, backend.SandboxModes)
-	}
 
 	probe := &fakeCursorProbeRunner{
 		path: "/qualified/bin/cursor-agent",

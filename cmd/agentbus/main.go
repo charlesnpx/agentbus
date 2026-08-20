@@ -64,19 +64,15 @@ func newDefaultApp() *app {
 		version:   version,
 		stateRoot: os.Getenv("AGENTBUS_STATE_ROOT"),
 	}
-	cachePath, err := engine.SetupProbeCachePath(a.stateRoot)
-	if err != nil {
-		cachePath = ""
-	}
-	a.backends = defaultBackends(cachePath)
+	a.backends = defaultBackends()
 	return a
 }
 
-func defaultBackends(cachePath string) []engine.Backend {
+func defaultBackends() []engine.Backend {
 	return []engine.Backend{
-		codexcli.New(codexcli.Options{Binary: resolvedDefaultBackendBinary("codex"), CachePath: cachePath}),
-		claudecli.New(claudecli.Options{Binary: resolvedDefaultBackendBinary("claude"), CachePath: cachePath}),
-		cursorcli.New(cursorcli.Options{Binary: resolvedCursorBinary(), CachePath: cachePath}),
+		codexcli.New(codexcli.Options{Binary: resolvedDefaultBackendBinary("codex")}),
+		claudecli.New(claudecli.Options{Binary: resolvedDefaultBackendBinary("claude")}),
+		cursorcli.New(cursorcli.Options{Binary: resolvedCursorBinary()}),
 	}
 }
 

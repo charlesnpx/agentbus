@@ -146,8 +146,7 @@ func (d *acpDriver) Interrupt(ctx context.Context, conn *duplex.Conn) error {
 	return active.sendCancel(conn)
 }
 
-// SetupQualify validates Cursor's no-prompt ACP lifecycle. Version and CLI
-// discovery are performed by cliadapter.SetupProbe before this driver hook.
+// SetupQualify validates Cursor's no-prompt ACP lifecycle.
 func (d *acpDriver) SetupQualify(ctx context.Context, runner command.Runner, opts engine.SessionOpts) (engine.ModelDiscovery, error) {
 	if runner == nil {
 		return engine.ModelDiscovery{}, errors.New("command runner is required")

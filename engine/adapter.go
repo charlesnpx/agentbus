@@ -98,32 +98,6 @@ const (
 	EventProgress      = "Progress"
 )
 
-// SetupProbeCache is written by setup after a live stream probe and read by
-// adapter Preflight without running another backend turn.
-type SetupProbeCache struct {
-	Version  int                 `json:"version"`
-	Backends []BackendSetupProbe `json:"backends"`
-}
-
-const SetupProbeCacheVersion = 3
-
-// BackendSetupProbe records the setup-time facts required by Preflight.
-type BackendSetupProbe struct {
-	Backend                string   `json:"backend"`
-	BinaryPath             string   `json:"binaryPath"`
-	Version                string   `json:"version"`
-	StreamSchema           string   `json:"streamSchema"`
-	ConfigMode             ModeInfo `json:"configMode"`
-	SandboxModes           []string `json:"sandboxModes"`
-	JSONEventsProbed       bool     `json:"jsonEventsProbed"`
-	DiscoveredModels       []string `json:"discoveredModels,omitempty"`
-	DiscoveredEfforts      []string `json:"discoveredEfforts,omitempty"`
-	DiscoverySource        string   `json:"discoverySource,omitempty"`
-	DiscoveryFetchedAt     string   `json:"discoveryFetchedAt,omitempty"`
-	DiscoveryClientVersion string   `json:"discoveryClientVersion,omitempty"`
-	DiscoveryWarnings      []string `json:"discoveryWarnings,omitempty"`
-}
-
 type ModelDiscovery struct {
 	Models        []string
 	Efforts       []string
@@ -141,10 +115,4 @@ type BackendMetadata struct {
 	Name    string
 	Models  []string
 	Efforts []string
-}
-
-// ModeInfo describes write/read-only configuration loading.
-type ModeInfo struct {
-	Write    string `json:"write"`
-	ReadOnly string `json:"readOnly"`
 }

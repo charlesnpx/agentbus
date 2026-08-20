@@ -19,8 +19,7 @@ const (
 
 // Options configures the Cursor CLI backend.
 type Options struct {
-	Binary    string
-	CachePath string
+	Binary string
 }
 
 // New constructs the Cursor ACP backend.
@@ -30,14 +29,10 @@ func New(opts Options) *cliadapter.Backend {
 		NameValue:        "cursor",
 		Binary:           opts.Binary,
 		MinimumVersion:   MinimumKnownGoodVersion,
-		CachePath:        opts.CachePath,
 		StreamSchema:     StreamSchema,
 		Driver:           driver,
 		VersionTransform: normalizeCursorVersion,
 		Discover:         discoverModels,
-		SetupQualify:     driver.SetupQualify,
-		ConfigMode:       engine.ModeInfo{Write: "user", ReadOnly: "user"},
-		SandboxModes:     []string{"agent", "plan", "ask"},
 	}
 }
 
