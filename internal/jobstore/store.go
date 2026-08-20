@@ -141,6 +141,9 @@ type Record struct {
 	Diagnostics   []string                `json:"diagnostics"`
 	Contract      protocol.ContractResult `json:"contract"`
 	ResultText    string                  `json:"resultText,omitempty"`
+	ResultPath    string                  `json:"resultPath,omitempty"`
+	ResultSHA256  string                  `json:"resultSHA256,omitempty"`
+	ResultBytes   int64                   `json:"resultBytes,omitempty"`
 	Artifacts     ArtifactPaths           `json:"artifacts"`
 }
 
@@ -154,6 +157,9 @@ type TerminalUpdate struct {
 	Diagnostics   []string
 	Contract      protocol.ContractResult
 	ResultText    string
+	ResultPath    string
+	ResultSHA256  string
+	ResultBytes   int64
 	FinishedAt    time.Time
 }
 
@@ -635,6 +641,9 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 		next.Diagnostics = append([]string(nil), terminal.Diagnostics...)
 		next.Contract = terminal.Contract
 		next.ResultText = terminal.ResultText
+		next.ResultPath = terminal.ResultPath
+		next.ResultSHA256 = terminal.ResultSHA256
+		next.ResultBytes = terminal.ResultBytes
 		if terminal.FinishedAt.IsZero() {
 			now := time.Now().UTC()
 			next.FinishedAt = &now

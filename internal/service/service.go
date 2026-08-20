@@ -125,6 +125,12 @@ type Server struct {
 	jobStoreMu sync.Mutex
 	jobStore   *jobstore.Store
 
+	executionMu     sync.Mutex
+	executionCtx    context.Context
+	executionCancel context.CancelFunc
+	executions      map[string]*activeExecution
+	executionWG     sync.WaitGroup
+
 	idleTimeout       time.Duration
 	idleCheckInterval time.Duration
 	shutdownTimeout   time.Duration
@@ -138,8 +144,9 @@ type Server struct {
 	// establish that a loser encounters the winner's held flock before release.
 	beforeSocketStateFlockHook func(*os.File)
 
-	clients   atomic.Int64
-	accepting atomic.Int64
+	clients    atomic.Int64
+	accepting  atomic.Int64
+	activeJobs atomic.Int64
 
 	mu                 sync.Mutex
 	lastActivity       time.Time
@@ -271,6 +278,7 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 		return err
 	}
 	serveCtx, cancel := context.WithCancel(ctx)
+	s.beginExecutions(serveCtx)
 	lifecycle := &serveLifecycle{
 		listener:      listener,
 		socket:        socketIdentity,
@@ -522,7 +530,7 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, listen
 			return
 		case <-ticker.C:
 			stale := s.checkBinaryStale()
-			quiet := s.clients.Load() == 0 && s.accepting.Load() == 0
+			quiet := s.clients.Load() == 0 && s.accepting.Load() == 0 && s.activeJobs.Load() == 0
 			if staleDraining {
 				settled := false
 				select {
