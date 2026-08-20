@@ -154,25 +154,6 @@ type TimeoutResolution struct {
 	Source    string `json:"source"`
 }
 
-// Valid reports whether resolution is either absent in a legacy record or has
-// a complete, internally consistent source shape.
-func (resolution TimeoutResolution) Valid() bool {
-	if resolution.Effective < 0 {
-		return false
-	}
-	if resolution.Source == "" {
-		return resolution.Requested == nil && resolution.Effective == 0
-	}
-	switch resolution.Source {
-	case TimeoutSourceClient:
-		return resolution.Requested != nil
-	case TimeoutSourceDaemonDefault:
-		return resolution.Requested == nil
-	default:
-		return false
-	}
-}
-
 // CloneTimeoutResolution returns an independent copy suitable for a durable
 // record or wire response.
 func CloneTimeoutResolution(resolution *TimeoutResolution) *TimeoutResolution {

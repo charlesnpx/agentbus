@@ -72,10 +72,6 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
-	atomicWriteFileCrashHook("after-rename", path)
-	if err := os.Chmod(path, perm); err != nil {
-		return err
-	}
 	return fsyncDir(dir)
 }
 
