@@ -25,7 +25,7 @@ import (
 
 const (
 	// ProtocolVersion is the only protocol version served by this daemon.
-	ProtocolVersion = 3
+	ProtocolVersion = protocol.Version3
 
 	defaultIdleTimeout    = 30 * time.Minute
 	defaultShutdown       = 30 * time.Second

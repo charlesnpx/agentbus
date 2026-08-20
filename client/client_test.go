@@ -22,7 +22,6 @@ import (
 
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
-	"github.com/charlesnpx/agentbus/internal/served"
 )
 
 func TestMain(m *testing.M) {
@@ -114,9 +113,9 @@ func clientTestSkipOrFailBindDenied(t *testing.T, context string, detail any) {
 }
 
 func TestClientHelloParsesBackendMetadata(t *testing.T) {
-	hello := runClientHello(t, `{"protocolVersion":2,"backends":["codex"],"backendMetadata":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}],"capabilities":{"models.discovery":true}}`)
+	hello := runClientHello(t, `{"protocolVersion":3,"backends":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}]}`)
 
-	if hello.ProtocolVersion != protocol.Version || len(hello.Backends) != 1 || hello.Backends[0] != "codex" || !hello.Capabilities["models.discovery"] {
+	if hello.ProtocolVersion != protocol.Version3 {
 		t.Fatalf("hello = %+v", hello)
 	}
 	if len(hello.BackendMetadata) != 1 {
@@ -128,19 +127,8 @@ func TestClientHelloParsesBackendMetadata(t *testing.T) {
 	}
 }
 
-func TestClientHelloParsesCapabilitiesWithoutBackendMetadata(t *testing.T) {
-	hello := runClientHello(t, `{"protocolVersion":2,"backends":["codex"],"capabilities":{"models.discovery":false}}`)
-
-	if hello.ProtocolVersion != protocol.Version || len(hello.Backends) != 1 || hello.Backends[0] != "codex" || hello.Capabilities["models.discovery"] {
-		t.Fatalf("hello = %+v", hello)
-	}
-	if hello.BackendMetadata != nil {
-		t.Fatalf("backend metadata = %+v, want nil", hello.BackendMetadata)
-	}
-}
-
 func TestClientHelloRejectsProtocolVersionMismatch(t *testing.T) {
-	err := runClientHelloError(t, `{"protocolVersion":1,"backends":["codex"],"capabilities":{}}`)
+	err := runClientHelloError(t, `{"protocolVersion":1,"backends":[]}`)
 	if !errors.Is(err, ErrProtocolVersionMismatch) {
 		t.Fatalf("clientHello error = %v, want ErrProtocolVersionMismatch", err)
 	}
@@ -148,7 +136,7 @@ func TestClientHelloRejectsProtocolVersionMismatch(t *testing.T) {
 	if !errors.As(err, &mismatch) || mismatch.Received != 1 {
 		t.Fatalf("clientHello mismatch = %#v, want server version 1", mismatch)
 	}
-	if !strings.Contains(err.Error(), "expected 2") || !strings.Contains(err.Error(), "received 1") {
+	if !strings.Contains(err.Error(), "expected 3") || !strings.Contains(err.Error(), "received 1") {
 		t.Fatalf("clientHello error message = %q, want expected and received versions", err.Error())
 	}
 }
@@ -186,16 +174,14 @@ func TestConnectProtocolVersionMismatchDoesNotAutostart(t *testing.T) {
 		done <- json.NewEncoder(conn).Encode(protocol.Response{
 			JSONRPC: "2.0",
 			ID:      json.RawMessage(`"hello"`),
-			Result: protocol.HelloResult{
+			Result: protocol.HelloResultV3{
 				ProtocolVersion: 1,
-				Backends:        []string{"codex"},
-				Capabilities:    protocol.DefaultCapabilities(),
 			},
 		})
 	}()
 
 	var starts atomic.Int64
-	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
+	starter := Starter(func(context.Context, StartOptions) (StartResult, error) {
 		starts.Add(1)
 		return StartResult{}, errors.New("starter should not be invoked for protocol mismatch")
 	})
@@ -243,7 +229,7 @@ func TestConnectBadTokenDoesNotAutostart(t *testing.T) {
 	})
 
 	var starts atomic.Int64
-	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
+	starter := Starter(func(context.Context, StartOptions) (StartResult, error) {
 		starts.Add(1)
 		return StartResult{}, errors.New("starter should not be invoked for bad token")
 	})
@@ -396,7 +382,7 @@ func TestJobGetVersionMismatchRPCErrorIsTyped(t *testing.T) {
 		Message: "protocol version mismatch",
 		Data: protocol.ErrorData{
 			Code:                  protocol.ErrorVersionMismatch,
-			ServerProtocolVersion: protocol.Version + 1,
+			ServerProtocolVersion: protocol.Version3 + 1,
 		},
 	}})
 
@@ -412,8 +398,8 @@ func TestJobGetVersionMismatchRPCErrorIsTyped(t *testing.T) {
 	if !errors.As(err, &mismatch) {
 		t.Fatalf("JobGet error = %T %v, want *ProtocolVersionMismatchError", err, err)
 	}
-	if mismatch.Expected != protocol.Version || mismatch.Received != protocol.Version+1 {
-		t.Fatalf("version mismatch = %#v, want expected %d received %d", mismatch, protocol.Version, protocol.Version+1)
+	if mismatch.Expected != protocol.Version3 || mismatch.Received != protocol.Version3+1 {
+		t.Fatalf("version mismatch = %#v, want expected %d received %d", mismatch, protocol.Version3, protocol.Version3+1)
 	}
 	var rpcErr *RPCError
 	if !errors.As(err, &rpcErr) {
@@ -623,7 +609,7 @@ func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	defer cancelServer()
 	var starts atomic.Int64
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
+	starter := Starter(func(ctx context.Context, opts StartOptions) (StartResult, error) {
 		starts.Add(1)
 		_, err := startClientTestDaemon(serverCtx, root, "race-token")
 		if err != nil {
@@ -667,7 +653,7 @@ func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 	}
 	close(clients)
 	for c := range clients {
-		if c.HelloResult().ProtocolVersion != protocol.Version {
+		if c.HelloResult().ProtocolVersion != protocol.Version3 {
 			t.Fatalf("hello = %+v", c.HelloResult())
 		}
 		_ = c.Close()
@@ -776,7 +762,7 @@ func testConnectHelloTransportFailureAutostartsReplacement(t *testing.T, token s
 	serverDone := make(chan error, 1)
 	var starts atomic.Int64
 	var serverStarted atomic.Bool
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
+	starter := Starter(func(ctx context.Context, opts StartOptions) (StartResult, error) {
 		starts.Add(1)
 		done, err := startClientTestDaemon(serverCtx, root, token)
 		if err != nil {
@@ -820,7 +806,7 @@ func testConnectHelloTransportFailureAutostartsReplacement(t *testing.T, token s
 	if got := starts.Load(); got != 1 {
 		t.Fatalf("starts = %d, want 1", got)
 	}
-	if client.HelloResult().ProtocolVersion != protocol.Version {
+	if client.HelloResult().ProtocolVersion != protocol.Version3 {
 		t.Fatalf("hello = %+v", client.HelloResult())
 	}
 }
@@ -916,7 +902,7 @@ func TestAutostartReplacesRefusedSocket(t *testing.T) {
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
 	var starts atomic.Int64
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
+	starter := Starter(func(ctx context.Context, opts StartOptions) (StartResult, error) {
 		starts.Add(1)
 		done, err := startClientTestDaemon(serverCtx, root, "refused-token")
 		if err != nil {
@@ -964,9 +950,9 @@ func TestConnectAutostartSurfacesLauncherFailureOnce(t *testing.T) {
 	t.Setenv("AGENTBUS_AUTOSTART_FAILURE_HELPER", "1")
 
 	var starts atomic.Int64
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
+	starter := Starter(func(ctx context.Context, opts StartOptions) (StartResult, error) {
 		starts.Add(1)
-		return (defaultStarter{}).StartDaemon(ctx, opts)
+		return defaultStarter(ctx, opts)
 	})
 	client, err := Connect(context.Background(), Options{
 		StateRoot:    root,
@@ -1003,117 +989,11 @@ func TestConnectAutostartSurfacesLauncherFailureOnce(t *testing.T) {
 	}
 }
 
-func TestConnectAutostartStartupErrorAuthorityRefusedTyped(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name         string
-		code         string
-		wantReason   string
-		wantSentinel error
-		notSentinel  error
-	}{
-		{
-			name:         "fail stopped",
-			code:         daemonlaunch.CodeAuthorityFailStopped,
-			wantReason:   protocol.AdmissionRejectRootFailStopped,
-			wantSentinel: ErrRootFailStopped,
-			notSentinel:  ErrRootSealed,
-		},
-		{
-			name:         "root sealed",
-			code:         daemonlaunch.CodeAuthorityRootSealed,
-			wantReason:   protocol.AdmissionRejectRootSealed,
-			wantSentinel: ErrRootSealed,
-			notSentinel:  ErrRootFailStopped,
-		},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			root := shortClientTempDir(t)
-			startupErr := &daemonlaunch.StartupError{
-				Kind:    daemonlaunch.ErrStartupFailed,
-				Code:    tt.code,
-				Message: "startup refused by readiness frame",
-			}
-			starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
-				return StartResult{}, startupErr
-			})
-
-			client, err := Connect(context.Background(), Options{
-				StateRoot: root,
-				Token:     "token",
-				Starter:   starter,
-			})
-			if client != nil {
-				_ = client.Close()
-			}
-			if err == nil {
-				t.Fatal("Connect succeeded, want startup refusal")
-			}
-			if !errors.Is(err, tt.wantSentinel) {
-				t.Fatalf("Connect error = %T %v, want %v", err, err, tt.wantSentinel)
-			}
-			if errors.Is(err, tt.notSentinel) {
-				t.Fatalf("Connect error = %T %v, unexpectedly matched %v", err, err, tt.notSentinel)
-			}
-			var refused *StartupRefusedError
-			if !errors.As(err, &refused) {
-				t.Fatalf("Connect error = %T %v, want StartupRefusedError", err, err)
-			}
-			if refused.Reason != tt.wantReason {
-				t.Fatalf("StartupRefusedError reason = %q, want %q", refused.Reason, tt.wantReason)
-			}
-			var gotStartup *daemonlaunch.StartupError
-			if !errors.As(err, &gotStartup) || gotStartup != startupErr {
-				t.Fatalf("Connect error = %T %v, want wrapped StartupError", err, err)
-			}
-		})
-	}
-}
-
-func TestConnectAutostartStartupErrorNonAuthorityNotTyped(t *testing.T) {
-	t.Parallel()
-	root := shortClientTempDir(t)
-	startupErr := &daemonlaunch.StartupError{
-		Kind:    daemonlaunch.ErrStartupFailed,
-		Code:    daemonlaunch.CodeAlreadyListening,
-		Message: "existing daemon verification failed",
-	}
-	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
-		return StartResult{}, startupErr
-	})
-
-	client, err := Connect(context.Background(), Options{
-		StateRoot: root,
-		Token:     "token",
-		Starter:   starter,
-	})
-	if client != nil {
-		_ = client.Close()
-	}
-	if err == nil {
-		t.Fatal("Connect succeeded, want startup error")
-	}
-	if errors.Is(err, ErrRootFailStopped) || errors.Is(err, ErrRootSealed) {
-		t.Fatalf("Connect error = %T %v, want non-authority startup error", err, err)
-	}
-	var refused *StartupRefusedError
-	if errors.As(err, &refused) {
-		t.Fatalf("Connect error = %T %v, unexpectedly matched StartupRefusedError", err, err)
-	}
-	var gotStartup *daemonlaunch.StartupError
-	if !errors.As(err, &gotStartup) || gotStartup != startupErr {
-		t.Fatalf("Connect error = %T %v, want original StartupError", err, err)
-	}
-}
-
 func TestConnectAutostartStartResultKeepsTimeoutBehavior(t *testing.T) {
 	t.Parallel()
 	root := shortClientTempDir(t)
 	const startTimeout = 180 * time.Millisecond
-	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
+	starter := Starter(func(context.Context, StartOptions) (StartResult, error) {
 		return StartResult{PID: 12345}, nil
 	})
 
@@ -1131,98 +1011,11 @@ func TestConnectAutostartStartResultKeepsTimeoutBehavior(t *testing.T) {
 	if err == nil {
 		t.Fatal("Connect succeeded, want timeout")
 	}
-	if errors.Is(err, ErrRootFailStopped) || errors.Is(err, ErrRootSealed) {
-		t.Fatalf("Connect error = %T %v, want generic timeout", err, err)
-	}
-	var refused *StartupRefusedError
-	if errors.As(err, &refused) {
-		t.Fatalf("Connect error = %T %v, unexpectedly matched StartupRefusedError", err, err)
-	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Connect error = %v, want deadline exceeded", err)
 	}
 	if elapsed < startTimeout-40*time.Millisecond {
 		t.Fatalf("Connect elapsed = %s, want timeout path near %s", elapsed, startTimeout)
-	}
-}
-
-func TestConnectAutostartRealUnsupportedHostSurfacesLauncherDiagnosticOnDarwin(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("real unsupported-host autostart diagnostic is macOS-only")
-	}
-	// This subprocess test exercises the strict-runtime diagnostic, not a
-	// developer's locally installed backend CLIs. Keep provider discovery out of
-	// the fixture so adding a default backend cannot turn the test into a live
-	// CLI probe before the intended startup failure is reached.
-	goBinary, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", filepath.Dir(goBinary))
-	root := shortClientTempDir(t)
-	bin := buildClientRealAgentbusBinary(t)
-
-	var starts atomic.Int64
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
-		starts.Add(1)
-		return (defaultStarter{}).StartDaemon(ctx, opts)
-	})
-	client, err := Connect(context.Background(), Options{
-		StateRoot:    root,
-		Token:        "token",
-		CommandPath:  bin,
-		StartTimeout: 2 * time.Second,
-		Starter:      starter,
-	})
-	if client != nil {
-		_ = client.Close()
-	}
-	if err == nil {
-		t.Fatal("Connect unexpectedly succeeded; want a strict-support launcher diagnostic or a supported-host unauthorized rejection")
-	}
-	var startup *daemonlaunch.StartupError
-	if !errors.As(err, &startup) || !errors.Is(err, daemonlaunch.ErrStartupFailed) {
-		// This test reproduces the launcher diagnostic for a host on which the
-		// strict native runtime is genuinely UNAVAILABLE. GOOS==darwin is not a
-		// proxy for that: a real macOS host (including GitHub's macos runner)
-		// supports the strict runtime, so the daemon starts, binds, and rejects
-		// this test's deliberately-invalid hello token with an unauthorized RPC
-		// error. Treat that as positive evidence of strict support and skip — the
-		// unsupported-host precondition cannot be reproduced here. This makes the
-		// test self-gating (the external skip-list entry is no longer required);
-		// any other outcome is unexpected and still fails.
-		var rpcErr *protocol.RPCError
-		if errors.As(err, &rpcErr) && rpcErr.Object.Data.Code == protocol.ErrorUnauthorized {
-			t.Skipf("host supports the strict native runtime; unsupported-host precondition unreproducible (Connect error = %v)", err)
-		}
-		if clientTestBindDeniedOutput(err.Error()) {
-			clientTestSkipOrFailBindDenied(t, "real unsupported-host autostart", err)
-		}
-		t.Fatalf("Connect error = %T %v, want the strict-support launcher diagnostic or a supported-host unauthorized rejection", err, err)
-	}
-	if errors.Is(err, daemonlaunch.ErrReadinessTimeout) || errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Connect error = %v, want launcher failure code, not timeout", err)
-	}
-	if clientTestBindDeniedOutput(err.Error()) {
-		clientTestSkipOrFailBindDenied(t, "real unsupported-host autostart", err)
-	}
-	if startup.Code != served.ErrAdmissionStrictSupportUnavailable.Error() ||
-		!strings.Contains(startup.Message, served.ErrAdmissionStrictSupportUnavailable.Error()) {
-		t.Fatalf("startup error = %+v, want strict support diagnostic", startup)
-	}
-	if got := starts.Load(); got != 1 {
-		t.Fatalf("starter calls = %d, want 1", got)
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		names := make([]string, 0, len(entries))
-		for _, entry := range entries {
-			names = append(names, entry.Name())
-		}
-		t.Fatalf("state root entries after unsupported autostart = %v, want empty root", names)
 	}
 }
 
@@ -1237,7 +1030,7 @@ func TestConnectAutostartHelloHangUsesSingleStartTimeout(t *testing.T) {
 	var listenerStarted atomic.Bool
 	var listenerMu sync.Mutex
 	var hungListener net.Listener
-	starter := StartFunc(func(context.Context, StartOptions) (StartResult, error) {
+	starter := Starter(func(context.Context, StartOptions) (StartResult, error) {
 		listener, err := net.Listen("unix", socketPath)
 		if err != nil {
 			return StartResult{}, err
@@ -1330,7 +1123,7 @@ func TestDefaultStarterDoesNotCancelDaemonAfterStartupContextEnds(t *testing.T) 
 	errorPath := filepath.Join(dir, "default-starter-helper-error")
 	t.Setenv("AGENTBUS_AUTOSTART_DETACH_ERROR_PATH", errorPath)
 	ctx, cancel := context.WithCancel(context.Background())
-	started, err := (defaultStarter{}).StartDaemon(ctx, StartOptions{
+	started, err := defaultStarter(ctx, StartOptions{
 		StateRoot:   dir,
 		SocketPath:  filepath.Join(dir, "agentbus.sock"),
 		TokenPath:   filepath.Join(dir, "token"),
@@ -1523,18 +1316,16 @@ func serveClientTestConn(conn net.Conn, token string) {
 				resp.Error = protocol.NewError(protocol.ErrorUnauthorized, "unauthorized", protocol.ErrorData{})
 				break
 			}
-			if params.ClientProtocolVersion != protocol.Version {
+			if params.ClientProtocolVersion != protocol.Version3 {
 				resp.Error = protocol.NewError(
 					protocol.ErrorVersionMismatch,
 					"protocol version mismatch",
-					protocol.ErrorData{ServerProtocolVersion: protocol.Version},
+					protocol.ErrorData{ServerProtocolVersion: protocol.Version3},
 				)
 				break
 			}
-			resp.Result = protocol.HelloResult{
-				ProtocolVersion: protocol.Version,
-				Backends:        []string{},
-				Capabilities:    protocol.DefaultCapabilities(),
+			resp.Result = protocol.HelloResultV3{
+				ProtocolVersion: protocol.Version3,
 			}
 		default:
 			resp.Error = protocol.NewError(protocol.ErrorMethodNotFound, "method not found", protocol.ErrorData{})

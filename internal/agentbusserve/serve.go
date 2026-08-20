@@ -5,31 +5,16 @@ import (
 	"errors"
 	"os"
 	"sync"
-	"time"
 
-	"github.com/charlesnpx/agentbus/engine/execution/authority"
-	"github.com/charlesnpx/agentbus/engine/execution/repository"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
-	"github.com/charlesnpx/agentbus/internal/served"
+	"github.com/charlesnpx/agentbus/internal/service"
 )
 
-type Config = served.Config
-type StrictAdmissionOptions = served.StrictAdmissionOptions
+// Config is the version-3 service configuration. agentbusserve owns only the
+// foreground-process/readiness bridge; service owns daemon behavior.
+type Config = service.Config
 
-var ErrShutdownDeadlineExceeded = served.ErrShutdownDeadlineExceeded
-
-type servedServer interface {
-	ServeWithStartupContext(context.Context, context.Context) error
-	Shutdown(context.Context) error
-	ShutdownTimeout() time.Duration
-}
-
-var productionServedConfigFunc = productionServedConfig
-var canonicalStateRootFunc = daemonlaunch.CanonicalStateRoot
-
-var newProductionServerAfterStrictAdmissionSupportPreflight = func(ctx context.Context, cfg served.Config) (servedServer, error) {
-	return served.NewAfterStrictAdmissionSupportPreflight(ctx, cfg)
-}
+var ErrShutdownDeadlineExceeded = service.ErrShutdownDeadlineExceeded
 
 type readinessPublicationGuard struct {
 	mu         sync.Mutex
@@ -60,6 +45,9 @@ func (guard *readinessPublicationGuard) Ready(ctx context.Context, reporter *dae
 	return reporter.Ready(canonicalRoot, socketPath)
 }
 
+// Serve runs the version-3 service while preserving the launcher's readiness
+// FD protocol. The readiness frame is published only after service has bound
+// its socket and completed restart reconciliation.
 func Serve(ctx context.Context, cfg Config) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -71,6 +59,7 @@ func Serve(ctx context.Context, cfg Config) error {
 	if hasReporter {
 		defer reporter.Close()
 	}
+
 	readinessGuard := &readinessPublicationGuard{}
 	stopReadinessCancel := func() bool { return true }
 	if hasReporter {
@@ -79,6 +68,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		})
 		defer stopReadinessCancel()
 	}
+
 	startupCtx := ctx
 	cancelStartup := func() {}
 	if hasReporter {
@@ -93,22 +83,10 @@ func Serve(ctx context.Context, cfg Config) error {
 		}
 	}
 	defer cancelStartup()
-	servedCfg, configErr := productionServedConfigFunc(cfg)
-	if configErr != nil {
-		err := configErr
-		if preflightErr := served.StrictAdmissionSupportPreflight(startupCtx, servedCfg); preflightErr != nil {
-			err = errors.Join(preflightErr, configErr)
-		}
-		_ = servedCfg.Runtime.Close()
-		if cleanServeTerminationAfterCancel(ctx, err) {
-			return nil
-		}
-		reportStartupFailure(reporter, err)
-		return err
-	}
+
 	if hasReporter {
-		previousHook := servedCfg.ReadyHook
-		servedCfg.ReadyHook = func(info served.ServeReadyInfo) error {
+		previousHook := cfg.ReadyHook
+		cfg.ReadyHook = func(info service.ServeReadyInfo) error {
 			if err := startupCtx.Err(); err != nil {
 				return err
 			}
@@ -117,10 +95,7 @@ func Serve(ctx context.Context, cfg Config) error {
 					return err
 				}
 			}
-			if err := startupCtx.Err(); err != nil {
-				return err
-			}
-			canonicalRoot, err := canonicalStateRootFunc(info.StateRoot)
+			canonicalRoot, err := daemonlaunch.CanonicalStateRoot(info.StateRoot)
 			if err != nil {
 				return err
 			}
@@ -131,21 +106,23 @@ func Serve(ctx context.Context, cfg Config) error {
 			return nil
 		}
 	}
-	server, err := newProductionServerAfterStrictAdmissionSupportPreflight(startupCtx, servedCfg)
+
+	server, err := service.New(cfg)
 	if err != nil {
-		_ = servedCfg.Runtime.Close()
 		if cleanServeTerminationAfterCancel(ctx, err) {
 			return nil
 		}
 		reportStartupFailure(reporter, err)
 		return err
 	}
+
 	serviceCtx, stopService := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopService()
 	done := make(chan error, 1)
 	go func() {
 		done <- server.ServeWithStartupContext(serviceCtx, startupCtx)
 	}()
+
 	select {
 	case err = <-done:
 		if cleanServeTerminationAfterCancel(ctx, err) {
@@ -168,11 +145,11 @@ func Serve(ctx context.Context, cfg Config) error {
 		cancelShutdown()
 		stopService()
 		serveErr := <-done
-		if shutdownErr != nil && !errors.Is(shutdownErr, served.ErrShutdownNotServing) {
+		if shutdownErr != nil && !errors.Is(shutdownErr, service.ErrShutdownNotServing) {
 			reportStartupFailure(reporter, shutdownErr)
 			return shutdownErr
 		}
-		if shutdownErr != nil && errors.Is(shutdownErr, served.ErrShutdownNotServing) && cleanServeTerminationAfterCancel(ctx, serveErr) {
+		if shutdownErr != nil && errors.Is(shutdownErr, service.ErrShutdownNotServing) && cleanServeTerminationAfterCancel(ctx, serveErr) {
 			return nil
 		}
 		if cleanServeTerminationAfterCancel(ctx, serveErr) {
@@ -189,7 +166,7 @@ func cleanServeTerminationAfterCancel(ctx context.Context, err error) bool {
 	return ctx != nil &&
 		ctx.Err() != nil &&
 		!cancellationContainsBootstrapFailure(err) &&
-		(errors.Is(err, context.Canceled) || errors.Is(err, served.ErrShutdownNotServing))
+		(err == nil || errors.Is(err, context.Canceled) || errors.Is(err, service.ErrShutdownNotServing))
 }
 
 func cancellationContainsBootstrapFailure(err error) bool {
@@ -197,85 +174,10 @@ func cancellationContainsBootstrapFailure(err error) bool {
 		return false
 	}
 	var startup *daemonlaunch.StartupError
-	var safety served.SafetyFailStopError
-	var diagnostic served.AdmissionSupportDiagnostic
-	var alreadyListening served.DaemonAlreadyListeningError
-	var rootBusy served.AdmissionRootBusyError
-	var rootMissing served.AdmissionRootMissingError
-	var rootIdentity served.AdmissionRootIdentityMismatchError
-	var rootSchema served.AdmissionRootIncompatibleSchemaError
-	var rootAnchor served.AdmissionRootAnchorError
-	switch {
-	case errors.As(err, &startup):
-		return true
-	case errors.As(err, &safety), errors.Is(err, served.ErrSafetyFailStopped):
-		return true
-	case errors.As(err, &diagnostic), errors.Is(err, served.ErrAdmissionStrictSupportUnavailable):
-		return true
-	case errors.As(err, &alreadyListening), errors.Is(err, served.ErrDaemonAlreadyListening):
-		return true
-	case errors.As(err, &rootBusy), errors.Is(err, served.ErrAdmissionRootBusy):
-		return true
-	case errors.As(err, &rootMissing), errors.Is(err, served.ErrAdmissionRootMissing):
-		return true
-	case errors.As(err, &rootIdentity), errors.As(err, &rootSchema), errors.As(err, &rootAnchor):
-		return true
-	case errors.Is(err, served.ErrRuntimeConsumed):
-		return true
-	case errors.Is(err, authority.ErrRootSealed),
-		errors.Is(err, authority.ErrAdmissionContractMismatch),
-		errors.Is(err, authority.ErrAnchorInvariant),
-		errors.Is(err, authority.ErrFailStopped),
-		errors.Is(err, authority.ErrFailStopRecord),
-		errors.Is(err, authority.ErrRecoveryNeeded):
-		return true
-	case errors.Is(err, repository.ErrInvalidRecord),
-		errors.Is(err, repository.ErrCorruptRecord),
-		errors.Is(err, repository.ErrProjectionMismatch),
-		errors.Is(err, repository.ErrAmbiguousCommit):
-		return true
-	default:
-		return false
-	}
-}
-
-// AdmissionRecoveryReport re-exports the served recovery report so callers
-// (notably cmd/agentbus) reach served only through agentbusserve, per the
-// architecture import guard.
-type AdmissionRecoveryReport = served.AdmissionRecoveryReport
-
-func RecoverAdmissionRoot(ctx context.Context, cfg Config) (served.AdmissionRecoveryReport, error) {
-	servedCfg, configErr := recoveryServedConfig(cfg)
-	if configErr != nil {
-		err := configErr
-		if preflightErr := served.StrictAdmissionSupportPreflight(ctx, servedCfg); preflightErr != nil {
-			err = errors.Join(preflightErr, configErr)
-		}
-		_ = servedCfg.Runtime.Close()
-		return served.AdmissionRecoveryReport{}, err
-	}
-	report, err := served.RecoverAdmissionRoot(ctx, servedCfg)
-	if err != nil {
-		_ = servedCfg.Runtime.Close()
-		return report, err
-	}
-	return report, nil
-}
-
-func productionServedConfig(cfg Config) (served.Config, error) {
-	return strictAdmissionServedConfig(cfg, StrictAdmissionOptions{})
-}
-
-func recoveryServedConfig(cfg Config) (served.Config, error) {
-	runtime, err := newRecoveryStrictAdmissionRuntime(StrictAdmissionOptions{})
-	cfg.Runtime = runtime
-	return cfg, err
-}
-
-var newRecoveryStrictAdmissionRuntime = served.NewStrictAdmissionRuntime
-
-func strictAdmissionServedConfig(cfg Config, opts StrictAdmissionOptions) (served.Config, error) {
-	return served.StrictAdmissionConfig(cfg, opts)
+	var alreadyListening service.DaemonAlreadyListeningError
+	return errors.As(err, &startup) ||
+		errors.As(err, &alreadyListening) ||
+		errors.Is(err, service.ErrDaemonAlreadyListening)
 }
 
 func redirectStderrToDevNull() {
@@ -298,31 +200,8 @@ func startupFailureCode(err error) string {
 	if err == nil {
 		return "error"
 	}
-	var diagnostic served.AdmissionSupportDiagnostic
-	switch {
-	case errors.As(err, &diagnostic), errors.Is(err, served.ErrAdmissionStrictSupportUnavailable):
-		return served.ErrAdmissionStrictSupportUnavailable.Error()
-	case errors.Is(err, served.ErrDaemonAlreadyListening):
+	if errors.Is(err, service.ErrDaemonAlreadyListening) {
 		return daemonlaunch.CodeAlreadyListening
-	case errors.Is(err, served.ErrAdmissionRootBusy):
-		return daemonlaunch.CodeAdmissionRootBusy
-	case errors.Is(err, served.ErrRuntimeConsumed):
-		return served.ErrRuntimeConsumed.Error()
-	case errors.Is(err, served.ErrSafetyFailStopped):
-		return daemonlaunch.CodeAuthorityFailStopped
-	case errors.Is(err, authority.ErrRootSealed):
-		return daemonlaunch.CodeAuthorityRootSealed
-	case errors.Is(err, authority.ErrAdmissionContractMismatch):
-		return authority.ErrAdmissionContractMismatch.Error()
-	case errors.Is(err, authority.ErrAnchorInvariant):
-		return authority.ErrAnchorInvariant.Error()
-	case errors.Is(err, authority.ErrFailStopped):
-		return daemonlaunch.CodeAuthorityFailStopped
-	case errors.Is(err, authority.ErrFailStopRecord):
-		return daemonlaunch.CodeAuthorityFailStopped
-	case errors.Is(err, authority.ErrRecoveryNeeded):
-		return authority.ErrRecoveryNeeded.Error()
-	default:
-		return "error"
 	}
+	return "error"
 }

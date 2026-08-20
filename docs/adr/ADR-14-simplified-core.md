@@ -121,7 +121,7 @@ job.get with a jobId returns this full JobRecord:
       "result": {
         "text": "string",
         "resultPath": "string",
-        "sha256": "sha256:lowercase-hex",
+        "sha256": "lowercase-64-character-hex",
         "bytes": 123
       },
       "contract": {
@@ -222,10 +222,11 @@ admission subcommand, and every internal-* subcommand are deleted.
 ### One state vocabulary
 
 The public state set is exactly queued, running, completed, failed, canceled,
-and unknown. starting and retrying are private persisted launch markers. Each
-MUST project as running and MUST NOT appear in a protocol or CLI response.
+and unknown. starting is a private persisted launch marker. It MUST project as
+running and MUST NOT appear in a protocol or CLI response. There is no retrying
+state, public or private.
 
-This table maps the current thirteen labels to version-3 public vocabulary for
+This table maps the current twelve labels to version-3 public vocabulary for
 review only. It is not a database migration and MUST NOT be implemented as one.
 
 | Current label | Version-3 projection | Required interpretation |
@@ -233,7 +234,6 @@ review only. It is not a database migration and MUST NOT be implemented as one.
 | queued | queued | Awaiting launch. |
 | starting | running | Private durable no-relaunch marker for the initial turn. |
 | running | running | Active work. |
-| retrying | running | Private durable no-relaunch marker for the correction turn. |
 | completed | completed | Terminal completion. |
 | completed_noncompliant | completed | ContractResult is evaluated and not compliant. |
 | failed | failed | FailureClass supplies the cause. |
@@ -366,25 +366,29 @@ bindings, identity hashes, terminal metadata, or ContractResult.
 
 Agentbus permits at most one initial process turn and, when required, at most
 one correction process turn per job. The retained adapter tree remains
-unchanged and continues to supervise one process per turn. The launch ordering
-is normative for both turns:
+unchanged and continues to supervise one process per turn. The initial-turn
+launch ordering is normative:
 
-1. Commit the job as private starting durably for the initial turn, or as
-   private retrying durably for the correction turn.
+1. Commit the job as private starting durably.
 2. If that commit did not cleanly succeed, DO NOT SPAWN.
 3. Fork and exec the backend into a new process group.
 4. In a separate transaction, record the process claim
    {pid, pgid, startToken}.
 
-The claim transaction MUST be separate from the durable turn-state transaction.
-It may fail after exec; that failure never licenses a second spawn for that
-turn. The initial process MUST have retired before Agentbus records the
-correction claim that replaces the initial claim. Neither turn is ever
-relaunched after a durable turn-state commit whose exec outcome is unknown.
+The initial process MUST have retired before Agentbus spawns the correction
+turn. The correction turn's process claim, recorded by the same
+OnProcessStart -> recordProcessClaim path as the initial turn's claim, is the
+durable evidence that the correction turn exists. There is no retrying state,
+public or private, and no durable retrying commit before correction spawn.
+
+The claim transaction MUST be separate from the durable initial-turn state
+transaction. It may fail after exec; that failure never licenses a second spawn
+for that turn. Neither turn is ever relaunched after its launch path leaves its
+exec outcome unknown.
 
 On daemon restart, Agentbus MUST relaunch nothing. It terminalizes a recovered
 queued job as failed with FailureClass internal. It terminalizes a recovered
-starting, retrying, or running job as unknown. It preserves every terminal
+starting or running job as unknown. It preserves every terminal
 record.
 Recovery and the orphan reaper run before new work is accepted.
 
@@ -401,7 +405,7 @@ eliminate that risk.
 
 ### Orphan reaper
 
-At restart, Agentbus snapshots each recovered starting, retrying, or running job before
+At restart, Agentbus snapshots each recovered starting or running job before
 terminalizing its public projection. For each such job with a claim, it reads
 the live process start token and compares it for exact equality with startToken.
 It signals the recorded process group only on exact equality.
@@ -430,6 +434,7 @@ look noncompliant.
 | 10 | Unknown job ID, unchanged |
 | 11 | Daemon startup failure, unchanged |
 | 13 | Shutdown deadline, unchanged |
+| 15 | completed, but the authoritative result artifact is missing, unreadable, or does not match its recorded digest |
 
 Codes 8 (reaped), 9 (quarantined), and 12 (authority fail-stop) are permanently
 retired and MUST NEVER be reused. unknown uses 14 rather than 8 because
@@ -481,7 +486,7 @@ delete an old root.
 | cgroup subsystem | Delete it; it is not an optional enhancement. | Plain process-group supervision and token-equality reaping. |
 | PolicyRegistry, named/shape contracts, retry templates, policy methods | Delete them. | One inline JSON Schema and one fixed correction attempt. |
 | engine/store.go workspace-store implementation | Delete it. | Single bbolt meta/requests/jobs store; no job-metadata GC. |
-| Parallel engine.JobState, model Outcome, and model PublicState vocabularies | Delete them together. | Six public states plus private starting and retrying markers. |
+| Parallel engine.JobState, model Outcome, and model PublicState vocabularies | Delete them together. | Six public states plus private starting marker. |
 | LateFinalization and orphaned/reaped re-entry | Delete them. | First-terminal-wins. |
 | engine/adapter tree and engine/command | Retain unchanged. | Convo Relay dependency remains supported. |
 | Provider sandbox policy, per-job write cache, private CODEX_HOME | Retain unchanged. | Delegate is deleting duplicate copies, not protections. |
@@ -508,7 +513,7 @@ delete an old root.
 - Retaining parked workers or a release/ack protocol.
 - Retaining a durable authority, anchor, safety latch, proof vocabulary, or
   binding index behind a simpler protocol.
-- Relaunching queued, starting, retrying, or running jobs on restart.
+- Relaunching queued, starting, or running jobs on restart.
 - Signaling on a missing, unreadable, or unequal start token.
 - Letting a late result overwrite terminal state.
 - Retaining named contracts, a registry, caller correction templates, or more

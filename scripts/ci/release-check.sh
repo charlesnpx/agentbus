@@ -13,8 +13,6 @@ if [[ "${AGENTBUS_STRICT_DOCKER_INSIDE:-0}" != "1" ]]; then
   fi
   printf 'release-check: entering strict-capable container image=%s\n' "$IMAGE"
   exec docker run --rm -i \
-      --privileged \
-    --cgroupns=private \
     -e AGENTBUS_STRICT_DOCKER_INSIDE=1 \
     -e CGO_ENABLED="${CGO_ENABLED:-0}" \
     -e GOCACHE="${CONTAINER_GOCACHE:-/tmp/agentbus-go-cache}" \
@@ -131,7 +129,6 @@ smoke_release_binary() {
   stdout=$(mktemp "${TMPDIR:-/tmp}/agentbus-release-stdout.XXXXXX")
   stderr=$(mktemp "${TMPDIR:-/tmp}/agentbus-release-stderr.XXXXXX")
 
-  run "$BIN" --help
   version_json=$("$BIN" version --json)
   validate_version_json "$version_json"
 
@@ -207,10 +204,9 @@ strict_startup_smoke() {
 
 require_python3
 printf 'release-check: Linux binaries are the supported production artifacts; non-Linux binaries are non-serving tooling.\n'
-# Serial package execution: several Linux tests take the delegated cgroup
-# root lease, which parallel package runs contend on inside one container.
+# Serial package execution is retained deliberately because tests in this
+# repository bind unix sockets and share state roots.
 run go test -count=1 -p 1 ./...
-run go run ./scripts/ci/strict-cgroup-preflight
 run go build -trimpath -ldflags "-X main.version=$VERSION" -o "$BIN" ./cmd/agentbus
 run smoke_release_binary
 run strict_startup_smoke

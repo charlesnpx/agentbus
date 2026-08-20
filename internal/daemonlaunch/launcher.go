@@ -22,22 +22,12 @@ import (
 )
 
 const (
-	ReadyFDEnv               = "AGENTBUS_READY_FD"
-	StartupDeadlineEnv       = "AGENTBUS_STARTUP_DEADLINE_UNIX_NANO"
-	ReadinessProtocolVersion = 1
-	DefaultTimeout           = 10 * time.Second
-	DefaultStderrTailBytes   = 64 * 1024
-	CodeAlreadyListening     = "agentbus daemon already listening"
-	CodeAdmissionRootBusy    = "agentbus admission root busy"
-	CodeAuthorityFailStopped = "agentbus authority root fail-stopped"
-	CodeAuthorityRootSealed  = "agentbus authority root sealed"
-	// ExitAuthorityFailStopped is the foreground daemon exit code for startup
-	// refusal by a fail-stopped authority root. Exit code 14 is reserved for
-	// engine.StateOrphaned.
-	ExitAuthorityFailStopped = 15
-	// ExitAuthorityRootSealed is the foreground daemon exit code for startup
-	// refusal by a sealed authority root.
-	ExitAuthorityRootSealed    = 16
+	ReadyFDEnv                 = "AGENTBUS_READY_FD"
+	StartupDeadlineEnv         = "AGENTBUS_STARTUP_DEADLINE_UNIX_NANO"
+	ReadinessProtocolVersion   = 1
+	DefaultTimeout             = 10 * time.Second
+	DefaultStderrTailBytes     = 64 * 1024
+	CodeAlreadyListening       = "agentbus daemon already listening"
 	readinessFDChildNumber     = 3
 	existingVerifyRetryPeriod  = 50 * time.Millisecond
 	failedExitGrace            = 500 * time.Millisecond
@@ -701,7 +691,7 @@ func verifyExistingDaemon(ctx context.Context, socketPath, tokenPath string) err
 		JSONRPC: "2.0",
 		ID:      json.RawMessage(`"hello"`),
 		Method:  protocol.MethodHello,
-		Params:  mustMarshal(protocol.HelloParams{ClientProtocolVersion: protocol.Version, Token: token}),
+		Params:  mustMarshal(protocol.HelloParams{ClientProtocolVersion: protocol.Version3, Token: token}),
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetWriteDeadline(deadline)
@@ -727,7 +717,7 @@ func verifyExistingDaemon(ctx context.Context, socketPath, tokenPath string) err
 	if resp.Error != nil {
 		return &protocol.RPCError{Object: *resp.Error}
 	}
-	var hello protocol.HelloResult
+	var hello protocol.HelloResultV3
 	raw, err = json.Marshal(resp.Result)
 	if err != nil {
 		return err
@@ -735,8 +725,8 @@ func verifyExistingDaemon(ctx context.Context, socketPath, tokenPath string) err
 	if err := json.Unmarshal(raw, &hello); err != nil {
 		return err
 	}
-	if hello.ProtocolVersion != protocol.Version {
-		return fmt.Errorf("protocol version mismatch: expected %d received %d", protocol.Version, hello.ProtocolVersion)
+	if hello.ProtocolVersion != protocol.Version3 {
+		return fmt.Errorf("protocol version mismatch: expected %d received %d", protocol.Version3, hello.ProtocolVersion)
 	}
 	return nil
 }
