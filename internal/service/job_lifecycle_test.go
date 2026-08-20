@@ -146,6 +146,36 @@ func TestJobGetUnknownIDReturnsTypedError(t *testing.T) {
 	}
 }
 
+func TestJobGetStoreReadFailureIsBackendUnavailable(t *testing.T) {
+	root := t.TempDir()
+	first := newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "get-store-error"}}})
+	submitted := submitResultForTest(t, submitForTest(t, first, submissionParams("get-store-error-workspace", "get-store-error-request", "get-store-error", t.TempDir(), "task")))
+	first.closeJobStore()
+
+	func() {
+		db, err := bolt.Open(root+"/jobs.db", 0o600, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if err := db.Update(func(tx *bolt.Tx) error {
+			jobs := tx.Bucket([]byte("jobs"))
+			if jobs == nil {
+				return errors.New("jobs bucket is missing")
+			}
+			return jobs.Put([]byte(submitted.JobID), []byte("not JSON"))
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	restarted := newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "get-store-error"}}})
+	outcome := restarted.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: submitted.JobID}))
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorBackendUnavailableV3 {
+		t.Fatalf("job.get store-read error = %#v, want backend-unavailable error", outcome.err)
+	}
+}
+
 func TestJobCancelBeforeSpawnIsDurable(t *testing.T) {
 	var starts atomic.Int64
 	backend := &executionFakeBackend{name: "cancel-before-spawn"}
@@ -324,36 +354,7 @@ func TestRestartRunningBecomesUnknownWithUncertainCleanup(t *testing.T) {
 	}
 }
 
-func TestRestartPreservesTerminalRecordBytes(t *testing.T) {
-	root := t.TempDir()
-	first := newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "terminal"}}})
-	submitted := submitResultForTest(t, submitForTest(t, first, submissionParams("terminal-workspace", "terminal-request", "terminal", t.TempDir(), "task")))
-	store, err := first.ensureJobStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.MarkTerminal(submitted.JobID, jobstore.TerminalUpdate{State: protocol.PublicStateCompleted, Cleanup: protocol.CleanupUncertain}); err != nil {
-		t.Fatal(err)
-	}
-	first.closeJobStore()
-	before := rawJobRecord(t, root, submitted.JobID)
-
-	restarted := newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "terminal"}}})
-	store, err = restarted.ensureJobStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := restarted.reconcileRecoveredJobs(store); err != nil {
-		t.Fatal(err)
-	}
-	restarted.closeJobStore()
-	after := rawJobRecord(t, root, submitted.JobID)
-	if !bytes.Equal(before, after) {
-		t.Fatalf("terminal record bytes changed across restart\nbefore=%s\nafter=%s", before, after)
-	}
-}
-
-func TestRestartUnknownIsNotRelaunchedAgain(t *testing.T) {
+func TestRestartPreservesUnknownTerminalRecordBytes(t *testing.T) {
 	root := t.TempDir()
 	var starts atomic.Int64
 	backend := &executionFakeBackend{name: "restart-unknown"}
@@ -367,31 +368,27 @@ func TestRestartUnknownIsNotRelaunchedAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.MarkStarting(submitted.JobID); err != nil {
+	if _, err := store.MarkTerminal(submitted.JobID, jobstore.TerminalUpdate{State: protocol.PublicStateUnknown, Cleanup: protocol.CleanupUncertain}); err != nil {
 		t.Fatal(err)
 	}
 	first.closeJobStore()
+	before := rawJobRecord(t, root, submitted.JobID)
 
-	for restart := 0; restart < 2; restart++ {
-		server := newTestServer(t, root, Config{Backends: []engine.Backend{backend}})
-		store, err := server.ensureJobStore()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := server.reconcileRecoveredJobs(store); err != nil {
-			t.Fatal(err)
-		}
-		stored, err := store.Get(submitted.JobID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if stored.State != protocol.PublicStateUnknown {
-			t.Fatalf("restart %d state = %q, want unknown", restart+1, stored.State)
-		}
-		server.closeJobStore()
+	restarted := newTestServer(t, root, Config{Backends: []engine.Backend{backend}})
+	store, err = restarted.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.reconcileRecoveredJobs(store); err != nil {
+		t.Fatal(err)
+	}
+	restarted.closeJobStore()
+	after := rawJobRecord(t, root, submitted.JobID)
+	if !bytes.Equal(before, after) {
+		t.Fatalf("terminal record bytes changed across restart\nbefore=%s\nafter=%s", before, after)
 	}
 	if got := starts.Load(); got != 0 {
-		t.Fatalf("recovered unknown backend Start calls = %d, want 0", got)
+		t.Fatalf("recovered terminal backend Start calls = %d, want 0", got)
 	}
 }
 

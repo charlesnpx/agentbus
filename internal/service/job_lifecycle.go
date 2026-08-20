@@ -36,7 +36,7 @@ func (s *Server) handleJobGet(raw json.RawMessage) requestOutcome {
 			if errors.Is(err, jobstore.ErrNotFound) {
 				return requestOutcome{err: unknownJobError(params.JobID)}
 			}
-			return invalidParams(fmt.Errorf("get job: %w", err))
+			return jobStoreUnavailable("get job", err)
 		}
 		wire, err := jobRecordWire(record)
 		if err != nil {
@@ -130,17 +130,21 @@ func jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, error) {
 	if err != nil {
 		return protocol.JobRecordWire{}, err
 	}
+	var tags map[string]string
+	if spec.Tags != nil {
+		tags = *spec.Tags
+	}
 	return protocol.JobRecordWire{
 		JobID:        record.JobID,
 		WorkspaceKey: record.WorkspaceKey,
 		RequestID:    record.RequestID,
 		Backend:      record.Backend,
 		State:        projectedState(record),
-		Tags:         cloneTags(spec.Tags),
+		Tags:         tags,
 		CreatedAt:    record.CreatedAt,
-		StartedAt:    cloneTime(record.StartedAt),
-		FinishedAt:   cloneTime(record.FinishedAt),
-		Timeout:      engine.CloneTimeoutResolution(timeout),
+		StartedAt:    record.StartedAt,
+		FinishedAt:   record.FinishedAt,
+		Timeout:      timeout,
 		Result:       projectResult(record),
 		Contract:     projectContract(record, spec),
 		Failure:      projectFailure(record),
@@ -178,32 +182,11 @@ func taskSpecForProjection(record jobstore.Record) (protocol.TaskSpecV3, *engine
 	return spec, timeout, nil
 }
 
-func cloneTags(tags *map[string]string) map[string]string {
-	if tags == nil {
-		return nil
-	}
-	clone := make(map[string]string, len(*tags))
-	for key, value := range *tags {
-		clone[key] = value
-	}
-	return clone
-}
-
-func cloneTime(value *time.Time) *time.Time {
-	if value == nil {
-		return nil
-	}
-	clone := value.UTC()
-	return &clone
-}
-
 func projectContract(record jobstore.Record, spec protocol.TaskSpecV3) *protocol.ContractResult {
 	if len(spec.OutputSchema) == 0 {
 		return nil
 	}
-	contract := record.Contract
-	contract.Violations = append([]string(nil), contract.Violations...)
-	return &contract
+	return &record.Contract
 }
 
 func projectContractVerdict(record jobstore.Record, spec protocol.TaskSpecV3) *protocol.ContractVerdict {
