@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"os/exec"
 	"slices"
 	"sync/atomic"
@@ -64,30 +63,20 @@ func TestJobGetReturnsBareRecordAndCompactSummaries(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UTC()
-	if err := os.Chtimes(info.ResultPath, now.Add(-15*24*time.Hour), now.Add(-15*24*time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SweepArtifacts(now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(info.ResultPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("swept result %q remains: %v", info.ResultPath, err)
-	}
 	durable, err := store.Get(terminal.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	swept := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: terminal.JobID}))
-	if swept.err != nil {
-		t.Fatalf("job.get swept result error = %#v", swept.err)
+	detailed := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: terminal.JobID}))
+	if detailed.err != nil {
+		t.Fatalf("job.get detailed result error = %#v", detailed.err)
 	}
-	sweptRecord, ok := swept.result.(protocol.JobRecordWire)
-	if !ok || sweptRecord.Result == nil {
-		t.Fatalf("job.get swept result = %#v, want record with result metadata", swept.result)
+	detailedRecord, ok := detailed.result.(protocol.JobRecordWire)
+	if !ok || detailedRecord.Result == nil {
+		t.Fatalf("job.get detailed result = %#v, want record with result metadata", detailed.result)
 	}
-	if result := sweptRecord.Result; result.Text != durable.ResultText || result.ResultPath != durable.ResultPath || result.SHA256 != durable.ResultSHA256 || result.Bytes != durable.ResultBytes {
-		t.Fatalf("job.get swept result = %#v, want durable path:%q sha256:%q bytes:%d", result, durable.ResultPath, durable.ResultSHA256, durable.ResultBytes)
+	if result := detailedRecord.Result; result.Text != durable.ResultText || result.ResultPath != durable.ResultPath || result.SHA256 != durable.ResultSHA256 || result.Bytes != durable.ResultBytes {
+		t.Fatalf("job.get detailed result = %#v, want durable path:%q sha256:%q bytes:%d", result, durable.ResultPath, durable.ResultSHA256, durable.ResultBytes)
 	}
 
 	list := server.handleJobGet(json.RawMessage(`{}`))

@@ -152,7 +152,6 @@ An empty parameter object lists jobs:
       "cleanup": "clean",
       "createdAt": "2026-08-20T12:00:00Z",
       "updatedAt": "2026-08-20T12:00:01Z",
-      "modelReported": "string",
       "failureClass": "backend_error",
       "contract": {
         "evaluated": true,
@@ -209,19 +208,18 @@ Passing a jobId returns the full job record:
   "logPaths": {
     "stdout": "string",
     "stderr": "string"
-  },
-  "modelReported": "string"
+  }
 }
 ~~~
 
 jobId, workspaceKey, requestId, backend, state, cleanup, createdAt, and timeout
-are always present. startedAt, finishedAt, tags, modelReported, result,
-contract, failure, and logPaths appear only when they apply.
+are always present. startedAt, finishedAt, tags, result, contract, failure,
+and logPaths appear only when they apply.
 
 result exists only for a completed job with an authoritative result. Its
 resultPath, sha256, and bytes are required; text may be omitted when the result
 is kept only in the artifact. The sha256 field is a bare lowercase 64-character
-hexadecimal digest. It has no prefix.
+hexadecimal digest with no algorithm prefix.
 
 failure exists only for a failed job. contract exists only when an outputSchema
 was submitted. attempts is one after initial evaluation and two only when the

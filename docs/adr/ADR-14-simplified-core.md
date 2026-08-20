@@ -144,14 +144,13 @@ job.get with a jobId returns this full JobRecord:
       "logPaths": {
         "stdout": "string",
         "stderr": "string"
-      },
-      "modelReported": "string"
+      }
     }
 
 JobRecord requires jobId, workspaceKey, requestId, backend, state, cleanup,
 createdAt, and timeout. timeout always contains effective and source; requested
-is absent unless taskSpec.timeoutMs was supplied. tags, startedAt, finishedAt,
-and modelReported are optional. result, contract, failure, and logPaths are
+is absent unless taskSpec.timeoutMs was supplied. tags, startedAt, and
+finishedAt are optional. result, contract, failure, and logPaths are
 pointer-valued groups and are absent when they do not apply. result exists only
 for an authoritative terminal result. In a present result, text is optional;
 resultPath, sha256, and bytes are required, retaining inline text or an
@@ -171,7 +170,6 @@ job.get with an empty object returns compact summaries:
         {
           "jobId": "string",
           "backend": "string",
-          "modelReported": "string",
           "state": "queued|running|completed|failed|canceled|unknown",
           "cleanup": "clean|uncertain",
           "createdAt": "RFC3339 UTC timestamp",
@@ -186,9 +184,9 @@ job.get with an empty object returns compact summaries:
     }
 
 Each JobSummary requires jobId, backend, state, cleanup, createdAt, and
-updatedAt. modelReported, failureClass, and the compact contract verdict are
-optional. If present, contract contains only evaluated and compliant. A summary
-never contains workspaceKey, requestId, tags, timeout, result, failure reason,
+updatedAt. failureClass and the compact contract verdict are optional. If
+present, contract contains only evaluated and compliant. A summary never
+contains workspaceKey, requestId, tags, timeout, result, failure reason,
 logPaths, prompt, cwd, or a process claim.
 
 job.cancel:
@@ -211,8 +209,10 @@ The complete CLI surface is version, serve, status, result, and cancel. There
 is no submit command: Delegate makes the typed job.submit request after task and
 identity preparation.
 
-status and result MUST project the same job.get response differently. status
-uses JobSummary for a list or JobRecord for one job, shows lifecycle, cleanup,
+status and result MUST project the same job.get response differently. For a
+selected job, their JSON modes write the byte-identical JobRecord, including
+inline result text when it is present. The human-readable status projection uses
+JobSummary for a list or JobRecord for one job, shows lifecycle, cleanup,
 contract verdict, and failure class, and MUST NEVER print the result text.
 result fetches the same JobRecord, writes authoritative terminal result text to
 standard output, and writes the applicable failure reason to standard error. A
@@ -366,9 +366,10 @@ whitespace do not affect the hash.
 
 There are no tombstones, request expiry, fingerprint-version negotiation,
 binding index, job-metadata garbage collection, or migrations. The requests
-binding lives for the version-3 store lifetime. Artifact garbage collection may
-remove only large prompt, log, and result files. It MUST NOT remove jobs,
-bindings, identity hashes, terminal metadata, or ContractResult.
+binding lives for the version-3 store lifetime. There is no artifact garbage
+collection: result and log artifacts remain until an operator removes them, so
+the state root grows until it is cleaned up. Removing an artifact does not
+remove jobs, bindings, identity hashes, terminal metadata, or ContractResult.
 
 ### Crash safety and no relaunch
 

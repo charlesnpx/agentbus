@@ -272,15 +272,6 @@ func (s *Server) closeJobStore() {
 	}
 }
 
-// ensureConfiguredBackend deliberately does only a map lookup. Live backend
-// checks belong after the job has been durably admitted.
-func (s *Server) ensureConfiguredBackend(name string) error {
-	if _, ok := s.backends[name]; !ok {
-		return fmt.Errorf("backend %q is unavailable", name)
-	}
-	return nil
-}
-
 func timeoutFromMillis(ms *int64) (*engine.TimeoutResolution, *protocol.ErrorObject) {
 	if ms == nil {
 		return &engine.TimeoutResolution{

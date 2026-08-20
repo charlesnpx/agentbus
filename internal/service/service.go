@@ -242,30 +242,6 @@ func New(cfg Config) (*Server, error) {
 	}, nil
 }
 
-// SocketPath returns the protocol socket path for stateRoot.
-func SocketPath(stateRoot string) (string, error) {
-	if stateRoot == "" {
-		var err error
-		stateRoot, err = engine.ResolveStateRoot()
-		if err != nil {
-			return "", err
-		}
-	}
-	return filepath.Join(stateRoot, protocol.SocketName), nil
-}
-
-// TokenPath returns the protocol token path for stateRoot.
-func TokenPath(stateRoot string) (string, error) {
-	if stateRoot == "" {
-		var err error
-		stateRoot, err = engine.ResolveStateRoot()
-		if err != nil {
-			return "", err
-		}
-	}
-	return filepath.Join(stateRoot, protocol.TokenFileName), nil
-}
-
 // ShutdownTimeout is the default bound a host should apply when it turns a
 // canceled process context into a graceful shutdown request.
 func (s *Server) ShutdownTimeout() time.Duration {

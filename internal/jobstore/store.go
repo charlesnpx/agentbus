@@ -27,9 +27,6 @@ const (
 	// replacement daemon hang silently while a draining predecessor still holds
 	// the database.
 	defaultOpenTimeout = 500 * time.Millisecond
-	artifactPromptTTL  = 14 * 24 * time.Hour
-	artifactResultTTL  = 14 * 24 * time.Hour
-	artifactLogTTL     = 30 * 24 * time.Hour
 )
 
 var (
@@ -97,10 +94,8 @@ type RequestBinding struct {
 	RequestHash [32]byte `json:"requestHash"`
 }
 
-// ArtifactPaths names the only sidecar data that artifact retention may remove.
-// Job records and request bindings are never retention candidates.
+// ArtifactPaths names the durable log and result sidecars for a job.
 type ArtifactPaths struct {
-	Prompt string `json:"prompt,omitempty"`
 	Log    string `json:"log,omitempty"`
 	Result string `json:"result,omitempty"`
 }
@@ -209,7 +204,6 @@ func (err *CorruptError) Unwrap() error { return err.Cause }
 func (*CorruptError) Is(target error) bool { return target == ErrCorrupt }
 
 type artifactLayout struct {
-	prompts string
 	logs    string
 	results string
 }
@@ -260,7 +254,6 @@ func Open(path string) (*Store, error) {
 		db:   db,
 		path: path,
 		artifacts: artifactLayout{
-			prompts: filepath.Join(filepath.Dir(path), "artifacts", "prompts"),
 			logs:    filepath.Join(filepath.Dir(path), "artifacts", "logs"),
 			results: filepath.Join(filepath.Dir(path), "artifacts", "results"),
 		},
@@ -468,24 +461,6 @@ func (store *Store) Get(id string) (Record, error) {
 
 // List returns all records ordered by job ID.
 func (store *Store) List() ([]Record, error) {
-	return store.listWhere(func(Record) bool { return true })
-}
-
-// ListQueued returns recovered jobs that were never started.
-func (store *Store) ListQueued() ([]Record, error) {
-	return store.listWhere(func(record Record) bool {
-		return record.State == protocol.PublicStateQueued
-	})
-}
-
-// ListStartingOrRunning returns jobs that must not be relaunched after restart.
-func (store *Store) ListStartingOrRunning() ([]Record, error) {
-	return store.listWhere(func(record Record) bool {
-		return record.Starting || record.State == protocol.PublicStateRunning
-	})
-}
-
-func (store *Store) listWhere(include func(Record) bool) ([]Record, error) {
 	var records []Record
 	err := store.view(func(tx *bolt.Tx) error {
 		jobs := tx.Bucket(bucketJobs)
@@ -500,9 +475,7 @@ func (store *Store) listWhere(include func(Record) bool) ([]Record, error) {
 			if err != nil {
 				return err
 			}
-			if include(record) {
-				records = append(records, record)
-			}
+			records = append(records, record)
 			return nil
 		})
 	})
@@ -665,53 +638,8 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 	})
 	return result, err
 }
-
-// SweepArtifacts removes only expired prompt, log, and result sidecar files.
-// It intentionally does not open a transaction and cannot delete records,
-// bindings, identity hashes, or ContractResult values.
-func (store *Store) SweepArtifacts(now time.Time) error {
-	if now.IsZero() {
-		return fmt.Errorf("%w: sweep time is required", ErrInvalid)
-	}
-	now = now.UTC()
-	for _, artifact := range []struct {
-		dir string
-		ttl time.Duration
-	}{
-		{dir: store.artifacts.prompts, ttl: artifactPromptTTL},
-		{dir: store.artifacts.logs, ttl: artifactLogTTL},
-		{dir: store.artifacts.results, ttl: artifactResultTTL},
-	} {
-		entries, err := os.ReadDir(artifact.dir)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue
-			}
-			info, err := entry.Info()
-			if err != nil {
-				return err
-			}
-			if now.Sub(info.ModTime()) < artifact.ttl {
-				continue
-			}
-			path := filepath.Join(artifact.dir, entry.Name())
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 func (store *Store) artifactPathsForID(id string) ArtifactPaths {
 	return ArtifactPaths{
-		Prompt: filepath.Join(store.artifacts.prompts, id+".json"),
 		Log:    filepath.Join(store.artifacts.logs, id+".log"),
 		Result: filepath.Join(store.artifacts.results, id+".txt"),
 	}

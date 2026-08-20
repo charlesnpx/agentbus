@@ -28,9 +28,7 @@ The core layout is:
   agentbus.sock
   agentbus.pid
   jobs.db
-  setup-probes.json
   artifacts/
-    prompts/
     logs/
     results/
 ~~~
@@ -39,26 +37,28 @@ token authenticates protocol.hello. agentbus.sock exists while the daemon is
 serving. agentbus.pid is written for a successful background launch or
 client-autostart; do not rely on it for a foreground daemon. jobs.db is the
 single bbolt store. It has exactly the meta, requests, and jobs buckets.
-artifacts contains prompt, log, and result sidecars. Records and request
-bindings are retained even when an artifact is later removed.
+artifacts contains log and result sidecars. There is no automatic artifact
+retention sweep: result and log artifacts remain until an operator removes
+them, so the state root grows until it is cleaned up.
 
 A Codex job may also create an implementation-managed private home below
 workspaces/<workspace-hash>/codex/<job-id>. It is separate from the shared job
 store and may contain per-job caches.
 
-The root and token are owner-only. Do not hand-edit jobs.db, token, artifacts,
-or the probe cache while a daemon is using the root.
+The root and token are owner-only. Do not hand-edit jobs.db, token, or
+artifacts while a daemon is using the root.
 
-## Starting and probing backends
+## Starting and selecting backends
 
 Use agentbus serve to start a background daemon. Use agentbus serve --foreground
 when a supervisor owns the process. The public CLI commands are version, serve,
 status, result, and cancel.
 
-There is no standalone setup command. Backend checking is lazy: the first
-submitted job for a backend triggers its probe, and the daemon caches the probe
-result under the state root. A hello response can describe configured backends;
-it does not prove that every backend has already been checked.
+There is no standalone setup command or backend probe. Admission checks only
+that the requested backend name is registered in the daemon's backend map. A
+registered backend that cannot run fails when the daemon starts its session,
+with the applicable failure class. A hello response describes configured
+backends; it does not establish that a backend can start a session.
 
 Submitting work is a typed job.submit request. The CLI intentionally has no
 submit subcommand. Use a compatible client to prepare compound identity and
@@ -80,8 +80,10 @@ erase a recorded completed result.
 
 ## Reading jobs and results
 
-agentbus status lists compact job summaries. With --job, it projects a full
-job.get record without printing result text.
+agentbus status lists compact job summaries. With --job, its human-readable
+projection omits result text, while `--json` emits the full job.get record.
+That JSON is byte-identical to `agentbus result --json` and deliberately
+includes inline result text when the record has it.
 
 agentbus result --job <id> reads the same full record. For a completed job it
 writes the authoritative result to standard output. It writes failure detail or
