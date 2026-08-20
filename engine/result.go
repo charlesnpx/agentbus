@@ -19,13 +19,8 @@ type EventText struct {
 	Truncated bool   `json:"truncated"`
 }
 
-// WriteResult spills the authoritative final result and returns result metadata.
-func (s *Store) WriteResult(jobID string, raw []byte, inlineCap int) (ResultInfo, error) {
-	return WriteResultForLayout(s.layout, jobID, raw, inlineCap)
-}
-
 // WriteResultForLayout writes a final result into layout.Results without
-// requiring a Store instance.
+// requiring a persistence instance.
 func WriteResultForLayout(layout WorkspaceLayout, jobID string, raw []byte, inlineCap int) (ResultInfo, error) {
 	path, err := ResultPathForLayout(layout, jobID)
 	if err != nil {

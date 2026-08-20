@@ -100,13 +100,11 @@ type WorkspaceLayout struct {
 	Logs      string
 	Results   string
 	Inputs    string
-	// Codex contains per-job CODEX_HOME directories. It is deliberately not
-	// created by ensureLayout: non-Codex workspaces do not need it.
+	// Codex contains per-job CODEX_HOME directories. It is created only for
+	// Codex workspaces, which do not all need it.
 	Codex      string
 	Quarantine string
 }
-
-const workspaceManifestFile = "workspace.json"
 
 // LayoutForWorkspace resolves and describes the state layout for cwd.
 func LayoutForWorkspace(root, cwd string) (WorkspaceLayout, error) {
@@ -152,18 +150,6 @@ func validateWorkspaceKey(key string) error {
 			continue
 		}
 		return errors.New("invalid workspace key")
-	}
-	return nil
-}
-
-func ensureLayout(layout WorkspaceLayout) error {
-	for _, dir := range []string{layout.Root, filepath.Join(layout.Root, "workspaces"), layout.Namespace, layout.Jobs, layout.Logs, layout.Results, layout.Inputs, layout.Quarantine} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return err
-		}
 	}
 	return nil
 }
