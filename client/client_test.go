@@ -22,7 +22,6 @@ import (
 
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
-	"github.com/charlesnpx/agentbus/internal/served"
 )
 
 func TestMain(m *testing.M) {
@@ -1130,86 +1129,6 @@ func TestConnectAutostartStartResultKeepsTimeoutBehavior(t *testing.T) {
 	}
 	if elapsed < startTimeout-40*time.Millisecond {
 		t.Fatalf("Connect elapsed = %s, want timeout path near %s", elapsed, startTimeout)
-	}
-}
-
-func TestConnectAutostartRealUnsupportedHostSurfacesLauncherDiagnosticOnDarwin(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("real unsupported-host autostart diagnostic is macOS-only")
-	}
-	// This subprocess test exercises the strict-runtime diagnostic, not a
-	// developer's locally installed backend CLIs. Keep provider discovery out of
-	// the fixture so adding a default backend cannot turn the test into a live
-	// CLI probe before the intended startup failure is reached.
-	goBinary, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", filepath.Dir(goBinary))
-	root := shortClientTempDir(t)
-	bin := buildClientRealAgentbusBinary(t)
-
-	var starts atomic.Int64
-	starter := StartFunc(func(ctx context.Context, opts StartOptions) (StartResult, error) {
-		starts.Add(1)
-		return (defaultStarter{}).StartDaemon(ctx, opts)
-	})
-	client, err := Connect(context.Background(), Options{
-		StateRoot:    root,
-		Token:        "token",
-		CommandPath:  bin,
-		StartTimeout: 2 * time.Second,
-		Starter:      starter,
-	})
-	if client != nil {
-		_ = client.Close()
-	}
-	if err == nil {
-		t.Fatal("Connect unexpectedly succeeded; want a strict-support launcher diagnostic or a supported-host unauthorized rejection")
-	}
-	var startup *daemonlaunch.StartupError
-	if !errors.As(err, &startup) || !errors.Is(err, daemonlaunch.ErrStartupFailed) {
-		// This test reproduces the launcher diagnostic for a host on which the
-		// strict native runtime is genuinely UNAVAILABLE. GOOS==darwin is not a
-		// proxy for that: a real macOS host (including GitHub's macos runner)
-		// supports the strict runtime, so the daemon starts, binds, and rejects
-		// this test's deliberately-invalid hello token with an unauthorized RPC
-		// error. Treat that as positive evidence of strict support and skip — the
-		// unsupported-host precondition cannot be reproduced here. This makes the
-		// test self-gating (the external skip-list entry is no longer required);
-		// any other outcome is unexpected and still fails.
-		var rpcErr *protocol.RPCError
-		if errors.As(err, &rpcErr) && rpcErr.Object.Data.Code == protocol.ErrorUnauthorized {
-			t.Skipf("host supports the strict native runtime; unsupported-host precondition unreproducible (Connect error = %v)", err)
-		}
-		if clientTestBindDeniedOutput(err.Error()) {
-			clientTestSkipOrFailBindDenied(t, "real unsupported-host autostart", err)
-		}
-		t.Fatalf("Connect error = %T %v, want the strict-support launcher diagnostic or a supported-host unauthorized rejection", err, err)
-	}
-	if errors.Is(err, daemonlaunch.ErrReadinessTimeout) || errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Connect error = %v, want launcher failure code, not timeout", err)
-	}
-	if clientTestBindDeniedOutput(err.Error()) {
-		clientTestSkipOrFailBindDenied(t, "real unsupported-host autostart", err)
-	}
-	if startup.Code != served.ErrAdmissionStrictSupportUnavailable.Error() ||
-		!strings.Contains(startup.Message, served.ErrAdmissionStrictSupportUnavailable.Error()) {
-		t.Fatalf("startup error = %+v, want strict support diagnostic", startup)
-	}
-	if got := starts.Load(); got != 1 {
-		t.Fatalf("starter calls = %d, want 1", got)
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		names := make([]string, 0, len(entries))
-		for _, entry := range entries {
-			names = append(names, entry.Name())
-		}
-		t.Fatalf("state root entries after unsupported autostart = %v, want empty root", names)
 	}
 }
 

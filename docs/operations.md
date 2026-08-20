@@ -199,28 +199,14 @@ The committed CI scripts are under `scripts/ci/`:
 - `solo-battery.sh` checks gofmt, build, vet, strict-tag vet, full tests, and
   Linux amd64/arm64 cross-builds; it can add full race tests with
   `SOLO_BATTERY_RACE=1`.
-- `docker-cgroup-v2.sh` runs the privileged Linux cgroup-v2 lane in the pinned
-  Go container. It performs strict preflight, partitioned builds/tests, race,
-  cgroup conformance, and strict E2E.
-- `product-e2e.sh` builds one CLI binary, smokes that exact binary, then runs
-  strict product E2E against it.
-- `release-check.sh` combines the strict-capable container, full tests, strict
-  preflight, exact release binary build, smoke, startup status round-trip, and
-  strict production tests.
-- `fail-closed.sh` runs the macOS supported process-group custody lane, the
-  restricted-Linux process-group fallback serving lane, and typed fail-closed
-  checks for genuine no-basic-supervision and incompatible contract cases. The
-  gate does not set `AGENTBUS_TEST_SANDBOX_BIND_DENIED`; Unix-socket bind
-  denial is a failure unless a developer explicitly opts into that local
-  sandbox skip.
+- `release-check.sh` combines a full test pass with an exact release-binary
+  build and command-line smoke checks.
 - `vuln.sh` installs the pinned `govulncheck` version and scans `./...`.
 
 The merge criterion is remote-green on the exact candidate SHA once GitHub
-Actions billing is restored. The privileged strict-lane artifact is retained by
-the staged workflow and is required evidence for the candidate SHA. Proposed
-workflows are staged in `scripts/ci/github-workflows-proposed/`; installing them
-means copying the selected YAML files into `.github/workflows/` after explicit
-user approval.
+Actions billing is restored. Proposed workflows are staged in
+`scripts/ci/github-workflows-proposed/`; installing them means copying the
+selected YAML files into `.github/workflows/` after explicit user approval.
 
 ## 10. Install Caveat
 

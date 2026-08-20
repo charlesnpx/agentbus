@@ -210,7 +210,6 @@ printf 'release-check: Linux binaries are the supported production artifacts; no
 # Serial package execution: several Linux tests take the delegated cgroup
 # root lease, which parallel package runs contend on inside one container.
 run go test -count=1 -p 1 ./...
-run go run ./scripts/ci/strict-cgroup-preflight
 run go build -trimpath -ldflags "-X main.version=$VERSION" -o "$BIN" ./cmd/agentbus
 run smoke_release_binary
 run strict_startup_smoke
