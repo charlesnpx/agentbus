@@ -1,5 +1,7 @@
 # ADR-8: Results, minimal migration, and terminal ordering
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Existing `<results>/<jobID>.txt` layout is preserved. Completed result publication orders as

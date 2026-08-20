@@ -1,20 +1,19 @@
 # ADR-14: Simplified core
 
-ADR-13 expressly leaves “parked-worker deletion, which is deferred to a separate
-deletion-oriented review” as a non-goal (ADR-13, line 290). This ADR is that
-separate deletion-oriented review. It completes the de-escalation that ADR-13
-began.
+ADR-13 expressly leaves worker-launch removal for a separate deletion-oriented
+review as a non-goal. This ADR is that review. It completes the de-escalation
+that ADR-13 began.
 
 ## Decision
 
 Agentbus becomes a small generic job service. It retains durable identified
 submission, one job lifecycle, inline JSON Schema validation, and process-group
-supervision. It deletes the durable-admission-authority, custody,
-parked-worker, and parallel-projection machinery. This ADR is NORMATIVE.
+supervision. It deletes the durable admission-control, process-proof,
+held-worker, and parallel-projection machinery. This ADR is NORMATIVE.
 
 ADR-14 supersedes the ADRs identified in the ADR index. Their historical files
-remain until the separately scheduled history move; their temporary location
-does not preserve their normative force.
+are retained under docs/history; their location does not preserve normative
+force.
 
 ### Cross-repository boundary
 
@@ -89,13 +88,19 @@ boolean. It is not a name, registry key, or caller-supplied correction program.
     {
       "jobId": "string",
       "state": "queued|running|completed|failed|canceled|unknown",
-      "deduplicated": "false|true"
+      "deduplicated": "false|true",
+      "timeout": {
+        "requested": 1800000,
+        "effective": 1800000,
+        "source": "client|daemon_default"
+      }
     }
 
-state is the current public projection. deduplicated is always present. A new
-admission returns the queued snapshot with deduplicated false; a matching replay
-returns the existing job's current state, including a terminal state, with
-deduplicated true.
+state is the current public projection. deduplicated and timeout are always
+present. timeout always contains effective and source; requested is absent
+unless taskSpec.timeoutMs was supplied. A new admission returns the queued
+snapshot with deduplicated false; a matching replay returns the existing job's
+current state, including a terminal state, with deduplicated true.
 
 job.get with a jobId returns this full JobRecord:
 
@@ -125,7 +130,7 @@ job.get with a jobId returns this full JobRecord:
         "bytes": 123
       },
       "contract": {
-        "schemaSha256": "sha256:lowercase-hex",
+        "schemaSha256": "schema-digest",
         "evaluated": true,
         "compliant": true,
         "attempts": 1,
@@ -139,14 +144,13 @@ job.get with a jobId returns this full JobRecord:
       "logPaths": {
         "stdout": "string",
         "stderr": "string"
-      },
-      "modelReported": "string"
+      }
     }
 
 JobRecord requires jobId, workspaceKey, requestId, backend, state, cleanup,
 createdAt, and timeout. timeout always contains effective and source; requested
-is absent unless taskSpec.timeoutMs was supplied. tags, startedAt, finishedAt,
-and modelReported are optional. result, contract, failure, and logPaths are
+is absent unless taskSpec.timeoutMs was supplied. tags, startedAt, and
+finishedAt are optional. result, contract, failure, and logPaths are
 pointer-valued groups and are absent when they do not apply. result exists only
 for an authoritative terminal result. In a present result, text is optional;
 resultPath, sha256, and bytes are required, retaining inline text or an
@@ -166,7 +170,6 @@ job.get with an empty object returns compact summaries:
         {
           "jobId": "string",
           "backend": "string",
-          "modelReported": "string",
           "state": "queued|running|completed|failed|canceled|unknown",
           "cleanup": "clean|uncertain",
           "createdAt": "RFC3339 UTC timestamp",
@@ -181,9 +184,9 @@ job.get with an empty object returns compact summaries:
     }
 
 Each JobSummary requires jobId, backend, state, cleanup, createdAt, and
-updatedAt. modelReported, failureClass, and the compact contract verdict are
-optional. If present, contract contains only evaluated and compliant. A summary
-never contains workspaceKey, requestId, tags, timeout, result, failure reason,
+updatedAt. failureClass and the compact contract verdict are optional. If
+present, contract contains only evaluated and compliant. A summary never
+contains workspaceKey, requestId, tags, timeout, result, failure reason,
 logPaths, prompt, cwd, or a process claim.
 
 job.cancel:
@@ -197,9 +200,8 @@ job.cancel:
       "state": "queued|running|completed|failed|canceled|unknown"
     }
 
-job.status, job.result, policy.validate, policy.register, and the capabilities
-map are deleted. There is no status-list flag; an empty job.get object is the
-only list request.
+Former extra job, schema, and capability operations are deleted. There is no
+status-list flag; an empty job.get object is the only list request.
 
 ### CLI version 0.13.0
 
@@ -207,8 +209,10 @@ The complete CLI surface is version, serve, status, result, and cancel. There
 is no submit command: Delegate makes the typed job.submit request after task and
 identity preparation.
 
-status and result MUST project the same job.get response differently. status
-uses JobSummary for a list or JobRecord for one job, shows lifecycle, cleanup,
+status and result MUST project the same job.get response differently. For a
+selected job, their JSON modes write the byte-identical JobRecord, including
+inline result text when it is present. The human-readable status projection uses
+JobSummary for a list or JobRecord for one job, shows lifecycle, cleanup,
 contract verdict, and failure class, and MUST NEVER print the result text.
 result fetches the same JobRecord, writes authoritative terminal result text to
 standard output, and writes the applicable failure reason to standard error. A
@@ -223,7 +227,7 @@ admission subcommand, and every internal-* subcommand are deleted.
 
 The public state set is exactly queued, running, completed, failed, canceled,
 and unknown. starting is a private persisted launch marker. It MUST project as
-running and MUST NOT appear in a protocol or CLI response. There is no retrying
+running and MUST NOT appear in a protocol or CLI response. There is no retry
 state, public or private.
 
 This table maps the current twelve labels to version-3 public vocabulary for
@@ -247,7 +251,8 @@ review only. It is not a database migration and MUST NOT be implemented as one.
 The current engine.JobState, execution/model Outcome, and execution/model
 PublicState vocabularies are deleted together. Decision and dispatch
 projections, with their proof-driven state machine, are deleted with the
-authority subsystem. One job record supplies the only version-3 vocabulary.
+admission-control subsystem. One job record supplies the only version-3
+vocabulary.
 
 ### Cleanup is independent
 
@@ -293,7 +298,7 @@ is:
 
 Agentbus appends the canonical submitted schema and bounded validation violations
 after that immutable text. The caller cannot replace, template, or extend it. A
-correction therefore has no authority to continue task work.
+correction therefore cannot continue task work.
 
 When outputSchema is present, ContractResult is recorded in the optional
 contract group as:
@@ -334,6 +339,9 @@ MUST use this order:
 7. Persist the new job and its requests binding atomically, then return
    deduplicated false.
 
+Failure in step 6 is a rejection. It creates neither a job record nor a
+requests binding.
+
 A same-hash replay does not inspect present backend availability or filesystem
 state. It succeeds even if cwd has been deleted or changed. A different hash is
 a conflict before backend or cwd validation.
@@ -358,9 +366,10 @@ whitespace do not affect the hash.
 
 There are no tombstones, request expiry, fingerprint-version negotiation,
 binding index, job-metadata garbage collection, or migrations. The requests
-binding lives for the version-3 store lifetime. Artifact garbage collection may
-remove only large prompt, log, and result files. It MUST NOT remove jobs,
-bindings, identity hashes, terminal metadata, or ContractResult.
+binding lives for the version-3 store lifetime. There is no artifact garbage
+collection: result and log artifacts remain until an operator removes them, so
+the state root grows until it is cleaned up. Removing an artifact does not
+remove jobs, bindings, identity hashes, terminal metadata, or ContractResult.
 
 ### Crash safety and no relaunch
 
@@ -378,8 +387,8 @@ launch ordering is normative:
 The initial process MUST have retired before Agentbus spawns the correction
 turn. The correction turn's process claim, recorded by the same
 OnProcessStart -> recordProcessClaim path as the initial turn's claim, is the
-durable evidence that the correction turn exists. There is no retrying state,
-public or private, and no durable retrying commit before correction spawn.
+durable evidence that the correction turn exists. There is no retry state,
+public or private, and no durable retry commit before correction spawn.
 
 The claim transaction MUST be separate from the durable initial-turn state
 transaction. It may fail after exec; that failure never licenses a second spawn
@@ -436,11 +445,12 @@ look noncompliant.
 | 13 | Shutdown deadline, unchanged |
 | 15 | completed, but the authoritative result artifact is missing, unreadable, or does not match its recorded digest |
 
-Codes 8 (reaped), 9 (quarantined), and 12 (authority fail-stop) are permanently
-retired and MUST NEVER be reused. unknown uses 14 rather than 8 because
-orphaned meant “we lost custody and cannot say what happened,” which is exactly
-unknown. Reaped meant the opposite: confirmed gone and cleaned up. Reusing code
-8 with an inverted meaning would break scripted consumers.
+Codes 8 (reaped), 9 (quarantined), and 12 (the former safety stop) are
+permanently retired and MUST NEVER be reused. unknown uses 14 rather than 8
+because orphaned meant “we lost process certainty and cannot say what
+happened,” which is exactly unknown. Reaped meant the opposite: confirmed gone
+and cleaned up. Reusing code 8 with an inverted meaning would break scripted
+consumers.
 
 ### First terminal wins
 
@@ -458,8 +468,8 @@ them. ADR-14 selects the former.
 Agentbus uses one bbolt store with exactly three top-level buckets: meta,
 requests, and jobs. meta holds format metadata. requests maps compound identity
 to immutable TaskSpec hash and job ID. jobs holds job records. There is no
-workspace fan-out store, authority root, anchor, binding index, proof record, or
-projection store.
+workspace fan-out store, admission root, anchor, binding index, proof record,
+or projection store.
 
 A corrupt or truncated database MUST produce a typed store error before socket
 bind and MUST NEVER fault the daemon. bbolt memory-maps its database, so a naive
@@ -481,9 +491,9 @@ delete an old root.
 
 | Existing concern | ADR-14 decision | Replacement or retained scope |
 | --- | --- | --- |
-| Durable admission authority subsystem | Delete it. | One bbolt store and one generic job service. |
-| Custody and parked-worker protocol | Delete it. | Direct fork and exec into one process group plus a separate claim. |
-| cgroup subsystem | Delete it; it is not an optional enhancement. | Plain process-group supervision and token-equality reaping. |
+| Durable admission-control subsystem | Delete it. | One bbolt store and one generic job service. |
+| Process-proof and held-worker protocol | Delete it. | Direct fork and exec into one process group plus a separate claim. |
+| Linux resource-hierarchy subsystem | Delete it; it is not an optional enhancement. | Plain process-group supervision and token-equality reaping. |
 | PolicyRegistry, named/shape contracts, retry templates, policy methods | Delete them. | One inline JSON Schema and one fixed correction attempt. |
 | engine/store.go workspace-store implementation | Delete it. | Single bbolt meta/requests/jobs store; no job-metadata GC. |
 | Parallel engine.JobState, model Outcome, and model PublicState vocabularies | Delete them together. | Six public states plus private starting marker. |
@@ -495,7 +505,7 @@ delete an old root.
 ## Invariant(s)
 
 - Agentbus owns generic job lifecycle, not review workflows or durable admission
-  authority.
+  control.
 - Identified replay compares canonical TaskSpec hash before filesystem or backend
   validation.
 - A job has at most one initial launch and at most one correction launch; neither
@@ -509,9 +519,9 @@ delete an old root.
 
 ## Rejected alternatives
 
-- Keeping cgroup as an optional custody enhancement.
-- Retaining parked workers or a release/ack protocol.
-- Retaining a durable authority, anchor, safety latch, proof vocabulary, or
+- Keeping the Linux resource hierarchy as an optional process-cleanup enhancement.
+- Retaining held workers or a release/ack protocol.
+- Retaining a durable admission-control subsystem, anchor, safety latch, proof vocabulary, or
   binding index behind a simpler protocol.
 - Relaunching queued, starting, or running jobs on restart.
 - Signaling on a missing, unreadable, or unequal start token.
@@ -526,21 +536,23 @@ Each identified job has one small durable lifetime with at most one initial turn
 and one correction turn. Agentbus remains safe against daemon-initiated duplicate
 launch of either turn while expressly accepting false unknown states and possibly
 leftover provider CLIs after a crash. That loss is visible rather than hidden
-behind custody proof machinery.
+behind process-proof machinery.
 
-Later deletion can remove authority, custody, cgroup, policy, legacy store, and
-parallel-state code against this ADR. Convo Relay adapters, command execution,
-provider sandboxing, per-job write isolation, private CODEX_HOME, and the
-underlying failure classifier remain outside that deletion.
+Later deletion can remove the legacy admission-control, process-proof,
+resource-hierarchy, validation, store, and parallel-state code against this
+ADR. Convo Relay adapters, command execution, provider sandboxing, per-job
+write isolation, private CODEX_HOME, and the underlying failure classifier
+remain outside that deletion.
 
 ## Non-goals
 
 This ADR does not change Witness review workflows, Delegate task preparation,
 engine/adapter, engine/command, Convo Relay embedded adapters, provider sandbox
 policy, per-job write cache, private CODEX_HOME, or underlying provider
-failure-classification logic. It does not provide protocol-v2 compatibility,
-state-root migration, cgroup retention, or a stronger daemon-restart cleanup
-guarantee than exact-token process-group signaling supports.
+failure-classification logic. It does not provide earlier-protocol
+compatibility, state-root migration, resource-hierarchy retention, or a
+stronger daemon-restart cleanup guarantee than exact-token process-group
+signaling supports.
 
 ## Amendments
 
@@ -557,3 +569,7 @@ job.submit result now admits every public replay state, the replay hash fixes it
 TaskSpec inputs and canonical form, and the ADR index names ADR-14 as the sole
 normative contract. These corrections remove contradictory review targets without
 changing the collapse's retained boundaries.
+
+The submit result includes the resolved timeout. New-record validation failure
+is a rejection with no job record or requests binding. The state vocabulary was
+reviewed to confirm that no retry state is implied.

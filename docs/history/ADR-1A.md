@@ -1,5 +1,7 @@
 # ADR-1A: Admission-store integrity policy
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 The admission DB uses restrictive permissions, normal bbolt syncing, and an integrity check before

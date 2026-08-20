@@ -1,5 +1,7 @@
 # ADR-8A: Result-publication exclusion
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Orphan-result cleanup deletes only files unreferenced by a terminal aggregate and excludes jobs with a

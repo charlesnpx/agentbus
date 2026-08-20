@@ -1,5 +1,7 @@
 # ADR-4: Read routing, historical dual-read, and statePath
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Exact job reads check bbolt first and legacy JSON second. Global/current `job.status` scans bbolt and

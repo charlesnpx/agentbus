@@ -1,5 +1,7 @@
 # ADR-13: Custody de-escalation
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 **Supersession.** This ADR NORMATIVELY amends ADR-12 `Corruption classes` lines
 81-102 for the safety scope of physical cleanup uncertainty, ADR-12 `Shutdown contract`
 lines 139-151 and its invariant at line 167, ADR-12 `Result semantics` lines 153-156,

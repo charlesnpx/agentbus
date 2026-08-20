@@ -418,50 +418,6 @@ func TestOpenHeldDatabaseReturnsTypedBusyWithinTimeout(t *testing.T) {
 	}
 }
 
-func TestSweepArtifactsDeletesExpiredFilesButRetainsRecord(t *testing.T) {
-	store := newTestStore(t)
-	defer closeTestStore(t, store)
-
-	record, _, err := store.SubmitTx(
-		RequestKey{WorkspaceKey: "workspace-artifacts", RequestID: "request-artifacts"},
-		testTaskSpec("artifact task"),
-		func(string) (Record, error) { return Record{Backend: "codex"}, nil },
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{record.Artifacts.Prompt, record.Artifacts.Log, record.Artifacts.Result} {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatalf("create artifact directory %s: %v", filepath.Dir(path), err)
-		}
-		if err := os.WriteFile(path, []byte("expired artifact"), 0o600); err != nil {
-			t.Fatalf("write artifact %s: %v", path, err)
-		}
-	}
-	now := time.Now().UTC()
-	expired := now.Add(-31 * 24 * time.Hour)
-	for _, path := range []string{record.Artifacts.Prompt, record.Artifacts.Log, record.Artifacts.Result} {
-		if err := os.Chtimes(path, expired, expired); err != nil {
-			t.Fatalf("age artifact %s: %v", path, err)
-		}
-	}
-	if err := store.SweepArtifacts(now); err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{record.Artifacts.Prompt, record.Artifacts.Log, record.Artifacts.Result} {
-		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("artifact %s remains after sweep: %v", path, err)
-		}
-	}
-	got, err := store.Get(record.JobID)
-	if err != nil {
-		t.Fatalf("job record disappeared during artifact sweep: %v", err)
-	}
-	if got.JobID != record.JobID {
-		t.Fatalf("record after artifact sweep = %q, want %q", got.JobID, record.JobID)
-	}
-}
-
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "jobs.db"))

@@ -1,5 +1,7 @@
 # ADR-5B: GroupRef and containment proof
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 `GroupRef` records schema version, custody id, launch key, host boot id, PGID, leader process identity,

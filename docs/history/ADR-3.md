@@ -1,5 +1,7 @@
 # ADR-3: Post-acceptance response and error contract
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Before acceptance, validation, backend, capability, and store errors are definitive rejection. After

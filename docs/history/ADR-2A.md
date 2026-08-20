@@ -1,5 +1,7 @@
 # ADR-2A: Coordinator-obligation linearization and fail-stop
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Submission materializes and validates an immutable launch spec, installs a non-runnable pending

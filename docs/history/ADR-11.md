@@ -1,5 +1,7 @@
 # ADR-11: AdmissionAuthority boundary
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 The coordinator/server-facing durable-operation contract is `AdmissionAuthority`, not

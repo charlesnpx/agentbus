@@ -1,5 +1,7 @@
 # ADR-7: Startup reconciliation as hard socket barrier
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Startup opens and integrity-checks the DB, generates the current boot ID, and reconciles every prior

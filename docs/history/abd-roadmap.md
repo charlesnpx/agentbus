@@ -735,7 +735,7 @@ see the R4A contract block.)
   (C4, invalid->Unknown fail-closed); PrepareSpec{Exec,LaunchKey,ReleaseSecret}+HeldLaunch{Ref,Release(ctx)
   tokenless,AbortAndVerify} (C2); HeldLaunchCore pure state machine over injected HeldLaunchEffects with
   opMu-serialized one-use Release/Abort/Close + HandleControlLoss (C3 states + race table). held_launch_test.go
-  race table; docs/abd-fd-ownership.md (FD matrix + compile-time assertions). NativeCustodian.Prepare NOT
+  race table; the former FD matrix document (removed with the retired launch design). NativeCustodian.Prepare NOT
   implemented; production unavailable. Verify: build/linux/gofmt/vet=0; custodian held_launch -race -count=3
   (33 PASS, 0 races); macOS go test ./...=0; Docker cgroup-v2 -p 1 full=0 + R0T RED=0. sol review pending.
 - 2026-07-20 R1-fix (9560a47): closed sol review of R1 (verdict was FIX-REQUIRED; core R1 confirmed

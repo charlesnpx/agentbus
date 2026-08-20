@@ -1,5 +1,7 @@
 # ADR-0: Reliability contract
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 AB-D's target contract is exactly-once admission for `(workspaceKey, requestId)` and fail-closed

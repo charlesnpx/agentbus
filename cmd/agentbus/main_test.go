@@ -244,6 +244,70 @@ func TestResultMissingArtifactReturnsExit15WithoutStdout(t *testing.T) {
 	}
 }
 
+func TestResultJSONRetainsRecordButUsesExit15ForUnusableArtifact(t *testing.T) {
+	artifactPath := filepath.Join(t.TempDir(), "result.txt")
+	artifactBytes := []byte("authoritative result")
+	if err := os.WriteFile(artifactPath, artifactBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(artifactBytes)
+
+	tests := []struct {
+		name   string
+		result protocol.ResultInfoWire
+	}{
+		{
+			name: "missing",
+			result: protocol.ResultInfoWire{
+				ResultPath: filepath.Join(t.TempDir(), "missing-result.txt"),
+				SHA256:     hex.EncodeToString(sum[:]),
+				Bytes:      int64(len(artifactBytes)),
+			},
+		},
+		{
+			name: "unreadable directory",
+			result: protocol.ResultInfoWire{
+				ResultPath: t.TempDir(),
+				SHA256:     hex.EncodeToString(sum[:]),
+				Bytes:      int64(len(artifactBytes)),
+			},
+		},
+		{
+			name: "byte mismatch",
+			result: protocol.ResultInfoWire{
+				ResultPath: artifactPath,
+				SHA256:     hex.EncodeToString(sum[:]),
+				Bytes:      int64(len(artifactBytes) - 1),
+			},
+		},
+		{
+			name: "digest mismatch",
+			result: protocol.ResultInfoWire{
+				ResultPath: artifactPath,
+				SHA256:     strings.Repeat("0", sha256.Size*2),
+				Bytes:      int64(len(artifactBytes)),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			record := withResult(detailedRecord(protocol.PublicStateCompleted), &tt.result)
+			a := testApp(t)
+			a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
+
+			statusCode, statusJSON, statusErr := runTestCLI(t, a, []string{"status", "--job", "job-1", "--json"})
+			resultCode, resultJSON, resultErr := runTestCLI(t, a, []string{"result", "--job", "job-1", "--json"})
+			if statusCode != 0 || statusErr != "" || resultCode != cliExitResultUnavailable || resultErr != "" {
+				t.Fatalf("status=(%d,%q) result=(%d,%q), want status success and result exit %d", statusCode, statusErr, resultCode, resultErr, cliExitResultUnavailable)
+			}
+			if resultJSON != statusJSON {
+				t.Fatalf("status JSON = %q\nresult JSON = %q\nwant byte-identical records", statusJSON, resultJSON)
+			}
+		})
+	}
+}
+
 func TestExitCodesUseStateFailureAndContract(t *testing.T) {
 	completedNoncompliant := detailedRecord(protocol.PublicStateCompleted)
 	completedNoncompliant.Contract = &protocol.ContractResult{Evaluated: true, Compliant: false}
@@ -322,6 +386,20 @@ func TestServeBackgroundStartupFailureUsesExit11(t *testing.T) {
 	code, stdout, stderr := runTestCLI(t, a, []string{"serve"})
 	if code != cliExitDaemonStartupFailure || stdout != "" || !strings.Contains(stderr, "serve:") {
 		t.Fatalf("serve=(code=%d stdout=%q stderr=%q), want startup exit %d", code, stdout, stderr, cliExitDaemonStartupFailure)
+	}
+}
+
+func TestServeForegroundStartupFailureUsesExit11(t *testing.T) {
+	a := testApp(t)
+	rootFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(rootFile, []byte("not a state root"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.stateRoot = rootFile
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"serve", "--foreground"})
+	if code != cliExitDaemonStartupFailure || stdout != "" || !strings.Contains(stderr, "agentbus:") {
+		t.Fatalf("serve foreground=(code=%d stdout=%q stderr=%q), want startup exit %d", code, stdout, stderr, cliExitDaemonStartupFailure)
 	}
 }
 

@@ -1,5 +1,7 @@
 # ADR-5A: Live supervisor-loss handling
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Unexpected worker exit or control EOF while the daemon is alive triggers reconciliation:

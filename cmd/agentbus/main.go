@@ -367,6 +367,9 @@ func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Write
 		if writeCode := writeOrError(out, errOut, record); writeCode != 0 {
 			return writeCode
 		}
+		if resultArtifactUnavailable(record) {
+			return cliExitResultUnavailable
+		}
 		return code
 	}
 	if resultCode := printJobRecordResult(out, errOut, record); resultCode != 0 {
@@ -546,6 +549,21 @@ func openVerifiedResultArtifact(result *protocol.ResultInfoWire) (*os.File, erro
 	return artifact, nil
 }
 
+// resultArtifactUnavailable checks the artifact only when the record needs it
+// to deliver a completed result. JSON still emits the authoritative record;
+// its exit status must nevertheless report an unusable large result.
+func resultArtifactUnavailable(record agentclient.JobGetResult) bool {
+	if record.State != protocol.PublicStateCompleted || record.Result == nil || record.Result.Text != "" || record.Result.ResultPath == "" {
+		return false
+	}
+	artifact, err := openVerifiedResultArtifact(record.Result)
+	if err != nil {
+		return true
+	}
+	_ = artifact.Close()
+	return false
+}
+
 func jobAge(createdAt time.Time) string {
 	if createdAt.IsZero() {
 		return "unknown"
@@ -651,7 +669,10 @@ func serveCommandError(errOut io.Writer, err error) int {
 		fmt.Fprintf(errOut, "agentbus: %v\n", err)
 		return cliExitShutdownForced
 	}
-	return commandError(errOut, err)
+	if err != nil {
+		fmt.Fprintf(errOut, "agentbus: %v\n", err)
+	}
+	return cliExitDaemonStartupFailure
 }
 
 func protocolCommandError(errOut io.Writer, operation string, err error) int {

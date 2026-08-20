@@ -1,5 +1,7 @@
 # ADR-10: Coordinator ownership drives shutdown and replacement
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 Idle shutdown and stale-binary replacement consult coordinator ownership. `HasOwnedWork()` and

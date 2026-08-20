@@ -1,5 +1,7 @@
 # ADR-12: Strict-only contract
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 AB-E freezes the strict-only protocol, replay, storage, rejection, shutdown, and result contract for
