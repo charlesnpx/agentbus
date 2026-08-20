@@ -46,9 +46,7 @@ type ErrorObject struct {
 // ErrorData carries the stable protocol error identifier and optional context.
 type ErrorData struct {
 	Code                  string `json:"code"`
-	SessionID             string `json:"sessionId,omitempty"`
 	JobID                 string `json:"jobId,omitempty"`
-	Backend               string `json:"backend,omitempty"`
 	ServerProtocolVersion int    `json:"serverProtocolVersion,omitempty"`
 }
 

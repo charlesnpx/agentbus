@@ -115,7 +115,7 @@ func clientTestSkipOrFailBindDenied(t *testing.T, context string, detail any) {
 func TestClientHelloParsesBackendMetadata(t *testing.T) {
 	hello := runClientHello(t, `{"protocolVersion":3,"backends":[{"backend":"codex","models":["gpt-5"],"efforts":["high"]}]}`)
 
-	if hello.ProtocolVersion != protocol.Version3 {
+	if hello.ProtocolVersion != protocol.Version {
 		t.Fatalf("hello = %+v", hello)
 	}
 	if len(hello.BackendMetadata) != 1 {
@@ -382,7 +382,7 @@ func TestJobGetVersionMismatchRPCErrorIsTyped(t *testing.T) {
 		Message: "protocol version mismatch",
 		Data: protocol.ErrorData{
 			Code:                  protocol.ErrorVersionMismatch,
-			ServerProtocolVersion: protocol.Version3 + 1,
+			ServerProtocolVersion: protocol.Version + 1,
 		},
 	}})
 
@@ -398,8 +398,8 @@ func TestJobGetVersionMismatchRPCErrorIsTyped(t *testing.T) {
 	if !errors.As(err, &mismatch) {
 		t.Fatalf("JobGet error = %T %v, want *ProtocolVersionMismatchError", err, err)
 	}
-	if mismatch.Expected != protocol.Version3 || mismatch.Received != protocol.Version3+1 {
-		t.Fatalf("version mismatch = %#v, want expected %d received %d", mismatch, protocol.Version3, protocol.Version3+1)
+	if mismatch.Expected != protocol.Version || mismatch.Received != protocol.Version+1 {
+		t.Fatalf("version mismatch = %#v, want expected %d received %d", mismatch, protocol.Version, protocol.Version+1)
 	}
 	var rpcErr *RPCError
 	if !errors.As(err, &rpcErr) {
@@ -653,7 +653,7 @@ func TestAutostartRaceStartsOneDaemon(t *testing.T) {
 	}
 	close(clients)
 	for c := range clients {
-		if c.HelloResult().ProtocolVersion != protocol.Version3 {
+		if c.HelloResult().ProtocolVersion != protocol.Version {
 			t.Fatalf("hello = %+v", c.HelloResult())
 		}
 		_ = c.Close()
@@ -806,7 +806,7 @@ func testConnectHelloTransportFailureAutostartsReplacement(t *testing.T, token s
 	if got := starts.Load(); got != 1 {
 		t.Fatalf("starts = %d, want 1", got)
 	}
-	if client.HelloResult().ProtocolVersion != protocol.Version3 {
+	if client.HelloResult().ProtocolVersion != protocol.Version {
 		t.Fatalf("hello = %+v", client.HelloResult())
 	}
 }
@@ -1316,16 +1316,16 @@ func serveClientTestConn(conn net.Conn, token string) {
 				resp.Error = protocol.NewError(protocol.ErrorUnauthorized, "unauthorized", protocol.ErrorData{})
 				break
 			}
-			if params.ClientProtocolVersion != protocol.Version3 {
+			if params.ClientProtocolVersion != protocol.Version {
 				resp.Error = protocol.NewError(
 					protocol.ErrorVersionMismatch,
 					"protocol version mismatch",
-					protocol.ErrorData{ServerProtocolVersion: protocol.Version3},
+					protocol.ErrorData{ServerProtocolVersion: protocol.Version},
 				)
 				break
 			}
 			resp.Result = protocol.HelloResult{
-				ProtocolVersion: protocol.Version3,
+				ProtocolVersion: protocol.Version,
 			}
 		default:
 			resp.Error = protocol.NewError(protocol.ErrorMethodNotFound, "method not found", protocol.ErrorData{})

@@ -125,7 +125,7 @@ func (a *app) run(ctx context.Context, args []string, _ io.Reader, out, errOut i
 
 func (a *app) runVersion(args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("version", errOut)
-	jsonOut := fs.Bool("json", false, fmt.Sprintf("emit JSON: {\"schema\":%d,\"version\":\"...\",\"protocolVersion\":%d}", cliJSONSchema, protocol.Version3))
+	jsonOut := fs.Bool("json", false, fmt.Sprintf("emit JSON: {\"schema\":%d,\"version\":\"...\",\"protocolVersion\":%d}", cliJSONSchema, protocol.Version))
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
@@ -133,9 +133,9 @@ func (a *app) runVersion(args []string, out, errOut io.Writer) int {
 		return usageError(errOut, "version does not accept positional arguments")
 	}
 	if *jsonOut {
-		return writeOrError(out, errOut, versionOutput{Schema: cliJSONSchema, Version: a.version, ProtocolVersion: protocol.Version3})
+		return writeOrError(out, errOut, versionOutput{Schema: cliJSONSchema, Version: a.version, ProtocolVersion: protocol.Version})
 	}
-	fmt.Fprintf(out, "agentbus %s protocol %d\n", a.version, protocol.Version3)
+	fmt.Fprintf(out, "agentbus %s protocol %d\n", a.version, protocol.Version)
 	return 0
 }
 

@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	// Version3 is the protocol major version served by the simplified daemon.
-	Version3 = 3
+	// Version is the protocol major version served by the simplified daemon.
+	Version = 3
 
 	// MethodJobGet retrieves one job, or all jobs when jobId is empty.
 	MethodJobGet = "job.get"

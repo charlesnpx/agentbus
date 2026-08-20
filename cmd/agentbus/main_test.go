@@ -35,7 +35,7 @@ func TestVersionReportsBothVersions(t *testing.T) {
 	}
 	var got versionOutput
 	decodeJSON(t, stdout, &got)
-	if got.Version != "test" || got.Schema != cliJSONSchema || got.ProtocolVersion != protocol.Version3 {
+	if got.Version != "test" || got.Schema != cliJSONSchema || got.ProtocolVersion != protocol.Version {
 		t.Fatalf("version output = %+v", got)
 	}
 }
