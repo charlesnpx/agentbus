@@ -290,3 +290,10 @@ func TestAccountFlaggedForAbuseStaysBackendError(t *testing.T) {
 		t.Fatalf("failure class = %q, want %q", got, protocol.FailureClassBackendError)
 	}
 }
+
+func TestPreSpawnFilesystemFailureStaysBackendError(t *testing.T) {
+	err := &os.PathError{Op: "open", Path: "/missing/job.stderr", Err: os.ErrNotExist}
+	if got := classifyExecutionFailure(err); got != protocol.FailureClassBackendError {
+		t.Fatalf("failure class = %q, want %q", got, protocol.FailureClassBackendError)
+	}
+}

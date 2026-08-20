@@ -621,3 +621,32 @@ func TestExecutionFailureAfterRecordedClaimPreservesUncertainCleanup(t *testing.
 		t.Fatalf("post-launch terminal record = %+v, want failed backend_error with uncertain cleanup and recorded claim", got)
 	}
 }
+
+func TestExecutionFailureWithoutRecordedClaimPreservesUncertainCleanup(t *testing.T) {
+	backend := &executionFakeBackend{name: "uncertain-without-claim"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, _ engine.TurnInput) (<-chan engine.Event, error) {
+				return executionEvents(
+					engine.Event{Type: engine.EventTerminalError, Err: errors.New("backend turn failed before process claim")},
+					engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{CleanupFailed: true}},
+				), nil
+			},
+		}, nil
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "uncertain without claim", nil)
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassBackendError || got.Cleanup != protocol.CleanupUncertain || got.ProcessClaim != nil {
+		t.Fatalf("no-claim terminal record = %+v, want failed backend_error with uncertain cleanup and no process claim", got)
+	}
+}

@@ -56,7 +56,13 @@ func classifyBackendFailureText(err error) protocol.FailureClass {
 	if err == nil {
 		return protocol.FailureClassBackendError
 	}
-	if backendProcessUnavailable(err) {
+	var execErr *exec.Error
+	if errors.As(err, &execErr) && errors.Is(execErr.Err, exec.ErrNotFound) {
+		return protocol.FailureClassBackendUnavailable
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) && pathErr.Op == "fork/exec" &&
+		(errors.Is(pathErr.Err, fs.ErrNotExist) || errors.Is(pathErr.Err, fs.ErrPermission)) {
 		return protocol.FailureClassBackendUnavailable
 	}
 	text := strings.ToLower(err.Error())
@@ -68,17 +74,4 @@ func classifyBackendFailureText(err error) protocol.FailureClass {
 		}
 	}
 	return protocol.FailureClassBackendError
-}
-
-// backendProcessUnavailable identifies the typed errors exec returns when the
-// configured binary is absent from PATH, missing at an explicit path, or is not
-// executable. These happen before a provider process exists.
-func backendProcessUnavailable(err error) bool {
-	var execErr *exec.Error
-	if errors.As(err, &execErr) && errors.Is(execErr.Err, exec.ErrNotFound) {
-		return true
-	}
-	var pathErr *os.PathError
-	return errors.As(err, &pathErr) &&
-		(errors.Is(pathErr.Err, fs.ErrNotExist) || errors.Is(pathErr.Err, fs.ErrPermission))
 }
