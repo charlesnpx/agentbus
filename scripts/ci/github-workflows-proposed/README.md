@@ -4,7 +4,7 @@ These workflow files are staged here for review and manual installation. After e
 
 ## Workflows
 
-- `test.yml`: PR/push default gate. Runs `scripts/ci/solo-battery.sh` with the race option enabled, so the same committed script performs gofmt, build, vet, strict-tag vet, test sweep, full test pass, full `go test -race ./...`, and Linux amd64/arm64 cross-builds.
+- `test.yml`: PR/push default gate. Runs `scripts/ci/solo-battery.sh` with the race option enabled, so the same committed script performs gofmt, build, vet, `go test ./...`, full `go test -race ./...`, Linux amd64/arm64 cross-builds, and Windows/Darwin embedded-engine cross-builds.
 - `vuln.yml`: Go vulnerability scan. Runs `scripts/ci/vuln.sh`, which installs `govulncheck` at the pinned version from the workflow env and scans `./...`.
 
 All workflow actions are pinned to full commit SHAs, and all Go lanes pin `GO_VERSION` to `1.26.0`.

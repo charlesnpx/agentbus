@@ -755,15 +755,16 @@ func cleanupAfterContextStop(run *activeExecution, contextErr error) (protocol.C
 }
 
 func cleanupForRun(run *activeExecution, cleanup protocol.Cleanup, diagnostics []string) (protocol.Cleanup, []string) {
-	attempted, recorded, claimErr := run.claimStatus()
+	_, recorded, claimErr := run.claimStatus()
 	if claimErr != nil {
 		cleanup = protocol.CleanupUncertain
 		diagnostics = append(diagnostics, "process claim: "+claimErr.Error())
 		return cleanup, diagnostics
 	}
-	if !attempted || !recorded {
-		cleanup = protocol.CleanupUncertain
-		diagnostics = append(diagnostics, "process claim was not recorded")
+	if !recorded {
+		// A durable claim is the service's evidence that a process group exists.
+		// Without one, a failed turn has no group whose cleanup can be uncertain.
+		return protocol.CleanupClean, diagnostics
 	}
 	return cleanup, diagnostics
 }
