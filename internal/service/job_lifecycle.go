@@ -436,6 +436,9 @@ func (s *Server) processGroupGone(pgid int) (bool, error) {
 	if pgid <= 0 {
 		return false, errors.New("process group id is invalid")
 	}
+	if s != nil && s.processGroupGoneFn != nil {
+		return s.processGroupGoneFn(pgid)
+	}
 	err := syscall.Kill(-pgid, 0)
 	if err == nil {
 		return false, nil

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -393,48 +394,63 @@ func TestRestartPreservesUnknownTerminalRecordBytes(t *testing.T) {
 }
 
 func TestOrphanReaperSignalsExactTokenMatch(t *testing.T) {
-	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "reaper-exact"}}})
-	server.processGroupGrace = 500 * time.Millisecond
-	cmd, claim := startReaperProcess(t)
-	waitDone := make(chan error, 1)
-	go func() {
-		waitDone <- cmd.Wait()
-		close(waitDone)
-	}()
-	defer func() {
-		_ = syscall.Kill(-claim.PGID, syscall.SIGKILL)
-		select {
-		case <-waitDone:
-		case <-time.After(time.Second):
-		}
-	}()
-	record := persistRunningClaim(t, server, "reaper-exact", claim)
-	store, err := server.ensureJobStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := server.reconcileRecoveredJobs(store); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-waitDone; err != nil {
-		if _, ok := err.(*exec.ExitError); !ok {
-			t.Fatalf("reaped process wait = %v", err)
-		}
-	}
-	stored, err := store.Get(record.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored.State != protocol.PublicStateUnknown || stored.Cleanup != protocol.CleanupClean {
-		t.Fatalf("exact-token reaped record = %#v", stored)
+	for _, tt := range []struct {
+		name              string
+		secondLookupToken string
+		wantCleanup       protocol.Cleanup
+		wantEvents        []string
+	}{
+		{
+			name:        "matching token signals in order",
+			wantCleanup: protocol.CleanupClean,
+			wantEvents:  []string{"lookup", "group-present", "lookup", "TERM", "group-gone"},
+		},
+		{
+			name:              "changed second token does not signal",
+			secondLookupToken: "recycled-pid-token",
+			wantCleanup:       protocol.CleanupUncertain,
+			wantEvents:        []string{"lookup", "group-present", "lookup"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "reaper-exact"}}})
+			fixture := newOrphanReaperFixture()
+			if tt.secondLookupToken != "" {
+				fixture.lookupTokens = []string{fixture.startToken, tt.secondLookupToken}
+			}
+			server.processTable = fixture
+			server.processGroups = fixture
+			server.processGroupGoneFn = fixture.processGroupGone
+			claim := fixture.claim()
+			record := persistRunningClaim(t, server, "reaper-exact", claim)
+			store, err := server.ensureJobStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := server.reconcileRecoveredJobs(store); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := store.Get(record.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.State != protocol.PublicStateUnknown || stored.Cleanup != tt.wantCleanup {
+				t.Fatalf("exact-token reaped record = %#v, want cleanup %s", stored, tt.wantCleanup)
+			}
+			if !slices.Equal(fixture.events, tt.wantEvents) {
+				t.Fatalf("exact-token events = %#v, want %#v", fixture.events, tt.wantEvents)
+			}
+		})
 	}
 }
 
 func TestOrphanReaperDoesNotSignalTokenMismatch(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "reaper-mismatch"}}})
-	server.processGroupGrace = 100 * time.Millisecond
-	cmd, claim := startReaperProcess(t)
-	defer stopReaperProcess(cmd, claim.PGID)
+	fixture := newOrphanReaperFixture()
+	server.processTable = fixture
+	server.processGroups = fixture
+	server.processGroupGoneFn = fixture.processGroupGone
+	claim := fixture.claim()
 	claim.StartToken = "recycled-pid-token"
 	record := persistRunningClaim(t, server, "reaper-mismatch", claim)
 	store, err := server.ensureJobStore()
@@ -444,8 +460,8 @@ func TestOrphanReaperDoesNotSignalTokenMismatch(t *testing.T) {
 	if err := server.reconcileRecoveredJobs(store); err != nil {
 		t.Fatal(err)
 	}
-	if _, alive, err := (engine.NativeProcessTable{}).Lookup(claim.PID); err != nil || !alive {
-		t.Fatalf("mismatched-token target = alive:%t err:%v, want process to survive", alive, err)
+	if fixture.lookups != 1 || len(fixture.signals) != 0 || len(fixture.groupGone) != 0 {
+		t.Fatalf("mismatched-token fixture activity = lookups:%d signals:%#v group-gone:%#v, want one lookup and no group action", fixture.lookups, fixture.signals, fixture.groupGone)
 	}
 	stored, err := store.Get(record.JobID)
 	if err != nil {
@@ -454,6 +470,83 @@ func TestOrphanReaperDoesNotSignalTokenMismatch(t *testing.T) {
 	if stored.State != protocol.PublicStateUnknown || stored.Cleanup != protocol.CleanupUncertain {
 		t.Fatalf("mismatched-token reaped record = %#v", stored)
 	}
+	if len(stored.Diagnostics) != 2 || stored.Diagnostics[1] != "orphan reaper: leader start token mismatch; no signal sent" {
+		t.Fatalf("mismatched-token diagnostics = %#v", stored.Diagnostics)
+	}
+}
+
+type processGroupSignalCall struct {
+	pgid   int
+	signal syscall.Signal
+}
+
+type orphanReaperFixture struct {
+	pid        int
+	pgid       int
+	startToken string
+	groupLive  bool
+
+	lookupTokens []string
+	lookupIndex  int
+	events       []string
+
+	lookups   int
+	signals   []processGroupSignalCall
+	groupGone []bool
+}
+
+func newOrphanReaperFixture() *orphanReaperFixture {
+	return &orphanReaperFixture{
+		pid:        4101,
+		pgid:       4101,
+		startToken: "exact-token",
+		groupLive:  true,
+	}
+}
+
+func (f *orphanReaperFixture) claim() jobstore.ProcessClaim {
+	return jobstore.ProcessClaim{PID: f.pid, PGID: f.pgid, StartToken: f.startToken}
+}
+
+func (f *orphanReaperFixture) Lookup(pid int) (engine.ProcessInfo, bool, error) {
+	f.events = append(f.events, "lookup")
+	f.lookups++
+	if pid != f.pid {
+		return engine.ProcessInfo{}, false, nil
+	}
+	startToken := f.startToken
+	if f.lookupIndex < len(f.lookupTokens) {
+		startToken = f.lookupTokens[f.lookupIndex]
+	}
+	f.lookupIndex++
+	return engine.ProcessInfo{PID: f.pid, StartTime: startToken}, true, nil
+}
+
+func (f *orphanReaperFixture) SignalProcessGroup(pgid int, signal syscall.Signal) error {
+	f.signals = append(f.signals, processGroupSignalCall{pgid: pgid, signal: signal})
+	if pgid != f.pgid {
+		return errors.New("unexpected process group")
+	}
+	if signal != syscall.SIGTERM {
+		return errors.New("unexpected process-group signal")
+	}
+	f.events = append(f.events, "TERM")
+	f.groupLive = false
+	return nil
+}
+
+func (f *orphanReaperFixture) processGroupGone(pgid int) (bool, error) {
+	if pgid != f.pgid {
+		return false, errors.New("unexpected process group")
+	}
+	seenGone := !f.groupLive
+	f.groupGone = append(f.groupGone, seenGone)
+	if seenGone {
+		f.events = append(f.events, "group-gone")
+	} else {
+		f.events = append(f.events, "group-present")
+	}
+	return seenGone, nil
 }
 
 func rawJobRecord(t *testing.T, root, jobID string) []byte {
@@ -493,11 +586,6 @@ func persistRunningClaim(t *testing.T, server *Server, backend string, claim job
 	return record
 }
 
-func startReaperProcess(t *testing.T) (*exec.Cmd, jobstore.ProcessClaim) {
-	t.Helper()
-	return startProcessGroup(t, "sleep", "30")
-}
-
 func startProcessGroup(t *testing.T, argv ...string) (*exec.Cmd, jobstore.ProcessClaim) {
 	t.Helper()
 	cmd := exec.Command(argv[0], argv[1:]...)
@@ -528,14 +616,5 @@ func stopWaitedProcessGroup(pgid int, waitDone <-chan error) {
 	select {
 	case <-waitDone:
 	case <-time.After(time.Second):
-	}
-}
-
-func stopReaperProcess(cmd *exec.Cmd, pgid int) {
-	if pgid > 0 {
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-	}
-	if cmd != nil {
-		_ = cmd.Wait()
 	}
 }

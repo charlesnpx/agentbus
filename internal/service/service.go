@@ -141,14 +141,16 @@ type Server struct {
 	jobStoreMu sync.Mutex
 	jobStore   *jobstore.Store
 
-	// processTable and processGroups are the service's restart-recovery
+	// processTable, processGroups, and processGroupGoneFn are the service's restart-recovery
 	// dependencies. They deliberately live here instead of in jobstore: the
 	// store owns durable records, while service owns the only process action
 	// taken from a recovered claim. Tests replace them with deterministic
-	// fakes; production uses the native implementations below.
-	processTable      engine.ProcessTable
-	processGroups     engine.ProcessGroupSignaler
-	processGroupGrace time.Duration
+	// fakes; production uses the native process implementations and leaves
+	// processGroupGoneFn nil for its syscall probe.
+	processTable       engine.ProcessTable
+	processGroups      engine.ProcessGroupSignaler
+	processGroupGoneFn func(int) (bool, error)
+	processGroupGrace  time.Duration
 
 	executionMu     sync.Mutex
 	executionCtx    context.Context
