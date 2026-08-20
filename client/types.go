@@ -18,7 +18,6 @@ type JobCancelResult = protocol.JobCancelResult
 type JobGetParams = protocol.JobGetParams
 type JobGetResult = protocol.JobRecordWire
 type JobGetListResult = protocol.JobGetListResult
-type JobRecordWire = protocol.JobRecordWire
 type JobSummaryWire = protocol.JobSummaryWire
 type PublicState = protocol.PublicState
 type FailureClass = protocol.FailureClass

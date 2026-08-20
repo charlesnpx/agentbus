@@ -348,6 +348,20 @@ func TestJobGetReflectWalksEverySummaryField(t *testing.T) {
 	assertReflectDecoded(t, reflect.ValueOf(want), reflect.ValueOf(got.Jobs[0]), "job.get summary")
 }
 
+func TestJobGetRejectsEmptyJobIDBeforeSending(t *testing.T) {
+	client, requests, _ := newOneShotClient(t, protocol.Response{Result: JobGetListResult{}})
+
+	_, err := client.JobGet(context.Background(), JobGetParams{})
+	if err == nil {
+		t.Fatal("JobGet succeeded with an empty job ID")
+	}
+	select {
+	case request := <-requests:
+		t.Fatalf("JobGet sent request with an empty job ID: %#v", request)
+	default:
+	}
+}
+
 func TestJobGetReturnsTypedRPCError(t *testing.T) {
 	const jsonRPCCode = -32017
 	client, _, done := newOneShotClient(t, protocol.Response{Error: &protocol.ErrorObject{
@@ -372,6 +386,44 @@ func TestJobGetReturnsTypedRPCError(t *testing.T) {
 	}
 	if got, want := FailureClass(rpcErr.Object.Data.Code), protocol.FailureClassBackendUnavailable; got != want {
 		t.Fatalf("failure class = %q, want %q", got, want)
+	}
+}
+
+func TestJobGetVersionMismatchRPCErrorIsTyped(t *testing.T) {
+	const jsonRPCCode = -32018
+	client, _, done := newOneShotClient(t, protocol.Response{Error: &protocol.ErrorObject{
+		Code:    jsonRPCCode,
+		Message: "protocol version mismatch",
+		Data: protocol.ErrorData{
+			Code:                  protocol.ErrorVersionMismatch,
+			ServerProtocolVersion: protocol.Version + 1,
+		},
+	}})
+
+	_, err := client.JobGet(context.Background(), JobGetParams{JobID: "job-version-mismatch"})
+	if err == nil {
+		t.Fatal("JobGet succeeded, want protocol version mismatch")
+	}
+	assertOneShotClientDone(t, done)
+	if !errors.Is(err, ErrProtocolVersionMismatch) {
+		t.Fatalf("JobGet error = %v, want ErrProtocolVersionMismatch", err)
+	}
+	var mismatch *ProtocolVersionMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("JobGet error = %T %v, want *ProtocolVersionMismatchError", err, err)
+	}
+	if mismatch.Expected != protocol.Version || mismatch.Received != protocol.Version+1 {
+		t.Fatalf("version mismatch = %#v, want expected %d received %d", mismatch, protocol.Version, protocol.Version+1)
+	}
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("JobGet error = %T %v, want wrapped *RPCError", err, err)
+	}
+	if !errors.Is(err, rpcErr) {
+		t.Fatalf("JobGet error = %v, want errors.Is through wrapped RPC error", err)
+	}
+	if rpcErr.Object.Code != jsonRPCCode || rpcErr.Object.Data.Code != protocol.ErrorVersionMismatch {
+		t.Fatalf("wrapped RPC error = %#v, want JSON-RPC code %d and stable code %q", rpcErr, jsonRPCCode, protocol.ErrorVersionMismatch)
 	}
 }
 
