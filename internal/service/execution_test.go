@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/jobstore"
@@ -533,8 +534,26 @@ func TestExecutionSpillsLargeTerminalResultWithDigestAndElision(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256([]byte(text))
-	if got.State != protocol.PublicStateCompleted || got.ResultText != "" || len(spilled) != len(text) || hex.EncodeToString(sum[:]) != hex.EncodeToString(sha256Sum(spilled)) {
+	wantSHA256 := hex.EncodeToString(sum[:])
+	if got.State != protocol.PublicStateCompleted || got.ResultText != "" || got.ResultPath != got.Artifacts.Result || got.ResultSHA256 != wantSHA256 || got.ResultBytes != int64(len(text)) || len(spilled) != len(text) || wantSHA256 != hex.EncodeToString(sha256Sum(spilled)) {
 		t.Fatalf("spilled terminal = state=%s inline=%d bytes=%d, want complete elided matching result", got.State, len(got.ResultText), len(spilled))
+	}
+	now := time.Now().UTC()
+	if err := os.Chtimes(got.ResultPath, now.Add(-15*24*time.Hour), now.Add(-15*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SweepArtifacts(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(got.ResultPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("spilled result %q remains after sweep: %v", got.ResultPath, err)
+	}
+	got, err = store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ResultPath != record.Artifacts.Result || got.ResultSHA256 != wantSHA256 || got.ResultBytes != int64(len(text)) {
+		t.Fatalf("terminal result metadata after sweep = path:%q sha256:%q bytes:%d, want path:%q sha256:%q bytes:%d", got.ResultPath, got.ResultSHA256, got.ResultBytes, record.Artifacts.Result, wantSHA256, len(text))
 	}
 }
 

@@ -641,12 +641,15 @@ func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstor
 		resultText = ""
 	}
 	s.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
-		State:       protocol.PublicStateCompleted,
-		Cleanup:     cleanup,
-		Diagnostics: diagnostics,
-		Contract:    contract,
-		ResultText:  resultText,
-		FinishedAt:  time.Now().UTC(),
+		State:        protocol.PublicStateCompleted,
+		Cleanup:      cleanup,
+		Diagnostics:  diagnostics,
+		Contract:     contract,
+		ResultText:   resultText,
+		ResultPath:   info.ResultPath,
+		ResultSHA256: info.SHA256,
+		ResultBytes:  info.Bytes,
+		FinishedAt:   time.Now().UTC(),
 	})
 }
 
