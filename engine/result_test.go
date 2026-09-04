@@ -1,11 +1,11 @@
 package engine
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -62,6 +62,7 @@ func TestResultPathsStayInNamespace(t *testing.T) {
 
 func TestCappedLogWriter(t *testing.T) {
 	t.Parallel()
+	const defaultCap = 64 * 1024 * 1024
 	path := filepath.Join(t.TempDir(), "log.txt")
 	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
@@ -69,32 +70,35 @@ func TestCappedLogWriter(t *testing.T) {
 	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	capBytes := int64(len(truncationMarker()) + 5)
-	w, err := NewCappedLogWriter(path, capBytes)
+	w, err := NewCappedLogWriter(path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n, err := w.Write([]byte("abcdefghi")); err != nil || n != 9 {
-		t.Fatalf("Write n=%d err=%v", n, err)
+	chunk := bytes.Repeat([]byte("x"), 1024*1024)
+	for range 65 {
+		if n, err := w.Write(chunk); err != nil || n != len(chunk) {
+			t.Fatalf("Write n=%d err=%v", n, err)
+		}
 	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if int64(len(b)) > capBytes {
-		t.Fatalf("log size = %d, want <= %d", len(b), capBytes)
-	}
-	if got := string(b); !strings.HasPrefix(got, "abcde") || !strings.Contains(got, "[agentbus: log truncated]") {
-		t.Fatalf("log contents = %q", got)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got := info.Size(); got != defaultCap {
+		t.Fatalf("default-capped log size = %d, want %d", got, defaultCap)
+	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("log mode = %o, want 600", got)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte(TruncationMarker())
+	if !bytes.HasSuffix(contents, marker) || bytes.Count(contents, marker) != 1 {
+		t.Fatal("default-capped log does not end with exactly one truncation marker")
 	}
 }

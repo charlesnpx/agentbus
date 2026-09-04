@@ -235,8 +235,11 @@ type ResultInfoWire struct {
 	Bytes      int64  `json:"bytes"`
 }
 
-// LogPathsWire identifies captured backend log files.
+// LogPathsWire identifies captured backend log files and whether each captured
+// file ended at the capped-log truncation marker.
 type LogPathsWire struct {
-	Stdout string `json:"stdout,omitempty"`
-	Stderr string `json:"stderr,omitempty"`
+	Stdout          string `json:"stdout,omitempty"`
+	StdoutTruncated *bool  `json:"stdoutTruncated,omitempty"`
+	Stderr          string `json:"stderr,omitempty"`
+	StderrTruncated *bool  `json:"stderrTruncated,omitempty"`
 }

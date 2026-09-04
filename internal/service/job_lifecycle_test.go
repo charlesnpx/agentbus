@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"sync/atomic"
 	"syscall"
@@ -163,6 +165,53 @@ func TestJobGetStoreReadFailureIsBackendUnavailable(t *testing.T) {
 	outcome := restarted.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: submitted.JobID}))
 	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorBackendUnavailable {
 		t.Fatalf("job.get store-read error = %#v, want backend-unavailable error", outcome.err)
+	}
+}
+
+func TestProjectLogPathsReportsTruncation(t *testing.T) {
+	logs := t.TempDir()
+	record := jobstore.Record{
+		JobID: "job_log_projection",
+		Artifacts: jobstore.ArtifactPaths{
+			Log: filepath.Join(logs, "job_log_projection.log"),
+		},
+	}
+	paths, err := engine.LogPathsForLayout(engine.WorkspaceLayout{Logs: logs}, record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.Stdout, []byte("backend stream"+engine.TruncationMarker()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.Stderr, []byte("backend stream completed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	wire := projectLogPaths(record)
+	if wire == nil {
+		t.Fatal("projectLogPaths returned nil")
+	}
+	if wire.Stdout != paths.Stdout || wire.Stderr != paths.Stderr {
+		t.Fatalf("log paths = %#v, want stdout %q and stderr %q", wire, paths.Stdout, paths.Stderr)
+	}
+	if wire.StdoutTruncated == nil || !*wire.StdoutTruncated {
+		t.Fatalf("stdout truncated = %v, want true", wire.StdoutTruncated)
+	}
+	if wire.StderrTruncated == nil || *wire.StderrTruncated {
+		t.Fatalf("stderr truncated = %v, want false", wire.StderrTruncated)
+	}
+
+	t.Cleanup(func() { _ = os.Chmod(paths.Stdout, 0o600) })
+	if err := os.Chmod(paths.Stdout, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if file, err := os.Open(paths.Stdout); err == nil {
+		_ = file.Close()
+		t.Fatal("stdout log remained readable after removing permissions")
+	}
+	wire = projectLogPaths(record)
+	if wire == nil || wire.StdoutTruncated != nil {
+		t.Fatalf("unreadable stdout projection = %#v, want nil truncation state", wire)
 	}
 }
 

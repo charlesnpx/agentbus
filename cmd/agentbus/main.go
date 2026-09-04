@@ -462,8 +462,21 @@ func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
 	}
 	if record.LogPaths != nil {
 		fmt.Fprintf(out, " logPaths.stdout=%s logPaths.stderr=%s", record.LogPaths.Stdout, record.LogPaths.Stderr)
+		printLogPathTruncationStatus(out, "stdout", record.LogPaths.Stdout, record.LogPaths.StdoutTruncated)
+		printLogPathTruncationStatus(out, "stderr", record.LogPaths.Stderr, record.LogPaths.StderrTruncated)
 	}
 	fmt.Fprintln(out)
+}
+
+func printLogPathTruncationStatus(out io.Writer, stream, path string, truncated *bool) {
+	if path == "" || (truncated != nil && !*truncated) {
+		return
+	}
+	if truncated == nil {
+		fmt.Fprintf(out, " logPaths.%s.truncation=unknown", stream)
+		return
+	}
+	fmt.Fprintf(out, " logPaths.%s.truncation=truncated", stream)
 }
 
 func printJobRecordResult(out, errOut io.Writer, record agentclient.JobGetResult) int {
