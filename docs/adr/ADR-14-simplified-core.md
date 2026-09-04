@@ -143,7 +143,9 @@ job.get with a jobId returns this full JobRecord:
       "cleanup": "clean|uncertain",
       "logPaths": {
         "stdout": "string",
-        "stderr": "string"
+        "stdoutTruncated": false,
+        "stderr": "string",
+        "stderrTruncated": false
       }
     }
 
@@ -158,6 +160,11 @@ authoritative path with its digest and byte count. A present failure has class
 and reason and exists only for failed jobs. contract exists only when
 outputSchema was submitted. ContractResult is exactly the object named contract;
 schemaSha256 exists only when a schema was submitted.
+
+For each present log path, its paired `stdoutTruncated` or `stderrTruncated`
+boolean is true only when the file ends in the capped-log marker (and is
+explicitly false for an untruncated file); default backend logs are bounded at
+64 MiB.
 
 job.get with an empty object returns compact summaries:
 

@@ -11,6 +11,10 @@ import (
 const (
 	DefaultInlineResultCap = 256 * 1024
 	DefaultEventTextCap    = 64 * 1024
+	// A measured Codex app-server stream writes 163 KB/min; over the four-hour
+	// maximum timeout that is about 39 MB, so 64 MiB leaves headroom while
+	// retaining a bounded log.
+	defaultCappedLogCapBytes int64 = 64 * 1024 * 1024
 )
 
 // EventText is text prepared for a streaming event.
@@ -152,7 +156,7 @@ func capEventMetadataString(s string, capBytes int) string {
 // NewCappedLogWriter opens a protocol-mode capped log file.
 func NewCappedLogWriter(path string, capBytes int64) (*CappedLogWriter, error) {
 	if capBytes <= 0 {
-		capBytes = 10 * 1024 * 1024
+		capBytes = defaultCappedLogCapBytes
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -181,7 +185,7 @@ func (w *CappedLogWriter) Write(p []byte) (int, error) {
 	if w.truncated {
 		return len(p), nil
 	}
-	marker := truncationMarker()
+	marker := TruncationMarker()
 	payloadCap := w.cap - int64(len(marker))
 	if payloadCap < 0 {
 		payloadCap = 0
@@ -222,7 +226,7 @@ func (w *CappedLogWriter) markTruncated() error {
 	if w.truncated {
 		return nil
 	}
-	marker := truncationMarker()
+	marker := TruncationMarker()
 	if int64(len(marker)) > w.cap {
 		marker = marker[:int(w.cap)]
 	}
@@ -231,6 +235,7 @@ func (w *CappedLogWriter) markTruncated() error {
 	return err
 }
 
-func truncationMarker() string {
+// TruncationMarker is appended once when a capped log reaches its limit.
+func TruncationMarker() string {
 	return "\n[agentbus: log truncated]\n"
 }

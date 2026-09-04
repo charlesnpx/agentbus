@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -238,9 +239,13 @@ func projectLogPaths(record jobstore.Record) *protocol.LogPathsWire {
 	wire := &protocol.LogPathsWire{}
 	if stdoutExists {
 		wire.Stdout = paths.Stdout
+		truncated := logEndsWithTruncationMarker(paths.Stdout)
+		wire.StdoutTruncated = &truncated
 	}
 	if stderrExists {
 		wire.Stderr = paths.Stderr
+		truncated := logEndsWithTruncationMarker(paths.Stderr)
+		wire.StderrTruncated = &truncated
 	}
 	return wire
 }
@@ -248,6 +253,26 @@ func projectLogPaths(record jobstore.Record) *protocol.LogPathsWire {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// logEndsWithTruncationMarker reads only the marker-sized tail so projection
+// stays bounded even when a log reaches its maximum size.
+func logEndsWithTruncationMarker(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	marker := engine.TruncationMarker()
+	if _, err := file.Seek(-int64(len(marker)), io.SeekEnd); err != nil {
+		return false
+	}
+	tail := make([]byte, len(marker))
+	if _, err := io.ReadFull(file, tail); err != nil {
+		return false
+	}
+	return string(tail) == marker
 }
 
 // reconcileRecoveredJobs is intentionally called before the listener exists.

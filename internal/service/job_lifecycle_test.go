@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"sync/atomic"
 	"syscall"
@@ -163,6 +165,79 @@ func TestJobGetStoreReadFailureIsBackendUnavailable(t *testing.T) {
 	outcome := restarted.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: submitted.JobID}))
 	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorBackendUnavailable {
 		t.Fatalf("job.get store-read error = %#v, want backend-unavailable error", outcome.err)
+	}
+}
+
+func TestProjectLogPathsReportsTruncation(t *testing.T) {
+	tests := []struct {
+		name          string
+		stdout        bool
+		contents      []byte
+		wantTruncated bool
+		wireField     []byte
+	}{
+		{
+			name:          "truncated stdout",
+			stdout:        true,
+			contents:      []byte("backend stream" + engine.TruncationMarker()),
+			wantTruncated: true,
+			wireField:     []byte(`"stdoutTruncated":true`),
+		},
+		{
+			name:          "untruncated stderr",
+			contents:      []byte("backend stream completed\n"),
+			wantTruncated: false,
+			wireField:     []byte(`"stderrTruncated":false`),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := t.TempDir()
+			record := jobstore.Record{
+				JobID: "job_log_projection",
+				Artifacts: jobstore.ArtifactPaths{
+					Log: filepath.Join(logs, "job_log_projection.log"),
+				},
+			}
+			paths, err := engine.LogPathsForLayout(engine.WorkspaceLayout{Logs: logs}, record.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := paths.Stderr
+			if tt.stdout {
+				path = paths.Stdout
+			}
+			if err := os.WriteFile(path, tt.contents, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			wire := projectLogPaths(record)
+			if wire == nil {
+				t.Fatal("projectLogPaths returned nil")
+			}
+			var truncated *bool
+			if tt.stdout {
+				if wire.Stdout != path {
+					t.Fatalf("stdout path = %q, want %q", wire.Stdout, path)
+				}
+				truncated = wire.StdoutTruncated
+			} else {
+				if wire.Stderr != path {
+					t.Fatalf("stderr path = %q, want %q", wire.Stderr, path)
+				}
+				truncated = wire.StderrTruncated
+			}
+			if truncated == nil || *truncated != tt.wantTruncated {
+				t.Fatalf("truncated = %v, want %t", truncated, tt.wantTruncated)
+			}
+			encoded, err := json.Marshal(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(encoded, tt.wireField) {
+				t.Fatalf("log paths JSON = %s, want %s", encoded, tt.wireField)
+			}
+		})
 	}
 }
 
