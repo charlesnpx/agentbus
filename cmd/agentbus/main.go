@@ -50,7 +50,7 @@ type app struct {
 
 type protocolClient interface {
 	JobGet(context.Context, agentclient.JobGetParams) (agentclient.JobGetResult, error)
-	JobGetList(context.Context) (agentclient.JobGetListResult, error)
+	JobList(context.Context, agentclient.JobListParams) (agentclient.JobListResult, error)
 	JobCancel(context.Context, agentclient.JobCancelParams) (agentclient.JobCancelResult, error)
 	Close() error
 }
@@ -287,13 +287,35 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 
 func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Writer) int {
 	fs := newCommandFlagSet("status", errOut)
-	jsonOut := fs.Bool("json", false, "emit the v3 job.get response")
+	jsonOut := fs.Bool("json", false, "emit the protocol response")
 	jobID := fs.String("job", "", "job id")
+	allWorkspaces := fs.Bool("all-workspaces", false, "list jobs from every workspace")
+	var tagValues []string
+	fs.Func("tag", "filter list by key=value (repeatable)", func(value string) error {
+		tagValues = append(tagValues, value)
+		return nil
+	})
+	var stateValues []string
+	fs.Func("state", "filter list by public state (repeatable)", func(value string) error {
+		stateValues = append(stateValues, value)
+		return nil
+	})
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
 	if fs.NArg() != 0 {
 		return usageError(errOut, "status does not accept positional arguments")
+	}
+	if *jobID != "" && (*allWorkspaces || len(tagValues) > 0 || len(stateValues) > 0) {
+		return usageError(errOut, "--all-workspaces, --tag, and --state apply only without --job")
+	}
+	var listParams agentclient.JobListParams
+	if *jobID == "" {
+		var err error
+		listParams, err = a.statusListParams(*allWorkspaces, tagValues, stateValues)
+		if err != nil {
+			return commandError(errOut, fmt.Errorf("status list parameters: %w", err))
+		}
 	}
 	client, err := a.connectProtocolClient(ctx)
 	if err != nil {
@@ -301,7 +323,7 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 	}
 	defer client.Close()
 	if *jobID == "" {
-		list, err := client.JobGetList(ctx)
+		list, err := client.JobList(ctx, listParams)
 		if err != nil {
 			return protocolCommandError(errOut, "status", err)
 		}
@@ -317,6 +339,10 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 				summary.CreatedAt,
 				summary.FailureClass,
 				summary.Contract,
+				summary.Tags,
+				summary.ItemCount,
+				summary.LastItemAt,
+				summary.Liveness,
 			)
 		}
 		return 0
@@ -334,6 +360,72 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 		printJobRecordStatus(out, record)
 	}
 	return cliExitCodeForRecord(record)
+}
+
+func (a *app) statusListParams(allWorkspaces bool, tagValues, stateValues []string) (agentclient.JobListParams, error) {
+	tags, err := parseTagFilters(tagValues)
+	if err != nil {
+		return agentclient.JobListParams{}, err
+	}
+	states, err := parseStateFilters(stateValues)
+	if err != nil {
+		return agentclient.JobListParams{}, err
+	}
+	params := agentclient.JobListParams{Tags: tags, States: states}
+	if allWorkspaces {
+		return params, nil
+	}
+	workspaceKey, err := currentWorkspaceKey()
+	if err != nil {
+		return agentclient.JobListParams{}, fmt.Errorf("derive current workspace key: %w", err)
+	}
+	params.WorkspaceKey = workspaceKey
+	return params, nil
+}
+
+func currentWorkspaceKey() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	canonicalCWD, err := engine.CanonicalWorkspace(cwd)
+	if err != nil {
+		return "", err
+	}
+	return engine.WorkspaceKey(canonicalCWD), nil
+}
+
+func parseTagFilters(values []string) (map[string]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	tags := make(map[string]string, len(values))
+	for _, value := range values {
+		key, tagValue, ok := strings.Cut(value, "=")
+		if !ok || key == "" {
+			return nil, fmt.Errorf("--tag requires key=value, got %q", value)
+		}
+		if _, exists := tags[key]; exists {
+			return nil, fmt.Errorf("--tag repeats key %q", key)
+		}
+		tags[key] = tagValue
+	}
+	return tags, nil
+}
+
+func parseStateFilters(values []string) ([]protocol.PublicState, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	states := make([]protocol.PublicState, 0, len(values))
+	for _, value := range values {
+		state := protocol.PublicState(value)
+		if !state.Valid() {
+			return nil, fmt.Errorf("--state requires a public state, got %q", value)
+		}
+		states = append(states, state)
+	}
+	return states, nil
 }
 
 func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Writer) int {
@@ -427,7 +519,7 @@ func (a *app) connectProtocolClient(ctx context.Context) (protocolClient, error)
 	return agentclient.Connect(ctx, opts)
 }
 
-func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, backend string, cleanup protocol.Cleanup, createdAt time.Time, failureClass protocol.FailureClass, contract *protocol.ContractVerdict) {
+func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, backend string, cleanup protocol.Cleanup, createdAt time.Time, failureClass protocol.FailureClass, contract *protocol.ContractVerdict, tags map[string]string, itemCount *int, lastItemAt *time.Time, liveness protocol.Liveness) {
 	fmt.Fprintf(out, "jobId=%s state=%s backend=%s cleanup=%s age=%s", jobID, state, backend, cleanup, jobAge(createdAt))
 	if failureClass != "" {
 		fmt.Fprintf(out, " failure.class=%s", failureClass)
@@ -435,11 +527,23 @@ func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, ba
 	if contract != nil {
 		fmt.Fprintf(out, " contract.evaluated=%t contract.compliant=%t", contract.Evaluated, contract.Compliant)
 	}
+	if len(tags) > 0 {
+		fmt.Fprintf(out, " tags=%s", formatTags(tags))
+	}
+	if itemCount != nil {
+		fmt.Fprintf(out, " itemCount=%d", *itemCount)
+	}
+	if lastItemAt != nil {
+		fmt.Fprintf(out, " lastItemAt=%s", humanTime(*lastItemAt))
+	}
+	if liveness != "" {
+		fmt.Fprintf(out, " liveness=%s", liveness)
+	}
 	fmt.Fprintln(out)
 }
 
 func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
-	printJobSummary(out, record.JobID, record.State, record.Backend, record.Cleanup, record.CreatedAt, "", nil)
+	printJobSummary(out, record.JobID, record.State, record.Backend, record.Cleanup, record.CreatedAt, "", nil, nil, nil, nil, "")
 	fmt.Fprintf(out, "createdAt=%s", humanTime(record.CreatedAt))
 	if record.StartedAt != nil {
 		fmt.Fprintf(out, " startedAt=%s", humanTime(*record.StartedAt))
@@ -722,7 +826,7 @@ func printRootHelp(out io.Writer) {
 	fmt.Fprint(out, `Usage:
   agentbus version [--json] (aliases: --version, -version, -V)
   agentbus serve [--foreground]
-  agentbus status [--job <id>] [--json]
+	  agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--all-workspaces] [--json]
   agentbus result --job <id> [--json]
   agentbus cancel --job <id> [--json]
 

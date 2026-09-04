@@ -20,45 +20,99 @@ import (
 
 const processGroupPollInterval = 10 * time.Millisecond
 
-// handleJobGet returns exactly the two protocol shapes: a bare detailed
-// record for an identified lookup, or a compact list envelope for {}.
+// handleJobGet returns a bare detailed record for an identified lookup.
 func (s *Server) handleJobGet(raw json.RawMessage) requestOutcome {
 	var params protocol.JobGetParams
 	if err := decodeStrict(raw, &params); err != nil {
+		return invalidParams(err)
+	}
+	if strings.TrimSpace(params.JobID) == "" {
+		return invalidParams(errors.New("jobId is required"))
+	}
+	store, err := s.ensureJobStore()
+	if err != nil {
+		return jobStoreUnavailable("open job store", err)
+	}
+	record, err := store.Get(params.JobID)
+	if err != nil {
+		if errors.Is(err, jobstore.ErrNotFound) {
+			return requestOutcome{err: unknownJobError(params.JobID)}
+		}
+		return jobStoreUnavailable("get job", err)
+	}
+	wire, err := jobRecordWire(record)
+	if err != nil {
+		return jobStoreUnavailable("project job record", err)
+	}
+	return requestOutcome{result: wire}
+}
+
+// handleJobList returns compact summaries after applying every supplied
+// workspace, tag, and public-state filter.
+func (s *Server) handleJobList(raw json.RawMessage) requestOutcome {
+	var params protocol.JobListParams
+	if err := decodeStrict(raw, &params); err != nil {
+		return invalidParams(err)
+	}
+	if err := validateJobListParams(params); err != nil {
 		return invalidParams(err)
 	}
 	store, err := s.ensureJobStore()
 	if err != nil {
 		return jobStoreUnavailable("open job store", err)
 	}
-	if params.JobID != "" {
-		record, err := store.Get(params.JobID)
-		if err != nil {
-			if errors.Is(err, jobstore.ErrNotFound) {
-				return requestOutcome{err: unknownJobError(params.JobID)}
-			}
-			return jobStoreUnavailable("get job", err)
-		}
-		wire, err := jobRecordWire(record)
-		if err != nil {
-			return jobStoreUnavailable("project job record", err)
-		}
-		return requestOutcome{result: wire}
-	}
-
 	records, err := store.List()
 	if err != nil {
 		return jobStoreUnavailable("list jobs", err)
 	}
 	jobs := make([]protocol.JobSummaryWire, 0, len(records))
 	for _, record := range records {
-		wire, err := jobSummaryWire(record)
+		spec, _, err := taskSpecForProjection(record)
 		if err != nil {
 			return jobStoreUnavailable("project job summary", err)
 		}
-		jobs = append(jobs, wire)
+		if !jobListMatches(record, spec, params) {
+			continue
+		}
+		jobs = append(jobs, s.jobSummaryWireFromSpec(record, spec))
 	}
-	return requestOutcome{result: protocol.JobGetListResult{Jobs: jobs}}
+	return requestOutcome{result: protocol.JobListResult{Jobs: jobs}}
+}
+
+func validateJobListParams(params protocol.JobListParams) error {
+	for _, state := range params.States {
+		if !state.Valid() {
+			return fmt.Errorf("states contains invalid public state %q", state)
+		}
+	}
+	return nil
+}
+
+func jobListMatches(record jobstore.Record, spec protocol.TaskSpec, params protocol.JobListParams) bool {
+	if params.WorkspaceKey != "" && record.WorkspaceKey != params.WorkspaceKey {
+		return false
+	}
+	if len(params.Tags) > 0 {
+		var tags map[string]string
+		if spec.Tags != nil {
+			tags = *spec.Tags
+		}
+		for key, want := range params.Tags {
+			if got, ok := tags[key]; !ok || got != want {
+				return false
+			}
+		}
+	}
+	if len(params.States) > 0 {
+		state := projectedState(record)
+		for _, allowed := range params.States {
+			if state == allowed {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 // handleJobCancel first prevents the locally owned execution from crossing a
@@ -158,21 +212,45 @@ func jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, error) {
 	}, nil
 }
 
-func jobSummaryWire(record jobstore.Record) (protocol.JobSummaryWire, error) {
+func (s *Server) jobSummaryWire(record jobstore.Record) (protocol.JobSummaryWire, error) {
 	spec, _, err := taskSpecForProjection(record)
 	if err != nil {
 		return protocol.JobSummaryWire{}, err
 	}
-	return protocol.JobSummaryWire{
+	return s.jobSummaryWireFromSpec(record, spec), nil
+}
+
+func (s *Server) jobSummaryWireFromSpec(record jobstore.Record, spec protocol.TaskSpec) protocol.JobSummaryWire {
+	var tags map[string]string
+	if spec.Tags != nil {
+		tags = *spec.Tags
+	}
+	wire := protocol.JobSummaryWire{
 		JobID:        record.JobID,
 		Backend:      record.Backend,
 		State:        projectedState(record),
+		Tags:         tags,
 		Cleanup:      record.Cleanup,
 		CreatedAt:    record.CreatedAt,
 		UpdatedAt:    record.UpdatedAt,
 		FailureClass: projectFailureClass(record),
 		Contract:     projectContractVerdict(record, spec),
-	}, nil
+	}
+	if record.State.IsTerminal() {
+		return wire
+	}
+	activity, active := s.ItemActivity(record.JobID)
+	if !active {
+		return wire
+	}
+	itemCount := activity.ItemCount
+	wire.ItemCount = &itemCount
+	if !activity.LastItemAt.IsZero() {
+		lastItemAt := activity.LastItemAt
+		wire.LastItemAt = &lastItemAt
+	}
+	wire.Liveness = s.recordedClaimLiveness(record.ProcessClaim)
+	return wire
 }
 
 func taskSpecForProjection(record jobstore.Record) (protocol.TaskSpec, *engine.TimeoutResolution, error) {
@@ -390,20 +468,65 @@ func (s *Server) cancellationPending(jobID string) bool {
 	return false
 }
 
+type processClaimDiagnosticKind uint8
+
+const (
+	processClaimExact processClaimDiagnosticKind = iota
+	processClaimMissing
+	processClaimIncomplete
+	processClaimUnreadable
+	processClaimUnavailable
+	processClaimStartTokenUnavailable
+	processClaimStartTokenMismatch
+)
+
+// processClaimDiagnostic preserves the identity-check result for both the
+// reaper and the public liveness projection. The public projection deliberately
+// maps this detailed private result to a small verdict enum.
+type processClaimDiagnostic struct {
+	kind processClaimDiagnosticKind
+	err  error
+}
+
+func (diagnostic processClaimDiagnostic) exact() bool {
+	return diagnostic.kind == processClaimExact
+}
+
+func (diagnostic processClaimDiagnostic) message() string {
+	switch diagnostic.kind {
+	case processClaimMissing:
+		return "orphan reaper: process claim is missing; no signal sent"
+	case processClaimIncomplete:
+		return "orphan reaper: process claim is incomplete; no signal sent"
+	case processClaimUnreadable:
+		return "orphan reaper: leader start token is unreadable; no signal sent: " + diagnostic.err.Error()
+	case processClaimUnavailable, processClaimStartTokenUnavailable:
+		return "orphan reaper: leader start token is unavailable; no signal sent"
+	case processClaimStartTokenMismatch:
+		return "orphan reaper: leader start token mismatch; no signal sent"
+	default:
+		return ""
+	}
+}
+
+func (diagnostic processClaimDiagnostic) liveness() protocol.Liveness {
+	switch diagnostic.kind {
+	case processClaimExact:
+		return protocol.LivenessAlive
+	case processClaimUnavailable, processClaimStartTokenMismatch:
+		return protocol.LivenessGone
+	default:
+		return protocol.LivenessUnknown
+	}
+}
+
 // terminateRecordedProcessClaim is the reaper's only signaling path. It
 // proves exact live-leader token equality immediately before TERM and again
 // before KILL. Any missing, unreadable, or changed identity is an uncertainty
 // result and deliberately sends no group signal.
 func (s *Server) terminateRecordedProcessClaim(claim *jobstore.ProcessClaim) (protocol.Cleanup, []string) {
-	if claim == nil {
-		return protocol.CleanupUncertain, []string{"orphan reaper: process claim is missing; no signal sent"}
-	}
-	if claim.PID <= 0 || claim.PGID <= 0 || claim.StartToken == "" {
-		return protocol.CleanupUncertain, []string{"orphan reaper: process claim is incomplete; no signal sent"}
-	}
-
-	if diagnostic := s.exactClaimDiagnostic(claim); diagnostic != "" {
-		return protocol.CleanupUncertain, []string{diagnostic}
+	if diagnostic := s.exactClaimDiagnostic(claim); !diagnostic.exact() {
+		return protocol.CleanupUncertain, []string{diagnostic.message()}
 	}
 	if gone, err := s.processGroupGone(claim.PGID); err != nil {
 		return protocol.CleanupUncertain, []string{"orphan reaper: inspect process group: " + err.Error()}
@@ -413,8 +536,8 @@ func (s *Server) terminateRecordedProcessClaim(claim *jobstore.ProcessClaim) (pr
 	// Inspecting group existence is not an identity proof. Repeat the exact
 	// leader-token comparison immediately before the first signal so a PID
 	// recycled in that small observation window is never targeted.
-	if diagnostic := s.exactClaimDiagnostic(claim); diagnostic != "" {
-		return protocol.CleanupUncertain, []string{diagnostic}
+	if diagnostic := s.exactClaimDiagnostic(claim); !diagnostic.exact() {
+		return protocol.CleanupUncertain, []string{diagnostic.message()}
 	}
 
 	if err := s.processGroupSignaler().SignalProcessGroup(claim.PGID, syscall.SIGTERM); err != nil {
@@ -426,8 +549,8 @@ func (s *Server) terminateRecordedProcessClaim(claim *jobstore.ProcessClaim) (pr
 		return protocol.CleanupClean, nil
 	}
 
-	if diagnostic := s.exactClaimDiagnostic(claim); diagnostic != "" {
-		return protocol.CleanupUncertain, []string{diagnostic}
+	if diagnostic := s.exactClaimDiagnostic(claim); !diagnostic.exact() {
+		return protocol.CleanupUncertain, []string{diagnostic.message()}
 	}
 	if err := s.processGroupSignaler().SignalProcessGroup(claim.PGID, syscall.SIGKILL); err != nil {
 		return protocol.CleanupUncertain, []string{"orphan reaper: send SIGKILL to exact claimed group: " + err.Error()}
@@ -437,22 +560,37 @@ func (s *Server) terminateRecordedProcessClaim(claim *jobstore.ProcessClaim) (pr
 	return protocol.CleanupUncertain, []string{"orphan reaper: process group did not exit within cancellation grace"}
 }
 
-func (s *Server) exactClaimDiagnostic(claim *jobstore.ProcessClaim) string {
+// recordedClaimLiveness derives the public verdict from the same exact
+// identity comparison used by the reaper; it never exposes the claim itself.
+func (s *Server) recordedClaimLiveness(claim *jobstore.ProcessClaim) protocol.Liveness {
+	return s.exactClaimDiagnostic(claim).liveness()
+}
+
+func (s *Server) exactClaimDiagnostic(claim *jobstore.ProcessClaim) processClaimDiagnostic {
+	if claim == nil {
+		return processClaimDiagnostic{kind: processClaimMissing}
+	}
+	if claim.PID <= 0 || claim.PGID <= 0 || claim.StartToken == "" {
+		return processClaimDiagnostic{kind: processClaimIncomplete}
+	}
 	table := s.processTable
 	if table == nil {
 		table = engine.NativeProcessTable{}
 	}
 	info, alive, err := table.Lookup(claim.PID)
 	if err != nil {
-		return "orphan reaper: leader start token is unreadable; no signal sent: " + err.Error()
+		return processClaimDiagnostic{kind: processClaimUnreadable, err: err}
 	}
-	if !alive || info.StartTime == "" {
-		return "orphan reaper: leader start token is unavailable; no signal sent"
+	if !alive {
+		return processClaimDiagnostic{kind: processClaimUnavailable}
+	}
+	if info.StartTime == "" {
+		return processClaimDiagnostic{kind: processClaimStartTokenUnavailable}
 	}
 	if info.StartTime != claim.StartToken {
-		return "orphan reaper: leader start token mismatch; no signal sent"
+		return processClaimDiagnostic{kind: processClaimStartTokenMismatch}
 	}
-	return ""
+	return processClaimDiagnostic{kind: processClaimExact}
 }
 
 func (s *Server) processGroupSignaler() engine.ProcessGroupSignaler {

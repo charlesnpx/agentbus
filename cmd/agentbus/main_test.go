@@ -122,15 +122,21 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 
 func TestStatusListHumanProjectionIncludesFailureClassAndContractVerdict(t *testing.T) {
 	created := time.Now().UTC().Add(-2 * time.Minute)
+	lastItemAt := created.Add(time.Minute)
+	itemCount := 3
 	a := testApp(t)
-	a.clientConnect = fakeConnector(&fakeProtocolClient{list: agentclient.JobGetListResult{Jobs: []agentclient.JobSummaryWire{{
+	a.clientConnect = fakeConnector(&fakeProtocolClient{list: agentclient.JobListResult{Jobs: []agentclient.JobSummaryWire{{
 		JobID:        "job-1",
 		Backend:      "codex",
 		State:        protocol.PublicStateRunning,
+		Tags:         map[string]string{"team": "core"},
 		Cleanup:      protocol.CleanupUncertain,
 		CreatedAt:    created,
 		FailureClass: protocol.FailureClassBackendError,
 		Contract:     &protocol.ContractVerdict{Evaluated: true, Compliant: false},
+		ItemCount:    &itemCount,
+		LastItemAt:   &lastItemAt,
+		Liveness:     protocol.LivenessAlive,
 	}}}})
 	code, stdout, stderr := runTestCLI(t, a, []string{"status"})
 	if code != 0 || stderr != "" {
@@ -138,8 +144,45 @@ func TestStatusListHumanProjectionIncludesFailureClassAndContractVerdict(t *test
 	}
 	if !strings.Contains(stdout, "jobId=job-1 state=running backend=codex cleanup=uncertain age=") ||
 		!strings.Contains(stdout, "failure.class=backend_error") ||
-		!strings.Contains(stdout, "contract.evaluated=true contract.compliant=false") {
+		!strings.Contains(stdout, "contract.evaluated=true contract.compliant=false") ||
+		!strings.Contains(stdout, "tags=team=core itemCount=3") ||
+		!strings.Contains(stdout, "lastItemAt="+lastItemAt.Format(time.RFC3339Nano)) ||
+		!strings.Contains(stdout, "liveness=alive") {
 		t.Fatalf("status list = %q", stdout)
+	}
+}
+
+func TestStatusListScopesCurrentWorkspaceAndCanListAllWorkspaces(t *testing.T) {
+	client := &fakeProtocolClient{list: agentclient.JobListResult{}}
+	a := testApp(t)
+	a.clientConnect = fakeConnector(client)
+
+	code, _, stderr := runTestCLI(t, a, []string{"status", "--tag", "team=core", "--state", "running"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("scoped status = (%d,%q)", code, stderr)
+	}
+	if len(client.listParams) != 1 {
+		t.Fatalf("scoped job.list calls = %d, want 1", len(client.listParams))
+	}
+	wantWorkspace, err := currentWorkspaceKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.listParams[0]; got.WorkspaceKey != wantWorkspace ||
+		!slices.Equal(got.States, []protocol.PublicState{protocol.PublicStateRunning}) ||
+		len(got.Tags) != 1 || got.Tags["team"] != "core" {
+		t.Fatalf("scoped job.list params = %#v", got)
+	}
+
+	code, _, stderr = runTestCLI(t, a, []string{"status", "--all-workspaces"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("all-workspaces status = (%d,%q)", code, stderr)
+	}
+	if len(client.listParams) != 2 {
+		t.Fatalf("all-workspaces job.list calls = %d, want 2", len(client.listParams))
+	}
+	if got := client.listParams[1]; got.WorkspaceKey != "" || len(got.Tags) != 0 || len(got.States) != 0 {
+		t.Fatalf("all-workspaces job.list params = %#v, want no filters", got)
 	}
 }
 
@@ -474,10 +517,11 @@ func runTestCLI(t *testing.T, a *app, args []string) (int, string, string) {
 }
 
 type fakeProtocolClient struct {
-	records map[string]agentclient.JobGetResult
-	list    agentclient.JobGetListResult
-	cancels map[string]agentclient.JobCancelResult
-	err     error
+	records    map[string]agentclient.JobGetResult
+	list       agentclient.JobListResult
+	listParams []agentclient.JobListParams
+	cancels    map[string]agentclient.JobCancelResult
+	err        error
 }
 
 func (c *fakeProtocolClient) JobGet(_ context.Context, params agentclient.JobGetParams) (agentclient.JobGetResult, error) {
@@ -491,10 +535,11 @@ func (c *fakeProtocolClient) JobGet(_ context.Context, params agentclient.JobGet
 	return record, nil
 }
 
-func (c *fakeProtocolClient) JobGetList(context.Context) (agentclient.JobGetListResult, error) {
+func (c *fakeProtocolClient) JobList(_ context.Context, params agentclient.JobListParams) (agentclient.JobListResult, error) {
 	if c.err != nil {
-		return agentclient.JobGetListResult{}, c.err
+		return agentclient.JobListResult{}, c.err
 	}
+	c.listParams = append(c.listParams, params)
 	return c.list, nil
 }
 

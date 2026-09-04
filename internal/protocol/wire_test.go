@@ -21,6 +21,8 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 	startedAt := time.Date(2025, time.January, 2, 3, 5, 5, 0, time.UTC)
 	finishedAt := time.Date(2025, time.January, 2, 3, 6, 5, 0, time.UTC)
 	updatedAt := time.Date(2025, time.January, 2, 3, 7, 5, 0, time.UTC)
+	lastItemAt := time.Date(2025, time.January, 2, 3, 7, 6, 0, time.UTC)
+	itemCount := 2
 	timeout := &engine.TimeoutResolution{
 		Requested: &requested,
 		Effective: 2345,
@@ -70,12 +72,16 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		JobID:         "job-1",
 		Backend:       "codex",
 		State:         PublicStateFailed,
+		Tags:          map[string]string{"team": "core"},
 		Cleanup:       CleanupUncertain,
 		CreatedAt:     createdAt,
 		UpdatedAt:     updatedAt,
 		ModelReported: "gpt-5",
 		FailureClass:  FailureClassBackendError,
 		Contract:      summaryContract,
+		ItemCount:     &itemCount,
+		LastItemAt:    &lastItemAt,
+		Liveness:      LivenessAlive,
 	}
 	taskSpec := TaskSpec{
 		Backend:      "codex",
@@ -90,7 +96,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 	}
 
 	const recordJSON = `{"jobId":"job-1","workspaceKey":"workspace-1","requestId":"request-1","backend":"codex","state":"completed","tags":{"team":"core"},"createdAt":"2025-01-02T03:04:05Z","startedAt":"2025-01-02T03:05:05Z","finishedAt":"2025-01-02T03:06:05Z","timeout":{"requested":1234,"effective":2345,"source":"client"},"result":{"text":"answer","resultPath":"/results/job-1","sha256":"result-sha","bytes":42},"contract":{"schemaSha256":"schema-sha","evaluated":true,"compliant":true,"attempts":2,"violations":["/answer"]},"failure":{"class":"backend_error","reason":"backend stopped"},"cleanup":"uncertain","logPaths":{"stdout":"/logs/job-1.out","stdoutTruncated":false,"stderr":"/logs/job-1.err","stderrTruncated":false},"modelReported":"gpt-5"}`
-	const summaryJSON = `{"jobId":"job-1","backend":"codex","state":"failed","cleanup":"uncertain","createdAt":"2025-01-02T03:04:05Z","updatedAt":"2025-01-02T03:07:05Z","modelReported":"gpt-5","failureClass":"backend_error","contract":{"evaluated":true,"compliant":false}}`
+	const summaryJSON = `{"jobId":"job-1","backend":"codex","state":"failed","tags":{"team":"core"},"cleanup":"uncertain","createdAt":"2025-01-02T03:04:05Z","updatedAt":"2025-01-02T03:07:05Z","modelReported":"gpt-5","failureClass":"backend_error","contract":{"evaluated":true,"compliant":false},"itemCount":2,"lastItemAt":"2025-01-02T03:07:06Z","liveness":"alive"}`
 
 	tests := []struct {
 		name  string
@@ -172,9 +178,15 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 			want:  recordJSON,
 		},
 		{
-			name:  "JobGet list response",
-			value: JobGetListResult{Jobs: []JobSummaryWire{summary}},
-			new:   func() any { return new(JobGetListResult) },
+			name:  "JobListParams",
+			value: JobListParams{WorkspaceKey: "workspace-1", Tags: tags, States: []PublicState{PublicStateQueued, PublicStateRunning}},
+			new:   func() any { return new(JobListParams) },
+			want:  `{"workspaceKey":"workspace-1","tags":{"team":"core"},"states":["queued","running"]}`,
+		},
+		{
+			name:  "JobList response",
+			value: JobListResult{Jobs: []JobSummaryWire{summary}},
+			new:   func() any { return new(JobListResult) },
 			want:  `{"jobs":[` + summaryJSON + `]}`,
 		},
 		{
@@ -224,9 +236,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if string(got) != test.want {
-				t.Fatalf("JSON = %s, want %s", got, test.want)
-			}
+			assertJSONEquivalent(t, got, []byte(test.want))
 
 			decoded := test.new()
 			if err := json.Unmarshal(got, decoded); err != nil {
@@ -266,6 +276,7 @@ func TestJobSummaryWireFieldAllowList(t *testing.T) {
 	want := map[string]struct{}{
 		"JobID": {}, "Backend": {}, "State": {}, "Cleanup": {}, "CreatedAt": {},
 		"UpdatedAt": {}, "ModelReported": {}, "FailureClass": {}, "Contract": {},
+		"Tags": {}, "ItemCount": {}, "LastItemAt": {}, "Liveness": {},
 	}
 
 	summaryType := reflect.TypeOf(JobSummaryWire{})
@@ -296,6 +307,35 @@ func TestWireEnumMethods(t *testing.T) {
 			if got := test.state.IsTerminal(); got != test.want {
 				t.Errorf("%q IsTerminal() = %t, want %t", test.state, got, test.want)
 			}
+		}
+	})
+
+	t.Run("PublicState.Valid", func(t *testing.T) {
+		for _, state := range []PublicState{
+			PublicStateQueued,
+			PublicStateRunning,
+			PublicStateCompleted,
+			PublicStateFailed,
+			PublicStateCanceled,
+			PublicStateUnknown,
+		} {
+			if !state.Valid() {
+				t.Errorf("%q Valid() = false, want true", state)
+			}
+		}
+		if PublicState("invalid").Valid() {
+			t.Error("invalid PublicState Valid() = true, want false")
+		}
+	})
+
+	t.Run("Liveness.Valid", func(t *testing.T) {
+		for _, liveness := range []Liveness{LivenessAlive, LivenessGone, LivenessUnknown} {
+			if !liveness.Valid() {
+				t.Errorf("%q Valid() = false, want true", liveness)
+			}
+		}
+		if Liveness("invalid").Valid() {
+			t.Error("invalid Liveness Valid() = true, want false")
 		}
 	})
 
@@ -337,6 +377,21 @@ func TestWireEnumMethods(t *testing.T) {
 			}
 		}
 	})
+}
+
+func assertJSONEquivalent(t *testing.T, got, want []byte) {
+	t.Helper()
+	var gotValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("decode actual JSON: %v", err)
+	}
+	var wantValue any
+	if err := json.Unmarshal(want, &wantValue); err != nil {
+		t.Fatalf("decode expected JSON: %v", err)
+	}
+	if !reflect.DeepEqual(gotValue, wantValue) {
+		t.Fatalf("JSON value = %#v, want %#v", gotValue, wantValue)
+	}
 }
 
 func assertZeroValueOmitsOmitEmpty(t *testing.T, value any) {

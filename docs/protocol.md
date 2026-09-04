@@ -4,13 +4,14 @@ Agentbus protocol version 3 is a JSON-RPC 2.0 service over a local,
 newline-delimited Unix socket. Each frame is one JSON object followed by a
 newline. The daemon accepts only protocol version 3.
 
-The wire surface has four methods:
+The wire surface has five methods:
 
 | Method | Purpose |
 | --- | --- |
 | protocol.hello | Authenticate the connection and confirm the protocol version. |
 | job.submit | Create or replay an identified job. |
-| job.get | Read one job or list compact job summaries. |
+| job.get | Read one identified job. |
+| job.list | List compact job summaries with optional workspace, tag, and state filters. |
 | job.cancel | Request cancellation of one job. |
 
 A client must call protocol.hello successfully before any other method on the
@@ -134,13 +135,26 @@ timeout.effective is milliseconds. timeout.source is client when timeoutMs was
 provided, otherwise daemon_default. timeout.requested is omitted when the
 daemon default is used.
 
-## job.get
+## job.list
 
-An empty parameter object lists jobs:
+All job.list parameters are optional:
 
 ~~~json
-{}
+{
+  "workspaceKey": "string",
+  "tags": {"key": "value"},
+  "states": ["queued", "running"]
+}
 ~~~
+
+An empty workspaceKey applies no workspace filter and returns matching jobs from
+every workspace. The server never invents a default workspace. tags is a map:
+a job matches only when it has every requested key with its requested value.
+states contains public states; a job matches when its public state is one of
+them. Empty or omitted tags and states do not filter. All supplied filter
+dimensions combine with AND.
+
+The result contains compact summaries:
 
 ~~~json
 {
@@ -149,6 +163,7 @@ An empty parameter object lists jobs:
       "jobId": "string",
       "backend": "string",
       "state": "running",
+      "tags": {"team": "core"},
       "cleanup": "clean",
       "createdAt": "2026-08-20T12:00:00Z",
       "updatedAt": "2026-08-20T12:00:01Z",
@@ -156,17 +171,45 @@ An empty parameter object lists jobs:
       "contract": {
         "evaluated": true,
         "compliant": false
-      }
+      },
+      "itemCount": 12,
+      "lastItemAt": "2026-08-20T12:00:01Z",
+      "liveness": "alive"
     }
   ]
 }
 ~~~
 
-The list contains summaries only. It does not expose request identity, task
-details, prompt, current working directory, result text, failure reason, log
-paths, or process claims.
+Each summary always contains jobId, backend, state, cleanup, createdAt, and
+updatedAt. tags, modelReported, failureClass, and contract appear when
+applicable. tags is the submitted tag map, allowing a caller to see why a tag
+filter matched.
 
-Passing a jobId returns the full job record:
+itemCount and liveness appear only while this daemon has an active execution
+for that job. lastItemAt appears after that active execution has assembled an
+item; it is absent before the first item. A terminal job, or a job that came
+from before this daemon started, has no activity or liveness projection.
+liveness is alive when the recorded claim exactly matches a live process,
+gone when the recorded claim is absent from the process table or mismatches a
+recycled process, and unknown when the daemon cannot establish the identity.
+The summary never exposes a PID, process-group ID, start token, or any process
+claim.
+
+The list contains summaries only. Other than tags, it does not expose request
+identity, task details, prompt, current working directory, result text, failure
+reason, log paths, or process claims.
+
+Workspace filtering is scoping, not ownership. The local Unix socket has no
+stable authenticated caller identity, so Agentbus cannot enforce who owns a
+job. The CLI computes the SHA-256 workspace key from its canonical current
+working directory and supplies it for agentbus status without --job. Passing
+--all-workspaces clears that filter. Two orchestrators in the same repository
+therefore share a workspace scope.
+
+## job.get
+
+job.get requires a non-empty jobId. An empty parameter object is an
+invalid_task_spec parameter error rather than a list request.
 
 ~~~json
 {"jobId":"string"}

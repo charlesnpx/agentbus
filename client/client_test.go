@@ -316,35 +316,45 @@ func TestJobGetReflectWalksEveryRecordField(t *testing.T) {
 	assertReflectDecoded(t, reflect.ValueOf(want), reflect.ValueOf(got), "job.get record")
 }
 
-func TestJobGetReflectWalksEverySummaryField(t *testing.T) {
+func TestJobListReflectWalksEverySummaryField(t *testing.T) {
 	want := reflectPopulatedValue[JobSummaryWire](t)
+	params := JobListParams{
+		WorkspaceKey: "workspace-reflect",
+		Tags:         map[string]string{"team": "core"},
+		States:       []PublicState{protocol.PublicStateRunning},
+	}
 	client, requests, done := newOneShotClient(t, protocol.Response{
-		Result: JobGetListResult{Jobs: []JobSummaryWire{want}},
+		Result: JobListResult{Jobs: []JobSummaryWire{want}},
 	})
 
-	got, err := client.JobGetList(context.Background())
+	got, err := client.JobList(context.Background(), params)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertJobGetRequest(t, <-requests, JobGetParams{})
+	assertJobListRequest(t, <-requests, params)
 	assertOneShotClientDone(t, done)
 	if len(got.Jobs) != 1 {
-		t.Fatalf("job.get summaries = %d, want 1", len(got.Jobs))
+		t.Fatalf("job.list summaries = %d, want 1", len(got.Jobs))
 	}
-	assertReflectDecoded(t, reflect.ValueOf(want), reflect.ValueOf(got.Jobs[0]), "job.get summary")
+	assertReflectDecoded(t, reflect.ValueOf(want), reflect.ValueOf(got.Jobs[0]), "job.list summary")
 }
 
-func TestJobGetRejectsEmptyJobIDBeforeSending(t *testing.T) {
-	client, requests, _ := newOneShotClient(t, protocol.Response{Result: JobGetListResult{}})
+func TestJobGetEmptyIDReturnsTypedRPCError(t *testing.T) {
+	client, requests, done := newOneShotClient(t, protocol.Response{Error: protocol.NewError(
+		protocol.ErrorInvalidTaskSpec,
+		"jobId is required",
+		protocol.ErrorData{},
+	)})
 
 	_, err := client.JobGet(context.Background(), JobGetParams{})
-	if err == nil {
-		t.Fatal("JobGet succeeded with an empty job ID")
+	assertJobGetRequest(t, <-requests, JobGetParams{})
+	assertOneShotClientDone(t, done)
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("JobGet empty ID error = %T %v, want *RPCError", err, err)
 	}
-	select {
-	case request := <-requests:
-		t.Fatalf("JobGet sent request with an empty job ID: %#v", request)
-	default:
+	if rpcErr.Object.Data.Code != protocol.ErrorInvalidTaskSpec {
+		t.Fatalf("JobGet empty ID code = %q, want %q", rpcErr.Object.Data.Code, protocol.ErrorInvalidTaskSpec)
 	}
 }
 
@@ -460,8 +470,22 @@ func assertJobGetRequest(t *testing.T, request protocol.Request, want JobGetPara
 	if got != want {
 		t.Fatalf("job.get params = %#v, want %#v", got, want)
 	}
-	if want.JobID == "" && string(request.Params) != "{}" {
-		t.Fatalf("empty job.get params = %s, want {}", request.Params)
+	if want.JobID == "" && len(request.Params) == 0 {
+		t.Fatal("empty job.get params were omitted")
+	}
+}
+
+func assertJobListRequest(t *testing.T, request protocol.Request, want JobListParams) {
+	t.Helper()
+	if request.Method != protocol.MethodJobList {
+		t.Fatalf("method = %q, want %q", request.Method, protocol.MethodJobList)
+	}
+	var got JobListParams
+	if err := json.Unmarshal(request.Params, &got); err != nil {
+		t.Fatalf("decode job.list params: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("job.list params = %#v, want %#v", got, want)
 	}
 }
 
