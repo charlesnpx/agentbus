@@ -207,7 +207,9 @@ Passing a jobId returns the full job record:
   },
   "logPaths": {
     "stdout": "string",
-    "stderr": "string"
+    "stdoutTruncated": false,
+    "stderr": "string",
+    "stderrTruncated": false
   }
 }
 ~~~
@@ -224,6 +226,11 @@ hexadecimal digest with no algorithm prefix.
 failure exists only for a failed job. contract exists only when an outputSchema
 was submitted. attempts is one after initial evaluation and two only when the
 single permitted correction was attempted.
+
+For each present log path, its paired `stdoutTruncated` or `stderrTruncated`
+boolean is explicitly present as `true` or `false` when the daemon can
+determine the state; the paired boolean is absent when the answer is unknown,
+such as when the log file cannot be read.
 
 ## job.cancel
 

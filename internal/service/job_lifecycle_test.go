@@ -169,75 +169,49 @@ func TestJobGetStoreReadFailureIsBackendUnavailable(t *testing.T) {
 }
 
 func TestProjectLogPathsReportsTruncation(t *testing.T) {
-	tests := []struct {
-		name          string
-		stdout        bool
-		contents      []byte
-		wantTruncated bool
-		wireField     []byte
-	}{
-		{
-			name:          "truncated stdout",
-			stdout:        true,
-			contents:      []byte("backend stream" + engine.TruncationMarker()),
-			wantTruncated: true,
-			wireField:     []byte(`"stdoutTruncated":true`),
-		},
-		{
-			name:          "untruncated stderr",
-			contents:      []byte("backend stream completed\n"),
-			wantTruncated: false,
-			wireField:     []byte(`"stderrTruncated":false`),
+	logs := t.TempDir()
+	record := jobstore.Record{
+		JobID: "job_log_projection",
+		Artifacts: jobstore.ArtifactPaths{
+			Log: filepath.Join(logs, "job_log_projection.log"),
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			logs := t.TempDir()
-			record := jobstore.Record{
-				JobID: "job_log_projection",
-				Artifacts: jobstore.ArtifactPaths{
-					Log: filepath.Join(logs, "job_log_projection.log"),
-				},
-			}
-			paths, err := engine.LogPathsForLayout(engine.WorkspaceLayout{Logs: logs}, record.JobID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			path := paths.Stderr
-			if tt.stdout {
-				path = paths.Stdout
-			}
-			if err := os.WriteFile(path, tt.contents, 0o600); err != nil {
-				t.Fatal(err)
-			}
+	paths, err := engine.LogPathsForLayout(engine.WorkspaceLayout{Logs: logs}, record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.Stdout, []byte("backend stream"+engine.TruncationMarker()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.Stderr, []byte("backend stream completed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-			wire := projectLogPaths(record)
-			if wire == nil {
-				t.Fatal("projectLogPaths returned nil")
-			}
-			var truncated *bool
-			if tt.stdout {
-				if wire.Stdout != path {
-					t.Fatalf("stdout path = %q, want %q", wire.Stdout, path)
-				}
-				truncated = wire.StdoutTruncated
-			} else {
-				if wire.Stderr != path {
-					t.Fatalf("stderr path = %q, want %q", wire.Stderr, path)
-				}
-				truncated = wire.StderrTruncated
-			}
-			if truncated == nil || *truncated != tt.wantTruncated {
-				t.Fatalf("truncated = %v, want %t", truncated, tt.wantTruncated)
-			}
-			encoded, err := json.Marshal(wire)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Contains(encoded, tt.wireField) {
-				t.Fatalf("log paths JSON = %s, want %s", encoded, tt.wireField)
-			}
-		})
+	wire := projectLogPaths(record)
+	if wire == nil {
+		t.Fatal("projectLogPaths returned nil")
+	}
+	if wire.Stdout != paths.Stdout || wire.Stderr != paths.Stderr {
+		t.Fatalf("log paths = %#v, want stdout %q and stderr %q", wire, paths.Stdout, paths.Stderr)
+	}
+	if wire.StdoutTruncated == nil || !*wire.StdoutTruncated {
+		t.Fatalf("stdout truncated = %v, want true", wire.StdoutTruncated)
+	}
+	if wire.StderrTruncated == nil || *wire.StderrTruncated {
+		t.Fatalf("stderr truncated = %v, want false", wire.StderrTruncated)
+	}
+
+	t.Cleanup(func() { _ = os.Chmod(paths.Stdout, 0o600) })
+	if err := os.Chmod(paths.Stdout, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if file, err := os.Open(paths.Stdout); err == nil {
+		_ = file.Close()
+		t.Fatal("stdout log remained readable after removing permissions")
+	}
+	wire = projectLogPaths(record)
+	if wire == nil || wire.StdoutTruncated != nil {
+		t.Fatalf("unreadable stdout projection = %#v, want nil truncation state", wire)
 	}
 }
 

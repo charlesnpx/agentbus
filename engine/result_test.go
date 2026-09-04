@@ -62,10 +62,7 @@ func TestResultPathsStayInNamespace(t *testing.T) {
 
 func TestCappedLogWriter(t *testing.T) {
 	t.Parallel()
-	const (
-		oldDefaultCap = 10 * 1024 * 1024
-		defaultCap    = 64 * 1024 * 1024
-	)
+	const defaultCap = 64 * 1024 * 1024
 	path := filepath.Join(t.TempDir(), "log.txt")
 	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
@@ -90,8 +87,8 @@ func TestCappedLogWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Size(); got != defaultCap || got <= oldDefaultCap {
-		t.Fatalf("default-capped log size = %d, want %d and > %d", got, defaultCap, oldDefaultCap)
+	if got := info.Size(); got != defaultCap {
+		t.Fatalf("default-capped log size = %d, want %d", got, defaultCap)
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("log mode = %o, want 600", got)

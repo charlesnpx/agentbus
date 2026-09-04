@@ -239,13 +239,11 @@ func projectLogPaths(record jobstore.Record) *protocol.LogPathsWire {
 	wire := &protocol.LogPathsWire{}
 	if stdoutExists {
 		wire.Stdout = paths.Stdout
-		truncated := logEndsWithTruncationMarker(paths.Stdout)
-		wire.StdoutTruncated = &truncated
+		wire.StdoutTruncated = logEndsWithTruncationMarker(paths.Stdout)
 	}
 	if stderrExists {
 		wire.Stderr = paths.Stderr
-		truncated := logEndsWithTruncationMarker(paths.Stderr)
-		wire.StderrTruncated = &truncated
+		wire.StderrTruncated = logEndsWithTruncationMarker(paths.Stderr)
 	}
 	return wire
 }
@@ -256,23 +254,33 @@ func fileExists(path string) bool {
 }
 
 // logEndsWithTruncationMarker reads only the marker-sized tail so projection
-// stays bounded even when a log reaches its maximum size.
-func logEndsWithTruncationMarker(path string) bool {
+// stays bounded even when a log reaches its maximum size. A nil result means
+// the file could not be inspected.
+func logEndsWithTruncationMarker(path string) *bool {
 	file, err := os.Open(path)
 	if err != nil {
-		return false
+		return nil
 	}
 	defer file.Close()
 
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return nil
+	}
 	marker := engine.TruncationMarker()
+	truncated := false
+	if info.Size() < int64(len(marker)) {
+		return &truncated
+	}
 	if _, err := file.Seek(-int64(len(marker)), io.SeekEnd); err != nil {
-		return false
+		return nil
 	}
 	tail := make([]byte, len(marker))
 	if _, err := io.ReadFull(file, tail); err != nil {
-		return false
+		return nil
 	}
-	return string(tail) == marker
+	truncated = string(tail) == marker
+	return &truncated
 }
 
 // reconcileRecoveredJobs is intentionally called before the listener exists.
