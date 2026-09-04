@@ -390,6 +390,28 @@ collection: result and log artifacts remain until an operator removes them, so
 the state root grows until it is cleaned up. Removing an artifact does not
 remove jobs, bindings, identity hashes, terminal metadata, or ContractResult.
 
+### Transcript item sidecars
+
+During a live turn, the service assembles normalized backend events into the
+private `<jobId>.items.jsonl` sidecar beside the backend logs. It is not a
+`logPaths` field, a durable store field, or a new RPC method. Each item has an
+ordinal, append time, closed kind (`message`, `tool`, `fileChange`, `warning`,
+or `error`), optional tool name and text, and a truncation flag. Consecutive
+agent-text events are coalesced; without a boundary signal in `engine.Event`,
+two otherwise adjacent agent messages also coalesce.
+
+Text is capped at 4 KiB per item and the sidecar at 16 MiB. The writer reserves
+space for a final `{"appendStopped":true}` control line when the file cap stops
+appending, so a later reader can report a gap instead of silently treating the
+partial item sequence as complete. Sidecar failures become job diagnostics and
+do not alter the operator work's outcome. File-change observations retain only
+their kind, name, and timestamp, never their paths or contents.
+
+The daemon keeps an in-memory logical item count and item/activity timestamps
+for each active execution. These are never bbolt transactions per event and do
+not derive health from sidecar bytes: activity continues to advance after the
+file cap. A contentless progress event advances only the activity timestamp.
+
 ### Crash safety and no relaunch
 
 Agentbus permits at most one initial process turn and, when required, at most

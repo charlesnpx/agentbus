@@ -56,6 +56,9 @@ func TestResultPathsStayInNamespace(t *testing.T) {
 			if _, err := LogPathsForLayout(layout, id); err == nil {
 				t.Fatalf("LogPathsForLayout(%q) succeeded", id)
 			}
+			if _, err := ItemPathForLayout(layout, id); err == nil {
+				t.Fatalf("ItemPathForLayout(%q) succeeded", id)
+			}
 		})
 	}
 }

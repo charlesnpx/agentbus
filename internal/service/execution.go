@@ -41,6 +41,9 @@ type activeExecution struct {
 	claimErr        error
 	interruptOnce   sync.Once
 	interruptErr    error
+	itemCount       int
+	lastItemAt      time.Time
+	lastActivityAt  time.Time
 }
 
 func newActiveExecution(jobID string, backend engine.Backend) *activeExecution {
@@ -424,6 +427,13 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.finishContextStop(store, record, err, cleanup, diagnostics)
 		return
 	}
+	itemPath, itemPathErr := engine.ItemPathForLayout(engine.WorkspaceLayout{Logs: filepath.Dir(record.Artifacts.Log)}, record.JobID)
+	itemWriter := newItemSidecarWriter(itemPath)
+	if itemPathErr != nil {
+		itemWriter = unavailableItemSidecarWriter(itemPathErr)
+	}
+	defer itemWriter.close()
+	items := newItemAssembler(run, itemWriter)
 
 	run.beginTurn()
 	events, err, canceled := run.startTurn(session, jobCtx, engine.TurnInput{
@@ -443,34 +453,40 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		if cleanup == protocol.CleanupClean {
 			cleanup, diagnostics = cleanupForRun(run, cleanup, diagnostics)
 		}
+		diagnostics = appendItemSidecarDiagnostics(diagnostics, itemWriter)
 		s.finishTurnError(store, record, jobCtx, err, cleanup, diagnostics)
 		return
 	}
 
-	outcome := collectTurn(jobCtx, run, events)
+	outcome := collectTurn(jobCtx, run, events, items)
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 	if run.cancellationRequested() {
 		return
 	}
 
 	if errors.Is(outcome.err, context.DeadlineExceeded) || outcome.timedOut {
+		outcome.diagnostics = appendItemSidecarDiagnostics(outcome.diagnostics, itemWriter)
 		s.recordExecutionFailure(store, record, outcome.cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, outcome.diagnostics)
 		return
 	}
 	if errors.Is(outcome.err, context.Canceled) || outcome.interrupted {
 		_, _, claimErr := run.claimStatus()
 		if claimErr != nil {
+			outcome.diagnostics = appendItemSidecarDiagnostics(outcome.diagnostics, itemWriter)
 			s.recordExecutionFailure(store, record, outcome.cleanup, protocol.FailureClassInternal, claimErr, outcome.diagnostics)
 			return
 		}
+		outcome.diagnostics = appendItemSidecarDiagnostics(outcome.diagnostics, itemWriter)
 		s.recordExecutionFailure(store, record, outcome.cleanup, protocol.FailureClassInterrupted, outcome.err, outcome.diagnostics)
 		return
 	}
 	if outcome.err != nil {
+		outcome.diagnostics = appendItemSidecarDiagnostics(outcome.diagnostics, itemWriter)
 		s.recordExecutionFailure(store, record, outcome.cleanup, classifyExecutionFailure(outcome.err), outcome.err, outcome.diagnostics)
 		return
 	}
-	text, contract, cleanup, diagnostics := s.evaluateOutputSchema(store, record, run, session, jobCtx, timeout, spec, logPaths, outcome.text, outcome.cleanup, outcome.diagnostics)
+	text, contract, cleanup, diagnostics := s.evaluateOutputSchema(store, record, run, session, jobCtx, timeout, spec, logPaths, items, outcome.text, outcome.cleanup, outcome.diagnostics)
+	diagnostics = appendItemSidecarDiagnostics(diagnostics, itemWriter)
 	s.recordExecutionCompletion(store, record, text, cleanup, diagnostics, contract)
 }
 
@@ -491,7 +507,7 @@ func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpec, error) {
 // evaluateOutputSchema runs only after the initial turn has successfully
 // retired and before the job's sole terminal write. A correction failure is a
 // contract failure, not a reason to discard the already authoritative result.
-func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, spec protocol.TaskSpec, logPaths engine.LogPaths, original string, cleanup protocol.Cleanup, diagnostics []string) (string, protocol.ContractResult, protocol.Cleanup, []string) {
+func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, spec protocol.TaskSpec, logPaths engine.LogPaths, items *itemAssembler, original string, cleanup protocol.Cleanup, diagnostics []string) (string, protocol.ContractResult, protocol.Cleanup, []string) {
 	if len(spec.OutputSchema) == 0 {
 		return original, protocol.ContractResult{}, cleanup, diagnostics
 	}
@@ -534,7 +550,7 @@ func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Rec
 	// retained adapter clears that turn's active process before closing its
 	// stream, so the correction's claim is recorded after the initial process
 	// has retired.
-	correction := s.runCorrectionTurn(store, record, run, session, ctx, timeout, logPaths, schema.CorrectionPrompt(string(spec.OutputSchema), initial.Violations))
+	correction := s.runCorrectionTurn(store, record, run, session, ctx, timeout, logPaths, items, schema.CorrectionPrompt(string(spec.OutputSchema), initial.Violations))
 	if correction.cleanup == protocol.CleanupUncertain {
 		cleanup = protocol.CleanupUncertain
 	}
@@ -559,7 +575,7 @@ func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Rec
 
 // runCorrectionTurn starts the sole read-only correction turn after the
 // initial turn has retired.
-func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, logPaths engine.LogPaths, prompt string) turnOutcome {
+func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, logPaths engine.LogPaths, items *itemAssembler, prompt string) turnOutcome {
 	run.beginTurn()
 	events, err, canceled := run.startTurn(session, ctx, engine.TurnInput{
 		Prompt:   prompt,
@@ -581,7 +597,7 @@ func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record
 		return turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics}
 	}
 
-	outcome := collectTurn(ctx, run, events)
+	outcome := collectTurn(ctx, run, events, items)
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 	return outcome
 }
@@ -647,8 +663,9 @@ type turnOutcome struct {
 	diagnostics []string
 }
 
-func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine.Event) turnOutcome {
+func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine.Event, items *itemAssembler) turnOutcome {
 	outcome := turnOutcome{cleanup: protocol.CleanupClean}
+	defer items.finishTurn()
 	if events == nil {
 		outcome.err = errors.New("backend returned a nil event stream")
 		return outcome
@@ -663,7 +680,7 @@ func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine
 				outcome.cleanup = protocol.CleanupUncertain
 				outcome.diagnostics = append(outcome.diagnostics, "backend cleanup: "+err.Error())
 			}
-			if drainTurnEvents(events, &outcome, &assistant, &result, &hasResult) {
+			if drainTurnEvents(events, &outcome, &assistant, &result, &hasResult, items) {
 				outcome.text = attemptFinalText(hasResult, result, assistant.String())
 			} else {
 				outcome.cleanup = protocol.CleanupUncertain
@@ -677,12 +694,12 @@ func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine
 				outcome.text = attemptFinalText(hasResult, result, assistant.String())
 				return outcome
 			}
-			absorbTurnEvent(&outcome, &assistant, &result, &hasResult, event)
+			absorbTurnEvent(&outcome, &assistant, &result, &hasResult, items, event)
 		}
 	}
 }
 
-func drainTurnEvents(events <-chan engine.Event, outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool) bool {
+func drainTurnEvents(events <-chan engine.Event, outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool, items *itemAssembler) bool {
 	timer := time.NewTimer(engine.DefaultCancelGrace)
 	defer timer.Stop()
 	for {
@@ -691,15 +708,16 @@ func drainTurnEvents(events <-chan engine.Event, outcome *turnOutcome, assistant
 			if !ok {
 				return true
 			}
-			absorbTurnEvent(outcome, assistant, result, hasResult, event)
+			absorbTurnEvent(outcome, assistant, result, hasResult, items, event)
 		case <-timer.C:
 			return false
 		}
 	}
 }
 
-func absorbTurnEvent(outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool, event engine.Event) {
+func absorbTurnEvent(outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool, items *itemAssembler, event engine.Event) {
 	rawText := authoritativeText(event)
+	items.absorb(event, rawText)
 	switch event.Type {
 	case engine.EventAgentText:
 		assistant.WriteString(rawText)
