@@ -51,13 +51,6 @@ func LogPathsForLayout(layout WorkspaceLayout, jobID string) (LogPaths, error) {
 	return LogPaths{Stdout: stdout, Stderr: stderr}, nil
 }
 
-// ItemPathForLayout returns the private transcript-item sidecar path for jobID.
-// It is intentionally separate from LogPaths: transcript items are a
-// service-internal artifact, not a backend log or a protocol field.
-func ItemPathForLayout(layout WorkspaceLayout, jobID string) (string, error) {
-	return safePathForID(layout.Logs, jobID, ".items.jsonl")
-}
-
 func writeResultFile(path string, raw []byte, inlineCap int) (ResultInfo, error) {
 	if inlineCap <= 0 {
 		inlineCap = DefaultInlineResultCap

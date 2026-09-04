@@ -5,11 +5,11 @@ package service
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charlesnpx/agentbus/engine"
 )
@@ -39,7 +39,7 @@ type TranscriptItem struct {
 	Kind      string    `json:"kind"`
 	Name      string    `json:"name,omitempty"`
 	Text      string    `json:"text,omitempty"`
-	Truncated bool      `json:"truncated,omitempty"`
+	Truncated bool      `json:"truncated"`
 }
 
 // ItemActivity is the in-memory transcript progress for a running job.
@@ -95,26 +95,46 @@ func (run *activeExecution) itemActivity() ItemActivity {
 	return activity
 }
 
+func (run *activeExecution) noteItemSidecarDiagnostic(diagnostic string) {
+	if run == nil || diagnostic == "" {
+		return
+	}
+	run.mu.Lock()
+	if run.itemSidecarDiag == "" {
+		run.itemSidecarDiag = diagnostic
+	}
+	run.mu.Unlock()
+}
+
+func (run *activeExecution) itemSidecarDiagnostics() []string {
+	if run == nil {
+		return nil
+	}
+	run.mu.Lock()
+	diagnostic := run.itemSidecarDiag
+	run.mu.Unlock()
+	if diagnostic == "" {
+		return nil
+	}
+	return []string{diagnostic}
+}
+
 // itemSidecarWriter owns the append-only sidecar for one job. It continues to
 // assign logical ordinals after a disk failure or cap so activity remains a
 // measure of the live event stream rather than a measure of file bytes.
 type itemSidecarWriter struct {
-	path       string
-	textCap    int
-	fileCap    int64
-	file       *os.File
-	written    int64
-	next       int
-	stopped    bool
-	failed     bool
-	diagnostic string
+	path        string
+	textCap     int
+	fileCap     int64
+	file        *os.File
+	written     int64
+	next        int
+	stopped     bool
+	diagnostic  string
+	failureSink func(string)
 }
 
-func newItemSidecarWriter(path string) *itemSidecarWriter {
-	return newItemSidecarWriterWithCaps(path, transcriptItemTextCap, transcriptItemFileCap)
-}
-
-func newItemSidecarWriterWithCaps(path string, textCap int, fileCap int64) *itemSidecarWriter {
+func newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarWriter {
 	if textCap <= 0 {
 		textCap = transcriptItemTextCap
 	}
@@ -122,14 +142,36 @@ func newItemSidecarWriterWithCaps(path string, textCap int, fileCap int64) *item
 		fileCap = transcriptItemFileCap
 	}
 	writer := &itemSidecarWriter{path: path, textCap: textCap, fileCap: fileCap}
-	writer.open()
+	if strings.TrimSpace(writer.path) == "" {
+		writer.noteFailure("open", fmt.Errorf("path is empty"))
+		return writer
+	}
+	if err := os.MkdirAll(filepath.Dir(writer.path), 0o700); err != nil {
+		writer.noteFailure("create parent", err)
+		return writer
+	}
+	file, err := os.OpenFile(writer.path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		writer.noteFailure("open", err)
+		return writer
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		writer.noteFailure("set mode", err)
+		return writer
+	}
+	writer.file = file
 	return writer
 }
 
-func unavailableItemSidecarWriter(err error) *itemSidecarWriter {
-	writer := &itemSidecarWriter{textCap: transcriptItemTextCap, fileCap: transcriptItemFileCap}
-	writer.noteFailure("resolve path", err)
-	return writer
+func (writer *itemSidecarWriter) setFailureSink(sink func(string)) {
+	if writer == nil {
+		return
+	}
+	writer.failureSink = sink
+	if writer.diagnostic != "" && writer.failureSink != nil {
+		writer.failureSink(writer.diagnostic)
+	}
 }
 
 func (writer *itemSidecarWriter) append(kind transcriptItemKind, name, text string, alreadyTruncated bool) TranscriptItem {
@@ -144,29 +186,31 @@ func (writer *itemSidecarWriter) append(kind transcriptItemKind, name, text stri
 		Name:    name,
 	}
 	if kind != transcriptItemFileChange {
-		item.Text, item.Truncated = capTranscriptItemText(text, writer.textCap)
+		item.Text, item.Truncated = truncateTranscriptText(text, writer.textCap)
 		item.Truncated = item.Truncated || alreadyTruncated
 	}
 	writer.write(item)
 	return item
 }
 
-func capTranscriptItemText(text string, capBytes int) (string, bool) {
+// truncateTranscriptText keeps text at or below capBytes without splitting a
+// UTF-8 rune. It is shared by completed items and coalesced agent-text runs.
+func truncateTranscriptText(text string, capBytes int) (string, bool) {
 	if capBytes <= 0 {
 		capBytes = transcriptItemTextCap
 	}
 	if len(text) <= capBytes {
 		return text, false
 	}
-	return text[:capBytes], true
+	end := capBytes
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end], true
 }
 
 func (writer *itemSidecarWriter) write(item TranscriptItem) {
-	if writer == nil || writer.stopped || writer.failed {
-		return
-	}
-	writer.open()
-	if writer.stopped || writer.failed || writer.file == nil {
+	if writer == nil || writer.stopped || writer.file == nil {
 		return
 	}
 	line, err := json.Marshal(item)
@@ -179,43 +223,11 @@ func (writer *itemSidecarWriter) write(item TranscriptItem) {
 		writer.markStopped()
 		return
 	}
-	if err := writeAll(writer.file, line); err != nil {
+	if _, err := writer.file.Write(line); err != nil {
 		writer.noteFailure("append item", err)
 		return
 	}
 	writer.written += int64(len(line))
-}
-
-func (writer *itemSidecarWriter) open() {
-	if writer == nil || writer.file != nil || writer.failed || writer.stopped {
-		return
-	}
-	if strings.TrimSpace(writer.path) == "" {
-		writer.noteFailure("open", fmt.Errorf("path is empty"))
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(writer.path), 0o700); err != nil {
-		writer.noteFailure("create parent", err)
-		return
-	}
-	file, err := os.OpenFile(writer.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		writer.noteFailure("open", err)
-		return
-	}
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		writer.noteFailure("set mode", err)
-		return
-	}
-	info, err := file.Stat()
-	if err != nil {
-		_ = file.Close()
-		writer.noteFailure("stat", err)
-		return
-	}
-	writer.file = file
-	writer.written = info.Size()
 }
 
 func (writer *itemSidecarWriter) remainingPayload() int64 {
@@ -233,30 +245,34 @@ func (writer *itemSidecarWriter) markStopped() {
 	if writer == nil || writer.stopped {
 		return
 	}
-	writer.stopped = true
-	if writer.failed || writer.file == nil {
+	if writer.file == nil {
+		writer.noteFailure("record append stop", fmt.Errorf("sidecar file is unavailable"))
 		return
 	}
 	if writer.written+int64(len(transcriptItemStopLine)) > writer.fileCap {
 		writer.noteFailure("record append stop", fmt.Errorf("sidecar is already at its %d-byte cap", writer.fileCap))
 		return
 	}
-	if err := writeAll(writer.file, transcriptItemStopLine); err != nil {
+	if _, err := writer.file.Write(transcriptItemStopLine); err != nil {
 		writer.noteFailure("record append stop", err)
 		return
 	}
 	writer.written += int64(len(transcriptItemStopLine))
+	writer.stopped = true
 }
 
 func (writer *itemSidecarWriter) noteFailure(operation string, err error) {
-	if writer == nil || writer.failed || err == nil {
+	if writer == nil || writer.diagnostic != "" || err == nil {
 		return
 	}
-	writer.failed = true
+	writer.stopped = true
 	writer.diagnostic = "item sidecar " + operation + ": " + err.Error()
 	if writer.file != nil {
 		_ = writer.file.Close()
 		writer.file = nil
+	}
+	if writer.failureSink != nil {
+		writer.failureSink(writer.diagnostic)
 	}
 }
 
@@ -281,20 +297,12 @@ func (writer *itemSidecarWriter) diagnostics() []string {
 	return []string{writer.diagnostic}
 }
 
-func writeAll(file *os.File, data []byte) error {
-	for len(data) > 0 {
-		n, err := file.Write(data)
-		if n > 0 {
-			data = data[n:]
-		}
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
+func itemSidecarPath(stdoutPath string) (string, error) {
+	base, ok := strings.CutSuffix(stdoutPath, ".stdout.log")
+	if !ok {
+		return "", fmt.Errorf("stdout log path %q is missing .stdout.log suffix", stdoutPath)
 	}
-	return nil
+	return base + ".items.jsonl", nil
 }
 
 // itemAssembler turns the normalized engine event stream into transcript
@@ -316,15 +324,16 @@ func (assembler *itemAssembler) absorb(event engine.Event, rawText string) {
 	if assembler == nil {
 		return
 	}
+	if event.Type == engine.EventAgentText {
+		assembler.appendAgentText(rawText)
+		return
+	}
 	if event.ObservedWorkspaceWriteItem {
 		assembler.flushMessage()
 		assembler.append(transcriptItemFileChange, event.Name, "", false)
 		return
 	}
 	switch event.Type {
-	case engine.EventAgentText:
-		assembler.appendAgentText(rawText)
-		return
 	case engine.EventProgress:
 		assembler.noteProgress(time.Now().UTC())
 		return
@@ -357,6 +366,7 @@ func (assembler *itemAssembler) appendAgentText(text string) {
 	if assembler == nil {
 		return
 	}
+	assembler.noteProgress(time.Now().UTC())
 	assembler.messageActive = true
 	if assembler.messageTruncated || len(text) == 0 {
 		return
@@ -374,7 +384,8 @@ func (assembler *itemAssembler) appendAgentText(text string) {
 		assembler.message.WriteString(text)
 		return
 	}
-	assembler.message.WriteString(text[:remaining])
+	truncated, _ := truncateTranscriptText(text, remaining)
+	assembler.message.WriteString(truncated)
 	assembler.messageTruncated = true
 }
 

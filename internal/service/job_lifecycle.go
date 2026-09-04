@@ -89,7 +89,11 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 		return requestOutcome{result: protocol.JobCancelResult{JobID: record.JobID, State: projectedState(record)}}
 	}
 
+	run := s.activeExecution(record.JobID)
 	cleanup, diagnostics := s.cancelActiveOrRecordedProcess(store, record)
+	if run != nil {
+		diagnostics = append(diagnostics, run.itemSidecarDiagnostics()...)
+	}
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
 		State:       protocol.PublicStateCanceled,
 		Cleanup:     cleanup,

@@ -44,6 +44,7 @@ type activeExecution struct {
 	itemCount       int
 	lastItemAt      time.Time
 	lastActivityAt  time.Time
+	itemSidecarDiag string
 }
 
 func newActiveExecution(jobID string, backend engine.Backend) *activeExecution {
@@ -427,11 +428,13 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.finishContextStop(store, record, err, cleanup, diagnostics)
 		return
 	}
-	itemPath, itemPathErr := engine.ItemPathForLayout(engine.WorkspaceLayout{Logs: filepath.Dir(record.Artifacts.Log)}, record.JobID)
-	itemWriter := newItemSidecarWriter(itemPath)
-	if itemPathErr != nil {
-		itemWriter = unavailableItemSidecarWriter(itemPathErr)
+	itemPath, err := itemSidecarPath(logPaths.Stdout)
+	if err != nil {
+		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("derive item sidecar path: %w", err), nil)
+		return
 	}
+	itemWriter := newItemSidecarWriter(itemPath, transcriptItemTextCap, transcriptItemFileCap)
+	itemWriter.setFailureSink(run.noteItemSidecarDiagnostic)
 	defer itemWriter.close()
 	items := newItemAssembler(run, itemWriter)
 

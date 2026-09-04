@@ -3,13 +3,17 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/jobstore"
@@ -18,7 +22,11 @@ import (
 
 func transcriptItemPath(t *testing.T, record jobstore.Record) string {
 	t.Helper()
-	path, err := engine.ItemPathForLayout(engine.WorkspaceLayout{Logs: filepath.Dir(record.Artifacts.Log)}, record.JobID)
+	logs, err := engine.LogPathsForLayout(engine.WorkspaceLayout{Logs: filepath.Dir(record.Artifacts.Log)}, record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := itemSidecarPath(logs.Stdout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,17 +60,28 @@ func readTranscriptItems(t *testing.T, record jobstore.Record) []TranscriptItem 
 }
 
 func TestTranscriptItemsCoalesceAgentTextRun(t *testing.T) {
+	events := make(chan engine.Event)
+	agentTextSent := make(chan struct{})
+	releaseEvents := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseEvents) }) }
+	t.Cleanup(release)
+
 	backend := &executionFakeBackend{name: "items-coalesce"}
 	backend.start = func(_ context.Context, _ engine.SessionOpts) (engine.Session, error) {
 		return &executionFakeSession{
 			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
 				input.OnProcessStart(engine.ProcessRef{PID: 6101, PGID: 6101, StartTime: "items-coalesce"}, 0)
-				return executionEvents(
-					engine.Event{Type: engine.EventAgentText, Text: "hel"},
-					engine.Event{Type: engine.EventAgentText, Text: "lo"},
-					engine.Event{Type: engine.EventToolUse, Name: "shell", Text: "pwd"},
-					engine.Event{Type: engine.EventProgress},
-				), nil
+				go func() {
+					events <- engine.Event{Type: engine.EventAgentText, Text: "hel"}
+					events <- engine.Event{Type: engine.EventAgentText, Text: "lo"}
+					close(agentTextSent)
+					<-releaseEvents
+					events <- engine.Event{Type: engine.EventToolUse, Name: "shell", Text: "pwd"}
+					events <- engine.Event{Type: engine.EventProgress}
+					close(events)
+				}()
+				return events, nil
 			},
 		}, nil
 	}
@@ -72,7 +91,41 @@ func TestTranscriptItemsCoalesceAgentTextRun(t *testing.T) {
 	server.executionMu.Lock()
 	server.executions = map[string]*activeExecution{record.JobID: run}
 	server.executionMu.Unlock()
-	server.runJob(context.Background(), record, run)
+	done := make(chan struct{})
+	go func() {
+		server.runJob(context.Background(), record, run)
+		close(done)
+	}()
+	select {
+	case <-agentTextSent:
+	case <-time.After(time.Second):
+		t.Fatal("agent-text events did not arrive")
+	}
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		activity, ok := server.ItemActivity(record.JobID)
+		if ok && !activity.LastActivityAt.IsZero() {
+			if activity.ItemCount != 0 || !activity.LastItemAt.IsZero() {
+				t.Fatalf("agent-text activity before flush = %+v, want timestamp only", activity)
+			}
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("agent-text did not advance activity before the message flush")
+		case <-ticker.C:
+		}
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("coalesced turn did not finish")
+	}
 
 	items := readTranscriptItems(t, record)
 	if len(items) != 2 {
@@ -126,19 +179,28 @@ func TestTranscriptItemsSuppressWorkspaceWriteText(t *testing.T) {
 	if got := items[0]; got.Kind != string(transcriptItemFileChange) || got.Name != "fileChange" || got.Text != "" || got.Truncated {
 		t.Fatalf("file-change item = %+v, want text-free fileChange", got)
 	}
+	sidecar, err := os.ReadFile(transcriptItemPath(t, record))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(sidecar, []byte(`"truncated":false`)) {
+		t.Fatalf("sidecar = %s, want explicit false truncated member", sidecar)
+	}
 }
 
 func TestTranscriptItemsCapText(t *testing.T) {
+	prefix := strings.Repeat("x", transcriptItemTextCap-1)
+	tooLong := prefix + "€"
 	backend := &executionFakeBackend{name: "items-cap"}
 	backend.start = func(_ context.Context, _ engine.SessionOpts) (engine.Session, error) {
 		return &executionFakeSession{
 			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
 				input.OnProcessStart(engine.ProcessRef{PID: 6103, PGID: 6103, StartTime: "items-cap"}, 0)
-				return executionEvents(engine.Event{
-					Type: engine.EventToolUse,
-					Name: "large-output",
-					Text: strings.Repeat("x", transcriptItemTextCap+1),
-				}), nil
+				return executionEvents(
+					engine.Event{Type: engine.EventAgentText, Text: prefix},
+					engine.Event{Type: engine.EventAgentText, Text: "€"},
+					engine.Event{Type: engine.EventToolUse, Name: "large-output", Text: tooLong},
+				), nil
 			},
 		}, nil
 	}
@@ -147,11 +209,50 @@ func TestTranscriptItemsCapText(t *testing.T) {
 	runExecution(t, server, record)
 
 	items := readTranscriptItems(t, record)
-	if len(items) != 1 {
-		t.Fatalf("item count = %d, want 1: %#v", len(items), items)
+	if len(items) != 2 {
+		t.Fatalf("item count = %d, want 2: %#v", len(items), items)
 	}
-	if got := items[0]; len(got.Text) != transcriptItemTextCap || !got.Truncated {
-		t.Fatalf("capped item = %+v, want %d-byte text with truncation", got, transcriptItemTextCap)
+	for _, item := range items {
+		if len(item.Text) > transcriptItemTextCap || !utf8.ValidString(item.Text) || item.Text != prefix || !item.Truncated {
+			t.Fatalf("capped item = %+v, want valid %d-byte-or-less text ending before the partial rune", item, transcriptItemTextCap)
+		}
+	}
+}
+
+func TestItemSidecarWriterStopsAtSmallFileCap(t *testing.T) {
+	const fileCap = 256
+	path := filepath.Join(t.TempDir(), "items.jsonl")
+	writer := newItemSidecarWriter(path, 8, fileCap)
+	for range 3 {
+		writer.append(transcriptItemTool, "tool", "output", false)
+	}
+	writer.close()
+	if writer.diagnostic != "" {
+		t.Fatalf("sidecar diagnostic = %q, want no write failure", writer.diagnostic)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(contents)) > fileCap {
+		t.Fatalf("sidecar size = %d, want at most %d", len(contents), fileCap)
+	}
+	if !bytes.HasSuffix(contents, transcriptItemStopLine) || bytes.Count(contents, transcriptItemStopLine) != 1 {
+		t.Fatalf("sidecar = %q, want one append-stopped marker", contents)
+	}
+}
+
+func TestItemSidecarPathDerivesFromStdoutLog(t *testing.T) {
+	stdout := filepath.Join(t.TempDir(), "job_123.stdout.log")
+	path, err := itemSidecarPath(stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := strings.TrimSuffix(stdout, ".stdout.log") + ".items.jsonl"; path != want {
+		t.Fatalf("sidecar path = %q, want %q", path, want)
+	}
+	if _, err := itemSidecarPath(strings.TrimSuffix(stdout, ".stdout.log") + ".stderr.log"); err == nil {
+		t.Fatal("non-stdout log path derived a sidecar path")
 	}
 }
 
@@ -203,13 +304,23 @@ func TestTranscriptItemsCorrectionTurnContinuesOrdinals(t *testing.T) {
 	}
 }
 
-func TestTranscriptItemSidecarFailureDoesNotChangeOutcome(t *testing.T) {
+func TestTranscriptItemSidecarFailureSurvivesCancellation(t *testing.T) {
+	events := make(chan engine.Event)
+	turnStarted := make(chan struct{})
+	var closeEvents sync.Once
+	closeStream := func() { closeEvents.Do(func() { close(events) }) }
+	t.Cleanup(closeStream)
+
 	backend := &executionFakeBackend{name: "items-write-failure"}
 	backend.start = func(_ context.Context, _ engine.SessionOpts) (engine.Session, error) {
 		return &executionFakeSession{
-			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
-				input.OnProcessStart(engine.ProcessRef{PID: 6106, PGID: 6106, StartTime: "items-write-failure"}, 0)
-				return executionEvents(engine.Event{Type: engine.EventResultMessage, Text: "authoritative"}), nil
+			turn: func(_ context.Context, _ engine.TurnInput) (<-chan engine.Event, error) {
+				close(turnStarted)
+				return events, nil
+			},
+			interrupt: func(context.Context) error {
+				closeStream()
+				return nil
 			},
 		}, nil
 	}
@@ -218,7 +329,32 @@ func TestTranscriptItemSidecarFailureDoesNotChangeOutcome(t *testing.T) {
 	if err := os.MkdirAll(transcriptItemPath(t, record), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	runExecution(t, server, record)
+	run := newActiveExecution(record.JobID, backend)
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: run}
+	server.executionMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		server.runJob(context.Background(), record, run)
+		close(done)
+	}()
+	select {
+	case <-turnStarted:
+	case <-time.After(time.Second):
+		t.Fatal("turn did not start")
+	}
+	if diagnostics := run.itemSidecarDiagnostics(); !strings.Contains(strings.Join(diagnostics, "\n"), "item sidecar open") {
+		t.Fatalf("active sidecar diagnostics = %#v, want constructor failure", diagnostics)
+	}
+	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
+	if canceled.err != nil {
+		t.Fatalf("job.cancel error = %#v", canceled.err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled turn did not finish")
+	}
 
 	store, err := server.ensureJobStore()
 	if err != nil {
@@ -228,8 +364,8 @@ func TestTranscriptItemSidecarFailureDoesNotChangeOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if terminal.State != protocol.PublicStateCompleted || terminal.ResultText != "authoritative" {
-		t.Fatalf("terminal record = %+v, want completed authoritative result", terminal)
+	if terminal.State != protocol.PublicStateCanceled {
+		t.Fatalf("terminal record = %+v, want canceled result", terminal)
 	}
 	if !strings.Contains(strings.Join(terminal.Diagnostics, "\n"), "item sidecar open") {
 		t.Fatalf("diagnostics = %#v, want sidecar failure", terminal.Diagnostics)
