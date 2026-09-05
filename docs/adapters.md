@@ -398,8 +398,9 @@ The codex adapter maps:
 | `thread/start` or `thread/resume` response thread id | session ID | stable app-server resume identifier |
 | `item/agentMessage/delta` | `AgentText` | incremental assistant text |
 | `item/completed` with an agent or assistant message item | `AgentText` | completed assistant text |
-| `item/completed` with command, file-change, MCP, or dynamic-tool items | `ToolUse` | one transcript item per logical tool call; the completed frame is the one that can carry output, result text, or an exit status |
-| `item/started` with command, file-change, MCP, or dynamic-tool items | `Progress` | a tool that has begun advances the liveness clock without adding a second item for the same call |
+| `item/started` with command, file-change, MCP, or dynamic-tool items | `Progress` | a tool that has begun advances the liveness clock and is retained pending by its item id; it does not add a second transcript item |
+| `item/completed` with command, file-change, MCP, or dynamic-tool items | `ToolUse` | the matching item id clears its pending lifecycle and produces one transcript item; a completed frame without an observed start is still recorded |
+| turn end with a pending command, file-change, MCP, or dynamic-tool item | `ToolUse` | pending items flush once before the completion outcome or any other turn return, including failed, empty-status, interrupted, and cancellation paths; a file-change flush remains a text-free `ObservedWorkspaceWriteItem` |
 | `warning`, `error`, `config/warning`, or `guardian/warning` notification text | `Warning` | backend warning surfaces |
 | `turn/completed` with status `completed` or empty status | `ResultMessage` | result text is the last completed agent message, a turn-level last-agent message, or the last agent delta |
 | `turn/completed` with status `failed`, unexpected interruption, or unsupported status | terminal error | the shared duplex runtime emits the driver error as a terminal error |
