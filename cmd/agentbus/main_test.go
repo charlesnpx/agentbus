@@ -123,20 +123,22 @@ func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testin
 func TestStatusListHumanProjectionIncludesFailureClassAndContractVerdict(t *testing.T) {
 	created := time.Now().UTC().Add(-2 * time.Minute)
 	lastItemAt := created.Add(time.Minute)
+	lastActivityAt := lastItemAt.Add(time.Second)
 	itemCount := 3
 	a := testApp(t)
 	a.clientConnect = fakeConnector(&fakeProtocolClient{list: agentclient.JobListResult{Jobs: []agentclient.JobSummaryWire{{
-		JobID:        "job-1",
-		Backend:      "codex",
-		State:        protocol.PublicStateRunning,
-		Tags:         map[string]string{"team": "core"},
-		Cleanup:      protocol.CleanupUncertain,
-		CreatedAt:    created,
-		FailureClass: protocol.FailureClassBackendError,
-		Contract:     &protocol.ContractVerdict{Evaluated: true, Compliant: false},
-		ItemCount:    &itemCount,
-		LastItemAt:   &lastItemAt,
-		Liveness:     protocol.LivenessAlive,
+		JobID:          "job-1",
+		Backend:        "codex",
+		State:          protocol.PublicStateRunning,
+		Tags:           map[string]string{"team": "core"},
+		Cleanup:        protocol.CleanupUncertain,
+		CreatedAt:      created,
+		FailureClass:   protocol.FailureClassBackendError,
+		Contract:       &protocol.ContractVerdict{Evaluated: true, Compliant: false},
+		ItemCount:      &itemCount,
+		LastItemAt:     &lastItemAt,
+		LastActivityAt: &lastActivityAt,
+		Liveness:       protocol.LivenessAlive,
 	}}}})
 	code, stdout, stderr := runTestCLI(t, a, []string{"status"})
 	if code != 0 || stderr != "" {
@@ -147,8 +149,18 @@ func TestStatusListHumanProjectionIncludesFailureClassAndContractVerdict(t *test
 		!strings.Contains(stdout, "contract.evaluated=true contract.compliant=false") ||
 		!strings.Contains(stdout, "tags=team=core itemCount=3") ||
 		!strings.Contains(stdout, "lastItemAt="+lastItemAt.Format(time.RFC3339Nano)) ||
+		!strings.Contains(stdout, "lastActivityAt="+lastActivityAt.Format(time.RFC3339Nano)) ||
 		!strings.Contains(stdout, "liveness=alive") {
 		t.Fatalf("status list = %q", stdout)
+	}
+
+	noActivity := testApp(t)
+	noActivity.clientConnect = fakeConnector(&fakeProtocolClient{list: agentclient.JobListResult{Jobs: []agentclient.JobSummaryWire{{
+		JobID: "job-2", Backend: "codex", State: protocol.PublicStateRunning, Cleanup: protocol.CleanupClean, CreatedAt: created,
+	}}}})
+	code, stdout, stderr = runTestCLI(t, noActivity, []string{"status"})
+	if code != 0 || stderr != "" || strings.Contains(stdout, "lastActivityAt=") {
+		t.Fatalf("status without activity = (%d,%q,%q), want unchanged human projection", code, stdout, stderr)
 	}
 }
 

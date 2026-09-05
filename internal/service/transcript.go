@@ -36,6 +36,7 @@ var transcriptKinds = map[string]struct{}{
 // handleJobTranscript returns a digest of the captured sidecar and the items
 // selected with stateless filters. A missing sidecar is an empty transcript:
 // it is expected for jobs that failed before their first turn and older jobs.
+// An existing sidecar without its final completion receipt is a gapped prefix.
 func (s *Server) handleJobTranscript(raw json.RawMessage) requestOutcome {
 	var params protocol.JobTranscriptParams
 	if err := decodeStrict(raw, &params); err != nil {
@@ -92,15 +93,10 @@ func (s *Server) jobTranscript(record jobstore.Record, params protocol.JobTransc
 	}
 	result := emptyJobTranscript(record)
 	if present {
-		result, err = readTranscriptSidecar(path, params)
-		if err != nil {
-			return protocol.JobTranscriptResult{}, err
-		}
+		result = readTranscriptSidecar(path, params)
 		result.State = projectedState(record)
 	}
-	failureMarker := hasItemSidecarFailureMarker(path)
 	result.Gap = result.Gap ||
-		failureMarker ||
 		hasItemSidecarFailure(record.Diagnostics) ||
 		record.State == protocol.PublicStateUnknown
 	if !record.State.IsTerminal() {
@@ -149,23 +145,37 @@ func newTranscriptCounts() map[string]int {
 	}
 }
 
-func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) (protocol.JobTranscriptResult, error) {
-	file, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return protocol.JobTranscriptResult{
-			Counts: newTranscriptCounts(),
-			Items:  make([]protocol.TranscriptItem, 0),
-		}, nil
-	}
-	if err != nil {
-		return protocol.JobTranscriptResult{}, err
-	}
-	defer file.Close()
-
+func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) protocol.JobTranscriptResult {
 	result := protocol.JobTranscriptResult{
 		Counts: newTranscriptCounts(),
 		Items:  make([]protocol.TranscriptItem, 0),
 	}
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return result
+	}
+	if err != nil {
+		// A failed read still leaves a useful captured prefix. Report its
+		// incompleteness instead of hiding it behind an RPC failure.
+		result.Gap = true
+		return result
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		result.Gap = true
+		return result
+	}
+	endsWithNewline := false
+	if info.Size() > 0 {
+		var lastByte [1]byte
+		if _, err := file.ReadAt(lastByte[:], info.Size()-1); err != nil {
+			result.Gap = true
+			return result
+		}
+		endsWithNewline = lastByte[0] == '\n'
+	}
+
 	kinds := make(map[string]struct{}, len(params.Kinds))
 	for _, kind := range params.Kinds {
 		kinds[kind] = struct{}{}
@@ -179,19 +189,56 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) (pr
 		}
 	}
 	var items, messages, errorItems []protocol.TranscriptItem
+	finishItems := func() {
+		if defaultDigest {
+			items = make([]protocol.TranscriptItem, 0, len(messages)+len(errorItems))
+			items = append(items, messages...)
+			items = append(items, errorItems...)
+			sort.Slice(items, func(left, right int) bool { return items[left].Ordinal < items[right].Ordinal })
+		} else if items == nil {
+			items = make([]protocol.TranscriptItem, 0)
+		}
+		result.Items = items
+	}
 
+	captureComplete := false
+	stopLine := transcriptItemStopLine[:len(transcriptItemStopLine)-1]
+	completeLine := transcriptItemCompleteLine[:len(transcriptItemCompleteLine)-1]
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 8*1024), maxTranscriptSidecarLine)
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if bytes.Equal(line, transcriptItemStopLine[:len(transcriptItemStopLine)-1]) {
+		if bytes.Equal(line, stopLine) {
 			result.Gap = true
 			continue
+		}
+		if bytes.Equal(line, completeLine) {
+			if captureComplete {
+				result.Gap = true
+			}
+			captureComplete = true
+			continue
+		}
+		if captureComplete {
+			// A completion receipt is valid only as the final sidecar record.
+			result.Gap = true
+		}
+		var control map[string]json.RawMessage
+		if err := json.Unmarshal(line, &control); err == nil {
+			_, hasAppendStopped := control["appendStopped"]
+			_, hasCaptureComplete := control["captureComplete"]
+			if hasAppendStopped || hasCaptureComplete {
+				finishItems()
+				result.Gap = true
+				return result
+			}
 		}
 
 		var item protocol.TranscriptItem
 		if err := json.Unmarshal(line, &item); err != nil {
-			return protocol.JobTranscriptResult{}, fmt.Errorf("decode transcript item: %w", err)
+			finishItems()
+			result.Gap = true
+			return result
 		}
 		result.ItemCount++
 		result.Counts[item.Kind]++
@@ -230,18 +277,15 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) (pr
 		items = append(items, item)
 	}
 	if err := scanner.Err(); err != nil {
-		return protocol.JobTranscriptResult{}, fmt.Errorf("scan transcript sidecar: %w", err)
+		finishItems()
+		result.Gap = true
+		return result
 	}
-	if defaultDigest {
-		items = make([]protocol.TranscriptItem, 0, len(messages)+len(errorItems))
-		items = append(items, messages...)
-		items = append(items, errorItems...)
-		sort.Slice(items, func(left, right int) bool { return items[left].Ordinal < items[right].Ordinal })
-	} else if items == nil {
-		items = make([]protocol.TranscriptItem, 0)
+	finishItems()
+	if !captureComplete || !endsWithNewline {
+		result.Gap = true
 	}
-	result.Items = items
-	return result, nil
+	return result
 }
 
 func setTranscriptBounds(result *protocol.JobTranscriptResult, item protocol.TranscriptItem) {
@@ -265,21 +309,6 @@ func hasItemSidecarFailure(diagnostics []string) bool {
 		}
 	}
 	return false
-}
-
-func hasItemSidecarFailureMarker(sidecarPath string) bool {
-	if strings.TrimSpace(sidecarPath) == "" {
-		return false
-	}
-	_, err := os.Stat(itemSidecarFailurePath(sidecarPath))
-	if err == nil {
-		return true
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return false
-	}
-	// If the marker cannot be inspected, continuity cannot be established.
-	return true
 }
 
 func appendTranscriptTail(items []protocol.TranscriptItem, item protocol.TranscriptItem, size int) []protocol.TranscriptItem {

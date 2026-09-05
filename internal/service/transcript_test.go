@@ -125,29 +125,98 @@ func TestJobTranscriptFiltersNarrowAndCombine(t *testing.T) {
 
 func TestJobTranscriptReportsGapAndMissingSidecar(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{})
-	item := transcriptTestItem(1, time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC), "warning")
+	item := transcriptTestItem(1, time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC), "message")
 	normal := transcriptTestRecord(t, server, "gap-normal")
 	writeTranscriptSidecar(t, normal, []protocol.TranscriptItem{item}, false)
 	gapped := transcriptTestRecord(t, server, "gap-present")
 	writeTranscriptSidecar(t, gapped, []protocol.TranscriptItem{item}, true)
 	missing := transcriptTestRecord(t, server, "gap-missing")
+	unopenable := transcriptTestRecord(t, server, "gap-unopenable")
+	unopenablePath, present, err := transcriptSidecarPath(unopenable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !present {
+		t.Fatal("unopenable test record has no transcript sidecar path")
+	}
+	if err := os.MkdirAll(filepath.Dir(unopenablePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(unopenablePath, unopenablePath); err != nil {
+		t.Fatal(err)
+	}
+
+	appendBytes := func(record jobstore.Record, payload []byte) {
+		t.Helper()
+		path, present, err := transcriptSidecarPath(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !present {
+			t.Fatal("test record has no transcript sidecar path")
+		}
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.Write(payload); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	decodeFailure := transcriptTestRecord(t, server, "gap-decode-failure")
+	writeTranscriptSidecar(t, decodeFailure, []protocol.TranscriptItem{item}, false)
+	appendBytes(decodeFailure, []byte(`{"ordinal":`))
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodeFailure, err = store.MarkTerminal(decodeFailure.JobID, jobstore.TerminalUpdate{
+		State:      protocol.PublicStateCompleted,
+		Cleanup:    protocol.CleanupClean,
+		FinishedAt: item.At.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for _, test := range []struct {
 		name          string
 		record        jobstore.Record
+		params        protocol.JobTranscriptParams
 		wantGap       bool
 		wantItemCount int
+		wantOrdinals  []int
+		wantTerminal  bool
 	}{
-		{name: "clear", record: normal, wantGap: false, wantItemCount: 1},
-		{name: "present", record: gapped, wantGap: true, wantItemCount: 1},
-		{name: "missing", record: missing, wantGap: false, wantItemCount: 0},
+		{name: "clear", record: normal, wantGap: false, wantItemCount: 1, wantOrdinals: []int{1}},
+		{name: "present", record: gapped, wantGap: true, wantItemCount: 1, wantOrdinals: []int{1}},
+		{name: "missing", record: missing, wantGap: false, wantItemCount: 0, wantOrdinals: []int{}},
+		{name: "unopenable", record: unopenable, wantGap: true, wantItemCount: 0, wantOrdinals: []int{}},
+		{name: "decode failure keeps prefix", record: decodeFailure, params: protocol.JobTranscriptParams{Kinds: []string{"message"}}, wantGap: true, wantItemCount: 1, wantOrdinals: []int{1}, wantTerminal: true},
 	} {
-		result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: test.record.JobID})
+		test.params.JobID = test.record.JobID
+		result := transcriptResultForTest(t, server, test.params)
 		if result.Gap != test.wantGap || result.ItemCount != test.wantItemCount {
 			t.Fatalf("%s transcript = %#v", test.name, result)
 		}
-		if test.wantItemCount == 0 && (len(result.Items) != 0 || result.FirstAt != nil || result.LastAt != nil || result.Counts["message"] != 0 || result.Counts["reasoning"] != 0 || result.Counts["tool"] != 0 || result.Counts["toolResult"] != 0 || result.Counts["fileChange"] != 0 || result.Counts["warning"] != 0 || result.Counts["error"] != 0) {
-			t.Fatalf("missing transcript = %#v, want an empty zero-count digest", result)
+		if got := transcriptOrdinals(result.Items); !reflect.DeepEqual(got, test.wantOrdinals) {
+			t.Fatalf("%s item ordinals = %v, want %v", test.name, got, test.wantOrdinals)
+		}
+		wantCounts := newTranscriptCounts()
+		wantCounts["message"] = test.wantItemCount
+		if !reflect.DeepEqual(result.Counts, wantCounts) {
+			t.Fatalf("%s counts = %#v, want %#v", test.name, result.Counts, wantCounts)
+		}
+		if test.wantItemCount == 0 && (result.FirstAt != nil || result.LastAt != nil) {
+			t.Fatalf("%s transcript bounds = first:%v last:%v, want none", test.name, result.FirstAt, result.LastAt)
+		}
+		if test.wantTerminal && result.State != protocol.PublicStateCompleted {
+			t.Fatalf("%s transcript state = %q, want completed", test.name, result.State)
 		}
 	}
 }
@@ -251,13 +320,13 @@ func writeTranscriptSidecar(t *testing.T, record jobstore.Record, items []protoc
 			t.Fatal(err)
 		}
 	}
+	control := transcriptItemCompleteLine
 	if gap {
-		if err := encoder.Encode(struct {
-			AppendStopped bool `json:"appendStopped"`
-		}{AppendStopped: true}); err != nil {
-			_ = file.Close()
-			t.Fatal(err)
-		}
+		control = transcriptItemStopLine
+	}
+	if _, err := file.Write(control); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
 	}
 	if err := file.Close(); err != nil {
 		t.Fatal(err)

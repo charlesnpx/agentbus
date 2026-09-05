@@ -300,12 +300,11 @@ not the whole stream: it returns counts and timestamps plus the last few
 message items and every captured error item. Any explicit selector returns its
 matching items, subject to limit. A missing sidecar returns a valid empty
 transcript with itemCount zero, seven zero counts, no timestamps, and items:
-[]; its gap follows the same three rules as everywhere else.
-
-When the sidecar's capped writer emitted its appendStopped marker, a sidecar
-write failure was recorded, or the daemon was interrupted while capturing, gap
-is true: the returned prefix may be incomplete rather than a claim that the
-job emitted no more activity.
+[]; gap is true when capture or reading could not establish continuity, so the
+returned prefix may be incomplete rather than a claim that the job emitted no
+more activity. A sidecar captured before completion receipts existed has no
+receipt and is therefore reported as a gapped prefix, because its completeness
+cannot be established.
 
 ## job.get
 

@@ -451,13 +451,17 @@ func (s *Server) cancelActiveOrRecordedProcess(store *jobstore.Store, record job
 		if current.State == protocol.PublicStateQueued && !current.Starting {
 			return protocol.CleanupClean, nil
 		}
-		if current.ProcessClaim == nil {
+		claim := current.ProcessClaim
+		if activeClaim := run.currentProcessClaim(); activeClaim != nil {
+			claim = activeClaim
+		}
+		if claim == nil {
 			return protocol.CleanupUncertain, []string{"cancel live process group: process claim is missing"}
 		}
 		if !sessionPresent {
-			return s.terminateRecordedProcessClaim(current.ProcessClaim)
+			return s.terminateRecordedProcessClaim(claim)
 		}
-		gone, err := s.waitForProcessGroupGone(current.ProcessClaim.PGID, s.processGroupCancellationGrace())
+		gone, err := s.waitForProcessGroupGone(claim.PGID, s.processGroupCancellationGrace())
 		if err != nil {
 			return protocol.CleanupUncertain, []string{"verify canceled process group: " + err.Error()}
 		}

@@ -161,10 +161,9 @@ Assistant chunks are emitted live and concatenated into the final result on an
 adapter; specifying one is rejected before launch.
 
 The adapter can observe the resolved ACP `models.currentModelId`, rather than
-echoing a requested model flag. That observation is not currently published in
-a JobRecord. ACP initialization, authentication, session creation, and mode
-selection occur as part of the job's session start; there is no separate
-discovery pass before that session.
+echoing a requested model flag. ACP initialization, authentication, session
+creation, and mode selection occur as part of the job's session start; there
+is no separate discovery pass before that session.
 
 ### claude write
 

@@ -5,6 +5,7 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,10 +20,12 @@ const (
 	transcriptItemTextCap       = 4 * 1024
 	transcriptItemFileCap       = 16 * 1024 * 1024
 	itemSidecarDiagnosticPrefix = "item sidecar "
-	itemSidecarFailureSuffix    = ".failure"
 )
 
-var transcriptItemStopLine = []byte("{\"appendStopped\":true}\n")
+var (
+	transcriptItemStopLine     = []byte("{\"appendStopped\":true}\n")
+	transcriptItemCompleteLine = []byte("{\"captureComplete\":true}\n")
+)
 
 type transcriptItemKind string
 
@@ -128,6 +131,7 @@ type itemSidecarWriter struct {
 	written     int64
 	next        int
 	stopped     bool
+	incomplete  bool
 	diagnostic  string
 	failureSink func(string)
 }
@@ -171,8 +175,10 @@ func (writer *itemSidecarWriter) setFailureSink(sink func(string)) {
 		return
 	}
 	writer.failureSink = sink
-	if writer.diagnostic != "" && writer.failureSink != nil {
-		writer.failureSink(writer.diagnostic)
+	if writer.failureSink != nil {
+		for _, diagnostic := range writer.diagnostics() {
+			writer.failureSink(diagnostic)
+		}
 	}
 }
 
@@ -237,10 +243,31 @@ func (writer *itemSidecarWriter) remainingPayload() int64 {
 		return 0
 	}
 	reserved := int64(len(transcriptItemStopLine))
+	if completion := int64(len(transcriptItemCompleteLine)); completion > reserved {
+		reserved = completion
+	}
 	if writer.written >= writer.fileCap-reserved {
 		return 0
 	}
 	return writer.fileCap - reserved - writer.written
+}
+
+func (writer *itemSidecarWriter) writeControlLine(file *os.File, line []byte) error {
+	if writer == nil || file == nil {
+		return fmt.Errorf("sidecar file is unavailable")
+	}
+	if writer.written+int64(len(line)) > writer.fileCap {
+		return fmt.Errorf("sidecar is already at its %d-byte cap", writer.fileCap)
+	}
+	written, err := file.Write(line)
+	if err != nil {
+		return err
+	}
+	if written != len(line) {
+		return io.ErrShortWrite
+	}
+	writer.written += int64(written)
+	return nil
 }
 
 func (writer *itemSidecarWriter) markStopped() {
@@ -251,16 +278,12 @@ func (writer *itemSidecarWriter) markStopped() {
 		writer.noteFailure("record append stop", fmt.Errorf("sidecar file is unavailable"))
 		return
 	}
-	if writer.written+int64(len(transcriptItemStopLine)) > writer.fileCap {
-		writer.noteFailure("record append stop", fmt.Errorf("sidecar is already at its %d-byte cap", writer.fileCap))
-		return
-	}
-	if _, err := writer.file.Write(transcriptItemStopLine); err != nil {
+	if err := writer.writeControlLine(writer.file, transcriptItemStopLine); err != nil {
 		writer.noteFailure("record append stop", err)
 		return
 	}
-	writer.written += int64(len(transcriptItemStopLine))
 	writer.stopped = true
+	writer.incomplete = true
 }
 
 func (writer *itemSidecarWriter) noteFailure(operation string, err error) {
@@ -268,30 +291,24 @@ func (writer *itemSidecarWriter) noteFailure(operation string, err error) {
 		return
 	}
 	writer.stopped = true
+	writer.incomplete = true
 	writer.diagnostic = itemSidecarDiagnosticPrefix + operation + ": " + err.Error()
 	if writer.file != nil {
 		_ = writer.file.Close()
 		writer.file = nil
 	}
-	writer.recordFailureMarker()
 	if writer.failureSink != nil {
 		writer.failureSink(writer.diagnostic)
 	}
 }
 
-// recordFailureMarker preserves a create-only signal when a deferred sidecar
-// close discovers a failure after the cancellation terminal record was written.
-// It is best effort: the marker can fail under the same broader filesystem
-// fault that stopped the sidecar.
-func (writer *itemSidecarWriter) recordFailureMarker() {
-	if writer == nil || strings.TrimSpace(writer.path) == "" {
+// markIncomplete withholds the completion receipt for uncertainty that does
+// not itself prevent sidecar I/O, such as a dropped backend frame.
+func (writer *itemSidecarWriter) markIncomplete() {
+	if writer == nil {
 		return
 	}
-	file, err := os.OpenFile(itemSidecarFailurePath(writer.path), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
-	if err != nil {
-		return
-	}
-	defer file.Close()
+	writer.incomplete = true
 }
 
 func (writer *itemSidecarWriter) close() {
@@ -300,8 +317,28 @@ func (writer *itemSidecarWriter) close() {
 	}
 	file := writer.file
 	writer.file = nil
+	// The receipt is written only after every item is durable, so a reader that
+	// sees it never treats an unsynced item prefix as a completed capture.
 	if err := file.Sync(); err != nil {
 		writer.noteFailure("sync", err)
+		_ = file.Close()
+		return
+	}
+	if writer.incomplete {
+		if err := file.Close(); err != nil {
+			writer.noteFailure("close", err)
+		}
+		return
+	}
+	if err := writer.writeControlLine(file, transcriptItemCompleteLine); err != nil {
+		writer.noteFailure("record capture completion", err)
+		_ = file.Close()
+		return
+	}
+	if err := file.Sync(); err != nil {
+		writer.noteFailure("sync capture completion", err)
+		_ = file.Close()
+		return
 	}
 	if err := file.Close(); err != nil {
 		writer.noteFailure("close", err)
@@ -309,10 +346,14 @@ func (writer *itemSidecarWriter) close() {
 }
 
 func (writer *itemSidecarWriter) diagnostics() []string {
-	if writer == nil || writer.diagnostic == "" {
+	if writer == nil {
 		return nil
 	}
-	return []string{writer.diagnostic}
+	diagnostics := make([]string, 0, 1)
+	if writer.diagnostic != "" {
+		diagnostics = append(diagnostics, writer.diagnostic)
+	}
+	return diagnostics
 }
 
 func itemSidecarPath(stdoutPath string) (string, error) {
@@ -321,10 +362,6 @@ func itemSidecarPath(stdoutPath string) (string, error) {
 		return "", fmt.Errorf("stdout log path %q is missing .stdout.log suffix", stdoutPath)
 	}
 	return base + ".items.jsonl", nil
-}
-
-func itemSidecarFailurePath(sidecarPath string) string {
-	return sidecarPath + itemSidecarFailureSuffix
 }
 
 // itemAssembler turns the normalized engine event stream into transcript
@@ -358,10 +395,8 @@ func (assembler *itemAssembler) absorb(event engine.Event, rawText string) {
 		return
 	}
 	switch event.Type {
-	case engine.EventProgress:
+	case engine.EventProgress, engine.EventModelReported:
 		assembler.noteProgress(time.Now().UTC())
-		return
-	case engine.EventModelReported:
 		return
 	}
 
@@ -378,6 +413,9 @@ func (assembler *itemAssembler) absorb(event engine.Event, rawText string) {
 		assembler.flushMessage()
 		assembler.append(transcriptItemToolResult, event.Name, rawText, false)
 	case engine.EventWarning:
+		if _, dropped := engine.TransportFrameDropsFromMetadata(event.Metadata); dropped {
+			assembler.writer.markIncomplete()
+		}
 		assembler.flushMessage()
 		assembler.append(transcriptItemWarning, "", rawText, false)
 	case engine.EventTerminalError:
