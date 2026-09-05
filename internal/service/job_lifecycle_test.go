@@ -391,7 +391,7 @@ func TestJobCancelBeforeSpawnIsDurable(t *testing.T) {
 	}
 }
 
-func TestJobCancelDoesNotTerminalizeAfterUnrecoverableRetirementReceipt(t *testing.T) {
+func TestJobCancelMarksIncompleteAfterRetirementReceiptFailure(t *testing.T) {
 	backend := &executionFakeBackend{name: "cancel-receipt-failure"}
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
 	record := queuedExecutionRecord(t, server, backend.Name(), "receipt failure", nil)
@@ -407,30 +407,28 @@ func TestJobCancelDoesNotTerminalizeAfterUnrecoverableRetirementReceipt(t *testi
 		return errors.New("temporary receipt store exhaustion")
 	}
 	run.beginTurn()
-	retired := run.retireTurn(store, turnOutcome{cleanup: protocol.CleanupClean, diagnostics: []string{"turn evidence"}})
-	if retired.retirementErr == nil {
-		t.Fatal("retireTurn reported a successful retirement after its receipt write failed")
-	}
-	if err := run.finalizeItemSidecar(store, nil); err == nil {
-		t.Fatal("finalization succeeded after every receipt retry failed")
-	}
-	if want := 1 + retirementReceiptRetryAttempts; attempts != want {
-		t.Fatalf("receipt write attempts = %d, want initial attempt plus %d retries", attempts, retirementReceiptRetryAttempts)
+	run.retireTurn(store, turnOutcome{cleanup: protocol.CleanupClean, diagnostics: []string{"turn evidence"}})
+	if attempts != 1 {
+		t.Fatalf("receipt write attempts = %d, want one immediate aggregate submission", attempts)
 	}
 
 	server.executionMu.Lock()
 	server.executions = map[string]*activeExecution{record.JobID: run}
 	server.executionMu.Unlock()
 	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
-	if canceled.err == nil || canceled.err.Data.Code != protocol.ErrorBackendUnavailable {
-		t.Fatalf("job.cancel after unrecoverable receipt = %#v, want backend-unavailable error", canceled.err)
+	if canceled.err != nil {
+		t.Fatalf("job.cancel after receipt failure = %#v", canceled.err)
 	}
 	stored, err := store.Get(record.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != protocol.PublicStateQueued || stored.Retirement != nil {
-		t.Fatalf("canceled record after unrecoverable receipt = %#v, want unchanged nonterminal record", stored)
+	if stored.State != protocol.PublicStateCanceled || !stored.EvidenceIncomplete || stored.Retirement != nil {
+		t.Fatalf("canceled record after receipt failure = %#v, want terminal incomplete evidence marker", stored)
+	}
+	transcript := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
+	if !transcript.Gap {
+		t.Fatalf("transcript after receipt failure = %#v, want gap", transcript)
 	}
 }
 

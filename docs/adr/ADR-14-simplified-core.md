@@ -310,9 +310,11 @@ item: counts, timestamps, the last few message items, and every captured error
 item. Explicit selectors widen the returned items subject to limit. A missing
 sidecar is an empty transcript with zero counts, no timestamps, items: [], and
 gap false. A terminal record remains readable because terminal handling never
-deletes its sidecar. gap is true only when the sidecar has its appendStopped
-marker, making its returned prefix visibly incomplete. liveness has the same
-active-execution-only projection and exact process-claim meaning as job.list.
+deletes its sidecar. gap is true when the sidecar has its appendStopped marker,
+when a durable sidecar-write diagnostic exists, or when the terminal record has
+its private evidenceIncomplete marker. Each case makes its returned prefix
+visibly incomplete. liveness has the same active-execution-only projection and
+exact process-claim meaning as job.list.
 
 job.cancel:
 
@@ -555,19 +557,28 @@ not a protocol field, so a running job's wire projection does not reveal interim
 cleanup or diagnostics. During a nonterminal lifetime the latest session id
 lives only in that receipt; the top-level session field is its terminal
 projection and the decode fallback for records written before receipts existed.
-A retiring turn persists its receipt before publishing its retirement to
-cancellation. Sidecar write failures persist their diagnostic when observed;
-if that receipt transaction fails, the observation remains pending in order and
-the finalization barrier retries it with a bounded backoff. An exhausted receipt
-retry makes the barrier fail, so cancellation leaves the record nonterminal
-rather than committing a terminal state it knows omits evidence. Final `Sync`
-and `Close` run behind that barrier before cancellation can commit terminal
-state.
+
+The service folds sidecar and turn observations into one ordered,
+de-duplicated pending aggregate and submits that aggregate as observations
+arrive. The receipt mutex protects only the aggregate snapshot, never a store
+transaction. A successful snapshot clears the aggregate unless a newer
+observation arrived concurrently, in which case one immediate handoff may
+submit the newer snapshot. The jobstore merges receipt diagnostics as an
+ordered set, so replaying the same aggregate after an ambiguous store outcome
+cannot double a diagnostic.
+
+There is no backoff schedule, drain loop, or cancellation-side finalization
+barrier. If an aggregate cannot be persisted, it remains pending and the first
+terminal transition writes the private evidenceIncomplete marker. job.transcript
+maps that marker to gap true rather than reporting a complete transcript whose
+retirement evidence is known incomplete. A cancellation with no active
+execution applies the same conservative marker. Final `Sync` and `Close`
+observations use this same aggregate path.
 
 The jobstore atomically merges that receipt into the first terminal intent.
 Completion, failure, cancellation, and restart reconciliation supply only their
 state-specific payloads. Receipt cleanup is monotonic, receipt diagnostics retain
-their order without a cancellation-side copy, and a non-completed terminal state
+their first-observation order without a cancellation-side copy, and a non-completed terminal state
 uses the receipt's session id for resumption. Completed records still omit their
 session id. Records written before this receipt existed decode with no receipt;
 recovery preserves only the facts those records already stored and remains

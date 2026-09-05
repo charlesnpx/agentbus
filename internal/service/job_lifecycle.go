@@ -145,19 +145,19 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 
 	run := s.activeExecution(record.JobID)
 	cleanup, diagnostics := s.cancelActiveOrRecordedProcess(store, record)
+	// A run with unfinalized evidence, or no run at all after a worker exited,
+	// cannot establish that its transcript is complete. Mark the terminal record
+	// conservatively instead of recreating a cancellation-side retry barrier.
+	evidenceIncomplete := run == nil
 	if run != nil {
-		// This wait holds neither a service mutex nor the launch fence. The
-		// retiring turn and final sidecar Sync/Close both persist their receipt
-		// before the barrier opens, so MarkTerminal can merge it atomically.
-		if err := run.waitForRetirementAndFinalization(); err != nil {
-			return jobStoreUnavailable("persist retirement receipt before cancellation", err)
-		}
+		evidenceIncomplete = run.retirementEvidenceIncomplete()
 	}
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
-		State:       protocol.PublicStateCanceled,
-		Cleanup:     cleanup,
-		Diagnostics: diagnostics,
-		FinishedAt:  time.Now().UTC(),
+		State:              protocol.PublicStateCanceled,
+		Cleanup:            cleanup,
+		Diagnostics:        diagnostics,
+		EvidenceIncomplete: evidenceIncomplete,
+		FinishedAt:         time.Now().UTC(),
 	})
 	if err != nil {
 		if errors.Is(err, jobstore.ErrTerminal) {

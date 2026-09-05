@@ -334,12 +334,19 @@ func TestV0131RecordDecodesWithoutInventedRetirementEvidence(t *testing.T) {
 	if decoded.State != protocol.PublicStateRunning || decoded.BackendSessionID != "thread-v0131" {
 		t.Fatalf("decoded v0.13.1 record = %#v", decoded)
 	}
-	retired, err := store.RetireTurn(jobID, RetirementReceipt{BackendSessionID: "thread-current"})
+	receipt := RetirementReceipt{
+		BackendSessionID: "thread-current",
+		Diagnostics:      []string{"turn retirement observation"},
+	}
+	retired, err := store.RetireTurn(jobID, receipt)
 	if err != nil {
 		t.Fatalf("RetireTurn current receipt: %v", err)
 	}
-	if retired.BackendSessionID != "thread-v0131" || retired.Retirement == nil || retired.Retirement.BackendSessionID != "thread-current" {
+	if retired.BackendSessionID != "thread-v0131" || retired.Retirement == nil || retired.Retirement.BackendSessionID != "thread-current" || len(retired.Retirement.Diagnostics) != 1 {
 		t.Fatalf("nonterminal receipt projection = %#v, want legacy field unchanged and current receipt retained", retired)
+	}
+	if _, err := store.RetireTurn(jobID, receipt); err != nil {
+		t.Fatalf("replay aggregate receipt: %v", err)
 	}
 	terminal, err := store.MarkTerminal(jobID, TerminalUpdate{
 		State:       protocol.PublicStateUnknown,
@@ -349,7 +356,7 @@ func TestV0131RecordDecodesWithoutInventedRetirementEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if terminal.State != protocol.PublicStateUnknown || terminal.Cleanup != protocol.CleanupClean || terminal.BackendSessionID != "thread-current" || len(terminal.Diagnostics) != 1 || terminal.Diagnostics[0] != "restart reconciliation: no relaunch" {
+	if terminal.State != protocol.PublicStateUnknown || terminal.Cleanup != protocol.CleanupClean || terminal.BackendSessionID != "thread-current" || len(terminal.Diagnostics) != 2 || terminal.Diagnostics[0] != "turn retirement observation" || terminal.Diagnostics[1] != "restart reconciliation: no relaunch" {
 		t.Fatalf("terminalized v0.13.1 record = %#v, want current receipt projection and new recovery observation", terminal)
 	}
 }

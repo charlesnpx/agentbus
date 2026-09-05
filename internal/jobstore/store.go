@@ -136,29 +136,33 @@ type Record struct {
 	// written before retirement receipts existed. An omitted value means the job
 	// never produced a resumable backend session; it is not an unknown-session
 	// marker.
-	BackendSessionID string                  `json:"backendSessionId,omitempty"`
-	Model            string                  `json:"model,omitempty"`
-	CWD              string                  `json:"cwd,omitempty"`
-	Write            bool                    `json:"write"`
-	Effort           string                  `json:"effort,omitempty"`
-	TaskSpec         json.RawMessage         `json:"taskSpec,omitempty"`
-	State            protocol.PublicState    `json:"state"`
-	Starting         bool                    `json:"starting,omitempty"`
-	ProcessClaim     *ProcessClaim           `json:"processClaim,omitempty"`
-	Cleanup          protocol.Cleanup        `json:"cleanup"`
-	CreatedAt        time.Time               `json:"createdAt"`
-	UpdatedAt        time.Time               `json:"updatedAt"`
-	StartedAt        *time.Time              `json:"startedAt,omitempty"`
-	FinishedAt       *time.Time              `json:"finishedAt,omitempty"`
-	FailureClass     protocol.FailureClass   `json:"failureClass,omitempty"`
-	FailureReason    string                  `json:"failureReason,omitempty"`
-	Diagnostics      []string                `json:"diagnostics"`
-	Contract         protocol.ContractResult `json:"contract"`
-	ResultText       string                  `json:"resultText,omitempty"`
-	ResultPath       string                  `json:"resultPath,omitempty"`
-	ResultSHA256     string                  `json:"resultSHA256,omitempty"`
-	ResultBytes      int64                   `json:"resultBytes,omitempty"`
-	Artifacts        ArtifactPaths           `json:"artifacts"`
+	BackendSessionID string                `json:"backendSessionId,omitempty"`
+	Model            string                `json:"model,omitempty"`
+	CWD              string                `json:"cwd,omitempty"`
+	Write            bool                  `json:"write"`
+	Effort           string                `json:"effort,omitempty"`
+	TaskSpec         json.RawMessage       `json:"taskSpec,omitempty"`
+	State            protocol.PublicState  `json:"state"`
+	Starting         bool                  `json:"starting,omitempty"`
+	ProcessClaim     *ProcessClaim         `json:"processClaim,omitempty"`
+	Cleanup          protocol.Cleanup      `json:"cleanup"`
+	CreatedAt        time.Time             `json:"createdAt"`
+	UpdatedAt        time.Time             `json:"updatedAt"`
+	StartedAt        *time.Time            `json:"startedAt,omitempty"`
+	FinishedAt       *time.Time            `json:"finishedAt,omitempty"`
+	FailureClass     protocol.FailureClass `json:"failureClass,omitempty"`
+	FailureReason    string                `json:"failureReason,omitempty"`
+	Diagnostics      []string              `json:"diagnostics"`
+	// EvidenceIncomplete is a private terminal marker. It means a retirement
+	// observation could not be durably recorded, so consumers must not treat a
+	// transcript as a complete account of the execution.
+	EvidenceIncomplete bool                    `json:"evidenceIncomplete,omitempty"`
+	Contract           protocol.ContractResult `json:"contract"`
+	ResultText         string                  `json:"resultText,omitempty"`
+	ResultPath         string                  `json:"resultPath,omitempty"`
+	ResultSHA256       string                  `json:"resultSHA256,omitempty"`
+	ResultBytes        int64                   `json:"resultBytes,omitempty"`
+	Artifacts          ArtifactPaths           `json:"artifacts"`
 	// Retirement is private durable turn evidence. It is intentionally omitted
 	// from every wire projection in internal/service.
 	Retirement *RetirementReceipt `json:"retirement,omitempty"`
@@ -169,17 +173,18 @@ type Record struct {
 // is deliberately absent: MarkTerminal merges the record's private retirement
 // receipt atomically with this state-specific payload.
 type TerminalUpdate struct {
-	State         protocol.PublicState
-	Cleanup       protocol.Cleanup
-	FailureClass  protocol.FailureClass
-	FailureReason string
-	Diagnostics   []string
-	Contract      protocol.ContractResult
-	ResultText    string
-	ResultPath    string
-	ResultSHA256  string
-	ResultBytes   int64
-	FinishedAt    time.Time
+	State              protocol.PublicState
+	Cleanup            protocol.Cleanup
+	FailureClass       protocol.FailureClass
+	FailureReason      string
+	Diagnostics        []string
+	EvidenceIncomplete bool
+	Contract           protocol.ContractResult
+	ResultText         string
+	ResultPath         string
+	ResultSHA256       string
+	ResultBytes        int64
+	FinishedAt         time.Time
 }
 
 // RecordLookup reads a record from the same submit transaction that is
@@ -635,9 +640,9 @@ func (store *Store) RecordProcessClaim(id string, claim ProcessClaim) (Record, e
 // recovery still needs the session, cleanup uncertainty, and diagnostics that
 // were already observed.
 //
-// Cleanup uncertainty is sticky and diagnostics retain call order. Callers
-// must submit each observation once; this method does not collapse distinct
-// observations that happen to have identical text.
+// Cleanup uncertainty is sticky and diagnostics retain first-observation
+// order. Receipt diagnostics are an ordered set: that makes an aggregate
+// submission idempotent when a commit outcome is ambiguous.
 func (store *Store) RetireTurn(id string, receipt RetirementReceipt) (Record, error) {
 	if err := validateJobID(id); err != nil {
 		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
@@ -668,7 +673,7 @@ func (store *Store) RetireTurn(id string, receipt RetirementReceipt) (Record, er
 		if receipt.CleanupUncertain {
 			nextReceipt.CleanupUncertain = true
 		}
-		nextReceipt.Diagnostics = append(nextReceipt.Diagnostics, receipt.Diagnostics...)
+		nextReceipt.Diagnostics = mergeRetirementDiagnostics(nextReceipt.Diagnostics, receipt.Diagnostics)
 		if !nextReceipt.empty() {
 			next.Retirement = &nextReceipt
 		}
@@ -718,6 +723,7 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 			next.Cleanup = protocol.CleanupUncertain
 		}
 		next.Diagnostics = mergeTerminalDiagnostics(next.Retirement, terminal.Diagnostics)
+		next.EvidenceIncomplete = next.EvidenceIncomplete || terminal.EvidenceIncomplete
 		applyTerminalPayload(&next, terminal)
 		if terminal.FinishedAt.IsZero() {
 			now := time.Now().UTC()
@@ -739,6 +745,26 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 		return nil
 	})
 	return result, err
+}
+
+// mergeRetirementDiagnostics keeps the first occurrence of each diagnostic.
+// A retirement receipt is an aggregate snapshot, so replaying it after an
+// ambiguous store result must not make an already-recorded diagnostic appear
+// twice in the terminal record.
+func mergeRetirementDiagnostics(existing, incoming []string) []string {
+	for _, diagnostic := range incoming {
+		seen := false
+		for _, recorded := range existing {
+			if recorded == diagnostic {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			existing = append(existing, diagnostic)
+		}
+	}
+	return existing
 }
 
 func mergeTerminalDiagnostics(receipt *RetirementReceipt, stateSpecific []string) []string {
@@ -951,6 +977,9 @@ func validateRecord(record Record) error {
 		if err := record.Retirement.validate(); err != nil {
 			return err
 		}
+	}
+	if record.EvidenceIncomplete && !record.State.IsTerminal() {
+		return fmt.Errorf("%w: incomplete evidence marker requires terminal state", ErrInvalid)
 	}
 	if !record.Cleanup.Valid() {
 		return fmt.Errorf("%w: invalid cleanup %q", ErrInvalid, record.Cleanup)
