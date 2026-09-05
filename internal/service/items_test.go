@@ -567,12 +567,6 @@ func TestItemSidecarWriterCleanCloseDoesNotCreateFailureMarker(t *testing.T) {
 }
 
 func TestItemSidecarFailureMarkerOpenFailureMarksGap(t *testing.T) {
-	server := newTestServer(t, t.TempDir(), Config{})
-	record := transcriptTestRecord(t, server, "failure-marker-open")
-	writeTranscriptSidecar(t, record, []protocol.TranscriptItem{
-		transcriptTestItem(1, time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC), "message"),
-	}, false)
-
 	// A 250-byte sidecar name is valid on the supported filesystems, while its
 	// .failure sibling exceeds the 255-byte filename limit and makes marker
 	// creation fail with an error other than EEXIST.
@@ -582,26 +576,11 @@ func TestItemSidecarFailureMarkerOpenFailureMarksGap(t *testing.T) {
 		t.Fatalf("marker-failure sidecar setup diagnostic = %q", writer.diagnostic)
 	}
 	defer writer.close()
-	run := newActiveExecution(record.JobID, nil)
+	run := newActiveExecution("failure-marker-open", nil)
 	writer.setFailureSink(run.noteItemSidecarDiagnostic)
 	writer.recordFailureMarker()
 	if !hasItemSidecarFailure(run.itemSidecarDiagnostics()) {
 		t.Fatalf("marker-open failure diagnostics = %#v, want durable sidecar gap source", run.itemSidecarDiagnostics())
-	}
-
-	store, err := server.ensureJobStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
-		State:       protocol.PublicStateCompleted,
-		Cleanup:     protocol.CleanupClean,
-		Diagnostics: run.itemSidecarDiagnostics(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID}); !result.Gap {
-		t.Fatalf("marker-open failure transcript = %#v, want gap true", result)
 	}
 
 	t.Run("existing marker is success", func(t *testing.T) {

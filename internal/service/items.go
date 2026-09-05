@@ -496,13 +496,6 @@ func (assembler *itemAssembler) finishTurn() {
 	}
 }
 
-func (assembler *itemAssembler) recordFailureMarker() {
-	if assembler == nil || assembler.writer == nil {
-		return
-	}
-	assembler.writer.recordFailureMarker()
-}
-
 func (assembler *itemAssembler) append(kind transcriptItemKind, name, text string, alreadyTruncated bool) {
 	if assembler == nil || assembler.writer == nil {
 		return
