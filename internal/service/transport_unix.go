@@ -130,6 +130,8 @@ func (s *Server) handle(connection *connection, request protocol.Request) reques
 		return s.handleJobGet(request.Params)
 	case protocol.MethodJobList:
 		return s.handleJobList(request.Params)
+	case protocol.MethodJobTranscript:
+		return s.handleJobTranscript(request.Params)
 	case protocol.MethodJobCancel:
 		return s.handleJobCancel(request.Params)
 	default:

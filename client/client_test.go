@@ -339,6 +339,31 @@ func TestJobListReflectWalksEverySummaryField(t *testing.T) {
 	assertReflectDecoded(t, reflect.ValueOf(want), reflect.ValueOf(got.Jobs[0]), "job.list summary")
 }
 
+func TestJobTranscriptReflectWalksEveryTranscriptField(t *testing.T) {
+	want := reflectPopulatedValue[JobTranscriptResult](t)
+	since := time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC)
+	sinceOrdinal := 7
+	last := 3
+	limit := 2
+	params := JobTranscriptParams{
+		JobID:        "job-reflect",
+		Kinds:        []string{"message", "error"},
+		Since:        &since,
+		SinceOrdinal: &sinceOrdinal,
+		Last:         &last,
+		Limit:        &limit,
+	}
+	client, requests, done := newOneShotClient(t, protocol.Response{Result: want})
+
+	got, err := client.JobTranscript(context.Background(), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJobTranscriptRequest(t, <-requests, params)
+	assertOneShotClientDone(t, done)
+	assertReflectDecoded(t, reflect.ValueOf(want), reflect.ValueOf(got), "job.transcript result")
+}
+
 func TestJobGetEmptyIDReturnsTypedRPCError(t *testing.T) {
 	client, requests, done := newOneShotClient(t, protocol.Response{Error: protocol.NewError(
 		protocol.ErrorInvalidTaskSpec,
@@ -486,6 +511,20 @@ func assertJobListRequest(t *testing.T, request protocol.Request, want JobListPa
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("job.list params = %#v, want %#v", got, want)
+	}
+}
+
+func assertJobTranscriptRequest(t *testing.T, request protocol.Request, want JobTranscriptParams) {
+	t.Helper()
+	if request.Method != protocol.MethodJobTranscript {
+		t.Fatalf("method = %q, want %q", request.Method, protocol.MethodJobTranscript)
+	}
+	var got JobTranscriptParams
+	if err := json.Unmarshal(request.Params, &got); err != nil {
+		t.Fatalf("decode job.transcript params: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("job.transcript params = %#v, want %#v", got, want)
 	}
 }
 

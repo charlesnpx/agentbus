@@ -52,7 +52,7 @@ artifacts while a daemon is using the root.
 
 Use agentbus serve to start a background daemon. Use agentbus serve --foreground
 when a supervisor owns the process. The public CLI commands are version, serve,
-status, result, and cancel.
+status, transcript, result, and cancel.
 
 There is no standalone setup command or backend probe. Admission checks only
 that the requested backend name is registered in the daemon's backend map. A

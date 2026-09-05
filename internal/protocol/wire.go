@@ -15,10 +15,12 @@ const (
 	MethodJobGet = "job.get"
 	// MethodJobList retrieves compact job summaries.
 	MethodJobList = "job.list"
+	// MethodJobTranscript retrieves the captured transcript for one job.
+	MethodJobTranscript = "job.transcript"
 )
 
 // The protocol error codes are the only codes protocol.hello, job.submit, job.get,
-// job.list, and job.cancel may produce.
+// job.list, job.transcript, and job.cancel may produce.
 const (
 	ErrorUnauthorized       = "unauthorized"
 	ErrorVersionMismatch    = "protocol_version_mismatch"
@@ -192,6 +194,43 @@ type JobListParams struct {
 // JobListResult is the response to job.list.
 type JobListResult struct {
 	Jobs []JobSummaryWire `json:"jobs"`
+}
+
+// JobTranscriptParams selects a stateless view of one job's captured
+// transcript. JobID is required. Every selector is optional and selectors
+// combine with AND.
+type JobTranscriptParams struct {
+	JobID        string     `json:"jobId"`
+	Kinds        []string   `json:"kinds,omitempty"`
+	Since        *time.Time `json:"since,omitempty"`
+	SinceOrdinal *int       `json:"sinceOrdinal,omitempty"`
+	Last         *int       `json:"last,omitempty"`
+	Limit        *int       `json:"limit,omitempty"`
+}
+
+// TranscriptItem is one normalized, backend-neutral event captured for a
+// job. Kind is one of message, tool, fileChange, warning, or error.
+type TranscriptItem struct {
+	Ordinal   int       `json:"ordinal"`
+	At        time.Time `json:"at"`
+	Kind      string    `json:"kind"`
+	Name      string    `json:"name,omitempty"`
+	Text      string    `json:"text,omitempty"`
+	Truncated bool      `json:"truncated"`
+}
+
+// JobTranscriptResult is the captured transcript digest and selected items
+// for one job. Counts, itemCount, firstAt, lastAt, and gap describe the
+// captured sidecar rather than only the selected Items.
+type JobTranscriptResult struct {
+	State     PublicState      `json:"state"`
+	Liveness  Liveness         `json:"liveness,omitempty"`
+	ItemCount int              `json:"itemCount"`
+	Counts    map[string]int   `json:"counts"`
+	FirstAt   *time.Time       `json:"firstAt,omitempty"`
+	LastAt    *time.Time       `json:"lastAt,omitempty"`
+	Items     []TranscriptItem `json:"items"`
+	Gap       bool             `json:"gap"`
 }
 
 // JobCancelParams is the parameter object for job.cancel.

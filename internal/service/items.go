@@ -12,11 +12,13 @@ import (
 	"unicode/utf8"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
 const (
-	transcriptItemTextCap = 4 * 1024
-	transcriptItemFileCap = 16 * 1024 * 1024
+	transcriptItemTextCap       = 4 * 1024
+	transcriptItemFileCap       = 16 * 1024 * 1024
+	itemSidecarDiagnosticPrefix = "item sidecar "
 )
 
 var transcriptItemStopLine = []byte("{\"appendStopped\":true}\n")
@@ -31,16 +33,9 @@ const (
 	transcriptItemError      transcriptItemKind = "error"
 )
 
-// TranscriptItem is one normalized, backend-neutral event captured for a job.
-// Its Kind is one of message, tool, fileChange, warning, or error.
-type TranscriptItem struct {
-	Ordinal   int       `json:"ordinal"`
-	At        time.Time `json:"at"`
-	Kind      string    `json:"kind"`
-	Name      string    `json:"name,omitempty"`
-	Text      string    `json:"text,omitempty"`
-	Truncated bool      `json:"truncated"`
-}
+// TranscriptItem is the wire-shaped normalized event captured in a job's
+// private sidecar.
+type TranscriptItem = protocol.TranscriptItem
 
 // ItemActivity is the in-memory transcript progress for a running job.
 // LastActivityAt also advances for contentless progress events; LastItemAt
@@ -266,7 +261,7 @@ func (writer *itemSidecarWriter) noteFailure(operation string, err error) {
 		return
 	}
 	writer.stopped = true
-	writer.diagnostic = "item sidecar " + operation + ": " + err.Error()
+	writer.diagnostic = itemSidecarDiagnosticPrefix + operation + ": " + err.Error()
 	if writer.file != nil {
 		_ = writer.file.Close()
 		writer.file = nil

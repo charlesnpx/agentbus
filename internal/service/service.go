@@ -1,8 +1,7 @@
 //go:build darwin || linux
 
 // Package service exposes the transport and lifecycle for the version-3
-// agentbus daemon. It serves protocol.hello and durable job.submit; later
-// units add the remaining job methods.
+// agentbus daemon, including its complete job wire surface.
 package service
 
 import (
@@ -252,7 +251,7 @@ func (s *Server) ShutdownTimeout() time.Duration {
 }
 
 // Serve listens until ctx is canceled, an idle timeout fires, or a stale
-// binary has drained. It serves protocol.hello and job.submit.
+// binary has drained.
 func (s *Server) Serve(ctx context.Context) error {
 	return s.serve(ctx, ctx)
 }

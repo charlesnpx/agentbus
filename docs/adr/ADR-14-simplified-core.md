@@ -32,7 +32,7 @@ them.
 ### Protocol version 3
 
 Protocol version is 3. Its entire method set is protocol.hello, job.submit,
-job.get, job.list, and job.cancel. Any other method, including a former method, is absent
+job.get, job.list, job.transcript, and job.cancel. Any other method, including a former method, is absent
 and MUST return the JSON-RPC method-not-found response. Each shape below is a
 JSON-RPC params or result object, not its envelope. Optional fields are omitted,
 never null. Times are RFC 3339 UTC strings.
@@ -228,6 +228,66 @@ working directory for status without --job; --all-workspaces intentionally
 clears that filter. Multiple orchestrators in one repository share a workspace
 scope.
 
+job.transcript returns a stateless digest and selected captured items for one
+job:
+
+    params
+    {
+      "jobId": "string",
+      "kinds": ["message", "error"],
+      "since": "RFC3339 UTC timestamp",
+      "sinceOrdinal": 141,
+      "last": 10,
+      "limit": 20
+    }
+
+    result
+    {
+      "state": "queued|running|completed|failed|canceled|unknown",
+      "liveness": "alive|gone|unknown",
+      "itemCount": 258,
+      "counts": {
+        "message": 6,
+        "tool": 156,
+        "fileChange": 0,
+        "warning": 0,
+        "error": 1
+      },
+      "firstAt": "RFC3339 UTC timestamp",
+      "lastAt": "RFC3339 UTC timestamp",
+      "items": [
+        {
+          "ordinal": 141,
+          "at": "RFC3339 UTC timestamp",
+          "kind": "message",
+          "name": "optional tool name",
+          "text": "optional text",
+          "truncated": false
+        }
+      ],
+      "gap": false
+    }
+
+jobId is required. kinds, since, sinceOrdinal, last, and limit are optional
+and stateless. kinds selects the listed closed item kinds; since and
+sinceOrdinal are strict-after filters; last selects the final N matching items;
+and limit bounds selected items. All supplied filters combine with AND. An
+ordinal is an explicit, durable caller handle: a caller may record the last
+ordinal it saw and later supply it as sinceOrdinal, rather than retaining an
+opaque cursor across compaction. If last and limit are both supplied, the
+response keeps the most recent minimum of the two bounds.
+
+itemCount, counts, firstAt, lastAt, and gap describe the captured sidecar, not
+only the selected items. counts always names every closed kind, including zero
+values. With no selector, job.transcript returns a digest rather than every
+item: counts, timestamps, the last few message items, and every captured error
+item. Explicit selectors widen the returned items subject to limit. A missing
+sidecar is an empty transcript with zero counts, no timestamps, items: [], and
+gap false. A terminal record remains readable because terminal handling never
+deletes its sidecar. gap is true only when the sidecar has its appendStopped
+marker, making its returned prefix visibly incomplete. liveness has the same
+active-execution-only projection and exact process-claim meaning as job.list.
+
 job.cancel:
 
     params
@@ -240,11 +300,11 @@ job.cancel:
     }
 
 Former extra job, schema, and capability operations are deleted. job.list is
-the only list request.
+the only multi-job list request.
 
 ### CLI version 0.13.0
 
-The complete CLI surface is version, serve, status, result, and cancel. There
+The complete CLI surface is version, serve, status, transcript, result, and cancel. There
 is no submit command: Delegate makes the typed job.submit request after task and
 identity preparation.
 
@@ -265,6 +325,12 @@ exists, result writes no result text and reports why on standard error.
 cancel invokes job.cancel. version reports application version 0.13.0 and
 protocol version 3. serve owns daemon startup only. setup, validate, every
 admission subcommand, and every internal-* subcommand are deleted.
+
+transcript invokes job.transcript. It requires --job and accepts repeatable
+--kind plus --last, --since, --since-ordinal, --limit, and --json. Its text
+mode prints a metadata line, digest counts for the unselected default request,
+and one line per item beginning with that item's ordinal so an operator can use
+it as a later --since-ordinal value.
 
 Admission validates a requested backend only by registered-backend map lookup;
 the daemon does not probe backends, lazily probe them, or retain a probe cache.
@@ -432,7 +498,7 @@ During a live turn, the service assembles normalized backend events into the
 private `<jobId>.items.jsonl` sidecar beside the backend logs. The service
 derives that path from the validated stdout-log path by replacing its
 `.stdout.log` suffix; it is not an engine API, a `logPaths` field, a durable
-store field, or a new RPC method. Each item has an ordinal, append time, closed
+store field. job.transcript is the only RPC that reads it. Each item has an ordinal, append time, closed
 kind (`message`, `tool`, `fileChange`, `warning`, or `error`), optional tool
 name and text, and an explicit truncation flag. Consecutive agent-text events
 are coalesced; without a boundary signal in `engine.Event`, two otherwise
@@ -595,7 +661,7 @@ delete an old root.
 - A recorded terminal state is immutable.
 - Cleanup uncertainty cannot erase an authoritative result.
 - Restart reaping signals only exact start-token equality.
-- The public protocol has exactly five methods and exactly six states.
+- The public protocol has exactly six methods and exactly six states.
 - The version-3 store opens safely before socket bind or returns a typed error.
 - Old roots are not compatible with version 0.13.0 and are not migrated.
 
@@ -656,7 +722,10 @@ is a rejection with no job record or requests binding. The state vocabulary was
 reviewed to confirm that no retry state is implied.
 
 The version-3 contract now separates single-record job.get from filtered
-job.list without a version bump. job.list exposes submitted tags plus
-daemon-local item activity and liveness verdicts, never process identifiers.
+job.list and stateless job.transcript without a version bump. job.list exposes
+submitted tags plus daemon-local item activity and liveness verdicts, never
+process identifiers. job.transcript exposes a bounded digest by default,
+gap-aware captured items on demand, and ordinal handles instead of opaque
+cursors.
 Workspace scoping remains a client-selected filter rather than an ownership
 claim or enforcement mechanism.
