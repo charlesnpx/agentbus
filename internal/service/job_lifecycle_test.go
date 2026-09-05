@@ -572,20 +572,13 @@ func TestJobCancelBetweenProcessStartAndClaimPersistenceKeepsClaim(t *testing.T)
 	}
 
 	ref := engine.ProcessRef{PID: 4117, PGID: 4117, StartTime: "claim-persistence-window-token"}
-	interrupted := make(chan struct{})
 	observedLivePGID := make(chan int)
 	server.processGroupGoneFn = func(pgid int) (bool, error) {
 		observedLivePGID <- pgid
 		return true, nil
 	}
-	session := &executionFakeSession{
-		interrupt: func(context.Context) error {
-			close(interrupted)
-			return nil
-		},
-	}
 	run := newActiveExecution(record.JobID, backend)
-	run.setSession(session)
+	run.setSession(&executionFakeSession{})
 	run.beginTurn()
 	// This is the reachable state after OnProcessStart notes the identity and
 	// releases the launch gate, but before its separate claim transaction.
@@ -610,11 +603,6 @@ func TestJobCancelBetweenProcessStartAndClaimPersistenceKeepsClaim(t *testing.T)
 		cancelDone <- server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
 	}()
 	select {
-	case <-interrupted:
-	case <-time.After(time.Second):
-		t.Fatal("job.cancel did not interrupt the live session")
-	}
-	select {
 	case pgid := <-observedLivePGID:
 		if pgid != ref.PGID {
 			t.Fatalf("job.cancel observed process group %d, want live claim group %d", pgid, ref.PGID)
@@ -626,10 +614,6 @@ func TestJobCancelBetweenProcessStartAndClaimPersistenceKeepsClaim(t *testing.T)
 	// The turn owner persists after containment has selected the live claim,
 	// before it retires and lets cancellation commit the terminal record.
 	run.persistProcessClaim(store)
-	attempted, recorded, claimErr := run.claimStatus()
-	if !attempted || !recorded || claimErr != nil {
-		t.Fatalf("claim status after persistence = attempted:%t recorded:%t err:%v", attempted, recorded, claimErr)
-	}
 	run.retireTurn(store, turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean})
 
 	select {

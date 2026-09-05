@@ -186,13 +186,9 @@ func (run *activeExecution) startTurn(store *jobstore.Store, session engine.Sess
 		releaseLaunch()
 		return nil, context.Canceled, true
 	}
-	reportedStart := input.OnProcessStart
-	input.OnProcessStart = func(ref engine.ProcessRef, backendChildPID int) {
+	input.OnProcessStart = func(ref engine.ProcessRef, _ int) {
 		run.noteProcessClaim(ref)
 		releaseLaunch()
-		if reportedStart != nil {
-			reportedStart(ref, backendChildPID)
-		}
 		run.persistProcessClaim(store)
 	}
 	events, err := session.Turn(ctx, input)
