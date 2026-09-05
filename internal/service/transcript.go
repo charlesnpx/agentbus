@@ -94,7 +94,9 @@ func (s *Server) jobTranscript(record jobstore.Record, params protocol.JobTransc
 	if present {
 		result, err = readTranscriptSidecar(path, params)
 		if err != nil {
-			return protocol.JobTranscriptResult{}, err
+			// A failed read still leaves a useful captured prefix. Report its
+			// incompleteness instead of hiding it behind an RPC failure.
+			result.Gap = true
 		}
 		result.State = projectedState(record)
 	}
@@ -150,22 +152,19 @@ func newTranscriptCounts() map[string]int {
 }
 
 func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) (protocol.JobTranscriptResult, error) {
-	file, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return protocol.JobTranscriptResult{
-			Counts: newTranscriptCounts(),
-			Items:  make([]protocol.TranscriptItem, 0),
-		}, nil
-	}
-	if err != nil {
-		return protocol.JobTranscriptResult{}, err
-	}
-	defer file.Close()
-
 	result := protocol.JobTranscriptResult{
 		Counts: newTranscriptCounts(),
 		Items:  make([]protocol.TranscriptItem, 0),
 	}
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return result, nil
+	}
+	if err != nil {
+		return result, fmt.Errorf("open transcript sidecar: %w", err)
+	}
+	defer file.Close()
+
 	kinds := make(map[string]struct{}, len(params.Kinds))
 	for _, kind := range params.Kinds {
 		kinds[kind] = struct{}{}
@@ -179,6 +178,17 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) (pr
 		}
 	}
 	var items, messages, errorItems []protocol.TranscriptItem
+	finishItems := func() {
+		if defaultDigest {
+			items = make([]protocol.TranscriptItem, 0, len(messages)+len(errorItems))
+			items = append(items, messages...)
+			items = append(items, errorItems...)
+			sort.Slice(items, func(left, right int) bool { return items[left].Ordinal < items[right].Ordinal })
+		} else if items == nil {
+			items = make([]protocol.TranscriptItem, 0)
+		}
+		result.Items = items
+	}
 
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 8*1024), maxTranscriptSidecarLine)
@@ -191,7 +201,8 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) (pr
 
 		var item protocol.TranscriptItem
 		if err := json.Unmarshal(line, &item); err != nil {
-			return protocol.JobTranscriptResult{}, fmt.Errorf("decode transcript item: %w", err)
+			finishItems()
+			return result, fmt.Errorf("decode transcript item: %w", err)
 		}
 		result.ItemCount++
 		result.Counts[item.Kind]++
@@ -230,17 +241,10 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) (pr
 		items = append(items, item)
 	}
 	if err := scanner.Err(); err != nil {
-		return protocol.JobTranscriptResult{}, fmt.Errorf("scan transcript sidecar: %w", err)
+		finishItems()
+		return result, fmt.Errorf("scan transcript sidecar: %w", err)
 	}
-	if defaultDigest {
-		items = make([]protocol.TranscriptItem, 0, len(messages)+len(errorItems))
-		items = append(items, messages...)
-		items = append(items, errorItems...)
-		sort.Slice(items, func(left, right int) bool { return items[left].Ordinal < items[right].Ordinal })
-	} else if items == nil {
-		items = make([]protocol.TranscriptItem, 0)
-	}
-	result.Items = items
+	finishItems()
 	return result, nil
 }
 

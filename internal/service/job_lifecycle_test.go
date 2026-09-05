@@ -218,12 +218,13 @@ func TestJobLifecycleProjectsBackendReportedModel(t *testing.T) {
 				t.Fatalf("running job.list error = %#v", list.err)
 			}
 			jobs := list.result.(protocol.JobListResult).Jobs
-			if detail.ModelReported == reportedModel && len(jobs) == 1 && jobs[0].JobID == record.JobID && jobs[0].ModelReported == reportedModel {
+			if detail.ModelReported == reportedModel && len(jobs) == 1 && jobs[0].JobID == record.JobID && jobs[0].ModelReported == reportedModel &&
+				jobs[0].ItemCount != nil && *jobs[0].ItemCount == 0 && jobs[0].LastItemAt == nil && jobs[0].LastActivityAt != nil {
 				break
 			}
 			select {
 			case <-deadline.C:
-				t.Fatalf("running model projection: job.get=%q job.list=%#v, want %q", detail.ModelReported, jobs, reportedModel)
+				t.Fatalf("running model projection: job.get=%q job.list=%#v, want model %q with activity but no item", detail.ModelReported, jobs, reportedModel)
 			case <-ticker.C:
 			}
 		}

@@ -186,6 +186,34 @@ func TestTranscriptItemsSuppressWorkspaceWriteText(t *testing.T) {
 	if !bytes.Contains(sidecar, []byte(`"truncated":false`)) {
 		t.Fatalf("sidecar = %s, want explicit false truncated member", sidecar)
 	}
+	if result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID}); result.Gap {
+		t.Fatalf("clean file-change transcript = %#v, want gap false", result)
+	}
+
+	t.Run("dropped completed frame marks gap", func(t *testing.T) {
+		drops := engine.TransportFrameDrops{Count: 1, Bytes: 1024, RedactedPrefix: "method=item/completed"}
+		backend := &executionFakeBackend{name: "items-dropped-completed-frame"}
+		backend.start = func(_ context.Context, _ engine.SessionOpts) (engine.Session, error) {
+			return &executionFakeSession{
+				turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+					input.OnProcessStart(engine.ProcessRef{PID: 6107, PGID: 6107, StartTime: "items-dropped-completed-frame"}, 0)
+					return executionEvents(engine.Event{
+						Type:     engine.EventWarning,
+						Text:     "discarded completed item frame",
+						Metadata: drops.EventMetadata(),
+					}), nil
+				},
+			}, nil
+		}
+		server := newExecutionServer(t, backend)
+		record := queuedExecutionRecord(t, server, backend.Name(), "dropped completed frame", nil)
+		runExecution(t, server, record)
+
+		result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
+		if !result.Gap || result.ItemCount != 1 || result.Counts["warning"] != 1 || result.Counts["tool"] != 0 || result.Counts["fileChange"] != 0 {
+			t.Fatalf("dropped completed-frame transcript = %#v, want warning-only incomplete prefix", result)
+		}
+	})
 }
 
 func TestTranscriptItemsCapTextAndDoNotCoalesceReasoningOrToolResults(t *testing.T) {

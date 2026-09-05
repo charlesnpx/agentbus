@@ -279,10 +279,10 @@ func (writer *itemSidecarWriter) noteFailure(operation string, err error) {
 	}
 }
 
-// recordFailureMarker preserves a create-only signal when a deferred sidecar
-// close discovers a failure after the cancellation terminal record was written.
-// It is best effort: the marker can fail under the same broader filesystem
-// fault that stopped the sidecar.
+// recordFailureMarker preserves a create-only signal that the capture is known
+// to be incomplete, whether a sidecar write failed or a backend frame was
+// dropped. It is best effort: the marker can fail under the same broader
+// filesystem fault that stopped the sidecar.
 func (writer *itemSidecarWriter) recordFailureMarker() {
 	if writer == nil || strings.TrimSpace(writer.path) == "" {
 		return
@@ -358,10 +358,8 @@ func (assembler *itemAssembler) absorb(event engine.Event, rawText string) {
 		return
 	}
 	switch event.Type {
-	case engine.EventProgress:
+	case engine.EventProgress, engine.EventModelReported:
 		assembler.noteProgress(time.Now().UTC())
-		return
-	case engine.EventModelReported:
 		return
 	}
 
@@ -378,6 +376,9 @@ func (assembler *itemAssembler) absorb(event engine.Event, rawText string) {
 		assembler.flushMessage()
 		assembler.append(transcriptItemToolResult, event.Name, rawText, false)
 	case engine.EventWarning:
+		if _, dropped := engine.TransportFrameDropsFromMetadata(event.Metadata); dropped {
+			assembler.writer.recordFailureMarker()
+		}
 		assembler.flushMessage()
 		assembler.append(transcriptItemWarning, "", rawText, false)
 	case engine.EventTerminalError:
