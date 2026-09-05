@@ -100,8 +100,8 @@ func (s *Server) jobTranscript(record jobstore.Record, params protocol.JobTransc
 		hasItemSidecarFailure(record.Diagnostics) ||
 		record.State == protocol.PublicStateUnknown
 	if !record.State.IsTerminal() {
-		_, active := s.ItemActivity(record.JobID)
-		if active {
+		if run := s.activeExecution(record.JobID); run != nil {
+			result.Gap = result.Gap || hasItemSidecarFailure(run.itemSidecarDiagnostics())
 			result.Liveness = s.exactClaimDiagnostic(record.ProcessClaim).liveness
 		}
 	}

@@ -295,7 +295,7 @@ job:
           "truncated": false
         }
       ],
-      "gap": false
+      "gap": true
     }
 
 jobId is required. kinds, since, sinceOrdinal, last, and limit are optional
@@ -319,6 +319,8 @@ existed has no receipt and is therefore reported as a gapped prefix, because
 its completeness cannot be established. A terminal record remains readable
 because terminal handling never deletes its sidecar. liveness has the same
 active-execution-only projection and exact process-claim meaning as job.list.
+While a job runs, its transcript is not yet proven complete, so gap is true;
+callers distinguish that from real loss using state.
 
 job.cancel:
 

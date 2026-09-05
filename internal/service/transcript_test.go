@@ -246,6 +246,30 @@ func TestJobTranscriptReportsGapForDurableSidecarFailure(t *testing.T) {
 	}
 }
 
+func TestJobTranscriptReportsLiveSidecarOpenFailure(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{})
+	record := transcriptTestRecord(t, server, "live-sidecar-open-failure")
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err = store.MarkStarting(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run := newActiveExecution(record.JobID, nil)
+	run.noteItemSidecarDiagnostic(itemSidecarDiagnosticPrefix + "open: injected failure")
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: run}
+	server.executionMu.Unlock()
+
+	result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
+	if result.State != protocol.PublicStateRunning || result.ItemCount != 0 || !result.Gap {
+		t.Fatalf("live transcript after sidecar-open failure = %#v, want running empty gapped transcript", result)
+	}
+}
+
 func TestJobTranscriptOrdinalRoundTrip(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{})
 	record := transcriptTestRecord(t, server, "ordinal")

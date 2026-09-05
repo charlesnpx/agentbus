@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -294,6 +295,74 @@ func TestItemSidecarWriterStopsAtSmallFileCap(t *testing.T) {
 	if !bytes.HasSuffix(contents, transcriptItemStopLine) || bytes.Count(contents, transcriptItemStopLine) != 1 {
 		t.Fatalf("sidecar = %q, want one append-stopped marker", contents)
 	}
+}
+
+func TestItemSidecarWriterSyncsCreatedDirectories(t *testing.T) {
+	t.Run("publishes sidecar and newly created ancestors once", func(t *testing.T) {
+		root := t.TempDir()
+		path := filepath.Join(root, "artifacts", "logs", "items.jsonl")
+		originalSync := syncItemSidecarDirectory
+		t.Cleanup(func() { syncItemSidecarDirectory = originalSync })
+
+		synced := make([]string, 0, 3)
+		syncItemSidecarDirectory = func(dir string) error {
+			if len(synced) == 0 {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("sidecar did not exist before its directory was synced: %v", err)
+				}
+			}
+			synced = append(synced, dir)
+			return nil
+		}
+
+		writer := newItemSidecarWriter(path, transcriptItemTextCap, transcriptItemFileCap)
+		if writer.file == nil || writer.diagnostic != "" {
+			t.Fatalf("new writer = %+v, want open sidecar without a diagnostic", writer)
+		}
+		want := []string{filepath.Dir(path), filepath.Dir(filepath.Dir(path)), root}
+		if len(synced) != len(want) {
+			t.Fatalf("synced directories = %v, want %v", synced, want)
+		}
+		for index, directory := range want {
+			if synced[index] != directory {
+				t.Fatalf("synced directory %d = %q, want %q", index, synced[index], directory)
+			}
+		}
+
+		writer.append(transcriptItemTool, "tool", "output", false)
+		writer.append(transcriptItemTool, "tool", "more output", false)
+		writer.close()
+		if writer.diagnostic != "" {
+			t.Fatalf("writer diagnostic = %q, want no failure", writer.diagnostic)
+		}
+		if len(synced) != len(want) {
+			t.Fatalf("append or close added directory syncs: got %v, want %v", synced, want)
+		}
+	})
+
+	t.Run("directory sync failure withholds the receipt", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "artifacts", "logs", "items.jsonl")
+		originalSync := syncItemSidecarDirectory
+		t.Cleanup(func() { syncItemSidecarDirectory = originalSync })
+		syncCalls := 0
+		syncItemSidecarDirectory = func(string) error {
+			syncCalls++
+			return errors.New("injected directory sync failure")
+		}
+
+		writer := newItemSidecarWriter(path, transcriptItemTextCap, transcriptItemFileCap)
+		if syncCalls != 1 || writer.file != nil || !strings.HasPrefix(writer.diagnostic, itemSidecarDiagnosticPrefix+"sync parent directory:") {
+			t.Fatalf("writer after directory sync failure = %+v, sync calls = %d", writer, syncCalls)
+		}
+		writer.close()
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(contents, transcriptItemCompleteLine) {
+			t.Fatalf("sidecar = %q, want no completion receipt after directory sync failure", contents)
+		}
+	})
 }
 
 func TestItemSidecarPathDerivesFromStdoutLog(t *testing.T) {

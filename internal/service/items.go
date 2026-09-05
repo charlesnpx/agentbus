@@ -4,6 +4,7 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +26,14 @@ const (
 var (
 	transcriptItemStopLine     = []byte("{\"appendStopped\":true}\n")
 	transcriptItemCompleteLine = []byte("{\"captureComplete\":true}\n")
+	syncItemSidecarDirectory   = func(dir string) error {
+		file, err := os.Open(dir)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		return file.Sync()
+	}
 )
 
 type transcriptItemKind string
@@ -152,7 +161,13 @@ func newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarW
 		writer.noteFailure("open", fmt.Errorf("path is empty"))
 		return writer
 	}
-	if err := os.MkdirAll(filepath.Dir(writer.path), 0o700); err != nil {
+	parent := filepath.Dir(writer.path)
+	directoriesToSync, err := itemSidecarDirectoriesToSync(parent)
+	if err != nil {
+		writer.noteFailure("inspect parent", err)
+		return writer
+	}
+	if err := os.MkdirAll(parent, 0o700); err != nil {
 		writer.noteFailure("create parent", err)
 		return writer
 	}
@@ -167,7 +182,42 @@ func newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarW
 		return writer
 	}
 	writer.file = file
+	// Publish the sidecar name before a later receipt can make its contents
+	// authoritative. If MkdirAll created any components, their parent entries
+	// need the same treatment so the sidecar remains reachable after a crash.
+	for _, dir := range directoriesToSync {
+		if err := syncItemSidecarDirectory(dir); err != nil {
+			writer.noteFailure("sync parent directory", fmt.Errorf("%s: %w", dir, err))
+			return writer
+		}
+	}
 	return writer
+}
+
+// itemSidecarDirectoriesToSync returns the sidecar parent followed by every
+// ancestor through the first pre-existing directory. Syncing that chain after
+// creation makes both the new sidecar entry and any MkdirAll-created components
+// durable without charging append operations for directory syncs.
+func itemSidecarDirectoriesToSync(dir string) ([]string, error) {
+	directories := []string{dir}
+	for current := dir; ; {
+		info, err := os.Stat(current)
+		switch {
+		case err == nil:
+			if !info.IsDir() {
+				return nil, fmt.Errorf("sidecar parent %q is not a directory", current)
+			}
+			return directories, nil
+		case !errors.Is(err, os.ErrNotExist):
+			return nil, err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil, fmt.Errorf("sidecar parent %q has no existing ancestor", dir)
+		}
+		directories = append(directories, parent)
+		current = parent
+	}
 }
 
 func (writer *itemSidecarWriter) setFailureSink(sink func(string)) {
