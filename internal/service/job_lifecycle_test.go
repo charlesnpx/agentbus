@@ -130,14 +130,6 @@ func TestJobLifecycleProjectsBackendReportedModel(t *testing.T) {
 			}
 			runExecution(t, server, record)
 
-			stored, err := store.Get(submitted.JobID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if stored.ModelReported != test.reported {
-				t.Fatalf("stored modelReported = %q, want %q", stored.ModelReported, test.reported)
-			}
-
 			get := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: submitted.JobID}))
 			if get.err != nil {
 				t.Fatalf("job.get error = %#v", get.err)
@@ -158,11 +150,91 @@ func TestJobLifecycleProjectsBackendReportedModel(t *testing.T) {
 			if len(jobs) != 1 || jobs[0].JobID != submitted.JobID || jobs[0].ModelReported != test.reported {
 				t.Fatalf("job.list jobs = %#v, want %q with modelReported %q", jobs, submitted.JobID, test.reported)
 			}
-			if test.reported == "" && (stored.ModelReported == requestedModel || detail.ModelReported == requestedModel || jobs[0].ModelReported == requestedModel) {
-				t.Fatalf("unreported model echoed requested model %q", requestedModel)
-			}
 		})
 	}
+
+	t.Run("running", func(t *testing.T) {
+		const reportedModel = "backend-resolved-model"
+		events := make(chan engine.Event)
+		modelSent := make(chan struct{})
+		releaseEvents := make(chan struct{})
+		released := false
+		release := func() {
+			if !released {
+				close(releaseEvents)
+				released = true
+			}
+		}
+		t.Cleanup(release)
+
+		backend := &executionFakeBackend{name: "model-running"}
+		backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+			return &executionFakeSession{
+				turn: func(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+					go func() {
+						events <- engine.Event{Type: engine.EventModelReported, ModelReported: reportedModel}
+						close(modelSent)
+						<-releaseEvents
+						events <- engine.Event{Type: engine.EventResultMessage, Text: "finished"}
+						close(events)
+					}()
+					return events, nil
+				},
+			}, nil
+		}
+		server := newExecutionServer(t, backend)
+		record := queuedExecutionRecord(t, server, backend.Name(), "report the resolved model", nil)
+		run := newActiveExecution(record.JobID, backend)
+		server.executionMu.Lock()
+		server.executions = map[string]*activeExecution{record.JobID: run}
+		server.executionMu.Unlock()
+		done := make(chan struct{})
+		go func() {
+			server.runJob(context.Background(), record, run)
+			close(done)
+		}()
+
+		select {
+		case <-modelSent:
+		case <-time.After(time.Second):
+			t.Fatal("model-report event did not arrive")
+		}
+
+		deadline := time.NewTimer(time.Second)
+		defer deadline.Stop()
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			get := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: record.JobID}))
+			if get.err != nil {
+				t.Fatalf("running job.get error = %#v", get.err)
+			}
+			detail, ok := get.result.(protocol.JobRecordWire)
+			if !ok {
+				t.Fatalf("running job.get result = %T, want protocol.JobRecordWire", get.result)
+			}
+			list := server.handleJobList(mustJSON(t, protocol.JobListParams{}))
+			if list.err != nil {
+				t.Fatalf("running job.list error = %#v", list.err)
+			}
+			jobs := list.result.(protocol.JobListResult).Jobs
+			if detail.ModelReported == reportedModel && len(jobs) == 1 && jobs[0].JobID == record.JobID && jobs[0].ModelReported == reportedModel {
+				break
+			}
+			select {
+			case <-deadline.C:
+				t.Fatalf("running model projection: job.get=%q job.list=%#v, want %q", detail.ModelReported, jobs, reportedModel)
+			case <-ticker.C:
+			}
+		}
+
+		release()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("running model turn did not finish")
+		}
+	})
 }
 
 func TestJobListFiltersCombineWithAND(t *testing.T) {

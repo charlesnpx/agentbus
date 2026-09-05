@@ -658,17 +658,16 @@ func (store *Store) RecordBackendSessionID(id, sessionID string) (Record, error)
 // RecordModelReported preserves the first non-empty model observation from a
 // backend. It is separate from the requested Model: an omitted observation
 // remains omitted rather than being inferred from the request.
-func (store *Store) RecordModelReported(id, model string) (Record, error) {
+func (store *Store) RecordModelReported(id, model string) error {
 	if err := validateJobID(id); err != nil {
-		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
 	model = strings.TrimSpace(model)
 	if model == "" {
-		return Record{}, fmt.Errorf("%w: reported model is required", ErrInvalid)
+		return fmt.Errorf("%w: reported model is required", ErrInvalid)
 	}
 
-	var result Record
-	err := store.update(func(tx *bolt.Tx) error {
+	return store.update(func(tx *bolt.Tx) error {
 		jobs := tx.Bucket(bucketJobs)
 		if jobs == nil {
 			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
@@ -681,7 +680,6 @@ func (store *Store) RecordModelReported(id, model string) (Record, error) {
 			return ErrTerminal
 		}
 		if current.ModelReported != "" {
-			result = current
 			return nil
 		}
 
@@ -695,10 +693,8 @@ func (store *Store) RecordModelReported(id, model string) (Record, error) {
 		if err := putRecord(jobs, next); err != nil {
 			return err
 		}
-		result = next
 		return nil
 	})
-	return result, err
 }
 
 // MarkTerminal records the first terminal state. Later updates are rejected so

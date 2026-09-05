@@ -46,6 +46,7 @@ type activeExecution struct {
 	lastItemAt         time.Time
 	lastActivityAt     time.Time
 	itemSidecarDiag    string
+	modelReported      string
 	turn               *activeTurn
 	latestSessionID    string
 	retiredCleanup     protocol.Cleanup
@@ -75,6 +76,31 @@ func (run *activeExecution) setSession(session engine.Session) {
 	run.mu.Lock()
 	run.session = session
 	run.mu.Unlock()
+}
+
+func (run *activeExecution) noteModelReported(model string) {
+	if run == nil {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	run.mu.Lock()
+	if run.modelReported == "" {
+		run.modelReported = model
+	}
+	run.mu.Unlock()
+}
+
+func (run *activeExecution) reportedModel() string {
+	if run == nil {
+		return ""
+	}
+	run.mu.Lock()
+	model := run.modelReported
+	run.mu.Unlock()
+	return model
 }
 
 func (run *activeExecution) cancellationRequested() bool {
@@ -186,10 +212,7 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 	}
 	turn.once.Do(func() {
 		if strings.TrimSpace(outcome.modelReported) != "" {
-			if store == nil {
-				outcome.cleanup = protocol.CleanupUncertain
-				outcome.diagnostics = append(outcome.diagnostics, "record reported model: job store is unavailable")
-			} else if _, err := store.RecordModelReported(run.jobID, outcome.modelReported); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
+			if err := store.RecordModelReported(run.jobID, outcome.modelReported); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
 				outcome.cleanup = protocol.CleanupUncertain
 				outcome.diagnostics = append(outcome.diagnostics, "record reported model: "+err.Error())
 			}
@@ -923,7 +946,7 @@ func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine
 				outcome.cleanup = protocol.CleanupUncertain
 				outcome.diagnostics = append(outcome.diagnostics, "backend cleanup: "+err.Error())
 			}
-			if drainTurnEvents(events, &outcome, &assistant, &result, &hasResult, items) {
+			if drainTurnEvents(run, events, &outcome, &assistant, &result, &hasResult, items) {
 				outcome.text = attemptFinalText(hasResult, result, assistant.String())
 			} else {
 				outcome.cleanup = protocol.CleanupUncertain
@@ -937,12 +960,12 @@ func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine
 				outcome.text = attemptFinalText(hasResult, result, assistant.String())
 				return outcome
 			}
-			absorbTurnEvent(&outcome, &assistant, &result, &hasResult, items, event)
+			absorbTurnEvent(run, &outcome, &assistant, &result, &hasResult, items, event)
 		}
 	}
 }
 
-func drainTurnEvents(events <-chan engine.Event, outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool, items *itemAssembler) bool {
+func drainTurnEvents(run *activeExecution, events <-chan engine.Event, outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool, items *itemAssembler) bool {
 	timer := time.NewTimer(engine.DefaultCancelGrace)
 	defer timer.Stop()
 	for {
@@ -951,21 +974,23 @@ func drainTurnEvents(events <-chan engine.Event, outcome *turnOutcome, assistant
 			if !ok {
 				return true
 			}
-			absorbTurnEvent(outcome, assistant, result, hasResult, items, event)
+			absorbTurnEvent(run, outcome, assistant, result, hasResult, items, event)
 		case <-timer.C:
 			return false
 		}
 	}
 }
 
-func absorbTurnEvent(outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool, items *itemAssembler, event engine.Event) {
+func absorbTurnEvent(run *activeExecution, outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool, items *itemAssembler, event engine.Event) {
 	rawText := authoritativeText(event)
 	items.absorb(event, rawText)
 	switch event.Type {
 	case engine.EventModelReported:
+		model := strings.TrimSpace(event.ModelReported)
 		if outcome.modelReported == "" {
-			outcome.modelReported = strings.TrimSpace(event.ModelReported)
+			outcome.modelReported = model
 		}
+		run.noteModelReported(model)
 	case engine.EventAgentText:
 		assistant.WriteString(rawText)
 	case engine.EventResultMessage:
