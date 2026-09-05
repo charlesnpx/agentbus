@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -462,6 +463,162 @@ func TestTranscriptItemSidecarFailureSurvivesCancellation(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(terminal.Diagnostics, "\n"), "item sidecar open") {
 		t.Fatalf("diagnostics = %#v, want sidecar failure", terminal.Diagnostics)
+	}
+}
+
+func TestCanceledTranscriptReportsGapWhenSidecarSyncFailsAfterTerminal(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{})
+	record := transcriptTestRecord(t, server, "gap-sync-failure-after-cancel")
+	writer := newItemSidecarWriter(transcriptItemPath(t, record), transcriptItemTextCap, transcriptItemFileCap)
+	writer.append(transcriptItemTool, "lost", "captured before sync failed", false)
+	syncEntered := make(chan struct{})
+	releaseSync := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSync) }) }
+	writer.syncFile = func(*os.File) error {
+		close(syncEntered)
+		<-releaseSync
+		return syscall.EIO
+	}
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
+		State:   protocol.PublicStateCanceled,
+		Cleanup: protocol.CleanupClean,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.State != protocol.PublicStateCanceled || hasItemSidecarFailure(terminal.Diagnostics) {
+		t.Fatalf("terminal record before deferred sync = %#v, want canceled without sidecar diagnostic", terminal)
+	}
+
+	var closeOnce sync.Once
+	done := make(chan struct{})
+	closeWriter := func() {
+		closeOnce.Do(func() {
+			writer.close()
+			close(done)
+		})
+	}
+	t.Cleanup(func() {
+		release()
+		closeWriter()
+	})
+	go closeWriter()
+	select {
+	case <-syncEntered:
+	case <-time.After(time.Second):
+		t.Fatal("deferred sidecar sync did not begin")
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("execution did not finish after deferred sync release")
+	}
+	if !hasItemSidecarFailure(writer.diagnostics()) {
+		t.Fatalf("sidecar diagnostics = %#v, want production sync failure", writer.diagnostics())
+	}
+	terminal, err = store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasItemSidecarFailure(terminal.Diagnostics) {
+		t.Fatalf("terminal record after deferred sync = %#v, want immutable pre-sync diagnostics", terminal)
+	}
+	sidecar, err := os.ReadFile(transcriptItemPath(t, record))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(sidecar, transcriptItemStopLine) {
+		t.Fatalf("sidecar = %q, want no append-stopped marker for the sync failure", sidecar)
+	}
+	if _, err := os.Stat(itemSidecarFailurePath(transcriptItemPath(t, record))); err != nil {
+		t.Fatalf("sidecar failure marker = %v", err)
+	}
+
+	result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
+	if result.State != protocol.PublicStateCanceled || result.ItemCount != 1 || !result.Gap {
+		t.Fatalf("canceled transcript = %#v, want captured item with gap", result)
+	}
+}
+
+func TestCanceledTranscriptStaysCleanAfterSidecarClose(t *testing.T) {
+	events := make(chan engine.Event, 1)
+	events <- engine.Event{Type: engine.EventToolUse, Name: "kept", Text: "captured before clean close"}
+	turnStarted := make(chan struct{})
+	var closeEvents sync.Once
+	closeStream := func() { closeEvents.Do(func() { close(events) }) }
+	t.Cleanup(closeStream)
+
+	backend := &executionFakeBackend{name: "items-clean-sync-after-cancel"}
+	backend.start = func(_ context.Context, _ engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				input.OnProcessStart(engine.ProcessRef{PID: 6122, PGID: 6122, StartTime: "items-clean-sync-after-cancel"}, 0)
+				close(turnStarted)
+				return events, nil
+			},
+			interrupt: func(context.Context) error {
+				closeStream()
+				return nil
+			},
+		}, nil
+	}
+	server := newExecutionServer(t, backend)
+	server.processGroupGoneFn = func(int) (bool, error) { return true, nil }
+	record := queuedExecutionRecord(t, server, backend.Name(), "cancel after clean sidecar capture", nil)
+	run := newActiveExecution(record.JobID, backend)
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: run}
+	server.executionMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		server.runJob(context.Background(), record, run)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		closeStream()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("clean canceled execution did not finish during cleanup")
+		}
+	})
+
+	select {
+	case <-turnStarted:
+	case <-time.After(time.Second):
+		t.Fatal("turn did not start")
+	}
+	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
+	if canceled.err != nil {
+		t.Fatalf("job.cancel error = %#v", canceled.err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("clean canceled execution did not finish")
+	}
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.State != protocol.PublicStateCanceled || hasItemSidecarFailure(terminal.Diagnostics) {
+		t.Fatalf("clean terminal record = %#v, want canceled without sidecar failure", terminal)
+	}
+	result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
+	if result.State != protocol.PublicStateCanceled || result.ItemCount != 1 || result.Gap {
+		t.Fatalf("clean canceled transcript = %#v, want captured item without gap", result)
 	}
 }
 
