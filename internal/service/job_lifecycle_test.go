@@ -1074,7 +1074,6 @@ func TestOrphanReaperDoesNotSignalTokenMismatch(t *testing.T) {
 	}
 	wantDiagnostics := []string{
 		"restart reconciliation: no relaunch",
-		"restart reconciliation: transcript may be incomplete",
 		"orphan reaper: leader start token mismatch; no signal sent",
 	}
 	if !slices.Equal(stored.Diagnostics, wantDiagnostics) {

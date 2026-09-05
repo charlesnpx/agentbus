@@ -298,8 +298,9 @@ job remains readable because terminal handling does not remove its sidecar.
 With no kinds, since, sinceOrdinal, last, or limit, the response is a digest,
 not the whole stream: it returns counts and timestamps plus the last few
 message items and every captured error item. Any explicit selector returns its
-matching items, subject to limit. A missing sidecar is a valid empty transcript
-with itemCount zero, seven zero counts, items: [], and gap false.
+matching items, subject to limit. A missing sidecar returns a valid empty
+transcript with itemCount zero, seven zero counts, no timestamps, and items:
+[]; its gap follows the same three rules as everywhere else.
 
 When the sidecar's capped writer emitted its appendStopped marker, a sidecar
 write failure was recorded, or the daemon was interrupted while capturing, gap

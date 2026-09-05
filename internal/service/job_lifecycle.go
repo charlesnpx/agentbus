@@ -408,16 +408,12 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 			})
 		case record.Starting || record.State == protocol.PublicStateRunning:
 			cleanup, diagnostics := s.terminateRecordedProcessClaim(record.ProcessClaim)
-			// The daemon was interrupted while transcript capture could have been
-			// in progress. Preserve that uncertainty for job.transcript without
-			// labeling it as an item-sidecar write failure.
 			_, err = store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
 				State:            protocol.PublicStateUnknown,
 				Cleanup:          cleanup,
 				BackendSessionID: record.BackendSessionID,
 				Diagnostics: append([]string{
 					"restart reconciliation: no relaunch",
-					"restart reconciliation: transcript may be incomplete",
 				}, diagnostics...),
 				FinishedAt: time.Now().UTC(),
 			})
