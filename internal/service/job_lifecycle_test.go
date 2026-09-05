@@ -559,6 +559,96 @@ func TestJobCancelBeforeSpawnIsDurable(t *testing.T) {
 	}
 }
 
+func TestJobCancelBetweenProcessStartAndClaimPersistenceKeepsClaim(t *testing.T) {
+	backend := &executionFakeBackend{name: "cancel-between-claim-phases"}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "cancel between process start and claim persistence", nil)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(record.JobID); err != nil {
+		t.Fatal(err)
+	}
+
+	ref := engine.ProcessRef{PID: 4117, PGID: 4117, StartTime: "claim-persistence-window-token"}
+	interrupted := make(chan struct{})
+	observedLivePGID := make(chan int)
+	server.processGroupGoneFn = func(pgid int) (bool, error) {
+		observedLivePGID <- pgid
+		return true, nil
+	}
+	session := &executionFakeSession{
+		interrupt: func(context.Context) error {
+			close(interrupted)
+			return nil
+		},
+	}
+	run := newActiveExecution(record.JobID, backend)
+	run.setSession(session)
+	run.beginTurn()
+	// This is the reachable state after OnProcessStart notes the identity and
+	// releases the launch gate, but before its separate claim transaction.
+	run.noteProcessClaim(ref)
+	t.Cleanup(func() {
+		run.retireTurn(store, turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean})
+	})
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: run}
+	server.executionMu.Unlock()
+
+	beforePersistence, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforePersistence.ProcessClaim != nil {
+		t.Fatalf("record before claim persistence = %#v, want no durable claim", beforePersistence)
+	}
+
+	cancelDone := make(chan requestOutcome, 1)
+	go func() {
+		cancelDone <- server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
+	}()
+	select {
+	case <-interrupted:
+	case <-time.After(time.Second):
+		t.Fatal("job.cancel did not interrupt the live session")
+	}
+	select {
+	case pgid := <-observedLivePGID:
+		if pgid != ref.PGID {
+			t.Fatalf("job.cancel observed process group %d, want live claim group %d", pgid, ref.PGID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("job.cancel did not use the live in-memory process claim")
+	}
+
+	// The turn owner persists after containment has selected the live claim,
+	// before it retires and lets cancellation commit the terminal record.
+	run.persistProcessClaim(store)
+	attempted, recorded, claimErr := run.claimStatus()
+	if !attempted || !recorded || claimErr != nil {
+		t.Fatalf("claim status after persistence = attempted:%t recorded:%t err:%v", attempted, recorded, claimErr)
+	}
+	run.retireTurn(store, turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean})
+
+	select {
+	case outcome := <-cancelDone:
+		if outcome.err != nil {
+			t.Fatalf("job.cancel error = %#v", outcome.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("job.cancel did not return after the active turn retired")
+	}
+	stored, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != protocol.PublicStateCanceled || stored.ProcessClaim == nil || stored.ProcessClaim.PID != ref.PID || stored.ProcessClaim.PGID != ref.PGID || stored.ProcessClaim.StartToken != ref.StartTime {
+		t.Fatalf("terminal record after the claim-persistence window = %#v, want canceled record retaining %+v", stored, ref)
+	}
+}
+
 func TestJobCancelDuringCorrectionPreservesRetiredTurnOutcome(t *testing.T) {
 	schemaRaw := json.RawMessage(`{"required":["ok"],"type":"object"}`)
 	correctionEvents := make(chan engine.Event)
