@@ -285,7 +285,7 @@ and later use sinceOrdinal: 141 without retaining server-issued state.
       "truncated": false
     }
   ],
-  "gap": false
+  "gap": true
 }
 ~~~
 
@@ -294,6 +294,8 @@ only the selected items. counts always has all seven kinds, including zero
 values. liveness appears only while this daemon has an active execution for the
 job and follows the same alive, gone, or unknown rule as job.list. A terminal
 job remains readable because terminal handling does not remove its sidecar.
+While a job runs, its transcript is not yet proven complete, so gap is true;
+callers distinguish that from real loss using state.
 
 With no kinds, since, sinceOrdinal, last, or limit, the response is a digest,
 not the whole stream: it returns counts and timestamps plus the last few

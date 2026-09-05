@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -276,7 +277,7 @@ func TestTranscriptItemsCapTextAndDoNotCoalesceReasoningOrToolResults(t *testing
 func TestItemSidecarWriterStopsAtSmallFileCap(t *testing.T) {
 	const fileCap = 256
 	path := filepath.Join(t.TempDir(), "items.jsonl")
-	writer := newItemSidecarWriter(path, 8, fileCap)
+	writer := newItemSidecarWriter(path, 8, fileCap, nil)
 	for range 3 {
 		writer.append(transcriptItemTool, "tool", "output", false)
 	}
@@ -294,6 +295,74 @@ func TestItemSidecarWriterStopsAtSmallFileCap(t *testing.T) {
 	if !bytes.HasSuffix(contents, transcriptItemStopLine) || bytes.Count(contents, transcriptItemStopLine) != 1 {
 		t.Fatalf("sidecar = %q, want one append-stopped marker", contents)
 	}
+}
+
+func TestItemSidecarWriterSyncsCreatedDirectories(t *testing.T) {
+	t.Run("publishes sidecar and newly created ancestors once", func(t *testing.T) {
+		root := t.TempDir()
+		path := filepath.Join(root, "artifacts", "logs", "items.jsonl")
+		originalSync := syncItemSidecarDirectory
+		t.Cleanup(func() { syncItemSidecarDirectory = originalSync })
+
+		synced := make([]string, 0, 3)
+		syncItemSidecarDirectory = func(dir string) error {
+			if len(synced) == 0 {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("sidecar did not exist before its directory was synced: %v", err)
+				}
+			}
+			synced = append(synced, dir)
+			return nil
+		}
+
+		writer := newItemSidecarWriter(path, transcriptItemTextCap, transcriptItemFileCap, nil)
+		if writer.file == nil || writer.diagnostic != "" {
+			t.Fatalf("new writer = %+v, want open sidecar without a diagnostic", writer)
+		}
+		want := []string{filepath.Dir(path), filepath.Dir(filepath.Dir(path)), root}
+		if len(synced) != len(want) {
+			t.Fatalf("synced directories = %v, want %v", synced, want)
+		}
+		for index, directory := range want {
+			if synced[index] != directory {
+				t.Fatalf("synced directory %d = %q, want %q", index, synced[index], directory)
+			}
+		}
+
+		writer.append(transcriptItemTool, "tool", "output", false)
+		writer.append(transcriptItemTool, "tool", "more output", false)
+		writer.close()
+		if writer.diagnostic != "" {
+			t.Fatalf("writer diagnostic = %q, want no failure", writer.diagnostic)
+		}
+		if len(synced) != len(want) {
+			t.Fatalf("append or close added directory syncs: got %v, want %v", synced, want)
+		}
+	})
+
+	t.Run("directory sync failure withholds the receipt", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "artifacts", "logs", "items.jsonl")
+		originalSync := syncItemSidecarDirectory
+		t.Cleanup(func() { syncItemSidecarDirectory = originalSync })
+		syncCalls := 0
+		syncItemSidecarDirectory = func(string) error {
+			syncCalls++
+			return errors.New("injected directory sync failure")
+		}
+
+		writer := newItemSidecarWriter(path, transcriptItemTextCap, transcriptItemFileCap, nil)
+		if syncCalls != 1 || writer.file != nil || !strings.HasPrefix(writer.diagnostic, itemSidecarDiagnosticPrefix+"sync parent directory:") {
+			t.Fatalf("writer after directory sync failure = %+v, sync calls = %d", writer, syncCalls)
+		}
+		writer.close()
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(contents, transcriptItemCompleteLine) {
+			t.Fatalf("sidecar = %q, want no completion receipt after directory sync failure", contents)
+		}
+	})
 }
 
 func TestItemSidecarPathDerivesFromStdoutLog(t *testing.T) {
@@ -501,11 +570,60 @@ func TestTranscriptItemSidecarFailureSurvivesCancellation(t *testing.T) {
 	}
 }
 
+func TestTranscriptItemSidecarOpenFailureSurvivesImmediateCancellation(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{})
+	record := transcriptTestRecord(t, server, "sidecar-open-immediate-cancel")
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err = store.MarkStarting(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	itemPath := transcriptItemPath(t, record)
+	if err := os.MkdirAll(filepath.Dir(itemPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("missing-sidecar", itemPath); err != nil {
+		t.Fatal(err)
+	}
+	run := newActiveExecution(record.JobID, nil)
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: run}
+	server.executionMu.Unlock()
+
+	// The dangling symlink makes construction's exclusive open fail but remains
+	// absent to the reader. Construction invokes the sink synchronously, so the
+	// next operation can cancel without a scheduler race.
+	writer := newItemSidecarWriter(itemPath, transcriptItemTextCap, transcriptItemFileCap, run.noteItemSidecarDiagnostic)
+	if !strings.HasPrefix(writer.diagnostic, itemSidecarDiagnosticPrefix+"open:") {
+		t.Fatalf("writer diagnostic = %q, want constructor failure", writer.diagnostic)
+	}
+	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
+	if canceled.err != nil {
+		t.Fatalf("job.cancel error = %#v", canceled.err)
+	}
+
+	terminal, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.State != protocol.PublicStateCanceled || !hasItemSidecarFailure(terminal.Diagnostics) {
+		t.Fatalf("terminal record = %#v, want canceled with sidecar failure", terminal)
+	}
+	result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
+	if result.State != protocol.PublicStateCanceled || result.ItemCount != 0 || !result.Gap {
+		t.Fatalf("terminal transcript = %#v, want empty gapped cancellation", result)
+	}
+}
+
 func TestCanceledTranscriptReportsGapWhenSidecarSyncFailsAfterTerminal(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{})
 	record := transcriptTestRecord(t, server, "gap-sync-failure-after-cancel")
 	itemPath := transcriptItemPath(t, record)
-	writer := newItemSidecarWriter(itemPath, transcriptItemTextCap, transcriptItemFileCap)
+	writer := newItemSidecarWriter(itemPath, transcriptItemTextCap, transcriptItemFileCap, nil)
 	writer.append(transcriptItemTool, "lost", "captured before sync failed", false)
 
 	store, err := server.ensureJobStore()

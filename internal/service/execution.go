@@ -630,8 +630,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("derive item sidecar path: %w", err), nil)
 		return
 	}
-	itemWriter := newItemSidecarWriter(itemPath, transcriptItemTextCap, transcriptItemFileCap)
-	itemWriter.setFailureSink(run.noteItemSidecarDiagnostic)
+	itemWriter := newItemSidecarWriter(itemPath, transcriptItemTextCap, transcriptItemFileCap, run.noteItemSidecarDiagnostic)
 	defer itemWriter.close()
 	items := newItemAssembler(run, itemWriter)
 

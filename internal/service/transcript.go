@@ -34,9 +34,9 @@ var transcriptKinds = map[string]struct{}{
 }
 
 // handleJobTranscript returns a digest of the captured sidecar and the items
-// selected with stateless filters. A missing sidecar is an empty transcript:
-// it is expected for jobs that failed before their first turn and older jobs.
-// An existing sidecar without its final completion receipt is a gapped prefix.
+// selected with stateless filters. A missing sidecar is an empty transcript for
+// terminal jobs that failed before their first turn and older jobs. A running
+// job is always gapped because its capture does not yet have a final receipt.
 func (s *Server) handleJobTranscript(raw json.RawMessage) requestOutcome {
 	var params protocol.JobTranscriptParams
 	if err := decodeStrict(raw, &params); err != nil {
@@ -98,10 +98,11 @@ func (s *Server) jobTranscript(record jobstore.Record, params protocol.JobTransc
 	}
 	result.Gap = result.Gap ||
 		hasItemSidecarFailure(record.Diagnostics) ||
-		record.State == protocol.PublicStateUnknown
+		record.State == protocol.PublicStateUnknown ||
+		result.State == protocol.PublicStateRunning
 	if !record.State.IsTerminal() {
-		_, active := s.ItemActivity(record.JobID)
-		if active {
+		if run := s.activeExecution(record.JobID); run != nil {
+			result.Gap = result.Gap || hasItemSidecarFailure(run.itemSidecarDiagnostics())
 			result.Liveness = s.exactClaimDiagnostic(record.ProcessClaim).liveness
 		}
 	}
