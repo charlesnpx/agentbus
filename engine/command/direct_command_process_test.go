@@ -272,7 +272,6 @@ trap 'exit 0' TERM
 	printf "child-ready:%s\\n" "$$"
 	while :; do read -r ignored; done
 ' &
-printf "leader-ready\\n"
 wait
 `},
 	})
@@ -312,23 +311,22 @@ wait
 	ready := make(chan string, 1)
 	readyErr := make(chan error, 1)
 	go func() {
+		// The leader installs its TERM trap before forking the child, so a
+		// child-ready line already proves the leader's trap is installed. A
+		// second leader token would add a synchronisation invariant without
+		// establishing another state this test needs.
 		reader := bufio.NewReader(command.Stdout())
-		leaderReady := false
-		childReady := ""
-		for !leaderReady || childReady == "" {
+		for {
 			line, err := reader.ReadString('\n')
 			if err != nil {
 				readyErr <- err
 				return
 			}
-			if line == "leader-ready\n" {
-				leaderReady = true
-			}
 			if strings.HasPrefix(line, "child-ready:") {
-				childReady = strings.TrimSpace(strings.TrimPrefix(line, "child-ready:"))
+				ready <- strings.TrimSpace(strings.TrimPrefix(line, "child-ready:"))
+				return
 			}
 		}
-		ready <- childReady
 	}()
 	select {
 	case err := <-readyErr:
