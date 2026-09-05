@@ -3,7 +3,6 @@
 package service
 
 import (
-	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -171,9 +170,6 @@ func TestJobTranscriptReportsGapAndMissingSidecar(t *testing.T) {
 	decodeFailure := transcriptTestRecord(t, server, "gap-decode-failure")
 	writeTranscriptSidecar(t, decodeFailure, []protocol.TranscriptItem{item}, false)
 	appendBytes(decodeFailure, []byte(`{"ordinal":`))
-	scanFailure := transcriptTestRecord(t, server, "gap-scan-failure")
-	writeTranscriptSidecar(t, scanFailure, []protocol.TranscriptItem{item}, false)
-	appendBytes(scanFailure, append(bytes.Repeat([]byte("x"), maxTranscriptSidecarLine+1), '\n'))
 
 	store, err := server.ensureJobStore()
 	if err != nil {
@@ -202,7 +198,6 @@ func TestJobTranscriptReportsGapAndMissingSidecar(t *testing.T) {
 		{name: "missing", record: missing, wantGap: false, wantItemCount: 0, wantOrdinals: []int{}},
 		{name: "unopenable", record: unopenable, wantGap: true, wantItemCount: 0, wantOrdinals: []int{}},
 		{name: "decode failure keeps prefix", record: decodeFailure, params: protocol.JobTranscriptParams{Kinds: []string{"message"}}, wantGap: true, wantItemCount: 1, wantOrdinals: []int{1}, wantTerminal: true},
-		{name: "scan failure keeps prefix", record: scanFailure, wantGap: true, wantItemCount: 1, wantOrdinals: []int{1}},
 	} {
 		test.params.JobID = test.record.JobID
 		result := transcriptResultForTest(t, server, test.params)

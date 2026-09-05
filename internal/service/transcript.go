@@ -272,14 +272,10 @@ func hasItemSidecarFailure(diagnostics []string) bool {
 }
 
 func hasItemSidecarFailureMarker(sidecarPath string) bool {
-	return hasItemSidecarMarker(sidecarPath, itemSidecarFailureSuffix)
-}
-
-func hasItemSidecarMarker(sidecarPath, suffix string) bool {
 	if strings.TrimSpace(sidecarPath) == "" {
 		return false
 	}
-	_, err := os.Stat(sidecarPath + suffix)
+	_, err := os.Stat(itemSidecarFailurePath(sidecarPath))
 	if err == nil {
 		return true
 	}
