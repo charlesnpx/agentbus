@@ -145,7 +145,7 @@ type itemSidecarWriter struct {
 	failureSink func(string)
 }
 
-func newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarWriter {
+func newItemSidecarWriter(path string, textCap int, fileCap int64, failureSink func(string)) *itemSidecarWriter {
 	if textCap <= 0 {
 		textCap = transcriptItemTextCap
 	}
@@ -153,9 +153,10 @@ func newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarW
 		fileCap = transcriptItemFileCap
 	}
 	writer := &itemSidecarWriter{
-		path:    path,
-		textCap: textCap,
-		fileCap: fileCap,
+		path:        path,
+		textCap:     textCap,
+		fileCap:     fileCap,
+		failureSink: failureSink,
 	}
 	if strings.TrimSpace(writer.path) == "" {
 		writer.noteFailure("open", fmt.Errorf("path is empty"))
@@ -217,18 +218,6 @@ func itemSidecarDirectoriesToSync(dir string) ([]string, error) {
 		}
 		directories = append(directories, parent)
 		current = parent
-	}
-}
-
-func (writer *itemSidecarWriter) setFailureSink(sink func(string)) {
-	if writer == nil {
-		return
-	}
-	writer.failureSink = sink
-	if writer.failureSink != nil {
-		for _, diagnostic := range writer.diagnostics() {
-			writer.failureSink(diagnostic)
-		}
 	}
 }
 

@@ -277,7 +277,7 @@ func TestTranscriptItemsCapTextAndDoNotCoalesceReasoningOrToolResults(t *testing
 func TestItemSidecarWriterStopsAtSmallFileCap(t *testing.T) {
 	const fileCap = 256
 	path := filepath.Join(t.TempDir(), "items.jsonl")
-	writer := newItemSidecarWriter(path, 8, fileCap)
+	writer := newItemSidecarWriter(path, 8, fileCap, nil)
 	for range 3 {
 		writer.append(transcriptItemTool, "tool", "output", false)
 	}
@@ -315,7 +315,7 @@ func TestItemSidecarWriterSyncsCreatedDirectories(t *testing.T) {
 			return nil
 		}
 
-		writer := newItemSidecarWriter(path, transcriptItemTextCap, transcriptItemFileCap)
+		writer := newItemSidecarWriter(path, transcriptItemTextCap, transcriptItemFileCap, nil)
 		if writer.file == nil || writer.diagnostic != "" {
 			t.Fatalf("new writer = %+v, want open sidecar without a diagnostic", writer)
 		}
@@ -350,7 +350,7 @@ func TestItemSidecarWriterSyncsCreatedDirectories(t *testing.T) {
 			return errors.New("injected directory sync failure")
 		}
 
-		writer := newItemSidecarWriter(path, transcriptItemTextCap, transcriptItemFileCap)
+		writer := newItemSidecarWriter(path, transcriptItemTextCap, transcriptItemFileCap, nil)
 		if syncCalls != 1 || writer.file != nil || !strings.HasPrefix(writer.diagnostic, itemSidecarDiagnosticPrefix+"sync parent directory:") {
 			t.Fatalf("writer after directory sync failure = %+v, sync calls = %d", writer, syncCalls)
 		}
@@ -570,11 +570,60 @@ func TestTranscriptItemSidecarFailureSurvivesCancellation(t *testing.T) {
 	}
 }
 
+func TestTranscriptItemSidecarOpenFailureSurvivesImmediateCancellation(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{})
+	record := transcriptTestRecord(t, server, "sidecar-open-immediate-cancel")
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err = store.MarkStarting(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	itemPath := transcriptItemPath(t, record)
+	if err := os.MkdirAll(filepath.Dir(itemPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("missing-sidecar", itemPath); err != nil {
+		t.Fatal(err)
+	}
+	run := newActiveExecution(record.JobID, nil)
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: run}
+	server.executionMu.Unlock()
+
+	// The dangling symlink makes construction's exclusive open fail but remains
+	// absent to the reader. Construction invokes the sink synchronously, so the
+	// next operation can cancel without a scheduler race.
+	writer := newItemSidecarWriter(itemPath, transcriptItemTextCap, transcriptItemFileCap, run.noteItemSidecarDiagnostic)
+	if !strings.HasPrefix(writer.diagnostic, itemSidecarDiagnosticPrefix+"open:") {
+		t.Fatalf("writer diagnostic = %q, want constructor failure", writer.diagnostic)
+	}
+	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
+	if canceled.err != nil {
+		t.Fatalf("job.cancel error = %#v", canceled.err)
+	}
+
+	terminal, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.State != protocol.PublicStateCanceled || !hasItemSidecarFailure(terminal.Diagnostics) {
+		t.Fatalf("terminal record = %#v, want canceled with sidecar failure", terminal)
+	}
+	result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
+	if result.State != protocol.PublicStateCanceled || result.ItemCount != 0 || !result.Gap {
+		t.Fatalf("terminal transcript = %#v, want empty gapped cancellation", result)
+	}
+}
+
 func TestCanceledTranscriptReportsGapWhenSidecarSyncFailsAfterTerminal(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{})
 	record := transcriptTestRecord(t, server, "gap-sync-failure-after-cancel")
 	itemPath := transcriptItemPath(t, record)
-	writer := newItemSidecarWriter(itemPath, transcriptItemTextCap, transcriptItemFileCap)
+	writer := newItemSidecarWriter(itemPath, transcriptItemTextCap, transcriptItemFileCap, nil)
 	writer.append(transcriptItemTool, "lost", "captured before sync failed", false)
 
 	store, err := server.ensureJobStore()
