@@ -314,8 +314,10 @@ item: counts, timestamps, the last few message items, and every captured error
 item. Explicit selectors widen the returned items subject to limit. A missing
 sidecar returns an empty transcript with zero counts, no timestamps, and items:
 []; gap is true when capture or reading could not establish continuity, so the
-returned prefix may be incomplete. A terminal record remains readable because
-terminal handling never deletes its sidecar. liveness has the same
+returned prefix may be incomplete. A sidecar captured before completion receipts
+existed has no receipt and is therefore reported as a gapped prefix, because
+its completeness cannot be established. A terminal record remains readable
+because terminal handling never deletes its sidecar. liveness has the same
 active-execution-only projection and exact process-claim meaning as job.list.
 
 job.cancel:

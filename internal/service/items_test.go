@@ -44,12 +44,20 @@ func readTranscriptItems(t *testing.T, record jobstore.Record) []TranscriptItem 
 	decoder := json.NewDecoder(file)
 	var items []TranscriptItem
 	for {
-		var item TranscriptItem
-		err := decoder.Decode(&item)
+		var line json.RawMessage
+		err := decoder.Decode(&line)
 		if err == io.EOF {
 			return items
 		}
 		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Equal(line, transcriptItemStopLine[:len(transcriptItemStopLine)-1]) ||
+			bytes.Equal(line, transcriptItemCompleteLine[:len(transcriptItemCompleteLine)-1]) {
+			continue
+		}
+		var item TranscriptItem
+		if err := json.Unmarshal(line, &item); err != nil {
 			t.Fatal(err)
 		}
 		if item.Ordinal == 0 {
@@ -496,7 +504,8 @@ func TestTranscriptItemSidecarFailureSurvivesCancellation(t *testing.T) {
 func TestCanceledTranscriptReportsGapWhenSidecarSyncFailsAfterTerminal(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{})
 	record := transcriptTestRecord(t, server, "gap-sync-failure-after-cancel")
-	writer := newItemSidecarWriter(transcriptItemPath(t, record), transcriptItemTextCap, transcriptItemFileCap)
+	itemPath := transcriptItemPath(t, record)
+	writer := newItemSidecarWriter(itemPath, transcriptItemTextCap, transcriptItemFileCap)
 	writer.append(transcriptItemTool, "lost", "captured before sync failed", false)
 
 	store, err := server.ensureJobStore()
@@ -532,69 +541,18 @@ func TestCanceledTranscriptReportsGapWhenSidecarSyncFailsAfterTerminal(t *testin
 	if hasItemSidecarFailure(terminal.Diagnostics) {
 		t.Fatalf("terminal record after deferred sync = %#v, want immutable pre-sync diagnostics", terminal)
 	}
-	sidecar, err := os.ReadFile(transcriptItemPath(t, record))
+	sidecar, err := os.ReadFile(itemPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(sidecar, transcriptItemStopLine) {
-		t.Fatalf("sidecar = %q, want no append-stopped marker for the sync failure", sidecar)
-	}
-	markerPath := itemSidecarFailurePath(transcriptItemPath(t, record))
-	if _, err := os.Stat(markerPath); err != nil {
-		t.Fatalf("sidecar failure marker = %v", err)
-	}
-	if marker, err := os.ReadFile(markerPath); err != nil || len(marker) != 0 {
-		t.Fatalf("sidecar failure marker = %q, %v; want empty marker", marker, err)
+	if bytes.Contains(sidecar, transcriptItemStopLine) || bytes.Contains(sidecar, transcriptItemCompleteLine) {
+		t.Fatalf("sidecar = %q, want no terminal control record for the sync failure", sidecar)
 	}
 
 	result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
 	if result.State != protocol.PublicStateCanceled || result.ItemCount != 1 || !result.Gap {
 		t.Fatalf("canceled transcript = %#v, want captured item with gap", result)
 	}
-}
-
-func TestItemSidecarWriterCleanCloseDoesNotCreateFailureMarker(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "items.jsonl")
-	writer := newItemSidecarWriter(path, transcriptItemTextCap, transcriptItemFileCap)
-	writer.append(transcriptItemTool, "kept", "captured before clean close", false)
-	writer.close()
-	if writer.diagnostic != "" {
-		t.Fatalf("sidecar diagnostic = %q, want no failure", writer.diagnostic)
-	}
-	if _, err := os.Stat(itemSidecarFailurePath(path)); !os.IsNotExist(err) {
-		t.Fatalf("sidecar failure marker stat error = %v, want not exist", err)
-	}
-}
-
-func TestItemSidecarFailureMarkerOpenFailureMarksGap(t *testing.T) {
-	// A 250-byte sidecar name is valid on the supported filesystems, while its
-	// .failure sibling exceeds the 255-byte filename limit and makes marker
-	// creation fail with an error other than EEXIST.
-	markerPath := filepath.Join(t.TempDir(), strings.Repeat("m", 250))
-	writer := newItemSidecarWriter(markerPath, transcriptItemTextCap, transcriptItemFileCap)
-	if writer.diagnostic != "" {
-		t.Fatalf("marker-failure sidecar setup diagnostic = %q", writer.diagnostic)
-	}
-	defer writer.close()
-	run := newActiveExecution("failure-marker-open", nil)
-	writer.setFailureSink(run.noteItemSidecarDiagnostic)
-	writer.recordFailureMarker()
-	if !hasItemSidecarFailure(run.itemSidecarDiagnostics()) {
-		t.Fatalf("marker-open failure diagnostics = %#v, want durable sidecar gap source", run.itemSidecarDiagnostics())
-	}
-
-	t.Run("existing marker is success", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "items.jsonl")
-		writer := newItemSidecarWriter(path, transcriptItemTextCap, transcriptItemFileCap)
-		defer writer.close()
-		if err := os.WriteFile(itemSidecarFailurePath(path), nil, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		writer.recordFailureMarker()
-		if diagnostics := writer.diagnostics(); len(diagnostics) != 0 {
-			t.Fatalf("existing marker diagnostics = %#v, want success", diagnostics)
-		}
-	})
 }
 
 func TestRestartedTranscriptReportsGapAfterUnpersistedSidecarFailure(t *testing.T) {
