@@ -235,10 +235,7 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 			}
 		}
 		if strings.TrimSpace(outcome.backendSessionID) != "" {
-			if store == nil {
-				outcome.cleanup = protocol.CleanupUncertain
-				outcome.diagnostics = append(outcome.diagnostics, "record backend session: job store is unavailable")
-			} else if _, err := store.RecordBackendSessionID(run.jobID, outcome.backendSessionID); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
+			if _, err := store.RecordBackendSessionID(run.jobID, outcome.backendSessionID); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
 				outcome.cleanup = protocol.CleanupUncertain
 				outcome.diagnostics = append(outcome.diagnostics, "record backend session: "+err.Error())
 			}
