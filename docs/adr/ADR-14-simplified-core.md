@@ -248,7 +248,9 @@ job:
       "itemCount": 258,
       "counts": {
         "message": 6,
+        "reasoning": 0,
         "tool": 156,
+        "toolResult": 0,
         "fileChange": 0,
         "warning": 0,
         "error": 1
@@ -499,10 +501,11 @@ private `<jobId>.items.jsonl` sidecar beside the backend logs. The service
 derives that path from the validated stdout-log path by replacing its
 `.stdout.log` suffix; it is not an engine API, a `logPaths` field, a durable
 store field. job.transcript is the only RPC that reads it. Each item has an ordinal, append time, closed
-kind (`message`, `tool`, `fileChange`, `warning`, or `error`), optional tool
-name and text, and an explicit truncation flag. Consecutive agent-text events
-are coalesced; without a boundary signal in `engine.Event`, two otherwise
-adjacent agent messages also coalesce.
+kind (`message`, `reasoning`, `tool`, `toolResult`, `fileChange`, `warning`, or
+`error`), optional tool name and text, and an explicit truncation flag.
+Consecutive agent-text events are coalesced; without a boundary signal in
+`engine.Event`, two otherwise adjacent agent messages also coalesce. Reasoning
+and tool-result events remain one item per event.
 
 Text is capped at 4 KiB per item on UTF-8 rune boundaries and the sidecar at 16
 MiB. The writer reserves space for a final `{"appendStopped":true}` control

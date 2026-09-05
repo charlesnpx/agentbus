@@ -224,15 +224,15 @@ an orchestrator's context compaction.
 }
 ~~~
 
-Kinds may contain message, tool, fileChange, warning, or error. An absent kinds
-field and an explicit empty kinds array both mean no kind filter. since includes
-items strictly after its RFC 3339 timestamp; sinceOrdinal includes items whose
-ordinal is strictly greater than its value. last selects the final N matching
-items and limit bounds the selected response. kinds, since, sinceOrdinal, and
-last combine with AND; when last and limit are both present, the response keeps
-the most recent minimum of the two bounds. An ordinal is a readable handle: a
-caller can record that it last saw ordinal 141 and later use sinceOrdinal: 141
-without retaining server-issued state.
+Kinds may contain message, reasoning, tool, toolResult, fileChange, warning,
+or error. An absent kinds field and an explicit empty kinds array both mean no
+kind filter. since includes items strictly after its RFC 3339 timestamp;
+sinceOrdinal includes items whose ordinal is strictly greater than its value.
+last selects the final N matching items and limit bounds the selected response.
+kinds, since, sinceOrdinal, and last combine with AND; when last and limit are
+both present, the response keeps the most recent minimum of the two bounds. An
+ordinal is a readable handle: a caller can record that it last saw ordinal 141
+and later use sinceOrdinal: 141 without retaining server-issued state.
 
 ~~~json
 {
@@ -241,7 +241,9 @@ without retaining server-issued state.
   "itemCount": 258,
   "counts": {
     "message": 6,
+    "reasoning": 0,
     "tool": 156,
+    "toolResult": 0,
     "fileChange": 0,
     "warning": 0,
     "error": 1
@@ -262,7 +264,7 @@ without retaining server-issued state.
 ~~~
 
 itemCount, counts, firstAt, lastAt, and gap describe the captured sidecar, not
-only the selected items. counts always has all five kinds, including zero
+only the selected items. counts always has all seven kinds, including zero
 values. liveness appears only while this daemon has an active execution for the
 job and follows the same alive, gone, or unknown rule as job.list. A terminal
 job remains readable because terminal handling does not remove its sidecar.
@@ -271,7 +273,7 @@ With no kinds, since, sinceOrdinal, last, or limit, the response is a digest,
 not the whole stream: it returns counts and timestamps plus the last few
 message items and every captured error item. Any explicit selector returns its
 matching items, subject to limit. A missing sidecar is a valid empty transcript
-with itemCount zero, five zero counts, items: [], and gap false.
+with itemCount zero, seven zero counts, items: [], and gap false.
 
 When the sidecar's capped writer emitted its appendStopped marker, gap is true.
 The captured items and counts are then a known prefix rather than a claim that
