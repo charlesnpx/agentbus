@@ -517,9 +517,6 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 			o.emitEvent(engine.Event{Type: engine.EventProgress})
 			return
 		}
-		if method != "item/completed" {
-			return
-		}
 		// File-change observations intentionally carry no item text. The service
 		// retains their count, never paths or contents.
 		o.emitEvent(engine.Event{
@@ -531,9 +528,6 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 	case "commandexecution", "mcptoolcall", "dynamictoolcall":
 		if method == "item/started" {
 			o.emitEvent(engine.Event{Type: engine.EventProgress})
-			return
-		}
-		if method != "item/completed" {
 			return
 		}
 		o.emitEvent(engine.Event{

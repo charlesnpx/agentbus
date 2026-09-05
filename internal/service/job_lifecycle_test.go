@@ -327,8 +327,14 @@ func TestJobListProjectsActiveActivityAndLiveness(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := newActiveExecution(record.JobID, server.backends[record.Backend])
-	lastItemAt := time.Now().UTC().Round(0)
+	lastItemAt := time.Now().UTC().Add(-time.Second).Round(0)
 	run.noteTranscriptItem(lastItemAt)
+	newItemAssembler(run, nil).absorb(engine.Event{Type: engine.EventProgress}, "")
+	activity := run.itemActivity()
+	if activity.ItemCount != 1 || !activity.LastItemAt.Equal(lastItemAt) || !activity.LastActivityAt.After(lastItemAt) {
+		t.Fatalf("contentless progress activity = %#v, want unchanged item timestamp and later activity timestamp", activity)
+	}
+	lastActivityAt := activity.LastActivityAt
 	server.executionMu.Lock()
 	server.executions = map[string]*activeExecution{record.JobID: run}
 	server.executionMu.Unlock()
@@ -354,12 +360,26 @@ func TestJobListProjectsActiveActivityAndLiveness(t *testing.T) {
 		summary := result.Jobs[0]
 		if summary.ItemCount == nil || *summary.ItemCount != 1 ||
 			summary.LastItemAt == nil || !summary.LastItemAt.Equal(lastItemAt) ||
+			summary.LastActivityAt == nil || !summary.LastActivityAt.Equal(lastActivityAt) ||
+			summary.LastItemAt.Equal(*summary.LastActivityAt) ||
 			summary.Liveness != test.liveness {
 			t.Fatalf("%s active summary = %#v", test.name, summary)
 		}
 		encoded, err := json.Marshal(summary)
 		if err != nil {
 			t.Fatal(err)
+		}
+		var wireSummary struct {
+			LastItemAt     *time.Time `json:"lastItemAt"`
+			LastActivityAt *time.Time `json:"lastActivityAt"`
+		}
+		if err := json.Unmarshal(encoded, &wireSummary); err != nil {
+			t.Fatal(err)
+		}
+		if wireSummary.LastItemAt == nil || !wireSummary.LastItemAt.Equal(lastItemAt) ||
+			wireSummary.LastActivityAt == nil || !wireSummary.LastActivityAt.Equal(lastActivityAt) ||
+			wireSummary.LastItemAt.Equal(*wireSummary.LastActivityAt) {
+			t.Fatalf("%s summary JSON activity = %s, want distinct item and activity timestamps", test.name, encoded)
 		}
 		for _, forbidden := range [][]byte{[]byte(`"pid"`), []byte(`"pgid"`), []byte(`"startToken"`), []byte(`"processClaim"`)} {
 			if bytes.Contains(encoded, forbidden) {
@@ -380,7 +400,7 @@ func TestJobListProjectsActiveActivityAndLiveness(t *testing.T) {
 		t.Fatalf("terminal job.list error = %#v", terminal.err)
 	}
 	summary := terminal.result.(protocol.JobListResult).Jobs[0]
-	if summary.ItemCount != nil || summary.LastItemAt != nil || summary.Liveness != "" {
+	if summary.ItemCount != nil || summary.LastItemAt != nil || summary.LastActivityAt != nil || summary.Liveness != "" {
 		t.Fatalf("terminal summary activity = %#v, want omitted fields", summary)
 	}
 }

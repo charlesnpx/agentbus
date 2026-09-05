@@ -303,6 +303,8 @@ type JobSummaryWire struct {
 	ItemCount *int `json:"itemCount,omitempty"`
 	// LastItemAt is present after an active execution has assembled an item.
 	LastItemAt *time.Time `json:"lastItemAt,omitempty"`
+	// LastActivityAt is present after an active execution observes backend activity.
+	LastActivityAt *time.Time `json:"lastActivityAt,omitempty"`
 	// Liveness is present only while this daemon has an active execution.
 	// It is a verdict, never a process identifier or process claim.
 	Liveness Liveness `json:"liveness,omitempty"`

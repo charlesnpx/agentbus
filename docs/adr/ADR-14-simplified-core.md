@@ -226,6 +226,7 @@ tags and states do not filter; all supplied dimensions combine with AND.
           },
           "itemCount": 12,
           "lastItemAt": "RFC3339 UTC timestamp",
+          "lastActivityAt": "RFC3339 UTC timestamp",
           "liveness": "alive|gone|unknown"
         }
       ]
@@ -238,6 +239,9 @@ is the submitted tag map and makes a tag match visible to the caller.
 
 itemCount and liveness appear only while this daemon has an active execution
 for the job. lastItemAt appears after that execution has assembled an item.
+lastActivityAt appears after that execution observes any backend activity,
+including a contentless progress event that assembles no item; it is therefore
+the field an orchestrator uses to distinguish a slow turn from a stalled one.
 Terminal jobs and jobs known only from a previous daemon lifetime omit those
 fields. Liveness is derived from the exact recorded process-claim comparison:
 matching is alive, a missing or mismatched recorded process is gone, and an
