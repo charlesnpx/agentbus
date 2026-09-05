@@ -345,6 +345,7 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 				summary.Tags,
 				summary.ItemCount,
 				summary.LastItemAt,
+				summary.LastActivityAt,
 				summary.Liveness,
 			)
 		}
@@ -604,7 +605,7 @@ func (a *app) connectProtocolClient(ctx context.Context) (protocolClient, error)
 	return agentclient.Connect(ctx, opts)
 }
 
-func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, backend string, cleanup protocol.Cleanup, createdAt time.Time, failureClass protocol.FailureClass, contract *protocol.ContractVerdict, tags map[string]string, itemCount *int, lastItemAt *time.Time, liveness protocol.Liveness) {
+func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, backend string, cleanup protocol.Cleanup, createdAt time.Time, failureClass protocol.FailureClass, contract *protocol.ContractVerdict, tags map[string]string, itemCount *int, lastItemAt, lastActivityAt *time.Time, liveness protocol.Liveness) {
 	fmt.Fprintf(out, "jobId=%s state=%s backend=%s cleanup=%s age=%s", jobID, state, backend, cleanup, jobAge(createdAt))
 	if failureClass != "" {
 		fmt.Fprintf(out, " failure.class=%s", failureClass)
@@ -621,6 +622,9 @@ func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, ba
 	if lastItemAt != nil {
 		fmt.Fprintf(out, " lastItemAt=%s", humanTime(*lastItemAt))
 	}
+	if lastActivityAt != nil {
+		fmt.Fprintf(out, " lastActivityAt=%s", humanTime(*lastActivityAt))
+	}
 	if liveness != "" {
 		fmt.Fprintf(out, " liveness=%s", liveness)
 	}
@@ -628,7 +632,7 @@ func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, ba
 }
 
 func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
-	printJobSummary(out, record.JobID, record.State, record.Backend, record.Cleanup, record.CreatedAt, "", nil, nil, nil, nil, "")
+	printJobSummary(out, record.JobID, record.State, record.Backend, record.Cleanup, record.CreatedAt, "", nil, nil, nil, nil, nil, "")
 	fmt.Fprintf(out, "createdAt=%s", humanTime(record.CreatedAt))
 	if record.StartedAt != nil {
 		fmt.Fprintf(out, " startedAt=%s", humanTime(*record.StartedAt))

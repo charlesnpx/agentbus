@@ -4,6 +4,7 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -121,15 +122,16 @@ func (run *activeExecution) itemSidecarDiagnostics() []string {
 // assign logical ordinals after a disk failure or cap so activity remains a
 // measure of the live event stream rather than a measure of file bytes.
 type itemSidecarWriter struct {
-	path        string
-	textCap     int
-	fileCap     int64
-	file        *os.File
-	written     int64
-	next        int
-	stopped     bool
-	diagnostic  string
-	failureSink func(string)
+	path             string
+	textCap          int
+	fileCap          int64
+	file             *os.File
+	written          int64
+	next             int
+	stopped          bool
+	diagnostic       string
+	markerDiagnostic string
+	failureSink      func(string)
 }
 
 func newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarWriter {
@@ -171,8 +173,10 @@ func (writer *itemSidecarWriter) setFailureSink(sink func(string)) {
 		return
 	}
 	writer.failureSink = sink
-	if writer.diagnostic != "" && writer.failureSink != nil {
-		writer.failureSink(writer.diagnostic)
+	if writer.failureSink != nil {
+		for _, diagnostic := range writer.diagnostics() {
+			writer.failureSink(diagnostic)
+		}
 	}
 }
 
@@ -281,17 +285,34 @@ func (writer *itemSidecarWriter) noteFailure(operation string, err error) {
 
 // recordFailureMarker preserves a create-only signal that the capture is known
 // to be incomplete, whether a sidecar write failed or a backend frame was
-// dropped. It is best effort: the marker can fail under the same broader
-// filesystem fault that stopped the sidecar.
+// dropped. An existing marker already establishes that fact; any other open
+// failure becomes a durable sidecar diagnostic instead of being discarded.
 func (writer *itemSidecarWriter) recordFailureMarker() {
 	if writer == nil || strings.TrimSpace(writer.path) == "" {
 		return
 	}
 	file, err := os.OpenFile(itemSidecarFailurePath(writer.path), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			writer.noteMarkerFailure(err)
+		}
 		return
 	}
 	defer file.Close()
+}
+
+// noteMarkerFailure deliberately leaves an otherwise usable sidecar writer
+// running. The marker is only needed after a separate incompleteness event;
+// its failed creation still has to reach the existing sidecar-diagnostic gap
+// source when no other sidecar failure has already done so.
+func (writer *itemSidecarWriter) noteMarkerFailure(err error) {
+	if writer == nil || err == nil || writer.diagnostic != "" || writer.markerDiagnostic != "" {
+		return
+	}
+	writer.markerDiagnostic = itemSidecarDiagnosticPrefix + "record failure marker: " + err.Error()
+	if writer.failureSink != nil {
+		writer.failureSink(writer.markerDiagnostic)
+	}
 }
 
 func (writer *itemSidecarWriter) close() {
@@ -309,10 +330,17 @@ func (writer *itemSidecarWriter) close() {
 }
 
 func (writer *itemSidecarWriter) diagnostics() []string {
-	if writer == nil || writer.diagnostic == "" {
+	if writer == nil {
 		return nil
 	}
-	return []string{writer.diagnostic}
+	diagnostics := make([]string, 0, 2)
+	if writer.diagnostic != "" {
+		diagnostics = append(diagnostics, writer.diagnostic)
+	}
+	if writer.markerDiagnostic != "" {
+		diagnostics = append(diagnostics, writer.markerDiagnostic)
+	}
+	return diagnostics
 }
 
 func itemSidecarPath(stdoutPath string) (string, error) {

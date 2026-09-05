@@ -807,7 +807,8 @@ func TestJobCancelRetainsCurrentTurnFinalEvidence(t *testing.T) {
 }
 
 func TestJobCancelReturnsAfterUnretiredTurnStreamGrace(t *testing.T) {
-	// This fake event stream intentionally never sends and never closes.
+	// This fake event stream stays open past the containment grace, then emits
+	// a transcript-producing tail event after cancellation has returned.
 	events := make(chan engine.Event)
 	turnStarted := make(chan struct{})
 	backend := &executionFakeBackend{name: "cancel-unretired-turn-stream"}
@@ -857,6 +858,12 @@ func TestJobCancelReturnsAfterUnretiredTurnStreamGrace(t *testing.T) {
 	case <-completionBound.C:
 		t.Fatal("job.cancel did not return after the event-stream containment grace")
 	}
+	select {
+	case events <- engine.Event{Type: engine.EventToolUse, Name: "late", Text: "abandoned tail"}:
+	case <-time.After(time.Second):
+		t.Fatal("discarded event stream did not accept the post-grace tail event")
+	}
+	close(events)
 	<-runDone
 
 	store, err := server.ensureJobStore()
@@ -869,6 +876,10 @@ func TestJobCancelReturnsAfterUnretiredTurnStreamGrace(t *testing.T) {
 	}
 	if stored.State != protocol.PublicStateCanceled || stored.Cleanup != protocol.CleanupUncertain {
 		t.Fatalf("canceled record = %#v, want canceled with uncertain cleanup", stored)
+	}
+	result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
+	if !result.Gap {
+		t.Fatalf("post-grace abandoned-tail transcript = %#v, want gap true", result)
 	}
 	for _, diagnostic := range stored.Diagnostics {
 		if diagnostic == "backend event stream did not close after containment grace" {

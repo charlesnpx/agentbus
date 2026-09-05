@@ -92,12 +92,7 @@ func (s *Server) jobTranscript(record jobstore.Record, params protocol.JobTransc
 	}
 	result := emptyJobTranscript(record)
 	if present {
-		result, err = readTranscriptSidecar(path, params)
-		if err != nil {
-			// A failed read still leaves a useful captured prefix. Report its
-			// incompleteness instead of hiding it behind an RPC failure.
-			result.Gap = true
-		}
+		result = readTranscriptSidecar(path, params)
 		result.State = projectedState(record)
 	}
 	failureMarker := hasItemSidecarFailureMarker(path)
@@ -151,17 +146,20 @@ func newTranscriptCounts() map[string]int {
 	}
 }
 
-func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) (protocol.JobTranscriptResult, error) {
+func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) protocol.JobTranscriptResult {
 	result := protocol.JobTranscriptResult{
 		Counts: newTranscriptCounts(),
 		Items:  make([]protocol.TranscriptItem, 0),
 	}
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return result, nil
+		return result
 	}
 	if err != nil {
-		return result, fmt.Errorf("open transcript sidecar: %w", err)
+		// A failed read still leaves a useful captured prefix. Report its
+		// incompleteness instead of hiding it behind an RPC failure.
+		result.Gap = true
+		return result
 	}
 	defer file.Close()
 
@@ -202,7 +200,8 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) (pr
 		var item protocol.TranscriptItem
 		if err := json.Unmarshal(line, &item); err != nil {
 			finishItems()
-			return result, fmt.Errorf("decode transcript item: %w", err)
+			result.Gap = true
+			return result
 		}
 		result.ItemCount++
 		result.Counts[item.Kind]++
@@ -242,10 +241,11 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) (pr
 	}
 	if err := scanner.Err(); err != nil {
 		finishItems()
-		return result, fmt.Errorf("scan transcript sidecar: %w", err)
+		result.Gap = true
+		return result
 	}
 	finishItems()
-	return result, nil
+	return result
 }
 
 func setTranscriptBounds(result *protocol.JobTranscriptResult, item protocol.TranscriptItem) {
