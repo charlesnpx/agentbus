@@ -464,3 +464,105 @@ func TestTranscriptItemSidecarFailureSurvivesCancellation(t *testing.T) {
 		t.Fatalf("diagnostics = %#v, want sidecar failure", terminal.Diagnostics)
 	}
 }
+
+func TestRestartedTranscriptReportsGapAfterUnpersistedSidecarFailure(t *testing.T) {
+	root := t.TempDir()
+	events := make(chan engine.Event, 1)
+	events <- engine.Event{Type: engine.EventToolUse, Name: "lost", Text: "captured before the crash"}
+	turnStarted := make(chan struct{})
+	var closeEvents sync.Once
+	closeStream := func() { closeEvents.Do(func() { close(events) }) }
+	parent, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		closeStream()
+	})
+
+	backend := &executionFakeBackend{name: "items-restart-gap"}
+	backend.start = func(_ context.Context, _ engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, _ engine.TurnInput) (<-chan engine.Event, error) {
+				close(turnStarted)
+				return events, nil
+			},
+			interrupt: func(context.Context) error {
+				closeStream()
+				return nil
+			},
+		}, nil
+	}
+	first := newTestServer(t, root, Config{Backends: []engine.Backend{backend}})
+	record := queuedExecutionRecord(t, first, backend.Name(), "restart after sidecar failure", nil)
+	itemPath := transcriptItemPath(t, record)
+	if err := os.MkdirAll(filepath.Dir(itemPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(itemPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	run := newActiveExecution(record.JobID, backend)
+	done := make(chan struct{})
+	go func() {
+		first.runJob(parent, record, run)
+		close(done)
+	}()
+	select {
+	case <-turnStarted:
+	case <-time.After(time.Second):
+		t.Fatal("turn did not start")
+	}
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for run.itemActivity().ItemCount != 1 {
+		select {
+		case <-deadline.C:
+			t.Fatal("lost transcript item was not observed")
+		case <-ticker.C:
+		}
+	}
+	if !hasItemSidecarFailure(run.itemSidecarDiagnostics()) {
+		t.Fatalf("active sidecar diagnostics = %#v, want production sidecar failure", run.itemSidecarDiagnostics())
+	}
+
+	store, err := first.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !started.Starting || hasItemSidecarFailure(started.Diagnostics) {
+		t.Fatalf("pre-crash record = %#v, want starting without a durable sidecar diagnostic", started)
+	}
+
+	// Closing the store without taking a terminal path models the abrupt daemon
+	// exit between the in-memory failure and terminal persistence.
+	first.closeJobStore()
+	restarted := newTestServer(t, root, Config{})
+	store, err = restarted.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.reconcileRecoveredJobs(store); err != nil {
+		t.Fatal(err)
+	}
+	result := transcriptResultForTest(t, restarted, protocol.JobTranscriptParams{JobID: record.JobID})
+	if result.State != protocol.PublicStateUnknown || result.ItemCount != 0 || !result.Gap {
+		t.Fatalf("restarted transcript = %#v, want unknown empty transcript with gap", result)
+	}
+
+	if _, err := run.requestCancellation(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("interrupted pre-crash turn did not finish")
+	}
+}

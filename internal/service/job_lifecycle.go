@@ -412,8 +412,10 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 				State:            protocol.PublicStateUnknown,
 				Cleanup:          cleanup,
 				BackendSessionID: record.BackendSessionID,
-				Diagnostics:      append([]string{"restart reconciliation: no relaunch"}, diagnostics...),
-				FinishedAt:       time.Now().UTC(),
+				Diagnostics: append([]string{
+					"restart reconciliation: no relaunch",
+				}, diagnostics...),
+				FinishedAt: time.Now().UTC(),
 			})
 		default:
 			// A terminal record is deliberately untouched. In particular, do

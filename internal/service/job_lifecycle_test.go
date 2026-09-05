@@ -1072,8 +1072,12 @@ func TestOrphanReaperDoesNotSignalTokenMismatch(t *testing.T) {
 	if stored.State != protocol.PublicStateUnknown || stored.Cleanup != protocol.CleanupUncertain {
 		t.Fatalf("mismatched-token reaped record = %#v", stored)
 	}
-	if len(stored.Diagnostics) != 2 || stored.Diagnostics[1] != "orphan reaper: leader start token mismatch; no signal sent" {
-		t.Fatalf("mismatched-token diagnostics = %#v", stored.Diagnostics)
+	wantDiagnostics := []string{
+		"restart reconciliation: no relaunch",
+		"orphan reaper: leader start token mismatch; no signal sent",
+	}
+	if !slices.Equal(stored.Diagnostics, wantDiagnostics) {
+		t.Fatalf("mismatched-token diagnostics = %#v, want %#v", stored.Diagnostics, wantDiagnostics)
 	}
 }
 
