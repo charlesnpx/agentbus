@@ -5,6 +5,7 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,10 +20,12 @@ const (
 	transcriptItemTextCap       = 4 * 1024
 	transcriptItemFileCap       = 16 * 1024 * 1024
 	itemSidecarDiagnosticPrefix = "item sidecar "
-	itemSidecarPendingSuffix    = ".pending"
 )
 
-var transcriptItemStopLine = []byte("{\"appendStopped\":true}\n")
+var (
+	transcriptItemStopLine     = []byte("{\"appendStopped\":true}\n")
+	transcriptItemCompleteLine = []byte("{\"captureComplete\":true}\n")
+)
 
 type transcriptItemKind string
 
@@ -153,10 +156,6 @@ func newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarW
 		writer.noteFailure("create parent", err)
 		return writer
 	}
-	if err := writer.createPendingMarker(); err != nil {
-		writer.noteFailure("create pending marker", err)
-		return writer
-	}
 	file, err := os.OpenFile(writer.path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		writer.noteFailure("open", err)
@@ -244,10 +243,31 @@ func (writer *itemSidecarWriter) remainingPayload() int64 {
 		return 0
 	}
 	reserved := int64(len(transcriptItemStopLine))
+	if completion := int64(len(transcriptItemCompleteLine)); completion > reserved {
+		reserved = completion
+	}
 	if writer.written >= writer.fileCap-reserved {
 		return 0
 	}
 	return writer.fileCap - reserved - writer.written
+}
+
+func (writer *itemSidecarWriter) writeControlLine(file *os.File, line []byte) error {
+	if writer == nil || file == nil {
+		return fmt.Errorf("sidecar file is unavailable")
+	}
+	if writer.written+int64(len(line)) > writer.fileCap {
+		return fmt.Errorf("sidecar is already at its %d-byte cap", writer.fileCap)
+	}
+	written, err := file.Write(line)
+	if err != nil {
+		return err
+	}
+	if written != len(line) {
+		return io.ErrShortWrite
+	}
+	writer.written += int64(written)
+	return nil
 }
 
 func (writer *itemSidecarWriter) markStopped() {
@@ -258,16 +278,12 @@ func (writer *itemSidecarWriter) markStopped() {
 		writer.noteFailure("record append stop", fmt.Errorf("sidecar file is unavailable"))
 		return
 	}
-	if writer.written+int64(len(transcriptItemStopLine)) > writer.fileCap {
-		writer.noteFailure("record append stop", fmt.Errorf("sidecar is already at its %d-byte cap", writer.fileCap))
-		return
-	}
-	if _, err := writer.file.Write(transcriptItemStopLine); err != nil {
+	if err := writer.writeControlLine(writer.file, transcriptItemStopLine); err != nil {
 		writer.noteFailure("record append stop", err)
 		return
 	}
-	writer.written += int64(len(transcriptItemStopLine))
 	writer.stopped = true
+	writer.incomplete = true
 }
 
 func (writer *itemSidecarWriter) noteFailure(operation string, err error) {
@@ -286,36 +302,13 @@ func (writer *itemSidecarWriter) noteFailure(operation string, err error) {
 	}
 }
 
-// markIncomplete preserves the pending marker for uncertainty that does not
-// itself prevent sidecar I/O, such as a dropped backend frame.
+// markIncomplete withholds the completion receipt for uncertainty that does
+// not itself prevent sidecar I/O, such as a dropped backend frame.
 func (writer *itemSidecarWriter) markIncomplete() {
 	if writer == nil {
 		return
 	}
 	writer.incomplete = true
-}
-
-func (writer *itemSidecarWriter) createPendingMarker() error {
-	if writer == nil || strings.TrimSpace(writer.path) == "" {
-		return fmt.Errorf("path is empty")
-	}
-	file, err := os.OpenFile(itemSidecarPendingPath(writer.path), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
-	if err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (writer *itemSidecarWriter) clearPendingMarker() {
-	if writer == nil || strings.TrimSpace(writer.path) == "" {
-		return
-	}
-	if err := os.Remove(itemSidecarPendingPath(writer.path)); err != nil && !os.IsNotExist(err) {
-		writer.noteFailure("clear pending marker", err)
-	}
 }
 
 func (writer *itemSidecarWriter) close() {
@@ -324,16 +317,32 @@ func (writer *itemSidecarWriter) close() {
 	}
 	file := writer.file
 	writer.file = nil
+	// The receipt is written only after every item is durable, so a reader that
+	// sees it never treats an unsynced item prefix as a completed capture.
 	if err := file.Sync(); err != nil {
 		writer.noteFailure("sync", err)
+		_ = file.Close()
+		return
+	}
+	if writer.incomplete {
+		if err := file.Close(); err != nil {
+			writer.noteFailure("close", err)
+		}
+		return
+	}
+	if err := writer.writeControlLine(file, transcriptItemCompleteLine); err != nil {
+		writer.noteFailure("record capture completion", err)
+		_ = file.Close()
+		return
+	}
+	if err := file.Sync(); err != nil {
+		writer.noteFailure("sync capture completion", err)
+		_ = file.Close()
+		return
 	}
 	if err := file.Close(); err != nil {
 		writer.noteFailure("close", err)
 	}
-	if writer.incomplete {
-		return
-	}
-	writer.clearPendingMarker()
 }
 
 func (writer *itemSidecarWriter) diagnostics() []string {
@@ -353,10 +362,6 @@ func itemSidecarPath(stdoutPath string) (string, error) {
 		return "", fmt.Errorf("stdout log path %q is missing .stdout.log suffix", stdoutPath)
 	}
 	return base + ".items.jsonl", nil
-}
-
-func itemSidecarPendingPath(sidecarPath string) string {
-	return sidecarPath + itemSidecarPendingSuffix
 }
 
 // itemAssembler turns the normalized engine event stream into transcript

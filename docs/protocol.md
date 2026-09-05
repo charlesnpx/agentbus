@@ -302,7 +302,9 @@ matching items, subject to limit. A missing sidecar returns a valid empty
 transcript with itemCount zero, seven zero counts, no timestamps, and items:
 []; gap is true when capture or reading could not establish continuity, so the
 returned prefix may be incomplete rather than a claim that the job emitted no
-more activity.
+more activity. A sidecar captured before completion receipts existed has no
+receipt and is therefore reported as a gapped prefix, because its completeness
+cannot be established.
 
 ## job.get
 

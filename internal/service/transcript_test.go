@@ -320,13 +320,13 @@ func writeTranscriptSidecar(t *testing.T, record jobstore.Record, items []protoc
 			t.Fatal(err)
 		}
 	}
+	control := transcriptItemCompleteLine
 	if gap {
-		if err := encoder.Encode(struct {
-			AppendStopped bool `json:"appendStopped"`
-		}{AppendStopped: true}); err != nil {
-			_ = file.Close()
-			t.Fatal(err)
-		}
+		control = transcriptItemStopLine
+	}
+	if _, err := file.Write(control); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
 	}
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
