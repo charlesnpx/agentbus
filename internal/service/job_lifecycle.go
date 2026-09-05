@@ -264,6 +264,10 @@ func (s *Server) jobSummaryWireFromSpec(record jobstore.Record, spec protocol.Ta
 		lastItemAt := activity.LastItemAt
 		wire.LastItemAt = &lastItemAt
 	}
+	if !activity.LastActivityAt.IsZero() {
+		lastActivityAt := activity.LastActivityAt
+		wire.LastActivityAt = &lastActivityAt
+	}
 	wire.Liveness = s.exactClaimDiagnostic(record.ProcessClaim).liveness
 	return wire
 }

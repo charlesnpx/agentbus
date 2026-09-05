@@ -923,9 +923,8 @@ func TestAppServerFileChangesReportObservedWorkspaceWriteItems(t *testing.T) {
 		peer.respond(thread, threadResult("thread-1"))
 		turn := peer.expectRequest("turn/start")
 		peer.respond(turn, turnResult("turn-1"))
-		peer.notify("item/started", itemParams("thread-1", "turn-1", map[string]any{"id": "change-started", "type": "fileChange", "name": "started file change", "changes": "started private change"}))
-		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "command", "type": "commandExecution"}))
-		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "change-completed", "type": "fileChange", "name": "completed file change", "changes": "completed private change"}))
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "change-one", "type": "fileChange", "name": "first file change", "changes": "first private change"}))
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "change-two", "type": "fileChange", "name": "second file change", "changes": "second private change"}))
 		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
 	})
 
@@ -942,7 +941,7 @@ func TestAppServerFileChangesReportObservedWorkspaceWriteItems(t *testing.T) {
 		observed bool
 	}
 	for _, event := range got {
-		if event.Name == "started file change" || event.Name == "completed file change" {
+		if event.Name == "first file change" || event.Name == "second file change" {
 			fileChanges = append(fileChanges, struct {
 				typ      string
 				name     string
@@ -962,11 +961,76 @@ func TestAppServerFileChangesReportObservedWorkspaceWriteItems(t *testing.T) {
 		text     string
 		observed bool
 	}{
-		{typ: engine.EventToolUse, name: "started file change", observed: true},
-		{typ: engine.EventToolUse, name: "completed file change", observed: true},
+		{typ: engine.EventToolUse, name: "first file change", observed: true},
+		{typ: engine.EventToolUse, name: "second file change", observed: true},
 	}
 	if !reflect.DeepEqual(fileChanges, wantFileChanges) {
 		t.Fatalf("file-change events = %#v, want %#v", fileChanges, wantFileChanges)
+	}
+}
+
+func TestAppServerEmitsOneEventPerLogicalItem(t *testing.T) {
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+
+		peer.notify("item/started", itemParams("thread-1", "turn-1", map[string]any{
+			"id": "command-1", "type": "commandExecution", "name": "started command", "command": "printf started",
+		}))
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{
+			"id": "command-1", "type": "commandExecution", "name": "completed command", "command": "printf completed", "aggregatedOutput": "completed output", "exitCode": 0,
+		}))
+		peer.notify("item/started", itemParams("thread-1", "turn-1", map[string]any{
+			"id": "file-1", "type": "fileChange", "name": "started file change", "changes": "started private change",
+		}))
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{
+			"id": "file-1", "type": "fileChange", "name": "completed file change", "changes": "completed private change",
+		}))
+		peer.notify("item/started", itemParams("thread-1", "turn-1", map[string]any{
+			"id": "message-1", "type": "agentMessage", "text": "draft",
+		}))
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{
+			"id": "message-1", "type": "agentMessage", "text": "final answer",
+		}))
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	type eventSummary struct {
+		typ      string
+		name     string
+		text     string
+		observed bool
+	}
+	gotSequence := make([]eventSummary, 0, len(got))
+	for _, event := range got {
+		gotSequence = append(gotSequence, eventSummary{
+			typ:      event.Type,
+			name:     event.Name,
+			text:     event.Text,
+			observed: event.ObservedWorkspaceWriteItem,
+		})
+	}
+	wantSequence := []eventSummary{
+		{typ: engine.EventProgress},
+		{typ: engine.EventToolUse, name: "completed command", text: "printf completed"},
+		{typ: engine.EventProgress},
+		{typ: engine.EventToolUse, name: "completed file change", observed: true},
+		{typ: engine.EventAgentText, text: "final answer"},
+		{typ: engine.EventResultMessage, text: "final answer"},
+		{typ: engine.EventTurnFinal},
+	}
+	if !reflect.DeepEqual(gotSequence, wantSequence) {
+		t.Fatalf("event sequence = %#v, want %#v", gotSequence, wantSequence)
 	}
 }
 

@@ -197,6 +197,7 @@ The result contains compact summaries:
       },
       "itemCount": 12,
       "lastItemAt": "2026-08-20T12:00:01Z",
+      "lastActivityAt": "2026-08-20T12:00:02Z",
       "liveness": "alive"
     }
   ]
@@ -210,8 +211,11 @@ filter matched.
 
 itemCount and liveness appear only while this daemon has an active execution
 for that job. lastItemAt appears after that active execution has assembled an
-item; it is absent before the first item. A terminal job, or a job that came
-from before this daemon started, has no activity or liveness projection.
+item; it is absent before the first item. lastActivityAt advances whenever the
+backend does anything observable, including a contentless progress event;
+lastItemAt advances only when a transcript item is assembled. An orchestrator
+watching for a stall should use lastActivityAt. A terminal job, or a job that
+came from before this daemon started, has no activity or liveness projection.
 liveness is alive when the recorded claim exactly matches a live process,
 gone when the recorded claim is absent from the process table or mismatches a
 recycled process, and unknown when the daemon cannot establish the identity.
