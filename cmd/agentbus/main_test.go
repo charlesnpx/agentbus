@@ -152,37 +152,68 @@ func TestStatusListHumanProjectionIncludesFailureClassAndContractVerdict(t *test
 	}
 }
 
-func TestStatusListScopesCurrentWorkspaceAndCanListAllWorkspaces(t *testing.T) {
-	client := &fakeProtocolClient{list: agentclient.JobListResult{}}
-	a := testApp(t)
-	a.clientConnect = fakeConnector(client)
+func TestStatusListDefaultsAllWorkspacesAndFiltersExplicitWorkspace(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          []string
+		wantCode      int
+		wantWorkspace string
+		wantTags      map[string]string
+		wantStates    []protocol.PublicState
+		wantErr       string
+	}{
+		{
+			name:     "default lists every workspace",
+			args:     []string{"status"},
+			wantCode: 0,
+		},
+		{
+			name:          "explicit workspace key filters the list",
+			args:          []string{"status", "--workspace-key", "delegate-v1-workspace", "--tag", "team=core", "--state", "running"},
+			wantCode:      0,
+			wantWorkspace: "delegate-v1-workspace",
+			wantTags:      map[string]string{"team": "core"},
+			wantStates:    []protocol.PublicState{protocol.PublicStateRunning},
+		},
+		{
+			name:     "all workspaces flag is removed",
+			args:     []string{"status", "--all-workspaces"},
+			wantCode: 2,
+			wantErr:  "flag provided but not defined: -all-workspaces",
+		},
+	}
 
-	code, _, stderr := runTestCLI(t, a, []string{"status", "--tag", "team=core", "--state", "running"})
-	if code != 0 || stderr != "" {
-		t.Fatalf("scoped status = (%d,%q)", code, stderr)
-	}
-	if len(client.listParams) != 1 {
-		t.Fatalf("scoped job.list calls = %d, want 1", len(client.listParams))
-	}
-	wantWorkspace, err := currentWorkspaceKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := client.listParams[0]; got.WorkspaceKey != wantWorkspace ||
-		!slices.Equal(got.States, []protocol.PublicState{protocol.PublicStateRunning}) ||
-		len(got.Tags) != 1 || got.Tags["team"] != "core" {
-		t.Fatalf("scoped job.list params = %#v", got)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &fakeProtocolClient{list: agentclient.JobListResult{}}
+			a := testApp(t)
+			a.clientConnect = fakeConnector(client)
 
-	code, _, stderr = runTestCLI(t, a, []string{"status", "--all-workspaces"})
-	if code != 0 || stderr != "" {
-		t.Fatalf("all-workspaces status = (%d,%q)", code, stderr)
-	}
-	if len(client.listParams) != 2 {
-		t.Fatalf("all-workspaces job.list calls = %d, want 2", len(client.listParams))
-	}
-	if got := client.listParams[1]; got.WorkspaceKey != "" || len(got.Tags) != 0 || len(got.States) != 0 {
-		t.Fatalf("all-workspaces job.list params = %#v, want no filters", got)
+			code, _, stderr := runTestCLI(t, a, tt.args)
+			if code != tt.wantCode || (tt.wantErr == "" && stderr != "") || (tt.wantErr != "" && !strings.Contains(stderr, tt.wantErr)) {
+				t.Fatalf("status = (%d,%q), want (%d, containing %q)", code, stderr, tt.wantCode, tt.wantErr)
+			}
+			if tt.wantErr != "" {
+				if len(client.listParams) != 0 {
+					t.Fatalf("removed flag made %d job.list calls, want 0", len(client.listParams))
+				}
+				return
+			}
+			if len(client.listParams) != 1 {
+				t.Fatalf("job.list calls = %d, want 1", len(client.listParams))
+			}
+			if got := client.listParams[0]; got.WorkspaceKey != tt.wantWorkspace ||
+				!slices.Equal(got.States, tt.wantStates) ||
+				len(got.Tags) != len(tt.wantTags) {
+				t.Fatalf("job.list params = %#v", got)
+			} else {
+				for key, want := range tt.wantTags {
+					if got.Tags[key] != want {
+						t.Fatalf("job.list tags = %#v, want %s=%s", got.Tags, key, want)
+					}
+				}
+			}
+		})
 	}
 }
 

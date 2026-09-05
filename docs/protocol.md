@@ -118,6 +118,10 @@ effort, outputSchema, tags, and timeoutMs are optional. outputSchema is one
 inline Draft 2020-12 JSON Schema value: an object or a boolean. timeoutMs is a
 non-negative integer no greater than four hours; zero means no deadline.
 
+workspaceKey is an opaque, submitter-chosen namespace. Agentbus cannot derive
+another tool's workspaceKey, even when that tool submits work for the same
+directory.
+
 resumeJobId names a prior job, never a backend thread ID. For a new submission,
 the target must be a terminal non-completed job for the same backend and must
 have recorded a backend session ID at turn retirement. A target without that ID
@@ -220,10 +224,10 @@ reason, log paths, or process claims.
 
 Workspace filtering is scoping, not ownership. The local Unix socket has no
 stable authenticated caller identity, so Agentbus cannot enforce who owns a
-job. The CLI computes the SHA-256 workspace key from its canonical current
-working directory and supplies it for agentbus status without --job. Passing
---all-workspaces clears that filter. Two orchestrators in the same repository
-therefore share a workspace scope.
+job. workspaceKey is an opaque, submitter-chosen namespace, and Agentbus
+cannot derive another tool's key. Therefore, status without --job sends no
+workspace filter and lists every workspace; a caller that knows a key can use
+--workspace-key <key> to filter the list.
 
 ## job.transcript
 

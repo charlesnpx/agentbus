@@ -274,51 +274,103 @@ func TestItemSidecarPathDerivesFromStdoutLog(t *testing.T) {
 	}
 }
 
-func TestTranscriptItemsCorrectionTurnContinuesOrdinals(t *testing.T) {
+func TestTranscriptItemsResultMessageTerminatesAgentTextRun(t *testing.T) {
 	const initialResult = `{"wrong":true}`
 	const correctedResult = `{"ok":true}`
 	schemaRaw := json.RawMessage(`{"required":["ok"],"type":"object"}`)
-	turns := 0
-	backend := &executionFakeBackend{name: "items-correction"}
-	backend.start = func(_ context.Context, _ engine.SessionOpts) (engine.Session, error) {
-		return &executionFakeSession{
-			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
-				turns++
-				switch turns {
-				case 1:
-					input.OnProcessStart(engine.ProcessRef{PID: 6104, PGID: 6104, StartTime: "items-initial"}, 0)
-					return executionEvents(
-						engine.Event{Type: engine.EventAgentText, Text: "draft"},
-						engine.Event{Type: engine.EventResultMessage, Text: initialResult},
-					), nil
-				case 2:
-					input.OnProcessStart(engine.ProcessRef{PID: 6105, PGID: 6105, StartTime: "items-correction"}, 0)
-					return executionEvents(
-						engine.Event{Type: engine.EventToolUse, Name: "validate", Text: "retry"},
-						engine.Event{Type: engine.EventResultMessage, Text: correctedResult},
-					), nil
-				default:
-					t.Fatalf("turn count = %d, want 2", turns)
-					return nil, nil
-				}
+	type expectedItem struct {
+		kind transcriptItemKind
+		name string
+		text string
+	}
+	tests := []struct {
+		name             string
+		initialEvents    []engine.Event
+		correctionEvents []engine.Event
+		withSchema       bool
+		want             []expectedItem
+	}{
+		{
+			name: "matching agent text and result share one item",
+			initialEvents: []engine.Event{
+				{Type: engine.EventAgentText, Text: "tagged "},
+				{Type: engine.EventAgentText, Text: "ok"},
+				{Type: engine.EventResultMessage, Text: "tagged ok"},
 			},
-		}, nil
+			want: []expectedItem{{kind: transcriptItemMessage, text: "tagged ok"}},
+		},
+		{
+			name: "result without agent text becomes an item",
+			initialEvents: []engine.Event{
+				{Type: engine.EventResultMessage, Text: "result only"},
+			},
+			want: []expectedItem{{kind: transcriptItemMessage, text: "result only"}},
+		},
+		{
+			name: "different agent text and result remain separate across correction",
+			initialEvents: []engine.Event{
+				{Type: engine.EventAgentText, Text: "draft"},
+				{Type: engine.EventResultMessage, Text: initialResult},
+			},
+			correctionEvents: []engine.Event{
+				{Type: engine.EventToolUse, Name: "validate", Text: "retry"},
+				{Type: engine.EventResultMessage, Text: correctedResult},
+			},
+			withSchema: true,
+			want: []expectedItem{
+				{kind: transcriptItemMessage, text: "draft"},
+				{kind: transcriptItemMessage, text: initialResult},
+				{kind: transcriptItemTool, name: "validate", text: "retry"},
+				{kind: transcriptItemMessage, text: correctedResult},
+			},
+		},
 	}
-	server := newExecutionServer(t, backend)
-	record := queuedExecutionRecordWithSchema(t, server, backend.Name(), "correct", nil, schemaRaw)
-	runExecution(t, server, record)
 
-	items := readTranscriptItems(t, record)
-	if len(items) != 4 {
-		t.Fatalf("item count = %d, want 4: %#v", len(items), items)
-	}
-	for index, item := range items {
-		if item.Ordinal != index+1 {
-			t.Fatalf("item %d ordinal = %d, want %d", index, item.Ordinal, index+1)
-		}
-	}
-	if got := items[3]; got.Kind != string(transcriptItemMessage) || got.Text != correctedResult {
-		t.Fatalf("last correction item = %+v, want corrected result message", got)
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			turns := 0
+			backend := &executionFakeBackend{name: "items-result-message"}
+			backend.start = func(_ context.Context, _ engine.SessionOpts) (engine.Session, error) {
+				return &executionFakeSession{
+					turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+						turns++
+						input.OnProcessStart(engine.ProcessRef{PID: 6103 + turns, PGID: 6103 + turns, StartTime: "items-result-message"}, 0)
+						switch turns {
+						case 1:
+							return executionEvents(tt.initialEvents...), nil
+						case 2:
+							if !tt.withSchema {
+								t.Fatalf("turn count = %d, want 1", turns)
+							}
+							return executionEvents(tt.correctionEvents...), nil
+						default:
+							t.Fatalf("turn count = %d, want at most 2", turns)
+							return nil, nil
+						}
+					},
+				}, nil
+			}
+			server := newExecutionServer(t, backend)
+			var record jobstore.Record
+			if tt.withSchema {
+				record = queuedExecutionRecordWithSchema(t, server, backend.Name(), "correct", nil, schemaRaw)
+			} else {
+				record = queuedExecutionRecord(t, server, backend.Name(), "result message", nil)
+			}
+			runExecution(t, server, record)
+
+			items := readTranscriptItems(t, record)
+			if len(items) != len(tt.want) {
+				t.Fatalf("item count = %d, want %d: %#v", len(items), len(tt.want), items)
+			}
+			for index, item := range items {
+				want := tt.want[index]
+				if item.Ordinal != index+1 || item.Kind != string(want.kind) || item.Name != want.name || item.Text != want.text {
+					t.Fatalf("item %d = %+v, want ordinal=%d kind=%s name=%q text=%q", index, item, index+1, want.kind, want.name, want.text)
+				}
+			}
+		})
 	}
 }
 
