@@ -292,7 +292,7 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 	fs := newCommandFlagSet("status", errOut)
 	jsonOut := fs.Bool("json", false, "emit the protocol response")
 	jobID := fs.String("job", "", "job id")
-	allWorkspaces := fs.Bool("all-workspaces", false, "list jobs from every workspace")
+	workspaceKey := fs.String("workspace-key", "", "filter list by submitter workspace key")
 	var tagValues []string
 	fs.Func("tag", "filter list by key=value (repeatable)", func(value string) error {
 		tagValues = append(tagValues, value)
@@ -309,13 +309,13 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 	if fs.NArg() != 0 {
 		return usageError(errOut, "status does not accept positional arguments")
 	}
-	if *jobID != "" && (*allWorkspaces || len(tagValues) > 0 || len(stateValues) > 0) {
-		return usageError(errOut, "--all-workspaces, --tag, and --state apply only without --job")
+	if *jobID != "" && (*workspaceKey != "" || len(tagValues) > 0 || len(stateValues) > 0) {
+		return usageError(errOut, "--workspace-key, --tag, and --state apply only without --job")
 	}
 	var listParams agentclient.JobListParams
 	if *jobID == "" {
 		var err error
-		listParams, err = a.statusListParams(*allWorkspaces, tagValues, stateValues)
+		listParams, err = a.statusListParams(*workspaceKey, tagValues, stateValues)
 		if err != nil {
 			return commandError(errOut, fmt.Errorf("status list parameters: %w", err))
 		}
@@ -365,7 +365,7 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 	return cliExitCodeForRecord(record)
 }
 
-func (a *app) statusListParams(allWorkspaces bool, tagValues, stateValues []string) (agentclient.JobListParams, error) {
+func (a *app) statusListParams(workspaceKey string, tagValues, stateValues []string) (agentclient.JobListParams, error) {
 	tags, err := parseTagFilters(tagValues)
 	if err != nil {
 		return agentclient.JobListParams{}, err
@@ -374,16 +374,7 @@ func (a *app) statusListParams(allWorkspaces bool, tagValues, stateValues []stri
 	if err != nil {
 		return agentclient.JobListParams{}, err
 	}
-	params := agentclient.JobListParams{Tags: tags, States: states}
-	if allWorkspaces {
-		return params, nil
-	}
-	workspaceKey, err := currentWorkspaceKey()
-	if err != nil {
-		return agentclient.JobListParams{}, fmt.Errorf("derive current workspace key: %w", err)
-	}
-	params.WorkspaceKey = workspaceKey
-	return params, nil
+	return agentclient.JobListParams{WorkspaceKey: workspaceKey, Tags: tags, States: states}, nil
 }
 
 func (a *app) runTranscript(ctx context.Context, args []string, out, errOut io.Writer) int {
@@ -487,18 +478,6 @@ func printJobTranscript(out io.Writer, transcript agentclient.JobTranscriptResul
 		}
 		fmt.Fprintln(out)
 	}
-}
-
-func currentWorkspaceKey() (string, error) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	canonicalCWD, err := engine.CanonicalWorkspace(cwd)
-	if err != nil {
-		return "", err
-	}
-	return engine.WorkspaceKey(canonicalCWD), nil
 }
 
 func parseTagFilters(values []string) (map[string]string, error) {
@@ -932,7 +911,7 @@ func printRootHelp(out io.Writer) {
 	fmt.Fprint(out, `Usage:
   agentbus version [--json] (aliases: --version, -version, -V)
   agentbus serve [--foreground]
-	  agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--all-workspaces] [--json]
+  agentbus status [--job <id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--json]
   agentbus transcript --job <id> [--kind <kind>]... [--last <n>] [--since <rfc3339>] [--since-ordinal <n>] [--limit <n>] [--json]
   agentbus result --job <id> [--json]
   agentbus cancel --job <id> [--json]

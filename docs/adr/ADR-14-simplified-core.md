@@ -86,6 +86,10 @@ present, is exactly one inline Draft 2020-12 JSON Schema value, either an
 object or a boolean. It is not a name, registry key, or caller-supplied
 correction program.
 
+workspaceKey is an opaque, submitter-chosen namespace. Agentbus cannot derive
+another tool's workspaceKey, even when that tool submits work for the same
+directory.
+
     result
     {
       "jobId": "string",
@@ -243,10 +247,10 @@ cwd, a PID, a process-group ID, a start token, or a process claim.
 
 Workspace filtering is scoping, not ownership. The same-user local socket has
 no stable authenticated caller identity, so Agentbus cannot enforce who owns a
-job. The CLI derives the SHA-256 workspace key from its canonical current
-working directory for status without --job; --all-workspaces intentionally
-clears that filter. Multiple orchestrators in one repository share a workspace
-scope.
+job. workspaceKey is an opaque, submitter-chosen namespace, and Agentbus
+cannot derive another tool's key. Status without --job sends no workspace
+filter and lists every workspace; --workspace-key <key> is the explicit filter
+for a caller that knows a namespace.
 
 job.transcript returns a stateless digest and selected captured items for one
 job:
@@ -333,8 +337,8 @@ identity preparation. The typed TaskSpec exposes resumeJobId for that path.
 status and result MUST project the same job.get response differently for a
 selected job. Their JSON modes write the byte-identical JobRecord, including
 inline result text when it is present. Without --job, status invokes job.list,
-derives and sends the current workspace scope by default, and sends no
-workspaceKey under --all-workspaces. --tag and --state are repeatable job.list
+sends no workspaceKey by default, and lists every workspace. --workspace-key
+is the explicit workspace filter; --tag and --state are repeatable job.list
 filters. The human-readable status projection uses JobSummary for a list or
 JobRecord for one job, shows lifecycle, cleanup, contract verdict, failure
 class, tags, and any present activity or liveness fields, and MUST NEVER print

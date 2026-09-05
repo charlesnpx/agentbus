@@ -340,8 +340,7 @@ func (assembler *itemAssembler) absorb(event engine.Event, rawText string) {
 
 	switch event.Type {
 	case engine.EventResultMessage:
-		assembler.flushMessage()
-		assembler.append(transcriptItemMessage, "", rawText, false)
+		assembler.appendResultMessage(rawText)
 	case engine.EventReasoning:
 		assembler.flushMessage()
 		assembler.append(transcriptItemReasoning, "", rawText, false)
@@ -400,6 +399,23 @@ func (assembler *itemAssembler) flushMessage() {
 	assembler.message.Reset()
 	assembler.messageActive = false
 	assembler.messageTruncated = false
+}
+
+// appendResultMessage ends a pending agent-text run. Exact byte equality,
+// including trailing whitespace, makes the flushed run the result item; any
+// difference remains a second item so content is never silently discarded. A
+// truncated run cannot establish equality with its full original text, so its
+// result is retained separately.
+func (assembler *itemAssembler) appendResultMessage(text string) {
+	if assembler == nil {
+		return
+	}
+	matchesPending := assembler.messageActive && !assembler.messageTruncated && assembler.message.String() == text
+	assembler.flushMessage()
+	if matchesPending {
+		return
+	}
+	assembler.append(transcriptItemMessage, "", text, false)
 }
 
 func (assembler *itemAssembler) finishTurn() {
