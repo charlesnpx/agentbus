@@ -145,14 +145,23 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 
 	run := s.activeExecution(record.JobID)
 	cleanup, diagnostics := s.cancelActiveOrRecordedProcess(store, record)
+	backendSessionID := ""
 	if run != nil {
+		if retired, observed := run.retiredTurnOutcome(); observed {
+			if retired.cleanup == protocol.CleanupUncertain {
+				cleanup = protocol.CleanupUncertain
+			}
+			diagnostics = append(diagnostics, retired.diagnostics...)
+			backendSessionID = retired.backendSessionID
+		}
 		diagnostics = append(diagnostics, run.itemSidecarDiagnostics()...)
 	}
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
-		State:       protocol.PublicStateCanceled,
-		Cleanup:     cleanup,
-		Diagnostics: diagnostics,
-		FinishedAt:  time.Now().UTC(),
+		State:            protocol.PublicStateCanceled,
+		Cleanup:          cleanup,
+		BackendSessionID: backendSessionID,
+		Diagnostics:      diagnostics,
+		FinishedAt:       time.Now().UTC(),
 	})
 	if err != nil {
 		if errors.Is(err, jobstore.ErrTerminal) {

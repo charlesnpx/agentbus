@@ -122,8 +122,10 @@ resumeJobId names a prior job, never a backend thread ID. For a new submission,
 the target must be a terminal non-completed job for the same backend and must
 have recorded a backend session ID at turn retirement. A target without that ID
 returns `invalid_task_spec` with its jobId; Agentbus never falls back to a fresh
-thread. Completed jobs are not resumable because a normal completed Codex job
-cleans up its private CODEX_HOME.
+thread. Completed jobs are not resumable because completion is final. Normal successful
+Codex cleanup also removes the private CODEX_HOME, but a home retained after
+uncertain cleanup is a recovery artifact rather than permission to reopen
+completed work.
 
 A resume creates a new job with a new id, record, transcript sidecar, result,
 and fresh deadline. It replays the prior backend thread as history; it does not

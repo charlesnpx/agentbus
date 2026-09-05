@@ -46,6 +46,17 @@ type activeExecution struct {
 	lastItemAt      time.Time
 	lastActivityAt  time.Time
 	itemSidecarDiag string
+	turn            *activeTurn
+	latestSessionID string
+}
+
+// activeTurn owns the one retirement receipt for a turn. A cancellation can
+// wait on that receipt without racing a later correction turn that replaces
+// activeExecution.turn.
+type activeTurn struct {
+	done    chan struct{}
+	once    sync.Once
+	outcome turnOutcome
 }
 
 func newActiveExecution(jobID string, backend engine.Backend) *activeExecution {
@@ -153,7 +164,55 @@ func (run *activeExecution) beginTurn() {
 	run.claimAttempted = false
 	run.claimRecorded = false
 	run.claimErr = nil
+	run.turn = &activeTurn{done: make(chan struct{})}
 	run.mu.Unlock()
+}
+
+// retireTurn publishes the full observed result of the current turn before a
+// cancellation commits its terminal record. The per-turn receipt remains
+// stable after a later correction turn starts.
+func (run *activeExecution) retireTurn(outcome turnOutcome) {
+	if run == nil {
+		return
+	}
+	run.mu.Lock()
+	turn := run.turn
+	run.mu.Unlock()
+	if turn == nil {
+		return
+	}
+	turn.once.Do(func() {
+		turn.outcome = outcome
+		run.mu.Lock()
+		if strings.TrimSpace(outcome.backendSessionID) != "" {
+			run.latestSessionID = outcome.backendSessionID
+		}
+		run.mu.Unlock()
+		close(turn.done)
+	})
+}
+
+// retiredTurnOutcome waits only when a turn has been started. Its result is
+// the cancellation receipt; a job canceled before its first turn therefore
+// keeps the intentionally empty session ID.
+func (run *activeExecution) retiredTurnOutcome() (turnOutcome, bool) {
+	if run == nil {
+		return turnOutcome{}, false
+	}
+	run.mu.Lock()
+	turn := run.turn
+	run.mu.Unlock()
+	if turn == nil {
+		return turnOutcome{}, false
+	}
+	<-turn.done
+	outcome := turn.outcome
+	run.mu.Lock()
+	if outcome.backendSessionID == "" {
+		outcome.backendSessionID = run.latestSessionID
+	}
+	run.mu.Unlock()
+	return outcome, true
 }
 
 func (run *activeExecution) interrupt() error {
@@ -396,7 +455,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		}
 		var managed *managedCodexHome
 		if resumeTarget != nil {
-			codexHome, err := s.resumeCodexHome(*resumeTarget)
+			codexHome, err := s.resumeCodexHome(store, *resumeTarget)
 			if err != nil {
 				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare resumed Codex home: %w", err), nil)
 				return
@@ -419,19 +478,6 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			}
 		}
 		if record.Write {
-			if resumeTarget != nil {
-				// A resumed Codex session must use the source job's CODEX_HOME,
-				// but write-only cache paths remain owned by the new job.
-				_, prepared, err := s.prepareCodexHome(layout, record.JobID)
-				if prepared != nil {
-					s.rememberManagedCodexHome(record.JobID, prepared)
-				}
-				if err != nil {
-					s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare resumed Codex job cache home: %w", err), nil)
-					return
-				}
-				managed = prepared
-			}
 			cache, managed, cacheErr := prepareCodexJobCache(layout, record.JobID, managed)
 			if managed != nil {
 				s.rememberManagedCodexHome(record.JobID, managed)
@@ -495,6 +541,13 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		},
 	})
 	if canceled {
+		if events == nil {
+			run.retireTurn(turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean})
+			return
+		}
+		outcome := collectTurn(jobCtx, run, events, items)
+		outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
+		run.retireTurn(outcome)
 		return
 	}
 	if err != nil {
@@ -503,12 +556,14 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			cleanup, diagnostics = cleanupForRun(run, cleanup, diagnostics)
 		}
 		diagnostics = appendItemSidecarDiagnostics(diagnostics, itemWriter)
+		run.retireTurn(turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics})
 		s.finishTurnError(store, record, jobCtx, err, cleanup, diagnostics)
 		return
 	}
 
 	outcome := collectTurn(jobCtx, run, events, items)
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
+	run.retireTurn(outcome)
 	if run.cancellationRequested() {
 		return
 	}
@@ -553,9 +608,9 @@ func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpec, error) {
 	return spec, nil
 }
 
-// resumeTargetForExecution repeats admission's durable target checks without
-// consulting the backend. The source job is terminal and immutable, so this is
-// a consistency check before the new job crosses its no-relaunch boundary.
+// resumeTargetForExecution loads the source selected by admission. Admission
+// already validated it transactionally before the new record was persisted;
+// terminal records are immutable, so execution needs only the durable lookup.
 func resumeTargetForExecution(store *jobstore.Store, spec protocol.TaskSpec) (*jobstore.Record, error) {
 	if spec.ResumeJobID == "" {
 		return nil, nil
@@ -567,16 +622,14 @@ func resumeTargetForExecution(store *jobstore.Store, spec protocol.TaskSpec) (*j
 	if err != nil {
 		return nil, err
 	}
-	if err := validateResumeTarget(spec, target); err != nil {
-		return nil, err
-	}
 	return &target, nil
 }
 
-// resumeCodexHome returns the exact CODEX_HOME that owned the source job's
-// thread. It intentionally never creates a replacement: a missing source home
-// must fail the new job rather than making a fresh thread look like a resume.
-func (s *Server) resumeCodexHome(source jobstore.Record) (string, error) {
+// resumeCodexHome returns the exact CODEX_HOME at the root of a resume
+// lineage: that is where the backend thread actually lives. It intentionally
+// never creates a replacement, because a missing thread home must fail the new
+// job rather than making a fresh thread look like a resume.
+func (s *Server) resumeCodexHome(store *jobstore.Store, source jobstore.Record) (string, error) {
 	if s == nil {
 		return "", errors.New("nil service server")
 	}
@@ -598,10 +651,14 @@ func (s *Server) resumeCodexHome(source jobstore.Record) (string, error) {
 		}
 		return path, nil
 	}
-	if source.JobID == "" || filepath.Base(source.JobID) != source.JobID || source.CWD == "" {
+	threadSource, err := resumeThreadSource(store, source)
+	if err != nil {
+		return "", err
+	}
+	if threadSource.JobID == "" || filepath.Base(threadSource.JobID) != threadSource.JobID || threadSource.CWD == "" {
 		return "", errors.New("resume target has no valid managed Codex home identity")
 	}
-	path := filepath.Join(s.stateRoot, "workspaces", engine.WorkspaceKey(source.CWD), "codex", source.JobID)
+	path := filepath.Join(s.stateRoot, "workspaces", engine.WorkspaceKey(threadSource.CWD), "codex", threadSource.JobID)
 	info, err := os.Lstat(path)
 	if err != nil {
 		return "", fmt.Errorf("inspect source Codex home: %w", err)
@@ -610,6 +667,36 @@ func (s *Server) resumeCodexHome(source jobstore.Record) (string, error) {
 		return "", errors.New("source Codex home is not a directory")
 	}
 	return path, nil
+}
+
+// resumeThreadSource follows persisted resumeJobId links to the job that
+// created the managed thread home. Each link is immutable after admission; the
+// cycle check makes a corrupt record fail closed before a backend launch.
+func resumeThreadSource(store *jobstore.Store, source jobstore.Record) (jobstore.Record, error) {
+	if store == nil {
+		return jobstore.Record{}, errors.New("job store is unavailable")
+	}
+	seen := make(map[string]struct{})
+	for {
+		if source.JobID == "" {
+			return jobstore.Record{}, errors.New("resume target has no job ID")
+		}
+		if _, duplicate := seen[source.JobID]; duplicate {
+			return jobstore.Record{}, errors.New("resume lineage contains a cycle")
+		}
+		seen[source.JobID] = struct{}{}
+		spec, err := taskSpecFromRecord(source)
+		if err != nil {
+			return jobstore.Record{}, fmt.Errorf("decode resume lineage job %q: %w", source.JobID, err)
+		}
+		if spec.ResumeJobID == "" {
+			return source, nil
+		}
+		source, err = store.Get(spec.ResumeJobID)
+		if err != nil {
+			return jobstore.Record{}, fmt.Errorf("load resume lineage job %q: %w", spec.ResumeJobID, err)
+		}
+	}
 }
 
 // evaluateOutputSchema runs only after the initial turn has successfully
@@ -698,18 +785,29 @@ func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record
 		},
 	})
 	if canceled {
-		return turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean}
+		if events == nil {
+			outcome := turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean}
+			run.retireTurn(outcome)
+			return outcome
+		}
+		outcome := collectTurn(ctx, run, events, items)
+		outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
+		run.retireTurn(outcome)
+		return outcome
 	}
 	if err != nil {
 		cleanup, diagnostics := cleanupAfterContextStop(run, ctx.Err())
 		if cleanup == protocol.CleanupClean {
 			cleanup, diagnostics = cleanupForRun(run, cleanup, diagnostics)
 		}
-		return turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics}
+		outcome := turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics}
+		run.retireTurn(outcome)
+		return outcome
 	}
 
 	outcome := collectTurn(ctx, run, events, items)
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
+	run.retireTurn(outcome)
 	return outcome
 }
 
@@ -900,6 +998,7 @@ func cleanupForRun(run *activeExecution, cleanup protocol.Cleanup, diagnostics [
 func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstore.Record, text string, cleanup protocol.Cleanup, diagnostics []string, contract protocol.ContractResult, backendSessionID string) {
 	info, err := spillAuthoritativeResult(record, []byte(text))
 	if err != nil {
+		// The spill failure makes this a failed record, which may be resumed.
 		s.recordExecutionFailureWithSessionID(store, record, cleanup, protocol.FailureClassInternal, fmt.Errorf("spill authoritative result: %w", err), diagnostics, backendSessionID)
 		return
 	}
@@ -907,17 +1006,18 @@ func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstor
 	if info.TextElided {
 		resultText = ""
 	}
+	// Completed work is final even when cleanup retains its home, so completed
+	// records deliberately omit the backend session ID.
 	s.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
-		State:            protocol.PublicStateCompleted,
-		Cleanup:          cleanup,
-		BackendSessionID: backendSessionID,
-		Diagnostics:      diagnostics,
-		Contract:         contract,
-		ResultText:       resultText,
-		ResultPath:       info.ResultPath,
-		ResultSHA256:     info.SHA256,
-		ResultBytes:      info.Bytes,
-		FinishedAt:       time.Now().UTC(),
+		State:        protocol.PublicStateCompleted,
+		Cleanup:      cleanup,
+		Diagnostics:  diagnostics,
+		Contract:     contract,
+		ResultText:   resultText,
+		ResultPath:   info.ResultPath,
+		ResultSHA256: info.SHA256,
+		ResultBytes:  info.Bytes,
+		FinishedAt:   time.Now().UTC(),
 	})
 }
 

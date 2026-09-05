@@ -768,6 +768,48 @@ func TestJobSubmitResumeTargetWithoutSessionReturnsTypedError(t *testing.T) {
 	}
 }
 
+func TestJobSubmitCompletedTargetWithRetainedHomeRemainsRejected(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	source := submitResultForTest(t, submitForTest(t, server, submissionParams("resume-completed-source", "source", "codex", t.TempDir(), "source")))
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(source.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layout, err := engine.LayoutForWorkspace(server.stateRoot, record.CWD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(layout.Codex, record.JobID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkTerminal(source.JobID, jobstore.TerminalUpdate{
+		State:            protocol.PublicStateCompleted,
+		Cleanup:          protocol.CleanupUncertain,
+		BackendSessionID: "retained-completed-thread",
+		FinishedAt:       time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	params := submissionParams("resume-completed-target", "resume", "codex", t.TempDir(), "continue")
+	params.TaskSpec.ResumeJobID = source.JobID
+	outcome := submitForTest(t, server, params)
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || outcome.err.Data.JobID != source.JobID {
+		t.Fatalf("resume completed target = %#v, want typed invalid-task error for %q", outcome.err, source.JobID)
+	}
+	records, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].JobID != source.JobID {
+		t.Fatalf("records after completed-target rejection = %+v, want only source %q", records, source.JobID)
+	}
+}
+
 func TestJobSubmitResumeTargetParticipatesInReplayIdentity(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
 	store, err := server.ensureJobStore()

@@ -273,10 +273,6 @@ type JobRecordWire struct {
 	Cleanup       Cleanup                   `json:"cleanup"`
 	LogPaths      *LogPathsWire             `json:"logPaths,omitempty"`
 	ModelReported string                    `json:"modelReported,omitempty"`
-	// BackendSessionID is the backend-owned resumable-session identifier when
-	// one was observed at turn retirement. It is absent when no turn produced
-	// such an identifier.
-	BackendSessionID string `json:"backendSessionId,omitempty"`
 }
 
 // JobSummaryWire is the compact item returned when job.list lists jobs. It

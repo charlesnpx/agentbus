@@ -386,8 +386,71 @@ func TestJobCancelBeforeSpawnIsDurable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != protocol.PublicStateCanceled || stored.Cleanup != protocol.CleanupClean {
+	if stored.State != protocol.PublicStateCanceled || stored.Cleanup != protocol.CleanupClean || stored.BackendSessionID != "" {
 		t.Fatalf("record after cancel-before-spawn = %#v", stored)
+	}
+}
+
+func TestJobCancelAfterTurnRetirementPreservesSessionForResume(t *testing.T) {
+	events := make(chan engine.Event, 1)
+	turnStarted := make(chan struct{})
+	backend := &executionFakeBackend{name: "cancel-retired-turn"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, _ engine.TurnInput) (<-chan engine.Event, error) {
+				close(turnStarted)
+				return events, nil
+			},
+			interrupt: func(context.Context) error {
+				events <- engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-canceled"}}
+				close(events)
+				return nil
+			},
+		}, nil
+	}
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
+	record := queuedExecutionRecord(t, server, backend.Name(), "cancel after turn", nil)
+	run := newActiveExecution(record.JobID, backend)
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: run}
+	server.executionMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		server.runJob(context.Background(), record, run)
+		close(done)
+	}()
+	select {
+	case <-turnStarted:
+	case <-time.After(time.Second):
+		t.Fatal("turn did not start")
+	}
+
+	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
+	if canceled.err != nil {
+		t.Fatalf("job.cancel error = %#v", canceled.err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled turn did not retire")
+	}
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != protocol.PublicStateCanceled || stored.BackendSessionID != "thread-canceled" {
+		t.Fatalf("canceled terminal record = %#v, want retained turn session", stored)
+	}
+	params := submissionParams("cancel-resume-workspace", "cancel-resume-request", backend.Name(), t.TempDir(), "continue")
+	params.TaskSpec.ResumeJobID = record.JobID
+	resumed := submitResultForTest(t, submitForTest(t, server, params))
+	if resumed.State != protocol.PublicStateQueued {
+		t.Fatalf("resume after cancellation = %#v, want admitted queued job", resumed)
 	}
 }
 

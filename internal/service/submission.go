@@ -247,10 +247,10 @@ func resumeTargetFromLookup(spec protocol.TaskSpec, lookup jobstore.RecordLookup
 }
 
 // validateResumeTarget limits resume to a retired non-completed job. A live
-// session may still be running, and completed Codex jobs deliberately clean
-// their per-job home, so either case could make Resume race or silently lose
-// the thread history. Failed, canceled, and unknown terminal jobs are eligible
-// when their retired turn recorded a backend session ID.
+// session may still be running, while a completed job is a final service
+// result; a home retained after uncertain cleanup is a recovery artifact, not
+// permission to reopen completed work. Failed, canceled, and unknown terminal
+// jobs are eligible when their retired turn recorded a backend session ID.
 func validateResumeTarget(spec protocol.TaskSpec, target jobstore.Record) error {
 	if target.JobID != spec.ResumeJobID {
 		return errors.New("resume lookup returned a different job")

@@ -109,16 +109,18 @@ new admission, Agentbus resolves that job's recorded backend session internally
 and invokes the backend's Resume operation. The source must be a terminal,
 non-completed job using the same backend and must have a recorded session ID.
 An absent ID is an invalid task specification, never permission to start a new
-thread. Completed jobs are deliberately excluded because normal successful
-Codex cleanup removes their per-job CODEX_HOME.
+thread. Completed jobs are deliberately excluded because completion is final
+service semantics. Normal successful Codex cleanup also removes the private
+home; a home retained after uncertain cleanup is a recovery artifact, not
+permission to reopen completed work.
 
 Resuming always creates a new job with a new id, record, transcript sidecar,
 result, and fresh deadline. It replays the prior thread as history; it neither
 continues the source job nor extends the source deadline. Managed Codex resumes
-use the source job's retained CODEX_HOME, while any write cache belongs to the
-new job. resumeJobId is part of the complete canonical TaskSpec hash, so two
-otherwise identical submissions with different targets conflict under the same
-compound request identity rather than deduplicating.
+use the retained CODEX_HOME at the root of the resume lineage, while any write
+cache belongs to the new job. resumeJobId is part of the complete canonical
+TaskSpec hash, so two otherwise identical submissions with different targets
+conflict under the same compound request identity rather than deduplicating.
 
 job.get with a jobId returns this full JobRecord:
 
