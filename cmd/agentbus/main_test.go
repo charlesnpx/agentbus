@@ -186,6 +186,60 @@ func TestStatusListScopesCurrentWorkspaceAndCanListAllWorkspaces(t *testing.T) {
 	}
 }
 
+func TestTranscriptForwardsSelectorsAndPrintsDigest(t *testing.T) {
+	since := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	transcript := agentclient.JobTranscriptResult{
+		State:     protocol.PublicStateRunning,
+		Liveness:  protocol.LivenessAlive,
+		ItemCount: 3,
+		Counts: map[string]int{
+			"message": 1, "tool": 1, "fileChange": 0, "warning": 0, "error": 1,
+		},
+		Items: []agentclient.TranscriptItem{
+			{Ordinal: 7, At: since.Add(time.Second), Kind: "message", Text: "hello\nworld"},
+		},
+	}
+	client := &fakeProtocolClient{transcripts: map[string]agentclient.JobTranscriptResult{"job-1": transcript}}
+	a := testApp(t)
+	a.clientConnect = fakeConnector(client)
+
+	code, stdout, stderr := runTestCLI(t, a, []string{
+		"transcript", "--job", "job-1", "--kind", "message", "--kind", "error",
+		"--since", since.Format(time.RFC3339Nano), "--since-ordinal", "6", "--last", "3", "--limit", "2",
+	})
+	if code != 0 || stderr != "" {
+		t.Fatalf("selected transcript = (%d,%q)", code, stderr)
+	}
+	if len(client.transcriptParams) != 1 {
+		t.Fatalf("job.transcript calls = %d, want 1", len(client.transcriptParams))
+	}
+	params := client.transcriptParams[0]
+	if params.JobID != "job-1" || !slices.Equal(params.Kinds, []string{"message", "error"}) || params.Since == nil || !params.Since.Equal(since) || params.SinceOrdinal == nil || *params.SinceOrdinal != 6 || params.Last == nil || *params.Last != 3 || params.Limit == nil || *params.Limit != 2 {
+		t.Fatalf("transcript params = %#v", params)
+	}
+	if !strings.Contains(stdout, "state=running itemCount=3 liveness=alive gap=false") || !strings.Contains(stdout, "7 kind=message") || !strings.Contains(stdout, `text="hello\nworld"`) {
+		t.Fatalf("selected transcript output = %q", stdout)
+	}
+	if strings.Contains(stdout, "counts message=") {
+		t.Fatalf("selected transcript unexpectedly printed digest counts: %q", stdout)
+	}
+
+	code, stdout, stderr = runTestCLI(t, a, []string{"transcript", "--job", "job-1"})
+	if code != 0 || stderr != "" || !strings.Contains(stdout, "counts message=1 tool=1 fileChange=0 warning=0 error=1") {
+		t.Fatalf("digest transcript = (%d,%q,%q)", code, stdout, stderr)
+	}
+
+	code, stdout, stderr = runTestCLI(t, a, []string{"transcript", "--job", "job-1", "--json"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("JSON transcript = (%d,%q)", code, stderr)
+	}
+	var decoded agentclient.JobTranscriptResult
+	decodeJSON(t, stdout, &decoded)
+	if decoded.ItemCount != transcript.ItemCount || len(decoded.Items) != 1 || decoded.Items[0].Ordinal != 7 {
+		t.Fatalf("JSON transcript = %#v", decoded)
+	}
+}
+
 func TestResultHumanProjection(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -517,11 +571,13 @@ func runTestCLI(t *testing.T, a *app, args []string) (int, string, string) {
 }
 
 type fakeProtocolClient struct {
-	records    map[string]agentclient.JobGetResult
-	list       agentclient.JobListResult
-	listParams []agentclient.JobListParams
-	cancels    map[string]agentclient.JobCancelResult
-	err        error
+	records          map[string]agentclient.JobGetResult
+	list             agentclient.JobListResult
+	listParams       []agentclient.JobListParams
+	transcripts      map[string]agentclient.JobTranscriptResult
+	transcriptParams []agentclient.JobTranscriptParams
+	cancels          map[string]agentclient.JobCancelResult
+	err              error
 }
 
 func (c *fakeProtocolClient) JobGet(_ context.Context, params agentclient.JobGetParams) (agentclient.JobGetResult, error) {
@@ -541,6 +597,18 @@ func (c *fakeProtocolClient) JobList(_ context.Context, params agentclient.JobLi
 	}
 	c.listParams = append(c.listParams, params)
 	return c.list, nil
+}
+
+func (c *fakeProtocolClient) JobTranscript(_ context.Context, params agentclient.JobTranscriptParams) (agentclient.JobTranscriptResult, error) {
+	if c.err != nil {
+		return agentclient.JobTranscriptResult{}, c.err
+	}
+	c.transcriptParams = append(c.transcriptParams, params)
+	result, ok := c.transcripts[params.JobID]
+	if !ok {
+		return agentclient.JobTranscriptResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "not found", protocol.ErrorData{JobID: params.JobID})}
+	}
+	return result, nil
 }
 
 func (c *fakeProtocolClient) JobCancel(_ context.Context, params agentclient.JobCancelParams) (agentclient.JobCancelResult, error) {

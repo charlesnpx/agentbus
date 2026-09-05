@@ -94,6 +94,32 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		OutputSchema: json.RawMessage(`{"type":"object"}`),
 		Tags:         &tags,
 	}
+	since := time.Date(2025, time.January, 2, 3, 7, 0, 0, time.UTC)
+	sinceOrdinal := 4
+	last := 3
+	limit := 2
+	transcriptParams := JobTranscriptParams{
+		JobID:        "job-1",
+		Kinds:        []string{"message", "error"},
+		Since:        &since,
+		SinceOrdinal: &sinceOrdinal,
+		Last:         &last,
+		Limit:        &limit,
+	}
+	transcript := JobTranscriptResult{
+		State:     PublicStateRunning,
+		Liveness:  LivenessAlive,
+		ItemCount: 2,
+		Counts: map[string]int{
+			"message": 1, "tool": 1, "fileChange": 0, "warning": 0, "error": 0,
+		},
+		FirstAt: &createdAt,
+		LastAt:  &lastItemAt,
+		Items: []TranscriptItem{{
+			Ordinal: 7, At: lastItemAt, Kind: "message", Text: "answer", Truncated: false,
+		}},
+		Gap: false,
+	}
 
 	const recordJSON = `{"jobId":"job-1","workspaceKey":"workspace-1","requestId":"request-1","backend":"codex","state":"completed","tags":{"team":"core"},"createdAt":"2025-01-02T03:04:05Z","startedAt":"2025-01-02T03:05:05Z","finishedAt":"2025-01-02T03:06:05Z","timeout":{"requested":1234,"effective":2345,"source":"client"},"result":{"text":"answer","resultPath":"/results/job-1","sha256":"result-sha","bytes":42},"contract":{"schemaSha256":"schema-sha","evaluated":true,"compliant":true,"attempts":2,"violations":["/answer"]},"failure":{"class":"backend_error","reason":"backend stopped"},"cleanup":"uncertain","logPaths":{"stdout":"/logs/job-1.out","stdoutTruncated":false,"stderr":"/logs/job-1.err","stderrTruncated":false},"modelReported":"gpt-5"}`
 	const summaryJSON = `{"jobId":"job-1","backend":"codex","state":"failed","tags":{"team":"core"},"cleanup":"uncertain","createdAt":"2025-01-02T03:04:05Z","updatedAt":"2025-01-02T03:07:05Z","modelReported":"gpt-5","failureClass":"backend_error","contract":{"evaluated":true,"compliant":false},"itemCount":2,"lastItemAt":"2025-01-02T03:07:06Z","liveness":"alive"}`
@@ -188,6 +214,18 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 			value: JobListResult{Jobs: []JobSummaryWire{summary}},
 			new:   func() any { return new(JobListResult) },
 			want:  `{"jobs":[` + summaryJSON + `]}`,
+		},
+		{
+			name:  "JobTranscriptParams",
+			value: transcriptParams,
+			new:   func() any { return new(JobTranscriptParams) },
+			want:  `{"jobId":"job-1","kinds":["message","error"],"since":"2025-01-02T03:07:00Z","sinceOrdinal":4,"last":3,"limit":2}`,
+		},
+		{
+			name:  "JobTranscriptResult",
+			value: transcript,
+			new:   func() any { return new(JobTranscriptResult) },
+			want:  `{"state":"running","liveness":"alive","itemCount":2,"counts":{"message":1,"tool":1,"fileChange":0,"warning":0,"error":0},"firstAt":"2025-01-02T03:04:05Z","lastAt":"2025-01-02T03:07:06Z","items":[{"ordinal":7,"at":"2025-01-02T03:07:06Z","kind":"message","text":"answer","truncated":false}],"gap":false}`,
 		},
 		{
 			name:  "JobCancelParams",

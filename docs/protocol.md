@@ -4,7 +4,7 @@ Agentbus protocol version 3 is a JSON-RPC 2.0 service over a local,
 newline-delimited Unix socket. Each frame is one JSON object followed by a
 newline. The daemon accepts only protocol version 3.
 
-The wire surface has five methods:
+The wire surface has six methods:
 
 | Method | Purpose |
 | --- | --- |
@@ -12,6 +12,7 @@ The wire surface has five methods:
 | job.submit | Create or replay an identified job. |
 | job.get | Read one identified job. |
 | job.list | List compact job summaries with optional workspace, tag, and state filters. |
+| job.transcript | Return a stateless digest and selected captured items for one job. |
 | job.cancel | Request cancellation of one job. |
 
 A client must call protocol.hello successfully before any other method on the
@@ -205,6 +206,75 @@ job. The CLI computes the SHA-256 workspace key from its canonical current
 working directory and supplies it for agentbus status without --job. Passing
 --all-workspaces clears that filter. Two orchestrators in the same repository
 therefore share a workspace scope.
+
+## job.transcript
+
+job.transcript requires jobId and reads the append-only item sidecar for that
+job. It is deliberately stateless: there is no opaque cursor to retain across
+an orchestrator's context compaction.
+
+~~~json
+{
+  "jobId": "string",
+  "kinds": ["message", "error"],
+  "since": "2026-08-20T12:00:00Z",
+  "sinceOrdinal": 141,
+  "last": 10,
+  "limit": 20
+}
+~~~
+
+kinds may contain message, tool, fileChange, warning, or error. since includes
+items strictly after its RFC 3339 timestamp; sinceOrdinal includes items whose
+ordinal is strictly greater than its value. last selects the final N matching
+items and limit bounds the selected response. kinds, since, sinceOrdinal, and
+last combine with AND; when last and limit are both present, the response keeps
+the most recent minimum of the two bounds. An ordinal is a readable handle: a
+caller can record that it last saw ordinal 141 and later use sinceOrdinal: 141
+without retaining server-issued state.
+
+~~~json
+{
+  "state": "running",
+  "liveness": "alive",
+  "itemCount": 258,
+  "counts": {
+    "message": 6,
+    "tool": 156,
+    "fileChange": 0,
+    "warning": 0,
+    "error": 1
+  },
+  "firstAt": "2026-08-20T12:00:00Z",
+  "lastAt": "2026-08-20T12:27:00Z",
+  "items": [
+    {
+      "ordinal": 141,
+      "at": "2026-08-20T12:26:00Z",
+      "kind": "message",
+      "text": "working on the requested change",
+      "truncated": false
+    }
+  ],
+  "gap": false
+}
+~~~
+
+itemCount, counts, firstAt, lastAt, and gap describe the captured sidecar, not
+only the selected items. counts always has all five kinds, including zero
+values. liveness appears only while this daemon has an active execution for the
+job and follows the same alive, gone, or unknown rule as job.list. A terminal
+job remains readable because terminal handling does not remove its sidecar.
+
+With no kinds, since, sinceOrdinal, last, or limit, the response is a digest,
+not the whole stream: it returns counts and timestamps plus the last few
+message items and every captured error item. Any explicit selector returns its
+matching items, subject to limit. A missing sidecar is a valid empty transcript
+with itemCount zero, five zero counts, items: [], and gap false.
+
+When the sidecar's capped writer emitted its appendStopped marker, gap is true.
+The captured items and counts are then a known prefix rather than a claim that
+the job emitted no more activity.
 
 ## job.get
 

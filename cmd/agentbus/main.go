@@ -51,6 +51,7 @@ type app struct {
 type protocolClient interface {
 	JobGet(context.Context, agentclient.JobGetParams) (agentclient.JobGetResult, error)
 	JobList(context.Context, agentclient.JobListParams) (agentclient.JobListResult, error)
+	JobTranscript(context.Context, agentclient.JobTranscriptParams) (agentclient.JobTranscriptResult, error)
 	JobCancel(context.Context, agentclient.JobCancelParams) (agentclient.JobCancelResult, error)
 	Close() error
 }
@@ -110,6 +111,8 @@ func (a *app) run(ctx context.Context, args []string, _ io.Reader, out, errOut i
 		return a.runServe(ctx, args[1:], errOut)
 	case "status":
 		return a.runStatus(ctx, args[1:], out, errOut)
+	case "transcript":
+		return a.runTranscript(ctx, args[1:], out, errOut)
 	case "result":
 		return a.runResult(ctx, args[1:], out, errOut)
 	case "cancel":
@@ -381,6 +384,107 @@ func (a *app) statusListParams(allWorkspaces bool, tagValues, stateValues []stri
 	}
 	params.WorkspaceKey = workspaceKey
 	return params, nil
+}
+
+func (a *app) runTranscript(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newCommandFlagSet("transcript", errOut)
+	jsonOut := fs.Bool("json", false, "emit the job.transcript response")
+	jobID := fs.String("job", "", "job id")
+	var kinds []string
+	fs.Func("kind", "include transcript kind (repeatable)", func(value string) error {
+		kinds = append(kinds, value)
+		return nil
+	})
+	since := fs.String("since", "", "include items after this RFC3339 timestamp")
+	sinceOrdinal := fs.Int("since-ordinal", 0, "include items after this ordinal")
+	last := fs.Int("last", 0, "include the last N matching items")
+	limit := fs.Int("limit", 0, "limit matching items")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return usageError(errOut, "transcript does not accept positional arguments")
+	}
+	if *jobID == "" {
+		return usageError(errOut, "transcript requires --job <id>")
+	}
+
+	params := agentclient.JobTranscriptParams{JobID: *jobID, Kinds: append([]string(nil), kinds...)}
+	if transcriptFlagSet(fs, "since") {
+		parsed, err := time.Parse(time.RFC3339Nano, *since)
+		if err != nil {
+			return usageError(errOut, "--since requires an RFC3339 timestamp: %v", err)
+		}
+		params.Since = &parsed
+	}
+	if transcriptFlagSet(fs, "since-ordinal") {
+		params.SinceOrdinal = sinceOrdinal
+	}
+	if transcriptFlagSet(fs, "last") {
+		params.Last = last
+	}
+	if transcriptFlagSet(fs, "limit") {
+		params.Limit = limit
+	}
+
+	client, err := a.connectProtocolClient(ctx)
+	if err != nil {
+		return protocolCommandError(errOut, "transcript", err)
+	}
+	defer client.Close()
+	transcript, err := client.JobTranscript(ctx, params)
+	if err != nil {
+		return protocolCommandError(errOut, "transcript", err)
+	}
+	if *jsonOut {
+		return writeOrError(out, errOut, transcript)
+	}
+	printJobTranscript(out, transcript, transcriptIsDigestRequest(params))
+	return 0
+}
+
+func transcriptFlagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(current *flag.Flag) {
+		if current.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+func transcriptIsDigestRequest(params agentclient.JobTranscriptParams) bool {
+	return len(params.Kinds) == 0 && params.Since == nil && params.SinceOrdinal == nil && params.Last == nil && params.Limit == nil
+}
+
+func printJobTranscript(out io.Writer, transcript agentclient.JobTranscriptResult, digest bool) {
+	fmt.Fprintf(out, "state=%s itemCount=%d", transcript.State, transcript.ItemCount)
+	if transcript.Liveness != "" {
+		fmt.Fprintf(out, " liveness=%s", transcript.Liveness)
+	}
+	fmt.Fprintf(out, " gap=%t\n", transcript.Gap)
+	if digest {
+		fmt.Fprintf(out, "counts message=%d tool=%d fileChange=%d warning=%d error=%d\n",
+			transcript.Counts["message"],
+			transcript.Counts["tool"],
+			transcript.Counts["fileChange"],
+			transcript.Counts["warning"],
+			transcript.Counts["error"],
+		)
+	}
+	for _, item := range transcript.Items {
+		fmt.Fprintf(out, "%d kind=%s at=%s", item.Ordinal, item.Kind, humanTime(item.At))
+		if item.Name != "" {
+			fmt.Fprintf(out, " name=%s", item.Name)
+		}
+		if item.Text != "" {
+			fmt.Fprintf(out, " text=%q", item.Text)
+		}
+		if item.Truncated {
+			fmt.Fprint(out, " truncated=true")
+		}
+		fmt.Fprintln(out)
+	}
 }
 
 func currentWorkspaceKey() (string, error) {
@@ -827,6 +931,7 @@ func printRootHelp(out io.Writer) {
   agentbus version [--json] (aliases: --version, -version, -V)
   agentbus serve [--foreground]
 	  agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--all-workspaces] [--json]
+  agentbus transcript --job <id> [--kind <kind>]... [--last <n>] [--since <rfc3339>] [--since-ordinal <n>] [--limit <n>] [--json]
   agentbus result --job <id> [--json]
   agentbus cancel --job <id> [--json]
 

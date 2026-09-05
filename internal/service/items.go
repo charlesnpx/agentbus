@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
 const (
@@ -31,16 +32,9 @@ const (
 	transcriptItemError      transcriptItemKind = "error"
 )
 
-// TranscriptItem is one normalized, backend-neutral event captured for a job.
-// Its Kind is one of message, tool, fileChange, warning, or error.
-type TranscriptItem struct {
-	Ordinal   int       `json:"ordinal"`
-	At        time.Time `json:"at"`
-	Kind      string    `json:"kind"`
-	Name      string    `json:"name,omitempty"`
-	Text      string    `json:"text,omitempty"`
-	Truncated bool      `json:"truncated"`
-}
+// TranscriptItem is the wire-shaped normalized event captured in a job's
+// private sidecar.
+type TranscriptItem = protocol.TranscriptItem
 
 // ItemActivity is the in-memory transcript progress for a running job.
 // LastActivityAt also advances for contentless progress events; LastItemAt

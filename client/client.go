@@ -958,6 +958,14 @@ func (c *Client) JobList(ctx context.Context, params JobListParams) (JobListResu
 	return out, err
 }
 
+// JobTranscript returns the captured transcript digest and selected items for
+// one job.
+func (c *Client) JobTranscript(ctx context.Context, params JobTranscriptParams) (JobTranscriptResult, error) {
+	var out JobTranscriptResult
+	err := c.do(ctx, protocol.MethodJobTranscript, params, &out)
+	return out, err
+}
+
 func (c *Client) JobCancel(ctx context.Context, params JobCancelParams) (JobCancelResult, error) {
 	var out JobCancelResult
 	err := c.do(ctx, protocol.MethodJobCancel, params, &out)
