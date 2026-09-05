@@ -492,10 +492,6 @@ func (o *turnObserver) handle(frame duplex.Frame) bool {
 	case "turn/completed", "task_complete":
 		o.complete(payload)
 		return true
-	case "warning", "error", "config/warning", "guardian/warning":
-		if text := textFrom(payload); text != "" {
-			o.emitEvent(engine.Event{Type: engine.EventWarning, Text: text, Metadata: frame.Object})
-		}
 	}
 	return false
 }
@@ -516,13 +512,22 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 				}
 			}
 		}
-	case "commandexecution", "filechange", "mcptoolcall", "dynamictoolcall":
+	case "filechange":
+		// File-change observations intentionally carry no item text. The service
+		// retains their count, never paths or contents, for both started and
+		// completed notifications.
 		o.emitEvent(engine.Event{
 			Type:                       engine.EventToolUse,
 			Name:                       toolName(item),
-			Text:                       toolText(item),
 			Metadata:                   metadata,
-			ObservedWorkspaceWriteItem: method == "item/completed" && kind == "filechange",
+			ObservedWorkspaceWriteItem: true,
+		})
+	case "commandexecution", "mcptoolcall", "dynamictoolcall":
+		o.emitEvent(engine.Event{
+			Type:     engine.EventToolUse,
+			Name:     toolName(item),
+			Text:     toolText(item),
+			Metadata: metadata,
 		})
 	}
 }

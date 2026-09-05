@@ -566,6 +566,53 @@ func TestAppServerCompletedTurnUsesLastCompletedAgentMessageAsResult(t *testing.
 	}
 }
 
+func TestAppServerWarningFrameEmitsOneOrderedEventSequence(t *testing.T) {
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "message-1", "delta": "done"})
+		peer.notify("warning", map[string]any{"message": "notice"})
+		completed := completedParams("thread-1", "turn-1", "completed", "")
+		completed["last_agent_message"] = "done"
+		peer.notify("turn/completed", completed)
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	gotSequence := make([]struct {
+		typ  string
+		text string
+	}, 0, len(got))
+	for _, event := range got {
+		if event.Type == engine.EventTurnFinal {
+			continue
+		}
+		gotSequence = append(gotSequence, struct {
+			typ  string
+			text string
+		}{typ: event.Type, text: event.Text})
+	}
+	wantSequence := []struct {
+		typ  string
+		text string
+	}{
+		{typ: engine.EventAgentText, text: "done"},
+		{typ: engine.EventWarning, text: "notice"},
+		{typ: engine.EventResultMessage, text: "done"},
+	}
+	if !reflect.DeepEqual(gotSequence, wantSequence) {
+		t.Fatalf("event sequence = %#v, want %#v", gotSequence, wantSequence)
+	}
+}
+
 func TestAppServerCompletedTurnUsesCompletedTextAfterMismatchedAgentDelta(t *testing.T) {
 	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
 		peer := newAppServerPeer(t, proc)
@@ -868,7 +915,7 @@ func TestAppServerProviderOverloadIgnoresTerminalItemInventory(t *testing.T) {
 	}
 }
 
-func TestAppServerCompletedFileChangeReportsObservedWorkspaceWriteItem(t *testing.T) {
+func TestAppServerFileChangesReportObservedWorkspaceWriteItems(t *testing.T) {
 	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
 		peer := newAppServerPeer(t, proc)
 		peer.handshake()
@@ -876,9 +923,9 @@ func TestAppServerCompletedFileChangeReportsObservedWorkspaceWriteItem(t *testin
 		peer.respond(thread, threadResult("thread-1"))
 		turn := peer.expectRequest("turn/start")
 		peer.respond(turn, turnResult("turn-1"))
-		peer.notify("item/started", itemParams("thread-1", "turn-1", map[string]any{"id": "change-started", "type": "fileChange"}))
+		peer.notify("item/started", itemParams("thread-1", "turn-1", map[string]any{"id": "change-started", "type": "fileChange", "name": "started file change", "changes": "started private change"}))
 		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "command", "type": "commandExecution"}))
-		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "change-completed", "type": "fileChange"}))
+		peer.notify("item/completed", itemParams("thread-1", "turn-1", map[string]any{"id": "change-completed", "type": "fileChange", "name": "completed file change", "changes": "completed private change"}))
 		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
 	})
 
@@ -888,14 +935,38 @@ func TestAppServerCompletedFileChangeReportsObservedWorkspaceWriteItem(t *testin
 		t.Fatal(err)
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
-	var observed int
+	var fileChanges []struct {
+		typ      string
+		name     string
+		text     string
+		observed bool
+	}
 	for _, event := range got {
-		if event.ObservedWorkspaceWriteItem {
-			observed++
+		if event.Name == "started file change" || event.Name == "completed file change" {
+			fileChanges = append(fileChanges, struct {
+				typ      string
+				name     string
+				text     string
+				observed bool
+			}{
+				typ:      event.Type,
+				name:     event.Name,
+				text:     event.Text,
+				observed: event.ObservedWorkspaceWriteItem,
+			})
 		}
 	}
-	if observed != 1 {
-		t.Fatalf("observed workspace-write events = %d, want 1; events = %#v", observed, got)
+	wantFileChanges := []struct {
+		typ      string
+		name     string
+		text     string
+		observed bool
+	}{
+		{typ: engine.EventToolUse, name: "started file change", observed: true},
+		{typ: engine.EventToolUse, name: "completed file change", observed: true},
+	}
+	if !reflect.DeepEqual(fileChanges, wantFileChanges) {
+		t.Fatalf("file-change events = %#v, want %#v", fileChanges, wantFileChanges)
 	}
 }
 

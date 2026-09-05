@@ -307,6 +307,30 @@ func TestTranscriptItemsResultMessageTerminatesAgentTextRun(t *testing.T) {
 			want: []expectedItem{{kind: transcriptItemMessage, text: "result only"}},
 		},
 		{
+			name: "matching agent text, warning, and result produce one message and one warning",
+			initialEvents: []engine.Event{
+				{Type: engine.EventAgentText, Text: "done"},
+				{Type: engine.EventWarning, Text: "notice"},
+				{Type: engine.EventResultMessage, Text: "done"},
+			},
+			want: []expectedItem{
+				{kind: transcriptItemMessage, text: "done"},
+				{kind: transcriptItemWarning, text: "notice"},
+			},
+		},
+		{
+			name: "workspace-write tool text is suppressed",
+			initialEvents: []engine.Event{
+				{
+					Type:                       engine.EventToolUse,
+					Name:                       "fileChange",
+					Text:                       "private path and contents",
+					ObservedWorkspaceWriteItem: true,
+				},
+			},
+			want: []expectedItem{{kind: transcriptItemFileChange, name: "fileChange"}},
+		},
+		{
 			name: "different agent text and result remain separate across correction",
 			initialEvents: []engine.Event{
 				{Type: engine.EventAgentText, Text: "draft"},

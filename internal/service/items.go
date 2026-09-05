@@ -311,6 +311,8 @@ type itemAssembler struct {
 	message          strings.Builder
 	messageActive    bool
 	messageTruncated bool
+	lastAgentRun     string
+	lastAgentRunOK   bool
 }
 
 func newItemAssembler(run *activeExecution, writer *itemSidecarWriter) *itemAssembler {
@@ -369,6 +371,11 @@ func (assembler *itemAssembler) appendAgentText(text string) {
 		return
 	}
 	assembler.noteProgress(time.Now().UTC())
+	if !assembler.messageActive {
+		// A new run supersedes any run retained across an intervening event.
+		assembler.lastAgentRun = ""
+		assembler.lastAgentRunOK = false
+	}
 	assembler.messageActive = true
 	if assembler.messageTruncated || len(text) == 0 {
 		return
@@ -395,24 +402,35 @@ func (assembler *itemAssembler) flushMessage() {
 	if assembler == nil || !assembler.messageActive {
 		return
 	}
-	assembler.append(transcriptItemMessage, "", assembler.message.String(), assembler.messageTruncated)
+	text := assembler.message.String()
+	assembler.append(transcriptItemMessage, "", text, assembler.messageTruncated)
+	assembler.lastAgentRun = text
+	assembler.lastAgentRunOK = !assembler.messageTruncated
 	assembler.message.Reset()
 	assembler.messageActive = false
 	assembler.messageTruncated = false
 }
 
-// appendResultMessage ends a pending agent-text run. Exact byte equality,
-// including trailing whitespace, makes the flushed run the result item; any
-// difference remains a second item so content is never silently discarded. A
-// truncated run cannot establish equality with its full original text, so its
-// result is retained separately.
+// appendResultMessage ends an agent-text run. Exact byte equality, including
+// trailing whitespace, makes the most recent untruncated run the result item,
+// even if a non-message item already flushed it. Any difference remains a
+// second item so content is never silently discarded. A truncated run cannot
+// establish equality with its full original text, so its result is retained
+// separately.
 func (assembler *itemAssembler) appendResultMessage(text string) {
 	if assembler == nil {
 		return
 	}
-	matchesPending := assembler.messageActive && !assembler.messageTruncated && assembler.message.String() == text
+	matchesAgentRun := false
+	if assembler.messageActive {
+		matchesAgentRun = !assembler.messageTruncated && assembler.message.String() == text
+	} else {
+		matchesAgentRun = assembler.lastAgentRunOK && assembler.lastAgentRun == text
+	}
 	assembler.flushMessage()
-	if matchesPending {
+	assembler.lastAgentRun = ""
+	assembler.lastAgentRunOK = false
+	if matchesAgentRun {
 		return
 	}
 	assembler.append(transcriptItemMessage, "", text, false)
