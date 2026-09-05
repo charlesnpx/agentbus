@@ -40,6 +40,7 @@ type activeExecution struct {
 	claimAttempted     bool
 	claimRecorded      bool
 	claimErr           error
+	processClaim       *jobstore.ProcessClaim
 	interruptOnce      sync.Once
 	interruptErr       error
 	itemCount          int
@@ -168,16 +169,31 @@ func (run *activeExecution) startSession(ctx context.Context, opts engine.Sessio
 }
 
 // startTurn applies the same launch gate to Session.Turn, which is where the
-// retained adapters fork and exec their provider process groups.
-func (run *activeExecution) startTurn(session engine.Session, ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error, bool) {
+// retained adapters fork and exec their provider process groups. Once an
+// adapter reports that its process exists, the gate is released before the
+// separate durable claim transaction; a cancellation then uses that in-memory
+// claim and waits for this active turn to retire before terminalizing.
+func (run *activeExecution) startTurn(store *jobstore.Store, session engine.Session, ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error, bool) {
 	run.launchMu.Lock()
+	launchLocked := true
+	releaseLaunch := func() {
+		if launchLocked {
+			run.launchMu.Unlock()
+			launchLocked = false
+		}
+	}
 	if run.cancellationRequested() {
-		run.launchMu.Unlock()
+		releaseLaunch()
 		return nil, context.Canceled, true
+	}
+	input.OnProcessStart = func(ref engine.ProcessRef, _ int) {
+		run.noteProcessClaim(ref)
+		releaseLaunch()
+		run.persistProcessClaim(store)
 	}
 	events, err := session.Turn(ctx, input)
 	canceled := run.cancellationRequested()
-	run.launchMu.Unlock()
+	releaseLaunch()
 	if canceled {
 		_ = run.interrupt()
 	}
@@ -192,6 +208,7 @@ func (run *activeExecution) beginTurn() {
 	run.claimAttempted = false
 	run.claimRecorded = false
 	run.claimErr = nil
+	run.processClaim = nil
 	run.turn = &activeTurn{done: make(chan struct{})}
 	run.mu.Unlock()
 }
@@ -297,7 +314,11 @@ func (run *activeExecution) interrupt() error {
 	return run.interruptErr
 }
 
-func (run *activeExecution) recordProcessClaim(store *jobstore.Store, ref engine.ProcessRef) {
+// noteProcessClaim retains the one process identity reported synchronously by
+// an adapter while startTurn holds launchMu. The owner persists it immediately
+// after startTurn releases that lock, before the active turn can retire.
+func (run *activeExecution) noteProcessClaim(ref engine.ProcessRef) {
+	claim := jobstore.ProcessClaim{PID: ref.PID, PGID: ref.PGID, StartToken: ref.StartTime}
 	run.mu.Lock()
 	if run.claimAttempted {
 		run.claimErr = errors.New("backend reported more than one process claim for one turn")
@@ -306,9 +327,23 @@ func (run *activeExecution) recordProcessClaim(store *jobstore.Store, ref engine
 		return
 	}
 	run.claimAttempted = true
+	run.processClaim = &claim
+	run.mu.Unlock()
+}
+
+// persistProcessClaim performs the separate durable claim transaction after
+// launchMu is released. If cancellation wins that small interval, it uses the
+// in-memory claim for containment and waits for this active turn to retire;
+// the owner invokes this method before that retirement can publish.
+func (run *activeExecution) persistProcessClaim(store *jobstore.Store) {
+	run.mu.Lock()
+	if run.claimRecorded || run.processClaim == nil {
+		run.mu.Unlock()
+		return
+	}
+	claim := *run.processClaim
 	run.mu.Unlock()
 
-	claim := jobstore.ProcessClaim{PID: ref.PID, PGID: ref.PGID, StartToken: ref.StartTime}
 	_, err := store.RecordProcessClaim(run.jobID, claim)
 
 	run.mu.Lock()
@@ -321,6 +356,22 @@ func (run *activeExecution) recordProcessClaim(store *jobstore.Store, ref engine
 	if err != nil {
 		run.containAfterClaimFailure()
 	}
+}
+
+// currentProcessClaim returns the active turn's identity, including the short
+// interval after an adapter reports it and before its durable transaction
+// commits. Cancellation prefers it to a prior turn's durable claim.
+func (run *activeExecution) currentProcessClaim() *jobstore.ProcessClaim {
+	if run == nil {
+		return nil
+	}
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.processClaim == nil {
+		return nil
+	}
+	claim := *run.processClaim
+	return &claim
 }
 
 func (run *activeExecution) containAfterClaimFailure() {
@@ -468,7 +519,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	}
 
 	// This durable transaction is intentionally separate from the later claim
-	// transaction in activeExecution.recordProcessClaim.
+	// transaction in activeExecution.persistProcessClaim.
 	started, err := store.MarkStarting(record.JobID)
 	if err != nil {
 		// A failed or ambiguous starting commit must never license a spawn. Try
@@ -588,14 +639,11 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	items := newItemAssembler(run, itemWriter)
 
 	run.beginTurn()
-	events, err, canceled := run.startTurn(session, jobCtx, engine.TurnInput{
+	events, err, canceled := run.startTurn(store, session, jobCtx, engine.TurnInput{
 		Prompt:   spec.Prompt,
 		Write:    spec.Write,
 		Timeout:  timeout,
 		LogPaths: logPaths,
-		OnProcessStart: func(ref engine.ProcessRef, _ int) {
-			run.recordProcessClaim(store, ref)
-		},
 	})
 	if canceled {
 		if events == nil {
@@ -830,14 +878,11 @@ func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Rec
 // initial turn has retired.
 func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, logPaths engine.LogPaths, items *itemAssembler, prompt string) turnOutcome {
 	run.beginTurn()
-	events, err, canceled := run.startTurn(session, ctx, engine.TurnInput{
+	events, err, canceled := run.startTurn(store, session, ctx, engine.TurnInput{
 		Prompt:   prompt,
 		Write:    false,
 		Timeout:  timeout,
 		LogPaths: logPaths,
-		OnProcessStart: func(ref engine.ProcessRef, _ int) {
-			run.recordProcessClaim(store, ref)
-		},
 	})
 	if canceled {
 		if events == nil {
