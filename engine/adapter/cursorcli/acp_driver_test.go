@@ -111,19 +111,63 @@ func TestACPFreshWritableTurn(t *testing.T) {
 		t.Fatalf("model events = %#v", models)
 	}
 	tools := eventsOfType(got, engine.EventToolUse)
-	if len(tools) != 2 {
-		t.Fatalf("tool events = %#v, want tool call and update", tools)
+	if len(tools) != 1 {
+		t.Fatalf("tool events = %#v, want one completed lifecycle", tools)
 	}
-	for _, event := range tools {
-		metadata, err := json.Marshal(event.Metadata)
-		if err != nil || strings.Contains(string(metadata), "rawInput") || strings.Contains(string(metadata), "must-not-leak") {
-			t.Fatalf("tool metadata leaked raw input: %s (%v)", metadata, err)
-		}
+	tool := tools[0]
+	if !tool.ObservedWorkspaceWriteItem || tool.Text != "" {
+		t.Fatalf("tool event = %#v, want a text-free workspace-write observation", tool)
+	}
+	metadata, err := json.Marshal(tool.Metadata)
+	if err != nil || strings.Contains(string(metadata), "rawInput") || strings.Contains(string(metadata), "must-not-leak") || strings.Contains(string(metadata), "ignored.txt") || strings.Contains(string(metadata), "old") || strings.Contains(string(metadata), "new") {
+		t.Fatalf("tool metadata leaked private tool content: %s (%v)", metadata, err)
+	}
+	progress := eventsOfType(got, engine.EventProgress)
+	if len(progress) != 1 || progress[0].Text != "" || progress[0].Metadata != nil {
+		t.Fatalf("progress events = %#v, want one empty lifecycle progress event", progress)
 	}
 	runner.assertRetired(t)
 	if process := runner.lastProcess(); process == nil || !process.stdinClosed.Load() {
 		t.Fatal("writable ACP process did not retire after stdin was closed")
 	}
+}
+
+func TestACPTurnFlushesToolCallWithoutTerminalUpdate(t *testing.T) {
+	runner := newFakeACPRunner(t, func(t *testing.T, proc *fakeACPProcess, spec command.ExecSpec) {
+		peer := newACPPeer(t, proc)
+		peer.handshake(false)
+		newSession := peer.expectRequest("session/new")
+		peer.respond(newSession, acpSessionResult("session-unterminated", "unterminated-model"))
+
+		setMode := peer.expectRequest("session/set_mode")
+		peer.respond(setMode, map[string]any{})
+		prompt := peer.expectRequest("session/prompt")
+		peer.notify("session/update", map[string]any{
+			"sessionId":     "session-unterminated",
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "tool-no-terminal",
+			"title":         "Inspect config",
+			"kind":          "read",
+			"status":        "in_progress",
+		})
+		peer.respond(prompt, map[string]any{"stopReason": "end_turn"})
+	})
+
+	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir()})
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEvents(t, events, 2*time.Second)
+	tools := eventsOfType(got, engine.EventToolUse)
+	if len(tools) != 1 || tools[0].Name != "Inspect config" || tools[0].Text != "Inspect config (in_progress)" || tools[0].ObservedWorkspaceWriteItem {
+		t.Fatalf("tool events = %#v, want one flushed non-write tool observation", tools)
+	}
+	progress := eventsOfType(got, engine.EventProgress)
+	if len(progress) != 1 {
+		t.Fatalf("progress events = %#v, want one lifecycle progress event", progress)
+	}
+	runner.assertRetired(t)
 }
 
 func TestACPLoadedReadOnlyTurnCancellation(t *testing.T) {

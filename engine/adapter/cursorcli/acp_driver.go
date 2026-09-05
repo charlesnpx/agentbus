@@ -114,6 +114,10 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 			"text": input.Prompt,
 		}},
 	}, observer)
+	// A prompt response can arrive without a terminal update for an observed
+	// tool call. Flush those calls before the result so their observations are
+	// retained even when ACP omits (or uses an unrecognized) terminal status.
+	observer.flushToolUses()
 	if err != nil {
 		return info.sessionID, err
 	}
@@ -435,8 +439,19 @@ func (i acpSessionInfo) currentModel() string {
 }
 
 type acpTurnObserver struct {
-	emit duplex.EmitFunc
-	text strings.Builder
+	emit               duplex.EmitFunc
+	text               strings.Builder
+	pendingToolCalls   map[string]*acpToolCall
+	pendingToolCallIDs []string
+	emittedToolCallIDs map[string]struct{}
+}
+
+type acpToolCall struct {
+	id                     string
+	title                  string
+	kind                   string
+	status                 string
+	workspaceWriteObserved bool
 }
 
 func (o *acpTurnObserver) handle(frame duplex.Frame) {
@@ -452,39 +467,115 @@ func (o *acpTurnObserver) handle(frame duplex.Frame) {
 			o.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text})
 		}
 	case "tool_call", "tool_call_update":
-		o.emitToolUse(update)
+		o.handleToolUse(update)
 	}
 }
 
-func (o *acpTurnObserver) emitToolUse(update map[string]any) {
-	title := firstString(update, "title")
-	kind := firstString(update, "kind")
-	status := firstString(update, "status")
-	name := title
+func (o *acpTurnObserver) handleToolUse(update map[string]any) {
+	toolCallID := firstString(update, "toolCallId")
+	if toolCallID == "" {
+		// ACP tool-call lifecycles are keyed by toolCallId. A malformed frame
+		// without one still proves activity, but cannot safely be correlated into
+		// a transcript item.
+		o.emitEvent(engine.Event{Type: engine.EventProgress})
+		return
+	}
+	if _, emitted := o.emittedToolCallIDs[toolCallID]; emitted {
+		return
+	}
+	if o.pendingToolCalls == nil {
+		o.pendingToolCalls = make(map[string]*acpToolCall)
+	}
+	toolCall := o.pendingToolCalls[toolCallID]
+	if toolCall == nil {
+		toolCall = &acpToolCall{id: toolCallID}
+		o.pendingToolCalls[toolCallID] = toolCall
+		o.pendingToolCallIDs = append(o.pendingToolCallIDs, toolCallID)
+	}
+	toolCall.absorb(update)
+
+	// The Cursor fixture establishes completed as the terminal status. Keep all
+	// other statuses pending until the prompt finishes so an absent or
+	// unrecognized terminal frame is still recorded once.
+	if toolCall.status == "completed" {
+		o.emitToolCall(toolCall)
+		delete(o.pendingToolCalls, toolCallID)
+		if o.emittedToolCallIDs == nil {
+			o.emittedToolCallIDs = make(map[string]struct{})
+		}
+		o.emittedToolCallIDs[toolCallID] = struct{}{}
+		return
+	}
+	o.emitEvent(engine.Event{Type: engine.EventProgress})
+}
+
+func (o *acpTurnObserver) flushToolUses() {
+	for _, toolCallID := range o.pendingToolCallIDs {
+		toolCall, ok := o.pendingToolCalls[toolCallID]
+		if !ok {
+			continue
+		}
+		o.emitToolCall(toolCall)
+	}
+}
+
+func (c *acpToolCall) absorb(update map[string]any) {
+	if title := firstString(update, "title"); title != "" {
+		c.title = title
+	}
+	if kind := firstString(update, "kind"); kind != "" {
+		c.kind = kind
+	}
+	if status := firstString(update, "status"); status != "" {
+		c.status = status
+	}
+	if hasACPDiffContent(update["content"]) {
+		c.workspaceWriteObserved = true
+	}
+}
+
+func (o *acpTurnObserver) emitToolCall(toolCall *acpToolCall) {
+	name := toolCall.title
 	if name == "" {
-		name = kind
+		name = toolCall.kind
 	}
 	if name == "" {
 		name = "tool"
 	}
-	text := title
-	if text == "" {
-		text = name
+	metadata := map[string]any{"toolCallId": toolCall.id}
+	if toolCall.kind != "" {
+		metadata["kind"] = toolCall.kind
 	}
-	if status != "" {
-		text += " (" + status + ")"
+	if toolCall.status != "" {
+		metadata["status"] = toolCall.status
 	}
-	metadata := make(map[string]any)
-	if toolCallID, ok := update["toolCallId"]; ok && strings.TrimSpace(stringValue(toolCallID)) != "" {
-		metadata["toolCallId"] = toolCallID
+	event := engine.Event{
+		Type:                       engine.EventToolUse,
+		Name:                       name,
+		Metadata:                   metadata,
+		ObservedWorkspaceWriteItem: toolCall.workspaceWriteObserved,
 	}
-	if kind != "" {
-		metadata["kind"] = kind
+	if !toolCall.workspaceWriteObserved {
+		event.Text = name
+		if toolCall.status != "" {
+			event.Text += " (" + toolCall.status + ")"
+		}
 	}
-	if status != "" {
-		metadata["status"] = status
+	o.emitEvent(event)
+}
+
+func hasACPDiffContent(content any) bool {
+	switch content := content.(type) {
+	case map[string]any:
+		return firstString(content, "type") == "diff"
+	case []any:
+		for _, item := range content {
+			if block, ok := item.(map[string]any); ok && firstString(block, "type") == "diff" {
+				return true
+			}
+		}
 	}
-	o.emitEvent(engine.Event{Type: engine.EventToolUse, Name: name, Text: text, Metadata: metadata})
+	return false
 }
 
 func (o *acpTurnObserver) resultText() string {
