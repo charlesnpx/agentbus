@@ -993,7 +993,7 @@ func collectTurn(s *Server, ctx context.Context, run *activeExecution, events <-
 			} else {
 				outcome.cleanup = protocol.CleanupUncertain
 				outcome.diagnostics = append(outcome.diagnostics, "backend event stream did not close after containment grace")
-				items.writer.recordFailureMarker()
+				items.writer.markIncomplete()
 				discardTurnEvents(events)
 			}
 			outcome.err = ctx.Err()

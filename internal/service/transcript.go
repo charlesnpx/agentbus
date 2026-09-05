@@ -95,9 +95,9 @@ func (s *Server) jobTranscript(record jobstore.Record, params protocol.JobTransc
 		result = readTranscriptSidecar(path, params)
 		result.State = projectedState(record)
 	}
-	failureMarker := hasItemSidecarFailureMarker(path)
+	pendingMarker := hasItemSidecarPendingMarker(path)
 	result.Gap = result.Gap ||
-		failureMarker ||
+		pendingMarker ||
 		hasItemSidecarFailure(record.Diagnostics) ||
 		record.State == protocol.PublicStateUnknown
 	if !record.State.IsTerminal() {
@@ -271,11 +271,11 @@ func hasItemSidecarFailure(diagnostics []string) bool {
 	return false
 }
 
-func hasItemSidecarFailureMarker(sidecarPath string) bool {
+func hasItemSidecarPendingMarker(sidecarPath string) bool {
 	if strings.TrimSpace(sidecarPath) == "" {
 		return false
 	}
-	_, err := os.Stat(itemSidecarFailurePath(sidecarPath))
+	_, err := os.Stat(itemSidecarPendingPath(sidecarPath))
 	if err == nil {
 		return true
 	}

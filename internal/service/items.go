@@ -4,7 +4,6 @@ package service
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,7 +19,7 @@ const (
 	transcriptItemTextCap       = 4 * 1024
 	transcriptItemFileCap       = 16 * 1024 * 1024
 	itemSidecarDiagnosticPrefix = "item sidecar "
-	itemSidecarFailureSuffix    = ".failure"
+	itemSidecarPendingSuffix    = ".pending"
 )
 
 var transcriptItemStopLine = []byte("{\"appendStopped\":true}\n")
@@ -122,16 +121,16 @@ func (run *activeExecution) itemSidecarDiagnostics() []string {
 // assign logical ordinals after a disk failure or cap so activity remains a
 // measure of the live event stream rather than a measure of file bytes.
 type itemSidecarWriter struct {
-	path             string
-	textCap          int
-	fileCap          int64
-	file             *os.File
-	written          int64
-	next             int
-	stopped          bool
-	diagnostic       string
-	markerDiagnostic string
-	failureSink      func(string)
+	path        string
+	textCap     int
+	fileCap     int64
+	file        *os.File
+	written     int64
+	next        int
+	stopped     bool
+	incomplete  bool
+	diagnostic  string
+	failureSink func(string)
 }
 
 func newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarWriter {
@@ -152,6 +151,10 @@ func newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarW
 	}
 	if err := os.MkdirAll(filepath.Dir(writer.path), 0o700); err != nil {
 		writer.noteFailure("create parent", err)
+		return writer
+	}
+	if err := writer.createPendingMarker(); err != nil {
+		writer.noteFailure("create pending marker", err)
 		return writer
 	}
 	file, err := os.OpenFile(writer.path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
@@ -272,46 +275,46 @@ func (writer *itemSidecarWriter) noteFailure(operation string, err error) {
 		return
 	}
 	writer.stopped = true
+	writer.incomplete = true
 	writer.diagnostic = itemSidecarDiagnosticPrefix + operation + ": " + err.Error()
 	if writer.file != nil {
 		_ = writer.file.Close()
 		writer.file = nil
 	}
-	writer.recordFailureMarker()
 	if writer.failureSink != nil {
 		writer.failureSink(writer.diagnostic)
 	}
 }
 
-// recordFailureMarker preserves a create-only signal that the capture is known
-// to be incomplete, whether a sidecar write failed or a backend frame was
-// dropped. An existing marker already establishes that fact; any other open
-// failure becomes a durable sidecar diagnostic instead of being discarded.
-func (writer *itemSidecarWriter) recordFailureMarker() {
+// markIncomplete preserves the pending marker for uncertainty that does not
+// itself prevent sidecar I/O, such as a dropped backend frame.
+func (writer *itemSidecarWriter) markIncomplete() {
+	if writer == nil {
+		return
+	}
+	writer.incomplete = true
+}
+
+func (writer *itemSidecarWriter) createPendingMarker() error {
+	if writer == nil || strings.TrimSpace(writer.path) == "" {
+		return fmt.Errorf("path is empty")
+	}
+	file, err := os.OpenFile(itemSidecarPendingPath(writer.path), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (writer *itemSidecarWriter) clearPendingMarker() {
 	if writer == nil || strings.TrimSpace(writer.path) == "" {
 		return
 	}
-	file, err := os.OpenFile(itemSidecarFailurePath(writer.path), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
-	if err != nil {
-		if !errors.Is(err, os.ErrExist) {
-			writer.noteMarkerFailure(err)
-		}
-		return
-	}
-	defer file.Close()
-}
-
-// noteMarkerFailure deliberately leaves an otherwise usable sidecar writer
-// running. The marker is only needed after a separate incompleteness event;
-// its failed creation still has to reach the existing sidecar-diagnostic gap
-// source when no other sidecar failure has already done so.
-func (writer *itemSidecarWriter) noteMarkerFailure(err error) {
-	if writer == nil || err == nil || writer.diagnostic != "" || writer.markerDiagnostic != "" {
-		return
-	}
-	writer.markerDiagnostic = itemSidecarDiagnosticPrefix + "record failure marker: " + err.Error()
-	if writer.failureSink != nil {
-		writer.failureSink(writer.markerDiagnostic)
+	if err := os.Remove(itemSidecarPendingPath(writer.path)); err != nil && !os.IsNotExist(err) {
+		writer.noteFailure("clear pending marker", err)
 	}
 }
 
@@ -327,18 +330,19 @@ func (writer *itemSidecarWriter) close() {
 	if err := file.Close(); err != nil {
 		writer.noteFailure("close", err)
 	}
+	if writer.incomplete {
+		return
+	}
+	writer.clearPendingMarker()
 }
 
 func (writer *itemSidecarWriter) diagnostics() []string {
 	if writer == nil {
 		return nil
 	}
-	diagnostics := make([]string, 0, 2)
+	diagnostics := make([]string, 0, 1)
 	if writer.diagnostic != "" {
 		diagnostics = append(diagnostics, writer.diagnostic)
-	}
-	if writer.markerDiagnostic != "" {
-		diagnostics = append(diagnostics, writer.markerDiagnostic)
 	}
 	return diagnostics
 }
@@ -351,8 +355,8 @@ func itemSidecarPath(stdoutPath string) (string, error) {
 	return base + ".items.jsonl", nil
 }
 
-func itemSidecarFailurePath(sidecarPath string) string {
-	return sidecarPath + itemSidecarFailureSuffix
+func itemSidecarPendingPath(sidecarPath string) string {
+	return sidecarPath + itemSidecarPendingSuffix
 }
 
 // itemAssembler turns the normalized engine event stream into transcript
@@ -405,7 +409,7 @@ func (assembler *itemAssembler) absorb(event engine.Event, rawText string) {
 		assembler.append(transcriptItemToolResult, event.Name, rawText, false)
 	case engine.EventWarning:
 		if _, dropped := engine.TransportFrameDropsFromMetadata(event.Metadata); dropped {
-			assembler.writer.recordFailureMarker()
+			assembler.writer.markIncomplete()
 		}
 		assembler.flushMessage()
 		assembler.append(transcriptItemWarning, "", rawText, false)
