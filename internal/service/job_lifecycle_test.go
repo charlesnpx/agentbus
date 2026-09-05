@@ -386,8 +386,93 @@ func TestJobCancelBeforeSpawnIsDurable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != protocol.PublicStateCanceled || stored.Cleanup != protocol.CleanupClean {
+	if stored.State != protocol.PublicStateCanceled || stored.Cleanup != protocol.CleanupClean || stored.BackendSessionID != "" {
 		t.Fatalf("record after cancel-before-spawn = %#v", stored)
+	}
+}
+
+func TestJobCancelDuringCorrectionPreservesRetiredTurnOutcome(t *testing.T) {
+	schemaRaw := json.RawMessage(`{"required":["ok"],"type":"object"}`)
+	correctionEvents := make(chan engine.Event)
+	correctionStarted := make(chan struct{})
+	turns := 0
+	backend := &executionFakeBackend{name: "cancel-during-correction"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				turns++
+				switch turns {
+				case 1:
+					input.OnProcessStart(engine.ProcessRef{PID: 4113, PGID: 4113, StartTime: "initial-correction-token"}, 0)
+					return executionEvents(
+						engine.Event{Type: engine.EventResultMessage, Text: `{"wrong":true}`},
+						engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-initial", CleanupFailed: true}},
+					), nil
+				case 2:
+					if input.Write {
+						t.Fatal("correction turn was write-enabled")
+					}
+					input.OnProcessStart(engine.ProcessRef{PID: 4114, PGID: 4114, StartTime: "correction-cancel-token"}, 0)
+					close(correctionStarted)
+					return correctionEvents, nil
+				default:
+					t.Fatalf("turns = %d, want initial and correction turns", turns)
+					return nil, nil
+				}
+			},
+			interrupt: func(context.Context) error {
+				close(correctionEvents)
+				return nil
+			},
+		}, nil
+	}
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
+	server.processGroupGoneFn = func(int) (bool, error) { return true, nil }
+	record := queuedExecutionRecordWithSchema(t, server, backend.Name(), "correct after invalid output", nil, schemaRaw)
+	run := newActiveExecution(record.JobID, backend)
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: run}
+	server.executionMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		server.runJob(context.Background(), record, run)
+		close(done)
+	}()
+	select {
+	case <-correctionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("correction turn did not start")
+	}
+
+	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
+	if canceled.err != nil {
+		t.Fatalf("job.cancel error = %#v", canceled.err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled correction did not retire")
+	}
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != protocol.PublicStateCanceled || stored.Cleanup != protocol.CleanupUncertain || stored.BackendSessionID != "thread-initial" {
+		t.Fatalf("canceled correction record = %#v, want canceled uncertain record with initial session", stored)
+	}
+	initialDiagnosticCount := 0
+	for _, diagnostic := range stored.Diagnostics {
+		if diagnostic == "backend reported uncertain cleanup" {
+			initialDiagnosticCount++
+		}
+	}
+	if initialDiagnosticCount != 1 {
+		t.Fatalf("canceled correction diagnostics = %#v, want one initial cleanup diagnostic", stored.Diagnostics)
 	}
 }
 
@@ -495,7 +580,7 @@ func TestRestartQueuedBecomesFailedWithoutStart(t *testing.T) {
 	}
 }
 
-func TestRestartRunningBecomesUnknownWithUncertainCleanup(t *testing.T) {
+func TestRestartDuringCorrectionPreservesRetiredSessionForResume(t *testing.T) {
 	root := t.TempDir()
 	first := newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "restart-running"}}})
 	submitted := submitResultForTest(t, submitForTest(t, first, submissionParams("restart-running-workspace", "restart-running-request", "restart-running", t.TempDir(), "task")))
@@ -506,7 +591,18 @@ func TestRestartRunningBecomesUnknownWithUncertainCleanup(t *testing.T) {
 	if _, err := store.MarkStarting(submitted.JobID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.RecordProcessClaim(submitted.JobID, jobstore.ProcessClaim{PID: 2147483647, PGID: 2147483647, StartToken: "missing-running-token"}); err != nil {
+	run := newActiveExecution(submitted.JobID, nil)
+	run.beginTurn()
+	if _, err := store.RecordProcessClaim(submitted.JobID, jobstore.ProcessClaim{PID: 2147483647, PGID: 2147483647, StartToken: "initial-turn-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if retired := run.retireTurn(store, turnOutcome{backendSessionID: "thread-recovered", cleanup: protocol.CleanupClean}); retired.backendSessionID != "thread-recovered" {
+		t.Fatalf("retired turn = %#v, want recorded session", retired)
+	}
+	// The initial turn has retired and its session write has committed before
+	// this second turn starts; restart reconciliation must retain that ID.
+	run.beginTurn()
+	if _, err := store.RecordProcessClaim(submitted.JobID, jobstore.ProcessClaim{PID: 2147483647, PGID: 2147483647, StartToken: "correction-turn-token"}); err != nil {
 		t.Fatal(err)
 	}
 	first.closeJobStore()
@@ -523,8 +619,14 @@ func TestRestartRunningBecomesUnknownWithUncertainCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != protocol.PublicStateUnknown || stored.Cleanup != protocol.CleanupUncertain {
+	if stored.State != protocol.PublicStateUnknown || stored.Cleanup != protocol.CleanupUncertain || stored.BackendSessionID != "thread-recovered" {
 		t.Fatalf("reconciled running record = %#v", stored)
+	}
+	params := submissionParams("restart-resume-workspace", "restart-resume-request", "restart-running", t.TempDir(), "continue")
+	params.TaskSpec.ResumeJobID = submitted.JobID
+	resumed := submitResultForTest(t, submitForTest(t, restarted, params))
+	if resumed.State != protocol.PublicStateQueued {
+		t.Fatalf("resume after restart reconciliation = %#v, want queued job", resumed)
 	}
 }
 

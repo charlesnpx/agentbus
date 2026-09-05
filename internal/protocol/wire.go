@@ -152,10 +152,14 @@ type ContractVerdict struct {
 
 // TaskSpec describes a job submitted through protocol v3.
 type TaskSpec struct {
-	Backend      string             `json:"backend"`
-	CWD          string             `json:"cwd"`
-	Prompt       string             `json:"prompt"`
-	Write        bool               `json:"write"`
+	Backend string `json:"backend"`
+	CWD     string `json:"cwd"`
+	Prompt  string `json:"prompt"`
+	Write   bool   `json:"write"`
+	// ResumeJobID names the prior job whose recorded backend session should be
+	// resumed for this new job. It is part of the immutable task specification
+	// and therefore participates in identified-replay hashing.
+	ResumeJobID  string             `json:"resumeJobId,omitempty"`
 	Model        *string            `json:"model,omitempty"`
 	Effort       *string            `json:"effort,omitempty"`
 	TimeoutMS    *int64             `json:"timeoutMs,omitempty"`

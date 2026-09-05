@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,8 +23,9 @@ import (
 )
 
 type executionFakeBackend struct {
-	name  string
-	start func(context.Context, engine.SessionOpts) (engine.Session, error)
+	name   string
+	start  func(context.Context, engine.SessionOpts) (engine.Session, error)
+	resume func(context.Context, string, engine.SessionOpts) (engine.Session, error)
 }
 
 func (backend *executionFakeBackend) Name() string { return backend.name }
@@ -39,8 +41,11 @@ func (backend *executionFakeBackend) Start(ctx context.Context, opts engine.Sess
 	return backend.start(ctx, opts)
 }
 
-func (backend *executionFakeBackend) Resume(context.Context, string, engine.SessionOpts) (engine.Session, error) {
-	return nil, errors.New("fake backend Resume was not configured")
+func (backend *executionFakeBackend) Resume(ctx context.Context, id string, opts engine.SessionOpts) (engine.Session, error) {
+	if backend.resume == nil {
+		return nil, errors.New("fake backend Resume was not configured")
+	}
+	return backend.resume(ctx, id, opts)
 }
 
 type executionFakeSession struct {
@@ -648,5 +653,247 @@ func TestExecutionFailureWithoutRecordedClaimPreservesUncertainCleanup(t *testin
 	}
 	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassBackendError || got.Cleanup != protocol.CleanupUncertain || got.ProcessClaim != nil {
 		t.Fatalf("no-claim terminal record = %+v, want failed backend_error with uncertain cleanup and no process claim", got)
+	}
+}
+
+func TestExecutionDoesNotPersistSessionIDOnCompletedRecords(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		start   func(context.Context, engine.SessionOpts) (engine.Session, error)
+		wantID  string
+		wantRun protocol.PublicState
+	}{
+		{
+			name: "turn final session id",
+			start: func(context.Context, engine.SessionOpts) (engine.Session, error) {
+				return &executionFakeSession{
+					turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+						input.OnProcessStart(engine.ProcessRef{PID: 4110, PGID: 4110, StartTime: "session-id-token"}, 0)
+						return executionEvents(
+							engine.Event{Type: engine.EventResultMessage, Text: "done"},
+							engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-finished"}},
+						), nil
+					},
+				}, nil
+			},
+			wantID:  "",
+			wantRun: protocol.PublicStateCompleted,
+		},
+		{
+			name: "start failure before first turn",
+			start: func(context.Context, engine.SessionOpts) (engine.Session, error) {
+				return nil, errors.New("start failed before first turn")
+			},
+			wantRun: protocol.PublicStateFailed,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := &executionFakeBackend{name: "session-id-" + tt.name, start: tt.start}
+			server := newExecutionServer(t, backend)
+			record := queuedExecutionRecord(t, server, backend.Name(), "session id", nil)
+			runExecution(t, server, record)
+
+			store, err := server.ensureJobStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := store.Get(record.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != tt.wantRun || got.BackendSessionID != tt.wantID {
+				t.Fatalf("terminal record = state=%s backendSessionID=%q, want state=%s backendSessionID=%q", got.State, got.BackendSessionID, tt.wantRun, tt.wantID)
+			}
+		})
+	}
+}
+
+func TestExecutionResumeFollowsManagedHomeLineage(t *testing.T) {
+	var startCalled bool
+	var resumedIDs []string
+	var resumedHomes []string
+	backend := &executionFakeBackend{name: "codex"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		startCalled = true
+		return nil, errors.New("Start must not run for a resumed job")
+	}
+	backend.resume = func(_ context.Context, id string, opts engine.SessionOpts) (engine.Session, error) {
+		resumedIDs = append(resumedIDs, id)
+		resumedHomes = append(resumedHomes, opts.EnvOverlay["CODEX_HOME"])
+		switch id {
+		case "thread-source":
+			return &executionFakeSession{
+				turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+					input.OnProcessStart(engine.ProcessRef{PID: 4111, PGID: 4111, StartTime: "first-resume-token"}, 0)
+					return executionEvents(
+						engine.Event{Type: engine.EventTerminalError, Err: errors.New("first resumed turn failed")},
+						engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-first-resumed"}},
+					), nil
+				},
+			}, nil
+		case "thread-first-resumed":
+			return &executionFakeSession{
+				turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+					input.OnProcessStart(engine.ProcessRef{PID: 4112, PGID: 4112, StartTime: "second-resume-token"}, 0)
+					return executionEvents(
+						engine.Event{Type: engine.EventResultMessage, Text: "second resumed result"},
+						engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-second-resumed"}},
+					), nil
+				},
+			}, nil
+		default:
+			return nil, fmt.Errorf("unexpected resume session %q", id)
+		}
+	}
+	server := newExecutionServer(t, backend)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceResult := submitResultForTest(t, submitForTest(t, server, submissionParams("resume-source-workspace", "resume-source-request", backend.Name(), t.TempDir(), "source")))
+	source, err := store.Get(sourceResult.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkTerminal(source.JobID, jobstore.TerminalUpdate{
+		State:            protocol.PublicStateFailed,
+		Cleanup:          protocol.CleanupClean,
+		BackendSessionID: "thread-source",
+		FailureClass:     protocol.FailureClassBackendError,
+		FailureReason:    "timed out after a turn",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sourceLayout, err := engine.LayoutForWorkspace(server.stateRoot, source.CWD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceHome := filepath.Join(sourceLayout.Codex, source.JobID)
+	if err := os.MkdirAll(sourceHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	persistedSource, err := store.Get(source.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persistedSource.State != protocol.PublicStateFailed || persistedSource.BackendSessionID != "thread-source" {
+		t.Fatalf("source record = %+v, want failed source with recorded session", persistedSource)
+	}
+
+	newResumed := func(workspace, requestID, resumeJobID string) jobstore.Record {
+		t.Helper()
+		spec := protocol.TaskSpec{
+			Backend:     backend.Name(),
+			CWD:         t.TempDir(),
+			Prompt:      "continue from the source thread",
+			Write:       false,
+			ResumeJobID: resumeJobID,
+		}
+		raw, err := json.Marshal(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resumed, deduplicated, err := store.SubmitTx(
+			jobstore.RequestKey{WorkspaceKey: workspace, RequestID: requestID},
+			raw,
+			func(id string) (jobstore.Record, error) {
+				return jobstore.Record{JobID: id, Backend: spec.Backend, CWD: spec.CWD, Write: spec.Write}, nil
+			},
+		)
+		if err != nil || deduplicated {
+			t.Fatalf("create resumed job = (%+v, deduplicated=%t, %v), want new record", resumed, deduplicated, err)
+		}
+		return resumed
+	}
+
+	firstResumed := newResumed("first-resume-workspace", "first-resume-request", source.JobID)
+	runExecution(t, server, firstResumed)
+	firstTerminal, err := store.Get(firstResumed.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstTerminal.State != protocol.PublicStateFailed || firstTerminal.BackendSessionID != "thread-first-resumed" {
+		t.Fatalf("first resumed terminal = %+v, want failed with its new recorded session", firstTerminal)
+	}
+	firstLayout, err := engine.LayoutForWorkspace(server.stateRoot, firstResumed.CWD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(firstLayout.Codex, firstResumed.JobID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only first resumed home stat = %v, want no new managed thread home", err)
+	}
+
+	secondResumed := newResumed("second-resume-workspace", "second-resume-request", firstResumed.JobID)
+	runExecution(t, server, secondResumed)
+	secondTerminal, err := store.Get(secondResumed.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondTerminal.State != protocol.PublicStateCompleted || secondTerminal.BackendSessionID != "" {
+		t.Fatalf("second resumed terminal = %+v, want completed without a retained session", secondTerminal)
+	}
+	if startCalled || len(resumedIDs) != 2 || resumedIDs[0] != "thread-source" || resumedIDs[1] != "thread-first-resumed" || resumedHomes[0] != sourceHome || resumedHomes[1] != sourceHome {
+		t.Fatalf("session launches = Start:%t Resume:%#v CODEX_HOME:%#v, want Start:false IDs:[thread-source thread-first-resumed] homes:[%q %q]", startCalled, resumedIDs, resumedHomes, sourceHome, sourceHome)
+	}
+	if secondTerminal.JobID == source.JobID || secondTerminal.Artifacts == source.Artifacts || secondTerminal.Artifacts == firstTerminal.Artifacts {
+		t.Fatalf("second resumed terminal = %+v, want a distinct record with its own artifacts", secondTerminal)
+	}
+}
+
+func TestJobSubmitRejectsCodexResumeWithoutPerJobHome(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		config     func(*testing.T, *Config)
+		wantReason string
+	}{
+		{
+			name: "inherited home",
+			config: func(_ *testing.T, cfg *Config) {
+				cfg.CodexHomeInherit = true
+			},
+			wantReason: "inherited CODEX_HOME",
+		},
+		{
+			name: "override home",
+			config: func(t *testing.T, cfg *Config) {
+				cfg.CodexHomeOverride = t.TempDir()
+			},
+			wantReason: "AGENTBUS_CODEX_HOME override",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := &executionFakeBackend{name: "codex"}
+			cfg := Config{Backends: []engine.Backend{backend}}
+			tt.config(t, &cfg)
+			server := newTestServer(t, t.TempDir(), cfg)
+			source := queuedExecutionRecord(t, server, backend.Name(), "source", nil)
+			store, err := server.ensureJobStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.MarkTerminal(source.JobID, jobstore.TerminalUpdate{
+				State:            protocol.PublicStateFailed,
+				Cleanup:          protocol.CleanupClean,
+				BackendSessionID: "thread-source",
+				FailureClass:     protocol.FailureClassBackendError,
+				FailureReason:    "source turn stopped",
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			params := submissionParams("non-managed-resume-"+strings.ReplaceAll(tt.name, " ", "-"), "resume", backend.Name(), t.TempDir(), "continue")
+			params.TaskSpec.ResumeJobID = source.JobID
+			outcome := submitForTest(t, server, params)
+			if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || outcome.err.Data.JobID != source.JobID || !strings.Contains(outcome.err.Message, tt.wantReason) {
+				t.Fatalf("rejected resume submission = %#v, want invalid task spec explaining %q for %q", outcome.err, tt.wantReason, source.JobID)
+			}
+			records, err := store.List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(records) != 1 || records[0].JobID != source.JobID {
+				t.Fatalf("records after rejected resume = %#v, want only source %q", records, source.JobID)
+			}
+		})
 	}
 }

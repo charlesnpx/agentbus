@@ -88,6 +88,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		CWD:          "/workspace",
 		Prompt:       "do work",
 		Write:        true,
+		ResumeJobID:  "job_previous",
 		Model:        &model,
 		Effort:       &effort,
 		TimeoutMS:    &requested,
@@ -183,7 +184,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 			name:  "JobSubmitParams",
 			value: JobSubmitParams{WorkspaceKey: "workspace-1", RequestID: "request-1", TaskSpec: taskSpec},
 			new:   func() any { return new(JobSubmitParams) },
-			want:  `{"workspaceKey":"workspace-1","requestId":"request-1","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true,"model":"gpt-5","effort":"high","timeoutMs":1234,"outputSchema":{"type":"object"},"tags":{"team":"core"}}}`,
+			want:  `{"workspaceKey":"workspace-1","requestId":"request-1","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true,"resumeJobId":"job_previous","model":"gpt-5","effort":"high","timeoutMs":1234,"outputSchema":{"type":"object"},"tags":{"team":"core"}}}`,
 		},
 		{
 			name:  "JobSubmitResult",

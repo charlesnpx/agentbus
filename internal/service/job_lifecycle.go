@@ -145,14 +145,25 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 
 	run := s.activeExecution(record.JobID)
 	cleanup, diagnostics := s.cancelActiveOrRecordedProcess(store, record)
+	backendSessionID := record.BackendSessionID
 	if run != nil {
+		if retired, observed := run.retiredTurnOutcome(); observed {
+			if retired.cleanup == protocol.CleanupUncertain {
+				cleanup = protocol.CleanupUncertain
+			}
+			diagnostics = append(diagnostics, retired.diagnostics...)
+			if retired.backendSessionID != "" {
+				backendSessionID = retired.backendSessionID
+			}
+		}
 		diagnostics = append(diagnostics, run.itemSidecarDiagnostics()...)
 	}
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
-		State:       protocol.PublicStateCanceled,
-		Cleanup:     cleanup,
-		Diagnostics: diagnostics,
-		FinishedAt:  time.Now().UTC(),
+		State:            protocol.PublicStateCanceled,
+		Cleanup:          cleanup,
+		BackendSessionID: backendSessionID,
+		Diagnostics:      diagnostics,
+		FinishedAt:       time.Now().UTC(),
 	})
 	if err != nil {
 		if errors.Is(err, jobstore.ErrTerminal) {
@@ -382,10 +393,11 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 		case record.Starting || record.State == protocol.PublicStateRunning:
 			cleanup, diagnostics := s.terminateRecordedProcessClaim(record.ProcessClaim)
 			_, err = store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
-				State:       protocol.PublicStateUnknown,
-				Cleanup:     cleanup,
-				Diagnostics: append([]string{"restart reconciliation: no relaunch"}, diagnostics...),
-				FinishedAt:  time.Now().UTC(),
+				State:            protocol.PublicStateUnknown,
+				Cleanup:          cleanup,
+				BackendSessionID: record.BackendSessionID,
+				Diagnostics:      append([]string{"restart reconciliation: no relaunch"}, diagnostics...),
+				FinishedAt:       time.Now().UTC(),
 			})
 		default:
 			// A terminal record is deliberately untouched. In particular, do

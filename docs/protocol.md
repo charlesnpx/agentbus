@@ -103,6 +103,7 @@ specification is rejected.
     "cwd": "/absolute/path",
     "write": true,
     "prompt": "string",
+    "resumeJobId": "job_previous",
     "model": "string",
     "effort": "string",
     "outputSchema": {},
@@ -112,10 +113,27 @@ specification is rejected.
 }
 ~~~
 
-backend, cwd, write, and prompt are required task fields. model, effort,
-outputSchema, tags, and timeoutMs are optional. outputSchema is one inline
-Draft 2020-12 JSON Schema value: an object or a boolean. timeoutMs is a
+backend, cwd, write, and prompt are required task fields. resumeJobId, model,
+effort, outputSchema, tags, and timeoutMs are optional. outputSchema is one
+inline Draft 2020-12 JSON Schema value: an object or a boolean. timeoutMs is a
 non-negative integer no greater than four hours; zero means no deadline.
+
+resumeJobId names a prior job, never a backend thread ID. For a new submission,
+the target must be a terminal non-completed job for the same backend and must
+have recorded a backend session ID at turn retirement. A target without that ID
+returns `invalid_task_spec` with its jobId; Agentbus never falls back to a fresh
+thread. Completed jobs are not resumable because completion is final. Normal successful
+Codex cleanup also removes the private CODEX_HOME, but a home retained after
+uncertain cleanup is a recovery artifact rather than permission to reopen
+completed work.
+
+A resume creates a new job with a new id, record, transcript sidecar, result,
+and fresh deadline. It replays the prior backend thread as history; it does not
+continue the old job or extend its deadline. Under the normal managed Codex
+configuration, the new job uses the retained CODEX_HOME at the root of the
+resume lineage so the backend can see that thread. Different resumeJobId values
+are different task specifications for identified replay, even when workspaceKey
+and requestId are the same.
 
 The result always includes the resolved timeout:
 
