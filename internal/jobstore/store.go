@@ -41,6 +41,10 @@ var (
 	// ErrStarting reports an attempt to start a job that already crossed the
 	// durable no-relaunch boundary.
 	ErrStarting = errors.New("jobstore: job is already starting")
+	// ErrEvidenceIncomplete reports that a previous retirement receipt did not
+	// finish its write-ahead sequence. Its marker must remain set rather than
+	// being cleared by a later observation.
+	ErrEvidenceIncomplete = errors.New("jobstore: retirement evidence is already incomplete")
 	// ErrBusy reports a database held by another daemon beyond Open's timeout.
 	ErrBusy = errors.New("jobstore: root busy")
 	// ErrCorrupt reports an unsafe or structurally invalid bbolt database.
@@ -153,9 +157,11 @@ type Record struct {
 	FailureClass     protocol.FailureClass `json:"failureClass,omitempty"`
 	FailureReason    string                `json:"failureReason,omitempty"`
 	Diagnostics      []string              `json:"diagnostics"`
-	// EvidenceIncomplete is a private terminal marker. It means a retirement
-	// observation could not be durably recorded, so consumers must not treat a
-	// transcript as a complete account of the execution.
+	// EvidenceIncomplete is a private write-ahead marker. It is set on a
+	// nonterminal record before a retirement receipt is written, and cleared
+	// only after that receipt is durable. A surviving marker is promoted by
+	// terminalization, so consumers never treat an uncertain transcript as a
+	// complete account of the execution.
 	EvidenceIncomplete bool                    `json:"evidenceIncomplete,omitempty"`
 	Contract           protocol.ContractResult `json:"contract"`
 	ResultText         string                  `json:"resultText,omitempty"`
@@ -173,18 +179,17 @@ type Record struct {
 // is deliberately absent: MarkTerminal merges the record's private retirement
 // receipt atomically with this state-specific payload.
 type TerminalUpdate struct {
-	State              protocol.PublicState
-	Cleanup            protocol.Cleanup
-	FailureClass       protocol.FailureClass
-	FailureReason      string
-	Diagnostics        []string
-	EvidenceIncomplete bool
-	Contract           protocol.ContractResult
-	ResultText         string
-	ResultPath         string
-	ResultSHA256       string
-	ResultBytes        int64
-	FinishedAt         time.Time
+	State         protocol.PublicState
+	Cleanup       protocol.Cleanup
+	FailureClass  protocol.FailureClass
+	FailureReason string
+	Diagnostics   []string
+	Contract      protocol.ContractResult
+	ResultText    string
+	ResultPath    string
+	ResultSHA256  string
+	ResultBytes   int64
+	FinishedAt    time.Time
 }
 
 // RecordLookup reads a record from the same submit transaction that is
@@ -634,6 +639,62 @@ func (store *Store) RecordProcessClaim(id string, claim ProcessClaim) (Record, e
 	return result, err
 }
 
+// MarkEvidenceIncomplete durably records intent before a retirement receipt
+// write. If a prior receipt left the marker set, ErrEvidenceIncomplete prevents
+// a later observation from clearing that durable gap.
+func (store *Store) MarkEvidenceIncomplete(id string) (Record, error) {
+	return store.setEvidenceIncomplete(id, true)
+}
+
+// ClearEvidenceIncomplete removes a write-ahead marker only after its receipt
+// is durable. A terminal record is immutable, preserving a marker that raced
+// with cancellation or restart reconciliation.
+func (store *Store) ClearEvidenceIncomplete(id string) (Record, error) {
+	return store.setEvidenceIncomplete(id, false)
+}
+
+func (store *Store) setEvidenceIncomplete(id string, incomplete bool) (Record, error) {
+	if err := validateJobID(id); err != nil {
+		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+
+	var result Record
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if current.State.IsTerminal() {
+			return ErrTerminal
+		}
+		if current.EvidenceIncomplete == incomplete {
+			if incomplete {
+				return ErrEvidenceIncomplete
+			}
+			result = current
+			return nil
+		}
+
+		next := current
+		next.EvidenceIncomplete = incomplete
+		next.UpdatedAt = time.Now().UTC()
+		normalizeRecord(&next)
+		if err := validateRecord(next); err != nil {
+			return err
+		}
+		if err := putRecord(jobs, next); err != nil {
+			return err
+		}
+		result = next
+		return nil
+	})
+	return result, err
+}
+
 // RetireTurn atomically records one turn's common retirement evidence. It is
 // deliberately separate from the process-claim transaction: a daemon can stop
 // after a turn retires but before the job reaches terminal state, and restart
@@ -723,7 +784,8 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 			next.Cleanup = protocol.CleanupUncertain
 		}
 		next.Diagnostics = mergeTerminalDiagnostics(next.Retirement, terminal.Diagnostics)
-		next.EvidenceIncomplete = next.EvidenceIncomplete || terminal.EvidenceIncomplete
+		// next begins as current, deliberately preserving a write-ahead marker
+		// when cancellation or restart terminalizes between mark and clear.
 		applyTerminalPayload(&next, terminal)
 		if terminal.FinishedAt.IsZero() {
 			now := time.Now().UTC()
@@ -978,9 +1040,9 @@ func validateRecord(record Record) error {
 			return err
 		}
 	}
-	if record.EvidenceIncomplete && !record.State.IsTerminal() {
-		return fmt.Errorf("%w: incomplete evidence marker requires terminal state", ErrInvalid)
-	}
+	// A nonterminal marker is the durable write-ahead intent for a receipt.
+	// Keeping it valid across a crash lets restart reconciliation promote it to
+	// the terminal record instead of forgetting the evidence gap.
 	if !record.Cleanup.Valid() {
 		return fmt.Errorf("%w: invalid cleanup %q", ErrInvalid, record.Cleanup)
 	}

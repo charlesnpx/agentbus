@@ -32,30 +32,23 @@ type activeExecution struct {
 	// cross a process-launch boundary. A request that acquires it first keeps a
 	// queued/starting job from subsequently reaching Backend.Start or
 	// Session.Turn before its durable cancellation is committed.
-	launchMu                   sync.Mutex
-	mu                         sync.Mutex
-	cancel                     context.CancelFunc
-	session                    engine.Session
-	cancelRequested            bool
-	claimAttempted             bool
-	claimRecorded              bool
-	claimErr                   error
-	interruptOnce              sync.Once
-	interruptErr               error
-	itemCount                  int
-	lastItemAt                 time.Time
-	lastActivityAt             time.Time
-	turn                       *activeTurn
-	sidecarFinalizationPending bool
+	launchMu        sync.Mutex
+	mu              sync.Mutex
+	cancel          context.CancelFunc
+	session         engine.Session
+	cancelRequested bool
+	claimAttempted  bool
+	claimRecorded   bool
+	claimErr        error
+	interruptOnce   sync.Once
+	interruptErr    error
+	itemCount       int
+	lastItemAt      time.Time
+	lastActivityAt  time.Time
+	turn            *activeTurn
 
-	// receiptMu protects one aggregate of observations that is not known to be
-	// durable. The store call deliberately happens after this mutex is released.
-	receiptMu                 sync.Mutex
-	pendingRetirementReceipt  *jobstore.RetirementReceipt
-	receiptRevision           uint64
-	receiptSubmissionInFlight bool
-	retirementReceiptWriter   func(*jobstore.Store, string, jobstore.RetirementReceipt) error
-	itemSidecarWriterFactory  func(string, int, int64) *itemSidecarWriter
+	retirementReceiptWriter  func(*jobstore.Store, string, jobstore.RetirementReceipt) error
+	itemSidecarWriterFactory func(string, int, int64) *itemSidecarWriter
 }
 
 // activeTurn owns one turn's outcome while a later correction turn may replace
@@ -172,13 +165,13 @@ func (run *activeExecution) beginTurn() {
 	run.claimRecorded = false
 	run.claimErr = nil
 	run.turn = &activeTurn{done: make(chan struct{})}
-	run.sidecarFinalizationPending = true
 	run.mu.Unlock()
 }
 
 // retireTurn persists the current turn's common evidence before publishing its
-// completion. A failed persistence leaves the aggregate pending, which makes
-// the eventual terminal record conservative instead of blocking retirement.
+// completion. A failed persistence leaves its durable write-ahead marker set,
+// which makes eventual terminalization conservative without blocking
+// retirement.
 func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcome) turnOutcome {
 	if run == nil {
 		return outcome
@@ -204,27 +197,25 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 	return turn.outcome
 }
 
-// recordRetirementReceipt folds an observation into the one pending aggregate
-// and submits a snapshot. A later observation can make one immediate handoff
-// submission after an in-flight snapshot succeeds; there is no backoff loop or
-// finalization retry.
+// recordRetirementReceipt writes durable intent before the receipt it protects.
+// If the receipt, the later clear, or the daemon fails, the marker remains on
+// the record for cancellation or restart reconciliation to promote.
 func (run *activeExecution) recordRetirementReceipt(store *jobstore.Store, receipt jobstore.RetirementReceipt) {
 	if run == nil {
 		return
 	}
-	run.receiptMu.Lock()
-	if run.pendingRetirementReceipt == nil {
-		run.pendingRetirementReceipt = &jobstore.RetirementReceipt{}
+	if _, err := store.MarkEvidenceIncomplete(run.jobID); err != nil {
+		if !errors.Is(err, jobstore.ErrTerminal) && !errors.Is(err, jobstore.ErrEvidenceIncomplete) {
+			log.Printf("agentbus service: job %s retirement evidence marker write failed: %v", run.jobID, err)
+		}
+		return
 	}
-	foldRetirementReceipt(run.pendingRetirementReceipt, receipt)
-	run.receiptRevision++
-	run.receiptMu.Unlock()
-
-	if run.submitPendingRetirementReceipt(store) {
-		// A concurrent observation arrived while the first snapshot was in the
-		// store. One immediate follow-up folds it into the same aggregate; if
-		// that also races or fails, the terminal marker records the gap.
-		run.submitPendingRetirementReceipt(store)
+	if err := run.writeRetirementReceipt(store, receipt); err != nil {
+		log.Printf("agentbus service: job %s retirement receipt write failed: %v", run.jobID, err)
+		return
+	}
+	if _, err := store.ClearEvidenceIncomplete(run.jobID); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
+		log.Printf("agentbus service: job %s retirement evidence marker clear failed: %v", run.jobID, err)
 	}
 }
 
@@ -242,92 +233,6 @@ func (run *activeExecution) writeRetirementReceipt(store *jobstore.Store, receip
 	return err
 }
 
-// submitPendingRetirementReceipt snapshots the aggregate under receiptMu, then
-// releases it before entering bbolt. It reports whether one newer observation
-// arrived after a successful submission and needs an immediate handoff.
-func (run *activeExecution) submitPendingRetirementReceipt(store *jobstore.Store) bool {
-	if run == nil {
-		return false
-	}
-	run.receiptMu.Lock()
-	if run.pendingRetirementReceipt == nil || run.receiptSubmissionInFlight {
-		run.receiptMu.Unlock()
-		return false
-	}
-	receipt := cloneRetirementReceipt(*run.pendingRetirementReceipt)
-	revision := run.receiptRevision
-	run.receiptSubmissionInFlight = true
-	run.receiptMu.Unlock()
-
-	err := run.writeRetirementReceipt(store, receipt)
-
-	run.receiptMu.Lock()
-	run.receiptSubmissionInFlight = false
-	if err != nil {
-		run.receiptMu.Unlock()
-		log.Printf("agentbus service: job %s retirement receipt write failed: %v", run.jobID, err)
-		return false
-	}
-	if run.receiptRevision == revision {
-		run.pendingRetirementReceipt = nil
-		run.receiptMu.Unlock()
-		return false
-	}
-	run.receiptMu.Unlock()
-	return true
-}
-
-func cloneRetirementReceipt(receipt jobstore.RetirementReceipt) jobstore.RetirementReceipt {
-	receipt.Diagnostics = append([]string(nil), receipt.Diagnostics...)
-	return receipt
-}
-
-func foldRetirementReceipt(aggregate *jobstore.RetirementReceipt, observation jobstore.RetirementReceipt) {
-	if aggregate == nil {
-		return
-	}
-	if strings.TrimSpace(observation.BackendSessionID) != "" {
-		aggregate.BackendSessionID = observation.BackendSessionID
-	}
-	aggregate.CleanupUncertain = aggregate.CleanupUncertain || observation.CleanupUncertain
-	aggregate.Diagnostics = appendUniqueRetirementDiagnostics(aggregate.Diagnostics, observation.Diagnostics)
-}
-
-func appendUniqueRetirementDiagnostics(existing, incoming []string) []string {
-	for _, diagnostic := range incoming {
-		seen := false
-		for _, recorded := range existing {
-			if recorded == diagnostic {
-				seen = true
-				break
-			}
-		}
-		if !seen {
-			existing = append(existing, diagnostic)
-		}
-	}
-	return existing
-}
-
-// retirementEvidenceIncomplete reports whether cancellation might otherwise
-// commit a terminal record before all observed receipt or sidecar evidence is
-// known durable. It is a conservative check, never a wait barrier.
-func (run *activeExecution) retirementEvidenceIncomplete() bool {
-	if run == nil {
-		return true
-	}
-	run.receiptMu.Lock()
-	incomplete := run.pendingRetirementReceipt != nil || run.receiptSubmissionInFlight
-	run.receiptMu.Unlock()
-	if incomplete {
-		return true
-	}
-	run.mu.Lock()
-	incomplete = run.sidecarFinalizationPending
-	run.mu.Unlock()
-	return incomplete
-}
-
 func (run *activeExecution) newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarWriter {
 	if run != nil && run.itemSidecarWriterFactory != nil {
 		return run.itemSidecarWriterFactory(path, textCap, fileCap)
@@ -336,18 +241,11 @@ func (run *activeExecution) newItemSidecarWriter(path string, textCap int, fileC
 }
 
 // finalizeItemSidecar closes the shared sidecar once the execution is about to
-// terminalize. Its failure sink folds the diagnostic into the same receipt
-// aggregate; a failed store submission leaves the terminal marker conservative.
-func (run *activeExecution) finalizeItemSidecar(writer *itemSidecarWriter) {
+// terminalize. Its failure sink uses the same write-ahead receipt sequence.
+func (*activeExecution) finalizeItemSidecar(writer *itemSidecarWriter) {
 	if writer != nil {
 		writer.close()
 	}
-	if run == nil {
-		return
-	}
-	run.mu.Lock()
-	run.sidecarFinalizationPending = false
-	run.mu.Unlock()
 }
 
 func (run *activeExecution) interrupt() error {
@@ -1163,9 +1061,6 @@ func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstor
 		ResultBytes:  info.Bytes,
 		FinishedAt:   time.Now().UTC(),
 	}
-	if run != nil && run.retirementEvidenceIncomplete() {
-		terminal.EvidenceIncomplete = true
-	}
 	s.markTerminal(store, record.JobID, terminal)
 }
 
@@ -1181,9 +1076,6 @@ func (s *Server) recordExecutionFailure(store *jobstore.Store, record jobstore.R
 		Diagnostics:   diagnostics,
 		FinishedAt:    time.Now().UTC(),
 	}
-	if run != nil && run.retirementEvidenceIncomplete() {
-		terminal.EvidenceIncomplete = true
-	}
 	s.markTerminal(store, record.JobID, terminal)
 }
 
@@ -1193,9 +1085,6 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 	// backend stream race it with an interrupted, failed, or completed record.
 	if s.cancellationPending(jobID) {
 		return
-	}
-	if run := s.activeExecution(jobID); run != nil && run.retirementEvidenceIncomplete() {
-		terminal.EvidenceIncomplete = true
 	}
 	if home := s.takeManagedCodexHome(jobID); home != nil {
 		current, getErr := store.Get(jobID)

@@ -402,14 +402,21 @@ func TestJobCancelMarksIncompleteAfterRetirementReceiptFailure(t *testing.T) {
 
 	run := newActiveExecution(record.JobID, backend)
 	attempts := 0
-	run.retirementReceiptWriter = func(*jobstore.Store, string, jobstore.RetirementReceipt) error {
+	run.retirementReceiptWriter = func(store *jobstore.Store, jobID string, _ jobstore.RetirementReceipt) error {
 		attempts++
+		marked, err := store.Get(jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !marked.EvidenceIncomplete {
+			t.Fatalf("receipt attempt record = %#v, want durable write-ahead marker", marked)
+		}
 		return errors.New("temporary receipt store exhaustion")
 	}
 	run.beginTurn()
 	run.retireTurn(store, turnOutcome{cleanup: protocol.CleanupClean, diagnostics: []string{"turn evidence"}})
 	if attempts != 1 {
-		t.Fatalf("receipt write attempts = %d, want one immediate aggregate submission", attempts)
+		t.Fatalf("receipt write attempts = %d, want one write-ahead receipt attempt", attempts)
 	}
 
 	server.executionMu.Lock()
@@ -429,6 +436,52 @@ func TestJobCancelMarksIncompleteAfterRetirementReceiptFailure(t *testing.T) {
 	transcript := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
 	if !transcript.Gap {
 		t.Fatalf("transcript after receipt failure = %#v, want gap", transcript)
+	}
+}
+
+func TestRestartPromotesWriteAheadEvidenceMarker(t *testing.T) {
+	root := t.TempDir()
+	backend := &executionFakeBackend{name: "restart-write-ahead-marker"}
+	first := newTestServer(t, root, Config{Backends: []engine.Backend{backend}})
+	record := queuedExecutionRecord(t, first, backend.Name(), "write-ahead crash", nil)
+	store, err := first.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(record.JobID); err != nil {
+		t.Fatal(err)
+	}
+	run := newActiveExecution(record.JobID, backend)
+	run.retirementReceiptWriter = func(store *jobstore.Store, jobID string, receipt jobstore.RetirementReceipt) error {
+		if _, err := store.RetireTurn(jobID, receipt); err != nil {
+			return err
+		}
+		// Simulate a daemon crash after the receipt is durable and before its
+		// write-ahead marker can be cleared.
+		first.closeJobStore()
+		return nil
+	}
+	run.beginTurn()
+	run.retireTurn(store, turnOutcome{backendSessionID: "thread-crashed", cleanup: protocol.CleanupClean})
+
+	restarted := newTestServer(t, root, Config{Backends: []engine.Backend{backend}})
+	store, err = restarted.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.reconcileRecoveredJobs(store); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != protocol.PublicStateUnknown || !stored.EvidenceIncomplete || stored.BackendSessionID != "thread-crashed" {
+		t.Fatalf("reconciled write-ahead record = %#v, want unknown terminal record with the durable receipt and incomplete evidence", stored)
+	}
+	transcript := transcriptResultForTest(t, restarted, protocol.JobTranscriptParams{JobID: record.JobID})
+	if !transcript.Gap {
+		t.Fatalf("restarted transcript = %#v, want gap from surviving write-ahead marker", transcript)
 	}
 }
 
@@ -666,8 +719,12 @@ func TestRestartDuringCorrectionPreservesRetiredSessionForResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != protocol.PublicStateUnknown || stored.Cleanup != protocol.CleanupUncertain || stored.BackendSessionID != "thread-recovered" {
+	if stored.State != protocol.PublicStateUnknown || stored.Cleanup != protocol.CleanupUncertain || stored.BackendSessionID != "thread-recovered" || stored.EvidenceIncomplete {
 		t.Fatalf("reconciled running record = %#v", stored)
+	}
+	transcript := transcriptResultForTest(t, restarted, protocol.JobTranscriptParams{JobID: submitted.JobID})
+	if transcript.Gap {
+		t.Fatalf("healthy retired transcript = %#v, want no gap after marker clear", transcript)
 	}
 	params := submissionParams("restart-resume-workspace", "restart-resume-request", "restart-running", t.TempDir(), "continue")
 	params.TaskSpec.ResumeJobID = submitted.JobID

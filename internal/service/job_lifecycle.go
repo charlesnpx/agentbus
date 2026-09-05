@@ -143,21 +143,12 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 		return requestOutcome{result: protocol.JobCancelResult{JobID: record.JobID, State: projectedState(record)}}
 	}
 
-	run := s.activeExecution(record.JobID)
 	cleanup, diagnostics := s.cancelActiveOrRecordedProcess(store, record)
-	// A run with unfinalized evidence, or no run at all after a worker exited,
-	// cannot establish that its transcript is complete. Mark the terminal record
-	// conservatively instead of recreating a cancellation-side retry barrier.
-	evidenceIncomplete := run == nil
-	if run != nil {
-		evidenceIncomplete = run.retirementEvidenceIncomplete()
-	}
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
-		State:              protocol.PublicStateCanceled,
-		Cleanup:            cleanup,
-		Diagnostics:        diagnostics,
-		EvidenceIncomplete: evidenceIncomplete,
-		FinishedAt:         time.Now().UTC(),
+		State:       protocol.PublicStateCanceled,
+		Cleanup:     cleanup,
+		Diagnostics: diagnostics,
+		FinishedAt:  time.Now().UTC(),
 	})
 	if err != nil {
 		if errors.Is(err, jobstore.ErrTerminal) {
