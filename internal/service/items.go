@@ -19,6 +19,7 @@ const (
 	transcriptItemTextCap       = 4 * 1024
 	transcriptItemFileCap       = 16 * 1024 * 1024
 	itemSidecarDiagnosticPrefix = "item sidecar "
+	itemSidecarFailureSuffix    = ".failure"
 )
 
 var transcriptItemStopLine = []byte("{\"appendStopped\":true}\n")
@@ -138,7 +139,11 @@ func newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarW
 	if fileCap <= 0 {
 		fileCap = transcriptItemFileCap
 	}
-	writer := &itemSidecarWriter{path: path, textCap: textCap, fileCap: fileCap}
+	writer := &itemSidecarWriter{
+		path:    path,
+		textCap: textCap,
+		fileCap: fileCap,
+	}
 	if strings.TrimSpace(writer.path) == "" {
 		writer.noteFailure("open", fmt.Errorf("path is empty"))
 		return writer
@@ -268,9 +273,25 @@ func (writer *itemSidecarWriter) noteFailure(operation string, err error) {
 		_ = writer.file.Close()
 		writer.file = nil
 	}
+	writer.recordFailureMarker()
 	if writer.failureSink != nil {
 		writer.failureSink(writer.diagnostic)
 	}
+}
+
+// recordFailureMarker preserves a create-only signal when a deferred sidecar
+// close discovers a failure after the cancellation terminal record was written.
+// It is best effort: the marker can fail under the same broader filesystem
+// fault that stopped the sidecar.
+func (writer *itemSidecarWriter) recordFailureMarker() {
+	if writer == nil || strings.TrimSpace(writer.path) == "" {
+		return
+	}
+	file, err := os.OpenFile(itemSidecarFailurePath(writer.path), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		return
+	}
+	defer file.Close()
 }
 
 func (writer *itemSidecarWriter) close() {
@@ -300,6 +321,10 @@ func itemSidecarPath(stdoutPath string) (string, error) {
 		return "", fmt.Errorf("stdout log path %q is missing .stdout.log suffix", stdoutPath)
 	}
 	return base + ".items.jsonl", nil
+}
+
+func itemSidecarFailurePath(sidecarPath string) string {
+	return sidecarPath + itemSidecarFailureSuffix
 }
 
 // itemAssembler turns the normalized engine event stream into transcript
