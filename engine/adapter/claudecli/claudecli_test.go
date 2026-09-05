@@ -443,12 +443,12 @@ func TestClaudePartialAssistantTextEmitsExactlyOnce(t *testing.T) {
 		peer := newClaudePeer(t, proc)
 		peer.handshake()
 		peer.expectUser("stream")
-		emitMessage := func(id string, chunks ...string) {
+		emitMessage := func(chunks ...string) {
 			peer.write(map[string]any{
 				"type": "stream_event",
 				"event": map[string]any{
 					"type":    "message_start",
-					"message": map[string]any{"id": id, "role": "assistant"},
+					"message": map[string]any{"role": "assistant"},
 				},
 			})
 			for _, chunk := range chunks {
@@ -467,14 +467,13 @@ func TestClaudePartialAssistantTextEmitsExactlyOnce(t *testing.T) {
 			peer.write(map[string]any{
 				"type": "assistant",
 				"message": map[string]any{
-					"id":      id,
 					"role":    "assistant",
 					"content": []any{map[string]any{"type": "text", "text": strings.Join(chunks, "")}},
 				},
 			})
 		}
-		emitMessage("msg-one", "first ", "message")
-		emitMessage("msg-two", "second ", "message")
+		emitMessage("first ", "message")
+		emitMessage("second ", "message")
 		peer.emitResult("success", false, "done")
 	})
 
@@ -492,6 +491,122 @@ func TestClaudePartialAssistantTextEmitsExactlyOnce(t *testing.T) {
 	}
 	if text := strings.Join(agentText, "|"); text != "first |message|second |message" {
 		t.Fatalf("agent text = %#v, want each partial chunk exactly once", agentText)
+	}
+	if resultText(got) != "done" {
+		t.Fatalf("events = %#v, want result done", got)
+	}
+}
+
+func TestClaudeIdentifiedPartialsWithIDlessCompletedAssistantEmitExactlyOnce(t *testing.T) {
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("identified partials")
+		peer.write(map[string]any{
+			"type": "stream_event",
+			"event": map[string]any{
+				"type":    "message_start",
+				"message": map[string]any{"id": "msg-identified", "role": "assistant"},
+			},
+		})
+		for _, chunk := range []string{"identified ", "partials"} {
+			peer.write(map[string]any{
+				"type": "stream_event",
+				"event": map[string]any{
+					"type":  "content_block_delta",
+					"delta": map[string]any{"type": "text_delta", "text": chunk},
+				},
+			})
+		}
+		peer.write(map[string]any{
+			"type":  "stream_event",
+			"event": map[string]any{"type": "message_stop"},
+		})
+		peer.write(map[string]any{
+			"type": "assistant",
+			"message": map[string]any{
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "text", "text": "identified partials"},
+					map[string]any{"type": "tool_use", "name": "Bash", "input": map[string]any{"command": "git status"}},
+				},
+			},
+		})
+		peer.emitResult("success", false, "done")
+	})
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "identified partials"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	var agentText []string
+	for _, event := range got {
+		if event.Type == engine.EventAgentText {
+			agentText = append(agentText, event.Text)
+		}
+	}
+	if text := strings.Join(agentText, "|"); text != "identified |partials" {
+		t.Fatalf("agent text = %#v, want identified partial chunks exactly once", agentText)
+	}
+	if !containsToolUse(got, "Bash", "git status") {
+		t.Fatalf("events = %#v, want tool use from completed assistant frame", got)
+	}
+	if resultText(got) != "done" {
+		t.Fatalf("events = %#v, want result done", got)
+	}
+}
+
+func TestClaudeUnidentifiedPartialsEmitExactlyOnce(t *testing.T) {
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("unidentified partials")
+		peer.write(map[string]any{
+			"type": "stream_event",
+			"event": map[string]any{
+				"type":    "message_start",
+				"message": map[string]any{"role": "assistant"},
+			},
+		})
+		for _, chunk := range []string{"without ", "ids"} {
+			peer.write(map[string]any{
+				"type": "stream_event",
+				"event": map[string]any{
+					"type":  "content_block_delta",
+					"delta": map[string]any{"type": "text_delta", "text": chunk},
+				},
+			})
+		}
+		peer.write(map[string]any{
+			"type":  "stream_event",
+			"event": map[string]any{"type": "message_stop"},
+		})
+		peer.write(map[string]any{
+			"type": "assistant",
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": []any{map[string]any{"type": "text", "text": "without ids"}},
+			},
+		})
+		peer.emitResult("success", false, "done")
+	})
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "unidentified partials"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	var agentText []string
+	for _, event := range got {
+		if event.Type == engine.EventAgentText {
+			agentText = append(agentText, event.Text)
+		}
+	}
+	if text := strings.Join(agentText, "|"); text != "without |ids" {
+		t.Fatalf("agent text = %#v, want unidentified partial chunks exactly once", agentText)
 	}
 	if resultText(got) != "done" {
 		t.Fatalf("events = %#v, want result done", got)

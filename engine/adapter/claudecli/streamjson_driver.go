@@ -26,13 +26,15 @@ type streamJSONDriver struct {
 }
 
 type claudeStream struct {
-	driver                *streamJSONDriver
-	conn                  *duplex.Conn
-	emit                  duplex.EmitFunc
-	pending               []duplex.Frame
-	lastProgress          time.Time
-	partialMessageID      string
-	partialAgentDeltaByID map[string]bool
+	driver       *streamJSONDriver
+	conn         *duplex.Conn
+	emit         duplex.EmitFunc
+	pending      []duplex.Frame
+	lastProgress time.Time
+	// Claude is assumed to send a completed assistant frame before the next
+	// message_start. If it does not, this flag could suppress that later
+	// message's completed text after the prior message emitted partial text.
+	partialAgentTextEmitted bool
 }
 
 func newStreamJSONDriver(binary string) *streamJSONDriver {
@@ -323,7 +325,8 @@ func (s *claudeStream) emitModelReported(obj map[string]any) {
 
 func (s *claudeStream) emitAssistant(obj map[string]any) {
 	msg, _ := firstMap(obj, "message")
-	hasAgentDelta := s.hasPartialAgentDelta(msg)
+	hasAgentDelta := s.partialAgentTextEmitted
+	s.partialAgentTextEmitted = false
 	content := anySlice(msg["content"])
 	if len(content) == 0 {
 		if !hasAgentDelta {
@@ -371,52 +374,21 @@ func (s *claudeStream) emitPartialAssistant(obj map[string]any) {
 	}
 	switch strings.ToLower(firstString(event, "type")) {
 	case "message_start":
-		s.partialMessageID = streamEventMessageID(event)
+		s.partialAgentTextEmitted = false
 	case "content_block_delta":
-		if id := streamEventMessageID(event); id != "" {
-			s.partialMessageID = id
-		}
 		s.emitPartialAgentText(event, obj)
-	case "message_stop":
-		s.partialMessageID = ""
 	}
 }
 
 func (s *claudeStream) emitPartialAgentText(event, metadata map[string]any) {
-	// The completed assistant frame is suppressed by message ID. Do not emit a
-	// partial chunk until that ID is known, because an unidentifiable chunk
-	// cannot be safely de-duplicated later.
-	if s.partialMessageID == "" {
-		return
-	}
 	delta, ok := firstMap(event, "delta")
 	if !ok || strings.ToLower(firstString(delta, "type")) != "text_delta" {
 		return
 	}
 	if text := firstString(delta, "text"); text != "" {
-		if s.partialAgentDeltaByID == nil {
-			s.partialAgentDeltaByID = make(map[string]bool)
-		}
-		s.partialAgentDeltaByID[s.partialMessageID] = true
+		s.partialAgentTextEmitted = true
 		s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: metadata})
 	}
-}
-
-func (s *claudeStream) hasPartialAgentDelta(message map[string]any) bool {
-	return s.partialAgentDeltaByID[assistantMessageID(message)]
-}
-
-func streamEventMessageID(event map[string]any) string {
-	if message, ok := firstMap(event, "message"); ok {
-		if id := assistantMessageID(message); id != "" {
-			return id
-		}
-	}
-	return strings.TrimSpace(firstString(event, "message_id", "messageId"))
-}
-
-func assistantMessageID(message map[string]any) string {
-	return strings.TrimSpace(firstString(message, "id", "message_id", "messageId"))
 }
 
 func (s *claudeStream) emitToolResults(obj map[string]any) {
