@@ -58,7 +58,7 @@ func TestClaudeStreamJSONArgvAndPermissionProfiles(t *testing.T) {
 	assertArgValue(t, readOnlySpec.Argv, "--permission-mode", "dontAsk")
 	assertNotContainsArg(t, readOnlySpec.Argv, "--cwd")
 	assertNotContainsArg(t, readOnlySpec.Argv, "--replay-user-messages")
-	assertNotContainsArg(t, readOnlySpec.Argv, "--include-partial-messages")
+	assertContainsArg(t, readOnlySpec.Argv, "--include-partial-messages")
 	assertNotContainsArg(t, readOnlySpec.Argv, "--dangerously-skip-permissions")
 
 	session = startFakeClaudeSession(t, engine.SessionOpts{CWD: cwd})
@@ -406,6 +406,21 @@ func TestClaudeAnswersControlRequestsAndMapsAssistantEvents(t *testing.T) {
 		}
 
 		peer.emitAssistant("assistant text", "Bash", map[string]any{"command": "git status"})
+		peer.write(map[string]any{
+			"type": "user",
+			"message": map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type":        "tool_result",
+						"tool_use_id": "toolu-status",
+						"content": []any{
+							map[string]any{"type": "text", "text": "working tree clean"},
+						},
+					},
+				},
+			},
+		})
 		peer.emitResult("success", false, "done")
 	})
 
@@ -415,8 +430,68 @@ func TestClaudeAnswersControlRequestsAndMapsAssistantEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
-	if !containsModel(got, "claude-sonnet") || !containsEvent(got, engine.EventAgentText, "assistant text") || !containsToolUse(got, "Bash", "git status") {
-		t.Fatalf("events = %#v, want model, assistant text, and tool use", got)
+	if !containsModel(got, "claude-sonnet") || !containsEvent(got, engine.EventAgentText, "assistant text") || !containsToolUse(got, "Bash", "git status") || !containsToolResult(got, "toolu-status", "working tree clean") {
+		t.Fatalf("events = %#v, want model, assistant text, tool use, and tool result", got)
+	}
+	if resultText(got) != "done" {
+		t.Fatalf("events = %#v, want result done", got)
+	}
+}
+
+func TestClaudePartialAssistantTextEmitsExactlyOnce(t *testing.T) {
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("stream")
+		emitMessage := func(id string, chunks ...string) {
+			peer.write(map[string]any{
+				"type": "stream_event",
+				"event": map[string]any{
+					"type":    "message_start",
+					"message": map[string]any{"id": id, "role": "assistant"},
+				},
+			})
+			for _, chunk := range chunks {
+				peer.write(map[string]any{
+					"type": "stream_event",
+					"event": map[string]any{
+						"type":  "content_block_delta",
+						"delta": map[string]any{"type": "text_delta", "text": chunk},
+					},
+				})
+			}
+			peer.write(map[string]any{
+				"type":  "stream_event",
+				"event": map[string]any{"type": "message_stop"},
+			})
+			peer.write(map[string]any{
+				"type": "assistant",
+				"message": map[string]any{
+					"id":      id,
+					"role":    "assistant",
+					"content": []any{map[string]any{"type": "text", "text": strings.Join(chunks, "")}},
+				},
+			})
+		}
+		emitMessage("msg-one", "first ", "message")
+		emitMessage("msg-two", "second ", "message")
+		peer.emitResult("success", false, "done")
+	})
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "stream"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	var agentText []string
+	for _, event := range got {
+		if event.Type == engine.EventAgentText {
+			agentText = append(agentText, event.Text)
+		}
+	}
+	if text := strings.Join(agentText, "|"); text != "first |message|second |message" {
+		t.Fatalf("agent text = %#v, want each partial chunk exactly once", agentText)
 	}
 	if resultText(got) != "done" {
 		t.Fatalf("events = %#v, want result done", got)
@@ -445,6 +520,10 @@ func TestClaudeThinkingFramesEmitRateLimitedProgress(t *testing.T) {
 	}
 	if progress[0].Text != "" || progress[0].Metadata != nil {
 		t.Fatalf("progress event = %#v, want no text or metadata", progress[0])
+	}
+	reasoning := eventsOfType(got, engine.EventReasoning)
+	if len(reasoning) != 2 || reasoning[0].Text != "first private thought" || reasoning[1].Text != "second private thought" {
+		t.Fatalf("reasoning events = %#v, want both thinking texts", reasoning)
 	}
 	if resultText(got) != "done" {
 		t.Fatalf("events = %#v, want result done", got)
@@ -944,6 +1023,15 @@ func containsModel(events []engine.Event, model string) bool {
 func containsToolUse(events []engine.Event, name, textSub string) bool {
 	for _, ev := range events {
 		if ev.Type == engine.EventToolUse && ev.Name == name && strings.Contains(ev.Text, textSub) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsToolResult(events []engine.Event, name, textSub string) bool {
+	for _, ev := range events {
+		if ev.Type == engine.EventToolResult && ev.Name == name && strings.Contains(ev.Text, textSub) {
 			return true
 		}
 	}

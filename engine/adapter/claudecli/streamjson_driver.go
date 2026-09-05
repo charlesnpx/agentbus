@@ -26,11 +26,13 @@ type streamJSONDriver struct {
 }
 
 type claudeStream struct {
-	driver       *streamJSONDriver
-	conn         *duplex.Conn
-	emit         duplex.EmitFunc
-	pending      []duplex.Frame
-	lastProgress time.Time
+	driver                *streamJSONDriver
+	conn                  *duplex.Conn
+	emit                  duplex.EmitFunc
+	pending               []duplex.Frame
+	lastProgress          time.Time
+	partialMessageID      string
+	partialAgentDeltaByID map[string]bool
 }
 
 func newStreamJSONDriver(binary string) *streamJSONDriver {
@@ -48,6 +50,7 @@ func (d *streamJSONDriver) ExecSpec(resumeID string, opts engine.SessionOpts, in
 		"stream-json",
 		"--output-format",
 		"stream-json",
+		"--include-partial-messages",
 		"--verbose",
 	}
 	if opts.Model != "" {
@@ -243,17 +246,23 @@ func (s *claudeStream) handleFrame(ctx context.Context, frame duplex.Frame, sess
 	}
 	frameType := strings.ToLower(firstString(obj, "type"))
 	if isClaudeProgressFrameType(frameType) {
-		s.emitProgress()
+		s.emitThinking(obj, obj)
 		return false, nil
 	}
 	switch frameType {
 	case "control_request":
 		_, err := s.handleControlRequest(ctx, obj)
 		return false, err
-	case "control_response", "user":
+	case "control_response":
+		return false, nil
+	case "user":
+		s.emitToolResults(obj)
 		return false, nil
 	case "system":
 		s.emitModelReported(obj)
+		return false, nil
+	case "stream_event":
+		s.emitPartialAssistant(obj)
 		return false, nil
 	case "assistant":
 		s.emitAssistant(obj)
@@ -314,10 +323,13 @@ func (s *claudeStream) emitModelReported(obj map[string]any) {
 
 func (s *claudeStream) emitAssistant(obj map[string]any) {
 	msg, _ := firstMap(obj, "message")
+	hasAgentDelta := s.hasPartialAgentDelta(msg)
 	content := anySlice(msg["content"])
 	if len(content) == 0 {
-		if text := textFrom(obj); text != "" {
-			s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
+		if !hasAgentDelta {
+			if text := textFrom(obj); text != "" {
+				s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
+			}
 		}
 		return
 	}
@@ -328,13 +340,15 @@ func (s *claudeStream) emitAssistant(obj map[string]any) {
 		}
 		blockType := strings.ToLower(firstString(block, "type"))
 		if isClaudeProgressFrameType(blockType) {
-			s.emitProgress()
+			s.emitThinking(block, obj)
 			continue
 		}
 		switch blockType {
 		case "text":
-			if text := textValue(block["text"]); text != "" {
-				s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
+			if !hasAgentDelta {
+				if text := textValue(block["text"]); text != "" {
+					s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
+				}
 			}
 		case "tool_use":
 			name := firstString(block, "name")
@@ -348,6 +362,90 @@ func (s *claudeStream) emitAssistant(obj map[string]any) {
 			s.emitEvent(engine.Event{Type: engine.EventToolUse, Name: name, Text: text, Metadata: obj})
 		}
 	}
+}
+
+func (s *claudeStream) emitPartialAssistant(obj map[string]any) {
+	event, ok := firstMap(obj, "event")
+	if !ok {
+		return
+	}
+	switch strings.ToLower(firstString(event, "type")) {
+	case "message_start":
+		s.partialMessageID = streamEventMessageID(event)
+	case "content_block_delta":
+		if id := streamEventMessageID(event); id != "" {
+			s.partialMessageID = id
+		}
+		s.emitPartialAgentText(event, obj)
+	case "message_stop":
+		s.partialMessageID = ""
+	}
+}
+
+func (s *claudeStream) emitPartialAgentText(event, metadata map[string]any) {
+	// The completed assistant frame is suppressed by message ID. Do not emit a
+	// partial chunk until that ID is known, because an unidentifiable chunk
+	// cannot be safely de-duplicated later.
+	if s.partialMessageID == "" {
+		return
+	}
+	delta, ok := firstMap(event, "delta")
+	if !ok || strings.ToLower(firstString(delta, "type")) != "text_delta" {
+		return
+	}
+	if text := firstString(delta, "text"); text != "" {
+		if s.partialAgentDeltaByID == nil {
+			s.partialAgentDeltaByID = make(map[string]bool)
+		}
+		s.partialAgentDeltaByID[s.partialMessageID] = true
+		s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: metadata})
+	}
+}
+
+func (s *claudeStream) hasPartialAgentDelta(message map[string]any) bool {
+	return s.partialAgentDeltaByID[assistantMessageID(message)]
+}
+
+func streamEventMessageID(event map[string]any) string {
+	if message, ok := firstMap(event, "message"); ok {
+		if id := assistantMessageID(message); id != "" {
+			return id
+		}
+	}
+	return strings.TrimSpace(firstString(event, "message_id", "messageId"))
+}
+
+func assistantMessageID(message map[string]any) string {
+	return strings.TrimSpace(firstString(message, "id", "message_id", "messageId"))
+}
+
+func (s *claudeStream) emitToolResults(obj map[string]any) {
+	message, _ := firstMap(obj, "message")
+	for _, item := range anySlice(message["content"]) {
+		block, ok := item.(map[string]any)
+		if !ok || strings.ToLower(firstString(block, "type")) != "tool_result" {
+			continue
+		}
+		text := textValue(block["content"])
+		if text == "" {
+			text = textValue(block["text"])
+		}
+		s.emitEvent(engine.Event{
+			Type:     engine.EventToolResult,
+			Name:     firstString(block, "tool_use_id", "toolUseId", "id"),
+			Text:     text,
+			Metadata: obj,
+		})
+	}
+}
+
+func (s *claudeStream) emitThinking(source, metadata map[string]any) {
+	if text := firstString(source, "thinking", "text", "content"); text != "" {
+		s.emitEvent(engine.Event{Type: engine.EventReasoning, Text: text, Metadata: metadata})
+	}
+	// Preserve the existing rate-limited liveness signal for callers that use
+	// Progress independently of textual reasoning (including empty frames).
+	s.emitProgress()
 }
 
 func (s *claudeStream) emitResult(obj map[string]any) {

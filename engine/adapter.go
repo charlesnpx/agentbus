@@ -93,6 +93,8 @@ type TurnFinalObservation struct {
 const (
 	EventAgentText     = "AgentText"
 	EventToolUse       = "ToolUse"
+	EventToolResult    = "ToolResult"
+	EventReasoning     = "Reasoning"
 	EventWarning       = "Warning"
 	EventModelReported = "ModelReported"
 	EventResultMessage = "ResultMessage"
