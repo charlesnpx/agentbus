@@ -27,7 +27,9 @@ type transcriptItemKind string
 
 const (
 	transcriptItemMessage    transcriptItemKind = "message"
+	transcriptItemReasoning  transcriptItemKind = "reasoning"
 	transcriptItemTool       transcriptItemKind = "tool"
+	transcriptItemToolResult transcriptItemKind = "toolResult"
 	transcriptItemFileChange transcriptItemKind = "fileChange"
 	transcriptItemWarning    transcriptItemKind = "warning"
 	transcriptItemError      transcriptItemKind = "error"
@@ -340,9 +342,15 @@ func (assembler *itemAssembler) absorb(event engine.Event, rawText string) {
 	case engine.EventResultMessage:
 		assembler.flushMessage()
 		assembler.append(transcriptItemMessage, "", rawText, false)
+	case engine.EventReasoning:
+		assembler.flushMessage()
+		assembler.append(transcriptItemReasoning, "", rawText, false)
 	case engine.EventToolUse:
 		assembler.flushMessage()
 		assembler.append(transcriptItemTool, event.Name, rawText, false)
+	case engine.EventToolResult:
+		assembler.flushMessage()
+		assembler.append(transcriptItemToolResult, event.Name, rawText, false)
 	case engine.EventWarning:
 		assembler.flushMessage()
 		assembler.append(transcriptItemWarning, "", rawText, false)

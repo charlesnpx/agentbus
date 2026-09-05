@@ -44,8 +44,19 @@ func TestJobTranscriptDefaultDigestSurvivesTerminalState(t *testing.T) {
 	if result.State != protocol.PublicStateCompleted || result.ItemCount != len(items) || result.Gap {
 		t.Fatalf("terminal transcript summary = %#v", result)
 	}
-	if result.Counts["tool"] != 6 || result.Counts["message"] != 6 || result.Counts["error"] != 1 || result.Counts["warning"] != 0 || result.Counts["fileChange"] != 0 {
-		t.Fatalf("digest counts = %#v", result.Counts)
+	wantCounts := map[string]int{
+		"message":    6,
+		"reasoning":  0,
+		"tool":       6,
+		"toolResult": 0,
+		"fileChange": 0,
+		"warning":    0,
+		"error":      1,
+	}
+	for kind, want := range wantCounts {
+		if got, ok := result.Counts[kind]; !ok || got != want {
+			t.Fatalf("digest count for %q = %d, present=%t, want %d: %#v", kind, got, ok, want, result.Counts)
+		}
 	}
 	if result.FirstAt == nil || !result.FirstAt.Equal(items[0].At) || result.LastAt == nil || !result.LastAt.Equal(items[len(items)-1].At) {
 		t.Fatalf("digest bounds = first:%v last:%v", result.FirstAt, result.LastAt)
@@ -62,10 +73,12 @@ func TestJobTranscriptFiltersNarrowAndCombine(t *testing.T) {
 	items := []protocol.TranscriptItem{
 		transcriptTestItem(1, start, "message"),
 		transcriptTestItem(2, start.Add(time.Second), "tool"),
-		transcriptTestItem(3, start.Add(2*time.Second), "message"),
-		transcriptTestItem(4, start.Add(3*time.Second), "warning"),
+		transcriptTestItem(3, start.Add(2*time.Second), "reasoning"),
+		transcriptTestItem(4, start.Add(3*time.Second), "toolResult"),
 		transcriptTestItem(5, start.Add(4*time.Second), "message"),
-		transcriptTestItem(6, start.Add(5*time.Second), "error"),
+		transcriptTestItem(6, start.Add(5*time.Second), "warning"),
+		transcriptTestItem(7, start.Add(6*time.Second), "message"),
+		transcriptTestItem(8, start.Add(7*time.Second), "error"),
 	}
 	writeTranscriptSidecar(t, record, items, false)
 
@@ -76,24 +89,35 @@ func TestJobTranscriptFiltersNarrowAndCombine(t *testing.T) {
 		params protocol.JobTranscriptParams
 		want   []int
 	}{
-		{name: "kinds", params: protocol.JobTranscriptParams{Kinds: []string{"message"}}, want: []int{1, 3, 5}},
-		{name: "since", params: protocol.JobTranscriptParams{Since: timePointer(items[1].At)}, want: []int{3, 4, 5, 6}},
-		{name: "since ordinal", params: protocol.JobTranscriptParams{SinceOrdinal: intPointer(3)}, want: []int{4, 5, 6}},
-		{name: "last", params: protocol.JobTranscriptParams{Last: intPointer(2)}, want: []int{5, 6}},
+		{name: "kinds", params: protocol.JobTranscriptParams{Kinds: []string{"message"}}, want: []int{1, 5, 7}},
+		{name: "reasoning kind", params: protocol.JobTranscriptParams{Kinds: []string{"reasoning"}}, want: []int{3}},
+		{name: "tool-result kind", params: protocol.JobTranscriptParams{Kinds: []string{"toolResult"}}, want: []int{4}},
+		{name: "since", params: protocol.JobTranscriptParams{Since: timePointer(items[1].At)}, want: []int{3, 4, 5, 6, 7, 8}},
+		{name: "since ordinal", params: protocol.JobTranscriptParams{SinceOrdinal: intPointer(3)}, want: []int{4, 5, 6, 7, 8}},
+		{name: "last", params: protocol.JobTranscriptParams{Last: intPointer(2)}, want: []int{7, 8}},
 		{name: "limit", params: protocol.JobTranscriptParams{Limit: intPointer(2)}, want: []int{1, 2}},
 		{name: "combined", params: protocol.JobTranscriptParams{
 			Kinds:        []string{"message"},
 			Since:        timePointer(items[1].At),
 			SinceOrdinal: intPointer(2),
 			Last:         intPointer(1),
-		}, want: []int{5}},
+		}, want: []int{7}},
 	} {
 		test.params.JobID = record.JobID
 		result := transcriptResultForTest(t, server, test.params)
 		if got := transcriptOrdinals(result.Items); !reflect.DeepEqual(got, test.want) {
 			t.Fatalf("%s item ordinals = %v, want %v", test.name, got, test.want)
 		}
-		if result.ItemCount != len(items) || result.Counts["tool"] != 1 || result.Counts["message"] != 3 {
+		wantCounts := map[string]int{
+			"message":    3,
+			"reasoning":  1,
+			"tool":       1,
+			"toolResult": 1,
+			"fileChange": 0,
+			"warning":    1,
+			"error":      1,
+		}
+		if result.ItemCount != len(items) || !reflect.DeepEqual(result.Counts, wantCounts) {
 			t.Fatalf("%s metadata unexpectedly narrowed = %#v", test.name, result)
 		}
 	}
@@ -122,7 +146,7 @@ func TestJobTranscriptReportsGapAndMissingSidecar(t *testing.T) {
 		if result.Gap != test.wantGap || result.ItemCount != test.wantItemCount {
 			t.Fatalf("%s transcript = %#v", test.name, result)
 		}
-		if test.wantItemCount == 0 && (len(result.Items) != 0 || result.FirstAt != nil || result.LastAt != nil || result.Counts["message"] != 0 || result.Counts["tool"] != 0 || result.Counts["fileChange"] != 0 || result.Counts["warning"] != 0 || result.Counts["error"] != 0) {
+		if test.wantItemCount == 0 && (len(result.Items) != 0 || result.FirstAt != nil || result.LastAt != nil || result.Counts["message"] != 0 || result.Counts["reasoning"] != 0 || result.Counts["tool"] != 0 || result.Counts["toolResult"] != 0 || result.Counts["fileChange"] != 0 || result.Counts["warning"] != 0 || result.Counts["error"] != 0) {
 			t.Fatalf("missing transcript = %#v, want an empty zero-count digest", result)
 		}
 	}

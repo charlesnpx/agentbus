@@ -25,7 +25,9 @@ const (
 
 var transcriptKinds = map[string]struct{}{
 	string(transcriptItemMessage):    {},
+	string(transcriptItemReasoning):  {},
 	string(transcriptItemTool):       {},
+	string(transcriptItemToolResult): {},
 	string(transcriptItemFileChange): {},
 	string(transcriptItemWarning):    {},
 	string(transcriptItemError):      {},
@@ -134,7 +136,9 @@ func transcriptSidecarPath(record jobstore.Record) (string, bool, error) {
 func newTranscriptCounts() map[string]int {
 	return map[string]int{
 		string(transcriptItemMessage):    0,
+		string(transcriptItemReasoning):  0,
 		string(transcriptItemTool):       0,
+		string(transcriptItemToolResult): 0,
 		string(transcriptItemFileChange): 0,
 		string(transcriptItemWarning):    0,
 		string(transcriptItemError):      0,

@@ -188,7 +188,7 @@ func TestTranscriptItemsSuppressWorkspaceWriteText(t *testing.T) {
 	}
 }
 
-func TestTranscriptItemsCapText(t *testing.T) {
+func TestTranscriptItemsCapTextAndDoNotCoalesceReasoningOrToolResults(t *testing.T) {
 	prefix := strings.Repeat("x", transcriptItemTextCap-1)
 	tooLong := prefix + "€"
 	backend := &executionFakeBackend{name: "items-cap"}
@@ -200,6 +200,10 @@ func TestTranscriptItemsCapText(t *testing.T) {
 					engine.Event{Type: engine.EventAgentText, Text: prefix},
 					engine.Event{Type: engine.EventAgentText, Text: "€"},
 					engine.Event{Type: engine.EventToolUse, Name: "large-output", Text: tooLong},
+					engine.Event{Type: engine.EventReasoning, Text: tooLong},
+					engine.Event{Type: engine.EventReasoning, Text: tooLong},
+					engine.Event{Type: engine.EventToolResult, Text: tooLong},
+					engine.Event{Type: engine.EventToolResult, Text: tooLong},
 				), nil
 			},
 		}, nil
@@ -209,10 +213,24 @@ func TestTranscriptItemsCapText(t *testing.T) {
 	runExecution(t, server, record)
 
 	items := readTranscriptItems(t, record)
-	if len(items) != 2 {
-		t.Fatalf("item count = %d, want 2: %#v", len(items), items)
+	want := []struct {
+		kind transcriptItemKind
+		name string
+	}{
+		{kind: transcriptItemMessage},
+		{kind: transcriptItemTool, name: "large-output"},
+		{kind: transcriptItemReasoning},
+		{kind: transcriptItemReasoning},
+		{kind: transcriptItemToolResult},
+		{kind: transcriptItemToolResult},
 	}
-	for _, item := range items {
+	if len(items) != len(want) {
+		t.Fatalf("item count = %d, want %d: %#v", len(items), len(want), items)
+	}
+	for index, item := range items {
+		if item.Kind != string(want[index].kind) || item.Name != want[index].name {
+			t.Fatalf("item %d = %+v, want kind %q and name %q", index, item, want[index].kind, want[index].name)
+		}
 		if len(item.Text) > transcriptItemTextCap || !utf8.ValidString(item.Text) || item.Text != prefix || !item.Truncated {
 			t.Fatalf("capped item = %+v, want valid %d-byte-or-less text ending before the partial rune", item, transcriptItemTextCap)
 		}

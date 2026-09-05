@@ -404,7 +404,6 @@ func (s *claudeStream) emitToolResults(obj map[string]any) {
 		}
 		s.emitEvent(engine.Event{
 			Type:     engine.EventToolResult,
-			Name:     firstString(block, "tool_use_id", "toolUseId", "id"),
 			Text:     text,
 			Metadata: obj,
 		})

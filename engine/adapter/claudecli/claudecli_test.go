@@ -430,7 +430,7 @@ func TestClaudeAnswersControlRequestsAndMapsAssistantEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := collectEventsWithTimeout(t, events, 2*time.Second)
-	if !containsModel(got, "claude-sonnet") || !containsEvent(got, engine.EventAgentText, "assistant text") || !containsToolUse(got, "Bash", "git status") || !containsToolResult(got, "toolu-status", "working tree clean") {
+	if !containsModel(got, "claude-sonnet") || !containsEvent(got, engine.EventAgentText, "assistant text") || !containsToolUse(got, "Bash", "git status") || !containsToolResult(got, "working tree clean") {
 		t.Fatalf("events = %#v, want model, assistant text, tool use, and tool result", got)
 	}
 	if resultText(got) != "done" {
@@ -1144,9 +1144,9 @@ func containsToolUse(events []engine.Event, name, textSub string) bool {
 	return false
 }
 
-func containsToolResult(events []engine.Event, name, textSub string) bool {
+func containsToolResult(events []engine.Event, textSub string) bool {
 	for _, ev := range events {
-		if ev.Type == engine.EventToolResult && ev.Name == name && strings.Contains(ev.Text, textSub) {
+		if ev.Type == engine.EventToolResult && ev.Name == "" && strings.Contains(ev.Text, textSub) {
 			return true
 		}
 	}
