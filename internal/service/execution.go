@@ -602,7 +602,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			run.retireTurn(store, turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean})
 			return
 		}
-		outcome := collectTurn(jobCtx, run, events, items)
+		outcome := collectTurn(s, jobCtx, run, events, items)
 		outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 		run.retireTurn(store, outcome)
 		return
@@ -618,7 +618,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		return
 	}
 
-	outcome := collectTurn(jobCtx, run, events, items)
+	outcome := collectTurn(s, jobCtx, run, events, items)
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 	outcome = run.retireTurn(store, outcome)
 	if run.cancellationRequested() {
@@ -845,7 +845,7 @@ func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record
 			outcome = run.retireTurn(store, outcome)
 			return outcome
 		}
-		outcome := collectTurn(ctx, run, events, items)
+		outcome := collectTurn(s, ctx, run, events, items)
 		outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 		outcome = run.retireTurn(store, outcome)
 		return outcome
@@ -860,7 +860,7 @@ func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record
 		return outcome
 	}
 
-	outcome := collectTurn(ctx, run, events, items)
+	outcome := collectTurn(s, ctx, run, events, items)
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
 	outcome = run.retireTurn(store, outcome)
 	return outcome
@@ -929,7 +929,7 @@ type turnOutcome struct {
 	diagnostics      []string
 }
 
-func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine.Event, items *itemAssembler) turnOutcome {
+func collectTurn(s *Server, ctx context.Context, run *activeExecution, events <-chan engine.Event, items *itemAssembler) turnOutcome {
 	outcome := turnOutcome{cleanup: protocol.CleanupClean}
 	defer items.finishTurn()
 	if events == nil {
@@ -946,7 +946,7 @@ func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine
 				outcome.cleanup = protocol.CleanupUncertain
 				outcome.diagnostics = append(outcome.diagnostics, "backend cleanup: "+err.Error())
 			}
-			if drainTurnEvents(run, events, &outcome, &assistant, &result, &hasResult, items) {
+			if drainTurnEvents(s, run, events, &outcome, &assistant, &result, &hasResult, items) {
 				outcome.text = attemptFinalText(hasResult, result, assistant.String())
 			} else {
 				outcome.cleanup = protocol.CleanupUncertain
@@ -965,8 +965,15 @@ func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine
 	}
 }
 
-func drainTurnEvents(run *activeExecution, events <-chan engine.Event, outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool, items *itemAssembler) bool {
-	timer := time.NewTimer(engine.DefaultCancelGrace)
+func (s *Server) turnDrainCancellationGrace() time.Duration {
+	if s != nil && s.turnDrainGrace > 0 {
+		return s.turnDrainGrace
+	}
+	return engine.DefaultCancelGrace
+}
+
+func drainTurnEvents(s *Server, run *activeExecution, events <-chan engine.Event, outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool, items *itemAssembler) bool {
+	timer := time.NewTimer(s.turnDrainCancellationGrace())
 	defer timer.Stop()
 	for {
 		select {
