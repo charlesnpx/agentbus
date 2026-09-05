@@ -430,7 +430,7 @@ func (assembler *itemAssembler) absorb(event engine.Event, rawText string) {
 	}
 	if event.ObservedWorkspaceWriteItem {
 		assembler.flushMessage()
-		assembler.append(transcriptItemFileChange, event.Name, "", false)
+		assembler.append(transcriptItemFileChange, "", "", false)
 		return
 	}
 	switch event.Type {

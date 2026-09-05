@@ -433,8 +433,54 @@ func TestClaudeAnswersControlRequestsAndMapsAssistantEvents(t *testing.T) {
 	if !containsModel(got, "claude-sonnet") || !containsEvent(got, engine.EventAgentText, "assistant text") || !containsToolUse(got, "Bash", "git status") || !containsToolResult(got, "working tree clean") {
 		t.Fatalf("events = %#v, want model, assistant text, tool use, and tool result", got)
 	}
+	tools := eventsOfType(got, engine.EventToolUse)
+	if len(tools) != 1 || tools[0].Name != "Bash" || !strings.Contains(tools[0].Text, "git status") || tools[0].ObservedWorkspaceWriteItem {
+		t.Fatalf("tool events = %#v, want one ordinary Bash observation with command text", tools)
+	}
 	if resultText(got) != "done" {
 		t.Fatalf("events = %#v, want result done", got)
+	}
+}
+
+func TestClaudeFileWritingToolUsesAreTextFreeWorkspaceWrites(t *testing.T) {
+	tests := []struct {
+		name  string
+		input map[string]any
+	}{
+		{
+			name:  "Write",
+			input: map[string]any{"file_path": "/workspace/customer-a/secret.env", "content": "must-not-persist"},
+		},
+		{
+			name:  "Edit",
+			input: map[string]any{"file_path": "/workspace/customer-a/secret.env", "old_string": "old", "new_string": "must-not-persist"},
+		},
+		{
+			name:  "NotebookEdit",
+			input: map[string]any{"notebook_path": "/workspace/customer-a/secret.ipynb", "new_source": "must-not-persist"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {
+				peer := newClaudePeer(t, proc)
+				peer.handshake()
+				peer.expectUser("write a file")
+				peer.emitAssistant("", tt.name, tt.input)
+				peer.emitResult("success", false, "done")
+			})
+
+			session := startFakeClaudeSession(t, engine.SessionOpts{})
+			events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "write a file", Write: true}, runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tools := eventsOfType(collectEventsWithTimeout(t, events, 2*time.Second), engine.EventToolUse)
+			if len(tools) != 1 || tools[0].Name != tt.name || !tools[0].ObservedWorkspaceWriteItem || tools[0].Text != "" {
+				t.Fatalf("tool events = %#v, want one text-free workspace-write observation", tools)
+			}
+		})
 	}
 }
 

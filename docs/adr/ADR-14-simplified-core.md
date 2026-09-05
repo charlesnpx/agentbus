@@ -545,7 +545,7 @@ line when the file cap stops appending, so a later reader can report a gap
 instead of silently treating the partial item sequence as complete. A sidecar
 belongs to one live execution and is never resumed. Sidecar failures become job
 diagnostics and do not alter the operator work's outcome. File-change
-observations retain only their kind, name, and timestamp, never their paths or
+observations retain only their kind and timestamp, never a name, path, or
 contents.
 
 The daemon keeps an in-memory logical item count and item/activity timestamps

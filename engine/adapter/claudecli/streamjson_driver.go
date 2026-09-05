@@ -355,15 +355,32 @@ func (s *claudeStream) emitAssistant(obj map[string]any) {
 			}
 		case "tool_use":
 			name := firstString(block, "name")
-			text := textValue(block["text"])
-			if text == "" {
-				text = textValue(block["input"])
+			event := engine.Event{
+				Type:                       engine.EventToolUse,
+				Name:                       name,
+				Metadata:                   obj,
+				ObservedWorkspaceWriteItem: isClaudeWorkspaceWriteTool(name),
 			}
-			if text == "" {
-				text = name
+			if !event.ObservedWorkspaceWriteItem {
+				event.Text = textValue(block["text"])
+				if event.Text == "" {
+					event.Text = textValue(block["input"])
+				}
+				if event.Text == "" {
+					event.Text = name
+				}
 			}
-			s.emitEvent(engine.Event{Type: engine.EventToolUse, Name: name, Text: text, Metadata: obj})
+			s.emitEvent(event)
 		}
+	}
+}
+
+func isClaudeWorkspaceWriteTool(name string) bool {
+	switch name {
+	case "Edit", "Write", "NotebookEdit":
+		return true
+	default:
+		return false
 	}
 }
 

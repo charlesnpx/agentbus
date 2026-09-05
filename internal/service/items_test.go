@@ -162,7 +162,7 @@ func TestTranscriptItemsCoalesceAgentTextRun(t *testing.T) {
 	}
 }
 
-func TestTranscriptItemsSuppressWorkspaceWriteText(t *testing.T) {
+func TestTranscriptItemsSuppressWorkspaceWriteNameAndText(t *testing.T) {
 	backend := &executionFakeBackend{name: "items-file-change"}
 	backend.start = func(_ context.Context, _ engine.SessionOpts) (engine.Session, error) {
 		return &executionFakeSession{
@@ -170,7 +170,7 @@ func TestTranscriptItemsSuppressWorkspaceWriteText(t *testing.T) {
 				input.OnProcessStart(engine.ProcessRef{PID: 6102, PGID: 6102, StartTime: "items-file-change"}, 0)
 				return executionEvents(engine.Event{
 					Type:                       engine.EventToolUse,
-					Name:                       "fileChange",
+					Name:                       "Edit /workspace/customer-a/secret.env",
 					Text:                       "private path and contents",
 					ObservedWorkspaceWriteItem: true,
 				}), nil
@@ -185,12 +185,15 @@ func TestTranscriptItemsSuppressWorkspaceWriteText(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("item count = %d, want 1: %#v", len(items), items)
 	}
-	if got := items[0]; got.Kind != string(transcriptItemFileChange) || got.Name != "fileChange" || got.Text != "" || got.Truncated {
-		t.Fatalf("file-change item = %+v, want text-free fileChange", got)
+	if got := items[0]; got.Kind != string(transcriptItemFileChange) || got.Name != "" || got.Text != "" || got.Truncated {
+		t.Fatalf("file-change item = %+v, want nameless, text-free fileChange", got)
 	}
 	sidecar, err := os.ReadFile(transcriptItemPath(t, record))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if bytes.Contains(sidecar, []byte("/workspace/customer-a/secret.env")) {
+		t.Fatalf("sidecar leaked workspace path: %s", sidecar)
 	}
 	if !bytes.Contains(sidecar, []byte(`"truncated":false`)) {
 		t.Fatalf("sidecar = %s, want explicit false truncated member", sidecar)
@@ -424,16 +427,16 @@ func TestTranscriptItemsResultMessageTerminatesAgentTextRun(t *testing.T) {
 			},
 		},
 		{
-			name: "workspace-write tool text is suppressed",
+			name: "workspace-write tool name and text are suppressed",
 			initialEvents: []engine.Event{
 				{
 					Type:                       engine.EventToolUse,
-					Name:                       "fileChange",
+					Name:                       "Edit /workspace/customer-a/secret.env",
 					Text:                       "private path and contents",
 					ObservedWorkspaceWriteItem: true,
 				},
 			},
-			want: []expectedItem{{kind: transcriptItemFileChange, name: "fileChange"}},
+			want: []expectedItem{{kind: transcriptItemFileChange}},
 		},
 		{
 			name: "different agent text and result remain separate across correction",

@@ -40,6 +40,11 @@ CLI-backed adapters run through the shared duplex runtime. A backend with a
 bidirectional provider protocol supplies a `duplex.Driver`; the older
 build-argv/parse-JSONL shape is wrapped as a trivial one-shot driver.
 
+An adapter marks an observed workspace write with
+`ObservedWorkspaceWriteItem`. The persistence boundary records its file-change
+observation with only its kind and timestamp; it never records a name, path, or
+contents.
+
 ## Supported argv profiles
 
 The following profiles are the only supported v1 CLI shapes. Adapters MUST NOT
@@ -416,7 +421,7 @@ when Cursor finishes a prompt without a terminal tool-call frame.
 | `session/update` `agent_message_chunk` | `AgentText` | incremental assistant text |
 | `session/update` `tool_call` or `tool_call_update` with a nonterminal status | `Progress` | a lifecycle frame advances the liveness clock without adding a second tool item |
 | `session/update` `tool_call` or `tool_call_update` with the same `toolCallId` and status `completed` | `ToolUse` | fields from the lifecycle are correlated by id and produce exactly one item |
-| a correlated tool-call frame whose `content` includes a `diff` block | `ToolUse` with `ObservedWorkspaceWriteItem` | the emitted item has no text; the service retains only the workspace-write count, never diff paths or contents |
+| a correlated tool-call frame whose `content` includes a `diff` block | `ToolUse` with `ObservedWorkspaceWriteItem` | the emitted item has no text; the service retains only its kind and timestamp, never a name, path, or contents |
 | turn end, whether or not it ended successfully, after a correlated call has no recognized terminal frame | `ToolUse` | the pending call is flushed once before the prompt outcome is handled, preventing an unterminated lifecycle from being lost |
 | `session/prompt` response with `stopReason: "end_turn"` | `ResultMessage` | result text is the concatenated assistant chunks |
 
