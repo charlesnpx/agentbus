@@ -295,8 +295,14 @@ func TestItemSidecarWriterStopsAtSmallFileCap(t *testing.T) {
 	if int64(len(contents)) > fileCap {
 		t.Fatalf("sidecar size = %d, want at most %d", len(contents), fileCap)
 	}
-	if !bytes.HasSuffix(contents, transcriptItemStopLine) || bytes.Count(contents, transcriptItemStopLine) != 1 {
-		t.Fatalf("sidecar = %q, want one append-stopped marker", contents)
+	if bytes.Contains(contents, transcriptItemStopLine) {
+		t.Fatalf("sidecar = %q, want no append-stopped marker", contents)
+	}
+	if bytes.Contains(contents, transcriptItemCompleteLine) {
+		t.Fatalf("sidecar = %q, want no completion receipt after the cap", contents)
+	}
+	if result := readTranscriptSidecar(path, protocol.JobTranscriptParams{}); !result.Gap {
+		t.Fatalf("capped sidecar transcript = %#v, want gap", result)
 	}
 }
 
@@ -619,6 +625,89 @@ func TestTranscriptItemSidecarOpenFailureSurvivesImmediateCancellation(t *testin
 	result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
 	if result.State != protocol.PublicStateCanceled || result.ItemCount != 0 || !result.Gap {
 		t.Fatalf("terminal transcript = %#v, want empty gapped cancellation", result)
+	}
+}
+
+func TestFinalSidecarCloseFailureLeavesTerminalTranscriptsComplete(t *testing.T) {
+	originalClose := closeItemSidecarFile
+	closeCalls := 0
+	closeItemSidecarFile = func(file *os.File) error {
+		closeCalls++
+		if err := originalClose(file); err != nil {
+			return err
+		}
+		return errors.New("injected close failure after completion sync")
+	}
+	t.Cleanup(func() { closeItemSidecarFile = originalClose })
+
+	server := newTestServer(t, t.TempDir(), Config{})
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sidecar []byte
+	for _, test := range []struct {
+		name                string
+		state               protocol.PublicState
+		closeBeforeTerminal bool
+	}{
+		{name: "ordinary terminal", state: protocol.PublicStateCompleted, closeBeforeTerminal: true},
+		{name: "cancellation terminal", state: protocol.PublicStateCanceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			record := transcriptTestRecord(t, server, strings.ReplaceAll(test.name, " ", "-"))
+			path := transcriptItemPath(t, record)
+			writer := newItemSidecarWriter(path, transcriptItemTextCap, transcriptItemFileCap, nil)
+			writer.write(TranscriptItem{
+				Ordinal: 1,
+				At:      time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC),
+				Kind:    string(transcriptItemTool),
+				Name:    "tool",
+				Text:    "captured",
+			})
+
+			diagnostics := []string(nil)
+			if test.closeBeforeTerminal {
+				diagnostics = appendItemSidecarDiagnostics(diagnostics, writer)
+			}
+			if len(diagnostics) != 0 || len(writer.diagnostics()) != 0 {
+				t.Fatalf("close diagnostics = %#v / %#v, want none after completion sync", diagnostics, writer.diagnostics())
+			}
+			terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
+				State:       test.state,
+				Cleanup:     protocol.CleanupClean,
+				Diagnostics: diagnostics,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !test.closeBeforeTerminal {
+				writer.close()
+				if diagnostics := writer.diagnostics(); len(diagnostics) != 0 {
+					t.Fatalf("deferred close diagnostics = %#v, want none after completion sync", diagnostics)
+				}
+			}
+			if hasItemSidecarFailure(terminal.Diagnostics) {
+				t.Fatalf("terminal record = %#v, want no sidecar failure", terminal)
+			}
+
+			contents, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sidecar == nil {
+				sidecar = contents
+			} else if !bytes.Equal(contents, sidecar) {
+				t.Fatalf("cancellation sidecar = %q, want same durable state as ordinary terminal %q", contents, sidecar)
+			}
+			result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
+			if result.State != test.state || result.ItemCount != 1 || result.Gap {
+				t.Fatalf("terminal transcript = %#v, want state %q with one complete item", result, test.state)
+			}
+		})
+	}
+	if closeCalls != 2 {
+		t.Fatalf("final close calls = %d, want 2", closeCalls)
 	}
 }
 

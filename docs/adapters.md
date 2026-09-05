@@ -41,9 +41,10 @@ bidirectional provider protocol supplies a `duplex.Driver`; the older
 build-argv/parse-JSONL shape is wrapped as a trivial one-shot driver.
 
 An adapter marks an observed workspace write with
-`ObservedWorkspaceWriteItem`. The persistence boundary records its file-change
-observation with only its kind and timestamp; it never records a name, path, or
-contents.
+`ObservedWorkspaceWriteItem`. The emitted event may still carry a provider name
+and metadata; the persistence boundary retains none of it. A persisted
+file-change item keeps only its ordinal, timestamp, kind, and truncation state,
+never a provider-supplied name, path, contents, or metadata.
 
 ## Supported argv profiles
 
@@ -422,7 +423,7 @@ when Cursor finishes a prompt without a terminal tool-call frame.
 | `session/update` `agent_message_chunk` | `AgentText` | incremental assistant text |
 | `session/update` `tool_call` or `tool_call_update` with a nonterminal status | `Progress` | a lifecycle frame advances the liveness clock without adding a second tool item |
 | `session/update` `tool_call` or `tool_call_update` with the same `toolCallId` and status `completed` | `ToolUse` | fields from the lifecycle are correlated by id and produce exactly one item |
-| a correlated tool-call frame whose `content` includes a `diff` block | `ToolUse` with `ObservedWorkspaceWriteItem` | the emitted item has no text; the service retains only its kind and timestamp, never a name, path, or contents |
+| a correlated tool-call frame whose `content` includes a `diff` block | `ToolUse` with `ObservedWorkspaceWriteItem` | the emitted event has no text; the persistence boundary retains no provider-supplied name, path, contents, or metadata |
 | turn end, whether or not it ended successfully, after a correlated call has no recognized terminal frame | `ToolUse` | the pending call is flushed once before the prompt outcome is handled, preventing an unterminated lifecycle from being lost |
 | `session/prompt` response with `stopReason: "end_turn"` | `ResultMessage` | result text is the concatenated assistant chunks |
 
@@ -503,8 +504,7 @@ malformed records, and map backend events to `AgentText`, `ToolUse`, `Warning`,
 `ResultMessage`, and `TerminalError`. It MUST extract a stable backend session
 id from any documented start or event envelope, retain the first valid id, and
 use it for resume. A backend init/configuration event may carry the actual
-model; the current JobRecord projection does not publish it. The adapter MUST
-distinguish progress text from the authoritative
+model. The adapter MUST distinguish progress text from the authoritative
 terminal result and map the latter to exactly the `ResultMessage` consumed by
 engine result selection. Parse errors, unsupported terminal shapes, and
 non-zero process exits MUST surface as terminal errors rather than successful
