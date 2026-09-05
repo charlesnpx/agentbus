@@ -965,15 +965,8 @@ func collectTurn(s *Server, ctx context.Context, run *activeExecution, events <-
 	}
 }
 
-func (s *Server) turnDrainCancellationGrace() time.Duration {
-	if s != nil && s.turnDrainGrace > 0 {
-		return s.turnDrainGrace
-	}
-	return engine.DefaultCancelGrace
-}
-
 func drainTurnEvents(s *Server, run *activeExecution, events <-chan engine.Event, outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool, items *itemAssembler) bool {
-	timer := time.NewTimer(s.turnDrainCancellationGrace())
+	timer := time.NewTimer(s.turnDrainGrace)
 	defer timer.Stop()
 	for {
 		select {

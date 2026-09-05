@@ -647,7 +647,7 @@ func TestJobCancelDuringCorrectionPreservesRetiredTurnOutcome(t *testing.T) {
 func TestJobCancelRetainsCurrentTurnFinalEvidence(t *testing.T) {
 	events := make(chan engine.Event, 1)
 	turnStarted := make(chan struct{})
-	publishAfterInterrupt := make(chan struct{})
+	publishedFinal := false
 	backend := &executionFakeBackend{name: "cancel-current-turn-evidence"}
 	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
 		return &executionFakeSession{
@@ -656,25 +656,24 @@ func TestJobCancelRetainsCurrentTurnFinalEvidence(t *testing.T) {
 				close(turnStarted)
 				return events, nil
 			},
-			interrupt: func(context.Context) error {
-				go func() {
-					<-publishAfterInterrupt
-					events <- engine.Event{
-						Type: engine.EventTurnFinal,
-						TurnFinal: &engine.TurnFinalObservation{
-							BackendSessionID: "thread-current",
-							CleanupFailed:    true,
-						},
-					}
-					close(events)
-				}()
-				close(publishAfterInterrupt)
-				return nil
-			},
+			interrupt: func(context.Context) error { return nil },
 		}, nil
 	}
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
-	server.processGroupGoneFn = func(int) (bool, error) { return true, nil }
+	server.processGroupGoneFn = func(int) (bool, error) {
+		if !publishedFinal {
+			publishedFinal = true
+			events <- engine.Event{
+				Type: engine.EventTurnFinal,
+				TurnFinal: &engine.TurnFinalObservation{
+					BackendSessionID: "thread-current",
+					CleanupFailed:    true,
+				},
+			}
+			close(events)
+		}
+		return true, nil
+	}
 	record := queuedExecutionRecord(t, server, backend.Name(), "cancel after turn launch", nil)
 	run := newActiveExecution(record.JobID, backend)
 	server.executionMu.Lock()
