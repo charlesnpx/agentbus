@@ -417,7 +417,7 @@ when Cursor finishes a prompt without a terminal tool-call frame.
 | `session/update` `tool_call` or `tool_call_update` with a nonterminal status | `Progress` | a lifecycle frame advances the liveness clock without adding a second tool item |
 | `session/update` `tool_call` or `tool_call_update` with the same `toolCallId` and status `completed` | `ToolUse` | fields from the lifecycle are correlated by id and produce exactly one item |
 | a correlated tool-call frame whose `content` includes a `diff` block | `ToolUse` with `ObservedWorkspaceWriteItem` | the emitted item has no text; the service retains only the workspace-write count, never diff paths or contents |
-| prompt completion after a correlated call has no recognized terminal frame | `ToolUse` | the pending call is flushed once before the result, preventing an unterminated lifecycle from being lost |
+| turn end, whether or not it ended successfully, after a correlated call has no recognized terminal frame | `ToolUse` | the pending call is flushed once before the prompt outcome is handled, preventing an unterminated lifecycle from being lost |
 | `session/prompt` response with `stopReason: "end_turn"` | `ResultMessage` | result text is the concatenated assistant chunks |
 
 ## Adding a backend

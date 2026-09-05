@@ -516,11 +516,6 @@ func (o *acpTurnObserver) flushToolUses() {
 			continue
 		}
 		o.emitToolCall(toolCall)
-		delete(o.pendingToolCalls, toolCallID)
-		if o.emittedToolCallIDs == nil {
-			o.emittedToolCallIDs = make(map[string]struct{})
-		}
-		o.emittedToolCallIDs[toolCallID] = struct{}{}
 	}
 }
 
