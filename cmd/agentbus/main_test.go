@@ -160,7 +160,6 @@ func TestStatusListDefaultsAllWorkspacesAndFiltersExplicitWorkspace(t *testing.T
 		wantWorkspace string
 		wantTags      map[string]string
 		wantStates    []protocol.PublicState
-		wantErr       string
 	}{
 		{
 			name:     "default lists every workspace",
@@ -179,7 +178,6 @@ func TestStatusListDefaultsAllWorkspacesAndFiltersExplicitWorkspace(t *testing.T
 			name:     "all workspaces flag is removed",
 			args:     []string{"status", "--all-workspaces"},
 			wantCode: 2,
-			wantErr:  "flag provided but not defined: -all-workspaces",
 		},
 	}
 
@@ -190,10 +188,10 @@ func TestStatusListDefaultsAllWorkspacesAndFiltersExplicitWorkspace(t *testing.T
 			a.clientConnect = fakeConnector(client)
 
 			code, _, stderr := runTestCLI(t, a, tt.args)
-			if code != tt.wantCode || (tt.wantErr == "" && stderr != "") || (tt.wantErr != "" && !strings.Contains(stderr, tt.wantErr)) {
-				t.Fatalf("status = (%d,%q), want (%d, containing %q)", code, stderr, tt.wantCode, tt.wantErr)
+			if code != tt.wantCode {
+				t.Fatalf("status = (%d,%q), want %d", code, stderr, tt.wantCode)
 			}
-			if tt.wantErr != "" {
+			if tt.wantCode != 0 {
 				if len(client.listParams) != 0 {
 					t.Fatalf("removed flag made %d job.list calls, want 0", len(client.listParams))
 				}

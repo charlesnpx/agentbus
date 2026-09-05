@@ -327,7 +327,6 @@ func TestTranscriptItemsResultMessageTerminatesAgentTextRun(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			turns := 0
 			backend := &executionFakeBackend{name: "items-result-message"}
