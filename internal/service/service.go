@@ -150,6 +150,7 @@ type Server struct {
 	processGroups      engine.ProcessGroupSignaler
 	processGroupGoneFn func(int) (bool, error)
 	processGroupGrace  time.Duration
+	turnDrainGrace     time.Duration
 
 	executionMu     sync.Mutex
 	executionCtx    context.Context
@@ -233,6 +234,7 @@ func New(cfg Config) (*Server, error) {
 		processTable:      engine.NativeProcessTable{},
 		processGroups:     engine.NativeProcessGroupSignaler{},
 		processGroupGrace: engine.DefaultCancelGrace,
+		turnDrainGrace:    engine.DefaultCancelGrace,
 		idleTimeout:       idleTimeout,
 		idleCheckInterval: idleCheckInterval,
 		shutdownTimeout:   normalizeShutdownTimeout(cfg.ShutdownTimeout),

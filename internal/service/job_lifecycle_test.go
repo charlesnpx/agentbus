@@ -644,6 +644,165 @@ func TestJobCancelDuringCorrectionPreservesRetiredTurnOutcome(t *testing.T) {
 	}
 }
 
+func TestJobCancelRetainsCurrentTurnFinalEvidence(t *testing.T) {
+	events := make(chan engine.Event, 1)
+	turnStarted := make(chan struct{})
+	publishedFinal := false
+	backend := &executionFakeBackend{name: "cancel-current-turn-evidence"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				input.OnProcessStart(engine.ProcessRef{PID: 4115, PGID: 4115, StartTime: "current-turn-cancel-token"}, 0)
+				close(turnStarted)
+				return events, nil
+			},
+			interrupt: func(context.Context) error { return nil },
+		}, nil
+	}
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
+	server.processGroupGoneFn = func(int) (bool, error) {
+		if !publishedFinal {
+			publishedFinal = true
+			events <- engine.Event{
+				Type: engine.EventTurnFinal,
+				TurnFinal: &engine.TurnFinalObservation{
+					BackendSessionID: "thread-current",
+					CleanupFailed:    true,
+				},
+			}
+			close(events)
+		}
+		return true, nil
+	}
+	record := queuedExecutionRecord(t, server, backend.Name(), "cancel after turn launch", nil)
+	run := newActiveExecution(record.JobID, backend)
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: run}
+	server.executionMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		server.runJob(context.Background(), record, run)
+		close(done)
+	}()
+	select {
+	case <-turnStarted:
+	case <-time.After(time.Second):
+		t.Fatal("turn did not start")
+	}
+
+	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
+	if canceled.err != nil {
+		t.Fatalf("job.cancel error = %#v", canceled.err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled turn did not retire")
+	}
+
+	get := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: record.JobID}))
+	if get.err != nil {
+		t.Fatalf("job.get error = %#v", get.err)
+	}
+	detail, ok := get.result.(protocol.JobRecordWire)
+	if !ok {
+		t.Fatalf("job.get result = %T, want protocol.JobRecordWire", get.result)
+	}
+	if detail.State != protocol.PublicStateCanceled || detail.Cleanup != protocol.CleanupUncertain {
+		t.Fatalf("job.get canceled record = %#v, want canceled with uncertain cleanup", detail)
+	}
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != protocol.PublicStateCanceled || stored.Cleanup != protocol.CleanupUncertain || stored.BackendSessionID != "thread-current" {
+		t.Fatalf("durable canceled record = %#v, want canceled uncertain record with current session", stored)
+	}
+	for _, diagnostic := range stored.Diagnostics {
+		if diagnostic == "backend reported uncertain cleanup" {
+			return
+		}
+	}
+	t.Fatalf("durable canceled diagnostics = %#v, want backend cleanup uncertainty", stored.Diagnostics)
+}
+
+func TestJobCancelReturnsAfterUnretiredTurnStreamGrace(t *testing.T) {
+	// This fake event stream intentionally never sends and never closes.
+	events := make(chan engine.Event)
+	turnStarted := make(chan struct{})
+	backend := &executionFakeBackend{name: "cancel-unretired-turn-stream"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				input.OnProcessStart(engine.ProcessRef{PID: 4116, PGID: 4116, StartTime: "unretired-turn-cancel-token"}, 0)
+				close(turnStarted)
+				return events, nil
+			},
+			interrupt: func(context.Context) error {
+				return nil
+			},
+		}, nil
+	}
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
+	server.processGroupGoneFn = func(int) (bool, error) { return true, nil }
+	server.turnDrainGrace = 100 * time.Millisecond
+	record := queuedExecutionRecord(t, server, backend.Name(), "cancel with an unretired turn", nil)
+	run := newActiveExecution(record.JobID, backend)
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: run}
+	server.executionMu.Unlock()
+	runDone := make(chan struct{})
+	go func() {
+		server.runJob(context.Background(), record, run)
+		close(runDone)
+	}()
+	select {
+	case <-turnStarted:
+	case <-time.After(time.Second):
+		t.Fatal("turn did not start")
+	}
+
+	cancelRaw := mustJSON(t, protocol.JobCancelParams{JobID: record.JobID})
+	cancelDone := make(chan requestOutcome, 1)
+	go func() {
+		cancelDone <- server.handleJobCancel(cancelRaw)
+	}()
+	completionBound := time.NewTimer(2 * server.turnDrainGrace)
+	defer completionBound.Stop()
+	select {
+	case canceled := <-cancelDone:
+		if canceled.err != nil {
+			t.Fatalf("job.cancel error = %#v", canceled.err)
+		}
+	case <-completionBound.C:
+		t.Fatal("job.cancel did not return after the event-stream containment grace")
+	}
+	<-runDone
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != protocol.PublicStateCanceled || stored.Cleanup != protocol.CleanupUncertain {
+		t.Fatalf("canceled record = %#v, want canceled with uncertain cleanup", stored)
+	}
+	for _, diagnostic := range stored.Diagnostics {
+		if diagnostic == "backend event stream did not close after containment grace" {
+			return
+		}
+	}
+	t.Fatalf("canceled diagnostics = %#v, want event-stream cleanup uncertainty", stored.Diagnostics)
+}
+
 func TestJobCancelAfterSpawnRecordsCleanupOutcome(t *testing.T) {
 	for _, tt := range []struct {
 		name        string
