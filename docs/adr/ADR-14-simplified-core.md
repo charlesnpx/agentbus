@@ -544,9 +544,11 @@ MiB. The writer reserves space for a final `{"captureComplete":true}` control
 line. If the file cap stops appending, it withholds that receipt so a later
 reader reports a gap instead of silently treating the partial item sequence as
 complete. A sidecar belongs to one live execution and is never resumed. Sidecar
-failures become job diagnostics and do not alter the operator work's outcome.
-File-change items retain no provider-derived data: never a name, path, or
-contents.
+failures before a completion receipt is successfully synced become job
+diagnostics and do not alter the operator work's outcome; once that receipt is
+durable, a later close error adds no evidence and is discarded. A persisted
+file-change item keeps only its ordinal, timestamp, kind, and truncation state,
+never a provider-supplied name, path, contents, or metadata.
 
 The daemon keeps an in-memory logical item count and item/activity timestamps
 for each active execution. These are never bbolt transactions per event and do
