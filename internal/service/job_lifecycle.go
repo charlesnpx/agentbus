@@ -40,7 +40,7 @@ func (s *Server) handleJobGet(raw json.RawMessage) requestOutcome {
 		}
 		return jobStoreUnavailable("get job", err)
 	}
-	wire, err := jobRecordWire(record)
+	wire, err := s.jobRecordWire(record)
 	if err != nil {
 		return jobStoreUnavailable("project job record", err)
 	}
@@ -195,7 +195,7 @@ func projectedState(record jobstore.Record) protocol.PublicState {
 	return record.State
 }
 
-func jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, error) {
+func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, error) {
 	spec, timeout, err := taskSpecForProjection(record)
 	if err != nil {
 		return protocol.JobRecordWire{}, err
@@ -205,22 +205,33 @@ func jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, error) {
 		tags = *spec.Tags
 	}
 	return protocol.JobRecordWire{
-		JobID:        record.JobID,
-		WorkspaceKey: record.WorkspaceKey,
-		RequestID:    record.RequestID,
-		Backend:      record.Backend,
-		State:        projectedState(record),
-		Tags:         tags,
-		CreatedAt:    record.CreatedAt,
-		StartedAt:    record.StartedAt,
-		FinishedAt:   record.FinishedAt,
-		Timeout:      timeout,
-		Result:       projectResult(record),
-		Contract:     projectContract(record, spec),
-		Failure:      projectFailure(record),
-		Cleanup:      record.Cleanup,
-		LogPaths:     projectLogPaths(record),
+		JobID:         record.JobID,
+		WorkspaceKey:  record.WorkspaceKey,
+		RequestID:     record.RequestID,
+		Backend:       record.Backend,
+		State:         projectedState(record),
+		Tags:          tags,
+		CreatedAt:     record.CreatedAt,
+		StartedAt:     record.StartedAt,
+		FinishedAt:    record.FinishedAt,
+		Timeout:       timeout,
+		Result:        projectResult(record),
+		Contract:      projectContract(record, spec),
+		Failure:       projectFailure(record),
+		Cleanup:       record.Cleanup,
+		LogPaths:      projectLogPaths(record),
+		ModelReported: s.projectedModelReported(record),
 	}, nil
+}
+
+func (s *Server) projectedModelReported(record jobstore.Record) string {
+	if record.State.IsTerminal() {
+		return record.ModelReported
+	}
+	if run := s.activeExecution(record.JobID); run != nil {
+		return run.reportedModel()
+	}
+	return record.ModelReported
 }
 
 func (s *Server) jobSummaryWireFromSpec(record jobstore.Record, spec protocol.TaskSpec) protocol.JobSummaryWire {
@@ -229,15 +240,16 @@ func (s *Server) jobSummaryWireFromSpec(record jobstore.Record, spec protocol.Ta
 		tags = *spec.Tags
 	}
 	wire := protocol.JobSummaryWire{
-		JobID:        record.JobID,
-		Backend:      record.Backend,
-		State:        projectedState(record),
-		Tags:         tags,
-		Cleanup:      record.Cleanup,
-		CreatedAt:    record.CreatedAt,
-		UpdatedAt:    record.UpdatedAt,
-		FailureClass: projectFailureClass(record),
-		Contract:     projectContractVerdict(record, spec),
+		JobID:         record.JobID,
+		Backend:       record.Backend,
+		State:         projectedState(record),
+		Tags:          tags,
+		Cleanup:       record.Cleanup,
+		CreatedAt:     record.CreatedAt,
+		UpdatedAt:     record.UpdatedAt,
+		ModelReported: s.projectedModelReported(record),
+		FailureClass:  projectFailureClass(record),
+		Contract:      projectContractVerdict(record, spec),
 	}
 	if record.State.IsTerminal() {
 		return wire

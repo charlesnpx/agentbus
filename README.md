@@ -3,7 +3,7 @@
 Agentbus is a local generic job service for backend CLIs. It stores identified
 jobs, supervises their process groups, and exposes a small JSON-RPC interface.
 
-Version 0.13.0 serves protocol version 3. The published contract is
+Version 0.13.1 serves protocol version 3. The published contract is
 [docs/protocol.md](docs/protocol.md). Operator details, including the required
 state-root break for this release, are in
 [docs/operations.md](docs/operations.md).

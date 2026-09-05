@@ -1,6 +1,6 @@
 # Agentbus operations
 
-This runbook covers Agentbus 0.13.0 and protocol version 3 on macOS and Linux.
+This runbook covers Agentbus 0.13.1 and protocol version 3 on macOS and Linux.
 The daemon supervises backend process groups and records cleanup as a separate
 clean-or-uncertain value.
 
@@ -140,9 +140,8 @@ recorded token. This is the deliberate trade-off for preventing duplicate work.
 Result and log artifacts remain until an operator removes them. Nothing reclaims
 that disk automatically.
 
-Downstream compatibility remains incomplete: Delegate will not build against
-0.13.0 without edits, and Convo Relay needs two line edits to drop a removed
-option field.
+Delegate v0.10.0 pins Agentbus v0.13.1. Convo Relay still needs two line edits
+to drop a removed option field.
 
 Admission validates only backend registration. An unusable backend binary is
 therefore discovered when a job runs, not when it is submitted.
