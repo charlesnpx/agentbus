@@ -20,6 +20,7 @@ import (
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/jcs"
+	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
@@ -730,5 +731,78 @@ func TestJobSubmitConfiguredBackendDoesNotPreflightDuringAdmission(t *testing.T)
 	}
 	if got := backend.sessions.Load(); got != 0 {
 		t.Fatalf("provider sessions during admission = %d, want 0", got)
+	}
+}
+
+func TestJobSubmitResumeTargetWithoutSessionReturnsTypedError(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
+	source := submitResultForTest(t, submitForTest(t, server, submissionParams("resume-missing-source", "source", "fake", t.TempDir(), "source")))
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkTerminal(source.JobID, jobstore.TerminalUpdate{
+		State:         protocol.PublicStateFailed,
+		Cleanup:       protocol.CleanupClean,
+		FailureClass:  protocol.FailureClassBackendError,
+		FailureReason: "failed before its first turn",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	params := submissionParams("resume-missing-target", "resume", "fake", t.TempDir(), "continue")
+	params.TaskSpec.ResumeJobID = source.JobID
+	outcome := submitForTest(t, server, params)
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || outcome.err.Data.JobID != source.JobID {
+		t.Fatalf("resume without session = %#v, want typed invalid-task error for %q", outcome.err, source.JobID)
+	}
+	if outcome.result != nil {
+		t.Fatalf("resume without session result = %#v, want error only", outcome.result)
+	}
+	records, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].JobID != source.JobID {
+		t.Fatalf("records after invalid resume = %+v, want only source %q", records, source.JobID)
+	}
+}
+
+func TestJobSubmitResumeTargetParticipatesInReplayIdentity(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newSource := func(requestID string, sessionID string) protocol.JobSubmitResult {
+		source := submitResultForTest(t, submitForTest(t, server, submissionParams("resume-identity-source", requestID, "fake", t.TempDir(), "source")))
+		if _, err := store.MarkTerminal(source.JobID, jobstore.TerminalUpdate{
+			State:            protocol.PublicStateFailed,
+			Cleanup:          protocol.CleanupClean,
+			BackendSessionID: sessionID,
+			FailureClass:     protocol.FailureClassBackendError,
+			FailureReason:    "timed out after a turn",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return source
+	}
+	firstSource := newSource("source-one", "thread-one")
+	secondSource := newSource("source-two", "thread-two")
+
+	params := submissionParams("resume-identity", "same-request", "fake", t.TempDir(), "continue")
+	params.TaskSpec.ResumeJobID = firstSource.JobID
+	first := submitResultForTest(t, submitForTest(t, server, params))
+	params.TaskSpec.ResumeJobID = secondSource.JobID
+	conflict := submitForTest(t, server, params)
+	if conflict.err == nil || conflict.err.Data.Code != protocol.ErrorInvalidTaskSpec || conflict.err.Data.JobID != first.JobID {
+		t.Fatalf("different resume target replay = %#v, want typed conflict bound to %q", conflict.err, first.JobID)
+	}
+	records, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 3 {
+		t.Fatalf("records after conflicting resume identity = %d, want two sources and one new job", len(records))
 	}
 }

@@ -70,6 +70,7 @@ job.submit:
         "backend": "string",
         "cwd": "string",
         "write": true,
+        "resumeJobId": "job_previous",
         "model": "string",
         "effort": "string",
         "prompt": "string",
@@ -79,10 +80,11 @@ job.submit:
       }
     }
 
-backend, cwd, write, and prompt are required TaskSpec fields. model, effort,
-outputSchema, tags, and timeoutMs are optional. outputSchema, if present, is
-exactly one inline Draft 2020-12 JSON Schema value, either an object or a
-boolean. It is not a name, registry key, or caller-supplied correction program.
+backend, cwd, write, and prompt are required TaskSpec fields. resumeJobId,
+model, effort, outputSchema, tags, and timeoutMs are optional. outputSchema, if
+present, is exactly one inline Draft 2020-12 JSON Schema value, either an
+object or a boolean. It is not a name, registry key, or caller-supplied
+correction program.
 
     result
     {
@@ -101,6 +103,22 @@ present. timeout always contains effective and source; requested is absent
 unless taskSpec.timeoutMs was supplied. A new admission returns the queued
 snapshot with deduplicated false; a matching replay returns the existing job's
 current state, including a terminal state, with deduplicated true.
+
+resumeJobId names the prior job rather than exposing a backend session ID. On a
+new admission, Agentbus resolves that job's recorded backend session internally
+and invokes the backend's Resume operation. The source must be a terminal,
+non-completed job using the same backend and must have a recorded session ID.
+An absent ID is an invalid task specification, never permission to start a new
+thread. Completed jobs are deliberately excluded because normal successful
+Codex cleanup removes their per-job CODEX_HOME.
+
+Resuming always creates a new job with a new id, record, transcript sidecar,
+result, and fresh deadline. It replays the prior thread as history; it neither
+continues the source job nor extends the source deadline. Managed Codex resumes
+use the source job's retained CODEX_HOME, while any write cache belongs to the
+new job. resumeJobId is part of the complete canonical TaskSpec hash, so two
+otherwise identical submissions with different targets conflict under the same
+compound request identity rather than deduplicating.
 
 job.get with a jobId returns this full JobRecord:
 
@@ -307,8 +325,8 @@ the only multi-job list request.
 ### CLI version 0.13.0
 
 The complete CLI surface is version, serve, status, transcript, result, and cancel. There
-is no submit command: Delegate makes the typed job.submit request after task and
-identity preparation.
+is no submit or resume command: Delegate makes the typed job.submit request after task and
+identity preparation. The typed TaskSpec exposes resumeJobId for that path.
 
 status and result MUST project the same job.get response differently for a
 selected job. Their JSON modes write the byte-identical JobRecord, including
@@ -472,10 +490,10 @@ a conflict before backend or cwd validation.
 The TaskSpec hash is SHA-256 over the UTF-8 bytes of the RFC 8785 JSON
 Canonicalization Scheme (JCS) representation of the submitted TaskSpec. Its
 input contains exactly the required fields backend, cwd, write, and prompt, plus
-each supplied optional field among model, effort, outputSchema, tags, and
-timeoutMs. It contains no derived value, default, workspaceKey, requestId, or
-filesystem observation. cwd is the submitted string bytes; it is not resolved,
-statted, or path-canonicalized.
+each supplied optional field among resumeJobId, model, effort, outputSchema,
+tags, and timeoutMs. It contains no derived value, default, workspaceKey,
+requestId, or filesystem observation. cwd is the submitted string bytes; it is
+not resolved, statted, or path-canonicalized.
 
 An absent optional field is omitted from the canonical object; a present field
 remains present even when its legal value is empty, including model: "", tags:

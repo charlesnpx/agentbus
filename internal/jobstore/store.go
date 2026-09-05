@@ -114,49 +114,59 @@ type ProcessClaim struct {
 // Starting is the private persisted no-relaunch marker; its public projection
 // is always State=running.
 type Record struct {
-	JobID         string                  `json:"jobId"`
-	WorkspaceKey  string                  `json:"workspaceKey"`
-	RequestID     string                  `json:"requestId"`
-	Backend       string                  `json:"backend"`
-	Model         string                  `json:"model,omitempty"`
-	CWD           string                  `json:"cwd,omitempty"`
-	Write         bool                    `json:"write"`
-	Effort        string                  `json:"effort,omitempty"`
-	TaskSpec      json.RawMessage         `json:"taskSpec,omitempty"`
-	State         protocol.PublicState    `json:"state"`
-	Starting      bool                    `json:"starting,omitempty"`
-	ProcessClaim  *ProcessClaim           `json:"processClaim,omitempty"`
-	Cleanup       protocol.Cleanup        `json:"cleanup"`
-	CreatedAt     time.Time               `json:"createdAt"`
-	UpdatedAt     time.Time               `json:"updatedAt"`
-	StartedAt     *time.Time              `json:"startedAt,omitempty"`
-	FinishedAt    *time.Time              `json:"finishedAt,omitempty"`
-	FailureClass  protocol.FailureClass   `json:"failureClass,omitempty"`
-	FailureReason string                  `json:"failureReason,omitempty"`
-	Diagnostics   []string                `json:"diagnostics"`
-	Contract      protocol.ContractResult `json:"contract"`
-	ResultText    string                  `json:"resultText,omitempty"`
-	ResultPath    string                  `json:"resultPath,omitempty"`
-	ResultSHA256  string                  `json:"resultSHA256,omitempty"`
-	ResultBytes   int64                   `json:"resultBytes,omitempty"`
-	Artifacts     ArtifactPaths           `json:"artifacts"`
+	JobID        string `json:"jobId"`
+	WorkspaceKey string `json:"workspaceKey"`
+	RequestID    string `json:"requestId"`
+	Backend      string `json:"backend"`
+	// BackendSessionID is assigned only from a backend's turn-final
+	// observation. An omitted value means the job never produced a resumable
+	// backend session; it is not an unknown-session marker.
+	BackendSessionID string                  `json:"backendSessionId,omitempty"`
+	Model            string                  `json:"model,omitempty"`
+	CWD              string                  `json:"cwd,omitempty"`
+	Write            bool                    `json:"write"`
+	Effort           string                  `json:"effort,omitempty"`
+	TaskSpec         json.RawMessage         `json:"taskSpec,omitempty"`
+	State            protocol.PublicState    `json:"state"`
+	Starting         bool                    `json:"starting,omitempty"`
+	ProcessClaim     *ProcessClaim           `json:"processClaim,omitempty"`
+	Cleanup          protocol.Cleanup        `json:"cleanup"`
+	CreatedAt        time.Time               `json:"createdAt"`
+	UpdatedAt        time.Time               `json:"updatedAt"`
+	StartedAt        *time.Time              `json:"startedAt,omitempty"`
+	FinishedAt       *time.Time              `json:"finishedAt,omitempty"`
+	FailureClass     protocol.FailureClass   `json:"failureClass,omitempty"`
+	FailureReason    string                  `json:"failureReason,omitempty"`
+	Diagnostics      []string                `json:"diagnostics"`
+	Contract         protocol.ContractResult `json:"contract"`
+	ResultText       string                  `json:"resultText,omitempty"`
+	ResultPath       string                  `json:"resultPath,omitempty"`
+	ResultSHA256     string                  `json:"resultSHA256,omitempty"`
+	ResultBytes      int64                   `json:"resultBytes,omitempty"`
+	Artifacts        ArtifactPaths           `json:"artifacts"`
 }
 
 // TerminalUpdate supplies the durable data for a first terminal transition.
 // State must be completed, failed, canceled, or unknown.
 type TerminalUpdate struct {
-	State         protocol.PublicState
-	Cleanup       protocol.Cleanup
-	FailureClass  protocol.FailureClass
-	FailureReason string
-	Diagnostics   []string
-	Contract      protocol.ContractResult
-	ResultText    string
-	ResultPath    string
-	ResultSHA256  string
-	ResultBytes   int64
-	FinishedAt    time.Time
+	State            protocol.PublicState
+	Cleanup          protocol.Cleanup
+	BackendSessionID string
+	FailureClass     protocol.FailureClass
+	FailureReason    string
+	Diagnostics      []string
+	Contract         protocol.ContractResult
+	ResultText       string
+	ResultPath       string
+	ResultSHA256     string
+	ResultBytes      int64
+	FinishedAt       time.Time
 }
+
+// RecordLookup reads a record from the same submit transaction that is
+// deciding a request binding. It lets a new-record factory validate an
+// existing dependency without breaking the same-hash replay ordering.
+type RecordLookup func(id string) (Record, error)
 
 // ConflictError identifies the existing binding that disagrees with a replay.
 type ConflictError struct {
@@ -346,6 +356,23 @@ func (store *Store) SubmitTx(key RequestKey, taskSpec []byte, mk func(id string)
 	if mk == nil {
 		return Record{}, false, fmt.Errorf("%w: record factory is required", ErrInvalid)
 	}
+	return store.submitTx(key, taskSpec, func(id string, _ RecordLookup) (Record, error) {
+		return mk(id)
+	})
+}
+
+// SubmitTxWithLookup is SubmitTx for a new record that must validate another
+// durable record. lookup reads through the active jobs bucket only after a
+// matching replay has returned or a conflicting replay has failed, preserving
+// SubmitTx's identity-before-validation rule.
+func (store *Store) SubmitTxWithLookup(key RequestKey, taskSpec []byte, mk func(id string, lookup RecordLookup) (Record, error)) (Record, bool, error) {
+	if mk == nil {
+		return Record{}, false, fmt.Errorf("%w: record factory is required", ErrInvalid)
+	}
+	return store.submitTx(key, taskSpec, mk)
+}
+
+func (store *Store) submitTx(key RequestKey, taskSpec []byte, mk func(id string, lookup RecordLookup) (Record, error)) (Record, bool, error) {
 	if err := key.Validate(); err != nil {
 		return Record{}, false, err
 	}
@@ -390,7 +417,9 @@ func (store *Store) SubmitTx(key RequestKey, taskSpec []byte, mk func(id string)
 		if err != nil {
 			return err
 		}
-		record, err := mk(id)
+		record, err := mk(id, func(id string) (Record, error) {
+			return getRecord(jobs, id)
+		})
 		if err != nil {
 			return err
 		}
@@ -609,6 +638,7 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 		next.State = terminal.State
 		next.Starting = false
 		next.Cleanup = terminal.Cleanup
+		next.BackendSessionID = terminal.BackendSessionID
 		next.FailureClass = terminal.FailureClass
 		next.FailureReason = terminal.FailureReason
 		next.Diagnostics = append([]string(nil), terminal.Diagnostics...)
@@ -698,6 +728,7 @@ func decodeRecord(encoded []byte, expectedID string) (Record, error) {
 
 func normalizeNewRecord(record *Record, now time.Time) {
 	record.State = protocol.PublicStateQueued
+	record.BackendSessionID = ""
 	if record.Cleanup == "" {
 		record.Cleanup = protocol.CleanupClean
 	}
@@ -750,6 +781,9 @@ func validateRecord(record Record) error {
 		if err := record.ProcessClaim.validate(); err != nil {
 			return err
 		}
+	}
+	if record.BackendSessionID != "" && strings.TrimSpace(record.BackendSessionID) == "" {
+		return fmt.Errorf("%w: backend session id cannot be whitespace", ErrInvalid)
 	}
 	if !record.Cleanup.Valid() {
 		return fmt.Errorf("%w: invalid cleanup %q", ErrInvalid, record.Cleanup)

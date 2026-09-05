@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -97,16 +98,25 @@ func (run *activeExecution) requestCancellation() (sessionPresent bool, err erro
 	return true, run.interrupt()
 }
 
-// startSession serializes Backend.Start with requestCancellation. It reports a
-// pending cancellation separately so runJob never converts that request into
-// a competing interrupted/failed terminal record.
-func (run *activeExecution) startSession(ctx context.Context, opts engine.SessionOpts) (engine.Session, error, bool) {
+// startSession serializes Backend.Start or Backend.Resume with
+// requestCancellation. It reports a pending cancellation separately so runJob
+// never converts that request into a competing interrupted/failed terminal
+// record.
+func (run *activeExecution) startSession(ctx context.Context, opts engine.SessionOpts, resumeID string) (engine.Session, error, bool) {
 	run.launchMu.Lock()
 	if run.cancellationRequested() {
 		run.launchMu.Unlock()
 		return nil, context.Canceled, true
 	}
-	session, err := run.backend.Start(ctx, opts)
+	var (
+		session engine.Session
+		err     error
+	)
+	if resumeID == "" {
+		session, err = run.backend.Start(ctx, opts)
+	} else {
+		session, err = run.backend.Resume(ctx, resumeID, opts)
+	}
 	if session != nil {
 		run.setSession(session)
 	}
@@ -335,6 +345,12 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		return
 	}
 
+	resumeTarget, err := resumeTargetForExecution(store, spec)
+	if err != nil {
+		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("resolve resume target: %w", err), nil)
+		return
+	}
+
 	// This durable transaction is intentionally separate from the later claim
 	// transaction in activeExecution.recordProcessClaim.
 	started, err := store.MarkStarting(record.JobID)
@@ -378,18 +394,44 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare Codex workspace layout: %w", err), nil)
 			return
 		}
-		codexHome, managed, err := s.prepareCodexHome(layout, record.JobID)
-		if managed != nil {
-			s.rememberManagedCodexHome(record.JobID, managed)
-		}
-		if err != nil {
-			s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare Codex home: %w", err), nil)
-			return
-		}
-		if codexHome != "" {
-			opts.EnvOverlay = map[string]string{"CODEX_HOME": codexHome}
+		var managed *managedCodexHome
+		if resumeTarget != nil {
+			codexHome, err := s.resumeCodexHome(*resumeTarget)
+			if err != nil {
+				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare resumed Codex home: %w", err), nil)
+				return
+			}
+			if codexHome != "" {
+				opts.EnvOverlay = map[string]string{"CODEX_HOME": codexHome}
+			}
+		} else {
+			codexHome, prepared, err := s.prepareCodexHome(layout, record.JobID)
+			if prepared != nil {
+				s.rememberManagedCodexHome(record.JobID, prepared)
+			}
+			if err != nil {
+				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare Codex home: %w", err), nil)
+				return
+			}
+			managed = prepared
+			if codexHome != "" {
+				opts.EnvOverlay = map[string]string{"CODEX_HOME": codexHome}
+			}
 		}
 		if record.Write {
+			if resumeTarget != nil {
+				// A resumed Codex session must use the source job's CODEX_HOME,
+				// but write-only cache paths remain owned by the new job.
+				_, prepared, err := s.prepareCodexHome(layout, record.JobID)
+				if prepared != nil {
+					s.rememberManagedCodexHome(record.JobID, prepared)
+				}
+				if err != nil {
+					s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare resumed Codex job cache home: %w", err), nil)
+					return
+				}
+				managed = prepared
+			}
 			cache, managed, cacheErr := prepareCodexJobCache(layout, record.JobID, managed)
 			if managed != nil {
 				s.rememberManagedCodexHome(record.JobID, managed)
@@ -408,7 +450,11 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			}
 		}
 	}
-	session, err, canceled := run.startSession(jobCtx, opts)
+	resumeSessionID := ""
+	if resumeTarget != nil {
+		resumeSessionID = resumeTarget.BackendSessionID
+	}
+	session, err, canceled := run.startSession(jobCtx, opts, resumeSessionID)
 	if canceled {
 		return
 	}
@@ -469,28 +515,28 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 
 	if errors.Is(outcome.err, context.DeadlineExceeded) || outcome.timedOut {
 		outcome.diagnostics = appendItemSidecarDiagnostics(outcome.diagnostics, itemWriter)
-		s.recordExecutionFailure(store, record, outcome.cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, outcome.diagnostics)
+		s.recordExecutionFailureWithSessionID(store, record, outcome.cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, outcome.diagnostics, outcome.backendSessionID)
 		return
 	}
 	if errors.Is(outcome.err, context.Canceled) || outcome.interrupted {
 		_, _, claimErr := run.claimStatus()
 		if claimErr != nil {
 			outcome.diagnostics = appendItemSidecarDiagnostics(outcome.diagnostics, itemWriter)
-			s.recordExecutionFailure(store, record, outcome.cleanup, protocol.FailureClassInternal, claimErr, outcome.diagnostics)
+			s.recordExecutionFailureWithSessionID(store, record, outcome.cleanup, protocol.FailureClassInternal, claimErr, outcome.diagnostics, outcome.backendSessionID)
 			return
 		}
 		outcome.diagnostics = appendItemSidecarDiagnostics(outcome.diagnostics, itemWriter)
-		s.recordExecutionFailure(store, record, outcome.cleanup, protocol.FailureClassInterrupted, outcome.err, outcome.diagnostics)
+		s.recordExecutionFailureWithSessionID(store, record, outcome.cleanup, protocol.FailureClassInterrupted, outcome.err, outcome.diagnostics, outcome.backendSessionID)
 		return
 	}
 	if outcome.err != nil {
 		outcome.diagnostics = appendItemSidecarDiagnostics(outcome.diagnostics, itemWriter)
-		s.recordExecutionFailure(store, record, outcome.cleanup, classifyExecutionFailure(outcome.err), outcome.err, outcome.diagnostics)
+		s.recordExecutionFailureWithSessionID(store, record, outcome.cleanup, classifyExecutionFailure(outcome.err), outcome.err, outcome.diagnostics, outcome.backendSessionID)
 		return
 	}
-	text, contract, cleanup, diagnostics := s.evaluateOutputSchema(store, record, run, session, jobCtx, timeout, spec, logPaths, items, outcome.text, outcome.cleanup, outcome.diagnostics)
+	text, backendSessionID, contract, cleanup, diagnostics := s.evaluateOutputSchema(store, record, run, session, jobCtx, timeout, spec, logPaths, items, outcome.text, outcome.backendSessionID, outcome.cleanup, outcome.diagnostics)
 	diagnostics = appendItemSidecarDiagnostics(diagnostics, itemWriter)
-	s.recordExecutionCompletion(store, record, text, cleanup, diagnostics, contract)
+	s.recordExecutionCompletion(store, record, text, cleanup, diagnostics, contract, backendSessionID)
 }
 
 func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpec, error) {
@@ -507,17 +553,76 @@ func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpec, error) {
 	return spec, nil
 }
 
+// resumeTargetForExecution repeats admission's durable target checks without
+// consulting the backend. The source job is terminal and immutable, so this is
+// a consistency check before the new job crosses its no-relaunch boundary.
+func resumeTargetForExecution(store *jobstore.Store, spec protocol.TaskSpec) (*jobstore.Record, error) {
+	if spec.ResumeJobID == "" {
+		return nil, nil
+	}
+	if store == nil {
+		return nil, errors.New("job store is unavailable")
+	}
+	target, err := store.Get(spec.ResumeJobID)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateResumeTarget(spec, target); err != nil {
+		return nil, err
+	}
+	return &target, nil
+}
+
+// resumeCodexHome returns the exact CODEX_HOME that owned the source job's
+// thread. It intentionally never creates a replacement: a missing source home
+// must fail the new job rather than making a fresh thread look like a resume.
+func (s *Server) resumeCodexHome(source jobstore.Record) (string, error) {
+	if s == nil {
+		return "", errors.New("nil service server")
+	}
+	if s.codexHomeInherit {
+		// The source and resumed jobs both inherit the daemon's CODEX_HOME.
+		return "", nil
+	}
+	if override := strings.TrimSpace(s.codexHomeOverride); override != "" {
+		if !filepath.IsAbs(override) {
+			return "", errors.New("AGENTBUS_CODEX_HOME must be an absolute path")
+		}
+		path := filepath.Clean(override)
+		info, err := os.Stat(path)
+		if err != nil {
+			return "", fmt.Errorf("inspect configured Codex home: %w", err)
+		}
+		if !info.IsDir() {
+			return "", errors.New("configured Codex home is not a directory")
+		}
+		return path, nil
+	}
+	if source.JobID == "" || filepath.Base(source.JobID) != source.JobID || source.CWD == "" {
+		return "", errors.New("resume target has no valid managed Codex home identity")
+	}
+	path := filepath.Join(s.stateRoot, "workspaces", engine.WorkspaceKey(source.CWD), "codex", source.JobID)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("inspect source Codex home: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", errors.New("source Codex home is not a directory")
+	}
+	return path, nil
+}
+
 // evaluateOutputSchema runs only after the initial turn has successfully
 // retired and before the job's sole terminal write. A correction failure is a
 // contract failure, not a reason to discard the already authoritative result.
-func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, spec protocol.TaskSpec, logPaths engine.LogPaths, items *itemAssembler, original string, cleanup protocol.Cleanup, diagnostics []string) (string, protocol.ContractResult, protocol.Cleanup, []string) {
+func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Record, run *activeExecution, session engine.Session, ctx context.Context, timeout time.Duration, spec protocol.TaskSpec, logPaths engine.LogPaths, items *itemAssembler, original string, backendSessionID string, cleanup protocol.Cleanup, diagnostics []string) (string, string, protocol.ContractResult, protocol.Cleanup, []string) {
 	if len(spec.OutputSchema) == 0 {
-		return original, protocol.ContractResult{}, cleanup, diagnostics
+		return original, backendSessionID, protocol.ContractResult{}, cleanup, diagnostics
 	}
 
 	digest, err := schema.Digest(spec.OutputSchema)
 	if err != nil {
-		return original, protocol.ContractResult{
+		return original, backendSessionID, protocol.ContractResult{
 			Evaluated:  true,
 			Compliant:  false,
 			Attempts:   1,
@@ -536,17 +641,17 @@ func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Rec
 		contract.Evaluated = true
 		contract.Compliant = false
 		contract.Violations = []string{"schema validation: " + executionFailureReason(err)}
-		return original, contract, cleanup, append(diagnostics, "evaluate output schema: "+executionFailureReason(err))
+		return original, backendSessionID, contract, cleanup, append(diagnostics, "evaluate output schema: "+executionFailureReason(err))
 	}
 	if contract.Compliant {
-		return original, contract, cleanup, diagnostics
+		return original, backendSessionID, contract, cleanup, diagnostics
 	}
 	if err := ctx.Err(); err != nil {
-		return original, contract, cleanup, diagnostics
+		return original, backendSessionID, contract, cleanup, diagnostics
 	}
 	initialClaimAttempted, initialClaimRecorded, initialClaimErr := run.claimStatus()
 	if initialClaimErr != nil || !initialClaimAttempted || !initialClaimRecorded {
-		return original, contract, cleanup, diagnostics
+		return original, backendSessionID, contract, cleanup, diagnostics
 	}
 
 	// collectTurn returns only after the initial event stream closes. The
@@ -554,26 +659,29 @@ func (s *Server) evaluateOutputSchema(store *jobstore.Store, record jobstore.Rec
 	// stream, so the correction's claim is recorded after the initial process
 	// has retired.
 	correction := s.runCorrectionTurn(store, record, run, session, ctx, timeout, logPaths, items, schema.CorrectionPrompt(string(spec.OutputSchema), initial.Violations))
+	if correction.backendSessionID != "" {
+		backendSessionID = correction.backendSessionID
+	}
 	if correction.cleanup == protocol.CleanupUncertain {
 		cleanup = protocol.CleanupUncertain
 	}
 	diagnostics = append(diagnostics, correction.diagnostics...)
 	contract.Attempts = 2
 	if correction.err != nil || correction.timedOut || correction.interrupted {
-		return original, contract, cleanup, diagnostics
+		return original, backendSessionID, contract, cleanup, diagnostics
 	}
 	if _, _, claimErr := run.claimStatus(); claimErr != nil {
-		return original, contract, cleanup, diagnostics
+		return original, backendSessionID, contract, cleanup, diagnostics
 	}
 
 	corrected, err := schema.Validate(correction.text, spec.OutputSchema)
 	if err != nil || !corrected.Compliant {
-		return original, contract, cleanup, diagnostics
+		return original, backendSessionID, contract, cleanup, diagnostics
 	}
 	contract.Evaluated = corrected.Evaluated
 	contract.Compliant = corrected.Compliant
 	contract.Violations = append([]string(nil), corrected.Violations...)
-	return correction.text, contract, cleanup, diagnostics
+	return correction.text, backendSessionID, contract, cleanup, diagnostics
 }
 
 // runCorrectionTurn starts the sole read-only correction turn after the
@@ -658,12 +766,13 @@ func classifyExecutionFailure(err error) protocol.FailureClass {
 }
 
 type turnOutcome struct {
-	text        string
-	err         error
-	timedOut    bool
-	interrupted bool
-	cleanup     protocol.Cleanup
-	diagnostics []string
+	text             string
+	backendSessionID string
+	err              error
+	timedOut         bool
+	interrupted      bool
+	cleanup          protocol.Cleanup
+	diagnostics      []string
 }
 
 func collectTurn(ctx context.Context, run *activeExecution, events <-chan engine.Event, items *itemAssembler) turnOutcome {
@@ -739,6 +848,9 @@ func absorbTurnEvent(outcome *turnOutcome, assistant *strings.Builder, result *s
 		if event.TurnFinal == nil {
 			return
 		}
+		if strings.TrimSpace(event.TurnFinal.BackendSessionID) != "" {
+			outcome.backendSessionID = event.TurnFinal.BackendSessionID
+		}
 		if event.TurnFinal.CleanupFailed {
 			outcome.cleanup = protocol.CleanupUncertain
 			outcome.diagnostics = append(outcome.diagnostics, "backend reported uncertain cleanup")
@@ -785,10 +897,10 @@ func cleanupForRun(run *activeExecution, cleanup protocol.Cleanup, diagnostics [
 	return cleanup, diagnostics
 }
 
-func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstore.Record, text string, cleanup protocol.Cleanup, diagnostics []string, contract protocol.ContractResult) {
+func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstore.Record, text string, cleanup protocol.Cleanup, diagnostics []string, contract protocol.ContractResult, backendSessionID string) {
 	info, err := spillAuthoritativeResult(record, []byte(text))
 	if err != nil {
-		s.recordExecutionFailure(store, record, cleanup, protocol.FailureClassInternal, fmt.Errorf("spill authoritative result: %w", err), diagnostics)
+		s.recordExecutionFailureWithSessionID(store, record, cleanup, protocol.FailureClassInternal, fmt.Errorf("spill authoritative result: %w", err), diagnostics, backendSessionID)
 		return
 	}
 	resultText := info.Text
@@ -796,29 +908,35 @@ func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstor
 		resultText = ""
 	}
 	s.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
-		State:        protocol.PublicStateCompleted,
-		Cleanup:      cleanup,
-		Diagnostics:  diagnostics,
-		Contract:     contract,
-		ResultText:   resultText,
-		ResultPath:   info.ResultPath,
-		ResultSHA256: info.SHA256,
-		ResultBytes:  info.Bytes,
-		FinishedAt:   time.Now().UTC(),
+		State:            protocol.PublicStateCompleted,
+		Cleanup:          cleanup,
+		BackendSessionID: backendSessionID,
+		Diagnostics:      diagnostics,
+		Contract:         contract,
+		ResultText:       resultText,
+		ResultPath:       info.ResultPath,
+		ResultSHA256:     info.SHA256,
+		ResultBytes:      info.Bytes,
+		FinishedAt:       time.Now().UTC(),
 	})
 }
 
 func (s *Server) recordExecutionFailure(store *jobstore.Store, record jobstore.Record, cleanup protocol.Cleanup, class protocol.FailureClass, cause error, diagnostics []string) {
+	s.recordExecutionFailureWithSessionID(store, record, cleanup, class, cause, diagnostics, "")
+}
+
+func (s *Server) recordExecutionFailureWithSessionID(store *jobstore.Store, record jobstore.Record, cleanup protocol.Cleanup, class protocol.FailureClass, cause error, diagnostics []string, backendSessionID string) {
 	if !class.Valid() {
 		class = protocol.FailureClassInternal
 	}
 	s.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
-		State:         protocol.PublicStateFailed,
-		Cleanup:       cleanup,
-		FailureClass:  class,
-		FailureReason: executionFailureReason(cause),
-		Diagnostics:   diagnostics,
-		FinishedAt:    time.Now().UTC(),
+		State:            protocol.PublicStateFailed,
+		Cleanup:          cleanup,
+		BackendSessionID: backendSessionID,
+		FailureClass:     class,
+		FailureReason:    executionFailureReason(cause),
+		Diagnostics:      diagnostics,
+		FinishedAt:       time.Now().UTC(),
 	})
 }
 

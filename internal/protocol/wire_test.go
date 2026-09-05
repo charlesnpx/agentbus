@@ -51,22 +51,23 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 	}
 	summaryContract := &ContractVerdict{Evaluated: true, Compliant: false}
 	record := JobRecordWire{
-		JobID:         "job-1",
-		WorkspaceKey:  "workspace-1",
-		RequestID:     "request-1",
-		Backend:       "codex",
-		State:         PublicStateCompleted,
-		Tags:          map[string]string{"team": "core"},
-		CreatedAt:     createdAt,
-		StartedAt:     &startedAt,
-		FinishedAt:    &finishedAt,
-		Timeout:       timeout,
-		Result:        result,
-		Contract:      contract,
-		Failure:       &JobFailureWire{Class: FailureClassBackendError, Reason: "backend stopped"},
-		Cleanup:       CleanupUncertain,
-		LogPaths:      logPaths,
-		ModelReported: "gpt-5",
+		JobID:            "job-1",
+		WorkspaceKey:     "workspace-1",
+		RequestID:        "request-1",
+		Backend:          "codex",
+		State:            PublicStateCompleted,
+		Tags:             map[string]string{"team": "core"},
+		CreatedAt:        createdAt,
+		StartedAt:        &startedAt,
+		FinishedAt:       &finishedAt,
+		Timeout:          timeout,
+		Result:           result,
+		Contract:         contract,
+		Failure:          &JobFailureWire{Class: FailureClassBackendError, Reason: "backend stopped"},
+		Cleanup:          CleanupUncertain,
+		LogPaths:         logPaths,
+		ModelReported:    "gpt-5",
+		BackendSessionID: "thread-1",
 	}
 	summary := JobSummaryWire{
 		JobID:         "job-1",
@@ -88,6 +89,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		CWD:          "/workspace",
 		Prompt:       "do work",
 		Write:        true,
+		ResumeJobID:  "job_previous",
 		Model:        &model,
 		Effort:       &effort,
 		TimeoutMS:    &requested,
@@ -121,7 +123,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 		Gap: false,
 	}
 
-	const recordJSON = `{"jobId":"job-1","workspaceKey":"workspace-1","requestId":"request-1","backend":"codex","state":"completed","tags":{"team":"core"},"createdAt":"2025-01-02T03:04:05Z","startedAt":"2025-01-02T03:05:05Z","finishedAt":"2025-01-02T03:06:05Z","timeout":{"requested":1234,"effective":2345,"source":"client"},"result":{"text":"answer","resultPath":"/results/job-1","sha256":"result-sha","bytes":42},"contract":{"schemaSha256":"schema-sha","evaluated":true,"compliant":true,"attempts":2,"violations":["/answer"]},"failure":{"class":"backend_error","reason":"backend stopped"},"cleanup":"uncertain","logPaths":{"stdout":"/logs/job-1.out","stdoutTruncated":false,"stderr":"/logs/job-1.err","stderrTruncated":false},"modelReported":"gpt-5"}`
+	const recordJSON = `{"jobId":"job-1","workspaceKey":"workspace-1","requestId":"request-1","backend":"codex","state":"completed","tags":{"team":"core"},"createdAt":"2025-01-02T03:04:05Z","startedAt":"2025-01-02T03:05:05Z","finishedAt":"2025-01-02T03:06:05Z","timeout":{"requested":1234,"effective":2345,"source":"client"},"result":{"text":"answer","resultPath":"/results/job-1","sha256":"result-sha","bytes":42},"contract":{"schemaSha256":"schema-sha","evaluated":true,"compliant":true,"attempts":2,"violations":["/answer"]},"failure":{"class":"backend_error","reason":"backend stopped"},"cleanup":"uncertain","logPaths":{"stdout":"/logs/job-1.out","stdoutTruncated":false,"stderr":"/logs/job-1.err","stderrTruncated":false},"modelReported":"gpt-5","backendSessionId":"thread-1"}`
 	const summaryJSON = `{"jobId":"job-1","backend":"codex","state":"failed","tags":{"team":"core"},"cleanup":"uncertain","createdAt":"2025-01-02T03:04:05Z","updatedAt":"2025-01-02T03:07:05Z","modelReported":"gpt-5","failureClass":"backend_error","contract":{"evaluated":true,"compliant":false},"itemCount":2,"lastItemAt":"2025-01-02T03:07:06Z","liveness":"alive"}`
 
 	tests := []struct {
@@ -183,7 +185,7 @@ func TestWireGoldenJSONRoundTrip(t *testing.T) {
 			name:  "JobSubmitParams",
 			value: JobSubmitParams{WorkspaceKey: "workspace-1", RequestID: "request-1", TaskSpec: taskSpec},
 			new:   func() any { return new(JobSubmitParams) },
-			want:  `{"workspaceKey":"workspace-1","requestId":"request-1","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true,"model":"gpt-5","effort":"high","timeoutMs":1234,"outputSchema":{"type":"object"},"tags":{"team":"core"}}}`,
+			want:  `{"workspaceKey":"workspace-1","requestId":"request-1","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true,"resumeJobId":"job_previous","model":"gpt-5","effort":"high","timeoutMs":1234,"outputSchema":{"type":"object"},"tags":{"team":"core"}}}`,
 		},
 		{
 			name:  "JobSubmitResult",
@@ -298,6 +300,7 @@ func TestJobRecordWireFieldAllowList(t *testing.T) {
 		"State": {}, "Tags": {}, "CreatedAt": {}, "StartedAt": {},
 		"FinishedAt": {}, "Timeout": {}, "Result": {}, "Contract": {},
 		"Failure": {}, "Cleanup": {}, "LogPaths": {}, "ModelReported": {},
+		"BackendSessionID": {},
 	}
 
 	recordType := reflect.TypeOf(JobRecordWire{})

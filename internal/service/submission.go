@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/jcs"
@@ -21,6 +22,28 @@ type jobSubmitInput struct {
 	key               jobstore.RequestKey
 	taskSpec          map[string]json.RawMessage
 	canonicalTaskSpec []byte
+}
+
+// resumeTargetError identifies a resume target that makes a new task invalid.
+// It remains an invalid_task_spec protocol error because protocol v3 has no
+// separate resume error code, while retaining the target job ID in ErrorData.
+type resumeTargetError struct {
+	jobID string
+	cause error
+}
+
+func (err *resumeTargetError) Error() string {
+	if err == nil || err.cause == nil {
+		return "resume target is unavailable"
+	}
+	return fmt.Sprintf("resume target %q: %v", err.jobID, err.cause)
+}
+
+func (err *resumeTargetError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.cause
 }
 
 // handleJobSubmit keeps idempotency ahead of all present-time backend and
@@ -43,7 +66,7 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "open job store: "+err.Error(), protocol.ErrorData{})}
 	}
 	var executionBackend engine.Backend
-	record, deduplicated, err := store.SubmitTx(input.key, input.canonicalTaskSpec, func(id string) (jobstore.Record, error) {
+	record, deduplicated, err := store.SubmitTxWithLookup(input.key, input.canonicalTaskSpec, func(id string, lookup jobstore.RecordLookup) (jobstore.Record, error) {
 		// Everything in this factory is new-key-only: SubmitTx has already
 		// compared the canonical TaskSpec hash with a durable binding.
 		spec, err := decodeTaskSpec(input.canonicalTaskSpec)
@@ -52,6 +75,11 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 		}
 		if err := validateNewTaskSpec(spec, input.taskSpec); err != nil {
 			return jobstore.Record{}, err
+		}
+		if spec.ResumeJobID != "" {
+			if _, err := resumeTargetFromLookup(spec, lookup); err != nil {
+				return jobstore.Record{}, err
+			}
 		}
 		// Production Server instances never mutate their private configured
 		// backend map after New. Capture the admitted adapter with this new job
@@ -79,6 +107,10 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 	if err != nil {
 		if errors.Is(err, jobstore.ErrConflict) {
 			return s.jobSubmitConflict(err)
+		}
+		var resumeErr *resumeTargetError
+		if errors.As(err, &resumeErr) {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "submit job: "+resumeErr.Error(), protocol.ErrorData{JobID: resumeErr.jobID})}
 		}
 		return requestOutcome{err: protocol.NewError(protocol.ErrorInvalidTaskSpec, "submit job: "+err.Error(), protocol.ErrorData{})}
 	}
@@ -149,7 +181,7 @@ func parseJobSubmitInput(raw json.RawMessage) (jobSubmitInput, error) {
 	}
 	for name := range input.taskSpec {
 		switch name {
-		case "backend", "cwd", "write", "prompt", "model", "effort", "outputSchema", "tags", "timeoutMs":
+		case "backend", "cwd", "write", "prompt", "resumeJobId", "model", "effort", "outputSchema", "tags", "timeoutMs":
 		default:
 			return jobSubmitInput{}, fmt.Errorf("json: unknown field %q", name)
 		}
@@ -173,7 +205,7 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 			return fmt.Errorf("taskSpec missing required field %s", required)
 		}
 	}
-	for _, optional := range []string{"model", "effort", "outputSchema", "tags", "timeoutMs"} {
+	for _, optional := range []string{"resumeJobId", "model", "effort", "outputSchema", "tags", "timeoutMs"} {
 		value, present := raw[optional]
 		if present && string(value) == "null" {
 			return fmt.Errorf("taskSpec.%s cannot be null", optional)
@@ -181,6 +213,9 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 	}
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
 		return fmt.Errorf("taskSpec requires backend, absolute cwd, write, and prompt")
+	}
+	if _, supplied := raw["resumeJobId"]; supplied && strings.TrimSpace(spec.ResumeJobID) == "" {
+		return errors.New("taskSpec.resumeJobId must name a job")
 	}
 	if _, errObj := timeoutFromMillis(spec.TimeoutMS); errObj != nil {
 		return errors.New(errObj.Message)
@@ -193,6 +228,44 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 		if _, err := schema.Validate("null", spec.OutputSchema); err != nil {
 			return fmt.Errorf("outputSchema: %w", err)
 		}
+	}
+	return nil
+}
+
+func resumeTargetFromLookup(spec protocol.TaskSpec, lookup jobstore.RecordLookup) (jobstore.Record, error) {
+	if lookup == nil {
+		return jobstore.Record{}, &resumeTargetError{jobID: spec.ResumeJobID, cause: errors.New("resume lookup is unavailable")}
+	}
+	target, err := lookup(spec.ResumeJobID)
+	if err != nil {
+		return jobstore.Record{}, &resumeTargetError{jobID: spec.ResumeJobID, cause: err}
+	}
+	if err := validateResumeTarget(spec, target); err != nil {
+		return jobstore.Record{}, &resumeTargetError{jobID: spec.ResumeJobID, cause: err}
+	}
+	return target, nil
+}
+
+// validateResumeTarget limits resume to a retired non-completed job. A live
+// session may still be running, and completed Codex jobs deliberately clean
+// their per-job home, so either case could make Resume race or silently lose
+// the thread history. Failed, canceled, and unknown terminal jobs are eligible
+// when their retired turn recorded a backend session ID.
+func validateResumeTarget(spec protocol.TaskSpec, target jobstore.Record) error {
+	if target.JobID != spec.ResumeJobID {
+		return errors.New("resume lookup returned a different job")
+	}
+	if target.Backend != spec.Backend {
+		return fmt.Errorf("resume target backend %q does not match taskSpec.backend %q", target.Backend, spec.Backend)
+	}
+	if target.State == protocol.PublicStateCompleted {
+		return errors.New("completed jobs are not resumable")
+	}
+	if !target.State.IsTerminal() {
+		return fmt.Errorf("resume target is %s rather than terminal", target.State)
+	}
+	if strings.TrimSpace(target.BackendSessionID) == "" {
+		return errors.New("resume target has no recorded backend session")
 	}
 	return nil
 }
