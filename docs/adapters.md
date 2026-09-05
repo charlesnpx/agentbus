@@ -399,6 +399,27 @@ The codex adapter maps:
 | `turn/completed` with status `completed` or empty status | `ResultMessage` | result text is the last completed agent message, a turn-level last-agent message, or the last agent delta |
 | `turn/completed` with status `failed`, unexpected interruption, or unsupported status | terminal error | the shared duplex runtime emits the driver error as a terminal error |
 
+## Cursor ACP event mapping
+
+For `cursor-acp-v1`, Cursor emits ACP `session/update` notifications while a
+`session/prompt` request is active. Tool-call notifications are lifecycle
+frames, not independently countable tool operations.
+
+The pinned Cursor fixture establishes `in_progress` as a nonterminal status and
+`completed` as a terminal one. It does not establish another terminal status,
+so the adapter records only `completed` immediately and retains every other
+status until prompt processing ends. That fallback preserves a tool observation
+when Cursor finishes a prompt without a terminal tool-call frame.
+
+| Cursor ACP frame | agentbus event | Basis |
+| --- | --- | --- |
+| `session/update` `agent_message_chunk` | `AgentText` | incremental assistant text |
+| `session/update` `tool_call` or `tool_call_update` with a nonterminal status | `Progress` | a lifecycle frame advances the liveness clock without adding a second tool item |
+| `session/update` `tool_call` or `tool_call_update` with the same `toolCallId` and status `completed` | `ToolUse` | fields from the lifecycle are correlated by id and produce exactly one item |
+| a correlated tool-call frame whose `content` includes a `diff` block | `ToolUse` with `ObservedWorkspaceWriteItem` | the emitted item has no text; the service retains only the workspace-write count, never diff paths or contents |
+| prompt completion after a correlated call has no recognized terminal frame | `ToolUse` | the pending call is flushed once before the result, preventing an unterminated lifecycle from being lost |
+| `session/prompt` response with `stopReason: "end_turn"` | `ResultMessage` | result text is the concatenated assistant chunks |
+
 ## Adding a backend
 
 This is the normative recipe for adding a backend adapter. A backend profile
