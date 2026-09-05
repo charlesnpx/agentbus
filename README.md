@@ -13,7 +13,7 @@ state-root break for this release, are in
 ~~~text
 agentbus version [--json]
 agentbus serve [--foreground]
-agentbus status [--job <id>] [--json]
+agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--all-workspaces] [--json]
 agentbus result --job <id> [--json]
 agentbus cancel --job <id> [--json]
 ~~~

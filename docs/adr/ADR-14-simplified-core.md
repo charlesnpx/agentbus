@@ -32,7 +32,7 @@ them.
 ### Protocol version 3
 
 Protocol version is 3. Its entire method set is protocol.hello, job.submit,
-job.get, and job.cancel. Any other method, including a former method, is absent
+job.get, job.list, and job.cancel. Any other method, including a former method, is absent
 and MUST return the JSON-RPC method-not-found response. Each shape below is a
 JSON-RPC params or result object, not its envelope. Optional fields are omitted,
 never null. Times are RFC 3339 UTC strings.
@@ -166,10 +166,23 @@ boolean is true only when the file ends in the capped-log marker (and is
 explicitly false for an untruncated file); default backend logs are bounded at
 64 MiB.
 
-job.get with an empty object returns compact summaries:
+job.get requires a non-empty jobId. An empty parameter object is an
+invalid_task_spec parameter error and never lists jobs.
+
+job.list returns compact summaries:
 
     params
-    {}
+    {
+      "workspaceKey": "string",
+      "tags": {"string": "string"},
+      "states": ["queued|running|completed|failed|canceled|unknown"]
+    }
+
+workspaceKey, tags, and states are optional. An empty workspaceKey means no
+workspace filter, so the server returns matching jobs from every workspace and
+does not invent a default. A tag filter matches only when every requested key
+has its requested value. A state filter matches public state. Empty or omitted
+tags and states do not filter; all supplied dimensions combine with AND.
 
     result
     {
@@ -178,6 +191,7 @@ job.get with an empty object returns compact summaries:
           "jobId": "string",
           "backend": "string",
           "state": "queued|running|completed|failed|canceled|unknown",
+          "tags": {"string": "string"},
           "cleanup": "clean|uncertain",
           "createdAt": "RFC3339 UTC timestamp",
           "updatedAt": "RFC3339 UTC timestamp",
@@ -185,16 +199,34 @@ job.get with an empty object returns compact summaries:
           "contract": {
             "evaluated": true,
             "compliant": true
-          }
+          },
+          "itemCount": 12,
+          "lastItemAt": "RFC3339 UTC timestamp",
+          "liveness": "alive|gone|unknown"
         }
       ]
     }
 
 Each JobSummary requires jobId, backend, state, cleanup, createdAt, and
-updatedAt. failureClass and the compact contract verdict are optional. If
-present, contract contains only evaluated and compliant. A summary never
-contains workspaceKey, requestId, tags, timeout, result, failure reason,
-logPaths, prompt, cwd, or a process claim.
+updatedAt. tags, failureClass, modelReported, and the compact contract verdict
+are optional. If present, contract contains only evaluated and compliant. tags
+is the submitted tag map and makes a tag match visible to the caller.
+
+itemCount and liveness appear only while this daemon has an active execution
+for the job. lastItemAt appears after that execution has assembled an item.
+Terminal jobs and jobs known only from a previous daemon lifetime omit those
+fields. Liveness is derived from the exact recorded process-claim comparison:
+matching is alive, a missing or mismatched recorded process is gone, and an
+unreadable or incomplete identity is unknown. A summary never contains
+workspaceKey, requestId, timeout, result, failure reason, logPaths, prompt,
+cwd, a PID, a process-group ID, a start token, or a process claim.
+
+Workspace filtering is scoping, not ownership. The same-user local socket has
+no stable authenticated caller identity, so Agentbus cannot enforce who owns a
+job. The CLI derives the SHA-256 workspace key from its canonical current
+working directory for status without --job; --all-workspaces intentionally
+clears that filter. Multiple orchestrators in one repository share a workspace
+scope.
 
 job.cancel:
 
@@ -207,8 +239,8 @@ job.cancel:
       "state": "queued|running|completed|failed|canceled|unknown"
     }
 
-Former extra job, schema, and capability operations are deleted. There is no
-status-list flag; an empty job.get object is the only list request.
+Former extra job, schema, and capability operations are deleted. job.list is
+the only list request.
 
 ### CLI version 0.13.0
 
@@ -216,11 +248,15 @@ The complete CLI surface is version, serve, status, result, and cancel. There
 is no submit command: Delegate makes the typed job.submit request after task and
 identity preparation.
 
-status and result MUST project the same job.get response differently. For a
-selected job, their JSON modes write the byte-identical JobRecord, including
-inline result text when it is present. The human-readable status projection uses
-JobSummary for a list or JobRecord for one job, shows lifecycle, cleanup,
-contract verdict, and failure class, and MUST NEVER print the result text.
+status and result MUST project the same job.get response differently for a
+selected job. Their JSON modes write the byte-identical JobRecord, including
+inline result text when it is present. Without --job, status invokes job.list,
+derives and sends the current workspace scope by default, and sends no
+workspaceKey under --all-workspaces. --tag and --state are repeatable job.list
+filters. The human-readable status projection uses JobSummary for a list or
+JobRecord for one job, shows lifecycle, cleanup, contract verdict, failure
+class, tags, and any present activity or liveness fields, and MUST NEVER print
+the result text.
 result fetches the same JobRecord, writes authoritative terminal result text to
 standard output, and writes the applicable failure reason to standard error. A
 successful result is therefore pipeable. If no authoritative terminal result
@@ -559,7 +595,7 @@ delete an old root.
 - A recorded terminal state is immutable.
 - Cleanup uncertainty cannot erase an authoritative result.
 - Restart reaping signals only exact start-token equality.
-- The public protocol has exactly four methods and exactly six states.
+- The public protocol has exactly five methods and exactly six states.
 - The version-3 store opens safely before socket bind or returns a typed error.
 - Old roots are not compatible with version 0.13.0 and are not migrated.
 
@@ -604,9 +640,8 @@ signaling supports.
 
 After ADR-14 was first written, its wire examples were corrected against the
 authoritative specification. TaskSpec uses outputSchema, and JobRecord preserves
-the required nested, operator-visible fields while the empty-object job.get
-listing remains compact. These corrections remove shape drift without changing
-the collapse's semantics.
+the required nested, operator-visible fields while job.list remains compact.
+These corrections remove shape drift without changing the collapse's semantics.
 
 The amended launch invariant distinguishes the one initial turn from the one
 permitted correction turn, applies durable state-before-spawn and separate claims
@@ -619,3 +654,9 @@ changing the collapse's retained boundaries.
 The submit result includes the resolved timeout. New-record validation failure
 is a rejection with no job record or requests binding. The state vocabulary was
 reviewed to confirm that no retry state is implied.
+
+The version-3 contract now separates single-record job.get from filtered
+job.list without a version bump. job.list exposes submitted tags plus
+daemon-local item activity and liveness verdicts, never process identifiers.
+Workspace scoping remains a client-selected filter rather than an ownership
+claim or enforcement mechanism.

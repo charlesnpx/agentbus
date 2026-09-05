@@ -11,12 +11,14 @@ const (
 	// Version is the protocol major version served by the simplified daemon.
 	Version = 3
 
-	// MethodJobGet retrieves one job, or all jobs when jobId is empty.
+	// MethodJobGet retrieves one identified job.
 	MethodJobGet = "job.get"
+	// MethodJobList retrieves compact job summaries.
+	MethodJobList = "job.list"
 )
 
 // The protocol error codes are the only codes protocol.hello, job.submit, job.get,
-// and job.cancel may produce.
+// job.list, and job.cancel may produce.
 const (
 	ErrorUnauthorized       = "unauthorized"
 	ErrorVersionMismatch    = "protocol_version_mismatch"
@@ -49,6 +51,31 @@ func (state PublicState) IsTerminal() bool {
 		return false
 	}
 }
+
+// Valid reports whether state is a public job state.
+func (state PublicState) Valid() bool {
+	switch state {
+	case PublicStateQueued,
+		PublicStateRunning,
+		PublicStateCompleted,
+		PublicStateFailed,
+		PublicStateCanceled,
+		PublicStateUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+// Liveness is the daemon's current verdict for an active job's recorded
+// process claim. It deliberately exposes no process identifiers.
+type Liveness string
+
+const (
+	LivenessAlive   Liveness = "alive"
+	LivenessGone    Liveness = "gone"
+	LivenessUnknown Liveness = "unknown"
+)
 
 // FailureClass is the stable, machine-readable category for a failed job.
 type FailureClass string
@@ -149,14 +176,21 @@ type JobSubmitResult struct {
 	Timeout      *engine.TimeoutResolution `json:"timeout,omitempty"`
 }
 
-// JobGetParams is the parameter object for job.get. A non-empty JobID returns
-// a JobRecordWire directly; an empty JobID returns a JobGetListResult.
+// JobGetParams is the parameter object for job.get.
 type JobGetParams struct {
 	JobID string `json:"jobId,omitempty"`
 }
 
-// JobGetListResult is the response to job.get when JobID is empty.
-type JobGetListResult struct {
+// JobListParams is the parameter object for job.list. Every field is
+// optional; omitted or empty filters do not restrict the result.
+type JobListParams struct {
+	WorkspaceKey string            `json:"workspaceKey,omitempty"`
+	Tags         map[string]string `json:"tags,omitempty"`
+	States       []PublicState     `json:"states,omitempty"`
+}
+
+// JobListResult is the response to job.list.
+type JobListResult struct {
 	Jobs []JobSummaryWire `json:"jobs"`
 }
 
@@ -197,7 +231,7 @@ type JobRecordWire struct {
 	ModelReported string                    `json:"modelReported,omitempty"`
 }
 
-// JobSummaryWire is the compact item returned when job.get lists jobs. It
+// JobSummaryWire is the compact item returned when job.list lists jobs. It
 // deliberately excludes request-local identifiers, task details, detailed
 // results, failure reasons, logs, and process claims.
 type JobSummaryWire struct {
@@ -207,6 +241,8 @@ type JobSummaryWire struct {
 	Backend string `json:"backend"`
 	// State lets a client distinguish pending work from terminal work.
 	State PublicState `json:"state"`
+	// Tags identifies the submitted labels that can be used to filter a list.
+	Tags map[string]string `json:"tags,omitempty"`
 	// Cleanup reports post-run cleanup certainty alongside the public state.
 	Cleanup Cleanup `json:"cleanup"`
 	// CreatedAt reports when the job was created.
@@ -219,6 +255,13 @@ type JobSummaryWire struct {
 	FailureClass FailureClass `json:"failureClass,omitempty"`
 	// Contract is the compact output-schema verdict, when evaluation occurred.
 	Contract *ContractVerdict `json:"contract,omitempty"`
+	// ItemCount is present only while this daemon has an active execution.
+	ItemCount *int `json:"itemCount,omitempty"`
+	// LastItemAt is present after an active execution has assembled an item.
+	LastItemAt *time.Time `json:"lastItemAt,omitempty"`
+	// Liveness is present only while this daemon has an active execution.
+	// It is a verdict, never a process identifier or process claim.
+	Liveness Liveness `json:"liveness,omitempty"`
 }
 
 // JobFailureWire records the public failure category and reason for a job.

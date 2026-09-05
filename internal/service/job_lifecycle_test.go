@@ -22,7 +22,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-func TestJobGetReturnsBareRecordAndCompactSummaries(t *testing.T) {
+func TestJobGetRequiresIDAndReturnsBareRecord(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
 	tags := map[string]string{"unit": "u9"}
 	timeout := int64(250)
@@ -30,6 +30,11 @@ func TestJobGetReturnsBareRecordAndCompactSummaries(t *testing.T) {
 	params.TaskSpec.Tags = &tags
 	params.TaskSpec.TimeoutMS = &timeout
 	submitted := submitResultForTest(t, submitForTest(t, server, params))
+
+	empty := server.handleJobGet(json.RawMessage(`{}`))
+	if empty.err == nil || empty.err.Data.Code != protocol.ErrorInvalidTaskSpec {
+		t.Fatalf("empty job.get = %#v, want typed invalid params", empty.err)
+	}
 
 	single := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: submitted.JobID}))
 	if single.err != nil {
@@ -80,26 +85,153 @@ func TestJobGetReturnsBareRecordAndCompactSummaries(t *testing.T) {
 	if result := detailedRecord.Result; result.Text != durable.ResultText || result.ResultPath != durable.ResultPath || result.SHA256 != durable.ResultSHA256 || result.Bytes != durable.ResultBytes {
 		t.Fatalf("job.get detailed result = %#v, want durable path:%q sha256:%q bytes:%d", result, durable.ResultPath, durable.ResultSHA256, durable.ResultBytes)
 	}
+}
 
-	list := server.handleJobGet(json.RawMessage(`{}`))
-	if list.err != nil {
-		t.Fatalf("job.get list error = %#v", list.err)
+func TestJobListFiltersCombineWithAND(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
+	submit := func(workspace, requestID string, tags map[string]string) protocol.JobSubmitResult {
+		params := submissionParams(workspace, requestID, "fake", t.TempDir(), requestID)
+		params.TaskSpec.Tags = &tags
+		return submitResultForTest(t, submitForTest(t, server, params))
 	}
-	result, ok := list.result.(protocol.JobGetListResult)
-	if !ok {
-		t.Fatalf("job.get list result = %T, want protocol.JobGetListResult", list.result)
-	}
-	if len(result.Jobs) != 1 || result.Jobs[0].JobID != submitted.JobID {
-		t.Fatalf("job.get list = %#v", result)
-	}
-	encoded, err := json.Marshal(result.Jobs[0])
+	queued := submit("workspace-a", "queued", map[string]string{"project": "one", "team": "core"})
+	failed := submit("workspace-b", "failed", map[string]string{"project": "one", "team": "ops"})
+	completed := submit("workspace-a", "completed", map[string]string{"project": "two", "team": "core"})
+	store, err := server.ensureJobStore()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range [][]byte{[]byte(`workspaceKey`), []byte(`requestId`), []byte(`timeout`), []byte(`processClaim`)} {
-		if bytes.Contains(encoded, forbidden) {
-			t.Fatalf("summary JSON = %s, unexpectedly contains %s", encoded, forbidden)
+	if _, err := store.MarkTerminal(failed.JobID, jobstore.TerminalUpdate{
+		State:        protocol.PublicStateFailed,
+		Cleanup:      protocol.CleanupClean,
+		FailureClass: protocol.FailureClassBackendError,
+		FinishedAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkTerminal(completed.JobID, jobstore.TerminalUpdate{
+		State:      protocol.PublicStateCompleted,
+		Cleanup:    protocol.CleanupClean,
+		FinishedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		params protocol.JobListParams
+		want   []string
+	}{
+		{name: "no filters", want: []string{queued.JobID, failed.JobID, completed.JobID}},
+		{name: "workspace", params: protocol.JobListParams{WorkspaceKey: "workspace-a"}, want: []string{queued.JobID, completed.JobID}},
+		{name: "tags", params: protocol.JobListParams{Tags: map[string]string{"project": "one"}}, want: []string{queued.JobID, failed.JobID}},
+		{name: "states", params: protocol.JobListParams{States: []protocol.PublicState{protocol.PublicStateCompleted}}, want: []string{completed.JobID}},
+		{name: "all filters", params: protocol.JobListParams{
+			WorkspaceKey: "workspace-a",
+			Tags:         map[string]string{"project": "one", "team": "core"},
+			States:       []protocol.PublicState{protocol.PublicStateQueued},
+		}, want: []string{queued.JobID}},
+	} {
+		outcome := server.handleJobList(mustJSON(t, test.params))
+		if outcome.err != nil {
+			t.Fatalf("%s job.list error = %#v", test.name, outcome.err)
 		}
+		result, ok := outcome.result.(protocol.JobListResult)
+		if !ok {
+			t.Fatalf("%s job.list result = %T, want protocol.JobListResult", test.name, outcome.result)
+		}
+		got := make(map[string]protocol.JobSummaryWire, len(result.Jobs))
+		for _, summary := range result.Jobs {
+			got[summary.JobID] = summary
+		}
+		if len(got) != len(test.want) {
+			t.Fatalf("%s job.list = %#v, want IDs %#v", test.name, result.Jobs, test.want)
+		}
+		for _, jobID := range test.want {
+			if _, ok := got[jobID]; !ok {
+				t.Fatalf("%s job.list missing %q: %#v", test.name, jobID, result.Jobs)
+			}
+		}
+		if test.name == "all filters" && got[queued.JobID].Tags["project"] != "one" {
+			t.Fatalf("job.list summary tags = %#v, want projected tags", got[queued.JobID].Tags)
+		}
+	}
+}
+
+func TestJobListProjectsActiveActivityAndLiveness(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
+	params := submissionParams("activity-workspace", "activity-request", "fake", t.TempDir(), "activity")
+	tags := map[string]string{"watch": "true"}
+	params.TaskSpec.Tags = &tags
+	submitted := submitResultForTest(t, submitForTest(t, server, params))
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(submitted.JobID); err != nil {
+		t.Fatal(err)
+	}
+	claim := jobstore.ProcessClaim{PID: 7191, PGID: 7191, StartToken: "activity-token"}
+	record, err := store.RecordProcessClaim(submitted.JobID, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := newActiveExecution(record.JobID, server.backends[record.Backend])
+	lastItemAt := time.Now().UTC().Round(0)
+	run.noteTranscriptItem(lastItemAt)
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: run}
+	server.executionMu.Unlock()
+
+	for _, test := range []struct {
+		name     string
+		table    summaryProcessTable
+		liveness protocol.Liveness
+	}{
+		{name: "matching claim", table: summaryProcessTable{info: engine.ProcessInfo{PID: claim.PID, StartTime: claim.StartToken}, alive: true}, liveness: protocol.LivenessAlive},
+		{name: "token mismatch", table: summaryProcessTable{info: engine.ProcessInfo{PID: claim.PID, StartTime: "recycled-token"}, alive: true}, liveness: protocol.LivenessGone},
+		{name: "unreadable claim", table: summaryProcessTable{err: errors.New("permission denied")}, liveness: protocol.LivenessUnknown},
+	} {
+		server.processTable = test.table
+		outcome := server.handleJobList(mustJSON(t, protocol.JobListParams{}))
+		if outcome.err != nil {
+			t.Fatalf("%s job.list error = %#v", test.name, outcome.err)
+		}
+		result := outcome.result.(protocol.JobListResult)
+		if len(result.Jobs) != 1 {
+			t.Fatalf("%s job.list jobs = %#v", test.name, result.Jobs)
+		}
+		summary := result.Jobs[0]
+		if summary.ItemCount == nil || *summary.ItemCount != 1 ||
+			summary.LastItemAt == nil || !summary.LastItemAt.Equal(lastItemAt) ||
+			summary.Liveness != test.liveness {
+			t.Fatalf("%s active summary = %#v", test.name, summary)
+		}
+		encoded, err := json.Marshal(summary)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, forbidden := range [][]byte{[]byte(`"pid"`), []byte(`"pgid"`), []byte(`"startToken"`), []byte(`"processClaim"`)} {
+			if bytes.Contains(encoded, forbidden) {
+				t.Fatalf("%s summary JSON = %s, unexpectedly contains %s", test.name, encoded, forbidden)
+			}
+		}
+	}
+
+	if _, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
+		State:      protocol.PublicStateCompleted,
+		Cleanup:    protocol.CleanupClean,
+		FinishedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	terminal := server.handleJobList(mustJSON(t, protocol.JobListParams{}))
+	if terminal.err != nil {
+		t.Fatalf("terminal job.list error = %#v", terminal.err)
+	}
+	summary := terminal.result.(protocol.JobListResult).Jobs[0]
+	if summary.ItemCount != nil || summary.LastItemAt != nil || summary.Liveness != "" {
+		t.Fatalf("terminal summary activity = %#v, want omitted fields", summary)
 	}
 }
 
@@ -531,6 +663,16 @@ type orphanReaperFixture struct {
 	lookups   int
 	signals   []processGroupSignalCall
 	groupGone []bool
+}
+
+type summaryProcessTable struct {
+	info  engine.ProcessInfo
+	alive bool
+	err   error
+}
+
+func (table summaryProcessTable) Lookup(int) (engine.ProcessInfo, bool, error) {
+	return table.info, table.alive, table.err
 }
 
 func newOrphanReaperFixture() *orphanReaperFixture {
