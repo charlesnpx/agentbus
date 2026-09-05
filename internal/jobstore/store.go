@@ -147,7 +147,9 @@ type Record struct {
 }
 
 // TerminalUpdate supplies the durable data for a first terminal transition.
-// State must be completed, failed, canceled, or unknown.
+// State must be completed, failed, canceled, or unknown. Completed records
+// always clear BackendSessionID; for other terminal states, an empty ID retains
+// one already recorded by a retired turn.
 type TerminalUpdate struct {
 	State            protocol.PublicState
 	Cleanup          protocol.Cleanup
@@ -610,6 +612,48 @@ func (store *Store) RecordProcessClaim(id string, claim ProcessClaim) (Record, e
 	return result, err
 }
 
+// RecordBackendSessionID records a non-empty backend session ID after a turn
+// retires. It is deliberately a separate transaction from the process claim:
+// a daemon can stop after a retired turn but before the job reaches terminal
+// state, and the session must still be available for restart recovery.
+func (store *Store) RecordBackendSessionID(id, sessionID string) (Record, error) {
+	if err := validateJobID(id); err != nil {
+		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return Record{}, fmt.Errorf("%w: backend session id is required", ErrInvalid)
+	}
+
+	var result Record
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if current.State.IsTerminal() {
+			return ErrTerminal
+		}
+
+		next := current
+		next.BackendSessionID = sessionID
+		next.UpdatedAt = time.Now().UTC()
+		normalizeRecord(&next)
+		if err := validateRecord(next); err != nil {
+			return err
+		}
+		if err := putRecord(jobs, next); err != nil {
+			return err
+		}
+		result = next
+		return nil
+	})
+	return result, err
+}
+
 // MarkTerminal records the first terminal state. Later updates are rejected so
 // a known result can never be overwritten by a late finalization or recovery.
 func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, error) {
@@ -638,7 +682,11 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 		next.State = terminal.State
 		next.Starting = false
 		next.Cleanup = terminal.Cleanup
-		next.BackendSessionID = terminal.BackendSessionID
+		if terminal.State == protocol.PublicStateCompleted {
+			next.BackendSessionID = ""
+		} else if terminal.BackendSessionID != "" {
+			next.BackendSessionID = terminal.BackendSessionID
+		}
 		next.FailureClass = terminal.FailureClass
 		next.FailureReason = terminal.FailureReason
 		next.Diagnostics = append([]string(nil), terminal.Diagnostics...)

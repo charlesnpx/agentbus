@@ -77,7 +77,7 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 			return jobstore.Record{}, err
 		}
 		if spec.ResumeJobID != "" {
-			if _, err := resumeTargetFromLookup(spec, lookup); err != nil {
+			if _, err := s.resumeTargetFromLookup(spec, lookup); err != nil {
 				return jobstore.Record{}, err
 			}
 		}
@@ -232,7 +232,7 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 	return nil
 }
 
-func resumeTargetFromLookup(spec protocol.TaskSpec, lookup jobstore.RecordLookup) (jobstore.Record, error) {
+func (s *Server) resumeTargetFromLookup(spec protocol.TaskSpec, lookup jobstore.RecordLookup) (jobstore.Record, error) {
 	if lookup == nil {
 		return jobstore.Record{}, &resumeTargetError{jobID: spec.ResumeJobID, cause: errors.New("resume lookup is unavailable")}
 	}
@@ -242,6 +242,11 @@ func resumeTargetFromLookup(spec protocol.TaskSpec, lookup jobstore.RecordLookup
 	}
 	if err := validateResumeTarget(spec, target); err != nil {
 		return jobstore.Record{}, &resumeTargetError{jobID: spec.ResumeJobID, cause: err}
+	}
+	if spec.Backend == "codex" {
+		if err := s.validateCodexResumeHome(); err != nil {
+			return jobstore.Record{}, &resumeTargetError{jobID: spec.ResumeJobID, cause: err}
+		}
 	}
 	return target, nil
 }

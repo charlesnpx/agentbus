@@ -768,29 +768,16 @@ func TestJobSubmitResumeTargetWithoutSessionReturnsTypedError(t *testing.T) {
 	}
 }
 
-func TestJobSubmitCompletedTargetWithRetainedHomeRemainsRejected(t *testing.T) {
+func TestJobSubmitCompletedTargetRemainsRejected(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
 	source := submitResultForTest(t, submitForTest(t, server, submissionParams("resume-completed-source", "source", "codex", t.TempDir(), "source")))
 	store, err := server.ensureJobStore()
 	if err != nil {
 		t.Fatal(err)
 	}
-	record, err := store.Get(source.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	layout, err := engine.LayoutForWorkspace(server.stateRoot, record.CWD)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(layout.Codex, record.JobID), 0o700); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := store.MarkTerminal(source.JobID, jobstore.TerminalUpdate{
-		State:            protocol.PublicStateCompleted,
-		Cleanup:          protocol.CleanupUncertain,
-		BackendSessionID: "retained-completed-thread",
-		FinishedAt:       time.Now().UTC(),
+		State:   protocol.PublicStateCompleted,
+		Cleanup: protocol.CleanupUncertain,
 	}); err != nil {
 		t.Fatal(err)
 	}

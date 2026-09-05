@@ -32,22 +32,24 @@ type activeExecution struct {
 	// cross a process-launch boundary. A request that acquires it first keeps a
 	// queued/starting job from subsequently reaching Backend.Start or
 	// Session.Turn before its durable cancellation is committed.
-	launchMu        sync.Mutex
-	mu              sync.Mutex
-	cancel          context.CancelFunc
-	session         engine.Session
-	cancelRequested bool
-	claimAttempted  bool
-	claimRecorded   bool
-	claimErr        error
-	interruptOnce   sync.Once
-	interruptErr    error
-	itemCount       int
-	lastItemAt      time.Time
-	lastActivityAt  time.Time
-	itemSidecarDiag string
-	turn            *activeTurn
-	latestSessionID string
+	launchMu           sync.Mutex
+	mu                 sync.Mutex
+	cancel             context.CancelFunc
+	session            engine.Session
+	cancelRequested    bool
+	claimAttempted     bool
+	claimRecorded      bool
+	claimErr           error
+	interruptOnce      sync.Once
+	interruptErr       error
+	itemCount          int
+	lastItemAt         time.Time
+	lastActivityAt     time.Time
+	itemSidecarDiag    string
+	turn               *activeTurn
+	latestSessionID    string
+	retiredCleanup     protocol.Cleanup
+	retiredDiagnostics []string
 }
 
 // activeTurn owns the one retirement receipt for a turn. A cancellation can
@@ -168,33 +170,50 @@ func (run *activeExecution) beginTurn() {
 	run.mu.Unlock()
 }
 
-// retireTurn publishes the full observed result of the current turn before a
-// cancellation commits its terminal record. The per-turn receipt remains
-// stable after a later correction turn starts.
-func (run *activeExecution) retireTurn(outcome turnOutcome) {
+// retireTurn durably records a non-empty session ID, then publishes the full
+// observed result of the current turn before a cancellation commits its
+// terminal record. The aggregate keeps facts from earlier turns available after
+// a later correction turn replaces the per-turn receipt.
+func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcome) turnOutcome {
 	if run == nil {
-		return
+		return outcome
 	}
 	run.mu.Lock()
 	turn := run.turn
 	run.mu.Unlock()
 	if turn == nil {
-		return
+		return outcome
 	}
 	turn.once.Do(func() {
+		if strings.TrimSpace(outcome.backendSessionID) != "" {
+			if store == nil {
+				outcome.cleanup = protocol.CleanupUncertain
+				outcome.diagnostics = append(outcome.diagnostics, "record backend session: job store is unavailable")
+			} else if _, err := store.RecordBackendSessionID(run.jobID, outcome.backendSessionID); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
+				outcome.cleanup = protocol.CleanupUncertain
+				outcome.diagnostics = append(outcome.diagnostics, "record backend session: "+err.Error())
+			}
+		}
+		outcome.diagnostics = append([]string(nil), outcome.diagnostics...)
 		turn.outcome = outcome
 		run.mu.Lock()
 		if strings.TrimSpace(outcome.backendSessionID) != "" {
 			run.latestSessionID = outcome.backendSessionID
 		}
+		if outcome.cleanup == protocol.CleanupUncertain {
+			run.retiredCleanup = protocol.CleanupUncertain
+		}
+		run.retiredDiagnostics = append(run.retiredDiagnostics, outcome.diagnostics...)
 		run.mu.Unlock()
 		close(turn.done)
 	})
+	<-turn.done
+	return turn.outcome
 }
 
 // retiredTurnOutcome waits only when a turn has been started. Its result is
-// the cancellation receipt; a job canceled before its first turn therefore
-// keeps the intentionally empty session ID.
+// the aggregate cancellation receipt; a job canceled before its first turn
+// therefore keeps the intentionally empty session ID and clean cleanup state.
 func (run *activeExecution) retiredTurnOutcome() (turnOutcome, bool) {
 	if run == nil {
 		return turnOutcome{}, false
@@ -208,8 +227,14 @@ func (run *activeExecution) retiredTurnOutcome() (turnOutcome, bool) {
 	<-turn.done
 	outcome := turn.outcome
 	run.mu.Lock()
-	if outcome.backendSessionID == "" {
+	if strings.TrimSpace(outcome.backendSessionID) == "" {
 		outcome.backendSessionID = run.latestSessionID
+	}
+	if run.retiredCleanup == protocol.CleanupUncertain {
+		outcome.cleanup = protocol.CleanupUncertain
+	}
+	if len(run.retiredDiagnostics) > 0 {
+		outcome.diagnostics = append([]string(nil), run.retiredDiagnostics...)
 	}
 	run.mu.Unlock()
 	return outcome, true
@@ -542,12 +567,12 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	})
 	if canceled {
 		if events == nil {
-			run.retireTurn(turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean})
+			run.retireTurn(store, turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean})
 			return
 		}
 		outcome := collectTurn(jobCtx, run, events, items)
 		outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
-		run.retireTurn(outcome)
+		run.retireTurn(store, outcome)
 		return
 	}
 	if err != nil {
@@ -556,14 +581,14 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			cleanup, diagnostics = cleanupForRun(run, cleanup, diagnostics)
 		}
 		diagnostics = appendItemSidecarDiagnostics(diagnostics, itemWriter)
-		run.retireTurn(turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics})
-		s.finishTurnError(store, record, jobCtx, err, cleanup, diagnostics)
+		outcome := run.retireTurn(store, turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics})
+		s.finishTurnError(store, record, jobCtx, outcome.err, outcome.cleanup, outcome.diagnostics)
 		return
 	}
 
 	outcome := collectTurn(jobCtx, run, events, items)
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
-	run.retireTurn(outcome)
+	outcome = run.retireTurn(store, outcome)
 	if run.cancellationRequested() {
 		return
 	}
@@ -625,31 +650,29 @@ func resumeTargetForExecution(store *jobstore.Store, spec protocol.TaskSpec) (*j
 	return &target, nil
 }
 
+// validateCodexResumeHome rejects compatibility home modes because the source
+// record does not retain their original path. A resumed thread must use the
+// durable per-job home that actually owns it.
+func (s *Server) validateCodexResumeHome() error {
+	if s == nil {
+		return errors.New("nil service server")
+	}
+	if s.codexHomeInherit {
+		return errors.New("cannot resume Codex job with inherited CODEX_HOME: the source job home was not recorded")
+	}
+	if strings.TrimSpace(s.codexHomeOverride) != "" {
+		return errors.New("cannot resume Codex job with AGENTBUS_CODEX_HOME override: the source job home was not recorded")
+	}
+	return nil
+}
+
 // resumeCodexHome returns the exact CODEX_HOME at the root of a resume
 // lineage: that is where the backend thread actually lives. It intentionally
 // never creates a replacement, because a missing thread home must fail the new
 // job rather than making a fresh thread look like a resume.
 func (s *Server) resumeCodexHome(store *jobstore.Store, source jobstore.Record) (string, error) {
-	if s == nil {
-		return "", errors.New("nil service server")
-	}
-	if s.codexHomeInherit {
-		// The source and resumed jobs both inherit the daemon's CODEX_HOME.
-		return "", nil
-	}
-	if override := strings.TrimSpace(s.codexHomeOverride); override != "" {
-		if !filepath.IsAbs(override) {
-			return "", errors.New("AGENTBUS_CODEX_HOME must be an absolute path")
-		}
-		path := filepath.Clean(override)
-		info, err := os.Stat(path)
-		if err != nil {
-			return "", fmt.Errorf("inspect configured Codex home: %w", err)
-		}
-		if !info.IsDir() {
-			return "", errors.New("configured Codex home is not a directory")
-		}
-		return path, nil
+	if err := s.validateCodexResumeHome(); err != nil {
+		return "", err
 	}
 	threadSource, err := resumeThreadSource(store, source)
 	if err != nil {
@@ -787,12 +810,12 @@ func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record
 	if canceled {
 		if events == nil {
 			outcome := turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean}
-			run.retireTurn(outcome)
+			outcome = run.retireTurn(store, outcome)
 			return outcome
 		}
 		outcome := collectTurn(ctx, run, events, items)
 		outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
-		run.retireTurn(outcome)
+		outcome = run.retireTurn(store, outcome)
 		return outcome
 	}
 	if err != nil {
@@ -801,13 +824,13 @@ func (s *Server) runCorrectionTurn(store *jobstore.Store, record jobstore.Record
 			cleanup, diagnostics = cleanupForRun(run, cleanup, diagnostics)
 		}
 		outcome := turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics}
-		run.retireTurn(outcome)
+		outcome = run.retireTurn(store, outcome)
 		return outcome
 	}
 
 	outcome := collectTurn(ctx, run, events, items)
 	outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
-	run.retireTurn(outcome)
+	outcome = run.retireTurn(store, outcome)
 	return outcome
 }
 

@@ -130,10 +130,10 @@ completed work.
 A resume creates a new job with a new id, record, transcript sidecar, result,
 and fresh deadline. It replays the prior backend thread as history; it does not
 continue the old job or extend its deadline. Under the normal managed Codex
-configuration, the new job uses the source job's retained CODEX_HOME so the
-backend can see that thread. Different resumeJobId values are different task
-specifications for identified replay, even when workspaceKey and requestId are
-the same.
+configuration, the new job uses the retained CODEX_HOME at the root of the
+resume lineage so the backend can see that thread. Different resumeJobId values
+are different task specifications for identified replay, even when workspaceKey
+and requestId are the same.
 
 The result always includes the resolved timeout:
 

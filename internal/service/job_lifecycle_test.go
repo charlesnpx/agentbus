@@ -391,25 +391,44 @@ func TestJobCancelBeforeSpawnIsDurable(t *testing.T) {
 	}
 }
 
-func TestJobCancelAfterTurnRetirementPreservesSessionForResume(t *testing.T) {
-	events := make(chan engine.Event, 1)
-	turnStarted := make(chan struct{})
-	backend := &executionFakeBackend{name: "cancel-retired-turn"}
+func TestJobCancelDuringCorrectionPreservesRetiredTurnOutcome(t *testing.T) {
+	schemaRaw := json.RawMessage(`{"required":["ok"],"type":"object"}`)
+	correctionEvents := make(chan engine.Event)
+	correctionStarted := make(chan struct{})
+	turns := 0
+	backend := &executionFakeBackend{name: "cancel-during-correction"}
 	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
 		return &executionFakeSession{
-			turn: func(_ context.Context, _ engine.TurnInput) (<-chan engine.Event, error) {
-				close(turnStarted)
-				return events, nil
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				turns++
+				switch turns {
+				case 1:
+					input.OnProcessStart(engine.ProcessRef{PID: 4113, PGID: 4113, StartTime: "initial-correction-token"}, 0)
+					return executionEvents(
+						engine.Event{Type: engine.EventResultMessage, Text: `{"wrong":true}`},
+						engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-initial", CleanupFailed: true}},
+					), nil
+				case 2:
+					if input.Write {
+						t.Fatal("correction turn was write-enabled")
+					}
+					input.OnProcessStart(engine.ProcessRef{PID: 4114, PGID: 4114, StartTime: "correction-cancel-token"}, 0)
+					close(correctionStarted)
+					return correctionEvents, nil
+				default:
+					t.Fatalf("turns = %d, want initial and correction turns", turns)
+					return nil, nil
+				}
 			},
 			interrupt: func(context.Context) error {
-				events <- engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "thread-canceled"}}
-				close(events)
+				close(correctionEvents)
 				return nil
 			},
 		}, nil
 	}
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
-	record := queuedExecutionRecord(t, server, backend.Name(), "cancel after turn", nil)
+	server.processGroupGoneFn = func(int) (bool, error) { return true, nil }
+	record := queuedExecutionRecordWithSchema(t, server, backend.Name(), "correct after invalid output", nil, schemaRaw)
 	run := newActiveExecution(record.JobID, backend)
 	server.executionMu.Lock()
 	server.executions = map[string]*activeExecution{record.JobID: run}
@@ -420,9 +439,9 @@ func TestJobCancelAfterTurnRetirementPreservesSessionForResume(t *testing.T) {
 		close(done)
 	}()
 	select {
-	case <-turnStarted:
+	case <-correctionStarted:
 	case <-time.After(time.Second):
-		t.Fatal("turn did not start")
+		t.Fatal("correction turn did not start")
 	}
 
 	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
@@ -432,7 +451,7 @@ func TestJobCancelAfterTurnRetirementPreservesSessionForResume(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("canceled turn did not retire")
+		t.Fatal("canceled correction did not retire")
 	}
 
 	store, err := server.ensureJobStore()
@@ -443,14 +462,17 @@ func TestJobCancelAfterTurnRetirementPreservesSessionForResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != protocol.PublicStateCanceled || stored.BackendSessionID != "thread-canceled" {
-		t.Fatalf("canceled terminal record = %#v, want retained turn session", stored)
+	if stored.State != protocol.PublicStateCanceled || stored.Cleanup != protocol.CleanupUncertain || stored.BackendSessionID != "thread-initial" {
+		t.Fatalf("canceled correction record = %#v, want canceled uncertain record with initial session", stored)
 	}
-	params := submissionParams("cancel-resume-workspace", "cancel-resume-request", backend.Name(), t.TempDir(), "continue")
-	params.TaskSpec.ResumeJobID = record.JobID
-	resumed := submitResultForTest(t, submitForTest(t, server, params))
-	if resumed.State != protocol.PublicStateQueued {
-		t.Fatalf("resume after cancellation = %#v, want admitted queued job", resumed)
+	initialDiagnosticCount := 0
+	for _, diagnostic := range stored.Diagnostics {
+		if diagnostic == "backend reported uncertain cleanup" {
+			initialDiagnosticCount++
+		}
+	}
+	if initialDiagnosticCount != 1 {
+		t.Fatalf("canceled correction diagnostics = %#v, want one initial cleanup diagnostic", stored.Diagnostics)
 	}
 }
 
@@ -558,7 +580,7 @@ func TestRestartQueuedBecomesFailedWithoutStart(t *testing.T) {
 	}
 }
 
-func TestRestartRunningBecomesUnknownWithUncertainCleanup(t *testing.T) {
+func TestRestartDuringCorrectionPreservesRetiredSessionForResume(t *testing.T) {
 	root := t.TempDir()
 	first := newTestServer(t, root, Config{Backends: []engine.Backend{helloBackend{name: "restart-running"}}})
 	submitted := submitResultForTest(t, submitForTest(t, first, submissionParams("restart-running-workspace", "restart-running-request", "restart-running", t.TempDir(), "task")))
@@ -569,7 +591,18 @@ func TestRestartRunningBecomesUnknownWithUncertainCleanup(t *testing.T) {
 	if _, err := store.MarkStarting(submitted.JobID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.RecordProcessClaim(submitted.JobID, jobstore.ProcessClaim{PID: 2147483647, PGID: 2147483647, StartToken: "missing-running-token"}); err != nil {
+	run := newActiveExecution(submitted.JobID, nil)
+	run.beginTurn()
+	if _, err := store.RecordProcessClaim(submitted.JobID, jobstore.ProcessClaim{PID: 2147483647, PGID: 2147483647, StartToken: "initial-turn-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if retired := run.retireTurn(store, turnOutcome{backendSessionID: "thread-recovered", cleanup: protocol.CleanupClean}); retired.backendSessionID != "thread-recovered" {
+		t.Fatalf("retired turn = %#v, want recorded session", retired)
+	}
+	// The initial turn has retired and its session write has committed before
+	// this second turn starts; restart reconciliation must retain that ID.
+	run.beginTurn()
+	if _, err := store.RecordProcessClaim(submitted.JobID, jobstore.ProcessClaim{PID: 2147483647, PGID: 2147483647, StartToken: "correction-turn-token"}); err != nil {
 		t.Fatal(err)
 	}
 	first.closeJobStore()
@@ -586,8 +619,14 @@ func TestRestartRunningBecomesUnknownWithUncertainCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != protocol.PublicStateUnknown || stored.Cleanup != protocol.CleanupUncertain {
+	if stored.State != protocol.PublicStateUnknown || stored.Cleanup != protocol.CleanupUncertain || stored.BackendSessionID != "thread-recovered" {
 		t.Fatalf("reconciled running record = %#v", stored)
+	}
+	params := submissionParams("restart-resume-workspace", "restart-resume-request", "restart-running", t.TempDir(), "continue")
+	params.TaskSpec.ResumeJobID = submitted.JobID
+	resumed := submitResultForTest(t, submitForTest(t, restarted, params))
+	if resumed.State != protocol.PublicStateQueued {
+		t.Fatalf("resume after restart reconciliation = %#v, want queued job", resumed)
 	}
 }
 

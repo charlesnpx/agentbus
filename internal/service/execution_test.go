@@ -839,3 +839,61 @@ func TestExecutionResumeFollowsManagedHomeLineage(t *testing.T) {
 		t.Fatalf("second resumed terminal = %+v, want a distinct record with its own artifacts", secondTerminal)
 	}
 }
+
+func TestJobSubmitRejectsCodexResumeWithoutPerJobHome(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		config     func(*testing.T, *Config)
+		wantReason string
+	}{
+		{
+			name: "inherited home",
+			config: func(_ *testing.T, cfg *Config) {
+				cfg.CodexHomeInherit = true
+			},
+			wantReason: "inherited CODEX_HOME",
+		},
+		{
+			name: "override home",
+			config: func(t *testing.T, cfg *Config) {
+				cfg.CodexHomeOverride = t.TempDir()
+			},
+			wantReason: "AGENTBUS_CODEX_HOME override",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := &executionFakeBackend{name: "codex"}
+			cfg := Config{Backends: []engine.Backend{backend}}
+			tt.config(t, &cfg)
+			server := newTestServer(t, t.TempDir(), cfg)
+			source := queuedExecutionRecord(t, server, backend.Name(), "source", nil)
+			store, err := server.ensureJobStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.MarkTerminal(source.JobID, jobstore.TerminalUpdate{
+				State:            protocol.PublicStateFailed,
+				Cleanup:          protocol.CleanupClean,
+				BackendSessionID: "thread-source",
+				FailureClass:     protocol.FailureClassBackendError,
+				FailureReason:    "source turn stopped",
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			params := submissionParams("non-managed-resume-"+strings.ReplaceAll(tt.name, " ", "-"), "resume", backend.Name(), t.TempDir(), "continue")
+			params.TaskSpec.ResumeJobID = source.JobID
+			outcome := submitForTest(t, server, params)
+			if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || outcome.err.Data.JobID != source.JobID || !strings.Contains(outcome.err.Message, tt.wantReason) {
+				t.Fatalf("rejected resume submission = %#v, want invalid task spec explaining %q for %q", outcome.err, tt.wantReason, source.JobID)
+			}
+			records, err := store.List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(records) != 1 || records[0].JobID != source.JobID {
+				t.Fatalf("records after rejected resume = %#v, want only source %q", records, source.JobID)
+			}
+		})
+	}
+}
