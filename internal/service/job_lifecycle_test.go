@@ -476,16 +476,22 @@ func TestRestartPromotesWriteAheadEvidenceMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != protocol.PublicStateUnknown || !stored.EvidenceIncomplete || stored.BackendSessionID != "thread-crashed" {
-		t.Fatalf("reconciled write-ahead record = %#v, want unknown terminal record with the durable receipt and incomplete evidence", stored)
+	if stored.State != protocol.PublicStateUnknown || !stored.EvidenceIncomplete || stored.Cleanup != protocol.CleanupUncertain || stored.BackendSessionID != "" {
+		t.Fatalf("reconciled write-ahead record = %#v, want unknown terminal record with uncertain cleanup and no resumable session", stored)
 	}
 	transcript := transcriptResultForTest(t, restarted, protocol.JobTranscriptParams{JobID: record.JobID})
 	if !transcript.Gap {
 		t.Fatalf("restarted transcript = %#v, want gap from surviving write-ahead marker", transcript)
 	}
+	resume := submissionParams("restart-incomplete-resume", "resume", backend.Name(), t.TempDir(), "continue")
+	resume.TaskSpec.ResumeJobID = record.JobID
+	resumeOutcome := submitForTest(t, restarted, resume)
+	if resumeOutcome.err == nil || resumeOutcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || resumeOutcome.err.Data.JobID != record.JobID || resumeOutcome.result != nil {
+		t.Fatalf("resume from incomplete terminal record = %#v, want typed invalid-task error for %q", resumeOutcome, record.JobID)
+	}
 }
 
-func TestJobCancelDuringCorrectionPreservesRetiredTurnOutcome(t *testing.T) {
+func TestJobCancelDuringCorrectionProjectsRetiredSessionOnlyWithCompleteEvidence(t *testing.T) {
 	schemaRaw := json.RawMessage(`{"required":["ok"],"type":"object"}`)
 	correctionEvents := make(chan engine.Event)
 	correctionStarted := make(chan struct{})
@@ -556,8 +562,8 @@ func TestJobCancelDuringCorrectionPreservesRetiredTurnOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != protocol.PublicStateCanceled || stored.Cleanup != protocol.CleanupUncertain || stored.BackendSessionID != "thread-initial" {
-		t.Fatalf("canceled correction record = %#v, want canceled uncertain record with initial session", stored)
+	if stored.State != protocol.PublicStateCanceled || stored.Cleanup != protocol.CleanupUncertain || stored.Retirement == nil || stored.Retirement.BackendSessionID != "thread-initial" {
+		t.Fatalf("canceled correction record = %#v, want canceled record retaining the initial private receipt", stored)
 	}
 	initialDiagnosticCount := 0
 	for _, diagnostic := range stored.Diagnostics {
@@ -570,9 +576,19 @@ func TestJobCancelDuringCorrectionPreservesRetiredTurnOutcome(t *testing.T) {
 	}
 	resume := submissionParams("cancel-correction-resume", "resume", backend.Name(), t.TempDir(), "continue")
 	resume.TaskSpec.ResumeJobID = record.JobID
-	resumed := submitResultForTest(t, submitForTest(t, server, resume))
-	if resumed.State != protocol.PublicStateQueued {
-		t.Fatalf("resume from canceled correction = %#v, want queued", resumed)
+	if stored.EvidenceIncomplete {
+		resumeOutcome := submitForTest(t, server, resume)
+		if stored.BackendSessionID != "" || resumeOutcome.err == nil || resumeOutcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || resumeOutcome.err.Data.JobID != record.JobID || resumeOutcome.result != nil {
+			t.Fatalf("resume from incomplete correction = stored %#v, outcome %#v; want no stale session and a typed invalid-task error for %q", stored, resumeOutcome, record.JobID)
+		}
+	} else {
+		if stored.BackendSessionID != "thread-initial" {
+			t.Fatalf("complete correction record = %#v, want initial resumable session", stored)
+		}
+		resumed := submitResultForTest(t, submitForTest(t, server, resume))
+		if resumed.State != protocol.PublicStateQueued {
+			t.Fatalf("resume from complete correction = %#v, want queued", resumed)
+		}
 	}
 }
 

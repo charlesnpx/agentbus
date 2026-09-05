@@ -361,6 +361,43 @@ func TestV0131RecordDecodesWithoutInventedRetirementEvidence(t *testing.T) {
 	}
 }
 
+func TestMarkedTerminalSuppressesStaleRetirementProjection(t *testing.T) {
+	store := newTestStore(t)
+	defer closeTestStore(t, store)
+
+	record, _, err := store.SubmitTx(
+		RequestKey{WorkspaceKey: "workspace-incomplete-evidence", RequestID: "request-incomplete-evidence"},
+		testTaskSpec("terminalize incomplete evidence"),
+		func(string) (Record, error) { return Record{Backend: "codex"}, nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkEvidenceIncomplete(record.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RetireTurn(record.JobID, RetirementReceipt{BackendSessionID: "thread-stale"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClearEvidenceIncomplete(record.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkEvidenceIncomplete(record.JobID); err != nil {
+		t.Fatal(err)
+	}
+
+	terminal, err := store.MarkTerminal(record.JobID, TerminalUpdate{
+		State:   protocol.PublicStateCanceled,
+		Cleanup: protocol.CleanupClean,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.State != protocol.PublicStateCanceled || !terminal.EvidenceIncomplete || terminal.Cleanup != protocol.CleanupUncertain || terminal.BackendSessionID != "" || terminal.Retirement == nil || terminal.Retirement.BackendSessionID != "thread-stale" {
+		t.Fatalf("marked terminal record = %#v, want uncertain cleanup and no stale session projection", terminal)
+	}
+}
+
 func TestReopenRecoversTerminalRecord(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "jobs.db")
 	store, err := Open(path)

@@ -780,7 +780,7 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 		next.State = terminal.State
 		next.Starting = false
 		next.Cleanup = terminal.Cleanup
-		if next.Retirement != nil && next.Retirement.CleanupUncertain {
+		if next.EvidenceIncomplete || (next.Retirement != nil && next.Retirement.CleanupUncertain) {
 			next.Cleanup = protocol.CleanupUncertain
 		}
 		next.Diagnostics = mergeTerminalDiagnostics(next.Retirement, terminal.Diagnostics)
@@ -877,6 +877,11 @@ func applyTerminalPayload(record *Record, terminal TerminalUpdate) {
 }
 
 func retirementBackendSessionID(record Record) string {
+	if record.EvidenceIncomplete {
+		// A surviving marker means the most recent turn's receipt was not
+		// durably recorded, so an earlier session cannot be safely projected.
+		return ""
+	}
 	if record.Retirement != nil && strings.TrimSpace(record.Retirement.BackendSessionID) != "" {
 		return record.Retirement.BackendSessionID
 	}
