@@ -205,21 +205,22 @@ func jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, error) {
 		tags = *spec.Tags
 	}
 	return protocol.JobRecordWire{
-		JobID:        record.JobID,
-		WorkspaceKey: record.WorkspaceKey,
-		RequestID:    record.RequestID,
-		Backend:      record.Backend,
-		State:        projectedState(record),
-		Tags:         tags,
-		CreatedAt:    record.CreatedAt,
-		StartedAt:    record.StartedAt,
-		FinishedAt:   record.FinishedAt,
-		Timeout:      timeout,
-		Result:       projectResult(record),
-		Contract:     projectContract(record, spec),
-		Failure:      projectFailure(record),
-		Cleanup:      record.Cleanup,
-		LogPaths:     projectLogPaths(record),
+		JobID:         record.JobID,
+		WorkspaceKey:  record.WorkspaceKey,
+		RequestID:     record.RequestID,
+		Backend:       record.Backend,
+		State:         projectedState(record),
+		Tags:          tags,
+		CreatedAt:     record.CreatedAt,
+		StartedAt:     record.StartedAt,
+		FinishedAt:    record.FinishedAt,
+		Timeout:       timeout,
+		Result:        projectResult(record),
+		Contract:      projectContract(record, spec),
+		Failure:       projectFailure(record),
+		Cleanup:       record.Cleanup,
+		LogPaths:      projectLogPaths(record),
+		ModelReported: record.ModelReported,
 	}, nil
 }
 
@@ -229,15 +230,16 @@ func (s *Server) jobSummaryWireFromSpec(record jobstore.Record, spec protocol.Ta
 		tags = *spec.Tags
 	}
 	wire := protocol.JobSummaryWire{
-		JobID:        record.JobID,
-		Backend:      record.Backend,
-		State:        projectedState(record),
-		Tags:         tags,
-		Cleanup:      record.Cleanup,
-		CreatedAt:    record.CreatedAt,
-		UpdatedAt:    record.UpdatedAt,
-		FailureClass: projectFailureClass(record),
-		Contract:     projectContractVerdict(record, spec),
+		JobID:         record.JobID,
+		Backend:       record.Backend,
+		State:         projectedState(record),
+		Tags:          tags,
+		Cleanup:       record.Cleanup,
+		CreatedAt:     record.CreatedAt,
+		UpdatedAt:     record.UpdatedAt,
+		ModelReported: record.ModelReported,
+		FailureClass:  projectFailureClass(record),
+		Contract:      projectContractVerdict(record, spec),
 	}
 	if record.State.IsTerminal() {
 		return wire

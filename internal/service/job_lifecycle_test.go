@@ -89,6 +89,82 @@ func TestJobGetRequiresIDAndReturnsBareRecord(t *testing.T) {
 	}
 }
 
+func TestJobLifecycleProjectsBackendReportedModel(t *testing.T) {
+	const requestedModel = "caller-requested-model"
+	for _, test := range []struct {
+		name      string
+		requestID string
+		reported  string
+	}{
+		{name: "reported", requestID: "reported", reported: "backend-resolved-model"},
+		{name: "not reported", requestID: "not-reported"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := &executionFakeBackend{name: "model-" + test.requestID}
+			backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+				return &executionFakeSession{
+					turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+						input.OnProcessStart(engine.ProcessRef{PID: 4190, PGID: 4190, StartTime: "model-report-token"}, 0)
+						events := []engine.Event{}
+						if test.reported != "" {
+							events = append(events, engine.Event{Type: engine.EventModelReported, ModelReported: test.reported})
+						}
+						events = append(events, engine.Event{Type: engine.EventResultMessage, Text: "finished"})
+						return executionEvents(events...), nil
+					},
+				}, nil
+			}
+			server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
+			params := submissionParams("model-workspace", "model-"+test.requestID, backend.Name(), t.TempDir(), "report the resolved model")
+			requested := requestedModel
+			params.TaskSpec.Model = &requested
+			submitted := submitResultForTest(t, submitForTest(t, server, params))
+
+			store, err := server.ensureJobStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			record, err := store.Get(submitted.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runExecution(t, server, record)
+
+			stored, err := store.Get(submitted.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.ModelReported != test.reported {
+				t.Fatalf("stored modelReported = %q, want %q", stored.ModelReported, test.reported)
+			}
+
+			get := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: submitted.JobID}))
+			if get.err != nil {
+				t.Fatalf("job.get error = %#v", get.err)
+			}
+			detail, ok := get.result.(protocol.JobRecordWire)
+			if !ok {
+				t.Fatalf("job.get result = %T, want protocol.JobRecordWire", get.result)
+			}
+			if detail.ModelReported != test.reported {
+				t.Fatalf("job.get modelReported = %q, want %q", detail.ModelReported, test.reported)
+			}
+
+			list := server.handleJobList(mustJSON(t, protocol.JobListParams{}))
+			if list.err != nil {
+				t.Fatalf("job.list error = %#v", list.err)
+			}
+			jobs := list.result.(protocol.JobListResult).Jobs
+			if len(jobs) != 1 || jobs[0].JobID != submitted.JobID || jobs[0].ModelReported != test.reported {
+				t.Fatalf("job.list jobs = %#v, want %q with modelReported %q", jobs, submitted.JobID, test.reported)
+			}
+			if test.reported == "" && (stored.ModelReported == requestedModel || detail.ModelReported == requestedModel || jobs[0].ModelReported == requestedModel) {
+				t.Fatalf("unreported model echoed requested model %q", requestedModel)
+			}
+		})
+	}
+}
+
 func TestJobListFiltersCombineWithAND(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
 	submit := func(workspace, requestID string, tags map[string]string) protocol.JobSubmitResult {

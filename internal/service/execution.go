@@ -185,6 +185,15 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 		return outcome
 	}
 	turn.once.Do(func() {
+		if strings.TrimSpace(outcome.modelReported) != "" {
+			if store == nil {
+				outcome.cleanup = protocol.CleanupUncertain
+				outcome.diagnostics = append(outcome.diagnostics, "record reported model: job store is unavailable")
+			} else if _, err := store.RecordModelReported(run.jobID, outcome.modelReported); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
+				outcome.cleanup = protocol.CleanupUncertain
+				outcome.diagnostics = append(outcome.diagnostics, "record reported model: "+err.Error())
+			}
+		}
 		if strings.TrimSpace(outcome.backendSessionID) != "" {
 			if store == nil {
 				outcome.cleanup = protocol.CleanupUncertain
@@ -889,6 +898,7 @@ func classifyExecutionFailure(err error) protocol.FailureClass {
 type turnOutcome struct {
 	text             string
 	backendSessionID string
+	modelReported    string
 	err              error
 	timedOut         bool
 	interrupted      bool
@@ -952,6 +962,10 @@ func absorbTurnEvent(outcome *turnOutcome, assistant *strings.Builder, result *s
 	rawText := authoritativeText(event)
 	items.absorb(event, rawText)
 	switch event.Type {
+	case engine.EventModelReported:
+		if outcome.modelReported == "" {
+			outcome.modelReported = strings.TrimSpace(event.ModelReported)
+		}
 	case engine.EventAgentText:
 		assistant.WriteString(rawText)
 	case engine.EventResultMessage:
