@@ -464,9 +464,11 @@ func printJobTranscript(out io.Writer, transcript agentclient.JobTranscriptResul
 	}
 	fmt.Fprintf(out, " gap=%t\n", transcript.Gap)
 	if digest {
-		fmt.Fprintf(out, "counts message=%d tool=%d fileChange=%d warning=%d error=%d\n",
+		fmt.Fprintf(out, "counts message=%d reasoning=%d tool=%d toolResult=%d fileChange=%d warning=%d error=%d\n",
 			transcript.Counts["message"],
+			transcript.Counts["reasoning"],
 			transcript.Counts["tool"],
+			transcript.Counts["toolResult"],
 			transcript.Counts["fileChange"],
 			transcript.Counts["warning"],
 			transcript.Counts["error"],

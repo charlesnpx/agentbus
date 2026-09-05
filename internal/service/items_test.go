@@ -200,10 +200,10 @@ func TestTranscriptItemsCapTextAndDoNotCoalesceReasoningOrToolResults(t *testing
 					engine.Event{Type: engine.EventAgentText, Text: prefix},
 					engine.Event{Type: engine.EventAgentText, Text: "€"},
 					engine.Event{Type: engine.EventToolUse, Name: "large-output", Text: tooLong},
-					engine.Event{Type: "Reasoning", Text: tooLong},
-					engine.Event{Type: "Reasoning", Text: tooLong},
-					engine.Event{Type: "ToolResult", Name: "large-result-one", Text: tooLong},
-					engine.Event{Type: "ToolResult", Name: "large-result-two", Text: tooLong},
+					engine.Event{Type: engine.EventReasoning, Text: tooLong},
+					engine.Event{Type: engine.EventReasoning, Text: tooLong},
+					engine.Event{Type: engine.EventToolResult, Text: tooLong},
+					engine.Event{Type: engine.EventToolResult, Text: tooLong},
 				), nil
 			},
 		}, nil
@@ -221,8 +221,8 @@ func TestTranscriptItemsCapTextAndDoNotCoalesceReasoningOrToolResults(t *testing
 		{kind: transcriptItemTool, name: "large-output"},
 		{kind: transcriptItemReasoning},
 		{kind: transcriptItemReasoning},
-		{kind: transcriptItemToolResult, name: "large-result-one"},
-		{kind: transcriptItemToolResult, name: "large-result-two"},
+		{kind: transcriptItemToolResult},
+		{kind: transcriptItemToolResult},
 	}
 	if len(items) != len(want) {
 		t.Fatalf("item count = %d, want %d: %#v", len(items), len(want), items)

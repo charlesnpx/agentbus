@@ -209,7 +209,8 @@ type JobTranscriptParams struct {
 }
 
 // TranscriptItem is one normalized, backend-neutral event captured for a
-// job. Kind is one of message, tool, fileChange, warning, or error.
+// job. Kind is one of message, reasoning, tool, toolResult, fileChange,
+// warning, or error.
 type TranscriptItem struct {
 	Ordinal   int       `json:"ordinal"`
 	At        time.Time `json:"at"`
