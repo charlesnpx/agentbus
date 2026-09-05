@@ -125,7 +125,6 @@ type itemSidecarWriter struct {
 	textCap     int
 	fileCap     int64
 	file        *os.File
-	syncFile    func(*os.File) error
 	written     int64
 	next        int
 	stopped     bool
@@ -141,10 +140,9 @@ func newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarW
 		fileCap = transcriptItemFileCap
 	}
 	writer := &itemSidecarWriter{
-		path:     path,
-		textCap:  textCap,
-		fileCap:  fileCap,
-		syncFile: (*os.File).Sync,
+		path:    path,
+		textCap: textCap,
+		fileCap: fileCap,
 	}
 	if strings.TrimSpace(writer.path) == "" {
 		writer.noteFailure("open", fmt.Errorf("path is empty"))
@@ -294,10 +292,6 @@ func (writer *itemSidecarWriter) recordFailureMarker() {
 		return
 	}
 	defer file.Close()
-	if _, err := file.Write([]byte("sidecar failure\n")); err != nil {
-		return
-	}
-	_ = file.Sync()
 }
 
 func (writer *itemSidecarWriter) close() {
@@ -306,7 +300,7 @@ func (writer *itemSidecarWriter) close() {
 	}
 	file := writer.file
 	writer.file = nil
-	if err := writer.syncFile(file); err != nil {
+	if err := file.Sync(); err != nil {
 		writer.noteFailure("sync", err)
 	}
 	if err := file.Close(); err != nil {

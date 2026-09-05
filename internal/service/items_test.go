@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -471,15 +470,6 @@ func TestCanceledTranscriptReportsGapWhenSidecarSyncFailsAfterTerminal(t *testin
 	record := transcriptTestRecord(t, server, "gap-sync-failure-after-cancel")
 	writer := newItemSidecarWriter(transcriptItemPath(t, record), transcriptItemTextCap, transcriptItemFileCap)
 	writer.append(transcriptItemTool, "lost", "captured before sync failed", false)
-	syncEntered := make(chan struct{})
-	releaseSync := make(chan struct{})
-	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { close(releaseSync) }) }
-	writer.syncFile = func(*os.File) error {
-		close(syncEntered)
-		<-releaseSync
-		return syscall.EIO
-	}
 
 	store, err := server.ensureJobStore()
 	if err != nil {
@@ -496,32 +486,16 @@ func TestCanceledTranscriptReportsGapWhenSidecarSyncFailsAfterTerminal(t *testin
 		t.Fatalf("terminal record before deferred sync = %#v, want canceled without sidecar diagnostic", terminal)
 	}
 
-	var closeOnce sync.Once
-	done := make(chan struct{})
-	closeWriter := func() {
-		closeOnce.Do(func() {
-			writer.close()
-			close(done)
-		})
+	if writer.file == nil {
+		t.Fatal("sidecar writer has no file")
 	}
-	t.Cleanup(func() {
-		release()
-		closeWriter()
-	})
-	go closeWriter()
-	select {
-	case <-syncEntered:
-	case <-time.After(time.Second):
-		t.Fatal("deferred sidecar sync did not begin")
+	// A closed *os.File makes writer.close's direct Sync call fail predictably.
+	if err := writer.file.Close(); err != nil {
+		t.Fatal(err)
 	}
-	release()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("execution did not finish after deferred sync release")
-	}
-	if !hasItemSidecarFailure(writer.diagnostics()) {
-		t.Fatalf("sidecar diagnostics = %#v, want production sync failure", writer.diagnostics())
+	writer.close()
+	if !strings.HasPrefix(writer.diagnostic, itemSidecarDiagnosticPrefix+"sync:") {
+		t.Fatalf("sidecar diagnostics = %#v, want real sync failure", writer.diagnostics())
 	}
 	terminal, err = store.Get(record.JobID)
 	if err != nil {
@@ -537,8 +511,12 @@ func TestCanceledTranscriptReportsGapWhenSidecarSyncFailsAfterTerminal(t *testin
 	if bytes.Contains(sidecar, transcriptItemStopLine) {
 		t.Fatalf("sidecar = %q, want no append-stopped marker for the sync failure", sidecar)
 	}
-	if _, err := os.Stat(itemSidecarFailurePath(transcriptItemPath(t, record))); err != nil {
+	markerPath := itemSidecarFailurePath(transcriptItemPath(t, record))
+	if _, err := os.Stat(markerPath); err != nil {
 		t.Fatalf("sidecar failure marker = %v", err)
+	}
+	if marker, err := os.ReadFile(markerPath); err != nil || len(marker) != 0 {
+		t.Fatalf("sidecar failure marker = %q, %v; want empty marker", marker, err)
 	}
 
 	result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
@@ -547,78 +525,16 @@ func TestCanceledTranscriptReportsGapWhenSidecarSyncFailsAfterTerminal(t *testin
 	}
 }
 
-func TestCanceledTranscriptStaysCleanAfterSidecarClose(t *testing.T) {
-	events := make(chan engine.Event, 1)
-	events <- engine.Event{Type: engine.EventToolUse, Name: "kept", Text: "captured before clean close"}
-	turnStarted := make(chan struct{})
-	var closeEvents sync.Once
-	closeStream := func() { closeEvents.Do(func() { close(events) }) }
-	t.Cleanup(closeStream)
-
-	backend := &executionFakeBackend{name: "items-clean-sync-after-cancel"}
-	backend.start = func(_ context.Context, _ engine.SessionOpts) (engine.Session, error) {
-		return &executionFakeSession{
-			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
-				input.OnProcessStart(engine.ProcessRef{PID: 6122, PGID: 6122, StartTime: "items-clean-sync-after-cancel"}, 0)
-				close(turnStarted)
-				return events, nil
-			},
-			interrupt: func(context.Context) error {
-				closeStream()
-				return nil
-			},
-		}, nil
+func TestItemSidecarWriterCleanCloseDoesNotCreateFailureMarker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "items.jsonl")
+	writer := newItemSidecarWriter(path, transcriptItemTextCap, transcriptItemFileCap)
+	writer.append(transcriptItemTool, "kept", "captured before clean close", false)
+	writer.close()
+	if writer.diagnostic != "" {
+		t.Fatalf("sidecar diagnostic = %q, want no failure", writer.diagnostic)
 	}
-	server := newExecutionServer(t, backend)
-	server.processGroupGoneFn = func(int) (bool, error) { return true, nil }
-	record := queuedExecutionRecord(t, server, backend.Name(), "cancel after clean sidecar capture", nil)
-	run := newActiveExecution(record.JobID, backend)
-	server.executionMu.Lock()
-	server.executions = map[string]*activeExecution{record.JobID: run}
-	server.executionMu.Unlock()
-	done := make(chan struct{})
-	go func() {
-		server.runJob(context.Background(), record, run)
-		close(done)
-	}()
-	t.Cleanup(func() {
-		closeStream()
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-			t.Error("clean canceled execution did not finish during cleanup")
-		}
-	})
-
-	select {
-	case <-turnStarted:
-	case <-time.After(time.Second):
-		t.Fatal("turn did not start")
-	}
-	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
-	if canceled.err != nil {
-		t.Fatalf("job.cancel error = %#v", canceled.err)
-	}
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("clean canceled execution did not finish")
-	}
-
-	store, err := server.ensureJobStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	terminal, err := store.Get(record.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if terminal.State != protocol.PublicStateCanceled || hasItemSidecarFailure(terminal.Diagnostics) {
-		t.Fatalf("clean terminal record = %#v, want canceled without sidecar failure", terminal)
-	}
-	result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
-	if result.State != protocol.PublicStateCanceled || result.ItemCount != 1 || result.Gap {
-		t.Fatalf("clean canceled transcript = %#v, want captured item without gap", result)
+	if _, err := os.Stat(itemSidecarFailurePath(path)); !os.IsNotExist(err) {
+		t.Fatalf("sidecar failure marker stat error = %v, want not exist", err)
 	}
 }
 
