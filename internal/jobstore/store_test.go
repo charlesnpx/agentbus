@@ -311,6 +311,42 @@ func TestRecordProcessClaimUsesSeparateTransaction(t *testing.T) {
 	}
 }
 
+func TestV0131RecordDecodesWithoutInventedRetirementEvidence(t *testing.T) {
+	store := newTestStore(t)
+	defer closeTestStore(t, store)
+
+	const jobID = "job_0123456789abcdef0123456789abcdef"
+	legacy := []byte(`{"jobId":"job_0123456789abcdef0123456789abcdef","workspaceKey":"legacy-workspace","requestId":"legacy-request","backend":"codex","backendSessionId":"thread-v0131","state":"running","cleanup":"clean","createdAt":"2026-09-05T12:00:00Z","updatedAt":"2026-09-05T12:00:00Z","diagnostics":[],"contract":{"violations":[]}}`)
+	if err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return errors.New("jobs bucket is missing")
+		}
+		return jobs.Put([]byte(jobID), legacy)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	decoded, err := store.Get(jobID)
+	if err != nil {
+		t.Fatalf("decode v0.13.1 record: %v", err)
+	}
+	if decoded.State != protocol.PublicStateRunning || decoded.BackendSessionID != "thread-v0131" {
+		t.Fatalf("decoded v0.13.1 record = %#v", decoded)
+	}
+	terminal, err := store.MarkTerminal(jobID, TerminalUpdate{
+		State:       protocol.PublicStateUnknown,
+		Cleanup:     protocol.CleanupClean,
+		Diagnostics: []string{"restart reconciliation: no relaunch"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.State != protocol.PublicStateUnknown || terminal.Cleanup != protocol.CleanupClean || terminal.BackendSessionID != "thread-v0131" || len(terminal.Diagnostics) != 1 || terminal.Diagnostics[0] != "restart reconciliation: no relaunch" {
+		t.Fatalf("terminalized v0.13.1 record = %#v, want only its legacy session and new recovery observation", terminal)
+	}
+}
+
 func TestReopenRecoversTerminalRecord(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "jobs.db")
 	store, err := Open(path)

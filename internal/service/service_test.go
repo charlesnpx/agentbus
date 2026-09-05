@@ -805,12 +805,14 @@ func TestJobSubmitResumeTargetParticipatesInReplayIdentity(t *testing.T) {
 	}
 	newSource := func(requestID string, sessionID string) protocol.JobSubmitResult {
 		source := submitResultForTest(t, submitForTest(t, server, submissionParams("resume-identity-source", requestID, "fake", t.TempDir(), "source")))
+		if _, err := store.RetireTurn(source.JobID, jobstore.RetirementReceipt{BackendSessionID: sessionID}); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := store.MarkTerminal(source.JobID, jobstore.TerminalUpdate{
-			State:            protocol.PublicStateFailed,
-			Cleanup:          protocol.CleanupClean,
-			BackendSessionID: sessionID,
-			FailureClass:     protocol.FailureClassBackendError,
-			FailureReason:    "timed out after a turn",
+			State:         protocol.PublicStateFailed,
+			Cleanup:       protocol.CleanupClean,
+			FailureClass:  protocol.FailureClassBackendError,
+			FailureReason: "timed out after a turn",
 		}); err != nil {
 			t.Fatal(err)
 		}

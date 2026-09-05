@@ -474,6 +474,12 @@ func TestJobCancelDuringCorrectionPreservesRetiredTurnOutcome(t *testing.T) {
 	if initialDiagnosticCount != 1 {
 		t.Fatalf("canceled correction diagnostics = %#v, want one initial cleanup diagnostic", stored.Diagnostics)
 	}
+	resume := submissionParams("cancel-correction-resume", "resume", backend.Name(), t.TempDir(), "continue")
+	resume.TaskSpec.ResumeJobID = record.JobID
+	resumed := submitResultForTest(t, submitForTest(t, server, resume))
+	if resumed.State != protocol.PublicStateQueued {
+		t.Fatalf("resume from canceled correction = %#v, want queued", resumed)
+	}
 }
 
 func TestJobCancelAfterSpawnRecordsCleanupOutcome(t *testing.T) {

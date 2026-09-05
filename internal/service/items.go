@@ -92,30 +92,6 @@ func (run *activeExecution) itemActivity() ItemActivity {
 	return activity
 }
 
-func (run *activeExecution) noteItemSidecarDiagnostic(diagnostic string) {
-	if run == nil || diagnostic == "" {
-		return
-	}
-	run.mu.Lock()
-	if run.itemSidecarDiag == "" {
-		run.itemSidecarDiag = diagnostic
-	}
-	run.mu.Unlock()
-}
-
-func (run *activeExecution) itemSidecarDiagnostics() []string {
-	if run == nil {
-		return nil
-	}
-	run.mu.Lock()
-	diagnostic := run.itemSidecarDiag
-	run.mu.Unlock()
-	if diagnostic == "" {
-		return nil
-	}
-	return []string{diagnostic}
-}
-
 // itemSidecarWriter owns the append-only sidecar for one job. It continues to
 // assign logical ordinals after a disk failure or cap so activity remains a
 // measure of the live event stream rather than a measure of file bytes.
@@ -287,13 +263,6 @@ func (writer *itemSidecarWriter) close() {
 	}
 }
 
-func (writer *itemSidecarWriter) diagnostics() []string {
-	if writer == nil || writer.diagnostic == "" {
-		return nil
-	}
-	return []string{writer.diagnostic}
-}
-
 func itemSidecarPath(stdoutPath string) (string, error) {
 	base, ok := strings.CutSuffix(stdoutPath, ".stdout.log")
 	if !ok {
@@ -436,12 +405,4 @@ func (assembler *itemAssembler) noteProgress(at time.Time) {
 	if assembler != nil {
 		assembler.run.noteTranscriptProgress(at)
 	}
-}
-
-func appendItemSidecarDiagnostics(diagnostics []string, writer *itemSidecarWriter) []string {
-	if writer == nil {
-		return diagnostics
-	}
-	writer.close()
-	return append(diagnostics, writer.diagnostics()...)
 }

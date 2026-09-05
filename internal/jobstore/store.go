@@ -109,6 +109,19 @@ type ProcessClaim struct {
 	StartToken string `json:"startToken"`
 }
 
+// RetirementReceipt is private durable evidence observed while one or more
+// backend turns retire. It is deliberately part of the store record rather
+// than a protocol type: running-job wire projections must not expose interim
+// cleanup or diagnostics.
+//
+// A nil receipt on Record is the empty receipt used by records written before
+// retirement evidence was introduced.
+type RetirementReceipt struct {
+	BackendSessionID string   `json:"backendSessionId,omitempty"`
+	CleanupUncertain bool     `json:"cleanupUncertain,omitempty"`
+	Diagnostics      []string `json:"diagnostics,omitempty"`
+}
+
 // Record is the durable job record. State, cleanup, failure class, and contract
 // deliberately use the protocol's v3 types rather than parallel store types.
 // Starting is the private persisted no-relaunch marker; its public projection
@@ -144,25 +157,27 @@ type Record struct {
 	ResultSHA256     string                  `json:"resultSHA256,omitempty"`
 	ResultBytes      int64                   `json:"resultBytes,omitempty"`
 	Artifacts        ArtifactPaths           `json:"artifacts"`
+	// Retirement is private durable turn evidence. It is intentionally omitted
+	// from every wire projection in internal/service.
+	Retirement *RetirementReceipt `json:"retirement,omitempty"`
 }
 
 // TerminalUpdate supplies the durable data for a first terminal transition.
-// State must be completed, failed, canceled, or unknown. Completed records
-// always clear BackendSessionID; for other terminal states, an empty ID retains
-// one already recorded by a retired turn.
+// State must be completed, failed, canceled, or unknown. Common turn evidence
+// is deliberately absent: MarkTerminal merges the record's private retirement
+// receipt atomically with this state-specific payload.
 type TerminalUpdate struct {
-	State            protocol.PublicState
-	Cleanup          protocol.Cleanup
-	BackendSessionID string
-	FailureClass     protocol.FailureClass
-	FailureReason    string
-	Diagnostics      []string
-	Contract         protocol.ContractResult
-	ResultText       string
-	ResultPath       string
-	ResultSHA256     string
-	ResultBytes      int64
-	FinishedAt       time.Time
+	State         protocol.PublicState
+	Cleanup       protocol.Cleanup
+	FailureClass  protocol.FailureClass
+	FailureReason string
+	Diagnostics   []string
+	Contract      protocol.ContractResult
+	ResultText    string
+	ResultPath    string
+	ResultSHA256  string
+	ResultBytes   int64
+	FinishedAt    time.Time
 }
 
 // RecordLookup reads a record from the same submit transaction that is
@@ -612,16 +627,21 @@ func (store *Store) RecordProcessClaim(id string, claim ProcessClaim) (Record, e
 	return result, err
 }
 
-// RecordBackendSessionID records a non-empty backend session ID after a turn
-// retires. It is deliberately a separate transaction from the process claim:
-// a daemon can stop after a retired turn but before the job reaches terminal
-// state, and the session must still be available for restart recovery.
-func (store *Store) RecordBackendSessionID(id, sessionID string) (Record, error) {
+// RetireTurn atomically records one turn's common retirement evidence. It is
+// deliberately separate from the process-claim transaction: a daemon can stop
+// after a turn retires but before the job reaches terminal state, and restart
+// recovery still needs the session, cleanup uncertainty, and diagnostics that
+// were already observed.
+//
+// Cleanup uncertainty is sticky and diagnostics retain call order. Callers
+// must submit each observation once; this method does not collapse distinct
+// observations that happen to have identical text.
+func (store *Store) RetireTurn(id string, receipt RetirementReceipt) (Record, error) {
 	if err := validateJobID(id); err != nil {
 		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
-	if strings.TrimSpace(sessionID) == "" {
-		return Record{}, fmt.Errorf("%w: backend session id is required", ErrInvalid)
+	if err := receipt.validate(); err != nil {
+		return Record{}, err
 	}
 
 	var result Record
@@ -639,7 +659,18 @@ func (store *Store) RecordBackendSessionID(id, sessionID string) (Record, error)
 		}
 
 		next := current
-		next.BackendSessionID = sessionID
+		nextReceipt := cloneRetirementReceipt(current.Retirement)
+		if strings.TrimSpace(receipt.BackendSessionID) != "" {
+			nextReceipt.BackendSessionID = receipt.BackendSessionID
+			next.BackendSessionID = receipt.BackendSessionID
+		}
+		if receipt.CleanupUncertain {
+			nextReceipt.CleanupUncertain = true
+		}
+		nextReceipt.Diagnostics = append(nextReceipt.Diagnostics, receipt.Diagnostics...)
+		if !nextReceipt.empty() {
+			next.Retirement = &nextReceipt
+		}
 		next.UpdatedAt = time.Now().UTC()
 		normalizeRecord(&next)
 		if err := validateRecord(next); err != nil {
@@ -682,19 +713,11 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 		next.State = terminal.State
 		next.Starting = false
 		next.Cleanup = terminal.Cleanup
-		if terminal.State == protocol.PublicStateCompleted {
-			next.BackendSessionID = ""
-		} else if terminal.BackendSessionID != "" {
-			next.BackendSessionID = terminal.BackendSessionID
+		if next.Retirement != nil && next.Retirement.CleanupUncertain {
+			next.Cleanup = protocol.CleanupUncertain
 		}
-		next.FailureClass = terminal.FailureClass
-		next.FailureReason = terminal.FailureReason
-		next.Diagnostics = append([]string(nil), terminal.Diagnostics...)
-		next.Contract = terminal.Contract
-		next.ResultText = terminal.ResultText
-		next.ResultPath = terminal.ResultPath
-		next.ResultSHA256 = terminal.ResultSHA256
-		next.ResultBytes = terminal.ResultBytes
+		next.Diagnostics = mergeTerminalDiagnostics(next.Retirement, terminal.Diagnostics)
+		applyTerminalPayload(&next, terminal)
 		if terminal.FinishedAt.IsZero() {
 			now := time.Now().UTC()
 			next.FinishedAt = &now
@@ -716,6 +739,89 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 	})
 	return result, err
 }
+
+func mergeTerminalDiagnostics(receipt *RetirementReceipt, stateSpecific []string) []string {
+	capacity := len(stateSpecific)
+	if receipt != nil {
+		capacity += len(receipt.Diagnostics)
+	}
+	diagnostics := make([]string, 0, capacity)
+	if receipt != nil {
+		diagnostics = append(diagnostics, receipt.Diagnostics...)
+	}
+	return append(diagnostics, stateSpecific...)
+}
+
+// applyTerminalPayload clears every payload that does not belong to terminal's
+// state before copying the state-specific fields. Common evidence is merged by
+// MarkTerminal above, so it cannot accidentally move a result, contract, or
+// failure payload between terminal states.
+func applyTerminalPayload(record *Record, terminal TerminalUpdate) {
+	if record == nil {
+		return
+	}
+	record.FailureClass = ""
+	record.FailureReason = ""
+	record.Contract = protocol.ContractResult{}
+	record.ResultText = ""
+	record.ResultPath = ""
+	record.ResultSHA256 = ""
+	record.ResultBytes = 0
+
+	switch terminal.State {
+	case protocol.PublicStateCompleted:
+		// Completed work is final even when its private receipt observed a
+		// backend session, so it deliberately cannot be resumed.
+		record.BackendSessionID = ""
+		record.Contract = cloneContractResult(terminal.Contract)
+		record.ResultText = terminal.ResultText
+		record.ResultPath = terminal.ResultPath
+		record.ResultSHA256 = terminal.ResultSHA256
+		record.ResultBytes = terminal.ResultBytes
+	case protocol.PublicStateFailed:
+		record.BackendSessionID = retirementBackendSessionID(*record)
+		record.FailureClass = terminal.FailureClass
+		record.FailureReason = terminal.FailureReason
+	case protocol.PublicStateCanceled, protocol.PublicStateUnknown:
+		record.BackendSessionID = retirementBackendSessionID(*record)
+	}
+}
+
+func retirementBackendSessionID(record Record) string {
+	if record.Retirement != nil && strings.TrimSpace(record.Retirement.BackendSessionID) != "" {
+		return record.Retirement.BackendSessionID
+	}
+	// Records written before retirement receipts can still carry the old durable
+	// session field. Retaining it preserves their conservative recovery behavior
+	// without inventing cleanup or diagnostic evidence they never stored.
+	return record.BackendSessionID
+}
+
+func cloneContractResult(value protocol.ContractResult) protocol.ContractResult {
+	value.Violations = append([]string(nil), value.Violations...)
+	return value
+}
+
+func cloneRetirementReceipt(receipt *RetirementReceipt) RetirementReceipt {
+	if receipt == nil {
+		return RetirementReceipt{}
+	}
+	copy := *receipt
+	copy.Diagnostics = append([]string(nil), receipt.Diagnostics...)
+	return copy
+}
+
+func (receipt RetirementReceipt) empty() bool {
+	return receipt.BackendSessionID == "" && !receipt.CleanupUncertain && len(receipt.Diagnostics) == 0
+}
+
+func (receipt RetirementReceipt) validate() error {
+	if receipt.BackendSessionID != "" && strings.TrimSpace(receipt.BackendSessionID) == "" {
+		return fmt.Errorf("%w: retirement backend session id cannot be whitespace", ErrInvalid)
+	}
+	return nil
+}
+
 func (store *Store) artifactPathsForID(id string) ArtifactPaths {
 	return ArtifactPaths{
 		Log:    filepath.Join(store.artifacts.logs, id+".log"),
@@ -804,6 +910,13 @@ func normalizeRecord(record *Record) {
 		claim := *record.ProcessClaim
 		record.ProcessClaim = &claim
 	}
+	if record.Retirement != nil {
+		receipt := cloneRetirementReceipt(record.Retirement)
+		if receipt.Diagnostics == nil {
+			receipt.Diagnostics = []string{}
+		}
+		record.Retirement = &receipt
+	}
 	if record.Diagnostics == nil {
 		record.Diagnostics = []string{}
 	}
@@ -832,6 +945,11 @@ func validateRecord(record Record) error {
 	}
 	if record.BackendSessionID != "" && strings.TrimSpace(record.BackendSessionID) == "" {
 		return fmt.Errorf("%w: backend session id cannot be whitespace", ErrInvalid)
+	}
+	if record.Retirement != nil {
+		if err := record.Retirement.validate(); err != nil {
+			return err
+		}
 	}
 	if !record.Cleanup.Valid() {
 		return fmt.Errorf("%w: invalid cleanup %q", ErrInvalid, record.Cleanup)

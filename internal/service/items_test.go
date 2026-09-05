@@ -373,7 +373,7 @@ func TestTranscriptItemsResultMessageTerminatesAgentTextRun(t *testing.T) {
 	}
 }
 
-func TestTranscriptItemSidecarFailureSurvivesCancellation(t *testing.T) {
+func TestTranscriptItemSidecarFailureSurvivesRestart(t *testing.T) {
 	events := make(chan engine.Event)
 	turnStarted := make(chan struct{})
 	var closeEvents sync.Once
@@ -393,18 +393,16 @@ func TestTranscriptItemSidecarFailureSurvivesCancellation(t *testing.T) {
 			},
 		}, nil
 	}
-	server := newExecutionServer(t, backend)
-	record := queuedExecutionRecord(t, server, backend.Name(), "sidecar failure", nil)
+	root := t.TempDir()
+	first := newTestServer(t, root, Config{Backends: []engine.Backend{backend}})
+	record := queuedExecutionRecord(t, first, backend.Name(), "sidecar failure", nil)
 	if err := os.MkdirAll(transcriptItemPath(t, record), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	run := newActiveExecution(record.JobID, backend)
-	server.executionMu.Lock()
-	server.executions = map[string]*activeExecution{record.JobID: run}
-	server.executionMu.Unlock()
 	done := make(chan struct{})
 	go func() {
-		server.runJob(context.Background(), record, run)
+		first.runJob(context.Background(), record, run)
 		close(done)
 	}()
 	select {
@@ -412,31 +410,45 @@ func TestTranscriptItemSidecarFailureSurvivesCancellation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("turn did not start")
 	}
-	if diagnostics := run.itemSidecarDiagnostics(); !strings.Contains(strings.Join(diagnostics, "\n"), "item sidecar open") {
-		t.Fatalf("active sidecar diagnostics = %#v, want constructor failure", diagnostics)
+	// Keep the failed sidecar absent for the post-restart read. The directory is
+	// only the test's unwritable-open fixture; the observed failure has already
+	// crossed the durable receipt boundary before Turn returned.
+	if err := os.Remove(transcriptItemPath(t, record)); err != nil {
+		t.Fatal(err)
 	}
-	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
-	if canceled.err != nil {
-		t.Fatalf("job.cancel error = %#v", canceled.err)
+	first.closeJobStore()
+	// This only releases the in-process test worker after its store has closed;
+	// it must not write a terminal state that a stopped daemon could not write.
+	if _, err := run.requestCancellation(); err != nil {
+		t.Fatal(err)
 	}
+	closeStream()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("canceled turn did not finish")
+		t.Fatal("simulated stopped daemon did not drain")
 	}
 
-	store, err := server.ensureJobStore()
+	restarted := newTestServer(t, root, Config{Backends: []engine.Backend{backend}})
+	store, err := restarted.ensureJobStore()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.reconcileRecoveredJobs(store); err != nil {
 		t.Fatal(err)
 	}
 	terminal, err := store.Get(record.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if terminal.State != protocol.PublicStateCanceled {
-		t.Fatalf("terminal record = %+v, want canceled result", terminal)
+	if terminal.State != protocol.PublicStateUnknown {
+		t.Fatalf("recovered terminal record = %+v, want unknown", terminal)
 	}
 	if !strings.Contains(strings.Join(terminal.Diagnostics, "\n"), "item sidecar open") {
-		t.Fatalf("diagnostics = %#v, want sidecar failure", terminal.Diagnostics)
+		t.Fatalf("recovered diagnostics = %#v, want sidecar failure", terminal.Diagnostics)
+	}
+	transcript := transcriptResultForTest(t, restarted, protocol.JobTranscriptParams{JobID: record.JobID})
+	if !transcript.Gap || transcript.ItemCount != 0 {
+		t.Fatalf("recovered transcript = %#v, want an empty gapped transcript", transcript)
 	}
 }

@@ -755,12 +755,14 @@ func TestExecutionResumeFollowsManagedHomeLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.RetireTurn(source.JobID, jobstore.RetirementReceipt{BackendSessionID: "thread-source"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.MarkTerminal(source.JobID, jobstore.TerminalUpdate{
-		State:            protocol.PublicStateFailed,
-		Cleanup:          protocol.CleanupClean,
-		BackendSessionID: "thread-source",
-		FailureClass:     protocol.FailureClassBackendError,
-		FailureReason:    "timed out after a turn",
+		State:         protocol.PublicStateFailed,
+		Cleanup:       protocol.CleanupClean,
+		FailureClass:  protocol.FailureClassBackendError,
+		FailureReason: "timed out after a turn",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -871,12 +873,14 @@ func TestJobSubmitRejectsCodexResumeWithoutPerJobHome(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if _, err := store.RetireTurn(source.JobID, jobstore.RetirementReceipt{BackendSessionID: "thread-source"}); err != nil {
+				t.Fatal(err)
+			}
 			if _, err := store.MarkTerminal(source.JobID, jobstore.TerminalUpdate{
-				State:            protocol.PublicStateFailed,
-				Cleanup:          protocol.CleanupClean,
-				BackendSessionID: "thread-source",
-				FailureClass:     protocol.FailureClassBackendError,
-				FailureReason:    "source turn stopped",
+				State:         protocol.PublicStateFailed,
+				Cleanup:       protocol.CleanupClean,
+				FailureClass:  protocol.FailureClassBackendError,
+				FailureReason: "source turn stopped",
 			}); err != nil {
 				t.Fatal(err)
 			}

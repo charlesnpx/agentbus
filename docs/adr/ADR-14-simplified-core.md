@@ -546,6 +546,26 @@ not derive health from sidecar bytes: activity continues to advance after the
 file cap. Every agent-text event and every contentless progress event advances
 only the activity timestamp until an item is assembled.
 
+### Durable retirement receipt
+
+The stored job record has a private retirement receipt for common evidence
+observed by the service: the latest backend session id, sticky cleanup
+uncertainty, and diagnostics in observation order. It is internal jobstore data,
+not a protocol field, so a running job's wire projection does not reveal interim
+cleanup or diagnostics. A retiring turn persists its receipt before publishing
+its retirement to cancellation. Sidecar write failures persist their diagnostic
+when observed; final `Sync` and `Close` run behind an execution-finalization
+barrier before cancellation can commit terminal state.
+
+The jobstore atomically merges that receipt into the first terminal intent.
+Completion, failure, cancellation, and restart reconciliation supply only their
+state-specific payloads. Receipt cleanup is monotonic, receipt diagnostics retain
+their order without a cancellation-side copy, and a non-completed terminal state
+uses the receipt's session id for resumption. Completed records still omit their
+session id. Records written before this receipt existed decode with no receipt;
+recovery preserves only the facts those records already stored and remains
+conservative.
+
 ### Crash safety and no relaunch
 
 Agentbus permits at most one initial process turn and, when required, at most
