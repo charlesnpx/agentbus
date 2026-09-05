@@ -31,6 +31,10 @@ type claudeStream struct {
 	emit         duplex.EmitFunc
 	pending      []duplex.Frame
 	lastProgress time.Time
+	// Claude is assumed to send a completed assistant frame before the next
+	// message_start. If it does not, this flag could suppress that later
+	// message's completed text after the prior message emitted partial text.
+	partialAgentTextEmitted bool
 }
 
 func newStreamJSONDriver(binary string) *streamJSONDriver {
@@ -48,6 +52,7 @@ func (d *streamJSONDriver) ExecSpec(resumeID string, opts engine.SessionOpts, in
 		"stream-json",
 		"--output-format",
 		"stream-json",
+		"--include-partial-messages",
 		"--verbose",
 	}
 	if opts.Model != "" {
@@ -243,17 +248,23 @@ func (s *claudeStream) handleFrame(ctx context.Context, frame duplex.Frame, sess
 	}
 	frameType := strings.ToLower(firstString(obj, "type"))
 	if isClaudeProgressFrameType(frameType) {
-		s.emitProgress()
+		s.emitThinking(obj, obj)
 		return false, nil
 	}
 	switch frameType {
 	case "control_request":
 		_, err := s.handleControlRequest(ctx, obj)
 		return false, err
-	case "control_response", "user":
+	case "control_response":
+		return false, nil
+	case "user":
+		s.emitToolResults(obj)
 		return false, nil
 	case "system":
 		s.emitModelReported(obj)
+		return false, nil
+	case "stream_event":
+		s.emitPartialAssistant(obj)
 		return false, nil
 	case "assistant":
 		s.emitAssistant(obj)
@@ -314,10 +325,14 @@ func (s *claudeStream) emitModelReported(obj map[string]any) {
 
 func (s *claudeStream) emitAssistant(obj map[string]any) {
 	msg, _ := firstMap(obj, "message")
+	hasAgentDelta := s.partialAgentTextEmitted
+	s.partialAgentTextEmitted = false
 	content := anySlice(msg["content"])
 	if len(content) == 0 {
-		if text := textFrom(obj); text != "" {
-			s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
+		if !hasAgentDelta {
+			if text := textFrom(obj); text != "" {
+				s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
+			}
 		}
 		return
 	}
@@ -328,13 +343,15 @@ func (s *claudeStream) emitAssistant(obj map[string]any) {
 		}
 		blockType := strings.ToLower(firstString(block, "type"))
 		if isClaudeProgressFrameType(blockType) {
-			s.emitProgress()
+			s.emitThinking(block, obj)
 			continue
 		}
 		switch blockType {
 		case "text":
-			if text := textValue(block["text"]); text != "" {
-				s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
+			if !hasAgentDelta {
+				if text := textValue(block["text"]); text != "" {
+					s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: obj})
+				}
 			}
 		case "tool_use":
 			name := firstString(block, "name")
@@ -348,6 +365,58 @@ func (s *claudeStream) emitAssistant(obj map[string]any) {
 			s.emitEvent(engine.Event{Type: engine.EventToolUse, Name: name, Text: text, Metadata: obj})
 		}
 	}
+}
+
+func (s *claudeStream) emitPartialAssistant(obj map[string]any) {
+	event, ok := firstMap(obj, "event")
+	if !ok {
+		return
+	}
+	switch strings.ToLower(firstString(event, "type")) {
+	case "message_start":
+		s.partialAgentTextEmitted = false
+	case "content_block_delta":
+		s.emitPartialAgentText(event, obj)
+	}
+}
+
+func (s *claudeStream) emitPartialAgentText(event, metadata map[string]any) {
+	delta, ok := firstMap(event, "delta")
+	if !ok || strings.ToLower(firstString(delta, "type")) != "text_delta" {
+		return
+	}
+	if text := firstString(delta, "text"); text != "" {
+		s.partialAgentTextEmitted = true
+		s.emitEvent(engine.Event{Type: engine.EventAgentText, Text: text, Metadata: metadata})
+	}
+}
+
+func (s *claudeStream) emitToolResults(obj map[string]any) {
+	message, _ := firstMap(obj, "message")
+	for _, item := range anySlice(message["content"]) {
+		block, ok := item.(map[string]any)
+		if !ok || strings.ToLower(firstString(block, "type")) != "tool_result" {
+			continue
+		}
+		text := textValue(block["content"])
+		if text == "" {
+			text = textValue(block["text"])
+		}
+		s.emitEvent(engine.Event{
+			Type:     engine.EventToolResult,
+			Text:     text,
+			Metadata: obj,
+		})
+	}
+}
+
+func (s *claudeStream) emitThinking(source, metadata map[string]any) {
+	if text := firstString(source, "thinking", "text", "content"); text != "" {
+		s.emitEvent(engine.Event{Type: engine.EventReasoning, Text: text, Metadata: metadata})
+	}
+	// Preserve the existing rate-limited liveness signal for callers that use
+	// Progress independently of textual reasoning (including empty frames).
+	s.emitProgress()
 }
 
 func (s *claudeStream) emitResult(obj map[string]any) {

@@ -43,71 +43,6 @@ var ErrProtocolVersionMismatch = errors.New("protocol version mismatch")
 // fallback.
 var ErrAutostartLockUnsafe = errors.New("agentbus autostart lock path unsafe")
 
-// ErrRootFailStopped identifies daemon startup refusal because the authority
-// root has tripped fail-stop before the daemon opened its socket.
-var ErrRootFailStopped = errors.New("agentbus authority root fail-stopped")
-
-// ErrRootSealed identifies daemon startup refusal because the authority root
-// has been permanently sealed before the daemon opened its socket.
-var ErrRootSealed = errors.New("agentbus authority root sealed")
-
-// StartupRefusedError reports a daemon autostart that exited before becoming
-// ready because the authority root permanently refused startup. Reason is the
-// admission cause, such as "root_fail_stopped" or "root_sealed".
-type StartupRefusedError struct {
-	Reason string
-	Err    error
-}
-
-func (e *StartupRefusedError) Error() string {
-	if e == nil {
-		return "agentbus daemon startup refused"
-	}
-	message := "agentbus daemon startup refused"
-	if sentinel := startupRefusedSentinel(e.Reason); sentinel != nil {
-		message += ": " + sentinel.Error()
-	} else if reason := strings.TrimSpace(e.Reason); reason != "" {
-		message += ": " + reason
-	}
-	if e.Err != nil {
-		message += ": " + e.Err.Error()
-	}
-	return message
-}
-
-func (e *StartupRefusedError) Is(target error) bool {
-	if e == nil {
-		return false
-	}
-	return target != nil && startupRefusedSentinel(e.Reason) == target
-}
-
-func (e *StartupRefusedError) Unwrap() error {
-	if e == nil {
-		return nil
-	}
-	sentinel := startupRefusedSentinel(e.Reason)
-	switch {
-	case sentinel != nil && e.Err != nil:
-		return errors.Join(sentinel, e.Err)
-	case sentinel != nil:
-		return sentinel
-	default:
-		return e.Err
-	}
-}
-
-func startupRefusedSentinel(reason string) error {
-	switch strings.TrimSpace(reason) {
-	case protocol.AdmissionRejectRootFailStopped:
-		return ErrRootFailStopped
-	case protocol.AdmissionRejectRootSealed:
-		return ErrRootSealed
-	default:
-		return nil
-	}
-}
-
 type AutostartLockUnsafeError struct {
 	Path   string
 	Reason string
@@ -137,10 +72,12 @@ func (e AutostartLockUnsafeError) Unwrap() error {
 }
 
 // ProtocolVersionMismatchError reports the expected and received protocol
-// versions from a failed hello exchange.
+// versions. Cause carries the RPC error when the server reports the mismatch
+// through a JSON-RPC error response.
 type ProtocolVersionMismatchError struct {
 	Expected int
 	Received int
+	Cause    *protocol.RPCError
 }
 
 func (e *ProtocolVersionMismatchError) Error() string {
@@ -154,6 +91,25 @@ func (e *ProtocolVersionMismatchError) Is(target error) bool {
 	return target == ErrProtocolVersionMismatch
 }
 
+func (e *ProtocolVersionMismatchError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func rpcResponseError(object protocol.ErrorObject) error {
+	rpcErr := &protocol.RPCError{Object: object}
+	if object.Data.Code != protocol.ErrorVersionMismatch {
+		return rpcErr
+	}
+	return &ProtocolVersionMismatchError{
+		Expected: protocol.Version,
+		Received: object.Data.ServerProtocolVersion,
+		Cause:    rpcErr,
+	}
+}
+
 // Options configures a protocol client.
 type Options struct {
 	StateRoot        string
@@ -162,7 +118,7 @@ type Options struct {
 	DisableAutoStart bool
 	CommandPath      string
 	StartTimeout     time.Duration
-	Starter          DaemonStarter
+	Starter          Starter
 }
 
 // StartOptions are passed to a daemon starter.
@@ -188,17 +144,8 @@ func (result StartResult) KillAndWait() error {
 	return result.killAndWait()
 }
 
-// DaemonStarter starts an agentbus foreground daemon process.
-type DaemonStarter interface {
-	StartDaemon(context.Context, StartOptions) (StartResult, error)
-}
-
-// StartFunc adapts a function to DaemonStarter.
-type StartFunc func(context.Context, StartOptions) (StartResult, error)
-
-func (f StartFunc) StartDaemon(ctx context.Context, opts StartOptions) (StartResult, error) {
-	return f(ctx, opts)
-}
+// Starter starts an agentbus foreground daemon process.
+type Starter func(context.Context, StartOptions) (StartResult, error)
 
 // Client is a typed JSON-RPC client for the local agentbus daemon.
 type Client struct {
@@ -228,7 +175,7 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 			return nil, err
 		}
 		if err := c.autostart(ctx); err != nil {
-			return nil, startupRefusedFromStartupError(err)
+			return nil, err
 		}
 	}
 	return c, nil
@@ -315,7 +262,7 @@ func clientHello(ctx context.Context, conn net.Conn, reader *bufio.Reader, token
 		return HelloResult{}, err
 	}
 	if resp.Error != nil {
-		return HelloResult{}, &protocol.RPCError{Object: *resp.Error}
+		return HelloResult{}, rpcResponseError(*resp.Error)
 	}
 	raw, err := json.Marshal(resp.Result)
 	if err != nil {
@@ -385,9 +332,9 @@ func (c *Client) autostart(ctx context.Context) error {
 	}
 	starter := c.opts.Starter
 	if starter == nil {
-		starter = defaultStarter{}
+		starter = defaultStarter
 	}
-	started, err := starter.StartDaemon(autoCtx, StartOptions{
+	started, err := starter(autoCtx, StartOptions{
 		StateRoot:   c.stateRoot,
 		SocketPath:  c.socketPath,
 		TokenPath:   c.tokenPath,
@@ -395,7 +342,7 @@ func (c *Client) autostart(ctx context.Context) error {
 		Timeout:     remainingTimeout(autoCtx),
 	})
 	if err != nil {
-		return startupRefusedFromStartupError(err)
+		return err
 	}
 	pidPath := filepath.Join(c.stateRoot, "agentbus.pid")
 	pidWritten := false
@@ -718,31 +665,7 @@ func remainingTimeout(ctx context.Context) time.Duration {
 	return remaining
 }
 
-func startupRefusedFromStartupError(err error) error {
-	if err == nil {
-		return nil
-	}
-	var refused *StartupRefusedError
-	if errors.As(err, &refused) {
-		return err
-	}
-	var startup *daemonlaunch.StartupError
-	if !errors.As(err, &startup) {
-		return err
-	}
-	switch strings.TrimSpace(startup.Code) {
-	case daemonlaunch.CodeAuthorityFailStopped:
-		return &StartupRefusedError{Reason: protocol.AdmissionRejectRootFailStopped, Err: err}
-	case daemonlaunch.CodeAuthorityRootSealed:
-		return &StartupRefusedError{Reason: protocol.AdmissionRejectRootSealed, Err: err}
-	default:
-		return err
-	}
-}
-
-type defaultStarter struct{}
-
-func (defaultStarter) StartDaemon(ctx context.Context, opts StartOptions) (StartResult, error) {
+func defaultStarter(ctx context.Context, opts StartOptions) (StartResult, error) {
 	command := opts.CommandPath
 	if command == "" {
 		var err error
@@ -894,7 +817,7 @@ func (c *Client) do(ctx context.Context, method string, params any, result any) 
 		return ctx.Err()
 	case resp := <-ch:
 		if resp.Error != nil {
-			return &protocol.RPCError{Object: *resp.Error}
+			return rpcResponseError(*resp.Error)
 		}
 		if result == nil {
 			return nil
@@ -926,7 +849,7 @@ func (c *Client) reconnect(ctx context.Context) error {
 	} else if !autostartableConnectError(err) {
 		return err
 	}
-	return startupRefusedFromStartupError(c.autostart(ctx))
+	return c.autostart(ctx)
 }
 
 func autostartableConnectError(err error) bool {
@@ -1021,33 +944,31 @@ func (c *Client) JobSubmit(ctx context.Context, params JobSubmitParams) (JobSubm
 	return out, err
 }
 
-func (c *Client) JobStatus(ctx context.Context, params JobStatusParams) (JobStatusResult, error) {
-	var out JobStatusResult
-	err := c.do(ctx, protocol.MethodJobStatus, params, &out)
+// JobGet returns the complete record for the requested job.
+func (c *Client) JobGet(ctx context.Context, params JobGetParams) (JobGetResult, error) {
+	var out JobGetResult
+	err := c.do(ctx, protocol.MethodJobGet, params, &out)
 	return out, err
 }
 
-func (c *Client) JobResult(ctx context.Context, params JobResultParams) (JobResult, error) {
-	var out JobResult
-	err := c.do(ctx, protocol.MethodJobResult, params, &out)
+// JobList returns compact summaries filtered by the supplied optional fields.
+func (c *Client) JobList(ctx context.Context, params JobListParams) (JobListResult, error) {
+	var out JobListResult
+	err := c.do(ctx, protocol.MethodJobList, params, &out)
+	return out, err
+}
+
+// JobTranscript returns the captured transcript digest and selected items for
+// one job.
+func (c *Client) JobTranscript(ctx context.Context, params JobTranscriptParams) (JobTranscriptResult, error) {
+	var out JobTranscriptResult
+	err := c.do(ctx, protocol.MethodJobTranscript, params, &out)
 	return out, err
 }
 
 func (c *Client) JobCancel(ctx context.Context, params JobCancelParams) (JobCancelResult, error) {
 	var out JobCancelResult
 	err := c.do(ctx, protocol.MethodJobCancel, params, &out)
-	return out, err
-}
-
-func (c *Client) PolicyValidate(ctx context.Context, params PolicyValidateParams) (PolicyValidateResult, error) {
-	var out PolicyValidateResult
-	err := c.do(ctx, protocol.MethodPolicyValidate, params, &out)
-	return out, err
-}
-
-func (c *Client) PolicyRegister(ctx context.Context, params PolicyRegisterParams) (PolicyRegisterResult, error) {
-	var out PolicyRegisterResult
-	err := c.do(ctx, protocol.MethodPolicyRegister, params, &out)
 	return out, err
 }
 

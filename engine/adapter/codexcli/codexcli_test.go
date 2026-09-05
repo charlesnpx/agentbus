@@ -990,68 +990,32 @@ func TestAppServerUnknownNotificationIsIgnored(t *testing.T) {
 	}
 }
 
-func TestAppServerSetupQualifyDiscoversModelsAndRequiresOne(t *testing.T) {
-	t.Run("discovers model list", func(t *testing.T) {
-		runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
-			peer := newAppServerPeer(t, proc)
-			peer.handshake()
-			req := peer.expectRequest("model/list")
-			peer.respond(req, map[string]any{
-				"data": []any{
-					map[string]any{
-						"model": "gpt-5.4",
-						"supportedReasoningEfforts": []any{
-							map[string]any{"reasoningEffort": "high"},
-							map[string]any{"reasoningEffort": "low"},
-						},
-					},
-					map[string]any{
-						"id":                        "id-only-model",
-						"supportedReasoningEfforts": []any{"xhigh"},
-					},
-				},
-			})
-		})
-		driver := newAppServerDriver("fake-codex", WritePolicyWorkspaceOffline)
-		discovery, err := driver.SetupQualify(context.Background(), runner, engine.SessionOpts{CWD: t.TempDir()})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := strings.Join(discovery.Models, ","); got != "gpt-5.4,id-only-model" {
-			t.Fatalf("models = %q", got)
-		}
-		if got := strings.Join(discovery.Efforts, ","); got != "low,high,xhigh" {
-			t.Fatalf("efforts = %q", got)
-		}
-		if discovery.Source != "app-server" || discovery.FetchedAt == "" {
-			t.Fatalf("discovery provenance = %#v", discovery)
-		}
-	})
-
-	t.Run("zero models fails", func(t *testing.T) {
-		runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
-			peer := newAppServerPeer(t, proc)
-			peer.handshake()
-			req := peer.expectRequest("model/list")
-			peer.respond(req, map[string]any{"data": []any{}})
-		})
-		driver := newAppServerDriver("fake-codex", WritePolicyWorkspaceOffline)
-		discovery, err := driver.SetupQualify(context.Background(), runner, engine.SessionOpts{CWD: t.TempDir()})
-		if err == nil || !strings.Contains(err.Error(), "no usable models") || len(discovery.Models) != 0 {
-			t.Fatalf("discovery=%#v err=%v, want zero-model qualification failure", discovery, err)
-		}
-	})
-}
-
-func TestCodexPreflightUsesAppServerStreamSchema(t *testing.T) {
+func TestCodexPreflightSucceedsWithoutSetupProbeCache(t *testing.T) {
+	stateRoot := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateRoot)
+	cachePath := filepath.Join(stateRoot, "agentbus", "setup-probes.json")
+	if _, err := os.Stat(cachePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("setup probe cache before preflight: err=%v, want not exist", err)
+	}
 	fake := fakeVersionCodex(t)
-	backend := New(Options{Binary: fake.bin, CachePath: fake.cache})
+	backend := New(Options{Binary: fake.bin})
 	health, err := backend.Preflight(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health.StreamSchema != "codex-appserver-v1" {
-		t.Fatalf("health = %#v", health)
+	want := engine.Health{
+		Backend:      "codex",
+		BinaryPath:   fake.bin,
+		Version:      MinimumKnownGoodVersion,
+		StreamSchema: StreamSchema,
+		Minimum:      MinimumKnownGoodVersion,
+		Warning:      "model discovery unavailable; using static known-good validation lists",
+	}
+	if health != want {
+		t.Fatalf("health = %#v, want %#v", health, want)
+	}
+	if _, err := os.Stat(cachePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("setup probe cache after preflight: err=%v, want not exist", err)
 	}
 }
 
@@ -1481,16 +1445,14 @@ func resultRawText(events []engine.Event) string {
 }
 
 type fakeVersionCLI struct {
-	bin   string
-	cache string
+	bin string
 }
 
 func fakeVersionCodex(t *testing.T) fakeVersionCLI {
 	t.Helper()
 	dir := t.TempDir()
 	fake := fakeVersionCLI{
-		bin:   filepath.Join(dir, "fakecodex"),
-		cache: filepath.Join(dir, "setup-probes.json"),
+		bin: filepath.Join(dir, "fakecodex"),
 	}
 	script := `#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -1502,25 +1464,5 @@ exit 1
 	if err := os.WriteFile(fake.bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeCache(t, fake.cache, "codex", fake.bin, MinimumKnownGoodVersion, StreamSchema)
 	return fake
-}
-
-func writeCache(t *testing.T, path, backend, bin, version, schema string) {
-	t.Helper()
-	raw, err := json.Marshal(engine.SetupProbeCache{Version: engine.SetupProbeCacheVersion, Backends: []engine.BackendSetupProbe{{
-		Backend:          backend,
-		BinaryPath:       bin,
-		Version:          version,
-		StreamSchema:     schema,
-		ConfigMode:       engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
-		SandboxModes:     []string{"workspace-write", "read-only"},
-		JSONEventsProbed: true,
-	}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
 }

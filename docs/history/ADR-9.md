@@ -1,5 +1,7 @@
 # ADR-9: Restore global legacy job.status
 
+**Status:** Superseded by [ADR-14](../adr/ADR-14-simplified-core.md).
+
 ## Decision
 
 The legacy `job.status` scope change is reverted. `job.status` without an exact job ID is again a

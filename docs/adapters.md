@@ -43,7 +43,7 @@ build-argv/parse-JSONL shape is wrapped as a trivial one-shot driver.
 ## Supported argv profiles
 
 The following profiles are the only supported v1 CLI shapes. Adapters MUST NOT
-invent additional permission modes under protocol v1.
+invent additional permission modes under this adapter contract.
 
 | Backend | Profile | Argv/process shape |
 | --- | --- | --- |
@@ -118,12 +118,11 @@ negative value uses the 32 MiB default; it never disables the limit.
 
 When a backend frame exceeds the limit, agentbus discards that frame through
 its newline and resumes at the next frame. It retains at most 4 KiB in memory
-only to classify the envelope; it does not persist that payload. The terminal
-record keeps only the discarded-frame count, total bytes, and a short redacted
-`method=` or `type=` summary when the bounded prefix establishes one. Codex
-turn-terminal frames (`turn/completed` and `task_complete`) and unclassified
-or unknown oversized frames fail the turn rather than being skipped, because a
-prefix is evidence of a frame type, not proof that no result was carried.
+only to classify the envelope; it does not persist that payload or a terminal
+record summary of it. Codex turn-terminal frames (`turn/completed` and
+`task_complete`) and unclassified or unknown oversized frames fail the turn
+rather than being skipped, because a prefix is evidence of a frame type, not
+proof that no result was carried.
 
 ### codex effort values
 
@@ -161,12 +160,11 @@ Assistant chunks are emitted live and concatenated into the final result on an
 `end_turn` completion. Cursor does not expose an effort control through this
 adapter; specifying one is rejected before launch.
 
-The adapter reports the resolved ACP `models.currentModelId`, rather than
-echoing a requested model flag. Setup uses a no-prompt ACP qualification
-(`initialize`, `authenticate`, `session/new`, and verified `session/set_mode`)
-in a temporary working directory. Model discovery additionally parses the
-small `cursor-agent models` listing after its `Available models` header; an
-empty parsed catalog is valid and explicit model IDs pass through.
+The adapter can observe the resolved ACP `models.currentModelId`, rather than
+echoing a requested model flag. That observation is not currently published in
+a JobRecord. ACP initialization, authentication, session creation, and mode
+selection occur as part of the job's session start; there is no separate
+discovery pass before that session.
 
 ### claude write
 
@@ -351,130 +349,17 @@ Read-only turns MUST apply the strongest backend-supported read-only profile:
 Write turns run under user configuration because real work may legitimately
 need the user's MCP servers, hooks, plugins, credentials, and skills.
 
-`agentbus setup --json` MUST report these fields per backend:
+## Backend admission and startup
 
-```json
-{
-  "backend": "codex",
-  "binaryPath": "/Users/me/.local/bin/codex",
-  "version": "1.2.3",
-  "configMode": {
-    "write": "user",
-    "readOnly": "hermetic"
-  },
-  "sandboxModes": ["workspace-write", "read-only"],
-  "jsonEventsProbe": {
-    "ran": true,
-    "version": "1.2.3",
-    "streamSchema": "codex-appserver-v1"
-  }
-}
-```
+There is no standalone setup command. Submission admission checks only whether
+the requested backend name is registered in the daemon's backend map. It does
+not run the backend, resolve its executable, or validate its version at
+admission time.
 
-## Drift guard
-
-Adapters MUST run setup-time stream qualification only during
-`agentbus setup`. Generic adapters use a live trivial-turn stream probe, which
-may spend real API quota. Codex app-server uses a driver-backed setup
-qualification instead: it starts `codex app-server`, completes the
-`initialize`/`initialized` handshake, and calls `model/list` without sending a
-user prompt. Setup records the detected backend version and stream schema in
-agentbus state.
-
-Routine `Preflight` MUST NOT run a network turn. It checks:
-
-- backend binary exists and is executable
-- current backend version matches the setup cache
-- current backend version is at least the adapter's minimum known-good version
-- cached stream schema exists for the backend
-
-If the version differs from the setup cache, `Preflight` MUST fail loudly with:
-
-```text
-backend version changed since setup; re-run agentbus setup, then retry the launch so the running daemon can re-probe the refreshed cache; restart the daemon if it is running an older agentbus binary
-```
-
-Each adapter MUST declare a minimum known-good version. The exact values are
-pinned by adapter tests:
-
-| Backend | Minimum known-good version |
-| --- | --- |
-| codex | `0.143.0` |
-| cursor | `2026.08.04` |
-| claude | `2.1.205` |
-
-Current stream schema identifiers are:
-
-| Backend | Stream schema |
-| --- | --- |
-| codex | `codex-appserver-v1` |
-| cursor | `cursor-acp-v1` |
-| claude | `claude-streamjson-v2` |
-
-The setup probe cache consumed by `Preflight` is internal agentbus state and has
-this shape:
-
-```json
-{
-  "version": 3,
-  "backends": [
-    {
-      "backend": "codex",
-      "binaryPath": "/Users/me/.local/bin/codex",
-      "version": "0.143.0",
-      "streamSchema": "codex-appserver-v1",
-      "configMode": {
-        "write": "user",
-        "readOnly": "hermetic"
-      },
-      "sandboxModes": ["workspace-write", "read-only"],
-      "jsonEventsProbed": true,
-      "discoveredModels": ["gpt-5.4"],
-      "discoveredEfforts": ["low", "medium", "high", "xhigh"],
-      "discoverySource": "app-server",
-      "discoveryFetchedAt": "2026-07-11T12:00:00Z",
-      "discoveryClientVersion": "0.143.0"
-    }
-  ]
-}
-```
-
-Model and effort discovery is captured into the setup probe cache. Codex
-discovers models during app-server setup qualification by calling `model/list`
-with hidden models excluded and following cursors until the listing is complete.
-The adapter caches non-hidden model identifiers and the union of supported
-reasoning efforts, ordered as `none`, `minimal`, `low`, `medium`, `high`,
-`xhigh`, `max`, `ultra`, then first-seen unknown levels. A repeated cursor, an
-empty usable model list, or a `model/list` error fails Codex setup
-qualification.
-
-Claude discovery remains local help scraping: the adapter runs `claude --help`
-and parses documented model aliases/examples and effort choices. Help-scraped
-values are not an account-entitlement query.
-
-For generic discovery hooks, discovery failure does not by itself make a
-backend unavailable. A requested model or effort outside a discovered catalog
-emits a warning and is passed through to the backend. Only explicitly
-configured static allow-lists reject a selection before the backend starts.
-Missing discovery data falls back to those static known-good lists with a
-warning.
-
-Verified discovery surfaces for the installed CLIs:
-
-| Backend | Verified source | Discovery status |
-| --- | --- | --- |
-| codex | app-server `model/list` during setup qualification | Non-hidden model identifiers and supported reasoning efforts are cached from the app-server response. |
-| cursor | ACP `session/new` plus best-effort `cursor-agent models` parsing | ACP's available/current model identifiers are cached during no-prompt qualification; the CLI listing is a small best-effort catalog and may be empty. |
-| claude | `claude --help` lists effort choices and documents model aliases/examples | Efforts and documented model aliases/examples are cached. These are help-advertised values, not an account-entitlement query. |
-| gemini | `gemini --help` exposes `--model` but no model or effort listing | B1-ready discovery interface returns no listing; static fallback applies when the B2 adapter is added. |
-
-`agentbus setup --json` exposes `discoveredModels`, `discoveredEfforts`,
-`discoveryFetchedAt`, `discoveryClientVersion`, and `warnings` per backend.
-`protocol.hello.backendMetadata` exposes the cached arrays with capability
-`models.discovery`; the protocol major remains 1. When a driver-backed backend
-has empty live discovery during serve-time probing, validation and metadata are
-hydrated from the matching setup cache entry if the binary path, version, and
-stream schema still match.
+After durable admission, the daemon starts the requested backend session. A
+registered backend that cannot start fails at that point with the applicable
+failure class. `protocol.hello` can list configured backend names, but it does
+not prove that any listed backend can start a session.
 
 ## A5 flag verification amendments
 
@@ -483,12 +368,10 @@ The installed CLIs verified for A5 reported:
 | Backend | Documented flag/profile item | Installed CLI result | Amendment |
 | --- | --- | --- | --- |
 | codex | `app-server` process | adapter launches `codex app-server` and speaks JSON-RPC over JSONL stdio | use the duplex app-server driver |
-| codex | app-server handshake | `initialize` response followed by `initialized` notification | required before thread, turn, or discovery requests |
+| codex | app-server handshake | `initialize` response followed by `initialized` notification | required before thread or turn requests |
 | codex | app-server turn lifecycle | `thread/start` or `thread/resume`, then `turn/start`; `turn/interrupt` cancels the active turn | map session id, prompt, CWD, model, effort, sandbox, and approval policy through app-server requests |
-| codex | setup model discovery | app-server `model/list` is called during `SetupQualify` | cache discovery source `app-server`; do not read an external model cache file |
 | cursor | ACP process | `cursor-agent [--model <id>] acp` is a hidden ACP subcommand | use ACP JSON-RPC over JSONL stdio; do not pass `--mode` |
 | cursor | ACP lifecycle | v1 `initialize`, `authenticate(cursor_login)`, `session/new` or `session/load`, verified `session/set_mode`, then `session/prompt` | map write to `agent`, read-only to `plan`, and discard load replay updates before collecting the new turn |
-| cursor | setup qualification | no-prompt ACP handshake and session mode verification | run in a temporary working directory; require a usable mode and clean process retirement |
 | claude | `-p` stream-json input mode | present in `claude --help` as print mode with `--input-format stream-json` | send control-protocol initialization and one user-message envelope on stdin |
 | claude | `--output-format stream-json` | present in `claude --help`; the installed CLI requires `--verbose` with print-mode streaming | add `--verbose` |
 | claude | `--dangerously-skip-permissions` | present in `claude --help` | none |
@@ -530,9 +413,9 @@ profile.
 Implement `Backend` and `Session` as described in [Go interfaces](#go-interfaces).
 The implementation MUST keep responsibilities at the existing boundary:
 
-- `Backend.Name` returns the stable protocol name. `Preflight` performs only
-  local availability and drift checks. `Start` and `Resume` validate options
-  and create sessions; `Resume` MUST reject an empty backend session id.
+- `Backend.Name` returns the stable protocol name. `Preflight` is not a daemon
+  admission check. `Start` and `Resume` validate options and create sessions;
+  `Resume` MUST reject an empty backend session id.
 - `Session.ID` returns the backend id extracted from the stream. `Turn` launches
   exactly one backend process turn and emits normalized events. `Interrupt`
   sends the backend-native interrupt request when supported, falls back to
@@ -542,19 +425,6 @@ The implementation MUST keep responsibilities at the existing boundary:
   the complete read-only profile even when the original session was writable.
 - The adapter MUST NOT take over job state, policy validation or retry
   decisions, result spilling, or workflow semantics owned by the engine.
-
-Implement the B1 discovery or setup-qualification hooks in addition to
-`Backend`: expose `ModelDiscoverer.DiscoverModels(context.Context)` for local
-discovery surfaces, or a driver-backed setup qualifier when the backend
-protocol itself is the evidenced discovery surface. Return `ModelDiscovery`
-with models, efforts, provenance, and warnings as available, and cache the
-result in `BackendSetupProbe`. For generic discovery hooks, missing or failed
-discovery MUST leave empty lists plus an explicit warning and MUST NOT make the
-backend unavailable. A driver-backed setup qualifier MAY fail setup when it
-cannot produce the required setup facts. Selections outside a discovered set
-MUST warn and pass through; only an explicit static allow-list may reject them.
-Metadata advertised by `protocol.hello` comes from setup cache or matching
-cache hydration and MUST NOT launch a network turn.
 
 ### 2. Verify and pin argv profiles
 
@@ -605,9 +475,9 @@ The adapter MUST parse the CLI's real streaming format incrementally, reject
 malformed records, and map backend events to `AgentText`, `ToolUse`, `Warning`,
 `ResultMessage`, and `TerminalError`. It MUST extract a stable backend session
 id from any documented start or event envelope, retain the first valid id, and
-use it for resume. When a backend init/configuration event carries a model, the
-adapter MUST capture that non-empty model as best-effort reported-model data.
-It MUST distinguish progress text from the authoritative
+use it for resume. A backend init/configuration event may carry the actual
+model; the current JobRecord projection does not publish it. The adapter MUST
+distinguish progress text from the authoritative
 terminal result and map the latter to exactly the `ResultMessage` consumed by
 engine result selection. Parse errors, unsupported terminal shapes, and
 non-zero process exits MUST surface as terminal errors rather than successful
@@ -620,27 +490,18 @@ terminal completion semantics are backend-specific. Capture representative
 installed-binary events without API spend where possible, parse defensively
 only around verified shapes, and pin those fixtures in tests.
 
-### 5. Wire setup, versions, and drift guards
+### 5. Wire session startup and failure handling
 
-Declare and test a minimum known-good CLI version and a version normalizer.
-Wire the backend into `agentbus setup` so its setup qualification records the
-resolved binary path, normalized version, stream schema, configuration modes,
-sandbox modes, JSON-event success, and discovery result or warning. Generic
-adapters may use a live trivial-turn probe; driver-backed adapters may provide
-their own setup qualification when that is the evidenced discovery surface.
-Setup is the only place a live probe may spend API quota.
-
-Routine `Preflight` MUST remain local: resolve the executable, reject versions
-below the minimum, and compare binary path, version, and exact stream-schema
-identifier with the versioned setup cache. Missing cache data or any drift MUST
-fail with an actionable instruction to rerun setup. Register the adapter in the
-CLI/daemon backend list only after setup reporting, cache migration behavior,
-and `protocol.hello` metadata are wired and tested.
+Register the backend under its stable name and test its real session-start
+behavior. The daemon admits only registered names; it does not run a setup or
+advance session check. A backend failure during session start must surface
+through the established failure classification after the job has been durably
+admitted.
 
 ### 6. Build a hermetic fake-backend test suite
 
-Use a temporary executable and isolated setup cache; tests MUST NOT require the
-real vendor CLI, user configuration, network, or API quota. At minimum, cover:
+Use a temporary executable when needed; tests MUST NOT require the real vendor
+CLI, user configuration, network, or API quota. At minimum, cover:
 
 - golden process argv and protocol input for write, read-only, resume, and corrective-resume;
   assert that corrective resume downgrades a writable session to the complete
@@ -651,27 +512,25 @@ real vendor CLI, user configuration, network, or API quota. At minimum, cover:
 - timeout behavior and explicit interrupt, including termination of the whole
   process group (PGID) rather than only the direct child
 - event and log truncation with the truncation marker and flag preserved
-- unsupported model and effort rejection, discovered-cache validation, missing
-  discovery fallback, and stale-cache warnings
-- minimum-version rejection, binary/version/schema drift, setup-probe output,
-  and discovery parsing from captured fake help or backend-protocol output
+- unsupported model and effort behavior, when the adapter implements it
+- session-start failures and their classified terminal result
 
 Run `go test -race ./...` and `go vet ./...` after registration. A backend is
 not complete until the tests can falsify its permission profile, process
-supervision, parser, resume behavior, and drift guard.
+supervision, parser, resume behavior, and session-start failure handling.
 
-## Native structured output capability
+## Native structured output support
 
 Adapters MAY detect backend-native structured output support:
 
-| Backend | Candidate vendor flag | agentbus capability |
+| Backend | Candidate vendor flag | Adapter use |
 | --- | --- | --- |
-| codex | `--output-schema` | `nativeStructuredOutput.codex` |
-| claude | `--json-schema` | `nativeStructuredOutput.claude` |
+| codex | `--output-schema` | backend-local optimization |
+| claude | `--json-schema` | backend-local optimization |
 
-These capabilities are surfaced in `protocol.hello.capabilities`. They are a
-future optimization only. Protocol v1 structural compliance uses post-hoc
-validation of the persisted final result as defined in `docs/protocol.md`.
+This support adds no protocol field or method. Version-3 structural compliance
+uses the submitted inline JSON Schema and final-result validation defined in
+`docs/protocol.md`.
 
 ## Adapter responsibilities
 

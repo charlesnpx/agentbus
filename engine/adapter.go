@@ -22,9 +22,12 @@ type Session interface {
 
 // Health is the non-network preflight result for a backend.
 type Health struct {
-	Backend      string
-	BinaryPath   string
-	Version      string
+	Backend    string
+	BinaryPath string
+	Version    string
+	// StreamSchema is the stream protocol this adapter speaks. It is an
+	// adapter declaration, not a capability verified from the binary by
+	// Preflight.
 	StreamSchema string
 	Minimum      string
 	Warning      string
@@ -90,6 +93,8 @@ type TurnFinalObservation struct {
 const (
 	EventAgentText     = "AgentText"
 	EventToolUse       = "ToolUse"
+	EventToolResult    = "ToolResult"
+	EventReasoning     = "Reasoning"
 	EventWarning       = "Warning"
 	EventModelReported = "ModelReported"
 	EventResultMessage = "ResultMessage"
@@ -97,32 +102,6 @@ const (
 	EventTurnFinal     = "TurnFinal"
 	EventProgress      = "Progress"
 )
-
-// SetupProbeCache is written by setup after a live stream probe and read by
-// adapter Preflight without running another backend turn.
-type SetupProbeCache struct {
-	Version  int                 `json:"version"`
-	Backends []BackendSetupProbe `json:"backends"`
-}
-
-const SetupProbeCacheVersion = 3
-
-// BackendSetupProbe records the setup-time facts required by Preflight.
-type BackendSetupProbe struct {
-	Backend                string   `json:"backend"`
-	BinaryPath             string   `json:"binaryPath"`
-	Version                string   `json:"version"`
-	StreamSchema           string   `json:"streamSchema"`
-	ConfigMode             ModeInfo `json:"configMode"`
-	SandboxModes           []string `json:"sandboxModes"`
-	JSONEventsProbed       bool     `json:"jsonEventsProbed"`
-	DiscoveredModels       []string `json:"discoveredModels,omitempty"`
-	DiscoveredEfforts      []string `json:"discoveredEfforts,omitempty"`
-	DiscoverySource        string   `json:"discoverySource,omitempty"`
-	DiscoveryFetchedAt     string   `json:"discoveryFetchedAt,omitempty"`
-	DiscoveryClientVersion string   `json:"discoveryClientVersion,omitempty"`
-	DiscoveryWarnings      []string `json:"discoveryWarnings,omitempty"`
-}
 
 type ModelDiscovery struct {
 	Models        []string
@@ -141,10 +120,4 @@ type BackendMetadata struct {
 	Name    string
 	Models  []string
 	Efforts []string
-}
-
-// ModeInfo describes write/read-only configuration loading.
-type ModeInfo struct {
-	Write    string `json:"write"`
-	ReadOnly string `json:"readOnly"`
 }

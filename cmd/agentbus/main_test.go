@@ -3,793 +3,614 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	agentclient "github.com/charlesnpx/agentbus/client"
 	"github.com/charlesnpx/agentbus/engine"
-	"github.com/charlesnpx/agentbus/engine/execution/authority"
-	"github.com/charlesnpx/agentbus/internal/agentbusserve"
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
 
-type testClock struct{ now time.Time }
-
-func (c testClock) Now() time.Time { return c.now }
-
-type fakeProbe struct {
-	probe engine.BackendSetupProbe
-	err   error
-}
-
-func (p fakeProbe) SetupProbe(context.Context) (engine.BackendSetupProbe, error) {
-	return p.probe, p.err
-}
-
-type fakeBackend struct {
-	name   string
-	health engine.Health
-	err    error
-}
-
-func (b fakeBackend) Name() string { return b.name }
-
-func (b fakeBackend) Preflight(context.Context) (engine.Health, error) {
-	if b.err != nil {
-		return engine.Health{}, b.err
-	}
-	return b.health, nil
-}
-
-func (b fakeBackend) Start(context.Context, engine.SessionOpts) (engine.Session, error) {
-	return nil, errors.New("not used")
-}
-
-func (b fakeBackend) Resume(context.Context, string, engine.SessionOpts) (engine.Session, error) {
-	return nil, errors.New("not used")
-}
-
-func TestVersionAndServeCommands(t *testing.T) {
-	t.Parallel()
+func TestVersionReportsBothVersions(t *testing.T) {
 	a := testApp(t)
-
-	code, stdout, stderr := runTestCLI(t, a, []string{"version", "--json"}, "")
-	if code != 0 {
-		t.Fatalf("version exit = %d stderr=%s", code, stderr)
+	code, stdout, stderr := runTestCLI(t, a, []string{"version"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("version exit=%d stderr=%q", code, stderr)
 	}
-	var version versionOutput
-	decodeJSON(t, stdout, &version)
-	if version.Version != "test" || version.ProtocolVersion != protocol.Version || version.Schema != cliJSONSchema {
-		t.Fatalf("version output = %+v", version)
+	if stdout != "agentbus test protocol 3\n" {
+		t.Fatalf("human version output = %q", stdout)
 	}
 
-	code, stdout, stderr = runTestCLI(t, a, []string{"serve", "--help"}, "")
-	if code != 0 {
-		t.Fatalf("serve help exit = %d stderr=%s", code, stderr)
+	code, stdout, stderr = runTestCLI(t, a, []string{"version", "--json"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("JSON version exit=%d stderr=%q", code, stderr)
 	}
-	help := stdout + stderr
-	removedServeFlag := "--" + "admission"
-	if strings.Contains(help, removedServeFlag) {
-		t.Fatalf("serve help still mentions admission flag: stdout=%s stderr=%s", stdout, stderr)
-	}
-
-	code, _, stderr = runTestCLI(t, a, []string{"serve", "--foreground", removedServeFlag + "=strict"}, "")
-	if code == 0 || !strings.Contains(stderr, "flag provided but not defined") {
-		t.Fatalf("removed admission flag exit=%d stderr=%s", code, stderr)
+	var got versionOutput
+	decodeJSON(t, stdout, &got)
+	if got.Version != "test" || got.Schema != cliJSONSchema || got.ProtocolVersion != protocol.Version {
+		t.Fatalf("version output = %+v", got)
 	}
 }
 
-func TestVersionFlagMatchesVersionSubcommand(t *testing.T) {
-	t.Parallel()
+func TestDeletedCommandIsUnknown(t *testing.T) {
 	a := testApp(t)
-
-	wantCode, wantStdout, wantStderr := runTestCLI(t, a, []string{"version"}, "")
-	gotCode, gotStdout, gotStderr := runTestCLI(t, a, []string{"--version"}, "")
-	if gotCode != wantCode || gotStdout != wantStdout || gotStderr != wantStderr {
-		t.Fatalf("--version = code=%d stdout=%q stderr=%q, want code=%d stdout=%q stderr=%q", gotCode, gotStdout, gotStderr, wantCode, wantStdout, wantStderr)
+	code, _, stderr := runTestCLI(t, a, []string{"setup"})
+	if code != 2 || !strings.Contains(stderr, "unknown command") {
+		t.Fatalf("exit=%d stderr=%q, want unknown-command usage error", code, stderr)
 	}
 }
 
-func TestVersionJSONFlagMatchesVersionJSONSubcommand(t *testing.T) {
-	t.Parallel()
-	a := testApp(t)
-
-	wantCode, wantStdout, wantStderr := runTestCLI(t, a, []string{"version", "--json"}, "")
-	gotCode, gotStdout, gotStderr := runTestCLI(t, a, []string{"--version", "--json"}, "")
-	if gotCode != wantCode || gotStdout != wantStdout || gotStderr != wantStderr {
-		t.Fatalf("--version --json = code=%d stdout=%q stderr=%q, want code=%d stdout=%q stderr=%q", gotCode, gotStdout, gotStderr, wantCode, wantStdout, wantStderr)
+func TestStatusAndResultJSONAreByteIdentical(t *testing.T) {
+	digest := strings.Repeat("a", sha256.Size*2)
+	record := detailedRecord(protocol.PublicStateCompleted)
+	record.Result = &protocol.ResultInfoWire{
+		Text:       "the result",
+		ResultPath: "/state/results/job-1",
+		SHA256:     digest,
+		Bytes:      10,
 	}
-}
-
-func TestCodexHomeSettingsPreferInheritanceOptOut(t *testing.T) {
-	t.Setenv("AGENTBUS_CODEX_HOME", "/tmp/fixed-codex-home")
-	t.Setenv("AGENTBUS_CODEX_HOME_INHERIT", "1")
-	t.Setenv("CODEX_HOME", "/tmp/operator-codex-home")
-	override, inherit, authHome := codexHomeSettings()
-	if override != "/tmp/fixed-codex-home" || !inherit || authHome != "/tmp/operator-codex-home" {
-		t.Fatalf("codex settings = override=%q inherit=%t auth=%q", override, inherit, authHome)
-	}
-}
-
-func TestStartBackgroundDaemonWritesPIDAfterLauncherReady(t *testing.T) {
-	a := testApp(t)
-	launched := make(chan struct{})
-	releaseReady := make(chan struct{})
-	a.daemonLauncher = func(ctx context.Context, opts daemonlaunch.Options) (daemonlaunch.Result, error) {
-		if opts.StateRoot != a.stateRoot {
-			t.Errorf("launcher state root = %q, want %q", opts.StateRoot, a.stateRoot)
-		}
-		close(launched)
-		select {
-		case <-releaseReady:
-		case <-ctx.Done():
-			return daemonlaunch.Result{}, ctx.Err()
-		}
-		return daemonlaunch.Result{PID: 4242, CanonicalStateRoot: a.stateRoot}, nil
-	}
-
-	done := make(chan error, 1)
-	go func() { done <- a.startBackgroundDaemon(context.Background()) }()
-	select {
-	case <-launched:
-	case <-time.After(time.Second):
-		t.Fatal("launcher was not invoked")
-	}
-	pidPath := filepath.Join(a.stateRoot, "agentbus.pid")
-	if _, err := os.Stat(pidPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("pid file before readiness stat error = %v, want not exist", err)
-	}
-	close(releaseReady)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("startBackgroundDaemon did not return after readiness")
-	}
-	raw, err := os.ReadFile(pidPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.TrimSpace(string(raw)) != "4242" {
-		t.Fatalf("pid file = %q, want 4242", raw)
-	}
-}
-
-func TestSetupCachesProbeAndReportsJSON(t *testing.T) {
-	t.Parallel()
-	a := testApp(t)
-	probe := engine.BackendSetupProbe{
-		Backend:           "codex",
-		BinaryPath:        "/tmp/bin/codex",
-		Version:           "0.143.0",
-		StreamSchema:      "codex-json-v1",
-		ConfigMode:        engine.ModeInfo{Write: "user", ReadOnly: "hermetic"},
-		SandboxModes:      []string{"workspace-write", "read-only"},
-		JSONEventsProbed:  true,
-		DiscoveredModels:  []string{"gpt-5.4"},
-		DiscoveredEfforts: []string{"high"},
-	}
-	a.backends = []backendSpec{{
-		name: "codex",
-		backend: fakeBackend{
-			name: "codex",
-			health: engine.Health{
-				Backend:      "codex",
-				BinaryPath:   probe.BinaryPath,
-				Version:      probe.Version,
-				StreamSchema: probe.StreamSchema,
-			},
-		},
-		probe: fakeProbe{probe: probe},
-	}}
-
-	code, stdout, stderr := runTestCLI(t, a, []string{"setup", "--json"}, "")
-	if code != 0 {
-		t.Fatalf("setup exit = %d stderr=%s stdout=%s", code, stderr, stdout)
-	}
-	var output setupOutput
-	decodeJSON(t, stdout, &output)
-	if len(output.Backends) != 1 {
-		t.Fatalf("backends = %d, want 1", len(output.Backends))
-	}
-	got := output.Backends[0]
-	if got.Backend != "codex" || got.BinaryPath != probe.BinaryPath || got.Version != probe.Version || !got.JSONEventsProbe.Ran || got.JSONEventsProbe.StreamSchema != probe.StreamSchema {
-		t.Fatalf("setup backend = %+v", got)
-	}
-	if strings.Join(got.DiscoveredModels, ",") != "gpt-5.4" || strings.Join(got.DiscoveredEfforts, ",") != "high" {
-		t.Fatalf("discovery report=%+v", got)
-	}
-	cachePath, err := engine.SetupProbeCachePath(a.stateRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cache, err := engine.ReadSetupProbeCache(cachePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cache.Version != engine.SetupProbeCacheVersion || len(cache.Backends) != 1 || cache.Backends[0].Version != probe.Version || cache.Backends[0].StreamSchema != probe.StreamSchema || len(cache.Backends[0].DiscoveredModels) != 1 {
-		t.Fatalf("cache = %+v", cache)
-	}
-}
-
-func TestSetupReportsDiscoveryWarnings(t *testing.T) {
-	t.Parallel()
-	a := testApp(t)
-	probe := engine.BackendSetupProbe{Backend: "claude", BinaryPath: "/tmp/bin/claude", Version: "2.1.205", StreamSchema: "claude-stream-json-v1", JSONEventsProbed: true, DiscoveryWarnings: []string{"claude model discovery failed: claude --help model discovery parser found no model or effort listings"}}
-	a.backends = []backendSpec{{name: "claude", backend: fakeBackend{name: "claude", health: engine.Health{Backend: "claude", BinaryPath: probe.BinaryPath, Version: probe.Version, StreamSchema: probe.StreamSchema}}, probe: fakeProbe{probe: probe}}}
-	code, stdout, stderr := runTestCLI(t, a, []string{"setup", "--json"}, "")
-	if code != 0 {
-		t.Fatalf("setup exit=%d stderr=%s stdout=%s", code, stderr, stdout)
-	}
-	var output setupOutput
-	decodeJSON(t, stdout, &output)
-	if len(output.Backends) != 1 || len(output.Backends[0].Warnings) != 1 || !strings.Contains(output.Backends[0].Warnings[0], "claude --help") {
-		t.Fatalf("output=%+v", output)
-	}
-}
-
-func TestSetupDriftDetectionFailsLoudly(t *testing.T) {
-	t.Parallel()
-	a := testApp(t)
-	drift := "backend version changed since setup; re-run agentbus setup, then retry the launch so the running daemon can re-probe the refreshed cache; restart the daemon if it is running an older agentbus binary"
-	probe := engine.BackendSetupProbe{
-		Backend:          "claude",
-		BinaryPath:       "/tmp/bin/claude",
-		Version:          "2.1.205",
-		StreamSchema:     "claude-stream-json-v1",
-		JSONEventsProbed: true,
-	}
-	a.backends = []backendSpec{{
-		name:    "claude",
-		backend: fakeBackend{name: "claude", err: errors.New(drift)},
-		probe:   fakeProbe{probe: probe},
-	}}
-
-	code, stdout, stderr := runTestCLI(t, a, []string{"setup", "--json"}, "")
-	if code != 1 {
-		t.Fatalf("setup exit = %d stderr=%s stdout=%s", code, stderr, stdout)
-	}
-	var output setupOutput
-	decodeJSON(t, stdout, &output)
-	if output.Error != "setup preflight failed" {
-		t.Fatalf("setup error = %q", output.Error)
-	}
-	if len(output.Backends) != 1 || !strings.Contains(output.Backends[0].Error, drift) {
-		t.Fatalf("backend error = %+v", output.Backends)
-	}
-	if !strings.Contains(stdout, drift) {
-		t.Fatalf("drift was not loud in JSON output: %s", stdout)
-	}
-}
-
-func TestAdmissionCLIInspectResetAndSealFlags(t *testing.T) {
-	t.Parallel()
-	a := testApp(t)
-	root := filepath.Join(t.TempDir(), "admission-root")
-
-	code, stdout, stderr := runTestCLI(t, a, []string{"admission", "reset-empty-root", "--state-root", root, "--json"}, "")
-	if code != 0 {
-		t.Fatalf("reset-empty-root exit = %d stderr=%s stdout=%s", code, stderr, stdout)
-	}
-	var reset authority.RootInspection
-	decodeJSON(t, stdout, &reset)
-	if reset.DomainUUID == "" || reset.Sealed || !reset.Counts.Empty() || reset.ActivationMetadata.Activated {
-		t.Fatalf("reset inspection = %+v", reset)
-	}
-
-	code, stdout, stderr = runTestCLI(t, a, []string{"admission", "inspect", "--state-root", root, "--json"}, "")
-	if code != 0 {
-		t.Fatalf("inspect exit = %d stderr=%s stdout=%s", code, stderr, stdout)
-	}
-	var inspected authority.RootInspection
-	decodeJSON(t, stdout, &inspected)
-	if inspected.DomainUUID != reset.DomainUUID || !inspected.Counts.Empty() {
-		t.Fatalf("inspect = %+v, reset = %+v", inspected, reset)
-	}
-
-	code, _, stderr = runTestCLI(t, a, []string{"admission", "seal", "--state-root", root}, "")
-	if code != 1 || !strings.Contains(stderr, authority.ErrSealConfirmationRequired.Error()) {
-		t.Fatalf("seal without flags exit=%d stderr=%s", code, stderr)
-	}
-	newRoot := filepath.Join(t.TempDir(), "new-admission-root")
-	code, stdout, stderr = runTestCLI(t, a, []string{"admission", "seal", "--state-root", root, "--new-state-root", newRoot, "--start-new-authority-domain", "--acknowledge-replay-history-reset", "--json"}, "")
-	if code != 0 {
-		t.Fatalf("seal exit=%d stderr=%s stdout=%s", code, stderr, stdout)
-	}
-	var sealed authority.SealReport
-	decodeJSON(t, stdout, &sealed)
-	if !sealed.OldRootSealed || sealed.NewRoot != newRoot || sealed.NewDomainUUID == "" {
-		t.Fatalf("seal report = %+v", sealed)
-	}
-
-	code, stdout, stderr = runTestCLI(t, a, []string{"admission", "--help"}, "")
-	if code != 0 {
-		t.Fatalf("admission help exit=%d stderr=%s", code, stderr)
-	}
-	if !strings.Contains(stdout, "Multi-root read/cancel/result routing is out of scope in this first release.") {
-		t.Fatalf("admission help missing limitation sentence: %s", stdout)
-	}
-}
-
-func TestAdmissionCLIInspectBusyRootErrorsAreActionableAndStructured(t *testing.T) {
-	a := testApp(t)
-	a.inspectAdmissionRoot = func(context.Context, string) (authority.RootInspection, error) {
-		return authority.RootInspection{}, authority.ErrRootBusy
-	}
-
-	code, stdout, stderr := runTestCLI(t, a, []string{"admission", "inspect", "--state-root", t.TempDir()}, "")
-	if code != 1 {
-		t.Fatalf("text inspect exit = %d, want 1; stderr=%s stdout=%s", code, stderr, stdout)
-	}
-	if stdout != "" {
-		t.Fatalf("text inspect stdout = %q, want empty", stdout)
-	}
-	if !strings.Contains(stderr, authority.ErrRootBusy.Error()) {
-		t.Fatalf("text inspect stderr = %q, want root-busy error", stderr)
-	}
-
-	code, stdout, stderr = runTestCLI(t, a, []string{"admission", "inspect", "--state-root", t.TempDir(), "--json"}, "")
-	if code != 1 {
-		t.Fatalf("JSON inspect exit = %d, want 1; stderr=%s stdout=%s", code, stderr, stdout)
-	}
-	if stderr != "" {
-		t.Fatalf("JSON inspect stderr = %q, want empty", stderr)
-	}
-	var output admissionInspectErrorOutput
-	decodeJSON(t, stdout, &output)
-	if output.Schema != cliJSONSchema || output.Code != authority.ErrRootBusy.Error() || !strings.Contains(output.Error, authority.ErrRootBusy.Error()) {
-		t.Fatalf("JSON inspect error = %+v, want schema, root-busy code, and root-busy error", output)
-	}
-}
-
-func TestAdmissionRecoverTextReportIncludesADR13Counts(t *testing.T) {
-	t.Parallel()
-	a := testApp(t)
-	root := filepath.Join(t.TempDir(), "admission-root")
-	a.recoverAdmissionRoot = func(_ context.Context, cfg agentbusserve.Config) (agentbusserve.AdmissionRecoveryReport, error) {
-		if cfg.StateRoot != root {
-			t.Errorf("recover state root = %q, want %q", cfg.StateRoot, root)
-		}
-		return agentbusserve.AdmissionRecoveryReport{
-			Mode:               "recovery_only",
-			WorkItems:          1,
-			QuiescedLaunches:   2,
-			FinalizedJobs:      3,
-			OrphanedJobs:       4,
-			UnresolvedLaunches: 5,
-			CleanupWarnings:    6,
-			RecoveryPasses:     7,
-		}, nil
-	}
-
-	code, stdout, stderr := runTestCLI(t, a, []string{"admission", "recover", "--state-root", root}, "")
-	if code != 0 {
-		t.Fatalf("recover exit=%d stderr=%s stdout=%s", code, stderr, stdout)
-	}
-	for _, want := range []string{"orphanedJobs=4", "unresolvedLaunches=5", "cleanupWarnings=6"} {
-		if !strings.Contains(stdout, want) {
-			t.Fatalf("recover text report = %q, want %q", stdout, want)
-		}
-	}
-}
-
-func TestStatusResultAndCancelExitCodes(t *testing.T) {
-	t.Parallel()
-	a := testApp(t)
-	client := &fakeProtocolClient{
-		statuses: map[string]agentclient.JobStatus{
-			"job_done":    {JobID: "job_done", SessionID: "ses_done", State: engine.StateCompleted},
-			"job_running": {JobID: "job_running", SessionID: "ses_running", State: engine.StateRunning},
-			"job_orphan":  {JobID: "job_orphan", SessionID: "ses_orphan", State: engine.StateOrphaned},
-		},
-		results: map[string]agentclient.JobResult{
-			"job_done":    {JobID: "job_done", SessionID: "ses_done", State: engine.StateCompleted, Result: &engine.ResultInfo{Text: "done", Bytes: 4}},
-			"job_running": {JobID: "job_running", SessionID: "ses_running", State: engine.StateRunning},
-			"job_orphan":  {JobID: "job_orphan", SessionID: "ses_orphan", State: engine.StateOrphaned},
-		},
-		cancels: map[string]agentclient.JobCancelResult{
-			"job_cancel_me": {JobID: "job_cancel_me", State: engine.StateCanceled},
-		},
-	}
-	a.clientConnect = func(ctx context.Context, opts agentclient.Options) (protocolClient, error) {
-		if opts.StateRoot != a.stateRoot {
-			t.Errorf("client state root = %q, want %q", opts.StateRoot, a.stateRoot)
-		}
-		if opts.CommandPath == "" {
-			t.Error("client command path is empty")
-		}
-		return client, nil
-	}
-
-	tests := []struct {
-		name      string
-		args      []string
-		wantCode  int
-		wantState engine.JobState
-	}{
-		{name: "status completed", args: []string{"status", "--job", "job_done", "--json"}, wantCode: 0, wantState: engine.StateCompleted},
-		{name: "status nonterminal", args: []string{"status", "--job", "job_running", "--json"}, wantCode: 2, wantState: engine.StateRunning},
-		{name: "status orphaned", args: []string{"status", "--job", "job_orphan", "--json"}, wantCode: 14, wantState: engine.StateOrphaned},
-		{name: "result completed", args: []string{"result", "--job", "job_done", "--json"}, wantCode: 0, wantState: engine.StateCompleted},
-		{name: "result nonterminal", args: []string{"result", "--job", "job_running", "--json"}, wantCode: 2, wantState: engine.StateRunning},
-		{name: "result orphaned", args: []string{"result", "--job", "job_orphan", "--json"}, wantCode: 14, wantState: engine.StateOrphaned},
-		{name: "cancel queued", args: []string{"cancel", "--job", "job_cancel_me", "--json"}, wantCode: 7, wantState: engine.StateCanceled},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			code, stdout, stderr := runTestCLI(t, a, tt.args, "")
-			if code != tt.wantCode {
-				t.Fatalf("exit = %d want %d stderr=%s stdout=%s", code, tt.wantCode, stderr, stdout)
-			}
-			if tt.args[0] == "status" {
-				var output protocol.JobStatusResult
-				decodeJSON(t, stdout, &output)
-				if len(output.Jobs) != 1 || output.Jobs[0].State != tt.wantState {
-					t.Fatalf("status output = %+v", output)
-				}
-				return
-			}
-			if tt.args[0] == "result" {
-				var output protocol.JobResult
-				decodeJSON(t, stdout, &output)
-				if output.State != tt.wantState {
-					t.Fatalf("result output = %+v", output)
-				}
-				if tt.wantState == engine.StateCompleted && (output.Result == nil || output.Result.Text != "done") {
-					t.Fatalf("result text = %+v", output.Result)
-				}
-				return
-			}
-			var output protocol.JobCancelResult
-			decodeJSON(t, stdout, &output)
-			if output.State != tt.wantState {
-				t.Fatalf("cancel output = %+v", output)
-			}
-		})
-	}
-}
-
-func TestStatusListsViaProtocolClient(t *testing.T) {
-	t.Parallel()
 	a := testApp(t)
 	a.clientConnect = func(context.Context, agentclient.Options) (protocolClient, error) {
-		return &fakeProtocolClient{
-			list: []agentclient.JobStatus{
-				{JobID: "job_a", State: engine.StateRunning},
-				{JobID: "job_b", State: engine.StateCompleted},
-			},
-		}, nil
+		return &fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}}, nil
 	}
-	code, stdout, stderr := runTestCLI(t, a, []string{"status", "--json"}, "")
-	if code != 0 {
-		t.Fatalf("status list exit=%d stderr=%s stdout=%s", code, stderr, stdout)
+
+	statusCode, statusJSON, statusErr := runTestCLI(t, a, []string{"status", "--job", "job-1", "--json"})
+	resultCode, resultJSON, resultErr := runTestCLI(t, a, []string{"result", "--job", "job-1", "--json"})
+	if statusCode != 0 || resultCode != 0 || statusErr != "" || resultErr != "" {
+		t.Fatalf("status=(%d,%q) result=(%d,%q)", statusCode, statusErr, resultCode, resultErr)
 	}
-	var output protocol.JobStatusResult
-	decodeJSON(t, stdout, &output)
-	if len(output.Jobs) != 2 || output.Jobs[0].JobID != "job_a" || output.Jobs[1].JobID != "job_b" {
-		t.Fatalf("status list output = %+v", output)
+	if statusJSON != resultJSON {
+		t.Fatalf("status JSON = %q\nresult JSON = %q\nwant byte-identical job.get records", statusJSON, resultJSON)
+	}
+	if !strings.Contains(statusJSON, `"result":{"text":"the result","resultPath":"/state/results/job-1","sha256":"`+digest+`","bytes":10}`) {
+		t.Fatalf("result JSON shape = %q, want bare lowercase SHA-256 value", statusJSON)
 	}
 }
 
-func TestStatusResultCancelProtocolErrorExitCodes(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name       string
-		args       []string
-		err        error
-		wantCode   int
-		wantStderr []string
-	}{
-		{
-			name:       "unknown job",
-			args:       []string{"status", "--job", "job_missing"},
-			err:        &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: "job_missing"})},
-			wantCode:   cliExitUnknownJob,
-			wantStderr: []string{"code=unknown_job", "jobId=job_missing"},
-		},
-		{
-			name:       "unknown job classifies by code",
-			args:       []string{"result", "--job", "job_missing"},
-			err:        &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "authority does not have this job", protocol.ErrorData{JobID: "job_missing"})},
-			wantCode:   cliExitUnknownJob,
-			wantStderr: []string{"code=unknown_job", "jobId=job_missing"},
-		},
-		{
-			name:       "fail stop",
-			args:       []string{"status", "--job", "job_failstop"},
-			err:        &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorBackendUnavailable, "authority fail-stopped", protocol.ErrorData{AdmissionCause: protocol.AdmissionRejectRootFailStopped})},
-			wantCode:   cliExitAuthorityFailStop,
-			wantStderr: []string{"code=backend_unavailable", "admissionCause=root_fail_stopped"},
-		},
-		{
-			name:       "daemon startup failure",
-			args:       []string{"result", "--job", "job_any"},
-			err:        &daemonlaunch.StartupError{Kind: daemonlaunch.ErrStartupFailed, Code: "strict admission support unavailable", Message: "unsupported host"},
-			wantCode:   cliExitDaemonStartupFailure,
-			wantStderr: []string{"daemon startup failed", "unsupported host"},
-		},
+func TestStatusHumanProjectionIncludesOperatorFieldsAndNeverResultText(t *testing.T) {
+	record := detailedRecord(protocol.PublicStateFailed)
+	started := record.CreatedAt.Add(time.Minute)
+	finished := started.Add(time.Minute)
+	record.StartedAt = &started
+	record.FinishedAt = &finished
+	record.Tags = map[string]string{"z": "last", "a": "first"}
+	record.ModelReported = "gpt-5"
+	record.Result = &protocol.ResultInfoWire{
+		Text:       "secret result text",
+		ResultPath: "/state/results/job-1",
+		SHA256:     strings.Repeat("a", sha256.Size*2),
+		Bytes:      18,
 	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			a := testApp(t)
-			a.clientConnect = func(context.Context, agentclient.Options) (protocolClient, error) {
-				return &fakeProtocolClient{err: tt.err}, nil
-			}
-			code, stdout, stderr := runTestCLI(t, a, tt.args, "")
-			if code != tt.wantCode {
-				t.Fatalf("exit=%d want=%d stdout=%s stderr=%s", code, tt.wantCode, stdout, stderr)
-			}
-			if stdout != "" {
-				t.Fatalf("stdout=%q, want empty", stdout)
-			}
-			for _, want := range tt.wantStderr {
-				if !strings.Contains(stderr, want) {
-					t.Fatalf("stderr=%q, want %q", stderr, want)
-				}
-			}
-		})
+	record.Failure = &protocol.JobFailureWire{Class: protocol.FailureClassBackendError, Reason: "provider stopped"}
+	record.Contract = &protocol.ContractResult{Evaluated: true, Compliant: false}
+	record.LogPaths = &protocol.LogPathsWire{Stdout: "/logs/out", Stderr: "/logs/err"}
+	a := testApp(t)
+	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"status", "--job", "job-1"})
+	if code != 4 || stderr != "" {
+		t.Fatalf("status exit=%d stderr=%q", code, stderr)
+	}
+	for _, want := range []string{
+		"jobId=job-1 state=failed backend=codex cleanup=clean age=",
+		"createdAt=2026-01-02T03:04:05Z",
+		"startedAt=2026-01-02T03:05:05Z",
+		"finishedAt=2026-01-02T03:06:05Z",
+		"timeout.effective=1800000 timeout.source=client",
+		"model=gpt-5 tags=a=first,z=last",
+		"result.bytes=18 result.sha256=sha256:aaaaaaaaaaaa",
+		"failure.class=backend_error failure.reason=provider stopped",
+		"contract.evaluated=true contract.compliant=false",
+		"logPaths.stdout=/logs/out logPaths.stderr=/logs/err",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("status output missing %q:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "secret result text") || strings.Contains(stdout, "/state/results/job-1") {
+		t.Fatalf("status exposed result text or path: %q", stdout)
 	}
 }
 
-func TestProtocolCommandErrorStartupErrorExitCodes(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name       string
-		err        error
-		wantCode   int
-		wantStderr []string
-	}{
-		{
-			name: "authority fail stop code",
-			err: &daemonlaunch.StartupError{
-				Kind:    daemonlaunch.ErrStartupFailed,
-				Code:    daemonlaunch.CodeAuthorityFailStopped,
-				Message: "authority fail-stopped: persisted unsafe stop",
-			},
-			wantCode:   cliExitAuthorityFailStop,
-			wantStderr: []string{"code=backend_unavailable", "admissionCause=root_fail_stopped", "authority fail-stopped"},
-		},
-		{
-			name:       "readiness timeout",
-			err:        &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessTimeout, Message: "deadline exceeded"},
-			wantCode:   cliExitDaemonStartupFailure,
-			wantStderr: []string{"daemon readiness timed out"},
-		},
-		{
-			name:       "readiness protocol",
-			err:        &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessProtocol, Message: "bad frame"},
-			wantCode:   cliExitDaemonStartupFailure,
-			wantStderr: []string{"daemon readiness protocol error"},
-		},
-		{
-			name:       "readiness eof",
-			err:        &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessEOF},
-			wantCode:   cliExitDaemonStartupFailure,
-			wantStderr: []string{"daemon exited before readiness"},
-		},
-		{
-			name:       "other startup kind",
-			err:        &daemonlaunch.StartupError{Kind: errors.New("daemon spawn failed"), Message: "exec failed"},
-			wantCode:   cliExitDaemonStartupFailure,
-			wantStderr: []string{"daemon spawn failed", "exec failed"},
-		},
-		{
-			name: "unknown startup code",
-			err: &daemonlaunch.StartupError{
-				Kind:    daemonlaunch.ErrStartupFailed,
-				Code:    "strict admission support unavailable",
-				Message: "unsupported host",
-			},
-			wantCode:   cliExitDaemonStartupFailure,
-			wantStderr: []string{"daemon startup failed", "strict admission support unavailable"},
-		},
+func TestStatusListHumanProjectionIncludesFailureClassAndContractVerdict(t *testing.T) {
+	created := time.Now().UTC().Add(-2 * time.Minute)
+	lastItemAt := created.Add(time.Minute)
+	itemCount := 3
+	a := testApp(t)
+	a.clientConnect = fakeConnector(&fakeProtocolClient{list: agentclient.JobListResult{Jobs: []agentclient.JobSummaryWire{{
+		JobID:        "job-1",
+		Backend:      "codex",
+		State:        protocol.PublicStateRunning,
+		Tags:         map[string]string{"team": "core"},
+		Cleanup:      protocol.CleanupUncertain,
+		CreatedAt:    created,
+		FailureClass: protocol.FailureClassBackendError,
+		Contract:     &protocol.ContractVerdict{Evaluated: true, Compliant: false},
+		ItemCount:    &itemCount,
+		LastItemAt:   &lastItemAt,
+		Liveness:     protocol.LivenessAlive,
+	}}}})
+	code, stdout, stderr := runTestCLI(t, a, []string{"status"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("status list exit=%d stderr=%q", code, stderr)
 	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			var stderr bytes.Buffer
-			code := protocolCommandError(&stderr, "status", tt.err)
-			if code != tt.wantCode {
-				t.Fatalf("exit=%d want=%d stderr=%s", code, tt.wantCode, stderr.String())
-			}
-			for _, want := range tt.wantStderr {
-				if !strings.Contains(stderr.String(), want) {
-					t.Fatalf("stderr=%q, want %q", stderr.String(), want)
-				}
-			}
-		})
+	if !strings.Contains(stdout, "jobId=job-1 state=running backend=codex cleanup=uncertain age=") ||
+		!strings.Contains(stdout, "failure.class=backend_error") ||
+		!strings.Contains(stdout, "contract.evaluated=true contract.compliant=false") ||
+		!strings.Contains(stdout, "tags=team=core itemCount=3") ||
+		!strings.Contains(stdout, "lastItemAt="+lastItemAt.Format(time.RFC3339Nano)) ||
+		!strings.Contains(stdout, "liveness=alive") {
+		t.Fatalf("status list = %q", stdout)
 	}
 }
 
-func TestServeCommandErrorAuthorityStartupRefusedExitCodes(t *testing.T) {
-	t.Parallel()
+func TestStatusListScopesCurrentWorkspaceAndCanListAllWorkspaces(t *testing.T) {
+	client := &fakeProtocolClient{list: agentclient.JobListResult{}}
+	a := testApp(t)
+	a.clientConnect = fakeConnector(client)
+
+	code, _, stderr := runTestCLI(t, a, []string{"status", "--tag", "team=core", "--state", "running"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("scoped status = (%d,%q)", code, stderr)
+	}
+	if len(client.listParams) != 1 {
+		t.Fatalf("scoped job.list calls = %d, want 1", len(client.listParams))
+	}
+	wantWorkspace, err := currentWorkspaceKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.listParams[0]; got.WorkspaceKey != wantWorkspace ||
+		!slices.Equal(got.States, []protocol.PublicState{protocol.PublicStateRunning}) ||
+		len(got.Tags) != 1 || got.Tags["team"] != "core" {
+		t.Fatalf("scoped job.list params = %#v", got)
+	}
+
+	code, _, stderr = runTestCLI(t, a, []string{"status", "--all-workspaces"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("all-workspaces status = (%d,%q)", code, stderr)
+	}
+	if len(client.listParams) != 2 {
+		t.Fatalf("all-workspaces job.list calls = %d, want 2", len(client.listParams))
+	}
+	if got := client.listParams[1]; got.WorkspaceKey != "" || len(got.Tags) != 0 || len(got.States) != 0 {
+		t.Fatalf("all-workspaces job.list params = %#v, want no filters", got)
+	}
+}
+
+func TestTranscriptForwardsSelectorsAndPrintsDigest(t *testing.T) {
+	since := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	transcript := agentclient.JobTranscriptResult{
+		State:     protocol.PublicStateRunning,
+		Liveness:  protocol.LivenessAlive,
+		ItemCount: 5,
+		Counts: map[string]int{
+			"message": 1, "reasoning": 1, "tool": 1, "toolResult": 1, "fileChange": 0, "warning": 0, "error": 1,
+		},
+		Items: []agentclient.TranscriptItem{
+			{Ordinal: 7, At: since.Add(time.Second), Kind: "message", Name: "tool\nname", Text: "hello\nworld"},
+		},
+	}
+	client := &fakeProtocolClient{transcripts: map[string]agentclient.JobTranscriptResult{"job-1": transcript}}
+	a := testApp(t)
+	a.clientConnect = fakeConnector(client)
+
+	code, stdout, stderr := runTestCLI(t, a, []string{
+		"transcript", "--job", "job-1", "--kind", "message", "--kind", "error",
+		"--since", since.Format(time.RFC3339Nano), "--since-ordinal", "6", "--last", "3", "--limit", "2",
+	})
+	if code != 0 || stderr != "" {
+		t.Fatalf("selected transcript = (%d,%q)", code, stderr)
+	}
+	if len(client.transcriptParams) != 1 {
+		t.Fatalf("job.transcript calls = %d, want 1", len(client.transcriptParams))
+	}
+	params := client.transcriptParams[0]
+	if params.JobID != "job-1" || !slices.Equal(params.Kinds, []string{"message", "error"}) || params.Since == nil || !params.Since.Equal(since) || params.SinceOrdinal == nil || *params.SinceOrdinal != 6 || params.Last == nil || *params.Last != 3 || params.Limit == nil || *params.Limit != 2 {
+		t.Fatalf("transcript params = %#v", params)
+	}
+	if !strings.Contains(stdout, "state=running itemCount=5 liveness=alive gap=false") || !strings.Contains(stdout, "7 kind=message") || !strings.Contains(stdout, `name="tool\nname"`) || !strings.Contains(stdout, `text="hello\nworld"`) {
+		t.Fatalf("selected transcript output = %q", stdout)
+	}
+	lines := strings.Split(strings.TrimSuffix(stdout, "\n"), "\n")
+	if len(lines) != 2 || !strings.HasPrefix(lines[1], "7 ") {
+		t.Fatalf("selected transcript item must remain on one ordinal-prefixed line: %q", stdout)
+	}
+	if strings.Contains(stdout, "counts message=") {
+		t.Fatalf("selected transcript unexpectedly printed digest counts: %q", stdout)
+	}
+
+	code, stdout, stderr = runTestCLI(t, a, []string{"transcript", "--job", "job-1"})
+	if code != 0 || stderr != "" || !strings.Contains(stdout, "counts message=1 reasoning=1 tool=1 toolResult=1 fileChange=0 warning=0 error=1") {
+		t.Fatalf("digest transcript = (%d,%q,%q)", code, stdout, stderr)
+	}
+
+	code, stdout, stderr = runTestCLI(t, a, []string{"transcript", "--job", "job-1", "--json"})
+	if code != 0 || stderr != "" {
+		t.Fatalf("JSON transcript = (%d,%q)", code, stderr)
+	}
+	var decoded agentclient.JobTranscriptResult
+	decodeJSON(t, stdout, &decoded)
+	if decoded.ItemCount != transcript.ItemCount || len(decoded.Items) != 1 || decoded.Items[0].Ordinal != 7 {
+		t.Fatalf("JSON transcript = %#v", decoded)
+	}
+}
+
+func TestResultHumanProjection(t *testing.T) {
 	tests := []struct {
 		name       string
-		err        error
+		record     agentclient.JobGetResult
 		wantCode   int
+		wantStdout string
 		wantStderr string
 	}{
 		{
-			name:       "authority fail stop sentinel",
-			err:        authority.ErrFailStopped,
-			wantCode:   15,
-			wantStderr: authority.ErrFailStopped.Error(),
+			name:     "text is pipeable and newline terminated",
+			record:   withResult(detailedRecord(protocol.PublicStateCompleted), &protocol.ResultInfoWire{Text: "pipe me", SHA256: strings.Repeat("a", sha256.Size*2), Bytes: 7}),
+			wantCode: 0, wantStdout: "pipe me\n",
 		},
 		{
-			name:       "authority root sealed",
-			err:        authority.ErrRootSealed,
-			wantCode:   16,
-			wantStderr: authority.ErrRootSealed.Error(),
+			name:       "completed without result is unavailable",
+			record:     detailedRecord(protocol.PublicStateCompleted),
+			wantCode:   cliExitResultUnavailable,
+			wantStderr: "no authoritative result",
 		},
 		{
-			name:       "generic error",
-			err:        errors.New("ordinary startup failure"),
-			wantCode:   1,
-			wantStderr: "ordinary startup failure",
+			name:     "failed writes diagnostics only",
+			record:   withFailure(detailedRecord(protocol.PublicStateFailed), protocol.FailureClassTimeout, "deadline exceeded"),
+			wantCode: 5, wantStderr: "failure.class=timeout failure.reason=deadline exceeded",
+		},
+		{
+			name:       "nonterminal writes state only to stderr",
+			record:     detailedRecord(protocol.PublicStateRunning),
+			wantCode:   2,
+			wantStderr: "jobId=job-1 state=running",
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			var stderr bytes.Buffer
-			code := serveCommandError(&stderr, tt.err)
-			if code != tt.wantCode {
-				t.Fatalf("exit=%d want=%d stderr=%s", code, tt.wantCode, stderr.String())
-			}
-			if !strings.Contains(stderr.String(), tt.wantStderr) {
-				t.Fatalf("stderr=%q, want %q", stderr.String(), tt.wantStderr)
-			}
-		})
-	}
-}
-
-func TestStatusResultCancelDaemonStartupFailureLeavesRootEmpty(t *testing.T) {
-	t.Parallel()
-	for _, args := range [][]string{
-		{"status", "--job", "job_any"},
-		{"result", "--job", "job_any"},
-		{"cancel", "--job", "job_any"},
-	} {
-		args := args
-		t.Run(args[0], func(t *testing.T) {
 			a := testApp(t)
-			a.clientConnect = func(context.Context, agentclient.Options) (protocolClient, error) {
-				return nil, &daemonlaunch.StartupError{Kind: daemonlaunch.ErrStartupFailed, Code: "strict admission support unavailable", Message: "unsupported host"}
-			}
-			code, stdout, stderr := runTestCLI(t, a, args, "")
-			if code != cliExitDaemonStartupFailure {
-				t.Fatalf("exit=%d want=%d stdout=%s stderr=%s", code, cliExitDaemonStartupFailure, stdout, stderr)
-			}
-			if _, err := os.Stat(a.stateRoot); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("state root stat = %v, want not exist", err)
+			a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": tt.record}})
+			code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1"})
+			if code != tt.wantCode || stdout != tt.wantStdout || !strings.Contains(stderr, tt.wantStderr) {
+				t.Fatalf("result=(code=%d stdout=%q stderr=%q), want code=%d stdout=%q stderr containing %q", code, stdout, stderr, tt.wantCode, tt.wantStdout, tt.wantStderr)
 			}
 		})
 	}
 }
 
-func TestSessionsCommandIsUnknown(t *testing.T) {
-	t.Parallel()
+func TestResultStreamsVerifiedArtifact(t *testing.T) {
+	artifactBytes := []byte(strings.Repeat("a", engine.DefaultInlineResultCap+1))
+	artifactPath := filepath.Join(t.TempDir(), "result.txt")
+	if err := os.WriteFile(artifactPath, artifactBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(artifactBytes)
+	record := withResult(detailedRecord(protocol.PublicStateCompleted), &protocol.ResultInfoWire{
+		ResultPath: artifactPath,
+		SHA256:     hex.EncodeToString(sum[:]),
+		Bytes:      int64(len(artifactBytes)),
+	})
 	a := testApp(t)
-	code, _, stderr := runTestCLI(t, a, []string{"sessions"}, "")
-	if code != 2 || !strings.Contains(stderr, "unknown command") {
-		t.Fatalf("sessions exit=%d stderr=%s", code, stderr)
+	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1"})
+	if code != 0 || stdout != string(artifactBytes) || stderr != "" {
+		t.Fatalf("result=(code=%d stdout=%d bytes stderr=%q), want verified artifact bytes and success", code, len(stdout), stderr)
 	}
 }
 
-func TestValidateContractFilesAndRegisteredNames(t *testing.T) {
-	t.Parallel()
+func TestResultRejectsPrefixedDigest(t *testing.T) {
+	artifactBytes := []byte("authoritative result")
+	artifactPath := filepath.Join(t.TempDir(), "result.txt")
+	if err := os.WriteFile(artifactPath, artifactBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(artifactBytes)
+	record := withResult(detailedRecord(protocol.PublicStateCompleted), &protocol.ResultInfoWire{
+		ResultPath: artifactPath,
+		SHA256:     "sha256:" + hex.EncodeToString(sum[:]),
+		Bytes:      int64(len(artifactBytes)),
+	})
 	a := testApp(t)
-	spec := engine.ContractSpec{JSONSchema: json.RawMessage(`{
-		"type":"object",
-		"required":["status"],
-		"properties":{"status":{"const":"ok"}}
-	}`)}
-	contractPath := writeJSONFile(t, t.TempDir(), "contract.json", spec)
-	textPath := filepath.Join(t.TempDir(), "result.txt")
-	if err := os.WriteFile(textPath, []byte(`{"status":"ok"}`), 0o600); err != nil {
+	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1"})
+	if code != cliExitResultUnavailable || stdout != "" || !strings.Contains(stderr, "SHA-256 check failed") {
+		t.Fatalf("result=(code=%d stdout=%q stderr=%q), want prefixed digest rejection", code, stdout, stderr)
+	}
+}
+
+func TestResultMissingArtifactReturnsExit15WithoutStdout(t *testing.T) {
+	artifactPath := filepath.Join(t.TempDir(), "missing-result.txt")
+	record := withResult(detailedRecord(protocol.PublicStateCompleted), &protocol.ResultInfoWire{
+		ResultPath: artifactPath,
+		SHA256:     strings.Repeat("0", sha256.Size*2),
+		Bytes:      1,
+	})
+	a := testApp(t)
+	a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"result", "--job", "job-1"})
+	if code != 15 || stdout != "" || !strings.Contains(stderr, artifactPath) || !strings.Contains(stderr, "missing") {
+		t.Fatalf("result=(code=%d stdout=%q stderr=%q), want exit 15, empty stdout, and missing artifact diagnostic", code, stdout, stderr)
+	}
+}
+
+func TestResultJSONRetainsRecordButUsesExit15ForUnusableArtifact(t *testing.T) {
+	artifactPath := filepath.Join(t.TempDir(), "result.txt")
+	artifactBytes := []byte("authoritative result")
+	if err := os.WriteFile(artifactPath, artifactBytes, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	sum := sha256.Sum256(artifactBytes)
 
-	code, stdout, stderr := runTestCLI(t, a, []string{"validate", "--contract", contractPath, "--text-file", textPath, "--json"}, "")
-	if code != 0 {
-		t.Fatalf("validate file exit = %d stderr=%s stdout=%s", code, stderr, stdout)
-	}
-	var fileResult engine.ValidationResult
-	decodeJSON(t, stdout, &fileResult)
-	if !fileResult.Valid || fileResult.ContractSHA256 == "" {
-		t.Fatalf("file validation = %+v", fileResult)
+	tests := []struct {
+		name   string
+		result protocol.ResultInfoWire
+	}{
+		{
+			name: "missing",
+			result: protocol.ResultInfoWire{
+				ResultPath: filepath.Join(t.TempDir(), "missing-result.txt"),
+				SHA256:     hex.EncodeToString(sum[:]),
+				Bytes:      int64(len(artifactBytes)),
+			},
+		},
+		{
+			name: "unreadable directory",
+			result: protocol.ResultInfoWire{
+				ResultPath: t.TempDir(),
+				SHA256:     hex.EncodeToString(sum[:]),
+				Bytes:      int64(len(artifactBytes)),
+			},
+		},
+		{
+			name: "byte mismatch",
+			result: protocol.ResultInfoWire{
+				ResultPath: artifactPath,
+				SHA256:     hex.EncodeToString(sum[:]),
+				Bytes:      int64(len(artifactBytes) - 1),
+			},
+		},
+		{
+			name: "digest mismatch",
+			result: protocol.ResultInfoWire{
+				ResultPath: artifactPath,
+				SHA256:     strings.Repeat("0", sha256.Size*2),
+				Bytes:      int64(len(artifactBytes)),
+			},
+		},
 	}
 
-	if _, err := a.registry.Register("delegate/test@1", spec); err != nil {
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			record := withResult(detailedRecord(protocol.PublicStateCompleted), &tt.result)
+			a := testApp(t)
+			a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": record}})
+
+			statusCode, statusJSON, statusErr := runTestCLI(t, a, []string{"status", "--job", "job-1", "--json"})
+			resultCode, resultJSON, resultErr := runTestCLI(t, a, []string{"result", "--job", "job-1", "--json"})
+			if statusCode != 0 || statusErr != "" || resultCode != cliExitResultUnavailable || resultErr != "" {
+				t.Fatalf("status=(%d,%q) result=(%d,%q), want status success and result exit %d", statusCode, statusErr, resultCode, resultErr, cliExitResultUnavailable)
+			}
+			if resultJSON != statusJSON {
+				t.Fatalf("status JSON = %q\nresult JSON = %q\nwant byte-identical records", statusJSON, resultJSON)
+			}
+		})
+	}
+}
+
+func TestExitCodesUseStateFailureAndContract(t *testing.T) {
+	completedNoncompliant := detailedRecord(protocol.PublicStateCompleted)
+	completedNoncompliant.Contract = &protocol.ContractResult{Evaluated: true, Compliant: false}
+	tests := []struct {
+		name   string
+		record agentclient.JobGetResult
+		want   int
+	}{
+		{"queued", detailedRecord(protocol.PublicStateQueued), 2},
+		{"running", detailedRecord(protocol.PublicStateRunning), 2},
+		{"completed", detailedRecord(protocol.PublicStateCompleted), 0},
+		{"completed noncompliant", completedNoncompliant, 3},
+		{"failed default", detailedRecord(protocol.PublicStateFailed), 4},
+		{"failed timeout", withFailure(detailedRecord(protocol.PublicStateFailed), protocol.FailureClassTimeout, "timeout"), 5},
+		{"failed interrupted", withFailure(detailedRecord(protocol.PublicStateFailed), protocol.FailureClassInterrupted, "interrupted"), 6},
+		{"canceled", detailedRecord(protocol.PublicStateCanceled), 7},
+		{"unknown", detailedRecord(protocol.PublicStateUnknown), 14},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := testApp(t)
+			a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": tt.record}})
+			code, _, _ := runTestCLI(t, a, []string{"status", "--job", "job-1", "--json"})
+			if code != tt.want {
+				t.Fatalf("status exit=%d, want %d", code, tt.want)
+			}
+		})
+	}
+}
+
+func TestCancelFetchesRecordForContractExitCode(t *testing.T) {
+	record := detailedRecord(protocol.PublicStateCompleted)
+	record.Contract = &protocol.ContractResult{Evaluated: true, Compliant: false}
+	a := testApp(t)
+	a.clientConnect = fakeConnector(&fakeProtocolClient{
+		records: map[string]agentclient.JobGetResult{"job-1": record},
+		cancels: map[string]agentclient.JobCancelResult{"job-1": {JobID: "job-1", State: protocol.PublicStateCompleted}},
+	})
+	code, stdout, stderr := runTestCLI(t, a, []string{"cancel", "--job", "job-1", "--json"})
+	if code != 3 || stderr != "" {
+		t.Fatalf("cancel exit=%d stderr=%q", code, stderr)
+	}
+	if stdout != "{\"jobId\":\"job-1\",\"state\":\"completed\"}\n" {
+		t.Fatalf("cancel JSON = %q", stdout)
+	}
+}
+
+func TestProtocolErrorsAndStartupFailuresKeepTypedExitCodes(t *testing.T) {
+	unknown := &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "not found", protocol.ErrorData{JobID: "missing"})}
+	startup := &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessEOF}
+	for _, tt := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"unknown job", unknown, cliExitUnknownJob},
+		{"startup", startup, cliExitDaemonStartupFailure},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			a := testApp(t)
+			a.clientConnect = func(context.Context, agentclient.Options) (protocolClient, error) { return nil, tt.err }
+			code, stdout, stderr := runTestCLI(t, a, []string{"status", "--job", "missing"})
+			if code != tt.want || stdout != "" || stderr == "" {
+				t.Fatalf("status=(%d,%q,%q), want code %d and diagnostics", code, stdout, stderr, tt.want)
+			}
+		})
+	}
+}
+
+func TestServeBackgroundStartupFailureUsesExit11(t *testing.T) {
+	a := testApp(t)
+	a.daemonLauncher = func(context.Context, daemonlaunch.Options) (daemonlaunch.Result, error) {
+		return daemonlaunch.Result{}, &daemonlaunch.StartupError{Kind: daemonlaunch.ErrReadinessEOF}
+	}
+
+	code, stdout, stderr := runTestCLI(t, a, []string{"serve"})
+	if code != cliExitDaemonStartupFailure || stdout != "" || !strings.Contains(stderr, "serve:") {
+		t.Fatalf("serve=(code=%d stdout=%q stderr=%q), want startup exit %d", code, stdout, stderr, cliExitDaemonStartupFailure)
+	}
+}
+
+func TestServeForegroundStartupFailureUsesExit11(t *testing.T) {
+	a := testApp(t)
+	rootFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(rootFile, []byte("not a state root"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	code, stdout, stderr = runTestCLI(t, a, []string{"validate", "--contract", "delegate/test@1", "--text-file", textPath, "--json"}, "")
-	if code != 0 {
-		t.Fatalf("validate name exit = %d stderr=%s stdout=%s", code, stderr, stdout)
-	}
-	var namedResult engine.ValidationResult
-	decodeJSON(t, stdout, &namedResult)
-	if !namedResult.Valid || namedResult.ContractName != "delegate/test@1" {
-		t.Fatalf("named validation = %+v", namedResult)
-	}
+	a.stateRoot = rootFile
 
-	badPath := filepath.Join(t.TempDir(), "bad.txt")
-	if err := os.WriteFile(badPath, []byte(`{"status":"bad"}`), 0o600); err != nil {
+	code, stdout, stderr := runTestCLI(t, a, []string{"serve", "--foreground"})
+	if code != cliExitDaemonStartupFailure || stdout != "" || !strings.Contains(stderr, "agentbus:") {
+		t.Fatalf("serve foreground=(code=%d stdout=%q stderr=%q), want startup exit %d", code, stdout, stderr, cliExitDaemonStartupFailure)
+	}
+}
+
+func TestStartBackgroundDaemonWritesPIDAfterReady(t *testing.T) {
+	a := testApp(t)
+	a.daemonLauncher = func(_ context.Context, opts daemonlaunch.Options) (daemonlaunch.Result, error) {
+		if got, want := opts.Args, []string{"serve", "--foreground"}; !slices.Equal(got, want) {
+			t.Fatalf("launch args=%v want=%v", got, want)
+		}
+		return daemonlaunch.Result{PID: 4242, CanonicalStateRoot: a.stateRoot}, nil
+	}
+	if err := a.startBackgroundDaemon(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	code, stdout, stderr = runTestCLI(t, a, []string{"validate", "--contract", contractPath, "--text-file", badPath, "--json"}, "")
-	if code != 3 {
-		t.Fatalf("invalid validate exit = %d stderr=%s stdout=%s", code, stderr, stdout)
+	raw, err := os.ReadFile(filepath.Join(a.stateRoot, "agentbus.pid"))
+	if err != nil || string(raw) != "4242\n" {
+		t.Fatalf("pid file=(%q,%v)", raw, err)
 	}
-	var badResult engine.ValidationResult
-	decodeJSON(t, stdout, &badResult)
-	if badResult.Valid || len(badResult.Missing) == 0 {
-		t.Fatalf("bad validation = %+v", badResult)
+}
+
+func TestCodexHomeSettingsPreferInheritance(t *testing.T) {
+	t.Setenv("AGENTBUS_CODEX_HOME", "/override")
+	t.Setenv("AGENTBUS_CODEX_HOME_INHERIT", "1")
+	t.Setenv("CODEX_HOME", "/auth")
+	override, inherit, authHome := codexHomeSettings()
+	if override != "/override" || !inherit || authHome != "/auth" {
+		t.Fatalf("settings=(%q,%t,%q)", override, inherit, authHome)
 	}
+}
+
+func detailedRecord(state protocol.PublicState) agentclient.JobGetResult {
+	created := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	return agentclient.JobGetResult{
+		JobID:        "job-1",
+		WorkspaceKey: "workspace-1",
+		RequestID:    "request-1",
+		Backend:      "codex",
+		State:        state,
+		CreatedAt:    created,
+		Cleanup:      protocol.CleanupClean,
+		Timeout: &engine.TimeoutResolution{
+			Effective: 1800000,
+			Source:    engine.TimeoutSourceClient,
+		},
+	}
+}
+
+func withResult(record agentclient.JobGetResult, result *protocol.ResultInfoWire) agentclient.JobGetResult {
+	record.Result = result
+	return record
+}
+
+func withFailure(record agentclient.JobGetResult, class protocol.FailureClass, reason string) agentclient.JobGetResult {
+	record.Failure = &protocol.JobFailureWire{Class: class, Reason: reason}
+	return record
 }
 
 func testApp(t *testing.T) *app {
 	t.Helper()
-	root := filepath.Join(t.TempDir(), "state")
-	cwd := t.TempDir()
-	return &app{
-		version:   "test",
-		stateRoot: root,
-		cwd:       cwd,
-		registry:  engine.NewPolicyRegistry(),
-		clock:     testClock{now: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)},
-	}
+	return &app{version: "test", stateRoot: filepath.Join(t.TempDir(), "state")}
 }
 
-func runTestCLI(t *testing.T, a *app, args []string, stdin string) (int, string, string) {
+func fakeConnector(client protocolClient) func(context.Context, agentclient.Options) (protocolClient, error) {
+	return func(context.Context, agentclient.Options) (protocolClient, error) { return client, nil }
+}
+
+func runTestCLI(t *testing.T, a *app, args []string) (int, string, string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := a.run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr)
+	code := a.run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	return code, stdout.String(), stderr.String()
 }
 
 type fakeProtocolClient struct {
-	list     []agentclient.JobStatus
-	statuses map[string]agentclient.JobStatus
-	results  map[string]agentclient.JobResult
-	cancels  map[string]agentclient.JobCancelResult
-	err      error
+	records          map[string]agentclient.JobGetResult
+	list             agentclient.JobListResult
+	listParams       []agentclient.JobListParams
+	transcripts      map[string]agentclient.JobTranscriptResult
+	transcriptParams []agentclient.JobTranscriptParams
+	cancels          map[string]agentclient.JobCancelResult
+	err              error
 }
 
-func (c *fakeProtocolClient) JobStatus(_ context.Context, params agentclient.JobStatusParams) (agentclient.JobStatusResult, error) {
+func (c *fakeProtocolClient) JobGet(_ context.Context, params agentclient.JobGetParams) (agentclient.JobGetResult, error) {
 	if c.err != nil {
-		return agentclient.JobStatusResult{}, c.err
+		return agentclient.JobGetResult{}, c.err
 	}
-	if params.JobID != "" {
-		status, ok := c.statuses[params.JobID]
-		if !ok {
-			return agentclient.JobStatusResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: params.JobID})}
-		}
-		return agentclient.JobStatusResult{Jobs: []agentclient.JobStatus{status}}, nil
-	}
-	if len(c.list) > 0 {
-		return agentclient.JobStatusResult{Jobs: append([]agentclient.JobStatus(nil), c.list...)}, nil
-	}
-	return agentclient.JobStatusResult{Jobs: mapValues(c.statuses)}, nil
-}
-
-func (c *fakeProtocolClient) JobResult(_ context.Context, params agentclient.JobResultParams) (agentclient.JobResult, error) {
-	if c.err != nil {
-		return agentclient.JobResult{}, c.err
-	}
-	result, ok := c.results[params.JobID]
+	record, ok := c.records[params.JobID]
 	if !ok {
-		return agentclient.JobResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+		return agentclient.JobGetResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "not found", protocol.ErrorData{JobID: params.JobID})}
+	}
+	return record, nil
+}
+
+func (c *fakeProtocolClient) JobList(_ context.Context, params agentclient.JobListParams) (agentclient.JobListResult, error) {
+	if c.err != nil {
+		return agentclient.JobListResult{}, c.err
+	}
+	c.listParams = append(c.listParams, params)
+	return c.list, nil
+}
+
+func (c *fakeProtocolClient) JobTranscript(_ context.Context, params agentclient.JobTranscriptParams) (agentclient.JobTranscriptResult, error) {
+	if c.err != nil {
+		return agentclient.JobTranscriptResult{}, c.err
+	}
+	c.transcriptParams = append(c.transcriptParams, params)
+	result, ok := c.transcripts[params.JobID]
+	if !ok {
+		return agentclient.JobTranscriptResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "not found", protocol.ErrorData{JobID: params.JobID})}
 	}
 	return result, nil
 }
@@ -800,39 +621,16 @@ func (c *fakeProtocolClient) JobCancel(_ context.Context, params agentclient.Job
 	}
 	result, ok := c.cancels[params.JobID]
 	if !ok {
-		return agentclient.JobCancelResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "job is not known", protocol.ErrorData{JobID: params.JobID})}
+		return agentclient.JobCancelResult{}, &protocol.RPCError{Object: *protocol.NewError(protocol.ErrorUnknownJob, "not found", protocol.ErrorData{JobID: params.JobID})}
 	}
 	return result, nil
 }
 
-func (c *fakeProtocolClient) Close() error {
-	return nil
-}
-
-func mapValues(in map[string]agentclient.JobStatus) []agentclient.JobStatus {
-	out := make([]agentclient.JobStatus, 0, len(in))
-	for _, value := range in {
-		out = append(out, value)
-	}
-	return out
-}
+func (c *fakeProtocolClient) Close() error { return nil }
 
 func decodeJSON(t *testing.T, raw string, target any) {
 	t.Helper()
 	if err := json.Unmarshal([]byte(raw), target); err != nil {
 		t.Fatalf("decode JSON %q: %v", raw, err)
 	}
-}
-
-func writeJSONFile(t *testing.T, dir, name string, value any) string {
-	t.Helper()
-	raw, err := json.Marshal(value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
 }
