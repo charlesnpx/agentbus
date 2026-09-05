@@ -149,7 +149,9 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 		// This wait holds neither a service mutex nor the launch fence. The
 		// retiring turn and final sidecar Sync/Close both persist their receipt
 		// before the barrier opens, so MarkTerminal can merge it atomically.
-		run.waitForRetirementAndFinalization()
+		if err := run.waitForRetirementAndFinalization(); err != nil {
+			return jobStoreUnavailable("persist retirement receipt before cancellation", err)
+		}
 	}
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
 		State:       protocol.PublicStateCanceled,

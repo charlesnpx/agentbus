@@ -131,9 +131,11 @@ type Record struct {
 	WorkspaceKey string `json:"workspaceKey"`
 	RequestID    string `json:"requestId"`
 	Backend      string `json:"backend"`
-	// BackendSessionID is assigned only from a backend's turn-final
-	// observation. An omitted value means the job never produced a resumable
-	// backend session; it is not an unknown-session marker.
+	// BackendSessionID is the terminal projection of a retirement receipt. On a
+	// nonterminal record it remains only as the decode fallback for records
+	// written before retirement receipts existed. An omitted value means the job
+	// never produced a resumable backend session; it is not an unknown-session
+	// marker.
 	BackendSessionID string                  `json:"backendSessionId,omitempty"`
 	Model            string                  `json:"model,omitempty"`
 	CWD              string                  `json:"cwd,omitempty"`
@@ -662,7 +664,6 @@ func (store *Store) RetireTurn(id string, receipt RetirementReceipt) (Record, er
 		nextReceipt := cloneRetirementReceipt(current.Retirement)
 		if strings.TrimSpace(receipt.BackendSessionID) != "" {
 			nextReceipt.BackendSessionID = receipt.BackendSessionID
-			next.BackendSessionID = receipt.BackendSessionID
 		}
 		if receipt.CleanupUncertain {
 			nextReceipt.CleanupUncertain = true

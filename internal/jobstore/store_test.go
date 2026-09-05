@@ -334,6 +334,13 @@ func TestV0131RecordDecodesWithoutInventedRetirementEvidence(t *testing.T) {
 	if decoded.State != protocol.PublicStateRunning || decoded.BackendSessionID != "thread-v0131" {
 		t.Fatalf("decoded v0.13.1 record = %#v", decoded)
 	}
+	retired, err := store.RetireTurn(jobID, RetirementReceipt{BackendSessionID: "thread-current"})
+	if err != nil {
+		t.Fatalf("RetireTurn current receipt: %v", err)
+	}
+	if retired.BackendSessionID != "thread-v0131" || retired.Retirement == nil || retired.Retirement.BackendSessionID != "thread-current" {
+		t.Fatalf("nonterminal receipt projection = %#v, want legacy field unchanged and current receipt retained", retired)
+	}
 	terminal, err := store.MarkTerminal(jobID, TerminalUpdate{
 		State:       protocol.PublicStateUnknown,
 		Cleanup:     protocol.CleanupClean,
@@ -342,8 +349,8 @@ func TestV0131RecordDecodesWithoutInventedRetirementEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if terminal.State != protocol.PublicStateUnknown || terminal.Cleanup != protocol.CleanupClean || terminal.BackendSessionID != "thread-v0131" || len(terminal.Diagnostics) != 1 || terminal.Diagnostics[0] != "restart reconciliation: no relaunch" {
-		t.Fatalf("terminalized v0.13.1 record = %#v, want only its legacy session and new recovery observation", terminal)
+	if terminal.State != protocol.PublicStateUnknown || terminal.Cleanup != protocol.CleanupClean || terminal.BackendSessionID != "thread-current" || len(terminal.Diagnostics) != 1 || terminal.Diagnostics[0] != "restart reconciliation: no relaunch" {
+		t.Fatalf("terminalized v0.13.1 record = %#v, want current receipt projection and new recovery observation", terminal)
 	}
 }
 

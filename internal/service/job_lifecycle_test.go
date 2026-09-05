@@ -391,6 +391,49 @@ func TestJobCancelBeforeSpawnIsDurable(t *testing.T) {
 	}
 }
 
+func TestJobCancelDoesNotTerminalizeAfterUnrecoverableRetirementReceipt(t *testing.T) {
+	backend := &executionFakeBackend{name: "cancel-receipt-failure"}
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
+	record := queuedExecutionRecord(t, server, backend.Name(), "receipt failure", nil)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run := newActiveExecution(record.JobID, backend)
+	attempts := 0
+	run.retirementReceiptWriter = func(*jobstore.Store, string, jobstore.RetirementReceipt) error {
+		attempts++
+		return errors.New("temporary receipt store exhaustion")
+	}
+	run.beginTurn()
+	retired := run.retireTurn(store, turnOutcome{cleanup: protocol.CleanupClean, diagnostics: []string{"turn evidence"}})
+	if retired.retirementErr == nil {
+		t.Fatal("retireTurn reported a successful retirement after its receipt write failed")
+	}
+	if err := run.finalizeItemSidecar(store, nil); err == nil {
+		t.Fatal("finalization succeeded after every receipt retry failed")
+	}
+	if want := 1 + retirementReceiptRetryAttempts; attempts != want {
+		t.Fatalf("receipt write attempts = %d, want initial attempt plus %d retries", attempts, retirementReceiptRetryAttempts)
+	}
+
+	server.executionMu.Lock()
+	server.executions = map[string]*activeExecution{record.JobID: run}
+	server.executionMu.Unlock()
+	canceled := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
+	if canceled.err == nil || canceled.err.Data.Code != protocol.ErrorBackendUnavailable {
+		t.Fatalf("job.cancel after unrecoverable receipt = %#v, want backend-unavailable error", canceled.err)
+	}
+	stored, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != protocol.PublicStateQueued || stored.Retirement != nil {
+		t.Fatalf("canceled record after unrecoverable receipt = %#v, want unchanged nonterminal record", stored)
+	}
+}
+
 func TestJobCancelDuringCorrectionPreservesRetiredTurnOutcome(t *testing.T) {
 	schemaRaw := json.RawMessage(`{"required":["ok"],"type":"object"}`)
 	correctionEvents := make(chan engine.Event)

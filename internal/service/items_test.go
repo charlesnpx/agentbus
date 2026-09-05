@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -450,5 +451,128 @@ func TestTranscriptItemSidecarFailureSurvivesRestart(t *testing.T) {
 	transcript := transcriptResultForTest(t, restarted, protocol.JobTranscriptParams{JobID: record.JobID})
 	if !transcript.Gap || transcript.ItemCount != 0 {
 		t.Fatalf("recovered transcript = %#v, want an empty gapped transcript", transcript)
+	}
+}
+
+func TestTransientSidecarReceiptRetrySurvivesRestart(t *testing.T) {
+	root := t.TempDir()
+	backend := &executionFakeBackend{name: "items-retry-receipt"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(context.Context, engine.TurnInput) (<-chan engine.Event, error) {
+				return executionEvents(engine.Event{Type: engine.EventResultMessage, Text: "completed after retry"}), nil
+			},
+		}, nil
+	}
+	first := newTestServer(t, root, Config{Backends: []engine.Backend{backend}})
+	record := queuedExecutionRecord(t, first, backend.Name(), "retry sidecar receipt", nil)
+	sidecarPath := transcriptItemPath(t, record)
+	if err := os.MkdirAll(sidecarPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	run := newActiveExecution(record.JobID, backend)
+	sidecarReceiptWrites := 0
+	run.retirementReceiptWriter = func(store *jobstore.Store, jobID string, receipt jobstore.RetirementReceipt) error {
+		if len(receipt.Diagnostics) == 1 && strings.HasPrefix(receipt.Diagnostics[0], itemSidecarDiagnosticPrefix) {
+			sidecarReceiptWrites++
+			if sidecarReceiptWrites == 1 {
+				return errors.New("transient receipt write failure")
+			}
+		}
+		_, err := store.RetireTurn(jobID, receipt)
+		return err
+	}
+	first.runJob(context.Background(), record, run)
+	if sidecarReceiptWrites != 2 {
+		t.Fatalf("sidecar receipt writes = %d, want failed initial write and one finalization retry", sidecarReceiptWrites)
+	}
+	store, err := first.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.State != protocol.PublicStateCompleted || len(terminal.Diagnostics) != 1 || !strings.HasPrefix(terminal.Diagnostics[0], itemSidecarDiagnosticPrefix+"open:") {
+		t.Fatalf("terminal after transient receipt retry = %#v, want completed record with one sidecar-open diagnostic", terminal)
+	}
+
+	if err := os.Remove(sidecarPath); err != nil {
+		t.Fatal(err)
+	}
+	first.closeJobStore()
+	restarted := newTestServer(t, root, Config{Backends: []engine.Backend{backend}})
+	transcript := transcriptResultForTest(t, restarted, protocol.JobTranscriptParams{JobID: record.JobID})
+	if !transcript.Gap || transcript.State != protocol.PublicStateCompleted {
+		t.Fatalf("transcript after restart = %#v, want completed gapped transcript", transcript)
+	}
+}
+
+func TestRetirementDiagnosticsFollowObservationOrder(t *testing.T) {
+	tests := []struct {
+		name       string
+		canceled   bool
+		wantPrefix string
+	}{
+		{name: "canceled with events", canceled: true, wantPrefix: "backend reported uncertain cleanup"},
+		{name: "turn start error", wantPrefix: "process claim: "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := &executionFakeBackend{name: "items-diagnostic-order-" + tt.name}
+			var run *activeExecution
+			backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+				return &executionFakeSession{
+					turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+						if tt.canceled {
+							input.OnProcessStart(engine.ProcessRef{PID: 6191, PGID: 6191, StartTime: "items-diagnostic-order"}, 0)
+							run.mu.Lock()
+							run.cancelRequested = true
+							run.mu.Unlock()
+							return executionEvents(engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{CleanupFailed: true}}), nil
+						}
+						input.OnProcessStart(engine.ProcessRef{}, 0)
+						return nil, errors.New("start turn failed")
+					},
+				}, nil
+			}
+			server := newExecutionServer(t, backend)
+			record := queuedExecutionRecord(t, server, backend.Name(), "diagnostic order", nil)
+			run = newActiveExecution(record.JobID, backend)
+			sidecarPath := transcriptItemPath(t, record)
+			writer := newItemSidecarWriter(sidecarPath, transcriptItemTextCap, transcriptItemFileCap)
+			if writer.file == nil {
+				t.Fatal("test sidecar writer did not open its file")
+			}
+			if err := writer.file.Close(); err != nil {
+				t.Fatal(err)
+			}
+			run.itemSidecarWriterFactory = func(path string, textCap int, fileCap int64) *itemSidecarWriter {
+				if path != sidecarPath || textCap != transcriptItemTextCap || fileCap != transcriptItemFileCap {
+					t.Fatalf("sidecar writer request = (%q, %d, %d)", path, textCap, fileCap)
+				}
+				return writer
+			}
+			server.runJob(context.Background(), record, run)
+
+			store, err := server.ensureJobStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.canceled {
+				if _, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{State: protocol.PublicStateCanceled, Cleanup: protocol.CleanupClean}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			terminal, err := store.Get(record.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !terminal.State.IsTerminal() || len(terminal.Diagnostics) != 2 || !strings.HasPrefix(terminal.Diagnostics[0], tt.wantPrefix) || !strings.HasPrefix(terminal.Diagnostics[1], itemSidecarDiagnosticPrefix+"sync:") {
+				t.Fatalf("persisted diagnostics = %#v, want [%q, item sidecar sync] in observation order", terminal.Diagnostics, tt.wantPrefix)
+			}
+		})
 	}
 }

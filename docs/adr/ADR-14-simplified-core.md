@@ -552,10 +552,17 @@ The stored job record has a private retirement receipt for common evidence
 observed by the service: the latest backend session id, sticky cleanup
 uncertainty, and diagnostics in observation order. It is internal jobstore data,
 not a protocol field, so a running job's wire projection does not reveal interim
-cleanup or diagnostics. A retiring turn persists its receipt before publishing
-its retirement to cancellation. Sidecar write failures persist their diagnostic
-when observed; final `Sync` and `Close` run behind an execution-finalization
-barrier before cancellation can commit terminal state.
+cleanup or diagnostics. During a nonterminal lifetime the latest session id
+lives only in that receipt; the top-level session field is its terminal
+projection and the decode fallback for records written before receipts existed.
+A retiring turn persists its receipt before publishing its retirement to
+cancellation. Sidecar write failures persist their diagnostic when observed;
+if that receipt transaction fails, the observation remains pending in order and
+the finalization barrier retries it with a bounded backoff. An exhausted receipt
+retry makes the barrier fail, so cancellation leaves the record nonterminal
+rather than committing a terminal state it knows omits evidence. Final `Sync`
+and `Close` run behind that barrier before cancellation can commit terminal
+state.
 
 The jobstore atomically merges that receipt into the first terminal intent.
 Completion, failure, cancellation, and restart reconciliation supply only their

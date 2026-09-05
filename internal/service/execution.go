@@ -48,16 +48,33 @@ type activeExecution struct {
 	turn             *activeTurn
 	finalizationDone chan struct{}
 	finalizationOnce sync.Once
+	finalizationErr  error
+
+	// receiptMu serializes every receipt write so an earlier failed sidecar
+	// observation cannot be overtaken by a later turn receipt. Pending receipts
+	// are retried at the finalization barrier in their observation order.
+	receiptMu                  sync.Mutex
+	pendingRetirementReceipts  []jobstore.RetirementReceipt
+	pendingRetirementErr       error
+	unrecoverableRetirementErr error
+	retirementReceiptWriter    func(*jobstore.Store, string, jobstore.RetirementReceipt) error
+	itemSidecarWriterFactory   func(string, int, int64) *itemSidecarWriter
 }
 
 // activeTurn owns the one retirement receipt for a turn. A cancellation can
 // wait on that receipt without racing a later correction turn that replaces
 // activeExecution.turn.
 type activeTurn struct {
-	done    chan struct{}
-	once    sync.Once
-	outcome turnOutcome
+	done       chan struct{}
+	once       sync.Once
+	outcome    turnOutcome
+	receiptErr error
 }
+
+const (
+	retirementReceiptRetryAttempts = 3
+	retirementReceiptRetryDelay    = 10 * time.Millisecond
+)
 
 func newActiveExecution(jobID string, backend engine.Backend) *activeExecution {
 	return &activeExecution{jobID: jobID, backend: backend}
@@ -173,7 +190,9 @@ func (run *activeExecution) beginTurn() {
 
 // retireTurn persists the current turn's common evidence before publishing its
 // completion. Cancellation reads only the durable receipt, never an in-memory
-// reconstruction of prior turns.
+// reconstruction of prior turns. A closed done channel therefore means the
+// attempt settled; receiptErr distinguishes a durable retirement from one that
+// still needs the finalization retry barrier.
 func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcome) turnOutcome {
 	if run == nil {
 		return outcome
@@ -191,8 +210,12 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 			Diagnostics:      append([]string(nil), outcome.diagnostics...),
 		}
 		if err := run.recordRetirementReceipt(store, receipt); err != nil {
-			outcome.cleanup = protocol.CleanupUncertain
-			outcome.diagnostics = append(outcome.diagnostics, "record turn retirement: "+err.Error())
+			// Do not turn a failed durability boundary into an ordinary turn
+			// diagnostic: a terminal write must wait for the bounded retry below.
+			// The error is carried separately so callers cannot treat done as
+			// successful retirement.
+			outcome.retirementErr = err
+			turn.receiptErr = err
 		}
 		outcome.diagnostics = append([]string(nil), outcome.diagnostics...)
 		turn.outcome = outcome
@@ -202,9 +225,37 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 	return turn.outcome
 }
 
+// recordRetirementReceipt writes receipt immediately or retains it in-order for
+// the finalization retry barrier. Its error tells a retiring turn that it must
+// not be treated as durably complete yet.
 func (run *activeExecution) recordRetirementReceipt(store *jobstore.Store, receipt jobstore.RetirementReceipt) error {
+	if run == nil {
+		return errors.New("active execution is unavailable")
+	}
+	run.receiptMu.Lock()
+	defer run.receiptMu.Unlock()
+	if run.unrecoverableRetirementErr != nil {
+		run.pendingRetirementReceipts = append(run.pendingRetirementReceipts, cloneRetirementReceipt(receipt))
+		return run.unrecoverableRetirementErr
+	}
+	if len(run.pendingRetirementReceipts) != 0 {
+		run.pendingRetirementReceipts = append(run.pendingRetirementReceipts, cloneRetirementReceipt(receipt))
+		return fmt.Errorf("retirement receipt is pending: %w", run.pendingRetirementErr)
+	}
+	if err := run.writeRetirementReceipt(store, receipt); err != nil {
+		run.pendingRetirementReceipts = append(run.pendingRetirementReceipts, cloneRetirementReceipt(receipt))
+		run.pendingRetirementErr = err
+		return err
+	}
+	return nil
+}
+
+func (run *activeExecution) writeRetirementReceipt(store *jobstore.Store, receipt jobstore.RetirementReceipt) error {
 	if store == nil {
 		return errors.New("job store is unavailable")
+	}
+	if run != nil && run.retirementReceiptWriter != nil {
+		return run.retirementReceiptWriter(store, run.jobID, receipt)
 	}
 	_, err := store.RetireTurn(run.jobID, receipt)
 	if errors.Is(err, jobstore.ErrTerminal) {
@@ -213,12 +264,58 @@ func (run *activeExecution) recordRetirementReceipt(store *jobstore.Store, recei
 	return err
 }
 
+// retryPendingRetirementReceipts drains pending receipts in order. An
+// unrecoverable error means the immediate write plus all three bounded retry
+// attempts failed; callers must leave the job nonterminal rather than commit a
+// record they know omits observed evidence.
+func (run *activeExecution) retryPendingRetirementReceipts(store *jobstore.Store) error {
+	if run == nil {
+		return errors.New("active execution is unavailable")
+	}
+	run.receiptMu.Lock()
+	defer run.receiptMu.Unlock()
+	if run.unrecoverableRetirementErr != nil {
+		return run.unrecoverableRetirementErr
+	}
+	for len(run.pendingRetirementReceipts) != 0 {
+		receipt := run.pendingRetirementReceipts[0]
+		var err error
+		for attempt := 0; attempt < retirementReceiptRetryAttempts; attempt++ {
+			time.Sleep(retirementReceiptRetryDelay << attempt)
+			err = run.writeRetirementReceipt(store, receipt)
+			if err == nil {
+				run.pendingRetirementReceipts = run.pendingRetirementReceipts[1:]
+				run.pendingRetirementErr = nil
+				break
+			}
+		}
+		if err != nil {
+			run.pendingRetirementErr = err
+			run.unrecoverableRetirementErr = fmt.Errorf("persist retirement receipt after %d retries: %w", retirementReceiptRetryAttempts, err)
+			return run.unrecoverableRetirementErr
+		}
+	}
+	return nil
+}
+
+func cloneRetirementReceipt(receipt jobstore.RetirementReceipt) jobstore.RetirementReceipt {
+	receipt.Diagnostics = append([]string(nil), receipt.Diagnostics...)
+	return receipt
+}
+
+func (run *activeExecution) newItemSidecarWriter(path string, textCap int, fileCap int64) *itemSidecarWriter {
+	if run != nil && run.itemSidecarWriterFactory != nil {
+		return run.itemSidecarWriterFactory(path, textCap, fileCap)
+	}
+	return newItemSidecarWriter(path, textCap, fileCap)
+}
+
 // waitForRetirementAndFinalization waits without retaining a service mutex or
 // launch fence. The sidecar barrier includes Sync and Close observations, so a
 // cancellation cannot commit terminal state before their receipt is durable.
-func (run *activeExecution) waitForRetirementAndFinalization() {
+func (run *activeExecution) waitForRetirementAndFinalization() error {
 	if run == nil {
-		return
+		return nil
 	}
 	run.mu.Lock()
 	turn := run.turn
@@ -230,28 +327,58 @@ func (run *activeExecution) waitForRetirementAndFinalization() {
 	if finalizationDone != nil {
 		<-finalizationDone
 	}
+	run.mu.Lock()
+	finalizationErr := run.finalizationErr
+	run.mu.Unlock()
+	if finalizationErr != nil {
+		return finalizationErr
+	}
+	run.receiptMu.Lock()
+	pendingErr := run.unrecoverableRetirementErr
+	if pendingErr == nil && len(run.pendingRetirementReceipts) != 0 {
+		pendingErr = fmt.Errorf("retirement receipt remains pending: %w", run.pendingRetirementErr)
+	}
+	run.receiptMu.Unlock()
+	if pendingErr != nil {
+		return pendingErr
+	}
+	if finalizationDone == nil && turn != nil && turn.receiptErr != nil {
+		return turn.receiptErr
+	}
+	return nil
 }
 
 // finalizeItemSidecar establishes the finalization barrier for the entire
 // execution, not an individual turn. The shared sidecar stays open across a
 // correction turn, but its Sync/Close error is persisted before this channel is
 // published to cancellation.
-func (run *activeExecution) finalizeItemSidecar(writer *itemSidecarWriter) {
+func (run *activeExecution) finalizeItemSidecar(store *jobstore.Store, writer *itemSidecarWriter) error {
 	if run == nil {
 		if writer != nil {
 			writer.close()
 		}
-		return
+		return nil
 	}
-	if writer != nil {
-		writer.close()
-	}
+	run.finalizationOnce.Do(func() {
+		if writer != nil {
+			writer.close()
+		}
+		err := run.retryPendingRetirementReceipts(store)
+		run.mu.Lock()
+		run.finalizationErr = err
+		finalizationDone := run.finalizationDone
+		run.mu.Unlock()
+		if err != nil {
+			log.Printf("agentbus service: job %s retirement receipt finalization failed: %v", run.jobID, err)
+		}
+		if finalizationDone != nil {
+			close(finalizationDone)
+		}
+	})
 	run.mu.Lock()
-	finalizationDone := run.finalizationDone
+	err := run.finalizationErr
 	run.mu.Unlock()
-	if finalizationDone != nil {
-		run.finalizationOnce.Do(func() { close(finalizationDone) })
-	}
+	return err
 }
 
 func (run *activeExecution) interrupt() error {
@@ -566,17 +693,17 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	}
 	run.beginTurn()
 	var itemWriter *itemSidecarWriter
-	defer func() { run.finalizeItemSidecar(itemWriter) }()
+	finalize := func() error { return run.finalizeItemSidecar(store, itemWriter) }
+	defer func() { _ = finalize() }()
 	if run.cancellationRequested() {
-		run.finalizeItemSidecar(nil)
 		run.retireTurn(store, turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean})
+		_ = finalize()
 		return
 	}
-	itemWriter = newItemSidecarWriter(itemPath, transcriptItemTextCap, transcriptItemFileCap)
+	itemWriter = run.newItemSidecarWriter(itemPath, transcriptItemTextCap, transcriptItemFileCap)
 	itemWriter.setFailureSink(func(diagnostic string) {
-		if err := run.recordRetirementReceipt(store, jobstore.RetirementReceipt{Diagnostics: []string{diagnostic}}); err != nil {
-			log.Printf("agentbus service: job %s item-sidecar receipt write failed: %v", record.JobID, err)
-		}
+		// The method retains a failed write for the finalization retry barrier.
+		run.recordRetirementReceipt(store, jobstore.RetirementReceipt{Diagnostics: []string{diagnostic}})
 	})
 	items := newItemAssembler(run, itemWriter)
 
@@ -591,14 +718,14 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	})
 	if canceled {
 		if events == nil {
-			run.finalizeItemSidecar(itemWriter)
 			run.retireTurn(store, turnOutcome{err: context.Canceled, cleanup: protocol.CleanupClean})
+			_ = finalize()
 			return
 		}
 		outcome := collectTurn(jobCtx, run, events, items)
 		outcome.cleanup, outcome.diagnostics = cleanupForRun(run, outcome.cleanup, outcome.diagnostics)
-		run.finalizeItemSidecar(itemWriter)
 		run.retireTurn(store, outcome)
+		_ = finalize()
 		return
 	}
 	if err != nil {
@@ -606,8 +733,10 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		if cleanup == protocol.CleanupClean {
 			cleanup, diagnostics = cleanupForRun(run, cleanup, diagnostics)
 		}
-		run.finalizeItemSidecar(itemWriter)
 		outcome := run.retireTurn(store, turnOutcome{err: err, cleanup: cleanup, diagnostics: diagnostics})
+		if err := finalize(); err != nil {
+			return
+		}
 		s.finishTurnError(store, record, jobCtx, outcome.err, outcome.cleanup)
 		return
 	}
@@ -620,31 +749,50 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	}
 
 	if errors.Is(outcome.err, context.DeadlineExceeded) || outcome.timedOut {
-		run.finalizeItemSidecar(itemWriter)
+		if err := finalize(); err != nil {
+			return
+		}
 		s.recordExecutionFailure(store, record, outcome.cleanup, protocol.FailureClassTimeout, context.DeadlineExceeded, nil)
 		return
 	}
 	if errors.Is(outcome.err, context.Canceled) || outcome.interrupted {
 		_, _, claimErr := run.claimStatus()
 		if claimErr != nil {
-			run.finalizeItemSidecar(itemWriter)
+			if err := finalize(); err != nil {
+				return
+			}
 			s.recordExecutionFailure(store, record, outcome.cleanup, protocol.FailureClassInternal, claimErr, nil)
 			return
 		}
-		run.finalizeItemSidecar(itemWriter)
+		if err := finalize(); err != nil {
+			return
+		}
 		s.recordExecutionFailure(store, record, outcome.cleanup, protocol.FailureClassInterrupted, outcome.err, nil)
 		return
 	}
 	if outcome.err != nil {
-		run.finalizeItemSidecar(itemWriter)
+		if err := finalize(); err != nil {
+			return
+		}
 		s.recordExecutionFailure(store, record, outcome.cleanup, classifyExecutionFailure(outcome.err), outcome.err, nil)
 		return
+	}
+	if outcome.retirementErr != nil && len(spec.OutputSchema) != 0 {
+		// A correction is a new process turn, so the initial receipt must become
+		// durable first. This retries a pending sidecar receipt without closing
+		// the execution-finalization barrier; an exhausted retry leaves the job
+		// nonterminal and the deferred finalization publishes the same error.
+		if err := run.retryPendingRetirementReceipts(store); err != nil {
+			return
+		}
 	}
 	text, contract, cleanup, diagnostics := s.evaluateOutputSchema(store, record, run, session, jobCtx, timeout, spec, logPaths, items, outcome.text, outcome.cleanup)
 	if run.cancellationRequested() {
 		return
 	}
-	run.finalizeItemSidecar(itemWriter)
+	if err := finalize(); err != nil {
+		return
+	}
 	s.recordExecutionCompletion(store, record, text, cleanup, diagnostics, contract)
 }
 
@@ -914,6 +1062,7 @@ func classifyExecutionFailure(err error) protocol.FailureClass {
 type turnOutcome struct {
 	text             string
 	backendSessionID string
+	retirementErr    error
 	err              error
 	timedOut         bool
 	interrupted      bool
