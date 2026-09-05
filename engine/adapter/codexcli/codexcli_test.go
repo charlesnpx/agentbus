@@ -868,7 +868,7 @@ func TestAppServerProviderOverloadIgnoresTerminalItemInventory(t *testing.T) {
 	}
 }
 
-func TestAppServerCompletedFileChangeReportsObservedWorkspaceWriteItem(t *testing.T) {
+func TestAppServerFileChangesReportObservedWorkspaceWriteItems(t *testing.T) {
 	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
 		peer := newAppServerPeer(t, proc)
 		peer.handshake()
@@ -894,8 +894,8 @@ func TestAppServerCompletedFileChangeReportsObservedWorkspaceWriteItem(t *testin
 			observed++
 		}
 	}
-	if observed != 1 {
-		t.Fatalf("observed workspace-write events = %d, want 1; events = %#v", observed, got)
+	if observed != 2 {
+		t.Fatalf("observed workspace-write events = %d, want 2; events = %#v", observed, got)
 	}
 }
 

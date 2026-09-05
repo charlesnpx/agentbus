@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,6 +18,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/adapter/codexcli"
+	"github.com/charlesnpx/agentbus/engine/command"
 	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 )
@@ -57,6 +61,194 @@ func readTranscriptItems(t *testing.T, record jobstore.Record) []TranscriptItem 
 		}
 		items = append(items, item)
 	}
+}
+
+type runnerBackedCodexSession struct {
+	session engine.Session
+	runner  command.Runner
+}
+
+func (session *runnerBackedCodexSession) ID() string {
+	return session.session.ID()
+}
+
+func (session *runnerBackedCodexSession) Turn(ctx context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+	turner, ok := session.session.(interface {
+		TurnWithRunner(context.Context, engine.TurnInput, command.Runner) (<-chan engine.Event, error)
+	})
+	if !ok {
+		return nil, errors.New("Codex session does not support injected command runners")
+	}
+	return turner.TurnWithRunner(ctx, input, session.runner)
+}
+
+func (session *runnerBackedCodexSession) Interrupt(ctx context.Context) error {
+	return session.session.Interrupt(ctx)
+}
+
+func scriptedCodexBackend(t *testing.T, runner command.Runner) *executionFakeBackend {
+	t.Helper()
+	backend := &executionFakeBackend{name: "scripted-codex"}
+	backend.start = func(ctx context.Context, opts engine.SessionOpts) (engine.Session, error) {
+		session, err := codexcli.New(codexcli.Options{Binary: "fake-codex"}).Start(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		return &runnerBackedCodexSession{session: session, runner: runner}, nil
+	}
+	return backend
+}
+
+type scriptedCodexRunner struct {
+	frames []map[string]any
+
+	mu        sync.Mutex
+	started   bool
+	scriptErr error
+}
+
+func newScriptedCodexRunner(frames ...map[string]any) *scriptedCodexRunner {
+	return &scriptedCodexRunner{frames: append([]map[string]any(nil), frames...)}
+}
+
+func (runner *scriptedCodexRunner) Start(context.Context, command.ExecSpec) (command.RunningCommand, error) {
+	runner.mu.Lock()
+	if runner.started {
+		runner.mu.Unlock()
+		return nil, errors.New("scripted Codex runner started more than once")
+	}
+	runner.started = true
+	runner.mu.Unlock()
+
+	process := newScriptedCodexProcess()
+	go runner.serve(process)
+	return process, nil
+}
+
+func (runner *scriptedCodexRunner) serve(process *scriptedCodexProcess) {
+	var scriptErr error
+	defer func() {
+		_ = process.stdinR.Close()
+		_ = process.stdoutW.Close()
+		_ = process.stderrW.Close()
+		runner.mu.Lock()
+		runner.scriptErr = scriptErr
+		runner.mu.Unlock()
+		process.finish(scriptErr)
+	}()
+
+	decoder := json.NewDecoder(process.stdinR)
+	for {
+		var request map[string]any
+		if err := decoder.Decode(&request); err != nil {
+			scriptErr = fmt.Errorf("read Codex request: %w", err)
+			return
+		}
+		method, _ := request["method"].(string)
+		switch method {
+		case "initialize":
+			scriptErr = process.writeJSON(map[string]any{"id": request["id"], "result": map[string]any{}})
+		case "initialized":
+			continue
+		case "thread/start":
+			scriptErr = process.writeJSON(map[string]any{"id": request["id"], "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}})
+		case "turn/start":
+			scriptErr = process.writeJSON(map[string]any{"id": request["id"], "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}})
+			if scriptErr == nil {
+				for _, frame := range runner.frames {
+					if scriptErr = process.writeJSON(frame); scriptErr != nil {
+						break
+					}
+				}
+			}
+			return
+		default:
+			scriptErr = fmt.Errorf("unexpected Codex request method %q", method)
+		}
+		if scriptErr != nil {
+			return
+		}
+	}
+}
+
+func (runner *scriptedCodexRunner) assert(t *testing.T) {
+	t.Helper()
+	runner.mu.Lock()
+	started := runner.started
+	scriptErr := runner.scriptErr
+	runner.mu.Unlock()
+	if !started {
+		t.Fatal("scripted Codex runner was not started")
+	}
+	if scriptErr != nil {
+		t.Fatal(scriptErr)
+	}
+}
+
+type scriptedCodexProcess struct {
+	stdinR  *io.PipeReader
+	stdinW  *io.PipeWriter
+	stdoutR *io.PipeReader
+	stdoutW *io.PipeWriter
+	stderrR *io.PipeReader
+	stderrW *io.PipeWriter
+
+	done chan struct{}
+	once sync.Once
+	err  error
+}
+
+func newScriptedCodexProcess() *scriptedCodexProcess {
+	stdinR, stdinW := io.Pipe()
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	return &scriptedCodexProcess{
+		stdinR:  stdinR,
+		stdinW:  stdinW,
+		stdoutR: stdoutR,
+		stdoutW: stdoutW,
+		stderrR: stderrR,
+		stderrW: stderrW,
+		done:    make(chan struct{}),
+	}
+}
+
+func (process *scriptedCodexProcess) Stdin() io.WriteCloser { return process.stdinW }
+
+func (process *scriptedCodexProcess) Stdout() io.ReadCloser { return process.stdoutR }
+
+func (process *scriptedCodexProcess) Stderr() io.ReadCloser { return process.stderrR }
+
+func (process *scriptedCodexProcess) Wait(ctx context.Context) (command.ExitObservation, error) {
+	select {
+	case <-process.done:
+		return command.ExitObservation{Exited: true, Code: 0}, process.err
+	case <-ctx.Done():
+		return command.ExitObservation{}, ctx.Err()
+	}
+}
+
+func (process *scriptedCodexProcess) Interrupt(context.Context) error { return nil }
+
+func (process *scriptedCodexProcess) ProcessRef() (engine.ProcessRef, int) {
+	return engine.ProcessRef{PID: 6104, PGID: 6104, StartTime: "scripted-codex"}, 0
+}
+
+func (process *scriptedCodexProcess) writeJSON(value any) error {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	_, err = process.stdoutW.Write(payload)
+	return err
+}
+
+func (process *scriptedCodexProcess) finish(err error) {
+	process.once.Do(func() {
+		process.err = err
+		close(process.done)
+	})
 }
 
 func TestTranscriptItemsCoalesceAgentTextRun(t *testing.T) {
@@ -185,6 +377,109 @@ func TestTranscriptItemsSuppressWorkspaceWriteText(t *testing.T) {
 	}
 	if !bytes.Contains(sidecar, []byte(`"truncated":false`)) {
 		t.Fatalf("sidecar = %s, want explicit false truncated member", sidecar)
+	}
+}
+
+func TestTranscriptItemsCodexWarningAndMatchingResult(t *testing.T) {
+	runner := newScriptedCodexRunner(
+		map[string]any{
+			"method": "item/agentMessage/delta",
+			"params": map[string]any{
+				"threadId": "thread-1",
+				"turnId":   "turn-1",
+				"itemId":   "message-1",
+				"delta":    "done",
+			},
+		},
+		map[string]any{
+			"method": "warning",
+			"params": map[string]any{
+				"message": "notice",
+			},
+		},
+		map[string]any{
+			"method": "turn/completed",
+			"params": map[string]any{
+				"threadId": "thread-1",
+				"turn": map[string]any{
+					"id":     "turn-1",
+					"items":  []any{},
+					"status": "completed",
+				},
+			},
+		},
+	)
+	backend := scriptedCodexBackend(t, runner)
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "warning sequence", nil)
+	runExecution(t, server, record)
+	runner.assert(t)
+
+	items := readTranscriptItems(t, record)
+	if len(items) != 2 {
+		t.Fatalf("item count = %d, want message and one warning: %#v", len(items), items)
+	}
+	if got := items[0]; got.Ordinal != 1 || got.Kind != string(transcriptItemMessage) || got.Text != "done" || got.Truncated {
+		t.Fatalf("item 1 = %+v, want untruncated message done", got)
+	}
+	if got := items[1]; got.Ordinal != 2 || got.Kind != string(transcriptItemWarning) || got.Text != "notice" || got.Truncated {
+		t.Fatalf("item 2 = %+v, want one untruncated warning", got)
+	}
+}
+
+func TestTranscriptItemsCodexStartedFileChangeSuppressesText(t *testing.T) {
+	const sensitiveChange = "diff --git a/private/secret.txt b/private/secret.txt\n+do-not-persist-this"
+	runner := newScriptedCodexRunner(
+		map[string]any{
+			"method": "item/started",
+			"params": map[string]any{
+				"threadId": "thread-1",
+				"turnId":   "turn-1",
+				"item": map[string]any{
+					"id":      "change-started",
+					"type":    "fileChange",
+					"path":    "private/secret.txt",
+					"changes": sensitiveChange,
+				},
+			},
+		},
+		map[string]any{
+			"method": "turn/completed",
+			"params": map[string]any{
+				"threadId": "thread-1",
+				"turn": map[string]any{
+					"id":     "turn-1",
+					"items":  []any{},
+					"status": "completed",
+				},
+			},
+		},
+	)
+	backend := scriptedCodexBackend(t, runner)
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "started file change", nil)
+	runExecution(t, server, record)
+	runner.assert(t)
+
+	items := readTranscriptItems(t, record)
+	var fileChanges []TranscriptItem
+	for _, item := range items {
+		if item.Kind == string(transcriptItemFileChange) {
+			fileChanges = append(fileChanges, item)
+		}
+	}
+	if len(fileChanges) != 1 {
+		t.Fatalf("file-change item count = %d, want 1: %#v", len(fileChanges), items)
+	}
+	if got := fileChanges[0]; got.Ordinal != 1 || got.Text != "" || got.Truncated {
+		t.Fatalf("file-change item = %+v, want text-free untruncated fileChange", got)
+	}
+	sidecar, err := os.ReadFile(transcriptItemPath(t, record))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(sidecar, []byte(sensitiveChange)) || bytes.Contains(sidecar, []byte("private/secret.txt")) {
+		t.Fatalf("sidecar leaked started file-change data: %s", sidecar)
 	}
 }
 
