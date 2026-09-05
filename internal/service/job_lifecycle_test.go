@@ -3,10 +3,12 @@
 package service
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -393,18 +395,19 @@ func TestJobCancelAfterSpawnRecordsCleanupOutcome(t *testing.T) {
 	for _, tt := range []struct {
 		name        string
 		argv        []string
+		readyLine   string
 		waitForExit bool
 		wantCleanup protocol.Cleanup
 	}{
 		{name: "clean inside grace", argv: []string{"sleep", "30"}, waitForExit: true, wantCleanup: protocol.CleanupClean},
-		{name: "uncertain outside grace", argv: []string{"sh", "-c", "trap '' TERM; while :; do sleep 1; done"}, wantCleanup: protocol.CleanupUncertain},
+		{name: "uncertain outside grace", argv: []string{"sh", "-c", "trap '' TERM; printf 'term-trap-ready\\n'; while :; do sleep 1; done"}, readyLine: "term-trap-ready\n", wantCleanup: protocol.CleanupUncertain},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			interrupted := false
 			backend := &executionFakeBackend{name: "cancel-after-spawn-" + tt.name}
 			server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{backend}})
 			server.processGroupGrace = 100 * time.Millisecond
-			cmd, claim := startProcessGroup(t, tt.argv...)
+			cmd, claim := startProcessGroup(t, tt.readyLine, tt.argv...)
 			waitDone := make(chan error, 1)
 			go func() {
 				waitDone <- cmd.Wait()
@@ -766,10 +769,18 @@ func persistRunningClaim(t *testing.T, server *Server, backend string, claim job
 	return record
 }
 
-func startProcessGroup(t *testing.T, argv ...string) (*exec.Cmd, jobstore.ProcessClaim) {
+func startProcessGroup(t *testing.T, readyLine string, argv ...string) (*exec.Cmd, jobstore.ProcessClaim) {
 	t.Helper()
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var stdout io.ReadCloser
+	if readyLine != "" {
+		var err error
+		stdout, err = cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -785,6 +796,20 @@ func startProcessGroup(t *testing.T, argv ...string) (*exec.Cmd, jobstore.Proces
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 		_ = cmd.Wait()
 		t.Fatalf("read reaper process identity: alive=%t info=%#v err=%v", alive, info, err)
+	}
+	if readyLine != "" {
+		line, err := bufio.NewReader(stdout).ReadString('\n')
+		_ = stdout.Close()
+		if err != nil {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			_ = cmd.Wait()
+			t.Fatalf("read TERM-ignore readiness: %v", err)
+		}
+		if line != readyLine {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			_ = cmd.Wait()
+			t.Fatalf("TERM-ignore readiness = %q, want %q", line, readyLine)
+		}
 	}
 	return cmd, jobstore.ProcessClaim{PID: pid, PGID: pgid, StartToken: info.StartTime}
 }

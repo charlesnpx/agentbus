@@ -269,15 +269,11 @@ func TestDirectCommandRunnerCanceledAfterLeaderTERMExitKeepsDescendantPipeOpen(t
 trap 'exit 0' TERM
 /bin/sh -c '
 	trap "" TERM
-	deadline=$(( $(date +%s) + 2 ))
 	printf "child-ready:%s\\n" "$$"
-	while :; do
-		printf "child-output\\n"
-		if [ "$(date +%s)" -ge "$deadline" ]; then exit 0; fi
-		sleep 0.01
-	done
+	while :; do read -r ignored; done
 ' &
-while :; do :; done
+printf "leader-ready\\n"
+wait
 `},
 	})
 	if err != nil {
@@ -287,8 +283,15 @@ while :; do :; done
 	if !ok {
 		t.Fatalf("running command type = %T, want *directRunningCommand", running)
 	}
+	var childPID int
 	t.Cleanup(func() {
 		cancel()
+		if childPID > 0 {
+			_ = syscall.Kill(childPID, syscall.SIGKILL)
+		}
+		if command.cmd != nil && command.cmd.Process != nil {
+			_ = command.cmd.Process.Kill()
+		}
 		command.startWait()
 		if command.stdin != nil {
 			_ = command.stdin.Close()
@@ -310,19 +313,23 @@ while :; do :; done
 	readyErr := make(chan error, 1)
 	go func() {
 		reader := bufio.NewReader(command.Stdout())
-		for {
+		leaderReady := false
+		childReady := ""
+		for !leaderReady || childReady == "" {
 			line, err := reader.ReadString('\n')
 			if err != nil {
 				readyErr <- err
 				return
 			}
+			if line == "leader-ready\n" {
+				leaderReady = true
+			}
 			if strings.HasPrefix(line, "child-ready:") {
-				ready <- strings.TrimSpace(strings.TrimPrefix(line, "child-ready:"))
-				return
+				childReady = strings.TrimSpace(strings.TrimPrefix(line, "child-ready:"))
 			}
 		}
+		ready <- childReady
 	}()
-	var childPID int
 	select {
 	case err := <-readyErr:
 		t.Fatalf("child readiness read error = %v", err)
@@ -339,6 +346,21 @@ while :; do :; done
 	} else if want := command.terminator.capturedProcessRef().PGID; childGroup != want {
 		t.Fatalf("child process group = %d, want leader process group %d", childGroup, want)
 	}
+
+	// cmd.Wait reaps the leader independently of the descendant's stdout. Hold
+	// the reaper's grace clock until that real TERM response has happened, so
+	// the asserted cleanup branch is selected by process state, not scheduling.
+	command.startWait()
+	originalSignal := processGroupSignal
+	setProcessGroupSignal(t, func(pid int, signal syscall.Signal) error {
+		if err := originalSignal(pid, signal); err != nil || signal != syscall.SIGTERM {
+			return err
+		}
+		for !command.terminator.leaderReaped.Load() {
+			time.Sleep(time.Millisecond)
+		}
+		return nil
+	})
 
 	cancel()
 	waitDone := make(chan error, 1)
@@ -363,7 +385,9 @@ while :; do :; done
 		t.Fatalf("cleanup error = %v, want ErrProcessIdentityUnverifiable", observation.CleanupErr)
 	}
 
-	<-time.After(2 * cancelGrace)
+	if code := command.cmd.ProcessState.ExitCode(); code != 0 {
+		t.Fatalf("leader exit code = %d, want clean TERM exit", code)
+	}
 	assertProcessRunning(t, childPID)
 	if _, err := command.stdoutPipe.Stat(); err != nil {
 		t.Fatalf("stdout pipe closed after partial termination: %v", err)
