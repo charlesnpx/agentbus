@@ -4,6 +4,7 @@ package service
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -95,6 +96,7 @@ func (s *Server) jobTranscript(record jobstore.Record, params protocol.JobTransc
 		}
 		result.State = projectedState(record)
 	}
+	result.Gap = result.Gap || hasItemSidecarFailure(record.Diagnostics)
 	if !record.State.IsTerminal() {
 		_, active := s.ItemActivity(record.JobID)
 		if active {
@@ -151,31 +153,30 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) (pr
 		return protocol.JobTranscriptResult{}, err
 	}
 	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return protocol.JobTranscriptResult{}, err
-	}
-	// The digest deliberately retains every error item. Enforce the writer's
-	// durable file cap here too, so an unexpected artifact cannot make that
-	// bounded policy consume unbounded memory.
-	if info.Size() > transcriptItemFileCap {
-		return protocol.JobTranscriptResult{}, fmt.Errorf("transcript sidecar exceeds its %d-byte cap", transcriptItemFileCap)
-	}
 
 	result := protocol.JobTranscriptResult{
 		Counts: newTranscriptCounts(),
 		Items:  make([]protocol.TranscriptItem, 0),
 	}
-	selector := newTranscriptSelector(params)
+	kinds := make(map[string]struct{}, len(params.Kinds))
+	for _, kind := range params.Kinds {
+		kinds[kind] = struct{}{}
+	}
+	defaultDigest := len(params.Kinds) == 0 && params.Since == nil && params.SinceOrdinal == nil && params.Last == nil && params.Limit == nil
+	last := 0
+	if params.Last != nil {
+		last = *params.Last
+		if params.Limit != nil && *params.Limit < last {
+			last = *params.Limit
+		}
+	}
+	var items, messages, errorItems []protocol.TranscriptItem
+
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 8*1024), maxTranscriptSidecarLine)
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		stopped, err := transcriptAppendStopped(line)
-		if err != nil {
-			return protocol.JobTranscriptResult{}, fmt.Errorf("decode sidecar entry: %w", err)
-		}
-		if stopped {
+		if bytes.Equal(line, transcriptItemStopLine[:len(transcriptItemStopLine)-1]) {
 			result.Gap = true
 			continue
 		}
@@ -184,50 +185,55 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) (pr
 		if err := json.Unmarshal(line, &item); err != nil {
 			return protocol.JobTranscriptResult{}, fmt.Errorf("decode transcript item: %w", err)
 		}
-		if err := validateTranscriptItem(item); err != nil {
-			return protocol.JobTranscriptResult{}, err
-		}
 		result.ItemCount++
 		result.Counts[item.Kind]++
 		setTranscriptBounds(&result, item)
-		if selector.matches(item) {
-			selector.add(item)
+
+		if len(kinds) > 0 {
+			if _, ok := kinds[item.Kind]; !ok {
+				continue
+			}
 		}
+		if params.Since != nil && !item.At.After(*params.Since) {
+			continue
+		}
+		if params.SinceOrdinal != nil && item.Ordinal <= *params.SinceOrdinal {
+			continue
+		}
+
+		if defaultDigest {
+			switch item.Kind {
+			case string(transcriptItemMessage):
+				messages = appendTranscriptTail(messages, item, defaultTranscriptMessageTail)
+			case string(transcriptItemError):
+				// Errors are typically rare and are the exception to the small
+				// message tail: preserve every captured error in the digest.
+				errorItems = append(errorItems, item)
+			}
+			continue
+		}
+		if params.Last != nil {
+			items = appendTranscriptTail(items, item, last)
+			continue
+		}
+		if params.Limit != nil && len(items) >= *params.Limit {
+			continue
+		}
+		items = append(items, item)
 	}
 	if err := scanner.Err(); err != nil {
 		return protocol.JobTranscriptResult{}, fmt.Errorf("scan transcript sidecar: %w", err)
 	}
-	result.Items = selector.selectedItems()
+	if defaultDigest {
+		items = make([]protocol.TranscriptItem, 0, len(messages)+len(errorItems))
+		items = append(items, messages...)
+		items = append(items, errorItems...)
+		sort.Slice(items, func(left, right int) bool { return items[left].Ordinal < items[right].Ordinal })
+	} else if items == nil {
+		items = make([]protocol.TranscriptItem, 0)
+	}
+	result.Items = items
 	return result, nil
-}
-
-func transcriptAppendStopped(line []byte) (bool, error) {
-	var control struct {
-		AppendStopped *bool `json:"appendStopped"`
-	}
-	if err := json.Unmarshal(line, &control); err != nil {
-		return false, err
-	}
-	if control.AppendStopped == nil {
-		return false, nil
-	}
-	if !*control.AppendStopped {
-		return false, errors.New("appendStopped control entry must be true")
-	}
-	return true, nil
-}
-
-func validateTranscriptItem(item protocol.TranscriptItem) error {
-	if item.Ordinal <= 0 {
-		return errors.New("transcript item has no ordinal")
-	}
-	if item.At.IsZero() {
-		return errors.New("transcript item has no timestamp")
-	}
-	if _, ok := transcriptKinds[item.Kind]; !ok {
-		return fmt.Errorf("transcript item has invalid kind %q", item.Kind)
-	}
-	return nil
 }
 
 func setTranscriptBounds(result *protocol.JobTranscriptResult, item protocol.TranscriptItem) {
@@ -244,92 +250,13 @@ func setTranscriptBounds(result *protocol.JobTranscriptResult, item protocol.Tra
 	}
 }
 
-type transcriptSelector struct {
-	params        protocol.JobTranscriptParams
-	kinds         map[string]struct{}
-	defaultDigest bool
-	items         []protocol.TranscriptItem
-	messages      []protocol.TranscriptItem
-	errors        []protocol.TranscriptItem
-	last          int
-}
-
-func newTranscriptSelector(params protocol.JobTranscriptParams) *transcriptSelector {
-	selector := &transcriptSelector{
-		params:        params,
-		kinds:         make(map[string]struct{}, len(params.Kinds)),
-		defaultDigest: len(params.Kinds) == 0 && params.Since == nil && params.SinceOrdinal == nil && params.Last == nil && params.Limit == nil,
-	}
-	for _, kind := range params.Kinds {
-		selector.kinds[kind] = struct{}{}
-	}
-	if params.Last != nil {
-		selector.last = *params.Last
-		if params.Limit != nil && *params.Limit < selector.last {
-			selector.last = *params.Limit
+func hasItemSidecarFailure(diagnostics []string) bool {
+	for _, diagnostic := range diagnostics {
+		if strings.HasPrefix(diagnostic, itemSidecarDiagnosticPrefix) {
+			return true
 		}
 	}
-	return selector
-}
-
-func (selector *transcriptSelector) matches(item protocol.TranscriptItem) bool {
-	if selector == nil {
-		return false
-	}
-	if len(selector.kinds) > 0 {
-		if _, ok := selector.kinds[item.Kind]; !ok {
-			return false
-		}
-	}
-	if selector.params.Since != nil && !item.At.After(*selector.params.Since) {
-		return false
-	}
-	if selector.params.SinceOrdinal != nil && item.Ordinal <= *selector.params.SinceOrdinal {
-		return false
-	}
-	return true
-}
-
-func (selector *transcriptSelector) add(item protocol.TranscriptItem) {
-	if selector == nil {
-		return
-	}
-	if selector.defaultDigest {
-		switch item.Kind {
-		case string(transcriptItemMessage):
-			selector.messages = appendTranscriptTail(selector.messages, item, defaultTranscriptMessageTail)
-		case string(transcriptItemError):
-			// Errors are typically rare and are the exception to the small
-			// message tail: preserve every captured error in the digest.
-			selector.errors = append(selector.errors, item)
-		}
-		return
-	}
-	if selector.params.Last != nil {
-		selector.items = appendTranscriptTail(selector.items, item, selector.last)
-		return
-	}
-	if selector.params.Limit != nil && len(selector.items) >= *selector.params.Limit {
-		return
-	}
-	selector.items = append(selector.items, item)
-}
-
-func (selector *transcriptSelector) selectedItems() []protocol.TranscriptItem {
-	if selector == nil {
-		return make([]protocol.TranscriptItem, 0)
-	}
-	if !selector.defaultDigest {
-		if selector.items == nil {
-			return make([]protocol.TranscriptItem, 0)
-		}
-		return selector.items
-	}
-	items := make([]protocol.TranscriptItem, 0, len(selector.messages)+len(selector.errors))
-	items = append(items, selector.messages...)
-	items = append(items, selector.errors...)
-	sort.Slice(items, func(left, right int) bool { return items[left].Ordinal < items[right].Ordinal })
-	return items
+	return false
 }
 
 func appendTranscriptTail(items []protocol.TranscriptItem, item protocol.TranscriptItem, size int) []protocol.TranscriptItem {

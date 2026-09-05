@@ -475,7 +475,7 @@ func printJobTranscript(out io.Writer, transcript agentclient.JobTranscriptResul
 	for _, item := range transcript.Items {
 		fmt.Fprintf(out, "%d kind=%s at=%s", item.Ordinal, item.Kind, humanTime(item.At))
 		if item.Name != "" {
-			fmt.Fprintf(out, " name=%s", item.Name)
+			fmt.Fprintf(out, " name=%q", item.Name)
 		}
 		if item.Text != "" {
 			fmt.Fprintf(out, " text=%q", item.Text)

@@ -128,6 +128,31 @@ func TestJobTranscriptReportsGapAndMissingSidecar(t *testing.T) {
 	}
 }
 
+func TestJobTranscriptReportsGapForDurableSidecarFailure(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{})
+	item := transcriptTestItem(1, time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC), "message")
+	record := transcriptTestRecord(t, server, "gap-sidecar-failure")
+	writeTranscriptSidecar(t, record, []protocol.TranscriptItem{item}, false)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
+		State:       protocol.PublicStateCompleted,
+		Cleanup:     protocol.CleanupClean,
+		Diagnostics: []string{itemSidecarDiagnosticPrefix + "sync: test failure"},
+		FinishedAt:  item.At.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result := transcriptResultForTest(t, server, protocol.JobTranscriptParams{JobID: record.JobID})
+	if !result.Gap || result.ItemCount != 1 {
+		t.Fatalf("sidecar failure transcript = %#v, want one item and gap", result)
+	}
+}
+
 func TestJobTranscriptOrdinalRoundTrip(t *testing.T) {
 	server := newTestServer(t, t.TempDir(), Config{})
 	record := transcriptTestRecord(t, server, "ordinal")

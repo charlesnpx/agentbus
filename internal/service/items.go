@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	transcriptItemTextCap = 4 * 1024
-	transcriptItemFileCap = 16 * 1024 * 1024
+	transcriptItemTextCap       = 4 * 1024
+	transcriptItemFileCap       = 16 * 1024 * 1024
+	itemSidecarDiagnosticPrefix = "item sidecar "
 )
 
 var transcriptItemStopLine = []byte("{\"appendStopped\":true}\n")
@@ -260,7 +261,7 @@ func (writer *itemSidecarWriter) noteFailure(operation string, err error) {
 		return
 	}
 	writer.stopped = true
-	writer.diagnostic = "item sidecar " + operation + ": " + err.Error()
+	writer.diagnostic = itemSidecarDiagnosticPrefix + operation + ": " + err.Error()
 	if writer.file != nil {
 		_ = writer.file.Close()
 		writer.file = nil

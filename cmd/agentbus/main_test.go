@@ -196,7 +196,7 @@ func TestTranscriptForwardsSelectorsAndPrintsDigest(t *testing.T) {
 			"message": 1, "tool": 1, "fileChange": 0, "warning": 0, "error": 1,
 		},
 		Items: []agentclient.TranscriptItem{
-			{Ordinal: 7, At: since.Add(time.Second), Kind: "message", Text: "hello\nworld"},
+			{Ordinal: 7, At: since.Add(time.Second), Kind: "message", Name: "tool\nname", Text: "hello\nworld"},
 		},
 	}
 	client := &fakeProtocolClient{transcripts: map[string]agentclient.JobTranscriptResult{"job-1": transcript}}
@@ -217,8 +217,12 @@ func TestTranscriptForwardsSelectorsAndPrintsDigest(t *testing.T) {
 	if params.JobID != "job-1" || !slices.Equal(params.Kinds, []string{"message", "error"}) || params.Since == nil || !params.Since.Equal(since) || params.SinceOrdinal == nil || *params.SinceOrdinal != 6 || params.Last == nil || *params.Last != 3 || params.Limit == nil || *params.Limit != 2 {
 		t.Fatalf("transcript params = %#v", params)
 	}
-	if !strings.Contains(stdout, "state=running itemCount=3 liveness=alive gap=false") || !strings.Contains(stdout, "7 kind=message") || !strings.Contains(stdout, `text="hello\nworld"`) {
+	if !strings.Contains(stdout, "state=running itemCount=3 liveness=alive gap=false") || !strings.Contains(stdout, "7 kind=message") || !strings.Contains(stdout, `name="tool\nname"`) || !strings.Contains(stdout, `text="hello\nworld"`) {
 		t.Fatalf("selected transcript output = %q", stdout)
+	}
+	lines := strings.Split(strings.TrimSuffix(stdout, "\n"), "\n")
+	if len(lines) != 2 || !strings.HasPrefix(lines[1], "7 ") {
+		t.Fatalf("selected transcript item must remain on one ordinal-prefixed line: %q", stdout)
 	}
 	if strings.Contains(stdout, "counts message=") {
 		t.Fatalf("selected transcript unexpectedly printed digest counts: %q", stdout)

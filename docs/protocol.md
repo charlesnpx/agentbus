@@ -224,7 +224,8 @@ an orchestrator's context compaction.
 }
 ~~~
 
-kinds may contain message, tool, fileChange, warning, or error. since includes
+Kinds may contain message, tool, fileChange, warning, or error. An absent kinds
+field and an explicit empty kinds array both mean no kind filter. since includes
 items strictly after its RFC 3339 timestamp; sinceOrdinal includes items whose
 ordinal is strictly greater than its value. last selects the final N matching
 items and limit bounds the selected response. kinds, since, sinceOrdinal, and
