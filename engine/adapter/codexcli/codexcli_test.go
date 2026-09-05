@@ -707,6 +707,9 @@ func TestAppServerTaskCompleteUsesLastAgentMessageAsResult(t *testing.T) {
 		peer.respond(thread, threadResult("thread-1"))
 		turn := peer.expectRequest("turn/start")
 		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("item/started", itemParams("thread-1", "turn-1", map[string]any{
+			"id": "pending-change", "type": "fileChange", "name": "pending file change", "changes": "private pending change",
+		}))
 		peer.notify("task_complete", map[string]any{
 			"turn_id":            "turn-1",
 			"last_agent_message": "done",
@@ -725,6 +728,22 @@ func TestAppServerTaskCompleteUsesLastAgentMessageAsResult(t *testing.T) {
 	}
 	if resultRawText(got) != "done" {
 		t.Fatalf("events = %#v, want task_complete last agent message raw result", got)
+	}
+	var pendingFileChanges []engine.Event
+	progress := 0
+	for _, event := range got {
+		if event.Type == engine.EventProgress {
+			progress++
+		}
+		if event.Name == "pending file change" {
+			pendingFileChanges = append(pendingFileChanges, event)
+		}
+	}
+	if len(pendingFileChanges) != 1 || pendingFileChanges[0].Type != engine.EventToolUse || !pendingFileChanges[0].ObservedWorkspaceWriteItem || pendingFileChanges[0].Text != "" {
+		t.Fatalf("pending file-change events = %#v, want one text-free workspace-write observation", pendingFileChanges)
+	}
+	if progress != 1 {
+		t.Fatalf("progress events = %d, want one started-item heartbeat", progress)
 	}
 	if session.ID() != "thread-1" {
 		t.Fatalf("session id after task_complete = %q, want thread-1", session.ID())
@@ -833,9 +852,10 @@ func TestAppServerTerminalTurnStatuses(t *testing.T) {
 func TestAppServerProviderOverloadIgnoresTerminalItemInventory(t *testing.T) {
 	const capacityMessage = "Selected model is at capacity. Please try a different model."
 	tests := []struct {
-		name          string
-		notifyItems   []map[string]any
-		configureTurn func(map[string]any)
+		name                string
+		notifyItems         []map[string]any
+		configureTurn       func(map[string]any)
+		wantStartedToolItem bool
 	}{
 		{
 			name: "items absent",
@@ -868,6 +888,7 @@ func TestAppServerProviderOverloadIgnoresTerminalItemInventory(t *testing.T) {
 				{"id": "command-1", "type": "commandExecution", "command": "echo wrote"},
 				{"id": "file-1", "type": "fileChange", "changes": "wrote a file"},
 			},
+			wantStartedToolItem: true,
 		},
 	}
 	for _, test := range tests {
@@ -911,7 +932,75 @@ func TestAppServerProviderOverloadIgnoresTerminalItemInventory(t *testing.T) {
 					t.Fatalf("terminal event error = %v, want ErrProviderOverloaded", event.Err)
 				}
 			}
+			if test.wantStartedToolItem {
+				var startedTools []engine.Event
+				progress := 0
+				for _, event := range got {
+					if event.Type == engine.EventProgress {
+						progress++
+					}
+					if event.Type == engine.EventToolUse && event.Name == "echo wrote" {
+						startedTools = append(startedTools, event)
+					}
+				}
+				if len(startedTools) != 1 || startedTools[0].Text != "echo wrote" {
+					t.Fatalf("started command events = %#v, want one retained observation", startedTools)
+				}
+				if progress != 1 {
+					t.Fatalf("progress events = %d, want one started-item heartbeat", progress)
+				}
+			}
 		})
+	}
+}
+
+func TestAppServerInterruptFlushesPendingFileChange(t *testing.T) {
+	started := make(chan struct{})
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("item/started", itemParams("thread-1", "turn-1", map[string]any{
+			"id": "interrupted-change", "type": "fileChange", "name": "interrupted file change", "changes": "private interrupted change",
+		}))
+		close(started)
+		interrupt := peer.expectRequest("turn/interrupt")
+		assertParam(t, interrupt, "threadId", "thread-1")
+		assertParam(t, interrupt, "turnId", "turn-1")
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "interrupted", ""))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := session.Interrupt(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	var fileChanges []engine.Event
+	progress := 0
+	for _, event := range got {
+		if event.Type == engine.EventProgress {
+			progress++
+		}
+		if event.Name == "interrupted file change" {
+			fileChanges = append(fileChanges, event)
+		}
+		if event.Type == engine.EventTerminalError {
+			t.Fatalf("requested interruption was terminal: %#v", got)
+		}
+	}
+	if len(fileChanges) != 1 || fileChanges[0].Type != engine.EventToolUse || !fileChanges[0].ObservedWorkspaceWriteItem || fileChanges[0].Text != "" {
+		t.Fatalf("interrupted file-change events = %#v, want one text-free workspace-write observation", fileChanges)
+	}
+	if progress != 1 {
+		t.Fatalf("progress events = %d, want one started-item heartbeat", progress)
 	}
 }
 

@@ -77,6 +77,10 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	}
 
 	observer := &turnObserver{emit: emit}
+	// A turn can stop after item/started without ever delivering its matching
+	// item/completed notification. Flush on every return after turn/start begins,
+	// including transport errors and cancellation paths that bypass completion.
+	defer observer.flushPendingToolItems()
 	turnResult, err := rpc.request(ctx, "turn/start", turnStartParams(threadID, opts, input, d.writePolicy), observer)
 	if err != nil {
 		return threadID, err
@@ -468,7 +472,15 @@ type turnObserver struct {
 	agentDeltaSeen     map[string]bool
 	agentDeltaText     map[string]*strings.Builder
 	lastDeltaAgentItem string
+	pendingToolItems   map[string]pendingToolItem
+	pendingToolItemIDs []string
+	emittedToolItemIDs map[string]struct{}
 	completion         *turnCompletion
+}
+
+type pendingToolItem struct {
+	item     map[string]any
+	metadata map[string]any
 }
 
 type turnCompletion struct {
@@ -512,11 +524,78 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 				}
 			}
 		}
-	case "filechange":
+	case "filechange", "commandexecution", "mcptoolcall", "dynamictoolcall":
+		itemID := toolItemID(payload, item)
 		if method == "item/started" {
+			o.recordPendingToolItem(itemID, item, metadata)
 			o.emitEvent(engine.Event{Type: engine.EventProgress})
 			return
 		}
+		if !o.completePendingToolItem(itemID) {
+			return
+		}
+		o.emitToolItem(item, metadata)
+	}
+}
+
+func (o *turnObserver) recordPendingToolItem(itemID string, item map[string]any, metadata map[string]any) {
+	// The app-server fixtures identify item lifecycles by params.item.id. Do not
+	// collapse id-less frames under a shared fallback: two concurrent tools of the
+	// same kind would then be indistinguishable.
+	if itemID == "" || o.toolItemWasEmitted(itemID) {
+		return
+	}
+	if o.pendingToolItems == nil {
+		o.pendingToolItems = make(map[string]pendingToolItem)
+	}
+	if _, exists := o.pendingToolItems[itemID]; exists {
+		return
+	}
+	o.pendingToolItems[itemID] = pendingToolItem{item: item, metadata: metadata}
+	o.pendingToolItemIDs = append(o.pendingToolItemIDs, itemID)
+}
+
+func (o *turnObserver) completePendingToolItem(itemID string) bool {
+	if itemID == "" {
+		// A completed frame that arrived without a started frame is still a
+		// terminal observation, as it was before lifecycle retention.
+		return true
+	}
+	if o.toolItemWasEmitted(itemID) {
+		return false
+	}
+	delete(o.pendingToolItems, itemID)
+	o.markToolItemEmitted(itemID)
+	return true
+}
+
+func (o *turnObserver) flushPendingToolItems() {
+	for _, itemID := range o.pendingToolItemIDs {
+		pending, ok := o.pendingToolItems[itemID]
+		if !ok {
+			continue
+		}
+		delete(o.pendingToolItems, itemID)
+		o.markToolItemEmitted(itemID)
+		o.emitToolItem(pending.item, pending.metadata)
+	}
+}
+
+func (o *turnObserver) toolItemWasEmitted(itemID string) bool {
+	_, emitted := o.emittedToolItemIDs[itemID]
+	return emitted
+}
+
+func (o *turnObserver) markToolItemEmitted(itemID string) {
+	if o.emittedToolItemIDs == nil {
+		o.emittedToolItemIDs = make(map[string]struct{})
+	}
+	o.emittedToolItemIDs[itemID] = struct{}{}
+}
+
+func (o *turnObserver) emitToolItem(item map[string]any, metadata map[string]any) {
+	switch normalizeKind(firstString(item, "type")) {
+	case "filechange":
 		// File-change observations intentionally carry no item text. The service
 		// retains their count, never paths or contents.
 		o.emitEvent(engine.Event{
@@ -526,10 +605,6 @@ func (o *turnObserver) handleItem(method string, payload map[string]any, metadat
 			ObservedWorkspaceWriteItem: true,
 		})
 	case "commandexecution", "mcptoolcall", "dynamictoolcall":
-		if method == "item/started" {
-			o.emitEvent(engine.Event{Type: engine.EventProgress})
-			return
-		}
 		o.emitEvent(engine.Event{
 			Type:     engine.EventToolUse,
 			Name:     toolName(item),
@@ -625,6 +700,9 @@ func (o *turnObserver) resultText() string {
 }
 
 func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer *turnObserver) (string, error) {
+	// Flush before emitting a result or returning an error so failed, empty, and
+	// interrupted completions retain observations in their original turn order.
+	observer.flushPendingToolItems()
 	completion := observer.completion
 	if completion == nil {
 		return threadID, nil
@@ -906,6 +984,13 @@ func agentDeltaItemID(payload map[string]any) string {
 		return firstString(item, "id", "itemId", "item_id")
 	}
 	return firstString(payload, "id")
+}
+
+func toolItemID(payload, item map[string]any) string {
+	if itemID := firstString(item, "id", "itemId", "item_id"); itemID != "" {
+		return itemID
+	}
+	return firstString(payload, "itemId", "item_id", "id")
 }
 
 func agentDeltaItemIDOrDefault(payload map[string]any) string {
