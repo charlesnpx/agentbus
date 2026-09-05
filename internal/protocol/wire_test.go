@@ -328,17 +328,6 @@ func TestWireEnumMethods(t *testing.T) {
 		}
 	})
 
-	t.Run("Liveness.Valid", func(t *testing.T) {
-		for _, liveness := range []Liveness{LivenessAlive, LivenessGone, LivenessUnknown} {
-			if !liveness.Valid() {
-				t.Errorf("%q Valid() = false, want true", liveness)
-			}
-		}
-		if Liveness("invalid").Valid() {
-			t.Error("invalid Liveness Valid() = true, want false")
-		}
-	})
-
 	t.Run("FailureClass.Valid", func(t *testing.T) {
 		tests := []struct {
 			class FailureClass

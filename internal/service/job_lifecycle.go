@@ -212,14 +212,6 @@ func jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, error) {
 	}, nil
 }
 
-func (s *Server) jobSummaryWire(record jobstore.Record) (protocol.JobSummaryWire, error) {
-	spec, _, err := taskSpecForProjection(record)
-	if err != nil {
-		return protocol.JobSummaryWire{}, err
-	}
-	return s.jobSummaryWireFromSpec(record, spec), nil
-}
-
 func (s *Server) jobSummaryWireFromSpec(record jobstore.Record, spec protocol.TaskSpec) protocol.JobSummaryWire {
 	var tags map[string]string
 	if spec.Tags != nil {
@@ -249,7 +241,7 @@ func (s *Server) jobSummaryWireFromSpec(record jobstore.Record, spec protocol.Ta
 		lastItemAt := activity.LastItemAt
 		wire.LastItemAt = &lastItemAt
 	}
-	wire.Liveness = s.recordedClaimLiveness(record.ProcessClaim)
+	wire.Liveness = s.exactClaimDiagnostic(record.ProcessClaim).liveness
 	return wire
 }
 
@@ -468,56 +460,15 @@ func (s *Server) cancellationPending(jobID string) bool {
 	return false
 }
 
-type processClaimDiagnosticKind uint8
-
-const (
-	processClaimExact processClaimDiagnosticKind = iota
-	processClaimMissing
-	processClaimIncomplete
-	processClaimUnreadable
-	processClaimUnavailable
-	processClaimStartTokenUnavailable
-	processClaimStartTokenMismatch
-)
-
 // processClaimDiagnostic preserves the identity-check result for both the
-// reaper and the public liveness projection. The public projection deliberately
-// maps this detailed private result to a small verdict enum.
+// reaper and the public liveness projection.
 type processClaimDiagnostic struct {
-	kind processClaimDiagnosticKind
-	err  error
+	message  string
+	liveness protocol.Liveness
 }
 
 func (diagnostic processClaimDiagnostic) exact() bool {
-	return diagnostic.kind == processClaimExact
-}
-
-func (diagnostic processClaimDiagnostic) message() string {
-	switch diagnostic.kind {
-	case processClaimMissing:
-		return "orphan reaper: process claim is missing; no signal sent"
-	case processClaimIncomplete:
-		return "orphan reaper: process claim is incomplete; no signal sent"
-	case processClaimUnreadable:
-		return "orphan reaper: leader start token is unreadable; no signal sent: " + diagnostic.err.Error()
-	case processClaimUnavailable, processClaimStartTokenUnavailable:
-		return "orphan reaper: leader start token is unavailable; no signal sent"
-	case processClaimStartTokenMismatch:
-		return "orphan reaper: leader start token mismatch; no signal sent"
-	default:
-		return ""
-	}
-}
-
-func (diagnostic processClaimDiagnostic) liveness() protocol.Liveness {
-	switch diagnostic.kind {
-	case processClaimExact:
-		return protocol.LivenessAlive
-	case processClaimUnavailable, processClaimStartTokenMismatch:
-		return protocol.LivenessGone
-	default:
-		return protocol.LivenessUnknown
-	}
+	return diagnostic.message == ""
 }
 
 // terminateRecordedProcessClaim is the reaper's only signaling path. It
@@ -526,7 +477,7 @@ func (diagnostic processClaimDiagnostic) liveness() protocol.Liveness {
 // result and deliberately sends no group signal.
 func (s *Server) terminateRecordedProcessClaim(claim *jobstore.ProcessClaim) (protocol.Cleanup, []string) {
 	if diagnostic := s.exactClaimDiagnostic(claim); !diagnostic.exact() {
-		return protocol.CleanupUncertain, []string{diagnostic.message()}
+		return protocol.CleanupUncertain, []string{diagnostic.message}
 	}
 	if gone, err := s.processGroupGone(claim.PGID); err != nil {
 		return protocol.CleanupUncertain, []string{"orphan reaper: inspect process group: " + err.Error()}
@@ -537,7 +488,7 @@ func (s *Server) terminateRecordedProcessClaim(claim *jobstore.ProcessClaim) (pr
 	// leader-token comparison immediately before the first signal so a PID
 	// recycled in that small observation window is never targeted.
 	if diagnostic := s.exactClaimDiagnostic(claim); !diagnostic.exact() {
-		return protocol.CleanupUncertain, []string{diagnostic.message()}
+		return protocol.CleanupUncertain, []string{diagnostic.message}
 	}
 
 	if err := s.processGroupSignaler().SignalProcessGroup(claim.PGID, syscall.SIGTERM); err != nil {
@@ -550,7 +501,7 @@ func (s *Server) terminateRecordedProcessClaim(claim *jobstore.ProcessClaim) (pr
 	}
 
 	if diagnostic := s.exactClaimDiagnostic(claim); !diagnostic.exact() {
-		return protocol.CleanupUncertain, []string{diagnostic.message()}
+		return protocol.CleanupUncertain, []string{diagnostic.message}
 	}
 	if err := s.processGroupSignaler().SignalProcessGroup(claim.PGID, syscall.SIGKILL); err != nil {
 		return protocol.CleanupUncertain, []string{"orphan reaper: send SIGKILL to exact claimed group: " + err.Error()}
@@ -560,18 +511,18 @@ func (s *Server) terminateRecordedProcessClaim(claim *jobstore.ProcessClaim) (pr
 	return protocol.CleanupUncertain, []string{"orphan reaper: process group did not exit within cancellation grace"}
 }
 
-// recordedClaimLiveness derives the public verdict from the same exact
-// identity comparison used by the reaper; it never exposes the claim itself.
-func (s *Server) recordedClaimLiveness(claim *jobstore.ProcessClaim) protocol.Liveness {
-	return s.exactClaimDiagnostic(claim).liveness()
-}
-
 func (s *Server) exactClaimDiagnostic(claim *jobstore.ProcessClaim) processClaimDiagnostic {
 	if claim == nil {
-		return processClaimDiagnostic{kind: processClaimMissing}
+		return processClaimDiagnostic{
+			message:  "orphan reaper: process claim is missing; no signal sent",
+			liveness: protocol.LivenessUnknown,
+		}
 	}
 	if claim.PID <= 0 || claim.PGID <= 0 || claim.StartToken == "" {
-		return processClaimDiagnostic{kind: processClaimIncomplete}
+		return processClaimDiagnostic{
+			message:  "orphan reaper: process claim is incomplete; no signal sent",
+			liveness: protocol.LivenessUnknown,
+		}
 	}
 	table := s.processTable
 	if table == nil {
@@ -579,18 +530,30 @@ func (s *Server) exactClaimDiagnostic(claim *jobstore.ProcessClaim) processClaim
 	}
 	info, alive, err := table.Lookup(claim.PID)
 	if err != nil {
-		return processClaimDiagnostic{kind: processClaimUnreadable, err: err}
+		return processClaimDiagnostic{
+			message:  "orphan reaper: leader start token is unreadable; no signal sent: " + err.Error(),
+			liveness: protocol.LivenessUnknown,
+		}
 	}
 	if !alive {
-		return processClaimDiagnostic{kind: processClaimUnavailable}
+		return processClaimDiagnostic{
+			message:  "orphan reaper: leader start token is unavailable; no signal sent",
+			liveness: protocol.LivenessGone,
+		}
 	}
 	if info.StartTime == "" {
-		return processClaimDiagnostic{kind: processClaimStartTokenUnavailable}
+		return processClaimDiagnostic{
+			message:  "orphan reaper: leader start token is unavailable; no signal sent",
+			liveness: protocol.LivenessUnknown,
+		}
 	}
 	if info.StartTime != claim.StartToken {
-		return processClaimDiagnostic{kind: processClaimStartTokenMismatch}
+		return processClaimDiagnostic{
+			message:  "orphan reaper: leader start token mismatch; no signal sent",
+			liveness: protocol.LivenessGone,
+		}
 	}
-	return processClaimDiagnostic{kind: processClaimExact}
+	return processClaimDiagnostic{liveness: protocol.LivenessAlive}
 }
 
 func (s *Server) processGroupSignaler() engine.ProcessGroupSignaler {

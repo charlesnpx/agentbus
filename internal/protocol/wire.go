@@ -77,16 +77,6 @@ const (
 	LivenessUnknown Liveness = "unknown"
 )
 
-// Valid reports whether liveness is one of the public verdicts.
-func (liveness Liveness) Valid() bool {
-	switch liveness {
-	case LivenessAlive, LivenessGone, LivenessUnknown:
-		return true
-	default:
-		return false
-	}
-}
-
 // FailureClass is the stable, machine-readable category for a failed job.
 type FailureClass string
 
