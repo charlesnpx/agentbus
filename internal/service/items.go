@@ -26,6 +26,7 @@ const (
 var (
 	transcriptItemStopLine     = []byte("{\"appendStopped\":true}\n")
 	transcriptItemCompleteLine = []byte("{\"captureComplete\":true}\n")
+	closeItemSidecarFile       = func(file *os.File) error { return file.Close() }
 	syncItemSidecarDirectory   = func(dir string) error {
 		file, err := os.Open(dir)
 		if err != nil {
@@ -281,10 +282,7 @@ func (writer *itemSidecarWriter) remainingPayload() int64 {
 	if writer == nil {
 		return 0
 	}
-	reserved := int64(len(transcriptItemStopLine))
-	if completion := int64(len(transcriptItemCompleteLine)); completion > reserved {
-		reserved = completion
-	}
+	reserved := int64(len(transcriptItemCompleteLine))
 	if writer.written >= writer.fileCap-reserved {
 		return 0
 	}
@@ -311,14 +309,6 @@ func (writer *itemSidecarWriter) writeControlLine(file *os.File, line []byte) er
 
 func (writer *itemSidecarWriter) markStopped() {
 	if writer == nil || writer.stopped {
-		return
-	}
-	if writer.file == nil {
-		writer.noteFailure("record append stop", fmt.Errorf("sidecar file is unavailable"))
-		return
-	}
-	if err := writer.writeControlLine(writer.file, transcriptItemStopLine); err != nil {
-		writer.noteFailure("record append stop", err)
 		return
 	}
 	writer.stopped = true
@@ -379,9 +369,7 @@ func (writer *itemSidecarWriter) close() {
 		_ = file.Close()
 		return
 	}
-	if err := file.Close(); err != nil {
-		writer.noteFailure("close", err)
-	}
+	_ = closeItemSidecarFile(file)
 }
 
 func (writer *itemSidecarWriter) diagnostics() []string {
