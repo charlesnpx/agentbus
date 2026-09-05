@@ -98,7 +98,9 @@ func (s *Server) jobTranscript(record jobstore.Record, params protocol.JobTransc
 		}
 		result.State = projectedState(record)
 	}
-	result.Gap = result.Gap || hasItemSidecarFailure(record.Diagnostics)
+	result.Gap = result.Gap ||
+		hasItemSidecarFailure(record.Diagnostics) ||
+		record.State == protocol.PublicStateUnknown
 	if !record.State.IsTerminal() {
 		_, active := s.ItemActivity(record.JobID)
 		if active {

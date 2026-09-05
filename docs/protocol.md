@@ -301,9 +301,10 @@ message items and every captured error item. Any explicit selector returns its
 matching items, subject to limit. A missing sidecar is a valid empty transcript
 with itemCount zero, seven zero counts, items: [], and gap false.
 
-When the sidecar's capped writer emitted its appendStopped marker, gap is true.
-The captured items and counts are then a known prefix rather than a claim that
-the job emitted no more activity.
+When the sidecar's capped writer emitted its appendStopped marker, a sidecar
+write failure was recorded, or the daemon was interrupted while capturing, gap
+is true: the returned prefix may be incomplete rather than a claim that the
+job emitted no more activity.
 
 ## job.get
 

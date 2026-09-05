@@ -314,8 +314,9 @@ item: counts, timestamps, the last few message items, and every captured error
 item. Explicit selectors widen the returned items subject to limit. A missing
 sidecar is an empty transcript with zero counts, no timestamps, items: [], and
 gap false. A terminal record remains readable because terminal handling never
-deletes its sidecar. gap is true only when the sidecar has its appendStopped
-marker, making its returned prefix visibly incomplete. liveness has the same
+deletes its sidecar. gap is true when the sidecar has its appendStopped marker,
+a sidecar write failure was recorded, or the daemon was interrupted while
+capturing: the returned prefix may be incomplete. liveness has the same
 active-execution-only projection and exact process-claim meaning as job.list.
 
 job.cancel:
