@@ -123,6 +123,7 @@ type Record struct {
 	// backend session; it is not an unknown-session marker.
 	BackendSessionID string                  `json:"backendSessionId,omitempty"`
 	Model            string                  `json:"model,omitempty"`
+	ModelReported    string                  `json:"modelReported,omitempty"`
 	CWD              string                  `json:"cwd,omitempty"`
 	Write            bool                    `json:"write"`
 	Effort           string                  `json:"effort,omitempty"`
@@ -652,6 +653,48 @@ func (store *Store) RecordBackendSessionID(id, sessionID string) (Record, error)
 		return nil
 	})
 	return result, err
+}
+
+// RecordModelReported preserves the first non-empty model observation from a
+// backend. It is separate from the requested Model: an omitted observation
+// remains omitted rather than being inferred from the request.
+func (store *Store) RecordModelReported(id, model string) error {
+	if err := validateJobID(id); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return fmt.Errorf("%w: reported model is required", ErrInvalid)
+	}
+
+	return store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if current.State.IsTerminal() {
+			return ErrTerminal
+		}
+		if current.ModelReported != "" {
+			return nil
+		}
+
+		next := current
+		next.ModelReported = model
+		next.UpdatedAt = time.Now().UTC()
+		normalizeRecord(&next)
+		if err := validateRecord(next); err != nil {
+			return err
+		}
+		if err := putRecord(jobs, next); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 // MarkTerminal records the first terminal state. Later updates are rejected so
