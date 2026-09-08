@@ -107,7 +107,11 @@ also carries the prompt, reasoning effort, sandbox, and approval policy.
 `Interrupt` sends `turn/interrupt` for the active thread and turn before the
 shared runtime falls back to process interruption. An interrupt requested
 after `turn/start` is written but before its response supplies a turn ID is
-latched and sent as soon as that response identifies the active turn.
+latched and sent once that response identifies the active turn, unless the turn
+has already completed by then, in which case nothing is sent because there is no
+longer a turn to interrupt. The latch still records that the interruption was
+requested, so a provider-reported interruption is classified as requested rather
+than unsolicited.
 
 When served by the daemon, Codex additionally receives a job-private
 `CODEX_HOME` under the workspace state namespace. Agentbus links only the

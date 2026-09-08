@@ -99,6 +99,11 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	}
 
 	pendingThreadID, interruptPending := active.setTurnID(turnID)
+	// A completion observed before the turn/start response means the turn is
+	// already over, so a latched interrupt is deliberately not sent: the frame
+	// could not affect anything, and a write to an exiting provider would fail
+	// and replace this completion with an error. setTurnID still reports the
+	// request, which keeps an interrupted status classified as requested.
 	if observer.completion != nil {
 		return finishTurnCompletion(threadID, active, observer)
 	}
