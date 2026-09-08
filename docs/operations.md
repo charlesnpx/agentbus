@@ -1,6 +1,6 @@
 # Agentbus operations
 
-This runbook covers Agentbus 0.13.1 and protocol version 3 on macOS and Linux.
+This runbook covers Agentbus 0.14.0 and protocol version 3 on macOS and Linux.
 The daemon supervises backend process groups and records cleanup as a separate
 clean-or-uncertain value.
 
@@ -123,14 +123,10 @@ startup rather than being repaired in place. Preserve the root for diagnosis;
 do not create a replacement database at the same path unless you have first
 performed the required version-break cleanup above.
 
-## Current footprint and residual risks
+## Footprint and residual risks
 
-At the final sweep, excluding vendor, Agentbus has 15,272 production Go lines
-and 13,819 test Go lines: reductions of 40,166 and 50,875 from the
-55,438-production-line and 64,694-test-line baseline. It has 17 Go packages.
-The largest production file is `engine/adapter/codexcli/appserver_driver.go`
-at 1,032 lines, and the largest test file is
-`engine/adapter/internal/duplex/session_test.go` at 1,880 lines.
+The code footprint is measured from the checked-out tree at release review and
+is not a stable operational property. Agentbus has 17 Go packages.
 
 If the daemon dies mid-run, a provider process can remain orphaned. Recovery
 marks recovered running work unknown and never relaunches it; the reaper signals

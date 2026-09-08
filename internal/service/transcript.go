@@ -34,9 +34,10 @@ var transcriptKinds = map[string]struct{}{
 }
 
 // handleJobTranscript returns a digest of the captured sidecar and the items
-// selected with stateless filters. A missing sidecar is an empty transcript for
-// terminal jobs that failed before their first turn and older jobs. A running
-// job is always gapped because its capture does not yet have a final receipt.
+// selected with stateless filters. A missing sidecar is an empty transcript
+// only when the job never entered starting; once starting was recorded, its
+// absence leaves capture continuity unestablished. A running job is always
+// gapped because its capture does not yet have a final receipt.
 func (s *Server) handleJobTranscript(raw json.RawMessage) requestOutcome {
 	var params protocol.JobTranscriptParams
 	if err := decodeStrict(raw, &params); err != nil {
@@ -93,7 +94,11 @@ func (s *Server) jobTranscript(record jobstore.Record, params protocol.JobTransc
 	}
 	result := emptyJobTranscript(record)
 	if present {
-		result = readTranscriptSidecar(path, params)
+		sidecar := readTranscriptSidecar(path, params)
+		result = sidecar.JobTranscriptResult
+		if sidecar.missing && record.StartedAt != nil {
+			result.Gap = true
+		}
 		result.State = projectedState(record)
 	}
 	result.Gap = result.Gap ||
@@ -146,33 +151,38 @@ func newTranscriptCounts() map[string]int {
 	}
 }
 
-func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) protocol.JobTranscriptResult {
+type transcriptSidecarRead struct {
+	protocol.JobTranscriptResult
+	missing bool
+}
+
+func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) transcriptSidecarRead {
 	result := protocol.JobTranscriptResult{
 		Counts: newTranscriptCounts(),
 		Items:  make([]protocol.TranscriptItem, 0),
 	}
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return result
+		return transcriptSidecarRead{JobTranscriptResult: result, missing: true}
 	}
 	if err != nil {
 		// A failed read still leaves a useful captured prefix. Report its
 		// incompleteness instead of hiding it behind an RPC failure.
 		result.Gap = true
-		return result
+		return transcriptSidecarRead{JobTranscriptResult: result}
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
 		result.Gap = true
-		return result
+		return transcriptSidecarRead{JobTranscriptResult: result}
 	}
 	endsWithNewline := false
 	if info.Size() > 0 {
 		var lastByte [1]byte
 		if _, err := file.ReadAt(lastByte[:], info.Size()-1); err != nil {
 			result.Gap = true
-			return result
+			return transcriptSidecarRead{JobTranscriptResult: result}
 		}
 		endsWithNewline = lastByte[0] == '\n'
 	}
@@ -231,7 +241,7 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) pro
 			if hasAppendStopped || hasCaptureComplete {
 				finishItems()
 				result.Gap = true
-				return result
+				return transcriptSidecarRead{JobTranscriptResult: result}
 			}
 		}
 
@@ -239,7 +249,7 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) pro
 		if err := json.Unmarshal(line, &item); err != nil {
 			finishItems()
 			result.Gap = true
-			return result
+			return transcriptSidecarRead{JobTranscriptResult: result}
 		}
 		result.ItemCount++
 		result.Counts[item.Kind]++
@@ -280,13 +290,13 @@ func readTranscriptSidecar(path string, params protocol.JobTranscriptParams) pro
 	if err := scanner.Err(); err != nil {
 		finishItems()
 		result.Gap = true
-		return result
+		return transcriptSidecarRead{JobTranscriptResult: result}
 	}
 	finishItems()
 	if !captureComplete || !endsWithNewline {
 		result.Gap = true
 	}
-	return result
+	return transcriptSidecarRead{JobTranscriptResult: result}
 }
 
 func setTranscriptBounds(result *protocol.JobTranscriptResult, item protocol.TranscriptItem) {

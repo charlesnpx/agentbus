@@ -428,11 +428,20 @@ func (a *app) runTranscript(ctx context.Context, args []string, out, errOut io.W
 	if err != nil {
 		return protocolCommandError(errOut, "transcript", err)
 	}
-	if *jsonOut {
-		return writeOrError(out, errOut, transcript)
+	// job.transcript omits failure and contract information, so fetch the full
+	// record before selecting the documented selected-job exit code.
+	record, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: *jobID})
+	if err != nil {
+		return protocolCommandError(errOut, "transcript", err)
 	}
-	printJobTranscript(out, transcript, transcriptIsDigestRequest(params))
-	return 0
+	if *jsonOut {
+		if code := writeOrError(out, errOut, transcript); code != 0 {
+			return code
+		}
+	} else {
+		printJobTranscript(out, transcript, transcriptIsDigestRequest(params))
+	}
+	return cliExitCodeForRecord(record)
 }
 
 func transcriptFlagSet(fs *flag.FlagSet, name string) bool {
