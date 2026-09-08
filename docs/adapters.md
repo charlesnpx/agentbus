@@ -105,7 +105,9 @@ working directory when one is supplied. The app-server thread and turn requests
 carry the requested working directory and model when provided; the turn request
 also carries the prompt, reasoning effort, sandbox, and approval policy.
 `Interrupt` sends `turn/interrupt` for the active thread and turn before the
-shared runtime falls back to process interruption.
+shared runtime falls back to process interruption. An interrupt requested
+after `turn/start` is written but before its response supplies a turn ID is
+latched and sent as soon as that response identifies the active turn.
 
 When served by the daemon, Codex additionally receives a job-private
 `CODEX_HOME` under the workspace state namespace. Agentbus links only the
