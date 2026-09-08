@@ -131,6 +131,7 @@ func TestJobTranscriptReportsGapAndMissingSidecar(t *testing.T) {
 	legacyStopped := transcriptTestRecord(t, server, "gap-present")
 	writeTranscriptSidecar(t, legacyStopped, []protocol.TranscriptItem{item}, true)
 	missing := transcriptTestRecord(t, server, "gap-missing")
+	neverStarted := transcriptTestRecord(t, server, "gap-never-started")
 	unopenable := transcriptTestRecord(t, server, "gap-unopenable")
 	unopenablePath, present, err := transcriptSidecarPath(unopenable)
 	if err != nil {
@@ -175,13 +176,31 @@ func TestJobTranscriptReportsGapAndMissingSidecar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	missing, err = store.MarkStarting(missing.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing.StartedAt == nil {
+		t.Fatal("missing test record did not record startedAt")
+	}
 	missing, err = store.MarkTerminal(missing.JobID, jobstore.TerminalUpdate{
+		State:      protocol.PublicStateCompleted,
+		Cleanup:    protocol.CleanupClean,
+		FinishedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	neverStarted, err = store.MarkTerminal(neverStarted.JobID, jobstore.TerminalUpdate{
 		State:      protocol.PublicStateCompleted,
 		Cleanup:    protocol.CleanupClean,
 		FinishedAt: item.At.Add(time.Second),
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if neverStarted.StartedAt != nil {
+		t.Fatal("never-started test record unexpectedly has startedAt")
 	}
 	decodeFailure, err = store.MarkTerminal(decodeFailure.JobID, jobstore.TerminalUpdate{
 		State:      protocol.PublicStateCompleted,
@@ -203,7 +222,8 @@ func TestJobTranscriptReportsGapAndMissingSidecar(t *testing.T) {
 	}{
 		{name: "clear", record: normal, wantGap: false, wantItemCount: 1, wantOrdinals: []int{1}},
 		{name: "legacy append-stopped", record: legacyStopped, wantGap: true, wantItemCount: 1, wantOrdinals: []int{1}},
-		{name: "missing terminal", record: missing, wantGap: false, wantItemCount: 0, wantOrdinals: []int{}, wantTerminal: true},
+		{name: "missing terminal", record: missing, wantGap: true, wantItemCount: 0, wantOrdinals: []int{}, wantTerminal: true},
+		{name: "missing terminal before starting", record: neverStarted, wantGap: false, wantItemCount: 0, wantOrdinals: []int{}, wantTerminal: true},
 		{name: "unopenable", record: unopenable, wantGap: true, wantItemCount: 0, wantOrdinals: []int{}},
 		{name: "decode failure keeps prefix", record: decodeFailure, params: protocol.JobTranscriptParams{Kinds: []string{"message"}}, wantGap: true, wantItemCount: 1, wantOrdinals: []int{1}, wantTerminal: true},
 	} {

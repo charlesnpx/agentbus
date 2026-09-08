@@ -1,6 +1,6 @@
 # Agentbus operations
 
-This runbook covers Agentbus 0.13.1 and protocol version 3 on macOS and Linux.
+This runbook covers Agentbus 0.14.0 and protocol version 3 on macOS and Linux.
 The daemon supervises backend process groups and records cleanup as a separate
 clean-or-uncertain value.
 
@@ -123,14 +123,10 @@ startup rather than being repaired in place. Preserve the root for diagnosis;
 do not create a replacement database at the same path unless you have first
 performed the required version-break cleanup above.
 
-## Current footprint and residual risks
+## Footprint and residual risks
 
-At the final sweep, excluding vendor, Agentbus has 15,272 production Go lines
-and 13,819 test Go lines: reductions of 40,166 and 50,875 from the
-55,438-production-line and 64,694-test-line baseline. It has 17 Go packages.
-The largest production file is `engine/adapter/codexcli/appserver_driver.go`
-at 1,032 lines, and the largest test file is
-`engine/adapter/internal/duplex/session_test.go` at 1,880 lines.
+The code footprint is measured from the checked-out tree at release review and
+is not a stable operational property. Agentbus has 17 Go packages.
 
 If the daemon dies mid-run, a provider process can remain orphaned. Recovery
 marks recovered running work unknown and never relaunches it; the reaper signals
@@ -140,8 +136,9 @@ recorded token. This is the deliberate trade-off for preventing duplicate work.
 Result and log artifacts remain until an operator removes them. Nothing reclaims
 that disk automatically.
 
-Delegate v0.10.0 pins Agentbus v0.13.1. Convo Relay still needs two line edits
-to drop a removed option field.
+Downstream pins are recorded in each consumer's own go.mod and are not restated
+here, because a version written into this runbook goes stale without warning.
+Convo Relay still needs two line edits to drop a removed option field.
 
 Admission validates only backend registration. An unusable backend binary is
 therefore discovered when a job runs, not when it is submitted.

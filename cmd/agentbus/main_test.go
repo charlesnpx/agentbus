@@ -240,7 +240,10 @@ func TestTranscriptForwardsSelectorsAndPrintsDigest(t *testing.T) {
 			{Ordinal: 7, At: since.Add(time.Second), Kind: "message", Name: "tool\nname", Text: "hello\nworld"},
 		},
 	}
-	client := &fakeProtocolClient{transcripts: map[string]agentclient.JobTranscriptResult{"job-1": transcript}}
+	client := &fakeProtocolClient{
+		records:     map[string]agentclient.JobGetResult{"job-1": detailedRecord(protocol.PublicStateRunning)},
+		transcripts: map[string]agentclient.JobTranscriptResult{"job-1": transcript},
+	}
 	a := testApp(t)
 	a.clientConnect = fakeConnector(client)
 
@@ -248,7 +251,7 @@ func TestTranscriptForwardsSelectorsAndPrintsDigest(t *testing.T) {
 		"transcript", "--job", "job-1", "--kind", "message", "--kind", "error",
 		"--since", since.Format(time.RFC3339Nano), "--since-ordinal", "6", "--last", "3", "--limit", "2",
 	})
-	if code != 0 || stderr != "" {
+	if code != 2 || stderr != "" {
 		t.Fatalf("selected transcript = (%d,%q)", code, stderr)
 	}
 	if len(client.transcriptParams) != 1 {
@@ -270,12 +273,12 @@ func TestTranscriptForwardsSelectorsAndPrintsDigest(t *testing.T) {
 	}
 
 	code, stdout, stderr = runTestCLI(t, a, []string{"transcript", "--job", "job-1"})
-	if code != 0 || stderr != "" || !strings.Contains(stdout, "counts message=1 reasoning=1 tool=1 toolResult=1 fileChange=0 warning=0 error=1") {
+	if code != 2 || stderr != "" || !strings.Contains(stdout, "counts message=1 reasoning=1 tool=1 toolResult=1 fileChange=0 warning=0 error=1") {
 		t.Fatalf("digest transcript = (%d,%q,%q)", code, stdout, stderr)
 	}
 
 	code, stdout, stderr = runTestCLI(t, a, []string{"transcript", "--job", "job-1", "--json"})
-	if code != 0 || stderr != "" {
+	if code != 2 || stderr != "" {
 		t.Fatalf("JSON transcript = (%d,%q)", code, stderr)
 	}
 	var decoded agentclient.JobTranscriptResult
@@ -470,11 +473,19 @@ func TestExitCodesUseStateFailureAndContract(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			client := &fakeProtocolClient{
+				records:     map[string]agentclient.JobGetResult{"job-1": tt.record},
+				transcripts: map[string]agentclient.JobTranscriptResult{"job-1": {State: tt.record.State}},
+				cancels:     map[string]agentclient.JobCancelResult{"job-1": {JobID: "job-1", State: tt.record.State}},
+			}
 			a := testApp(t)
-			a.clientConnect = fakeConnector(&fakeProtocolClient{records: map[string]agentclient.JobGetResult{"job-1": tt.record}})
-			code, _, _ := runTestCLI(t, a, []string{"status", "--job", "job-1", "--json"})
-			if code != tt.want {
-				t.Fatalf("status exit=%d, want %d", code, tt.want)
+			a.clientConnect = fakeConnector(client)
+			statusCode, _, _ := runTestCLI(t, a, []string{"status", "--job", "job-1", "--json"})
+			resultCode, _, _ := runTestCLI(t, a, []string{"result", "--job", "job-1", "--json"})
+			transcriptCode, _, _ := runTestCLI(t, a, []string{"transcript", "--job", "job-1", "--json"})
+			cancelCode, _, _ := runTestCLI(t, a, []string{"cancel", "--job", "job-1", "--json"})
+			if statusCode != tt.want || resultCode != tt.want || transcriptCode != tt.want || cancelCode != tt.want {
+				t.Fatalf("selected-job exits: status=%d result=%d transcript=%d cancel=%d, want %d", statusCode, resultCode, transcriptCode, cancelCode, tt.want)
 			}
 		})
 	}
