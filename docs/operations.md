@@ -136,8 +136,9 @@ recorded token. This is the deliberate trade-off for preventing duplicate work.
 Result and log artifacts remain until an operator removes them. Nothing reclaims
 that disk automatically.
 
-Delegate v0.10.0 pins Agentbus v0.13.1. Convo Relay still needs two line edits
-to drop a removed option field.
+Downstream pins are recorded in each consumer's own go.mod and are not restated
+here, because a version written into this runbook goes stale without warning.
+Convo Relay still needs two line edits to drop a removed option field.
 
 Admission validates only backend registration. An unusable backend binary is
 therefore discovered when a job runs, not when it is submitted.
