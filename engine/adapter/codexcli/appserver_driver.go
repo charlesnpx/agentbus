@@ -31,9 +31,11 @@ type appServerDriver struct {
 }
 
 type activeAppServerTurn struct {
+	mu                 sync.Mutex
 	threadID           string
 	turnID             string
-	interruptRequested atomic.Bool
+	turnStartSent      bool
+	interruptRequested bool
 }
 
 func newAppServerDriver(binary string, writePolicy WritePolicy) *appServerDriver {
@@ -62,9 +64,9 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	var threadResult any
 	var err error
 	if resumeID == "" {
-		threadResult, err = rpc.request(ctx, "thread/start", threadParams(opts, input, ""), nil)
+		threadResult, err = rpc.request(ctx, "thread/start", threadParams(opts, input, ""), nil, nil)
 	} else {
-		threadResult, err = rpc.request(ctx, "thread/resume", threadParams(opts, input, resumeID), nil)
+		threadResult, err = rpc.request(ctx, "thread/resume", threadParams(opts, input, resumeID), nil, nil)
 	}
 	if err != nil {
 		return "", err
@@ -81,7 +83,13 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 	// item/completed notification. Flush on every return after turn/start begins,
 	// including transport errors and cancellation paths that bypass completion.
 	defer observer.flushPendingToolItems()
-	turnResult, err := rpc.request(ctx, "turn/start", turnStartParams(threadID, opts, input, d.writePolicy), observer)
+	active := &activeAppServerTurn{threadID: threadID}
+	// Register before issuing turn/start. writeTurnStart keeps this turn's lock
+	// through the successful write and marks it sent before an Interrupt can
+	// inspect it, so there is no post-write, pre-registration gap.
+	d.setActive(conn, active)
+	defer d.clearActive(conn, active)
+	turnResult, err := rpc.request(ctx, "turn/start", turnStartParams(threadID, opts, input, d.writePolicy), observer, active.writeTurnStart(conn))
 	if err != nil {
 		return threadID, err
 	}
@@ -90,12 +98,19 @@ func (d *appServerDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resume
 		return threadID, errors.New("codex app-server turn/start response missing turn id")
 	}
 
-	active := &activeAppServerTurn{threadID: threadID, turnID: turnID}
-	d.setActive(conn, active)
-	defer d.clearActive(conn, active)
-
+	pendingThreadID, interruptPending := active.setTurnID(turnID)
+	// A completion observed before the turn/start response means the turn is
+	// already over, so a latched interrupt is deliberately not sent: the frame
+	// could not affect anything, and a write to an exiting provider would fail
+	// and replace this completion with an error. setTurnID still reports the
+	// request, which keeps an interrupted status classified as requested.
 	if observer.completion != nil {
 		return finishTurnCompletion(threadID, active, observer)
+	}
+	if interruptPending {
+		if err := d.sendInterrupt(conn, pendingThreadID, turnID); err != nil {
+			return threadID, err
+		}
 	}
 	for {
 		frame, err := rpc.nextFrame(ctx)
@@ -123,20 +138,68 @@ func (d *appServerDriver) Interrupt(ctx context.Context, conn *duplex.Conn) erro
 	if active == nil {
 		return nil
 	}
-	active.interruptRequested.Store(true)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
+	threadID, turnID, ready := active.requestInterrupt()
+	if !ready {
+		// Before turn/start is written there is no provider turn to cancel. Once
+		// it is written, requestInterrupt retains the intent until RunTurn has the
+		// response's turn ID and can send the native interrupt.
+		return nil
+	}
+	return d.sendInterrupt(conn, threadID, turnID)
+}
+
+func (d *appServerDriver) sendInterrupt(conn *duplex.Conn, threadID, turnID string) error {
 	return conn.WriteJSON(map[string]any{
 		"id":     d.nextRequestID(),
 		"method": "turn/interrupt",
 		"params": map[string]any{
-			"threadId": active.threadID,
-			"turnId":   active.turnID,
+			"threadId": threadID,
+			"turnId":   turnID,
 		},
 	})
+}
+
+func (t *activeAppServerTurn) requestInterrupt() (threadID, turnID string, ready bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.turnStartSent {
+		return "", "", false
+	}
+	t.interruptRequested = true
+	if t.turnID == "" {
+		return "", "", false
+	}
+	return t.threadID, t.turnID, true
+}
+
+func (t *activeAppServerTurn) writeTurnStart(conn *duplex.Conn) func(map[string]any) error {
+	return func(request map[string]any) error {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if err := conn.WriteJSON(request); err != nil {
+			return err
+		}
+		t.turnStartSent = true
+		return nil
+	}
+}
+
+func (t *activeAppServerTurn) setTurnID(turnID string) (threadID string, interruptPending bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.turnID = turnID
+	return t.threadID, t.interruptRequested
+}
+
+func (t *activeAppServerTurn) interruptWasRequested() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.interruptRequested
 }
 
 func (d *appServerDriver) binaryName() string {
@@ -198,23 +261,29 @@ func (c *appServerRPC) handshake(ctx context.Context) error {
 		"capabilities": map[string]any{
 			"experimentalApi": true,
 		},
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		return err
 	}
 	return c.conn.WriteJSON(map[string]any{"method": "initialized"})
 }
 
-func (c *appServerRPC) request(ctx context.Context, method string, params any, observer *turnObserver) (any, error) {
+func (c *appServerRPC) request(ctx context.Context, method string, params any, observer *turnObserver, writeRequest func(map[string]any) error) (any, error) {
 	id := c.driver.nextRequestID()
 	if params == nil {
 		params = map[string]any{}
 	}
-	if err := c.conn.WriteJSON(map[string]any{
+	request := map[string]any{
 		"id":     id,
 		"method": method,
 		"params": params,
-	}); err != nil {
+	}
+	if writeRequest == nil {
+		writeRequest = func(request map[string]any) error {
+			return c.conn.WriteJSON(request)
+		}
+	}
+	if err := writeRequest(request); err != nil {
 		return nil, err
 	}
 
@@ -728,7 +797,7 @@ func finishTurnCompletion(threadID string, active *activeAppServerTurn, observer
 		}
 		return threadID, fmt.Errorf("codex app-server turn failed: %s", msg)
 	case "interrupted":
-		if active != nil && active.interruptRequested.Load() {
+		if active != nil && active.interruptWasRequested() {
 			return threadID, nil
 		}
 		return threadID, fmt.Errorf("codex app-server turn interrupted before completion: %w", engine.ErrTurnInterrupted)

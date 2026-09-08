@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/engine/adapter/internal/cliadapter"
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
@@ -955,7 +956,6 @@ func TestAppServerProviderOverloadIgnoresTerminalItemInventory(t *testing.T) {
 }
 
 func TestAppServerInterruptFlushesPendingFileChange(t *testing.T) {
-	started := make(chan struct{})
 	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
 		peer := newAppServerPeer(t, proc)
 		peer.handshake()
@@ -966,7 +966,6 @@ func TestAppServerInterruptFlushesPendingFileChange(t *testing.T) {
 		peer.notify("item/started", itemParams("thread-1", "turn-1", map[string]any{
 			"id": "interrupted-change", "type": "fileChange", "name": "interrupted file change", "changes": "private interrupted change",
 		}))
-		close(started)
 		interrupt := peer.expectRequest("turn/interrupt")
 		assertParam(t, interrupt, "threadId", "thread-1")
 		assertParam(t, interrupt, "turnId", "turn-1")
@@ -978,11 +977,23 @@ func TestAppServerInterruptFlushesPendingFileChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	<-started
+	var startedEvent engine.Event
+	select {
+	case event, ok := <-events:
+		if !ok {
+			t.Fatal("events closed before started-item heartbeat")
+		}
+		startedEvent = event
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for started-item heartbeat")
+	}
+	if startedEvent.Type != engine.EventProgress {
+		t.Fatalf("first event = %#v, want started-item heartbeat", startedEvent)
+	}
 	if err := session.Interrupt(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	got := append([]engine.Event{startedEvent}, collectEventsWithTimeout(t, events, 2*time.Second)...)
 	var fileChanges []engine.Event
 	progress := 0
 	for _, event := range got {
@@ -1001,6 +1012,90 @@ func TestAppServerInterruptFlushesPendingFileChange(t *testing.T) {
 	}
 	if progress != 1 {
 		t.Fatalf("progress events = %d, want one started-item heartbeat", progress)
+	}
+}
+
+func TestAppServerInterruptLatchesSentTurnStartUntilResponse(t *testing.T) {
+	turnStartWritten := make(chan struct{})
+	allowTurnResponse := make(chan struct{})
+	responseReleased := false
+	releaseTurnResponse := func() {
+		if responseReleased {
+			return
+		}
+		close(allowTurnResponse)
+		responseReleased = true
+	}
+	defer releaseTurnResponse()
+
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		close(turnStartWritten)
+		<-allowTurnResponse
+		peer.respond(turn, turnResult("turn-1"))
+		interrupt := peer.expectRequest("turn/interrupt")
+		assertParam(t, interrupt, "threadId", "thread-1")
+		assertParam(t, interrupt, "turnId", "turn-1")
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "interrupted", ""))
+	})
+
+	backend, ok := New(Options{Binary: "fake-codex"}).(*cliadapter.Backend)
+	if !ok {
+		t.Fatal("codex backend was not a CLI adapter backend")
+	}
+	driver, ok := backend.Driver.(*appServerDriver)
+	if !ok {
+		t.Fatal("codex backend did not use app-server driver")
+	}
+	session, err := backend.Start(context.Background(), engine.SessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "hello"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-turnStartWritten
+
+	var active *activeAppServerTurn
+	var interrupt func(context.Context) error
+	driver.mu.Lock()
+	for conn, candidate := range driver.active {
+		selectedConn := conn
+		active = candidate
+		interrupt = func(ctx context.Context) error {
+			return driver.Interrupt(ctx, selectedConn)
+		}
+		break
+	}
+	driver.mu.Unlock()
+	if active == nil || interrupt == nil {
+		t.Fatal("turn/start was written without an active app-server turn")
+	}
+
+	active.mu.Lock()
+	turnStartSent := active.turnStartSent
+	active.mu.Unlock()
+	if !turnStartSent {
+		t.Fatal("active turn did not record successful turn/start write")
+	}
+	if err := interrupt(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !active.interruptWasRequested() {
+		t.Fatal("interrupt was not latched before turn/start response")
+	}
+
+	releaseTurnResponse()
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	for _, event := range got {
+		if event.Type == engine.EventTerminalError {
+			t.Fatalf("latched interruption was terminal: %#v", got)
+		}
 	}
 }
 
