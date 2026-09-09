@@ -305,6 +305,91 @@ func TestTurnFinalObservationAcrossTerminalShapes(t *testing.T) {
 	}
 }
 
+func TestTurnTeardownBoundsRetirementAndPreservesDriverOutcome(t *testing.T) {
+	const resultResumeID = "resume-result"
+	const errorResumeID = "resume-error"
+	driverErr := errors.New("could not select Cursor model: Invalid model value: missing")
+
+	tests := []struct {
+		name              string
+		driver            Driver
+		wantResumeID      string
+		wantDriverErr     error
+		finishOnInterrupt bool
+	}{
+		{
+			name:         "result survives a backend that never retires",
+			driver:       finalObservationTestDriver{resumeID: resultResumeID},
+			wantResumeID: resultResumeID,
+		},
+		{
+			name: "driver error survives forced retirement",
+			driver: terminalErrorResumeDriver{
+				FixtureDriver: FixtureDriver{Spec: command.ExecSpec{Argv: []string{"fixture"}}},
+				resumeID:      errorResumeID,
+				err:           driverErr,
+			},
+			wantResumeID:      errorResumeID,
+			wantDriverErr:     driverErr,
+			finishOnInterrupt: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			proc := newFakeCommand()
+			proc.onInterrupt = func() error {
+				_ = proc.stdoutW.Close()
+				if test.finishOnInterrupt {
+					proc.finish(command.ExitObservation{Exited: true, Signal: "interrupt"}, errors.New("forced interrupt wait error"))
+				}
+				return nil
+			}
+			runner := &fakeRunner{running: proc}
+			session := newSessionWithDriver(t, runner, test.driver, 0, "")
+
+			events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "terminal"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := collectEventsWithTimeout(t, events, 12*time.Second)
+			// Release a deliberately non-retiring fake after the turn has proved
+			// that it no longer waits for process retirement.
+			proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+			_ = proc.stderrW.Close()
+
+			if gotID := session.ID(); gotID != test.wantResumeID {
+				t.Fatalf("session ID = %q, want %q", gotID, test.wantResumeID)
+			}
+			if got := proc.interrupts.Load(); got != 1 {
+				t.Fatalf("process interrupt count = %d, want 1", got)
+			}
+
+			var terminalErrors []engine.Event
+			for _, event := range got {
+				if event.Type == engine.EventTerminalError {
+					terminalErrors = append(terminalErrors, event)
+				}
+			}
+			if test.wantDriverErr == nil {
+				if len(terminalErrors) != 0 {
+					t.Fatalf("terminal errors = %#v, want none; events = %#v", terminalErrors, got)
+				}
+			} else if len(terminalErrors) != 1 || terminalErrors[0].Text != test.wantDriverErr.Error() {
+				t.Fatalf("terminal errors = %#v, want only %q; events = %#v", terminalErrors, test.wantDriverErr, got)
+			}
+
+			if len(got) == 0 || got[len(got)-1].Type != engine.EventTurnFinal || got[len(got)-1].TurnFinal == nil {
+				t.Fatalf("events = %#v, want final TurnFinal event", got)
+			}
+			final := got[len(got)-1].TurnFinal
+			if final.ReturnCodeKnown || final.ExecutionFailed || final.CleanupFailed {
+				t.Fatalf("forced teardown TurnFinal = %#v, want unknown non-failure observation", *final)
+			}
+		})
+	}
+}
+
 func TestTurnFinalKeepsCompletedResumeIDWhenFinalSendBackpressures(t *testing.T) {
 	const (
 		firstResumeID  = "resume-first"
@@ -409,6 +494,76 @@ func TestTurnFinalKeepsSettlementDispositionWhenDeadlineExpiresDuringTeardown(t 
 	}
 	if final := got[0].TurnFinal; final.TimedOut || final.Canceled {
 		t.Fatalf("TurnFinal after post-settlement deadline = %#v, want TimedOut=false and Canceled=false", *final)
+	}
+}
+
+func TestTurnKeepsDriverErrorWhenDeadlineExpiresDuringRetirement(t *testing.T) {
+	baseCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	ctx := &errNotifyingContext{
+		Context:    baseCtx,
+		errChecked: make(chan struct{}),
+	}
+
+	proc := newFakeCommand()
+	proc.waitIgnoresContext = true
+	observed := newFakeObservedCommand(proc, command.FinalObservation{
+		Exit: command.ExitObservation{Exited: true, Code: 0},
+	}, nil)
+	finalRelease := make(chan struct{})
+	observed.finalRelease = finalRelease
+	var releaseOnce sync.Once
+	releaseFinalObservation := func() {
+		releaseOnce.Do(func() { close(finalRelease) })
+	}
+	t.Cleanup(func() {
+		releaseFinalObservation()
+		_ = proc.stdoutW.Close()
+		_ = proc.stderrW.Close()
+		proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	})
+
+	driverErr := errors.New("driver failed before deadline")
+	runner := &fakeRunner{running: observed}
+	session := newSessionWithDriver(t, runner, finalObservationTestDriver{
+		resumeID: "resume-driver-error",
+		err:      driverErr,
+	}, 0, "")
+
+	events, err := session.Turn(ctx, engine.TurnInput{Prompt: "turn"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSignal(t, ctx.errChecked, "settlement disposition capture")
+	if err := baseCtx.Err(); err != nil {
+		t.Fatalf("context expired before settlement disposition was captured: %v", err)
+	}
+	<-baseCtx.Done()
+
+	// Make retirement begin only after the deadline, then hold its final
+	// observation open so retirement is definitely incomplete while the
+	// deadline is already expired.
+	proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+	waitForSignal(t, observed.finalCalled, "retirement final observation")
+	_ = proc.stdoutW.Close()
+	_ = proc.stderrW.Close()
+	releaseFinalObservation()
+
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	var terminalErrors []engine.Event
+	for _, event := range got {
+		if event.Type == engine.EventTerminalError {
+			terminalErrors = append(terminalErrors, event)
+		}
+	}
+	if len(terminalErrors) != 1 || terminalErrors[0].Text != driverErr.Error() {
+		t.Fatalf("terminal errors = %#v, want only %q; events = %#v", terminalErrors, driverErr, got)
+	}
+	if len(got) == 0 || got[len(got)-1].Type != engine.EventTurnFinal || got[len(got)-1].TurnFinal == nil {
+		t.Fatalf("events = %#v, want final TurnFinal event", got)
+	}
+	if final := got[len(got)-1].TurnFinal; final.TimedOut || final.Canceled {
+		t.Fatalf("TurnFinal = %#v, want the captured non-timeout disposition", *final)
 	}
 }
 
@@ -1776,23 +1931,27 @@ type fakeCommand struct {
 	stdinW  *trackedPipeWriter
 	stdoutR *io.PipeReader
 	stdoutW *io.PipeWriter
-	stderrR *io.PipeReader
-	stderrW *io.PipeWriter
+	stderrR io.ReadCloser
+	stderrW io.WriteCloser
 
-	waitCh         chan struct{}
-	finishOnce     sync.Once
-	exit           command.ExitObservation
-	waitErr        error
-	onInterrupt    func() error
-	onInterruptCtx func(context.Context) error
-	interrupts     atomic.Int32
-	stdinClosed    atomic.Bool
+	waitCh             chan struct{}
+	finishOnce         sync.Once
+	exit               command.ExitObservation
+	waitErr            error
+	waitIgnoresContext bool
+	onInterrupt        func() error
+	onInterruptCtx     func(context.Context) error
+	interrupts         atomic.Int32
+	stdinClosed        atomic.Bool
 }
 
 func newFakeCommand() *fakeCommand {
 	stdinR, stdinPipeW := io.Pipe()
 	stdoutR, stdoutW := io.Pipe()
-	stderrR, stderrW := io.Pipe()
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		panic(err)
+	}
 	cmd := &fakeCommand{
 		stdinR:  stdinR,
 		stdoutR: stdoutR,
@@ -1818,6 +1977,10 @@ func (c *fakeCommand) Stderr() io.ReadCloser {
 }
 
 func (c *fakeCommand) Wait(ctx context.Context) (command.ExitObservation, error) {
+	if c.waitIgnoresContext {
+		<-c.waitCh
+		return c.exit, c.waitErr
+	}
 	select {
 	case <-c.waitCh:
 		return c.exit, c.waitErr
@@ -1857,10 +2020,11 @@ func (w *trackedPipeWriter) Close() error {
 
 type fakeObservedCommand struct {
 	*fakeCommand
-	final       command.FinalObservation
-	finalErr    error
-	finalCalled chan struct{}
-	finalOnce   sync.Once
+	final        command.FinalObservation
+	finalErr     error
+	finalCalled  chan struct{}
+	finalRelease <-chan struct{}
+	finalOnce    sync.Once
 }
 
 func newFakeObservedCommand(cmd *fakeCommand, final command.FinalObservation, finalErr error) *fakeObservedCommand {
@@ -1876,5 +2040,8 @@ func (c *fakeObservedCommand) FinalObservation(context.Context) (command.FinalOb
 	c.finalOnce.Do(func() {
 		close(c.finalCalled)
 	})
+	if c.finalRelease != nil {
+		<-c.finalRelease
+	}
 	return c.final, c.finalErr
 }

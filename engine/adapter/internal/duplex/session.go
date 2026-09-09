@@ -21,7 +21,12 @@ const (
 	// DefaultInterruptGrace mirrors the engine cancellation grace without
 	// coupling this adapter package to store internals.
 	DefaultInterruptGrace = 10 * time.Second
-	eventBufferSize       = 16
+	// Five seconds gives a healthy backend room to retire while bounding teardown
+	// for a backend that ignores stdin closure, including one final interrupt-
+	// driven exit attempt.
+	turnRetirementGrace          = 5 * time.Second
+	turnRetirementInterruptGrace = 5 * time.Second
+	eventBufferSize              = 16
 )
 
 var (
@@ -246,7 +251,8 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 		stdoutWriter = stdoutLog
 	}
 	retirement := startRetirement(turnCtx, running)
-	conn := newConn(running.Stdin(), running.Stdout(), stdoutWriter, running, retirement)
+	stdoutPipe := running.Stdout()
+	conn := newConn(running.Stdin(), stdoutPipe, stdoutWriter, running, retirement)
 	active := &activeTurn{running: running, conn: conn, retirement: retirement}
 	s.active = active
 	s.mu.Unlock()
@@ -263,7 +269,7 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	}
 
 	events := make(chan engine.Event, eventBufferSize)
-	go s.runTurn(driverCtx, driverCancel, turnCtx, turnCancel, input, resumeID, active, running.Stderr(), stderrWriter, &stderr, stdoutLog, stderrLog, events)
+	go s.runTurn(driverCtx, driverCancel, turnCtx, turnCancel, input, resumeID, active, stdoutPipe, running.Stderr(), stderrWriter, &stderr, stdoutLog, stderrLog, events)
 	return events, nil
 }
 
@@ -304,7 +310,7 @@ func normalizeEnvironment(goos string, layers ...[]string) []string {
 	return env
 }
 
-func (s *Session) runTurn(driverCtx context.Context, driverCancel context.CancelFunc, turnCtx context.Context, turnCancel context.CancelFunc, input engine.TurnInput, resumeID string, active *activeTurn, stderrPipe io.ReadCloser, stderrWriter io.Writer, stderr *bytes.Buffer, stdoutLog *engine.CappedLogWriter, stderrLog *engine.CappedLogWriter, events chan<- engine.Event) {
+func (s *Session) runTurn(driverCtx context.Context, driverCancel context.CancelFunc, turnCtx context.Context, turnCancel context.CancelFunc, input engine.TurnInput, resumeID string, active *activeTurn, stdoutPipe io.ReadCloser, stderrPipe io.ReadCloser, stderrWriter io.Writer, stderr *bytes.Buffer, stdoutLog *engine.CappedLogWriter, stderrLog *engine.CappedLogWriter, events chan<- engine.Event) {
 	defer close(events)
 	defer turnCancel()
 	defer driverCancel()
@@ -325,6 +331,7 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 
 	result, earlyExit := waitForTurnResult(driverDone, active.retirement)
 	result, earlyExit = classifyTurnResult(result, earlyExit)
+	dispositionAtResult := captureTurnDisposition(turnCtx)
 	if errors.Is(result.err, ErrFrameTooLarge) && !errors.Is(result.err, engine.ErrTransportFrameTooLarge) {
 		result.err = fmt.Errorf("%w: %w", engine.ErrTransportFrameTooLarge, result.err)
 	}
@@ -334,8 +341,21 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 		active.conn.drainReader()
 		close(drainDone)
 	}()
-	observation, _ := active.retirement.wait(context.Background())
-	stderrCopyErr := <-stderrDone
+	observation, normalRetirement := waitForTurnRetirement(active)
+	var stderrCopyErr error
+	if normalRetirement {
+		stderrCopyErr = <-stderrDone
+	} else {
+		// A forced give-up has no trustworthy backend output boundary. Close the
+		// stderr reader so the copier can finish. Preserve copier failures other
+		// than the one this deliberate close causes. An os/exec pipe reports
+		// io.ErrClosedPipe rather than os.ErrClosed, so both are suppressed.
+		_ = stderrPipe.Close()
+		stderrCopyErr = <-stderrDone
+		if errors.Is(stderrCopyErr, io.ErrClosedPipe) || errors.Is(stderrCopyErr, os.ErrClosed) {
+			stderrCopyErr = nil
+		}
+	}
 
 	if result.resumeID != "" {
 		s.setID(result.resumeID)
@@ -344,10 +364,15 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	// A later turn may install a new resume ID, and teardown itself can outlive a
 	// caller's deadline.
 	completedSessionID := s.ID()
-	disposition := captureTurnDisposition(turnCtx)
-	if drainDone == nil {
-		active.conn.drainReader()
+	disposition := dispositionAtResult
+	if normalRetirement {
+		if drainDone == nil {
+			active.conn.drainReader()
+		} else {
+			<-drainDone
+		}
 	} else {
+		_ = stdoutPipe.Close()
 		<-drainDone
 	}
 	frameDrops := active.conn.FrameDrops()
@@ -381,6 +406,43 @@ func waitForTurnResult(driverDone <-chan turnResult, retirement *retirement) (tu
 		}
 		result := <-driverDone
 		return result, true
+	}
+}
+
+// waitForTurnRetirement preserves the old prompt-retirement observation. Once
+// that grace is exhausted, the process interrupt is best-effort and any
+// observation it produces is intentionally discarded: it describes teardown,
+// not the already-settled semantic turn. A zero observation keeps execution
+// failure and return-code fields unknown instead of manufacturing a failure.
+func waitForTurnRetirement(active *activeTurn) (command.FinalObservation, bool) {
+	if observation, ok := waitForRetirement(active.retirement, turnRetirementGrace); ok {
+		return observation, true
+	}
+
+	interruptCtx, cancel := context.WithTimeout(context.Background(), turnRetirementInterruptGrace)
+	go func() {
+		_ = active.conn.Interrupt(interruptCtx)
+	}()
+
+	_, _ = waitForRetirement(active.retirement, turnRetirementInterruptGrace)
+	cancel()
+	return command.FinalObservation{}, false
+}
+
+func waitForRetirement(retirement *retirement, grace time.Duration) (command.FinalObservation, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	observation, err := retirement.wait(ctx)
+	if err == nil {
+		return observation, true
+	}
+	// If retirement won the race with the timeout, preserve the normal path's
+	// observation rather than needlessly interrupting a process that is gone.
+	select {
+	case <-retirement.done:
+		return retirement.observation, true
+	default:
+		return command.FinalObservation{}, false
 	}
 }
 
