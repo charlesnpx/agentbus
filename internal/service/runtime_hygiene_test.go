@@ -206,6 +206,62 @@ func TestManagedCodexHomeIsRemovedAfterCleanCompletion(t *testing.T) {
 	if _, err := os.Stat(home); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("clean terminal managed home stat = %v, want removed", err)
 	}
+	resumeSpec := protocol.TaskSpec{Backend: "codex", ResumeJobID: record.JobID}
+	const wantResumeReason = "completed jobs are not resumable unless submitted with session retention; submit a new job"
+	if err := validateResumeTarget(resumeSpec, got); err == nil || err.Error() != wantResumeReason {
+		t.Fatalf("resume completed job error = %v, want %q", err, wantResumeReason)
+	}
+}
+
+func TestManagedCodexHomeRetainedForSessionContinuation(t *testing.T) {
+	var home string
+	backend := &executionFakeBackend{name: "codex"}
+	backend.start = func(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
+		home = opts.EnvOverlay["CODEX_HOME"]
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				input.OnProcessStart(engine.ProcessRef{PID: 4102, PGID: 4102, StartTime: "retained-process-token"}, 0)
+				return executionEvents(
+					engine.Event{Type: engine.EventResultMessage, Text: "retained result"},
+					engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{BackendSessionID: "retained-thread"}},
+				), nil
+			},
+		}, nil
+	}
+	server := newTestServer(t, t.TempDir(), Config{
+		Backends:      []engine.Backend{backend},
+		CodexAuthHome: filepath.Join(t.TempDir(), "missing-auth-home"),
+	})
+	params := submissionParams("retained-completion", "source", "codex", t.TempDir(), "runtime hygiene test")
+	params.TaskSpec.RetainSession = true
+	source := submitResultForTest(t, submitForTest(t, server, params))
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(source.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runExecution(t, server, record)
+
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateCompleted || got.Cleanup != protocol.CleanupClean || !got.RetainSession || got.BackendSessionID != "retained-thread" {
+		t.Fatalf("terminal record = %+v, want completed retained session", got)
+	}
+	if _, err := os.Stat(home); err != nil {
+		t.Fatalf("retained managed home stat = %v, want home to exist", err)
+	}
+
+	resumeParams := submissionParams("retained-resume", "continue", "codex", t.TempDir(), "continue the conversation")
+	resumeParams.TaskSpec.ResumeJobID = record.JobID
+	resumed := submitResultForTest(t, submitForTest(t, server, resumeParams))
+	if resumed.Deduplicated || resumed.State != protocol.PublicStateQueued || resumed.JobID == record.JobID {
+		t.Fatalf("retained resume result = %+v, want a new queued job", resumed)
+	}
 }
 
 func TestManagedCodexHomeRetainedWhenCleanupUncertainAndResultSurvives(t *testing.T) {
@@ -268,7 +324,7 @@ func TestManagedCodexHomeIdentityMismatchIsRetained(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cleanup, _ := finalizeManagedCodexHome(home, protocol.PublicStateCompleted, protocol.CleanupClean, nil)
+	cleanup, _ := finalizeManagedCodexHome(home, jobstore.Record{State: protocol.PublicStateCompleted}, protocol.CleanupClean, nil)
 	if cleanup != protocol.CleanupUncertain {
 		t.Fatalf("cleanup = %q, want %q", cleanup, protocol.CleanupUncertain)
 	}

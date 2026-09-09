@@ -159,12 +159,16 @@ type TaskSpec struct {
 	// ResumeJobID names the prior job whose recorded backend session should be
 	// resumed for this new job. It is part of the immutable task specification
 	// and therefore participates in identified-replay hashing.
-	ResumeJobID  string             `json:"resumeJobId,omitempty"`
-	Model        *string            `json:"model,omitempty"`
-	Effort       *string            `json:"effort,omitempty"`
-	TimeoutMS    *int64             `json:"timeoutMs,omitempty"`
-	OutputSchema json.RawMessage    `json:"outputSchema,omitempty"`
-	Tags         *map[string]string `json:"tags,omitempty"`
+	ResumeJobID string `json:"resumeJobId,omitempty"`
+	// RetainSession declares that the submitter intends to continue this
+	// conversation after it completes, so the backend session home must not be
+	// cleaned up.
+	RetainSession bool               `json:"retainSession,omitempty"`
+	Model         *string            `json:"model,omitempty"`
+	Effort        *string            `json:"effort,omitempty"`
+	TimeoutMS     *int64             `json:"timeoutMs,omitempty"`
+	OutputSchema  json.RawMessage    `json:"outputSchema,omitempty"`
+	Tags          *map[string]string `json:"tags,omitempty"`
 }
 
 // JobSubmitParams is the parameter object for job.submit.

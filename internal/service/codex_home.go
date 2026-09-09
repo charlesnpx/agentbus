@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/charlesnpx/agentbus/engine"
+	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 	"golang.org/x/sys/unix"
 )
@@ -397,19 +398,23 @@ func linkManagedCodexHomeFile(sourceHome string, destination *managedCodexHome, 
 	return nil
 }
 
-func codexHomeCleanupEligible(state protocol.PublicState) bool {
-	return state == protocol.PublicStateCompleted
+func sessionHomeRetained(record jobstore.Record) bool {
+	return record.State != protocol.PublicStateCompleted || record.RetainSession
+}
+
+func codexHomeCleanupEligible(record jobstore.Record) bool {
+	return !sessionHomeRetained(record)
 }
 
 // finalizeManagedCodexHome executes cleanup before committing the terminal
 // record, so a failed identity-checked removal is reflected on the independent
 // cleanup axis without rewriting a known result or public state.
-func finalizeManagedCodexHome(home *managedCodexHome, state protocol.PublicState, cleanup protocol.Cleanup, diagnostics []string) (protocol.Cleanup, []string) {
+func finalizeManagedCodexHome(home *managedCodexHome, record jobstore.Record, cleanup protocol.Cleanup, diagnostics []string) (protocol.Cleanup, []string) {
 	if home == nil {
 		return cleanup, diagnostics
 	}
 	defer home.close()
-	if cleanup != protocol.CleanupClean || !codexHomeCleanupEligible(state) {
+	if cleanup != protocol.CleanupClean || !codexHomeCleanupEligible(record) {
 		return cleanup, diagnostics
 	}
 	if err := removeManagedCodexHome(home); err != nil {

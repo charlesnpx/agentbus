@@ -1108,8 +1108,9 @@ func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstor
 	if info.TextElided {
 		resultText = ""
 	}
-	// Completed work is final even when cleanup retains its home, so completed
-	// records deliberately omit the backend session ID.
+	// Completed work remains terminal even when cleanup retains its home. The
+	// store keeps the session ID for retained completed records so they can be
+	// resumed as a new job, and clears it for other completed records.
 	s.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
 		State:        protocol.PublicStateCompleted,
 		Cleanup:      cleanup,
@@ -1159,7 +1160,9 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 			home.close()
 			return
 		} else {
-			terminal.Cleanup, terminal.Diagnostics = finalizeManagedCodexHome(home, terminal.State, terminal.Cleanup, terminal.Diagnostics)
+			cleanupRecord := current
+			cleanupRecord.State = terminal.State
+			terminal.Cleanup, terminal.Diagnostics = finalizeManagedCodexHome(home, cleanupRecord, terminal.Cleanup, terminal.Diagnostics)
 		}
 	}
 	_, err := store.MarkTerminal(jobID, terminal)
