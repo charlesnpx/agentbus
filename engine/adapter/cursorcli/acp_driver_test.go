@@ -284,6 +284,23 @@ func TestACPNegativeTerminalProtocolBranches(t *testing.T) {
 			terminalText: "could not verify Cursor mode: set mode rejected",
 		},
 		{
+			name: "error data message is included",
+			run: func(t *testing.T, peer *acpPeer) {
+				setMode := peer.expectRequest("session/set_mode")
+				peer.write(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      setMode["id"],
+					"error": map[string]any{
+						"code":    -32602,
+						"message": "Invalid params",
+						"data":    map[string]any{"message": "Invalid model value: definitely-not-a-model"},
+					},
+				})
+				peer.expectStdinClose()
+			},
+			terminalText: "could not verify Cursor mode: Invalid params: Invalid model value: definitely-not-a-model",
+		},
+		{
 			name: "unsupported reverse request is method not found",
 			run: func(t *testing.T, peer *acpPeer) {
 				setMode := peer.expectRequest("session/set_mode")

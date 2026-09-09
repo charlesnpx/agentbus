@@ -620,6 +620,13 @@ func responseResult(object map[string]any) (any, error) {
 			if value := firstString(errObject, "message"); value != "" {
 				message = value
 			}
+			// Cursor puts the category in message ("Invalid params") and the
+			// actionable sentence in data.message. Keep both.
+			if data, ok := firstMap(errObject, "data"); ok {
+				if value := firstString(data, "message"); value != "" {
+					message += ": " + value
+				}
+			}
 		} else if value := strings.TrimSpace(stringValue(rawError)); value != "" {
 			message = value
 		}
