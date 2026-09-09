@@ -5,6 +5,9 @@ import "github.com/charlesnpx/agentbus/internal/protocol"
 type HelloParams = protocol.HelloParams
 type BackendInfo = protocol.BackendInfo
 type HelloResult = protocol.HelloResult
+
+// TaskSpec is the client-facing alias of protocol.TaskSpec, including its
+// optional RetainSession declaration.
 type TaskSpec = protocol.TaskSpec
 type JobSubmitParams = protocol.JobSubmitParams
 type JobSubmitResult = protocol.JobSubmitResult

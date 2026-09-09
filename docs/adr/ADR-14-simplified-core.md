@@ -71,6 +71,7 @@ job.submit:
         "cwd": "string",
         "write": true,
         "resumeJobId": "job_previous",
+        "retainSession": true,
         "model": "string",
         "effort": "string",
         "prompt": "string",
@@ -81,9 +82,9 @@ job.submit:
     }
 
 backend, cwd, write, and prompt are required TaskSpec fields. resumeJobId,
-model, effort, outputSchema, tags, and timeoutMs are optional. outputSchema, if
-present, is exactly one inline Draft 2020-12 JSON Schema value, either an
-object or a boolean. It is not a name, registry key, or caller-supplied
+retainSession, model, effort, outputSchema, tags, and timeoutMs are optional.
+outputSchema, if present, is exactly one inline Draft 2020-12 JSON Schema value,
+either an object or a boolean. It is not a name, registry key, or caller-supplied
 correction program.
 
 workspaceKey is an opaque, submitter-chosen namespace. Agentbus cannot derive
@@ -110,13 +111,15 @@ current state, including a terminal state, with deduplicated true.
 
 resumeJobId names the prior job rather than exposing a backend session ID. On a
 new admission, Agentbus resolves that job's recorded backend session internally
-and invokes the backend's Resume operation. The source must be a terminal,
-non-completed job using the same backend and must have a recorded session ID.
-An absent ID is an invalid task specification, never permission to start a new
-thread. Completed jobs are deliberately excluded because completion is final
-service semantics. Normal successful Codex cleanup also removes the private
-home; a home retained after uncertain cleanup is a recovery artifact, not
-permission to reopen completed work.
+and invokes the backend's Resume operation. The source must be terminal, use the
+same backend, and have a recorded session ID. An absent ID is an invalid task
+specification, never permission to start a new thread. A completed source is
+eligible only when its original submission included retainSession=true; other
+terminal states retain their existing resume rules. Retention leaves the
+managed Codex session home in place and Agentbus never cleans it automatically;
+an operator may remove
+<state-root>/workspaces/<workspace-hash>/codex/<job-id> after no further resume
+is needed.
 
 Resuming always creates a new job with a new id, record, transcript sidecar,
 result, and fresh deadline. It replays the prior thread as history; it neither
@@ -340,7 +343,8 @@ the only multi-job list request.
 
 The complete CLI surface is version, serve, status, transcript, result, and cancel. There
 is no submit or resume command: Delegate makes the typed job.submit request after task and
-identity preparation. The typed TaskSpec exposes resumeJobId for that path.
+identity preparation. The typed TaskSpec exposes resumeJobId and retainSession
+for that path.
 
 status and result MUST project the same job.get response differently for a
 selected job. Their JSON modes write the byte-identical JobRecord, including
@@ -504,8 +508,8 @@ a conflict before backend or cwd validation.
 The TaskSpec hash is SHA-256 over the UTF-8 bytes of the RFC 8785 JSON
 Canonicalization Scheme (JCS) representation of the submitted TaskSpec. Its
 input contains exactly the required fields backend, cwd, write, and prompt, plus
-each supplied optional field among resumeJobId, model, effort, outputSchema,
-tags, and timeoutMs. It contains no derived value, default, workspaceKey,
+each supplied optional field among resumeJobId, retainSession, model, effort,
+outputSchema, tags, and timeoutMs. It contains no derived value, default, workspaceKey,
 requestId, or filesystem observation. cwd is the submitted string bytes; it is
 not resolved, statted, or path-canonicalized.
 

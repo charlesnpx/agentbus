@@ -104,6 +104,7 @@ specification is rejected.
     "write": true,
     "prompt": "string",
     "resumeJobId": "job_previous",
+    "retainSession": true,
     "model": "string",
     "effort": "string",
     "outputSchema": {},
@@ -113,23 +114,26 @@ specification is rejected.
 }
 ~~~
 
-backend, cwd, write, and prompt are required task fields. resumeJobId, model,
-effort, outputSchema, tags, and timeoutMs are optional. outputSchema is one
-inline Draft 2020-12 JSON Schema value: an object or a boolean. timeoutMs is a
-non-negative integer no greater than four hours; zero means no deadline.
+backend, cwd, write, and prompt are required task fields. resumeJobId,
+retainSession, model, effort, outputSchema, tags, and timeoutMs are optional.
+outputSchema is one inline Draft 2020-12 JSON Schema value: an object or a
+boolean. timeoutMs is a non-negative integer no greater than four hours; zero
+means no deadline.
 
 workspaceKey is an opaque, submitter-chosen namespace. Agentbus cannot derive
 another tool's workspaceKey, even when that tool submits work for the same
 directory.
 
 resumeJobId names a prior job, never a backend thread ID. For a new submission,
-the target must be a terminal non-completed job for the same backend and must
-have recorded a backend session ID at turn retirement. A target without that ID
-returns `invalid_task_spec` with its jobId; Agentbus never falls back to a fresh
-thread. Completed jobs are not resumable because completion is final. Normal successful
-Codex cleanup also removes the private CODEX_HOME, but a home retained after
-uncertain cleanup is a recovery artifact rather than permission to reopen
-completed work.
+the target must be terminal, use the same backend, and have a recorded backend
+session ID at turn retirement. A target without that ID returns
+`invalid_task_spec` with its jobId; Agentbus never falls back to a fresh thread.
+A completed target is resumable only when its original submission included
+`retainSession: true`; other terminal states retain their existing resume
+rules. With retention, the managed Codex session home remains in place and is
+never cleaned automatically. An operator may remove
+`<state-root>/workspaces/<workspace-hash>/codex/<job-id>` after no further
+resume is needed.
 
 A resume creates a new job with a new id, record, transcript sidecar, result,
 and fresh deadline. It replays the prior backend thread as history; it does not

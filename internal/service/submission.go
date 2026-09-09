@@ -94,14 +94,15 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 			return jobstore.Record{}, err
 		}
 		return jobstore.Record{
-			JobID:        id,
-			WorkspaceKey: input.key.WorkspaceKey,
-			RequestID:    input.key.RequestID,
-			Backend:      spec.Backend,
-			Model:        taskSpecOptionalString(spec.Model),
-			CWD:          canonicalCWD,
-			Write:        spec.Write,
-			Effort:       taskSpecOptionalString(spec.Effort),
+			JobID:         id,
+			WorkspaceKey:  input.key.WorkspaceKey,
+			RequestID:     input.key.RequestID,
+			Backend:       spec.Backend,
+			Model:         taskSpecOptionalString(spec.Model),
+			CWD:           canonicalCWD,
+			Write:         spec.Write,
+			Effort:        taskSpecOptionalString(spec.Effort),
+			RetainSession: spec.RetainSession,
 		}, nil
 	})
 	if err != nil {
@@ -181,7 +182,7 @@ func parseJobSubmitInput(raw json.RawMessage) (jobSubmitInput, error) {
 	}
 	for name := range input.taskSpec {
 		switch name {
-		case "backend", "cwd", "write", "prompt", "resumeJobId", "model", "effort", "outputSchema", "tags", "timeoutMs":
+		case "backend", "cwd", "write", "prompt", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs":
 		default:
 			return jobSubmitInput{}, fmt.Errorf("json: unknown field %q", name)
 		}
@@ -205,7 +206,7 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 			return fmt.Errorf("taskSpec missing required field %s", required)
 		}
 	}
-	for _, optional := range []string{"resumeJobId", "model", "effort", "outputSchema", "tags", "timeoutMs"} {
+	for _, optional := range []string{"resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs"} {
 		value, present := raw[optional]
 		if present && string(value) == "null" {
 			return fmt.Errorf("taskSpec.%s cannot be null", optional)
@@ -251,11 +252,9 @@ func (s *Server) resumeTargetFromLookup(spec protocol.TaskSpec, lookup jobstore.
 	return target, nil
 }
 
-// validateResumeTarget limits resume to a retired non-completed job. A live
-// session may still be running, while a completed job is a final service
-// result; a home retained after uncertain cleanup is a recovery artifact, not
-// permission to reopen completed work. Failed, canceled, and unknown terminal
-// jobs are eligible when their retired turn recorded a backend session ID.
+// validateResumeTarget limits resume to a retired job whose backend session
+// home was retained. Failed, canceled, and unknown terminal jobs retain their
+// homes as before; a completed job must have declared session retention.
 func validateResumeTarget(spec protocol.TaskSpec, target jobstore.Record) error {
 	if target.JobID != spec.ResumeJobID {
 		return errors.New("resume lookup returned a different job")
@@ -263,8 +262,8 @@ func validateResumeTarget(spec protocol.TaskSpec, target jobstore.Record) error 
 	if target.Backend != spec.Backend {
 		return fmt.Errorf("resume target backend %q does not match taskSpec.backend %q", target.Backend, spec.Backend)
 	}
-	if target.State == protocol.PublicStateCompleted {
-		return errors.New("completed jobs are not resumable")
+	if !sessionHomeRetained(target) {
+		return errors.New("completed jobs are not resumable unless submitted with session retention; submit a new job")
 	}
 	if !target.State.IsTerminal() {
 		return fmt.Errorf("resume target is %s rather than terminal", target.State)

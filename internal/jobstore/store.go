@@ -122,6 +122,7 @@ type Record struct {
 	// observation. An omitted value means the job never produced a resumable
 	// backend session; it is not an unknown-session marker.
 	BackendSessionID string                  `json:"backendSessionId,omitempty"`
+	RetainSession    bool                    `json:"retainSession,omitempty"`
 	Model            string                  `json:"model,omitempty"`
 	ModelReported    string                  `json:"modelReported,omitempty"`
 	CWD              string                  `json:"cwd,omitempty"`
@@ -148,9 +149,10 @@ type Record struct {
 }
 
 // TerminalUpdate supplies the durable data for a first terminal transition.
-// State must be completed, failed, canceled, or unknown. Completed records
-// always clear BackendSessionID; for other terminal states, an empty ID retains
-// one already recorded by a retired turn.
+// State must be completed, failed, canceled, or unknown. A completed record
+// without session retention clears BackendSessionID; for retained completed
+// records and other terminal states, an empty ID retains one already recorded
+// by a retired turn.
 type TerminalUpdate struct {
 	State            protocol.PublicState
 	Cleanup          protocol.Cleanup
@@ -725,7 +727,7 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 		next.State = terminal.State
 		next.Starting = false
 		next.Cleanup = terminal.Cleanup
-		if terminal.State == protocol.PublicStateCompleted {
+		if terminal.State == protocol.PublicStateCompleted && !next.RetainSession {
 			next.BackendSessionID = ""
 		} else if terminal.BackendSessionID != "" {
 			next.BackendSessionID = terminal.BackendSessionID

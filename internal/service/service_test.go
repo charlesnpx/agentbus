@@ -475,6 +475,18 @@ func TestJobSubmitReplaySurvivesDeletedWorkspace(t *testing.T) {
 	}
 }
 
+func TestJobSubmitOmittedSessionRetentionPreservesReplayHash(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "codex"}}})
+	workspaceKey, requestID, cwd := "workspace-omitted-retention", "request-omitted-retention", t.TempDir()
+	legacy := json.RawMessage(fmt.Sprintf(`{"workspaceKey":%q,"requestId":%q,"taskSpec":{"backend":"codex","cwd":%q,"prompt":"same task","write":false}}`, workspaceKey, requestID, cwd))
+	first := submitResultForTest(t, server.handleJobSubmit(legacy))
+
+	replay := submitResultForTest(t, submitForTest(t, server, submissionParams(workspaceKey, requestID, "codex", cwd, "same task")))
+	if !replay.Deduplicated || replay.JobID != first.JobID {
+		t.Fatalf("omitted-retention replay = %+v, want deduplication of %q", replay, first.JobID)
+	}
+}
+
 func TestJobSubmitReplaySurvivesWorkspaceSymlinkReplacement(t *testing.T) {
 	root := t.TempDir()
 	cwd := filepath.Join(root, "workspace")
@@ -785,7 +797,8 @@ func TestJobSubmitCompletedTargetRemainsRejected(t *testing.T) {
 	params := submissionParams("resume-completed-target", "resume", "codex", t.TempDir(), "continue")
 	params.TaskSpec.ResumeJobID = source.JobID
 	outcome := submitForTest(t, server, params)
-	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || outcome.err.Data.JobID != source.JobID {
+	const wantReason = "completed jobs are not resumable unless submitted with session retention; submit a new job"
+	if outcome.err == nil || outcome.err.Data.Code != protocol.ErrorInvalidTaskSpec || outcome.err.Data.JobID != source.JobID || !strings.Contains(outcome.err.Message, wantReason) {
 		t.Fatalf("resume completed target = %#v, want typed invalid-task error for %q", outcome.err, source.JobID)
 	}
 	records, err := store.List()
