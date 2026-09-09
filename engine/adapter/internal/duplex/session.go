@@ -21,11 +21,11 @@ const (
 	// DefaultInterruptGrace mirrors the engine cancellation grace without
 	// coupling this adapter package to store internals.
 	DefaultInterruptGrace = 10 * time.Second
-	// These two bounded waits keep a backend that ignores stdin closure from
-	// holding a completed turn forever, while still allowing normal retirement
-	// and one final interrupt-driven exit attempt.
-	turnRetirementGrace          = time.Second
-	turnRetirementInterruptGrace = time.Second
+	// Five seconds gives a healthy backend room to retire while bounding teardown
+	// for a backend that ignores stdin closure, including one final interrupt-
+	// driven exit attempt.
+	turnRetirementGrace          = 5 * time.Second
+	turnRetirementInterruptGrace = 5 * time.Second
 	eventBufferSize              = 16
 )
 
@@ -251,7 +251,8 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 		stdoutWriter = stdoutLog
 	}
 	retirement := startRetirement(turnCtx, running)
-	conn := newConn(running.Stdin(), running.Stdout(), stdoutWriter, running, retirement)
+	stdoutPipe := running.Stdout()
+	conn := newConn(running.Stdin(), stdoutPipe, stdoutWriter, running, retirement)
 	active := &activeTurn{running: running, conn: conn, retirement: retirement}
 	s.active = active
 	s.mu.Unlock()
@@ -268,7 +269,7 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	}
 
 	events := make(chan engine.Event, eventBufferSize)
-	go s.runTurn(driverCtx, driverCancel, turnCtx, turnCancel, input, resumeID, active, running.Stderr(), stderrWriter, &stderr, stdoutLog, stderrLog, events)
+	go s.runTurn(driverCtx, driverCancel, turnCtx, turnCancel, input, resumeID, active, stdoutPipe, running.Stderr(), stderrWriter, &stderr, stdoutLog, stderrLog, events)
 	return events, nil
 }
 
@@ -309,7 +310,7 @@ func normalizeEnvironment(goos string, layers ...[]string) []string {
 	return env
 }
 
-func (s *Session) runTurn(driverCtx context.Context, driverCancel context.CancelFunc, turnCtx context.Context, turnCancel context.CancelFunc, input engine.TurnInput, resumeID string, active *activeTurn, stderrPipe io.ReadCloser, stderrWriter io.Writer, stderr *bytes.Buffer, stdoutLog *engine.CappedLogWriter, stderrLog *engine.CappedLogWriter, events chan<- engine.Event) {
+func (s *Session) runTurn(driverCtx context.Context, driverCancel context.CancelFunc, turnCtx context.Context, turnCancel context.CancelFunc, input engine.TurnInput, resumeID string, active *activeTurn, stdoutPipe io.ReadCloser, stderrPipe io.ReadCloser, stderrWriter io.Writer, stderr *bytes.Buffer, stdoutLog *engine.CappedLogWriter, stderrLog *engine.CappedLogWriter, events chan<- engine.Event) {
 	defer close(events)
 	defer turnCancel()
 	defer driverCancel()
@@ -346,10 +347,13 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 		stderrCopyErr = <-stderrDone
 	} else {
 		// A forced give-up has no trustworthy backend output boundary. Close the
-		// stderr reader so the copier can finish, but do not turn that deliberate
-		// teardown close into a terminal error.
+		// stderr reader so the copier can finish. Preserve copier failures other
+		// than the os.ErrClosed caused by this deliberate close.
 		_ = stderrPipe.Close()
-		<-stderrDone
+		stderrCopyErr = <-stderrDone
+		if errors.Is(stderrCopyErr, os.ErrClosed) {
+			stderrCopyErr = nil
+		}
 	}
 
 	if result.resumeID != "" {
@@ -359,18 +363,16 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	// A later turn may install a new resume ID, and teardown itself can outlive a
 	// caller's deadline.
 	completedSessionID := s.ID()
-	// A forced give-up keeps the disposition from when the driver completed its
-	// result so teardown cannot turn its own delay into a timeout or cancellation.
 	disposition := dispositionAtResult
 	if normalRetirement {
-		// Keep the existing settlement-time disposition for the normal retirement
-		// path, including a deadline that expires during ordinary stream teardown.
-		disposition = captureTurnDisposition(turnCtx)
 		if drainDone == nil {
 			active.conn.drainReader()
 		} else {
 			<-drainDone
 		}
+	} else {
+		_ = stdoutPipe.Close()
+		<-drainDone
 	}
 	frameDrops := active.conn.FrameDrops()
 	if !frameDrops.Empty() {
