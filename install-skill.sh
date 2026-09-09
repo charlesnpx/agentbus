@@ -73,7 +73,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --target)
-      [[ $# -ge 2 ]] || die "--target requires tools or all"
+      [[ $# -ge 2 ]] || die "--target requires claude, codex, tools, or all"
       TARGET=$2
       shift 2
       ;;
@@ -86,7 +86,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -h|--help)
-      printf 'Usage: %s [--plan|--install|--uninstall] --target tools|all [--json] [--install-root <abs>]\n' "$0" >&2
+      printf 'Usage: %s [--plan|--install|--uninstall] --target claude|codex|tools|all [--json] [--install-root <abs>]\n' "$0" >&2
       exit 0
       ;;
     *)
@@ -100,9 +100,8 @@ if [[ -z "$OPERATION" ]]; then
 fi
 
 case "$TARGET" in
-  tools|all) ;;
-  claude|codex) die "--target $TARGET has no skills in v1; use --target tools" ;;
-  *) die "--target must be tools or all" ;;
+  claude|codex|tools|all) ;;
+  *) die "--target must be claude, codex, tools, or all" ;;
 esac
 
 if [[ -n "$INSTALL_ROOT_ARG" && "$INSTALL_ROOT_ARG" != /* ]]; then
@@ -153,6 +152,86 @@ TOOL_PATH="$ROOT/.local/bin/agentbus"
 
 tools_requested() {
   [[ "$TARGET" == "tools" || "$TARGET" == "all" ]]
+}
+
+claude_requested() {
+  [[ "$TARGET" == "claude" || "$TARGET" == "all" ]]
+}
+
+codex_requested() {
+  [[ "$TARGET" == "codex" || "$TARGET" == "all" ]]
+}
+
+claude_skills_root() {
+  printf '%s\n' "$ROOT/.claude/skills"
+}
+
+codex_skills_root() {
+  if [[ -n "$INSTALL_ROOT_ARG" ]]; then
+    printf '%s\n' "$ROOT/.codex/skills"
+    return
+  fi
+
+  local codex_home=${CODEX_HOME:-}
+  if [[ -n "$codex_home" ]]; then
+    [[ "$codex_home" == /* ]] || die "CODEX_HOME must be absolute"
+    codex_home=$(trim_trailing_slash "$codex_home")
+    printf '%s\n' "$codex_home/skills"
+    return
+  fi
+  printf '%s\n' "$ROOT/.codex/skills"
+}
+
+set_skill_dirs_for_target() {
+  local target=$1
+  case "$target" in
+    claude|codex)
+      SKILL_DIRS=(agentbus)
+      ;;
+    *)
+      die "unsupported skill target $target"
+      ;;
+  esac
+}
+
+skill_root_for_target() {
+  case "$1" in
+    claude) claude_skills_root ;;
+    codex) codex_skills_root ;;
+    *) die "unsupported skill target $1" ;;
+  esac
+}
+
+skill_file_path() {
+  local target=$1
+  local escaped=$2
+  local root
+  root=$(skill_root_for_target "$target")
+  printf '%s\n' "$root/$escaped/SKILL.md"
+}
+
+install_skills_for_target() {
+  local target=$1
+  local escaped src dest
+  set_skill_dirs_for_target "$target"
+  for escaped in "${SKILL_DIRS[@]}"; do
+    src="$REPO_ROOT/skills/$escaped/SKILL.md"
+    [[ -f "$src" ]] || die "skill source not found: $src"
+    dest=$(skill_file_path "$target" "$escaped")
+    mkdir -p -- "$(dirname -- "$dest")"
+    cp -- "$src" "$dest"
+    chmod 0644 "$dest"
+  done
+}
+
+uninstall_skills_for_target() {
+  local target=$1
+  local escaped path
+  set_skill_dirs_for_target "$target"
+  for escaped in "${SKILL_DIRS[@]}"; do
+    path=$(skill_file_path "$target" "$escaped")
+    rm -rf -- "$(dirname -- "$path")"
+  done
 }
 
 sha256_file() {
@@ -252,10 +331,22 @@ case "$OPERATION" in
       [[ -n "$TOOL_SHA" ]] || die "failed to compute sha256 for $TOOL_PATH"
       restart_live_daemon
     fi
+    if claude_requested; then
+      install_skills_for_target claude
+    fi
+    if codex_requested; then
+      install_skills_for_target codex
+    fi
     ;;
   uninstall)
     if tools_requested; then
       rm -f -- "$TOOL_PATH"
+    fi
+    if claude_requested; then
+      uninstall_skills_for_target claude
+    fi
+    if codex_requested; then
+      uninstall_skills_for_target codex
     fi
     ;;
   *)
@@ -280,6 +371,25 @@ print_target() {
   printf '"%s":{"files":[' "$(json_escape "$name")"
   if [[ "$name" == "tools" ]]; then
     print_tool_file
+  else
+    local escaped path sha first=1
+    set_skill_dirs_for_target "$name"
+    for escaped in "${SKILL_DIRS[@]}"; do
+      path=$(skill_file_path "$name" "$escaped")
+      sha=""
+      if [[ "$OPERATION" == "install" && -f "$path" ]]; then
+        sha=$(sha256_file "$path")
+      fi
+      if [[ $first -eq 0 ]]; then
+        printf ','
+      fi
+      first=0
+      printf '{"path":"%s"' "$(json_escape "$path")"
+      if [[ -n "$sha" ]]; then
+        printf ',"sha256":"%s"' "$(json_escape "$sha")"
+      fi
+      printf '}'
+    done
   fi
   printf ']}'
 }
@@ -289,7 +399,7 @@ print_targets() {
   local first=1
   local name
   case "$TARGET" in
-    all) names=(tools) ;;
+    all) names=(tools claude codex) ;;
     *) names=("$TARGET") ;;
   esac
   printf '{'
