@@ -348,10 +348,11 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	} else {
 		// A forced give-up has no trustworthy backend output boundary. Close the
 		// stderr reader so the copier can finish. Preserve copier failures other
-		// than the os.ErrClosed caused by this deliberate close.
+		// than the one this deliberate close causes. An os/exec pipe reports
+		// io.ErrClosedPipe rather than os.ErrClosed, so both are suppressed.
 		_ = stderrPipe.Close()
 		stderrCopyErr = <-stderrDone
-		if errors.Is(stderrCopyErr, os.ErrClosed) {
+		if errors.Is(stderrCopyErr, io.ErrClosedPipe) || errors.Is(stderrCopyErr, os.ErrClosed) {
 			stderrCopyErr = nil
 		}
 	}
