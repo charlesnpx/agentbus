@@ -3,6 +3,17 @@
 Agentbus is a local generic job service for backend CLIs. It stores identified
 jobs, supervises their process groups, and exposes a small JSON-RPC interface.
 
+## Depends on / Depended on by
+
+Agentbus depends on nothing in the delegate/convo-relay/witness set.
+
+`delegate` imports `github.com/charlesnpx/agentbus/client`, pins a released
+Agentbus version, and its installer invokes `agentbus configure-codex-sandbox`;
+changes to those surfaces can break Delegate's build or installer.
+
+`convo-relay` embeds `github.com/charlesnpx/agentbus/engine` and its adapters;
+changes to those packages or their APIs can break its build.
+
 Version 0.14.0 serves protocol version 3. The published contract is
 [docs/protocol.md](docs/protocol.md). Operator details, including the required
 state-root break for this release, are in
