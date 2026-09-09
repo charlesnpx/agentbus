@@ -230,13 +230,11 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 	turn.once.Do(func() {
 		if strings.TrimSpace(outcome.modelReported) != "" {
 			if err := store.RecordModelReported(run.jobID, outcome.modelReported); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
-				outcome.cleanup = protocol.CleanupUncertain
 				outcome.diagnostics = append(outcome.diagnostics, "record reported model: "+err.Error())
 			}
 		}
 		if strings.TrimSpace(outcome.backendSessionID) != "" {
 			if _, err := store.RecordBackendSessionID(run.jobID, outcome.backendSessionID); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
-				outcome.cleanup = protocol.CleanupUncertain
 				outcome.diagnostics = append(outcome.diagnostics, "record backend session: "+err.Error())
 			}
 		}
