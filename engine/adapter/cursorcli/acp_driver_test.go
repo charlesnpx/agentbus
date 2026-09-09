@@ -182,14 +182,22 @@ func TestACPRequestedBareModelSelection(t *testing.T) {
 
 func TestACPUnavailableModelStopsBeforePrompt(t *testing.T) {
 	requestedModel := "missing-model"
-	availableName := "grok-4.6"
 	runner := newFakeACPRunner(t, func(t *testing.T, proc *fakeACPProcess, spec command.ExecSpec) {
 		peer := newACPPeer(t, proc)
 		peer.handshake(false)
 		newSession := peer.expectRequest("session/new")
 		peer.respond(newSession, acpSessionResult("session-unavailable", "current-model",
-			map[string]any{"modelId": "grok-4.6[effort=high,fast=true]", "name": availableName},
+			map[string]any{"modelId": "grok-4.6[effort=high,fast=true]", "name": "grok-4.6"},
 		))
+		setModel := peer.expectRequest("session/set_model")
+		if got := nestedString(setModel, "params", "modelId"); got != requestedModel {
+			t.Fatalf("modelId = %q, want unresolved %q", got, requestedModel)
+		}
+		peer.write(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      setModel["id"],
+			"error":   map[string]any{"code": -32602, "message": "Invalid model value: " + requestedModel},
+		})
 		peer.expectStdinClose()
 	})
 
@@ -200,8 +208,8 @@ func TestACPUnavailableModelStopsBeforePrompt(t *testing.T) {
 	}
 	got := collectEvents(t, events, 2*time.Second)
 	terminal := eventsOfType(got, engine.EventTerminalError)
-	if len(terminal) != 1 || !strings.Contains(terminal[0].Text, requestedModel) || !strings.Contains(terminal[0].Text, availableName) {
-		t.Fatalf("events = %#v, want unavailable model error naming %q and %q", got, requestedModel, availableName)
+	if len(terminal) != 1 || !strings.Contains(terminal[0].Text, "could not select Cursor model: Invalid model value: "+requestedModel) {
+		t.Fatalf("events = %#v, want Cursor model rejection for %q", got, requestedModel)
 	}
 	runner.assertRetired(t)
 }

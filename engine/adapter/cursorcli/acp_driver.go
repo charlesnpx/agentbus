@@ -96,10 +96,7 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 
 	model := info.currentModel()
 	if opts.Model != "" {
-		model, err = resolveModelID(opts.Model, anySlice(info.models["availableModels"]))
-		if err != nil {
-			return info.sessionID, fmt.Errorf("could not select Cursor model: %w", err)
-		}
+		model = resolveModelID(opts.Model, anySlice(info.models["availableModels"]))
 		if err := rpc.setModel(ctx, info.sessionID, model); err != nil {
 			return info.sessionID, fmt.Errorf("could not select Cursor model: %w", err)
 		}
@@ -457,18 +454,7 @@ func (i acpSessionInfo) currentModel() string {
 	return firstString(i.models, "currentModelId")
 }
 
-func resolveModelID(requested string, availableModels []any) (string, error) {
-	var names []string
-	for _, raw := range availableModels {
-		model, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		if name, ok := model["name"].(string); ok && name != "" {
-			names = append(names, name)
-		}
-	}
-
+func resolveModelID(requested string, availableModels []any) string {
 	for _, raw := range availableModels {
 		model, ok := raw.(map[string]any)
 		if !ok {
@@ -477,7 +463,7 @@ func resolveModelID(requested string, availableModels []any) (string, error) {
 		name, _ := model["name"].(string)
 		modelID, _ := model["modelId"].(string)
 		if name == requested && modelID != "" {
-			return modelID, nil
+			return modelID
 		}
 	}
 	for _, raw := range availableModels {
@@ -487,15 +473,10 @@ func resolveModelID(requested string, availableModels []any) (string, error) {
 		}
 		modelID, _ := model["modelId"].(string)
 		if modelID == requested {
-			return modelID, nil
+			return modelID
 		}
 	}
-
-	available := strings.Join(names, ", ")
-	if available == "" {
-		available = "none"
-	}
-	return "", fmt.Errorf("requested model %q is unavailable; available model names: %s", requested, available)
+	return requested
 }
 
 type acpTurnObserver struct {
