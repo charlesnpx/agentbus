@@ -107,10 +107,6 @@ func validateCodexSandboxWritableRoot(root string) error {
 	return nil
 }
 
-func configureCodexSandbox() codexSandboxResult {
-	return configureCodexSandboxWithWritableRoots(nil)
-}
-
 func configureCodexSandboxWithWritableRoots(extraWritableRoots []string) codexSandboxResult {
 	paths, err := resolveCodexSandboxPaths(os.Getenv, os.UserHomeDir)
 	if err != nil {
@@ -164,15 +160,6 @@ func resolveCodexSandboxPathsFrom(env func(string) string, homeDir func() (strin
 	}, nil
 }
 
-type agentbusStateRootUsageError struct {
-	Name  string
-	Value string
-}
-
-func (err agentbusStateRootUsageError) Error() string {
-	return fmt.Sprintf("%s %q must be absolute", err.Name, err.Value)
-}
-
 func resolveAgentbusUserCacheRootFrom(userCacheDir func() (string, error)) (string, error) {
 	cacheDir, err := userCacheDir()
 	if err != nil {
@@ -190,7 +177,7 @@ func resolveAgentbusStateRootFrom(env func(string) string, userHomeDir func() (s
 	}
 	if stateHome := env("XDG_STATE_HOME"); stateHome != "" {
 		if !filepath.IsAbs(stateHome) {
-			return "", agentbusStateRootUsageError{Name: "XDG_STATE_HOME", Value: stateHome}
+			return "", fmt.Errorf("XDG_STATE_HOME %q must be absolute", stateHome)
 		}
 		return canonicalizeAgentbusStateRoot("agentbus state root", filepath.Join(stateHome, "agentbus"))
 	}
@@ -209,7 +196,7 @@ func canonicalizeAgentbusStateRoot(label, root string) (string, error) {
 		return "", fmt.Errorf("%s is empty", label)
 	}
 	if !filepath.IsAbs(root) {
-		return "", agentbusStateRootUsageError{Name: label, Value: root}
+		return "", fmt.Errorf("%s %q must be absolute", label, root)
 	}
 	clean := filepath.Clean(root)
 	if evaluated, err := filepath.EvalSymlinks(clean); err == nil {

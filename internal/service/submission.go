@@ -262,7 +262,7 @@ func validateResumeTarget(spec protocol.TaskSpec, target jobstore.Record) error 
 	if target.Backend != spec.Backend {
 		return fmt.Errorf("resume target backend %q does not match taskSpec.backend %q", target.Backend, spec.Backend)
 	}
-	if !sessionHomeRetained(target) {
+	if !target.SessionHomeRetained() {
 		return errors.New("completed jobs are not resumable unless submitted with session retention; submit a new job")
 	}
 	if !target.State.IsTerminal() {

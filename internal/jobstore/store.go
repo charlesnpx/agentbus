@@ -148,6 +148,12 @@ type Record struct {
 	Artifacts        ArtifactPaths           `json:"artifacts"`
 }
 
+// SessionHomeRetained reports whether this record's backend session home is
+// retained after completion.
+func (record Record) SessionHomeRetained() bool {
+	return record.State != protocol.PublicStateCompleted || record.RetainSession
+}
+
 // TerminalUpdate supplies the durable data for a first terminal transition.
 // State must be completed, failed, canceled, or unknown. A completed record
 // without session retention clears BackendSessionID; for retained completed
@@ -727,7 +733,7 @@ func (store *Store) MarkTerminal(id string, terminal TerminalUpdate) (Record, er
 		next.State = terminal.State
 		next.Starting = false
 		next.Cleanup = terminal.Cleanup
-		if terminal.State == protocol.PublicStateCompleted && !next.RetainSession {
+		if !next.SessionHomeRetained() {
 			next.BackendSessionID = ""
 		} else if terminal.BackendSessionID != "" {
 			next.BackendSessionID = terminal.BackendSessionID

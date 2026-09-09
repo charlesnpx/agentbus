@@ -53,6 +53,52 @@ func runtimeHygieneRecord(t *testing.T, server *Server, cwd, requestID string, w
 	return record
 }
 
+func TestCompletedSessionRetentionIsSharedByStoreAndService(t *testing.T) {
+	store, err := jobstore.Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+
+	for _, tc := range []struct {
+		name   string
+		retain bool
+	}{
+		{name: "without-retention"},
+		{name: "with-retention", retain: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			record, _, err := store.SubmitTx(
+				jobstore.RequestKey{WorkspaceKey: "retention-agreement-" + tc.name, RequestID: tc.name},
+				[]byte(`{}`),
+				func(id string) (jobstore.Record, error) {
+					return jobstore.Record{JobID: id, Backend: "codex", RetainSession: tc.retain}, nil
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
+				State:            protocol.PublicStateCompleted,
+				Cleanup:          protocol.CleanupClean,
+				BackendSessionID: "retention-agreement-session",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			retained := terminal.SessionHomeRetained()
+			if retained != (terminal.BackendSessionID != "") {
+				t.Fatalf("store retention=%t, backend session ID=%q", retained, terminal.BackendSessionID)
+			}
+			resumeErr := validateResumeTarget(protocol.TaskSpec{Backend: terminal.Backend, ResumeJobID: terminal.JobID}, terminal)
+			if (resumeErr == nil) != retained {
+				t.Fatalf("service resume validation error=%v, shared retention=%t", resumeErr, retained)
+			}
+		})
+	}
+}
+
 func TestCodexWriteTurnReceivesPerJobSandboxCache(t *testing.T) {
 	var started engine.SessionOpts
 	backend := &executionFakeBackend{name: "codex"}

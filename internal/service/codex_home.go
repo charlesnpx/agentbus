@@ -398,14 +398,6 @@ func linkManagedCodexHomeFile(sourceHome string, destination *managedCodexHome, 
 	return nil
 }
 
-func sessionHomeRetained(record jobstore.Record) bool {
-	return record.State != protocol.PublicStateCompleted || record.RetainSession
-}
-
-func codexHomeCleanupEligible(record jobstore.Record) bool {
-	return !sessionHomeRetained(record)
-}
-
 // finalizeManagedCodexHome executes cleanup before committing the terminal
 // record, so a failed identity-checked removal is reflected on the independent
 // cleanup axis without rewriting a known result or public state.
@@ -414,7 +406,7 @@ func finalizeManagedCodexHome(home *managedCodexHome, record jobstore.Record, cl
 		return cleanup, diagnostics
 	}
 	defer home.close()
-	if cleanup != protocol.CleanupClean || !codexHomeCleanupEligible(record) {
+	if cleanup != protocol.CleanupClean || record.SessionHomeRetained() {
 		return cleanup, diagnostics
 	}
 	if err := removeManagedCodexHome(home); err != nil {
