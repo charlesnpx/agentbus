@@ -656,6 +656,39 @@ func TestExecutionFailureWithoutRecordedClaimPreservesUncertainCleanup(t *testin
 	}
 }
 
+func TestRetireTurnMetadataFailuresDoNotChangeCleanup(t *testing.T) {
+	backend := &executionFakeBackend{name: "retire-metadata-failure"}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "retire metadata failure", nil)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(record.JobID); err != nil {
+		t.Fatal(err)
+	}
+	run := newActiveExecution(record.JobID, backend)
+	run.beginTurn()
+	// Closing the real store makes both metadata writes fail without a test
+	// store seam. retireTurn must preserve cleanup while retaining why each
+	// metadata write could not be recorded.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	outcome := run.retireTurn(store, turnOutcome{
+		cleanup:          protocol.CleanupClean,
+		modelReported:    "resolved-model",
+		backendSessionID: "backend-session",
+	})
+	if outcome.cleanup != protocol.CleanupClean {
+		t.Fatalf("retired cleanup = %q, want clean after metadata-only failures", outcome.cleanup)
+	}
+	diagnostics := strings.Join(outcome.diagnostics, "\n")
+	if !strings.Contains(diagnostics, "record reported model:") || !strings.Contains(diagnostics, "record backend session:") {
+		t.Fatalf("retired diagnostics = %#v, want both metadata failure diagnostics", outcome.diagnostics)
+	}
+}
+
 func TestExecutionDoesNotPersistSessionIDOnCompletedRecords(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
