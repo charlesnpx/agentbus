@@ -17,6 +17,7 @@ agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--workspace-
 agentbus transcript --job <id> [--kind <kind>] [--since <timestamp>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]
 agentbus result --job <id> [--json]
 agentbus cancel --job <id> [--json]
+agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]
 ~~~
 
 Job submission uses the typed job.submit protocol method. There is no CLI submit
@@ -24,6 +25,10 @@ command.
 
 Set AGENTBUS_STATE_ROOT to select daemon state. Otherwise Agentbus uses
 $XDG_STATE_HOME/agentbus or ~/.local/state/agentbus.
+
+`configure-codex-sandbox` adds Agentbus's state and cache roots to
+`$CODEX_HOME/config.toml` (or `~/.codex/config.toml`), preserving existing TOML
+comments and formatting. Repeat `--writable-root` to add another absolute root.
 
 ## Packages
 

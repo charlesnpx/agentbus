@@ -3,6 +3,7 @@ module github.com/charlesnpx/agentbus
 go 1.26
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	go.etcd.io/bbolt v1.5.0
 	golang.org/x/text v0.40.0

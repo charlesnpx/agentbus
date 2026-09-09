@@ -207,6 +207,63 @@ live_install_root() {
   canonical_existing_dir "$HOME"
 }
 
+record_codex_sandbox_action() {
+  local config_path agentbus_state agentbus_cache codex_home state_home cache_home
+  case "$OPERATION" in
+    plan)
+      if [[ -n "${HOME:-}" && "$HOME" == /* ]]; then
+        codex_home=${CODEX_HOME:-"$HOME/.codex"}
+        state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}
+        if [[ -n "${AGENTBUS_STATE_ROOT:-}" ]]; then
+          agentbus_state=$AGENTBUS_STATE_ROOT
+        else
+          agentbus_state="$state_home/agentbus"
+        fi
+        if [[ "${OSTYPE:-}" == darwin* ]]; then
+          agentbus_cache="$HOME/Library/Caches/agentbus"
+        else
+          cache_home=${XDG_CACHE_HOME:-"$HOME/.cache"}
+          agentbus_cache="$cache_home/agentbus"
+        fi
+        if [[ "$codex_home" == /* && "$state_home" == /* && "$agentbus_state" == /* && "$agentbus_cache" == /* && ( -z "${XDG_CACHE_HOME:-}" || "$XDG_CACHE_HOME" == /* ) ]]; then
+          config_path="$codex_home/config.toml"
+          add_warning "codex sandbox writable_roots would-configure: $agentbus_state, $agentbus_cache (config $config_path)"
+        else
+          add_warning "codex sandbox writable_roots skipped: HOME, CODEX_HOME, AGENTBUS_STATE_ROOT, XDG_CACHE_HOME, and XDG_STATE_HOME must resolve to absolute paths"
+        fi
+      else
+        add_warning "codex sandbox writable_roots skipped: HOME, CODEX_HOME, AGENTBUS_STATE_ROOT, XDG_CACHE_HOME, and XDG_STATE_HOME must resolve to absolute paths"
+      fi
+      ;;
+    uninstall)
+      add_warning "codex sandbox writable_roots entries left in place; uninstall does not remove security configuration automatically"
+      ;;
+    install)
+      local live_root
+      live_root=$(live_install_root) || {
+        [[ -n "$INSTALL_ROOT_ARG" ]] && return 0
+        add_warning "codex sandbox writable_roots skipped: live HOME directory is unavailable"
+        return 0
+      }
+      # mise-en-place invokes Agentbus installers with a temporary
+      # --install-root, then copies the staged file into the live destination.
+      # Configuring from that staged invocation would mutate the user's Codex
+      # sandbox even though the staged binary has not been installed live.
+      # This expected skip is intentionally silent rather than a warning.
+      if [[ "$ROOT" != "$live_root" ]]; then
+        return 0
+      fi
+
+      local result
+      if result=$("$TOOL_PATH" configure-codex-sandbox 2>&1); then
+        add_warning "$result"
+      else
+        add_warning "codex sandbox writable_roots skipped: $result"
+      fi
+      ;;
+  esac
+}
+
 restart_live_daemon() {
   [[ "$OPERATION" == "install" ]] || return 0
   tools_requested || return 0
@@ -262,6 +319,8 @@ case "$OPERATION" in
     die "unsupported operation: $OPERATION"
     ;;
 esac
+
+record_codex_sandbox_action
 
 print_warnings() {
   printf '[%s]' "$WARNINGS_JSON"

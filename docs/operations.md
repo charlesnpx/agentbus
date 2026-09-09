@@ -52,7 +52,12 @@ artifacts while a daemon is using the root.
 
 Use agentbus serve to start a background daemon. Use agentbus serve --foreground
 when a supervisor owns the process. The public CLI commands are version, serve,
-status, transcript, result, and cancel.
+status, transcript, result, cancel, and configure-codex-sandbox.
+
+`agentbus configure-codex-sandbox` adds the Agentbus state root and cache root to
+Codex's `sandbox_workspace_write.writable_roots` array. It preserves existing
+TOML text and accepts repeatable `--writable-root` flags for additional absolute
+roots. Use `--json` for the action, config path, and resulting root list.
 
 There is no standalone setup command or backend probe. Admission checks only
 that the requested backend name is registered in the daemon's backend map. A

@@ -117,6 +117,8 @@ func (a *app) run(ctx context.Context, args []string, _ io.Reader, out, errOut i
 		return a.runResult(ctx, args[1:], out, errOut)
 	case "cancel":
 		return a.runCancel(ctx, args[1:], out, errOut)
+	case "configure-codex-sandbox":
+		return runConfigureCodexSandbox(args[1:], out, errOut)
 	default:
 		return usageError(errOut, "unknown command %q", args[0])
 	}
@@ -928,6 +930,7 @@ func printRootHelp(out io.Writer) {
   agentbus transcript --job <id> [--kind <kind>]... [--last <n>] [--since <rfc3339>] [--since-ordinal <n>] [--limit <n>] [--json]
   agentbus result --job <id> [--json]
   agentbus cancel --job <id> [--json]
+  agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]
 
 status and result use the same job.get record for a selected job. Their JSON
 output is identical; status is the operator projection and result is pipeable.
