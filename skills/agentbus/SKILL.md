@@ -27,21 +27,25 @@ to match any listed state. Valid states: `queued`, `running`, `completed`, `fail
 
 `transcript` without a selector (`--kind`, `--last`, `--since`, `--since-ordinal`, or
 `--limit`) returns a digest of counts/timestamps plus recent messages and captured
-errors. Any selector replaces that digest with a raw matching item tail, potentially
-containing only tool items.
+errors. Any selector replaces that digest with the matching items themselves, which
+may be only tool items; `--last` is the only selector that returns a tail.
 
 Follow a queued/running job forward with
 `--kind message --since-ordinal <n> --limit <n>`, starting at `0` and feeding back the
 highest returned ordinal; ordinal `0` is valid and the first assigned ordinal is `1`.
-`--last` cuts the head (for ordinals `[1, 9, 14, 16, 17]`, `--last 2` returns `[16, 17]`);
-there is no `--before-ordinal`, so discarded items cannot be fetched later. Treat
-`--last` as a one-time tail view, never a polling cursor.
+`--last` returns only the latest matching items in that one response (for ordinals
+`[1, 9, 14, 16, 17]`, `--last 2` returns `[16, 17]`). Every request re-reads the sidecar,
+so the earlier items stay reachable by asking again from a lower ordinal; what does not
+exist is paging backwards from a tail. Treat `--last` as a one-time view, never a
+polling cursor.
 
-The transcript response includes `state` and `gap`. While `state` is `queued` or
-`running`, a short or empty page means nothing more is readable yet; a running job is
-always gapped, so `gap` does not indicate exhaustion. Once terminal, `gap: false` means
-every captured item was seen; `gap: true` means capture or reading was incomplete and
-unseen items cannot be paged in.
+The transcript response includes `state` and `gap`, and they answer different questions.
+Drainage is a property of your paging: with a positive `--limit`, keep requesting pages
+until one comes back short or empty, and keep doing so after the job turns terminal.
+`gap` is a property of the capture, not of your page: `false` proves capture and reading
+were continuous, `true` means completeness cannot be claimed even after you have drained
+every readable matching item. A running job is always gapped, so `gap` says nothing
+about exhaustion while one is in flight.
 
 For a selected job, exit status is the job outcome, not command success: `0` completed,
 `2` queued/running, `3` completed-noncompliant, `4` failed, `5` timeout, `6` interrupted,
