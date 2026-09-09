@@ -21,7 +21,12 @@ const (
 	// DefaultInterruptGrace mirrors the engine cancellation grace without
 	// coupling this adapter package to store internals.
 	DefaultInterruptGrace = 10 * time.Second
-	eventBufferSize       = 16
+	// These two bounded waits keep a backend that ignores stdin closure from
+	// holding a completed turn forever, while still allowing normal retirement
+	// and one final interrupt-driven exit attempt.
+	turnRetirementGrace          = time.Second
+	turnRetirementInterruptGrace = time.Second
+	eventBufferSize              = 16
 )
 
 var (
@@ -325,6 +330,7 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 
 	result, earlyExit := waitForTurnResult(driverDone, active.retirement)
 	result, earlyExit = classifyTurnResult(result, earlyExit)
+	dispositionAtResult := captureTurnDisposition(turnCtx)
 	if errors.Is(result.err, ErrFrameTooLarge) && !errors.Is(result.err, engine.ErrTransportFrameTooLarge) {
 		result.err = fmt.Errorf("%w: %w", engine.ErrTransportFrameTooLarge, result.err)
 	}
@@ -334,8 +340,17 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 		active.conn.drainReader()
 		close(drainDone)
 	}()
-	observation, _ := active.retirement.wait(context.Background())
-	stderrCopyErr := <-stderrDone
+	observation, normalRetirement := waitForTurnRetirement(active)
+	var stderrCopyErr error
+	if normalRetirement {
+		stderrCopyErr = <-stderrDone
+	} else {
+		// A forced give-up has no trustworthy backend output boundary. Close the
+		// stderr reader so the copier can finish, but do not turn that deliberate
+		// teardown close into a terminal error.
+		_ = stderrPipe.Close()
+		<-stderrDone
+	}
 
 	if result.resumeID != "" {
 		s.setID(result.resumeID)
@@ -344,11 +359,18 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	// A later turn may install a new resume ID, and teardown itself can outlive a
 	// caller's deadline.
 	completedSessionID := s.ID()
-	disposition := captureTurnDisposition(turnCtx)
-	if drainDone == nil {
-		active.conn.drainReader()
-	} else {
-		<-drainDone
+	// A forced give-up keeps the disposition from when the driver completed its
+	// result so teardown cannot turn its own delay into a timeout or cancellation.
+	disposition := dispositionAtResult
+	if normalRetirement {
+		// Keep the existing settlement-time disposition for the normal retirement
+		// path, including a deadline that expires during ordinary stream teardown.
+		disposition = captureTurnDisposition(turnCtx)
+		if drainDone == nil {
+			active.conn.drainReader()
+		} else {
+			<-drainDone
+		}
 	}
 	frameDrops := active.conn.FrameDrops()
 	if !frameDrops.Empty() {
@@ -381,6 +403,43 @@ func waitForTurnResult(driverDone <-chan turnResult, retirement *retirement) (tu
 		}
 		result := <-driverDone
 		return result, true
+	}
+}
+
+// waitForTurnRetirement preserves the old prompt-retirement observation. Once
+// that grace is exhausted, the process interrupt is best-effort and any
+// observation it produces is intentionally discarded: it describes teardown,
+// not the already-settled semantic turn. A zero observation keeps execution
+// failure and return-code fields unknown instead of manufacturing a failure.
+func waitForTurnRetirement(active *activeTurn) (command.FinalObservation, bool) {
+	if observation, ok := waitForRetirement(active.retirement, turnRetirementGrace); ok {
+		return observation, true
+	}
+
+	interruptCtx, cancel := context.WithTimeout(context.Background(), turnRetirementInterruptGrace)
+	go func() {
+		_ = active.conn.Interrupt(interruptCtx)
+	}()
+
+	_, _ = waitForRetirement(active.retirement, turnRetirementInterruptGrace)
+	cancel()
+	return command.FinalObservation{}, false
+}
+
+func waitForRetirement(retirement *retirement, grace time.Duration) (command.FinalObservation, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	observation, err := retirement.wait(ctx)
+	if err == nil {
+		return observation, true
+	}
+	// If retirement won the race with the timeout, preserve the normal path's
+	// observation rather than needlessly interrupting a process that is gone.
+	select {
+	case <-retirement.done:
+		return retirement.observation, true
+	default:
+		return command.FinalObservation{}, false
 	}
 }
 

@@ -305,6 +305,91 @@ func TestTurnFinalObservationAcrossTerminalShapes(t *testing.T) {
 	}
 }
 
+func TestTurnTeardownBoundsRetirementAndPreservesDriverOutcome(t *testing.T) {
+	const resultResumeID = "resume-result"
+	const errorResumeID = "resume-error"
+	driverErr := errors.New("could not select Cursor model: Invalid model value: missing")
+
+	tests := []struct {
+		name              string
+		driver            Driver
+		wantResumeID      string
+		wantDriverErr     error
+		finishOnInterrupt bool
+	}{
+		{
+			name:         "result survives a backend that never retires",
+			driver:       finalObservationTestDriver{resumeID: resultResumeID},
+			wantResumeID: resultResumeID,
+		},
+		{
+			name: "driver error survives forced retirement",
+			driver: terminalErrorResumeDriver{
+				FixtureDriver: FixtureDriver{Spec: command.ExecSpec{Argv: []string{"fixture"}}},
+				resumeID:      errorResumeID,
+				err:           driverErr,
+			},
+			wantResumeID:      errorResumeID,
+			wantDriverErr:     driverErr,
+			finishOnInterrupt: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			proc := newFakeCommand()
+			proc.onInterrupt = func() error {
+				_ = proc.stdoutW.Close()
+				_ = proc.stderrW.Close()
+				if test.finishOnInterrupt {
+					proc.finish(command.ExitObservation{Exited: true, Signal: "interrupt"}, errors.New("forced interrupt wait error"))
+				}
+				return nil
+			}
+			runner := &fakeRunner{running: proc}
+			session := newSessionWithDriver(t, runner, test.driver, 0, "")
+
+			events, err := session.Turn(context.Background(), engine.TurnInput{Prompt: "terminal"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := collectEventsWithTimeout(t, events, 4*time.Second)
+			// Release a deliberately non-retiring fake after the turn has proved
+			// that it no longer waits for process retirement.
+			proc.finish(command.ExitObservation{Exited: true, Code: 0}, nil)
+
+			if gotID := session.ID(); gotID != test.wantResumeID {
+				t.Fatalf("session ID = %q, want %q", gotID, test.wantResumeID)
+			}
+			if got := proc.interrupts.Load(); got != 1 {
+				t.Fatalf("process interrupt count = %d, want 1", got)
+			}
+
+			var terminalErrors []engine.Event
+			for _, event := range got {
+				if event.Type == engine.EventTerminalError {
+					terminalErrors = append(terminalErrors, event)
+				}
+			}
+			if test.wantDriverErr == nil {
+				if len(terminalErrors) != 0 {
+					t.Fatalf("terminal errors = %#v, want none; events = %#v", terminalErrors, got)
+				}
+			} else if len(terminalErrors) != 1 || terminalErrors[0].Text != test.wantDriverErr.Error() {
+				t.Fatalf("terminal errors = %#v, want only %q; events = %#v", terminalErrors, test.wantDriverErr, got)
+			}
+
+			if len(got) == 0 || got[len(got)-1].Type != engine.EventTurnFinal || got[len(got)-1].TurnFinal == nil {
+				t.Fatalf("events = %#v, want final TurnFinal event", got)
+			}
+			final := got[len(got)-1].TurnFinal
+			if final.ReturnCodeKnown || final.ExecutionFailed || final.CleanupFailed {
+				t.Fatalf("forced teardown TurnFinal = %#v, want unknown non-failure observation", *final)
+			}
+		})
+	}
+}
+
 func TestTurnFinalKeepsCompletedResumeIDWhenFinalSendBackpressures(t *testing.T) {
 	const (
 		firstResumeID  = "resume-first"
