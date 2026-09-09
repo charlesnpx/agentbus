@@ -24,6 +24,7 @@ func TestACPFreshWritableTurn(t *testing.T) {
 	}
 
 	cwd := t.TempDir()
+	modelID := "resolved-model[context=272k,reasoning=medium,fast=false]"
 	runner := newFakeACPRunner(t, func(t *testing.T, proc *fakeACPProcess, spec command.ExecSpec) {
 		peer := newACPPeer(t, proc)
 		peer.handshake(false)
@@ -31,7 +32,16 @@ func TestACPFreshWritableTurn(t *testing.T) {
 		if got := nestedString(newSession, "params", "cwd"); !filepath.IsAbs(got) || got != cwd {
 			t.Fatalf("session/new cwd = %q, want absolute %q", got, cwd)
 		}
-		peer.respond(newSession, acpSessionResult("session-write", "resolved-model[context=272k,reasoning=medium,fast=false]"))
+		peer.respond(newSession, acpSessionResult("session-write", modelID))
+
+		setModel := peer.expectRequest("session/set_model")
+		if got := nestedString(setModel, "params", "sessionId"); got != "session-write" {
+			t.Fatalf("set_model sessionId = %q, want session-write", got)
+		}
+		if got := nestedString(setModel, "params", "modelId"); got != modelID {
+			t.Fatalf("modelId = %q, want %q", got, modelID)
+		}
+		peer.respond(setModel, map[string]any{})
 
 		setMode := peer.expectRequest("session/set_mode")
 		if got := nestedString(setMode, "params", "modeId"); got != "agent" {
@@ -92,13 +102,13 @@ func TestACPFreshWritableTurn(t *testing.T) {
 		peer.respond(prompt, map[string]any{"stopReason": "end_turn"})
 	})
 
-	session := startFakeCursorSession(t, engine.SessionOpts{CWD: cwd, Model: "requested-model"})
+	session := startFakeCursorSession(t, engine.SessionOpts{CWD: cwd, Model: modelID})
 	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := collectEvents(t, events, 2*time.Second)
-	if spec := runner.lastSpec(); !slices.Equal(spec.Argv, []string{"fake-cursor", "--model", "requested-model", "acp"}) || spec.Dir != cwd || spec.Env == nil {
+	if spec := runner.lastSpec(); !slices.Equal(spec.Argv, []string{"fake-cursor", "acp"}) || spec.Dir != cwd || spec.Env == nil {
 		t.Fatalf("exec argv=%#v dir=%q envSet=%v", spec.Argv, spec.Dir, spec.Env != nil)
 	}
 	if session.ID() != "session-write" {
@@ -107,7 +117,7 @@ func TestACPFreshWritableTurn(t *testing.T) {
 	if results := eventsOfType(got, engine.EventResultMessage); len(results) != 1 || results[0].Text != "Hello, world" {
 		t.Fatalf("result events = %#v, want one concatenated result", results)
 	}
-	if models := eventsOfType(got, engine.EventModelReported); len(models) != 1 || models[0].ModelReported != "resolved-model[context=272k,reasoning=medium,fast=false]" {
+	if models := eventsOfType(got, engine.EventModelReported); len(models) != 1 || models[0].ModelReported != modelID {
 		t.Fatalf("model events = %#v", models)
 	}
 	tools := eventsOfType(got, engine.EventToolUse)
@@ -130,6 +140,96 @@ func TestACPFreshWritableTurn(t *testing.T) {
 	if process := runner.lastProcess(); process == nil || !process.stdinClosed.Load() {
 		t.Fatal("writable ACP process did not retire after stdin was closed")
 	}
+}
+
+func TestACPRequestedBareModelSelection(t *testing.T) {
+	currentModel := "gpt-5.6-terra[context=272k,reasoning=medium,fast=false]"
+	requestedModel := "grok-4.6"
+	resolvedModel := "grok-4.6[effort=high,fast=true]"
+	runner := newFakeACPRunner(t, func(t *testing.T, proc *fakeACPProcess, spec command.ExecSpec) {
+		peer := newACPPeer(t, proc)
+		peer.handshake(false)
+		newSession := peer.expectRequest("session/new")
+		peer.respond(newSession, acpSessionResult("session-model", currentModel,
+			map[string]any{"modelId": "default[]", "name": "Auto"},
+			map[string]any{"modelId": resolvedModel, "name": requestedModel},
+			map[string]any{"modelId": "composer-2.5[fast=true]", "name": "composer-2.5"},
+		))
+
+		setModel := peer.expectRequest("session/set_model")
+		if got := nestedString(setModel, "params", "modelId"); got != resolvedModel {
+			t.Fatalf("modelId = %q, want %q", got, resolvedModel)
+		}
+		peer.respond(setModel, map[string]any{})
+
+		setMode := peer.expectRequest("session/set_mode")
+		peer.respond(setMode, map[string]any{})
+		prompt := peer.expectRequest("session/prompt")
+		peer.respond(prompt, map[string]any{"stopReason": "end_turn"})
+	})
+
+	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir(), Model: requestedModel})
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEvents(t, events, 2*time.Second)
+	if models := eventsOfType(got, engine.EventModelReported); len(models) != 1 || models[0].ModelReported != resolvedModel {
+		t.Fatalf("model events = %#v, want %q", models, resolvedModel)
+	}
+	runner.assertRetired(t)
+}
+
+func TestACPUnavailableModelStopsBeforePrompt(t *testing.T) {
+	requestedModel := "missing-model"
+	availableName := "grok-4.6"
+	runner := newFakeACPRunner(t, func(t *testing.T, proc *fakeACPProcess, spec command.ExecSpec) {
+		peer := newACPPeer(t, proc)
+		peer.handshake(false)
+		newSession := peer.expectRequest("session/new")
+		peer.respond(newSession, acpSessionResult("session-unavailable", "current-model",
+			map[string]any{"modelId": "grok-4.6[effort=high,fast=true]", "name": availableName},
+		))
+		peer.expectStdinClose()
+	})
+
+	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir(), Model: requestedModel})
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEvents(t, events, 2*time.Second)
+	terminal := eventsOfType(got, engine.EventTerminalError)
+	if len(terminal) != 1 || !strings.Contains(terminal[0].Text, requestedModel) || !strings.Contains(terminal[0].Text, availableName) {
+		t.Fatalf("events = %#v, want unavailable model error naming %q and %q", got, requestedModel, availableName)
+	}
+	runner.assertRetired(t)
+}
+
+func TestACPNoRequestedModelReportsCurrentModel(t *testing.T) {
+	currentModel := "gpt-5.6-terra[context=272k,reasoning=medium,fast=false]"
+	runner := newFakeACPRunner(t, func(t *testing.T, proc *fakeACPProcess, spec command.ExecSpec) {
+		peer := newACPPeer(t, proc)
+		peer.handshake(false)
+		newSession := peer.expectRequest("session/new")
+		peer.respond(newSession, acpSessionResult("session-default", currentModel))
+
+		setMode := peer.expectRequest("session/set_mode")
+		peer.respond(setMode, map[string]any{})
+		prompt := peer.expectRequest("session/prompt")
+		peer.respond(prompt, map[string]any{"stopReason": "end_turn"})
+	})
+
+	session := startFakeCursorSession(t, engine.SessionOpts{CWD: t.TempDir()})
+	events, err := turnWithFakeRunner(t, session, engine.TurnInput{Prompt: "hello", Write: true}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEvents(t, events, 2*time.Second)
+	if models := eventsOfType(got, engine.EventModelReported); len(models) != 1 || models[0].ModelReported != currentModel {
+		t.Fatalf("model events = %#v, want %q", models, currentModel)
+	}
+	runner.assertRetired(t)
 }
 
 func TestACPTurnFlushesToolCallWithoutTerminalUpdate(t *testing.T) {
@@ -674,7 +774,17 @@ func (p *acpPeer) write(value any) {
 	}
 }
 
-func acpSessionResult(sessionID, currentModel string) map[string]any {
+func acpSessionResult(sessionID, currentModel string, modelOptions ...map[string]any) map[string]any {
+	if len(modelOptions) == 0 {
+		modelOptions = []map[string]any{
+			{"modelId": currentModel, "name": currentModel},
+			{"modelId": "fallback-model", "name": "fallback-model"},
+		}
+	}
+	availableModels := make([]any, len(modelOptions))
+	for index, model := range modelOptions {
+		availableModels[index] = model
+	}
 	return map[string]any{
 		"sessionId": sessionID,
 		"modes": map[string]any{
@@ -686,11 +796,8 @@ func acpSessionResult(sessionID, currentModel string) map[string]any {
 			},
 		},
 		"models": map[string]any{
-			"currentModelId": currentModel,
-			"availableModels": []any{
-				map[string]any{"modelId": currentModel},
-				map[string]any{"modelId": "fallback-model"},
-			},
+			"currentModelId":  currentModel,
+			"availableModels": availableModels,
 		},
 	}
 }

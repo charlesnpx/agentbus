@@ -68,12 +68,7 @@ func (d *acpDriver) ExecSpec(_ string, opts engine.SessionOpts, _ engine.TurnInp
 	if opts.Effort != "" {
 		return command.ExecSpec{}, errors.New("cursor backend does not expose a supported effort control")
 	}
-	argv := []string{d.binary}
-	if opts.Model != "" {
-		argv = append(argv, "--model", opts.Model)
-	}
-	argv = append(argv, "acp")
-	return command.ExecSpec{Argv: argv, Dir: opts.CWD}, nil
+	return command.ExecSpec{Argv: []string{d.binary, "acp"}, Dir: opts.CWD}, nil
 }
 
 func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID string, opts engine.SessionOpts, input engine.TurnInput, emit duplex.EmitFunc) (string, error) {
@@ -99,7 +94,17 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 	d.setActive(conn, active)
 	defer d.clearActive(conn, active)
 
-	if model := info.currentModel(); model != "" && emit != nil {
+	model := info.currentModel()
+	if opts.Model != "" {
+		model, err = resolveModelID(opts.Model, anySlice(info.models["availableModels"]))
+		if err != nil {
+			return info.sessionID, fmt.Errorf("could not select Cursor model: %w", err)
+		}
+		if err := rpc.setModel(ctx, info.sessionID, model); err != nil {
+			return info.sessionID, fmt.Errorf("could not select Cursor model: %w", err)
+		}
+	}
+	if model != "" && emit != nil {
 		emit(engine.Event{Type: engine.EventModelReported, ModelReported: model})
 	}
 	if err := rpc.setMode(ctx, info.sessionID, cursorMode(input.Write)); err != nil {
@@ -254,6 +259,20 @@ func (c *acpRPC) setMode(ctx context.Context, sessionID, modeID string) error {
 	}
 	if _, ok := result.(map[string]any); !ok {
 		return errors.New("Cursor mode response was not an object")
+	}
+	return nil
+}
+
+func (c *acpRPC) setModel(ctx context.Context, sessionID, modelID string) error {
+	result, err := c.request(ctx, "session/set_model", map[string]any{
+		"sessionId": sessionID,
+		"modelId":   modelID,
+	}, nil)
+	if err != nil {
+		return err
+	}
+	if _, ok := result.(map[string]any); !ok {
+		return errors.New("Cursor model response was not an object")
 	}
 	return nil
 }
@@ -436,6 +455,47 @@ func parseSessionInfo(result any) (acpSessionInfo, error) {
 
 func (i acpSessionInfo) currentModel() string {
 	return firstString(i.models, "currentModelId")
+}
+
+func resolveModelID(requested string, availableModels []any) (string, error) {
+	var names []string
+	for _, raw := range availableModels {
+		model, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name, ok := model["name"].(string); ok && name != "" {
+			names = append(names, name)
+		}
+	}
+
+	for _, raw := range availableModels {
+		model, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := model["name"].(string)
+		modelID, _ := model["modelId"].(string)
+		if name == requested && modelID != "" {
+			return modelID, nil
+		}
+	}
+	for _, raw := range availableModels {
+		model, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		modelID, _ := model["modelId"].(string)
+		if modelID == requested {
+			return modelID, nil
+		}
+	}
+
+	available := strings.Join(names, ", ")
+	if available == "" {
+		available = "none"
+	}
+	return "", fmt.Errorf("requested model %q is unavailable; available model names: %s", requested, available)
 }
 
 type acpTurnObserver struct {
