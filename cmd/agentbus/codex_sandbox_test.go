@@ -494,6 +494,9 @@ func TestConfigureCodexSandboxCommandAddsWritableRoot(t *testing.T) {
 	if err := os.MkdirAll(codexHome, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(extraRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(codexHome, "config.toml"), []byte("# Keep this comment.\nmodel = \"gpt-5\"\n[sandbox_workspace_write]\nwritable_roots = [\n  \"/unrelated\",\n]\n"), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +524,11 @@ func TestConfigureCodexSandboxCommandAddsWritableRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantRoots := appendUniqueCodexSandboxRoots(paths.WritableRoots, []string{extraRoot})
+	resolvedExtraRoot, err := filepath.EvalSymlinks(extraRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRoots := appendUniqueCodexSandboxRoots(paths.WritableRoots, []string{resolvedExtraRoot})
 	if strings.Join(result.WritableRoots, "\x00") != strings.Join(wantRoots, "\x00") {
 		t.Fatalf("result writable roots = %#v, want %#v", result.WritableRoots, wantRoots)
 	}
@@ -538,6 +545,59 @@ func TestConfigureCodexSandboxCommandAddsWritableRoot(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "# Keep this comment.") || !strings.Contains(string(raw), "\"/unrelated\"") {
 		t.Fatalf("existing config content was not preserved:\n%s", raw)
+	}
+}
+
+func TestConfigureCodexSandboxCommandCanonicalizesSymlinkedWritableRoot(t *testing.T) {
+	home := t.TempDir()
+	codexHome := filepath.Join(home, "codex")
+	stateRoot := filepath.Join(home, "agentbus-state")
+	cacheHome := filepath.Join(home, "cache")
+	realRoot := filepath.Join(home, "review-workspace")
+	symlinkedRoot := filepath.Join(home, "review-workspace-link")
+	if err := os.MkdirAll(codexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(realRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realRoot, symlinkedRoot); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "config.toml"), []byte("[sandbox_workspace_write]\nwritable_roots = []\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(symlinkedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", codexHome)
+	t.Setenv("AGENTBUS_STATE_ROOT", stateRoot)
+	t.Setenv("XDG_CACHE_HOME", cacheHome)
+
+	code, stdout, stderr := runTestCLI(t, testApp(t), []string{
+		"configure-codex-sandbox",
+		"--writable-root", symlinkedRoot,
+		"--json",
+	})
+	if code != 0 || stderr != "" {
+		t.Fatalf("configure exit=%d stderr=%q stdout=%q", code, stderr, stdout)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(codexHome, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := decodeCodexSandboxConfig(raw)
+	if err != nil {
+		t.Fatalf("result does not parse: %v\n%s", err, raw)
+	}
+	if !containsCodexSandboxRoot(parsed.SandboxWorkspaceWrite.WritableRoots, resolvedRoot) {
+		t.Fatalf("writable_roots = %#v, want resolved root %q", parsed.SandboxWorkspaceWrite.WritableRoots, resolvedRoot)
+	}
+	if containsCodexSandboxRoot(parsed.SandboxWorkspaceWrite.WritableRoots, symlinkedRoot) {
+		t.Fatalf("writable_roots retained symlinked root %q: %#v", symlinkedRoot, parsed.SandboxWorkspaceWrite.WritableRoots)
 	}
 }
 

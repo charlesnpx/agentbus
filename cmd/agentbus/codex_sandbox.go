@@ -56,8 +56,12 @@ func runConfigureCodexSandbox(args []string, stdout, stderr io.Writer) int {
 		if err := validateCodexSandboxWritableRoot(value); err != nil {
 			return err
 		}
-		if !containsCodexSandboxRoot(extraWritableRoots, value) {
-			extraWritableRoots = append(extraWritableRoots, value)
+		canonical, err := canonicalizeAgentbusStateRoot("writable root", value)
+		if err != nil {
+			return err
+		}
+		if !containsCodexSandboxRoot(extraWritableRoots, canonical) {
+			extraWritableRoots = append(extraWritableRoots, canonical)
 		}
 		return nil
 	})
