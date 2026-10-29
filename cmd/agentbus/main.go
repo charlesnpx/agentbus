@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,8 +36,13 @@ const (
 	cliExitDaemonStartupFailure = 11
 	cliExitShutdownForced       = 13
 	cliExitResultUnavailable    = 15
+	cliExitObservationTimeout   = 16
+	cliStatusDefaultLimit       = 50
+	cliTranscriptFollowPageSize = 100
 	shortSHA256HexLength        = 12
 )
+
+const cliObservationPollInterval = 250 * time.Millisecond
 
 var version = "dev"
 
@@ -57,7 +63,10 @@ type protocolClient interface {
 }
 
 func main() {
-	os.Exit(newDefaultApp().run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt)
+	code := newDefaultApp().run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+	stopSignals()
+	os.Exit(code)
 }
 
 func newDefaultApp() *app {
@@ -99,6 +108,27 @@ func (a *app) run(ctx context.Context, args []string, _ io.Reader, out, errOut i
 		printRootHelp(errOut)
 		return 2
 	}
+	if args[0] == "--help" || args[0] == "-h" {
+		printRootHelp(out)
+		return 0
+	}
+	if args[0] == "help" {
+		if len(args) == 1 {
+			printRootHelp(out)
+			return 0
+		}
+		if len(args) != 2 || !knownCommand(args[1]) {
+			return usageError(errOut, "help accepts one known command")
+		}
+		printCommandHelp(out, args[1])
+		return 0
+	}
+	if hasHelpFlag(args[1:]) {
+		if knownCommand(args[0]) {
+			printCommandHelp(out, args[0])
+			return 0
+		}
+	}
 	// These are spellings of version, not additional commands.
 	command := args[0]
 	if command == "--version" || command == "-version" || command == "-V" {
@@ -121,6 +151,45 @@ func (a *app) run(ctx context.Context, args []string, _ io.Reader, out, errOut i
 		return runConfigureCodexSandbox(args[1:], out, errOut)
 	default:
 		return usageError(errOut, "unknown command %q", args[0])
+	}
+}
+
+func knownCommand(command string) bool {
+	switch command {
+	case "version", "serve", "status", "transcript", "result", "cancel", "configure-codex-sandbox":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasHelpFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "--help" || arg == "-h" {
+			return true
+		}
+	}
+	return false
+}
+
+func printCommandHelp(out io.Writer, command string) {
+	switch command {
+	case "version":
+		fmt.Fprintln(out, "Usage: agentbus version [--json]")
+	case "serve":
+		fmt.Fprintln(out, "Usage: agentbus serve [--foreground]")
+	case "status":
+		fmt.Fprintln(out, "Usage: agentbus status [--job <id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--limit <n>] [--before <cursor> | --all] [--json]")
+	case "transcript":
+		fmt.Fprintln(out, "Usage: agentbus transcript --job <id> [--follow] [--kind <kind>]... [--since <rfc3339>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]")
+	case "result":
+		fmt.Fprintln(out, "Usage: agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]")
+	case "cancel":
+		fmt.Fprintln(out, "Usage: agentbus cancel --job <id> [--json]")
+	case "configure-codex-sandbox":
+		fmt.Fprintln(out, "Usage: agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]")
+	default:
+		printRootHelp(out)
 	}
 }
 
@@ -295,6 +364,9 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 	jsonOut := fs.Bool("json", false, "emit the protocol response")
 	jobID := fs.String("job", "", "job id")
 	workspaceKey := fs.String("workspace-key", "", "filter list by submitter workspace key")
+	limit := fs.Int("limit", cliStatusDefaultLimit, "limit list results (default 50 newest jobs)")
+	before := fs.String("before", "", "continue a truncated list from its nextCursor")
+	all := fs.Bool("all", false, "list all matching jobs")
 	var tagValues []string
 	fs.Func("tag", "filter list by key=value (repeatable)", func(value string) error {
 		tagValues = append(tagValues, value)
@@ -311,8 +383,18 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 	if fs.NArg() != 0 {
 		return usageError(errOut, "status does not accept positional arguments")
 	}
-	if *jobID != "" && (*workspaceKey != "" || len(tagValues) > 0 || len(stateValues) > 0) {
-		return usageError(errOut, "--workspace-key, --tag, and --state apply only without --job")
+	limitSet := transcriptFlagSet(fs, "limit")
+	beforeSet := transcriptFlagSet(fs, "before")
+	listFlagsSet := transcriptFlagSet(fs, "workspace-key") || transcriptFlagSet(fs, "tag") || transcriptFlagSet(fs, "state") ||
+		limitSet || beforeSet || transcriptFlagSet(fs, "all")
+	if *jobID != "" && listFlagsSet {
+		return usageError(errOut, "--workspace-key, --tag, --state, --limit, --before, and --all apply only without --job")
+	}
+	if *all && (limitSet || beforeSet) {
+		return usageError(errOut, "--all cannot be combined with --limit or --before")
+	}
+	if *limit <= 0 {
+		return usageError(errOut, "--limit must be a positive integer")
 	}
 	var listParams agentclient.JobListParams
 	if *jobID == "" {
@@ -320,6 +402,10 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 		listParams, err = a.statusListParams(*workspaceKey, tagValues, stateValues)
 		if err != nil {
 			return commandError(errOut, fmt.Errorf("status list parameters: %w", err))
+		}
+		if !*all {
+			listParams.Limit = *limit
+			listParams.Cursor = *before
 		}
 	}
 	client, err := a.connectProtocolClient(ctx)
@@ -350,6 +436,9 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 				summary.LastActivityAt,
 				summary.Liveness,
 			)
+		}
+		if list.Truncated {
+			fmt.Fprintf(errOut, "agentbus: status list truncated; continue with --before <cursor> --limit %d (nextCursor=%s)\n", *limit, list.NextCursor)
 		}
 		return 0
 	}
@@ -384,6 +473,7 @@ func (a *app) runTranscript(ctx context.Context, args []string, out, errOut io.W
 	fs := newCommandFlagSet("transcript", errOut)
 	jsonOut := fs.Bool("json", false, "emit the job.transcript response")
 	jobID := fs.String("job", "", "job id")
+	follow := fs.Bool("follow", false, "follow transcript items until the job is terminal and pages are drained")
 	var kinds []string
 	fs.Func("kind", "include transcript kind (repeatable)", func(value string) error {
 		kinds = append(kinds, value)
@@ -421,11 +511,19 @@ func (a *app) runTranscript(ctx context.Context, args []string, out, errOut io.W
 		params.Limit = limit
 	}
 
+	if *follow {
+		if transcriptFlagSet(fs, "since") || transcriptFlagSet(fs, "last") || transcriptFlagSet(fs, "limit") {
+			return usageError(errOut, "--follow can be combined with --kind and --since-ordinal, but not --since, --last, or --limit")
+		}
+	}
 	client, err := a.connectProtocolClient(ctx)
 	if err != nil {
 		return protocolCommandError(errOut, "transcript", err)
 	}
 	defer client.Close()
+	if *follow {
+		return a.followTranscript(ctx, client, *jobID, kinds, *sinceOrdinal, transcriptFlagSet(fs, "since-ordinal"), *jsonOut, out, errOut)
+	}
 	transcript, err := client.JobTranscript(ctx, params)
 	if err != nil {
 		return protocolCommandError(errOut, "transcript", err)
@@ -492,6 +590,135 @@ func printJobTranscript(out io.Writer, transcript agentclient.JobTranscriptResul
 	}
 }
 
+type transcriptFollowSummary struct {
+	Type      string               `json:"type"`
+	State     protocol.PublicState `json:"state"`
+	Liveness  protocol.Liveness    `json:"liveness,omitempty"`
+	ItemCount int                  `json:"itemCount"`
+	Counts    map[string]int       `json:"counts"`
+	FirstAt   *time.Time           `json:"firstAt,omitempty"`
+	LastAt    *time.Time           `json:"lastAt,omitempty"`
+	Gap       bool                 `json:"gap"`
+}
+
+func (a *app) followTranscript(ctx context.Context, client protocolClient, jobID string, kinds []string, startOrdinal int, hasStartOrdinal, jsonOut bool, out, errOut io.Writer) int {
+	cursor := 0
+	if hasStartOrdinal {
+		cursor = startOrdinal
+	}
+	pageSize := cliTranscriptFollowPageSize
+	delay := cliObservationPollInterval
+	var latest agentclient.JobTranscriptResult
+	for {
+		sinceOrdinal := cursor
+		page, err := client.JobTranscript(ctx, agentclient.JobTranscriptParams{
+			JobID:        jobID,
+			Kinds:        append([]string(nil), kinds...),
+			SinceOrdinal: &sinceOrdinal,
+			Limit:        &pageSize,
+		})
+		if err != nil {
+			if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+				if err := writeTranscriptFollowSummary(out, latest, jsonOut); err != nil {
+					return commandError(errOut, err)
+				}
+				return cliExitCodeForRecord(agentclient.JobGetResult{State: latest.State})
+			}
+			return protocolCommandError(errOut, "transcript", err)
+		}
+		latest = page
+		for _, item := range page.Items {
+			if item.Ordinal <= cursor {
+				continue
+			}
+			if jsonOut {
+				if code := writeOrError(out, errOut, item); code != 0 {
+					return code
+				}
+			} else {
+				printTranscriptItem(out, item)
+			}
+			cursor = item.Ordinal
+		}
+		if page.State.IsTerminal() && len(page.Items) < pageSize {
+			break
+		}
+		if !page.State.IsTerminal() && len(page.Items) < pageSize {
+			if !waitForObservation(ctx, delay, 0) {
+				if err := writeTranscriptFollowSummary(out, latest, jsonOut); err != nil {
+					return commandError(errOut, err)
+				}
+				return cliExitCodeForRecord(agentclient.JobGetResult{State: latest.State})
+			}
+			if delay < 2*time.Second {
+				delay *= 2
+				if delay > 2*time.Second {
+					delay = 2 * time.Second
+				}
+			}
+		}
+	}
+	if err := writeTranscriptFollowSummary(out, latest, jsonOut); err != nil {
+		return commandError(errOut, err)
+	}
+	record, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: jobID})
+	if err != nil {
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+			return cliExitCodeForRecord(agentclient.JobGetResult{State: latest.State})
+		}
+		return protocolCommandError(errOut, "transcript", err)
+	}
+	return cliExitCodeForRecord(record)
+}
+
+func printTranscriptItem(out io.Writer, item agentclient.TranscriptItem) {
+	fmt.Fprintf(out, "%d kind=%s at=%s", item.Ordinal, item.Kind, humanTime(item.At))
+	if item.Name != "" {
+		fmt.Fprintf(out, " name=%q", item.Name)
+	}
+	if item.Text != "" {
+		fmt.Fprintf(out, " text=%q", item.Text)
+	}
+	if item.Truncated {
+		fmt.Fprint(out, " truncated=true")
+	}
+	fmt.Fprintln(out)
+}
+
+func writeTranscriptFollowSummary(out io.Writer, transcript agentclient.JobTranscriptResult, jsonOut bool) error {
+	if jsonOut {
+		return writeJSON(out, transcriptFollowSummary{
+			Type: "summary", State: transcript.State, Liveness: transcript.Liveness,
+			ItemCount: transcript.ItemCount, Counts: transcript.Counts, FirstAt: transcript.FirstAt,
+			LastAt: transcript.LastAt, Gap: transcript.Gap,
+		})
+	}
+	if _, err := fmt.Fprintf(out, "state=%s itemCount=%d", transcript.State, transcript.ItemCount); err != nil {
+		return err
+	}
+	if transcript.Liveness != "" {
+		if _, err := fmt.Fprintf(out, " liveness=%s", transcript.Liveness); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintf(out, " gap=%t\n", transcript.Gap)
+	return err
+}
+
+func waitForObservation(ctx context.Context, delay time.Duration, remaining time.Duration) bool {
+	if remaining > 0 && delay > remaining {
+		delay = remaining
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func parseTagFilters(values []string) (map[string]string, error) {
 	if len(values) == 0 {
 		return nil, nil
@@ -529,6 +756,8 @@ func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Write
 	fs := newCommandFlagSet("result", errOut)
 	jsonOut := fs.Bool("json", false, "emit the v3 job.get response")
 	jobID := fs.String("job", "", "job id")
+	wait := fs.Bool("wait", false, "observe the job until it is terminal or the timeout expires")
+	waitTimeoutValue := fs.String("wait-timeout", "30m", "maximum observation time (requires --wait; include a unit such as 30m)")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
@@ -538,12 +767,30 @@ func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Write
 	if *jobID == "" {
 		return usageError(errOut, "result requires --job <id>")
 	}
+	waitTimeoutSet := transcriptFlagSet(fs, "wait-timeout")
+	waitTimeout := 30 * time.Minute
+	if *wait || waitTimeoutSet {
+		var err error
+		waitTimeout, err = parseWaitDuration(*waitTimeoutValue)
+		if err != nil {
+			return usageError(errOut, "%v", err)
+		}
+	}
+	if waitTimeoutSet && !*wait {
+		return usageError(errOut, "--wait-timeout requires --wait")
+	}
 	client, err := a.connectProtocolClient(ctx)
 	if err != nil {
 		return protocolCommandError(errOut, "result", err)
 	}
 	defer client.Close()
-	record, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: *jobID})
+	var record agentclient.JobGetResult
+	observationTimedOut := false
+	if *wait {
+		record, observationTimedOut, err = a.observeJob(ctx, client, *jobID, waitTimeout)
+	} else {
+		record, err = client.JobGet(ctx, agentclient.JobGetParams{JobID: *jobID})
+	}
 	if err != nil {
 		return protocolCommandError(errOut, "result", err)
 	}
@@ -555,12 +802,98 @@ func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Write
 		if resultArtifactUnavailable(record) {
 			return cliExitResultUnavailable
 		}
+		if observationTimedOut {
+			return cliExitObservationTimeout
+		}
 		return code
 	}
 	if resultCode := printJobRecordResult(out, errOut, record); resultCode != 0 {
 		return resultCode
 	}
+	if observationTimedOut {
+		return cliExitObservationTimeout
+	}
 	return code
+}
+
+func (a *app) observeJob(ctx context.Context, client protocolClient, jobID string, timeout time.Duration) (agentclient.JobGetResult, bool, error) {
+	deadline := time.Now().Add(timeout)
+	delay := cliObservationPollInterval
+	last, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: jobID})
+	if err != nil {
+		return agentclient.JobGetResult{}, false, err
+	}
+	if last.State.IsTerminal() {
+		return last, false, nil
+	}
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return last, true, nil
+		}
+		if !waitForObservation(ctx, delay, remaining) {
+			if ctx.Err() != nil {
+				return last, false, ctx.Err()
+			}
+			return last, true, nil
+		}
+		if time.Until(deadline) <= 0 {
+			return last, true, nil
+		}
+		requestCtx, cancel := context.WithDeadline(ctx, deadline)
+		requestDeadline, _ := requestCtx.Deadline()
+		callerDeadline, hasCallerDeadline := ctx.Deadline()
+		observationDeadlineBoundsRequest := requestDeadline.Equal(deadline) && (!hasCallerDeadline || deadline.Before(callerDeadline))
+		record, err := client.JobGet(requestCtx, agentclient.JobGetParams{JobID: jobID})
+		cancel()
+		if err != nil {
+			if ctx.Err() == nil && observationDeadlineBoundsRequest && time.Until(deadline) <= 0 && isDeadlineError(err) {
+				return last, true, nil
+			}
+			return last, false, err
+		}
+		last = record
+		if record.State.IsTerminal() {
+			return record, false, nil
+		}
+		if delay < 2*time.Second {
+			delay *= 2
+			if delay > 2*time.Second {
+				delay = 2 * time.Second
+			}
+		}
+	}
+}
+
+func isDeadlineError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
+}
+
+func parseWaitDuration(value string) (time.Duration, error) {
+	if _, err := strconv.ParseFloat(value, 64); err == nil && strings.TrimSpace(value) == value && value != "" {
+		unitful := value + "s"
+		parsed, parseErr := time.ParseDuration(unitful)
+		if parseErr == nil {
+			alternate := parsed.String()
+			if parsed%time.Minute == 0 {
+				alternate = fmt.Sprintf("%dm", parsed/time.Minute)
+			}
+			return 0, fmt.Errorf("%s is ambiguous; use %s or %s", value, unitful, alternate)
+		}
+		return 0, fmt.Errorf("%s is ambiguous; include a unit, for example 2400s or 40m", value)
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("--wait-timeout requires a duration with an explicit unit: %w", err)
+	}
+	if duration <= 0 {
+		return 0, errors.New("--wait-timeout must be greater than zero")
+	}
+	return duration, nil
 }
 
 func (a *app) runCancel(ctx context.Context, args []string, out, errOut io.Writer) int {
@@ -860,6 +1193,11 @@ func newCommandFlagSet(name string, errOut io.Writer) *flag.FlagSet {
 }
 
 func parseFlags(fs *flag.FlagSet, args []string) (int, bool) {
+	if duplicate := duplicateSingletonFlag(fs, args); duplicate != "" {
+		fmt.Fprintf(fs.Output(), "agentbus: flag --%s specified more than once\n\n", duplicate)
+		fs.Usage()
+		return 2, false
+	}
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0, false
@@ -867,6 +1205,41 @@ func parseFlags(fs *flag.FlagSet, args []string) (int, bool) {
 		return 2, false
 	}
 	return 0, true
+}
+
+func duplicateSingletonFlag(fs *flag.FlagSet, args []string) string {
+	repeatable := map[string]bool{"kind": true, "tag": true, "state": true, "writable-root": true}
+	counts := make(map[string]int)
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			continue
+		}
+		name := strings.TrimLeft(arg, "-")
+		if flagName, _, hasValue := strings.Cut(name, "="); hasValue {
+			name = flagName
+		}
+		flag := fs.Lookup(name)
+		if flag == nil {
+			continue
+		}
+		counts[name]++
+		if counts[name] > 1 && !repeatable[name] {
+			return name
+		}
+		if !strings.Contains(arg, "=") && !isBoolFlag(flag) && i+1 < len(args) {
+			i++
+		}
+	}
+	return ""
+}
+
+func isBoolFlag(flag *flag.Flag) bool {
+	value, ok := flag.Value.(interface{ IsBoolFlag() bool })
+	return ok && value.IsBoolFlag()
 }
 
 func usageError(errOut io.Writer, format string, args ...any) int {
@@ -929,22 +1302,27 @@ func writeJSON(out io.Writer, v any) error {
 
 func printRootHelp(out io.Writer) {
 	fmt.Fprint(out, `Usage:
+  agentbus --help | -h | help
   agentbus version [--json] (aliases: --version, -version, -V)
   agentbus serve [--foreground]
-  agentbus status [--job <id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--json]
-  agentbus transcript --job <id> [--kind <kind>]... [--last <n>] [--since <rfc3339>] [--since-ordinal <n>] [--limit <n>] [--json]
-  agentbus result --job <id> [--json]
+  agentbus status [--job <id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--limit <n>] [--before <cursor> | --all] [--json]
+  agentbus transcript --job <id> [--follow] [--kind <kind>]... [--last <n>] [--since <rfc3339>] [--since-ordinal <n>] [--limit <n>] [--json]
+  agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]
   agentbus cancel --job <id> [--json]
   agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]
 
 status and result use the same job.get record for a selected job. Their JSON
 output is identical; status is the operator projection and result is pipeable.
+The status list defaults to 50 newest jobs; use --before with the returned
+nextCursor to continue, or --all for full history. Duration values require
+units: 2400 is ambiguous; use 2400s or 40m.
 
 Exit codes for a selected job:
   completed=0, queued/running=2, completed-noncompliant=3, failed=4,
   timeout=5, interrupted=6, canceled=7, unknown-job=10,
   daemon-startup-failure=11, shutdown-deadline=13, unknown=14,
-  result-artifact-unavailable=15: completed, but the authoritative result artifact is missing, unreadable, or does not match its recorded digest
+  result-artifact-unavailable=15: completed, but the authoritative result artifact is missing, unreadable, or does not match its recorded digest,
+  observation-timeout=16: result observation expired; the job was not canceled
 `)
 }
 
