@@ -23,11 +23,12 @@ state-root break for this release, are in
 
 ~~~text
 agentbus version [--json]
-agentbus serve [--foreground]
+agentbus serve [--foreground] [--prune-interval 24h]
 agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--workspace-key <key>] [--json]
 agentbus transcript --job <id> [--kind <kind>] [--since <timestamp>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]
 agentbus result --job <id> [--json]
 agentbus cancel --job <id> [--json]
+agentbus prune [--apply] [--successful-older-than 168h] [--failed-older-than 720h] [--json]
 agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]
 ~~~
 

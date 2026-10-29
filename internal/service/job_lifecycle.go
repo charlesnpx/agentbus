@@ -219,6 +219,7 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 		Contract:      projectContract(record, spec),
 		Failure:       projectFailure(record),
 		Cleanup:       record.Cleanup,
+		LogsPruned:    record.LogsPruned,
 		LogPaths:      projectLogPaths(record),
 		ModelReported: s.projectedModelReported(record),
 	}, nil

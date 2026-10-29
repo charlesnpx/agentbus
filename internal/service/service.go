@@ -89,6 +89,7 @@ type Config struct {
 	IdleTimeout       time.Duration
 	IdleCheckInterval time.Duration
 	ShutdownTimeout   time.Duration
+	PruneInterval     time.Duration
 	ReadyHook         func(ServeReadyInfo) error
 }
 
@@ -140,6 +141,13 @@ type Server struct {
 	jobStoreMu sync.Mutex
 	jobStore   *jobstore.Store
 
+	pruneMu          sync.Mutex
+	pruneInterval    time.Duration
+	pruneIndexCursor string
+	pruneApplyCursor string
+	pruneTargets     map[string]struct{}
+	pruneIndexed     bool
+
 	// processTable, processGroups, and processGroupGoneFn are the service's restart-recovery
 	// dependencies. They deliberately live here instead of in jobstore: the
 	// store owns durable records, while service owns the only process action
@@ -189,6 +197,9 @@ type Server struct {
 // New creates a daemon server and ensures that its state root and token file
 // exist. An existing token always wins over Config.Token.
 func New(cfg Config) (*Server, error) {
+	if cfg.PruneInterval < 0 {
+		return nil, errors.New("prune interval cannot be negative")
+	}
 	root, err := ensureStateRoot(cfg.StateRoot)
 	if err != nil {
 		return nil, err
@@ -238,6 +249,7 @@ func New(cfg Config) (*Server, error) {
 		idleTimeout:       idleTimeout,
 		idleCheckInterval: idleCheckInterval,
 		shutdownTimeout:   normalizeShutdownTimeout(cfg.ShutdownTimeout),
+		pruneInterval:     cfg.PruneInterval,
 		readyHook:         cfg.ReadyHook,
 		lastActivity:      time.Now().UTC(),
 	}, nil
@@ -297,6 +309,7 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	}
 	serveCtx, cancel := context.WithCancel(ctx)
 	s.beginExecutions(serveCtx)
+	var pruneWG sync.WaitGroup
 	lifecycle := &serveLifecycle{
 		listener:      listener,
 		socket:        socketIdentity,
@@ -315,10 +328,10 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 		_ = listener.Close()
 		s.removeOwnedSocket(socketIdentity, "server shutdown")
 		cancel()
+		pruneWG.Wait()
 		s.clearLifecycle(lifecycle)
 		close(lifecycle.serveDone)
 	}()
-
 	if err := startupCtx.Err(); err != nil {
 		return err
 	}
@@ -326,6 +339,13 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 		if err := s.readyHook(ServeReadyInfo{StateRoot: s.stateRoot, SocketPath: s.socketPath}); err != nil {
 			return err
 		}
+	}
+	if s.pruneInterval > 0 {
+		pruneWG.Add(1)
+		go func() {
+			defer pruneWG.Done()
+			s.automaticPruneLoop(serveCtx)
+		}()
 	}
 	s.touchActivity()
 	go func() {
@@ -572,6 +592,11 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, listen
 				}
 				s.removeOwnedSocket(socketIdentity, "stale daemon listener close")
 				staleDraining = true
+				continue
+			}
+			if s.pruneInterval > 0 {
+				// An enabled periodic sweep needs a daemon that remains available
+				// until its next tick, even when no clients are connected.
 				continue
 			}
 			if s.idleTimeout < 0 {

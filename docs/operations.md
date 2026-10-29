@@ -37,9 +37,37 @@ token authenticates protocol.hello. agentbus.sock exists while the daemon is
 serving. agentbus.pid is written for a successful background launch or
 client-autostart; do not rely on it for a foreground daemon. jobs.db is the
 single bbolt store. It has exactly the meta, requests, and jobs buckets.
-artifacts contains log and result sidecars. There is no automatic artifact
-retention sweep: result and log artifacts remain until an operator removes
-them, so the state root grows until it is cleaned up.
+artifacts contains log and result sidecars. Automatic pruning is disabled by
+default. `agentbus prune` previews eligible
+cleanup by default; pass `--apply` to delete. Completed jobs use a default age
+threshold of 168 hours (7 days); failed, canceled, and unknown jobs use 720
+hours (30 days). Both are configurable proposals through
+`--successful-older-than` and `--failed-older-than`, using Go duration syntax.
+The command reports the selected or removed paths and byte totals, plus any
+jobs or paths it skipped and why.
+
+Pruning selects only raw log sidecars below `artifacts/logs` and disposable
+`cache`/`tmp` directories below a managed per-job Codex home. The job must be
+terminal, have `cleanup=clean`, and be older than the threshold for its state.
+Transcript responses and `job.get` report `pruned=true` or `logsPruned=true`
+after log sidecars have been removed, distinguishing deliberate pruning from a
+missing capture.
+
+`agentbus serve --prune-interval 24h` enables an automatic sweep when that
+invocation starts a daemon; it is off by default and uses the same 7-day and
+30-day thresholds. The daemon stays available while periodic pruning is
+enabled, even when it has no connected clients. Each sweep processes at most
+64 job records for cleanup and skips a managed cache tree with more than 10,000
+entries, so later sweeps can continue through larger stores.
+
+Pruning never deletes job records, request bindings or fingerprints, result
+artifacts, active or queued jobs, jobs with uncertain cleanup, retained
+sessions, failed/canceled/unknown jobs with a recorded resumable backend
+session, or a job targeted by a non-terminal resume request. It never deletes
+TaskSpec.cwd contents, Git worktrees, supplied artifact paths, or anything
+Agentbus did not create under its state root. It also never follows a symlink
+outside an owned directory. Delegate review-packet directories remain
+Delegate-owned.
 
 A Codex job may also create an implementation-managed private home below
 workspaces/<workspace-hash>/codex/<job-id>. It is separate from the shared job
@@ -52,7 +80,7 @@ artifacts while a daemon is using the root.
 
 Use agentbus serve to start a background daemon. Use agentbus serve --foreground
 when a supervisor owns the process. The public CLI commands are version, serve,
-status, transcript, result, cancel, and configure-codex-sandbox.
+status, transcript, result, cancel, prune, and configure-codex-sandbox.
 
 `agentbus configure-codex-sandbox` adds the Agentbus state root and cache root to
 Codex's `sandbox_workspace_write.writable_roots` array. It preserves existing
@@ -138,8 +166,9 @@ marks recovered running work unknown and never relaunches it; the reaper signals
 a recorded process group only when its live start token exactly matches the
 recorded token. This is the deliberate trade-off for preventing duplicate work.
 
-Result and log artifacts remain until an operator removes them. Nothing reclaims
-that disk automatically.
+Result artifacts and all artifacts outside the first retention policy remain
+until an operator removes them. Automatic pruning remains disabled unless
+`serve --prune-interval` is set.
 
 Downstream pins are recorded in each consumer's own go.mod and are not restated
 here, because a version written into this runbook goes stale without warning.
