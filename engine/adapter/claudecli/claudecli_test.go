@@ -383,6 +383,67 @@ func TestClaudeStructuredRateLimitCarriesProviderEvidence(t *testing.T) {
 	}
 }
 
+func TestClaudeAssistantModelObservationReplacesSystemModel(t *testing.T) {
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("observe model")
+		peer.emitSystem("session-model", "model-a")
+		peer.write(map[string]any{
+			"type": "assistant",
+			"message": map[string]any{
+				"role":    "assistant",
+				"model":   "model-b",
+				"content": []any{},
+			},
+		})
+		peer.emitResult("success", false, "done")
+	})
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "observe model"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observations := eventsOfType(collectEventsWithTimeout(t, events, 2*time.Second), engine.EventModelReported)
+	if len(observations) != 2 || observations[0].ModelReported != "model-a" || observations[len(observations)-1].ModelReported != "model-b" {
+		t.Fatalf("model observations = %#v, want model-a followed by latest model-b", observations)
+	}
+}
+
+func TestClaudePermissionErrorWith403IsNotAuthentication(t *testing.T) {
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("permission denied")
+		peer.write(map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "permission_error",
+				"status":  403,
+				"message": "permission denied",
+			},
+		})
+	})
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "permission denied"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	for _, event := range got {
+		var failure *engine.ProviderFailureError
+		if event.Type == engine.EventTerminalError && errors.As(event.Err, &failure) {
+			if failure.Evidence.Class == "authentication" {
+				t.Fatalf("provider failure = %+v, want permission_error status 403 not classified as authentication", failure.Evidence)
+			}
+			return
+		}
+	}
+	t.Fatalf("events = %#v, want structured permission failure", got)
+}
+
 func TestClaudeSessionIDCapturedAndResumed(t *testing.T) {
 	runner := newFakeClaudeRunner(t,
 		func(t *testing.T, proc *fakeClaudeProcess, spec command.ExecSpec) {

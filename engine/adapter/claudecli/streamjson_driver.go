@@ -327,6 +327,7 @@ func (s *claudeStream) emitModelReported(obj map[string]any) {
 
 func (s *claudeStream) emitAssistant(obj map[string]any) {
 	msg, _ := firstMap(obj, "message")
+	s.emitModelReported(msg)
 	hasAgentDelta := s.partialAgentTextEmitted
 	s.partialAgentTextEmitted = false
 	content := anySlice(msg["content"])
@@ -394,6 +395,8 @@ func (s *claudeStream) emitPartialAssistant(obj map[string]any) {
 	switch strings.ToLower(firstString(event, "type")) {
 	case "message_start":
 		s.partialAgentTextEmitted = false
+		message, _ := firstMap(event, "message")
+		s.emitModelReported(message)
 	case "content_block_delta":
 		s.emitPartialAgentText(event, obj)
 	}
@@ -520,7 +523,7 @@ func classifyClaudeProviderFailure(code, message string, objects []map[string]an
 		return "content_policy"
 	}
 	for _, object := range objects {
-		if status := firstNumber(object, "status", "status_code", "statusCode"); status == 401 || status == 403 {
+		if status := firstNumber(object, "status", "status_code", "statusCode"); status == 401 {
 			return "authentication"
 		}
 	}

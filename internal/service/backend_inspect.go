@@ -117,6 +117,7 @@ func (s *Server) backendVersion(path string) (string, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), backendVersionProbeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "--version")
+	cmd.WaitDelay = 500 * time.Millisecond
 	stdout := &boundedOutput{limit: backendVersionOutputCap}
 	stderr := &boundedOutput{limit: backendVersionOutputCap}
 	cmd.Stdout = stdout

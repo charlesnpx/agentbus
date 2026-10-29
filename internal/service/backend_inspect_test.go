@@ -8,8 +8,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/internal/protocol"
@@ -107,6 +109,67 @@ func TestBackendInspectIsolatesVersionFailureAndCachesSuccessfulProbe(t *testing
 	}
 	if string(count) != "x" {
 		t.Fatalf("version probe count marker = %q, want one invocation", count)
+	}
+}
+
+func TestBackendInspectBoundsVersionProbeWithInheritedOutputPipe(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lingering-backend")
+	childPIDPath := filepath.Join(dir, "child-pid")
+	script := "#!/bin/sh\nsleep 60 &\necho $! > " + shellQuote(childPIDPath) + "\nprintf 'lingering-backend 1.0\\n'\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	killChild := func() {
+		pidText, err := os.ReadFile(childPIDPath)
+		if err != nil {
+			return
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(pidText)))
+		if err != nil {
+			return
+		}
+		child, err := os.FindProcess(pid)
+		if err == nil {
+			_ = child.Kill()
+		}
+	}
+	t.Cleanup(killChild)
+
+	server := newTestServer(t, t.TempDir(), Config{
+		Backends: []engine.Backend{inspectTestBackend{name: "lingering", path: path}},
+	})
+	type inspectionResult struct {
+		result protocol.BackendInspectResult
+		err    *protocol.ErrorObject
+	}
+	done := make(chan inspectionResult, 1)
+	started := time.Now()
+	go func() {
+		outcome := server.handleBackendInspect(json.RawMessage(`{}`))
+		result, _ := outcome.result.(protocol.BackendInspectResult)
+		done <- inspectionResult{result: result, err: outcome.err}
+	}()
+
+	select {
+	case inspected := <-done:
+		elapsed := time.Since(started)
+		if inspected.err != nil {
+			t.Fatalf("backend.inspect error = %#v", inspected.err)
+		}
+		if elapsed > 4*time.Second {
+			t.Fatalf("backend.inspect took %s, want return within 4s", elapsed)
+		}
+		if len(inspected.result.Backends) != 1 || inspected.result.Backends[0].Error == "" {
+			t.Fatalf("backend entries = %#v, want one version-probe error entry", inspected.result.Backends)
+		}
+	case <-time.After(4 * time.Second):
+		killChild()
+		<-done
+		t.Fatal("backend.inspect did not return within 4s while a child held stdout open")
 	}
 }
 
