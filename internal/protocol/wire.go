@@ -381,7 +381,21 @@ type JobRecordWire struct {
 	Cleanup       Cleanup                   `json:"cleanup"`
 	LogPaths      *LogPathsWire             `json:"logPaths,omitempty"`
 	ModelReported string                    `json:"modelReported,omitempty"`
+	Execution     *ExecutionPosture         `json:"execution,omitempty"`
 	Steers        []SteerSummaryWire        `json:"steers"`
+}
+
+// ExecutionPosture records the requested source access and the backend
+// enforcement and scratch/cache paths selected when a job starts. It is
+// descriptive; it does not negotiate or expand backend capabilities.
+type ExecutionPosture struct {
+	Intent         string            `json:"intent"`
+	SourceWritable bool              `json:"sourceWritable"`
+	Scratch        string            `json:"scratch,omitempty"`
+	Caches         map[string]string `json:"caches,omitempty"`
+	Network        string            `json:"network"`
+	GitMetadata    string            `json:"gitMetadata"`
+	Enforcement    string            `json:"enforcement"`
 }
 
 // JobSummaryWire is the compact item returned when job.list lists jobs. It
