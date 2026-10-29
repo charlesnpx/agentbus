@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,7 +19,10 @@ import (
 	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/protocol"
 	"github.com/charlesnpx/agentbus/internal/schema"
+	"golang.org/x/sys/unix"
 )
+
+const lowStateRootSpaceThresholdBytes uint64 = 256 * 1024 * 1024
 
 // activeExecution is deliberately small. The retained adapter and
 // command.DirectCommandRunner own process-group creation, TERM, bounded wait,
@@ -27,6 +31,9 @@ import (
 type activeExecution struct {
 	jobID   string
 	backend engine.Backend
+	// slotAcquiredAt starts the execution timeout and is fixed when the
+	// scheduler reserves a concurrency slot.
+	slotAcquiredAt time.Time
 
 	// launchMu linearizes a cancellation request with the two calls that may
 	// cross a process-launch boundary. A request that acquires it first keeps a
@@ -190,6 +197,10 @@ func (run *activeExecution) startSession(ctx context.Context, opts engine.Sessio
 	if run.cancellationRequested() {
 		run.launchMu.Unlock()
 		return nil, context.Canceled, true
+	}
+	if err := ctx.Err(); err != nil {
+		run.launchMu.Unlock()
+		return nil, err, false
 	}
 	var (
 		session engine.Session
@@ -478,6 +489,8 @@ func (s *Server) beginExecutions(parent context.Context) {
 	if s.executions == nil {
 		s.executions = make(map[string]*activeExecution)
 	}
+	s.queuedJobs = nil
+	s.runningByBackend = make(map[string]int)
 	s.executionMu.Unlock()
 }
 
@@ -492,16 +505,49 @@ func (s *Server) stopExecutions() {
 	cancel := s.executionCancel
 	s.executionCtx = nil
 	s.executionCancel = nil
+	queued := len(s.queuedJobs)
+	s.queuedJobs = nil
 	s.executionMu.Unlock()
+	if queued > 0 {
+		s.activeJobs.Add(-int64(queued))
+	}
 	if cancel != nil {
 		cancel()
 	}
 	s.executionWG.Wait()
 }
 
-// enqueueQueuedJob starts exactly one newly admitted queued record while the
-// daemon is serving. A recovered queued record is intentionally never passed
-// here.
+type queuedJob struct {
+	record  jobstore.Record
+	backend engine.Backend
+}
+
+// queueWouldExceed reports whether a new submission would wait beyond the
+// configured queue bound. A submission that can claim an immediately free
+// slot is not a queue entry, even when the waiting queue is full.
+func (s *Server) queueWouldExceed(backend string) bool {
+	s.executionMu.Lock()
+	defer s.executionMu.Unlock()
+	if s.executionCtx == nil || s.executionCtx.Err() != nil {
+		return false
+	}
+	if len(s.queuedJobs) < s.maxQueued {
+		return false
+	}
+	if len(s.executions) >= s.maxJobs || s.runningByBackend[backend] >= s.maxJobsPerBackend {
+		return true
+	}
+	for _, queued := range s.queuedJobs {
+		if queued.record.Backend == backend {
+			return true
+		}
+	}
+	return false
+}
+
+// enqueueQueuedJob records one newly admitted queued job and fills every
+// currently available slot without allowing a saturated backend to block a
+// later eligible backend. Recovered jobs are intentionally never passed here.
 func (s *Server) enqueueQueuedJob(record jobstore.Record, backend engine.Backend) {
 	if s == nil || record.State != protocol.PublicStateQueued || record.JobID == "" {
 		return
@@ -511,27 +557,85 @@ func (s *Server) enqueueQueuedJob(record jobstore.Record, backend engine.Backend
 		s.executionMu.Unlock()
 		return
 	}
+	store, err := s.ensureJobStore()
+	if err != nil {
+		s.executionMu.Unlock()
+		return
+	}
+	current, err := store.Get(record.JobID)
+	if err != nil || current.State != protocol.PublicStateQueued || current.Starting {
+		s.executionMu.Unlock()
+		return
+	}
+	record = current
+	for _, queued := range s.queuedJobs {
+		if queued.record.JobID == record.JobID {
+			s.executionMu.Unlock()
+			return
+		}
+	}
 	if _, exists := s.executions[record.JobID]; exists {
 		s.executionMu.Unlock()
 		return
 	}
-	run := newActiveExecution(record.JobID, backend)
-	s.executions[record.JobID] = run
+	s.queuedJobs = append(s.queuedJobs, queuedJob{record: record, backend: backend})
+	s.activeJobs.Add(1)
+	s.dispatchQueuedLocked()
+	s.executionMu.Unlock()
+}
+
+// dispatchQueuedLocked starts as many eligible jobs as the daemon-owned
+// global and per-backend limits permit. The first eligible item wins; an
+// earlier item for a saturated backend does not block a different backend.
+// The caller holds executionMu.
+func (s *Server) dispatchQueuedLocked() {
+	for s.executionCtx != nil && s.executionCtx.Err() == nil && len(s.executions) < s.maxJobs {
+		selected := -1
+		for index, queued := range s.queuedJobs {
+			if s.runningByBackend[queued.record.Backend] < s.maxJobsPerBackend {
+				selected = index
+				break
+			}
+		}
+		if selected < 0 {
+			return
+		}
+		queued := s.queuedJobs[selected]
+		copy(s.queuedJobs[selected:], s.queuedJobs[selected+1:])
+		s.queuedJobs[len(s.queuedJobs)-1] = queuedJob{}
+		s.queuedJobs = s.queuedJobs[:len(s.queuedJobs)-1]
+		s.startQueuedJobLocked(queued)
+	}
+}
+
+// startQueuedJobLocked reserves a slot before the goroutine can cross the
+// durable starting transition. The caller holds executionMu.
+func (s *Server) startQueuedJobLocked(queued queuedJob) {
+	if _, exists := s.executions[queued.record.JobID]; exists {
+		return
+	}
+	run := newActiveExecution(queued.record.JobID, queued.backend)
+	run.slotAcquiredAt = time.Now().UTC()
+	s.executions[queued.record.JobID] = run
+	s.runningByBackend[queued.record.Backend]++
 	parent := s.executionCtx
 	s.executionWG.Add(1)
-	s.activeJobs.Add(1)
-	s.executionMu.Unlock()
 
 	go func() {
 		defer s.executionWG.Done()
-		defer s.activeJobs.Add(-1)
 		defer s.touchActivity()
-		s.runJob(parent, record, run)
+		s.runJob(parent, queued.record, run)
 		s.executionMu.Lock()
-		if s.executions[record.JobID] == run {
-			delete(s.executions, record.JobID)
+		if s.executions[queued.record.JobID] == run {
+			delete(s.executions, queued.record.JobID)
 		}
+		s.runningByBackend[queued.record.Backend]--
+		if s.runningByBackend[queued.record.Backend] <= 0 {
+			delete(s.runningByBackend, queued.record.Backend)
+		}
+		s.dispatchQueuedLocked()
 		s.executionMu.Unlock()
+		s.activeJobs.Add(-1)
 	}()
 }
 
@@ -564,19 +668,41 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	// effective timeout has exactly one source of truth.
 	timeout := time.Duration(resolution.Effective) * time.Millisecond
 
-	jobCtx, cancel := context.WithCancel(parent)
+	var jobCtx context.Context
+	var cancel context.CancelFunc
 	if timeout > 0 {
-		jobCtx, cancel = context.WithTimeout(parent, timeout)
+		acquiredAt := run.slotAcquiredAt
+		if acquiredAt.IsZero() {
+			acquiredAt = time.Now().UTC()
+		}
+		jobCtx, cancel = context.WithDeadline(parent, acquiredAt.Add(timeout))
+	} else {
+		jobCtx, cancel = context.WithCancel(parent)
 	}
 	run.setCancel(cancel)
 	defer cancel()
 	if run.cancellationRequested() {
 		return
 	}
+	if err := jobCtx.Err(); err != nil {
+		s.finishStartError(store, record, jobCtx, err)
+		return
+	}
 
 	resumeTarget, err := resumeTargetForExecution(store, spec)
 	if err != nil {
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("resolve resume target: %w", err), nil)
+		return
+	}
+	if diagnostic := stateRootSpaceDiagnostic(s.stateRoot); diagnostic != "" {
+		if updated, appendErr := store.AppendDiagnostic(record.JobID, diagnostic); appendErr != nil {
+			log.Printf("agentbus service: job %s cannot record state-root space diagnostic: %v", record.JobID, appendErr)
+		} else {
+			record = updated
+		}
+	}
+	if err := jobCtx.Err(); err != nil {
+		s.finishStartError(store, record, jobCtx, err)
 		return
 	}
 
@@ -1149,6 +1275,9 @@ func drainTurnEvents(s *Server, run *activeExecution, events <-chan engine.Event
 func absorbTurnEvent(run *activeExecution, outcome *turnOutcome, assistant *strings.Builder, result *string, hasResult *bool, items *itemAssembler, event engine.Event) {
 	rawText := authoritativeText(event)
 	items.absorb(event, rawText)
+	if captureWarning, _ := event.Metadata["agentbusCaptureWarning"].(bool); captureWarning {
+		outcome.diagnostics = append(outcome.diagnostics, rawText)
+	}
 	switch event.Type {
 	case engine.EventModelReported:
 		model := strings.TrimSpace(event.ModelReported)
@@ -1225,8 +1354,9 @@ func cleanupForRun(run *activeExecution, cleanup protocol.Cleanup, diagnostics [
 func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstore.Record, text string, cleanup protocol.Cleanup, diagnostics []string, contract protocol.ContractResult, backendSessionID string) {
 	info, err := spillAuthoritativeResult(record, []byte(text))
 	if err != nil {
-		// The spill failure makes this a failed record, which may be resumed.
-		s.recordExecutionFailureWithSessionID(store, record, cleanup, protocol.FailureClassInternal, fmt.Errorf("spill authoritative result: %w", err), diagnostics, backendSessionID)
+		// Result persistence is mandatory for an authoritative completion. Keep
+		// the provider session and partial transcript available as a failed job.
+		s.recordExecutionFailureWithSessionID(store, record, cleanup, protocol.FailureClassStorage, fmt.Errorf("persist final result artifact: %w", err), diagnostics, backendSessionID)
 		return
 	}
 	resultText := info.Text
@@ -1237,15 +1367,16 @@ func (s *Server) recordExecutionCompletion(store *jobstore.Store, record jobstor
 	// store keeps the session ID for retained completed records so they can be
 	// resumed as a new job, and clears it for other completed records.
 	s.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
-		State:        protocol.PublicStateCompleted,
-		Cleanup:      cleanup,
-		Diagnostics:  diagnostics,
-		Contract:     contract,
-		ResultText:   resultText,
-		ResultPath:   info.ResultPath,
-		ResultSHA256: info.SHA256,
-		ResultBytes:  info.Bytes,
-		FinishedAt:   time.Now().UTC(),
+		State:            protocol.PublicStateCompleted,
+		Cleanup:          cleanup,
+		BackendSessionID: backendSessionID,
+		Diagnostics:      appendRecordDiagnostics(record.Diagnostics, diagnostics),
+		Contract:         contract,
+		ResultText:       resultText,
+		ResultPath:       info.ResultPath,
+		ResultSHA256:     info.SHA256,
+		ResultBytes:      info.Bytes,
+		FinishedAt:       time.Now().UTC(),
 	})
 }
 
@@ -1263,7 +1394,7 @@ func (s *Server) recordExecutionFailureWithSessionID(store *jobstore.Store, reco
 		BackendSessionID: backendSessionID,
 		FailureClass:     class,
 		FailureReason:    executionFailureReason(cause),
-		Diagnostics:      diagnostics,
+		Diagnostics:      appendRecordDiagnostics(record.Diagnostics, diagnostics),
 		FinishedAt:       time.Now().UTC(),
 	})
 }
@@ -1296,28 +1427,92 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 	if s.cancellationPending(jobID) {
 		return
 	}
-	if home := s.takeManagedCodexHome(jobID); home != nil {
+	var (
+		home          *managedCodexHome
+		cleanupRecord jobstore.Record
+	)
+	if home = s.takeManagedCodexHome(jobID); home != nil {
 		current, getErr := store.Get(jobID)
 		if getErr != nil {
 			home.close()
+			home = nil
 			terminal.Cleanup = protocol.CleanupUncertain
 			terminal.Diagnostics = append(terminal.Diagnostics, "inspect managed Codex home terminal record: "+getErr.Error())
 		} else if current.State.IsTerminal() {
 			home.close()
 			return
 		} else {
-			cleanupRecord := current
+			cleanupRecord = current
 			cleanupRecord.State = terminal.State
-			terminal.Cleanup, terminal.Diagnostics = finalizeManagedCodexHome(home, cleanupRecord, terminal.Cleanup, terminal.Diagnostics)
 		}
 	}
 	_, err := store.MarkTerminal(jobID, terminal)
-	if err == nil || errors.Is(err, jobstore.ErrTerminal) {
+	if err == nil {
+		if home != nil {
+			cleanup, diagnostics := finalizeManagedCodexHome(home, cleanupRecord, terminal.Cleanup, terminal.Diagnostics)
+			if cleanup != terminal.Cleanup && len(diagnostics) > len(terminal.Diagnostics) {
+				log.Printf("agentbus service: job %s managed Codex home cleanup after terminal write: %s", jobID, diagnostics[len(diagnostics)-1])
+			}
+		}
+		return
+	}
+	if errors.Is(err, jobstore.ErrTerminal) {
+		if home != nil {
+			home.close()
+		}
 		// ErrTerminal is the store-enforced first-terminal-wins result. A
 		// later observer never retries or overwrites that recorded outcome.
 		return
 	}
+	if terminal.State == protocol.PublicStateCompleted {
+		storageCause := fmt.Errorf("persist terminal job record: %w", err)
+		storageDiagnostic := "storage failure: " + executionFailureReason(storageCause)
+		failed := jobstore.TerminalUpdate{
+			State:            protocol.PublicStateFailed,
+			Cleanup:          terminal.Cleanup,
+			BackendSessionID: terminal.BackendSessionID,
+			FailureClass:     protocol.FailureClassStorage,
+			FailureReason:    executionFailureReason(storageCause),
+			Diagnostics:      appendRecordDiagnostics(terminal.Diagnostics, []string{storageDiagnostic}),
+			FinishedAt:       time.Now().UTC(),
+		}
+		if _, failureErr := store.MarkTerminal(jobID, failed); failureErr == nil {
+			if home != nil {
+				home.close()
+			}
+			return
+		} else if !errors.Is(failureErr, jobstore.ErrTerminal) {
+			err = errors.Join(err, fmt.Errorf("persist storage failure terminal record: %w", failureErr))
+		}
+	}
+	if home != nil {
+		home.close()
+	}
 	log.Printf("agentbus service: job %s terminal write failed: %v", jobID, err)
+}
+
+func appendRecordDiagnostics(recordDiagnostics, additional []string) []string {
+	result := append([]string(nil), recordDiagnostics...)
+	return append(result, additional...)
+}
+
+func stateRootSpaceDiagnostic(root string) string {
+	var stats unix.Statfs_t
+	if err := unix.Statfs(root, &stats); err != nil {
+		return ""
+	}
+	if stats.Bavail <= 0 || stats.Bsize <= 0 {
+		return fmt.Sprintf("low state-root free space: less than %d bytes available; warning threshold is %d bytes", uint64(0), lowStateRootSpaceThresholdBytes)
+	}
+	blocks, blockSize := uint64(stats.Bavail), uint64(stats.Bsize)
+	available := ^uint64(0)
+	if blocks <= math.MaxUint64/blockSize {
+		available = blocks * blockSize
+	}
+	if available >= lowStateRootSpaceThresholdBytes {
+		return ""
+	}
+	return fmt.Sprintf("low state-root free space: %d bytes available; warning threshold is %d bytes", available, lowStateRootSpaceThresholdBytes)
 }
 
 func executionFailureReason(err error) string {

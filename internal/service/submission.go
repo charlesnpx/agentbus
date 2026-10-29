@@ -18,6 +18,8 @@ import (
 
 const jobStoreFilename = "jobs.db"
 
+var errQueueFull = errors.New("agentbus submission queue is full")
+
 type jobSubmitInput struct {
 	key               jobstore.RequestKey
 	taskSpec          map[string]json.RawMessage
@@ -65,6 +67,16 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "open job store: "+err.Error(), protocol.ErrorData{})}
 	}
+	// Serialize admission through queue insertion so concurrent submissions
+	// cannot all observe the same final queue slot. The capacity snapshot is
+	// taken before entering bbolt to keep scheduler and store lock order
+	// independent. A full-queue rejection is still checked only in SubmitTx's
+	// new-record factory, so matching idempotent retries always return their
+	// original job.
+	s.submissionMu.Lock()
+	defer s.submissionMu.Unlock()
+	backendName := taskSpecBackendName(input.taskSpec)
+	queueFullAtAdmission := backendName != "" && s.queueWouldExceed(backendName)
 	var executionBackend engine.Backend
 	record, deduplicated, err := store.SubmitTxWithLookup(input.key, input.canonicalTaskSpec, func(id string, lookup jobstore.RecordLookup) (jobstore.Record, error) {
 		// Everything in this factory is new-key-only: SubmitTx has already
@@ -93,6 +105,9 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 		if err != nil {
 			return jobstore.Record{}, err
 		}
+		if queueFullAtAdmission && spec.Backend == backendName {
+			return jobstore.Record{}, errQueueFull
+		}
 		return jobstore.Record{
 			JobID:         id,
 			WorkspaceKey:  input.key.WorkspaceKey,
@@ -107,6 +122,9 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 		}, nil
 	})
 	if err != nil {
+		if errors.Is(err, errQueueFull) {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorQueueFull, fmt.Sprintf("submission rejected: daemon queue is full (maximum %d waiting jobs)", s.maxQueued), protocol.ErrorData{})}
+		}
 		if errors.Is(err, jobstore.ErrConflict) {
 			return s.jobSubmitConflict(err)
 		}
@@ -127,6 +145,14 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 		s.enqueueQueuedJob(record, executionBackend)
 	}
 	return requestOutcome{result: jobSubmitResult(record, deduplicated, timeout)}
+}
+
+func taskSpecBackendName(fields map[string]json.RawMessage) string {
+	var backend string
+	if err := json.Unmarshal(fields["backend"], &backend); err != nil {
+		return ""
+	}
+	return backend
 }
 
 // parseJobSubmitInput performs only the JSON work needed to derive the

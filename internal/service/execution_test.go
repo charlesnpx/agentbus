@@ -542,6 +542,151 @@ func TestExecutionSpillsLargeTerminalResultWithDigestAndElision(t *testing.T) {
 	}
 }
 
+func TestExecutionCaptureWarningIsRecordedAndGapsTranscript(t *testing.T) {
+	const warningText = "capture warning: raw stdout log stopped after 128 bytes: no space left on device"
+	backend := &executionFakeBackend{name: "capture-warning"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				input.OnProcessStart(engine.ProcessRef{PID: 4210, PGID: 4210, StartTime: "capture-token"}, 0)
+				return executionEvents(
+					engine.Event{Type: engine.EventWarning, Text: warningText, Metadata: map[string]any{"agentbusCaptureWarning": true, "bytesCaptured": 128}},
+					engine.Event{Type: engine.EventResultMessage, Text: "finished"},
+				), nil
+			},
+		}, nil
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "capture warning", nil)
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(got.Diagnostics, "\n"), warningText) {
+		t.Fatalf("job diagnostics = %#v, want capture warning", got.Diagnostics)
+	}
+	wire, err := server.jobRecordWire(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(wire.Diagnostics, "\n"), warningText) {
+		t.Fatalf("job.get diagnostics = %#v, want capture warning", wire.Diagnostics)
+	}
+	limit := 10
+	transcript, err := server.jobTranscript(got, protocol.JobTranscriptParams{JobID: got.JobID, Limit: &limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !transcript.Gap || len(transcript.Items) == 0 || transcript.Items[0].Kind != "warning" || transcript.Items[0].Text != warningText {
+		t.Fatalf("transcript = %#v, want warning item and a capture gap", transcript)
+	}
+}
+
+func TestExecutionResultArtifactFailureTerminalizesAsStorageFailure(t *testing.T) {
+	const backendSessionID = "storage-failure-session"
+	backend := &executionFakeBackend{name: "storage-failure"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				input.OnProcessStart(engine.ProcessRef{PID: 4211, PGID: 4211, StartTime: "storage-token"}, 0)
+				return executionEvents(
+					engine.Event{Type: engine.EventResultMessage, Text: "final output that cannot be persisted"},
+					engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{BackendSessionID: backendSessionID}},
+				), nil
+			},
+		}, nil
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "storage failure", nil)
+	if err := os.MkdirAll(filepath.Dir(record.Artifacts.Result), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(record.Artifacts.Result, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassStorage {
+		t.Fatalf("terminal record = state %q class %q, want failed storage", got.State, got.FailureClass)
+	}
+	if !strings.Contains(got.FailureReason, "persist final result artifact") ||
+		!(strings.Contains(got.FailureReason, "exist") || strings.Contains(got.FailureReason, "directory")) {
+		t.Fatalf("failure reason = %q, want storage stage and OS error", got.FailureReason)
+	}
+	if got.ResultPath != "" || got.ResultText != "" {
+		t.Fatalf("failed record contains an authoritative result: path=%q text=%q", got.ResultPath, got.ResultText)
+	}
+	if got.BackendSessionID != backendSessionID {
+		t.Fatalf("backend session ID = %q, want %q", got.BackendSessionID, backendSessionID)
+	}
+	limit := 10
+	transcript, err := server.jobTranscript(got, protocol.JobTranscriptParams{JobID: got.JobID, Limit: &limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transcript.ItemCount != 1 || len(transcript.Items) != 1 || transcript.Items[0].Text != "final output that cannot be persisted" {
+		t.Fatalf("transcript = %#v, want retained partial output", transcript)
+	}
+}
+
+func TestManagedCodexHomeSurvivesTerminalStorageFailure(t *testing.T) {
+	server := newExecutionServer(t, &executionFakeBackend{name: "codex"})
+	record := queuedExecutionRecord(t, server, "codex", "terminal storage failure", nil)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(record.JobID); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := engine.LayoutForWorkspace(server.stateRoot, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := createManagedCodexHome(layout, record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.rememberManagedCodexHome(record.JobID, home)
+
+	// A completed record cannot carry a failure reason. This makes the first
+	// terminal write fail validation and exercises the storage-failure fallback.
+	server.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
+		State:            protocol.PublicStateCompleted,
+		Cleanup:          protocol.CleanupClean,
+		BackendSessionID: "terminal-storage-session",
+		FailureReason:    "invalid on a completed record",
+	})
+
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassStorage {
+		t.Fatalf("terminal record = state %q class %q, want failed storage fallback", got.State, got.FailureClass)
+	}
+	if got.BackendSessionID != "terminal-storage-session" {
+		t.Fatalf("backend session ID = %q, want session retained by failed record", got.BackendSessionID)
+	}
+	if _, err := os.Stat(home.path); err != nil {
+		t.Fatalf("managed home stat = %v, want home to survive failed terminal persistence", err)
+	}
+}
+
 func sha256Sum(value []byte) []byte {
 	sum := sha256.Sum256(value)
 	return sum[:]

@@ -28,6 +28,7 @@ The core layout is:
   agentbus.sock
   agentbus.pid
   jobs.db
+  startup-diagnostic.log   # written when daemon autostart fails
   artifacts/
     logs/
     results/
@@ -36,7 +37,10 @@ The core layout is:
 token authenticates protocol.hello. agentbus.sock exists while the daemon is
 serving. agentbus.pid is written for a successful background launch or
 client-autostart; do not rely on it for a foreground daemon. jobs.db is the
-single bbolt store. It has exactly the meta, requests, and jobs buckets.
+single bbolt store, not SQLite. Do not inspect it with sqlite3; use
+`agentbus status` and `job.get` for job state and diagnostics. It has exactly
+the meta, requests, and jobs buckets. startup-diagnostic.log is written on a
+failed daemon autostart and contains the startup phase and bounded diagnostic.
 artifacts contains log and result sidecars. Automatic pruning is disabled by
 default. `agentbus prune` previews eligible
 cleanup by default; pass `--apply` to delete. Completed jobs use a default age
@@ -101,7 +105,26 @@ artifacts while a daemon is using the root.
 ## Starting and selecting backends
 
 Use agentbus serve to start a background daemon. Use agentbus serve --foreground
-when a supervisor owns the process. The public CLI commands are version, serve,
+when a supervisor owns the process. Both forms accept `--max-jobs`,
+`--max-jobs-per-backend`, and `--max-queued`. Their defaults are 4 total jobs,
+2 jobs per backend, and 64 waiting jobs. These are starting values, not
+measured optima. Each value must be a positive integer; zero does not mean
+unlimited. The values apply when a daemon starts and do not reconfigure an
+already serving daemon.
+
+Jobs beyond the execution limits remain queued and start in FIFO order within
+their backend when a slot opens. A queued job for a saturated backend does not
+block a later job for another backend with a free slot. The queue bound counts
+waiting jobs; a matching deduplicated submission does not consume another
+entry. When the bound is reached, a new job.submit returns the typed
+`queue_full` error and CLI exit code 19. A queued cancellation removes the job
+before it can start a provider. Job lookup, listing, transcript, and queued
+cancellation remain available while all execution slots are occupied.
+
+The timeout is execution time: it begins when the daemon reserves a slot, not
+when job.submit is accepted. `queuedAt` records queue entry and `startedAt`
+records the start transition, so status shows both the waiting age and whether
+the job is queued or running. The public CLI commands are version, serve,
 status, transcript, result, cancel, prune, and configure-codex-sandbox.
 
 `agentbus configure-codex-sandbox` adds the Agentbus state root and cache root to
@@ -132,6 +155,23 @@ For a recovered process claim, the daemon signals a process group only after
 the recorded start token exactly matches the live process. It records cleanup
 as uncertain when cleanup cannot be established. Cleanup uncertainty does not
 erase a recorded completed result.
+
+## Capture and storage failures
+
+Raw stdout and stderr logs are optional diagnostics. If a raw-log sink fails,
+Agentbus stops writing that log and keeps draining provider output. `job.get`
+includes a bounded `diagnostics` entry with the captured byte count and sink
+error; `agentbus transcript` includes the warning and reports `gap: true`.
+The missing raw-log suffix cannot be reconstructed.
+
+Before a job launches, Agentbus checks available space on the state-root
+filesystem. Below 256 MiB it records a low-space diagnostic and still attempts
+the job because this estimate cannot predict the job's exact storage needs.
+There is no automatic cleanup on a write failure. If Agentbus cannot persist a
+final result artifact or its completed job record, the job is failed with
+failure class `storage` and the operating-system error. It does not publish an
+authoritative result; any captured transcript and known backend session remain
+available when their writes succeeded.
 
 ## Reading jobs and results
 
@@ -179,8 +219,10 @@ class, and schema compliance:
 | 13 | shutdown deadline exceeded |
 | 14 | unknown |
 | 15 | completed but the authoritative result artifact is missing, unreadable, or disagrees with its recorded digest |
+| 19 | submission rejected because the daemon's waiting queue is full |
 
-Codes 8, 9, and 12 are permanently retired. Do not reuse them.
+Codes 8, 9, and 12 are permanently retired. Codes 16–18 are reserved for other
+units. Do not reuse them.
 
 `agentbus steer` exits 17 for a rejected receipt and 18 for an unknown-delivery receipt.
 
@@ -191,6 +233,13 @@ binding its socket. A corrupt, truncated, incompatible, or busy database stops
 startup rather than being repaired in place. Preserve the root for diagnosis;
 do not create a replacement database at the same path unless you have first
 performed the required version-break cleanup above.
+
+Autostart errors distinguish a busy bbolt store, an incompatible or corrupt
+store, a process that exited before readiness, and a readiness timeout. The
+error names the startup phase and the `startup-diagnostic.log` path in the
+state root. It also includes the bounded stderr tail when available.
+If the daemon process cannot be started, the error uses code
+`process_start_failed` and phase `launching daemon process`.
 
 ## Footprint and residual risks
 

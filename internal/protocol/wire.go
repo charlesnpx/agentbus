@@ -31,6 +31,7 @@ const (
 	ErrorMethodNotFound     = "method_not_found"
 	ErrorBackendUnavailable = "backend_unavailable"
 	ErrorInvalidTaskSpec    = "invalid_task_spec"
+	ErrorQueueFull          = "queue_full"
 	ErrorUnknownJob         = "unknown_job"
 )
 
@@ -118,6 +119,7 @@ const (
 	FailureClassTimeout        FailureClass = "timeout"
 	FailureClassInterrupted    FailureClass = "interrupted"
 	FailureClassInternal       FailureClass = "internal"
+	FailureClassStorage        FailureClass = "storage"
 )
 
 // Valid reports whether class is one of the protocol v3 failure categories.
@@ -131,7 +133,8 @@ func (class FailureClass) Valid() bool {
 		FailureClassBackendError,
 		FailureClassTimeout,
 		FailureClassInterrupted,
-		FailureClassInternal:
+		FailureClassInternal,
+		FailureClassStorage:
 		return true
 	default:
 		return false
@@ -410,12 +413,14 @@ type JobRecordWire struct {
 	State         PublicState               `json:"state"`
 	Tags          map[string]string         `json:"tags,omitempty"`
 	CreatedAt     time.Time                 `json:"createdAt"`
+	QueuedAt      time.Time                 `json:"queuedAt"`
 	StartedAt     *time.Time                `json:"startedAt,omitempty"`
 	FinishedAt    *time.Time                `json:"finishedAt,omitempty"`
 	Timeout       *engine.TimeoutResolution `json:"timeout,omitempty"`
 	Result        *ResultInfoWire           `json:"result,omitempty"`
 	Contract      *ContractResult           `json:"contract,omitempty"`
 	Failure       *JobFailureWire           `json:"failure,omitempty"`
+	Diagnostics   []string                  `json:"diagnostics,omitempty"`
 	Cleanup       Cleanup                   `json:"cleanup"`
 	LogsPruned    bool                      `json:"logsPruned,omitempty"`
 	LogPaths      *LogPathsWire             `json:"logPaths,omitempty"`
@@ -453,6 +458,8 @@ type JobSummaryWire struct {
 	Cleanup Cleanup `json:"cleanup"`
 	// CreatedAt reports when the job was created.
 	CreatedAt time.Time `json:"createdAt"`
+	// QueuedAt reports when the job entered the daemon queue.
+	QueuedAt time.Time `json:"queuedAt"`
 	// UpdatedAt reports when the job was last updated.
 	UpdatedAt time.Time `json:"updatedAt"`
 	// ModelReported is the model reported by the backend, when available.
