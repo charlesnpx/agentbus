@@ -156,6 +156,13 @@ the recorded start token exactly matches the live process. It records cleanup
 as uncertain when cleanup cannot be established. Cleanup uncertainty does not
 erase a recorded completed result.
 
+Replacing the Agentbus binary makes a running daemon finish active work and
+restart on the new binary once it has no clients or active jobs; installs do
+not signal the daemon. A manual SIGTERM initiates graceful connection shutdown
+and then cancels the service context; any jobs still running at cancellation
+are interrupted and recorded as failed with
+`cancellationReason: daemon_shutdown`.
+
 ## Capture and storage failures
 
 Raw stdout and stderr logs are optional diagnostics. If a raw-log sink fails,

@@ -264,7 +264,7 @@ record_codex_sandbox_action() {
   esac
 }
 
-restart_live_daemon() {
+report_live_daemon_upgrade() {
   [[ "$OPERATION" == "install" ]] || return 0
   tools_requested || return 0
 
@@ -285,14 +285,10 @@ restart_live_daemon() {
       continue
     fi
     matched=1
-    if kill -TERM "$pid" 2>/dev/null; then
-      add_warning "restarted running agentbus daemon (pid $pid) so the upgraded binary serves new connections; any in-flight jobs are interrupted by the restart and reconciled (not resumed) by the reaper — re-submit them if needed"
-    else
-      add_warning "could not restart running agentbus daemon (pid $pid) after upgrade"
-    fi
+    add_warning "running agentbus daemon (pid $pid) will restart on the new binary once it has no clients or active jobs; in-flight jobs are not interrupted"
   done
   if [[ $matched -eq 0 ]]; then
-    add_warning "no running agentbus daemon found at $TOOL_PATH"
+    add_warning "no matching running agentbus daemon found at $TOOL_PATH"
   fi
 }
 
@@ -307,7 +303,7 @@ case "$OPERATION" in
       build_agentbus "$TOOL_PATH"
       TOOL_SHA=$(sha256_file "$TOOL_PATH")
       [[ -n "$TOOL_SHA" ]] || die "failed to compute sha256 for $TOOL_PATH"
-      restart_live_daemon
+      report_live_daemon_upgrade
     fi
     ;;
   uninstall)
