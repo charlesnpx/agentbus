@@ -141,11 +141,12 @@ execution slot, not when the job is submitted.
   "workspaceKey": "string",
   "requestId": "string",
   "taskSpec": {
-    "backend": "string",
+    "backend": "codex",
     "cwd": "/absolute/path",
     "write": true,
     "prompt": "string",
     "inputMode": "steerable",
+    "localIPC": true,
     "resumeJobId": "job_previous",
     "retainSession": true,
     "model": "string",
@@ -157,7 +158,7 @@ execution slot, not when the job is submitted.
 }
 ~~~
 
-backend, cwd, write, and prompt are required task fields. inputMode,
+backend, cwd, write, and prompt are required task fields. inputMode, localIPC,
 resumeJobId,
 retainSession, model, effort, outputSchema, tags, and timeoutMs are optional.
 inputMode accepts `fixed` or `steerable`. Omission means `fixed`; this value is
@@ -167,6 +168,14 @@ hash for every prior request. A daemon that does not recognize the field
 rejects it as `invalid_task_spec` through strict unknown-field decoding, so no
 protocol major-version bump is needed. The field is independent of `write` and
 does not infer review intent from prompt text.
+`localIPC` is also immutable request data; omitting it preserves existing replay
+hashes. Set it to true only for a Codex write job on macOS. It
+allows Unix sockets under the job's managed scratch root and TCP loopback. The
+job shares loopback with the host; the profile adds no other Unix socket paths,
+Docker socket access, or outbound domains. Claude and Cursor requests are
+rejected. Linux requests are rejected because Codex's current Linux sandbox
+blocks Unix sockets before applying its allowlist. A resumed job follows its
+new TaskSpec value and does not inherit IPC permission from the target job.
 outputSchema is one inline Draft 2020-12 JSON Schema value: an object or a
 boolean. timeoutMs is a non-negative integer no greater than four hours; zero
 means no deadline.
@@ -436,7 +445,9 @@ invalid_task_spec parameter error rather than a list request.
       "GOCACHE": "/state-root/workspaces/key/codex/job_id/cache/go-build",
       "GOMODCACHE": "/home/user/go/pkg/mod"
     },
+    "shell": "sandboxed",
     "network": "denied",
+    "localIPC": "scratch",
     "gitMetadata": "read-only",
     "enforcement": "os-sandbox"
   },
@@ -471,11 +482,21 @@ steering receipts. Each steer summary contains messageId, status, mechanism,
 and time; mechanism is empty unless delivery was confirmed. `execution` appears
 after the job starts and is recorded atomically with its starting transition.
 It contains intent (`inspect` or
-`edit`), the selected source write mode, optional scratch and cache paths,
-network policy, Git metadata access, and enforcement strength. The posture is
-descriptive: `sourceWritable` reports the selected mode, while `enforcement`
-identifies whether the backend uses an OS sandbox, agent permissions, or no
-filesystem boundary. For Codex edit jobs using the `workspaceWrite` sandbox,
+`edit`), the selected source write mode, optional scratch and cache paths, shell
+policy, local IPC, network policy, Git metadata access, and enforcement
+strength. `localIPC` is `denied` for Codex jobs using the ordinary sandbox,
+`scratch` for Codex jobs using the local IPC profile, and `unenforced` for
+trusted full-access Codex writes and Claude/Cursor. The `shell` field is
+`sandboxed` for Codex jobs using the OS sandbox, `restricted` for Claude
+read-only jobs (the adapter's allowed/denied shell tool lists), and
+`unenforced` for trusted full-access Codex writes, Claude write, and Cursor
+jobs. The posture is descriptive:
+`sourceWritable` reports the selected mode, while `enforcement` identifies
+whether the backend uses an OS sandbox, agent permissions, or no filesystem
+boundary. Before any non-trusted Codex job launches app-server, Agentbus runs a
+bounded `codex sandbox -- true` check. A failure records `backend_unavailable`
+with the sandbox diagnostic and does not fall back to a weaker mode. For Codex
+edit jobs using the `workspaceWrite` sandbox,
 `gitMetadata` is `read-only` because the granted writable roots do not include
 the Git metadata directory. `logsPruned` is true after the daemon removes this
 job's raw log sidecars. diagnostics appears when the job has recorded

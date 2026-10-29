@@ -726,6 +726,23 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, fmt.Errorf("backend %q is unavailable", record.Backend), nil)
 		return
 	}
+	codexSandboxed := true
+	if policy, ok := run.backend.(interface {
+		CodexSandboxRequired(write, localIPC bool) bool
+	}); ok {
+		codexSandboxed = policy.CodexSandboxRequired(record.Write, spec.LocalIPC)
+		if codexSandboxed {
+			if err := s.ensureCodexSandbox(jobCtx, run.backend); err != nil {
+				if jobCtx.Err() != nil {
+					s.finishStartError(store, record, jobCtx, jobCtx.Err())
+					return
+				}
+				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable,
+					fmt.Errorf("Codex OS sandbox cannot start on this host: %w", err), nil)
+				return
+			}
+		}
+	}
 	requestedModel := record.Model
 	requestedEffort := record.Effort
 	if defaults := s.backendDefaults[record.Backend]; defaults.Model != "" && requestedModel == "" {
@@ -735,11 +752,12 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		requestedEffort = defaults.Effort
 	}
 	opts := engine.SessionOpts{
-		CWD:     record.CWD,
-		Write:   record.Write,
-		Model:   requestedModel,
-		Effort:  requestedEffort,
-		Timeout: timeout,
+		CWD:      record.CWD,
+		Write:    record.Write,
+		LocalIPC: spec.LocalIPC,
+		Model:    requestedModel,
+		Effort:   requestedEffort,
+		Timeout:  timeout,
 	}
 	var (
 		layout  engine.WorkspaceLayout
@@ -831,7 +849,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 	if record.Write {
 		scratch = cache.root
 	}
-	posture := executionPosture(record.Backend, record.Write, scratch, caches)
+	posture := executionPosture(record.Backend, record.Write, spec.LocalIPC, codexSandboxed, scratch, caches)
 	if run.cancellationRequested() {
 		s.discardManagedCodexHome(record.JobID)
 		return
@@ -958,6 +976,9 @@ func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpec, error) {
 	}
 	if spec.InputMode != "" && spec.InputMode != protocol.InputModeFixed && spec.InputMode != protocol.InputModeSteerable {
 		return spec, fmt.Errorf("durable task spec has invalid inputMode %q", spec.InputMode)
+	}
+	if err := validateLocalIPCSpec(spec, localIPCGOOS); err != nil {
+		return spec, fmt.Errorf("durable task spec has invalid localIPC: %w", err)
 	}
 	if record.InputMode != "" && record.InputMode != protocol.EffectiveInputMode(spec.InputMode) {
 		return spec, errors.New("durable task spec inputMode disagrees with job record")

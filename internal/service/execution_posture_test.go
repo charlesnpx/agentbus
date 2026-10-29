@@ -12,32 +12,56 @@ import (
 func TestExecutionPostureByBackend(t *testing.T) {
 	writeCaches := map[string]string{"GOCACHE": "job-cache/go-build"}
 	tests := []struct {
-		name    string
-		backend string
-		write   bool
-		want    protocol.ExecutionPosture
+		name      string
+		backend   string
+		write     bool
+		localIPC  bool
+		sandboxed bool
+		want      protocol.ExecutionPosture
 	}{
 		{
-			name:    "codex inspect",
-			backend: "codex",
+			name:      "codex inspect",
+			backend:   "codex",
+			sandboxed: true,
 			want: protocol.ExecutionPosture{
-				Intent: "inspect", Network: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
+				Intent: "inspect", Shell: "sandboxed", Network: "denied", LocalIPC: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
 			},
 		},
 		{
-			name:    "codex edit",
+			name:      "codex edit",
+			backend:   "codex",
+			write:     true,
+			sandboxed: true,
+			want: protocol.ExecutionPosture{
+				Intent: "edit", SourceWritable: true, Scratch: "job-cache", Caches: writeCaches,
+				Shell: "sandboxed", Network: "denied", LocalIPC: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
+			},
+		},
+		{
+			name:      "codex edit with local IPC",
+			backend:   "codex",
+			write:     true,
+			localIPC:  true,
+			sandboxed: true,
+			want: protocol.ExecutionPosture{
+				Intent: "edit", SourceWritable: true, Scratch: "job-cache", Caches: writeCaches,
+				Shell: "sandboxed", Network: "denied", LocalIPC: "scratch", GitMetadata: "read-only", Enforcement: "os-sandbox",
+			},
+		},
+		{
+			name:    "trusted Codex edit",
 			backend: "codex",
 			write:   true,
 			want: protocol.ExecutionPosture{
 				Intent: "edit", SourceWritable: true, Scratch: "job-cache", Caches: writeCaches,
-				Network: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
+				Shell: "unenforced", Network: "unenforced", LocalIPC: "unenforced", GitMetadata: "writable", Enforcement: "none",
 			},
 		},
 		{
 			name:    "claude inspect",
 			backend: "claude",
 			want: protocol.ExecutionPosture{
-				Intent: "inspect", Network: "unenforced", GitMetadata: "unenforced", Enforcement: "none",
+				Intent: "inspect", Shell: "restricted", Network: "unenforced", LocalIPC: "unenforced", GitMetadata: "unenforced", Enforcement: "none",
 			},
 		},
 		{
@@ -46,14 +70,14 @@ func TestExecutionPostureByBackend(t *testing.T) {
 			write:   true,
 			want: protocol.ExecutionPosture{
 				Intent: "edit", SourceWritable: true, Scratch: "job-cache", Caches: writeCaches,
-				Network: "unenforced", GitMetadata: "writable", Enforcement: "none",
+				Shell: "unenforced", Network: "unenforced", LocalIPC: "unenforced", GitMetadata: "writable", Enforcement: "none",
 			},
 		},
 		{
 			name:    "cursor inspect",
 			backend: "cursor",
 			want: protocol.ExecutionPosture{
-				Intent: "inspect", Network: "unenforced", GitMetadata: "read-only", Enforcement: "agent-permissions",
+				Intent: "inspect", Shell: "unenforced", Network: "unenforced", LocalIPC: "unenforced", GitMetadata: "read-only", Enforcement: "agent-permissions",
 			},
 		},
 		{
@@ -62,7 +86,7 @@ func TestExecutionPostureByBackend(t *testing.T) {
 			write:   true,
 			want: protocol.ExecutionPosture{
 				Intent: "edit", SourceWritable: true, Scratch: "job-cache", Caches: writeCaches,
-				Network: "unenforced", GitMetadata: "writable", Enforcement: "agent-permissions",
+				Shell: "unenforced", Network: "unenforced", LocalIPC: "unenforced", GitMetadata: "writable", Enforcement: "agent-permissions",
 			},
 		},
 	}
@@ -74,7 +98,7 @@ func TestExecutionPostureByBackend(t *testing.T) {
 				scratch = "job-cache"
 				caches = writeCaches
 			}
-			got := executionPosture(test.backend, test.write, scratch, caches)
+			got := executionPosture(test.backend, test.write, test.localIPC, test.sandboxed, scratch, caches)
 			if !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("executionPosture(%q, %t) = %#v, want %#v", test.backend, test.write, got, test.want)
 			}

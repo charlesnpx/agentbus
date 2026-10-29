@@ -97,6 +97,12 @@ deadline, permission envelope, model, effort, and schema. Delivery may be
 native or interrupt-and-continue depending on the adapter. Delivery uncertainty
 is reported without automatic redelivery; a steerable task does not guarantee
 that a provider follows the instruction or rolls back tools already started.
+TaskSpec `localIPC` is an optional Codex-only request for a write job on macOS.
+It permits Unix sockets under that job's managed scratch directory and TCP
+loopback. The host shares loopback with the job. Agentbus does not grant other
+socket paths, Docker access, or outbound domains; Claude and Cursor requests
+are rejected, as are Linux requests because Codex's Linux sandbox cannot grant
+Unix sockets. A resumed job follows the new TaskSpec's `localIPC` value.
 Codex uses native app-server `turn/steer`; confirmation means its correlated
 JSON-RPC success response arrived before the steer context ended. No response
 before that deadline is reported as unconfirmed.
@@ -132,10 +138,17 @@ changes; it is not a filesystem sandbox.
 Inspect jobs receive no job-private scratch or writable caches: current
 read-only backend modes do not enforce a writable root outside the submitted
 workspace. `job.get` and `agentbus status --job <id>` expose the execution
-posture recorded at start, including intent, source write mode, scratch/cache
-paths, network and Git metadata policy, and enforcement strength. Codex uses
-its OS sandbox, Cursor uses agent-mode permissions, and Claude has no filesystem
-or network sandbox. `sourceWritable` reflects the selected inspect/edit mode;
+posture recorded at start, including intent, source write mode, shell policy,
+local IPC, network and Git metadata policy, scratch/cache paths, and enforcement
+strength. Codex sandboxed jobs check that the OS sandbox can start before
+launching app-server; a failed check ends the job as `backend_unavailable`
+without a weaker fallback. Trusted full-access Codex writes report shell and
+IPC as `unenforced`. Claude read-only jobs restrict shell tools through
+their allowed/denied tool lists. Claude write jobs and Cursor jobs have no shell
+confinement configured by Agentbus. `localIPC` is `denied` for ordinary Codex
+jobs, `scratch` for Codex jobs requesting local IPC, and `unenforced` for
+trusted full-access Codex writes and Claude/Cursor. `sourceWritable` reflects
+the selected inspect/edit mode;
 `enforcement` identifies whether that mode has an OS sandbox, agent permissions,
 or no filesystem boundary.
 

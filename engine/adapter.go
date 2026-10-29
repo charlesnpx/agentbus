@@ -99,10 +99,12 @@ type SessionOpts struct {
 	// WriteSandboxRoot is added to workspace-write sandbox policies for write
 	// turns only. It is ignored for read-only and trusted turns.
 	WriteSandboxRoot string
-	Write            bool
-	Model            string
-	Effort           string
-	Timeout          time.Duration
+	// LocalIPC selects the Codex local-IPC permission profile for this job.
+	LocalIPC bool
+	Write    bool
+	Model    string
+	Effort   string
+	Timeout  time.Duration
 }
 
 // TurnInput is the effective input for one backend turn.
