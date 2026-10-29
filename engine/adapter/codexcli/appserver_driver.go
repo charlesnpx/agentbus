@@ -58,13 +58,13 @@ func newAppServerDriver(binary string, writePolicy WritePolicy) *appServerDriver
 func (d *appServerDriver) ExecSpec(_ string, opts engine.SessionOpts, _ engine.TurnInput) (command.ExecSpec, error) {
 	argv := []string{d.binaryName(), "app-server"}
 	if opts.LocalIPC {
-		if !opts.Write {
-			return command.ExecSpec{}, errors.New("Codex local IPC requires a write-enabled job")
+		if !opts.Write && !opts.Verify {
+			return command.ExecSpec{}, errors.New("Codex local IPC requires a write-enabled or verify job")
 		}
 		if opts.CWD == "" || opts.WriteSandboxRoot == "" || opts.LocalIPCRoot == "" {
 			return command.ExecSpec{}, errors.New("Codex local IPC requires workspace, scratch, and private temp roots")
 		}
-		argv = append(argv, localIPCConfigArgs(opts.CWD, opts.WriteSandboxRoot, opts.LocalIPCRoot)...)
+		argv = append(argv, localIPCConfigArgsForWorkspace(opts.CWD, opts.WriteSandboxRoot, opts.LocalIPCRoot, !opts.Verify, !opts.Verify)...)
 	}
 	return command.ExecSpec{
 		Argv: argv,
@@ -1228,10 +1228,11 @@ func threadParams(opts engine.SessionOpts, input engine.TurnInput, resumeID stri
 	params := map[string]any{
 		"approvalPolicy": "never",
 	}
-	if opts.LocalIPC && input.Write {
+	workspaceWrite := input.Write || opts.Verify
+	if opts.LocalIPC && workspaceWrite {
 		params["permissions"] = localIPCPermissionProfile
 	} else {
-		params["sandbox"] = sandboxMode(input.Write)
+		params["sandbox"] = sandboxMode(workspaceWrite)
 	}
 	if opts.CWD != "" {
 		params["cwd"] = opts.CWD
@@ -1254,10 +1255,19 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 			"text": input.Prompt,
 		}},
 	}
-	if opts.LocalIPC && input.Write {
+	workspaceWrite := input.Write || opts.Verify
+	if opts.LocalIPC && workspaceWrite {
 		params["permissions"] = localIPCPermissionProfile
 	} else {
-		params["sandboxPolicy"] = sandboxPolicy(input.Write, opts.CWD, opts.WriteSandboxRoot, writePolicy)
+		if opts.Verify {
+			writePolicy = WritePolicyWorkspaceOffline
+		}
+		policy := sandboxPolicy(workspaceWrite, opts.CWD, opts.WriteSandboxRoot, writePolicy)
+		if opts.Verify {
+			policy["excludeSlashTmp"] = true
+			policy["excludeTmpdirEnvVar"] = true
+		}
+		params["sandboxPolicy"] = policy
 	}
 	if opts.CWD != "" {
 		params["cwd"] = opts.CWD
@@ -1272,6 +1282,10 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 }
 
 func localIPCConfigArgs(workspace, scratch, ipcRoot string) []string {
+	return localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, true, true)
+}
+
+func localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot string, includeGitMetadata, includeSystemTemp bool) []string {
 	type filesystemEntry struct {
 		path       string
 		permission string
@@ -1290,8 +1304,12 @@ func localIPCConfigArgs(workspace, scratch, ipcRoot string) []string {
 	setFilesystemPermission(workspace, "write")
 	setFilesystemPermission(scratch, "write")
 	setFilesystemPermission(ipcRoot, "write")
-	setFilesystemPermission("/tmp", "write")
-	setFilesystemPermission(filepath.Join(workspace, ".git"), "read")
+	if includeSystemTemp {
+		setFilesystemPermission("/tmp", "write")
+	}
+	if includeGitMetadata {
+		setFilesystemPermission(filepath.Join(workspace, ".git"), "read")
+	}
 	filesystemParts := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		filesystemParts = append(filesystemParts, tomlString(entry.path)+"=\""+entry.permission+"\"")

@@ -931,6 +931,13 @@ func TestAppServerWriteCacheAppliesOnlyToWriteTurns(t *testing.T) {
 				if !ok || !reflect.DeepEqual(gotPolicy, tt.wantPolicy) {
 					t.Fatalf("turn/start sandboxPolicy = %#v, want %#v", params["sandboxPolicy"], tt.wantPolicy)
 				}
+				if tt.write {
+					for _, key := range []string{"excludeSlashTmp", "excludeTmpdirEnvVar"} {
+						if _, ok := gotPolicy[key]; ok {
+							t.Fatalf("ordinary write sandboxPolicy contains verify-only %q: %#v", key, gotPolicy)
+						}
+					}
+				}
 				peer.respond(turn, turnResult("turn-1"))
 				peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
 			})
@@ -1967,6 +1974,120 @@ func execSpecEnvironmentValue(spec command.ExecSpec, key string) (string, bool) 
 		}
 	}
 	return "", false
+}
+
+func TestAppServerVerifyUsesFrozenWorkspaceAndOfflineWritableRoots(t *testing.T) {
+	source := t.TempDir()
+	frozenCopy := t.TempDir()
+	scratch := t.TempDir()
+	prompt := "run the submitted checks"
+	writeOverlay := map[string]string{"GOCACHE": filepath.Join(scratch, "cache", "go-build")}
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		if spec.Dir != frozenCopy {
+			t.Fatalf("provider cwd = %q, want frozen copy %q", spec.Dir, frozenCopy)
+		}
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		threadParams := thread["params"].(map[string]any)
+		if threadParams["cwd"] != frozenCopy || threadParams["sandbox"] != "workspace-write" {
+			t.Fatalf("thread/start params = %#v, want frozen cwd and workspace-write mode", threadParams)
+		}
+		if _, ok := threadParams["permissions"]; ok {
+			t.Fatalf("verify thread/start unexpectedly used a permission profile: %#v", threadParams)
+		}
+		peer.respond(thread, threadResult("thread-verify"))
+		turn := peer.expectRequest("turn/start")
+		turnParams := turn["params"].(map[string]any)
+		wantPolicy := map[string]any{
+			"type":                "workspaceWrite",
+			"networkAccess":       false,
+			"writableRoots":       []any{frozenCopy, scratch},
+			"excludeSlashTmp":     true,
+			"excludeTmpdirEnvVar": true,
+		}
+		if turnParams["cwd"] != frozenCopy || !reflect.DeepEqual(turnParams["sandboxPolicy"], wantPolicy) {
+			t.Fatalf("verify turn/start params = %#v, want cwd %q and policy %#v", turnParams, frozenCopy, wantPolicy)
+		}
+		for _, root := range wantPolicy["writableRoots"].([]any) {
+			if root == source {
+				t.Fatalf("submitted source appears in verify writable roots: %#v", wantPolicy["writableRoots"])
+			}
+		}
+		input := turnParams["input"].([]any)
+		if len(input) != 1 || input[0].(map[string]any)["text"] != prompt {
+			t.Fatalf("verify prompt input = %#v, want unchanged prompt %q", turnParams["input"], prompt)
+		}
+		peer.respond(turn, turnResult("turn-verify"))
+		peer.notify("turn/completed", completedParams("thread-verify", "turn-verify", "completed", ""))
+	})
+	session := startFakeCodexSessionWithOptions(t, Options{Binary: "fake-codex", WritePolicy: WritePolicyTrusted}, engine.SessionOpts{
+		CWD: frozenCopy, WriteSandboxRoot: scratch, Verify: true, WriteEnvOverlay: writeOverlay,
+	})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: prompt, Write: false}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	if got, ok := execSpecEnvironmentValue(runner.lastSpec(), "GOCACHE"); !ok || got != writeOverlay["GOCACHE"] {
+		t.Fatalf("verify GOCACHE = %q present=%t, want scratch cache %q", got, ok, writeOverlay["GOCACHE"])
+	}
+}
+
+func TestAppServerVerifyLocalIPCProfileUsesCopyWithoutGitMetadata(t *testing.T) {
+	source := t.TempDir()
+	frozenCopy := t.TempDir()
+	scratch := t.TempDir()
+	ipcRoot := t.TempDir()
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		if spec.Dir != frozenCopy {
+			t.Fatalf("provider cwd = %q, want frozen copy %q", spec.Dir, frozenCopy)
+		}
+		arguments := strings.Join(spec.Argv, "\n")
+		for _, expected := range []string{
+			tomlString(frozenCopy) + `="write"`,
+			tomlString(scratch) + `="write"`,
+			tomlString(ipcRoot) + `="write"`,
+		} {
+			if !strings.Contains(arguments, expected) {
+				t.Fatalf("local IPC argv does not grant %s: %#v", expected, spec.Argv)
+			}
+		}
+		for _, forbidden := range []string{tomlString(source) + `="write"`, tomlString(filepath.Join(source, ".git")), tomlString(filepath.Join(frozenCopy, ".git"))} {
+			if strings.Contains(arguments, forbidden) {
+				t.Fatalf("verify local IPC argv contains source or copy Git metadata entry %s: %#v", forbidden, spec.Argv)
+			}
+		}
+		if strings.Contains(arguments, tomlString("/tmp")+`="write"`) {
+			t.Fatalf("verify local IPC argv contains a broad /tmp write grant: %#v", spec.Argv)
+		}
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		threadParams := thread["params"].(map[string]any)
+		if threadParams["cwd"] != frozenCopy || threadParams["permissions"] != localIPCPermissionProfile {
+			t.Fatalf("verify local IPC thread/start params = %#v, want copy cwd and %q profile", threadParams, localIPCPermissionProfile)
+		}
+		peer.respond(thread, threadResult("thread-verify-ipc"))
+		turn := peer.expectRequest("turn/start")
+		turnParams := turn["params"].(map[string]any)
+		if turnParams["cwd"] != frozenCopy || turnParams["permissions"] != localIPCPermissionProfile {
+			t.Fatalf("verify local IPC turn/start params = %#v, want copy cwd and %q profile", turnParams, localIPCPermissionProfile)
+		}
+		if _, ok := turnParams["sandboxPolicy"]; ok {
+			t.Fatalf("verify local IPC turn/start unexpectedly has sandboxPolicy: %#v", turnParams)
+		}
+		peer.respond(turn, turnResult("turn-verify-ipc"))
+		peer.notify("turn/completed", completedParams("thread-verify-ipc", "turn-verify-ipc", "completed", ""))
+	})
+	session := startFakeCodexSession(t, engine.SessionOpts{
+		CWD: frozenCopy, WriteSandboxRoot: scratch, LocalIPCRoot: ipcRoot, LocalIPC: true, Verify: true,
+	})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "run tests", Write: false}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
 }
 
 type fakeAppServerProcess struct {

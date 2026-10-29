@@ -159,8 +159,8 @@ execution slot, not when the job is submitted.
 ~~~
 
 backend, cwd, write, and prompt are required task fields. inputMode, localIPC,
-resumeJobId,
-retainSession, model, effort, outputSchema, tags, and timeoutMs are optional.
+verify, resumeJobId, retainSession, model, effort, outputSchema, tags, and
+timeoutMs are optional.
 inputMode accepts `fixed` or `steerable`. Omission means `fixed`; this value is
 stored with the immutable task specification and participates in identified
 replay hashing. Because it uses `omitempty`, omission preserves the existing
@@ -169,8 +169,8 @@ rejects it as `invalid_task_spec` through strict unknown-field decoding, so no
 protocol major-version bump is needed. The field is independent of `write` and
 does not infer review intent from prompt text.
 `localIPC` is also immutable request data; omitting it preserves existing replay
-hashes. Set it to true only for a Codex write job on macOS. It allows Unix
-sockets under a short, private per-job temp directory and TCP loopback. That
+hashes. Set it to true only for a Codex write or verify job on macOS. It allows
+Unix sockets under a short, private per-job temp directory and TCP loopback. That
 directory is used as `TMPDIR`; the other writable caches remain under the job's
 managed scratch root. The job fails before launch with `backend_unavailable`
 if the resolved directory exceeds 80 bytes. It shares loopback with the host;
@@ -179,6 +179,39 @@ domains. Claude and Cursor requests are rejected. Linux requests are rejected
 because Codex's current Linux sandbox blocks Unix sockets before applying its
 allowlist. A resumed job follows its new TaskSpec value and does not inherit
 IPC permission from the target job.
+`verify` is immutable request data; omission preserves existing replay hashes.
+Set it to true only with `backend: "codex"` and `write: false`. The submitted
+`cwd` must be inside a Git work tree. Verify cannot use `resumeJobId` or retain
+a backend session. Claude and Cursor are rejected because their configured
+modes do not enforce a read-only boundary for a copy outside the submitted
+source. `localIPC` may be combined with verify on macOS; the existing Linux
+Unix-socket sandbox refusal still applies.
+
+A Verify task spec has this shape:
+
+~~~json
+{
+  "backend": "codex",
+  "cwd": "/absolute/git/worktree",
+  "write": false,
+  "prompt": "run the project checks",
+  "verify": true
+}
+~~~
+
+Before launch, Agentbus copies tracked and untracked, non-ignored files from
+`cwd` into `<scratch>/src`, skipping tracked files deleted on disk. It preserves
+regular-file mode bits and recreates symlinks without following them. The copy
+has no `.git` metadata; the execution posture reports `gitMetadata: "none"`.
+Copies are limited to 2 GiB and 200,000 entries; exceeding either fixed bound
+fails before launch. Codex runs with `cwd` at the copy and an OS sandbox whose
+writable roots are the copy and managed scratch, plus the private IPC directory
+when requested. Network access is denied apart from requested local IPC. The
+submitted source is not a writable root. A disposable copy is workflow
+protection by itself, not an OS security boundary for a process running as the
+same user without a sandbox; Verify therefore refuses backends without the
+required Codex sandbox.
+The copy is removed with managed scratch when the job finishes.
 outputSchema is one inline Draft 2020-12 JSON Schema value: an object or a
 boolean. timeoutMs is a non-negative integer no greater than four hours; zero
 means no deadline.
@@ -485,10 +518,13 @@ inputMode project as `fixed`; steers is an empty array when there are no
 steering receipts. Each steer summary contains messageId, status, mechanism,
 and time; mechanism is empty unless delivery was confirmed. `execution` appears
 after the job starts and is recorded atomically with its starting transition.
-It contains intent (`inspect` or
-`edit`), the selected source write mode, optional scratch and cache paths, shell
+It contains intent (`inspect`, `verify`, or `edit`), the selected source write
+mode, optional scratch and cache paths, shell
 policy, local IPC, network policy, Git metadata access, and enforcement
-strength. `localIPC` is `denied` for Codex jobs using the ordinary sandbox,
+strength. Verify posture also includes `frozenCopy` (the absolute copy path) and
+`frozenSource`, an object with the captured Git `head` commit and `dirty` status.
+For Verify, `sourceWritable` is false, `gitMetadata` is `none`, and
+`enforcement` is `os-sandbox`. `localIPC` is `denied` for Codex jobs using the ordinary sandbox,
 `private-dir` for Codex jobs using the local IPC profile, and `unenforced` for
 trusted full-access Codex writes and Claude/Cursor. The `shell` field is
 `sandboxed` for Codex jobs using the OS sandbox, `restricted` for Claude
@@ -497,9 +533,12 @@ read-only jobs (the adapter's allowed/denied shell tool lists), and
 jobs. The posture is descriptive:
 `sourceWritable` reports the selected mode, while `enforcement` identifies
 whether the backend uses an OS sandbox, agent permissions, or no filesystem
-boundary. Before any non-trusted Codex job launches app-server, Agentbus runs a
-bounded `codex sandbox -- true` check. A failure records `backend_unavailable`
-with the sandbox diagnostic and does not fall back to a weaker mode. For Codex
+boundary. Verify turns do not get the sandbox's implicit `/tmp` and `TMPDIR`
+writable grants; managed scratch remains writable through its explicit root.
+Before a sandboxed Codex job, including every Verify job, launches
+app-server, Agentbus runs a bounded `codex sandbox -- true` check. A failure
+records `backend_unavailable` with the sandbox diagnostic and does not fall
+back to a weaker mode. For Codex
 edit jobs using the `workspaceWrite` sandbox,
 `gitMetadata` is `read-only` because the granted writable roots do not include
 the Git metadata directory. `logsPruned` is true after the daemon removes this
