@@ -153,6 +153,8 @@ Autostart errors distinguish a busy bbolt store, an incompatible or corrupt
 store, a process that exited before readiness, and a readiness timeout. The
 error names the startup phase and the `startup-diagnostic.log` path in the
 state root. It also includes the bounded stderr tail when available.
+If the daemon process cannot be started, the error uses code
+`process_start_failed` and phase `launching daemon process`.
 
 ## Footprint and residual risks
 

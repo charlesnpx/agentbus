@@ -643,6 +643,50 @@ func TestExecutionResultArtifactFailureTerminalizesAsStorageFailure(t *testing.T
 	}
 }
 
+func TestManagedCodexHomeSurvivesTerminalStorageFailure(t *testing.T) {
+	server := newExecutionServer(t, &executionFakeBackend{name: "codex"})
+	record := queuedExecutionRecord(t, server, "codex", "terminal storage failure", nil)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(record.JobID); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := engine.LayoutForWorkspace(server.stateRoot, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := createManagedCodexHome(layout, record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.rememberManagedCodexHome(record.JobID, home)
+
+	// A completed record cannot carry a failure reason. This makes the first
+	// terminal write fail validation and exercises the storage-failure fallback.
+	server.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
+		State:            protocol.PublicStateCompleted,
+		Cleanup:          protocol.CleanupClean,
+		BackendSessionID: "terminal-storage-session",
+		FailureReason:    "invalid on a completed record",
+	})
+
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassStorage {
+		t.Fatalf("terminal record = state %q class %q, want failed storage fallback", got.State, got.FailureClass)
+	}
+	if got.BackendSessionID != "terminal-storage-session" {
+		t.Fatalf("backend session ID = %q, want session retained by failed record", got.BackendSessionID)
+	}
+	if _, err := os.Stat(home.path); err != nil {
+		t.Fatalf("managed home stat = %v, want home to survive failed terminal persistence", err)
+	}
+}
+
 func sha256Sum(value []byte) []byte {
 	sum := sha256.Sum256(value)
 	return sum[:]

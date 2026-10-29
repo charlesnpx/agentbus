@@ -56,6 +56,37 @@ func TestLaunchFailedRecordIncludesDiagnosticAndStderr(t *testing.T) {
 	assertPIDGone(t, readPIDFile(t, pidPath))
 }
 
+func TestLaunchStarterFailureWritesStartupDiagnostic(t *testing.T) {
+	root := shortLaunchTempDir(t)
+	startErr := errors.New("exec failed")
+	_, err := Launch(context.Background(), Options{
+		CommandPath: "daemon",
+		StateRoot:   root,
+		Starter: func(ProcessConfig) (Process, error) {
+			return nil, startErr
+		},
+	})
+	if err == nil {
+		t.Fatal("Launch succeeded, want process start failure")
+	}
+	var startup *StartupError
+	if !errors.As(err, &startup) || !errors.Is(err, ErrStartupFailed) || !errors.Is(err, startErr) {
+		t.Fatalf("Launch error = %T %v, want typed process start failure", err, err)
+	}
+	if startup.Code != CodeProcessStartFailed || startup.Phase != "launching daemon process" {
+		t.Fatalf("startup error = %+v, want process_start_failed in launch phase", startup)
+	}
+	diagnostic, readErr := os.ReadFile(startup.DiagnosticPath)
+	if readErr != nil {
+		t.Fatalf("read startup diagnostic %q: %v", startup.DiagnosticPath, readErr)
+	}
+	if !strings.Contains(string(diagnostic), CodeProcessStartFailed) ||
+		!strings.Contains(string(diagnostic), "launching daemon process") ||
+		!strings.Contains(string(diagnostic), startErr.Error()) {
+		t.Fatalf("startup diagnostic = %q, want code, phase, and cause", diagnostic)
+	}
+}
+
 func TestLaunchSetsid(t *testing.T) {
 	root := shortLaunchTempDir(t)
 	result, err := Launch(context.Background(), helperLaunchOptions(t, root, "ready", "", 2*time.Second))

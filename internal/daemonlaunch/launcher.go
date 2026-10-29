@@ -31,6 +31,7 @@ const (
 	CodeStoreCorrupt           = "store_corrupt"
 	CodeStoreIncompatible      = "store_incompatible"
 	CodeProcessExited          = "process_exited_before_ready"
+	CodeProcessStartFailed     = "process_start_failed"
 	CodeReadinessTimeout       = "readiness_timeout"
 	CodeAlreadyListening       = "agentbus daemon already listening"
 	readinessFDChildNumber     = 3
@@ -441,7 +442,7 @@ func Launch(ctx context.Context, opts Options) (result Result, launchErr error) 
 		stderrCapture.cleanup()
 		return Result{}, &StartupError{
 			Kind:  ErrStartupFailed,
-			Code:  "process_start_failed",
+			Code:  CodeProcessStartFailed,
 			Phase: "launching daemon process",
 			Cause: err,
 		}
@@ -461,7 +462,12 @@ func Launch(ctx context.Context, opts Options) (result Result, launchErr error) 
 	if err != nil {
 		_ = readyWrite.Close()
 		stderrCapture.cleanup()
-		return Result{}, err
+		return Result{}, &StartupError{
+			Kind:  ErrStartupFailed,
+			Code:  CodeProcessStartFailed,
+			Phase: "launching daemon process",
+			Cause: err,
+		}
 	}
 	_ = readyWrite.Close()
 	_ = stderrCapture.closeWriter()
@@ -608,18 +614,7 @@ func writeStartupDiagnostic(root string, err error) error {
 		return err
 	}
 	startup.DiagnosticPath = filepath.Join(root, startupDiagnosticFilename)
-	var content strings.Builder
-	fmt.Fprintf(&content, "startup phase: %s\nstartup code: %s\n", startup.Phase, startup.Code)
-	if startup.Message != "" {
-		fmt.Fprintf(&content, "message: %s\n", startup.Message)
-	}
-	if startup.Cause != nil {
-		fmt.Fprintf(&content, "cause: %s\n", startup.Cause.Error())
-	}
-	if startup.StderrTail != "" {
-		fmt.Fprintf(&content, "stderr tail:\n%s\n", strings.TrimRight(startup.StderrTail, "\n"))
-	}
-	text := content.String()
+	text := startup.Error()
 	const maxStartupDiagnosticBytes = 128 * 1024
 	if len(text) > maxStartupDiagnosticBytes {
 		text = text[len(text)-maxStartupDiagnosticBytes:]

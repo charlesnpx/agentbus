@@ -1166,23 +1166,39 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 	if s.cancellationPending(jobID) {
 		return
 	}
-	if home := s.takeManagedCodexHome(jobID); home != nil {
+	var (
+		home          *managedCodexHome
+		cleanupRecord jobstore.Record
+	)
+	if home = s.takeManagedCodexHome(jobID); home != nil {
 		current, getErr := store.Get(jobID)
 		if getErr != nil {
 			home.close()
+			home = nil
 			terminal.Cleanup = protocol.CleanupUncertain
 			terminal.Diagnostics = append(terminal.Diagnostics, "inspect managed Codex home terminal record: "+getErr.Error())
 		} else if current.State.IsTerminal() {
 			home.close()
 			return
 		} else {
-			cleanupRecord := current
+			cleanupRecord = current
 			cleanupRecord.State = terminal.State
-			terminal.Cleanup, terminal.Diagnostics = finalizeManagedCodexHome(home, cleanupRecord, terminal.Cleanup, terminal.Diagnostics)
 		}
 	}
 	_, err := store.MarkTerminal(jobID, terminal)
-	if err == nil || errors.Is(err, jobstore.ErrTerminal) {
+	if err == nil {
+		if home != nil {
+			cleanup, diagnostics := finalizeManagedCodexHome(home, cleanupRecord, terminal.Cleanup, terminal.Diagnostics)
+			if cleanup != terminal.Cleanup && len(diagnostics) > len(terminal.Diagnostics) {
+				log.Printf("agentbus service: job %s managed Codex home cleanup after terminal write: %s", jobID, diagnostics[len(diagnostics)-1])
+			}
+		}
+		return
+	}
+	if errors.Is(err, jobstore.ErrTerminal) {
+		if home != nil {
+			home.close()
+		}
 		// ErrTerminal is the store-enforced first-terminal-wins result. A
 		// later observer never retries or overwrites that recorded outcome.
 		return
@@ -1200,10 +1216,16 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 			FinishedAt:       time.Now().UTC(),
 		}
 		if _, failureErr := store.MarkTerminal(jobID, failed); failureErr == nil {
+			if home != nil {
+				home.close()
+			}
 			return
 		} else if !errors.Is(failureErr, jobstore.ErrTerminal) {
 			err = errors.Join(err, fmt.Errorf("persist storage failure terminal record: %w", failureErr))
 		}
+	}
+	if home != nil {
+		home.close()
 	}
 	log.Printf("agentbus service: job %s terminal write failed: %v", jobID, err)
 }
