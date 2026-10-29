@@ -569,7 +569,8 @@ func (store *Store) ListPage(limit int, afterID string) (records []Record, nextA
 	return records, nextAfter, more, nil
 }
 
-// MarkLogsPruned records that the job's diagnostic log sidecars were removed.
+// MarkLogsPruned marks that the job's diagnostic log sidecars are pruned. It
+// is persisted before unlinking so a later sweep can retry after interruption.
 // It leaves UpdatedAt unchanged because pruning is artifact lifecycle metadata,
 // not a new job state transition.
 func (store *Store) MarkLogsPruned(id string) (Record, error) {

@@ -119,11 +119,7 @@ func (s *Server) pruneArtifacts(store *jobstore.Store, dryRun bool, successfulAg
 	if err != nil {
 		return protocol.ArtifactsPruneResult{}, err
 	}
-	resumeTargets, err := nonterminalResumeTargets(records)
-	if err != nil {
-		return protocol.ArtifactsPruneResult{}, err
-	}
-	return s.pruneArtifactRecords(store, root, records, resumeTargets, dryRun, successfulAge, failedAge)
+	return s.pruneArtifactRecords(store, root, records, dryRun, successfulAge, failedAge)
 }
 
 func (s *Server) automaticPruneSweep(store *jobstore.Store) (protocol.ArtifactsPruneResult, error) {
@@ -140,48 +136,23 @@ func (s *Server) automaticPruneSweep(store *jobstore.Store) (protocol.ArtifactsP
 	if err != nil {
 		return protocol.ArtifactsPruneResult{}, fmt.Errorf("evaluate state root: %w", err)
 	}
-	if !s.pruneIndexed {
-		records, next, more, err := store.ListPage(autoPruneMaxJobsPerSweep, s.pruneIndexCursor)
-		if err != nil {
-			return protocol.ArtifactsPruneResult{}, err
-		}
-		pageTargets, err := nonterminalResumeTargets(records)
-		if err != nil {
-			return protocol.ArtifactsPruneResult{}, err
-		}
-		if s.pruneTargets == nil {
-			s.pruneTargets = make(map[string]struct{})
-		}
-		for target := range pageTargets {
-			s.pruneTargets[target] = struct{}{}
-		}
-		s.pruneIndexCursor = next
-		if more {
-			return emptyPruneResult(false, defaultSuccessfulPruneAge, defaultFailedPruneAge), nil
-		}
-		s.pruneIndexed = true
-		s.pruneApplyCursor = ""
-	}
 	records, next, more, err := store.ListPage(autoPruneMaxJobsPerSweep, s.pruneApplyCursor)
 	if err != nil {
 		return protocol.ArtifactsPruneResult{}, err
 	}
-	result, err := s.pruneArtifactRecords(store, root, records, s.pruneTargets, false, defaultSuccessfulPruneAge, defaultFailedPruneAge)
+	result, err := s.pruneArtifactRecords(store, root, records, false, defaultSuccessfulPruneAge, defaultFailedPruneAge)
 	if err != nil {
 		return protocol.ArtifactsPruneResult{}, err
 	}
 	if more {
 		s.pruneApplyCursor = next
 	} else {
-		s.pruneIndexCursor = ""
 		s.pruneApplyCursor = ""
-		s.pruneTargets = nil
-		s.pruneIndexed = false
 	}
 	return result, nil
 }
 
-func (s *Server) pruneArtifactRecords(store *jobstore.Store, root string, records []jobstore.Record, resumeTargets map[string]struct{}, dryRun bool, successfulAge, failedAge time.Duration) (protocol.ArtifactsPruneResult, error) {
+func (s *Server) pruneArtifactRecords(store *jobstore.Store, root string, records []jobstore.Record, dryRun bool, successfulAge, failedAge time.Duration) (protocol.ArtifactsPruneResult, error) {
 	result := emptyPruneResult(dryRun, successfulAge, failedAge)
 	logsFD, logsErr := openExistingManagedDirectory(root, "artifacts", "logs")
 	if logsErr == nil {
@@ -191,7 +162,7 @@ func (s *Server) pruneArtifactRecords(store *jobstore.Store, root string, record
 	}
 	now := time.Now().UTC()
 	for _, record := range records {
-		if reason := s.pruneSkipReason(record, resumeTargets, now, successfulAge, failedAge); reason != "" {
+		if reason := s.pruneSkipReason(record, now, successfulAge, failedAge); reason != "" {
 			result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Reason: reason})
 			continue
 		}
@@ -222,24 +193,7 @@ func emptyPruneResult(dryRun bool, successfulAge, failedAge time.Duration) proto
 	}
 }
 
-func nonterminalResumeTargets(records []jobstore.Record) (map[string]struct{}, error) {
-	targets := make(map[string]struct{})
-	for _, record := range records {
-		if record.State.IsTerminal() {
-			continue
-		}
-		var spec protocol.TaskSpec
-		if len(record.TaskSpec) == 0 || json.Unmarshal(record.TaskSpec, &spec) != nil {
-			return nil, fmt.Errorf("read non-terminal job %s resume target: invalid task spec", record.JobID)
-		}
-		if spec.ResumeJobID != "" {
-			targets[spec.ResumeJobID] = struct{}{}
-		}
-	}
-	return targets, nil
-}
-
-func (s *Server) pruneSkipReason(record jobstore.Record, resumeTargets map[string]struct{}, now time.Time, successfulAge, failedAge time.Duration) string {
+func (s *Server) pruneSkipReason(record jobstore.Record, now time.Time, successfulAge, failedAge time.Duration) string {
 	if s.activeExecution(record.JobID) != nil {
 		return "job still has an active execution"
 	}
@@ -254,9 +208,6 @@ func (s *Server) pruneSkipReason(record jobstore.Record, resumeTargets map[strin
 	}
 	if record.State != protocol.PublicStateCompleted && record.BackendSessionID != "" {
 		return "backend session is resumable"
-	}
-	if _, ok := resumeTargets[record.JobID]; ok {
-		return "job is the resume target of a non-terminal job"
 	}
 	if record.FinishedAt == nil {
 		return "terminal job has no finish time"
@@ -301,10 +252,15 @@ func (s *Server) pruneJobLogs(store *jobstore.Store, root string, logsFD int, re
 		{kind: "log", path: base.Stdout, name: filepath.Base(base.Stdout)},
 		{kind: "log", path: base.Stderr, name: filepath.Base(base.Stderr)},
 	}
-	jobLogsRemoved := false
+	type presentSidecar struct {
+		kind string
+		path string
+		name string
+	}
+	presentSidecars := make([]presentSidecar, 0, len(paths))
 	for _, candidate := range paths {
-		size, present, statErr := managedRegularFileSize(logsFD, candidate.name)
-		if errors.Is(statErr, unix.ENOENT) || (!present && statErr == nil) {
+		size, filePresent, statErr := managedRegularFileSize(logsFD, candidate.name)
+		if errors.Is(statErr, unix.ENOENT) || (!filePresent && statErr == nil) {
 			continue
 		}
 		if statErr != nil {
@@ -317,20 +273,29 @@ func (s *Server) pruneJobLogs(store *jobstore.Store, root string, logsFD int, re
 			result.WouldRemoveBytes += size
 			continue
 		}
-		removedBytes, removeErr := removeManagedRegularFile(logsFD, candidate.name)
-		if removeErr != nil {
-			result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Path: candidate.path, Reason: removeErr.Error()})
-			continue
-		}
-		item.Bytes = removedBytes
-		result.Removed = append(result.Removed, item)
-		result.RemovedBytes += removedBytes
-		jobLogsRemoved = true
+		presentSidecars = append(presentSidecars, presentSidecar{kind: candidate.kind, path: candidate.path, name: candidate.name})
 	}
-	if jobLogsRemoved {
+	if dryRun || len(presentSidecars) == 0 {
+		return
+	}
+	if !record.LogsPruned {
 		if _, err := store.MarkLogsPruned(record.JobID); err != nil {
 			result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Reason: "record pruned logs: " + err.Error()})
+			return
 		}
+	}
+	for _, sidecar := range presentSidecars {
+		removedBytes, removeErr := removeManagedRegularFile(logsFD, sidecar.name)
+		if errors.Is(removeErr, unix.ENOENT) {
+			continue
+		}
+		if removeErr != nil {
+			result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Path: sidecar.path, Reason: removeErr.Error()})
+			continue
+		}
+		item := protocol.PruneItem{JobID: record.JobID, Kind: sidecar.kind, Path: sidecar.path, Bytes: removedBytes}
+		result.Removed = append(result.Removed, item)
+		result.RemovedBytes += removedBytes
 	}
 }
 

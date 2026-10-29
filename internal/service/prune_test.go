@@ -24,15 +24,14 @@ func TestPruneDryRunApplyEligibilityAndTranscriptMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	completed := newPruneTestJob(t, server, "completed", protocol.PublicStateCompleted, protocol.CleanupClean, false, "", "")
-	failed := newPruneTestJob(t, server, "failed", protocol.PublicStateFailed, protocol.CleanupClean, false, "", "")
-	retained := newPruneTestJob(t, server, "retained", protocol.PublicStateCompleted, protocol.CleanupClean, true, "session-retained", "")
-	resumable := newPruneTestJob(t, server, "resumable", protocol.PublicStateFailed, protocol.CleanupClean, false, "session-resumable", "")
-	uncertain := newPruneTestJob(t, server, "uncertain", protocol.PublicStateCompleted, protocol.CleanupUncertain, false, "", "")
-	resumeTarget := newPruneTestJob(t, server, "resume-target", protocol.PublicStateCompleted, protocol.CleanupClean, false, "", "")
-	queued := newPruneTestJob(t, server, "queued", protocol.PublicStateQueued, protocol.CleanupClean, false, "", resumeTarget.JobID)
-	running := newPruneTestJob(t, server, "running", protocol.PublicStateRunning, protocol.CleanupClean, false, "", "")
-	young := newPruneTestJob(t, server, "young", protocol.PublicStateCompleted, protocol.CleanupClean, false, "", "", time.Hour)
+	completed := newPruneTestJob(t, server, "completed", protocol.PublicStateCompleted, protocol.CleanupClean, false, "")
+	failed := newPruneTestJob(t, server, "failed", protocol.PublicStateFailed, protocol.CleanupClean, false, "")
+	retained := newPruneTestJob(t, server, "retained", protocol.PublicStateCompleted, protocol.CleanupClean, true, "session-retained")
+	resumable := newPruneTestJob(t, server, "resumable", protocol.PublicStateFailed, protocol.CleanupClean, false, "session-resumable")
+	uncertain := newPruneTestJob(t, server, "uncertain", protocol.PublicStateCompleted, protocol.CleanupUncertain, false, "")
+	queued := newPruneTestJob(t, server, "queued", protocol.PublicStateQueued, protocol.CleanupClean, false, "")
+	running := newPruneTestJob(t, server, "running", protocol.PublicStateRunning, protocol.CleanupClean, false, "")
+	young := newPruneTestJob(t, server, "young", protocol.PublicStateCompleted, protocol.CleanupClean, false, "", time.Hour)
 
 	completedLogs := writePruneTestLogs(t, completed, map[string]string{
 		"stdout": "out",
@@ -45,7 +44,7 @@ func TestPruneDryRunApplyEligibilityAndTranscriptMarker(t *testing.T) {
 		"items":  "fi",
 	})
 	protectedLogs := make([]string, 0)
-	for _, record := range []jobstore.Record{retained, resumable, uncertain, resumeTarget, queued, running, young} {
+	for _, record := range []jobstore.Record{retained, resumable, uncertain, queued, running, young} {
 		protectedLogs = append(protectedLogs, writePruneTestLogs(t, record, map[string]string{"stdout": "keep"})...)
 	}
 	completedHome, outsideFile := writePruneTestCodexArtifacts(t, server, completed)
@@ -94,13 +93,12 @@ func TestPruneDryRunApplyEligibilityAndTranscriptMarker(t *testing.T) {
 		reasonByJob[skipped.JobID] = skipped.Reason
 	}
 	for jobID, want := range map[string]string{
-		retained.JobID:     "session is retained",
-		resumable.JobID:    "backend session is resumable",
-		uncertain.JobID:    "cleanup is uncertain",
-		resumeTarget.JobID: "job is the resume target of a non-terminal job",
-		queued.JobID:       "job is active or queued",
-		running.JobID:      "job is active or queued",
-		young.JobID:        "job is younger than the 168h0m0s retention threshold",
+		retained.JobID:  "session is retained",
+		resumable.JobID: "backend session is resumable",
+		uncertain.JobID: "cleanup is uncertain",
+		queued.JobID:    "job is active or queued",
+		running.JobID:   "job is active or queued",
+		young.JobID:     "job is younger than the 168h0m0s retention threshold",
 	} {
 		if reasonByJob[jobID] != want {
 			t.Errorf("skip reason for %s = %q, want %q", jobID, reasonByJob[jobID], want)
@@ -167,30 +165,47 @@ func TestAutomaticPruneSweepBoundsRecordWork(t *testing.T) {
 		}
 	}
 
-	page, cursor, more, err := store.ListPage(autoPruneMaxJobsPerSweep, "")
-	if err != nil || len(page) != autoPruneMaxJobsPerSweep || !more {
-		t.Fatalf("first record page = %d records, more=%t, err=%v", len(page), more, err)
+	firstSweep, err := server.automaticPruneSweep(store)
+	if err != nil || len(firstSweep.Skipped) != autoPruneMaxJobsPerSweep || server.pruneApplyCursor == "" {
+		t.Fatalf("first sweep skipped=%d cursor=%q err=%v", len(firstSweep.Skipped), server.pruneApplyCursor, err)
 	}
-	if _, err := server.automaticPruneSweep(store); err != nil {
-		t.Fatal(err)
-	}
-	if server.pruneIndexCursor != cursor || server.pruneIndexed {
-		t.Fatalf("first index cursor=%q indexed=%t, want cursor %q and incomplete index", server.pruneIndexCursor, server.pruneIndexed, cursor)
-	}
-	firstApply, err := server.automaticPruneSweep(store)
-	if err != nil || len(firstApply.Skipped) != autoPruneMaxJobsPerSweep {
-		t.Fatalf("first apply page skipped=%d, err=%v", len(firstApply.Skipped), err)
-	}
-	if !server.pruneIndexed {
-		t.Fatal("resume-target index did not complete after the remaining six records")
-	}
-	lastApply, err := server.automaticPruneSweep(store)
-	if err != nil || len(lastApply.Skipped) != 6 || server.pruneIndexed {
-		t.Fatalf("last apply page skipped=%d indexed=%t err=%v", len(lastApply.Skipped), server.pruneIndexed, err)
+	lastSweep, err := server.automaticPruneSweep(store)
+	if err != nil || len(lastSweep.Skipped) != 6 || server.pruneApplyCursor != "" {
+		t.Fatalf("last sweep skipped=%d cursor=%q err=%v", len(lastSweep.Skipped), server.pruneApplyCursor, err)
 	}
 }
 
-func newPruneTestJob(t *testing.T, server *Server, requestID string, state protocol.PublicState, cleanup protocol.Cleanup, retain bool, sessionID, resumeID string, finishedAgo ...time.Duration) jobstore.Record {
+func TestAutomaticPruneSweepRetriesMarkedLogSidecars(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{})
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := newPruneTestJob(t, server, "marked-sidecars", protocol.PublicStateCompleted, protocol.CleanupClean, false, "")
+	paths := writePruneTestLogs(t, record, map[string]string{
+		"stdout": "out",
+		"stderr": "error",
+		"items":  "item",
+	})
+	if _, err := store.MarkLogsPruned(record.JobID); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := server.automaticPruneSweep(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Removed) != len(paths) {
+		t.Fatalf("sweep removed %d sidecars, want %d: %+v", len(result.Removed), len(paths), result)
+	}
+	for _, path := range paths {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("sweep left marked sidecar %s: %v", path, err)
+		}
+	}
+}
+
+func newPruneTestJob(t *testing.T, server *Server, requestID string, state protocol.PublicState, cleanup protocol.Cleanup, retain bool, sessionID string, finishedAgo ...time.Duration) jobstore.Record {
 	t.Helper()
 	cwd := t.TempDir()
 	canonicalCWD, err := engine.CanonicalWorkspace(cwd)
@@ -198,7 +213,7 @@ func newPruneTestJob(t *testing.T, server *Server, requestID string, state proto
 		t.Fatal(err)
 	}
 	workspaceKey := engine.WorkspaceKey(canonicalCWD)
-	spec := protocol.TaskSpec{Backend: "codex", CWD: canonicalCWD, Prompt: "prune test", Write: true, RetainSession: retain, ResumeJobID: resumeID}
+	spec := protocol.TaskSpec{Backend: "codex", CWD: canonicalCWD, Prompt: "prune test", Write: true, RetainSession: retain}
 	raw, err := json.Marshal(spec)
 	if err != nil {
 		t.Fatal(err)

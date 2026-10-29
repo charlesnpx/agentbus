@@ -143,10 +143,7 @@ type Server struct {
 
 	pruneMu          sync.Mutex
 	pruneInterval    time.Duration
-	pruneIndexCursor string
 	pruneApplyCursor string
-	pruneTargets     map[string]struct{}
-	pruneIndexed     bool
 
 	// processTable, processGroups, and processGroupGoneFn are the service's restart-recovery
 	// dependencies. They deliberately live here instead of in jobstore: the
