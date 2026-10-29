@@ -99,6 +99,7 @@ type Conn struct {
 	decodeErrs <-chan error
 	readerDone <-chan struct{}
 	drops      *frameDropTracker
+	capture    *captureWarningTracker
 	running    command.RunningCommand
 	retirement *retirement
 
@@ -107,11 +108,17 @@ type Conn struct {
 	closeErr  error
 }
 
-func newConn(stdin io.WriteCloser, stdout io.ReadCloser, stdoutLog io.Writer, running command.RunningCommand, retirement *retirement) *Conn {
+func newConn(stdin io.WriteCloser, stdout io.ReadCloser, stdoutLog io.Writer, capture *captureWarningTracker, running command.RunningCommand, retirement *retirement) *Conn {
 	frames := make(chan Frame, 16)
 	decodeErrs := make(chan error, 1)
 	readerDone := make(chan struct{})
 	drops := &frameDropTracker{}
+	if capture == nil {
+		capture = &captureWarningTracker{source: "stdout"}
+	}
+	if stdoutLog != nil {
+		stdoutLog = capture.tolerantWriter(stdoutLog)
+	}
 	go readJSONL(stdout, stdoutLog, frames, decodeErrs, readerDone, drops)
 	return &Conn{
 		stdin:      stdin,
@@ -119,9 +126,17 @@ func newConn(stdin io.WriteCloser, stdout io.ReadCloser, stdoutLog io.Writer, ru
 		decodeErrs: decodeErrs,
 		readerDone: readerDone,
 		drops:      drops,
+		capture:    capture,
 		running:    running,
 		retirement: retirement,
 	}
+}
+
+func (c *Conn) captureWarning() *captureWarning {
+	if c == nil || c.capture == nil {
+		return nil
+	}
+	return c.capture.snapshot()
 }
 
 // FrameDrops returns the backend JSONL frames discarded by the bounded reader.

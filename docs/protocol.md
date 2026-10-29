@@ -4,16 +4,19 @@ Agentbus protocol version 3 is a JSON-RPC 2.0 service over a local,
 newline-delimited Unix socket. Each frame is one JSON object followed by a
 newline. The daemon accepts only protocol version 3.
 
-The wire surface has six methods:
+The wire surface has nine methods:
 
 | Method | Purpose |
 | --- | --- |
 | protocol.hello | Authenticate the connection and confirm the protocol version. |
+| backend.inspect | Inspect configured backend executables and daemon defaults. |
 | job.submit | Create or replay an identified job. |
 | job.get | Read one identified job. |
 | job.list | List compact job summaries with optional workspace, tag, and state filters. |
 | job.transcript | Return a stateless digest and selected captured items for one job. |
 | job.cancel | Request cancellation of one job. |
+| artifacts.prune | Preview or remove eligible Agentbus-owned diagnostic artifacts. |
+| job.steer | Submit one bounded follow-up instruction to an active steerable job. |
 
 A client must call protocol.hello successfully before any other method on the
 connection. A second hello on the same connection is invalid. Unknown methods
@@ -58,6 +61,7 @@ Agentbus errors. The stable data.code values are:
 | method_not_found | The requested method is not part of the version-3 surface. |
 | backend_unavailable | The daemon cannot use the requested backend or its job store. |
 | invalid_task_spec | Parameters, identity, task specification, or inline schema are invalid. |
+| queue_full | The new submission would exceed the daemon's bounded waiting queue. |
 | unknown_job | No job has the requested jobId. |
 
 jobId is included when the error relates to a known or requested job. Clients
@@ -88,11 +92,49 @@ available model and effort metadata:
 }
 ~~~
 
+## backend.inspect
+
+backend.inspect takes an empty parameter object and inspects each configured
+backend independently:
+
+~~~json
+{}
+~~~
+
+~~~json
+{
+  "backends": [
+    {
+      "backend": "codex",
+      "executablePath": "/usr/local/bin/codex",
+      "version": "codex-cli 1.2.3",
+      "defaultModel": "gpt-5-codex",
+      "defaultEffort": "high"
+    },
+    {
+      "backend": "claude",
+      "error": "--version failed: exit status 1"
+    }
+  ]
+}
+~~~
+
+Each entry contains the resolved executable path, the first line of its
+`--version` output, and configured default model/effort when present. A
+per-backend `error` reports path resolution or version-probe failure and does
+not block the other entries. The daemon makes at most one bounded `--version`
+call per executable path and modification time during its lifetime, caching
+both successful results and failures. Inspection does not query provider
+accounts, billing, or model catalogues.
+
 ## job.submit
 
 Submission has a compound identity. A matching replay returns the existing job
 without launching it again. Reusing the same identity with a different task
-specification is rejected.
+specification is rejected. A new submission that exceeds the daemon's bounded
+waiting queue returns `queue_full`; matching deduplicated submissions are not
+new queue entries. Execution timeouts begin when the daemon reserves an
+execution slot, not when the job is submitted.
 
 ~~~json
 {
@@ -103,6 +145,7 @@ specification is rejected.
     "cwd": "/absolute/path",
     "write": true,
     "prompt": "string",
+    "inputMode": "steerable",
     "resumeJobId": "job_previous",
     "retainSession": true,
     "model": "string",
@@ -114,8 +157,16 @@ specification is rejected.
 }
 ~~~
 
-backend, cwd, write, and prompt are required task fields. resumeJobId,
+backend, cwd, write, and prompt are required task fields. inputMode,
+resumeJobId,
 retainSession, model, effort, outputSchema, tags, and timeoutMs are optional.
+inputMode accepts `fixed` or `steerable`. Omission means `fixed`; this value is
+stored with the immutable task specification and participates in identified
+replay hashing. Because it uses `omitempty`, omission preserves the existing
+hash for every prior request. A daemon that does not recognize the field
+rejects it as `invalid_task_spec` through strict unknown-field decoding, so no
+protocol major-version bump is needed. The field is independent of `write` and
+does not infer review intent from prompt text.
 outputSchema is one inline Draft 2020-12 JSON Schema value: an object or a
 boolean. timeoutMs is a non-negative integer no greater than four hours; zero
 means no deadline.
@@ -170,7 +221,9 @@ All job.list parameters are optional:
 {
   "workspaceKey": "string",
   "tags": {"key": "value"},
-  "states": ["queued", "running"]
+  "states": ["queued", "running"],
+  "limit": 50,
+  "cursor": "opaque-next-page-token"
 }
 ~~~
 
@@ -193,6 +246,7 @@ The result contains compact summaries:
       "tags": {"team": "core"},
       "cleanup": "clean",
       "createdAt": "2026-08-20T12:00:00Z",
+      "queuedAt": "2026-08-20T12:00:00Z",
       "updatedAt": "2026-08-20T12:00:01Z",
       "failureClass": "backend_error",
       "contract": {
@@ -208,10 +262,14 @@ The result contains compact summaries:
 }
 ~~~
 
-Each summary always contains jobId, backend, state, cleanup, createdAt, and
-updatedAt. tags, modelReported, failureClass, and contract appear when
-applicable. tags is the submitted tag map, allowing a caller to see why a tag
-filter matched.
+Each summary always contains jobId, backend, state, cleanup, createdAt,
+queuedAt, and updatedAt. queuedAt is the time the job entered the queue;
+startedAt on job.get shows when the durable running transition was recorded.
+tags, modelReported, effortReported, failureClass, and contract appear when
+applicable. modelReported is the latest model the backend reported;
+effortReported is included when the backend reports effort. Neither is filled
+from the task request. tags is the submitted tag map, allowing a caller to see
+why a tag filter matched.
 
 itemCount and liveness appear only while this daemon has an active execution
 for that job. lastItemAt appears after that active execution has assembled an
@@ -236,6 +294,15 @@ job. workspaceKey is an opaque, submitter-chosen namespace, and Agentbus
 cannot derive another tool's key. Therefore, status without --job sends no
 workspace filter and lists every workspace; a caller that knows a key can use
 --workspace-key <key> to filter the list.
+
+The wire limit is optional. Omitting it preserves the existing unbounded
+client.JobList behavior; a positive limit returns newest jobs first, ordered by
+createdAt descending and jobId descending for ties. cursor continues strictly
+after the last summary in that ordering. A truncated result contains
+`"truncated": true` and a `nextCursor` that can be sent as `cursor` on the next
+request. When there is no further page, those fields are omitted. The CLI sends
+a limit of 50 by default, supports `--before <nextCursor>` for continuation,
+and uses `--all` to omit the wire limit.
 
 ## job.transcript
 
@@ -312,6 +379,33 @@ more activity. A sidecar captured before completion receipts existed has no
 receipt and is therefore reported as a gapped prefix, because its completeness
 cannot be established.
 
+When Agentbus has deliberately removed a job's log sidecars, the result also
+includes `pruned: true` and an empty transcript. This distinguishes retention
+cleanup from a sidecar that was never created or is unexpectedly missing.
+
+## artifacts.prune
+
+This method previews eligible artifact cleanup by default. `dryRun` may be
+omitted (equivalent to `true`) or set to `false` to apply the cleanup.
+Thresholds use Go duration syntax and default to `168h` for completed jobs and
+`720h` for failed, canceled, or unknown jobs.
+
+~~~json
+{
+  "dryRun": true,
+  "successfulOlderThan": "168h",
+  "failedOlderThan": "720h"
+}
+~~~
+
+The result contains `wouldRemove` and `wouldRemoveBytes` for a dry-run,
+`removed` and `removedBytes` after an apply pass, and `skipped` entries with a
+job ID, optional path, and reason. The method removes only clean terminal jobs'
+raw log sidecars and Agentbus-created Codex `cache`/`tmp` directories after the
+age threshold for their state. Retained sessions, resumable sessions, resume
+targets of non-terminal jobs, and all other unsafe or ineligible paths are
+skipped. Job records, request identity, and result artifacts are preserved.
+
 ## job.get
 
 job.get requires a non-empty jobId. An empty parameter object is an
@@ -327,33 +421,40 @@ invalid_task_spec parameter error rather than a list request.
   "workspaceKey": "string",
   "requestId": "string",
   "backend": "string",
-  "state": "completed",
+  "inputMode": "steerable",
+  "steers": [],
+  "state": "running",
   "cleanup": "clean",
   "createdAt": "2026-08-20T12:00:00Z",
+  "queuedAt": "2026-08-20T12:00:00Z",
   "startedAt": "2026-08-20T12:00:01Z",
-  "finishedAt": "2026-08-20T12:00:05Z",
+  "execution": {
+    "intent": "edit",
+    "sourceWritable": true,
+    "scratch": "/state-root/workspaces/key/codex/job_id",
+    "caches": {
+      "GOCACHE": "/state-root/workspaces/key/codex/job_id/cache/go-build",
+      "GOMODCACHE": "/home/user/go/pkg/mod"
+    },
+    "network": "denied",
+    "gitMetadata": "read-only",
+    "enforcement": "os-sandbox"
+  },
   "timeout": {
     "effective": 1800000,
     "source": "daemon_default"
   },
+  "deadline": "2026-08-20T12:30:01Z",
+  "remainingMs": 1799500,
+  "resumable": {
+    "eligible": false,
+    "reason": "resume target is running rather than terminal"
+  },
+  "modelRequested": "gpt-5-codex",
+  "effortRequested": "high",
+  "modelReported": "gpt-5-codex",
+  "effortReported": "high",
   "tags": {"key": "value"},
-  "result": {
-    "text": "optional inline result",
-    "resultPath": "/state-root/artifacts/results/job_x.txt",
-    "sha256": "64 lowercase hexadecimal characters",
-    "bytes": 123
-  },
-  "contract": {
-    "schemaSha256": "schema digest",
-    "evaluated": true,
-    "compliant": true,
-    "attempts": 1,
-    "violations": []
-  },
-  "failure": {
-    "class": "backend_error",
-    "reason": "string"
-  },
   "logPaths": {
     "stdout": "string",
     "stdoutTruncated": false,
@@ -363,9 +464,39 @@ invalid_task_spec parameter error rather than a list request.
 }
 ~~~
 
-jobId, workspaceKey, requestId, backend, state, cleanup, createdAt, and timeout
-are always present. startedAt, finishedAt, tags, result, contract, failure,
-and logPaths appear only when they apply.
+jobId, workspaceKey, requestId, backend, inputMode, state, cleanup, createdAt,
+queuedAt, timeout, and steers are always present. Older stored jobs without
+inputMode project as `fixed`; steers is an empty array when there are no
+steering receipts. Each steer summary contains messageId, status, mechanism,
+and time; mechanism is empty unless delivery was confirmed. `execution` appears
+after the job starts and is recorded atomically with its starting transition.
+It contains intent (`inspect` or
+`edit`), the selected source write mode, optional scratch and cache paths,
+network policy, Git metadata access, and enforcement strength. The posture is
+descriptive: `sourceWritable` reports the selected mode, while `enforcement`
+identifies whether the backend uses an OS sandbox, agent permissions, or no
+filesystem boundary. For Codex edit jobs using the `workspaceWrite` sandbox,
+`gitMetadata` is `read-only` because the granted writable roots do not include
+the Git metadata directory. `logsPruned` is true after the daemon removes this
+job's raw log sidecars. diagnostics appears when the job has recorded
+operational diagnostics.
+
+startedAt, finishedAt, deadline, remainingMs, tags, result, contract, failure,
+cancellationReason, logPaths, modelRequested, effortRequested, modelReported,
+and effortReported appear only when they apply. resumable is a derived
+projection of the same session and retention rules used when validating resume
+submissions. Its `eligible` value describes local admission only; it is not a
+promise that the provider will accept the resume. deadline and remainingMs are
+present for a running job with a finite effective timeout. deadline is derived
+from startedAt plus timeout.effective; remainingMs is the current time left,
+clamped at zero.
+
+modelRequested and effortRequested preserve only values in the submitted
+TaskSpec, so they may be absent when a configured daemon default was applied.
+`requested is not executed`: these fields record intent, while modelReported
+and effortReported record the latest values observed in provider telemetry.
+modelReported retains its name for compatibility and now means latest
+observation; observed values are never filled from requested values.
 
 result exists only for a completed job with an authoritative result. Its
 resultPath, sha256, and bytes are required; text may be omitted when the result
@@ -375,6 +506,28 @@ hexadecimal digest with no algorithm prefix.
 failure exists only for a failed job. contract exists only when an outputSchema
 was submitted. attempts is one after initial evaluation and two only when the
 single permitted correction was attempted.
+
+When supplied by a provider, failure also includes its providerCode,
+providerMessage (bounded to 512 Unicode code points), stage, and absolute
+retryAfter time. providerCode is bounded to 128 code points. Existing class
+and reason values keep their prior meaning. Current stages are `startup`,
+`turn`, and `finalize`; schema-correction errors remain contract diagnostics
+under the existing correction behavior. A transient failure can leave partial
+workspace edits. Agentbus does not retry automatically; replay is the caller's
+decision.
+
+~~~json
+{
+  "failure": {
+    "class": "usage_limit",
+    "reason": "provider reported a usage limit",
+    "providerCode": "rate_limit_error",
+    "providerMessage": "weekly usage limit reached",
+    "stage": "turn",
+    "retryAfter": "2026-08-20T12:15:00Z"
+  }
+}
+~~~
 
 For each present log path, its paired `stdoutTruncated` or `stderrTruncated`
 boolean is explicitly present as `true` or `false` when the daemon can
@@ -395,7 +548,59 @@ The result reports the durable public state after the cancellation request:
 
 If the job is already terminal, cancellation returns that existing state. A
 race with completion also returns the first terminal state recorded by the
-daemon.
+daemon. Read job.get or `agentbus status --job <id>` for the persisted
+cancellationReason.
+
+## job.steer
+
+~~~json
+{"jobId":"string","messageId":"caller-generated-id","text":"follow-up instruction"}
+~~~
+
+messageId must contain 1 to 256 bytes. text must be non-empty and at most
+65,536 UTF-8 bytes (64 KiB). A steerable job accepts instructions only while a
+provider Turn is active. Fixed-input jobs return `not_steerable` before any
+provider I/O. Queued, completed, failed, canceled, or otherwise inactive jobs
+return `not_running`; job.steer never creates a job. A schema-correction Turn
+returns `schema_correction_active`.
+
+The receipt shape is:
+
+~~~json
+{"jobId":"string","messageId":"caller-generated-id","status":"admitted","mechanism":"","reason":"","deduplicated":false}
+~~~
+
+status is `admitted`, `delivered`, `rejected`, or `unknown`. An admitted receipt
+is immediate queue acceptance; job.get later shows its delivery outcome.
+mechanism is `native` or `interrupt_continue` only for confirmed delivery and
+is empty otherwise. reason is empty for admitted/delivered and one of
+`not_steerable`, `not_running`, `duplicate_conflict`, `queue_full`,
+`schema_correction_active`, `backend_unsupported`, or
+`delivery_unconfirmed` for rejection or uncertainty.
+
+The daemon orders steering against cancellation, schema correction, and job
+completion. Repeating a messageId with the same text returns its original
+receipt with `deduplicated: true`; a different text returns
+`duplicate_conflict`. The per-job pending queue is ordered and capped at eight
+messages. Each durable steer record stores messageId, the text SHA-256 and byte
+size, status, mechanism, reason, and timestamps. The text itself is not added to
+the original prompt or task hash. Cancel rejects queued steers and remains
+authoritative.
+
+The adapter contract keeps one logical Turn and one final result. An internal
+interrupt used to steer is not cancellation, and an interrupted segment's
+partial result is not the job result. Steering never changes deadline,
+permissions, model, effort, or schema. Sessions without steering support
+return `backend_unsupported`.
+
+`unknown` means provider delivery could not be confirmed. After a daemon
+restart, an admitted steer without a recorded outcome becomes
+`unknown`/`delivery_unconfirmed`; it is never sent again automatically.
+Deduplication is client-request identity, not provider exactly-once delivery.
+The daemon does not promise simultaneous interruption across backends, provider
+compliance with the new instruction, a stable provider turn ID across an
+interrupt-and-continue, rollback of already-started tools, a fresh-session
+fallback, or an alternative-backend fallback.
 
 ## States, cleanup, and failures
 
@@ -429,13 +634,36 @@ Failure classes are data on failed jobs, not more states:
 | --- | --- |
 | backend_unavailable | The selected backend could not be used. |
 | provider_overloaded | The provider reported capacity pressure. |
+| usage_limit | The provider reported a usage or rate limit. |
 | model_unavailable | The requested model was unavailable. |
 | content_policy | The provider refused the request on content-policy grounds. |
-| authentication | Authentication was rejected. This class is reserved; no current producer assigns it. |
+| authentication | The provider explicitly rejected authentication. |
 | backend_error | A launched backend returned another error. |
 | timeout | The job deadline expired. |
 | interrupted | The backend stopped without a successful terminal result. |
 | internal | Agentbus could not make a more specific classification. |
+| storage | Agentbus could not persist an authoritative result or terminal record. |
+
+The Codex app-server adapter recognizes structured completion `errorInfo` or
+`errorCode` signals for usage/rate limits, authentication, unavailable models,
+content policy, and overload. The Claude stream-json adapter recognizes
+structured error code/type/status signals for these classes, plus explicit
+usage-limit phrases in provider error messages. Its authentication mapping
+requires an authentication code or status 401. Other adapter errors retain
+their existing classification when they do not carry a distinguishable
+provider signal. Cursor ACP preserves its structured JSON-RPC error code and
+message, but does not assign `usage_limit` or `authentication` from generic
+terminal errors. Provider reset and retry-after values are normalized to the
+absolute `retryAfter` timestamp when present.
+
+`cancellationReason` is independent of public state and can be `operator`,
+`deadline`, `daemon_shutdown`, or `provider_interruption`. `operator` is
+recorded for job.cancel, including a queued job; the other values are recorded
+on their corresponding timeout, daemon-shutdown, and provider-interruption
+terminal paths. An operator cancel still wins the existing canceled terminal
+transition; deadlines and provider interruptions retain their existing failed
+classifications and states. Internal steering interrupts are not cancellation
+reasons.
 
 ## Inline schema validation
 

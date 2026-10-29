@@ -28,6 +28,7 @@ The core layout is:
   agentbus.sock
   agentbus.pid
   jobs.db
+  startup-diagnostic.log   # written when daemon autostart fails
   artifacts/
     logs/
     results/
@@ -36,14 +37,67 @@ The core layout is:
 token authenticates protocol.hello. agentbus.sock exists while the daemon is
 serving. agentbus.pid is written for a successful background launch or
 client-autostart; do not rely on it for a foreground daemon. jobs.db is the
-single bbolt store. It has exactly the meta, requests, and jobs buckets.
-artifacts contains log and result sidecars. There is no automatic artifact
-retention sweep: result and log artifacts remain until an operator removes
-them, so the state root grows until it is cleaned up.
+single bbolt store, not SQLite. Do not inspect it with sqlite3; use
+`agentbus status` and `job.get` for job state and diagnostics. It has exactly
+the meta, requests, and jobs buckets. startup-diagnostic.log is written on a
+failed daemon autostart and contains the startup phase and bounded diagnostic.
+artifacts contains log and result sidecars. Automatic pruning is disabled by
+default. `agentbus prune` previews eligible
+cleanup by default; pass `--apply` to delete. Completed jobs use a default age
+threshold of 168 hours (7 days); failed, canceled, and unknown jobs use 720
+hours (30 days). Both are configurable proposals through
+`--successful-older-than` and `--failed-older-than`, using Go duration syntax.
+The command reports the selected or removed paths and byte totals, plus any
+jobs or paths it skipped and why.
 
-A Codex job may also create an implementation-managed private home below
-workspaces/<workspace-hash>/codex/<job-id>. It is separate from the shared job
-store and may contain per-job caches.
+Pruning selects only raw log sidecars below `artifacts/logs` and disposable
+`cache`/`tmp` directories below a managed per-job Codex home. The job must be
+terminal, have `cleanup=clean`, and be older than the threshold for its state.
+Transcript responses and `job.get` report `pruned=true` or `logsPruned=true`
+after log sidecars have been removed, distinguishing deliberate pruning from a
+missing capture.
+
+`agentbus serve --prune-interval 24h` enables an automatic sweep when that
+invocation starts a daemon; it is off by default and uses the same 7-day and
+30-day thresholds. The daemon stays available while periodic pruning is
+enabled, even when it has no connected clients. Each sweep processes at most
+64 job records for cleanup and skips a managed cache tree with more than 10,000
+entries, so later sweeps can continue through larger stores.
+
+Pruning never deletes job records, request bindings or fingerprints, result
+artifacts, active or queued jobs, jobs with uncertain cleanup, retained
+sessions, failed/canceled/unknown jobs with a recorded resumable backend
+session, or a job targeted by a non-terminal resume request. It never deletes
+TaskSpec.cwd contents, Git worktrees, supplied artifact paths, or anything
+Agentbus did not create under its state root. It also never follows a symlink
+outside an owned directory. Delegate review-packet directories remain
+Delegate-owned.
+
+A job may create a managed private directory below
+workspaces/<workspace-hash>/codex/<job-id>. Codex uses it for its private home;
+writable jobs on all backends use it for job-private scratch and build-tool
+caches. It is separate from the shared job store.
+
+Writable jobs set `GOCACHE`, `TMPDIR`, `npm_config_cache`, `COREPACK_HOME`,
+`XDG_CACHE_HOME`, `npm_config_store_dir`, and `YARN_CACHE_FOLDER` to private
+directories there. Writable Codex jobs add that directory as an OS sandbox
+writable root. Inspect jobs get no private scratch or writable-cache
+environment: the current read-only backend profiles do not enforce a writable
+root outside the submitted workspace, and Agentbus does not weaken those
+profiles to add one. Codex may still receive the resolved host `GOMODCACHE` for
+reads.
+
+Codex jobs use the daemon's effective Go module cache for reads. Agentbus
+resolves `GOMODCACHE` once at daemon startup, using the daemon environment first
+and otherwise `go env GOMODCACHE` with a two-second timeout. If neither gives a
+path, Agentbus leaves `GOMODCACHE` at its default. It never redirects this
+variable to an empty per-job directory. The Codex workspace-write sandbox
+keeps the host module cache readable and outside its writable roots on macOS
+and Linux; a cache miss cannot be filled because Codex network access is
+denied. Codex jobs set `GOPROXY=off`, which makes a missing module fail with
+Go's own offline lookup error instead of retrying DNS. `-mod=readonly` only
+restricts module-file changes; it is not a filesystem sandbox or a promise
+that a cache is writable.
 
 The root and token are owner-only. Do not hand-edit jobs.db, token, or
 artifacts while a daemon is using the root.
@@ -51,8 +105,27 @@ artifacts while a daemon is using the root.
 ## Starting and selecting backends
 
 Use agentbus serve to start a background daemon. Use agentbus serve --foreground
-when a supervisor owns the process. The public CLI commands are version, serve,
-status, transcript, result, cancel, and configure-codex-sandbox.
+when a supervisor owns the process. Both forms accept `--max-jobs`,
+`--max-jobs-per-backend`, and `--max-queued`. Their defaults are 4 total jobs,
+2 jobs per backend, and 64 waiting jobs. These are starting values, not
+measured optima. Each value must be a positive integer; zero does not mean
+unlimited. The values apply when a daemon starts and do not reconfigure an
+already serving daemon.
+
+Jobs beyond the execution limits remain queued and start in FIFO order within
+their backend when a slot opens. A queued job for a saturated backend does not
+block a later job for another backend with a free slot. The queue bound counts
+waiting jobs; a matching deduplicated submission does not consume another
+entry. When the bound is reached, a new job.submit returns the typed
+`queue_full` error and CLI exit code 19. A queued cancellation removes the job
+before it can start a provider. Job lookup, listing, transcript, and queued
+cancellation remain available while all execution slots are occupied.
+
+The timeout is execution time: it begins when the daemon reserves a slot, not
+when job.submit is accepted. `queuedAt` records queue entry and `startedAt`
+records the start transition, so status shows both the waiting age and whether
+the job is queued or running. The public CLI commands are version, serve,
+status, transcript, result, cancel, prune, and configure-codex-sandbox.
 
 `agentbus configure-codex-sandbox` adds the Agentbus state root and cache root to
 Codex's `sandbox_workspace_write.writable_roots` array. It preserves existing
@@ -83,12 +156,41 @@ the recorded start token exactly matches the live process. It records cleanup
 as uncertain when cleanup cannot be established. Cleanup uncertainty does not
 erase a recorded completed result.
 
+## Capture and storage failures
+
+Raw stdout and stderr logs are optional diagnostics. If a raw-log sink fails,
+Agentbus stops writing that log and keeps draining provider output. `job.get`
+includes a bounded `diagnostics` entry with the captured byte count and sink
+error; `agentbus transcript` includes the warning and reports `gap: true`.
+The missing raw-log suffix cannot be reconstructed.
+
+Before a job launches, Agentbus checks available space on the state-root
+filesystem. Below 256 MiB it records a low-space diagnostic and still attempts
+the job because this estimate cannot predict the job's exact storage needs.
+There is no automatic cleanup on a write failure. If Agentbus cannot persist a
+final result artifact or its completed job record, the job is failed with
+failure class `storage` and the operating-system error. It does not publish an
+authoritative result; any captured transcript and known backend session remain
+available when their writes succeeded.
+
 ## Reading jobs and results
 
 agentbus status lists compact job summaries. With --job, its human-readable
 projection omits result text, while `--json` emits the full job.get record.
 That JSON is byte-identical to `agentbus result --json` and deliberately
 includes inline result text when the record has it.
+
+The full record includes an `execution` object after the job starts. It records
+`intent` (`inspect` or `edit`), `sourceWritable`, `scratch`, a cache-path map,
+`network`, `gitMetadata`, and `enforcement`. These are descriptive values, not
+a capability negotiation. `sourceWritable` reports the selected inspect/edit
+mode; `enforcement` says whether the backend provides an OS sandbox, agent
+permissions, or no filesystem boundary. Codex uses OS sandbox enforcement and
+denies job network access. Cursor uses agent-mode permissions, which do not
+sandbox filesystem or network access at the OS level. Claude has no filesystem
+or network sandbox; read-only tool permissions do not establish filesystem
+containment. The execution object is a start-time snapshot. This unit has no
+`verify` intent.
 
 agentbus result --job <id> reads the same full record. For a completed job it
 writes the authoritative result to standard output. It writes failure detail or
@@ -117,8 +219,12 @@ class, and schema compliance:
 | 13 | shutdown deadline exceeded |
 | 14 | unknown |
 | 15 | completed but the authoritative result artifact is missing, unreadable, or disagrees with its recorded digest |
+| 19 | submission rejected because the daemon's waiting queue is full |
 
-Codes 8, 9, and 12 are permanently retired. Do not reuse them.
+Codes 8, 9, and 12 are permanently retired. Codes 16–18 are reserved for other
+units. Do not reuse them.
+
+`agentbus steer` exits 17 for a rejected receipt and 18 for an unknown-delivery receipt.
 
 ## Store failures
 
@@ -127,6 +233,13 @@ binding its socket. A corrupt, truncated, incompatible, or busy database stops
 startup rather than being repaired in place. Preserve the root for diagnosis;
 do not create a replacement database at the same path unless you have first
 performed the required version-break cleanup above.
+
+Autostart errors distinguish a busy bbolt store, an incompatible or corrupt
+store, a process that exited before readiness, and a readiness timeout. The
+error names the startup phase and the `startup-diagnostic.log` path in the
+state root. It also includes the bounded stderr tail when available.
+If the daemon process cannot be started, the error uses code
+`process_start_failed` and phase `launching daemon process`.
 
 ## Footprint and residual risks
 
@@ -138,8 +251,9 @@ marks recovered running work unknown and never relaunches it; the reaper signals
 a recorded process group only when its live start token exactly matches the
 recorded token. This is the deliberate trade-off for preventing duplicate work.
 
-Result and log artifacts remain until an operator removes them. Nothing reclaims
-that disk automatically.
+Result artifacts and all artifacts outside the first retention policy remain
+until an operator removes them. Automatic pruning remains disabled unless
+`serve --prune-interval` is set.
 
 Downstream pins are recorded in each consumer's own go.mod and are not restated
 here, because a version written into this runbook goes stale without warning.

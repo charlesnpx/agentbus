@@ -10,9 +10,10 @@ const (
 	SocketName    = "agentbus.sock"
 	TokenFileName = "token"
 
-	MethodHello     = "protocol.hello"
-	MethodJobSubmit = "job.submit"
-	MethodJobCancel = "job.cancel"
+	MethodHello          = "protocol.hello"
+	MethodJobSubmit      = "job.submit"
+	MethodJobCancel      = "job.cancel"
+	MethodBackendInspect = "backend.inspect"
 )
 
 const (

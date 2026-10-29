@@ -183,15 +183,21 @@ func TestInstallerLiveInstallRestartsMatchingDaemon(t *testing.T) {
 	root := repoRoot(t)
 	home := t.TempDir()
 	stubBin := t.TempDir()
-	daemon := exec.Command("sleep", "30")
+	daemon := exec.Command("/bin/sh", "-c", "while IFS= read -r ignored; do :; done")
+	daemonStdin, err := daemon.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := daemon.Start(); err != nil {
+		_ = daemonStdin.Close()
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if daemon.Process != nil {
+		_ = daemonStdin.Close()
+		if daemon.Process != nil && daemon.ProcessState == nil {
 			_ = daemon.Process.Kill()
+			_ = daemon.Wait()
 		}
-		_ = daemon.Wait()
 	})
 	canonicalHome, err := filepath.EvalSymlinks(home)
 	if err != nil {

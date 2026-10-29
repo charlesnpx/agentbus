@@ -74,6 +74,14 @@ then `initialized`, then `thread/start` for a fresh session or `thread/resume`
 for a resumed session, then `turn/start`. Progress arrives as `item/*`
 notifications and semantic completion arrives as `turn/completed`.
 
+An active turn accepts native `turn/steer` requests using the `threadId` from
+the thread response, the `expectedTurnId` from `turn/start`, and one text
+input. The request does not change model, working directory, sandbox,
+effort, or schema. `RunTurn` remains the only app-server frame reader and
+correlates the steer response by JSON-RPC request id. Delivery is confirmed
+only when the response succeeds; if the steer context ends before a response,
+the result is unconfirmed. This mechanism does not interrupt the turn.
+
 Write turns set the app-server turn request's sandbox to workspace-write with
 approval policy `never` and network access disabled. When a CWD is available,
 it is also used as the writable root.
@@ -166,8 +174,16 @@ turns choose an offered `allow_once` option and read-only turns choose an
 offered `reject_once` option. It never selects an `*_always` option. Other
 server requests fail explicitly as JSON-RPC method-not-found.
 
-`Interrupt` sends ACP `session/cancel` for the active session. A resulting
-`stopReason: "cancelled"` is clean only after that interrupt was requested.
+`Interrupt` sends ACP `session/cancel` for the active session. Steering uses
+that same notification, answers any later `session/request_permission` with
+the `cancelled` outcome, drains the cancelled `session/prompt` response, and
+writes a new `session/prompt` on the same session with the follow-up text. The
+cancelled segment is not emitted as a result; only the resumed segment supplies
+the logical turn's result. ACP provides no separate acceptance acknowledgement
+before the prompt's terminal response, so `Confirmed` means the continuation
+prompt request was written after the prior prompt drained. It does not prove
+that Cursor accepted the instruction semantically or followed it. A resulting
+`stopReason: "cancelled"` is clean only after an interrupt was requested.
 Assistant chunks are emitted live and concatenated into the final result on an
 `end_turn` completion. Cursor does not expose an effort control through this
 adapter; specifying one is rejected before launch.
@@ -195,6 +211,16 @@ Claude's bidirectional stream-json input protocol: it sends a control-protocol
 `control_request` messages, and treats the `result` message as authoritative
 turn completion. A `result` with subtype `success` and no error flag emits the
 result text; other result subtypes or `is_error` values emit terminal errors.
+
+Steering uses `interrupt_continue` over that same persistent connection. The
+driver sends a `control_request` with `request.subtype` set to `interrupt` and
+waits for a matching `control_response` with subtype `success`. It drains the
+interrupted segment's `result` without emitting it as the logical result, then
+writes the follow-up as a user message and continues reading the resumed
+segment. A delivery is confirmed only after the interrupt acknowledgement and
+follow-up write. This is not same-turn injection and does not confirm that
+Claude followed the instruction. The adapter does not enable
+`--replay-user-messages`, which would change the existing transcript behavior.
 
 ### claude effort values
 

@@ -89,6 +89,101 @@ func TestJobGetRequiresIDAndReturnsBareRecord(t *testing.T) {
 	}
 }
 
+func TestJobGetProjectsDeadlineAndResumabilityFromDurableFields(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
+	timeoutMS := int64(120_000)
+	runningParams := submissionParams("projection-workspace", "running-retained", "fake", t.TempDir(), "running retained")
+	runningParams.TaskSpec.RetainSession = true
+	runningParams.TaskSpec.TimeoutMS = &timeoutMS
+	running := submitResultForTest(t, submitForTest(t, server, runningParams))
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(running.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordBackendSessionID(running.JobID, "running-session"); err != nil {
+		t.Fatal(err)
+	}
+	runningRecord, err := store.Get(running.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runningWire, err := server.jobRecordWire(runningRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDeadline := runningRecord.StartedAt.Add(time.Duration(timeoutMS) * time.Millisecond)
+	if runningWire.Deadline == nil || !runningWire.Deadline.Equal(wantDeadline) || runningWire.RemainingMs == nil || *runningWire.RemainingMs < 0 || *runningWire.RemainingMs > timeoutMS {
+		t.Fatalf("running deadline projection = deadline %v remaining %v, want %v and [0,%d]ms", runningWire.Deadline, runningWire.RemainingMs, wantDeadline, timeoutMS)
+	}
+	if runningWire.Resumable == nil || runningWire.Resumable.Eligible || runningWire.Resumable.Reason != "resume target is running rather than terminal" {
+		t.Fatalf("running resumability = %#v, want ineligible while running", runningWire.Resumable)
+	}
+
+	completedParams := submissionParams("projection-workspace", "completed-not-retained", "fake", t.TempDir(), "completed not retained")
+	completed := submitResultForTest(t, submitForTest(t, server, completedParams))
+	if _, err := store.MarkStarting(completed.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordBackendSessionID(completed.JobID, "completed-session"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkTerminal(completed.JobID, jobstore.TerminalUpdate{
+		State: protocol.PublicStateCompleted, Cleanup: protocol.CleanupClean, FinishedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	completedRecord, err := store.Get(completed.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedWire, err := server.jobRecordWire(completedRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completedWire.Deadline != nil || completedWire.RemainingMs != nil {
+		t.Fatalf("completed deadline projection = %v / %v, want omitted", completedWire.Deadline, completedWire.RemainingMs)
+	}
+	if completedWire.Resumable == nil || completedWire.Resumable.Eligible || completedWire.Resumable.Reason != "completed jobs are not resumable unless submitted with session retention; submit a new job" {
+		t.Fatalf("completed resumability = %#v, want non-retained ineligibility", completedWire.Resumable)
+	}
+}
+
+func TestJobGetProjectsDeadlineFromActiveExecutionSlot(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
+	timeoutMS := int64(120_000)
+	params := submissionParams("projection-workspace", "slot-deadline", "fake", t.TempDir(), "slot deadline")
+	params.TaskSpec.TimeoutMS = &timeoutMS
+	submitted := submitResultForTest(t, submitForTest(t, server, params))
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(submitted.JobID); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(submitted.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slotAcquiredAt := record.StartedAt.Add(-5 * time.Minute)
+	server.executionMu.Lock()
+	server.executions = make(map[string]*activeExecution)
+	server.executions[record.JobID] = &activeExecution{jobID: record.JobID, slotAcquiredAt: slotAcquiredAt}
+	server.executionMu.Unlock()
+
+	wire, err := server.jobRecordWire(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDeadline := slotAcquiredAt.Add(time.Duration(timeoutMS) * time.Millisecond)
+	if wire.Deadline == nil || !wire.Deadline.Equal(wantDeadline) {
+		t.Fatalf("running deadline projection = %v, want slot deadline %v", wire.Deadline, wantDeadline)
+	}
+}
+
 func TestJobLifecycleProjectsBackendReportedModel(t *testing.T) {
 	const requestedModel = "caller-requested-model"
 	for _, test := range []struct {
@@ -306,6 +401,45 @@ func TestJobListFiltersCombineWithAND(t *testing.T) {
 		if test.name == "all filters" && got[queued.JobID].Tags["project"] != "one" {
 			t.Fatalf("job.list summary tags = %#v, want projected tags", got[queued.JobID].Tags)
 		}
+	}
+}
+
+func TestJobListCursorPagesNewestFirstAndKeepsOmittedLimitUnbounded(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
+	for _, requestID := range []string{"page-a", "page-b", "page-c"} {
+		params := submissionParams("workspace-pages", requestID, "fake", t.TempDir(), requestID)
+		if result := submitResultForTest(t, submitForTest(t, server, params)); result.JobID == "" {
+			t.Fatal("submission has no job id")
+		}
+	}
+
+	unbounded := server.handleJobList(mustJSON(t, protocol.JobListParams{}))
+	if unbounded.err != nil {
+		t.Fatalf("unbounded job.list error = %#v", unbounded.err)
+	}
+	unboundedResult := unbounded.result.(protocol.JobListResult)
+	if len(unboundedResult.Jobs) != 3 || unboundedResult.Truncated || unboundedResult.NextCursor != "" {
+		t.Fatalf("omitted-limit result=%#v, want all jobs without truncation", unboundedResult)
+	}
+
+	firstOutcome := server.handleJobList(mustJSON(t, protocol.JobListParams{Limit: 2}))
+	if firstOutcome.err != nil {
+		t.Fatalf("first page error = %#v", firstOutcome.err)
+	}
+	first := firstOutcome.result.(protocol.JobListResult)
+	if len(first.Jobs) != 2 || !first.Truncated || first.NextCursor == "" {
+		t.Fatalf("first page=%#v, want two summaries and a continuation", first)
+	}
+	if first.Jobs[0].CreatedAt.Before(first.Jobs[1].CreatedAt) {
+		t.Fatalf("first page is not newest first: %#v", first.Jobs)
+	}
+	secondOutcome := server.handleJobList(mustJSON(t, protocol.JobListParams{Limit: 2, Cursor: first.NextCursor}))
+	if secondOutcome.err != nil {
+		t.Fatalf("second page error = %#v", secondOutcome.err)
+	}
+	second := secondOutcome.result.(protocol.JobListResult)
+	if len(second.Jobs) != 1 || second.Truncated || second.NextCursor != "" || second.Jobs[0].JobID == first.Jobs[0].JobID || second.Jobs[0].JobID == first.Jobs[1].JobID {
+		t.Fatalf("second page=%#v, want final non-overlapping summary", second)
 	}
 }
 
@@ -897,8 +1031,8 @@ func TestJobCancelAfterSpawnRecordsCleanupOutcome(t *testing.T) {
 		waitForExit bool
 		wantCleanup protocol.Cleanup
 	}{
-		{name: "clean inside grace", argv: []string{"sleep", "30"}, waitForExit: true, wantCleanup: protocol.CleanupClean},
-		{name: "uncertain outside grace", argv: []string{"sh", "-c", "trap '' TERM; printf 'term-trap-ready\\n'; while :; do sleep 1; done"}, readyLine: "term-trap-ready\n", wantCleanup: protocol.CleanupUncertain},
+		{name: "clean inside grace", argv: []string{"sh", "-c", "while IFS= read -r ignored; do :; done"}, waitForExit: true, wantCleanup: protocol.CleanupClean},
+		{name: "uncertain outside grace", argv: []string{"sh", "-c", "trap '' TERM; printf 'term-trap-ready\\n'; while IFS= read -r ignored; do :; done"}, readyLine: "term-trap-ready\n", wantCleanup: protocol.CleanupUncertain},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			interrupted := false
@@ -1292,17 +1426,27 @@ func startProcessGroup(t *testing.T, readyLine string, argv ...string) (*exec.Cm
 	t.Helper()
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	var stdout io.ReadCloser
 	if readyLine != "" {
 		var err error
 		stdout, err = cmd.StdoutPipe()
 		if err != nil {
+			_ = stdin.Close()
 			t.Fatal(err)
 		}
 	}
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		stopProcessGroupFixture(t, cmd)
+	})
 	pid := cmd.Process.Pid
 	pgid, err := syscall.Getpgid(pid)
 	if err != nil {
@@ -1331,6 +1475,18 @@ func startProcessGroup(t *testing.T, readyLine string, argv ...string) (*exec.Cm
 		}
 	}
 	return cmd, jobstore.ProcessClaim{PID: pid, PGID: pgid, StartToken: info.StartTime}
+}
+
+func stopProcessGroupFixture(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if cmd.ProcessState == nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
 }
 
 func stopWaitedProcessGroup(pgid int, waitDone <-chan error) {

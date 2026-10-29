@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
 	"github.com/charlesnpx/agentbus/engine/adapter/claudecli"
@@ -542,6 +543,151 @@ func TestExecutionSpillsLargeTerminalResultWithDigestAndElision(t *testing.T) {
 	}
 }
 
+func TestExecutionCaptureWarningIsRecordedAndGapsTranscript(t *testing.T) {
+	const warningText = "capture warning: raw stdout log stopped after 128 bytes: no space left on device"
+	backend := &executionFakeBackend{name: "capture-warning"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				input.OnProcessStart(engine.ProcessRef{PID: 4210, PGID: 4210, StartTime: "capture-token"}, 0)
+				return executionEvents(
+					engine.Event{Type: engine.EventWarning, Text: warningText, Metadata: map[string]any{"agentbusCaptureWarning": true, "bytesCaptured": 128}},
+					engine.Event{Type: engine.EventResultMessage, Text: "finished"},
+				), nil
+			},
+		}, nil
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "capture warning", nil)
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(got.Diagnostics, "\n"), warningText) {
+		t.Fatalf("job diagnostics = %#v, want capture warning", got.Diagnostics)
+	}
+	wire, err := server.jobRecordWire(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(wire.Diagnostics, "\n"), warningText) {
+		t.Fatalf("job.get diagnostics = %#v, want capture warning", wire.Diagnostics)
+	}
+	limit := 10
+	transcript, err := server.jobTranscript(got, protocol.JobTranscriptParams{JobID: got.JobID, Limit: &limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !transcript.Gap || len(transcript.Items) == 0 || transcript.Items[0].Kind != "warning" || transcript.Items[0].Text != warningText {
+		t.Fatalf("transcript = %#v, want warning item and a capture gap", transcript)
+	}
+}
+
+func TestExecutionResultArtifactFailureTerminalizesAsStorageFailure(t *testing.T) {
+	const backendSessionID = "storage-failure-session"
+	backend := &executionFakeBackend{name: "storage-failure"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				input.OnProcessStart(engine.ProcessRef{PID: 4211, PGID: 4211, StartTime: "storage-token"}, 0)
+				return executionEvents(
+					engine.Event{Type: engine.EventResultMessage, Text: "final output that cannot be persisted"},
+					engine.Event{Type: engine.EventTurnFinal, TurnFinal: &engine.TurnFinalObservation{BackendSessionID: backendSessionID}},
+				), nil
+			},
+		}, nil
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "storage failure", nil)
+	if err := os.MkdirAll(filepath.Dir(record.Artifacts.Result), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(record.Artifacts.Result, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassStorage {
+		t.Fatalf("terminal record = state %q class %q, want failed storage", got.State, got.FailureClass)
+	}
+	if !strings.Contains(got.FailureReason, "persist final result artifact") ||
+		!(strings.Contains(got.FailureReason, "exist") || strings.Contains(got.FailureReason, "directory")) {
+		t.Fatalf("failure reason = %q, want storage stage and OS error", got.FailureReason)
+	}
+	if got.ResultPath != "" || got.ResultText != "" {
+		t.Fatalf("failed record contains an authoritative result: path=%q text=%q", got.ResultPath, got.ResultText)
+	}
+	if got.BackendSessionID != backendSessionID {
+		t.Fatalf("backend session ID = %q, want %q", got.BackendSessionID, backendSessionID)
+	}
+	limit := 10
+	transcript, err := server.jobTranscript(got, protocol.JobTranscriptParams{JobID: got.JobID, Limit: &limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transcript.ItemCount != 1 || len(transcript.Items) != 1 || transcript.Items[0].Text != "final output that cannot be persisted" {
+		t.Fatalf("transcript = %#v, want retained partial output", transcript)
+	}
+}
+
+func TestManagedCodexHomeSurvivesTerminalStorageFailure(t *testing.T) {
+	server := newExecutionServer(t, &executionFakeBackend{name: "codex"})
+	record := queuedExecutionRecord(t, server, "codex", "terminal storage failure", nil)
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(record.JobID); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := engine.LayoutForWorkspace(server.stateRoot, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := createManagedCodexHome(layout, record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.rememberManagedCodexHome(record.JobID, home)
+
+	// A completed record cannot carry a failure reason. This makes the first
+	// terminal write fail validation and exercises the storage-failure fallback.
+	server.markTerminal(store, record.JobID, jobstore.TerminalUpdate{
+		State:            protocol.PublicStateCompleted,
+		Cleanup:          protocol.CleanupClean,
+		BackendSessionID: "terminal-storage-session",
+		FailureReason:    "invalid on a completed record",
+	})
+
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassStorage {
+		t.Fatalf("terminal record = state %q class %q, want failed storage fallback", got.State, got.FailureClass)
+	}
+	if got.BackendSessionID != "terminal-storage-session" {
+		t.Fatalf("backend session ID = %q, want session retained by failed record", got.BackendSessionID)
+	}
+	if _, err := os.Stat(home.path); err != nil {
+		t.Fatalf("managed home stat = %v, want home to survive failed terminal persistence", err)
+	}
+}
+
 func sha256Sum(value []byte) []byte {
 	sum := sha256.Sum256(value)
 	return sum[:]
@@ -571,6 +717,157 @@ func TestExecutionProviderOverloadedUsesTypedFailureClass(t *testing.T) {
 	}
 	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassProviderOverloaded {
 		t.Fatalf("overload terminal = %+v, want provider_overloaded", got)
+	}
+}
+
+func TestExecutionUsageLimitPreservesProviderEvidence(t *testing.T) {
+	resetAt := time.Date(2026, time.October, 28, 23, 15, 0, 0, time.UTC)
+	backend := &executionFakeBackend{name: "usage-limit"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{
+			turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+				input.OnProcessStart(engine.ProcessRef{PID: 4199, PGID: 4199, StartTime: "usage-limit-token"}, 0)
+				failure := &engine.ProviderFailureError{
+					Evidence: engine.ProviderFailureEvidence{
+						Class: "usage_limit", Code: "rate_limit_error", Message: "weekly usage limit reached", RetryAfter: &resetAt,
+					},
+					Cause: errors.New("provider rate limit reached"),
+				}
+				return executionEvents(engine.Event{Type: engine.EventTerminalError, Text: failure.Error(), Err: failure}), nil
+			},
+		}, nil
+	}
+	server := newExecutionServer(t, backend)
+	record := queuedExecutionRecord(t, server, backend.Name(), "quota retry metadata", nil)
+	runExecution(t, server, record)
+
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(record.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.PublicStateFailed || got.FailureClass != protocol.FailureClassUsageLimit || got.FailureStage != "turn" {
+		t.Fatalf("failure record = %+v, want usage_limit at turn stage", got)
+	}
+	if got.FailureProviderCode != "rate_limit_error" || got.FailureProviderMessage != "weekly usage limit reached" || got.FailureRetryAfter == nil || !got.FailureRetryAfter.Equal(resetAt) {
+		t.Fatalf("provider evidence = code %q message %q retryAfter %v", got.FailureProviderCode, got.FailureProviderMessage, got.FailureRetryAfter)
+	}
+	if got.FailureReason != "provider rate limit reached" {
+		t.Fatalf("failure reason = %q, want original adapter reason", got.FailureReason)
+	}
+}
+
+func TestCancellationAndTimeoutReasonsPersistWithoutStateChanges(t *testing.T) {
+	tests := []struct {
+		name      string
+		state     protocol.PublicState
+		reason    protocol.CancellationReason
+		configure func(*testing.T, *Server, *executionFakeBackend, jobstore.Record)
+	}{
+		{
+			name: "operator cancel of queued job", state: protocol.PublicStateCanceled, reason: protocol.CancellationReasonOperator,
+			configure: func(t *testing.T, server *Server, _ *executionFakeBackend, record jobstore.Record) {
+				outcome := server.handleJobCancel(mustJSON(t, protocol.JobCancelParams{JobID: record.JobID}))
+				if outcome.err != nil {
+					t.Fatalf("job.cancel error = %#v", outcome.err)
+				}
+			},
+		},
+		{
+			name: "deadline", state: protocol.PublicStateFailed, reason: protocol.CancellationReasonDeadline,
+			configure: func(t *testing.T, server *Server, backend *executionFakeBackend, record jobstore.Record) {
+				backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+					return &executionFakeSession{turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+						input.OnProcessStart(engine.ProcessRef{PID: 4200, PGID: 4200, StartTime: "deadline-token"}, 0)
+						return executionEvents(engine.Event{Type: engine.EventTerminalError, Text: context.DeadlineExceeded.Error(), Err: context.DeadlineExceeded}), nil
+					}}, nil
+				}
+				runExecution(t, server, record)
+			},
+		},
+		{
+			name: "daemon shutdown", state: protocol.PublicStateFailed, reason: protocol.CancellationReasonDaemonShutdown,
+			configure: func(t *testing.T, server *Server, backend *executionFakeBackend, record jobstore.Record) {
+				backend.start = func(ctx context.Context, _ engine.SessionOpts) (engine.Session, error) { return nil, ctx.Err() }
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				server.runJob(ctx, record, newActiveExecution(record.JobID, backend))
+			},
+		},
+		{
+			name: "provider interruption", state: protocol.PublicStateFailed, reason: protocol.CancellationReasonProviderInterruption,
+			configure: func(t *testing.T, server *Server, backend *executionFakeBackend, record jobstore.Record) {
+				backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+					return &executionFakeSession{turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+						input.OnProcessStart(engine.ProcessRef{PID: 4201, PGID: 4201, StartTime: "interrupt-token"}, 0)
+						return executionEvents(engine.Event{Type: engine.EventTerminalError, Text: engine.ErrTurnInterrupted.Error(), Err: engine.ErrTurnInterrupted}), nil
+					}}, nil
+				}
+				server.runJob(context.Background(), record, newActiveExecution(record.JobID, backend))
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := &executionFakeBackend{name: "cancel-reason"}
+			server := newExecutionServer(t, backend)
+			record := queuedExecutionRecord(t, server, backend.Name(), test.name, nil)
+			test.configure(t, server, backend, record)
+			store, err := server.ensureJobStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := store.Get(record.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != test.state || got.CancellationReason != test.reason {
+				t.Fatalf("terminal record = state %q cancellationReason %q, want %q / %q", got.State, got.CancellationReason, test.state, test.reason)
+			}
+		})
+	}
+}
+
+func TestLatestObservedModelAndEffortReplaceEarlierValues(t *testing.T) {
+	backend := &executionFakeBackend{name: "model-observation"}
+	backend.start = func(context.Context, engine.SessionOpts) (engine.Session, error) {
+		return &executionFakeSession{turn: func(_ context.Context, input engine.TurnInput) (<-chan engine.Event, error) {
+			input.OnProcessStart(engine.ProcessRef{PID: 4202, PGID: 4202, StartTime: "model-observation-token"}, 0)
+			return executionEvents(
+				engine.Event{Type: engine.EventModelReported, ModelReported: "first-model", EffortReported: "low"},
+				engine.Event{Type: engine.EventModelReported, ModelReported: "latest-model", EffortReported: "high"},
+				engine.Event{Type: engine.EventResultMessage, Text: "done"},
+			), nil
+		}}, nil
+	}
+	server := newExecutionServer(t, backend)
+	requestedModel, requestedEffort := "requested-model", "minimal"
+	params := submissionParams("model-observation-ws", "model-observation-request", backend.Name(), t.TempDir(), "model provenance")
+	params.TaskSpec.Model, params.TaskSpec.Effort = &requestedModel, &requestedEffort
+	submitted := submitResultForTest(t, submitForTest(t, server, params))
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(submitted.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runExecution(t, server, record)
+	got, err := store.Get(submitted.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != requestedModel || got.Effort != requestedEffort || got.ModelReported != "latest-model" || got.EffortReported != "high" {
+		t.Fatalf("requested/observed selection = requested %q/%q observed %q/%q", got.Model, got.Effort, got.ModelReported, got.EffortReported)
+	}
+	wireOutcome := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: submitted.JobID}))
+	wire := wireOutcome.result.(protocol.JobRecordWire)
+	if wire.ModelRequested == nil || *wire.ModelRequested != requestedModel || wire.EffortRequested == nil || *wire.EffortRequested != requestedEffort {
+		t.Fatalf("requested wire selection = model %v effort %v", wire.ModelRequested, wire.EffortRequested)
 	}
 }
 

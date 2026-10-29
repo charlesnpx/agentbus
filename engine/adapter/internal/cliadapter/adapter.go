@@ -52,6 +52,10 @@ type ProbedBackendDescriptor struct {
 
 func (b *Backend) Name() string { return b.NameValue }
 
+func (b *Backend) BackendInspection() engine.BackendInspection {
+	return engine.BackendInspection{Executable: b.binary()}
+}
+
 func (b *Backend) Preflight(ctx context.Context) (engine.Health, error) {
 	probed, err := ProbeBackend(ctx, command.DirectProbeRunner{}, b.staticDescriptor())
 	if err != nil {
@@ -114,7 +118,7 @@ func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts
 	return b.newSession(id, opts, warning, false)
 }
 
-func (b *Backend) newSession(id string, opts engine.SessionOpts, validationWarning string, suppressValidationWarning bool) (*Session, error) {
+func (b *Backend) newSession(id string, opts engine.SessionOpts, validationWarning string, suppressValidationWarning bool) (engine.Session, error) {
 	session := &Session{
 		backend:                   b,
 		opts:                      opts,
@@ -138,7 +142,18 @@ func (b *Backend) newSession(id string, opts engine.SessionOpts, validationWarni
 		return nil, err
 	}
 	session.duplexSession = duplexSession
+	if _, ok := driver.(duplex.SteerDriver); ok {
+		return &steerableSession{Session: session}, nil
+	}
 	return session, nil
+}
+
+type steerableSession struct {
+	*Session
+}
+
+func (s *steerableSession) Steer(ctx context.Context, msg engine.SteerMessage) (engine.SteerDelivery, error) {
+	return s.duplexSession.Steer(ctx, msg)
 }
 
 func (b *Backend) binary() string {

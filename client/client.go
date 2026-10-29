@@ -951,6 +951,13 @@ func (c *Client) JobGet(ctx context.Context, params JobGetParams) (JobGetResult,
 	return out, err
 }
 
+// Steer submits or deduplicates one follow-up instruction for a running job.
+func (c *Client) Steer(ctx context.Context, params JobSteerParams) (JobSteerResult, error) {
+	var out JobSteerResult
+	err := c.do(ctx, protocol.MethodJobSteer, params, &out)
+	return out, err
+}
+
 // JobList returns compact summaries filtered by the supplied optional fields.
 func (c *Client) JobList(ctx context.Context, params JobListParams) (JobListResult, error) {
 	var out JobListResult
@@ -969,6 +976,21 @@ func (c *Client) JobTranscript(ctx context.Context, params JobTranscriptParams) 
 func (c *Client) JobCancel(ctx context.Context, params JobCancelParams) (JobCancelResult, error) {
 	var out JobCancelResult
 	err := c.do(ctx, protocol.MethodJobCancel, params, &out)
+	return out, err
+}
+
+// BackendInspect returns resolved local executable and version information for
+// each configured backend. Individual backend failures remain in the result.
+func (c *Client) BackendInspect(ctx context.Context, params BackendInspectParams) (BackendInspectResult, error) {
+	var out BackendInspectResult
+	err := c.do(ctx, protocol.MethodBackendInspect, params, &out)
+	return out, err
+}
+
+// ArtifactsPrune previews or removes eligible Agentbus-owned artifacts.
+func (c *Client) ArtifactsPrune(ctx context.Context, params ArtifactsPruneParams) (ArtifactsPruneResult, error) {
+	var out ArtifactsPruneResult
+	err := c.do(ctx, protocol.MethodArtifactsPrune, params, &out)
 	return out, err
 }
 

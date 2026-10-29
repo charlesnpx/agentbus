@@ -49,8 +49,8 @@ type WorkspaceLayout struct {
 	Logs      string
 	Results   string
 	Inputs    string
-	// Codex contains per-job CODEX_HOME directories. It is created only for
-	// Codex workspaces, which do not all need it.
+	// Codex contains per-job managed homes and execution caches. It is created
+	// only for workspaces that need per-job backend state.
 	Codex      string
 	Quarantine string
 }

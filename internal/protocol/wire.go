@@ -17,18 +17,44 @@ const (
 	MethodJobList = "job.list"
 	// MethodJobTranscript retrieves the captured transcript for one job.
 	MethodJobTranscript = "job.transcript"
+	// MethodArtifactsPrune removes eligible Agentbus-owned diagnostic artifacts.
+	MethodArtifactsPrune = "artifacts.prune"
+	// MethodJobSteer submits one in-flight instruction to an active steerable job.
+	MethodJobSteer = "job.steer"
 )
 
-// The protocol error codes are the only codes protocol.hello, job.submit, job.get,
-// job.list, job.transcript, and job.cancel may produce.
+// The protocol error codes are the only codes protocol.hello, backend.inspect,
+// job.submit, job.get, job.list, job.transcript, job.cancel, job.steer, and
+// artifacts.prune may produce.
 const (
 	ErrorUnauthorized       = "unauthorized"
 	ErrorVersionMismatch    = "protocol_version_mismatch"
 	ErrorMethodNotFound     = "method_not_found"
 	ErrorBackendUnavailable = "backend_unavailable"
 	ErrorInvalidTaskSpec    = "invalid_task_spec"
+	ErrorQueueFull          = "queue_full"
 	ErrorUnknownJob         = "unknown_job"
 )
+
+// InputMode determines whether a running task accepts follow-up instructions.
+// The empty value is the wire-compatible spelling of fixed; callers should
+// omit it when submitting fixed-input work. Unknown values are invalid.
+type InputMode string
+
+const (
+	// InputModeFixed freezes the submitted prompt for the life of the job.
+	InputModeFixed InputMode = "fixed"
+	// InputModeSteerable allows bounded follow-up instructions during its active turn.
+	InputModeSteerable InputMode = "steerable"
+)
+
+// EffectiveInputMode maps an omitted legacy value to the fail-closed default.
+func EffectiveInputMode(mode InputMode) InputMode {
+	if mode == "" {
+		return InputModeFixed
+	}
+	return mode
+}
 
 // PublicState is the stable job state exposed by protocol v3. The daemon
 // persists an internal "starting" state to enforce the no-relaunch boundary,
@@ -85,15 +111,16 @@ type FailureClass string
 const (
 	FailureClassBackendUnavailable FailureClass = "backend_unavailable"
 	FailureClassProviderOverloaded FailureClass = "provider_overloaded"
+	FailureClassUsageLimit         FailureClass = "usage_limit"
 	FailureClassModelUnavailable   FailureClass = "model_unavailable"
 	FailureClassContentPolicy      FailureClass = "content_policy"
-	// FailureClassAuthentication records authentication failures. No producer
-	// classifies failures this way yet.
+	// FailureClassAuthentication records distinguishable provider authentication failures.
 	FailureClassAuthentication FailureClass = "authentication"
 	FailureClassBackendError   FailureClass = "backend_error"
 	FailureClassTimeout        FailureClass = "timeout"
 	FailureClassInterrupted    FailureClass = "interrupted"
 	FailureClassInternal       FailureClass = "internal"
+	FailureClassStorage        FailureClass = "storage"
 )
 
 // Valid reports whether class is one of the protocol v3 failure categories.
@@ -101,13 +128,15 @@ func (class FailureClass) Valid() bool {
 	switch class {
 	case FailureClassBackendUnavailable,
 		FailureClassProviderOverloaded,
+		FailureClassUsageLimit,
 		FailureClassModelUnavailable,
 		FailureClassContentPolicy,
 		FailureClassAuthentication,
 		FailureClassBackendError,
 		FailureClassTimeout,
 		FailureClassInterrupted,
-		FailureClassInternal:
+		FailureClassInternal,
+		FailureClassStorage:
 		return true
 	default:
 		return false
@@ -156,6 +185,9 @@ type TaskSpec struct {
 	CWD     string `json:"cwd"`
 	Prompt  string `json:"prompt"`
 	Write   bool   `json:"write"`
+	// InputMode is immutable request data and participates in replay hashing.
+	// Omission means fixed and, due to omitempty, preserves existing hashes.
+	InputMode InputMode `json:"inputMode,omitempty"`
 	// ResumeJobID names the prior job whose recorded backend session should be
 	// resumed for this new job. It is part of the immutable task specification
 	// and therefore participates in identified-replay hashing.
@@ -169,6 +201,78 @@ type TaskSpec struct {
 	TimeoutMS     *int64             `json:"timeoutMs,omitempty"`
 	OutputSchema  json.RawMessage    `json:"outputSchema,omitempty"`
 	Tags          *map[string]string `json:"tags,omitempty"`
+}
+
+// JobSteerParams is one caller-identified follow-up instruction. MessageID is
+// bounded to 256 bytes and Text to 64 KiB by the daemon.
+type JobSteerParams struct {
+	JobID     string `json:"jobId"`
+	MessageID string `json:"messageId"`
+	Text      string `json:"text"`
+}
+
+// SteerStatus is the stable result of a steering request.
+type SteerStatus string
+
+const (
+	SteerStatusAdmitted  SteerStatus = "admitted"
+	SteerStatusDelivered SteerStatus = "delivered"
+	SteerStatusRejected  SteerStatus = "rejected"
+	SteerStatusUnknown   SteerStatus = "unknown"
+)
+
+// SteerReason is a stable, machine-readable rejection or uncertainty cause.
+type SteerReason string
+
+const (
+	SteerReasonNotSteerable           SteerReason = "not_steerable"
+	SteerReasonNotRunning             SteerReason = "not_running"
+	SteerReasonDuplicateConflict      SteerReason = "duplicate_conflict"
+	SteerReasonQueueFull              SteerReason = "queue_full"
+	SteerReasonSchemaCorrectionActive SteerReason = "schema_correction_active"
+	SteerReasonBackendUnsupported     SteerReason = "backend_unsupported"
+	SteerReasonDeliveryUnconfirmed    SteerReason = "delivery_unconfirmed"
+)
+
+// JobSteerResult is the immediate receipt from job.steer. An admitted receipt
+// is updated asynchronously in job.get once the adapter reports an outcome.
+type JobSteerResult struct {
+	JobID        string      `json:"jobId"`
+	MessageID    string      `json:"messageId"`
+	Status       SteerStatus `json:"status"`
+	Mechanism    string      `json:"mechanism"`
+	Reason       SteerReason `json:"reason"`
+	Deduplicated bool        `json:"deduplicated"`
+}
+
+// SteerRecord is the durable audit metadata for one message. Text itself is
+// never stored; TextSHA256 and TextBytes allow identity checks on retries.
+type SteerRecord struct {
+	MessageID  string      `json:"messageId"`
+	TextSHA256 string      `json:"textSha256"`
+	TextBytes  int         `json:"textBytes"`
+	Status     SteerStatus `json:"status"`
+	Mechanism  string      `json:"mechanism,omitempty"`
+	Reason     SteerReason `json:"reason,omitempty"`
+	CreatedAt  time.Time   `json:"createdAt"`
+	UpdatedAt  time.Time   `json:"updatedAt"`
+}
+
+// SteerSummaryWire is the text-free steering projection included in job.get.
+type SteerSummaryWire struct {
+	MessageID string      `json:"messageId"`
+	Status    SteerStatus `json:"status"`
+	Mechanism string      `json:"mechanism"`
+	Time      time.Time   `json:"time"`
+}
+
+// JobSteerRecordUpdate changes the durable outcome for an admitted message.
+type JobSteerRecordUpdate struct {
+	JobID     string
+	MessageID string
+	Status    SteerStatus
+	Mechanism string
+	Reason    SteerReason
 }
 
 // JobSubmitParams is the parameter object for job.submit.
@@ -191,17 +295,23 @@ type JobGetParams struct {
 	JobID string `json:"jobId,omitempty"`
 }
 
-// JobListParams is the parameter object for job.list. Every field is
-// optional; omitted or empty filters do not restrict the result.
+// JobListParams is the parameter object for job.list. Every field is optional;
+// omitted or empty filters do not restrict results, while limit and cursor
+// select an optional page.
 type JobListParams struct {
 	WorkspaceKey string            `json:"workspaceKey,omitempty"`
 	Tags         map[string]string `json:"tags,omitempty"`
 	States       []PublicState     `json:"states,omitempty"`
+	Limit        int               `json:"limit,omitempty"`
+	Cursor       string            `json:"cursor,omitempty"`
 }
 
-// JobListResult is the response to job.list.
+// JobListResult is the response to job.list. Truncated and NextCursor are set
+// only when another page exists.
 type JobListResult struct {
-	Jobs []JobSummaryWire `json:"jobs"`
+	Jobs       []JobSummaryWire `json:"jobs"`
+	Truncated  bool             `json:"truncated,omitempty"`
+	NextCursor string           `json:"nextCursor,omitempty"`
 }
 
 // JobTranscriptParams selects a stateless view of one job's captured
@@ -234,12 +344,48 @@ type TranscriptItem struct {
 type JobTranscriptResult struct {
 	State     PublicState      `json:"state"`
 	Liveness  Liveness         `json:"liveness,omitempty"`
+	Pruned    bool             `json:"pruned,omitempty"`
 	ItemCount int              `json:"itemCount"`
 	Counts    map[string]int   `json:"counts"`
 	FirstAt   *time.Time       `json:"firstAt,omitempty"`
 	LastAt    *time.Time       `json:"lastAt,omitempty"`
 	Items     []TranscriptItem `json:"items"`
 	Gap       bool             `json:"gap"`
+}
+
+// ArtifactsPruneParams configures a dry-run or apply pass over owned
+// diagnostic artifacts. Thresholds use time.ParseDuration syntax.
+type ArtifactsPruneParams struct {
+	DryRun              *bool  `json:"dryRun,omitempty"`
+	SuccessfulOlderThan string `json:"successfulOlderThan,omitempty"`
+	FailedOlderThan     string `json:"failedOlderThan,omitempty"`
+}
+
+// PruneItem identifies one owned artifact selected or removed by a prune pass.
+type PruneItem struct {
+	JobID string `json:"jobId"`
+	Kind  string `json:"kind"`
+	Path  string `json:"path"`
+	Bytes int64  `json:"bytes"`
+}
+
+// PruneSkip identifies a job or artifact that could not be safely pruned.
+type PruneSkip struct {
+	JobID  string `json:"jobId"`
+	Path   string `json:"path,omitempty"`
+	Reason string `json:"reason"`
+}
+
+// ArtifactsPruneResult reports selected or removed items and retained items.
+type ArtifactsPruneResult struct {
+	DryRun              bool        `json:"dryRun"`
+	SuccessfulOlderThan string      `json:"successfulOlderThan"`
+	FailedOlderThan     string      `json:"failedOlderThan"`
+	WouldRemove         []PruneItem `json:"wouldRemove"`
+	Removed             []PruneItem `json:"removed"`
+	Skipped             []PruneSkip `json:"skipped"`
+	WouldRemoveBytes    int64       `json:"wouldRemoveBytes"`
+	RemovedBytes        int64       `json:"removedBytes"`
 }
 
 // JobCancelParams is the parameter object for job.cancel.
@@ -261,22 +407,35 @@ type HelloResult struct {
 
 // JobRecordWire is the detailed response to job.get when JobID is provided.
 type JobRecordWire struct {
-	JobID         string                    `json:"jobId"`
-	WorkspaceKey  string                    `json:"workspaceKey"`
-	RequestID     string                    `json:"requestId"`
-	Backend       string                    `json:"backend"`
-	State         PublicState               `json:"state"`
-	Tags          map[string]string         `json:"tags,omitempty"`
-	CreatedAt     time.Time                 `json:"createdAt"`
-	StartedAt     *time.Time                `json:"startedAt,omitempty"`
-	FinishedAt    *time.Time                `json:"finishedAt,omitempty"`
-	Timeout       *engine.TimeoutResolution `json:"timeout,omitempty"`
-	Result        *ResultInfoWire           `json:"result,omitempty"`
-	Contract      *ContractResult           `json:"contract,omitempty"`
-	Failure       *JobFailureWire           `json:"failure,omitempty"`
-	Cleanup       Cleanup                   `json:"cleanup"`
-	LogPaths      *LogPathsWire             `json:"logPaths,omitempty"`
-	ModelReported string                    `json:"modelReported,omitempty"`
+	JobID              string                    `json:"jobId"`
+	WorkspaceKey       string                    `json:"workspaceKey"`
+	RequestID          string                    `json:"requestId"`
+	Backend            string                    `json:"backend"`
+	InputMode          InputMode                 `json:"inputMode"`
+	State              PublicState               `json:"state"`
+	Tags               map[string]string         `json:"tags,omitempty"`
+	CreatedAt          time.Time                 `json:"createdAt"`
+	QueuedAt           time.Time                 `json:"queuedAt"`
+	StartedAt          *time.Time                `json:"startedAt,omitempty"`
+	FinishedAt         *time.Time                `json:"finishedAt,omitempty"`
+	Timeout            *engine.TimeoutResolution `json:"timeout,omitempty"`
+	Deadline           *time.Time                `json:"deadline,omitempty"`
+	RemainingMs        *int64                    `json:"remainingMs,omitempty"`
+	Resumable          *ResumableProjection      `json:"resumable,omitempty"`
+	ModelRequested     *string                   `json:"modelRequested,omitempty"`
+	EffortRequested    *string                   `json:"effortRequested,omitempty"`
+	Result             *ResultInfoWire           `json:"result,omitempty"`
+	Contract           *ContractResult           `json:"contract,omitempty"`
+	Failure            *JobFailureWire           `json:"failure,omitempty"`
+	Diagnostics        []string                  `json:"diagnostics,omitempty"`
+	Cleanup            Cleanup                   `json:"cleanup"`
+	LogsPruned         bool                      `json:"logsPruned,omitempty"`
+	LogPaths           *LogPathsWire             `json:"logPaths,omitempty"`
+	ModelReported      string                    `json:"modelReported,omitempty"`
+	EffortReported     string                    `json:"effortReported,omitempty"`
+	Execution          *ExecutionPosture         `json:"execution,omitempty"`
+	Steers             []SteerSummaryWire        `json:"steers"`
+	CancellationReason CancellationReason        `json:"cancellationReason,omitempty"`
 }
 
 // JobSummaryWire is the compact item returned when job.list lists jobs. It
@@ -295,10 +454,14 @@ type JobSummaryWire struct {
 	Cleanup Cleanup `json:"cleanup"`
 	// CreatedAt reports when the job was created.
 	CreatedAt time.Time `json:"createdAt"`
+	// QueuedAt reports when the job entered the daemon queue.
+	QueuedAt time.Time `json:"queuedAt"`
 	// UpdatedAt reports when the job was last updated.
 	UpdatedAt time.Time `json:"updatedAt"`
-	// ModelReported is the model reported by the backend, when available.
+	// ModelReported is the latest model value reported by the backend, when available.
 	ModelReported string `json:"modelReported,omitempty"`
+	// EffortReported is the latest effort value reported by the backend, when available.
+	EffortReported string `json:"effortReported,omitempty"`
 	// FailureClass is the compact failure category for a failed job, when set.
 	FailureClass FailureClass `json:"failureClass,omitempty"`
 	// Contract is the compact output-schema verdict, when evaluation occurred.
@@ -314,10 +477,75 @@ type JobSummaryWire struct {
 	Liveness Liveness `json:"liveness,omitempty"`
 }
 
+// ExecutionPosture records the requested source access and the backend
+// enforcement and scratch/cache paths selected when a job starts. It is
+// descriptive; it does not negotiate or expand backend capabilities.
+type ExecutionPosture struct {
+	Intent         string            `json:"intent"`
+	SourceWritable bool              `json:"sourceWritable"`
+	Scratch        string            `json:"scratch,omitempty"`
+	Caches         map[string]string `json:"caches,omitempty"`
+	Network        string            `json:"network"`
+	GitMetadata    string            `json:"gitMetadata"`
+	Enforcement    string            `json:"enforcement"`
+}
+
 // JobFailureWire records the public failure category and reason for a job.
 type JobFailureWire struct {
-	Class  FailureClass `json:"class"`
-	Reason string       `json:"reason"`
+	Class           FailureClass `json:"class"`
+	Reason          string       `json:"reason"`
+	ProviderCode    string       `json:"providerCode,omitempty"`
+	ProviderMessage string       `json:"providerMessage,omitempty"`
+	Stage           string       `json:"stage,omitempty"`
+	RetryAfter      *time.Time   `json:"retryAfter,omitempty"`
+}
+
+// CancellationReason records why cancellation, timeout, or interruption ended
+// a job. It is independent of the terminal public state.
+type CancellationReason string
+
+const (
+	CancellationReasonOperator             CancellationReason = "operator"
+	CancellationReasonDeadline             CancellationReason = "deadline"
+	CancellationReasonDaemonShutdown       CancellationReason = "daemon_shutdown"
+	CancellationReasonProviderInterruption CancellationReason = "provider_interruption"
+)
+
+// Valid reports whether reason is one of the protocol cancellation causes.
+func (reason CancellationReason) Valid() bool {
+	switch reason {
+	case CancellationReasonOperator, CancellationReasonDeadline, CancellationReasonDaemonShutdown, CancellationReasonProviderInterruption:
+		return true
+	default:
+		return false
+	}
+}
+
+// ResumableProjection explains whether the durable record satisfies the local
+// admission rules for creating a resumed job.
+type ResumableProjection struct {
+	Eligible bool   `json:"eligible"`
+	Reason   string `json:"reason"`
+}
+
+// BackendInspectParams selects no options; inspection is a narrow read-only
+// view of configured local executables.
+type BackendInspectParams struct{}
+
+// BackendInspectionWire is one backend's executable inspection. Error is
+// isolated to this entry so one failing executable cannot hide the others.
+type BackendInspectionWire struct {
+	Backend        string `json:"backend"`
+	ExecutablePath string `json:"executablePath,omitempty"`
+	Version        string `json:"version,omitempty"`
+	DefaultModel   string `json:"defaultModel,omitempty"`
+	DefaultEffort  string `json:"defaultEffort,omitempty"`
+	Error          string `json:"error,omitempty"`
+}
+
+// BackendInspectResult is the response to backend.inspect.
+type BackendInspectResult struct {
+	Backends []BackendInspectionWire `json:"backends"`
 }
 
 // ResultInfoWire describes the authoritative spilled final result.

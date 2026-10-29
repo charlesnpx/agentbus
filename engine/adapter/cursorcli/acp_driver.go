@@ -33,27 +33,207 @@ type activeACPTurn struct {
 	mu                 sync.Mutex
 	sessionID          string
 	write              bool
+	promptActive       bool
 	interruptRequested bool
+	jobCancelled       bool
+	finished           bool
+	steerRequested     bool
+	pendingSteer       *acpSteerRequest
 }
 
-func (t *activeACPTurn) sendCancel(conn *duplex.Conn) error {
+type acpSteerRequest struct {
+	text      string
+	ctx       context.Context
+	done      chan struct{}
+	delivery  engine.SteerDelivery
+	err       error
+	completed bool
+}
+
+func (t *activeACPTurn) completeSteerLocked(request *acpSteerRequest, delivery engine.SteerDelivery, err error) {
+	if request == nil || request.completed {
+		return
+	}
+	request.delivery = delivery
+	request.err = err
+	request.completed = true
+	close(request.done)
+}
+
+func (t *activeACPTurn) cancel(conn *duplex.Conn) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	err := conn.WriteJSON(map[string]any{
+	if t.finished || t.jobCancelled {
+		return nil
+	}
+	t.jobCancelled = true
+	if t.pendingSteer != nil {
+		t.completeSteerLocked(t.pendingSteer, engine.SteerDelivery{}, context.Canceled)
+		t.pendingSteer = nil
+	}
+	if !t.promptActive || t.interruptRequested {
+		return nil
+	}
+	if err := writeACPCancel(conn, t.sessionID); err != nil {
+		return err
+	}
+	t.interruptRequested = true
+	return nil
+}
+
+func writeACPCancel(conn *duplex.Conn, sessionID string) error {
+	return conn.WriteJSON(map[string]any{
 		"jsonrpc": "2.0",
 		"method":  "session/cancel",
-		"params":  map[string]any{"sessionId": t.sessionID},
+		"params":  map[string]any{"sessionId": sessionID},
 	})
-	if err == nil {
-		t.interruptRequested = true
-	}
-	return err
 }
 
-func (t *activeACPTurn) interruptWasRequested() bool {
+func (t *activeACPTurn) prompt(ctx context.Context, rpc *acpRPC, text string, observer *acpTurnObserver, continuation *acpSteerRequest) (any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	t.mu.Lock()
+	if t.finished {
+		t.mu.Unlock()
+		return nil, engine.ErrSteerNotActive
+	}
+	if t.jobCancelled {
+		if continuation != nil {
+			t.completeSteerLocked(continuation, engine.SteerDelivery{}, context.Canceled)
+		}
+		t.mu.Unlock()
+		return nil, context.Canceled
+	}
+	if t.promptActive {
+		t.mu.Unlock()
+		return nil, errors.New("Cursor ACP prompt is already active")
+	}
+	if err := ctx.Err(); err != nil {
+		t.mu.Unlock()
+		return nil, err
+	}
+	if continuation != nil {
+		if t.pendingSteer != continuation {
+			t.mu.Unlock()
+			return nil, engine.ErrSteerNotActive
+		}
+		if err := continuation.ctx.Err(); err != nil {
+			t.pendingSteer = nil
+			t.completeSteerLocked(continuation, engine.SteerDelivery{}, err)
+			t.finished = true
+			t.mu.Unlock()
+			return nil, err
+		}
+	}
+	t.promptActive = true
+	requestID, err := rpc.writeRequest("session/prompt", map[string]any{
+		"sessionId": t.sessionID,
+		"prompt": []any{map[string]any{
+			"type": "text",
+			"text": text,
+		}},
+	})
+	if err != nil {
+		t.promptActive = false
+		t.finished = true
+		if continuation != nil {
+			t.pendingSteer = nil
+			t.completeSteerLocked(continuation, engine.SteerDelivery{}, err)
+		}
+		t.mu.Unlock()
+		return nil, err
+	}
+	if continuation != nil {
+		t.pendingSteer = nil
+		t.interruptRequested = false
+		t.completeSteerLocked(continuation, engine.SteerDelivery{
+			Mechanism: engine.SteerMechanismInterruptContinue,
+			Confirmed: true,
+		}, nil)
+	}
+	t.mu.Unlock()
+
+	result, err := rpc.awaitResponse(ctx, "session/prompt", requestID, observer)
+	if err != nil {
+		t.mu.Lock()
+		t.promptActive = false
+		t.finished = true
+		if t.pendingSteer != nil {
+			t.completeSteerLocked(t.pendingSteer, engine.SteerDelivery{}, err)
+			t.pendingSteer = nil
+		}
+		t.mu.Unlock()
+		return nil, err
+	}
+	t.mu.Lock()
+	t.promptActive = false
+	stopReason := firstString(resultMap(result), "stopReason")
+	if stopReason != "cancelled" || t.jobCancelled {
+		t.finished = true
+		if t.pendingSteer != nil {
+			t.completeSteerLocked(t.pendingSteer, engine.SteerDelivery{}, engine.ErrSteerNotActive)
+			t.pendingSteer = nil
+		}
+	}
+	t.mu.Unlock()
+	return result, nil
+}
+
+func (t *activeACPTurn) continueAfterCancelledPrompt(ctx context.Context) (*acpSteerRequest, bool, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.interruptRequested
+	if t.jobCancelled {
+		t.finished = true
+		if t.pendingSteer != nil {
+			t.completeSteerLocked(t.pendingSteer, engine.SteerDelivery{}, context.Canceled)
+			t.pendingSteer = nil
+		}
+		return nil, true, nil
+	}
+	if !t.interruptRequested {
+		t.finished = true
+		return nil, false, fmt.Errorf("cursor ACP prompt was cancelled without a requested interrupt: %w", engine.ErrTurnInterrupted)
+	}
+	request := t.pendingSteer
+	if request == nil {
+		t.finished = true
+		return nil, false, errors.New("cursor ACP cancelled prompt has no pending continuation")
+	}
+	if err := ctx.Err(); err != nil {
+		t.pendingSteer = nil
+		t.finished = true
+		t.completeSteerLocked(request, engine.SteerDelivery{}, err)
+		return nil, false, err
+	}
+	if err := request.ctx.Err(); err != nil {
+		t.pendingSteer = nil
+		t.finished = true
+		t.completeSteerLocked(request, engine.SteerDelivery{}, err)
+		return nil, false, err
+	}
+	return request, false, nil
+}
+
+func (t *activeACPTurn) finish() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.finished = true
+	t.promptActive = false
+	if t.pendingSteer != nil {
+		err := engine.ErrSteerNotActive
+		if t.jobCancelled {
+			err = context.Canceled
+		}
+		t.completeSteerLocked(t.pendingSteer, engine.SteerDelivery{}, err)
+		t.pendingSteer = nil
+	}
+}
+
+func (t *activeACPTurn) hasSteerRequest() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.steerRequested
 }
 
 func newACPDriver(binary string) *acpDriver {
@@ -92,7 +272,10 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 
 	active := &activeACPTurn{sessionID: info.sessionID, write: input.Write}
 	d.setActive(conn, active)
-	defer d.clearActive(conn, active)
+	defer func() {
+		active.finish()
+		d.clearActive(conn, active)
+	}()
 
 	model := info.currentModel()
 	if opts.Model != "" {
@@ -109,33 +292,40 @@ func (d *acpDriver) RunTurn(ctx context.Context, conn *duplex.Conn, resumeID str
 	}
 
 	observer := &acpTurnObserver{emit: emit}
-	result, err := rpc.request(ctx, "session/prompt", map[string]any{
-		"sessionId": info.sessionID,
-		"prompt": []any{map[string]any{
-			"type": "text",
-			"text": input.Prompt,
-		}},
-	}, observer)
-	// A prompt response can arrive without a terminal update for an observed
-	// tool call. Flush those calls before the result so their observations are
-	// retained even when ACP omits (or uses an unrecognized) terminal status.
-	observer.flushToolUses()
-	if err != nil {
-		return info.sessionID, err
-	}
-
-	stopReason := firstString(resultMap(result), "stopReason")
-	observer.emitEvent(engine.Event{Type: engine.EventResultMessage, Text: observer.resultText()})
-	switch stopReason {
-	case "end_turn":
-		return info.sessionID, nil
-	case "cancelled":
-		if active.interruptWasRequested() {
-			return info.sessionID, nil
+	result, err := active.prompt(ctx, rpc, input.Prompt, observer, nil)
+	for {
+		// A prompt response can arrive without a terminal update for an observed
+		// tool call. Flush those calls before handling this segment's outcome.
+		observer.flushToolUses()
+		if err != nil {
+			return info.sessionID, err
 		}
-		return info.sessionID, fmt.Errorf("cursor ACP prompt was cancelled without a requested interrupt: %w", engine.ErrTurnInterrupted)
-	default:
-		return info.sessionID, fmt.Errorf("cursor ACP prompt completed with terminal stopReason %q", stopReason)
+
+		stopReason := firstString(resultMap(result), "stopReason")
+		switch stopReason {
+		case "end_turn":
+			observer.emitEvent(engine.Event{Type: engine.EventResultMessage, Text: observer.resultText()})
+			return info.sessionID, nil
+		case "cancelled":
+			continuation, jobCancelled, err := active.continueAfterCancelledPrompt(ctx)
+			if err != nil {
+				return info.sessionID, err
+			}
+			if jobCancelled {
+				// Preserve the existing empty result for an explicit job cancel;
+				// never expose the cancelled segment's partial text as a result.
+				if active.hasSteerRequest() {
+					observer.emitEvent(duplex.ResultSegmentBoundary())
+				}
+				observer.emitEvent(engine.Event{Type: engine.EventResultMessage})
+				return info.sessionID, nil
+			}
+			observer.emitEvent(duplex.ResultSegmentBoundary())
+			observer = &acpTurnObserver{emit: emit}
+			result, err = active.prompt(ctx, rpc, continuation.text, observer, continuation)
+		default:
+			return info.sessionID, fmt.Errorf("cursor ACP prompt completed with terminal stopReason %q", stopReason)
+		}
 	}
 }
 
@@ -149,7 +339,53 @@ func (d *acpDriver) Interrupt(ctx context.Context, conn *duplex.Conn) error {
 		return ctx.Err()
 	default:
 	}
-	return active.sendCancel(conn)
+	return active.cancel(conn)
+}
+
+func (d *acpDriver) Steer(ctx context.Context, conn *duplex.Conn, msg engine.SteerMessage) (engine.SteerDelivery, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return engine.SteerDelivery{}, err
+	}
+	active := d.activeTurn(conn)
+	if active == nil {
+		return engine.SteerDelivery{}, engine.ErrSteerNotActive
+	}
+	request := &acpSteerRequest{text: msg.Text, ctx: ctx, done: make(chan struct{})}
+	active.mu.Lock()
+	if active.finished || active.jobCancelled || !active.promptActive {
+		active.mu.Unlock()
+		return engine.SteerDelivery{}, engine.ErrSteerNotActive
+	}
+	if active.pendingSteer != nil {
+		active.mu.Unlock()
+		return engine.SteerDelivery{}, errors.New("Cursor ACP steer is already pending")
+	}
+	active.pendingSteer = request
+	if err := writeACPCancel(conn, active.sessionID); err != nil {
+		active.pendingSteer = nil
+		active.mu.Unlock()
+		return engine.SteerDelivery{}, err
+	}
+	active.interruptRequested = true
+	active.steerRequested = true
+	active.mu.Unlock()
+
+	select {
+	case <-request.done:
+		return request.delivery, request.err
+	case <-ctx.Done():
+		active.mu.Lock()
+		if request.completed {
+			delivery, err := request.delivery, request.err
+			active.mu.Unlock()
+			return delivery, err
+		}
+		active.mu.Unlock()
+		return engine.SteerDelivery{}, ctx.Err()
+	}
 }
 
 func (d *acpDriver) newRPC(conn *duplex.Conn, emit duplex.EmitFunc) *acpRPC {
@@ -275,6 +511,14 @@ func (c *acpRPC) setModel(ctx context.Context, sessionID, modelID string) error 
 }
 
 func (c *acpRPC) request(ctx context.Context, method string, params any, observer *acpTurnObserver) (any, error) {
+	id, err := c.writeRequest(method, params)
+	if err != nil {
+		return nil, err
+	}
+	return c.awaitResponse(ctx, method, id, observer)
+}
+
+func (c *acpRPC) writeRequest(method string, params any) (string, error) {
 	id := c.driver.nextRequestID()
 	if params == nil {
 		params = map[string]any{}
@@ -285,9 +529,12 @@ func (c *acpRPC) request(ctx context.Context, method string, params any, observe
 		"method":  method,
 		"params":  params,
 	}); err != nil {
-		return nil, err
+		return "", err
 	}
+	return id, nil
+}
 
+func (c *acpRPC) awaitResponse(ctx context.Context, method, id string, observer *acpTurnObserver) (any, error) {
 	requestCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
 	defer cancel()
 	for {
@@ -379,7 +626,7 @@ func (c *acpRPC) handlePermissionRequest(id any, params map[string]any) error {
 	}
 	active.mu.Lock()
 	defer active.mu.Unlock()
-	if active.interruptRequested {
+	if active.interruptRequested || active.jobCancelled {
 		return c.writeResult(id, map[string]any{
 			"outcome": map[string]any{"outcome": "cancelled"},
 		})
@@ -657,21 +904,45 @@ func sessionUpdate(params map[string]any) map[string]any {
 func responseResult(object map[string]any) (any, error) {
 	if rawError, ok := object["error"]; ok {
 		message := "request failed"
+		providerMessage := ""
+		providerCode := ""
 		if errObject, ok := rawError.(map[string]any); ok {
 			if value := firstString(errObject, "message"); value != "" {
 				message = value
+				providerMessage = value
+			}
+			if value := firstString(errObject, "code", "error_code", "errorCode"); value != "" {
+				providerCode = value
+			} else if code, exists := errObject["code"]; exists {
+				providerCode = fmt.Sprint(code)
 			}
 			// Cursor puts the category in message ("Invalid params") and the
 			// actionable sentence in data.message. Keep both.
 			if data, ok := firstMap(errObject, "data"); ok {
 				if value := firstString(data, "message"); value != "" {
 					message += ": " + value
+					if providerMessage == "" {
+						providerMessage = value
+					} else {
+						providerMessage += ": " + value
+					}
+				}
+				if providerCode == "" {
+					providerCode = firstString(data, "code", "error_code", "errorCode")
 				}
 			}
 		} else if value := strings.TrimSpace(stringValue(rawError)); value != "" {
 			message = value
+			providerMessage = value
 		}
-		return nil, errors.New(message)
+		cause := errors.New(message)
+		if providerCode != "" || providerMessage != "" {
+			return nil, &engine.ProviderFailureError{
+				Evidence: engine.ProviderFailureEvidence{Code: providerCode, Message: providerMessage},
+				Cause:    cause,
+			}
+		}
+		return nil, cause
 	}
 	result, ok := object["result"]
 	if !ok {
