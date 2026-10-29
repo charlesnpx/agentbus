@@ -771,7 +771,7 @@ func (c *appServerRPC) handleNotification(frame duplex.Frame) {
 
 func isCodexSelectionNotification(method string) bool {
 	switch method {
-	case "thread/started", "thread/updated", "thread/model/changed", "thread/settings/changed",
+	case "thread/started", "thread/updated", "thread/model/changed", "thread/settings/changed", "thread/settings/updated",
 		"turn/started", "model/changed", "settings/updated", "config/settings/updated":
 		return true
 	default:
@@ -817,7 +817,7 @@ func codexSelectionValues(value any) (string, string) {
 				}
 			}
 		}
-		for _, key := range []string{"thread", "turn", "settings", "config", "modelSettings", "model_settings", "reasoning"} {
+		for _, key := range []string{"thread", "turn", "settings", "config", "modelSettings", "model_settings", "threadSettings", "reasoning"} {
 			if nested, ok := firstMap(object, key); ok {
 				visit(nested, depth+1)
 			}

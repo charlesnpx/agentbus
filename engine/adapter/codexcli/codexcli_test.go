@@ -166,6 +166,56 @@ func TestAppServerLocalIPCUsesScopedPermissionsProfile(t *testing.T) {
 	_ = collectEventsWithTimeout(t, events, 2*time.Second)
 }
 
+func TestAppServerThreadSettingsUpdateReportsEffectiveSelection(t *testing.T) {
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, _ command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("thread/started", map[string]any{"threadId": "thread-1", "reasoningEffort": "medium"})
+		peer.notify("thread/settings/updated", map[string]any{
+			"threadId": "thread-1",
+			"threadSettings": map[string]any{
+				"model":  "gpt-6-luna",
+				"effort": "max",
+				"collaborationMode": map[string]any{
+					"mode": "default",
+					"settings": map[string]any{
+						"model":            "gpt-6-luna",
+						"reasoning_effort": "max",
+					},
+				},
+			},
+		})
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{Model: "gpt-6-luna", Effort: "max"})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "observe effective selection"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	var observations []engine.Event
+	for _, event := range got {
+		if event.Type == engine.EventModelReported {
+			observations = append(observations, event)
+		}
+	}
+	if len(observations) != 2 {
+		t.Fatalf("model observations = %#v, want thread start and later settings update", observations)
+	}
+	if observations[0].EffortReported != "medium" {
+		t.Fatalf("first effort observation = %q, want medium from thread start", observations[0].EffortReported)
+	}
+	last := observations[len(observations)-1]
+	if last.ModelReported != "gpt-6-luna" || last.EffortReported != "max" {
+		t.Fatalf("last model observation = %#v, want model gpt-6-luna and effort max", last)
+	}
+}
+
 func TestAppServerNativeSteerUsesTurnSteerAndKeepsOneLogicalTurn(t *testing.T) {
 	turnStarted := make(chan struct{})
 	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
