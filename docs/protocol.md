@@ -4,7 +4,7 @@ Agentbus protocol version 3 is a JSON-RPC 2.0 service over a local,
 newline-delimited Unix socket. Each frame is one JSON object followed by a
 newline. The daemon accepts only protocol version 3.
 
-The wire surface has six methods:
+The wire surface has seven methods:
 
 | Method | Purpose |
 | --- | --- |
@@ -14,6 +14,7 @@ The wire surface has six methods:
 | job.list | List compact job summaries with optional workspace, tag, and state filters. |
 | job.transcript | Return a stateless digest and selected captured items for one job. |
 | job.cancel | Request cancellation of one job. |
+| job.steer | Submit one bounded follow-up instruction to an active steerable job. |
 
 A client must call protocol.hello successfully before any other method on the
 connection. A second hello on the same connection is invalid. Unknown methods
@@ -103,6 +104,7 @@ specification is rejected.
     "cwd": "/absolute/path",
     "write": true,
     "prompt": "string",
+    "inputMode": "steerable",
     "resumeJobId": "job_previous",
     "retainSession": true,
     "model": "string",
@@ -114,8 +116,16 @@ specification is rejected.
 }
 ~~~
 
-backend, cwd, write, and prompt are required task fields. resumeJobId,
+backend, cwd, write, and prompt are required task fields. inputMode,
+resumeJobId,
 retainSession, model, effort, outputSchema, tags, and timeoutMs are optional.
+inputMode accepts `fixed` or `steerable`. Omission means `fixed`; this value is
+stored with the immutable task specification and participates in identified
+replay hashing. Because it uses `omitempty`, omission preserves the existing
+hash for every prior request. A daemon that does not recognize the field
+rejects it as `invalid_task_spec` through strict unknown-field decoding, so no
+protocol major-version bump is needed. The field is independent of `write` and
+does not infer review intent from prompt text.
 outputSchema is one inline Draft 2020-12 JSON Schema value: an object or a
 boolean. timeoutMs is a non-negative integer no greater than four hours; zero
 means no deadline.
@@ -338,6 +348,8 @@ invalid_task_spec parameter error rather than a list request.
   "workspaceKey": "string",
   "requestId": "string",
   "backend": "string",
+  "inputMode": "fixed",
+  "steers": [],
   "state": "completed",
   "cleanup": "clean",
   "createdAt": "2026-08-20T12:00:00Z",
@@ -374,9 +386,12 @@ invalid_task_spec parameter error rather than a list request.
 }
 ~~~
 
-jobId, workspaceKey, requestId, backend, state, cleanup, createdAt, and timeout
-are always present. startedAt, finishedAt, tags, result, contract, failure,
-and logPaths appear only when they apply.
+jobId, workspaceKey, requestId, backend, inputMode, state, cleanup, createdAt,
+timeout, and steers are always present. Older stored jobs without inputMode
+project as `fixed`; steers is an empty array when there are no steering
+receipts. Each steer summary contains messageId, status, mechanism, and time;
+mechanism is empty unless delivery was confirmed. startedAt, finishedAt, tags,
+result, contract, failure, and logPaths appear only when they apply.
 
 result exists only for a completed job with an authoritative result. Its
 resultPath, sha256, and bytes are required; text may be omitted when the result
@@ -407,6 +422,57 @@ The result reports the durable public state after the cancellation request:
 If the job is already terminal, cancellation returns that existing state. A
 race with completion also returns the first terminal state recorded by the
 daemon.
+
+## job.steer
+
+~~~json
+{"jobId":"string","messageId":"caller-generated-id","text":"follow-up instruction"}
+~~~
+
+messageId must contain 1 to 256 bytes. text must be non-empty and at most
+65,536 UTF-8 bytes (64 KiB). A steerable job accepts instructions only while a
+provider Turn is active. Fixed-input jobs return `not_steerable` before any
+provider I/O. Queued, completed, failed, canceled, or otherwise inactive jobs
+return `not_running`; job.steer never creates a job. A schema-correction Turn
+returns `schema_correction_active`.
+
+The receipt shape is:
+
+~~~json
+{"jobId":"string","messageId":"caller-generated-id","status":"admitted","mechanism":"","reason":"","deduplicated":false}
+~~~
+
+status is `admitted`, `delivered`, `rejected`, or `unknown`. An admitted receipt
+is immediate queue acceptance; job.get later shows its delivery outcome.
+mechanism is `native` or `interrupt_continue` only for confirmed delivery and
+is empty otherwise. reason is empty for admitted/delivered and one of
+`not_steerable`, `not_running`, `duplicate_conflict`, `queue_full`,
+`schema_correction_active`, `backend_unsupported`, or
+`delivery_unconfirmed` for rejection or uncertainty.
+
+The daemon orders steering against cancellation, schema correction, and job
+completion. Repeating a messageId with the same text returns its original
+receipt with `deduplicated: true`; a different text returns
+`duplicate_conflict`. The per-job pending queue is ordered and capped at eight
+messages. Each durable steer record stores messageId, the text SHA-256 and byte
+size, status, mechanism, reason, and timestamps. The text itself is not added to
+the original prompt or task hash. Cancel rejects queued steers and remains
+authoritative.
+
+The adapter contract keeps one logical Turn and one final result. An internal
+interrupt used to steer is not cancellation, and an interrupted segment's
+partial result is not the job result. Steering never changes deadline,
+permissions, model, effort, or schema. Sessions without steering support
+return `backend_unsupported`.
+
+`unknown` means provider delivery could not be confirmed. After a daemon
+restart, an admitted steer without a recorded outcome becomes
+`unknown`/`delivery_unconfirmed`; it is never sent again automatically.
+Deduplication is client-request identity, not provider exactly-once delivery.
+The daemon does not promise simultaneous interruption across backends, provider
+compliance with the new instruction, a stable provider turn ID across an
+interrupt-and-continue, rollback of already-started tools, a fresh-session
+fallback, or an alternative-backend fallback.
 
 ## States, cleanup, and failures
 

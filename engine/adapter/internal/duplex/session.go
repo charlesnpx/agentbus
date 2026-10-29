@@ -45,6 +45,15 @@ type Driver interface {
 	Interrupt(ctx context.Context, conn *Conn) error
 }
 
+// SteerDriver is an optional driver extension for steering an active logical
+// Turn. RunTurn remains the sole reader of Conn.Frames; Steer may write a
+// control message or coordinate with RunTurn, but must not start another stream
+// reader. For interrupt-and-continue, the same RunTurn invocation must emit
+// only the resumed segment's final result and one TurnFinal event.
+type SteerDriver interface {
+	Steer(ctx context.Context, conn *Conn, msg engine.SteerMessage) (engine.SteerDelivery, error)
+}
+
 // SessionConfig configures a duplex runtime session.
 type SessionConfig struct {
 	Runner         command.Runner
@@ -76,6 +85,8 @@ type activeTurn struct {
 	running    command.RunningCommand
 	conn       *Conn
 	retirement *retirement
+	steerMu    sync.RWMutex
+	turnDone   bool
 
 	interruptOnce sync.Once
 	interruptErr  error
@@ -330,6 +341,9 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	}()
 
 	result, earlyExit := waitForTurnResult(driverDone, active.retirement)
+	active.steerMu.Lock()
+	active.turnDone = true
+	active.steerMu.Unlock()
 	result, earlyExit = classifyTurnResult(result, earlyExit)
 	dispositionAtResult := captureTurnDisposition(turnCtx)
 	if errors.Is(result.err, ErrFrameTooLarge) && !errors.Is(result.err, engine.ErrTransportFrameTooLarge) {
@@ -392,6 +406,29 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	// remains as the panic-safe fallback.
 	s.clearActive(active)
 	events <- turnFinalEvent(completedSessionID, disposition, observation)
+}
+
+// Steer forwards one follow-up instruction to the optional driver extension
+// only while its RunTurn is active. The shared RunTurn keeps sole ownership of
+// the provider stream reader.
+func (s *Session) Steer(ctx context.Context, msg engine.SteerMessage) (engine.SteerDelivery, error) {
+	s.mu.Lock()
+	active := s.active
+	driver := s.driver
+	s.mu.Unlock()
+	if active == nil {
+		return engine.SteerDelivery{}, engine.ErrSteerNotActive
+	}
+	active.steerMu.RLock()
+	defer active.steerMu.RUnlock()
+	if active.turnDone {
+		return engine.SteerDelivery{}, engine.ErrSteerNotActive
+	}
+	steerer, ok := driver.(SteerDriver)
+	if !ok {
+		return engine.SteerDelivery{}, engine.ErrSteerUnsupported
+	}
+	return steerer.Steer(ctx, active.conn, msg)
 }
 
 func waitForTurnResult(driverDone <-chan turnResult, retirement *retirement) (turnResult, bool) {
