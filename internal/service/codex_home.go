@@ -495,12 +495,10 @@ func removeManagedCodexHomeContents(directoryFD int) error {
 			if err != nil {
 				return err
 			}
-			// Go creates module-cache directories mode 0555, and unlinking an
-			// entry requires write permission on the directory that contains it,
-			// so a populated GOMODCACHE would otherwise be undeletable and retain
-			// the whole job leaf forever. Restore owner write on the descriptor we
-			// already opened and identity-checked, so containment does not depend
-			// on re-resolving the path.
+			// Unlinking an entry requires write permission on the directory that
+			// contains it. Restore owner write on the descriptor we already opened
+			// and identity-checked, so cleanup does not depend on re-resolving the
+			// path.
 			if err := unix.Fchmod(childFD, 0o700); err != nil {
 				closeErr := unix.Close(childFD)
 				if closeErr != nil {

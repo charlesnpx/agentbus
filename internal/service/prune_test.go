@@ -301,13 +301,13 @@ func writePruneTestCodexArtifacts(t *testing.T, server *Server, record jobstore.
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache, managed, err := prepareCodexJobCache(layout, record.JobID, home)
+	cache, managed, err := prepareJobCache(layout, record.JobID, home)
 	if err != nil {
 		home.close()
 		t.Fatal(err)
 	}
 	defer managed.close()
-	cacheFile := filepath.Join(cache.goMod, "module-cache-entry")
+	cacheFile := filepath.Join(cache.goBuild, "build-cache-entry")
 	tmpFile := filepath.Join(cache.tmp, "scratch")
 	if err := os.WriteFile(cacheFile, []byte("cache!"), 0o600); err != nil {
 		t.Fatal(err)
