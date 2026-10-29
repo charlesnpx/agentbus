@@ -45,6 +45,15 @@ type Driver interface {
 	Interrupt(ctx context.Context, conn *Conn) error
 }
 
+// SteerDriver is an optional driver extension for steering an active logical
+// Turn. RunTurn remains the sole reader of Conn.Frames; Steer may write a
+// control message or coordinate with RunTurn, but must not start another stream
+// reader. For interrupt-and-continue, the same RunTurn invocation must emit
+// only the resumed segment's final result and one TurnFinal event.
+type SteerDriver interface {
+	Steer(ctx context.Context, conn *Conn, msg engine.SteerMessage) (engine.SteerDelivery, error)
+}
+
 // SessionConfig configures a duplex runtime session.
 type SessionConfig struct {
 	Runner         command.Runner
@@ -76,6 +85,8 @@ type activeTurn struct {
 	running    command.RunningCommand
 	conn       *Conn
 	retirement *retirement
+	steerMu    sync.RWMutex
+	turnDone   bool
 
 	interruptOnce sync.Once
 	interruptErr  error
@@ -198,28 +209,24 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 
 	var stderr bytes.Buffer
 	var stderrLog *engine.CappedLogWriter
+	stderrCapture := &captureWarningTracker{source: "stderr"}
 	stderrWriter := io.Writer(&stderr)
 	if input.LogPaths.Stderr != "" {
 		stderrLog, err = engine.NewCappedLogWriter(input.LogPaths.Stderr, 0)
 		if err != nil {
-			driverCancel()
-			turnCancel()
-			s.mu.Unlock()
-			return nil, err
+			stderrCapture.fail(err)
+			stderrLog = nil
+		} else {
+			stderrWriter = io.MultiWriter(&stderr, stderrCapture.tolerantWriter(stderrLog))
 		}
-		stderrWriter = io.MultiWriter(&stderr, stderrLog)
 	}
 	var stdoutLog *engine.CappedLogWriter
+	stdoutCapture := &captureWarningTracker{source: "stdout"}
 	if input.LogPaths.Stdout != "" {
 		stdoutLog, err = engine.NewCappedLogWriter(input.LogPaths.Stdout, 0)
 		if err != nil {
-			if stderrLog != nil {
-				_ = stderrLog.Close()
-			}
-			driverCancel()
-			turnCancel()
-			s.mu.Unlock()
-			return nil, err
+			stdoutCapture.fail(err)
+			stdoutLog = nil
 		}
 	}
 
@@ -252,7 +259,7 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	}
 	retirement := startRetirement(turnCtx, running)
 	stdoutPipe := running.Stdout()
-	conn := newConn(running.Stdin(), stdoutPipe, stdoutWriter, running, retirement)
+	conn := newConn(running.Stdin(), stdoutPipe, stdoutWriter, stdoutCapture, running, retirement)
 	active := &activeTurn{running: running, conn: conn, retirement: retirement}
 	s.active = active
 	s.mu.Unlock()
@@ -269,7 +276,7 @@ func (s *Session) TurnWithRunner(ctx context.Context, input engine.TurnInput, ru
 	}
 
 	events := make(chan engine.Event, eventBufferSize)
-	go s.runTurn(driverCtx, driverCancel, turnCtx, turnCancel, input, resumeID, active, stdoutPipe, running.Stderr(), stderrWriter, &stderr, stdoutLog, stderrLog, events)
+	go s.runTurn(driverCtx, driverCancel, turnCtx, turnCancel, input, resumeID, active, stdoutPipe, running.Stderr(), stderrWriter, &stderr, stdoutLog, stderrLog, stderrCapture, events)
 	return events, nil
 }
 
@@ -310,7 +317,7 @@ func normalizeEnvironment(goos string, layers ...[]string) []string {
 	return env
 }
 
-func (s *Session) runTurn(driverCtx context.Context, driverCancel context.CancelFunc, turnCtx context.Context, turnCancel context.CancelFunc, input engine.TurnInput, resumeID string, active *activeTurn, stdoutPipe io.ReadCloser, stderrPipe io.ReadCloser, stderrWriter io.Writer, stderr *bytes.Buffer, stdoutLog *engine.CappedLogWriter, stderrLog *engine.CappedLogWriter, events chan<- engine.Event) {
+func (s *Session) runTurn(driverCtx context.Context, driverCancel context.CancelFunc, turnCtx context.Context, turnCancel context.CancelFunc, input engine.TurnInput, resumeID string, active *activeTurn, stdoutPipe io.ReadCloser, stderrPipe io.ReadCloser, stderrWriter io.Writer, stderr *bytes.Buffer, stdoutLog *engine.CappedLogWriter, stderrLog *engine.CappedLogWriter, stderrCapture *captureWarningTracker, events chan<- engine.Event) {
 	defer close(events)
 	defer turnCancel()
 	defer driverCancel()
@@ -330,6 +337,9 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	}()
 
 	result, earlyExit := waitForTurnResult(driverDone, active.retirement)
+	active.steerMu.Lock()
+	active.turnDone = true
+	active.steerMu.Unlock()
 	result, earlyExit = classifyTurnResult(result, earlyExit)
 	dispositionAtResult := captureTurnDisposition(turnCtx)
 	if errors.Is(result.err, ErrFrameTooLarge) && !errors.Is(result.err, engine.ErrTransportFrameTooLarge) {
@@ -381,10 +391,21 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	}
 	emitCompletionEvents(disposition, events, result.err, earlyExit, observation, stderr, stderrCopyErr)
 	if stdoutLog != nil {
-		_ = stdoutLog.Close()
+		if err := stdoutLog.Close(); err != nil {
+			active.conn.capture.setWritten(stdoutLog.CapturedBytes())
+			active.conn.capture.fail(err)
+		}
 	}
 	if stderrLog != nil {
-		_ = stderrLog.Close()
+		if err := stderrLog.Close(); err != nil {
+			stderrCapture.setWritten(stderrLog.CapturedBytes())
+			stderrCapture.fail(err)
+		}
+	}
+	for _, warning := range []*captureWarning{active.conn.captureWarning(), stderrCapture.snapshot()} {
+		if warning != nil {
+			events <- warningWithMetadata(warning.text(), warning.event())
+		}
 	}
 
 	// Clear active before channel closure, preserving the existing guarantee that
@@ -392,6 +413,29 @@ func (s *Session) runTurn(driverCtx context.Context, driverCancel context.Cancel
 	// remains as the panic-safe fallback.
 	s.clearActive(active)
 	events <- turnFinalEvent(completedSessionID, disposition, observation)
+}
+
+// Steer forwards one follow-up instruction to the optional driver extension
+// only while its RunTurn is active. The shared RunTurn keeps sole ownership of
+// the provider stream reader.
+func (s *Session) Steer(ctx context.Context, msg engine.SteerMessage) (engine.SteerDelivery, error) {
+	s.mu.Lock()
+	active := s.active
+	driver := s.driver
+	s.mu.Unlock()
+	if active == nil {
+		return engine.SteerDelivery{}, engine.ErrSteerNotActive
+	}
+	active.steerMu.RLock()
+	defer active.steerMu.RUnlock()
+	if active.turnDone {
+		return engine.SteerDelivery{}, engine.ErrSteerNotActive
+	}
+	steerer, ok := driver.(SteerDriver)
+	if !ok {
+		return engine.SteerDelivery{}, engine.ErrSteerUnsupported
+	}
+	return steerer.Steer(ctx, active.conn, msg)
 }
 
 func waitForTurnResult(driverDone <-chan turnResult, retirement *retirement) (turnResult, bool) {

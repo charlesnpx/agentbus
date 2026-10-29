@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/charlesnpx/agentbus/internal/daemonlaunch"
+	"github.com/charlesnpx/agentbus/internal/jobstore"
 	"github.com/charlesnpx/agentbus/internal/service"
 )
 
@@ -194,7 +195,7 @@ func reportStartupFailure(reporter *daemonlaunch.Reporter, err error) {
 	if reporter == nil || reporter.Sent() || err == nil {
 		return
 	}
-	_ = reporter.Failed(startupFailureCode(err), err.Error())
+	_ = reporter.FailedAt(startupFailurePhase(err), startupFailureCode(err), err.Error())
 }
 
 func startupFailureCode(err error) string {
@@ -204,5 +205,27 @@ func startupFailureCode(err error) string {
 	if errors.Is(err, service.ErrDaemonAlreadyListening) {
 		return daemonlaunch.CodeAlreadyListening
 	}
+	if errors.Is(err, jobstore.ErrBusy) {
+		return daemonlaunch.CodeStoreBusy
+	}
+	if errors.Is(err, jobstore.ErrCorrupt) {
+		return daemonlaunch.CodeStoreCorrupt
+	}
+	if errors.Is(err, jobstore.ErrIncompatible) {
+		return daemonlaunch.CodeStoreIncompatible
+	}
 	return "error"
+}
+
+func startupFailurePhase(err error) string {
+	switch {
+	case errors.Is(err, jobstore.ErrBusy), errors.Is(err, jobstore.ErrCorrupt), errors.Is(err, jobstore.ErrIncompatible):
+		return "opening job store"
+	case errors.Is(err, service.ErrDaemonAlreadyListening):
+		return "binding daemon socket"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return "waiting for daemon readiness"
+	default:
+		return "daemon initialization"
+	}
 }

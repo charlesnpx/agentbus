@@ -2,7 +2,23 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"time"
+)
+
+var (
+	// ErrSteerUnsupported means the session's adapter cannot steer this turn.
+	ErrSteerUnsupported = errors.New("steering unsupported")
+	// ErrSteerNotActive means there is no active provider turn to steer.
+	ErrSteerNotActive = errors.New("no active turn to steer")
+)
+
+const (
+	// SteerMechanismNative identifies provider-native steering of the current turn.
+	SteerMechanismNative = "native"
+	// SteerMechanismInterruptContinue identifies an interrupt followed by a
+	// continuation in the same provider conversation.
+	SteerMechanismInterruptContinue = "interrupt_continue"
 )
 
 // Backend is the public engine adapter surface for a backend CLI.
@@ -29,6 +45,36 @@ type Session interface {
 	ID() string
 	Turn(ctx context.Context, input TurnInput) (<-chan Event, error)
 	Interrupt(ctx context.Context) error
+}
+
+// Steerer is an optional extension implemented by sessions that can accept a
+// follow-up instruction during their currently running Turn. Turn's event
+// channel must stay open while steering and continue with events from any
+// resumed segment. The logical Turn emits exactly one final result and one
+// TurnFinal observation. An internal interruption used to steer must never be
+// exposed as cancellation or a terminal error, and a partial result from the
+// interrupted segment must never be reported as the logical turn's final
+// result. Implementations must not change the turn's deadline, permissions,
+// model, effort, or schema. Sessions without this interface remain valid and
+// are treated as not supporting steering.
+type Steerer interface {
+	Steer(ctx context.Context, msg SteerMessage) (SteerDelivery, error)
+}
+
+// SteerMessage is one caller-identified follow-up instruction. Text is passed
+// only to the active adapter and is not added to the original TurnInput.
+type SteerMessage struct {
+	ID   string
+	Text string
+}
+
+// SteerDelivery reports the adapter's delivery mechanism and whether the
+// provider acknowledged the instruction. Confirmed=false means the message
+// was written but provider acceptance was not confirmed; callers must retain
+// that uncertainty and must not redeliver automatically.
+type SteerDelivery struct {
+	Mechanism string
+	Confirmed bool
 }
 
 // Health is the non-network preflight result for a backend.

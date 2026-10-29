@@ -27,9 +27,12 @@ const (
 	// ProtocolVersion is the only protocol version served by this daemon.
 	ProtocolVersion = protocol.Version
 
-	defaultIdleTimeout    = 30 * time.Minute
-	defaultShutdown       = 30 * time.Second
-	oversizedWriteTimeout = time.Second
+	defaultIdleTimeout       = 30 * time.Minute
+	defaultShutdown          = 30 * time.Second
+	defaultMaxJobs           = 4
+	defaultMaxJobsPerBackend = 2
+	defaultMaxQueued         = 64
+	oversizedWriteTimeout    = time.Second
 )
 
 var (
@@ -91,6 +94,10 @@ type Config struct {
 	IdleTimeout       time.Duration
 	IdleCheckInterval time.Duration
 	ShutdownTimeout   time.Duration
+	MaxJobs           int
+	MaxJobsPerBackend int
+	MaxQueued         int
+	PruneInterval     time.Duration
 	ReadyHook         func(ServeReadyInfo) error
 }
 
@@ -146,11 +153,16 @@ type Server struct {
 	codexHomeOverride string
 	codexHomeInherit  bool
 	codexAuthHome     string
+	moduleCache       string
 	codexHomesMu      sync.Mutex
 	managedCodexHomes map[string]*managedCodexHome
 
 	jobStoreMu sync.Mutex
 	jobStore   *jobstore.Store
+
+	pruneMu          sync.Mutex
+	pruneInterval    time.Duration
+	pruneApplyCursor string
 
 	// processTable, processGroups, and processGroupGoneFn are the service's restart-recovery
 	// dependencies. They deliberately live here instead of in jobstore: the
@@ -164,11 +176,17 @@ type Server struct {
 	processGroupGrace  time.Duration
 	turnDrainGrace     time.Duration
 
-	executionMu     sync.Mutex
-	executionCtx    context.Context
-	executionCancel context.CancelFunc
-	executions      map[string]*activeExecution
-	executionWG     sync.WaitGroup
+	executionMu       sync.Mutex
+	executionCtx      context.Context
+	executionCancel   context.CancelFunc
+	executions        map[string]*activeExecution
+	executionWG       sync.WaitGroup
+	submissionMu      sync.Mutex
+	queuedJobs        []queuedJob
+	runningByBackend  map[string]int
+	maxJobs           int
+	maxJobsPerBackend int
+	maxQueued         int
 
 	idleTimeout       time.Duration
 	idleCheckInterval time.Duration
@@ -201,6 +219,21 @@ type Server struct {
 // New creates a daemon server and ensures that its state root and token file
 // exist. An existing token always wins over Config.Token.
 func New(cfg Config) (*Server, error) {
+	if cfg.PruneInterval < 0 {
+		return nil, errors.New("prune interval cannot be negative")
+	}
+	if cfg.MaxJobs < 0 || cfg.MaxJobsPerBackend < 0 || cfg.MaxQueued < 0 {
+		return nil, errors.New("max-jobs, max-jobs-per-backend, and max-queued must be positive")
+	}
+	if cfg.MaxJobs == 0 {
+		cfg.MaxJobs = defaultMaxJobs
+	}
+	if cfg.MaxJobsPerBackend == 0 {
+		cfg.MaxJobsPerBackend = defaultMaxJobsPerBackend
+	}
+	if cfg.MaxQueued == 0 {
+		cfg.MaxQueued = defaultMaxQueued
+	}
 	root, err := ensureStateRoot(cfg.StateRoot)
 	if err != nil {
 		return nil, err
@@ -248,14 +281,20 @@ func New(cfg Config) (*Server, error) {
 		codexHomeOverride: cfg.CodexHomeOverride,
 		codexHomeInherit:  cfg.CodexHomeInherit,
 		codexAuthHome:     cfg.CodexAuthHome,
+		moduleCache:       resolveModuleCache(),
 		managedCodexHomes: make(map[string]*managedCodexHome),
 		processTable:      engine.NativeProcessTable{},
 		processGroups:     engine.NativeProcessGroupSignaler{},
 		processGroupGrace: engine.DefaultCancelGrace,
 		turnDrainGrace:    engine.DefaultCancelGrace,
+		maxJobs:           cfg.MaxJobs,
+		maxJobsPerBackend: cfg.MaxJobsPerBackend,
+		maxQueued:         cfg.MaxQueued,
+		runningByBackend:  make(map[string]int),
 		idleTimeout:       idleTimeout,
 		idleCheckInterval: idleCheckInterval,
 		shutdownTimeout:   normalizeShutdownTimeout(cfg.ShutdownTimeout),
+		pruneInterval:     cfg.PruneInterval,
 		readyHook:         cfg.ReadyHook,
 		lastActivity:      time.Now().UTC(),
 	}, nil
@@ -315,6 +354,7 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 	}
 	serveCtx, cancel := context.WithCancel(ctx)
 	s.beginExecutions(serveCtx)
+	var pruneWG sync.WaitGroup
 	lifecycle := &serveLifecycle{
 		listener:      listener,
 		socket:        socketIdentity,
@@ -333,10 +373,10 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 		_ = listener.Close()
 		s.removeOwnedSocket(socketIdentity, "server shutdown")
 		cancel()
+		pruneWG.Wait()
 		s.clearLifecycle(lifecycle)
 		close(lifecycle.serveDone)
 	}()
-
 	if err := startupCtx.Err(); err != nil {
 		return err
 	}
@@ -344,6 +384,13 @@ func (s *Server) serve(ctx, startupCtx context.Context) error {
 		if err := s.readyHook(ServeReadyInfo{StateRoot: s.stateRoot, SocketPath: s.socketPath}); err != nil {
 			return err
 		}
+	}
+	if s.pruneInterval > 0 {
+		pruneWG.Add(1)
+		go func() {
+			defer pruneWG.Done()
+			s.automaticPruneLoop(serveCtx)
+		}()
 	}
 	s.touchActivity()
 	go func() {
@@ -590,6 +637,11 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, listen
 				}
 				s.removeOwnedSocket(socketIdentity, "stale daemon listener close")
 				staleDraining = true
+				continue
+			}
+			if s.pruneInterval > 0 {
+				// An enabled periodic sweep needs a daemon that remains available
+				// until its next tick, even when no clients are connected.
 				continue
 			}
 			if s.idleTimeout < 0 {

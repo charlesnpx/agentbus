@@ -18,6 +18,8 @@ import (
 
 const jobStoreFilename = "jobs.db"
 
+var errQueueFull = errors.New("agentbus submission queue is full")
+
 type jobSubmitInput struct {
 	key               jobstore.RequestKey
 	taskSpec          map[string]json.RawMessage
@@ -65,6 +67,16 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 	if err != nil {
 		return requestOutcome{err: protocol.NewError(protocol.ErrorBackendUnavailable, "open job store: "+err.Error(), protocol.ErrorData{})}
 	}
+	// Serialize admission through queue insertion so concurrent submissions
+	// cannot all observe the same final queue slot. The capacity snapshot is
+	// taken before entering bbolt to keep scheduler and store lock order
+	// independent. A full-queue rejection is still checked only in SubmitTx's
+	// new-record factory, so matching idempotent retries always return their
+	// original job.
+	s.submissionMu.Lock()
+	defer s.submissionMu.Unlock()
+	backendName := taskSpecBackendName(input.taskSpec)
+	queueFullAtAdmission := backendName != "" && s.queueWouldExceed(backendName)
 	var executionBackend engine.Backend
 	record, deduplicated, err := store.SubmitTxWithLookup(input.key, input.canonicalTaskSpec, func(id string, lookup jobstore.RecordLookup) (jobstore.Record, error) {
 		// Everything in this factory is new-key-only: SubmitTx has already
@@ -93,11 +105,15 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 		if err != nil {
 			return jobstore.Record{}, err
 		}
+		if queueFullAtAdmission && spec.Backend == backendName {
+			return jobstore.Record{}, errQueueFull
+		}
 		return jobstore.Record{
 			JobID:         id,
 			WorkspaceKey:  input.key.WorkspaceKey,
 			RequestID:     input.key.RequestID,
 			Backend:       spec.Backend,
+			InputMode:     protocol.EffectiveInputMode(spec.InputMode),
 			Model:         taskSpecOptionalString(spec.Model),
 			CWD:           canonicalCWD,
 			Write:         spec.Write,
@@ -106,6 +122,9 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 		}, nil
 	})
 	if err != nil {
+		if errors.Is(err, errQueueFull) {
+			return requestOutcome{err: protocol.NewError(protocol.ErrorQueueFull, fmt.Sprintf("submission rejected: daemon queue is full (maximum %d waiting jobs)", s.maxQueued), protocol.ErrorData{})}
+		}
 		if errors.Is(err, jobstore.ErrConflict) {
 			return s.jobSubmitConflict(err)
 		}
@@ -126,6 +145,14 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 		s.enqueueQueuedJob(record, executionBackend)
 	}
 	return requestOutcome{result: jobSubmitResult(record, deduplicated, timeout)}
+}
+
+func taskSpecBackendName(fields map[string]json.RawMessage) string {
+	var backend string
+	if err := json.Unmarshal(fields["backend"], &backend); err != nil {
+		return ""
+	}
+	return backend
 }
 
 // parseJobSubmitInput performs only the JSON work needed to derive the
@@ -182,7 +209,7 @@ func parseJobSubmitInput(raw json.RawMessage) (jobSubmitInput, error) {
 	}
 	for name := range input.taskSpec {
 		switch name {
-		case "backend", "cwd", "write", "prompt", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs":
+		case "backend", "cwd", "write", "prompt", "inputMode", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs":
 		default:
 			return jobSubmitInput{}, fmt.Errorf("json: unknown field %q", name)
 		}
@@ -206,7 +233,7 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 			return fmt.Errorf("taskSpec missing required field %s", required)
 		}
 	}
-	for _, optional := range []string{"resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs"} {
+	for _, optional := range []string{"inputMode", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs"} {
 		value, present := raw[optional]
 		if present && string(value) == "null" {
 			return fmt.Errorf("taskSpec.%s cannot be null", optional)
@@ -214,6 +241,9 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 	}
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
 		return fmt.Errorf("taskSpec requires backend, absolute cwd, write, and prompt")
+	}
+	if _, supplied := raw["inputMode"]; supplied && spec.InputMode != protocol.InputModeFixed && spec.InputMode != protocol.InputModeSteerable {
+		return fmt.Errorf("taskSpec.inputMode must be %q or %q", protocol.InputModeFixed, protocol.InputModeSteerable)
 	}
 	if _, supplied := raw["resumeJobId"]; supplied && strings.TrimSpace(spec.ResumeJobID) == "" {
 		return errors.New("taskSpec.resumeJobId must name a job")

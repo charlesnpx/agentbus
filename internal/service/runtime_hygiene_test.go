@@ -99,7 +99,12 @@ func TestCompletedSessionRetentionIsSharedByStoreAndService(t *testing.T) {
 	}
 }
 
-func TestCodexWriteTurnReceivesPerJobSandboxCache(t *testing.T) {
+func TestCodexWriteTurnUsesPrivateWritableCacheAndHostModuleCache(t *testing.T) {
+	hostModuleCache := filepath.Join(t.TempDir(), "host-mod-cache")
+	if err := os.MkdirAll(hostModuleCache, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOMODCACHE", hostModuleCache)
 	var started engine.SessionOpts
 	backend := &executionFakeBackend{name: "codex"}
 	backend.start = func(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
@@ -109,8 +114,12 @@ func TestCodexWriteTurnReceivesPerJobSandboxCache(t *testing.T) {
 		}
 		for _, path := range []string{
 			filepath.Join(opts.WriteSandboxRoot, "cache", "go-build"),
-			filepath.Join(opts.WriteSandboxRoot, "cache", "go-mod"),
 			filepath.Join(opts.WriteSandboxRoot, "tmp"),
+			filepath.Join(opts.WriteSandboxRoot, "cache", "npm"),
+			filepath.Join(opts.WriteSandboxRoot, "cache", "corepack"),
+			filepath.Join(opts.WriteSandboxRoot, "cache", "xdg"),
+			filepath.Join(opts.WriteSandboxRoot, "cache", "pnpm"),
+			filepath.Join(opts.WriteSandboxRoot, "cache", "yarn"),
 		} {
 			info, err := os.Stat(path)
 			if err != nil {
@@ -132,10 +141,26 @@ func TestCodexWriteTurnReceivesPerJobSandboxCache(t *testing.T) {
 	if started.WriteSandboxRoot == "" {
 		t.Fatal("write Codex session did not start")
 	}
+	if got := started.EnvOverlay["GOMODCACHE"]; got != hostModuleCache {
+		t.Fatalf("EnvOverlay[GOMODCACHE] = %q, want resolved host cache %q", got, hostModuleCache)
+	}
+	if relative, err := filepath.Rel(started.WriteSandboxRoot, started.EnvOverlay["GOMODCACHE"]); err == nil {
+		inside := relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
+		if inside {
+			t.Fatalf("GOMODCACHE %q is not outside job cache root %q", started.EnvOverlay["GOMODCACHE"], started.WriteSandboxRoot)
+		}
+	}
+	if got := started.EnvOverlay["GOPROXY"]; got != "off" {
+		t.Fatalf("EnvOverlay[GOPROXY] = %q, want off", got)
+	}
 	want := map[string]string{
-		"GOCACHE":    filepath.Join(started.WriteSandboxRoot, "cache", "go-build"),
-		"GOMODCACHE": filepath.Join(started.WriteSandboxRoot, "cache", "go-mod"),
-		"TMPDIR":     filepath.Join(started.WriteSandboxRoot, "tmp"),
+		"GOCACHE":              filepath.Join(started.WriteSandboxRoot, "cache", "go-build"),
+		"TMPDIR":               filepath.Join(started.WriteSandboxRoot, "tmp"),
+		"npm_config_cache":     filepath.Join(started.WriteSandboxRoot, "cache", "npm"),
+		"COREPACK_HOME":        filepath.Join(started.WriteSandboxRoot, "cache", "corepack"),
+		"XDG_CACHE_HOME":       filepath.Join(started.WriteSandboxRoot, "cache", "xdg"),
+		"npm_config_store_dir": filepath.Join(started.WriteSandboxRoot, "cache", "pnpm"),
+		"YARN_CACHE_FOLDER":    filepath.Join(started.WriteSandboxRoot, "cache", "yarn"),
 	}
 	if len(started.WriteEnvOverlay) != len(want) {
 		t.Fatalf("WriteEnvOverlay = %#v, want exactly %#v", started.WriteEnvOverlay, want)
@@ -148,6 +173,43 @@ func TestCodexWriteTurnReceivesPerJobSandboxCache(t *testing.T) {
 		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 			t.Fatalf("WriteEnvOverlay[%q] = %q is outside sandbox root %q", key, path, started.WriteSandboxRoot)
 		}
+	}
+	get := server.handleJobGet(mustJSON(t, protocol.JobGetParams{JobID: record.JobID}))
+	if get.err != nil {
+		t.Fatalf("job.get error = %#v", get.err)
+	}
+	detail, ok := get.result.(protocol.JobRecordWire)
+	if !ok || detail.Execution == nil {
+		t.Fatalf("job.get execution posture = %#v, want persisted posture", get.result)
+	}
+	if detail.Execution.Intent != "edit" || !detail.Execution.SourceWritable || detail.Execution.Scratch != started.WriteSandboxRoot {
+		t.Fatalf("job.get execution posture = %#v, want edit posture with job scratch", detail.Execution)
+	}
+	if got := detail.Execution.Caches["GOMODCACHE"]; got != hostModuleCache {
+		t.Fatalf("job.get execution GOMODCACHE = %q, want %q", got, hostModuleCache)
+	}
+}
+
+func TestCodexWriteTurnOmitsGOMODCACHEWhenHostCacheCannotResolve(t *testing.T) {
+	t.Setenv("GOMODCACHE", "")
+	t.Setenv("PATH", t.TempDir())
+	var started engine.SessionOpts
+	backend := &executionFakeBackend{name: "codex"}
+	backend.start = func(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
+		started = opts
+		return claimedResultSession("offline result"), nil
+	}
+	server := newTestServer(t, t.TempDir(), Config{
+		Backends:      []engine.Backend{backend},
+		CodexAuthHome: filepath.Join(t.TempDir(), "missing-auth-home"),
+	})
+	record := runtimeHygieneRecord(t, server, t.TempDir(), "missing-host-module-cache", true)
+	runExecution(t, server, record)
+	if _, ok := started.EnvOverlay["GOMODCACHE"]; ok {
+		t.Fatalf("EnvOverlay unexpectedly set GOMODCACHE: %#v", started.EnvOverlay)
+	}
+	if _, ok := started.WriteEnvOverlay["GOMODCACHE"]; ok {
+		t.Fatalf("WriteEnvOverlay unexpectedly set GOMODCACHE: %#v", started.WriteEnvOverlay)
 	}
 }
 
@@ -222,7 +284,7 @@ func TestManagedCodexHomeIsRemovedAfterCleanCompletion(t *testing.T) {
 	backend := &executionFakeBackend{name: "codex"}
 	backend.start = func(_ context.Context, opts engine.SessionOpts) (engine.Session, error) {
 		home = opts.EnvOverlay["CODEX_HOME"]
-		marker := filepath.Join(opts.WriteSandboxRoot, "cache", "go-mod", "cached-module")
+		marker := filepath.Join(opts.WriteSandboxRoot, "cache", "npm", "cached-module")
 		if err := os.WriteFile(marker, []byte("cached"), 0o600); err != nil {
 			t.Fatal(err)
 		}

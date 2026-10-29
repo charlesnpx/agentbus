@@ -25,11 +25,13 @@ state-root break for this release, are in
 agentbus version [--json]
 agentbus --help
 agentbus backends [--json]
-agentbus serve [--foreground]
+agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>] [--prune-interval 24h]
 agentbus status [--job <id>] [--tag <key=value>] [--state <state>] [--workspace-key <key>] [--limit <n>] [--before <cursor> | --all] [--json]
 agentbus transcript --job <id> [--follow] [--kind <kind>] [--since <timestamp>] [--since-ordinal <n>] [--last <n>] [--limit <n>] [--json]
 agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]
 agentbus cancel --job <id> [--json]
+agentbus prune [--apply] [--successful-older-than 168h] [--failed-older-than 720h] [--json]
+agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]
 agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]
 ~~~
 
@@ -76,8 +78,51 @@ Repeatable filters such as `--tag` and `--state` keep accepting multiple values.
 Job submission uses the typed job.submit protocol method. There is no CLI submit
 command.
 
+The daemon runs at most 4 jobs at once and 2 per backend by default, and keeps
+up to 64 additional jobs waiting. These are starting values, not measured
+optima. Set positive integer limits with `agentbus serve`; zero is rejected.
+The values apply when a daemon starts and do not change an already serving daemon.
+When the waiting queue is full, a new job.submit is rejected with
+`queue_full` (CLI exit code 19). A matching deduplicated request does not use
+another queue entry. Job execution timeouts begin when a job gets a slot;
+`queuedAt` and `startedAt` show its wait and execution start.
+
+TaskSpec `inputMode` is `fixed` when omitted. Set it to `steerable` only when
+the running task may receive follow-up instructions. `agentbus steer` submits
+one caller-identified message from a file or stdin; `status --job` shows the
+mode and text-free steer receipts. A steerable job retains one public job ID,
+deadline, permission envelope, model, effort, and schema. Delivery may be
+native or interrupt-and-continue depending on the adapter. Delivery uncertainty
+is reported without automatic redelivery; a steerable task does not guarantee
+that a provider follows the instruction or rolls back tools already started.
+`agentbus steer` exits 17 for a rejected receipt and 18 when delivery is unknown.
+The wire details and receipt reasons are in [docs/protocol.md](docs/protocol.md).
+
 Set AGENTBUS_STATE_ROOT to select daemon state. Otherwise Agentbus uses
 $XDG_STATE_HOME/agentbus or ~/.local/state/agentbus.
+
+Writable jobs get private Go build, temporary, npm, Corepack, pnpm, and Yarn
+caches under their managed state directory, outside the repository. Codex
+workspace-write jobs can write there through the OS sandbox's managed writable
+root. Agentbus resolves the daemon's `GOMODCACHE` once (from the daemon
+environment, or `go env GOMODCACHE` with a short timeout) and leaves jobs
+pointing at that populated host cache for reads; it never replaces it with an
+empty per-job directory. The Codex sandbox allows reading the host module cache
+on macOS and Linux while keeping it outside the writable roots. If no cache
+path resolves, Agentbus leaves `GOMODCACHE` at its default. Codex jobs set
+`GOPROXY=off`, so a missing module fails with Go's own offline lookup error
+instead of repeated DNS retries. `-mod=readonly` only restricts module-file
+changes; it is not a filesystem sandbox.
+
+Inspect jobs receive no job-private scratch or writable caches: current
+read-only backend modes do not enforce a writable root outside the submitted
+workspace. `job.get` and `agentbus status --job <id>` expose the execution
+posture recorded at start, including intent, source write mode, scratch/cache
+paths, network and Git metadata policy, and enforcement strength. Codex uses
+its OS sandbox, Cursor uses agent-mode permissions, and Claude has no filesystem
+or network sandbox. `sourceWritable` reflects the selected inspect/edit mode;
+`enforcement` identifies whether that mode has an OS sandbox, agent permissions,
+or no filesystem boundary.
 
 `configure-codex-sandbox` adds Agentbus's state and cache roots to
 `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`), preserving existing TOML
@@ -120,7 +165,8 @@ and message, but does not classify generic errors as usage or authentication
 failures. Existing `provider_overloaded`, `model_unavailable`, and
 `content_policy` classes remain. A transient failure may leave partial
 workspace edits, so replay is the caller's decision and Agentbus does not
-retry automatically. See [docs/protocol.md](docs/protocol.md) for field shapes,
+retry automatically. The `storage` class identifies failed result or terminal
+record persistence. See [docs/protocol.md](docs/protocol.md) for field shapes,
 provider signals, and the full method contract.
 
 ## Packages

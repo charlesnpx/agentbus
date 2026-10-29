@@ -37,6 +37,9 @@ const (
 	cliExitShutdownForced       = 13
 	cliExitResultUnavailable    = 15
 	cliExitObservationTimeout   = 16
+	cliExitSteerRejected        = 17
+	cliExitSteerUnknown         = 18
+	cliExitQueueFull            = 19
 	cliStatusDefaultLimit       = 50
 	cliTranscriptFollowPageSize = 100
 	shortSHA256HexLength        = 12
@@ -60,6 +63,7 @@ type protocolClient interface {
 	JobList(context.Context, agentclient.JobListParams) (agentclient.JobListResult, error)
 	JobTranscript(context.Context, agentclient.JobTranscriptParams) (agentclient.JobTranscriptResult, error)
 	JobCancel(context.Context, agentclient.JobCancelParams) (agentclient.JobCancelResult, error)
+	ArtifactsPrune(context.Context, agentclient.ArtifactsPruneParams) (agentclient.ArtifactsPruneResult, error)
 	Close() error
 }
 
@@ -104,7 +108,7 @@ func resolvedCursorBinary() string {
 	return ""
 }
 
-func (a *app) run(ctx context.Context, args []string, _ io.Reader, out, errOut io.Writer) int {
+func (a *app) run(ctx context.Context, args []string, stdin io.Reader, out, errOut io.Writer) int {
 	if len(args) == 0 {
 		printRootHelp(errOut)
 		return 2
@@ -150,6 +154,10 @@ func (a *app) run(ctx context.Context, args []string, _ io.Reader, out, errOut i
 		return a.runResult(ctx, args[1:], out, errOut)
 	case "cancel":
 		return a.runCancel(ctx, args[1:], out, errOut)
+	case "prune":
+		return a.runPrune(ctx, args[1:], out, errOut)
+	case "steer":
+		return a.runSteer(ctx, args[1:], stdin, out, errOut)
 	case "configure-codex-sandbox":
 		return runConfigureCodexSandbox(args[1:], out, errOut)
 	default:
@@ -159,7 +167,7 @@ func (a *app) run(ctx context.Context, args []string, _ io.Reader, out, errOut i
 
 func knownCommand(command string) bool {
 	switch command {
-	case "version", "backends", "serve", "status", "transcript", "result", "cancel", "configure-codex-sandbox":
+	case "version", "backends", "serve", "status", "transcript", "result", "cancel", "prune", "steer", "configure-codex-sandbox":
 		return true
 	default:
 		return false
@@ -182,7 +190,7 @@ func printCommandHelp(out io.Writer, command string) {
 	case "backends":
 		fmt.Fprintln(out, "Usage: agentbus backends [--json]")
 	case "serve":
-		fmt.Fprintln(out, "Usage: agentbus serve [--foreground]")
+		fmt.Fprintln(out, "Usage: agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>] [--prune-interval 24h]")
 	case "status":
 		fmt.Fprintln(out, "Usage: agentbus status [--job <id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--limit <n>] [--before <cursor> | --all] [--json]")
 	case "transcript":
@@ -191,6 +199,10 @@ func printCommandHelp(out io.Writer, command string) {
 		fmt.Fprintln(out, "Usage: agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]")
 	case "cancel":
 		fmt.Fprintln(out, "Usage: agentbus cancel --job <id> [--json]")
+	case "prune":
+		fmt.Fprintln(out, "Usage: agentbus prune [--apply] [--successful-older-than 168h] [--failed-older-than 720h] [--json]")
+	case "steer":
+		fmt.Fprintln(out, "Usage: agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]")
 	case "configure-codex-sandbox":
 		fmt.Fprintln(out, "Usage: agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]")
 	default:
@@ -260,14 +272,24 @@ func (a *app) runVersion(args []string, out, errOut io.Writer) int {
 func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int {
 	fs := newCommandFlagSet("serve", errOut)
 	foreground := fs.Bool("foreground", false, "run daemon in foreground")
+	maxJobs := fs.Int("max-jobs", 4, "maximum concurrent jobs across all backends (positive integer)")
+	maxJobsPerBackend := fs.Int("max-jobs-per-backend", 2, "maximum concurrent jobs per backend (positive integer)")
+	maxQueued := fs.Int("max-queued", 64, "maximum waiting jobs before submissions are rejected (positive integer)")
+	pruneInterval := fs.Duration("prune-interval", 0, "run the owned-artifact retention sweep at this interval (default off)")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
 	if fs.NArg() != 0 {
 		return usageError(errOut, "serve does not accept positional arguments")
 	}
+	if *maxJobs <= 0 || *maxJobsPerBackend <= 0 || *maxQueued <= 0 {
+		return usageError(errOut, "--max-jobs, --max-jobs-per-backend, and --max-queued must be positive integers")
+	}
+	if *pruneInterval < 0 {
+		return usageError(errOut, "--prune-interval cannot be negative")
+	}
 	if !*foreground {
-		if err := a.startBackgroundDaemon(ctx); err != nil {
+		if err := a.startBackgroundDaemon(ctx, *maxJobs, *maxJobsPerBackend, *maxQueued, *pruneInterval); err != nil {
 			return protocolCommandError(errOut, "serve", err)
 		}
 		return 0
@@ -282,6 +304,10 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 		CodexHomeOverride: codexHomeOverride,
 		CodexHomeInherit:  codexHomeInherit,
 		CodexAuthHome:     codexAuthHome,
+		MaxJobs:           *maxJobs,
+		MaxJobsPerBackend: *maxJobsPerBackend,
+		MaxQueued:         *maxQueued,
+		PruneInterval:     *pruneInterval,
 	})
 	if err != nil {
 		return serveCommandError(errOut, err)
@@ -311,7 +337,7 @@ func codexHomeSettings() (override string, inherit bool, authHome string) {
 		strings.TrimSpace(os.Getenv("CODEX_HOME"))
 }
 
-func (a *app) startBackgroundDaemon(ctx context.Context) error {
+func (a *app) startBackgroundDaemon(ctx context.Context, maxJobs, maxJobsPerBackend, maxQueued int, pruneInterval time.Duration) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -320,9 +346,18 @@ func (a *app) startBackgroundDaemon(ctx context.Context) error {
 	if a.daemonLauncher != nil {
 		launcher = a.daemonLauncher
 	}
+	args := []string{
+		"serve", "--foreground",
+		"--max-jobs", strconv.Itoa(maxJobs),
+		"--max-jobs-per-backend", strconv.Itoa(maxJobsPerBackend),
+		"--max-queued", strconv.Itoa(maxQueued),
+	}
+	if pruneInterval > 0 {
+		args = append(args, "--prune-interval", pruneInterval.String())
+	}
 	result, err := launcher(ctx, daemonlaunch.Options{
 		CommandPath: exe,
-		Args:        []string{"serve", "--foreground"},
+		Args:        args,
 		StateRoot:   a.stateRoot,
 		Timeout:     daemonlaunch.DefaultTimeout,
 		Starter:     startDaemonProcess,
@@ -492,6 +527,7 @@ func (a *app) runStatus(ctx context.Context, args []string, out, errOut io.Write
 				summary.Backend,
 				summary.Cleanup,
 				summary.CreatedAt,
+				summary.QueuedAt,
 				summary.FailureClass,
 				summary.Contract,
 				summary.Tags,
@@ -627,7 +663,11 @@ func printJobTranscript(out io.Writer, transcript agentclient.JobTranscriptResul
 	if transcript.Liveness != "" {
 		fmt.Fprintf(out, " liveness=%s", transcript.Liveness)
 	}
-	fmt.Fprintf(out, " gap=%t\n", transcript.Gap)
+	fmt.Fprintf(out, " gap=%t", transcript.Gap)
+	if transcript.Pruned {
+		fmt.Fprint(out, " pruned=true")
+	}
+	fmt.Fprintln(out)
 	if digest {
 		fmt.Fprintf(out, "counts message=%d reasoning=%d tool=%d toolResult=%d fileChange=%d warning=%d error=%d\n",
 			transcript.Counts["message"],
@@ -998,6 +1038,149 @@ func (a *app) runCancel(ctx context.Context, args []string, out, errOut io.Write
 	return cliExitCodeForRecord(record)
 }
 
+func (a *app) runPrune(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newCommandFlagSet("prune", errOut)
+	apply := fs.Bool("apply", false, "delete eligible artifacts (default is dry-run)")
+	successfulAge := fs.Duration("successful-older-than", 168*time.Hour, "minimum age for completed jobs")
+	failedAge := fs.Duration("failed-older-than", 720*time.Hour, "minimum age for failed, canceled, or unknown jobs")
+	jsonOut := fs.Bool("json", false, "emit the artifacts.prune response")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return usageError(errOut, "prune does not accept positional arguments")
+	}
+	if *successfulAge <= 0 || *failedAge <= 0 {
+		return usageError(errOut, "prune age thresholds must be greater than zero")
+	}
+	client, err := a.connectProtocolClient(ctx)
+	if err != nil {
+		return protocolCommandError(errOut, "prune", err)
+	}
+	defer client.Close()
+	dryRun := !*apply
+	result, err := client.ArtifactsPrune(ctx, agentclient.ArtifactsPruneParams{
+		DryRun:              &dryRun,
+		SuccessfulOlderThan: successfulAge.String(),
+		FailedOlderThan:     failedAge.String(),
+	})
+	if err != nil {
+		return protocolCommandError(errOut, "prune", err)
+	}
+	if *jsonOut {
+		return writeOrError(out, errOut, result)
+	}
+	mode := "apply"
+	if result.DryRun {
+		mode = "dry-run"
+	}
+	fmt.Fprintf(out, "mode=%s successfulOlderThan=%s failedOlderThan=%s wouldRemoveBytes=%d removedBytes=%d\n",
+		mode, result.SuccessfulOlderThan, result.FailedOlderThan, result.WouldRemoveBytes, result.RemovedBytes)
+	for _, item := range result.WouldRemove {
+		fmt.Fprintf(out, "would-remove jobId=%s kind=%s bytes=%d path=%q\n", item.JobID, item.Kind, item.Bytes, item.Path)
+	}
+	for _, item := range result.Removed {
+		fmt.Fprintf(out, "removed jobId=%s kind=%s bytes=%d path=%q\n", item.JobID, item.Kind, item.Bytes, item.Path)
+	}
+	for _, skipped := range result.Skipped {
+		fmt.Fprintf(out, "skipped jobId=%s reason=%q", skipped.JobID, skipped.Reason)
+		if skipped.Path != "" {
+			fmt.Fprintf(out, " path=%q", skipped.Path)
+		}
+		fmt.Fprintln(out)
+	}
+	return 0
+}
+
+type steeringProtocolClient interface {
+	Steer(context.Context, agentclient.JobSteerParams) (agentclient.JobSteerResult, error)
+}
+
+func (a *app) runSteer(ctx context.Context, args []string, stdin io.Reader, out, errOut io.Writer) int {
+	fs := newCommandFlagSet("steer", errOut)
+	jsonOut := fs.Bool("json", false, "emit the job.steer receipt as JSON")
+	jobID := fs.String("job", "", "job id")
+	messageID := fs.String("request-id", "", "caller-generated steering message id")
+	messageFile := fs.String("message-file", "", "file containing steering text, or - for stdin")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return usageError(errOut, "steer does not accept positional arguments")
+	}
+	if *jobID == "" || *messageID == "" || *messageFile == "" {
+		return usageError(errOut, "steer requires --job <id>, --request-id <messageId>, and --message-file <path|->")
+	}
+	message, err := readSteerMessage(*messageFile, stdin)
+	if err != nil {
+		return commandError(errOut, err)
+	}
+	client, err := a.connectProtocolClient(ctx)
+	if err != nil {
+		return protocolCommandError(errOut, "steer", err)
+	}
+	defer client.Close()
+	steerer, ok := client.(steeringProtocolClient)
+	if !ok {
+		return commandError(errOut, errors.New("connected client does not support job.steer"))
+	}
+	receipt, err := steerer.Steer(ctx, agentclient.JobSteerParams{JobID: *jobID, MessageID: *messageID, Text: message})
+	if err != nil {
+		return protocolCommandError(errOut, "steer", err)
+	}
+	if *jsonOut {
+		if code := writeOrError(out, errOut, receipt); code != 0 {
+			return code
+		}
+	} else {
+		fmt.Fprintf(out, "jobId=%s messageId=%s status=%s", receipt.JobID, receipt.MessageID, receipt.Status)
+		if receipt.Mechanism != "" {
+			fmt.Fprintf(out, " mechanism=%s", receipt.Mechanism)
+		}
+		if receipt.Reason != "" {
+			fmt.Fprintf(out, " reason=%s", receipt.Reason)
+		}
+		fmt.Fprintf(out, " deduplicated=%t\n", receipt.Deduplicated)
+	}
+	switch receipt.Status {
+	case protocol.SteerStatusAdmitted, protocol.SteerStatusDelivered:
+		return 0
+	case protocol.SteerStatusRejected:
+		return cliExitSteerRejected
+	case protocol.SteerStatusUnknown:
+		return cliExitSteerUnknown
+	default:
+		return commandError(errOut, fmt.Errorf("daemon returned invalid steering status %q", receipt.Status))
+	}
+}
+
+func readSteerMessage(path string, stdin io.Reader) (string, error) {
+	var source io.Reader
+	var file *os.File
+	if path == "-" {
+		source = stdin
+	} else {
+		opened, err := os.Open(path)
+		if err != nil {
+			return "", fmt.Errorf("open steering message file: %w", err)
+		}
+		file = opened
+		defer file.Close()
+		source = file
+	}
+	if source == nil {
+		return "", errors.New("stdin is unavailable for --message-file -")
+	}
+	message, err := io.ReadAll(io.LimitReader(source, 64*1024+1))
+	if err != nil {
+		return "", fmt.Errorf("read steering message: %w", err)
+	}
+	if len(message) > 64*1024 {
+		return "", errors.New("steering message exceeds 65536 bytes")
+	}
+	return string(message), nil
+}
+
 func (a *app) connectProtocolClient(ctx context.Context) (protocolClient, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -1013,8 +1196,11 @@ func (a *app) connectProtocolClient(ctx context.Context) (protocolClient, error)
 	return agentclient.Connect(ctx, opts)
 }
 
-func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, backend string, cleanup protocol.Cleanup, createdAt time.Time, failureClass protocol.FailureClass, contract *protocol.ContractVerdict, tags map[string]string, itemCount *int, lastItemAt, lastActivityAt *time.Time, liveness protocol.Liveness) {
-	fmt.Fprintf(out, "jobId=%s state=%s backend=%s cleanup=%s age=%s", jobID, state, backend, cleanup, jobAge(createdAt))
+func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, backend string, cleanup protocol.Cleanup, createdAt, queuedAt time.Time, failureClass protocol.FailureClass, contract *protocol.ContractVerdict, tags map[string]string, itemCount *int, lastItemAt, lastActivityAt *time.Time, liveness protocol.Liveness) {
+	if queuedAt.IsZero() {
+		queuedAt = createdAt
+	}
+	fmt.Fprintf(out, "jobId=%s state=%s backend=%s cleanup=%s queuedAt=%s age=%s", jobID, state, backend, cleanup, humanTime(queuedAt), jobAge(createdAt))
 	if failureClass != "" {
 		fmt.Fprintf(out, " failure.class=%s", failureClass)
 	}
@@ -1040,7 +1226,7 @@ func printJobSummary(out io.Writer, jobID string, state protocol.PublicState, ba
 }
 
 func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
-	printJobSummary(out, record.JobID, record.State, record.Backend, record.Cleanup, record.CreatedAt, "", nil, nil, nil, nil, nil, "")
+	printJobSummary(out, record.JobID, record.State, record.Backend, record.Cleanup, record.CreatedAt, record.QueuedAt, "", nil, nil, nil, nil, nil, "")
 	fmt.Fprintf(out, "createdAt=%s", humanTime(record.CreatedAt))
 	if record.StartedAt != nil {
 		fmt.Fprintf(out, " startedAt=%s", humanTime(*record.StartedAt))
@@ -1051,6 +1237,7 @@ func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
 	if record.Timeout != nil {
 		fmt.Fprintf(out, " timeout.effective=%d timeout.source=%s", record.Timeout.Effective, record.Timeout.Source)
 	}
+	fmt.Fprintf(out, " inputMode=%s", protocol.EffectiveInputMode(record.InputMode))
 	if record.Deadline != nil {
 		fmt.Fprintf(out, " deadline=%s", humanTime(*record.Deadline))
 	}
@@ -1102,7 +1289,19 @@ func printJobRecordStatus(out io.Writer, record agentclient.JobGetResult) {
 		printLogPathTruncationStatus(out, "stdout", record.LogPaths.Stdout, record.LogPaths.StdoutTruncated)
 		printLogPathTruncationStatus(out, "stderr", record.LogPaths.Stderr, record.LogPaths.StderrTruncated)
 	}
+	if record.Execution != nil {
+		if encoded, err := json.Marshal(record.Execution); err == nil {
+			fmt.Fprintf(out, " execution=%s", encoded)
+		}
+	}
 	fmt.Fprintln(out)
+	for _, steer := range record.Steers {
+		fmt.Fprintf(out, "steer.messageId=%s status=%s", steer.MessageID, steer.Status)
+		if steer.Mechanism != "" {
+			fmt.Fprintf(out, " mechanism=%s", steer.Mechanism)
+		}
+		fmt.Fprintf(out, " time=%s\n", humanTime(steer.Time))
+	}
 }
 
 func printLogPathTruncationStatus(out io.Writer, stream, path string, truncated *bool) {
@@ -1368,6 +1567,10 @@ func protocolCommandError(errOut io.Writer, operation string, err error) int {
 		return cliExitDaemonStartupFailure
 	}
 	var rpcErr *protocol.RPCError
+	if errors.As(err, &rpcErr) && rpcErr.Object.Data.Code == protocol.ErrorQueueFull {
+		fmt.Fprintf(errOut, "agentbus: %s: code=%s: %s\n", operation, rpcErr.Object.Data.Code, rpcErr.Object.Message)
+		return cliExitQueueFull
+	}
 	if errors.As(err, &rpcErr) && rpcErr.Object.Data.Code == protocol.ErrorUnknownJob {
 		jobID := rpcErr.Object.Data.JobID
 		if jobID == "" {
@@ -1400,11 +1603,13 @@ func printRootHelp(out io.Writer) {
   agentbus --help | -h | help
   agentbus version [--json] (aliases: --version, -version, -V)
   agentbus backends [--json]
-  agentbus serve [--foreground]
+  agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>] [--prune-interval 24h]
   agentbus status [--job <id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--limit <n>] [--before <cursor> | --all] [--json]
   agentbus transcript --job <id> [--follow] [--kind <kind>]... [--last <n>] [--since <rfc3339>] [--since-ordinal <n>] [--limit <n>] [--json]
   agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]
   agentbus cancel --job <id> [--json]
+  agentbus prune [--apply] [--successful-older-than 168h] [--failed-older-than 720h] [--json]
+  agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]
   agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]
 
 status and result use the same job.get record for a selected job. Their JSON
@@ -1413,12 +1618,15 @@ The status list defaults to 50 newest jobs; use --before with the returned
 nextCursor to continue, or --all for full history. Duration values require
 units: 2400 is ambiguous; use 2400s or 40m.
 
-Exit codes for a selected job:
+Exit codes for a selected job and protocol outcomes:
   completed=0, queued/running=2, completed-noncompliant=3, failed=4,
   timeout=5, interrupted=6, canceled=7, unknown-job=10,
   daemon-startup-failure=11, shutdown-deadline=13, unknown=14,
   result-artifact-unavailable=15: completed, but the authoritative result artifact is missing, unreadable, or does not match its recorded digest,
   observation-timeout=16: result observation expired; the job was not canceled
+  queue-full=19: submission rejected because the daemon's waiting queue is full
+
+Steering exit codes: rejected=17, delivery-unknown=18.
 `)
 }
 
