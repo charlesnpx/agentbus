@@ -30,7 +30,7 @@ func TestExecutionPostureByBackend(t *testing.T) {
 			write:   true,
 			want: protocol.ExecutionPosture{
 				Intent: "edit", SourceWritable: true, Scratch: "job-cache", Caches: writeCaches,
-				Network: "denied", GitMetadata: "writable", Enforcement: "os-sandbox",
+				Network: "denied", GitMetadata: "read-only", Enforcement: "os-sandbox",
 			},
 		},
 		{

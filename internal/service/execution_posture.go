@@ -50,11 +50,7 @@ func executionPosture(backend string, write bool, scratch string, caches map[str
 	case "codex":
 		posture.Enforcement = "os-sandbox"
 		posture.Network = "denied"
-		if write {
-			posture.GitMetadata = "writable"
-		} else {
-			posture.GitMetadata = "read-only"
-		}
+		posture.GitMetadata = "read-only"
 	case "cursor":
 		posture.Enforcement = "agent-permissions"
 		if write {

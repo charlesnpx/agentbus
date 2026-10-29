@@ -340,7 +340,7 @@ invalid_task_spec parameter error rather than a list request.
       "GOMODCACHE": "/home/user/go/pkg/mod"
     },
     "network": "denied",
-    "gitMetadata": "writable",
+    "gitMetadata": "read-only",
     "enforcement": "os-sandbox"
   },
   "finishedAt": "2026-08-20T12:00:05Z",
@@ -382,8 +382,10 @@ atomically with its starting transition. It contains intent (`inspect` or
 network policy, Git metadata access, and enforcement strength. The posture is
 descriptive: `sourceWritable` reports the selected mode, while `enforcement`
 identifies whether the backend uses an OS sandbox, agent permissions, or no
-filesystem boundary. startedAt, finishedAt, tags, result, contract, failure,
-and logPaths appear only when they apply.
+filesystem boundary. For Codex edit jobs using the `workspaceWrite` sandbox,
+`gitMetadata` is `read-only` because the granted writable roots do not include
+the Git metadata directory. startedAt, finishedAt, tags, result, contract,
+failure, and logPaths appear only when they apply.
 
 result exists only for a completed job with an authoritative result. Its
 resultPath, sha256, and bytes are required; text may be omitted when the result
