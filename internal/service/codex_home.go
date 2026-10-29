@@ -5,6 +5,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -18,9 +19,10 @@ import (
 
 var codexHomeLinkedFiles = []string{"auth.json", "config.toml"}
 
-// managedCodexHome records both the directory identity created for one job and
-// directory handles pinned to its original parents. Cleanup only removes a
-// leaf after it still resolves to this identity through the pinned parent.
+// managedCodexHome records the private per-job state directory identity and
+// directory handles pinned to its original parents. Writable jobs also keep
+// their scratch and caches in this leaf. Cleanup only removes it after it
+// still resolves to this identity through the pinned parent.
 type managedCodexHome struct {
 	path        string
 	name        string
@@ -31,10 +33,14 @@ type managedCodexHome struct {
 }
 
 type jobCachePaths struct {
-	root    string
-	goBuild string
-	goMod   string
-	tmp     string
+	root     string
+	goBuild  string
+	tmp      string
+	npm      string
+	corepack string
+	xdg      string
+	pnpm     string
+	yarn     string
 }
 
 func (home *managedCodexHome) close() {
@@ -121,13 +127,12 @@ func (s *Server) prepareCodexHome(layout engine.WorkspaceLayout, jobID string) (
 	return path, managed, nil
 }
 
-// prepareCodexJobCache creates the private Go cache and temporary directories
-// inside the accepted job's managed Codex state leaf. It runs before the
-// adapter starts an app-server process, so toolchains never race directory
-// creation under their sandbox.
-func prepareCodexJobCache(layout engine.WorkspaceLayout, jobID string, managed *managedCodexHome) (jobCachePaths, *managedCodexHome, error) {
+// prepareJobCache creates private scratch and build-tool cache directories
+// inside the accepted job's managed state leaf. It runs before the adapter
+// starts so tools never race directory creation under their sandbox.
+func prepareJobCache(layout engine.WorkspaceLayout, jobID string, managed *managedCodexHome) (jobCachePaths, *managedCodexHome, error) {
 	if jobID == "" || filepath.Base(jobID) != jobID || jobID == "." || jobID == ".." {
-		return jobCachePaths{}, managed, fmt.Errorf("invalid Codex job directory name")
+		return jobCachePaths{}, managed, fmt.Errorf("invalid job cache directory name")
 	}
 	if managed == nil {
 		var err error
@@ -137,24 +142,28 @@ func prepareCodexJobCache(layout engine.WorkspaceLayout, jobID string, managed *
 		}
 	}
 	if managed.directoryFD < 0 {
-		return jobCachePaths{}, managed, errors.New("managed Codex job directory is unavailable")
+		return jobCachePaths{}, managed, errors.New("managed job cache directory is unavailable")
 	}
 	root, err := filepath.Abs(managed.path)
 	if err != nil {
-		return jobCachePaths{}, managed, fmt.Errorf("resolve managed Codex job cache path: %w", err)
+		return jobCachePaths{}, managed, fmt.Errorf("resolve managed job cache path: %w", err)
 	}
 	paths := jobCachePaths{
-		root:    root,
-		goBuild: filepath.Join(root, "cache", "go-build"),
-		goMod:   filepath.Join(root, "cache", "go-mod"),
-		tmp:     filepath.Join(root, "tmp"),
+		root:     root,
+		goBuild:  filepath.Join(root, "cache", "go-build"),
+		tmp:      filepath.Join(root, "tmp"),
+		npm:      filepath.Join(root, "cache", "npm"),
+		corepack: filepath.Join(root, "cache", "corepack"),
+		xdg:      filepath.Join(root, "cache", "xdg"),
+		pnpm:     filepath.Join(root, "cache", "pnpm"),
+		yarn:     filepath.Join(root, "cache", "yarn"),
 	}
 	cacheFD, err := createManagedDirectory(managed.directoryFD, "cache")
 	if err != nil {
 		return paths, managed, err
 	}
 	defer unix.Close(cacheFD)
-	for _, name := range []string{"go-build", "go-mod"} {
+	for _, name := range []string{"go-build", "npm", "corepack", "xdg", "pnpm", "yarn"} {
 		directoryFD, err := createManagedDirectory(cacheFD, name)
 		if err != nil {
 			return paths, managed, err
@@ -171,15 +180,15 @@ func prepareCodexJobCache(layout engine.WorkspaceLayout, jobID string, managed *
 
 func createManagedDirectory(parentFD int, name string) (int, error) {
 	if err := unix.Mkdirat(parentFD, name, 0o700); err != nil {
-		return -1, fmt.Errorf("create managed Codex job directory %s: %w", name, err)
+		return -1, fmt.Errorf("create managed job cache directory %s: %w", name, err)
 	}
 	directoryFD, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return -1, fmt.Errorf("open managed Codex job directory %s: %w", name, err)
+		return -1, fmt.Errorf("open managed job cache directory %s: %w", name, err)
 	}
 	if err := unix.Fchmod(directoryFD, 0o700); err != nil {
 		_ = unix.Close(directoryFD)
-		return -1, fmt.Errorf("secure managed Codex job directory %s: %w", name, err)
+		return -1, fmt.Errorf("secure managed job cache directory %s: %w", name, err)
 	}
 	return directoryFD, nil
 }
@@ -398,9 +407,9 @@ func linkManagedCodexHomeFile(sourceHome string, destination *managedCodexHome, 
 	return nil
 }
 
-// finalizeManagedCodexHome executes cleanup before committing the terminal
-// record, so a failed identity-checked removal is reflected on the independent
-// cleanup axis without rewriting a known result or public state.
+// finalizeManagedCodexHome executes cleanup after the terminal record is
+// committed, so a failed terminal write can never remove a session home still
+// named by the record.
 func finalizeManagedCodexHome(home *managedCodexHome, record jobstore.Record, cleanup protocol.Cleanup, diagnostics []string) (protocol.Cleanup, []string) {
 	if home == nil {
 		return cleanup, diagnostics
@@ -486,12 +495,10 @@ func removeManagedCodexHomeContents(directoryFD int) error {
 			if err != nil {
 				return err
 			}
-			// Go creates module-cache directories mode 0555, and unlinking an
-			// entry requires write permission on the directory that contains it,
-			// so a populated GOMODCACHE would otherwise be undeletable and retain
-			// the whole job leaf forever. Restore owner write on the descriptor we
-			// already opened and identity-checked, so containment does not depend
-			// on re-resolving the path.
+			// Unlinking an entry requires write permission on the directory that
+			// contains it. Restore owner write on the descriptor we already opened
+			// and identity-checked, so cleanup does not depend on re-resolving the
+			// path.
 			if err := unix.Fchmod(childFD, 0o700); err != nil {
 				closeErr := unix.Close(childFD)
 				if closeErr != nil {
@@ -517,6 +524,183 @@ func removeManagedCodexHomeContents(directoryFD int) error {
 		}
 	}
 	return nil
+}
+
+// openExistingManagedDirectory opens a descendant directory through pinned
+// descriptors without creating or following any component.
+func openExistingManagedDirectory(root string, components ...string) (int, error) {
+	rootFD, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	currentFD := rootFD
+	for _, component := range components {
+		if component == "" || component == "." || component == ".." || strings.ContainsRune(component, filepath.Separator) {
+			_ = unix.Close(currentFD)
+			return -1, errors.New("invalid managed directory component")
+		}
+		nextFD, openErr := unix.Openat(currentFD, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		_ = unix.Close(currentFD)
+		if openErr != nil {
+			return -1, openErr
+		}
+		currentFD = nextFD
+	}
+	return currentFD, nil
+}
+
+func openExistingManagedCodexHomeParent(layout engine.WorkspaceLayout) (int, error) {
+	return openExistingManagedDirectory(layout.Root, "workspaces", layout.Key, "codex")
+}
+
+func openManagedDirectoryAt(parentFD int, name string) (int, error) {
+	if name == "" || name == "." || name == ".." || strings.ContainsRune(name, filepath.Separator) {
+		return -1, errors.New("invalid managed directory name")
+	}
+	directoryFD, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	var named, opened unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		_ = unix.Close(directoryFD)
+		return -1, err
+	}
+	if err := unix.Fstat(directoryFD, &opened); err != nil {
+		_ = unix.Close(directoryFD)
+		return -1, err
+	}
+	if named.Mode&unix.S_IFMT != unix.S_IFDIR || named.Dev != opened.Dev || named.Ino != opened.Ino {
+		_ = unix.Close(directoryFD)
+		return -1, errors.New("managed directory identity mismatch")
+	}
+	return directoryFD, nil
+}
+
+func measureManagedCodexHomeContents(directoryFD int, remaining *int) (int64, error) {
+	copyFD, err := unix.Dup(directoryFD)
+	if err != nil {
+		return 0, err
+	}
+	directory := os.NewFile(uintptr(copyFD), "managed Codex artifact")
+	defer directory.Close()
+	var total int64
+	for {
+		entries, readErr := directory.ReadDir(256)
+		for _, entry := range entries {
+			*remaining--
+			if *remaining < 0 {
+				return 0, errors.New("managed artifact exceeds the per-sweep entry limit")
+			}
+			var stat unix.Stat_t
+			if err := unix.Fstatat(directoryFD, entry.Name(), &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+				return 0, err
+			}
+			if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
+				childFD, err := openManagedDirectoryAt(directoryFD, entry.Name())
+				if err != nil {
+					return 0, err
+				}
+				childBytes, measureErr := measureManagedCodexHomeContents(childFD, remaining)
+				closeErr := unix.Close(childFD)
+				if measureErr != nil {
+					return 0, measureErr
+				}
+				if closeErr != nil {
+					return 0, closeErr
+				}
+				total += childBytes
+			} else if stat.Mode&unix.S_IFMT == unix.S_IFREG {
+				total += stat.Size
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return total, nil
+		}
+		if readErr != nil {
+			return 0, readErr
+		}
+	}
+}
+
+func removeManagedCodexHomeChild(parentFD int, name string) error {
+	directoryFD, err := openManagedDirectoryAt(parentFD, name)
+	if err != nil {
+		return err
+	}
+	if err := unix.Fchmod(directoryFD, 0o700); err != nil {
+		_ = unix.Close(directoryFD)
+		return err
+	}
+	if err := removeManagedCodexHomeContents(directoryFD); err != nil {
+		_ = unix.Close(directoryFD)
+		return err
+	}
+	var named, opened unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		_ = unix.Close(directoryFD)
+		return err
+	}
+	if err := unix.Fstat(directoryFD, &opened); err != nil {
+		_ = unix.Close(directoryFD)
+		return err
+	}
+	if named.Mode&unix.S_IFMT != unix.S_IFDIR || named.Dev != opened.Dev || named.Ino != opened.Ino {
+		_ = unix.Close(directoryFD)
+		return errors.New("managed artifact identity changed before removal")
+	}
+	if err := unix.Close(directoryFD); err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(parentFD, name, unix.AT_REMOVEDIR); err != nil {
+		return fmt.Errorf("remove managed artifact directory: %w", err)
+	}
+	return nil
+}
+
+func managedRegularFileSize(parentFD int, name string) (int64, bool, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return 0, false, errors.New("artifact is not a regular file")
+	}
+	return stat.Size, true, nil
+}
+
+func removeManagedRegularFile(parentFD int, name string) (int64, error) {
+	fileFD, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, err
+	}
+	var opened, named unix.Stat_t
+	if err := unix.Fstat(fileFD, &opened); err != nil {
+		_ = unix.Close(fileFD)
+		return 0, err
+	}
+	if opened.Mode&unix.S_IFMT != unix.S_IFREG {
+		_ = unix.Close(fileFD)
+		return 0, errors.New("artifact is not a regular file")
+	}
+	if err := unix.Fstatat(parentFD, name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		_ = unix.Close(fileFD)
+		return 0, err
+	}
+	if named.Mode&unix.S_IFMT != unix.S_IFREG || named.Dev != opened.Dev || named.Ino != opened.Ino {
+		_ = unix.Close(fileFD)
+		return 0, errors.New("artifact identity changed before removal")
+	}
+	if err := unix.Close(fileFD); err != nil {
+		return 0, err
+	}
+	if err := unix.Unlinkat(parentFD, name, 0); err != nil {
+		return 0, err
+	}
+	return opened.Size, nil
 }
 
 func (s *Server) rememberManagedCodexHome(jobID string, home *managedCodexHome) {
@@ -550,4 +734,17 @@ func (s *Server) closeManagedCodexHome(jobID string) {
 	if home := s.takeManagedCodexHome(jobID); home != nil {
 		home.close()
 	}
+}
+
+// discardManagedCodexHome removes a prepared per-job state leaf when the job
+// is canceled or cannot commit its starting transition before a backend runs.
+func (s *Server) discardManagedCodexHome(jobID string) {
+	home := s.takeManagedCodexHome(jobID)
+	if home == nil {
+		return
+	}
+	if err := removeManagedCodexHome(home); err != nil {
+		log.Printf("agentbus service: discard managed job state %s: %v", home.path, err)
+	}
+	home.close()
 }

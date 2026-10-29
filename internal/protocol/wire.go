@@ -17,18 +17,21 @@ const (
 	MethodJobList = "job.list"
 	// MethodJobTranscript retrieves the captured transcript for one job.
 	MethodJobTranscript = "job.transcript"
+	// MethodArtifactsPrune removes eligible Agentbus-owned diagnostic artifacts.
+	MethodArtifactsPrune = "artifacts.prune"
 	// MethodJobSteer submits one in-flight instruction to an active steerable job.
 	MethodJobSteer = "job.steer"
 )
 
 // The protocol error codes are the only codes protocol.hello, job.submit, job.get,
-// job.list, job.transcript, job.cancel, and job.steer may produce.
+// job.list, job.transcript, job.cancel, job.steer, and artifacts.prune may produce.
 const (
 	ErrorUnauthorized       = "unauthorized"
 	ErrorVersionMismatch    = "protocol_version_mismatch"
 	ErrorMethodNotFound     = "method_not_found"
 	ErrorBackendUnavailable = "backend_unavailable"
 	ErrorInvalidTaskSpec    = "invalid_task_spec"
+	ErrorQueueFull          = "queue_full"
 	ErrorUnknownJob         = "unknown_job"
 )
 
@@ -116,6 +119,7 @@ const (
 	FailureClassTimeout        FailureClass = "timeout"
 	FailureClassInterrupted    FailureClass = "interrupted"
 	FailureClassInternal       FailureClass = "internal"
+	FailureClassStorage        FailureClass = "storage"
 )
 
 // Valid reports whether class is one of the protocol v3 failure categories.
@@ -129,7 +133,8 @@ func (class FailureClass) Valid() bool {
 		FailureClassBackendError,
 		FailureClassTimeout,
 		FailureClassInterrupted,
-		FailureClassInternal:
+		FailureClassInternal,
+		FailureClassStorage:
 		return true
 	default:
 		return false
@@ -337,12 +342,48 @@ type TranscriptItem struct {
 type JobTranscriptResult struct {
 	State     PublicState      `json:"state"`
 	Liveness  Liveness         `json:"liveness,omitempty"`
+	Pruned    bool             `json:"pruned,omitempty"`
 	ItemCount int              `json:"itemCount"`
 	Counts    map[string]int   `json:"counts"`
 	FirstAt   *time.Time       `json:"firstAt,omitempty"`
 	LastAt    *time.Time       `json:"lastAt,omitempty"`
 	Items     []TranscriptItem `json:"items"`
 	Gap       bool             `json:"gap"`
+}
+
+// ArtifactsPruneParams configures a dry-run or apply pass over owned
+// diagnostic artifacts. Thresholds use time.ParseDuration syntax.
+type ArtifactsPruneParams struct {
+	DryRun              *bool  `json:"dryRun,omitempty"`
+	SuccessfulOlderThan string `json:"successfulOlderThan,omitempty"`
+	FailedOlderThan     string `json:"failedOlderThan,omitempty"`
+}
+
+// PruneItem identifies one owned artifact selected or removed by a prune pass.
+type PruneItem struct {
+	JobID string `json:"jobId"`
+	Kind  string `json:"kind"`
+	Path  string `json:"path"`
+	Bytes int64  `json:"bytes"`
+}
+
+// PruneSkip identifies a job or artifact that could not be safely pruned.
+type PruneSkip struct {
+	JobID  string `json:"jobId"`
+	Path   string `json:"path,omitempty"`
+	Reason string `json:"reason"`
+}
+
+// ArtifactsPruneResult reports selected or removed items and retained items.
+type ArtifactsPruneResult struct {
+	DryRun              bool        `json:"dryRun"`
+	SuccessfulOlderThan string      `json:"successfulOlderThan"`
+	FailedOlderThan     string      `json:"failedOlderThan"`
+	WouldRemove         []PruneItem `json:"wouldRemove"`
+	Removed             []PruneItem `json:"removed"`
+	Skipped             []PruneSkip `json:"skipped"`
+	WouldRemoveBytes    int64       `json:"wouldRemoveBytes"`
+	RemovedBytes        int64       `json:"removedBytes"`
 }
 
 // JobCancelParams is the parameter object for job.cancel.
@@ -372,16 +413,33 @@ type JobRecordWire struct {
 	State         PublicState               `json:"state"`
 	Tags          map[string]string         `json:"tags,omitempty"`
 	CreatedAt     time.Time                 `json:"createdAt"`
+	QueuedAt      time.Time                 `json:"queuedAt"`
 	StartedAt     *time.Time                `json:"startedAt,omitempty"`
 	FinishedAt    *time.Time                `json:"finishedAt,omitempty"`
 	Timeout       *engine.TimeoutResolution `json:"timeout,omitempty"`
 	Result        *ResultInfoWire           `json:"result,omitempty"`
 	Contract      *ContractResult           `json:"contract,omitempty"`
 	Failure       *JobFailureWire           `json:"failure,omitempty"`
+	Diagnostics   []string                  `json:"diagnostics,omitempty"`
 	Cleanup       Cleanup                   `json:"cleanup"`
+	LogsPruned    bool                      `json:"logsPruned,omitempty"`
 	LogPaths      *LogPathsWire             `json:"logPaths,omitempty"`
 	ModelReported string                    `json:"modelReported,omitempty"`
+	Execution     *ExecutionPosture         `json:"execution,omitempty"`
 	Steers        []SteerSummaryWire        `json:"steers"`
+}
+
+// ExecutionPosture records the requested source access and the backend
+// enforcement and scratch/cache paths selected when a job starts. It is
+// descriptive; it does not negotiate or expand backend capabilities.
+type ExecutionPosture struct {
+	Intent         string            `json:"intent"`
+	SourceWritable bool              `json:"sourceWritable"`
+	Scratch        string            `json:"scratch,omitempty"`
+	Caches         map[string]string `json:"caches,omitempty"`
+	Network        string            `json:"network"`
+	GitMetadata    string            `json:"gitMetadata"`
+	Enforcement    string            `json:"enforcement"`
 }
 
 // JobSummaryWire is the compact item returned when job.list lists jobs. It
@@ -400,6 +458,8 @@ type JobSummaryWire struct {
 	Cleanup Cleanup `json:"cleanup"`
 	// CreatedAt reports when the job was created.
 	CreatedAt time.Time `json:"createdAt"`
+	// QueuedAt reports when the job entered the daemon queue.
+	QueuedAt time.Time `json:"queuedAt"`
 	// UpdatedAt reports when the job was last updated.
 	UpdatedAt time.Time `json:"updatedAt"`
 	// ModelReported is the model reported by the backend, when available.

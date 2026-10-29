@@ -979,6 +979,13 @@ func (c *Client) JobCancel(ctx context.Context, params JobCancelParams) (JobCanc
 	return out, err
 }
 
+// ArtifactsPrune previews or removes eligible Agentbus-owned artifacts.
+func (c *Client) ArtifactsPrune(ctx context.Context, params ArtifactsPruneParams) (ArtifactsPruneResult, error) {
+	var out ArtifactsPruneResult
+	err := c.do(ctx, protocol.MethodArtifactsPrune, params, &out)
+	return out, err
+}
+
 func mustMarshal(v any) json.RawMessage {
 	b, err := json.Marshal(v)
 	if err != nil {

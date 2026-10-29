@@ -4,7 +4,7 @@ Agentbus protocol version 3 is a JSON-RPC 2.0 service over a local,
 newline-delimited Unix socket. Each frame is one JSON object followed by a
 newline. The daemon accepts only protocol version 3.
 
-The wire surface has seven methods:
+The wire surface has eight methods:
 
 | Method | Purpose |
 | --- | --- |
@@ -14,6 +14,7 @@ The wire surface has seven methods:
 | job.list | List compact job summaries with optional workspace, tag, and state filters. |
 | job.transcript | Return a stateless digest and selected captured items for one job. |
 | job.cancel | Request cancellation of one job. |
+| artifacts.prune | Preview or remove eligible Agentbus-owned diagnostic artifacts. |
 | job.steer | Submit one bounded follow-up instruction to an active steerable job. |
 
 A client must call protocol.hello successfully before any other method on the
@@ -59,6 +60,7 @@ Agentbus errors. The stable data.code values are:
 | method_not_found | The requested method is not part of the version-3 surface. |
 | backend_unavailable | The daemon cannot use the requested backend or its job store. |
 | invalid_task_spec | Parameters, identity, task specification, or inline schema are invalid. |
+| queue_full | The new submission would exceed the daemon's bounded waiting queue. |
 | unknown_job | No job has the requested jobId. |
 
 jobId is included when the error relates to a known or requested job. Clients
@@ -93,7 +95,10 @@ available model and effort metadata:
 
 Submission has a compound identity. A matching replay returns the existing job
 without launching it again. Reusing the same identity with a different task
-specification is rejected.
+specification is rejected. A new submission that exceeds the daemon's bounded
+waiting queue returns `queue_full`; matching deduplicated submissions are not
+new queue entries. Execution timeouts begin when the daemon reserves an
+execution slot, not when the job is submitted.
 
 ~~~json
 {
@@ -205,6 +210,7 @@ The result contains compact summaries:
       "tags": {"team": "core"},
       "cleanup": "clean",
       "createdAt": "2026-08-20T12:00:00Z",
+      "queuedAt": "2026-08-20T12:00:00Z",
       "updatedAt": "2026-08-20T12:00:01Z",
       "failureClass": "backend_error",
       "contract": {
@@ -220,10 +226,11 @@ The result contains compact summaries:
 }
 ~~~
 
-Each summary always contains jobId, backend, state, cleanup, createdAt, and
-updatedAt. tags, modelReported, failureClass, and contract appear when
-applicable. tags is the submitted tag map, allowing a caller to see why a tag
-filter matched.
+Each summary always contains jobId, backend, state, cleanup, createdAt,
+queuedAt, and updatedAt. queuedAt is the time the job entered the queue;
+startedAt on job.get shows when the durable running transition was recorded. tags,
+modelReported, failureClass, and contract appear when applicable. tags is the
+submitted tag map, allowing a caller to see why a tag filter matched.
 
 itemCount and liveness appear only while this daemon has an active execution
 for that job. lastItemAt appears after that active execution has assembled an
@@ -333,6 +340,33 @@ more activity. A sidecar captured before completion receipts existed has no
 receipt and is therefore reported as a gapped prefix, because its completeness
 cannot be established.
 
+When Agentbus has deliberately removed a job's log sidecars, the result also
+includes `pruned: true` and an empty transcript. This distinguishes retention
+cleanup from a sidecar that was never created or is unexpectedly missing.
+
+## artifacts.prune
+
+This method previews eligible artifact cleanup by default. `dryRun` may be
+omitted (equivalent to `true`) or set to `false` to apply the cleanup.
+Thresholds use Go duration syntax and default to `168h` for completed jobs and
+`720h` for failed, canceled, or unknown jobs.
+
+~~~json
+{
+  "dryRun": true,
+  "successfulOlderThan": "168h",
+  "failedOlderThan": "720h"
+}
+~~~
+
+The result contains `wouldRemove` and `wouldRemoveBytes` for a dry-run,
+`removed` and `removedBytes` after an apply pass, and `skipped` entries with a
+job ID, optional path, and reason. The method removes only clean terminal jobs'
+raw log sidecars and Agentbus-created Codex `cache`/`tmp` directories after the
+age threshold for their state. Retained sessions, resumable sessions, resume
+targets of non-terminal jobs, and all other unsafe or ineligible paths are
+skipped. Job records, request identity, and result artifacts are preserved.
+
 ## job.get
 
 job.get requires a non-empty jobId. An empty parameter object is an
@@ -352,8 +386,22 @@ invalid_task_spec parameter error rather than a list request.
   "steers": [],
   "state": "completed",
   "cleanup": "clean",
+  "logsPruned": true,
   "createdAt": "2026-08-20T12:00:00Z",
+  "queuedAt": "2026-08-20T12:00:00Z",
   "startedAt": "2026-08-20T12:00:01Z",
+  "execution": {
+    "intent": "edit",
+    "sourceWritable": true,
+    "scratch": "/state-root/workspaces/key/codex/job_id",
+    "caches": {
+      "GOCACHE": "/state-root/workspaces/key/codex/job_id/cache/go-build",
+      "GOMODCACHE": "/home/user/go/pkg/mod"
+    },
+    "network": "denied",
+    "gitMetadata": "read-only",
+    "enforcement": "os-sandbox"
+  },
   "finishedAt": "2026-08-20T12:00:05Z",
   "timeout": {
     "effective": 1800000,
@@ -387,11 +435,20 @@ invalid_task_spec parameter error rather than a list request.
 ~~~
 
 jobId, workspaceKey, requestId, backend, inputMode, state, cleanup, createdAt,
-timeout, and steers are always present. Older stored jobs without inputMode
+queuedAt, timeout, and steers are always present. Older stored jobs without inputMode
 project as `fixed`; steers is an empty array when there are no steering
 receipts. Each steer summary contains messageId, status, mechanism, and time;
-mechanism is empty unless delivery was confirmed. startedAt, finishedAt, tags,
-result, contract, failure, and logPaths appear only when they apply.
+mechanism is empty unless delivery was confirmed. `execution` appears after the job starts and is recorded
+atomically with its starting transition. It contains intent (`inspect` or
+`edit`), the selected source write mode, optional scratch and cache paths,
+network policy, Git metadata access, and enforcement strength. The posture is
+descriptive: `sourceWritable` reports the selected mode, while `enforcement`
+identifies whether the backend uses an OS sandbox, agent permissions, or no
+filesystem boundary. For Codex edit jobs using the `workspaceWrite` sandbox,
+`gitMetadata` is `read-only` because the granted writable roots do not include
+the Git metadata directory. startedAt, finishedAt, tags, result, contract,
+failure, and logPaths appear only when they apply. `logsPruned` is true after
+the daemon removes this job's raw log sidecars.
 
 result exists only for a completed job with an authoritative result. Its
 resultPath, sha256, and bytes are required; text may be omitted when the result
