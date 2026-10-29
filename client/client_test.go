@@ -391,6 +391,34 @@ func TestJobTranscriptReflectWalksEveryTranscriptField(t *testing.T) {
 	assertReflectDecoded(t, reflect.ValueOf(want), reflect.ValueOf(got), "job.transcript result")
 }
 
+func TestArtifactsPruneSendsTypedRequestAndReadsResult(t *testing.T) {
+	dryRun := false
+	params := ArtifactsPruneParams{
+		DryRun:              &dryRun,
+		SuccessfulOlderThan: "168h",
+		FailedOlderThan:     "720h",
+	}
+	want := reflectPopulatedValue[ArtifactsPruneResult](t)
+	client, requests, done := newOneShotClient(t, protocol.Response{Result: want})
+	got, err := client.ArtifactsPrune(context.Background(), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := <-requests
+	if request.Method != protocol.MethodArtifactsPrune {
+		t.Fatalf("method = %q, want %q", request.Method, protocol.MethodArtifactsPrune)
+	}
+	var gotParams ArtifactsPruneParams
+	if err := json.Unmarshal(request.Params, &gotParams); err != nil {
+		t.Fatalf("decode artifacts.prune params: %v", err)
+	}
+	if !reflect.DeepEqual(gotParams, params) {
+		t.Fatalf("artifacts.prune params = %#v, want %#v", gotParams, params)
+	}
+	assertOneShotClientDone(t, done)
+	assertReflectDecoded(t, reflect.ValueOf(want), reflect.ValueOf(got), "artifacts.prune result")
+}
+
 func TestJobGetEmptyIDReturnsTypedRPCError(t *testing.T) {
 	client, requests, done := newOneShotClient(t, protocol.Response{Error: protocol.NewError(
 		protocol.ErrorInvalidTaskSpec,

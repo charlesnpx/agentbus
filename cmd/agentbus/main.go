@@ -62,6 +62,7 @@ type protocolClient interface {
 	JobList(context.Context, agentclient.JobListParams) (agentclient.JobListResult, error)
 	JobTranscript(context.Context, agentclient.JobTranscriptParams) (agentclient.JobTranscriptResult, error)
 	JobCancel(context.Context, agentclient.JobCancelParams) (agentclient.JobCancelResult, error)
+	ArtifactsPrune(context.Context, agentclient.ArtifactsPruneParams) (agentclient.ArtifactsPruneResult, error)
 	Close() error
 }
 
@@ -150,6 +151,8 @@ func (a *app) run(ctx context.Context, args []string, stdin io.Reader, out, errO
 		return a.runResult(ctx, args[1:], out, errOut)
 	case "cancel":
 		return a.runCancel(ctx, args[1:], out, errOut)
+	case "prune":
+		return a.runPrune(ctx, args[1:], out, errOut)
 	case "steer":
 		return a.runSteer(ctx, args[1:], stdin, out, errOut)
 	case "configure-codex-sandbox":
@@ -220,6 +223,7 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 	maxJobs := fs.Int("max-jobs", 4, "maximum concurrent jobs across all backends (positive integer)")
 	maxJobsPerBackend := fs.Int("max-jobs-per-backend", 2, "maximum concurrent jobs per backend (positive integer)")
 	maxQueued := fs.Int("max-queued", 64, "maximum waiting jobs before submissions are rejected (positive integer)")
+	pruneInterval := fs.Duration("prune-interval", 0, "run the owned-artifact retention sweep at this interval (default off)")
 	if code, ok := parseFlags(fs, args); !ok {
 		return code
 	}
@@ -229,8 +233,11 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 	if *maxJobs <= 0 || *maxJobsPerBackend <= 0 || *maxQueued <= 0 {
 		return usageError(errOut, "--max-jobs, --max-jobs-per-backend, and --max-queued must be positive integers")
 	}
+	if *pruneInterval < 0 {
+		return usageError(errOut, "--prune-interval cannot be negative")
+	}
 	if !*foreground {
-		if err := a.startBackgroundDaemon(ctx, *maxJobs, *maxJobsPerBackend, *maxQueued); err != nil {
+		if err := a.startBackgroundDaemon(ctx, *maxJobs, *maxJobsPerBackend, *maxQueued, *pruneInterval); err != nil {
 			return protocolCommandError(errOut, "serve", err)
 		}
 		return 0
@@ -247,6 +254,7 @@ func (a *app) runServe(ctx context.Context, args []string, errOut io.Writer) int
 		MaxJobs:           *maxJobs,
 		MaxJobsPerBackend: *maxJobsPerBackend,
 		MaxQueued:         *maxQueued,
+		PruneInterval:     *pruneInterval,
 	})
 	if err != nil {
 		return serveCommandError(errOut, err)
@@ -261,7 +269,7 @@ func codexHomeSettings() (override string, inherit bool, authHome string) {
 		strings.TrimSpace(os.Getenv("CODEX_HOME"))
 }
 
-func (a *app) startBackgroundDaemon(ctx context.Context, maxJobs, maxJobsPerBackend, maxQueued int) error {
+func (a *app) startBackgroundDaemon(ctx context.Context, maxJobs, maxJobsPerBackend, maxQueued int, pruneInterval time.Duration) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -270,17 +278,21 @@ func (a *app) startBackgroundDaemon(ctx context.Context, maxJobs, maxJobsPerBack
 	if a.daemonLauncher != nil {
 		launcher = a.daemonLauncher
 	}
+	args := []string{
+		"serve", "--foreground",
+		"--max-jobs", strconv.Itoa(maxJobs),
+		"--max-jobs-per-backend", strconv.Itoa(maxJobsPerBackend),
+		"--max-queued", strconv.Itoa(maxQueued),
+	}
+	if pruneInterval > 0 {
+		args = append(args, "--prune-interval", pruneInterval.String())
+	}
 	result, err := launcher(ctx, daemonlaunch.Options{
 		CommandPath: exe,
-		Args: []string{
-			"serve", "--foreground",
-			"--max-jobs", strconv.Itoa(maxJobs),
-			"--max-jobs-per-backend", strconv.Itoa(maxJobsPerBackend),
-			"--max-queued", strconv.Itoa(maxQueued),
-		},
-		StateRoot: a.stateRoot,
-		Timeout:   daemonlaunch.DefaultTimeout,
-		Starter:   startDaemonProcess,
+		Args:        args,
+		StateRoot:   a.stateRoot,
+		Timeout:     daemonlaunch.DefaultTimeout,
+		Starter:     startDaemonProcess,
 	})
 	if err != nil {
 		return err
@@ -583,7 +595,11 @@ func printJobTranscript(out io.Writer, transcript agentclient.JobTranscriptResul
 	if transcript.Liveness != "" {
 		fmt.Fprintf(out, " liveness=%s", transcript.Liveness)
 	}
-	fmt.Fprintf(out, " gap=%t\n", transcript.Gap)
+	fmt.Fprintf(out, " gap=%t", transcript.Gap)
+	if transcript.Pruned {
+		fmt.Fprint(out, " pruned=true")
+	}
+	fmt.Fprintln(out)
 	if digest {
 		fmt.Fprintf(out, "counts message=%d reasoning=%d tool=%d toolResult=%d fileChange=%d warning=%d error=%d\n",
 			transcript.Counts["message"],
@@ -952,6 +968,60 @@ func (a *app) runCancel(ctx context.Context, args []string, out, errOut io.Write
 		fmt.Fprintf(out, "jobId=%s state=%s\n", result.JobID, result.State)
 	}
 	return cliExitCodeForRecord(record)
+}
+
+func (a *app) runPrune(ctx context.Context, args []string, out, errOut io.Writer) int {
+	fs := newCommandFlagSet("prune", errOut)
+	apply := fs.Bool("apply", false, "delete eligible artifacts (default is dry-run)")
+	successfulAge := fs.Duration("successful-older-than", 168*time.Hour, "minimum age for completed jobs")
+	failedAge := fs.Duration("failed-older-than", 720*time.Hour, "minimum age for failed, canceled, or unknown jobs")
+	jsonOut := fs.Bool("json", false, "emit the artifacts.prune response")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return usageError(errOut, "prune does not accept positional arguments")
+	}
+	if *successfulAge <= 0 || *failedAge <= 0 {
+		return usageError(errOut, "prune age thresholds must be greater than zero")
+	}
+	client, err := a.connectProtocolClient(ctx)
+	if err != nil {
+		return protocolCommandError(errOut, "prune", err)
+	}
+	defer client.Close()
+	dryRun := !*apply
+	result, err := client.ArtifactsPrune(ctx, agentclient.ArtifactsPruneParams{
+		DryRun:              &dryRun,
+		SuccessfulOlderThan: successfulAge.String(),
+		FailedOlderThan:     failedAge.String(),
+	})
+	if err != nil {
+		return protocolCommandError(errOut, "prune", err)
+	}
+	if *jsonOut {
+		return writeOrError(out, errOut, result)
+	}
+	mode := "apply"
+	if result.DryRun {
+		mode = "dry-run"
+	}
+	fmt.Fprintf(out, "mode=%s successfulOlderThan=%s failedOlderThan=%s wouldRemoveBytes=%d removedBytes=%d\n",
+		mode, result.SuccessfulOlderThan, result.FailedOlderThan, result.WouldRemoveBytes, result.RemovedBytes)
+	for _, item := range result.WouldRemove {
+		fmt.Fprintf(out, "would-remove jobId=%s kind=%s bytes=%d path=%q\n", item.JobID, item.Kind, item.Bytes, item.Path)
+	}
+	for _, item := range result.Removed {
+		fmt.Fprintf(out, "removed jobId=%s kind=%s bytes=%d path=%q\n", item.JobID, item.Kind, item.Bytes, item.Path)
+	}
+	for _, skipped := range result.Skipped {
+		fmt.Fprintf(out, "skipped jobId=%s reason=%q", skipped.JobID, skipped.Reason)
+		if skipped.Path != "" {
+			fmt.Fprintf(out, " path=%q", skipped.Path)
+		}
+		fmt.Fprintln(out)
+	}
+	return 0
 }
 
 type steeringProtocolClient interface {
@@ -1427,11 +1497,12 @@ func printRootHelp(out io.Writer) {
 	fmt.Fprint(out, `Usage:
   agentbus --help | -h | help
   agentbus version [--json] (aliases: --version, -version, -V)
-  agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>]
+  agentbus serve [--foreground] [--max-jobs <n>] [--max-jobs-per-backend <n>] [--max-queued <n>] [--prune-interval 24h]
   agentbus status [--job <id>] [--workspace-key <key>] [--tag <key=value>] [--state <state>] [--limit <n>] [--before <cursor> | --all] [--json]
   agentbus transcript --job <id> [--follow] [--kind <kind>]... [--last <n>] [--since <rfc3339>] [--since-ordinal <n>] [--limit <n>] [--json]
   agentbus result --job <id> [--wait [--wait-timeout <duration>]] [--json]
   agentbus cancel --job <id> [--json]
+  agentbus prune [--apply] [--successful-older-than 168h] [--failed-older-than 720h] [--json]
   agentbus steer --job <id> --request-id <messageId> --message-file <path|-> [--json]
   agentbus configure-codex-sandbox [--writable-root <absolute-path>]... [--json]
 

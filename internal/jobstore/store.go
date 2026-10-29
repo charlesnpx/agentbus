@@ -140,6 +140,7 @@ type Record struct {
 	Starting      bool                    `json:"starting,omitempty"`
 	ProcessClaim  *ProcessClaim           `json:"processClaim,omitempty"`
 	Cleanup       protocol.Cleanup        `json:"cleanup"`
+	LogsPruned    bool                    `json:"logsPruned,omitempty"`
 	CreatedAt     time.Time               `json:"createdAt"`
 	UpdatedAt     time.Time               `json:"updatedAt"`
 	StartedAt     *time.Time              `json:"startedAt,omitempty"`
@@ -530,6 +531,82 @@ func (store *Store) List() ([]Record, error) {
 		return nil, err
 	}
 	return records, nil
+}
+
+// ListPage returns up to limit records after afterID in job-ID order. more is
+// true when another page exists; nextAfter is the last returned job ID.
+func (store *Store) ListPage(limit int, afterID string) (records []Record, nextAfter string, more bool, err error) {
+	if limit <= 0 {
+		return nil, "", false, fmt.Errorf("%w: page limit must be positive", ErrInvalid)
+	}
+	records = make([]Record, 0, limit)
+	err = store.view(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		cursor := jobs.Cursor()
+		var key, value []byte
+		if afterID == "" {
+			key, value = cursor.First()
+		} else {
+			key, value = cursor.Seek([]byte(afterID))
+			if string(key) == afterID {
+				key, value = cursor.Next()
+			}
+		}
+		for key != nil && len(records) < limit {
+			if value == nil {
+				return fmt.Errorf("%w: nested jobs bucket %q", ErrCorrupt, key)
+			}
+			record, err := decodeRecord(value, string(key))
+			if err != nil {
+				return err
+			}
+			records = append(records, record)
+			nextAfter = record.JobID
+			key, value = cursor.Next()
+		}
+		more = key != nil
+		return nil
+	})
+	if err != nil {
+		return nil, "", false, err
+	}
+	return records, nextAfter, more, nil
+}
+
+// MarkLogsPruned marks that the job's diagnostic log sidecars are pruned. It
+// is persisted before unlinking so a later sweep can retry after interruption.
+// It leaves UpdatedAt unchanged because pruning is artifact lifecycle metadata,
+// not a new job state transition.
+func (store *Store) MarkLogsPruned(id string) (Record, error) {
+	if err := validateJobID(id); err != nil {
+		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	var result Record
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if !current.State.IsTerminal() || current.Cleanup != protocol.CleanupClean {
+			return fmt.Errorf("%w: only clean terminal jobs can have logs marked pruned", ErrInvalid)
+		}
+		if !current.LogsPruned {
+			current.LogsPruned = true
+			if err := putRecord(jobs, current); err != nil {
+				return err
+			}
+		}
+		result = current
+		return nil
+	})
+	return result, err
 }
 
 // MarkStarting commits the private no-relaunch marker before a caller spawns
@@ -1091,6 +1168,9 @@ func validateRecord(record Record) error {
 	}
 	if !record.Cleanup.Valid() {
 		return fmt.Errorf("%w: invalid cleanup %q", ErrInvalid, record.Cleanup)
+	}
+	if record.LogsPruned && (!record.State.IsTerminal() || record.Cleanup != protocol.CleanupClean) {
+		return fmt.Errorf("%w: pruned logs require a clean terminal job", ErrInvalid)
 	}
 	if record.CreatedAt.IsZero() || record.UpdatedAt.IsZero() {
 		return fmt.Errorf("%w: createdAt and updatedAt are required", ErrInvalid)

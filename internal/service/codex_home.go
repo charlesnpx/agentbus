@@ -5,6 +5,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -494,12 +495,10 @@ func removeManagedCodexHomeContents(directoryFD int) error {
 			if err != nil {
 				return err
 			}
-			// Go creates module-cache directories mode 0555, and unlinking an
-			// entry requires write permission on the directory that contains it,
-			// so a populated GOMODCACHE would otherwise be undeletable and retain
-			// the whole job leaf forever. Restore owner write on the descriptor we
-			// already opened and identity-checked, so containment does not depend
-			// on re-resolving the path.
+			// Unlinking an entry requires write permission on the directory that
+			// contains it. Restore owner write on the descriptor we already opened
+			// and identity-checked, so cleanup does not depend on re-resolving the
+			// path.
 			if err := unix.Fchmod(childFD, 0o700); err != nil {
 				closeErr := unix.Close(childFD)
 				if closeErr != nil {
@@ -525,6 +524,183 @@ func removeManagedCodexHomeContents(directoryFD int) error {
 		}
 	}
 	return nil
+}
+
+// openExistingManagedDirectory opens a descendant directory through pinned
+// descriptors without creating or following any component.
+func openExistingManagedDirectory(root string, components ...string) (int, error) {
+	rootFD, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	currentFD := rootFD
+	for _, component := range components {
+		if component == "" || component == "." || component == ".." || strings.ContainsRune(component, filepath.Separator) {
+			_ = unix.Close(currentFD)
+			return -1, errors.New("invalid managed directory component")
+		}
+		nextFD, openErr := unix.Openat(currentFD, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		_ = unix.Close(currentFD)
+		if openErr != nil {
+			return -1, openErr
+		}
+		currentFD = nextFD
+	}
+	return currentFD, nil
+}
+
+func openExistingManagedCodexHomeParent(layout engine.WorkspaceLayout) (int, error) {
+	return openExistingManagedDirectory(layout.Root, "workspaces", layout.Key, "codex")
+}
+
+func openManagedDirectoryAt(parentFD int, name string) (int, error) {
+	if name == "" || name == "." || name == ".." || strings.ContainsRune(name, filepath.Separator) {
+		return -1, errors.New("invalid managed directory name")
+	}
+	directoryFD, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	var named, opened unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		_ = unix.Close(directoryFD)
+		return -1, err
+	}
+	if err := unix.Fstat(directoryFD, &opened); err != nil {
+		_ = unix.Close(directoryFD)
+		return -1, err
+	}
+	if named.Mode&unix.S_IFMT != unix.S_IFDIR || named.Dev != opened.Dev || named.Ino != opened.Ino {
+		_ = unix.Close(directoryFD)
+		return -1, errors.New("managed directory identity mismatch")
+	}
+	return directoryFD, nil
+}
+
+func measureManagedCodexHomeContents(directoryFD int, remaining *int) (int64, error) {
+	copyFD, err := unix.Dup(directoryFD)
+	if err != nil {
+		return 0, err
+	}
+	directory := os.NewFile(uintptr(copyFD), "managed Codex artifact")
+	defer directory.Close()
+	var total int64
+	for {
+		entries, readErr := directory.ReadDir(256)
+		for _, entry := range entries {
+			*remaining--
+			if *remaining < 0 {
+				return 0, errors.New("managed artifact exceeds the per-sweep entry limit")
+			}
+			var stat unix.Stat_t
+			if err := unix.Fstatat(directoryFD, entry.Name(), &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+				return 0, err
+			}
+			if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
+				childFD, err := openManagedDirectoryAt(directoryFD, entry.Name())
+				if err != nil {
+					return 0, err
+				}
+				childBytes, measureErr := measureManagedCodexHomeContents(childFD, remaining)
+				closeErr := unix.Close(childFD)
+				if measureErr != nil {
+					return 0, measureErr
+				}
+				if closeErr != nil {
+					return 0, closeErr
+				}
+				total += childBytes
+			} else if stat.Mode&unix.S_IFMT == unix.S_IFREG {
+				total += stat.Size
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return total, nil
+		}
+		if readErr != nil {
+			return 0, readErr
+		}
+	}
+}
+
+func removeManagedCodexHomeChild(parentFD int, name string) error {
+	directoryFD, err := openManagedDirectoryAt(parentFD, name)
+	if err != nil {
+		return err
+	}
+	if err := unix.Fchmod(directoryFD, 0o700); err != nil {
+		_ = unix.Close(directoryFD)
+		return err
+	}
+	if err := removeManagedCodexHomeContents(directoryFD); err != nil {
+		_ = unix.Close(directoryFD)
+		return err
+	}
+	var named, opened unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		_ = unix.Close(directoryFD)
+		return err
+	}
+	if err := unix.Fstat(directoryFD, &opened); err != nil {
+		_ = unix.Close(directoryFD)
+		return err
+	}
+	if named.Mode&unix.S_IFMT != unix.S_IFDIR || named.Dev != opened.Dev || named.Ino != opened.Ino {
+		_ = unix.Close(directoryFD)
+		return errors.New("managed artifact identity changed before removal")
+	}
+	if err := unix.Close(directoryFD); err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(parentFD, name, unix.AT_REMOVEDIR); err != nil {
+		return fmt.Errorf("remove managed artifact directory: %w", err)
+	}
+	return nil
+}
+
+func managedRegularFileSize(parentFD int, name string) (int64, bool, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return 0, false, errors.New("artifact is not a regular file")
+	}
+	return stat.Size, true, nil
+}
+
+func removeManagedRegularFile(parentFD int, name string) (int64, error) {
+	fileFD, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, err
+	}
+	var opened, named unix.Stat_t
+	if err := unix.Fstat(fileFD, &opened); err != nil {
+		_ = unix.Close(fileFD)
+		return 0, err
+	}
+	if opened.Mode&unix.S_IFMT != unix.S_IFREG {
+		_ = unix.Close(fileFD)
+		return 0, errors.New("artifact is not a regular file")
+	}
+	if err := unix.Fstatat(parentFD, name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		_ = unix.Close(fileFD)
+		return 0, err
+	}
+	if named.Mode&unix.S_IFMT != unix.S_IFREG || named.Dev != opened.Dev || named.Ino != opened.Ino {
+		_ = unix.Close(fileFD)
+		return 0, errors.New("artifact identity changed before removal")
+	}
+	if err := unix.Close(fileFD); err != nil {
+		return 0, err
+	}
+	if err := unix.Unlinkat(parentFD, name, 0); err != nil {
+		return 0, err
+	}
+	return opened.Size, nil
 }
 
 func (s *Server) rememberManagedCodexHome(jobID string, home *managedCodexHome) {

@@ -4,7 +4,7 @@ Agentbus protocol version 3 is a JSON-RPC 2.0 service over a local,
 newline-delimited Unix socket. Each frame is one JSON object followed by a
 newline. The daemon accepts only protocol version 3.
 
-The wire surface has seven methods:
+The wire surface has eight methods:
 
 | Method | Purpose |
 | --- | --- |
@@ -14,6 +14,7 @@ The wire surface has seven methods:
 | job.list | List compact job summaries with optional workspace, tag, and state filters. |
 | job.transcript | Return a stateless digest and selected captured items for one job. |
 | job.cancel | Request cancellation of one job. |
+| artifacts.prune | Preview or remove eligible Agentbus-owned diagnostic artifacts. |
 | job.steer | Submit one bounded follow-up instruction to an active steerable job. |
 
 A client must call protocol.hello successfully before any other method on the
@@ -339,6 +340,33 @@ more activity. A sidecar captured before completion receipts existed has no
 receipt and is therefore reported as a gapped prefix, because its completeness
 cannot be established.
 
+When Agentbus has deliberately removed a job's log sidecars, the result also
+includes `pruned: true` and an empty transcript. This distinguishes retention
+cleanup from a sidecar that was never created or is unexpectedly missing.
+
+## artifacts.prune
+
+This method previews eligible artifact cleanup by default. `dryRun` may be
+omitted (equivalent to `true`) or set to `false` to apply the cleanup.
+Thresholds use Go duration syntax and default to `168h` for completed jobs and
+`720h` for failed, canceled, or unknown jobs.
+
+~~~json
+{
+  "dryRun": true,
+  "successfulOlderThan": "168h",
+  "failedOlderThan": "720h"
+}
+~~~
+
+The result contains `wouldRemove` and `wouldRemoveBytes` for a dry-run,
+`removed` and `removedBytes` after an apply pass, and `skipped` entries with a
+job ID, optional path, and reason. The method removes only clean terminal jobs'
+raw log sidecars and Agentbus-created Codex `cache`/`tmp` directories after the
+age threshold for their state. Retained sessions, resumable sessions, resume
+targets of non-terminal jobs, and all other unsafe or ineligible paths are
+skipped. Job records, request identity, and result artifacts are preserved.
+
 ## job.get
 
 job.get requires a non-empty jobId. An empty parameter object is an
@@ -358,6 +386,7 @@ invalid_task_spec parameter error rather than a list request.
   "steers": [],
   "state": "completed",
   "cleanup": "clean",
+  "logsPruned": true,
   "createdAt": "2026-08-20T12:00:00Z",
   "queuedAt": "2026-08-20T12:00:00Z",
   "startedAt": "2026-08-20T12:00:01Z",
@@ -418,7 +447,8 @@ identifies whether the backend uses an OS sandbox, agent permissions, or no
 filesystem boundary. For Codex edit jobs using the `workspaceWrite` sandbox,
 `gitMetadata` is `read-only` because the granted writable roots do not include
 the Git metadata directory. startedAt, finishedAt, tags, result, contract,
-failure, and logPaths appear only when they apply.
+failure, and logPaths appear only when they apply. `logsPruned` is true after
+the daemon removes this job's raw log sidecars.
 
 result exists only for a completed job with an authoritative result. Its
 resultPath, sha256, and bytes are required; text may be omitted when the result

@@ -88,6 +88,12 @@ func validateJobTranscriptParams(params protocol.JobTranscriptParams) error {
 }
 
 func (s *Server) jobTranscript(record jobstore.Record, params protocol.JobTranscriptParams) (protocol.JobTranscriptResult, error) {
+	if record.LogsPruned {
+		result := emptyJobTranscript(record)
+		result.Pruned = true
+		result.Gap = true
+		return result, nil
+	}
 	path, present, err := transcriptSidecarPath(record)
 	if err != nil {
 		return protocol.JobTranscriptResult{}, err
