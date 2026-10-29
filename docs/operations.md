@@ -63,7 +63,7 @@ their backend when a slot opens. A queued job for a saturated backend does not
 block a later job for another backend with a free slot. The queue bound counts
 waiting jobs; a matching deduplicated submission does not consume another
 entry. When the bound is reached, a new job.submit returns the typed
-`queue_full` error and CLI exit code 16. A queued cancellation removes the job
+`queue_full` error and CLI exit code 19. A queued cancellation removes the job
 before it can start a provider. Job lookup, listing, transcript, and queued
 cancellation remain available while all execution slots are occupied.
 
@@ -136,9 +136,10 @@ class, and schema compliance:
 | 13 | shutdown deadline exceeded |
 | 14 | unknown |
 | 15 | completed but the authoritative result artifact is missing, unreadable, or disagrees with its recorded digest |
-| 16 | submission rejected because the daemon's waiting queue is full |
+| 19 | submission rejected because the daemon's waiting queue is full |
 
-Codes 8, 9, and 12 are permanently retired. Do not reuse them.
+Codes 8, 9, and 12 are permanently retired. Codes 16–18 are reserved for other
+units. Do not reuse them.
 
 ## Store failures
 

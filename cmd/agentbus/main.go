@@ -36,7 +36,7 @@ const (
 	cliExitDaemonStartupFailure = 11
 	cliExitShutdownForced       = 13
 	cliExitResultUnavailable    = 15
-	cliExitQueueFull            = 16
+	cliExitQueueFull            = 19
 	shortSHA256HexLength        = 12
 )
 
@@ -964,7 +964,7 @@ Exit codes for a selected job and protocol outcomes:
   timeout=5, interrupted=6, canceled=7, unknown-job=10,
   daemon-startup-failure=11, shutdown-deadline=13, unknown=14,
   result-artifact-unavailable=15: completed, but the authoritative result artifact is missing, unreadable, or does not match its recorded digest
-  queue-full=16: submission rejected because the daemon's waiting queue is full
+  queue-full=19: submission rejected because the daemon's waiting queue is full
 `)
 }
 

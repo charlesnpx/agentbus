@@ -419,7 +419,6 @@ func (s *Server) beginExecutions(parent context.Context) {
 		s.executions = make(map[string]*activeExecution)
 	}
 	s.queuedJobs = nil
-	s.runningJobs = 0
 	s.runningByBackend = make(map[string]int)
 	s.executionMu.Unlock()
 }
@@ -464,7 +463,7 @@ func (s *Server) queueWouldExceed(backend string) bool {
 	if len(s.queuedJobs) < s.maxQueued {
 		return false
 	}
-	if s.runningJobs >= s.maxJobs || s.runningByBackend[backend] >= s.maxJobsPerBackend {
+	if len(s.executions) >= s.maxJobs || s.runningByBackend[backend] >= s.maxJobsPerBackend {
 		return true
 	}
 	for _, queued := range s.queuedJobs {
@@ -519,7 +518,7 @@ func (s *Server) enqueueQueuedJob(record jobstore.Record, backend engine.Backend
 // earlier item for a saturated backend does not block a different backend.
 // The caller holds executionMu.
 func (s *Server) dispatchQueuedLocked() {
-	for s.executionCtx != nil && s.executionCtx.Err() == nil && s.runningJobs < s.maxJobs {
+	for s.executionCtx != nil && s.executionCtx.Err() == nil && len(s.executions) < s.maxJobs {
 		selected := -1
 		for index, queued := range s.queuedJobs {
 			if s.runningByBackend[queued.record.Backend] < s.maxJobsPerBackend {
@@ -547,7 +546,6 @@ func (s *Server) startQueuedJobLocked(queued queuedJob) {
 	run := newActiveExecution(queued.record.JobID, queued.backend)
 	run.slotAcquiredAt = time.Now().UTC()
 	s.executions[queued.record.JobID] = run
-	s.runningJobs++
 	s.runningByBackend[queued.record.Backend]++
 	parent := s.executionCtx
 	s.executionWG.Add(1)
@@ -560,7 +558,6 @@ func (s *Server) startQueuedJobLocked(queued queuedJob) {
 		if s.executions[queued.record.JobID] == run {
 			delete(s.executions, queued.record.JobID)
 		}
-		s.runningJobs--
 		s.runningByBackend[queued.record.Backend]--
 		if s.runningByBackend[queued.record.Backend] <= 0 {
 			delete(s.runningByBackend, queued.record.Backend)

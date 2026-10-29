@@ -518,7 +518,7 @@ func TestProtocolErrorsAndStartupFailuresKeepTypedExitCodes(t *testing.T) {
 		want int
 	}{
 		{"unknown job", unknown, cliExitUnknownJob},
-		{"queue full", queueFull, cliExitQueueFull},
+		{"queue full", queueFull, 19},
 		{"startup", startup, cliExitDaemonStartupFailure},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

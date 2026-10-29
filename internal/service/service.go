@@ -165,7 +165,6 @@ type Server struct {
 	executionWG       sync.WaitGroup
 	submissionMu      sync.Mutex
 	queuedJobs        []queuedJob
-	runningJobs       int
 	runningByBackend  map[string]int
 	maxJobs           int
 	maxJobsPerBackend int

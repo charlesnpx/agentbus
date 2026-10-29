@@ -39,7 +39,7 @@ up to 64 additional jobs waiting. These are starting values, not measured
 optima. Set positive integer limits with `agentbus serve`; zero is rejected.
 The values apply when a daemon starts and do not change an already serving daemon.
 When the waiting queue is full, a new job.submit is rejected with
-`queue_full` (CLI exit code 16). A matching deduplicated request does not use
+`queue_full` (CLI exit code 19). A matching deduplicated request does not use
 another queue entry. Job execution timeouts begin when a job gets a slot;
 `queuedAt` and `startedAt` show its wait and execution start.
 
