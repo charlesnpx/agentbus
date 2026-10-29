@@ -233,6 +233,7 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 		diagnostics = append(diagnostics, run.itemSidecarDiagnostics()...)
 	}
 	diagnostics = appendRecordDiagnostics(record.Diagnostics, diagnostics)
+	cleanup, diagnostics = s.cleanupVerifyFrozenCopyForRecord(record, cleanup, diagnostics)
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
 		State:              protocol.PublicStateCanceled,
 		Cleanup:            cleanup,
@@ -275,11 +276,12 @@ func (s *Server) cancelQueuedJob(store *jobstore.Store, record jobstore.Record) 
 			break
 		}
 	}
+	cleanup, diagnostics := s.cleanupVerifyFrozenCopyForRecord(record, protocol.CleanupClean, record.Diagnostics)
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
 		State:              protocol.PublicStateCanceled,
-		Cleanup:            protocol.CleanupClean,
+		Cleanup:            cleanup,
 		CancellationReason: protocol.CancellationReasonOperator,
-		Diagnostics:        appendRecordDiagnostics(record.Diagnostics, nil),
+		Diagnostics:        diagnostics,
 		FinishedAt:         time.Now().UTC(),
 	})
 	if err != nil {
@@ -625,19 +627,20 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 		if err := store.MarkPendingSteersUnknown(record.JobID); err != nil {
 			return fmt.Errorf("reconcile steering receipts for job %s: %w", record.JobID, err)
 		}
+		var terminal jobstore.TerminalUpdate
 		switch {
 		case record.State == protocol.PublicStateQueued:
-			_, err = store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
+			terminal = jobstore.TerminalUpdate{
 				State:         protocol.PublicStateFailed,
 				Cleanup:       protocol.CleanupClean,
 				FailureClass:  protocol.FailureClassInternal,
 				FailureReason: "daemon restarted before job launch",
 				Diagnostics:   []string{"restart reconciliation: queued job was never relaunched"},
 				FinishedAt:    time.Now().UTC(),
-			})
+			}
 		case record.Starting || record.State == protocol.PublicStateRunning:
 			cleanup, diagnostics := s.terminateRecordedProcessClaim(record.ProcessClaim)
-			_, err = store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{
+			terminal = jobstore.TerminalUpdate{
 				State:            protocol.PublicStateUnknown,
 				Cleanup:          cleanup,
 				BackendSessionID: record.BackendSessionID,
@@ -645,7 +648,7 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 					"restart reconciliation: no relaunch",
 				}, diagnostics...),
 				FinishedAt: time.Now().UTC(),
-			})
+			}
 		default:
 			// A terminal record is deliberately untouched. In particular, do
 			// not use MarkTerminal here: even a logically equivalent rewrite
@@ -653,6 +656,8 @@ func (s *Server) reconcileRecoveredJobs(store *jobstore.Store) error {
 			s.discardRecordedLocalIPCRoot(record)
 			continue
 		}
+		terminal.Cleanup, terminal.Diagnostics = s.cleanupVerifyFrozenCopyForRecord(record, terminal.Cleanup, terminal.Diagnostics)
+		_, err = store.MarkTerminal(record.JobID, terminal)
 		if err != nil && !errors.Is(err, jobstore.ErrTerminal) {
 			return fmt.Errorf("reconcile recovered job %s: %w", record.JobID, err)
 		}
