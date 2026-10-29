@@ -370,6 +370,7 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 		Cleanup:       record.Cleanup,
 		LogPaths:      projectLogPaths(record),
 		ModelReported: s.projectedModelReported(record),
+		Execution:     record.Execution,
 		Steers:        steers,
 	}, nil
 }

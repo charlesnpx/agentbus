@@ -140,6 +140,7 @@ type Server struct {
 	codexHomeOverride string
 	codexHomeInherit  bool
 	codexAuthHome     string
+	moduleCache       string
 	codexHomesMu      sync.Mutex
 	managedCodexHomes map[string]*managedCodexHome
 
@@ -254,6 +255,7 @@ func New(cfg Config) (*Server, error) {
 		codexHomeOverride: cfg.CodexHomeOverride,
 		codexHomeInherit:  cfg.CodexHomeInherit,
 		codexAuthHome:     cfg.CodexAuthHome,
+		moduleCache:       resolveModuleCache(),
 		managedCodexHomes: make(map[string]*managedCodexHome),
 		processTable:      engine.NativeProcessTable{},
 		processGroups:     engine.NativeProcessGroupSignaler{},
