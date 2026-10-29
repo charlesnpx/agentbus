@@ -63,6 +63,8 @@ type claudeStream struct {
 	// message_start. If it does not, this flag could suppress that later
 	// message's completed text after the prior message emitted partial text.
 	partialAgentTextEmitted bool
+	pendingAuthFrame        map[string]any
+	pendingAuthFailure      *engine.ProviderFailureError
 }
 
 func newStreamJSONDriver(binary string) *streamJSONDriver {
@@ -488,8 +490,7 @@ func (s *claudeStream) handleResult(ctx context.Context, obj map[string]any) (bo
 	if pending == nil {
 		s.completed = true
 		s.mu.Unlock()
-		s.emitResult(obj)
-		return true, nil
+		return true, s.emitResult(obj)
 	}
 	if pending.abandoned {
 		s.steer = nil
@@ -517,8 +518,7 @@ func (s *claudeStream) handleResult(ctx context.Context, obj map[string]any) (bo
 		s.mu.Unlock()
 		// The result arrived before a successful interrupt acknowledgement, so
 		// the original segment completed normally and remains the logical result.
-		s.emitResult(obj)
-		return true, nil
+		return true, s.emitResult(obj)
 	}
 	if err := ctx.Err(); err != nil {
 		s.steer = nil
@@ -613,7 +613,7 @@ func (s *claudeStream) handleFrame(ctx context.Context, frame duplex.Frame, sess
 		s.emitPartialAssistant(obj)
 		return false, nil
 	case "assistant":
-		s.emitAssistant(obj)
+		s.handleAssistant(obj)
 		return false, nil
 	case "result":
 		return s.handleResult(ctx, obj)
@@ -664,10 +664,27 @@ func (s *claudeStream) handleControlRequest(ctx context.Context, obj map[string]
 
 func (s *claudeStream) emitModelReported(obj map[string]any) {
 	model := strings.TrimSpace(firstString(obj, "model"))
+	if model == "<synthetic>" {
+		model = ""
+	}
 	effort := strings.TrimSpace(firstString(obj, "effort", "reasoning_effort", "reasoningEffort"))
 	if model != "" || effort != "" {
 		s.emitEvent(engine.Event{Type: engine.EventModelReported, ModelReported: model, EffortReported: effort, Metadata: obj})
 	}
+}
+
+func (s *claudeStream) handleAssistant(obj map[string]any) {
+	if boolValue(obj["is_api_error_message"]) {
+		text := textFrom(obj)
+		event := claudeTerminalError(text, obj)
+		var failure *engine.ProviderFailureError
+		if errors.As(event.Err, &failure) && failure != nil && failure.Evidence.Class == "authentication" {
+			s.pendingAuthFrame = obj
+			s.pendingAuthFailure = failure
+			return
+		}
+	}
+	s.emitAssistant(obj)
 }
 
 func (s *claudeStream) emitAssistant(obj map[string]any) {
@@ -786,20 +803,33 @@ func (s *claudeStream) emitThinking(source, metadata map[string]any) {
 	s.emitProgress()
 }
 
-func (s *claudeStream) emitResult(obj map[string]any) {
+func (s *claudeStream) emitResult(obj map[string]any) error {
+	if s.pendingAuthFailure != nil {
+		failure := s.pendingAuthFailure
+		frame := s.pendingAuthFrame
+		s.pendingAuthFailure = nil
+		s.pendingAuthFrame = nil
+		if !isClaudeSuccessResult(obj) {
+			return failure
+		}
+		// An assistant error marker is not terminal on its own. Keep ordinary
+		// assistant/result semantics if Claude follows it with a successful result.
+		s.emitAssistant(frame)
+	}
 	subtype, _ := obj["subtype"].(string)
 	isError := boolValue(obj["is_error"]) || boolValue(obj["isError"])
 	if !isError && subtype == "success" {
 		text := explicitResultText(obj["result"])
 		if strings.TrimSpace(text) == "" {
 			s.emitEvent(engine.Event{Type: engine.EventTerminalError, Text: missingSuccessResultText(obj), Metadata: obj})
-			return
+			return nil
 		}
 		s.emitEvent(engine.Event{Type: engine.EventResultMessage, Text: text, Metadata: obj})
-		return
+		return nil
 	}
 	text := resultErrorText(obj, strings.TrimSpace(subtype))
 	s.emitEvent(claudeTerminalError(text, obj))
+	return nil
 }
 
 func claudeTerminalError(text string, metadata map[string]any) engine.Event {
@@ -828,6 +858,9 @@ func claudeProviderFailure(metadata map[string]any, fallbackMessage string) (eng
 		if code == "" {
 			if index == 0 {
 				code = firstString(object, "code", "error_code", "errorCode")
+				if code == "" && boolValue(object["is_api_error_message"]) {
+					code = firstString(object, "error")
+				}
 			} else {
 				code = firstString(object, "code", "type", "error_code", "errorCode")
 			}
@@ -858,7 +891,7 @@ func classifyClaudeProviderFailure(code, message string, objects []map[string]an
 	switch normalized {
 	case "ratelimit", "ratelimiterror", "usagelimit", "usagelimiterror", "quotaexceeded", "quotaerror":
 		return "usage_limit"
-	case "authentication", "authenticationerror", "unauthorized", "invalidapikey", "invalidtoken":
+	case "authentication", "authenticationerror", "authenticationfailed", "unauthorized", "invalidapikey", "invalidtoken":
 		return "authentication"
 	case "serveroverloaded", "overloaded":
 		return "provider_overloaded"
