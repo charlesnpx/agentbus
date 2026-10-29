@@ -114,7 +114,7 @@ func (b *Backend) Resume(ctx context.Context, id string, opts engine.SessionOpts
 	return b.newSession(id, opts, warning, false)
 }
 
-func (b *Backend) newSession(id string, opts engine.SessionOpts, validationWarning string, suppressValidationWarning bool) (*Session, error) {
+func (b *Backend) newSession(id string, opts engine.SessionOpts, validationWarning string, suppressValidationWarning bool) (engine.Session, error) {
 	session := &Session{
 		backend:                   b,
 		opts:                      opts,
@@ -138,7 +138,18 @@ func (b *Backend) newSession(id string, opts engine.SessionOpts, validationWarni
 		return nil, err
 	}
 	session.duplexSession = duplexSession
+	if _, ok := driver.(duplex.SteerDriver); ok {
+		return &steerableSession{Session: session}, nil
+	}
 	return session, nil
+}
+
+type steerableSession struct {
+	*Session
+}
+
+func (s *steerableSession) Steer(ctx context.Context, msg engine.SteerMessage) (engine.SteerDelivery, error) {
+	return s.duplexSession.Steer(ctx, msg)
 }
 
 func (b *Backend) binary() string {
@@ -337,12 +348,6 @@ func (s *Session) turnWithDuplexRunner(ctx context.Context, input engine.TurnInp
 
 func (s *Session) Interrupt(ctx context.Context) error {
 	return s.duplexSession.Interrupt(ctx)
-}
-
-// Steer forwards an active-turn instruction through the duplex session.
-// Drivers without a steering extension return ErrSteerUnsupported.
-func (s *Session) Steer(ctx context.Context, message engine.SteerMessage) (engine.SteerDelivery, error) {
-	return s.duplexSession.Steer(ctx, message)
 }
 
 func (s *Session) NativeInterrupt(ctx context.Context) (bool, error) {

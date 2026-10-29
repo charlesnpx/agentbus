@@ -174,8 +174,16 @@ turns choose an offered `allow_once` option and read-only turns choose an
 offered `reject_once` option. It never selects an `*_always` option. Other
 server requests fail explicitly as JSON-RPC method-not-found.
 
-`Interrupt` sends ACP `session/cancel` for the active session. A resulting
-`stopReason: "cancelled"` is clean only after that interrupt was requested.
+`Interrupt` sends ACP `session/cancel` for the active session. Steering uses
+that same notification, answers any later `session/request_permission` with
+the `cancelled` outcome, drains the cancelled `session/prompt` response, and
+writes a new `session/prompt` on the same session with the follow-up text. The
+cancelled segment is not emitted as a result; only the resumed segment supplies
+the logical turn's result. ACP provides no separate acceptance acknowledgement
+before the prompt's terminal response, so `Confirmed` means the continuation
+prompt request was written after the prior prompt drained. It does not prove
+that Cursor accepted the instruction semantically or followed it. A resulting
+`stopReason: "cancelled"` is clean only after an interrupt was requested.
 Assistant chunks are emitted live and concatenated into the final result on an
 `end_turn` completion. Cursor does not expose an effort control through this
 adapter; specifying one is rejected before launch.

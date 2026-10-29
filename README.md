@@ -105,6 +105,11 @@ not same-turn injection; confirmed delivery does not mean Claude followed the
 instruction.
 The wire details and receipt reasons are in [docs/protocol.md](docs/protocol.md).
 
+Cursor steering uses ACP interrupt-and-continue on the same session. Its
+`Confirmed` receipt means the follow-up prompt was written after the cancelled
+prompt drained; ACP provides no separate acceptance acknowledgement before the
+new prompt's response.
+
 Set AGENTBUS_STATE_ROOT to select daemon state. Otherwise Agentbus uses
 $XDG_STATE_HOME/agentbus or ~/.local/state/agentbus.
 
