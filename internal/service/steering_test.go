@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -147,6 +148,26 @@ func TestFixedJobSteerRejectedBeforeSessionSteer(t *testing.T) {
 	}
 }
 
+func TestSteerUpdateFailureAppearsInExecutionDiagnostics(t *testing.T) {
+	session := &testSteerSession{delivery: engine.SteerDelivery{Mechanism: engine.SteerMechanismNative, Confirmed: true}}
+	server, store, run, jobID := newRunningSteerTestJob(t, protocol.InputModeSteerable, session, false)
+	params := protocol.JobSteerParams{JobID: jobID, MessageID: "diagnostic-message", Text: "persist outcome"}
+	if receipt := steerForTest(t, server, params); receipt.Status != protocol.SteerStatusAdmitted {
+		t.Fatalf("steer receipt = %#v, want admitted", receipt)
+	}
+	queued := <-run.steerQueue
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	server.deliverSteer(store, run, context.Background(), queued)
+
+	outcome := run.retireTurn(store, turnOutcome{cleanup: protocol.CleanupClean})
+	diagnostics := strings.Join(outcome.diagnostics, "\n")
+	if !strings.Contains(diagnostics, "update steer delivery outcome:") {
+		t.Fatalf("turn diagnostics = %#v, want failed steer outcome persistence", outcome.diagnostics)
+	}
+}
+
 func TestSteerDeduplicatesAndConflictsByMessageID(t *testing.T) {
 	session := &testSteerSession{
 		entered:  make(chan engine.SteerMessage, 1),
@@ -223,6 +244,88 @@ func TestSteerPendingQueueIsBounded(t *testing.T) {
 	}
 	if len(record.Steers) != maxPendingSteers+1 || record.Steers[maxPendingSteers].Reason != protocol.SteerReasonQueueFull {
 		t.Fatalf("steer records after queue overflow = %#v", record.Steers)
+	}
+}
+
+func TestJobCancelUnblocksSteeringWhileTurnRetires(t *testing.T) {
+	session := &testSteerSession{entered: make(chan engine.SteerMessage, 1)}
+	server, store, run, jobID := newRunningSteerTestJob(t, protocol.InputModeSteerable, session, false)
+	steerCtx, cancelSteer := context.WithCancel(context.Background())
+	defer cancelSteer()
+	run.setCancel(cancelSteer)
+	server.startSteeringWorker(store, run, steerCtx)
+	server.processGroupGoneFn = func(int) (bool, error) { return true, nil }
+
+	queued := steerForTest(t, server, protocol.JobSteerParams{JobID: jobID, MessageID: "blocked-message", Text: "wait for cancellation"})
+	if queued.Status != protocol.SteerStatusAdmitted {
+		t.Fatalf("queued steer receipt = %#v, want admitted", queued)
+	}
+	select {
+	case <-session.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("steering worker did not enter the blocking Steer call")
+	}
+
+	retireDone := make(chan struct{})
+	go func() {
+		run.retireTurn(store, turnOutcome{cleanup: protocol.CleanupClean})
+		close(retireDone)
+	}()
+	turnClosed := make(chan bool, 1)
+	go func() {
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+		for {
+			if run.controlMu.TryLock() {
+				inactive := !run.turnActive
+				run.controlMu.Unlock()
+				if inactive {
+					turnClosed <- true
+					return
+				}
+			}
+			select {
+			case <-timer.C:
+				turnClosed <- false
+				return
+			default:
+				runtime.Gosched()
+			}
+		}
+	}()
+	if !<-turnClosed {
+		cancelSteer()
+		<-retireDone
+		t.Fatal("turn retirement held controlMu while waiting for the blocked Steer call")
+	}
+
+	cancelDone := make(chan requestOutcome, 1)
+	cancelRequest := mustJSON(t, protocol.JobCancelParams{JobID: jobID})
+	go func() { cancelDone <- server.handleJobCancel(cancelRequest) }()
+	select {
+	case outcome := <-cancelDone:
+		if outcome.err != nil {
+			t.Fatalf("job.cancel error = %#v", outcome.err)
+		}
+		result, ok := outcome.result.(protocol.JobCancelResult)
+		if !ok || result.State != protocol.PublicStateCanceled {
+			t.Fatalf("job.cancel result = %#v, want canceled", outcome.result)
+		}
+	case <-time.After(2 * time.Second):
+		cancelSteer()
+		t.Fatal("job.cancel did not complete while the Steer call was blocked")
+	}
+	select {
+	case <-retireDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn retirement did not finish after cancellation released Steer")
+	}
+	stored, err := store.Get(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != protocol.PublicStateCanceled {
+		t.Fatalf("stored job state = %s, want canceled", stored.State)
 	}
 }
 

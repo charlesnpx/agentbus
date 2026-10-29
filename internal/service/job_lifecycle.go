@@ -166,6 +166,7 @@ func (s *Server) handleJobCancel(raw json.RawMessage) requestOutcome {
 				backendSessionID = retired.backendSessionID
 			}
 		}
+		diagnostics = append(diagnostics, run.takeSteerDiagnostics()...)
 		diagnostics = append(diagnostics, run.itemSidecarDiagnostics()...)
 	}
 	terminal, err := store.MarkTerminal(record.JobID, jobstore.TerminalUpdate{

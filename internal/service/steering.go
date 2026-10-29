@@ -118,20 +118,9 @@ func (s *Server) handleJobSteer(raw json.RawMessage) requestOutcome {
 		return steerDuplicateReceipt(params, textHash, stored)
 	}
 	if status == protocol.SteerStatusAdmitted {
-		select {
-		case run.steerQueue <- queuedSteer{message: engine.SteerMessage{ID: params.MessageID, Text: params.Text}}:
-			run.steerPending++
-			run.steerQueued[params.MessageID] = struct{}{}
-		default:
-			updated, updateErr := store.UpdateSteer(protocol.JobSteerRecordUpdate{
-				JobID: params.JobID, MessageID: params.MessageID,
-				Status: protocol.SteerStatusRejected, Reason: protocol.SteerReasonQueueFull,
-			})
-			if updateErr != nil {
-				return jobStoreUnavailable("record full steering queue", updateErr)
-			}
-			stored = updated
-		}
+		run.steerQueue <- queuedSteer{message: engine.SteerMessage{ID: params.MessageID, Text: params.Text}}
+		run.steerPending++
+		run.steerQueued[params.MessageID] = struct{}{}
 		return requestOutcome{result: steerReceipt(params.JobID, stored, false)}
 	}
 	return requestOutcome{result: steerReceipt(params.JobID, stored, false)}
@@ -244,10 +233,12 @@ func (s *Server) deliverSteer(store *jobstore.Store, run *activeExecution, ctx c
 				reason = ""
 				mechanism = validSteerMechanism(delivery.Mechanism)
 			}
-			_, _ = store.UpdateSteer(protocol.JobSteerRecordUpdate{
+			if _, err := store.UpdateSteer(protocol.JobSteerRecordUpdate{
 				JobID: run.jobID, MessageID: queued.message.ID,
 				Status: status, Mechanism: mechanism, Reason: reason,
-			})
+			}); err != nil {
+				run.noteSteerDiagnostic("update steer delivery outcome: " + err.Error())
+			}
 			close(deliveryDone)
 
 			run.controlMu.Lock()
@@ -258,10 +249,12 @@ func (s *Server) deliverSteer(store *jobstore.Store, run *activeExecution, ctx c
 			return
 		}
 	}
-	_, _ = store.UpdateSteer(protocol.JobSteerRecordUpdate{
+	if _, err := store.UpdateSteer(protocol.JobSteerRecordUpdate{
 		JobID: run.jobID, MessageID: queued.message.ID,
 		Status: status, Reason: reason,
-	})
+	}); err != nil {
+		run.noteSteerDiagnostic("update steer rejection outcome: " + err.Error())
+	}
 	run.controlMu.Unlock()
 }
 
@@ -281,7 +274,12 @@ func (s *Server) cancelSteering(store *jobstore.Store, run *activeExecution) boo
 		return true
 	}
 	run.controlMu.Lock()
-	if run.steerClosed {
+	if run.steerCanceled {
+		run.controlMu.Unlock()
+		return false
+	}
+	current, err := store.Get(run.jobID)
+	if err != nil || current.State.IsTerminal() {
 		run.controlMu.Unlock()
 		return false
 	}
@@ -295,10 +293,12 @@ func (s *Server) cancelSteering(store *jobstore.Store, run *activeExecution) boo
 // rejectQueuedSteersLocked discards all queued, not-yet-delivered messages.
 func (run *activeExecution) rejectQueuedSteersLocked(store *jobstore.Store, reason protocol.SteerReason) {
 	for messageID := range run.steerQueued {
-		_, _ = store.UpdateSteer(protocol.JobSteerRecordUpdate{
+		if _, err := store.UpdateSteer(protocol.JobSteerRecordUpdate{
 			JobID: run.jobID, MessageID: messageID,
 			Status: protocol.SteerStatusRejected, Reason: reason,
-		})
+		}); err != nil {
+			run.noteSteerDiagnostic("update queued steer rejection: " + err.Error())
+		}
 		delete(run.steerQueued, messageID)
 	}
 	run.steerPending = 0
@@ -311,15 +311,13 @@ func (run *activeExecution) rejectQueuedSteersLocked(store *jobstore.Store, reas
 	}
 }
 
-func (run *activeExecution) closeSteeringLocked(store *jobstore.Store) {
+func (run *activeExecution) closeSteeringLocked(store *jobstore.Store) <-chan struct{} {
 	run.steerClosed = true
 	run.turnActive = false
 	run.rejectQueuedSteersLocked(store, protocol.SteerReasonNotRunning)
-	if run.steerInFlightDone != nil {
-		<-run.steerInFlightDone
-		run.steerInFlightDone = nil
-	}
+	inFlightDone := run.steerInFlightDone
 	run.steerStopOnce.Do(func() { close(run.steerStop) })
+	return inFlightDone
 }
 
 func (run *activeExecution) waitSteeringWorker() {
@@ -341,8 +339,11 @@ func (s *Server) finishSteering(store *jobstore.Store, run *activeExecution) {
 		return
 	}
 	run.controlMu.Lock()
-	run.closeSteeringLocked(store)
+	inFlightDone := run.closeSteeringLocked(store)
 	run.controlMu.Unlock()
+	if inFlightDone != nil {
+		<-inFlightDone
+	}
 	run.waitSteeringWorker()
 }
 

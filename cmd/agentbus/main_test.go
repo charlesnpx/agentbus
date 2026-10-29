@@ -133,8 +133,8 @@ func TestSteerCommandReceiptAndExitCodes(t *testing.T) {
 	}{
 		{name: "admitted", status: protocol.SteerStatusAdmitted, want: 0},
 		{name: "delivered", status: protocol.SteerStatusDelivered, want: 0},
-		{name: "rejected", status: protocol.SteerStatusRejected, want: cliExitSteerRejected},
-		{name: "unknown", status: protocol.SteerStatusUnknown, want: cliExitSteerUnknown},
+		{name: "rejected", status: protocol.SteerStatusRejected, want: 17},
+		{name: "unknown", status: protocol.SteerStatusUnknown, want: 18},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := &fakeProtocolClient{steer: agentclient.JobSteerResult{

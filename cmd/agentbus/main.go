@@ -35,8 +35,8 @@ const (
 	cliExitDaemonStartupFailure = 11
 	cliExitShutdownForced       = 13
 	cliExitResultUnavailable    = 15
-	cliExitSteerRejected        = 16
-	cliExitSteerUnknown         = 17
+	cliExitSteerRejected        = 17
+	cliExitSteerUnknown         = 18
 	shortSHA256HexLength        = 12
 )
 
@@ -1042,7 +1042,7 @@ Exit codes for a selected job:
   daemon-startup-failure=11, shutdown-deadline=13, unknown=14,
   result-artifact-unavailable=15: completed, but the authoritative result artifact is missing, unreadable, or does not match its recorded digest
 
-Steering exit codes: rejected=16, delivery-unknown=17.
+Steering exit codes: rejected=17, delivery-unknown=18.
 `)
 }
 

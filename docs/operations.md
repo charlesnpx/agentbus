@@ -120,6 +120,8 @@ class, and schema compliance:
 
 Codes 8, 9, and 12 are permanently retired. Do not reuse them.
 
+`agentbus steer` exits 17 for a rejected receipt and 18 for an unknown-delivery receipt.
+
 ## Store failures
 
 The daemon opens an existing database through a fault-isolated preflight before

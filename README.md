@@ -43,7 +43,7 @@ deadline, permission envelope, model, effort, and schema. Delivery may be
 native or interrupt-and-continue depending on the adapter. Delivery uncertainty
 is reported without automatic redelivery; a steerable task does not guarantee
 that a provider follows the instruction or rolls back tools already started.
-`agentbus steer` exits 16 for a rejected receipt and 17 when delivery is unknown.
+`agentbus steer` exits 17 for a rejected receipt and 18 when delivery is unknown.
 The wire details and receipt reasons are in [docs/protocol.md](docs/protocol.md).
 
 Set AGENTBUS_STATE_ROOT to select daemon state. Otherwise Agentbus uses

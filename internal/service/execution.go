@@ -50,6 +50,7 @@ type activeExecution struct {
 	lastItemAt             time.Time
 	lastActivityAt         time.Time
 	itemSidecarDiag        string
+	steerDiagnostics       []string
 	modelReported          string
 	turn                   *activeTurn
 	latestSessionID        string
@@ -93,6 +94,26 @@ func (run *activeExecution) setCancel(cancel context.CancelFunc) {
 	run.mu.Lock()
 	run.cancel = cancel
 	run.mu.Unlock()
+}
+
+func (run *activeExecution) noteSteerDiagnostic(diagnostic string) {
+	if run == nil || diagnostic == "" {
+		return
+	}
+	run.mu.Lock()
+	run.steerDiagnostics = append(run.steerDiagnostics, diagnostic)
+	run.mu.Unlock()
+}
+
+func (run *activeExecution) takeSteerDiagnostics() []string {
+	if run == nil {
+		return nil
+	}
+	run.mu.Lock()
+	diagnostics := append([]string(nil), run.steerDiagnostics...)
+	run.steerDiagnostics = nil
+	run.mu.Unlock()
+	return diagnostics
 }
 
 func (run *activeExecution) setSession(session engine.Session) {
@@ -263,11 +284,17 @@ func (run *activeExecution) retireTurn(store *jobstore.Store, outcome turnOutcom
 		run.controlMu.Lock()
 		run.turnActive = false
 		run.rejectQueuedSteersLocked(store, protocol.SteerReasonNotRunning)
-		if run.steerInFlightDone != nil {
-			<-run.steerInFlightDone
+		steerInFlightDone := run.steerInFlightDone
+		run.controlMu.Unlock()
+		if steerInFlightDone != nil {
+			<-steerInFlightDone
+		}
+		run.controlMu.Lock()
+		if run.steerInFlightDone == steerInFlightDone {
 			run.steerInFlightDone = nil
 		}
 		run.controlMu.Unlock()
+		outcome.diagnostics = append(outcome.diagnostics, run.takeSteerDiagnostics()...)
 		if strings.TrimSpace(outcome.modelReported) != "" {
 			if err := store.RecordModelReported(run.jobID, outcome.modelReported); err != nil && !errors.Is(err, jobstore.ErrTerminal) {
 				outcome.diagnostics = append(outcome.diagnostics, "record reported model: "+err.Error())
@@ -1198,14 +1225,23 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 	run := s.activeExecution(jobID)
 	if run != nil {
 		run.controlMu.Lock()
-		defer func() {
-			run.controlMu.Unlock()
-			run.waitSteeringWorker()
-		}()
 		if run.steerCanceled {
+			run.controlMu.Unlock()
 			return
 		}
-		run.closeSteeringLocked(store)
+		inFlightDone := run.closeSteeringLocked(store)
+		run.controlMu.Unlock()
+		if inFlightDone != nil {
+			<-inFlightDone
+		}
+		run.waitSteeringWorker()
+		run.controlMu.Lock()
+		if run.steerCanceled {
+			run.controlMu.Unlock()
+			return
+		}
+		defer run.controlMu.Unlock()
+		terminal.Diagnostics = append(terminal.Diagnostics, run.takeSteerDiagnostics()...)
 	}
 	// job.cancel has already reserved this active execution and will commit a
 	// canceled first terminal itself. Do not let an asynchronously drained
