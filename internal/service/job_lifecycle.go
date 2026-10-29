@@ -355,7 +355,7 @@ func (s *Server) jobRecordWire(record jobstore.Record) (protocol.JobRecordWire, 
 	if record.InputMode != "" {
 		inputMode = record.InputMode
 	}
-	deadline, remaining := jobDeadlineProjection(record, timeout, time.Now().UTC())
+	deadline, remaining := s.jobDeadlineProjection(record, timeout, time.Now().UTC())
 	modelRequested := cloneRequestedValue(spec.Model)
 	effortRequested := cloneRequestedValue(spec.Effort)
 	modelReported, effortReported := s.projectedSelection(record)
@@ -451,11 +451,21 @@ func cloneRequestedValue(value *string) *string {
 	return &copy
 }
 
-func jobDeadlineProjection(record jobstore.Record, timeout *engine.TimeoutResolution, now time.Time) (*time.Time, *int64) {
-	if projectedState(record) != protocol.PublicStateRunning || record.StartedAt == nil || timeout == nil || timeout.Effective <= 0 {
+func (s *Server) jobDeadlineProjection(record jobstore.Record, timeout *engine.TimeoutResolution, now time.Time) (*time.Time, *int64) {
+	if projectedState(record) != protocol.PublicStateRunning || timeout == nil || timeout.Effective <= 0 {
 		return nil, nil
 	}
-	deadline := record.StartedAt.Add(time.Duration(timeout.Effective) * time.Millisecond).UTC()
+	startedAt := record.StartedAt
+	s.executionMu.Lock()
+	if run := s.executions[record.JobID]; run != nil && !run.slotAcquiredAt.IsZero() {
+		slotAcquiredAt := run.slotAcquiredAt
+		startedAt = &slotAcquiredAt
+	}
+	s.executionMu.Unlock()
+	if startedAt == nil {
+		return nil, nil
+	}
+	deadline := startedAt.Add(time.Duration(timeout.Effective) * time.Millisecond).UTC()
 	remaining := deadline.Sub(now).Milliseconds()
 	if remaining < 0 {
 		remaining = 0

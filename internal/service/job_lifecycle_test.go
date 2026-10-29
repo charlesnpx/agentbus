@@ -151,6 +151,39 @@ func TestJobGetProjectsDeadlineAndResumabilityFromDurableFields(t *testing.T) {
 	}
 }
 
+func TestJobGetProjectsDeadlineFromActiveExecutionSlot(t *testing.T) {
+	server := newTestServer(t, t.TempDir(), Config{Backends: []engine.Backend{helloBackend{name: "fake"}}})
+	timeoutMS := int64(120_000)
+	params := submissionParams("projection-workspace", "slot-deadline", "fake", t.TempDir(), "slot deadline")
+	params.TaskSpec.TimeoutMS = &timeoutMS
+	submitted := submitResultForTest(t, submitForTest(t, server, params))
+	store, err := server.ensureJobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStarting(submitted.JobID); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(submitted.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slotAcquiredAt := record.StartedAt.Add(-5 * time.Minute)
+	server.executionMu.Lock()
+	server.executions = make(map[string]*activeExecution)
+	server.executions[record.JobID] = &activeExecution{jobID: record.JobID, slotAcquiredAt: slotAcquiredAt}
+	server.executionMu.Unlock()
+
+	wire, err := server.jobRecordWire(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDeadline := slotAcquiredAt.Add(time.Duration(timeoutMS) * time.Millisecond)
+	if wire.Deadline == nil || !wire.Deadline.Equal(wantDeadline) {
+		t.Fatalf("running deadline projection = %v, want slot deadline %v", wire.Deadline, wantDeadline)
+	}
+}
+
 func TestJobLifecycleProjectsBackendReportedModel(t *testing.T) {
 	const requestedModel = "caller-requested-model"
 	for _, test := range []struct {

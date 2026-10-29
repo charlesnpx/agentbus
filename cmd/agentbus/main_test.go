@@ -107,24 +107,17 @@ func TestResultWaitExpiryReportsRecordWithoutCanceling(t *testing.T) {
 	}
 }
 
-func TestResultWaitExpiryDuringFirstLookupReportsRecord(t *testing.T) {
+func TestResultWaitExpiryDuringFirstLookupReturnsObservationTimeout(t *testing.T) {
 	started := make(chan struct{})
-	release := make(chan struct{})
 	client := &fakeProtocolClient{jobGetFunc: func(ctx context.Context, params agentclient.JobGetParams) (agentclient.JobGetResult, error) {
 		close(started)
-		guard := time.NewTimer(5 * time.Second)
-		defer guard.Stop()
-		select {
-		case <-ctx.Done():
-			return agentclient.JobGetResult{}, ctx.Err()
-		case <-release:
-			return detailedRecord(protocol.PublicStateRunning), nil
-		case <-guard.C:
-			return agentclient.JobGetResult{}, errors.New("fake JobGet response timed out")
-		}
+		<-ctx.Done()
+		return agentclient.JobGetResult{}, ctx.Err()
 	}}
 	a := testApp(t)
 	a.clientConnect = fakeConnector(client)
+	callerCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	type result struct {
 		code   int
 		stdout string
@@ -133,7 +126,7 @@ func TestResultWaitExpiryDuringFirstLookupReportsRecord(t *testing.T) {
 	resultCh := make(chan result, 1)
 	go func() {
 		var stdout, stderr bytes.Buffer
-		code := a.run(context.Background(), []string{"result", "--job", "job-1", "--wait", "--wait-timeout", "1ms", "--json"}, strings.NewReader(""), &stdout, &stderr)
+		code := a.run(callerCtx, []string{"result", "--job", "job-1", "--wait", "--wait-timeout", "1ms", "--json"}, strings.NewReader(""), &stdout, &stderr)
 		resultCh <- result{code: code, stdout: stdout.String(), stderr: stderr.String()}
 	}()
 	startGuard := time.NewTimer(5 * time.Second)
@@ -143,31 +136,18 @@ func TestResultWaitExpiryDuringFirstLookupReportsRecord(t *testing.T) {
 		t.Fatal("timed out waiting for the first JobGet call")
 	}
 	startGuard.Stop()
-	wait := time.NewTimer(20 * time.Millisecond)
-	waitGuard := time.NewTimer(5 * time.Second)
-	select {
-	case <-wait.C:
-	case <-waitGuard.C:
-		t.Fatal("timed out waiting for the observation deadline")
-	}
-	wait.Stop()
-	waitGuard.Stop()
-	close(release)
 	resultGuard := time.NewTimer(5 * time.Second)
 	var got result
 	select {
 	case got = <-resultCh:
 	case <-resultGuard.C:
+		cancel()
+		<-resultCh
 		t.Fatal("timed out waiting for the result command")
 	}
 	resultGuard.Stop()
-	if got.code != cliExitObservationTimeout || got.stderr != "" {
-		t.Fatalf("wait expiry=(%d,%q,%q), want observation timeout and first record", got.code, got.stdout, got.stderr)
-	}
-	var record agentclient.JobGetResult
-	decodeJSON(t, got.stdout, &record)
-	if record.JobID != "job-1" || record.State != protocol.PublicStateRunning {
-		t.Fatalf("wait result=%#v, want the observed running record", record)
+	if got.code != cliExitObservationTimeout || got.stdout != "" || !strings.Contains(got.stderr, "observation timed out before the job could be read") {
+		t.Fatalf("wait expiry=(%d,%q,%q), want observation timeout without a record and a clear stderr message", got.code, got.stdout, got.stderr)
 	}
 }
 
