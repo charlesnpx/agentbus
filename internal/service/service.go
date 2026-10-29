@@ -615,13 +615,7 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, listen
 			stale := s.checkBinaryStale()
 			quiet := s.clients.Load() == 0 && s.accepting.Load() == 0 && s.activeJobs.Load() == 0
 			if staleDraining {
-				settled := false
-				select {
-				case <-acceptSettled:
-					settled = true
-				default:
-				}
-				if !quiet || !settled {
+				if !quiet {
 					continue
 				}
 				cancel()
