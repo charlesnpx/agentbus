@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -402,6 +403,115 @@ func TestIdleShutdownAfterConfiguredWindow(t *testing.T) {
 	}
 }
 
+func TestStaleBinaryDrainsActiveJobThenStopsAfterAcceptSettles(t *testing.T) {
+	const idleCheckInterval = 200 * time.Millisecond
+	server := newTestServer(t, t.TempDir(), Config{
+		IdleTimeout:       time.Hour,
+		IdleCheckInterval: idleCheckInterval,
+	})
+	executablePath := filepath.Join(t.TempDir(), "daemon")
+	if err := os.WriteFile(executablePath, []byte("original binary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := statBinaryIdentity(executablePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	server.executablePath = executablePath
+	server.executableIdentity = identity
+	server.mu.Unlock()
+	server.activeJobs.Store(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	listener := &drainTestListener{closed: make(chan struct{})}
+	acceptSettled := make(chan struct{})
+	idleDone := make(chan struct{})
+	go func() {
+		_, _ = listener.Accept()
+		close(acceptSettled)
+	}()
+	go func() {
+		server.idleLoop(ctx, cancel, listener, socketFileIdentity{}, acceptSettled)
+		close(idleDone)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = listener.Close()
+		select {
+		case <-idleDone:
+		case <-time.After(time.Second):
+			t.Error("stale-binary idle loop did not stop during cleanup")
+		}
+	})
+	if err := os.WriteFile(executablePath, []byte("replacement binary is longer"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.NewTimer(2 * idleCheckInterval)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		server.mu.Lock()
+		stale := server.binaryStale
+		server.mu.Unlock()
+		if stale {
+			break
+		}
+		select {
+		case <-idleDone:
+			t.Fatal("idle loop stopped while a job was active")
+		case <-deadline.C:
+			t.Fatal("daemon did not observe the replaced executable")
+		case <-ticker.C:
+		}
+	}
+	select {
+	case <-listener.closed:
+		t.Fatal("stale listener closed while a job was active")
+	case <-ctx.Done():
+		t.Fatal("daemon context canceled while a job was active")
+	default:
+	}
+
+	server.activeJobs.Store(0)
+	select {
+	case <-listener.closed:
+	case <-time.After(2 * idleCheckInterval):
+		t.Fatal("stale daemon did not close its listener after the job ended")
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(idleCheckInterval / 2):
+		t.Fatal("stale daemon waited for another idle-check interval after its accept loop settled")
+	}
+	select {
+	case <-idleDone:
+	case <-time.After(idleCheckInterval / 2):
+		t.Fatal("stale idle loop did not return after daemon cancellation")
+	}
+}
+
+type drainTestListener struct {
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func (listener *drainTestListener) Accept() (net.Conn, error) {
+	<-listener.closed
+	return nil, net.ErrClosed
+}
+
+func (listener *drainTestListener) Close() error {
+	listener.closeOnce.Do(func() { close(listener.closed) })
+	return nil
+}
+
+func (*drainTestListener) Addr() net.Addr {
+	return &net.UnixAddr{Name: "drain-test", Net: "unix"}
+}
+
 type submitSessionBackend struct {
 	name       string
 	sessions   atomic.Int64
@@ -723,14 +833,14 @@ func TestJobSubmitRejectsUnknownInputMode(t *testing.T) {
 	}
 }
 
-func TestOmittedInputModePreservesBaseTaskSpecHash(t *testing.T) {
+func TestOmittedInputModeAndLocalIPCPreserveBaseTaskSpecHash(t *testing.T) {
 	raw := json.RawMessage(`{"workspaceKey":"workspace-omitted-mode","requestId":"request-omitted-mode","taskSpec":{"backend":"codex","cwd":"/workspace","prompt":"do work","write":true}}`)
 	input, err := parseJobSubmitInput(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := sha256.Sum256(input.canonicalTaskSpec)
-	// Golden from the base TaskSpec wire shape, which had no inputMode field.
+	// Golden from the base TaskSpec wire shape, which had neither optional field.
 	const want = "7a22b85c1404f61b27ea2df61765d20cef408966134b4a5d547f164f6f9d3d97"
 	if gotHex := hex.EncodeToString(got[:]); gotHex != want {
 		t.Fatalf("omitted inputMode request hash = %s, want base golden %s; taskSpec=%s", gotHex, want, input.canonicalTaskSpec)

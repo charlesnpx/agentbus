@@ -188,6 +188,12 @@ type TaskSpec struct {
 	// InputMode is immutable request data and participates in replay hashing.
 	// Omission means fixed and, due to omitempty, preserves existing hashes.
 	InputMode InputMode `json:"inputMode,omitempty"`
+	// LocalIPC requests Codex local sockets in managed scratch and loopback TCP.
+	// It is immutable request data and omission preserves existing hashes.
+	LocalIPC bool `json:"localIPC,omitempty"`
+	// Verify requests execution from a daemon-created frozen copy. It is
+	// immutable request data and omission preserves existing hashes.
+	Verify bool `json:"verify,omitempty"`
 	// ResumeJobID names the prior job whose recorded backend session should be
 	// resumed for this new job. It is part of the immutable task specification
 	// and therefore participates in identified-replay hashing.
@@ -484,10 +490,20 @@ type ExecutionPosture struct {
 	Intent         string            `json:"intent"`
 	SourceWritable bool              `json:"sourceWritable"`
 	Scratch        string            `json:"scratch,omitempty"`
+	FrozenCopy     string            `json:"frozenCopy,omitempty"`
+	FrozenSource   *FrozenSource     `json:"frozenSource,omitempty"`
 	Caches         map[string]string `json:"caches,omitempty"`
+	Shell          string            `json:"shell"`
 	Network        string            `json:"network"`
+	LocalIPC       string            `json:"localIPC"`
 	GitMetadata    string            `json:"gitMetadata"`
 	Enforcement    string            `json:"enforcement"`
+}
+
+// FrozenSource identifies the submitted source revision captured for Verify.
+type FrozenSource struct {
+	Head  string `json:"head"`
+	Dirty bool   `json:"dirty"`
 }
 
 // JobFailureWire records the public failure category and reason for a job.

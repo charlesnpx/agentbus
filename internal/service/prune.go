@@ -175,7 +175,7 @@ func (s *Server) pruneArtifactRecords(store *jobstore.Store, root string, record
 				Reason: "open owned log directory: " + logsErr.Error(),
 			})
 		}
-		if record.Backend == "codex" && record.Write {
+		if record.Backend == "codex" && (record.Write || recordUsesVerify(record)) {
 			s.pruneJobCodexArtifacts(root, record, dryRun, &result)
 		}
 	}
@@ -324,7 +324,7 @@ func (s *Server) pruneJobCodexArtifacts(root string, record jobstore.Record, dry
 		return
 	}
 	defer unix.Close(homeFD)
-	for _, name := range []string{"cache", "tmp"} {
+	for _, name := range []string{"cache", "tmp", "src"} {
 		path := filepath.Join(root, "workspaces", workspaceKey, "codex", record.JobID, name)
 		var stat unix.Stat_t
 		if err := unix.Fstatat(homeFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, unix.ENOENT) {
@@ -334,7 +334,7 @@ func (s *Server) pruneJobCodexArtifacts(root string, record jobstore.Record, dry
 			continue
 		}
 		if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
-			result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Path: path, Reason: "managed cache path is not a real directory"})
+			result.Skipped = append(result.Skipped, protocol.PruneSkip{JobID: record.JobID, Path: path, Reason: "managed artifact path is not a real directory"})
 			continue
 		}
 		directoryFD, err := openManagedDirectoryAt(homeFD, name)

@@ -94,15 +94,22 @@ type Health struct {
 type SessionOpts struct {
 	CWD        string
 	EnvOverlay map[string]string
-	// WriteEnvOverlay is merged after EnvOverlay only for write turns.
+	// WriteEnvOverlay is merged after EnvOverlay for write and Verify turns.
 	WriteEnvOverlay map[string]string
-	// WriteSandboxRoot is added to workspace-write sandbox policies for write
-	// turns only. It is ignored for read-only and trusted turns.
+	// WriteSandboxRoot is added to workspaceWrite sandbox policies for write
+	// and Verify turns. Trusted and Inspect policies do not use it.
 	WriteSandboxRoot string
-	Write            bool
-	Model            string
-	Effort           string
-	Timeout          time.Duration
+	// LocalIPC selects the Codex local-IPC permission profile for this job.
+	LocalIPC bool
+	// Verify permits workspace writes only to the disposable frozen copy and
+	// managed scratch. It does not change the submitted write intent.
+	Verify bool
+	// LocalIPCRoot is the private short temp directory granted for local IPC.
+	LocalIPCRoot string
+	Write        bool
+	Model        string
+	Effort       string
+	Timeout      time.Duration
 }
 
 // TurnInput is the effective input for one backend turn.

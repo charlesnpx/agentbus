@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,8 +56,18 @@ func newAppServerDriver(binary string, writePolicy WritePolicy) *appServerDriver
 }
 
 func (d *appServerDriver) ExecSpec(_ string, opts engine.SessionOpts, _ engine.TurnInput) (command.ExecSpec, error) {
+	argv := []string{d.binaryName(), "app-server"}
+	if opts.LocalIPC {
+		if !opts.Write && !opts.Verify {
+			return command.ExecSpec{}, errors.New("Codex local IPC requires a write-enabled or verify job")
+		}
+		if opts.CWD == "" || opts.WriteSandboxRoot == "" || opts.LocalIPCRoot == "" {
+			return command.ExecSpec{}, errors.New("Codex local IPC requires workspace, scratch, and private temp roots")
+		}
+		argv = append(argv, localIPCConfigArgsForWorkspace(opts.CWD, opts.WriteSandboxRoot, opts.LocalIPCRoot, !opts.Verify, !opts.Verify)...)
+	}
 	return command.ExecSpec{
-		Argv: []string{d.binaryName(), "app-server"},
+		Argv: argv,
 		Dir:  opts.CWD,
 	}, nil
 }
@@ -760,7 +771,7 @@ func (c *appServerRPC) handleNotification(frame duplex.Frame) {
 
 func isCodexSelectionNotification(method string) bool {
 	switch method {
-	case "thread/started", "thread/updated", "thread/model/changed", "thread/settings/changed",
+	case "thread/started", "thread/updated", "thread/model/changed", "thread/settings/changed", "thread/settings/updated",
 		"turn/started", "model/changed", "settings/updated", "config/settings/updated":
 		return true
 	default:
@@ -806,7 +817,7 @@ func codexSelectionValues(value any) (string, string) {
 				}
 			}
 		}
-		for _, key := range []string{"thread", "turn", "settings", "config", "modelSettings", "model_settings", "reasoning"} {
+		for _, key := range []string{"thread", "turn", "settings", "config", "modelSettings", "model_settings", "threadSettings", "reasoning"} {
 			if nested, ok := firstMap(object, key); ok {
 				visit(nested, depth+1)
 			}
@@ -1216,7 +1227,12 @@ func normalizeProviderErrorInfo(errorInfo string) string {
 func threadParams(opts engine.SessionOpts, input engine.TurnInput, resumeID string) map[string]any {
 	params := map[string]any{
 		"approvalPolicy": "never",
-		"sandbox":        sandboxMode(input.Write),
+	}
+	workspaceWrite := input.Write || opts.Verify
+	if opts.LocalIPC && workspaceWrite {
+		params["permissions"] = localIPCPermissionProfile
+	} else {
+		params["sandbox"] = sandboxMode(workspaceWrite)
 	}
 	if opts.CWD != "" {
 		params["cwd"] = opts.CWD
@@ -1234,11 +1250,24 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 	params := map[string]any{
 		"threadId":       threadID,
 		"approvalPolicy": "never",
-		"sandboxPolicy":  sandboxPolicy(input.Write, opts.CWD, opts.WriteSandboxRoot, writePolicy),
 		"input": []map[string]any{{
 			"type": "text",
 			"text": input.Prompt,
 		}},
+	}
+	workspaceWrite := input.Write || opts.Verify
+	if opts.LocalIPC && workspaceWrite {
+		params["permissions"] = localIPCPermissionProfile
+	} else {
+		if opts.Verify {
+			writePolicy = WritePolicyWorkspaceOffline
+		}
+		policy := sandboxPolicy(workspaceWrite, opts.CWD, opts.WriteSandboxRoot, writePolicy)
+		if opts.Verify {
+			policy["excludeSlashTmp"] = true
+			policy["excludeTmpdirEnvVar"] = true
+		}
+		params["sandboxPolicy"] = policy
 	}
 	if opts.CWD != "" {
 		params["cwd"] = opts.CWD
@@ -1250,6 +1279,82 @@ func turnStartParams(threadID string, opts engine.SessionOpts, input engine.Turn
 		params["effort"] = opts.Effort
 	}
 	return params
+}
+
+func localIPCConfigArgs(workspace, scratch, ipcRoot string) []string {
+	return localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot, true, true)
+}
+
+func localIPCConfigArgsForWorkspace(workspace, scratch, ipcRoot string, includeGitMetadata, includeSystemTemp bool) []string {
+	type filesystemEntry struct {
+		path       string
+		permission string
+	}
+	entries := make([]filesystemEntry, 0, 6)
+	indices := make(map[string]int, 6)
+	setFilesystemPermission := func(path, permission string) {
+		if index, ok := indices[path]; ok {
+			entries[index].permission = permission
+			return
+		}
+		indices[path] = len(entries)
+		entries = append(entries, filesystemEntry{path: path, permission: permission})
+	}
+	setFilesystemPermission(":root", "read")
+	setFilesystemPermission(workspace, "write")
+	setFilesystemPermission(scratch, "write")
+	setFilesystemPermission(ipcRoot, "write")
+	if includeSystemTemp {
+		setFilesystemPermission("/tmp", "write")
+	}
+	if includeGitMetadata {
+		setFilesystemPermission(filepath.Join(workspace, ".git"), "read")
+	}
+	filesystemParts := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		filesystemParts = append(filesystemParts, tomlString(entry.path)+"=\""+entry.permission+"\"")
+	}
+	filesystem := "{" + strings.Join(filesystemParts, ",") + "}"
+	return []string{
+		"-c", `default_permissions=":workspace"`,
+		"-c", "features.network_proxy=true",
+		"-c", "permissions." + localIPCPermissionProfile + ".filesystem=" + filesystem,
+		"-c", "permissions." + localIPCPermissionProfile + ".network.enabled=true",
+		"-c", "permissions." + localIPCPermissionProfile + ".network.allow_local_binding=true",
+		"-c", "permissions." + localIPCPermissionProfile + ".network.unix_sockets={" + tomlString(ipcRoot) + "=\"allow\"}",
+	}
+}
+
+func tomlString(value string) string {
+	var quoted strings.Builder
+	quoted.Grow(len(value) + 2)
+	quoted.WriteByte('"')
+	for _, r := range value {
+		switch r {
+		case '\\':
+			quoted.WriteString(`\\`)
+		case '"':
+			quoted.WriteString(`\"`)
+		case '\b':
+			quoted.WriteString(`\b`)
+		case '\t':
+			quoted.WriteString(`\t`)
+		case '\n':
+			quoted.WriteString(`\n`)
+		case '\f':
+			quoted.WriteString(`\f`)
+		case '\r':
+			quoted.WriteString(`\r`)
+		default:
+			if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+				fmt.Fprintf(&quoted, `\u%04X`, r)
+			} else {
+				quoted.WriteRune(r)
+			}
+		}
+	}
+	quoted.WriteByte('"')
+	return quoted.String()
 }
 
 func sandboxMode(write bool) string {

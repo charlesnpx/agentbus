@@ -726,6 +726,28 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, fmt.Errorf("backend %q is unavailable", record.Backend), nil)
 		return
 	}
+	codexSandboxed := true
+	policy, hasSandboxPolicy := run.backend.(interface {
+		CodexSandboxRequired(write, localIPC bool) bool
+	})
+	if spec.Verify && !hasSandboxPolicy {
+		s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, errors.New("verify requires Codex OS sandbox support"), nil)
+		return
+	}
+	if hasSandboxPolicy {
+		codexSandboxed = policy.CodexSandboxRequired(record.Write, spec.LocalIPC) || spec.Verify
+		if codexSandboxed {
+			if err := s.ensureCodexSandbox(jobCtx, run.backend); err != nil {
+				if jobCtx.Err() != nil {
+					s.finishStartError(store, record, jobCtx, jobCtx.Err())
+					return
+				}
+				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable,
+					fmt.Errorf("Codex OS sandbox cannot start on this host: %w", err), nil)
+				return
+			}
+		}
+	}
 	requestedModel := record.Model
 	requestedEffort := record.Effort
 	if defaults := s.backendDefaults[record.Backend]; defaults.Model != "" && requestedModel == "" {
@@ -735,17 +757,21 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		requestedEffort = defaults.Effort
 	}
 	opts := engine.SessionOpts{
-		CWD:     record.CWD,
-		Write:   record.Write,
-		Model:   requestedModel,
-		Effort:  requestedEffort,
-		Timeout: timeout,
+		CWD:      record.CWD,
+		Write:    record.Write,
+		LocalIPC: spec.LocalIPC,
+		Verify:   spec.Verify,
+		Model:    requestedModel,
+		Effort:   requestedEffort,
+		Timeout:  timeout,
 	}
 	var (
-		layout  engine.WorkspaceLayout
-		managed *managedCodexHome
-		cache   jobCachePaths
-		caches  map[string]string
+		layout         engine.WorkspaceLayout
+		managed        *managedCodexHome
+		cache          jobCachePaths
+		caches         map[string]string
+		frozenCopyPath string
+		frozenSource   *protocol.FrozenSource
 	)
 	if record.Backend == "codex" {
 		layout, err = engine.LayoutForWorkspace(s.stateRoot, record.CWD)
@@ -792,7 +818,7 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			return
 		}
 	}
-	if record.Write {
+	if record.Write || spec.Verify {
 		cache, managed, err = prepareJobCache(layout, record.JobID, managed)
 		if managed != nil {
 			s.rememberManagedCodexHome(record.JobID, managed)
@@ -804,6 +830,29 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		if record.Backend == "codex" {
 			opts.WriteSandboxRoot = cache.root
 		}
+		if spec.Verify {
+			frozenCopyPath = filepath.Join(cache.root, "src")
+			identity, copyErr := createFrozenCopyContext(jobCtx, record.CWD, frozenCopyPath)
+			if copyErr != nil {
+				if jobCtx.Err() != nil {
+					s.finishStartError(store, record, jobCtx, jobCtx.Err())
+					return
+				}
+				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassInternal, fmt.Errorf("prepare frozen verification copy: %w", copyErr), nil)
+				return
+			}
+			frozenSource = &identity
+			opts.CWD = frozenCopyPath
+		}
+		if spec.LocalIPC {
+			ipcRoot, rootErr := createLocalIPCRoot()
+			if rootErr != nil {
+				s.recordExecutionFailure(store, record, protocol.CleanupClean, protocol.FailureClassBackendUnavailable, rootErr, nil)
+				return
+			}
+			opts.LocalIPCRoot = ipcRoot
+			s.rememberManagedLocalIPCRoot(record.JobID, ipcRoot)
+		}
 		opts.WriteEnvOverlay = map[string]string{
 			"GOCACHE":              cache.goBuild,
 			"TMPDIR":               cache.tmp,
@@ -812,6 +861,9 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 			"XDG_CACHE_HOME":       cache.xdg,
 			"npm_config_store_dir": cache.pnpm,
 			"YARN_CACHE_FOLDER":    cache.yarn,
+		}
+		if spec.LocalIPC {
+			opts.WriteEnvOverlay["TMPDIR"] = opts.LocalIPCRoot
 		}
 		caches = make(map[string]string, len(opts.WriteEnvOverlay)+1)
 		for key, value := range opts.WriteEnvOverlay {
@@ -828,10 +880,14 @@ func (s *Server) runJob(parent context.Context, record jobstore.Record, run *act
 		caches = nil
 	}
 	scratch := ""
-	if record.Write {
+	if record.Write || spec.Verify {
 		scratch = cache.root
 	}
-	posture := executionPosture(record.Backend, record.Write, scratch, caches)
+	posture := executionPosture(record.Backend, record.Write, spec.Verify, spec.LocalIPC, codexSandboxed, scratch, caches)
+	if spec.Verify {
+		posture.FrozenCopy = frozenCopyPath
+		posture.FrozenSource = frozenSource
+	}
 	if run.cancellationRequested() {
 		s.discardManagedCodexHome(record.JobID)
 		return
@@ -959,10 +1015,16 @@ func taskSpecFromRecord(record jobstore.Record) (protocol.TaskSpec, error) {
 	if spec.InputMode != "" && spec.InputMode != protocol.InputModeFixed && spec.InputMode != protocol.InputModeSteerable {
 		return spec, fmt.Errorf("durable task spec has invalid inputMode %q", spec.InputMode)
 	}
+	if err := validateVerifyTaskSpec(spec); err != nil {
+		return spec, fmt.Errorf("durable task spec has invalid verify: %w", err)
+	}
+	if err := validateLocalIPCSpec(spec, localIPCGOOS); err != nil {
+		return spec, fmt.Errorf("durable task spec has invalid localIPC: %w", err)
+	}
 	if record.InputMode != "" && record.InputMode != protocol.EffectiveInputMode(spec.InputMode) {
 		return spec, errors.New("durable task spec inputMode disagrees with job record")
 	}
-	if spec.Backend != record.Backend || spec.CWD == "" || spec.Prompt == "" {
+	if spec.Backend != record.Backend || spec.CWD == "" || spec.Prompt == "" || spec.Write != record.Write {
 		return spec, errors.New("durable task spec disagrees with job record")
 	}
 	return spec, nil
@@ -1541,15 +1603,28 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 			terminal.Cleanup = protocol.CleanupUncertain
 			terminal.Diagnostics = append(terminal.Diagnostics, "inspect managed Codex home terminal record: "+getErr.Error())
 		} else if current.State.IsTerminal() {
+			if recordUsesVerify(current) {
+				if copyErr := removeFrozenCopyFromManagedHome(home); copyErr != nil {
+					log.Printf("agentbus service: job %s frozen verification copy cleanup after terminal race: %v", jobID, copyErr)
+				}
+			}
 			home.close()
+			s.discardRecordedLocalIPCRoot(current)
 			return
 		} else {
 			cleanupRecord = current
 			cleanupRecord.State = terminal.State
+			if recordUsesVerify(cleanupRecord) {
+				if copyErr := removeFrozenCopyFromManagedHome(home); copyErr != nil {
+					terminal.Cleanup = protocol.CleanupUncertain
+					terminal.Diagnostics = append(terminal.Diagnostics, "frozen verification copy cleanup: "+copyErr.Error())
+				}
+			}
 		}
 	}
 	_, err := store.MarkTerminal(jobID, terminal)
 	if err == nil {
+		s.discardManagedLocalIPCRoot(jobID, "")
 		if home != nil {
 			cleanup, diagnostics := finalizeManagedCodexHome(home, cleanupRecord, terminal.Cleanup, terminal.Diagnostics)
 			if cleanup != terminal.Cleanup && len(diagnostics) > len(terminal.Diagnostics) {
@@ -1562,6 +1637,7 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 		if home != nil {
 			home.close()
 		}
+		s.discardManagedLocalIPCRoot(jobID, "")
 		// ErrTerminal is the store-enforced first-terminal-wins result. A
 		// later observer never retries or overwrites that recorded outcome.
 		return
@@ -1579,12 +1655,15 @@ func (s *Server) markTerminal(store *jobstore.Store, jobID string, terminal jobs
 			FinishedAt:       time.Now().UTC(),
 		}
 		if _, failureErr := store.MarkTerminal(jobID, failed); failureErr == nil {
+			s.discardManagedLocalIPCRoot(jobID, "")
 			if home != nil {
 				home.close()
 			}
 			return
 		} else if !errors.Is(failureErr, jobstore.ErrTerminal) {
 			err = errors.Join(err, fmt.Errorf("persist storage failure terminal record: %w", failureErr))
+		} else {
+			s.discardManagedLocalIPCRoot(jobID, "")
 		}
 	}
 	if home != nil {

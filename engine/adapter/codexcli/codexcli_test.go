@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/charlesnpx/agentbus/engine"
-	"github.com/charlesnpx/agentbus/engine/adapter/internal/cliadapter"
 	"github.com/charlesnpx/agentbus/engine/command"
 )
 
@@ -31,6 +30,31 @@ func TestStaticDefaultEffortsAcceptMaxAndUltra(t *testing.T) {
 	}
 }
 
+func TestCodexSandboxRequiredExceptForTrustedWriteTurns(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		policy   WritePolicy
+		write    bool
+		localIPC bool
+		want     bool
+	}{
+		{name: "read-only always sandboxed", policy: WritePolicyTrusted, write: false, want: true},
+		{name: "ordinary edit sandboxed", policy: WritePolicyWorkspaceOffline, write: true, want: true},
+		{name: "trusted edit unrestricted", policy: WritePolicyTrusted, write: true, want: false},
+		{name: "trusted local IPC remains sandboxed", policy: WritePolicyTrusted, write: true, localIPC: true, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend, ok := New(Options{Binary: "fake-codex", WritePolicy: test.policy}).(*backend)
+			if !ok {
+				t.Fatal("Codex constructor did not retain its sandbox policy")
+			}
+			if got := backend.CodexSandboxRequired(test.write, test.localIPC); got != test.want {
+				t.Fatalf("CodexSandboxRequired(%t, %t) = %t, want %t", test.write, test.localIPC, got, test.want)
+			}
+		})
+	}
+}
+
 func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing.T) {
 	t.Run("handshake order", func(t *testing.T) {
 		cwd := t.TempDir()
@@ -40,8 +64,22 @@ func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing
 			peer.respond(init, initializeResult())
 			peer.expectNotification("initialized")
 			thread := peer.expectRequest("thread/start")
+			threadParams, ok := thread["params"].(map[string]any)
+			if !ok || threadParams["sandbox"] != "workspace-write" {
+				t.Fatalf("thread/start params = %#v, want existing workspace-write sandbox", thread["params"])
+			}
+			if _, ok := threadParams["permissions"]; ok {
+				t.Fatalf("thread/start params = %#v, local IPC profile must be absent", threadParams)
+			}
 			peer.respond(thread, threadResult("thread-1"))
 			turn := peer.expectRequest("turn/start")
+			turnParams, ok := turn["params"].(map[string]any)
+			if !ok || turnParams["sandboxPolicy"] == nil {
+				t.Fatalf("turn/start params = %#v, want existing sandboxPolicy", turn["params"])
+			}
+			if _, ok := turnParams["permissions"]; ok {
+				t.Fatalf("turn/start params = %#v, local IPC profile must be absent", turnParams)
+			}
 			peer.respond(turn, turnResult("turn-1"))
 			peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
 		})
@@ -78,6 +116,138 @@ func TestAppServerInitializeHandshakePrecedesTurnAndFailureIsTerminal(t *testing
 			t.Fatalf("events = %#v, want terminal initialize error", got)
 		}
 	})
+}
+
+func TestAppServerLocalIPCUsesScopedPermissionsProfile(t *testing.T) {
+	cwd := `/work/a"b\c`
+	scratch := `/scratch/d"e\f`
+	ipcRoot := `/tmp/ipc/r"oot\w`
+	wantArgv := []string{
+		"fake-codex", "app-server",
+		"-c", `default_permissions=":workspace"`,
+		"-c", "features.network_proxy=true",
+		"-c", `permissions.agentbus_local_ipc.filesystem={":root"="read","/work/a\"b\\c"="write","/scratch/d\"e\\f"="write","/tmp/ipc/r\"oot\\w"="write","/tmp"="write","/work/a\"b\\c/.git"="read"}`,
+		"-c", "permissions.agentbus_local_ipc.network.enabled=true",
+		"-c", "permissions.agentbus_local_ipc.network.allow_local_binding=true",
+		"-c", `permissions.agentbus_local_ipc.network.unix_sockets={"/tmp/ipc/r\"oot\\w"="allow"}`,
+	}
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		if !reflect.DeepEqual(spec.Argv, wantArgv) {
+			t.Fatalf("argv = %#v, want quoted local IPC profile overrides %#v", spec.Argv, wantArgv)
+		}
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		threadParams, ok := thread["params"].(map[string]any)
+		if !ok || threadParams["permissions"] != localIPCPermissionProfile {
+			t.Fatalf("thread/start params = %#v, want permissions profile %q", thread["params"], localIPCPermissionProfile)
+		}
+		if _, ok := threadParams["sandbox"]; ok {
+			t.Fatalf("thread/start params contain incompatible sandbox field: %#v", threadParams)
+		}
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		turnParams, ok := turn["params"].(map[string]any)
+		if !ok || turnParams["permissions"] != localIPCPermissionProfile {
+			t.Fatalf("turn/start params = %#v, want permissions profile %q", turn["params"], localIPCPermissionProfile)
+		}
+		if _, ok := turnParams["sandboxPolicy"]; ok {
+			t.Fatalf("turn/start params contain incompatible sandboxPolicy field: %#v", turnParams)
+		}
+		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+	})
+	session := startFakeCodexSession(t, engine.SessionOpts{
+		CWD: cwd, Write: true, LocalIPC: true, WriteSandboxRoot: scratch, LocalIPCRoot: ipcRoot,
+	})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "use local IPC", Write: true}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+
+	readOnlyRunner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		if !reflect.DeepEqual(spec.Argv, wantArgv) {
+			t.Fatalf("read-only turn argv = %#v, want local IPC profile available for the session %#v", spec.Argv, wantArgv)
+		}
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/resume")
+		threadParams, ok := thread["params"].(map[string]any)
+		if !ok || threadParams["sandbox"] != "read-only" {
+			t.Fatalf("read-only thread/resume params = %#v, want sandbox read-only", thread["params"])
+		}
+		if _, ok := threadParams["permissions"]; ok {
+			t.Fatalf("read-only thread/resume params contain writable permissions: %#v", threadParams)
+		}
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		turnParams, ok := turn["params"].(map[string]any)
+		wantPolicy := map[string]any{"type": "readOnly", "networkAccess": false}
+		if !ok || !reflect.DeepEqual(turnParams["sandboxPolicy"], wantPolicy) {
+			t.Fatalf("read-only turn/start params = %#v, want sandboxPolicy %#v", turn["params"], wantPolicy)
+		}
+		if _, ok := turnParams["permissions"]; ok {
+			t.Fatalf("read-only turn/start params contain writable permissions: %#v", turnParams)
+		}
+		peer.respond(turn, turnResult("turn-2"))
+		peer.notify("turn/completed", completedParams("thread-1", "turn-2", "completed", ""))
+	})
+	events, err = turnWithRunner(t, session, engine.TurnInput{Prompt: "correct the result", Write: false}, readOnlyRunner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+}
+
+func TestAppServerThreadSettingsUpdateReportsEffectiveSelection(t *testing.T) {
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, _ command.ExecSpec) {
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		peer.respond(thread, threadResult("thread-1"))
+		turn := peer.expectRequest("turn/start")
+		peer.respond(turn, turnResult("turn-1"))
+		peer.notify("thread/started", map[string]any{"threadId": "thread-1", "reasoningEffort": "medium"})
+		peer.notify("thread/settings/updated", map[string]any{
+			"threadId": "thread-1",
+			"threadSettings": map[string]any{
+				"model":  "gpt-6-luna",
+				"effort": "max",
+				"collaborationMode": map[string]any{
+					"mode": "default",
+					"settings": map[string]any{
+						"model":            "gpt-6-luna",
+						"reasoning_effort": "max",
+					},
+				},
+			},
+		})
+		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
+	})
+
+	session := startFakeCodexSession(t, engine.SessionOpts{Model: "gpt-6-luna", Effort: "max"})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "observe effective selection"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	var observations []engine.Event
+	for _, event := range got {
+		if event.Type == engine.EventModelReported {
+			observations = append(observations, event)
+		}
+	}
+	if len(observations) != 2 {
+		t.Fatalf("model observations = %#v, want thread start and later settings update", observations)
+	}
+	if observations[0].EffortReported != "medium" {
+		t.Fatalf("first effort observation = %q, want medium from thread start", observations[0].EffortReported)
+	}
+	last := observations[len(observations)-1]
+	if last.ModelReported != "gpt-6-luna" || last.EffortReported != "max" {
+		t.Fatalf("last model observation = %#v, want model gpt-6-luna and effort max", last)
+	}
 }
 
 func TestAppServerNativeSteerUsesTurnSteerAndKeepsOneLogicalTurn(t *testing.T) {
@@ -761,6 +931,13 @@ func TestAppServerWriteCacheAppliesOnlyToWriteTurns(t *testing.T) {
 				if !ok || !reflect.DeepEqual(gotPolicy, tt.wantPolicy) {
 					t.Fatalf("turn/start sandboxPolicy = %#v, want %#v", params["sandboxPolicy"], tt.wantPolicy)
 				}
+				if tt.write {
+					for _, key := range []string{"excludeSlashTmp", "excludeTmpdirEnvVar"} {
+						if _, ok := gotPolicy[key]; ok {
+							t.Fatalf("ordinary write sandboxPolicy contains verify-only %q: %#v", key, gotPolicy)
+						}
+					}
+				}
 				peer.respond(turn, turnResult("turn-1"))
 				peer.notify("turn/completed", completedParams("thread-1", "turn-1", "completed", ""))
 			})
@@ -1424,7 +1601,7 @@ func TestAppServerInterruptLatchesSentTurnStartUntilResponse(t *testing.T) {
 		peer.notify("turn/completed", completedParams("thread-1", "turn-1", "interrupted", ""))
 	})
 
-	backend, ok := New(Options{Binary: "fake-codex"}).(*cliadapter.Backend)
+	backend, ok := New(Options{Binary: "fake-codex"}).(*backend)
 	if !ok {
 		t.Fatal("codex backend was not a CLI adapter backend")
 	}
@@ -1797,6 +1974,120 @@ func execSpecEnvironmentValue(spec command.ExecSpec, key string) (string, bool) 
 		}
 	}
 	return "", false
+}
+
+func TestAppServerVerifyUsesFrozenWorkspaceAndOfflineWritableRoots(t *testing.T) {
+	source := t.TempDir()
+	frozenCopy := t.TempDir()
+	scratch := t.TempDir()
+	prompt := "run the submitted checks"
+	writeOverlay := map[string]string{"GOCACHE": filepath.Join(scratch, "cache", "go-build")}
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		if spec.Dir != frozenCopy {
+			t.Fatalf("provider cwd = %q, want frozen copy %q", spec.Dir, frozenCopy)
+		}
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		threadParams := thread["params"].(map[string]any)
+		if threadParams["cwd"] != frozenCopy || threadParams["sandbox"] != "workspace-write" {
+			t.Fatalf("thread/start params = %#v, want frozen cwd and workspace-write mode", threadParams)
+		}
+		if _, ok := threadParams["permissions"]; ok {
+			t.Fatalf("verify thread/start unexpectedly used a permission profile: %#v", threadParams)
+		}
+		peer.respond(thread, threadResult("thread-verify"))
+		turn := peer.expectRequest("turn/start")
+		turnParams := turn["params"].(map[string]any)
+		wantPolicy := map[string]any{
+			"type":                "workspaceWrite",
+			"networkAccess":       false,
+			"writableRoots":       []any{frozenCopy, scratch},
+			"excludeSlashTmp":     true,
+			"excludeTmpdirEnvVar": true,
+		}
+		if turnParams["cwd"] != frozenCopy || !reflect.DeepEqual(turnParams["sandboxPolicy"], wantPolicy) {
+			t.Fatalf("verify turn/start params = %#v, want cwd %q and policy %#v", turnParams, frozenCopy, wantPolicy)
+		}
+		for _, root := range wantPolicy["writableRoots"].([]any) {
+			if root == source {
+				t.Fatalf("submitted source appears in verify writable roots: %#v", wantPolicy["writableRoots"])
+			}
+		}
+		input := turnParams["input"].([]any)
+		if len(input) != 1 || input[0].(map[string]any)["text"] != prompt {
+			t.Fatalf("verify prompt input = %#v, want unchanged prompt %q", turnParams["input"], prompt)
+		}
+		peer.respond(turn, turnResult("turn-verify"))
+		peer.notify("turn/completed", completedParams("thread-verify", "turn-verify", "completed", ""))
+	})
+	session := startFakeCodexSessionWithOptions(t, Options{Binary: "fake-codex", WritePolicy: WritePolicyTrusted}, engine.SessionOpts{
+		CWD: frozenCopy, WriteSandboxRoot: scratch, Verify: true, WriteEnvOverlay: writeOverlay,
+	})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: prompt, Write: false}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
+	if got, ok := execSpecEnvironmentValue(runner.lastSpec(), "GOCACHE"); !ok || got != writeOverlay["GOCACHE"] {
+		t.Fatalf("verify GOCACHE = %q present=%t, want scratch cache %q", got, ok, writeOverlay["GOCACHE"])
+	}
+}
+
+func TestAppServerVerifyLocalIPCProfileUsesCopyWithoutGitMetadata(t *testing.T) {
+	source := t.TempDir()
+	frozenCopy := t.TempDir()
+	scratch := t.TempDir()
+	ipcRoot := t.TempDir()
+	runner := newFakeAppServerRunner(t, func(t *testing.T, proc *fakeAppServerProcess, spec command.ExecSpec) {
+		if spec.Dir != frozenCopy {
+			t.Fatalf("provider cwd = %q, want frozen copy %q", spec.Dir, frozenCopy)
+		}
+		arguments := strings.Join(spec.Argv, "\n")
+		for _, expected := range []string{
+			tomlString(frozenCopy) + `="write"`,
+			tomlString(scratch) + `="write"`,
+			tomlString(ipcRoot) + `="write"`,
+		} {
+			if !strings.Contains(arguments, expected) {
+				t.Fatalf("local IPC argv does not grant %s: %#v", expected, spec.Argv)
+			}
+		}
+		for _, forbidden := range []string{tomlString(source) + `="write"`, tomlString(filepath.Join(source, ".git")), tomlString(filepath.Join(frozenCopy, ".git"))} {
+			if strings.Contains(arguments, forbidden) {
+				t.Fatalf("verify local IPC argv contains source or copy Git metadata entry %s: %#v", forbidden, spec.Argv)
+			}
+		}
+		if strings.Contains(arguments, tomlString("/tmp")+`="write"`) {
+			t.Fatalf("verify local IPC argv contains a broad /tmp write grant: %#v", spec.Argv)
+		}
+		peer := newAppServerPeer(t, proc)
+		peer.handshake()
+		thread := peer.expectRequest("thread/start")
+		threadParams := thread["params"].(map[string]any)
+		if threadParams["cwd"] != frozenCopy || threadParams["permissions"] != localIPCPermissionProfile {
+			t.Fatalf("verify local IPC thread/start params = %#v, want copy cwd and %q profile", threadParams, localIPCPermissionProfile)
+		}
+		peer.respond(thread, threadResult("thread-verify-ipc"))
+		turn := peer.expectRequest("turn/start")
+		turnParams := turn["params"].(map[string]any)
+		if turnParams["cwd"] != frozenCopy || turnParams["permissions"] != localIPCPermissionProfile {
+			t.Fatalf("verify local IPC turn/start params = %#v, want copy cwd and %q profile", turnParams, localIPCPermissionProfile)
+		}
+		if _, ok := turnParams["sandboxPolicy"]; ok {
+			t.Fatalf("verify local IPC turn/start unexpectedly has sandboxPolicy: %#v", turnParams)
+		}
+		peer.respond(turn, turnResult("turn-verify-ipc"))
+		peer.notify("turn/completed", completedParams("thread-verify-ipc", "turn-verify-ipc", "completed", ""))
+	})
+	session := startFakeCodexSession(t, engine.SessionOpts{
+		CWD: frozenCopy, WriteSandboxRoot: scratch, LocalIPCRoot: ipcRoot, LocalIPC: true, Verify: true,
+	})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "run tests", Write: false}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEventsWithTimeout(t, events, 2*time.Second)
 }
 
 type fakeAppServerProcess struct {

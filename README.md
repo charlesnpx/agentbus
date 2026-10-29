@@ -97,6 +97,15 @@ deadline, permission envelope, model, effort, and schema. Delivery may be
 native or interrupt-and-continue depending on the adapter. Delivery uncertainty
 is reported without automatic redelivery; a steerable task does not guarantee
 that a provider follows the instruction or rolls back tools already started.
+TaskSpec `localIPC` is an optional Codex-only request for a write or verify job on macOS.
+It permits Unix sockets under a short, private per-job temp directory used as
+`TMPDIR`, and TCP loopback. Other writable caches remain under the job's
+managed scratch directory. Agentbus rejects the job before launch with
+`backend_unavailable` if the resolved directory exceeds 80 bytes. The host
+shares loopback with the job. Agentbus does not grant other socket paths,
+Docker access, or outbound domains; Claude and Cursor requests are rejected, as
+are Linux requests because Codex's Linux sandbox cannot grant Unix sockets. A
+resumed job follows the new TaskSpec's `localIPC` value.
 Codex uses native app-server `turn/steer`; confirmation means its correlated
 JSON-RPC success response arrived before the steer context ended. No response
 before that deadline is reported as unconfirmed.
@@ -129,15 +138,42 @@ path resolves, Agentbus leaves `GOMODCACHE` at its default. Codex jobs set
 instead of repeated DNS retries. `-mod=readonly` only restricts module-file
 changes; it is not a filesystem sandbox.
 
-Inspect jobs receive no job-private scratch or writable caches: current
-read-only backend modes do not enforce a writable root outside the submitted
-workspace. `job.get` and `agentbus status --job <id>` expose the execution
-posture recorded at start, including intent, source write mode, scratch/cache
-paths, network and Git metadata policy, and enforcement strength. Codex uses
-its OS sandbox, Cursor uses agent-mode permissions, and Claude has no filesystem
-or network sandbox. `sourceWritable` reflects the selected inspect/edit mode;
-`enforcement` identifies whether that mode has an OS sandbox, agent permissions,
-or no filesystem boundary.
+Agentbus has three execution intentions. **Inspect** asks for no source writes.
+Codex uses its OS read-only sandbox with network denied; Claude restricts shell
+tools through its allowed/denied tool lists but has no OS filesystem boundary;
+Cursor uses its agent permission mode. Inspect does not create job-private
+scratch or writable caches. **Verify** sets TaskSpec `verify: true` with
+`write: false` and runs Codex in a disposable copy of the Git work tree. The
+copy contains tracked and untracked, non-ignored files as they exist when the
+job starts, has no `.git` metadata, and sits under managed scratch. Codex's OS
+sandbox grants writes only to that copy and scratch, adding the private IPC
+directory when `localIPC` is requested. Verify turns do not get the sandbox's
+implicit `/tmp` and `TMPDIR` writable grants; managed scratch remains writable
+through its explicit root. Network access is denied apart from the requested
+local IPC. The submitted source is not a writable root. Verify is refused for
+Claude and Cursor because their configured modes do not enforce
+that boundary. It requires a Git work tree, cannot resume or retain a session,
+and is limited to 2 GiB and 200,000 copied entries. **Edit** grants workspace
+writes. Ordinary Codex edits use the OS sandbox with managed scratch and network denied; trusted
+full-access Codex edits have no OS filesystem boundary. Claude edits have no OS
+filesystem boundary, and Cursor uses its agent permission mode.
+
+A disposable copy protects the submitted tree by workflow arrangement; by
+itself it is not an OS security boundary for a process running as the same user
+without a sandbox.
+Verify therefore requires Codex's OS sandbox and refuses backends that cannot
+enforce the requested read-only boundary. Codex sandboxed jobs check that the
+OS sandbox can start before launching app-server; a failed check ends the job
+as `backend_unavailable` without a weaker fallback. `job.get` and
+`agentbus status --job <id>` expose the posture recorded at start, including
+intent, whether the submitted source is writable, shell policy, local IPC,
+network and Git metadata policy, scratch/cache paths, and enforcement strength.
+For verify, the posture also records the frozen copy path and its Git HEAD and
+dirty status. `localIPC` is `denied` for ordinary sandboxed Codex jobs,
+`private-dir` for Codex jobs requesting local IPC, and `unenforced` for trusted
+full-access Codex edits and Claude/Cursor. `sourceWritable` describes the
+submitted source tree; `enforcement` identifies an OS sandbox, agent
+permissions, or no filesystem boundary.
 
 `configure-codex-sandbox` adds Agentbus's state and cache roots to
 `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`), preserving existing TOML
