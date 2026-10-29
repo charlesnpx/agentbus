@@ -134,6 +134,8 @@ func (s *Server) handle(connection *connection, request protocol.Request) reques
 		return s.handleJobTranscript(request.Params)
 	case protocol.MethodJobCancel:
 		return s.handleJobCancel(request.Params)
+	case protocol.MethodJobSteer:
+		return s.handleJobSteer(request.Params)
 	default:
 		return requestOutcome{err: protocol.NewError(protocol.ErrorMethodNotFound, "method not found", protocol.ErrorData{})}
 	}

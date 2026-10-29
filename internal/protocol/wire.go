@@ -17,10 +17,12 @@ const (
 	MethodJobList = "job.list"
 	// MethodJobTranscript retrieves the captured transcript for one job.
 	MethodJobTranscript = "job.transcript"
+	// MethodJobSteer submits one in-flight instruction to an active steerable job.
+	MethodJobSteer = "job.steer"
 )
 
 // The protocol error codes are the only codes protocol.hello, job.submit, job.get,
-// job.list, job.transcript, and job.cancel may produce.
+// job.list, job.transcript, job.cancel, and job.steer may produce.
 const (
 	ErrorUnauthorized       = "unauthorized"
 	ErrorVersionMismatch    = "protocol_version_mismatch"
@@ -29,6 +31,26 @@ const (
 	ErrorInvalidTaskSpec    = "invalid_task_spec"
 	ErrorUnknownJob         = "unknown_job"
 )
+
+// InputMode determines whether a running task accepts follow-up instructions.
+// The empty value is the wire-compatible spelling of fixed; callers should
+// omit it when submitting fixed-input work. Unknown values are invalid.
+type InputMode string
+
+const (
+	// InputModeFixed freezes the submitted prompt for the life of the job.
+	InputModeFixed InputMode = "fixed"
+	// InputModeSteerable allows bounded follow-up instructions during its active turn.
+	InputModeSteerable InputMode = "steerable"
+)
+
+// EffectiveInputMode maps an omitted legacy value to the fail-closed default.
+func EffectiveInputMode(mode InputMode) InputMode {
+	if mode == "" {
+		return InputModeFixed
+	}
+	return mode
+}
 
 // PublicState is the stable job state exposed by protocol v3. The daemon
 // persists an internal "starting" state to enforce the no-relaunch boundary,
@@ -156,6 +178,9 @@ type TaskSpec struct {
 	CWD     string `json:"cwd"`
 	Prompt  string `json:"prompt"`
 	Write   bool   `json:"write"`
+	// InputMode is immutable request data and participates in replay hashing.
+	// Omission means fixed and, due to omitempty, preserves existing hashes.
+	InputMode InputMode `json:"inputMode,omitempty"`
 	// ResumeJobID names the prior job whose recorded backend session should be
 	// resumed for this new job. It is part of the immutable task specification
 	// and therefore participates in identified-replay hashing.
@@ -169,6 +194,78 @@ type TaskSpec struct {
 	TimeoutMS     *int64             `json:"timeoutMs,omitempty"`
 	OutputSchema  json.RawMessage    `json:"outputSchema,omitempty"`
 	Tags          *map[string]string `json:"tags,omitempty"`
+}
+
+// JobSteerParams is one caller-identified follow-up instruction. MessageID is
+// bounded to 256 bytes and Text to 64 KiB by the daemon.
+type JobSteerParams struct {
+	JobID     string `json:"jobId"`
+	MessageID string `json:"messageId"`
+	Text      string `json:"text"`
+}
+
+// SteerStatus is the stable result of a steering request.
+type SteerStatus string
+
+const (
+	SteerStatusAdmitted  SteerStatus = "admitted"
+	SteerStatusDelivered SteerStatus = "delivered"
+	SteerStatusRejected  SteerStatus = "rejected"
+	SteerStatusUnknown   SteerStatus = "unknown"
+)
+
+// SteerReason is a stable, machine-readable rejection or uncertainty cause.
+type SteerReason string
+
+const (
+	SteerReasonNotSteerable           SteerReason = "not_steerable"
+	SteerReasonNotRunning             SteerReason = "not_running"
+	SteerReasonDuplicateConflict      SteerReason = "duplicate_conflict"
+	SteerReasonQueueFull              SteerReason = "queue_full"
+	SteerReasonSchemaCorrectionActive SteerReason = "schema_correction_active"
+	SteerReasonBackendUnsupported     SteerReason = "backend_unsupported"
+	SteerReasonDeliveryUnconfirmed    SteerReason = "delivery_unconfirmed"
+)
+
+// JobSteerResult is the immediate receipt from job.steer. An admitted receipt
+// is updated asynchronously in job.get once the adapter reports an outcome.
+type JobSteerResult struct {
+	JobID        string      `json:"jobId"`
+	MessageID    string      `json:"messageId"`
+	Status       SteerStatus `json:"status"`
+	Mechanism    string      `json:"mechanism"`
+	Reason       SteerReason `json:"reason"`
+	Deduplicated bool        `json:"deduplicated"`
+}
+
+// SteerRecord is the durable audit metadata for one message. Text itself is
+// never stored; TextSHA256 and TextBytes allow identity checks on retries.
+type SteerRecord struct {
+	MessageID  string      `json:"messageId"`
+	TextSHA256 string      `json:"textSha256"`
+	TextBytes  int         `json:"textBytes"`
+	Status     SteerStatus `json:"status"`
+	Mechanism  string      `json:"mechanism,omitempty"`
+	Reason     SteerReason `json:"reason,omitempty"`
+	CreatedAt  time.Time   `json:"createdAt"`
+	UpdatedAt  time.Time   `json:"updatedAt"`
+}
+
+// SteerSummaryWire is the text-free steering projection included in job.get.
+type SteerSummaryWire struct {
+	MessageID string      `json:"messageId"`
+	Status    SteerStatus `json:"status"`
+	Mechanism string      `json:"mechanism"`
+	Time      time.Time   `json:"time"`
+}
+
+// JobSteerRecordUpdate changes the durable outcome for an admitted message.
+type JobSteerRecordUpdate struct {
+	JobID     string
+	MessageID string
+	Status    SteerStatus
+	Mechanism string
+	Reason    SteerReason
 }
 
 // JobSubmitParams is the parameter object for job.submit.
@@ -265,6 +362,7 @@ type JobRecordWire struct {
 	WorkspaceKey  string                    `json:"workspaceKey"`
 	RequestID     string                    `json:"requestId"`
 	Backend       string                    `json:"backend"`
+	InputMode     InputMode                 `json:"inputMode"`
 	State         PublicState               `json:"state"`
 	Tags          map[string]string         `json:"tags,omitempty"`
 	CreatedAt     time.Time                 `json:"createdAt"`
@@ -277,6 +375,7 @@ type JobRecordWire struct {
 	Cleanup       Cleanup                   `json:"cleanup"`
 	LogPaths      *LogPathsWire             `json:"logPaths,omitempty"`
 	ModelReported string                    `json:"modelReported,omitempty"`
+	Steers        []SteerSummaryWire        `json:"steers"`
 }
 
 // JobSummaryWire is the compact item returned when job.list lists jobs. It

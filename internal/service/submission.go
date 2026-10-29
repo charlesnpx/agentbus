@@ -98,6 +98,7 @@ func (s *Server) handleJobSubmit(raw json.RawMessage) requestOutcome {
 			WorkspaceKey:  input.key.WorkspaceKey,
 			RequestID:     input.key.RequestID,
 			Backend:       spec.Backend,
+			InputMode:     protocol.EffectiveInputMode(spec.InputMode),
 			Model:         taskSpecOptionalString(spec.Model),
 			CWD:           canonicalCWD,
 			Write:         spec.Write,
@@ -182,7 +183,7 @@ func parseJobSubmitInput(raw json.RawMessage) (jobSubmitInput, error) {
 	}
 	for name := range input.taskSpec {
 		switch name {
-		case "backend", "cwd", "write", "prompt", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs":
+		case "backend", "cwd", "write", "prompt", "inputMode", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs":
 		default:
 			return jobSubmitInput{}, fmt.Errorf("json: unknown field %q", name)
 		}
@@ -206,7 +207,7 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 			return fmt.Errorf("taskSpec missing required field %s", required)
 		}
 	}
-	for _, optional := range []string{"resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs"} {
+	for _, optional := range []string{"inputMode", "resumeJobId", "retainSession", "model", "effort", "outputSchema", "tags", "timeoutMs"} {
 		value, present := raw[optional]
 		if present && string(value) == "null" {
 			return fmt.Errorf("taskSpec.%s cannot be null", optional)
@@ -214,6 +215,9 @@ func validateNewTaskSpec(spec protocol.TaskSpec, raw map[string]json.RawMessage)
 	}
 	if spec.Backend == "" || spec.CWD == "" || !filepath.IsAbs(spec.CWD) || spec.Prompt == "" {
 		return fmt.Errorf("taskSpec requires backend, absolute cwd, write, and prompt")
+	}
+	if _, supplied := raw["inputMode"]; supplied && spec.InputMode != protocol.InputModeFixed && spec.InputMode != protocol.InputModeSteerable {
+		return fmt.Errorf("taskSpec.inputMode must be %q or %q", protocol.InputModeFixed, protocol.InputModeSteerable)
 	}
 	if _, supplied := raw["resumeJobId"]; supplied && strings.TrimSpace(spec.ResumeJobID) == "" {
 		return errors.New("taskSpec.resumeJobId must name a job")
