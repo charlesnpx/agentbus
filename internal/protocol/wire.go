@@ -94,6 +94,7 @@ const (
 	FailureClassTimeout        FailureClass = "timeout"
 	FailureClassInterrupted    FailureClass = "interrupted"
 	FailureClassInternal       FailureClass = "internal"
+	FailureClassStorage        FailureClass = "storage"
 )
 
 // Valid reports whether class is one of the protocol v3 failure categories.
@@ -107,7 +108,8 @@ func (class FailureClass) Valid() bool {
 		FailureClassBackendError,
 		FailureClassTimeout,
 		FailureClassInterrupted,
-		FailureClassInternal:
+		FailureClassInternal,
+		FailureClassStorage:
 		return true
 	default:
 		return false
@@ -274,6 +276,7 @@ type JobRecordWire struct {
 	Result        *ResultInfoWire           `json:"result,omitempty"`
 	Contract      *ContractResult           `json:"contract,omitempty"`
 	Failure       *JobFailureWire           `json:"failure,omitempty"`
+	Diagnostics   []string                  `json:"diagnostics,omitempty"`
 	Cleanup       Cleanup                   `json:"cleanup"`
 	LogPaths      *LogPathsWire             `json:"logPaths,omitempty"`
 	ModelReported string                    `json:"modelReported,omitempty"`

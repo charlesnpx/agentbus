@@ -84,6 +84,59 @@ func TestFixtureDriverHappyPath(t *testing.T) {
 	}
 }
 
+func TestFailedRawLogSinkDoesNotDropTerminalFrame(t *testing.T) {
+	const capturedBytes = 29
+	payload := []byte("{\"type\":\"message\",\"text\":\"first\"}\n{\"type\":\"complete\",\"text\":\"done\"}\n")
+	stdout, peer := io.Pipe()
+	frames := make(chan Frame, 4)
+	decodeErrs := make(chan error, 1)
+	done := make(chan struct{})
+	capture := &captureWarningTracker{source: "stdout"}
+	sink := &failAfterBytesWriter{remaining: capturedBytes}
+	go readJSONL(stdout, capture.tolerantWriter(sink), frames, decodeErrs, done, nil)
+	go func() {
+		_, _ = peer.Write(payload)
+		_ = peer.Close()
+	}()
+
+	var types []string
+	for frame := range frames {
+		if frame.Err != nil {
+			t.Fatalf("unexpected frame error: %v", frame.Err)
+		}
+		typ, _ := frame.Object["type"].(string)
+		types = append(types, typ)
+	}
+	<-done
+	if err := <-decodeErrs; err != nil {
+		t.Fatalf("decode error = %v, want none", err)
+	}
+	if got := strings.Join(types, ","); got != "message,complete" {
+		t.Fatalf("decoded frame types = %q, want message,complete", got)
+	}
+	warning := capture.snapshot()
+	if warning == nil || warning.bytes != capturedBytes || warning.err != "no space left on device" {
+		t.Fatalf("capture warning = %+v, want sink error after %d bytes", warning, capturedBytes)
+	}
+}
+
+type failAfterBytesWriter struct {
+	remaining int
+}
+
+func (writer *failAfterBytesWriter) Write(payload []byte) (int, error) {
+	if writer.remaining <= 0 {
+		return 0, errors.New("no space left on device")
+	}
+	if len(payload) > writer.remaining {
+		n := writer.remaining
+		writer.remaining = 0
+		return n, errors.New("no space left on device")
+	}
+	writer.remaining -= len(payload)
+	return len(payload), nil
+}
+
 func TestTurnCapturesBackendStdoutAndStderrLogs(t *testing.T) {
 	proc := newFakeCommand()
 	runner := &fakeRunner{running: proc}

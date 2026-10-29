@@ -28,6 +28,7 @@ The core layout is:
   agentbus.sock
   agentbus.pid
   jobs.db
+  startup-diagnostic.log   # written when daemon autostart fails
   artifacts/
     logs/
     results/
@@ -36,7 +37,10 @@ The core layout is:
 token authenticates protocol.hello. agentbus.sock exists while the daemon is
 serving. agentbus.pid is written for a successful background launch or
 client-autostart; do not rely on it for a foreground daemon. jobs.db is the
-single bbolt store. It has exactly the meta, requests, and jobs buckets.
+single bbolt store, not SQLite. Do not inspect it with sqlite3; use
+`agentbus status` and `job.get` for job state and diagnostics. It has exactly
+the meta, requests, and jobs buckets. startup-diagnostic.log is written on a
+failed daemon autostart and contains the startup phase and bounded diagnostic.
 artifacts contains log and result sidecars. There is no automatic artifact
 retention sweep: result and log artifacts remain until an operator removes
 them, so the state root grows until it is cleaned up.
@@ -83,6 +87,23 @@ the recorded start token exactly matches the live process. It records cleanup
 as uncertain when cleanup cannot be established. Cleanup uncertainty does not
 erase a recorded completed result.
 
+## Capture and storage failures
+
+Raw stdout and stderr logs are optional diagnostics. If a raw-log sink fails,
+Agentbus stops writing that log and keeps draining provider output. `job.get`
+includes a bounded `diagnostics` entry with the captured byte count and sink
+error; `agentbus transcript` includes the warning and reports `gap: true`.
+The missing raw-log suffix cannot be reconstructed.
+
+Before a job launches, Agentbus checks available space on the state-root
+filesystem. Below 256 MiB it records a low-space diagnostic and still attempts
+the job because this estimate cannot predict the job's exact storage needs.
+There is no automatic cleanup on a write failure. If Agentbus cannot persist a
+final result artifact or its completed job record, the job is failed with
+failure class `storage` and the operating-system error. It does not publish an
+authoritative result; any captured transcript and known backend session remain
+available when their writes succeeded.
+
 ## Reading jobs and results
 
 agentbus status lists compact job summaries. With --job, its human-readable
@@ -127,6 +148,11 @@ binding its socket. A corrupt, truncated, incompatible, or busy database stops
 startup rather than being repaired in place. Preserve the root for diagnosis;
 do not create a replacement database at the same path unless you have first
 performed the required version-break cleanup above.
+
+Autostart errors distinguish a busy bbolt store, an incompatible or corrupt
+store, a process that exited before readiness, and a readiness timeout. The
+error names the startup phase and the `startup-diagnostic.log` path in the
+state root. It also includes the bounded stderr tail when available.
 
 ## Footprint and residual risks
 

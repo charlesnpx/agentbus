@@ -21,7 +21,9 @@ import (
 )
 
 const (
-	storeFormatVersion = "1"
+	storeFormatVersion      = "1"
+	diagnosticEntryMaxRunes = 512
+	diagnosticEntryMaxCount = 64
 	// defaultOpenTimeout bounds how long Open waits for the database file lock.
 	// bbolt with nil options blocks indefinitely on the flock, which would let a
 	// replacement daemon hang silently while a draining predecessor still holds
@@ -703,6 +705,52 @@ func (store *Store) RecordModelReported(id, model string) error {
 		}
 		return nil
 	})
+}
+
+// AppendDiagnostic records one bounded operational diagnostic without
+// changing the job's execution state.
+func (store *Store) AppendDiagnostic(id, diagnostic string) (Record, error) {
+	if err := validateJobID(id); err != nil {
+		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	diagnostic = strings.TrimSpace(diagnostic)
+	if diagnostic == "" {
+		return Record{}, fmt.Errorf("%w: diagnostic is required", ErrInvalid)
+	}
+	runes := []rune(diagnostic)
+	if len(runes) > diagnosticEntryMaxRunes {
+		diagnostic = string(runes[:diagnosticEntryMaxRunes-3]) + "..."
+	}
+	var result Record
+	err := store.update(func(tx *bolt.Tx) error {
+		jobs := tx.Bucket(bucketJobs)
+		if jobs == nil {
+			return fmt.Errorf("%w: missing jobs bucket", ErrCorrupt)
+		}
+		current, err := getRecord(jobs, id)
+		if err != nil {
+			return err
+		}
+		if current.State.IsTerminal() {
+			return ErrTerminal
+		}
+		next := current
+		next.Diagnostics = append(append([]string(nil), current.Diagnostics...), diagnostic)
+		if len(next.Diagnostics) > diagnosticEntryMaxCount {
+			next.Diagnostics = append([]string(nil), next.Diagnostics[len(next.Diagnostics)-diagnosticEntryMaxCount:]...)
+		}
+		next.UpdatedAt = time.Now().UTC()
+		normalizeRecord(&next)
+		if err := validateRecord(next); err != nil {
+			return err
+		}
+		if err := putRecord(jobs, next); err != nil {
+			return err
+		}
+		result = next
+		return nil
+	})
+	return result, err
 }
 
 // MarkTerminal records the first terminal state. Later updates are rejected so

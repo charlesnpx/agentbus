@@ -27,6 +27,11 @@ const (
 	ReadinessProtocolVersion   = 1
 	DefaultTimeout             = 10 * time.Second
 	DefaultStderrTailBytes     = 64 * 1024
+	CodeStoreBusy              = "store_busy"
+	CodeStoreCorrupt           = "store_corrupt"
+	CodeStoreIncompatible      = "store_incompatible"
+	CodeProcessExited          = "process_exited_before_ready"
+	CodeReadinessTimeout       = "readiness_timeout"
 	CodeAlreadyListening       = "agentbus daemon already listening"
 	readinessFDChildNumber     = 3
 	existingVerifyRetryPeriod  = 50 * time.Millisecond
@@ -34,6 +39,7 @@ const (
 	killWaitTimeout            = 5 * time.Second
 	startupDeadlineReportGrace = 250 * time.Millisecond
 	stderrDrainGrace           = 100 * time.Millisecond
+	startupDiagnosticFilename  = "startup-diagnostic.log"
 )
 
 var (
@@ -42,6 +48,9 @@ var (
 	ErrReadinessTimeout           = errors.New("daemon readiness timed out")
 	ErrReadinessCanceled          = errors.New("daemon readiness canceled")
 	ErrReadinessProtocol          = errors.New("daemon readiness protocol error")
+	ErrStoreBusy                  = errors.New("daemon job store is busy")
+	ErrStoreCorrupt               = errors.New("daemon job store is corrupt")
+	ErrStoreIncompatible          = errors.New("daemon job store is incompatible")
 	ErrCanonicalStateRootMismatch = errors.New("daemon canonical state root mismatch")
 	ErrExistingDaemonVerification = errors.New("existing daemon verification failed")
 )
@@ -56,6 +65,7 @@ type readyRecord struct {
 type failedRecord struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	Phase   string `json:"phase,omitempty"`
 }
 
 type readinessFrame struct {
@@ -128,12 +138,19 @@ func (reporter *Reporter) Ready(canonicalStateRoot, socketPath string) error {
 }
 
 func (reporter *Reporter) Failed(code, message string) error {
+	return reporter.FailedAt("", code, message)
+}
+
+// FailedAt publishes a startup failure with the service phase that failed
+// before readiness.
+func (reporter *Reporter) FailedAt(phase, code, message string) error {
 	if strings.TrimSpace(code) == "" {
 		code = "error"
 	}
 	return reporter.write(readinessFrame{Failed: &failedRecord{
 		Code:    code,
 		Message: message,
+		Phase:   phase,
 	}})
 }
 
@@ -287,7 +304,10 @@ type StartupError struct {
 	Kind                       error
 	Code                       string
 	Message                    string
+	Phase                      string
 	StderrTail                 string
+	DiagnosticPath             string
+	DiagnosticError            string
 	ExpectedCanonicalStateRoot string
 	ActualCanonicalStateRoot   string
 	Cause                      error
@@ -315,6 +335,9 @@ func (err *StartupError) Error() string {
 		}
 		b.WriteString(err.Message)
 	}
+	if err.Phase != "" {
+		fmt.Fprintf(&b, " (startup phase: %s)", err.Phase)
+	}
 	if err.ExpectedCanonicalStateRoot != "" || err.ActualCanonicalStateRoot != "" {
 		fmt.Fprintf(&b, ": expected canonicalStateRoot %q received %q", err.ExpectedCanonicalStateRoot, err.ActualCanonicalStateRoot)
 	}
@@ -325,6 +348,14 @@ func (err *StartupError) Error() string {
 	if strings.TrimSpace(err.StderrTail) != "" {
 		b.WriteString("\nstderr tail:\n")
 		b.WriteString(strings.TrimRight(err.StderrTail, "\n"))
+	}
+	if err.DiagnosticPath != "" {
+		b.WriteString("\ndiagnostic log: ")
+		b.WriteString(err.DiagnosticPath)
+	}
+	if err.DiagnosticError != "" {
+		b.WriteString("\ndiagnostic log write failed: ")
+		b.WriteString(err.DiagnosticError)
 	}
 	return b.String()
 }
@@ -346,7 +377,13 @@ func (err *StartupError) Unwrap() error {
 	return errors.Join(err.Kind, err.Cause)
 }
 
-func Launch(ctx context.Context, opts Options) (Result, error) {
+func Launch(ctx context.Context, opts Options) (result Result, launchErr error) {
+	var diagnosticRoot string
+	defer func() {
+		if launchErr != nil && diagnosticRoot != "" {
+			launchErr = writeStartupDiagnostic(diagnosticRoot, launchErr)
+		}
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -360,6 +397,7 @@ func Launch(ctx context.Context, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	diagnosticRoot = root
 	socketPath := opts.SocketPath
 	if socketPath == "" {
 		socketPath = filepath.Join(root, protocol.SocketName)
@@ -389,14 +427,24 @@ func Launch(ctx context.Context, opts Options) (Result, error) {
 	if err != nil {
 		_ = readyWrite.Close()
 		stderrCapture.cleanup()
-		return Result{}, err
+		return Result{}, &StartupError{
+			Kind:  ErrStartupFailed,
+			Code:  "stderr_capture_failed",
+			Phase: "setting up startup diagnostics",
+			Cause: err,
+		}
 	}
 
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
 		_ = readyWrite.Close()
 		stderrCapture.cleanup()
-		return Result{}, err
+		return Result{}, &StartupError{
+			Kind:  ErrStartupFailed,
+			Code:  "process_start_failed",
+			Phase: "launching daemon process",
+			Cause: err,
+		}
 	}
 	defer devNull.Close()
 
@@ -436,7 +484,11 @@ func Launch(ctx context.Context, opts Options) (Result, error) {
 		if errors.Is(launchCtx.Err(), context.DeadlineExceeded) {
 			kind = ErrReadinessTimeout
 		}
-		return Result{}, &StartupError{Kind: kind, StderrTail: tail, Cause: errors.Join(launchCtx.Err(), killErr)}
+		code := "readiness_canceled"
+		if kind == ErrReadinessTimeout {
+			code = CodeReadinessTimeout
+		}
+		return Result{}, &StartupError{Kind: kind, Code: code, Phase: "waiting for daemon readiness", StderrTail: tail, Cause: errors.Join(launchCtx.Err(), killErr)}
 	}
 }
 
@@ -450,10 +502,12 @@ func handleFrame(ctx context.Context, handle *Handle, got handshakeResult, expec
 		killErr := handle.KillAndWait()
 		tail := stderrCapture.stopAndTail()
 		kind := ErrReadinessProtocol
+		code := "readiness_protocol_error"
 		if errors.Is(got.err, io.EOF) {
 			kind = ErrReadinessEOF
+			code = CodeProcessExited
 		}
-		return Result{}, &StartupError{Kind: kind, StderrTail: tail, Cause: errors.Join(got.err, killErr)}
+		return Result{}, &StartupError{Kind: kind, Code: code, Phase: "waiting for daemon readiness", StderrTail: tail, Cause: errors.Join(got.err, killErr)}
 	}
 	frame := got.frame
 	switch {
@@ -462,18 +516,20 @@ func handleFrame(ctx context.Context, handle *Handle, got handshakeResult, expec
 		if ready.ProtocolVersion != ReadinessProtocolVersion {
 			killErr := handle.KillAndWait()
 			tail := stderrCapture.stopAndTail()
-			return Result{}, &StartupError{Kind: ErrReadinessProtocol, Message: fmt.Sprintf("protocolVersion=%d", ready.ProtocolVersion), StderrTail: tail, Cause: killErr}
+			return Result{}, &StartupError{Kind: ErrReadinessProtocol, Code: "readiness_protocol_error", Phase: "validating daemon readiness", Message: fmt.Sprintf("protocolVersion=%d", ready.ProtocolVersion), StderrTail: tail, Cause: killErr}
 		}
 		if ready.PID != handle.pid {
 			killErr := handle.KillAndWait()
 			tail := stderrCapture.stopAndTail()
-			return Result{}, &StartupError{Kind: ErrReadinessProtocol, Message: fmt.Sprintf("pid=%d want %d", ready.PID, handle.pid), StderrTail: tail, Cause: killErr}
+			return Result{}, &StartupError{Kind: ErrReadinessProtocol, Code: "readiness_protocol_error", Phase: "validating daemon readiness", Message: fmt.Sprintf("pid=%d want %d", ready.PID, handle.pid), StderrTail: tail, Cause: killErr}
 		}
 		if ready.CanonicalStateRoot != expectedRoot {
 			killErr := handle.KillAndWait()
 			tail := stderrCapture.stopAndTail()
 			return Result{}, &StartupError{
 				Kind:                       ErrCanonicalStateRootMismatch,
+				Code:                       "canonical_state_root_mismatch",
+				Phase:                      "validating daemon readiness",
 				ExpectedCanonicalStateRoot: expectedRoot,
 				ActualCanonicalStateRoot:   ready.CanonicalStateRoot,
 				StderrTail:                 tail,
@@ -497,6 +553,7 @@ func handleFrame(ctx context.Context, handle *Handle, got handshakeResult, expec
 						Kind:       ErrStartupFailed,
 						Code:       failed.Code,
 						Message:    failed.Message,
+						Phase:      failed.Phase,
 						StderrTail: tail,
 						Cause:      waitErr,
 					}
@@ -509,6 +566,7 @@ func handleFrame(ctx context.Context, handle *Handle, got handshakeResult, expec
 					Kind:       ErrExistingDaemonVerification,
 					Code:       failed.Code,
 					Message:    failed.Message,
+					Phase:      failed.Phase,
 					StderrTail: tail,
 					Cause:      errors.Join(verifyErr, waitErr),
 				}
@@ -517,17 +575,75 @@ func handleFrame(ctx context.Context, handle *Handle, got handshakeResult, expec
 		waitErr := handle.waitGraceOrKill(failedExitGrace)
 		tail := stderrCapture.stopAndTail()
 		return Result{}, &StartupError{
-			Kind:       ErrStartupFailed,
+			Kind:       startupFailureKind(failed.Code),
 			Code:       failed.Code,
 			Message:    failed.Message,
+			Phase:      failed.Phase,
 			StderrTail: tail,
 			Cause:      waitErr,
 		}
 	default:
 		killErr := handle.KillAndWait()
 		tail := stderrCapture.stopAndTail()
-		return Result{}, &StartupError{Kind: ErrReadinessProtocol, Message: "frame must contain exactly one of ready or failed", StderrTail: tail, Cause: killErr}
+		return Result{}, &StartupError{Kind: ErrReadinessProtocol, Code: "readiness_protocol_error", Phase: "validating daemon readiness", Message: "frame must contain exactly one of ready or failed", StderrTail: tail, Cause: killErr}
 	}
+}
+
+func startupFailureKind(code string) error {
+	switch code {
+	case CodeStoreBusy:
+		return ErrStoreBusy
+	case CodeStoreCorrupt:
+		return ErrStoreCorrupt
+	case CodeStoreIncompatible:
+		return ErrStoreIncompatible
+	default:
+		return ErrStartupFailed
+	}
+}
+
+func writeStartupDiagnostic(root string, err error) error {
+	var startup *StartupError
+	if !errors.As(err, &startup) {
+		return err
+	}
+	startup.DiagnosticPath = filepath.Join(root, startupDiagnosticFilename)
+	var content strings.Builder
+	fmt.Fprintf(&content, "startup phase: %s\nstartup code: %s\n", startup.Phase, startup.Code)
+	if startup.Message != "" {
+		fmt.Fprintf(&content, "message: %s\n", startup.Message)
+	}
+	if startup.Cause != nil {
+		fmt.Fprintf(&content, "cause: %s\n", startup.Cause.Error())
+	}
+	if startup.StderrTail != "" {
+		fmt.Fprintf(&content, "stderr tail:\n%s\n", strings.TrimRight(startup.StderrTail, "\n"))
+	}
+	text := content.String()
+	const maxStartupDiagnosticBytes = 128 * 1024
+	if len(text) > maxStartupDiagnosticBytes {
+		text = text[len(text)-maxStartupDiagnosticBytes:]
+	}
+	writeErr := os.MkdirAll(root, 0o700)
+	file, openErr := os.OpenFile(startup.DiagnosticPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	writeErr = errors.Join(writeErr, openErr)
+	if file != nil {
+		if chmodErr := file.Chmod(0o600); chmodErr != nil {
+			writeErr = errors.Join(writeErr, chmodErr)
+		}
+		if _, err := io.WriteString(file, text); err != nil {
+			writeErr = errors.Join(writeErr, err)
+		}
+		writeErr = errors.Join(writeErr, file.Sync(), file.Close())
+	}
+	if writeErr != nil {
+		message := writeErr.Error()
+		if len(message) > 512 {
+			message = message[:509] + "..."
+		}
+		startup.DiagnosticError = message
+	}
+	return err
 }
 
 func readFrame(file *os.File) (readinessFrame, error) {
