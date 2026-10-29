@@ -703,6 +703,8 @@ func emitCompletionEvents(disposition turnDisposition, events chan<- engine.Even
 		events <- warning("backend turn timed out")
 		return
 	}
+	var providerFailure *engine.ProviderFailureError
+	structuredProviderFailure := errors.As(driverErr, &providerFailure) && providerFailure != nil
 	if driverErr != nil {
 		events <- terminalError(driverErr)
 	}
@@ -710,6 +712,9 @@ func emitCompletionEvents(disposition turnDisposition, events chan<- engine.Even
 		events <- warning(observation.CleanupErr.Error())
 	}
 	if observation.ExecutionErr != nil || (earlyExit && driverErr == nil) {
+		if structuredProviderFailure {
+			return
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" && stderrCopyErr != nil {
 			msg = stderrCopyErr.Error()
@@ -723,7 +728,7 @@ func emitCompletionEvents(disposition turnDisposition, events chan<- engine.Even
 		events <- terminalError(errors.New(msg))
 		return
 	}
-	if stderrCopyErr != nil {
+	if stderrCopyErr != nil && !structuredProviderFailure {
 		events <- terminalError(stderrCopyErr)
 	}
 }

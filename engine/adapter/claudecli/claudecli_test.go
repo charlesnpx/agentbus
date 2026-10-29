@@ -811,6 +811,85 @@ func TestClaudeStructuredRateLimitCarriesProviderEvidence(t *testing.T) {
 	}
 }
 
+func TestClaudeAuthenticationFailureSurvivesResultAndProcessExit(t *testing.T) {
+	const authMessage = "Failed to authenticate: OAuth session expired and could not be refreshed"
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("authenticate")
+		peer.write(map[string]any{
+			"type": "assistant",
+			"message": map[string]any{
+				"model": "<synthetic>", "role": "assistant",
+				"content": []any{map[string]any{"type": "text", "text": authMessage}},
+			},
+			"error": "authentication_failed", "is_api_error_message": true,
+		})
+		peer.write(map[string]any{
+			"type": "result", "subtype": "success", "is_error": true,
+			"terminal_reason": "api_error", "result": authMessage,
+			"permission_denials": []any{}, "num_turns": 1,
+		})
+		proc.finish(command.ExitObservation{Exited: true, Code: 1}, errors.New("exit status 1"))
+	})
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "authenticate"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	terminals := eventsOfType(got, engine.EventTerminalError)
+	if len(terminals) != 1 {
+		t.Fatalf("terminal events = %#v, want one typed authentication failure", terminals)
+	}
+	var failure *engine.ProviderFailureError
+	if !errors.As(terminals[0].Err, &failure) || failure == nil {
+		t.Fatalf("terminal error = %#v, want ProviderFailureError", terminals[0].Err)
+	}
+	if failure.Evidence.Class != "authentication" || failure.Evidence.Code != "authentication_failed" || failure.Evidence.Message != authMessage {
+		t.Fatalf("provider evidence = %+v, want authentication_failed and the OAuth message", failure.Evidence)
+	}
+	if terminals[0].Text != authMessage || strings.Contains(terminals[0].Text, "exit status 1") {
+		t.Fatalf("terminal text = %q, want the OAuth message preserved through exit", terminals[0].Text)
+	}
+	if containsEventType(got, engine.EventResultMessage) || containsModel(got, "<synthetic>") || containsEvent(got, engine.EventAgentText, authMessage) {
+		t.Fatalf("events = %#v, must not fabricate success, emit the auth error as assistant text, or report the synthetic model", got)
+	}
+	finals := eventsOfType(got, engine.EventTurnFinal)
+	if len(finals) != 1 || finals[0].TurnFinal == nil || !finals[0].TurnFinal.ReturnCodeKnown || finals[0].TurnFinal.ReturnCode != 1 || !finals[0].TurnFinal.ExecutionFailed {
+		t.Fatalf("TurnFinal events = %#v, want the observed failed exit code 1", finals)
+	}
+}
+
+func TestClaudeAuthenticationAssistantFrameWaitsForErrorResult(t *testing.T) {
+	const authMessage = "Failed to authenticate: OAuth session expired and could not be refreshed"
+	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
+		peer := newClaudePeer(t, proc)
+		peer.handshake()
+		peer.expectUser("authenticate")
+		peer.write(map[string]any{
+			"type": "assistant",
+			"message": map[string]any{
+				"model": "<synthetic>", "role": "assistant",
+				"content": []any{map[string]any{"type": "text", "text": authMessage}},
+			},
+			"error": "authentication_failed", "is_api_error_message": true,
+		})
+		peer.emitResult("success", false, "ordinary answer")
+	})
+
+	session := startFakeClaudeSession(t, engine.SessionOpts{})
+	events, err := turnWithRunner(t, session, engine.TurnInput{Prompt: "authenticate"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEventsWithTimeout(t, events, 2*time.Second)
+	if containsEventType(got, engine.EventTerminalError) || !containsEvent(got, engine.EventAgentText, authMessage) || resultText(got) != "ordinary answer" {
+		t.Fatalf("events = %#v, want ordinary assistant and result events after a successful result", got)
+	}
+}
+
 func TestClaudeAssistantModelObservationReplacesSystemModel(t *testing.T) {
 	runner := newFakeClaudeRunner(t, func(t *testing.T, proc *fakeClaudeProcess, _ command.ExecSpec) {
 		peer := newClaudePeer(t, proc)
