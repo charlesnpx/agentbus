@@ -54,8 +54,10 @@ agentbus status --all
 
 `result --wait` observes the job with `job.get` until it becomes terminal or
 the observation timeout expires. The default timeout is 30m. Expiry prints the
-current record and exits 16; it does not cancel the job. Durations need explicit
-units: `2400` is ambiguous, so use `2400s` or `40m`.
+current record and exits 16; if the first lookup times out before a record is
+available, it prints a timeout message to stderr and exits 16. It does not cancel
+the job. Durations need explicit units: `2400` is ambiguous, so use `2400s` or
+`40m`.
 
 ~~~sh
 agentbus result --job "$JOB_ID" --wait --wait-timeout 30m

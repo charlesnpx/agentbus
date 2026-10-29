@@ -898,6 +898,10 @@ func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Write
 	if err != nil {
 		return protocolCommandError(errOut, "result", err)
 	}
+	if observationTimedOut && record.JobID == "" {
+		fmt.Fprintln(errOut, "result observation timed out before the job could be read")
+		return cliExitObservationTimeout
+	}
 	code := cliExitCodeForRecord(record)
 	if *jsonOut {
 		if writeCode := writeOrError(out, errOut, record); writeCode != 0 {
@@ -923,8 +927,16 @@ func (a *app) runResult(ctx context.Context, args []string, out, errOut io.Write
 func (a *app) observeJob(ctx context.Context, client protocolClient, jobID string, timeout time.Duration) (agentclient.JobGetResult, bool, error) {
 	deadline := time.Now().Add(timeout)
 	delay := cliObservationPollInterval
-	last, err := client.JobGet(ctx, agentclient.JobGetParams{JobID: jobID})
+	requestCtx, cancel := context.WithDeadline(ctx, deadline)
+	requestDeadline, _ := requestCtx.Deadline()
+	callerDeadline, hasCallerDeadline := ctx.Deadline()
+	observationDeadlineBoundsRequest := requestDeadline.Equal(deadline) && (!hasCallerDeadline || deadline.Before(callerDeadline))
+	last, err := client.JobGet(requestCtx, agentclient.JobGetParams{JobID: jobID})
+	cancel()
 	if err != nil {
+		if ctx.Err() == nil && observationDeadlineBoundsRequest && time.Until(deadline) <= 0 && isDeadlineError(err) {
+			return agentclient.JobGetResult{}, true, nil
+		}
 		return agentclient.JobGetResult{}, false, err
 	}
 	if last.State.IsTerminal() {
