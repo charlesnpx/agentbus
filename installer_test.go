@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/charlesnpx/agentbus/internal/protocol"
@@ -179,7 +180,7 @@ func TestInstallerStagedInstallDoesNotRestartDaemon(t *testing.T) {
 	}
 }
 
-func TestInstallerLiveInstallRestartsMatchingDaemon(t *testing.T) {
+func TestInstallerLiveInstallWarnsForMatchingDaemonWithoutStoppingIt(t *testing.T) {
 	root := repoRoot(t)
 	home := t.TempDir()
 	stubBin := t.TempDir()
@@ -218,15 +219,13 @@ func TestInstallerLiveInstallRestartsMatchingDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatalf("live install failed: %v stderr=%s stdout=%s", err, stderr, stdout)
 	}
-	if warnings := decodeInstallerResult(t, stdout).Warnings; !containsWarningText(warnings, fmt.Sprintf("restarted running agentbus daemon (pid %d)", daemon.Process.Pid)) {
+	warnings := decodeInstallerResult(t, stdout).Warnings
+	if !containsWarningText(warnings, fmt.Sprintf("running agentbus daemon (pid %d) will restart on the new binary once it has no clients or active jobs; in-flight jobs are not interrupted", daemon.Process.Pid)) {
 		t.Fatalf("live install warnings = %#v", warnings)
 	}
-	if err := daemon.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ProcessState.ExitCode() == 0 {
-			t.Fatalf("daemon was not terminated by installer: %v", err)
-		}
+	if err := daemon.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("daemon is not alive after install: %v", err)
 	}
-	daemon.Process = nil
 }
 
 func TestInstallerRejectsMalformedFlags(t *testing.T) {

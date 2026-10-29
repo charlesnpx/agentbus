@@ -622,13 +622,7 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, listen
 			stale := s.checkBinaryStale()
 			quiet := s.clients.Load() == 0 && s.accepting.Load() == 0 && s.activeJobs.Load() == 0
 			if staleDraining {
-				settled := false
-				select {
-				case <-acceptSettled:
-					settled = true
-				default:
-				}
-				if !quiet || !settled {
+				if !quiet {
 					continue
 				}
 				cancel()
@@ -644,6 +638,15 @@ func (s *Server) idleLoop(ctx context.Context, cancel context.CancelFunc, listen
 				}
 				s.removeOwnedSocket(socketIdentity, "stale daemon listener close")
 				staleDraining = true
+				select {
+				case <-ctx.Done():
+					return
+				case <-acceptSettled:
+				}
+				if s.clients.Load() == 0 && s.accepting.Load() == 0 && s.activeJobs.Load() == 0 {
+					cancel()
+					return
+				}
 				continue
 			}
 			if s.pruneInterval > 0 {
